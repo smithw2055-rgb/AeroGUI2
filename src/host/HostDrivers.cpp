@@ -80,9 +80,15 @@ EmbeddedGameHost::EmbeddedGameHost(
     , renderTree_(renderTree) {}
 
 void EmbeddedGameHost::TickUi(float dt, std::uint32_t activePhaseMask) {
-    (void)dt;
     telemetry_.frameCount += 1u;
     telemetry_.lastActivePhaseMask = activePhaseMask;
+
+    if (inputRouter_ && animationEngine_ && !inputRouter_->GetAnimationEngine()) {
+        inputRouter_->SetAnimationEngine(animationEngine_);
+    }
+    if (bindingEngine_ && animationEngine_ && !bindingEngine_->GetAnimationEngine()) {
+        bindingEngine_->SetAnimationEngine(animationEngine_);
+    }
 
     if ((activePhaseMask & UiPhase_Input) != 0u && inputRouter_) {
         telemetry_.inputEventsDispatched += inputRouter_->FlushQueuedEvents();
@@ -99,6 +105,10 @@ void EmbeddedGameHost::TickUi(float dt, std::uint32_t activePhaseMask) {
         } else {
             telemetry_.trackBUpdates += bindingEngine_->FlushTrackB();
         }
+    }
+
+    if ((activePhaseMask & UiPhase_MotionStateMachine) != 0u && animationEngine_) {
+        telemetry_.stateMachineTransitions += animationEngine_->EvaluateStateMachines(dt);
     }
 
     if ((activePhaseMask & UiPhase_Style) != 0u) {
@@ -182,10 +192,12 @@ bool DesktopEventHost::CanSleepIdle() const noexcept {
          (RenderDirty | SubtreeRenderDirty)) != 0u;
     const bool rootVisualDirty = rootLayoutDirty || rootRenderDirty;
     const bool routerPending = inputRouter_ && inputRouter_->HasPendingEvents();
+    const bool bindingDirty = bindingEngine_ && bindingEngine_->HasPendingDirtyObjects();
     const bool animEngineActive = animationEngine_ && animationEngine_->HasActiveAnimations();
     return !hasActiveAnimations_ &&
            !animEngineActive &&
            !hasDirtyObjects_ &&
+           !bindingDirty &&
            !hasDirtyLayout_ &&
            !hasPendingInputEvents_ &&
            !routerPending &&
@@ -193,7 +205,6 @@ bool DesktopEventHost::CanSleepIdle() const noexcept {
 }
 
 void DesktopEventHost::TickUi(float dt, std::uint32_t activePhaseMask) {
-    (void)dt;
     if (CanSleepIdle()) {
         // 0.0% CPU / 0.0% GPU polling when idle
         return;
@@ -201,6 +212,13 @@ void DesktopEventHost::TickUi(float dt, std::uint32_t activePhaseMask) {
 
     telemetry_.frameCount += 1u;
     telemetry_.lastActivePhaseMask = activePhaseMask;
+
+    if (inputRouter_ && animationEngine_ && !inputRouter_->GetAnimationEngine()) {
+        inputRouter_->SetAnimationEngine(animationEngine_);
+    }
+    if (bindingEngine_ && animationEngine_ && !bindingEngine_->GetAnimationEngine()) {
+        bindingEngine_->SetAnimationEngine(animationEngine_);
+    }
 
     if ((activePhaseMask & UiPhase_Input) != 0u && inputRouter_ && inputRouter_->HasPendingEvents()) {
         const std::size_t dispatched = inputRouter_->FlushQueuedEvents();
@@ -211,10 +229,19 @@ void DesktopEventHost::TickUi(float dt, std::uint32_t activePhaseMask) {
         }
     }
 
-    if (hasDirtyObjects_ && bindingEngine_ && (activePhaseMask & UiPhase_TrackABinding) != 0u) {
+    if ((hasDirtyObjects_ || (bindingEngine_ && bindingEngine_->HasPendingDirtyObjects())) &&
+        bindingEngine_ && (activePhaseMask & UiPhase_TrackABinding) != 0u) {
         const std::size_t updated = bindingEngine_->FlushTrackA();
         telemetry_.trackAUpdates += updated;
         if (updated > 0) {
+            hasDirtyLayout_ = true;
+        }
+    }
+
+    if ((activePhaseMask & UiPhase_MotionStateMachine) != 0u && animationEngine_) {
+        const std::size_t smChanged = animationEngine_->EvaluateStateMachines(dt);
+        telemetry_.stateMachineTransitions += smChanged;
+        if (smChanged > 0u) {
             hasDirtyLayout_ = true;
         }
     }
@@ -265,6 +292,9 @@ void DesktopEventHost::TickUi(float dt, std::uint32_t activePhaseMask) {
     hasDirtyObjects_ = false;
     hasDirtyLayout_ = false;
     hasPendingInputEvents_ = false;
+    if (animationEngine_) {
+        hasActiveAnimations_ = animationEngine_->HasActiveAnimations();
+    }
 }
 
 ZeroCopySubmissionStats DesktopEventHost::RecordGpuCommands(
@@ -534,12 +564,20 @@ WebCanvasHost::WebCanvasHost(
     , webBackend_(webBackend) {}
 
 void WebCanvasHost::TickUi(float dt, std::uint32_t activePhaseMask) {
-    (void)dt;
-    if (inputRouter_ && inputRouter_->HasPendingEvents()) {
+    if ((inputRouter_ && inputRouter_->HasPendingEvents()) ||
+        (bindingEngine_ && bindingEngine_->HasPendingDirtyObjects()) ||
+        (animationEngine_ && animationEngine_->HasActiveAnimations())) {
         rafState_ = WebRafState::ActiveTicking;
     }
     if (rafState_ == WebRafState::SuspendedIdle) {
         return;
+    }
+
+    if (inputRouter_ && animationEngine_ && !inputRouter_->GetAnimationEngine()) {
+        inputRouter_->SetAnimationEngine(animationEngine_);
+    }
+    if (bindingEngine_ && animationEngine_ && !bindingEngine_->GetAnimationEngine()) {
+        bindingEngine_->SetAnimationEngine(animationEngine_);
     }
 
     telemetry_.frameCount += 1u;
@@ -560,6 +598,11 @@ void WebCanvasHost::TickUi(float dt, std::uint32_t activePhaseMask) {
         const std::size_t b = bindingEngine_->FlushTrackB();
         telemetry_.trackBUpdates += b;
         changes += b;
+    }
+    if ((activePhaseMask & UiPhase_MotionStateMachine) != 0u && animationEngine_) {
+        const std::size_t smChanged = animationEngine_->EvaluateStateMachines(dt);
+        telemetry_.stateMachineTransitions += smChanged;
+        changes += smChanged;
     }
     if ((activePhaseMask & UiPhase_Style) != 0u) {
         telemetry_.stylePassesRun += 1u;

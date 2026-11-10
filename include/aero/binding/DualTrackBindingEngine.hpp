@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -12,6 +13,8 @@
 #include "aero/core/UIElement.hpp"
 
 namespace aero {
+
+class AnimationEngine;
 
 struct ReactiveBindingInstance {
     std::uint16_t bindingSlotId = 0;
@@ -80,11 +83,16 @@ public:
 
     void SetProgramImage(const ProgramImage* program) noexcept { program_ = program; }
     void SetUiInterpreter(const Interpreter* uiInterpreter) noexcept { uiInterpreter_ = uiInterpreter; }
+    void SetAnimationEngine(AnimationEngine* animationEngine) noexcept { animationEngine_ = animationEngine; }
+    void SetWakeHostCallback(std::function<void()> callback) { wakeHostCallback_ = std::move(callback); }
 
     [[nodiscard]] ExecutionDomainContext& Domains() noexcept { return domains_; }
     [[nodiscard]] const ExecutionDomainContext& Domains() const noexcept { return domains_; }
     [[nodiscard]] const ProgramImage* Program() const noexcept { return program_; }
     [[nodiscard]] const Interpreter* UiInterpreter() const noexcept { return uiInterpreter_; }
+    [[nodiscard]] AnimationEngine* GetAnimationEngine() const noexcept { return animationEngine_; }
+    [[nodiscard]] bool HasPendingDirtyObjects() const noexcept;
+    void MarkValuesInPools() const noexcept;
 
     // =========================================================================
     // Track A: ReactiveSlotTrack (Multi-hop CompiledSlotChain + ElementName)
@@ -176,6 +184,8 @@ private:
     ExecutionDomainContext& domains_;
     const ProgramImage* program_ = nullptr;
     const Interpreter* uiInterpreter_ = nullptr;
+    AnimationEngine* animationEngine_ = nullptr;
+    std::function<void()> wakeHostCallback_{};
     std::uint16_t nextBindingSlotId_ = 1;
     std::uint64_t lastObservedGcEpoch_ = 0;
     std::vector<ReactiveBindingInstance> trackABindings_;

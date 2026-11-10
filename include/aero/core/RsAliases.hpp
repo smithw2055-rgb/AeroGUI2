@@ -38,8 +38,9 @@ namespace rs_aot = ::realscript::aot;
 using SymbolId = rs_sem::SymbolId;
 using PrimitiveType = rs_sem::PrimitiveType;
 
-// Unified 24-byte value model & primitive wrappers
+// Unified 16-byte value model (RealScript RuntimeAbiMajor = 2) & primitive wrappers
 using UnifiedValue = rs_rt::Value;
+using ValueTag = rs_rt::ValueTag;
 using Float4Value = rs_rt::Float4Value;
 using FloatValue = rs_rt::FloatValue;
 using StringValue = rs_rt::StringValue;

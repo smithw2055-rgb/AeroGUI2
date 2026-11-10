@@ -21,13 +21,13 @@ void ScriptUiBridge::RegisterCoreUiBindings(BindingRegistry& bindings) {
                 error.message = "missing NativeHandle argument";
                 return std::nullopt;
             }
-            const auto* handle = std::get_if<NativeHandle>(&args[0]);
-            if (!handle) {
+            NativeHandle handle{};
+            if (!args[0].tryGetNativeHandle(handle)) {
                 error.code = ErrorCode::TypeMismatch;
                 error.message = "expected NativeHandle";
                 return std::nullopt;
             }
-            auto* elem = UIElement::FromNativeHandle(*handlesPtr, *handle);
+            auto* elem = UIElement::FromNativeHandle(*handlesPtr, handle);
             if (!elem) {
                 error.code = ErrorCode::InvalidObjectReference;
                 error.message = "invalid or expired UIElement NativeHandle";
@@ -49,13 +49,13 @@ void ScriptUiBridge::RegisterCoreUiBindings(BindingRegistry& bindings) {
                 error.message = "missing arguments for UIElement_SetWidth";
                 return std::nullopt;
             }
-            const auto* handle = std::get_if<NativeHandle>(&args[0]);
-            if (!handle) {
+            NativeHandle handle{};
+            if (!args[0].tryGetNativeHandle(handle)) {
                 error.code = ErrorCode::TypeMismatch;
                 error.message = "expected NativeHandle";
                 return std::nullopt;
             }
-            auto* elem = UIElement::FromNativeHandle(*handlesPtr, *handle);
+            auto* elem = UIElement::FromNativeHandle(*handlesPtr, handle);
             if (!elem) {
                 error.code = ErrorCode::InvalidObjectReference;
                 error.message = "invalid or expired UIElement NativeHandle";
@@ -85,14 +85,14 @@ void ScriptUiBridge::RegisterCoreUiBindings(BindingRegistry& bindings) {
                 error.message = "missing arguments for UIElement_GetProperty";
                 return std::nullopt;
             }
-            const auto* handle = std::get_if<NativeHandle>(&args[0]);
+            NativeHandle handle{};
             const auto* propId = std::get_if<std::int64_t>(&args[1]);
-            if (!handle || !propId) {
+            if (!args[0].tryGetNativeHandle(handle) || !propId) {
                 error.code = ErrorCode::TypeMismatch;
                 error.message = "expected (NativeHandle, int)";
                 return std::nullopt;
             }
-            auto* elem = UIElement::FromNativeHandle(*handlesPtr, *handle);
+            auto* elem = UIElement::FromNativeHandle(*handlesPtr, handle);
             if (!elem) {
                 error.code = ErrorCode::InvalidObjectReference;
                 error.message = "invalid or expired UIElement NativeHandle";
@@ -114,14 +114,14 @@ void ScriptUiBridge::RegisterCoreUiBindings(BindingRegistry& bindings) {
                 error.message = "missing arguments for UIElement_SetProperty";
                 return std::nullopt;
             }
-            const auto* handle = std::get_if<NativeHandle>(&args[0]);
+            NativeHandle handle{};
             const auto* propId = std::get_if<std::int64_t>(&args[1]);
-            if (!handle || !propId) {
+            if (!args[0].tryGetNativeHandle(handle) || !propId) {
                 error.code = ErrorCode::TypeMismatch;
                 error.message = "expected (NativeHandle, int, Value)";
                 return std::nullopt;
             }
-            auto* elem = UIElement::FromNativeHandle(*handlesPtr, *handle);
+            auto* elem = UIElement::FromNativeHandle(*handlesPtr, handle);
             if (!elem) {
                 error.code = ErrorCode::InvalidObjectReference;
                 error.message = "invalid or expired UIElement NativeHandle";

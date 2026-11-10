@@ -3,6 +3,9 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
+#include <memory>
+#include <string>
 #include <string_view>
 #include <vector>
 
@@ -26,6 +29,15 @@ struct SpringConfig {
     EasingMode mode,
     float normalizedTime01) noexcept;
 
+// 4-iteration 32-bit float Newton-Raphson + bisection fallback 1D Cubic Bezier solver
+// (supports Q7.8 overshoot tangents y1, y2 outside [0, 1])
+[[nodiscard]] float EvaluateCubicBezier1D(
+    float x1,
+    float y1,
+    float x2,
+    float y2,
+    float normalizedTime01) noexcept;
+
 enum class AnimationTrackKind : std::uint8_t {
     Inactive = 0,
     TweenFloat = 1,
@@ -33,6 +45,16 @@ enum class AnimationTrackKind : std::uint8_t {
     KeyFrames = 3,
     SpringFloat = 4,
     SpringFloat4 = 5,
+    CompiledClipSlice = 6,
+};
+
+struct TimelineEventInvocation {
+    UIElement* rootControl = nullptr;
+    std::string_view eventName{};
+    SymbolId handlerSymbolId = 0;
+    float timeSec = 0.0f;
+    float floatPayload = 0.0f;
+    std::int32_t intPayload = 0;
 };
 
 // Zero-allocation fixed-size inline keyframe entry (avoids per-track std::vector heap allocations)
@@ -44,10 +66,11 @@ struct InlineTrackKeyFrame {
     bool isDiscrete = false;
 };
 
-// Zero-allocation AnimationEngine backed by CompactPropertyEntry::animationTrackId:
+// Zero-allocation AnimationEngine backed by CompactPropertyEntry::animationTrackId & MotionStateMachineBank:
 // - Contiguous pool of reusable AnimationTrack slots (free-list recycled -> 0 heap allocs in steady state)
-// - Tween & multi-keyframe timelines (Float, Color/Thickness/CornerRadius Float4, Discrete Bool/Int)
+// - Tween, inline keyframes & zero-copy flat CompiledClipSlice tracks (CubicBezier, AnalyticalEase, Linear, HoldStep)
 // - Second-order C1 velocity-continuous Spring physics (interruptible mid-flight retargeting)
+// - Multi-layer State Machine (Override + Additive single-pass blend accumulator, ScrubbedClip, Blend1D, ExitTime, Triggers)
 // - Automatic animationTrackId linkage & pre-animation base value restoration on FillBehavior::Stop
 class AnimationEngine {
 public:
@@ -55,8 +78,14 @@ public:
     static constexpr std::size_t kMaxInlineKeyFrames = 8u;
 
     explicit AnimationEngine(std::size_t initialReservedTracks = 64u);
+    ~AnimationEngine() noexcept;
 
     void Clear();
+    void MarkValuesInPools() const noexcept;
+    void SetWakeHostCallback(std::function<void()> callback) { wakeHostCallback_ = std::move(callback); }
+    void SetTimelineEventCallback(std::function<void(const TimelineEventInvocation&)> callback) {
+        timelineEventCallback_ = std::move(callback);
+    }
 
     // Start or retarget a scalar float tween (Opacity, Width, AnimScaleX, AnimRotateAngle, etc.)
     std::uint16_t StartFloatTween(
@@ -134,13 +163,71 @@ public:
     std::uint16_t StartTimeline(UIElement* scopeRoot, const AxbAnimationTimeline& timeline);
     std::size_t BeginStoryboard(UIElement* scopeRoot, const AxbStoryboard& storyboard);
     bool StopPropertyAnimation(UIElement* target, std::uint16_t propId, bool restoreBaseValue = true) noexcept;
+    std::size_t StopSubtreeAnimations(const UIElement* subtreeRoot, bool restoreBaseValue = false) noexcept;
 
-    // Advance all active tracks by dt seconds (0 heap allocations in steady state).
+    // Start a zero-copy flat CompiledClipSlice track pointing directly into AxbPackage::motionKeyframes
+    std::uint16_t StartCompiledClipTrack(
+        UIElement* target,
+        const AxbMotionTrackDesc& trackDesc,
+        const AxbFlatKeyframe* keyframePool,
+        std::size_t poolCount,
+        float durationSeconds,
+        bool isLooping = false,
+        bool autoReverse = false,
+        FillBehavior fillBehavior = FillBehavior::HoldEnd);
+
+    // =========================================================================
+    // Phase 6: Multi-Layer Motion State Machine & ContractInputBank API
+    // =========================================================================
+    bool InstantiatePackageMotion(
+        UIElement* rootControl,
+        UIElement* const* localElements,
+        std::size_t localElementCount,
+        const AxbPackage& package);
+
+    bool SetStateMachineInputFloat(UIElement* rootControl, std::uint16_t slotIdx, float value) noexcept;
+    bool SetStateMachineInputFloatByName(UIElement* rootControl, std::string_view inputName, float value) noexcept;
+    bool SetStateMachineInputBool(UIElement* rootControl, std::uint16_t slotIdx, bool value) noexcept {
+        return SetStateMachineInputFloat(rootControl, slotIdx, value ? 1.0f : 0.0f);
+    }
+    bool SetStateMachineInputBoolByName(UIElement* rootControl, std::string_view inputName, bool value) noexcept {
+        return SetStateMachineInputFloatByName(rootControl, inputName, value ? 1.0f : 0.0f);
+    }
+    bool FireStateMachineTrigger(UIElement* rootControl, std::uint16_t slotIdx) noexcept;
+    bool FireStateMachineTriggerByName(UIElement* rootControl, std::string_view triggerName) noexcept;
+    [[nodiscard]] float GetStateMachineInputFloat(const UIElement* rootControl, std::uint16_t slotIdx) const noexcept;
+    [[nodiscard]] float GetStateMachineInputFloatByName(
+        const UIElement* rootControl,
+        std::string_view inputName) const noexcept;
+
+    // Built-in pointer/focus listener dispatch (invoked by InputEventRouter during UiPhase_Input)
+    bool DispatchPointerListenerEvent(UIElement* hitElement, SmListenerEventKind eventKind) noexcept;
+
+    // UiPhase_MotionStateMachine: evaluate state machine transition conditions, ExitTime guards, and reset Triggers
+    std::size_t EvaluateStateMachines(float dtSeconds = 0.0f) noexcept;
+
+    // Virtualized DataTemplate scroll support: sync bridge inputs & snap state machines to steady state (0 allocs)
+    void OnSubtreeDataContextRebound(UIElement* subtreeRoot) noexcept;
+
+    // Sub-5ms Stateful Motion Hot Reload: migrate active state machine layer times & ContractInputBank by hash
+    std::size_t MigrateStateMachinesOnHotReload(
+        UIElement* rootControl,
+        UIElement* const* newLocalElements,
+        std::size_t newLocalElementCount,
+        const AxbPackage& newPackage);
+
+    [[nodiscard]] bool IsStateMachineSettled(const UIElement* rootControl) const noexcept;
+    [[nodiscard]] std::size_t StateMachineCount() const noexcept { return stateMachines_.size(); }
+    [[nodiscard]] std::size_t ActiveStateMachineCount() const noexcept;
+
+    // Advance all active tracks & unsettled state machines by dt seconds (0 heap allocations in steady state).
     // Returns number of property writes performed during this tick.
     std::size_t Tick(float dtSeconds) noexcept;
 
     [[nodiscard]] std::size_t ActiveTrackCount() const noexcept { return activeCount_; }
-    [[nodiscard]] bool HasActiveAnimations() const noexcept { return activeCount_ > 0u; }
+    [[nodiscard]] bool HasActiveAnimations() const noexcept {
+        return activeCount_ > 0u || ActiveStateMachineCount() > 0u;
+    }
     [[nodiscard]] float GetTrackVelocityX(std::uint16_t trackId) const noexcept;
     [[nodiscard]] std::uint16_t FindActiveTrackId(
         const UIElement* target,
@@ -158,6 +245,8 @@ private:
         bool hadBaseSnapshot = false;
         ValueSourceRank baseRank = ValueSourceRank::Local;
         std::uint8_t keyFrameCount = 0;
+        std::uint8_t channelCount = 1;
+        std::uint8_t quantizeInlineW = 1;
 
         IntrusivePtr<UIElement> target{};
         UnifiedValue baseSnapshot{};
@@ -173,12 +262,86 @@ private:
         Float4Value velF4{};
         SpringConfig spring{};
 
+        const AxbFlatKeyframe* sliceFrames = nullptr;
+        std::uint32_t sliceCount = 0u;
+        std::uint32_t cachedSegmentIdx = 0u;
+
         std::array<InlineTrackKeyFrame, kMaxInlineKeyFrames> keyFrames{};
+    };
+
+    struct ContractInputRuntimeSlot {
+        std::string name;
+        std::uint64_t nameHash = 0ULL;
+        std::uint8_t valueKind = 0u;
+        bool isTrigger = false;
+        bool dirtyThisFrame = true;
+        std::uint16_t bridgePropId = 0xFFFFu;
+        float scalarValue = 0.0f;
+        Float4Value float4Value{};
+    };
+
+    struct LayerRuntimeState {
+        std::uint32_t layerDescIdx = 0u;
+        std::uint64_t layerNameHash = 0ULL;
+        SmLayerBlendMode blendMode = SmLayerBlendMode::Override;
+        float layerWeight = 1.0f;
+        std::uint16_t activeStateIdx = 0u;
+        std::uint64_t activeStateNameHash = 0ULL;
+        float activeTime = 0.0f;
+        float prevActiveTime = 0.0f;
+        std::uint16_t prevStateIdx = 0xFFFFu;
+        float prevStateTime = 0.0f;
+        float crossfadeElapsed = 0.0f;
+        float crossfadeDuration = 0.0f;
+        EasingFunctionKind crossfadeEaseKind = EasingFunctionKind::Cubic;
+        EasingMode crossfadeEaseMode = EasingMode::EaseOut;
+    };
+
+    struct ChannelBlendSlot {
+        std::uint16_t localElementIdx = 0u;
+        std::uint16_t propId = 0u;
+        std::uint8_t channelCount = 1u;
+        std::uint8_t quantizeInlineW = 1u;
+        bool hadBaseSnapshot = false;
+        bool touchedThisFrame = false;
+        ValueSourceRank baseRank = ValueSourceRank::Local;
+        UnifiedValue baseSnapshot{};
+        Float4Value restValue{};
+        Float4Value accumValue{};
+    };
+
+    struct MotionStateMachineInstance {
+        IntrusivePtr<UIElement> rootControl{};
+        std::vector<IntrusivePtr<UIElement>> localElements;
+        std::shared_ptr<AxbPackage> motionData;
+        std::uint32_t machineDescIdx = 0u;
+        std::uint64_t machineNameHash = 0ULL;
+        bool isSettled = false;
+        bool evaluatedTransitionsThisFrame = false;
+        bool needsInitialEval = true;
+        std::vector<ContractInputRuntimeSlot> contractInputs;
+        std::vector<LayerRuntimeState> layers;
+        std::vector<ChannelBlendSlot> channelScratch;
+        std::vector<std::uint32_t> trackSegmentCache;
     };
 
     [[nodiscard]] static float DefaultScalarForProperty(std::uint16_t propId) noexcept;
     [[nodiscard]] static float ReadCurrentScalar(const UIElement* target, std::uint16_t propId) noexcept;
     [[nodiscard]] static Float4Value ReadCurrentFloat4(const UIElement* target, std::uint16_t propId) noexcept;
+    [[nodiscard]] static Float4Value EvaluateFlatTrackAtTime(
+        const AxbMotionTrackDesc& trackDesc,
+        const AxbFlatKeyframe* keyframePool,
+        std::size_t poolCount,
+        float localTime,
+        std::uint32_t& ioCachedSegmentIdx) noexcept;
+
+    void SyncBridgePropertiesToContractInputs(MotionStateMachineInstance& sm) noexcept;
+    bool EvaluateStateMachineTransitions(MotionStateMachineInstance& sm) noexcept;
+    std::size_t EvaluateAndBlendStateMachineInstance(
+        MotionStateMachineInstance& sm,
+        float dtSeconds,
+        bool snapCrossfades) noexcept;
+    [[nodiscard]] bool CheckStateMachineInstanceSettled(const MotionStateMachineInstance& sm) const noexcept;
 
     std::uint16_t AcquireTrackSlot(
         UIElement* target,
@@ -192,6 +355,9 @@ private:
     std::vector<AnimationTrack> tracks_;
     std::vector<std::uint16_t> freeTrackIds_;
     std::size_t activeCount_ = 0u;
+    std::vector<MotionStateMachineInstance> stateMachines_;
+    std::function<void()> wakeHostCallback_{};
+    std::function<void(const TimelineEventInvocation&)> timelineEventCallback_{};
 };
 
 } // namespace aero

@@ -1,4 +1,5 @@
 #include "aero/input/InputEventRouter.hpp"
+#include "aero/animation/AnimationEngine.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -292,10 +293,20 @@ void InputEventRouter::UpdateHoveredTarget(UIElement* newHovered) noexcept {
     }
     if (hoveredElement_) {
         hoveredElement_->SetHovered(false);
+        if (animationEngine_) {
+            (void)animationEngine_->DispatchPointerListenerEvent(
+                hoveredElement_.Get(),
+                SmListenerEventKind::PointerExit);
+        }
     }
     hoveredElement_.Reset(newHovered, true);
     if (hoveredElement_) {
         hoveredElement_->SetHovered(true);
+        if (animationEngine_) {
+            (void)animationEngine_->DispatchPointerListenerEvent(
+                hoveredElement_.Get(),
+                SmListenerEventKind::PointerEnter);
+        }
     }
 }
 
@@ -355,10 +366,20 @@ bool InputEventRouter::SetFocus(UIElement* element) {
     }
     if (focusedElement_) {
         focusedElement_->SetFocused(false);
+        if (animationEngine_) {
+            (void)animationEngine_->DispatchPointerListenerEvent(
+                focusedElement_.Get(),
+                SmListenerEventKind::FocusLost);
+        }
     }
     focusedElement_.Reset(element, true);
     if (focusedElement_) {
         focusedElement_->SetFocused(true);
+        if (animationEngine_) {
+            (void)animationEngine_->DispatchPointerListenerEvent(
+                focusedElement_.Get(),
+                SmListenerEventKind::FocusGained);
+        }
     }
     SyncImeFocusState();
     return focusedElement_.Get() != nullptr;
@@ -367,6 +388,11 @@ bool InputEventRouter::SetFocus(UIElement* element) {
 void InputEventRouter::ClearFocus() {
     if (focusedElement_) {
         focusedElement_->SetFocused(false);
+        if (animationEngine_) {
+            (void)animationEngine_->DispatchPointerListenerEvent(
+                focusedElement_.Get(),
+                SmListenerEventKind::FocusLost);
+        }
         focusedElement_.Reset();
     }
     if (imeHost_) {
@@ -458,6 +484,11 @@ bool InputEventRouter::DispatchPointerDown(
             ClearFocus();
         }
         target->SetPressed(true);
+        if (animationEngine_) {
+            (void)animationEngine_->DispatchPointerListenerEvent(
+                target,
+                SmListenerEventKind::PointerDown);
+        }
     }
 
     bool requestCapture = false;
@@ -504,6 +535,11 @@ bool InputEventRouter::DispatchPointerUp(
         const bool inside = PointInsideElementLocalBounds(target.Get(), localPt);
         if (button == PointerButton::Left) {
             target->SetPressed(false);
+            if (inside && animationEngine_) {
+                (void)animationEngine_->DispatchPointerListenerEvent(
+                    target.Get(),
+                    SmListenerEventKind::PointerUpInside);
+            }
         }
         if (target->IsEffectivelyEnabled()) {
             handled = target->OnPointerUp(localPt, button, modifiers, inside);

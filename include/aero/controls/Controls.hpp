@@ -19,6 +19,7 @@
 namespace aero {
 
 class StyleTriggerEngine;
+class AnimationEngine;
 
 enum class Orientation : std::uint8_t {
     Vertical = 0,
@@ -623,6 +624,9 @@ public:
     void AssignStyleEnginePointer(StyleTriggerEngine* styleEngine) noexcept {
         styleEngine_ = styleEngine;
     }
+    void SetAnimationEngine(AnimationEngine* animationEngine) noexcept {
+        animationEngine_ = animationEngine;
+    }
 
     void SetItemTemplateKey(std::string_view key);
     [[nodiscard]] std::string GetItemTemplateKey() const;
@@ -660,6 +664,7 @@ public:
 
 protected:
     [[nodiscard]] ExecutionDomainContext* Domains() const noexcept { return domains_; }
+    void MarkExtraValuesInPools() const noexcept override;
 
 private:
     struct RealizedVirtualSlot {
@@ -682,6 +687,7 @@ private:
     ExecutionDomainContext* domains_ = nullptr;
     DualTrackBindingEngine* bindingEngine_ = nullptr;
     StyleTriggerEngine* styleEngine_ = nullptr;
+    AnimationEngine* animationEngine_ = nullptr;
     ItemGeneratorFn itemGenerator_;
     ItemBinderFn itemBinder_;
     std::vector<UnifiedValue> items_;
@@ -763,6 +769,9 @@ class AxbTemplateRegistry {
 public:
     static AxbTemplateRegistry& Instance() noexcept;
 
+    AxbTemplateRegistry() noexcept;
+    ~AxbTemplateRegistry();
+
     void Register(std::string className, AxbPackage package);
     void RegisterResources(const AxbPackage& package);
     void RegisterResource(std::string key, UnifiedValue value);
@@ -770,6 +779,7 @@ public:
     void RegisterStyle(AxbStyleDefinition style);
     void RegisterStoryboard(AxbStoryboard storyboard);
     void RegisterDataTemplate(AxbDataTemplate dataTemplate);
+    void MarkValuesInPools() const noexcept;
     [[nodiscard]] const UnifiedValue* FindResource(std::string_view key) const noexcept;
     [[nodiscard]] const AxbPackage* Find(std::string_view className) const noexcept;
     [[nodiscard]] const AxbMtsdfPathEntry* FindMtsdfPath(std::uint64_t pathHash) const noexcept;
@@ -822,7 +832,8 @@ public:
         DualTrackBindingEngine* bindingEngine = nullptr,
         ObjectRef dataContext = {},
         const Interpreter* eventInterpreter = nullptr,
-        rs_aot::ExecutionContext* eventAotContext = nullptr);
+        rs_aot::ExecutionContext* eventAotContext = nullptr,
+        AnimationEngine* animationEngine = nullptr);
     ~UserControl() override = default;
 
     static const TypeClass* StaticTypeClass() noexcept;
@@ -844,7 +855,8 @@ public:
         DualTrackBindingEngine* bindingEngine = nullptr,
         ObjectRef dataContext = {},
         const Interpreter* eventInterpreter = nullptr,
-        rs_aot::ExecutionContext* eventAotContext = nullptr);
+        rs_aot::ExecutionContext* eventAotContext = nullptr,
+        AnimationEngine* animationEngine = nullptr);
 
 private:
     std::string controlClassName_;
@@ -861,7 +873,8 @@ bool MountAxbTemplate(
     DualTrackBindingEngine* bindingEngine = nullptr,
     ObjectRef dataContext = {},
     const Interpreter* eventInterpreter = nullptr,
-    rs_aot::ExecutionContext* eventAotContext = nullptr);
+    rs_aot::ExecutionContext* eventAotContext = nullptr,
+    AnimationEngine* animationEngine = nullptr);
 
 void EnsureControlTypesRegistered() noexcept;
 

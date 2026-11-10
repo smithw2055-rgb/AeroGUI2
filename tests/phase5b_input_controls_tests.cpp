@@ -72,7 +72,7 @@ bool ApproxEq(float a, float b, float eps = 1e-2f) noexcept {
 // 1. Memory Layout Invariants & Zero-Allocation InputEventRouter Steady State
 // ============================================================================
 void TestInlineInteractiveStatesAndZeroAllocRouter() {
-    static_assert(sizeof(aero::UnifiedValue) == 24, "UnifiedValue == 24B");
+    static_assert(sizeof(aero::UnifiedValue) == 16, "UnifiedValue == 16B");
     static_assert(sizeof(aero::Float4Value) == 16, "Float4Value == 16B");
     static_assert(sizeof(aero::CompactPropertyEntry) == 32, "CompactPropertyEntry == 32B");
     static_assert(sizeof(aero::FastInlineStorage) == 56, "FastInlineStorage == 56B");

@@ -118,7 +118,34 @@ void main() {
         return;
     }
 
-    // 3: TexturedQuad
+    // 5: SdfRadialArc (Analytical SDF Ring/Arc/Progressbar, 0 CPU tessellation)
+    if (v_PrimType == 5u) {
+        float startRad = float(v_Flags & 0x3Fu) * (6.2831853 / 64.0);
+        float sweepRad = float((v_Flags >> 6u) & 0x3Fu) * (6.2831853 / 63.0);
+        float innerRatio = float((v_Flags >> 12u) & 0x0Fu) * (1.0 / 16.0);
+        vec2 halfSize = max(abs(u_QuadHalfExtent), v_QuadHalfSize);
+        float outerR = max(1.0, min(halfSize.x, halfSize.y));
+        float innerR = innerRatio * outerR;
+        float midR = 0.5 * (outerR + innerR);
+        float halfThick = max(0.5, 0.5 * (outerR - innerR));
+        float midAngle = startRad + 0.5 * sweepRad;
+        float halfSweep = clamp(0.5 * sweepRad, 0.001, 3.14159265);
+        float cs = cos(midAngle);
+        float sn = sin(midAngle);
+        vec2 q = vec2(
+            v_UvOrLocalPos.x * cs + v_UvOrLocalPos.y * sn,
+            abs(-v_UvOrLocalPos.x * sn + v_UvOrLocalPos.y * cs));
+        vec2 sc = vec2(cos(halfSweep), sin(halfSweep));
+        float dist = (sc.y * q.x > sc.x * q.y)
+            ? (abs(length(q) - midR) - halfThick)
+            : (length(q - sc * midR) - halfThick);
+        float aa = max(fwidth(dist) * 0.75, 1e-4);
+        float cov = (sweepRad <= 0.001) ? 0.0 : smoothstep(aa, -aa, dist);
+        o_FragColor = vec4(v_Color.rgb, v_Color.a * cov);
+        return;
+    }
+
+    // 3: TexturedQuad / 6: DynamicMesh
     vec4 texel = texture(u_GlyphAndUiAtlas, v_UvOrLocalPos);
     o_FragColor = texel * v_Color;
 }
@@ -233,6 +260,32 @@ void main() {
         return;
     }
 
+    if (v_PrimType == 5u) {
+        float startRad = float(v_Flags & 0x3Fu) * (6.2831853 / 64.0);
+        float sweepRad = float((v_Flags >> 6u) & 0x3Fu) * (6.2831853 / 63.0);
+        float innerRatio = float((v_Flags >> 12u) & 0x0Fu) * (1.0 / 16.0);
+        vec2 halfSize = max(abs(u_QuadHalfExtent), v_QuadHalfSize);
+        float outerR = max(1.0, min(halfSize.x, halfSize.y));
+        float innerR = innerRatio * outerR;
+        float midR = 0.5 * (outerR + innerR);
+        float halfThick = max(0.5, 0.5 * (outerR - innerR));
+        float midAngle = startRad + 0.5 * sweepRad;
+        float halfSweep = clamp(0.5 * sweepRad, 0.001, 3.14159265);
+        float cs = cos(midAngle);
+        float sn = sin(midAngle);
+        vec2 q = vec2(
+            v_UvOrLocalPos.x * cs + v_UvOrLocalPos.y * sn,
+            abs(-v_UvOrLocalPos.x * sn + v_UvOrLocalPos.y * cs));
+        vec2 sc = vec2(cos(halfSweep), sin(halfSweep));
+        float dist = (sc.y * q.x > sc.x * q.y)
+            ? (abs(length(q) - midR) - halfThick)
+            : (length(q - sc * midR) - halfThick);
+        float aa = max(fwidth(dist) * 0.75, 1e-4);
+        float cov = (sweepRad <= 0.001) ? 0.0 : smoothstep(aa, -aa, dist);
+        o_FragColor = vec4(v_Color.rgb, v_Color.a * cov);
+        return;
+    }
+
     o_FragColor = texture(u_GlyphAndUiAtlas, v_UvOrLocalPos) * v_Color;
 }
 )";
@@ -329,6 +382,31 @@ fn fs_main(in : VertexOut) -> @location(0) vec4<f32> {
             fillCov = max(fillCov, clamp(0.5 + strokePx * 0.5 - abs(trueDistPx), 0.0, 1.0));
         }
         return vec4<f32>(in.color.rgb, in.color.a * fillCov);
+    }
+    if (in.primType == 5u) {
+        let startRad = f32(in.flags & 0x3Fu) * (6.2831853 / 64.0);
+        let sweepRad = f32((in.flags >> 6u) & 0x3Fu) * (6.2831853 / 63.0);
+        let innerRatio = f32((in.flags >> 12u) & 0x0Fu) * (1.0 / 16.0);
+        let halfSize = max(abs(u_Globals.quadHalfExtent), in.quadHalfSize);
+        let outerR = max(1.0, min(halfSize.x, halfSize.y));
+        let innerR = innerRatio * outerR;
+        let midR = 0.5 * (outerR + innerR);
+        let halfThick = max(0.5, 0.5 * (outerR - innerR));
+        let midAngle = startRad + 0.5 * sweepRad;
+        let halfSweep = clamp(0.5 * sweepRad, 0.001, 3.14159265);
+        let cs = cos(midAngle);
+        let sn = sin(midAngle);
+        let q = vec2<f32>(
+            in.uvOrLocal.x * cs + in.uvOrLocal.y * sn,
+            abs(-in.uvOrLocal.x * sn + in.uvOrLocal.y * cs));
+        let sc = vec2<f32>(cos(halfSweep), sin(halfSweep));
+        let dist = select(
+            length(q - sc * midR) - halfThick,
+            abs(length(q) - midR) - halfThick,
+            sc.y * q.x > sc.x * q.y);
+        let aa = max(fwidth(dist) * 0.75, 1e-4);
+        let cov = select(smoothstep(aa, -aa, dist), 0.0, sweepRad <= 0.001);
+        return vec4<f32>(in.color.rgb, in.color.a * cov);
     }
     return textureSample(u_AtlasTex, u_AtlasSampler, in.uvOrLocal) * in.color;
 }
@@ -711,6 +789,29 @@ void ZeroCopyGpuStream::RasterizeTreeToRgba8(
                             fillCov = std::max(fillCov, strokeCov);
                         }
                         coverage = fillCov;
+                    } else if (prim == AeroPrimType::SdfRadialArc) {
+                        float startDeg = 0.0f;
+                        float sweepDeg = 0.0f;
+                        float innerRatio = 0.0f;
+                        UnpackSdfRadialArcParams(v0.flags, startDeg, sweepDeg, innerRatio);
+                        const float unscaledHalfW = std::max(std::fabs(v0.u), std::fabs(v2.u));
+                        const float unscaledHalfH = std::max(std::fabs(v0.v), std::fabs(v2.v));
+                        const float halfW = (unscaledHalfW > 1e-4f) ? unscaledHalfW : (localQuadW * 0.5f);
+                        const float halfH = (unscaledHalfH > 1e-4f) ? unscaledHalfH : (localQuadH * 0.5f);
+                        const float localX = (su - 0.5f) * (2.0f * halfW);
+                        const float localY = (sv - 0.5f) * (2.0f * halfH);
+                        const float aaFeather = std::max(
+                            1e-4f,
+                            (halfW * localQuadH + halfH * localQuadW) * std::fabs(invDet));
+                        coverage = EvaluateSdfRadialArcCoverage(
+                            localX,
+                            localY,
+                            halfW,
+                            halfH,
+                            startDeg,
+                            sweepDeg,
+                            innerRatio,
+                            aaFeather);
                     } else if (prim == AeroPrimType::SdfTextGlyph) {
                         const bool inGlyphBody = (su >= 0.15f && su <= 0.85f && sv >= 0.15f && sv <= 0.85f);
                         coverage = inGlyphBody ? 0.92f : 0.0f;

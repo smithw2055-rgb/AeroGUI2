@@ -19,6 +19,8 @@ enum class AeroPrimType : std::uint16_t {
     SdfTextGlyph = 2,
     TexturedQuad = 3,
     MsdfVectorPath = 4, // 4-channel MTSDF Vector Path (4-vertex Quad, 0 CPU triangulation)
+    SdfRadialArc = 5,   // Analytical SDF Ring/Arc/Progressbar (startAngle, sweepAngle, innerRadius)
+    DynamicMesh = 6,    // Deformable 2D triangle strip/indexed quad mesh inside 4KB CommandPage
 };
 
 enum AeroVertexFlags : std::uint16_t {
@@ -163,6 +165,28 @@ void UnpackMtsdfParams(
     float renderedHeightPx,
     bool singleChannelTrueSdfOnly = false) noexcept;
 
+// Pack startAngleDeg [0..360) (6 bits), sweepAngleDeg [0..360] (6 bits), innerRadiusRatio01 [0..0.9375] (4 bits)
+[[nodiscard]] std::uint16_t PackSdfRadialArcParams(
+    float startAngleDeg,
+    float sweepAngleDeg,
+    float innerRadiusRatio01) noexcept;
+void UnpackSdfRadialArcParams(
+    std::uint16_t packed,
+    float& outStartAngleDeg,
+    float& outSweepAngleDeg,
+    float& outInnerRadiusRatio01) noexcept;
+
+// CPU reference evaluation matching the GPU UberShader SDF analytical radial ring/arc anti-aliasing
+[[nodiscard]] float EvaluateSdfRadialArcCoverage(
+    float sampleLocalX,
+    float sampleLocalY,
+    float halfWidth,
+    float halfHeight,
+    float startAngleDeg,
+    float sweepAngleDeg,
+    float innerRadiusRatio01,
+    float aaFeatherWidth = 1.0f) noexcept;
+
 class PagedRenderTree {
 public:
     PagedRenderTree();
@@ -235,6 +259,25 @@ public:
         const Color& tintColor,
         float opacity = 1.0f,
         const UIElement* owner = nullptr);
+
+    // Allocate a 4-vertex analytical SDF radial arc / ring / gauge quad (0 CPU tessellation)
+    std::uint32_t AllocateRadialArcNode(
+        float x,
+        float y,
+        float width,
+        float height,
+        float startAngleDeg,
+        float sweepAngleDeg,
+        float innerRadiusRatio01,
+        const Color& color,
+        float opacity = 1.0f,
+        const UIElement* owner = nullptr);
+
+    bool UpdateRadialArcNode(
+        std::uint32_t nodeId,
+        float startAngleDeg,
+        float sweepAngleDeg,
+        float innerRadiusRatio01) noexcept;
 
     // Reserve a contiguous batch of N HUD bar nodes for O(1) SIMD/pointer-walk Track B updates
     std::uint32_t AllocateHudBarBatch(

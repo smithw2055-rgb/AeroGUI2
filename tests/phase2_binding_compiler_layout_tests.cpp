@@ -653,10 +653,10 @@ public TacticalHud CreateTacticalHud()
     AERO_CHECK(
         domains.readObjectField(DomainKind::Ui, hudObj, compiled.axbPackage.rootHandleFieldIndex, rootHandleVal, &clickErr),
         "Read __nativeRootHandle field from partial class instance");
-    const auto* rootHandlePtr = std::get_if<NativeHandle>(&rootHandleVal);
+    NativeHandle rootHandle{};
     AERO_CHECK(
-        rootHandlePtr != nullptr && rootHandlePtr->valid() &&
-        UIElement::FromNativeHandle(domains.nativeHandles(), *rootHandlePtr) == hudControl.Get(),
+        rootHandleVal.tryGetNativeHandle(rootHandle) && rootHandle.valid() &&
+        UIElement::FromNativeHandle(domains.nativeHandles(), rootHandle) == hudControl.Get(),
         "__nativeRootHandle on script partial class resolves back to hudControl UIElement");
 
     // Verify duplicate .g.rs guard in AeroCompiler::Compile

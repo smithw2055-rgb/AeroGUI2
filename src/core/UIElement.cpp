@@ -3,6 +3,8 @@
 #include <algorithm>
 #include <cmath>
 #include <limits>
+#include <mutex>
+#include <unordered_set>
 
 #include "aero/binding/DualTrackBindingEngine.hpp"
 #include "aero/compiler/AxbFormat.hpp"
@@ -11,6 +13,46 @@
 namespace aero {
 
 namespace {
+
+struct LiveTraceableUIElementRegistry {
+    std::mutex mutex;
+    std::unordered_set<const UIElement*> elements;
+    bool markerRegistered = false;
+
+    static LiveTraceableUIElementRegistry& Instance() noexcept {
+        static LiveTraceableUIElementRegistry reg;
+        return reg;
+    }
+
+    void Register(const UIElement* elem) {
+        if (!elem) return;
+        bool needHook = false;
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            elements.insert(elem);
+            if (!markerRegistered) {
+                markerRegistered = true;
+                needHook = true;
+            }
+        }
+        if (needHook) {
+            rs_rt::registerExternalValuePoolRootMarker(this, [this]() {
+                std::lock_guard<std::mutex> lock(mutex);
+                for (const UIElement* e : elements) {
+                    if (e) {
+                        e->MarkSparseValuesInPools();
+                    }
+                }
+            });
+        }
+    }
+
+    void Unregister(const UIElement* elem) noexcept {
+        if (!elem) return;
+        std::lock_guard<std::mutex> lock(mutex);
+        elements.erase(elem);
+    }
+};
 
 TypeClass gUIElementTypeClass{};
 TypeClass gPanelTypeClass{};
@@ -198,6 +240,10 @@ Button::Button() {
 }
 
 UIElement::~UIElement() {
+    if (registeredInValuePoolSet_) {
+        LiveTraceableUIElementRegistry::Instance().Unregister(this);
+        registeredInValuePoolSet_ = false;
+    }
     DetachRenderNodeSpan();
     boundBindingEngine_ = nullptr;
 
@@ -374,6 +420,10 @@ NativeHandle UIElement::ToNativeHandle(NativeHandleRegistry& registry) {
             return cachedNativeHandle_;
         }
     }
+    if (boundRegistry_ && cachedNativeHandle_.valid()) {
+        (void)boundRegistry_->release(cachedNativeHandle_);
+        cachedNativeHandle_ = {};
+    }
     boundRegistry_ = &registry;
     cachedNativeHandle_ = registry.createBorrowed(
         GetTypeClass()->rsSymbolId,
@@ -413,6 +463,7 @@ bool UIElement::BindScriptWrapper(
     if (!registry.setCachedWrapper(handle, wrapperRef, uiHeap.heapId())) {
         return false;
     }
+    pinnedWrapperRoot_.reset();
     UpdateWrapperPinState(&registry, &uiHeap);
     return true;
 }
@@ -612,17 +663,19 @@ void UIElement::SetRenderTransform(const Matrix2D& matrix) {
 Matrix2D UIElement::GetRenderTransform() const noexcept {
     Matrix2D m = Matrix2D::Identity();
     if (const auto* lin = FindCompactEntry(PropId_RenderTransform)) {
-        if (const auto* f4 = std::get_if<Float4Value>(&lin->effectiveValue)) {
-            m.m00 = f4->x;
-            m.m01 = f4->y;
-            m.m10 = f4->z;
-            m.m11 = f4->w;
+        Float4Value f4{};
+        if (lin->effectiveValue.tryGetFloat4(f4)) {
+            m.m00 = f4.x;
+            m.m01 = f4.y;
+            m.m10 = f4.z;
+            m.m11 = f4.w;
         }
     }
     if (const auto* tr = FindCompactEntry(PropId_RenderTransformTranslation)) {
-        if (const auto* f4 = std::get_if<Float4Value>(&tr->effectiveValue)) {
-            m.tx = f4->x;
-            m.ty = f4->y;
+        Float4Value f4{};
+        if (tr->effectiveValue.tryGetFloat4(f4)) {
+            m.tx = f4.x;
+            m.ty = f4.y;
         }
     }
     return m;
@@ -643,11 +696,12 @@ void UIElement::SetLayoutTransform(const Matrix2D& matrix) {
 Matrix2D UIElement::GetLayoutTransform() const noexcept {
     Matrix2D m = Matrix2D::Identity();
     if (const auto* lt = FindCompactEntry(PropId_LayoutTransform)) {
-        if (const auto* f4 = std::get_if<Float4Value>(&lt->effectiveValue)) {
-            m.m00 = f4->x;
-            m.m01 = f4->y;
-            m.m10 = f4->z;
-            m.m11 = f4->w;
+        Float4Value f4{};
+        if (lt->effectiveValue.tryGetFloat4(f4)) {
+            m.m00 = f4.x;
+            m.m01 = f4.y;
+            m.m10 = f4.z;
+            m.m11 = f4.w;
         }
     }
     return m;
@@ -666,8 +720,9 @@ void UIElement::SetRenderTransformOrigin(Point origin) {
 
 Point UIElement::GetRenderTransformOrigin() const noexcept {
     if (const auto* orig = FindCompactEntry(PropId_RenderTransformOrigin)) {
-        if (const auto* f4 = std::get_if<Float4Value>(&orig->effectiveValue)) {
-            return Point{f4->x, f4->y};
+        Float4Value f4{};
+        if (orig->effectiveValue.tryGetFloat4(f4)) {
+            return Point{f4.x, f4.y};
         }
     }
     return Point{0.0f, 0.0f};
@@ -687,8 +742,9 @@ Matrix2D UIElement::ComputeLocalEffectiveTransform2DForRect(const Rect& r) const
 
     // 0. LayoutTransform (maps unrotated [r.x..r.x+w]x[r.y..r.y+h] into post-layout AABB [r.x..r.x+effBoxW]x[r.y..r.y+effBoxH])
     if (const auto* ltEntry = FindCompactEntry(PropId_LayoutTransform)) {
-        if (const auto* f4 = std::get_if<Float4Value>(&ltEntry->effectiveValue)) {
-            const Matrix2D lt{f4->x, f4->y, f4->z, f4->w, 0.0f, 0.0f};
+        Float4Value f4{};
+        if (ltEntry->effectiveValue.tryGetFloat4(f4)) {
+            const Matrix2D lt{f4.x, f4.y, f4.z, f4.w, 0.0f, 0.0f};
             if (!lt.IsIdentity()) {
                 const float minRelX = std::min(0.0f, lt.m00 * w) + std::min(0.0f, lt.m01 * h);
                 const float minRelY = std::min(0.0f, lt.m10 * w) + std::min(0.0f, lt.m11 * h);
@@ -723,33 +779,42 @@ Matrix2D UIElement::ComputeLocalEffectiveTransform2DForRect(const Rect& r) const
         eff = Matrix2D::Multiply(Matrix2D::Scaling(cosYaw, cosPitch, cx, cy), eff);
     }
 
-    // 2. Standard 2D Affine RenderTransform + Independent Phase 5C Animated Transform Channels
+    // 2. Standard 2D Affine RenderTransform + Independent Phase 5C/6 Animated Transform Channels (TRS + Skew)
     //    composed around normalized RenderTransformOrigin without double-scaling static translation!
     const bool hasRtLin = (FindCompactEntry(PropId_RenderTransform) != nullptr);
     const bool hasRtTrans = (FindCompactEntry(PropId_RenderTransformTranslation) != nullptr);
     const auto* sxEntry = FindCompactEntry(PropId_AnimScaleX);
     const auto* syEntry = FindCompactEntry(PropId_AnimScaleY);
+    const auto* skxEntry = FindCompactEntry(PropId_AnimSkewX);
+    const auto* skyEntry = FindCompactEntry(PropId_AnimSkewY);
     const auto* rotEntry = FindCompactEntry(PropId_AnimRotateAngle);
     const auto* txEntry = FindCompactEntry(PropId_AnimTranslateX);
     const auto* tyEntry = FindCompactEntry(PropId_AnimTranslateY);
-    const bool hasAnimTf = (sxEntry || syEntry || rotEntry || txEntry || tyEntry);
+    const bool hasAnimTf = (sxEntry || syEntry || skxEntry || skyEntry || rotEntry || txEntry || tyEntry);
 
     if (hasRtLin || hasRtTrans || hasAnimTf) {
         Matrix2D combinedRt = Matrix2D::Identity();
         if (hasAnimTf) {
             float animSx = 1.0f;
             float animSy = 1.0f;
+            float animSkx = 0.0f;
+            float animSky = 0.0f;
             float animDeg = 0.0f;
             float animTx = 0.0f;
             float animTy = 0.0f;
             if (sxEntry) (void)TryGetFloat(sxEntry->effectiveValue, animSx);
             if (syEntry) (void)TryGetFloat(syEntry->effectiveValue, animSy);
+            if (skxEntry) (void)TryGetFloat(skxEntry->effectiveValue, animSkx);
+            if (skyEntry) (void)TryGetFloat(skyEntry->effectiveValue, animSky);
             if (rotEntry) (void)TryGetFloat(rotEntry->effectiveValue, animDeg);
             if (txEntry) (void)TryGetFloat(txEntry->effectiveValue, animTx);
             if (tyEntry) (void)TryGetFloat(tyEntry->effectiveValue, animTy);
 
             if (std::fabs(animSx - 1.0f) > 1e-6f || std::fabs(animSy - 1.0f) > 1e-6f) {
                 combinedRt = Matrix2D::Multiply(Matrix2D::Scaling(animSx, animSy), combinedRt);
+            }
+            if (std::fabs(animSkx) > 1e-6f || std::fabs(animSky) > 1e-6f) {
+                combinedRt = Matrix2D::Multiply(Matrix2D::Skew(animSkx, animSky), combinedRt);
             }
             if (std::fabs(animDeg) > 1e-6f) {
                 combinedRt = Matrix2D::Multiply(Matrix2D::Rotation(animDeg), combinedRt);
@@ -771,8 +836,9 @@ Matrix2D UIElement::ComputeLocalEffectiveTransform2DForRect(const Rect& r) const
 
     // 3. Legacy PropId_RenderTransformMatrix (Float4Value{sx, sy, tx, ty} around global origin)
     if (const auto* rtmEntry = FindCompactEntry(PropId_RenderTransformMatrix)) {
-        if (const auto* f4 = std::get_if<Float4Value>(&rtmEntry->effectiveValue)) {
-            const Matrix2D legacyM{f4->x, 0.0f, 0.0f, f4->y, f4->z, f4->w};
+        Float4Value f4{};
+        if (rtmEntry->effectiveValue.tryGetFloat4(f4)) {
+            const Matrix2D legacyM{f4.x, 0.0f, 0.0f, f4.y, f4.z, f4.w};
             eff = Matrix2D::Multiply(legacyM, eff);
         }
     }
@@ -887,8 +953,9 @@ void UIElement::Measure(Size availableSize) noexcept {
     Matrix2D lt = Matrix2D::Identity();
     bool hasLt = false;
     if (const auto* ltEntry = FindCompactEntry(PropId_LayoutTransform)) {
-        if (const auto* f4 = std::get_if<Float4Value>(&ltEntry->effectiveValue)) {
-            lt = Matrix2D{f4->x, f4->y, f4->z, f4->w, 0.0f, 0.0f};
+        Float4Value f4{};
+        if (ltEntry->effectiveValue.tryGetFloat4(f4)) {
+            lt = Matrix2D{f4.x, f4.y, f4.z, f4.w, 0.0f, 0.0f};
             hasLt = !lt.IsIdentity();
         }
     }
@@ -964,8 +1031,9 @@ void UIElement::Arrange(Rect finalRect) noexcept {
     Matrix2D lt = Matrix2D::Identity();
     bool hasLt = false;
     if (const auto* ltEntry = FindCompactEntry(PropId_LayoutTransform)) {
-        if (const auto* f4 = std::get_if<Float4Value>(&ltEntry->effectiveValue)) {
-            lt = Matrix2D{f4->x, f4->y, f4->z, f4->w, 0.0f, 0.0f};
+        Float4Value f4{};
+        if (ltEntry->effectiveValue.tryGetFloat4(f4)) {
+            lt = Matrix2D{f4.x, f4.y, f4.z, f4.w, 0.0f, 0.0f};
             hasLt = !lt.IsIdentity();
         }
     }
@@ -1333,6 +1401,14 @@ bool UIElement::SetValue(
             break;
     }
 
+    if (value.isTraceable()) {
+        rs_rt::pinValueInPools(value);
+        if (!registeredInValuePoolSet_) {
+            registeredInValuePoolSet_ = true;
+            LiveTraceableUIElementRegistry::Instance().Register(this);
+        }
+    }
+
     auto it = std::lower_bound(
         sparseProps_.begin(),
         sparseProps_.end(),
@@ -1429,6 +1505,13 @@ bool UIElement::ForceEffectiveValue(
                 PropId_LayoutTransform,
                 UnifiedValue{Float4Value{m.m00, m.m01, m.m10, m.m11}},
                 rank);
+        }
+    }
+    if (value.isTraceable()) {
+        rs_rt::pinValueInPools(value);
+        if (!registeredInValuePoolSet_) {
+            registeredInValuePoolSet_ = true;
+            LiveTraceableUIElementRegistry::Instance().Register(this);
         }
     }
     const auto rawRank = static_cast<std::uint8_t>(rank);
@@ -1659,6 +1742,63 @@ bool UIElement::SetPropertyMetadata(
     return true;
 }
 
+bool UIElement::SetPropertyExtendedMetadata(
+    std::uint16_t propId,
+    std::uint16_t secondaryTrackId,
+    std::uint16_t contractInputSlot,
+    std::uint16_t blendWeightUnorm16,
+    std::uint16_t entryMetaFlags) {
+    if (IsFastInlinePropertyId(propId)) {
+        return false;
+    }
+    auto it = std::lower_bound(
+        sparseProps_.begin(),
+        sparseProps_.end(),
+        propId,
+        [](const CompactPropertyEntry& e, std::uint16_t id) {
+            return e.propId < id;
+        });
+    if (it != sparseProps_.end() && it->propId == propId) {
+        it->secondaryTrackId = secondaryTrackId;
+        it->contractInputSlot = contractInputSlot;
+        it->blendWeightUnorm16 = blendWeightUnorm16;
+        it->entryMetaFlags = entryMetaFlags;
+        return true;
+    }
+    CompactPropertyEntry entry{};
+    entry.propId = propId;
+    entry.sourceRank = static_cast<std::uint8_t>(ValueSourceRank::Default);
+    entry.secondaryTrackId = secondaryTrackId;
+    entry.contractInputSlot = contractInputSlot;
+    entry.blendWeightUnorm16 = blendWeightUnorm16;
+    entry.entryMetaFlags = entryMetaFlags;
+    sparseProps_.insert(it, std::move(entry));
+    return true;
+}
+
+void UIElement::EnsureRegisteredInValuePoolSet() noexcept {
+    if (!registeredInValuePoolSet_) {
+        registeredInValuePoolSet_ = true;
+        LiveTraceableUIElementRegistry::Instance().Register(this);
+    }
+}
+
+void UIElement::MarkSparseValuesInPools() const noexcept {
+    for (const auto& entry : sparseProps_) {
+        if (entry.effectiveValue.isTraceable()) {
+            rs_rt::markValueInPools(entry.effectiveValue);
+        }
+    }
+    MarkExtraValuesInPools();
+}
+
+void UIElement::MarkSubtreeValuesInPools() const noexcept {
+    MarkSparseValuesInPools();
+    for (const UIElement* c = firstChild_; c != nullptr; c = c->nextSibling_) {
+        c->MarkSubtreeValuesInPools();
+    }
+}
+
 void Button::SetContentText(std::string_view text) {
     SetValue(PropId_Text, value::FromString(std::string(text)), ValueSourceRank::Local);
 }
@@ -1683,6 +1823,7 @@ bool Button::PerformClick(RuntimeError* error) {
     if (!IsEffectivelyEnabled()) {
         return false;
     }
+    IntrusivePtr<Button> selfGuard(this, true);
     ++clickGeneration_;
     if (clickCallback_) {
         clickCallback_(*this);

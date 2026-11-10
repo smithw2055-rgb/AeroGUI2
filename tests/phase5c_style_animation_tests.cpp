@@ -88,7 +88,7 @@ aero::Color ReadElemBg(const aero::UIElement* elem) noexcept {
 // 1. ABI Layout Invariants, animationTrackId Linkage & Zero-Allocation Steady State
 // ============================================================================
 void TestZeroAllocStyleTriggerAndAnimationSteadyState() {
-    static_assert(sizeof(aero::UnifiedValue) == 24, "UnifiedValue == 24B");
+    static_assert(sizeof(aero::UnifiedValue) == 16, "UnifiedValue == 16B");
     static_assert(sizeof(aero::Float4Value) == 16, "Float4Value == 16B");
     static_assert(sizeof(aero::CompactPropertyEntry) == 32, "CompactPropertyEntry == 32B");
     static_assert(sizeof(aero::FastInlineStorage) == 56, "FastInlineStorage == 56B");

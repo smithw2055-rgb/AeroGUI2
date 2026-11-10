@@ -5,6 +5,7 @@
 #include <string_view>
 #include <vector>
 
+#include "aero/compiler/AeroSceneIR.hpp"
 #include "aero/compiler/AxbFormat.hpp"
 #include "aero/core/RsAliases.hpp"
 #include "realscript/compiler/Compilation.h"
@@ -36,6 +37,7 @@ struct AeroCompileResult {
     bool succeeded = false;
     std::string generatedPartialRsPath;
     std::string generatedPartialRsCode;
+    AeroSceneGraphIR sceneIr{};
     AxbPackage axbPackage;
     std::vector<std::uint8_t> axbBytes;
     std::vector<rs_bc::Module> bytecodeModules;

@@ -386,6 +386,82 @@ float EvaluateMtsdfCoverage(
     return std::clamp(screenPxDistance + 0.5f, 0.0f, 1.0f);
 }
 
+std::uint16_t PackSdfRadialArcParams(
+    float startAngleDeg,
+    float sweepAngleDeg,
+    float innerRadiusRatio01) noexcept {
+    float normStart = std::fmod(startAngleDeg, 360.0f);
+    if (normStart < 0.0f) {
+        normStart += 360.0f;
+    }
+    const float clampedSweep = std::clamp(sweepAngleDeg, 0.0f, 360.0f);
+    const float clampedInner = std::clamp(innerRadiusRatio01, 0.0f, 0.9375f);
+    const auto qStart = static_cast<std::uint16_t>(
+        std::clamp(normStart * (64.0f / 360.0f) + 0.5f, 0.0f, 63.0f)) & 0x3Fu;
+    const auto qSweep = static_cast<std::uint16_t>(
+        std::clamp(clampedSweep * (63.0f / 360.0f) + 0.5f, 0.0f, 63.0f)) & 0x3Fu;
+    const auto qInner = static_cast<std::uint16_t>(
+        std::clamp(clampedInner * 16.0f + 0.5f, 0.0f, 15.0f)) & 0x0Fu;
+    return static_cast<std::uint16_t>(qStart | (qSweep << 6u) | (qInner << 12u));
+}
+
+void UnpackSdfRadialArcParams(
+    std::uint16_t packed,
+    float& outStartAngleDeg,
+    float& outSweepAngleDeg,
+    float& outInnerRadiusRatio01) noexcept {
+    outStartAngleDeg = static_cast<float>(packed & 0x3Fu) * (360.0f / 64.0f);
+    outSweepAngleDeg = static_cast<float>((packed >> 6u) & 0x3Fu) * (360.0f / 63.0f);
+    outInnerRadiusRatio01 = static_cast<float>((packed >> 12u) & 0x0Fu) * (1.0f / 16.0f);
+}
+
+float EvaluateSdfRadialArcCoverage(
+    float sampleLocalX,
+    float sampleLocalY,
+    float halfWidth,
+    float halfHeight,
+    float startAngleDeg,
+    float sweepAngleDeg,
+    float innerRadiusRatio01,
+    float aaFeatherWidth) noexcept {
+    if (sweepAngleDeg <= 0.01f) {
+        return 0.0f;
+    }
+    const float outerR = std::max(1.0f, std::min(halfWidth, halfHeight));
+    const float innerR = std::clamp(innerRadiusRatio01, 0.0f, 0.95f) * outerR;
+    const float midR = 0.5f * (outerR + innerR);
+    const float halfThick = std::max(0.5f, 0.5f * (outerR - innerR));
+
+    float signedDist = 0.0f;
+    if (sweepAngleDeg >= 359.0f) {
+        const float r = std::sqrt(sampleLocalX * sampleLocalX + sampleLocalY * sampleLocalY);
+        signedDist = std::fabs(r - midR) - halfThick;
+    } else {
+        constexpr float kDegToRad = 3.1415926535f / 180.0f;
+        const float midAngleRad = (startAngleDeg + 0.5f * sweepAngleDeg) * kDegToRad;
+        const float halfSweepRad = std::clamp(0.5f * sweepAngleDeg * kDegToRad, 0.001f, 3.14159265f);
+        const float csMid = std::cos(midAngleRad);
+        const float snMid = std::sin(midAngleRad);
+        // Rotate sample point by -midAngleRad so the arc is symmetric about +X axis
+        const float rx = sampleLocalX * csMid + sampleLocalY * snMid;
+        const float ry = std::fabs(-sampleLocalX * snMid + sampleLocalY * csMid);
+        const float scX = std::cos(halfSweepRad);
+        const float scY = std::sin(halfSweepRad);
+        if (scY * rx > scX * ry) {
+            const float len = std::sqrt(rx * rx + ry * ry);
+            signedDist = std::fabs(len - midR) - halfThick;
+        } else {
+            const float dx = rx - scX * midR;
+            const float dy = ry - scY * midR;
+            signedDist = std::sqrt(dx * dx + dy * dy) - halfThick;
+        }
+    }
+
+    const float feather = std::max(aaFeatherWidth, 0.001f);
+    const float t = std::clamp(0.5f - (signedDist / feather), 0.0f, 1.0f);
+    return t * t * (3.0f - 2.0f * t);
+}
+
 PagedRenderTree::PagedRenderTree()
     : treeId_(gNextRenderTreeId.fetch_add(1u, std::memory_order_relaxed)) {
     InitPreCachedDigitGlyphs();
@@ -566,7 +642,8 @@ void PagedRenderTree::WriteQuadVertices(RenderNodeDescriptor& node) noexcept {
     float vMin = node.uv0Y;
     float uMax = node.uv1X;
     float vMax = node.uv1Y;
-    if (node.primType == AeroPrimType::SdfRoundedRect) {
+    if (node.primType == AeroPrimType::SdfRoundedRect ||
+        node.primType == AeroPrimType::SdfRadialArc) {
         uMin = -w * 0.5f;
         vMin = -h * 0.5f;
         uMax = w * 0.5f;
@@ -801,6 +878,65 @@ std::uint32_t PagedRenderTree::AllocateTexturedNode(
     WriteQuadVertices(nodes_.back());
     MarkPageDirty(pageIdx, vOffset);
     return nodeId;
+}
+
+std::uint32_t PagedRenderTree::AllocateRadialArcNode(
+    float x,
+    float y,
+    float width,
+    float height,
+    float startAngleDeg,
+    float sweepAngleDeg,
+    float innerRadiusRatio01,
+    const Color& color,
+    float opacity,
+    const UIElement* owner) {
+    const std::uint32_t pageIdx = EnsurePageForAllocation(4u, activeClipRect_, activeClipEnabled_);
+    CommandPage& page = pages_[pageIdx];
+    const auto vOffset = static_cast<std::uint16_t>(page.header.vertexCount);
+    page.header.vertexCount += 4u;
+    page.header.nodeCount += 1u;
+
+    const auto nodeId = static_cast<std::uint32_t>(nodes_.size());
+    RenderNodeDescriptor desc{};
+    desc.nodeId = nodeId;
+    desc.pageIndex = pageIdx;
+    desc.vertexOffsetInPage = vOffset;
+    desc.vertexCount = 4u;
+    desc.primType = AeroPrimType::SdfRadialArc;
+    desc.encodedSdfParams = PackSdfRadialArcParams(startAngleDeg, sweepAngleDeg, innerRadiusRatio01);
+    desc.x = x;
+    desc.y = y;
+    desc.width = width;
+    desc.height = height;
+    desc.opacity = opacity;
+    desc.baseRgba = PackColorRgba8(color, 1.0f);
+    desc.sourceElement = owner;
+
+    nodes_.push_back(desc);
+    WriteQuadVertices(nodes_.back());
+    MarkPageDirty(pageIdx, vOffset);
+    return nodeId;
+}
+
+bool PagedRenderTree::UpdateRadialArcNode(
+    std::uint32_t nodeId,
+    float startAngleDeg,
+    float sweepAngleDeg,
+    float innerRadiusRatio01) noexcept {
+    if (nodeId >= nodes_.size()) {
+        return false;
+    }
+    RenderNodeDescriptor& node = nodes_[nodeId];
+    const std::uint16_t packed = PackSdfRadialArcParams(startAngleDeg, sweepAngleDeg, innerRadiusRatio01);
+    if (node.primType == AeroPrimType::SdfRadialArc && node.encodedSdfParams == packed) {
+        return false;
+    }
+    node.primType = AeroPrimType::SdfRadialArc;
+    node.encodedSdfParams = packed;
+    WriteQuadVertices(node);
+    MarkPageDirty(node.pageIndex, node.vertexOffsetInPage);
+    return true;
 }
 
 std::uint32_t PagedRenderTree::AllocateHudBarBatch(
@@ -2388,9 +2524,29 @@ bool PagedRenderTree::SyncDirtySubtreeRecursive(
     }
 
     if (forceSubtreeSync || (flags & RenderDirty) != 0u) {
+        const std::uint32_t oldFirstId = elem->RenderNodeId();
+        const std::uint16_t oldSpan = elem->RenderNodeSpan();
+        const std::size_t oldNodeCount = nodes_.size();
+        const bool hadLaterNodes = (oldFirstId + oldSpan) < oldNodeCount;
         if (!UpdateElementInPlace(elem, curState)) {
             outNeedsFullRebuild = true;
             return false;
+        }
+        if (hadLaterNodes && elem->RenderNodeId() != oldFirstId && elem->RenderNodeId() < nodes_.size()) {
+            const RenderNodeDescriptor& newN = nodes_[elem->RenderNodeId()];
+            for (std::size_t laterIdx = static_cast<std::size_t>(oldFirstId) + oldSpan;
+                 laterIdx < oldNodeCount;
+                 ++laterIdx) {
+                const RenderNodeDescriptor& ln = nodes_[laterIdx];
+                if (ln.vertexCount == 0u || ln.width <= 0.0f || ln.height <= 0.0f) {
+                    continue;
+                }
+                if (ln.x < newN.x + newN.width && ln.x + ln.width > newN.x &&
+                    ln.y < newN.y + newN.height && ln.y + ln.height > newN.y) {
+                    outNeedsFullRebuild = true;
+                    return false;
+                }
+            }
         }
         ++ioUpdatedNodes;
         elem->ClearLayoutDirtyFlags(RenderDirty);

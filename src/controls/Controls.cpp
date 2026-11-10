@@ -1,5 +1,7 @@
 #include "aero/controls/Controls.hpp"
+#include "aero/animation/AnimationEngine.hpp"
 #include "aero/style/StyleTriggerEngine.hpp"
+#include "realscript/aot_cpp/AotRuntime.h"
 
 #include <algorithm>
 #include <cmath>
@@ -2798,7 +2800,10 @@ IntrusivePtr<UIElement> ItemsControl::InstantiateTemplatedItem(
     if (const auto* ref = std::get_if<ObjectRef>(&itemVal)) {
         itemObj = *ref;
     }
-    (void)MountAxbTemplate(created.Get(), tplPkg, domains_, bindingEngine_, itemObj);
+    AnimationEngine* effAnimEngine = animationEngine_
+        ? animationEngine_
+        : (bindingEngine_ ? bindingEngine_->GetAnimationEngine() : nullptr);
+    (void)MountAxbTemplate(created.Get(), tplPkg, domains_, bindingEngine_, itemObj, nullptr, nullptr, effAnimEngine);
     if (styleEngine_) {
         styleEngine_->RegisterPackageStyles(tplPkg);
         (void)styleEngine_->BindSubtreeStyles(created.Get());
@@ -2807,12 +2812,26 @@ IntrusivePtr<UIElement> ItemsControl::InstantiateTemplatedItem(
     return created;
 }
 
+void ItemsControl::MarkExtraValuesInPools() const noexcept {
+    for (const auto& item : items_) {
+        if (item.isTraceable()) {
+            rs_rt::markValueInPools(item);
+        }
+    }
+}
+
 void ItemsControl::RebuildAllMaterializedItems(NativeHandleRegistry* registry, ManagedHeap* uiHeap) {
     virtualSlots_.clear();
     firstRealizedIndex_ = 0u;
     realizedEndExclusive_ = items_.size();
 
+    AnimationEngine* effAnimEngine = animationEngine_
+        ? animationEngine_
+        : (bindingEngine_ ? bindingEngine_->GetAnimationEngine() : nullptr);
     while (UIElement* ch = FirstChild()) {
+        if (effAnimEngine) {
+            effAnimEngine->StopSubtreeAnimations(ch, false);
+        }
         if (bindingEngine_) {
             (void)bindingEngine_->UnbindSubtree(ch);
         }
@@ -2902,6 +2921,9 @@ void ItemsControl::SyncVirtualizedWindow(
                 }
             }
             // Custom itemGenerator without itemBinder or mismatched template: replace element cleanly
+            if (auto* animEng = animationEngine_ ? animationEngine_ : (bindingEngine_ ? bindingEngine_->GetAnimationEngine() : nullptr)) {
+                animEng->StopSubtreeAnimations(reused.Get(), false);
+            }
             if (bindingEngine_) {
                 (void)bindingEngine_->UnbindSubtree(reused.Get());
             }
@@ -2951,8 +2973,14 @@ void ItemsControl::SyncVirtualizedWindow(
     }
 
     // Remove any leftover surplus containers if viewport shrank
+    AnimationEngine* effAnimEngine = animationEngine_
+        ? animationEngine_
+        : (bindingEngine_ ? bindingEngine_->GetAnimationEngine() : nullptr);
     for (auto& surplus : recyclable) {
         if (surplus.element) {
+            if (effAnimEngine) {
+                effAnimEngine->StopSubtreeAnimations(surplus.element.Get(), false);
+            }
             if (bindingEngine_) {
                 (void)bindingEngine_->UnbindSubtree(surplus.element.Get());
             }
@@ -2995,14 +3023,36 @@ void ItemsControl::SetItemsSource(
         }
     }
     items_ = items;
+    bool hasTraceable = false;
+    for (const auto& item : items_) {
+        if (item.isTraceable()) {
+            rs_rt::pinValueInPools(item);
+            hasTraceable = true;
+        }
+    }
+    if (hasTraceable) {
+        EnsureRegisteredInValuePoolSet();
+    }
     estimatedMaxItemWidth_ = 80.0f;
 
     if (IsVirtualizing() && !IsA<ComboBox>()) {
         virtualSlots_.clear();
         firstRealizedIndex_ = 0u;
         realizedEndExclusive_ = 0u;
-        while (FirstChild()) {
-            RemoveChild(FirstChild(), registry, uiHeap);
+        AnimationEngine* effAnimEngine = animationEngine_
+            ? animationEngine_
+            : (bindingEngine_ ? bindingEngine_->GetAnimationEngine() : nullptr);
+        while (UIElement* ch = FirstChild()) {
+            if (effAnimEngine) {
+                effAnimEngine->StopSubtreeAnimations(ch, false);
+            }
+            if (bindingEngine_) {
+                (void)bindingEngine_->UnbindSubtree(ch);
+            }
+            if (styleEngine_) {
+                (void)styleEngine_->UnbindSubtreeStyles(ch);
+            }
+            RemoveChild(ch, registry, uiHeap);
         }
         InvalidateLayout();
         return;
@@ -3505,6 +3555,71 @@ AxbTemplateRegistry& AxbTemplateRegistry::Instance() noexcept {
     return instance;
 }
 
+AxbTemplateRegistry::AxbTemplateRegistry() noexcept {
+    rs_rt::registerExternalValuePoolRootMarker(
+        this,
+        [this]() noexcept {
+            MarkValuesInPools();
+        });
+}
+
+AxbTemplateRegistry::~AxbTemplateRegistry() {
+    rs_rt::unregisterExternalValuePoolRootMarker(this);
+}
+
+void AxbTemplateRegistry::MarkValuesInPools() const noexcept {
+    std::lock_guard<std::mutex> lock(mutex_);
+    for (const auto& kv : templates_) {
+        kv.second.MarkValuesInPools();
+    }
+    for (const auto& kv : resources_) {
+        if (kv.second.isTraceable()) {
+            rs_rt::markValueInPools(kv.second);
+        }
+    }
+    auto markStyle = [](const AxbStyleDefinition& st) noexcept {
+        for (const auto& s : st.setters) {
+            if (s.value.isTraceable()) rs_rt::markValueInPools(s.value);
+        }
+        for (const auto& tr : st.triggers) {
+            for (const auto& cond : tr.conditions) {
+                if (cond.expectedValue.isTraceable()) rs_rt::markValueInPools(cond.expectedValue);
+            }
+            for (const auto& s : tr.setters) {
+                if (s.value.isTraceable()) rs_rt::markValueInPools(s.value);
+            }
+        }
+        for (const auto& vsg : st.visualStateGroups) {
+            for (const auto& vs : vsg.states) {
+                for (const auto& s : vs.setters) {
+                    if (s.value.isTraceable()) rs_rt::markValueInPools(s.value);
+                }
+            }
+        }
+    };
+    for (const auto& kv : styles_) {
+        markStyle(kv.second);
+    }
+    for (const auto& kv : implicitStyles_) {
+        markStyle(kv.second);
+    }
+    for (const auto& kv : storyboards_) {
+        for (const auto& tl : kv.second.timelines) {
+            if (tl.fromValue.isTraceable()) rs_rt::markValueInPools(tl.fromValue);
+            if (tl.toValue.isTraceable()) rs_rt::markValueInPools(tl.toValue);
+            for (const auto& kf : tl.keyFrames) {
+                if (kf.value.isTraceable()) rs_rt::markValueInPools(kf.value);
+            }
+        }
+    }
+    for (const auto& kv : dataTemplates_) {
+        if (kv.second) kv.second->MarkValuesInPools();
+    }
+    for (const auto& kv : implicitDataTemplates_) {
+        if (kv.second) kv.second->MarkValuesInPools();
+    }
+}
+
 const AxbMtsdfPathEntry* AxbTemplateRegistry::InsertMtsdfPathLocked(AxbMtsdfPathEntry entry) {
     if (entry.pathHash == 0) {
         return nullptr;
@@ -3549,6 +3664,7 @@ const AxbMtsdfPathEntry* AxbTemplateRegistry::InsertMtsdfPathLocked(AxbMtsdfPath
 }
 
 void AxbTemplateRegistry::Register(std::string className, AxbPackage package) {
+    package.PinValuesInPools();
     std::lock_guard<std::mutex> lock(mutex_);
     for (const auto& kv : package.resources) {
         if (!kv.first.empty()) {
@@ -3608,6 +3724,7 @@ void AxbTemplateRegistry::Register(std::string className, AxbPackage package) {
 }
 
 void AxbTemplateRegistry::RegisterResources(const AxbPackage& package) {
+    package.PinValuesInPools();
     std::lock_guard<std::mutex> lock(mutex_);
     for (const auto& kv : package.resources) {
         if (!kv.first.empty()) {
@@ -3659,6 +3776,24 @@ void AxbTemplateRegistry::RegisterResources(const AxbPackage& package) {
 }
 
 void AxbTemplateRegistry::RegisterStyle(AxbStyleDefinition style) {
+    for (const auto& s : style.setters) {
+        if (s.value.isTraceable()) rs_rt::pinValueInPools(s.value);
+    }
+    for (const auto& tr : style.triggers) {
+        for (const auto& cond : tr.conditions) {
+            if (cond.expectedValue.isTraceable()) rs_rt::pinValueInPools(cond.expectedValue);
+        }
+        for (const auto& s : tr.setters) {
+            if (s.value.isTraceable()) rs_rt::pinValueInPools(s.value);
+        }
+    }
+    for (const auto& vsg : style.visualStateGroups) {
+        for (const auto& vs : vsg.states) {
+            for (const auto& s : vs.setters) {
+                if (s.value.isTraceable()) rs_rt::pinValueInPools(s.value);
+            }
+        }
+    }
     std::lock_guard<std::mutex> lock(mutex_);
     if (!style.key.empty()) {
         styles_[style.key] = std::move(style);
@@ -3670,6 +3805,13 @@ void AxbTemplateRegistry::RegisterStyle(AxbStyleDefinition style) {
 
 void AxbTemplateRegistry::RegisterStoryboard(AxbStoryboard storyboard) {
     if (!storyboard.key.empty()) {
+        for (const auto& tl : storyboard.timelines) {
+            if (tl.fromValue.isTraceable()) rs_rt::pinValueInPools(tl.fromValue);
+            if (tl.toValue.isTraceable()) rs_rt::pinValueInPools(tl.toValue);
+            for (const auto& kf : tl.keyFrames) {
+                if (kf.value.isTraceable()) rs_rt::pinValueInPools(kf.value);
+            }
+        }
         std::lock_guard<std::mutex> lock(mutex_);
         storyboards_[storyboard.key] = std::move(storyboard);
     }
@@ -3679,6 +3821,7 @@ void AxbTemplateRegistry::RegisterDataTemplate(AxbDataTemplate dataTemplate) {
     if (!dataTemplate.templatePackage) {
         return;
     }
+    dataTemplate.templatePackage->PinValuesInPools();
     std::lock_guard<std::mutex> lock(mutex_);
     if (!dataTemplate.key.empty()) {
         dataTemplates_[dataTemplate.key] = dataTemplate.templatePackage;
@@ -3773,6 +3916,9 @@ std::vector<AxbStoryboard> AxbTemplateRegistry::RegisteredStoryboards() const {
 
 void AxbTemplateRegistry::RegisterResource(std::string key, UnifiedValue value) {
     if (!key.empty()) {
+        if (value.isTraceable()) {
+            rs_rt::pinValueInPools(value);
+        }
         std::lock_guard<std::mutex> lock(mutex_);
         resources_[std::move(key)] = std::move(value);
     }
@@ -3829,7 +3975,8 @@ const AxbMtsdfPathEntry* AxbTemplateRegistry::FindOrBakeMtsdfPath(std::string_vi
             return &it->second;
         }
     }
-    AxbMtsdfPathEntry baked = BakeSvgPathToMtsdfEntry(pathData, 32u, 4.0f, 0u, 1024u);
+    const std::uint16_t adaptiveCell = SelectAdaptiveMtsdfCellSize(pathData);
+    AxbMtsdfPathEntry baked = BakeSvgPathToMtsdfEntry(pathData, adaptiveCell, 4.0f, 0u, 1024u);
     std::lock_guard<std::mutex> lock(mutex_);
     return InsertMtsdfPathLocked(std::move(baked));
 }
@@ -3844,7 +3991,8 @@ UserControl::UserControl(
     DualTrackBindingEngine* bindingEngine,
     ObjectRef dataContext,
     const Interpreter* eventInterpreter,
-    rs_aot::ExecutionContext* eventAotContext)
+    rs_aot::ExecutionContext* eventAotContext,
+    AnimationEngine* animationEngine)
     : controlClassName_(className) {
     EnsureControlTypesRegistered();
     if (const AxbPackage* pkg = AxbTemplateRegistry::Instance().Find(className)) {
@@ -3854,7 +4002,8 @@ UserControl::UserControl(
             bindingEngine,
             dataContext,
             eventInterpreter,
-            eventAotContext);
+            eventAotContext,
+            animationEngine);
     }
 }
 
@@ -3864,7 +4013,8 @@ bool UserControl::MountTemplate(
     DualTrackBindingEngine* bindingEngine,
     ObjectRef dataContext,
     const Interpreter* eventInterpreter,
-    rs_aot::ExecutionContext* eventAotContext) {
+    rs_aot::ExecutionContext* eventAotContext,
+    AnimationEngine* animationEngine) {
     templateMounted_ = MountAxbTemplate(
         this,
         package,
@@ -3872,7 +4022,8 @@ bool UserControl::MountTemplate(
         bindingEngine,
         dataContext,
         eventInterpreter,
-        eventAotContext);
+        eventAotContext,
+        animationEngine);
     return templateMounted_;
 }
 
@@ -3882,7 +4033,8 @@ Window::Window(
     DualTrackBindingEngine* bindingEngine,
     ObjectRef dataContext,
     const Interpreter* eventInterpreter,
-    rs_aot::ExecutionContext* eventAotContext)
+    rs_aot::ExecutionContext* eventAotContext,
+    AnimationEngine* animationEngine)
     : windowClassName_(className) {
     EnsureControlTypesRegistered();
     if (const AxbPackage* pkg = AxbTemplateRegistry::Instance().Find(className)) {
@@ -3892,7 +4044,8 @@ Window::Window(
             bindingEngine,
             dataContext,
             eventInterpreter,
-            eventAotContext);
+            eventAotContext,
+            animationEngine);
     }
 }
 
@@ -3902,7 +4055,8 @@ bool Window::MountTemplate(
     DualTrackBindingEngine* bindingEngine,
     ObjectRef dataContext,
     const Interpreter* eventInterpreter,
-    rs_aot::ExecutionContext* eventAotContext) {
+    rs_aot::ExecutionContext* eventAotContext,
+    AnimationEngine* animationEngine) {
     templateMounted_ = MountAxbTemplate(
         this,
         package,
@@ -3910,7 +4064,8 @@ bool Window::MountTemplate(
         bindingEngine,
         dataContext,
         eventInterpreter,
-        eventAotContext);
+        eventAotContext,
+        animationEngine);
     return templateMounted_;
 }
 
@@ -3993,9 +4148,13 @@ bool MountAxbTemplate(
     DualTrackBindingEngine* bindingEngine,
     ObjectRef dataContext,
     const Interpreter* eventInterpreter,
-    rs_aot::ExecutionContext* eventAotContext) {
+    rs_aot::ExecutionContext* eventAotContext,
+    AnimationEngine* animationEngine) {
     if (!rootControl) {
         return false;
+    }
+    if (!animationEngine && bindingEngine) {
+        animationEngine = bindingEngine->GetAnimationEngine();
     }
 
     if (!package.mtsdfPaths.empty()) {
@@ -4019,6 +4178,7 @@ bool MountAxbTemplate(
         dataContext.valid() ? dataContext : rootControl->BoundScriptWrapper();
 
     std::vector<UIElement*> elementStack;
+    std::vector<UIElement*> localElements;
     bool rootVisited = false;
 
     for (const auto& inst : package.instructions) {
@@ -4055,7 +4215,8 @@ bool MountAxbTemplate(
                             bindingEngine,
                             effectiveContext,
                             eventInterpreter,
-                            eventAotContext);
+                            eventAotContext,
+                            animationEngine);
                     } else {
                         createdChild = CreateElementByTypeName(typeName);
                     }
@@ -4068,6 +4229,7 @@ bool MountAxbTemplate(
                 if (auto* ic = currentElem ? currentElem->DynamicCast<ItemsControl>() : nullptr) {
                     ic->SetDomains(domains);
                     ic->SetBindingEngine(bindingEngine);
+                    ic->SetAnimationEngine(animationEngine);
                 }
 
                 if (currentElem && !elemName.empty()) {
@@ -4094,6 +4256,7 @@ bool MountAxbTemplate(
                 }
 
                 elementStack.push_back(currentElem);
+                localElements.push_back(currentElem);
                 break;
             }
 
@@ -4171,21 +4334,96 @@ bool MountAxbTemplate(
 
             case AxbOpcode::BindEvent: {
                 if (!elementStack.empty() && elementStack.back()) {
-                    if (auto* btn = elementStack.back()->DynamicCast<Button>()) {
-                        const ObjectRef targetObj = rootControl->BoundScriptWrapper().valid()
-                            ? rootControl->BoundScriptWrapper()
-                            : effectiveContext;
-                        if (targetObj.valid() && inst.symbolId != 0) {
+                    UIElement* elem = elementStack.back();
+                    const ObjectRef targetObj = rootControl->BoundScriptWrapper().valid()
+                        ? rootControl->BoundScriptWrapper()
+                        : effectiveContext;
+                    const SymbolId methodId = inst.symbolId;
+                    const bool isSimCommand = (inst.flags & 0x01u) != 0u;
+                    if (targetObj.valid() && methodId != 0) {
+                        auto invokeBoundHandler = [eventInterpreter, eventAotContext, domains, targetObj, methodId, isSimCommand](
+                                                      const UnifiedValue& argVal,
+                                                      bool hasArg) {
+                            if (isSimCommand && domains) {
+                                std::vector<UnifiedValue> payload;
+                                if (hasArg) {
+                                    payload.push_back(argVal);
+                                }
+                                domains->enqueueSimCommand(SimCommandEnvelope{
+                                    methodId,
+                                    targetObj,
+                                    std::move(payload),
+                                    0ULL});
+                            }
+                            if (eventInterpreter) {
+                                std::vector<UnifiedValue> args{targetObj};
+                                if (hasArg) {
+                                    args.push_back(argVal);
+                                }
+                                auto res = eventInterpreter->invoke(methodId, args);
+                                if (!res.succeeded &&
+                                    res.error.code == ErrorCode::InvalidArguments &&
+                                    res.statistics.instructionsExecuted == 0u &&
+                                    args.size() > 1u) {
+                                    args.resize(1u);
+                                    (void)eventInterpreter->invoke(methodId, args);
+                                }
+                            } else if (eventAotContext) {
+                                std::vector<UnifiedValue> args{targetObj};
+                                if (hasArg) {
+                                    args.push_back(argVal);
+                                }
+                                UnifiedValue ret{};
+                                if (!eventAotContext->invoke(
+                                        methodId, args.data(), args.size(), ret) &&
+                                    args.size() > 1u) {
+                                    (void)eventAotContext->invoke(
+                                        methodId, args.data(), 1u, ret);
+                                }
+                            }
+                        };
+
+                        if (auto* slider = elem->DynamicCast<Slider>()) {
+                            slider->SetValueChangedCallback(
+                                [invokeBoundHandler](Slider&, float val) {
+                                    invokeBoundHandler(MakeFloat(val), true);
+                                });
+                        } else if (auto* tb = elem->DynamicCast<TextBox>()) {
+                            tb->SetTextChangedCallback(
+                                [invokeBoundHandler](TextBox&, const std::string& text) {
+                                    invokeBoundHandler(value::FromString(text), true);
+                                });
+                        } else if (auto* combo = elem->DynamicCast<ComboBox>()) {
+                            combo->SetSelectionChangedCallback(
+                                [invokeBoundHandler](ComboBox&, std::int32_t idx) {
+                                    invokeBoundHandler(value::FromInt(idx), true);
+                                });
+                        } else if (auto* btn = elem->DynamicCast<Button>()) {
+                            if (isSimCommand && domains) {
+                                btn->SetClickCallback(
+                                    [domains, targetObj, methodId](Button& b) {
+                                        std::vector<UnifiedValue> payload;
+                                        const UnifiedValue cmdParam = b.GetValue(PropId_CommandParameter);
+                                        if (!std::holds_alternative<std::monostate>(cmdParam)) {
+                                            payload.push_back(cmdParam);
+                                        }
+                                        domains->enqueueSimCommand(SimCommandEnvelope{
+                                            methodId,
+                                            targetObj,
+                                            std::move(payload),
+                                            0ULL});
+                                    });
+                            }
                             if (eventInterpreter) {
                                 btn->BindScriptClickHandler(
                                     eventInterpreter,
                                     targetObj,
-                                    inst.symbolId);
+                                    methodId);
                             } else if (eventAotContext) {
                                 btn->BindAotClickHandler(
                                     eventAotContext,
                                     targetObj,
-                                    inst.symbolId);
+                                    methodId);
                             }
                         }
                     }
@@ -4235,6 +4473,14 @@ bool MountAxbTemplate(
                 break;
             }
         }
+    }
+
+    if (rootVisited && animationEngine && package.HasMotionSection()) {
+        animationEngine->InstantiatePackageMotion(
+            rootControl,
+            localElements.data(),
+            localElements.size(),
+            package);
     }
 
     return rootVisited;

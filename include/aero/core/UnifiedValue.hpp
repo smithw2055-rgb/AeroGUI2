@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -13,11 +14,13 @@
 
 namespace aero {
 
-// P0-2: Directly alias RealScript's 24-byte Value variant (via RsAliases.hpp) to avoid
-// custom struct layout conflicts at offset 16 (std::variant index discriminator).
+// RealScript RuntimeAbiMajor = 2: Directly alias RealScript's 16-byte alignas(16) Value.
 static_assert(
-    sizeof(UnifiedValue) == 24,
-    "UnifiedValue must remain exactly 24 bytes across C++ and RealScript ABI");
+    sizeof(UnifiedValue) == 16,
+    "UnifiedValue must remain exactly 16 bytes across C++ and RealScript ABI v2.0");
+static_assert(
+    alignof(UnifiedValue) == 16,
+    "UnifiedValue must remain 16-byte aligned across C++ and RealScript ABI v2.0");
 static_assert(
     std::is_trivially_copyable_v<Float4Value>,
     "Float4Value payload must be trivially copyable");
@@ -308,13 +311,36 @@ struct CornerRadius {
     return FloatValue{v};
 }
 
+// Rounds the 4th component w to top 24 bits of IEEE-754 float (sign + 8-bit exp + top 15-bit mantissa,
+// clearing low 8 mantissa bits) so that Value::storeFloat4 100% hits ValueTag::Float4Inline (zero pool alloc,
+// zero mutex lock, zero GC trace overhead) during high-frequency Color/CornerRadius/Thickness animations.
+[[nodiscard]] inline UnifiedValue MakeFloat4InlineFast(Float4Value v) noexcept {
+    std::uint32_t wBits = 0;
+    std::memcpy(&wBits, &v.w, sizeof(wBits));
+    if ((wBits & 0xFFu) != 0u) {
+        if ((wBits & 0x7F800000u) != 0x7F800000u) {
+            const std::uint32_t roundBias = 0x7Fu + ((wBits >> 8u) & 1u);
+            wBits = (wBits + roundBias) & ~0xFFu;
+            std::memcpy(&v.w, &wBits, sizeof(v.w));
+        } else {
+            wBits &= ~0xFFu;
+            std::memcpy(&v.w, &wBits, sizeof(v.w));
+        }
+    }
+    return UnifiedValue{v};
+}
+
+[[nodiscard]] inline UnifiedValue MakeFloat4InlineFast(float x, float y, float z, float w) noexcept {
+    return MakeFloat4InlineFast(Float4Value{x, y, z, w});
+}
+
 [[nodiscard]] inline bool TryGetFloat(const UnifiedValue& v, float& out) noexcept {
-    if (const auto* f = std::get_if<FloatValue>(&v)) {
-        out = f->value;
+    if (v.tryGetFloat(out)) {
         return true;
     }
-    if (const auto* i = std::get_if<std::int64_t>(&v)) {
-        out = static_cast<float>(*i);
+    std::int64_t i = 0;
+    if (v.tryGetInt64(i)) {
+        out = static_cast<float>(i);
         return true;
     }
     return false;
@@ -336,6 +362,10 @@ namespace value {
 
 [[nodiscard]] inline UnifiedValue MakeFloat(float v) noexcept {
     return FloatValue{v};
+}
+
+[[nodiscard]] inline UnifiedValue MakeFloat4InlineFast(Float4Value v) noexcept {
+    return ::aero::MakeFloat4InlineFast(v);
 }
 
 [[nodiscard]] inline UnifiedValue FromFloat(float v) noexcept {
@@ -379,37 +409,42 @@ namespace value {
 }
 
 [[nodiscard]] inline std::optional<Color> TryGetColor(const UnifiedValue& v) noexcept {
-    if (const auto* f4 = std::get_if<Float4Value>(&v)) {
-        return Color::FromFloat4(*f4);
+    Float4Value f4{};
+    if (v.tryGetFloat4(f4)) {
+        return Color::FromFloat4(f4);
     }
     return std::nullopt;
 }
 
 [[nodiscard]] inline std::optional<Point> TryGetPoint(const UnifiedValue& v) noexcept {
-    if (const auto* f4 = std::get_if<Float4Value>(&v)) {
-        return Point::FromFloat4(*f4);
+    Float4Value f4{};
+    if (v.tryGetFloat4(f4)) {
+        return Point::FromFloat4(f4);
     }
     return std::nullopt;
 }
 
 [[nodiscard]] inline std::optional<Rect> TryGetRect(const UnifiedValue& v) noexcept {
-    if (const auto* f4 = std::get_if<Float4Value>(&v)) {
-        return Rect::FromFloat4(*f4);
+    Float4Value f4{};
+    if (v.tryGetFloat4(f4)) {
+        return Rect::FromFloat4(f4);
     }
     return std::nullopt;
 }
 
 [[nodiscard]] inline std::optional<Thickness> TryGetThickness(const UnifiedValue& v) noexcept {
-    if (const auto* f4 = std::get_if<Float4Value>(&v)) {
-        return Thickness::FromFloat4(*f4);
+    Float4Value f4{};
+    if (v.tryGetFloat4(f4)) {
+        return Thickness::FromFloat4(f4);
     }
     return std::nullopt;
 }
 
 [[nodiscard]] inline std::optional<CornerRadius> TryGetCornerRadius(
     const UnifiedValue& v) noexcept {
-    if (const auto* f4 = std::get_if<Float4Value>(&v)) {
-        return CornerRadius::FromFloat4(*f4);
+    Float4Value f4{};
+    if (v.tryGetFloat4(f4)) {
+        return CornerRadius::FromFloat4(f4);
     }
     return std::nullopt;
 }

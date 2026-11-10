@@ -505,6 +505,1218 @@ bool AeroCompiler::BindPackageAgainstProgram(
     return package.BindAgainstProgram(program, rootDataTypeName, domains);
 }
 
+namespace {
+
+void PopulateSceneIrFromPackage(
+    const AxbPackage& pkg,
+    FrontendSourceFormat format,
+    std::string_view sourcePath,
+    AeroSceneGraphIR& outIr) {
+    outIr = AeroSceneGraphIR{};
+    outIr.sourceFormat = format;
+    outIr.sourcePath = std::string(sourcePath);
+    outIr.className = pkg.className;
+    outIr.loweredPackage = pkg;
+
+    std::vector<std::uint32_t> parentStack;
+    for (const auto& inst : pkg.instructions) {
+        if (inst.opcode == AxbOpcode::BeginElement) {
+            IrSceneNode node{};
+            node.localElementIdx = static_cast<std::uint32_t>(outIr.nodes.size());
+            node.parentElementIdx = parentStack.empty() ? 0xFFFFFFFFu : parentStack.back();
+            node.typeName = std::string(pkg.GetString(inst.strIdx0));
+            node.name = std::string(pkg.GetString(inst.strIdx1));
+            if (!parentStack.empty() && parentStack.back() < outIr.nodes.size()) {
+                outIr.nodes[parentStack.back()].childIndices.push_back(node.localElementIdx);
+            }
+            parentStack.push_back(node.localElementIdx);
+            outIr.nodes.push_back(std::move(node));
+        } else if (inst.opcode == AxbOpcode::EndElement) {
+            if (!parentStack.empty()) {
+                parentStack.pop_back();
+            }
+        } else if (inst.opcode == AxbOpcode::SetStaticProperty && !parentStack.empty()) {
+            IrSceneNode& cur = outIr.nodes[parentStack.back()];
+            cur.staticProperties.emplace_back(inst.propId, inst.literalValue);
+            if (inst.propId == PropId_Width) {
+                (void)TryGetFloat(inst.literalValue, cur.width);
+            } else if (inst.propId == PropId_Height) {
+                (void)TryGetFloat(inst.literalValue, cur.height);
+            } else if (inst.propId == PropId_AnimTranslateX || inst.propId == PropId_CanvasLeft) {
+                (void)TryGetFloat(inst.literalValue, cur.translateX);
+            } else if (inst.propId == PropId_AnimTranslateY || inst.propId == PropId_CanvasTop) {
+                (void)TryGetFloat(inst.literalValue, cur.translateY);
+            } else if (inst.propId == PropId_AnimScaleX) {
+                (void)TryGetFloat(inst.literalValue, cur.scaleX);
+            } else if (inst.propId == PropId_AnimScaleY) {
+                (void)TryGetFloat(inst.literalValue, cur.scaleY);
+            } else if (inst.propId == PropId_AnimRotateAngle) {
+                (void)TryGetFloat(inst.literalValue, cur.rotateDeg);
+            } else if (inst.propId == PropId_AnimSkewX) {
+                (void)TryGetFloat(inst.literalValue, cur.skewXDeg);
+            } else if (inst.propId == PropId_AnimSkewY) {
+                (void)TryGetFloat(inst.literalValue, cur.skewYDeg);
+            } else if (inst.propId == PropId_Opacity) {
+                (void)TryGetFloat(inst.literalValue, cur.opacity);
+            } else if (inst.propId == PropId_PathData) {
+                if (const auto* sv = std::get_if<StringValue>(&inst.literalValue)) {
+                    cur.svgPathData = std::string(sv->view());
+                }
+            }
+        }
+    }
+
+    if (!outIr.nodes.empty()) {
+        outIr.designWidth = outIr.nodes[0].width > 0.0f ? outIr.nodes[0].width : 256.0f;
+        outIr.designHeight = outIr.nodes[0].height > 0.0f ? outIr.nodes[0].height : 256.0f;
+    }
+
+    for (const auto& mp : pkg.mtsdfPaths) {
+        IrVectorShapeAsset shape{};
+        shape.pathHash = mp.pathHash;
+        shape.adaptiveCellSize = mp.cellWidth;
+        shape.pxRange = mp.pxRange;
+        outIr.vectorShapes.push_back(std::move(shape));
+    }
+
+    for (std::size_t ciIdx = 0; ciIdx < pkg.contractInputs.size(); ++ciIdx) {
+        const auto& cp = pkg.contractInputs[ciIdx];
+        IrContractPort port{};
+        port.name = std::string(pkg.GetString(cp.nameStrIdx));
+        port.direction = cp.isTrigger ? IrContractPortDirection::OutputTrigger : IrContractPortDirection::Input;
+        port.valueType = cp.isTrigger ? IrContractPortValueType::Trigger
+                                      : static_cast<IrContractPortValueType>(cp.valueKind);
+        port.assignedPropId = (cp.bridgePropId != 0xFFFFu)
+            ? cp.bridgePropId
+            : static_cast<std::uint16_t>(PropId_FirstContractInput + ciIdx);
+        port.smInputIndex = static_cast<std::uint16_t>(ciIdx);
+        port.defaultValue = cp.defaultValue;
+        (void)TryGetFloat(cp.defaultValue, port.defaultFloat);
+        outIr.contractPorts.push_back(std::move(port));
+    }
+}
+
+void EmitDecomposedSvgMatrixInstructions(const Matrix2D& m, AxbPackage& pkg) {
+    const DecomposedTransform2D d = PolarDecomposeMatrix2D(m);
+    auto pushFloatProp = [&](std::uint16_t propId, float v) {
+        AxbInstruction inst{};
+        inst.opcode = AxbOpcode::SetStaticProperty;
+        inst.propId = propId;
+        inst.literalValue = MakeFloat(v);
+        pkg.instructions.push_back(std::move(inst));
+    };
+    if (std::fabs(d.translateX) > 1e-4f) pushFloatProp(PropId_AnimTranslateX, d.translateX);
+    if (std::fabs(d.translateY) > 1e-4f) pushFloatProp(PropId_AnimTranslateY, d.translateY);
+    if (std::fabs(d.rotateDeg) > 1e-4f) pushFloatProp(PropId_AnimRotateAngle, d.rotateDeg);
+    if (std::fabs(d.scaleX - 1.0f) > 1e-4f) pushFloatProp(PropId_AnimScaleX, d.scaleX);
+    if (std::fabs(d.scaleY - 1.0f) > 1e-4f) pushFloatProp(PropId_AnimScaleY, d.scaleY);
+    if (std::fabs(d.skewXDeg) > 1e-4f) pushFloatProp(PropId_AnimSkewX, d.skewXDeg);
+    if (std::fabs(d.skewYDeg) > 1e-4f) pushFloatProp(PropId_AnimSkewY, d.skewYDeg);
+}
+
+Matrix2D ParseSvgTransformAttr(std::string_view raw) noexcept {
+    raw = Trim(raw);
+    if (raw.rfind("matrix(", 0) == 0 && raw.back() == ')') {
+        return ParseXamlMatrix2DLiteral(raw.substr(7, raw.size() - 8));
+    }
+    if (raw.rfind("translate(", 0) == 0 && raw.back() == ')') {
+        const auto inner = raw.substr(10, raw.size() - 11);
+        const std::size_t sep = inner.find_first_of(", ");
+        const float tx = ParseFloat32(sep == std::string_view::npos ? inner : inner.substr(0, sep), 0.0f);
+        const float ty = sep == std::string_view::npos ? 0.0f : ParseFloat32(Trim(inner.substr(sep + 1)), 0.0f);
+        return Matrix2D::Translation(tx, ty);
+    }
+    if (raw.rfind("scale(", 0) == 0 && raw.back() == ')') {
+        const auto inner = raw.substr(6, raw.size() - 7);
+        const std::size_t sep = inner.find_first_of(", ");
+        const float sx = ParseFloat32(sep == std::string_view::npos ? inner : inner.substr(0, sep), 1.0f);
+        const float sy = sep == std::string_view::npos ? sx : ParseFloat32(Trim(inner.substr(sep + 1)), sx);
+        return Matrix2D::Scaling(sx, sy);
+    }
+    if (raw.rfind("rotate(", 0) == 0 && raw.back() == ')') {
+        const auto inner = raw.substr(7, raw.size() - 8);
+        return Matrix2D::Rotation(ParseFloat32(inner, 0.0f));
+    }
+    return Matrix2D::Identity();
+}
+
+// Simple JSON token helpers for Lottie & Rive structured JSON/RIV descriptions
+std::string_view FindJsonFieldValue(std::string_view obj, std::string_view key) noexcept {
+    const std::string pattern = "\"" + std::string(key) + "\"";
+    int depth = 0;
+    for (std::size_t i = 0; i < obj.size(); ++i) {
+        const char c = obj[i];
+        if (c == '\"') {
+            std::size_t endQuote = i + 1;
+            while (endQuote < obj.size() && !(obj[endQuote] == '\"' && obj[endQuote - 1] != '\\')) {
+                ++endQuote;
+            }
+            if (endQuote >= obj.size()) break;
+            if (depth <= 1 && (endQuote - i + 1) == pattern.size() &&
+                obj.substr(i, pattern.size()) == pattern) {
+                std::size_t pos = endQuote + 1;
+                while (pos < obj.size() && std::isspace(static_cast<unsigned char>(obj[pos]))) {
+                    ++pos;
+                }
+                if (pos < obj.size() && obj[pos] == ':') {
+                    ++pos;
+                    while (pos < obj.size() && std::isspace(static_cast<unsigned char>(obj[pos]))) {
+                        ++pos;
+                    }
+                    if (pos >= obj.size()) return {};
+                    const char startChar = obj[pos];
+                    if (startChar == '\"') {
+                        std::size_t valEnd = pos + 1;
+                        while (valEnd < obj.size() && !(obj[valEnd] == '\"' && obj[valEnd - 1] != '\\')) {
+                            ++valEnd;
+                        }
+                        return obj.substr(pos + 1, valEnd - (pos + 1));
+                    }
+                    if (startChar == '{' || startChar == '[') {
+                        const char closeChar = (startChar == '{') ? '}' : ']';
+                        int subDepth = 0;
+                        bool subStr = false;
+                        for (std::size_t j = pos; j < obj.size(); ++j) {
+                            if (obj[j] == '\"' && (j == pos || obj[j - 1] != '\\')) {
+                                subStr = !subStr;
+                                continue;
+                            }
+                            if (subStr) continue;
+                            if (obj[j] == startChar) ++subDepth;
+                            else if (obj[j] == closeChar) {
+                                --subDepth;
+                                if (subDepth == 0) return obj.substr(pos, j - pos + 1);
+                            }
+                        }
+                        return {};
+                    }
+                    std::size_t endVal = pos;
+                    while (endVal < obj.size() && obj[endVal] != ',' && obj[endVal] != '}' &&
+                           obj[endVal] != ']' && !std::isspace(static_cast<unsigned char>(obj[endVal]))) {
+                        ++endVal;
+                    }
+                    return obj.substr(pos, endVal - pos);
+                }
+            }
+            i = endQuote;
+            continue;
+        }
+        if (c == '{' || c == '[') {
+            ++depth;
+        } else if (c == '}' || c == ']') {
+            if (depth > 0) --depth;
+        }
+    }
+    return {};
+}
+
+std::vector<std::string_view> SplitJsonTopLevelArray(std::string_view arr) {
+    std::vector<std::string_view> items;
+    arr = Trim(arr);
+    if (arr.size() < 2 || arr.front() != '[' || arr.back() != ']') return items;
+    arr = Trim(arr.substr(1, arr.size() - 2));
+    int depth = 0;
+    bool inStr = false;
+    std::size_t itemStart = 0;
+    for (std::size_t i = 0; i < arr.size(); ++i) {
+        const char c = arr[i];
+        if (c == '\"' && (i == 0 || arr[i - 1] != '\\')) inStr = !inStr;
+        if (inStr) continue;
+        if (c == '{' || c == '[') ++depth;
+        else if (c == '}' || c == ']') {
+            if (depth > 0) --depth;
+        } else if (c == ',' && depth == 0) {
+            const auto piece = Trim(arr.substr(itemStart, i - itemStart));
+            if (!piece.empty()) items.push_back(piece);
+            itemStart = i + 1;
+        }
+    }
+    const auto tail = Trim(arr.substr(itemStart));
+    if (!tail.empty()) items.push_back(tail);
+    return items;
+}
+
+float ExtractFirstFloatFromJsonToken(std::string_view tok, float fallback) noexcept {
+    tok = Trim(tok);
+    if (tok.empty()) return fallback;
+    if (tok.front() == '[') {
+        auto elems = SplitJsonTopLevelArray(tok);
+        if (!elems.empty()) return ParseFloat32(elems[0], fallback);
+        return fallback;
+    }
+    return ParseFloat32(tok, fallback);
+}
+
+bool IsSvgAssetInput(std::string_view path, std::string_view content) noexcept {
+    if (path.size() >= 4 && EqualsIgnoreCase(path.substr(path.size() - 4), ".svg")) {
+        return true;
+    }
+    const std::string_view trimmed = Trim(content);
+    return trimmed.rfind("<svg", 0) == 0;
+}
+
+bool IsLottieAssetInput(std::string_view path, std::string_view content) noexcept {
+    if ((path.size() >= 5 && EqualsIgnoreCase(path.substr(path.size() - 5), ".json")) ||
+        (path.size() >= 7 && EqualsIgnoreCase(path.substr(path.size() - 7), ".lottie"))) {
+        const std::string_view trimmed = Trim(content);
+        if (!trimmed.empty() && trimmed.front() == '{' &&
+            trimmed.find("\"layers\"") != std::string_view::npos) {
+            return true;
+        }
+    }
+    const std::string_view trimmed = Trim(content);
+    return !trimmed.empty() && trimmed.front() == '{' &&
+           trimmed.find("\"fr\"") != std::string_view::npos &&
+           trimmed.find("\"layers\"") != std::string_view::npos;
+}
+
+bool IsRiveAssetInput(std::string_view path, std::string_view content) noexcept {
+    if (path.size() >= 4 && EqualsIgnoreCase(path.substr(path.size() - 4), ".riv")) {
+        return true;
+    }
+    const std::string_view trimmed = Trim(content);
+    if (trimmed.size() >= 4 && trimmed.substr(0, 4) == "RIVE") {
+        return true;
+    }
+    return !trimmed.empty() && trimmed.front() == '{' &&
+           trimmed.find("\"artboard\"") != std::string_view::npos &&
+           trimmed.find("\"stateMachines\"") != std::string_view::npos;
+}
+
+} // namespace
+
+bool SvgTokenFrontendImporter::ImportToSceneIR(
+    std::string_view sourcePath,
+    const std::uint8_t* rawBytes,
+    std::size_t byteLength,
+    AeroSceneGraphIR& outIr,
+    std::vector<std::string>& outDiagnostics) const {
+    if (!rawBytes || byteLength == 0) {
+        outDiagnostics.push_back("AERO_SVG_EMPTY: Empty SVG input");
+        return false;
+    }
+    const std::string_view src(reinterpret_cast<const char*>(rawBytes), byteLength);
+    AxbPackage pkg{};
+    pkg.InternString("");
+    pkg.rootTypeName = "Canvas";
+
+    float viewW = 256.0f;
+    float viewH = 256.0f;
+    std::unordered_set<std::uint64_t> bakedHashes;
+    bool rootEmitted = false;
+    std::size_t openContainers = 0u;
+
+    std::size_t pos = 0;
+    while (pos < src.size()) {
+        const std::size_t lt = src.find('<', pos);
+        if (lt == std::string_view::npos) break;
+        pos = lt + 1;
+        if (pos >= src.size()) break;
+        if (src.substr(pos, 3) == "!--") {
+            const std::size_t endC = src.find("-->", pos + 3);
+            pos = (endC == std::string_view::npos) ? src.size() : (endC + 3);
+            continue;
+        }
+        if (src[pos] == '?') {
+            const std::size_t endD = src.find("?>", pos + 1);
+            pos = (endD == std::string_view::npos) ? src.size() : (endD + 2);
+            continue;
+        }
+        if (src[pos] == '/') {
+            const std::size_t gt = src.find('>', pos + 1);
+            const std::string_view closeTag = StripXmlPrefix(Trim(src.substr(pos + 1, (gt == std::string_view::npos ? src.size() : gt) - (pos + 1))));
+            if ((closeTag == "svg" || closeTag == "g") && openContainers > 0u) {
+                AxbInstruction endInst{};
+                endInst.opcode = AxbOpcode::EndElement;
+                pkg.instructions.push_back(std::move(endInst));
+                --openContainers;
+            }
+            pos = (gt == std::string_view::npos) ? src.size() : (gt + 1);
+            continue;
+        }
+
+        std::size_t tagEnd = pos;
+        while (tagEnd < src.size() && !std::isspace(static_cast<unsigned char>(src[tagEnd])) &&
+               src[tagEnd] != '>' && src[tagEnd] != '/') {
+            ++tagEnd;
+        }
+        const std::string_view shortTag = StripXmlPrefix(src.substr(pos, tagEnd - pos));
+        pos = tagEnd;
+
+        std::vector<std::pair<std::string_view, std::string_view>> attrs;
+        bool selfClosing = false;
+        while (pos < src.size()) {
+            while (pos < src.size() && std::isspace(static_cast<unsigned char>(src[pos]))) ++pos;
+            if (pos >= src.size()) break;
+            if (src[pos] == '>') { ++pos; break; }
+            if (src.substr(pos, 2) == "/>") { selfClosing = true; pos += 2; break; }
+            const std::size_t aStart = pos;
+            while (pos < src.size() && src[pos] != '=' &&
+                   !std::isspace(static_cast<unsigned char>(src[pos])) &&
+                   src[pos] != '>' && src[pos] != '/') {
+                ++pos;
+            }
+            const std::string_view aName = src.substr(aStart, pos - aStart);
+            while (pos < src.size() && std::isspace(static_cast<unsigned char>(src[pos]))) ++pos;
+            std::string_view aVal;
+            if (pos < src.size() && src[pos] == '=') {
+                ++pos;
+                while (pos < src.size() && std::isspace(static_cast<unsigned char>(src[pos]))) ++pos;
+                if (pos < src.size() && (src[pos] == '\"' || src[pos] == '\'')) {
+                    const char q = src[pos++];
+                    const std::size_t vStart = pos;
+                    while (pos < src.size() && src[pos] != q) ++pos;
+                    aVal = src.substr(vStart, pos - vStart);
+                    if (pos < src.size() && src[pos] == q) ++pos;
+                }
+            }
+            if (!aName.empty()) attrs.emplace_back(aName, aVal);
+        }
+
+        if (shortTag == "svg") {
+            std::string_view elemId;
+            for (const auto& kv : attrs) {
+                if (kv.first == "x:Class") pkg.className = std::string(Trim(kv.second));
+                else if (kv.first == "id" || kv.first == "x:Name") elemId = Trim(kv.second);
+                else if (kv.first == "width") viewW = ParseFloat32(kv.second, viewW);
+                else if (kv.first == "height") viewH = ParseFloat32(kv.second, viewH);
+                else if (kv.first == "viewBox") {
+                    std::string_view vb = Trim(kv.second);
+                    float vals[4]{0.0f, 0.0f, viewW, viewH};
+                    for (int vi = 0; vi < 4 && !vb.empty(); ++vi) {
+                        const std::size_t sep = vb.find_first_of(", ");
+                        vals[vi] = ParseFloat32(sep == std::string_view::npos ? vb : vb.substr(0, sep), vals[vi]);
+                        if (sep == std::string_view::npos) break;
+                        vb = Trim(vb.substr(sep + 1));
+                    }
+                    if (vals[2] > 0.0f) viewW = vals[2];
+                    if (vals[3] > 0.0f) viewH = vals[3];
+                }
+            }
+            AxbInstruction beginRoot{};
+            beginRoot.opcode = AxbOpcode::BeginElement;
+            beginRoot.strIdx0 = pkg.InternString("Canvas");
+            beginRoot.strIdx1 = pkg.InternString(elemId);
+            pkg.instructions.push_back(std::move(beginRoot));
+
+            AxbInstruction wInst{AxbOpcode::SetStaticProperty, PropId_Width, 0, 0, 0, 0, MakeFloat(viewW)};
+            AxbInstruction hInst{AxbOpcode::SetStaticProperty, PropId_Height, 0, 0, 0, 0, MakeFloat(viewH)};
+            pkg.instructions.push_back(std::move(wInst));
+            pkg.instructions.push_back(std::move(hInst));
+            rootEmitted = true;
+            if (selfClosing) {
+                AxbInstruction endInst{};
+                endInst.opcode = AxbOpcode::EndElement;
+                pkg.instructions.push_back(std::move(endInst));
+            } else {
+                ++openContainers;
+            }
+            continue;
+        }
+
+        if (!rootEmitted) continue;
+
+        if (shortTag == "g") {
+            std::string_view gName;
+            Matrix2D gMat = Matrix2D::Identity();
+            bool hasMat = false;
+            float gOpacity = 1.0f;
+            for (const auto& kv : attrs) {
+                if (kv.first == "id" || kv.first == "x:Name") gName = Trim(kv.second);
+                else if (kv.first == "transform") { gMat = ParseSvgTransformAttr(kv.second); hasMat = true; }
+                else if (kv.first == "opacity") gOpacity = ParseFloat32(kv.second, 1.0f);
+            }
+            AxbInstruction beginG{};
+            beginG.opcode = AxbOpcode::BeginElement;
+            beginG.strIdx0 = pkg.InternString("Canvas");
+            beginG.strIdx1 = pkg.InternString(gName);
+            pkg.instructions.push_back(std::move(beginG));
+            if (!gName.empty()) {
+                pkg.namedControls.push_back(AxbNamedControlSlot{std::string(gName), "Canvas", 0, PropertySlotHandle::InvalidIndex});
+            }
+            if (std::fabs(gOpacity - 1.0f) > 1e-4f) {
+                pkg.instructions.push_back(AxbInstruction{AxbOpcode::SetStaticProperty, PropId_Opacity, 0, 0, 0, 0, MakeFloat(gOpacity)});
+            }
+            if (hasMat) {
+                EmitDecomposedSvgMatrixInstructions(gMat, pkg);
+            }
+            if (selfClosing) {
+                pkg.instructions.push_back(AxbInstruction{AxbOpcode::EndElement});
+            } else {
+                ++openContainers;
+            }
+            continue;
+        }
+
+        if (shortTag == "path") {
+            std::string_view pName;
+            std::string_view dPath;
+            std::string_view fillStr = "#FFFFFFFF";
+            std::string_view strokeStr;
+            float strokeW = 0.0f;
+            float opacity = 1.0f;
+            float pathW = viewW;
+            float pathH = viewH;
+            Matrix2D pMat = Matrix2D::Identity();
+            bool hasMat = false;
+
+            for (const auto& kv : attrs) {
+                if (kv.first == "id" || kv.first == "x:Name") pName = Trim(kv.second);
+                else if (kv.first == "d" || kv.first == "Data") dPath = Trim(kv.second);
+                else if (kv.first == "fill" || kv.first == "Fill") fillStr = Trim(kv.second);
+                else if (kv.first == "stroke" || kv.first == "Stroke") strokeStr = Trim(kv.second);
+                else if (kv.first == "stroke-width" || kv.first == "StrokeThickness") strokeW = ParseFloat32(kv.second, 0.0f);
+                else if (kv.first == "opacity" || kv.first == "Opacity") opacity = ParseFloat32(kv.second, 1.0f);
+                else if (kv.first == "width" || kv.first == "Width") pathW = ParseFloat32(kv.second, viewW);
+                else if (kv.first == "height" || kv.first == "Height") pathH = ParseFloat32(kv.second, viewH);
+                else if (kv.first == "transform") { pMat = ParseSvgTransformAttr(kv.second); hasMat = true; }
+            }
+
+            if (!dPath.empty()) {
+                const std::uint64_t h = ComputeSvgPathHash(dPath);
+                if (h != 0 && bakedHashes.insert(h).second) {
+                    const std::uint16_t adaptiveDim = SelectAdaptiveMtsdfCellSize(dPath);
+                    const auto slotIdx = static_cast<std::uint16_t>(pkg.mtsdfPaths.size());
+                    pkg.mtsdfPaths.push_back(BakeSvgPathToMtsdfEntry(dPath, adaptiveDim, 4.0f, slotIdx, 256u));
+                }
+            }
+
+            AxbInstruction beginP{};
+            beginP.opcode = AxbOpcode::BeginElement;
+            beginP.strIdx0 = pkg.InternString("Path");
+            beginP.strIdx1 = pkg.InternString(pName);
+            pkg.instructions.push_back(std::move(beginP));
+            if (!pName.empty()) {
+                pkg.namedControls.push_back(AxbNamedControlSlot{std::string(pName), "Path", 0, PropertySlotHandle::InvalidIndex});
+            }
+            pkg.instructions.push_back(AxbInstruction{AxbOpcode::SetStaticProperty, PropId_Width, 0, 0, 0, 0, MakeFloat(pathW)});
+            pkg.instructions.push_back(AxbInstruction{AxbOpcode::SetStaticProperty, PropId_Height, 0, 0, 0, 0, MakeFloat(pathH)});
+            pkg.instructions.push_back(AxbInstruction{AxbOpcode::SetStaticProperty, PropId_HorizontalAlignment, 0, 0, 0, 0, value::FromInt(1)});
+            pkg.instructions.push_back(AxbInstruction{AxbOpcode::SetStaticProperty, PropId_VerticalAlignment, 0, 0, 0, 0, value::FromInt(1)});
+            if (!dPath.empty()) {
+                pkg.instructions.push_back(AxbInstruction{AxbOpcode::SetStaticProperty, PropId_PathData, 0, 0, 0, 0, value::FromString(std::string(dPath))});
+            }
+            if (!fillStr.empty() && !EqualsIgnoreCase(fillStr, "none")) {
+                pkg.instructions.push_back(AxbInstruction{AxbOpcode::SetStaticProperty, PropId_Background, 0, 0, 0, 0, ParseBuiltinLiteralPropertyValue(PropId_Background, fillStr)});
+            }
+            if (!strokeStr.empty() && !EqualsIgnoreCase(strokeStr, "none")) {
+                pkg.instructions.push_back(AxbInstruction{AxbOpcode::SetStaticProperty, PropId_BorderBrush, 0, 0, 0, 0, ParseBuiltinLiteralPropertyValue(PropId_BorderBrush, strokeStr)});
+            }
+            if (strokeW > 0.0f) {
+                pkg.instructions.push_back(AxbInstruction{AxbOpcode::SetStaticProperty, PropId_BorderThickness, 0, 0, 0, 0, value::FromThickness(Thickness(strokeW))});
+            }
+            if (std::fabs(opacity - 1.0f) > 1e-4f) {
+                pkg.instructions.push_back(AxbInstruction{AxbOpcode::SetStaticProperty, PropId_Opacity, 0, 0, 0, 0, MakeFloat(opacity)});
+            }
+            if (hasMat) {
+                EmitDecomposedSvgMatrixInstructions(pMat, pkg);
+            }
+            pkg.instructions.push_back(AxbInstruction{AxbOpcode::EndElement});
+        }
+    }
+
+    while (openContainers > 0u) {
+        pkg.instructions.push_back(AxbInstruction{AxbOpcode::EndElement});
+        --openContainers;
+    }
+
+    if (!pkg.mtsdfPaths.empty()) {
+        PackMtsdfAtlasSkyline(pkg.mtsdfPaths, 256u);
+    }
+
+    PopulateSceneIrFromPackage(pkg, FrontendSourceFormat::SvgVectorToken, sourcePath, outIr);
+    return !pkg.instructions.empty();
+}
+
+bool LottieFrontendImporter::ImportToSceneIR(
+    std::string_view sourcePath,
+    const std::uint8_t* rawBytes,
+    std::size_t byteLength,
+    AeroSceneGraphIR& outIr,
+    std::vector<std::string>& outDiagnostics) const {
+    if (!rawBytes || byteLength == 0) {
+        outDiagnostics.push_back("AERO_LOTTIE_EMPTY: Empty Lottie JSON input");
+        return false;
+    }
+    const std::string_view json(reinterpret_cast<const char*>(rawBytes), byteLength);
+    const float fps = ParseFloat32(FindJsonFieldValue(json, "fr"), 60.0f);
+    const float inFrame = ParseFloat32(FindJsonFieldValue(json, "ip"), 0.0f);
+    const float outFrame = ParseFloat32(FindJsonFieldValue(json, "op"), 60.0f);
+    const float compW = ParseFloat32(FindJsonFieldValue(json, "w"), 256.0f);
+    const float compH = ParseFloat32(FindJsonFieldValue(json, "h"), 256.0f);
+    const std::string_view compName = FindJsonFieldValue(json, "nm");
+    const std::string_view classAttr = FindJsonFieldValue(json, "x:Class");
+    const float durationSec = std::max(0.001f, (outFrame - inFrame) / std::max(1.0f, fps));
+
+    AxbPackage pkg{};
+    pkg.InternString("");
+    pkg.rootTypeName = "Canvas";
+    if (!classAttr.empty()) {
+        pkg.className = std::string(classAttr);
+    }
+
+    // Root Canvas (localElementIdx = 0)
+    pkg.instructions.push_back(AxbInstruction{
+        AxbOpcode::BeginElement, 0, 0, pkg.InternString("Canvas"), pkg.InternString(compName), 0, {}});
+    pkg.instructions.push_back(AxbInstruction{AxbOpcode::SetStaticProperty, PropId_Width, 0, 0, 0, 0, MakeFloat(compW)});
+    pkg.instructions.push_back(AxbInstruction{AxbOpcode::SetStaticProperty, PropId_Height, 0, 0, 0, 0, MakeFloat(compH)});
+
+    AxbMotionClipDesc mainClip{};
+    mainClip.nameStrIdx = pkg.InternString(compName.empty() ? "LottieMain" : compName);
+    mainClip.durationSec = durationSec;
+    mainClip.firstTrackIdx = 0u;
+    mainClip.trackCount = 0u;
+    mainClip.isLooping = true;
+
+    struct LayerIndMap {
+        int lottieInd = -1;
+        int parentInd = -1;
+        std::uint32_t localElemIdx = 0u;
+    };
+    std::vector<LayerIndMap> layerMappings;
+    std::unordered_set<std::uint64_t> bakedHashes;
+
+    auto parseAnimOrStaticChannel = [&](std::string_view propObj,
+                                        std::uint32_t targetElemIdx,
+                                        std::uint16_t propId,
+                                        float scaleFactor,
+                                        float defaultStaticVal,
+                                        int componentIdx) -> float {
+        if (propObj.empty()) return defaultStaticVal;
+        const std::string_view aFlag = FindJsonFieldValue(propObj, "a");
+        const std::string_view kVal = FindJsonFieldValue(propObj, "k");
+        if (aFlag != "1") {
+            if (kVal.front() == '[') {
+                const auto comps = SplitJsonTopLevelArray(kVal);
+                if (static_cast<std::size_t>(componentIdx) < comps.size()) {
+                    return ParseFloat32(comps[static_cast<std::size_t>(componentIdx)], defaultStaticVal) * scaleFactor;
+                }
+            }
+            return ExtractFirstFloatFromJsonToken(kVal, defaultStaticVal) * scaleFactor;
+        }
+
+        const auto kfObjs = SplitJsonTopLevelArray(kVal);
+        if (kfObjs.empty()) return defaultStaticVal;
+
+        AxbMotionTrackDesc track{};
+        track.localElementIdx = static_cast<std::uint16_t>(targetElemIdx);
+        track.targetPropId = propId;
+        track.channelCount = 1u;
+        track.firstKeyframeIdx = static_cast<std::uint32_t>(pkg.motionKeyframes.size());
+
+        float firstVal = defaultStaticVal;
+        float prevEndVal = defaultStaticVal;
+        bool hasPrevEnd = false;
+        for (std::size_t ki = 0; ki < kfObjs.size(); ++ki) {
+            const std::string_view kfObj = kfObjs[ki];
+            const float tFrame = ParseFloat32(FindJsonFieldValue(kfObj, "t"), inFrame);
+            const std::string_view sArr = FindJsonFieldValue(kfObj, "s");
+            const std::string_view eArr = FindJsonFieldValue(kfObj, "e");
+            float val = hasPrevEnd ? prevEndVal : defaultStaticVal;
+            if (!sArr.empty()) {
+                if (sArr.front() == '[') {
+                    const auto comps = SplitJsonTopLevelArray(sArr);
+                    if (static_cast<std::size_t>(componentIdx) < comps.size()) {
+                        val = ParseFloat32(comps[static_cast<std::size_t>(componentIdx)], val) * scaleFactor;
+                    } else if (!comps.empty()) {
+                        val = ParseFloat32(comps[0], val) * scaleFactor;
+                    }
+                } else {
+                    val = ParseFloat32(sArr, val) * scaleFactor;
+                }
+            }
+            if (!eArr.empty()) {
+                if (eArr.front() == '[') {
+                    const auto comps = SplitJsonTopLevelArray(eArr);
+                    if (static_cast<std::size_t>(componentIdx) < comps.size()) {
+                        prevEndVal = ParseFloat32(comps[static_cast<std::size_t>(componentIdx)], val) * scaleFactor;
+                        hasPrevEnd = true;
+                    } else if (!comps.empty()) {
+                        prevEndVal = ParseFloat32(comps[0], val) * scaleFactor;
+                        hasPrevEnd = true;
+                    }
+                } else {
+                    prevEndVal = ParseFloat32(eArr, val) * scaleFactor;
+                    hasPrevEnd = true;
+                }
+            }
+            if (ki == 0) firstVal = val;
+
+            AxbFlatKeyframe kf{};
+            kf.timeSec = std::max(0.0f, (tFrame - inFrame) / std::max(1.0f, fps));
+            kf.value = Float4Value{val, 0.0f, 0.0f, 0.0f};
+            const std::string_view oObj = FindJsonFieldValue(kfObj, "o");
+            const std::string_view iObj = FindJsonFieldValue(kfObj, "i");
+            if (!oObj.empty() && !iObj.empty()) {
+                kf.interp = static_cast<std::uint8_t>(CurveInterpMode::CubicBezier);
+                const float bx1 = std::clamp(ExtractFirstFloatFromJsonToken(FindJsonFieldValue(oObj, "x"), 0.25f), 0.0f, 1.0f);
+                const float by1 = std::clamp(ExtractFirstFloatFromJsonToken(FindJsonFieldValue(oObj, "y"), 0.25f), -4.0f, 4.0f);
+                const float bx2 = std::clamp(ExtractFirstFloatFromJsonToken(FindJsonFieldValue(iObj, "x"), 0.75f), 0.0f, 1.0f);
+                const float by2 = std::clamp(ExtractFirstFloatFromJsonToken(FindJsonFieldValue(iObj, "y"), 0.75f), -4.0f, 4.0f);
+                kf.easeKindOrCtrlX1 = static_cast<std::uint8_t>(std::round(bx1 * 255.0f));
+                kf.easeModeOrCtrlX2 = static_cast<std::uint8_t>(std::round(bx2 * 255.0f));
+                kf.ctrlY1Fixed8 = static_cast<std::int16_t>(std::round(by1 * 256.0f));
+                kf.ctrlY2Fixed8 = static_cast<std::int16_t>(std::round(by2 * 256.0f));
+            } else {
+                kf.interp = static_cast<std::uint8_t>(CurveInterpMode::Linear);
+            }
+            pkg.motionKeyframes.push_back(std::move(kf));
+        }
+
+        track.keyframeCount = static_cast<std::uint32_t>(pkg.motionKeyframes.size()) - track.firstKeyframeIdx;
+        if (track.keyframeCount > 0u) {
+            pkg.motionTracks.push_back(std::move(track));
+            ++mainClip.trackCount;
+        }
+        return firstVal;
+    };
+
+    const std::string_view layersArr = FindJsonFieldValue(json, "layers");
+    const auto layerObjs = SplitJsonTopLevelArray(layersArr);
+    std::uint32_t nextLocalElemIdx = 1u;
+    for (const auto& layerObj : layerObjs) {
+        const std::string_view layerName = FindJsonFieldValue(layerObj, "nm");
+        const int ind = static_cast<int>(ParseFloat32(FindJsonFieldValue(layerObj, "ind"), -1.0f));
+        const int parentInd = static_cast<int>(ParseFloat32(FindJsonFieldValue(layerObj, "parent"), -1.0f));
+        const std::string_view dPath = FindJsonFieldValue(layerObj, "d");
+        const std::string_view fillHex = FindJsonFieldValue(layerObj, "fill");
+        const float lw = ParseFloat32(FindJsonFieldValue(layerObj, "w"), compW);
+        const float lh = ParseFloat32(FindJsonFieldValue(layerObj, "h"), compH);
+
+        const std::uint32_t elemIdx = nextLocalElemIdx++;
+        layerMappings.push_back(LayerIndMap{ind, parentInd, elemIdx});
+
+        const std::string_view elemType = dPath.empty() ? "Border" : "Path";
+        pkg.instructions.push_back(AxbInstruction{
+            AxbOpcode::BeginElement, 0, 0, pkg.InternString(elemType), pkg.InternString(layerName), 0, {}});
+        if (!layerName.empty()) {
+            pkg.namedControls.push_back(AxbNamedControlSlot{
+                std::string(layerName), std::string(elemType), 0, PropertySlotHandle::InvalidIndex});
+        }
+        pkg.instructions.push_back(AxbInstruction{AxbOpcode::SetStaticProperty, PropId_Width, 0, 0, 0, 0, MakeFloat(lw)});
+        pkg.instructions.push_back(AxbInstruction{AxbOpcode::SetStaticProperty, PropId_Height, 0, 0, 0, 0, MakeFloat(lh)});
+        pkg.instructions.push_back(AxbInstruction{AxbOpcode::SetStaticProperty, PropId_HorizontalAlignment, 0, 0, 0, 0, value::FromInt(1)});
+        pkg.instructions.push_back(AxbInstruction{AxbOpcode::SetStaticProperty, PropId_VerticalAlignment, 0, 0, 0, 0, value::FromInt(1)});
+
+        if (!dPath.empty()) {
+            const std::uint64_t h = ComputeSvgPathHash(dPath);
+            if (h != 0 && bakedHashes.insert(h).second) {
+                const std::uint16_t adaptiveDim = SelectAdaptiveMtsdfCellSize(dPath);
+                const auto slotIdx = static_cast<std::uint16_t>(pkg.mtsdfPaths.size());
+                pkg.mtsdfPaths.push_back(BakeSvgPathToMtsdfEntry(dPath, adaptiveDim, 4.0f, slotIdx, 256u));
+            }
+            pkg.instructions.push_back(AxbInstruction{
+                AxbOpcode::SetStaticProperty, PropId_PathData, 0, 0, 0, 0, value::FromString(std::string(dPath))});
+            if (!fillHex.empty()) {
+                pkg.instructions.push_back(AxbInstruction{
+                    AxbOpcode::SetStaticProperty, PropId_Background, 0, 0, 0, 0, ParseBuiltinLiteralPropertyValue(PropId_Background, fillHex)});
+            }
+        } else if (!fillHex.empty()) {
+            pkg.instructions.push_back(AxbInstruction{
+                AxbOpcode::SetStaticProperty, PropId_Background, 0, 0, 0, 0, ParseBuiltinLiteralPropertyValue(PropId_Background, fillHex)});
+        }
+
+        const std::string_view ksObj = FindJsonFieldValue(layerObj, "ks");
+        if (!ksObj.empty()) {
+            const float op = parseAnimOrStaticChannel(FindJsonFieldValue(ksObj, "o"), elemIdx, PropId_Opacity, 0.01f, 1.0f, 0);
+            const float rot = parseAnimOrStaticChannel(FindJsonFieldValue(ksObj, "r"), elemIdx, PropId_AnimRotateAngle, 1.0f, 0.0f, 0);
+            const float tx = parseAnimOrStaticChannel(FindJsonFieldValue(ksObj, "p"), elemIdx, PropId_AnimTranslateX, 1.0f, 0.0f, 0);
+            const float ty = parseAnimOrStaticChannel(FindJsonFieldValue(ksObj, "p"), elemIdx, PropId_AnimTranslateY, 1.0f, 0.0f, 1);
+            const float sx = parseAnimOrStaticChannel(FindJsonFieldValue(ksObj, "s"), elemIdx, PropId_AnimScaleX, 0.01f, 1.0f, 0);
+            const float sy = parseAnimOrStaticChannel(FindJsonFieldValue(ksObj, "s"), elemIdx, PropId_AnimScaleY, 0.01f, 1.0f, 1);
+            const float skx = parseAnimOrStaticChannel(FindJsonFieldValue(ksObj, "sk"), elemIdx, PropId_AnimSkewX, 1.0f, 0.0f, 0);
+
+            if (std::fabs(op - 1.0f) > 1e-4f)
+                pkg.instructions.push_back(AxbInstruction{AxbOpcode::SetStaticProperty, PropId_Opacity, 0, 0, 0, 0, MakeFloat(op)});
+            if (std::fabs(rot) > 1e-4f)
+                pkg.instructions.push_back(AxbInstruction{AxbOpcode::SetStaticProperty, PropId_AnimRotateAngle, 0, 0, 0, 0, MakeFloat(rot)});
+            if (std::fabs(tx) > 1e-4f)
+                pkg.instructions.push_back(AxbInstruction{AxbOpcode::SetStaticProperty, PropId_AnimTranslateX, 0, 0, 0, 0, MakeFloat(tx)});
+            if (std::fabs(ty) > 1e-4f)
+                pkg.instructions.push_back(AxbInstruction{AxbOpcode::SetStaticProperty, PropId_AnimTranslateY, 0, 0, 0, 0, MakeFloat(ty)});
+            if (std::fabs(sx - 1.0f) > 1e-4f)
+                pkg.instructions.push_back(AxbInstruction{AxbOpcode::SetStaticProperty, PropId_AnimScaleX, 0, 0, 0, 0, MakeFloat(sx)});
+            if (std::fabs(sy - 1.0f) > 1e-4f)
+                pkg.instructions.push_back(AxbInstruction{AxbOpcode::SetStaticProperty, PropId_AnimScaleY, 0, 0, 0, 0, MakeFloat(sy)});
+            if (std::fabs(skx) > 1e-4f)
+                pkg.instructions.push_back(AxbInstruction{AxbOpcode::SetStaticProperty, PropId_AnimSkewX, 0, 0, 0, 0, MakeFloat(skx)});
+        }
+
+        pkg.instructions.push_back(AxbInstruction{AxbOpcode::EndElement});
+    }
+
+    // Close Root Canvas
+    pkg.instructions.push_back(AxbInstruction{AxbOpcode::EndElement});
+
+    // Resolve Lottie `parent` layer indices into non-tree AxbTransformConstraintDesc records
+    for (const auto& lm : layerMappings) {
+        if (lm.parentInd >= 0) {
+            for (const auto& targetLm : layerMappings) {
+                if (targetLm.lottieInd == lm.parentInd && targetLm.localElemIdx != lm.localElemIdx) {
+                    AxbTransformConstraintDesc tc{};
+                    tc.childLocalElementIdx = static_cast<std::uint16_t>(lm.localElemIdx);
+                    tc.parentLocalElementIdx = static_cast<std::uint16_t>(targetLm.localElemIdx);
+                    pkg.transformConstraints.push_back(tc);
+                    break;
+                }
+            }
+        }
+    }
+
+    if (!pkg.mtsdfPaths.empty()) {
+        PackMtsdfAtlasSkyline(pkg.mtsdfPaths, 256u);
+    }
+
+    // Add MOT6 clip + default "Progress" contract input + playback state machine
+    pkg.motionClips.push_back(mainClip);
+
+    AxbContractInputDesc progressIn{};
+    progressIn.nameStrIdx = pkg.InternString("Progress");
+    progressIn.valueKind = 1u; // Float
+    progressIn.isTrigger = 0u;
+    progressIn.bridgePropId = PropId_FirstContractInput;
+    progressIn.defaultValue = MakeFloat(0.0f);
+    pkg.contractInputs.push_back(progressIn);
+
+    AxbSmState playState{};
+    playState.nameStrIdx = pkg.InternString("Playing");
+    playState.kind = SmStateKind::SingleClip;
+    playState.primaryClipIdx = 0u;
+    playState.speedMultiplier = 1.0f;
+    pkg.smStates.push_back(playState);
+
+    AxbSmState scrubState{};
+    scrubState.nameStrIdx = pkg.InternString("Scrub");
+    scrubState.kind = SmStateKind::ScrubbedClip;
+    scrubState.primaryClipIdx = 0u;
+    scrubState.progressInputSlot = 0u;
+    scrubState.speedMultiplier = 1.0f;
+    pkg.smStates.push_back(scrubState);
+
+    AxbSmLayerDesc layer{};
+    layer.nameStrIdx = pkg.InternString("MainLayer");
+    layer.blendMode = SmLayerBlendMode::Override;
+    layer.layerWeight = 1.0f;
+    layer.firstStateIdx = 0u;
+    layer.stateCount = 2u;
+    layer.entryStateIdx = 0u;
+    pkg.smLayers.push_back(layer);
+
+    AxbStateMachineDesc sm{};
+    sm.nameStrIdx = pkg.InternString("LottiePlayback");
+    sm.firstLayerIdx = 0u;
+    sm.layerCount = 1u;
+    pkg.stateMachines.push_back(sm);
+
+    PopulateSceneIrFromPackage(pkg, FrontendSourceFormat::LottieJson, sourcePath, outIr);
+    return true;
+}
+
+bool RiveFrontendImporter::ImportToSceneIR(
+    std::string_view sourcePath,
+    const std::uint8_t* rawBytes,
+    std::size_t byteLength,
+    AeroSceneGraphIR& outIr,
+    std::vector<std::string>& outDiagnostics) const {
+    if (!rawBytes || byteLength == 0) {
+        outDiagnostics.push_back("AERO_RIVE_EMPTY: Empty Rive .riv input");
+        return false;
+    }
+    std::string_view content(reinterpret_cast<const char*>(rawBytes), byteLength);
+    if (content.size() >= 4 && content.substr(0, 4) == "RIVE") {
+        content = Trim(content.substr(4));
+    }
+
+    AxbPackage pkg{};
+    pkg.InternString("");
+    pkg.rootTypeName = "Canvas";
+
+    const std::string_view classAttr = FindJsonFieldValue(content, "x:Class");
+    if (!classAttr.empty()) {
+        pkg.className = std::string(classAttr);
+    }
+
+    const std::string_view abObj = FindJsonFieldValue(content, "artboard");
+    const std::string_view abSource = abObj.empty() ? content : abObj;
+    const std::string_view abName = FindJsonFieldValue(abSource, "name");
+    const float abW = ParseFloat32(FindJsonFieldValue(abSource, "width"), 320.0f);
+    const float abH = ParseFloat32(FindJsonFieldValue(abSource, "height"), 320.0f);
+
+    pkg.instructions.push_back(AxbInstruction{
+        AxbOpcode::BeginElement, 0, 0, pkg.InternString("Canvas"), pkg.InternString(abName), 0, {}});
+    pkg.instructions.push_back(AxbInstruction{AxbOpcode::SetStaticProperty, PropId_Width, 0, 0, 0, 0, MakeFloat(abW)});
+    pkg.instructions.push_back(AxbInstruction{AxbOpcode::SetStaticProperty, PropId_Height, 0, 0, 0, 0, MakeFloat(abH)});
+
+    std::unordered_map<std::string, std::uint32_t> elemIndexByName;
+    if (!abName.empty()) {
+        elemIndexByName.emplace(std::string(abName), 0u);
+    }
+    std::unordered_set<std::uint64_t> bakedHashes;
+
+    const auto nodeObjs = SplitJsonTopLevelArray(FindJsonFieldValue(abSource, "nodes"));
+    std::uint32_t nextElemIdx = 1u;
+    for (const auto& nodeObj : nodeObjs) {
+        const std::string_view nName = FindJsonFieldValue(nodeObj, "name");
+        const std::string_view nType = FindJsonFieldValue(nodeObj, "type");
+        const std::string_view dPath = FindJsonFieldValue(nodeObj, "path");
+        const std::string_view fillHex = FindJsonFieldValue(nodeObj, "fill");
+        const float nw = ParseFloat32(FindJsonFieldValue(nodeObj, "width"), abW);
+        const float nh = ParseFloat32(FindJsonFieldValue(nodeObj, "height"), abH);
+        const float nx = ParseFloat32(FindJsonFieldValue(nodeObj, "x"), 0.0f);
+        const float ny = ParseFloat32(FindJsonFieldValue(nodeObj, "y"), 0.0f);
+        const float nRot = ParseFloat32(FindJsonFieldValue(nodeObj, "rotation"), 0.0f);
+        const float nsx = ParseFloat32(FindJsonFieldValue(nodeObj, "scaleX"), 1.0f);
+        const float nsy = ParseFloat32(FindJsonFieldValue(nodeObj, "scaleY"), 1.0f);
+        const float nOp = ParseFloat32(FindJsonFieldValue(nodeObj, "opacity"), 1.0f);
+
+        const std::uint32_t curIdx = nextElemIdx++;
+        if (!nName.empty()) {
+            elemIndexByName.emplace(std::string(nName), curIdx);
+        }
+
+        const std::string_view runtimeType = (!dPath.empty() || EqualsIgnoreCase(nType, "Path")) ? "Path"
+                                           : (EqualsIgnoreCase(nType, "TextBlock") ? "TextBlock" : "Border");
+        pkg.instructions.push_back(AxbInstruction{
+            AxbOpcode::BeginElement, 0, 0, pkg.InternString(runtimeType), pkg.InternString(nName), 0, {}});
+        if (!nName.empty()) {
+            pkg.namedControls.push_back(AxbNamedControlSlot{
+                std::string(nName), std::string(runtimeType), 0, PropertySlotHandle::InvalidIndex});
+        }
+        pkg.instructions.push_back(AxbInstruction{AxbOpcode::SetStaticProperty, PropId_Width, 0, 0, 0, 0, MakeFloat(nw)});
+        pkg.instructions.push_back(AxbInstruction{AxbOpcode::SetStaticProperty, PropId_Height, 0, 0, 0, 0, MakeFloat(nh)});
+        pkg.instructions.push_back(AxbInstruction{AxbOpcode::SetStaticProperty, PropId_HorizontalAlignment, 0, 0, 0, 0, value::FromInt(1)});
+        pkg.instructions.push_back(AxbInstruction{AxbOpcode::SetStaticProperty, PropId_VerticalAlignment, 0, 0, 0, 0, value::FromInt(1)});
+        if (std::fabs(nx) > 1e-4f)
+            pkg.instructions.push_back(AxbInstruction{AxbOpcode::SetStaticProperty, PropId_AnimTranslateX, 0, 0, 0, 0, MakeFloat(nx)});
+        if (std::fabs(ny) > 1e-4f)
+            pkg.instructions.push_back(AxbInstruction{AxbOpcode::SetStaticProperty, PropId_AnimTranslateY, 0, 0, 0, 0, MakeFloat(ny)});
+        if (std::fabs(nRot) > 1e-4f)
+            pkg.instructions.push_back(AxbInstruction{AxbOpcode::SetStaticProperty, PropId_AnimRotateAngle, 0, 0, 0, 0, MakeFloat(nRot)});
+        if (std::fabs(nsx - 1.0f) > 1e-4f)
+            pkg.instructions.push_back(AxbInstruction{AxbOpcode::SetStaticProperty, PropId_AnimScaleX, 0, 0, 0, 0, MakeFloat(nsx)});
+        if (std::fabs(nsy - 1.0f) > 1e-4f)
+            pkg.instructions.push_back(AxbInstruction{AxbOpcode::SetStaticProperty, PropId_AnimScaleY, 0, 0, 0, 0, MakeFloat(nsy)});
+        if (std::fabs(nOp - 1.0f) > 1e-4f)
+            pkg.instructions.push_back(AxbInstruction{AxbOpcode::SetStaticProperty, PropId_Opacity, 0, 0, 0, 0, MakeFloat(nOp)});
+
+        if (!dPath.empty()) {
+            const std::uint64_t h = ComputeSvgPathHash(dPath);
+            if (h != 0 && bakedHashes.insert(h).second) {
+                const std::uint16_t adaptiveDim = SelectAdaptiveMtsdfCellSize(dPath);
+                const auto slotIdx = static_cast<std::uint16_t>(pkg.mtsdfPaths.size());
+                pkg.mtsdfPaths.push_back(BakeSvgPathToMtsdfEntry(dPath, adaptiveDim, 4.0f, slotIdx, 256u));
+            }
+            pkg.instructions.push_back(AxbInstruction{
+                AxbOpcode::SetStaticProperty, PropId_PathData, 0, 0, 0, 0, value::FromString(std::string(dPath))});
+            if (!fillHex.empty()) {
+                pkg.instructions.push_back(AxbInstruction{
+                    AxbOpcode::SetStaticProperty, PropId_Background, 0, 0, 0, 0, ParseBuiltinLiteralPropertyValue(PropId_Background, fillHex)});
+            }
+        } else if (!fillHex.empty()) {
+            pkg.instructions.push_back(AxbInstruction{
+                AxbOpcode::SetStaticProperty, PropId_Background, 0, 0, 0, 0, ParseBuiltinLiteralPropertyValue(PropId_Background, fillHex)});
+        }
+
+        pkg.instructions.push_back(AxbInstruction{AxbOpcode::EndElement});
+    }
+
+    // Close Artboard Canvas
+    pkg.instructions.push_back(AxbInstruction{AxbOpcode::EndElement});
+
+    if (!pkg.mtsdfPaths.empty()) {
+        PackMtsdfAtlasSkyline(pkg.mtsdfPaths, 256u);
+    }
+
+    // Parse non-tree bone/transform constraints
+    const auto constraintObjs = SplitJsonTopLevelArray(FindJsonFieldValue(abSource, "constraints"));
+    for (const auto& cObj : constraintObjs) {
+        const std::string constrainedName(FindJsonFieldValue(cObj, "constrained"));
+        const std::string targetName(FindJsonFieldValue(cObj, "target"));
+        const auto itC = elemIndexByName.find(constrainedName);
+        const auto itT = elemIndexByName.find(targetName);
+        if (itC != elemIndexByName.end() && itT != elemIndexByName.end()) {
+            AxbTransformConstraintDesc tc{};
+            tc.childLocalElementIdx = static_cast<std::uint16_t>(itC->second);
+            tc.parentLocalElementIdx = static_cast<std::uint16_t>(itT->second);
+            pkg.transformConstraints.push_back(tc);
+        }
+    }
+
+    // Parse clips
+    std::unordered_map<std::string, std::uint32_t> clipIndexByName;
+    const auto clipObjs = SplitJsonTopLevelArray(FindJsonFieldValue(content, "clips"));
+    for (const auto& clObj : clipObjs) {
+        const std::string_view clName = FindJsonFieldValue(clObj, "name");
+        AxbMotionClipDesc clip{};
+        clip.nameStrIdx = pkg.InternString(clName);
+        clip.durationSec = std::max(0.001f, ParseFloat32(FindJsonFieldValue(clObj, "duration"), 1.0f));
+        clip.isLooping = EqualsIgnoreCase(FindJsonFieldValue(clObj, "loop"), "true");
+        clip.firstTrackIdx = static_cast<std::uint32_t>(pkg.motionTracks.size());
+        clip.firstEventIdx = static_cast<std::uint32_t>(pkg.motionEvents.size());
+
+        const auto trObjs = SplitJsonTopLevelArray(FindJsonFieldValue(clObj, "tracks"));
+        for (const auto& trObj : trObjs) {
+            const std::string targetName(FindJsonFieldValue(trObj, "target"));
+            const std::string_view propName = FindJsonFieldValue(trObj, "property");
+            const auto itElem = elemIndexByName.find(targetName);
+            const std::uint32_t targetIdx = (itElem != elemIndexByName.end()) ? itElem->second : 0u;
+            const std::uint16_t propId = ResolveBuiltinPropertyId(propName);
+            if (propId == kUnmappedPropId) continue;
+
+            AxbMotionTrackDesc tr{};
+            tr.localElementIdx = static_cast<std::uint16_t>(targetIdx);
+            tr.targetPropId = propId;
+            tr.channelCount = 1u;
+            tr.firstKeyframeIdx = static_cast<std::uint32_t>(pkg.motionKeyframes.size());
+            const auto kfObjs = SplitJsonTopLevelArray(FindJsonFieldValue(trObj, "keyframes"));
+            for (const auto& kfObj : kfObjs) {
+                AxbFlatKeyframe kf{};
+                kf.timeSec = ParseFloat32(FindJsonFieldValue(kfObj, "t"), 0.0f);
+                const std::string_view vRaw = FindJsonFieldValue(kfObj, "v");
+                const UnifiedValue parsedV = ParseBuiltinLiteralPropertyValue(propId, vRaw);
+                if (! parsedV.tryGetFloat4(kf.value)) {
+                    float sf = 0.0f;
+                    (void)TryGetFloat(parsedV, sf);
+                    kf.value = Float4Value{sf, 0.0f, 0.0f, 0.0f};
+                } else {
+                    tr.channelCount = 4u;
+                }
+                const std::string_view easeStr = FindJsonFieldValue(kfObj, "easing");
+                if (EqualsIgnoreCase(easeStr, "CubicBezier")) {
+                    kf.interp = static_cast<std::uint8_t>(CurveInterpMode::CubicBezier);
+                    const float bx1 = std::clamp(ParseFloat32(FindJsonFieldValue(kfObj, "bx1"), 0.25f), 0.0f, 1.0f);
+                    const float by1 = std::clamp(ParseFloat32(FindJsonFieldValue(kfObj, "by1"), 0.1f), -4.0f, 4.0f);
+                    const float bx2 = std::clamp(ParseFloat32(FindJsonFieldValue(kfObj, "bx2"), 0.25f), 0.0f, 1.0f);
+                    const float by2 = std::clamp(ParseFloat32(FindJsonFieldValue(kfObj, "by2"), 1.0f), -4.0f, 4.0f);
+                    kf.easeKindOrCtrlX1 = static_cast<std::uint8_t>(std::round(bx1 * 255.0f));
+                    kf.easeModeOrCtrlX2 = static_cast<std::uint8_t>(std::round(bx2 * 255.0f));
+                    kf.ctrlY1Fixed8 = static_cast<std::int16_t>(std::round(by1 * 256.0f));
+                    kf.ctrlY2Fixed8 = static_cast<std::int16_t>(std::round(by2 * 256.0f));
+                } else {
+                    kf.interp = static_cast<std::uint8_t>(CurveInterpMode::Linear);
+                }
+                pkg.motionKeyframes.push_back(std::move(kf));
+            }
+            tr.keyframeCount = static_cast<std::uint32_t>(pkg.motionKeyframes.size()) - tr.firstKeyframeIdx;
+            if (tr.keyframeCount > 0u) {
+                pkg.motionTracks.push_back(std::move(tr));
+            }
+        }
+        clip.trackCount = static_cast<std::uint32_t>(pkg.motionTracks.size()) - clip.firstTrackIdx;
+
+        const auto evObjs = SplitJsonTopLevelArray(FindJsonFieldValue(clObj, "events"));
+        for (const auto& evObj : evObjs) {
+            AxbTimelineEventMarker ev{};
+            ev.timeSec = ParseFloat32(FindJsonFieldValue(evObj, "t"), 0.0f);
+            ev.eventNameStrIdx = pkg.InternString(FindJsonFieldValue(evObj, "name"));
+            pkg.motionEvents.push_back(ev);
+        }
+        clip.eventCount = static_cast<std::uint32_t>(pkg.motionEvents.size() - clip.firstEventIdx);
+
+        const auto clipIdx = static_cast<std::uint32_t>(pkg.motionClips.size());
+        if (!clName.empty()) clipIndexByName.emplace(std::string(clName), clipIdx);
+        pkg.motionClips.push_back(clip);
+    }
+
+    // Parse StateMachines
+    const auto smObjs = SplitJsonTopLevelArray(FindJsonFieldValue(content, "stateMachines"));
+    for (const auto& smObj : smObjs) {
+        AxbStateMachineDesc sm{};
+        sm.nameStrIdx = pkg.InternString(FindJsonFieldValue(smObj, "name"));
+        sm.firstLayerIdx = static_cast<std::uint32_t>(pkg.smLayers.size());
+        sm.firstListenerIdx = static_cast<std::uint32_t>(pkg.smListeners.size());
+
+        std::unordered_map<std::string, std::uint32_t> inputIdxByName;
+        const auto inObjs = SplitJsonTopLevelArray(FindJsonFieldValue(smObj, "inputs"));
+        for (const auto& inObj : inObjs) {
+            const std::string_view inName = FindJsonFieldValue(inObj, "name");
+            const std::string_view inType = FindJsonFieldValue(inObj, "type");
+            const auto slotIdx = static_cast<std::uint32_t>(pkg.contractInputs.size());
+            const auto portPropId = static_cast<std::uint16_t>(PropId_FirstContractInput + slotIdx);
+
+            AxbContractInputDesc inDesc{};
+            inDesc.nameStrIdx = pkg.InternString(inName);
+            inDesc.bridgePropId = portPropId;
+            if (EqualsIgnoreCase(inType, "Boolean") || EqualsIgnoreCase(inType, "Bool")) {
+                inDesc.valueKind = 0u;
+                inDesc.defaultValue = UnifiedValue{EqualsIgnoreCase(FindJsonFieldValue(inObj, "default"), "true")};
+            } else if (EqualsIgnoreCase(inType, "Trigger")) {
+                inDesc.valueKind = 5u;
+                inDesc.isTrigger = 1u;
+                inDesc.defaultValue = MakeFloat(0.0f);
+            } else {
+                inDesc.valueKind = 1u;
+                inDesc.defaultValue = MakeFloat(ParseFloat32(FindJsonFieldValue(inObj, "default"), 0.0f));
+            }
+            pkg.contractInputs.push_back(inDesc);
+            if (!inName.empty()) inputIdxByName.emplace(std::string(inName), slotIdx);
+        }
+
+        const auto layerObjs = SplitJsonTopLevelArray(FindJsonFieldValue(smObj, "layers"));
+        for (const auto& lyObj : layerObjs) {
+            AxbSmLayerDesc ly{};
+            ly.nameStrIdx = pkg.InternString(FindJsonFieldValue(lyObj, "name"));
+            ly.blendMode = EqualsIgnoreCase(FindJsonFieldValue(lyObj, "blendMode"), "Additive")
+                ? SmLayerBlendMode::Additive
+                : SmLayerBlendMode::Override;
+            ly.layerWeight = ParseFloat32(FindJsonFieldValue(lyObj, "weight"), 1.0f);
+            ly.firstStateIdx = static_cast<std::uint32_t>(pkg.smStates.size());
+            ly.firstTransitionIdx = static_cast<std::uint32_t>(pkg.smTransitions.size());
+
+            std::unordered_map<std::string, std::uint16_t> stateIdxByName;
+            const auto stObjs = SplitJsonTopLevelArray(FindJsonFieldValue(lyObj, "states"));
+            for (const auto& stObj : stObjs) {
+                const std::string_view stName = FindJsonFieldValue(stObj, "name");
+                const std::string_view stKind = FindJsonFieldValue(stObj, "kind");
+                const auto globalStIdx = static_cast<std::uint16_t>(pkg.smStates.size());
+                if (!stName.empty()) stateIdxByName.emplace(std::string(stName), globalStIdx);
+
+                AxbSmState st{};
+                st.nameStrIdx = pkg.InternString(stName);
+                st.speedMultiplier = ParseFloat32(FindJsonFieldValue(stObj, "speed"), 1.0f);
+
+                if (EqualsIgnoreCase(stKind, "Blend1D")) {
+                    st.kind = SmStateKind::Blend1D;
+                    const std::string paramName(FindJsonFieldValue(stObj, "input"));
+                    const auto itIn = inputIdxByName.find(paramName);
+                    st.progressInputSlot = (itIn != inputIdxByName.end()) ? static_cast<std::uint16_t>(itIn->second) : 0u;
+                    const auto bItems = SplitJsonTopLevelArray(FindJsonFieldValue(stObj, "thresholds"));
+                    if (!bItems.empty()) {
+                        st.blendRangeMin = ParseFloat32(FindJsonFieldValue(bItems.front(), "threshold"), 0.0f);
+                        const std::string cl0(FindJsonFieldValue(bItems.front(), "clip"));
+                        const auto it0 = clipIndexByName.find(cl0);
+                        st.primaryClipIdx = (it0 != clipIndexByName.end()) ? static_cast<std::uint16_t>(it0->second) : 0u;
+                        if (bItems.size() >= 2u) {
+                            st.blendRangeMax = ParseFloat32(FindJsonFieldValue(bItems.back(), "threshold"), 100.0f);
+                            const std::string cl1(FindJsonFieldValue(bItems.back(), "clip"));
+                            const auto it1 = clipIndexByName.find(cl1);
+                            st.secondaryClipIdx = (it1 != clipIndexByName.end()) ? static_cast<std::uint16_t>(it1->second) : st.primaryClipIdx;
+                        } else {
+                            st.blendRangeMax = st.blendRangeMin + 1.0f;
+                            st.secondaryClipIdx = st.primaryClipIdx;
+                        }
+                    }
+                } else if (EqualsIgnoreCase(stKind, "ScrubbedClip")) {
+                    st.kind = SmStateKind::ScrubbedClip;
+                    const std::string clName(FindJsonFieldValue(stObj, "clip"));
+                    const auto itCl = clipIndexByName.find(clName);
+                    st.primaryClipIdx = (itCl != clipIndexByName.end()) ? static_cast<std::uint16_t>(itCl->second) : 0u;
+                    const std::string paramName(FindJsonFieldValue(stObj, "input"));
+                    const auto itIn = inputIdxByName.find(paramName);
+                    st.progressInputSlot = (itIn != inputIdxByName.end()) ? static_cast<std::uint16_t>(itIn->second) : 0u;
+                } else {
+                    st.kind = SmStateKind::SingleClip;
+                    const std::string clName(FindJsonFieldValue(stObj, "clip"));
+                    const auto itCl = clipIndexByName.find(clName);
+                    st.primaryClipIdx = (itCl != clipIndexByName.end()) ? static_cast<std::uint16_t>(itCl->second) : 0u;
+                }
+                pkg.smStates.push_back(st);
+            }
+            ly.stateCount = static_cast<std::uint16_t>(pkg.smStates.size() - ly.firstStateIdx);
+            ly.entryStateIdx = static_cast<std::uint16_t>(ly.firstStateIdx);
+
+            // Parse transitions in layer
+            const auto trObjs = SplitJsonTopLevelArray(FindJsonFieldValue(lyObj, "transitions"));
+            for (const auto& trObj : trObjs) {
+                const std::string fromName(FindJsonFieldValue(trObj, "from"));
+                const std::string toName(FindJsonFieldValue(trObj, "to"));
+                const auto itTo = stateIdxByName.find(toName);
+                if (itTo == stateIdxByName.end()) continue;
+
+                AxbSmTransition tr{};
+                if (fromName == "*" || fromName.empty()) {
+                    tr.fromStateIdx = 0xFFFFu;
+                } else {
+                    const auto itFrom = stateIdxByName.find(fromName);
+                    if (itFrom == stateIdxByName.end()) continue;
+                    tr.fromStateIdx = itFrom->second;
+                }
+                tr.toStateIdx = itTo->second;
+                tr.crossfadeDurationSec = ParseFloat32(FindJsonFieldValue(trObj, "duration"), 0.15f);
+                tr.exitTimeNormalized01 = ParseFloat32(FindJsonFieldValue(trObj, "exitTime"), 0.0f);
+                tr.hasExitTime = (tr.exitTimeNormalized01 > 0.0f);
+                tr.firstConditionIdx = static_cast<std::uint32_t>(pkg.smConditions.size());
+
+                const auto condObjs = SplitJsonTopLevelArray(FindJsonFieldValue(trObj, "conditions"));
+                for (const auto& cObj : condObjs) {
+                    const std::string inName(FindJsonFieldValue(cObj, "input"));
+                    const auto itIn = inputIdxByName.find(inName);
+                    if (itIn == inputIdxByName.end()) continue;
+                    AxbSmCondition cond{};
+                    cond.inputSlotIdx = static_cast<std::uint16_t>(itIn->second);
+                    const std::string_view opStr = FindJsonFieldValue(cObj, "op");
+                    if (opStr == "==" || EqualsIgnoreCase(opStr, "Equals")) cond.op = SmCompareOp::Equal;
+                    else if (opStr == "!=" || EqualsIgnoreCase(opStr, "NotEquals")) cond.op = SmCompareOp::NotEqual;
+                    else if (opStr == ">" || EqualsIgnoreCase(opStr, "Greater")) cond.op = SmCompareOp::Greater;
+                    else if (opStr == ">=" || EqualsIgnoreCase(opStr, "GreaterOrEqual")) cond.op = SmCompareOp::GreaterOrEqual;
+                    else if (opStr == "<" || EqualsIgnoreCase(opStr, "Less")) cond.op = SmCompareOp::Less;
+                    else if (opStr == "<=" || EqualsIgnoreCase(opStr, "LessOrEqual")) cond.op = SmCompareOp::LessOrEqual;
+                    else if (EqualsIgnoreCase(opStr, "TriggerFired")) cond.op = SmCompareOp::TriggerFired;
+                    else if (EqualsIgnoreCase(opStr, "IsTrue")) cond.op = SmCompareOp::BoolTrue;
+                    else if (EqualsIgnoreCase(opStr, "IsFalse")) cond.op = SmCompareOp::BoolFalse;
+                    cond.threshold = ParseFloat32(FindJsonFieldValue(cObj, "value"), 0.0f);
+                    pkg.smConditions.push_back(cond);
+                }
+                tr.conditionCount = static_cast<std::uint16_t>(pkg.smConditions.size() - tr.firstConditionIdx);
+                pkg.smTransitions.push_back(tr);
+            }
+            ly.transitionCount = static_cast<std::uint16_t>(pkg.smTransitions.size() - ly.firstTransitionIdx);
+
+            pkg.smLayers.push_back(ly);
+        }
+        sm.layerCount = static_cast<std::uint16_t>(pkg.smLayers.size() - sm.firstLayerIdx);
+
+        const auto lstObjs = SplitJsonTopLevelArray(FindJsonFieldValue(smObj, "listeners"));
+        for (const auto& lObj : lstObjs) {
+            AxbSmPointerListener lst{};
+            const std::string targetName(FindJsonFieldValue(lObj, "target"));
+            const auto itEl = elemIndexByName.find(targetName);
+            lst.hitTargetElementIdx = (itEl != elemIndexByName.end()) ? static_cast<std::uint16_t>(itEl->second) : 0u;
+            const std::string_view evStr = FindJsonFieldValue(lObj, "event");
+            if (EqualsIgnoreCase(evStr, "PointerExit")) lst.eventKind = SmListenerEventKind::PointerExit;
+            else if (EqualsIgnoreCase(evStr, "PointerDown")) lst.eventKind = SmListenerEventKind::PointerDown;
+            else if (EqualsIgnoreCase(evStr, "PointerUp") || EqualsIgnoreCase(evStr, "Click")) lst.eventKind = SmListenerEventKind::PointerUpInside;
+            else if (EqualsIgnoreCase(evStr, "FocusGained")) lst.eventKind = SmListenerEventKind::FocusGained;
+            else if (EqualsIgnoreCase(evStr, "FocusLost")) lst.eventKind = SmListenerEventKind::FocusLost;
+            else lst.eventKind = SmListenerEventKind::PointerEnter;
+
+            const std::string inName(FindJsonFieldValue(lObj, "input"));
+            const auto itIn = inputIdxByName.find(inName);
+            lst.targetInputSlot = (itIn != inputIdxByName.end()) ? static_cast<std::uint16_t>(itIn->second) : 0u;
+            const std::string_view actStr = FindJsonFieldValue(lObj, "action");
+            if (EqualsIgnoreCase(actStr, "FireTrigger")) lst.actionKind = SmListenerActionKind::FireTrigger;
+            else if (EqualsIgnoreCase(actStr, "AddFloat") || EqualsIgnoreCase(actStr, "AddDelta")) lst.actionKind = SmListenerActionKind::AddDelta;
+            else lst.actionKind = SmListenerActionKind::SetFloatOrBool;
+            lst.actionValue = ParseFloat32(FindJsonFieldValue(lObj, "value"), 1.0f);
+            pkg.smListeners.push_back(lst);
+        }
+        sm.listenerCount = static_cast<std::uint16_t>(pkg.smListeners.size() - sm.firstListenerIdx);
+
+        pkg.stateMachines.push_back(sm);
+    }
+
+    PopulateSceneIrFromPackage(pkg, FrontendSourceFormat::RiveBinary, sourcePath, outIr);
+    return true;
+}
+
+bool XamlFrontendImporter::ImportToSceneIR(
+    std::string_view sourcePath,
+    const std::uint8_t* rawBytes,
+    std::size_t byteLength,
+    AeroSceneGraphIR& outIr,
+    std::vector<std::string>& outDiagnostics) const {
+    AeroCompiler compiler;
+    AeroCompileInput in{};
+    in.xamlPath = std::string(sourcePath);
+    if (rawBytes && byteLength > 0) {
+        in.xamlContent.assign(reinterpret_cast<const char*>(rawBytes), byteLength);
+    }
+    AeroCompileResult res = compiler.Compile(in);
+    outDiagnostics.insert(outDiagnostics.end(), res.diagnostics.begin(), res.diagnostics.end());
+    outIr = std::move(res.sceneIr);
+    return res.succeeded;
+}
+
 AeroCompileResult AeroCompiler::Compile(const AeroCompileInput& input) const {
     AeroCompileResult result{};
     AxbPackage& pkg = result.axbPackage;
@@ -512,7 +1724,32 @@ AeroCompileResult AeroCompiler::Compile(const AeroCompileInput& input) const {
 
     std::string rootDataType;
     const std::string_view src = input.xamlContent;
-    std::size_t pos = 0;
+
+    // Multi-Frontend Importer Dispatch (.svg, Lottie .json/.lottie, Rive .riv)
+    const bool isSvgInput = IsSvgAssetInput(input.xamlPath, src);
+    const bool isLottieInput = !isSvgInput && IsLottieAssetInput(input.xamlPath, src);
+    const bool isRiveInput = !isSvgInput && !isLottieInput && IsRiveAssetInput(input.xamlPath, src);
+    if (isSvgInput || isLottieInput || isRiveInput) {
+        bool importedOk = false;
+        const auto* rawPtr = reinterpret_cast<const std::uint8_t*>(src.data());
+        if (isSvgInput) {
+            SvgTokenFrontendImporter importer;
+            importedOk = importer.ImportToSceneIR(input.xamlPath, rawPtr, src.size(), result.sceneIr, result.diagnostics);
+        } else if (isLottieInput) {
+            LottieFrontendImporter importer;
+            importedOk = importer.ImportToSceneIR(input.xamlPath, rawPtr, src.size(), result.sceneIr, result.diagnostics);
+        } else {
+            RiveFrontendImporter importer;
+            importedOk = importer.ImportToSceneIR(input.xamlPath, rawPtr, src.size(), result.sceneIr, result.diagnostics);
+        }
+        if (!importedOk) {
+            result.succeeded = false;
+            return result;
+        }
+        pkg = result.sceneIr.loweredPackage;
+    }
+
+    std::size_t pos = (isSvgInput || isLottieInput || isRiveInput) ? src.size() : 0;
     bool seenRoot = false;
     std::unordered_set<std::uint64_t> bakedPathHashes;
     std::uint32_t nextInlineVsmStyleId = 0u;
@@ -526,8 +1763,9 @@ AeroCompileResult AeroCompiler::Compile(const AeroCompileInput& input) const {
         if (h == 0 || !bakedPathHashes.insert(h).second) {
             return;
         }
+        const std::uint16_t adaptiveDim = SelectAdaptiveMtsdfCellSize(svgPathData);
         const auto slotIdx = static_cast<std::uint16_t>(pkg.mtsdfPaths.size());
-        pkg.mtsdfPaths.push_back(BakeSvgPathToMtsdfEntry(svgPathData, 32u, 4.0f, slotIdx, 256u));
+        pkg.mtsdfPaths.push_back(BakeSvgPathToMtsdfEntry(svgPathData, adaptiveDim, 4.0f, slotIdx, 256u));
     };
 
     auto emitStaticRenderTransform = [&](const Matrix2D& m) {
@@ -2113,11 +3351,12 @@ AeroCompileResult AeroCompiler::Compile(const AeroCompileInput& input) const {
                 }
                 const std::string synthKey = ownerElemScope.inlineStyleKey;
                 const std::string ownerType = std::string(StripXmlPrefix(ownerElemScope.tagName));
+                const std::string ownerBasedOnKey = ownerElemScope.resourceKey;
                 const std::size_t depth = pushNonVisualScope();
                 ActiveStyleScope synthStyle{};
                 synthStyle.def.key = synthKey;
                 synthStyle.def.targetTypeName = ownerType;
-                synthStyle.def.basedOnKey = ownerElemScope.resourceKey;
+                synthStyle.def.basedOnKey = ownerBasedOnKey;
                 synthStyle.scopeDepth = depth;
                 synthStyle.isInlinePropertyElement = EndsWith(shortTag, ".Style");
                 styleStack.push_back(std::move(synthStyle));
@@ -2576,6 +3815,14 @@ AeroCompileResult AeroCompiler::Compile(const AeroCompileInput& input) const {
         }
     }
 
+    if (!pkg.mtsdfPaths.empty() && !isSvgInput && !isLottieInput && !isRiveInput) {
+        PackMtsdfAtlasSkyline(pkg.mtsdfPaths, 256u);
+    }
+
+    if (!isSvgInput && !isLottieInput && !isRiveInput) {
+        PopulateSceneIrFromPackage(pkg, FrontendSourceFormat::Xaml, input.xamlPath, result.sceneIr);
+    }
+
     // Generate *.g.rs partial class stub when x:Class is specified
     std::vector<SourceFile> allSources = input.scriptSources;
     if (!pkg.className.empty()) {
@@ -2772,12 +4019,13 @@ std::string EmitUnifiedValueLiteralCpp(const UnifiedValue& val) {
     if (const auto* f = std::get_if<FloatValue>(&val)) {
         return "aero::MakeFloat(" + FormatFloatLiteral(f->value) + ")";
     }
-    if (const auto* f4 = std::get_if<Float4Value>(&val)) {
-        return "aero::UnifiedValue{aero::Float4Value{" +
-               FormatFloatLiteral(f4->x) + ", " +
-               FormatFloatLiteral(f4->y) + ", " +
-               FormatFloatLiteral(f4->z) + ", " +
-               FormatFloatLiteral(f4->w) + "}}";
+    Float4Value f4{};
+    if (val.tryGetFloat4(f4)) {
+        return "aero::MakeFloat4InlineFast(" +
+               FormatFloatLiteral(f4.x) + ", " +
+               FormatFloatLiteral(f4.y) + ", " +
+               FormatFloatLiteral(f4.z) + ", " +
+               FormatFloatLiteral(f4.w) + ")";
     }
     if (const auto* s = std::get_if<StringValue>(&val)) {
         return "aero::value::FromString(\"" + EscapeAotCppString(s->str()) + "\")";
@@ -3142,6 +4390,8 @@ AeroViewAotCppOutput AeroCompiler::GenerateAotCppFromPackage(
     std::vector<std::string> elemVarStack;
     std::size_t nextElemId = 0;
     bool rootVisited = false;
+    src += "    std::vector<aero::UIElement*> localElements;\n";
+    src += "    localElements.reserve(" + std::to_string(package.instructions.size() / 2u + 1u) + "u);\n";
 
     for (const auto& inst : package.instructions) {
         switch (inst.opcode) {
@@ -3178,12 +4428,16 @@ AeroViewAotCppOutput AeroCompiler::GenerateAotCppFromPackage(
                     src += "        " + parentVar + "->AddChild(" + varName + ", registry, uiHeap);\n";
                     src += "    }\n";
                 }
+                src += "    localElements.push_back(" + varName + ");\n";
 
                 if (const auto probe = CreateElementByTypeName(typeName);
                     probe && probe->IsA<ItemsControl>()) {
                     src += "    if (auto* ic = " + varName + " ? " + varName + "->DynamicCast<aero::ItemsControl>() : nullptr) {\n";
                     src += "        ic->SetDomains(domains);\n";
                     src += "        ic->SetBindingEngine(bindingEngine);\n";
+                    src += "        if (bindingEngine) {\n";
+                    src += "            ic->SetAnimationEngine(bindingEngine->GetAnimationEngine());\n";
+                    src += "        }\n";
                     src += "    }\n";
                 }
 
@@ -3301,15 +4555,19 @@ AeroViewAotCppOutput AeroCompiler::GenerateAotCppFromPackage(
             case AxbOpcode::BindEvent: {
                 if (!elemVarStack.empty()) {
                     const std::string& curVar = elemVarStack.back();
+                    SymbolId handlerSym = inst.symbolId;
+                    if (handlerSym == 0 && inst.strIdx0 < package.eventBindings.size()) {
+                        handlerSym = package.eventBindings[inst.strIdx0].handlerSymbolId;
+                    }
                     src += "    if (" + curVar + " && wrapperObj.valid() && " +
-                           std::to_string(inst.symbolId) + "ULL != 0ULL) {\n";
+                           std::to_string(handlerSym) + "ULL != 0ULL) {\n";
                     src += "        if (auto* btn = " + curVar + "->DynamicCast<aero::Button>()) {\n";
                     src += "            if (eventInterpreter) {\n";
                     src += "                btn->BindScriptClickHandler(eventInterpreter, wrapperObj, " +
-                           std::to_string(inst.symbolId) + "ULL);\n";
+                           std::to_string(handlerSym) + "ULL);\n";
                     src += "            } else if (eventAotContext) {\n";
                     src += "                btn->BindAotClickHandler(eventAotContext, wrapperObj, " +
-                           std::to_string(inst.symbolId) + "ULL);\n";
+                           std::to_string(handlerSym) + "ULL);\n";
                     src += "            }\n";
                     src += "        }\n";
                     src += "    }\n";
@@ -3366,6 +4624,31 @@ AeroViewAotCppOutput AeroCompiler::GenerateAotCppFromPackage(
                 }
                 break;
             }
+        }
+    }
+
+    if (package.HasMotionSection()) {
+        const std::vector<std::uint8_t> motPkgBytes = package.Serialize();
+        if (!motPkgBytes.empty()) {
+            src += "    if (bindingEngine && bindingEngine->GetAnimationEngine()) {\n";
+            src += "        static constexpr std::uint8_t kAotMotionPkgBytes[] = {";
+            for (std::size_t b = 0; b < motPkgBytes.size(); ++b) {
+                if (b > 0) src += ",";
+                src += std::to_string(static_cast<unsigned>(motPkgBytes[b])) + "u";
+            }
+            src += "};\n";
+            src += "        static const aero::AxbPackage kAotMotionPkg = []() {\n";
+            src += "            aero::AxbPackage p{};\n";
+            src += "            (void)aero::AxbPackage::Deserialize(kAotMotionPkgBytes, sizeof(kAotMotionPkgBytes), p);\n";
+            src += "            p.PinValuesInPools();\n";
+            src += "            return p;\n";
+            src += "        }();\n";
+            src += "        (void)bindingEngine->GetAnimationEngine()->InstantiatePackageMotion(\n";
+            src += "            rootControl,\n";
+            src += "            localElements.data(),\n";
+            src += "            localElements.size(),\n";
+            src += "            kAotMotionPkg);\n";
+            src += "    }\n";
         }
     }
 

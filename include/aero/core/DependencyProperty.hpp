@@ -186,6 +186,10 @@ enum BuiltinPropertyId : std::uint16_t {
     PropId_Style = 76,                      // StringValue (Style resource key)
     // Phase 5D: Declarative DataTemplate Attachment
     PropId_ItemTemplate = 77,               // StringValue (DataTemplate resource key)
+    // Phase 6: Independent Orthogonal Skew Animation Channels & Multi-Frontend Contract Bridges
+    PropId_AnimSkewX = 78,                  // float degrees (default 0.0f, composed around RenderTransformOrigin)
+    PropId_AnimSkewY = 79,                  // float degrees (default 0.0f, composed around RenderTransformOrigin)
+    PropId_FirstContractInput = 0x1000u,    // Dynamic/Contract input bridge slot range [0x1000 .. 0x1FFFu]
     // Pseudo-property IDs for zero-allocation inline interactive Trigger conditions
     PropId_TriggerIsMouseOver = 0xFF01u,
     PropId_TriggerIsPressed = 0xFF02u,
@@ -246,21 +250,34 @@ static_assert(
     sizeof(FastInlineStorage) == 56,
     "FastInlineStorage layout size check");
 
-// P1-4: 32-byte 8-byte-aligned sparse property entry.
-// Because UnifiedValue (rs_rt::Value) is 8-byte aligned (24 bytes),
-// the 4 bytes following (propId, sourceRank, flags) are explicitly utilized for
-// bindingSlotId and animationTrackId instead of being wasted as compiler padding.
-struct alignas(8) CompactPropertyEntry {
+// C-03 & ABI v2.0: 32-byte 16-byte-aligned zero-hole sparse property entry.
+// Bytes 0..7 store core dependency property & primary track indices;
+// Bytes 8..15 explicitly utilize the 16B alignment space for dual-track Crossfade/Additive
+// blending and ContractInputBank slot mapping;
+// Bytes 16..31 hold the 16B UnifiedValue payload (byte 31 = ValueTag).
+struct alignas(16) CompactPropertyEntry {
+    // --- Bytes 0..7: Core dependency property & primary track indices ---
     std::uint16_t propId = 0;
-    std::uint8_t sourceRank = static_cast<std::uint8_t>(ValueSourceRank::Local);
-    std::uint8_t flags = 0;
+    std::uint8_t  sourceRank = static_cast<std::uint8_t>(ValueSourceRank::Local);
+    std::uint8_t  flags = 0;
     std::uint16_t bindingSlotId = 0xFFFFu;
     std::uint16_t animationTrackId = 0xFFFFu;
+
+    // --- Bytes 8..15: Explicit 16B alignment space (0 memory bloat for dual-track blend & contract bridge) ---
+    std::uint16_t secondaryTrackId = 0xFFFFu;  // Crossfade or Additive secondary track index
+    std::uint16_t contractInputSlot = 0xFFFFu; // Mapped slot in component's ContractInputBank
+    std::uint16_t blendWeightUnorm16 = 0u;     // 0..65535 normalized blend weight
+    std::uint16_t entryMetaFlags = 0u;         // Snapshot & inline quantization metadata flags
+
+    // --- Bytes 16..31: 16B aligned UnifiedValue payload (byte 31 is ValueTag) ---
     UnifiedValue effectiveValue{};
 };
 
 static_assert(
     sizeof(CompactPropertyEntry) == 32,
     "CompactPropertyEntry must be exactly 32 bytes (2 entries per 64B cache line)");
+static_assert(
+    alignof(CompactPropertyEntry) == 16,
+    "CompactPropertyEntry must be 16-byte aligned");
 
 } // namespace aero

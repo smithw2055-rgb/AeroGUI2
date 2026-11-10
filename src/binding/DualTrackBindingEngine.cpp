@@ -1,4 +1,5 @@
 #include "aero/binding/DualTrackBindingEngine.hpp"
+#include "aero/animation/AnimationEngine.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -85,10 +86,10 @@ namespace {
         !std::holds_alternative<std::int64_t>(a) && !std::holds_alternative<std::int64_t>(b)) {
         return std::fabs(af - bf) <= 1e-5f;
     }
-    if (const auto* af4 = std::get_if<Float4Value>(&a)) {
-        if (const auto* bf4 = std::get_if<Float4Value>(&b)) {
-            return *af4 == *bf4;
-        }
+    Float4Value af4{};
+    Float4Value bf4{};
+    if (a.tryGetFloat4(af4) && b.tryGetFloat4(bf4)) {
+        return af4 == bf4;
     }
     if (const auto* as = std::get_if<StringValue>(&a)) {
         if (const auto* bs = std::get_if<StringValue>(&b)) {
@@ -111,9 +112,14 @@ DualTrackBindingEngine::DualTrackBindingEngine(
     const Interpreter* uiInterpreter) noexcept
     : domains_(domains),
       program_(program),
-      uiInterpreter_(uiInterpreter) {}
+      uiInterpreter_(uiInterpreter) {
+    rs_rt::registerExternalValuePoolRootMarker(this, [this]() {
+        MarkValuesInPools();
+    });
+}
 
 DualTrackBindingEngine::~DualTrackBindingEngine() noexcept {
+    rs_rt::unregisterExternalValuePoolRootMarker(this);
     for (auto& binding : trackABindings_) {
         if (binding.targetElement && binding.targetElement->BoundTwoWayEngine() == this) {
             binding.targetElement->BindTwoWayEngine(nullptr);
@@ -133,6 +139,41 @@ DualTrackBindingEngine::~DualTrackBindingEngine() noexcept {
     for (auto& eb : elementBindings_) {
         if (eb.targetElement && eb.targetElement->BoundTwoWayEngine() == this) {
             eb.targetElement->BindTwoWayEngine(nullptr);
+        }
+    }
+}
+
+bool DualTrackBindingEngine::HasPendingDirtyObjects() const noexcept {
+    for (const auto& b : trackABindings_) {
+        if (b.mode == BindingMode::OneTime && b.initialized) {
+            continue;
+        }
+        for (const auto& hopRef : b.resolvedHopObjects) {
+            if (!hopRef.valid()) {
+                continue;
+            }
+            if (const auto* heap = domains_.heapForObject(hopRef)) {
+                if (heap->dirtyFieldMask(hopRef) != 0ULL) {
+                    return true;
+                }
+            }
+        }
+    }
+    return false;
+}
+
+void DualTrackBindingEngine::MarkValuesInPools() const noexcept {
+    for (const auto& b : trackABindings_) {
+        if (b.fallbackValue.isTraceable()) {
+            rs_rt::markValueInPools(b.fallbackValue);
+        }
+    }
+    for (const auto& eb : elementBindings_) {
+        if (eb.fallbackValue.isTraceable()) {
+            rs_rt::markValueInPools(eb.fallbackValue);
+        }
+        if (eb.lastSyncedValue.isTraceable()) {
+            rs_rt::markValueInPools(eb.lastSyncedValue);
         }
     }
 }
@@ -372,6 +413,9 @@ bool DualTrackBindingEngine::EvaluateAndSyncElementBinding(ElementPropertyBindin
         return false;
     }
 
+    if (val.isTraceable()) {
+        rs_rt::pinValueInPools(val);
+    }
     eb.lastSyncedValue = val;
     eb.initialized = true;
     if (!std::holds_alternative<std::monostate>(val) && !std::holds_alternative<NullObject>(val)) {
@@ -409,6 +453,9 @@ std::uint16_t DualTrackBindingEngine::BindChain(
     instance.converter = compiledChain.converter;
     instance.rootObject = rootObject;
     instance.fallbackValue = compiledChain.fallbackValue;
+    if (instance.fallbackValue.isTraceable()) {
+        rs_rt::pinValueInPools(instance.fallbackValue);
+    }
     instance.hops = compiledChain.hops;
     instance.resolvedHopObjects.assign(compiledChain.hops.size(), ObjectRef{});
     instance.targetElement = targetElement;
@@ -456,6 +503,9 @@ std::uint16_t DualTrackBindingEngine::BindElementProperty(
     eb.targetPropertyId = compiledChain.targetPropertyId;
     eb.targetElement = targetElement;
     eb.fallbackValue = compiledChain.fallbackValue;
+    if (eb.fallbackValue.isTraceable()) {
+        rs_rt::pinValueInPools(eb.fallbackValue);
+    }
 
     if (eb.mode == BindingMode::TwoWay) {
         targetElement->BindTwoWayEngine(this);
@@ -543,6 +593,9 @@ std::size_t DualTrackBindingEngine::RebindSubtreeRootObject(
         }
         ++reboundCount;
     }
+    if (animationEngine_) {
+        animationEngine_->OnSubtreeDataContextRebound(subtreeRoot);
+    }
     return reboundCount;
 }
 
@@ -619,6 +672,9 @@ std::size_t DualTrackBindingEngine::FlushTrackA(RuntimeError* error) {
             if (mask == 0ULL) {
                 continue;
             }
+            // Clear dirty mask BEFORE EvaluateAndSyncChain so any secondary mutations
+            // triggered inside SetValue / OnPropertyChanged are preserved for subsequent flushes!
+            heap.clearDirtyFieldMask(dirtyObj);
             // Index-based scan so nested BindChain calls during SetValue never invalidate iterators!
             const std::size_t bindingSnapshotCount = trackABindings_.size();
             for (std::size_t bIdx = 0; bIdx < bindingSnapshotCount && bIdx < trackABindings_.size(); ++bIdx) {
@@ -644,7 +700,6 @@ std::size_t DualTrackBindingEngine::FlushTrackA(RuntimeError* error) {
                     }
                 }
             }
-            heap.clearDirtyFieldMask(dirtyObj);
         }
     };
 
@@ -672,7 +727,9 @@ std::size_t DualTrackBindingEngine::FlushTrackA(RuntimeError* error) {
 
     if (gcEpoch != lastObservedGcEpoch_) {
         lastObservedGcEpoch_ = gcEpoch;
-        for (auto& binding : trackABindings_) {
+        const std::size_t gcSnapshotCount = trackABindings_.size();
+        for (std::size_t bIdx = 0u; bIdx < gcSnapshotCount && bIdx < trackABindings_.size(); ++bIdx) {
+            auto& binding = trackABindings_[bIdx];
             if (!binding.initialized || !binding.targetElement ||
                 binding.mode == BindingMode::OneTime) {
                 continue;
@@ -699,12 +756,15 @@ std::size_t DualTrackBindingEngine::FlushTrackA(RuntimeError* error) {
                 }
             }
             if (anyDead) {
-                ApplyFallbackOrClear(binding);
+                ApplyFallbackOrClear(trackABindings_[bIdx]);
                 ++updatedCount;
             }
         }
     }
 
+    if (updatedCount > 0u && wakeHostCallback_) {
+        wakeHostCallback_();
+    }
     return updatedCount;
 }
 
@@ -719,7 +779,9 @@ bool DualTrackBindingEngine::PushTwoWayToSource(
     bool anyPushed = false;
 
     // 1. Push TwoWay ElementName / RelativeSource UIElement-to-UIElement bindings
-    for (auto& eb : elementBindings_) {
+    const std::size_t ebSnapshotCount = elementBindings_.size();
+    for (std::size_t eIdx = 0u; eIdx < ebSnapshotCount && eIdx < elementBindings_.size(); ++eIdx) {
+        auto& eb = elementBindings_[eIdx];
         if (eb.targetElement.Get() != targetElement ||
             eb.targetPropertyId != targetPropertyId ||
             eb.mode != BindingMode::TwoWay) {
@@ -730,24 +792,29 @@ bool DualTrackBindingEngine::PushTwoWayToSource(
         }
         if (eb.cachedSourceElement && eb.cachedSourceElement != targetElement) {
             UnifiedValue uiVal = targetElement->GetValue(targetPropertyId);
+            if (uiVal.isTraceable()) {
+                rs_rt::pinValueInPools(uiVal);
+            }
             eb.lastSyncedValue = uiVal;
             eb.initialized = true;
             if (eb.converter != ValueConverterKind::None) {
                 uiVal = ApplyBuiltinValueConverter(eb.converter, uiVal, true);
             }
-            const UnifiedValue curSrcVal = ReadElementPropertyOrState(
-                eb.cachedSourceElement,
-                eb.sourcePropertyId);
+            UIElement* cachedSrc = eb.cachedSourceElement;
+            const std::uint16_t srcProp = eb.sourcePropertyId;
+            const UnifiedValue curSrcVal = ReadElementPropertyOrState(cachedSrc, srcProp);
             if (!BindingValuesEqual(curSrcVal, uiVal) &&
-                eb.cachedSourceElement->SetValue(eb.sourcePropertyId, uiVal, ValueSourceRank::Local)) {
-                (void)eb.cachedSourceElement->NotifyTwoWayPropertyMutated(eb.sourcePropertyId, error);
+                cachedSrc->SetValue(srcProp, uiVal, ValueSourceRank::Local)) {
+                (void)cachedSrc->NotifyTwoWayPropertyMutated(srcProp, error);
                 anyPushed = true;
             }
         }
     }
 
     // 2. Push TwoWay ViewModel ObjectRef bindings
-    for (auto& binding : trackABindings_) {
+    const std::size_t bSnapshotCount = trackABindings_.size();
+    for (std::size_t bIdx = 0u; bIdx < bSnapshotCount && bIdx < trackABindings_.size(); ++bIdx) {
+        auto& binding = trackABindings_[bIdx];
         if (binding.targetElement.Get() != targetElement ||
             binding.targetPropertyId != targetPropertyId ||
             binding.mode != BindingMode::TwoWay ||
@@ -817,6 +884,9 @@ bool DualTrackBindingEngine::PushTwoWayToSource(
         }
     }
 
+    if (anyPushed && wakeHostCallback_) {
+        wakeHostCallback_();
+    }
     return anyPushed;
 }
 
@@ -838,7 +908,9 @@ std::size_t DualTrackBindingEngine::ApplyHotReloadMigration(
         return false;
     };
 
-    for (auto& binding : trackABindings_) {
+    const std::size_t bSnapshotCount = trackABindings_.size();
+    for (std::size_t bIdx = 0u; bIdx < bSnapshotCount && bIdx < trackABindings_.size(); ++bIdx) {
+        auto& binding = trackABindings_[bIdx];
         bool touched = mapObjectRef(binding.rootObject);
         // Unbind old hop observers and clear resolvedHopObjects BEFORE EvaluateAndSyncChain
         // so migrated newRef instances properly acquire addUiObserver() and oldRefs release theirs.
@@ -862,7 +934,7 @@ std::size_t DualTrackBindingEngine::ApplyHotReloadMigration(
         for (auto& hop : binding.hops) {
             hop.declaringTypeId = 0;
         }
-        if (EvaluateAndSyncChain(binding, 0, error) || touched) {
+        if (EvaluateAndSyncChain(trackABindings_[bIdx], 0, error) || touched) {
             ++migratedCount;
         }
     }

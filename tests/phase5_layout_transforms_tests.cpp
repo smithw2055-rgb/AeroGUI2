@@ -112,7 +112,7 @@ namespace aero::tests {
 // Test 1: HorizontalAlignment / VerticalAlignment (0-Alloc Inline) & MaxWidth / MaxHeight
 // ============================================================================
 void TestAlignmentAndMaxDimensionsZeroAlloc() {
-    static_assert(sizeof(UnifiedValue) == 24, "UnifiedValue must remain 24B");
+    static_assert(sizeof(UnifiedValue) == 16, "UnifiedValue must remain 16B");
     static_assert(sizeof(Float4Value) == 16, "Float4Value must remain 16B");
     static_assert(sizeof(CompactPropertyEntry) == 32, "CompactPropertyEntry must remain 32B");
     static_assert(sizeof(FastInlineStorage) == 56, "FastInlineStorage must remain 56B");

@@ -12,6 +12,7 @@
 namespace aero {
 
 class ITextInputMethodHost;
+class AnimationEngine;
 
 enum class InputEventKind : std::uint8_t {
     PointerMove = 0,
@@ -57,6 +58,9 @@ public:
 
     void SetImeHost(ITextInputMethodHost* imeHost) noexcept { imeHost_ = imeHost; }
     [[nodiscard]] ITextInputMethodHost* ImeHost() const noexcept { return imeHost_; }
+
+    void SetAnimationEngine(AnimationEngine* animationEngine) noexcept { animationEngine_ = animationEngine; }
+    [[nodiscard]] AnimationEngine* GetAnimationEngine() const noexcept { return animationEngine_; }
 
     // Non-allocating event ring queue API (for HostDrivers UiPhase_Input)
     bool QueuePointerMove(Point position, std::uint8_t modifiers = KeyMod_None) noexcept;
@@ -126,6 +130,7 @@ private:
 
     UIElement* rootVisual_ = nullptr;
     ITextInputMethodHost* imeHost_ = nullptr;
+    AnimationEngine* animationEngine_ = nullptr;
 
     IntrusivePtr<UIElement> hoveredElement_{};
     IntrusivePtr<UIElement> capturedElement_{};

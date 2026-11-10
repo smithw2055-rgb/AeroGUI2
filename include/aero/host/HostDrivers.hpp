@@ -24,11 +24,12 @@ enum UiPhaseMask : std::uint32_t {
     UiPhase_SimCommandFlush = 1u << 1u,
     UiPhase_TrackABinding = 1u << 2u,
     UiPhase_TrackBBinding = 1u << 3u,
-    UiPhase_Animation = 1u << 4u,
+    UiPhase_MotionStateMachine = 1u << 4u,
     UiPhase_Style = 1u << 5u,
-    UiPhase_Layout = 1u << 6u,
-    UiPhase_RenderRecord = 1u << 7u,
-    UiPhase_All = 0xFFu,
+    UiPhase_Animation = 1u << 6u,
+    UiPhase_Layout = 1u << 7u,
+    UiPhase_RenderRecord = 1u << 8u,
+    UiPhase_All = 0x1FFu,
     // Fast HUD refresh mask: only Track B SIMD column scan + dirty 4KB page recording (skips Style & Layout)
     UiPhase_HudFastRefresh = UiPhase_TrackBBinding | UiPhase_RenderRecord,
 };
@@ -36,6 +37,7 @@ enum UiPhaseMask : std::uint32_t {
 struct HostFrameTelemetry {
     std::uint64_t frameCount = 0;
     std::uint32_t lastActivePhaseMask = 0;
+    std::size_t stateMachineTransitions = 0;
     std::size_t stylePassesRun = 0;
     std::size_t styleTriggerChanges = 0;
     std::size_t animationTrackUpdates = 0;
@@ -335,6 +337,12 @@ public:
 
     [[nodiscard]] bool CanSleepIdle() const noexcept override {
         if (inputRouter_ && inputRouter_->HasPendingEvents()) {
+            return false;
+        }
+        if (bindingEngine_ && bindingEngine_->HasPendingDirtyObjects()) {
+            return false;
+        }
+        if (animationEngine_ && animationEngine_->HasActiveAnimations()) {
             return false;
         }
         return rafState_ == WebRafState::SuspendedIdle;

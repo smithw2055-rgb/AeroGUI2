@@ -67,12 +67,12 @@ void WriteValue(std::vector<std::uint8_t>& out, const UnifiedValue& val) {
     } else if (const auto* f = std::get_if<FloatValue>(&val)) {
         WriteU8(out, static_cast<std::uint8_t>(AxbLiteralTag::Float32));
         WriteF32(out, f->value);
-    } else if (const auto* f4 = std::get_if<Float4Value>(&val)) {
+    } else if (Float4Value f4{}; val.tryGetFloat4(f4)) {
         WriteU8(out, static_cast<std::uint8_t>(AxbLiteralTag::Float4));
-        WriteF32(out, f4->x);
-        WriteF32(out, f4->y);
-        WriteF32(out, f4->z);
-        WriteF32(out, f4->w);
+        WriteF32(out, f4.x);
+        WriteF32(out, f4.y);
+        WriteF32(out, f4.z);
+        WriteF32(out, f4.w);
     } else if (const auto* s = std::get_if<StringValue>(&val)) {
         WriteU8(out, static_cast<std::uint8_t>(AxbLiteralTag::String));
         WriteString(out, s->view());
@@ -174,12 +174,18 @@ struct ByteReader {
                     return false;
                 }
                 out = UnifiedValue{f4};
+                if (out.isTraceable()) {
+                    rs_rt::pinValueInPools(out);
+                }
                 return true;
             }
             case AxbLiteralTag::String: {
                 std::string s;
                 if (!ReadString(s)) return false;
                 out = value::FromString(std::move(s));
+                if (out.isTraceable()) {
+                    rs_rt::pinValueInPools(out);
+                }
                 return true;
             }
         }
@@ -1084,11 +1090,15 @@ std::uint16_t ResolveBuiltinPropertyId(std::string_view propertyName) noexcept {
     if (propertyName == "IsPassword") return PropId_IsPassword;
     if (propertyName == "Style") return PropId_Style;
     if (propertyName == "ItemTemplate") return PropId_ItemTemplate;
-    if (propertyName == "ScaleX") return PropId_AnimScaleX;
-    if (propertyName == "ScaleY") return PropId_AnimScaleY;
-    if (propertyName == "RotateAngle" || propertyName == "Angle") return PropId_AnimRotateAngle;
-    if (propertyName == "TranslateX") return PropId_AnimTranslateX;
-    if (propertyName == "TranslateY") return PropId_AnimTranslateY;
+    if (propertyName == "ScaleX" || propertyName == "AnimScaleX") return PropId_AnimScaleX;
+    if (propertyName == "ScaleY" || propertyName == "AnimScaleY") return PropId_AnimScaleY;
+    if (propertyName == "RotateAngle" || propertyName == "Angle" || propertyName == "AnimRotateAngle") {
+        return PropId_AnimRotateAngle;
+    }
+    if (propertyName == "TranslateX" || propertyName == "AnimTranslateX") return PropId_AnimTranslateX;
+    if (propertyName == "TranslateY" || propertyName == "AnimTranslateY") return PropId_AnimTranslateY;
+    if (propertyName == "SkewX" || propertyName == "AnimSkewX" || propertyName == "AngleX") return PropId_AnimSkewX;
+    if (propertyName == "SkewY" || propertyName == "AnimSkewY" || propertyName == "AngleY") return PropId_AnimSkewY;
     return PropId_Tag;
 }
 
@@ -1125,6 +1135,12 @@ std::uint16_t ResolveAnimationTargetPropertyId(std::string_view targetPropertyPa
 
     if (s.find("ScaleX") != std::string_view::npos) return PropId_AnimScaleX;
     if (s.find("ScaleY") != std::string_view::npos) return PropId_AnimScaleY;
+    if (s.find("SkewX") != std::string_view::npos || s.find("AngleX") != std::string_view::npos) {
+        return PropId_AnimSkewX;
+    }
+    if (s.find("SkewY") != std::string_view::npos || s.find("AngleY") != std::string_view::npos) {
+        return PropId_AnimSkewY;
+    }
     if (s.find("Angle") != std::string_view::npos) return PropId_AnimRotateAngle;
     if (s.find("TranslateX") != std::string_view::npos) return PropId_AnimTranslateX;
     if (s.find("TranslateY") != std::string_view::npos) return PropId_AnimTranslateY;
@@ -1396,6 +1412,8 @@ UnifiedValue ParseBuiltinLiteralPropertyValue(
         case PropId_AnimRotateAngle:
         case PropId_AnimTranslateX:
         case PropId_AnimTranslateY:
+        case PropId_AnimSkewX:
+        case PropId_AnimSkewY:
             return MakeFloat(ParseFloat32Fast(rawValue));
 
         case PropId_IsChecked:
@@ -1566,6 +1584,130 @@ std::uint64_t ComputeSvgPathHash(std::string_view pathData) noexcept {
 
 Rect MeasureSvgPathBounds(std::string_view pathData) {
     return ParseSvgPathGeometry(pathData).bounds;
+}
+
+std::uint16_t SelectAdaptiveMtsdfCellSize(
+    std::string_view pathData,
+    float designMaxSpanPx,
+    float* outRecommendedPxRange) noexcept {
+    const ParsedSvgGeometry geom = ParseSvgPathGeometry(pathData);
+    std::size_t segCount = 0;
+    for (const auto& contour : geom.contours) {
+        if (contour.points.size() >= 2u) {
+            segCount += (contour.points.size() - 1u);
+        }
+    }
+    const float span = std::max(designMaxSpanPx, std::max(geom.bounds.width, geom.bounds.height));
+    std::uint16_t cell = 32u;
+    float range = 4.0f;
+    if (span <= 40.0f && segCount <= 16u) {
+        cell = 32u;
+        range = 4.0f;
+    } else if (span <= 128.0f && segCount <= 64u) {
+        cell = 64u;
+        range = 6.0f;
+    } else {
+        cell = 128u;
+        range = 8.0f;
+    }
+    if (outRecommendedPxRange) {
+        *outRecommendedPxRange = range;
+    }
+    return cell;
+}
+
+void PackMtsdfAtlasSkyline(
+    std::vector<AxbMtsdfPathEntry>& ioEntries,
+    std::uint16_t atlasSize) noexcept {
+    if (ioEntries.empty()) {
+        return;
+    }
+
+    auto tryPackWithSize = [&](std::uint16_t targetAtlasSize) -> bool {
+        const std::uint16_t safeAtlas = std::max<std::uint16_t>(targetAtlasSize, 256u);
+        const std::uint16_t yStart = static_cast<std::uint16_t>(safeAtlas / 2u);
+        std::vector<std::uint16_t> skyline(safeAtlas, yStart);
+
+        // Pack in descending cell height order for minimal Skyline fragmentation while preserving ioEntries order
+        std::vector<std::size_t> order(ioEntries.size());
+        for (std::size_t i = 0; i < order.size(); ++i) {
+            order[i] = i;
+        }
+        std::stable_sort(order.begin(), order.end(), [&](std::size_t a, std::size_t b) {
+            return ioEntries[a].cellHeight > ioEntries[b].cellHeight;
+        });
+
+        const float invAtlas = 1.0f / static_cast<float>(safeAtlas);
+        for (const std::size_t idx : order) {
+            auto& entry = ioEntries[idx];
+            const std::uint16_t cw = std::clamp<std::uint16_t>(entry.cellWidth, 8u, safeAtlas);
+            const std::uint16_t ch = std::clamp<std::uint16_t>(entry.cellHeight, 8u, safeAtlas);
+            std::uint16_t bestX = 0xFFFFu;
+            std::uint16_t bestY = 0xFFFFu;
+
+            for (std::uint16_t x = 0; x + cw <= safeAtlas; x = static_cast<std::uint16_t>(x + 8u)) {
+                std::uint16_t maxY = yStart;
+                for (std::uint16_t k = 0; k < cw; ++k) {
+                    maxY = std::max(maxY, skyline[x + k]);
+                }
+                if (maxY + ch <= safeAtlas && maxY < bestY) {
+                    bestY = maxY;
+                    bestX = x;
+                }
+            }
+
+            if (bestX == 0xFFFFu) {
+                return false;
+            }
+
+            for (std::uint16_t k = 0; k < cw; ++k) {
+                skyline[bestX + k] = static_cast<std::uint16_t>(bestY + ch);
+            }
+
+            entry.atlasWidth = safeAtlas;
+            entry.atlasHeight = safeAtlas;
+            entry.u0 = (static_cast<float>(bestX) + 0.5f) * invAtlas;
+            entry.v0 = (static_cast<float>(bestY) + 0.5f) * invAtlas;
+            entry.u1 = (static_cast<float>(bestX + cw) - 0.5f) * invAtlas;
+            entry.v1 = (static_cast<float>(bestY + ch) - 0.5f) * invAtlas;
+        }
+        return true;
+    };
+
+    const std::uint16_t initialAtlas = std::max<std::uint16_t>(atlasSize, 512u);
+    if (!tryPackWithSize(initialAtlas)) {
+        (void)tryPackWithSize(1024u);
+    }
+}
+
+DecomposedTransform2D PolarDecomposeMatrix2D(const Matrix2D& m) noexcept {
+    DecomposedTransform2D out{};
+    out.translateX = m.tx;
+    out.translateY = m.ty;
+
+    constexpr float kRadToDeg = 180.0f / 3.14159265358979323846f;
+    const float sx = std::sqrt(m.m00 * m.m00 + m.m10 * m.m10);
+    if (sx <= 1e-7f) {
+        out.scaleX = 0.0f;
+        out.scaleY = std::sqrt(m.m01 * m.m01 + m.m11 * m.m11);
+        return out;
+    }
+
+    out.scaleX = sx;
+    const float rad = std::atan2(m.m10, m.m00);
+    out.rotateDeg = rad * kRadToDeg;
+
+    const float c = m.m00 / sx;
+    const float s = m.m10 / sx;
+    // Un-rotate second column (m01, m11)^T by R(-rad):
+    // u = k * sy, v = sy
+    const float u = c * m.m01 + s * m.m11;
+    const float sy = -s * m.m01 + c * m.m11;
+    out.scaleY = sy;
+    if (std::fabs(sy) > 1e-7f) {
+        out.skewXDeg = std::atan(u / sy) * kRadToDeg;
+    }
+    return out;
 }
 
 AxbMtsdfPathEntry BakeSvgPathToMtsdfEntry(
@@ -1913,6 +2055,95 @@ std::string_view AxbPackage::GetString(std::uint32_t index) const noexcept {
     return {};
 }
 
+namespace {
+
+template <typename Fn>
+void VisitPackageValues(const AxbPackage& pkg, Fn&& fn) noexcept {
+    for (const auto& inst : pkg.instructions) {
+        if (inst.literalValue.isTraceable()) {
+            fn(inst.literalValue);
+        }
+    }
+    for (const auto& res : pkg.resources) {
+        if (res.second.isTraceable()) {
+            fn(res.second);
+        }
+    }
+    for (const auto& ch : pkg.bindingChains) {
+        if (ch.fallbackValue.isTraceable()) {
+            fn(ch.fallbackValue);
+        }
+    }
+    auto visitStoryboards = [&](const std::vector<AxbStoryboard>& sbs) noexcept {
+        for (const auto& sb : sbs) {
+            for (const auto& tl : sb.timelines) {
+                if (tl.fromValue.isTraceable()) fn(tl.fromValue);
+                if (tl.toValue.isTraceable()) fn(tl.toValue);
+                for (const auto& kf : tl.keyFrames) {
+                    if (kf.value.isTraceable()) fn(kf.value);
+                }
+            }
+        }
+    };
+    visitStoryboards(pkg.storyboards);
+    for (const auto& st : pkg.styles) {
+        for (const auto& setter : st.setters) {
+            if (setter.value.isTraceable()) fn(setter.value);
+        }
+        for (const auto& trig : st.triggers) {
+            for (const auto& cond : trig.conditions) {
+                if (cond.expectedValue.isTraceable()) fn(cond.expectedValue);
+            }
+            for (const auto& setter : trig.setters) {
+                if (setter.value.isTraceable()) fn(setter.value);
+            }
+            visitStoryboards(trig.enterStoryboards);
+            visitStoryboards(trig.exitStoryboards);
+        }
+        for (const auto& et : st.eventTriggers) {
+            visitStoryboards(et.storyboards);
+        }
+        for (const auto& vsg : st.visualStateGroups) {
+            for (const auto& vs : vsg.states) {
+                for (const auto& setter : vs.setters) {
+                    if (setter.value.isTraceable()) fn(setter.value);
+                }
+                for (const auto& tl : vs.storyboard.timelines) {
+                    if (tl.fromValue.isTraceable()) fn(tl.fromValue);
+                    if (tl.toValue.isTraceable()) fn(tl.toValue);
+                    for (const auto& kf : tl.keyFrames) {
+                        if (kf.value.isTraceable()) fn(kf.value);
+                    }
+                }
+            }
+        }
+    }
+    for (const auto& ci : pkg.contractInputs) {
+        if (ci.defaultValue.isTraceable()) {
+            fn(ci.defaultValue);
+        }
+    }
+    for (const auto& dt : pkg.dataTemplates) {
+        if (dt.templatePackage) {
+            VisitPackageValues(*dt.templatePackage, fn);
+        }
+    }
+}
+
+} // namespace
+
+void AxbPackage::PinValuesInPools() const noexcept {
+    VisitPackageValues(*this, [](const UnifiedValue& v) noexcept {
+        rs_rt::pinValueInPools(v);
+    });
+}
+
+void AxbPackage::MarkValuesInPools() const noexcept {
+    VisitPackageValues(*this, [](const UnifiedValue& v) noexcept {
+        rs_rt::markValueInPools(v);
+    });
+}
+
 bool AxbPackage::BindAgainstProgram(
     const ProgramImage& program,
     std::string_view rootDataTypeName,
@@ -2020,18 +2251,43 @@ bool AxbPackage::BindAgainstProgram(
             }
             const auto* ownerSym = program.resolveType(currentHopOwnerId);
             SymbolId nextTypeId = 0;
+            std::string rawNextTypeName;
             if (ownerSym) {
                 for (const auto& pr : ownerSym->properties) {
                     if (pr.name == hop.memberName && !pr.typeName.empty()) {
-                        nextTypeId = rs_sem::stableTypeId(pr.typeName);
+                        rawNextTypeName = pr.typeName;
                         break;
                     }
                 }
-                if (nextTypeId == 0) {
+                if (rawNextTypeName.empty()) {
                     for (const auto& fl : ownerSym->fields) {
                         if (fl.name == hop.memberName && !fl.typeName.empty()) {
-                            nextTypeId = rs_sem::stableTypeId(fl.typeName);
+                            rawNextTypeName = fl.typeName;
                             break;
+                        }
+                    }
+                }
+                if (!rawNextTypeName.empty()) {
+                    std::string canonicalNext = rawNextTypeName;
+                    if (canonicalNext.find("::") == std::string::npos) {
+                        if (const auto lastDot = canonicalNext.rfind('.'); lastDot != std::string::npos) {
+                            canonicalNext = canonicalNext.substr(0, lastDot) + "::" + canonicalNext.substr(lastDot + 1);
+                        }
+                    }
+                    nextTypeId = rs_sem::stableTypeId(canonicalNext);
+                    if (!program.resolveType(nextTypeId)) {
+                        for (const auto& mod : program.modules()) {
+                            for (const auto& t : mod.types) {
+                                if (t.name == rawNextTypeName ||
+                                    (mod.name + "." + t.name) == rawNextTypeName ||
+                                    (mod.name + "::" + t.name) == rawNextTypeName) {
+                                    nextTypeId = t.id;
+                                    break;
+                                }
+                            }
+                            if (program.resolveType(nextTypeId)) {
+                                break;
+                            }
                         }
                     }
                 }
@@ -2039,6 +2295,23 @@ bool AxbPackage::BindAgainstProgram(
             currentHopOwnerId = nextTypeId;
         }
     };
+
+    // 2b. Bind timeline motionEvents handler method SymbolIds on the partial class
+    if (rootTypeSym) {
+        for (auto& mev : motionEvents) {
+            const std::string_view evName = GetString(mev.eventNameStrIdx);
+            if (evName.empty()) {
+                continue;
+            }
+            const std::string onEvName = "On" + std::string(evName);
+            for (const auto& m : rootTypeSym->methods) {
+                if (m.name == evName || m.name == onEvName) {
+                    mev.handlerSymbolId = m.id;
+                    break;
+                }
+            }
+        }
+    }
 
     // 3. Bind multi-hop PropertySlotHandles in bindingChains
     for (auto& chain : bindingChains) {
@@ -2346,6 +2619,151 @@ std::vector<std::uint8_t> AxbPackage::Serialize() const {
                 : std::vector<std::uint8_t>{};
             WriteU32(out, static_cast<std::uint32_t>(subBytes.size()));
             out.insert(out.end(), subBytes.begin(), subBytes.end());
+        }
+    }
+
+    if (HasMotionSection()) {
+        WriteU32(out, kAxb4MotionSectionMagic);
+
+        // 1. Flat keyframes (28 bytes each)
+        WriteU32(out, static_cast<std::uint32_t>(motionKeyframes.size()));
+        for (const auto& kf : motionKeyframes) {
+            WriteF32(out, kf.timeSec);
+            WriteF32(out, kf.value.x);
+            WriteF32(out, kf.value.y);
+            WriteF32(out, kf.value.z);
+            WriteF32(out, kf.value.w);
+            WriteU8(out, kf.interp);
+            WriteU8(out, kf.easeKindOrCtrlX1);
+            WriteU8(out, kf.easeModeOrCtrlX2);
+            WriteU8(out, kf.flags);
+            WriteU16(out, static_cast<std::uint16_t>(kf.ctrlY1Fixed8));
+            WriteU16(out, static_cast<std::uint16_t>(kf.ctrlY2Fixed8));
+        }
+
+        // 2. Motion tracks
+        WriteU32(out, static_cast<std::uint32_t>(motionTracks.size()));
+        for (const auto& tr : motionTracks) {
+            WriteU16(out, tr.localElementIdx);
+            WriteU16(out, tr.targetPropId);
+            WriteU8(out, tr.channelCount);
+            WriteU8(out, tr.quantizeInlineW);
+            WriteU16(out, tr.reserved);
+            WriteU32(out, tr.firstKeyframeIdx);
+            WriteU32(out, tr.keyframeCount);
+        }
+
+        // 3. Timeline event markers
+        WriteU32(out, static_cast<std::uint32_t>(motionEvents.size()));
+        for (const auto& mev : motionEvents) {
+            WriteF32(out, mev.timeSec);
+            WriteU32(out, mev.eventNameStrIdx);
+            WriteU64(out, mev.handlerSymbolId);
+            WriteF32(out, mev.floatPayload);
+            WriteU32(out, static_cast<std::uint32_t>(mev.intPayload));
+        }
+
+        // 4. Motion clips
+        WriteU32(out, static_cast<std::uint32_t>(motionClips.size()));
+        for (const auto& cl : motionClips) {
+            WriteU32(out, cl.nameStrIdx);
+            WriteF32(out, cl.durationSec);
+            WriteU8(out, cl.isLooping ? 1u : 0u);
+            WriteU8(out, cl.autoReverse ? 1u : 0u);
+            WriteU32(out, cl.firstTrackIdx);
+            WriteU32(out, cl.trackCount);
+            WriteU32(out, cl.firstEventIdx);
+            WriteU32(out, cl.eventCount);
+        }
+
+        // 5. Transform constraints
+        WriteU32(out, static_cast<std::uint32_t>(transformConstraints.size()));
+        for (const auto& tc : transformConstraints) {
+            WriteU16(out, tc.childLocalElementIdx);
+            WriteU16(out, tc.parentLocalElementIdx);
+        }
+
+        // 6. State machine conditions
+        WriteU32(out, static_cast<std::uint32_t>(smConditions.size()));
+        for (const auto& sc : smConditions) {
+            WriteU16(out, sc.inputSlotIdx);
+            WriteU8(out, static_cast<std::uint8_t>(sc.op));
+            WriteU8(out, sc.reserved);
+            WriteF32(out, sc.threshold);
+        }
+
+        // 7. State machine transitions
+        WriteU32(out, static_cast<std::uint32_t>(smTransitions.size()));
+        for (const auto& tr : smTransitions) {
+            WriteU16(out, tr.fromStateIdx);
+            WriteU16(out, tr.toStateIdx);
+            WriteF32(out, tr.crossfadeDurationSec);
+            WriteU8(out, static_cast<std::uint8_t>(tr.easeKind));
+            WriteU8(out, static_cast<std::uint8_t>(tr.easeMode));
+            WriteU8(out, tr.hasExitTime ? 1u : 0u);
+            WriteU8(out, tr.allowSelfInterrupt ? 1u : 0u);
+            WriteF32(out, tr.exitTimeNormalized01);
+            WriteU32(out, tr.firstConditionIdx);
+            WriteU16(out, tr.conditionCount);
+            WriteU16(out, tr.priority);
+        }
+
+        // 8. State machine states
+        WriteU32(out, static_cast<std::uint32_t>(smStates.size()));
+        for (const auto& st : smStates) {
+            WriteU32(out, st.nameStrIdx);
+            WriteU8(out, static_cast<std::uint8_t>(st.kind));
+            WriteU8(out, st.reserved);
+            WriteU16(out, st.primaryClipIdx);
+            WriteU16(out, st.secondaryClipIdx);
+            WriteU16(out, st.progressInputSlot);
+            WriteF32(out, st.speedMultiplier);
+            WriteF32(out, st.blendRangeMin);
+            WriteF32(out, st.blendRangeMax);
+        }
+
+        // 9. State machine layers
+        WriteU32(out, static_cast<std::uint32_t>(smLayers.size()));
+        for (const auto& ly : smLayers) {
+            WriteU32(out, ly.nameStrIdx);
+            WriteU8(out, static_cast<std::uint8_t>(ly.blendMode));
+            WriteU8(out, ly.reserved);
+            WriteU16(out, ly.entryStateIdx);
+            WriteF32(out, ly.layerWeight);
+            WriteU32(out, ly.firstStateIdx);
+            WriteU16(out, ly.stateCount);
+            WriteU32(out, ly.firstTransitionIdx);
+            WriteU16(out, ly.transitionCount);
+        }
+
+        // 10. Pointer listeners
+        WriteU32(out, static_cast<std::uint32_t>(smListeners.size()));
+        for (const auto& ls : smListeners) {
+            WriteU16(out, ls.hitTargetElementIdx);
+            WriteU8(out, static_cast<std::uint8_t>(ls.eventKind));
+            WriteU8(out, static_cast<std::uint8_t>(ls.actionKind));
+            WriteU16(out, ls.targetInputSlot);
+            WriteF32(out, ls.actionValue);
+        }
+
+        // 11. Contract input descriptors
+        WriteU32(out, static_cast<std::uint32_t>(contractInputs.size()));
+        for (const auto& ci : contractInputs) {
+            WriteU32(out, ci.nameStrIdx);
+            WriteU8(out, ci.valueKind);
+            WriteU8(out, ci.isTrigger);
+            WriteU16(out, ci.bridgePropId);
+            WriteValue(out, ci.defaultValue);
+        }
+
+        // 12. State machine descriptors
+        WriteU32(out, static_cast<std::uint32_t>(stateMachines.size()));
+        for (const auto& sm : stateMachines) {
+            WriteU32(out, sm.nameStrIdx);
+            WriteU32(out, sm.firstLayerIdx);
+            WriteU16(out, sm.layerCount);
+            WriteU32(out, sm.firstListenerIdx);
+            WriteU16(out, sm.listenerCount);
         }
     }
 
@@ -2720,138 +3138,404 @@ bool AxbPackage::Deserialize(
     }
 
     if (r.offset < r.size) {
+        const std::size_t peekDtp = r.offset;
         std::uint32_t dtpMagic = 0;
-        if (!r.ReadU32(dtpMagic) || dtpMagic != kAxb4Phase5DSectionMagic) {
+        if (!r.ReadU32(dtpMagic)) {
             return failStcSection("corrupted AXB4 Phase 5D section magic");
         }
+        if (dtpMagic == kAxb4Phase5DSectionMagic) {
+            constexpr std::uint8_t kMaxConverterRaw =
+                static_cast<std::uint8_t>(ValueConverterKind::NullToBoolean);
+            constexpr std::uint8_t kMaxConditionSourceRaw =
+                static_cast<std::uint8_t>(TriggerConditionSource::AncestorProperty);
+            constexpr std::uint8_t kMaxRoutedEventRaw =
+                static_cast<std::uint8_t>(RoutedTriggerEvent::Unchecked);
 
-        constexpr std::uint8_t kMaxConverterRaw =
-            static_cast<std::uint8_t>(ValueConverterKind::NullToBoolean);
-        constexpr std::uint8_t kMaxConditionSourceRaw =
-            static_cast<std::uint8_t>(TriggerConditionSource::DataContextBinding);
-        constexpr std::uint8_t kMaxRoutedEventRaw =
-            static_cast<std::uint8_t>(RoutedTriggerEvent::Unchecked);
-
-        std::uint32_t bcExtCount = 0;
-        if (!r.ReadU32(bcExtCount) || bcExtCount != pkg.bindingChains.size()) {
-            return failStcSection("corrupted AXB4 Phase 5D bindingChains header");
-        }
-        for (std::uint32_t i = 0; i < bcExtCount; ++i) {
-            std::uint8_t relSelf = 0u, conv = 0u;
-            if (!r.ReadString(pkg.bindingChains[i].elementName) ||
-                !r.ReadString(pkg.bindingChains[i].relativeAncestorType) ||
-                !r.ReadU8(relSelf) ||
-                !r.ReadU8(conv) ||
-                conv > kMaxConverterRaw) {
-                return failStcSection("corrupted AXB4 Phase 5D bindingChain extension");
+            std::uint32_t bcExtCount = 0;
+            if (!r.ReadU32(bcExtCount) || bcExtCount != pkg.bindingChains.size()) {
+                return failStcSection("corrupted AXB4 Phase 5D bindingChains header");
             }
-            pkg.bindingChains[i].relativeSelf = (relSelf != 0u);
-            pkg.bindingChains[i].converter = static_cast<ValueConverterKind>(conv);
-        }
-
-        std::uint32_t stExtCount = 0;
-        if (!r.ReadU32(stExtCount) || stExtCount != pkg.styles.size()) {
-            return failStcSection("corrupted AXB4 Phase 5D styles extension header");
-        }
-        for (std::uint32_t si = 0; si < stExtCount; ++si) {
-            auto& st = pkg.styles[si];
-            std::uint32_t trigExtCount = 0;
-            if (!r.ReadU32(trigExtCount) || trigExtCount != st.triggers.size()) {
-                return failStcSection("corrupted AXB4 Phase 5D triggers extension header");
-            }
-            for (std::uint32_t ti = 0; ti < trigExtCount; ++ti) {
-                auto& trig = st.triggers[ti];
-                std::uint32_t condExtCount = 0;
-                if (!r.ReadU32(condExtCount) || condExtCount != trig.conditions.size()) {
-                    return failStcSection("corrupted AXB4 Phase 5D conditions extension header");
+            for (std::uint32_t i = 0; i < bcExtCount; ++i) {
+                std::uint8_t relSelf = 0u, conv = 0u;
+                if (!r.ReadString(pkg.bindingChains[i].elementName) ||
+                    !r.ReadString(pkg.bindingChains[i].relativeAncestorType) ||
+                    !r.ReadU8(relSelf) ||
+                    !r.ReadU8(conv) ||
+                    conv > kMaxConverterRaw) {
+                    return failStcSection("corrupted AXB4 Phase 5D bindingChain extension");
                 }
-                for (std::uint32_t ci = 0; ci < condExtCount; ++ci) {
-                    auto& cond = trig.conditions[ci];
-                    std::uint8_t sk = 0u, cv = 0u, expNull = 0u;
-                    std::uint32_t hopCount = 0;
-                    if (!r.ReadU8(sk) ||
-                        !r.ReadU8(cv) ||
-                        !r.ReadU8(expNull) ||
-                        sk > kMaxConditionSourceRaw ||
-                        cv > kMaxConverterRaw ||
-                        !r.ReadString(cond.sourceName) ||
-                        !r.ReadString(cond.bindingPath) ||
-                        !r.ReadU32(hopCount) ||
-                        hopCount > (r.size - r.offset) / 34u) {
-                        return failStcSection("corrupted AXB4 Phase 5D condition extension");
+                pkg.bindingChains[i].relativeSelf = (relSelf != 0u);
+                pkg.bindingChains[i].converter = static_cast<ValueConverterKind>(conv);
+            }
+
+            std::uint32_t stExtCount = 0;
+            if (!r.ReadU32(stExtCount) || stExtCount != pkg.styles.size()) {
+                return failStcSection("corrupted AXB4 Phase 5D styles extension header");
+            }
+            for (std::uint32_t si = 0; si < stExtCount; ++si) {
+                auto& st = pkg.styles[si];
+                std::uint32_t trigExtCount = 0;
+                if (!r.ReadU32(trigExtCount) || trigExtCount != st.triggers.size()) {
+                    return failStcSection("corrupted AXB4 Phase 5D triggers extension header");
+                }
+                for (std::uint32_t ti = 0; ti < trigExtCount; ++ti) {
+                    auto& trig = st.triggers[ti];
+                    std::uint32_t condExtCount = 0;
+                    if (!r.ReadU32(condExtCount) || condExtCount != trig.conditions.size()) {
+                        return failStcSection("corrupted AXB4 Phase 5D conditions extension header");
                     }
-                    cond.sourceKind = static_cast<TriggerConditionSource>(sk);
-                    cond.converter = static_cast<ValueConverterKind>(cv);
-                    cond.expectNull = (expNull != 0u);
-                    cond.compiledHops.resize(hopCount);
-                    for (std::uint32_t h = 0; h < hopCount; ++h) {
-                        auto& hop = cond.compiledHops[h];
-                        std::uint8_t hopFlags = 0u;
-                        if (!r.ReadString(hop.memberName) ||
-                            !r.ReadU64(hop.declaringTypeId) ||
-                            !r.ReadU32(hop.fieldIndex) ||
-                            !r.ReadU8(hop.observableBitIndex) ||
-                            !r.ReadU64(hop.getterSymbolId) ||
-                            !r.ReadU64(hop.setterSymbolId) ||
-                            !r.ReadU8(hopFlags)) {
-                            return failStcSection("corrupted AXB4 Phase 5D compiledHop entry");
+                    for (std::uint32_t ci = 0; ci < condExtCount; ++ci) {
+                        auto& cond = trig.conditions[ci];
+                        std::uint8_t sk = 0u, cv = 0u, expNull = 0u;
+                        std::uint32_t hopCount = 0;
+                        if (!r.ReadU8(sk) ||
+                            !r.ReadU8(cv) ||
+                            !r.ReadU8(expNull) ||
+                            sk > kMaxConditionSourceRaw ||
+                            cv > kMaxConverterRaw ||
+                            !r.ReadString(cond.sourceName) ||
+                            !r.ReadString(cond.bindingPath) ||
+                            !r.ReadU32(hopCount) ||
+                            hopCount > (r.size - r.offset) / 34u) {
+                            return failStcSection("corrupted AXB4 Phase 5D condition extension");
                         }
-                        hop.isAutoProperty = (hopFlags & 0x01u) != 0u;
-                        hop.isObservable = (hopFlags & 0x02u) != 0u;
-                        hop.isReadOnly = (hopFlags & 0x04u) != 0u;
-                        hop.isSimState = (hopFlags & 0x08u) != 0u;
-                        hop.isSimCommand = (hopFlags & 0x10u) != 0u;
+                        cond.sourceKind = static_cast<TriggerConditionSource>(sk);
+                        cond.converter = static_cast<ValueConverterKind>(cv);
+                        cond.expectNull = (expNull != 0u);
+                        cond.compiledHops.resize(hopCount);
+                        for (std::uint32_t h = 0; h < hopCount; ++h) {
+                            auto& hop = cond.compiledHops[h];
+                            std::uint8_t hopFlags = 0u;
+                            if (!r.ReadString(hop.memberName) ||
+                                !r.ReadU64(hop.declaringTypeId) ||
+                                !r.ReadU32(hop.fieldIndex) ||
+                                !r.ReadU8(hop.observableBitIndex) ||
+                                !r.ReadU64(hop.getterSymbolId) ||
+                                !r.ReadU64(hop.setterSymbolId) ||
+                                !r.ReadU8(hopFlags)) {
+                                return failStcSection("corrupted AXB4 Phase 5D compiledHop entry");
+                            }
+                            hop.isAutoProperty = (hopFlags & 0x01u) != 0u;
+                            hop.isObservable = (hopFlags & 0x02u) != 0u;
+                            hop.isReadOnly = (hopFlags & 0x04u) != 0u;
+                            hop.isSimState = (hopFlags & 0x08u) != 0u;
+                            hop.isSimCommand = (hopFlags & 0x10u) != 0u;
+                        }
+                    }
+                }
+
+                std::uint32_t etCount = 0;
+                if (!r.ReadU32(etCount) || etCount > (r.size - r.offset) / 6u) {
+                    return failStcSection("corrupted AXB4 Phase 5D EventTriggers header");
+                }
+                st.eventTriggers.resize(etCount);
+                for (std::uint32_t ei = 0; ei < etCount; ++ei) {
+                    auto& et = st.eventTriggers[ei];
+                    std::uint8_t ek = 0u;
+                    std::uint32_t sbCount = 0;
+                    if (!r.ReadU8(ek) ||
+                        ek > kMaxRoutedEventRaw ||
+                        !r.ReadString(et.sourceName) ||
+                        !r.ReadU32(sbCount) ||
+                        sbCount > (r.size - r.offset) / 4u) {
+                        return failStcSection("corrupted AXB4 Phase 5D EventTrigger entry");
+                    }
+                    et.eventKind = static_cast<RoutedTriggerEvent>(ek);
+                    et.storyboards.resize(sbCount);
+                    for (std::uint32_t sbi = 0; sbi < sbCount; ++sbi) {
+                        if (!readStoryboard(et.storyboards[sbi])) return false;
                     }
                 }
             }
 
-            std::uint32_t etCount = 0;
-            if (!r.ReadU32(etCount) || etCount > (r.size - r.offset) / 6u) {
-                return failStcSection("corrupted AXB4 Phase 5D EventTriggers header");
+            std::uint32_t dtCount = 0;
+            if (!r.ReadU32(dtCount) || dtCount > (r.size - r.offset) / 12u) {
+                return failStcSection("corrupted AXB4 Phase 5D DataTemplates header");
             }
-            st.eventTriggers.resize(etCount);
-            for (std::uint32_t ei = 0; ei < etCount; ++ei) {
-                auto& et = st.eventTriggers[ei];
-                std::uint8_t ek = 0u;
-                std::uint32_t sbCount = 0;
-                if (!r.ReadU8(ek) ||
-                    ek > kMaxRoutedEventRaw ||
-                    !r.ReadString(et.sourceName) ||
-                    !r.ReadU32(sbCount) ||
-                    sbCount > (r.size - r.offset) / 4u) {
-                    return failStcSection("corrupted AXB4 Phase 5D EventTrigger entry");
+            pkg.dataTemplates.resize(dtCount);
+            for (std::uint32_t di = 0; di < dtCount; ++di) {
+                auto& dt = pkg.dataTemplates[di];
+                std::vector<std::uint8_t> subBytes;
+                if (!r.ReadString(dt.key) ||
+                    !r.ReadString(dt.dataTypeName) ||
+                    !r.ReadBytes(subBytes)) {
+                    return failStcSection("corrupted AXB4 Phase 5D DataTemplate entry");
                 }
-                et.eventKind = static_cast<RoutedTriggerEvent>(ek);
-                et.storyboards.resize(sbCount);
-                for (std::uint32_t sbi = 0; sbi < sbCount; ++sbi) {
-                    if (!readStoryboard(et.storyboards[sbi])) return false;
+                if (!subBytes.empty()) {
+                    auto subPkg = std::make_shared<AxbPackage>();
+                    if (!AxbPackage::Deserialize(subBytes, *subPkg, errorMessage)) {
+                        return false;
+                    }
+                    dt.templatePackage = std::move(subPkg);
                 }
+            }
+        } else {
+            r.offset = peekDtp;
+        }
+    }
+
+    if (r.offset < r.size) {
+        std::uint32_t motMagic = 0;
+        if (!r.ReadU32(motMagic) || motMagic != kAxb4MotionSectionMagic) {
+            return failStcSection("corrupted AXB4 MOT6 section magic");
+        }
+
+        // 1. Flat keyframes
+        std::uint32_t kfCount = 0;
+        if (!r.ReadU32(kfCount) || kfCount > (r.size - r.offset) / 28u) {
+            return failStcSection("corrupted AXB4 MOT6 motionKeyframes header");
+        }
+        pkg.motionKeyframes.resize(kfCount);
+        for (std::uint32_t i = 0; i < kfCount; ++i) {
+            auto& kf = pkg.motionKeyframes[i];
+            std::uint16_t y1Raw = 0u, y2Raw = 0u;
+            if (!r.ReadF32(kf.timeSec) ||
+                !r.ReadF32(kf.value.x) ||
+                !r.ReadF32(kf.value.y) ||
+                !r.ReadF32(kf.value.z) ||
+                !r.ReadF32(kf.value.w) ||
+                !r.ReadU8(kf.interp) ||
+                !r.ReadU8(kf.easeKindOrCtrlX1) ||
+                !r.ReadU8(kf.easeModeOrCtrlX2) ||
+                !r.ReadU8(kf.flags) ||
+                !r.ReadU16(y1Raw) ||
+                !r.ReadU16(y2Raw)) {
+                return failStcSection("corrupted AXB4 MOT6 keyframe entry");
+            }
+            kf.ctrlY1Fixed8 = static_cast<std::int16_t>(y1Raw);
+            kf.ctrlY2Fixed8 = static_cast<std::int16_t>(y2Raw);
+        }
+
+        // 2. Motion tracks
+        std::uint32_t trCount = 0;
+        if (!r.ReadU32(trCount) || trCount > (r.size - r.offset) / 16u) {
+            return failStcSection("corrupted AXB4 MOT6 motionTracks header");
+        }
+        pkg.motionTracks.resize(trCount);
+        for (std::uint32_t i = 0; i < trCount; ++i) {
+            auto& tr = pkg.motionTracks[i];
+            if (!r.ReadU16(tr.localElementIdx) ||
+                !r.ReadU16(tr.targetPropId) ||
+                !r.ReadU8(tr.channelCount) ||
+                !r.ReadU8(tr.quantizeInlineW) ||
+                !r.ReadU16(tr.reserved) ||
+                !r.ReadU32(tr.firstKeyframeIdx) ||
+                !r.ReadU32(tr.keyframeCount)) {
+                return failStcSection("corrupted AXB4 MOT6 track entry");
             }
         }
 
-        std::uint32_t dtCount = 0;
-        if (!r.ReadU32(dtCount) || dtCount > (r.size - r.offset) / 12u) {
-            return failStcSection("corrupted AXB4 Phase 5D DataTemplates header");
+        // 3. Timeline event markers
+        std::uint32_t mevCount = 0;
+        if (!r.ReadU32(mevCount) || mevCount > (r.size - r.offset) / 24u) {
+            return failStcSection("corrupted AXB4 MOT6 motionEvents header");
         }
-        pkg.dataTemplates.resize(dtCount);
-        for (std::uint32_t di = 0; di < dtCount; ++di) {
-            auto& dt = pkg.dataTemplates[di];
-            std::vector<std::uint8_t> subBytes;
-            if (!r.ReadString(dt.key) ||
-                !r.ReadString(dt.dataTypeName) ||
-                !r.ReadBytes(subBytes)) {
-                return failStcSection("corrupted AXB4 Phase 5D DataTemplate entry");
+        pkg.motionEvents.resize(mevCount);
+        for (std::uint32_t i = 0; i < mevCount; ++i) {
+            auto& mev = pkg.motionEvents[i];
+            std::uint32_t ipRaw = 0u;
+            if (!r.ReadF32(mev.timeSec) ||
+                !r.ReadU32(mev.eventNameStrIdx) ||
+                !r.ReadU64(mev.handlerSymbolId) ||
+                !r.ReadF32(mev.floatPayload) ||
+                !r.ReadU32(ipRaw)) {
+                return failStcSection("corrupted AXB4 MOT6 event marker entry");
             }
-            if (!subBytes.empty()) {
-                auto subPkg = std::make_shared<AxbPackage>();
-                if (!AxbPackage::Deserialize(subBytes, *subPkg, errorMessage)) {
-                    return false;
-                }
-                dt.templatePackage = std::move(subPkg);
+            mev.intPayload = static_cast<std::int32_t>(ipRaw);
+        }
+
+        // 4. Motion clips
+        std::uint32_t clCount = 0;
+        if (!r.ReadU32(clCount) || clCount > (r.size - r.offset) / 26u) {
+            return failStcSection("corrupted AXB4 MOT6 motionClips header");
+        }
+        pkg.motionClips.resize(clCount);
+        for (std::uint32_t i = 0; i < clCount; ++i) {
+            auto& cl = pkg.motionClips[i];
+            std::uint8_t loopRaw = 0u, revRaw = 0u;
+            if (!r.ReadU32(cl.nameStrIdx) ||
+                !r.ReadF32(cl.durationSec) ||
+                !r.ReadU8(loopRaw) ||
+                !r.ReadU8(revRaw) ||
+                !r.ReadU32(cl.firstTrackIdx) ||
+                !r.ReadU32(cl.trackCount) ||
+                !r.ReadU32(cl.firstEventIdx) ||
+                !r.ReadU32(cl.eventCount)) {
+                return failStcSection("corrupted AXB4 MOT6 clip entry");
+            }
+            cl.isLooping = (loopRaw != 0u);
+            cl.autoReverse = (revRaw != 0u);
+        }
+
+        // 5. Transform constraints
+        std::uint32_t tcCount = 0;
+        if (!r.ReadU32(tcCount) || tcCount > (r.size - r.offset) / 4u) {
+            return failStcSection("corrupted AXB4 MOT6 transformConstraints header");
+        }
+        pkg.transformConstraints.resize(tcCount);
+        for (std::uint32_t i = 0; i < tcCount; ++i) {
+            auto& tc = pkg.transformConstraints[i];
+            if (!r.ReadU16(tc.childLocalElementIdx) ||
+                !r.ReadU16(tc.parentLocalElementIdx)) {
+                return failStcSection("corrupted AXB4 MOT6 transformConstraint entry");
+            }
+        }
+
+        // 6. State machine conditions
+        std::uint32_t scCount = 0;
+        if (!r.ReadU32(scCount) || scCount > (r.size - r.offset) / 8u) {
+            return failStcSection("corrupted AXB4 MOT6 smConditions header");
+        }
+        pkg.smConditions.resize(scCount);
+        for (std::uint32_t i = 0; i < scCount; ++i) {
+            auto& sc = pkg.smConditions[i];
+            std::uint8_t opRaw = 0u;
+            if (!r.ReadU16(sc.inputSlotIdx) ||
+                !r.ReadU8(opRaw) ||
+                !r.ReadU8(sc.reserved) ||
+                !r.ReadF32(sc.threshold) ||
+                opRaw > static_cast<std::uint8_t>(SmCompareOp::TriggerFired)) {
+                return failStcSection("corrupted AXB4 MOT6 smCondition entry");
+            }
+            sc.op = static_cast<SmCompareOp>(opRaw);
+        }
+
+        // 7. State machine transitions
+        std::uint32_t smTrCount = 0;
+        if (!r.ReadU32(smTrCount) || smTrCount > (r.size - r.offset) / 24u) {
+            return failStcSection("corrupted AXB4 MOT6 smTransitions header");
+        }
+        pkg.smTransitions.resize(smTrCount);
+        for (std::uint32_t i = 0; i < smTrCount; ++i) {
+            auto& tr = pkg.smTransitions[i];
+            std::uint8_t ek = 0u, em = 0u, hasExit = 0u, selfInt = 0u;
+            if (!r.ReadU16(tr.fromStateIdx) ||
+                !r.ReadU16(tr.toStateIdx) ||
+                !r.ReadF32(tr.crossfadeDurationSec) ||
+                !r.ReadU8(ek) ||
+                !r.ReadU8(em) ||
+                !r.ReadU8(hasExit) ||
+                !r.ReadU8(selfInt) ||
+                !r.ReadF32(tr.exitTimeNormalized01) ||
+                !r.ReadU32(tr.firstConditionIdx) ||
+                !r.ReadU16(tr.conditionCount) ||
+                !r.ReadU16(tr.priority) ||
+                ek > kMaxEasingKindRaw ||
+                em > kMaxEasingModeRaw) {
+                return failStcSection("corrupted AXB4 MOT6 smTransition entry");
+            }
+            tr.easeKind = static_cast<EasingFunctionKind>(ek);
+            tr.easeMode = static_cast<EasingMode>(em);
+            tr.hasExitTime = (hasExit != 0u);
+            tr.allowSelfInterrupt = (selfInt != 0u);
+        }
+
+        // 8. State machine states
+        std::uint32_t smStCount = 0;
+        if (!r.ReadU32(smStCount) || smStCount > (r.size - r.offset) / 24u) {
+            return failStcSection("corrupted AXB4 MOT6 smStates header");
+        }
+        pkg.smStates.resize(smStCount);
+        for (std::uint32_t i = 0; i < smStCount; ++i) {
+            auto& st = pkg.smStates[i];
+            std::uint8_t kRaw = 0u;
+            if (!r.ReadU32(st.nameStrIdx) ||
+                !r.ReadU8(kRaw) ||
+                !r.ReadU8(st.reserved) ||
+                !r.ReadU16(st.primaryClipIdx) ||
+                !r.ReadU16(st.secondaryClipIdx) ||
+                !r.ReadU16(st.progressInputSlot) ||
+                !r.ReadF32(st.speedMultiplier) ||
+                !r.ReadF32(st.blendRangeMin) ||
+                !r.ReadF32(st.blendRangeMax) ||
+                kRaw > static_cast<std::uint8_t>(SmStateKind::ExitState)) {
+                return failStcSection("corrupted AXB4 MOT6 smState entry");
+            }
+            st.kind = static_cast<SmStateKind>(kRaw);
+        }
+
+        // 9. State machine layers
+        std::uint32_t smLyCount = 0;
+        if (!r.ReadU32(smLyCount) || smLyCount > (r.size - r.offset) / 24u) {
+            return failStcSection("corrupted AXB4 MOT6 smLayers header");
+        }
+        pkg.smLayers.resize(smLyCount);
+        for (std::uint32_t i = 0; i < smLyCount; ++i) {
+            auto& ly = pkg.smLayers[i];
+            std::uint8_t bmRaw = 0u;
+            if (!r.ReadU32(ly.nameStrIdx) ||
+                !r.ReadU8(bmRaw) ||
+                !r.ReadU8(ly.reserved) ||
+                !r.ReadU16(ly.entryStateIdx) ||
+                !r.ReadF32(ly.layerWeight) ||
+                !r.ReadU32(ly.firstStateIdx) ||
+                !r.ReadU16(ly.stateCount) ||
+                !r.ReadU32(ly.firstTransitionIdx) ||
+                !r.ReadU16(ly.transitionCount) ||
+                bmRaw > static_cast<std::uint8_t>(SmLayerBlendMode::Additive)) {
+                return failStcSection("corrupted AXB4 MOT6 smLayer entry");
+            }
+            ly.blendMode = static_cast<SmLayerBlendMode>(bmRaw);
+        }
+
+        // 10. Pointer listeners
+        std::uint32_t lsCount = 0;
+        if (!r.ReadU32(lsCount) || lsCount > (r.size - r.offset) / 10u) {
+            return failStcSection("corrupted AXB4 MOT6 smListeners header");
+        }
+        pkg.smListeners.resize(lsCount);
+        for (std::uint32_t i = 0; i < lsCount; ++i) {
+            auto& ls = pkg.smListeners[i];
+            std::uint8_t evRaw = 0u, actRaw = 0u;
+            if (!r.ReadU16(ls.hitTargetElementIdx) ||
+                !r.ReadU8(evRaw) ||
+                !r.ReadU8(actRaw) ||
+                !r.ReadU16(ls.targetInputSlot) ||
+                !r.ReadF32(ls.actionValue) ||
+                evRaw > static_cast<std::uint8_t>(SmListenerEventKind::FocusLost) ||
+                actRaw > static_cast<std::uint8_t>(SmListenerActionKind::AddDelta)) {
+                return failStcSection("corrupted AXB4 MOT6 smListener entry");
+            }
+            ls.eventKind = static_cast<SmListenerEventKind>(evRaw);
+            ls.actionKind = static_cast<SmListenerActionKind>(actRaw);
+        }
+
+        // 11. Contract input descriptors
+        std::uint32_t ciCount = 0;
+        if (!r.ReadU32(ciCount) || ciCount > (r.size - r.offset) / 9u) {
+            return failStcSection("corrupted AXB4 MOT6 contractInputs header");
+        }
+        pkg.contractInputs.resize(ciCount);
+        for (std::uint32_t i = 0; i < ciCount; ++i) {
+            auto& ci = pkg.contractInputs[i];
+            if (!r.ReadU32(ci.nameStrIdx) ||
+                !r.ReadU8(ci.valueKind) ||
+                !r.ReadU8(ci.isTrigger) ||
+                !r.ReadU16(ci.bridgePropId) ||
+                !r.ReadValue(ci.defaultValue)) {
+                return failStcSection("corrupted AXB4 MOT6 contractInput entry");
+            }
+        }
+
+        // 12. State machine descriptors
+        std::uint32_t smCount = 0;
+        if (!r.ReadU32(smCount) || smCount > (r.size - r.offset) / 16u) {
+            return failStcSection("corrupted AXB4 MOT6 stateMachines header");
+        }
+        pkg.stateMachines.resize(smCount);
+        for (std::uint32_t i = 0; i < smCount; ++i) {
+            auto& sm = pkg.stateMachines[i];
+            if (!r.ReadU32(sm.nameStrIdx) ||
+                !r.ReadU32(sm.firstLayerIdx) ||
+                !r.ReadU16(sm.layerCount) ||
+                !r.ReadU32(sm.firstListenerIdx) ||
+                !r.ReadU16(sm.listenerCount)) {
+                return failStcSection("corrupted AXB4 MOT6 stateMachine entry");
             }
         }
     }
 
+    pkg.PinValuesInPools();
     outPackage = std::move(pkg);
     return true;
 }

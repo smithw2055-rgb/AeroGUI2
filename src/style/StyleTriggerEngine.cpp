@@ -61,10 +61,10 @@ namespace {
         !std::holds_alternative<bool>(a) && !std::holds_alternative<bool>(b)) {
         return std::fabs(af - bf) <= 1e-4f;
     }
-    if (const auto* af4 = std::get_if<Float4Value>(&a)) {
-        if (const auto* bf4 = std::get_if<Float4Value>(&b)) {
-            return *af4 == *bf4;
-        }
+    Float4Value af4{};
+    Float4Value bf4{};
+    if (a.tryGetFloat4(af4) && b.tryGetFloat4(bf4)) {
+        return af4 == bf4;
     }
     if (const auto* as = std::get_if<StringValue>(&a)) {
         if (const auto* bs = std::get_if<StringValue>(&b)) {
@@ -171,11 +171,84 @@ namespace {
 
 } // namespace
 
+namespace {
+
+template <typename Fn>
+void VisitStoryboardValues(const AxbStoryboard& sb, Fn&& fn) noexcept {
+    for (const auto& tl : sb.timelines) {
+        if (tl.fromValue.isTraceable()) fn(tl.fromValue);
+        if (tl.toValue.isTraceable()) fn(tl.toValue);
+        for (const auto& kf : tl.keyFrames) {
+            if (kf.value.isTraceable()) fn(kf.value);
+        }
+    }
+}
+
+template <typename Fn>
+void VisitStyleValues(const AxbStyleDefinition& st, Fn&& fn) noexcept {
+    for (const auto& s : st.setters) {
+        if (s.value.isTraceable()) fn(s.value);
+    }
+    for (const auto& trig : st.triggers) {
+        for (const auto& cond : trig.conditions) {
+            if (cond.expectedValue.isTraceable()) fn(cond.expectedValue);
+        }
+        for (const auto& s : trig.setters) {
+            if (s.value.isTraceable()) fn(s.value);
+        }
+        for (const auto& sb : trig.enterStoryboards) VisitStoryboardValues(sb, fn);
+        for (const auto& sb : trig.exitStoryboards) VisitStoryboardValues(sb, fn);
+    }
+    for (const auto& et : st.eventTriggers) {
+        for (const auto& sb : et.storyboards) VisitStoryboardValues(sb, fn);
+    }
+    for (const auto& vsg : st.visualStateGroups) {
+        for (const auto& vs : vsg.states) {
+            for (const auto& s : vs.setters) {
+                if (s.value.isTraceable()) fn(s.value);
+            }
+            VisitStoryboardValues(vs.storyboard, fn);
+        }
+    }
+}
+
+} // namespace
+
 StyleTriggerEngine::StyleTriggerEngine(
     AnimationEngine* animationEngine,
     DualTrackBindingEngine* bindingEngine)
     : animationEngine_(animationEngine) {
     SetBindingEngine(bindingEngine);
+    rs_rt::registerExternalValuePoolRootMarker(this, [this]() {
+        MarkValuesInPools();
+    });
+}
+
+StyleTriggerEngine::~StyleTriggerEngine() noexcept {
+    rs_rt::unregisterExternalValuePoolRootMarker(this);
+}
+
+void StyleTriggerEngine::MarkValuesInPools() const noexcept {
+    auto markFn = [](const UnifiedValue& v) noexcept {
+        rs_rt::markValueInPools(v);
+    };
+    for (const auto& kv : keyedStyles_) {
+        VisitStyleValues(kv.second, markFn);
+    }
+    for (const auto& kv : implicitTypeStyles_) {
+        VisitStyleValues(kv.second, markFn);
+    }
+    for (const auto& kv : keyedStoryboards_) {
+        VisitStoryboardValues(kv.second, markFn);
+    }
+    for (const auto& inst : instances_) {
+        VisitStyleValues(inst.resolvedStyle, markFn);
+        for (const auto& slot : inst.propertySnapshots) {
+            if (slot.captured && slot.hadBaseValue && slot.baseValue.isTraceable()) {
+                rs_rt::markValueInPools(slot.baseValue);
+            }
+        }
+    }
 }
 
 void StyleTriggerEngine::Clear() {
@@ -186,6 +259,9 @@ void StyleTriggerEngine::Clear() {
 }
 
 void StyleTriggerEngine::RegisterStyle(AxbStyleDefinition style) {
+    VisitStyleValues(style, [](const UnifiedValue& v) noexcept {
+        rs_rt::pinValueInPools(v);
+    });
     style.targetTypeName = std::string(ShortTypeNameView(style.targetTypeName));
     if (!style.key.empty()) {
         keyedStyles_[style.key] = std::move(style);
@@ -195,6 +271,9 @@ void StyleTriggerEngine::RegisterStyle(AxbStyleDefinition style) {
 }
 
 void StyleTriggerEngine::RegisterStoryboard(AxbStoryboard storyboard) {
+    VisitStoryboardValues(storyboard, [](const UnifiedValue& v) noexcept {
+        rs_rt::pinValueInPools(v);
+    });
     if (!storyboard.key.empty()) {
         keyedStoryboards_[storyboard.key] = std::move(storyboard);
     }
@@ -347,12 +426,18 @@ void StyleTriggerEngine::CaptureSnapshotIfNeeded(PropertySnapshotSlot& slot) {
         slot.hadBaseValue = (curRank != ValueSourceRank::Default);
         slot.baseRank = curRank;
         slot.baseValue = target->GetValue(slot.propId);
+        if (slot.baseValue.isTraceable()) {
+            rs_rt::pinValueInPools(slot.baseValue);
+        }
     } else if (const auto* entry = target->FindCompactEntry(slot.propId)) {
         if (!std::holds_alternative<std::monostate>(entry->effectiveValue) &&
             entry->sourceRank != static_cast<std::uint8_t>(ValueSourceRank::Default)) {
             slot.hadBaseValue = true;
             slot.baseRank = static_cast<ValueSourceRank>(entry->sourceRank);
             slot.baseValue = entry->effectiveValue;
+            if (slot.baseValue.isTraceable()) {
+                rs_rt::pinValueInPools(slot.baseValue);
+            }
         } else {
             slot.hadBaseValue = false;
         }
@@ -984,23 +1069,24 @@ bool StyleTriggerEngine::GoToVisualState(
     if (!element || stateName.empty()) {
         return false;
     }
-    for (auto& inst : instances_) {
-        if (inst.element.Get() != element) {
+    const std::size_t instSnapshot = instances_.size();
+    for (std::size_t i = 0u; i < instSnapshot && i < instances_.size(); ++i) {
+        if (instances_[i].element.Get() != element) {
             continue;
         }
         const std::size_t groupLimit = std::min(
-            inst.resolvedStyle.visualStateGroups.size(),
+            instances_[i].resolvedStyle.visualStateGroups.size(),
             kMaxVisualStateGroupsPerElement);
         for (std::size_t g = 0u; g < groupLimit; ++g) {
             const std::int16_t foundIdx = FindStateIndexByName(
-                inst.resolvedStyle.visualStateGroups[g],
+                instances_[i].resolvedStyle.visualStateGroups[g],
                 stateName);
             if (foundIdx >= 0) {
-                inst.groupStates[g].manualOverride = true;
-                if (inst.groupStates[g].activeStateIndex != foundIdx || !inst.initialized) {
-                    inst.groupStates[g].activeStateIndex = foundIdx;
-                    inst.initialized = true;
-                    ReapplyActiveOverrides(inst, inst.activeTriggerMask, useTransitions, false);
+                instances_[i].groupStates[g].manualOverride = true;
+                if (instances_[i].groupStates[g].activeStateIndex != foundIdx || !instances_[i].initialized) {
+                    instances_[i].groupStates[g].activeStateIndex = foundIdx;
+                    instances_[i].initialized = true;
+                    ReapplyActiveOverrides(instances_[i], instances_[i].activeTriggerMask, useTransitions, false);
                 }
                 return true;
             }
@@ -1028,23 +1114,24 @@ std::size_t StyleTriggerEngine::EvaluateSubtree(UIElement* subtreeRoot, bool res
         return false;
     };
 
-    for (auto& inst : instances_) {
-        UIElement* elem = inst.element.Get();
+    const std::size_t instSnapshotCount = instances_.size();
+    for (std::size_t instIdx = 0u; instIdx < instSnapshotCount && instIdx < instances_.size(); ++instIdx) {
+        UIElement* elem = instances_[instIdx].element.Get();
         if (!elem || !isInSubtree(elem)) {
             continue;
         }
         if (resetEventStates) {
-            inst.eventStates = {};
+            instances_[instIdx].eventStates = {};
         }
 
         // Note: do NOT skip Collapsed elements if a DataTrigger on Visibility itself could un-collapse them!
-        const bool eventFired = EvaluateEventTriggers(inst);
+        const bool eventFired = EvaluateEventTriggers(instances_[instIdx]);
 
         // 1. Compute 64-bit active trigger bitmask
         std::uint64_t nextMask = 0ULL;
-        const std::size_t trigLimit = std::min<std::size_t>(inst.resolvedStyle.triggers.size(), 64u);
+        const std::size_t trigLimit = std::min<std::size_t>(instances_[instIdx].resolvedStyle.triggers.size(), 64u);
         for (std::size_t t = 0u; t < trigLimit; ++t) {
-            auto& trig = inst.resolvedStyle.triggers[t];
+            auto& trig = instances_[instIdx].resolvedStyle.triggers[t];
             if (trig.conditions.empty()) {
                 continue;
             }
@@ -1063,14 +1150,14 @@ std::size_t StyleTriggerEngine::EvaluateSubtree(UIElement* subtreeRoot, bool res
         // 2. Compute automatic CommonStates / FocusStates / CheckStates indices
         bool anyGroupChanged = false;
         const std::size_t groupLimit = std::min(
-            inst.resolvedStyle.visualStateGroups.size(),
+            instances_[instIdx].resolvedStyle.visualStateGroups.size(),
             kMaxVisualStateGroupsPerElement);
         for (std::size_t g = 0u; g < groupLimit; ++g) {
-            if (inst.groupStates[g].manualOverride) {
+            if (instances_[instIdx].groupStates[g].manualOverride) {
                 continue;
             }
-            const auto& vsg = inst.resolvedStyle.visualStateGroups[g];
-            std::int16_t desiredIdx = inst.groupStates[g].activeStateIndex;
+            const auto& vsg = instances_[instIdx].resolvedStyle.visualStateGroups[g];
+            std::int16_t desiredIdx = instances_[instIdx].groupStates[g].activeStateIndex;
 
             if (vsg.name == "CommonStates" || vsg.name.empty()) {
                 if (!elem->IsEffectivelyEnabled()) {
@@ -1097,23 +1184,23 @@ std::size_t StyleTriggerEngine::EvaluateSubtree(UIElement* subtreeRoot, bool res
                     : FindStateIndexByName(vsg, "Unchecked");
             }
 
-            if (desiredIdx != inst.groupStates[g].activeStateIndex) {
-                inst.groupStates[g].activeStateIndex = desiredIdx;
+            if (desiredIdx != instances_[instIdx].groupStates[g].activeStateIndex) {
+                instances_[instIdx].groupStates[g].activeStateIndex = desiredIdx;
                 anyGroupChanged = true;
             }
         }
 
         // O(1) clean-frame short-circuit!
-        if (inst.initialized && nextMask == inst.activeTriggerMask && !anyGroupChanged) {
+        if (instances_[instIdx].initialized && nextMask == instances_[instIdx].activeTriggerMask && !anyGroupChanged) {
             if (eventFired) {
                 ++changedElements;
             }
             continue;
         }
 
-        const bool firstPass = !inst.initialized;
-        inst.initialized = true;
-        ReapplyActiveOverrides(inst, nextMask, !firstPass, firstPass);
+        const bool firstPass = !instances_[instIdx].initialized;
+        instances_[instIdx].initialized = true;
+        ReapplyActiveOverrides(instances_[instIdx], nextMask, !firstPass, firstPass);
         ++changedElements;
     }
 

@@ -18,6 +18,7 @@ namespace aero {
 
 struct AxbPackage;
 class DualTrackBindingEngine;
+class AnimationEngine;
 
 template <typename T>
 class IntrusivePtr {
@@ -441,6 +442,53 @@ public:
     void SetRenderTransformOrigin(Point origin);
     [[nodiscard]] Point GetRenderTransformOrigin() const noexcept;
 
+    // Animated & decomposed 2D transform channel getters
+    [[nodiscard]] float GetTranslateX() const noexcept {
+        if (const auto* rt = FindCompactEntry(PropId_RenderTransformTranslation);
+            rt && rt->sourceRank == static_cast<std::uint8_t>(ValueSourceRank::Animation)) {
+            Float4Value f4{};
+            if (rt->effectiveValue.tryGetFloat4(f4)) return f4.x;
+        }
+        float v = 0.0f;
+        if (value::TryGetFloat(GetValue(PropId_AnimTranslateX), v)) return v;
+        return GetRenderTransform().tx;
+    }
+    [[nodiscard]] float GetTranslateY() const noexcept {
+        if (const auto* rt = FindCompactEntry(PropId_RenderTransformTranslation);
+            rt && rt->sourceRank == static_cast<std::uint8_t>(ValueSourceRank::Animation)) {
+            Float4Value f4{};
+            if (rt->effectiveValue.tryGetFloat4(f4)) return f4.y;
+        }
+        float v = 0.0f;
+        if (value::TryGetFloat(GetValue(PropId_AnimTranslateY), v)) return v;
+        return GetRenderTransform().ty;
+    }
+    [[nodiscard]] float GetScaleX() const noexcept {
+        float v = 1.0f;
+        (void)value::TryGetFloat(GetValue(PropId_AnimScaleX), v);
+        return v;
+    }
+    [[nodiscard]] float GetScaleY() const noexcept {
+        float v = 1.0f;
+        (void)value::TryGetFloat(GetValue(PropId_AnimScaleY), v);
+        return v;
+    }
+    [[nodiscard]] float GetRotateAngle() const noexcept {
+        float v = 0.0f;
+        (void)value::TryGetFloat(GetValue(PropId_AnimRotateAngle), v);
+        return v;
+    }
+    [[nodiscard]] float GetSkewX() const noexcept {
+        float v = 0.0f;
+        (void)value::TryGetFloat(GetValue(PropId_AnimSkewX), v);
+        return v;
+    }
+    [[nodiscard]] float GetSkewY() const noexcept {
+        float v = 0.0f;
+        (void)value::TryGetFloat(GetValue(PropId_AnimSkewY), v);
+        return v;
+    }
+
     // Effective layout-space 2D affine matrix combining LayoutTransform, RenderTransform + RenderTransformOrigin,
     // legacy PropId_RenderTransformMatrix, and Projection3D Yaw/Pitch around FinalRect center.
     [[nodiscard]] Matrix2D ComputeLocalEffectiveTransform2D() const noexcept;
@@ -547,19 +595,69 @@ public:
     bool ForceClearSparseEntry(std::uint16_t propId);
     bool ClearValue(std::uint16_t propId, ValueSourceRank rank = ValueSourceRank::Local);
 
-    // Sparse entry metadata inspection/mutation (bindingSlotId & animationTrackId in 32B entry)
+    // Sparse entry metadata inspection/mutation (bindingSlotId, animationTrackId & extended blend/contract slots in 32B entry)
     [[nodiscard]] const CompactPropertyEntry* FindCompactEntry(
         std::uint16_t propId) const noexcept;
     bool SetPropertyMetadata(
         std::uint16_t propId,
         std::uint16_t bindingSlotId,
         std::uint16_t animationTrackId);
+    bool SetPropertyExtendedMetadata(
+        std::uint16_t propId,
+        std::uint16_t secondaryTrackId,
+        std::uint16_t contractInputSlot,
+        std::uint16_t blendWeightUnorm16 = 0u,
+        std::uint16_t entryMetaFlags = 0u);
     [[nodiscard]] std::size_t SparsePropertyCount() const noexcept {
-        return sparseProps_.size();
+        std::size_t count = 0u;
+        for (const auto& e : sparseProps_) {
+            if (!std::holds_alternative<std::monostate>(e.effectiveValue)) {
+                ++count;
+            }
+        }
+        return count;
     }
+    [[nodiscard]] const std::vector<CompactPropertyEntry>& SparseProperties() const noexcept {
+        return sparseProps_;
+    }
+
+    // C-03: 16-bit fast-slot active animation bitmask for O(1) fast-inline track tracking & restoration
+    [[nodiscard]] std::uint16_t GetFastActiveAnimMask() const noexcept {
+        return fastActiveAnimMask_;
+    }
+    void SetFastActiveAnimBit(int fastSlotIdx, bool active) noexcept {
+        if (fastSlotIdx >= 0 && fastSlotIdx < static_cast<int>(kFastInlinePropertySlotCount)) {
+            const auto bit = static_cast<std::uint16_t>(1u << static_cast<unsigned>(fastSlotIdx));
+            if (active) {
+                fastActiveAnimMask_ |= bit;
+            } else {
+                fastActiveAnimMask_ &= static_cast<std::uint16_t>(~bit);
+            }
+        }
+    }
+    void SetFastPropertyAnimActive(std::uint16_t propId, bool active) noexcept {
+        int slotIdx = -1;
+        if (propId < 8u) {
+            slotIdx = static_cast<int>(propId);
+        } else if (propId == PropId_HorizontalAlignment) {
+            slotIdx = 8;
+        } else if (propId == PropId_VerticalAlignment) {
+            slotIdx = 9;
+        } else if (propId == PropId_IsEnabled) {
+            slotIdx = 10;
+        } else if (propId == PropId_Focusable) {
+            slotIdx = 11;
+        }
+        SetFastActiveAnimBit(slotIdx, active);
+    }
+
+    void MarkSparseValuesInPools() const noexcept;
+    void MarkSubtreeValuesInPools() const noexcept;
 
 protected:
     void CoerceSparseFloatInPlace(std::uint16_t propId, float clampedValue) noexcept;
+    void EnsureRegisteredInValuePoolSet() noexcept;
+    virtual void MarkExtraValuesInPools() const noexcept {}
 
 private:
     friend class DepthBucketLayoutQueue;
@@ -620,6 +718,8 @@ private:
     ObjectRef boundWrapperRef_{};
     PersistentRoot pinnedWrapperRoot_{};
     bool isConnectedToRoot_ = false;
+    bool registeredInValuePoolSet_ = false;
+    std::uint16_t fastActiveAnimMask_ = 0u;
     std::array<std::uint8_t, kFastInlinePropertySlotCount> fastInlineRanks_{};
 
     // High-frequency properties inline + 32B compact sparse vector
@@ -647,7 +747,8 @@ public:
         DualTrackBindingEngine* bindingEngine = nullptr,
         ObjectRef dataContext = {},
         const Interpreter* eventInterpreter = nullptr,
-        rs_aot::ExecutionContext* eventAotContext = nullptr);
+        rs_aot::ExecutionContext* eventAotContext = nullptr,
+        AnimationEngine* animationEngine = nullptr);
     ~Window() override = default;
 
     static const TypeClass* StaticTypeClass() noexcept;
@@ -668,7 +769,8 @@ public:
         DualTrackBindingEngine* bindingEngine = nullptr,
         ObjectRef dataContext = {},
         const Interpreter* eventInterpreter = nullptr,
-        rs_aot::ExecutionContext* eventAotContext = nullptr);
+        rs_aot::ExecutionContext* eventAotContext = nullptr,
+        AnimationEngine* animationEngine = nullptr);
 
 private:
     std::string windowClassName_;

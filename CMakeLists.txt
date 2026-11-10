@@ -146,6 +146,12 @@ if(AERO_BUILD_COMPILER_TOOLS)
         )
         target_link_libraries(aerogui_phase5d_tests PRIVATE aerogui_core)
         add_test(NAME aerogui_phase5d_tests COMMAND aerogui_phase5d_tests)
+
+        add_executable(aerogui_phase6_tests
+            tests/phase6_abi_motion_importers_tests.cpp
+        )
+        target_link_libraries(aerogui_phase6_tests PRIVATE aerogui_core)
+        add_test(NAME aerogui_phase6_tests COMMAND aerogui_phase6_tests)
     endif()
 else()
     # In Wasm / REALSCRIPT_SLIM_RUNTIME mode, aerogui_core aliases the pure runtime

@@ -30,6 +30,9 @@ public:
     explicit StyleTriggerEngine(
         AnimationEngine* animationEngine = nullptr,
         DualTrackBindingEngine* bindingEngine = nullptr);
+    ~StyleTriggerEngine() noexcept;
+
+    void MarkValuesInPools() const noexcept;
 
     void SetAnimationEngine(AnimationEngine* animationEngine) noexcept {
         animationEngine_ = animationEngine;

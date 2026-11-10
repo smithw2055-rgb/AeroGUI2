@@ -138,7 +138,8 @@ std::shared_ptr<const ProgramImage> CompileAndLinkProgram(
 // Test 1: 24B UnifiedValue & Float4Value UI Primitives (P0-2)
 // ============================================================================
 void TestUnifiedValueAndFloat4() {
-    static_assert(sizeof(UnifiedValue) == 24, "UnifiedValue must be 24 bytes");
+    static_assert(sizeof(UnifiedValue) == 16, "UnifiedValue must be 16 bytes");
+    static_assert(alignof(UnifiedValue) == 16, "UnifiedValue must be 16-byte aligned");
     static_assert(sizeof(Float4Value) == 16, "Float4Value must be 16 bytes");
 
     const Color c{0.25f, 0.5f, 0.75f, 1.0f};
@@ -221,8 +222,8 @@ void TestUIElementVisualTreeAndProperties() {
         sizeof(CompactPropertyEntry) == 32,
         "CompactPropertyEntry must be 32 bytes");
     static_assert(
-        alignof(CompactPropertyEntry) == 8,
-        "CompactPropertyEntry must be 8-byte aligned");
+        alignof(CompactPropertyEntry) == 16,
+        "CompactPropertyEntry must be 16-byte aligned");
 
     auto window = MakeIntrusive<Window>();
     auto panel = MakeIntrusive<Panel>();
