@@ -1,6 +1,7 @@
 #include "aero/render/PagedRenderTree.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstring>
 
@@ -9,6 +10,8 @@
 namespace aero {
 
 namespace {
+
+std::atomic<std::uint32_t> gNextRenderTreeId{1u};
 
 [[nodiscard]] std::uint8_t ClampToByte(float v) noexcept {
     if (v <= 0.0f) return 0u;
@@ -24,6 +27,145 @@ namespace {
     const float clamped = (opacity <= 0.0f) ? 0.0f : (opacity >= 1.0f ? 1.0f : opacity);
     const auto scaledA = static_cast<std::uint32_t>(static_cast<float>(a) * clamped + 0.5f);
     return (baseRgba & 0x00FFFFFFu) | ((scaledA & 0xFFu) << 24u);
+}
+
+[[nodiscard]] bool SameClipRect(const CommandPageHeader& hdr, const Rect& clip, bool clipActive) noexcept {
+    const bool hdrClipped = (hdr.flags & CommandPageFlag_ScissorClipActive) != 0u;
+    if (hdrClipped != clipActive) {
+        return false;
+    }
+    if (!clipActive) {
+        return true;
+    }
+    return std::fabs(hdr.clipX - clip.x) < 0.01f &&
+           std::fabs(hdr.clipY - clip.y) < 0.01f &&
+           std::fabs(hdr.clipW - clip.width) < 0.01f &&
+           std::fabs(hdr.clipH - clip.height) < 0.01f;
+}
+
+[[nodiscard]] Rect IntersectRect(const Rect& a, const Rect& b) noexcept {
+    const float x0 = std::max(a.x, b.x);
+    const float y0 = std::max(a.y, b.y);
+    const float x1 = std::min(a.x + a.width, b.x + b.width);
+    const float y1 = std::min(a.y + a.height, b.y + b.height);
+    return Rect{x0, y0, std::max(0.0f, x1 - x0), std::max(0.0f, y1 - y0)};
+}
+
+struct MtsdfMappedQuad {
+    Rect quadRect{};
+    float u0 = 0.0f;
+    float v0 = 0.0f;
+    float u1 = 1.0f;
+    float v1 = 1.0f;
+};
+
+// Map the geometry sub-region [cellBoxX0..cellBoxX1] x [cellBoxY0..cellBoxY1] inside the uniform-scaled
+// MTSDF cell onto screen `fitted`, preserving exact non-square aspect ratio and outer AA/stroke padding.
+[[nodiscard]] MtsdfMappedQuad ComputeMtsdfMappedPlacement(
+    const Rect& fitted,
+    const AxbMtsdfPathEntry& entry,
+    float strokeThickness) noexcept {
+    if (fitted.width <= 0.0f || fitted.height <= 0.0f ||
+        entry.cellWidth == 0 || entry.cellHeight == 0) {
+        return MtsdfMappedQuad{fitted, entry.u0, entry.v0, entry.u1, entry.v1};
+    }
+
+    const float cellW = static_cast<float>(entry.cellWidth);
+    const float cellH = static_cast<float>(entry.cellHeight);
+    const float safeRange = std::max(entry.pxRange, 1.0f);
+    const float padTexels = std::ceil(safeRange) + 1.0f;
+    const float usableW = std::max(2.0f, cellW - 2.0f * padTexels);
+    const float usableH = std::max(2.0f, cellH - 2.0f * padTexels);
+    const float uniformScale = std::min(
+        usableW / std::max(1e-3f, entry.boundsW),
+        usableH / std::max(1e-3f, entry.boundsH));
+
+    const float scaledW = std::max(1e-3f, entry.boundsW * uniformScale);
+    const float scaledH = std::max(1e-3f, entry.boundsH * uniformScale);
+    const float cellBoxX0 = (cellW - scaledW) * 0.5f;
+    const float cellBoxY0 = (cellH - scaledH) * 0.5f;
+
+    const float screenPadPx = 1.5f + std::max(0.0f, strokeThickness) * 0.5f;
+    const float marginTexX = std::max(1.0f, screenPadPx * (scaledW / std::max(1.0f, fitted.width)));
+    const float marginTexY = std::max(1.0f, screenPadPx * (scaledH / std::max(1.0f, fitted.height)));
+
+    const float tx0 = std::clamp(cellBoxX0 - marginTexX, 0.5f, cellBoxX0);
+    const float tx1 = std::clamp(cellBoxX0 + scaledW + marginTexX, cellBoxX0 + scaledW, cellW - 0.5f);
+    const float ty0 = std::clamp(cellBoxY0 - marginTexY, 0.5f, cellBoxY0);
+    const float ty1 = std::clamp(cellBoxY0 + scaledH + marginTexY, cellBoxY0 + scaledH, cellH - 0.5f);
+
+    const float pxPerTexX = fitted.width / scaledW;
+    const float pxPerTexY = fitted.height / scaledH;
+    const Rect quadRect{
+        fitted.x - (cellBoxX0 - tx0) * pxPerTexX,
+        fitted.y - (cellBoxY0 - ty0) * pxPerTexY,
+        (tx1 - tx0) * pxPerTexX,
+        (ty1 - ty0) * pxPerTexY};
+
+    const float invCellSpanX = 1.0f / std::max(1.0f, cellW - 1.0f);
+    const float invCellSpanY = 1.0f / std::max(1.0f, cellH - 1.0f);
+    const float u0 = entry.u0 + (tx0 - 0.5f) * invCellSpanX * (entry.u1 - entry.u0);
+    const float u1 = entry.u0 + (tx1 - 0.5f) * invCellSpanX * (entry.u1 - entry.u0);
+    const float v0 = entry.v0 + (ty0 - 0.5f) * invCellSpanY * (entry.v1 - entry.v0);
+    const float v1 = entry.v0 + (ty1 - 0.5f) * invCellSpanY * (entry.v1 - entry.v0);
+
+    return MtsdfMappedQuad{quadRect, u0, v0, u1, v1};
+}
+
+void ClassifyPathEmission(
+    const Path& pathElem,
+    bool& outEmitFillNode,
+    bool& outEmitSeparateStrokeNode) noexcept {
+    const float strokeW = pathElem.GetStrokeThickness();
+    const bool hasStrokeBrush = pathElem.HasExplicitStroke() && strokeW > 0.0f;
+    const bool hasFillBrush = pathElem.HasExplicitFill();
+    if (!hasFillBrush && hasStrokeBrush) {
+        outEmitFillNode = false;
+        outEmitSeparateStrokeNode = true;
+    } else if (hasFillBrush && hasStrokeBrush) {
+        outEmitFillNode = true;
+        outEmitSeparateStrokeNode = true;
+    } else {
+        outEmitFillNode = true;
+        outEmitSeparateStrokeNode = false;
+    }
+}
+
+[[nodiscard]] Rect ComputeStretchedDestRect(
+    const Rect& box,
+    float naturalW,
+    float naturalH,
+    Stretch stretch) noexcept {
+    if (box.width <= 0.0f || box.height <= 0.0f || naturalW <= 0.0f || naturalH <= 0.0f) {
+        return box;
+    }
+    switch (stretch) {
+        case Stretch::None:
+            return Rect{box.x, box.y, naturalW, naturalH};
+        case Stretch::Fill:
+            return box;
+        case Stretch::UniformToFill: {
+            const float s = std::max(box.width / naturalW, box.height / naturalH);
+            const float dw = naturalW * s;
+            const float dh = naturalH * s;
+            return Rect{
+                box.x + (box.width - dw) * 0.5f,
+                box.y + (box.height - dh) * 0.5f,
+                dw,
+                dh};
+        }
+        case Stretch::Uniform:
+        default: {
+            const float s = std::min(box.width / naturalW, box.height / naturalH);
+            const float dw = naturalW * s;
+            const float dh = naturalH * s;
+            return Rect{
+                box.x + (box.width - dw) * 0.5f,
+                box.y + (box.height - dh) * 0.5f,
+                dw,
+                dh};
+        }
+    }
 }
 
 } // namespace
@@ -52,6 +194,29 @@ void UnpackSdfRoundedRectParams(
     outBorderThickness = static_cast<float>((packed >> 8u) & 0xFFu) * 0.5f;
 }
 
+std::uint16_t PackMtsdfParams(
+    float pxRange,
+    std::uint16_t atlasSize,
+    float strokeThickness,
+    bool strokeOnly) noexcept {
+    const float safeAtlas = static_cast<float>(std::max<std::uint16_t>(atlasSize, 16u));
+    const float uvRange = std::max(pxRange, 1.0f) / safeAtlas;
+    const auto quantUvRange = static_cast<std::uint16_t>(
+        std::clamp(uvRange * 4096.0f + 0.5f, 1.0f, 255.0f)) & 0xFFu;
+    const auto quantStroke = static_cast<std::uint16_t>(
+        std::clamp(strokeThickness * 2.0f + 0.5f, 0.0f, 127.0f)) & 0x7Fu;
+    const std::uint16_t strokeOnlyBit = strokeOnly ? 0x8000u : 0x0000u;
+    return static_cast<std::uint16_t>(quantUvRange | (quantStroke << 8u) | strokeOnlyBit);
+}
+
+void UnpackMtsdfParams(
+    std::uint16_t packed,
+    float& outUvRange,
+    float& outStrokeThickness) noexcept {
+    outUvRange = static_cast<float>(std::max<std::uint16_t>(1u, packed & 0xFFu)) / 4096.0f;
+    outStrokeThickness = static_cast<float>((packed >> 8u) & 0x7Fu) * 0.5f;
+}
+
 float EvaluateSdfRoundedRectCoverage(
     float sampleLocalX,
     float sampleLocalY,
@@ -74,7 +239,62 @@ float EvaluateSdfRoundedRectCoverage(
     return t * t * (3.0f - 2.0f * t);
 }
 
-PagedRenderTree::PagedRenderTree() {
+float EvaluateMtsdfCoverage(
+    const AxbMtsdfPathEntry& entry,
+    float normX01,
+    float normY01,
+    float renderedWidthPx,
+    float renderedHeightPx,
+    bool singleChannelTrueSdfOnly) noexcept {
+    if (entry.cellWidth == 0 || entry.cellHeight == 0 ||
+        entry.mtsdfRgbaPixels.size() < static_cast<std::size_t>(entry.cellWidth) * entry.cellHeight * 4u) {
+        return 0.0f;
+    }
+
+    const float u = std::clamp(normX01, 0.0f, 1.0f) * static_cast<float>(entry.cellWidth) - 0.5f;
+    const float v = std::clamp(normY01, 0.0f, 1.0f) * static_cast<float>(entry.cellHeight) - 0.5f;
+
+    const int x0 = std::clamp(static_cast<int>(std::floor(u)), 0, static_cast<int>(entry.cellWidth) - 1);
+    const int y0 = std::clamp(static_cast<int>(std::floor(v)), 0, static_cast<int>(entry.cellHeight) - 1);
+    const int x1 = std::min(x0 + 1, static_cast<int>(entry.cellWidth) - 1);
+    const int y1 = std::min(y0 + 1, static_cast<int>(entry.cellHeight) - 1);
+    const float fx = std::clamp(u - std::floor(u), 0.0f, 1.0f);
+    const float fy = std::clamp(v - std::floor(v), 0.0f, 1.0f);
+
+    auto sampleChannel = [&](int cx, int cy, std::size_t ch) noexcept -> float {
+        const std::size_t idx = (static_cast<std::size_t>(cy) * entry.cellWidth + static_cast<std::size_t>(cx)) * 4u + ch;
+        return static_cast<float>(entry.mtsdfRgbaPixels[idx]) / 255.0f;
+    };
+
+    auto bilerpChannel = [&](std::size_t ch) noexcept -> float {
+        const float c00 = sampleChannel(x0, y0, ch);
+        const float c10 = sampleChannel(x1, y0, ch);
+        const float c01 = sampleChannel(x0, y1, ch);
+        const float c11 = sampleChannel(x1, y1, ch);
+        const float top = c00 + (c10 - c00) * fx;
+        const float bot = c01 + (c11 - c01) * fx;
+        return top + (bot - top) * fy;
+    };
+
+    float sd = 0.0f;
+    if (singleChannelTrueSdfOnly) {
+        sd = bilerpChannel(3u);
+    } else {
+        const float r = bilerpChannel(0u);
+        const float g = bilerpChannel(1u);
+        const float b = bilerpChannel(2u);
+        sd = std::max(std::min(r, g), std::min(std::max(r, g), b));
+    }
+
+    const float scaleX = std::max(1.0f, renderedWidthPx) / static_cast<float>(entry.cellWidth);
+    const float scaleY = std::max(1.0f, renderedHeightPx) / static_cast<float>(entry.cellHeight);
+    const float screenPxRange = std::max(0.5f * entry.pxRange * (scaleX + scaleY), 1.0f);
+    const float screenPxDistance = screenPxRange * (sd - 0.5f);
+    return std::clamp(screenPxDistance + 0.5f, 0.0f, 1.0f);
+}
+
+PagedRenderTree::PagedRenderTree()
+    : treeId_(gNextRenderTreeId.fetch_add(1u, std::memory_order_relaxed)) {
     InitPreCachedDigitGlyphs();
 }
 
@@ -82,28 +302,96 @@ void PagedRenderTree::InitPreCachedDigitGlyphs() noexcept {
     for (auto& g : preCachedGlyphs_) {
         g = GlyphUvRect{0.0f, 0.0f, 0.0f, 0.0f, 8.0f, false};
     }
-    // Pre-cache ASCII HUD symbols ('0'-'9', '.', '%', '+', '-', '/', ':', ' ') in a 16x8 normalized UV grid
+    // Partition top half of atlas (v in [0.0..0.5), rows 0..7 of 16x16 grid) exclusively for font glyphs
+    // so bottom half (v in [0.5..1.0)) never collides with MTSDF vector icon cells.
     constexpr char kHudChars[] = "0123456789.%+-/: ";
     for (std::size_t i = 0; i < sizeof(kHudChars) - 1; ++i) {
         const auto ch = static_cast<std::uint8_t>(kHudChars[i]) & 0x7Fu;
         const float col = static_cast<float>(i % 16u);
-        const float row = static_cast<float>(i / 16u);
+        const float row = static_cast<float>(i / 16u); // rows 0..1
         GlyphUvRect rect{};
         rect.u0 = col * 0.0625f;
-        rect.v0 = row * 0.125f;
+        rect.v0 = row * 0.0625f;
         rect.u1 = rect.u0 + 0.055f;
-        rect.v1 = rect.v0 + 0.110f;
+        rect.v1 = rect.v0 + 0.055f;
         rect.advanceX = 9.0f;
         rect.valid = true;
         preCachedGlyphs_[ch] = rect;
     }
+    std::size_t slot = sizeof(kHudChars) - 1u; // slots 17..94 -> rows 1..5
+    for (std::uint32_t cp = 0x20u; cp <= 0x7Eu; ++cp) {
+        if (preCachedGlyphs_[cp].valid) {
+            continue;
+        }
+        const float col = static_cast<float>(slot % 16u);
+        const float row = static_cast<float>((slot / 16u) % 6u);
+        GlyphUvRect rect{};
+        rect.u0 = col * 0.0625f;
+        rect.v0 = row * 0.0625f;
+        rect.u1 = rect.u0 + 0.055f;
+        rect.v1 = rect.v0 + 0.055f;
+        rect.advanceX = 8.4f;
+        rect.valid = true;
+        preCachedGlyphs_[cp] = rect;
+        ++slot;
+    }
+}
+
+GlyphUvRect PagedRenderTree::LookupCodePointGlyph(std::uint32_t codePoint) const noexcept {
+    if (codePoint < 128u && preCachedGlyphs_[codePoint].valid) {
+        return preCachedGlyphs_[codePoint];
+    }
+    // Deterministic hashed UV slot in rows 6..7 (v in [0.375..0.500)) of the top-half glyph region
+    const std::uint32_t mixed = (codePoint * 2654435761u) >> 16u;
+    const float col = static_cast<float>(mixed & 0x0Fu);
+    const float row = static_cast<float>(6u + ((mixed >> 4u) & 0x01u));
+    GlyphUvRect rect{};
+    rect.u0 = col * 0.0625f;
+    rect.v0 = row * 0.0625f;
+    rect.u1 = rect.u0 + 0.058f;
+    rect.v1 = rect.v0 + 0.058f;
+    rect.advanceX = IsWideCjkCodePoint(codePoint) ? 14.0f : 8.4f;
+    rect.valid = true;
+    return rect;
 }
 
 void PagedRenderTree::Clear() noexcept {
+    boundRootElement_ = nullptr;
+    activeClipRect_ = Rect{0.0f, 0.0f, 16384.0f, 16384.0f};
+    activeClipEnabled_ = false;
     pages_.clear();
     nodes_.clear();
     pageDirtyFlags_.clear();
     dirtyPageList_.clear();
+    // Advance treeId_ so stale cached renderNodeId_ handles on UIElements never collide
+    treeId_ = gNextRenderTreeId.fetch_add(1u, std::memory_order_relaxed);
+}
+
+std::uint32_t PagedRenderTree::EnsurePageForAllocation(
+    std::uint32_t neededVertices,
+    const Rect& clipRect,
+    bool clipActive) {
+    const bool needNewPage = pages_.empty() ||
+        (pages_.back().header.vertexCount + neededVertices > kVerticesPerCommandPage) ||
+        !SameClipRect(pages_.back().header, clipRect, clipActive);
+
+    if (needNewPage) {
+        const auto newPageIdx = static_cast<std::uint32_t>(pages_.size());
+        CommandPage newPage{};
+        newPage.header.pageIndex = newPageIdx;
+        newPage.header.firstNodeId = static_cast<std::uint32_t>(nodes_.size());
+        if (clipActive) {
+            newPage.header.clipX = clipRect.x;
+            newPage.header.clipY = clipRect.y;
+            newPage.header.clipW = clipRect.width;
+            newPage.header.clipH = clipRect.height;
+            newPage.header.flags |= CommandPageFlag_ScissorClipActive;
+        }
+        pages_.push_back(newPage);
+        pageDirtyFlags_.push_back(0u);
+        dirtyPageList_.reserve(pages_.size());
+    }
+    return static_cast<std::uint32_t>(pages_.size() - 1u);
 }
 
 void PagedRenderTree::MarkPageDirty(
@@ -122,6 +410,30 @@ void PagedRenderTree::MarkPageDirty(
         pageDirtyFlags_[pageIndex] = 1u;
         dirtyPageList_.push_back(pageIndex);
     }
+}
+
+void PagedRenderTree::ZeroOutNodeVertices(RenderNodeDescriptor& node) noexcept {
+    if (node.pageIndex >= pages_.size()) {
+        return;
+    }
+    CommandPage& page = pages_[node.pageIndex];
+    const std::size_t vOffset = node.vertexOffsetInPage;
+    const std::size_t count = std::min<std::size_t>(
+        node.vertexCount,
+        kVerticesPerCommandPage - std::min<std::size_t>(vOffset, kVerticesPerCommandPage));
+    AeroVertex* __restrict v = page.vertices.data() + vOffset;
+    for (std::size_t i = 0; i < count; ++i) {
+        v[i] = AeroVertex{};
+        v[i].rgba = 0u;
+    }
+    const std::uint32_t firstQuad = static_cast<std::uint32_t>(vOffset / 4u);
+    const std::uint32_t quadCount = static_cast<std::uint32_t>(count / 4u);
+    for (std::uint32_t q = 0; q < quadCount; ++q) {
+        if (firstQuad + q < 64u) {
+            page.header.dirtyQuadMask |= (1ULL << (firstQuad + q));
+        }
+    }
+    MarkPageDirty(node.pageIndex, node.vertexOffsetInPage);
 }
 
 void PagedRenderTree::WriteQuadVertices(RenderNodeDescriptor& node) noexcept {
@@ -155,12 +467,21 @@ void PagedRenderTree::WriteQuadVertices(RenderNodeDescriptor& node) noexcept {
     const auto prim = static_cast<std::uint16_t>(node.primType);
     const std::uint16_t flags = node.encodedSdfParams;
 
-    // For SdfRoundedRect, (u, v) stores local quad coordinates [-w*0.5, +w*0.5] x [-h*0.5, +h*0.5]
-    // so the fragment shader computes exact SDF distance without extra uniforms.
-    const float uMin = (node.primType == AeroPrimType::SdfRoundedRect) ? (-w * 0.5f) : 0.0f;
-    const float vMin = (node.primType == AeroPrimType::SdfRoundedRect) ? (-h * 0.5f) : 0.0f;
-    const float uMax = (node.primType == AeroPrimType::SdfRoundedRect) ? (w * 0.5f) : 1.0f;
-    const float vMax = (node.primType == AeroPrimType::SdfRoundedRect) ? (h * 0.5f) : 1.0f;
+    float uMin = node.uv0X;
+    float vMin = node.uv0Y;
+    float uMax = node.uv1X;
+    float vMax = node.uv1Y;
+    if (node.primType == AeroPrimType::SdfRoundedRect) {
+        uMin = -w * 0.5f;
+        vMin = -h * 0.5f;
+        uMax = w * 0.5f;
+        vMax = h * 0.5f;
+    } else if (node.primType == AeroPrimType::SolidQuad) {
+        uMin = 0.0f;
+        vMin = 0.0f;
+        uMax = 1.0f;
+        vMax = 1.0f;
+    }
 
     v[0] = AeroVertex{x0, y0, uMin, vMin, packedColor, prim, flags};
     v[1] = AeroVertex{x1, y1, uMax, vMin, packedColor, prim, flags};
@@ -177,17 +498,7 @@ std::uint32_t PagedRenderTree::AllocateRenderNode(
     float cornerRadius,
     float borderThickness,
     const UIElement* owner) {
-    if (pages_.empty() || (pages_.back().header.vertexCount + 4u > kVerticesPerCommandPage)) {
-        const auto newPageIdx = static_cast<std::uint32_t>(pages_.size());
-        CommandPage newPage{};
-        newPage.header.pageIndex = newPageIdx;
-        newPage.header.firstNodeId = static_cast<std::uint32_t>(nodes_.size());
-        pages_.push_back(newPage);
-        pageDirtyFlags_.push_back(0u);
-        dirtyPageList_.reserve(pages_.size());
-    }
-
-    const auto pageIdx = static_cast<std::uint32_t>(pages_.size() - 1u);
+    const std::uint32_t pageIdx = EnsurePageForAllocation(4u, activeClipRect_, activeClipEnabled_);
     CommandPage& page = pages_[pageIdx];
     const auto vOffset = static_cast<std::uint16_t>(page.header.vertexCount);
     page.header.vertexCount += 4u;
@@ -229,17 +540,8 @@ std::uint32_t PagedRenderTree::AllocateHudDigitsNode(
     const std::uint32_t maxQuadsPerPage = static_cast<std::uint32_t>(kVerticesPerCommandPage / 4u);
     const std::uint32_t clampedDigits = std::clamp(maxDigits, 1u, maxQuadsPerPage);
     const std::uint32_t neededVertices = clampedDigits * 4u;
-    if (pages_.empty() || (pages_.back().header.vertexCount + neededVertices > kVerticesPerCommandPage)) {
-        const auto newPageIdx = static_cast<std::uint32_t>(pages_.size());
-        CommandPage newPage{};
-        newPage.header.pageIndex = newPageIdx;
-        newPage.header.firstNodeId = static_cast<std::uint32_t>(nodes_.size());
-        pages_.push_back(newPage);
-        pageDirtyFlags_.push_back(0u);
-        dirtyPageList_.reserve(pages_.size());
-    }
+    const std::uint32_t pageIdx = EnsurePageForAllocation(neededVertices, activeClipRect_, activeClipEnabled_);
 
-    const auto pageIdx = static_cast<std::uint32_t>(pages_.size() - 1u);
     CommandPage& page = pages_[pageIdx];
     const auto vOffset = static_cast<std::uint16_t>(page.header.vertexCount);
     page.header.vertexCount += neededVertices;
@@ -262,6 +564,147 @@ std::uint32_t PagedRenderTree::AllocateHudDigitsNode(
 
     nodes_.push_back(desc);
     (void)UpdateHudDigitsText(nodeId, "0");
+    return nodeId;
+}
+
+std::uint32_t PagedRenderTree::AllocateTextRunNode(
+    float x,
+    float y,
+    float fontSize,
+    std::string_view utf8Text,
+    const Color& color,
+    float opacity,
+    std::uint32_t reservedGlyphCapacity,
+    const UIElement* owner) {
+    const std::uint32_t maxQuadsPerPage = static_cast<std::uint32_t>(kVerticesPerCommandPage / 4u);
+    const std::size_t visibleGlyphs = CountVisibleUtf8Glyphs(utf8Text);
+    const std::uint32_t desiredSlots = (reservedGlyphCapacity > 0u)
+        ? reservedGlyphCapacity
+        : static_cast<std::uint32_t>(std::max<std::size_t>(visibleGlyphs + 8u, 16u));
+    const std::uint32_t clampedSlots = std::clamp(desiredSlots, 1u, maxQuadsPerPage);
+    const std::uint32_t neededVertices = clampedSlots * 4u;
+
+    const std::uint32_t pageIdx = EnsurePageForAllocation(neededVertices, activeClipRect_, activeClipEnabled_);
+    CommandPage& page = pages_[pageIdx];
+    const auto vOffset = static_cast<std::uint16_t>(page.header.vertexCount);
+    page.header.vertexCount += neededVertices;
+    page.header.nodeCount += 1u;
+
+    const auto nodeId = static_cast<std::uint32_t>(nodes_.size());
+    RenderNodeDescriptor desc{};
+    desc.nodeId = nodeId;
+    desc.pageIndex = pageIdx;
+    desc.vertexOffsetInPage = vOffset;
+    desc.vertexCount = static_cast<std::uint16_t>(neededVertices);
+    desc.primType = AeroPrimType::SdfTextGlyph;
+    desc.encodedSdfParams = AeroVertexFlag_GrayscaleSdfText;
+    desc.x = x;
+    desc.y = y;
+    desc.width = std::max(1.0f, fontSize);
+    desc.height = std::max(1.0f, fontSize * 1.2f);
+    desc.opacity = opacity;
+    desc.baseRgba = PackColorRgba8(color, 1.0f);
+    desc.sourceElement = owner;
+
+    nodes_.push_back(desc);
+    (void)UpdateTextRunNode(nodeId, x, y, fontSize, utf8Text, color, opacity);
+    return nodeId;
+}
+
+std::uint32_t PagedRenderTree::AllocateMtsdfPathNode(
+    float x,
+    float y,
+    float width,
+    float height,
+    const AxbMtsdfPathEntry& mtsdfEntry,
+    const Color& fillColor,
+    float strokeThickness,
+    float opacity,
+    const UIElement* owner) {
+    const std::uint32_t pageIdx = EnsurePageForAllocation(4u, activeClipRect_, activeClipEnabled_);
+    CommandPage& page = pages_[pageIdx];
+    const auto vOffset = static_cast<std::uint16_t>(page.header.vertexCount);
+    page.header.vertexCount += 4u;
+    page.header.nodeCount += 1u;
+
+    const MtsdfMappedQuad mapped = ComputeMtsdfMappedPlacement(
+        Rect{x, y, width, height},
+        mtsdfEntry,
+        strokeThickness);
+
+    const auto nodeId = static_cast<std::uint32_t>(nodes_.size());
+    RenderNodeDescriptor desc{};
+    desc.nodeId = nodeId;
+    desc.pageIndex = pageIdx;
+    desc.vertexOffsetInPage = vOffset;
+    desc.vertexCount = 4u;
+    desc.primType = AeroPrimType::MsdfVectorPath;
+    desc.encodedSdfParams = PackMtsdfParams(
+        mtsdfEntry.pxRange,
+        mtsdfEntry.atlasWidth,
+        strokeThickness,
+        false);
+    desc.x = mapped.quadRect.x;
+    desc.y = mapped.quadRect.y;
+    desc.width = mapped.quadRect.width;
+    desc.height = mapped.quadRect.height;
+    desc.opacity = opacity;
+    desc.borderThickness = strokeThickness;
+    desc.uv0X = mapped.u0;
+    desc.uv0Y = mapped.v0;
+    desc.uv1X = mapped.u1;
+    desc.uv1Y = mapped.v1;
+    desc.baseRgba = PackColorRgba8(fillColor, 1.0f);
+    desc.mtsdfPathHash = mtsdfEntry.pathHash;
+    desc.sourceElement = owner;
+
+    nodes_.push_back(desc);
+    WriteQuadVertices(nodes_.back());
+    MarkPageDirty(pageIdx, vOffset);
+    return nodeId;
+}
+
+std::uint32_t PagedRenderTree::AllocateTexturedNode(
+    float x,
+    float y,
+    float width,
+    float height,
+    float u0,
+    float v0,
+    float u1,
+    float v1,
+    const Color& tintColor,
+    float opacity,
+    const UIElement* owner) {
+    const std::uint32_t pageIdx = EnsurePageForAllocation(4u, activeClipRect_, activeClipEnabled_);
+    CommandPage& page = pages_[pageIdx];
+    const auto vOffset = static_cast<std::uint16_t>(page.header.vertexCount);
+    page.header.vertexCount += 4u;
+    page.header.nodeCount += 1u;
+
+    const auto nodeId = static_cast<std::uint32_t>(nodes_.size());
+    RenderNodeDescriptor desc{};
+    desc.nodeId = nodeId;
+    desc.pageIndex = pageIdx;
+    desc.vertexOffsetInPage = vOffset;
+    desc.vertexCount = 4u;
+    desc.primType = AeroPrimType::TexturedQuad;
+    desc.encodedSdfParams = AeroVertexFlag_None;
+    desc.x = x;
+    desc.y = y;
+    desc.width = width;
+    desc.height = height;
+    desc.opacity = opacity;
+    desc.uv0X = u0;
+    desc.uv0Y = v0;
+    desc.uv1X = u1;
+    desc.uv1Y = v1;
+    desc.baseRgba = PackColorRgba8(tintColor, 1.0f);
+    desc.sourceElement = owner;
+
+    nodes_.push_back(desc);
+    WriteQuadVertices(nodes_.back());
+    MarkPageDirty(pageIdx, vOffset);
     return nodeId;
 }
 
@@ -391,7 +834,6 @@ bool PagedRenderTree::UpdateHudDigitsText(
             q[3] = AeroVertex{x0, y1, uv.u0, uv.v1, packedColor, prim, flags};
             cursorX += gw;
         } else {
-            // Degenerate zero-area quad for unused trailing digit slots
             q[0] = AeroVertex{cursorX, cursorY, 0.0f, 0.0f, 0u, prim, flags};
             q[1] = AeroVertex{cursorX, cursorY, 0.0f, 0.0f, 0u, prim, flags};
             q[2] = AeroVertex{cursorX, cursorY, 0.0f, 0.0f, 0u, prim, flags};
@@ -408,6 +850,224 @@ bool PagedRenderTree::UpdateHudDigitsText(
     }
     MarkPageDirty(node.pageIndex, node.vertexOffsetInPage);
     return true;
+}
+
+bool PagedRenderTree::UpdateTextRunNodeSlice(
+    std::uint32_t nodeId,
+    float x,
+    float y,
+    float fontSize,
+    std::string_view utf8Text,
+    std::size_t& ioUtf8Cursor,
+    float& ioLocalPenX,
+    float& ioLocalPenY,
+    const Color& color,
+    float opacity) noexcept {
+    if (nodeId >= nodes_.size()) {
+        return false;
+    }
+    RenderNodeDescriptor& node = nodes_[nodeId];
+    if (node.pageIndex >= pages_.size() || node.primType != AeroPrimType::SdfTextGlyph) {
+        return false;
+    }
+
+    const std::size_t maxSlots = node.vertexCount / 4u;
+    node.x = x;
+    node.y = y;
+    node.width = std::max(1.0f, fontSize);
+    node.height = std::max(1.0f, fontSize * 1.2f);
+    node.opacity = opacity;
+    node.baseRgba = PackColorRgba8(color, 1.0f);
+
+    // Recompute node.tx / node.ty from baseTx / baseTy so moving (x, y) under Projection3D stays exact
+    node.tx = node.baseTx + node.x * (node.m00 - 1.0f);
+    node.ty = node.baseTy + node.y * (node.m11 - 1.0f);
+
+    CommandPage& page = pages_[node.pageIndex];
+    AeroVertex* __restrict vBase = page.vertices.data() + node.vertexOffsetInPage;
+    const std::uint32_t packedColor = ScalePackedRgbaAlpha(node.baseRgba, node.opacity);
+    const auto prim = static_cast<std::uint16_t>(AeroPrimType::SdfTextGlyph);
+    const std::uint16_t flags = node.encodedSdfParams;
+
+    const float originX = node.x + node.tx;
+    const float originY = node.y + node.ty;
+    const float lineH = node.height;
+
+    for (std::size_t slot = 0; slot < maxSlots; ++slot) {
+        AeroVertex* __restrict q = vBase + (slot * 4u);
+        std::uint32_t cp = 0;
+        bool emitted = false;
+        while (DecodeNextUtf8CodePoint(utf8Text, ioUtf8Cursor, cp)) {
+            if (cp == '\n') {
+                ioLocalPenX = 0.0f;
+                ioLocalPenY += lineH;
+                continue;
+            }
+            if (cp == '\r') {
+                continue;
+            }
+            const bool wideCjk = IsWideCjkCodePoint(cp);
+            const float gw = wideCjk ? (node.width * 0.95f) : (node.width * 0.6f);
+            const float gh = lineH;
+            if (cp == ' ') {
+                ioLocalPenX += gw;
+                continue;
+            }
+            const GlyphUvRect uv = LookupCodePointGlyph(cp);
+            const float gx0 = originX + ioLocalPenX * node.m00 + ioLocalPenY * node.m01;
+            const float gy0 = originY + ioLocalPenX * node.m10 + ioLocalPenY * node.m11;
+            const float gx1 = gx0 + gw * node.m00;
+            const float gy1 = gy0 + gw * node.m10;
+            const float gx2 = gx1 + gh * node.m01;
+            const float gy2 = gy1 + gh * node.m11;
+            const float gx3 = gx0 + gh * node.m01;
+            const float gy3 = gy0 + gh * node.m11;
+
+            q[0] = AeroVertex{gx0, gy0, uv.u0, uv.v0, packedColor, prim, flags};
+            q[1] = AeroVertex{gx1, gy1, uv.u1, uv.v0, packedColor, prim, flags};
+            q[2] = AeroVertex{gx2, gy2, uv.u1, uv.v1, packedColor, prim, flags};
+            q[3] = AeroVertex{gx3, gy3, uv.u0, uv.v1, packedColor, prim, flags};
+            ioLocalPenX += gw;
+            emitted = true;
+            break;
+        }
+
+        if (!emitted) {
+            q[0] = AeroVertex{originX, originY, 0.0f, 0.0f, 0u, prim, flags};
+            q[1] = AeroVertex{originX, originY, 0.0f, 0.0f, 0u, prim, flags};
+            q[2] = AeroVertex{originX, originY, 0.0f, 0.0f, 0u, prim, flags};
+            q[3] = AeroVertex{originX, originY, 0.0f, 0.0f, 0u, prim, flags};
+        }
+    }
+
+    const std::uint32_t firstQuadIdx = static_cast<std::uint32_t>(node.vertexOffsetInPage / 4u);
+    for (std::size_t i = 0; i < maxSlots; ++i) {
+        const std::uint32_t qIdx = firstQuadIdx + static_cast<std::uint32_t>(i);
+        if (qIdx < 64u) {
+            page.header.dirtyQuadMask |= (1ULL << qIdx);
+        }
+    }
+    MarkPageDirty(node.pageIndex, node.vertexOffsetInPage);
+    return true;
+}
+
+bool PagedRenderTree::UpdateTextRunNode(
+    std::uint32_t nodeId,
+    float x,
+    float y,
+    float fontSize,
+    std::string_view utf8Text,
+    const Color& color,
+    float opacity) noexcept {
+    if (nodeId >= nodes_.size()) {
+        return false;
+    }
+    const RenderNodeDescriptor& node = nodes_[nodeId];
+    if (node.pageIndex >= pages_.size() || node.primType != AeroPrimType::SdfTextGlyph) {
+        return false;
+    }
+
+    const std::size_t maxSlots = node.vertexCount / 4u;
+    const std::size_t neededGlyphs = CountVisibleUtf8Glyphs(utf8Text);
+    if (neededGlyphs > maxSlots) {
+        return false;
+    }
+
+    std::size_t utf8Cursor = 0;
+    float localPenX = 0.0f;
+    float localPenY = 0.0f;
+    return UpdateTextRunNodeSlice(
+        nodeId,
+        x,
+        y,
+        fontSize,
+        utf8Text,
+        utf8Cursor,
+        localPenX,
+        localPenY,
+        color,
+        opacity);
+}
+
+std::uint16_t PagedRenderTree::EmitTextRunNodes(
+    float x,
+    float y,
+    float fontSize,
+    std::string_view utf8Text,
+    const Color& color,
+    float opacity,
+    const RenderTraversalState& curState,
+    const UIElement* owner) {
+    const std::uint32_t maxQuadsPerPage = static_cast<std::uint32_t>(kVerticesPerCommandPage / 4u);
+    const std::size_t visibleGlyphs = CountVisibleUtf8Glyphs(utf8Text);
+    const std::size_t totalDesiredSlots = std::max<std::size_t>(visibleGlyphs + 8u, 16u);
+    const std::size_t chunkCount = std::max<std::size_t>(
+        1u,
+        (visibleGlyphs + maxQuadsPerPage - 1u) / maxQuadsPerPage);
+
+    std::size_t remainingDesired = totalDesiredSlots;
+    std::size_t utf8Cursor = 0;
+    float localPenX = 0.0f;
+    float localPenY = 0.0f;
+    std::uint16_t emittedNodes = 0u;
+
+    for (std::size_t c = 0; c < chunkCount; ++c) {
+        const std::uint32_t slotCap = (c + 1u < chunkCount)
+            ? maxQuadsPerPage
+            : static_cast<std::uint32_t>(std::clamp<std::size_t>(remainingDesired, 1u, maxQuadsPerPage));
+        if (remainingDesired > slotCap) {
+            remainingDesired -= slotCap;
+        } else {
+            remainingDesired = 0u;
+        }
+
+        const std::uint32_t neededVertices = slotCap * 4u;
+        const std::uint32_t pageIdx = EnsurePageForAllocation(neededVertices, activeClipRect_, activeClipEnabled_);
+        CommandPage& page = pages_[pageIdx];
+        const auto vOffset = static_cast<std::uint16_t>(page.header.vertexCount);
+        page.header.vertexCount += neededVertices;
+        page.header.nodeCount += 1u;
+
+        const auto nodeId = static_cast<std::uint32_t>(nodes_.size());
+        RenderNodeDescriptor desc{};
+        desc.nodeId = nodeId;
+        desc.pageIndex = pageIdx;
+        desc.vertexOffsetInPage = vOffset;
+        desc.vertexCount = static_cast<std::uint16_t>(neededVertices);
+        desc.primType = AeroPrimType::SdfTextGlyph;
+        desc.encodedSdfParams = AeroVertexFlag_GrayscaleSdfText;
+        desc.x = x;
+        desc.y = y;
+        desc.width = std::max(1.0f, fontSize);
+        desc.height = std::max(1.0f, fontSize * 1.2f);
+        desc.opacity = opacity;
+        desc.m00 = curState.m00;
+        desc.m01 = curState.m01;
+        desc.m10 = curState.m10;
+        desc.m11 = curState.m11;
+        desc.baseTx = curState.tx;
+        desc.baseTy = curState.ty;
+        desc.tx = curState.tx + x * (curState.m00 - 1.0f);
+        desc.ty = curState.ty + y * (curState.m11 - 1.0f);
+        desc.inheritedOpacity = curState.inheritedOpacity;
+        desc.baseRgba = PackColorRgba8(color, 1.0f);
+        desc.sourceElement = owner;
+
+        nodes_.push_back(desc);
+        (void)UpdateTextRunNodeSlice(
+            nodeId,
+            x,
+            y,
+            fontSize,
+            utf8Text,
+            utf8Cursor,
+            localPenX,
+            localPenY,
+            color,
+            opacity);
+        ++emittedNodes;
+    }
+    return emittedNodes;
 }
 
 bool PagedRenderTree::InvalidateNodePage(std::uint32_t nodeId) noexcept {
@@ -435,48 +1095,510 @@ bool PagedRenderTree::UpdateDirtyElement(const UIElement* element) noexcept {
     if (!element) {
         return false;
     }
-    for (auto& node : nodes_) {
-        if (node.sourceElement == element) {
-            const Visibility vis = element->GetVisibility();
-            const Rect r = element->FinalRect();
-            node.x = r.x;
-            node.y = r.y;
-            if (vis == Visibility::Collapsed) {
-                node.width = 0.0f;
-                node.height = 0.0f;
-                node.opacity = 0.0f;
-            } else {
-                node.width = (r.width > 0.0f) ? r.width : std::max(0.0f, element->GetWidth());
-                node.height = (r.height > 0.0f) ? r.height : std::max(0.0f, element->GetHeight());
-                node.opacity = (vis == Visibility::Visible) ? element->GetOpacity() : 0.0f;
-            }
-            if (auto bg = value::TryGetColor(element->GetValue(PropId_Background))) {
-                node.baseRgba = PackColorRgba8(*bg, 1.0f);
-            } else if (auto fg = value::TryGetColor(element->GetValue(PropId_Foreground))) {
-                node.baseRgba = PackColorRgba8(*fg, 1.0f);
-            } else {
-                node.baseRgba = PackColorRgba8(Color{0.18f, 0.22f, 0.28f, 1.0f}, 1.0f);
-            }
-            if (auto cr = value::TryGetCornerRadius(element->GetValue(PropId_CornerRadius))) {
-                node.cornerRadius = cr->topLeft;
-            } else {
-                node.cornerRadius = 0.0f;
-            }
-            if (auto bt = value::TryGetThickness(element->GetValue(PropId_BorderThickness))) {
-                node.borderThickness = bt->left;
-            } else {
-                node.borderThickness = 0.0f;
-            }
-            node.encodedSdfParams = PackSdfRoundedRectParams(node.cornerRadius, node.borderThickness);
-            node.primType = (node.cornerRadius > 0.0f || node.borderThickness > 0.0f)
-                ? AeroPrimType::SdfRoundedRect
-                : AeroPrimType::SolidQuad;
-            WriteQuadVertices(node);
-            MarkPageDirty(node.pageIndex, node.vertexOffsetInPage);
-            return true;
+
+    // Reconstruct ancestor state along parent chain in O(depth) with 0 heap allocations
+    const UIElement* chain[64]{};
+    std::size_t depth = 0;
+    for (const UIElement* anc = element->Parent(); anc != nullptr && depth < 64u; anc = anc->Parent()) {
+        chain[depth++] = anc;
+    }
+
+    RenderTraversalState parentState{};
+    for (std::size_t idx = depth; idx > 0u; --idx) {
+        const UIElement* anc = chain[idx - 1u];
+        const Visibility ancVis = anc->GetVisibility();
+        if (ancVis != Visibility::Visible) {
+            parentState.inheritedOpacity = 0.0f;
+        } else {
+            parentState.inheritedOpacity *= std::clamp(anc->GetOpacity(), 0.0f, 1.0f);
+        }
+        const Rect ar = anc->FinalRect();
+        const float aw = (ar.width > 0.0f) ? ar.width : std::max(0.0f, anc->GetWidth());
+        const float ah = (ar.height > 0.0f) ? ar.height : std::max(0.0f, anc->GetHeight());
+        const UnifiedValue rtmVal = anc->GetValue(PropId_RenderTransformMatrix);
+        if (const auto* f4 = std::get_if<Float4Value>(&rtmVal)) {
+            parentState.tx += parentState.m00 * f4->z;
+            parentState.ty += parentState.m11 * f4->w;
+            parentState.m00 *= f4->x;
+            parentState.m11 *= f4->y;
+        }
+        float yawDeg = 0.0f, pitchDeg = 0.0f;
+        (void)TryGetFloat(anc->GetValue(PropId_Projection3DYaw), yawDeg);
+        (void)TryGetFloat(anc->GetValue(PropId_Projection3DPitch), pitchDeg);
+        if (yawDeg != 0.0f || pitchDeg != 0.0f) {
+            constexpr float kDegToRad = 3.14159265358979323846f / 180.0f;
+            const float cosYaw = std::cos(yawDeg * kDegToRad);
+            const float cosPitch = std::cos(pitchDeg * kDegToRad);
+            const float cx = ar.x + aw * 0.5f;
+            const float cy = ar.y + ah * 0.5f;
+            parentState.tx += parentState.m00 * (cx * (1.0f - cosYaw));
+            parentState.ty += parentState.m11 * (cy * (1.0f - cosPitch));
+            parentState.m00 *= cosYaw;
+            parentState.m11 *= cosPitch;
+        }
+        const UnifiedValue clipVal = anc->GetValue(PropId_ClipToBounds);
+        if (const auto* clipBool = std::get_if<bool>(&clipVal); clipBool && *clipBool) {
+            const float cx0 = parentState.m00 * ar.x + parentState.tx;
+            const float cx1 = parentState.m00 * (ar.x + aw) + parentState.tx;
+            const float cy0 = parentState.m11 * ar.y + parentState.ty;
+            const float cy1 = parentState.m11 * (ar.y + ah) + parentState.ty;
+            const Rect bounds{std::min(cx0, cx1), std::min(cy0, cy1), std::fabs(cx1 - cx0), std::fabs(cy1 - cy0)};
+            parentState.clipRect = parentState.clipActive ? IntersectRect(parentState.clipRect, bounds) : bounds;
+            parentState.clipActive = true;
         }
     }
-    return false;
+
+    RenderTraversalState curState = parentState;
+    const Visibility vis = element->GetVisibility();
+    if (vis != Visibility::Visible) {
+        curState.inheritedOpacity = 0.0f;
+    } else {
+        curState.inheritedOpacity *= std::clamp(element->GetOpacity(), 0.0f, 1.0f);
+    }
+    const Rect r = element->FinalRect();
+    const float w = (vis == Visibility::Collapsed) ? 0.0f : ((r.width > 0.0f) ? r.width : std::max(0.0f, element->GetWidth()));
+    const float h = (vis == Visibility::Collapsed) ? 0.0f : ((r.height > 0.0f) ? r.height : std::max(0.0f, element->GetHeight()));
+    const UnifiedValue rtmVal = element->GetValue(PropId_RenderTransformMatrix);
+    if (const auto* f4 = std::get_if<Float4Value>(&rtmVal)) {
+        curState.tx += curState.m00 * f4->z;
+        curState.ty += curState.m11 * f4->w;
+        curState.m00 *= f4->x;
+        curState.m11 *= f4->y;
+    }
+    float yawDeg = 0.0f, pitchDeg = 0.0f;
+    (void)TryGetFloat(element->GetValue(PropId_Projection3DYaw), yawDeg);
+    (void)TryGetFloat(element->GetValue(PropId_Projection3DPitch), pitchDeg);
+    if (yawDeg != 0.0f || pitchDeg != 0.0f) {
+        constexpr float kDegToRad = 3.14159265358979323846f / 180.0f;
+        const float cosYaw = std::cos(yawDeg * kDegToRad);
+        const float cosPitch = std::cos(pitchDeg * kDegToRad);
+        const float cx = r.x + w * 0.5f;
+        const float cy = r.y + h * 0.5f;
+        curState.tx += curState.m00 * (cx * (1.0f - cosYaw));
+        curState.ty += curState.m11 * (cy * (1.0f - cosPitch));
+        curState.m00 *= cosYaw;
+        curState.m11 *= cosPitch;
+    }
+
+    return UpdateElementInPlace(element, curState);
+}
+
+bool PagedRenderTree::UpdateElementInPlace(
+    const UIElement* element,
+    const RenderTraversalState& curState) {
+    if (!element) {
+        return false;
+    }
+
+    // O(1) direct span lookup via UIElement::RenderNodeId(), with O(N) fallback only if unbound
+    std::uint32_t firstId = UIElement::InvalidRenderNodeId;
+    std::uint16_t span = 0u;
+    if (element->RenderTreeId() == treeId_ &&
+        element->RenderNodeId() < nodes_.size() &&
+        element->RenderNodeSpan() > 0u &&
+        nodes_[element->RenderNodeId()].sourceElement == element) {
+        firstId = element->RenderNodeId();
+        span = element->RenderNodeSpan();
+    } else {
+        for (std::uint32_t i = 0; i < static_cast<std::uint32_t>(nodes_.size()); ++i) {
+            if (nodes_[i].sourceElement == element) {
+                firstId = i;
+                span = 1u;
+                while (firstId + span < nodes_.size() &&
+                       nodes_[firstId + span].sourceElement == element) {
+                    ++span;
+                }
+                element->BindRenderNodeSpan(treeId_, firstId, span);
+                break;
+            }
+        }
+    }
+
+    if (firstId == UIElement::InvalidRenderNodeId || span == 0u) {
+        return false;
+    }
+
+    const Visibility vis = element->GetVisibility();
+    const Rect r = element->FinalRect();
+    const float boxW = (vis == Visibility::Collapsed)
+        ? 0.0f
+        : ((r.width > 0.0f) ? r.width : std::max(0.0f, element->GetWidth()));
+    const float boxH = (vis == Visibility::Collapsed)
+        ? 0.0f
+        : ((r.height > 0.0f) ? r.height : std::max(0.0f, element->GetHeight()));
+    const float effOpacity = (vis == Visibility::Visible) ? curState.inheritedOpacity : 0.0f;
+
+    auto syncQuadTransform = [&](RenderNodeDescriptor& nd) noexcept {
+        nd.m00 = curState.m00;
+        nd.m01 = curState.m01;
+        nd.m10 = curState.m10;
+        nd.m11 = curState.m11;
+        nd.baseTx = curState.tx;
+        nd.baseTy = curState.ty;
+        nd.tx = curState.tx + nd.x * (curState.m00 - 1.0f);
+        nd.ty = curState.ty + nd.y * (curState.m11 - 1.0f);
+        nd.inheritedOpacity = curState.inheritedOpacity;
+    };
+
+    // Specialized Path update
+    if (const auto* pathElem = element->DynamicCast<Path>()) {
+        const std::string pathStr = pathElem->GetData();
+        const AxbMtsdfPathEntry* entry = AxbTemplateRegistry::Instance().FindOrBakeMtsdfPath(pathStr);
+        if (!entry || vis == Visibility::Collapsed) {
+            for (std::uint16_t k = 0; k < span; ++k) {
+                RenderNodeDescriptor& nd = nodes_[firstId + k];
+                nd.width = 0.0f;
+                nd.height = 0.0f;
+                nd.opacity = 0.0f;
+                syncQuadTransform(nd);
+                WriteQuadVertices(nd);
+                MarkPageDirty(nd.pageIndex, nd.vertexOffsetInPage);
+            }
+            element->ClearLayoutDirtyFlags(RenderDirty);
+            return true;
+        }
+
+        bool emitFill = true;
+        bool emitSeparateStroke = false;
+        ClassifyPathEmission(*pathElem, emitFill, emitSeparateStroke);
+        const std::uint16_t neededNodes = static_cast<std::uint16_t>((emitFill ? 1u : 0u) + (emitSeparateStroke ? 1u : 0u));
+        if (neededNodes != span) {
+            // Structural transition between 1-node and 2-node fill+stroke Path -> rebuild cleanly
+            return false;
+        }
+
+        const Rect fitted = ComputeStretchedDestRect(
+            Rect{r.x, r.y, boxW, boxH},
+            entry->boundsW,
+            entry->boundsH,
+            pathElem->GetStretch());
+        const float strokeW = pathElem->GetStrokeThickness();
+        const MtsdfMappedQuad mapped = ComputeMtsdfMappedPlacement(fitted, *entry, strokeW);
+
+        std::uint16_t k = 0;
+        if (emitFill) {
+            RenderNodeDescriptor& nd = nodes_[firstId + k];
+            nd.x = mapped.quadRect.x;
+            nd.y = mapped.quadRect.y;
+            nd.width = mapped.quadRect.width;
+            nd.height = mapped.quadRect.height;
+            nd.opacity = effOpacity;
+            nd.primType = AeroPrimType::MsdfVectorPath;
+            nd.uv0X = mapped.u0;
+            nd.uv0Y = mapped.v0;
+            nd.uv1X = mapped.u1;
+            nd.uv1Y = mapped.v1;
+            const float inlineStrokeW = emitSeparateStroke ? 0.0f : strokeW;
+            nd.borderThickness = inlineStrokeW;
+            nd.encodedSdfParams = PackMtsdfParams(entry->pxRange, entry->atlasWidth, inlineStrokeW, false);
+            nd.baseRgba = PackColorRgba8(pathElem->GetFill(), 1.0f);
+            nd.mtsdfPathHash = entry->pathHash;
+            syncQuadTransform(nd);
+            WriteQuadVertices(nd);
+            MarkPageDirty(nd.pageIndex, nd.vertexOffsetInPage);
+            ++k;
+        }
+        if (emitSeparateStroke && k < span) {
+            RenderNodeDescriptor& nd = nodes_[firstId + k];
+            nd.x = mapped.quadRect.x;
+            nd.y = mapped.quadRect.y;
+            nd.width = mapped.quadRect.width;
+            nd.height = mapped.quadRect.height;
+            nd.opacity = effOpacity;
+            nd.primType = AeroPrimType::MsdfVectorPath;
+            nd.uv0X = mapped.u0;
+            nd.uv0Y = mapped.v0;
+            nd.uv1X = mapped.u1;
+            nd.uv1Y = mapped.v1;
+            nd.borderThickness = strokeW;
+            nd.encodedSdfParams = PackMtsdfParams(entry->pxRange, entry->atlasWidth, strokeW, true);
+            nd.baseRgba = PackColorRgba8(pathElem->GetStroke(), 1.0f);
+            nd.mtsdfPathHash = entry->pathHash;
+            syncQuadTransform(nd);
+            WriteQuadVertices(nd);
+            MarkPageDirty(nd.pageIndex, nd.vertexOffsetInPage);
+        }
+        element->ClearLayoutDirtyFlags(RenderDirty);
+        return true;
+    }
+
+    // Specialized TextBlock update (optional background quad + 1..N SdfTextGlyph run nodes)
+    if (const auto* tb = element->DynamicCast<TextBlock>()) {
+        const auto bgOpt = value::TryGetColor(element->GetValue(PropId_Background));
+        const bool wantsBgNode = bgOpt.has_value() && bgOpt->a > 0.0f;
+        const bool hasBgNode = (nodes_[firstId].primType != AeroPrimType::SdfTextGlyph);
+        if (wantsBgNode && !hasBgNode) {
+            // Newly added Background on previously unbacked TextBlock -> rebuild to preserve Z-order
+            return false;
+        }
+
+        const Thickness pad = tb->GetPadding();
+        std::string txt = tb->GetText();
+        if (txt.empty()) {
+            const UnifiedValue phVal = tb->GetValue(PropId_Placeholder);
+            if (const auto* ph = std::get_if<StringValue>(&phVal)) {
+                txt = ph->str();
+            }
+        }
+        const std::string_view activeText = (vis == Visibility::Collapsed)
+            ? std::string_view{}
+            : std::string_view{txt};
+        const Color fgColor = tb->GetForeground();
+        const float fontSize = tb->GetFontSize();
+
+        std::size_t totalGlyphCap = 0;
+        for (std::uint16_t k = 0; k < span; ++k) {
+            if (nodes_[firstId + k].primType == AeroPrimType::SdfTextGlyph) {
+                totalGlyphCap += nodes_[firstId + k].vertexCount / 4u;
+            }
+        }
+
+        if (CountVisibleUtf8Glyphs(activeText) > totalGlyphCap) {
+            // Text grew past reserved span capacity -> zero entire old span and emit contiguous expanded span
+            // while preserving exact parent scissor clip state!
+            const Rect prevClip = activeClipRect_;
+            const bool prevClipOn = activeClipEnabled_;
+            activeClipRect_ = curState.clipRect;
+            activeClipEnabled_ = curState.clipActive;
+
+            for (std::uint16_t k = 0; k < span; ++k) {
+                ZeroOutNodeVertices(nodes_[firstId + k]);
+            }
+
+            const std::uint32_t newSpanStart = static_cast<std::uint32_t>(nodes_.size());
+            std::uint16_t newSpanCount = 0u;
+            if (wantsBgNode) {
+                const float cr = value::TryGetCornerRadius(tb->GetValue(PropId_CornerRadius))
+                    .value_or(CornerRadius{}).topLeft;
+                const std::uint32_t bgId = AllocateRenderNode(
+                    r.x, r.y, boxW, boxH, *bgOpt, cr, 0.0f, element);
+                nodes_[bgId].opacity = effOpacity;
+                syncQuadTransform(nodes_[bgId]);
+                WriteQuadVertices(nodes_[bgId]);
+                MarkPageDirty(nodes_[bgId].pageIndex, nodes_[bgId].vertexOffsetInPage);
+                ++newSpanCount;
+            }
+            newSpanCount = static_cast<std::uint16_t>(
+                newSpanCount + EmitTextRunNodes(
+                    r.x + pad.left,
+                    r.y + pad.top,
+                    fontSize,
+                    activeText,
+                    fgColor,
+                    effOpacity,
+                    curState,
+                    element));
+
+            activeClipRect_ = prevClip;
+            activeClipEnabled_ = prevClipOn;
+
+            element->BindRenderNodeSpan(treeId_, newSpanStart, newSpanCount);
+            element->ClearLayoutDirtyFlags(RenderDirty);
+            return true;
+        }
+
+        std::size_t utf8Cursor = 0;
+        float localPenX = 0.0f;
+        float localPenY = 0.0f;
+        for (std::uint16_t k = 0; k < span; ++k) {
+            RenderNodeDescriptor& node = nodes_[firstId + k];
+            if (node.primType == AeroPrimType::SdfTextGlyph) {
+                node.m00 = curState.m00;
+                node.m01 = curState.m01;
+                node.m10 = curState.m10;
+                node.m11 = curState.m11;
+                node.baseTx = curState.tx;
+                node.baseTy = curState.ty;
+                node.inheritedOpacity = curState.inheritedOpacity;
+                (void)UpdateTextRunNodeSlice(
+                    firstId + k,
+                    r.x + pad.left,
+                    r.y + pad.top,
+                    fontSize,
+                    activeText,
+                    utf8Cursor,
+                    localPenX,
+                    localPenY,
+                    fgColor,
+                    effOpacity);
+            } else {
+                node.x = r.x;
+                node.y = r.y;
+                node.width = boxW;
+                node.height = boxH;
+                node.opacity = wantsBgNode ? effOpacity : 0.0f;
+                if (wantsBgNode) {
+                    node.baseRgba = PackColorRgba8(*bgOpt, 1.0f);
+                }
+                node.cornerRadius = value::TryGetCornerRadius(tb->GetValue(PropId_CornerRadius))
+                    .value_or(CornerRadius{}).topLeft;
+                node.encodedSdfParams = PackSdfRoundedRectParams(node.cornerRadius, 0.0f);
+                node.primType = (node.cornerRadius > 0.0f) ? AeroPrimType::SdfRoundedRect : AeroPrimType::SolidQuad;
+                syncQuadTransform(node);
+                WriteQuadVertices(node);
+                MarkPageDirty(node.pageIndex, node.vertexOffsetInPage);
+            }
+        }
+        element->ClearLayoutDirtyFlags(RenderDirty);
+        return true;
+    }
+
+    // Specialized Button update (box node + optional centered SdfTextGlyph label span)
+    if (const auto* btn = element->DynamicCast<Button>()) {
+        const std::string label = (!btn->FirstChild()) ? btn->GetContentText() : std::string{};
+        const std::string_view activeLabel = (vis == Visibility::Collapsed)
+            ? std::string_view{}
+            : std::string_view{label};
+
+        std::size_t totalLabelGlyphCap = 0;
+        bool hasLabelNode = false;
+        for (std::uint16_t k = 0; k < span; ++k) {
+            if (nodes_[firstId + k].primType == AeroPrimType::SdfTextGlyph) {
+                hasLabelNode = true;
+                totalLabelGlyphCap += nodes_[firstId + k].vertexCount / 4u;
+            }
+        }
+        if (!label.empty() && !hasLabelNode) {
+            // Button initially had empty Content="" and gained text -> rebuild cleanly to preserve Z-order
+            return false;
+        }
+
+        Color fg{0.96f, 0.98f, 1.0f, 1.0f};
+        if (auto fgOpt = value::TryGetColor(btn->GetValue(PropId_Foreground))) {
+            fg = *fgOpt;
+        }
+        float fontSize = 14.0f;
+        (void)TryGetFloat(btn->GetValue(PropId_FontSize), fontSize);
+        const Size labelMetrics = MeasureUtf8TextRun(label, fontSize);
+        const float lx = r.x + std::max(4.0f, (boxW - labelMetrics.width) * 0.5f);
+        const float ly = r.y + std::max(2.0f, (boxH - fontSize * 1.2f) * 0.5f);
+
+        if (CountVisibleUtf8Glyphs(activeLabel) > totalLabelGlyphCap) {
+            const Rect prevClip = activeClipRect_;
+            const bool prevClipOn = activeClipEnabled_;
+            activeClipRect_ = curState.clipRect;
+            activeClipEnabled_ = curState.clipActive;
+
+            for (std::uint16_t k = 0; k < span; ++k) {
+                ZeroOutNodeVertices(nodes_[firstId + k]);
+            }
+
+            const std::uint32_t newSpanStart = static_cast<std::uint32_t>(nodes_.size());
+            Color bgColor{0.22f, 0.34f, 0.54f, 1.0f};
+            if (auto bg = value::TryGetColor(btn->GetValue(PropId_Background))) {
+                bgColor = *bg;
+            }
+            const float cr = value::TryGetCornerRadius(btn->GetValue(PropId_CornerRadius))
+                .value_or(CornerRadius{4.0f}).topLeft;
+            const float bt = value::TryGetThickness(btn->GetValue(PropId_BorderThickness))
+                .value_or(Thickness{}).left;
+            const std::uint32_t boxId = AllocateRenderNode(r.x, r.y, boxW, boxH, bgColor, cr, bt, element);
+            nodes_[boxId].opacity = effOpacity;
+            syncQuadTransform(nodes_[boxId]);
+            WriteQuadVertices(nodes_[boxId]);
+            MarkPageDirty(nodes_[boxId].pageIndex, nodes_[boxId].vertexOffsetInPage);
+
+            const std::uint16_t textSpan = EmitTextRunNodes(
+                lx, ly, fontSize, activeLabel, fg, effOpacity, curState, element);
+
+            activeClipRect_ = prevClip;
+            activeClipEnabled_ = prevClipOn;
+
+            element->BindRenderNodeSpan(treeId_, newSpanStart, static_cast<std::uint16_t>(1u + textSpan));
+            element->ClearLayoutDirtyFlags(RenderDirty);
+            return true;
+        }
+
+        std::size_t utf8Cursor = 0;
+        float localPenX = 0.0f;
+        float localPenY = 0.0f;
+        for (std::uint16_t k = 0; k < span; ++k) {
+            RenderNodeDescriptor& node = nodes_[firstId + k];
+            if (node.primType == AeroPrimType::SdfTextGlyph) {
+                node.m00 = curState.m00;
+                node.m01 = curState.m01;
+                node.m10 = curState.m10;
+                node.m11 = curState.m11;
+                node.baseTx = curState.tx;
+                node.baseTy = curState.ty;
+                node.inheritedOpacity = curState.inheritedOpacity;
+                (void)UpdateTextRunNodeSlice(
+                    firstId + k,
+                    lx,
+                    ly,
+                    fontSize,
+                    activeLabel,
+                    utf8Cursor,
+                    localPenX,
+                    localPenY,
+                    fg,
+                    effOpacity);
+            } else {
+                node.x = r.x;
+                node.y = r.y;
+                node.width = boxW;
+                node.height = boxH;
+                node.opacity = effOpacity;
+                if (auto bg = value::TryGetColor(btn->GetValue(PropId_Background))) {
+                    node.baseRgba = PackColorRgba8(*bg, 1.0f);
+                } else {
+                    node.baseRgba = PackColorRgba8(Color{0.22f, 0.34f, 0.54f, 1.0f}, 1.0f);
+                }
+                node.cornerRadius = value::TryGetCornerRadius(btn->GetValue(PropId_CornerRadius))
+                    .value_or(CornerRadius{4.0f}).topLeft;
+                node.borderThickness = value::TryGetThickness(btn->GetValue(PropId_BorderThickness))
+                    .value_or(Thickness{}).left;
+                node.encodedSdfParams = PackSdfRoundedRectParams(node.cornerRadius, node.borderThickness);
+                node.primType = (node.cornerRadius > 0.0f || node.borderThickness > 0.0f)
+                    ? AeroPrimType::SdfRoundedRect
+                    : AeroPrimType::SolidQuad;
+                syncQuadTransform(node);
+                WriteQuadVertices(node);
+                MarkPageDirty(node.pageIndex, node.vertexOffsetInPage);
+            }
+        }
+        element->ClearLayoutDirtyFlags(RenderDirty);
+        return true;
+    }
+
+    // Generic Quad / Border / Panel / Image update
+    RenderNodeDescriptor& node = nodes_[firstId];
+    node.x = r.x;
+    node.y = r.y;
+    node.width = boxW;
+    node.height = boxH;
+    node.opacity = effOpacity;
+    if (element->IsA<Image>()) {
+        node.primType = AeroPrimType::TexturedQuad;
+        node.baseRgba = PackColorRgba8(Color{1.0f, 1.0f, 1.0f, 1.0f}, 1.0f);
+    } else {
+        if (auto bg = value::TryGetColor(element->GetValue(PropId_Background))) {
+            node.baseRgba = PackColorRgba8(*bg, 1.0f);
+        } else if (auto fg = value::TryGetColor(element->GetValue(PropId_Foreground))) {
+            node.baseRgba = PackColorRgba8(*fg, 1.0f);
+        } else {
+            node.baseRgba = PackColorRgba8(Color{0.18f, 0.22f, 0.28f, 1.0f}, 1.0f);
+        }
+        if (auto cr = value::TryGetCornerRadius(element->GetValue(PropId_CornerRadius))) {
+            node.cornerRadius = cr->topLeft;
+        } else {
+            node.cornerRadius = 0.0f;
+        }
+        if (auto bt = value::TryGetThickness(element->GetValue(PropId_BorderThickness))) {
+            node.borderThickness = bt->left;
+        } else {
+            node.borderThickness = 0.0f;
+        }
+        node.encodedSdfParams = PackSdfRoundedRectParams(node.cornerRadius, node.borderThickness);
+        node.primType = (node.cornerRadius > 0.0f || node.borderThickness > 0.0f)
+            ? AeroPrimType::SdfRoundedRect
+            : AeroPrimType::SolidQuad;
+    }
+    syncQuadTransform(node);
+    WriteQuadVertices(node);
+    MarkPageDirty(node.pageIndex, node.vertexOffsetInPage);
+    element->ClearLayoutDirtyFlags(RenderDirty);
+    return true;
 }
 
 std::size_t PagedRenderTree::BatchUpdateWidthsFromRawColumn(
@@ -500,7 +1622,6 @@ std::size_t PagedRenderTree::BatchUpdateWidthsFromRawColumn(
     CommandPage* __restrict pagesBase = pages_.data();
     std::uint8_t* __restrict dirtyFlagsBase = pageDirtyFlags_.data();
 
-    // Pre-sized raw pointer write into dirtyPageList_ (guaranteed capacity >= pages_.size())
     std::size_t dirtyListCount = dirtyPageList_.size();
     dirtyPageList_.resize(pages_.size());
     std::uint32_t* __restrict dirtyListBase = dirtyPageList_.data();
@@ -587,12 +1708,215 @@ std::size_t PagedRenderTree::BuildFromVisualTree(const UIElement* rootElement) {
     if (!rootElement) {
         return 0;
     }
-    TraverseAndEmitElement(rootElement);
+    boundRootElement_ = rootElement;
+    RenderTraversalState rootState{};
+    TraverseAndEmitElement(rootElement, rootState);
     return nodes_.size();
 }
 
-void PagedRenderTree::TraverseAndEmitElement(const UIElement* elem) {
-    if (!elem || elem->GetVisibility() == Visibility::Collapsed) {
+void PagedRenderTree::CollapseSubtreeRenderNodesRecursive(
+    const UIElement* elem,
+    std::size_t& ioUpdatedNodes) noexcept {
+    if (!elem) {
+        return;
+    }
+    if (elem->RenderTreeId() == treeId_ &&
+        elem->RenderNodeId() < nodes_.size() &&
+        elem->RenderNodeSpan() > 0u) {
+        const std::uint32_t firstId = elem->RenderNodeId();
+        const std::uint16_t span = elem->RenderNodeSpan();
+        bool anyZeroed = false;
+        for (std::uint16_t k = 0; k < span && firstId + k < nodes_.size(); ++k) {
+            RenderNodeDescriptor& nd = nodes_[firstId + k];
+            if (nd.sourceElement == elem) {
+                nd.width = 0.0f;
+                nd.height = 0.0f;
+                nd.opacity = 0.0f;
+                ZeroOutNodeVertices(nd);
+                anyZeroed = true;
+            }
+        }
+        if (anyZeroed) {
+            ++ioUpdatedNodes;
+        }
+    }
+    elem->DetachRenderNodeSpan();
+    elem->ClearLayoutDirtyFlags(static_cast<std::uint8_t>(RenderDirty | SubtreeRenderDirty));
+    for (const UIElement* child = elem->FirstChild(); child != nullptr; child = child->NextSibling()) {
+        CollapseSubtreeRenderNodesRecursive(child, ioUpdatedNodes);
+    }
+}
+
+std::size_t PagedRenderTree::SyncVisualTree(const UIElement* rootElement) {
+    if (!rootElement) {
+        Clear();
+        return 0;
+    }
+    if (boundRootElement_ != rootElement ||
+        nodes_.empty() ||
+        (rootElement->GetVisibility() != Visibility::Collapsed && rootElement->RenderTreeId() != treeId_)) {
+        return BuildFromVisualTree(rootElement);
+    }
+
+    // Fast O(1) clean-frame short-circuit!
+    const std::uint8_t rootFlags = rootElement->GetLayoutDirtyFlags();
+    if ((rootFlags & (RenderDirty | SubtreeRenderDirty)) == 0u) {
+        return 0;
+    }
+
+    std::size_t updatedNodes = 0;
+    bool needsRebuild = false;
+    RenderTraversalState rootState{};
+    (void)SyncDirtySubtreeRecursive(rootElement, rootState, false, updatedNodes, needsRebuild);
+    if (needsRebuild) {
+        return BuildFromVisualTree(rootElement);
+    }
+    return updatedNodes;
+}
+
+bool PagedRenderTree::SyncDirtySubtreeRecursive(
+    const UIElement* elem,
+    const RenderTraversalState& parentState,
+    bool forceSubtreeSync,
+    std::size_t& ioUpdatedNodes,
+    bool& outNeedsFullRebuild) {
+    if (!elem) {
+        return true;
+    }
+
+    const std::uint8_t flags = elem->GetLayoutDirtyFlags();
+    if (!forceSubtreeSync && (flags & (RenderDirty | SubtreeRenderDirty)) == 0u) {
+        return true;
+    }
+
+    // If a container or leaf transitioned to Collapsed, zero out its entire subtree's GPU vertices in-place (0 allocs!)
+    if (elem->GetVisibility() == Visibility::Collapsed) {
+        CollapseSubtreeRenderNodesRecursive(elem, ioUpdatedNodes);
+        return true;
+    }
+
+    // If a new child was dynamically added, a sibling was removed (parent detached), or Visibility transitioned
+    // out of Collapsed/unemitted state, trigger a clean structural rebuild once.
+    if (elem->RenderTreeId() != treeId_ ||
+        elem->RenderNodeId() >= nodes_.size() ||
+        elem->RenderNodeSpan() == 0u ||
+        nodes_[elem->RenderNodeId()].sourceElement != elem) {
+        outNeedsFullRebuild = true;
+        return false;
+    }
+
+    const Rect r = elem->FinalRect();
+    const float w = (r.width > 0.0f) ? r.width : std::max(0.0f, elem->GetWidth());
+    const float h = (r.height > 0.0f) ? r.height : std::max(0.0f, elem->GetHeight());
+
+    RenderTraversalState curState = parentState;
+    if (elem->GetVisibility() != Visibility::Visible) {
+        curState.inheritedOpacity = 0.0f;
+    } else {
+        curState.inheritedOpacity *= std::clamp(elem->GetOpacity(), 0.0f, 1.0f);
+    }
+
+    const UnifiedValue rtmVal = elem->GetValue(PropId_RenderTransformMatrix);
+    if (const auto* f4 = std::get_if<Float4Value>(&rtmVal)) {
+        curState.tx += curState.m00 * f4->z;
+        curState.ty += curState.m11 * f4->w;
+        curState.m00 *= f4->x;
+        curState.m11 *= f4->y;
+    }
+    float yawDeg = 0.0f;
+    float pitchDeg = 0.0f;
+    (void)TryGetFloat(elem->GetValue(PropId_Projection3DYaw), yawDeg);
+    (void)TryGetFloat(elem->GetValue(PropId_Projection3DPitch), pitchDeg);
+    if (yawDeg != 0.0f || pitchDeg != 0.0f) {
+        constexpr float kDegToRad = 3.14159265358979323846f / 180.0f;
+        const float cosYaw = std::cos(yawDeg * kDegToRad);
+        const float cosPitch = std::cos(pitchDeg * kDegToRad);
+        const float cx = r.x + w * 0.5f;
+        const float cy = r.y + h * 0.5f;
+        curState.tx += curState.m00 * (cx * (1.0f - cosYaw));
+        curState.ty += curState.m11 * (cy * (1.0f - cosPitch));
+        curState.m00 *= cosYaw;
+        curState.m11 *= cosPitch;
+    }
+
+    // Check whether this container's inherited opacity or 2D/3D transform changed so descendants also sync
+    bool propagateToAllChildren = forceSubtreeSync;
+    if (!propagateToAllChildren && elem->FirstChild() != nullptr) {
+        const RenderNodeDescriptor& prevNode = nodes_[elem->RenderNodeId()];
+        if (std::fabs(prevNode.inheritedOpacity - curState.inheritedOpacity) > 1e-5f ||
+            std::fabs(prevNode.m00 - curState.m00) > 1e-5f ||
+            std::fabs(prevNode.m11 - curState.m11) > 1e-5f ||
+            std::fabs(prevNode.baseTx - curState.tx) > 1e-3f ||
+            std::fabs(prevNode.baseTy - curState.ty) > 1e-3f) {
+            propagateToAllChildren = true;
+        }
+    }
+
+    if (forceSubtreeSync || (flags & RenderDirty) != 0u) {
+        if (!UpdateElementInPlace(elem, curState)) {
+            outNeedsFullRebuild = true;
+            return false;
+        }
+        ++ioUpdatedNodes;
+        elem->ClearLayoutDirtyFlags(RenderDirty);
+    }
+
+    RenderTraversalState childState = curState;
+    const UnifiedValue clipVal = elem->GetValue(PropId_ClipToBounds);
+    if (const auto* clipBool = std::get_if<bool>(&clipVal); clipBool && *clipBool) {
+        const float cx0 = curState.m00 * r.x + curState.tx;
+        const float cx1 = curState.m00 * (r.x + w) + curState.tx;
+        const float cy0 = curState.m11 * r.y + curState.ty;
+        const float cy1 = curState.m11 * (r.y + h) + curState.ty;
+        const Rect transformedBounds{
+            std::min(cx0, cx1),
+            std::min(cy0, cy1),
+            std::fabs(cx1 - cx0),
+            std::fabs(cy1 - cy0)};
+        childState.clipRect = childState.clipActive
+            ? IntersectRect(childState.clipRect, transformedBounds)
+            : transformedBounds;
+        childState.clipActive = true;
+    }
+
+    // Verify child CommandPage scissor state matches childState when container or clip changed
+    if (elem->FirstChild() != nullptr && (forceSubtreeSync || (flags & RenderDirty) != 0u)) {
+        for (const UIElement* child = elem->FirstChild(); child != nullptr; child = child->NextSibling()) {
+            if (child->GetVisibility() != Visibility::Collapsed &&
+                child->RenderTreeId() == treeId_ &&
+                child->RenderNodeId() < nodes_.size()) {
+                const std::uint32_t cPageIdx = nodes_[child->RenderNodeId()].pageIndex;
+                if (cPageIdx < pages_.size() &&
+                    !SameClipRect(pages_[cPageIdx].header, childState.clipRect, childState.clipActive)) {
+                    outNeedsFullRebuild = true;
+                    return false;
+                }
+                break;
+            }
+        }
+    }
+
+    if (propagateToAllChildren || (flags & SubtreeRenderDirty) != 0u) {
+        for (const UIElement* child = elem->FirstChild(); child != nullptr; child = child->NextSibling()) {
+            if (!SyncDirtySubtreeRecursive(
+                    child, childState, propagateToAllChildren, ioUpdatedNodes, outNeedsFullRebuild)) {
+                return false;
+            }
+        }
+        elem->ClearLayoutDirtyFlags(SubtreeRenderDirty);
+    }
+    return true;
+}
+
+void PagedRenderTree::TraverseAndEmitElement(
+    const UIElement* elem,
+    const RenderTraversalState& parentState) {
+    if (!elem) {
+        return;
+    }
+    if (elem->GetVisibility() == Visibility::Collapsed) {
+        std::size_t dummy = 0;
+        CollapseSubtreeRenderNodesRecursive(elem, dummy);
         return;
     }
 
@@ -600,40 +1924,261 @@ void PagedRenderTree::TraverseAndEmitElement(const UIElement* elem) {
     const float w = (r.width > 0.0f) ? r.width : std::max(0.0f, elem->GetWidth());
     const float h = (r.height > 0.0f) ? r.height : std::max(0.0f, elem->GetHeight());
 
-    Color color{0.18f, 0.22f, 0.28f, 1.0f};
-    if (auto bg = value::TryGetColor(elem->GetValue(PropId_Background))) {
-        color = *bg;
-    } else if (auto fg = value::TryGetColor(elem->GetValue(PropId_Foreground))) {
-        color = *fg;
+    // Compose inherited opacity and local 2D/3D foreshortening transform with parentState
+    RenderTraversalState curState = parentState;
+    if (elem->GetVisibility() != Visibility::Visible) {
+        curState.inheritedOpacity = 0.0f;
+    } else {
+        curState.inheritedOpacity *= std::clamp(elem->GetOpacity(), 0.0f, 1.0f);
+    }
+    const float effOpacity = curState.inheritedOpacity;
+
+    const UnifiedValue rtmVal = elem->GetValue(PropId_RenderTransformMatrix);
+    if (const auto* f4 = std::get_if<Float4Value>(&rtmVal)) {
+        curState.tx += curState.m00 * f4->z;
+        curState.ty += curState.m11 * f4->w;
+        curState.m00 *= f4->x;
+        curState.m11 *= f4->y;
+    }
+    float yawDeg = 0.0f;
+    float pitchDeg = 0.0f;
+    (void)TryGetFloat(elem->GetValue(PropId_Projection3DYaw), yawDeg);
+    (void)TryGetFloat(elem->GetValue(PropId_Projection3DPitch), pitchDeg);
+    if (yawDeg != 0.0f || pitchDeg != 0.0f) {
+        constexpr float kDegToRad = 3.14159265358979323846f / 180.0f;
+        const float cosYaw = std::cos(yawDeg * kDegToRad);
+        const float cosPitch = std::cos(pitchDeg * kDegToRad);
+        const float cx = r.x + w * 0.5f;
+        const float cy = r.y + h * 0.5f;
+        curState.tx += curState.m00 * (cx * (1.0f - cosYaw));
+        curState.ty += curState.m11 * (cy * (1.0f - cosPitch));
+        curState.m00 *= cosYaw;
+        curState.m11 *= cosPitch;
     }
 
-    float cornerRadius = 0.0f;
-    if (auto cr = value::TryGetCornerRadius(elem->GetValue(PropId_CornerRadius))) {
-        cornerRadius = cr->topLeft;
+    // Apply current clip state for this element's own primitives
+    activeClipRect_ = curState.clipRect;
+    activeClipEnabled_ = curState.clipActive;
+
+    const std::uint32_t spanStartId = static_cast<std::uint32_t>(nodes_.size());
+    std::uint16_t emittedCount = 0u;
+
+    auto applyNodeTransform = [&](std::uint32_t nid) noexcept {
+        RenderNodeDescriptor& nd = nodes_[nid];
+        nd.m00 = curState.m00;
+        nd.m01 = curState.m01;
+        nd.m10 = curState.m10;
+        nd.m11 = curState.m11;
+        nd.baseTx = curState.tx;
+        nd.baseTy = curState.ty;
+        nd.tx = curState.tx + nd.x * (curState.m00 - 1.0f);
+        nd.ty = curState.ty + nd.y * (curState.m11 - 1.0f);
+        nd.inheritedOpacity = curState.inheritedOpacity;
+        if (nd.primType != AeroPrimType::SdfTextGlyph) {
+            WriteQuadVertices(nd);
+        }
+    };
+
+    if (const auto* pathElem = elem->DynamicCast<Path>()) {
+        const std::string pathStr = pathElem->GetData();
+        if (const AxbMtsdfPathEntry* mtsdf = AxbTemplateRegistry::Instance().FindOrBakeMtsdfPath(pathStr)) {
+            const Rect fitted = ComputeStretchedDestRect(
+                Rect{r.x, r.y, w, h},
+                mtsdf->boundsW,
+                mtsdf->boundsH,
+                pathElem->GetStretch());
+            const float strokeW = pathElem->GetStrokeThickness();
+            bool emitFill = true;
+            bool emitSeparateStroke = false;
+            ClassifyPathEmission(*pathElem, emitFill, emitSeparateStroke);
+
+            if (emitFill) {
+                const float inlineStrokeW = emitSeparateStroke ? 0.0f : strokeW;
+                const std::uint32_t nid = AllocateMtsdfPathNode(
+                    fitted.x,
+                    fitted.y,
+                    fitted.width,
+                    fitted.height,
+                    *mtsdf,
+                    pathElem->GetFill(),
+                    inlineStrokeW,
+                    effOpacity,
+                    elem);
+                applyNodeTransform(nid);
+                ++emittedCount;
+            }
+            if (emitSeparateStroke) {
+                const std::uint32_t strokeNid = AllocateMtsdfPathNode(
+                    fitted.x,
+                    fitted.y,
+                    fitted.width,
+                    fitted.height,
+                    *mtsdf,
+                    pathElem->GetStroke(),
+                    strokeW,
+                    effOpacity,
+                    elem);
+                nodes_[strokeNid].encodedSdfParams = PackMtsdfParams(
+                    mtsdf->pxRange,
+                    mtsdf->atlasWidth,
+                    strokeW,
+                    true);
+                applyNodeTransform(strokeNid);
+                ++emittedCount;
+            }
+        } else {
+            const std::uint32_t nid = AllocateRenderNode(
+                r.x, r.y, 0.0f, 0.0f, pathElem->GetFill(), 0.0f, 0.0f, elem);
+            nodes_[nid].opacity = 0.0f;
+            applyNodeTransform(nid);
+            emittedCount = 1u;
+        }
+    } else if (const auto* imgElem = elem->DynamicCast<Image>()) {
+        (void)imgElem;
+        const std::uint32_t nid = AllocateTexturedNode(
+            r.x,
+            r.y,
+            w,
+            h,
+            0.0f,
+            0.0f,
+            1.0f,
+            1.0f,
+            Color{1.0f, 1.0f, 1.0f, 1.0f},
+            effOpacity,
+            elem);
+        applyNodeTransform(nid);
+        emittedCount = 1u;
+    } else if (const auto* tb = elem->DynamicCast<TextBlock>()) {
+        if (auto bg = value::TryGetColor(tb->GetValue(PropId_Background)); bg && bg->a > 0.0f) {
+            const float cr = value::TryGetCornerRadius(tb->GetValue(PropId_CornerRadius))
+                .value_or(CornerRadius{}).topLeft;
+            const std::uint32_t bgId = AllocateRenderNode(
+                r.x, r.y, w, h, *bg, cr, 0.0f, elem);
+            nodes_[bgId].opacity = effOpacity;
+            applyNodeTransform(bgId);
+            ++emittedCount;
+        }
+        std::string text = tb->GetText();
+        if (text.empty()) {
+            const UnifiedValue phVal = tb->GetValue(PropId_Placeholder);
+            if (const auto* ph = std::get_if<StringValue>(&phVal)) {
+                text = ph->str();
+            }
+        }
+        const Thickness pad = tb->GetPadding();
+        const float fontSize = tb->GetFontSize();
+        const Color fg = tb->GetForeground();
+        emittedCount = static_cast<std::uint16_t>(
+            emittedCount + EmitTextRunNodes(
+                r.x + pad.left,
+                r.y + pad.top,
+                fontSize,
+                text,
+                fg,
+                effOpacity,
+                curState,
+                elem));
+    } else if (const auto* btn = elem->DynamicCast<Button>()) {
+        Color bgColor{0.22f, 0.34f, 0.54f, 1.0f};
+        if (auto bg = value::TryGetColor(btn->GetValue(PropId_Background))) {
+            bgColor = *bg;
+        }
+        const float cr = value::TryGetCornerRadius(btn->GetValue(PropId_CornerRadius))
+            .value_or(CornerRadius{4.0f}).topLeft;
+        const float bt = value::TryGetThickness(btn->GetValue(PropId_BorderThickness))
+            .value_or(Thickness{}).left;
+        const std::uint32_t boxId = AllocateRenderNode(
+            r.x, r.y, w, h, bgColor, cr, bt, elem);
+        nodes_[boxId].opacity = effOpacity;
+        applyNodeTransform(boxId);
+        ++emittedCount;
+
+        if (!btn->FirstChild()) {
+            const std::string label = btn->GetContentText();
+            if (!label.empty()) {
+                Color fg{0.96f, 0.98f, 1.0f, 1.0f};
+                if (auto fgOpt = value::TryGetColor(btn->GetValue(PropId_Foreground))) {
+                    fg = *fgOpt;
+                }
+                float fontSize = 14.0f;
+                (void)TryGetFloat(btn->GetValue(PropId_FontSize), fontSize);
+                const Size labelMetrics = MeasureUtf8TextRun(label, fontSize);
+                const float lx = r.x + std::max(4.0f, (w - labelMetrics.width) * 0.5f);
+                const float ly = r.y + std::max(2.0f, (h - fontSize * 1.2f) * 0.5f);
+                emittedCount = static_cast<std::uint16_t>(
+                    emittedCount + EmitTextRunNodes(
+                        lx,
+                        ly,
+                        fontSize,
+                        label,
+                        fg,
+                        effOpacity,
+                        curState,
+                        elem));
+            }
+        }
+    } else {
+        Color color{0.18f, 0.22f, 0.28f, 1.0f};
+        if (auto bg = value::TryGetColor(elem->GetValue(PropId_Background))) {
+            color = *bg;
+        } else if (auto fg = value::TryGetColor(elem->GetValue(PropId_Foreground))) {
+            color = *fg;
+        }
+
+        float cornerRadius = 0.0f;
+        if (auto cr = value::TryGetCornerRadius(elem->GetValue(PropId_CornerRadius))) {
+            cornerRadius = cr->topLeft;
+        }
+
+        float borderThickness = 0.0f;
+        if (auto bt = value::TryGetThickness(elem->GetValue(PropId_BorderThickness))) {
+            borderThickness = bt->left;
+        }
+
+        const std::uint32_t nodeId = AllocateRenderNode(
+            r.x,
+            r.y,
+            w,
+            h,
+            color,
+            cornerRadius,
+            borderThickness,
+            elem);
+        nodes_[nodeId].opacity = effOpacity;
+        applyNodeTransform(nodeId);
+        emittedCount = 1u;
     }
 
-    float borderThickness = 0.0f;
-    if (auto bt = value::TryGetThickness(elem->GetValue(PropId_BorderThickness))) {
-        borderThickness = bt->left;
-    }
+    elem->BindRenderNodeSpan(treeId_, spanStartId, emittedCount);
+    elem->ClearLayoutDirtyFlags(static_cast<std::uint8_t>(RenderDirty | SubtreeRenderDirty));
 
-    const std::uint32_t nodeId = AllocateRenderNode(
-        r.x,
-        r.y,
-        w,
-        h,
-        color,
-        cornerRadius,
-        borderThickness,
-        elem);
-    nodes_[nodeId].opacity = (elem->GetVisibility() == Visibility::Visible)
-        ? elem->GetOpacity()
-        : 0.0f;
-    WriteQuadVertices(nodes_[nodeId]);
+    // If this container specifies ClipToBounds=true, intersect transformed child clip rect before descending
+    RenderTraversalState childState = curState;
+    const UnifiedValue clipVal = elem->GetValue(PropId_ClipToBounds);
+    if (const auto* clipBool = std::get_if<bool>(&clipVal); clipBool && *clipBool) {
+        const float cx0 = curState.m00 * r.x + curState.tx;
+        const float cx1 = curState.m00 * (r.x + w) + curState.tx;
+        const float cy0 = curState.m11 * r.y + curState.ty;
+        const float cy1 = curState.m11 * (r.y + h) + curState.ty;
+        const Rect localBounds{
+            std::min(cx0, cx1),
+            std::min(cy0, cy1),
+            std::fabs(cx1 - cx0),
+            std::fabs(cy1 - cy0)};
+        childState.clipRect = childState.clipActive
+            ? IntersectRect(childState.clipRect, localBounds)
+            : localBounds;
+        childState.clipActive = true;
+    }
 
     for (const UIElement* child = elem->FirstChild(); child != nullptr; child = child->NextSibling()) {
-        TraverseAndEmitElement(child);
+        TraverseAndEmitElement(child, childState);
     }
+
+    // Restore active clip state after visiting children
+    activeClipRect_ = parentState.clipRect;
+    activeClipEnabled_ = parentState.clipActive;
 }
 
 bool PagedRenderTree::IsPageDirty(std::size_t pageIndex) const noexcept {

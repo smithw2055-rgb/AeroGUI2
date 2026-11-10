@@ -12,6 +12,8 @@ TypeClass gGridTypeClass{};
 TypeClass gCanvasTypeClass{};
 TypeClass gBorderTypeClass{};
 TypeClass gTextBlockTypeClass{};
+TypeClass gPathTypeClass{};
+TypeClass gImageTypeClass{};
 TypeClass gItemsControlTypeClass{};
 TypeClass gUserControlTypeClass{};
 bool gControlTypesInitialized = false;
@@ -43,6 +45,8 @@ void EnsureControlTypesRegistered() noexcept {
     reg.RegisterType(gCanvasTypeClass, "Aero.UI.Canvas", panel);
     reg.RegisterType(gBorderTypeClass, "Aero.UI.Border", panel);
     reg.RegisterType(gTextBlockTypeClass, "Aero.UI.TextBlock", uiElem);
+    reg.RegisterType(gPathTypeClass, "Aero.UI.Path", uiElem);
+    reg.RegisterType(gImageTypeClass, "Aero.UI.Image", uiElem);
     reg.RegisterType(gItemsControlTypeClass, "Aero.UI.ItemsControl", panel);
     reg.RegisterType(gUserControlTypeClass, "Aero.UI.UserControl", panel);
 }
@@ -70,6 +74,16 @@ const TypeClass* Border::StaticTypeClass() noexcept {
 const TypeClass* TextBlock::StaticTypeClass() noexcept {
     EnsureControlTypesRegistered();
     return &gTextBlockTypeClass;
+}
+
+const TypeClass* Path::StaticTypeClass() noexcept {
+    EnsureControlTypesRegistered();
+    return &gPathTypeClass;
+}
+
+const TypeClass* Image::StaticTypeClass() noexcept {
+    EnsureControlTypesRegistered();
+    return &gImageTypeClass;
 }
 
 const TypeClass* ItemsControl::StaticTypeClass() noexcept {
@@ -295,7 +309,6 @@ Size Grid::MeasureCore(Size availableSize) noexcept {
         c.computedWidth = (c.unit == GridUnitType::Pixel) ? c.value : 0.0f;
     }
 
-    // Pass 1: Measure all children and size single-span non-Pixel tracks
     bool hasMultiSpan = false;
     for (UIElement* child = FirstChild(); child != nullptr; child = child->NextSibling()) {
         child->Measure(innerAvail);
@@ -324,8 +337,6 @@ Size Grid::MeasureCore(Size availableSize) noexcept {
         }
     }
 
-    // Pass 2: Distribute any excess DesiredSize of multi-span children to Star tracks first,
-    // or Auto tracks only when no Star track participates in the span.
     if (hasMultiSpan) {
         for (UIElement* child = FirstChild(); child != nullptr; child = child->NextSibling()) {
             const std::size_t rIdx = std::min<std::size_t>(
@@ -480,7 +491,6 @@ void Grid::ArrangeCore(Rect finalRect) noexcept {
         }
     }
 
-    // Multi-span Auto inflation only applies when NO Star track participates in the span
     if (hasMultiSpan) {
         for (UIElement* child = FirstChild(); child != nullptr; child = child->NextSibling()) {
             const std::size_t rIdx = std::min<std::size_t>(
@@ -745,6 +755,17 @@ float TextBlock::GetFontSize() const noexcept {
     return 14.0f;
 }
 
+void TextBlock::SetForeground(const Color& color) {
+    SetValue(PropId_Foreground, value::FromColor(color), ValueSourceRank::Local);
+}
+
+Color TextBlock::GetForeground() const noexcept {
+    if (auto c = value::TryGetColor(GetValue(PropId_Foreground))) {
+        return *c;
+    }
+    return Color{0.94f, 0.96f, 0.98f, 1.0f};
+}
+
 Size TextBlock::MeasureCore(Size availableSize) noexcept {
     (void)availableSize;
     const Thickness p = GetPadding();
@@ -756,11 +777,167 @@ Size TextBlock::MeasureCore(Size availableSize) noexcept {
             text = s->str();
         }
     }
-    const std::size_t codePoints = rs_rt::utf8CodePointLength(text);
-    const float advancePerCodePoint = fontSize * 0.6f;
-    const float textW = static_cast<float>(codePoints) * advancePerCodePoint;
-    const float textH = (codePoints > 0) ? (fontSize * 1.25f) : 0.0f;
-    return Size{textW + p.left + p.right, textH + p.top + p.bottom};
+    const Size textMetrics = MeasureUtf8TextRun(text, fontSize);
+    return Size{textMetrics.width + p.left + p.right, textMetrics.height + p.top + p.bottom};
+}
+
+// ============================================================================
+// Path (4-Channel MTSDF Vector Icon Control)
+// ============================================================================
+
+Path::Path() {
+    EnsureControlTypesRegistered();
+}
+
+void Path::SetData(std::string_view svgPathData) {
+    SetValue(PropId_PathData, value::FromString(std::string(svgPathData)), ValueSourceRank::Local);
+}
+
+std::string Path::GetData() const {
+    const auto v = GetValue(PropId_PathData);
+    if (const auto* s = std::get_if<StringValue>(&v)) {
+        return s->str();
+    }
+    return {};
+}
+
+void Path::SetFill(const Color& color) {
+    SetValue(PropId_Background, value::FromColor(color), ValueSourceRank::Local);
+}
+
+bool Path::HasExplicitFill() const noexcept {
+    return value::TryGetColor(GetValue(PropId_Background)).has_value() ||
+           value::TryGetColor(GetValue(PropId_Foreground)).has_value();
+}
+
+Color Path::GetFill() const noexcept {
+    if (auto c = value::TryGetColor(GetValue(PropId_Background))) {
+        return *c;
+    }
+    if (auto fg = value::TryGetColor(GetValue(PropId_Foreground))) {
+        return *fg;
+    }
+    if (HasExplicitStroke() && GetStrokeThickness() > 0.0f) {
+        return Color{0.0f, 0.0f, 0.0f, 0.0f};
+    }
+    return Color{0.92f, 0.95f, 1.0f, 1.0f};
+}
+
+void Path::SetStroke(const Color& color) {
+    SetValue(PropId_BorderBrush, value::FromColor(color), ValueSourceRank::Local);
+}
+
+bool Path::HasExplicitStroke() const noexcept {
+    if (auto c = value::TryGetColor(GetValue(PropId_BorderBrush))) {
+        return c->a > 0.0f;
+    }
+    return false;
+}
+
+Color Path::GetStroke() const noexcept {
+    if (auto c = value::TryGetColor(GetValue(PropId_BorderBrush))) {
+        return *c;
+    }
+    return Color{0.0f, 0.0f, 0.0f, 0.0f};
+}
+
+void Path::SetStrokeThickness(float thickness) {
+    SetValue(PropId_BorderThickness, value::FromThickness(Thickness(thickness)), ValueSourceRank::Local);
+}
+
+float Path::GetStrokeThickness() const noexcept {
+    if (auto t = value::TryGetThickness(GetValue(PropId_BorderThickness))) {
+        return t->left;
+    }
+    return 0.0f;
+}
+
+void Path::SetStretch(Stretch stretch) {
+    SetValue(PropId_Stretch, value::FromInt(static_cast<std::int64_t>(stretch)), ValueSourceRank::Local);
+}
+
+Stretch Path::GetStretch() const noexcept {
+    const auto v = GetValue(PropId_Stretch);
+    if (const auto* i = std::get_if<std::int64_t>(&v)) {
+        if (*i >= 0 && *i <= 3) {
+            return static_cast<Stretch>(*i);
+        }
+    }
+    return Stretch::Uniform;
+}
+
+Size Path::MeasureCore(Size availableSize) noexcept {
+    (void)availableSize;
+    const Thickness p = GetPadding();
+    const std::string data = GetData();
+    if (data.empty()) {
+        return Size{p.left + p.right, p.top + p.bottom};
+    }
+    const Stretch stretch = GetStretch();
+    float bx = 0.0f, by = 0.0f, bw = 0.0f, bh = 0.0f;
+    const std::uint64_t h = ComputeSvgPathHash(data);
+    if (const AxbMtsdfPathEntry* baked = AxbTemplateRegistry::Instance().FindMtsdfPath(h)) {
+        bx = baked->boundsX;
+        by = baked->boundsY;
+        bw = baked->boundsW;
+        bh = baked->boundsH;
+    } else {
+        const Rect b = MeasureSvgPathBounds(data);
+        bx = b.x;
+        by = b.y;
+        bw = b.width;
+        bh = b.height;
+    }
+    if (stretch == Stretch::None) {
+        return Size{
+            std::max(1.0f, std::max(bw, bx + bw)) + p.left + p.right,
+            std::max(1.0f, std::max(bh, by + bh)) + p.top + p.bottom};
+    }
+    return Size{
+        std::max(1.0f, bw) + p.left + p.right,
+        std::max(1.0f, bh) + p.top + p.bottom};
+}
+
+// ============================================================================
+// Image
+// ============================================================================
+
+Image::Image() {
+    EnsureControlTypesRegistered();
+}
+
+void Image::SetSource(std::string_view sourceUri) {
+    SetValue(PropId_ImageSource, value::FromString(std::string(sourceUri)), ValueSourceRank::Local);
+}
+
+std::string Image::GetSource() const {
+    const auto v = GetValue(PropId_ImageSource);
+    if (const auto* s = std::get_if<StringValue>(&v)) {
+        return s->str();
+    }
+    return {};
+}
+
+void Image::SetStretch(Stretch stretch) {
+    SetValue(PropId_Stretch, value::FromInt(static_cast<std::int64_t>(stretch)), ValueSourceRank::Local);
+}
+
+Stretch Image::GetStretch() const noexcept {
+    const auto v = GetValue(PropId_Stretch);
+    if (const auto* i = std::get_if<std::int64_t>(&v)) {
+        if (*i >= 0 && *i <= 3) {
+            return static_cast<Stretch>(*i);
+        }
+    }
+    return Stretch::Uniform;
+}
+
+Size Image::MeasureCore(Size availableSize) noexcept {
+    (void)availableSize;
+    const Thickness p = GetPadding();
+    const std::string src = GetSource();
+    const float defaultSide = src.empty() ? 0.0f : 32.0f;
+    return Size{defaultSide + p.left + p.right, defaultSide + p.top + p.bottom};
 }
 
 // ============================================================================
@@ -886,11 +1063,59 @@ AxbTemplateRegistry& AxbTemplateRegistry::Instance() noexcept {
     return instance;
 }
 
+const AxbMtsdfPathEntry* AxbTemplateRegistry::InsertMtsdfPathLocked(AxbMtsdfPathEntry entry) {
+    if (entry.pathHash == 0) {
+        return nullptr;
+    }
+    if (const auto existing = mtsdfPaths_.find(entry.pathHash); existing != mtsdfPaths_.end()) {
+        return &existing->second;
+    }
+
+    // Assign a globally unique, non-overlapping UV slot in the bottom half [0.5..1.0) of the unified UI/Glyph atlas
+    const std::uint16_t safeCell = std::clamp<std::uint16_t>(
+        entry.cellWidth == 0 ? 32u : entry.cellWidth, 8u, 128u);
+    entry.cellWidth = safeCell;
+    entry.cellHeight = safeCell;
+
+    const std::uint32_t slot = nextMtsdfAtlasSlot_++;
+    std::uint16_t atlasDim = 1024u;
+    while (atlasDim < 4096u) {
+        const std::uint32_t cols = std::max<std::uint32_t>(1u, atlasDim / safeCell);
+        const std::uint32_t iconRows = std::max<std::uint32_t>(1u, cols / 2u);
+        if (slot < cols * iconRows) {
+            break;
+        }
+        atlasDim = static_cast<std::uint16_t>(atlasDim * 2u);
+    }
+
+    const std::uint32_t cols = std::max<std::uint32_t>(1u, atlasDim / safeCell);
+    const std::uint32_t rowBase = std::max<std::uint32_t>(1u, cols / 2u);
+    const std::uint32_t iconRows = std::max<std::uint32_t>(1u, cols - rowBase);
+    const std::uint32_t slotCol = slot % cols;
+    const std::uint32_t slotRow = rowBase + ((slot / cols) % iconRows);
+    const float invAtlas = 1.0f / static_cast<float>(atlasDim);
+
+    entry.atlasWidth = atlasDim;
+    entry.atlasHeight = atlasDim;
+    entry.u0 = (static_cast<float>(slotCol * safeCell) + 0.5f) * invAtlas;
+    entry.v0 = (static_cast<float>(slotRow * safeCell) + 0.5f) * invAtlas;
+    entry.u1 = (static_cast<float>((slotCol + 1u) * safeCell) - 0.5f) * invAtlas;
+    entry.v1 = (static_cast<float>((slotRow + 1u) * safeCell) - 0.5f) * invAtlas;
+
+    auto [insertedIt, _] = mtsdfPaths_.emplace(entry.pathHash, std::move(entry));
+    return &insertedIt->second;
+}
+
 void AxbTemplateRegistry::Register(std::string className, AxbPackage package) {
     std::lock_guard<std::mutex> lock(mutex_);
     for (const auto& kv : package.resources) {
         if (!kv.first.empty()) {
             resources_[kv.first] = kv.second;
+        }
+    }
+    for (const auto& mp : package.mtsdfPaths) {
+        if (mp.pathHash != 0) {
+            (void)InsertMtsdfPathLocked(mp);
         }
     }
     if (className.empty()) {
@@ -910,12 +1135,24 @@ void AxbTemplateRegistry::RegisterResources(const AxbPackage& package) {
             resources_[kv.first] = kv.second;
         }
     }
+    for (const auto& mp : package.mtsdfPaths) {
+        if (mp.pathHash != 0) {
+            (void)InsertMtsdfPathLocked(mp);
+        }
+    }
 }
 
 void AxbTemplateRegistry::RegisterResource(std::string key, UnifiedValue value) {
     if (!key.empty()) {
         std::lock_guard<std::mutex> lock(mutex_);
         resources_[std::move(key)] = std::move(value);
+    }
+}
+
+void AxbTemplateRegistry::RegisterMtsdfPath(AxbMtsdfPathEntry entry) {
+    if (entry.pathHash != 0) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        (void)InsertMtsdfPathLocked(std::move(entry));
     }
 }
 
@@ -940,6 +1177,33 @@ const AxbPackage* AxbTemplateRegistry::Find(std::string_view className) const no
         return &it->second;
     }
     return nullptr;
+}
+
+const AxbMtsdfPathEntry* AxbTemplateRegistry::FindMtsdfPath(std::uint64_t pathHash) const noexcept {
+    std::lock_guard<std::mutex> lock(mutex_);
+    const auto it = mtsdfPaths_.find(pathHash);
+    if (it != mtsdfPaths_.end()) {
+        return &it->second;
+    }
+    return nullptr;
+}
+
+const AxbMtsdfPathEntry* AxbTemplateRegistry::FindOrBakeMtsdfPath(std::string_view pathData) {
+    if (pathData.empty()) {
+        return nullptr;
+    }
+    const std::uint64_t hash = ComputeSvgPathHash(pathData);
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        const auto it = mtsdfPaths_.find(hash);
+        if (it != mtsdfPaths_.end()) {
+            return &it->second;
+        }
+    }
+    // On-demand fallback bake outside lock; final slot allocation & insertion is serialized inside InsertMtsdfPathLocked
+    AxbMtsdfPathEntry baked = BakeSvgPathToMtsdfEntry(pathData, 32u, 4.0f, 0u, 1024u);
+    std::lock_guard<std::mutex> lock(mutex_);
+    return InsertMtsdfPathLocked(std::move(baked));
 }
 
 UserControl::UserControl() {
@@ -1039,11 +1303,18 @@ IntrusivePtr<UIElement> CreateElementByTypeName(std::string_view typeName) {
         return MakeIntrusive<Grid>();
     }
     if (shortName == "Canvas") return MakeIntrusive<Canvas>();
-    if (shortName == "Border" || shortName == "Viewbox" || shortName == "ScrollViewer" ||
+    if (shortName == "Path") return MakeIntrusive<Path>();
+    if (shortName == "Image") return MakeIntrusive<Image>();
+    if (shortName == "ScrollViewer") {
+        auto sv = MakeIntrusive<Border>();
+        sv->SetValue(PropId_ClipToBounds, UnifiedValue{true}, ValueSourceRank::ThemeStyle);
+        return sv;
+    }
+    if (shortName == "Border" || shortName == "Viewbox" ||
         shortName == "ContentControl" || shortName == "ContentPresenter" ||
-        shortName == "Rectangle" || shortName == "Ellipse" || shortName == "Path" ||
+        shortName == "Rectangle" || shortName == "Ellipse" ||
         shortName == "Line" || shortName == "Polygon" || shortName == "Polyline" ||
-        shortName == "Image" || shortName == "RiveControl" || shortName == "BoxShadow" ||
+        shortName == "RiveControl" || shortName == "BoxShadow" ||
         shortName == "Slider" || shortName == "ProgressBar" ||
         shortName == "ComboBoxItem" || shortName == "ListBoxItem" ||
         shortName == "ListViewItem" || shortName == "TreeViewItem") {
@@ -1084,6 +1355,13 @@ bool MountAxbTemplate(
     rs_aot::ExecutionContext* eventAotContext) {
     if (!rootControl) {
         return false;
+    }
+
+    // Ensure pre-baked MTSDF vector path cells carried in this package are registered for zero-CPU-tessellation rendering
+    if (!package.mtsdfPaths.empty()) {
+        for (const auto& mp : package.mtsdfPaths) {
+            AxbTemplateRegistry::Instance().RegisterMtsdfPath(mp);
+        }
     }
 
     NativeHandleRegistry* registry = domains ? &domains->nativeHandles() : nullptr;
@@ -1145,7 +1423,6 @@ bool MountAxbTemplate(
                 if (currentElem && !elemName.empty()) {
                     currentElem->SetName(std::string(elemName));
 
-                    // Populate x:Name field slot on the partial class script instance if present
                     const ObjectRef wrapperObj = rootControl->BoundScriptWrapper().valid()
                         ? rootControl->BoundScriptWrapper()
                         : effectiveContext;

@@ -37,6 +37,7 @@ struct HostFrameTelemetry {
     std::size_t layoutPassesRun = 0;
     std::size_t trackAUpdates = 0;
     std::size_t trackBUpdates = 0;
+    std::size_t renderNodesSynced = 0;
     ZeroCopySubmissionStats gpuStats{};
 };
 
@@ -103,11 +104,14 @@ public:
     DesktopEventHost(
         UIElement* rootVisual = nullptr,
         DualTrackBindingEngine* bindingEngine = nullptr,
-        DepthBucketLayoutQueue* layoutQueue = nullptr) noexcept;
+        DepthBucketLayoutQueue* layoutQueue = nullptr,
+        PagedRenderTree* renderTree = nullptr) noexcept;
 
     [[nodiscard]] std::string_view HostName() const noexcept override {
         return "DesktopEventHost";
     }
+
+    void SetRenderTree(PagedRenderTree* tree) noexcept { renderTree_ = tree; }
 
     void SetStateFlags(
         bool hasActiveAnimations,
@@ -143,6 +147,7 @@ private:
     UIElement* rootVisual_ = nullptr;
     DualTrackBindingEngine* bindingEngine_ = nullptr;
     DepthBucketLayoutQueue* layoutQueue_ = nullptr;
+    PagedRenderTree* renderTree_ = nullptr;
     Size viewportSize_{1920.0f, 1080.0f};
     Size lastLaidOutViewport_{-1.0f, -1.0f};
     bool hasActiveAnimations_ = false;
@@ -276,11 +281,14 @@ public:
         UIElement* rootVisual = nullptr,
         DualTrackBindingEngine* bindingEngine = nullptr,
         DepthBucketLayoutQueue* layoutQueue = nullptr,
-        ShaderBackend webBackend = ShaderBackend::WebGL2);
+        ShaderBackend webBackend = ShaderBackend::WebGL2,
+        PagedRenderTree* renderTree = nullptr);
 
     [[nodiscard]] std::string_view HostName() const noexcept override {
         return "WebCanvasHost";
     }
+
+    void SetRenderTree(PagedRenderTree* tree) noexcept { renderTree_ = tree; }
 
     // Strictly non-blocking rAF state machine (ASYNCIFY is strictly forbidden)
     [[nodiscard]] static constexpr bool IsAsyncifyEnabled() noexcept { return false; }
@@ -315,6 +323,7 @@ private:
     UIElement* rootVisual_ = nullptr;
     DualTrackBindingEngine* bindingEngine_ = nullptr;
     DepthBucketLayoutQueue* layoutQueue_ = nullptr;
+    PagedRenderTree* renderTree_ = nullptr;
     ShaderBackend webBackend_ = ShaderBackend::WebGL2;
     WebRafState rafState_ = WebRafState::ActiveTicking;
     WebImeAdapter imeAdapter_{};

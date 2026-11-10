@@ -95,6 +95,27 @@ struct AxbInstruction {
     UnifiedValue literalValue{};
 };
 
+// Offline / on-demand 4-channel MTSDF (Multi-channel + True Signed Distance Field)
+// atlas entry for SVG <Path Data="M..."/> & <Geometry> vector icons.
+struct AxbMtsdfPathEntry {
+    std::uint64_t pathHash = 0;
+    float boundsX = 0.0f;
+    float boundsY = 0.0f;
+    float boundsW = 32.0f;
+    float boundsH = 32.0f;
+    float u0 = 0.0f;
+    float v0 = 0.0f;
+    float u1 = 1.0f;
+    float v1 = 1.0f;
+    std::uint16_t atlasWidth = 256;
+    std::uint16_t atlasHeight = 256;
+    std::uint16_t cellWidth = 32;
+    std::uint16_t cellHeight = 32;
+    float pxRange = 4.0f;
+    // 4-channel RGBA8 MTSDF cell (R,G,B = corner-preserving directional SDF, A = true Euclidean SDF)
+    std::vector<std::uint8_t> mtsdfRgbaPixels;
+};
+
 struct AxbPackage {
     std::string className;
     std::string rootTypeName;
@@ -105,9 +126,16 @@ struct AxbPackage {
     std::vector<AxbEventBindingRecord> eventBindings;
     std::vector<AxbInstruction> instructions;
     std::vector<std::pair<std::string, UnifiedValue>> resources;
+    std::vector<AxbMtsdfPathEntry> mtsdfPaths;
 
     std::uint32_t InternString(std::string_view text);
     [[nodiscard]] std::string_view GetString(std::uint32_t index) const noexcept;
+
+    // Runtime-compatible re-binding against an updated ProgramImage (< 5ms Hot Reload, 0 compiler frontend needed)
+    bool BindAgainstProgram(
+        const ProgramImage& program,
+        std::string_view rootDataTypeName = {},
+        const ExecutionDomainContext* domains = nullptr);
 
     [[nodiscard]] std::vector<std::uint8_t> Serialize() const;
     static bool Deserialize(
@@ -120,5 +148,31 @@ struct AxbPackage {
         AxbPackage& outPackage,
         std::string* errorMessage = nullptr);
 };
+
+// Runtime-accessible property literal helpers & SVG Path -> 4-channel MTSDF baker
+[[nodiscard]] std::uint16_t ResolveBuiltinPropertyId(std::string_view propertyName) noexcept;
+[[nodiscard]] UnifiedValue ParseBuiltinLiteralPropertyValue(
+    std::uint16_t propId,
+    std::string_view rawValue);
+[[nodiscard]] Color ParseXamlColorLiteral(std::string_view raw) noexcept;
+[[nodiscard]] std::string DecodeXamlXmlEntities(std::string_view raw);
+
+[[nodiscard]] std::uint64_t ComputeSvgPathHash(std::string_view pathData) noexcept;
+[[nodiscard]] Rect MeasureSvgPathBounds(std::string_view pathData);
+[[nodiscard]] AxbMtsdfPathEntry BakeSvgPathToMtsdfEntry(
+    std::string_view pathData,
+    std::uint16_t cellSize = 32,
+    float pxRange = 4.0f,
+    std::uint16_t atlasSlotIndex = 0,
+    std::uint16_t atlasSize = 512);
+
+// Shared UTF-8 validation, CJK width classification & multi-line text metrics
+[[nodiscard]] bool DecodeNextUtf8CodePoint(
+    std::string_view utf8Text,
+    std::size_t& ioCursor,
+    std::uint32_t& outCodePoint) noexcept;
+[[nodiscard]] bool IsWideCjkCodePoint(std::uint32_t codePoint) noexcept;
+[[nodiscard]] Size MeasureUtf8TextRun(std::string_view utf8Text, float fontSize) noexcept;
+[[nodiscard]] std::size_t CountVisibleUtf8Glyphs(std::string_view utf8Text) noexcept;
 
 } // namespace aero

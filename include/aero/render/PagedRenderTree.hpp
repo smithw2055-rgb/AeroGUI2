@@ -7,6 +7,7 @@
 #include <vector>
 
 #include "aero/binding/DualTrackBindingEngine.hpp"
+#include "aero/compiler/AxbFormat.hpp"
 #include "aero/core/UIElement.hpp"
 #include "aero/core/UnifiedValue.hpp"
 
@@ -17,6 +18,7 @@ enum class AeroPrimType : std::uint16_t {
     SdfRoundedRect = 1,
     SdfTextGlyph = 2,
     TexturedQuad = 3,
+    MsdfVectorPath = 4, // 4-channel MTSDF Vector Path (4-vertex Quad, 0 CPU triangulation)
 };
 
 enum AeroVertexFlags : std::uint16_t {
@@ -44,6 +46,11 @@ inline constexpr std::size_t kCommandPageSizeBytes = 4096;
 inline constexpr std::size_t kCommandPageHeaderBytes = 64;
 inline constexpr std::size_t kVerticesPerCommandPage =
     (kCommandPageSizeBytes - kCommandPageHeaderBytes) / sizeof(AeroVertex); // 168 vertices (42 quads)
+
+enum CommandPageFlags : std::uint32_t {
+    CommandPageFlag_None = 0u,
+    CommandPageFlag_ScissorClipActive = 1u << 0u,
+};
 
 struct CommandPageHeader {
     std::uint32_t pageIndex = 0;
@@ -94,14 +101,23 @@ struct RenderNodeDescriptor {
     float opacity = 1.0f;
     float cornerRadius = 0.0f;
     float borderThickness = 0.0f;
-    // 2D affine matrix (m00, m01, m10, m11, tx, ty)
+    // UV rectangle for TexturedQuad / MsdfVectorPath (unused by SolidQuad/SdfRoundedRect)
+    float uv0X = 0.0f;
+    float uv0Y = 0.0f;
+    float uv1X = 1.0f;
+    float uv1Y = 1.0f;
+    // 2D affine matrix (m00, m01, m10, m11, tx, ty) & cached ancestor state
     float m00 = 1.0f;
     float m01 = 0.0f;
     float m10 = 0.0f;
     float m11 = 1.0f;
     float tx = 0.0f;
     float ty = 0.0f;
+    float baseTx = 0.0f;
+    float baseTy = 0.0f;
+    float inheritedOpacity = 1.0f;
     std::uint32_t baseRgba = 0xFFFFFFFFu;
+    std::uint64_t mtsdfPathHash = 0;
     const UIElement* sourceElement = nullptr;
 };
 
@@ -115,6 +131,20 @@ void UnpackSdfRoundedRectParams(
     float& outCornerRadius,
     float& outBorderThickness) noexcept;
 
+// Pack MTSDF normalized UV range (in 1/4096 UV units), optional stroke width (bits 8..14), and strokeOnly bit (bit 15)
+[[nodiscard]] std::uint16_t PackMtsdfParams(
+    float pxRange,
+    std::uint16_t atlasSize,
+    float strokeThickness = 0.0f,
+    bool strokeOnly = false) noexcept;
+void UnpackMtsdfParams(
+    std::uint16_t packed,
+    float& outUvRange,
+    float& outStrokeThickness) noexcept;
+[[nodiscard]] constexpr bool IsMtsdfStrokeOnly(std::uint16_t packed) noexcept {
+    return (packed & 0x8000u) != 0u;
+}
+
 // CPU reference evaluation matching the GPU UberShader SDF analytical rounded-rect anti-aliasing
 [[nodiscard]] float EvaluateSdfRoundedRectCoverage(
     float sampleLocalX,
@@ -124,14 +154,30 @@ void UnpackSdfRoundedRectParams(
     float cornerRadius,
     float aaFeatherWidth = 1.0f) noexcept;
 
+// CPU reference evaluation matching the GPU UberShader 4-channel MTSDF median(R,G,B) + fwidth AA
+[[nodiscard]] float EvaluateMtsdfCoverage(
+    const AxbMtsdfPathEntry& entry,
+    float normX01,
+    float normY01,
+    float renderedWidthPx,
+    float renderedHeightPx,
+    bool singleChannelTrueSdfOnly = false) noexcept;
+
 class PagedRenderTree {
 public:
     PagedRenderTree();
 
     void Clear() noexcept;
 
-    // Build paged 4KB render tree from a laid-out UIElement hierarchy
+    [[nodiscard]] std::uint32_t TreeId() const noexcept { return treeId_; }
+
+    // Full build of paged 4KB render tree from a laid-out UIElement hierarchy
     std::size_t BuildFromVisualTree(const UIElement* rootElement);
+
+    // O(dirty_nodes) zero-allocation incremental synchronization from UIElement hierarchy:
+    // Walks ONLY branches carrying (RenderDirty | SubtreeRenderDirty) and updates bound render
+    // node spans in O(1) via UIElement::RenderNodeId() without rebuilding clean pages.
+    std::size_t SyncVisualTree(const UIElement* rootElement);
 
     // Allocate a standalone fast-path render node (e.g. ECS HUD health bar or damage counter)
     std::uint32_t AllocateRenderNode(
@@ -152,6 +198,43 @@ public:
         float glyphHeight,
         std::uint32_t maxDigits,
         const Color& color);
+
+    // Allocate a general UTF-8 SdfTextGlyph run node (supports ASCII + CJK codePoints, up to 42 glyphs/page)
+    std::uint32_t AllocateTextRunNode(
+        float x,
+        float y,
+        float fontSize,
+        std::string_view utf8Text,
+        const Color& color,
+        float opacity = 1.0f,
+        std::uint32_t reservedGlyphCapacity = 0,
+        const UIElement* owner = nullptr);
+
+    // Allocate a 4-vertex 4-channel MTSDF vector path quad (0 CPU triangulation)
+    std::uint32_t AllocateMtsdfPathNode(
+        float x,
+        float y,
+        float width,
+        float height,
+        const AxbMtsdfPathEntry& mtsdfEntry,
+        const Color& fillColor,
+        float strokeThickness = 0.0f,
+        float opacity = 1.0f,
+        const UIElement* owner = nullptr);
+
+    // Allocate a 4-vertex textured image quad
+    std::uint32_t AllocateTexturedNode(
+        float x,
+        float y,
+        float width,
+        float height,
+        float u0,
+        float v0,
+        float u1,
+        float v1,
+        const Color& tintColor,
+        float opacity = 1.0f,
+        const UIElement* owner = nullptr);
 
     // Reserve a contiguous batch of N HUD bar nodes for O(1) SIMD/pointer-walk Track B updates
     std::uint32_t AllocateHudBarBatch(
@@ -176,6 +259,14 @@ public:
         float tx,
         float ty) noexcept;
     bool UpdateHudDigitsText(std::uint32_t nodeId, std::string_view asciiDigits) noexcept;
+    bool UpdateTextRunNode(
+        std::uint32_t nodeId,
+        float x,
+        float y,
+        float fontSize,
+        std::string_view utf8Text,
+        const Color& color,
+        float opacity) noexcept;
     bool InvalidateNodePage(std::uint32_t nodeId) noexcept;
     bool UpdateDirtyElement(const UIElement* element) noexcept;
 
@@ -217,13 +308,67 @@ public:
         const auto idx = static_cast<std::uint8_t>(asciiChar) & 0x7Fu;
         return preCachedGlyphs_[idx];
     }
+    [[nodiscard]] GlyphUvRect LookupCodePointGlyph(std::uint32_t codePoint) const noexcept;
 
 private:
-    void InitPreCachedDigitGlyphs() noexcept;
-    void WriteQuadVertices(RenderNodeDescriptor& node) noexcept;
-    void MarkPageDirty(std::uint32_t pageIndex, std::uint16_t vertexOffsetInPage) noexcept;
-    void TraverseAndEmitElement(const UIElement* elem);
+    struct RenderTraversalState {
+        Rect clipRect{0.0f, 0.0f, 16384.0f, 16384.0f};
+        bool clipActive = false;
+        float inheritedOpacity = 1.0f;
+        float m00 = 1.0f;
+        float m01 = 0.0f;
+        float m10 = 0.0f;
+        float m11 = 1.0f;
+        float tx = 0.0f;
+        float ty = 0.0f;
+    };
 
+    void InitPreCachedDigitGlyphs() noexcept;
+    std::uint32_t EnsurePageForAllocation(
+        std::uint32_t neededVertices,
+        const Rect& clipRect,
+        bool clipActive);
+    void WriteQuadVertices(RenderNodeDescriptor& node) noexcept;
+    void ZeroOutNodeVertices(RenderNodeDescriptor& node) noexcept;
+    void MarkPageDirty(std::uint32_t pageIndex, std::uint16_t vertexOffsetInPage) noexcept;
+    bool UpdateTextRunNodeSlice(
+        std::uint32_t nodeId,
+        float x,
+        float y,
+        float fontSize,
+        std::string_view utf8Text,
+        std::size_t& ioUtf8Cursor,
+        float& ioLocalPenX,
+        float& ioLocalPenY,
+        const Color& color,
+        float opacity) noexcept;
+    std::uint16_t EmitTextRunNodes(
+        float x,
+        float y,
+        float fontSize,
+        std::string_view utf8Text,
+        const Color& color,
+        float opacity,
+        const RenderTraversalState& curState,
+        const UIElement* owner);
+    bool UpdateElementInPlace(
+        const UIElement* element,
+        const RenderTraversalState& curState);
+    void CollapseSubtreeRenderNodesRecursive(
+        const UIElement* elem,
+        std::size_t& ioUpdatedNodes) noexcept;
+    void TraverseAndEmitElement(const UIElement* elem, const RenderTraversalState& parentState);
+    bool SyncDirtySubtreeRecursive(
+        const UIElement* elem,
+        const RenderTraversalState& parentState,
+        bool forceSubtreeSync,
+        std::size_t& ioUpdatedNodes,
+        bool& outNeedsFullRebuild);
+
+    std::uint32_t treeId_ = 1u;
+    const UIElement* boundRootElement_ = nullptr;
+    Rect activeClipRect_{0.0f, 0.0f, 16384.0f, 16384.0f};
+    bool activeClipEnabled_ = false;
     std::vector<CommandPage> pages_;
     std::vector<RenderNodeDescriptor> nodes_;
     std::vector<std::uint8_t> pageDirtyFlags_;

@@ -29,6 +29,13 @@ enum class GridUnitType : std::uint8_t {
     Star = 2,
 };
 
+enum class Stretch : std::uint8_t {
+    None = 0,
+    Fill = 1,
+    Uniform = 2,
+    UniformToFill = 3,
+};
+
 struct RowDefinition {
     GridUnitType unit = GridUnitType::Star;
     float value = 1.0f;
@@ -162,6 +169,58 @@ public:
     void SetFontSize(float fontSize);
     [[nodiscard]] float GetFontSize() const noexcept;
 
+    void SetForeground(const Color& color);
+    [[nodiscard]] Color GetForeground() const noexcept;
+
+    Size MeasureCore(Size availableSize) noexcept override;
+};
+
+class Path : public UIElement {
+public:
+    Path();
+    ~Path() override = default;
+
+    static const TypeClass* StaticTypeClass() noexcept;
+    [[nodiscard]] const TypeClass* GetTypeClass() const noexcept override {
+        return StaticTypeClass();
+    }
+
+    void SetData(std::string_view svgPathData);
+    [[nodiscard]] std::string GetData() const;
+
+    void SetFill(const Color& color);
+    [[nodiscard]] Color GetFill() const noexcept;
+    [[nodiscard]] bool HasExplicitFill() const noexcept;
+
+    void SetStroke(const Color& color);
+    [[nodiscard]] Color GetStroke() const noexcept;
+    [[nodiscard]] bool HasExplicitStroke() const noexcept;
+
+    void SetStrokeThickness(float thickness);
+    [[nodiscard]] float GetStrokeThickness() const noexcept;
+
+    void SetStretch(Stretch stretch);
+    [[nodiscard]] Stretch GetStretch() const noexcept;
+
+    Size MeasureCore(Size availableSize) noexcept override;
+};
+
+class Image : public UIElement {
+public:
+    Image();
+    ~Image() override = default;
+
+    static const TypeClass* StaticTypeClass() noexcept;
+    [[nodiscard]] const TypeClass* GetTypeClass() const noexcept override {
+        return StaticTypeClass();
+    }
+
+    void SetSource(std::string_view sourceUri);
+    [[nodiscard]] std::string GetSource() const;
+
+    void SetStretch(Stretch stretch);
+    [[nodiscard]] Stretch GetStretch() const noexcept;
+
     Size MeasureCore(Size availableSize) noexcept override;
 };
 
@@ -200,7 +259,7 @@ private:
     std::vector<UnifiedValue> items_;
 };
 
-// Self-contained template registry for UserControl / Window automatic .axb4 mounting
+// Self-contained template & MTSDF vector icon registry for automatic .axb4 mounting
 class AxbTemplateRegistry {
 public:
     static AxbTemplateRegistry& Instance() noexcept;
@@ -208,18 +267,31 @@ public:
     void Register(std::string className, AxbPackage package);
     void RegisterResources(const AxbPackage& package);
     void RegisterResource(std::string key, UnifiedValue value);
+    void RegisterMtsdfPath(AxbMtsdfPathEntry entry);
     [[nodiscard]] const UnifiedValue* FindResource(std::string_view key) const noexcept;
     [[nodiscard]] const AxbPackage* Find(std::string_view className) const noexcept;
+    [[nodiscard]] const AxbMtsdfPathEntry* FindMtsdfPath(std::uint64_t pathHash) const noexcept;
+    [[nodiscard]] const AxbMtsdfPathEntry* FindOrBakeMtsdfPath(std::string_view pathData);
+    [[nodiscard]] std::size_t RegisteredMtsdfPathCount() const noexcept {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return mtsdfPaths_.size();
+    }
     void Clear() noexcept {
         std::lock_guard<std::mutex> lock(mutex_);
         templates_.clear();
         resources_.clear();
+        mtsdfPaths_.clear();
+        nextMtsdfAtlasSlot_ = 0u;
     }
 
 private:
+    const AxbMtsdfPathEntry* InsertMtsdfPathLocked(AxbMtsdfPathEntry entry);
+
     mutable std::mutex mutex_;
     std::unordered_map<std::string, AxbPackage> templates_;
     std::unordered_map<std::string, UnifiedValue> resources_;
+    std::unordered_map<std::uint64_t, AxbMtsdfPathEntry> mtsdfPaths_;
+    std::uint32_t nextMtsdfAtlasSlot_ = 0u;
 };
 
 class UserControl : public Panel {

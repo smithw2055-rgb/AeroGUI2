@@ -86,6 +86,8 @@ template <typename T, typename... Args>
 
 class UIElement {
 public:
+    static constexpr std::uint32_t InvalidRenderNodeId = 0xFFFFFFFFu;
+
     UIElement();
     virtual ~UIElement();
 
@@ -190,6 +192,24 @@ public:
     [[nodiscard]] Rect FinalRect() const noexcept { return finalRect_; }
     [[nodiscard]] std::uint16_t TreeDepth() const noexcept { return treeDepth_; }
 
+    // O(1) PagedRenderTree linkage (eliminates O(N) sourceElement linear scans)
+    void BindRenderNodeSpan(
+        std::uint32_t renderTreeId,
+        std::uint32_t firstNodeId,
+        std::uint16_t nodeSpan) const noexcept {
+        renderTreeId_ = renderTreeId;
+        renderNodeId_ = firstNodeId;
+        renderNodeSpan_ = nodeSpan;
+    }
+    void DetachRenderNodeSpan() const noexcept {
+        renderTreeId_ = 0u;
+        renderNodeId_ = InvalidRenderNodeId;
+        renderNodeSpan_ = 0u;
+    }
+    [[nodiscard]] std::uint32_t RenderTreeId() const noexcept { return renderTreeId_; }
+    [[nodiscard]] std::uint32_t RenderNodeId() const noexcept { return renderNodeId_; }
+    [[nodiscard]] std::uint16_t RenderNodeSpan() const noexcept { return renderNodeSpan_; }
+
     // 8 Fast Inline Properties (0 heap allocation fast path)
     [[nodiscard]] float GetWidth() const noexcept { return fastProps_.width; }
     void SetWidth(float v) noexcept {
@@ -261,7 +281,7 @@ public:
     void SetOpacity(float v) noexcept {
         if (fastProps_.opacity != v) {
             fastProps_.opacity = v;
-            fastProps_.layoutDirtyFlags |= RenderDirty;
+            InvalidateRender();
         }
     }
 
@@ -272,7 +292,7 @@ public:
         const auto raw = static_cast<std::uint8_t>(v);
         if (fastProps_.visibility != raw) {
             fastProps_.visibility = raw;
-            fastProps_.layoutDirtyFlags |= RenderDirty;
+            InvalidateRender();
             InvalidateLayout();
         }
     }
@@ -285,15 +305,21 @@ public:
         fastProps_.layoutDirtyFlags |= ArrangeDirty;
         PropagateSubtreeDirty(SubtreeArrangeDirty);
     }
+    void InvalidateRender() noexcept {
+        fastProps_.layoutDirtyFlags |= RenderDirty;
+        PropagateSubtreeDirty(SubtreeRenderDirty);
+    }
     void InvalidateLayout() noexcept {
-        fastProps_.layoutDirtyFlags |= (MeasureDirty | ArrangeDirty);
-        PropagateSubtreeDirty(SubtreeLayoutDirty);
+        fastProps_.layoutDirtyFlags |= (MeasureDirty | ArrangeDirty | RenderDirty);
+        PropagateSubtreeDirty(static_cast<std::uint8_t>(SubtreeLayoutDirty | SubtreeRenderDirty));
     }
 
     [[nodiscard]] std::uint8_t GetLayoutDirtyFlags() const noexcept {
         return fastProps_.layoutDirtyFlags;
     }
-    void ClearLayoutDirtyFlags(std::uint8_t mask = static_cast<std::uint8_t>(LayoutAllDirty | SubtreeLayoutDirty)) noexcept {
+    void ClearLayoutDirtyFlags(
+        std::uint8_t mask = static_cast<std::uint8_t>(
+            LayoutAllDirty | SubtreeLayoutDirty | SubtreeRenderDirty)) const noexcept {
         fastProps_.layoutDirtyFlags &= static_cast<std::uint8_t>(~mask);
     }
 
@@ -351,6 +377,11 @@ private:
     std::uint16_t treeDepth_ = 0;
     bool inMeasureQueue_ = false;
     bool inArrangeQueue_ = false;
+
+    // O(1) PagedRenderTree node span cache
+    mutable std::uint32_t renderTreeId_ = 0u;
+    mutable std::uint32_t renderNodeId_ = InvalidRenderNodeId;
+    mutable std::uint16_t renderNodeSpan_ = 0u;
 
     // Layout computed geometry & cached Measure constraint
     Size lastMeasureConstraint_{-1.0f, -1.0f};

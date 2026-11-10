@@ -28,6 +28,14 @@ struct GlBufferSubDataSpan {
     const void* sourcePageVertexPtr = nullptr;
 };
 
+struct GpuClipDrawBatch {
+    std::uint32_t firstPageIndex = 0;
+    std::uint32_t pageCount = 0;
+    std::uint32_t vertexCount = 0;
+    bool scissorActive = false;
+    Rect scissorRect{0.0f, 0.0f, 16384.0f, 16384.0f};
+};
+
 struct ZeroCopySubmissionStats {
     std::uint64_t frameIndex = 0;
     std::size_t dirtyPagesUploaded = 0;
@@ -67,10 +75,23 @@ public:
         return subDataSpans_;
     }
 
+    [[nodiscard]] const std::vector<GpuClipDrawBatch>& LastClipDrawBatches() const noexcept {
+        return clipDrawBatches_;
+    }
+
     [[nodiscard]] const AeroVertex* MappedPageVertices(std::size_t pageIndex) const noexcept;
     [[nodiscard]] std::size_t RingCapacityBytes() const noexcept { return ringCapacityBytes_; }
 
-    // Built-in 200-line unified UberShader sources (Desktop GL 3.3, WebGL2 #version 300 es, WebGPU WGSL)
+    // Headless software UberShader rasterizer matching GPU UberShader SDF/MTSDF/Scissor math
+    // for deterministic CI Golden Image pixel verification without a display server.
+    static void RasterizeTreeToRgba8(
+        const PagedRenderTree& tree,
+        std::uint32_t viewportWidth,
+        std::uint32_t viewportHeight,
+        std::vector<std::uint8_t>& outRgba8,
+        Color clearColor = Color{0.06f, 0.08f, 0.11f, 1.0f});
+
+    // Built-in unified UberShader sources (Desktop GL 3.3, WebGL2 #version 300 es, WebGPU WGSL)
     [[nodiscard]] static std::string_view UberVertexShaderSource(ShaderBackend backend) noexcept;
     [[nodiscard]] static std::string_view UberPixelShaderSource(ShaderBackend backend) noexcept;
 
@@ -83,6 +104,7 @@ private:
     std::vector<std::uint8_t> ownedRingStorage_;
     std::uint8_t* mappedRingBase_ = nullptr;
     std::vector<GlBufferSubDataSpan> subDataSpans_;
+    std::vector<GpuClipDrawBatch> clipDrawBatches_;
     ZeroCopySubmissionStats lastStats_{};
 };
 

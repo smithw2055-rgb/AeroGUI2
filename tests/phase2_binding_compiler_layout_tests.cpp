@@ -1117,9 +1117,9 @@ public void SetLocale(LocalizationView view, string code)
         campaignTb->GetText() == "开始星际战役",
         "Localization switched to zh-CN UTF-8 string");
     campaignTb->Measure(Size{400.0f, 100.0f});
-    // 6 CJK codepoints * (20.0f * 0.6f) = 72.0f width
+    // 6 wide CJK codepoints * (20.0f * 0.95f) = 114.0f width
     AERO_CHECK(
-        std::fabs(campaignTb->DesiredSize().width - 72.0f) < 1e-4f,
+        std::fabs(campaignTb->DesiredSize().width - 114.0f) < 1e-4f,
         "UTF-8 codepoint-aware TextBlock Measure computes exact width for 6 CJK characters");
 
     // ------------------------------------------------------------------------

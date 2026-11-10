@@ -9,48 +9,6 @@ namespace aero {
 
 namespace {
 
-bool DecodeNextUtf8CodePoint(
-    std::string_view text,
-    std::size_t& cursor,
-    std::uint32_t& outCodePoint) noexcept {
-    if (cursor >= text.size()) {
-        return false;
-    }
-    const auto b0 = static_cast<std::uint8_t>(text[cursor]);
-    if ((b0 & 0x80u) == 0u) {
-        outCodePoint = b0;
-        cursor += 1u;
-        return true;
-    }
-    if ((b0 & 0xE0u) == 0xC0u && cursor + 1u < text.size()) {
-        const auto b1 = static_cast<std::uint8_t>(text[cursor + 1u]) & 0x3Fu;
-        outCodePoint = ((static_cast<std::uint32_t>(b0 & 0x1Fu) << 6u) | b1);
-        cursor += 2u;
-        return true;
-    }
-    if ((b0 & 0xF0u) == 0xE0u && cursor + 2u < text.size()) {
-        const auto b1 = static_cast<std::uint8_t>(text[cursor + 1u]) & 0x3Fu;
-        const auto b2 = static_cast<std::uint8_t>(text[cursor + 2u]) & 0x3Fu;
-        outCodePoint = ((static_cast<std::uint32_t>(b0 & 0x0Fu) << 12u) |
-                        (static_cast<std::uint32_t>(b1) << 6u) | b2);
-        cursor += 3u;
-        return true;
-    }
-    if ((b0 & 0xF8u) == 0xF0u && cursor + 3u < text.size()) {
-        const auto b1 = static_cast<std::uint8_t>(text[cursor + 1u]) & 0x3Fu;
-        const auto b2 = static_cast<std::uint8_t>(text[cursor + 2u]) & 0x3Fu;
-        const auto b3 = static_cast<std::uint8_t>(text[cursor + 3u]) & 0x3Fu;
-        outCodePoint = ((static_cast<std::uint32_t>(b0 & 0x07u) << 18u) |
-                        (static_cast<std::uint32_t>(b1) << 12u) |
-                        (static_cast<std::uint32_t>(b2) << 6u) | b3);
-        cursor += 4u;
-        return true;
-    }
-    outCodePoint = 0xFFFDu;
-    cursor += 1u;
-    return true;
-}
-
 AriaShadowNode BuildAriaNodeRecursive(const UIElement* elem) {
     AriaShadowNode node{};
     if (!elem) {
@@ -137,6 +95,14 @@ void EmbeddedGameHost::TickUi(float dt, std::uint32_t activePhaseMask) {
             rootVisual_->Arrange(Rect{0.0f, 0.0f, viewportSize_.width, viewportSize_.height});
         }
     }
+
+    // Automatically synchronize dirty UIElement nodes into PagedRenderTree in O(dirty_nodes)
+    // (Skipped on pure HUD fast-refresh frames where Track B writes directly to CommandPages)
+    if (renderTree_ && rootVisual_ &&
+        (activePhaseMask & UiPhase_RenderRecord) != 0u &&
+        (activePhaseMask & UiPhase_Layout) != 0u) {
+        telemetry_.renderNodesSynced += renderTree_->SyncVisualTree(rootVisual_);
+    }
 }
 
 ZeroCopySubmissionStats EmbeddedGameHost::RecordGpuCommands(
@@ -153,10 +119,12 @@ ZeroCopySubmissionStats EmbeddedGameHost::RecordGpuCommands(
 DesktopEventHost::DesktopEventHost(
     UIElement* rootVisual,
     DualTrackBindingEngine* bindingEngine,
-    DepthBucketLayoutQueue* layoutQueue) noexcept
+    DepthBucketLayoutQueue* layoutQueue,
+    PagedRenderTree* renderTree) noexcept
     : rootVisual_(rootVisual)
     , bindingEngine_(bindingEngine)
-    , layoutQueue_(layoutQueue) {}
+    , layoutQueue_(layoutQueue)
+    , renderTree_(renderTree) {}
 
 void DesktopEventHost::SetStateFlags(
     bool hasActiveAnimations,
@@ -170,10 +138,14 @@ void DesktopEventHost::SetStateFlags(
 }
 
 bool DesktopEventHost::CanSleepIdle() const noexcept {
+    const bool rootVisualDirty = renderTree_ && rootVisual_ &&
+        (rootVisual_->GetLayoutDirtyFlags() &
+         (MeasureDirty | ArrangeDirty | RenderDirty | SubtreeLayoutDirty | SubtreeRenderDirty)) != 0u;
     return !hasActiveAnimations_ &&
            !hasDirtyObjects_ &&
            !hasDirtyLayout_ &&
-           !hasPendingInputEvents_;
+           !hasPendingInputEvents_ &&
+           !rootVisualDirty;
 }
 
 void DesktopEventHost::TickUi(float dt, std::uint32_t activePhaseMask) {
@@ -198,7 +170,10 @@ void DesktopEventHost::TickUi(float dt, std::uint32_t activePhaseMask) {
         telemetry_.stylePassesRun += 1u;
     }
 
-    if ((activePhaseMask & UiPhase_Layout) != 0u && hasDirtyLayout_) {
+    const bool rootNeedsLayout = renderTree_ && rootVisual_ &&
+        (rootVisual_->GetLayoutDirtyFlags() &
+         (MeasureDirty | ArrangeDirty | SubtreeLayoutDirty)) != 0u;
+    if ((activePhaseMask & UiPhase_Layout) != 0u && (hasDirtyLayout_ || rootNeedsLayout)) {
         telemetry_.layoutPassesRun += 1u;
         if (rootVisual_ && viewportSize_ != lastLaidOutViewport_) {
             rootVisual_->InvalidateLayout();
@@ -213,6 +188,10 @@ void DesktopEventHost::TickUi(float dt, std::uint32_t activePhaseMask) {
             rootVisual_->Measure(viewportSize_);
             rootVisual_->Arrange(Rect{0.0f, 0.0f, viewportSize_.width, viewportSize_.height});
         }
+    }
+
+    if (renderTree_ && rootVisual_ && (activePhaseMask & UiPhase_RenderRecord) != 0u) {
+        telemetry_.renderNodesSynced += renderTree_->SyncVisualTree(rootVisual_);
     }
 
     // Clear transient dirty flags after processing; if animations are off, next check can sleep idle
@@ -266,7 +245,6 @@ void WebImeAdapter::OnCompositionUpdate(std::string_view preeditText, std::uint3
     isComposing_ = true;
     preeditText_.assign(preeditText);
     caretOffset_ = caretOffset;
-    // Position transparent DOM input overlay X relative to base caret + committed + active caretOffset
     overlayDomRect_.x = baseCaretRect_.x +
         static_cast<float>(committedText_.size() + caretOffset) * 2.0f;
     if (focusedElement_) {
@@ -330,7 +308,6 @@ WebFontStreamProvider::WebFontStreamProvider() {
 }
 
 std::uint32_t WebFontStreamProvider::ComputeShardIdForCodePoint(std::uint32_t codePoint) const noexcept {
-    // Partition Unicode into 256-codepoint shards (e.g. 0x4E00 -> shard 0x4E, 0x6211 '我' -> shard 0x62)
     return codePoint >> 8u;
 }
 
@@ -426,10 +403,12 @@ WebCanvasHost::WebCanvasHost(
     UIElement* rootVisual,
     DualTrackBindingEngine* bindingEngine,
     DepthBucketLayoutQueue* layoutQueue,
-    ShaderBackend webBackend)
+    ShaderBackend webBackend,
+    PagedRenderTree* renderTree)
     : rootVisual_(rootVisual)
     , bindingEngine_(bindingEngine)
     , layoutQueue_(layoutQueue)
+    , renderTree_(renderTree)
     , webBackend_(webBackend) {}
 
 void WebCanvasHost::TickUi(float dt, std::uint32_t activePhaseMask) {
@@ -472,7 +451,13 @@ void WebCanvasHost::TickUi(float dt, std::uint32_t activePhaseMask) {
         }
     }
 
-    // Automatically suspend rAF if no IME composition, no pending font shards, and no dirty bindings
+    if (renderTree_ && rootVisual_ && (activePhaseMask & UiPhase_RenderRecord) != 0u) {
+        const std::size_t synced = renderTree_->SyncVisualTree(rootVisual_);
+        telemetry_.renderNodesSynced += synced;
+        changes += synced;
+    }
+
+    // Automatically suspend rAF if no IME composition, no pending font shards, and no dirty bindings/layout/render
     if (changes == 0 && !imeAdapter_.IsComposing() && fontStream_.PendingFetchRequests().empty()) {
         rafState_ = WebRafState::SuspendedIdle;
     }

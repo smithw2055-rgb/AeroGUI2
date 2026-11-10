@@ -15,6 +15,16 @@ TypeClass gWindowTypeClass{};
 TypeClass gButtonTypeClass{};
 bool gBuiltinTypesInitialized = false;
 
+void DetachSubtreeRenderNodes(UIElement* elem) noexcept {
+    if (!elem) {
+        return;
+    }
+    elem->DetachRenderNodeSpan();
+    for (UIElement* c = elem->FirstChild(); c != nullptr; c = c->NextSibling()) {
+        DetachSubtreeRenderNodes(c);
+    }
+}
+
 } // namespace
 
 void EnsureBuiltinTypesRegistered() noexcept {
@@ -66,6 +76,8 @@ Button::Button() {
 }
 
 UIElement::~UIElement() {
+    DetachRenderNodeSpan();
+
     // Detach children safely
     UIElement* child = firstChild_;
     while (child) {
@@ -180,6 +192,8 @@ bool UIElement::AddChild(
     lastChild_ = child;
 
     child->UpdateSubtreeDepth(static_cast<std::uint16_t>(treeDepth_ + 1u));
+    DetachSubtreeRenderNodes(child);
+    child->InvalidateRender();
     InvalidateLayout();
     child->PropagateRootConnection(
         isConnectedToRoot_,
@@ -210,6 +224,9 @@ bool UIElement::RemoveChild(
     child->prevSibling_ = nullptr;
     child->nextSibling_ = nullptr;
     child->UpdateSubtreeDepth(0);
+    DetachSubtreeRenderNodes(child);
+    // Detach parent's render tree binding marker to signal structural removal to PagedRenderTree
+    DetachRenderNodeSpan();
     InvalidateLayout();
 
     child->PropagateRootConnection(
@@ -305,6 +322,9 @@ namespace {
         case PropId_CanvasTop:
         case PropId_Orientation:
         case PropId_Spacing:
+        case PropId_PathData:
+        case PropId_ImageSource:
+        case PropId_Stretch:
             return true;
         default:
             return false;
@@ -344,9 +364,17 @@ UIElement* UIElement::HitTest(Point point) noexcept {
         return nullptr;
     }
 
-    // Apply 2D/3D inverse projection transform around element center first so child subtree
-    // hit-testing operates in this container's unprojected local coordinate space.
+    // Apply inverse 2D RenderTransformMatrix and 3D projection transform around element center
+    // so child subtree hit-testing operates in this container's local coordinate space.
     Point localPt = point;
+    const UnifiedValue rtmVal = GetValue(PropId_RenderTransformMatrix);
+    if (const auto* f4 = std::get_if<Float4Value>(&rtmVal)) {
+        const float safeSx = (std::abs(f4->x) > 1e-4f) ? f4->x : (f4->x >= 0.0f ? 1e-4f : -1e-4f);
+        const float safeSy = (std::abs(f4->y) > 1e-4f) ? f4->y : (f4->y >= 0.0f ? 1e-4f : -1e-4f);
+        localPt.x = (localPt.x - f4->z) / safeSx;
+        localPt.y = (localPt.y - f4->w) / safeSy;
+    }
+
     const Rect r = finalRect_;
     const float cx = r.x + r.width * 0.5f;
     const float cy = r.y + r.height * 0.5f;
@@ -364,8 +392,18 @@ UIElement* UIElement::HitTest(Point point) noexcept {
         const float cosPitch = std::cos(pitchDeg * kDegToRad);
         const float safeCosYaw = (std::abs(cosYaw) > 0.05f) ? cosYaw : (cosYaw >= 0.0f ? 0.05f : -0.05f);
         const float safeCosPitch = (std::abs(cosPitch) > 0.05f) ? cosPitch : (cosPitch >= 0.0f ? 0.05f : -0.05f);
-        localPt.x = cx + (point.x - cx) / safeCosYaw;
-        localPt.y = cy + (point.y - cy) / safeCosPitch;
+        localPt.x = cx + (localPt.x - cx) / safeCosYaw;
+        localPt.y = cy + (localPt.y - cy) / safeCosPitch;
+    }
+
+    // Optional ClipToBounds check before testing children
+    const UnifiedValue clipVal = GetValue(PropId_ClipToBounds);
+    if (const auto* clipBool = std::get_if<bool>(&clipVal); clipBool && *clipBool) {
+        if (r.width <= 0.0f || r.height <= 0.0f ||
+            localPt.x < r.x || localPt.x > r.x + r.width ||
+            localPt.y < r.y || localPt.y > r.y + r.height) {
+            return nullptr;
+        }
     }
 
     // Traverse children in reverse Z-order (lastChild_ -> firstChild_)
@@ -431,7 +469,11 @@ void UIElement::Measure(Size availableSize) noexcept {
 
 void UIElement::Arrange(Rect finalRect) noexcept {
     if (GetVisibility() == Visibility::Collapsed) {
-        finalRect_ = {finalRect.x, finalRect.y, 0.0f, 0.0f};
+        const Rect collapsedRect{finalRect.x, finalRect.y, 0.0f, 0.0f};
+        if (finalRect_ != collapsedRect) {
+            finalRect_ = collapsedRect;
+            InvalidateRender();
+        }
         ClearLayoutDirtyFlags(ArrangeDirty | SubtreeArrangeDirty);
         return;
     }
@@ -450,7 +492,10 @@ void UIElement::Arrange(Rect finalRect) noexcept {
         innerRect.height = fastProps_.height;
     }
 
-    finalRect_ = innerRect;
+    if (finalRect_ != innerRect) {
+        finalRect_ = innerRect;
+        InvalidateRender();
+    }
     ArrangeCore(innerRect);
     ClearLayoutDirtyFlags(ArrangeDirty | SubtreeArrangeDirty);
 }
@@ -600,7 +645,7 @@ bool UIElement::SetValue(
         }
         it->sourceRank = rawRank;
         it->effectiveValue = value;
-        fastProps_.layoutDirtyFlags |= RenderDirty;
+        InvalidateRender();
         if (IsLayoutAffectingSparseProperty(propId)) {
             InvalidateLayout();
             if (IsParentLayoutAttachedProperty(propId) && parent_) {
@@ -619,7 +664,7 @@ bool UIElement::SetValue(
     entry.animationTrackId = 0xFFFFu;
     entry.effectiveValue = value;
     sparseProps_.insert(it, std::move(entry));
-    fastProps_.layoutDirtyFlags |= RenderDirty;
+    InvalidateRender();
     if (IsLayoutAffectingSparseProperty(propId)) {
         InvalidateLayout();
         if (IsParentLayoutAttachedProperty(propId) && parent_) {
@@ -682,7 +727,7 @@ bool UIElement::ClearValue(std::uint16_t propId, ValueSourceRank rank) {
         return false;
     }
     sparseProps_.erase(it);
-    fastProps_.layoutDirtyFlags |= RenderDirty;
+    InvalidateRender();
     if (IsLayoutAffectingSparseProperty(propId)) {
         InvalidateLayout();
         if (IsParentLayoutAttachedProperty(propId) && parent_) {

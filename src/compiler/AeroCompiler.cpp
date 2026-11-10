@@ -2,9 +2,10 @@
 
 #include <algorithm>
 #include <cctype>
-#include <charconv>
+#include <cstdio>
 #include <cstdlib>
-#include <cstring>
+#include <string>
+#include <unordered_set>
 
 #include "aero/controls/Controls.hpp"
 #include "aero/core/TypeClass.hpp"
@@ -14,169 +15,6 @@
 namespace aero {
 
 namespace {
-
-enum class AxbLiteralTag : std::uint8_t {
-    Empty = 0,
-    Bool = 1,
-    Int64 = 2,
-    Float32 = 3,
-    Float4 = 4,
-    String = 5,
-};
-
-void WriteU8(std::vector<std::uint8_t>& out, std::uint8_t v) {
-    out.push_back(v);
-}
-
-void WriteU16(std::vector<std::uint8_t>& out, std::uint16_t v) {
-    out.push_back(static_cast<std::uint8_t>(v & 0xFFu));
-    out.push_back(static_cast<std::uint8_t>((v >> 8u) & 0xFFu));
-}
-
-void WriteU32(std::vector<std::uint8_t>& out, std::uint32_t v) {
-    for (int i = 0; i < 4; ++i) {
-        out.push_back(static_cast<std::uint8_t>((v >> (i * 8)) & 0xFFu));
-    }
-}
-
-void WriteU64(std::vector<std::uint8_t>& out, std::uint64_t v) {
-    for (int i = 0; i < 8; ++i) {
-        out.push_back(static_cast<std::uint8_t>((v >> (i * 8)) & 0xFFu));
-    }
-}
-
-void WriteF32(std::vector<std::uint8_t>& out, float v) {
-    std::uint32_t bits = 0;
-    std::memcpy(&bits, &v, sizeof(float));
-    WriteU32(out, bits);
-}
-
-void WriteString(std::vector<std::uint8_t>& out, std::string_view s) {
-    WriteU32(out, static_cast<std::uint32_t>(s.size()));
-    out.insert(out.end(), s.begin(), s.end());
-}
-
-void WriteValue(std::vector<std::uint8_t>& out, const UnifiedValue& val) {
-    if (const auto* b = std::get_if<bool>(&val)) {
-        WriteU8(out, static_cast<std::uint8_t>(AxbLiteralTag::Bool));
-        WriteU8(out, *b ? 1u : 0u);
-    } else if (const auto* i = std::get_if<std::int64_t>(&val)) {
-        WriteU8(out, static_cast<std::uint8_t>(AxbLiteralTag::Int64));
-        WriteU64(out, static_cast<std::uint64_t>(*i));
-    } else if (const auto* f = std::get_if<FloatValue>(&val)) {
-        WriteU8(out, static_cast<std::uint8_t>(AxbLiteralTag::Float32));
-        WriteF32(out, f->value);
-    } else if (const auto* f4 = std::get_if<Float4Value>(&val)) {
-        WriteU8(out, static_cast<std::uint8_t>(AxbLiteralTag::Float4));
-        WriteF32(out, f4->x);
-        WriteF32(out, f4->y);
-        WriteF32(out, f4->z);
-        WriteF32(out, f4->w);
-    } else if (const auto* s = std::get_if<StringValue>(&val)) {
-        WriteU8(out, static_cast<std::uint8_t>(AxbLiteralTag::String));
-        WriteString(out, s->view());
-    } else {
-        WriteU8(out, static_cast<std::uint8_t>(AxbLiteralTag::Empty));
-    }
-}
-
-struct ByteReader {
-    const std::uint8_t* data = nullptr;
-    std::size_t size = 0;
-    std::size_t offset = 0;
-
-    bool ReadU8(std::uint8_t& out) noexcept {
-        if (offset + 1 > size) return false;
-        out = data[offset++];
-        return true;
-    }
-
-    bool ReadU16(std::uint16_t& out) noexcept {
-        if (offset + 2 > size) return false;
-        out = static_cast<std::uint16_t>(data[offset]) |
-              static_cast<std::uint16_t>(static_cast<std::uint16_t>(data[offset + 1]) << 8u);
-        offset += 2;
-        return true;
-    }
-
-    bool ReadU32(std::uint32_t& out) noexcept {
-        if (offset + 4 > size) return false;
-        out = 0;
-        for (int i = 0; i < 4; ++i) {
-            out |= (static_cast<std::uint32_t>(data[offset + i]) << (i * 8));
-        }
-        offset += 4;
-        return true;
-    }
-
-    bool ReadU64(std::uint64_t& out) noexcept {
-        if (offset + 8 > size) return false;
-        out = 0;
-        for (int i = 0; i < 8; ++i) {
-            out |= (static_cast<std::uint64_t>(data[offset + i]) << (i * 8));
-        }
-        offset += 8;
-        return true;
-    }
-
-    bool ReadF32(float& out) noexcept {
-        std::uint32_t bits = 0;
-        if (!ReadU32(bits)) return false;
-        std::memcpy(&out, &bits, sizeof(float));
-        return true;
-    }
-
-    bool ReadString(std::string& out) {
-        std::uint32_t len = 0;
-        if (!ReadU32(len) || offset + len > size) return false;
-        out.assign(reinterpret_cast<const char*>(data + offset), len);
-        offset += len;
-        return true;
-    }
-
-    bool ReadValue(UnifiedValue& out) {
-        std::uint8_t tagRaw = 0;
-        if (!ReadU8(tagRaw)) return false;
-        switch (static_cast<AxbLiteralTag>(tagRaw)) {
-            case AxbLiteralTag::Empty:
-                out = std::monostate{};
-                return true;
-            case AxbLiteralTag::Bool: {
-                std::uint8_t b = 0;
-                if (!ReadU8(b)) return false;
-                out = (b != 0);
-                return true;
-            }
-            case AxbLiteralTag::Int64: {
-                std::uint64_t v = 0;
-                if (!ReadU64(v)) return false;
-                out = static_cast<std::int64_t>(v);
-                return true;
-            }
-            case AxbLiteralTag::Float32: {
-                float f = 0.0f;
-                if (!ReadF32(f)) return false;
-                out = MakeFloat(f);
-                return true;
-            }
-            case AxbLiteralTag::Float4: {
-                Float4Value f4{};
-                if (!ReadF32(f4.x) || !ReadF32(f4.y) || !ReadF32(f4.z) || !ReadF32(f4.w)) {
-                    return false;
-                }
-                out = UnifiedValue{f4};
-                return true;
-            }
-            case AxbLiteralTag::String: {
-                std::string s;
-                if (!ReadString(s)) return false;
-                out = value::FromString(std::move(s));
-                return true;
-            }
-        }
-        return false;
-    }
-};
 
 std::string_view Trim(std::string_view s) noexcept {
     while (!s.empty() && std::isspace(static_cast<unsigned char>(s.front()))) {
@@ -202,33 +40,6 @@ float ParseFloat32(std::string_view text, float fallback = 0.0f) noexcept {
     return val;
 }
 
-std::vector<float> ParseFloatList(std::string_view text) {
-    std::vector<float> nums;
-    std::size_t pos = 0;
-    while (pos < text.size()) {
-        while (pos < text.size() &&
-               (text[pos] == ',' || std::isspace(static_cast<unsigned char>(text[pos])))) {
-            ++pos;
-        }
-        if (pos >= text.size()) break;
-        std::size_t end = pos;
-        while (end < text.size() && text[end] != ',' &&
-               !std::isspace(static_cast<unsigned char>(text[end]))) {
-            ++end;
-        }
-        nums.push_back(ParseFloat32(text.substr(pos, end - pos)));
-        pos = end;
-    }
-    return nums;
-}
-
-std::uint8_t HexNibble(char c) noexcept {
-    if (c >= '0' && c <= '9') return static_cast<std::uint8_t>(c - '0');
-    if (c >= 'a' && c <= 'f') return static_cast<std::uint8_t>(10 + (c - 'a'));
-    if (c >= 'A' && c <= 'F') return static_cast<std::uint8_t>(10 + (c - 'A'));
-    return 0;
-}
-
 bool EqualsIgnoreCase(std::string_view a, std::string_view b) noexcept {
     if (a.size() != b.size()) return false;
     for (std::size_t i = 0; i < a.size(); ++i) {
@@ -238,113 +49,6 @@ bool EqualsIgnoreCase(std::string_view a, std::string_view b) noexcept {
         }
     }
     return true;
-}
-
-Color ParseHexColor(std::string_view hex) noexcept {
-    if (hex.size() == 6) {
-        const float r = static_cast<float>((HexNibble(hex[0]) << 4) | HexNibble(hex[1])) / 255.0f;
-        const float g = static_cast<float>((HexNibble(hex[2]) << 4) | HexNibble(hex[3])) / 255.0f;
-        const float b = static_cast<float>((HexNibble(hex[4]) << 4) | HexNibble(hex[5])) / 255.0f;
-        return Color{r, g, b, 1.0f};
-    }
-    if (hex.size() == 8) {
-        const float a = static_cast<float>((HexNibble(hex[0]) << 4) | HexNibble(hex[1])) / 255.0f;
-        const float r = static_cast<float>((HexNibble(hex[2]) << 4) | HexNibble(hex[3])) / 255.0f;
-        const float g = static_cast<float>((HexNibble(hex[4]) << 4) | HexNibble(hex[5])) / 255.0f;
-        const float b = static_cast<float>((HexNibble(hex[6]) << 4) | HexNibble(hex[7])) / 255.0f;
-        return Color{r, g, b, a};
-    }
-    return Color{0.0f, 0.0f, 0.0f, 1.0f};
-}
-
-Color ParseColorLiteral(std::string_view raw) noexcept {
-    raw = Trim(raw);
-    if (!raw.empty() && raw.front() == '#') {
-        raw.remove_prefix(1);
-        if (raw.size() == 3) {
-            const float r = static_cast<float>(HexNibble(raw[0]) * 17) / 255.0f;
-            const float g = static_cast<float>(HexNibble(raw[1]) * 17) / 255.0f;
-            const float b = static_cast<float>(HexNibble(raw[2]) * 17) / 255.0f;
-            return Color{r, g, b, 1.0f};
-        }
-        return ParseHexColor(raw);
-    }
-    struct NamedColorEntry {
-        std::string_view name;
-        std::string_view hex8;
-    };
-    static constexpr NamedColorEntry kNamedColors[] = {
-        {"Transparent", "00000000"},
-        {"White", "FFFFFFFF"},
-        {"Black", "FF000000"},
-        {"Red", "FFFF0000"},
-        {"Green", "FF008000"},
-        {"Blue", "FF0000FF"},
-        {"Yellow", "FFFFFF00"},
-        {"Cyan", "FF00FFFF"},
-        {"Aqua", "FF00FFFF"},
-        {"Magenta", "FFFF00FF"},
-        {"Fuchsia", "FFFF00FF"},
-        {"Gray", "FF808080"},
-        {"Grey", "FF808080"},
-        {"LightGray", "FFD3D3D3"},
-        {"DarkGray", "FFA9A9A9"},
-        {"Silver", "FFC0C0C0"},
-        {"WhiteSmoke", "FFF5F5F5"},
-        {"LightSeaGreen", "FF20B2AA"},
-        {"MediumSeaGreen", "FF3CB371"},
-        {"SeaGreen", "FF2E8B57"},
-        {"Turquoise", "FF40E0D0"},
-        {"MediumTurquoise", "FF48D1CC"},
-        {"DarkTurquoise", "FF00CED1"},
-        {"DodgerBlue", "FF1E90FF"},
-        {"DeepSkyBlue", "FF00BFFF"},
-        {"SkyBlue", "FF87CEEB"},
-        {"LightSkyBlue", "FF87CEFA"},
-        {"CornflowerBlue", "FF6495ED"},
-        {"RoyalBlue", "FF4169E1"},
-        {"SteelBlue", "FF4682B4"},
-        {"Teal", "FF008080"},
-        {"OrangeRed", "FFFF4500"},
-        {"Orange", "FFFFA500"},
-        {"Gold", "FFFFD700"},
-        {"Crimson", "FFDC143C"},
-        {"Tomato", "FFFF6347"},
-        {"Coral", "FFFF7F50"},
-        {"Salmon", "FFFA8072"},
-        {"Lime", "FF00FF00"},
-        {"LimeGreen", "FF32CD32"},
-        {"LawnGreen", "FF7CFC00"},
-        {"GreenYellow", "FFADFF2F"},
-        {"Purple", "FF800080"},
-        {"Violet", "FFEE82EE"},
-        {"Plum", "FFDDA0DD"},
-        {"Indigo", "FF4B0082"},
-        {"SlateGray", "FF708090"},
-        {"DarkSlateGray", "FF2F4F4F"},
-        {"Brown", "FFA52A2A"},
-        {"SaddleBrown", "FF8B4513"},
-        {"Tan", "FFD2B48C"},
-        {"Wheat", "FFF5DEB3"},
-        {"Beige", "FFF5F5DC"},
-        {"Ivory", "FFFFFFF0"},
-        {"Navy", "FF000080"},
-        {"MidnightBlue", "FF191970"},
-        {"Maroon", "FF800000"},
-        {"Olive", "FF808000"},
-        {"Pink", "FFFFC0CB"},
-        {"HotPink", "FFFF69B4"},
-        {"DeepPink", "FFFF1493"},
-    };
-    for (const auto& entry : kNamedColors) {
-        if (EqualsIgnoreCase(raw, entry.name)) {
-            return ParseHexColor(entry.hex8);
-        }
-    }
-    const auto vals = ParseFloatList(raw);
-    if (vals.size() >= 4) return Color{vals[0], vals[1], vals[2], vals[3]};
-    if (vals.size() == 3) return Color{vals[0], vals[1], vals[2], 1.0f};
-    return Color{0.0f, 0.0f, 0.0f, 1.0f};
 }
 
 std::pair<GridUnitType, float> ParseGridLength(std::string_view raw) noexcept {
@@ -375,309 +79,7 @@ bool EndsWith(std::string_view s, std::string_view suffix) noexcept {
            s.compare(s.size() - suffix.size(), suffix.size(), suffix) == 0;
 }
 
-std::string DecodeXmlEntities(std::string_view raw) {
-    if (raw.find('&') == std::string_view::npos) {
-        return std::string(raw);
-    }
-    std::string out;
-    out.reserve(raw.size());
-    for (std::size_t i = 0; i < raw.size();) {
-        if (raw[i] == '&') {
-            if (raw.substr(i, 5) == "&amp;") {
-                out.push_back('&');
-                i += 5;
-                continue;
-            }
-            if (raw.substr(i, 4) == "&lt;") {
-                out.push_back('<');
-                i += 4;
-                continue;
-            }
-            if (raw.substr(i, 4) == "&gt;") {
-                out.push_back('>');
-                i += 4;
-                continue;
-            }
-            if (raw.substr(i, 6) == "&quot;") {
-                out.push_back('"');
-                i += 6;
-                continue;
-            }
-            if (raw.substr(i, 6) == "&apos;") {
-                out.push_back('\'');
-                i += 6;
-                continue;
-            }
-        }
-        out.push_back(raw[i]);
-        ++i;
-    }
-    return out;
-}
-
 } // namespace
-
-// ============================================================================
-// AxbPackage String Table & Binary Serialization (.axb4)
-// ============================================================================
-
-std::uint32_t AxbPackage::InternString(std::string_view text) {
-    if (stringTable.empty()) {
-        stringTable.emplace_back("");
-    }
-    if (text.empty()) {
-        return 0;
-    }
-    for (std::size_t i = 1; i < stringTable.size(); ++i) {
-        if (stringTable[i] == text) {
-            return static_cast<std::uint32_t>(i);
-        }
-    }
-    const auto idx = static_cast<std::uint32_t>(stringTable.size());
-    stringTable.emplace_back(text);
-    return idx;
-}
-
-std::string_view AxbPackage::GetString(std::uint32_t index) const noexcept {
-    if (index < stringTable.size()) {
-        return stringTable[index];
-    }
-    return {};
-}
-
-std::vector<std::uint8_t> AxbPackage::Serialize() const {
-    std::vector<std::uint8_t> out;
-    out.reserve(512);
-
-    WriteU32(out, kAxb4Magic);
-    WriteU32(out, kAxb4Version);
-    WriteString(out, className);
-    WriteString(out, rootTypeName);
-
-    WriteU32(out, static_cast<std::uint32_t>(stringTable.size()));
-    for (const auto& s : stringTable) {
-        WriteString(out, s);
-    }
-
-    WriteU32(out, static_cast<std::uint32_t>(namedControls.size()));
-    for (const auto& nc : namedControls) {
-        WriteString(out, nc.name);
-        WriteString(out, nc.typeName);
-        WriteU64(out, nc.typeSymbolId);
-        WriteU32(out, nc.fieldIndexInClass);
-    }
-
-    WriteU32(out, static_cast<std::uint32_t>(bindingChains.size()));
-    for (const auto& chain : bindingChains) {
-        WriteString(out, chain.rawPath);
-        WriteU16(out, chain.targetPropertyId);
-        WriteU8(out, static_cast<std::uint8_t>(chain.mode));
-        WriteU32(out, static_cast<std::uint32_t>(chain.hops.size()));
-        for (const auto& hop : chain.hops) {
-            WriteString(out, hop.memberName);
-            WriteU64(out, hop.declaringTypeId);
-            WriteU32(out, hop.fieldIndex);
-            WriteU8(out, hop.observableBitIndex);
-            WriteU64(out, hop.getterSymbolId);
-            WriteU64(out, hop.setterSymbolId);
-            std::uint8_t hopFlags = 0;
-            if (hop.isAutoProperty) hopFlags |= 0x01u;
-            if (hop.isObservable) hopFlags |= 0x02u;
-            if (hop.isReadOnly) hopFlags |= 0x04u;
-            if (hop.isSimState) hopFlags |= 0x08u;
-            if (hop.isSimCommand) hopFlags |= 0x10u;
-            WriteU8(out, hopFlags);
-        }
-    }
-
-    WriteU32(out, static_cast<std::uint32_t>(eventBindings.size()));
-    for (const auto& ev : eventBindings) {
-        WriteString(out, ev.controlName);
-        WriteString(out, ev.eventName);
-        WriteString(out, ev.handlerMethodName);
-        WriteU64(out, ev.handlerSymbolId);
-    }
-
-    WriteU32(out, static_cast<std::uint32_t>(instructions.size()));
-    for (const auto& inst : instructions) {
-        WriteU8(out, static_cast<std::uint8_t>(inst.opcode));
-        WriteU16(out, inst.propId);
-        WriteU8(out, inst.flags);
-        WriteU32(out, inst.strIdx0);
-        WriteU32(out, inst.strIdx1);
-        WriteU64(out, inst.symbolId);
-        WriteValue(out, inst.literalValue);
-    }
-
-    WriteU32(out, rootHandleFieldIndex);
-    WriteU32(out, static_cast<std::uint32_t>(resources.size()));
-    for (const auto& kv : resources) {
-        WriteString(out, kv.first);
-        WriteValue(out, kv.second);
-    }
-    WriteU32(out, static_cast<std::uint32_t>(bindingChains.size()));
-    for (const auto& chain : bindingChains) {
-        WriteValue(out, chain.fallbackValue);
-    }
-    return out;
-}
-
-bool AxbPackage::Deserialize(
-    const std::uint8_t* data,
-    std::size_t size,
-    AxbPackage& outPackage,
-    std::string* errorMessage) {
-    ByteReader r{data, size, 0};
-    std::uint32_t magic = 0;
-    std::uint32_t version = 0;
-    if (!r.ReadU32(magic) || magic != kAxb4Magic) {
-        if (errorMessage) *errorMessage = "invalid AXB4 magic header";
-        return false;
-    }
-    if (!r.ReadU32(version) || version != kAxb4Version) {
-        if (errorMessage) *errorMessage = "unsupported AXB4 version";
-        return false;
-    }
-
-    AxbPackage pkg{};
-    if (!r.ReadString(pkg.className) || !r.ReadString(pkg.rootTypeName)) {
-        if (errorMessage) *errorMessage = "corrupted AXB4 header strings";
-        return false;
-    }
-
-    std::uint32_t strCount = 0;
-    if (!r.ReadU32(strCount) || strCount > (r.size - r.offset) / 4u) return false;
-    pkg.stringTable.resize(strCount);
-    for (std::uint32_t i = 0; i < strCount; ++i) {
-        if (!r.ReadString(pkg.stringTable[i])) return false;
-    }
-
-    std::uint32_t ncCount = 0;
-    if (!r.ReadU32(ncCount) || ncCount > (r.size - r.offset) / 20u) return false;
-    pkg.namedControls.resize(ncCount);
-    for (std::uint32_t i = 0; i < ncCount; ++i) {
-        auto& nc = pkg.namedControls[i];
-        if (!r.ReadString(nc.name) ||
-            !r.ReadString(nc.typeName) ||
-            !r.ReadU64(nc.typeSymbolId) ||
-            !r.ReadU32(nc.fieldIndexInClass)) {
-            return false;
-        }
-    }
-
-    std::uint32_t chainCount = 0;
-    if (!r.ReadU32(chainCount) || chainCount > (r.size - r.offset) / 11u) return false;
-    pkg.bindingChains.resize(chainCount);
-    for (std::uint32_t i = 0; i < chainCount; ++i) {
-        auto& chain = pkg.bindingChains[i];
-        std::uint8_t modeRaw = 0;
-        std::uint32_t hopCount = 0;
-        if (!r.ReadString(chain.rawPath) ||
-            !r.ReadU16(chain.targetPropertyId) ||
-            !r.ReadU8(modeRaw) ||
-            !r.ReadU32(hopCount) ||
-            hopCount > (r.size - r.offset) / 34u) {
-            return false;
-        }
-        chain.mode = static_cast<BindingMode>(modeRaw);
-        chain.hops.resize(hopCount);
-        for (std::uint32_t h = 0; h < hopCount; ++h) {
-            auto& hop = chain.hops[h];
-            std::uint8_t hopFlags = 0;
-            if (!r.ReadString(hop.memberName) ||
-                !r.ReadU64(hop.declaringTypeId) ||
-                !r.ReadU32(hop.fieldIndex) ||
-                !r.ReadU8(hop.observableBitIndex) ||
-                !r.ReadU64(hop.getterSymbolId) ||
-                !r.ReadU64(hop.setterSymbolId) ||
-                !r.ReadU8(hopFlags)) {
-                return false;
-            }
-            hop.isAutoProperty = (hopFlags & 0x01u) != 0;
-            hop.isObservable = (hopFlags & 0x02u) != 0;
-            hop.isReadOnly = (hopFlags & 0x04u) != 0;
-            hop.isSimState = (hopFlags & 0x08u) != 0;
-            hop.isSimCommand = (hopFlags & 0x10u) != 0;
-        }
-    }
-
-    std::uint32_t evCount = 0;
-    if (!r.ReadU32(evCount) || evCount > (r.size - r.offset) / 20u) return false;
-    pkg.eventBindings.resize(evCount);
-    for (std::uint32_t i = 0; i < evCount; ++i) {
-        auto& ev = pkg.eventBindings[i];
-        if (!r.ReadString(ev.controlName) ||
-            !r.ReadString(ev.eventName) ||
-            !r.ReadString(ev.handlerMethodName) ||
-            !r.ReadU64(ev.handlerSymbolId)) {
-            return false;
-        }
-    }
-
-    std::uint32_t instCount = 0;
-    if (!r.ReadU32(instCount) || instCount > (r.size - r.offset) / 21u) return false;
-    pkg.instructions.resize(instCount);
-    for (std::uint32_t i = 0; i < instCount; ++i) {
-        auto& inst = pkg.instructions[i];
-        std::uint8_t opRaw = 0;
-        if (!r.ReadU8(opRaw) ||
-            !r.ReadU16(inst.propId) ||
-            !r.ReadU8(inst.flags) ||
-            !r.ReadU32(inst.strIdx0) ||
-            !r.ReadU32(inst.strIdx1) ||
-            !r.ReadU64(inst.symbolId) ||
-            !r.ReadValue(inst.literalValue)) {
-            return false;
-        }
-        inst.opcode = static_cast<AxbOpcode>(opRaw);
-    }
-
-    if (r.offset < r.size) {
-        if (!r.ReadU32(pkg.rootHandleFieldIndex)) {
-            if (errorMessage) *errorMessage = "truncated AXB4 rootHandleFieldIndex";
-            return false;
-        }
-    }
-    if (r.offset < r.size) {
-        std::uint32_t resCount = 0;
-        if (!r.ReadU32(resCount) || resCount > (r.size - r.offset) / 5u) {
-            if (errorMessage) *errorMessage = "corrupted AXB4 resources section";
-            return false;
-        }
-        pkg.resources.resize(resCount);
-        for (std::uint32_t i = 0; i < resCount; ++i) {
-            if (!r.ReadString(pkg.resources[i].first) ||
-                !r.ReadValue(pkg.resources[i].second)) {
-                if (errorMessage) *errorMessage = "corrupted AXB4 resource entry";
-                return false;
-            }
-        }
-    }
-    if (r.offset < r.size) {
-        std::uint32_t fbCount = 0;
-        if (!r.ReadU32(fbCount) || fbCount > pkg.bindingChains.size() ||
-            fbCount > (r.size - r.offset)) {
-            if (errorMessage) *errorMessage = "corrupted AXB4 binding fallback section";
-            return false;
-        }
-        for (std::uint32_t i = 0; i < fbCount; ++i) {
-            if (!r.ReadValue(pkg.bindingChains[i].fallbackValue)) {
-                if (errorMessage) *errorMessage = "corrupted AXB4 binding fallback value";
-                return false;
-            }
-        }
-    }
-
-    outPackage = std::move(pkg);
-    return true;
-}
-
-bool AxbPackage::Deserialize(
-    const std::vector<std::uint8_t>& bytes,
-    AxbPackage& outPackage,
-    std::string* errorMessage) {
-    return Deserialize(bytes.data(), bytes.size(), outPackage, errorMessage);
-}
 
 // ============================================================================
 // AeroCompiler Single-Pass XAML + RealScript Unified Compiler
@@ -688,118 +90,13 @@ AeroCompiler::AeroCompiler() {
 }
 
 std::uint16_t AeroCompiler::ResolvePropertyId(std::string_view propertyName) noexcept {
-    if (propertyName == "Width" || propertyName == "d:DesignWidth") return PropId_Width;
-    if (propertyName == "Height" || propertyName == "d:DesignHeight") return PropId_Height;
-    if (propertyName == "MinWidth") return PropId_MinWidth;
-    if (propertyName == "MinHeight") return PropId_MinHeight;
-    if (propertyName == "Margin") return PropId_Margin;
-    if (propertyName == "Padding") return PropId_Padding;
-    if (propertyName == "Opacity") return PropId_Opacity;
-    if (propertyName == "Visibility") return PropId_Visibility;
-    if (propertyName == "Background" || propertyName == "Fill") return PropId_Background;
-    if (propertyName == "Foreground") return PropId_Foreground;
-    if (propertyName == "BorderBrush" || propertyName == "Stroke") return PropId_BorderBrush;
-    if (propertyName == "BorderThickness" || propertyName == "StrokeThickness") return PropId_BorderThickness;
-    if (propertyName == "CornerRadius" || propertyName == "RadiusX" || propertyName == "RadiusY") return PropId_CornerRadius;
-    if (propertyName == "Title" || propertyName == "Header") return PropId_Title;
-    if (propertyName == "Tag") return PropId_Tag;
-    if (propertyName == "DataContext") return PropId_DataContext;
-    if (propertyName == "Text" || propertyName == "Content") return PropId_Text;
-    if (propertyName == "Placeholder" || propertyName == "noesis:Text.Placeholder") return PropId_Placeholder;
-    if (propertyName == "FontSize") return PropId_FontSize;
-    if (propertyName == "Orientation") return PropId_Orientation;
-    if (propertyName == "Grid.Row" || propertyName == "Row") return PropId_GridRow;
-    if (propertyName == "Grid.Column" || propertyName == "Column") return PropId_GridColumn;
-    if (propertyName == "Grid.RowSpan" || propertyName == "RowSpan") return PropId_GridRowSpan;
-    if (propertyName == "Grid.ColumnSpan" || propertyName == "ColumnSpan") return PropId_GridColumnSpan;
-    if (propertyName == "Canvas.Left" || propertyName == "Left") return PropId_CanvasLeft;
-    if (propertyName == "Canvas.Top" || propertyName == "Top") return PropId_CanvasTop;
-    if (propertyName == "ItemsSource") return PropId_ItemsSource;
-    if (propertyName == "CommandParameter") return PropId_CommandParameter;
-    if (propertyName == "Projection3D.Yaw" || propertyName == "Projection3DYaw") return PropId_Projection3DYaw;
-    if (propertyName == "Projection3D.Pitch" || propertyName == "Projection3DPitch") return PropId_Projection3DPitch;
-    if (propertyName == "Spacing") return PropId_Spacing;
-    if (propertyName == "Value") return PropId_Value;
-    if (propertyName == "Minimum" || propertyName == "MinValue") return PropId_Minimum;
-    if (propertyName == "Maximum" || propertyName == "MaxValue") return PropId_Maximum;
-    if (propertyName == "IsChecked" || propertyName == "IsSelected" || propertyName == "IsExpanded") return PropId_IsChecked;
-    if (propertyName == "SelectedItem") return PropId_SelectedItem;
-    if (propertyName == "SelectedIndex") return PropId_SelectedIndex;
-    return PropId_Tag;
+    return ResolveBuiltinPropertyId(propertyName);
 }
 
 UnifiedValue AeroCompiler::ParseLiteralPropertyValue(
     std::uint16_t propId,
     std::string_view rawValue) {
-    rawValue = Trim(rawValue);
-    switch (propId) {
-        case PropId_Width:
-        case PropId_Height:
-        case PropId_MinWidth:
-        case PropId_MinHeight:
-        case PropId_Opacity:
-        case PropId_FontSize:
-        case PropId_CanvasLeft:
-        case PropId_CanvasTop:
-        case PropId_Projection3DYaw:
-        case PropId_Projection3DPitch:
-        case PropId_Spacing:
-        case PropId_Value:
-        case PropId_Minimum:
-        case PropId_Maximum:
-            return MakeFloat(ParseFloat32(rawValue));
-
-        case PropId_IsChecked:
-            return EqualsIgnoreCase(rawValue, "true") || rawValue == "1";
-
-        case PropId_Visibility:
-            if (rawValue == "Collapsed" || rawValue == "2") return value::FromInt(2);
-            if (rawValue == "Hidden" || rawValue == "1") return value::FromInt(1);
-            return value::FromInt(0);
-
-        case PropId_Orientation:
-            if (rawValue == "Horizontal" || rawValue == "1") return value::FromInt(1);
-            return value::FromInt(0);
-
-        case PropId_GridRow:
-        case PropId_GridColumn:
-        case PropId_GridRowSpan:
-        case PropId_GridColumnSpan:
-        case PropId_SelectedIndex: {
-            std::int64_t iv = 0;
-            (void)std::from_chars(rawValue.data(), rawValue.data() + rawValue.size(), iv);
-            return value::FromInt(iv);
-        }
-
-        case PropId_Margin:
-        case PropId_Padding:
-        case PropId_BorderThickness: {
-            const auto nums = ParseFloatList(rawValue);
-            if (nums.size() == 1) return value::FromThickness(Thickness(nums[0]));
-            if (nums.size() == 2) return value::FromThickness(Thickness(nums[0], nums[1]));
-            if (nums.size() >= 4) {
-                return value::FromThickness(Thickness(nums[0], nums[1], nums[2], nums[3]));
-            }
-            return value::FromThickness(Thickness{});
-        }
-
-        case PropId_CornerRadius: {
-            const auto nums = ParseFloatList(rawValue);
-            if (nums.size() == 1) return value::FromCornerRadius(CornerRadius(nums[0]));
-            if (nums.size() >= 4) {
-                return value::FromCornerRadius(CornerRadius(nums[0], nums[1], nums[2], nums[3]));
-            }
-            return value::FromCornerRadius(CornerRadius{});
-        }
-
-        case PropId_Background:
-        case PropId_Foreground:
-        case PropId_BorderBrush:
-            return value::FromColor(ParseColorLiteral(rawValue));
-
-        default:
-            return value::FromString(DecodeXmlEntities(rawValue));
-    }
+    return ParseBuiltinLiteralPropertyValue(propId, rawValue);
 }
 
 bool AeroCompiler::BindPackageAgainstProgram(
@@ -807,133 +104,7 @@ bool AeroCompiler::BindPackageAgainstProgram(
     const ProgramImage& program,
     std::string_view rootDataTypeName,
     const ExecutionDomainContext* domains) {
-    ExecutionDomainContext localDomains;
-    if (!domains) {
-        localDomains.registerProgramObservableMetadata(program);
-        domains = &localDomains;
-    }
-
-    const std::string effectiveClassName = !rootDataTypeName.empty()
-        ? std::string(rootDataTypeName)
-        : package.className;
-
-    SymbolId classTypeId = 0;
-    if (!effectiveClassName.empty()) {
-        std::string canonical = effectiveClassName;
-        if (canonical.find("::") == std::string::npos) {
-            if (const auto lastDot = canonical.rfind('.'); lastDot != std::string::npos) {
-                canonical = canonical.substr(0, lastDot) + "::" + canonical.substr(lastDot + 1);
-            }
-        }
-        classTypeId = rs_sem::stableTypeId(canonical);
-        if (!program.resolveType(classTypeId)) {
-            for (const auto& mod : program.modules()) {
-                for (const auto& t : mod.types) {
-                    if (t.name == effectiveClassName ||
-                        (mod.name + "." + t.name) == effectiveClassName ||
-                        (mod.name + "::" + t.name) == effectiveClassName) {
-                        classTypeId = t.id;
-                        break;
-                    }
-                }
-            }
-        }
-    }
-
-    const rs_sem::TypeSymbol* rootTypeSym =
-        (classTypeId != 0) ? program.resolveType(classTypeId) : nullptr;
-
-    // 1. Bind __nativeRootHandle and x:Name control field indices on the partial class
-    if (rootTypeSym) {
-        for (std::size_t fIdx = 0; fIdx < rootTypeSym->fields.size(); ++fIdx) {
-            if (rootTypeSym->fields[fIdx].name == "__nativeRootHandle") {
-                package.rootHandleFieldIndex = static_cast<std::uint32_t>(fIdx);
-                break;
-            }
-        }
-        for (auto& nc : package.namedControls) {
-            for (std::size_t fIdx = 0; fIdx < rootTypeSym->fields.size(); ++fIdx) {
-                if (rootTypeSym->fields[fIdx].name == nc.name) {
-                    nc.fieldIndexInClass = static_cast<std::uint32_t>(fIdx);
-                    break;
-                }
-            }
-        }
-    }
-
-    // 2. Bind event handler method SymbolIds on the partial class (including Command -> Start/OnStart fallback)
-    if (rootTypeSym) {
-        for (auto& ev : package.eventBindings) {
-            for (const auto& m : rootTypeSym->methods) {
-                if (m.name == ev.handlerMethodName) {
-                    ev.handlerSymbolId = m.id;
-                    break;
-                }
-            }
-            if (ev.handlerSymbolId == 0 && ev.handlerMethodName.size() > 7 &&
-                ev.handlerMethodName.compare(ev.handlerMethodName.size() - 7, 7, "Command") == 0) {
-                const std::string baseCmd = ev.handlerMethodName.substr(0, ev.handlerMethodName.size() - 7);
-                const std::string onBaseCmd = "On" + baseCmd;
-                for (const auto& m : rootTypeSym->methods) {
-                    if (m.name == baseCmd || m.name == onBaseCmd) {
-                        ev.handlerSymbolId = m.id;
-                        break;
-                    }
-                }
-            }
-        }
-        for (auto& inst : package.instructions) {
-            if (inst.opcode == AxbOpcode::BindEvent && inst.strIdx0 < package.eventBindings.size()) {
-                inst.symbolId = package.eventBindings[inst.strIdx0].handlerSymbolId;
-            }
-        }
-    }
-
-    // 3. Bind multi-hop PropertySlotHandles in bindingChains
-    for (auto& chain : package.bindingChains) {
-        SymbolId currentHopOwnerId = classTypeId;
-        for (auto& hop : chain.hops) {
-            if (currentHopOwnerId == 0) {
-                break;
-            }
-            if (auto slotOpt = domains->resolvePropertySlot(
-                    program, currentHopOwnerId, hop.memberName)) {
-                hop.declaringTypeId = slotOpt->typeId;
-                hop.fieldIndex = slotOpt->backingFieldIndex;
-                hop.observableBitIndex = slotOpt->observableBitIndex;
-                hop.getterSymbolId = slotOpt->getterSymbolId;
-                hop.setterSymbolId = slotOpt->setterSymbolId;
-                hop.isAutoProperty = slotOpt->isAutoProperty;
-                hop.isObservable = slotOpt->isObservable;
-                hop.isReadOnly = slotOpt->isReadOnly;
-                hop.isSimState = slotOpt->isSimState;
-                hop.isSimCommand = slotOpt->isSimCommand;
-            }
-
-            // Advance currentHopOwnerId to the hop's member type if it is an Object
-            const auto* ownerSym = program.resolveType(currentHopOwnerId);
-            SymbolId nextTypeId = 0;
-            if (ownerSym) {
-                for (const auto& p : ownerSym->properties) {
-                    if (p.name == hop.memberName && !p.typeName.empty()) {
-                        nextTypeId = rs_sem::stableTypeId(p.typeName);
-                        break;
-                    }
-                }
-                if (nextTypeId == 0) {
-                    for (const auto& f : ownerSym->fields) {
-                        if (f.name == hop.memberName && !f.typeName.empty()) {
-                            nextTypeId = rs_sem::stableTypeId(f.typeName);
-                            break;
-                        }
-                    }
-                }
-            }
-            currentHopOwnerId = nextTypeId;
-        }
-    }
-
-    return true;
+    return package.BindAgainstProgram(program, rootDataTypeName, domains);
 }
 
 AeroCompileResult AeroCompiler::Compile(const AeroCompileInput& input) const {
@@ -945,6 +116,20 @@ AeroCompileResult AeroCompiler::Compile(const AeroCompileInput& input) const {
     const std::string_view src = input.xamlContent;
     std::size_t pos = 0;
     bool seenRoot = false;
+    std::unordered_set<std::uint64_t> bakedPathHashes;
+
+    auto ensurePathBakedIntoPackage = [&](std::string_view svgPathData) {
+        svgPathData = Trim(svgPathData);
+        if (svgPathData.empty()) {
+            return;
+        }
+        const std::uint64_t h = ComputeSvgPathHash(svgPathData);
+        if (h == 0 || !bakedPathHashes.insert(h).second) {
+            return;
+        }
+        const auto slotIdx = static_cast<std::uint16_t>(pkg.mtsdfPaths.size());
+        pkg.mtsdfPaths.push_back(BakeSvgPathToMtsdfEntry(svgPathData, 32u, 4.0f, slotIdx, 256u));
+    };
 
     enum class XmlScopeKind : std::uint8_t {
         VisualElement = 0,
@@ -1042,18 +227,18 @@ AeroCompileResult AeroCompiler::Compile(const AeroCompileInput& input) const {
                 if (top.kind == XmlScopeKind::KeyedResourceItem ||
                     top.kind == XmlScopeKind::RunInline) {
                     if (!top.accumulatedText.empty()) top.accumulatedText.push_back(' ');
-                    top.accumulatedText += DecodeXmlEntities(rawInner);
+                    top.accumulatedText += DecodeXamlXmlEntities(rawInner);
                 } else if (top.kind == XmlScopeKind::TransparentContainer &&
                            top.targetPropId != 0 && nonVisualDepth == 0) {
                     if (!top.accumulatedText.empty()) top.accumulatedText.push_back(' ');
-                    top.accumulatedText += DecodeXmlEntities(rawInner);
+                    top.accumulatedText += DecodeXamlXmlEntities(rawInner);
                 } else if (top.kind == XmlScopeKind::VisualElement && nonVisualDepth == 0) {
                     const std::string_view st = StripXmlPrefix(top.tagName);
                     if (st == "TextBlock" || st == "Label" || st == "Button" ||
                         st == "RepeatButton" || st == "ToggleButton" ||
                         st == "CheckBox" || st == "RadioButton" || st == "Hyperlink") {
                         if (!top.accumulatedText.empty()) top.accumulatedText.push_back(' ');
-                        top.accumulatedText += DecodeXmlEntities(rawInner);
+                        top.accumulatedText += DecodeXamlXmlEntities(rawInner);
                     }
                 }
             }
@@ -1096,7 +281,13 @@ AeroCompileResult AeroCompiler::Compile(const AeroCompileInput& input) const {
                     if (st == "Color" && !closed.accumulatedText.empty()) {
                         pkg.resources.emplace_back(
                             closed.resourceKey,
-                            value::FromColor(ParseColorLiteral(closed.accumulatedText)));
+                            value::FromColor(ParseXamlColorLiteral(closed.accumulatedText)));
+                    } else if ((st == "Geometry" || st == "StreamGeometry" || st == "PathGeometry") &&
+                               !closed.accumulatedText.empty()) {
+                        ensurePathBakedIntoPackage(closed.accumulatedText);
+                        pkg.resources.emplace_back(
+                            closed.resourceKey,
+                            value::FromString(closed.accumulatedText));
                     } else if (st == "String" || (!closed.brushAssigned && !closed.accumulatedText.empty())) {
                         pkg.resources.emplace_back(
                             closed.resourceKey,
@@ -1104,6 +295,9 @@ AeroCompileResult AeroCompiler::Compile(const AeroCompileInput& input) const {
                     }
                 } else if (closed.kind == XmlScopeKind::TransparentContainer &&
                            closed.targetPropId != 0 && !closed.accumulatedText.empty()) {
+                    if (closed.targetPropId == PropId_PathData) {
+                        ensurePathBakedIntoPackage(closed.accumulatedText);
+                    }
                     AxbInstruction propTextInst{};
                     propTextInst.opcode = AxbOpcode::SetStaticProperty;
                     propTextInst.propId = closed.targetPropId;
@@ -1222,7 +416,7 @@ AeroCompileResult AeroCompiler::Compile(const AeroCompileInput& input) const {
             }
         }
 
-        // If currently inside a non-visual scope, handle resource extraction or brush property assignment
+        // Inside non-visual scope: handle resource extraction or brush property assignment
         if (nonVisualDepth > 0) {
             XmlScopeEntry& parentScope = scopeStack.back();
             if (parentScope.kind == XmlScopeKind::ResourceContainer) {
@@ -1232,9 +426,29 @@ AeroCompileResult AeroCompiler::Compile(const AeroCompileInput& input) const {
                             if (a.name == "Color" && (a.value.empty() || a.value.front() != '{')) {
                                 pkg.resources.emplace_back(
                                     std::string(xKey),
-                                    value::FromColor(ParseColorLiteral(a.value)));
+                                    value::FromColor(ParseXamlColorLiteral(a.value)));
                                 break;
                             }
+                        }
+                    } else if ((shortTag == "Geometry" || shortTag == "StreamGeometry" || shortTag == "PathGeometry")) {
+                        bool handledAttr = false;
+                        for (const auto& a : attrs) {
+                            if (a.name == "Figures" || a.name == "Data") {
+                                const std::string decoded = DecodeXamlXmlEntities(a.value);
+                                ensurePathBakedIntoPackage(decoded);
+                                pkg.resources.emplace_back(std::string(xKey), value::FromString(decoded));
+                                handledAttr = true;
+                                break;
+                            }
+                        }
+                        if (!selfClosing && !handledAttr) {
+                            XmlScopeEntry itemScope{};
+                            itemScope.kind = XmlScopeKind::KeyedResourceItem;
+                            itemScope.tagName = std::string(tagName);
+                            itemScope.resourceKey = std::string(xKey);
+                            scopeStack.push_back(std::move(itemScope));
+                            ++nonVisualDepth;
+                            continue;
                         }
                     } else if (!selfClosing &&
                                (shortTag == "LinearGradientBrush" || shortTag == "RadialGradientBrush" ||
@@ -1265,7 +479,7 @@ AeroCompileResult AeroCompiler::Compile(const AeroCompileInput& input) const {
                     if (a.name == "Color" && (a.value.empty() || a.value.front() != '{')) {
                         pkg.resources.emplace_back(
                             parentScope.resourceKey,
-                            value::FromColor(ParseColorLiteral(a.value)));
+                            value::FromColor(ParseXamlColorLiteral(a.value)));
                         parentScope.brushAssigned = true;
                         break;
                     }
@@ -1278,7 +492,7 @@ AeroCompileResult AeroCompiler::Compile(const AeroCompileInput& input) const {
                         AxbInstruction setInst{};
                         setInst.opcode = AxbOpcode::SetStaticProperty;
                         setInst.propId = parentScope.targetPropId;
-                        setInst.literalValue = value::FromColor(ParseColorLiteral(a.value));
+                        setInst.literalValue = value::FromColor(ParseXamlColorLiteral(a.value));
                         pkg.instructions.push_back(std::move(setInst));
                         parentScope.brushAssigned = true;
                         break;
@@ -1299,7 +513,7 @@ AeroCompileResult AeroCompiler::Compile(const AeroCompileInput& input) const {
             continue;
         }
 
-        // Top-level ResourceDictionary root file (e.g. Resources.xaml, Language-en.xaml)
+        // Top-level ResourceDictionary root file
         if (!seenRoot && shortTag == "ResourceDictionary") {
             seenRoot = true;
             pkg.rootTypeName = "ResourceDictionary";
@@ -1322,10 +536,11 @@ AeroCompileResult AeroCompiler::Compile(const AeroCompileInput& input) const {
             continue;
         }
 
-        // Property-element tags (<Type.Property>) or non-visual elements
+        // Property-element tags (<Type.Property>)
         if (shortTag == "Grid.RowDefinitions" || shortTag == "Grid.ColumnDefinitions" ||
             EndsWith(shortTag, ".Header") ||
-            EndsWith(shortTag, ".Content")) {
+            EndsWith(shortTag, ".Content") ||
+            EndsWith(shortTag, ".Data")) {
             if (!selfClosing) {
                 XmlScopeEntry trans{};
                 trans.kind = XmlScopeKind::TransparentContainer;
@@ -1334,6 +549,8 @@ AeroCompileResult AeroCompiler::Compile(const AeroCompileInput& input) const {
                     trans.targetPropId = PropId_Title;
                 } else if (EndsWith(shortTag, ".Content")) {
                     trans.targetPropId = PropId_Text;
+                } else if (EndsWith(shortTag, ".Data")) {
+                    trans.targetPropId = PropId_PathData;
                 } else {
                     trans.targetPropId = 0;
                 }
@@ -1373,7 +590,7 @@ AeroCompileResult AeroCompiler::Compile(const AeroCompileInput& input) const {
             std::string runText;
             for (const auto& a : attrs) {
                 if (a.name == "Text") {
-                    runText = DecodeXmlEntities(a.value);
+                    runText = DecodeXamlXmlEntities(a.value);
                     break;
                 }
             }
@@ -1565,6 +782,11 @@ AeroCompileResult AeroCompiler::Compile(const AeroCompileInput& input) const {
                         resInst.strIdx0 = pkg.InternString(keyPart);
                         if (const UnifiedValue* resVal = findLocalOrGlobalResource(keyPart)) {
                             resInst.literalValue = *resVal;
+                            if (propId == PropId_PathData) {
+                                if (const auto* sv = std::get_if<StringValue>(resVal)) {
+                                    ensurePathBakedIntoPackage(sv->view());
+                                }
+                            }
                         } else if (inner.rfind("noesis:Loc ", 0) == 0 &&
                                    (propId == PropId_Text || propId == PropId_Title ||
                                     propId == PropId_Content || propId == PropId_Placeholder)) {
@@ -1575,7 +797,6 @@ AeroCompileResult AeroCompiler::Compile(const AeroCompileInput& input) const {
                     continue;
                 }
 
-                // Skip non-DataContext markup extensions ({TemplateBinding}, {x:Type}, {x:Static}, {x:Null}, {RelativeSource})
                 if (inner.rfind("TemplateBinding", 0) == 0 ||
                     inner.rfind("x:Type", 0) == 0 ||
                     inner.rfind("x:Static", 0) == 0 ||
@@ -1669,10 +890,17 @@ AeroCompileResult AeroCompiler::Compile(const AeroCompileInput& input) const {
                 continue;
             }
 
+            const UnifiedValue litVal = ParseLiteralPropertyValue(propId, trimmedVal);
+            if (propId == PropId_PathData) {
+                if (const auto* sv = std::get_if<StringValue>(&litVal)) {
+                    ensurePathBakedIntoPackage(sv->view());
+                }
+            }
+
             AxbInstruction setInst{};
             setInst.opcode = AxbOpcode::SetStaticProperty;
             setInst.propId = propId;
-            setInst.literalValue = ParseLiteralPropertyValue(propId, trimmedVal);
+            setInst.literalValue = litVal;
             pkg.instructions.push_back(std::move(setInst));
         }
 
@@ -1891,7 +1119,7 @@ AeroViewAotCppOutput AeroCompiler::GenerateAotCppFromPackage(
     hdr += "} // namespace " + out.cppNamespace + "\n";
     out.header = std::move(hdr);
 
-    // 2. Emit C++17 Source (.cpp) - unrolled batch creation, static properties & pre-resolved bindings
+    // 2. Emit C++17 Source (.cpp) - unrolled batch creation, static properties, MTSDF registration & pre-resolved bindings
     std::string src;
     src += "// Auto-generated by aero-compiler --aot-cpp (Zero-XML C++17 Visual Tree & Binding Builder)\n";
     src += "#include \"aero/controls/Controls.hpp\"\n";
@@ -1908,6 +1136,42 @@ AeroViewAotCppOutput AeroCompiler::GenerateAotCppFromPackage(
     src += "        return false;\n";
     src += "    }\n";
     src += "    aero::EnsureControlTypesRegistered();\n";
+
+    // Emit pre-baked MTSDF vector path entries so pure C++17 AOT views have 0 runtime SVG parsing
+    for (std::size_t mpIdx = 0; mpIdx < package.mtsdfPaths.size(); ++mpIdx) {
+        const auto& mp = package.mtsdfPaths[mpIdx];
+        if (mp.pathHash == 0 || mp.mtsdfRgbaPixels.empty()) {
+            continue;
+        }
+        src += "    if (!aero::AxbTemplateRegistry::Instance().FindMtsdfPath(" +
+               std::to_string(mp.pathHash) + "ULL)) {\n";
+        const std::string arrName = "kMtsdfPixels_" + std::to_string(mpIdx);
+        src += "        static constexpr std::uint8_t " + arrName + "[] = {";
+        for (std::size_t b = 0; b < mp.mtsdfRgbaPixels.size(); ++b) {
+            if (b > 0) src += ",";
+            src += std::to_string(static_cast<unsigned>(mp.mtsdfRgbaPixels[b])) + "u";
+        }
+        src += "};\n";
+        src += "        aero::AxbMtsdfPathEntry entry{};\n";
+        src += "        entry.pathHash = " + std::to_string(mp.pathHash) + "ULL;\n";
+        src += "        entry.boundsX = " + FormatFloatLiteral(mp.boundsX) + ";\n";
+        src += "        entry.boundsY = " + FormatFloatLiteral(mp.boundsY) + ";\n";
+        src += "        entry.boundsW = " + FormatFloatLiteral(mp.boundsW) + ";\n";
+        src += "        entry.boundsH = " + FormatFloatLiteral(mp.boundsH) + ";\n";
+        src += "        entry.u0 = " + FormatFloatLiteral(mp.u0) + ";\n";
+        src += "        entry.v0 = " + FormatFloatLiteral(mp.v0) + ";\n";
+        src += "        entry.u1 = " + FormatFloatLiteral(mp.u1) + ";\n";
+        src += "        entry.v1 = " + FormatFloatLiteral(mp.v1) + ";\n";
+        src += "        entry.atlasWidth = " + std::to_string(mp.atlasWidth) + "u;\n";
+        src += "        entry.atlasHeight = " + std::to_string(mp.atlasHeight) + "u;\n";
+        src += "        entry.cellWidth = " + std::to_string(mp.cellWidth) + "u;\n";
+        src += "        entry.cellHeight = " + std::to_string(mp.cellHeight) + "u;\n";
+        src += "        entry.pxRange = " + FormatFloatLiteral(mp.pxRange) + ";\n";
+        src += "        entry.mtsdfRgbaPixels.assign(" + arrName + ", " + arrName + " + sizeof(" + arrName + "));\n";
+        src += "        aero::AxbTemplateRegistry::Instance().RegisterMtsdfPath(std::move(entry));\n";
+        src += "    }\n";
+    }
+
     src += "    aero::NativeHandleRegistry* registry = domains ? &domains->nativeHandles() : nullptr;\n";
     src += "    aero::ManagedHeap* uiHeap = domains ? &domains->uiHeap() : nullptr;\n";
     src += "    const aero::ObjectRef effectiveContext = dataContext.valid() ? dataContext : rootControl->BoundScriptWrapper();\n";
