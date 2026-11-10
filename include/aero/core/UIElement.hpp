@@ -181,6 +181,7 @@ public:
     // Layout geometry & Measure/Arrange lifecycle
     void Measure(Size availableSize) noexcept;
     void Arrange(Rect finalRect) noexcept;
+    [[nodiscard]] UIElement* HitTest(Point point) noexcept;
     virtual Size MeasureCore(Size availableSize) noexcept;
     virtual void ArrangeCore(Rect finalRect) noexcept;
     virtual void OnPropertyChanged(std::uint16_t propId, const UnifiedValue& newValue);
@@ -194,7 +195,7 @@ public:
     void SetWidth(float v) noexcept {
         if (fastProps_.width != v) {
             fastProps_.width = v;
-            fastProps_.layoutDirtyFlags |= (MeasureDirty | ArrangeDirty);
+            InvalidateLayout();
         }
     }
 
@@ -202,7 +203,7 @@ public:
     void SetHeight(float v) noexcept {
         if (fastProps_.height != v) {
             fastProps_.height = v;
-            fastProps_.layoutDirtyFlags |= (MeasureDirty | ArrangeDirty);
+            InvalidateLayout();
         }
     }
 
@@ -210,7 +211,7 @@ public:
     void SetMinWidth(float v) noexcept {
         if (fastProps_.minWidth != v) {
             fastProps_.minWidth = v;
-            fastProps_.layoutDirtyFlags |= (MeasureDirty | ArrangeDirty);
+            InvalidateLayout();
         }
     }
 
@@ -218,7 +219,7 @@ public:
     void SetMinHeight(float v) noexcept {
         if (fastProps_.minHeight != v) {
             fastProps_.minHeight = v;
-            fastProps_.layoutDirtyFlags |= (MeasureDirty | ArrangeDirty);
+            InvalidateLayout();
         }
     }
 
@@ -235,7 +236,7 @@ public:
             fastProps_.marginT = m.top;
             fastProps_.marginR = m.right;
             fastProps_.marginB = m.bottom;
-            fastProps_.layoutDirtyFlags |= (MeasureDirty | ArrangeDirty);
+            InvalidateLayout();
         }
     }
 
@@ -252,7 +253,7 @@ public:
             fastProps_.paddingT = p.top;
             fastProps_.paddingR = p.right;
             fastProps_.paddingB = p.bottom;
-            fastProps_.layoutDirtyFlags |= (MeasureDirty | ArrangeDirty);
+            InvalidateLayout();
         }
     }
 
@@ -271,14 +272,28 @@ public:
         const auto raw = static_cast<std::uint8_t>(v);
         if (fastProps_.visibility != raw) {
             fastProps_.visibility = raw;
-            fastProps_.layoutDirtyFlags |= LayoutAllDirty;
+            fastProps_.layoutDirtyFlags |= RenderDirty;
+            InvalidateLayout();
         }
+    }
+
+    void InvalidateMeasure() noexcept {
+        fastProps_.layoutDirtyFlags |= MeasureDirty;
+        PropagateSubtreeDirty(SubtreeMeasureDirty);
+    }
+    void InvalidateArrange() noexcept {
+        fastProps_.layoutDirtyFlags |= ArrangeDirty;
+        PropagateSubtreeDirty(SubtreeArrangeDirty);
+    }
+    void InvalidateLayout() noexcept {
+        fastProps_.layoutDirtyFlags |= (MeasureDirty | ArrangeDirty);
+        PropagateSubtreeDirty(SubtreeLayoutDirty);
     }
 
     [[nodiscard]] std::uint8_t GetLayoutDirtyFlags() const noexcept {
         return fastProps_.layoutDirtyFlags;
     }
-    void ClearLayoutDirtyFlags(std::uint8_t mask = LayoutAllDirty) noexcept {
+    void ClearLayoutDirtyFlags(std::uint8_t mask = static_cast<std::uint8_t>(LayoutAllDirty | SubtreeLayoutDirty)) noexcept {
         fastProps_.layoutDirtyFlags &= static_cast<std::uint8_t>(~mask);
     }
 
@@ -311,6 +326,14 @@ private:
     void UpdateWrapperPinState(
         NativeHandleRegistry* registry,
         ManagedHeap* uiHeap) noexcept;
+    void PropagateSubtreeDirty(std::uint8_t subtreeMask) noexcept {
+        for (UIElement* cur = parent_; cur != nullptr; cur = cur->parent_) {
+            if ((cur->fastProps_.layoutDirtyFlags & subtreeMask) == subtreeMask) {
+                break;
+            }
+            cur->fastProps_.layoutDirtyFlags |= subtreeMask;
+        }
+    }
     void UpdateSubtreeDepth(std::uint16_t newDepth) noexcept;
 
     mutable std::atomic<std::uint32_t> refCount_{0};
@@ -329,7 +352,8 @@ private:
     bool inMeasureQueue_ = false;
     bool inArrangeQueue_ = false;
 
-    // Layout computed geometry
+    // Layout computed geometry & cached Measure constraint
+    Size lastMeasureConstraint_{-1.0f, -1.0f};
     Size desiredSize_{0.0f, 0.0f};
     Rect finalRect_{0.0f, 0.0f, 0.0f, 0.0f};
     std::string name_;
@@ -369,7 +393,8 @@ public:
         ExecutionDomainContext* domains = nullptr,
         DualTrackBindingEngine* bindingEngine = nullptr,
         ObjectRef dataContext = {},
-        const Interpreter* eventInterpreter = nullptr);
+        const Interpreter* eventInterpreter = nullptr,
+        rs_aot::ExecutionContext* eventAotContext = nullptr);
     ~Window() override = default;
 
     static const TypeClass* StaticTypeClass() noexcept;
@@ -389,7 +414,8 @@ public:
         ExecutionDomainContext* domains = nullptr,
         DualTrackBindingEngine* bindingEngine = nullptr,
         ObjectRef dataContext = {},
-        const Interpreter* eventInterpreter = nullptr);
+        const Interpreter* eventInterpreter = nullptr,
+        rs_aot::ExecutionContext* eventAotContext = nullptr);
 
 private:
     std::string windowClassName_;
@@ -419,6 +445,16 @@ public:
         ObjectRef targetObject,
         SymbolId methodSymbolId) noexcept {
         scriptInterpreter_ = interpreter;
+        scriptAotContext_ = nullptr;
+        scriptTargetObject_ = targetObject;
+        scriptClickMethodId_ = methodSymbolId;
+    }
+    void BindAotClickHandler(
+        rs_aot::ExecutionContext* aotContext,
+        ObjectRef targetObject,
+        SymbolId methodSymbolId) noexcept {
+        scriptAotContext_ = aotContext;
+        scriptInterpreter_ = nullptr;
         scriptTargetObject_ = targetObject;
         scriptClickMethodId_ = methodSymbolId;
     }
@@ -429,6 +465,7 @@ public:
 private:
     ClickCallback clickCallback_;
     const Interpreter* scriptInterpreter_ = nullptr;
+    rs_aot::ExecutionContext* scriptAotContext_ = nullptr;
     ObjectRef scriptTargetObject_{};
     SymbolId scriptClickMethodId_ = 0;
 };

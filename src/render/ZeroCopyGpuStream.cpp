@@ -20,12 +20,14 @@ out vec2 v_UvOrLocalPos;
 out vec4 v_Color;
 flat out uint v_PrimType;
 flat out uint v_Flags;
+flat out vec2 v_QuadHalfSize;
 
 void main() {
     vec2 ndc = (a_Position / max(u_ViewportSize, vec2(1.0))) * 2.0 - 1.0;
     ndc.y = -ndc.y;
     gl_Position = vec4(ndc, 0.0, 1.0);
     v_UvOrLocalPos = a_TexCoord;
+    v_QuadHalfSize = abs(a_TexCoord);
     v_Color = vec4(
         float((a_PackedRgba >>  0u) & 0xFFu) / 255.0,
         float((a_PackedRgba >>  8u) & 0xFFu) / 255.0,
@@ -43,6 +45,7 @@ in vec2 v_UvOrLocalPos;
 in vec4 v_Color;
 flat in uint v_PrimType;
 flat in uint v_Flags;
+flat in vec2 v_QuadHalfSize;
 
 uniform sampler2D u_GlyphAndUiAtlas;
 uniform vec2 u_QuadHalfExtent;
@@ -65,7 +68,7 @@ void main() {
     if (v_PrimType == 1u) {
         float cornerRadius    = float(v_Flags & 0xFFu) * 0.5;
         float borderThickness = float((v_Flags >> 8u) & 0xFFu) * 0.5;
-        vec2 halfSize = max(abs(u_QuadHalfExtent), abs(v_UvOrLocalPos));
+        vec2 halfSize = max(abs(u_QuadHalfExtent), v_QuadHalfSize);
         float dist = sdRoundedBox(v_UvOrLocalPos, halfSize, cornerRadius);
         float aa = max(fwidth(dist), 0.75);
         float outerCoverage = smoothstep(aa, -aa, dist);
@@ -110,12 +113,14 @@ out vec2 v_UvOrLocalPos;
 out vec4 v_Color;
 flat out uint v_PrimType;
 flat out uint v_Flags;
+flat out vec2 v_QuadHalfSize;
 
 void main() {
     vec2 ndc = (a_Position / max(u_ViewportSize, vec2(1.0))) * 2.0 - 1.0;
     ndc.y = -ndc.y;
     gl_Position = vec4(ndc, 0.0, 1.0);
     v_UvOrLocalPos = a_TexCoord;
+    v_QuadHalfSize = abs(a_TexCoord);
     v_Color = vec4(
         float((a_PackedRgba >>  0u) & 0xFFu) / 255.0,
         float((a_PackedRgba >>  8u) & 0xFFu) / 255.0,
@@ -137,6 +142,7 @@ in vec2 v_UvOrLocalPos;
 in vec4 v_Color;
 flat in uint v_PrimType;
 flat in uint v_Flags;
+flat in vec2 v_QuadHalfSize;
 
 uniform sampler2D u_GlyphAndUiAtlas;
 uniform vec2 u_QuadHalfExtent;
@@ -157,7 +163,7 @@ void main() {
     if (v_PrimType == 1u) {
         float cornerRadius    = float(v_Flags & 0xFFu) * 0.5;
         float borderThickness = float((v_Flags >> 8u) & 0xFFu) * 0.5;
-        vec2 halfSize = max(abs(u_QuadHalfExtent), abs(v_UvOrLocalPos));
+        vec2 halfSize = max(abs(u_QuadHalfExtent), v_QuadHalfSize);
         float dist = sdRoundedBox(v_UvOrLocalPos, halfSize, cornerRadius);
         float aa = max(fwidth(dist), 0.75);
         float outerCoverage = smoothstep(aa, -aa, dist);
@@ -206,6 +212,7 @@ struct VertexOut {
     @location(1) color : vec4<f32>,
     @location(2) @interpolate(flat) primType : u32,
     @location(3) @interpolate(flat) flags : u32,
+    @location(4) @interpolate(flat) quadHalfSize : vec2<f32>,
 };
 
 fn sdRoundedBox(p : vec2<f32>, b : vec2<f32>, r : f32) -> f32 {
@@ -221,6 +228,7 @@ fn vs_main(in : VertexIn) -> VertexOut {
     ndc.y = -ndc.y;
     out.clipPos = vec4<f32>(ndc, 0.0, 1.0);
     out.uvOrLocal = in.uvOrLocal;
+    out.quadHalfSize = abs(in.uvOrLocal);
     out.color = vec4<f32>(
         f32((in.packedRgba >>  0u) & 0xFFu) / 255.0,
         f32((in.packedRgba >>  8u) & 0xFFu) / 255.0,
@@ -240,7 +248,7 @@ fn fs_main(in : VertexOut) -> @location(0) vec4<f32> {
     if (in.primType == 1u) {
         let radius = f32(in.flags & 0xFFu) * 0.5;
         let borderThickness = f32((in.flags >> 8u) & 0xFFu) * 0.5;
-        let halfSize = max(abs(u_Globals.quadHalfExtent), abs(in.uvOrLocal));
+        let halfSize = max(abs(u_Globals.quadHalfExtent), in.quadHalfSize);
         let dist = sdRoundedBox(in.uvOrLocal, halfSize, radius);
         let aa = max(fwidth(dist), 0.75);
         var cov = smoothstep(aa, -aa, dist);

@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <functional>
+#include <mutex>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -75,14 +76,25 @@ public:
     void AddRowDefinition(GridUnitType unit, float value = 1.0f);
     void AddColumnDefinition(GridUnitType unit, float value = 1.0f);
     void ClearDefinitions() noexcept {
-        rows_.clear();
-        cols_.clear();
+        if (!rows_.empty() || !cols_.empty()) {
+            rows_.clear();
+            cols_.clear();
+            InvalidateLayout();
+        }
     }
+    [[nodiscard]] std::size_t RowDefinitionCount() const noexcept { return rows_.size(); }
+    [[nodiscard]] std::size_t ColumnDefinitionCount() const noexcept { return cols_.size(); }
+    [[nodiscard]] const std::vector<RowDefinition>& Rows() const noexcept { return rows_; }
+    [[nodiscard]] const std::vector<ColumnDefinition>& Columns() const noexcept { return cols_; }
 
     static void SetRow(UIElement* element, std::int32_t row);
     [[nodiscard]] static std::int32_t GetRow(const UIElement* element) noexcept;
     static void SetColumn(UIElement* element, std::int32_t col);
     [[nodiscard]] static std::int32_t GetColumn(const UIElement* element) noexcept;
+    static void SetRowSpan(UIElement* element, std::int32_t span);
+    [[nodiscard]] static std::int32_t GetRowSpan(const UIElement* element) noexcept;
+    static void SetColumnSpan(UIElement* element, std::int32_t span);
+    [[nodiscard]] static std::int32_t GetColumnSpan(const UIElement* element) noexcept;
 
     Size MeasureCore(Size availableSize) noexcept override;
     void ArrangeCore(Rect finalRect) noexcept override;
@@ -194,11 +206,20 @@ public:
     static AxbTemplateRegistry& Instance() noexcept;
 
     void Register(std::string className, AxbPackage package);
+    void RegisterResources(const AxbPackage& package);
+    void RegisterResource(std::string key, UnifiedValue value);
+    [[nodiscard]] const UnifiedValue* FindResource(std::string_view key) const noexcept;
     [[nodiscard]] const AxbPackage* Find(std::string_view className) const noexcept;
-    void Clear() noexcept { templates_.clear(); }
+    void Clear() noexcept {
+        std::lock_guard<std::mutex> lock(mutex_);
+        templates_.clear();
+        resources_.clear();
+    }
 
 private:
+    mutable std::mutex mutex_;
     std::unordered_map<std::string, AxbPackage> templates_;
+    std::unordered_map<std::string, UnifiedValue> resources_;
 };
 
 class UserControl : public Panel {
@@ -209,7 +230,8 @@ public:
         ExecutionDomainContext* domains = nullptr,
         DualTrackBindingEngine* bindingEngine = nullptr,
         ObjectRef dataContext = {},
-        const Interpreter* eventInterpreter = nullptr);
+        const Interpreter* eventInterpreter = nullptr,
+        rs_aot::ExecutionContext* eventAotContext = nullptr);
     ~UserControl() override = default;
 
     static const TypeClass* StaticTypeClass() noexcept;
@@ -230,7 +252,8 @@ public:
         ExecutionDomainContext* domains = nullptr,
         DualTrackBindingEngine* bindingEngine = nullptr,
         ObjectRef dataContext = {},
-        const Interpreter* eventInterpreter = nullptr);
+        const Interpreter* eventInterpreter = nullptr,
+        rs_aot::ExecutionContext* eventAotContext = nullptr);
 
 private:
     std::string controlClassName_;
@@ -246,7 +269,8 @@ bool MountAxbTemplate(
     ExecutionDomainContext* domains = nullptr,
     DualTrackBindingEngine* bindingEngine = nullptr,
     ObjectRef dataContext = {},
-    const Interpreter* eventInterpreter = nullptr);
+    const Interpreter* eventInterpreter = nullptr,
+    rs_aot::ExecutionContext* eventAotContext = nullptr);
 
 void EnsureControlTypesRegistered() noexcept;
 

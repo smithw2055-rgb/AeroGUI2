@@ -415,7 +415,18 @@ bool PagedRenderTree::InvalidateNodePage(std::uint32_t nodeId) noexcept {
         return false;
     }
     RenderNodeDescriptor& node = nodes_[nodeId];
-    WriteQuadVertices(node);
+    if (node.primType != AeroPrimType::SdfTextGlyph) {
+        WriteQuadVertices(node);
+    } else if (node.pageIndex < pages_.size()) {
+        CommandPage& page = pages_[node.pageIndex];
+        const std::uint32_t firstQuad = static_cast<std::uint32_t>(node.vertexOffsetInPage / 4u);
+        const std::uint32_t quadCount = std::max<std::uint32_t>(1u, static_cast<std::uint32_t>(node.vertexCount / 4u));
+        for (std::uint32_t i = 0; i < quadCount; ++i) {
+            if (firstQuad + i < 64u) {
+                page.header.dirtyQuadMask |= (1ULL << (firstQuad + i));
+            }
+        }
+    }
     MarkPageDirty(node.pageIndex, node.vertexOffsetInPage);
     return true;
 }
@@ -426,12 +437,40 @@ bool PagedRenderTree::UpdateDirtyElement(const UIElement* element) noexcept {
     }
     for (auto& node : nodes_) {
         if (node.sourceElement == element) {
+            const Visibility vis = element->GetVisibility();
             const Rect r = element->FinalRect();
             node.x = r.x;
             node.y = r.y;
-            node.width = (r.width > 0.0f) ? r.width : element->GetWidth();
-            node.height = (r.height > 0.0f) ? r.height : element->GetHeight();
-            node.opacity = element->GetOpacity();
+            if (vis == Visibility::Collapsed) {
+                node.width = 0.0f;
+                node.height = 0.0f;
+                node.opacity = 0.0f;
+            } else {
+                node.width = (r.width > 0.0f) ? r.width : std::max(0.0f, element->GetWidth());
+                node.height = (r.height > 0.0f) ? r.height : std::max(0.0f, element->GetHeight());
+                node.opacity = (vis == Visibility::Visible) ? element->GetOpacity() : 0.0f;
+            }
+            if (auto bg = value::TryGetColor(element->GetValue(PropId_Background))) {
+                node.baseRgba = PackColorRgba8(*bg, 1.0f);
+            } else if (auto fg = value::TryGetColor(element->GetValue(PropId_Foreground))) {
+                node.baseRgba = PackColorRgba8(*fg, 1.0f);
+            } else {
+                node.baseRgba = PackColorRgba8(Color{0.18f, 0.22f, 0.28f, 1.0f}, 1.0f);
+            }
+            if (auto cr = value::TryGetCornerRadius(element->GetValue(PropId_CornerRadius))) {
+                node.cornerRadius = cr->topLeft;
+            } else {
+                node.cornerRadius = 0.0f;
+            }
+            if (auto bt = value::TryGetThickness(element->GetValue(PropId_BorderThickness))) {
+                node.borderThickness = bt->left;
+            } else {
+                node.borderThickness = 0.0f;
+            }
+            node.encodedSdfParams = PackSdfRoundedRectParams(node.cornerRadius, node.borderThickness);
+            node.primType = (node.cornerRadius > 0.0f || node.borderThickness > 0.0f)
+                ? AeroPrimType::SdfRoundedRect
+                : AeroPrimType::SolidQuad;
             WriteQuadVertices(node);
             MarkPageDirty(node.pageIndex, node.vertexOffsetInPage);
             return true;
@@ -517,20 +556,28 @@ std::size_t PagedRenderTree::BatchUpdateFromEcsTrackB(
     std::size_t totalUpdated = 0;
     std::uint32_t cursorNodeId = firstNodeId;
     for (const auto& channel : bindingEngine.EcsChannels()) {
-        if (!channel.rawView.basePtr || channel.elementStride == 0) {
-            continue;
-        }
-        const std::size_t count = !channel.targetElements.empty()
+        const NativeRawColumnView* view = bindingEngine.ResolveChannelView(channel);
+        const std::size_t reservedSpan = !channel.targetElements.empty()
             ? channel.targetElements.size()
-            : channel.rawView.count;
-        totalUpdated += BatchUpdateWidthsFromRawColumn(
-            cursorNodeId,
-            count,
-            channel.rawView.basePtr,
-            channel.elementStride,
-            channel.fieldByteOffset,
-            channel.scaleFactor);
-        cursorNodeId += static_cast<std::uint32_t>(count);
+            : (view ? view->count : 0u);
+        if (view && view->basePtr) {
+            const std::size_t stride = (channel.elementStride != 0)
+                ? channel.elementStride
+                : view->strideBytes;
+            if (stride != 0) {
+                const std::size_t count = !channel.targetElements.empty()
+                    ? std::min(channel.targetElements.size(), view->count)
+                    : view->count;
+                totalUpdated += BatchUpdateWidthsFromRawColumn(
+                    cursorNodeId,
+                    count,
+                    view->basePtr,
+                    stride,
+                    channel.fieldByteOffset,
+                    channel.scaleFactor);
+            }
+        }
+        cursorNodeId += static_cast<std::uint32_t>(reservedSpan);
     }
     return totalUpdated;
 }
@@ -550,8 +597,8 @@ void PagedRenderTree::TraverseAndEmitElement(const UIElement* elem) {
     }
 
     const Rect r = elem->FinalRect();
-    const float w = (r.width > 0.0f) ? r.width : elem->GetWidth();
-    const float h = (r.height > 0.0f) ? r.height : elem->GetHeight();
+    const float w = (r.width > 0.0f) ? r.width : std::max(0.0f, elem->GetWidth());
+    const float h = (r.height > 0.0f) ? r.height : std::max(0.0f, elem->GetHeight());
 
     Color color{0.18f, 0.22f, 0.28f, 1.0f};
     if (auto bg = value::TryGetColor(elem->GetValue(PropId_Background))) {
@@ -579,7 +626,9 @@ void PagedRenderTree::TraverseAndEmitElement(const UIElement* elem) {
         cornerRadius,
         borderThickness,
         elem);
-    nodes_[nodeId].opacity = elem->GetOpacity();
+    nodes_[nodeId].opacity = (elem->GetVisibility() == Visibility::Visible)
+        ? elem->GetOpacity()
+        : 0.0f;
     WriteQuadVertices(nodes_[nodeId]);
 
     for (const UIElement* child = elem->FirstChild(); child != nullptr; child = child->NextSibling()) {

@@ -3,6 +3,8 @@
 #include <algorithm>
 #include <cmath>
 
+#include "realscript/aot_cpp/AotRuntime.h"
+
 namespace aero {
 
 namespace {
@@ -178,7 +180,7 @@ bool UIElement::AddChild(
     lastChild_ = child;
 
     child->UpdateSubtreeDepth(static_cast<std::uint16_t>(treeDepth_ + 1u));
-    fastProps_.layoutDirtyFlags |= (MeasureDirty | ArrangeDirty);
+    InvalidateLayout();
     child->PropagateRootConnection(
         isConnectedToRoot_,
         registry ? registry : boundRegistry_,
@@ -208,7 +210,7 @@ bool UIElement::RemoveChild(
     child->prevSibling_ = nullptr;
     child->nextSibling_ = nullptr;
     child->UpdateSubtreeDepth(0);
-    fastProps_.layoutDirtyFlags |= (MeasureDirty | ArrangeDirty);
+    InvalidateLayout();
 
     child->PropagateRootConnection(
         false,
@@ -284,6 +286,47 @@ void UIElement::SyncVisualTreeGcRoots(
     }
 }
 
+namespace {
+
+[[nodiscard]] constexpr bool IsLayoutAffectingSparseProperty(std::uint16_t propId) noexcept {
+    switch (propId) {
+        case PropId_BorderThickness:
+        case PropId_FontSize:
+        case PropId_Title:
+        case PropId_Text:
+        case PropId_Content:
+        case PropId_Placeholder:
+        case PropId_ItemsSource:
+        case PropId_GridRow:
+        case PropId_GridColumn:
+        case PropId_GridRowSpan:
+        case PropId_GridColumnSpan:
+        case PropId_CanvasLeft:
+        case PropId_CanvasTop:
+        case PropId_Orientation:
+        case PropId_Spacing:
+            return true;
+        default:
+            return false;
+    }
+}
+
+[[nodiscard]] constexpr bool IsParentLayoutAttachedProperty(std::uint16_t propId) noexcept {
+    switch (propId) {
+        case PropId_GridRow:
+        case PropId_GridColumn:
+        case PropId_GridRowSpan:
+        case PropId_GridColumnSpan:
+        case PropId_CanvasLeft:
+        case PropId_CanvasTop:
+            return true;
+        default:
+            return false;
+    }
+}
+
+} // namespace
+
 UIElement* UIElement::FindName(std::string_view targetName) noexcept {
     if (!targetName.empty() && name_ == targetName) {
         return this;
@@ -296,10 +339,60 @@ UIElement* UIElement::FindName(std::string_view targetName) noexcept {
     return nullptr;
 }
 
+UIElement* UIElement::HitTest(Point point) noexcept {
+    if (GetVisibility() != Visibility::Visible || GetOpacity() <= 0.0f) {
+        return nullptr;
+    }
+
+    // Apply 2D/3D inverse projection transform around element center first so child subtree
+    // hit-testing operates in this container's unprojected local coordinate space.
+    Point localPt = point;
+    const Rect r = finalRect_;
+    const float cx = r.x + r.width * 0.5f;
+    const float cy = r.y + r.height * 0.5f;
+    float yawDeg = 0.0f;
+    float pitchDeg = 0.0f;
+    if (auto yv = value::TryGetFloat(GetValue(PropId_Projection3DYaw))) {
+        yawDeg = *yv;
+    }
+    if (auto pv = value::TryGetFloat(GetValue(PropId_Projection3DPitch))) {
+        pitchDeg = *pv;
+    }
+    if (yawDeg != 0.0f || pitchDeg != 0.0f) {
+        constexpr float kDegToRad = 3.14159265358979323846f / 180.0f;
+        const float cosYaw = std::cos(yawDeg * kDegToRad);
+        const float cosPitch = std::cos(pitchDeg * kDegToRad);
+        const float safeCosYaw = (std::abs(cosYaw) > 0.05f) ? cosYaw : (cosYaw >= 0.0f ? 0.05f : -0.05f);
+        const float safeCosPitch = (std::abs(cosPitch) > 0.05f) ? cosPitch : (cosPitch >= 0.0f ? 0.05f : -0.05f);
+        localPt.x = cx + (point.x - cx) / safeCosYaw;
+        localPt.y = cy + (point.y - cy) / safeCosPitch;
+    }
+
+    // Traverse children in reverse Z-order (lastChild_ -> firstChild_)
+    for (UIElement* child = lastChild_; child != nullptr; child = child->prevSibling_) {
+        if (UIElement* hit = child->HitTest(localPt)) {
+            return hit;
+        }
+    }
+
+    if (r.width > 0.0f && r.height > 0.0f &&
+        localPt.x >= r.x && localPt.x <= r.x + r.width &&
+        localPt.y >= r.y && localPt.y <= r.y + r.height) {
+        return this;
+    }
+    return nullptr;
+}
+
 void UIElement::Measure(Size availableSize) noexcept {
     if (GetVisibility() == Visibility::Collapsed) {
         desiredSize_ = {0.0f, 0.0f};
-        ClearLayoutDirtyFlags(MeasureDirty);
+        lastMeasureConstraint_ = availableSize;
+        ClearLayoutDirtyFlags(MeasureDirty | SubtreeMeasureDirty);
+        return;
+    }
+
+    if ((fastProps_.layoutDirtyFlags & (MeasureDirty | SubtreeMeasureDirty)) == 0u &&
+        lastMeasureConstraint_ == availableSize) {
         return;
     }
 
@@ -332,13 +425,14 @@ void UIElement::Measure(Size availableSize) noexcept {
     desiredSize_ = {
         coreSize.width + marginW,
         coreSize.height + marginH};
-    ClearLayoutDirtyFlags(MeasureDirty);
+    lastMeasureConstraint_ = availableSize;
+    ClearLayoutDirtyFlags(MeasureDirty | SubtreeMeasureDirty);
 }
 
 void UIElement::Arrange(Rect finalRect) noexcept {
     if (GetVisibility() == Visibility::Collapsed) {
         finalRect_ = {finalRect.x, finalRect.y, 0.0f, 0.0f};
-        ClearLayoutDirtyFlags(ArrangeDirty);
+        ClearLayoutDirtyFlags(ArrangeDirty | SubtreeArrangeDirty);
         return;
     }
 
@@ -358,7 +452,7 @@ void UIElement::Arrange(Rect finalRect) noexcept {
 
     finalRect_ = innerRect;
     ArrangeCore(innerRect);
-    ClearLayoutDirtyFlags(ArrangeDirty);
+    ClearLayoutDirtyFlags(ArrangeDirty | SubtreeArrangeDirty);
 }
 
 Size UIElement::MeasureCore(Size availableSize) noexcept {
@@ -507,6 +601,12 @@ bool UIElement::SetValue(
         it->sourceRank = rawRank;
         it->effectiveValue = value;
         fastProps_.layoutDirtyFlags |= RenderDirty;
+        if (IsLayoutAffectingSparseProperty(propId)) {
+            InvalidateLayout();
+            if (IsParentLayoutAttachedProperty(propId) && parent_) {
+                parent_->InvalidateLayout();
+            }
+        }
         OnPropertyChanged(propId, value);
         return true;
     }
@@ -520,6 +620,12 @@ bool UIElement::SetValue(
     entry.effectiveValue = value;
     sparseProps_.insert(it, std::move(entry));
     fastProps_.layoutDirtyFlags |= RenderDirty;
+    if (IsLayoutAffectingSparseProperty(propId)) {
+        InvalidateLayout();
+        if (IsParentLayoutAttachedProperty(propId) && parent_) {
+            parent_->InvalidateLayout();
+        }
+    }
     OnPropertyChanged(propId, value);
     return true;
 }
@@ -528,27 +634,35 @@ bool UIElement::ClearValue(std::uint16_t propId, ValueSourceRank rank) {
     switch (propId) {
     case PropId_Width:
         SetWidth(-1.0f);
+        OnPropertyChanged(propId, std::monostate{});
         return true;
     case PropId_Height:
         SetHeight(-1.0f);
+        OnPropertyChanged(propId, std::monostate{});
         return true;
     case PropId_MinWidth:
         SetMinWidth(0.0f);
+        OnPropertyChanged(propId, std::monostate{});
         return true;
     case PropId_MinHeight:
         SetMinHeight(0.0f);
+        OnPropertyChanged(propId, std::monostate{});
         return true;
     case PropId_Margin:
         SetMargin({});
+        OnPropertyChanged(propId, std::monostate{});
         return true;
     case PropId_Padding:
         SetPadding({});
+        OnPropertyChanged(propId, std::monostate{});
         return true;
     case PropId_Opacity:
         SetOpacity(1.0f);
+        OnPropertyChanged(propId, std::monostate{});
         return true;
     case PropId_Visibility:
         SetVisibility(Visibility::Visible);
+        OnPropertyChanged(propId, std::monostate{});
         return true;
     default:
         break;
@@ -569,6 +683,12 @@ bool UIElement::ClearValue(std::uint16_t propId, ValueSourceRank rank) {
     }
     sparseProps_.erase(it);
     fastProps_.layoutDirtyFlags |= RenderDirty;
+    if (IsLayoutAffectingSparseProperty(propId)) {
+        InvalidateLayout();
+        if (IsParentLayoutAttachedProperty(propId) && parent_) {
+            parent_->InvalidateLayout();
+        }
+    }
     OnPropertyChanged(propId, std::monostate{});
     return true;
 }
@@ -633,15 +753,64 @@ bool Button::PerformClick(RuntimeError* error) {
     if (clickCallback_) {
         clickCallback_(*this);
     }
-    if (scriptInterpreter_ && scriptTargetObject_.valid() && scriptClickMethodId_ != 0) {
-        const auto res = scriptInterpreter_->invoke(
-            scriptClickMethodId_,
-            {scriptTargetObject_});
-        if (!res.succeeded) {
-            if (error) {
-                *error = res.error;
+    if (scriptTargetObject_.valid() && scriptClickMethodId_ != 0) {
+        std::vector<UnifiedValue> args;
+        args.push_back(scriptTargetObject_);
+        const UnifiedValue cmdParam = GetValue(PropId_CommandParameter);
+        if (!std::holds_alternative<std::monostate>(cmdParam)) {
+            args.push_back(cmdParam);
+        }
+        if (scriptInterpreter_) {
+            auto res = scriptInterpreter_->invoke(scriptClickMethodId_, args);
+            // Only retry for arity mismatch if 0 bytecode instructions ran (entry signature check),
+            // never re-entering a handler that already started executing and failed internally.
+            if (!res.succeeded &&
+                res.error.code == ErrorCode::InvalidArguments &&
+                res.statistics.instructionsExecuted == 0u) {
+                if (args.size() == 1u) {
+                    args.push_back(value::FromInt(0));
+                    res = scriptInterpreter_->invoke(scriptClickMethodId_, args);
+                } else if (args.size() > 1u) {
+                    args.resize(1u);
+                    res = scriptInterpreter_->invoke(scriptClickMethodId_, args);
+                }
             }
-            return false;
+            if (!res.succeeded) {
+                if (error) {
+                    *error = res.error;
+                }
+                return false;
+            }
+        } else if (scriptAotContext_) {
+            const auto& prog = scriptAotContext_->program();
+            for (std::uint32_t i = 0; i < prog.functionCount; ++i) {
+                const auto& fn = prog.functions[i];
+                if (fn.symbolId == scriptClickMethodId_) {
+                    if (args.size() < fn.parameterCount && fn.parameterTypes && fn.parameterTypeIds) {
+                        while (args.size() < fn.parameterCount) {
+                            const std::size_t pIdx = args.size();
+                            args.push_back(scriptAotContext_->defaultValue(
+                                fn.parameterTypes[pIdx],
+                                fn.parameterTypeIds[pIdx]));
+                        }
+                    } else if (args.size() > fn.parameterCount && fn.parameterCount >= 1u) {
+                        args.resize(fn.parameterCount);
+                    }
+                    break;
+                }
+            }
+            UnifiedValue outVal{};
+            const bool ok = scriptAotContext_->invoke(
+                scriptClickMethodId_,
+                args.data(),
+                args.size(),
+                outVal);
+            if (!ok) {
+                if (error) {
+                    *error = scriptAotContext_->error();
+                }
+                return false;
+            }
         }
     }
     return true;

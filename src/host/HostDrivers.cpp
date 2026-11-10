@@ -123,7 +123,14 @@ void EmbeddedGameHost::TickUi(float dt, std::uint32_t activePhaseMask) {
 
     if ((activePhaseMask & UiPhase_Layout) != 0u) {
         telemetry_.layoutPassesRun += 1u;
+        if (rootVisual_ && viewportSize_ != lastLaidOutViewport_) {
+            rootVisual_->InvalidateLayout();
+            lastLaidOutViewport_ = viewportSize_;
+        }
         if (layoutQueue_) {
+            if (rootVisual_) {
+                layoutQueue_->EnqueueDirtySubtree(rootVisual_);
+            }
             (void)layoutQueue_->FlushLayout(viewportSize_);
         } else if (rootVisual_) {
             rootVisual_->Measure(viewportSize_);
@@ -193,7 +200,14 @@ void DesktopEventHost::TickUi(float dt, std::uint32_t activePhaseMask) {
 
     if ((activePhaseMask & UiPhase_Layout) != 0u && hasDirtyLayout_) {
         telemetry_.layoutPassesRun += 1u;
+        if (rootVisual_ && viewportSize_ != lastLaidOutViewport_) {
+            rootVisual_->InvalidateLayout();
+            lastLaidOutViewport_ = viewportSize_;
+        }
         if (layoutQueue_) {
+            if (rootVisual_) {
+                layoutQueue_->EnqueueDirtySubtree(rootVisual_);
+            }
             (void)layoutQueue_->FlushLayout(viewportSize_);
         } else if (rootVisual_) {
             rootVisual_->Measure(viewportSize_);
@@ -222,6 +236,12 @@ ZeroCopySubmissionStats DesktopEventHost::RecordGpuCommands(
 // ============================================================================
 
 void WebImeAdapter::FocusTextInput(UIElement* focusedElement, Rect caretScreenRect) {
+    if (focusedElement_ != focusedElement) {
+        isComposing_ = false;
+        preeditText_.clear();
+        committedText_.clear();
+        caretOffset_ = 0;
+    }
     focusedElement_ = focusedElement;
     baseCaretRect_ = caretScreenRect;
     overlayDomRect_ = caretScreenRect;
@@ -437,7 +457,14 @@ void WebCanvasHost::TickUi(float dt, std::uint32_t activePhaseMask) {
     }
     if ((activePhaseMask & UiPhase_Layout) != 0u) {
         telemetry_.layoutPassesRun += 1u;
+        if (rootVisual_ && viewportSize_ != lastLaidOutViewport_) {
+            rootVisual_->InvalidateLayout();
+            lastLaidOutViewport_ = viewportSize_;
+        }
         if (layoutQueue_) {
+            if (rootVisual_) {
+                layoutQueue_->EnqueueDirtySubtree(rootVisual_);
+            }
             changes += layoutQueue_->FlushLayout(viewportSize_);
         } else if (rootVisual_) {
             rootVisual_->Measure(viewportSize_);

@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 #include "aero/core/DependencyProperty.hpp"
@@ -28,6 +29,9 @@ enum class AxbOpcode : std::uint8_t {
     BindProperty = 4,
     BindEcsColumn = 5,
     BindEvent = 6,
+    AddRowDefinition = 7,
+    AddColumnDefinition = 8,
+    SetResourceProperty = 9,
 };
 
 struct AxbCompiledHop {
@@ -63,6 +67,7 @@ struct AxbCompiledBindingChain {
     std::string rawPath;
     std::uint16_t targetPropertyId = 0;
     BindingMode mode = BindingMode::OneWay;
+    UnifiedValue fallbackValue{};
     std::vector<AxbCompiledHop> hops;
 };
 
@@ -93,11 +98,13 @@ struct AxbInstruction {
 struct AxbPackage {
     std::string className;
     std::string rootTypeName;
+    std::uint32_t rootHandleFieldIndex = PropertySlotHandle::InvalidIndex;
     std::vector<std::string> stringTable;
     std::vector<AxbNamedControlSlot> namedControls;
     std::vector<AxbCompiledBindingChain> bindingChains;
     std::vector<AxbEventBindingRecord> eventBindings;
     std::vector<AxbInstruction> instructions;
+    std::vector<std::pair<std::string, UnifiedValue>> resources;
 
     std::uint32_t InternString(std::string_view text);
     [[nodiscard]] std::string_view GetString(std::uint32_t index) const noexcept;

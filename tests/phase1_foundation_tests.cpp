@@ -41,7 +41,15 @@ struct AllocationTrackingScope {
 
 } // namespace
 
-void* operator new(std::size_t size) {
+#if defined(__GNUC__) || defined(__clang__)
+#define AERO_TEST_NOINLINE __attribute__((noinline))
+#elif defined(_MSC_VER)
+#define AERO_TEST_NOINLINE __declspec(noinline)
+#else
+#define AERO_TEST_NOINLINE
+#endif
+
+AERO_TEST_NOINLINE void* operator new(std::size_t size) {
     if (gTrackAllocations.load(std::memory_order_relaxed)) {
         gAllocationCount.fetch_add(1, std::memory_order_relaxed);
     }
@@ -51,11 +59,29 @@ void* operator new(std::size_t size) {
     throw std::bad_alloc();
 }
 
-void operator delete(void* ptr) noexcept {
+AERO_TEST_NOINLINE void* operator new[](std::size_t size) {
+    if (gTrackAllocations.load(std::memory_order_relaxed)) {
+        gAllocationCount.fetch_add(1, std::memory_order_relaxed);
+    }
+    if (void* ptr = std::malloc(size == 0 ? 1 : size)) {
+        return ptr;
+    }
+    throw std::bad_alloc();
+}
+
+AERO_TEST_NOINLINE void operator delete(void* ptr) noexcept {
     std::free(ptr);
 }
 
-void operator delete(void* ptr, std::size_t) noexcept {
+AERO_TEST_NOINLINE void operator delete(void* ptr, std::size_t) noexcept {
+    std::free(ptr);
+}
+
+AERO_TEST_NOINLINE void operator delete[](void* ptr) noexcept {
+    std::free(ptr);
+}
+
+AERO_TEST_NOINLINE void operator delete[](void* ptr, std::size_t) noexcept {
     std::free(ptr);
 }
 

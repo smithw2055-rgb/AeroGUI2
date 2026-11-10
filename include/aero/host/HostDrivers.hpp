@@ -67,7 +67,10 @@ public:
         return "EmbeddedGameHost";
     }
 
-    void SetRootVisual(UIElement* root) noexcept { rootVisual_ = root; }
+    void SetRootVisual(UIElement* root) noexcept {
+        rootVisual_ = root;
+        lastLaidOutViewport_ = {-1.0f, -1.0f};
+    }
     void SetBindingEngine(DualTrackBindingEngine* engine) noexcept { bindingEngine_ = engine; }
     void SetLayoutQueue(DepthBucketLayoutQueue* queue) noexcept { layoutQueue_ = queue; }
     void SetRenderTree(PagedRenderTree* tree) noexcept { renderTree_ = tree; }
@@ -88,6 +91,7 @@ private:
     DepthBucketLayoutQueue* layoutQueue_ = nullptr;
     PagedRenderTree* renderTree_ = nullptr;
     Size viewportSize_{1920.0f, 1080.0f};
+    Size lastLaidOutViewport_{-1.0f, -1.0f};
     HostFrameTelemetry telemetry_{};
 };
 
@@ -115,6 +119,7 @@ public:
     void NotifyDirtyObjects() noexcept { hasDirtyObjects_ = true; }
     void NotifyDirtyLayout() noexcept { hasDirtyLayout_ = true; }
     void SetActiveAnimations(bool active) noexcept { hasActiveAnimations_ = active; }
+    void SetViewportSize(Size viewport) noexcept { viewportSize_ = viewport; }
 
     // True when !hasActiveAnimations && !hasDirtyObjects && !hasDirtyLayout && !hasPendingInputEvents
     [[nodiscard]] bool CanSleepIdle() const noexcept override;
@@ -139,6 +144,7 @@ private:
     DualTrackBindingEngine* bindingEngine_ = nullptr;
     DepthBucketLayoutQueue* layoutQueue_ = nullptr;
     Size viewportSize_{1920.0f, 1080.0f};
+    Size lastLaidOutViewport_{-1.0f, -1.0f};
     bool hasActiveAnimations_ = false;
     bool hasDirtyObjects_ = false;
     bool hasDirtyLayout_ = false;
@@ -282,6 +288,7 @@ public:
     [[nodiscard]] ShaderBackend WebShaderBackend() const noexcept { return webBackend_; }
 
     void RequestWakeFrame() noexcept { rafState_ = WebRafState::ActiveTicking; }
+    void SetViewportSize(Size viewport) noexcept { viewportSize_ = viewport; }
     void SuspendIfClean(bool hasDirtyState) noexcept {
         rafState_ = hasDirtyState ? WebRafState::ActiveTicking : WebRafState::SuspendedIdle;
     }
@@ -313,6 +320,7 @@ private:
     WebImeAdapter imeAdapter_{};
     WebFontStreamProvider fontStream_{};
     Size viewportSize_{1280.0f, 720.0f};
+    Size lastLaidOutViewport_{-1.0f, -1.0f};
     HostFrameTelemetry telemetry_{};
 };
 

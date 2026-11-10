@@ -28,6 +28,9 @@ enum LayoutDirtyFlags : std::uint8_t {
     ArrangeDirty = 1u << 1u,
     RenderDirty = 1u << 2u,
     LayoutAllDirty = MeasureDirty | ArrangeDirty | RenderDirty,
+    SubtreeMeasureDirty = 1u << 3u,
+    SubtreeArrangeDirty = 1u << 4u,
+    SubtreeLayoutDirty = SubtreeMeasureDirty | SubtreeArrangeDirty,
 };
 
 // Built-in property IDs: 0..7 map directly to FastInlineStorage with 0 heap allocations.
@@ -64,6 +67,13 @@ enum BuiltinPropertyId : std::uint16_t {
     PropId_BorderThickness = 28,
     PropId_Spacing = 29,
     PropId_BorderBrush = 30,
+    PropId_Value = 31,
+    PropId_Minimum = 32,
+    PropId_Maximum = 33,
+    PropId_IsChecked = 34,
+    PropId_SelectedItem = 35,
+    PropId_Placeholder = 36,
+    PropId_SelectedIndex = 37,
 };
 
 // 8 high-frequency layout & rendering properties stored inline inside UIElement (36 bytes)
@@ -82,7 +92,7 @@ struct FastInlineStorage {
     float paddingB = 0.0f;
     float opacity = 1.0f;
     std::uint8_t visibility = static_cast<std::uint8_t>(Visibility::Visible);
-    std::uint8_t layoutDirtyFlags = LayoutDirtyFlags::LayoutAllDirty;
+    std::uint8_t layoutDirtyFlags = static_cast<std::uint8_t>(LayoutDirtyFlags::LayoutAllDirty | LayoutDirtyFlags::SubtreeLayoutDirty);
     std::uint16_t reserved = 0;
 };
 

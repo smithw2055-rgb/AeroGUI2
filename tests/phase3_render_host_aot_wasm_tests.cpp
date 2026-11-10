@@ -49,7 +49,15 @@ struct AllocationTrackingScope {
 
 } // namespace
 
-void* operator new(std::size_t size) {
+#if defined(__GNUC__) || defined(__clang__)
+#define AERO_TEST_NOINLINE __attribute__((noinline))
+#elif defined(_MSC_VER)
+#define AERO_TEST_NOINLINE __declspec(noinline)
+#else
+#define AERO_TEST_NOINLINE
+#endif
+
+AERO_TEST_NOINLINE void* operator new(std::size_t size) {
     if (gTrackAllocations.load(std::memory_order_relaxed)) {
         gAllocationCount.fetch_add(1, std::memory_order_relaxed);
     }
@@ -59,11 +67,29 @@ void* operator new(std::size_t size) {
     throw std::bad_alloc();
 }
 
-void operator delete(void* ptr) noexcept {
+AERO_TEST_NOINLINE void* operator new[](std::size_t size) {
+    if (gTrackAllocations.load(std::memory_order_relaxed)) {
+        gAllocationCount.fetch_add(1, std::memory_order_relaxed);
+    }
+    if (void* ptr = std::malloc(size == 0 ? 1 : size)) {
+        return ptr;
+    }
+    throw std::bad_alloc();
+}
+
+AERO_TEST_NOINLINE void operator delete(void* ptr) noexcept {
     std::free(ptr);
 }
 
-void operator delete(void* ptr, std::size_t) noexcept {
+AERO_TEST_NOINLINE void operator delete(void* ptr, std::size_t) noexcept {
+    std::free(ptr);
+}
+
+AERO_TEST_NOINLINE void operator delete[](void* ptr) noexcept {
+    std::free(ptr);
+}
+
+AERO_TEST_NOINLINE void operator delete[](void* ptr, std::size_t) noexcept {
     std::free(ptr);
 }
 
@@ -228,6 +254,12 @@ void TestSdfRoundedRectQuadAndUberShaders() {
     AERO_CHECK(webglStats.mechanism == RingUploadMechanism::WebGL2BufferSubData, "WebGL2 uses glBufferSubData ring");
     AERO_CHECK(webglStats.grayscaleSdfTextActive, "WebGL2 enables grayscale SDF AA text");
     AERO_CHECK(webglStream.LastBufferSubDataSpans().size() == 1u, "WebGL2 recorded 1 glBufferSubData span");
+
+    AERO_CHECK(gl33Vs.find("flat out vec2 v_QuadHalfSize") != std::string_view::npos &&
+               gl33Ps.find("max(abs(u_QuadHalfExtent), v_QuadHalfSize)") != std::string_view::npos &&
+               webgl2Ps.find("max(abs(u_QuadHalfExtent), v_QuadHalfSize)") != std::string_view::npos &&
+               wgslSrc.find("in.quadHalfSize") != std::string_view::npos,
+               "UberShaders pass flat v_QuadHalfSize / quadHalfSize from VS to FS for multi-size single-draw-call SDF batches");
 
     std::cout << "[PASS] TestSdfRoundedRectQuadAndUberShaders\n";
 }
@@ -420,6 +452,26 @@ void TestTriHostDriversEmbeddedDesktopAndWebCanvas() {
     AERO_CHECK(webGpuStats.mechanism == RingUploadMechanism::WebGL2BufferSubData,
                "WebCanvasHost streams dirty pages via WebGL2 glBufferSubData");
     AERO_CHECK(webGpuStats.grayscaleSdfTextActive, "WebCanvasHost routes grayscale SDF AA text");
+
+    // Verify WebImeAdapter::FocusTextInput clears stale committed/preedit text when switching focus to a different control
+    auto secondInput = MakeIntrusive<TextBlock>();
+    ime.FocusTextInput(secondInput.Get(), Rect{20.0f, 40.0f, 120.0f, 24.0f});
+    ime.OnCompositionStart();
+    AERO_CHECK(std::fabs(ime.OverlayDomInputRect().x - 20.0f) < 0.01f,
+               "WebImeAdapter::FocusTextInput resets stale committedText offset when switching focused element");
+    ime.BlurTextInput();
+
+    // Verify InvalidateNodePage on SdfTextGlyph node preserves multi-digit glyph UVs
+    const std::uint32_t hudDigitsNode = renderTree.AllocateHudDigitsNode(
+        10.0f, 20.0f, 8.0f, 16.0f, 8u, Color{1.0f, 1.0f, 1.0f, 1.0f});
+    AERO_CHECK(renderTree.UpdateHudDigitsText(hudDigitsNode, "42"), "Updated HUD digits node with 42");
+    const auto* dNode = renderTree.GetNode(hudDigitsNode);
+    const float uBefore = renderTree.GetPage(dNode->pageIndex).vertices[dNode->vertexOffsetInPage].u;
+    renderTree.ClearDirtyPages();
+    AERO_CHECK(renderTree.InvalidateNodePage(hudDigitsNode), "Invalidated HUD digits node page");
+    const float uAfter = renderTree.GetPage(dNode->pageIndex).vertices[dNode->vertexOffsetInPage].u;
+    AERO_CHECK(std::fabs(uBefore - uAfter) < 1e-6f && uAfter > 0.0f,
+               "InvalidateNodePage preserved SdfTextGlyph multi-digit UV coordinates");
 
     std::cout << "[PASS] TestTriHostDriversEmbeddedDesktopAndWebCanvas\n";
 }
@@ -737,6 +789,9 @@ public partial class SquadTacticalHud
                    "Merged partial class TypeDescriptor contains both FieldA and FieldB");
         AERO_CHECK(mergedOut.source.find("true, true, true") != std::string::npos,
                    "Merged partial class TypeDescriptor preserved observable=true, simState=true, partialType=true");
+        AERO_CHECK(mergedOut.source.find("65535u") == std::string::npos &&
+                   mergedOut.source.find("\"FieldB\", semantic::PrimitiveType::Float, 0x0000000000000000ULL, 1u, false, true, 1u, true") != std::string::npos,
+                   "Merged partial class assigned valid observableBitIndex=1u (not 65535u) to FieldB");
     }
 
     // 2) Cross-Heap Write Protection: UiPresentation direct storeField to SimHeap is rejected!
@@ -765,27 +820,158 @@ public partial class SquadTacticalHud
                std::get<std::int64_t>(loadedUnits) == 8,
                "SimHeap state not mutated until Simulation frame boundary flush");
 
-    // Flush SimCommands on Simulation domain via AOT ExecutionContext
-    const auto drained = domains.consumeSimCommands();
-    AERO_CHECK(drained.size() == 1u && drained[0].commandTypeId == deployMethodId,
-               "Drained SimCommandEnvelope matches RequestDeploy symbolId");
-    {
-        std::vector<UnifiedValue> dispatchArgs;
-        dispatchArgs.push_back(UnifiedValue{drained[0].targetObject});
-        dispatchArgs.insert(dispatchArgs.end(), drained[0].payload.begin(), drained[0].payload.end());
-        UnifiedValue simFlushOut{};
-        AERO_CHECK(aotSimCtx.invoke(
-                       drained[0].commandTypeId,
-                       dispatchArgs.data(),
-                       dispatchArgs.size(),
-                       simFlushOut),
-                   "Flushed SimCommand executed on Simulation AOT context");
-    }
+    // Flush SimCommands on Simulation domain directly via domains.flushSimCommands(aotSimCtx)
+    RuntimeError flushErr{};
+    const std::size_t flushedCount = domains.flushSimCommands(aotSimCtx, &flushErr);
+    AERO_CHECK(flushedCount == 1u && flushErr.code == ErrorCode::None,
+               "ExecutionDomainContext::flushSimCommands(aotSimCtx) executed 1 SimCommand");
     AERO_CHECK(aotSimCtx.loadField(hudTypeId, 1u, simHudVal, loadedUnits) &&
                std::get<std::int64_t>(loadedUnits) == 12,
                "Flushed AOT [SimCommand] updated SimHeap DeployedUnits from 8 to 12");
 
+    // Verify Button::BindAotClickHandler with CommandParameter
+    auto aotDeployBtn = MakeIntrusive<Button>();
+    aotDeployBtn->SetValue(PropId_CommandParameter, value::FromInt(5));
+    aotDeployBtn->BindAotClickHandler(&aotUiCtx, simHudObj, deployMethodId);
+    AERO_CHECK(aotDeployBtn->PerformClick(&flushErr), "Button::PerformClick via AOT UI context succeeded");
+    AERO_CHECK(domains.pendingSimCommandCount() == 1u, "Button AOT click enqueued SimCommand with CommandParameter=5");
+    AERO_CHECK(domains.flushSimCommands(aotSimCtx, &flushErr) == 1u, "Flushed Button AOT SimCommand");
+    AERO_CHECK(aotSimCtx.loadField(hudTypeId, 1u, simHudVal, loadedUnits) &&
+               std::get<std::int64_t>(loadedUnits) == 17,
+               "Button AOT click with CommandParameter=5 updated DeployedUnits from 12 to 17");
+
     std::cout << "[PASS] TestAeroCompilerAotCppAndRealScriptAotClosedLoop\n";
+}
+
+// ============================================================================
+// Test 6: Incremental Host Layout, 3D Container HitTest, PagedRenderTree Clear/Visibility,
+//         Track B Multi-Channel Cursor Alignment & AOT Template Event Mounting Regressions
+// ============================================================================
+void TestHostRenderHitTestAndAotHardeningRegressions() {
+    ExecutionDomainContext domains;
+    DualTrackBindingEngine bindingEngine(domains);
+    DepthBucketLayoutQueue layoutQueue;
+    PagedRenderTree renderTree;
+
+    auto root = MakeIntrusive<StackPanel>();
+    auto childCard = MakeIntrusive<Border>();
+    childCard->SetWidth(200.0f);
+    childCard->SetHeight(40.0f);
+    childCard->SetBackground(Color{0.8f, 0.2f, 0.2f, 1.0f});
+    childCard->SetCornerRadius(CornerRadius{8.0f});
+    auto deepLabel = MakeIntrusive<TextBlock>();
+    deepLabel->SetText("Short");
+    childCard->AddChild(deepLabel.Get());
+    auto siblingBtn = MakeIntrusive<Button>();
+    siblingBtn->SetHeight(30.0f);
+    root->AddChild(childCard.Get());
+    root->AddChild(siblingBtn.Get());
+
+    // 1. EmbeddedGameHost: initial frame lays out once; subsequent clean frame keeps layout clean
+    EmbeddedGameHost gameHost(root.Get(), &bindingEngine, &layoutQueue, &renderTree);
+    gameHost.SetViewportSize(Size{800.0f, 600.0f});
+    gameHost.TickUi(0.016f, UiPhase_All);
+    AERO_CHECK((root->GetLayoutDirtyFlags() & (MeasureDirty | ArrangeDirty | SubtreeLayoutDirty)) == 0u,
+               "Initial EmbeddedGameHost tick cleared all layout dirty flags");
+    gameHost.TickUi(0.016f, UiPhase_All);
+    AERO_CHECK(!layoutQueue.HasPendingMeasure() && !layoutQueue.HasPendingArrange() &&
+               (childCard->GetLayoutDirtyFlags() & (MeasureDirty | ArrangeDirty)) == 0u,
+               "Clean EmbeddedGameHost tick did NOT re-dirty visual tree");
+
+    // 2. WebCanvasHost: deep child mutation outside Track A/B (e.g. IME text update) is laid out!
+    WebCanvasHost webHost(root.Get(), &bindingEngine, &layoutQueue, ShaderBackend::WebGL2);
+    webHost.SetViewportSize(Size{800.0f, 600.0f});
+    webHost.TickUi(0.016f, UiPhase_All); // settle initial viewport
+    webHost.RequestWakeFrame();
+    childCard->SetHeight(90.0f); // mutate deep child directly (0 Track A/B changes)
+    webHost.TickUi(0.016f, UiPhase_All);
+    AERO_CHECK(std::fabs(siblingBtn->FinalRect().y - 90.0f) < 1e-4f &&
+               webHost.RafState() == WebRafState::ActiveTicking,
+               "WebCanvasHost detected SubtreeLayoutDirty on deep child and re-arranged sibling");
+
+    // 3. 3D Projection container HitTest transforms child coordinates before descending
+    auto projRoot = MakeIntrusive<Canvas>();
+    projRoot->Arrange(Rect{0.0f, 0.0f, 400.0f, 300.0f});
+    auto tiltedPanel = MakeIntrusive<Canvas>();
+    Canvas::SetLeft(tiltedPanel.Get(), 100.0f);
+    Canvas::SetTop(tiltedPanel.Get(), 50.0f);
+    tiltedPanel->SetWidth(200.0f);
+    tiltedPanel->SetHeight(100.0f);
+    tiltedPanel->SetValue(PropId_Projection3DYaw, MakeFloat(60.0f)); // cos(60 deg) = 0.5 around cx=200
+    auto innerBtn = MakeIntrusive<Button>();
+    Canvas::SetLeft(innerBtn.Get(), 0.0f); // unprojected X=[100..140], projected around cx=200 -> X=[150..170]
+    Canvas::SetTop(innerBtn.Get(), 10.0f);
+    innerBtn->SetWidth(40.0f);
+    innerBtn->SetHeight(30.0f);
+    tiltedPanel->AddChild(innerBtn.Get());
+    projRoot->AddChild(tiltedPanel.Get());
+    projRoot->Measure(Size{400.0f, 300.0f});
+    projRoot->Arrange(Rect{0.0f, 0.0f, 400.0f, 300.0f});
+    AERO_CHECK(projRoot->HitTest(Point{160.0f, 70.0f}) == innerBtn.Get(),
+               "HitTest inverted parent Projection3D.Yaw=60 before testing child Button at projected X=160");
+    AERO_CHECK(tiltedPanel->HitTest(Point{110.0f, 70.0f}) == nullptr &&
+               projRoot->HitTest(Point{110.0f, 70.0f}) == projRoot.Get(),
+               "HitTest outside projected foreshortened bounds (X=110) misses tiltedPanel and falls back to projRoot");
+
+    auto zeroSized = MakeIntrusive<Border>();
+    AERO_CHECK(zeroSized->HitTest(Point{0.0f, 0.0f}) == nullptr,
+               "Unarranged 0x0 UIElement does not falsely match HitTest(0, 0)");
+
+    // 4. PagedRenderTree::UpdateDirtyElement resets cleared properties and handles Visibility::Hidden
+    (void)renderTree.BuildFromVisualTree(root.Get());
+    AERO_CHECK(childCard->ClearValue(PropId_CornerRadius), "Cleared CornerRadius on childCard");
+    childCard->SetVisibility(Visibility::Hidden);
+    AERO_CHECK(renderTree.UpdateDirtyElement(childCard.Get()), "Updated dirty childCard in PagedRenderTree");
+    for (std::uint32_t i = 0; i < renderTree.NodeCount(); ++i) {
+        const auto* rn = renderTree.GetNode(i);
+        if (rn && rn->sourceElement == childCard.Get()) {
+            AERO_CHECK(rn->cornerRadius == 0.0f && rn->primType == AeroPrimType::SolidQuad,
+                       "Cleared CornerRadius reset RenderNodeDescriptor back to SolidQuad");
+            AERO_CHECK(rn->opacity == 0.0f, "Visibility::Hidden set render node effective opacity to 0");
+        }
+    }
+
+    // 5. Track B distinct field disambiguation & BatchUpdateFromEcsTrackB cursor alignment on partial view
+    struct DualBarComp {
+        float hp;
+        float shield;
+    };
+    std::array<DualBarComp, 4> compRows{{{50.0f, 120.0f}, {60.0f, 130.0f}, {70.0f, 140.0f}, {80.0f, 150.0f}}};
+    PagedRenderTree hudTree;
+    const std::uint32_t firstHudNode = hudTree.AllocateHudBarBatch(
+        8u, 0.0f, 0.0f, 10.0f, 6.0f, 2.0f, Color{0.2f, 0.8f, 0.4f, 1.0f}, 0.0f);
+
+    DualTrackBindingEngine trackBEngine(domains);
+    EcsColumnBindingChannel hpCh{};
+    hpCh.componentTypeName = "Game.ECS::DualBarComp";
+    hpCh.fieldName = "hp";
+    hpCh.rawView.basePtr = compRows.data();
+    hpCh.rawView.count = 2u; // Only 2 live entities currently active out of 4 reserved HUD slots!
+    hpCh.rawView.strideBytes = sizeof(DualBarComp);
+    hpCh.fieldByteOffset = offsetof(DualBarComp, hp);
+    hpCh.targetElements.resize(4u);
+
+    EcsColumnBindingChannel shieldCh{};
+    shieldCh.componentTypeName = "Game.ECS::DualBarComp";
+    shieldCh.fieldName = "shield";
+    shieldCh.rawView.basePtr = compRows.data();
+    shieldCh.rawView.count = 4u;
+    shieldCh.rawView.strideBytes = sizeof(DualBarComp);
+    shieldCh.fieldByteOffset = offsetof(DualBarComp, shield);
+    shieldCh.targetElements.resize(4u);
+
+    const std::size_t hpIdx = trackBEngine.BindEcsColumn(hpCh);
+    const std::size_t shIdx = trackBEngine.BindEcsColumn(shieldCh);
+    AERO_CHECK(hpIdx != shIdx, "Distinct ECS fields (hp vs shield) on same component stay separate channels");
+
+    (void)hudTree.BatchUpdateFromEcsTrackB(trackBEngine, firstHudNode);
+    AERO_CHECK(std::fabs(hudTree.GetNode(firstHudNode + 0u)->width - 50.0f) < 1e-4f &&
+               std::fabs(hudTree.GetNode(firstHudNode + 2u)->width - 10.0f) < 1e-4f &&
+               std::fabs(hudTree.GetNode(firstHudNode + 4u)->width - 120.0f) < 1e-4f &&
+               std::fabs(hudTree.GetNode(firstHudNode + 7u)->width - 150.0f) < 1e-4f,
+               "BatchUpdateFromEcsTrackB preserved channel 1 node offset (+4) even when channel 0 view.count=2 < 4");
+
+    std::cout << "[PASS] TestHostRenderHitTestAndAotHardeningRegressions\n";
 }
 
 } // namespace aero::tests
@@ -799,6 +985,7 @@ int main() {
     aero::tests::TestEcsHud1000NodesSub80MicrosecondsZeroAllocBenchmark();
     aero::tests::TestTriHostDriversEmbeddedDesktopAndWebCanvas();
     aero::tests::TestAeroCompilerAotCppAndRealScriptAotClosedLoop();
+    aero::tests::TestHostRenderHitTestAndAotHardeningRegressions();
 
     std::cout << "All AeroGUI 2.0 Phase 3 tests passed 100%!\n";
     return 0;

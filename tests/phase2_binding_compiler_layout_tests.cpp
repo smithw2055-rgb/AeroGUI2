@@ -44,7 +44,15 @@ struct AllocationTrackingScope {
 
 } // namespace
 
-void* operator new(std::size_t size) {
+#if defined(__GNUC__) || defined(__clang__)
+#define AERO_TEST_NOINLINE __attribute__((noinline))
+#elif defined(_MSC_VER)
+#define AERO_TEST_NOINLINE __declspec(noinline)
+#else
+#define AERO_TEST_NOINLINE
+#endif
+
+AERO_TEST_NOINLINE void* operator new(std::size_t size) {
     if (gTrackAllocations.load(std::memory_order_relaxed)) {
         gAllocationCount.fetch_add(1, std::memory_order_relaxed);
     }
@@ -54,11 +62,29 @@ void* operator new(std::size_t size) {
     throw std::bad_alloc();
 }
 
-void operator delete(void* ptr) noexcept {
+AERO_TEST_NOINLINE void* operator new[](std::size_t size) {
+    if (gTrackAllocations.load(std::memory_order_relaxed)) {
+        gAllocationCount.fetch_add(1, std::memory_order_relaxed);
+    }
+    if (void* ptr = std::malloc(size == 0 ? 1 : size)) {
+        return ptr;
+    }
+    throw std::bad_alloc();
+}
+
+AERO_TEST_NOINLINE void operator delete(void* ptr) noexcept {
     std::free(ptr);
 }
 
-void operator delete(void* ptr, std::size_t) noexcept {
+AERO_TEST_NOINLINE void operator delete(void* ptr, std::size_t) noexcept {
+    std::free(ptr);
+}
+
+AERO_TEST_NOINLINE void operator delete[](void* ptr) noexcept {
+    std::free(ptr);
+}
+
+AERO_TEST_NOINLINE void operator delete[](void* ptr, std::size_t) noexcept {
     std::free(ptr);
 }
 
@@ -616,10 +642,28 @@ public TacticalHud CreateTacticalHud()
     AERO_CHECK(winCompiled.succeeded, "Compiled CommandWindow with XML entities");
     auto selfMountedWin = MakeIntrusive<Window>("Game.UI.CommandWindow", &domains, &bindingEngine);
     AERO_CHECK(selfMountedWin->IsTemplateMounted(), "Window self-mounted its .axb4 template on construction");
-    const auto* titleSv = std::get_if<StringValue>(&selfMountedWin->GetValue(PropId_Title));
+    const UnifiedValue titleVal = selfMountedWin->GetValue(PropId_Title);
+    const auto* titleSv = std::get_if<StringValue>(&titleVal);
     AERO_CHECK(
         titleSv != nullptr && titleSv->str() == "R&D <Alpha> \"Core\" 'v2'",
         "Decoded XML entities in Window Title attribute");
+
+    // Verify __nativeRootHandle was populated on hudObj (field 0 of generated partial class)
+    UnifiedValue rootHandleVal{};
+    AERO_CHECK(
+        domains.readObjectField(DomainKind::Ui, hudObj, compiled.axbPackage.rootHandleFieldIndex, rootHandleVal, &clickErr),
+        "Read __nativeRootHandle field from partial class instance");
+    const auto* rootHandlePtr = std::get_if<NativeHandle>(&rootHandleVal);
+    AERO_CHECK(
+        rootHandlePtr != nullptr && rootHandlePtr->valid() &&
+        UIElement::FromNativeHandle(domains.nativeHandles(), *rootHandlePtr) == hudControl.Get(),
+        "__nativeRootHandle on script partial class resolves back to hudControl UIElement");
+
+    // Verify duplicate .g.rs guard in AeroCompiler::Compile
+    AeroCompileInput dupInput = input;
+    dupInput.scriptSources.push_back(SourceFile{compiled.generatedPartialRsPath, compiled.generatedPartialRsCode});
+    const AeroCompileResult dupCompiled = compiler.Compile(dupInput);
+    AERO_CHECK(dupCompiled.succeeded, "AeroCompiler deduplicates pre-existing .g.rs in scriptSources");
     auto* statusTb = selfMountedWin->FindName("StatusBanner")->DynamicCast<TextBlock>();
     AERO_CHECK(
         statusTb != nullptr && statusTb->GetText() == "Systems & Sensors <Online>",
@@ -846,6 +890,17 @@ public void UpdateQuestTitle(QuestItem q, string newTitle)
         std::fabs(engine.EcsChannels()[channelIdx].targetElements[500]->GetWidth() - expected500) < 1e-4f,
         "Track B element[500] Width matches scaled ECS column float value");
 
+    // 5. Verify Dead SimHeap/UiHeap object automatic fallback to default (Section II.1.4 contract)
+    q2Root.reset();
+    q1Root.reset();
+    vmRoot.reset();
+    ShadowStack emptyStack;
+    domains.uiHeap().collectFull(emptyStack);
+    AERO_CHECK(!domains.uiHeap().isAlive(quest2), "Unrooted quest2 collected by GC");
+    AERO_CHECK(engine.FlushTrackA(&err) >= 1u, "FlushTrackA detected dead bound object and triggered fallback");
+    AERO_CHECK(questTitleTb->GetText().empty(), "Dead bound object automatically reset bound TextBlock to default empty string");
+    AERO_CHECK(questBar->GetWidth() < 0.0f, "Dead bound object automatically reset bound Border Width to Auto (-1.0f)");
+
     std::cout << "[PASS] TestDualTrackBindingEngineMultiHopAndEcsColumn\n";
 }
 
@@ -939,6 +994,32 @@ void TestDepthBucketLayoutQueueAndCorePanels() {
     AERO_CHECK(
         (radarPin->FinalRect() == Rect{320.0f, 135.0f, 24.0f, 24.0f}),
         "Canvas arranged radarPin at (320, 135, 24, 24)");
+
+    // Verify incremental child size change in StackPanel triggers parent re-arrange of sibling btnB
+    btnA->SetHeight(60.0f);
+    layoutQueue.EnqueueMeasure(btnA.Get());
+    const std::size_t incProcessed = layoutQueue.FlushLayout(Size{1000.0f, 600.0f});
+    AERO_CHECK(incProcessed > 0u, "Incremental layout processed dirty child and parent");
+    AERO_CHECK(
+        (btnB->FinalRect() == Rect{0.0f, 118.0f, 200.0f, 40.0f}),
+        "Incremental child height change (32->60) in StackPanel re-arranged sibling btnB to Y=118");
+
+    // Verify Grid RowSpan and ColumnSpan
+    auto spanBanner = MakeIntrusive<Border>();
+    Grid::SetRow(spanBanner.Get(), 0);
+    Grid::SetColumn(spanBanner.Get(), 0);
+    Grid::SetColumnSpan(spanBanner.Get(), 2);
+    mainGrid->AddChild(spanBanner.Get());
+    layoutQueue.EnqueueSubtree(mainGrid.Get());
+    (void)layoutQueue.FlushLayout(Size{1000.0f, 600.0f});
+    AERO_CHECK(
+        (spanBanner->FinalRect() == Rect{0.0f, 0.0f, 1000.0f, 50.0f}),
+        "Grid ColumnSpan=2 arranged spanBanner across both columns (width = 200 + 800 = 1000)");
+
+    // Verify 2D/3D HitTest
+    AERO_CHECK(
+        rootWin->HitTest(Point{330.0f, 145.0f}) == radarPin.Get(),
+        "HitTest(330, 145) hit deepest child radarPin");
 
     std::cout << "[PASS] TestDepthBucketLayoutQueueAndCorePanels\n";
 }
@@ -1330,6 +1411,530 @@ public LocalizationView CreateLocalizationViewV2()
     std::cout << "[PASS] TestParadigmSamplesAndSub5msHotReload\n";
 }
 
+// ============================================================================
+// Test 8: Samples.zip Migration Completeness (Page, ResourceDictionary, Grid Definitions,
+//         Property-Element Brushes, Run Inline Text, Named Colors, Command & FallbackValue)
+// ============================================================================
+void TestSamplesMigrationCompletenessEndToEnd() {
+    AeroCompiler compiler;
+
+    // 1. Compile a standalone ResourceDictionary (like Localization/Language-en.xaml & Resources.xaml)
+    AeroCompileInput langDictInput{};
+    langDictInput.xamlPath = "Language-en.xaml";
+    langDictInput.xamlContent = R"(
+<ResourceDictionary
+  xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+  xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+  xmlns:sys="clr-namespace:System;assembly=mscorlib">
+  <SolidColorBrush x:Key="ThemeAccentBrush" Color="#FF2AA6E2"/>
+  <Color x:Key="ThemeHeaderColor">LightSeaGreen</Color>
+  <sys:String x:Key="LoginWelcomeLabel">Welcome back, Commander</sys:String>
+</ResourceDictionary>
+)";
+    const AeroCompileResult dictRes = compiler.Compile(langDictInput);
+    AERO_CHECK(dictRes.succeeded, "Compiled standalone ResourceDictionary XAML");
+    AERO_CHECK(dictRes.axbPackage.resources.size() == 3u, "Extracted 3 keyed resources from ResourceDictionary");
+
+    // 2. Compile a composite Page combining HelloWorld, Buttons, Login, Localization & Gallery patterns
+    AeroCompileInput pageInput{};
+    pageInput.xamlPath = "MigratedSamplePage.xaml";
+    pageInput.emitAotCpp = true;
+    pageInput.xamlContent = R"(
+<Page
+  xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+  xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+  xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
+  xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+  xmlns:b="http://schemas.microsoft.com/xaml/behaviors"
+  xmlns:noesis="clr-namespace:NoesisGUIExtensions"
+  mc:Ignorable="d"
+  x:Class="Game.UI.MigratedSamplePage"
+  d:DesignWidth="1280" d:DesignHeight="720"
+  Title="Noesis Sample Migration">
+  <Page.Resources>
+    <ResourceDictionary>
+      <LinearGradientBrush x:Key="DialogGradientBg" StartPoint="0,0" EndPoint="1,1">
+        <GradientStop Color="#FF235986" Offset="0"/>
+        <GradientStop Color="#FF123757" Offset="1"/>
+      </LinearGradientBrush>
+      <Storyboard x:Key="IntroAnim">
+        <DoubleAnimationUsingKeyFrames Storyboard.TargetName="DialogGrid" Storyboard.TargetProperty="Opacity">
+          <EasingDoubleKeyFrame KeyTime="0:0:0.5" Value="1"/>
+        </DoubleAnimationUsingKeyFrames>
+      </Storyboard>
+    </ResourceDictionary>
+  </Page.Resources>
+  <b:Interaction.Triggers>
+    <b:EventTrigger EventName="Loaded">
+      <b:ControlStoryboardAction Storyboard="{StaticResource IntroAnim}"/>
+    </b:EventTrigger>
+  </b:Interaction.Triggers>
+  <Grid x:Name="LayoutRoot" Background="{StaticResource DialogGradientBg}">
+    <Grid.RowDefinitions>
+      <RowDefinition Height="80"/>
+      <RowDefinition Height="*"/>
+      <RowDefinition Height="Auto"/>
+    </Grid.RowDefinitions>
+    <Grid.ColumnDefinitions>
+      <ColumnDefinition Width="200"/>
+      <ColumnDefinition Width="2*"/>
+    </Grid.ColumnDefinitions>
+    <Grid.RenderTransform>
+      <TransformGroup>
+        <ScaleTransform/>
+        <TranslateTransform/>
+      </TransformGroup>
+    </Grid.RenderTransform>
+    <HeaderedContentControl x:Name="HeaderSection" Grid.Row="0" Grid.ColumnSpan="2">
+      <HeaderedContentControl.Header>
+        <TextBlock x:Name="WelcomeBanner" Content="{noesis:Loc ResourceKey=LoginWelcomeLabel}" Foreground="Turquoise" />
+      </HeaderedContentControl.Header>
+      <TextBlock x:Name="RunSummaryText">
+        <Run>Click mode:</Run>
+        <Run FontWeight="Bold">Release</Run>
+      </TextBlock>
+    </HeaderedContentControl>
+    <Border x:Name="CardBorder" Grid.Row="1" Grid.Column="1" BorderThickness="2">
+      <Border.Background>
+        <RadialGradientBrush>
+          <GradientStop Color="#FF2C76B4" Offset="0"/>
+          <GradientStop Color="#FF123757" Offset="1"/>
+        </RadialGradientBrush>
+      </Border.Background>
+      <StackPanel Spacing="8">
+        <TextBlock x:Name="StatusMessage" Text="{Binding Message, Mode=TwoWay, FallbackValue=LOGIN READY}" Foreground="White"/>
+        <Button x:Name="StartBtn" Content="START" Command="{Binding StartCommand}" Height="36"/>
+      </StackPanel>
+    </Border>
+  </Grid>
+</Page>
+)";
+    pageInput.scriptSources.push_back(SourceFile{
+        "MigratedSamplePage.rs",
+        R"(
+module Game.UI;
+
+public partial class MigratedSamplePage
+{
+    [Observable]
+    public string Message { get; set; }
+
+    public MigratedSamplePage()
+    {
+        Message = "AUTHENTICATED";
+    }
+
+    public void OnStart()
+    {
+        Message = "MISSION STARTED";
+    }
+}
+
+public MigratedSamplePage CreateMigratedSamplePage()
+{
+    return new MigratedSamplePage();
+}
+)"});
+
+    const AeroCompileResult res = compiler.Compile(pageInput);
+    AERO_CHECK(res.succeeded, "Compiled MigratedSamplePage with full Noesis XAML syntax");
+    AERO_CHECK(res.axbPackage.bindingChains.size() == 1u,
+               "Only genuine {Binding Message} emitted into bindingChains (0 bogus StaticResource/Loc chains)");
+
+    ExecutionDomainContext domains;
+    domains.registerProgramObservableMetadata(*res.programImage);
+    Interpreter uiInterp(res.programImage, domains.uiHeapPtr());
+    uiInterp.setExecutionDomainContext(&domains, DomainKind::UiPresentation);
+
+    // First mount WITHOUT a ViewModel to verify FallbackValue, StaticResource, noesis:Loc, Run & Grid definitions
+    auto pageNoVm = CreateElementByTypeName(res.axbPackage.rootTypeName);
+    AERO_CHECK(MountAxbTemplate(pageNoVm.Get(), res.axbPackage, &domains, nullptr),
+               "Mounted MigratedSamplePage without ViewModel");
+    AERO_CHECK(std::fabs(pageNoVm->GetWidth() - 1280.0f) < 1e-4f &&
+               std::fabs(pageNoVm->GetHeight() - 720.0f) < 1e-4f,
+               "d:DesignWidth=1280 and d:DesignHeight=720 applied to root Page");
+
+    auto* layoutRoot = pageNoVm->FindName("LayoutRoot")->DynamicCast<Grid>();
+    AERO_CHECK(layoutRoot != nullptr, "Resolved LayoutRoot Grid");
+    AERO_CHECK(layoutRoot->RowDefinitionCount() == 3u && layoutRoot->ColumnDefinitionCount() == 2u,
+               "Grid.RowDefinitions (3) and Grid.ColumnDefinitions (2) populated on LayoutRoot");
+    AERO_CHECK(layoutRoot->Rows()[0].unit == GridUnitType::Pixel && std::fabs(layoutRoot->Rows()[0].value - 80.0f) < 1e-4f &&
+               layoutRoot->Rows()[1].unit == GridUnitType::Star &&
+               layoutRoot->Rows()[2].unit == GridUnitType::Auto,
+               "Parsed Pixel(80), Star(*), and Auto RowDefinitions");
+
+    auto* welcomeTb = pageNoVm->FindName("WelcomeBanner")->DynamicCast<TextBlock>();
+    AERO_CHECK(welcomeTb != nullptr && welcomeTb->GetText() == "Welcome back, Commander",
+               "{noesis:Loc ResourceKey=LoginWelcomeLabel} resolved against Language-en.xaml ResourceDictionary");
+
+    auto* runTb = pageNoVm->FindName("RunSummaryText")->DynamicCast<TextBlock>();
+    AERO_CHECK(runTb != nullptr && runTb->GetText() == "Click mode: Release",
+               "<TextBlock><Run>...</Run></TextBlock> concatenated inline Run text");
+
+    auto* statusNoVm = pageNoVm->FindName("StatusMessage")->DynamicCast<TextBlock>();
+    AERO_CHECK(statusNoVm != nullptr && statusNoVm->GetText() == "LOGIN READY",
+               "{Binding Message, FallbackValue=LOGIN READY} applied FallbackValue before ViewModel binding");
+
+    // Now mount WITH the RealScript ViewModel and verify Command="{Binding StartCommand}" -> OnStart()
+    const auto vmExec = uiInterp.invoke("Game.UI::CreateMigratedSamplePage", {});
+    AERO_CHECK(vmExec.succeeded && std::holds_alternative<ObjectRef>(vmExec.value), "Created MigratedSamplePage script VM");
+    const ObjectRef pageVm = std::get<ObjectRef>(vmExec.value);
+    auto vmKeepAlive = domains.uiHeap().retain(pageVm);
+
+    DualTrackBindingEngine bindingEngine(domains, res.programImage.get(), &uiInterp);
+    auto mountedPage = MakeIntrusive<UserControl>(
+        "Game.UI.MigratedSamplePage",
+        &domains,
+        &bindingEngine,
+        pageVm,
+        &uiInterp);
+    auto* statusWithVm = mountedPage->FindName("StatusMessage")->DynamicCast<TextBlock>();
+    auto* startBtn = mountedPage->FindName("StartBtn")->DynamicCast<Button>();
+    AERO_CHECK(statusWithVm != nullptr && statusWithVm->GetText() == "AUTHENTICATED",
+               "Initial bound Message updated from FallbackValue to ViewModel value AUTHENTICATED");
+    AERO_CHECK(startBtn != nullptr && startBtn->PerformClick(),
+               "Button Command={Binding StartCommand} resolved and invoked OnStart() on RealScript ViewModel");
+    (void)bindingEngine.FlushTrackA();
+    AERO_CHECK(statusWithVm->GetText() == "MISSION STARTED",
+               "Command={Binding StartCommand} mutated [Observable] Message to MISSION STARTED");
+
+    std::cout << "[PASS] TestSamplesMigrationCompletenessEndToEnd\n";
+}
+
+// ============================================================================
+// Test 9: Compiler, Binding, Hot-Reload Observer, Deserializer & Grid Span Regressions
+// ============================================================================
+void TestCompilerBindingAndGridHardeningRegressions() {
+    AeroCompiler compiler;
+    AxbTemplateRegistry::Instance().Clear();
+
+    // 1. Compile XAML BEFORE registering runtime resources, plus nested DataTemplate x:DataType,
+    //    ContentTemplate / StrokeDashArray suffix checks, <GroupBox.Header>/<Button.Content> text,
+    //    Placeholder alongside bound Text, SelectedIndex int literal, and FallbackValue on null hop.
+    AeroCompileInput input{};
+    input.xamlPath = "HardenedView.xaml";
+    input.emitAotCpp = true;
+    input.xamlContent = R"(
+<Page
+  xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+  xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+  xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
+  xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+  xmlns:noesis="clr-namespace:NoesisGUIExtensions"
+  mc:Ignorable="d"
+  x:Class="Game.UI.HardenedView"
+  d:DesignWidth="1024" d:DesignHeight="640">
+  <Page.Resources>
+    <DataTemplate x:Key="QuestRowTpl" x:DataType="Game.UI.QuestRowItem">
+      <TextBlock Text="{Binding RowLabel}"/>
+    </DataTemplate>
+  </Page.Resources>
+  <Grid x:Name="RootGrid" d:DesignWidth="333" d:DesignHeight="222">
+    <Grid.ColumnDefinitions>
+      <ColumnDefinition Width="Auto"/>
+      <ColumnDefinition Width="*"/>
+    </Grid.ColumnDefinitions>
+    <ContentControl x:Name="TemplatedHost">
+      <ContentControl.ContentTemplate>
+        <DataTemplate x:DataType="Game.UI.QuestRowItem">
+          <Button x:Name="LeakedTemplateButton" Content="SHOULD_NOT_MOUNT"/>
+        </DataTemplate>
+      </ContentControl.ContentTemplate>
+    </ContentControl>
+    <Path x:Name="VectorShape">
+      <Path.StrokeDashArray>2,2</Path.StrokeDashArray>
+    </Path>
+    <GroupBox x:Name="SettingsGroup" Grid.Column="0">
+      <GroupBox.Header>Squad Settings</GroupBox.Header>
+      <Button x:Name="ApplyBtn" Command="{Binding FailingInnerCallCommand}">
+        <Button.Content>Apply Now</Button.Content>
+      </Button>
+    </GroupBox>
+    <StackPanel Grid.Column="1">
+      <TextBox x:Name="UserBox" Text="{Binding UserName}" noesis:Text.Placeholder="Enter callsign"/>
+      <TextBlock x:Name="QuestStatusTb" Text="{Binding ActiveQuest.Title, FallbackValue=NO ACTIVE QUEST}"/>
+      <TextBlock x:Name="DynamicLocTb" Text="{DynamicResource DeferredBannerText}"/>
+      <ComboBox x:Name="SquadCombo" SelectedIndex="2" ItemsSource="{Binding SquadNames}"/>
+    </StackPanel>
+  </Grid>
+</Page>
+)";
+    input.scriptSources.push_back(SourceFile{
+        "HostMock.rs",
+        R"(
+module HostMock;
+
+public void TriggerInnerInvalidArgs()
+{
+}
+)"});
+    input.scriptSources.push_back(SourceFile{
+        "HardenedView.rs",
+        R"(
+module Game.UI;
+import HostMock;
+
+public class QuestRowItem
+{
+    [Observable]
+    public string Title { get; set; }
+
+    public QuestRowItem(string t)
+    {
+        Title = t;
+    }
+}
+
+public partial class HardenedView
+{
+    [Observable]
+    public string UserName { get; set; }
+
+    [Observable]
+    public QuestRowItem ActiveQuest { get; set; }
+
+    [Observable]
+    public string[] SquadNames { get; set; }
+
+    public int SideEffectCounter;
+
+    public HardenedView(QuestRowItem q)
+    {
+        UserName = "Maverick";
+        ActiveQuest = q;
+        SquadNames = new string[2];
+        SquadNames[0] = "Alpha";
+        SquadNames[1] = "Bravo";
+        SideEffectCounter = 0;
+    }
+
+    public void OnFailingInnerCall()
+    {
+        SideEffectCounter = SideEffectCounter + 1;
+        TriggerInnerInvalidArgs();
+    }
+}
+
+public QuestRowItem CreateQuestRow(string t)
+{
+    return new QuestRowItem(t);
+}
+
+public HardenedView CreateHardenedView(QuestRowItem q)
+{
+    return new HardenedView(q);
+}
+
+public void SetHardenedQuest(HardenedView v, QuestRowItem q)
+{
+    v.ActiveQuest = q;
+}
+)"});
+
+    const AeroCompileResult res = compiler.Compile(input);
+    AERO_CHECK(res.succeeded, "Compiled HardenedView with nested DataTemplate x:DataType");
+    AERO_CHECK(res.axbPackage.rootHandleFieldIndex != PropertySlotHandle::InvalidIndex,
+               "DataTemplate x:DataType did NOT hijack root class binding");
+    AERO_CHECK(res.aotCpp.source.find("eventAotContext") != std::string::npos &&
+               res.aotCpp.source.find("SetDomains(domains)") != std::string::npos,
+               "AOT C++ builder emits eventAotContext and SetDomains for ComboBox (ItemsControl)");
+
+    // Verify .axb4 round-trip preserves FallbackValue and rejects corrupted/truncated resources
+    AxbPackage decoded{};
+    std::string errMsg;
+    AERO_CHECK(AxbPackage::Deserialize(res.axbBytes, decoded, &errMsg),
+               "Deserialize valid .axb4 with binding fallback table");
+    std::vector<std::uint8_t> corruptedBytes = res.axbBytes;
+    // Append bogus huge resource count if we truncate tail to rootHandleFieldIndex + 0xFFFFFFFFu
+    corruptedBytes.resize(corruptedBytes.size() - 4u); // chop fallback count mid-tail and corrupt
+    corruptedBytes.push_back(0xFFu);
+    corruptedBytes.push_back(0xFFu);
+    corruptedBytes.push_back(0xFFu);
+    corruptedBytes.push_back(0x7Fu);
+    corruptedBytes.push_back(0x01u); // extra trailing byte with truncated value
+    AxbPackage rejectedPkg{};
+    AERO_CHECK(!AxbPackage::Deserialize(corruptedBytes, rejectedPkg, &errMsg),
+               "Deserialize rejects corrupted trailing section instead of OOM or silent success");
+
+    // Register runtime resource AFTER compilation (simulating offline-compiled .axb4 + runtime dictionary load)
+    AxbTemplateRegistry::Instance().RegisterResource(
+        "DeferredBannerText",
+        value::FromString("Runtime Loaded Localization"));
+
+    ExecutionDomainContext domains;
+    auto hostLinkedMods = res.bytecodeModules;
+    for (auto& m : hostLinkedMods) {
+        if (m.name == "HostMock") {
+            m.functions.clear();
+        }
+    }
+    RuntimeError hostLinkErr{};
+    auto hostLinkedImgOpt = ProgramImage::link(std::move(hostLinkedMods), hostLinkErr);
+    AERO_CHECK(hostLinkedImgOpt.has_value(), "Linked ProgramImage with external HostMock");
+    auto runtimeImg = std::make_shared<const ProgramImage>(std::move(*hostLinkedImgOpt));
+    domains.registerProgramObservableMetadata(*runtimeImg);
+    auto bindings = std::make_shared<BindingRegistry>();
+    (void)bindings->bind(
+        "HostMock::TriggerInnerInvalidArgs",
+        [](const rs_bc::FunctionReference&, ValueSpan, RuntimeError& err) -> std::optional<UnifiedValue> {
+            err.code = ErrorCode::InvalidArguments;
+            err.message = "inner_call_invalid_args";
+            return std::nullopt;
+        });
+    Interpreter uiInterp(runtimeImg, domains.uiHeapPtr());
+    uiInterp.setBindingRegistry(bindings);
+    uiInterp.setExecutionDomainContext(&domains, DomainKind::UiPresentation);
+
+    // Mount with ActiveQuest = null: FallbackValue MUST survive active DualTrackBindingEngine!
+    const auto vmNullQuestExec = uiInterp.invoke("Game.UI::CreateHardenedView", {NullObject{}});
+    AERO_CHECK(vmNullQuestExec.succeeded, "Created HardenedView with null ActiveQuest");
+    const ObjectRef viewVm = std::get<ObjectRef>(vmNullQuestExec.value);
+    auto vmPin = domains.uiHeap().retain(viewVm);
+
+    DualTrackBindingEngine bindingEngine(domains, runtimeImg.get(), &uiInterp);
+    auto page = CreateElementByTypeName(decoded.rootTypeName);
+    AERO_CHECK(MountAxbTemplate(page.Get(), decoded, &domains, &bindingEngine, viewVm, &uiInterp),
+               "Mounted HardenedView from deserialized AxbPackage");
+
+    // Verify ContentTemplate did NOT leak inner template elements into visual tree
+    AERO_CHECK(page->FindName("LeakedTemplateButton") == nullptr,
+               "ContentControl.ContentTemplate properly skipped (not treated as .Content)");
+
+    // Verify child d:DesignWidth on RootGrid was ignored while root Page kept d:DesignWidth=1024
+    auto* rootGrid = page->FindName("RootGrid")->DynamicCast<Grid>();
+    AERO_CHECK(rootGrid != nullptr && rootGrid->GetWidth() < 0.0f &&
+               std::fabs(page->GetWidth() - 1024.0f) < 1e-4f,
+               "d:DesignWidth applied only to root Page, leaving child Grid Auto-sized");
+
+    // Verify <GroupBox.Header> and <Button.Content> plain text extraction
+    auto* settingsGroup = page->FindName("SettingsGroup");
+    auto* applyBtn = page->FindName("ApplyBtn")->DynamicCast<Button>();
+    const auto hdrVal = settingsGroup ? settingsGroup->GetValue(PropId_Title) : UnifiedValue{};
+    AERO_CHECK(std::holds_alternative<StringValue>(hdrVal) &&
+               std::get<StringValue>(hdrVal).str() == "Squad Settings",
+               "<GroupBox.Header> plain text captured into PropId_Title");
+    AERO_CHECK(applyBtn != nullptr && applyBtn->GetContentText() == "Apply Now",
+               "<Button.Content> plain text captured into Button content");
+
+    // Verify Button::PerformClick does NOT re-invoke 0-arg handler when inner call raises InvalidArguments
+    RuntimeError innerClickErr{};
+    AERO_CHECK(!applyBtn->PerformClick(&innerClickErr),
+               "Button::PerformClick propagated inner InvalidArguments failure");
+    AERO_CHECK(innerClickErr.code == ErrorCode::InvalidArguments &&
+               innerClickErr.message.find("inner_call_invalid_args") != std::string::npos,
+               "Button::PerformClick preserved inner call error message without masking it");
+    const auto sideEffectSlot = *domains.resolvePropertySlot(
+        *res.programImage,
+        rs_sem::stableTypeId("Game.UI::HardenedView"),
+        "SideEffectCounter");
+    UnifiedValue sideEffectsVal{};
+    AERO_CHECK(domains.readPropertySlotFast(DomainKind::Ui, viewVm, sideEffectSlot, sideEffectsVal) &&
+               std::holds_alternative<std::int64_t>(sideEffectsVal) &&
+               std::get<std::int64_t>(sideEffectsVal) == 1,
+               "OnFailingInnerCall executed strictly once (SideEffectCounter == 1, no blind retry)");
+
+    // Verify Placeholder did NOT overwrite bound UserName ("Maverick")
+    auto* userBox = page->FindName("UserBox")->DynamicCast<TextBlock>();
+    AERO_CHECK(userBox != nullptr && userBox->GetText() == "Maverick",
+               "noesis:Text.Placeholder did not clobber bound Text property");
+    const auto phVal = userBox->GetValue(PropId_Placeholder);
+    AERO_CHECK(std::holds_alternative<StringValue>(phVal) &&
+               std::get<StringValue>(phVal).str() == "Enter callsign",
+               "Placeholder stored in dedicated PropId_Placeholder");
+
+    // Verify SelectedIndex parsed as int64(2) and runtime-registered DynamicResource resolved
+    auto* squadCombo = page->FindName("SquadCombo")->DynamicCast<ItemsControl>();
+    const auto selIdxVal = squadCombo ? squadCombo->GetValue(PropId_SelectedIndex) : UnifiedValue{};
+    AERO_CHECK(std::holds_alternative<std::int64_t>(selIdxVal) &&
+               std::get<std::int64_t>(selIdxVal) == 2,
+               "SelectedIndex='2' parsed as integer 2");
+    auto* dynLocTb = page->FindName("DynamicLocTb")->DynamicCast<TextBlock>();
+    AERO_CHECK(dynLocTb != nullptr && dynLocTb->GetText() == "Runtime Loaded Localization",
+               "SetResourceProperty resolved resource registered at runtime after compilation");
+
+    // Verify FallbackValue preserved when ActiveQuest is null AND after live quest object is GC'd
+    auto* questStatusTb = page->FindName("QuestStatusTb")->DynamicCast<TextBlock>();
+    AERO_CHECK(questStatusTb != nullptr && questStatusTb->GetText() == "NO ACTIVE QUEST",
+               "FallbackValue preserved when bound intermediate hop ActiveQuest is null");
+
+    auto questExec = uiInterp.invoke("Game.UI::CreateQuestRow", {value::FromString("Secure Relay")});
+    AERO_CHECK(questExec.succeeded, "Created live QuestRowItem");
+    const ObjectRef liveQuest = std::get<ObjectRef>(questExec.value);
+    auto questPin = domains.uiHeap().retain(liveQuest);
+    (void)uiInterp.invoke("Game.UI::SetHardenedQuest", {viewVm, liveQuest});
+    (void)bindingEngine.FlushTrackA();
+    AERO_CHECK(questStatusTb->GetText() == "Secure Relay",
+               "Bound QuestStatusTb updated to live quest title");
+
+    // Verify ApplyHotReloadMigration observer transfer (removeUiObserver on oldRef, addUiObserver on newRef)
+    auto quest2Exec = uiInterp.invoke("Game.UI::CreateQuestRow", {value::FromString("Migrated Relay V2")});
+    const ObjectRef migratedQuest = std::get<ObjectRef>(quest2Exec.value);
+    auto migratedPin = domains.uiHeap().retain(migratedQuest);
+    AERO_CHECK(domains.uiHeap().uiObserverCount(liveQuest) >= 1u &&
+               domains.uiHeap().uiObserverCount(migratedQuest) == 0u,
+               "Initial observer count on liveQuest before hot-reload migration");
+    (void)uiInterp.invoke("Game.UI::SetHardenedQuest", {viewVm, migratedQuest});
+    (void)domains.uiHeap().consumeDirtyObjects();
+    domains.uiHeap().clearDirtyFieldMask(viewVm);
+    (void)bindingEngine.ApplyHotReloadMigration(
+        *res.programImage,
+        {HotReloadMigrationPair{liveQuest, migratedQuest}});
+    AERO_CHECK(domains.uiHeap().uiObserverCount(liveQuest) == 0u &&
+               domains.uiHeap().uiObserverCount(migratedQuest) >= 1u,
+               "ApplyHotReloadMigration released oldRef observer and registered addUiObserver on newRef");
+    AERO_CHECK(questStatusTb->GetText() == "Migrated Relay V2",
+               "Hot-reload migrated hop synced Migrated Relay V2");
+
+    // Verify dead bound object after GC falls back to FallbackValue ("NO ACTIVE QUEST") instead of ""
+    (void)uiInterp.invoke("Game.UI::SetHardenedQuest", {viewVm, NullObject{}});
+    (void)domains.uiHeap().consumeDirtyObjects();
+    domains.uiHeap().clearDirtyFieldMask(viewVm);
+    migratedPin.reset();
+    ShadowStack emptyStack;
+    domains.uiHeap().collectFull(emptyStack);
+    AERO_CHECK(!domains.uiHeap().isAlive(migratedQuest), "Unrooted migratedQuest reclaimed by GC");
+    AERO_CHECK(bindingEngine.FlushTrackA() >= 1u &&
+               questStatusTb->GetText() == "NO ACTIVE QUEST",
+               "GC-reclaimed hop restored FallbackValue NO ACTIVE QUEST instead of clearing to empty");
+
+    // Now test Grid ColumnSpan=2 over (Auto, *) does NOT inflate Auto column 0
+    Grid autoStarGrid;
+    autoStarGrid.AddColumnDefinition(GridUnitType::Auto);
+    autoStarGrid.AddColumnDefinition(GridUnitType::Star, 1.0f);
+    autoStarGrid.AddRowDefinition(GridUnitType::Auto);
+    autoStarGrid.AddRowDefinition(GridUnitType::Star, 1.0f);
+
+    auto wideHeader = MakeIntrusive<Border>();
+    wideHeader->SetWidth(700.0f);
+    wideHeader->SetHeight(40.0f);
+    Grid::SetRow(wideHeader.Get(), 0);
+    Grid::SetColumn(wideHeader.Get(), 0);
+    Grid::SetColumnSpan(wideHeader.Get(), 2);
+
+    auto narrowSidebar = MakeIntrusive<Border>();
+    narrowSidebar->SetWidth(160.0f);
+    narrowSidebar->SetHeight(200.0f);
+    Grid::SetRow(narrowSidebar.Get(), 1);
+    Grid::SetColumn(narrowSidebar.Get(), 0);
+
+    auto mainBody = MakeIntrusive<Border>();
+    Grid::SetRow(mainBody.Get(), 1);
+    Grid::SetColumn(mainBody.Get(), 1);
+
+    autoStarGrid.AddChild(wideHeader.Get());
+    autoStarGrid.AddChild(narrowSidebar.Get());
+    autoStarGrid.AddChild(mainBody.Get());
+    autoStarGrid.Measure(Size{1000.0f, 600.0f});
+    autoStarGrid.Arrange(Rect{0.0f, 0.0f, 1000.0f, 600.0f});
+
+    AERO_CHECK(std::fabs(narrowSidebar->FinalRect().width - 160.0f) < 1e-4f &&
+               std::fabs(mainBody->FinalRect().x - 160.0f) < 1e-4f &&
+               std::fabs(mainBody->FinalRect().width - 840.0f) < 1e-4f,
+               "ColumnSpan=2 header across (Auto, *) preserved 160px Auto sidebar and 840px Star column");
+
+    std::cout << "[PASS] TestCompilerBindingAndGridHardeningRegressions\n";
+}
+
 } // namespace aero::tests
 
 int main() {
@@ -1342,6 +1947,8 @@ int main() {
     TestDualTrackBindingEngineMultiHopAndEcsColumn();
     TestDepthBucketLayoutQueueAndCorePanels();
     TestParadigmSamplesAndSub5msHotReload();
-    std::cout << "=== ALL 7 PHASE 2 TEST SUITES PASSED (100%) ===\n";
+    TestSamplesMigrationCompletenessEndToEnd();
+    TestCompilerBindingAndGridHardeningRegressions();
+    std::cout << "=== ALL 9 PHASE 2 TEST SUITES PASSED (100%) ===\n";
     return 0;
 }

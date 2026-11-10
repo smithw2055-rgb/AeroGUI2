@@ -196,10 +196,12 @@ Grid::Grid() {
 
 void Grid::AddRowDefinition(GridUnitType unit, float value) {
     rows_.push_back(RowDefinition{unit, value, 0.0f, 0.0f});
+    InvalidateLayout();
 }
 
 void Grid::AddColumnDefinition(GridUnitType unit, float value) {
     cols_.push_back(ColumnDefinition{unit, value, 0.0f, 0.0f});
+    InvalidateLayout();
 }
 
 void Grid::SetRow(UIElement* element, std::int32_t row) {
@@ -230,6 +232,36 @@ std::int32_t Grid::GetColumn(const UIElement* element) noexcept {
         return static_cast<std::int32_t>(std::max<std::int64_t>(0, *i));
     }
     return 0;
+}
+
+void Grid::SetRowSpan(UIElement* element, std::int32_t span) {
+    if (element) {
+        element->SetValue(PropId_GridRowSpan, value::FromInt(std::max<std::int32_t>(1, span)), ValueSourceRank::Local);
+    }
+}
+
+std::int32_t Grid::GetRowSpan(const UIElement* element) noexcept {
+    if (!element) return 1;
+    const auto v = element->GetValue(PropId_GridRowSpan);
+    if (const auto* i = std::get_if<std::int64_t>(&v)) {
+        return static_cast<std::int32_t>(std::max<std::int64_t>(1, *i));
+    }
+    return 1;
+}
+
+void Grid::SetColumnSpan(UIElement* element, std::int32_t span) {
+    if (element) {
+        element->SetValue(PropId_GridColumnSpan, value::FromInt(std::max<std::int32_t>(1, span)), ValueSourceRank::Local);
+    }
+}
+
+std::int32_t Grid::GetColumnSpan(const UIElement* element) noexcept {
+    if (!element) return 1;
+    const auto v = element->GetValue(PropId_GridColumnSpan);
+    if (const auto* i = std::get_if<std::int64_t>(&v)) {
+        return static_cast<std::int32_t>(std::max<std::int64_t>(1, *i));
+    }
+    return 1;
 }
 
 Size Grid::MeasureCore(Size availableSize) noexcept {
@@ -263,19 +295,106 @@ Size Grid::MeasureCore(Size availableSize) noexcept {
         c.computedWidth = (c.unit == GridUnitType::Pixel) ? c.value : 0.0f;
     }
 
-    // Measure all children
+    // Pass 1: Measure all children and size single-span non-Pixel tracks
+    bool hasMultiSpan = false;
     for (UIElement* child = FirstChild(); child != nullptr; child = child->NextSibling()) {
         child->Measure(innerAvail);
         const std::size_t rIdx = std::min<std::size_t>(
             static_cast<std::size_t>(GetRow(child)), rowCount - 1);
         const std::size_t cIdx = std::min<std::size_t>(
             static_cast<std::size_t>(GetColumn(child)), colCount - 1);
+        const std::size_t rSpan = std::min<std::size_t>(
+            static_cast<std::size_t>(GetRowSpan(child)), rowCount - rIdx);
+        const std::size_t cSpan = std::min<std::size_t>(
+            static_cast<std::size_t>(GetColumnSpan(child)), colCount - cIdx);
         const Size d = child->DesiredSize();
-        if (workRows[rIdx].unit != GridUnitType::Pixel) {
-            workRows[rIdx].computedHeight = std::max(workRows[rIdx].computedHeight, d.height);
+        if (rSpan == 1u) {
+            if (workRows[rIdx].unit != GridUnitType::Pixel) {
+                workRows[rIdx].computedHeight = std::max(workRows[rIdx].computedHeight, d.height);
+            }
+        } else {
+            hasMultiSpan = true;
         }
-        if (workCols[cIdx].unit != GridUnitType::Pixel) {
-            workCols[cIdx].computedWidth = std::max(workCols[cIdx].computedWidth, d.width);
+        if (cSpan == 1u) {
+            if (workCols[cIdx].unit != GridUnitType::Pixel) {
+                workCols[cIdx].computedWidth = std::max(workCols[cIdx].computedWidth, d.width);
+            }
+        } else {
+            hasMultiSpan = true;
+        }
+    }
+
+    // Pass 2: Distribute any excess DesiredSize of multi-span children to Star tracks first,
+    // or Auto tracks only when no Star track participates in the span.
+    if (hasMultiSpan) {
+        for (UIElement* child = FirstChild(); child != nullptr; child = child->NextSibling()) {
+            const std::size_t rIdx = std::min<std::size_t>(
+                static_cast<std::size_t>(GetRow(child)), rowCount - 1);
+            const std::size_t cIdx = std::min<std::size_t>(
+                static_cast<std::size_t>(GetColumn(child)), colCount - 1);
+            const std::size_t rSpan = std::min<std::size_t>(
+                static_cast<std::size_t>(GetRowSpan(child)), rowCount - rIdx);
+            const std::size_t cSpan = std::min<std::size_t>(
+                static_cast<std::size_t>(GetColumnSpan(child)), colCount - cIdx);
+            const Size d = child->DesiredSize();
+
+            if (rSpan > 1u) {
+                float spanH = 0.0f;
+                float starWeight = 0.0f;
+                std::size_t autoTracks = 0;
+                for (std::size_t sr = 0; sr < rSpan; ++sr) {
+                    const auto& tr = workRows[rIdx + sr];
+                    spanH += tr.computedHeight;
+                    if (tr.unit == GridUnitType::Star) starWeight += std::max(0.0f, tr.value);
+                    else if (tr.unit == GridUnitType::Auto) ++autoTracks;
+                }
+                if (d.height > spanH) {
+                    const float excess = d.height - spanH;
+                    if (starWeight > 0.0f) {
+                        for (std::size_t sr = 0; sr < rSpan; ++sr) {
+                            auto& tr = workRows[rIdx + sr];
+                            if (tr.unit == GridUnitType::Star) {
+                                tr.computedHeight += excess * (std::max(0.0f, tr.value) / starWeight);
+                            }
+                        }
+                    } else if (autoTracks > 0u) {
+                        const float share = excess / static_cast<float>(autoTracks);
+                        for (std::size_t sr = 0; sr < rSpan; ++sr) {
+                            auto& tr = workRows[rIdx + sr];
+                            if (tr.unit == GridUnitType::Auto) tr.computedHeight += share;
+                        }
+                    }
+                }
+            }
+
+            if (cSpan > 1u) {
+                float spanW = 0.0f;
+                float starWeight = 0.0f;
+                std::size_t autoTracks = 0;
+                for (std::size_t sc = 0; sc < cSpan; ++sc) {
+                    const auto& tc = workCols[cIdx + sc];
+                    spanW += tc.computedWidth;
+                    if (tc.unit == GridUnitType::Star) starWeight += std::max(0.0f, tc.value);
+                    else if (tc.unit == GridUnitType::Auto) ++autoTracks;
+                }
+                if (d.width > spanW) {
+                    const float excess = d.width - spanW;
+                    if (starWeight > 0.0f) {
+                        for (std::size_t sc = 0; sc < cSpan; ++sc) {
+                            auto& tc = workCols[cIdx + sc];
+                            if (tc.unit == GridUnitType::Star) {
+                                tc.computedWidth += excess * (std::max(0.0f, tc.value) / starWeight);
+                            }
+                        }
+                    } else if (autoTracks > 0u) {
+                        const float share = excess / static_cast<float>(autoTracks);
+                        for (std::size_t sc = 0; sc < cSpan; ++sc) {
+                            auto& tc = workCols[cIdx + sc];
+                            if (tc.unit == GridUnitType::Auto) tc.computedWidth += share;
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -334,17 +453,83 @@ void Grid::ArrangeCore(Rect finalRect) noexcept {
         }
     }
 
+    bool hasMultiSpan = false;
     for (UIElement* child = FirstChild(); child != nullptr; child = child->NextSibling()) {
         const std::size_t rIdx = std::min<std::size_t>(
             static_cast<std::size_t>(GetRow(child)), workRows.size() - 1);
         const std::size_t cIdx = std::min<std::size_t>(
             static_cast<std::size_t>(GetColumn(child)), workCols.size() - 1);
+        const std::size_t rSpan = std::min<std::size_t>(
+            static_cast<std::size_t>(GetRowSpan(child)), workRows.size() - rIdx);
+        const std::size_t cSpan = std::min<std::size_t>(
+            static_cast<std::size_t>(GetColumnSpan(child)), workCols.size() - cIdx);
         const Size d = child->DesiredSize();
-        if (workRows[rIdx].unit == GridUnitType::Auto) {
-            workRows[rIdx].computedHeight = std::max(workRows[rIdx].computedHeight, d.height);
+        if (rSpan == 1u) {
+            if (workRows[rIdx].unit == GridUnitType::Auto) {
+                workRows[rIdx].computedHeight = std::max(workRows[rIdx].computedHeight, d.height);
+            }
+        } else {
+            hasMultiSpan = true;
         }
-        if (workCols[cIdx].unit == GridUnitType::Auto) {
-            workCols[cIdx].computedWidth = std::max(workCols[cIdx].computedWidth, d.width);
+        if (cSpan == 1u) {
+            if (workCols[cIdx].unit == GridUnitType::Auto) {
+                workCols[cIdx].computedWidth = std::max(workCols[cIdx].computedWidth, d.width);
+            }
+        } else {
+            hasMultiSpan = true;
+        }
+    }
+
+    // Multi-span Auto inflation only applies when NO Star track participates in the span
+    if (hasMultiSpan) {
+        for (UIElement* child = FirstChild(); child != nullptr; child = child->NextSibling()) {
+            const std::size_t rIdx = std::min<std::size_t>(
+                static_cast<std::size_t>(GetRow(child)), workRows.size() - 1);
+            const std::size_t cIdx = std::min<std::size_t>(
+                static_cast<std::size_t>(GetColumn(child)), workCols.size() - 1);
+            const std::size_t rSpan = std::min<std::size_t>(
+                static_cast<std::size_t>(GetRowSpan(child)), workRows.size() - rIdx);
+            const std::size_t cSpan = std::min<std::size_t>(
+                static_cast<std::size_t>(GetColumnSpan(child)), workCols.size() - cIdx);
+            const Size d = child->DesiredSize();
+
+            if (rSpan > 1u) {
+                float spanH = 0.0f;
+                bool hasStar = false;
+                std::size_t autoTracks = 0;
+                for (std::size_t sr = 0; sr < rSpan; ++sr) {
+                    const auto& tr = workRows[rIdx + sr];
+                    spanH += tr.computedHeight;
+                    if (tr.unit == GridUnitType::Star) hasStar = true;
+                    else if (tr.unit == GridUnitType::Auto) ++autoTracks;
+                }
+                if (!hasStar && autoTracks > 0u && d.height > spanH) {
+                    const float share = (d.height - spanH) / static_cast<float>(autoTracks);
+                    for (std::size_t sr = 0; sr < rSpan; ++sr) {
+                        auto& tr = workRows[rIdx + sr];
+                        if (tr.unit == GridUnitType::Auto) tr.computedHeight += share;
+                    }
+                }
+            }
+
+            if (cSpan > 1u) {
+                float spanW = 0.0f;
+                bool hasStar = false;
+                std::size_t autoTracks = 0;
+                for (std::size_t sc = 0; sc < cSpan; ++sc) {
+                    const auto& tc = workCols[cIdx + sc];
+                    spanW += tc.computedWidth;
+                    if (tc.unit == GridUnitType::Star) hasStar = true;
+                    else if (tc.unit == GridUnitType::Auto) ++autoTracks;
+                }
+                if (!hasStar && autoTracks > 0u && d.width > spanW) {
+                    const float share = (d.width - spanW) / static_cast<float>(autoTracks);
+                    for (std::size_t sc = 0; sc < cSpan; ++sc) {
+                        auto& tc = workCols[cIdx + sc];
+                        if (tc.unit == GridUnitType::Auto) tc.computedWidth += share;
+                    }
+                }
+            }
         }
     }
 
@@ -381,11 +566,23 @@ void Grid::ArrangeCore(Rect finalRect) noexcept {
             static_cast<std::size_t>(GetRow(child)), workRows.size() - 1);
         const std::size_t cIdx = std::min<std::size_t>(
             static_cast<std::size_t>(GetColumn(child)), workCols.size() - 1);
+        const std::size_t rSpan = std::min<std::size_t>(
+            static_cast<std::size_t>(GetRowSpan(child)), workRows.size() - rIdx);
+        const std::size_t cSpan = std::min<std::size_t>(
+            static_cast<std::size_t>(GetColumnSpan(child)), workCols.size() - cIdx);
+        float spanW = 0.0f;
+        for (std::size_t sc = 0; sc < cSpan; ++sc) {
+            spanW += workCols[cIdx + sc].computedWidth;
+        }
+        float spanH = 0.0f;
+        for (std::size_t sr = 0; sr < rSpan; ++sr) {
+            spanH += workRows[rIdx + sr].computedHeight;
+        }
         child->Arrange(Rect{
             workCols[cIdx].offsetX,
             workRows[rIdx].offsetY,
-            workCols[cIdx].computedWidth,
-            workRows[rIdx].computedHeight});
+            spanW,
+            spanH});
     }
 }
 
@@ -552,7 +749,13 @@ Size TextBlock::MeasureCore(Size availableSize) noexcept {
     (void)availableSize;
     const Thickness p = GetPadding();
     const float fontSize = GetFontSize();
-    const std::string text = GetText();
+    std::string text = GetText();
+    if (text.empty()) {
+        const auto ph = GetValue(PropId_Placeholder);
+        if (const auto* s = std::get_if<StringValue>(&ph)) {
+            text = s->str();
+        }
+    }
     const std::size_t codePoints = rs_rt::utf8CodePointLength(text);
     const float advancePerCodePoint = fontSize * 0.6f;
     const float textW = static_cast<float>(codePoints) * advancePerCodePoint;
@@ -684,6 +887,15 @@ AxbTemplateRegistry& AxbTemplateRegistry::Instance() noexcept {
 }
 
 void AxbTemplateRegistry::Register(std::string className, AxbPackage package) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    for (const auto& kv : package.resources) {
+        if (!kv.first.empty()) {
+            resources_[kv.first] = kv.second;
+        }
+    }
+    if (className.empty()) {
+        return;
+    }
     const std::string shortName(StripNamespacePrefix(className));
     templates_[className] = package;
     if (shortName != className) {
@@ -691,7 +903,33 @@ void AxbTemplateRegistry::Register(std::string className, AxbPackage package) {
     }
 }
 
+void AxbTemplateRegistry::RegisterResources(const AxbPackage& package) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    for (const auto& kv : package.resources) {
+        if (!kv.first.empty()) {
+            resources_[kv.first] = kv.second;
+        }
+    }
+}
+
+void AxbTemplateRegistry::RegisterResource(std::string key, UnifiedValue value) {
+    if (!key.empty()) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        resources_[std::move(key)] = std::move(value);
+    }
+}
+
+const UnifiedValue* AxbTemplateRegistry::FindResource(std::string_view key) const noexcept {
+    std::lock_guard<std::mutex> lock(mutex_);
+    const auto it = resources_.find(std::string(key));
+    if (it != resources_.end()) {
+        return &it->second;
+    }
+    return nullptr;
+}
+
 const AxbPackage* AxbTemplateRegistry::Find(std::string_view className) const noexcept {
+    std::lock_guard<std::mutex> lock(mutex_);
     auto it = templates_.find(std::string(className));
     if (it != templates_.end()) {
         return &it->second;
@@ -713,11 +951,18 @@ UserControl::UserControl(
     ExecutionDomainContext* domains,
     DualTrackBindingEngine* bindingEngine,
     ObjectRef dataContext,
-    const Interpreter* eventInterpreter)
+    const Interpreter* eventInterpreter,
+    rs_aot::ExecutionContext* eventAotContext)
     : controlClassName_(className) {
     EnsureControlTypesRegistered();
     if (const AxbPackage* pkg = AxbTemplateRegistry::Instance().Find(className)) {
-        templateMounted_ = MountTemplate(*pkg, domains, bindingEngine, dataContext, eventInterpreter);
+        templateMounted_ = MountTemplate(
+            *pkg,
+            domains,
+            bindingEngine,
+            dataContext,
+            eventInterpreter,
+            eventAotContext);
     }
 }
 
@@ -726,14 +971,16 @@ bool UserControl::MountTemplate(
     ExecutionDomainContext* domains,
     DualTrackBindingEngine* bindingEngine,
     ObjectRef dataContext,
-    const Interpreter* eventInterpreter) {
+    const Interpreter* eventInterpreter,
+    rs_aot::ExecutionContext* eventAotContext) {
     templateMounted_ = MountAxbTemplate(
         this,
         package,
         domains,
         bindingEngine,
         dataContext,
-        eventInterpreter);
+        eventInterpreter,
+        eventAotContext);
     return templateMounted_;
 }
 
@@ -742,11 +989,18 @@ Window::Window(
     ExecutionDomainContext* domains,
     DualTrackBindingEngine* bindingEngine,
     ObjectRef dataContext,
-    const Interpreter* eventInterpreter)
+    const Interpreter* eventInterpreter,
+    rs_aot::ExecutionContext* eventAotContext)
     : windowClassName_(className) {
     EnsureControlTypesRegistered();
     if (const AxbPackage* pkg = AxbTemplateRegistry::Instance().Find(className)) {
-        templateMounted_ = MountTemplate(*pkg, domains, bindingEngine, dataContext, eventInterpreter);
+        templateMounted_ = MountTemplate(
+            *pkg,
+            domains,
+            bindingEngine,
+            dataContext,
+            eventInterpreter,
+            eventAotContext);
     }
 }
 
@@ -755,14 +1009,16 @@ bool Window::MountTemplate(
     ExecutionDomainContext* domains,
     DualTrackBindingEngine* bindingEngine,
     ObjectRef dataContext,
-    const Interpreter* eventInterpreter) {
+    const Interpreter* eventInterpreter,
+    rs_aot::ExecutionContext* eventAotContext) {
     templateMounted_ = MountAxbTemplate(
         this,
         package,
         domains,
         bindingEngine,
         dataContext,
-        eventInterpreter);
+        eventInterpreter,
+        eventAotContext);
     return templateMounted_;
 }
 
@@ -770,15 +1026,48 @@ IntrusivePtr<UIElement> CreateElementByTypeName(std::string_view typeName) {
     EnsureControlTypesRegistered();
     const std::string_view shortName = StripNamespacePrefix(typeName);
     if (shortName == "Window") return MakeIntrusive<Window>();
-    if (shortName == "Panel") return MakeIntrusive<Panel>();
-    if (shortName == "StackPanel") return MakeIntrusive<StackPanel>();
-    if (shortName == "Grid") return MakeIntrusive<Grid>();
+    if (shortName == "Panel" || shortName == "ResourceDictionary") return MakeIntrusive<Panel>();
+    if (shortName == "StackPanel" || shortName == "WrapPanel" ||
+        shortName == "HeaderedContentControl" || shortName == "GroupBox" ||
+        shortName == "Expander" || shortName == "ToolBar" ||
+        shortName == "StatusBar" || shortName == "Menu" ||
+        shortName == "ContextMenu" || shortName == "TabControl" ||
+        shortName == "TabItem") {
+        return MakeIntrusive<StackPanel>();
+    }
+    if (shortName == "Grid" || shortName == "UniformGrid" || shortName == "DockPanel") {
+        return MakeIntrusive<Grid>();
+    }
     if (shortName == "Canvas") return MakeIntrusive<Canvas>();
-    if (shortName == "Border") return MakeIntrusive<Border>();
-    if (shortName == "TextBlock") return MakeIntrusive<TextBlock>();
-    if (shortName == "Button") return MakeIntrusive<Button>();
-    if (shortName == "ItemsControl") return MakeIntrusive<ItemsControl>();
-    if (shortName == "UserControl") return MakeIntrusive<UserControl>();
+    if (shortName == "Border" || shortName == "Viewbox" || shortName == "ScrollViewer" ||
+        shortName == "ContentControl" || shortName == "ContentPresenter" ||
+        shortName == "Rectangle" || shortName == "Ellipse" || shortName == "Path" ||
+        shortName == "Line" || shortName == "Polygon" || shortName == "Polyline" ||
+        shortName == "Image" || shortName == "RiveControl" || shortName == "BoxShadow" ||
+        shortName == "Slider" || shortName == "ProgressBar" ||
+        shortName == "ComboBoxItem" || shortName == "ListBoxItem" ||
+        shortName == "ListViewItem" || shortName == "TreeViewItem") {
+        return MakeIntrusive<Border>();
+    }
+    if (shortName == "TextBlock" || shortName == "Label" ||
+        shortName == "TextBox" || shortName == "PasswordBox" ||
+        shortName == "RichTextBox") {
+        return MakeIntrusive<TextBlock>();
+    }
+    if (shortName == "Button" || shortName == "RepeatButton" ||
+        shortName == "ToggleButton" || shortName == "CheckBox" ||
+        shortName == "RadioButton" || shortName == "Hyperlink" ||
+        shortName == "MenuItem") {
+        return MakeIntrusive<Button>();
+    }
+    if (shortName == "ItemsControl" || shortName == "ComboBox" ||
+        shortName == "ListBox" || shortName == "ListView" ||
+        shortName == "TreeView" || shortName == "ItemsPresenter") {
+        return MakeIntrusive<ItemsControl>();
+    }
+    if (shortName == "UserControl" || shortName == "Page") {
+        return MakeIntrusive<UserControl>();
+    }
     if (AxbTemplateRegistry::Instance().Find(typeName) != nullptr) {
         return MakeIntrusive<UserControl>(typeName);
     }
@@ -791,7 +1080,8 @@ bool MountAxbTemplate(
     ExecutionDomainContext* domains,
     DualTrackBindingEngine* bindingEngine,
     ObjectRef dataContext,
-    const Interpreter* eventInterpreter) {
+    const Interpreter* eventInterpreter,
+    rs_aot::ExecutionContext* eventAotContext) {
     if (!rootControl) {
         return false;
     }
@@ -814,16 +1104,31 @@ bool MountAxbTemplate(
                 if (!rootVisited) {
                     rootVisited = true;
                     currentElem = rootControl;
+                    const ObjectRef wrapperObj = rootControl->BoundScriptWrapper().valid()
+                        ? rootControl->BoundScriptWrapper()
+                        : effectiveContext;
+                    if (domains && registry && wrapperObj.valid() &&
+                        package.rootHandleFieldIndex != PropertySlotHandle::InvalidIndex) {
+                        const auto rootH = rootControl->ToNativeHandle(*registry);
+                        (void)domains->writeObjectField(
+                            DomainKind::Ui,
+                            wrapperObj,
+                            package.rootHandleFieldIndex,
+                            rootH,
+                            nullptr);
+                    }
                 } else {
                     IntrusivePtr<UIElement> createdChild;
                     if (AxbTemplateRegistry::Instance().Find(typeName) != nullptr &&
-                        StripNamespacePrefix(typeName) != "UserControl") {
+                        StripNamespacePrefix(typeName) != "UserControl" &&
+                        StripNamespacePrefix(typeName) != "Page") {
                         createdChild = MakeIntrusive<UserControl>(
                             typeName,
                             domains,
                             bindingEngine,
                             effectiveContext,
-                            eventInterpreter);
+                            eventInterpreter,
+                            eventAotContext);
                     } else {
                         createdChild = CreateElementByTypeName(typeName);
                     }
@@ -910,9 +1215,18 @@ bool MountAxbTemplate(
                 if (!elementStack.empty() && elementStack.back() && bindingEngine) {
                     const std::string_view compName = package.GetString(inst.strIdx0);
                     const std::string_view fieldName = package.GetString(inst.strIdx1);
+                    auto resolveCanonicalTypeId = [](std::string_view raw) -> SymbolId {
+                        std::string canonical(raw);
+                        if (canonical.find("::") == std::string::npos) {
+                            if (const std::size_t lastDot = canonical.rfind('.'); lastDot != std::string::npos) {
+                                canonical.replace(lastDot, 1, "::");
+                            }
+                        }
+                        return rs_sem::stableTypeId(canonical);
+                    };
                     const SymbolId compId = (inst.symbolId != 0)
                         ? inst.symbolId
-                        : rs_sem::stableTypeId(std::string(compName));
+                        : resolveCanonicalTypeId(compName);
                     IntrusivePtr<UIElement> targetPtr(elementStack.back(), true);
                     (void)bindingEngine->BindEcsColumn(
                         compId,
@@ -930,12 +1244,61 @@ bool MountAxbTemplate(
                         const ObjectRef targetObj = rootControl->BoundScriptWrapper().valid()
                             ? rootControl->BoundScriptWrapper()
                             : effectiveContext;
-                        if (eventInterpreter && targetObj.valid() && inst.symbolId != 0) {
-                            btn->BindScriptClickHandler(
-                                eventInterpreter,
-                                targetObj,
-                                inst.symbolId);
+                        if (targetObj.valid() && inst.symbolId != 0) {
+                            if (eventInterpreter) {
+                                btn->BindScriptClickHandler(
+                                    eventInterpreter,
+                                    targetObj,
+                                    inst.symbolId);
+                            } else if (eventAotContext) {
+                                btn->BindAotClickHandler(
+                                    eventAotContext,
+                                    targetObj,
+                                    inst.symbolId);
+                            }
                         }
+                    }
+                }
+                break;
+            }
+
+            case AxbOpcode::AddRowDefinition: {
+                if (!elementStack.empty() && elementStack.back()) {
+                    if (auto* grid = elementStack.back()->DynamicCast<Grid>()) {
+                        const float val = value::TryGetFloat(inst.literalValue).value_or(1.0f);
+                        grid->AddRowDefinition(static_cast<GridUnitType>(inst.flags), val);
+                    }
+                }
+                break;
+            }
+
+            case AxbOpcode::AddColumnDefinition: {
+                if (!elementStack.empty() && elementStack.back()) {
+                    if (auto* grid = elementStack.back()->DynamicCast<Grid>()) {
+                        const float val = value::TryGetFloat(inst.literalValue).value_or(1.0f);
+                        grid->AddColumnDefinition(static_cast<GridUnitType>(inst.flags), val);
+                    }
+                }
+                break;
+            }
+
+            case AxbOpcode::SetResourceProperty: {
+                if (!elementStack.empty() && elementStack.back()) {
+                    const std::string_view key = package.GetString(inst.strIdx0);
+                    const UnifiedValue* resolved = nullptr;
+                    for (auto it = package.resources.rbegin(); it != package.resources.rend(); ++it) {
+                        if (it->first == key) {
+                            resolved = &it->second;
+                            break;
+                        }
+                    }
+                    if (!resolved) {
+                        resolved = AxbTemplateRegistry::Instance().FindResource(key);
+                    }
+                    if (resolved) {
+                        elementStack.back()->SetValue(inst.propId, *resolved, ValueSourceRank::Local);
+                    } else if (!std::holds_alternative<std::monostate>(inst.literalValue)) {
+                        elementStack.back()->SetValue(inst.propId, inst.literalValue, ValueSourceRank::Local);
                     }
                 }
                 break;

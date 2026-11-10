@@ -13,6 +13,48 @@ DualTrackBindingEngine::DualTrackBindingEngine(
       program_(program),
       uiInterpreter_(uiInterpreter) {}
 
+DualTrackBindingEngine::~DualTrackBindingEngine() noexcept {
+    for (auto& binding : trackABindings_) {
+        if (binding.mode == BindingMode::OneTime) {
+            continue;
+        }
+        for (auto& hopRef : binding.resolvedHopObjects) {
+            if (hopRef.valid()) {
+                if (auto* heap = domains_.heapForObject(hopRef)) {
+                    heap->removeUiObserver(hopRef);
+                }
+                hopRef = ObjectRef{};
+            }
+        }
+    }
+}
+
+void DualTrackBindingEngine::ApplyFallbackOrClear(ReactiveBindingInstance& binding) const {
+    if (!binding.targetElement) {
+        return;
+    }
+    std::uint16_t animTrack = 0xFFFFu;
+    if (binding.targetPropertyId >= PropId_FirstSparse) {
+        if (const auto* entry = binding.targetElement->FindCompactEntry(binding.targetPropertyId)) {
+            animTrack = entry->animationTrackId;
+        }
+    }
+    if (!std::holds_alternative<std::monostate>(binding.fallbackValue)) {
+        binding.targetElement->SetValue(
+            binding.targetPropertyId,
+            binding.fallbackValue,
+            ValueSourceRank::Local);
+        if (binding.targetPropertyId >= PropId_FirstSparse) {
+            binding.targetElement->SetPropertyMetadata(
+                binding.targetPropertyId,
+                binding.bindingSlotId,
+                animTrack);
+        }
+    } else {
+        binding.targetElement->ClearValue(binding.targetPropertyId);
+    }
+}
+
 bool DualTrackBindingEngine::EvaluateAndSyncChain(
     ReactiveBindingInstance& binding,
     std::size_t startHopIndex,
@@ -32,13 +74,38 @@ bool DualTrackBindingEngine::EvaluateAndSyncChain(
         return false;
     }
 
+    auto unbindHopRange = [&](std::size_t fromHop) {
+        for (std::size_t clearIdx = fromHop; clearIdx < binding.resolvedHopObjects.size(); ++clearIdx) {
+            const ObjectRef oldRef = binding.resolvedHopObjects[clearIdx];
+            if (oldRef.valid()) {
+                if (binding.mode != BindingMode::OneTime) {
+                    if (auto* oldHeap = domains_.heapForObject(oldRef)) {
+                        oldHeap->removeUiObserver(oldRef);
+                    }
+                }
+                binding.resolvedHopObjects[clearIdx] = ObjectRef{};
+            }
+        }
+    };
+
     for (std::size_t h = startHopIndex; h < binding.hops.size(); ++h) {
         auto* heap = domains_.heapForObject(currentObj);
         if (!heap || !heap->isAlive(currentObj)) {
+            unbindHopRange(h);
+            ApplyFallbackOrClear(binding);
             return false;
         }
-        binding.resolvedHopObjects[h] = currentObj;
-        heap->addUiObserver(currentObj);
+        if (!(binding.resolvedHopObjects[h] == currentObj)) {
+            if (binding.resolvedHopObjects[h].valid() && binding.mode != BindingMode::OneTime) {
+                if (auto* oldHeap = domains_.heapForObject(binding.resolvedHopObjects[h])) {
+                    oldHeap->removeUiObserver(binding.resolvedHopObjects[h]);
+                }
+            }
+            binding.resolvedHopObjects[h] = currentObj;
+            if (binding.mode != BindingMode::OneTime) {
+                heap->addUiObserver(currentObj);
+            }
+        }
 
         auto& hop = binding.hops[h];
         const SymbolId runtimeTypeId = heap->objectTypeId(currentObj).value_or(0);
@@ -69,6 +136,7 @@ bool DualTrackBindingEngine::EvaluateAndSyncChain(
                     hopVal,
                     error,
                     uiInterpreter_)) {
+                unbindHopRange(h + 1);
                 return false;
             }
         } else if (hop.fieldIndex != PropertySlotHandle::InvalidIndex) {
@@ -78,26 +146,26 @@ bool DualTrackBindingEngine::EvaluateAndSyncChain(
                     hop.fieldIndex,
                     hopVal,
                     error)) {
+                unbindHopRange(h + 1);
                 return false;
             }
         } else {
+            unbindHopRange(h + 1);
             return false;
         }
 
         if (h + 1 < binding.hops.size()) {
             const auto* nextRef = std::get_if<ObjectRef>(&hopVal);
             if (!nextRef || !nextRef->valid()) {
-                for (std::size_t clearIdx = h + 1; clearIdx < binding.hops.size(); ++clearIdx) {
-                    binding.resolvedHopObjects[clearIdx] = ObjectRef{};
-                }
-                binding.targetElement->ClearValue(binding.targetPropertyId);
+                unbindHopRange(h + 1);
+                ApplyFallbackOrClear(binding);
                 binding.initialized = true;
                 return true;
             }
             currentObj = *nextRef;
         } else {
             if (std::holds_alternative<NullObject>(hopVal)) {
-                binding.targetElement->ClearValue(binding.targetPropertyId);
+                ApplyFallbackOrClear(binding);
                 binding.initialized = true;
                 return true;
             }
@@ -112,6 +180,16 @@ bool DualTrackBindingEngine::EvaluateAndSyncChain(
                 binding.targetPropertyId,
                 hopVal,
                 ValueSourceRank::Local);
+            if (binding.targetPropertyId >= PropId_FirstSparse) {
+                const auto* entry = binding.targetElement->FindCompactEntry(binding.targetPropertyId);
+                if (!entry || entry->bindingSlotId == 0xFFFFu) {
+                    const std::uint16_t animTrack = entry ? entry->animationTrackId : 0xFFFFu;
+                    binding.targetElement->SetPropertyMetadata(
+                        binding.targetPropertyId,
+                        binding.bindingSlotId,
+                        animTrack);
+                }
+            }
             binding.initialized = true;
         }
     }
@@ -138,6 +216,7 @@ std::uint16_t DualTrackBindingEngine::BindChain(
     instance.rawPath = compiledChain.rawPath;
     instance.mode = compiledChain.mode;
     instance.rootObject = rootObject;
+    instance.fallbackValue = compiledChain.fallbackValue;
     instance.hops = compiledChain.hops;
     instance.resolvedHopObjects.assign(compiledChain.hops.size(), ObjectRef{});
     instance.targetElement = targetElement;
@@ -229,6 +308,50 @@ std::size_t DualTrackBindingEngine::FlushTrackA(RuntimeError* error) {
 
     processHeap(domains_.simHeap());
     processHeap(domains_.uiHeap());
+
+    // Only scan active bindings for GC-reclaimed objects when a GC cycle actually occurred,
+    // preserving O(1) cost on clean frames while guaranteeing automatic fallback on object death.
+    const auto& simStats = domains_.simHeap().statistics();
+    const auto& uiStats = domains_.uiHeap().statistics();
+    const std::uint64_t gcEpoch =
+        simStats.objectsReclaimed + simStats.collectionsCompleted + simStats.youngCollections +
+        uiStats.objectsReclaimed + uiStats.collectionsCompleted + uiStats.youngCollections;
+
+    if (gcEpoch != lastObservedGcEpoch_) {
+        lastObservedGcEpoch_ = gcEpoch;
+        for (auto& binding : trackABindings_) {
+            if (!binding.initialized || !binding.targetElement ||
+                binding.mode == BindingMode::OneTime) {
+                continue;
+            }
+            bool anyDead = false;
+            for (std::size_t h = 0; h < binding.resolvedHopObjects.size(); ++h) {
+                const ObjectRef ref = binding.resolvedHopObjects[h];
+                if (!ref.valid()) {
+                    continue;
+                }
+                auto* heap = domains_.heapForObject(ref);
+                if (!heap || !heap->isAlive(ref)) {
+                    anyDead = true;
+                    for (std::size_t clearIdx = h; clearIdx < binding.resolvedHopObjects.size(); ++clearIdx) {
+                        const ObjectRef oldRef = binding.resolvedHopObjects[clearIdx];
+                        if (oldRef.valid()) {
+                            if (auto* oldHeap = domains_.heapForObject(oldRef)) {
+                                oldHeap->removeUiObserver(oldRef);
+                            }
+                            binding.resolvedHopObjects[clearIdx] = ObjectRef{};
+                        }
+                    }
+                    break;
+                }
+            }
+            if (anyDead) {
+                ApplyFallbackOrClear(binding);
+                ++updatedCount;
+            }
+        }
+    }
+
     return updatedCount;
 }
 
@@ -290,6 +413,7 @@ std::size_t DualTrackBindingEngine::ApplyHotReloadMigration(
     const std::vector<HotReloadMigrationPair>& migratedRefs,
     RuntimeError* error) {
     program_ = &newProgram;
+    domains_.registerProgramObservableMetadata(newProgram);
     std::size_t migratedCount = 0;
 
     auto mapObjectRef = [&](ObjectRef& ref) -> bool {
@@ -304,9 +428,22 @@ std::size_t DualTrackBindingEngine::ApplyHotReloadMigration(
 
     for (auto& binding : trackABindings_) {
         bool touched = mapObjectRef(binding.rootObject);
+        // Unbind old hop observers and clear resolvedHopObjects BEFORE EvaluateAndSyncChain
+        // so migrated newRef instances properly acquire addUiObserver() and oldRefs release theirs.
         for (auto& hopObj : binding.resolvedHopObjects) {
-            if (mapObjectRef(hopObj)) {
-                touched = true;
+            if (hopObj.valid()) {
+                for (const auto& pair : migratedRefs) {
+                    if (hopObj == pair.oldRef) {
+                        touched = true;
+                        break;
+                    }
+                }
+                if (binding.mode != BindingMode::OneTime) {
+                    if (auto* oldHeap = domains_.heapForObject(hopObj)) {
+                        oldHeap->removeUiObserver(hopObj);
+                    }
+                }
+                hopObj = ObjectRef{};
             }
         }
         // Force re-resolution of all hops against newProgram
@@ -321,7 +458,95 @@ std::size_t DualTrackBindingEngine::ApplyHotReloadMigration(
     return migratedCount;
 }
 
+const NativeRawColumnView* DualTrackBindingEngine::ResolveChannelView(
+    const EcsColumnBindingChannel& ch) const noexcept {
+    if (ch.columnArrayRef.valid()) {
+        if (const auto* heap = domains_.heapForObject(ch.columnArrayRef)) {
+            if (const auto* v = heap->rawColumnView(ch.columnArrayRef)) {
+                return v;
+            }
+        }
+    }
+    if (ch.rawView.basePtr != nullptr) {
+        return &ch.rawView;
+    }
+    return nullptr;
+}
+
 std::size_t DualTrackBindingEngine::BindEcsColumn(EcsColumnBindingChannel channel) {
+    if (channel.componentTypeId == 0 && !channel.componentTypeName.empty()) {
+        std::string canonical = channel.componentTypeName;
+        if (canonical.find("::") == std::string::npos) {
+            if (const std::size_t lastDot = canonical.rfind('.'); lastDot != std::string::npos) {
+                canonical.replace(lastDot, 1, "::");
+            }
+        }
+        channel.componentTypeId = rs_sem::stableTypeId(canonical);
+    }
+
+    const bool incomingHasDataView =
+        channel.columnArrayRef.valid() || (channel.rawView.basePtr != nullptr);
+
+    auto mergeIntoExisting = [&](EcsColumnBindingChannel& existing) {
+        if (channel.columnArrayRef.valid()) existing.columnArrayRef = channel.columnArrayRef;
+        if (channel.rawView.basePtr) existing.rawView = channel.rawView;
+        if (channel.elementStride != 0) existing.elementStride = channel.elementStride;
+        if (incomingHasDataView || channel.fieldByteOffset != 0) {
+            existing.fieldByteOffset = channel.fieldByteOffset;
+        }
+        if (incomingHasDataView || channel.scalarKind != EcsFieldScalarKind::Float32) {
+            existing.scalarKind = channel.scalarKind;
+        }
+        if (incomingHasDataView || channel.scaleFactor != 1.0f) {
+            existing.scaleFactor = channel.scaleFactor;
+        }
+        if (!channel.componentTypeName.empty()) existing.componentTypeName = channel.componentTypeName;
+        if (!channel.fieldName.empty()) existing.fieldName = channel.fieldName;
+        if (!channel.targetElements.empty()) {
+            if (existing.targetElements.size() < channel.targetElements.size()) {
+                existing.targetElements.resize(channel.targetElements.size());
+            }
+            for (std::size_t r = 0; r < channel.targetElements.size(); ++r) {
+                if (channel.targetElements[r]) {
+                    existing.targetElements[r] = channel.targetElements[r];
+                }
+            }
+        }
+    };
+
+    if (channel.componentTypeId != 0) {
+        // Pass 1: exact fieldName match (or both unnamed with identical fieldByteOffset)
+        for (std::size_t i = 0; i < trackBChannels_.size(); ++i) {
+            auto& existing = trackBChannels_[i];
+            if (existing.componentTypeId != channel.componentTypeId ||
+                existing.targetPropertyId != channel.targetPropertyId) {
+                continue;
+            }
+            if ((!existing.fieldName.empty() && existing.fieldName == channel.fieldName) ||
+                (existing.fieldName.empty() && channel.fieldName.empty() &&
+                 existing.fieldByteOffset == channel.fieldByteOffset)) {
+                mergeIntoExisting(existing);
+                return i;
+            }
+        }
+        // Pass 2: pair an unnamed data-view registration with a XAML target-element placeholder
+        // ONLY when one side has no data view yet (prevents colliding distinct fields on same component).
+        for (std::size_t i = 0; i < trackBChannels_.size(); ++i) {
+            auto& existing = trackBChannels_[i];
+            if (existing.componentTypeId != channel.componentTypeId ||
+                existing.targetPropertyId != channel.targetPropertyId) {
+                continue;
+            }
+            const bool existingHasDataView =
+                existing.columnArrayRef.valid() || (existing.rawView.basePtr != nullptr);
+            if ((existing.fieldName.empty() || channel.fieldName.empty()) &&
+                (existingHasDataView != incomingHasDataView)) {
+                mergeIntoExisting(existing);
+                return i;
+            }
+        }
+    }
+
     const std::size_t idx = trackBChannels_.size();
     trackBChannels_.push_back(std::move(channel));
     return idx;
@@ -333,10 +558,12 @@ std::size_t DualTrackBindingEngine::BindEcsColumn(
     std::size_t rowIndex,
     const IntrusivePtr<UIElement>& targetElement,
     std::uint16_t targetPropertyId) {
-    (void)fieldName;
+    // Pass 1: exact fieldName match
     for (std::size_t i = 0; i < trackBChannels_.size(); ++i) {
         auto& ch = trackBChannels_[i];
-        if (ch.componentTypeId == componentTypeId && ch.targetPropertyId == targetPropertyId) {
+        if (ch.componentTypeId == componentTypeId &&
+            ch.targetPropertyId == targetPropertyId &&
+            ch.fieldName == fieldName) {
             if (rowIndex >= ch.targetElements.size()) {
                 ch.targetElements.resize(rowIndex + 1);
             }
@@ -344,9 +571,33 @@ std::size_t DualTrackBindingEngine::BindEcsColumn(
             return i;
         }
     }
+    // Pass 2: attach to an unnamed C++ data-view channel only when unambiguous (single unnamed match)
+    std::size_t unnamedMatchIdx = trackBChannels_.size();
+    std::size_t unnamedMatchCount = 0;
+    for (std::size_t i = 0; i < trackBChannels_.size(); ++i) {
+        const auto& ch = trackBChannels_[i];
+        if (ch.componentTypeId == componentTypeId &&
+            ch.targetPropertyId == targetPropertyId &&
+            (ch.fieldName.empty() || fieldName.empty())) {
+            unnamedMatchIdx = i;
+            ++unnamedMatchCount;
+        }
+    }
+    if (unnamedMatchCount == 1u) {
+        auto& ch = trackBChannels_[unnamedMatchIdx];
+        if (ch.fieldName.empty() && !fieldName.empty()) {
+            ch.fieldName = std::string(fieldName);
+        }
+        if (rowIndex >= ch.targetElements.size()) {
+            ch.targetElements.resize(rowIndex + 1);
+        }
+        ch.targetElements[rowIndex] = targetElement;
+        return unnamedMatchIdx;
+    }
 
     EcsColumnBindingChannel channel{};
     channel.componentTypeId = componentTypeId;
+    channel.fieldName = std::string(fieldName);
     channel.targetPropertyId = targetPropertyId;
     channel.targetElements.resize(rowIndex + 1);
     channel.targetElements[rowIndex] = targetElement;

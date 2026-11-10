@@ -18,6 +18,7 @@ struct ReactiveBindingInstance {
     std::string rawPath;
     BindingMode mode = BindingMode::OneWay;
     ObjectRef rootObject{};
+    UnifiedValue fallbackValue{};
     std::vector<AxbCompiledHop> hops;
     std::vector<ObjectRef> resolvedHopObjects;
     IntrusivePtr<UIElement> targetElement{};
@@ -34,6 +35,7 @@ enum class EcsFieldScalarKind : std::uint8_t {
 
 struct EcsColumnBindingChannel {
     std::string componentTypeName;
+    std::string fieldName;
     SymbolId componentTypeId = 0;
     ObjectRef columnArrayRef{};
     NativeRawColumnView rawView{};
@@ -56,6 +58,7 @@ public:
         ExecutionDomainContext& domains,
         const ProgramImage* program = nullptr,
         const Interpreter* uiInterpreter = nullptr) noexcept;
+    ~DualTrackBindingEngine() noexcept;
 
     void SetProgramImage(const ProgramImage* program) noexcept { program_ = program; }
     void SetUiInterpreter(const Interpreter* uiInterpreter) noexcept { uiInterpreter_ = uiInterpreter; }
@@ -119,7 +122,11 @@ public:
         return trackBChannels_;
     }
 
+    [[nodiscard]] const NativeRawColumnView* ResolveChannelView(
+        const EcsColumnBindingChannel& channel) const noexcept;
+
 private:
+    void ApplyFallbackOrClear(ReactiveBindingInstance& binding) const;
     bool EvaluateAndSyncChain(
         ReactiveBindingInstance& binding,
         std::size_t startHopIndex,
@@ -129,6 +136,7 @@ private:
     const ProgramImage* program_ = nullptr;
     const Interpreter* uiInterpreter_ = nullptr;
     std::uint16_t nextBindingSlotId_ = 1;
+    std::uint64_t lastObservedGcEpoch_ = 0;
     std::vector<ReactiveBindingInstance> trackABindings_;
     std::vector<EcsColumnBindingChannel> trackBChannels_;
 };

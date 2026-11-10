@@ -17,6 +17,7 @@ public:
     void EnqueueMeasure(UIElement* element) noexcept;
     void EnqueueArrange(UIElement* element) noexcept;
     void EnqueueSubtree(UIElement* root) noexcept;
+    void EnqueueDirtySubtree(UIElement* root) noexcept;
 
     [[nodiscard]] bool HasPendingMeasure() const noexcept {
         return nonEmptyMeasureMask_ != 0ULL;
@@ -39,6 +40,8 @@ private:
         return depth < 63u ? static_cast<std::size_t>(depth) : 63u;
     }
     [[nodiscard]] static std::size_t LowestSetBitIndex(std::uint64_t mask) noexcept;
+    [[nodiscard]] static std::size_t HighestSetBitIndex(std::uint64_t mask) noexcept;
+    void EnqueueUpwardMeasure(UIElement* element, std::uint64_t& upwardMask) noexcept;
 
     std::uint64_t nonEmptyMeasureMask_ = 0ULL;
     std::uint64_t nonEmptyArrangeMask_ = 0ULL;
