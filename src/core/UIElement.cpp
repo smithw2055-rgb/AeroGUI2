@@ -4,6 +4,7 @@
 #include <cmath>
 #include <limits>
 
+#include "aero/binding/DualTrackBindingEngine.hpp"
 #include "aero/compiler/AxbFormat.hpp"
 #include "realscript/aot_cpp/AotRuntime.h"
 
@@ -25,6 +26,29 @@ void DetachSubtreeRenderNodes(UIElement* elem) noexcept {
     for (UIElement* c = elem->FirstChild(); c != nullptr; c = c->NextSibling()) {
         DetachSubtreeRenderNodes(c);
     }
+}
+
+[[nodiscard]] bool TryCoerceBoolValue(const UnifiedValue& val, bool& outBool) noexcept {
+    if (const auto* b = std::get_if<bool>(&val)) {
+        outBool = *b;
+        return true;
+    }
+    if (const auto* i = std::get_if<std::int64_t>(&val)) {
+        outBool = (*i != 0);
+        return true;
+    }
+    if (const auto* sv = std::get_if<StringValue>(&val)) {
+        const std::string_view s = sv->view();
+        if (s == "true" || s == "True" || s == "TRUE" || s == "1") {
+            outBool = true;
+            return true;
+        }
+        if (s == "false" || s == "False" || s == "FALSE" || s == "0") {
+            outBool = false;
+            return true;
+        }
+    }
+    return false;
 }
 
 [[nodiscard]] constexpr bool IsLayoutAffectingSparseProperty(std::uint16_t propId) noexcept {
@@ -57,6 +81,8 @@ void DetachSubtreeRenderNodes(UIElement* elem) noexcept {
         case PropId_HorizontalScrollBarVisibility:
         case PropId_VerticalScrollBarVisibility:
         case PropId_LayoutTransform:
+        case PropId_IsVirtualizing:
+        case PropId_IsPassword:
             return true;
         default:
             return false;
@@ -173,6 +199,7 @@ Button::Button() {
 
 UIElement::~UIElement() {
     DetachRenderNodeSpan();
+    boundBindingEngine_ = nullptr;
 
     // Detach children safely
     UIElement* child = firstChild_;
@@ -399,6 +426,142 @@ void UIElement::SyncVisualTreeGcRoots(
     }
 }
 
+bool UIElement::CanReceiveFocus() const noexcept {
+    if (!IsFocusable() || !IsEffectivelyEnabled()) {
+        return false;
+    }
+    for (const UIElement* cur = this; cur != nullptr; cur = cur->parent_) {
+        if (cur->GetVisibility() != Visibility::Visible || cur->GetOpacity() <= 0.0f) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool UIElement::NotifyTwoWayPropertyMutated(std::uint16_t propId, RuntimeError* error) {
+    if (!boundBindingEngine_) {
+        return false;
+    }
+    return boundBindingEngine_->PushTwoWayToSource(this, propId, error);
+}
+
+Matrix2D UIElement::ComputeLocalToScreenMatrix2D() const noexcept {
+    const UIElement* chain[64]{};
+    std::size_t depth = 0;
+    for (const UIElement* anc = parent_; anc != nullptr && depth < 64u; anc = anc->parent_) {
+        chain[depth++] = anc;
+    }
+
+    Matrix2D worldM = Matrix2D::Identity();
+    for (std::size_t idx = depth; idx > 0u; --idx) {
+        const UIElement* anc = chain[idx - 1u];
+        const Matrix2D ancLocal = anc->ComputeLocalEffectiveTransform2D();
+        if (!ancLocal.IsIdentity()) {
+            worldM = Matrix2D::Multiply(worldM, ancLocal);
+        }
+        const Matrix2D ancChild = anc->GetChildContainerTransform2D();
+        if (!ancChild.IsIdentity()) {
+            worldM = Matrix2D::Multiply(worldM, ancChild);
+        }
+    }
+
+    const Matrix2D selfLocal = ComputeLocalEffectiveTransform2D();
+    if (!selfLocal.IsIdentity()) {
+        worldM = Matrix2D::Multiply(worldM, selfLocal);
+    }
+    return worldM;
+}
+
+Point UIElement::ScreenToLocal(Point screenPoint) const noexcept {
+    const Matrix2D worldM = ComputeLocalToScreenMatrix2D();
+    if (worldM.IsIdentity()) {
+        return screenPoint;
+    }
+    Matrix2D inv{};
+    if (worldM.TryInvert(inv)) {
+        return inv.TransformPoint(screenPoint);
+    }
+    return screenPoint;
+}
+
+Rect UIElement::LocalToScreenBounds(Rect localRect) const noexcept {
+    const Matrix2D worldM = ComputeLocalToScreenMatrix2D();
+    if (worldM.IsIdentity()) {
+        return localRect;
+    }
+    return worldM.TransformRectBounds(localRect);
+}
+
+bool UIElement::OnPointerDown(
+    Point localPoint,
+    PointerButton button,
+    std::uint8_t modifiers,
+    bool& outRequestCapture) {
+    (void)localPoint;
+    (void)button;
+    (void)modifiers;
+    outRequestCapture = false;
+    return false;
+}
+
+bool UIElement::OnPointerMove(Point localPoint, std::uint8_t modifiers) {
+    (void)localPoint;
+    (void)modifiers;
+    return false;
+}
+
+bool UIElement::OnPointerUp(
+    Point localPoint,
+    PointerButton button,
+    std::uint8_t modifiers,
+    bool insideBounds) {
+    (void)localPoint;
+    (void)button;
+    (void)modifiers;
+    (void)insideBounds;
+    return false;
+}
+
+bool UIElement::OnKeyDown(KeyCode key, std::uint8_t modifiers) {
+    (void)key;
+    (void)modifiers;
+    return false;
+}
+
+bool UIElement::OnTextInput(std::string_view utf8Text) {
+    (void)utf8Text;
+    return false;
+}
+
+void UIElement::OnFocusChanged(bool focused) {
+    (void)focused;
+}
+
+void UIElement::OnPointerCaptureLost() noexcept {}
+
+void UIElement::OnEnabledStateChanged(bool effectivelyEnabled) {
+    (void)effectivelyEnabled;
+}
+
+void UIElement::PropagateEnabledStateToSubtree() noexcept {
+    const bool effEnabled = IsEffectivelyEnabled();
+    if (!effEnabled) {
+        if ((fastProps_.reserved & InteractiveState_Pressed) != 0u) {
+            fastProps_.reserved = static_cast<std::uint8_t>(
+                fastProps_.reserved & ~(InteractiveState_Hovered | InteractiveState_Pressed));
+            OnPointerCaptureLost();
+        } else {
+            fastProps_.reserved = static_cast<std::uint8_t>(
+                fastProps_.reserved & ~InteractiveState_Hovered);
+        }
+    }
+    OnEnabledStateChanged(effEnabled);
+    InvalidateRender();
+    for (UIElement* c = firstChild_; c != nullptr; c = c->nextSibling_) {
+        c->PropagateEnabledStateToSubtree();
+    }
+}
+
 float UIElement::GetMaxWidth() const noexcept {
     if (const auto* entry = FindCompactEntry(PropId_MaxWidth)) {
         float out = std::numeric_limits<float>::infinity();
@@ -560,15 +723,50 @@ Matrix2D UIElement::ComputeLocalEffectiveTransform2DForRect(const Rect& r) const
         eff = Matrix2D::Multiply(Matrix2D::Scaling(cosYaw, cosPitch, cx, cy), eff);
     }
 
-    // 2. Standard 2D Affine RenderTransform around normalized RenderTransformOrigin
+    // 2. Standard 2D Affine RenderTransform + Independent Phase 5C Animated Transform Channels
+    //    composed around normalized RenderTransformOrigin without double-scaling static translation!
     const bool hasRtLin = (FindCompactEntry(PropId_RenderTransform) != nullptr);
     const bool hasRtTrans = (FindCompactEntry(PropId_RenderTransformTranslation) != nullptr);
-    if (hasRtLin || hasRtTrans) {
-        const Matrix2D rt = GetRenderTransform();
-        const Point origin = GetRenderTransformOrigin();
-        const float pivotX = r.x + origin.x * effBoxW;
-        const float pivotY = r.y + origin.y * effBoxH;
-        eff = Matrix2D::Multiply(rt.AroundPivot(pivotX, pivotY), eff);
+    const auto* sxEntry = FindCompactEntry(PropId_AnimScaleX);
+    const auto* syEntry = FindCompactEntry(PropId_AnimScaleY);
+    const auto* rotEntry = FindCompactEntry(PropId_AnimRotateAngle);
+    const auto* txEntry = FindCompactEntry(PropId_AnimTranslateX);
+    const auto* tyEntry = FindCompactEntry(PropId_AnimTranslateY);
+    const bool hasAnimTf = (sxEntry || syEntry || rotEntry || txEntry || tyEntry);
+
+    if (hasRtLin || hasRtTrans || hasAnimTf) {
+        Matrix2D combinedRt = Matrix2D::Identity();
+        if (hasAnimTf) {
+            float animSx = 1.0f;
+            float animSy = 1.0f;
+            float animDeg = 0.0f;
+            float animTx = 0.0f;
+            float animTy = 0.0f;
+            if (sxEntry) (void)TryGetFloat(sxEntry->effectiveValue, animSx);
+            if (syEntry) (void)TryGetFloat(syEntry->effectiveValue, animSy);
+            if (rotEntry) (void)TryGetFloat(rotEntry->effectiveValue, animDeg);
+            if (txEntry) (void)TryGetFloat(txEntry->effectiveValue, animTx);
+            if (tyEntry) (void)TryGetFloat(tyEntry->effectiveValue, animTy);
+
+            if (std::fabs(animSx - 1.0f) > 1e-6f || std::fabs(animSy - 1.0f) > 1e-6f) {
+                combinedRt = Matrix2D::Multiply(Matrix2D::Scaling(animSx, animSy), combinedRt);
+            }
+            if (std::fabs(animDeg) > 1e-6f) {
+                combinedRt = Matrix2D::Multiply(Matrix2D::Rotation(animDeg), combinedRt);
+            }
+            if (std::fabs(animTx) > 1e-6f || std::fabs(animTy) > 1e-6f) {
+                combinedRt = Matrix2D::Multiply(Matrix2D::Translation(animTx, animTy), combinedRt);
+            }
+        }
+        if (hasRtLin || hasRtTrans) {
+            combinedRt = Matrix2D::Multiply(GetRenderTransform(), combinedRt);
+        }
+        if (!combinedRt.IsIdentity()) {
+            const Point origin = GetRenderTransformOrigin();
+            const float pivotX = r.x + origin.x * effBoxW;
+            const float pivotY = r.y + origin.y * effBoxH;
+            eff = Matrix2D::Multiply(combinedRt.AroundPivot(pivotX, pivotY), eff);
+        }
     }
 
     // 3. Legacy PropId_RenderTransformMatrix (Float4Value{sx, sy, tx, ty} around global origin)
@@ -936,6 +1134,10 @@ UnifiedValue UIElement::GetValue(std::uint16_t propId) const {
             return static_cast<std::int64_t>(GetHorizontalAlignment());
         case PropId_VerticalAlignment:
             return static_cast<std::int64_t>(GetVerticalAlignment());
+        case PropId_IsEnabled:
+            return IsEnabled();
+        case PropId_Focusable:
+            return IsFocusable();
         default:
             break;
     }
@@ -945,15 +1147,39 @@ UnifiedValue UIElement::GetValue(std::uint16_t propId) const {
     return std::monostate{};
 }
 
+ValueSourceRank UIElement::GetPropertySourceRank(std::uint16_t propId) const noexcept {
+    const int fastSlot = FastInlineSlotIndex(propId);
+    if (fastSlot >= 0) {
+        return static_cast<ValueSourceRank>(fastInlineRanks_[static_cast<std::size_t>(fastSlot)]);
+    }
+    if (const auto* entry = FindCompactEntry(propId)) {
+        if (!std::holds_alternative<std::monostate>(entry->effectiveValue)) {
+            return static_cast<ValueSourceRank>(entry->sourceRank);
+        }
+    }
+    return ValueSourceRank::Default;
+}
+
 bool UIElement::SetValue(
     std::uint16_t propId,
     const UnifiedValue& value,
     ValueSourceRank rank) {
+    const auto rawRank = static_cast<std::uint8_t>(rank);
+    const int fastSlot = FastInlineSlotIndex(propId);
+    if (fastSlot >= 0) {
+        if (rawRank < fastInlineRanks_[static_cast<std::size_t>(fastSlot)]) {
+            return false;
+        }
+    }
     float numericVal = 0.0f;
+    bool boolVal = false;
     switch (propId) {
         case PropId_Width:
             if (TryGetFloat(value, numericVal)) {
                 SetWidth(numericVal);
+                fastInlineRanks_[0] = (numericVal < 0.0f)
+                    ? static_cast<std::uint8_t>(ValueSourceRank::Default)
+                    : rawRank;
                 OnPropertyChanged(propId, value);
                 return true;
             }
@@ -961,6 +1187,9 @@ bool UIElement::SetValue(
         case PropId_Height:
             if (TryGetFloat(value, numericVal)) {
                 SetHeight(numericVal);
+                fastInlineRanks_[1] = (numericVal < 0.0f)
+                    ? static_cast<std::uint8_t>(ValueSourceRank::Default)
+                    : rawRank;
                 OnPropertyChanged(propId, value);
                 return true;
             }
@@ -968,6 +1197,7 @@ bool UIElement::SetValue(
         case PropId_MinWidth:
             if (TryGetFloat(value, numericVal)) {
                 SetMinWidth(numericVal);
+                fastInlineRanks_[2] = rawRank;
                 OnPropertyChanged(propId, value);
                 return true;
             }
@@ -975,6 +1205,7 @@ bool UIElement::SetValue(
         case PropId_MinHeight:
             if (TryGetFloat(value, numericVal)) {
                 SetMinHeight(numericVal);
+                fastInlineRanks_[3] = rawRank;
                 OnPropertyChanged(propId, value);
                 return true;
             }
@@ -982,6 +1213,7 @@ bool UIElement::SetValue(
         case PropId_Margin:
             if (auto m = value::TryGetThickness(value)) {
                 SetMargin(*m);
+                fastInlineRanks_[4] = rawRank;
                 OnPropertyChanged(propId, value);
                 return true;
             }
@@ -989,6 +1221,7 @@ bool UIElement::SetValue(
         case PropId_Padding:
             if (auto p = value::TryGetThickness(value)) {
                 SetPadding(*p);
+                fastInlineRanks_[5] = rawRank;
                 OnPropertyChanged(propId, value);
                 return true;
             }
@@ -996,6 +1229,7 @@ bool UIElement::SetValue(
         case PropId_Opacity:
             if (TryGetFloat(value, numericVal)) {
                 SetOpacity(numericVal);
+                fastInlineRanks_[6] = rawRank;
                 OnPropertyChanged(propId, value);
                 return true;
             }
@@ -1004,6 +1238,7 @@ bool UIElement::SetValue(
             if (const auto* i = std::get_if<std::int64_t>(&value)) {
                 if (*i >= 0 && *i <= 2) {
                     SetVisibility(static_cast<Visibility>(*i));
+                    fastInlineRanks_[7] = rawRank;
                     OnPropertyChanged(propId, value);
                     return true;
                 }
@@ -1011,6 +1246,7 @@ bool UIElement::SetValue(
                 const UnifiedValue parsed = ParseBuiltinLiteralPropertyValue(propId, sv->str());
                 if (const auto* pi = std::get_if<std::int64_t>(&parsed)) {
                     SetVisibility(static_cast<Visibility>(*pi));
+                    fastInlineRanks_[7] = rawRank;
                     OnPropertyChanged(propId, parsed);
                     return true;
                 }
@@ -1020,6 +1256,7 @@ bool UIElement::SetValue(
             if (const auto* i = std::get_if<std::int64_t>(&value)) {
                 if (*i >= 0 && *i <= 3) {
                     SetHorizontalAlignment(static_cast<HorizontalAlignment>(*i));
+                    fastInlineRanks_[8] = rawRank;
                     OnPropertyChanged(propId, value);
                     return true;
                 }
@@ -1027,6 +1264,7 @@ bool UIElement::SetValue(
                 const UnifiedValue parsed = ParseBuiltinLiteralPropertyValue(propId, sv->str());
                 if (const auto* pi = std::get_if<std::int64_t>(&parsed)) {
                     SetHorizontalAlignment(static_cast<HorizontalAlignment>(*pi));
+                    fastInlineRanks_[8] = rawRank;
                     OnPropertyChanged(propId, parsed);
                     return true;
                 }
@@ -1036,6 +1274,7 @@ bool UIElement::SetValue(
             if (const auto* i = std::get_if<std::int64_t>(&value)) {
                 if (*i >= 0 && *i <= 3) {
                     SetVerticalAlignment(static_cast<VerticalAlignment>(*i));
+                    fastInlineRanks_[9] = rawRank;
                     OnPropertyChanged(propId, value);
                     return true;
                 }
@@ -1043,9 +1282,26 @@ bool UIElement::SetValue(
                 const UnifiedValue parsed = ParseBuiltinLiteralPropertyValue(propId, sv->str());
                 if (const auto* pi = std::get_if<std::int64_t>(&parsed)) {
                     SetVerticalAlignment(static_cast<VerticalAlignment>(*pi));
+                    fastInlineRanks_[9] = rawRank;
                     OnPropertyChanged(propId, parsed);
                     return true;
                 }
+            }
+            return false;
+        case PropId_IsEnabled:
+            if (TryCoerceBoolValue(value, boolVal)) {
+                SetIsEnabled(boolVal);
+                fastInlineRanks_[10] = rawRank;
+                OnPropertyChanged(propId, UnifiedValue{boolVal});
+                return true;
+            }
+            return false;
+        case PropId_Focusable:
+            if (TryCoerceBoolValue(value, boolVal)) {
+                SetFocusable(boolVal);
+                fastInlineRanks_[11] = rawRank;
+                OnPropertyChanged(propId, UnifiedValue{boolVal});
+                return true;
             }
             return false;
         case PropId_RenderTransform:
@@ -1077,7 +1333,6 @@ bool UIElement::SetValue(
             break;
     }
 
-    const auto rawRank = static_cast<std::uint8_t>(rank);
     auto it = std::lower_bound(
         sparseProps_.begin(),
         sparseProps_.end(),
@@ -1126,46 +1381,187 @@ bool UIElement::SetValue(
     return true;
 }
 
+void UIElement::SetStyleKey(std::string_view styleKey) {
+    if (styleKey.empty()) {
+        (void)ClearValue(PropId_Style, ValueSourceRank::Local);
+    } else {
+        (void)SetValue(PropId_Style, value::FromString(std::string(styleKey)), ValueSourceRank::Local);
+    }
+}
+
+std::string UIElement::GetStyleKey() const {
+    const UnifiedValue v = GetValue(PropId_Style);
+    if (const auto* sv = std::get_if<StringValue>(&v)) {
+        return sv->str();
+    }
+    return {};
+}
+
+bool UIElement::ForceEffectiveValue(
+    std::uint16_t propId,
+    const UnifiedValue& value,
+    ValueSourceRank rank) {
+    const int fastSlot = FastInlineSlotIndex(propId);
+    if (fastSlot >= 0) {
+        fastInlineRanks_[static_cast<std::size_t>(fastSlot)] =
+            static_cast<std::uint8_t>(ValueSourceRank::Default);
+        return SetValue(propId, value, rank);
+    }
+    if (propId == PropId_RenderTransform) {
+        if (const auto* sv = std::get_if<StringValue>(&value)) {
+            const Matrix2D m = ParseXamlMatrix2DLiteral(sv->str());
+            const bool okLin = ForceEffectiveValue(
+                PropId_RenderTransform,
+                UnifiedValue{Float4Value{m.m00, m.m01, m.m10, m.m11}},
+                rank);
+            if (okLin) {
+                (void)ForceEffectiveValue(
+                    PropId_RenderTransformTranslation,
+                    UnifiedValue{Float4Value{m.tx, m.ty, 0.0f, 0.0f}},
+                    rank);
+            }
+            return okLin;
+        }
+    } else if (propId == PropId_LayoutTransform) {
+        if (const auto* sv = std::get_if<StringValue>(&value)) {
+            const Matrix2D m = ParseXamlMatrix2DLiteral(sv->str());
+            return ForceEffectiveValue(
+                PropId_LayoutTransform,
+                UnifiedValue{Float4Value{m.m00, m.m01, m.m10, m.m11}},
+                rank);
+        }
+    }
+    const auto rawRank = static_cast<std::uint8_t>(rank);
+    auto it = std::lower_bound(
+        sparseProps_.begin(),
+        sparseProps_.end(),
+        propId,
+        [](const CompactPropertyEntry& e, std::uint16_t id) {
+            return e.propId < id;
+        });
+    if (it != sparseProps_.end() && it->propId == propId) {
+        it->sourceRank = rawRank;
+        it->effectiveValue = value;
+    } else {
+        CompactPropertyEntry entry{};
+        entry.propId = propId;
+        entry.sourceRank = rawRank;
+        entry.effectiveValue = value;
+        sparseProps_.insert(it, std::move(entry));
+    }
+    InvalidateRender();
+    if (IsLayoutAffectingSparseProperty(propId)) {
+        InvalidateLayout();
+        if (IsParentLayoutAttachedProperty(propId) && parent_) {
+            parent_->InvalidateLayout();
+        }
+    } else if (IsArrangeOnlySparseProperty(propId)) {
+        InvalidateArrange();
+    }
+    OnPropertyChanged(propId, value);
+    return true;
+}
+
+bool UIElement::ForceClearSparseEntry(std::uint16_t propId) {
+    auto it = std::lower_bound(
+        sparseProps_.begin(),
+        sparseProps_.end(),
+        propId,
+        [](const CompactPropertyEntry& e, std::uint16_t id) {
+            return e.propId < id;
+        });
+    if (it == sparseProps_.end() || it->propId != propId) {
+        return false;
+    }
+    if (it->bindingSlotId != 0xFFFFu || it->animationTrackId != 0xFFFFu) {
+        it->sourceRank = static_cast<std::uint8_t>(ValueSourceRank::Default);
+        it->effectiveValue = std::monostate{};
+    } else {
+        sparseProps_.erase(it);
+    }
+    if (propId == PropId_RenderTransform) {
+        (void)ForceClearSparseEntry(PropId_RenderTransformTranslation);
+    }
+    InvalidateRender();
+    if (IsLayoutAffectingSparseProperty(propId)) {
+        InvalidateLayout();
+        if (IsParentLayoutAttachedProperty(propId) && parent_) {
+            parent_->InvalidateLayout();
+        }
+    } else if (IsArrangeOnlySparseProperty(propId)) {
+        InvalidateArrange();
+    }
+    OnPropertyChanged(propId, std::monostate{});
+    return true;
+}
+
 bool UIElement::ClearValue(std::uint16_t propId, ValueSourceRank rank) {
+    const auto rawRank = static_cast<std::uint8_t>(rank);
+    const int fastSlot = FastInlineSlotIndex(propId);
+    if (fastSlot >= 0) {
+        if (rawRank < fastInlineRanks_[static_cast<std::size_t>(fastSlot)]) {
+            return false;
+        }
+    }
     switch (propId) {
     case PropId_Width:
         SetWidth(-1.0f);
+        fastInlineRanks_[0] = static_cast<std::uint8_t>(ValueSourceRank::Default);
         OnPropertyChanged(propId, std::monostate{});
         return true;
     case PropId_Height:
         SetHeight(-1.0f);
+        fastInlineRanks_[1] = static_cast<std::uint8_t>(ValueSourceRank::Default);
         OnPropertyChanged(propId, std::monostate{});
         return true;
     case PropId_MinWidth:
         SetMinWidth(0.0f);
+        fastInlineRanks_[2] = static_cast<std::uint8_t>(ValueSourceRank::Default);
         OnPropertyChanged(propId, std::monostate{});
         return true;
     case PropId_MinHeight:
         SetMinHeight(0.0f);
+        fastInlineRanks_[3] = static_cast<std::uint8_t>(ValueSourceRank::Default);
         OnPropertyChanged(propId, std::monostate{});
         return true;
     case PropId_Margin:
         SetMargin({});
+        fastInlineRanks_[4] = static_cast<std::uint8_t>(ValueSourceRank::Default);
         OnPropertyChanged(propId, std::monostate{});
         return true;
     case PropId_Padding:
         SetPadding({});
+        fastInlineRanks_[5] = static_cast<std::uint8_t>(ValueSourceRank::Default);
         OnPropertyChanged(propId, std::monostate{});
         return true;
     case PropId_Opacity:
         SetOpacity(1.0f);
+        fastInlineRanks_[6] = static_cast<std::uint8_t>(ValueSourceRank::Default);
         OnPropertyChanged(propId, std::monostate{});
         return true;
     case PropId_Visibility:
         SetVisibility(Visibility::Visible);
+        fastInlineRanks_[7] = static_cast<std::uint8_t>(ValueSourceRank::Default);
         OnPropertyChanged(propId, std::monostate{});
         return true;
     case PropId_HorizontalAlignment:
         SetHorizontalAlignment(HorizontalAlignment::Stretch);
+        fastInlineRanks_[8] = static_cast<std::uint8_t>(ValueSourceRank::Default);
         OnPropertyChanged(propId, std::monostate{});
         return true;
     case PropId_VerticalAlignment:
         SetVerticalAlignment(VerticalAlignment::Stretch);
+        fastInlineRanks_[9] = static_cast<std::uint8_t>(ValueSourceRank::Default);
+        OnPropertyChanged(propId, std::monostate{});
+        return true;
+    case PropId_IsEnabled:
+        SetIsEnabled(true);
+        fastInlineRanks_[10] = static_cast<std::uint8_t>(ValueSourceRank::Default);
+        OnPropertyChanged(propId, std::monostate{});
+        return true;
+    case PropId_Focusable:
+        ClearExplicitFocusable();
+        fastInlineRanks_[11] = static_cast<std::uint8_t>(ValueSourceRank::Default);
         OnPropertyChanged(propId, std::monostate{});
         return true;
     default:
@@ -1182,10 +1578,15 @@ bool UIElement::ClearValue(std::uint16_t propId, ValueSourceRank rank) {
     if (it == sparseProps_.end() || it->propId != propId) {
         return false;
     }
-    if (static_cast<std::uint8_t>(rank) < it->sourceRank) {
+    if (rawRank < it->sourceRank) {
         return false;
     }
-    sparseProps_.erase(it);
+    if (it->bindingSlotId != 0xFFFFu || it->animationTrackId != 0xFFFFu) {
+        it->sourceRank = static_cast<std::uint8_t>(ValueSourceRank::Default);
+        it->effectiveValue = std::monostate{};
+    } else {
+        sparseProps_.erase(it);
+    }
     if (propId == PropId_RenderTransform) {
         (void)ClearValue(PropId_RenderTransformTranslation, rank);
     }
@@ -1267,6 +1668,10 @@ std::string Button::GetContentText() const {
     if (const auto* s = std::get_if<StringValue>(&v)) {
         return s->str();
     }
+    const auto contentVal = GetValue(PropId_Content);
+    if (const auto* s = std::get_if<StringValue>(&contentVal)) {
+        return s->str();
+    }
     const auto titleVal = GetValue(PropId_Title);
     if (const auto* s = std::get_if<StringValue>(&titleVal)) {
         return s->str();
@@ -1275,6 +1680,10 @@ std::string Button::GetContentText() const {
 }
 
 bool Button::PerformClick(RuntimeError* error) {
+    if (!IsEffectivelyEnabled()) {
+        return false;
+    }
+    ++clickGeneration_;
     if (clickCallback_) {
         clickCallback_(*this);
     }
@@ -1339,6 +1748,52 @@ bool Button::PerformClick(RuntimeError* error) {
         }
     }
     return true;
+}
+
+bool Button::ActivateFromInput(RuntimeError* error) {
+    if (!IsEffectivelyEnabled()) {
+        return false;
+    }
+    return PerformClick(error);
+}
+
+bool Button::OnPointerDown(
+    Point localPoint,
+    PointerButton button,
+    std::uint8_t modifiers,
+    bool& outRequestCapture) {
+    (void)localPoint;
+    (void)modifiers;
+    if (button == PointerButton::Left && IsEffectivelyEnabled()) {
+        outRequestCapture = true;
+        return true;
+    }
+    outRequestCapture = false;
+    return false;
+}
+
+bool Button::OnPointerUp(
+    Point localPoint,
+    PointerButton button,
+    std::uint8_t modifiers,
+    bool insideBounds) {
+    (void)localPoint;
+    (void)modifiers;
+    if (button == PointerButton::Left && insideBounds && IsEffectivelyEnabled()) {
+        return ActivateFromInput();
+    }
+    return false;
+}
+
+bool Button::OnKeyDown(KeyCode key, std::uint8_t modifiers) {
+    (void)modifiers;
+    if (!IsEffectivelyEnabled()) {
+        return false;
+    }
+    if (key == KeyCode::Enter || key == KeyCode::Space) {
+        return ActivateFromInput();
+    }
+    return false;
 }
 
 Size Button::MeasureCore(Size availableSize) noexcept {

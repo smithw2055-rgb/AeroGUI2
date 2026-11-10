@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -22,6 +23,15 @@ enum class BindingMode : std::uint8_t {
     OneTime = 2,
 };
 
+enum class ValueConverterKind : std::uint8_t {
+    None = 0,
+    BooleanToVisibility = 1,
+    InverseBooleanToVisibility = 2,
+    InverseBoolean = 3,
+    NullToCollapsed = 4,
+    NullToBoolean = 5,
+};
+
 enum class AxbOpcode : std::uint8_t {
     BeginElement = 1,
     EndElement = 2,
@@ -32,6 +42,72 @@ enum class AxbOpcode : std::uint8_t {
     AddRowDefinition = 7,
     AddColumnDefinition = 8,
     SetResourceProperty = 9,
+};
+
+// ============================================================================
+// Phase 5C & 5D: Easing Curves, Storyboards, Data/Event Triggers & Templates
+// ============================================================================
+
+enum class EasingFunctionKind : std::uint8_t {
+    Linear = 0,
+    Quadratic = 1,
+    Cubic = 2,
+    Quartic = 3,
+    Quintic = 4,
+    Sine = 5,
+    Circle = 6,
+    Exponential = 7,
+    Back = 8,
+    Bounce = 9,
+    Elastic = 10,
+};
+
+enum class EasingMode : std::uint8_t {
+    EaseOut = 0,
+    EaseIn = 1,
+    EaseInOut = 2,
+};
+
+enum class FillBehavior : std::uint8_t {
+    HoldEnd = 0,
+    Stop = 1,
+};
+
+struct AxbKeyFrame {
+    float timeSeconds = 0.0f;
+    UnifiedValue value{};
+    EasingFunctionKind easingKind = EasingFunctionKind::Linear;
+    EasingMode easingMode = EasingMode::EaseOut;
+    bool isDiscrete = false;
+};
+
+struct AxbAnimationTimeline {
+    std::string targetName;
+    std::uint16_t targetPropertyId = 0;
+    float beginTimeSeconds = 0.0f;
+    float durationSeconds = 0.25f;
+    bool hasFrom = false;
+    UnifiedValue fromValue{};
+    bool hasTo = false;
+    UnifiedValue toValue{};
+    bool isBy = false;
+    EasingFunctionKind easingKind = EasingFunctionKind::Linear;
+    EasingMode easingMode = EasingMode::EaseOut;
+    FillBehavior fillBehavior = FillBehavior::HoldEnd;
+    bool autoReverse = false;
+    std::int32_t repeatCount = 1; // <= 0 denotes Forever loop
+    std::vector<AxbKeyFrame> keyFrames;
+};
+
+struct AxbStoryboard {
+    std::string key;
+    std::vector<AxbAnimationTimeline> timelines;
+};
+
+struct AxbPropertySetter {
+    std::string targetName;
+    std::uint16_t propId = 0;
+    UnifiedValue value{};
 };
 
 struct AxbCompiledHop {
@@ -63,12 +139,86 @@ struct AxbCompiledHop {
     }
 };
 
+enum class TriggerConditionSource : std::uint8_t {
+    SelfProperty = 0,
+    DataContextBinding = 1,
+    ElementNameProperty = 2,
+    AncestorProperty = 3,
+};
+
+struct AxbTriggerCondition {
+    AxbTriggerCondition() = default;
+    AxbTriggerCondition(std::uint16_t id, UnifiedValue expected)
+        : propId(id), expectedValue(std::move(expected)) {}
+
+    std::uint16_t propId = 0;
+    UnifiedValue expectedValue{};
+    TriggerConditionSource sourceKind = TriggerConditionSource::SelfProperty;
+    ValueConverterKind converter = ValueConverterKind::None;
+    bool expectNull = false;
+    std::string sourceName;
+    std::string bindingPath;
+    std::vector<AxbCompiledHop> compiledHops;
+};
+
+struct AxbStyleTrigger {
+    std::vector<AxbTriggerCondition> conditions;
+    std::vector<AxbPropertySetter> setters;
+    std::vector<AxbStoryboard> enterStoryboards;
+    std::vector<AxbStoryboard> exitStoryboards;
+    bool overrideLocalValues = false;
+};
+
+enum class RoutedTriggerEvent : std::uint8_t {
+    Loaded = 0,
+    Click = 1,
+    MouseEnter = 2,
+    MouseLeave = 3,
+    Checked = 4,
+    Unchecked = 5,
+};
+
+struct AxbEventTrigger {
+    RoutedTriggerEvent eventKind = RoutedTriggerEvent::Loaded;
+    std::string sourceName;
+    std::vector<AxbStoryboard> storyboards;
+};
+
+struct AxbVisualState {
+    std::string name;
+    std::vector<AxbPropertySetter> setters;
+    AxbStoryboard storyboard{};
+};
+
+struct AxbVisualStateGroup {
+    std::string name;
+    float defaultTransitionDuration = 0.0f;
+    EasingFunctionKind defaultEasingKind = EasingFunctionKind::Cubic;
+    EasingMode defaultEasingMode = EasingMode::EaseOut;
+    std::vector<AxbVisualState> states;
+};
+
+struct AxbStyleDefinition {
+    std::string key;
+    std::string targetTypeName;
+    std::string basedOnKey;
+    std::vector<AxbPropertySetter> setters;
+    std::vector<AxbStyleTrigger> triggers;
+    std::vector<AxbEventTrigger> eventTriggers;
+    std::vector<AxbVisualStateGroup> visualStateGroups;
+};
+
 struct AxbCompiledBindingChain {
     std::string rawPath;
     std::uint16_t targetPropertyId = 0;
     BindingMode mode = BindingMode::OneWay;
     UnifiedValue fallbackValue{};
     std::vector<AxbCompiledHop> hops;
+    // Phase 5D: ElementName / RelativeSource & zero-allocation built-in value converter
+    std::string elementName;
+    std::string relativeAncestorType;
+    bool relativeSelf = false;
+    ValueConverterKind converter = ValueConverterKind::None;
 };
 
 struct AxbNamedControlSlot {
@@ -116,6 +266,14 @@ struct AxbMtsdfPathEntry {
     std::vector<std::uint8_t> mtsdfRgbaPixels;
 };
 
+struct AxbPackage;
+
+struct AxbDataTemplate {
+    std::string key;
+    std::string dataTypeName;
+    std::shared_ptr<AxbPackage> templatePackage;
+};
+
 struct AxbPackage {
     std::string className;
     std::string rootTypeName;
@@ -127,6 +285,9 @@ struct AxbPackage {
     std::vector<AxbInstruction> instructions;
     std::vector<std::pair<std::string, UnifiedValue>> resources;
     std::vector<AxbMtsdfPathEntry> mtsdfPaths;
+    std::vector<AxbStyleDefinition> styles;
+    std::vector<AxbStoryboard> storyboards;
+    std::vector<AxbDataTemplate> dataTemplates;
 
     std::uint32_t InternString(std::string_view text);
     [[nodiscard]] std::string_view GetString(std::uint32_t index) const noexcept;
@@ -151,6 +312,19 @@ struct AxbPackage {
 
 // Runtime-accessible property literal helpers & SVG Path -> 4-channel MTSDF baker
 [[nodiscard]] std::uint16_t ResolveBuiltinPropertyId(std::string_view propertyName) noexcept;
+[[nodiscard]] std::uint16_t ResolveTriggerConditionPropertyId(std::string_view propertyName) noexcept;
+[[nodiscard]] std::uint16_t ResolveAnimationTargetPropertyId(std::string_view targetPropertyPath) noexcept;
+[[nodiscard]] float ParseXamlTimeSpanSeconds(std::string_view rawTimeSpan, float fallbackSeconds = 0.0f) noexcept;
+[[nodiscard]] EasingFunctionKind ParseEasingFunctionKind(std::string_view tagName) noexcept;
+[[nodiscard]] EasingMode ParseEasingMode(std::string_view rawMode) noexcept;
+[[nodiscard]] ValueConverterKind ParseValueConverterKind(std::string_view rawConverterKey) noexcept;
+[[nodiscard]] UnifiedValue ApplyBuiltinValueConverter(
+    ValueConverterKind kind,
+    const UnifiedValue& rawVal,
+    bool inverseForTwoWay = false) noexcept;
+[[nodiscard]] RoutedTriggerEvent ParseRoutedTriggerEvent(
+    std::string_view rawRoutedEvent,
+    bool& outRecognized) noexcept;
 [[nodiscard]] UnifiedValue ParseBuiltinLiteralPropertyValue(
     std::uint16_t propId,
     std::string_view rawValue);

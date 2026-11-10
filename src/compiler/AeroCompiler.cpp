@@ -2,8 +2,10 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <limits>
 #include <string>
 #include <unordered_set>
 
@@ -79,6 +81,402 @@ bool EndsWith(std::string_view s, std::string_view suffix) noexcept {
            s.compare(s.size() - suffix.size(), suffix.size(), suffix) == 0;
 }
 
+std::string_view ExtractMarkupResourceKey(std::string_view rawExpr) noexcept {
+    std::string_view v = Trim(rawExpr);
+    if (v.size() > 2u && v.front() == '{' && v.back() == '}') {
+        std::string_view inner = Trim(v.substr(1u, v.size() - 2u));
+        if (inner.rfind("StaticResource ", 0) == 0) {
+            inner = Trim(inner.substr(15u));
+        } else if (inner.rfind("DynamicResource ", 0) == 0) {
+            inner = Trim(inner.substr(16u));
+        } else {
+            return {};
+        }
+        if (inner.rfind("ResourceKey=", 0) == 0) {
+            inner = Trim(inner.substr(12u));
+        }
+        return inner;
+    }
+    return {};
+}
+
+std::string ExtractTargetTypeShortName(std::string_view rawTypeExpr) {
+    std::string_view v = Trim(rawTypeExpr);
+    if (v.size() > 2u && v.front() == '{' && v.back() == '}') {
+        v = Trim(v.substr(1u, v.size() - 2u));
+        if (v.rfind("x:Type ", 0) == 0) {
+            v = Trim(v.substr(7u));
+        } else if (v.rfind("Type ", 0) == 0) {
+            v = Trim(v.substr(5u));
+        }
+        if (v.rfind("TypeName=", 0) == 0) {
+            v = Trim(v.substr(9u));
+        }
+    }
+    v = StripXmlPrefix(v);
+    if (const std::size_t dot = v.rfind('.'); dot != std::string_view::npos) {
+        v = v.substr(dot + 1u);
+    }
+    return std::string(v);
+}
+
+constexpr std::uint16_t kUnmappedPropId = 0xFFFFu;
+
+std::uint16_t ResolveMappedSetterPropertyId(std::string_view rawProp) noexcept {
+    rawProp = Trim(rawProp);
+    if (rawProp.empty()) {
+        return kUnmappedPropId;
+    }
+    if (rawProp == "Tag") {
+        return PropId_Tag;
+    }
+    const std::uint16_t direct = ResolveBuiltinPropertyId(rawProp);
+    if (direct != PropId_Tag) {
+        return direct;
+    }
+    if (const std::size_t dot = rawProp.rfind('.'); dot != std::string_view::npos) {
+        const std::string_view leaf = rawProp.substr(dot + 1u);
+        if (leaf == "Tag") {
+            return PropId_Tag;
+        }
+        const std::uint16_t stripped = ResolveBuiltinPropertyId(leaf);
+        if (stripped != PropId_Tag) {
+            return stripped;
+        }
+    }
+    return kUnmappedPropId;
+}
+
+std::uint16_t ResolveMappedTriggerConditionId(std::string_view rawProp) noexcept {
+    rawProp = Trim(rawProp);
+    if (rawProp.empty()) {
+        return kUnmappedPropId;
+    }
+    if (rawProp == "Tag" || EndsWith(rawProp, ".Tag")) {
+        return PropId_Tag;
+    }
+    const std::uint16_t id = ResolveTriggerConditionPropertyId(rawProp);
+    return (id == PropId_Tag) ? kUnmappedPropId : id;
+}
+
+std::uint16_t ResolveMappedAnimationPropertyId(std::string_view rawPath) noexcept {
+    rawPath = Trim(rawPath);
+    if (rawPath.empty()) {
+        return kUnmappedPropId;
+    }
+    if (rawPath == "Tag" || EndsWith(rawPath, ".Tag") || EndsWith(rawPath, ".Tag)")) {
+        return PropId_Tag;
+    }
+    const std::uint16_t id = ResolveAnimationTargetPropertyId(rawPath);
+    return (id == PropId_Tag) ? kUnmappedPropId : id;
+}
+
+bool IsAnimationTimelineTag(std::string_view shortTag) noexcept {
+    return shortTag == "DoubleAnimation" ||
+           shortTag == "SingleAnimation" ||
+           shortTag == "ColorAnimation" ||
+           shortTag == "ThicknessAnimation" ||
+           shortTag == "PointAnimation" ||
+           shortTag == "DoubleAnimationUsingKeyFrames" ||
+           shortTag == "SingleAnimationUsingKeyFrames" ||
+           shortTag == "ColorAnimationUsingKeyFrames" ||
+           shortTag == "ThicknessAnimationUsingKeyFrames" ||
+           shortTag == "BooleanAnimationUsingKeyFrames" ||
+           shortTag == "ObjectAnimationUsingKeyFrames" ||
+           shortTag == "PointAnimationUsingKeyFrames";
+}
+
+bool IsAnimationKeyFrameTag(std::string_view shortTag) noexcept {
+    return EndsWith(shortTag, "DoubleKeyFrame") ||
+           EndsWith(shortTag, "SingleKeyFrame") ||
+           EndsWith(shortTag, "ColorKeyFrame") ||
+           EndsWith(shortTag, "ThicknessKeyFrame") ||
+           EndsWith(shortTag, "BooleanKeyFrame") ||
+           EndsWith(shortTag, "ObjectKeyFrame") ||
+           EndsWith(shortTag, "PointKeyFrame");
+}
+
+bool IsEasingFunctionTag(std::string_view shortTag) noexcept {
+    return shortTag.size() > 4u && EndsWith(shortTag, "Ease");
+}
+
+std::int32_t ParseRepeatCountAttr(std::string_view rawVal) noexcept {
+    rawVal = Trim(rawVal);
+    if (rawVal.empty()) {
+        return 1;
+    }
+    if (EqualsIgnoreCase(rawVal, "Forever")) {
+        return 0;
+    }
+    if (rawVal.back() == 'x' || rawVal.back() == 'X') {
+        rawVal.remove_suffix(1);
+    }
+    const float f = ParseFloat32(rawVal, 1.0f);
+    return (f <= 0.0f) ? 0 : std::max<std::int32_t>(1, static_cast<std::int32_t>(std::lround(f)));
+}
+
+struct ParsedBindingClause {
+    bool isValidBinding = false;
+    BindingMode mode = BindingMode::OneWay;
+    std::string_view pathPart;
+    std::string_view fallbackValue;
+    std::string_view elementName;
+    std::string relativeAncestorType;
+    bool relativeSelf = false;
+    ValueConverterKind converter = ValueConverterKind::None;
+};
+
+ParsedBindingClause ParseBindingMarkupExpression(std::string_view rawExpr) {
+    ParsedBindingClause out{};
+    std::string_view v = Trim(rawExpr);
+    if (v.size() < 2u || v.front() != '{' || v.back() != '}') {
+        return out;
+    }
+    std::string_view inner = Trim(v.substr(1u, v.size() - 2u));
+    if (inner == "Binding" || inner == "Bind") {
+        out.isValidBinding = true;
+        return out;
+    }
+    if (inner.rfind("Binding ", 0) == 0) {
+        inner = Trim(inner.substr(8u));
+    } else if (inner.rfind("Bind ", 0) == 0) {
+        inner = Trim(inner.substr(5u));
+    } else {
+        return out;
+    }
+    out.isValidBinding = true;
+
+    std::size_t pos = 0u;
+    bool firstClause = true;
+    while (pos < inner.size()) {
+        int braceDepth = 0;
+        std::size_t end = pos;
+        while (end < inner.size()) {
+            if (inner[end] == '{') ++braceDepth;
+            else if (inner[end] == '}' && braceDepth > 0) --braceDepth;
+            else if (inner[end] == ',' && braceDepth == 0) break;
+            ++end;
+        }
+        const std::string_view clause = Trim(inner.substr(pos, end - pos));
+        if (clause.rfind("Path=", 0) == 0) {
+            out.pathPart = Trim(clause.substr(5u));
+        } else if (clause.rfind("Mode=", 0) == 0) {
+            const std::string_view mStr = Trim(clause.substr(5u));
+            if (mStr == "TwoWay") out.mode = BindingMode::TwoWay;
+            else if (mStr == "OneTime") out.mode = BindingMode::OneTime;
+        } else if (clause.rfind("FallbackValue=", 0) == 0) {
+            out.fallbackValue = Trim(clause.substr(14u));
+        } else if (clause.rfind("ElementName=", 0) == 0) {
+            out.elementName = Trim(clause.substr(12u));
+        } else if (clause.rfind("Converter=", 0) == 0) {
+            const std::string_view convExpr = Trim(clause.substr(10u));
+            const std::string_view convKey = ExtractMarkupResourceKey(convExpr);
+            out.converter = ParseValueConverterKind(!convKey.empty() ? convKey : convExpr);
+        } else if (clause.rfind("RelativeSource=", 0) == 0) {
+            std::string_view rsExpr = Trim(clause.substr(15u));
+            if (rsExpr.size() > 2u && rsExpr.front() == '{' && rsExpr.back() == '}') {
+                rsExpr = Trim(rsExpr.substr(1u, rsExpr.size() - 2u));
+            }
+            if (rsExpr.find("Self") != std::string_view::npos) {
+                out.relativeSelf = true;
+            } else if (const auto ancPos = rsExpr.find("AncestorType="); ancPos != std::string_view::npos) {
+                std::string_view ancVal = Trim(rsExpr.substr(ancPos + 13u));
+                int bd = 0;
+                std::size_t ae = 0u;
+                while (ae < ancVal.size()) {
+                    if (ancVal[ae] == '{') ++bd;
+                    else if (ancVal[ae] == '}' && bd > 0) --bd;
+                    else if (ancVal[ae] == ',' && bd == 0) break;
+                    ++ae;
+                }
+                out.relativeAncestorType = ExtractTargetTypeShortName(ancVal.substr(0, ae));
+            }
+        } else if (firstClause && clause.find('=') == std::string_view::npos) {
+            out.pathPart = clause;
+        }
+        firstClause = false;
+        if (end >= inner.size()) break;
+        pos = end + 1u;
+    }
+
+    // Strip parentheses around attached property paths like "(noesis:DragDrop.IsContentEmpty)"
+    if (out.pathPart.size() > 2u && out.pathPart.front() == '(' && out.pathPart.back() == ')') {
+        out.pathPart = Trim(out.pathPart.substr(1u, out.pathPart.size() - 2u));
+    }
+    return out;
+}
+
+bool FindMatchingClosingTag(
+    std::string_view xml,
+    std::size_t innerStartPos,
+    std::string_view targetShortTag,
+    std::size_t& outInnerEnd,
+    std::size_t& outAfterCloseTag) noexcept {
+    std::size_t cur = innerStartPos;
+    int depth = 1;
+    while (cur < xml.size()) {
+        const std::size_t lt = xml.find('<', cur);
+        if (lt == std::string_view::npos) {
+            return false;
+        }
+        if (xml.substr(lt + 1u, 3u) == "!--") {
+            const std::size_t endC = xml.find("-->", lt + 4u);
+            if (endC == std::string_view::npos) return false;
+            cur = endC + 3u;
+            continue;
+        }
+        if (lt + 1u < xml.size() && xml[lt + 1u] == '?') {
+            const std::size_t endP = xml.find("?>", lt + 2u);
+            if (endP == std::string_view::npos) return false;
+            cur = endP + 2u;
+            continue;
+        }
+        const bool isClose = (lt + 1u < xml.size() && xml[lt + 1u] == '/');
+        const std::size_t nameStart = isClose ? (lt + 2u) : (lt + 1u);
+        std::size_t nameEnd = nameStart;
+        while (nameEnd < xml.size() &&
+               !std::isspace(static_cast<unsigned char>(xml[nameEnd])) &&
+               xml[nameEnd] != '>' && xml[nameEnd] != '/') {
+            ++nameEnd;
+        }
+        const std::string_view st = StripXmlPrefix(xml.substr(nameStart, nameEnd - nameStart));
+        // Advance to end of tag '>' respecting quotes
+        std::size_t scan = nameEnd;
+        bool selfClose = false;
+        while (scan < xml.size()) {
+            if (xml[scan] == '"' || xml[scan] == '\'') {
+                const char q = xml[scan++];
+                while (scan < xml.size() && xml[scan] != q) ++scan;
+                if (scan < xml.size()) ++scan;
+                continue;
+            }
+            if (xml[scan] == '>') {
+                std::size_t prev = scan;
+                while (prev > nameEnd && std::isspace(static_cast<unsigned char>(xml[prev - 1u]))) {
+                    --prev;
+                }
+                if (prev > nameEnd && xml[prev - 1u] == '/') {
+                    selfClose = true;
+                }
+                ++scan;
+                break;
+            }
+            ++scan;
+        }
+        if (st == targetShortTag) {
+            if (isClose) {
+                --depth;
+                if (depth == 0) {
+                    outInnerEnd = lt;
+                    outAfterCloseTag = scan;
+                    return true;
+                }
+            } else if (!selfClose) {
+                ++depth;
+            }
+        }
+        cur = scan;
+    }
+    return false;
+}
+
+enum class XmlScopeKind : std::uint8_t {
+    VisualElement = 0,
+    TransparentContainer = 1,
+    RunInline = 2,
+    ResourceContainer = 3,
+    KeyedResourceItem = 4,
+    BrushPropertyElement = 5,
+    TransformPropertyElement = 6,
+    TransformChildNode = 7,
+    NonVisualSkip = 8,
+};
+
+struct XmlScopeEntry {
+    XmlScopeKind kind = XmlScopeKind::VisualElement;
+    std::string tagName;
+    std::string resourceKey;
+    std::string inlineStyleKey;
+    std::uint16_t targetPropId = PropId_Background;
+    bool brushAssigned = false;
+    bool isItemTemplateContainer = false;
+    Matrix2D accumulatedTransform = Matrix2D::Identity();
+    std::string accumulatedText;
+};
+
+enum class SetterOwnerKind : std::uint8_t {
+    Style = 0,
+    Trigger = 1,
+    VisualState = 2,
+};
+
+enum class StoryboardOwnerKind : std::uint8_t {
+    StandaloneResource = 0,
+    TriggerEnter = 1,
+    TriggerExit = 2,
+    VisualState = 3,
+    EventTrigger = 4,
+    IgnoredEventTrigger = 5,
+};
+
+struct ActiveStyleScope {
+    AxbStyleDefinition def{};
+    std::size_t scopeDepth = 0;
+    std::size_t controlTemplateTriggersDepth = 0;
+    bool isInlinePropertyElement = false;
+};
+
+struct ActiveTriggerScope {
+    AxbStyleTrigger trig{};
+    std::size_t scopeDepth = 0;
+    std::size_t enterActionsDepth = 0;
+    std::size_t exitActionsDepth = 0;
+    bool isDataTrigger = false;
+    bool hasUnsupportedCondition = false;
+};
+
+struct ActiveEventTriggerScope {
+    AxbEventTrigger et{};
+    std::size_t scopeDepth = 0;
+    bool recognized = false;
+};
+
+struct ActiveVsgScope {
+    AxbVisualStateGroup group{};
+    std::size_t scopeDepth = 0;
+    std::size_t transitionsDepth = 0;
+};
+
+struct ActiveVisualStateScope {
+    AxbVisualState state{};
+    std::size_t scopeDepth = 0;
+};
+
+struct ActiveStoryboardScope {
+    AxbStoryboard sb{};
+    std::string defaultTargetName;
+    std::string defaultTargetProperty;
+    StoryboardOwnerKind owner = StoryboardOwnerKind::StandaloneResource;
+    std::size_t scopeDepth = 0;
+};
+
+struct ActiveTimelineScope {
+    AxbAnimationTimeline tl{};
+    std::size_t scopeDepth = 0;
+};
+
+struct ActiveKeyFrameScope {
+    AxbKeyFrame kf{};
+    std::size_t scopeDepth = 0;
+};
+
+struct ActiveSetterScope {
+    AxbPropertySetter setter{"", kUnmappedPropId, {}};
+    SetterOwnerKind owner = SetterOwnerKind::Style;
+    bool hasValue = false;
+    std::size_t scopeDepth = 0;
+};
+
 } // namespace
 
 // ============================================================================
@@ -117,6 +515,7 @@ AeroCompileResult AeroCompiler::Compile(const AeroCompileInput& input) const {
     std::size_t pos = 0;
     bool seenRoot = false;
     std::unordered_set<std::uint64_t> bakedPathHashes;
+    std::uint32_t nextInlineVsmStyleId = 0u;
 
     auto ensurePathBakedIntoPackage = [&](std::string_view svgPathData) {
         svgPathData = Trim(svgPathData);
@@ -153,29 +552,18 @@ AeroCompileResult AeroCompiler::Compile(const AeroCompileInput& input) const {
         pkg.instructions.push_back(std::move(ltInst));
     };
 
-    enum class XmlScopeKind : std::uint8_t {
-        VisualElement = 0,
-        TransparentContainer = 1,
-        RunInline = 2,
-        ResourceContainer = 3,
-        KeyedResourceItem = 4,
-        BrushPropertyElement = 5,
-        TransformPropertyElement = 6,
-        TransformChildNode = 7,
-        NonVisualSkip = 8,
-    };
-
-    struct XmlScopeEntry {
-        XmlScopeKind kind = XmlScopeKind::VisualElement;
-        std::string tagName;
-        std::string resourceKey;
-        std::uint16_t targetPropId = PropId_Background;
-        bool brushAssigned = false;
-        Matrix2D accumulatedTransform = Matrix2D::Identity();
-        std::string accumulatedText;
-    };
-
     std::vector<XmlScopeEntry> scopeStack;
+    std::vector<ActiveStyleScope> styleStack;
+    std::vector<ActiveTriggerScope> triggerStack;
+    std::vector<ActiveEventTriggerScope> eventTriggerStack;
+    std::uint32_t nextInlineDataTplId = 0u;
+    std::string dtRootTriggersStyleKey;
+    std::vector<ActiveVsgScope> vsgStack;
+    std::vector<ActiveVisualStateScope> visualStateStack;
+    std::vector<ActiveStoryboardScope> storyboardStack;
+    std::vector<ActiveTimelineScope> timelineStack;
+    std::vector<ActiveKeyFrameScope> keyFrameStack;
+    std::vector<ActiveSetterScope> setterStack;
     std::size_t nonVisualDepth = 0;
 
     auto findEnclosingTransformScope = [&]() noexcept -> XmlScopeEntry* {
@@ -199,6 +587,159 @@ AeroCompileResult AeroCompiler::Compile(const AeroCompileInput& input) const {
         return AxbTemplateRegistry::Instance().FindResource(key);
     };
 
+    auto findLocalOrGlobalStoryboard = [&](std::string_view key) -> const AxbStoryboard* {
+        for (auto it = pkg.storyboards.rbegin(); it != pkg.storyboards.rend(); ++it) {
+            if (it->key == key) {
+                return &(*it);
+            }
+        }
+        return AxbTemplateRegistry::Instance().FindStoryboard(key);
+    };
+
+    auto parseStyleOrAnimationValue = [&](std::uint16_t propId, std::string_view rawVal, bool& outValid) -> UnifiedValue {
+        outValid = false;
+        if (propId == kUnmappedPropId) {
+            return UnifiedValue{};
+        }
+        const std::string_view trimmed = Trim(rawVal);
+        if (trimmed.size() > 2u && trimmed.front() == '{' && trimmed.back() == '}') {
+            const std::string_view resKey = ExtractMarkupResourceKey(trimmed);
+            if (!resKey.empty()) {
+                if (const UnifiedValue* rv = findLocalOrGlobalResource(resKey)) {
+                    outValid = true;
+                    if (propId == PropId_PathData) {
+                        if (const auto* sv = std::get_if<StringValue>(rv)) {
+                            ensurePathBakedIntoPackage(sv->view());
+                        }
+                    }
+                    return *rv;
+                }
+            }
+            return UnifiedValue{};
+        }
+        outValid = true;
+        UnifiedValue parsed = ParseLiteralPropertyValue(propId, trimmed);
+        if (propId == PropId_PathData) {
+            if (const auto* sv = std::get_if<StringValue>(&parsed)) {
+                ensurePathBakedIntoPackage(sv->view());
+            }
+        }
+        return parsed;
+    };
+
+    auto commitSetterToOwner = [&](AxbPropertySetter&& s, SetterOwnerKind owner) {
+        if (s.propId == kUnmappedPropId || std::holds_alternative<std::monostate>(s.value)) {
+            return;
+        }
+        if (owner == SetterOwnerKind::VisualState && !visualStateStack.empty()) {
+            visualStateStack.back().state.setters.push_back(std::move(s));
+        } else if (owner == SetterOwnerKind::Trigger && !triggerStack.empty()) {
+            triggerStack.back().trig.setters.push_back(std::move(s));
+        } else if (owner == SetterOwnerKind::Style && !styleStack.empty()) {
+            styleStack.back().def.setters.push_back(std::move(s));
+        }
+    };
+
+    auto buildDataTriggerCondition = [&](std::string_view bindingAttr,
+                                         std::string_view valAttr,
+                                         bool hasValAttr,
+                                         AxbTriggerCondition& outCond) -> bool {
+        if (!hasValAttr) {
+            return false;
+        }
+        const ParsedBindingClause parsed = ParseBindingMarkupExpression(bindingAttr);
+        if (!parsed.isValidBinding) {
+            return false;
+        }
+        const std::string_view trimmedVal = Trim(valAttr);
+        outCond = AxbTriggerCondition{};
+        outCond.converter = parsed.converter;
+        if (trimmedVal.size() > 2u && trimmedVal.front() == '{' && trimmedVal.back() == '}') {
+            const std::string_view innerV = Trim(trimmedVal.substr(1u, trimmedVal.size() - 2u));
+            if (innerV.rfind("x:Null", 0) == 0) {
+                outCond.expectNull = true;
+            } else {
+                const std::string_view resK = ExtractMarkupResourceKey(trimmedVal);
+                if (!resK.empty()) {
+                    if (const UnifiedValue* rv = findLocalOrGlobalResource(resK)) {
+                        outCond.expectedValue = *rv;
+                    } else {
+                        return false;
+                    }
+                } else {
+                    return false;
+                }
+            }
+        }
+
+        if (parsed.relativeSelf) {
+            outCond.sourceKind = TriggerConditionSource::SelfProperty;
+            outCond.propId = ResolveMappedTriggerConditionId(parsed.pathPart);
+            if (outCond.propId == kUnmappedPropId) return false;
+            if (!outCond.expectNull && std::holds_alternative<std::monostate>(outCond.expectedValue)) {
+                bool ok = false;
+                outCond.expectedValue = parseStyleOrAnimationValue(outCond.propId, trimmedVal, ok);
+                if (!ok) outCond.expectedValue = value::FromString(DecodeXamlXmlEntities(trimmedVal));
+            }
+            return true;
+        }
+
+        if (!parsed.elementName.empty()) {
+            outCond.sourceKind = TriggerConditionSource::ElementNameProperty;
+            outCond.sourceName = std::string(parsed.elementName);
+            outCond.propId = ResolveMappedTriggerConditionId(parsed.pathPart);
+            if (outCond.propId == kUnmappedPropId) return false;
+            if (!outCond.expectNull && std::holds_alternative<std::monostate>(outCond.expectedValue)) {
+                if (outCond.propId == PropId_SelectedItem || outCond.propId == PropId_Text ||
+                    outCond.propId == PropId_Content || outCond.propId == PropId_Tag) {
+                    outCond.expectedValue = value::FromString(DecodeXamlXmlEntities(trimmedVal));
+                } else {
+                    bool ok = false;
+                    outCond.expectedValue = parseStyleOrAnimationValue(outCond.propId, trimmedVal, ok);
+                    if (!ok) outCond.expectedValue = value::FromString(DecodeXamlXmlEntities(trimmedVal));
+                }
+            }
+            return true;
+        }
+
+        if (!parsed.relativeAncestorType.empty()) {
+            outCond.sourceKind = TriggerConditionSource::AncestorProperty;
+            outCond.sourceName = parsed.relativeAncestorType;
+            outCond.propId = ResolveMappedTriggerConditionId(parsed.pathPart);
+            if (outCond.propId == kUnmappedPropId) return false;
+            if (!outCond.expectNull && std::holds_alternative<std::monostate>(outCond.expectedValue)) {
+                bool ok = false;
+                outCond.expectedValue = parseStyleOrAnimationValue(outCond.propId, trimmedVal, ok);
+                if (!ok) outCond.expectedValue = value::FromString(DecodeXamlXmlEntities(trimmedVal));
+            }
+            return true;
+        }
+
+        // DataContext Binding (single-hop, multi-hop, or empty "{Binding}" to DataContext itself)
+        outCond.sourceKind = TriggerConditionSource::DataContextBinding;
+        outCond.bindingPath = std::string(parsed.pathPart);
+        if (!parsed.pathPart.empty() && parsed.pathPart != ".") {
+            std::size_t segPos = 0u;
+            while (segPos < parsed.pathPart.size()) {
+                const std::size_t dot = parsed.pathPart.find('.', segPos);
+                const std::string_view seg = (dot == std::string_view::npos)
+                    ? parsed.pathPart.substr(segPos)
+                    : parsed.pathPart.substr(segPos, dot - segPos);
+                if (!seg.empty()) {
+                    AxbCompiledHop hop{};
+                    hop.memberName = std::string(seg);
+                    outCond.compiledHops.push_back(std::move(hop));
+                }
+                if (dot == std::string_view::npos) break;
+                segPos = dot + 1u;
+            }
+        }
+        if (!outCond.expectNull && std::holds_alternative<std::monostate>(outCond.expectedValue)) {
+            outCond.expectedValue = value::FromString(DecodeXamlXmlEntities(trimmedVal));
+        }
+        return true;
+    };
+
     auto isNonVisualElementTag = [](std::string_view shortTag) noexcept -> bool {
         return shortTag == "Style" ||
                shortTag == "ControlTemplate" ||
@@ -214,6 +755,7 @@ AeroCompileResult AeroCompiler::Compile(const AeroCompileInput& input) const {
                shortTag == "DataTrigger" ||
                shortTag == "MultiTrigger" ||
                shortTag == "MultiDataTrigger" ||
+               shortTag == "Condition" ||
                shortTag == "Setter" ||
                shortTag == "TransformGroup" ||
                shortTag == "ScaleTransform" ||
@@ -222,20 +764,9 @@ AeroCompileResult AeroCompiler::Compile(const AeroCompileInput& input) const {
                shortTag == "SkewTransform" ||
                shortTag == "MatrixTransform" ||
                shortTag == "Matrix" ||
-               shortTag == "DoubleAnimation" ||
-               shortTag == "DoubleAnimationUsingKeyFrames" ||
-               shortTag == "ColorAnimation" ||
-               shortTag == "ColorAnimationUsingKeyFrames" ||
-               shortTag == "BooleanAnimationUsingKeyFrames" ||
-               shortTag == "ObjectAnimationUsingKeyFrames" ||
-               shortTag == "PointAnimationUsingKeyFrames" ||
-               shortTag == "EasingDoubleKeyFrame" ||
-               shortTag == "LinearDoubleKeyFrame" ||
-               shortTag == "DiscreteDoubleKeyFrame" ||
-               shortTag == "SplineDoubleKeyFrame" ||
-               shortTag == "EasingColorKeyFrame" ||
-               shortTag == "LinearColorKeyFrame" ||
-               shortTag == "DiscreteBooleanKeyFrame" ||
+               IsAnimationTimelineTag(shortTag) ||
+               IsAnimationKeyFrameTag(shortTag) ||
+               IsEasingFunctionTag(shortTag) ||
                shortTag == "Geometry" ||
                shortTag == "PathGeometry" ||
                shortTag == "StreamGeometry" ||
@@ -274,7 +805,8 @@ AeroCompileResult AeroCompiler::Compile(const AeroCompileInput& input) const {
                     const std::string_view st = StripXmlPrefix(top.tagName);
                     if (st == "TextBlock" || st == "Label" || st == "Button" ||
                         st == "RepeatButton" || st == "ToggleButton" ||
-                        st == "CheckBox" || st == "RadioButton" || st == "Hyperlink") {
+                        st == "CheckBox" || st == "RadioButton" || st == "Hyperlink" ||
+                        st == "ComboBoxItem" || st == "ListBoxItem") {
                         if (!top.accumulatedText.empty()) top.accumulatedText.push_back(' ');
                         top.accumulatedText += DecodeXamlXmlEntities(rawInner);
                     }
@@ -303,6 +835,164 @@ AeroCompileResult AeroCompiler::Compile(const AeroCompileInput& input) const {
         if (src[pos] == '/') {
             const std::size_t gt = src.find('>', pos + 1);
             if (!scopeStack.empty()) {
+                const std::size_t closingDepth = scopeStack.size();
+
+                if (!keyFrameStack.empty() && keyFrameStack.back().scopeDepth == closingDepth) {
+                    ActiveKeyFrameScope finishedKf = std::move(keyFrameStack.back());
+                    keyFrameStack.pop_back();
+                    if (!timelineStack.empty() &&
+                        !std::holds_alternative<std::monostate>(finishedKf.kf.value)) {
+                        timelineStack.back().tl.keyFrames.push_back(std::move(finishedKf.kf));
+                    }
+                }
+
+                if (!timelineStack.empty() && timelineStack.back().scopeDepth == closingDepth) {
+                    ActiveTimelineScope finishedTl = std::move(timelineStack.back());
+                    timelineStack.pop_back();
+                    if (!storyboardStack.empty() && finishedTl.tl.targetPropertyId != kUnmappedPropId) {
+                        std::sort(
+                            finishedTl.tl.keyFrames.begin(),
+                            finishedTl.tl.keyFrames.end(),
+                            [](const AxbKeyFrame& a, const AxbKeyFrame& b) {
+                                return a.timeSeconds < b.timeSeconds;
+                            });
+                        storyboardStack.back().sb.timelines.push_back(std::move(finishedTl.tl));
+                    }
+                }
+
+                if (!storyboardStack.empty() && storyboardStack.back().scopeDepth == closingDepth) {
+                    ActiveStoryboardScope finishedSb = std::move(storyboardStack.back());
+                    storyboardStack.pop_back();
+                    switch (finishedSb.owner) {
+                        case StoryboardOwnerKind::StandaloneResource:
+                            if (!finishedSb.sb.key.empty() || !finishedSb.sb.timelines.empty()) {
+                                pkg.storyboards.push_back(std::move(finishedSb.sb));
+                            }
+                            break;
+                        case StoryboardOwnerKind::TriggerEnter:
+                            if (!triggerStack.empty() && !finishedSb.sb.timelines.empty()) {
+                                triggerStack.back().trig.enterStoryboards.push_back(std::move(finishedSb.sb));
+                            }
+                            break;
+                        case StoryboardOwnerKind::TriggerExit:
+                            if (!triggerStack.empty() && !finishedSb.sb.timelines.empty()) {
+                                triggerStack.back().trig.exitStoryboards.push_back(std::move(finishedSb.sb));
+                            }
+                            break;
+                        case StoryboardOwnerKind::VisualState:
+                            if (!visualStateStack.empty()) {
+                                visualStateStack.back().state.storyboard = std::move(finishedSb.sb);
+                            }
+                            break;
+                        case StoryboardOwnerKind::EventTrigger:
+                            if (!eventTriggerStack.empty() && !finishedSb.sb.timelines.empty()) {
+                                eventTriggerStack.back().et.storyboards.push_back(std::move(finishedSb.sb));
+                            }
+                            break;
+                        case StoryboardOwnerKind::IgnoredEventTrigger:
+                            break;
+                    }
+                }
+
+                if (!setterStack.empty() && setterStack.back().scopeDepth == closingDepth) {
+                    ActiveSetterScope finishedSetter = std::move(setterStack.back());
+                    setterStack.pop_back();
+                    if (finishedSetter.hasValue) {
+                        commitSetterToOwner(std::move(finishedSetter.setter), finishedSetter.owner);
+                    }
+                }
+
+                if (!visualStateStack.empty() && visualStateStack.back().scopeDepth == closingDepth) {
+                    ActiveVisualStateScope finishedVs = std::move(visualStateStack.back());
+                    visualStateStack.pop_back();
+                    if (!vsgStack.empty() && !finishedVs.state.name.empty()) {
+                        vsgStack.back().group.states.push_back(std::move(finishedVs.state));
+                    }
+                }
+
+                if (!vsgStack.empty() && vsgStack.back().transitionsDepth == closingDepth) {
+                    vsgStack.back().transitionsDepth = 0u;
+                }
+                if (!vsgStack.empty() && vsgStack.back().scopeDepth == closingDepth) {
+                    ActiveVsgScope finishedVsg = std::move(vsgStack.back());
+                    vsgStack.pop_back();
+                    if (!styleStack.empty() && !finishedVsg.group.states.empty()) {
+                        styleStack.back().def.visualStateGroups.push_back(std::move(finishedVsg.group));
+                    }
+                }
+
+                if (!triggerStack.empty()) {
+                    if (triggerStack.back().enterActionsDepth == closingDepth) {
+                        triggerStack.back().enterActionsDepth = 0u;
+                    }
+                    if (triggerStack.back().exitActionsDepth == closingDepth) {
+                        triggerStack.back().exitActionsDepth = 0u;
+                    }
+                    if (triggerStack.back().scopeDepth == closingDepth) {
+                        ActiveTriggerScope finishedTrig = std::move(triggerStack.back());
+                        triggerStack.pop_back();
+                        if (!styleStack.empty() &&
+                            !finishedTrig.hasUnsupportedCondition &&
+                            !finishedTrig.trig.conditions.empty()) {
+                            styleStack.back().def.triggers.push_back(std::move(finishedTrig.trig));
+                        }
+                    }
+                }
+
+                if (!eventTriggerStack.empty() && eventTriggerStack.back().scopeDepth == closingDepth) {
+                    ActiveEventTriggerScope finishedEt = std::move(eventTriggerStack.back());
+                    eventTriggerStack.pop_back();
+                    if (!styleStack.empty() && finishedEt.recognized && !finishedEt.et.storyboards.empty()) {
+                        styleStack.back().def.eventTriggers.push_back(std::move(finishedEt.et));
+                    }
+                }
+
+                if (!styleStack.empty()) {
+                    if (styleStack.back().controlTemplateTriggersDepth == closingDepth) {
+                        styleStack.back().controlTemplateTriggersDepth = 0u;
+                    }
+                    if (styleStack.back().scopeDepth == closingDepth) {
+                        ActiveStyleScope finishedStyle = std::move(styleStack.back());
+                        styleStack.pop_back();
+                        if (!finishedStyle.def.key.empty() || !finishedStyle.def.targetTypeName.empty()) {
+                            bool mergedExisting = false;
+                            if (!finishedStyle.def.key.empty()) {
+                                for (auto& existing : pkg.styles) {
+                                    if (existing.key == finishedStyle.def.key) {
+                                        if (existing.targetTypeName.empty() && !finishedStyle.def.targetTypeName.empty()) {
+                                            existing.targetTypeName = finishedStyle.def.targetTypeName;
+                                        }
+                                        if (existing.basedOnKey.empty() && !finishedStyle.def.basedOnKey.empty()) {
+                                            existing.basedOnKey = finishedStyle.def.basedOnKey;
+                                        }
+                                        existing.setters.insert(
+                                            existing.setters.end(),
+                                            finishedStyle.def.setters.begin(),
+                                            finishedStyle.def.setters.end());
+                                        existing.triggers.insert(
+                                            existing.triggers.end(),
+                                            finishedStyle.def.triggers.begin(),
+                                            finishedStyle.def.triggers.end());
+                                        existing.eventTriggers.insert(
+                                            existing.eventTriggers.end(),
+                                            finishedStyle.def.eventTriggers.begin(),
+                                            finishedStyle.def.eventTriggers.end());
+                                        existing.visualStateGroups.insert(
+                                            existing.visualStateGroups.end(),
+                                            finishedStyle.def.visualStateGroups.begin(),
+                                            finishedStyle.def.visualStateGroups.end());
+                                        mergedExisting = true;
+                                        break;
+                                    }
+                                }
+                            }
+                            if (!mergedExisting) {
+                                pkg.styles.push_back(std::move(finishedStyle.def));
+                            }
+                        }
+                    }
+                }
+
                 XmlScopeEntry closed = std::move(scopeStack.back());
                 scopeStack.pop_back();
                 if (closed.kind == XmlScopeKind::ResourceContainer ||
@@ -372,7 +1062,8 @@ AeroCompileResult AeroCompiler::Compile(const AeroCompileInput& input) const {
                     AxbInstruction endInst{};
                     endInst.opcode = AxbOpcode::EndElement;
                     pkg.instructions.push_back(std::move(endInst));
-                } else if (closed.kind == XmlScopeKind::ResourceContainer && scopeStack.empty()) {
+                } else if (closed.kind == XmlScopeKind::ResourceContainer && scopeStack.empty() &&
+                           pkg.rootTypeName == "ResourceDictionary") {
                     AxbInstruction endInst{};
                     endInst.opcode = AxbOpcode::EndElement;
                     pkg.instructions.push_back(std::move(endInst));
@@ -466,11 +1157,21 @@ AeroCompileResult AeroCompiler::Compile(const AeroCompileInput& input) const {
             }
         }
 
-        // Inside non-visual scope: handle resource extraction, 2D RenderTransform composition, or brush assignment
+        // Helper to push a NonVisualSkip scope and return the new scopeStack depth
+        auto pushNonVisualScope = [&](XmlScopeKind sk = XmlScopeKind::NonVisualSkip) -> std::size_t {
+            XmlScopeEntry entry{};
+            entry.kind = sk;
+            entry.tagName = std::string(tagName);
+            scopeStack.push_back(std::move(entry));
+            ++nonVisualDepth;
+            return scopeStack.size();
+        };
+
+        // Inside non-visual scope: handle Style/Trigger/Storyboard/VSM, resource extraction, 2D transforms, or brushes
         if (nonVisualDepth > 0) {
             XmlScopeEntry& parentScope = scopeStack.back();
 
-            // Active <Element.RenderTransform> / <Element.LayoutTransform> subtree
+            // 1. Active <Element.RenderTransform> / <Element.LayoutTransform> subtree
             if (XmlScopeEntry* tfScope = findEnclosingTransformScope()) {
                 auto resolveTransformResource = [&](std::string_view rawExpr, std::string_view attrName) -> const UnifiedValue* {
                     const std::string_view v = Trim(rawExpr);
@@ -615,15 +1316,607 @@ AeroCompileResult AeroCompiler::Compile(const AeroCompileInput& input) const {
                     tfScope->accumulatedTransform = Matrix2D::Multiply(step, tfScope->accumulatedTransform);
                 }
                 if (!selfClosing) {
-                    XmlScopeEntry childTf{};
-                    childTf.kind = XmlScopeKind::TransformChildNode;
-                    childTf.tagName = std::string(tagName);
-                    scopeStack.push_back(std::move(childTf));
-                    ++nonVisualDepth;
+                    (void)pushNonVisualScope(XmlScopeKind::TransformChildNode);
                 }
                 continue;
             }
 
+            // 2. Phase 5C: <Style>, <Trigger>, <MultiTrigger>, <VisualStateGroup>, <Storyboard>, <Setter>, <*Ease>
+            if (shortTag == "Style") {
+                if (!styleStack.empty() && styleStack.back().isInlinePropertyElement) {
+                    styleStack.back().isInlinePropertyElement = false;
+                    if (!xKey.empty()) {
+                        styleStack.back().def.key = std::string(xKey);
+                    }
+                    for (const auto& a : attrs) {
+                        if (a.name == "TargetType") {
+                            styleStack.back().def.targetTypeName = ExtractTargetTypeShortName(a.value);
+                        } else if (a.name == "BasedOn") {
+                            const std::string_view bKey = ExtractMarkupResourceKey(a.value);
+                            styleStack.back().def.basedOnKey = !bKey.empty()
+                                ? std::string(bKey)
+                                : std::string(Trim(a.value));
+                        }
+                    }
+                    if (!selfClosing) {
+                        (void)pushNonVisualScope();
+                    }
+                    continue;
+                }
+
+                AxbStyleDefinition styleDef{};
+                styleDef.key = std::string(xKey);
+                for (const auto& a : attrs) {
+                    if (a.name == "TargetType") {
+                        styleDef.targetTypeName = ExtractTargetTypeShortName(a.value);
+                    } else if (a.name == "BasedOn") {
+                        const std::string_view bKey = ExtractMarkupResourceKey(a.value);
+                        styleDef.basedOnKey = !bKey.empty()
+                            ? std::string(bKey)
+                            : std::string(Trim(a.value));
+                    }
+                }
+                if (selfClosing) {
+                    if (!styleDef.key.empty() || !styleDef.targetTypeName.empty()) {
+                        pkg.styles.push_back(std::move(styleDef));
+                    }
+                } else {
+                    const std::size_t depth = pushNonVisualScope();
+                    ActiveStyleScope sc{};
+                    sc.def = std::move(styleDef);
+                    sc.scopeDepth = depth;
+                    styleStack.push_back(std::move(sc));
+                }
+                continue;
+            }
+
+            if (shortTag == "ControlTemplate.Triggers") {
+                if (!selfClosing) {
+                    const std::size_t depth = pushNonVisualScope();
+                    if (!styleStack.empty()) {
+                        styleStack.back().controlTemplateTriggersDepth = depth;
+                    }
+                }
+                continue;
+            }
+
+            // Phase 5D: Compile <DataTemplate> inside ResourceDictionary or <ItemsControl.ItemTemplate>
+            if (shortTag == "DataTemplate" &&
+                (parentScope.kind == XmlScopeKind::ResourceContainer || parentScope.isItemTemplateContainer) &&
+                styleStack.empty()) {
+                std::string dtDataType;
+                for (const auto& a : attrs) {
+                    if (a.name == "DataType") {
+                        dtDataType = ExtractTargetTypeShortName(a.value);
+                    }
+                }
+                if (!selfClosing) {
+                    std::size_t innerEnd = 0u;
+                    std::size_t afterClose = 0u;
+                    if (FindMatchingClosingTag(src, pos, "DataTemplate", innerEnd, afterClose)) {
+                        const std::string_view innerXml = src.substr(pos, innerEnd - pos);
+                        const std::string outerScopeName = !pkg.className.empty()
+                            ? pkg.className
+                            : (!input.xamlPath.empty() ? input.xamlPath : pkg.rootTypeName);
+                        std::string dtKey;
+                        if (parentScope.isItemTemplateContainer) {
+                            dtKey = "__item_tpl_" + outerScopeName + "_" +
+                                    std::to_string(nextInlineDataTplId++);
+                        } else if (!xKey.empty()) {
+                            dtKey = std::string(xKey);
+                        } else {
+                            dtKey = "__implicit_dt_" + outerScopeName + "_" +
+                                    (dtDataType.empty() ? std::to_string(nextInlineDataTplId++) : dtDataType);
+                        }
+                        AxbTemplateRegistry::Instance().RegisterResources(pkg);
+                        AeroCompileInput subIn{};
+                        subIn.xamlPath = dtKey;
+                        subIn.xamlContent = std::string(innerXml);
+                        AeroCompileResult subRes = this->Compile(subIn);
+                        if (subRes.succeeded && !subRes.axbPackage.instructions.empty()) {
+                            AxbDataTemplate dt{};
+                            if (parentScope.isItemTemplateContainer) {
+                                dt.key = dtKey;
+                                AxbInstruction setTplInst{};
+                                setTplInst.opcode = AxbOpcode::SetStaticProperty;
+                                setTplInst.propId = PropId_ItemTemplate;
+                                setTplInst.literalValue = value::FromString(dt.key);
+                                pkg.instructions.push_back(std::move(setTplInst));
+                            } else {
+                                dt.key = std::string(xKey);
+                            }
+                            dt.dataTypeName = std::move(dtDataType);
+                            dt.templatePackage = std::make_shared<AxbPackage>(std::move(subRes.axbPackage));
+                            pkg.dataTemplates.push_back(std::move(dt));
+                        }
+                        pos = afterClose;
+                        continue;
+                    }
+                } else {
+                    continue;
+                }
+            }
+
+            if (shortTag == "EventTrigger" && !styleStack.empty()) {
+                AxbEventTrigger et{};
+                bool rec = false;
+                for (const auto& a : attrs) {
+                    if (a.name == "RoutedEvent") {
+                        et.eventKind = ParseRoutedTriggerEvent(a.value, rec);
+                    } else if (a.name == "SourceName") {
+                        et.sourceName = std::string(Trim(a.value));
+                    }
+                }
+                if (!selfClosing) {
+                    const std::size_t depth = pushNonVisualScope();
+                    ActiveEventTriggerScope ets{};
+                    ets.et = std::move(et);
+                    ets.scopeDepth = depth;
+                    ets.recognized = rec;
+                    eventTriggerStack.push_back(std::move(ets));
+                }
+                continue;
+            }
+
+            if ((shortTag == "Trigger" || shortTag == "MultiTrigger" ||
+                 shortTag == "DataTrigger" || shortTag == "MultiDataTrigger") &&
+                !styleStack.empty()) {
+                AxbStyleTrigger trig{};
+                trig.overrideLocalValues = (styleStack.back().controlTemplateTriggersDepth != 0u);
+                const bool isData = (shortTag == "DataTrigger" || shortTag == "MultiDataTrigger");
+                bool unsupportedCond = false;
+
+                if (shortTag == "Trigger") {
+                    std::string_view propAttr;
+                    std::string_view valAttr;
+                    bool hasValAttr = false;
+                    for (const auto& a : attrs) {
+                        if (a.name == "Property") {
+                            propAttr = a.value;
+                        } else if (a.name == "Value") {
+                            valAttr = a.value;
+                            hasValAttr = true;
+                        }
+                    }
+                    const std::uint16_t condPropId = ResolveMappedTriggerConditionId(propAttr);
+                    if (condPropId == kUnmappedPropId || !hasValAttr) {
+                        unsupportedCond = true;
+                    } else {
+                        bool ok = false;
+                        UnifiedValue expVal = parseStyleOrAnimationValue(condPropId, valAttr, ok);
+                        if (!ok) {
+                            unsupportedCond = true;
+                        } else {
+                            AxbTriggerCondition c{};
+                            c.propId = condPropId;
+                            c.expectedValue = std::move(expVal);
+                            trig.conditions.push_back(std::move(c));
+                        }
+                    }
+                } else if (shortTag == "DataTrigger") {
+                    std::string_view bindAttr;
+                    std::string_view valAttr;
+                    bool hasValAttr = false;
+                    for (const auto& a : attrs) {
+                        if (a.name == "Binding") {
+                            bindAttr = a.value;
+                        } else if (a.name == "Value") {
+                            valAttr = a.value;
+                            hasValAttr = true;
+                        }
+                    }
+                    AxbTriggerCondition dtCond{};
+                    if (buildDataTriggerCondition(bindAttr, valAttr, hasValAttr, dtCond)) {
+                        trig.conditions.push_back(std::move(dtCond));
+                    } else {
+                        unsupportedCond = true;
+                    }
+                }
+
+                if (!selfClosing) {
+                    const std::size_t depth = pushNonVisualScope();
+                    ActiveTriggerScope ts{};
+                    ts.trig = std::move(trig);
+                    ts.scopeDepth = depth;
+                    ts.isDataTrigger = isData;
+                    ts.hasUnsupportedCondition = unsupportedCond;
+                    triggerStack.push_back(std::move(ts));
+                }
+                continue;
+            }
+
+            if (shortTag == "Condition" && !triggerStack.empty()) {
+                std::string_view propAttr;
+                std::string_view bindAttr;
+                std::string_view valAttr;
+                bool hasBindAttr = false;
+                bool hasValAttr = false;
+                for (const auto& a : attrs) {
+                    if (a.name == "Property") propAttr = a.value;
+                    else if (a.name == "Binding") {
+                        bindAttr = a.value;
+                        hasBindAttr = true;
+                    } else if (a.name == "Value") {
+                        valAttr = a.value;
+                        hasValAttr = true;
+                    }
+                }
+                if (!triggerStack.back().hasUnsupportedCondition) {
+                    if (hasBindAttr || triggerStack.back().isDataTrigger) {
+                        AxbTriggerCondition dtCond{};
+                        if (buildDataTriggerCondition(bindAttr, valAttr, hasValAttr, dtCond)) {
+                            triggerStack.back().trig.conditions.push_back(std::move(dtCond));
+                        } else {
+                            triggerStack.back().hasUnsupportedCondition = true;
+                        }
+                    } else {
+                        const std::uint16_t condPropId = ResolveMappedTriggerConditionId(propAttr);
+                        if (condPropId == kUnmappedPropId || !hasValAttr) {
+                            triggerStack.back().hasUnsupportedCondition = true;
+                        } else {
+                            bool ok = false;
+                            UnifiedValue expVal = parseStyleOrAnimationValue(condPropId, valAttr, ok);
+                            if (!ok) {
+                                triggerStack.back().hasUnsupportedCondition = true;
+                            } else {
+                                AxbTriggerCondition c{};
+                                c.propId = condPropId;
+                                c.expectedValue = std::move(expVal);
+                                triggerStack.back().trig.conditions.push_back(std::move(c));
+                            }
+                        }
+                    }
+                }
+                if (!selfClosing) {
+                    (void)pushNonVisualScope();
+                }
+                continue;
+            }
+
+            if ((EndsWith(shortTag, ".EnterActions") || EndsWith(shortTag, ".ExitActions")) &&
+                !triggerStack.empty()) {
+                if (!selfClosing) {
+                    const std::size_t depth = pushNonVisualScope();
+                    if (EndsWith(shortTag, ".EnterActions")) {
+                        triggerStack.back().enterActionsDepth = depth;
+                    } else {
+                        triggerStack.back().exitActionsDepth = depth;
+                    }
+                }
+                continue;
+            }
+
+            if (shortTag == "BeginStoryboard") {
+                for (const auto& a : attrs) {
+                    if (a.name == "Storyboard") {
+                        const std::string_view sbKey = ExtractMarkupResourceKey(a.value);
+                        if (!sbKey.empty()) {
+                            if (const AxbStoryboard* foundSb = findLocalOrGlobalStoryboard(sbKey)) {
+                                if (!eventTriggerStack.empty()) {
+                                    eventTriggerStack.back().et.storyboards.push_back(*foundSb);
+                                } else if (!triggerStack.empty()) {
+                                    if (triggerStack.back().exitActionsDepth != 0u) {
+                                        triggerStack.back().trig.exitStoryboards.push_back(*foundSb);
+                                    } else if (triggerStack.back().enterActionsDepth != 0u) {
+                                        triggerStack.back().trig.enterStoryboards.push_back(*foundSb);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                if (!selfClosing) {
+                    (void)pushNonVisualScope();
+                }
+                continue;
+            }
+
+            if (shortTag == "VisualStateGroup" && !styleStack.empty()) {
+                AxbVisualStateGroup group{};
+                group.name = std::string(xName);
+                if (!selfClosing) {
+                    const std::size_t depth = pushNonVisualScope();
+                    ActiveVsgScope gs{};
+                    gs.group = std::move(group);
+                    gs.scopeDepth = depth;
+                    vsgStack.push_back(std::move(gs));
+                }
+                continue;
+            }
+
+            if (shortTag == "VisualStateGroup.Transitions" && !vsgStack.empty()) {
+                if (!selfClosing) {
+                    const std::size_t depth = pushNonVisualScope();
+                    vsgStack.back().transitionsDepth = depth;
+                }
+                continue;
+            }
+
+            if (shortTag == "VisualTransition" && !vsgStack.empty()) {
+                std::string_view fromState;
+                std::string_view toState;
+                for (const auto& a : attrs) {
+                    if (a.name == "From") fromState = Trim(a.value);
+                    else if (a.name == "To") toState = Trim(a.value);
+                    else if (a.name == "GeneratedDuration") {
+                        const float dur = ParseXamlTimeSpanSeconds(a.value, 0.0f);
+                        if ((fromState.empty() && toState.empty()) ||
+                            vsgStack.back().group.defaultTransitionDuration <= 0.0f) {
+                            vsgStack.back().group.defaultTransitionDuration = dur;
+                        }
+                    }
+                }
+                if (!selfClosing) {
+                    (void)pushNonVisualScope();
+                }
+                continue;
+            }
+
+            if (shortTag == "VisualState" && !vsgStack.empty()) {
+                AxbVisualState vs{};
+                vs.name = std::string(xName);
+                if (selfClosing) {
+                    if (!vs.name.empty()) {
+                        vsgStack.back().group.states.push_back(std::move(vs));
+                    }
+                } else {
+                    const std::size_t depth = pushNonVisualScope();
+                    ActiveVisualStateScope vss{};
+                    vss.state = std::move(vs);
+                    vss.scopeDepth = depth;
+                    visualStateStack.push_back(std::move(vss));
+                }
+                continue;
+            }
+
+            if (shortTag == "Storyboard") {
+                StoryboardOwnerKind sbOwner = StoryboardOwnerKind::IgnoredEventTrigger;
+                if (!visualStateStack.empty()) {
+                    sbOwner = StoryboardOwnerKind::VisualState;
+                } else if (!eventTriggerStack.empty()) {
+                    sbOwner = StoryboardOwnerKind::EventTrigger;
+                } else if (!triggerStack.empty() && triggerStack.back().exitActionsDepth != 0u) {
+                    sbOwner = StoryboardOwnerKind::TriggerExit;
+                } else if (!triggerStack.empty() && triggerStack.back().enterActionsDepth != 0u) {
+                    sbOwner = StoryboardOwnerKind::TriggerEnter;
+                } else if (parentScope.kind == XmlScopeKind::ResourceContainer) {
+                    sbOwner = StoryboardOwnerKind::StandaloneResource;
+                }
+
+                AxbStoryboard sb{};
+                sb.key = std::string(xKey);
+                std::string defTargetName;
+                std::string defTargetProp;
+                for (const auto& a : attrs) {
+                    if (a.name == "Storyboard.TargetName" || a.name == "TargetName") {
+                        defTargetName = std::string(Trim(a.value));
+                    } else if (a.name == "Storyboard.TargetProperty" || a.name == "TargetProperty") {
+                        defTargetProp = std::string(Trim(a.value));
+                    }
+                }
+
+                if (selfClosing) {
+                    if (sbOwner == StoryboardOwnerKind::StandaloneResource && !sb.key.empty()) {
+                        pkg.storyboards.push_back(std::move(sb));
+                    }
+                } else {
+                    const std::size_t depth = pushNonVisualScope();
+                    ActiveStoryboardScope sbs{};
+                    sbs.sb = std::move(sb);
+                    sbs.defaultTargetName = std::move(defTargetName);
+                    sbs.defaultTargetProperty = std::move(defTargetProp);
+                    sbs.owner = sbOwner;
+                    sbs.scopeDepth = depth;
+                    storyboardStack.push_back(std::move(sbs));
+                }
+                continue;
+            }
+
+            if (IsAnimationTimelineTag(shortTag) && !storyboardStack.empty()) {
+                AxbAnimationTimeline tl{};
+                tl.targetName = storyboardStack.back().defaultTargetName;
+                std::string rawTargetProp = storyboardStack.back().defaultTargetProperty;
+                std::string_view rawFrom;
+                std::string_view rawTo;
+                std::string_view rawBy;
+                bool hasFromAttr = false;
+                bool hasToAttr = false;
+                bool hasByAttr = false;
+
+                for (const auto& a : attrs) {
+                    if (a.name == "Storyboard.TargetName" || a.name == "TargetName") {
+                        tl.targetName = std::string(Trim(a.value));
+                    } else if (a.name == "Storyboard.TargetProperty" || a.name == "TargetProperty") {
+                        rawTargetProp = std::string(Trim(a.value));
+                    } else if (a.name == "BeginTime") {
+                        tl.beginTimeSeconds = ParseXamlTimeSpanSeconds(a.value, 0.0f);
+                    } else if (a.name == "Duration") {
+                        tl.durationSeconds = ParseXamlTimeSpanSeconds(a.value, 0.25f);
+                    } else if (a.name == "From") {
+                        rawFrom = a.value;
+                        hasFromAttr = true;
+                    } else if (a.name == "To") {
+                        rawTo = a.value;
+                        hasToAttr = true;
+                    } else if (a.name == "By") {
+                        rawBy = a.value;
+                        hasByAttr = true;
+                    } else if (a.name == "AutoReverse") {
+                        tl.autoReverse = EqualsIgnoreCase(Trim(a.value), "true") || Trim(a.value) == "1";
+                    } else if (a.name == "RepeatBehavior") {
+                        tl.repeatCount = ParseRepeatCountAttr(a.value);
+                    } else if (a.name == "FillBehavior") {
+                        tl.fillBehavior = EqualsIgnoreCase(Trim(a.value), "Stop")
+                            ? FillBehavior::Stop
+                            : FillBehavior::HoldEnd;
+                    }
+                }
+
+                tl.targetPropertyId = ResolveMappedAnimationPropertyId(rawTargetProp);
+                if (tl.targetPropertyId != kUnmappedPropId) {
+                    if (hasFromAttr) {
+                        bool ok = false;
+                        tl.fromValue = parseStyleOrAnimationValue(tl.targetPropertyId, rawFrom, ok);
+                        tl.hasFrom = ok;
+                    }
+                    if (hasToAttr) {
+                        bool ok = false;
+                        tl.toValue = parseStyleOrAnimationValue(tl.targetPropertyId, rawTo, ok);
+                        tl.hasTo = ok;
+                        tl.isBy = false;
+                    } else if (hasByAttr) {
+                        bool ok = false;
+                        tl.toValue = parseStyleOrAnimationValue(tl.targetPropertyId, rawBy, ok);
+                        tl.hasTo = ok;
+                        tl.isBy = ok;
+                    }
+                }
+
+                if (selfClosing) {
+                    if (tl.targetPropertyId != kUnmappedPropId) {
+                        storyboardStack.back().sb.timelines.push_back(std::move(tl));
+                    }
+                } else {
+                    const std::size_t depth = pushNonVisualScope();
+                    ActiveTimelineScope tls{};
+                    tls.tl = std::move(tl);
+                    tls.scopeDepth = depth;
+                    timelineStack.push_back(std::move(tls));
+                }
+                continue;
+            }
+
+            if (IsAnimationKeyFrameTag(shortTag) && !timelineStack.empty()) {
+                AxbKeyFrame kf{};
+                kf.isDiscrete =
+                    (shortTag.rfind("Discrete", 0) == 0) ||
+                    EndsWith(shortTag, "BooleanKeyFrame") ||
+                    EndsWith(shortTag, "ObjectKeyFrame");
+                if (shortTag.rfind("Spline", 0) == 0) {
+                    kf.easingKind = EasingFunctionKind::Cubic;
+                    kf.easingMode = EasingMode::EaseInOut;
+                }
+                const std::uint16_t targetPropId = timelineStack.back().tl.targetPropertyId;
+                for (const auto& a : attrs) {
+                    if (a.name == "KeyTime") {
+                        kf.timeSeconds = ParseXamlTimeSpanSeconds(a.value, 0.0f);
+                    } else if (a.name == "Value" && targetPropId != kUnmappedPropId) {
+                        bool ok = false;
+                        UnifiedValue parsed = parseStyleOrAnimationValue(targetPropId, a.value, ok);
+                        if (ok) {
+                            kf.value = std::move(parsed);
+                        }
+                    }
+                }
+                if (selfClosing) {
+                    if (!std::holds_alternative<std::monostate>(kf.value)) {
+                        timelineStack.back().tl.keyFrames.push_back(std::move(kf));
+                    }
+                } else {
+                    const std::size_t depth = pushNonVisualScope();
+                    ActiveKeyFrameScope kfs{};
+                    kfs.kf = std::move(kf);
+                    kfs.scopeDepth = depth;
+                    keyFrameStack.push_back(std::move(kfs));
+                }
+                continue;
+            }
+
+            if (IsEasingFunctionTag(shortTag)) {
+                EasingFunctionKind ek = ParseEasingFunctionKind(shortTag);
+                if (shortTag == "PowerEase") {
+                    ek = EasingFunctionKind::Quadratic;
+                    for (const auto& a : attrs) {
+                        if (a.name == "Power") {
+                            const int p = static_cast<int>(std::lround(ParseFloat32(a.value, 2.0f)));
+                            if (p <= 1) ek = EasingFunctionKind::Linear;
+                            else if (p == 2) ek = EasingFunctionKind::Quadratic;
+                            else if (p == 3) ek = EasingFunctionKind::Cubic;
+                            else if (p == 4) ek = EasingFunctionKind::Quartic;
+                            else ek = EasingFunctionKind::Quintic;
+                        }
+                    }
+                }
+                EasingMode em = EasingMode::EaseOut;
+                for (const auto& a : attrs) {
+                    if (a.name == "EasingMode") {
+                        em = ParseEasingMode(a.value);
+                    }
+                }
+                if (!keyFrameStack.empty()) {
+                    keyFrameStack.back().kf.easingKind = ek;
+                    keyFrameStack.back().kf.easingMode = em;
+                } else if (!timelineStack.empty()) {
+                    timelineStack.back().tl.easingKind = ek;
+                    timelineStack.back().tl.easingMode = em;
+                } else if (!vsgStack.empty()) {
+                    vsgStack.back().group.defaultEasingKind = ek;
+                    vsgStack.back().group.defaultEasingMode = em;
+                }
+                if (!selfClosing) {
+                    (void)pushNonVisualScope();
+                }
+                continue;
+            }
+
+            if (shortTag == "Setter" &&
+                (!visualStateStack.empty() || !triggerStack.empty() || !styleStack.empty())) {
+                SetterOwnerKind owner = SetterOwnerKind::Style;
+                if (!visualStateStack.empty()) {
+                    owner = SetterOwnerKind::VisualState;
+                } else if (!triggerStack.empty()) {
+                    owner = SetterOwnerKind::Trigger;
+                }
+
+                AxbPropertySetter setter{};
+                setter.propId = kUnmappedPropId;
+                std::string_view rawVal;
+                bool hasValAttr = false;
+                for (const auto& a : attrs) {
+                    if (a.name == "Property") {
+                        setter.propId = ResolveMappedSetterPropertyId(a.value);
+                    } else if (a.name == "TargetName") {
+                        setter.targetName = std::string(Trim(a.value));
+                    } else if (a.name == "Value") {
+                        rawVal = a.value;
+                        hasValAttr = true;
+                    }
+                }
+
+                bool hasValidVal = false;
+                if (setter.propId != kUnmappedPropId && hasValAttr) {
+                    setter.value = parseStyleOrAnimationValue(setter.propId, rawVal, hasValidVal);
+                }
+
+                if (selfClosing) {
+                    if (hasValidVal) {
+                        commitSetterToOwner(std::move(setter), owner);
+                    }
+                } else {
+                    const std::size_t depth = pushNonVisualScope();
+                    ActiveSetterScope ss{};
+                    ss.setter = std::move(setter);
+                    ss.owner = owner;
+                    ss.hasValue = hasValidVal;
+                    ss.scopeDepth = depth;
+                    setterStack.push_back(std::move(ss));
+                }
+                continue;
+            }
+
+            if (!setterStack.empty() && !setterStack.back().hasValue &&
+                setterStack.back().setter.propId != kUnmappedPropId &&
+                (shortTag == "SolidColorBrush" || shortTag == "GradientStop")) {
+                for (const auto& a : attrs) {
+                    if (a.name == "Color" && (a.value.empty() || a.value.front() != '{')) {
+                        setterStack.back().setter.value = value::FromColor(ParseXamlColorLiteral(a.value));
+                        setterStack.back().hasValue = true;
+                        break;
+                    }
+                }
+            }
+
+            // 3. Keyed ResourceDictionary items (Brushes, Colors, Doubles, Strings, SVG Geometries)
             if (parentScope.kind == XmlScopeKind::ResourceContainer) {
                 if (!xKey.empty()) {
                     if (shortTag == "SolidColorBrush") {
@@ -692,6 +1985,37 @@ AeroCompileResult AeroCompiler::Compile(const AeroCompileInput& input) const {
                     }
                 }
             }
+            if (shortTag == "VirtualizingStackPanel") {
+                // If <VirtualizingStackPanel/> appears inside <ItemsControl.ItemsPanel> on a live visual element
+                // (not inside a ResourceDictionary/Style/ControlTemplate), enable PropId_IsVirtualizing on that control!
+                bool insideItemsPanel = false;
+                bool blockedByTemplateOrRes = false;
+                for (auto it = scopeStack.rbegin(); it != scopeStack.rend(); ++it) {
+                    if (it->kind == XmlScopeKind::VisualElement) {
+                        break;
+                    }
+                    if (it->kind == XmlScopeKind::ResourceContainer ||
+                        it->kind == XmlScopeKind::KeyedResourceItem) {
+                        blockedByTemplateOrRes = true;
+                        break;
+                    }
+                    const std::string_view st = StripXmlPrefix(it->tagName);
+                    if (st == "Style" || st == "ControlTemplate" || st == "DataTemplate") {
+                        blockedByTemplateOrRes = true;
+                        break;
+                    }
+                    if (EndsWith(st, ".ItemsPanel")) {
+                        insideItemsPanel = true;
+                    }
+                }
+                if (insideItemsPanel && !blockedByTemplateOrRes) {
+                    AxbInstruction virtInst{};
+                    virtInst.opcode = AxbOpcode::SetStaticProperty;
+                    virtInst.propId = PropId_IsVirtualizing;
+                    virtInst.literalValue = UnifiedValue{true};
+                    pkg.instructions.push_back(std::move(virtInst));
+                }
+            }
             if (parentScope.kind == XmlScopeKind::BrushPropertyElement && !parentScope.brushAssigned &&
                 (shortTag == "SolidColorBrush" || shortTag == "GradientStop")) {
                 for (const auto& a : attrs) {
@@ -738,6 +2062,77 @@ AeroCompileResult AeroCompiler::Compile(const AeroCompileInput& input) const {
                 resRoot.kind = XmlScopeKind::ResourceContainer;
                 resRoot.tagName = std::string(tagName);
                 scopeStack.push_back(std::move(resRoot));
+                ++nonVisualDepth;
+            }
+            continue;
+        }
+
+        // Inline <DataTemplate.Triggers> at top level of a DataTemplate sub-package!
+        if (shortTag == "DataTemplate.Triggers" && scopeStack.empty()) {
+            if (!selfClosing) {
+                if (dtRootTriggersStyleKey.empty()) {
+                    const std::string scopePrefix = !pkg.className.empty()
+                        ? pkg.className
+                        : (!input.xamlPath.empty() ? input.xamlPath : pkg.rootTypeName);
+                    dtRootTriggersStyleKey = "__dt_root_triggers_" +
+                        scopePrefix + "_" +
+                        std::to_string(nextInlineVsmStyleId++);
+                }
+                const std::size_t depth = pushNonVisualScope();
+                ActiveStyleScope dtTrigStyle{};
+                dtTrigStyle.def.key = dtRootTriggersStyleKey;
+                dtTrigStyle.def.targetTypeName = !pkg.rootTypeName.empty()
+                    ? std::string(StripXmlPrefix(pkg.rootTypeName))
+                    : std::string("UIElement");
+                dtTrigStyle.controlTemplateTriggersDepth = depth;
+                dtTrigStyle.scopeDepth = depth;
+                styleStack.push_back(std::move(dtTrigStyle));
+            }
+            continue;
+        }
+
+        // Element-level <VisualStateManager.VisualStateGroups>, <Element.Style>, or <Element.Triggers>!
+        if ((shortTag == "VisualStateManager.VisualStateGroups" ||
+             EndsWith(shortTag, ".Style") ||
+             EndsWith(shortTag, ".Triggers")) &&
+            !scopeStack.empty()) {
+            if (!selfClosing) {
+                XmlScopeEntry& ownerElemScope = scopeStack.back();
+                if (ownerElemScope.inlineStyleKey.empty()) {
+                    const std::string scopePrefix = !pkg.className.empty()
+                        ? pkg.className
+                        : (!input.xamlPath.empty() ? input.xamlPath : pkg.rootTypeName);
+                    ownerElemScope.inlineStyleKey = "__inline_style_" +
+                        scopePrefix + "_" +
+                        std::to_string(nextInlineVsmStyleId++);
+                    AxbInstruction styleRefInst{};
+                    styleRefInst.opcode = AxbOpcode::SetStaticProperty;
+                    styleRefInst.propId = PropId_Style;
+                    styleRefInst.literalValue = value::FromString(ownerElemScope.inlineStyleKey);
+                    pkg.instructions.push_back(std::move(styleRefInst));
+                }
+                const std::string synthKey = ownerElemScope.inlineStyleKey;
+                const std::string ownerType = std::string(StripXmlPrefix(ownerElemScope.tagName));
+                const std::size_t depth = pushNonVisualScope();
+                ActiveStyleScope synthStyle{};
+                synthStyle.def.key = synthKey;
+                synthStyle.def.targetTypeName = ownerType;
+                synthStyle.def.basedOnKey = ownerElemScope.resourceKey;
+                synthStyle.scopeDepth = depth;
+                synthStyle.isInlinePropertyElement = EndsWith(shortTag, ".Style");
+                styleStack.push_back(std::move(synthStyle));
+            }
+            continue;
+        }
+
+        // Inline <ItemsControl.ItemTemplate><DataTemplate>...</DataTemplate></ItemsControl.ItemTemplate>
+        if (EndsWith(shortTag, ".ItemTemplate") && !scopeStack.empty()) {
+            if (!selfClosing) {
+                XmlScopeEntry itScope{};
+                itScope.kind = XmlScopeKind::NonVisualSkip;
+                itScope.tagName = std::string(tagName);
+                itScope.isItemTemplateContainer = true;
+                scopeStack.push_back(std::move(itScope));
                 ++nonVisualDepth;
             }
             continue;
@@ -872,11 +2267,7 @@ AeroCompileResult AeroCompiler::Compile(const AeroCompileInput& input) const {
 
         if (shortTag.find('.') != std::string_view::npos || isNonVisualElementTag(shortTag)) {
             if (!selfClosing) {
-                XmlScopeEntry skipScope{};
-                skipScope.kind = XmlScopeKind::NonVisualSkip;
-                skipScope.tagName = std::string(tagName);
-                scopeStack.push_back(std::move(skipScope));
-                ++nonVisualDepth;
+                (void)pushNonVisualScope();
             }
             continue;
         }
@@ -903,6 +2294,7 @@ AeroCompileResult AeroCompiler::Compile(const AeroCompileInput& input) const {
 
         bool hasExplicitWidth = false;
         bool hasExplicitHeight = false;
+        std::string attachedStyleKey;
         for (const auto& a : attrs) {
             if (a.name == "Width") hasExplicitWidth = true;
             if (a.name == "Height") hasExplicitHeight = true;
@@ -998,6 +2390,18 @@ AeroCompileResult AeroCompiler::Compile(const AeroCompileInput& input) const {
                         keyPart = Trim(keyPart.substr(12));
                     }
                     if (!keyPart.empty()) {
+                        if (propId == PropId_Style || propId == PropId_ItemTemplate) {
+                            if (propId == PropId_Style) {
+                                attachedStyleKey = std::string(keyPart);
+                            }
+                            AxbInstruction keyInst{};
+                            keyInst.opcode = AxbOpcode::SetStaticProperty;
+                            keyInst.propId = propId;
+                            keyInst.literalValue = value::FromString(std::string(keyPart));
+                            pkg.instructions.push_back(std::move(keyInst));
+                            continue;
+                        }
+
                         AxbInstruction resInst{};
                         resInst.opcode = AxbOpcode::SetResourceProperty;
                         resInst.propId = propId;
@@ -1027,43 +2431,14 @@ AeroCompileResult AeroCompiler::Compile(const AeroCompileInput& input) const {
                     continue;
                 }
 
-                if (inner == "Binding" || inner == "Bind") {
-                    inner = {};
-                } else if (inner.rfind("Binding ", 0) == 0) {
-                    inner = Trim(inner.substr(8));
-                } else if (inner.rfind("Bind ", 0) == 0) {
-                    inner = Trim(inner.substr(5));
-                } else {
+                const ParsedBindingClause parsedBind = ParseBindingMarkupExpression(trimmedVal);
+                if (!parsedBind.isValidBinding) {
                     continue;
                 }
 
-                BindingMode mode = BindingMode::OneWay;
-                std::string_view pathPart;
-                std::string_view fallbackValue;
-
-                std::size_t clausePos = 0;
-                bool firstClause = true;
-                while (clausePos < inner.size()) {
-                    const std::size_t comma = inner.find(',', clausePos);
-                    const std::string_view clause = Trim(
-                        (comma == std::string_view::npos)
-                            ? inner.substr(clausePos)
-                            : inner.substr(clausePos, comma - clausePos));
-                    if (clause.rfind("Path=", 0) == 0) {
-                        pathPart = Trim(clause.substr(5));
-                    } else if (clause.rfind("Mode=", 0) == 0) {
-                        const std::string_view modeStr = Trim(clause.substr(5));
-                        if (modeStr == "TwoWay") mode = BindingMode::TwoWay;
-                        else if (modeStr == "OneTime") mode = BindingMode::OneTime;
-                    } else if (clause.rfind("FallbackValue=", 0) == 0) {
-                        fallbackValue = Trim(clause.substr(14));
-                    } else if (firstClause && clause.find('=') == std::string_view::npos) {
-                        pathPart = clause;
-                    }
-                    firstClause = false;
-                    if (comma == std::string_view::npos) break;
-                    clausePos = comma + 1;
-                }
+                const BindingMode mode = parsedBind.mode;
+                const std::string_view pathPart = parsedBind.pathPart;
+                const std::string_view fallbackValue = parsedBind.fallbackValue;
 
                 UnifiedValue parsedFallback{};
                 if (!fallbackValue.empty()) {
@@ -1084,6 +2459,10 @@ AeroCompileResult AeroCompiler::Compile(const AeroCompileInput& input) const {
                 chain.targetPropertyId = propId;
                 chain.mode = mode;
                 chain.fallbackValue = std::move(parsedFallback);
+                chain.elementName = std::string(parsedBind.elementName);
+                chain.relativeAncestorType = parsedBind.relativeAncestorType;
+                chain.relativeSelf = parsedBind.relativeSelf;
+                chain.converter = parsedBind.converter;
 
                 std::size_t segPos = 0;
                 while (segPos < pathPart.size()) {
@@ -1128,6 +2507,11 @@ AeroCompileResult AeroCompiler::Compile(const AeroCompileInput& input) const {
                     ensurePathBakedIntoPackage(sv->view());
                 }
             }
+            if (propId == PropId_Style) {
+                if (const auto* sv = std::get_if<StringValue>(&litVal)) {
+                    attachedStyleKey = std::string(sv->view());
+                }
+            }
 
             AxbInstruction setInst{};
             setInst.opcode = AxbOpcode::SetStaticProperty;
@@ -1144,7 +2528,51 @@ AeroCompileResult AeroCompiler::Compile(const AeroCompileInput& input) const {
             XmlScopeEntry visScope{};
             visScope.kind = XmlScopeKind::VisualElement;
             visScope.tagName = std::string(tagName);
+            visScope.resourceKey = std::move(attachedStyleKey);
             scopeStack.push_back(std::move(visScope));
+        }
+    }
+
+    // If <DataTemplate.Triggers> was parsed at top level of a DataTemplate, attach it to the root element
+    // and chain BasedOn to any existing root Style!
+    if (!dtRootTriggersStyleKey.empty() && !pkg.instructions.empty() &&
+        pkg.instructions[0].opcode == AxbOpcode::BeginElement) {
+        for (auto& st : pkg.styles) {
+            if (st.key == dtRootTriggersStyleKey) {
+                if ((st.targetTypeName.empty() || st.targetTypeName == "UIElement") &&
+                    !pkg.rootTypeName.empty()) {
+                    st.targetTypeName = std::string(StripXmlPrefix(pkg.rootTypeName));
+                }
+                bool updatedExistingStyleInst = false;
+                for (std::size_t idx = 1u; idx < pkg.instructions.size(); ++idx) {
+                    auto& inst = pkg.instructions[idx];
+                    if (inst.opcode == AxbOpcode::BeginElement ||
+                        inst.opcode == AxbOpcode::EndElement) {
+                        break;
+                    }
+                    if (inst.opcode == AxbOpcode::SetStaticProperty &&
+                        inst.propId == PropId_Style) {
+                        if (const auto* sv = std::get_if<StringValue>(&inst.literalValue)) {
+                            const std::string existingStyleKey(sv->view());
+                            if (!existingStyleKey.empty() && existingStyleKey != dtRootTriggersStyleKey) {
+                                if (st.basedOnKey.empty()) {
+                                    st.basedOnKey = existingStyleKey;
+                                }
+                            }
+                        }
+                        inst.literalValue = value::FromString(dtRootTriggersStyleKey);
+                        updatedExistingStyleInst = true;
+                    }
+                }
+                if (!updatedExistingStyleInst) {
+                    AxbInstruction dtStyleInst{};
+                    dtStyleInst.opcode = AxbOpcode::SetStaticProperty;
+                    dtStyleInst.propId = PropId_Style;
+                    dtStyleInst.literalValue = value::FromString(dtRootTriggersStyleKey);
+                    pkg.instructions.insert(pkg.instructions.begin() + 1, std::move(dtStyleInst));
+                }
+                break;
+            }
         }
     }
 
@@ -1276,7 +2704,7 @@ AeroCompileResult AeroCompiler::Compile(const AeroCompileInput& input) const {
     result.axbBytes = pkg.Serialize();
     if (!pkg.className.empty()) {
         AxbTemplateRegistry::Instance().Register(pkg.className, pkg);
-    } else {
+    } else if (!input.xamlPath.empty() || pkg.rootTypeName == "ResourceDictionary") {
         AxbTemplateRegistry::Instance().RegisterResources(pkg);
     }
     result.succeeded = true;
@@ -1297,6 +2725,43 @@ std::string FormatFloatLiteral(float v) {
     return std::string(buf);
 }
 
+std::string EscapeAotCppString(std::string_view sv) {
+    std::string out;
+    out.reserve(sv.size() + 8u);
+    for (std::size_t i = 0u; i < sv.size(); ++i) {
+        const unsigned char c = static_cast<unsigned char>(sv[i]);
+        switch (c) {
+            case '\"': out += "\\\""; break;
+            case '\\': out += "\\\\"; break;
+            case '\n': out += "\\n"; break;
+            case '\r': out += "\\r"; break;
+            case '\t': out += "\\t"; break;
+            case '?':
+                if (i + 1u < sv.size() && sv[i + 1u] == '?') {
+                    out += "\\?";
+                } else {
+                    out.push_back('?');
+                }
+                break;
+            default:
+                if (c < 0x20u || c >= 0x7Fu) {
+                    // Use fixed 3-digit octal escape so following [0-9a-fA-F] chars are never eaten as hex!
+                    char oct[5];
+                    oct[0] = '\\';
+                    oct[1] = static_cast<char>('0' + ((c >> 6u) & 0x07u));
+                    oct[2] = static_cast<char>('0' + ((c >> 3u) & 0x07u));
+                    oct[3] = static_cast<char>('0' + (c & 0x07u));
+                    oct[4] = '\0';
+                    out.append(oct, 4u);
+                } else {
+                    out.push_back(static_cast<char>(c));
+                }
+                break;
+        }
+    }
+    return out;
+}
+
 std::string EmitUnifiedValueLiteralCpp(const UnifiedValue& val) {
     if (const auto* b = std::get_if<bool>(&val)) {
         return *b ? "aero::UnifiedValue{true}" : "aero::UnifiedValue{false}";
@@ -1315,9 +2780,79 @@ std::string EmitUnifiedValueLiteralCpp(const UnifiedValue& val) {
                FormatFloatLiteral(f4->w) + "}}";
     }
     if (const auto* s = std::get_if<StringValue>(&val)) {
-        return "aero::value::FromString(\"" + rs_aot::escapeCppString(s->str()) + "\")";
+        return "aero::value::FromString(\"" + EscapeAotCppString(s->str()) + "\")";
     }
     return "aero::UnifiedValue{}";
+}
+
+void AppendStoryboardPopulateCpp(
+    std::string& src,
+    const AxbStoryboard& sb,
+    const std::string& sbVar,
+    const std::string& indent) {
+    if (!sb.key.empty()) {
+        src += indent + sbVar + ".key = \"" + EscapeAotCppString(sb.key) + "\";\n";
+    }
+    for (const auto& tl : sb.timelines) {
+        src += indent + "{\n";
+        src += indent + "    aero::AxbAnimationTimeline tl{};\n";
+        if (!tl.targetName.empty()) {
+            src += indent + "    tl.targetName = \"" + EscapeAotCppString(tl.targetName) + "\";\n";
+        }
+        src += indent + "    tl.targetPropertyId = " + std::to_string(tl.targetPropertyId) + "u;\n";
+        src += indent + "    tl.beginTimeSeconds = " + FormatFloatLiteral(tl.beginTimeSeconds) + ";\n";
+        src += indent + "    tl.durationSeconds = " + FormatFloatLiteral(tl.durationSeconds) + ";\n";
+        src += indent + "    tl.hasFrom = " + std::string(tl.hasFrom ? "true" : "false") + ";\n";
+        if (tl.hasFrom) {
+            src += indent + "    tl.fromValue = " + EmitUnifiedValueLiteralCpp(tl.fromValue) + ";\n";
+        }
+        src += indent + "    tl.hasTo = " + std::string(tl.hasTo ? "true" : "false") + ";\n";
+        src += indent + "    tl.isBy = " + std::string(tl.isBy ? "true" : "false") + ";\n";
+        if (tl.hasTo) {
+            src += indent + "    tl.toValue = " + EmitUnifiedValueLiteralCpp(tl.toValue) + ";\n";
+        }
+        src += indent + "    tl.easingKind = static_cast<aero::EasingFunctionKind>(" +
+               std::to_string(static_cast<unsigned>(tl.easingKind)) + "u);\n";
+        src += indent + "    tl.easingMode = static_cast<aero::EasingMode>(" +
+               std::to_string(static_cast<unsigned>(tl.easingMode)) + "u);\n";
+        src += indent + "    tl.fillBehavior = static_cast<aero::FillBehavior>(" +
+               std::to_string(static_cast<unsigned>(tl.fillBehavior)) + "u);\n";
+        src += indent + "    tl.autoReverse = " + std::string(tl.autoReverse ? "true" : "false") + ";\n";
+        src += indent + "    tl.repeatCount = " + std::to_string(tl.repeatCount) + ";\n";
+        for (const auto& kf : tl.keyFrames) {
+            src += indent + "    {\n";
+            src += indent + "        aero::AxbKeyFrame kf{};\n";
+            src += indent + "        kf.timeSeconds = " + FormatFloatLiteral(kf.timeSeconds) + ";\n";
+            src += indent + "        kf.value = " + EmitUnifiedValueLiteralCpp(kf.value) + ";\n";
+            src += indent + "        kf.easingKind = static_cast<aero::EasingFunctionKind>(" +
+                   std::to_string(static_cast<unsigned>(kf.easingKind)) + "u);\n";
+            src += indent + "        kf.easingMode = static_cast<aero::EasingMode>(" +
+                   std::to_string(static_cast<unsigned>(kf.easingMode)) + "u);\n";
+            src += indent + "        kf.isDiscrete = " + std::string(kf.isDiscrete ? "true" : "false") + ";\n";
+            src += indent + "        tl.keyFrames.push_back(std::move(kf));\n";
+            src += indent + "    }\n";
+        }
+        src += indent + "    " + sbVar + ".timelines.push_back(std::move(tl));\n";
+        src += indent + "}\n";
+    }
+}
+
+void AppendSetterListPopulateCpp(
+    std::string& src,
+    const std::vector<AxbPropertySetter>& setters,
+    const std::string& targetVecExpr,
+    const std::string& indent) {
+    for (const auto& s : setters) {
+        src += indent + "{\n";
+        src += indent + "    aero::AxbPropertySetter ps{};\n";
+        if (!s.targetName.empty()) {
+            src += indent + "    ps.targetName = \"" + EscapeAotCppString(s.targetName) + "\";\n";
+        }
+        src += indent + "    ps.propId = " + std::to_string(s.propId) + "u;\n";
+        src += indent + "    ps.value = " + EmitUnifiedValueLiteralCpp(s.value) + ";\n";
+        src += indent + "    " + targetVecExpr + ".push_back(std::move(ps));\n";
+        src += indent + "}\n";
+    }
 }
 
 } // namespace
@@ -1358,7 +2893,7 @@ AeroViewAotCppOutput AeroCompiler::GenerateAotCppFromPackage(
     hdr += "} // namespace " + out.cppNamespace + "\n";
     out.header = std::move(hdr);
 
-    // 2. Emit C++17 Source (.cpp) - unrolled batch creation, static properties, MTSDF registration & pre-resolved bindings
+    // 2. Emit C++17 Source (.cpp) - unrolled batch creation, static properties, MTSDF, Styles/Storyboards & bindings
     std::string src;
     src += "// Auto-generated by aero-compiler --aot-cpp (Zero-XML C++17 Visual Tree & Binding Builder)\n";
     src += "#include <limits>\n";
@@ -1412,8 +2947,193 @@ AeroViewAotCppOutput AeroCompiler::GenerateAotCppFromPackage(
         src += "    }\n";
     }
 
+    // Emit keyed scalar/color/string resources into AxbTemplateRegistry for zero-XML AOT runtime
+    for (const auto& resPair : package.resources) {
+        if (resPair.first.empty()) {
+            continue;
+        }
+        src += "    if (!aero::AxbTemplateRegistry::Instance().FindResource(\"" +
+               EscapeAotCppString(resPair.first) + "\")) {\n";
+        src += "        aero::AxbTemplateRegistry::Instance().RegisterResource(\"" +
+               EscapeAotCppString(resPair.first) + "\", " +
+               EmitUnifiedValueLiteralCpp(resPair.second) + ");\n";
+        src += "    }\n";
+    }
+
+    // Emit pre-compiled Storyboards & Styles into AxbTemplateRegistry for zero-XML AOT runtime
+    for (const auto& sb : package.storyboards) {
+        if (sb.key.empty()) {
+            continue;
+        }
+        src += "    if (!aero::AxbTemplateRegistry::Instance().FindStoryboard(\"" +
+               EscapeAotCppString(sb.key) + "\")) {\n";
+        src += "        aero::AxbStoryboard sbDef{};\n";
+        AppendStoryboardPopulateCpp(src, sb, "sbDef", "        ");
+        src += "        aero::AxbTemplateRegistry::Instance().RegisterStoryboard(std::move(sbDef));\n";
+        src += "    }\n";
+    }
+
+    for (const auto& st : package.styles) {
+        if (!st.key.empty()) {
+            src += "    if (!aero::AxbTemplateRegistry::Instance().FindStyle(\"" +
+                   EscapeAotCppString(st.key) + "\")) {\n";
+        } else {
+            src += "    {\n";
+        }
+        src += "        aero::AxbStyleDefinition stDef{};\n";
+        if (!st.key.empty()) {
+            src += "        stDef.key = \"" + EscapeAotCppString(st.key) + "\";\n";
+        }
+        if (!st.targetTypeName.empty()) {
+            src += "        stDef.targetTypeName = \"" + EscapeAotCppString(st.targetTypeName) + "\";\n";
+        }
+        if (!st.basedOnKey.empty()) {
+            src += "        stDef.basedOnKey = \"" + EscapeAotCppString(st.basedOnKey) + "\";\n";
+        }
+        AppendSetterListPopulateCpp(src, st.setters, "stDef.setters", "        ");
+        for (const auto& trig : st.triggers) {
+            src += "        {\n";
+            src += "            aero::AxbStyleTrigger trigDef{};\n";
+            src += "            trigDef.overrideLocalValues = " +
+                   std::string(trig.overrideLocalValues ? "true" : "false") + ";\n";
+            for (const auto& cond : trig.conditions) {
+                src += "            {\n";
+                src += "                aero::AxbTriggerCondition tc{};\n";
+                src += "                tc.propId = " + std::to_string(cond.propId) + "u;\n";
+                src += "                tc.expectedValue = " + EmitUnifiedValueLiteralCpp(cond.expectedValue) + ";\n";
+                src += "                tc.sourceKind = static_cast<aero::TriggerConditionSource>(" +
+                       std::to_string(static_cast<unsigned>(cond.sourceKind)) + "u);\n";
+                src += "                tc.converter = static_cast<aero::ValueConverterKind>(" +
+                       std::to_string(static_cast<unsigned>(cond.converter)) + "u);\n";
+                src += "                tc.expectNull = " + std::string(cond.expectNull ? "true" : "false") + ";\n";
+                if (!cond.sourceName.empty()) {
+                    src += "                tc.sourceName = \"" + EscapeAotCppString(cond.sourceName) + "\";\n";
+                }
+                if (!cond.bindingPath.empty()) {
+                    src += "                tc.bindingPath = \"" + EscapeAotCppString(cond.bindingPath) + "\";\n";
+                }
+                for (const auto& chop : cond.compiledHops) {
+                    src += "                {\n";
+                    src += "                    aero::AxbCompiledHop ch{};\n";
+                    src += "                    ch.memberName = \"" + EscapeAotCppString(chop.memberName) + "\";\n";
+                    src += "                    ch.declaringTypeId = " + std::to_string(chop.declaringTypeId) + "ULL;\n";
+                    src += "                    ch.fieldIndex = " + std::to_string(chop.fieldIndex) + "u;\n";
+                    src += "                    ch.observableBitIndex = " + std::to_string(static_cast<unsigned>(chop.observableBitIndex)) + "u;\n";
+                    src += "                    ch.getterSymbolId = " + std::to_string(chop.getterSymbolId) + "ULL;\n";
+                    src += "                    ch.setterSymbolId = " + std::to_string(chop.setterSymbolId) + "ULL;\n";
+                    src += "                    ch.isAutoProperty = " + std::string(chop.isAutoProperty ? "true" : "false") + ";\n";
+                    src += "                    ch.isObservable = " + std::string(chop.isObservable ? "true" : "false") + ";\n";
+                    src += "                    ch.isReadOnly = " + std::string(chop.isReadOnly ? "true" : "false") + ";\n";
+                    src += "                    ch.isSimState = " + std::string(chop.isSimState ? "true" : "false") + ";\n";
+                    src += "                    ch.isSimCommand = " + std::string(chop.isSimCommand ? "true" : "false") + ";\n";
+                    src += "                    tc.compiledHops.push_back(std::move(ch));\n";
+                    src += "                }\n";
+                }
+                src += "                trigDef.conditions.push_back(std::move(tc));\n";
+                src += "            }\n";
+            }
+            AppendSetterListPopulateCpp(src, trig.setters, "trigDef.setters", "            ");
+            for (const auto& esb : trig.enterStoryboards) {
+                src += "            {\n";
+                src += "                aero::AxbStoryboard esbDef{};\n";
+                AppendStoryboardPopulateCpp(src, esb, "esbDef", "                ");
+                src += "                trigDef.enterStoryboards.push_back(std::move(esbDef));\n";
+                src += "            }\n";
+            }
+            for (const auto& xsb : trig.exitStoryboards) {
+                src += "            {\n";
+                src += "                aero::AxbStoryboard xsbDef{};\n";
+                AppendStoryboardPopulateCpp(src, xsb, "xsbDef", "                ");
+                src += "                trigDef.exitStoryboards.push_back(std::move(xsbDef));\n";
+                src += "            }\n";
+            }
+            src += "            stDef.triggers.push_back(std::move(trigDef));\n";
+            src += "        }\n";
+        }
+        for (const auto& vsg : st.visualStateGroups) {
+            src += "        {\n";
+            src += "            aero::AxbVisualStateGroup vsgDef{};\n";
+            src += "            vsgDef.name = \"" + EscapeAotCppString(vsg.name) + "\";\n";
+            src += "            vsgDef.defaultTransitionDuration = " +
+                   FormatFloatLiteral(vsg.defaultTransitionDuration) + ";\n";
+            src += "            vsgDef.defaultEasingKind = static_cast<aero::EasingFunctionKind>(" +
+                   std::to_string(static_cast<unsigned>(vsg.defaultEasingKind)) + "u);\n";
+            src += "            vsgDef.defaultEasingMode = static_cast<aero::EasingMode>(" +
+                   std::to_string(static_cast<unsigned>(vsg.defaultEasingMode)) + "u);\n";
+            for (const auto& vs : vsg.states) {
+                src += "            {\n";
+                src += "                aero::AxbVisualState vsDef{};\n";
+                src += "                vsDef.name = \"" + EscapeAotCppString(vs.name) + "\";\n";
+                AppendSetterListPopulateCpp(src, vs.setters, "vsDef.setters", "                ");
+                AppendStoryboardPopulateCpp(src, vs.storyboard, "vsDef.storyboard", "                ");
+                src += "                vsgDef.states.push_back(std::move(vsDef));\n";
+                src += "            }\n";
+            }
+            src += "            stDef.visualStateGroups.push_back(std::move(vsgDef));\n";
+            src += "        }\n";
+        }
+        for (const auto& et : st.eventTriggers) {
+            src += "        {\n";
+            src += "            aero::AxbEventTrigger etDef{};\n";
+            src += "            etDef.eventKind = static_cast<aero::RoutedTriggerEvent>(" +
+                   std::to_string(static_cast<unsigned>(et.eventKind)) + "u);\n";
+            if (!et.sourceName.empty()) {
+                src += "            etDef.sourceName = \"" + EscapeAotCppString(et.sourceName) + "\";\n";
+            }
+            for (const auto& etSb : et.storyboards) {
+                src += "            {\n";
+                src += "                aero::AxbStoryboard etSbDef{};\n";
+                AppendStoryboardPopulateCpp(src, etSb, "etSbDef", "                ");
+                src += "                etDef.storyboards.push_back(std::move(etSbDef));\n";
+                src += "            }\n";
+            }
+            src += "            stDef.eventTriggers.push_back(std::move(etDef));\n";
+            src += "        }\n";
+        }
+        src += "        aero::AxbTemplateRegistry::Instance().RegisterStyle(std::move(stDef));\n";
+        src += "    }\n";
+    }
+
+    for (std::size_t dtIdx = 0; dtIdx < package.dataTemplates.size(); ++dtIdx) {
+        const auto& dt = package.dataTemplates[dtIdx];
+        if (!dt.templatePackage) {
+            continue;
+        }
+        const std::vector<std::uint8_t> dtBytes = dt.templatePackage->Serialize();
+        if (dtBytes.empty()) {
+            continue;
+        }
+        if (!dt.key.empty()) {
+            src += "    if (!aero::AxbTemplateRegistry::Instance().FindDataTemplate(\"" +
+                   EscapeAotCppString(dt.key) + "\")) {\n";
+        } else {
+            src += "    {\n";
+        }
+        const std::string dtArr = "kDataTplBytes_" + std::to_string(dtIdx);
+        src += "        static constexpr std::uint8_t " + dtArr + "[] = {";
+        for (std::size_t b = 0; b < dtBytes.size(); ++b) {
+            if (b > 0) src += ",";
+            src += std::to_string(static_cast<unsigned>(dtBytes[b])) + "u";
+        }
+        src += "};\n";
+        src += "        auto subPkg = std::make_shared<aero::AxbPackage>();\n";
+        src += "        if (aero::AxbPackage::Deserialize(" + dtArr + ", sizeof(" + dtArr + "), *subPkg)) {\n";
+        src += "            aero::AxbDataTemplate dtDef{};\n";
+        if (!dt.key.empty()) {
+            src += "            dtDef.key = \"" + EscapeAotCppString(dt.key) + "\";\n";
+        }
+        if (!dt.dataTypeName.empty()) {
+            src += "            dtDef.dataTypeName = \"" + EscapeAotCppString(dt.dataTypeName) + "\";\n";
+        }
+        src += "            dtDef.templatePackage = std::move(subPkg);\n";
+        src += "            aero::AxbTemplateRegistry::Instance().RegisterDataTemplate(std::move(dtDef));\n";
+        src += "        }\n";
+        src += "    }\n";
+    }
+
     src += "    aero::NativeHandleRegistry* registry = domains ? &domains->nativeHandles() : nullptr;\n";
     src += "    aero::ManagedHeap* uiHeap = domains ? &domains->uiHeap() : nullptr;\n";
+    const std::string_view unusedNote = ""; (void)unusedNote;
     src += "    const aero::ObjectRef effectiveContext = dataContext.valid() ? dataContext : rootControl->BoundScriptWrapper();\n";
     src += "    const aero::ObjectRef wrapperObj = rootControl->BoundScriptWrapper().valid() ? rootControl->BoundScriptWrapper() : effectiveContext;\n\n";
     src += "    (void)registry; (void)uiHeap; (void)effectiveContext; (void)wrapperObj;\n";
@@ -1432,7 +3152,7 @@ AeroViewAotCppOutput AeroCompiler::GenerateAotCppFromPackage(
 
                 if (!rootVisited) {
                     rootVisited = true;
-                    src += "    aero::UIElement* " + varName + " = rootControl;\n";
+                    src += "    aero::UIElement* " + varName + " = rootControl; (void)" + varName + ";\n";
                     if (package.rootHandleFieldIndex != PropertySlotHandle::InvalidIndex) {
                         src += "    if (domains && registry && wrapperObj.valid()) {\n";
                         src += "        const auto rootH = rootControl->ToNativeHandle(*registry);\n";
@@ -1442,7 +3162,7 @@ AeroViewAotCppOutput AeroCompiler::GenerateAotCppFromPackage(
                     }
                 } else {
                     const std::string parentVar = elemVarStack.empty() ? "rootControl" : elemVarStack.back();
-                    const std::string escapedType = rs_aot::escapeCppString(std::string(typeName));
+                    const std::string escapedType = EscapeAotCppString(std::string(typeName));
                     const std::string_view shortChild = StripXmlPrefix(typeName);
                     if (AxbTemplateRegistry::Instance().Find(typeName) != nullptr &&
                         shortChild != "UserControl" && shortChild != "Page") {
@@ -1463,12 +3183,13 @@ AeroViewAotCppOutput AeroCompiler::GenerateAotCppFromPackage(
                     probe && probe->IsA<ItemsControl>()) {
                     src += "    if (auto* ic = " + varName + " ? " + varName + "->DynamicCast<aero::ItemsControl>() : nullptr) {\n";
                     src += "        ic->SetDomains(domains);\n";
+                    src += "        ic->SetBindingEngine(bindingEngine);\n";
                     src += "    }\n";
                 }
 
                 if (!elemName.empty()) {
                     src += "    if (" + varName + ") {\n";
-                    src += "        " + varName + "->SetName(\"" + rs_aot::escapeCppString(std::string(elemName)) + "\");\n";
+                    src += "        " + varName + "->SetName(\"" + EscapeAotCppString(std::string(elemName)) + "\");\n";
                     for (const auto& namedSlot : package.namedControls) {
                         if (namedSlot.name == elemName &&
                             namedSlot.fieldIndexInClass != PropertySlotHandle::InvalidIndex) {
@@ -1509,19 +3230,32 @@ AeroViewAotCppOutput AeroCompiler::GenerateAotCppFromPackage(
                 if (!elemVarStack.empty() && inst.strIdx0 < package.bindingChains.size()) {
                     const std::string& curVar = elemVarStack.back();
                     const auto& chain = package.bindingChains[inst.strIdx0];
-                    src += "    if (" + curVar + " && bindingEngine && effectiveContext.valid()) {\n";
+                    const bool isElemBind = !chain.elementName.empty() ||
+                                            !chain.relativeAncestorType.empty() ||
+                                            chain.relativeSelf;
+                    src += "    if (" + curVar + " && bindingEngine" +
+                           std::string(isElemBind ? "" : " && effectiveContext.valid()") + ") {\n";
                     src += "        aero::AxbCompiledBindingChain chain{};\n";
-                    src += "        chain.rawPath = \"" + rs_aot::escapeCppString(chain.rawPath) + "\";\n";
+                    src += "        chain.rawPath = \"" + EscapeAotCppString(chain.rawPath) + "\";\n";
                     src += "        chain.targetPropertyId = " + std::to_string(chain.targetPropertyId) + "u;\n";
                     src += "        chain.mode = static_cast<aero::BindingMode>(" +
                            std::to_string(static_cast<unsigned>(chain.mode)) + "u);\n";
+                    src += "        chain.converter = static_cast<aero::ValueConverterKind>(" +
+                           std::to_string(static_cast<unsigned>(chain.converter)) + "u);\n";
+                    if (!chain.elementName.empty()) {
+                        src += "        chain.elementName = \"" + EscapeAotCppString(chain.elementName) + "\";\n";
+                    }
+                    if (!chain.relativeAncestorType.empty()) {
+                        src += "        chain.relativeAncestorType = \"" + EscapeAotCppString(chain.relativeAncestorType) + "\";\n";
+                    }
+                    src += "        chain.relativeSelf = " + std::string(chain.relativeSelf ? "true" : "false") + ";\n";
                     if (!std::holds_alternative<std::monostate>(chain.fallbackValue)) {
                         src += "        chain.fallbackValue = " + EmitUnifiedValueLiteralCpp(chain.fallbackValue) + ";\n";
                     }
                     for (const auto& hop : chain.hops) {
                         src += "        {\n";
                         src += "            aero::AxbCompiledHop hop{};\n";
-                        src += "            hop.memberName = \"" + rs_aot::escapeCppString(hop.memberName) + "\";\n";
+                        src += "            hop.memberName = \"" + EscapeAotCppString(hop.memberName) + "\";\n";
                         src += "            hop.declaringTypeId = " + std::to_string(hop.declaringTypeId) + "ULL;\n";
                         src += "            hop.fieldIndex = " + std::to_string(hop.fieldIndex) + "u;\n";
                         src += "            hop.observableBitIndex = " + std::to_string(static_cast<unsigned>(hop.observableBitIndex)) + "u;\n";
@@ -1557,7 +3291,7 @@ AeroViewAotCppOutput AeroCompiler::GenerateAotCppFromPackage(
                         : rs_sem::stableTypeId(canonicalComp);
                     src += "    if (" + curVar + " && bindingEngine) {\n";
                     src += "        (void)bindingEngine->BindEcsColumn(" + std::to_string(compId) + "ULL, \"" +
-                           rs_aot::escapeCppString(std::string(fieldName)) + "\", 0u, aero::IntrusivePtr<aero::UIElement>(" +
+                           EscapeAotCppString(std::string(fieldName)) + "\", 0u, aero::IntrusivePtr<aero::UIElement>(" +
                            curVar + ", true), " + std::to_string(inst.propId) + "u);\n";
                     src += "    }\n";
                 }
@@ -1616,7 +3350,7 @@ AeroViewAotCppOutput AeroCompiler::GenerateAotCppFromPackage(
             case AxbOpcode::SetResourceProperty: {
                 if (!elemVarStack.empty()) {
                     const std::string& curVar = elemVarStack.back();
-                    const std::string escapedKey = rs_aot::escapeCppString(std::string(package.GetString(inst.strIdx0)));
+                    const std::string escapedKey = EscapeAotCppString(std::string(package.GetString(inst.strIdx0)));
                     src += "    if (" + curVar + ") {\n";
                     src += "        if (const auto* rv = aero::AxbTemplateRegistry::Instance().FindResource(\"" +
                            escapedKey + "\")) {\n";

@@ -17,12 +17,30 @@ struct ReactiveBindingInstance {
     std::uint16_t bindingSlotId = 0;
     std::string rawPath;
     BindingMode mode = BindingMode::OneWay;
+    ValueConverterKind converter = ValueConverterKind::None;
     ObjectRef rootObject{};
     UnifiedValue fallbackValue{};
     std::vector<AxbCompiledHop> hops;
     std::vector<ObjectRef> resolvedHopObjects;
     IntrusivePtr<UIElement> targetElement{};
     std::uint16_t targetPropertyId = 0;
+    bool initialized = false;
+};
+
+// Phase 5D: Zero-allocation UIElement-to-UIElement (ElementName / RelativeSource) binding instance
+struct ElementPropertyBindingInstance {
+    std::uint16_t bindingSlotId = 0;
+    BindingMode mode = BindingMode::OneWay;
+    ValueConverterKind converter = ValueConverterKind::None;
+    std::string elementName;
+    std::string relativeAncestorType;
+    bool relativeSelf = false;
+    std::uint16_t sourcePropertyId = 0;
+    std::uint16_t targetPropertyId = 0;
+    UIElement* cachedSourceElement = nullptr;
+    IntrusivePtr<UIElement> targetElement{};
+    UnifiedValue fallbackValue{};
+    UnifiedValue lastSyncedValue{};
     bool initialized = false;
 };
 
@@ -63,14 +81,23 @@ public:
     void SetProgramImage(const ProgramImage* program) noexcept { program_ = program; }
     void SetUiInterpreter(const Interpreter* uiInterpreter) noexcept { uiInterpreter_ = uiInterpreter; }
 
+    [[nodiscard]] ExecutionDomainContext& Domains() noexcept { return domains_; }
+    [[nodiscard]] const ExecutionDomainContext& Domains() const noexcept { return domains_; }
+    [[nodiscard]] const ProgramImage* Program() const noexcept { return program_; }
+    [[nodiscard]] const Interpreter* UiInterpreter() const noexcept { return uiInterpreter_; }
+
     // =========================================================================
-    // Track A: ReactiveSlotTrack (Multi-hop CompiledSlotChain + dirtyFieldMask)
+    // Track A: ReactiveSlotTrack (Multi-hop CompiledSlotChain + ElementName)
     // =========================================================================
     std::uint16_t BindChain(
         ObjectRef rootObject,
         const AxbCompiledBindingChain& compiledChain,
         const IntrusivePtr<UIElement>& targetElement,
         RuntimeError* error = nullptr);
+
+    std::uint16_t BindElementProperty(
+        const AxbCompiledBindingChain& compiledChain,
+        const IntrusivePtr<UIElement>& targetElement);
 
     std::uint16_t BindPath(
         ObjectRef rootObject,
@@ -80,12 +107,22 @@ public:
         BindingMode mode = BindingMode::OneWay,
         RuntimeError* error = nullptr);
 
-    // Flush dirty [Observable] objects across SimHeap and UiHeap, re-connecting
-    // any intermediate hop whose reference changed, and writing terminal slots in O(1).
+    // Phase 5D: Re-target all Track A bindings inside subtreeRoot to newRootObject in-place
+    // (0 heap allocations / 0 UIElement rebuilds during virtualized DataTemplate scrolling!)
+    std::size_t RebindSubtreeRootObject(
+        UIElement* subtreeRoot,
+        ObjectRef newRootObject,
+        RuntimeError* error = nullptr);
+
+    // Detach and clean up Track A / ElementName bindings targeting elements inside subtreeRoot.
+    std::size_t UnbindSubtree(const UIElement* subtreeRoot) noexcept;
+
+    // Flush dirty [Observable] objects across SimHeap and UiHeap + ElementName bindings,
+    // re-connecting any intermediate hop whose reference changed, and writing terminal slots in O(1).
     std::size_t FlushTrackA(RuntimeError* error = nullptr);
 
     // Push a TwoWay-bound UIElement property change back to the terminal ViewModel slot
-    // (or enqueue a SimCommandEnvelope if the setter is marked [SimCommand]).
+    // (or ElementName source property, or SimCommandEnvelope if marked [SimCommand]).
     bool PushTwoWayToSource(
         const UIElement* targetElement,
         std::uint16_t targetPropertyId,
@@ -100,6 +137,9 @@ public:
 
     [[nodiscard]] const std::vector<ReactiveBindingInstance>& ReactiveBindings() const noexcept {
         return trackABindings_;
+    }
+    [[nodiscard]] const std::vector<ElementPropertyBindingInstance>& ElementBindings() const noexcept {
+        return elementBindings_;
     }
 
     // =========================================================================
@@ -131,6 +171,7 @@ private:
         ReactiveBindingInstance& binding,
         std::size_t startHopIndex,
         RuntimeError* error);
+    bool EvaluateAndSyncElementBinding(ElementPropertyBindingInstance& eb);
 
     ExecutionDomainContext& domains_;
     const ProgramImage* program_ = nullptr;
@@ -138,6 +179,7 @@ private:
     std::uint16_t nextBindingSlotId_ = 1;
     std::uint64_t lastObservedGcEpoch_ = 0;
     std::vector<ReactiveBindingInstance> trackABindings_;
+    std::vector<ElementPropertyBindingInstance> elementBindings_;
     std::vector<EcsColumnBindingChannel> trackBChannels_;
 };
 

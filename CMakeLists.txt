@@ -28,6 +28,9 @@ set(AERO_RUNTIME_SOURCES
     src/layout/DepthBucketLayoutQueue.cpp
     src/binding/DualTrackBindingEngine.cpp
     src/controls/Controls.cpp
+    src/input/InputEventRouter.cpp
+    src/animation/AnimationEngine.cpp
+    src/style/StyleTriggerEngine.cpp
     src/render/PagedRenderTree.cpp
     src/render/ZeroCopyGpuStream.cpp
     src/host/HostDrivers.cpp
@@ -125,6 +128,24 @@ if(AERO_BUILD_COMPILER_TOOLS)
         )
         target_link_libraries(aerogui_phase5_tests PRIVATE aerogui_core)
         add_test(NAME aerogui_phase5_tests COMMAND aerogui_phase5_tests)
+
+        add_executable(aerogui_phase5b_tests
+            tests/phase5b_input_controls_tests.cpp
+        )
+        target_link_libraries(aerogui_phase5b_tests PRIVATE aerogui_core)
+        add_test(NAME aerogui_phase5b_tests COMMAND aerogui_phase5b_tests)
+
+        add_executable(aerogui_phase5c_tests
+            tests/phase5c_style_animation_tests.cpp
+        )
+        target_link_libraries(aerogui_phase5c_tests PRIVATE aerogui_core)
+        add_test(NAME aerogui_phase5c_tests COMMAND aerogui_phase5c_tests)
+
+        add_executable(aerogui_phase5d_tests
+            tests/phase5d_datatrigger_template_tests.cpp
+        )
+        target_link_libraries(aerogui_phase5d_tests PRIVATE aerogui_core)
+        add_test(NAME aerogui_phase5d_tests COMMAND aerogui_phase5d_tests)
     endif()
 else()
     # In Wasm / REALSCRIPT_SLIM_RUNTIME mode, aerogui_core aliases the pure runtime

@@ -189,6 +189,78 @@ void ClassifyPathEmission(
     }
 }
 
+[[nodiscard]] Color ModulateInteractiveSurfaceColor(Color base, const UIElement* elem) noexcept {
+    if (!elem) {
+        return base;
+    }
+    if (!elem->IsEffectivelyEnabled()) {
+        const float luma = 0.299f * base.r + 0.587f * base.g + 0.114f * base.b;
+        return Color{
+            0.5f * base.r + 0.5f * luma,
+            0.5f * base.g + 0.5f * luma,
+            0.5f * base.b + 0.5f * luma,
+            base.a * 0.55f};
+    }
+    if (elem->IsPressed()) {
+        return Color{
+            std::clamp(base.r * 0.78f, 0.0f, 1.0f),
+            std::clamp(base.g * 0.80f, 0.0f, 1.0f),
+            std::clamp(base.b * 0.86f, 0.0f, 1.0f),
+            base.a};
+    }
+    if (elem->IsHovered()) {
+        return Color{
+            std::clamp(base.r + 0.08f, 0.0f, 1.0f),
+            std::clamp(base.g + 0.09f, 0.0f, 1.0f),
+            std::clamp(base.b + 0.11f, 0.0f, 1.0f),
+            base.a};
+    }
+    return base;
+}
+
+struct SliderVisualGeometry {
+    Rect trackRect{};
+    Rect fillRect{};
+    Rect thumbRect{};
+};
+
+[[nodiscard]] SliderVisualGeometry ComputeSliderVisualGeometry(
+    const Slider& slider,
+    const Rect& r,
+    float boxW,
+    float boxH) noexcept {
+    const Thickness pad = slider.GetPadding();
+    const float ix = r.x + pad.left;
+    const float iy = r.y + pad.top;
+    const float iw = std::max(0.0f, boxW - (pad.left + pad.right));
+    const float ih = std::max(0.0f, boxH - (pad.top + pad.bottom));
+    const float t = slider.NormalizedPosition();
+
+    SliderVisualGeometry g{};
+    if (slider.GetOrientation() == Orientation::Vertical) {
+        const float thumbSize = std::min(16.0f, std::max(8.0f, iw));
+        const float trackThickness = std::min(6.0f, std::max(2.0f, iw * 0.3f));
+        const float trackX = ix + (iw - trackThickness) * 0.5f;
+        const float usableH = std::max(0.0f, ih - thumbSize);
+        const float thumbY = iy + (1.0f - t) * usableH;
+        const float centerThumbY = thumbY + thumbSize * 0.5f;
+        g.trackRect = Rect{trackX, iy, trackThickness, ih};
+        g.fillRect = Rect{trackX, centerThumbY, trackThickness, std::max(0.0f, (iy + ih) - centerThumbY)};
+        g.thumbRect = Rect{ix + (iw - thumbSize) * 0.5f, thumbY, thumbSize, thumbSize};
+    } else {
+        const float thumbSize = std::min(16.0f, std::max(8.0f, ih));
+        const float trackThickness = std::min(6.0f, std::max(2.0f, ih * 0.3f));
+        const float trackY = iy + (ih - trackThickness) * 0.5f;
+        const float usableW = std::max(0.0f, iw - thumbSize);
+        const float thumbX = ix + t * usableW;
+        const float centerThumbX = thumbX + thumbSize * 0.5f;
+        g.trackRect = Rect{ix, trackY, iw, trackThickness};
+        g.fillRect = Rect{ix, trackY, std::max(0.0f, centerThumbX - ix), trackThickness};
+        g.thumbRect = Rect{thumbX, iy + (ih - thumbSize) * 0.5f, thumbSize, thumbSize};
+    }
+    return g;
+}
+
 } // namespace
 
 std::uint32_t PackColorRgba8(const Color& color, float opacityMultiplier) noexcept {
@@ -384,6 +456,8 @@ void PagedRenderTree::Clear() noexcept {
     nodes_.clear();
     pageDirtyFlags_.clear();
     dirtyPageList_.clear();
+    pendingComboPopups_.clear();
+    activeComboPopupOwners_.clear();
     // Advance treeId_ so stale cached renderNodeId_ handles on UIElements never collide
     treeId_ = gNextRenderTreeId.fetch_add(1u, std::memory_order_relaxed);
 }
@@ -1320,6 +1394,341 @@ bool PagedRenderTree::UpdateElementInPlace(
         return true;
     }
 
+    // Specialized Slider update (constant 3-node span: track + active fill + thumb -> O(1) drag updates!)
+    if (const auto* slider = element->DynamicCast<Slider>()) {
+        if (span != 3u) {
+            return false;
+        }
+        const SliderVisualGeometry geom = ComputeSliderVisualGeometry(*slider, r, boxW, boxH);
+        const float effAlpha = slider->IsEffectivelyEnabled() ? effOpacity : (effOpacity * 0.55f);
+
+        Color trackColor = value::TryGetColor(slider->GetValue(PropId_Background))
+            .value_or(Color{0.16f, 0.20f, 0.26f, 1.0f});
+        Color fillColor = value::TryGetColor(slider->GetValue(PropId_Foreground))
+            .value_or(Color{0.24f, 0.56f, 0.96f, 1.0f});
+        Color thumbColor = ModulateInteractiveSurfaceColor(
+            Color{0.92f, 0.96f, 1.0f, 1.0f},
+            slider);
+        const float thumbBorder = slider->IsFocused() ? 2.0f : 1.0f;
+
+        auto updateSliderQuad = [&](std::uint32_t nid, const Rect& qr, const Color& col, float cr, float bt) {
+            RenderNodeDescriptor& nd = nodes_[nid];
+            nd.x = qr.x;
+            nd.y = qr.y;
+            nd.width = (vis == Visibility::Collapsed) ? 0.0f : qr.width;
+            nd.height = (vis == Visibility::Collapsed) ? 0.0f : qr.height;
+            nd.opacity = effAlpha;
+            nd.cornerRadius = cr;
+            nd.borderThickness = bt;
+            nd.encodedSdfParams = PackSdfRoundedRectParams(cr, bt);
+            nd.primType = (cr > 0.0f || bt > 0.0f) ? AeroPrimType::SdfRoundedRect : AeroPrimType::SolidQuad;
+            nd.baseRgba = PackColorRgba8(col, 1.0f);
+            syncQuadTransform(nd);
+            WriteQuadVertices(nd);
+            MarkPageDirty(nd.pageIndex, nd.vertexOffsetInPage);
+        };
+
+        updateSliderQuad(firstId + 0u, geom.trackRect, trackColor, 3.0f, 0.0f);
+        updateSliderQuad(firstId + 1u, geom.fillRect, fillColor, 3.0f, 0.0f);
+        updateSliderQuad(firstId + 2u, geom.thumbRect, thumbColor, geom.thumbRect.width * 0.5f, thumbBorder);
+        element->ClearLayoutDirtyFlags(RenderDirty);
+        return true;
+    }
+
+    // Specialized TextBox / PasswordBox update (box quad + 1..N SdfTextGlyph nodes + caret quad)
+    if (const auto* tbox = element->DynamicCast<TextBox>()) {
+        if (span < 3u) {
+            return false;
+        }
+        const std::string displayStr = tbox->GetDisplayString();
+        const bool showingPlaceholder = displayStr.empty();
+        const std::string renderedText = showingPlaceholder ? tbox->GetPlaceholder() : displayStr;
+        const std::string_view activeText = (vis == Visibility::Collapsed)
+            ? std::string_view{}
+            : std::string_view{renderedText};
+
+        std::size_t totalGlyphCap = 0u;
+        for (std::uint16_t k = 1u; k + 1u < span; ++k) {
+            if (nodes_[firstId + k].primType == AeroPrimType::SdfTextGlyph) {
+                totalGlyphCap += nodes_[firstId + k].vertexCount / 4u;
+            }
+        }
+        if (CountVisibleUtf8Glyphs(activeText) > totalGlyphCap) {
+            return false;
+        }
+
+        const float effAlpha = tbox->IsEffectivelyEnabled() ? effOpacity : (effOpacity * 0.55f);
+        Color boxBg = value::TryGetColor(tbox->GetValue(PropId_Background))
+            .value_or(Color{0.12f, 0.15f, 0.20f, 1.0f});
+        boxBg = ModulateInteractiveSurfaceColor(boxBg, tbox);
+        const float cr = value::TryGetCornerRadius(tbox->GetValue(PropId_CornerRadius))
+            .value_or(CornerRadius{4.0f}).topLeft;
+        const float bt = tbox->IsFocused()
+            ? 2.0f
+            : value::TryGetThickness(tbox->GetValue(PropId_BorderThickness)).value_or(Thickness{1.0f}).left;
+
+        // Node 0: Input field box
+        {
+            RenderNodeDescriptor& boxNode = nodes_[firstId];
+            boxNode.x = r.x;
+            boxNode.y = r.y;
+            boxNode.width = boxW;
+            boxNode.height = boxH;
+            boxNode.opacity = effAlpha;
+            boxNode.cornerRadius = cr;
+            boxNode.borderThickness = bt;
+            boxNode.encodedSdfParams = PackSdfRoundedRectParams(cr, bt);
+            boxNode.primType = AeroPrimType::SdfRoundedRect;
+            boxNode.baseRgba = PackColorRgba8(boxBg, 1.0f);
+            syncQuadTransform(boxNode);
+            WriteQuadVertices(boxNode);
+            MarkPageDirty(boxNode.pageIndex, boxNode.vertexOffsetInPage);
+        }
+
+        // Nodes [1 .. span-2]: UTF-8 text or muted placeholder
+        const Thickness pad = tbox->GetPadding();
+        const float padLeft = (pad.left > 0.0f) ? pad.left : 6.0f;
+        const float scrollX = showingPlaceholder ? 0.0f : tbox->HorizontalTextScrollOffset();
+        const float textX = r.x + padLeft - scrollX;
+        const float fontSize = tbox->GetFontSize();
+        const float textY = r.y + std::max(2.0f, (boxH - fontSize * 1.2f) * 0.5f);
+        const Color textColor = showingPlaceholder
+            ? Color{0.55f, 0.60f, 0.68f, 0.85f}
+            : tbox->GetForeground();
+
+        std::size_t utf8Cursor = 0u;
+        float localPenX = 0.0f;
+        float localPenY = 0.0f;
+        for (std::uint16_t k = 1u; k + 1u < span; ++k) {
+            RenderNodeDescriptor& tNode = nodes_[firstId + k];
+            tNode.m00 = curState.m00;
+            tNode.m01 = curState.m01;
+            tNode.m10 = curState.m10;
+            tNode.m11 = curState.m11;
+            tNode.baseTx = curState.tx;
+            tNode.baseTy = curState.ty;
+            tNode.inheritedOpacity = curState.inheritedOpacity;
+            (void)UpdateTextRunNodeSlice(
+                firstId + k,
+                textX,
+                textY,
+                fontSize,
+                activeText,
+                utf8Cursor,
+                localPenX,
+                localPenY,
+                textColor,
+                effAlpha);
+        }
+
+        // Node [span-1]: Caret quad (visible when focused & editable)
+        {
+            const Rect caretR = tbox->CaretLocalRect();
+            const bool showCaret = (vis == Visibility::Visible) && tbox->IsFocused() &&
+                                   !tbox->IsReadOnly() && tbox->IsEffectivelyEnabled();
+            RenderNodeDescriptor& caretNode = nodes_[firstId + span - 1u];
+            caretNode.x = caretR.x;
+            caretNode.y = caretR.y;
+            caretNode.width = showCaret ? caretR.width : 0.0f;
+            caretNode.height = showCaret ? caretR.height : 0.0f;
+            caretNode.opacity = showCaret ? effAlpha : 0.0f;
+            caretNode.primType = AeroPrimType::SolidQuad;
+            caretNode.encodedSdfParams = AeroVertexFlag_None;
+            caretNode.baseRgba = PackColorRgba8(Color{0.38f, 0.76f, 1.0f, 1.0f}, 1.0f);
+            syncQuadTransform(caretNode);
+            WriteQuadVertices(caretNode);
+            MarkPageDirty(caretNode.pageIndex, caretNode.vertexOffsetInPage);
+        }
+
+        element->ClearLayoutDirtyFlags(RenderDirty);
+        return true;
+    }
+
+    // Specialized ComboBox update: rebuild cleanly whenever popup is open or closing so top-layer overlay syncs
+    if (const auto* combo = element->DynamicCast<ComboBox>()) {
+        const bool hadActivePopup = std::find(
+            activeComboPopupOwners_.begin(),
+            activeComboPopupOwners_.end(),
+            element) != activeComboPopupOwners_.end();
+        if (combo->IsDropDownOpen() || hadActivePopup) {
+            return false;
+        }
+        // Closed ComboBox header in-place update (header box + chevron + text run)
+        if (span < 3u) {
+            return false;
+        }
+        const std::string selText = combo->GetSelectedItemText();
+        const std::string_view activeSel = (vis == Visibility::Collapsed)
+            ? std::string_view{}
+            : std::string_view{selText};
+        std::size_t glyphCap = 0u;
+        for (std::uint16_t k = 2u; k < span; ++k) {
+            if (nodes_[firstId + k].primType == AeroPrimType::SdfTextGlyph) {
+                glyphCap += nodes_[firstId + k].vertexCount / 4u;
+            }
+        }
+        if (CountVisibleUtf8Glyphs(activeSel) > glyphCap) {
+            return false;
+        }
+
+        const float effAlpha = combo->IsEffectivelyEnabled() ? effOpacity : (effOpacity * 0.55f);
+        Color hdrBg = value::TryGetColor(combo->GetValue(PropId_Background))
+            .value_or(Color{0.16f, 0.21f, 0.29f, 1.0f});
+        hdrBg = ModulateInteractiveSurfaceColor(hdrBg, combo);
+        const float bt = combo->IsFocused() ? 2.0f : 1.0f;
+
+        RenderNodeDescriptor& hdrNode = nodes_[firstId];
+        hdrNode.x = r.x;
+        hdrNode.y = r.y;
+        hdrNode.width = boxW;
+        hdrNode.height = boxH;
+        hdrNode.opacity = effAlpha;
+        hdrNode.cornerRadius = 4.0f;
+        hdrNode.borderThickness = bt;
+        hdrNode.encodedSdfParams = PackSdfRoundedRectParams(4.0f, bt);
+        hdrNode.primType = AeroPrimType::SdfRoundedRect;
+        hdrNode.baseRgba = PackColorRgba8(hdrBg, 1.0f);
+        syncQuadTransform(hdrNode);
+        WriteQuadVertices(hdrNode);
+        MarkPageDirty(hdrNode.pageIndex, hdrNode.vertexOffsetInPage);
+
+        RenderNodeDescriptor& chevNode = nodes_[firstId + 1u];
+        chevNode.x = r.x + std::max(0.0f, boxW - 18.0f);
+        chevNode.y = r.y + std::max(0.0f, (boxH - 6.0f) * 0.5f);
+        chevNode.width = (vis == Visibility::Collapsed) ? 0.0f : 10.0f;
+        chevNode.height = (vis == Visibility::Collapsed) ? 0.0f : 6.0f;
+        chevNode.opacity = effAlpha;
+        chevNode.primType = AeroPrimType::SdfRoundedRect;
+        chevNode.encodedSdfParams = PackSdfRoundedRectParams(2.0f, 0.0f);
+        chevNode.baseRgba = PackColorRgba8(Color{0.78f, 0.86f, 0.98f, 1.0f}, 1.0f);
+        syncQuadTransform(chevNode);
+        WriteQuadVertices(chevNode);
+        MarkPageDirty(chevNode.pageIndex, chevNode.vertexOffsetInPage);
+
+        float fontSize = 14.0f;
+        (void)TryGetFloat(combo->GetValue(PropId_FontSize), fontSize);
+        const Color fg = value::TryGetColor(combo->GetValue(PropId_Foreground))
+            .value_or(Color{0.95f, 0.97f, 1.0f, 1.0f});
+        const float tx = r.x + 8.0f;
+        const float ty = r.y + std::max(2.0f, (boxH - fontSize * 1.2f) * 0.5f);
+        std::size_t utf8Cursor = 0u;
+        float penX = 0.0f;
+        float penY = 0.0f;
+        for (std::uint16_t k = 2u; k < span; ++k) {
+            RenderNodeDescriptor& tn = nodes_[firstId + k];
+            tn.m00 = curState.m00;
+            tn.m01 = curState.m01;
+            tn.m10 = curState.m10;
+            tn.m11 = curState.m11;
+            tn.baseTx = curState.tx;
+            tn.baseTy = curState.ty;
+            tn.inheritedOpacity = curState.inheritedOpacity;
+            (void)UpdateTextRunNodeSlice(
+                firstId + k, tx, ty, fontSize, activeSel, utf8Cursor, penX, penY, fg, effAlpha);
+        }
+        element->ClearLayoutDirtyFlags(RenderDirty);
+        return true;
+    }
+
+    // Specialized CheckBox & RadioButton update (outer indicator + inner check/dot + optional label)
+    if (element->IsA<CheckBox>() || element->IsA<RadioButton>()) {
+        if (span < 2u) {
+            return false;
+        }
+        const auto* cb = element->DynamicCast<CheckBox>();
+        const auto* rb = element->DynamicCast<RadioButton>();
+        const bool isRadio = (rb != nullptr);
+        const bool checked = isRadio ? rb->IsChecked() : cb->IsChecked();
+        const auto* asBtn = static_cast<const Button*>(element);
+        const std::string label = (!element->FirstChild()) ? asBtn->GetContentText() : std::string{};
+        const std::string_view activeLabel = (vis == Visibility::Collapsed)
+            ? std::string_view{}
+            : std::string_view{label};
+
+        std::size_t glyphCap = 0u;
+        bool hasLabelNodes = false;
+        for (std::uint16_t k = 2u; k < span; ++k) {
+            if (nodes_[firstId + k].primType == AeroPrimType::SdfTextGlyph) {
+                hasLabelNodes = true;
+                glyphCap += nodes_[firstId + k].vertexCount / 4u;
+            }
+        }
+        if ((!label.empty() && !hasLabelNodes) || CountVisibleUtf8Glyphs(activeLabel) > glyphCap) {
+            return false;
+        }
+
+        const float effAlpha = element->IsEffectivelyEnabled() ? effOpacity : (effOpacity * 0.55f);
+        const Thickness pad = element->GetPadding();
+        const float boxSize = 18.0f;
+        const float ix = r.x + pad.left;
+        const float iy = r.y + pad.top + std::max(0.0f, (boxH - (pad.top + pad.bottom) - boxSize) * 0.5f);
+
+        Color outerColor = ModulateInteractiveSurfaceColor(
+            Color{0.16f, 0.22f, 0.30f, 1.0f},
+            element);
+        const float outerCr = isRadio ? 9.0f : 4.0f;
+        const float outerBt = element->IsFocused() ? 2.0f : 1.5f;
+
+        RenderNodeDescriptor& outerNd = nodes_[firstId];
+        outerNd.x = ix;
+        outerNd.y = iy;
+        outerNd.width = (vis == Visibility::Collapsed) ? 0.0f : boxSize;
+        outerNd.height = (vis == Visibility::Collapsed) ? 0.0f : boxSize;
+        outerNd.opacity = effAlpha;
+        outerNd.cornerRadius = outerCr;
+        outerNd.borderThickness = outerBt;
+        outerNd.encodedSdfParams = PackSdfRoundedRectParams(outerCr, outerBt);
+        outerNd.primType = AeroPrimType::SdfRoundedRect;
+        outerNd.baseRgba = PackColorRgba8(outerColor, 1.0f);
+        syncQuadTransform(outerNd);
+        WriteQuadVertices(outerNd);
+        MarkPageDirty(outerNd.pageIndex, outerNd.vertexOffsetInPage);
+
+        const float markSize = isRadio ? 8.0f : 10.0f;
+        const float markInset = (boxSize - markSize) * 0.5f;
+        const float markCr = isRadio ? 4.0f : 2.0f;
+        RenderNodeDescriptor& markNd = nodes_[firstId + 1u];
+        markNd.x = ix + markInset;
+        markNd.y = iy + markInset;
+        markNd.width = (vis == Visibility::Collapsed || !checked) ? 0.0f : markSize;
+        markNd.height = (vis == Visibility::Collapsed || !checked) ? 0.0f : markSize;
+        markNd.opacity = checked ? effAlpha : 0.0f;
+        markNd.cornerRadius = markCr;
+        markNd.borderThickness = 0.0f;
+        markNd.encodedSdfParams = PackSdfRoundedRectParams(markCr, 0.0f);
+        markNd.primType = AeroPrimType::SdfRoundedRect;
+        markNd.baseRgba = PackColorRgba8(Color{0.26f, 0.66f, 1.0f, 1.0f}, 1.0f);
+        syncQuadTransform(markNd);
+        WriteQuadVertices(markNd);
+        MarkPageDirty(markNd.pageIndex, markNd.vertexOffsetInPage);
+
+        if (hasLabelNodes) {
+            float fontSize = 14.0f;
+            (void)TryGetFloat(element->GetValue(PropId_FontSize), fontSize);
+            const Color fg = value::TryGetColor(element->GetValue(PropId_Foreground))
+                .value_or(Color{0.94f, 0.96f, 0.99f, 1.0f});
+            const float lx = ix + boxSize + 8.0f;
+            const float ly = r.y + std::max(2.0f, (boxH - fontSize * 1.2f) * 0.5f);
+            std::size_t utf8Cursor = 0u;
+            float penX = 0.0f;
+            float penY = 0.0f;
+            for (std::uint16_t k = 2u; k < span; ++k) {
+                RenderNodeDescriptor& tn = nodes_[firstId + k];
+                tn.m00 = curState.m00;
+                tn.m01 = curState.m01;
+                tn.m10 = curState.m10;
+                tn.m11 = curState.m11;
+                tn.baseTx = curState.tx;
+                tn.baseTy = curState.ty;
+                tn.inheritedOpacity = curState.inheritedOpacity;
+                (void)UpdateTextRunNodeSlice(
+                    firstId + k, lx, ly, fontSize, activeLabel, utf8Cursor, penX, penY, fg, effAlpha);
+            }
+        }
+        element->ClearLayoutDirtyFlags(RenderDirty);
+        return true;
+    }
+
     // Specialized TextBlock update (optional background quad + 1..N SdfTextGlyph run nodes)
     if (const auto* tb = element->DynamicCast<TextBlock>()) {
         const auto bgOpt = value::TryGetColor(element->GetValue(PropId_Background));
@@ -1537,15 +1946,16 @@ bool PagedRenderTree::UpdateElementInPlace(
                 node.width = boxW;
                 node.height = boxH;
                 node.opacity = effOpacity;
-                if (auto bg = value::TryGetColor(btn->GetValue(PropId_Background))) {
-                    node.baseRgba = PackColorRgba8(*bg, 1.0f);
-                } else {
-                    node.baseRgba = PackColorRgba8(Color{0.22f, 0.34f, 0.54f, 1.0f}, 1.0f);
-                }
+                Color btnBg = value::TryGetColor(btn->GetValue(PropId_Background))
+                    .value_or(Color{0.22f, 0.34f, 0.54f, 1.0f});
+                btnBg = ModulateInteractiveSurfaceColor(btnBg, btn);
+                node.baseRgba = PackColorRgba8(btnBg, 1.0f);
+                node.opacity = btn->IsEffectivelyEnabled() ? effOpacity : (effOpacity * 0.55f);
                 node.cornerRadius = value::TryGetCornerRadius(btn->GetValue(PropId_CornerRadius))
                     .value_or(CornerRadius{4.0f}).topLeft;
-                node.borderThickness = value::TryGetThickness(btn->GetValue(PropId_BorderThickness))
+                const float explicitBt = value::TryGetThickness(btn->GetValue(PropId_BorderThickness))
                     .value_or(Thickness{}).left;
+                node.borderThickness = btn->IsFocused() ? std::max(2.0f, explicitBt) : explicitBt;
                 node.encodedSdfParams = PackSdfRoundedRectParams(node.cornerRadius, node.borderThickness);
                 node.primType = (node.cornerRadius > 0.0f || node.borderThickness > 0.0f)
                     ? AeroPrimType::SdfRoundedRect
@@ -1728,6 +2138,111 @@ std::size_t PagedRenderTree::BatchUpdateFromEcsTrackB(
     return totalUpdated;
 }
 
+bool PagedRenderTree::SubtreeContainsActiveComboPopup(const UIElement* elem) const noexcept {
+    if (!elem || activeComboPopupOwners_.empty()) {
+        return false;
+    }
+    for (const UIElement* owner : activeComboPopupOwners_) {
+        for (const UIElement* cur = owner; cur != nullptr; cur = cur->Parent()) {
+            if (cur == elem) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+void PagedRenderTree::EmitDeferredComboPopups() {
+    if (pendingComboPopups_.empty()) {
+        return;
+    }
+    // Render open ComboBox dropdown menus unclipped on top of sibling controls
+    activeClipRect_ = Rect{0.0f, 0.0f, 16384.0f, 16384.0f};
+    activeClipEnabled_ = false;
+
+    for (const auto& entry : pendingComboPopups_) {
+        const ComboBox* combo = entry.combo;
+        if (!combo || !combo->IsDropDownOpen() || !combo->IsEffectivelyEnabled() ||
+            combo->GetVisibility() != Visibility::Visible || entry.state.inheritedOpacity <= 0.0f) {
+            continue;
+        }
+        const std::size_t itemCount = combo->ComboItemCount();
+        if (itemCount == 0u) {
+            continue;
+        }
+        activeComboPopupOwners_.push_back(combo);
+        const RenderTraversalState& st = entry.state;
+        const Rect popupR = combo->DropDownPopupLocalRect();
+        const float effAlpha = st.inheritedOpacity;
+
+        auto syncPopupQuad = [&](std::uint32_t nid) {
+            RenderNodeDescriptor& nd = nodes_[nid];
+            nd.m00 = st.m00;
+            nd.m01 = st.m01;
+            nd.m10 = st.m10;
+            nd.m11 = st.m11;
+            nd.baseTx = st.tx;
+            nd.baseTy = st.ty;
+            nd.tx = st.tx + nd.x * (st.m00 - 1.0f) + nd.y * st.m01;
+            nd.ty = st.ty + nd.x * st.m10 + nd.y * (st.m11 - 1.0f);
+            nd.inheritedOpacity = st.inheritedOpacity;
+            WriteQuadVertices(nd);
+        };
+
+        // Popup backdrop panel
+        const std::uint32_t bgNid = AllocateRenderNode(
+            popupR.x,
+            popupR.y,
+            popupR.width,
+            popupR.height,
+            Color{0.11f, 0.15f, 0.22f, 0.98f},
+            4.0f,
+            1.0f,
+            nullptr);
+        nodes_[bgNid].opacity = effAlpha;
+        syncPopupQuad(bgNid);
+
+        float fontSize = 14.0f;
+        (void)TryGetFloat(combo->GetValue(PropId_FontSize), fontSize);
+        const std::int32_t selIdx = combo->GetSelectedIndex();
+        const std::int32_t hiIdx = combo->HighlightedPopupIndex();
+
+        for (std::size_t i = 0u; i < itemCount; ++i) {
+            const float rowY = popupR.y + static_cast<float>(i) * ComboBox::kPopupRowHeight;
+            const auto iSigned = static_cast<std::int32_t>(i);
+            if (iSigned == hiIdx || iSigned == selIdx) {
+                const Color rowHighlight = (iSigned == hiIdx)
+                    ? Color{0.25f, 0.52f, 0.92f, 0.92f}
+                    : Color{0.20f, 0.34f, 0.56f, 0.75f};
+                const std::uint32_t rowId = AllocateRenderNode(
+                    popupR.x + 2.0f,
+                    rowY + 1.0f,
+                    std::max(0.0f, popupR.width - 4.0f),
+                    ComboBox::kPopupRowHeight - 2.0f,
+                    rowHighlight,
+                    3.0f,
+                    0.0f,
+                    nullptr);
+                nodes_[rowId].opacity = effAlpha;
+                syncPopupQuad(rowId);
+            }
+            const std::string itemLabel = combo->GetComboItemText(i);
+            if (!itemLabel.empty()) {
+                (void)EmitTextRunNodes(
+                    popupR.x + 8.0f,
+                    rowY + std::max(2.0f, (ComboBox::kPopupRowHeight - fontSize * 1.2f) * 0.5f),
+                    fontSize,
+                    itemLabel,
+                    Color{0.95f, 0.97f, 1.0f, 1.0f},
+                    effAlpha,
+                    st,
+                    nullptr);
+            }
+        }
+    }
+    pendingComboPopups_.clear();
+}
+
 std::size_t PagedRenderTree::BuildFromVisualTree(const UIElement* rootElement) {
     Clear();
     if (!rootElement) {
@@ -1736,6 +2251,7 @@ std::size_t PagedRenderTree::BuildFromVisualTree(const UIElement* rootElement) {
     boundRootElement_ = rootElement;
     RenderTraversalState rootState{};
     TraverseAndEmitElement(rootElement, rootState);
+    EmitDeferredComboPopups();
     return nodes_.size();
 }
 
@@ -1816,6 +2332,10 @@ bool PagedRenderTree::SyncDirtySubtreeRecursive(
 
     // If a container or leaf transitioned to Collapsed, zero out its entire subtree's GPU vertices in-place (0 allocs!)
     if (elem->GetVisibility() == Visibility::Collapsed) {
+        if (SubtreeContainsActiveComboPopup(elem)) {
+            outNeedsFullRebuild = true;
+            return false;
+        }
         CollapseSubtreeRenderNodesRecursive(elem, ioUpdatedNodes);
         return true;
     }
@@ -1839,6 +2359,13 @@ bool PagedRenderTree::SyncDirtySubtreeRecursive(
         curState.inheritedOpacity = 0.0f;
     } else {
         curState.inheritedOpacity *= std::clamp(elem->GetOpacity(), 0.0f, 1.0f);
+    }
+
+    if ((elem->GetVisibility() != Visibility::Visible || curState.inheritedOpacity <= 0.0f ||
+         !elem->IsEffectivelyEnabled()) &&
+        SubtreeContainsActiveComboPopup(elem)) {
+        outNeedsFullRebuild = true;
+        return false;
     }
 
     ApplyStateMatrix(
@@ -1867,6 +2394,11 @@ bool PagedRenderTree::SyncDirtySubtreeRecursive(
         }
         ++ioUpdatedNodes;
         elem->ClearLayoutDirtyFlags(RenderDirty);
+    }
+
+    if (elem->IsA<ComboBox>()) {
+        elem->ClearLayoutDirtyFlags(SubtreeRenderDirty);
+        return true;
     }
 
     RenderTraversalState childState = curState;
@@ -2047,6 +2579,92 @@ void PagedRenderTree::TraverseAndEmitElement(
             elem);
         applyNodeTransform(nid);
         emittedCount = 1u;
+    } else if (const auto* slider = elem->DynamicCast<Slider>()) {
+        const SliderVisualGeometry geom = ComputeSliderVisualGeometry(*slider, r, w, h);
+        const float effAlpha = slider->IsEffectivelyEnabled() ? effOpacity : (effOpacity * 0.55f);
+        const Color trackColor = value::TryGetColor(slider->GetValue(PropId_Background))
+            .value_or(Color{0.16f, 0.20f, 0.26f, 1.0f});
+        const Color fillColor = value::TryGetColor(slider->GetValue(PropId_Foreground))
+            .value_or(Color{0.24f, 0.56f, 0.96f, 1.0f});
+        const Color thumbColor = ModulateInteractiveSurfaceColor(
+            Color{0.92f, 0.96f, 1.0f, 1.0f},
+            slider);
+        const float thumbBorder = slider->IsFocused() ? 2.0f : 1.0f;
+
+        const std::uint32_t trackId = AllocateRenderNode(
+            geom.trackRect.x, geom.trackRect.y, geom.trackRect.width, geom.trackRect.height,
+            trackColor, 3.0f, 0.0f, elem);
+        nodes_[trackId].opacity = effAlpha;
+        applyNodeTransform(trackId);
+
+        const std::uint32_t fillId = AllocateRenderNode(
+            geom.fillRect.x, geom.fillRect.y, geom.fillRect.width, geom.fillRect.height,
+            fillColor, 3.0f, 0.0f, elem);
+        nodes_[fillId].opacity = effAlpha;
+        applyNodeTransform(fillId);
+
+        const std::uint32_t thumbId = AllocateRenderNode(
+            geom.thumbRect.x, geom.thumbRect.y, geom.thumbRect.width, geom.thumbRect.height,
+            thumbColor, geom.thumbRect.width * 0.5f, thumbBorder, elem);
+        nodes_[thumbId].opacity = effAlpha;
+        applyNodeTransform(thumbId);
+
+        emittedCount = 3u;
+    } else if (const auto* tbox = elem->DynamicCast<TextBox>()) {
+        const float effAlpha = tbox->IsEffectivelyEnabled() ? effOpacity : (effOpacity * 0.55f);
+        Color boxBg = value::TryGetColor(tbox->GetValue(PropId_Background))
+            .value_or(Color{0.12f, 0.15f, 0.20f, 1.0f});
+        boxBg = ModulateInteractiveSurfaceColor(boxBg, tbox);
+        const float cr = value::TryGetCornerRadius(tbox->GetValue(PropId_CornerRadius))
+            .value_or(CornerRadius{4.0f}).topLeft;
+        const float bt = tbox->IsFocused()
+            ? 2.0f
+            : value::TryGetThickness(tbox->GetValue(PropId_BorderThickness)).value_or(Thickness{1.0f}).left;
+
+        const std::uint32_t boxId = AllocateRenderNode(
+            r.x, r.y, w, h, boxBg, cr, bt, elem);
+        nodes_[boxId].opacity = effAlpha;
+        applyNodeTransform(boxId);
+        ++emittedCount;
+
+        const std::string displayStr = tbox->GetDisplayString();
+        const bool showingPlaceholder = displayStr.empty();
+        const std::string renderedText = showingPlaceholder ? tbox->GetPlaceholder() : displayStr;
+        const Thickness pad = tbox->GetPadding();
+        const float padLeft = (pad.left > 0.0f) ? pad.left : 6.0f;
+        const float scrollX = showingPlaceholder ? 0.0f : tbox->HorizontalTextScrollOffset();
+        const float textX = r.x + padLeft - scrollX;
+        const float fontSize = tbox->GetFontSize();
+        const float textY = r.y + std::max(2.0f, (h - fontSize * 1.2f) * 0.5f);
+        const Color textColor = showingPlaceholder
+            ? Color{0.55f, 0.60f, 0.68f, 0.85f}
+            : tbox->GetForeground();
+
+        emittedCount = static_cast<std::uint16_t>(
+            emittedCount + EmitTextRunNodes(
+                textX,
+                textY,
+                fontSize,
+                renderedText,
+                textColor,
+                effAlpha,
+                curState,
+                elem));
+
+        const Rect caretR = tbox->CaretLocalRect();
+        const bool showCaret = tbox->IsFocused() && !tbox->IsReadOnly() && tbox->IsEffectivelyEnabled();
+        const std::uint32_t caretId = AllocateRenderNode(
+            caretR.x,
+            caretR.y,
+            showCaret ? caretR.width : 0.0f,
+            showCaret ? caretR.height : 0.0f,
+            Color{0.38f, 0.76f, 1.0f, 1.0f},
+            0.0f,
+            0.0f,
+            elem);
+        nodes_[caretId].opacity = showCaret ? effAlpha : 0.0f;
+        applyNodeTransform(caretId);
+        ++emittedCount;
     } else if (const auto* tb = elem->DynamicCast<TextBlock>()) {
         if (auto bg = value::TryGetColor(tb->GetValue(PropId_Background)); bg && bg->a > 0.0f) {
             const float cr = value::TryGetCornerRadius(tb->GetValue(PropId_CornerRadius))
@@ -2077,18 +2695,122 @@ void PagedRenderTree::TraverseAndEmitElement(
                 effOpacity,
                 curState,
                 elem));
+    } else if (const auto* combo = elem->DynamicCast<ComboBox>()) {
+        const float effAlpha = combo->IsEffectivelyEnabled() ? effOpacity : (effOpacity * 0.55f);
+        Color hdrBg = value::TryGetColor(combo->GetValue(PropId_Background))
+            .value_or(Color{0.16f, 0.21f, 0.29f, 1.0f});
+        hdrBg = ModulateInteractiveSurfaceColor(hdrBg, combo);
+        const float bt = combo->IsFocused() ? 2.0f : 1.0f;
+
+        const std::uint32_t hdrId = AllocateRenderNode(
+            r.x, r.y, w, h, hdrBg, 4.0f, bt, elem);
+        nodes_[hdrId].opacity = effAlpha;
+        applyNodeTransform(hdrId);
+        ++emittedCount;
+
+        const std::uint32_t chevId = AllocateRenderNode(
+            r.x + std::max(0.0f, w - 18.0f),
+            r.y + std::max(0.0f, (h - 6.0f) * 0.5f),
+            10.0f,
+            6.0f,
+            Color{0.78f, 0.86f, 0.98f, 1.0f},
+            2.0f,
+            0.0f,
+            elem);
+        nodes_[chevId].opacity = effAlpha;
+        applyNodeTransform(chevId);
+        ++emittedCount;
+
+        float fontSize = 14.0f;
+        (void)TryGetFloat(combo->GetValue(PropId_FontSize), fontSize);
+        const Color fg = value::TryGetColor(combo->GetValue(PropId_Foreground))
+            .value_or(Color{0.95f, 0.97f, 1.0f, 1.0f});
+        const std::string selText = combo->GetSelectedItemText();
+        emittedCount = static_cast<std::uint16_t>(
+            emittedCount + EmitTextRunNodes(
+                r.x + 8.0f,
+                r.y + std::max(2.0f, (h - fontSize * 1.2f) * 0.5f),
+                fontSize,
+                selText,
+                fg,
+                effAlpha,
+                curState,
+                elem));
+
+        if (combo->IsDropDownOpen() && combo->IsEffectivelyEnabled() &&
+            combo->GetVisibility() == Visibility::Visible && curState.inheritedOpacity > 0.0f &&
+            combo->ComboItemCount() > 0u) {
+            pendingComboPopups_.push_back(DeferredComboPopup{combo, curState});
+        }
+    } else if (elem->IsA<CheckBox>() || elem->IsA<RadioButton>()) {
+        const auto* cb = elem->DynamicCast<CheckBox>();
+        const auto* rb = elem->DynamicCast<RadioButton>();
+        const bool isRadio = (rb != nullptr);
+        const bool checked = isRadio ? rb->IsChecked() : cb->IsChecked();
+        const float effAlpha = elem->IsEffectivelyEnabled() ? effOpacity : (effOpacity * 0.55f);
+
+        const Thickness pad = elem->GetPadding();
+        const float boxSize = 18.0f;
+        const float ix = r.x + pad.left;
+        const float iy = r.y + pad.top + std::max(0.0f, (h - (pad.top + pad.bottom) - boxSize) * 0.5f);
+
+        const Color outerColor = ModulateInteractiveSurfaceColor(
+            Color{0.16f, 0.22f, 0.30f, 1.0f},
+            elem);
+        const float outerCr = isRadio ? 9.0f : 4.0f;
+        const float outerBt = elem->IsFocused() ? 2.0f : 1.5f;
+        const std::uint32_t outerId = AllocateRenderNode(
+            ix, iy, boxSize, boxSize, outerColor, outerCr, outerBt, elem);
+        nodes_[outerId].opacity = effAlpha;
+        applyNodeTransform(outerId);
+        ++emittedCount;
+
+        const float markSize = isRadio ? 8.0f : 10.0f;
+        const float markInset = (boxSize - markSize) * 0.5f;
+        const float markCr = isRadio ? 4.0f : 2.0f;
+        const std::uint32_t markId = AllocateRenderNode(
+            ix + markInset,
+            iy + markInset,
+            checked ? markSize : 0.0f,
+            checked ? markSize : 0.0f,
+            Color{0.26f, 0.66f, 1.0f, 1.0f},
+            markCr,
+            0.0f,
+            elem);
+        nodes_[markId].opacity = checked ? effAlpha : 0.0f;
+        applyNodeTransform(markId);
+        ++emittedCount;
+
+        if (!elem->FirstChild()) {
+            const auto* asBtn = static_cast<const Button*>(elem);
+            const std::string label = asBtn->GetContentText();
+            if (!label.empty()) {
+                float fontSize = 14.0f;
+                (void)TryGetFloat(elem->GetValue(PropId_FontSize), fontSize);
+                const Color fg = value::TryGetColor(elem->GetValue(PropId_Foreground))
+                    .value_or(Color{0.94f, 0.96f, 0.99f, 1.0f});
+                const float lx = ix + boxSize + 8.0f;
+                const float ly = r.y + std::max(2.0f, (h - fontSize * 1.2f) * 0.5f);
+                emittedCount = static_cast<std::uint16_t>(
+                    emittedCount + EmitTextRunNodes(
+                        lx, ly, fontSize, label, fg, effAlpha, curState, elem));
+            }
+        }
     } else if (const auto* btn = elem->DynamicCast<Button>()) {
+        const float effAlpha = btn->IsEffectivelyEnabled() ? effOpacity : (effOpacity * 0.55f);
         Color bgColor{0.22f, 0.34f, 0.54f, 1.0f};
         if (auto bg = value::TryGetColor(btn->GetValue(PropId_Background))) {
             bgColor = *bg;
         }
+        bgColor = ModulateInteractiveSurfaceColor(bgColor, btn);
         const float cr = value::TryGetCornerRadius(btn->GetValue(PropId_CornerRadius))
             .value_or(CornerRadius{4.0f}).topLeft;
-        const float bt = value::TryGetThickness(btn->GetValue(PropId_BorderThickness))
+        const float explicitBt = value::TryGetThickness(btn->GetValue(PropId_BorderThickness))
             .value_or(Thickness{}).left;
+        const float bt = btn->IsFocused() ? std::max(2.0f, explicitBt) : explicitBt;
         const std::uint32_t boxId = AllocateRenderNode(
             r.x, r.y, w, h, bgColor, cr, bt, elem);
-        nodes_[boxId].opacity = effOpacity;
+        nodes_[boxId].opacity = effAlpha;
         applyNodeTransform(boxId);
         ++emittedCount;
 
@@ -2111,7 +2833,7 @@ void PagedRenderTree::TraverseAndEmitElement(
                         fontSize,
                         label,
                         fg,
-                        effOpacity,
+                        effAlpha,
                         curState,
                         elem));
             }
@@ -2175,8 +2897,10 @@ void PagedRenderTree::TraverseAndEmitElement(
         childState.m00, childState.m01, childState.m10, childState.m11, childState.tx, childState.ty,
         elem->GetChildContainerTransform2D());
 
-    for (const UIElement* child = elem->FirstChild(); child != nullptr; child = child->NextSibling()) {
-        TraverseAndEmitElement(child, childState);
+    if (!elem->IsA<ComboBox>()) {
+        for (const UIElement* child = elem->FirstChild(); child != nullptr; child = child->NextSibling()) {
+            TraverseAndEmitElement(child, childState);
+        }
     }
 
     // Restore active clip state after visiting children

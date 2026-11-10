@@ -16,6 +16,9 @@
 
 namespace aero {
 
+struct AxbPackage;
+class DualTrackBindingEngine;
+
 template <typename T>
 class IntrusivePtr {
 public:
@@ -189,6 +192,10 @@ public:
     virtual void ArrangeCore(Rect finalRect) noexcept;
     virtual void OnPropertyChanged(std::uint16_t propId, const UnifiedValue& newValue);
 
+    // Coordinate space conversions across ancestor 2D/3D transforms & Viewbox scaling (0 heap allocs)
+    [[nodiscard]] Point ScreenToLocal(Point screenPoint) const noexcept;
+    [[nodiscard]] Rect LocalToScreenBounds(Rect localRect) const noexcept;
+
     // Container-applied child coordinate transform (used by Viewbox uniform/fill scaling)
     [[nodiscard]] virtual Matrix2D GetChildContainerTransform2D() const noexcept {
         return Matrix2D::Identity();
@@ -203,6 +210,129 @@ public:
     [[nodiscard]] Rect FinalRect() const noexcept { return finalRect_; }
     [[nodiscard]] Rect LastArrangeSlot() const noexcept { return lastArrangeSlot_; }
     [[nodiscard]] std::uint16_t TreeDepth() const noexcept { return treeDepth_; }
+
+    // Zero-allocation inline interactive visual & focus states (packed in FastInlineStorage::reserved)
+    [[nodiscard]] bool IsEnabled() const noexcept {
+        return (fastProps_.reserved & InteractiveState_Disabled) == 0u;
+    }
+    void SetIsEnabled(bool enabled) noexcept {
+        fastInlineRanks_[10] = static_cast<std::uint8_t>(ValueSourceRank::Local);
+        const std::uint8_t next = enabled
+            ? static_cast<std::uint8_t>(fastProps_.reserved & ~InteractiveState_Disabled)
+            : static_cast<std::uint8_t>(fastProps_.reserved | InteractiveState_Disabled);
+        if (fastProps_.reserved != next) {
+            fastProps_.reserved = next;
+            PropagateEnabledStateToSubtree();
+        }
+    }
+    [[nodiscard]] bool IsEffectivelyEnabled() const noexcept {
+        for (const UIElement* cur = this; cur != nullptr; cur = cur->parent_) {
+            if (!cur->IsEnabled()) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    [[nodiscard]] bool IsHovered() const noexcept {
+        return (fastProps_.reserved & InteractiveState_Hovered) != 0u;
+    }
+    void SetHovered(bool hovered) noexcept {
+        const std::uint8_t next = hovered
+            ? static_cast<std::uint8_t>(fastProps_.reserved | InteractiveState_Hovered)
+            : static_cast<std::uint8_t>(fastProps_.reserved & ~InteractiveState_Hovered);
+        if (fastProps_.reserved != next) {
+            fastProps_.reserved = next;
+            InvalidateRender();
+        }
+    }
+
+    [[nodiscard]] bool IsPressed() const noexcept {
+        return (fastProps_.reserved & InteractiveState_Pressed) != 0u;
+    }
+    void SetPressed(bool pressed) noexcept {
+        const std::uint8_t next = pressed
+            ? static_cast<std::uint8_t>(fastProps_.reserved | InteractiveState_Pressed)
+            : static_cast<std::uint8_t>(fastProps_.reserved & ~InteractiveState_Pressed);
+        if (fastProps_.reserved != next) {
+            fastProps_.reserved = next;
+            if (!pressed) {
+                OnPointerCaptureLost();
+            }
+            InvalidateRender();
+        } else if (!pressed) {
+            OnPointerCaptureLost();
+        }
+    }
+
+    [[nodiscard]] bool IsFocused() const noexcept {
+        return (fastProps_.reserved & InteractiveState_Focused) != 0u;
+    }
+    void SetFocused(bool focused) noexcept {
+        const std::uint8_t next = focused
+            ? static_cast<std::uint8_t>(fastProps_.reserved | InteractiveState_Focused)
+            : static_cast<std::uint8_t>(fastProps_.reserved & ~InteractiveState_Focused);
+        if (fastProps_.reserved != next) {
+            fastProps_.reserved = next;
+            InvalidateRender();
+            OnFocusChanged(focused);
+        }
+    }
+
+    [[nodiscard]] virtual bool DefaultFocusable() const noexcept { return false; }
+    [[nodiscard]] bool IsFocusable() const noexcept {
+        if ((fastProps_.reserved & InteractiveState_FocusableExplicit) != 0u) {
+            return (fastProps_.reserved & InteractiveState_FocusableValue) != 0u;
+        }
+        return DefaultFocusable();
+    }
+    void SetFocusable(bool focusable) noexcept {
+        fastInlineRanks_[11] = static_cast<std::uint8_t>(ValueSourceRank::Local);
+        std::uint8_t next = static_cast<std::uint8_t>(
+            fastProps_.reserved | InteractiveState_FocusableExplicit);
+        if (focusable) {
+            next = static_cast<std::uint8_t>(next | InteractiveState_FocusableValue);
+        } else {
+            next = static_cast<std::uint8_t>(next & ~InteractiveState_FocusableValue);
+        }
+        fastProps_.reserved = next;
+    }
+    void ClearExplicitFocusable() noexcept {
+        fastInlineRanks_[11] = static_cast<std::uint8_t>(ValueSourceRank::Default);
+        fastProps_.reserved = static_cast<std::uint8_t>(
+            fastProps_.reserved & ~(InteractiveState_FocusableExplicit | InteractiveState_FocusableValue));
+    }
+    [[nodiscard]] bool CanReceiveFocus() const noexcept;
+
+    // Automatic TwoWay binding write-back linkage
+    void BindTwoWayEngine(DualTrackBindingEngine* engine) noexcept {
+        boundBindingEngine_ = engine;
+    }
+    [[nodiscard]] DualTrackBindingEngine* BoundTwoWayEngine() const noexcept {
+        return boundBindingEngine_;
+    }
+    bool NotifyTwoWayPropertyMutated(std::uint16_t propId, RuntimeError* error = nullptr);
+
+    // Virtual zero-RTTI input dispatch hooks invoked by InputEventRouter
+    [[nodiscard]] virtual bool IsInteractiveControl() const noexcept {
+        return DefaultFocusable();
+    }
+    virtual bool OnPointerDown(
+        Point localPoint,
+        PointerButton button,
+        std::uint8_t modifiers,
+        bool& outRequestCapture);
+    virtual bool OnPointerMove(Point localPoint, std::uint8_t modifiers);
+    virtual bool OnPointerUp(
+        Point localPoint,
+        PointerButton button,
+        std::uint8_t modifiers,
+        bool insideBounds);
+    virtual bool OnKeyDown(KeyCode key, std::uint8_t modifiers);
+    virtual bool OnTextInput(std::string_view utf8Text);
+    virtual void OnFocusChanged(bool focused);
+    virtual void OnPointerCaptureLost() noexcept;
+    virtual void OnEnabledStateChanged(bool effectivelyEnabled);
 
     // O(1) PagedRenderTree linkage (eliminates O(N) sourceElement linear scans)
     void BindRenderNodeSpan(
@@ -225,6 +355,8 @@ public:
     // Fast Inline Properties (0 heap allocation fast path)
     [[nodiscard]] float GetWidth() const noexcept { return fastProps_.width; }
     void SetWidth(float v) noexcept {
+        fastInlineRanks_[0] = static_cast<std::uint8_t>(
+            v < 0.0f ? ValueSourceRank::Default : ValueSourceRank::Local);
         if (fastProps_.width != v) {
             fastProps_.width = v;
             InvalidateLayout();
@@ -233,6 +365,8 @@ public:
 
     [[nodiscard]] float GetHeight() const noexcept { return fastProps_.height; }
     void SetHeight(float v) noexcept {
+        fastInlineRanks_[1] = static_cast<std::uint8_t>(
+            v < 0.0f ? ValueSourceRank::Default : ValueSourceRank::Local);
         if (fastProps_.height != v) {
             fastProps_.height = v;
             InvalidateLayout();
@@ -241,6 +375,7 @@ public:
 
     [[nodiscard]] float GetMinWidth() const noexcept { return fastProps_.minWidth; }
     void SetMinWidth(float v) noexcept {
+        fastInlineRanks_[2] = static_cast<std::uint8_t>(ValueSourceRank::Local);
         if (fastProps_.minWidth != v) {
             fastProps_.minWidth = v;
             InvalidateLayout();
@@ -249,6 +384,7 @@ public:
 
     [[nodiscard]] float GetMinHeight() const noexcept { return fastProps_.minHeight; }
     void SetMinHeight(float v) noexcept {
+        fastInlineRanks_[3] = static_cast<std::uint8_t>(ValueSourceRank::Local);
         if (fastProps_.minHeight != v) {
             fastProps_.minHeight = v;
             InvalidateLayout();
@@ -265,6 +401,7 @@ public:
         return static_cast<HorizontalAlignment>(fastProps_.alignmentFlags & 0x03u);
     }
     void SetHorizontalAlignment(HorizontalAlignment align) noexcept {
+        fastInlineRanks_[8] = static_cast<std::uint8_t>(ValueSourceRank::Local);
         const auto raw = static_cast<std::uint8_t>(align) & 0x03u;
         const auto next = static_cast<std::uint8_t>((fastProps_.alignmentFlags & ~0x03u) | raw);
         if (fastProps_.alignmentFlags != next) {
@@ -280,6 +417,7 @@ public:
         return static_cast<VerticalAlignment>((fastProps_.alignmentFlags >> 2u) & 0x03u);
     }
     void SetVerticalAlignment(VerticalAlignment align) noexcept {
+        fastInlineRanks_[9] = static_cast<std::uint8_t>(ValueSourceRank::Local);
         const auto raw = static_cast<std::uint8_t>((static_cast<std::uint8_t>(align) & 0x03u) << 2u);
         const auto next = static_cast<std::uint8_t>((fastProps_.alignmentFlags & ~0x0Cu) | raw);
         if (fastProps_.alignmentFlags != next) {
@@ -316,6 +454,7 @@ public:
             fastProps_.marginB};
     }
     void SetMargin(const Thickness& m) noexcept {
+        fastInlineRanks_[4] = static_cast<std::uint8_t>(ValueSourceRank::Local);
         if (GetMargin() != m) {
             fastProps_.marginL = m.left;
             fastProps_.marginT = m.top;
@@ -333,6 +472,7 @@ public:
             fastProps_.paddingB};
     }
     void SetPadding(const Thickness& p) noexcept {
+        fastInlineRanks_[5] = static_cast<std::uint8_t>(ValueSourceRank::Local);
         if (GetPadding() != p) {
             fastProps_.paddingL = p.left;
             fastProps_.paddingT = p.top;
@@ -344,6 +484,7 @@ public:
 
     [[nodiscard]] float GetOpacity() const noexcept { return fastProps_.opacity; }
     void SetOpacity(float v) noexcept {
+        fastInlineRanks_[6] = static_cast<std::uint8_t>(ValueSourceRank::Local);
         if (fastProps_.opacity != v) {
             fastProps_.opacity = v;
             InvalidateRender();
@@ -354,6 +495,7 @@ public:
         return static_cast<Visibility>(fastProps_.visibility);
     }
     void SetVisibility(Visibility v) noexcept {
+        fastInlineRanks_[7] = static_cast<std::uint8_t>(ValueSourceRank::Local);
         const auto raw = static_cast<std::uint8_t>(v);
         if (fastProps_.visibility != raw) {
             fastProps_.visibility = raw;
@@ -388,12 +530,21 @@ public:
         fastProps_.layoutDirtyFlags &= static_cast<std::uint8_t>(~mask);
     }
 
-    // Unified DependencyProperty read/write (fast inline for propId < 8 & alignments, 32B sparse entry for others)
+    void SetStyleKey(std::string_view styleKey);
+    [[nodiscard]] std::string GetStyleKey() const;
+
+    // Unified DependencyProperty read/write (fast inline for propId < 8 & alignments/interactive, 32B sparse entry for others)
     [[nodiscard]] UnifiedValue GetValue(std::uint16_t propId) const;
+    [[nodiscard]] ValueSourceRank GetPropertySourceRank(std::uint16_t propId) const noexcept;
     bool SetValue(
         std::uint16_t propId,
         const UnifiedValue& value,
         ValueSourceRank rank = ValueSourceRank::Local);
+    bool ForceEffectiveValue(
+        std::uint16_t propId,
+        const UnifiedValue& value,
+        ValueSourceRank rank);
+    bool ForceClearSparseEntry(std::uint16_t propId);
     bool ClearValue(std::uint16_t propId, ValueSourceRank rank = ValueSourceRank::Local);
 
     // Sparse entry metadata inspection/mutation (bindingSlotId & animationTrackId in 32B entry)
@@ -413,6 +564,8 @@ protected:
 private:
     friend class DepthBucketLayoutQueue;
 
+    [[nodiscard]] Matrix2D ComputeLocalToScreenMatrix2D() const noexcept;
+    void PropagateEnabledStateToSubtree() noexcept;
     void PropagateRootConnection(
         bool connected,
         NativeHandleRegistry* registry,
@@ -459,13 +612,15 @@ private:
     Rect finalRect_{0.0f, 0.0f, 0.0f, 0.0f};
     std::string name_;
 
-    // Zero-hash NativeHandle slot & generation cache
+    // Zero-hash NativeHandle slot, binding engine backlink & generation cache
     NativeHandle cachedNativeHandle_{};
     NativeHandleRegistry* boundRegistry_ = nullptr;
     ManagedHeap* boundUiHeap_ = nullptr;
+    DualTrackBindingEngine* boundBindingEngine_ = nullptr;
     ObjectRef boundWrapperRef_{};
     PersistentRoot pinnedWrapperRoot_{};
     bool isConnectedToRoot_ = false;
+    std::array<std::uint8_t, kFastInlinePropertySlotCount> fastInlineRanks_{};
 
     // High-frequency properties inline + 32B compact sparse vector
     FastInlineStorage fastProps_{};
@@ -482,9 +637,6 @@ public:
         return StaticTypeClass();
     }
 };
-
-struct AxbPackage;
-class DualTrackBindingEngine;
 
 class Window : public Panel {
 public:
@@ -535,6 +687,8 @@ public:
         return StaticTypeClass();
     }
 
+    [[nodiscard]] bool DefaultFocusable() const noexcept override { return true; }
+
     void SetContentText(std::string_view text);
     [[nodiscard]] std::string GetContentText() const;
 
@@ -560,6 +714,20 @@ public:
         scriptClickMethodId_ = methodSymbolId;
     }
     bool PerformClick(RuntimeError* error = nullptr);
+    virtual bool ActivateFromInput(RuntimeError* error = nullptr);
+    [[nodiscard]] std::uint32_t ClickGeneration() const noexcept { return clickGeneration_; }
+
+    bool OnPointerDown(
+        Point localPoint,
+        PointerButton button,
+        std::uint8_t modifiers,
+        bool& outRequestCapture) override;
+    bool OnPointerUp(
+        Point localPoint,
+        PointerButton button,
+        std::uint8_t modifiers,
+        bool insideBounds) override;
+    bool OnKeyDown(KeyCode key, std::uint8_t modifiers) override;
 
     Size MeasureCore(Size availableSize) noexcept override;
 
@@ -569,6 +737,7 @@ private:
     rs_aot::ExecutionContext* scriptAotContext_ = nullptr;
     ObjectRef scriptTargetObject_{};
     SymbolId scriptClickMethodId_ = 0;
+    std::uint32_t clickGeneration_ = 0u;
 };
 
 // Initialize built-in AeroGUI TypeClass hierarchy and Euler-tour intervals

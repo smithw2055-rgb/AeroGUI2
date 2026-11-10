@@ -7,11 +7,14 @@
 #include <unordered_map>
 #include <vector>
 
+#include "aero/animation/AnimationEngine.hpp"
 #include "aero/binding/DualTrackBindingEngine.hpp"
 #include "aero/core/UIElement.hpp"
+#include "aero/input/InputEventRouter.hpp"
 #include "aero/layout/DepthBucketLayoutQueue.hpp"
 #include "aero/render/PagedRenderTree.hpp"
 #include "aero/render/ZeroCopyGpuStream.hpp"
+#include "aero/style/StyleTriggerEngine.hpp"
 
 namespace aero {
 
@@ -34,9 +37,12 @@ struct HostFrameTelemetry {
     std::uint64_t frameCount = 0;
     std::uint32_t lastActivePhaseMask = 0;
     std::size_t stylePassesRun = 0;
+    std::size_t styleTriggerChanges = 0;
+    std::size_t animationTrackUpdates = 0;
     std::size_t layoutPassesRun = 0;
     std::size_t trackAUpdates = 0;
     std::size_t trackBUpdates = 0;
+    std::size_t inputEventsDispatched = 0;
     std::size_t renderNodesSynced = 0;
     ZeroCopySubmissionStats gpuStats{};
 };
@@ -75,6 +81,12 @@ public:
     void SetBindingEngine(DualTrackBindingEngine* engine) noexcept { bindingEngine_ = engine; }
     void SetLayoutQueue(DepthBucketLayoutQueue* queue) noexcept { layoutQueue_ = queue; }
     void SetRenderTree(PagedRenderTree* tree) noexcept { renderTree_ = tree; }
+    void SetInputRouter(InputEventRouter* router) noexcept { inputRouter_ = router; }
+    [[nodiscard]] InputEventRouter* InputRouter() const noexcept { return inputRouter_; }
+    void SetStyleEngine(StyleTriggerEngine* styleEngine) noexcept { styleEngine_ = styleEngine; }
+    [[nodiscard]] StyleTriggerEngine* StyleEngine() const noexcept { return styleEngine_; }
+    void SetAnimationEngine(AnimationEngine* animEngine) noexcept { animationEngine_ = animEngine; }
+    [[nodiscard]] AnimationEngine* GetAnimationEngine() const noexcept { return animationEngine_; }
     void SetViewportSize(Size viewport) noexcept { viewportSize_ = viewport; }
 
     void TickUi(float dt, std::uint32_t activePhaseMask = UiPhase_All) override;
@@ -91,6 +103,9 @@ private:
     DualTrackBindingEngine* bindingEngine_ = nullptr;
     DepthBucketLayoutQueue* layoutQueue_ = nullptr;
     PagedRenderTree* renderTree_ = nullptr;
+    InputEventRouter* inputRouter_ = nullptr;
+    StyleTriggerEngine* styleEngine_ = nullptr;
+    AnimationEngine* animationEngine_ = nullptr;
     Size viewportSize_{1920.0f, 1080.0f};
     Size lastLaidOutViewport_{-1.0f, -1.0f};
     HostFrameTelemetry telemetry_{};
@@ -112,6 +127,12 @@ public:
     }
 
     void SetRenderTree(PagedRenderTree* tree) noexcept { renderTree_ = tree; }
+    void SetInputRouter(InputEventRouter* router) noexcept { inputRouter_ = router; }
+    [[nodiscard]] InputEventRouter* InputRouter() const noexcept { return inputRouter_; }
+    void SetStyleEngine(StyleTriggerEngine* styleEngine) noexcept { styleEngine_ = styleEngine; }
+    [[nodiscard]] StyleTriggerEngine* StyleEngine() const noexcept { return styleEngine_; }
+    void SetAnimationEngine(AnimationEngine* animEngine) noexcept { animationEngine_ = animEngine; }
+    [[nodiscard]] AnimationEngine* GetAnimationEngine() const noexcept { return animationEngine_; }
 
     void SetStateFlags(
         bool hasActiveAnimations,
@@ -148,6 +169,9 @@ private:
     DualTrackBindingEngine* bindingEngine_ = nullptr;
     DepthBucketLayoutQueue* layoutQueue_ = nullptr;
     PagedRenderTree* renderTree_ = nullptr;
+    InputEventRouter* inputRouter_ = nullptr;
+    StyleTriggerEngine* styleEngine_ = nullptr;
+    AnimationEngine* animationEngine_ = nullptr;
     Size viewportSize_{1920.0f, 1080.0f};
     Size lastLaidOutViewport_{-1.0f, -1.0f};
     bool hasActiveAnimations_ = false;
@@ -214,6 +238,8 @@ private:
     std::uint32_t caretOffset_ = 0;
     std::string preeditText_;
     std::string committedText_;
+    std::string compositionBaseText_;
+    std::size_t compositionBaseCaret_ = 0;
     std::string cachedClipboard_;
 };
 
@@ -289,6 +315,12 @@ public:
     }
 
     void SetRenderTree(PagedRenderTree* tree) noexcept { renderTree_ = tree; }
+    void SetInputRouter(InputEventRouter* router) noexcept { inputRouter_ = router; }
+    [[nodiscard]] InputEventRouter* InputRouter() const noexcept { return inputRouter_; }
+    void SetStyleEngine(StyleTriggerEngine* styleEngine) noexcept { styleEngine_ = styleEngine; }
+    [[nodiscard]] StyleTriggerEngine* StyleEngine() const noexcept { return styleEngine_; }
+    void SetAnimationEngine(AnimationEngine* animEngine) noexcept { animationEngine_ = animEngine; }
+    [[nodiscard]] AnimationEngine* GetAnimationEngine() const noexcept { return animationEngine_; }
 
     // Strictly non-blocking rAF state machine (ASYNCIFY is strictly forbidden)
     [[nodiscard]] static constexpr bool IsAsyncifyEnabled() noexcept { return false; }
@@ -302,6 +334,9 @@ public:
     }
 
     [[nodiscard]] bool CanSleepIdle() const noexcept override {
+        if (inputRouter_ && inputRouter_->HasPendingEvents()) {
+            return false;
+        }
         return rafState_ == WebRafState::SuspendedIdle;
     }
 
@@ -324,6 +359,9 @@ private:
     DualTrackBindingEngine* bindingEngine_ = nullptr;
     DepthBucketLayoutQueue* layoutQueue_ = nullptr;
     PagedRenderTree* renderTree_ = nullptr;
+    InputEventRouter* inputRouter_ = nullptr;
+    StyleTriggerEngine* styleEngine_ = nullptr;
+    AnimationEngine* animationEngine_ = nullptr;
     ShaderBackend webBackend_ = ShaderBackend::WebGL2;
     WebRafState rafState_ = WebRafState::ActiveTicking;
     WebImeAdapter imeAdapter_{};

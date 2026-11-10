@@ -357,6 +357,13 @@ private:
     void CollapseSubtreeRenderNodesRecursive(
         const UIElement* elem,
         std::size_t& ioUpdatedNodes) noexcept;
+    struct DeferredComboPopup {
+        const class ComboBox* combo = nullptr;
+        RenderTraversalState state{};
+    };
+
+    [[nodiscard]] bool SubtreeContainsActiveComboPopup(const UIElement* elem) const noexcept;
+    void EmitDeferredComboPopups();
     void TraverseAndEmitElement(const UIElement* elem, const RenderTraversalState& parentState);
     bool SyncDirtySubtreeRecursive(
         const UIElement* elem,
@@ -373,6 +380,8 @@ private:
     std::vector<RenderNodeDescriptor> nodes_;
     std::vector<std::uint8_t> pageDirtyFlags_;
     std::vector<std::uint32_t> dirtyPageList_;
+    std::vector<DeferredComboPopup> pendingComboPopups_;
+    std::vector<const UIElement*> activeComboPopupOwners_;
     std::array<GlyphUvRect, 128> preCachedGlyphs_{};
 };
 

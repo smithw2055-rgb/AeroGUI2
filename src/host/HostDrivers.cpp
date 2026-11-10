@@ -17,20 +17,42 @@ AriaShadowNode BuildAriaNodeRecursive(const UIElement* elem) {
     node.bounds = elem->FinalRect();
     node.label = elem->Name();
 
-    if (const auto* btn = elem->DynamicCast<Button>()) {
+    if (const auto* rb = elem->DynamicCast<RadioButton>()) {
+        node.role = "radio";
+        node.value = rb->IsChecked() ? "true" : "false";
+        if (node.label.empty()) node.label = rb->GetContentText();
+        node.focusable = rb->CanReceiveFocus();
+    } else if (const auto* cb = elem->DynamicCast<CheckBox>()) {
+        node.role = "checkbox";
+        node.value = cb->IsChecked() ? "true" : "false";
+        if (node.label.empty()) node.label = cb->GetContentText();
+        node.focusable = cb->CanReceiveFocus();
+    } else if (const auto* slider = elem->DynamicCast<Slider>()) {
+        node.role = "slider";
+        node.value = rs_rt::valueToString(MakeFloat(slider->GetSliderValue()));
+        node.focusable = slider->CanReceiveFocus();
+    } else if (const auto* tbox = elem->DynamicCast<TextBox>()) {
+        node.role = "textbox";
+        node.value = tbox->GetDisplayString();
+        node.focusable = tbox->CanReceiveFocus();
+    } else if (const auto* combo = elem->DynamicCast<ComboBox>()) {
+        node.role = "combobox";
+        node.value = combo->GetSelectedItemText();
+        node.focusable = combo->CanReceiveFocus();
+    } else if (const auto* btn = elem->DynamicCast<Button>()) {
         node.role = "button";
         node.value = btn->GetContentText();
-        node.focusable = true;
+        node.focusable = btn->CanReceiveFocus();
     } else if (const auto* tb = elem->DynamicCast<TextBlock>()) {
         node.role = "text";
         node.value = tb->GetText();
-        node.focusable = false;
+        node.focusable = elem->CanReceiveFocus();
     } else if (elem->IsA<Window>()) {
         node.role = "dialog";
         node.focusable = true;
     } else {
         node.role = "group";
-        node.focusable = false;
+        node.focusable = elem->CanReceiveFocus();
     }
 
     for (const UIElement* c = elem->FirstChild(); c != nullptr; c = c->NextSibling()) {
@@ -62,6 +84,10 @@ void EmbeddedGameHost::TickUi(float dt, std::uint32_t activePhaseMask) {
     telemetry_.frameCount += 1u;
     telemetry_.lastActivePhaseMask = activePhaseMask;
 
+    if ((activePhaseMask & UiPhase_Input) != 0u && inputRouter_) {
+        telemetry_.inputEventsDispatched += inputRouter_->FlushQueuedEvents();
+    }
+
     if ((activePhaseMask & UiPhase_TrackABinding) != 0u && bindingEngine_) {
         telemetry_.trackAUpdates += bindingEngine_->FlushTrackA();
     }
@@ -77,6 +103,16 @@ void EmbeddedGameHost::TickUi(float dt, std::uint32_t activePhaseMask) {
 
     if ((activePhaseMask & UiPhase_Style) != 0u) {
         telemetry_.stylePassesRun += 1u;
+        if (styleEngine_) {
+            if (bindingEngine_ && !styleEngine_->GetBindingEngine()) {
+                styleEngine_->SetBindingEngine(bindingEngine_);
+            }
+            telemetry_.styleTriggerChanges += styleEngine_->EvaluateAndApply();
+        }
+    }
+
+    if ((activePhaseMask & UiPhase_Animation) != 0u && animationEngine_) {
+        telemetry_.animationTrackUpdates += animationEngine_->Tick(dt);
     }
 
     if ((activePhaseMask & UiPhase_Layout) != 0u) {
@@ -138,13 +174,21 @@ void DesktopEventHost::SetStateFlags(
 }
 
 bool DesktopEventHost::CanSleepIdle() const noexcept {
-    const bool rootVisualDirty = renderTree_ && rootVisual_ &&
+    const bool rootLayoutDirty = rootVisual_ &&
         (rootVisual_->GetLayoutDirtyFlags() &
-         (MeasureDirty | ArrangeDirty | RenderDirty | SubtreeLayoutDirty | SubtreeRenderDirty)) != 0u;
+         (MeasureDirty | ArrangeDirty | SubtreeLayoutDirty)) != 0u;
+    const bool rootRenderDirty = renderTree_ && rootVisual_ &&
+        (rootVisual_->GetLayoutDirtyFlags() &
+         (RenderDirty | SubtreeRenderDirty)) != 0u;
+    const bool rootVisualDirty = rootLayoutDirty || rootRenderDirty;
+    const bool routerPending = inputRouter_ && inputRouter_->HasPendingEvents();
+    const bool animEngineActive = animationEngine_ && animationEngine_->HasActiveAnimations();
     return !hasActiveAnimations_ &&
+           !animEngineActive &&
            !hasDirtyObjects_ &&
            !hasDirtyLayout_ &&
            !hasPendingInputEvents_ &&
+           !routerPending &&
            !rootVisualDirty;
 }
 
@@ -158,6 +202,15 @@ void DesktopEventHost::TickUi(float dt, std::uint32_t activePhaseMask) {
     telemetry_.frameCount += 1u;
     telemetry_.lastActivePhaseMask = activePhaseMask;
 
+    if ((activePhaseMask & UiPhase_Input) != 0u && inputRouter_ && inputRouter_->HasPendingEvents()) {
+        const std::size_t dispatched = inputRouter_->FlushQueuedEvents();
+        telemetry_.inputEventsDispatched += dispatched;
+        if (dispatched > 0u) {
+            hasDirtyObjects_ = true;
+            hasDirtyLayout_ = true;
+        }
+    }
+
     if (hasDirtyObjects_ && bindingEngine_ && (activePhaseMask & UiPhase_TrackABinding) != 0u) {
         const std::size_t updated = bindingEngine_->FlushTrackA();
         telemetry_.trackAUpdates += updated;
@@ -166,11 +219,25 @@ void DesktopEventHost::TickUi(float dt, std::uint32_t activePhaseMask) {
         }
     }
 
-    if ((activePhaseMask & UiPhase_Style) != 0u && (hasDirtyObjects_ || hasDirtyLayout_)) {
+    if ((activePhaseMask & UiPhase_Style) != 0u && (styleEngine_ || hasDirtyObjects_ || hasDirtyLayout_)) {
         telemetry_.stylePassesRun += 1u;
+        if (styleEngine_) {
+            if (bindingEngine_ && !styleEngine_->GetBindingEngine()) {
+                styleEngine_->SetBindingEngine(bindingEngine_);
+            }
+            const std::size_t stChanged = styleEngine_->EvaluateAndApply();
+            telemetry_.styleTriggerChanges += stChanged;
+            if (stChanged > 0u) {
+                hasDirtyLayout_ = true;
+            }
+        }
     }
 
-    const bool rootNeedsLayout = renderTree_ && rootVisual_ &&
+    if ((activePhaseMask & UiPhase_Animation) != 0u && animationEngine_ && animationEngine_->HasActiveAnimations()) {
+        telemetry_.animationTrackUpdates += animationEngine_->Tick(dt);
+    }
+
+    const bool rootNeedsLayout = rootVisual_ &&
         (rootVisual_->GetLayoutDirtyFlags() &
          (MeasureDirty | ArrangeDirty | SubtreeLayoutDirty)) != 0u;
     if ((activePhaseMask & UiPhase_Layout) != 0u && (hasDirtyLayout_ || rootNeedsLayout)) {
@@ -220,6 +287,13 @@ void WebImeAdapter::FocusTextInput(UIElement* focusedElement, Rect caretScreenRe
         preeditText_.clear();
         committedText_.clear();
         caretOffset_ = 0;
+        if (const auto* tbox = focusedElement ? focusedElement->DynamicCast<TextBox>() : nullptr) {
+            compositionBaseText_ = tbox->GetText();
+            compositionBaseCaret_ = tbox->GetCaretIndex();
+        } else {
+            compositionBaseText_.clear();
+            compositionBaseCaret_ = 0u;
+        }
     }
     focusedElement_ = focusedElement;
     baseCaretRect_ = caretScreenRect;
@@ -232,16 +306,48 @@ void WebImeAdapter::BlurTextInput() {
     imeFocused_ = false;
     isComposing_ = false;
     preeditText_.clear();
+    compositionBaseText_.clear();
+    compositionBaseCaret_ = 0u;
 }
 
 void WebImeAdapter::OnCompositionStart() {
     isComposing_ = true;
     preeditText_.clear();
     caretOffset_ = 0;
-    overlayDomRect_.x = baseCaretRect_.x + static_cast<float>(committedText_.size()) * 2.0f;
+    if (auto* tbox = focusedElement_ ? focusedElement_->DynamicCast<TextBox>() : nullptr) {
+        compositionBaseText_ = tbox->GetText();
+        compositionBaseCaret_ = tbox->GetCaretIndex();
+        baseCaretRect_ = tbox->CaretScreenRect();
+        overlayDomRect_ = baseCaretRect_;
+    } else {
+        overlayDomRect_.x = baseCaretRect_.x + static_cast<float>(committedText_.size()) * 2.0f;
+    }
 }
 
 void WebImeAdapter::OnCompositionUpdate(std::string_view preeditText, std::uint32_t caretOffset) {
+    if (auto* tbox = focusedElement_ ? focusedElement_->DynamicCast<TextBox>() : nullptr) {
+        if (!isComposing_) {
+            compositionBaseText_ = tbox->GetText();
+            compositionBaseCaret_ = tbox->GetCaretIndex();
+            baseCaretRect_ = tbox->CaretScreenRect();
+        }
+        isComposing_ = true;
+        preeditText_.assign(preeditText);
+        caretOffset_ = caretOffset;
+        overlayDomRect_.x = baseCaretRect_.x + static_cast<float>(caretOffset) * 2.0f;
+
+        std::size_t bytePos = 0u;
+        std::size_t cpCount = 0u;
+        std::uint32_t cp = 0u;
+        while (cpCount < compositionBaseCaret_ && DecodeNextUtf8CodePoint(compositionBaseText_, bytePos, cp)) {
+            ++cpCount;
+        }
+        const std::string preview =
+            compositionBaseText_.substr(0, bytePos) + preeditText_ + compositionBaseText_.substr(bytePos);
+        tbox->SetText(preview);
+        return;
+    }
+
     isComposing_ = true;
     preeditText_.assign(preeditText);
     caretOffset_ = caretOffset;
@@ -256,16 +362,32 @@ void WebImeAdapter::OnCompositionUpdate(std::string_view preeditText, std::uint3
 }
 
 void WebImeAdapter::OnCompositionEnd(std::string_view committedText) {
+    const bool wasComposing = isComposing_;
     isComposing_ = false;
     preeditText_.clear();
     committedText_ += std::string(committedText);
     caretOffset_ = 0;
-    overlayDomRect_.x = baseCaretRect_.x + static_cast<float>(committedText_.size()) * 2.0f;
     if (focusedElement_) {
+        if (auto* tbox = focusedElement_->DynamicCast<TextBox>()) {
+            if (wasComposing) {
+                tbox->SetText(compositionBaseText_);
+                tbox->SetCaretIndex(compositionBaseCaret_);
+            }
+            (void)tbox->InsertText(committedText);
+            compositionBaseText_ = tbox->GetText();
+            compositionBaseCaret_ = tbox->GetCaretIndex();
+            baseCaretRect_ = tbox->CaretScreenRect();
+            overlayDomRect_ = baseCaretRect_;
+            return;
+        }
+        overlayDomRect_.x = baseCaretRect_.x + static_cast<float>(committedText_.size()) * 2.0f;
         focusedElement_->SetValue(
             PropId_Text,
             value::FromString(committedText_),
             ValueSourceRank::Local);
+        (void)focusedElement_->NotifyTwoWayPropertyMutated(PropId_Text);
+    } else {
+        overlayDomRect_.x = baseCaretRect_.x + static_cast<float>(committedText_.size()) * 2.0f;
     }
 }
 
@@ -413,6 +535,9 @@ WebCanvasHost::WebCanvasHost(
 
 void WebCanvasHost::TickUi(float dt, std::uint32_t activePhaseMask) {
     (void)dt;
+    if (inputRouter_ && inputRouter_->HasPendingEvents()) {
+        rafState_ = WebRafState::ActiveTicking;
+    }
     if (rafState_ == WebRafState::SuspendedIdle) {
         return;
     }
@@ -421,6 +546,11 @@ void WebCanvasHost::TickUi(float dt, std::uint32_t activePhaseMask) {
     telemetry_.lastActivePhaseMask = activePhaseMask;
 
     std::size_t changes = 0;
+    if ((activePhaseMask & UiPhase_Input) != 0u && inputRouter_ && inputRouter_->HasPendingEvents()) {
+        const std::size_t dispatched = inputRouter_->FlushQueuedEvents();
+        telemetry_.inputEventsDispatched += dispatched;
+        changes += dispatched;
+    }
     if ((activePhaseMask & UiPhase_TrackABinding) != 0u && bindingEngine_) {
         const std::size_t a = bindingEngine_->FlushTrackA();
         telemetry_.trackAUpdates += a;
@@ -433,6 +563,19 @@ void WebCanvasHost::TickUi(float dt, std::uint32_t activePhaseMask) {
     }
     if ((activePhaseMask & UiPhase_Style) != 0u) {
         telemetry_.stylePassesRun += 1u;
+        if (styleEngine_) {
+            if (bindingEngine_ && !styleEngine_->GetBindingEngine()) {
+                styleEngine_->SetBindingEngine(bindingEngine_);
+            }
+            const std::size_t stChanged = styleEngine_->EvaluateAndApply();
+            telemetry_.styleTriggerChanges += stChanged;
+            changes += stChanged;
+        }
+    }
+    if ((activePhaseMask & UiPhase_Animation) != 0u && animationEngine_ && animationEngine_->HasActiveAnimations()) {
+        const std::size_t animUpdated = animationEngine_->Tick(dt);
+        telemetry_.animationTrackUpdates += animUpdated;
+        changes += animUpdated;
     }
     if ((activePhaseMask & UiPhase_Layout) != 0u) {
         telemetry_.layoutPassesRun += 1u;
@@ -458,7 +601,8 @@ void WebCanvasHost::TickUi(float dt, std::uint32_t activePhaseMask) {
     }
 
     // Automatically suspend rAF if no IME composition, no pending font shards, and no dirty bindings/layout/render
-    if (changes == 0 && !imeAdapter_.IsComposing() && fontStream_.PendingFetchRequests().empty()) {
+    const bool animStillRunning = animationEngine_ && animationEngine_->HasActiveAnimations();
+    if (changes == 0 && !animStillRunning && !imeAdapter_.IsComposing() && fontStream_.PendingFetchRequests().empty()) {
         rafState_ = WebRafState::SuspendedIdle;
     }
 }
