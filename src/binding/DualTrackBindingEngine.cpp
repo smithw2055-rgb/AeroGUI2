@@ -34,7 +34,7 @@ void DualTrackBindingEngine::ApplyFallbackOrClear(ReactiveBindingInstance& bindi
         return;
     }
     std::uint16_t animTrack = 0xFFFFu;
-    if (binding.targetPropertyId >= PropId_FirstSparse) {
+    if (!IsFastInlinePropertyId(binding.targetPropertyId)) {
         if (const auto* entry = binding.targetElement->FindCompactEntry(binding.targetPropertyId)) {
             animTrack = entry->animationTrackId;
         }
@@ -44,7 +44,7 @@ void DualTrackBindingEngine::ApplyFallbackOrClear(ReactiveBindingInstance& bindi
             binding.targetPropertyId,
             binding.fallbackValue,
             ValueSourceRank::Local);
-        if (binding.targetPropertyId >= PropId_FirstSparse) {
+        if (!IsFastInlinePropertyId(binding.targetPropertyId)) {
             binding.targetElement->SetPropertyMetadata(
                 binding.targetPropertyId,
                 binding.bindingSlotId,
@@ -180,7 +180,7 @@ bool DualTrackBindingEngine::EvaluateAndSyncChain(
                 binding.targetPropertyId,
                 hopVal,
                 ValueSourceRank::Local);
-            if (binding.targetPropertyId >= PropId_FirstSparse) {
+            if (!IsFastInlinePropertyId(binding.targetPropertyId)) {
                 const auto* entry = binding.targetElement->FindCompactEntry(binding.targetPropertyId);
                 if (!entry || entry->bindingSlotId == 0xFFFFu) {
                     const std::uint16_t animTrack = entry ? entry->animationTrackId : 0xFFFFu;
@@ -222,7 +222,7 @@ std::uint16_t DualTrackBindingEngine::BindChain(
     instance.targetElement = targetElement;
     instance.targetPropertyId = compiledChain.targetPropertyId;
 
-    if (instance.targetPropertyId >= PropId_FirstSparse) {
+    if (!IsFastInlinePropertyId(instance.targetPropertyId)) {
         targetElement->SetPropertyMetadata(instance.targetPropertyId, slotId, 0xFFFFu);
     }
 

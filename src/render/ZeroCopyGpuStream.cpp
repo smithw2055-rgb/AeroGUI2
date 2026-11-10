@@ -77,7 +77,7 @@ void main() {
         float borderThickness = float((v_Flags >> 8u) & 0xFFu) * 0.5;
         vec2 halfSize = max(abs(u_QuadHalfExtent), v_QuadHalfSize);
         float dist = sdRoundedBox(v_UvOrLocalPos, halfSize, cornerRadius);
-        float aa = max(fwidth(dist), 0.75);
+        float aa = max(fwidth(dist) * 0.75, 1e-4);
         float outerCoverage = smoothstep(aa, -aa, dist);
         if (borderThickness > 0.0) {
             float innerDist = dist + borderThickness;
@@ -195,7 +195,7 @@ void main() {
         float borderThickness = float((v_Flags >> 8u) & 0xFFu) * 0.5;
         vec2 halfSize = max(abs(u_QuadHalfExtent), v_QuadHalfSize);
         float dist = sdRoundedBox(v_UvOrLocalPos, halfSize, cornerRadius);
-        float aa = max(fwidth(dist), 0.75);
+        float aa = max(fwidth(dist) * 0.75, 1e-4);
         float outerCoverage = smoothstep(aa, -aa, dist);
         if (borderThickness > 0.0) {
             float innerDist = dist + borderThickness;
@@ -301,7 +301,7 @@ fn fs_main(in : VertexOut) -> @location(0) vec4<f32> {
         let borderThickness = f32((in.flags >> 8u) & 0xFFu) * 0.5;
         let halfSize = max(abs(u_Globals.quadHalfExtent), in.quadHalfSize);
         let dist = sdRoundedBox(in.uvOrLocal, halfSize, radius);
-        let aa = max(fwidth(dist), 0.75);
+        let aa = max(fwidth(dist) * 0.75, 1e-4);
         var cov = smoothstep(aa, -aa, dist);
         if (borderThickness > 0.0) {
             let innerDist = dist + borderThickness;
@@ -564,7 +564,9 @@ void ZeroCopyGpuStream::RasterizeTreeToRgba8(
                 break;
             }
             const AeroVertex& v0 = page.vertices[vIdx + 0u];
+            const AeroVertex& v1 = page.vertices[vIdx + 1u];
             const AeroVertex& v2 = page.vertices[vIdx + 2u];
+            const AeroVertex& v3 = page.vertices[vIdx + 3u];
             const std::uint8_t a8 = static_cast<std::uint8_t>((v0.rgba >> 24u) & 0xFFu);
             if (a8 == 0u) {
                 continue;
@@ -574,13 +576,23 @@ void ZeroCopyGpuStream::RasterizeTreeToRgba8(
             const std::uint8_t b8 = static_cast<std::uint8_t>((v0.rgba >> 16u) & 0xFFu);
             const float baseAlpha = static_cast<float>(a8) / 255.0f;
 
-            const float minX = std::min(v0.x, v2.x);
-            const float maxX = std::max(v0.x, v2.x);
-            const float minY = std::min(v0.y, v2.y);
-            const float maxY = std::max(v0.y, v2.y);
-            const float quadW = maxX - minX;
-            const float quadH = maxY - minY;
-            if (quadW <= 0.01f || quadH <= 0.01f) {
+            const float minX = std::min(std::min(v0.x, v1.x), std::min(v2.x, v3.x));
+            const float maxX = std::max(std::max(v0.x, v1.x), std::max(v2.x, v3.x));
+            const float minY = std::min(std::min(v0.y, v1.y), std::min(v2.y, v3.y));
+            const float maxY = std::max(std::max(v0.y, v1.y), std::max(v2.y, v3.y));
+
+            const float e1x = v1.x - v0.x;
+            const float e1y = v1.y - v0.y;
+            const float e3x = v3.x - v0.x;
+            const float e3y = v3.y - v0.y;
+            const float det = e1x * e3y - e1y * e3x;
+            if (std::fabs(det) <= 1e-4f) {
+                continue;
+            }
+            const float invDet = 1.0f / det;
+            const float localQuadW = std::sqrt(e1x * e1x + e1y * e1y);
+            const float localQuadH = std::sqrt(e3x * e3x + e3y * e3y);
+            if (localQuadW <= 0.01f || localQuadH <= 0.01f) {
                 continue;
             }
 
@@ -597,7 +609,11 @@ void ZeroCopyGpuStream::RasterizeTreeToRgba8(
                 for (int px = pxStart; px < pxEnd; ++px) {
                     const float sx = static_cast<float>(px) + 0.5f;
                     const float sy = static_cast<float>(py) + 0.5f;
-                    if (sx < minX || sx > maxX || sy < minY || sy > maxY) {
+                    const float dx = sx - v0.x;
+                    const float dy = sy - v0.y;
+                    const float su = (dx * e3y - dy * e3x) * invDet;
+                    const float sv = (e1x * dy - e1y * dx) * invDet;
+                    if (su < 0.0f || su > 1.0f || sv < 0.0f || sv > 1.0f) {
                         continue;
                     }
 
@@ -607,23 +623,28 @@ void ZeroCopyGpuStream::RasterizeTreeToRgba8(
                         float rad = 0.0f;
                         float border = 0.0f;
                         UnpackSdfRoundedRectParams(v0.flags, rad, border);
-                        const float halfW = quadW * 0.5f;
-                        const float halfH = quadH * 0.5f;
-                        const float localX = sx - (minX + halfW);
-                        const float localY = sy - (minY + halfH);
+                        const float unscaledHalfW = std::max(std::fabs(v0.u), std::fabs(v2.u));
+                        const float unscaledHalfH = std::max(std::fabs(v0.v), std::fabs(v2.v));
+                        const float halfW = (unscaledHalfW > 1e-4f) ? unscaledHalfW : (localQuadW * 0.5f);
+                        const float halfH = (unscaledHalfH > 1e-4f) ? unscaledHalfH : (localQuadH * 0.5f);
+                        const float localX = (su - 0.5f) * (2.0f * halfW);
+                        const float localY = (sv - 0.5f) * (2.0f * halfH);
+                        const float aaFeather = std::max(
+                            1e-4f,
+                            (halfW * localQuadH + halfH * localQuadW) * std::fabs(invDet));
                         const float outerCov = EvaluateSdfRoundedRectCoverage(
                             localX,
                             localY,
                             halfW,
                             halfH,
                             rad,
-                            1.0f);
+                            aaFeather);
                         if (border > 0.0f) {
                             const float innerHalfW = std::max(0.0f, halfW - border);
                             const float innerHalfH = std::max(0.0f, halfH - border);
                             const float innerRad = std::max(0.0f, rad - border);
                             const float innerCov = (innerHalfW > 0.0f && innerHalfH > 0.0f)
-                                ? EvaluateSdfRoundedRectCoverage(localX, localY, innerHalfW, innerHalfH, innerRad, 1.0f)
+                                ? EvaluateSdfRoundedRectCoverage(localX, localY, innerHalfW, innerHalfH, innerRad, aaFeather)
                                 : 0.0f;
                             coverage = std::clamp(outerCov - innerCov * 0.35f, 0.0f, 1.0f);
                         } else {
@@ -639,8 +660,8 @@ void ZeroCopyGpuStream::RasterizeTreeToRgba8(
                         const float uMax = std::max(v0.u, v2.u);
                         const float vMin = std::min(v0.v, v2.v);
                         const float vMax = std::max(v0.v, v2.v);
-                        const float uInterp = uMin + ((sx - minX) / quadW) * (uMax - uMin);
-                        const float vInterp = vMin + ((sy - minY) / quadH) * (vMax - vMin);
+                        const float uInterp = v0.u + su * (v1.u - v0.u) + sv * (v3.u - v0.u);
+                        const float vInterp = v0.v + su * (v1.v - v0.v) + sv * (v3.v - v0.v);
 
                         const float entrySpanU = std::max(1e-6f, mtsdfEntry->u1 - mtsdfEntry->u0);
                         const float entrySpanV = std::max(1e-6f, mtsdfEntry->v1 - mtsdfEntry->v0);
@@ -649,10 +670,12 @@ void ZeroCopyGpuStream::RasterizeTreeToRgba8(
                         const float normX = std::clamp(cellTexX / cellW, 0.0f, 1.0f);
                         const float normY = std::clamp(cellTexY / cellH, 0.0f, 1.0f);
 
+                        const float perpQuadW = std::fabs(det) / std::max(localQuadH, 1e-4f);
+                        const float perpQuadH = std::fabs(det) / std::max(localQuadW, 1e-4f);
                         const float quadTexSpanX = std::max(1e-3f, ((uMax - uMin) / entrySpanU) * std::max(1.0f, cellW - 1.0f));
                         const float quadTexSpanY = std::max(1e-3f, ((vMax - vMin) / entrySpanV) * std::max(1.0f, cellH - 1.0f));
-                        const float fullCellW = cellW * (quadW / quadTexSpanX);
-                        const float fullCellH = cellH * (quadH / quadTexSpanY);
+                        const float fullCellW = cellW * (perpQuadW / quadTexSpanX);
+                        const float fullCellH = cellH * (perpQuadH / quadTexSpanY);
 
                         float unpackedUvRange = 0.0f;
                         float strokePx = 0.0f;
@@ -689,10 +712,7 @@ void ZeroCopyGpuStream::RasterizeTreeToRgba8(
                         }
                         coverage = fillCov;
                     } else if (prim == AeroPrimType::SdfTextGlyph) {
-                        // Synthetic analytical glyph stroke stem inside glyph box for Golden Image verification
-                        const float gx = (sx - minX) / quadW;
-                        const float gy = (sy - minY) / quadH;
-                        const bool inGlyphBody = (gx >= 0.15f && gx <= 0.85f && gy >= 0.15f && gy <= 0.85f);
+                        const bool inGlyphBody = (su >= 0.15f && su <= 0.85f && sv >= 0.15f && sv <= 0.85f);
                         coverage = inGlyphBody ? 0.92f : 0.0f;
                     }
 

@@ -4,6 +4,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <limits>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -188,8 +189,19 @@ public:
     virtual void ArrangeCore(Rect finalRect) noexcept;
     virtual void OnPropertyChanged(std::uint16_t propId, const UnifiedValue& newValue);
 
+    // Container-applied child coordinate transform (used by Viewbox uniform/fill scaling)
+    [[nodiscard]] virtual Matrix2D GetChildContainerTransform2D() const noexcept {
+        return Matrix2D::Identity();
+    }
+
+    // Container local-space clip bounds when ClipToBounds is active (ScrollViewer insets by Padding)
+    [[nodiscard]] virtual Rect GetLocalClipBounds() const noexcept {
+        return finalRect_;
+    }
+
     [[nodiscard]] Size DesiredSize() const noexcept { return desiredSize_; }
     [[nodiscard]] Rect FinalRect() const noexcept { return finalRect_; }
+    [[nodiscard]] Rect LastArrangeSlot() const noexcept { return lastArrangeSlot_; }
     [[nodiscard]] std::uint16_t TreeDepth() const noexcept { return treeDepth_; }
 
     // O(1) PagedRenderTree linkage (eliminates O(N) sourceElement linear scans)
@@ -210,7 +222,7 @@ public:
     [[nodiscard]] std::uint32_t RenderNodeId() const noexcept { return renderNodeId_; }
     [[nodiscard]] std::uint16_t RenderNodeSpan() const noexcept { return renderNodeSpan_; }
 
-    // 8 Fast Inline Properties (0 heap allocation fast path)
+    // Fast Inline Properties (0 heap allocation fast path)
     [[nodiscard]] float GetWidth() const noexcept { return fastProps_.width; }
     void SetWidth(float v) noexcept {
         if (fastProps_.width != v) {
@@ -242,6 +254,59 @@ public:
             InvalidateLayout();
         }
     }
+
+    [[nodiscard]] float GetMaxWidth() const noexcept;
+    void SetMaxWidth(float v);
+
+    [[nodiscard]] float GetMaxHeight() const noexcept;
+    void SetMaxHeight(float v);
+
+    [[nodiscard]] HorizontalAlignment GetHorizontalAlignment() const noexcept {
+        return static_cast<HorizontalAlignment>(fastProps_.alignmentFlags & 0x03u);
+    }
+    void SetHorizontalAlignment(HorizontalAlignment align) noexcept {
+        const auto raw = static_cast<std::uint8_t>(align) & 0x03u;
+        const auto next = static_cast<std::uint8_t>((fastProps_.alignmentFlags & ~0x03u) | raw);
+        if (fastProps_.alignmentFlags != next) {
+            fastProps_.alignmentFlags = next;
+            InvalidateLayout();
+            if (parent_) {
+                parent_->InvalidateArrange();
+            }
+        }
+    }
+
+    [[nodiscard]] VerticalAlignment GetVerticalAlignment() const noexcept {
+        return static_cast<VerticalAlignment>((fastProps_.alignmentFlags >> 2u) & 0x03u);
+    }
+    void SetVerticalAlignment(VerticalAlignment align) noexcept {
+        const auto raw = static_cast<std::uint8_t>((static_cast<std::uint8_t>(align) & 0x03u) << 2u);
+        const auto next = static_cast<std::uint8_t>((fastProps_.alignmentFlags & ~0x0Cu) | raw);
+        if (fastProps_.alignmentFlags != next) {
+            fastProps_.alignmentFlags = next;
+            InvalidateLayout();
+            if (parent_) {
+                parent_->InvalidateArrange();
+            }
+        }
+    }
+
+    // Full 2D Affine RenderTransform, LayoutTransform & normalized RenderTransformOrigin
+    void SetRenderTransform(const Matrix2D& matrix);
+    [[nodiscard]] Matrix2D GetRenderTransform() const noexcept;
+    void ClearRenderTransform();
+
+    void SetLayoutTransform(const Matrix2D& matrix);
+    [[nodiscard]] Matrix2D GetLayoutTransform() const noexcept;
+    void ClearLayoutTransform();
+
+    void SetRenderTransformOrigin(Point origin);
+    [[nodiscard]] Point GetRenderTransformOrigin() const noexcept;
+
+    // Effective layout-space 2D affine matrix combining LayoutTransform, RenderTransform + RenderTransformOrigin,
+    // legacy PropId_RenderTransformMatrix, and Projection3D Yaw/Pitch around FinalRect center.
+    [[nodiscard]] Matrix2D ComputeLocalEffectiveTransform2D() const noexcept;
+    [[nodiscard]] Matrix2D ComputeLocalEffectiveTransform2DForRect(const Rect& rectOverride) const noexcept;
 
     [[nodiscard]] Thickness GetMargin() const noexcept {
         return Thickness{
@@ -323,7 +388,7 @@ public:
         fastProps_.layoutDirtyFlags &= static_cast<std::uint8_t>(~mask);
     }
 
-    // Unified DependencyProperty read/write (fast inline for propId < 8, 32B sparse entry for >= 8)
+    // Unified DependencyProperty read/write (fast inline for propId < 8 & alignments, 32B sparse entry for others)
     [[nodiscard]] UnifiedValue GetValue(std::uint16_t propId) const;
     bool SetValue(
         std::uint16_t propId,
@@ -341,6 +406,9 @@ public:
     [[nodiscard]] std::size_t SparsePropertyCount() const noexcept {
         return sparseProps_.size();
     }
+
+protected:
+    void CoerceSparseFloatInPlace(std::uint16_t propId, float clampedValue) noexcept;
 
 private:
     friend class DepthBucketLayoutQueue;
@@ -383,8 +451,10 @@ private:
     mutable std::uint32_t renderNodeId_ = InvalidRenderNodeId;
     mutable std::uint16_t renderNodeSpan_ = 0u;
 
-    // Layout computed geometry & cached Measure constraint
+    // Layout computed geometry & cached Measure/Arrange constraints
     Size lastMeasureConstraint_{-1.0f, -1.0f};
+    Rect lastArrangeSlot_{0.0f, 0.0f, -1.0f, -1.0f};
+    Size measuredCoreSize_{0.0f, 0.0f};
     Size desiredSize_{0.0f, 0.0f};
     Rect finalRect_{0.0f, 0.0f, 0.0f, 0.0f};
     std::string name_;
@@ -397,7 +467,7 @@ private:
     PersistentRoot pinnedWrapperRoot_{};
     bool isConnectedToRoot_ = false;
 
-    // 8 high-frequency properties inline + 32B compact sparse vector
+    // High-frequency properties inline + 32B compact sparse vector
     FastInlineStorage fastProps_{};
     std::vector<CompactPropertyEntry> sparseProps_;
 };

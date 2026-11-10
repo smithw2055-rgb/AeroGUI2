@@ -6,6 +6,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 
 namespace aero {
 
@@ -980,11 +981,30 @@ std::string DecodeXamlXmlEntities(std::string_view raw) {
     return out;
 }
 
+Matrix2D ParseXamlMatrix2DLiteral(std::string_view raw) noexcept {
+    raw = TrimWs(raw);
+    if (raw.empty() || EqualsIgnoreCase(raw, "Identity")) {
+        return Matrix2D::Identity();
+    }
+    const auto nums = ParseFloatListFast(raw);
+    if (nums.size() >= 6u) {
+        return Matrix2D::FromWpfMatrix(nums[0], nums[1], nums[2], nums[3], nums[4], nums[5]);
+    }
+    if (nums.size() >= 4u) {
+        return Matrix2D::FromWpfMatrix(nums[0], nums[1], nums[2], nums[3], 0.0f, 0.0f);
+    }
+    return Matrix2D::Identity();
+}
+
 std::uint16_t ResolveBuiltinPropertyId(std::string_view propertyName) noexcept {
     if (propertyName == "Width" || propertyName == "d:DesignWidth") return PropId_Width;
     if (propertyName == "Height" || propertyName == "d:DesignHeight") return PropId_Height;
     if (propertyName == "MinWidth") return PropId_MinWidth;
     if (propertyName == "MinHeight") return PropId_MinHeight;
+    if (propertyName == "MaxWidth") return PropId_MaxWidth;
+    if (propertyName == "MaxHeight") return PropId_MaxHeight;
+    if (propertyName == "HorizontalAlignment") return PropId_HorizontalAlignment;
+    if (propertyName == "VerticalAlignment") return PropId_VerticalAlignment;
     if (propertyName == "Margin") return PropId_Margin;
     if (propertyName == "Padding") return PropId_Padding;
     if (propertyName == "Opacity") return PropId_Opacity;
@@ -1007,6 +1027,25 @@ std::uint16_t ResolveBuiltinPropertyId(std::string_view propertyName) noexcept {
     if (propertyName == "Grid.ColumnSpan" || propertyName == "ColumnSpan") return PropId_GridColumnSpan;
     if (propertyName == "Canvas.Left" || propertyName == "Left") return PropId_CanvasLeft;
     if (propertyName == "Canvas.Top" || propertyName == "Top") return PropId_CanvasTop;
+    if (propertyName == "DockPanel.Dock" || propertyName == "Dock") return PropId_Dock;
+    if (propertyName == "LastChildFill") return PropId_LastChildFill;
+    if (propertyName == "ItemWidth") return PropId_ItemWidth;
+    if (propertyName == "ItemHeight") return PropId_ItemHeight;
+    if (propertyName == "StretchDirection") return PropId_StretchDirection;
+    if (propertyName == "HorizontalScrollBarVisibility" ||
+        propertyName == "ScrollViewer.HorizontalScrollBarVisibility") {
+        return PropId_HorizontalScrollBarVisibility;
+    }
+    if (propertyName == "VerticalScrollBarVisibility" ||
+        propertyName == "ScrollViewer.VerticalScrollBarVisibility") {
+        return PropId_VerticalScrollBarVisibility;
+    }
+    if (propertyName == "HorizontalOffset" || propertyName == "ScrollViewer.HorizontalOffset") {
+        return PropId_HorizontalOffset;
+    }
+    if (propertyName == "VerticalOffset" || propertyName == "ScrollViewer.VerticalOffset") {
+        return PropId_VerticalOffset;
+    }
     if (propertyName == "ItemsSource") return PropId_ItemsSource;
     if (propertyName == "CommandParameter") return PropId_CommandParameter;
     if (propertyName == "Projection3D.Yaw" || propertyName == "Projection3DYaw") return PropId_Projection3DYaw;
@@ -1023,6 +1062,10 @@ std::uint16_t ResolveBuiltinPropertyId(std::string_view propertyName) noexcept {
     if (propertyName == "Stretch") return PropId_Stretch;
     if (propertyName == "ClipToBounds") return PropId_ClipToBounds;
     if (propertyName == "RenderTransformMatrix") return PropId_RenderTransformMatrix;
+    if (propertyName == "RenderTransform") return PropId_RenderTransform;
+    if (propertyName == "LayoutTransform") return PropId_LayoutTransform;
+    if (propertyName == "RenderTransformTranslation") return PropId_RenderTransformTranslation;
+    if (propertyName == "RenderTransformOrigin") return PropId_RenderTransformOrigin;
     return PropId_Tag;
 }
 
@@ -1033,6 +1076,23 @@ UnifiedValue ParseBuiltinLiteralPropertyValue(
     switch (propId) {
         case PropId_Width:
         case PropId_Height:
+        case PropId_ItemWidth:
+        case PropId_ItemHeight:
+            if (EqualsIgnoreCase(rawValue, "Auto") || EqualsIgnoreCase(rawValue, "NaN")) {
+                return MakeFloat(-1.0f);
+            }
+            return MakeFloat(ParseFloat32Fast(rawValue, -1.0f));
+
+        case PropId_MaxWidth:
+        case PropId_MaxHeight:
+            if (EqualsIgnoreCase(rawValue, "Infinity") ||
+                EqualsIgnoreCase(rawValue, "+Infinity") ||
+                EqualsIgnoreCase(rawValue, "Auto") ||
+                EqualsIgnoreCase(rawValue, "NaN")) {
+                return MakeFloat(std::numeric_limits<float>::infinity());
+            }
+            return MakeFloat(ParseFloat32Fast(rawValue, std::numeric_limits<float>::infinity()));
+
         case PropId_MinWidth:
         case PropId_MinHeight:
         case PropId_Opacity:
@@ -1045,19 +1105,42 @@ UnifiedValue ParseBuiltinLiteralPropertyValue(
         case PropId_Value:
         case PropId_Minimum:
         case PropId_Maximum:
+        case PropId_HorizontalOffset:
+        case PropId_VerticalOffset:
             return MakeFloat(ParseFloat32Fast(rawValue));
 
         case PropId_IsChecked:
         case PropId_ClipToBounds:
             return EqualsIgnoreCase(rawValue, "true") || rawValue == "1";
 
+        case PropId_LastChildFill:
+            return !EqualsIgnoreCase(rawValue, "false") && rawValue != "0";
+
         case PropId_Visibility:
             if (rawValue == "Collapsed" || rawValue == "2") return value::FromInt(2);
             if (rawValue == "Hidden" || rawValue == "1") return value::FromInt(1);
             return value::FromInt(0);
 
+        case PropId_HorizontalAlignment:
+            if (EqualsIgnoreCase(rawValue, "Left") || rawValue == "1") return value::FromInt(1);
+            if (EqualsIgnoreCase(rawValue, "Center") || rawValue == "2") return value::FromInt(2);
+            if (EqualsIgnoreCase(rawValue, "Right") || rawValue == "3") return value::FromInt(3);
+            return value::FromInt(0); // Stretch
+
+        case PropId_VerticalAlignment:
+            if (EqualsIgnoreCase(rawValue, "Top") || rawValue == "1") return value::FromInt(1);
+            if (EqualsIgnoreCase(rawValue, "Center") || rawValue == "2") return value::FromInt(2);
+            if (EqualsIgnoreCase(rawValue, "Bottom") || rawValue == "3") return value::FromInt(3);
+            return value::FromInt(0); // Stretch
+
+        case PropId_Dock:
+            if (EqualsIgnoreCase(rawValue, "Top") || rawValue == "1") return value::FromInt(1);
+            if (EqualsIgnoreCase(rawValue, "Right") || rawValue == "2") return value::FromInt(2);
+            if (EqualsIgnoreCase(rawValue, "Bottom") || rawValue == "3") return value::FromInt(3);
+            return value::FromInt(0); // Left
+
         case PropId_Orientation:
-            if (rawValue == "Horizontal" || rawValue == "1") return value::FromInt(1);
+            if (EqualsIgnoreCase(rawValue, "Horizontal") || rawValue == "1") return value::FromInt(1);
             return value::FromInt(0);
 
         case PropId_Stretch:
@@ -1065,6 +1148,19 @@ UnifiedValue ParseBuiltinLiteralPropertyValue(
             if (EqualsIgnoreCase(rawValue, "Fill") || rawValue == "1") return value::FromInt(1);
             if (EqualsIgnoreCase(rawValue, "UniformToFill") || rawValue == "3") return value::FromInt(3);
             return value::FromInt(2); // Default Stretch::Uniform = 2
+
+        case PropId_StretchDirection:
+            if (EqualsIgnoreCase(rawValue, "UpOnly") || rawValue == "1") return value::FromInt(1);
+            if (EqualsIgnoreCase(rawValue, "DownOnly") || rawValue == "2") return value::FromInt(2);
+            return value::FromInt(0); // Both
+
+        case PropId_HorizontalScrollBarVisibility:
+        case PropId_VerticalScrollBarVisibility:
+            if (EqualsIgnoreCase(rawValue, "Disabled") || rawValue == "0") return value::FromInt(0);
+            if (EqualsIgnoreCase(rawValue, "Auto") || rawValue == "1") return value::FromInt(1);
+            if (EqualsIgnoreCase(rawValue, "Hidden") || rawValue == "2") return value::FromInt(2);
+            if (EqualsIgnoreCase(rawValue, "Visible") || rawValue == "3") return value::FromInt(3);
+            return value::FromInt(propId == PropId_HorizontalScrollBarVisibility ? 0 : 1);
 
         case PropId_GridRow:
         case PropId_GridColumn:
@@ -1095,6 +1191,38 @@ UnifiedValue ParseBuiltinLiteralPropertyValue(
                 return value::FromCornerRadius(CornerRadius(nums[0], nums[1], nums[2], nums[3]));
             }
             return value::FromCornerRadius(CornerRadius{});
+        }
+
+        case PropId_RenderTransformOrigin: {
+            const auto nums = ParseFloatListFast(rawValue);
+            if (nums.size() == 1) {
+                return UnifiedValue{Float4Value{nums[0], nums[0], 0.0f, 0.0f}};
+            }
+            if (nums.size() >= 2) {
+                return UnifiedValue{Float4Value{nums[0], nums[1], 0.0f, 0.0f}};
+            }
+            return UnifiedValue{Float4Value{0.0f, 0.0f, 0.0f, 0.0f}};
+        }
+
+        case PropId_RenderTransform: {
+            const Matrix2D m = ParseXamlMatrix2DLiteral(rawValue);
+            if (std::fabs(m.tx) > 1e-6f || std::fabs(m.ty) > 1e-6f) {
+                return value::FromString(std::string(rawValue));
+            }
+            return UnifiedValue{Float4Value{m.m00, m.m01, m.m10, m.m11}};
+        }
+
+        case PropId_LayoutTransform: {
+            const Matrix2D m = ParseXamlMatrix2DLiteral(rawValue);
+            return UnifiedValue{Float4Value{m.m00, m.m01, m.m10, m.m11}};
+        }
+
+        case PropId_RenderTransformTranslation: {
+            const auto nums = ParseFloatListFast(rawValue);
+            if (nums.size() >= 2) {
+                return UnifiedValue{Float4Value{nums[0], nums[1], 0.0f, 0.0f}};
+            }
+            return UnifiedValue{Float4Value{0.0f, 0.0f, 0.0f, 0.0f}};
         }
 
         case PropId_RenderTransformMatrix: {

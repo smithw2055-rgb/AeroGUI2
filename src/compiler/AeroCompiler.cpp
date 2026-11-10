@@ -131,6 +131,28 @@ AeroCompileResult AeroCompiler::Compile(const AeroCompileInput& input) const {
         pkg.mtsdfPaths.push_back(BakeSvgPathToMtsdfEntry(svgPathData, 32u, 4.0f, slotIdx, 256u));
     };
 
+    auto emitStaticRenderTransform = [&](const Matrix2D& m) {
+        AxbInstruction linInst{};
+        linInst.opcode = AxbOpcode::SetStaticProperty;
+        linInst.propId = PropId_RenderTransform;
+        linInst.literalValue = UnifiedValue{Float4Value{m.m00, m.m01, m.m10, m.m11}};
+        pkg.instructions.push_back(std::move(linInst));
+
+        AxbInstruction trInst{};
+        trInst.opcode = AxbOpcode::SetStaticProperty;
+        trInst.propId = PropId_RenderTransformTranslation;
+        trInst.literalValue = UnifiedValue{Float4Value{m.tx, m.ty, 0.0f, 0.0f}};
+        pkg.instructions.push_back(std::move(trInst));
+    };
+
+    auto emitStaticLayoutTransform = [&](const Matrix2D& m) {
+        AxbInstruction ltInst{};
+        ltInst.opcode = AxbOpcode::SetStaticProperty;
+        ltInst.propId = PropId_LayoutTransform;
+        ltInst.literalValue = UnifiedValue{Float4Value{m.m00, m.m01, m.m10, m.m11}};
+        pkg.instructions.push_back(std::move(ltInst));
+    };
+
     enum class XmlScopeKind : std::uint8_t {
         VisualElement = 0,
         TransparentContainer = 1,
@@ -138,7 +160,9 @@ AeroCompileResult AeroCompiler::Compile(const AeroCompileInput& input) const {
         ResourceContainer = 3,
         KeyedResourceItem = 4,
         BrushPropertyElement = 5,
-        NonVisualSkip = 6,
+        TransformPropertyElement = 6,
+        TransformChildNode = 7,
+        NonVisualSkip = 8,
     };
 
     struct XmlScopeEntry {
@@ -147,11 +171,24 @@ AeroCompileResult AeroCompiler::Compile(const AeroCompileInput& input) const {
         std::string resourceKey;
         std::uint16_t targetPropId = PropId_Background;
         bool brushAssigned = false;
+        Matrix2D accumulatedTransform = Matrix2D::Identity();
         std::string accumulatedText;
     };
 
     std::vector<XmlScopeEntry> scopeStack;
     std::size_t nonVisualDepth = 0;
+
+    auto findEnclosingTransformScope = [&]() noexcept -> XmlScopeEntry* {
+        for (auto it = scopeStack.rbegin(); it != scopeStack.rend(); ++it) {
+            if (it->kind == XmlScopeKind::TransformPropertyElement) {
+                return &(*it);
+            }
+            if (it->kind != XmlScopeKind::TransformChildNode) {
+                break;
+            }
+        }
+        return nullptr;
+    };
 
     auto findLocalOrGlobalResource = [&](std::string_view key) -> const UnifiedValue* {
         for (auto it = pkg.resources.rbegin(); it != pkg.resources.rend(); ++it) {
@@ -184,6 +221,7 @@ AeroCompileResult AeroCompiler::Compile(const AeroCompileInput& input) const {
                shortTag == "TranslateTransform" ||
                shortTag == "SkewTransform" ||
                shortTag == "MatrixTransform" ||
+               shortTag == "Matrix" ||
                shortTag == "DoubleAnimation" ||
                shortTag == "DoubleAnimationUsingKeyFrames" ||
                shortTag == "ColorAnimation" ||
@@ -270,18 +308,30 @@ AeroCompileResult AeroCompiler::Compile(const AeroCompileInput& input) const {
                 if (closed.kind == XmlScopeKind::ResourceContainer ||
                     closed.kind == XmlScopeKind::KeyedResourceItem ||
                     closed.kind == XmlScopeKind::BrushPropertyElement ||
+                    closed.kind == XmlScopeKind::TransformPropertyElement ||
+                    closed.kind == XmlScopeKind::TransformChildNode ||
                     closed.kind == XmlScopeKind::NonVisualSkip) {
                     if (nonVisualDepth > 0) {
                         --nonVisualDepth;
                     }
                 }
-                if (closed.kind == XmlScopeKind::KeyedResourceItem &&
-                    !closed.resourceKey.empty()) {
+                if (closed.kind == XmlScopeKind::TransformPropertyElement) {
+                    if (closed.targetPropId == PropId_LayoutTransform) {
+                        emitStaticLayoutTransform(closed.accumulatedTransform);
+                    } else {
+                        emitStaticRenderTransform(closed.accumulatedTransform);
+                    }
+                } else if (closed.kind == XmlScopeKind::KeyedResourceItem &&
+                           !closed.resourceKey.empty()) {
                     const std::string_view st = StripXmlPrefix(closed.tagName);
                     if (st == "Color" && !closed.accumulatedText.empty()) {
                         pkg.resources.emplace_back(
                             closed.resourceKey,
                             value::FromColor(ParseXamlColorLiteral(closed.accumulatedText)));
+                    } else if ((st == "Double" || st == "Single") && !closed.accumulatedText.empty()) {
+                        pkg.resources.emplace_back(
+                            closed.resourceKey,
+                            MakeFloat(ParseFloat32(closed.accumulatedText, 0.0f)));
                     } else if ((st == "Geometry" || st == "StreamGeometry" || st == "PathGeometry") &&
                                !closed.accumulatedText.empty()) {
                         ensurePathBakedIntoPackage(closed.accumulatedText);
@@ -416,9 +466,164 @@ AeroCompileResult AeroCompiler::Compile(const AeroCompileInput& input) const {
             }
         }
 
-        // Inside non-visual scope: handle resource extraction or brush property assignment
+        // Inside non-visual scope: handle resource extraction, 2D RenderTransform composition, or brush assignment
         if (nonVisualDepth > 0) {
             XmlScopeEntry& parentScope = scopeStack.back();
+
+            // Active <Element.RenderTransform> / <Element.LayoutTransform> subtree
+            if (XmlScopeEntry* tfScope = findEnclosingTransformScope()) {
+                auto resolveTransformResource = [&](std::string_view rawExpr, std::string_view attrName) -> const UnifiedValue* {
+                    const std::string_view v = Trim(rawExpr);
+                    if (v.size() <= 2 || v.front() != '{' || v.back() != '}') {
+                        return nullptr;
+                    }
+                    const std::string_view inner = Trim(v.substr(1, v.size() - 2));
+                    if (inner.rfind("StaticResource ", 0) == 0 || inner.rfind("DynamicResource ", 0) == 0) {
+                        std::string_view keyPart = (inner.rfind("StaticResource ", 0) == 0)
+                            ? Trim(inner.substr(15))
+                            : Trim(inner.substr(16));
+                        if (keyPart.rfind("ResourceKey=", 0) == 0) {
+                            keyPart = Trim(keyPart.substr(12));
+                        }
+                        if (const UnifiedValue* rv = findLocalOrGlobalResource(keyPart)) {
+                            return rv;
+                        }
+                        result.diagnostics.push_back(
+                            "AERO_XAML_TRANSFORM_RESOURCE: Unresolved resource '" +
+                            std::string(keyPart) + "' on <" + std::string(shortTag) + " " +
+                            std::string(attrName) + ">");
+                        return nullptr;
+                    }
+                    if (inner == "Binding" || inner == "Bind" ||
+                        inner.rfind("Binding ", 0) == 0 ||
+                        inner.rfind("Bind ", 0) == 0 ||
+                        inner.rfind("EcsBind ", 0) == 0) {
+                        result.diagnostics.push_back(
+                            "AERO_XAML_TRANSFORM_BINDING: Dynamic binding on child transform element '<" +
+                            std::string(shortTag) + " " + std::string(attrName) +
+                            ">' is not supported; bind RenderTransform or LayoutTransform directly on the UIElement.");
+                    }
+                    return nullptr;
+                };
+
+                auto evalFloatAttr = [&](const ParsedAttr& a, float fallback, bool& outResolved) -> float {
+                    const std::string_view v = Trim(a.value);
+                    if (v.empty()) {
+                        outResolved = false;
+                        return fallback;
+                    }
+                    if (v.front() != '{') {
+                        outResolved = true;
+                        return ParseFloat32(v, fallback);
+                    }
+                    if (const UnifiedValue* rv = resolveTransformResource(v, a.name)) {
+                        float fv = fallback;
+                        if (TryGetFloat(*rv, fv)) {
+                            outResolved = true;
+                            return fv;
+                        }
+                        if (const auto* sv = std::get_if<StringValue>(rv)) {
+                            outResolved = true;
+                            return ParseFloat32(sv->view(), fallback);
+                        }
+                    }
+                    outResolved = false;
+                    return fallback;
+                };
+
+                Matrix2D step = Matrix2D::Identity();
+                bool hasStep = false;
+                if (shortTag == "ScaleTransform") {
+                    float sx = 1.0f, sy = 1.0f, cx = 0.0f, cy = 0.0f;
+                    for (const auto& a : attrs) {
+                        bool ok = false;
+                        if (a.name == "ScaleX") sx = evalFloatAttr(a, 1.0f, ok);
+                        else if (a.name == "ScaleY") sy = evalFloatAttr(a, 1.0f, ok);
+                        else if (a.name == "CenterX") cx = evalFloatAttr(a, 0.0f, ok);
+                        else if (a.name == "CenterY") cy = evalFloatAttr(a, 0.0f, ok);
+                    }
+                    step = Matrix2D::Scaling(sx, sy, cx, cy);
+                    hasStep = true;
+                } else if (shortTag == "RotateTransform") {
+                    float angle = 0.0f, cx = 0.0f, cy = 0.0f;
+                    for (const auto& a : attrs) {
+                        bool ok = false;
+                        if (a.name == "Angle") angle = evalFloatAttr(a, 0.0f, ok);
+                        else if (a.name == "CenterX") cx = evalFloatAttr(a, 0.0f, ok);
+                        else if (a.name == "CenterY") cy = evalFloatAttr(a, 0.0f, ok);
+                    }
+                    step = Matrix2D::Rotation(angle, cx, cy);
+                    hasStep = true;
+                } else if (shortTag == "TranslateTransform") {
+                    float dx = 0.0f, dy = 0.0f;
+                    for (const auto& a : attrs) {
+                        bool ok = false;
+                        if (a.name == "X") dx = evalFloatAttr(a, 0.0f, ok);
+                        else if (a.name == "Y") dy = evalFloatAttr(a, 0.0f, ok);
+                    }
+                    step = Matrix2D::Translation(dx, dy);
+                    hasStep = true;
+                } else if (shortTag == "SkewTransform") {
+                    float ax = 0.0f, ay = 0.0f, cx = 0.0f, cy = 0.0f;
+                    for (const auto& a : attrs) {
+                        bool ok = false;
+                        if (a.name == "AngleX") ax = evalFloatAttr(a, 0.0f, ok);
+                        else if (a.name == "AngleY") ay = evalFloatAttr(a, 0.0f, ok);
+                        else if (a.name == "CenterX") cx = evalFloatAttr(a, 0.0f, ok);
+                        else if (a.name == "CenterY") cy = evalFloatAttr(a, 0.0f, ok);
+                    }
+                    step = Matrix2D::Skew(ax, ay, cx, cy);
+                    hasStep = true;
+                } else if (shortTag == "MatrixTransform" || shortTag == "Matrix") {
+                    bool parsedMatrixStr = false;
+                    float m11 = 1.0f, m12 = 0.0f, m21 = 0.0f, m22 = 1.0f, ox = 0.0f, oy = 0.0f;
+                    bool anyElemAttr = false;
+                    for (const auto& a : attrs) {
+                        if (a.name == "Matrix") {
+                            const std::string_view mv = Trim(a.value);
+                            if (!mv.empty() && mv.front() != '{') {
+                                step = ParseXamlMatrix2DLiteral(mv);
+                                parsedMatrixStr = true;
+                                hasStep = true;
+                                break;
+                            }
+                            if (const UnifiedValue* rv = resolveTransformResource(mv, a.name)) {
+                                if (const auto* sv = std::get_if<StringValue>(rv)) {
+                                    step = ParseXamlMatrix2DLiteral(sv->view());
+                                    parsedMatrixStr = true;
+                                    hasStep = true;
+                                    break;
+                                }
+                            }
+                            continue;
+                        }
+                        bool ok = false;
+                        if (a.name == "M11") { m11 = evalFloatAttr(a, 1.0f, ok); anyElemAttr |= ok; }
+                        else if (a.name == "M12") { m12 = evalFloatAttr(a, 0.0f, ok); anyElemAttr |= ok; }
+                        else if (a.name == "M21") { m21 = evalFloatAttr(a, 0.0f, ok); anyElemAttr |= ok; }
+                        else if (a.name == "M22") { m22 = evalFloatAttr(a, 1.0f, ok); anyElemAttr |= ok; }
+                        else if (a.name == "OffsetX") { ox = evalFloatAttr(a, 0.0f, ok); anyElemAttr |= ok; }
+                        else if (a.name == "OffsetY") { oy = evalFloatAttr(a, 0.0f, ok); anyElemAttr |= ok; }
+                    }
+                    if (!parsedMatrixStr && anyElemAttr) {
+                        step = Matrix2D::FromWpfMatrix(m11, m12, m21, m22, ox, oy);
+                        hasStep = true;
+                    }
+                }
+
+                if (hasStep) {
+                    tfScope->accumulatedTransform = Matrix2D::Multiply(step, tfScope->accumulatedTransform);
+                }
+                if (!selfClosing) {
+                    XmlScopeEntry childTf{};
+                    childTf.kind = XmlScopeKind::TransformChildNode;
+                    childTf.tagName = std::string(tagName);
+                    scopeStack.push_back(std::move(childTf));
+                    ++nonVisualDepth;
+                }
+                continue;
+            }
+
             if (parentScope.kind == XmlScopeKind::ResourceContainer) {
                 if (!xKey.empty()) {
                     if (shortTag == "SolidColorBrush") {
@@ -452,7 +657,9 @@ AeroCompileResult AeroCompiler::Compile(const AeroCompileInput& input) const {
                         }
                     } else if (!selfClosing &&
                                (shortTag == "LinearGradientBrush" || shortTag == "RadialGradientBrush" ||
-                                shortTag == "Color" || shortTag == "String" || shortTag == "FlowDirection")) {
+                                shortTag == "Color" || shortTag == "String" ||
+                                shortTag == "Double" || shortTag == "Single" ||
+                                shortTag == "FlowDirection")) {
                         XmlScopeEntry itemScope{};
                         itemScope.kind = XmlScopeKind::KeyedResourceItem;
                         itemScope.tagName = std::string(tagName);
@@ -620,6 +827,21 @@ AeroCompileResult AeroCompiler::Compile(const AeroCompileInput& input) const {
                 resScope.kind = XmlScopeKind::ResourceContainer;
                 resScope.tagName = std::string(tagName);
                 scopeStack.push_back(std::move(resScope));
+                ++nonVisualDepth;
+            }
+            continue;
+        }
+
+        if (EndsWith(shortTag, ".RenderTransform") || EndsWith(shortTag, ".LayoutTransform")) {
+            if (!selfClosing) {
+                XmlScopeEntry tfScope{};
+                tfScope.kind = XmlScopeKind::TransformPropertyElement;
+                tfScope.tagName = std::string(tagName);
+                tfScope.targetPropId = EndsWith(shortTag, ".LayoutTransform")
+                    ? PropId_LayoutTransform
+                    : PropId_RenderTransform;
+                tfScope.accumulatedTransform = Matrix2D::Identity();
+                scopeStack.push_back(std::move(tfScope));
                 ++nonVisualDepth;
             }
             continue;
@@ -890,6 +1112,16 @@ AeroCompileResult AeroCompiler::Compile(const AeroCompileInput& input) const {
                 continue;
             }
 
+            // Inline 6-float XAML Matrix syntax: RenderTransform="m11, m12, m21, m22, offsetX, offsetY"
+            if (propId == PropId_RenderTransform) {
+                emitStaticRenderTransform(ParseXamlMatrix2DLiteral(trimmedVal));
+                continue;
+            }
+            if (propId == PropId_LayoutTransform) {
+                emitStaticLayoutTransform(ParseXamlMatrix2DLiteral(trimmedVal));
+                continue;
+            }
+
             const UnifiedValue litVal = ParseLiteralPropertyValue(propId, trimmedVal);
             if (propId == PropId_PathData) {
                 if (const auto* sv = std::get_if<StringValue>(&litVal)) {
@@ -1054,6 +1286,12 @@ AeroCompileResult AeroCompiler::Compile(const AeroCompileInput& input) const {
 namespace {
 
 std::string FormatFloatLiteral(float v) {
+    if (std::isinf(v)) {
+        return (v < 0.0f) ? "-std::numeric_limits<float>::infinity()" : "std::numeric_limits<float>::infinity()";
+    }
+    if (std::isnan(v)) {
+        return "-1.0f";
+    }
     char buf[64]{};
     std::snprintf(buf, sizeof(buf), "%.6ff", v);
     return std::string(buf);
@@ -1106,6 +1344,7 @@ AeroViewAotCppOutput AeroCompiler::GenerateAotCppFromPackage(
     hdr += "#pragma once\n\n";
     hdr += "// Auto-generated by aero-compiler --aot-cpp (Zero-XML C++17 Visual Tree & Binding Builder)\n";
     hdr += "#include <cstdint>\n";
+    hdr += "#include <limits>\n";
     hdr += "#include \"aero/controls/Controls.hpp\"\n";
     hdr += "#include \"aero/binding/DualTrackBindingEngine.hpp\"\n\n";
     hdr += "namespace " + out.cppNamespace + " {\n\n";
@@ -1122,6 +1361,7 @@ AeroViewAotCppOutput AeroCompiler::GenerateAotCppFromPackage(
     // 2. Emit C++17 Source (.cpp) - unrolled batch creation, static properties, MTSDF registration & pre-resolved bindings
     std::string src;
     src += "// Auto-generated by aero-compiler --aot-cpp (Zero-XML C++17 Visual Tree & Binding Builder)\n";
+    src += "#include <limits>\n";
     src += "#include \"aero/controls/Controls.hpp\"\n";
     src += "#include \"aero/binding/DualTrackBindingEngine.hpp\"\n\n";
     src += "namespace " + out.cppNamespace + " {\n\n";
@@ -1176,6 +1416,8 @@ AeroViewAotCppOutput AeroCompiler::GenerateAotCppFromPackage(
     src += "    aero::ManagedHeap* uiHeap = domains ? &domains->uiHeap() : nullptr;\n";
     src += "    const aero::ObjectRef effectiveContext = dataContext.valid() ? dataContext : rootControl->BoundScriptWrapper();\n";
     src += "    const aero::ObjectRef wrapperObj = rootControl->BoundScriptWrapper().valid() ? rootControl->BoundScriptWrapper() : effectiveContext;\n\n";
+    src += "    (void)registry; (void)uiHeap; (void)effectiveContext; (void)wrapperObj;\n";
+    src += "    (void)bindingEngine; (void)eventInterpreter; (void)eventAotContext;\n\n";
 
     std::vector<std::string> elemVarStack;
     std::size_t nextElemId = 0;

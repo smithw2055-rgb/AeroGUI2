@@ -51,6 +51,27 @@ std::atomic<std::uint32_t> gNextRenderTreeId{1u};
     return Rect{x0, y0, std::max(0.0f, x1 - x0), std::max(0.0f, y1 - y0)};
 }
 
+[[nodiscard]] Matrix2D MatrixFromState(
+    float m00, float m01, float m10, float m11, float tx, float ty) noexcept {
+    return Matrix2D{m00, m01, m10, m11, tx, ty};
+}
+
+void ApplyStateMatrix(
+    float& ioM00, float& ioM01, float& ioM10, float& ioM11, float& ioTx, float& ioTy,
+    const Matrix2D& localTransform) noexcept {
+    if (localTransform.IsIdentity()) {
+        return;
+    }
+    const Matrix2D parentM = MatrixFromState(ioM00, ioM01, ioM10, ioM11, ioTx, ioTy);
+    const Matrix2D composed = Matrix2D::Multiply(parentM, localTransform);
+    ioM00 = composed.m00;
+    ioM01 = composed.m01;
+    ioM10 = composed.m10;
+    ioM11 = composed.m11;
+    ioTx = composed.tx;
+    ioTy = composed.ty;
+}
+
 struct MtsdfMappedQuad {
     Rect quadRect{};
     float u0 = 0.0f;
@@ -879,9 +900,9 @@ bool PagedRenderTree::UpdateTextRunNodeSlice(
     node.opacity = opacity;
     node.baseRgba = PackColorRgba8(color, 1.0f);
 
-    // Recompute node.tx / node.ty from baseTx / baseTy so moving (x, y) under Projection3D stays exact
-    node.tx = node.baseTx + node.x * (node.m00 - 1.0f);
-    node.ty = node.baseTy + node.y * (node.m11 - 1.0f);
+    // Recompute node.tx / node.ty from baseTx / baseTy so moving (x, y) under full 2D affine + Projection3D stays exact
+    node.tx = node.baseTx + node.x * (node.m00 - 1.0f) + node.y * node.m01;
+    node.ty = node.baseTy + node.x * node.m10 + node.y * (node.m11 - 1.0f);
 
     CommandPage& page = pages_[node.pageIndex];
     AeroVertex* __restrict vBase = page.vertices.data() + node.vertexOffsetInPage;
@@ -1047,8 +1068,8 @@ std::uint16_t PagedRenderTree::EmitTextRunNodes(
         desc.m11 = curState.m11;
         desc.baseTx = curState.tx;
         desc.baseTy = curState.ty;
-        desc.tx = curState.tx + x * (curState.m00 - 1.0f);
-        desc.ty = curState.ty + y * (curState.m11 - 1.0f);
+        desc.tx = curState.tx + x * (curState.m00 - 1.0f) + y * curState.m01;
+        desc.ty = curState.ty + x * curState.m10 + y * (curState.m11 - 1.0f);
         desc.inheritedOpacity = curState.inheritedOpacity;
         desc.baseRgba = PackColorRgba8(color, 1.0f);
         desc.sourceElement = owner;
@@ -1115,37 +1136,24 @@ bool PagedRenderTree::UpdateDirtyElement(const UIElement* element) noexcept {
         const Rect ar = anc->FinalRect();
         const float aw = (ar.width > 0.0f) ? ar.width : std::max(0.0f, anc->GetWidth());
         const float ah = (ar.height > 0.0f) ? ar.height : std::max(0.0f, anc->GetHeight());
-        const UnifiedValue rtmVal = anc->GetValue(PropId_RenderTransformMatrix);
-        if (const auto* f4 = std::get_if<Float4Value>(&rtmVal)) {
-            parentState.tx += parentState.m00 * f4->z;
-            parentState.ty += parentState.m11 * f4->w;
-            parentState.m00 *= f4->x;
-            parentState.m11 *= f4->y;
-        }
-        float yawDeg = 0.0f, pitchDeg = 0.0f;
-        (void)TryGetFloat(anc->GetValue(PropId_Projection3DYaw), yawDeg);
-        (void)TryGetFloat(anc->GetValue(PropId_Projection3DPitch), pitchDeg);
-        if (yawDeg != 0.0f || pitchDeg != 0.0f) {
-            constexpr float kDegToRad = 3.14159265358979323846f / 180.0f;
-            const float cosYaw = std::cos(yawDeg * kDegToRad);
-            const float cosPitch = std::cos(pitchDeg * kDegToRad);
-            const float cx = ar.x + aw * 0.5f;
-            const float cy = ar.y + ah * 0.5f;
-            parentState.tx += parentState.m00 * (cx * (1.0f - cosYaw));
-            parentState.ty += parentState.m11 * (cy * (1.0f - cosPitch));
-            parentState.m00 *= cosYaw;
-            parentState.m11 *= cosPitch;
-        }
+        ApplyStateMatrix(
+            parentState.m00, parentState.m01, parentState.m10, parentState.m11, parentState.tx, parentState.ty,
+            anc->ComputeLocalEffectiveTransform2D());
         const UnifiedValue clipVal = anc->GetValue(PropId_ClipToBounds);
         if (const auto* clipBool = std::get_if<bool>(&clipVal); clipBool && *clipBool) {
-            const float cx0 = parentState.m00 * ar.x + parentState.tx;
-            const float cx1 = parentState.m00 * (ar.x + aw) + parentState.tx;
-            const float cy0 = parentState.m11 * ar.y + parentState.ty;
-            const float cy1 = parentState.m11 * (ar.y + ah) + parentState.ty;
-            const Rect bounds{std::min(cx0, cx1), std::min(cy0, cy1), std::fabs(cx1 - cx0), std::fabs(cy1 - cy0)};
+            const Matrix2D ancWorldM = MatrixFromState(
+                parentState.m00, parentState.m01, parentState.m10, parentState.m11, parentState.tx, parentState.ty);
+            Rect rawClip = anc->GetLocalClipBounds();
+            if (ar.width <= 0.0f && ar.height <= 0.0f && (aw > 0.0f || ah > 0.0f)) {
+                rawClip = Rect{ar.x, ar.y, aw, ah};
+            }
+            const Rect bounds = ancWorldM.TransformRectBounds(rawClip);
             parentState.clipRect = parentState.clipActive ? IntersectRect(parentState.clipRect, bounds) : bounds;
             parentState.clipActive = true;
         }
+        ApplyStateMatrix(
+            parentState.m00, parentState.m01, parentState.m10, parentState.m11, parentState.tx, parentState.ty,
+            anc->GetChildContainerTransform2D());
     }
 
     RenderTraversalState curState = parentState;
@@ -1155,30 +1163,9 @@ bool PagedRenderTree::UpdateDirtyElement(const UIElement* element) noexcept {
     } else {
         curState.inheritedOpacity *= std::clamp(element->GetOpacity(), 0.0f, 1.0f);
     }
-    const Rect r = element->FinalRect();
-    const float w = (vis == Visibility::Collapsed) ? 0.0f : ((r.width > 0.0f) ? r.width : std::max(0.0f, element->GetWidth()));
-    const float h = (vis == Visibility::Collapsed) ? 0.0f : ((r.height > 0.0f) ? r.height : std::max(0.0f, element->GetHeight()));
-    const UnifiedValue rtmVal = element->GetValue(PropId_RenderTransformMatrix);
-    if (const auto* f4 = std::get_if<Float4Value>(&rtmVal)) {
-        curState.tx += curState.m00 * f4->z;
-        curState.ty += curState.m11 * f4->w;
-        curState.m00 *= f4->x;
-        curState.m11 *= f4->y;
-    }
-    float yawDeg = 0.0f, pitchDeg = 0.0f;
-    (void)TryGetFloat(element->GetValue(PropId_Projection3DYaw), yawDeg);
-    (void)TryGetFloat(element->GetValue(PropId_Projection3DPitch), pitchDeg);
-    if (yawDeg != 0.0f || pitchDeg != 0.0f) {
-        constexpr float kDegToRad = 3.14159265358979323846f / 180.0f;
-        const float cosYaw = std::cos(yawDeg * kDegToRad);
-        const float cosPitch = std::cos(pitchDeg * kDegToRad);
-        const float cx = r.x + w * 0.5f;
-        const float cy = r.y + h * 0.5f;
-        curState.tx += curState.m00 * (cx * (1.0f - cosYaw));
-        curState.ty += curState.m11 * (cy * (1.0f - cosPitch));
-        curState.m00 *= cosYaw;
-        curState.m11 *= cosPitch;
-    }
+    ApplyStateMatrix(
+        curState.m00, curState.m01, curState.m10, curState.m11, curState.tx, curState.ty,
+        element->ComputeLocalEffectiveTransform2D());
 
     return UpdateElementInPlace(element, curState);
 }
@@ -1235,8 +1222,8 @@ bool PagedRenderTree::UpdateElementInPlace(
         nd.m11 = curState.m11;
         nd.baseTx = curState.tx;
         nd.baseTy = curState.ty;
-        nd.tx = curState.tx + nd.x * (curState.m00 - 1.0f);
-        nd.ty = curState.ty + nd.y * (curState.m11 - 1.0f);
+        nd.tx = curState.tx + nd.x * (curState.m00 - 1.0f) + nd.y * curState.m01;
+        nd.ty = curState.ty + nd.x * curState.m10 + nd.y * (curState.m11 - 1.0f);
         nd.inheritedOpacity = curState.inheritedOpacity;
     };
 
@@ -1273,6 +1260,9 @@ bool PagedRenderTree::UpdateElementInPlace(
             entry->boundsH,
             pathElem->GetStretch());
         const float strokeW = pathElem->GetStrokeThickness();
+        const float worldScaleX = std::sqrt(curState.m00 * curState.m00 + curState.m10 * curState.m10);
+        const float worldScaleY = std::sqrt(curState.m01 * curState.m01 + curState.m11 * curState.m11);
+        const float worldStrokeScale = std::max(0.0f, 0.5f * (worldScaleX + worldScaleY));
         const MtsdfMappedQuad mapped = ComputeMtsdfMappedPlacement(fitted, *entry, strokeW);
 
         std::uint16_t k = 0;
@@ -1290,7 +1280,11 @@ bool PagedRenderTree::UpdateElementInPlace(
             nd.uv1Y = mapped.v1;
             const float inlineStrokeW = emitSeparateStroke ? 0.0f : strokeW;
             nd.borderThickness = inlineStrokeW;
-            nd.encodedSdfParams = PackMtsdfParams(entry->pxRange, entry->atlasWidth, inlineStrokeW, false);
+            nd.encodedSdfParams = PackMtsdfParams(
+                entry->pxRange,
+                entry->atlasWidth,
+                inlineStrokeW * worldStrokeScale,
+                false);
             nd.baseRgba = PackColorRgba8(pathElem->GetFill(), 1.0f);
             nd.mtsdfPathHash = entry->pathHash;
             syncQuadTransform(nd);
@@ -1311,7 +1305,11 @@ bool PagedRenderTree::UpdateElementInPlace(
             nd.uv1X = mapped.u1;
             nd.uv1Y = mapped.v1;
             nd.borderThickness = strokeW;
-            nd.encodedSdfParams = PackMtsdfParams(entry->pxRange, entry->atlasWidth, strokeW, true);
+            nd.encodedSdfParams = PackMtsdfParams(
+                entry->pxRange,
+                entry->atlasWidth,
+                strokeW * worldStrokeScale,
+                true);
             nd.baseRgba = PackColorRgba8(pathElem->GetStroke(), 1.0f);
             nd.mtsdfPathHash = entry->pathHash;
             syncQuadTransform(nd);
@@ -1576,6 +1574,9 @@ bool PagedRenderTree::UpdateElementInPlace(
             node.baseRgba = PackColorRgba8(*bg, 1.0f);
         } else if (auto fg = value::TryGetColor(element->GetValue(PropId_Foreground))) {
             node.baseRgba = PackColorRgba8(*fg, 1.0f);
+        } else if (element->IsA<Viewbox>()) {
+            node.baseRgba = PackColorRgba8(Color{0.0f, 0.0f, 0.0f, 0.0f}, 1.0f);
+            node.opacity = 0.0f;
         } else {
             node.baseRgba = PackColorRgba8(Color{0.18f, 0.22f, 0.28f, 1.0f}, 1.0f);
         }
@@ -1634,12 +1635,13 @@ std::size_t PagedRenderTree::BatchUpdateWidthsFromRawColumn(
 
         RenderNodeDescriptor& node = nodePtr[i];
         if (node.width != w) {
+            const float oldW = node.width;
             node.width = w;
             CommandPage& page = pagesBase[node.pageIndex];
             AeroVertex* __restrict v = page.vertices.data() + node.vertexOffsetInPage;
 
-            const float ox = node.x + node.tx;
-            if (node.m00 == 1.0f && node.m10 == 0.0f && node.m01 == 0.0f) {
+            if (node.m00 == 1.0f && node.m10 == 0.0f && node.m01 == 0.0f && node.m11 == 1.0f) {
+                const float ox = node.x + node.tx;
                 const float rightX = ox + w;
                 v[1].x = rightX;
                 v[2].x = rightX;
@@ -1651,6 +1653,29 @@ std::size_t PagedRenderTree::BatchUpdateWidthsFromRawColumn(
                     v[3].u = -halfW;
                 }
             } else {
+                if (node.sourceElement != nullptr) {
+                    const Matrix2D oldLocal = node.sourceElement->ComputeLocalEffectiveTransform2DForRect(
+                        Rect{node.x, node.y, oldW, node.height});
+                    const Matrix2D newLocal = node.sourceElement->ComputeLocalEffectiveTransform2DForRect(
+                        Rect{node.x, node.y, w, node.height});
+                    if (oldLocal != newLocal) {
+                        Matrix2D invOld{};
+                        if (oldLocal.TryInvert(invOld)) {
+                            const Matrix2D prevWorld = MatrixFromState(
+                                node.m00, node.m01, node.m10, node.m11, node.baseTx, node.baseTy);
+                            const Matrix2D parentM = Matrix2D::Multiply(prevWorld, invOld);
+                            const Matrix2D nextWorld = Matrix2D::Multiply(parentM, newLocal);
+                            node.m00 = nextWorld.m00;
+                            node.m01 = nextWorld.m01;
+                            node.m10 = nextWorld.m10;
+                            node.m11 = nextWorld.m11;
+                            node.baseTx = nextWorld.tx;
+                            node.baseTy = nextWorld.ty;
+                            node.tx = nextWorld.tx + node.x * (nextWorld.m00 - 1.0f) + node.y * nextWorld.m01;
+                            node.ty = nextWorld.ty + node.x * nextWorld.m10 + node.y * (nextWorld.m11 - 1.0f);
+                        }
+                    }
+                }
                 WriteQuadVertices(node);
             }
 
@@ -1816,35 +1841,18 @@ bool PagedRenderTree::SyncDirtySubtreeRecursive(
         curState.inheritedOpacity *= std::clamp(elem->GetOpacity(), 0.0f, 1.0f);
     }
 
-    const UnifiedValue rtmVal = elem->GetValue(PropId_RenderTransformMatrix);
-    if (const auto* f4 = std::get_if<Float4Value>(&rtmVal)) {
-        curState.tx += curState.m00 * f4->z;
-        curState.ty += curState.m11 * f4->w;
-        curState.m00 *= f4->x;
-        curState.m11 *= f4->y;
-    }
-    float yawDeg = 0.0f;
-    float pitchDeg = 0.0f;
-    (void)TryGetFloat(elem->GetValue(PropId_Projection3DYaw), yawDeg);
-    (void)TryGetFloat(elem->GetValue(PropId_Projection3DPitch), pitchDeg);
-    if (yawDeg != 0.0f || pitchDeg != 0.0f) {
-        constexpr float kDegToRad = 3.14159265358979323846f / 180.0f;
-        const float cosYaw = std::cos(yawDeg * kDegToRad);
-        const float cosPitch = std::cos(pitchDeg * kDegToRad);
-        const float cx = r.x + w * 0.5f;
-        const float cy = r.y + h * 0.5f;
-        curState.tx += curState.m00 * (cx * (1.0f - cosYaw));
-        curState.ty += curState.m11 * (cy * (1.0f - cosPitch));
-        curState.m00 *= cosYaw;
-        curState.m11 *= cosPitch;
-    }
+    ApplyStateMatrix(
+        curState.m00, curState.m01, curState.m10, curState.m11, curState.tx, curState.ty,
+        elem->ComputeLocalEffectiveTransform2D());
 
-    // Check whether this container's inherited opacity or 2D/3D transform changed so descendants also sync
+    // Check whether this container's inherited opacity or full 2D/3D transform changed so descendants also sync
     bool propagateToAllChildren = forceSubtreeSync;
     if (!propagateToAllChildren && elem->FirstChild() != nullptr) {
         const RenderNodeDescriptor& prevNode = nodes_[elem->RenderNodeId()];
         if (std::fabs(prevNode.inheritedOpacity - curState.inheritedOpacity) > 1e-5f ||
             std::fabs(prevNode.m00 - curState.m00) > 1e-5f ||
+            std::fabs(prevNode.m01 - curState.m01) > 1e-5f ||
+            std::fabs(prevNode.m10 - curState.m10) > 1e-5f ||
             std::fabs(prevNode.m11 - curState.m11) > 1e-5f ||
             std::fabs(prevNode.baseTx - curState.tx) > 1e-3f ||
             std::fabs(prevNode.baseTy - curState.ty) > 1e-3f) {
@@ -1864,20 +1872,21 @@ bool PagedRenderTree::SyncDirtySubtreeRecursive(
     RenderTraversalState childState = curState;
     const UnifiedValue clipVal = elem->GetValue(PropId_ClipToBounds);
     if (const auto* clipBool = std::get_if<bool>(&clipVal); clipBool && *clipBool) {
-        const float cx0 = curState.m00 * r.x + curState.tx;
-        const float cx1 = curState.m00 * (r.x + w) + curState.tx;
-        const float cy0 = curState.m11 * r.y + curState.ty;
-        const float cy1 = curState.m11 * (r.y + h) + curState.ty;
-        const Rect transformedBounds{
-            std::min(cx0, cx1),
-            std::min(cy0, cy1),
-            std::fabs(cx1 - cx0),
-            std::fabs(cy1 - cy0)};
+        const Matrix2D worldM = MatrixFromState(
+            curState.m00, curState.m01, curState.m10, curState.m11, curState.tx, curState.ty);
+        Rect rawClip = elem->GetLocalClipBounds();
+        if (r.width <= 0.0f && r.height <= 0.0f && (w > 0.0f || h > 0.0f)) {
+            rawClip = Rect{r.x, r.y, w, h};
+        }
+        const Rect transformedBounds = worldM.TransformRectBounds(rawClip);
         childState.clipRect = childState.clipActive
             ? IntersectRect(childState.clipRect, transformedBounds)
             : transformedBounds;
         childState.clipActive = true;
     }
+    ApplyStateMatrix(
+        childState.m00, childState.m01, childState.m10, childState.m11, childState.tx, childState.ty,
+        elem->GetChildContainerTransform2D());
 
     // Verify child CommandPage scissor state matches childState when container or clip changed
     if (elem->FirstChild() != nullptr && (forceSubtreeSync || (flags & RenderDirty) != 0u)) {
@@ -1933,28 +1942,9 @@ void PagedRenderTree::TraverseAndEmitElement(
     }
     const float effOpacity = curState.inheritedOpacity;
 
-    const UnifiedValue rtmVal = elem->GetValue(PropId_RenderTransformMatrix);
-    if (const auto* f4 = std::get_if<Float4Value>(&rtmVal)) {
-        curState.tx += curState.m00 * f4->z;
-        curState.ty += curState.m11 * f4->w;
-        curState.m00 *= f4->x;
-        curState.m11 *= f4->y;
-    }
-    float yawDeg = 0.0f;
-    float pitchDeg = 0.0f;
-    (void)TryGetFloat(elem->GetValue(PropId_Projection3DYaw), yawDeg);
-    (void)TryGetFloat(elem->GetValue(PropId_Projection3DPitch), pitchDeg);
-    if (yawDeg != 0.0f || pitchDeg != 0.0f) {
-        constexpr float kDegToRad = 3.14159265358979323846f / 180.0f;
-        const float cosYaw = std::cos(yawDeg * kDegToRad);
-        const float cosPitch = std::cos(pitchDeg * kDegToRad);
-        const float cx = r.x + w * 0.5f;
-        const float cy = r.y + h * 0.5f;
-        curState.tx += curState.m00 * (cx * (1.0f - cosYaw));
-        curState.ty += curState.m11 * (cy * (1.0f - cosPitch));
-        curState.m00 *= cosYaw;
-        curState.m11 *= cosPitch;
-    }
+    ApplyStateMatrix(
+        curState.m00, curState.m01, curState.m10, curState.m11, curState.tx, curState.ty,
+        elem->ComputeLocalEffectiveTransform2D());
 
     // Apply current clip state for this element's own primitives
     activeClipRect_ = curState.clipRect;
@@ -1971,8 +1961,8 @@ void PagedRenderTree::TraverseAndEmitElement(
         nd.m11 = curState.m11;
         nd.baseTx = curState.tx;
         nd.baseTy = curState.ty;
-        nd.tx = curState.tx + nd.x * (curState.m00 - 1.0f);
-        nd.ty = curState.ty + nd.y * (curState.m11 - 1.0f);
+        nd.tx = curState.tx + nd.x * (curState.m00 - 1.0f) + nd.y * curState.m01;
+        nd.ty = curState.ty + nd.x * curState.m10 + nd.y * (curState.m11 - 1.0f);
         nd.inheritedOpacity = curState.inheritedOpacity;
         if (nd.primType != AeroPrimType::SdfTextGlyph) {
             WriteQuadVertices(nd);
@@ -1988,6 +1978,9 @@ void PagedRenderTree::TraverseAndEmitElement(
                 mtsdf->boundsH,
                 pathElem->GetStretch());
             const float strokeW = pathElem->GetStrokeThickness();
+            const float worldScaleX = std::sqrt(curState.m00 * curState.m00 + curState.m10 * curState.m10);
+            const float worldScaleY = std::sqrt(curState.m01 * curState.m01 + curState.m11 * curState.m11);
+            const float worldStrokeScale = std::max(0.0f, 0.5f * (worldScaleX + worldScaleY));
             bool emitFill = true;
             bool emitSeparateStroke = false;
             ClassifyPathEmission(*pathElem, emitFill, emitSeparateStroke);
@@ -2004,6 +1997,11 @@ void PagedRenderTree::TraverseAndEmitElement(
                     inlineStrokeW,
                     effOpacity,
                     elem);
+                nodes_[nid].encodedSdfParams = PackMtsdfParams(
+                    mtsdf->pxRange,
+                    mtsdf->atlasWidth,
+                    inlineStrokeW * worldStrokeScale,
+                    false);
                 applyNodeTransform(nid);
                 ++emittedCount;
             }
@@ -2021,7 +2019,7 @@ void PagedRenderTree::TraverseAndEmitElement(
                 nodes_[strokeNid].encodedSdfParams = PackMtsdfParams(
                     mtsdf->pxRange,
                     mtsdf->atlasWidth,
-                    strokeW,
+                    strokeW * worldStrokeScale,
                     true);
                 applyNodeTransform(strokeNid);
                 ++emittedCount;
@@ -2120,10 +2118,14 @@ void PagedRenderTree::TraverseAndEmitElement(
         }
     } else {
         Color color{0.18f, 0.22f, 0.28f, 1.0f};
+        bool transparentContainer = false;
         if (auto bg = value::TryGetColor(elem->GetValue(PropId_Background))) {
             color = *bg;
         } else if (auto fg = value::TryGetColor(elem->GetValue(PropId_Foreground))) {
             color = *fg;
+        } else if (elem->IsA<Viewbox>()) {
+            color = Color{0.0f, 0.0f, 0.0f, 0.0f};
+            transparentContainer = true;
         }
 
         float cornerRadius = 0.0f;
@@ -2145,7 +2147,7 @@ void PagedRenderTree::TraverseAndEmitElement(
             cornerRadius,
             borderThickness,
             elem);
-        nodes_[nodeId].opacity = effOpacity;
+        nodes_[nodeId].opacity = transparentContainer ? 0.0f : effOpacity;
         applyNodeTransform(nodeId);
         emittedCount = 1u;
     }
@@ -2157,20 +2159,21 @@ void PagedRenderTree::TraverseAndEmitElement(
     RenderTraversalState childState = curState;
     const UnifiedValue clipVal = elem->GetValue(PropId_ClipToBounds);
     if (const auto* clipBool = std::get_if<bool>(&clipVal); clipBool && *clipBool) {
-        const float cx0 = curState.m00 * r.x + curState.tx;
-        const float cx1 = curState.m00 * (r.x + w) + curState.tx;
-        const float cy0 = curState.m11 * r.y + curState.ty;
-        const float cy1 = curState.m11 * (r.y + h) + curState.ty;
-        const Rect localBounds{
-            std::min(cx0, cx1),
-            std::min(cy0, cy1),
-            std::fabs(cx1 - cx0),
-            std::fabs(cy1 - cy0)};
+        const Matrix2D worldM = MatrixFromState(
+            curState.m00, curState.m01, curState.m10, curState.m11, curState.tx, curState.ty);
+        Rect rawClip = elem->GetLocalClipBounds();
+        if (r.width <= 0.0f && r.height <= 0.0f && (w > 0.0f || h > 0.0f)) {
+            rawClip = Rect{r.x, r.y, w, h};
+        }
+        const Rect localBounds = worldM.TransformRectBounds(rawClip);
         childState.clipRect = childState.clipActive
             ? IntersectRect(childState.clipRect, localBounds)
             : localBounds;
         childState.clipActive = true;
     }
+    ApplyStateMatrix(
+        childState.m00, childState.m01, childState.m10, childState.m11, childState.tx, childState.ty,
+        elem->GetChildContainerTransform2D());
 
     for (const UIElement* child = elem->FirstChild(); child != nullptr; child = child->NextSibling()) {
         TraverseAndEmitElement(child, childState);

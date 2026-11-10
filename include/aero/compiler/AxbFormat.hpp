@@ -155,6 +155,7 @@ struct AxbPackage {
     std::uint16_t propId,
     std::string_view rawValue);
 [[nodiscard]] Color ParseXamlColorLiteral(std::string_view raw) noexcept;
+[[nodiscard]] Matrix2D ParseXamlMatrix2DLiteral(std::string_view raw) noexcept;
 [[nodiscard]] std::string DecodeXamlXmlEntities(std::string_view raw);
 
 [[nodiscard]] std::uint64_t ComputeSvgPathHash(std::string_view pathData) noexcept;

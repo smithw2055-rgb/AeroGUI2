@@ -30,8 +30,6 @@ namespace {
 void TestSlimRuntimeAxb4MountAndRenderWithoutCompilerFrontend() {
     aero::AxbTemplateRegistry::Instance().Clear();
 
-    // Construct an AxbPackage with pre-baked MTSDF vector icon and serialize/deserialize
-    // purely through aerogui_runtime (0 AeroCompiler.cpp / 0 RealScript frontend symbols!)
     constexpr const char* kShieldSvg = "M 4,4 L 28,4 L 28,18 L 16,28 L 4,18 Z";
     aero::AxbMtsdfPathEntry bakedShield = aero::BakeSvgPathToMtsdfEntry(kShieldSvg, 32u, 4.0f, 0u, 256u);
     AERO_SLIM_CHECK(bakedShield.pathHash != 0ULL, "Baked MTSDF shield hash is non-zero");
@@ -42,11 +40,6 @@ void TestSlimRuntimeAxb4MountAndRenderWithoutCompilerFrontend() {
     pkg.rootTypeName = "StackPanel";
     pkg.mtsdfPaths.push_back(bakedShield);
 
-    // <StackPanel Width="320" Height="160">
-    //   <Path x:Name="Emblem" Width="48" Height="48" Data="M 4,4 ..." Fill="#22CC88" />
-    //   <TextBlock x:Name="Title" Text="Slim Runtime Wasm 就绪" FontSize="16" />
-    //   <Button x:Name="OkBtn" Content="Confirm" Width="120" Height="32" />
-    // </StackPanel>
     {
         aero::AxbInstruction beginRoot{};
         beginRoot.opcode = aero::AxbOpcode::BeginElement;
@@ -66,7 +59,6 @@ void TestSlimRuntimeAxb4MountAndRenderWithoutCompilerFrontend() {
         setH.literalValue = aero::MakeFloat(160.0f);
         pkg.instructions.push_back(setH);
 
-        // Child 1: Path
         aero::AxbInstruction beginPath{};
         beginPath.opcode = aero::AxbOpcode::BeginElement;
         beginPath.strIdx0 = pkg.InternString("Path");
@@ -87,7 +79,6 @@ void TestSlimRuntimeAxb4MountAndRenderWithoutCompilerFrontend() {
         pkg.instructions.push_back(pathFill);
         pkg.instructions.push_back(aero::AxbInstruction{aero::AxbOpcode::EndElement});
 
-        // Child 2: TextBlock
         aero::AxbInstruction beginTb{};
         beginTb.opcode = aero::AxbOpcode::BeginElement;
         beginTb.strIdx0 = pkg.InternString("TextBlock");
@@ -100,7 +91,6 @@ void TestSlimRuntimeAxb4MountAndRenderWithoutCompilerFrontend() {
             aero::value::FromString("Slim Runtime Wasm 就绪")});
         pkg.instructions.push_back(aero::AxbInstruction{aero::AxbOpcode::EndElement});
 
-        // Child 3: Button
         aero::AxbInstruction beginBtn{};
         beginBtn.opcode = aero::AxbOpcode::BeginElement;
         beginBtn.strIdx0 = pkg.InternString("Button");
@@ -123,7 +113,6 @@ void TestSlimRuntimeAxb4MountAndRenderWithoutCompilerFrontend() {
             aero::MakeFloat(32.0f)});
         pkg.instructions.push_back(aero::AxbInstruction{aero::AxbOpcode::EndElement});
 
-        // Close root
         pkg.instructions.push_back(aero::AxbInstruction{aero::AxbOpcode::EndElement});
     }
 
@@ -146,7 +135,6 @@ void TestSlimRuntimeAxb4MountAndRenderWithoutCompilerFrontend() {
     AERO_SLIM_CHECK(aero::MountAxbTemplate(root.Get(), decoded, &domains, &bindingEngine),
                     "MountAxbTemplate succeeded in slim runtime without compiler frontend");
 
-    // Verify O(1) Euler-tour RTTI works with -fno-rtti enabled!
     auto* emblem = root->FindName("Emblem");
     AERO_SLIM_CHECK(emblem != nullptr && emblem->IsA<aero::Path>(),
                     "Euler-tour RTTI resolved Path under -fno-rtti");
@@ -168,12 +156,52 @@ void TestSlimRuntimeAxb4MountAndRenderWithoutCompilerFrontend() {
     std::cout << "[PASS] TestSlimRuntimeAxb4MountAndRenderWithoutCompilerFrontend\n";
 }
 
+void TestSlimRuntimePhase5APanelsAndAffineTransformsNoRtti() {
+    auto dock = aero::CreateElementByTypeName("DockPanel");
+    auto wrap = aero::CreateElementByTypeName("WrapPanel");
+    auto vbox = aero::CreateElementByTypeName("Viewbox");
+    auto scroll = aero::CreateElementByTypeName("ScrollViewer");
+
+    AERO_SLIM_CHECK(dock && dock->IsA<aero::DockPanel>(), "DockPanel Euler-tour RTTI under -fno-rtti");
+    AERO_SLIM_CHECK(wrap && wrap->IsA<aero::WrapPanel>(), "WrapPanel Euler-tour RTTI under -fno-rtti");
+    AERO_SLIM_CHECK(vbox && vbox->IsA<aero::Viewbox>(), "Viewbox Euler-tour RTTI under -fno-rtti");
+    AERO_SLIM_CHECK(scroll && scroll->IsA<aero::ScrollViewer>(), "ScrollViewer Euler-tour RTTI under -fno-rtti");
+
+    auto* vb = vbox->DynamicCast<aero::Viewbox>();
+    vb->SetWidth(200.0f);
+    vb->SetHeight(100.0f);
+    auto inner = aero::MakeIntrusive<aero::Canvas>();
+    inner->SetWidth(100.0f);
+    inner->SetHeight(50.0f);
+    auto rotBtn = aero::MakeIntrusive<aero::Button>();
+    aero::Canvas::SetLeft(rotBtn.Get(), 30.0f);
+    aero::Canvas::SetTop(rotBtn.Get(), 15.0f);
+    rotBtn->SetWidth(40.0f);
+    rotBtn->SetHeight(20.0f);
+    rotBtn->SetRenderTransformOrigin(aero::Point{0.5f, 0.5f});
+    rotBtn->SetRenderTransform(aero::Matrix2D::Rotation(90.0f));
+    inner->AddChild(rotBtn.Get());
+    vb->AddChild(inner.Get());
+
+    vb->Measure(aero::Size{200.0f, 100.0f});
+    vb->Arrange(aero::Rect{0.0f, 0.0f, 200.0f, 100.0f});
+
+    // Unscaled center is (50, 25), rotated 90 deg -> unscaled [40..60]x[5..45], scaled 2x by Viewbox -> [80..120]x[10..90]!
+    AERO_SLIM_CHECK(vb->HitTest(aero::Point{100.0f, 20.0f}) == rotBtn.Get(),
+                    "Slim runtime HitTest inverts both Viewbox 2x scale and child 90-deg RotateTransform");
+    AERO_SLIM_CHECK(vb->HitTest(aero::Point{65.0f, 50.0f}) == inner.Get(),
+                    "Slim runtime HitTest misses pre-rotation horizontal wing");
+
+    std::cout << "[PASS] TestSlimRuntimePhase5APanelsAndAffineTransformsNoRtti\n";
+}
+
 } // namespace
 
 int main() {
     aero::EnsureBuiltinTypesRegistered();
     aero::EnsureControlTypesRegistered();
     TestSlimRuntimeAxb4MountAndRenderWithoutCompilerFrontend();
+    TestSlimRuntimePhase5APanelsAndAffineTransformsNoRtti();
     std::cout << "AeroGUI 2.0 Slim Runtime (-fno-rtti, 0 Compiler Frontend) Smoke Tests Passed 100%!\n";
     return 0;
 }

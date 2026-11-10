@@ -2,12 +2,17 @@
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
 
 namespace aero {
 
 namespace {
 
 TypeClass gStackPanelTypeClass{};
+TypeClass gDockPanelTypeClass{};
+TypeClass gWrapPanelTypeClass{};
+TypeClass gViewboxTypeClass{};
+TypeClass gScrollViewerTypeClass{};
 TypeClass gGridTypeClass{};
 TypeClass gCanvasTypeClass{};
 TypeClass gBorderTypeClass{};
@@ -18,6 +23,8 @@ TypeClass gItemsControlTypeClass{};
 TypeClass gUserControlTypeClass{};
 bool gControlTypesInitialized = false;
 
+constexpr float kUnconstrainedSpace = 1000000.0f;
+
 std::string_view StripNamespacePrefix(std::string_view name) noexcept {
     if (const auto colon = name.rfind(':'); colon != std::string_view::npos) {
         name = name.substr(colon + 1);
@@ -26,6 +33,82 @@ std::string_view StripNamespacePrefix(std::string_view name) noexcept {
         name = name.substr(dot + 1);
     }
     return name;
+}
+
+void MarkSubtreeRenderDirtyRecursive(UIElement* elem) noexcept {
+    if (!elem) {
+        return;
+    }
+    elem->InvalidateRender();
+    for (UIElement* c = elem->FirstChild(); c != nullptr; c = c->NextSibling()) {
+        MarkSubtreeRenderDirtyRecursive(c);
+    }
+}
+
+void ComputeViewboxScaleFactors(
+    float contentW,
+    float contentH,
+    float availW,
+    float availH,
+    bool hasW,
+    bool hasH,
+    Stretch stretch,
+    StretchDirection dir,
+    float& outSx,
+    float& outSy) noexcept {
+    outSx = 1.0f;
+    outSy = 1.0f;
+    if (contentW <= 1e-5f || contentH <= 1e-5f || stretch == Stretch::None) {
+        return;
+    }
+
+    switch (stretch) {
+        case Stretch::None:
+            outSx = 1.0f;
+            outSy = 1.0f;
+            break;
+        case Stretch::Fill:
+            outSx = hasW ? (availW / contentW) : 1.0f;
+            outSy = hasH ? (availH / contentH) : 1.0f;
+            break;
+        case Stretch::Uniform: {
+            float s = 1.0f;
+            if (hasW && hasH) {
+                s = std::min(availW / contentW, availH / contentH);
+            } else if (hasW) {
+                s = availW / contentW;
+            } else if (hasH) {
+                s = availH / contentH;
+            }
+            outSx = s;
+            outSy = s;
+            break;
+        }
+        case Stretch::UniformToFill: {
+            float s = 1.0f;
+            if (hasW && hasH) {
+                s = std::max(availW / contentW, availH / contentH);
+            } else if (hasW) {
+                s = availW / contentW;
+            } else if (hasH) {
+                s = availH / contentH;
+            }
+            outSx = s;
+            outSy = s;
+            break;
+        }
+    }
+
+    outSx = std::max(0.0f, outSx);
+    outSy = std::max(0.0f, outSy);
+
+    if (dir == StretchDirection::UpOnly) {
+        outSx = std::max(1.0f, outSx);
+        outSy = std::max(1.0f, outSy);
+    } else if (dir == StretchDirection::DownOnly) {
+        outSx = std::min(1.0f, outSx);
+        outSy = std::min(1.0f, outSy);
+    }
 }
 
 } // namespace
@@ -41,6 +124,10 @@ void EnsureControlTypesRegistered() noexcept {
     const auto* panel = Panel::StaticTypeClass();
 
     reg.RegisterType(gStackPanelTypeClass, "Aero.UI.StackPanel", panel);
+    reg.RegisterType(gDockPanelTypeClass, "Aero.UI.DockPanel", panel);
+    reg.RegisterType(gWrapPanelTypeClass, "Aero.UI.WrapPanel", panel);
+    reg.RegisterType(gViewboxTypeClass, "Aero.UI.Viewbox", panel);
+    reg.RegisterType(gScrollViewerTypeClass, "Aero.UI.ScrollViewer", panel);
     reg.RegisterType(gGridTypeClass, "Aero.UI.Grid", panel);
     reg.RegisterType(gCanvasTypeClass, "Aero.UI.Canvas", panel);
     reg.RegisterType(gBorderTypeClass, "Aero.UI.Border", panel);
@@ -54,6 +141,26 @@ void EnsureControlTypesRegistered() noexcept {
 const TypeClass* StackPanel::StaticTypeClass() noexcept {
     EnsureControlTypesRegistered();
     return &gStackPanelTypeClass;
+}
+
+const TypeClass* DockPanel::StaticTypeClass() noexcept {
+    EnsureControlTypesRegistered();
+    return &gDockPanelTypeClass;
+}
+
+const TypeClass* WrapPanel::StaticTypeClass() noexcept {
+    EnsureControlTypesRegistered();
+    return &gWrapPanelTypeClass;
+}
+
+const TypeClass* Viewbox::StaticTypeClass() noexcept {
+    EnsureControlTypesRegistered();
+    return &gViewboxTypeClass;
+}
+
+const TypeClass* ScrollViewer::StaticTypeClass() noexcept {
+    EnsureControlTypesRegistered();
+    return &gScrollViewerTypeClass;
 }
 
 const TypeClass* Grid::StaticTypeClass() noexcept {
@@ -197,6 +304,726 @@ void StackPanel::ArrangeCore(Rect finalRect) noexcept {
             c->Arrange(Rect{cursor, startY, d.width, innerH});
             cursor += d.width + spacing;
         }
+    }
+}
+
+// ============================================================================
+// DockPanel
+// ============================================================================
+
+DockPanel::DockPanel() {
+    EnsureControlTypesRegistered();
+}
+
+void DockPanel::SetDock(UIElement* element, Dock dock) {
+    if (element) {
+        element->SetValue(
+            PropId_Dock,
+            value::FromInt(static_cast<std::int64_t>(dock)),
+            ValueSourceRank::Local);
+    }
+}
+
+Dock DockPanel::GetDock(const UIElement* element) noexcept {
+    if (!element) {
+        return Dock::Left;
+    }
+    const auto v = element->GetValue(PropId_Dock);
+    if (const auto* i = std::get_if<std::int64_t>(&v)) {
+        if (*i >= 0 && *i <= 3) {
+            return static_cast<Dock>(*i);
+        }
+    }
+    return Dock::Left;
+}
+
+void DockPanel::SetLastChildFill(bool fill) {
+    SetValue(PropId_LastChildFill, value::FromBool(fill), ValueSourceRank::Local);
+}
+
+bool DockPanel::GetLastChildFill() const noexcept {
+    const auto v = GetValue(PropId_LastChildFill);
+    if (const auto* b = std::get_if<bool>(&v)) {
+        return *b;
+    }
+    return true;
+}
+
+Size DockPanel::MeasureCore(Size availableSize) noexcept {
+    const Thickness p = GetPadding();
+    const float padW = p.left + p.right;
+    const float padH = p.top + p.bottom;
+    const float innerAvailW = std::max(0.0f, availableSize.width - padW);
+    const float innerAvailH = std::max(0.0f, availableSize.height - padH);
+
+    const bool lastFill = GetLastChildFill();
+    UIElement* lastVisible = nullptr;
+    if (lastFill) {
+        for (UIElement* c = FirstChild(); c != nullptr; c = c->NextSibling()) {
+            if (c->GetVisibility() != Visibility::Collapsed) {
+                lastVisible = c;
+            }
+        }
+    }
+
+    float accumW = 0.0f;
+    float accumH = 0.0f;
+    float parentW = 0.0f;
+    float parentH = 0.0f;
+
+    for (UIElement* c = FirstChild(); c != nullptr; c = c->NextSibling()) {
+        const Size childConstraint{
+            std::max(0.0f, innerAvailW - accumW),
+            std::max(0.0f, innerAvailH - accumH)};
+        c->Measure(childConstraint);
+        if (c->GetVisibility() == Visibility::Collapsed) {
+            continue;
+        }
+        const Size d = c->DesiredSize();
+        if (lastFill && c == lastVisible) {
+            parentW = std::max(parentW, accumW + d.width);
+            parentH = std::max(parentH, accumH + d.height);
+        } else {
+            switch (GetDock(c)) {
+                case Dock::Left:
+                case Dock::Right:
+                    parentH = std::max(parentH, accumH + d.height);
+                    accumW += d.width;
+                    break;
+                case Dock::Top:
+                case Dock::Bottom:
+                    parentW = std::max(parentW, accumW + d.width);
+                    accumH += d.height;
+                    break;
+            }
+        }
+    }
+
+    parentW = std::max(parentW, accumW);
+    parentH = std::max(parentH, accumH);
+    return Size{parentW + padW, parentH + padH};
+}
+
+void DockPanel::ArrangeCore(Rect finalRect) noexcept {
+    const Thickness p = GetPadding();
+    float left = finalRect.x + p.left;
+    float top = finalRect.y + p.top;
+    float right = left + std::max(0.0f, finalRect.width - (p.left + p.right));
+    float bottom = top + std::max(0.0f, finalRect.height - (p.top + p.bottom));
+
+    const bool lastFill = GetLastChildFill();
+    UIElement* lastVisible = nullptr;
+    if (lastFill) {
+        for (UIElement* c = FirstChild(); c != nullptr; c = c->NextSibling()) {
+            if (c->GetVisibility() != Visibility::Collapsed) {
+                lastVisible = c;
+            }
+        }
+    }
+
+    for (UIElement* c = FirstChild(); c != nullptr; c = c->NextSibling()) {
+        if (c->GetVisibility() == Visibility::Collapsed) {
+            c->Arrange(Rect{left, top, 0.0f, 0.0f});
+            continue;
+        }
+        const float remW = std::max(0.0f, right - left);
+        const float remH = std::max(0.0f, bottom - top);
+        if (lastFill && c == lastVisible) {
+            c->Arrange(Rect{left, top, remW, remH});
+        } else {
+            const Size d = c->DesiredSize();
+            switch (GetDock(c)) {
+                case Dock::Left: {
+                    const float w = std::min(d.width, remW);
+                    c->Arrange(Rect{left, top, w, remH});
+                    left += w;
+                    break;
+                }
+                case Dock::Right: {
+                    const float w = std::min(d.width, remW);
+                    c->Arrange(Rect{right - w, top, w, remH});
+                    right -= w;
+                    break;
+                }
+                case Dock::Top: {
+                    const float h = std::min(d.height, remH);
+                    c->Arrange(Rect{left, top, remW, h});
+                    top += h;
+                    break;
+                }
+                case Dock::Bottom: {
+                    const float h = std::min(d.height, remH);
+                    c->Arrange(Rect{left, bottom - h, remW, h});
+                    bottom -= h;
+                    break;
+                }
+            }
+        }
+    }
+}
+
+// ============================================================================
+// WrapPanel
+// ============================================================================
+
+WrapPanel::WrapPanel() {
+    EnsureControlTypesRegistered();
+}
+
+void WrapPanel::SetOrientation(Orientation o) {
+    SetValue(
+        PropId_Orientation,
+        value::FromInt(static_cast<std::int64_t>(o)),
+        ValueSourceRank::Local);
+}
+
+Orientation WrapPanel::GetOrientation() const noexcept {
+    const auto v = GetValue(PropId_Orientation);
+    if (const auto* i = std::get_if<std::int64_t>(&v)) {
+        return (*i == 0) ? Orientation::Vertical : Orientation::Horizontal;
+    }
+    return Orientation::Horizontal;
+}
+
+void WrapPanel::SetItemWidth(float width) {
+    if (std::isnan(width) || width <= 0.0f || std::isinf(width)) {
+        (void)ClearValue(PropId_ItemWidth, ValueSourceRank::Local);
+    } else {
+        (void)SetValue(PropId_ItemWidth, MakeFloat(width), ValueSourceRank::Local);
+    }
+}
+
+float WrapPanel::GetItemWidth() const noexcept {
+    float out = -1.0f;
+    if (TryGetFloat(GetValue(PropId_ItemWidth), out) && out > 0.0f && std::isfinite(out)) {
+        return out;
+    }
+    return -1.0f;
+}
+
+void WrapPanel::SetItemHeight(float height) {
+    if (std::isnan(height) || height <= 0.0f || std::isinf(height)) {
+        (void)ClearValue(PropId_ItemHeight, ValueSourceRank::Local);
+    } else {
+        (void)SetValue(PropId_ItemHeight, MakeFloat(height), ValueSourceRank::Local);
+    }
+}
+
+float WrapPanel::GetItemHeight() const noexcept {
+    float out = -1.0f;
+    if (TryGetFloat(GetValue(PropId_ItemHeight), out) && out > 0.0f && std::isfinite(out)) {
+        return out;
+    }
+    return -1.0f;
+}
+
+void WrapPanel::SetSpacing(float spacing) {
+    SetValue(PropId_Spacing, MakeFloat(spacing), ValueSourceRank::Local);
+}
+
+float WrapPanel::GetSpacing() const noexcept {
+    float out = 0.0f;
+    if (TryGetFloat(GetValue(PropId_Spacing), out)) {
+        return std::max(0.0f, out);
+    }
+    return 0.0f;
+}
+
+Size WrapPanel::MeasureCore(Size availableSize) noexcept {
+    const Thickness p = GetPadding();
+    const float padW = p.left + p.right;
+    const float padH = p.top + p.bottom;
+    const float innerW = std::max(0.0f, availableSize.width - padW);
+    const float innerH = std::max(0.0f, availableSize.height - padH);
+
+    const Orientation orient = GetOrientation();
+    const float itemW = GetItemWidth();
+    const float itemH = GetItemHeight();
+    const float spacing = GetSpacing();
+
+    const Size childConstraint{
+        (itemW > 0.0f) ? itemW : innerW,
+        (itemH > 0.0f) ? itemH : innerH};
+
+    const float lineLimit = (orient == Orientation::Horizontal) ? innerW : innerH;
+    float curLineMain = 0.0f;
+    float curLineCross = 0.0f;
+    float panelMain = 0.0f;
+    float panelCross = 0.0f;
+    std::size_t itemsInCurLine = 0u;
+    std::size_t completedLines = 0u;
+
+    for (UIElement* c = FirstChild(); c != nullptr; c = c->NextSibling()) {
+        c->Measure(childConstraint);
+        if (c->GetVisibility() == Visibility::Collapsed) {
+            continue;
+        }
+        const Size d = c->DesiredSize();
+        const float cw = (itemW > 0.0f) ? itemW : d.width;
+        const float ch = (itemH > 0.0f) ? itemH : d.height;
+        const float itemMain = (orient == Orientation::Horizontal) ? cw : ch;
+        const float itemCross = (orient == Orientation::Horizontal) ? ch : cw;
+
+        const float gap = (itemsInCurLine > 0u) ? spacing : 0.0f;
+        if (itemsInCurLine > 0u && (curLineMain + gap + itemMain > lineLimit + 1e-4f)) {
+            panelMain = std::max(panelMain, curLineMain);
+            panelCross += curLineCross;
+            ++completedLines;
+            curLineMain = itemMain;
+            curLineCross = itemCross;
+            itemsInCurLine = 1u;
+        } else {
+            curLineMain += gap + itemMain;
+            curLineCross = std::max(curLineCross, itemCross);
+            ++itemsInCurLine;
+        }
+    }
+
+    if (itemsInCurLine > 0u) {
+        panelMain = std::max(panelMain, curLineMain);
+        panelCross += curLineCross;
+        if (completedLines > 0u) {
+            panelCross += spacing * static_cast<float>(completedLines);
+        }
+    }
+
+    if (orient == Orientation::Horizontal) {
+        return Size{panelMain + padW, panelCross + padH};
+    }
+    return Size{panelCross + padW, panelMain + padH};
+}
+
+void WrapPanel::ArrangeCore(Rect finalRect) noexcept {
+    const Thickness p = GetPadding();
+    const float startX = finalRect.x + p.left;
+    const float startY = finalRect.y + p.top;
+    const float innerW = std::max(0.0f, finalRect.width - (p.left + p.right));
+    const float innerH = std::max(0.0f, finalRect.height - (p.top + p.bottom));
+
+    const Orientation orient = GetOrientation();
+    const float itemW = GetItemWidth();
+    const float itemH = GetItemHeight();
+    const float spacing = GetSpacing();
+    const float lineLimit = (orient == Orientation::Horizontal) ? innerW : innerH;
+
+    auto flushLine = [&](UIElement* lineFirst, UIElement* lineEndExclusive, float crossOffset, float lineCross) noexcept {
+        float mainCursor = 0.0f;
+        for (UIElement* it = lineFirst; it != lineEndExclusive; it = it->NextSibling()) {
+            if (it->GetVisibility() == Visibility::Collapsed) {
+                it->Arrange(Rect{startX, startY, 0.0f, 0.0f});
+                continue;
+            }
+            const Size d = it->DesiredSize();
+            const float cw = (itemW > 0.0f) ? itemW : d.width;
+            const float ch = (itemH > 0.0f) ? itemH : d.height;
+            if (orient == Orientation::Horizontal) {
+                it->Arrange(Rect{startX + mainCursor, startY + crossOffset, cw, (itemH > 0.0f) ? itemH : lineCross});
+                mainCursor += cw + spacing;
+            } else {
+                it->Arrange(Rect{startX + crossOffset, startY + mainCursor, (itemW > 0.0f) ? itemW : lineCross, ch});
+                mainCursor += ch + spacing;
+            }
+        }
+    };
+
+    UIElement* lineFirst = FirstChild();
+    float curLineMain = 0.0f;
+    float curLineCross = 0.0f;
+    float crossCursor = 0.0f;
+    std::size_t itemsInCurLine = 0u;
+
+    for (UIElement* c = FirstChild(); c != nullptr; c = c->NextSibling()) {
+        if (c->GetVisibility() == Visibility::Collapsed) {
+            continue;
+        }
+        const Size d = c->DesiredSize();
+        const float cw = (itemW > 0.0f) ? itemW : d.width;
+        const float ch = (itemH > 0.0f) ? itemH : d.height;
+        const float itemMain = (orient == Orientation::Horizontal) ? cw : ch;
+        const float itemCross = (orient == Orientation::Horizontal) ? ch : cw;
+        const float gap = (itemsInCurLine > 0u) ? spacing : 0.0f;
+
+        if (itemsInCurLine > 0u && (curLineMain + gap + itemMain > lineLimit + 1e-4f)) {
+            flushLine(lineFirst, c, crossCursor, curLineCross);
+            crossCursor += curLineCross + spacing;
+            lineFirst = c;
+            curLineMain = itemMain;
+            curLineCross = itemCross;
+            itemsInCurLine = 1u;
+        } else {
+            curLineMain += gap + itemMain;
+            curLineCross = std::max(curLineCross, itemCross);
+            ++itemsInCurLine;
+        }
+    }
+
+    if (lineFirst != nullptr) {
+        flushLine(lineFirst, nullptr, crossCursor, curLineCross);
+    }
+}
+
+// ============================================================================
+// Viewbox
+// ============================================================================
+
+Viewbox::Viewbox() {
+    EnsureControlTypesRegistered();
+}
+
+void Viewbox::SetStretch(Stretch stretch) {
+    SetValue(PropId_Stretch, value::FromInt(static_cast<std::int64_t>(stretch)), ValueSourceRank::Local);
+}
+
+Stretch Viewbox::GetStretch() const noexcept {
+    const auto v = GetValue(PropId_Stretch);
+    if (const auto* i = std::get_if<std::int64_t>(&v)) {
+        if (*i >= 0 && *i <= 3) {
+            return static_cast<Stretch>(*i);
+        }
+    }
+    return Stretch::Uniform;
+}
+
+void Viewbox::SetStretchDirection(StretchDirection dir) {
+    SetValue(
+        PropId_StretchDirection,
+        value::FromInt(static_cast<std::int64_t>(dir)),
+        ValueSourceRank::Local);
+}
+
+StretchDirection Viewbox::GetStretchDirection() const noexcept {
+    const auto v = GetValue(PropId_StretchDirection);
+    if (const auto* i = std::get_if<std::int64_t>(&v)) {
+        if (*i >= 0 && *i <= 2) {
+            return static_cast<StretchDirection>(*i);
+        }
+    }
+    return StretchDirection::Both;
+}
+
+Size Viewbox::MeasureCore(Size availableSize) noexcept {
+    const Thickness p = GetPadding();
+    const float padW = p.left + p.right;
+    const float padH = p.top + p.bottom;
+    const float innerAvailW = std::max(0.0f, availableSize.width - padW);
+    const float innerAvailH = std::max(0.0f, availableSize.height - padH);
+
+    UIElement* child = FirstChild();
+    if (!child) {
+        return Size{padW, padH};
+    }
+
+    // Measure single child in unconstrained natural design space
+    child->Measure(Size{kUnconstrainedSpace, kUnconstrainedSpace});
+    for (UIElement* extra = child->NextSibling(); extra != nullptr; extra = extra->NextSibling()) {
+        extra->Measure(Size{kUnconstrainedSpace, kUnconstrainedSpace});
+    }
+
+    if (child->GetVisibility() == Visibility::Collapsed) {
+        return Size{padW, padH};
+    }
+
+    const Size natural = child->DesiredSize();
+    const bool hasW = std::isfinite(availableSize.width) && (availableSize.width < kUnconstrainedSpace * 0.5f);
+    const bool hasH = std::isfinite(availableSize.height) && (availableSize.height < kUnconstrainedSpace * 0.5f);
+
+    float sx = 1.0f;
+    float sy = 1.0f;
+    ComputeViewboxScaleFactors(
+        natural.width,
+        natural.height,
+        innerAvailW,
+        innerAvailH,
+        hasW,
+        hasH,
+        GetStretch(),
+        GetStretchDirection(),
+        sx,
+        sy);
+
+    return Size{
+        natural.width * sx + padW,
+        natural.height * sy + padH};
+}
+
+void Viewbox::ArrangeCore(Rect finalRect) noexcept {
+    const Thickness p = GetPadding();
+    const float startX = finalRect.x + p.left;
+    const float startY = finalRect.y + p.top;
+    const float innerW = std::max(0.0f, finalRect.width - (p.left + p.right));
+    const float innerH = std::max(0.0f, finalRect.height - (p.top + p.bottom));
+
+    UIElement* child = FirstChild();
+    if (!child || child->GetVisibility() == Visibility::Collapsed) {
+        const bool resetChanged =
+            (std::fabs(childScaleX_ - 1.0f) > 1e-5f) ||
+            (std::fabs(childScaleY_ - 1.0f) > 1e-5f) ||
+            (std::fabs(childOriginX_ - startX) > 1e-3f) ||
+            (std::fabs(childOriginY_ - startY) > 1e-3f);
+        childScaleX_ = 1.0f;
+        childScaleY_ = 1.0f;
+        childOriginX_ = startX;
+        childOriginY_ = startY;
+        for (UIElement* c = child; c != nullptr; c = c->NextSibling()) {
+            c->Arrange(Rect{startX, startY, 0.0f, 0.0f});
+        }
+        if (resetChanged) {
+            InvalidateRender();
+            for (UIElement* c = FirstChild(); c != nullptr; c = c->NextSibling()) {
+                MarkSubtreeRenderDirtyRecursive(c);
+            }
+        }
+        return;
+    }
+
+    const Size natural = child->DesiredSize();
+    float sx = 1.0f;
+    float sy = 1.0f;
+    ComputeViewboxScaleFactors(
+        natural.width,
+        natural.height,
+        innerW,
+        innerH,
+        true,
+        true,
+        GetStretch(),
+        GetStretchDirection(),
+        sx,
+        sy);
+
+    const float scaledW = natural.width * sx;
+    const float scaledH = natural.height * sy;
+
+    float offsetX = (innerW - scaledW) * 0.5f;
+    switch (child->GetHorizontalAlignment()) {
+        case HorizontalAlignment::Left:
+            offsetX = 0.0f;
+            break;
+        case HorizontalAlignment::Right:
+            offsetX = innerW - scaledW;
+            break;
+        case HorizontalAlignment::Center:
+        case HorizontalAlignment::Stretch:
+            offsetX = (innerW - scaledW) * 0.5f;
+            break;
+    }
+
+    float offsetY = (innerH - scaledH) * 0.5f;
+    switch (child->GetVerticalAlignment()) {
+        case VerticalAlignment::Top:
+            offsetY = 0.0f;
+            break;
+        case VerticalAlignment::Bottom:
+            offsetY = innerH - scaledH;
+            break;
+        case VerticalAlignment::Center:
+        case VerticalAlignment::Stretch:
+            offsetY = (innerH - scaledH) * 0.5f;
+            break;
+    }
+
+    const float newOriginX = startX + offsetX;
+    const float newOriginY = startY + offsetY;
+    const bool scaleChanged =
+        (std::fabs(childScaleX_ - sx) > 1e-5f) ||
+        (std::fabs(childScaleY_ - sy) > 1e-5f) ||
+        (std::fabs(childOriginX_ - newOriginX) > 1e-3f) ||
+        (std::fabs(childOriginY_ - newOriginY) > 1e-3f);
+
+    childScaleX_ = sx;
+    childScaleY_ = sy;
+    childOriginX_ = newOriginX;
+    childOriginY_ = newOriginY;
+
+    child->Arrange(Rect{newOriginX, newOriginY, natural.width, natural.height});
+    for (UIElement* extra = child->NextSibling(); extra != nullptr; extra = extra->NextSibling()) {
+        const Size ed = extra->DesiredSize();
+        extra->Arrange(Rect{newOriginX, newOriginY, ed.width, ed.height});
+    }
+
+    if (scaleChanged) {
+        InvalidateRender();
+        for (UIElement* c = FirstChild(); c != nullptr; c = c->NextSibling()) {
+            MarkSubtreeRenderDirtyRecursive(c);
+        }
+    }
+}
+
+// ============================================================================
+// ScrollViewer
+// ============================================================================
+
+ScrollViewer::ScrollViewer() {
+    EnsureControlTypesRegistered();
+    SetValue(PropId_ClipToBounds, UnifiedValue{true}, ValueSourceRank::ThemeStyle);
+}
+
+void ScrollViewer::SetHorizontalScrollBarVisibility(ScrollBarVisibility vis) {
+    SetValue(
+        PropId_HorizontalScrollBarVisibility,
+        value::FromInt(static_cast<std::int64_t>(vis)),
+        ValueSourceRank::Local);
+}
+
+ScrollBarVisibility ScrollViewer::GetHorizontalScrollBarVisibility() const noexcept {
+    const auto v = GetValue(PropId_HorizontalScrollBarVisibility);
+    if (const auto* i = std::get_if<std::int64_t>(&v)) {
+        if (*i >= 0 && *i <= 3) {
+            return static_cast<ScrollBarVisibility>(*i);
+        }
+    }
+    return ScrollBarVisibility::Disabled;
+}
+
+void ScrollViewer::SetVerticalScrollBarVisibility(ScrollBarVisibility vis) {
+    SetValue(
+        PropId_VerticalScrollBarVisibility,
+        value::FromInt(static_cast<std::int64_t>(vis)),
+        ValueSourceRank::Local);
+}
+
+ScrollBarVisibility ScrollViewer::GetVerticalScrollBarVisibility() const noexcept {
+    const auto v = GetValue(PropId_VerticalScrollBarVisibility);
+    if (const auto* i = std::get_if<std::int64_t>(&v)) {
+        if (*i >= 0 && *i <= 3) {
+            return static_cast<ScrollBarVisibility>(*i);
+        }
+    }
+    return ScrollBarVisibility::Auto;
+}
+
+void ScrollViewer::SetHorizontalOffset(float offset) {
+    const float target = hasValidViewport_
+        ? std::clamp(offset, 0.0f, ScrollableWidth())
+        : std::max(0.0f, offset);
+    SetValue(PropId_HorizontalOffset, MakeFloat(target), ValueSourceRank::Local);
+}
+
+float ScrollViewer::GetHorizontalOffset() const noexcept {
+    float out = 0.0f;
+    if (TryGetFloat(GetValue(PropId_HorizontalOffset), out)) {
+        return hasValidViewport_
+            ? std::clamp(out, 0.0f, ScrollableWidth())
+            : std::max(0.0f, out);
+    }
+    return 0.0f;
+}
+
+void ScrollViewer::SetVerticalOffset(float offset) {
+    const float target = hasValidViewport_
+        ? std::clamp(offset, 0.0f, ScrollableHeight())
+        : std::max(0.0f, offset);
+    SetValue(PropId_VerticalOffset, MakeFloat(target), ValueSourceRank::Local);
+}
+
+float ScrollViewer::GetVerticalOffset() const noexcept {
+    float out = 0.0f;
+    if (TryGetFloat(GetValue(PropId_VerticalOffset), out)) {
+        return hasValidViewport_
+            ? std::clamp(out, 0.0f, ScrollableHeight())
+            : std::max(0.0f, out);
+    }
+    return 0.0f;
+}
+
+void ScrollViewer::ScrollToHorizontalOffset(float offset) {
+    SetHorizontalOffset(offset);
+}
+
+void ScrollViewer::ScrollToVerticalOffset(float offset) {
+    SetVerticalOffset(offset);
+}
+
+void ScrollViewer::ScrollBy(float deltaX, float deltaY) {
+    if (deltaX != 0.0f) {
+        ScrollToHorizontalOffset(GetHorizontalOffset() + deltaX);
+    }
+    if (deltaY != 0.0f) {
+        ScrollToVerticalOffset(GetVerticalOffset() + deltaY);
+    }
+}
+
+Size ScrollViewer::MeasureCore(Size availableSize) noexcept {
+    const Thickness p = GetPadding();
+    const float padW = p.left + p.right;
+    const float padH = p.top + p.bottom;
+    const float viewportAvailW = std::max(0.0f, availableSize.width - padW);
+    const float viewportAvailH = std::max(0.0f, availableSize.height - padH);
+
+    const bool canScrollH = (GetHorizontalScrollBarVisibility() != ScrollBarVisibility::Disabled);
+    const bool canScrollV = (GetVerticalScrollBarVisibility() != ScrollBarVisibility::Disabled);
+
+    const Size childConstraint{
+        canScrollH ? kUnconstrainedSpace : viewportAvailW,
+        canScrollV ? kUnconstrainedSpace : viewportAvailH};
+
+    float maxChildW = 0.0f;
+    float maxChildH = 0.0f;
+    for (UIElement* c = FirstChild(); c != nullptr; c = c->NextSibling()) {
+        c->Measure(childConstraint);
+        if (c->GetVisibility() != Visibility::Collapsed) {
+            maxChildW = std::max(maxChildW, c->DesiredSize().width);
+            maxChildH = std::max(maxChildH, c->DesiredSize().height);
+        }
+    }
+
+    extentSize_ = Size{maxChildW, maxChildH};
+    return Size{
+        std::min(maxChildW, viewportAvailW) + padW,
+        std::min(maxChildH, viewportAvailH) + padH};
+}
+
+void ScrollViewer::ArrangeCore(Rect finalRect) noexcept {
+    const Thickness p = GetPadding();
+    const float startX = finalRect.x + p.left;
+    const float startY = finalRect.y + p.top;
+    const float viewportW = std::max(0.0f, finalRect.width - (p.left + p.right));
+    const float viewportH = std::max(0.0f, finalRect.height - (p.top + p.bottom));
+
+    viewportSize_ = Size{viewportW, viewportH};
+    hasValidViewport_ = true;
+
+    float maxChildW = 0.0f;
+    float maxChildH = 0.0f;
+    for (UIElement* c = FirstChild(); c != nullptr; c = c->NextSibling()) {
+        if (c->GetVisibility() != Visibility::Collapsed) {
+            maxChildW = std::max(maxChildW, c->DesiredSize().width);
+            maxChildH = std::max(maxChildH, c->DesiredSize().height);
+        }
+    }
+    extentSize_ = Size{maxChildW, maxChildH};
+
+    const bool canScrollH = (GetHorizontalScrollBarVisibility() != ScrollBarVisibility::Disabled);
+    const bool canScrollV = (GetVerticalScrollBarVisibility() != ScrollBarVisibility::Disabled);
+    const float maxScrollX = std::max(0.0f, extentSize_.width - viewportW);
+    const float maxScrollY = std::max(0.0f, extentSize_.height - viewportH);
+
+    float rawX = 0.0f;
+    float rawY = 0.0f;
+    const bool hasRawX = TryGetFloat(UIElement::GetValue(PropId_HorizontalOffset), rawX);
+    const bool hasRawY = TryGetFloat(UIElement::GetValue(PropId_VerticalOffset), rawY);
+    const float clampedX = std::clamp(hasRawX ? rawX : 0.0f, 0.0f, maxScrollX);
+    const float clampedY = std::clamp(hasRawY ? rawY : 0.0f, 0.0f, maxScrollY);
+    if (hasRawX && rawX != clampedX) {
+        CoerceSparseFloatInPlace(PropId_HorizontalOffset, clampedX);
+    }
+    if (hasRawY && rawY != clampedY) {
+        CoerceSparseFloatInPlace(PropId_VerticalOffset, clampedY);
+    }
+
+    for (UIElement* c = FirstChild(); c != nullptr; c = c->NextSibling()) {
+        if (c->GetVisibility() == Visibility::Collapsed) {
+            c->Arrange(Rect{startX, startY, 0.0f, 0.0f});
+            continue;
+        }
+        const Size d = c->DesiredSize();
+        const float slotW = (canScrollH || d.width > viewportW) ? std::max(viewportW, d.width) : viewportW;
+        const float slotH = (canScrollV || d.height > viewportH) ? std::max(viewportH, d.height) : viewportH;
+        c->Arrange(Rect{
+            startX - clampedX,
+            startY - clampedY,
+            slotW,
+            slotH});
     }
 }
 
@@ -1200,7 +2027,6 @@ const AxbMtsdfPathEntry* AxbTemplateRegistry::FindOrBakeMtsdfPath(std::string_vi
             return &it->second;
         }
     }
-    // On-demand fallback bake outside lock; final slot allocation & insertion is serialized inside InsertMtsdfPathLocked
     AxbMtsdfPathEntry baked = BakeSvgPathToMtsdfEntry(pathData, 32u, 4.0f, 0u, 1024u);
     std::lock_guard<std::mutex> lock(mutex_);
     return InsertMtsdfPathLocked(std::move(baked));
@@ -1291,7 +2117,11 @@ IntrusivePtr<UIElement> CreateElementByTypeName(std::string_view typeName) {
     const std::string_view shortName = StripNamespacePrefix(typeName);
     if (shortName == "Window") return MakeIntrusive<Window>();
     if (shortName == "Panel" || shortName == "ResourceDictionary") return MakeIntrusive<Panel>();
-    if (shortName == "StackPanel" || shortName == "WrapPanel" ||
+    if (shortName == "DockPanel") return MakeIntrusive<DockPanel>();
+    if (shortName == "WrapPanel") return MakeIntrusive<WrapPanel>();
+    if (shortName == "Viewbox") return MakeIntrusive<Viewbox>();
+    if (shortName == "ScrollViewer") return MakeIntrusive<ScrollViewer>();
+    if (shortName == "StackPanel" ||
         shortName == "HeaderedContentControl" || shortName == "GroupBox" ||
         shortName == "Expander" || shortName == "ToolBar" ||
         shortName == "StatusBar" || shortName == "Menu" ||
@@ -1299,18 +2129,13 @@ IntrusivePtr<UIElement> CreateElementByTypeName(std::string_view typeName) {
         shortName == "TabItem") {
         return MakeIntrusive<StackPanel>();
     }
-    if (shortName == "Grid" || shortName == "UniformGrid" || shortName == "DockPanel") {
+    if (shortName == "Grid" || shortName == "UniformGrid") {
         return MakeIntrusive<Grid>();
     }
     if (shortName == "Canvas") return MakeIntrusive<Canvas>();
     if (shortName == "Path") return MakeIntrusive<Path>();
     if (shortName == "Image") return MakeIntrusive<Image>();
-    if (shortName == "ScrollViewer") {
-        auto sv = MakeIntrusive<Border>();
-        sv->SetValue(PropId_ClipToBounds, UnifiedValue{true}, ValueSourceRank::ThemeStyle);
-        return sv;
-    }
-    if (shortName == "Border" || shortName == "Viewbox" ||
+    if (shortName == "Border" ||
         shortName == "ContentControl" || shortName == "ContentPresenter" ||
         shortName == "Rectangle" || shortName == "Ellipse" ||
         shortName == "Line" || shortName == "Polygon" || shortName == "Polyline" ||
@@ -1357,7 +2182,6 @@ bool MountAxbTemplate(
         return false;
     }
 
-    // Ensure pre-baked MTSDF vector path cells carried in this package are registered for zero-CPU-tessellation rendering
     if (!package.mtsdfPaths.empty()) {
         for (const auto& mp : package.mtsdfPaths) {
             AxbTemplateRegistry::Instance().RegisterMtsdfPath(mp);

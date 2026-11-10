@@ -2,7 +2,9 @@
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
 
+#include "aero/compiler/AxbFormat.hpp"
 #include "realscript/aot_cpp/AotRuntime.h"
 
 namespace aero {
@@ -23,6 +25,100 @@ void DetachSubtreeRenderNodes(UIElement* elem) noexcept {
     for (UIElement* c = elem->FirstChild(); c != nullptr; c = c->NextSibling()) {
         DetachSubtreeRenderNodes(c);
     }
+}
+
+[[nodiscard]] constexpr bool IsLayoutAffectingSparseProperty(std::uint16_t propId) noexcept {
+    switch (propId) {
+        case PropId_BorderThickness:
+        case PropId_FontSize:
+        case PropId_Title:
+        case PropId_Text:
+        case PropId_Content:
+        case PropId_Placeholder:
+        case PropId_ItemsSource:
+        case PropId_GridRow:
+        case PropId_GridColumn:
+        case PropId_GridRowSpan:
+        case PropId_GridColumnSpan:
+        case PropId_CanvasLeft:
+        case PropId_CanvasTop:
+        case PropId_Orientation:
+        case PropId_Spacing:
+        case PropId_PathData:
+        case PropId_ImageSource:
+        case PropId_Stretch:
+        case PropId_MaxWidth:
+        case PropId_MaxHeight:
+        case PropId_Dock:
+        case PropId_LastChildFill:
+        case PropId_ItemWidth:
+        case PropId_ItemHeight:
+        case PropId_StretchDirection:
+        case PropId_HorizontalScrollBarVisibility:
+        case PropId_VerticalScrollBarVisibility:
+        case PropId_LayoutTransform:
+            return true;
+        default:
+            return false;
+    }
+}
+
+[[nodiscard]] constexpr bool IsArrangeOnlySparseProperty(std::uint16_t propId) noexcept {
+    switch (propId) {
+        case PropId_HorizontalOffset:
+        case PropId_VerticalOffset:
+            return true;
+        default:
+            return false;
+    }
+}
+
+[[nodiscard]] constexpr bool IsParentLayoutAttachedProperty(std::uint16_t propId) noexcept {
+    switch (propId) {
+        case PropId_GridRow:
+        case PropId_GridColumn:
+        case PropId_GridRowSpan:
+        case PropId_GridColumnSpan:
+        case PropId_CanvasLeft:
+        case PropId_CanvasTop:
+        case PropId_Dock:
+        case PropId_MaxWidth:
+        case PropId_MaxHeight:
+        case PropId_LayoutTransform:
+            return true;
+        default:
+            return false;
+    }
+}
+
+[[nodiscard]] Size MapAvailableSizeThroughLayoutTransform(Size slotAvail, const Matrix2D& lt) noexcept {
+    const float a = std::fabs(lt.m00);
+    const float b = std::fabs(lt.m01);
+    const float c = std::fabs(lt.m10);
+    const float d = std::fabs(lt.m11);
+    const float det = std::fabs(lt.m00 * lt.m11 - lt.m01 * lt.m10);
+    if (det <= 1e-6f) {
+        return Size{0.0f, 0.0f};
+    }
+    if (b <= 1e-6f && c <= 1e-6f) {
+        return Size{slotAvail.width / a, slotAvail.height / d};
+    }
+    if (a <= 1e-6f && d <= 1e-6f) {
+        return Size{slotAvail.height / c, slotAvail.width / b};
+    }
+    const float maxW = std::min(
+        (a > 1e-6f) ? (slotAvail.width / a) : 1e6f,
+        (c > 1e-6f) ? (slotAvail.height / c) : 1e6f);
+    const float maxH = std::min(
+        (b > 1e-6f) ? (slotAvail.width / b) : 1e6f,
+        (d > 1e-6f) ? (slotAvail.height / d) : 1e6f);
+    const float candidateW = 0.5f * maxW;
+    const float candidateH = std::min(
+        maxH,
+        std::min(
+            (b > 1e-6f) ? std::max(0.0f, (slotAvail.width - a * candidateW) / b) : maxH,
+            (d > 1e-6f) ? std::max(0.0f, (slotAvail.height - c * candidateW) / d) : maxH));
+    return Size{candidateW, candidateH};
 }
 
 } // namespace
@@ -303,49 +399,188 @@ void UIElement::SyncVisualTreeGcRoots(
     }
 }
 
-namespace {
+float UIElement::GetMaxWidth() const noexcept {
+    if (const auto* entry = FindCompactEntry(PropId_MaxWidth)) {
+        float out = std::numeric_limits<float>::infinity();
+        if (TryGetFloat(entry->effectiveValue, out) && out >= 0.0f && !std::isnan(out)) {
+            return out;
+        }
+    }
+    return std::numeric_limits<float>::infinity();
+}
 
-[[nodiscard]] constexpr bool IsLayoutAffectingSparseProperty(std::uint16_t propId) noexcept {
-    switch (propId) {
-        case PropId_BorderThickness:
-        case PropId_FontSize:
-        case PropId_Title:
-        case PropId_Text:
-        case PropId_Content:
-        case PropId_Placeholder:
-        case PropId_ItemsSource:
-        case PropId_GridRow:
-        case PropId_GridColumn:
-        case PropId_GridRowSpan:
-        case PropId_GridColumnSpan:
-        case PropId_CanvasLeft:
-        case PropId_CanvasTop:
-        case PropId_Orientation:
-        case PropId_Spacing:
-        case PropId_PathData:
-        case PropId_ImageSource:
-        case PropId_Stretch:
-            return true;
-        default:
-            return false;
+void UIElement::SetMaxWidth(float v) {
+    if (std::isnan(v) || v < 0.0f || std::isinf(v)) {
+        (void)ClearValue(PropId_MaxWidth, ValueSourceRank::Local);
+    } else {
+        (void)SetValue(PropId_MaxWidth, MakeFloat(v), ValueSourceRank::Local);
     }
 }
 
-[[nodiscard]] constexpr bool IsParentLayoutAttachedProperty(std::uint16_t propId) noexcept {
-    switch (propId) {
-        case PropId_GridRow:
-        case PropId_GridColumn:
-        case PropId_GridRowSpan:
-        case PropId_GridColumnSpan:
-        case PropId_CanvasLeft:
-        case PropId_CanvasTop:
-            return true;
-        default:
-            return false;
+float UIElement::GetMaxHeight() const noexcept {
+    if (const auto* entry = FindCompactEntry(PropId_MaxHeight)) {
+        float out = std::numeric_limits<float>::infinity();
+        if (TryGetFloat(entry->effectiveValue, out) && out >= 0.0f && !std::isnan(out)) {
+            return out;
+        }
+    }
+    return std::numeric_limits<float>::infinity();
+}
+
+void UIElement::SetMaxHeight(float v) {
+    if (std::isnan(v) || v < 0.0f || std::isinf(v)) {
+        (void)ClearValue(PropId_MaxHeight, ValueSourceRank::Local);
+    } else {
+        (void)SetValue(PropId_MaxHeight, MakeFloat(v), ValueSourceRank::Local);
     }
 }
 
-} // namespace
+void UIElement::SetRenderTransform(const Matrix2D& matrix) {
+    (void)SetValue(
+        PropId_RenderTransform,
+        UnifiedValue{Float4Value{matrix.m00, matrix.m01, matrix.m10, matrix.m11}},
+        ValueSourceRank::Local);
+    (void)SetValue(
+        PropId_RenderTransformTranslation,
+        UnifiedValue{Float4Value{matrix.tx, matrix.ty, 0.0f, 0.0f}},
+        ValueSourceRank::Local);
+}
+
+Matrix2D UIElement::GetRenderTransform() const noexcept {
+    Matrix2D m = Matrix2D::Identity();
+    if (const auto* lin = FindCompactEntry(PropId_RenderTransform)) {
+        if (const auto* f4 = std::get_if<Float4Value>(&lin->effectiveValue)) {
+            m.m00 = f4->x;
+            m.m01 = f4->y;
+            m.m10 = f4->z;
+            m.m11 = f4->w;
+        }
+    }
+    if (const auto* tr = FindCompactEntry(PropId_RenderTransformTranslation)) {
+        if (const auto* f4 = std::get_if<Float4Value>(&tr->effectiveValue)) {
+            m.tx = f4->x;
+            m.ty = f4->y;
+        }
+    }
+    return m;
+}
+
+void UIElement::ClearRenderTransform() {
+    (void)ClearValue(PropId_RenderTransform, ValueSourceRank::Local);
+    (void)ClearValue(PropId_RenderTransformTranslation, ValueSourceRank::Local);
+}
+
+void UIElement::SetLayoutTransform(const Matrix2D& matrix) {
+    (void)SetValue(
+        PropId_LayoutTransform,
+        UnifiedValue{Float4Value{matrix.m00, matrix.m01, matrix.m10, matrix.m11}},
+        ValueSourceRank::Local);
+}
+
+Matrix2D UIElement::GetLayoutTransform() const noexcept {
+    Matrix2D m = Matrix2D::Identity();
+    if (const auto* lt = FindCompactEntry(PropId_LayoutTransform)) {
+        if (const auto* f4 = std::get_if<Float4Value>(&lt->effectiveValue)) {
+            m.m00 = f4->x;
+            m.m01 = f4->y;
+            m.m10 = f4->z;
+            m.m11 = f4->w;
+        }
+    }
+    return m;
+}
+
+void UIElement::ClearLayoutTransform() {
+    (void)ClearValue(PropId_LayoutTransform, ValueSourceRank::Local);
+}
+
+void UIElement::SetRenderTransformOrigin(Point origin) {
+    (void)SetValue(
+        PropId_RenderTransformOrigin,
+        value::FromPoint(origin),
+        ValueSourceRank::Local);
+}
+
+Point UIElement::GetRenderTransformOrigin() const noexcept {
+    if (const auto* orig = FindCompactEntry(PropId_RenderTransformOrigin)) {
+        if (const auto* f4 = std::get_if<Float4Value>(&orig->effectiveValue)) {
+            return Point{f4->x, f4->y};
+        }
+    }
+    return Point{0.0f, 0.0f};
+}
+
+Matrix2D UIElement::ComputeLocalEffectiveTransform2D() const noexcept {
+    return ComputeLocalEffectiveTransform2DForRect(finalRect_);
+}
+
+Matrix2D UIElement::ComputeLocalEffectiveTransform2DForRect(const Rect& r) const noexcept {
+    const float w = (r.width > 0.0f) ? r.width : std::max(0.0f, fastProps_.width);
+    const float h = (r.height > 0.0f) ? r.height : std::max(0.0f, fastProps_.height);
+
+    Matrix2D eff = Matrix2D::Identity();
+    float effBoxW = w;
+    float effBoxH = h;
+
+    // 0. LayoutTransform (maps unrotated [r.x..r.x+w]x[r.y..r.y+h] into post-layout AABB [r.x..r.x+effBoxW]x[r.y..r.y+effBoxH])
+    if (const auto* ltEntry = FindCompactEntry(PropId_LayoutTransform)) {
+        if (const auto* f4 = std::get_if<Float4Value>(&ltEntry->effectiveValue)) {
+            const Matrix2D lt{f4->x, f4->y, f4->z, f4->w, 0.0f, 0.0f};
+            if (!lt.IsIdentity()) {
+                const float minRelX = std::min(0.0f, lt.m00 * w) + std::min(0.0f, lt.m01 * h);
+                const float minRelY = std::min(0.0f, lt.m10 * w) + std::min(0.0f, lt.m11 * h);
+                eff = Matrix2D{
+                    lt.m00,
+                    lt.m01,
+                    lt.m10,
+                    lt.m11,
+                    r.x - minRelX - (lt.m00 * r.x + lt.m01 * r.y),
+                    r.y - minRelY - (lt.m10 * r.x + lt.m11 * r.y)};
+                effBoxW = std::fabs(lt.m00) * w + std::fabs(lt.m01) * h;
+                effBoxH = std::fabs(lt.m10) * w + std::fabs(lt.m11) * h;
+            }
+        }
+    }
+
+    // 1. 3D foreshortening projection around element layout-box center (if active)
+    float yawDeg = 0.0f;
+    float pitchDeg = 0.0f;
+    if (const auto* yEntry = FindCompactEntry(PropId_Projection3DYaw)) {
+        (void)TryGetFloat(yEntry->effectiveValue, yawDeg);
+    }
+    if (const auto* pEntry = FindCompactEntry(PropId_Projection3DPitch)) {
+        (void)TryGetFloat(pEntry->effectiveValue, pitchDeg);
+    }
+    if (yawDeg != 0.0f || pitchDeg != 0.0f) {
+        constexpr float kDegToRad = 3.14159265358979323846f / 180.0f;
+        const float cosYaw = std::cos(yawDeg * kDegToRad);
+        const float cosPitch = std::cos(pitchDeg * kDegToRad);
+        const float cx = r.x + effBoxW * 0.5f;
+        const float cy = r.y + effBoxH * 0.5f;
+        eff = Matrix2D::Multiply(Matrix2D::Scaling(cosYaw, cosPitch, cx, cy), eff);
+    }
+
+    // 2. Standard 2D Affine RenderTransform around normalized RenderTransformOrigin
+    const bool hasRtLin = (FindCompactEntry(PropId_RenderTransform) != nullptr);
+    const bool hasRtTrans = (FindCompactEntry(PropId_RenderTransformTranslation) != nullptr);
+    if (hasRtLin || hasRtTrans) {
+        const Matrix2D rt = GetRenderTransform();
+        const Point origin = GetRenderTransformOrigin();
+        const float pivotX = r.x + origin.x * effBoxW;
+        const float pivotY = r.y + origin.y * effBoxH;
+        eff = Matrix2D::Multiply(rt.AroundPivot(pivotX, pivotY), eff);
+    }
+
+    // 3. Legacy PropId_RenderTransformMatrix (Float4Value{sx, sy, tx, ty} around global origin)
+    if (const auto* rtmEntry = FindCompactEntry(PropId_RenderTransformMatrix)) {
+        if (const auto* f4 = std::get_if<Float4Value>(&rtmEntry->effectiveValue)) {
+            const Matrix2D legacyM{f4->x, 0.0f, 0.0f, f4->y, f4->z, f4->w};
+            eff = Matrix2D::Multiply(legacyM, eff);
+        }
+    }
+
+    return eff;
+}
 
 UIElement* UIElement::FindName(std::string_view targetName) noexcept {
     if (!targetName.empty() && name_ == targetName) {
@@ -364,39 +599,21 @@ UIElement* UIElement::HitTest(Point point) noexcept {
         return nullptr;
     }
 
-    // Apply inverse 2D RenderTransformMatrix and 3D projection transform around element center
-    // so child subtree hit-testing operates in this container's local coordinate space.
+    // Invert this element's full 2D affine RenderTransform (+ RenderTransformOrigin + Projection3D)
     Point localPt = point;
-    const UnifiedValue rtmVal = GetValue(PropId_RenderTransformMatrix);
-    if (const auto* f4 = std::get_if<Float4Value>(&rtmVal)) {
-        const float safeSx = (std::abs(f4->x) > 1e-4f) ? f4->x : (f4->x >= 0.0f ? 1e-4f : -1e-4f);
-        const float safeSy = (std::abs(f4->y) > 1e-4f) ? f4->y : (f4->y >= 0.0f ? 1e-4f : -1e-4f);
-        localPt.x = (localPt.x - f4->z) / safeSx;
-        localPt.y = (localPt.y - f4->w) / safeSy;
+    const Matrix2D localTransform = ComputeLocalEffectiveTransform2D();
+    if (!localTransform.IsIdentity()) {
+        Matrix2D invLocal{};
+        if (!localTransform.TryInvert(invLocal)) {
+            return nullptr;
+        }
+        localPt = invLocal.TransformPoint(localPt);
     }
 
     const Rect r = finalRect_;
-    const float cx = r.x + r.width * 0.5f;
-    const float cy = r.y + r.height * 0.5f;
-    float yawDeg = 0.0f;
-    float pitchDeg = 0.0f;
-    if (auto yv = value::TryGetFloat(GetValue(PropId_Projection3DYaw))) {
-        yawDeg = *yv;
-    }
-    if (auto pv = value::TryGetFloat(GetValue(PropId_Projection3DPitch))) {
-        pitchDeg = *pv;
-    }
-    if (yawDeg != 0.0f || pitchDeg != 0.0f) {
-        constexpr float kDegToRad = 3.14159265358979323846f / 180.0f;
-        const float cosYaw = std::cos(yawDeg * kDegToRad);
-        const float cosPitch = std::cos(pitchDeg * kDegToRad);
-        const float safeCosYaw = (std::abs(cosYaw) > 0.05f) ? cosYaw : (cosYaw >= 0.0f ? 0.05f : -0.05f);
-        const float safeCosPitch = (std::abs(cosPitch) > 0.05f) ? cosPitch : (cosPitch >= 0.0f ? 0.05f : -0.05f);
-        localPt.x = cx + (localPt.x - cx) / safeCosYaw;
-        localPt.y = cy + (localPt.y - cy) / safeCosPitch;
-    }
 
     // Optional ClipToBounds check before testing children
+    bool childrenReachable = true;
     const UnifiedValue clipVal = GetValue(PropId_ClipToBounds);
     if (const auto* clipBool = std::get_if<bool>(&clipVal); clipBool && *clipBool) {
         if (r.width <= 0.0f || r.height <= 0.0f ||
@@ -404,12 +621,34 @@ UIElement* UIElement::HitTest(Point point) noexcept {
             localPt.y < r.y || localPt.y > r.y + r.height) {
             return nullptr;
         }
+        const Rect childClip = GetLocalClipBounds();
+        if (childClip.width <= 0.0f || childClip.height <= 0.0f ||
+            localPt.x < childClip.x || localPt.x > childClip.x + childClip.width ||
+            localPt.y < childClip.y || localPt.y > childClip.y + childClip.height) {
+            childrenReachable = false;
+        }
+    }
+
+    // Invert optional container child transform (e.g. Viewbox uniform/fill child scaling)
+    Point childPt = localPt;
+    if (childrenReachable) {
+        const Matrix2D childContainerTransform = GetChildContainerTransform2D();
+        if (!childContainerTransform.IsIdentity()) {
+            Matrix2D invChild{};
+            if (childContainerTransform.TryInvert(invChild)) {
+                childPt = invChild.TransformPoint(localPt);
+            } else {
+                childrenReachable = false;
+            }
+        }
     }
 
     // Traverse children in reverse Z-order (lastChild_ -> firstChild_)
-    for (UIElement* child = lastChild_; child != nullptr; child = child->prevSibling_) {
-        if (UIElement* hit = child->HitTest(localPt)) {
-            return hit;
+    if (childrenReachable) {
+        for (UIElement* child = lastChild_; child != nullptr; child = child->prevSibling_) {
+            if (UIElement* hit = child->HitTest(childPt)) {
+                return hit;
+            }
         }
     }
 
@@ -438,15 +677,37 @@ void UIElement::Measure(Size availableSize) noexcept {
     const float marginW = m.left + m.right;
     const float marginH = m.top + m.bottom;
 
-    Size innerAvail{
+    const float minW = std::max(0.0f, fastProps_.minWidth);
+    const float minH = std::max(0.0f, fastProps_.minHeight);
+    const float effMaxW = std::max(minW, GetMaxWidth());
+    const float effMaxH = std::max(minH, GetMaxHeight());
+
+    const Size outerSlotAvail{
         std::max(0.0f, availableSize.width - marginW),
         std::max(0.0f, availableSize.height - marginH)};
 
+    Matrix2D lt = Matrix2D::Identity();
+    bool hasLt = false;
+    if (const auto* ltEntry = FindCompactEntry(PropId_LayoutTransform)) {
+        if (const auto* f4 = std::get_if<Float4Value>(&ltEntry->effectiveValue)) {
+            lt = Matrix2D{f4->x, f4->y, f4->z, f4->w, 0.0f, 0.0f};
+            hasLt = !lt.IsIdentity();
+        }
+    }
+
+    const Size mappedAvail = hasLt
+        ? MapAvailableSizeThroughLayoutTransform(outerSlotAvail, lt)
+        : outerSlotAvail;
+
+    Size innerAvail{
+        std::min(mappedAvail.width, effMaxW),
+        std::min(mappedAvail.height, effMaxH)};
+
     if (fastProps_.width >= 0.0f) {
-        innerAvail.width = fastProps_.width;
+        innerAvail.width = std::clamp(fastProps_.width, minW, effMaxW);
     }
     if (fastProps_.height >= 0.0f) {
-        innerAvail.height = fastProps_.height;
+        innerAvail.height = std::clamp(fastProps_.height, minH, effMaxH);
     }
 
     Size coreSize = MeasureCore(innerAvail);
@@ -457,17 +718,27 @@ void UIElement::Measure(Size availableSize) noexcept {
         coreSize.height = fastProps_.height;
     }
 
-    coreSize.width = std::max(coreSize.width, fastProps_.minWidth);
-    coreSize.height = std::max(coreSize.height, fastProps_.minHeight);
+    coreSize.width = std::clamp(coreSize.width, minW, effMaxW);
+    coreSize.height = std::clamp(coreSize.height, minH, effMaxH);
+    measuredCoreSize_ = coreSize;
+
+    const float desiredCoreW = hasLt
+        ? (std::fabs(lt.m00) * coreSize.width + std::fabs(lt.m01) * coreSize.height)
+        : coreSize.width;
+    const float desiredCoreH = hasLt
+        ? (std::fabs(lt.m10) * coreSize.width + std::fabs(lt.m11) * coreSize.height)
+        : coreSize.height;
 
     desiredSize_ = {
-        coreSize.width + marginW,
-        coreSize.height + marginH};
+        desiredCoreW + marginW,
+        desiredCoreH + marginH};
     lastMeasureConstraint_ = availableSize;
     ClearLayoutDirtyFlags(MeasureDirty | SubtreeMeasureDirty);
 }
 
 void UIElement::Arrange(Rect finalRect) noexcept {
+    lastArrangeSlot_ = finalRect;
+
     if (GetVisibility() == Visibility::Collapsed) {
         const Rect collapsedRect{finalRect.x, finalRect.y, 0.0f, 0.0f};
         if (finalRect_ != collapsedRect) {
@@ -479,18 +750,126 @@ void UIElement::Arrange(Rect finalRect) noexcept {
     }
 
     const Thickness m = GetMargin();
-    Rect innerRect{
-        finalRect.x + m.left,
-        finalRect.y + m.top,
-        std::max(0.0f, finalRect.width - (m.left + m.right)),
-        std::max(0.0f, finalRect.height - (m.top + m.bottom))};
+    const float marginW = m.left + m.right;
+    const float marginH = m.top + m.bottom;
 
+    const float slotX = finalRect.x + m.left;
+    const float slotY = finalRect.y + m.top;
+    const float slotW = std::max(0.0f, finalRect.width - marginW);
+    const float slotH = std::max(0.0f, finalRect.height - marginH);
+
+    const float minW = std::max(0.0f, fastProps_.minWidth);
+    const float minH = std::max(0.0f, fastProps_.minHeight);
+    const float effMaxW = std::max(minW, GetMaxWidth());
+    const float effMaxH = std::max(minH, GetMaxHeight());
+
+    Matrix2D lt = Matrix2D::Identity();
+    bool hasLt = false;
+    if (const auto* ltEntry = FindCompactEntry(PropId_LayoutTransform)) {
+        if (const auto* f4 = std::get_if<Float4Value>(&ltEntry->effectiveValue)) {
+            lt = Matrix2D{f4->x, f4->y, f4->z, f4->w, 0.0f, 0.0f};
+            hasLt = !lt.IsIdentity();
+        }
+    }
+
+    const HorizontalAlignment hAlign = GetHorizontalAlignment();
+    const VerticalAlignment vAlign = GetVerticalAlignment();
+
+    const Size mappedSlot = hasLt
+        ? MapAvailableSizeThroughLayoutTransform(Size{slotW, slotH}, lt)
+        : Size{slotW, slotH};
+
+    const float naturalCoreW = hasLt
+        ? measuredCoreSize_.width
+        : std::max(0.0f, desiredSize_.width - marginW);
+    const float naturalCoreH = hasLt
+        ? measuredCoreSize_.height
+        : std::max(0.0f, desiredSize_.height - marginH);
+
+    const bool stretchLocalW = !hasLt
+        ? (hAlign == HorizontalAlignment::Stretch)
+        : ((std::fabs(lt.m01) <= 1e-6f && std::fabs(lt.m10) <= 1e-6f)
+               ? (hAlign == HorizontalAlignment::Stretch)
+               : ((std::fabs(lt.m00) <= 1e-6f && std::fabs(lt.m11) <= 1e-6f)
+                      ? (vAlign == VerticalAlignment::Stretch)
+                      : (hAlign == HorizontalAlignment::Stretch && vAlign == VerticalAlignment::Stretch)));
+
+    const bool stretchLocalH = !hasLt
+        ? (vAlign == VerticalAlignment::Stretch)
+        : ((std::fabs(lt.m01) <= 1e-6f && std::fabs(lt.m10) <= 1e-6f)
+               ? (vAlign == VerticalAlignment::Stretch)
+               : ((std::fabs(lt.m00) <= 1e-6f && std::fabs(lt.m11) <= 1e-6f)
+                      ? (hAlign == HorizontalAlignment::Stretch)
+                      : (hAlign == HorizontalAlignment::Stretch && vAlign == VerticalAlignment::Stretch)));
+
+    float arrangedW = mappedSlot.width;
     if (fastProps_.width >= 0.0f) {
-        innerRect.width = fastProps_.width;
+        arrangedW = std::clamp(fastProps_.width, minW, effMaxW);
+    } else if (stretchLocalW) {
+        arrangedW = std::clamp(mappedSlot.width, minW, effMaxW);
+    } else {
+        const float naturalW = (lastMeasureConstraint_.width >= 0.0f) ? naturalCoreW : mappedSlot.width;
+        arrangedW = std::clamp(naturalW, minW, effMaxW);
     }
+
+    float arrangedH = mappedSlot.height;
     if (fastProps_.height >= 0.0f) {
-        innerRect.height = fastProps_.height;
+        arrangedH = std::clamp(fastProps_.height, minH, effMaxH);
+    } else if (stretchLocalH) {
+        arrangedH = std::clamp(mappedSlot.height, minH, effMaxH);
+    } else {
+        const float naturalH = (lastMeasureConstraint_.height >= 0.0f) ? naturalCoreH : mappedSlot.height;
+        arrangedH = std::clamp(naturalH, minH, effMaxH);
     }
+
+    const float layoutBoxW = hasLt
+        ? (std::fabs(lt.m00) * arrangedW + std::fabs(lt.m01) * arrangedH)
+        : arrangedW;
+    const float layoutBoxH = hasLt
+        ? (std::fabs(lt.m10) * arrangedW + std::fabs(lt.m11) * arrangedH)
+        : arrangedH;
+
+    float offsetX = 0.0f;
+    switch (hAlign) {
+        case HorizontalAlignment::Left:
+            offsetX = 0.0f;
+            break;
+        case HorizontalAlignment::Center:
+            offsetX = (slotW - layoutBoxW) * 0.5f;
+            break;
+        case HorizontalAlignment::Right:
+            offsetX = slotW - layoutBoxW;
+            break;
+        case HorizontalAlignment::Stretch:
+            if (parent_ != nullptr && layoutBoxW < slotW) {
+                offsetX = (slotW - layoutBoxW) * 0.5f;
+            }
+            break;
+    }
+
+    float offsetY = 0.0f;
+    switch (vAlign) {
+        case VerticalAlignment::Top:
+            offsetY = 0.0f;
+            break;
+        case VerticalAlignment::Center:
+            offsetY = (slotH - layoutBoxH) * 0.5f;
+            break;
+        case VerticalAlignment::Bottom:
+            offsetY = slotH - layoutBoxH;
+            break;
+        case VerticalAlignment::Stretch:
+            if (parent_ != nullptr && layoutBoxH < slotH) {
+                offsetY = (slotH - layoutBoxH) * 0.5f;
+            }
+            break;
+    }
+
+    const Rect innerRect{
+        slotX + offsetX,
+        slotY + offsetY,
+        arrangedW,
+        arrangedH};
 
     if (finalRect_ != innerRect) {
         finalRect_ = innerRect;
@@ -553,6 +932,10 @@ UnifiedValue UIElement::GetValue(std::uint16_t propId) const {
             return MakeFloat(fastProps_.opacity);
         case PropId_Visibility:
             return static_cast<std::int64_t>(fastProps_.visibility);
+        case PropId_HorizontalAlignment:
+            return static_cast<std::int64_t>(GetHorizontalAlignment());
+        case PropId_VerticalAlignment:
+            return static_cast<std::int64_t>(GetVerticalAlignment());
         default:
             break;
     }
@@ -624,8 +1007,72 @@ bool UIElement::SetValue(
                     OnPropertyChanged(propId, value);
                     return true;
                 }
+            } else if (const auto* sv = std::get_if<StringValue>(&value)) {
+                const UnifiedValue parsed = ParseBuiltinLiteralPropertyValue(propId, sv->str());
+                if (const auto* pi = std::get_if<std::int64_t>(&parsed)) {
+                    SetVisibility(static_cast<Visibility>(*pi));
+                    OnPropertyChanged(propId, parsed);
+                    return true;
+                }
             }
             return false;
+        case PropId_HorizontalAlignment:
+            if (const auto* i = std::get_if<std::int64_t>(&value)) {
+                if (*i >= 0 && *i <= 3) {
+                    SetHorizontalAlignment(static_cast<HorizontalAlignment>(*i));
+                    OnPropertyChanged(propId, value);
+                    return true;
+                }
+            } else if (const auto* sv = std::get_if<StringValue>(&value)) {
+                const UnifiedValue parsed = ParseBuiltinLiteralPropertyValue(propId, sv->str());
+                if (const auto* pi = std::get_if<std::int64_t>(&parsed)) {
+                    SetHorizontalAlignment(static_cast<HorizontalAlignment>(*pi));
+                    OnPropertyChanged(propId, parsed);
+                    return true;
+                }
+            }
+            return false;
+        case PropId_VerticalAlignment:
+            if (const auto* i = std::get_if<std::int64_t>(&value)) {
+                if (*i >= 0 && *i <= 3) {
+                    SetVerticalAlignment(static_cast<VerticalAlignment>(*i));
+                    OnPropertyChanged(propId, value);
+                    return true;
+                }
+            } else if (const auto* sv = std::get_if<StringValue>(&value)) {
+                const UnifiedValue parsed = ParseBuiltinLiteralPropertyValue(propId, sv->str());
+                if (const auto* pi = std::get_if<std::int64_t>(&parsed)) {
+                    SetVerticalAlignment(static_cast<VerticalAlignment>(*pi));
+                    OnPropertyChanged(propId, parsed);
+                    return true;
+                }
+            }
+            return false;
+        case PropId_RenderTransform:
+            if (const auto* sv = std::get_if<StringValue>(&value)) {
+                const Matrix2D m = ParseXamlMatrix2DLiteral(sv->str());
+                const bool okLin = SetValue(
+                    PropId_RenderTransform,
+                    UnifiedValue{Float4Value{m.m00, m.m01, m.m10, m.m11}},
+                    rank);
+                if (okLin) {
+                    (void)SetValue(
+                        PropId_RenderTransformTranslation,
+                        UnifiedValue{Float4Value{m.tx, m.ty, 0.0f, 0.0f}},
+                        rank);
+                }
+                return okLin;
+            }
+            break;
+        case PropId_LayoutTransform:
+            if (const auto* sv = std::get_if<StringValue>(&value)) {
+                const Matrix2D m = ParseXamlMatrix2DLiteral(sv->str());
+                return SetValue(
+                    PropId_LayoutTransform,
+                    UnifiedValue{Float4Value{m.m00, m.m01, m.m10, m.m11}},
+                    rank);
+            }
+            break;
         default:
             break;
     }
@@ -651,6 +1098,8 @@ bool UIElement::SetValue(
             if (IsParentLayoutAttachedProperty(propId) && parent_) {
                 parent_->InvalidateLayout();
             }
+        } else if (IsArrangeOnlySparseProperty(propId)) {
+            InvalidateArrange();
         }
         OnPropertyChanged(propId, value);
         return true;
@@ -670,6 +1119,8 @@ bool UIElement::SetValue(
         if (IsParentLayoutAttachedProperty(propId) && parent_) {
             parent_->InvalidateLayout();
         }
+    } else if (IsArrangeOnlySparseProperty(propId)) {
+        InvalidateArrange();
     }
     OnPropertyChanged(propId, value);
     return true;
@@ -709,6 +1160,14 @@ bool UIElement::ClearValue(std::uint16_t propId, ValueSourceRank rank) {
         SetVisibility(Visibility::Visible);
         OnPropertyChanged(propId, std::monostate{});
         return true;
+    case PropId_HorizontalAlignment:
+        SetHorizontalAlignment(HorizontalAlignment::Stretch);
+        OnPropertyChanged(propId, std::monostate{});
+        return true;
+    case PropId_VerticalAlignment:
+        SetVerticalAlignment(VerticalAlignment::Stretch);
+        OnPropertyChanged(propId, std::monostate{});
+        return true;
     default:
         break;
     }
@@ -727,15 +1186,33 @@ bool UIElement::ClearValue(std::uint16_t propId, ValueSourceRank rank) {
         return false;
     }
     sparseProps_.erase(it);
+    if (propId == PropId_RenderTransform) {
+        (void)ClearValue(PropId_RenderTransformTranslation, rank);
+    }
     InvalidateRender();
     if (IsLayoutAffectingSparseProperty(propId)) {
         InvalidateLayout();
         if (IsParentLayoutAttachedProperty(propId) && parent_) {
             parent_->InvalidateLayout();
         }
+    } else if (IsArrangeOnlySparseProperty(propId)) {
+        InvalidateArrange();
     }
     OnPropertyChanged(propId, std::monostate{});
     return true;
+}
+
+void UIElement::CoerceSparseFloatInPlace(std::uint16_t propId, float clampedValue) noexcept {
+    auto it = std::lower_bound(
+        sparseProps_.begin(),
+        sparseProps_.end(),
+        propId,
+        [](const CompactPropertyEntry& e, std::uint16_t id) {
+            return e.propId < id;
+        });
+    if (it != sparseProps_.end() && it->propId == propId) {
+        it->effectiveValue = MakeFloat(clampedValue);
+    }
 }
 
 const CompactPropertyEntry* UIElement::FindCompactEntry(
@@ -757,6 +1234,9 @@ bool UIElement::SetPropertyMetadata(
     std::uint16_t propId,
     std::uint16_t bindingSlotId,
     std::uint16_t animationTrackId) {
+    if (IsFastInlinePropertyId(propId)) {
+        return false;
+    }
     auto it = std::lower_bound(
         sparseProps_.begin(),
         sparseProps_.end(),

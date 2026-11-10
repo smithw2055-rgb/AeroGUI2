@@ -137,6 +137,10 @@ std::size_t DepthBucketLayoutQueue::FlushLayout(Size rootViewportSize) noexcept 
 
     auto resolveAvailableSize = [&](const UIElement* elem) noexcept -> Size {
         if (const UIElement* p = elem->Parent()) {
+            if (elem->lastMeasureConstraint_.width >= 0.0f &&
+                elem->lastMeasureConstraint_.height >= 0.0f) {
+                return elem->lastMeasureConstraint_;
+            }
             const Rect pr = p->FinalRect();
             if (pr.width > 0.0f || pr.height > 0.0f) {
                 return Size{pr.width, pr.height};
@@ -239,11 +243,14 @@ std::size_t DepthBucketLayoutQueue::FlushLayout(Size rootViewportSize) noexcept 
                 head->Arrange(Rect{0.0f, 0.0f, rootViewportSize.width, rootViewportSize.height});
                 ++processedCount;
             } else if ((head->GetLayoutDirtyFlags() & ArrangeDirty) != 0u) {
-                Rect r = head->FinalRect();
-                if (r.width <= 0.0f && r.height <= 0.0f) {
-                    const Size d = head->DesiredSize();
-                    r.width = d.width;
-                    r.height = d.height;
+                Rect r = head->LastArrangeSlot();
+                if (r.width < 0.0f) {
+                    r = head->FinalRect();
+                    if (r.width <= 0.0f && r.height <= 0.0f) {
+                        const Size d = head->DesiredSize();
+                        r.width = d.width;
+                        r.height = d.height;
+                    }
                 }
                 head->Arrange(r);
                 ++processedCount;

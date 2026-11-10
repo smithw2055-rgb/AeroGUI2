@@ -36,6 +36,26 @@ enum class Stretch : std::uint8_t {
     UniformToFill = 3,
 };
 
+enum class StretchDirection : std::uint8_t {
+    Both = 0,
+    UpOnly = 1,
+    DownOnly = 2,
+};
+
+enum class Dock : std::uint8_t {
+    Left = 0,
+    Top = 1,
+    Right = 2,
+    Bottom = 3,
+};
+
+enum class ScrollBarVisibility : std::uint8_t {
+    Disabled = 0,
+    Auto = 1,
+    Hidden = 2,
+    Visible = 3,
+};
+
 struct RowDefinition {
     GridUnitType unit = GridUnitType::Star;
     float value = 1.0f;
@@ -68,6 +88,149 @@ public:
 
     Size MeasureCore(Size availableSize) noexcept override;
     void ArrangeCore(Rect finalRect) noexcept override;
+};
+
+class DockPanel : public Panel {
+public:
+    DockPanel();
+    ~DockPanel() override = default;
+
+    static const TypeClass* StaticTypeClass() noexcept;
+    [[nodiscard]] const TypeClass* GetTypeClass() const noexcept override {
+        return StaticTypeClass();
+    }
+
+    static void SetDock(UIElement* element, Dock dock);
+    [[nodiscard]] static Dock GetDock(const UIElement* element) noexcept;
+
+    void SetLastChildFill(bool fill);
+    [[nodiscard]] bool GetLastChildFill() const noexcept;
+
+    Size MeasureCore(Size availableSize) noexcept override;
+    void ArrangeCore(Rect finalRect) noexcept override;
+};
+
+class WrapPanel : public Panel {
+public:
+    WrapPanel();
+    ~WrapPanel() override = default;
+
+    static const TypeClass* StaticTypeClass() noexcept;
+    [[nodiscard]] const TypeClass* GetTypeClass() const noexcept override {
+        return StaticTypeClass();
+    }
+
+    void SetOrientation(Orientation o);
+    [[nodiscard]] Orientation GetOrientation() const noexcept;
+
+    void SetItemWidth(float width);
+    [[nodiscard]] float GetItemWidth() const noexcept;
+
+    void SetItemHeight(float height);
+    [[nodiscard]] float GetItemHeight() const noexcept;
+
+    void SetSpacing(float spacing);
+    [[nodiscard]] float GetSpacing() const noexcept;
+
+    Size MeasureCore(Size availableSize) noexcept override;
+    void ArrangeCore(Rect finalRect) noexcept override;
+};
+
+class Viewbox : public Panel {
+public:
+    Viewbox();
+    ~Viewbox() override = default;
+
+    static const TypeClass* StaticTypeClass() noexcept;
+    [[nodiscard]] const TypeClass* GetTypeClass() const noexcept override {
+        return StaticTypeClass();
+    }
+
+    void SetStretch(Stretch stretch);
+    [[nodiscard]] Stretch GetStretch() const noexcept;
+
+    void SetStretchDirection(StretchDirection dir);
+    [[nodiscard]] StretchDirection GetStretchDirection() const noexcept;
+
+    [[nodiscard]] float ChildScaleX() const noexcept { return childScaleX_; }
+    [[nodiscard]] float ChildScaleY() const noexcept { return childScaleY_; }
+    [[nodiscard]] float ChildOriginX() const noexcept { return childOriginX_; }
+    [[nodiscard]] float ChildOriginY() const noexcept { return childOriginY_; }
+
+    [[nodiscard]] Matrix2D GetChildContainerTransform2D() const noexcept override {
+        return Matrix2D::Scaling(childScaleX_, childScaleY_, childOriginX_, childOriginY_);
+    }
+
+    Size MeasureCore(Size availableSize) noexcept override;
+    void ArrangeCore(Rect finalRect) noexcept override;
+
+private:
+    float childScaleX_ = 1.0f;
+    float childScaleY_ = 1.0f;
+    float childOriginX_ = 0.0f;
+    float childOriginY_ = 0.0f;
+};
+
+class ScrollViewer : public Panel {
+public:
+    ScrollViewer();
+    ~ScrollViewer() override = default;
+
+    static const TypeClass* StaticTypeClass() noexcept;
+    [[nodiscard]] const TypeClass* GetTypeClass() const noexcept override {
+        return StaticTypeClass();
+    }
+
+    void SetHorizontalScrollBarVisibility(ScrollBarVisibility vis);
+    [[nodiscard]] ScrollBarVisibility GetHorizontalScrollBarVisibility() const noexcept;
+
+    void SetVerticalScrollBarVisibility(ScrollBarVisibility vis);
+    [[nodiscard]] ScrollBarVisibility GetVerticalScrollBarVisibility() const noexcept;
+
+    void SetHorizontalOffset(float offset);
+    [[nodiscard]] float GetHorizontalOffset() const noexcept;
+
+    void SetVerticalOffset(float offset);
+    [[nodiscard]] float GetVerticalOffset() const noexcept;
+
+    void ScrollToHorizontalOffset(float offset);
+    void ScrollToVerticalOffset(float offset);
+    void ScrollBy(float deltaX, float deltaY);
+
+    [[nodiscard]] float ExtentWidth() const noexcept { return extentSize_.width; }
+    [[nodiscard]] float ExtentHeight() const noexcept { return extentSize_.height; }
+    [[nodiscard]] float ViewportWidth() const noexcept { return viewportSize_.width; }
+    [[nodiscard]] float ViewportHeight() const noexcept { return viewportSize_.height; }
+    [[nodiscard]] float ScrollableWidth() const noexcept {
+        return (extentSize_.width > viewportSize_.width)
+            ? (extentSize_.width - viewportSize_.width)
+            : 0.0f;
+    }
+    [[nodiscard]] float ScrollableHeight() const noexcept {
+        return (extentSize_.height > viewportSize_.height)
+            ? (extentSize_.height - viewportSize_.height)
+            : 0.0f;
+    }
+
+    Size MeasureCore(Size availableSize) noexcept override;
+    void ArrangeCore(Rect finalRect) noexcept override;
+
+    [[nodiscard]] Rect GetLocalClipBounds() const noexcept override {
+        const Rect r = FinalRect();
+        const Thickness p = GetPadding();
+        const float padW = p.left + p.right;
+        const float padH = p.top + p.bottom;
+        return Rect{
+            r.x + p.left,
+            r.y + p.top,
+            (r.width > padW) ? (r.width - padW) : 0.0f,
+            (r.height > padH) ? (r.height - padH) : 0.0f};
+    }
+
+private:
+    Size extentSize_{0.0f, 0.0f};
+    Size viewportSize_{0.0f, 0.0f};
+    bool hasValidViewport_ = false;
 };
 
 class Grid : public Panel {

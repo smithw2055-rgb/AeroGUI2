@@ -171,7 +171,7 @@ bool ScriptUiBridge::BindObservableProperty(
     targetElement->SetValue(targetPropertyId, initialValue, ValueSourceRank::Local);
 
     const auto slotIndex = static_cast<std::uint16_t>(bindings_.size());
-    if (targetPropertyId >= PropId_FirstSparse) {
+    if (!IsFastInlinePropertyId(targetPropertyId)) {
         targetElement->SetPropertyMetadata(targetPropertyId, slotIndex, 0xFFFFu);
     }
 
