@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <functional>
 #include <limits>
+#include <memory>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -17,8 +18,20 @@
 namespace aero {
 
 struct AxbPackage;
+struct AxbControlTemplate;
+enum class ValueConverterKind : std::uint8_t;
+class ContentPresenter;
 class DualTrackBindingEngine;
 class AnimationEngine;
+
+struct UIEffectDescriptor {
+    UIEffectKind kind = UIEffectKind::None;
+    float blurRadius = 0.0f;
+    float shadowDepth = 5.0f;
+    float directionDeg = 315.0f;
+    float opacity = 1.0f;
+    Color color{0.0f, 0.0f, 0.0f, 1.0f};
+};
 
 template <typename T>
 class IntrusivePtr {
@@ -96,6 +109,10 @@ public:
     UIElement();
     virtual ~UIElement();
 
+    [[nodiscard]] static std::uint64_t TotalConstructedCount() noexcept;
+    [[nodiscard]] static std::uint64_t TotalDestroyedCount() noexcept;
+    [[nodiscard]] static std::uint64_t LiveInstanceCount() noexcept;
+
     UIElement(const UIElement&) = delete;
     UIElement& operator=(const UIElement&) = delete;
 
@@ -146,6 +163,14 @@ public:
         UIElement* child,
         NativeHandleRegistry* registry = nullptr,
         ManagedHeap* uiHeap = nullptr);
+    bool InsertChildAt(
+        UIElement* child,
+        std::size_t index,
+        NativeHandleRegistry* registry = nullptr,
+        ManagedHeap* uiHeap = nullptr);
+    void ReorderExistingChildren(
+        UIElement* const* orderedChildren,
+        std::size_t count) noexcept;
     bool RemoveChild(
         UIElement* child,
         NativeHandleRegistry* registry = nullptr,
@@ -224,6 +249,7 @@ public:
         if (fastProps_.reserved != next) {
             fastProps_.reserved = next;
             PropagateEnabledStateToSubtree();
+            if (mountedTemplate_) SyncTemplateBindingsForProperty(PropId_IsEnabled);
         }
     }
     [[nodiscard]] bool IsEffectivelyEnabled() const noexcept {
@@ -297,6 +323,7 @@ public:
             next = static_cast<std::uint8_t>(next & ~InteractiveState_FocusableValue);
         }
         fastProps_.reserved = next;
+        if (mountedTemplate_) SyncTemplateBindingsForProperty(PropId_Focusable);
     }
     void ClearExplicitFocusable() noexcept {
         fastInlineRanks_[11] = static_cast<std::uint8_t>(ValueSourceRank::Default);
@@ -361,6 +388,7 @@ public:
         if (fastProps_.width != v) {
             fastProps_.width = v;
             InvalidateLayout();
+            if (mountedTemplate_) SyncTemplateBindingsForProperty(PropId_Width);
         }
     }
 
@@ -371,6 +399,7 @@ public:
         if (fastProps_.height != v) {
             fastProps_.height = v;
             InvalidateLayout();
+            if (mountedTemplate_) SyncTemplateBindingsForProperty(PropId_Height);
         }
     }
 
@@ -380,6 +409,7 @@ public:
         if (fastProps_.minWidth != v) {
             fastProps_.minWidth = v;
             InvalidateLayout();
+            if (mountedTemplate_) SyncTemplateBindingsForProperty(PropId_MinWidth);
         }
     }
 
@@ -389,6 +419,7 @@ public:
         if (fastProps_.minHeight != v) {
             fastProps_.minHeight = v;
             InvalidateLayout();
+            if (mountedTemplate_) SyncTemplateBindingsForProperty(PropId_MinHeight);
         }
     }
 
@@ -411,6 +442,7 @@ public:
             if (parent_) {
                 parent_->InvalidateArrange();
             }
+            if (mountedTemplate_) SyncTemplateBindingsForProperty(PropId_HorizontalAlignment);
         }
     }
 
@@ -427,6 +459,7 @@ public:
             if (parent_) {
                 parent_->InvalidateArrange();
             }
+            if (mountedTemplate_) SyncTemplateBindingsForProperty(PropId_VerticalAlignment);
         }
     }
 
@@ -494,6 +527,27 @@ public:
     [[nodiscard]] Matrix2D ComputeLocalEffectiveTransform2D() const noexcept;
     [[nodiscard]] Matrix2D ComputeLocalEffectiveTransform2DForRect(const Rect& rectOverride) const noexcept;
 
+    // P1-5: True 3D Perspective Transform (CompositeTransform3D / PlaneProjection) & Effects
+    void SetTransform3D(const CompositeTransform3DParams& params);
+    [[nodiscard]] CompositeTransform3DParams GetTransform3D() const noexcept;
+    void ClearTransform3D();
+    [[nodiscard]] bool HasActiveTransform3D() const noexcept;
+    [[nodiscard]] bool HasAncestorOrSelfTransform3D() const noexcept;
+    [[nodiscard]] Matrix4x4 ComputeLocalEffectiveTransform3D() const noexcept;
+    [[nodiscard]] Matrix4x4 ComputeLocalEffectiveTransform3DForRect(const Rect& rectOverride) const noexcept;
+    [[nodiscard]] Matrix4x4 ComputeLocalToScreenMatrix3D() const noexcept;
+
+    void SetBlurEffect(float radiusPx);
+    void SetDropShadowEffect(
+        float blurRadiusPx,
+        float shadowDepthPx = 5.0f,
+        float directionDeg = 315.0f,
+        const Color& color = Color{0.0f, 0.0f, 0.0f, 1.0f},
+        float opacity = 1.0f);
+    void ClearEffect();
+    [[nodiscard]] UIEffectKind GetEffectKind() const noexcept;
+    [[nodiscard]] UIEffectDescriptor GetEffectDescriptor() const noexcept;
+
     [[nodiscard]] Thickness GetMargin() const noexcept {
         return Thickness{
             fastProps_.marginL,
@@ -509,6 +563,7 @@ public:
             fastProps_.marginR = m.right;
             fastProps_.marginB = m.bottom;
             InvalidateLayout();
+            if (mountedTemplate_) SyncTemplateBindingsForProperty(PropId_Margin);
         }
     }
 
@@ -527,6 +582,7 @@ public:
             fastProps_.paddingR = p.right;
             fastProps_.paddingB = p.bottom;
             InvalidateLayout();
+            if (mountedTemplate_) SyncTemplateBindingsForProperty(PropId_Padding);
         }
     }
 
@@ -536,6 +592,7 @@ public:
         if (fastProps_.opacity != v) {
             fastProps_.opacity = v;
             InvalidateRender();
+            if (mountedTemplate_) SyncTemplateBindingsForProperty(PropId_Opacity);
         }
     }
 
@@ -549,6 +606,7 @@ public:
             fastProps_.visibility = raw;
             InvalidateRender();
             InvalidateLayout();
+            if (mountedTemplate_) SyncTemplateBindingsForProperty(PropId_Visibility);
         }
     }
 
@@ -580,6 +638,44 @@ public:
 
     void SetStyleKey(std::string_view styleKey);
     [[nodiscard]] std::string GetStyleKey() const;
+
+    // P1-1: ControlTemplate mounting, TemplatedParent linkage, TemplateBinding & PART_* contract
+    [[nodiscard]] bool HasControlTemplate() const noexcept {
+        return mountedTemplate_ != nullptr;
+    }
+    [[nodiscard]] UIElement* TemplateRoot() const noexcept;
+    [[nodiscard]] const AxbControlTemplate* MountedControlTemplate() const noexcept;
+    [[nodiscard]] std::string GetControlTemplateKey() const;
+    void SetControlTemplateKey(std::string_view templateKey);
+
+    [[nodiscard]] UIElement* TemplatedParent() const noexcept { return templatedParent_; }
+    void SetTemplatedParent(UIElement* host) noexcept { templatedParent_ = host; }
+
+    bool ApplyControlTemplate(
+        const AxbControlTemplate& controlTemplate,
+        ExecutionDomainContext* domains = nullptr,
+        DualTrackBindingEngine* bindingEngine = nullptr,
+        ObjectRef dataContext = {},
+        const Interpreter* eventInterpreter = nullptr,
+        rs_aot::ExecutionContext* eventAotContext = nullptr,
+        AnimationEngine* animationEngine = nullptr);
+    bool ApplyControlTemplateByKey(std::string_view templateKey);
+    void ClearControlTemplate();
+
+    [[nodiscard]] UIElement* GetTemplateChild(std::string_view partName) const noexcept;
+    [[nodiscard]] const std::vector<IntrusivePtr<UIElement>>& LogicalTemplateContentChildren() const noexcept;
+
+    void AddTemplateBinding(
+        UIElement* target,
+        std::uint16_t sourcePropId,
+        std::uint16_t targetPropId,
+        ValueConverterKind converter);
+    void RegisterTemplateNamedPart(std::string_view partName, UIElement* partElement);
+    void RegisterTemplateContentPresenter(ContentPresenter* presenter);
+    void SyncTemplateBindingsForProperty(std::uint16_t changedPropId) noexcept;
+    void SyncTemplateBindingsForTarget(UIElement* target, std::uint16_t targetPropId) noexcept;
+    void RefreshAllTemplateBindings() noexcept;
+    void EnsureSparseSlotReserved(std::uint16_t propId);
 
     // Unified DependencyProperty read/write (fast inline for propId < 8 & alignments/interactive, 32B sparse entry for others)
     [[nodiscard]] UnifiedValue GetValue(std::uint16_t propId) const;
@@ -722,6 +818,16 @@ private:
     std::uint16_t fastActiveAnimMask_ = 0u;
     std::array<std::uint8_t, kFastInlinePropertySlotCount> fastInlineRanks_{};
 
+    struct MountedControlTemplateData;
+    [[nodiscard]] bool ReadTemplateSourceValueZeroAlloc(
+        std::uint16_t sourcePropId,
+        std::uint16_t changedPropId,
+        UnifiedValue& outVal) const noexcept;
+
+    UIElement* templatedParent_ = nullptr;
+    std::unique_ptr<MountedControlTemplateData> mountedTemplate_;
+    bool applyingControlTemplate_ = false;
+
     // High-frequency properties inline + 32B compact sparse vector
     FastInlineStorage fastProps_{};
     std::vector<CompactPropertyEntry> sparseProps_;
@@ -844,5 +950,13 @@ private:
 
 // Initialize built-in AeroGUI TypeClass hierarchy and Euler-tour intervals
 void EnsureBuiltinTypesRegistered() noexcept;
+
+// P1-2: Zero-ABI-overhead lifecycle & Loc.Source hooks for weak DynamicResource / Loc cleanup
+using UIElementDestroyHook = void (*)(const UIElement* element) noexcept;
+using UIElementLocSourceHook = void (*)(UIElement* element, std::string_view locSourceUri);
+
+void RegisterUIElementResourceHooks(
+    UIElementDestroyHook onDestroyed,
+    UIElementLocSourceHook onLocSourceChanged) noexcept;
 
 } // namespace aero

@@ -2,8 +2,10 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <utility>
 
 #include "aero/controls/Controls.hpp"
+#include "aero/render/FontAtlas.hpp"
 
 namespace aero {
 
@@ -73,13 +75,17 @@ EmbeddedGameHost::EmbeddedGameHost(
     UIElement* rootVisual,
     DualTrackBindingEngine* bindingEngine,
     DepthBucketLayoutQueue* layoutQueue,
-    PagedRenderTree* renderTree) noexcept
+    PagedRenderTree* renderTree,
+    std::shared_ptr<UiResourceContext> resourceContext) noexcept
     : rootVisual_(rootVisual)
     , bindingEngine_(bindingEngine)
     , layoutQueue_(layoutQueue)
-    , renderTree_(renderTree) {}
+    , renderTree_(renderTree)
+    , resourceContext_(std::move(resourceContext)) {}
 
 void EmbeddedGameHost::TickUi(float dt, std::uint32_t activePhaseMask) {
+    ScopedUiResourceContext resourceScope(resourceContext_);
+
     telemetry_.frameCount += 1u;
     telemetry_.lastActivePhaseMask = activePhaseMask;
 
@@ -100,7 +106,6 @@ void EmbeddedGameHost::TickUi(float dt, std::uint32_t activePhaseMask) {
 
     if ((activePhaseMask & UiPhase_TrackBBinding) != 0u && bindingEngine_) {
         if (renderTree_ && (activePhaseMask & UiPhase_Layout) == 0u) {
-            // Fast HUD Track B direct render-tree path (bypasses DP and LayoutEngine)
             telemetry_.trackBUpdates += renderTree_->BatchUpdateFromEcsTrackB(*bindingEngine_);
         } else {
             telemetry_.trackBUpdates += bindingEngine_->FlushTrackB();
@@ -142,8 +147,6 @@ void EmbeddedGameHost::TickUi(float dt, std::uint32_t activePhaseMask) {
         }
     }
 
-    // Automatically synchronize dirty UIElement nodes into PagedRenderTree in O(dirty_nodes)
-    // (Skipped on pure HUD fast-refresh frames where Track B writes directly to CommandPages)
     if (renderTree_ && rootVisual_ &&
         (activePhaseMask & UiPhase_RenderRecord) != 0u &&
         (activePhaseMask & UiPhase_Layout) != 0u) {
@@ -154,6 +157,7 @@ void EmbeddedGameHost::TickUi(float dt, std::uint32_t activePhaseMask) {
 ZeroCopySubmissionStats EmbeddedGameHost::RecordGpuCommands(
     PagedRenderTree& renderTree,
     ZeroCopyGpuStream& gpuStream) {
+    ScopedUiResourceContext resourceScope(resourceContext_);
     telemetry_.gpuStats = gpuStream.SubmitDirtyPages(renderTree);
     return telemetry_.gpuStats;
 }
@@ -166,11 +170,49 @@ DesktopEventHost::DesktopEventHost(
     UIElement* rootVisual,
     DualTrackBindingEngine* bindingEngine,
     DepthBucketLayoutQueue* layoutQueue,
-    PagedRenderTree* renderTree) noexcept
+    PagedRenderTree* renderTree,
+    std::shared_ptr<UiResourceContext> resourceContext) noexcept
     : rootVisual_(rootVisual)
     , bindingEngine_(bindingEngine)
     , layoutQueue_(layoutQueue)
-    , renderTree_(renderTree) {}
+    , renderTree_(renderTree)
+    , resourceContext_(std::move(resourceContext)) {
+    wakeRegisteredRegistry_ = resourceContext_
+        ? &resourceContext_->Templates()
+        : &AxbTemplateRegistry::Instance();
+    wakeRegisteredRegistry_->RegisterHostWakeListener(
+        this,
+        [](void* ud) noexcept {
+            static_cast<DesktopEventHost*>(ud)->NotifyDirtyLayout();
+        },
+        this);
+}
+
+DesktopEventHost::~DesktopEventHost() {
+    if (wakeRegisteredRegistry_ && AxbTemplateRegistry::IsLiveRegistry(wakeRegisteredRegistry_)) {
+        wakeRegisteredRegistry_->UnregisterHostWakeListener(this);
+    }
+    wakeRegisteredRegistry_ = nullptr;
+}
+
+void DesktopEventHost::SetResourceContext(std::shared_ptr<UiResourceContext> context) {
+    if (resourceContext_ == context) {
+        return;
+    }
+    if (wakeRegisteredRegistry_ && AxbTemplateRegistry::IsLiveRegistry(wakeRegisteredRegistry_)) {
+        wakeRegisteredRegistry_->UnregisterHostWakeListener(this);
+    }
+    resourceContext_ = std::move(context);
+    wakeRegisteredRegistry_ = resourceContext_
+        ? &resourceContext_->Templates()
+        : &AxbTemplateRegistry::Instance();
+    wakeRegisteredRegistry_->RegisterHostWakeListener(
+        this,
+        [](void* ud) noexcept {
+            static_cast<DesktopEventHost*>(ud)->NotifyDirtyLayout();
+        },
+        this);
+}
 
 void DesktopEventHost::SetStateFlags(
     bool hasActiveAnimations,
@@ -181,6 +223,9 @@ void DesktopEventHost::SetStateFlags(
     hasDirtyObjects_ = hasDirtyObjects;
     hasDirtyLayout_ = hasDirtyLayout;
     hasPendingInputEvents_ = hasPendingInputEvents;
+    if (hasActiveAnimations || hasDirtyObjects || hasDirtyLayout || hasPendingInputEvents) {
+        TriggerWake();
+    }
 }
 
 bool DesktopEventHost::CanSleepIdle() const noexcept {
@@ -205,6 +250,8 @@ bool DesktopEventHost::CanSleepIdle() const noexcept {
 }
 
 void DesktopEventHost::TickUi(float dt, std::uint32_t activePhaseMask) {
+    ScopedUiResourceContext resourceScope(resourceContext_);
+
     if (CanSleepIdle()) {
         // 0.0% CPU / 0.0% GPU polling when idle
         return;
@@ -300,6 +347,7 @@ void DesktopEventHost::TickUi(float dt, std::uint32_t activePhaseMask) {
 ZeroCopySubmissionStats DesktopEventHost::RecordGpuCommands(
     PagedRenderTree& renderTree,
     ZeroCopyGpuStream& gpuStream) {
+    ScopedUiResourceContext resourceScope(resourceContext_);
     if (renderTree.DirtyPageCount() == 0 && CanSleepIdle()) {
         return ZeroCopySubmissionStats{};
     }
@@ -308,8 +356,111 @@ ZeroCopySubmissionStats DesktopEventHost::RecordGpuCommands(
 }
 
 // ============================================================================
-// 3. WebImeAdapter & WebFontStreamProvider & WebCanvasHost
+// 3. DesktopImeAdapter, WebImeAdapter, WebFontStreamProvider & WebCanvasHost
 // ============================================================================
+
+void DesktopImeAdapter::FocusTextInput(UIElement* focusedElement, Rect caretScreenRect) {
+    if (focusedElement_ != focusedElement) {
+        isComposing_ = false;
+        preeditText_.clear();
+        caretOffset_ = 0u;
+        if (const auto* tbox = focusedElement ? focusedElement->DynamicCast<TextBox>() : nullptr) {
+            compositionBaseText_ = tbox->GetText();
+            compositionBaseCaret_ = tbox->GetCaretIndex();
+        } else {
+            compositionBaseText_.clear();
+            compositionBaseCaret_ = 0u;
+        }
+    }
+    focusedElement_ = focusedElement;
+    caretScreenRect_ = caretScreenRect;
+    imeFocused_ = (focusedElement != nullptr);
+    focusSyncCount_ += 1u;
+    if (spotSyncCallback_) {
+        spotSyncCallback_(caretScreenRect_, imeFocused_, spotSyncUserData_);
+    }
+}
+
+void DesktopImeAdapter::BlurTextInput() {
+    focusedElement_ = nullptr;
+    imeFocused_ = false;
+    isComposing_ = false;
+    preeditText_.clear();
+    compositionBaseText_.clear();
+    compositionBaseCaret_ = 0u;
+    if (spotSyncCallback_) {
+        spotSyncCallback_(caretScreenRect_, false, spotSyncUserData_);
+    }
+}
+
+void DesktopImeAdapter::OnCompositionStart() {
+    isComposing_ = true;
+    preeditText_.clear();
+    caretOffset_ = 0u;
+    if (auto* tbox = focusedElement_ ? focusedElement_->DynamicCast<TextBox>() : nullptr) {
+        compositionBaseText_ = tbox->GetText();
+        compositionBaseCaret_ = tbox->GetCaretIndex();
+        caretScreenRect_ = tbox->CaretScreenRect();
+        if (spotSyncCallback_) {
+            spotSyncCallback_(caretScreenRect_, true, spotSyncUserData_);
+        }
+    }
+}
+
+void DesktopImeAdapter::OnCompositionUpdate(std::string_view preeditText, std::uint32_t caretOffset) {
+    if (auto* tbox = focusedElement_ ? focusedElement_->DynamicCast<TextBox>() : nullptr) {
+        if (!isComposing_) {
+            compositionBaseText_ = tbox->GetText();
+            compositionBaseCaret_ = tbox->GetCaretIndex();
+            caretScreenRect_ = tbox->CaretScreenRect();
+        }
+        isComposing_ = true;
+        preeditText_.assign(preeditText);
+        caretOffset_ = caretOffset;
+
+        std::size_t bytePos = 0u;
+        std::size_t cpCount = 0u;
+        std::uint32_t cp = 0u;
+        while (cpCount < compositionBaseCaret_ && DecodeNextUtf8CodePoint(compositionBaseText_, bytePos, cp)) {
+            ++cpCount;
+        }
+        const std::string preview =
+            compositionBaseText_.substr(0, bytePos) + preeditText_ + compositionBaseText_.substr(bytePos);
+        tbox->SetText(preview);
+        caretScreenRect_ = tbox->CaretScreenRect();
+        if (spotSyncCallback_) {
+            spotSyncCallback_(caretScreenRect_, true, spotSyncUserData_);
+        }
+        return;
+    }
+
+    isComposing_ = true;
+    preeditText_.assign(preeditText);
+    caretOffset_ = caretOffset;
+}
+
+void DesktopImeAdapter::OnCompositionEnd(std::string_view committedText) {
+    const bool wasComposing = isComposing_;
+    isComposing_ = false;
+    preeditText_.clear();
+    committedText_ += std::string(committedText);
+    caretOffset_ = 0u;
+
+    if (auto* tbox = focusedElement_ ? focusedElement_->DynamicCast<TextBox>() : nullptr) {
+        if (wasComposing) {
+            tbox->SetText(compositionBaseText_);
+            tbox->SetCaretIndex(compositionBaseCaret_);
+        }
+        (void)tbox->InsertText(committedText);
+        compositionBaseText_ = tbox->GetText();
+        compositionBaseCaret_ = tbox->GetCaretIndex();
+        caretScreenRect_ = tbox->CaretScreenRect();
+        focusSyncCount_ += 1u;
+        if (spotSyncCallback_) {
+            spotSyncCallback_(caretScreenRect_, true, spotSyncUserData_);
+        }
+    }
+}
 
 void WebImeAdapter::FocusTextInput(UIElement* focusedElement, Rect caretScreenRect) {
     if (focusedElement_ != focusedElement) {
@@ -447,7 +598,6 @@ AriaShadowNode WebImeAdapter::BuildAriaShadowTree(const UIElement* rootElement) 
 }
 
 WebFontStreamProvider::WebFontStreamProvider() {
-    // Pre-load Basic ASCII shard (U+0000 .. U+00FF) at startup so Latin HUD text never stalls
     UnicodeShardDescriptor asciiShard{};
     asciiShard.shardId = 0u;
     asciiShard.rangeStart = 0x0000u;
@@ -513,13 +663,70 @@ std::size_t WebFontStreamProvider::InspectTextAndQueueMissingShards(
     return queuedCount;
 }
 
+bool WebFontStreamProvider::ExportShardPayloadForId(
+    std::uint32_t shardId,
+    std::string_view fontFamily,
+    std::vector<std::uint8_t>& outShardPayload) const {
+    const std::shared_ptr<UiResourceContext> boundCtx =
+        (UiResourceContext::ActiveOverride() == nullptr) ? resourceContext_.lock() : nullptr;
+    ScopedUiResourceContext resourceScope(boundCtx);
+    const std::uint32_t rangeStart = shardId << 8u;
+    const std::uint32_t rangeEnd = rangeStart + 0xFFu;
+    return FontAtlas::Instance().ExportGlyphShard(fontFamily, rangeStart, rangeEnd, outShardPayload);
+}
+
+bool WebFontStreamProvider::ExportRangeShardPayload(
+    std::string_view fontFamily,
+    std::uint32_t rangeStart,
+    std::uint32_t rangeEnd,
+    std::vector<std::uint8_t>& outShardPayload) {
+    return FontAtlas::Instance().ExportGlyphShard(fontFamily, rangeStart, rangeEnd, outShardPayload);
+}
+
 bool WebFontStreamProvider::OnShardDataArrived(
     std::uint32_t shardId,
     const std::vector<std::uint8_t>& shardPayload,
     PagedRenderTree* renderTreeToInvalidate) {
+    const std::shared_ptr<UiResourceContext> boundCtx =
+        (UiResourceContext::ActiveOverride() == nullptr) ? resourceContext_.lock() : nullptr;
+    ScopedUiResourceContext resourceScope(boundCtx);
+
+    if (shardPayload.empty()) {
+        return false;
+    }
+
+    bool hasBinaryHeader = false;
+    if (shardPayload.size() >= 4u) {
+        const std::uint32_t magic =
+            static_cast<std::uint32_t>(shardPayload[0]) |
+            (static_cast<std::uint32_t>(shardPayload[1]) << 8u) |
+            (static_cast<std::uint32_t>(shardPayload[2]) << 16u) |
+            (static_cast<std::uint32_t>(shardPayload[3]) << 24u);
+        hasBinaryHeader = (magic == kAeroFontShardMagic);
+    }
+
     auto it = shards_.find(shardId);
     if (it == shards_.end()) {
-        return false;
+        if (!hasBinaryHeader) {
+            return false;
+        }
+        (void)EnsureShardDescriptor(shardId << 8u);
+        it = shards_.find(shardId);
+    }
+
+    std::uint32_t unpackedStart = shardId << 8u;
+    std::uint32_t unpackedEnd = unpackedStart + 0xFFu;
+    std::size_t unpackedCount = 0u;
+    if (hasBinaryHeader) {
+        if (!FontAtlas::Instance().UnpackGlyphShard(
+                shardPayload.data(),
+                shardPayload.size(),
+                &unpackedStart,
+                &unpackedEnd,
+                &unpackedCount)) {
+            return false;
+        }
+        totalUnpackedGlyphs_ += unpackedCount;
     }
 
     UnicodeShardDescriptor& shard = it->second;
@@ -527,12 +734,22 @@ bool WebFontStreamProvider::OnShardDataArrived(
         shard.state = ShardLoadState::Loaded;
         shard.loadedByteSize = shardPayload.size();
         loadedShardCount_ += 1u;
+    } else {
+        shard.loadedByteSize = shardPayload.size();
+    }
+
+    if (hasBinaryHeader && renderTreeToInvalidate) {
+        (void)renderTreeToInvalidate->RefreshGlyphRange(unpackedStart, unpackedEnd);
     }
 
     for (auto reqIt = pendingRequests_.begin(); reqIt != pendingRequests_.end();) {
         if (reqIt->shardId == shardId) {
             if (renderTreeToInvalidate && reqIt->requestingRenderNodeId < renderTreeToInvalidate->NodeCount()) {
-                (void)renderTreeToInvalidate->InvalidateNodePage(reqIt->requestingRenderNodeId);
+                if (hasBinaryHeader) {
+                    (void)renderTreeToInvalidate->RefreshTextNode(reqIt->requestingRenderNodeId);
+                } else {
+                    (void)renderTreeToInvalidate->InvalidateNodePage(reqIt->requestingRenderNodeId);
+                }
             }
             reqIt = pendingRequests_.erase(reqIt);
         } else {
@@ -556,14 +773,56 @@ WebCanvasHost::WebCanvasHost(
     DualTrackBindingEngine* bindingEngine,
     DepthBucketLayoutQueue* layoutQueue,
     ShaderBackend webBackend,
-    PagedRenderTree* renderTree)
+    PagedRenderTree* renderTree,
+    std::shared_ptr<UiResourceContext> resourceContext)
     : rootVisual_(rootVisual)
     , bindingEngine_(bindingEngine)
     , layoutQueue_(layoutQueue)
     , renderTree_(renderTree)
-    , webBackend_(webBackend) {}
+    , resourceContext_(std::move(resourceContext))
+    , webBackend_(webBackend) {
+    fontStream_.SetResourceContext(resourceContext_);
+    wakeRegisteredRegistry_ = resourceContext_
+        ? &resourceContext_->Templates()
+        : &AxbTemplateRegistry::Instance();
+    wakeRegisteredRegistry_->RegisterHostWakeListener(
+        this,
+        [](void* ud) noexcept {
+            static_cast<WebCanvasHost*>(ud)->RequestWakeFrame();
+        },
+        this);
+}
+
+WebCanvasHost::~WebCanvasHost() {
+    if (wakeRegisteredRegistry_ && AxbTemplateRegistry::IsLiveRegistry(wakeRegisteredRegistry_)) {
+        wakeRegisteredRegistry_->UnregisterHostWakeListener(this);
+    }
+    wakeRegisteredRegistry_ = nullptr;
+}
+
+void WebCanvasHost::SetResourceContext(std::shared_ptr<UiResourceContext> context) {
+    if (resourceContext_ == context) {
+        return;
+    }
+    if (wakeRegisteredRegistry_ && AxbTemplateRegistry::IsLiveRegistry(wakeRegisteredRegistry_)) {
+        wakeRegisteredRegistry_->UnregisterHostWakeListener(this);
+    }
+    resourceContext_ = std::move(context);
+    fontStream_.SetResourceContext(resourceContext_);
+    wakeRegisteredRegistry_ = resourceContext_
+        ? &resourceContext_->Templates()
+        : &AxbTemplateRegistry::Instance();
+    wakeRegisteredRegistry_->RegisterHostWakeListener(
+        this,
+        [](void* ud) noexcept {
+            static_cast<WebCanvasHost*>(ud)->RequestWakeFrame();
+        },
+        this);
+}
 
 void WebCanvasHost::TickUi(float dt, std::uint32_t activePhaseMask) {
+    ScopedUiResourceContext resourceScope(resourceContext_);
+
     if ((inputRouter_ && inputRouter_->HasPendingEvents()) ||
         (bindingEngine_ && bindingEngine_->HasPendingDirtyObjects()) ||
         (animationEngine_ && animationEngine_->HasActiveAnimations())) {
@@ -643,7 +902,6 @@ void WebCanvasHost::TickUi(float dt, std::uint32_t activePhaseMask) {
         changes += synced;
     }
 
-    // Automatically suspend rAF if no IME composition, no pending font shards, and no dirty bindings/layout/render
     const bool animStillRunning = animationEngine_ && animationEngine_->HasActiveAnimations();
     if (changes == 0 && !animStillRunning && !imeAdapter_.IsComposing() && fontStream_.PendingFetchRequests().empty()) {
         rafState_ = WebRafState::SuspendedIdle;
@@ -653,6 +911,7 @@ void WebCanvasHost::TickUi(float dt, std::uint32_t activePhaseMask) {
 ZeroCopySubmissionStats WebCanvasHost::RecordGpuCommands(
     PagedRenderTree& renderTree,
     ZeroCopyGpuStream& gpuStream) {
+    ScopedUiResourceContext resourceScope(resourceContext_);
     gpuStream.SetBackend(webBackend_);
     telemetry_.gpuStats = gpuStream.SubmitDirtyPages(renderTree);
     return telemetry_.gpuStats;

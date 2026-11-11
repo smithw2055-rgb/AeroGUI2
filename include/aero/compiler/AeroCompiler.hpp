@@ -1,5 +1,6 @@
 #pragma once
 
+#include <functional>
 #include <memory>
 #include <string>
 #include <string_view>
@@ -14,6 +15,12 @@ namespace aero {
 
 using SourceFile = rs_comp::SourceFile;
 
+using ExternalXamlResolverFn = std::function<bool(
+    std::string_view requestedSource,
+    std::string_view currentXamlPath,
+    std::string& outResolvedPath,
+    std::string& outXamlContent)>;
+
 struct AeroCompileInput {
     std::string xamlPath = "MainView.xaml";
     std::string xamlContent;
@@ -21,6 +28,12 @@ struct AeroCompileInput {
     bool emitAotCpp = false;
     std::string aotCppNamespace = "aero::aot_generated";
     std::string aotViewBuilderName;
+
+    // P1-2: Optional cross-file ResourceDictionary.MergedDictionaries resolver & search roots
+    ExternalXamlResolverFn externalXamlResolver{};
+    std::string resourceSearchRoot;
+    std::vector<std::string> resourceSearchPaths;
+    bool autoMergeGlobalResources = true;
 };
 
 struct AeroViewAotCppOutput {
@@ -77,6 +90,11 @@ public:
     [[nodiscard]] static UnifiedValue ParseLiteralPropertyValue(
         std::uint16_t propId,
         std::string_view rawValue);
+
+private:
+    [[nodiscard]] AeroCompileResult CompileInternal(
+        const AeroCompileInput& input,
+        std::vector<std::string>& activeIncludeStack) const;
 };
 
 } // namespace aero

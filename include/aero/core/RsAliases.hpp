@@ -75,5 +75,8 @@ using DomainKind = rs_rt::DomainKind;
 using ExecutionDomainContext = rs_rt::ExecutionDomainContext;
 using SimCommandEnvelope = rs_rt::SimCommandEnvelope;
 using PropertySlotHandle = rs_game::PropertySlotHandle;
+using CollectionChangeKind = rs_rt::CollectionChangeKind;
+using CollectionChangeRecord = rs_rt::CollectionChangeRecord;
+using ObservableListHelper = rs_rt::ObservableListHelper;
 
 } // namespace aero

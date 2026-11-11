@@ -2,3 +2,4 @@
 	path = third-party/RealScript
 	url = https://github.com/smithw2055-rgb/RealScript.git
 	branch = AeroGUI-Integration
+	update = checkout

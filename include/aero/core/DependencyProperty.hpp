@@ -36,6 +36,18 @@ enum class VerticalAlignment : std::uint8_t {
     Bottom = 3,
 };
 
+enum class TextWrapping : std::uint8_t {
+    NoWrap = 0,
+    Wrap = 1,
+    WrapWithOverflow = 2,
+};
+
+enum class UIEffectKind : std::uint8_t {
+    None = 0,
+    Blur = 1,
+    DropShadow = 2,
+};
+
 enum class PointerButton : std::uint8_t {
     Left = 0,
     Right = 1,
@@ -189,6 +201,57 @@ enum BuiltinPropertyId : std::uint16_t {
     // Phase 6: Independent Orthogonal Skew Animation Channels & Multi-Frontend Contract Bridges
     PropId_AnimSkewX = 78,                  // float degrees (default 0.0f, composed around RenderTransformOrigin)
     PropId_AnimSkewY = 79,                  // float degrees (default 0.0f, composed around RenderTransformOrigin)
+    // P0-3: TrueType FontFamily & TextWrapping
+    PropId_FontFamily = 80,                 // StringValue (Font family name or XAML "./#Family" URI)
+    PropId_TextWrapping = 81,               // Int64 / TextWrapping enum (0 = NoWrap, 1 = Wrap, 2 = WrapWithOverflow)
+    // P1-1: ControlTemplate, TemplatedParent & Content Alignment (reserved range 90..95)
+    PropId_Template = 90,                   // StringValue (ControlTemplate resource key)
+    PropId_TemplatedParent = 91,            // TemplatedParent reference metadata
+    PropId_HorizontalContentAlignment = 92, // Int64 / HorizontalAlignment enum
+    PropId_VerticalContentAlignment = 93,   // Int64 / VerticalAlignment enum
+    PropId_ContentStringFormat = 94,        // StringValue (optional content format string)
+    // P1-2: MergedDictionaries & DynamicResource / Loc Live Localization (exclusive range 96..99)
+    PropId_MergedDictionarySource = 96,     // StringValue (ResourceDictionary Source URI)
+    PropId_LocSource = 97,                  // StringValue (noesis:Loc.Source / Loc.Source URI)
+    PropId_FlowDirection = 98,              // StringValue / Int64 (LeftToRight / RightToLeft)
+    // P1-3: Gradient Brushes, Geometric Primitives & Composite Controls [100 .. 119]
+    PropId_RadiusX = 100,                   // float (Rectangle.RadiusX)
+    PropId_RadiusY = 101,                   // float (Rectangle.RadiusY)
+    PropId_ShapePoints = 102,               // StringValue (Polygon.Points / Polyline.Points)
+    PropId_UniformRows = 103,               // Int64 / float (UniformGrid.Rows)
+    PropId_UniformColumns = 104,            // Int64 / float (UniformGrid.Columns)
+    PropId_FirstColumn = 105,               // Int64 / float (UniformGrid.FirstColumn)
+    PropId_IsExpanded = 106,                // bool (Expander.IsExpanded)
+    PropId_Header = 107,                    // StringValue / bool header-slot marker (HeaderedContentControl/GroupBox/Expander/TabItem)
+    PropId_BackgroundGradientId = 108,      // Int64 (GradientBrushRegistry brushId for Background / Fill)
+    PropId_StrokeThickness = 109,           // float (Shape.StrokeThickness)
+    PropId_ForegroundGradientId = 110,      // Int64 (GradientBrushRegistry brushId for Foreground)
+    PropId_BorderGradientId = 111,          // Int64 (GradientBrushRegistry brushId for BorderBrush / Stroke)
+    PropId_LineX1 = 112,                    // float (Line.X1)
+    PropId_LineY1 = 113,                    // float (Line.Y1)
+    PropId_LineX2 = 114,                    // float (Line.X2)
+    PropId_LineY2 = 115,                    // float (Line.Y2)
+    PropId_ExpandDirection = 116,           // Int64 (Expander.ExpandDirection: 0=Down, 1=Up, 2=Left, 3=Right)
+    PropId_IsIndeterminate = 117,           // bool (ProgressBar.IsIndeterminate)
+    PropId_TabStripPlacement = 118,         // Int64 (TabControl.TabStripPlacement: 0=Top, 1=Bottom, 2=Left, 3=Right)
+    PropId_ContentTemplate = 119,           // StringValue (TabControl.ContentTemplate DataTemplate key)
+    // P1-5: Exclusive BuiltinPropertyId range [130..145] for 3D Perspective, Blur/DropShadow Effects & RiveControl
+    PropId_Transform3DRotateXYZ = 130,      // Float4Value{rotXDeg, rotYDeg, rotZDeg, cameraDistance}
+    PropId_Transform3DTranslateXYZ = 131,   // Float4Value{tx, ty, tz, 0.0f}
+    PropId_Transform3DScaleXYZ = 132,       // Float4Value{sx, sy, sz, 1.0f}
+    PropId_Transform3DCenterXYZ = 133,      // Float4Value{cx, cy, cz, hasExplicitCenter}
+    PropId_EffectKind = 134,                // Int64 / UIEffectKind (0 = None, 1 = Blur, 2 = DropShadow)
+    PropId_EffectParams = 135,              // Float4Value{blurRadius, shadowDepth, directionDeg, opacity}
+    PropId_EffectColor = 136,               // Float4Value{r, g, b, a}
+    PropId_RiveSource = 137,                // StringValue (.riv binary asset source URI)
+    PropId_AnimRotation3DX = 138,           // float degrees (3D X-axis rotation channel)
+    PropId_AnimRotation3DY = 139,           // float degrees (3D Y-axis rotation channel)
+    PropId_AnimRotation3DZ = 140,           // float degrees (3D Z-axis rotation channel)
+    PropId_AnimTranslate3DX = 141,          // float px (3D X translation channel)
+    PropId_AnimTranslate3DY = 142,          // float px (3D Y translation channel)
+    PropId_AnimTranslate3DZ = 143,          // float px (3D Z translation channel)
+    PropId_EffectBlurRadius = 144,          // float px (bindable/animatable BlurRadius / Radius override)
+    PropId_EffectShadowDepth = 145,         // float px (bindable/animatable ShadowDepth override)
     PropId_FirstContractInput = 0x1000u,    // Dynamic/Contract input bridge slot range [0x1000 .. 0x1FFFu]
     // Pseudo-property IDs for zero-allocation inline interactive Trigger conditions
     PropId_TriggerIsMouseOver = 0xFF01u,

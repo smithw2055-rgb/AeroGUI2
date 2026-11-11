@@ -3,13 +3,16 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <string>
 #include <string_view>
+#include <unordered_map>
 #include <vector>
 
 #include "aero/binding/DualTrackBindingEngine.hpp"
 #include "aero/compiler/AxbFormat.hpp"
 #include "aero/core/UIElement.hpp"
 #include "aero/core/UnifiedValue.hpp"
+#include "aero/render/FontAtlas.hpp"
 
 namespace aero {
 
@@ -18,9 +21,23 @@ enum class AeroPrimType : std::uint16_t {
     SdfRoundedRect = 1,
     SdfTextGlyph = 2,
     TexturedQuad = 3,
-    MsdfVectorPath = 4, // 4-channel MTSDF Vector Path (4-vertex Quad, 0 CPU triangulation)
-    SdfRadialArc = 5,   // Analytical SDF Ring/Arc/Progressbar (startAngle, sweepAngle, innerRadius)
-    DynamicMesh = 6,    // Deformable 2D triangle strip/indexed quad mesh inside 4KB CommandPage
+    MsdfVectorPath = 4,      // 4-channel MTSDF Vector Path (4-vertex Quad, 0 CPU triangulation)
+    SdfRadialArc = 5,        // Analytical SDF Ring/Arc/Progressbar (startAngle, sweepAngle, innerRadius)
+    DynamicMesh = 6,         // Deformable 2D triangle strip/indexed quad mesh inside 4KB CommandPage
+    SdfEllipse = 7,          // Analytical SDF Ellipse / Circle fill & hollow stroke (P1-3)
+    GradientRoundedRect = 8, // Multi-stop Linear/Radial Gradient RoundedRect & Ellipse (P1-3)
+};
+
+// High-bit SDF sub-mode stored in bits [3..4] of AeroVertex::primType when (primType & 0x7u) == SdfRoundedRect:
+//   Mode 0: Compact uniform fast path (uniform CornerRadius + legacy single-quad borderThickness)
+//   Mode 1: Hollow SDF border ring with uniform CornerRadius (uniform or 4-side BorderThickness)
+//   Mode 2: Asymmetric 4-corner CornerRadius(topLeft, topRight, bottomRight, bottomLeft) pure fill
+//   Mode 3: Asymmetric 4-corner CornerRadius(topLeft, topRight, bottomRight, bottomLeft) hollow SDF border ring
+enum AeroSdfPrimMode : std::uint16_t {
+    AeroSdfPrimMode_UniformFast = 0u,
+    AeroSdfPrimMode_UniformHollowBorder = 1u,
+    AeroSdfPrimMode_AsymmetricFill = 2u,
+    AeroSdfPrimMode_AsymmetricHollowBorder = 3u,
 };
 
 enum AeroVertexFlags : std::uint16_t {
@@ -67,7 +84,11 @@ struct CommandPageHeader {
     float clipW = 16384.0f;
     float clipH = 16384.0f;
     std::uint32_t flags = 0;
+    // reserved[0] stores bound textureId (0 = default font/UI Skyline atlas, >0 = standalone texture handle)
     std::uint32_t reserved[3]{0, 0, 0};
+
+    [[nodiscard]] constexpr std::uint32_t TextureId() const noexcept { return reserved[0]; }
+    constexpr void SetTextureId(std::uint32_t texId) noexcept { reserved[0] = texId; }
 };
 
 static_assert(sizeof(CommandPageHeader) == 64, "CommandPageHeader must be exactly 64 bytes.");
@@ -119,19 +140,106 @@ struct RenderNodeDescriptor {
     float baseTy = 0.0f;
     float inheritedOpacity = 1.0f;
     std::uint32_t baseRgba = 0xFFFFFFFFu;
+    std::uint16_t encodedPrimExtra = 0; // High bits [3..15] OR'd into AeroVertex::primType for 4-corner/border SDF or gradientId
+    bool isHollowBorder = false;        // True when node renders an independent hollow BorderBrush/Stroke ring
+    bool isEllipseShape = false;        // True when GradientRoundedRect clips to analytical SDF Ellipse
+    std::uint32_t textureId = 0u;
+    std::uint32_t gradientBrushId = 0u; // Non-zero GradientBrushRegistry ID for AeroPrimType::GradientRoundedRect
     std::uint64_t mtsdfPathHash = 0;
     const UIElement* sourceElement = nullptr;
+    CornerRadius cornerRadii{};
+    Thickness borderThicknesses{};
+    // P1-5: 3D perspective planar homography & soft SDF shadow/blur parameters
+    bool hasPerspective3D = false;
+    float softFeatherPx = 0.0f;
+    float sdfPadPx = 0.0f;
+    Matrix4x4 worldMatrix3D{};
+};
+
+struct BlurLayerSpan {
+    std::uint32_t firstNodeId = 0u;
+    std::uint32_t endNodeId = 0u;
+    float radiusPx = 0.0f;
+    Rect clipRect{0.0f, 0.0f, 16384.0f, 16384.0f};
+    bool clipActive = false;
 };
 
 // Pack RGBA [0..1] floats into ABGR/RGBA 32-bit uint
 [[nodiscard]] std::uint32_t PackColorRgba8(const Color& color, float opacityMultiplier = 1.0f) noexcept;
 
-// Pack cornerRadius and borderThickness (in 0.5px steps, 0..127.5px) into 16-bit flags
+// Pack cornerRadius and borderThickness (in 0.5px steps, 0..127.5px) into 16-bit flags (uniform fast path)
 [[nodiscard]] std::uint16_t PackSdfRoundedRectParams(float cornerRadius, float borderThickness) noexcept;
 void UnpackSdfRoundedRectParams(
     std::uint16_t packed,
     float& outCornerRadius,
     float& outBorderThickness) noexcept;
+
+[[nodiscard]] constexpr bool IsUniformCornerRadius(const CornerRadius& cr) noexcept {
+    return cr.topLeft == cr.topRight &&
+           cr.topRight == cr.bottomRight &&
+           cr.bottomRight == cr.bottomLeft;
+}
+
+[[nodiscard]] constexpr bool IsUniformThickness(const Thickness& bt) noexcept {
+    return bt.left == bt.top &&
+           bt.top == bt.right &&
+           bt.right == bt.bottom;
+}
+
+// Pack 4-component CornerRadius + 4-side BorderThickness + hollow border mode into AeroVertex::primType[3..15] & flags[0..15]
+void PackSdfRoundedRectVertexParams(
+    const CornerRadius& cornerRadii,
+    const Thickness& borderThickness,
+    bool hollowBorder,
+    std::uint16_t& outPrimExtra,
+    std::uint16_t& outFlags) noexcept;
+
+void UnpackSdfRoundedRectVertexParams(
+    std::uint16_t vertexPrimType,
+    std::uint16_t vertexFlags,
+    CornerRadius& outCornerRadii,
+    Thickness& outBorderThickness,
+    bool& outHollowBorder) noexcept;
+
+// P1-3: Analytical SDF Ellipse / Circle vertex packing & CPU coverage reference
+[[nodiscard]] std::uint16_t PackSdfEllipseParams(
+    float strokeThickness,
+    bool hollowStroke) noexcept;
+void UnpackSdfEllipseParams(
+    std::uint16_t packedFlags,
+    float& outStrokeThickness,
+    bool& outHollowStroke) noexcept;
+[[nodiscard]] float EvaluateSdfEllipseCoverage(
+    float sampleLocalX,
+    float sampleLocalY,
+    float halfWidth,
+    float halfHeight,
+    float strokeThickness = 0.0f,
+    bool hollowStroke = false,
+    float aaFeatherWidth = 1.0f) noexcept;
+
+// P1-3: GradientRoundedRect vertex packing (12-bit brushId in primType[4..15] + cornerRadius & ellipse bit in flags)
+void PackGradientRoundedRectVertexParams(
+    std::uint32_t gradientBrushId,
+    float cornerRadius,
+    bool isEllipseShape,
+    std::uint16_t& outPrimExtra,
+    std::uint16_t& outFlags) noexcept;
+void UnpackGradientRoundedRectVertexParams(
+    std::uint16_t vertexPrimWord,
+    std::uint16_t vertexFlags,
+    std::uint32_t& outGradientBrushId,
+    float& outCornerRadius,
+    bool& outIsEllipseShape) noexcept;
+
+// Decode effective AeroPrimType from 16-bit AeroVertex::primType preserving P0-1 3-bit SdfRoundedRect extra modes
+[[nodiscard]] constexpr AeroPrimType DecodeVertexPrimType(std::uint16_t rawVertexPrim) noexcept {
+    const std::uint16_t low3 = static_cast<std::uint16_t>(rawVertexPrim & 0x0007u);
+    if (low3 == 0u && (rawVertexPrim & 0x0008u) != 0u) {
+        return AeroPrimType::GradientRoundedRect;
+    }
+    return static_cast<AeroPrimType>(low3);
+}
 
 // Pack MTSDF normalized UV range (in 1/4096 UV units), optional stroke width (bits 8..14), and strokeOnly bit (bit 15)
 [[nodiscard]] std::uint16_t PackMtsdfParams(
@@ -147,13 +255,32 @@ void UnpackMtsdfParams(
     return (packed & 0x8000u) != 0u;
 }
 
-// CPU reference evaluation matching the GPU UberShader SDF analytical rounded-rect anti-aliasing
+// CPU reference evaluation matching the GPU UberShader SDF analytical rounded-rect anti-aliasing (uniform fast path)
 [[nodiscard]] float EvaluateSdfRoundedRectCoverage(
     float sampleLocalX,
     float sampleLocalY,
     float halfWidth,
     float halfHeight,
     float cornerRadius,
+    float aaFeatherWidth = 1.0f) noexcept;
+
+// CPU reference evaluation matching GPU sdRoundedBox4(p, b, vec4(tr, br, tl, bl)) for asymmetric 4-corner CornerRadius
+[[nodiscard]] float EvaluateSdfRoundedRectCoverage(
+    float sampleLocalX,
+    float sampleLocalY,
+    float halfWidth,
+    float halfHeight,
+    const CornerRadius& cornerRadii,
+    float aaFeatherWidth = 1.0f) noexcept;
+
+// CPU reference evaluation for hollow SDF border rings with asymmetric 4-corner CornerRadius and 4-side BorderThickness
+[[nodiscard]] float EvaluateSdfRoundedBorderCoverage(
+    float sampleLocalX,
+    float sampleLocalY,
+    float halfWidth,
+    float halfHeight,
+    const CornerRadius& cornerRadii,
+    const Thickness& borderThickness,
     float aaFeatherWidth = 1.0f) noexcept;
 
 // CPU reference evaluation matching the GPU UberShader 4-channel MTSDF median(R,G,B) + fwidth AA
@@ -214,6 +341,52 @@ public:
         float borderThickness = 0.0f,
         const UIElement* owner = nullptr);
 
+    // Allocate a filled rounded-rect node supporting asymmetric 4-component CornerRadius(tl, tr, br, bl)
+    std::uint32_t AllocateRoundedRectNode(
+        float x,
+        float y,
+        float width,
+        float height,
+        const Color& color,
+        const CornerRadius& cornerRadii,
+        const UIElement* owner = nullptr);
+
+    // Allocate an analytical hollow SDF border ring node supporting independent BorderBrush, 4-corner radii & 4-side thickness
+    std::uint32_t AllocateBorderRingNode(
+        float x,
+        float y,
+        float width,
+        float height,
+        const Color& borderColor,
+        const CornerRadius& cornerRadii,
+        const Thickness& borderThickness,
+        const UIElement* owner = nullptr);
+
+    // P1-3: Allocate an analytical SDF Ellipse / Circle node (fill or hollow stroke ring)
+    std::uint32_t AllocateEllipseNode(
+        float x,
+        float y,
+        float width,
+        float height,
+        const Color& color,
+        float strokeThickness = 0.0f,
+        bool hollowStroke = false,
+        float opacity = 1.0f,
+        const UIElement* owner = nullptr);
+
+    // P1-3: Allocate a multi-stop Linear/Radial Gradient RoundedRect (or Ellipse) node
+    std::uint32_t AllocateGradientRoundedRectNode(
+        float x,
+        float y,
+        float width,
+        float height,
+        std::uint32_t gradientBrushId,
+        const CornerRadius& cornerRadii = CornerRadius{},
+        bool isEllipseShape = false,
+        const Color& tintModulator = Color{1.0f, 1.0f, 1.0f, 1.0f},
+        float opacity = 1.0f,
+        const UIElement* owner = nullptr);
+
     // Allocate a multi-digit HUD numeric node backed by pre-cached glyph UVs (0 font shaping)
     std::uint32_t AllocateHudDigitsNode(
         float x,
@@ -223,7 +396,7 @@ public:
         std::uint32_t maxDigits,
         const Color& color);
 
-    // Allocate a general UTF-8 SdfTextGlyph run node (supports ASCII + CJK codePoints, up to 42 glyphs/page)
+    // Allocate a general UTF-8 SdfTextGlyph run node (supports TTF/SDF FontAtlas, wrapping & CJK shards, up to 42 glyphs/page)
     std::uint32_t AllocateTextRunNode(
         float x,
         float y,
@@ -232,7 +405,10 @@ public:
         const Color& color,
         float opacity = 1.0f,
         std::uint32_t reservedGlyphCapacity = 0,
-        const UIElement* owner = nullptr);
+        const UIElement* owner = nullptr,
+        std::string_view fontFamily = {},
+        float maxWidth = 1000000.0f,
+        TextWrapping wrapMode = TextWrapping::NoWrap);
 
     // Allocate a 4-vertex 4-channel MTSDF vector path quad (0 CPU triangulation)
     std::uint32_t AllocateMtsdfPathNode(
@@ -246,7 +422,7 @@ public:
         float opacity = 1.0f,
         const UIElement* owner = nullptr);
 
-    // Allocate a 4-vertex textured image quad
+    // Allocate a 4-vertex textured image quad (default textureId = 0 shared UI atlas)
     std::uint32_t AllocateTexturedNode(
         float x,
         float y,
@@ -259,6 +435,21 @@ public:
         const Color& tintColor,
         float opacity = 1.0f,
         const UIElement* owner = nullptr);
+
+    // Allocate a 4-vertex textured image quad bound to an explicit textureId slot
+    std::uint32_t AllocateTexturedNode(
+        float x,
+        float y,
+        float width,
+        float height,
+        float u0,
+        float v0,
+        float u1,
+        float v1,
+        const Color& tintColor,
+        float opacity,
+        const UIElement* owner,
+        std::uint32_t textureId);
 
     // Allocate a 4-vertex analytical SDF radial arc / ring / gauge quad (0 CPU tessellation)
     std::uint32_t AllocateRadialArcNode(
@@ -309,8 +500,13 @@ public:
         float fontSize,
         std::string_view utf8Text,
         const Color& color,
-        float opacity) noexcept;
+        float opacity,
+        std::string_view fontFamily = {},
+        float maxWidth = 1000000.0f,
+        TextWrapping wrapMode = TextWrapping::NoWrap) noexcept;
     bool InvalidateNodePage(std::uint32_t nodeId) noexcept;
+    bool RefreshTextNode(std::uint32_t nodeId) noexcept;
+    std::size_t RefreshGlyphRange(std::uint32_t rangeStart, std::uint32_t rangeEnd) noexcept;
     bool UpdateDirtyElement(const UIElement* element) noexcept;
 
     // Track B (EcsColumnSimdTrack) direct zero-allocation batch update:
@@ -338,6 +534,9 @@ public:
     [[nodiscard]] const RenderNodeDescriptor* GetNode(std::uint32_t nodeId) const noexcept {
         return (nodeId < nodes_.size()) ? &nodes_[nodeId] : nullptr;
     }
+    [[nodiscard]] const std::vector<BlurLayerSpan>& BlurLayerSpans() const noexcept {
+        return blurLayerSpans_;
+    }
 
     // Dirty 4KB page tracking
     [[nodiscard]] bool IsPageDirty(std::size_t pageIndex) const noexcept;
@@ -352,6 +551,10 @@ public:
         return preCachedGlyphs_[idx];
     }
     [[nodiscard]] GlyphUvRect LookupCodePointGlyph(std::uint32_t codePoint) const noexcept;
+    [[nodiscard]] GlyphUvRect LookupFontGlyph(
+        std::string_view fontFamily,
+        std::uint32_t codePoint,
+        float fontSize = 14.0f) const noexcept;
 
 private:
     struct RenderTraversalState {
@@ -364,25 +567,26 @@ private:
         float m11 = 1.0f;
         float tx = 0.0f;
         float ty = 0.0f;
+        bool hasPerspective3D = false;
+        Matrix4x4 world3D{};
     };
 
     void InitPreCachedDigitGlyphs() noexcept;
     std::uint32_t EnsurePageForAllocation(
         std::uint32_t neededVertices,
         const Rect& clipRect,
-        bool clipActive);
+        bool clipActive,
+        std::uint32_t textureId = 0u);
     void WriteQuadVertices(RenderNodeDescriptor& node) noexcept;
     void ZeroOutNodeVertices(RenderNodeDescriptor& node) noexcept;
     void MarkPageDirty(std::uint32_t pageIndex, std::uint16_t vertexOffsetInPage) noexcept;
-    bool UpdateTextRunNodeSlice(
+    bool WriteLayoutGlyphSlice(
         std::uint32_t nodeId,
         float x,
         float y,
         float fontSize,
-        std::string_view utf8Text,
-        std::size_t& ioUtf8Cursor,
-        float& ioLocalPenX,
-        float& ioLocalPenY,
+        const TextLayoutResult& layout,
+        std::size_t& ioGlyphCursor,
         const Color& color,
         float opacity) noexcept;
     std::uint16_t EmitTextRunNodes(
@@ -393,7 +597,10 @@ private:
         const Color& color,
         float opacity,
         const RenderTraversalState& curState,
-        const UIElement* owner);
+        const UIElement* owner,
+        std::string_view fontFamily = {},
+        float maxWidth = 1000000.0f,
+        TextWrapping wrapMode = TextWrapping::NoWrap);
     bool UpdateElementInPlace(
         const UIElement* element,
         const RenderTraversalState& curState);
@@ -424,7 +631,21 @@ private:
     std::vector<std::uint8_t> pageDirtyFlags_;
     std::vector<std::uint32_t> dirtyPageList_;
     std::vector<DeferredComboPopup> pendingComboPopups_;
+    struct StandaloneTextRunRecord {
+        float x = 0.0f;
+        float y = 0.0f;
+        float fontSize = 14.0f;
+        std::string utf8Text;
+        std::string fontFamily;
+        Color color{1.0f, 1.0f, 1.0f, 1.0f};
+        float opacity = 1.0f;
+        float maxWidth = 1000000.0f;
+        TextWrapping wrapMode = TextWrapping::NoWrap;
+    };
+
+    std::vector<BlurLayerSpan> blurLayerSpans_;
     std::vector<const UIElement*> activeComboPopupOwners_;
+    std::unordered_map<std::uint32_t, StandaloneTextRunRecord> standaloneTextRuns_;
     std::array<GlyphUvRect, 128> preCachedGlyphs_{};
 };
 

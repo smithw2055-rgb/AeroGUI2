@@ -622,6 +622,15 @@ std::uint16_t AnimationEngine::StartTimeline(
     UIElement* target = timeline.targetName.empty()
         ? scopeRoot
         : scopeRoot->FindName(timeline.targetName);
+    if (!target && !timeline.targetName.empty()) {
+        UIElement* treeRoot = scopeRoot;
+        while (treeRoot->Parent() != nullptr) {
+            treeRoot = treeRoot->Parent();
+        }
+        if (treeRoot != scopeRoot) {
+            target = treeRoot->FindName(timeline.targetName);
+        }
+    }
     if (!target) {
         return InvalidTrackId;
     }
@@ -760,6 +769,29 @@ std::uint16_t AnimationEngine::StartTimeline(
         timeline.repeatCount);
 }
 
+namespace {
+
+[[nodiscard]] UIElement* ResolveStoryboardTimelineTarget(
+    UIElement* scopeRoot,
+    std::string_view targetName) noexcept {
+    if (!scopeRoot) {
+        return nullptr;
+    }
+    if (targetName.empty()) {
+        return scopeRoot;
+    }
+    if (UIElement* local = scopeRoot->FindName(targetName)) {
+        return local;
+    }
+    UIElement* treeRoot = scopeRoot;
+    while (treeRoot->Parent() != nullptr) {
+        treeRoot = treeRoot->Parent();
+    }
+    return (treeRoot != scopeRoot) ? treeRoot->FindName(targetName) : nullptr;
+}
+
+} // namespace
+
 std::size_t AnimationEngine::BeginStoryboard(
     UIElement* scopeRoot,
     const AxbStoryboard& storyboard) {
@@ -773,6 +805,114 @@ std::size_t AnimationEngine::BeginStoryboard(
         }
     }
     return started;
+}
+
+std::size_t AnimationEngine::StopStoryboard(
+    UIElement* scopeRoot,
+    const AxbStoryboard& storyboard,
+    bool restoreBaseValue) noexcept {
+    if (!scopeRoot) {
+        return 0u;
+    }
+    std::size_t stopped = 0u;
+    for (const auto& tl : storyboard.timelines) {
+        UIElement* target = ResolveStoryboardTimelineTarget(scopeRoot, tl.targetName);
+        if (target && StopPropertyAnimation(target, tl.targetPropertyId, restoreBaseValue)) {
+            ++stopped;
+        }
+    }
+    return stopped;
+}
+
+std::size_t AnimationEngine::TogglePlayPauseStoryboard(
+    UIElement* scopeRoot,
+    const AxbStoryboard& storyboard) {
+    if (!scopeRoot) {
+        return 0u;
+    }
+    bool anyActive = false;
+    bool anyUnpaused = false;
+    for (const auto& tl : storyboard.timelines) {
+        UIElement* target = ResolveStoryboardTimelineTarget(scopeRoot, tl.targetName);
+        if (!target) {
+            continue;
+        }
+        const std::uint16_t id = FindActiveTrackId(target, tl.targetPropertyId);
+        if (id != InvalidTrackId && id < tracks_.size() &&
+            tracks_[id].kind != AnimationTrackKind::Inactive) {
+            anyActive = true;
+            if (!tracks_[id].paused) {
+                anyUnpaused = true;
+            }
+        }
+    }
+
+    if (!anyActive) {
+        return BeginStoryboard(scopeRoot, storyboard);
+    }
+
+    const bool nextPaused = anyUnpaused;
+    std::size_t toggled = 0u;
+    for (const auto& tl : storyboard.timelines) {
+        UIElement* target = ResolveStoryboardTimelineTarget(scopeRoot, tl.targetName);
+        if (!target) {
+            continue;
+        }
+        const std::uint16_t id = FindActiveTrackId(target, tl.targetPropertyId);
+        if (id != InvalidTrackId && id < tracks_.size() &&
+            tracks_[id].kind != AnimationTrackKind::Inactive) {
+            tracks_[id].paused = nextPaused;
+            ++toggled;
+        }
+    }
+    if (!nextPaused && toggled > 0u && wakeHostCallback_) {
+        wakeHostCallback_();
+    }
+    return toggled;
+}
+
+bool AnimationEngine::IsStoryboardActive(
+    UIElement* scopeRoot,
+    const AxbStoryboard& storyboard) const noexcept {
+    if (!scopeRoot) {
+        return false;
+    }
+    for (const auto& tl : storyboard.timelines) {
+        UIElement* target = ResolveStoryboardTimelineTarget(scopeRoot, tl.targetName);
+        if (!target) {
+            continue;
+        }
+        const std::uint16_t id = FindActiveTrackId(target, tl.targetPropertyId);
+        if (id != InvalidTrackId && id < tracks_.size() &&
+            tracks_[id].kind != AnimationTrackKind::Inactive) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool AnimationEngine::IsStoryboardPaused(
+    UIElement* scopeRoot,
+    const AxbStoryboard& storyboard) const noexcept {
+    if (!scopeRoot) {
+        return false;
+    }
+    bool anyActive = false;
+    for (const auto& tl : storyboard.timelines) {
+        UIElement* target = ResolveStoryboardTimelineTarget(scopeRoot, tl.targetName);
+        if (!target) {
+            continue;
+        }
+        const std::uint16_t id = FindActiveTrackId(target, tl.targetPropertyId);
+        if (id != InvalidTrackId && id < tracks_.size() &&
+            tracks_[id].kind != AnimationTrackKind::Inactive) {
+            anyActive = true;
+            if (!tracks_[id].paused) {
+                return false;
+            }
+        }
+    }
+    return anyActive;
 }
 
 bool AnimationEngine::StopPropertyAnimation(
@@ -1980,6 +2120,9 @@ std::size_t AnimationEngine::Tick(float dtSeconds) noexcept {
         UIElement* target = tr.target.Get();
         if (!target) {
             ReleaseTrackSlot(tr, false);
+            continue;
+        }
+        if (tr.paused) {
             continue;
         }
 

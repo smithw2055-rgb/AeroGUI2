@@ -32,6 +32,7 @@ struct GpuClipDrawBatch {
     std::uint32_t firstPageIndex = 0;
     std::uint32_t pageCount = 0;
     std::uint32_t vertexCount = 0;
+    std::uint32_t textureId = 0; // 0 = default font/UI Skyline atlas, >0 = standalone texture handle
     bool scissorActive = false;
     Rect scissorRect{0.0f, 0.0f, 16384.0f, 16384.0f};
 };
@@ -82,8 +83,8 @@ public:
     [[nodiscard]] const AeroVertex* MappedPageVertices(std::size_t pageIndex) const noexcept;
     [[nodiscard]] std::size_t RingCapacityBytes() const noexcept { return ringCapacityBytes_; }
 
-    // Headless software UberShader rasterizer matching GPU UberShader SDF/MTSDF/Scissor math
-    // for deterministic CI Golden Image pixel verification without a display server.
+    // Headless software UberShader rasterizer matching GPU UberShader SDF (sdRoundedBox / sdRoundedBox4 /
+    // hollow BorderBrush ring) / MTSDF / Scissor math for deterministic CI Golden Image pixel verification.
     static void RasterizeTreeToRgba8(
         const PagedRenderTree& tree,
         std::uint32_t viewportWidth,

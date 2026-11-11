@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <string_view>
@@ -57,6 +58,20 @@ enum class ScrollBarVisibility : std::uint8_t {
     Auto = 1,
     Hidden = 2,
     Visible = 3,
+};
+
+enum class ExpandDirection : std::uint8_t {
+    Down = 0,
+    Up = 1,
+    Left = 2,
+    Right = 3,
+};
+
+enum class TabStripPlacement : std::uint8_t {
+    Top = 0,
+    Bottom = 1,
+    Left = 2,
+    Right = 3,
 };
 
 struct RowDefinition {
@@ -335,8 +350,36 @@ public:
     void SetFontSize(float fontSize);
     [[nodiscard]] float GetFontSize() const noexcept;
 
+    void SetFontFamily(std::string_view fontFamily);
+    [[nodiscard]] std::string GetFontFamily() const;
+
+    void SetTextWrapping(TextWrapping wrapping);
+    [[nodiscard]] TextWrapping GetTextWrapping() const noexcept;
+
     void SetForeground(const Color& color);
     [[nodiscard]] Color GetForeground() const noexcept;
+
+    Size MeasureCore(Size availableSize) noexcept override;
+};
+
+class ContentPresenter : public Panel {
+public:
+    ContentPresenter();
+    ~ContentPresenter() override = default;
+
+    static const TypeClass* StaticTypeClass() noexcept;
+    [[nodiscard]] const TypeClass* GetTypeClass() const noexcept override {
+        return StaticTypeClass();
+    }
+
+    [[nodiscard]] std::string GetEffectiveText() const;
+    [[nodiscard]] Color GetEffectiveForeground() const noexcept;
+    [[nodiscard]] float GetEffectiveFontSize() const noexcept;
+    [[nodiscard]] std::string GetEffectiveFontFamily() const;
+    [[nodiscard]] TextWrapping GetEffectiveTextWrapping() const noexcept;
+    [[nodiscard]] HorizontalAlignment GetEffectiveHorizontalContentAlignment() const noexcept;
+    [[nodiscard]] VerticalAlignment GetEffectiveVerticalContentAlignment() const noexcept;
+    [[nodiscard]] Point ComputeTextOrigin(const Rect& boxRect, Size textSize) const noexcept;
 
     Size MeasureCore(Size availableSize) noexcept override;
 };
@@ -365,7 +408,7 @@ public:
         checkedChangedCallback_ = std::move(callback);
     }
 
-    bool ActivateFromInput(RuntimeError* error = nullptr) override;
+    bool ActivateFromInput(RuntimeError* error = nullptr);
     Size MeasureCore(Size availableSize) noexcept override;
     void ArrangeCore(Rect finalRect) noexcept override;
 
@@ -396,7 +439,7 @@ public:
     }
 
     void OnPropertyChanged(std::uint16_t propId, const UnifiedValue& newValue) override;
-    bool ActivateFromInput(RuntimeError* error = nullptr) override;
+    bool ActivateFromInput(RuntimeError* error = nullptr);
     Size MeasureCore(Size availableSize) noexcept override;
     void ArrangeCore(Rect finalRect) noexcept override;
 
@@ -459,9 +502,12 @@ public:
         std::uint8_t modifiers,
         bool insideBounds) override;
     bool OnKeyDown(KeyCode key, std::uint8_t modifiers) override;
+    void OnPropertyChanged(std::uint16_t propId, const UnifiedValue& newValue) override;
     void OnPointerCaptureLost() noexcept override;
     void OnEnabledStateChanged(bool effectivelyEnabled) override;
     Size MeasureCore(Size availableSize) noexcept override;
+    void ArrangeCore(Rect finalRect) noexcept override;
+    void SyncTemplateParts() noexcept;
 
 private:
     bool UpdateValueFromLocalPoint(Point localPt);
@@ -574,6 +620,392 @@ public:
     Size MeasureCore(Size availableSize) noexcept override;
 };
 
+// ============================================================================
+// P1-3 Geometric Primitives: Rectangle, Ellipse, Line, Polygon, Polyline
+// ============================================================================
+
+class Rectangle : public UIElement {
+public:
+    Rectangle();
+    ~Rectangle() override = default;
+
+    static const TypeClass* StaticTypeClass() noexcept;
+    [[nodiscard]] const TypeClass* GetTypeClass() const noexcept override {
+        return StaticTypeClass();
+    }
+
+    void SetRadiusX(float rx);
+    [[nodiscard]] float GetRadiusX() const noexcept;
+
+    void SetRadiusY(float ry);
+    [[nodiscard]] float GetRadiusY() const noexcept;
+
+    [[nodiscard]] float EffectiveCornerRadius() const noexcept;
+
+    void SetFill(const Color& color);
+    [[nodiscard]] Color GetFill() const noexcept;
+    [[nodiscard]] bool HasFill() const noexcept;
+    void SetFillGradientBrushId(std::uint32_t brushId);
+    [[nodiscard]] std::uint32_t GetFillGradientBrushId() const noexcept;
+
+    void SetStroke(const Color& color);
+    [[nodiscard]] Color GetStroke() const noexcept;
+    [[nodiscard]] bool HasStroke() const noexcept;
+    [[nodiscard]] std::uint32_t GetStrokeGradientBrushId() const noexcept;
+
+    void SetStrokeThickness(float thickness);
+    [[nodiscard]] float GetStrokeThickness() const noexcept;
+
+    Size MeasureCore(Size availableSize) noexcept override;
+};
+
+class Ellipse : public UIElement {
+public:
+    Ellipse();
+    ~Ellipse() override = default;
+
+    static const TypeClass* StaticTypeClass() noexcept;
+    [[nodiscard]] const TypeClass* GetTypeClass() const noexcept override {
+        return StaticTypeClass();
+    }
+
+    void SetFill(const Color& color);
+    [[nodiscard]] Color GetFill() const noexcept;
+    [[nodiscard]] bool HasFill() const noexcept;
+    void SetFillGradientBrushId(std::uint32_t brushId);
+    [[nodiscard]] std::uint32_t GetFillGradientBrushId() const noexcept;
+
+    void SetStroke(const Color& color);
+    [[nodiscard]] Color GetStroke() const noexcept;
+    [[nodiscard]] bool HasStroke() const noexcept;
+
+    void SetStrokeThickness(float thickness);
+    [[nodiscard]] float GetStrokeThickness() const noexcept;
+
+    Size MeasureCore(Size availableSize) noexcept override;
+};
+
+class Line : public UIElement {
+public:
+    Line();
+    ~Line() override = default;
+
+    static const TypeClass* StaticTypeClass() noexcept;
+    [[nodiscard]] const TypeClass* GetTypeClass() const noexcept override {
+        return StaticTypeClass();
+    }
+
+    void SetX1(float x1);
+    [[nodiscard]] float GetX1() const noexcept;
+
+    void SetY1(float y1);
+    [[nodiscard]] float GetY1() const noexcept;
+
+    void SetX2(float x2);
+    [[nodiscard]] float GetX2() const noexcept;
+
+    void SetY2(float y2);
+    [[nodiscard]] float GetY2() const noexcept;
+
+    void SetStroke(const Color& color);
+    [[nodiscard]] Color GetStroke() const noexcept;
+    [[nodiscard]] bool HasStroke() const noexcept;
+
+    void SetStrokeThickness(float thickness);
+    [[nodiscard]] float GetStrokeThickness() const noexcept;
+
+    Size MeasureCore(Size availableSize) noexcept override;
+};
+
+class Polygon : public Path {
+public:
+    Polygon();
+    ~Polygon() override = default;
+
+    static const TypeClass* StaticTypeClass() noexcept;
+    [[nodiscard]] const TypeClass* GetTypeClass() const noexcept override {
+        return StaticTypeClass();
+    }
+
+    void SetPoints(std::string_view pointsText);
+    [[nodiscard]] std::string GetPoints() const;
+
+    void OnPropertyChanged(std::uint16_t propId, const UnifiedValue& newValue) override;
+};
+
+class Polyline : public Path {
+public:
+    Polyline();
+    ~Polyline() override = default;
+
+    static const TypeClass* StaticTypeClass() noexcept;
+    [[nodiscard]] const TypeClass* GetTypeClass() const noexcept override {
+        return StaticTypeClass();
+    }
+
+    void SetPoints(std::string_view pointsText);
+    [[nodiscard]] std::string GetPoints() const;
+
+    void OnPropertyChanged(std::uint16_t propId, const UnifiedValue& newValue) override;
+};
+
+// ============================================================================
+// P1-3 Composite Layout & Interactive Controls
+// ============================================================================
+
+class UniformGrid : public Panel {
+public:
+    UniformGrid();
+    ~UniformGrid() override = default;
+
+    static const TypeClass* StaticTypeClass() noexcept;
+    [[nodiscard]] const TypeClass* GetTypeClass() const noexcept override {
+        return StaticTypeClass();
+    }
+
+    void SetRows(std::int32_t rows);
+    [[nodiscard]] std::int32_t GetRows() const noexcept;
+
+    void SetColumns(std::int32_t cols);
+    [[nodiscard]] std::int32_t GetColumns() const noexcept;
+
+    void SetFirstColumn(std::int32_t firstCol);
+    [[nodiscard]] std::int32_t GetFirstColumn() const noexcept;
+
+    void ComputeEffectiveGridDimensions(
+        std::size_t nonCollapsedChildCount,
+        std::int32_t& outRows,
+        std::int32_t& outCols,
+        std::int32_t& outFirstCol) const noexcept;
+
+    Size MeasureCore(Size availableSize) noexcept override;
+    void ArrangeCore(Rect finalRect) noexcept override;
+};
+
+class ProgressBar : public UIElement {
+public:
+    ProgressBar();
+    ~ProgressBar() override = default;
+
+    static const TypeClass* StaticTypeClass() noexcept;
+    [[nodiscard]] const TypeClass* GetTypeClass() const noexcept override {
+        return StaticTypeClass();
+    }
+
+    void SetMinimum(float minVal);
+    [[nodiscard]] float GetMinimum() const noexcept;
+
+    void SetMaximum(float maxVal);
+    [[nodiscard]] float GetMaximum() const noexcept;
+
+    void SetProgressValue(float val);
+    [[nodiscard]] float GetProgressValue() const noexcept;
+
+    void SetOrientation(Orientation o);
+    [[nodiscard]] Orientation GetOrientation() const noexcept;
+
+    void SetIsIndeterminate(bool indeterminate);
+    [[nodiscard]] bool IsIndeterminate() const noexcept;
+
+    [[nodiscard]] float NormalizedProgress() const noexcept;
+    [[nodiscard]] Rect ComputeFillBarLocalRect() const noexcept;
+
+    Size MeasureCore(Size availableSize) noexcept override;
+};
+
+class HeaderedContentControl : public Panel {
+public:
+    static constexpr float kDefaultHeaderBarHeight = 26.0f;
+
+    HeaderedContentControl();
+    ~HeaderedContentControl() override = default;
+
+    static const TypeClass* StaticTypeClass() noexcept;
+    [[nodiscard]] const TypeClass* GetTypeClass() const noexcept override {
+        return StaticTypeClass();
+    }
+
+    void SetHeader(std::string_view header);
+    [[nodiscard]] std::string GetHeader() const;
+
+    void SetHeaderElement(UIElement* headerElem) noexcept;
+    [[nodiscard]] UIElement* GetHeaderElement() const noexcept;
+    [[nodiscard]] bool HasHeader() const noexcept;
+
+    [[nodiscard]] Rect HeaderLocalRect() const noexcept { return headerLocalRect_; }
+    [[nodiscard]] Rect ContentLocalRect() const noexcept { return contentLocalRect_; }
+
+    Size MeasureCore(Size availableSize) noexcept override;
+    void ArrangeCore(Rect finalRect) noexcept override;
+
+protected:
+    Rect headerLocalRect_{};
+    Rect contentLocalRect_{};
+    UIElement* headerElement_ = nullptr;
+};
+
+class GroupBox : public HeaderedContentControl {
+public:
+    GroupBox();
+    ~GroupBox() override = default;
+
+    static const TypeClass* StaticTypeClass() noexcept;
+    [[nodiscard]] const TypeClass* GetTypeClass() const noexcept override {
+        return StaticTypeClass();
+    }
+
+    [[nodiscard]] Rect BodyBorderLocalRect() const noexcept { return bodyBorderLocalRect_; }
+
+    Size MeasureCore(Size availableSize) noexcept override;
+    void ArrangeCore(Rect finalRect) noexcept override;
+
+private:
+    Rect bodyBorderLocalRect_{};
+};
+
+class Expander : public HeaderedContentControl {
+public:
+    using ExpandedChangedCallback = std::function<void(Expander&, bool)>;
+    static constexpr float kDefaultExpanderHeaderHeight = 28.0f;
+
+    Expander();
+    ~Expander() override = default;
+
+    static const TypeClass* StaticTypeClass() noexcept;
+    [[nodiscard]] const TypeClass* GetTypeClass() const noexcept override {
+        return StaticTypeClass();
+    }
+
+    [[nodiscard]] bool DefaultFocusable() const noexcept override { return true; }
+
+    void SetIsExpanded(bool expanded);
+    [[nodiscard]] bool IsExpanded() const noexcept;
+    void ToggleExpanded();
+
+    void SetExpandDirection(ExpandDirection dir);
+    [[nodiscard]] ExpandDirection GetExpandDirection() const noexcept;
+
+    [[nodiscard]] bool IsBodyChildHidden(const UIElement* child) const noexcept;
+
+    void SetExpandedChangedCallback(ExpandedChangedCallback callback) {
+        expandedChangedCallback_ = std::move(callback);
+    }
+
+    void OnPropertyChanged(std::uint16_t propId, const UnifiedValue& newValue) override;
+    bool ActivateFromInput(RuntimeError* error = nullptr);
+    bool OnPointerDown(
+        Point localPoint,
+        PointerButton button,
+        std::uint8_t modifiers,
+        bool& outRequestCapture) override;
+    bool OnKeyDown(KeyCode key, std::uint8_t modifiers) override;
+    Size MeasureCore(Size availableSize) noexcept override;
+    void ArrangeCore(Rect finalRect) noexcept override;
+
+private:
+    ExpandedChangedCallback expandedChangedCallback_;
+};
+
+class TabItem : public HeaderedContentControl {
+public:
+    TabItem();
+    ~TabItem() override = default;
+
+    static const TypeClass* StaticTypeClass() noexcept;
+    [[nodiscard]] const TypeClass* GetTypeClass() const noexcept override {
+        return StaticTypeClass();
+    }
+
+    void SetIsSelected(bool selected);
+    [[nodiscard]] bool IsSelected() const noexcept;
+
+    Size MeasureCore(Size availableSize) noexcept override;
+    void ArrangeCore(Rect finalRect) noexcept override;
+};
+
+class TabControl : public Panel {
+public:
+    using SelectionChangedCallback = std::function<void(TabControl&, std::int32_t)>;
+    static constexpr float kDefaultTabStripHeight = 32.0f;
+
+    TabControl();
+    ~TabControl() override = default;
+
+    static const TypeClass* StaticTypeClass() noexcept;
+    [[nodiscard]] const TypeClass* GetTypeClass() const noexcept override {
+        return StaticTypeClass();
+    }
+
+    [[nodiscard]] bool DefaultFocusable() const noexcept override { return true; }
+
+    void SetSelectedIndex(std::int32_t index);
+    [[nodiscard]] std::int32_t GetSelectedIndex() const noexcept;
+    bool SelectTabInteractive(std::int32_t index);
+
+    void SetTabStripPlacement(TabStripPlacement placement);
+    [[nodiscard]] TabStripPlacement GetTabStripPlacement() const noexcept;
+
+    [[nodiscard]] std::size_t TabCount() const noexcept;
+    [[nodiscard]] UIElement* GetTabElement(std::size_t index) const noexcept;
+    [[nodiscard]] std::string GetTabHeaderText(std::size_t index) const;
+    [[nodiscard]] const std::vector<Rect>& TabHeaderLocalRects() const noexcept {
+        return tabHeaderRects_;
+    }
+    [[nodiscard]] Rect GetTabHeaderLocalRect(std::size_t index) const noexcept;
+    [[nodiscard]] Rect TabStripLocalRect() const noexcept { return tabStripLocalRect_; }
+    [[nodiscard]] Rect ContentPanelLocalRect() const noexcept { return contentPanelLocalRect_; }
+    [[nodiscard]] std::int32_t HitTestTabHeaderIndex(Point localPoint) const noexcept;
+    [[nodiscard]] bool IsChildInactiveTabPage(const UIElement* child) const noexcept;
+
+    void SetDomains(ExecutionDomainContext* domains) noexcept { domains_ = domains; }
+    void SetBindingEngine(DualTrackBindingEngine* engine) noexcept { bindingEngine_ = engine; }
+    void AssignStyleEnginePointer(StyleTriggerEngine* styleEngine) noexcept { styleEngine_ = styleEngine; }
+    void SetAnimationEngine(AnimationEngine* animationEngine) noexcept { animationEngine_ = animationEngine; }
+
+    void SetItemsSource(
+        const std::vector<UnifiedValue>& items,
+        NativeHandleRegistry* registry = nullptr,
+        ManagedHeap* uiHeap = nullptr);
+    bool ApplyIncrementalChanges(
+        const CollectionChangeRecord* changes,
+        std::size_t changeCount);
+    [[nodiscard]] const std::vector<UnifiedValue>& Items() const noexcept { return items_; }
+
+    void SetSelectionChangedCallback(SelectionChangedCallback callback) {
+        selectionChangedCallback_ = std::move(callback);
+    }
+
+    void OnPropertyChanged(std::uint16_t propId, const UnifiedValue& newValue) override;
+    bool OnPointerDown(
+        Point localPoint,
+        PointerButton button,
+        std::uint8_t modifiers,
+        bool& outRequestCapture) override;
+    bool OnKeyDown(KeyCode key, std::uint8_t modifiers) override;
+    Size MeasureCore(Size availableSize) noexcept override;
+    void ArrangeCore(Rect finalRect) noexcept override;
+
+protected:
+    void MarkExtraValuesInPools() const noexcept override;
+
+private:
+    void SyncTabSelectionStates() noexcept;
+    [[nodiscard]] UnifiedValue NormalizeTabItemValue(const UnifiedValue& raw);
+    [[nodiscard]] IntrusivePtr<UIElement> InstantiateTabItemForValue(const UnifiedValue& itemVal);
+    void ReleaseTabChildResources(UIElement* child);
+
+    ExecutionDomainContext* domains_ = nullptr;
+    DualTrackBindingEngine* bindingEngine_ = nullptr;
+    StyleTriggerEngine* styleEngine_ = nullptr;
+    AnimationEngine* animationEngine_ = nullptr;
+    std::vector<UnifiedValue> items_;
+    SelectionChangedCallback selectionChangedCallback_;
+    std::vector<Rect> tabHeaderRects_;
+    Rect tabStripLocalRect_{};
+    Rect contentPanelLocalRect_{};
+    bool syncingTabs_ = false;
+};
+
 class Image : public UIElement {
 public:
     Image();
@@ -589,6 +1021,11 @@ public:
 
     void SetStretch(Stretch stretch);
     [[nodiscard]] Stretch GetStretch() const noexcept;
+
+    void SetStretchDirection(StretchDirection dir);
+    [[nodiscard]] StretchDirection GetStretchDirection() const noexcept;
+
+    [[nodiscard]] Size GetNaturalImageSize() const;
 
     Size MeasureCore(Size availableSize) noexcept override;
 };
@@ -637,8 +1074,12 @@ public:
     void SetVirtualItemHeight(float itemHeight);
     [[nodiscard]] float GetVirtualItemHeight() const noexcept;
 
+    void SetSelectedIndex(std::int32_t index);
+    [[nodiscard]] std::int32_t GetSelectedIndex() const noexcept;
+    [[nodiscard]] UnifiedValue GetSelectedItem() const;
+
     [[nodiscard]] std::size_t TotalItemCount() const noexcept {
-        return !items_.empty() ? items_.size() : ChildCount();
+        return !items_.empty() ? items_.size() : (hasBoundItemsSource_ ? 0u : ChildCount());
     }
     [[nodiscard]] std::size_t RealizedItemCount() const noexcept {
         return ChildCount();
@@ -658,6 +1099,10 @@ public:
         NativeHandleRegistry* registry = nullptr,
         ManagedHeap* uiHeap = nullptr);
 
+    bool ApplyIncrementalChanges(
+        const CollectionChangeRecord* changes,
+        std::size_t changeCount);
+
     void OnPropertyChanged(std::uint16_t propId, const UnifiedValue& newValue) override;
     Size MeasureCore(Size availableSize) noexcept override;
     void ArrangeCore(Rect finalRect) noexcept override;
@@ -672,6 +1117,24 @@ private:
         IntrusivePtr<UIElement> element{};
         const AxbPackage* appliedTemplate = nullptr;
     };
+
+    [[nodiscard]] UnifiedValue NormalizeItemValue(const UnifiedValue& raw);
+    void ReleaseChildSubtreeResources(UIElement* ch);
+    [[nodiscard]] IntrusivePtr<UIElement> CreateMaterializedItemVisual(
+        std::size_t index,
+        const UnifiedValue& itemVal,
+        const AxbPackage*& outAppliedTemplate);
+    bool RebindMaterializedItemInPlace(
+        UIElement* elem,
+        const AxbPackage* appliedTpl,
+        std::size_t index,
+        const UnifiedValue& itemVal);
+    void SyncSelectionMetadataAfterMutation(std::int32_t nextSelectedIndex);
+    void ComputeCurrentVirtualWindow(
+        Size fallbackChildAvail,
+        std::size_t& outFirstIdx,
+        std::size_t& outEndExclusive,
+        Size& outMeasureConstraint) const noexcept;
 
     void RebuildAllMaterializedItems(NativeHandleRegistry* registry, ManagedHeap* uiHeap);
     void SyncVirtualizedWindow(
@@ -695,6 +1158,35 @@ private:
     std::size_t firstRealizedIndex_ = 0;
     std::size_t realizedEndExclusive_ = 0;
     float estimatedMaxItemWidth_ = 80.0f;
+    Size lastChildAvailableSize_{240.0f, 240.0f};
+    bool hasValidMeasureConstraint_ = false;
+    bool hasBoundItemsSource_ = false;
+    bool syncingItemsSelection_ = false;
+};
+
+class ListBox : public ItemsControl {
+public:
+    using SelectionChangedCallback = std::function<void(ListBox&, std::int32_t)>;
+
+    ListBox();
+    ~ListBox() override = default;
+
+    static const TypeClass* StaticTypeClass() noexcept;
+    [[nodiscard]] const TypeClass* GetTypeClass() const noexcept override {
+        return StaticTypeClass();
+    }
+
+    [[nodiscard]] bool DefaultFocusable() const noexcept override { return true; }
+
+    void SetSelectionChangedCallback(SelectionChangedCallback callback) {
+        selectionChangedCallback_ = std::move(callback);
+    }
+
+    void OnPropertyChanged(std::uint16_t propId, const UnifiedValue& newValue) override;
+
+private:
+    SelectionChangedCallback selectionChangedCallback_;
+    std::int32_t lastNotifiedSelectedIndex_ = -1;
 };
 
 class ComboBox : public ItemsControl {
@@ -765,12 +1257,36 @@ private:
 };
 
 // Self-contained template & MTSDF vector icon registry for automatic .axb4 mounting
+struct DynamicResourceSubscription {
+    UIElement* target = nullptr;
+    UIElement* mountRoot = nullptr;
+    std::uint16_t propId = 0u;
+    std::uint8_t flags = AxbResourceFlag_DynamicResource;
+    bool hadAncestorWhenBound = false;
+    std::string resourceKey;
+};
+
+class UiResourceContext;
+
 class AxbTemplateRegistry {
 public:
+    using WakeHostCallback = void (*)(void* userData) noexcept;
+
     static AxbTemplateRegistry& Instance() noexcept;
+    [[nodiscard]] static bool IsLiveRegistry(const AxbTemplateRegistry* registry) noexcept;
 
     AxbTemplateRegistry() noexcept;
     ~AxbTemplateRegistry();
+
+    AxbTemplateRegistry(const AxbTemplateRegistry&) = delete;
+    AxbTemplateRegistry& operator=(const AxbTemplateRegistry&) = delete;
+
+    void SetOwnerContext(UiResourceContext* owner) noexcept { ownerContext_ = owner; }
+    [[nodiscard]] UiResourceContext* OwnerContext() const noexcept { return ownerContext_; }
+    [[nodiscard]] bool HasAnyDynamicSubscriptions() const noexcept {
+        return hasSubscriptions_.load(std::memory_order_acquire);
+    }
+    [[nodiscard]] bool HasSubscriptionInSubtree(const UIElement* scopeRoot) const noexcept;
 
     void Register(std::string className, AxbPackage package);
     void RegisterResources(const AxbPackage& package);
@@ -779,8 +1295,10 @@ public:
     void RegisterStyle(AxbStyleDefinition style);
     void RegisterStoryboard(AxbStoryboard storyboard);
     void RegisterDataTemplate(AxbDataTemplate dataTemplate);
+    void RegisterControlTemplate(AxbControlTemplate controlTemplate);
     void MarkValuesInPools() const noexcept;
     [[nodiscard]] const UnifiedValue* FindResource(std::string_view key) const noexcept;
+    [[nodiscard]] const UnifiedValue* FindDynamicResource(std::string_view key) const noexcept;
     [[nodiscard]] const AxbPackage* Find(std::string_view className) const noexcept;
     [[nodiscard]] const AxbMtsdfPathEntry* FindMtsdfPath(std::uint64_t pathHash) const noexcept;
     [[nodiscard]] const AxbMtsdfPathEntry* FindOrBakeMtsdfPath(std::string_view pathData);
@@ -789,38 +1307,103 @@ public:
     [[nodiscard]] const AxbStoryboard* FindStoryboard(std::string_view key) const noexcept;
     [[nodiscard]] const AxbPackage* FindDataTemplate(std::string_view key) const noexcept;
     [[nodiscard]] const AxbPackage* FindImplicitDataTemplate(std::string_view shortDataTypeName) const noexcept;
+    [[nodiscard]] const AxbControlTemplate* FindControlTemplate(std::string_view key) const noexcept;
+    [[nodiscard]] const AxbControlTemplate* FindImplicitControlTemplate(std::string_view targetTypeName) const noexcept;
     [[nodiscard]] std::vector<AxbStyleDefinition> RegisteredStyles() const;
     [[nodiscard]] std::vector<AxbStoryboard> RegisteredStoryboards() const;
+    [[nodiscard]] std::vector<AxbControlTemplate> RegisteredControlTemplates() const;
     [[nodiscard]] std::size_t RegisteredMtsdfPathCount() const noexcept {
         std::lock_guard<std::mutex> lock(mutex_);
         return mtsdfPaths_.size();
     }
+
+    // P1-2: Weak DynamicResource / {noesis:Loc} subscription & sub-millisecond live dictionary hot-switching
+    void SubscribeDynamicResource(
+        UIElement* target,
+        UIElement* mountRoot,
+        std::uint16_t propId,
+        std::string_view resourceKey,
+        std::uint8_t flags = AxbResourceFlag_DynamicResource);
+    void UnsubscribeElement(const UIElement* element) noexcept;
+    std::size_t PruneStaleDynamicSubscriptions() noexcept;
+    [[nodiscard]] std::size_t ActiveDynamicSubscriptionCount() const noexcept;
+
+    std::size_t SetDynamicResource(
+        std::string key,
+        UnifiedValue value,
+        UIElement* scopeRoot = nullptr);
+    std::size_t ApplyDynamicDictionary(
+        const AxbPackage& dictPkg,
+        UIElement* scopeRoot = nullptr);
+
+    void RegisterDictionary(std::string sourceUri, AxbPackage dictPkg);
+    [[nodiscard]] const AxbPackage* FindDictionary(std::string_view sourceUri) const noexcept;
+    std::size_t ApplyRegisteredDictionary(
+        std::string_view sourceUri,
+        UIElement* scopeRoot = nullptr);
+
+    void SetWakeHostCallback(WakeHostCallback callback, void* userData = nullptr) noexcept;
+    void RegisterHostWakeListener(const void* ownerKey, WakeHostCallback callback, void* userData = nullptr);
+    void UnregisterHostWakeListener(const void* ownerKey) noexcept;
+
+    static void ApplyResolvedResourceToElement(
+        UIElement* target,
+        std::uint16_t propId,
+        const UnifiedValue& rawVal);
+
     void Clear() noexcept {
         std::lock_guard<std::mutex> lock(mutex_);
         templates_.clear();
         resources_.clear();
+        dynamicOverrides_.clear();
+        registeredDictionaries_.clear();
+        dynamicSubscriptions_.clear();
         mtsdfPaths_.clear();
         styles_.clear();
         implicitStyles_.clear();
         storyboards_.clear();
         dataTemplates_.clear();
         implicitDataTemplates_.clear();
+        controlTemplates_.clear();
+        implicitControlTemplates_.clear();
+        customWakeCallback_ = nullptr;
+        customWakeUserData_ = nullptr;
         nextMtsdfAtlasSlot_ = 0u;
+        hasSubscriptions_.store(false, std::memory_order_release);
     }
 
 private:
+    struct HostWakeEntry {
+        const void* ownerKey = nullptr;
+        WakeHostCallback callback = nullptr;
+        void* userData = nullptr;
+    };
+
     const AxbMtsdfPathEntry* InsertMtsdfPathLocked(AxbMtsdfPathEntry entry);
+    static bool IsSubscriptionAttachedLocked(const DynamicResourceSubscription& sub) noexcept;
+    static bool IsWithinScopeRoot(const UIElement* target, const UIElement* scopeRoot) noexcept;
+    void SnapshotWakeListenersLocked(std::vector<HostWakeEntry>& outListeners) const;
 
     mutable std::mutex mutex_;
     std::unordered_map<std::string, AxbPackage> templates_;
     std::unordered_map<std::string, UnifiedValue> resources_;
+    std::unordered_map<std::string, UnifiedValue> dynamicOverrides_;
+    std::unordered_map<std::string, AxbPackage> registeredDictionaries_;
+    std::vector<DynamicResourceSubscription> dynamicSubscriptions_;
+    std::vector<HostWakeEntry> hostWakeListeners_;
+    WakeHostCallback customWakeCallback_ = nullptr;
+    void* customWakeUserData_ = nullptr;
     std::unordered_map<std::uint64_t, AxbMtsdfPathEntry> mtsdfPaths_;
     std::unordered_map<std::string, AxbStyleDefinition> styles_;
     std::unordered_map<std::string, AxbStyleDefinition> implicitStyles_;
     std::unordered_map<std::string, AxbStoryboard> storyboards_;
     std::unordered_map<std::string, std::shared_ptr<AxbPackage>> dataTemplates_;
     std::unordered_map<std::string, std::shared_ptr<AxbPackage>> implicitDataTemplates_;
+    std::unordered_map<std::string, AxbControlTemplate> controlTemplates_;
+    std::unordered_map<std::string, AxbControlTemplate> implicitControlTemplates_;
     std::uint32_t nextMtsdfAtlasSlot_ = 0u;
+    UiResourceContext* ownerContext_ = nullptr;
+    std::atomic<bool> hasSubscriptions_{false};
 };
 
 class UserControl : public Panel {
@@ -863,12 +1446,100 @@ private:
     bool templateMounted_ = false;
 };
 
+class RiveControl : public UserControl {
+public:
+    RiveControl();
+    explicit RiveControl(
+        std::string_view sourceUri,
+        AnimationEngine* animationEngine = nullptr);
+    ~RiveControl() override;
+
+    static const TypeClass* StaticTypeClass() noexcept;
+    [[nodiscard]] const TypeClass* GetTypeClass() const noexcept override {
+        return StaticTypeClass();
+    }
+
+    static void AddAssetSearchDirectory(std::string_view directory);
+    static void ClearAssetSearchDirectories();
+
+    void SetSource(std::string_view sourceUri);
+    [[nodiscard]] std::string GetSource() const;
+
+    bool LoadFromMemory(
+        const std::uint8_t* rawBytes,
+        std::size_t byteLength,
+        std::string_view artboardNameHint = {});
+
+    void SetStretch(Stretch stretch);
+    [[nodiscard]] Stretch GetStretch() const noexcept;
+
+    void SetStretchDirection(StretchDirection dir);
+    [[nodiscard]] StretchDirection GetStretchDirection() const noexcept;
+
+    void SetAnimationEngine(AnimationEngine* engine) noexcept;
+    [[nodiscard]] AnimationEngine* ActiveAnimationEngine() const noexcept;
+
+    bool SetInputFloat(std::string_view inputName, float value) noexcept;
+    bool SetInputBool(std::string_view inputName, bool value) noexcept;
+    bool FireTrigger(std::string_view triggerName) noexcept;
+    [[nodiscard]] float GetInputFloat(std::string_view inputName) const noexcept;
+    std::size_t Advance(float dtSeconds) noexcept;
+
+    [[nodiscard]] bool IsRiveLoaded() const noexcept {
+        return mountedPackage_ != nullptr && artboardRoot_.Get() != nullptr;
+    }
+    [[nodiscard]] const AxbPackage* MountedRivePackage() const noexcept {
+        return mountedPackage_.get();
+    }
+    [[nodiscard]] Canvas* ArtboardCanvas() const noexcept {
+        return artboardRoot_.Get();
+    }
+    [[nodiscard]] Size ArtboardSize() const noexcept {
+        return artboardSize_;
+    }
+
+    [[nodiscard]] Matrix2D GetChildContainerTransform2D() const noexcept override {
+        return Matrix2D::Scaling(childScaleX_, childScaleY_, childOriginX_, childOriginY_);
+    }
+
+    void OnPropertyChanged(std::uint16_t propId, const UnifiedValue& newValue) override;
+    Size MeasureCore(Size availableSize) noexcept override;
+    void ArrangeCore(Rect finalRect) noexcept override;
+
+private:
+    bool ReloadFromSourceUri(std::string_view sourceUri);
+    bool MountDecodedRivePackage(std::shared_ptr<AxbPackage> pkg);
+
+    std::shared_ptr<AxbPackage> mountedPackage_;
+    IntrusivePtr<Canvas> artboardRoot_;
+    AnimationEngine* externalAnimationEngine_ = nullptr;
+    std::unique_ptr<AnimationEngine> ownedAnimationEngine_;
+    std::string loadedSourceUri_;
+    Size artboardSize_{0.0f, 0.0f};
+    float childScaleX_ = 1.0f;
+    float childScaleY_ = 1.0f;
+    float childOriginX_ = 0.0f;
+    float childOriginY_ = 0.0f;
+    bool reloadingSource_ = false;
+};
+
 // Factory and self-contained .axb4 instruction VM mounting
 [[nodiscard]] IntrusivePtr<UIElement> CreateElementByTypeName(std::string_view typeName);
 
 bool MountAxbTemplate(
     UIElement* rootControl,
     const AxbPackage& package,
+    ExecutionDomainContext* domains = nullptr,
+    DualTrackBindingEngine* bindingEngine = nullptr,
+    ObjectRef dataContext = {},
+    const Interpreter* eventInterpreter = nullptr,
+    rs_aot::ExecutionContext* eventAotContext = nullptr,
+    AnimationEngine* animationEngine = nullptr);
+
+bool MountControlTemplatePackage(
+    UIElement* hostControl,
+    UIElement* templateRootControl,
+    const AxbPackage& templatePackage,
     ExecutionDomainContext* domains = nullptr,
     DualTrackBindingEngine* bindingEngine = nullptr,
     ObjectRef dataContext = {},

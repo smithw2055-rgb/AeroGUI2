@@ -3,6 +3,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -16,16 +17,17 @@
 
 namespace aero {
 
-// Zero-allocation Style, Property/MultiTrigger, DataTrigger/MultiDataTrigger, EventTrigger & VisualStateManager engine:
-// - Resolves keyed Style="{StaticResource ...}", BasedOn inheritance chains, and implicit TargetType styles
-// - Pre-allocates per-element property override backup slots & EventTrigger state slots on style attachment (0 heap allocs per frame!)
-// - Evaluates inline interactive state flags, DataContext ObjectRef multi-hop slots, ElementName, and RelativeSource conditions
-//   into a 64-bit activeTriggerMask with O(1) clean-frame short-circuiting
-// - Dispatches RoutedEvent EventTriggers (Loaded, Click, MouseEnter, MouseLeave, Checked, Unchecked) and VSM transitions
+// Zero-allocation Style, Property/MultiTrigger, DataTrigger/MultiDataTrigger, EventTrigger,
+// XAML Behaviors (<b:Interaction.Triggers>) & VisualStateManager engine
 class StyleTriggerEngine {
 public:
+    using SoundActionCallback = std::function<void(
+        UIElement* sourceElement,
+        std::string_view soundUri,
+        float volume)>;
+
     static constexpr std::size_t kMaxVisualStateGroupsPerElement = 4u;
-    static constexpr std::size_t kMaxEventTriggersPerElement = 8u;
+    static constexpr std::size_t kMaxEventTriggersPerElement = 16u;
 
     explicit StyleTriggerEngine(
         AnimationEngine* animationEngine = nullptr,
@@ -62,6 +64,17 @@ public:
         if (uiInterpreter) uiInterpreter_ = uiInterpreter;
     }
 
+    void SetAotExecutionContext(rs_aot::ExecutionContext* aotContext) noexcept {
+        aotContext_ = aotContext;
+    }
+
+    void SetSoundActionCallback(SoundActionCallback callback) {
+        soundActionCallback_ = std::move(callback);
+    }
+    [[nodiscard]] const SoundActionCallback& GetSoundActionCallback() const noexcept {
+        return soundActionCallback_;
+    }
+
     void Clear();
 
     // Register style & storyboard definitions (automatically resolves BasedOn inheritance)
@@ -86,8 +99,7 @@ public:
         std::string_view stateName,
         bool useTransitions = true);
 
-    // Evaluate all bound Property/Data/Event triggers & automatic CommonStates/FocusStates/CheckStates (0 heap allocs!)
-    // Returns number of elements whose active trigger mask, visual state, or routed event fired this pass.
+    // Evaluate all bound Property/Data/Event/Interaction triggers & automatic CommonStates/FocusStates/CheckStates
     std::size_t EvaluateAndApply();
     std::size_t EvaluateSubtree(UIElement* subtreeRoot, bool resetEventStates = false);
 
@@ -112,6 +124,8 @@ private:
     struct EventTriggerRuntimeState {
         UIElement* cachedSource = nullptr;
         std::uint32_t lastClickGen = 0u;
+        std::int64_t prevSelectedIndex = -1;
+        float prevNumericValue = 0.0f;
         bool prevHovered = false;
         bool prevChecked = false;
         bool initialized = false;
@@ -132,6 +146,12 @@ private:
         UIElement* elem,
         AxbTriggerCondition& cond);
     [[nodiscard]] bool EvaluateEventTriggers(StyledElementInstance& inst);
+    void ExecuteInteractionActions(
+        StyledElementInstance& inst,
+        std::vector<AxbInteractionAction>& actions);
+    void ExecuteSingleInteractionAction(
+        StyledElementInstance& inst,
+        AxbInteractionAction& action);
     [[nodiscard]] static bool HasFocusedDescendant(const UIElement* elem) noexcept;
     [[nodiscard]] static bool IsFastInlineAtDefault(const UIElement* elem, std::uint16_t propId) noexcept;
 
@@ -152,6 +172,8 @@ private:
     ExecutionDomainContext* domains_ = nullptr;
     const ProgramImage* program_ = nullptr;
     const Interpreter* uiInterpreter_ = nullptr;
+    rs_aot::ExecutionContext* aotContext_ = nullptr;
+    SoundActionCallback soundActionCallback_{};
     std::unordered_map<std::string, AxbStyleDefinition> keyedStyles_;
     std::unordered_map<std::string, AxbStyleDefinition> implicitTypeStyles_;
     std::unordered_map<std::string, AxbStoryboard> keyedStoryboards_;

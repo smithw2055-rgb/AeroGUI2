@@ -1,10 +1,13 @@
 #pragma once
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -16,7 +19,10 @@ namespace aero {
 
 inline constexpr std::uint32_t kAxb4Magic = 0x34425841u; // "AXB4"
 inline constexpr std::uint32_t kAxb4Version = 0x00020000u;
-inline constexpr std::uint32_t kAxb4MotionSectionMagic = 0x36544F4Du; // "MOT6"
+inline constexpr std::uint32_t kAxb4MotionSectionMagic = 0x36544F4Du;     // "MOT6"
+inline constexpr std::uint32_t kAxb4MergedDictSectionMagic = 0x3231524Du; // "MR12"
+inline constexpr std::uint32_t kAxb4ControlTemplateSectionMagic = 0x31505443u; // "CTP1"
+inline constexpr std::uint32_t kAxb4P14SectionMagic = 0x34315041u;    // "AP14"
 
 enum class BindingMode : std::uint8_t {
     OneWay = 0,
@@ -31,6 +37,8 @@ enum class ValueConverterKind : std::uint8_t {
     InverseBoolean = 3,
     NullToCollapsed = 4,
     NullToBoolean = 5,
+    MathExpression = 6,
+    CustomScriptOrHost = 7,
 };
 
 enum class AxbOpcode : std::uint8_t {
@@ -43,7 +51,109 @@ enum class AxbOpcode : std::uint8_t {
     AddRowDefinition = 7,
     AddColumnDefinition = 8,
     SetResourceProperty = 9,
+    BindTemplateParent = 10,
+    BindMultiProperty = 11,
 };
+
+// P1-2: Exclusive AxbInstruction::flags encoding on AxbOpcode::SetResourceProperty (opcode 9)
+enum AxbResourceLookupFlags : std::uint8_t {
+    AxbResourceFlag_StaticResource = 0x00u,
+    AxbResourceFlag_DynamicResource = 0x02u,
+    AxbResourceFlag_Loc = 0x04u,
+    BindMultiProperty = 11,
+};
+
+// ============================================================================
+// P1-3: Multi-Stop LinearGradientBrush & RadialGradientBrush Registry + 1D LUT
+// ============================================================================
+
+enum class GradientBrushKind : std::uint8_t {
+    Linear = 0,
+    Radial = 1,
+};
+
+enum class BrushMappingMode : std::uint8_t {
+    RelativeToBoundingBox = 0,
+    Absolute = 1,
+};
+
+enum class GradientSpreadMethod : std::uint8_t {
+    Pad = 0,
+    Reflect = 1,
+    Repeat = 2,
+};
+
+struct GradientStop {
+    float offset = 0.0f;
+    Color color{0.0f, 0.0f, 0.0f, 1.0f};
+};
+
+struct GradientBrushDesc {
+    static constexpr std::uint32_t kLutWidth = 256u;
+
+    std::uint32_t brushId = 0u;
+    GradientBrushKind kind = GradientBrushKind::Linear;
+    BrushMappingMode mappingMode = BrushMappingMode::RelativeToBoundingBox;
+    GradientSpreadMethod spreadMethod = GradientSpreadMethod::Pad;
+    float opacity = 1.0f;
+    // LinearGradientBrush endpoints (default XAML diagonal 0,0 -> 1,1)
+    Point startPoint{0.0f, 0.0f};
+    Point endPoint{1.0f, 1.0f};
+    // RadialGradientBrush ellipse center, focal origin & radii (default 0.5,0.5, rx=0.5, ry=0.5)
+    Point center{0.5f, 0.5f};
+    Point gradientOrigin{0.5f, 0.5f};
+    float radiusX = 0.5f;
+    float radiusY = 0.5f;
+    std::vector<GradientStop> stops;
+    // Pre-baked 256-texel RGBA8 1D ramp for O(1) GPU LUT row upload & CPU bilinear evaluation
+    std::array<std::uint8_t, kLutWidth * 4u> bakedRampRgba8{};
+};
+
+void BakeGradientBrushRamp(GradientBrushDesc& ioBrush) noexcept;
+[[nodiscard]] Color SampleGradientRampAtT(
+    const GradientBrushDesc& brush,
+    float rawT) noexcept;
+[[nodiscard]] Color EvaluateGradientBrushAtNormalizedUv(
+    const GradientBrushDesc& brush,
+    float normU,
+    float normV,
+    float quadWidthPx = 1.0f,
+    float quadHeightPx = 1.0f) noexcept;
+[[nodiscard]] std::string SerializeGradientBrushSpec(const GradientBrushDesc& brush);
+[[nodiscard]] bool IsGradientBrushSpec(std::string_view raw) noexcept;
+[[nodiscard]] bool TryDeserializeGradientBrushSpec(
+    std::string_view raw,
+    GradientBrushDesc& outBrush);
+
+class GradientBrushRegistry {
+public:
+    static constexpr std::uint32_t kMaxBrushId = 4095u;
+
+    static GradientBrushRegistry& Instance() noexcept;
+
+    GradientBrushRegistry() noexcept = default;
+    ~GradientBrushRegistry() = default;
+
+    GradientBrushRegistry(const GradientBrushRegistry&) = delete;
+    GradientBrushRegistry& operator=(const GradientBrushRegistry&) = delete;
+
+    std::uint32_t RegisterBrush(GradientBrushDesc desc);
+    std::uint32_t RegisterOrResolveSpec(std::string_view serializedSpec);
+    [[nodiscard]] const GradientBrushDesc* Find(std::uint32_t brushId) const noexcept;
+    [[nodiscard]] std::size_t BrushCount() const noexcept;
+    [[nodiscard]] std::uint32_t Revision() const noexcept;
+    void Clear() noexcept;
+
+private:
+    mutable std::mutex mutex_;
+    std::vector<GradientBrushDesc> brushes_;
+    std::unordered_map<std::string, std::uint32_t> specToId_;
+    std::uint32_t revision_ = 1u;
+};
+
+[[nodiscard]] std::string ConvertPointsToSvgPath(
+    std::string_view rawPoints,
+    bool closePath);
 
 // ============================================================================
 // Phase 5C & 5D: Easing Curves, Storyboards, Data/Event Triggers & Templates
@@ -140,11 +250,95 @@ struct AxbCompiledHop {
     }
 };
 
+struct AxbCompiledMultiBinding;
+
+struct AxbCompiledBindingChain {
+    std::string rawPath;
+    std::uint16_t targetPropertyId = 0;
+    BindingMode mode = BindingMode::OneWay;
+    UnifiedValue fallbackValue{};
+    std::vector<AxbCompiledHop> hops;
+    // Phase 5D: ElementName / RelativeSource & zero-allocation built-in value converter
+    std::string elementName;
+    std::string relativeAncestorType;
+    bool relativeSelf = false;
+    ValueConverterKind converter = ValueConverterKind::None;
+    // P1-4: StringFormat, MathConverter expression, ConverterParameter & custom converter key/symbols
+    std::string converterKey;
+    std::string converterParameter;
+    std::string stringFormat;
+    SymbolId converterSymbolId = 0;
+    SymbolId convertBackSymbolId = 0;
+    std::shared_ptr<AxbCompiledMultiBinding> nestedMultiBinding{};
+};
+
+struct AxbCompiledMultiBinding {
+    std::uint16_t targetPropertyId = 0;
+    BindingMode mode = BindingMode::OneWay;
+    ValueConverterKind converter = ValueConverterKind::None;
+    std::string converterKey;
+    std::string converterParameter;
+    std::string stringFormat;
+    UnifiedValue fallbackValue{};
+    SymbolId converterSymbolId = 0;
+    SymbolId convertBackSymbolId = 0;
+    std::vector<AxbCompiledBindingChain> sources;
+};
+
 enum class TriggerConditionSource : std::uint8_t {
     SelfProperty = 0,
     DataContextBinding = 1,
     ElementNameProperty = 2,
     AncestorProperty = 3,
+};
+
+enum class TriggerComparisonOp : std::uint8_t {
+    Equal = 0,
+    NotEqual = 1,
+    LessThan = 2,
+    LessThanOrEqual = 3,
+    GreaterThan = 4,
+    GreaterThanOrEqual = 5,
+};
+
+enum class ControlStoryboardOption : std::uint8_t {
+    Play = 0,
+    Stop = 1,
+    TogglePlayPause = 2,
+};
+
+enum class InteractionActionKind : std::uint8_t {
+    ChangeProperty = 0,
+    ControlStoryboard = 1,
+    InvokeCommand = 2,
+    PlaySound = 3,
+};
+
+struct AxbInteractionAction {
+    InteractionActionKind kind = InteractionActionKind::ChangeProperty;
+    std::string actionName;
+    bool isEnabled = true;
+    // ChangePropertyAction (empty targetName targets the host element itself)
+    std::string targetName;
+    std::uint16_t propId = 0;
+    std::string propertyName;
+    UnifiedValue value{};
+    // ControlStoryboardAction
+    std::string storyboardKey;
+    AxbStoryboard inlineStoryboard{};
+    ControlStoryboardOption storyboardOption = ControlStoryboardOption::Play;
+    // InvokeCommandAction
+    std::string commandPath;
+    std::vector<AxbCompiledHop> commandHops;
+    SymbolId commandMethodSymbolId = 0;
+    bool isSimCommand = false;
+    bool hasCommandParameter = false;
+    UnifiedValue commandParameter{};
+    AxbCompiledBindingChain commandParameterBinding{};
+    bool hasCommandParameterBinding = false;
+    // PlaySoundAction
+    std::string soundSource;
+    float volume = 1.0f;
 };
 
 struct AxbTriggerCondition {
@@ -160,6 +354,10 @@ struct AxbTriggerCondition {
     std::string sourceName;
     std::string bindingPath;
     std::vector<AxbCompiledHop> compiledHops;
+    TriggerComparisonOp comparison = TriggerComparisonOp::Equal;
+    std::string converterKey;
+    std::string converterParameter;
+    SymbolId converterSymbolId = 0;
 };
 
 struct AxbStyleTrigger {
@@ -168,6 +366,9 @@ struct AxbStyleTrigger {
     std::vector<AxbStoryboard> enterStoryboards;
     std::vector<AxbStoryboard> exitStoryboards;
     bool overrideLocalValues = false;
+    bool isInteractionTrigger = false;
+    std::vector<AxbInteractionAction> enterActions;
+    std::vector<AxbInteractionAction> exitActions;
 };
 
 enum class RoutedTriggerEvent : std::uint8_t {
@@ -177,12 +378,15 @@ enum class RoutedTriggerEvent : std::uint8_t {
     MouseLeave = 3,
     Checked = 4,
     Unchecked = 5,
+    SelectionChanged = 6,
+    ValueChanged = 7,
 };
 
 struct AxbEventTrigger {
     RoutedTriggerEvent eventKind = RoutedTriggerEvent::Loaded;
     std::string sourceName;
     std::vector<AxbStoryboard> storyboards;
+    std::vector<AxbInteractionAction> actions;
 };
 
 struct AxbVisualState {
@@ -199,27 +403,27 @@ struct AxbVisualStateGroup {
     std::vector<AxbVisualState> states;
 };
 
-struct AxbStyleDefinition {
+struct AxbPackage;
+
+struct AxbControlTemplate {
     std::string key;
     std::string targetTypeName;
-    std::string basedOnKey;
-    std::vector<AxbPropertySetter> setters;
+    std::shared_ptr<AxbPackage> templatePackage;
     std::vector<AxbStyleTrigger> triggers;
     std::vector<AxbEventTrigger> eventTriggers;
     std::vector<AxbVisualStateGroup> visualStateGroups;
 };
 
-struct AxbCompiledBindingChain {
-    std::string rawPath;
-    std::uint16_t targetPropertyId = 0;
-    BindingMode mode = BindingMode::OneWay;
-    UnifiedValue fallbackValue{};
-    std::vector<AxbCompiledHop> hops;
-    // Phase 5D: ElementName / RelativeSource & zero-allocation built-in value converter
-    std::string elementName;
-    std::string relativeAncestorType;
-    bool relativeSelf = false;
-    ValueConverterKind converter = ValueConverterKind::None;
+struct AxbStyleDefinition {
+    std::string key;
+    std::string targetTypeName;
+    std::string basedOnKey;
+    std::string controlTemplateKey;
+    std::shared_ptr<AxbControlTemplate> inlineControlTemplate;
+    std::vector<AxbPropertySetter> setters;
+    std::vector<AxbStyleTrigger> triggers;
+    std::vector<AxbEventTrigger> eventTriggers;
+    std::vector<AxbVisualStateGroup> visualStateGroups;
 };
 
 struct AxbNamedControlSlot {
@@ -266,8 +470,6 @@ struct AxbMtsdfPathEntry {
     // 4-channel RGBA8 MTSDF cell (R,G,B = corner-preserving directional SDF, A = true Euclidean SDF)
     std::vector<std::uint8_t> mtsdfRgbaPixels;
 };
-
-struct AxbPackage;
 
 struct AxbDataTemplate {
     std::string key;
@@ -453,6 +655,7 @@ struct AxbPackage {
     std::vector<std::string> stringTable;
     std::vector<AxbNamedControlSlot> namedControls;
     std::vector<AxbCompiledBindingChain> bindingChains;
+    std::vector<AxbCompiledMultiBinding> multiBindings;
     std::vector<AxbEventBindingRecord> eventBindings;
     std::vector<AxbInstruction> instructions;
     std::vector<std::pair<std::string, UnifiedValue>> resources;
@@ -460,6 +663,7 @@ struct AxbPackage {
     std::vector<AxbStyleDefinition> styles;
     std::vector<AxbStoryboard> storyboards;
     std::vector<AxbDataTemplate> dataTemplates;
+    std::vector<AxbControlTemplate> controlTemplates;
 
     // Phase 6 MOT6 flat motion & state-machine buffers
     std::vector<AxbFlatKeyframe> motionKeyframes;
@@ -475,6 +679,9 @@ struct AxbPackage {
     std::vector<AxbContractInputDesc> contractInputs;
     std::vector<AxbStateMachineDesc> stateMachines;
 
+    // P1-2: Ordered list of merged ResourceDictionary Source URIs resolved into this package
+    std::vector<std::string> mergedDictionarySources;
+
     std::uint32_t InternString(std::string_view text);
     [[nodiscard]] std::string_view GetString(std::uint32_t index) const noexcept;
 
@@ -484,6 +691,20 @@ struct AxbPackage {
                !smTransitions.empty() || !smStates.empty() || !smLayers.empty() ||
                !smListeners.empty() || !contractInputs.empty() || !stateMachines.empty();
     }
+
+    [[nodiscard]] const AxbControlTemplate* FindControlTemplate(std::string_view key) const noexcept {
+        if (key.empty()) {
+            return nullptr;
+        }
+        for (auto it = controlTemplates.rbegin(); it != controlTemplates.rend(); ++it) {
+            if (it->key == key) {
+                return &(*it);
+            }
+        }
+        return nullptr;
+    }
+
+    [[nodiscard]] bool HasP14Section() const noexcept;
 
     void PinValuesInPools() const noexcept;
     void MarkValuesInPools() const noexcept;
@@ -514,10 +735,31 @@ struct AxbPackage {
 [[nodiscard]] EasingFunctionKind ParseEasingFunctionKind(std::string_view tagName) noexcept;
 [[nodiscard]] EasingMode ParseEasingMode(std::string_view rawMode) noexcept;
 [[nodiscard]] ValueConverterKind ParseValueConverterKind(std::string_view rawConverterKey) noexcept;
+[[nodiscard]] TriggerComparisonOp ParseTriggerComparisonOp(std::string_view rawOp) noexcept;
+[[nodiscard]] ControlStoryboardOption ParseControlStoryboardOption(std::string_view rawOpt) noexcept;
 [[nodiscard]] UnifiedValue ApplyBuiltinValueConverter(
     ValueConverterKind kind,
     const UnifiedValue& rawVal,
     bool inverseForTwoWay = false) noexcept;
+
+// P1-4: Zero-exception 32-bit float recursive-descent MathConverter expression evaluator
+// Supports {0}..{8}, @VALUE, @PARAMETER, + - * / %, unary + - !, (), < <= > >= == != && || ? :,
+// and min/max/abs/clamp/floor/ceil/round/pow/sqrt/sin/cos/tan/lerp/sign.
+[[nodiscard]] bool EvaluateMathConverterExpression(
+    std::string_view expression,
+    const UnifiedValue* args,
+    std::size_t argCount,
+    float parameterValue,
+    float& outResult) noexcept;
+
+// P1-4: Zero-exception StringFormat engine supporting {0}..{8} placeholders & numeric specifiers
+// (0, 00, 000, F0, F1, F2, P0, G, C2, #,.##, standalone specifiers like "F1", and escaped {{ / }}).
+[[nodiscard]] std::string FormatBindingString(
+    std::string_view formatSpec,
+    const UnifiedValue* args,
+    std::size_t argCount,
+    const ExecutionDomainContext* domains = nullptr);
+
 [[nodiscard]] RoutedTriggerEvent ParseRoutedTriggerEvent(
     std::string_view rawRoutedEvent,
     bool& outRecognized) noexcept;
@@ -544,6 +786,18 @@ void PackMtsdfAtlasSkyline(
     std::vector<AxbMtsdfPathEntry>& ioEntries,
     std::uint16_t atlasSize = 512) noexcept;
 
+// P1-5: Real Rive v7 LEB128 binary .riv stream detection & runtime/compiler decoding to AxbPackage
+[[nodiscard]] bool IsRiveBinaryStream(
+    const std::uint8_t* rawBytes,
+    std::size_t byteLength) noexcept;
+
+[[nodiscard]] bool DecodeRiveBinaryToAxbPackage(
+    const std::uint8_t* rawBytes,
+    std::size_t byteLength,
+    AxbPackage& outPackage,
+    std::vector<std::string>* outDiagnostics = nullptr,
+    std::string_view artboardNameHint = {});
+
 struct DecomposedTransform2D {
     float translateX = 0.0f;
     float translateY = 0.0f;
@@ -562,6 +816,12 @@ struct DecomposedTransform2D {
     std::uint32_t& outCodePoint) noexcept;
 [[nodiscard]] bool IsWideCjkCodePoint(std::uint32_t codePoint) noexcept;
 [[nodiscard]] Size MeasureUtf8TextRun(std::string_view utf8Text, float fontSize) noexcept;
+[[nodiscard]] Size MeasureUtf8TextRun(
+    std::string_view utf8Text,
+    float fontSize,
+    std::string_view fontFamily,
+    float maxWidth = 1000000.0f,
+    TextWrapping wrapMode = TextWrapping::NoWrap) noexcept;
 [[nodiscard]] std::size_t CountVisibleUtf8Glyphs(std::string_view utf8Text) noexcept;
 
 } // namespace aero

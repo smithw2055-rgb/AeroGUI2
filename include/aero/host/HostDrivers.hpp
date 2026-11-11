@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -10,6 +11,7 @@
 #include "aero/animation/AnimationEngine.hpp"
 #include "aero/binding/DualTrackBindingEngine.hpp"
 #include "aero/core/UIElement.hpp"
+#include "aero/core/UiResourceContext.hpp"
 #include "aero/input/InputEventRouter.hpp"
 #include "aero/layout/DepthBucketLayoutQueue.hpp"
 #include "aero/render/PagedRenderTree.hpp"
@@ -17,6 +19,8 @@
 #include "aero/style/StyleTriggerEngine.hpp"
 
 namespace aero {
+
+using HostWakeCallback = void (*)(void* userData) noexcept;
 
 enum UiPhaseMask : std::uint32_t {
     UiPhase_None = 0u,
@@ -59,6 +63,14 @@ public:
         PagedRenderTree& renderTree,
         ZeroCopyGpuStream& gpuStream) = 0;
     [[nodiscard]] virtual bool CanSleepIdle() const noexcept = 0;
+
+    // P2-1: Optional instance-scoped UiResourceContext binding for multi-viewport / PIE isolation
+    virtual void SetResourceContext(std::shared_ptr<UiResourceContext> context) {
+        (void)context;
+    }
+    [[nodiscard]] virtual std::shared_ptr<UiResourceContext> GetResourceContext() const noexcept {
+        return nullptr;
+    }
 };
 
 // ============================================================================
@@ -70,19 +82,32 @@ public:
         UIElement* rootVisual = nullptr,
         DualTrackBindingEngine* bindingEngine = nullptr,
         DepthBucketLayoutQueue* layoutQueue = nullptr,
-        PagedRenderTree* renderTree = nullptr) noexcept;
+        PagedRenderTree* renderTree = nullptr,
+        std::shared_ptr<UiResourceContext> resourceContext = nullptr) noexcept;
 
     [[nodiscard]] std::string_view HostName() const noexcept override {
         return "EmbeddedGameHost";
     }
 
+    void SetResourceContext(std::shared_ptr<UiResourceContext> context) override {
+        resourceContext_ = std::move(context);
+    }
+    [[nodiscard]] std::shared_ptr<UiResourceContext> GetResourceContext() const noexcept override {
+        return resourceContext_;
+    }
+
     void SetRootVisual(UIElement* root) noexcept {
+        ScopedUiResourceContext scope(resourceContext_);
         rootVisual_ = root;
         lastLaidOutViewport_ = {-1.0f, -1.0f};
     }
+    [[nodiscard]] UIElement* RootVisual() const noexcept { return rootVisual_; }
     void SetBindingEngine(DualTrackBindingEngine* engine) noexcept { bindingEngine_ = engine; }
+    [[nodiscard]] DualTrackBindingEngine* GetBindingEngine() const noexcept { return bindingEngine_; }
     void SetLayoutQueue(DepthBucketLayoutQueue* queue) noexcept { layoutQueue_ = queue; }
+    [[nodiscard]] DepthBucketLayoutQueue* GetLayoutQueue() const noexcept { return layoutQueue_; }
     void SetRenderTree(PagedRenderTree* tree) noexcept { renderTree_ = tree; }
+    [[nodiscard]] PagedRenderTree* GetRenderTree() const noexcept { return renderTree_; }
     void SetInputRouter(InputEventRouter* router) noexcept { inputRouter_ = router; }
     [[nodiscard]] InputEventRouter* InputRouter() const noexcept { return inputRouter_; }
     void SetStyleEngine(StyleTriggerEngine* styleEngine) noexcept { styleEngine_ = styleEngine; }
@@ -90,6 +115,7 @@ public:
     void SetAnimationEngine(AnimationEngine* animEngine) noexcept { animationEngine_ = animEngine; }
     [[nodiscard]] AnimationEngine* GetAnimationEngine() const noexcept { return animationEngine_; }
     void SetViewportSize(Size viewport) noexcept { viewportSize_ = viewport; }
+    [[nodiscard]] Size ViewportSize() const noexcept { return viewportSize_; }
 
     void TickUi(float dt, std::uint32_t activePhaseMask = UiPhase_All) override;
 
@@ -108,6 +134,7 @@ private:
     InputEventRouter* inputRouter_ = nullptr;
     StyleTriggerEngine* styleEngine_ = nullptr;
     AnimationEngine* animationEngine_ = nullptr;
+    std::shared_ptr<UiResourceContext> resourceContext_{};
     Size viewportSize_{1920.0f, 1080.0f};
     Size lastLaidOutViewport_{-1.0f, -1.0f};
     HostFrameTelemetry telemetry_{};
@@ -122,19 +149,57 @@ public:
         UIElement* rootVisual = nullptr,
         DualTrackBindingEngine* bindingEngine = nullptr,
         DepthBucketLayoutQueue* layoutQueue = nullptr,
-        PagedRenderTree* renderTree = nullptr) noexcept;
+        PagedRenderTree* renderTree = nullptr,
+        std::shared_ptr<UiResourceContext> resourceContext = nullptr) noexcept;
+    ~DesktopEventHost() override;
 
     [[nodiscard]] std::string_view HostName() const noexcept override {
         return "DesktopEventHost";
     }
 
+    void SetResourceContext(std::shared_ptr<UiResourceContext> context) override;
+    [[nodiscard]] std::shared_ptr<UiResourceContext> GetResourceContext() const noexcept override {
+        return resourceContext_;
+    }
+
+    void SetRootVisual(UIElement* root) noexcept {
+        ScopedUiResourceContext scope(resourceContext_);
+        rootVisual_ = root;
+        lastLaidOutViewport_ = {-1.0f, -1.0f};
+        hasDirtyLayout_ = true;
+        TriggerWake();
+    }
+    [[nodiscard]] UIElement* RootVisual() const noexcept { return rootVisual_; }
+
+    void SetBindingEngine(DualTrackBindingEngine* engine) noexcept { bindingEngine_ = engine; }
+    [[nodiscard]] DualTrackBindingEngine* GetBindingEngine() const noexcept { return bindingEngine_; }
+
+    void SetLayoutQueue(DepthBucketLayoutQueue* queue) noexcept { layoutQueue_ = queue; }
+    [[nodiscard]] DepthBucketLayoutQueue* GetLayoutQueue() const noexcept { return layoutQueue_; }
+
     void SetRenderTree(PagedRenderTree* tree) noexcept { renderTree_ = tree; }
+    [[nodiscard]] PagedRenderTree* GetRenderTree() const noexcept { return renderTree_; }
+
     void SetInputRouter(InputEventRouter* router) noexcept { inputRouter_ = router; }
     [[nodiscard]] InputEventRouter* InputRouter() const noexcept { return inputRouter_; }
+
     void SetStyleEngine(StyleTriggerEngine* styleEngine) noexcept { styleEngine_ = styleEngine; }
     [[nodiscard]] StyleTriggerEngine* StyleEngine() const noexcept { return styleEngine_; }
+
     void SetAnimationEngine(AnimationEngine* animEngine) noexcept { animationEngine_ = animEngine; }
     [[nodiscard]] AnimationEngine* GetAnimationEngine() const noexcept { return animationEngine_; }
+
+    // Register a zero-allocation wake hook (e.g. NativeWindowHost pipe/Win32 Event signaler)
+    // so dirty notifications from any thread wake a sleeping OS event loop immediately.
+    void SetWakeCallback(HostWakeCallback callback, void* userData) noexcept {
+        wakeCallback_ = callback;
+        wakeUserData_ = userData;
+    }
+    void TriggerWake() const noexcept {
+        if (wakeCallback_) {
+            wakeCallback_(wakeUserData_);
+        }
+    }
 
     void SetStateFlags(
         bool hasActiveAnimations,
@@ -142,11 +207,32 @@ public:
         bool hasDirtyLayout,
         bool hasPendingInputEvents = false) noexcept;
 
-    void NotifyInputEvent() noexcept { hasPendingInputEvents_ = true; }
-    void NotifyDirtyObjects() noexcept { hasDirtyObjects_ = true; }
-    void NotifyDirtyLayout() noexcept { hasDirtyLayout_ = true; }
-    void SetActiveAnimations(bool active) noexcept { hasActiveAnimations_ = active; }
-    void SetViewportSize(Size viewport) noexcept { viewportSize_ = viewport; }
+    void NotifyInputEvent() noexcept {
+        hasPendingInputEvents_ = true;
+        TriggerWake();
+    }
+    void NotifyDirtyObjects() noexcept {
+        hasDirtyObjects_ = true;
+        TriggerWake();
+    }
+    void NotifyDirtyLayout() noexcept {
+        hasDirtyLayout_ = true;
+        TriggerWake();
+    }
+    void SetActiveAnimations(bool active) noexcept {
+        hasActiveAnimations_ = active;
+        if (active) {
+            TriggerWake();
+        }
+    }
+    void SetViewportSize(Size viewport) noexcept {
+        if (viewportSize_ != viewport) {
+            viewportSize_ = viewport;
+            hasDirtyLayout_ = true;
+            TriggerWake();
+        }
+    }
+    [[nodiscard]] Size ViewportSize() const noexcept { return viewportSize_; }
 
     // True when !hasActiveAnimations && !hasDirtyObjects && !hasDirtyLayout && !hasPendingInputEvents
     [[nodiscard]] bool CanSleepIdle() const noexcept override;
@@ -174,6 +260,10 @@ private:
     InputEventRouter* inputRouter_ = nullptr;
     StyleTriggerEngine* styleEngine_ = nullptr;
     AnimationEngine* animationEngine_ = nullptr;
+    std::shared_ptr<UiResourceContext> resourceContext_{};
+    AxbTemplateRegistry* wakeRegisteredRegistry_ = nullptr;
+    HostWakeCallback wakeCallback_ = nullptr;
+    void* wakeUserData_ = nullptr;
     Size viewportSize_{1920.0f, 1080.0f};
     Size lastLaidOutViewport_{-1.0f, -1.0f};
     bool hasActiveAnimations_ = false;
@@ -184,7 +274,7 @@ private:
 };
 
 // ============================================================================
-// 3. WebCanvasHost: Transparent DOM Bridge (IME + Clipboard + ARIA) & CJK Font Shards
+// 3. IME Adapters & WebCanvasHost
 // ============================================================================
 class ITextInputMethodHost {
 public:
@@ -195,6 +285,47 @@ public:
     virtual void OnCompositionStart() = 0;
     virtual void OnCompositionUpdate(std::string_view preeditText, std::uint32_t caretOffset) = 0;
     virtual void OnCompositionEnd(std::string_view committedText) = 0;
+};
+
+using NativeImeRectSyncCallback = void (*)(Rect caretScreenRect, bool active, void* userData) noexcept;
+
+// Desktop X11 / Win32 / Headless IME adapter tracking caret screen bounds & composition text
+class DesktopImeAdapter final : public ITextInputMethodHost {
+public:
+    DesktopImeAdapter() = default;
+
+    void FocusTextInput(UIElement* focusedElement, Rect caretScreenRect) override;
+    void BlurTextInput() override;
+    void OnCompositionStart() override;
+    void OnCompositionUpdate(std::string_view preeditText, std::uint32_t caretOffset) override;
+    void OnCompositionEnd(std::string_view committedText) override;
+
+    void SetNativeSpotSyncCallback(NativeImeRectSyncCallback callback, void* userData) noexcept {
+        spotSyncCallback_ = callback;
+        spotSyncUserData_ = userData;
+    }
+
+    [[nodiscard]] bool IsImeActive() const noexcept { return imeFocused_; }
+    [[nodiscard]] bool IsComposing() const noexcept { return isComposing_; }
+    [[nodiscard]] UIElement* FocusedElement() const noexcept { return focusedElement_; }
+    [[nodiscard]] Rect CaretScreenRect() const noexcept { return caretScreenRect_; }
+    [[nodiscard]] const std::string& PreeditString() const noexcept { return preeditText_; }
+    [[nodiscard]] const std::string& CommittedString() const noexcept { return committedText_; }
+    [[nodiscard]] std::uint32_t FocusSyncCount() const noexcept { return focusSyncCount_; }
+
+private:
+    UIElement* focusedElement_ = nullptr;
+    Rect caretScreenRect_{0.0f, 0.0f, 0.0f, 0.0f};
+    bool imeFocused_ = false;
+    bool isComposing_ = false;
+    std::uint32_t caretOffset_ = 0;
+    std::uint32_t focusSyncCount_ = 0;
+    std::string preeditText_;
+    std::string committedText_;
+    std::string compositionBaseText_;
+    std::size_t compositionBaseCaret_ = 0;
+    NativeImeRectSyncCallback spotSyncCallback_ = nullptr;
+    void* spotSyncUserData_ = nullptr;
 };
 
 struct AriaShadowNode {
@@ -272,12 +403,29 @@ class WebFontStreamProvider {
 public:
     WebFontStreamProvider();
 
+    void SetResourceContext(std::weak_ptr<UiResourceContext> context) noexcept {
+        resourceContext_ = std::move(context);
+    }
+
     // Decode UTF-8 codePoints and enqueue non-blocking shard fetch requests for any unloaded CJK range
     std::size_t InspectTextAndQueueMissingShards(
         std::string_view utf8Text,
         std::uint32_t targetRenderNodeId = 0);
 
-    // Complete an async shard fetch and mark affected PagedRenderTree nodes/pages dirty
+    // Export a compact binary "AGFS" glyph shard for shardId ([shardId*256 .. shardId*256+255])
+    [[nodiscard]] bool ExportShardPayloadForId(
+        std::uint32_t shardId,
+        std::string_view fontFamily,
+        std::vector<std::uint8_t>& outShardPayload) const;
+
+    // Export a compact binary "AGFS" glyph shard for an arbitrary Unicode codePoint range
+    [[nodiscard]] static bool ExportRangeShardPayload(
+        std::string_view fontFamily,
+        std::uint32_t rangeStart,
+        std::uint32_t rangeEnd,
+        std::vector<std::uint8_t>& outShardPayload);
+
+    // Complete an async shard fetch, unpack binary SDF glyphs into FontAtlas, and mark affected pages dirty
     bool OnShardDataArrived(
         std::uint32_t shardId,
         const std::vector<std::uint8_t>& shardPayload,
@@ -289,13 +437,16 @@ public:
         return pendingRequests_;
     }
     [[nodiscard]] std::size_t LoadedShardCount() const noexcept { return loadedShardCount_; }
+    [[nodiscard]] std::size_t TotalUnpackedGlyphs() const noexcept { return totalUnpackedGlyphs_; }
 
 private:
     UnicodeShardDescriptor& EnsureShardDescriptor(std::uint32_t codePoint);
 
+    std::weak_ptr<UiResourceContext> resourceContext_{};
     std::unordered_map<std::uint32_t, UnicodeShardDescriptor> shards_;
     std::vector<FontShardFetchRequest> pendingRequests_;
     std::size_t loadedShardCount_ = 0;
+    std::size_t totalUnpackedGlyphs_ = 0;
 };
 
 enum class WebRafState : std::uint8_t {
@@ -310,13 +461,28 @@ public:
         DualTrackBindingEngine* bindingEngine = nullptr,
         DepthBucketLayoutQueue* layoutQueue = nullptr,
         ShaderBackend webBackend = ShaderBackend::WebGL2,
-        PagedRenderTree* renderTree = nullptr);
+        PagedRenderTree* renderTree = nullptr,
+        std::shared_ptr<UiResourceContext> resourceContext = nullptr);
+    ~WebCanvasHost() override;
 
     [[nodiscard]] std::string_view HostName() const noexcept override {
         return "WebCanvasHost";
     }
 
+    void SetResourceContext(std::shared_ptr<UiResourceContext> context) override;
+    [[nodiscard]] std::shared_ptr<UiResourceContext> GetResourceContext() const noexcept override {
+        return resourceContext_;
+    }
+
+    void SetRootVisual(UIElement* root) noexcept {
+        ScopedUiResourceContext scope(resourceContext_);
+        rootVisual_ = root;
+        lastLaidOutViewport_ = {-1.0f, -1.0f};
+        RequestWakeFrame();
+    }
+    [[nodiscard]] UIElement* RootVisual() const noexcept { return rootVisual_; }
     void SetRenderTree(PagedRenderTree* tree) noexcept { renderTree_ = tree; }
+    [[nodiscard]] PagedRenderTree* GetRenderTree() const noexcept { return renderTree_; }
     void SetInputRouter(InputEventRouter* router) noexcept { inputRouter_ = router; }
     [[nodiscard]] InputEventRouter* InputRouter() const noexcept { return inputRouter_; }
     void SetStyleEngine(StyleTriggerEngine* styleEngine) noexcept { styleEngine_ = styleEngine; }
@@ -324,13 +490,29 @@ public:
     void SetAnimationEngine(AnimationEngine* animEngine) noexcept { animationEngine_ = animEngine; }
     [[nodiscard]] AnimationEngine* GetAnimationEngine() const noexcept { return animationEngine_; }
 
+    void SetWakeCallback(HostWakeCallback callback, void* userData) noexcept {
+        wakeCallback_ = callback;
+        wakeUserData_ = userData;
+    }
+
     // Strictly non-blocking rAF state machine (ASYNCIFY is strictly forbidden)
     [[nodiscard]] static constexpr bool IsAsyncifyEnabled() noexcept { return false; }
     [[nodiscard]] WebRafState RafState() const noexcept { return rafState_; }
     [[nodiscard]] ShaderBackend WebShaderBackend() const noexcept { return webBackend_; }
 
-    void RequestWakeFrame() noexcept { rafState_ = WebRafState::ActiveTicking; }
-    void SetViewportSize(Size viewport) noexcept { viewportSize_ = viewport; }
+    void RequestWakeFrame() noexcept {
+        rafState_ = WebRafState::ActiveTicking;
+        if (wakeCallback_) {
+            wakeCallback_(wakeUserData_);
+        }
+    }
+    void SetViewportSize(Size viewport) noexcept {
+        if (viewportSize_ != viewport) {
+            viewportSize_ = viewport;
+            RequestWakeFrame();
+        }
+    }
+    [[nodiscard]] Size ViewportSize() const noexcept { return viewportSize_; }
     void SuspendIfClean(bool hasDirtyState) noexcept {
         rafState_ = hasDirtyState ? WebRafState::ActiveTicking : WebRafState::SuspendedIdle;
     }
@@ -370,6 +552,10 @@ private:
     InputEventRouter* inputRouter_ = nullptr;
     StyleTriggerEngine* styleEngine_ = nullptr;
     AnimationEngine* animationEngine_ = nullptr;
+    std::shared_ptr<UiResourceContext> resourceContext_{};
+    AxbTemplateRegistry* wakeRegisteredRegistry_ = nullptr;
+    HostWakeCallback wakeCallback_ = nullptr;
+    void* wakeUserData_ = nullptr;
     ShaderBackend webBackend_ = ShaderBackend::WebGL2;
     WebRafState rafState_ = WebRafState::ActiveTicking;
     WebImeAdapter imeAdapter_{};
@@ -378,5 +564,8 @@ private:
     Size lastLaidOutViewport_{-1.0f, -1.0f};
     HostFrameTelemetry telemetry_{};
 };
+
+using DesktopHostDriver = DesktopEventHost;
+using WasmHostDriver = WebCanvasHost;
 
 } // namespace aero

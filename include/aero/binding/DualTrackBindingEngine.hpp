@@ -3,8 +3,10 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -21,20 +23,35 @@ struct ReactiveBindingInstance {
     std::string rawPath;
     BindingMode mode = BindingMode::OneWay;
     ValueConverterKind converter = ValueConverterKind::None;
+    std::string converterKey;
+    std::string converterParameter;
+    std::string stringFormat;
+    SymbolId converterSymbolId = 0;
+    SymbolId convertBackSymbolId = 0;
     ObjectRef rootObject{};
     UnifiedValue fallbackValue{};
     std::vector<AxbCompiledHop> hops;
     std::vector<ObjectRef> resolvedHopObjects;
     IntrusivePtr<UIElement> targetElement{};
     std::uint16_t targetPropertyId = 0;
+    ObjectRef syncedCollectionRef{};
+    ObjectRef syncedCollectionWrapperRef{};
+    ObjectRef syncedCollectionOwnerRef{};
+    std::uint8_t syncedCollectionBitIndex = 0xFFu;
+    std::uint64_t lastSeenMutationVersion = 0;
     bool initialized = false;
 };
 
-// Phase 5D: Zero-allocation UIElement-to-UIElement (ElementName / RelativeSource) binding instance
+// Phase 5D + P1-4: Zero-allocation UIElement-to-UIElement (ElementName / RelativeSource) binding instance
 struct ElementPropertyBindingInstance {
     std::uint16_t bindingSlotId = 0;
     BindingMode mode = BindingMode::OneWay;
     ValueConverterKind converter = ValueConverterKind::None;
+    std::string converterKey;
+    std::string converterParameter;
+    std::string stringFormat;
+    SymbolId converterSymbolId = 0;
+    SymbolId convertBackSymbolId = 0;
     std::string elementName;
     std::string relativeAncestorType;
     bool relativeSelf = false;
@@ -44,6 +61,50 @@ struct ElementPropertyBindingInstance {
     IntrusivePtr<UIElement> targetElement{};
     UnifiedValue fallbackValue{};
     UnifiedValue lastSyncedValue{};
+    bool initialized = false;
+};
+
+struct MultiBindingInstance;
+
+// P1-4: Individual source slot inside a MultiBindingInstance (supports DataContext hop chains,
+// ElementName / RelativeSource properties, and nested sub-MultiBindings)
+struct MultiBindingSourceSlot {
+    bool isElementSource = false;
+    std::string rawPath;
+    std::string elementName;
+    std::string relativeAncestorType;
+    bool relativeSelf = false;
+    std::uint16_t sourcePropertyId = 0;
+    UIElement* cachedSourceElement = nullptr;
+    std::vector<AxbCompiledHop> hops;
+    std::vector<ObjectRef> resolvedHopObjects;
+    ValueConverterKind converter = ValueConverterKind::None;
+    std::string converterKey;
+    std::string converterParameter;
+    std::string stringFormat;
+    SymbolId converterSymbolId = 0;
+    SymbolId convertBackSymbolId = 0;
+    UnifiedValue fallbackValue{};
+    UnifiedValue lastEvaluatedValue{};
+    std::shared_ptr<MultiBindingInstance> nestedMulti{};
+};
+
+struct MultiBindingInstance {
+    std::uint16_t bindingSlotId = 0;
+    BindingMode mode = BindingMode::OneWay;
+    ValueConverterKind converter = ValueConverterKind::None;
+    std::string converterKey;
+    std::string converterParameter;
+    std::string stringFormat;
+    SymbolId converterSymbolId = 0;
+    SymbolId convertBackSymbolId = 0;
+    ObjectRef rootObject{};
+    UnifiedValue fallbackValue{};
+    UnifiedValue lastSyncedOutput{};
+    std::vector<MultiBindingSourceSlot> sources;
+    IntrusivePtr<UIElement> targetElement{};
+    std::uint16_t targetPropertyId = 0;
+    bool hasElementSource = false;
     bool initialized = false;
 };
 
@@ -75,6 +136,14 @@ struct HotReloadMigrationPair {
 
 class DualTrackBindingEngine {
 public:
+    using HostValueConvertFn = std::function<UnifiedValue(
+        const UnifiedValue& value,
+        std::string_view parameter)>;
+    using HostMultiValueConvertFn = std::function<UnifiedValue(
+        const UnifiedValue* values,
+        std::size_t count,
+        std::string_view parameter)>;
+
     explicit DualTrackBindingEngine(
         ExecutionDomainContext& domains,
         const ProgramImage* program = nullptr,
@@ -95,7 +164,42 @@ public:
     void MarkValuesInPools() const noexcept;
 
     // =========================================================================
-    // Track A: ReactiveSlotTrack (Multi-hop CompiledSlotChain + ElementName)
+    // P1-4: Named C++ & RealScript SymbolId IValueConverter / IMultiValueConverter Registry
+    // =========================================================================
+    void RegisterValueConverter(
+        std::string name,
+        HostValueConvertFn convertFn,
+        HostValueConvertFn convertBackFn = {});
+
+    void RegisterMultiValueConverter(
+        std::string name,
+        HostMultiValueConvertFn convertFn);
+
+    void RegisterScriptValueConverter(
+        std::string name,
+        SymbolId convertSymbolId,
+        SymbolId convertBackSymbolId = 0,
+        ObjectRef receiverObject = ObjectRef{});
+
+    [[nodiscard]] UnifiedValue ApplySingleValueConversion(
+        ValueConverterKind kind,
+        std::string_view converterKey,
+        std::string_view converterParameter,
+        SymbolId scriptConvertSym,
+        SymbolId scriptConvertBackSym,
+        const UnifiedValue& rawVal,
+        bool inverseForTwoWay) const;
+
+    [[nodiscard]] UnifiedValue ApplyMultiValueConversion(
+        ValueConverterKind kind,
+        std::string_view converterKey,
+        std::string_view converterParameter,
+        SymbolId scriptConvertSym,
+        const UnifiedValue* values,
+        std::size_t count) const;
+
+    // =========================================================================
+    // Track A: ReactiveSlotTrack (Multi-hop CompiledSlotChain, MultiBinding & ElementName)
     // =========================================================================
     std::uint16_t BindChain(
         ObjectRef rootObject,
@@ -107,6 +211,12 @@ public:
         const AxbCompiledBindingChain& compiledChain,
         const IntrusivePtr<UIElement>& targetElement);
 
+    std::uint16_t BindMultiChain(
+        ObjectRef rootObject,
+        const AxbCompiledMultiBinding& compiledMulti,
+        const IntrusivePtr<UIElement>& targetElement,
+        RuntimeError* error = nullptr);
+
     std::uint16_t BindPath(
         ObjectRef rootObject,
         std::string_view propertyPath,
@@ -115,17 +225,19 @@ public:
         BindingMode mode = BindingMode::OneWay,
         RuntimeError* error = nullptr);
 
-    // Phase 5D: Re-target all Track A bindings inside subtreeRoot to newRootObject in-place
-    // (0 heap allocations / 0 UIElement rebuilds during virtualized DataTemplate scrolling!)
+    // Phase 5D: Re-target all Track A & MultiBinding instances inside subtreeRoot to newRootObject in-place
     std::size_t RebindSubtreeRootObject(
         UIElement* subtreeRoot,
         ObjectRef newRootObject,
         RuntimeError* error = nullptr);
 
-    // Detach and clean up Track A / ElementName bindings targeting elements inside subtreeRoot.
+    // Detach and clean up Track A / MultiBinding / ElementName bindings targeting elements inside subtreeRoot.
     std::size_t UnbindSubtree(const UIElement* subtreeRoot) noexcept;
 
-    // Flush dirty [Observable] objects across SimHeap and UiHeap + ElementName bindings,
+    // Detach a single binding instance by its bindingSlotId
+    bool UnbindSlot(std::uint16_t bindingSlotId) noexcept;
+
+    // Flush dirty [Observable] objects across SimHeap and UiHeap + MultiBindings + ElementName bindings,
     // re-connecting any intermediate hop whose reference changed, and writing terminal slots in O(1).
     std::size_t FlushTrackA(RuntimeError* error = nullptr);
 
@@ -148,6 +260,9 @@ public:
     }
     [[nodiscard]] const std::vector<ElementPropertyBindingInstance>& ElementBindings() const noexcept {
         return elementBindings_;
+    }
+    [[nodiscard]] const std::vector<MultiBindingInstance>& MultiBindings() const noexcept {
+        return multiBindings_;
     }
 
     // =========================================================================
@@ -174,6 +289,41 @@ public:
         const EcsColumnBindingChannel& channel) const noexcept;
 
 private:
+    struct RegisteredConverterEntry {
+        HostValueConvertFn convertFn{};
+        HostValueConvertFn convertBackFn{};
+        HostMultiValueConvertFn multiConvertFn{};
+        SymbolId convertSymbolId = 0;
+        SymbolId convertBackSymbolId = 0;
+        ObjectRef receiverObject{};
+    };
+
+    [[nodiscard]] UnifiedValue InvokeScriptConverterSymbol(
+        SymbolId fnSym,
+        ObjectRef receiverObj,
+        const UnifiedValue* values,
+        std::size_t valueCount,
+        std::string_view parameter) const;
+
+    [[nodiscard]] UnifiedValue FinalizeTargetPropertyValue(
+        std::uint16_t targetPropId,
+        std::string_view stringFormat,
+        const UnifiedValue& val) const;
+
+    void PopulateMultiBindingFromCompiled(
+        MultiBindingInstance& outInst,
+        ObjectRef rootObject,
+        const AxbCompiledMultiBinding& compiledMulti,
+        const IntrusivePtr<UIElement>& targetElement) const;
+
+    void ReleaseMultiBindingObservers(MultiBindingInstance& mb) noexcept;
+    [[nodiscard]] UnifiedValue EvaluateMultiBindingValue(
+        MultiBindingInstance& mb,
+        RuntimeError* error,
+        bool& outAnyValid);
+    bool EvaluateAndSyncMultiBinding(MultiBindingInstance& mb, RuntimeError* error);
+
+    void ReleaseCollectionObserver(ReactiveBindingInstance& binding) noexcept;
     void ApplyFallbackOrClear(ReactiveBindingInstance& binding) const;
     bool EvaluateAndSyncChain(
         ReactiveBindingInstance& binding,
@@ -188,8 +338,11 @@ private:
     std::function<void()> wakeHostCallback_{};
     std::uint16_t nextBindingSlotId_ = 1;
     std::uint64_t lastObservedGcEpoch_ = 0;
+    std::unordered_map<std::string, RegisteredConverterEntry> registeredConverters_;
+    std::vector<CollectionChangeRecord> scratchCollectionDeltas_;
     std::vector<ReactiveBindingInstance> trackABindings_;
     std::vector<ElementPropertyBindingInstance> elementBindings_;
+    std::vector<MultiBindingInstance> multiBindings_;
     std::vector<EcsColumnBindingChannel> trackBChannels_;
 };
 

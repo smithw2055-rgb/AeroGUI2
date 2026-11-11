@@ -1,238 +1,224 @@
-# AeroGUI 2.0 + RealScript 下一代融合架构总体设计方案（集成 10 项源码级契约修正版）
+# AeroGUI 2.0 + RealScript 融合架构总体设计规范（ABI v2.0 & P0/P1/P2 全量实装版）
 
-**设计定位**：以 **RealScript（v0.98.0，`AeroGUI-Integration` 分支）** 扎实的编译器、MIR 优化器、字节码虚拟机、增量 GC、零拷贝 ECS 与 C++17 AOT（`rsaot`）为唯一脚本与反射底座（**仅做增量架构改造**）；同时**彻底抛弃旧版 AeroGUI 的历史包袱与冗余设计，从零全新设计极简高性能 C++17 UI 内核（AeroGUI 2.0）**，打造一套同时胜任**高性能游戏内嵌 UI（HUD / 3D 空间 UI）**、**通用跨平台桌面/移动应用**以及 **WebGL2 / WebGPU + WebAssembly 浏览器端应用**的现代类 C# + XAML 融合框架。
+**架构版本**：`ABI v2.0`（`RealScript RuntimeAbiMajor = 2`，`.axb4` 格式版本 `0x00020000`）
+**设计定位**：以 **RealScript（v0.98.0，`AeroGUI-Integration` 分支）** 编译器、MIR 优化器、字节码虚拟机、增量 GC、零拷贝 ECS 与 C++17 AOT（`rsaot`）为唯一托管与反射底座；从零构建**零第三方依赖、纯 32 位 `float` 管线、无 C++ RTTI/异常运行时依赖**的现代 C++17 UI 内核 **AeroGUI 2.0**，一套架构同时支撑**高性能游戏内嵌 HUD / 3D 空间 UI**、**0% 静止 CPU 占用原生桌面应用（Linux X11 / Win32）**以及 **WebGL2 / WebGPU + WebAssembly 浏览器端应用**。
 
-**关联云盘资源索引**：
+**关联参考索引**：
 
 * [AeroGUI 云盘项目根目录](https://drive.google.com/drive/folders/1pyAXOm4o8NrHcKiNWaP0brz87u1GsjE7)
-* [AeroGUI/samples 24 个标准样例工程目录](https://drive.google.com/drive/folders/1juGtPNwOnNJkAEo4RddoLamzzc6YacbJ)（对照 [AeroGUI/Noesis_Samples 基准目录](https://drive.google.com/drive/folders/1EWu3sbWuOFE5ciKt9KTqeIqQx7OTrm1K)）
+* [AeroGUI/samples 官方样例工程参考集](https://drive.google.com/drive/folders/1juGtPNwOnNJkAEo4RddoLamzzc6YacbJ)（对照 [AeroGUI/Noesis_Samples 基准目录](https://drive.google.com/drive/folders/1EWu3sbWuOFE5ciKt9KTqeIqQx7OTrm1K)）
 * [旧版 AeroGUI 代码架构深度审查报告（历史存档参考）](https://docs.google.com/document/d/1UeFe_QUCXnq5zdFHxngI_jB-HAGg8TcFja2XBuA3yO4/edit?usp=drivesdk)
+* [Samples.zip 全量 21 个官方示例黄金像素与解析基准报告](SAMPLES_BENCHMARK_REPORT.md)
 
 ---
 
-# 零、 架构审查与 10 项源码级契约修正总览
+# 一、 核心二进制契约与尺寸不变量总表（100% 源码 `static_assert` 锁死）
 
-在对照 RealScript（`third-party/RealScript`）与旧版 AeroGUI 真实源码完成深度可行性核验后，本方案已将以下 **10 项源码级契约修正（P0-1 ~ P0-5、P1-1 ~ P1-5）** 完整集成至各章节架构与 Phase 1 原型底座实现中：
+AeroGUI 2.0 与 RealScript 在编译期通过 `static_assert` 锁死全部跨界数据结构的字节尺寸与对齐边界，确保 C++17 内核、RealScript 字节码 VM、`rsaot` 生成代码以及 GPU 环形顶点流之间**零拆装箱、零拷贝、零隐式填充空洞**：
 
-| 修正编号 | 模块与源码位置 | 初始草案中的假设偏差 | 修正后落地方案（已在 Phase 1 实现） |
-| :--- | :--- | :--- | :--- |
-| **P0-1** | **跨堆互通 (`ExecutionDomainContext`)**<br>`Runtime.h` / `ManagedHeap.cpp` / `ExecutionDomain.h` | 1. 硬编码 `ref.heapId == 1U`（实际 `heapId` 为全局原子自增）；<br>2. 忽略运行期脚本 `string` 是绑定在源堆上的 `ObjectRef(ObjectKind::String)`；<br>3. 调用了尚未存在的 `fieldGetFast` 与 `stepIdleForDuration`。 | 1. 动态比对 `ref.heapId == simHeap_->heapId()` 与 `uiHeap_->heapId()`；<br>2. 跨堆读取 `ObjectKind::String` 时自动提取源堆 `stringView` 转为不可变池化 `StringValue`（并提供跨堆 `resolveStringView` 路由）；<br>3. 在 `ManagedHeap` 中实现零分配 `fieldGetFast`、`fieldSetFast` 与带时间预算的 `stepIdleForDuration`。 |
-| **P0-2** | **统一值模型 (`UnifiedValue`)**<br>`Runtime.h` / `UnifiedValue.hpp` | 自定义 `struct UnifiedValue` 在 offset 16..23 放置 `typeSymbolId` + `kind`，与 `realscript::runtime::Value`（24B `std::variant`，offset 16 为 `index()`）二进制布局冲突。 | 直接定义 `using UnifiedValue = realscript::runtime::Value;`，并在 `realscript::runtime::Value` variant 中扩展 16B `Float4Value` 承载 UI 的 `Color` / `Rect` / `Thickness` / `CornerRadius`，严格保持 `sizeof(Value) == 24` 且 Trivially Copyable，跨界传递无需 `reinterpret_cast`。 |
-| **P0-3** | **类型标识 (`SymbolId`)**<br>`Semantic.h` / `TypeClass.hpp` | 将 `TypeClass::rsSymbolId` 定义为 `uint32_t`，截断了 RealScript 的 64 位 FNV-1a `semantic::SymbolId`。 | `TypeClass::rsSymbolId` 统一使用 64 位 `realscript::semantic::SymbolId` (`uint64_t`)，与 `NativeHandle::typeId` 和 `ProgramImage` 完全对齐。 |
-| **P0-4** | **代际弱引用与多播委托 (`WeakRef` / `WeakDelegate`)**<br>`ManagedHeap.cpp` / `Interpreter.cpp` | 将所有委托节点的 `field[0]` 从 GC `referenceFields` 移除，会导致 8 字段多播委托二叉树左子树（`field[3] == 4` 时 `field[0]` 为 `leftChain`）及 Lambda 闭包实例被 GC 误杀。 | 保持普通委托、多播组合节点（`field[3] == 4`）与闭包委托 `referenceFields = {0u, 7u}` 强引用不变；新增专用弱目标委托支持（`allocateWeakDelegate`，`referenceFields = {7u}`，`flags` 标记 `kDelegateWeakTargetFlag = 8`）与代际 `WeakRef`，在 `flattenDelegate` / `InvokeDelegate` 及 `pruneDelegateChain` 时自动跳过并摘除已销毁的宿主目标。 |
-| **P0-5** | **小对象内联槽位访问 (`HeapObject`)**<br>`ManagedHeap.cpp` | 假设对象字段总在 `HeapObject::values` vector 中，忽略了字段数 `<= 4` 时存储在 `inlineValues`（此时 `values` 为空）。 | `ManagedHeap::fieldGetFast` 与 `fieldSetFast` 统一通过 `object->valueCount()` 与 `object->valueAt(fieldIndex)`（`usesInlineValues ? inlineValues[i] : values[i]`）读写。 |
-| **P1-1** | **`[Observable]` 与 64 位脏字段位图 (`dirtyFieldMask`)**<br>`Semantic.h` / `Compilation.cpp` / `ManagedHeap.cpp` | 直接执行 `1ULL << fieldIndex`，当类含 `sequence` 合成字段或大量控件字段导致 `fieldIndex >= 64` 时触发 C++ 移位未定义行为（UB）。 | 在编译期为 `[Observable]` 属性/字段分配独立的 `observableBitIndex (0..62)`，超出 63 个可观察字段时统一归并至溢出位 `63`（保证移位量恒在 `0..63`）；在 `HeapObject::Header` 中内置 `uint64_t dirtyFieldMask`、值相等性短路与去重脏对象队列 `dirtyObjects`。 |
-| **P1-2** | **`partial class` 跨语法树归并**<br>`Syntax.h` / `SyntaxFacts.cpp` / `Compilation.cpp` | 原编译器对同模块同名 `class` 直接报错 `RS4004`。 | 在词法/语法层支持 `partial` 修饰符（`SyntaxKind::PartialKeyword`），并在 `Compilation.cpp` 中按确定性文件顺序将同模块同名 `partial class` 的字段、属性、方法、事件、序列与接口列表归并。 |
-| **P1-3** | **零装箱属性槽位访问 ABI (`PropertySlotHandle`)**<br>`ExecutionDomain.h` / `GameScripting.h` | 缺少绕过字符串查找的编译期/运行期槽位句柄 API。 | 暴露 `PropertySlotHandle`（含 `declaringTypeId`、`fieldIndex`、`dirtyBitIndex`、`primitiveType`、`getterSymbolId`、`setterSymbolId`、`isDirectBackingField`）及 O(1) 槽位直读直写 API。 |
-| **P1-4** | **`CompactPropertyEntry` 对齐与视觉树 GC Root**<br>`UIElement.hpp` / `ExecutionDomain.cpp` | 1. `CompactPropertyEntry` 因 `UnifiedValue` 8B 对齐存在 4B 隐式 padding（实际 32B）；<br>2. 视觉树上挂载的派生控件 `cachedWrapper` 未纳入 `UiHeap` GC Root。 | 1. 显式利用 `CompactPropertyEntry` 的 4B 对齐空间存储 `uint16_t bindingSlotId` 与 `uint16_t animationTrackId`（固定 32B 无空洞）；<br>2. 在 `NativeHandleRegistry` 中提供 O(1) 借用槽位 `createBorrowed` / `resolveRawFast`，并在 `ExecutionDomainContext` GC 扫描中将活动视觉树节点的 `cachedWrapper` 作为 `UiHeap` 根保活。 |
-| **P1-5** | **AOT 与 Wasm 友好性**<br>`AotRuntime.h` / `AotRuntime.cpp` | `AotRuntime` 含裸 `try/catch/throw`，在 `-fno-exceptions` 下无法编译；Web 端需控制字体光栅化体积。 | 使用 `#if defined(__cpp_exceptions) || defined(_CPPUNWIND)` 宏保护 `AotRuntime` 中的异常块，明确 Wasm 端轻量化字形管线策略。 |
-
----
-
-# 一、 总体架构愿景与核心设计原则
-
-## 1. 为什么采用“RealScript 增量演进 + AeroGUI 2.0 推倒重来”？
-
-* **RealScript 代码基础扎实，天然具备做 UI 托管底座的基因**：现有 RealScript 已完整实现类 C# 语法、单继承（含脚本继承 C++ 类型）、接口、泛型、委托闭包、24B Trivial `Value`、16B 代际 `ObjectRef` 与 `NativeHandle`（`include/realscript/runtime/Runtime.h:44-114`）、`bindEcsRawColumnAuto` 零拷贝 ECS 列映射、带状态热重载（`include/realscript/hot_reload/HotReload.h`）、LSP/DAP 工具链以及 `rsaot --trusted-release` C++17 AOT 后端。只需针对 UI 场景补充双堆隔离、`partial class`、`[Observable]` 64 位脏位图织入、`PropertySlotHandle` 与弱引用委托支持，即可直接接管一切业务逻辑与反射职责。
-* **旧版 AeroGUI 的 10.1 万行代码中有大量“在 C++17 中强行模拟 CLR”的冗余包袱**：旧版为了在纯 C++ 中支持 MVVM、动态绑定和反射，造出了 4 张分裂的元数据表、640 KB 静态表、32B 非平凡 Value、56B/304B 膨胀属性存储、四层 ViewFrame 包装、三遍 XAML 编译与四级渲染顶点拷贝。当引入 RealScript 后，**AeroGUI 2.0 可以砍掉约 75% 的冗余代码（从 10.1 万行精简至约 2.5 万行纯 C++17 核心）**，聚焦于**保留模式视觉树 + 紧凑依赖属性 + 位图深度桶布局器 + 双轨绑定器 + 零拷贝 GPU 渲染内核**。
-
-## 2. 新旧架构全局对比矩阵
-
-| 架构维度 | 旧版 AeroGUI 独立架构（废弃） | AeroGUI 2.0 + RealScript 融合新架构 | 量化收益与本质跨越 |
-| :--- | :--- | :--- | :--- |
-| **职责分工与代码规模** | C++ 既写底层渲染又写 ViewModel、Converter、反射宏（10.1 万行 C++） | **C++ 仅保留约 2.5 万行视觉/布局/渲染内核**；一切 ViewModel、命令、转换器、Code-Behind 100% 由 RealScript (`.rs`) 承载 | 内核代码量削减 **75%**，应用层样板代码削减 **80%** |
-| **反射与类型系统** | 4 张 C++ 元数据表 + 640 KB `g_compactTypeIdTable` + `OrdinaryPropertyAdapter` 堆分配 | C++ 仅留**极简静态 `TypeClass`**（欧拉序区间 + 64 位 `rsSymbolId`）；全量反射统一归口至 RealScript `ProgramImage` | 消除 640 KB 静态表与约 3,500 行 C++ 反射表复制代码，转型耗时低于 1ns |
-| **值模型（Value ABI）** | 32B 非平凡 `Aero::Base::Value`（大于 16B 即二次堆分配）与 24B `rs::Value` 割裂 | 全局唯一 **24B Trivial `UnifiedValue`**（即 `realscript::runtime::Value`，扩展 16B `Float4Value` 原位内联 Color/Rect/Thickness/CornerRadius） | 跨 C++/脚本边界传递**零拆装箱、零拷贝、零 `reinterpret_cast`、零原子引用计数增减** |
-| **游戏脚本与 UI 脚本兼容** | 无脚本层，或面临确定性逻辑被 UI 帧率/GC 污染的风险 | **一语言双堆（`SimHeap` + `UiHeap` 动态 `heapId` 路由）** 共享只读 `ProgramImage`，Sim 到 UI 零拷贝只读槽穿透（含跨堆字符串自动池化转换），UI 到 Sim 走 `[SimCommand]` 队列 | 同一工程同一语法，**100% 保护帧同步确定性**，零 DTO 转换开销 |
-| **属性存储与优先级** | 56B `PropertyStoreEntry` + 304B `StoredValueRare`，单控件分配即占 264B | **快慢分离存储**：8 个高频属性直接内联为 `UIElement` 结构体字段（低于 2ns 直写）；稀疏属性采用 **32B 紧凑槽位数组（含绑定与动画槽位索引）** | 单控件内存降低 **70%**，高频属性写入提速 **20x-40x** |
-| **数据绑定引擎** | 运行期字符串路径分词 + 4 波次装箱刷新 + 单步监听限制 | **双轨绑定引擎**：轨道 A 为编译期多级整数槽位链（`CompiledSlotChain` + 64 位安全 `dirtyFieldMask`）；轨道 B 为 `bindEcsRawColumnAuto` SIMD 内存列直写渲染节点 | 支持任意深度路径自动通知；1,000 个游戏 HUD 血条每帧刷新低于 0.08ms、0 堆分配 |
-| **编译、热重载与发布** | 三遍 XAML 编译 + 运行期重解析 `{Binding}`；改 C++ 逻辑需重编链接 | **`aero-compiler`（`xamlc` + `rsc` + `rsaot` 合一）**：开发期 `.axb4` + `.rsbc` 引用映射状态迁移热重载（低于 5ms）；发布期生成纯 C++17 代码经 LTO 单体编译 | 开发期毫秒级热重载，发布期**零 XML 解析器、零字节码解释器开销** |
-| **跨平台与 WebGL2/Wasm** | 仅桌面端且 16ms 轮询耗电；四级顶点拷贝；OpenGL 3.3 不兼容 WebGL2 | **三栖宿主（`GameHost` / `DesktopHost` 0% 静止功耗 / `WebHost`）** + 零拷贝 GPU 缓冲流 + WebGL2/WebGPU 后端（**650-850 KB Wasm**） | 静止功耗降至 **0%**，Web 端包体积仅为 Avalonia Wasm 的 **1/15** |
+| 核心数据结构 | 源码头文件位置 | 精确尺寸 (`sizeof`) | 对齐 (`alignof`) | 核心布局与设计职责 |
+| :--- | :--- | ---: | ---: | :--- |
+| **`UnifiedValue`** (`rs::runtime::Value`) | `realscript/runtime/Runtime.h`<br>`aero/core/UnifiedValue.hpp` | **16 Bytes** | **16 Bytes** | 全局唯一 ABI v2.0 值单元；字节 `0..14` 为联合体载荷，字节 `15` 为统一 `ValueTag` (`0..29`)，单个 64B 缓存行紧密容纳 4 个值。 |
+| **`Float4Value`** | `realscript/runtime/Runtime.h` | **16 Bytes** | **4 Bytes** | 4 通道 32 位 `float {x, y, z, w}`，统一承载 UI `Color`、`Rect`、`Point`、`Thickness`、`CornerRadius` 与变换向量。 |
+| **`ObjectRef` / `StringValue` / `StructValue`** | `realscript/runtime/Runtime.h` | **16 Bytes** | **4 / 8 Bytes** | 均严格控制为 16B，且在 `offsetof == 15` 处内嵌 `vtag_`，与 `Value::u_` 原位重合，无需外包 `std::variant` 判别器。 |
+| **`NativeHandle`** | `realscript/runtime/Runtime.h` | **16 Bytes** | **8 Bytes** | 代际原生句柄（`slot:32`、`generation:16`、`registryId:16`、`typeId:64`）；存入 `Value` 时经 `typeIdx` 池化压缩至 `NativeHandleCell`（16B）。 |
+| **`FastInlineStorage`** | `aero/core/DependencyProperty.hpp` | **56 Bytes** | **4 Bytes** | `UIElement` 内联高频属性块（`Width/Height/MinWidth/MinHeight/Margin/Padding/Opacity/Visibility` + 对齐位 + 交互焦点状态位 + 布局脏标记）。 |
+| **`CompactPropertyEntry`** | `aero/core/DependencyProperty.hpp` | **32 Bytes** | **16 Bytes** | 零空洞稀疏依赖属性槽：字节 `0..7` 存 `propId/sourceRank/flags/bindingSlotId/animationTrackId`；字节 `8..15` 存双轨混合与契约输入槽；字节 `16..31` 存 16B `UnifiedValue`（每 64B 缓存行恰好 2 个条目）。 |
+| **`AxbFlatKeyframe`** | `aero/compiler/AxbFormat.hpp` | **28 Bytes** | **4 Bytes** | `MOT6` 扁平连续关键帧记录（`timeSec` + `Float4Value` + 插值模式 + Q7.8 定点三次贝塞尔超调切线控制点）。 |
+| **`AeroVertex`** | `aero/render/PagedRenderTree.hpp` | **24 Bytes** | **4 Bytes** | 纯 `float` GPU UberShader 顶点（`x, y, u, v` + `uint32_t rgba` + `uint16_t primType` + `uint16_t flags`）。 |
+| **`CommandPageHeader`** | `aero/render/PagedRenderTree.hpp` | **64 Bytes** | **8 Bytes** | 4KB 渲染页头（含 `pageIndex`、`vertexCount`、`dirtyRevision`、64 位 `dirtyQuadMask`、`clipRect` 与 `reserved[0]` 独立 `textureId` 槽位）。 |
+| **`CommandPage`** | `aero/render/PagedRenderTree.hpp` | **4096 Bytes** | **64 Bytes** | 4KB 分页 GPU 命令与顶点块：`64B Header + 168 * 24B AeroVertex`（精确容纳 **42 个独立 Quad**，零字节浪费）。 |
 
 ---
 
-# 二、 RealScript 架构增量改造设计（在扎实底座上的 5 项演进）
+# 二、 16B 统一值模型（ABI v2.0）与双堆托管底座
 
-RealScript 现有的前端（`src/syntax/`、`src/semantic/`）、中端（`src/mir/`、`src/optimization/`）与后端（`src/bytecode/`、`src/aot_cpp/`、`src/runtime/`）架构非常清晰，无需推翻重来，仅需在以下 5 个切入点做增量扩展：
+## 1. 16 字节 `UnifiedValue`（`rs::runtime::Value`）内存布局
 
-## 1. 一语言双堆（`SimDomain` + `UiDomain`）与跨堆零拷贝安全互通（含 P0-1 & P0-5 修正）
+旧版方案采用 24 字节 `std::variant` 导致缓存行利用率偏低且存在对齐空洞。在 **ABI v2.0（`RuntimeAbiMajor = 2`）** 中，`realscript::runtime::Value` 与 `aero::UnifiedValue` 彻底升级为 **16 字节、`alignas(16)` 平凡可拷贝联合体**，将类型判别标签统一固定在**第 15 字节（`offset 15`）**：
 
-为了在一套游戏中同时支撑**确定性游戏脚本（Gameplay）和游戏/通用 UI 脚本（Presentation）**，直接利用 RealScript 现有的只读 `ProgramImage`（`include/realscript/game/GameScripting.h`）和携带 32 位 `heapId` 的 `ObjectRef`（`include/realscript/runtime/Runtime.h:44-76`）：
-
-* **编译期同构（单一 `ProgramImage`）**：游戏逻辑模块（`module Game.Sim;`）与 UI 模块（`module Game.UI;`）在同一个编译会话中编译为同一份只读 `ProgramImage`，共享全部 64 位 `semantic::SymbolId`、结构体布局与字段槽位索引（`fieldIndex`）。UI 脚本可直接 `import Game.Sim;`。
-* **运行期双堆隔离（`SimHeap` vs `UiHeap`）**：
-  * **`SimDomain`（绑定 `SimHeap`，动态 `simHeap->heapId()`）**：开启 `DeterminismMode::Strict/Record/Replay`，固定 Tick 驱动，使用确定性 `sequence` 帧协程，严禁调用系统时钟或非确定性 UI API。
-  * **`UiDomain`（绑定 `UiHeap`，动态 `uiHeap->heapId()`）**：开启 `DeterminismMode::Off`，跟随渲染帧率或 OS 事件唤醒，在每帧渲染提交后的 Idle 窗口执行有界增量 GC（`ManagedHeap::stepIdleForDuration(shadowStack, maxMs)`）。
-* **跨堆交互的“只读槽穿透 + 跨堆字符串池化 + 命令队列回写”规则**：
-  1. **UI 直读 Sim 对象（O(1) 零拷贝，兼容 `inlineValues`）**：当运行在 `UiDomain` 的代码或 AeroGUI 2.0 绑定器读取一个 `ObjectRef` 的字段时，`ExecutionDomainContext::readObjectFieldFast` 动态比对 `ref.heapId == simHeap_->heapId()` 或 `uiHeap_->heapId()`，直接调用 `targetHeap->fieldGetFast(ref, fieldIndex, outVal)`（内部通过 `object->valueAt(fieldIndex)` 兼容 `<= 4` 字段 `inlineValues` 与 `> 4` 字段 `values`）。若读取出的字段是源堆上的 `ObjectRef(ObjectKind::String)`，自动提取 `targetHeap->stringView(strRef)` 并转换为不可变池化 `StringValue`，彻底消除跨堆字符串 `heapId` 校验失败问题。
-  2. **编译期与运行期写保护（`[SimState]`）**：在 `UiDomain` 中对任何属于 `SimHeap` 的对象调用 `writeObjectFieldFast` 将在运行期直接拦截拒绝（返回 `false` 并记录违规计数），同时禁止将 `UiHeap` 的 `ObjectRef` 写入 `SimHeap`，确保 UI 绝不污染逻辑帧确定性状态。
-  3. **UI 触发游戏动作（`[SimCommand]` 自动封送）**：当 UI 脚本调用标记了 `[SimCommand]` 的游戏逻辑方法时，通过 `ExecutionDomainContext::enqueueSimCommand` 向命令队列投递紧凑命令包 `SimCommandEnvelope`（含目标 `ObjectRef`、方法 64 位 `SymbolId` 与内联参数槽），在下一个确定性 `SimTick` 开头统一消费并写入 Replay 流。
-  4. **单向弱根 GC 安全性**：`SimHeap` 严禁持有 `UiHeap` 的引用；`UiHeap` 持有的 `SimHeap` 引用不参与 `SimHeap` 的 GC 根扫描，而是依靠 `ObjectRef::generation` 代数在访问时做 O(1) 存活校验（`simHeap->isAlive(ref)`），当游戏实体销毁时 UI 自动切回默认值。
-
-```cpp
-// RealScript 增量改造 1：include/realscript/runtime/ExecutionDomain.h
-namespace realscript::runtime {
-
-enum class DomainKind : std::uint8_t {
-    DeterministicSim = 1, // 严格确定性、固定 Tick、sequence 状态机
-    UiPresentation   = 2, // 响应式 UI、帧末 Idle GC、事件驱动
-};
-
-class ExecutionDomainContext {
-public:
-    ExecutionDomainContext(
-        std::shared_ptr<const ProgramImage> program,
-        std::shared_ptr<ManagedHeap> simHeap,
-        std::shared_ptr<ManagedHeap> uiHeap,
-        std::shared_ptr<NativeHandleRegistry> nativeHandles = nullptr);
-
-    // 跨堆安全只读槽位访问：动态匹配 heapId，兼容小对象 inlineValues，自动转换跨堆 String
-    bool readObjectFieldFast(
-        ObjectRef ref,
-        std::uint16_t fieldIndex,
-        Value& outVal) const noexcept;
-
-    // 写入严格校验：禁止从 UiPresentation 修改 SimHeap 对象，禁止将 UiHeap 引用写入 SimHeap
-    bool writeObjectFieldFast(
-        DomainKind callerDomain,
-        ObjectRef ref,
-        std::uint16_t fieldIndex,
-        const Value& val) noexcept;
-};
-
-} // namespace realscript::runtime
+```text
++-----------------------------------------------------------------------+---------------+
+| Bytes 0 .. 14 (15 Bytes Inline Payload / Arena Handle / Object Slot)  | Byte 15 (1B)  |
+|  - ValueTaggedCell<T> (sizeof(T) <= 12): bool, i64, f32, f64, Vec3... |   ValueTag    |
+|  - Float4InlineCell: float x (0..3), float y (4..7), float z (8..11), |   (0 .. 29)   |
+|                      uint8 w0, w1, w2 (top 24 bits of IEEE-754 float) |   Tag = 22    |
+|  - NativeHandleCell: slot(u32), gen(u16), regId(u16), typeIdx(u32)    |   Tag = 23    |
+|  - ArenaRefCell:     arenaIdx(u32) -> EnumArena/QuatArena/Float4Arena |  Tag = 24..26 |
+|  - StructValue:      typeId(u64), storageHandle(u32), inlineMeta(3B)  |   Tag = 27    |
+|  - StringValue:      const std::string* ptr(8B), internId(u32), pad   |   Tag = 28    |
+|  - ObjectRef:        slot(u32), generation(u32), heapId(u32), kind    |   Tag = 29    |
++-----------------------------------------------------------------------+---------------+
 ```
 
-## 2. `partial class` 跨语法树归并与 `[Observable]` 编译器内建织入（含 P1-1 & P1-2 修正）
+* **非追踪内联值标签（`ValueTag` `0..23`，`< ValueTag::FirstTraceable`）**：
+  * `Monostate(0)`、`NullString(1)`、`NullObject(2)`、`NullArray(3)`、`Bool(4)`、`Byte(5)`、`SByte(6)`、`Short(7)`、`UShort(8)`、`Int64(9)`、`UInt(10)`、`Long(11)`、`ULong(12)`、`Float(13)`、`Double(14)`、`Char(15)`、`EnumInline(16)`（64 位 `SymbolId` + 32 位枚举值原位内联）、`Fixed(17)`、`Fixed16(18)`、`Vec2(19)`、`Vec3(20)`、`QuatInline(21)`、`Float4Inline(22)`、`NativeHandle(23)`。
+* **可追踪/池驻留标签（`ValueTag` `24..29`，`>= ValueTag::FirstTraceable`）**：
+  * `EnumArena(24)`（超 32 位枚举值）、`QuatArena(25)`、`Float4Arena(26)`、`Struct(27)`、`String(28)`、`ObjectRef(29)`。`Value::isTraceable()` 仅需单条无分支比较 `tag >= FirstTraceable`。
 
-* **支持 `partial class`（改造 `include/realscript/syntax/Syntax.h`、`src/syntax/SyntaxFacts.cpp` 与 `src/compiler/Compilation.cpp`）**：
-  * 在词法/语法分析器中增加 `SyntaxKind::PartialKeyword` 并纳入声明修饰符集合；
-  * 在 `Compilation.cpp` 构建模块类型前，允许同一模块内的 `MyWindow.rs`（手写业务逻辑）与 `MyWindow.g.rs`（由 XAML 编译器自动生成的命名控件字段、属性槽位表与事件绑定代码）在均声明了 `partial` 时，按确定性文件名顺序归并字段、属性、方法、序列、构造函数、事件与接口列表；若同名类未全部标记 `partial`，则保持 `RS4004` 重复类型报错。
-* **`[Observable]` 编译器织入与 64 位安全对象脏位图（改造 `include/realscript/semantic/Semantic.h`、`src/compiler/Compilation.cpp` 与 `src/runtime/ManagedHeap.cpp`）**：
-  * **独立 `observableBitIndex (0..63)` 分配（消除 `fieldIndex >= 64` 移位 UB）**：在 `FieldSymbol` 与 `PropertySymbol` 中引入 `bool observable` 与 `uint16_t observableBitIndex`。编译期为标记了 `[Observable]` 的属性（或标记了 `[Observable]` 的类的公开属性/字段）按顺序分配独立的 `0..62` 位索引；若单个类的可观察属性超过 63 个，后续属性统一映射到溢出位 `63`（`kDirtyOverflowBit = 63`），保证 `1ULL << bitIndex` 永远不会发生 C++ 未定义移位行为。
-  * **值相等性短路与去重脏队列**：在每个 `ManagedHeap` 的 `HeapObject::Header` 内置 `uint64_t dirtyFieldMask = 0`、`uint16_t uiObserverCount = 0` 与 `bool inDirtyQueue = false`。当字段值写入时，若新旧 `Value` 相等则直接短路返回；若不等，则置位 `dirtyFieldMask |= (1ULL << safeBit)`，且在同一帧内无论修改多少次，仅在首次变脏时将 `ObjectRef` 压入 `dirtyObjects` 队列一次。
+## 2. `Float4Inline` 高频动画零分配快径与 `MakeFloat4InlineFast`
 
-## 3. 零装箱属性槽位访问 ABI（`PropertySlotHandle`，P1-3）
+UI 引擎中 `Color(r,g,b,a)`、`Thickness(l,t,r,b)`、`CornerRadius(tl,tr,br,bl)` 与 `Rect(x,y,w,h)` 均为 16 字节 `Float4Value`。为了在 16B `Value` 中同时装下 4 个 `float` 和 1 字节 `ValueTag`：
 
-在 `include/realscript/runtime/ExecutionDomain.h` 与 `include/realscript/game/GameScripting.h` 中增设绕过字符串查找的编译期/运行期槽位句柄：
+1. **无损自动内联**：当第 4 分量 `w` 的 IEEE-754 单精度尾数低 8 位全为 `0`（例如 `w = 1.0f` 不透明 Alpha、`0.0f`、`0.5f`、`0.25f` 或任何整数像素圆角/边距 `0..32768`）时，`Value` 自动将 `w` 的高 24 位（1 位符号 + 8 位阶码 + 高 15 位尾数）存入字节 `12..14`，标记 `ValueTag::Float4Inline(22)`，**0 池分配、0 锁竞争**。
+2. **高精度溢出回退**：当静态字面量的 `w` 含有非零低 8 位尾数时，自动通过 `detail::internArenaFloat4` 驻留到 `ValuePool` 连续槽位并标记 `ValueTag::Float4Arena(26)`，保持 32 位全精度无损往返。
+3. **动画热路径 `MakeFloat4InlineFast`**：在 `AnimationEngine` 每帧插值 `Color` / `Thickness` / `CornerRadius` 时，调用 `aero::MakeFloat4InlineFast(Float4Value)` 对 `w` 执行 IEEE-754 最近偶数舍入至高 24 位（精度达 `1/32768`，远超 8-bit/10-bit 色彩与亚像素几何精度），保证每帧数千通道属性插值 **100% 命中 `Float4Inline`**，完全不触碰 `ValuePool`。
 
-```cpp
-struct PropertySlotHandle {
-    semantic::SymbolId declaringTypeId = 0;
-    std::uint16_t fieldIndex = 0xFFFFu;       // 直接对应 HeapObject::valueAt(fieldIndex)
-    std::uint16_t dirtyBitIndex = 0xFFFFu;    // 对应 dirtyFieldMask 的安全位偏移 (0..63)
-    semantic::PrimitiveType primitiveType = semantic::PrimitiveType::Error;
-    semantic::SymbolId getterSymbolId = 0;    // 若为自定义计算属性，指向编译期函数符号
-    semantic::SymbolId setterSymbolId = 0;
-    bool isDirectBackingField = true;         // true 时直接读写 HeapObject 槽位，不进 VM 栈帧
-    bool isReadonly = false;
-};
-```
+## 3. `ValuePool` 大结构驻留与外部 GC 根标记协议（External Root Sweep Survival）
 
-## 4. 代际弱引用 `WeakRef` 与多播委托弱目标自动断路（含 P0-4 修正）
+RealScript 运行时通过 `SharedValuePoolBridge` 统一管理跨模块共享的 `StringValue` 驻留池、`Float4Arena` / `QuatArena` / `EnumArena`、`InlineStructArenaEntry`（`<= 4` 槽位结构体扁平池）、堆分配 `StructStorage` 与 `NativeHandle` `SymbolId` 映射表。
 
-* **零表代际 `WeakRef`**：在 `Runtime.h` 中提供 16B `WeakRef`（包装 `ObjectRef` 但不参与 GC 强引用扫描）。读取时调用 `weakRef.lock(heap)` 比较 `slots[ref.slot].generation == ref.generation`，实现 O(1) 零哈希表代际存活验证。
-* **多播委托二叉树保护与弱目标叶子自动摘除（改造 `ManagedHeap.cpp` 与 `Interpreter.cpp`）**：
-  * 普通委托、Lambda 闭包委托与多播委托组合节点（`field[3] == 4`，其中 `field[0]` 为左子树 `leftChain`，`field[7]` 为右子树 `rightChain`）保持 `referenceFields = {0u, 7u}` 强引用不变，确保多播树结构与匿名闭包绝不被 GC 误回收；
-  * 新增 `ManagedHeap::allocateWeakDelegate`（仅将 `referenceFields` 设为 `{7u}`，并在 `field[3]` 置位 `kDelegateWeakTargetFlag = 8`）。当遍历或调用委托（`flattenDelegate` / `InvokeDelegate` / `pruneDelegateChain`）时，若发现弱目标叶子节点的 `field[0]`（`target`）已销毁（`!heap->isAlive(target)`），自动跳过并从多播链中摘除该失效叶子。
+当 `ManagedHeap` 触发增量或全量垃圾回收并调用 `ValuePool::sweepUnmarked()` 时，为了防止驻留在 C++ 视觉树、模板缓存或样式/动画引擎中的池化字符串与大结构被误回收，AeroGUI 2.0 实现了严密的**外部根标记协议**：
 
-## 5. `UiDomain` 可重入异步任务与 Wasm 无异常友好运行时（含 P1-5 修正）
+* **自动注册外部标记回调**：活跃的 C++ 子系统在初始化/挂载时接入 `ValuePool` 外部根扫描链，GC 标记阶段自动遍历并调用 `rs_rt::markValueInPools(val)`：
+  1. **视觉树与控件层**：`UIElement::MarkSparseValuesInPools()`、`UIElement::MarkSubtreeValuesInPools()` 与 `ItemsControl::MarkExtraValuesInPools()`（保护稀疏属性表与虚拟化列表 `ItemsSource` 数据项）；
+  2. **二进制包与全局注册表**：`AxbPackage::PinValuesInPools()` / `MarkValuesInPools()` 与 `AxbTemplateRegistry::MarkValuesInPools()`（保护已反序列化的静态/动态资源、样式 Setter、触发器条件值及模板默认值）；
+  3. **绑定、样式与动画引擎**：`DualTrackBindingEngine::MarkValuesInPools()`、`StyleTriggerEngine::MarkValuesInPools()`（保护属性快照 `PropertySnapshotSlot::baseValue`）以及 `AnimationEngine::MarkValuesInPools()`（保护关键帧与基础值快照）。
+* **视觉树 `PersistentRoot` 托管包装保活**：当 `UIElement` 连接到根视觉树（`SetAsRootVisual(true)`）且绑定了 `UiHeap` 上的脚本派生包装对象（`BindScriptWrapper`）时，自动通过 `PersistentRoot` 将该 `ObjectRef` 固定为 `UiHeap` 强根；断开子树时自动释放，杜绝悬垂引用与内存泄漏。
 
-* **双轨协程规划**：`SimDomain` 继续使用合成在组件字段上的零分配确定性 `sequence`；`UiDomain` 规划支持堆分配可重入状态机与取消令牌绑定。
-* **AOT 无异常宏保护**：在 `AotRuntime.h` 与 `AotRuntime.cpp` 中使用 `#if defined(__cpp_exceptions) || defined(_CPPUNWIND)` 保护异常块，确保在 Emscripten `-fno-exceptions -fno-rtti` 下顺利编译。
+## 4. 一语言双堆（`SimDomain` + `UiDomain`）、`partial class` 与 `[Observable]`
+
+* **双堆动态路由与确定性隔离（`ExecutionDomainContext`）**：
+  * `SimDomain`（绑定 `SimHeap`）运行固定 Tick 确定性逻辑；`UiDomain`（绑定 `UiHeap`）跟随渲染帧或 OS 事件唤醒并在帧末执行有界增量 GC（`stepIdleForDuration`）。
+  * `readObjectField` 动态匹配 `ref.heapId`（兼容 `<= 4` 字段 `inlineValues` 与 `> 4` 字段 `values`），跨堆读取 `ObjectKind::String` 时自动池化为不可变 `StringValue`；`writeObjectField` 严禁从 `UiDomain` 修改 `SimHeap` 状态，UI 对游戏状态的变更一律通过 `[SimCommand]` 封送至 `SimCommandEnvelope` 队列。
+* **`partial class` 与 64 位安全 `dirtyFieldMask`**：
+  * `AeroCompiler` 单通解析 `.xaml` 并合成强类型 `*.g.rs` `partial class` 桩代码（含命名控件槽位与事件处理器绑定），与手写 `.rs` 源码在同一次编译会话中归并为单一 `ProgramImage`；
+  * `[Observable]` 属性在编译期分配独立 `observableBitIndex (0..62)`，超出 63 个可观察成员时归并至溢出位 `63`，彻底根除 `1ULL << idx` 移位未定义行为，并在值相等时短路跳过脏队列入队。
 
 ---
 
-# 三、 AeroGUI 2.0 全新内核架构设计（抛弃历史包袱，精简至约 2.5 万行 C++17）
+# 三、 `.axb4` 二进制包规范全表（Version `0x00020000`）
 
-## 1. AeroGUI 2.0 极简五层模块划分
+`.axb4` 是 AeroGUI 2.0 面向运行时的零 XML 解析器、单通线性二进制包格式（定义于 `include/aero/compiler/AxbFormat.hpp` 与 `src/core/AxbFormat.cpp`）。纯运行时（`aerogui_runtime`）无需链接任何 XML 或脚本编译器前端即可在亚毫秒内完成反序列化、热重载重绑定（`BindAgainstProgram`）与视觉树挂载（`MountAxbTemplate`）。
 
-1. **`aero/core`（对象、极简类型与快慢分离属性系统）**：24B `UnifiedValue`（直接复用 `realscript::runtime::Value`）、64 位 `rsSymbolId` 的静态 `TypeClass`、`DependencyProperty`、`UIElement`（8 大高频属性内联快槽 + 32B 紧凑稀疏表 + 纯侵入式视觉树 + `NativeHandleRegistry` 零哈希互转）。
-2. **`aero/layout`（位图深度桶布局与命中测试引擎）**：64 层侵入式 `DepthBucketLayoutQueue`、核心面板与统一 2D/3D 逆矩阵命中测试。
-3. **`aero/binding`（双轨数据绑定、样式触发器与 XAML VM）**：单通二进制 `.axb4` 加载器、`ReactiveSlotBinder`（对接 `ExecutionDomainContext` 与 `PropertySlotHandle`）与 `EcsColumnSimdBinder`（对接 `NativeRawColumnView`）。
-4. **`aero/controls`（完全模板驱动的精简标准控件库）**：所有控件统一走 `ControlTemplate` 与标准容器生成契约。
-5. **`aero/render` 与 `aero/host`（零拷贝 GPU 渲染器与三栖宿主）**：分页式 `PagedRenderTree`、`ZeroCopyGpuStream`、24B 顶点 Uber-Shader 后端及 `GameHost` / `DesktopHost` / `WebHost`。
+## 1. 文件头与核心基础表结构
 
-## 2. 核心基础层：24B `UnifiedValue`、与 NoesisGUI 对齐的全链路 `float` 数值规范与极简 `TypeClass`（含 P0-2 & P0-3 修正）
+所有多字节整数与 IEEE-754 单精度浮点数均采用 **Little-Endian（小端序）** 编码；字符串统一编码为 `uint32_t byteLen + UTF-8 bytes`；`UnifiedValue` 字面量按 `AxbLiteralTag` 编码（`Empty=0`、`Bool=1`、`Int64=2`、`Float32=3`、`Float4=4`、`String=5`）。
 
-AeroGUI 2.0 直接复用 `realscript::runtime::Value` 作为 `aero::UnifiedValue`，并在 `realscript::runtime::Value` 中内置 16B `Float4Value`（承载 `Color`、`Rect`、`Thickness`、`CornerRadius`）与 4B `FloatValue`。
+| 顺序 | 区段名称 | 魔数 / 标识 | 二进制内容与字段布局 |
+| ---: | :--- | :--- | :--- |
+| 1 | **文件魔数与版本头** | `"AXB4"` (`0x34425841`) | `magic:u32` (`0x34425841`)、`version:u32` (`0x00020000`)、`className:str`、`rootTypeName:str` |
+| 2 | **字符串驻留池** | `stringTable` | `count:u32` + `count * str`（供指令流与 `MOT6` 状态机通过 `uint32_t strIdx` O(1) 索引） |
+| 3 | **命名控件槽位表** | `namedControls` | `count:u32` + `{name:str, typeName:str, typeSymbolId:u64, fieldIndexInClass:u32}` |
+| 4 | **编译期槽位链基表** | `bindingChains` | `count:u32` + `{rawPath:str, targetPropId:u16, mode:u8, hopCount:u32, hops[...]}`（每跳含 `memberName`、64 位 `declaringTypeId`、`fieldIndex`、`observableBitIndex`、`getter/setterSymbolId` 与标志位） |
+| 5 | **事件路由绑定表** | `eventBindings` | `count:u32` + `{controlName:str, eventName:str, handlerMethodName:str, handlerSymbolId:u64}` |
+| 6 | **主视觉树指令流** | `instructions` | `count:u32` + `{opcode:u8, propId:u16, flags:u8, strIdx0:u32, strIdx1:u32, symbolId:u64, literalValue:Value}` |
+| 7 | **根句柄与静态资源表** | `resources` & `fallbacks` | `rootHandleFieldIndex:u32`、`resCount:u32 + {key:str, val:Value}`、`fbCount:u32 + fallbackValues[...]` |
 
-* **与 NoesisGUI 对齐的全链路 `float` 数值规范（禁用 `double`）**：
-  * AeroGUI 2.0 的所有 UI 数值类型与 NoesisGUI 严格对齐，统一采用 32 位单精度 `float`（**禁止在 UI 层使用 `double`**），从而与底层 GPU 顶点缓冲和着色器 Uniform 直接对齐，彻底消除 CPU 到 GPU 的 `double <-> float` 转换开销。
-  * 在 `UnifiedValue.hpp` 中提供 `MakeFloat(float v)`（底层直接构造 `FloatValue{v}`）与 `TryGetFloat(const UnifiedValue& v, float& out)` 作为 UI 唯一标准浮点接口；所有 `UIElement` 内联快槽/稀疏槽、几何与布局结构（`Size`、`Point`、`Rect`、`Thickness`、`CornerRadius`）、`.axb4` 二进制指令流浮点字面量以及 RealScript 侧 UI 脚本/`*.g.rs` 生成代码中的 UI 属性类型统一采用 `float`。
+## 2. 主指令集全表（`AxbOpcode` `1..11`）
 
-```cpp
-// include/aero/core/UnifiedValue.hpp — 直接复用 realscript::runtime::Value，100% 零转换同构
-#pragma once
-#include "realscript/runtime/Runtime.h"
+| Opcode | 枚举名称 | `propId` 语义 | `flags` 语义 | `strIdx0` / `strIdx1` / `symbolId` / `literalValue` 操作数契约 |
+| ---: | :--- | :--- | :--- | :--- |
+| **1** | `BeginElement` | 保留 (`0`) | `0x01` = 挂载至父 `HeaderedContentControl` 的 `Header` 槽 | `strIdx0`: 控件类型名字符串索引；`strIdx1`: `x:Name` 字符串索引（无名称时为 `0xFFFFFFFF`）；压入当前挂载元素栈。 |
+| **2** | `EndElement` | 保留 (`0`) | `0` | 弹出当前挂载元素栈顶节点，闭合子树作用域。 |
+| **3** | `SetStaticProperty` | 目标 `BuiltinPropertyId` | `0` | 将预解析的 `literalValue` 以 `ValueSourceRank::Local` 写入栈顶元素对应快槽或稀疏槽（渐变刷自动解析注册至 `GradientBrushRegistry`）。 |
+| **4** | `BindProperty` | 目标 `BuiltinPropertyId` | `0` | `strIdx0` 指向 `bindingChains[strIdx0]`，在 `DualTrackBindingEngine` 中建立 Track A 多跳槽位链或 `ElementName`/`RelativeSource` 绑定。 |
+| **5** | `BindEcsColumn` | 目标 `BuiltinPropertyId` | `0` | `symbolId`: ECS 组件 64 位 `SymbolId`；`strIdx0`: 字段名索引；`strIdx1`: 行索引；建立 Track B `NativeRawColumnView` 零拷贝列绑定。 |
+| **6** | `BindEvent` | 保留 (`0`) | `0` | `strIdx0` 指向 `eventBindings[strIdx0]`，`symbolId` 为目标方法 64 位符号 ID（支持 VM `Interpreter`、AOT 函数表与弱目标委托路由）。 |
+| **7** | `AddRowDefinition` | 保留 (`0`) | `GridUnitType` (`Auto=0, Pixel=1, Star=2`) | `literalValue` (`Float32`) 为行高数值/权重，向栈顶 `Grid` 追加 `RowDefinition`。 |
+| **8** | `AddColumnDefinition` | 保留 (`0`) | `GridUnitType` (`Auto=0, Pixel=1, Star=2`) | `literalValue` (`Float32`) 为列宽数值/权重，向栈顶 `Grid` 追加 `ColumnDefinition`。 |
+| **9** | `SetResourceProperty` | 目标 `BuiltinPropertyId` | `AxbResourceLookupFlags`：<br>`0x00`=`StaticResource`<br>`0x02`=`DynamicResource`<br>`0x04`=`{noesis:Loc}` | `strIdx0` 为资源键名索引；`0x00` 执行静态资源查表注入，`0x02` 与 `0x04` 同时在 `AxbTemplateRegistry` 注册弱订阅以支持亚毫秒级运行期主题/多语言热切换。 |
+| **10** | `BindTemplateParent` | 目标子元素 `BuiltinPropertyId` | `ValueConverterKind` (`0..7`) | `strIdx0` 存储源宿主控件属性 ID（`sourcePropId`），在 `ControlTemplate` 内部建立 O(1) 零分配 `TemplateBinding` 同步通道。 |
+| **11** | `BindMultiProperty` | 目标 `BuiltinPropertyId` | `0` | `strIdx0` 指向 `multiBindings[strIdx0]`（由 `AP14` 段承载），建立多源聚合 `MultiBinding`（支持嵌套子 `MultiBinding`、`StringFormat`、`MathConverter` 与 `IMultiValueConverter`）。 |
 
-namespace aero {
+## 3. 扩展二进制段全表（Optional Trailing Sections）
 
-using UnifiedValue = realscript::runtime::Value;
-using Float4Value  = realscript::runtime::Float4Value;
+主指令流与资源表之后，`.axb4` 按需追加自描述的四字节魔数扩展段，全部经过双向边界防御校验（零越界、零异常）：
 
-static_assert(sizeof(UnifiedValue) == 24, "UnifiedValue must be exactly 24 bytes");
-static_assert(std::is_trivially_copyable_v<UnifiedValue>, "Zero copy/dtor overhead");
-
-// 极简静态 TypeClass：采用 64 位 realscript::semantic::SymbolId 与 O(1) 欧拉序区间转型
-struct TypeClass final {
-    using FactoryFn = class UIElement* (*)() noexcept;
-
-    std::string_view name{};
-    const TypeClass* base = nullptr;
-    FactoryFn factory = nullptr;
-    std::uint16_t treeIn = 0U;
-    std::uint16_t treeOut = 0U;
-    realscript::semantic::SymbolId rsSymbolId = 0ULL; // 64-bit FNV-1a SymbolId (P0-3)
-
-    [[nodiscard]] constexpr bool IsDerivedFrom(const TypeClass* ancestor) const noexcept {
-        return ancestor != nullptr &&
-               (this == ancestor || (treeIn >= ancestor->treeIn && treeIn <= ancestor->treeOut));
-    }
-};
-
-} // namespace aero
-```
-
-## 3. 快慢分离的依赖属性与纯侵入式 `UIElement`（含 P1-4 修正）
-
-AeroGUI 2.0 将属性分为**热路径内联快槽（`FastInlineStorage`）与紧凑稀疏扩展槽（`CompactPropertyEntry`）**，并通过 `NativeHandleRegistry::createBorrowed` / `resolveRawFast` 实现 C++ `UIElement*` 与脚本 `NativeHandle` 的 O(1) 零哈希、零堆分配互转：
-
-```cpp
-// include/aero/core/UIElement.hpp
-namespace aero {
-
-enum FastPropertySlot : std::uint16_t {
-    kFastSlotWidth           = 1U << 0,
-    kFastSlotHeight          = 1U << 1,
-    kFastSlotMargin          = 1U << 2,
-    kFastSlotOpacity         = 1U << 3,
-    kFastSlotVisibility      = 1U << 4,
-    kFastSlotRenderTransform = 1U << 5,
-    kFastSlotClipRect        = 1U << 6,
-    kFastSlotForegroundRGBA  = 1U << 7,
-};
-
-// 稀疏属性条目：32B 紧凑对齐（显式利用 4B 对齐空间存放 bindingSlotId 与 animationTrackId，P1-4）
-struct alignas(8) CompactPropertyEntry {
-    std::uint16_t dpIndex = 0xFFFFU;
-    std::uint8_t  activeRank = 0U;
-    std::uint8_t  flags = 0U;
-    std::uint16_t bindingSlotId = 0xFFFFU;
-    std::uint16_t animationTrackId = 0xFFFFU;
-    UnifiedValue  effectiveValue{}; // 24B Trivial Value
-};
-static_assert(sizeof(CompactPropertyEntry) == 32, "CompactPropertyEntry must be 32 bytes");
-
-} // namespace aero
-```
+| 扩展段魔数 | ASCII 标识 | 引入阶段 | 承载数据结构与核心职责 |
+| :--- | :---: | :---: | :--- |
+| `0x4644534D` | **`"MSDF"`** | Phase 4 / 6 | **自适应 4 通道 MTSDF 矢量图集段**：序列化 `AxbMtsdfPathEntry[]`（64 位 `pathHash`、包围盒、图集 UV、自适应 `32/64/128` 单元格尺寸、`pxRange` 及 RGBA8 四通道方向距离场像素，其中 RGB 保角点锐度、A 存真实欧氏 SDF 供描边与柔和阴影采样）。 |
+| `0x35435453` | **`"STC5"`** | Phase 5C | **声明式样式、缓动故事板与视觉状态组段**：序列化 `AxbStyleDefinition[]`（含 `BasedOn` 继承链、属性 Setter、带进出场动画的 `Trigger`/`MultiTrigger`、`VisualStateManager` 状态组）与 `AxbStoryboard[]`（11 种解析缓动函数 × 3 模式 + 关键帧序列）。 |
+| `0x35505444` | **`"DTP5"`** | Phase 5D | **元素相对绑定、数据/事件触发器与数据模板段**：扩展 `bindingChains` 的 `ElementName` / `RelativeSource (Self / AncestorType)` 与内建 `ValueConverterKind`；序列化 `DataTrigger` / `MultiDataTrigger` 多跳编译路径、`AxbEventTrigger[]`（`Loaded/Click/MouseEnter/Checked/ValueChanged` 等 8 类路由事件）及递归子包 `AxbDataTemplate[]`。 |
+| `0x36544F4D` | **`"MOT6"`** | Phase 6 / P1-5 | **多前端扁平动画曲线、骨骼约束与多层状态机段**：连续存储 12 张扁平数组：`motionKeyframes`（28B `AxbFlatKeyframe`）、`motionTracks`、`motionEvents`（时间轴帧事件标记）、`motionClips`、`transformConstraints`（非树父子骨骼/Null 层变换约束）、`smConditions`、`smTransitions`（含交叉淡入淡出与 `ExitTime` 门控）、`smStates`（`SingleClip` / `ScrubbedClip` / `Blend1D` / `ExitState`）、`smLayers`（`Override` 覆盖层与 `Additive` 叠加层）、`smListeners`（零 VM 往返指针/焦点监听器）、`contractInputs`（映射 `0x1000 + slot`）与 `stateMachines`。 |
+| `0x31505443` | **`"CTP1"`** | P1-1 | **无头控件模板段（`ControlTemplate`）**：序列化 `AxbControlTemplate[]`（`key`、`targetTypeName`、内嵌完整 `.axb4` 子包字节流、带 `TargetName` 的模板触发器、模板路由事件触发器与 `VisualStateGroups`），反序列化后自动与 `Style` 的 `PropId_Template` 关联。 |
+| `0x3231524D` | **`"MR12"`** | P1-2 | **合并资源字典溯源段（`MergedDictionaries`）**：按拓扑顺序记录跨文件合并至当前包的 `ResourceDictionary Source` URI 列表（含 `.noesis` 工程级全局字典自动合并路径）。 |
+| `0x34315041` | **`"AP14"`** | P1-4 | **多源绑定、数学/格式化转换器与交互行为段**：序列化 `StringFormat`、`MathConverter` 表达式、自定义 C++/RealScript `IValueConverter`/`IMultiValueConverter` 符号、`AxbCompiledMultiBinding[]`（支持递归嵌套）、触发器关系比较算子 `TriggerComparisonOp`（`==, !=, <, <=, >, >=`）及 `<b:Interaction.Triggers>` 四大动作（`ChangePropertyAction`、`ControlStoryboardAction`、`InvokeCommandAction`、`PlaySoundAction`）。 |
 
 ---
 
-# 四、 双轨数据绑定、统一编译与三栖宿主路线图
+# 四、 零外部依赖渲染管线与跨平台窗口闭环
 
-| 实施阶段 | RealScript 侧改造任务（`third-party/RealScript`） | AeroGUI 2.0 侧设计任务（`c:\Projects\AeroGUI2`） | 里程碑验收标准 |
-| :--- | :--- | :--- | :--- |
-| **Phase 1：统一 ABI 与双堆底座（当前阶段）** | 1. 落地 `ExecutionDomainContext`（`SimHeap` + `UiHeap` 动态 `heapId`、跨堆 `String` 池化转换与跨堆只读保护）；<br>2. 实现 `partial class` 语法归并与 `[Observable]` 64 位安全 `dirtyFieldMask` 编译期织入；<br>3. 暴露 `PropertySlotHandle` O(1) 槽位读写 API、代际 `WeakRef` 与弱目标委托自动摘除。 | 1. 落地 24B `UnifiedValue`（含 `Float4Value`）、64 位 `rsSymbolId` 的 `TypeClass` 与纯侵入式 `UIElement`；<br>2. 实现 8 大高频属性内联快槽（`FastInlineStorage`）与 32B 紧凑稀疏表（`CompactPropertyEntry`）；<br>3. 打通 `UIElement::nativeSlot_` 与 `NativeHandleRegistry` 零哈希零分配互转及视觉树 `cachedWrapper` GC 保活。 | C++ `UIElement` 与 RealScript 对象跨界读写 0 堆分配；跨堆只读保护、代数失效、`partial class`、`[Observable]` 脏位图与弱委托单测 100% 通过。 |
-| **Phase 2：双轨绑定、统一编译器与控件自挂载** | 1. 完善 `[SimState]` 与 `[SimCommand]` 编译器自动封送代码生成；<br>2. 落地 `UiDomain` 堆分配可重入 `async Task`。 | 1. 开发单通 `aero-compiler`（`.xaml + .rs -> .axb4 + .g.rs`）；<br>2. 落地 `DualTrackBindingEngine` 与 `DepthBucketLayoutQueue`。 | 迁移核心 Samples，样板代码减少 **80%**，热重载延迟低于 **5ms**。 |
-| **Phase 3：零拷贝渲染、三栖宿主与 WebGL2/Wasm** | 1. 扩展 `rsaot` 栈上局部帧优化；<br>2. 拆分 `realscript_aot_runtime` 纯运行时 CMake 目标。 | 1. 落地 4KB 分页式 `PagedRenderTree` 与 `ZeroCopyGpuStream`；<br>2. 实现 `EmbeddedGameHost`、`DesktopEventHost` 与 `WebCanvasHost`。 | 1,000 个 ECS HUD 节点每帧刷新低于 **0.08ms**；桌面静止 CPU 占用 **0.0%**；产出轻量级 Wasm 演示应用。 |
+AeroGUI 2.0 彻底剔除了 FreeType、HarfBuzz、libpng、zlib、libjpeg、stb、GLFW/SDL 与 rive-cpp 等一切外部第三方二进制依赖，以精炼的自研 C++17 模块打通从资产解码到硬件上屏的完整闭环：
+
+## 1. `FontAtlas`：纯 C++17 TrueType 解析、Cardano 二次贝塞尔解析 SDF 与 `"AGFS"` 分片
+
+* **零依赖 `.ttf` 解析器（`TrueTypeFontFace`）**：直接解析 `head`、`hhea`、`maxp`、`hmtx`、`loca`、`glyf`（支持简单字形与递归复合字形 `Compound Glyph` 仿射拼接）、`cmap`（Format 4 / Format 6 / Format 12 全 Unicode 平面及 Symbol 编码回退）、`kern` 字距调整表与 `name` 家族名表，全程零异常、零 RTTI、纯 `float` 计算。
+* **Cardano 解析二次贝塞尔欧氏距离场烘焙**：对每条 TrueType 二次贝塞尔轮廓段 $B(t) = (1-t)^2 P_0 + 2(1-t)t P_1 + t^2 P_2$，通过 **Cardano 三次方程解析求根**求取采样点到曲线的精确最短欧氏距离与绕数符号，烘焙至 `1024x1024` 统一图集上半区（`v in [0.0, 0.5)`）的 Skyline R8 动态图集中；未加载外部 `.ttf` 时自带几何矢量化 ASCII SDF 保底字库，确保无头测试 100% 清晰可读。
+* **UTF-8 排版与 `"AGFS"` WebFont 流式分片**：`FontAtlas::MeasureLayout` 完整支持字距、`Ascent/Descent/LineGap` 多行度量及 `NoWrap` / `Wrap` / `WrapWithOverflow` 断词折行；`ExportGlyphShard` / `UnpackGlyphShard` 与 `WebFontStreamProvider` 支持按 256 码位区间导出紧凑 `"AGFS"`（`0x53464741`）二进制字形分片，在 Web 端非阻塞异步拉取 CJK 分片并在到达后局部刷新脏渲染页。
+
+## 2. `ImageAtlas`：零依赖 RFC1951 / PNG / JPEG / BMP / TGA 解码与多贴图拆合批
+
+* **纯 C++17 原生图像解码栈**：内建完整 **RFC1951 DEFLATE / RFC1950 zlib 解压器**（定长与动态 Huffman 树 + LZ77 滑动窗口）、**PNG 解码器**（支持 5 种 Paeth/Sub/Up/Average 扫描线滤波还原、8/16-bit 灰度/索引调色板 `PLTE`+`tRNS`/RGB/RGBA）、**Baseline JPEG 解码器**（SOF0/DHT/DQT、ZigZag 反量化、2D IDCT 与 YCbCr 转 RGBA8）、**BMP**（24/32-bit 上下翻转兼容）与 **TGA**（未压缩及 RLE 压缩）。
+* **XAML Pack URI 归一化与零 Scissor 拉伸裁剪**：`NormalizeImageUriPath` 自动剥离 `pack://application:,,,/Assembly;component/` 前缀；`ComputeImageStretchPlacement` 精确计算 `None`、`Fill`、`Uniform` 与 `UniformToFill` 的目标矩形与裁剪子 UV，无需额外插入 GPU Scissor 断批即可完成居中裁切。
+* **Skyline 共享图集与独立大贴图槽位拆合批**：小尺寸 UI 图标（默认 `<= 512x512`）自动通过 Skyline 算法打包进 `2048x2048` 共享图集（`textureId = 0`，四周自动外扩 1px 边缘像素消除双线性采样渗色）；大幅背景原画自动分配独立 `textureId > 0` 槽位，由 `CommandPageHeader::TextureId()` 与 `GpuClipDrawBatch::textureId` 自动完成合批与切页。
+
+## 3. `GradientBrushRegistry` 与 9 类 GPU UberShader 解析几何图元
+
+* **多停点渐变刷与 256-Texel 1D LUT 烘焙**：`GradientBrushRegistry`（上限 `4095` 把活跃画刷）统一管理多停点 `LinearGradientBrush` 与带偏移焦点 `GradientOrigin` 的 `RadialGradientBrush`（支持 `Pad` / `Reflect` / `Repeat` 延展模式及 `RelativeToBoundingBox` / `Absolute` 映射模式）。每把画刷预烘焙为 256 像素宽 RGBA8 一维色带行与浮点几何元数据行上传至共享图集底部，GPU 片元着色器与 CPU 参考光栅化器均通过 O(1) 采样完成精确求值。
+* **24B 顶点统一承载全部 9 种 `AeroPrimType`**：
+  * `0: SolidQuad`（纯色矩形快径）
+  * `1: SdfRoundedRect`（含 4 种 SDF 子模式：统一圆角快径、统一圆角镂空四边独立厚度边框环、非对称四角 `sdRoundedBox4` 填充、非对称四角镂空 `BorderBrush` 环）
+  * `2: SdfTextGlyph`（单通道 SDF 抗锯齿字形）
+  * `3: TexturedQuad`（`Image` / `ImageBrush` 双线性采样贴图矩形）
+  * `4: MsdfVectorPath`（4 通道 `median(R,G,B)` 保角点矢量图标 + A 通道欧氏描边）
+  * `5: SdfRadialArc`（零细分解析 SDF 圆环/扇形仪表盘）
+  * `6: DynamicMesh`（4KB 页内可变形 2D 网格）
+  * `7: SdfEllipse`（`<Ellipse>` 解析 SDF 抗锯齿椭圆填充与镂空描边环）
+  * `8: GradientRoundedRect`（12-bit `brushId` 驱动的多停点线性/径向渐变圆角矩形与渐变椭圆）
+
+## 4. `Matrix4x4` 3D 透视平面单应性正逆投影、`BlurEffect`/`DropShadowEffect` 与 Rive v7 解码器
+
+* **纯 `float` 3D 透视变换与闭式逆单应性命中测试**：
+  * `UIElement` 原生支持 `<noesis:CompositeTransform3D>` 与 `<PlaneProjection>`（`RotationX/Y/Z`、`TranslateX/Y/Z`、`ScaleX/Y/Z`、自定义枢轴与虚拟相机距离 `d = 1000px`），每个通道均开放独立 `BuiltinPropertyId (138..143)` 供故事板关键帧动画驱动。
+  * `Matrix4x4::ComposePlanarHomography` 精确级联多层祖先 3D 平面单应性矩阵，渲染树通过 `ProjectPoint2D` 输出真实透视梯形顶点；输入命中测试通过 `Matrix4x4::InverseProjectScreenToLocalPlane` 闭式求解 $3 \times 3$ 射线-平面（$z=0$）逆单应性伴随矩阵并校验前向裁剪面 $w > 0$，使 3D 倾斜面板内的按钮、滑块与输入框保持像素级精准点击交互。
+* **`DropShadowEffect` 与 `BlurEffect`**：
+  * `DropShadowEffect` 在主体图元前自动生成外扩 `sdfPadPx` 的解析柔和距离场阴影节点（零离屏 RT 切换开销）；
+  * `BlurEffect` 在 `PagedRenderTree` 中记录 `BlurLayerSpan` 子树区间，渲染后端在预乘 Alpha 离屏层完成子树光栅化与三遍可分离盒式近似高斯卷积模糊后再合成回主帧缓冲。
+* **Rive v7.0 LEB128 `.riv` 原生二进制流解码器与 `RiveControl`**：
+  * `DecodeRiveBinaryToAxbPackage` 与 `RiveFrontendImporter` 直接解析真实 Rive v7.0 二进制文件头（`"RIVE"` + 主次版本 + LEB128 属性表 Schema），提取 Artboard、骨骼/变换层级、参数化与三次贝塞尔闭合/开放轮廓（自动转为 SVG 路径并烘焙自适应 MTSDF）、线性动画与三次贝塞尔时间切线曲线、多层状态机、混合态与交互监听器，一键降级为标准 `.axb4 + MOT6` 包；XAML `<noesis:RiveControl Source="..."/>` 原生支持自动加载、拉伸对齐与 `<noesis:RiveInput>` 契约端口驱动。
+
+## 5. `GpuBackend` 与 `NativeWindowHost` 三栖零轮询宿主闭环
+
+* **双模 GPU 渲染设备（`IGpuDeviceBackend`）**：
+  * `OpenGlDeviceBackend`：零外部 GL 头文件依赖，内置完整 40 函数指针 `GlFunctionTable`，运行期在 Linux 通过 `dlopen("libGL.so.1" / "libEGL.so.1")`、在 Windows 通过 `opengl32.dll` + `wglGetProcAddress` 动态解析 OpenGL 3.3 Core / WebGL2 入口点，管理环形 VBO、静态扩容 Quad EBO、多槽位贴图与 Scissor 裁剪批次提交。
+  * `SoftwareSurfaceBackend`：无 GPU/无显示服务环境下由 `CreateBestAvailableGpuBackend` 自动无感回退，直接复用 `ZeroCopyGpuStream::RasterizeTreeToRgba8` 软件 UberShader 管线，确保 CI 黄金像素测试与桌面硬件渲染共享同一套数学语义，并提供零依赖 PPM/BMP 帧导出。
+* **三栖窗口与事件阻塞唤醒桥（`NativeWindowHost` + `HostDrivers`）**：
+  * **Linux (`LinuxX11OpenGL` / `LinuxX11Software`)**：动态 `dlopen("libX11.so.6")` 创建原生窗口，当 `DesktopEventHost::CanSleepIdle()` 为真时阻塞于 `poll(XConnectionNumber, wakePipeFd)`，实现 **0.0% 静止 CPU/GPU 占用**，任意后台线程可通过自管道 `WakeEventLoop()` 亚毫秒唤醒；无 `DISPLAY` 时自动降级至 `HeadlessSoftware`。
+  * **Windows (`Win32WglOpenGL` / `Win32GdiSoftware`)**：原生 `HWND` + WGL 3.3 Core 上下文 + `IMM32` 输入法光标跟随 + `MsgWaitForMultipleObjects` 零轮询阻塞唤醒。
+  * **WebAssembly (`EmscriptenWebGL2`)**：编译参数严格锁定 `-Oz -flto -fno-exceptions -fno-rtti -msimd128 -sUSE_WEBGL2=1 -sASYNCIFY=0`；通过按需 `requestAnimationFrame` 状态机（干净帧自动挂起 `SuspendedIdle`）、`WebImeAdapter` 透明 DOM `<input>` 组合输入桥与 `AriaShadowNode` 无障碍语义树，将纯运行时体积严格控制在轻量级预算之内。
+
+---
+
+# 五、 全栈模块目录与里程碑实装矩阵
+
+```text
+AeroGUI2/
+├── include/aero/
+│   ├── core/        #RsAliases, UnifiedValue(16B + Matrix2D/Matrix4x4), TypeClass(64-bit SymbolId),
+│   │                #DependencyProperty(FastInlineStorage 56B + CompactPropertyEntry 32B), UIElement
+│   ├── bridge/      #ScriptUiBridge (UIElement <-> NativeHandle O(1) 互转与可观察槽位桥接)
+│   ├── compiler/    #AxbFormat(.axb4 Opcodes 1..11 + MSDF/STC5/DTP5/MOT6/CTP1/MR12/AP14 + Rive v7),
+│   │                #AeroSceneIR(Xaml/Rive/Lottie/Svg Importers + ContractInputBank), AeroCompiler
+│   ├── layout/      #DepthBucketLayoutQueue (64 层位图扫描深度桶增量 Measure/Arrange 队列)
+│   ├── binding/     #DualTrackBindingEngine (Track A 多跳链/MultiBinding/转换器 + Track B ECS SIMD 列)
+│   ├── controls/    #Controls (Panel/Grid/Dock/Wrap/UniformGrid/ScrollViewer/Viewbox/TabControl/Expander/
+│   │                #Button/CheckBox/RadioButton/Slider/TextBox/ComboBox/ItemsControl/Shapes/RiveControl)
+│   ├── input/       #InputEventRouter (64 槽零分配输入环、2D/3D 逆投影命中测试、滚轮冒泡与焦点导航)
+│   ├── animation/   #AnimationEngine (11x3 缓动、C1 二阶弹簧、MakeFloat4InlineFast 与 MOT6 多层状态机)
+│   ├── style/       #StyleTriggerEngine (BasedOn 样式、Property/Data/Event/Interaction 触发器与 VSM)
+│   ├── render/      #FontAtlas(TTF+Cardano SDF+AGFS), ImageAtlas(DEFLATE+PNG/JPG/BMP/TGA+Skyline),
+│   │                #PagedRenderTree(4KB CommandPage + 9 PrimTypes), ZeroCopyGpuStream, GpuBackend
+│   └── host/        #HostDrivers(EmbeddedGame/DesktopEvent/WebCanvas + IME/WebFont), NativeWindowHost
+├── src/             #对应纯 C++17 实现（运行时与编译器物理隔离，支持 -fno-rtti / -fno-exceptions）
+├── third-party/
+│   └── RealScript/  #Git 子模块（ABI v2.0 16B Value、ValuePool、双堆 ExecutionDomain、partial/[Observable]）
+└── tests/           #phase1..phase6 + p0_1..p0_4 + p1_1..p1_5 + p2_1..p2_3 全量回归套件
+```
+
+| 阶段里程碑 | 核心交付内容 | 回归测试套件 | 状态 |
+| :--- | :--- | :--- | :---: |
+| **Phase 1 ~ 6** | 统一 ABI v2.0 底座、双轨绑定、`DepthBucketLayoutQueue`、4KB `PagedRenderTree`、`MOT6` 多层状态机与多前端 IR | `phase1_foundation_tests` ~ `phase6_abi_motion_importers_tests` + `phase4_slim_runtime_smoke_tests` | 已实装 |
+| **P0-1 ~ P0-4** | 非对称圆角/镂空边框 SDF、`OpenGlDeviceBackend` + `NativeWindowHost`、纯 C++17 `.ttf` Cardano SDF `FontAtlas`、RFC1951 + PNG/JPG/BMP/TGA `ImageAtlas` | `p0_1_tests` ~ `p0_4_tests` | 已实装 |
+| **P1-1 ~ P1-5** | `CTP1` `ControlTemplate`、`MR12` 跨文件资源字典与 `{noesis:Loc}` 热切换、`GradientBrushRegistry` + 几何图元/复合控件、`AP14` `MultiBinding`/`MathConverter`/交互行为、3D 透视单应性 + `Blur/DropShadow` + Rive v7 `.riv` 解码器 | `p1_1_tests` ~ `p1_5_tests` | 已实装 |
+| **P2-3（本阶段）** | 架构设计文档全面同步至 ABI v2.0、`.gitmodules` 与 `CMakeLists.txt` CTest 工程化闭环、`Samples.zip` 全量 **21 工程 / 74 `.xaml` / 9 `.riv` / 16 主场景黄金像素基准库** | `p2_3_tests`（**318/318 断言 100% 通过**） | 已实装 |

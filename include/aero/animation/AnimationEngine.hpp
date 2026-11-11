@@ -66,12 +66,7 @@ struct InlineTrackKeyFrame {
     bool isDiscrete = false;
 };
 
-// Zero-allocation AnimationEngine backed by CompactPropertyEntry::animationTrackId & MotionStateMachineBank:
-// - Contiguous pool of reusable AnimationTrack slots (free-list recycled -> 0 heap allocs in steady state)
-// - Tween, inline keyframes & zero-copy flat CompiledClipSlice tracks (CubicBezier, AnalyticalEase, Linear, HoldStep)
-// - Second-order C1 velocity-continuous Spring physics (interruptible mid-flight retargeting)
-// - Multi-layer State Machine (Override + Additive single-pass blend accumulator, ScrubbedClip, Blend1D, ExitTime, Triggers)
-// - Automatic animationTrackId linkage & pre-animation base value restoration on FillBehavior::Stop
+// Zero-allocation AnimationEngine backed by CompactPropertyEntry::animationTrackId & MotionStateMachineBank
 class AnimationEngine {
 public:
     static constexpr std::uint16_t InvalidTrackId = 0xFFFFu;
@@ -135,8 +130,7 @@ public:
             fillBehavior);
     }
 
-    // Start or retarget a C1 velocity-continuous second-order spring on a scalar float property!
-    // If an active spring track already exists on (target, propId), retargets in-place preserving current velocity!
+    // Start or retarget a C1 velocity-continuous second-order spring on a scalar float property
     std::uint16_t RetargetSpringFloat(
         UIElement* target,
         std::uint16_t propId,
@@ -159,9 +153,13 @@ public:
         EasingFunctionKind easingKind = EasingFunctionKind::Cubic,
         EasingMode easingMode = EasingMode::EaseOut);
 
-    // Start a compiled AxbAnimationTimeline or full AxbStoryboard against scopeRoot
+    // Start, stop, or toggle play/pause of a compiled AxbAnimationTimeline or full AxbStoryboard against scopeRoot
     std::uint16_t StartTimeline(UIElement* scopeRoot, const AxbAnimationTimeline& timeline);
     std::size_t BeginStoryboard(UIElement* scopeRoot, const AxbStoryboard& storyboard);
+    std::size_t StopStoryboard(UIElement* scopeRoot, const AxbStoryboard& storyboard, bool restoreBaseValue = true) noexcept;
+    std::size_t TogglePlayPauseStoryboard(UIElement* scopeRoot, const AxbStoryboard& storyboard);
+    [[nodiscard]] bool IsStoryboardActive(UIElement* scopeRoot, const AxbStoryboard& storyboard) const noexcept;
+    [[nodiscard]] bool IsStoryboardPaused(UIElement* scopeRoot, const AxbStoryboard& storyboard) const noexcept;
     bool StopPropertyAnimation(UIElement* target, std::uint16_t propId, bool restoreBaseValue = true) noexcept;
     std::size_t StopSubtreeAnimations(const UIElement* subtreeRoot, bool restoreBaseValue = false) noexcept;
 
@@ -242,6 +240,7 @@ private:
         EasingMode easingMode = EasingMode::EaseOut;
         FillBehavior fillBehavior = FillBehavior::HoldEnd;
         bool autoReverse = false;
+        bool paused = false;
         bool hadBaseSnapshot = false;
         ValueSourceRank baseRank = ValueSourceRank::Local;
         std::uint8_t keyFrameCount = 0;
