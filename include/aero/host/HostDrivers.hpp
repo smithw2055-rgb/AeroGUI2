@@ -407,6 +407,11 @@ public:
         resourceContext_ = std::move(context);
     }
 
+    void SetWakeCallback(HostWakeCallback callback, void* userData) noexcept {
+        wakeCallback_ = callback;
+        wakeUserData_ = userData;
+    }
+
     // Decode UTF-8 codePoints and enqueue non-blocking shard fetch requests for any unloaded CJK range
     std::size_t InspectTextAndQueueMissingShards(
         std::string_view utf8Text,
@@ -443,6 +448,8 @@ private:
     UnicodeShardDescriptor& EnsureShardDescriptor(std::uint32_t codePoint);
 
     std::weak_ptr<UiResourceContext> resourceContext_{};
+    HostWakeCallback wakeCallback_ = nullptr;
+    void* wakeUserData_ = nullptr;
     std::unordered_map<std::uint32_t, UnicodeShardDescriptor> shards_;
     std::vector<FontShardFetchRequest> pendingRequests_;
     std::size_t loadedShardCount_ = 0;
@@ -541,6 +548,10 @@ public:
 
     [[nodiscard]] WebFontStreamProvider& FontStream() noexcept { return fontStream_; }
     [[nodiscard]] const WebFontStreamProvider& FontStream() const noexcept { return fontStream_; }
+
+    bool OnFontShardLoaded(
+        std::uint32_t shardId,
+        const std::vector<std::uint8_t>& shardPayload);
 
     [[nodiscard]] const HostFrameTelemetry& Telemetry() const noexcept { return telemetry_; }
 

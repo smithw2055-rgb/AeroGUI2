@@ -15,6 +15,11 @@ if(NOT EMSCRIPTEN)
     find_package(Threads QUIET)
 endif()
 
+if(REALSCRIPT_SLIM_RUNTIME OR EMSCRIPTEN)
+    set(REALSCRIPT_INSTALL_SDK OFF CACHE BOOL "" FORCE)
+    set(REALSCRIPT_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+endif()
+
 # Include RealScript from third-party/RealScript
 add_subdirectory(third-party/RealScript)
 
@@ -65,6 +70,10 @@ target_link_libraries(aerogui_runtime
 
 if(TARGET Threads::Threads)
     target_link_libraries(aerogui_runtime PUBLIC Threads::Threads)
+endif()
+
+if(WIN32)
+    target_link_libraries(aerogui_runtime PUBLIC user32 gdi32 imm32)
 endif()
 
 if(UNIX AND NOT APPLE AND NOT EMSCRIPTEN)
@@ -120,18 +129,25 @@ if(AERO_BUILD_COMPILER_TOOLS)
     )
 
     if(AERO_BUILD_TESTS)
-        # Helper function to register test targets guarded by file existence
+        # Helper function to register test targets with strict source existence verification
         function(aero_register_core_test target_name source_rel_path)
             if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/${source_rel_path}")
                 add_executable(${target_name}
                     "${source_rel_path}"
                 )
                 target_link_libraries(${target_name} PRIVATE aerocore)
+                target_compile_definitions(${target_name}
+                    PRIVATE
+                        AERO_SAMPLES_DIR="${CMAKE_CURRENT_SOURCE_DIR}/Samples"
+                        AERO_TEST_TEMP_DIR="${CMAKE_CURRENT_BINARY_DIR}/test_out"
+                )
                 add_test(
                     NAME ${target_name}
                     COMMAND ${target_name}
                     WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
                 )
+            else()
+                message(FATAL_ERROR "Missing test source: ${CMAKE_CURRENT_SOURCE_DIR}/${source_rel_path}")
             endif()
         endfunction()
 
@@ -190,6 +206,14 @@ if(AERO_BUILD_TESTS)
             PRIVATE
                 realscript_slim_runtime
         )
+        target_compile_definitions(aerogui_slim_runtime_tests
+            PRIVATE
+                AERO_SAMPLES_DIR="${CMAKE_CURRENT_SOURCE_DIR}/Samples"
+                AERO_TEST_TEMP_DIR="${CMAKE_CURRENT_BINARY_DIR}/test_out"
+        )
+        if(WIN32)
+            target_link_libraries(aerogui_slim_runtime_tests PRIVATE user32 gdi32 imm32)
+        endif()
         if(TARGET Threads::Threads)
             target_link_libraries(aerogui_slim_runtime_tests PRIVATE Threads::Threads)
         endif()
@@ -206,5 +230,7 @@ if(AERO_BUILD_TESTS)
             COMMAND aerogui_slim_runtime_tests
             WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
         )
+    else()
+        message(FATAL_ERROR "Missing test source: ${CMAKE_CURRENT_SOURCE_DIR}/tests/phase4_slim_runtime_smoke_tests.cpp")
     endif()
 endif()

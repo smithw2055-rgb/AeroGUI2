@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <mutex>
@@ -73,12 +74,14 @@ struct TextureSlotBuffer {
     const std::uint8_t* src,
     std::size_t srcSize,
     std::vector<std::uint8_t>& outData,
-    std::size_t* outConsumedBytes = nullptr) noexcept;
+    std::size_t* outConsumedBytes = nullptr,
+    std::size_t maxOutputBytes = 128u * 1024u * 1024u) noexcept;
 
 [[nodiscard]] bool DecompressZlib(
     const std::uint8_t* src,
     std::size_t srcSize,
-    std::vector<std::uint8_t>& outData) noexcept;
+    std::vector<std::uint8_t>& outData,
+    std::size_t maxOutputBytes = 128u * 1024u * 1024u) noexcept;
 
 // Format sniffing & pure C++17 zero-dependency RGBA8 image decoders (PNG / JPEG / BMP / TGA)
 [[nodiscard]] ImageFormat DetectImageFormat(const std::uint8_t* data, std::size_t size) noexcept;
@@ -194,8 +197,16 @@ public:
         std::string_view localBaseDir = {}) const;
 
     // Texture slot inspection & headless bilinear RGBA8 sampler for ZeroCopyGpuStream::RasterizeTreeToRgba8
+    [[nodiscard]] std::uint64_t Revision() const noexcept { return revision_.load(std::memory_order_acquire); }
     [[nodiscard]] bool HasTextureSlot(std::uint32_t textureId) const noexcept;
     [[nodiscard]] const TextureSlotBuffer* GetTextureSlot(std::uint32_t textureId) const noexcept;
+    [[nodiscard]] bool CopyTextureSlotIfModified(
+        std::uint32_t textureId,
+        std::uint32_t& ioKnownSlotRevision,
+        std::uint32_t& outWidth,
+        std::uint32_t& outHeight,
+        std::vector<std::uint8_t>& outRgba8,
+        bool& outWasUpdated) const;
     [[nodiscard]] Color SampleBilinearRgba(std::uint32_t textureId, float u, float v) const noexcept;
 
     [[nodiscard]] std::size_t LoadedEntryCount() const noexcept;
@@ -230,6 +241,7 @@ private:
         std::string_view localBaseDir) const;
 
     mutable std::mutex mutex_;
+    std::atomic<std::uint64_t> revision_{1u};
     std::uint32_t sharedAtlasSize_ = kDefaultSharedAtlasSize;
     std::uint32_t maxPackableWidth_ = kDefaultMaxPackableExtent;
     std::uint32_t maxPackableHeight_ = kDefaultMaxPackableExtent;

@@ -1930,8 +1930,18 @@ void AppendFixedFloat32(
 
     bool neg = (numVal < 0.0f);
     const float absVal = std::fabs(numVal);
-    const auto scaled = static_cast<std::uint64_t>(
-        std::llround(absVal * static_cast<float>(scale)));
+    const float rawScaled = absVal * static_cast<float>(scale);
+    if (!std::isfinite(rawScaled) || rawScaled >= 9.0e18f) {
+        char expBuf[64]{};
+        const int n = std::snprintf(expBuf, sizeof(expBuf), "%g", static_cast<double>(numVal));
+        if (n > 0) {
+            out.append(expBuf, static_cast<std::size_t>(std::min<int>(n, static_cast<int>(sizeof(expBuf) - 1))));
+        } else {
+            out += "0";
+        }
+        return;
+    }
+    const auto scaled = static_cast<std::uint64_t>(std::llround(rawScaled));
     if (scaled == 0u) {
         neg = false;
     }
@@ -2070,6 +2080,17 @@ std::string FormatSingleBindingArgument(
             }
             if (leadUpper == 'D') {
                 const std::size_t pad = hasExplicitPrec ? std::min<std::size_t>(prec, 16u) : 1u;
+                if (!std::holds_alternative<std::int64_t>(rawVal) &&
+                    (!std::isfinite(numVal) || std::fabs(numVal) >= 9.0e18f)) {
+                    char expBuf[64]{};
+                    const int n = std::snprintf(expBuf, sizeof(expBuf), "%g", static_cast<double>(numVal));
+                    if (n > 0) {
+                        out.append(expBuf, static_cast<std::size_t>(std::min<int>(n, static_cast<int>(sizeof(expBuf) - 1))));
+                    } else {
+                        out += "0";
+                    }
+                    return out;
+                }
                 const auto iv = std::holds_alternative<std::int64_t>(rawVal)
                     ? std::get<std::int64_t>(rawVal)
                     : static_cast<std::int64_t>(std::llround(numVal));
@@ -2253,7 +2274,8 @@ std::string FormatBindingString(
             bool hasDigits = false;
             while (p < token.size() && std::isdigit(static_cast<unsigned char>(token[p]))) {
                 hasDigits = true;
-                argIdx = argIdx * 10u + static_cast<std::size_t>(token[p] - '0');
+                const std::size_t digit = static_cast<std::size_t>(token[p] - '0');
+                argIdx = (argIdx <= 65535u) ? (argIdx * 10u + digit) : 65536u;
                 ++p;
             }
             if (!hasDigits) {
@@ -2261,7 +2283,8 @@ std::string FormatBindingString(
                 i = closePos + 1u;
                 continue;
             }
-            int alignWidth = 0;
+            std::size_t alignMag = 0u;
+            bool alignLeft = false;
             bool hasAlign = false;
             if (p < token.size() && token[p] == ',') {
                 ++p;
@@ -2270,14 +2293,18 @@ std::string FormatBindingString(
                 if (p < token.size() && token[p] == '-') {
                     negAlign = true;
                     ++p;
+                } else if (p < token.size() && token[p] == '+') {
+                    ++p;
                 }
-                int w = 0;
+                std::size_t w = 0u;
                 while (p < token.size() && std::isdigit(static_cast<unsigned char>(token[p]))) {
-                    w = w * 10 + (token[p] - '0');
+                    const std::size_t digit = static_cast<std::size_t>(token[p] - '0');
+                    w = (w * 10u + digit > 512u) ? 512u : (w * 10u + digit);
                     hasAlign = true;
                     ++p;
                 }
-                alignWidth = negAlign ? -w : w;
+                alignMag = w;
+                alignLeft = negAlign;
             }
             std::string_view itemSpec{};
             if (p < token.size() && token[p] == ':') {
@@ -2287,18 +2314,13 @@ std::string FormatBindingString(
             if (args && argIdx < argCount) {
                 formattedItem = FormatSingleBindingArgument(args[argIdx], itemSpec, domains);
             }
-            if (hasAlign) {
-                const std::size_t absW = static_cast<std::size_t>(std::abs(alignWidth));
-                if (formattedItem.size() < absW) {
-                    const std::size_t pad = absW - formattedItem.size();
-                    if (alignWidth < 0) {
-                        out += formattedItem;
-                        out.append(pad, ' ');
-                    } else {
-                        out.append(pad, ' ');
-                        out += formattedItem;
-                    }
+            if (hasAlign && formattedItem.size() < alignMag) {
+                const std::size_t pad = alignMag - formattedItem.size();
+                if (alignLeft) {
+                    out += formattedItem;
+                    out.append(pad, ' ');
                 } else {
+                    out.append(pad, ' ');
                     out += formattedItem;
                 }
             } else {
@@ -2745,7 +2767,9 @@ void PackMtsdfAtlasSkyline(
 
     const std::uint16_t initialAtlas = std::max<std::uint16_t>(atlasSize, 512u);
     if (!tryPackWithSize(initialAtlas)) {
-        (void)tryPackWithSize(1024u);
+        if (initialAtlas >= 1024u || !tryPackWithSize(1024u)) {
+            (void)tryPackWithSize(2048u);
+        }
     }
 }
 
@@ -3195,6 +3219,60 @@ void VisitPackageValues(const AxbPackage& pkg, Fn&& fn) noexcept {
         }
     };
     visitStoryboards(pkg.storyboards);
+    auto visitInteractionActions = [&](const std::vector<AxbInteractionAction>& acts) noexcept {
+        for (const auto& act : acts) {
+            if (act.value.isTraceable()) fn(act.value);
+            if (act.commandParameter.isTraceable()) fn(act.commandParameter);
+            if (act.commandParameterBinding.fallbackValue.isTraceable()) {
+                fn(act.commandParameterBinding.fallbackValue);
+            }
+            if (act.commandParameterBinding.nestedMultiBinding) {
+                visitMultiBindingRec(visitMultiBindingRec, *act.commandParameterBinding.nestedMultiBinding);
+            }
+            for (const auto& tl : act.inlineStoryboard.timelines) {
+                if (tl.fromValue.isTraceable()) fn(tl.fromValue);
+                if (tl.toValue.isTraceable()) fn(tl.toValue);
+                for (const auto& kf : tl.keyFrames) {
+                    if (kf.value.isTraceable()) fn(kf.value);
+                }
+            }
+        }
+    };
+    auto visitControlTemplate = [&](const AxbControlTemplate& ct) noexcept {
+        if (ct.templatePackage) {
+            VisitPackageValues(*ct.templatePackage, fn);
+        }
+        for (const auto& trig : ct.triggers) {
+            for (const auto& cond : trig.conditions) {
+                if (cond.expectedValue.isTraceable()) fn(cond.expectedValue);
+            }
+            for (const auto& setter : trig.setters) {
+                if (setter.value.isTraceable()) fn(setter.value);
+            }
+            visitStoryboards(trig.enterStoryboards);
+            visitStoryboards(trig.exitStoryboards);
+            visitInteractionActions(trig.enterActions);
+            visitInteractionActions(trig.exitActions);
+        }
+        for (const auto& et : ct.eventTriggers) {
+            visitStoryboards(et.storyboards);
+            visitInteractionActions(et.actions);
+        }
+        for (const auto& vsg : ct.visualStateGroups) {
+            for (const auto& vs : vsg.states) {
+                for (const auto& setter : vs.setters) {
+                    if (setter.value.isTraceable()) fn(setter.value);
+                }
+                for (const auto& tl : vs.storyboard.timelines) {
+                    if (tl.fromValue.isTraceable()) fn(tl.fromValue);
+                    if (tl.toValue.isTraceable()) fn(tl.toValue);
+                    for (const auto& kf : tl.keyFrames) {
+                        if (kf.value.isTraceable()) fn(kf.value);
+                    }
+                }
+            }
+        }
+    };
     for (const auto& st : pkg.styles) {
         for (const auto& setter : st.setters) {
             if (setter.value.isTraceable()) fn(setter.value);
@@ -3208,24 +3286,6 @@ void VisitPackageValues(const AxbPackage& pkg, Fn&& fn) noexcept {
             }
             visitStoryboards(trig.enterStoryboards);
             visitStoryboards(trig.exitStoryboards);
-        }
-        auto visitInteractionActions = [&](const std::vector<AxbInteractionAction>& acts) noexcept {
-            for (const auto& act : acts) {
-                if (act.value.isTraceable()) fn(act.value);
-                if (act.commandParameter.isTraceable()) fn(act.commandParameter);
-                if (act.commandParameterBinding.fallbackValue.isTraceable()) {
-                    fn(act.commandParameterBinding.fallbackValue);
-                }
-                for (const auto& tl : act.inlineStoryboard.timelines) {
-                    if (tl.fromValue.isTraceable()) fn(tl.fromValue);
-                    if (tl.toValue.isTraceable()) fn(tl.toValue);
-                    for (const auto& kf : tl.keyFrames) {
-                        if (kf.value.isTraceable()) fn(kf.value);
-                    }
-                }
-            }
-        };
-        for (const auto& trig : st.triggers) {
             visitInteractionActions(trig.enterActions);
             visitInteractionActions(trig.exitActions);
         }
@@ -3247,6 +3307,9 @@ void VisitPackageValues(const AxbPackage& pkg, Fn&& fn) noexcept {
                 }
             }
         }
+        if (st.inlineControlTemplate) {
+            visitControlTemplate(*st.inlineControlTemplate);
+        }
     }
     for (const auto& ci : pkg.contractInputs) {
         if (ci.defaultValue.isTraceable()) {
@@ -3258,45 +3321,8 @@ void VisitPackageValues(const AxbPackage& pkg, Fn&& fn) noexcept {
             VisitPackageValues(*dt.templatePackage, fn);
         }
     }
-    auto visitControlTemplate = [&](const AxbControlTemplate& ct) noexcept {
-        if (ct.templatePackage) {
-            VisitPackageValues(*ct.templatePackage, fn);
-        }
-        for (const auto& trig : ct.triggers) {
-            for (const auto& cond : trig.conditions) {
-                if (cond.expectedValue.isTraceable()) fn(cond.expectedValue);
-            }
-            for (const auto& setter : trig.setters) {
-                if (setter.value.isTraceable()) fn(setter.value);
-            }
-            visitStoryboards(trig.enterStoryboards);
-            visitStoryboards(trig.exitStoryboards);
-        }
-        for (const auto& et : ct.eventTriggers) {
-            visitStoryboards(et.storyboards);
-        }
-        for (const auto& vsg : ct.visualStateGroups) {
-            for (const auto& vs : vsg.states) {
-                for (const auto& setter : vs.setters) {
-                    if (setter.value.isTraceable()) fn(setter.value);
-                }
-                for (const auto& tl : vs.storyboard.timelines) {
-                    if (tl.fromValue.isTraceable()) fn(tl.fromValue);
-                    if (tl.toValue.isTraceable()) fn(tl.toValue);
-                    for (const auto& kf : tl.keyFrames) {
-                        if (kf.value.isTraceable()) fn(kf.value);
-                    }
-                }
-            }
-        }
-    };
     for (const auto& ct : pkg.controlTemplates) {
         visitControlTemplate(ct);
-    }
-    for (const auto& st : pkg.styles) {
-        if (st.inlineControlTemplate) {
-            visitControlTemplate(*st.inlineControlTemplate);
-        }
     }
 }
 
@@ -3400,6 +3426,83 @@ bool AxbPackage::BindAgainstProgram(
         }
     }
 
+    auto resolveMemberTargetTypeId = [&](SymbolId ownerTypeId, const AxbCompiledHop& hop) -> SymbolId {
+        std::string rawNextTypeName;
+        const rs_sem::TypeSymbol* walkOwner = (ownerTypeId != 0) ? program.resolveType(ownerTypeId) : nullptr;
+        for (std::uint32_t baseDepth = 0u; walkOwner && baseDepth < 16u && rawNextTypeName.empty(); ++baseDepth) {
+            for (const auto& pr : walkOwner->properties) {
+                if (pr.name == hop.memberName && !pr.typeName.empty()) {
+                    rawNextTypeName = pr.typeName;
+                    break;
+                }
+            }
+            if (rawNextTypeName.empty()) {
+                for (const auto& fl : walkOwner->fields) {
+                    if (fl.name == hop.memberName && !fl.typeName.empty()) {
+                        rawNextTypeName = fl.typeName;
+                        break;
+                    }
+                }
+            }
+            if (rawNextTypeName.empty()) {
+                const std::string getterName = "get_" + hop.memberName;
+                for (const auto& m : walkOwner->methods) {
+                    if ((hop.getterSymbolId != 0 && m.id == hop.getterSymbolId) ||
+                        (m.propertyGetter && m.name == getterName)) {
+                        const std::string& rtName = rs_sem::storageReturnTypeNameOf(m);
+                        if (!rtName.empty()) {
+                            rawNextTypeName = rtName;
+                            break;
+                        }
+                    }
+                }
+            }
+            walkOwner = (walkOwner->baseTypeId != 0 && walkOwner->baseTypeId != walkOwner->id)
+                ? program.resolveType(walkOwner->baseTypeId)
+                : nullptr;
+        }
+        if (rawNextTypeName.empty()) {
+            return 0;
+        }
+        std::string canonicalNext = rawNextTypeName;
+        if (canonicalNext.find("::") == std::string::npos) {
+            if (const auto lastDot = canonicalNext.rfind('.'); lastDot != std::string::npos) {
+                canonicalNext = canonicalNext.substr(0, lastDot) + "::" + canonicalNext.substr(lastDot + 1);
+            }
+        }
+        SymbolId nextTypeId = rs_sem::stableTypeId(canonicalNext);
+        if (!program.resolveType(nextTypeId)) {
+            nextTypeId = 0;
+            for (const auto& mod : program.modules()) {
+                for (const auto& t : mod.types) {
+                    if (t.name == rawNextTypeName ||
+                        (mod.name + "." + t.name) == rawNextTypeName ||
+                        (mod.name + "::" + t.name) == rawNextTypeName) {
+                        nextTypeId = t.id;
+                        break;
+                    }
+                }
+                if (nextTypeId != 0 && program.resolveType(nextTypeId)) {
+                    break;
+                }
+            }
+        }
+        return program.resolveType(nextTypeId) ? nextTypeId : 0;
+    };
+
+    auto applyResolvedSlotToHop = [](AxbCompiledHop& hop, const PropertySlotHandle& slot) noexcept {
+        hop.declaringTypeId = slot.typeId;
+        hop.fieldIndex = slot.backingFieldIndex;
+        hop.observableBitIndex = slot.observableBitIndex;
+        hop.getterSymbolId = slot.getterSymbolId;
+        hop.setterSymbolId = slot.setterSymbolId;
+        hop.isAutoProperty = slot.isAutoProperty;
+        hop.isObservable = slot.isObservable;
+        hop.isReadOnly = slot.isReadOnly;
+        hop.isSimState = slot.isSimState;
+        hop.isSimCommand = slot.isSimCommand;
+    };
+
     auto bindHopVector = [&](std::vector<AxbCompiledHop>& hops, SymbolId rootOwnerId) {
         SymbolId currentHopOwnerId = rootOwnerId;
         for (auto& hop : hops) {
@@ -3408,61 +3511,9 @@ bool AxbPackage::BindAgainstProgram(
             }
             if (auto slotOpt = domains->resolvePropertySlot(
                     program, currentHopOwnerId, hop.memberName)) {
-                hop.declaringTypeId = slotOpt->typeId;
-                hop.fieldIndex = slotOpt->backingFieldIndex;
-                hop.observableBitIndex = slotOpt->observableBitIndex;
-                hop.getterSymbolId = slotOpt->getterSymbolId;
-                hop.setterSymbolId = slotOpt->setterSymbolId;
-                hop.isAutoProperty = slotOpt->isAutoProperty;
-                hop.isObservable = slotOpt->isObservable;
-                hop.isReadOnly = slotOpt->isReadOnly;
-                hop.isSimState = slotOpt->isSimState;
-                hop.isSimCommand = slotOpt->isSimCommand;
+                applyResolvedSlotToHop(hop, *slotOpt);
             }
-            const auto* ownerSym = program.resolveType(currentHopOwnerId);
-            SymbolId nextTypeId = 0;
-            std::string rawNextTypeName;
-            if (ownerSym) {
-                for (const auto& pr : ownerSym->properties) {
-                    if (pr.name == hop.memberName && !pr.typeName.empty()) {
-                        rawNextTypeName = pr.typeName;
-                        break;
-                    }
-                }
-                if (rawNextTypeName.empty()) {
-                    for (const auto& fl : ownerSym->fields) {
-                        if (fl.name == hop.memberName && !fl.typeName.empty()) {
-                            rawNextTypeName = fl.typeName;
-                            break;
-                        }
-                    }
-                }
-                if (!rawNextTypeName.empty()) {
-                    std::string canonicalNext = rawNextTypeName;
-                    if (canonicalNext.find("::") == std::string::npos) {
-                        if (const auto lastDot = canonicalNext.rfind('.'); lastDot != std::string::npos) {
-                            canonicalNext = canonicalNext.substr(0, lastDot) + "::" + canonicalNext.substr(lastDot + 1);
-                        }
-                    }
-                    nextTypeId = rs_sem::stableTypeId(canonicalNext);
-                    if (!program.resolveType(nextTypeId)) {
-                        for (const auto& mod : program.modules()) {
-                            for (const auto& t : mod.types) {
-                                if (t.name == rawNextTypeName ||
-                                    (mod.name + "." + t.name) == rawNextTypeName ||
-                                    (mod.name + "::" + t.name) == rawNextTypeName) {
-                                    nextTypeId = t.id;
-                                    break;
-                                }
-                            }
-                            if (program.resolveType(nextTypeId)) {
-                                break;
-                            }
-                        }
-                    }
-                }
-            }
-            currentHopOwnerId = nextTypeId;
+            currentHopOwnerId = resolveMemberTargetTypeId(currentHopOwnerId, hop);
         }
     };
 
@@ -3523,72 +3574,6 @@ bool AxbPackage::BindAgainstProgram(
         }
     };
 
-    auto bindActionCommand = [&](AxbInteractionAction& act) {
-        if (act.kind != InteractionActionKind::InvokeCommand) {
-            return;
-        }
-        if (act.hasCommandParameterBinding &&
-            act.commandParameterBinding.elementName.empty() &&
-            act.commandParameterBinding.relativeAncestorType.empty() &&
-            !act.commandParameterBinding.relativeSelf) {
-            bindHopVector(act.commandParameterBinding.hops, classTypeId);
-            resolveConverterSymbols(
-                act.commandParameterBinding.converter,
-                act.commandParameterBinding.converterKey,
-                act.commandParameterBinding.converterSymbolId,
-                act.commandParameterBinding.convertBackSymbolId);
-        }
-        if (act.commandPath.empty()) {
-            return;
-        }
-        if (!act.commandHops.empty()) {
-            bindHopVector(act.commandHops, classTypeId);
-            if (act.commandHops.back().isSimCommand) {
-                act.isSimCommand = true;
-            }
-        }
-        // Resolve method SymbolId on owner class (last hop's declaring/owner type or rootTypeSym)
-        const rs_sem::TypeSymbol* methodOwnerSym = rootTypeSym;
-        if (act.commandHops.size() > 1u) {
-            const SymbolId penultDecl = act.commandHops.back().declaringTypeId;
-            if (penultDecl != 0) {
-                if (const auto* ts = program.resolveType(penultDecl)) {
-                    methodOwnerSym = ts;
-                }
-            }
-        }
-        std::string leafCmd = act.commandPath;
-        if (const auto dot = leafCmd.rfind('.'); dot != std::string::npos) {
-            leafCmd = leafCmd.substr(dot + 1u);
-        }
-        if (methodOwnerSym && !leafCmd.empty()) {
-            for (const auto& m : methodOwnerSym->methods) {
-                if (m.name == leafCmd) {
-                    act.commandMethodSymbolId = m.id;
-                    break;
-                }
-            }
-            if (act.commandMethodSymbolId == 0 && leafCmd.size() > 7u &&
-                leafCmd.compare(leafCmd.size() - 7u, 7u, "Command") == 0) {
-                const std::string baseCmd = leafCmd.substr(0u, leafCmd.size() - 7u);
-                const std::string onBaseCmd = "On" + baseCmd;
-                for (const auto& m : methodOwnerSym->methods) {
-                    if (m.name == baseCmd || m.name == onBaseCmd) {
-                        act.commandMethodSymbolId = m.id;
-                        break;
-                    }
-                }
-            }
-        }
-        if (act.commandMethodSymbolId != 0) {
-            if (const auto* loc = program.resolveFunction(act.commandMethodSymbolId)) {
-                if (loc->function && loc->function->simCommand) {
-                    act.isSimCommand = true;
-                }
-            }
-        }
-    };
-
     auto bindMultiRec = [&](auto& self, AxbCompiledMultiBinding& mb) -> void {
         resolveConverterSymbols(
             mb.converter,
@@ -3611,6 +3596,110 @@ bool AxbPackage::BindAgainstProgram(
         }
     };
 
+    auto bindActionCommand = [&](AxbInteractionAction& act) {
+        if (act.kind != InteractionActionKind::InvokeCommand) {
+            return;
+        }
+        if (act.hasCommandParameterBinding) {
+            resolveConverterSymbols(
+                act.commandParameterBinding.converter,
+                act.commandParameterBinding.converterKey,
+                act.commandParameterBinding.converterSymbolId,
+                act.commandParameterBinding.convertBackSymbolId);
+            if (act.commandParameterBinding.nestedMultiBinding) {
+                bindMultiRec(bindMultiRec, *act.commandParameterBinding.nestedMultiBinding);
+            }
+            if (act.commandParameterBinding.elementName.empty() &&
+                act.commandParameterBinding.relativeAncestorType.empty() &&
+                !act.commandParameterBinding.relativeSelf) {
+                bindHopVector(act.commandParameterBinding.hops, classTypeId);
+            }
+        }
+        if (act.commandPath.empty() && act.commandHops.empty()) {
+            return;
+        }
+        if (act.commandHops.empty() && !act.commandPath.empty()) {
+            std::size_t segPos = 0u;
+            while (segPos < act.commandPath.size()) {
+                const std::size_t dot = act.commandPath.find('.', segPos);
+                const std::string_view seg = (dot == std::string::npos)
+                    ? std::string_view(act.commandPath).substr(segPos)
+                    : std::string_view(act.commandPath).substr(segPos, dot - segPos);
+                if (!seg.empty()) {
+                    AxbCompiledHop hop{};
+                    hop.memberName = std::string(seg);
+                    act.commandHops.push_back(std::move(hop));
+                }
+                if (dot == std::string::npos) break;
+                segPos = dot + 1u;
+            }
+        }
+        SymbolId ownerTypeId = classTypeId;
+        if (act.commandHops.size() > 1u) {
+            for (std::size_t hi = 0u; hi + 1u < act.commandHops.size(); ++hi) {
+                auto& hop = act.commandHops[hi];
+                if (ownerTypeId == 0) {
+                    break;
+                }
+                if (auto slotOpt = domains->resolvePropertySlot(program, ownerTypeId, hop.memberName)) {
+                    applyResolvedSlotToHop(hop, *slotOpt);
+                }
+                ownerTypeId = resolveMemberTargetTypeId(ownerTypeId, hop);
+            }
+        }
+        if (!act.commandHops.empty() && ownerTypeId != 0) {
+            auto& lastHop = act.commandHops.back();
+            if (auto slotOpt = domains->resolvePropertySlot(program, ownerTypeId, lastHop.memberName)) {
+                applyResolvedSlotToHop(lastHop, *slotOpt);
+                if (lastHop.isSimCommand) {
+                    act.isSimCommand = true;
+                }
+            }
+        }
+        const rs_sem::TypeSymbol* methodOwnerSym =
+            (ownerTypeId != 0) ? program.resolveType(ownerTypeId) : nullptr;
+
+        std::string leafCmd = !act.commandHops.empty()
+            ? act.commandHops.back().memberName
+            : act.commandPath;
+        if (const auto dot = leafCmd.rfind('.'); dot != std::string::npos) {
+            leafCmd = leafCmd.substr(dot + 1u);
+        }
+        if (methodOwnerSym && !leafCmd.empty()) {
+            act.commandMethodSymbolId = 0;
+            const rs_sem::TypeSymbol* walkSym = methodOwnerSym;
+            for (std::uint32_t baseDepth = 0u; walkSym && baseDepth < 16u && act.commandMethodSymbolId == 0; ++baseDepth) {
+                for (const auto& m : walkSym->methods) {
+                    if (m.name == leafCmd) {
+                        act.commandMethodSymbolId = m.id;
+                        break;
+                    }
+                }
+                if (act.commandMethodSymbolId == 0 && leafCmd.size() > 7u &&
+                    leafCmd.compare(leafCmd.size() - 7u, 7u, "Command") == 0) {
+                    const std::string baseCmd = leafCmd.substr(0u, leafCmd.size() - 7u);
+                    const std::string onBaseCmd = "On" + baseCmd;
+                    for (const auto& m : walkSym->methods) {
+                        if (m.name == baseCmd || m.name == onBaseCmd) {
+                            act.commandMethodSymbolId = m.id;
+                            break;
+                        }
+                    }
+                }
+                walkSym = (walkSym->baseTypeId != 0 && walkSym->baseTypeId != walkSym->id)
+                    ? program.resolveType(walkSym->baseTypeId)
+                    : nullptr;
+            }
+        }
+        if (act.commandMethodSymbolId != 0) {
+            if (const auto* loc = program.resolveFunction(act.commandMethodSymbolId)) {
+                if (loc->function && loc->function->simCommand) {
+                    act.isSimCommand = true;
+                }
+            }
+        }
+    };
+
     // 3. Bind multi-hop PropertySlotHandles & converter symbols in bindingChains and multiBindings
     for (auto& chain : bindingChains) {
         resolveConverterSymbols(
@@ -3629,6 +3718,38 @@ bool AxbPackage::BindAgainstProgram(
     for (auto& mb : multiBindings) {
         bindMultiRec(bindMultiRec, mb);
     }
+
+    auto bindControlTemplate = [&](AxbControlTemplate& ct) {
+        for (auto& trig : ct.triggers) {
+            for (auto& cond : trig.conditions) {
+                SymbolId dummyBack = 0;
+                resolveConverterSymbols(
+                    cond.converter,
+                    cond.converterKey,
+                    cond.converterSymbolId,
+                    dummyBack);
+                if (classTypeId != 0 &&
+                    cond.sourceKind == TriggerConditionSource::DataContextBinding &&
+                    !cond.compiledHops.empty()) {
+                    bindHopVector(cond.compiledHops, classTypeId);
+                }
+            }
+            for (auto& act : trig.enterActions) {
+                bindActionCommand(act);
+            }
+            for (auto& act : trig.exitActions) {
+                bindActionCommand(act);
+            }
+        }
+        for (auto& et : ct.eventTriggers) {
+            for (auto& act : et.actions) {
+                bindActionCommand(act);
+            }
+        }
+        if (ct.templatePackage) {
+            (void)ct.templatePackage->BindAgainstProgram(program, effectiveClassName, domains);
+        }
+    };
 
     // 4. Bind DataTrigger / MultiDataTrigger compiledHops & Interaction actions against root DataType
     for (auto& style : styles) {
@@ -3658,6 +3779,9 @@ bool AxbPackage::BindAgainstProgram(
                 bindActionCommand(act);
             }
         }
+        if (style.inlineControlTemplate) {
+            bindControlTemplate(*style.inlineControlTemplate);
+        }
     }
 
     // 5. Bind nested DataTemplate & ControlTemplate sub-packages
@@ -3667,19 +3791,7 @@ bool AxbPackage::BindAgainstProgram(
         }
     }
     for (auto& ct : controlTemplates) {
-        if (classTypeId != 0) {
-            for (auto& trig : ct.triggers) {
-                for (auto& cond : trig.conditions) {
-                    if (cond.sourceKind == TriggerConditionSource::DataContextBinding &&
-                        !cond.compiledHops.empty()) {
-                        bindHopVector(cond.compiledHops, classTypeId);
-                    }
-                }
-            }
-        }
-        if (ct.templatePackage) {
-            (void)ct.templatePackage->BindAgainstProgram(program, effectiveClassName, domains);
-        }
+        bindControlTemplate(ct);
     }
 
     return true;
@@ -4408,11 +4520,20 @@ std::vector<std::uint8_t> AxbPackage::Serialize() const {
     return out;
 }
 
-bool AxbPackage::Deserialize(
+namespace {
+
+bool DeserializeAxbPackageWithDepth(
     const std::uint8_t* data,
     std::size_t size,
     AxbPackage& outPackage,
-    std::string* errorMessage) {
+    std::string* errorMessage,
+    std::uint32_t depth) {
+    constexpr std::uint32_t kMaxNestedAxbDeserializeDepth = 8u;
+    if (depth > kMaxNestedAxbDeserializeDepth) {
+        if (errorMessage) *errorMessage = "AXB4 nested template recursion depth exceeded (max 8)";
+        return false;
+    }
+
     ByteReader r{data, size, 0};
     std::uint32_t magic = 0;
     std::uint32_t version = 0;
@@ -4553,46 +4674,6 @@ bool AxbPackage::Deserialize(
             }
         }
     }
-    if (r.offset < r.size) {
-        const std::size_t peekPos = r.offset;
-        std::uint32_t secMagic = 0;
-        if (!r.ReadU32(secMagic)) {
-            if (errorMessage) *errorMessage = "corrupted AXB4 trailing section header";
-            return false;
-        }
-        if (secMagic == kAxb4MtsdfSectionMagic) {
-            std::uint32_t mtsdfCount = 0;
-            if (!r.ReadU32(mtsdfCount) || mtsdfCount > (r.size - r.offset) / 56u) {
-                if (errorMessage) *errorMessage = "corrupted AXB4 MTSDF atlas section";
-                return false;
-            }
-            pkg.mtsdfPaths.resize(mtsdfCount);
-            for (std::uint32_t i = 0; i < mtsdfCount; ++i) {
-                auto& mp = pkg.mtsdfPaths[i];
-                if (!r.ReadU64(mp.pathHash) ||
-                    !r.ReadF32(mp.boundsX) ||
-                    !r.ReadF32(mp.boundsY) ||
-                    !r.ReadF32(mp.boundsW) ||
-                    !r.ReadF32(mp.boundsH) ||
-                    !r.ReadF32(mp.u0) ||
-                    !r.ReadF32(mp.v0) ||
-                    !r.ReadF32(mp.u1) ||
-                    !r.ReadF32(mp.v1) ||
-                    !r.ReadU16(mp.atlasWidth) ||
-                    !r.ReadU16(mp.atlasHeight) ||
-                    !r.ReadU16(mp.cellWidth) ||
-                    !r.ReadU16(mp.cellHeight) ||
-                    !r.ReadF32(mp.pxRange) ||
-                    !r.ReadBytes(mp.mtsdfRgbaPixels)) {
-                    if (errorMessage) *errorMessage = "corrupted AXB4 MTSDF entry";
-                    return false;
-                }
-            }
-        } else {
-            r.offset = peekPos;
-        }
-    }
-
     auto failStcSection = [&](const char* msg) -> bool {
         if (errorMessage) *errorMessage = msg;
         return false;
@@ -4656,14 +4737,58 @@ bool AxbPackage::Deserialize(
         return true;
     };
 
-    if (r.offset < r.size) {
-        const std::size_t peekStc = r.offset;
-        std::uint32_t stcMagic = 0;
-        if (!r.ReadU32(stcMagic)) {
-            if (errorMessage) *errorMessage = "corrupted AXB4 trailing section magic";
-            return false;
+    constexpr std::uint32_t kSecBit_MSDF = 1u << 0;
+    constexpr std::uint32_t kSecBit_STC5 = 1u << 1;
+    constexpr std::uint32_t kSecBit_DTP5 = 1u << 2;
+    constexpr std::uint32_t kSecBit_MOT6 = 1u << 3;
+    constexpr std::uint32_t kSecBit_CTP1 = 1u << 4;
+    constexpr std::uint32_t kSecBit_MR12 = 1u << 5;
+    constexpr std::uint32_t kSecBit_AP14 = 1u << 6;
+    std::uint32_t seenSectionMask = 0u;
+
+    while (r.offset < r.size) {
+        std::uint32_t trailMagic = 0;
+        if (!r.ReadU32(trailMagic)) {
+            return failStcSection("corrupted AXB4 trailing section magic");
         }
-        if (stcMagic == kAxb4StyleAnimSectionMagic) {
+        if (trailMagic == kAxb4MtsdfSectionMagic) {
+            if ((seenSectionMask & kSecBit_MSDF) != 0u) {
+                return failStcSection("corrupted AXB4 duplicate MSDF section");
+            }
+            seenSectionMask |= kSecBit_MSDF;
+            std::uint32_t mtsdfCount = 0;
+            if (!r.ReadU32(mtsdfCount) || mtsdfCount > (r.size - r.offset) / 56u) {
+                return failStcSection("corrupted AXB4 MTSDF atlas section");
+            }
+            pkg.mtsdfPaths.resize(mtsdfCount);
+            for (std::uint32_t i = 0; i < mtsdfCount; ++i) {
+                auto& mp = pkg.mtsdfPaths[i];
+                if (!r.ReadU64(mp.pathHash) ||
+                    !r.ReadF32(mp.boundsX) ||
+                    !r.ReadF32(mp.boundsY) ||
+                    !r.ReadF32(mp.boundsW) ||
+                    !r.ReadF32(mp.boundsH) ||
+                    !r.ReadF32(mp.u0) ||
+                    !r.ReadF32(mp.v0) ||
+                    !r.ReadF32(mp.u1) ||
+                    !r.ReadF32(mp.v1) ||
+                    !r.ReadU16(mp.atlasWidth) ||
+                    !r.ReadU16(mp.atlasHeight) ||
+                    !r.ReadU16(mp.cellWidth) ||
+                    !r.ReadU16(mp.cellHeight) ||
+                    !r.ReadF32(mp.pxRange) ||
+                    !r.ReadBytes(mp.mtsdfRgbaPixels)) {
+                    return failStcSection("corrupted AXB4 MTSDF entry");
+                }
+            }
+        } else if (trailMagic == kAxb4StyleAnimSectionMagic) {
+            if ((seenSectionMask & kSecBit_STC5) != 0u) {
+                return failStcSection("corrupted AXB4 duplicate STC5 section");
+            }
+            if ((seenSectionMask & (kSecBit_DTP5 | kSecBit_AP14)) != 0u) {
+                return failStcSection("corrupted AXB4 out-of-order STC5 section");
+            }
+            seenSectionMask |= kSecBit_STC5;
             auto readSetterList = [&](std::vector<AxbPropertySetter>& setters) -> bool {
                 std::uint32_t sc = 0;
                 if (!r.ReadU32(sc) || sc > (r.size - r.offset) / 7u) {
@@ -4777,18 +4902,14 @@ bool AxbPackage::Deserialize(
             for (std::uint32_t sbi = 0; sbi < sbCount; ++sbi) {
                 if (!readStoryboard(pkg.storyboards[sbi])) return false;
             }
-        } else {
-            r.offset = peekStc;
-        }
-    }
-
-    if (r.offset < r.size) {
-        const std::size_t peekDtp = r.offset;
-        std::uint32_t dtpMagic = 0;
-        if (!r.ReadU32(dtpMagic)) {
-            return failStcSection("corrupted AXB4 Phase 5D section magic");
-        }
-        if (dtpMagic == kAxb4Phase5DSectionMagic) {
+        } else if (trailMagic == kAxb4Phase5DSectionMagic) {
+            if ((seenSectionMask & kSecBit_DTP5) != 0u) {
+                return failStcSection("corrupted AXB4 duplicate DTP5 section");
+            }
+            if ((seenSectionMask & kSecBit_AP14) != 0u) {
+                return failStcSection("corrupted AXB4 out-of-order DTP5 section after AP14");
+            }
+            seenSectionMask |= kSecBit_DTP5;
             constexpr std::uint8_t kMaxConverterRaw =
                 static_cast<std::uint8_t>(ValueConverterKind::CustomScriptOrHost);
             constexpr std::uint8_t kMaxConditionSourceRaw =
@@ -4908,23 +5029,18 @@ bool AxbPackage::Deserialize(
                 }
                 if (!subBytes.empty()) {
                     auto subPkg = std::make_shared<AxbPackage>();
-                    if (!AxbPackage::Deserialize(subBytes, *subPkg, errorMessage)) {
+                    if (!DeserializeAxbPackageWithDepth(
+                            subBytes.data(), subBytes.size(), *subPkg, errorMessage, depth + 1u)) {
                         return false;
                     }
                     dt.templatePackage = std::move(subPkg);
                 }
             }
-        } else {
-            r.offset = peekDtp;
-        }
-    }
-
-    while (r.offset < r.size) {
-        std::uint32_t trailMagic = 0;
-        if (!r.ReadU32(trailMagic)) {
-            return failStcSection("corrupted AXB4 trailing section magic");
-        }
-        if (trailMagic == kAxb4MotionSectionMagic) {
+        } else if (trailMagic == kAxb4MotionSectionMagic) {
+            if ((seenSectionMask & kSecBit_MOT6) != 0u) {
+                return failStcSection("corrupted AXB4 duplicate MOT6 section");
+            }
+            seenSectionMask |= kSecBit_MOT6;
         // 1. Flat keyframes
         std::uint32_t kfCount = 0;
         if (!r.ReadU32(kfCount) || kfCount > (r.size - r.offset) / 28u) {
@@ -5179,6 +5295,13 @@ bool AxbPackage::Deserialize(
             }
         }
         } else if (trailMagic == kAxb4ControlTemplateSectionMagic) {
+        if ((seenSectionMask & kSecBit_CTP1) != 0u) {
+            return failStcSection("corrupted AXB4 duplicate CTP1 section");
+        }
+        if ((seenSectionMask & kSecBit_AP14) != 0u) {
+            return failStcSection("corrupted AXB4 out-of-order CTP1 section after AP14");
+        }
+        seenSectionMask |= kSecBit_CTP1;
         constexpr std::uint8_t kMaxCtpConverterRaw =
             static_cast<std::uint8_t>(ValueConverterKind::CustomScriptOrHost);
         constexpr std::uint8_t kMaxCtpCondSrcRaw =
@@ -5217,7 +5340,8 @@ bool AxbPackage::Deserialize(
             }
             if (!subBytes.empty()) {
                 auto subPkg = std::make_shared<AxbPackage>();
-                if (!AxbPackage::Deserialize(subBytes, *subPkg, errorMessage)) {
+                if (!DeserializeAxbPackageWithDepth(
+                        subBytes.data(), subBytes.size(), *subPkg, errorMessage, depth + 1u)) {
                     return false;
                 }
                 ct.templatePackage = std::move(subPkg);
@@ -5360,6 +5484,10 @@ bool AxbPackage::Deserialize(
             }
         }
         } else if (trailMagic == kAxb4MergedDictSectionMagic) {
+        if ((seenSectionMask & kSecBit_MR12) != 0u) {
+            return failStcSection("corrupted AXB4 duplicate MR12 section");
+        }
+        seenSectionMask |= kSecBit_MR12;
         std::uint32_t mrCount = 0;
         if (!r.ReadU32(mrCount) || mrCount > (r.size - r.offset) / 4u) {
             return failStcSection("corrupted AXB4 mergedDictionarySources header");
@@ -5371,6 +5499,10 @@ bool AxbPackage::Deserialize(
             }
         }
         } else if (trailMagic == kAxb4P14SectionMagic) {
+        if ((seenSectionMask & kSecBit_AP14) != 0u) {
+            return failStcSection("corrupted AXB4 duplicate AP14 section");
+        }
+        seenSectionMask |= kSecBit_AP14;
 
         auto readHopVec = [&](std::vector<AxbCompiledHop>& hops) -> bool {
             std::uint32_t hopCount = 0;
@@ -5651,9 +5783,27 @@ bool AxbPackage::Deserialize(
         }
     }
 
+    for (auto& st : pkg.styles) {
+        if (!st.controlTemplateKey.empty()) {
+            if (const AxbControlTemplate* foundCt = pkg.FindControlTemplate(st.controlTemplateKey)) {
+                st.inlineControlTemplate = std::make_shared<AxbControlTemplate>(*foundCt);
+            }
+        }
+    }
+
     pkg.PinValuesInPools();
     outPackage = std::move(pkg);
     return true;
+}
+
+} // namespace
+
+bool AxbPackage::Deserialize(
+    const std::uint8_t* data,
+    std::size_t size,
+    AxbPackage& outPackage,
+    std::string* errorMessage) {
+    return DeserializeAxbPackageWithDepth(data, size, outPackage, errorMessage, 0u);
 }
 
 bool AxbPackage::Deserialize(
@@ -6262,7 +6412,7 @@ struct RiveDecodedArtboard {
 };
 
 void AppendSvgNumber(std::string& out, float v) {
-    if (std::isnan(v) || std::isinf(v)) {
+    if (!std::isfinite(v)) {
         out.push_back('0');
         return;
     }
@@ -6273,6 +6423,19 @@ void AppendSvgNumber(std::string& out, float v) {
         }
         out.push_back('-');
         v = -v;
+    } else if (v < 0.0005f) {
+        out.push_back('0');
+        return;
+    }
+    if (!(std::fabs(v) < 1.0e15f)) {
+        char expBuf[32]{};
+        const int n = std::snprintf(expBuf, sizeof(expBuf), "%.6g", static_cast<double>(v));
+        if (n > 0) {
+            out.append(expBuf, static_cast<std::size_t>(std::min<int>(n, static_cast<int>(sizeof(expBuf) - 1))));
+        } else {
+            out.push_back('0');
+        }
+        return;
     }
     const auto scaled = static_cast<std::int64_t>(v * 1000.0f + 0.5f);
     const std::int64_t intPart = scaled / 1000;
@@ -6422,7 +6585,7 @@ struct RiveCubicVertex {
     if (tk == 4u) {
         const float w = pathObj.GetF32(20u, 0.0f);
         const float h = pathObj.GetF32(21u, 0.0f);
-        if (w <= 1e-3f || h <= 1e-3f) {
+        if (!std::isfinite(w) || !std::isfinite(h) || w <= 1e-3f || h <= 1e-3f) {
             return {};
         }
         const float ox = pathObj.GetF32(123u, 0.5f);
@@ -6462,7 +6625,7 @@ struct RiveCubicVertex {
     if (tk == 7u) {
         const float w = pathObj.GetF32(20u, 0.0f);
         const float h = pathObj.GetF32(21u, 0.0f);
-        if (w <= 1e-3f || h <= 1e-3f) {
+        if (!std::isfinite(w) || !std::isfinite(h) || w <= 1e-3f || h <= 1e-3f) {
             return {};
         }
         const float ox = pathObj.GetF32(123u, 0.5f);
@@ -6526,7 +6689,7 @@ struct RiveCubicVertex {
     if (tk == 8u || tk == 51u || tk == 52u) {
         const float w = pathObj.GetF32(20u, 0.0f);
         const float h = pathObj.GetF32(21u, 0.0f);
-        if (w <= 1e-3f || h <= 1e-3f) {
+        if (!std::isfinite(w) || !std::isfinite(h) || w <= 1e-3f || h <= 1e-3f) {
             return {};
         }
         const float ox = pathObj.GetF32(123u, 0.5f);
@@ -6535,10 +6698,17 @@ struct RiveCubicVertex {
         const float cy = (0.5f - oy) * h;
         const float rx = w * 0.5f;
         const float ry = h * 0.5f;
-        const std::uint32_t pts = (tk == 8u) ? 3u : std::max<std::uint32_t>(3u, static_cast<std::uint32_t>(pathObj.GetU64(125u, 5u)));
+        const std::uint64_t rawPts = pathObj.GetU64(125u, 5u);
+        const std::uint32_t pts = (tk == 8u)
+            ? 3u
+            : static_cast<std::uint32_t>(std::clamp<std::uint64_t>(rawPts, 3u, 512u));
         const bool isStar = (tk == 52u);
-        const float innerRatio = isStar ? std::clamp(pathObj.GetF32(127u, 0.5f), 0.05f, 1.0f) : 1.0f;
+        const float rawInner = pathObj.GetF32(127u, 0.5f);
+        const float innerRatio = isStar
+            ? std::clamp(std::isfinite(rawInner) ? rawInner : 0.5f, 0.05f, 1.0f)
+            : 1.0f;
         const std::uint32_t totalVerts = isStar ? (pts * 2u) : pts;
+        svg.reserve(static_cast<std::size_t>(totalVerts) * 20u + 4u);
         constexpr float kHalfPi = 1.57079632679f;
         constexpr float kTwoPi = 6.28318530718f;
         for (std::uint32_t i = 0u; i < totalVerts; ++i) {
@@ -6911,6 +7081,9 @@ bool DecodeRiveBinaryToAxbPackage(
         if (compactBakeMode) {
             recRange = 3.0f;
         }
+        if (pkg.mtsdfPaths.size() > 0xFFFFu) {
+            return false;
+        }
         const auto slotIdx = static_cast<std::uint16_t>(pkg.mtsdfPaths.size());
         AxbMtsdfPathEntry entry = BakeSvgPathToMtsdfEntry(svgData, cellDim, recRange, slotIdx, 512u);
         outBounds = Rect{entry.boundsX, entry.boundsY, entry.boundsW, entry.boundsH};
@@ -6925,13 +7098,57 @@ bool DecodeRiveBinaryToAxbPackage(
 
     constexpr float kRadToDeg = 180.0f / 3.14159265358979323846f;
 
+    bool hierarchyOverflowOrCycle = false;
+    std::vector<std::uint8_t> activeArtboardStack(artboards.size(), 0u);
+
     auto emitArtboardSubtree = [&](auto& selfRef,
                                    std::size_t abIndex,
                                    float rootOffsetX,
                                    float rootOffsetY,
                                    int nestingDepth,
                                    bool recordMainIndices) -> void {
+        if (hierarchyOverflowOrCycle || abIndex >= artboards.size() || activeArtboardStack[abIndex] != 0u) {
+            hierarchyOverflowOrCycle = true;
+            return;
+        }
+        activeArtboardStack[abIndex] = 1u;
+
         const RiveDecodedArtboard& ab = artboards[abIndex];
+        // Detect any cyclic parent chain across artboard objects in O(N)
+        std::vector<std::uint8_t> parentState(ab.objects.size(), 0u);
+        for (std::size_t startIdx = 1u; startIdx < ab.objects.size(); ++startIdx) {
+            if (parentState[startIdx] == 2u) {
+                continue;
+            }
+            std::size_t cur = startIdx;
+            while (cur > 0u && cur < ab.objects.size() && parentState[cur] == 0u) {
+                parentState[cur] = 1u;
+                const std::uint64_t pid = ab.objects[cur].GetU64(5u, 0xFFFFFFFFULL);
+                if (pid >= ab.objects.size()) {
+                    cur = 0u;
+                    break;
+                }
+                cur = static_cast<std::size_t>(pid);
+            }
+            if (cur > 0u && cur < ab.objects.size() && parentState[cur] == 1u) {
+                hierarchyOverflowOrCycle = true;
+                activeArtboardStack[abIndex] = 0u;
+                if (outDiagnostics) {
+                    outDiagnostics->push_back("AERO_RIVE_PARENT_CYCLE: Cyclic parent chain in Rive artboard");
+                }
+                return;
+            }
+            cur = startIdx;
+            while (cur > 0u && cur < ab.objects.size() && parentState[cur] == 1u) {
+                parentState[cur] = 2u;
+                const std::uint64_t pid = ab.objects[cur].GetU64(5u, 0xFFFFFFFFULL);
+                if (pid >= ab.objects.size()) {
+                    break;
+                }
+                cur = static_cast<std::size_t>(pid);
+            }
+        }
+
         std::vector<std::vector<std::size_t>> childrenMap(ab.objects.size());
         for (std::size_t i = 1u; i < ab.objects.size(); ++i) {
             const std::uint64_t pid = ab.objects[i].GetU64(5u, 0xFFFFFFFFULL);
@@ -6940,12 +7157,32 @@ bool DecodeRiveBinaryToAxbPackage(
             }
         }
 
-        auto emitNodeRecursive = [&](auto& nodeRec, std::size_t objIdx, bool parentIsArtboardRoot) -> void {
+        std::vector<std::uint8_t> activeNodeStack(ab.objects.size(), 0u);
+
+        auto emitNodeRecursive = [&](auto& nodeRec,
+                                     std::size_t objIdx,
+                                     bool parentIsArtboardRoot,
+                                     std::uint32_t depth) -> void {
+            constexpr std::uint32_t kMaxRiveHierarchyDepth = 256u;
+            if (hierarchyOverflowOrCycle || objIdx >= ab.objects.size()) {
+                return;
+            }
+            if (depth > kMaxRiveHierarchyDepth || activeNodeStack[objIdx] != 0u) {
+                hierarchyOverflowOrCycle = true;
+                if (outDiagnostics) {
+                    outDiagnostics->push_back(
+                        depth > kMaxRiveHierarchyDepth
+                            ? "AERO_RIVE_MAX_DEPTH: Rive hierarchy depth exceeds maximum limit (256)"
+                            : "AERO_RIVE_PARENT_CYCLE: Cyclic hierarchy node in Rive artboard");
+                }
+                return;
+            }
             const RiveDecodedObject& obj = ab.objects[objIdx];
             const std::uint32_t tk = obj.typeKey;
             if (!IsRiveHierarchyNodeType(tk)) {
                 return;
             }
+            activeNodeStack[objIdx] = 1u;
 
             const std::string_view nodeName = recordMainIndices ? obj.GetStr(4u) : std::string_view{};
             const std::uint32_t myElemIdx = nextLocalElemIdx++;
@@ -7077,18 +7314,26 @@ bool DecodeRiveBinaryToAxbPackage(
             // Recurse into child hierarchy nodes in exact draw order
             for (std::size_t cIdx : childrenMap[objIdx]) {
                 if (IsRiveHierarchyNodeType(ab.objects[cIdx].typeKey)) {
-                    nodeRec(nodeRec, cIdx, false);
+                    nodeRec(nodeRec, cIdx, false, depth + 1u);
+                    if (hierarchyOverflowOrCycle) {
+                        break;
+                    }
                 }
             }
 
+            activeNodeStack[objIdx] = 0u;
             pkg.instructions.push_back(AxbInstruction{AxbOpcode::EndElement});
         };
 
         for (std::size_t cIdx : childrenMap[0]) {
             if (IsRiveHierarchyNodeType(ab.objects[cIdx].typeKey)) {
-                emitNodeRecursive(emitNodeRecursive, cIdx, true);
+                emitNodeRecursive(emitNodeRecursive, cIdx, true, 1u);
+                if (hierarchyOverflowOrCycle) {
+                    break;
+                }
             }
         }
+        activeArtboardStack[abIndex] = 0u;
     };
 
     emitArtboardSubtree(
@@ -7098,6 +7343,9 @@ bool DecodeRiveBinaryToAxbPackage(
         abOriginY * abH,
         0,
         true);
+    if (hierarchyOverflowOrCycle) {
+        return false;
+    }
 
     // Close root Artboard Canvas
     pkg.instructions.push_back(AxbInstruction{AxbOpcode::EndElement});
@@ -7119,7 +7367,9 @@ bool DecodeRiveBinaryToAxbPackage(
                 targetObjId < mainObjToElemIdx.size()) {
                 const std::uint32_t cElem = mainObjToElemIdx[constrainedObjId];
                 const std::uint32_t tElem = mainObjToElemIdx[targetObjId];
-                if (cElem != 0xFFFFFFFFu && tElem != 0xFFFFFFFFu && cElem != tElem) {
+                if (cElem != 0xFFFFFFFFu && tElem != 0xFFFFFFFFu &&
+                    cElem <= 0xFFFFu && tElem <= 0xFFFFu &&
+                    cElem != tElem) {
                     AxbTransformConstraintDesc tc{};
                     tc.childLocalElementIdx = static_cast<std::uint16_t>(cElem);
                     tc.parentLocalElementIdx = static_cast<std::uint16_t>(tElem);
@@ -7230,7 +7480,9 @@ bool DecodeRiveBinaryToAxbPackage(
                 const auto rivePropKey = static_cast<std::uint32_t>(sub.GetU64(53u, 0u));
                 bool convRad = false;
                 const std::uint16_t mappedProp = mapRiveKeyedProperty(rivePropKey, convRad);
-                if (currentTargetElemIdx != 0xFFFFFFFFu && mappedProp != 0xFFFFu) {
+                if (currentTargetElemIdx != 0xFFFFFFFFu &&
+                    currentTargetElemIdx <= 0xFFFFu &&
+                    mappedProp != 0xFFFFu) {
                     activeTrack = AxbMotionTrackDesc{};
                     activeTrack.localElementIdx = static_cast<std::uint16_t>(currentTargetElemIdx);
                     activeTrack.targetPropId = mappedProp;
@@ -7270,10 +7522,14 @@ bool DecodeRiveBinaryToAxbPackage(
                     const auto interpId = static_cast<std::size_t>(sub.GetU64(69u, 0xFFFFFFFFULL));
                     if (interpId < mainAb.objects.size() && mainAb.objects[interpId].typeKey == 28u) {
                         const RiveDecodedObject& eo = mainAb.objects[interpId];
-                        x1 = std::clamp(eo.GetF32(63u, 0.42f), 0.0f, 1.0f);
-                        y1 = std::clamp(eo.GetF32(64u, 0.0f), -4.0f, 4.0f);
-                        x2 = std::clamp(eo.GetF32(65u, 0.58f), 0.0f, 1.0f);
-                        y2 = std::clamp(eo.GetF32(66u, 1.0f), -4.0f, 4.0f);
+                        const float rx1 = eo.GetF32(63u, 0.42f);
+                        const float ry1 = eo.GetF32(64u, 0.0f);
+                        const float rx2 = eo.GetF32(65u, 0.58f);
+                        const float ry2 = eo.GetF32(66u, 1.0f);
+                        x1 = std::clamp(std::isfinite(rx1) ? rx1 : 0.42f, 0.0f, 1.0f);
+                        y1 = std::clamp(std::isfinite(ry1) ? ry1 : 0.0f, -4.0f, 4.0f);
+                        x2 = std::clamp(std::isfinite(rx2) ? rx2 : 0.58f, 0.0f, 1.0f);
+                        y2 = std::clamp(std::isfinite(ry2) ? ry2 : 1.0f, -4.0f, 4.0f);
                     }
                     kf.easeKindOrCtrlX1 = static_cast<std::uint8_t>(x1 * 255.0f + 0.5f);
                     kf.easeModeOrCtrlX2 = static_cast<std::uint8_t>(x2 * 255.0f + 0.5f);
@@ -7314,6 +7570,13 @@ bool DecodeRiveBinaryToAxbPackage(
         while (idx < mainAb.objects.size() && mainAb.objects[idx].typeKey != 53u && mainAb.objects[idx].typeKey != 1u) {
             const RiveDecodedObject& item = mainAb.objects[idx];
             if (item.typeKey == 56u || item.typeKey == 58u || item.typeKey == 59u) {
+                if (pkg.contractInputs.size() >= 0x1000u) {
+                    if (outDiagnostics) {
+                        outDiagnostics->push_back(
+                            "AERO_RIVE_TOO_MANY_INPUTS: Rive contract input count exceeds maximum slot limit (4096)");
+                    }
+                    return false;
+                }
                 const auto globalSlot = static_cast<std::uint16_t>(pkg.contractInputs.size());
                 AxbContractInputDesc inDesc{};
                 inDesc.nameStrIdx = pkg.InternString(item.GetStr(138u));
@@ -7374,23 +7637,32 @@ bool DecodeRiveBinaryToAxbPackage(
                         RawRiveState rs{};
                         rs.tk = lo.typeKey;
                         if (lo.typeKey == 61u || lo.typeKey == 73u || lo.typeKey == 76u) {
-                            const auto clipId = static_cast<std::uint16_t>(lo.GetU64(149u, 0u));
+                            const std::uint64_t rawClipId = lo.GetU64(149u, 0u);
+                            const bool validClip =
+                                (rawClipId < pkg.motionClips.size()) && (rawClipId < 0xFFFFu);
+                            const std::uint16_t clipId = validClip
+                                ? static_cast<std::uint16_t>(rawClipId)
+                                : static_cast<std::uint16_t>(0xFFFFu);
                             AxbSmState st{};
                             st.nameStrIdx = pkg.InternString(
-                                clipId < pkg.motionClips.size()
+                                validClip
                                     ? pkg.GetString(pkg.motionClips[clipId].nameStrIdx)
                                     : "State");
                             st.kind = SmStateKind::SingleClip;
-                            st.primaryClipIdx = (clipId < pkg.motionClips.size()) ? clipId : 0xFFFFu;
+                            st.primaryClipIdx = clipId;
                             st.speedMultiplier = 1.0f;
-                            rs.emittedPlayableIdx = static_cast<std::uint16_t>(pkg.smStates.size());
-                            pkg.smStates.push_back(st);
+                            if (pkg.smStates.size() < 0xFFFFu) {
+                                rs.emittedPlayableIdx = static_cast<std::uint16_t>(pkg.smStates.size());
+                                pkg.smStates.push_back(st);
+                            }
                         } else if (lo.typeKey == 64u) {
                             AxbSmState st{};
                             st.nameStrIdx = pkg.InternString("Exit");
                             st.kind = SmStateKind::ExitState;
-                            rs.emittedPlayableIdx = static_cast<std::uint16_t>(pkg.smStates.size());
-                            pkg.smStates.push_back(st);
+                            if (pkg.smStates.size() < 0xFFFFu) {
+                                rs.emittedPlayableIdx = static_cast<std::uint16_t>(pkg.smStates.size());
+                                pkg.smStates.push_back(st);
+                            }
                         }
                         rawStates.push_back(std::move(rs));
                         ++idx;
@@ -7416,9 +7688,13 @@ bool DecodeRiveBinaryToAxbPackage(
                                 break;
                             }
                             const auto localInId = static_cast<std::size_t>(co.GetU64(155u, 0u));
-                            if (localInId < smInputKinds.size()) {
+                            const std::size_t resolvedSlot =
+                                static_cast<std::size_t>(smFirstInputSlot) + localInId;
+                            if (localInId < smInputKinds.size() &&
+                                resolvedSlot < 0x1000u &&
+                                rt.condCount < 0xFFFFu) {
                                 AxbSmCondition cond{};
-                                cond.inputSlotIdx = static_cast<std::uint16_t>(smFirstInputSlot + localInId);
+                                cond.inputSlotIdx = static_cast<std::uint16_t>(resolvedSlot);
                                 const std::uint8_t ik = smInputKinds[localInId];
                                 const std::uint64_t opVal = co.GetU64(156u, 0u);
                                 if (ik == 5u || co.typeKey == 68u) {

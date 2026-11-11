@@ -3,8 +3,10 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <iostream>
 #include <string>
+#include <system_error>
 #include <unordered_set>
 #include <vector>
 
@@ -33,12 +35,52 @@ namespace aero::tests {
 
 namespace {
 
-constexpr const char* kRobotoPath =
-    "/working_dir/c_1a21a30fb41e1c84/scratch/samples/DataBinding/Data/Roboto-Regular.ttf";
-constexpr const char* kAeroMaticsPath =
-    "/working_dir/c_1a21a30fb41e1c84/scratch/samples/HelloWorld/Data/Aero Matics Regular.ttf";
-constexpr const char* kPtSansPath =
-    "/working_dir/c_1a21a30fb41e1c84/scratch/samples/Localization/Data/PTSans-Regular.ttf";
+std::filesystem::path ResolveSamplesDir() {
+    std::error_code ec;
+    if (const char* envDir = std::getenv("AERO_SAMPLES_DIR"); envDir && envDir[0] != '\0') {
+        const std::filesystem::path p(envDir);
+        if (std::filesystem::is_directory(p, ec)) {
+            return p;
+        }
+    }
+#ifdef AERO_SAMPLES_DIR
+    {
+        const std::filesystem::path p(AERO_SAMPLES_DIR);
+        if (!p.empty() && std::filesystem::is_directory(p, ec)) {
+            return p;
+        }
+    }
+#endif
+    constexpr const char* kCandidates[] = {
+        "Samples",
+        "samples",
+        "../Samples",
+        "../samples",
+        "../../Samples",
+        "../../samples",
+        "../../../Samples",
+        "../../../samples",
+    };
+    for (const char* cand : kCandidates) {
+        const std::filesystem::path p(cand);
+        if (std::filesystem::is_directory(p, ec)) {
+            return p;
+        }
+    }
+    return std::filesystem::path("Samples");
+}
+
+std::string RobotoFontPath() {
+    return (ResolveSamplesDir() / "DataBinding" / "Data" / "Roboto-Regular.ttf").string();
+}
+
+std::string AeroMaticsFontPath() {
+    return (ResolveSamplesDir() / "HelloWorld" / "Data" / "Aero Matics Regular.ttf").string();
+}
+
+std::string PtSansFontPath() {
+    return (ResolveSamplesDir() / "Localization" / "Data" / "PTSans-Regular.ttf").string();
+}
 
 void PushBE16(std::vector<std::uint8_t>& b, std::uint16_t v) {
     b.push_back(static_cast<std::uint8_t>((v >> 8u) & 0xFFu));
@@ -211,17 +253,17 @@ void TestBuiltInFallbackAsciiSdfAndCollisionFreeLookup() {
 void TestTrueTypeBinaryParsingContoursCompoundAndKerning() {
     TrueTypeFontFace roboto;
     std::string err;
-    AERO_P03_CHECK(roboto.LoadFromFile(kRobotoPath, &err), "Loaded Roboto-Regular.ttf: " + err);
+    AERO_P03_CHECK(roboto.LoadFromFile(RobotoFontPath(), &err), "Loaded Roboto-Regular.ttf: " + err);
     AERO_P03_CHECK(roboto.UnitsPerEm() == 2048u && roboto.AscentFUnits() > 1500 && roboto.DescentFUnits() < -200,
                    "Roboto head/hhea metrics parsed accurately");
 
     TrueTypeFontFace aeroMatics;
-    AERO_P03_CHECK(aeroMatics.LoadFromFile(kAeroMaticsPath, &err), "Loaded Aero Matics Regular.ttf: " + err);
+    AERO_P03_CHECK(aeroMatics.LoadFromFile(AeroMaticsFontPath(), &err), "Loaded Aero Matics Regular.ttf: " + err);
     AERO_P03_CHECK(aeroMatics.UnitsPerEm() == 2048u && aeroMatics.GlyphCount() > 150u,
                    "Aero Matics Regular head/maxp parsed accurately");
 
     TrueTypeFontFace ptSans;
-    AERO_P03_CHECK(ptSans.LoadFromFile(kPtSansPath, &err), "Loaded PTSans-Regular.ttf (long loca=1): " + err);
+    AERO_P03_CHECK(ptSans.LoadFromFile(PtSansFontPath(), &err), "Loaded PTSans-Regular.ttf (long loca=1): " + err);
     AERO_P03_CHECK(ptSans.UnitsPerEm() == 1000u && ptSans.GlyphCount() > 500u,
                    "PTSans long-loca format=1 parsed accurately");
 
@@ -305,9 +347,9 @@ void TestMeasureTextLayoutAndTextBlockWrapping() {
     atlas.ClearCustomFonts();
 
     std::string err;
-    AERO_P03_CHECK(atlas.LoadTrueTypeFontFromFile(kRobotoPath, "Roboto", false, &err),
+    AERO_P03_CHECK(atlas.LoadTrueTypeFontFromFile(RobotoFontPath(), "Roboto", false, &err),
                    "Registered Roboto in FontAtlas: " + err);
-    AERO_P03_CHECK(atlas.LoadTrueTypeFontFromFile(kAeroMaticsPath, "Aero Matics", false, &err),
+    AERO_P03_CHECK(atlas.LoadTrueTypeFontFromFile(AeroMaticsFontPath(), "Aero Matics", false, &err),
                    "Registered Aero Matics in FontAtlas: " + err);
 
     // 1. Direct MeasureTextLayout proportional advanceX & wrap verification
@@ -421,7 +463,7 @@ void TestWebFontShardExportUnpackAndDirtyPageInvalidation() {
     // Step 1: Offline/server-side: load PTSans-Regular.ttf (contains Cyrillic U+0400..U+04FF = shard 0x04)
     // and export compact binary "AGFS" glyph shard for shardId = 0x04!
     std::string err;
-    AERO_P03_CHECK(atlas.LoadTrueTypeFontFromFile(kPtSansPath, "PTSans", false, &err),
+    AERO_P03_CHECK(atlas.LoadTrueTypeFontFromFile(PtSansFontPath(), "PTSans", false, &err),
                    "Loaded PTSans-Regular.ttf for shard export: " + err);
 
     WebFontStreamProvider exporterStream;
@@ -519,9 +561,9 @@ void TestRasterizeHelloAeroGui2WithRealTrueTypeFonts() {
     atlas.ClearCustomFonts();
 
     std::string err;
-    AERO_P03_CHECK(atlas.LoadTrueTypeFontFromFile(kAeroMaticsPath, "Aero Matics", true, &err),
+    AERO_P03_CHECK(atlas.LoadTrueTypeFontFromFile(AeroMaticsFontPath(), "Aero Matics", true, &err),
                    "Loaded Aero Matics Regular.ttf as default font: " + err);
-    AERO_P03_CHECK(atlas.LoadTrueTypeFontFromFile(kRobotoPath, "Roboto", false, &err),
+    AERO_P03_CHECK(atlas.LoadTrueTypeFontFromFile(RobotoFontPath(), "Roboto", false, &err),
                    "Loaded Roboto-Regular.ttf: " + err);
 
     constexpr std::uint32_t kFbW = 460u;

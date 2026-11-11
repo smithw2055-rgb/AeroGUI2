@@ -1,6 +1,7 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -162,11 +163,15 @@ private:
     void ShutdownPlatformWindow() noexcept;
     void SwapOrBlitPlatformSurface() noexcept;
     void DrainWakeSignal() noexcept;
+    bool WaitForEventsOrWake(std::int32_t timeoutMs) noexcept;
     void SyncNativeImeSpot(Rect caretRect, bool active) noexcept;
     [[nodiscard]] bool CanHostSleepIdle() const noexcept;
     void NotifyHostInputArrived() noexcept;
     [[nodiscard]] std::shared_ptr<UiResourceContext> EffectiveResourceContext() const noexcept;
 
+#if defined(_WIN32)
+    bool EnsureWin32ImmLoaded() noexcept;
+#endif
 #if defined(__EMSCRIPTEN__)
     void ScheduleEmscriptenRafIfNeeded() noexcept;
 #endif
@@ -192,18 +197,31 @@ private:
     std::atomic<bool> closeRequested_{false};
     std::atomic<bool> wakeSignaled_{false};
     bool needsInitialRender_ = true;
+    std::chrono::steady_clock::time_point lastFrameTimestamp_{};
+    bool hasLastFrameTimestamp_ = false;
 
-#if defined(__linux__) && !defined(__EMSCRIPTEN__)
+#if (defined(__linux__) || defined(__APPLE__)) && !defined(__EMSCRIPTEN__)
     int wakePipeFds_[2]{-1, -1};
+#endif
+#if defined(__linux__) && !defined(__EMSCRIPTEN__)
     struct LinuxX11State;
     std::unique_ptr<LinuxX11State> x11_;
 #elif defined(_WIN32)
     void* win32Hwnd_ = nullptr;
     void* win32Hdc_ = nullptr;
     void* win32Hglrc_ = nullptr;
+    void* win32OpenglModule_ = nullptr;
+    void* win32ImmModule_ = nullptr;
+    void* win32ImmGetContext_ = nullptr;
+    void* win32ImmSetCompositionWindow_ = nullptr;
+    void* win32ImmGetCompositionStringW_ = nullptr;
+    void* win32ImmReleaseContext_ = nullptr;
+    bool win32ImmProbed_ = false;
     void* win32WakeEvent_ = nullptr;
     std::uint16_t pendingHighSurrogate_ = 0u;
+    std::uint8_t win32PressedMouseMask_ = 0u;
 #elif defined(__EMSCRIPTEN__)
+    std::string emCanvasSelector_;
     int webglContextHandle_ = 0;
     bool rafScheduled_ = false;
     float lastRafTimeMs_ = -1.0f;

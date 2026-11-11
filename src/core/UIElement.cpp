@@ -6,9 +6,12 @@
 #include <mutex>
 #include <unordered_set>
 
+#include "aero/animation/AnimationEngine.hpp"
 #include "aero/binding/DualTrackBindingEngine.hpp"
 #include "aero/compiler/AxbFormat.hpp"
 #include "aero/controls/Controls.hpp"
+#include "aero/core/UiResourceContext.hpp"
+#include "aero/style/StyleTriggerEngine.hpp"
 #include "realscript/aot_cpp/AotRuntime.h"
 
 namespace aero {
@@ -248,8 +251,20 @@ namespace {
 constexpr std::uint16_t kEntryMeta_PinnedTemplateSlot = 0x0001u;
 } // namespace
 
+void ClearSubtreeTemplatedParent(UIElement* node, const UIElement* expectedHost) noexcept {
+    if (!node) {
+        return;
+    }
+    if (node->TemplatedParent() == expectedHost) {
+        node->SetTemplatedParent(nullptr);
+    }
+    for (UIElement* c = node->FirstChild(); c != nullptr; c = c->NextSibling()) {
+        ClearSubtreeTemplatedParent(c, expectedHost);
+    }
+}
+
 struct TemplateBindingLink {
-    UIElement* target = nullptr;
+    IntrusivePtr<UIElement> target{};
     std::uint16_t sourcePropId = 0;
     std::uint16_t targetPropId = 0;
     ValueConverterKind converter = ValueConverterKind::None;
@@ -257,7 +272,7 @@ struct TemplateBindingLink {
 
 struct TemplatePartEntry {
     std::string name;
-    UIElement* element = nullptr;
+    IntrusivePtr<UIElement> element{};
 };
 
 struct UIElement::MountedControlTemplateData {
@@ -266,8 +281,8 @@ struct UIElement::MountedControlTemplateData {
     std::vector<IntrusivePtr<UIElement>> logicalChildren;
     std::vector<TemplateBindingLink> bindings;
     std::vector<TemplatePartEntry> namedParts;
-    std::vector<ContentPresenter*> contentPresenters;
-    std::vector<UIElement*> inheritedTextNodes;
+    std::vector<IntrusivePtr<ContentPresenter>> contentPresenters;
+    std::vector<IntrusivePtr<UIElement>> inheritedTextNodes;
 };
 
 void RegisterUIElementResourceHooks(
@@ -342,6 +357,10 @@ Button::Button() {
 
 UIElement::~UIElement() {
     gTotalDestroyedUIElements.fetch_add(1u, std::memory_order_relaxed);
+    if (referencedAsElementSource_) {
+        DualTrackBindingEngine::NotifyElementDestroyedGlobal(this);
+        referencedAsElementSource_ = false;
+    }
     if (const auto destroyFn = gElementDestroyHook.load(std::memory_order_acquire)) {
         destroyFn(this);
     }
@@ -351,12 +370,18 @@ UIElement::~UIElement() {
     }
     DetachRenderNodeSpan();
     boundBindingEngine_ = nullptr;
+    boundStyleEngine_ = nullptr;
+    boundAnimationEngine_ = nullptr;
+    if (mountedTemplate_ && mountedTemplate_->templateRoot) {
+        ClearSubtreeTemplatedParent(mountedTemplate_->templateRoot.Get(), this);
+    }
     mountedTemplate_.reset();
 
     // Detach children safely
     UIElement* child = firstChild_;
     while (child) {
         UIElement* next = child->nextSibling_;
+        ClearSubtreeTemplatedParent(child, this);
         child->parent_ = nullptr;
         child->prevSibling_ = nullptr;
         child->nextSibling_ = nullptr;
@@ -1332,16 +1357,116 @@ UIEffectDescriptor UIElement::GetEffectDescriptor() const noexcept {
     return desc;
 }
 
-UIElement* UIElement::FindName(std::string_view targetName) noexcept {
-    if (!targetName.empty() && name_ == targetName) {
-        return this;
+namespace {
+
+UIElement* FindNameInTemplateSubtree(
+    UIElement* node,
+    const UIElement* templateHost,
+    std::string_view targetName) noexcept {
+    if (!node || node->TemplatedParent() != templateHost) {
+        return nullptr;
     }
-    for (UIElement* child = firstChild_; child != nullptr; child = child->nextSibling_) {
-        if (UIElement* found = child->FindName(targetName)) {
+    if (node->IsNamescopeBoundary()) {
+        return nullptr;
+    }
+    if (!targetName.empty() && node->Name() == targetName) {
+        return node;
+    }
+    if (node->IsA<UserControl>()) {
+        return nullptr;
+    }
+    if (node->HasControlTemplate()) {
+        for (const auto& lc : node->LogicalTemplateContentChildren()) {
+            if (UIElement* found = FindNameInTemplateSubtree(lc.Get(), templateHost, targetName)) {
+                return found;
+            }
+        }
+        return nullptr;
+    }
+    for (UIElement* c = node->FirstChild(); c != nullptr; c = c->NextSibling()) {
+        if (UIElement* found = FindNameInTemplateSubtree(c, templateHost, targetName)) {
             return found;
         }
     }
     return nullptr;
+}
+
+UIElement* FindNameInScope(
+    UIElement* node,
+    const UIElement* scopeRoot,
+    std::string_view targetName) noexcept {
+    if (!node) {
+        return nullptr;
+    }
+    if (node != scopeRoot) {
+        if (node->IsNamescopeBoundary()) {
+            return nullptr;
+        }
+        if (node->TemplatedParent() != nullptr && node->TemplatedParent() != scopeRoot) {
+            return nullptr;
+        }
+    }
+    if (!targetName.empty() && node->Name() == targetName) {
+        return node;
+    }
+    if (node != scopeRoot && node->IsA<UserControl>()) {
+        return nullptr;
+    }
+    if (node->HasControlTemplate()) {
+        if (node == scopeRoot) {
+            if (UIElement* tplRoot = node->TemplateRoot()) {
+                if (UIElement* found = FindNameInTemplateSubtree(tplRoot, node, targetName)) {
+                    return found;
+                }
+            }
+        }
+        for (const auto& lc : node->LogicalTemplateContentChildren()) {
+            if (UIElement* found = FindNameInScope(lc.Get(), scopeRoot, targetName)) {
+                return found;
+            }
+        }
+        return nullptr;
+    }
+    for (UIElement* child = node->FirstChild(); child != nullptr; child = child->NextSibling()) {
+        if (UIElement* found = FindNameInScope(child, scopeRoot, targetName)) {
+            return found;
+        }
+    }
+    return nullptr;
+}
+
+} // namespace
+
+UIElement* UIElement::FindName(std::string_view targetName) noexcept {
+    if (targetName.empty()) {
+        return nullptr;
+    }
+    return FindNameInScope(this, this, targetName);
+}
+
+UIElement* UIElement::FindNamescopeRoot(UIElement* elem) noexcept {
+    if (!elem) {
+        return nullptr;
+    }
+    if (elem->TemplatedParent() != nullptr) {
+        for (UIElement* cur = elem; cur != nullptr && cur != elem->TemplatedParent(); cur = cur->Parent()) {
+            if (cur->IsNamescopeBoundary() || cur->IsA<UserControl>()) {
+                return cur;
+            }
+        }
+        return elem->TemplatedParent();
+    }
+    UIElement* cur = elem;
+    if (cur->IsNamescopeBoundary() || cur->IsA<UserControl>()) {
+        return cur;
+    }
+    while (cur->Parent() != nullptr) {
+        cur = cur->Parent();
+        if (cur->IsNamescopeBoundary() || cur->IsA<UserControl>()) {
+            return cur;
+        }
+    }
+    return cur;
 }
 
 UIElement* UIElement::HitTest(Point point) noexcept {
@@ -2444,8 +2569,52 @@ void UIElement::MarkSparseValuesInPools() const noexcept {
             rs_rt::markValueInPools(entry.effectiveValue);
         }
     }
-    if (mountedTemplate_ && mountedTemplate_->definition.templatePackage) {
-        mountedTemplate_->definition.templatePackage->MarkValuesInPools();
+    if (mountedTemplate_) {
+        const auto& def = mountedTemplate_->definition;
+        if (def.templatePackage) {
+            def.templatePackage->MarkValuesInPools();
+        }
+        auto markStoryboard = [](const AxbStoryboard& sb) noexcept {
+            for (const auto& tl : sb.timelines) {
+                if (tl.fromValue.isTraceable()) rs_rt::markValueInPools(tl.fromValue);
+                if (tl.toValue.isTraceable()) rs_rt::markValueInPools(tl.toValue);
+                for (const auto& kf : tl.keyFrames) {
+                    if (kf.value.isTraceable()) rs_rt::markValueInPools(kf.value);
+                }
+            }
+        };
+        auto markAction = [&](const AxbInteractionAction& act) noexcept {
+            if (act.value.isTraceable()) rs_rt::markValueInPools(act.value);
+            if (act.commandParameter.isTraceable()) rs_rt::markValueInPools(act.commandParameter);
+            if (act.commandParameterBinding.fallbackValue.isTraceable()) {
+                rs_rt::markValueInPools(act.commandParameterBinding.fallbackValue);
+            }
+            markStoryboard(act.inlineStoryboard);
+        };
+        for (const auto& tr : def.triggers) {
+            for (const auto& c : tr.conditions) {
+                if (c.expectedValue.isTraceable()) rs_rt::markValueInPools(c.expectedValue);
+            }
+            for (const auto& s : tr.setters) {
+                if (s.value.isTraceable()) rs_rt::markValueInPools(s.value);
+            }
+            for (const auto& sb : tr.enterStoryboards) markStoryboard(sb);
+            for (const auto& sb : tr.exitStoryboards) markStoryboard(sb);
+            for (const auto& act : tr.enterActions) markAction(act);
+            for (const auto& act : tr.exitActions) markAction(act);
+        }
+        for (const auto& et : def.eventTriggers) {
+            for (const auto& sb : et.storyboards) markStoryboard(sb);
+            for (const auto& act : et.actions) markAction(act);
+        }
+        for (const auto& vsg : def.visualStateGroups) {
+            for (const auto& vs : vsg.states) {
+                for (const auto& s : vs.setters) {
+                    if (s.value.isTraceable()) rs_rt::markValueInPools(s.value);
+                }
+                markStoryboard(vs.storyboard);
+            }
+        }
     }
     MarkExtraValuesInPools();
 }
@@ -2618,12 +2787,12 @@ namespace {
 void CollectTemplateTextBlocksRecursive(
     UIElement* node,
     UIElement* expectedHost,
-    std::vector<UIElement*>& outNodes) {
+    std::vector<IntrusivePtr<UIElement>>& outNodes) {
     if (!node) {
         return;
     }
     if (node->TemplatedParent() == expectedHost && node->IsA<TextBlock>()) {
-        outNodes.push_back(node);
+        outNodes.emplace_back(node, true);
     }
     for (UIElement* c = node->FirstChild(); c != nullptr; c = c->NextSibling()) {
         CollectTemplateTextBlocksRecursive(c, expectedHost, outNodes);
@@ -2724,23 +2893,26 @@ void UIElement::RegisterTemplateNamedPart(std::string_view partName, UIElement* 
     }
     for (auto& existing : mountedTemplate_->namedParts) {
         if (existing.name == partName) {
-            existing.element = partElement;
+            existing.element.Reset(partElement, true);
             return;
         }
     }
-    mountedTemplate_->namedParts.push_back(TemplatePartEntry{std::string(partName), partElement});
+    TemplatePartEntry entry{};
+    entry.name = std::string(partName);
+    entry.element.Reset(partElement, true);
+    mountedTemplate_->namedParts.push_back(std::move(entry));
 }
 
 void UIElement::RegisterTemplateContentPresenter(ContentPresenter* presenter) {
     if (!mountedTemplate_ || !presenter) {
         return;
     }
-    if (std::find(
-            mountedTemplate_->contentPresenters.begin(),
-            mountedTemplate_->contentPresenters.end(),
-            presenter) == mountedTemplate_->contentPresenters.end()) {
-        mountedTemplate_->contentPresenters.push_back(presenter);
+    for (const auto& existing : mountedTemplate_->contentPresenters) {
+        if (existing.Get() == presenter) {
+            return;
+        }
     }
+    mountedTemplate_->contentPresenters.emplace_back(presenter, true);
 }
 
 void UIElement::AddTemplateBinding(
@@ -2763,17 +2935,18 @@ void UIElement::AddTemplateBinding(
     }
 
     for (auto& existing : mountedTemplate_->bindings) {
-        if (existing.target == target && existing.targetPropId == targetPropId) {
+        if (existing.target.Get() == target && existing.targetPropId == targetPropId) {
             existing.sourcePropId = sourcePropId;
             existing.converter = converter;
             return;
         }
     }
-    mountedTemplate_->bindings.push_back(TemplateBindingLink{
-        target,
-        sourcePropId,
-        targetPropId,
-        converter});
+    TemplateBindingLink link{};
+    link.target.Reset(target, true);
+    link.sourcePropId = sourcePropId;
+    link.targetPropId = targetPropId;
+    link.converter = converter;
+    mountedTemplate_->bindings.push_back(std::move(link));
 }
 
 bool UIElement::ReadTemplateSourceValueZeroAlloc(
@@ -2906,7 +3079,7 @@ void UIElement::SyncTemplateBindingsForProperty(std::uint16_t changedPropId) noe
             changedPropId == PropId_TextWrapping ||
             changedPropId == PropId_HorizontalContentAlignment ||
             changedPropId == PropId_VerticalContentAlignment;
-        for (ContentPresenter* cp : mountedTemplate_->contentPresenters) {
+        for (const auto& cp : mountedTemplate_->contentPresenters) {
             if (!cp) continue;
             if (affectsMetrics) {
                 cp->InvalidateLayout();
@@ -2917,7 +3090,7 @@ void UIElement::SyncTemplateBindingsForProperty(std::uint16_t changedPropId) noe
         if (changedPropId == PropId_FontSize ||
             changedPropId == PropId_FontFamily ||
             changedPropId == PropId_Foreground) {
-            for (UIElement* tbNode : mountedTemplate_->inheritedTextNodes) {
+            for (const auto& tbNode : mountedTemplate_->inheritedTextNodes) {
                 if (!tbNode) continue;
                 if (changedPropId == PropId_Foreground) {
                     tbNode->InvalidateRender();
@@ -2940,7 +3113,7 @@ void UIElement::SyncTemplateBindingsForTarget(UIElement* target, std::uint16_t t
         return;
     }
     for (const auto& link : mountedTemplate_->bindings) {
-        if (link.target != target || link.targetPropId != targetPropId) {
+        if (link.target.Get() != target || link.targetPropId != targetPropId) {
             continue;
         }
         UnifiedValue srcVal{};
@@ -2971,7 +3144,7 @@ void UIElement::RefreshAllTemplateBindings() noexcept {
             (void)link.target->SetValue(link.targetPropId, srcVal, ValueSourceRank::ThemeStyle);
         }
     }
-    for (ContentPresenter* cp : mountedTemplate_->contentPresenters) {
+    for (const auto& cp : mountedTemplate_->contentPresenters) {
         if (cp) {
             cp->InvalidateLayout();
         }
@@ -2987,7 +3160,7 @@ UIElement* UIElement::GetTemplateChild(std::string_view partName) const noexcept
     }
     for (const auto& entry : mountedTemplate_->namedParts) {
         if (entry.name == partName) {
-            return entry.element;
+            return entry.element.Get();
         }
     }
     return FindTemplateChildRecursiveFallback(
@@ -3001,22 +3174,49 @@ void UIElement::ClearControlTemplate() {
         return;
     }
     std::vector<IntrusivePtr<UIElement>> savedLogical = std::move(mountedTemplate_->logicalChildren);
-    for (ContentPresenter* cp : mountedTemplate_->contentPresenters) {
+    for (const auto& cp : mountedTemplate_->contentPresenters) {
         if (!cp) continue;
         for (const auto& lc : savedLogical) {
-            if (lc && lc->Parent() == cp) {
+            if (lc && lc->Parent() == cp.Get()) {
                 (void)cp->RemoveChild(lc.Get(), boundRegistry_, boundUiHeap_);
             }
         }
     }
-    if (mountedTemplate_->templateRoot) {
-        (void)RemoveChild(mountedTemplate_->templateRoot.Get(), boundRegistry_, boundUiHeap_);
+    IntrusivePtr<UIElement> oldTplRoot = mountedTemplate_->templateRoot;
+    if (oldTplRoot) {
+        if (boundStyleEngine_) {
+            boundStyleEngine_->OnElementControlTemplateChanging(this, oldTplRoot.Get());
+        }
+        auto resolveLiveAnim = [&](AnimationEngine* cand) noexcept -> AnimationEngine* {
+            return AnimationEngine::IsLiveInstance(cand) ? cand : nullptr;
+        };
+        AnimationEngine* anim = resolveLiveAnim(boundAnimationEngine_);
+        if (!anim && boundStyleEngine_) {
+            anim = resolveLiveAnim(boundStyleEngine_->GetAnimationEngine());
+        }
+        if (!anim && boundBindingEngine_) {
+            anim = resolveLiveAnim(boundBindingEngine_->GetAnimationEngine());
+        }
+        if (anim) {
+            (void)anim->StopSubtreeAnimations(oldTplRoot.Get(), false);
+        }
+        if (boundBindingEngine_) {
+            (void)boundBindingEngine_->UnbindSubtree(oldTplRoot.Get());
+        }
+        if (boundStyleEngine_) {
+            (void)boundStyleEngine_->UnbindSubtreeStyles(oldTplRoot.Get());
+        }
+        (void)RemoveChild(oldTplRoot.Get(), boundRegistry_, boundUiHeap_);
+        ClearSubtreeTemplatedParent(oldTplRoot.Get(), this);
     }
     mountedTemplate_.reset();
     for (const auto& lc : savedLogical) {
         if (lc) {
             (void)AddChild(lc.Get(), boundRegistry_, boundUiHeap_);
         }
+    }
+    if (boundStyleEngine_) {
+        boundStyleEngine_->OnElementControlTemplateCleared(this);
     }
     InvalidateLayout();
     InvalidateRender();
@@ -3027,10 +3227,45 @@ bool UIElement::ApplyControlTemplateByKey(std::string_view templateKey) {
         ClearControlTemplate();
         return false;
     }
+    ExecutionDomainContext* domains = boundBindingEngine_
+        ? &boundBindingEngine_->Domains()
+        : (boundStyleEngine_ ? boundStyleEngine_->GetDomains() : nullptr);
+    std::shared_ptr<UiResourceContext> domainCtx =
+        (domains && !UiResourceContext::HasActiveThreadOverride())
+            ? UiResourceContext::FindForDomains(domains)
+            : nullptr;
+    ScopedUiResourceContext ctxGuard(std::move(domainCtx));
+
     if (const AxbControlTemplate* ct = AxbTemplateRegistry::Instance().FindControlTemplate(templateKey)) {
-        ExecutionDomainContext* domains = boundBindingEngine_ ? &boundBindingEngine_->Domains() : nullptr;
-        AnimationEngine* anim = boundBindingEngine_ ? boundBindingEngine_->GetAnimationEngine() : nullptr;
-        return ApplyControlTemplate(*ct, domains, boundBindingEngine_, BoundScriptWrapper(), nullptr, nullptr, anim);
+        DualTrackBindingEngine* bindingEng = boundBindingEngine_;
+        const Interpreter* interp = bindingEng
+            ? bindingEng->UiInterpreter()
+            : (boundStyleEngine_ ? boundStyleEngine_->GetUiInterpreter() : nullptr);
+        rs_aot::ExecutionContext* aotCtx = boundStyleEngine_
+            ? boundStyleEngine_->GetAotExecutionContext()
+            : nullptr;
+        AnimationEngine* anim = AnimationEngine::IsLiveInstance(boundAnimationEngine_)
+            ? boundAnimationEngine_
+            : (boundStyleEngine_ && AnimationEngine::IsLiveInstance(boundStyleEngine_->GetAnimationEngine())
+                   ? boundStyleEngine_->GetAnimationEngine()
+                   : (bindingEng && AnimationEngine::IsLiveInstance(bindingEng->GetAnimationEngine())
+                          ? bindingEng->GetAnimationEngine()
+                          : nullptr));
+
+        ObjectRef effectiveDc{};
+        for (const UIElement* cur = this; cur != nullptr; cur = cur->Parent()) {
+            const UnifiedValue dcVal = cur->GetValue(PropId_DataContext);
+            if (const auto* ref = std::get_if<ObjectRef>(&dcVal); ref && ref->valid()) {
+                effectiveDc = *ref;
+                break;
+            }
+            if (cur->BoundScriptWrapper().valid()) {
+                effectiveDc = cur->BoundScriptWrapper();
+                break;
+            }
+        }
+
+        return ApplyControlTemplate(*ct, domains, bindingEng, effectiveDc, interp, aotCtx, anim);
     }
     return false;
 }
@@ -3058,6 +3293,16 @@ bool UIElement::ApplyControlTemplate(
         }
     }
 
+    ExecutionDomainContext* effDomains = domains
+        ? domains
+        : (bindingEngine ? &bindingEngine->Domains()
+                         : (boundBindingEngine_ ? &boundBindingEngine_->Domains() : nullptr));
+    std::shared_ptr<UiResourceContext> domainCtx =
+        (effDomains && !UiResourceContext::HasActiveThreadOverride())
+            ? UiResourceContext::FindForDomains(effDomains)
+            : nullptr;
+    ScopedUiResourceContext ctxGuard(std::move(domainCtx));
+
     // Idempotent fast path if this exact ControlTemplate is already mounted on this host
     if (mountedTemplate_ &&
         (mountedTemplate_->definition.templatePackage.get() == controlTemplate.templatePackage.get() ||
@@ -3067,25 +3312,68 @@ bool UIElement::ApplyControlTemplate(
         mountedTemplate_->definition.eventTriggers = controlTemplate.eventTriggers;
         mountedTemplate_->definition.visualStateGroups = controlTemplate.visualStateGroups;
         RefreshAllTemplateBindings();
+        if (boundStyleEngine_) {
+            boundStyleEngine_->OnElementControlTemplateApplied(this);
+        }
         return true;
     }
 
+    // Validate & instantiate root element BEFORE detaching logical children or tearing down existing template!
+    const AxbPackage& tplPkg = *controlTemplate.templatePackage;
+    const AxbInstruction& firstInst = tplPkg.instructions[0];
+    if (firstInst.opcode != AxbOpcode::BeginElement) {
+        return false;
+    }
+    const std::string_view rootTypeName = tplPkg.GetString(firstInst.strIdx0);
+    IntrusivePtr<UIElement> tplRoot = CreateElementByTypeName(rootTypeName);
+    if (!tplRoot) {
+        return false;
+    }
+
     applyingControlTemplate_ = true;
+    if (animationEngine && !boundAnimationEngine_) {
+        boundAnimationEngine_ = animationEngine;
+    }
 
     // 1. Preserve non-template logical children (e.g. graphical <Button><Path/></Button> content)
+    //    and cleanly tear down any previously mounted template subtree across all engines!
     std::vector<IntrusivePtr<UIElement>> savedLogical;
     if (mountedTemplate_) {
         savedLogical = std::move(mountedTemplate_->logicalChildren);
-        for (ContentPresenter* cp : mountedTemplate_->contentPresenters) {
+        for (const auto& cp : mountedTemplate_->contentPresenters) {
             if (!cp) continue;
             for (const auto& lc : savedLogical) {
-                if (lc && lc->Parent() == cp) {
+                if (lc && lc->Parent() == cp.Get()) {
                     (void)cp->RemoveChild(lc.Get(), boundRegistry_, boundUiHeap_);
                 }
             }
         }
-        if (mountedTemplate_->templateRoot) {
-            (void)RemoveChild(mountedTemplate_->templateRoot.Get(), boundRegistry_, boundUiHeap_);
+        IntrusivePtr<UIElement> oldTplRoot = mountedTemplate_->templateRoot;
+        if (oldTplRoot) {
+            if (boundStyleEngine_) {
+                boundStyleEngine_->OnElementControlTemplateChanging(this, oldTplRoot.Get());
+            }
+            AnimationEngine* effAnim = AnimationEngine::IsLiveInstance(animationEngine)
+                ? animationEngine
+                : (AnimationEngine::IsLiveInstance(boundAnimationEngine_)
+                       ? boundAnimationEngine_
+                       : (boundStyleEngine_ && AnimationEngine::IsLiveInstance(boundStyleEngine_->GetAnimationEngine())
+                              ? boundStyleEngine_->GetAnimationEngine()
+                              : (boundBindingEngine_ && AnimationEngine::IsLiveInstance(boundBindingEngine_->GetAnimationEngine())
+                                     ? boundBindingEngine_->GetAnimationEngine()
+                                     : nullptr)));
+            if (effAnim) {
+                (void)effAnim->StopSubtreeAnimations(oldTplRoot.Get(), false);
+            }
+            DualTrackBindingEngine* effBind = bindingEngine ? bindingEngine : boundBindingEngine_;
+            if (effBind) {
+                (void)effBind->UnbindSubtree(oldTplRoot.Get());
+            }
+            if (boundStyleEngine_) {
+                (void)boundStyleEngine_->UnbindSubtreeStyles(oldTplRoot.Get());
+            }
+            (void)RemoveChild(oldTplRoot.Get(), boundRegistry_, boundUiHeap_);
+            ClearSubtreeTemplatedParent(oldTplRoot.Get(), this);
         }
         mountedTemplate_.reset();
     } else {
@@ -3096,20 +3384,6 @@ bool UIElement::ApplyControlTemplate(
         }
     }
 
-    // 2. Instantiate root element of the template visual subtree
-    const AxbPackage& tplPkg = *controlTemplate.templatePackage;
-    const AxbInstruction& firstInst = tplPkg.instructions[0];
-    if (firstInst.opcode != AxbOpcode::BeginElement) {
-        applyingControlTemplate_ = false;
-        return false;
-    }
-    const std::string_view rootTypeName = tplPkg.GetString(firstInst.strIdx0);
-    IntrusivePtr<UIElement> tplRoot = CreateElementByTypeName(rootTypeName);
-    if (!tplRoot) {
-        applyingControlTemplate_ = false;
-        return false;
-    }
-
     auto data = std::make_unique<MountedControlTemplateData>();
     data->definition = controlTemplate;
     data->templateRoot = tplRoot;
@@ -3117,8 +3391,8 @@ bool UIElement::ApplyControlTemplate(
     mountedTemplate_ = std::move(data);
 
     tplRoot->SetTemplatedParent(this);
-    NativeHandleRegistry* reg = domains ? &domains->nativeHandles() : boundRegistry_;
-    ManagedHeap* heap = domains ? &domains->uiHeap() : boundUiHeap_;
+    NativeHandleRegistry* reg = effDomains ? &effDomains->nativeHandles() : boundRegistry_;
+    ManagedHeap* heap = effDomains ? &effDomains->uiHeap() : boundUiHeap_;
     (void)AddChild(tplRoot.Get(), reg, heap);
 
     // Pre-reserve common host properties so runtime SetValue on host never reallocates sparseProps_
@@ -3136,22 +3410,24 @@ bool UIElement::ApplyControlTemplate(
     }
     EnsureRegisteredInValuePoolSet();
 
-    // 3. Mount template instructions, wiring TemplatedParent, BindTemplateParent, PART_* & ContentPresenter
+    // 2. Mount template instructions, wiring TemplatedParent, BindTemplateParent, PART_* & ContentPresenter
     const bool mountedOk = MountControlTemplatePackage(
         this,
         tplRoot.Get(),
         tplPkg,
-        domains,
+        effDomains,
         bindingEngine ? bindingEngine : boundBindingEngine_,
         dataContext,
         eventInterpreter,
         eventAotContext,
-        animationEngine);
+        AnimationEngine::IsLiveInstance(animationEngine)
+            ? animationEngine
+            : (AnimationEngine::IsLiveInstance(boundAnimationEngine_) ? boundAnimationEngine_ : nullptr));
 
     if (mountedOk && mountedTemplate_) {
         // Host logical UIElement content inside the primary ContentPresenter if present
         if (!mountedTemplate_->logicalChildren.empty() && !mountedTemplate_->contentPresenters.empty()) {
-            ContentPresenter* primaryCp = mountedTemplate_->contentPresenters.front();
+            ContentPresenter* primaryCp = mountedTemplate_->contentPresenters.front().Get();
             for (const auto& lc : mountedTemplate_->logicalChildren) {
                 if (lc && primaryCp) {
                     (void)primaryCp->AddChild(lc.Get(), reg, heap);
@@ -3163,6 +3439,9 @@ bool UIElement::ApplyControlTemplate(
     }
 
     applyingControlTemplate_ = false;
+    if (mountedOk && boundStyleEngine_) {
+        boundStyleEngine_->OnElementControlTemplateApplied(this);
+    }
     InvalidateLayout();
     InvalidateRender();
     return mountedOk;

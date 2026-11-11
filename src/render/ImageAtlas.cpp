@@ -584,19 +584,27 @@ struct JpegScanBitReader {
                     hitMarker = true;
                 } else {
                     std::uint8_t next = data[pos];
-                    while (next == 0xFFu && (pos + 1u) < size) {
+                    std::uint32_t ffRun = 0u;
+                    while (next == 0xFFu) {
+                        if (++ffRun > 2048u || (pos + 1u) >= size) {
+                            pos = size;
+                            hitMarker = true;
+                            break;
+                        }
                         ++pos;
                         next = data[pos];
                     }
-                    if (next == 0x00u) {
-                        ++pos;
-                        bitBuf = (bitBuf << 8u) | 0xFFULL;
-                        bitCount += 8u;
-                    } else {
-                        // Encountered real marker (FF next); leave `pos` pointing at `next` and rewind 1 byte to `0xFF`
-                        --pos;
-                        hitMarker = true;
-                        pendingMarker = next;
+                    if (!hitMarker) {
+                        if (next == 0x00u) {
+                            ++pos;
+                            bitBuf = (bitBuf << 8u) | 0xFFULL;
+                            bitCount += 8u;
+                        } else {
+                            // Encountered real marker (FF next); leave `pos` pointing at `0xFF`
+                            --pos;
+                            hitMarker = true;
+                            pendingMarker = next;
+                        }
                     }
                 }
             }
@@ -624,12 +632,14 @@ struct JpegScanBitReader {
     }
 
     [[nodiscard]] int ReceiveExtend(std::uint32_t s) noexcept {
-        if (s == 0u) {
+        if (s == 0u || s > 16u) {
             return 0;
         }
-        const int v = static_cast<int>(ReadBitsMsb(s));
-        const int half = 1 << (s - 1u);
-        return (v < half) ? (v - ((1 << s) - 1)) : v;
+        const std::uint32_t v = ReadBitsMsb(s);
+        const std::uint32_t half = 1u << (s - 1u);
+        return (v < half)
+            ? (static_cast<int>(v) - static_cast<int>((1u << s) - 1u))
+            : static_cast<int>(v);
     }
 
     [[nodiscard]] bool DecodeSymbol(const JpegHuffmanTable& ht, std::uint8_t& outSym) noexcept {
@@ -681,8 +691,14 @@ struct JpegScanBitReader {
         while (pos < size && data[pos] == 0xFFu) {
             ++pos;
         }
-        if (pos < size && data[pos] >= 0xD0u && data[pos] <= 0xD7u) {
-            ++pos;
+        if (pos < size) {
+            if ((data[pos] >= 0xD0u && data[pos] <= 0xD7u) || data[pos] == 0x00u) {
+                ++pos;
+            } else if (pos > 0u) {
+                --pos;
+                hitMarker = true;
+                pendingMarker = data[pos + 1u];
+            }
         }
     }
 
@@ -727,201 +743,220 @@ bool InflateRfc1951(
     const std::uint8_t* src,
     std::size_t srcSize,
     std::vector<std::uint8_t>& outData,
-    std::size_t* outConsumedBytes) noexcept {
+    std::size_t* outConsumedBytes,
+    std::size_t maxOutputBytes) noexcept {
     outData.clear();
     if (!src || srcSize == 0u) {
         return false;
     }
 
-    DeflateBitReader br{src, srcSize, 0u, 0u, 0u};
-    bool isFinalBlock = false;
+    try {
+        outData.reserve(std::min<std::size_t>(maxOutputBytes, std::min<std::size_t>(srcSize * 4u, 65536u)));
 
-    while (!isFinalBlock) {
-        std::uint32_t bfinal = 0u;
-        std::uint32_t btype = 0u;
-        if (!br.ReadBits(1u, bfinal) || !br.ReadBits(2u, btype)) {
-            return false;
-        }
-        isFinalBlock = (bfinal != 0u);
+        DeflateBitReader br{src, srcSize, 0u, 0u, 0u};
+        bool isFinalBlock = false;
 
-        if (btype == 0u) {
-            // Uncompressed stored block
-            std::uint8_t hdr[4]{};
-            if (!br.ReadAlignedBytes(hdr, 4u)) {
+        while (!isFinalBlock) {
+            std::uint32_t bfinal = 0u;
+            std::uint32_t btype = 0u;
+            if (!br.ReadBits(1u, bfinal) || !br.ReadBits(2u, btype)) {
                 return false;
             }
-            const std::uint16_t len = ReadLe16(hdr);
-            const std::uint16_t nlen = ReadLe16(hdr + 2u);
-            if (static_cast<std::uint16_t>(len ^ 0xFFFFu) != nlen) {
-                return false;
-            }
-            const std::size_t oldSz = outData.size();
-            outData.resize(oldSz + len);
-            if (len > 0u && !br.ReadAlignedBytes(outData.data() + oldSz, len)) {
-                return false;
-            }
-        } else if (btype == 1u || btype == 2u) {
-            DeflateHuffmanTable litLenTable{};
-            DeflateHuffmanTable distTable{};
+            isFinalBlock = (bfinal != 0u);
 
-            if (btype == 1u) {
-                std::array<std::uint8_t, 288u> fixedLit{};
-                for (std::size_t i = 0u; i <= 143u; ++i) fixedLit[i] = 8u;
-                for (std::size_t i = 144u; i <= 255u; ++i) fixedLit[i] = 9u;
-                for (std::size_t i = 256u; i <= 279u; ++i) fixedLit[i] = 7u;
-                for (std::size_t i = 280u; i <= 287u; ++i) fixedLit[i] = 8u;
-                std::array<std::uint8_t, 32u> fixedDist{};
-                fixedDist.fill(5u);
-                if (!litLenTable.Build(fixedLit.data(), fixedLit.size()) ||
-                    !distTable.Build(fixedDist.data(), fixedDist.size())) {
+            if (btype == 0u) {
+                // Uncompressed stored block
+                std::uint8_t hdr[4]{};
+                if (!br.ReadAlignedBytes(hdr, 4u)) {
                     return false;
                 }
-            } else {
-                std::uint32_t hlitRaw = 0u;
-                std::uint32_t hdistRaw = 0u;
-                std::uint32_t hclenRaw = 0u;
-                if (!br.ReadBits(5u, hlitRaw) ||
-                    !br.ReadBits(5u, hdistRaw) ||
-                    !br.ReadBits(4u, hclenRaw)) {
+                const std::uint16_t len = ReadLe16(hdr);
+                const std::uint16_t nlen = ReadLe16(hdr + 2u);
+                if (static_cast<std::uint16_t>(len ^ 0xFFFFu) != nlen) {
                     return false;
                 }
-                const std::uint32_t hlit = hlitRaw + 257u;
-                const std::uint32_t hdist = hdistRaw + 1u;
-                const std::uint32_t hclen = hclenRaw + 4u;
-                if (hlit > 286u || hdist > 32u) {
+                if (static_cast<std::size_t>(len) > maxOutputBytes ||
+                    outData.size() > maxOutputBytes - static_cast<std::size_t>(len)) {
                     return false;
                 }
-
-                std::array<std::uint8_t, 19u> clLengths{};
-                for (std::uint32_t i = 0u; i < hclen; ++i) {
-                    std::uint32_t lenVal = 0u;
-                    if (!br.ReadBits(3u, lenVal)) {
-                        return false;
-                    }
-                    clLengths[kDeflateCodeLengthOrder[i]] = static_cast<std::uint8_t>(lenVal);
-                }
-
-                DeflateHuffmanTable clTable{};
-                if (!clTable.Build(clLengths.data(), clLengths.size())) {
+                const std::size_t oldSz = outData.size();
+                outData.resize(oldSz + len);
+                if (len > 0u && !br.ReadAlignedBytes(outData.data() + oldSz, len)) {
                     return false;
                 }
+            } else if (btype == 1u || btype == 2u) {
+                DeflateHuffmanTable litLenTable{};
+                DeflateHuffmanTable distTable{};
 
-                const std::uint32_t totalLengths = hlit + hdist;
-                std::array<std::uint8_t, 320u> unpackedLengths{};
-                std::uint32_t idx = 0u;
-                while (idx < totalLengths) {
-                    std::uint16_t sym = 0u;
-                    if (!clTable.Decode(br, sym)) {
+                if (btype == 1u) {
+                    std::array<std::uint8_t, 288u> fixedLit{};
+                    for (std::size_t i = 0u; i <= 143u; ++i) fixedLit[i] = 8u;
+                    for (std::size_t i = 144u; i <= 255u; ++i) fixedLit[i] = 9u;
+                    for (std::size_t i = 256u; i <= 279u; ++i) fixedLit[i] = 7u;
+                    for (std::size_t i = 280u; i <= 287u; ++i) fixedLit[i] = 8u;
+                    std::array<std::uint8_t, 32u> fixedDist{};
+                    fixedDist.fill(5u);
+                    if (!litLenTable.Build(fixedLit.data(), fixedLit.size()) ||
+                        !distTable.Build(fixedDist.data(), fixedDist.size())) {
                         return false;
-                    }
-                    if (sym <= 15u) {
-                        unpackedLengths[idx++] = static_cast<std::uint8_t>(sym);
-                    } else if (sym == 16u) {
-                        if (idx == 0u) {
-                            return false;
-                        }
-                        std::uint32_t extra = 0u;
-                        if (!br.ReadBits(2u, extra)) {
-                            return false;
-                        }
-                        const std::uint32_t repeat = 3u + extra;
-                        if (idx + repeat > totalLengths) {
-                            return false;
-                        }
-                        const std::uint8_t prev = unpackedLengths[idx - 1u];
-                        for (std::uint32_t r = 0u; r < repeat; ++r) {
-                            unpackedLengths[idx++] = prev;
-                        }
-                    } else if (sym == 17u || sym == 18u) {
-                        std::uint32_t extra = 0u;
-                        const std::uint32_t bits = (sym == 17u) ? 3u : 7u;
-                        const std::uint32_t base = (sym == 17u) ? 3u : 11u;
-                        if (!br.ReadBits(bits, extra)) {
-                            return false;
-                        }
-                        const std::uint32_t repeat = base + extra;
-                        if (idx + repeat > totalLengths) {
-                            return false;
-                        }
-                        for (std::uint32_t r = 0u; r < repeat; ++r) {
-                            unpackedLengths[idx++] = 0u;
-                        }
-                    } else {
-                        return false;
-                    }
-                }
-
-                if (unpackedLengths[256u] == 0u) {
-                    return false;
-                }
-                if (!litLenTable.Build(unpackedLengths.data(), hlit) ||
-                    !distTable.Build(unpackedLengths.data() + hlit, hdist)) {
-                    return false;
-                }
-            }
-
-            // Decode Huffman-compressed literals & LZ77 back-references
-            for (;;) {
-                std::uint16_t sym = 0u;
-                if (!litLenTable.Decode(br, sym)) {
-                    return false;
-                }
-                if (sym < 256u) {
-                    outData.push_back(static_cast<std::uint8_t>(sym));
-                } else if (sym == 256u) {
-                    break;
-                } else if (sym <= 285u) {
-                    const std::uint32_t lenIdx = sym - 257u;
-                    std::uint32_t lenExtra = 0u;
-                    if (!br.ReadBits(kDeflateLenExtra[lenIdx], lenExtra)) {
-                        return false;
-                    }
-                    const std::size_t matchLen = static_cast<std::size_t>(kDeflateLenBase[lenIdx]) + lenExtra;
-
-                    std::uint16_t distSym = 0u;
-                    if (!distTable.Decode(br, distSym) || distSym >= 30u) {
-                        return false;
-                    }
-                    std::uint32_t distExtra = 0u;
-                    if (!br.ReadBits(kDeflateDistExtra[distSym], distExtra)) {
-                        return false;
-                    }
-                    const std::size_t distance = static_cast<std::size_t>(kDeflateDistBase[distSym]) + distExtra;
-                    if (distance == 0u || distance > outData.size()) {
-                        return false;
-                    }
-
-                    const std::size_t dstPos = outData.size();
-                    outData.resize(dstPos + matchLen);
-                    std::uint8_t* dstPtr = outData.data() + dstPos;
-                    const std::uint8_t* srcPtr = dstPtr - distance;
-                    if (distance >= matchLen) {
-                        std::memcpy(dstPtr, srcPtr, matchLen);
-                    } else {
-                        for (std::size_t i = 0u; i < matchLen; ++i) {
-                            dstPtr[i] = srcPtr[i];
-                        }
                     }
                 } else {
-                    return false;
-                }
-            }
-        } else {
-            return false;
-        }
-    }
+                    std::uint32_t hlitRaw = 0u;
+                    std::uint32_t hdistRaw = 0u;
+                    std::uint32_t hclenRaw = 0u;
+                    if (!br.ReadBits(5u, hlitRaw) ||
+                        !br.ReadBits(5u, hdistRaw) ||
+                        !br.ReadBits(4u, hclenRaw)) {
+                        return false;
+                    }
+                    const std::uint32_t hlit = hlitRaw + 257u;
+                    const std::uint32_t hdist = hdistRaw + 1u;
+                    const std::uint32_t hclen = hclenRaw + 4u;
+                    if (hlit > 286u || hdist > 32u) {
+                        return false;
+                    }
 
-    br.AlignToByte();
-    if (outConsumedBytes) {
-        *outConsumedBytes = br.EffectiveConsumedBytes();
+                    std::array<std::uint8_t, 19u> clLengths{};
+                    for (std::uint32_t i = 0u; i < hclen; ++i) {
+                        std::uint32_t lenVal = 0u;
+                        if (!br.ReadBits(3u, lenVal)) {
+                            return false;
+                        }
+                        clLengths[kDeflateCodeLengthOrder[i]] = static_cast<std::uint8_t>(lenVal);
+                    }
+
+                    DeflateHuffmanTable clTable{};
+                    if (!clTable.Build(clLengths.data(), clLengths.size())) {
+                        return false;
+                    }
+
+                    const std::uint32_t totalLengths = hlit + hdist;
+                    std::array<std::uint8_t, 320u> unpackedLengths{};
+                    std::uint32_t idx = 0u;
+                    while (idx < totalLengths) {
+                        std::uint16_t sym = 0u;
+                        if (!clTable.Decode(br, sym)) {
+                            return false;
+                        }
+                        if (sym <= 15u) {
+                            unpackedLengths[idx++] = static_cast<std::uint8_t>(sym);
+                        } else if (sym == 16u) {
+                            if (idx == 0u) {
+                                return false;
+                            }
+                            std::uint32_t extra = 0u;
+                            if (!br.ReadBits(2u, extra)) {
+                                return false;
+                            }
+                            const std::uint32_t repeat = 3u + extra;
+                            if (idx + repeat > totalLengths) {
+                                return false;
+                            }
+                            const std::uint8_t prev = unpackedLengths[idx - 1u];
+                            for (std::uint32_t r = 0u; r < repeat; ++r) {
+                                unpackedLengths[idx++] = prev;
+                            }
+                        } else if (sym == 17u || sym == 18u) {
+                            std::uint32_t extra = 0u;
+                            const std::uint32_t bits = (sym == 17u) ? 3u : 7u;
+                            const std::uint32_t base = (sym == 17u) ? 3u : 11u;
+                            if (!br.ReadBits(bits, extra)) {
+                                return false;
+                            }
+                            const std::uint32_t repeat = base + extra;
+                            if (idx + repeat > totalLengths) {
+                                return false;
+                            }
+                            for (std::uint32_t r = 0u; r < repeat; ++r) {
+                                unpackedLengths[idx++] = 0u;
+                            }
+                        } else {
+                            return false;
+                        }
+                    }
+
+                    if (unpackedLengths[256u] == 0u) {
+                        return false;
+                    }
+                    if (!litLenTable.Build(unpackedLengths.data(), hlit) ||
+                        !distTable.Build(unpackedLengths.data() + hlit, hdist)) {
+                        return false;
+                    }
+                }
+
+                // Decode Huffman-compressed literals & LZ77 back-references
+                for (;;) {
+                    std::uint16_t sym = 0u;
+                    if (!litLenTable.Decode(br, sym)) {
+                        return false;
+                    }
+                    if (sym < 256u) {
+                        if (outData.size() >= maxOutputBytes) {
+                            return false;
+                        }
+                        outData.push_back(static_cast<std::uint8_t>(sym));
+                    } else if (sym == 256u) {
+                        break;
+                    } else if (sym <= 285u) {
+                        const std::uint32_t lenIdx = sym - 257u;
+                        std::uint32_t lenExtra = 0u;
+                        if (!br.ReadBits(kDeflateLenExtra[lenIdx], lenExtra)) {
+                            return false;
+                        }
+                        const std::size_t matchLen = static_cast<std::size_t>(kDeflateLenBase[lenIdx]) + lenExtra;
+                        if (matchLen > maxOutputBytes || outData.size() > maxOutputBytes - matchLen) {
+                            return false;
+                        }
+
+                        std::uint16_t distSym = 0u;
+                        if (!distTable.Decode(br, distSym) || distSym >= 30u) {
+                            return false;
+                        }
+                        std::uint32_t distExtra = 0u;
+                        if (!br.ReadBits(kDeflateDistExtra[distSym], distExtra)) {
+                            return false;
+                        }
+                        const std::size_t distance = static_cast<std::size_t>(kDeflateDistBase[distSym]) + distExtra;
+                        if (distance == 0u || distance > outData.size()) {
+                            return false;
+                        }
+
+                        const std::size_t dstPos = outData.size();
+                        outData.resize(dstPos + matchLen);
+                        std::uint8_t* dstPtr = outData.data() + dstPos;
+                        const std::uint8_t* srcPtr = dstPtr - distance;
+                        if (distance >= matchLen) {
+                            std::memcpy(dstPtr, srcPtr, matchLen);
+                        } else {
+                            for (std::size_t i = 0u; i < matchLen; ++i) {
+                                dstPtr[i] = srcPtr[i];
+                            }
+                        }
+                    } else {
+                        return false;
+                    }
+                }
+            } else {
+                return false;
+            }
+        }
+
+        br.AlignToByte();
+        if (outConsumedBytes) {
+            *outConsumedBytes = br.EffectiveConsumedBytes();
+        }
+        return true;
+    } catch (...) {
+        outData.clear();
+        return false;
     }
-    return true;
 }
 
 bool DecompressZlib(
     const std::uint8_t* src,
     std::size_t srcSize,
-    std::vector<std::uint8_t>& outData) noexcept {
+    std::vector<std::uint8_t>& outData,
+    std::size_t maxOutputBytes) noexcept {
     if (!src || srcSize < 6u) {
         return false;
     }
@@ -937,22 +972,20 @@ bool DecompressZlib(
     if ((flg & 0x20u) != 0u) {
         headerBytes += 4u;
     }
-    if (srcSize <= headerBytes) {
+    if (srcSize < headerBytes + 4u) {
         return false;
     }
 
     std::size_t consumed = 0u;
-    if (!InflateRfc1951(src + headerBytes, srcSize - headerBytes, outData, &consumed)) {
+    if (!InflateRfc1951(src + headerBytes, srcSize - headerBytes, outData, &consumed, maxOutputBytes)) {
         return false;
     }
-    if (headerBytes + consumed + 4u <= srcSize) {
-        const std::uint32_t expectedAdler = ReadBe32(src + headerBytes + consumed);
-        const std::uint32_t actualAdler = ComputeAdler32(outData.data(), outData.size());
-        if (expectedAdler != actualAdler) {
-            return false;
-        }
+    if (consumed > (srcSize - headerBytes) || (srcSize - headerBytes - consumed) < 4u) {
+        return false;
     }
-    return true;
+    const std::uint32_t expectedAdler = ReadBe32(src + headerBytes + consumed);
+    const std::uint32_t actualAdler = ComputeAdler32(outData.data(), outData.size());
+    return expectedAdler == actualAdler;
 }
 
 ImageFormat DetectImageFormat(const std::uint8_t* data, std::size_t size) noexcept {
@@ -1042,7 +1075,8 @@ bool DecodePngFromMemory(
             const std::uint8_t filterMethod = chunkData[11];
             interlace = chunkData[12];
 
-            if (width == 0u || height == 0u || width > 16384u || height > 16384u ||
+            if (width == 0u || height == 0u || width > 8192u || height > 8192u ||
+                static_cast<std::uint64_t>(width) * static_cast<std::uint64_t>(height) * 4ULL > 128ULL * 1024ULL * 1024ULL ||
                 compMethod != 0u || filterMethod != 0u || interlace > 1u) {
                 SetError(outError, "Unsupported PNG IHDR parameters.");
                 return false;
@@ -1100,24 +1134,65 @@ bool DecodePngFromMemory(
         return false;
     }
 
-    std::vector<std::uint8_t> rawDecompressed;
-    if (!DecompressZlib(idatCompressed.data(), idatCompressed.size(), rawDecompressed)) {
-        SetError(outError, "Failed to decompress PNG zlib IDAT stream.");
-        return false;
-    }
-
     const std::uint32_t channels =
         (colorType == 0u) ? 1u :
         (colorType == 2u) ? 3u :
         (colorType == 3u) ? 1u :
         (colorType == 4u) ? 2u : 4u;
-    const std::uint32_t bitsPerPixel = channels * static_cast<std::uint32_t>(bitDepth);
-    const std::size_t filterBpp = std::max<std::size_t>(1u, (bitsPerPixel + 7u) / 8u);
+    const std::uint64_t bitsPerPixel =
+        static_cast<std::uint64_t>(channels) * static_cast<std::uint64_t>(bitDepth);
+    const std::size_t filterBpp =
+        static_cast<std::size_t>(std::max<std::uint64_t>(1ULL, (bitsPerPixel + 7ULL) / 8ULL));
+
+    constexpr std::uint64_t kMaxPngBytes = 128ULL * 1024ULL * 1024ULL;
+    const std::uint64_t rgbaBytes64 =
+        static_cast<std::uint64_t>(width) * static_cast<std::uint64_t>(height) * 4ULL;
+    if (width > 8192u || height > 8192u || rgbaBytes64 > kMaxPngBytes) {
+        SetError(outError, "PNG dimensions exceed maximum safe decode limits.");
+        return false;
+    }
+
+    std::uint64_t expectedDecompressedBytes = 0ULL;
+    if (interlace == 0u) {
+        const std::uint64_t rowBytes64 =
+            (static_cast<std::uint64_t>(width) * bitsPerPixel + 7ULL) / 8ULL;
+        expectedDecompressedBytes = static_cast<std::uint64_t>(height) * (1ULL + rowBytes64);
+    } else {
+        constexpr std::uint32_t kStartX[7] = {0, 4, 0, 2, 0, 1, 0};
+        constexpr std::uint32_t kStartY[7] = {0, 0, 4, 0, 2, 0, 1};
+        constexpr std::uint32_t kStepX[7]  = {8, 8, 4, 4, 2, 2, 1};
+        constexpr std::uint32_t kStepY[7]  = {8, 8, 8, 4, 4, 2, 2};
+        for (int pass = 0; pass < 7; ++pass) {
+            if (kStartX[pass] >= width || kStartY[pass] >= height) {
+                continue;
+            }
+            const std::uint64_t subW =
+                (static_cast<std::uint64_t>(width - kStartX[pass]) + kStepX[pass] - 1ULL) / kStepX[pass];
+            const std::uint64_t subH =
+                (static_cast<std::uint64_t>(height - kStartY[pass]) + kStepY[pass] - 1ULL) / kStepY[pass];
+            const std::uint64_t rowBytes64 = (subW * bitsPerPixel + 7ULL) / 8ULL;
+            expectedDecompressedBytes += subH * (1ULL + rowBytes64);
+        }
+    }
+    if (expectedDecompressedBytes == 0ULL || expectedDecompressedBytes > kMaxPngBytes) {
+        SetError(outError, "PNG scanline buffer exceeds maximum safe decode limits.");
+        return false;
+    }
+
+    std::vector<std::uint8_t> rawDecompressed;
+    if (!DecompressZlib(
+            idatCompressed.data(),
+            idatCompressed.size(),
+            rawDecompressed,
+            static_cast<std::size_t>(expectedDecompressedBytes))) {
+        SetError(outError, "Failed to decompress PNG zlib IDAT stream.");
+        return false;
+    }
 
     outImage.width = width;
     outImage.height = height;
     outImage.format = ImageFormat::Png;
-    outImage.rgbaPixels.assign(static_cast<std::size_t>(width) * height * 4u, 0u);
+    outImage.rgbaPixels.assign(static_cast<std::size_t>(rgbaBytes64), 0u);
 
     auto unpackScanlineToRgba = [&](const std::uint8_t* scanRow,
                                     std::uint32_t subWidth,
@@ -1428,7 +1503,8 @@ bool DecodeJpegFromMemory(
             height = ReadBe16(segData + 1u);
             width = ReadBe16(segData + 3u);
             numComp = segData[5];
-            if (precision != 8u || width == 0u || height == 0u || width > 16384u || height > 16384u ||
+            if (precision != 8u || width == 0u || height == 0u || width > 8192u || height > 8192u ||
+                static_cast<std::uint64_t>(width) * static_cast<std::uint64_t>(height) > 64ULL * 1024ULL * 1024ULL ||
                 (numComp != 1u && numComp != 3u) || payloadLen < 6u + numComp * 3u) {
                 SetError(outError, "Unsupported JPEG frame parameters.");
                 return false;
@@ -1510,7 +1586,8 @@ bool DecodeJpegFromMemory(
             const std::uint8_t ahal = segData[specOff + 2u];
             const std::uint8_t ah = static_cast<std::uint8_t>((ahal >> 4u) & 0x0Fu);
             const std::uint8_t al = static_cast<std::uint8_t>(ahal & 0x0Fu);
-            if (ss > 63u || se > 63u || ss > se) {
+            if (ss > 63u || se > 63u || ss > se || ah > 13u || al > 13u ||
+                (isProgressive && ss == 0u && se != 0u)) {
                 SetError(outError, "Invalid JPEG spectral selection range.");
                 return false;
             }
@@ -1658,10 +1735,12 @@ bool DecodeJpegFromMemory(
                             return false;
                         }
                         dcPred[c] += br.ReceiveExtend(dcCat);
-                        blk[0] = static_cast<std::int16_t>(dcPred[c] << al);
+                        blk[0] = static_cast<std::int16_t>(
+                            static_cast<std::uint16_t>(static_cast<std::uint32_t>(dcPred[c])) << al);
                     } else {
                         if (br.ReadBitsMsb(1u) != 0u) {
-                            blk[0] = static_cast<std::int16_t>(blk[0] | (1 << al));
+                            blk[0] = static_cast<std::int16_t>(
+                                static_cast<std::uint16_t>(blk[0]) | static_cast<std::uint16_t>(1u << al));
                         }
                     }
                     return true;
@@ -1722,7 +1801,7 @@ bool DecodeJpegFromMemory(
                     const auto& acHuff = acTables[comp.acTableId];
                     const std::uint32_t validBx = (width * comp.hSamp + maxHSamp * 8u - 1u) / (maxHSamp * 8u);
                     const std::uint32_t validBy = (height * comp.vSamp + maxVSamp * 8u - 1u) / (maxVSamp * 8u);
-                    const auto bitVal = static_cast<std::int16_t>(1 << al);
+                    const auto bitVal = static_cast<std::int16_t>(static_cast<std::uint16_t>(1u << al));
 
                     for (std::uint32_t by = 0u; by < validBy; ++by) {
                         for (std::uint32_t bx = 0u; bx < validBx; ++bx) {
@@ -1761,7 +1840,8 @@ bool DecodeJpegFromMemory(
                                         SetError(outError, "Progressive JPEG AC run overflow.");
                                         return false;
                                     }
-                                    blk[kJpegZigZag[k]] = static_cast<std::int16_t>(br.ReceiveExtend(s) << al);
+                                    blk[kJpegZigZag[k]] = static_cast<std::int16_t>(
+                                        static_cast<std::uint16_t>(static_cast<std::uint32_t>(br.ReceiveExtend(s))) << al);
                                     ++k;
                                 }
                             } else {
@@ -1965,21 +2045,24 @@ bool DecodeBmpFromMemory(
 
     const std::uint32_t dataOffset = ReadLe32(data + 10u);
     const std::uint32_t dibSize = ReadLe32(data + 14u);
-    if (dibSize < 40u || 14u + dibSize > size || dataOffset >= size) {
+    if (dibSize < 40u ||
+        14ULL + static_cast<std::uint64_t>(dibSize) > static_cast<std::uint64_t>(size) ||
+        static_cast<std::uint64_t>(dataOffset) >= static_cast<std::uint64_t>(size)) {
         SetError(outError, "Unsupported or truncated BMP DIB header.");
         return false;
     }
 
     const auto rawW = static_cast<std::int32_t>(ReadLe32(data + 18u));
-    const auto rawH = static_cast<std::int32_t>(ReadLe32(data + 22u));
+    const std::uint32_t rawHu = ReadLe32(data + 22u);
+    const auto rawH = static_cast<std::int32_t>(rawHu);
     const std::uint16_t planes = ReadLe16(data + 26u);
     const std::uint16_t bpp = ReadLe16(data + 28u);
     const std::uint32_t compression = ReadLe32(data + 30u);
     const std::uint32_t clrUsed = ReadLe32(data + 46u);
 
     const bool topDown = (rawH < 0);
-    const std::int32_t absH = topDown ? -rawH : rawH;
-    if (rawW <= 0 || absH <= 0 || rawW > 16384 || absH > 16384 || planes != 1u ||
+    const std::uint32_t absH = topDown ? (0u - rawHu) : rawHu;
+    if (rawW <= 0 || absH == 0u || rawW > 8192 || absH > 8192u || planes != 1u ||
         (compression != 0u && compression != 3u) ||
         (bpp != 8u && bpp != 16u && bpp != 24u && bpp != 32u)) {
         SetError(outError, "Unsupported BMP dimensions, bit depth, or compression.");
@@ -1987,12 +2070,14 @@ bool DecodeBmpFromMemory(
     }
 
     const auto width = static_cast<std::uint32_t>(rawW);
-    const auto height = static_cast<std::uint32_t>(absH);
-    const std::size_t rowStride = ((static_cast<std::size_t>(width) * bpp + 31u) / 32u) * 4u;
-    if (dataOffset + rowStride * height > size) {
+    const auto height = absH;
+    const std::uint64_t rowStride64 = ((static_cast<std::uint64_t>(width) * bpp + 31ULL) / 32ULL) * 4ULL;
+    if (static_cast<std::uint64_t>(dataOffset) + rowStride64 * static_cast<std::uint64_t>(height) >
+        static_cast<std::uint64_t>(size)) {
         SetError(outError, "Truncated BMP pixel array.");
         return false;
     }
+    const auto rowStride = static_cast<std::size_t>(rowStride64);
 
     std::uint32_t rMask = 0x00FF0000u;
     std::uint32_t gMask = 0x0000FF00u;
@@ -2005,16 +2090,22 @@ bool DecodeBmpFromMemory(
         aMask = 0u;
     }
     if (compression == 3u) {
-        const std::size_t maskOff = (dibSize >= 56u) ? 54u : (14u + dibSize);
-        if (maskOff + 12u <= size) {
-            rMask = ReadLe32(data + maskOff + 0u);
-            gMask = ReadLe32(data + maskOff + 4u);
-            bMask = ReadLe32(data + maskOff + 8u);
-            if (dibSize >= 56u && maskOff + 16u <= size) {
-                aMask = ReadLe32(data + maskOff + 12u);
-            } else {
-                aMask = 0u;
-            }
+        const std::uint64_t maskOff64 = (dibSize >= 56u)
+            ? 54ULL
+            : (14ULL + static_cast<std::uint64_t>(dibSize));
+        if (maskOff64 + 12ULL > static_cast<std::uint64_t>(size) ||
+            (dibSize < 56u && maskOff64 + 12ULL > static_cast<std::uint64_t>(dataOffset))) {
+            SetError(outError, "Truncated BMP BI_BITFIELDS masks.");
+            return false;
+        }
+        const auto maskOff = static_cast<std::size_t>(maskOff64);
+        rMask = ReadLe32(data + maskOff + 0u);
+        gMask = ReadLe32(data + maskOff + 4u);
+        bMask = ReadLe32(data + maskOff + 8u);
+        if (dibSize >= 56u && maskOff64 + 16ULL <= static_cast<std::uint64_t>(size)) {
+            aMask = ReadLe32(data + maskOff + 12u);
+        } else {
+            aMask = 0u;
         }
     }
 
@@ -2032,9 +2123,12 @@ bool DecodeBmpFromMemory(
         return static_cast<std::uint8_t>((raw * 255u + (m >> 1u)) / m);
     };
 
-    const std::size_t paletteOffset = 14u + dibSize;
+    const std::uint64_t paletteOffset64 = 14ULL + static_cast<std::uint64_t>(dibSize);
+    const auto paletteOffset = static_cast<std::size_t>(paletteOffset64);
     const std::uint32_t palCount = (bpp == 8u) ? ((clrUsed > 0u && clrUsed <= 256u) ? clrUsed : 256u) : 0u;
-    if (bpp == 8u && paletteOffset + static_cast<std::size_t>(palCount) * 4u > dataOffset) {
+    if (bpp == 8u &&
+        (paletteOffset64 + static_cast<std::uint64_t>(palCount) * 4ULL > static_cast<std::uint64_t>(dataOffset) ||
+         paletteOffset64 + static_cast<std::uint64_t>(palCount) * 4ULL > static_cast<std::uint64_t>(size))) {
         SetError(outError, "Truncated BMP color table.");
         return false;
     }
@@ -2439,6 +2533,7 @@ void ImageAtlas::ConfigureAtlas(
     }
     maxPackableWidth_ = std::min(maxPackableWidth, sharedAtlasSize_ - 2u);
     maxPackableHeight_ = std::min(maxPackableHeight, sharedAtlasSize_ - 2u);
+    revision_.fetch_add(1u, std::memory_order_release);
 }
 
 std::uint32_t ImageAtlas::SharedAtlasSize() const noexcept {
@@ -2646,7 +2741,8 @@ void ImageAtlas::BlitWithExtrudedBorderLocked(
         if (innerX + iw < aw) copyTexel(innerX + iw, innerY + ih, iw - 1u, ih - 1u);
     }
 
-    atlasBuf.dirtyRevision += 1u;
+    const std::uint64_t nextRev = revision_.fetch_add(1u, std::memory_order_acq_rel) + 1u;
+    atlasBuf.dirtyRevision = static_cast<std::uint32_t>(nextRev != 0u ? nextRev : 1u);
 }
 
 const ImageAtlasEntry* ImageAtlas::InsertDecodedLocked(
@@ -2701,11 +2797,12 @@ const ImageAtlasEntry* ImageAtlas::InsertDecodedLocked(
 
     if (!packedInSharedAtlas) {
         const std::uint32_t texId = nextStandaloneTextureId_++;
+        const std::uint64_t nextRev = revision_.fetch_add(1u, std::memory_order_acq_rel) + 1u;
         TextureSlotBuffer slot{};
         slot.textureId = texId;
         slot.width = image.width;
         slot.height = image.height;
-        slot.dirtyRevision = 1u;
+        slot.dirtyRevision = static_cast<std::uint32_t>(nextRev != 0u ? nextRev : 1u);
         slot.isAtlas = false;
         slot.rgbaPixels = std::move(image.rgbaPixels);
         textureSlots_.emplace(texId, std::move(slot));
@@ -2874,6 +2971,38 @@ const TextureSlotBuffer* ImageAtlas::GetTextureSlot(std::uint32_t textureId) con
     return (it != textureSlots_.end()) ? &it->second : nullptr;
 }
 
+bool ImageAtlas::CopyTextureSlotIfModified(
+    std::uint32_t textureId,
+    std::uint32_t& ioKnownSlotRevision,
+    std::uint32_t& outWidth,
+    std::uint32_t& outHeight,
+    std::vector<std::uint8_t>& outRgba8,
+    bool& outWasUpdated) const {
+    outWasUpdated = false;
+    std::lock_guard<std::mutex> lock(mutex_);
+    const auto it = textureSlots_.find(textureId);
+    if (it == textureSlots_.end()) {
+        outWidth = 0u;
+        outHeight = 0u;
+        return false;
+    }
+    const TextureSlotBuffer& slot = it->second;
+    const std::size_t expectedBytes = static_cast<std::size_t>(slot.width) * slot.height * 4u;
+    if (slot.width == 0u || slot.height == 0u || slot.rgbaPixels.size() < expectedBytes) {
+        outWidth = 0u;
+        outHeight = 0u;
+        return false;
+    }
+    outWidth = slot.width;
+    outHeight = slot.height;
+    if (ioKnownSlotRevision == 0u || ioKnownSlotRevision != slot.dirtyRevision) {
+        outRgba8.assign(slot.rgbaPixels.data(), slot.rgbaPixels.data() + expectedBytes);
+        ioKnownSlotRevision = slot.dirtyRevision;
+        outWasUpdated = true;
+    }
+    return true;
+}
+
 Color ImageAtlas::SampleBilinearRgba(std::uint32_t textureId, float u, float v) const noexcept {
     std::lock_guard<std::mutex> lock(mutex_);
     const auto it = textureSlots_.find(textureId);
@@ -2942,6 +3071,7 @@ void ImageAtlas::Clear() noexcept {
     entries_.clear();
     textureSlots_.clear();
     nextStandaloneTextureId_ = 1u;
+    revision_.fetch_add(1u, std::memory_order_release);
 }
 
 } // namespace aero

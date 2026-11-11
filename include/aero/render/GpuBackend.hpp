@@ -10,6 +10,14 @@
 #include "aero/render/PagedRenderTree.hpp"
 #include "aero/render/ZeroCopyGpuStream.hpp"
 
+#if !defined(AERO_GL_APIENTRY)
+#if defined(_WIN32)
+#define AERO_GL_APIENTRY __stdcall
+#else
+#define AERO_GL_APIENTRY
+#endif
+#endif
+
 namespace aero {
 
 enum class GpuBackendKind : std::uint8_t {
@@ -88,85 +96,85 @@ using AeroGLintptr = std::ptrdiff_t;
 using AeroGLsizeiptr = std::ptrdiff_t;
 
 struct GlFunctionTable {
-    void (*Viewport)(AeroGLint x, AeroGLint y, AeroGLsizei width, AeroGLsizei height) = nullptr;
-    void (*Scissor)(AeroGLint x, AeroGLint y, AeroGLsizei width, AeroGLsizei height) = nullptr;
-    void (*Enable)(AeroGLenum cap) = nullptr;
-    void (*Disable)(AeroGLenum cap) = nullptr;
-    void (*BlendFuncSeparate)(
+    void (AERO_GL_APIENTRY *Viewport)(AeroGLint x, AeroGLint y, AeroGLsizei width, AeroGLsizei height) = nullptr;
+    void (AERO_GL_APIENTRY *Scissor)(AeroGLint x, AeroGLint y, AeroGLsizei width, AeroGLsizei height) = nullptr;
+    void (AERO_GL_APIENTRY *Enable)(AeroGLenum cap) = nullptr;
+    void (AERO_GL_APIENTRY *Disable)(AeroGLenum cap) = nullptr;
+    void (AERO_GL_APIENTRY *BlendFuncSeparate)(
         AeroGLenum srcRGB,
         AeroGLenum dstRGB,
         AeroGLenum srcAlpha,
         AeroGLenum dstAlpha) = nullptr;
-    void (*ClearColor)(AeroGLfloat r, AeroGLfloat g, AeroGLfloat b, AeroGLfloat a) = nullptr;
-    void (*Clear)(AeroGLbitfield mask) = nullptr;
+    void (AERO_GL_APIENTRY *ClearColor)(AeroGLfloat r, AeroGLfloat g, AeroGLfloat b, AeroGLfloat a) = nullptr;
+    void (AERO_GL_APIENTRY *Clear)(AeroGLbitfield mask) = nullptr;
 
-    void (*GenBuffers)(AeroGLsizei n, AeroGLuint* buffers) = nullptr;
-    void (*DeleteBuffers)(AeroGLsizei n, const AeroGLuint* buffers) = nullptr;
-    void (*BindBuffer)(AeroGLenum target, AeroGLuint buffer) = nullptr;
-    void (*BufferData)(
+    void (AERO_GL_APIENTRY *GenBuffers)(AeroGLsizei n, AeroGLuint* buffers) = nullptr;
+    void (AERO_GL_APIENTRY *DeleteBuffers)(AeroGLsizei n, const AeroGLuint* buffers) = nullptr;
+    void (AERO_GL_APIENTRY *BindBuffer)(AeroGLenum target, AeroGLuint buffer) = nullptr;
+    void (AERO_GL_APIENTRY *BufferData)(
         AeroGLenum target,
         AeroGLsizeiptr size,
         const void* data,
         AeroGLenum usage) = nullptr;
-    void (*BufferSubData)(
+    void (AERO_GL_APIENTRY *BufferSubData)(
         AeroGLenum target,
         AeroGLintptr offset,
         AeroGLsizeiptr size,
         const void* data) = nullptr;
 
-    void (*GenVertexArrays)(AeroGLsizei n, AeroGLuint* arrays) = nullptr;
-    void (*DeleteVertexArrays)(AeroGLsizei n, const AeroGLuint* arrays) = nullptr;
-    void (*BindVertexArray)(AeroGLuint array) = nullptr;
-    void (*EnableVertexAttribArray)(AeroGLuint index) = nullptr;
-    void (*VertexAttribPointer)(
+    void (AERO_GL_APIENTRY *GenVertexArrays)(AeroGLsizei n, AeroGLuint* arrays) = nullptr;
+    void (AERO_GL_APIENTRY *DeleteVertexArrays)(AeroGLsizei n, const AeroGLuint* arrays) = nullptr;
+    void (AERO_GL_APIENTRY *BindVertexArray)(AeroGLuint array) = nullptr;
+    void (AERO_GL_APIENTRY *EnableVertexAttribArray)(AeroGLuint index) = nullptr;
+    void (AERO_GL_APIENTRY *VertexAttribPointer)(
         AeroGLuint index,
         AeroGLint size,
         AeroGLenum type,
         AeroGLboolean normalized,
         AeroGLsizei stride,
         const void* pointer) = nullptr;
-    void (*VertexAttribIPointer)(
+    void (AERO_GL_APIENTRY *VertexAttribIPointer)(
         AeroGLuint index,
         AeroGLint size,
         AeroGLenum type,
         AeroGLsizei stride,
         const void* pointer) = nullptr;
 
-    AeroGLuint (*CreateShader)(AeroGLenum shaderType) = nullptr;
-    void (*DeleteShader)(AeroGLuint shader) = nullptr;
-    void (*ShaderSource)(
+    AeroGLuint (AERO_GL_APIENTRY *CreateShader)(AeroGLenum shaderType) = nullptr;
+    void (AERO_GL_APIENTRY *DeleteShader)(AeroGLuint shader) = nullptr;
+    void (AERO_GL_APIENTRY *ShaderSource)(
         AeroGLuint shader,
         AeroGLsizei count,
         const AeroGLchar* const* string,
         const AeroGLint* length) = nullptr;
-    void (*CompileShader)(AeroGLuint shader) = nullptr;
-    void (*GetShaderiv)(AeroGLuint shader, AeroGLenum pname, AeroGLint* params) = nullptr;
-    void (*GetShaderInfoLog)(
+    void (AERO_GL_APIENTRY *CompileShader)(AeroGLuint shader) = nullptr;
+    void (AERO_GL_APIENTRY *GetShaderiv)(AeroGLuint shader, AeroGLenum pname, AeroGLint* params) = nullptr;
+    void (AERO_GL_APIENTRY *GetShaderInfoLog)(
         AeroGLuint shader,
         AeroGLsizei maxLength,
         AeroGLsizei* length,
         AeroGLchar* infoLog) = nullptr;
 
-    AeroGLuint (*CreateProgram)() = nullptr;
-    void (*DeleteProgram)(AeroGLuint program) = nullptr;
-    void (*AttachShader)(AeroGLuint program, AeroGLuint shader) = nullptr;
-    void (*LinkProgram)(AeroGLuint program) = nullptr;
-    void (*GetProgramiv)(AeroGLuint program, AeroGLenum pname, AeroGLint* params) = nullptr;
-    void (*GetProgramInfoLog)(
+    AeroGLuint (AERO_GL_APIENTRY *CreateProgram)() = nullptr;
+    void (AERO_GL_APIENTRY *DeleteProgram)(AeroGLuint program) = nullptr;
+    void (AERO_GL_APIENTRY *AttachShader)(AeroGLuint program, AeroGLuint shader) = nullptr;
+    void (AERO_GL_APIENTRY *LinkProgram)(AeroGLuint program) = nullptr;
+    void (AERO_GL_APIENTRY *GetProgramiv)(AeroGLuint program, AeroGLenum pname, AeroGLint* params) = nullptr;
+    void (AERO_GL_APIENTRY *GetProgramInfoLog)(
         AeroGLuint program,
         AeroGLsizei maxLength,
         AeroGLsizei* length,
         AeroGLchar* infoLog) = nullptr;
-    void (*UseProgram)(AeroGLuint program) = nullptr;
-    AeroGLint (*GetUniformLocation)(AeroGLuint program, const AeroGLchar* name) = nullptr;
-    void (*Uniform1i)(AeroGLint location, AeroGLint v0) = nullptr;
-    void (*Uniform2f)(AeroGLint location, AeroGLfloat v0, AeroGLfloat v1) = nullptr;
+    void (AERO_GL_APIENTRY *UseProgram)(AeroGLuint program) = nullptr;
+    AeroGLint (AERO_GL_APIENTRY *GetUniformLocation)(AeroGLuint program, const AeroGLchar* name) = nullptr;
+    void (AERO_GL_APIENTRY *Uniform1i)(AeroGLint location, AeroGLint v0) = nullptr;
+    void (AERO_GL_APIENTRY *Uniform2f)(AeroGLint location, AeroGLfloat v0, AeroGLfloat v1) = nullptr;
 
-    void (*GenTextures)(AeroGLsizei n, AeroGLuint* textures) = nullptr;
-    void (*DeleteTextures)(AeroGLsizei n, const AeroGLuint* textures) = nullptr;
-    void (*ActiveTexture)(AeroGLenum texture) = nullptr;
-    void (*BindTexture)(AeroGLenum target, AeroGLuint texture) = nullptr;
-    void (*TexImage2D)(
+    void (AERO_GL_APIENTRY *GenTextures)(AeroGLsizei n, AeroGLuint* textures) = nullptr;
+    void (AERO_GL_APIENTRY *DeleteTextures)(AeroGLsizei n, const AeroGLuint* textures) = nullptr;
+    void (AERO_GL_APIENTRY *ActiveTexture)(AeroGLenum texture) = nullptr;
+    void (AERO_GL_APIENTRY *BindTexture)(AeroGLenum target, AeroGLuint texture) = nullptr;
+    void (AERO_GL_APIENTRY *TexImage2D)(
         AeroGLenum target,
         AeroGLint level,
         AeroGLint internalFormat,
@@ -176,7 +184,7 @@ struct GlFunctionTable {
         AeroGLenum format,
         AeroGLenum type,
         const void* data) = nullptr;
-    void (*TexSubImage2D)(
+    void (AERO_GL_APIENTRY *TexSubImage2D)(
         AeroGLenum target,
         AeroGLint level,
         AeroGLint xoffset,
@@ -186,15 +194,15 @@ struct GlFunctionTable {
         AeroGLenum format,
         AeroGLenum type,
         const void* pixels) = nullptr;
-    void (*TexParameteri)(AeroGLenum target, AeroGLenum pname, AeroGLint param) = nullptr;
-    void (*PixelStorei)(AeroGLenum pname, AeroGLint param) = nullptr;
+    void (AERO_GL_APIENTRY *TexParameteri)(AeroGLenum target, AeroGLenum pname, AeroGLint param) = nullptr;
+    void (AERO_GL_APIENTRY *PixelStorei)(AeroGLenum pname, AeroGLint param) = nullptr;
 
-    void (*DrawElements)(
+    void (AERO_GL_APIENTRY *DrawElements)(
         AeroGLenum mode,
         AeroGLsizei count,
         AeroGLenum type,
         const void* indices) = nullptr;
-    void (*ReadPixels)(
+    void (AERO_GL_APIENTRY *ReadPixels)(
         AeroGLint x,
         AeroGLint y,
         AeroGLsizei width,
@@ -202,8 +210,8 @@ struct GlFunctionTable {
         AeroGLenum format,
         AeroGLenum type,
         void* data) = nullptr;
-    AeroGLenum (*GetError)() = nullptr;
-    const std::uint8_t* (*GetString)(AeroGLenum name) = nullptr;
+    AeroGLenum (AERO_GL_APIENTRY *GetError)() = nullptr;
+    const std::uint8_t* (AERO_GL_APIENTRY *GetString)(AeroGLenum name) = nullptr;
 
     [[nodiscard]] bool IsComplete() const noexcept;
 };
@@ -397,8 +405,19 @@ public:
     [[nodiscard]] std::size_t RingBufferByteCapacity() const noexcept { return ringBufferBytes_; }
 
 private:
+    struct GlImageSlotState {
+        AeroGLuint texId = 0;
+        std::uint32_t width = 0;
+        std::uint32_t height = 0;
+        std::uint32_t slotRevision = 0;
+        std::uint64_t lastGlobalRevision = 0;
+    };
+
     bool LoadDynamicGlEntryPoints();
     void BindAeroVertexLayout() noexcept;
+    void SyncUnifiedUiAtlas(const PagedRenderTree& tree);
+    AeroGLuint EnsureFallbackWhiteTexture();
+    AeroGLuint ResolveBatchImageTexture(std::uint32_t textureId);
 
     GlFunctionTable gl_{};
     bool hasCustomTable_ = false;
@@ -414,10 +433,12 @@ private:
     AeroGLuint ringVboId_ = 0;
     AeroGLuint quadEboId_ = 0;
     AeroGLuint atlasTextureId_ = 0;
+    AeroGLuint fallbackWhiteTexId_ = 0;
 
     AeroGLint uViewportSizeLoc_ = -1;
     AeroGLint uQuadHalfExtentLoc_ = -1;
     AeroGLint uAtlasSamplerLoc_ = -1;
+    AeroGLint uImageSamplerLoc_ = -1;
 
     std::size_t maxPagesInRing_ = 0;
     std::size_t ringBufferBytes_ = 0;
@@ -427,6 +448,17 @@ private:
     std::uint32_t lastViewportWidth_ = 0;
     std::uint32_t lastViewportHeight_ = 0;
 
+    bool syncedUiAtlasReady_ = false;
+    std::uint64_t syncedFontRevision_ = 0;
+    std::uint32_t syncedMtsdfOwnerId_ = 0;
+    std::uint64_t syncedMtsdfRevision_ = 0;
+    std::uint32_t syncedMtsdfRows_ = 0;
+    std::uint32_t syncedGradientRevision_ = 0;
+    std::uint32_t syncedMinGradRow_ = 1023u;
+
+    std::vector<GlImageSlotState> imageSlotTextures_;
+    std::vector<std::uint8_t> uiAtlasScratchRgba8_;
+    std::vector<std::uint8_t> imageUploadScratchRgba8_;
     std::vector<std::uint32_t> quadIndexMirror_;
     std::string diagnostics_;
     GpuBackendTelemetry telemetry_{};
@@ -520,7 +552,8 @@ private:
     std::uint32_t atlasHeight_ = 0;
     std::uint32_t framebufferWidth_ = 0;
     std::uint32_t framebufferHeight_ = 0;
-    std::uint32_t lastRenderedTreeId_ = 0;
+    std::uint32_t lastRenderedTreeId_ = 0xFFFFFFFFu;
+    std::size_t lastRenderedNodeCount_ = 0u;
     Color lastClearColor_{0.0f, 0.0f, 0.0f, 0.0f};
 
     std::vector<std::uint8_t> ringMirrorBytes_;

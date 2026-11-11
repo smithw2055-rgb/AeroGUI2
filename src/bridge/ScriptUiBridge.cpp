@@ -3,6 +3,8 @@
 #include <string>
 #include <utility>
 
+#include "aero/core/UiResourceContext.hpp"
+
 namespace aero {
 
 ScriptUiBridge::ScriptUiBridge(
@@ -294,6 +296,11 @@ std::size_t ScriptUiBridge::FlushReactiveBindings(RuntimeError* error) {
     if (!engine_) {
         return 0u;
     }
+    std::shared_ptr<UiResourceContext> domainCtx =
+        !UiResourceContext::HasActiveThreadOverride()
+            ? UiResourceContext::FindForDomains(&domains_)
+            : nullptr;
+    ScopedUiResourceContext ctxGuard(std::move(domainCtx));
     return engine_->FlushTrackA(error) + engine_->FlushTrackB();
 }
 

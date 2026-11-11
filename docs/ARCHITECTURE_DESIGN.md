@@ -109,11 +109,11 @@ RealScript 运行时通过 `SharedValuePoolBridge` 统一管理跨模块共享�
 
 | Opcode | 枚举名称 | `propId` 语义 | `flags` 语义 | `strIdx0` / `strIdx1` / `symbolId` / `literalValue` 操作数契约 |
 | ---: | :--- | :--- | :--- | :--- |
-| **1** | `BeginElement` | 保留 (`0`) | `0x01` = 挂载至父 `HeaderedContentControl` 的 `Header` 槽 | `strIdx0`: 控件类型名字符串索引；`strIdx1`: `x:Name` 字符串索引（无名称时为 `0xFFFFFFFF`）；压入当前挂载元素栈。 |
+| **1** | `BeginElement` | 保留 (`0`) | `0x01` = 挂载至父 `HeaderedContentControl` 的 `Header` 槽 | `strIdx0`: 控件类型名字符串索引；`strIdx1`: `x:Name` 字符串索引（无名称时为 `0`，因为空串 `""` 固定驻留于字符串表索引 `0`）；压入当前挂载元素栈。 |
 | **2** | `EndElement` | 保留 (`0`) | `0` | 弹出当前挂载元素栈顶节点，闭合子树作用域。 |
 | **3** | `SetStaticProperty` | 目标 `BuiltinPropertyId` | `0` | 将预解析的 `literalValue` 以 `ValueSourceRank::Local` 写入栈顶元素对应快槽或稀疏槽（渐变刷自动解析注册至 `GradientBrushRegistry`）。 |
 | **4** | `BindProperty` | 目标 `BuiltinPropertyId` | `0` | `strIdx0` 指向 `bindingChains[strIdx0]`，在 `DualTrackBindingEngine` 中建立 Track A 多跳槽位链或 `ElementName`/`RelativeSource` 绑定。 |
-| **5** | `BindEcsColumn` | 目标 `BuiltinPropertyId` | `0` | `symbolId`: ECS 组件 64 位 `SymbolId`；`strIdx0`: 字段名索引；`strIdx1`: 行索引；建立 Track B `NativeRawColumnView` 零拷贝列绑定。 |
+| **5** | `BindEcsColumn` | 目标 `BuiltinPropertyId` | `0` | `symbolId`: ECS 组件 64 位 `SymbolId`；`strIdx0`: 组件名字符串索引；`strIdx1`: 字段名字符串索引；建立 Track B `NativeRawColumnView` 零拷贝列绑定。 |
 | **6** | `BindEvent` | 保留 (`0`) | `0` | `strIdx0` 指向 `eventBindings[strIdx0]`，`symbolId` 为目标方法 64 位符号 ID（支持 VM `Interpreter`、AOT 函数表与弱目标委托路由）。 |
 | **7** | `AddRowDefinition` | 保留 (`0`) | `GridUnitType` (`Auto=0, Pixel=1, Star=2`) | `literalValue` (`Float32`) 为行高数值/权重，向栈顶 `Grid` 追加 `RowDefinition`。 |
 | **8** | `AddColumnDefinition` | 保留 (`0`) | `GridUnitType` (`Auto=0, Pixel=1, Star=2`) | `literalValue` (`Float32`) 为列宽数值/权重，向栈顶 `Grid` 追加 `ColumnDefinition`。 |

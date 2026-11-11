@@ -45,9 +45,48 @@ void Check(bool cond, const char* expr, int line, const char* msg = "") {
 #define AERO_CHECK(cond) Check((cond), #cond, __LINE__)
 #define AERO_CHECK_MSG(cond, msg) Check((cond), #cond, __LINE__, (msg))
 
-constexpr const char* kSamplesRoot = "/working_dir/c_1a21a30fb41e1c84/scratch/samples";
-constexpr const char* kLocalizationDir = "/working_dir/c_1a21a30fb41e1c84/scratch/samples/Localization/Data";
-constexpr const char* kInventoryDir = "/working_dir/c_1a21a30fb41e1c84/scratch/samples/Inventory/Data";
+std::filesystem::path ResolveSamplesDir() {
+    std::error_code ec;
+    if (const char* envDir = std::getenv("AERO_SAMPLES_DIR"); envDir && envDir[0] != '\0') {
+        const std::filesystem::path p(envDir);
+        if (std::filesystem::is_directory(p, ec)) {
+            return p;
+        }
+    }
+#ifdef AERO_SAMPLES_DIR
+    {
+        const std::filesystem::path p(AERO_SAMPLES_DIR);
+        if (!p.empty() && std::filesystem::is_directory(p, ec)) {
+            return p;
+        }
+    }
+#endif
+    constexpr const char* kCandidates[] = {
+        "Samples",
+        "samples",
+        "../Samples",
+        "../samples",
+        "../../Samples",
+        "../../samples",
+        "../../../Samples",
+        "../../../samples",
+    };
+    for (const char* cand : kCandidates) {
+        const std::filesystem::path p(cand);
+        if (std::filesystem::is_directory(p, ec)) {
+            return p;
+        }
+    }
+    return std::filesystem::path("Samples");
+}
+
+std::string GetLocalizationDir() {
+    return (ResolveSamplesDir() / "Localization" / "Data").string();
+}
+
+std::string GetInventoryDir() {
+    return (ResolveSamplesDir() / "Inventory" / "Data").string();
+}
 
 const aero::UnifiedValue* FindPkgResource(const aero::AxbPackage& pkg, std::string_view key) noexcept {
     for (auto it = pkg.resources.rbegin(); it != pkg.resources.rend(); ++it) {
@@ -174,8 +213,9 @@ void TestLocalizationSampleCompilationAndPrimitives() {
     AERO_CHECK(aero::AxbResourceFlag_Loc == 0x04u);
 
     // 2. Compile MainPage.xaml directly from disk (auto-merges co-located Resources.xaml via Localization.noesis)
+    const std::string locDir = GetLocalizationDir();
     aero::AeroCompileInput mainIn{};
-    mainIn.xamlPath = std::string(kLocalizationDir) + "/MainPage.xaml";
+    mainIn.xamlPath = locDir + "/MainPage.xaml";
     const aero::AeroCompileResult mainRes = compiler.Compile(mainIn);
     AERO_CHECK_MSG(mainRes.succeeded, "Localization/Data/MainPage.xaml should compile cleanly");
 
@@ -222,7 +262,7 @@ void TestLocalizationSampleCompilationAndPrimitives() {
     // 3. Compile Language-en.xaml, Language-fr.xaml (UTF-8 BOM), Language-jp.xaml (UTF-8 BOM), Language-ar.xaml (UTF-8 BOM)
     auto compileLang = [&](const char* fileName) -> aero::AeroCompileResult {
         aero::AeroCompileInput in{};
-        in.xamlPath = std::string(kLocalizationDir) + "/" + fileName;
+        in.xamlPath = locDir + "/" + fileName;
         return compiler.Compile(in);
     };
 
@@ -325,14 +365,15 @@ void TestLocalizationSampleCompilationAndPrimitives() {
 void TestLocalizationLiveHotSwitchEnFrJpArAndFlagImage() {
     aero::AxbTemplateRegistry::Instance().Clear();
     aero::ImageAtlas::Instance().Clear();
-    aero::ImageAtlas::Instance().SetBaseDirectory(kLocalizationDir);
+    const std::string locDir = GetLocalizationDir();
+    aero::ImageAtlas::Instance().SetBaseDirectory(locDir);
 
     aero::AeroCompiler compiler;
 
     // Compile language dictionaries first and start with English active
     auto compileFile = [&](const char* relFile) {
         aero::AeroCompileInput in{};
-        in.xamlPath = std::string(kLocalizationDir) + "/" + relFile;
+        in.xamlPath = locDir + "/" + relFile;
         return compiler.Compile(in);
     };
     const auto enRes = compileFile("Language-en.xaml");
@@ -655,7 +696,7 @@ void TestMergedDictionariesPackUriCycleAxbRoundTripAndInventory() {
 
     // 3. Compile official Samples/Inventory/Data/MainPage.xaml (auto-merging Inventory/Data/Resources.xaml)
     aero::AeroCompileInput invIn{};
-    invIn.xamlPath = std::string(kInventoryDir) + "/MainPage.xaml";
+    invIn.xamlPath = GetInventoryDir() + "/MainPage.xaml";
     const auto invRes = compiler.Compile(invIn);
     AERO_CHECK_MSG(invRes.succeeded, "Samples/Inventory/Data/MainPage.xaml should compile and merge Resources.xaml");
     AERO_CHECK(!invRes.axbPackage.mergedDictionarySources.empty());

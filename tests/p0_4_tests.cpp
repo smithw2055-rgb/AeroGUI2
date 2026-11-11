@@ -3,8 +3,10 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <iostream>
 #include <string>
+#include <system_error>
 #include <vector>
 
 #include "aero/compiler/AeroCompiler.hpp"
@@ -33,7 +35,44 @@ void CheckImpl(bool cond, const char* expr, int line, const char* msg) {
     return std::fabs(a - b) <= eps;
 }
 
-constexpr const char* kSamplesDir = "/working_dir/c_1a21a30fb41e1c84/scratch/samples";
+std::filesystem::path ResolveSamplesDir() {
+    std::error_code ec;
+    if (const char* envDir = std::getenv("AERO_SAMPLES_DIR"); envDir && envDir[0] != '\0') {
+        const std::filesystem::path p(envDir);
+        if (std::filesystem::is_directory(p, ec)) {
+            return p;
+        }
+    }
+#ifdef AERO_SAMPLES_DIR
+    {
+        const std::filesystem::path p(AERO_SAMPLES_DIR);
+        if (!p.empty() && std::filesystem::is_directory(p, ec)) {
+            return p;
+        }
+    }
+#endif
+    constexpr const char* kCandidates[] = {
+        "Samples",
+        "samples",
+        "../Samples",
+        "../samples",
+        "../../Samples",
+        "../../samples",
+        "../../../Samples",
+        "../../../samples",
+    };
+    for (const char* cand : kCandidates) {
+        const std::filesystem::path p(cand);
+        if (std::filesystem::is_directory(p, ec)) {
+            return p;
+        }
+    }
+    return std::filesystem::path("Samples");
+}
+
+std::string SamplesDirStr() {
+    return ResolveSamplesDir().string();
+}
 
 // Build a minimal valid uncompressed 24-bit BMP in memory (4x4 quadrant pattern)
 std::vector<std::uint8_t> BuildSyntheticBmp24() {
@@ -100,7 +139,7 @@ std::vector<std::uint8_t> BuildSyntheticRleTga32() {
 void TestZeroDependencyImageDecoders() {
     aero::DecodedImage earth{};
     std::string err;
-    const std::string earthPath = std::string(kSamplesDir) + "/DataBinding/Data/Images/Earth.png";
+    const std::string earthPath = SamplesDirStr() + "/DataBinding/Data/Images/Earth.png";
     AERO_CHECK(aero::DecodeImageFromFile(earthPath, earth, &err), "Decode Earth.png via pure C++17 PNG+Inflate");
     AERO_CHECK(earth.Valid() && earth.format == aero::ImageFormat::Png, "Earth.png DecodedImage valid PNG");
     AERO_CHECK(earth.width == 256u && earth.height == 256u, "Earth.png dimensions == 256x256");
@@ -127,20 +166,20 @@ void TestZeroDependencyImageDecoders() {
 
     // Test 8-bit RGB PNG (QuestLog/Data/Images/Image0.png: 558x225)
     aero::DecodedImage questImg{};
-    const std::string questPath = std::string(kSamplesDir) + "/QuestLog/Data/Images/Image0.png";
+    const std::string questPath = SamplesDirStr() + "/QuestLog/Data/Images/Image0.png";
     AERO_CHECK(aero::DecodeImageFromFile(questPath, questImg, &err), "Decode QuestLog Image0.png (RGB8)");
     AERO_CHECK(questImg.width == 558u && questImg.height == 225u, "Image0.png dimensions == 558x225");
     AERO_CHECK(questImg.rgbaPixels[3u] == 255u, "RGB8 PNG expands alpha to 255");
 
     // Test 8-bit Palette Colormap PNG (DataBinding/Data/Images/Space.png: 1920x1920)
     aero::DecodedImage spaceImg{};
-    const std::string spacePath = std::string(kSamplesDir) + "/DataBinding/Data/Images/Space.png";
+    const std::string spacePath = SamplesDirStr() + "/DataBinding/Data/Images/Space.png";
     AERO_CHECK(aero::DecodeImageFromFile(spacePath, spaceImg, &err), "Decode Space.png (8-bit PLTE colormap)");
     AERO_CHECK(spaceImg.width == 1920u && spaceImg.height == 1920u, "Space.png dimensions == 1920x1920");
 
     // Test real Baseline Exif JPEG (BackgroundBlur/Data/Background.jpg: 2508x1252)
     aero::DecodedImage bgJpg{};
-    const std::string bgJpgPath = std::string(kSamplesDir) + "/BackgroundBlur/Data/Background.jpg";
+    const std::string bgJpgPath = SamplesDirStr() + "/BackgroundBlur/Data/Background.jpg";
     AERO_CHECK(aero::DecodeImageFromFile(bgJpgPath, bgJpg, &err), "Decode BackgroundBlur/Data/Background.jpg");
     AERO_CHECK(bgJpg.Valid() && bgJpg.format == aero::ImageFormat::Jpeg, "Background.jpg DecodedImage valid JPEG");
     AERO_CHECK(bgJpg.width == 2508u && bgJpg.height == 1252u, "Background.jpg dimensions == 2508x1252");
@@ -167,7 +206,7 @@ void TestZeroDependencyImageDecoders() {
 
     // Test second real Exif JPEG (Inventory/Data/Images/Background.jpg: 1920x1080)
     aero::DecodedImage invBg{};
-    const std::string invBgPath = std::string(kSamplesDir) + "/Inventory/Data/Images/Background.jpg";
+    const std::string invBgPath = SamplesDirStr() + "/Inventory/Data/Images/Background.jpg";
     AERO_CHECK(aero::DecodeImageFromFile(invBgPath, invBg, &err), "Decode Inventory Background.jpg");
     AERO_CHECK(invBg.width == 1920u && invBg.height == 1080u, "Inventory Background.jpg == 1920x1080");
 
@@ -198,8 +237,8 @@ void TestZeroDependencyImageDecoders() {
 void TestRelativeUriAndMeasureCoreNaturalSizing() {
     auto& atlas = aero::ImageAtlas::Instance();
     atlas.Clear();
-    atlas.SetBaseDirectory(std::string(kSamplesDir) + "/DataBinding/Data");
-    atlas.AddSearchDirectory(std::string(kSamplesDir) + "/QuestLog/Data");
+    atlas.SetBaseDirectory(SamplesDirStr() + "/DataBinding/Data");
+    atlas.AddSearchDirectory(SamplesDirStr() + "/QuestLog/Data");
 
     // Relative XAML URI resolution ("Images/Earth.png") + WPF pack:// URI resolution
     const aero::ImageAtlasEntry* earthEntry = atlas.LoadOrGet("Images/Earth.png");
@@ -252,7 +291,7 @@ void TestRelativeUriAndMeasureCoreNaturalSizing() {
 void TestStretchModesGeometryAndUvCropping() {
     auto& atlas = aero::ImageAtlas::Instance();
     atlas.Clear();
-    atlas.SetBaseDirectory(std::string(kSamplesDir) + "/DataBinding/Data");
+    atlas.SetBaseDirectory(SamplesDirStr() + "/DataBinding/Data");
 
     const aero::ImageAtlasEntry* earth = atlas.LoadOrGet("Images/Earth.png");
     AERO_CHECK(earth != nullptr, "Loaded Earth.png into Skyline atlas");
@@ -378,9 +417,9 @@ void TestStretchModesGeometryAndUvCropping() {
 void TestAtlasBatchMergingAndMultiTextureSplitting() {
     auto& atlas = aero::ImageAtlas::Instance();
     atlas.Clear();
-    atlas.AddSearchDirectory(std::string(kSamplesDir) + "/DataBinding/Data");
-    atlas.AddSearchDirectory(std::string(kSamplesDir) + "/Inventory/Data");
-    atlas.AddSearchDirectory(std::string(kSamplesDir) + "/BackgroundBlur/Data");
+    atlas.AddSearchDirectory(SamplesDirStr() + "/DataBinding/Data");
+    atlas.AddSearchDirectory(SamplesDirStr() + "/Inventory/Data");
+    atlas.AddSearchDirectory(SamplesDirStr() + "/BackgroundBlur/Data");
 
     // 1. Multiple small/medium sprites in shared Skyline UI atlas -> 1 single CommandPage & 1 DrawCall batch!
     {
@@ -516,7 +555,7 @@ void TestAtlasBatchMergingAndMultiTextureSplitting() {
 void TestSoftwareRasterizeTexturedVisualTree() {
     auto& atlas = aero::ImageAtlas::Instance();
     atlas.Clear();
-    atlas.SetBaseDirectory(std::string(kSamplesDir) + "/DataBinding/Data");
+    atlas.SetBaseDirectory(SamplesDirStr() + "/DataBinding/Data");
 
     // Register a deterministic 2x2 crisp RGBA sprite to verify bilinear interpolation & vertex color tinting,
     // alongside a real 256x256 PNG (Earth.png) rendered inside the same visual tree!

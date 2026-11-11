@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -126,6 +127,7 @@ private:
     bool ExtractGlyphRecursive(
         std::uint32_t glyphIndex,
         std::uint32_t depth,
+        std::uint32_t& ioTotalVisitedComponents,
         std::vector<TtfContourSegment>& outSegments,
         std::vector<TtfPoint>* outRawPoints) const;
 
@@ -151,6 +153,8 @@ private:
 
     bool hasFormat12_ = false;
     bool hasFormat4_ = false;
+    bool cmap12Sorted_ = true;
+    bool cmap4Sorted_ = true;
     bool isSymbolCmap_ = false;
     std::vector<CmapFormat12Group> cmap12Groups_;
     std::vector<CmapFormat4Segment> cmap4Segments_;
@@ -317,8 +321,16 @@ public:
 
     [[nodiscard]] std::uint16_t AtlasWidth() const noexcept { return atlasWidth_; }
     [[nodiscard]] std::uint16_t AtlasHeight() const noexcept { return atlasHeight_; }
-    [[nodiscard]] std::uint64_t Revision() const noexcept { return revision_; }
+    [[nodiscard]] std::uint64_t Revision() const noexcept { return revision_.load(std::memory_order_acquire); }
     [[nodiscard]] const std::vector<std::uint8_t>& SdfR8Pixels() const noexcept { return sdfPixels_; }
+
+    // Thread-safe snapshot expansion of the top SDF glyph band [0 .. min(maxRows, glyphRegionHeight_)] into RGBA8
+    void CopyGlyphRegionRgba8(
+        std::uint32_t maxRows,
+        std::vector<std::uint8_t>& outRgba8,
+        std::uint32_t& outWidth,
+        std::uint32_t& outRows,
+        std::uint64_t* outRevision = nullptr) const;
 
     [[nodiscard]] static std::string NormalizeFamilyKey(std::string_view rawFamily);
 
@@ -365,7 +377,7 @@ private:
     std::uint16_t glyphRegionHeight_ = kDefaultAtlasSize / 2u; // Top half v in [0.0..0.5)
     std::vector<std::uint16_t> skyline_;
     std::vector<std::uint8_t> sdfPixels_;
-    std::uint64_t revision_ = 1u;
+    std::atomic<std::uint64_t> revision_{1u};
 
     std::uint32_t nextFontId_ = 1u;
     std::string defaultFamilyKey_;

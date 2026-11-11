@@ -67,6 +67,9 @@ public:
     void SetAotExecutionContext(rs_aot::ExecutionContext* aotContext) noexcept {
         aotContext_ = aotContext;
     }
+    [[nodiscard]] ExecutionDomainContext* GetDomains() const noexcept { return domains_; }
+    [[nodiscard]] const Interpreter* GetUiInterpreter() const noexcept { return uiInterpreter_; }
+    [[nodiscard]] rs_aot::ExecutionContext* GetAotExecutionContext() const noexcept { return aotContext_; }
 
     void SetSoundActionCallback(SoundActionCallback callback) {
         soundActionCallback_ = std::move(callback);
@@ -92,6 +95,9 @@ public:
     bool AttachStyleByKey(UIElement* element, std::string_view styleKey);
     std::size_t BindSubtreeStyles(UIElement* rootElement, bool applyImplicitTypeStyles = true);
     std::size_t UnbindSubtreeStyles(const UIElement* subtreeRoot) noexcept;
+    void OnElementControlTemplateChanging(UIElement* host, UIElement* oldTemplateRoot) noexcept;
+    void OnElementControlTemplateCleared(UIElement* host);
+    void OnElementControlTemplateApplied(UIElement* host);
 
     // Imperative / script VisualStateManager transition (e.g. GoToState(card, "Expanded", true))
     bool GoToVisualState(
@@ -107,7 +113,7 @@ public:
 
 private:
     struct PropertySnapshotSlot {
-        UIElement* resolvedTarget = nullptr;
+        IntrusivePtr<UIElement> resolvedTarget{};
         std::uint16_t propId = 0;
         bool captured = false;
         bool hadBaseValue = false;
@@ -122,7 +128,7 @@ private:
     };
 
     struct EventTriggerRuntimeState {
-        UIElement* cachedSource = nullptr;
+        IntrusivePtr<UIElement> cachedSource{};
         std::uint32_t lastClickGen = 0u;
         std::int64_t prevSelectedIndex = -1;
         float prevNumericValue = 0.0f;
@@ -133,6 +139,7 @@ private:
 
     struct StyledElementInstance {
         IntrusivePtr<UIElement> element{};
+        AxbStyleDefinition baseFlattenedStyle{};
         AxbStyleDefinition resolvedStyle{};
         std::uint64_t activeTriggerMask = 0ULL;
         bool initialized = false;
@@ -178,6 +185,7 @@ private:
     std::unordered_map<std::string, AxbStyleDefinition> implicitTypeStyles_;
     std::unordered_map<std::string, AxbStoryboard> keyedStoryboards_;
     std::vector<StyledElementInstance> instances_;
+    bool inAttachStyle_ = false;
 };
 
 } // namespace aero

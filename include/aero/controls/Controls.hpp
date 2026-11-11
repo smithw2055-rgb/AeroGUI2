@@ -1036,7 +1036,7 @@ public:
     using ItemBinderFn = std::function<void(std::size_t index, const UnifiedValue& item, UIElement& element)>;
 
     ItemsControl();
-    ~ItemsControl() override = default;
+    ~ItemsControl() override;
 
     static const TypeClass* StaticTypeClass() noexcept;
     [[nodiscard]] const TypeClass* GetTypeClass() const noexcept override {
@@ -1109,6 +1109,8 @@ public:
 
 protected:
     [[nodiscard]] ExecutionDomainContext* Domains() const noexcept { return domains_; }
+    [[nodiscard]] bool IsDeferringSelectionNotify() const noexcept { return deferSelectionNotify_; }
+    [[nodiscard]] bool ComputeLiveScrollViewport(float& outViewTop, float& outViewH) const noexcept;
     void MarkExtraValuesInPools() const noexcept override;
 
 private:
@@ -1119,7 +1121,10 @@ private:
     };
 
     [[nodiscard]] UnifiedValue NormalizeItemValue(const UnifiedValue& raw);
+    [[nodiscard]] std::int32_t FindMatchingItemIndex(const UnifiedValue& target) const;
     void ReleaseChildSubtreeResources(UIElement* ch);
+    void ClearRecyclePool(NativeHandleRegistry* registry = nullptr, ManagedHeap* uiHeap = nullptr);
+    void MoveVirtualSlotsToRecyclePool(NativeHandleRegistry* registry = nullptr, ManagedHeap* uiHeap = nullptr);
     [[nodiscard]] IntrusivePtr<UIElement> CreateMaterializedItemVisual(
         std::size_t index,
         const UnifiedValue& itemVal,
@@ -1155,6 +1160,7 @@ private:
     ItemBinderFn itemBinder_;
     std::vector<UnifiedValue> items_;
     std::vector<RealizedVirtualSlot> virtualSlots_;
+    std::vector<RealizedVirtualSlot> recyclePool_;
     std::size_t firstRealizedIndex_ = 0;
     std::size_t realizedEndExclusive_ = 0;
     float estimatedMaxItemWidth_ = 80.0f;
@@ -1162,6 +1168,7 @@ private:
     bool hasValidMeasureConstraint_ = false;
     bool hasBoundItemsSource_ = false;
     bool syncingItemsSelection_ = false;
+    bool deferSelectionNotify_ = false;
 };
 
 class ListBox : public ItemsControl {
@@ -1182,11 +1189,26 @@ public:
         selectionChangedCallback_ = std::move(callback);
     }
 
+    bool SelectIndexInteractive(std::int32_t index);
+
     void OnPropertyChanged(std::uint16_t propId, const UnifiedValue& newValue) override;
+    bool OnPointerDown(
+        Point localPoint,
+        PointerButton button,
+        std::uint8_t modifiers,
+        bool& outRequestCapture) override;
+    bool OnKeyDown(KeyCode key, std::uint8_t modifiers) override;
+
+protected:
+    void MarkExtraValuesInPools() const noexcept override;
 
 private:
+    void ScrollItemIntoView(std::int32_t index) noexcept;
+
     SelectionChangedCallback selectionChangedCallback_;
     std::int32_t lastNotifiedSelectedIndex_ = -1;
+    UnifiedValue lastNotifiedSelectedItem_{};
+    bool hasNotifiedSelection_ = false;
 };
 
 class ComboBox : public ItemsControl {
@@ -1299,6 +1321,12 @@ public:
     void MarkValuesInPools() const noexcept;
     [[nodiscard]] const UnifiedValue* FindResource(std::string_view key) const noexcept;
     [[nodiscard]] const UnifiedValue* FindDynamicResource(std::string_view key) const noexcept;
+    [[nodiscard]] const UnifiedValue* FindResourceForElement(
+        std::string_view key,
+        const UIElement* target) const noexcept;
+    [[nodiscard]] const UnifiedValue* FindDynamicResourceForElement(
+        std::string_view key,
+        const UIElement* target) const noexcept;
     [[nodiscard]] const AxbPackage* Find(std::string_view className) const noexcept;
     [[nodiscard]] const AxbMtsdfPathEntry* FindMtsdfPath(std::uint64_t pathHash) const noexcept;
     [[nodiscard]] const AxbMtsdfPathEntry* FindOrBakeMtsdfPath(std::string_view pathData);
@@ -1356,6 +1384,7 @@ public:
         templates_.clear();
         resources_.clear();
         dynamicOverrides_.clear();
+        scopedDynamicOverrides_.clear();
         registeredDictionaries_.clear();
         dynamicSubscriptions_.clear();
         mtsdfPaths_.clear();
@@ -1378,8 +1407,21 @@ private:
         WakeHostCallback callback = nullptr;
         void* userData = nullptr;
     };
+    struct PendingResourceUpdate {
+        IntrusivePtr<UIElement> target;
+        std::uint16_t propId = 0u;
+        UnifiedValue newValue{};
+    };
 
     const AxbMtsdfPathEntry* InsertMtsdfPathLocked(AxbMtsdfPathEntry entry);
+    void CollectDynamicDictionaryUpdates(
+        const AxbPackage& dictPkg,
+        UIElement* scopeRoot,
+        std::vector<PendingResourceUpdate>& outUpdates,
+        std::vector<HostWakeEntry>& outWakeList);
+    [[nodiscard]] const UnifiedValue* FindScopedOverrideLocked(
+        std::string_view key,
+        const UIElement* target) const noexcept;
     static bool IsSubscriptionAttachedLocked(const DynamicResourceSubscription& sub) noexcept;
     static bool IsWithinScopeRoot(const UIElement* target, const UIElement* scopeRoot) noexcept;
     void SnapshotWakeListenersLocked(std::vector<HostWakeEntry>& outListeners) const;
@@ -1388,6 +1430,7 @@ private:
     std::unordered_map<std::string, AxbPackage> templates_;
     std::unordered_map<std::string, UnifiedValue> resources_;
     std::unordered_map<std::string, UnifiedValue> dynamicOverrides_;
+    std::unordered_map<const UIElement*, std::unordered_map<std::string, UnifiedValue>> scopedDynamicOverrides_;
     std::unordered_map<std::string, AxbPackage> registeredDictionaries_;
     std::vector<DynamicResourceSubscription> dynamicSubscriptions_;
     std::vector<HostWakeEntry> hostWakeListeners_;

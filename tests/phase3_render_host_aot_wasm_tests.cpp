@@ -195,15 +195,23 @@ void TestAeroVertex24BAndPagedRenderTreeIncrementalUpdate() {
                "All 42 quad bits marked in dirtyQuadMask for 42-digit HUD node");
     (void)gpuStream.SubmitDirtyPages(tree);
 
-    // Ring buffer wrap-around (pageIndex >= maxPagesInRing)
+    // Owned internal ring auto-grows when pageIndex >= initial maxPagesInRing so pages never alias;
+    // fixed external mapped ring wraps modulo capacity (17 % 16 == 1).
     ZeroCopyGpuStream smallRingStream(ShaderBackend::DesktopGL33, 16);
     PagedRenderTree wrapTree;
     (void)wrapTree.AllocateHudBarBatch(18u * 42u, 0.0f, 0.0f, 80.0f, 6.0f, 1.0f, Color{0.5f, 0.5f, 0.5f, 1.0f}, 0.0f);
-    AERO_CHECK(wrapTree.PageCount() == 18u, "18 pages allocated (> 16-page ring capacity)");
+    AERO_CHECK(wrapTree.PageCount() == 18u, "18 pages allocated (> 16-page initial ring capacity)");
     const auto wrapStats = smallRingStream.SubmitDirtyPages(wrapTree);
-    AERO_CHECK(wrapStats.dirtyPagesUploaded == 18u, "Ring buffer wrap-around streamed all 18 pages");
-    AERO_CHECK(smallRingStream.MappedPageVertices(17u) == smallRingStream.MappedPageVertices(1u),
-               "Page 17 wraps to ring slot 1 (17 % 16 == 1)");
+    AERO_CHECK(wrapStats.dirtyPagesUploaded == 18u, "Owned ring auto-grew and streamed all 18 pages");
+    AERO_CHECK(smallRingStream.MappedPageVertices(17u) != nullptr &&
+                   smallRingStream.MappedPageVertices(17u) != smallRingStream.MappedPageVertices(1u),
+               "Owned ring auto-growth prevents page 17 from aliasing slot 1");
+
+    std::vector<AeroVertex> fixedExternalRing(16u * kVerticesPerCommandPage);
+    ZeroCopyGpuStream extRingStream(ShaderBackend::DesktopGL33, 16);
+    extRingStream.BindExternalMappedRing(fixedExternalRing.data(), fixedExternalRing.size() * sizeof(AeroVertex));
+    AERO_CHECK(extRingStream.MappedPageVertices(17u) == extRingStream.MappedPageVertices(1u),
+               "Fixed external ring wraps page 17 to ring slot 1 (17 % 16 == 1)");
 
     std::cout << "[PASS] TestAeroVertex24BAndPagedRenderTreeIncrementalUpdate\n";
 }

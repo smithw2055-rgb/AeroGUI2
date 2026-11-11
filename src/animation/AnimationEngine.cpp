@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <mutex>
 
 namespace aero {
 
@@ -84,6 +85,53 @@ constexpr float kPi = 3.14159265358979323846f;
     }
     return false;
 }
+
+class LiveAnimationEngineRegistry {
+public:
+    static LiveAnimationEngineRegistry& Instance() noexcept {
+        static LiveAnimationEngineRegistry reg;
+        return reg;
+    }
+
+    void Register(AnimationEngine* engine) {
+        if (!engine) {
+            return;
+        }
+        std::lock_guard<std::mutex> lock(mutex_);
+        engines_.push_back(engine);
+    }
+
+    void Unregister(const AnimationEngine* engine) noexcept {
+        if (!engine) {
+            return;
+        }
+        std::lock_guard<std::mutex> lock(mutex_);
+        for (std::size_t i = 0u; i < engines_.size(); ++i) {
+            if (engines_[i] == engine) {
+                engines_[i] = engines_.back();
+                engines_.pop_back();
+                return;
+            }
+        }
+    }
+
+    [[nodiscard]] bool Contains(const AnimationEngine* engine) const noexcept {
+        if (!engine) {
+            return false;
+        }
+        std::lock_guard<std::mutex> lock(mutex_);
+        for (const AnimationEngine* cur : engines_) {
+            if (cur == engine) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+private:
+    mutable std::mutex mutex_;
+    std::vector<AnimationEngine*> engines_;
+};
 
 } // namespace
 
@@ -179,6 +227,7 @@ float EvaluateCubicBezier1D(
 AnimationEngine::AnimationEngine(std::size_t initialReservedTracks) {
     tracks_.reserve(initialReservedTracks);
     freeTrackIds_.reserve(initialReservedTracks);
+    LiveAnimationEngineRegistry::Instance().Register(this);
     rs_rt::registerExternalValuePoolRootMarker(this, [this]() {
         MarkValuesInPools();
     });
@@ -186,6 +235,11 @@ AnimationEngine::AnimationEngine(std::size_t initialReservedTracks) {
 
 AnimationEngine::~AnimationEngine() noexcept {
     rs_rt::unregisterExternalValuePoolRootMarker(this);
+    LiveAnimationEngineRegistry::Instance().Unregister(this);
+}
+
+bool AnimationEngine::IsLiveInstance(const AnimationEngine* engine) noexcept {
+    return LiveAnimationEngineRegistry::Instance().Contains(engine);
 }
 
 void AnimationEngine::MarkValuesInPools() const noexcept {
@@ -223,6 +277,7 @@ void AnimationEngine::Clear() {
     tracks_.clear();
     freeTrackIds_.clear();
     activeCount_ = 0u;
+    pausedCount_ = 0u;
     stateMachines_.clear();
 }
 
@@ -311,6 +366,9 @@ std::uint16_t AnimationEngine::AcquireTrackSlot(
     if (existingId != InvalidTrackId) {
         AnimationTrack& existing = tracks_[existingId];
         if (preserveExistingSnapshotAndVelocity) {
+            if (existing.paused && pausedCount_ > 0u) {
+                --pausedCount_;
+            }
             outPreservedPos = existing.posF4;
             outPreservedVel = existing.velF4;
             outWasActiveSpring =
@@ -406,6 +464,10 @@ void AnimationEngine::ReleaseTrackSlot(AnimationTrack& track, bool restoreSnapsh
         }
     }
 
+    if (track.paused && pausedCount_ > 0u) {
+        --pausedCount_;
+    }
+    track.paused = false;
     track.kind = AnimationTrackKind::Inactive;
     track.target.Reset();
     track.baseSnapshot = std::monostate{};
@@ -623,12 +685,9 @@ std::uint16_t AnimationEngine::StartTimeline(
         ? scopeRoot
         : scopeRoot->FindName(timeline.targetName);
     if (!target && !timeline.targetName.empty()) {
-        UIElement* treeRoot = scopeRoot;
-        while (treeRoot->Parent() != nullptr) {
-            treeRoot = treeRoot->Parent();
-        }
-        if (treeRoot != scopeRoot) {
-            target = treeRoot->FindName(timeline.targetName);
+        UIElement* nsRoot = UIElement::FindNamescopeRoot(scopeRoot);
+        if (nsRoot && nsRoot != scopeRoot) {
+            target = nsRoot->FindName(timeline.targetName);
         }
     }
     if (!target) {
@@ -783,11 +842,8 @@ namespace {
     if (UIElement* local = scopeRoot->FindName(targetName)) {
         return local;
     }
-    UIElement* treeRoot = scopeRoot;
-    while (treeRoot->Parent() != nullptr) {
-        treeRoot = treeRoot->Parent();
-    }
-    return (treeRoot != scopeRoot) ? treeRoot->FindName(targetName) : nullptr;
+    UIElement* nsRoot = UIElement::FindNamescopeRoot(scopeRoot);
+    return (nsRoot && nsRoot != scopeRoot) ? nsRoot->FindName(targetName) : nullptr;
 }
 
 } // namespace
@@ -861,7 +917,14 @@ std::size_t AnimationEngine::TogglePlayPauseStoryboard(
         const std::uint16_t id = FindActiveTrackId(target, tl.targetPropertyId);
         if (id != InvalidTrackId && id < tracks_.size() &&
             tracks_[id].kind != AnimationTrackKind::Inactive) {
-            tracks_[id].paused = nextPaused;
+            if (tracks_[id].paused != nextPaused) {
+                tracks_[id].paused = nextPaused;
+                if (nextPaused) {
+                    ++pausedCount_;
+                } else if (pausedCount_ > 0u) {
+                    --pausedCount_;
+                }
+            }
             ++toggled;
         }
     }

@@ -8,6 +8,7 @@ namespace aero {
 namespace {
 
 thread_local UiResourceContext* gActiveThreadResourceContext = nullptr;
+thread_local ScopedUiResourceContext* gTopScopedResourceFrame = nullptr;
 std::atomic<std::size_t> gLiveResourceContextCount{0u};
 
 struct DomainResourceBindingTable {
@@ -44,6 +45,14 @@ UiResourceContext::~UiResourceContext() {
     if (gActiveThreadResourceContext == this) {
         gActiveThreadResourceContext = nullptr;
     }
+    for (ScopedUiResourceContext* frame = gTopScopedResourceFrame; frame != nullptr; frame = frame->prevFrame_) {
+        if (frame->previous_ == this) {
+            frame->previous_ = nullptr;
+        }
+        if (frame->pushed_ == this) {
+            frame->pushed_ = nullptr;
+        }
+    }
     templates_.SetOwnerContext(nullptr);
     ClearAll();
     gLiveResourceContextCount.fetch_sub(1u, std::memory_order_relaxed);
@@ -63,6 +72,10 @@ UiResourceContext& UiResourceContext::Current() noexcept {
 
 UiResourceContext* UiResourceContext::ActiveOverride() noexcept {
     return gActiveThreadResourceContext;
+}
+
+bool UiResourceContext::HasActiveThreadOverride() noexcept {
+    return gActiveThreadResourceContext != nullptr;
 }
 
 std::size_t UiResourceContext::LiveInstanceCount() noexcept {
@@ -143,17 +156,21 @@ void UiResourceContext::ClearAll() noexcept {
 }
 
 ScopedUiResourceContext::ScopedUiResourceContext(UiResourceContext& context) noexcept
-    : previous_(gActiveThreadResourceContext)
+    : prevFrame_(gTopScopedResourceFrame)
+    , previous_(gActiveThreadResourceContext)
     , pushed_(&context)
     , active_(true) {
+    gTopScopedResourceFrame = this;
     gActiveThreadResourceContext = &context;
 }
 
 ScopedUiResourceContext::ScopedUiResourceContext(UiResourceContext* context) noexcept {
     if (context != nullptr) {
+        prevFrame_ = gTopScopedResourceFrame;
         previous_ = gActiveThreadResourceContext;
         pushed_ = context;
         active_ = true;
+        gTopScopedResourceFrame = this;
         gActiveThreadResourceContext = context;
     }
 }
@@ -161,9 +178,11 @@ ScopedUiResourceContext::ScopedUiResourceContext(UiResourceContext* context) noe
 ScopedUiResourceContext::ScopedUiResourceContext(std::shared_ptr<UiResourceContext> context) noexcept {
     if (context != nullptr) {
         pinned_ = std::move(context);
+        prevFrame_ = gTopScopedResourceFrame;
         previous_ = gActiveThreadResourceContext;
         pushed_ = pinned_.get();
         active_ = true;
+        gTopScopedResourceFrame = this;
         gActiveThreadResourceContext = pushed_;
     }
 }
@@ -171,6 +190,16 @@ ScopedUiResourceContext::ScopedUiResourceContext(std::shared_ptr<UiResourceConte
 ScopedUiResourceContext::~ScopedUiResourceContext() noexcept {
     if (active_) {
         gActiveThreadResourceContext = previous_;
+        if (gTopScopedResourceFrame == this) {
+            gTopScopedResourceFrame = prevFrame_;
+        } else {
+            for (ScopedUiResourceContext* cur = gTopScopedResourceFrame; cur != nullptr; cur = cur->prevFrame_) {
+                if (cur->prevFrame_ == this) {
+                    cur->prevFrame_ = prevFrame_;
+                    break;
+                }
+            }
+        }
     }
 }
 

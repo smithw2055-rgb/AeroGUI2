@@ -1,9 +1,12 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
+#include <filesystem>
 #include <fstream>
 #include <string>
 #include <string_view>
+#include <system_error>
 #include <vector>
 
 #include "aero/animation/AnimationEngine.hpp"
@@ -119,9 +122,45 @@ void TestPropertyIdExclusiveRange() {
 // ============================================================================
 // 1. Real Rive v7 LEB128 Binary .riv Stream Decoder + RiveControl + JSON Compat
 // ============================================================================
+std::filesystem::path ResolveSamplesDir() {
+    std::error_code ec;
+    if (const char* envDir = std::getenv("AERO_SAMPLES_DIR"); envDir && envDir[0] != '\0') {
+        const std::filesystem::path p(envDir);
+        if (std::filesystem::is_directory(p, ec)) {
+            return p;
+        }
+    }
+#ifdef AERO_SAMPLES_DIR
+    {
+        const std::filesystem::path p(AERO_SAMPLES_DIR);
+        if (!p.empty() && std::filesystem::is_directory(p, ec)) {
+            return p;
+        }
+    }
+#endif
+    constexpr const char* kCandidates[] = {
+        "Samples",
+        "samples",
+        "../Samples",
+        "../samples",
+        "../../Samples",
+        "../../samples",
+        "../../../Samples",
+        "../../../samples",
+    };
+    for (const char* cand : kCandidates) {
+        const std::filesystem::path p(cand);
+        if (std::filesystem::is_directory(p, ec)) {
+            return p;
+        }
+    }
+    return std::filesystem::path("Samples");
+}
+
 void TestRealRiveV7BinaryImportersAndRiveControl() {
     const int startFails = gFailureCount;
-    const std::string riveDir = "/working_dir/c_1a21a30fb41e1c84/scratch/samples/Rive/Data/";
+    const std::filesystem::path riveDirPath = ResolveSamplesDir() / "Rive" / "Data";
+    const std::string riveDir = riveDirPath.string();
     RiveControl::ClearAssetSearchDirectories();
     RiveControl::AddAssetSearchDirectory(riveDir);
 
@@ -140,7 +179,7 @@ void TestRealRiveV7BinaryImportersAndRiveControl() {
     RiveFrontendImporter importer;
     for (const char* fileName : kSampleRiveFiles) {
         std::vector<std::uint8_t> bytes;
-        const std::string fullPath = riveDir + fileName;
+        const std::string fullPath = (riveDirPath / fileName).string();
         AERO_P15_CHECK(LoadFileBytes(fullPath, bytes), fileName);
         AERO_P15_CHECK(IsRiveBinaryStream(bytes.data(), bytes.size()), "IsRiveBinaryStream detects v7 header");
 

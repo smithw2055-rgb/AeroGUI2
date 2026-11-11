@@ -162,6 +162,7 @@ public:
     [[nodiscard]] AnimationEngine* GetAnimationEngine() const noexcept { return animationEngine_; }
     [[nodiscard]] bool HasPendingDirtyObjects() const noexcept;
     void MarkValuesInPools() const noexcept;
+    static void NotifyElementDestroyedGlobal(const UIElement* element) noexcept;
 
     // =========================================================================
     // P1-4: Named C++ & RealScript SymbolId IValueConverter / IMultiValueConverter Registry
@@ -296,7 +297,11 @@ private:
         SymbolId convertSymbolId = 0;
         SymbolId convertBackSymbolId = 0;
         ObjectRef receiverObject{};
+        std::shared_ptr<PersistentRoot> receiverRoot{};
     };
+
+    [[nodiscard]] bool HasAnyBindingTargeting(const UIElement* elem) const noexcept;
+    void ScrubDestroyedSourceElement(const UIElement* destroyed) noexcept;
 
     [[nodiscard]] UnifiedValue InvokeScriptConverterSymbol(
         SymbolId fnSym,

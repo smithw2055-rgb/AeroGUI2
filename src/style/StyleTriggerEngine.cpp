@@ -7,6 +7,7 @@
 #include <cstdlib>
 
 #include "aero/controls/Controls.hpp"
+#include "aero/core/UiResourceContext.hpp"
 #include "realscript/bytecode/Bytecode.h"
 #include "realscript/aot_cpp/AotRuntime.h"
 
@@ -338,6 +339,54 @@ void VisitStyleValues(const AxbStyleDefinition& st, Fn&& fn) noexcept {
             VisitStoryboardValues(vs.storyboard, fn);
         }
     }
+    if (st.inlineControlTemplate) {
+        const auto& ct = *st.inlineControlTemplate;
+        for (const auto& trig : ct.triggers) {
+            for (const auto& cond : trig.conditions) {
+                if (cond.expectedValue.isTraceable()) fn(cond.expectedValue);
+            }
+            for (const auto& s : trig.setters) {
+                if (s.value.isTraceable()) fn(s.value);
+            }
+            for (const auto& sb : trig.enterStoryboards) VisitStoryboardValues(sb, fn);
+            for (const auto& sb : trig.exitStoryboards) VisitStoryboardValues(sb, fn);
+            for (const auto& act : trig.enterActions) {
+                if (act.value.isTraceable()) fn(act.value);
+                if (act.commandParameter.isTraceable()) fn(act.commandParameter);
+                if (act.commandParameterBinding.fallbackValue.isTraceable()) {
+                    fn(act.commandParameterBinding.fallbackValue);
+                }
+                VisitStoryboardValues(act.inlineStoryboard, fn);
+            }
+            for (const auto& act : trig.exitActions) {
+                if (act.value.isTraceable()) fn(act.value);
+                if (act.commandParameter.isTraceable()) fn(act.commandParameter);
+                if (act.commandParameterBinding.fallbackValue.isTraceable()) {
+                    fn(act.commandParameterBinding.fallbackValue);
+                }
+                VisitStoryboardValues(act.inlineStoryboard, fn);
+            }
+        }
+        for (const auto& et : ct.eventTriggers) {
+            for (const auto& sb : et.storyboards) VisitStoryboardValues(sb, fn);
+            for (const auto& act : et.actions) {
+                if (act.value.isTraceable()) fn(act.value);
+                if (act.commandParameter.isTraceable()) fn(act.commandParameter);
+                if (act.commandParameterBinding.fallbackValue.isTraceable()) {
+                    fn(act.commandParameterBinding.fallbackValue);
+                }
+                VisitStoryboardValues(act.inlineStoryboard, fn);
+            }
+        }
+        for (const auto& vsg : ct.visualStateGroups) {
+            for (const auto& vs : vsg.states) {
+                for (const auto& s : vs.setters) {
+                    if (s.value.isTraceable()) fn(s.value);
+                }
+                VisitStoryboardValues(vs.storyboard, fn);
+            }
+        }
+    }
 }
 
 } // namespace
@@ -354,6 +403,11 @@ StyleTriggerEngine::StyleTriggerEngine(
 
 StyleTriggerEngine::~StyleTriggerEngine() noexcept {
     rs_rt::unregisterExternalValuePoolRootMarker(this);
+    for (auto& inst : instances_) {
+        if (inst.element && inst.element->BoundStyleEngine() == this) {
+            inst.element->BindStyleEngine(nullptr);
+        }
+    }
 }
 
 void StyleTriggerEngine::MarkValuesInPools() const noexcept {
@@ -362,15 +416,30 @@ void StyleTriggerEngine::MarkValuesInPools() const noexcept {
     };
     for (const auto& kv : keyedStyles_) {
         VisitStyleValues(kv.second, markFn);
+        if (kv.second.inlineControlTemplate && kv.second.inlineControlTemplate->templatePackage) {
+            kv.second.inlineControlTemplate->templatePackage->MarkValuesInPools();
+        }
     }
     for (const auto& kv : implicitTypeStyles_) {
         VisitStyleValues(kv.second, markFn);
+        if (kv.second.inlineControlTemplate && kv.second.inlineControlTemplate->templatePackage) {
+            kv.second.inlineControlTemplate->templatePackage->MarkValuesInPools();
+        }
     }
     for (const auto& kv : keyedStoryboards_) {
         VisitStoryboardValues(kv.second, markFn);
     }
     for (const auto& inst : instances_) {
+        VisitStyleValues(inst.baseFlattenedStyle, markFn);
+        if (inst.baseFlattenedStyle.inlineControlTemplate &&
+            inst.baseFlattenedStyle.inlineControlTemplate->templatePackage) {
+            inst.baseFlattenedStyle.inlineControlTemplate->templatePackage->MarkValuesInPools();
+        }
         VisitStyleValues(inst.resolvedStyle, markFn);
+        if (inst.resolvedStyle.inlineControlTemplate &&
+            inst.resolvedStyle.inlineControlTemplate->templatePackage) {
+            inst.resolvedStyle.inlineControlTemplate->templatePackage->MarkValuesInPools();
+        }
         for (const auto& slot : inst.propertySnapshots) {
             if (slot.captured && slot.hadBaseValue && slot.baseValue.isTraceable()) {
                 rs_rt::markValueInPools(slot.baseValue);
@@ -380,6 +449,11 @@ void StyleTriggerEngine::MarkValuesInPools() const noexcept {
 }
 
 void StyleTriggerEngine::Clear() {
+    for (auto& inst : instances_) {
+        if (inst.element && inst.element->BoundStyleEngine() == this) {
+            inst.element->BindStyleEngine(nullptr);
+        }
+    }
     keyedStyles_.clear();
     implicitTypeStyles_.clear();
     keyedStoryboards_.clear();
@@ -390,6 +464,9 @@ void StyleTriggerEngine::RegisterStyle(AxbStyleDefinition style) {
     VisitStyleValues(style, [](const UnifiedValue& v) noexcept {
         rs_rt::pinValueInPools(v);
     });
+    if (style.inlineControlTemplate && style.inlineControlTemplate->templatePackage) {
+        style.inlineControlTemplate->templatePackage->PinValuesInPools();
+    }
     style.targetTypeName = std::string(ShortTypeNameView(style.targetTypeName));
     if (!style.key.empty()) {
         keyedStyles_[style.key] = std::move(style);
@@ -545,12 +622,12 @@ void StyleTriggerEngine::EnsurePropertySnapshotSlot(
         return;
     }
     for (const auto& s : inst.propertySnapshots) {
-        if (s.resolvedTarget == target && s.propId == propId) {
+        if (s.resolvedTarget.Get() == target && s.propId == propId) {
             return;
         }
     }
     PropertySnapshotSlot slot{};
-    slot.resolvedTarget = target;
+    slot.resolvedTarget.Reset(target, true);
     slot.propId = propId;
     inst.propertySnapshots.push_back(std::move(slot));
 }
@@ -560,7 +637,7 @@ void StyleTriggerEngine::CaptureSnapshotIfNeeded(PropertySnapshotSlot& slot) {
         return;
     }
     slot.captured = true;
-    UIElement* target = slot.resolvedTarget;
+    UIElement* target = slot.resolvedTarget.Get();
     if (IsFastInlinePropertyId(slot.propId)) {
         const ValueSourceRank curRank = target->GetPropertySourceRank(slot.propId);
         slot.hadBaseValue = (curRank != ValueSourceRank::Default);
@@ -592,7 +669,7 @@ void StyleTriggerEngine::RestoreAllCapturedSnapshots(StyledElementInstance& inst
             continue;
         }
         if (animationEngine_) {
-            (void)animationEngine_->StopPropertyAnimation(slot.resolvedTarget, slot.propId, false);
+            (void)animationEngine_->StopPropertyAnimation(slot.resolvedTarget.Get(), slot.propId, false);
         }
         if (slot.hadBaseValue) {
             (void)slot.resolvedTarget->ForceEffectiveValue(
@@ -605,7 +682,7 @@ void StyleTriggerEngine::RestoreAllCapturedSnapshots(StyledElementInstance& inst
             (void)slot.resolvedTarget->ForceClearSparseEntry(slot.propId);
         }
         if (UIElement* tp = slot.resolvedTarget->TemplatedParent()) {
-            tp->SyncTemplateBindingsForTarget(slot.resolvedTarget, slot.propId);
+            tp->SyncTemplateBindingsForTarget(slot.resolvedTarget.Get(), slot.propId);
         }
         slot.captured = false;
         slot.touchedThisPass = false;
@@ -616,8 +693,19 @@ bool StyleTriggerEngine::AttachStyle(UIElement* element, const AxbStyleDefinitio
     if (!element) {
         return false;
     }
+    if (bindingEngine_) {
+        domains_ = &bindingEngine_->Domains();
+        if (bindingEngine_->Program()) program_ = bindingEngine_->Program();
+        if (bindingEngine_->UiInterpreter()) uiInterpreter_ = bindingEngine_->UiInterpreter();
+    }
+
+    element->BindStyleEngine(this);
+    if (animationEngine_ && !element->BoundAnimationEngine()) {
+        element->BindAnimationEngine(animationEngine_);
+    }
 
     AxbStyleDefinition style = FlattenStyleChain(rawStyle);
+    AxbStyleDefinition baseFlattened = style;
 
     // 1a. Mount ControlTemplate first if defined by this Style (and not already overridden locally)
     {
@@ -639,14 +727,17 @@ bool StyleTriggerEngine::AttachStyle(UIElement* element, const AxbStyleDefinitio
                 }
                 if (ct) {
                     const ObjectRef effDc = ResolveEffectiveDataContext(element);
+                    const bool prevInAttach = inAttachStyle_;
+                    inAttachStyle_ = true;
                     (void)element->ApplyControlTemplate(
                         *ct,
                         domains_,
                         bindingEngine_,
                         effDc,
                         uiInterpreter_,
-                        nullptr,
+                        aotContext_,
                         animationEngine_);
+                    inAttachStyle_ = prevInAttach;
                 }
             }
         }
@@ -710,6 +801,7 @@ bool StyleTriggerEngine::AttachStyle(UIElement* element, const AxbStyleDefinitio
     }
 
     targetInst->element.Reset(element, true);
+    targetInst->baseFlattenedStyle = std::move(baseFlattened);
     targetInst->resolvedStyle = std::move(style);
     targetInst->activeTriggerMask = 0ULL;
     targetInst->initialized = false;
@@ -769,6 +861,21 @@ std::size_t StyleTriggerEngine::BindSubtreeStyles(
     if (!rootElement) {
         return 0u;
     }
+    if (bindingEngine_) {
+        domains_ = &bindingEngine_->Domains();
+        if (bindingEngine_->Program()) program_ = bindingEngine_->Program();
+        if (bindingEngine_->UiInterpreter()) uiInterpreter_ = bindingEngine_->UiInterpreter();
+    }
+    std::shared_ptr<UiResourceContext> domainCtx =
+        (domains_ && !UiResourceContext::HasActiveThreadOverride())
+            ? UiResourceContext::FindForDomains(domains_)
+            : nullptr;
+    ScopedUiResourceContext ctxGuard(std::move(domainCtx));
+
+    rootElement->BindStyleEngine(this);
+    if (animationEngine_ && !rootElement->BoundAnimationEngine()) {
+        rootElement->BindAnimationEngine(animationEngine_);
+    }
     if (auto* ic = rootElement->DynamicCast<ItemsControl>()) {
         ic->AssignStyleEnginePointer(this);
     } else if (auto* tc = rootElement->DynamicCast<TabControl>()) {
@@ -821,6 +928,17 @@ std::size_t StyleTriggerEngine::UnbindSubtreeStyles(const UIElement* subtreeRoot
     if (!subtreeRoot) {
         return 0u;
     }
+    auto clearBoundRec = [this](auto& self, UIElement* node) noexcept -> void {
+        if (!node) return;
+        if (node->BoundStyleEngine() == this) {
+            node->BindStyleEngine(nullptr);
+        }
+        for (UIElement* c = node->FirstChild(); c != nullptr; c = c->NextSibling()) {
+            self(self, c);
+        }
+    };
+    clearBoundRec(clearBoundRec, const_cast<UIElement*>(subtreeRoot));
+
     auto isInSubtree = [&](const UIElement* candidate) noexcept -> bool {
         for (const UIElement* cur = candidate; cur != nullptr; cur = cur->Parent()) {
             if (cur == subtreeRoot) {
@@ -835,17 +953,21 @@ std::size_t StyleTriggerEngine::UnbindSubtreeStyles(const UIElement* subtreeRoot
     for (std::size_t i = 0u; i < instances_.size(); ++i) {
         if (instances_[i].element && isInSubtree(instances_[i].element.Get())) {
             RestoreAllCapturedSnapshots(instances_[i]);
+            if (instances_[i].element->BoundStyleEngine() == this) {
+                instances_[i].element->BindStyleEngine(nullptr);
+            }
             ++removed;
             continue;
         }
         for (auto& rt : instances_[i].eventStates) {
-            if (rt.cachedSource && isInSubtree(rt.cachedSource)) {
-                rt.cachedSource = nullptr;
+            if (rt.cachedSource && isInSubtree(rt.cachedSource.Get())) {
+                rt.cachedSource.Reset();
+                rt.initialized = false;
             }
         }
         for (auto& slot : instances_[i].propertySnapshots) {
-            if (slot.resolvedTarget && isInSubtree(slot.resolvedTarget)) {
-                slot.resolvedTarget = nullptr;
+            if (slot.resolvedTarget && isInSubtree(slot.resolvedTarget.Get())) {
+                slot.resolvedTarget.Reset();
                 slot.captured = false;
             }
         }
@@ -856,6 +978,139 @@ std::size_t StyleTriggerEngine::UnbindSubtreeStyles(const UIElement* subtreeRoot
     }
     instances_.resize(writeIdx);
     return removed;
+}
+
+void StyleTriggerEngine::OnElementControlTemplateChanging(
+    UIElement* host,
+    UIElement* oldTemplateRoot) noexcept {
+    if (!host || !oldTemplateRoot) {
+        return;
+    }
+    auto isInOldTpl = [oldTemplateRoot](const UIElement* candidate) noexcept -> bool {
+        for (const UIElement* cur = candidate; cur != nullptr; cur = cur->Parent()) {
+            if (cur == oldTemplateRoot) {
+                return true;
+            }
+        }
+        return false;
+    };
+    for (auto& inst : instances_) {
+        for (auto& slot : inst.propertySnapshots) {
+            if (slot.resolvedTarget && isInOldTpl(slot.resolvedTarget.Get())) {
+                if (slot.captured) {
+                    if (animationEngine_) {
+                        (void)animationEngine_->StopPropertyAnimation(
+                            slot.resolvedTarget.Get(), slot.propId, false);
+                    }
+                    if (slot.hadBaseValue) {
+                        (void)slot.resolvedTarget->ForceEffectiveValue(
+                            slot.propId, slot.baseValue, slot.baseRank);
+                    } else if (IsFastInlinePropertyId(slot.propId)) {
+                        (void)slot.resolvedTarget->ClearValue(slot.propId, ValueSourceRank::Animation);
+                    } else {
+                        (void)slot.resolvedTarget->ForceClearSparseEntry(slot.propId);
+                    }
+                }
+                slot.resolvedTarget.Reset();
+                slot.captured = false;
+                slot.touchedThisPass = false;
+            }
+        }
+        for (auto& rt : inst.eventStates) {
+            if (rt.cachedSource && isInOldTpl(rt.cachedSource.Get())) {
+                rt.cachedSource.Reset();
+                rt.initialized = false;
+            }
+        }
+    }
+}
+
+void StyleTriggerEngine::OnElementControlTemplateCleared(UIElement* host) {
+    if (inAttachStyle_ || !host) {
+        return;
+    }
+    for (std::size_t i = 0u; i < instances_.size(); ++i) {
+        if (instances_[i].element.Get() != host) {
+            continue;
+        }
+        RestoreAllCapturedSnapshots(instances_[i]);
+        instances_[i].resolvedStyle = instances_[i].baseFlattenedStyle;
+        instances_[i].activeTriggerMask = 0ULL;
+        instances_[i].initialized = false;
+        instances_[i].groupStates = {};
+        instances_[i].eventStates = {};
+        instances_[i].propertySnapshots.clear();
+
+        auto reserveTarget = [&](const std::string& targetName, std::uint16_t propId) {
+            UIElement* resolved = targetName.empty() ? host : host->FindName(targetName);
+            if (resolved) {
+                EnsurePropertySnapshotSlot(instances_[i], resolved, propId);
+            }
+        };
+        for (const auto& trig : instances_[i].resolvedStyle.triggers) {
+            for (const auto& st : trig.setters) reserveTarget(st.targetName, st.propId);
+            for (const auto& esb : trig.enterStoryboards) {
+                for (const auto& tl : esb.timelines) reserveTarget(tl.targetName, tl.targetPropertyId);
+            }
+            for (const auto& xsb : trig.exitStoryboards) {
+                for (const auto& tl : xsb.timelines) reserveTarget(tl.targetName, tl.targetPropertyId);
+            }
+        }
+        for (const auto& vsg : instances_[i].resolvedStyle.visualStateGroups) {
+            for (const auto& vs : vsg.states) {
+                for (const auto& st : vs.setters) reserveTarget(st.targetName, st.propId);
+                for (const auto& tl : vs.storyboard.timelines) reserveTarget(tl.targetName, tl.targetPropertyId);
+            }
+        }
+        (void)EvaluateSubtree(host, true);
+        break;
+    }
+}
+
+void StyleTriggerEngine::OnElementControlTemplateApplied(UIElement* host) {
+    if (inAttachStyle_ || !host) {
+        return;
+    }
+    if (bindingEngine_) {
+        domains_ = &bindingEngine_->Domains();
+        if (bindingEngine_->Program()) program_ = bindingEngine_->Program();
+        if (bindingEngine_->UiInterpreter()) uiInterpreter_ = bindingEngine_->UiInterpreter();
+    }
+    std::shared_ptr<UiResourceContext> domainCtx =
+        (domains_ && !UiResourceContext::HasActiveThreadOverride())
+            ? UiResourceContext::FindForDomains(domains_)
+            : nullptr;
+    ScopedUiResourceContext ctxGuard(std::move(domainCtx));
+
+    const bool prevInAttach = inAttachStyle_;
+    inAttachStyle_ = true;
+
+    bool foundExisting = false;
+    for (std::size_t i = 0u; i < instances_.size(); ++i) {
+        if (instances_[i].element.Get() == host) {
+            AxbStyleDefinition savedBase = instances_[i].baseFlattenedStyle;
+            (void)AttachStyle(host, savedBase);
+            foundExisting = true;
+            break;
+        }
+    }
+    if (!foundExisting) {
+        if (const AxbControlTemplate* ct = host->MountedControlTemplate()) {
+            if (!ct->triggers.empty() || !ct->eventTriggers.empty() || !ct->visualStateGroups.empty()) {
+                AxbStyleDefinition synthStyle{};
+                if (const char* tn = host->GetTypeClass()->typeName) {
+                    synthStyle.targetTypeName = std::string(ShortTypeNameView(tn));
+                }
+                (void)AttachStyle(host, synthStyle);
+            }
+        }
+    }
+    if (UIElement* tplRoot = host->TemplateRoot()) {
+        (void)BindSubtreeStyles(tplRoot, true);
+    }
+
+    inAttachStyle_ = prevInAttach;
+    (void)EvaluateSubtree(host, true);
 }
 
 bool StyleTriggerEngine::HasFocusedDescendant(const UIElement* elem) noexcept {
@@ -936,8 +1191,12 @@ bool StyleTriggerEngine::EvaluateSingleCondition(
         }
 
         case TriggerConditionSource::ElementNameProperty: {
-            UIElement* root = FindTreeRoot(elem);
-            UIElement* srcElem = root ? root->FindName(cond.sourceName) : nullptr;
+            UIElement* srcElem = elem->FindName(cond.sourceName);
+            if (!srcElem) {
+                if (UIElement* scopeRoot = UIElement::FindNamescopeRoot(elem)) {
+                    srcElem = scopeRoot->FindName(cond.sourceName);
+                }
+            }
             if (!srcElem) {
                 return false;
             }
@@ -1118,8 +1377,8 @@ void StyleTriggerEngine::ExecuteSingleInteractionAction(
             } else {
                 target = elem->FindName(action.targetName);
                 if (!target) {
-                    if (UIElement* root = FindTreeRoot(elem)) {
-                        target = root->FindName(action.targetName);
+                    if (UIElement* scopeRoot = UIElement::FindNamescopeRoot(elem)) {
+                        target = scopeRoot->FindName(action.targetName);
                     }
                 }
             }
@@ -1224,8 +1483,13 @@ void StyleTriggerEngine::ExecuteSingleInteractionAction(
                                 break;
                             }
                         }
-                    } else if (UIElement* root = FindTreeRoot(elem)) {
-                        srcEl = root->FindName(cpb.elementName);
+                    } else {
+                        srcEl = elem->FindName(cpb.elementName);
+                        if (!srcEl) {
+                            if (UIElement* scopeRoot = UIElement::FindNamescopeRoot(elem)) {
+                                srcEl = scopeRoot->FindName(cpb.elementName);
+                            }
+                        }
                     }
                     const std::uint16_t spId = ResolveTriggerConditionPropertyId(cpb.rawPath);
                     if (srcEl && spId != 0u) {
@@ -1469,17 +1733,18 @@ bool StyleTriggerEngine::EvaluateEventTriggers(StyledElementInstance& inst) {
 
         if (!rt.cachedSource) {
             if (et.sourceName.empty()) {
-                rt.cachedSource = elem;
+                rt.cachedSource.Reset(elem, true);
             } else {
-                rt.cachedSource = elem->FindName(et.sourceName);
-                if (!rt.cachedSource) {
-                    if (UIElement* root = FindTreeRoot(elem)) {
-                        rt.cachedSource = root->FindName(et.sourceName);
+                UIElement* found = elem->FindName(et.sourceName);
+                if (!found) {
+                    if (UIElement* scopeRoot = UIElement::FindNamescopeRoot(elem)) {
+                        found = scopeRoot->FindName(et.sourceName);
                     }
                 }
+                rt.cachedSource.Reset(found, true);
             }
         }
-        UIElement* src = rt.cachedSource;
+        UIElement* src = rt.cachedSource.Get();
         if (!src) {
             continue;
         }
@@ -1596,7 +1861,7 @@ void StyleTriggerEngine::ReapplyActiveOverrides(
 
     auto findSnapshotSlot = [&](UIElement* target, std::uint16_t propId) -> PropertySnapshotSlot* {
         for (auto& slot : inst.propertySnapshots) {
-            if (slot.resolvedTarget == target && slot.propId == propId) {
+            if (slot.resolvedTarget.Get() == target && slot.propId == propId) {
                 return &slot;
             }
         }
@@ -1718,7 +1983,7 @@ void StyleTriggerEngine::ReapplyActiveOverrides(
             continue;
         }
         if (animationEngine_) {
-            (void)animationEngine_->StopPropertyAnimation(slot.resolvedTarget, slot.propId, false);
+            (void)animationEngine_->StopPropertyAnimation(slot.resolvedTarget.Get(), slot.propId, false);
         }
         if (slot.hadBaseValue) {
             (void)slot.resolvedTarget->ForceEffectiveValue(
@@ -1731,7 +1996,7 @@ void StyleTriggerEngine::ReapplyActiveOverrides(
             (void)slot.resolvedTarget->ForceClearSparseEntry(slot.propId);
         }
         if (UIElement* tp = slot.resolvedTarget->TemplatedParent()) {
-            tp->SyncTemplateBindingsForTarget(slot.resolvedTarget, slot.propId);
+            tp->SyncTemplateBindingsForTarget(slot.resolvedTarget.Get(), slot.propId);
         }
         slot.captured = false;
     }
@@ -1777,6 +2042,17 @@ std::size_t StyleTriggerEngine::EvaluateAndApply() {
 }
 
 std::size_t StyleTriggerEngine::EvaluateSubtree(UIElement* subtreeRoot, bool resetEventStates) {
+    if (bindingEngine_) {
+        domains_ = &bindingEngine_->Domains();
+        if (bindingEngine_->Program()) program_ = bindingEngine_->Program();
+        if (bindingEngine_->UiInterpreter()) uiInterpreter_ = bindingEngine_->UiInterpreter();
+    }
+    std::shared_ptr<UiResourceContext> domainCtx =
+        (domains_ && !UiResourceContext::HasActiveThreadOverride())
+            ? UiResourceContext::FindForDomains(domains_)
+            : nullptr;
+    ScopedUiResourceContext ctxGuard(std::move(domainCtx));
+
     std::size_t changedElements = 0u;
 
     auto isInSubtree = [&](const UIElement* candidate) noexcept -> bool {

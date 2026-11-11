@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <thread>
 
 #if defined(__EMSCRIPTEN__)
 #include <emscripten/emscripten.h>
@@ -16,8 +17,10 @@
 #endif
 #include <windows.h>
 #include <windowsx.h>
-#elif defined(__linux__)
+#elif defined(__linux__) || defined(__APPLE__)
+#if defined(__linux__)
 #include <dlfcn.h>
+#endif
 #include <errno.h>
 #include <fcntl.h>
 #include <poll.h>
@@ -30,6 +33,9 @@ namespace {
 
 [[maybe_unused]] void EncodeCodePointToUtf8(std::uint32_t cp, char outBuf[4], std::size_t& outLen) noexcept {
     outLen = 0u;
+    if (cp >= 0xD800u && cp <= 0xDFFFu) {
+        return;
+    }
     if (cp <= 0x7Fu) {
         outBuf[0] = static_cast<char>(cp);
         outLen = 1u;
@@ -50,6 +56,58 @@ namespace {
         outLen = 4u;
     }
 }
+
+#if defined(_WIN32)
+[[nodiscard]] std::string ConvertUtf16SliceToUtf8(
+    const wchar_t* wstr,
+    std::size_t wlen,
+    std::size_t* outCodePointCount = nullptr) {
+    std::string out;
+    if (outCodePointCount) {
+        *outCodePointCount = 0u;
+    }
+    if (!wstr || wlen == 0u) {
+        return out;
+    }
+    out.reserve(wlen * 3u);
+    std::size_t cpTotal = 0u;
+    for (std::size_t i = 0u; i < wlen; ++i) {
+        const auto u16 = static_cast<std::uint16_t>(wstr[i]);
+        if (u16 == 0u) {
+            break;
+        }
+        std::uint32_t cp = u16;
+        if (u16 >= 0xD800u && u16 <= 0xDBFFu) {
+            if (i + 1u < wlen) {
+                const auto low = static_cast<std::uint16_t>(wstr[i + 1u]);
+                if (low >= 0xDC00u && low <= 0xDFFFu) {
+                    cp = 0x10000u +
+                        ((static_cast<std::uint32_t>(u16) - 0xD800u) << 10u) +
+                        (static_cast<std::uint32_t>(low) - 0xDC00u);
+                    ++i;
+                } else {
+                    continue; // Reject lone high surrogate
+                }
+            } else {
+                continue; // Reject trailing lone high surrogate
+            }
+        } else if (u16 >= 0xDC00u && u16 <= 0xDFFFu) {
+            continue; // Reject lone low surrogate
+        }
+        char utf8[4]{};
+        std::size_t len = 0u;
+        EncodeCodePointToUtf8(cp, utf8, len);
+        if (len > 0u) {
+            out.append(utf8, len);
+            ++cpTotal;
+        }
+    }
+    if (outCodePointCount) {
+        *outCodePointCount = cpTotal;
+    }
+    return out;
+}
+#endif
 
 template <typename FnPtr>
 [[maybe_unused]] void BindDynSymbol(FnPtr& outTyped, void* rawSym) noexcept {
@@ -429,6 +487,26 @@ struct FirstCallbackParam<Ret (*)(Arg0, Rest...)> {
 
 using EmRafTimestamp = typename FirstCallbackParam<em_raf_callback_func>::Type;
 
+[[nodiscard]] Point MapEmCanvasCssPoint(
+    const char* selector,
+    std::uint32_t canvasWidth,
+    std::uint32_t canvasHeight,
+    float cssX,
+    float cssY) noexcept {
+    EmRafTimestamp cssW{};
+    EmRafTimestamp cssH{};
+    if (selector &&
+        emscripten_get_element_css_size(selector, &cssW, &cssH) == EMSCRIPTEN_RESULT_SUCCESS &&
+        static_cast<float>(cssW) > 0.5f &&
+        static_cast<float>(cssH) > 0.5f) {
+        const float scaleX = static_cast<float>(canvasWidth) / static_cast<float>(cssW);
+        const float scaleY = static_cast<float>(canvasHeight) / static_cast<float>(cssH);
+        return Point{cssX * scaleX, cssY * scaleY};
+    }
+    const float dpr = std::max(0.25f, static_cast<float>(emscripten_get_device_pixel_ratio()));
+    return Point{cssX * dpr, cssY * dpr};
+}
+
 [[nodiscard]] std::uint8_t TranslateEmModifiers(
     EM_BOOL shiftKey,
     EM_BOOL ctrlKey,
@@ -594,6 +672,7 @@ bool NativeWindowHost::Initialize(const NativeWindowConfig& config) {
     closeRequested_.store(false, std::memory_order_release);
     wakeSignaled_.store(false, std::memory_order_release);
     needsInitialRender_ = true;
+    hasLastFrameTimestamp_ = false;
 
     if (!activeGpuStream_) {
 #if defined(__EMSCRIPTEN__)
@@ -618,7 +697,7 @@ bool NativeWindowHost::Initialize(const NativeWindowConfig& config) {
         inputRouter_->SetImeHost(webHost_ ? static_cast<ITextInputMethodHost*>(&webHost_->ImeAdapter()) : &desktopIme_);
     }
 
-#if defined(__linux__) && !defined(__EMSCRIPTEN__)
+#if (defined(__linux__) || defined(__APPLE__)) && !defined(__EMSCRIPTEN__)
     if (pipe(wakePipeFds_) == 0) {
         for (int fd : wakePipeFds_) {
             const int flags = fcntl(fd, F_GETFL, 0);
@@ -698,6 +777,9 @@ void NativeWindowHost::ShutdownPlatformWindow() noexcept {
         }
         x11_.reset();
     }
+#endif
+
+#if (defined(__linux__) || defined(__APPLE__)) && !defined(__EMSCRIPTEN__)
     for (int& fd : wakePipeFds_) {
         if (fd >= 0) {
             (void)close(fd);
@@ -706,7 +788,9 @@ void NativeWindowHost::ShutdownPlatformWindow() noexcept {
     }
 #elif defined(_WIN32)
     if (win32Hglrc_) {
-        HMODULE glMod = GetModuleHandleA("opengl32.dll");
+        HMODULE glMod = win32OpenglModule_
+            ? static_cast<HMODULE>(win32OpenglModule_)
+            : GetModuleHandleA("opengl32.dll");
         if (glMod) {
             auto wglMakeCur = reinterpret_cast<BOOL (WINAPI*)(HDC, HGLRC)>(
                 GetProcAddress(glMod, "wglMakeCurrent"));
@@ -717,26 +801,58 @@ void NativeWindowHost::ShutdownPlatformWindow() noexcept {
         }
         win32Hglrc_ = nullptr;
     }
+    if (win32OpenglModule_) {
+        FreeLibrary(static_cast<HMODULE>(win32OpenglModule_));
+        win32OpenglModule_ = nullptr;
+    }
+    if (win32ImmModule_) {
+        FreeLibrary(static_cast<HMODULE>(win32ImmModule_));
+        win32ImmModule_ = nullptr;
+    }
+    win32ImmGetContext_ = nullptr;
+    win32ImmSetCompositionWindow_ = nullptr;
+    win32ImmGetCompositionStringW_ = nullptr;
+    win32ImmReleaseContext_ = nullptr;
+    win32ImmProbed_ = false;
+    pendingHighSurrogate_ = 0u;
+    win32PressedMouseMask_ = 0u;
     if (win32Hdc_ && win32Hwnd_) {
         ReleaseDC(static_cast<HWND>(win32Hwnd_), static_cast<HDC>(win32Hdc_));
         win32Hdc_ = nullptr;
     }
     if (win32Hwnd_) {
-        DestroyWindow(static_cast<HWND>(win32Hwnd_));
+        HWND hwnd = static_cast<HWND>(win32Hwnd_);
         win32Hwnd_ = nullptr;
+        SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
+        DestroyWindow(hwnd);
     }
     if (win32WakeEvent_) {
         CloseHandle(static_cast<HANDLE>(win32WakeEvent_));
         win32WakeEvent_ = nullptr;
     }
 #elif defined(__EMSCRIPTEN__)
+    if (!emCanvasSelector_.empty()) {
+        const char* sel = emCanvasSelector_.c_str();
+        (void)emscripten_set_mousemove_callback(sel, nullptr, EM_FALSE, nullptr);
+        (void)emscripten_set_mousedown_callback(sel, nullptr, EM_FALSE, nullptr);
+        (void)emscripten_set_mouseup_callback(sel, nullptr, EM_FALSE, nullptr);
+        (void)emscripten_set_wheel_callback(sel, nullptr, EM_FALSE, nullptr);
+        (void)emscripten_set_touchstart_callback(sel, nullptr, EM_FALSE, nullptr);
+        (void)emscripten_set_touchmove_callback(sel, nullptr, EM_FALSE, nullptr);
+        (void)emscripten_set_touchend_callback(sel, nullptr, EM_FALSE, nullptr);
+        emCanvasSelector_.clear();
+    }
+    (void)emscripten_set_keydown_callback(EMSCRIPTEN_EVENT_TARGET_WINDOW, nullptr, EM_FALSE, nullptr);
+    (void)emscripten_set_keyup_callback(EMSCRIPTEN_EVENT_TARGET_WINDOW, nullptr, EM_FALSE, nullptr);
     if (webglContextHandle_ > 0) {
         (void)emscripten_webgl_destroy_context(webglContextHandle_);
         webglContextHandle_ = 0;
     }
     rafScheduled_ = false;
+    lastRafTimeMs_ = -1.0f;
 #endif
 
+    hasLastFrameTimestamp_ = false;
     mode_ = NativeWindowMode::Uninitialized;
 }
 
@@ -788,7 +904,31 @@ bool NativeWindowHost::InitializePlatformWindowAndBackend(const NativeWindowConf
     attrs.majorVersion = 2;
     attrs.minorVersion = 0;
 
-    const char* selector = config.canvasSelector.empty() ? "#canvas" : config.canvasSelector.c_str();
+    emCanvasSelector_ = config.canvasSelector.empty() ? "#canvas" : config.canvasSelector;
+    const char* selector = emCanvasSelector_.c_str();
+    {
+        detail::wasm_abi::EmRafTimestamp cssW{};
+        detail::wasm_abi::EmRafTimestamp cssH{};
+        const float dpr = std::max(1.0f, static_cast<float>(emscripten_get_device_pixel_ratio()));
+        if (emscripten_get_element_css_size(selector, &cssW, &cssH) == EMSCRIPTEN_RESULT_SUCCESS &&
+            static_cast<float>(cssW) > 1.0f &&
+            static_cast<float>(cssH) > 1.0f) {
+            const auto dprW = static_cast<std::uint32_t>(std::lround(static_cast<float>(cssW) * dpr));
+            const auto dprH = static_cast<std::uint32_t>(std::lround(static_cast<float>(cssH) * dpr));
+            if (dprW > 0u && dprH > 0u) {
+                width_ = dprW;
+                height_ = dprH;
+                gpuCfg.initialViewportWidth = width_;
+                gpuCfg.initialViewportHeight = height_;
+                if (desktopHost_) {
+                    desktopHost_->SetViewportSize(Size{static_cast<float>(width_), static_cast<float>(height_)});
+                }
+                if (webHost_) {
+                    webHost_->SetViewportSize(Size{static_cast<float>(width_), static_cast<float>(height_)});
+                }
+            }
+        }
+    }
     (void)emscripten_set_canvas_element_size(selector, static_cast<int>(width_), static_cast<int>(height_));
     webglContextHandle_ = emscripten_webgl_create_context(selector, &attrs);
     if (webglContextHandle_ > 0 &&
@@ -801,9 +941,15 @@ bool NativeWindowHost::InitializePlatformWindowAndBackend(const NativeWindowConf
             (void)emscripten_set_mousemove_callback(selector, this, EM_FALSE,
                 [](int, const EmscriptenMouseEvent* e, void* ud) -> EM_BOOL {
                     auto* self = static_cast<NativeWindowHost*>(ud);
-                    self->OnPlatformMouseMove(
+                    const Point pt = detail::wasm_abi::MapEmCanvasCssPoint(
+                        self->emCanvasSelector_.c_str(),
+                        self->Width(),
+                        self->Height(),
                         static_cast<float>(e->targetX),
-                        static_cast<float>(e->targetY),
+                        static_cast<float>(e->targetY));
+                    self->OnPlatformMouseMove(
+                        pt.x,
+                        pt.y,
                         detail::wasm_abi::TranslateEmModifiers(e->shiftKey, e->ctrlKey, e->altKey));
                     return EM_TRUE;
                 });
@@ -812,9 +958,15 @@ bool NativeWindowHost::InitializePlatformWindowAndBackend(const NativeWindowConf
                     auto* self = static_cast<NativeWindowHost*>(ud);
                     const PointerButton btn = (e->button == 2) ? PointerButton::Right
                         : ((e->button == 1) ? PointerButton::Middle : PointerButton::Left);
-                    self->OnPlatformMouseButton(
+                    const Point pt = detail::wasm_abi::MapEmCanvasCssPoint(
+                        self->emCanvasSelector_.c_str(),
+                        self->Width(),
+                        self->Height(),
                         static_cast<float>(e->targetX),
-                        static_cast<float>(e->targetY),
+                        static_cast<float>(e->targetY));
+                    self->OnPlatformMouseButton(
+                        pt.x,
+                        pt.y,
                         btn,
                         true,
                         detail::wasm_abi::TranslateEmModifiers(e->shiftKey, e->ctrlKey, e->altKey));
@@ -825,9 +977,15 @@ bool NativeWindowHost::InitializePlatformWindowAndBackend(const NativeWindowConf
                     auto* self = static_cast<NativeWindowHost*>(ud);
                     const PointerButton btn = (e->button == 2) ? PointerButton::Right
                         : ((e->button == 1) ? PointerButton::Middle : PointerButton::Left);
-                    self->OnPlatformMouseButton(
+                    const Point pt = detail::wasm_abi::MapEmCanvasCssPoint(
+                        self->emCanvasSelector_.c_str(),
+                        self->Width(),
+                        self->Height(),
                         static_cast<float>(e->targetX),
-                        static_cast<float>(e->targetY),
+                        static_cast<float>(e->targetY));
+                    self->OnPlatformMouseButton(
+                        pt.x,
+                        pt.y,
                         btn,
                         false,
                         detail::wasm_abi::TranslateEmModifiers(e->shiftKey, e->ctrlKey, e->altKey));
@@ -838,13 +996,71 @@ bool NativeWindowHost::InitializePlatformWindowAndBackend(const NativeWindowConf
                     auto* self = static_cast<NativeWindowHost*>(ud);
                     const float scale = (e->deltaMode == DOM_DELTA_LINE) ? 16.0f
                         : ((e->deltaMode == DOM_DELTA_PAGE) ? static_cast<float>(self->Height()) : 1.0f);
-                    self->OnPlatformMouseWheel(
+                    const Point pt = detail::wasm_abi::MapEmCanvasCssPoint(
+                        self->emCanvasSelector_.c_str(),
+                        self->Width(),
+                        self->Height(),
                         static_cast<float>(e->mouse.targetX),
-                        static_cast<float>(e->mouse.targetY),
+                        static_cast<float>(e->mouse.targetY));
+                    self->OnPlatformMouseWheel(
+                        pt.x,
+                        pt.y,
                         static_cast<float>(e->deltaX) * scale,
                         static_cast<float>(e->deltaY) * scale,
                         detail::wasm_abi::TranslateEmModifiers(
                             e->mouse.shiftKey, e->mouse.ctrlKey, e->mouse.altKey));
+                    return EM_TRUE;
+                });
+            (void)emscripten_set_touchstart_callback(selector, this, EM_FALSE,
+                [](int, const EmscriptenTouchEvent* e, void* ud) -> EM_BOOL {
+                    auto* self = static_cast<NativeWindowHost*>(ud);
+                    if (e->numTouches <= 0) return EM_FALSE;
+                    const Point pt = detail::wasm_abi::MapEmCanvasCssPoint(
+                        self->emCanvasSelector_.c_str(),
+                        self->Width(),
+                        self->Height(),
+                        static_cast<float>(e->touches[0].targetX),
+                        static_cast<float>(e->touches[0].targetY));
+                    self->OnPlatformMouseButton(
+                        pt.x,
+                        pt.y,
+                        PointerButton::Left,
+                        true,
+                        detail::wasm_abi::TranslateEmModifiers(e->shiftKey, e->ctrlKey, e->altKey));
+                    return EM_TRUE;
+                });
+            (void)emscripten_set_touchmove_callback(selector, this, EM_FALSE,
+                [](int, const EmscriptenTouchEvent* e, void* ud) -> EM_BOOL {
+                    auto* self = static_cast<NativeWindowHost*>(ud);
+                    if (e->numTouches <= 0) return EM_FALSE;
+                    const Point pt = detail::wasm_abi::MapEmCanvasCssPoint(
+                        self->emCanvasSelector_.c_str(),
+                        self->Width(),
+                        self->Height(),
+                        static_cast<float>(e->touches[0].targetX),
+                        static_cast<float>(e->touches[0].targetY));
+                    self->OnPlatformMouseMove(
+                        pt.x,
+                        pt.y,
+                        detail::wasm_abi::TranslateEmModifiers(e->shiftKey, e->ctrlKey, e->altKey));
+                    return EM_TRUE;
+                });
+            (void)emscripten_set_touchend_callback(selector, this, EM_FALSE,
+                [](int, const EmscriptenTouchEvent* e, void* ud) -> EM_BOOL {
+                    auto* self = static_cast<NativeWindowHost*>(ud);
+                    if (e->numTouches <= 0) return EM_FALSE;
+                    const Point pt = detail::wasm_abi::MapEmCanvasCssPoint(
+                        self->emCanvasSelector_.c_str(),
+                        self->Width(),
+                        self->Height(),
+                        static_cast<float>(e->touches[0].targetX),
+                        static_cast<float>(e->touches[0].targetY));
+                    self->OnPlatformMouseButton(
+                        pt.x,
+                        pt.y,
+                        PointerButton::Left,
+                        false,
+                        detail::wasm_abi::TranslateEmModifiers(e->shiftKey, e->ctrlKey, e->altKey));
                     return EM_TRUE;
                 });
             (void)emscripten_set_keydown_callback(EMSCRIPTEN_EVENT_TARGET_WINDOW, this, EM_FALSE,
@@ -886,6 +1102,11 @@ bool NativeWindowHost::InitializePlatformWindowAndBackend(const NativeWindowConf
             return true;
         }
     }
+    if (webglContextHandle_ > 0) {
+        (void)emscripten_webgl_destroy_context(webglContextHandle_);
+        webglContextHandle_ = 0;
+    }
+    emCanvasSelector_.clear();
 
     if (!config.allowHeadlessFallback) {
         diagnostics_ = "Failed to initialize Emscripten WebGL2 context.";
@@ -960,33 +1181,69 @@ bool NativeWindowHost::InitializePlatformWindowAndBackend(const NativeWindowConf
                     queryWinMods());
                 return 0;
             case WM_LBUTTONDOWN:
-            case WM_LBUTTONUP:
-                if (msg == WM_LBUTTONDOWN) SetCapture(hwnd); else ReleaseCapture();
+            case WM_LBUTTONUP: {
+                const bool isDown = (msg == WM_LBUTTONDOWN);
+                if (isDown) {
+                    if (self->win32PressedMouseMask_ == 0u) SetCapture(hwnd);
+                    self->win32PressedMouseMask_ |= 0x01u;
+                } else {
+                    self->win32PressedMouseMask_ = static_cast<std::uint8_t>(self->win32PressedMouseMask_ & ~0x01u);
+                    if (self->win32PressedMouseMask_ == 0u && GetCapture() == hwnd) ReleaseCapture();
+                }
                 self->OnPlatformMouseButton(
                     static_cast<float>(GET_X_LPARAM(lParam)),
                     static_cast<float>(GET_Y_LPARAM(lParam)),
                     PointerButton::Left,
-                    msg == WM_LBUTTONDOWN,
+                    isDown,
                     queryWinMods());
                 return 0;
+            }
             case WM_RBUTTONDOWN:
-            case WM_RBUTTONUP:
+            case WM_RBUTTONUP: {
+                const bool isDown = (msg == WM_RBUTTONDOWN);
+                if (isDown) {
+                    if (self->win32PressedMouseMask_ == 0u) SetCapture(hwnd);
+                    self->win32PressedMouseMask_ |= 0x02u;
+                } else {
+                    self->win32PressedMouseMask_ = static_cast<std::uint8_t>(self->win32PressedMouseMask_ & ~0x02u);
+                    if (self->win32PressedMouseMask_ == 0u && GetCapture() == hwnd) ReleaseCapture();
+                }
                 self->OnPlatformMouseButton(
                     static_cast<float>(GET_X_LPARAM(lParam)),
                     static_cast<float>(GET_Y_LPARAM(lParam)),
                     PointerButton::Right,
-                    msg == WM_RBUTTONDOWN,
+                    isDown,
                     queryWinMods());
                 return 0;
+            }
             case WM_MBUTTONDOWN:
-            case WM_MBUTTONUP:
+            case WM_MBUTTONUP: {
+                const bool isDown = (msg == WM_MBUTTONDOWN);
+                if (isDown) {
+                    if (self->win32PressedMouseMask_ == 0u) SetCapture(hwnd);
+                    self->win32PressedMouseMask_ |= 0x04u;
+                } else {
+                    self->win32PressedMouseMask_ = static_cast<std::uint8_t>(self->win32PressedMouseMask_ & ~0x04u);
+                    if (self->win32PressedMouseMask_ == 0u && GetCapture() == hwnd) ReleaseCapture();
+                }
                 self->OnPlatformMouseButton(
                     static_cast<float>(GET_X_LPARAM(lParam)),
                     static_cast<float>(GET_Y_LPARAM(lParam)),
                     PointerButton::Middle,
-                    msg == WM_MBUTTONDOWN,
+                    isDown,
                     queryWinMods());
                 return 0;
+            }
+            case WM_CAPTURECHANGED: {
+                if (reinterpret_cast<HWND>(lParam) != hwnd && self->win32PressedMouseMask_ != 0u) {
+                    self->win32PressedMouseMask_ = 0u;
+                    if (self->inputRouter_) {
+                        self->inputRouter_->CancelPointerInteraction();
+                    }
+                    self->NotifyHostInputArrived();
+                }
+                return 0;
+            }
             case WM_MOUSEWHEEL: {
                 POINT pt{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
                 ScreenToClient(hwnd, &pt);
@@ -1029,21 +1286,122 @@ bool NativeWindowHost::InitializePlatformWindowAndBackend(const NativeWindowConf
                 }
                 break;
             }
+            case WM_IME_STARTCOMPOSITION: {
+                if (ITextInputMethodHost* ime = self->ActiveImeHost()) {
+                    ime->OnCompositionStart();
+                    self->telemetry_.osEventsTranslated += 1u;
+                    self->NotifyHostInputArrived();
+                }
+                return 0;
+            }
+            case WM_IME_COMPOSITION: {
+                if (self->EnsureWin32ImmLoaded()) {
+                    using ImmGetCtxFn = HANDLE (WINAPI*)(HWND);
+                    using ImmGetCompStrFn = LONG (WINAPI*)(HANDLE, DWORD, LPVOID, DWORD);
+                    using ImmRelCtxFn = BOOL (WINAPI*)(HWND, HANDLE);
+                    auto immGet = reinterpret_cast<ImmGetCtxFn>(self->win32ImmGetContext_);
+                    auto immGetStr = reinterpret_cast<ImmGetCompStrFn>(self->win32ImmGetCompositionStringW_);
+                    auto immRel = reinterpret_cast<ImmRelCtxFn>(self->win32ImmReleaseContext_);
+                    if (HANDLE himc = immGet(hwnd)) {
+                        bool handled = false;
+                        ITextInputMethodHost* ime = self->ActiveImeHost();
+                        // GCS_RESULTSTR = 0x0800
+                        if ((lParam & 0x0800L) != 0 && ime) {
+                            const LONG byteLen = immGetStr(himc, 0x0800u, nullptr, 0u);
+                            std::string utf8;
+                            if (byteLen > 0) {
+                                std::vector<wchar_t> wbuf(
+                                    static_cast<std::size_t>(byteLen) / sizeof(wchar_t) + 1u,
+                                    L'\0');
+                                const LONG got = immGetStr(himc, 0x0800u, wbuf.data(), static_cast<DWORD>(byteLen));
+                                if (got > 0) {
+                                    utf8 = ConvertUtf16SliceToUtf8(
+                                        wbuf.data(),
+                                        static_cast<std::size_t>(got) / sizeof(wchar_t));
+                                }
+                            }
+                            ime->OnCompositionEnd(utf8);
+                            if (self->webHost_ && !utf8.empty()) {
+                                ScopedUiResourceContext resourceScope(self->EffectiveResourceContext());
+                                (void)self->webHost_->FontStream().InspectTextAndQueueMissingShards(utf8);
+                            }
+                            handled = true;
+                        }
+                        // GCS_COMPSTR = 0x0008, GCS_CURSORPOS = 0x0080
+                        if ((lParam & 0x0008L) != 0 && ime) {
+                            const LONG byteLen = immGetStr(himc, 0x0008u, nullptr, 0u);
+                            std::string utf8;
+                            std::size_t cpCount = 0u;
+                            if (byteLen > 0) {
+                                std::vector<wchar_t> wbuf(
+                                    static_cast<std::size_t>(byteLen) / sizeof(wchar_t) + 1u,
+                                    L'\0');
+                                const LONG got = immGetStr(himc, 0x0008u, wbuf.data(), static_cast<DWORD>(byteLen));
+                                if (got > 0) {
+                                    utf8 = ConvertUtf16SliceToUtf8(
+                                        wbuf.data(),
+                                        static_cast<std::size_t>(got) / sizeof(wchar_t),
+                                        &cpCount);
+                                }
+                            }
+                            const LONG rawCursorWchars = immGetStr(himc, 0x0080u, nullptr, 0u);
+                            const auto caretCp = (rawCursorWchars >= 0)
+                                ? std::min<std::uint32_t>(
+                                    static_cast<std::uint32_t>(rawCursorWchars),
+                                    static_cast<std::uint32_t>(cpCount))
+                                : static_cast<std::uint32_t>(cpCount);
+                            ime->OnCompositionUpdate(utf8, caretCp);
+                            handled = true;
+                        }
+                        (void)immRel(hwnd, himc);
+                        if (handled) {
+                            self->telemetry_.osEventsTranslated += 1u;
+                            self->NotifyHostInputArrived();
+                            const LPARAM remFlags = lParam & ~(0x0800L | 0x0008L);
+                            if (remFlags == 0) {
+                                return 0;
+                            }
+                            return DefWindowProcW(hwnd, msg, wParam, remFlags);
+                        }
+                    }
+                }
+                break;
+            }
+            case WM_IME_ENDCOMPOSITION: {
+                if (ITextInputMethodHost* ime = self->ActiveImeHost()) {
+                    if (self->desktopIme_.IsComposing() ||
+                        (self->webHost_ && self->webHost_->ImeAdapter().IsComposing())) {
+                        ime->OnCompositionEnd("");
+                    }
+                    self->telemetry_.osEventsTranslated += 1u;
+                    self->NotifyHostInputArrived();
+                }
+                return 0;
+            }
             case WM_CHAR: {
                 const auto u16 = static_cast<std::uint16_t>(wParam);
                 if (u16 >= 0xD800u && u16 <= 0xDBFFu) {
                     self->pendingHighSurrogate_ = u16;
                     return 0;
                 }
-                std::uint32_t cp = u16;
-                if (u16 >= 0xDC00u && u16 <= 0xDFFFu && self->pendingHighSurrogate_ != 0u) {
-                    cp = 0x10000u +
+                if (u16 >= 0xDC00u && u16 <= 0xDFFFu) {
+                    if (self->pendingHighSurrogate_ == 0u) {
+                        return 0; // Reject lone low surrogate
+                    }
+                    const std::uint32_t cp = 0x10000u +
                         ((static_cast<std::uint32_t>(self->pendingHighSurrogate_) - 0xD800u) << 10u) +
                         (static_cast<std::uint32_t>(u16) - 0xDC00u);
                     self->pendingHighSurrogate_ = 0u;
-                } else {
-                    self->pendingHighSurrogate_ = 0u;
+                    char utf8[4]{};
+                    std::size_t len = 0u;
+                    EncodeCodePointToUtf8(cp, utf8, len);
+                    if (len > 0u) {
+                        self->OnPlatformTextInput(std::string_view(utf8, len));
+                    }
+                    return 0;
                 }
+                self->pendingHighSurrogate_ = 0u;
+                const std::uint32_t cp = u16;
                 if (cp >= 0x20u && cp != 0x7Fu) {
                     char utf8[4]{};
                     std::size_t len = 0u;
@@ -1073,13 +1431,34 @@ bool NativeWindowHost::InitializePlatformWindowAndBackend(const NativeWindowConf
         }
     }
 
+    std::wstring wideTitle = L"AeroGUI 2.0";
+    if (!config.title.empty()) {
+        const int needed = MultiByteToWideChar(
+            CP_UTF8,
+            0,
+            config.title.data(),
+            static_cast<int>(config.title.size()),
+            nullptr,
+            0);
+        if (needed > 0) {
+            wideTitle.resize(static_cast<std::size_t>(needed));
+            (void)MultiByteToWideChar(
+                CP_UTF8,
+                0,
+                config.title.data(),
+                static_cast<int>(config.title.size()),
+                wideTitle.data(),
+                needed);
+        }
+    }
+
     RECT wr{0, 0, static_cast<LONG>(width_), static_cast<LONG>(height_)};
     AdjustWindowRect(&wr, WS_OVERLAPPEDWINDOW, FALSE);
     HWND hwnd = CreateWindowExW(
         0,
         kWndClassName,
-        L"AeroGUI 2.0",
-        WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+        wideTitle.c_str(),
+        WS_OVERLAPPEDWINDOW,
         CW_USEDEFAULT,
         CW_USEDEFAULT,
         wr.right - wr.left,
@@ -1105,6 +1484,7 @@ bool NativeWindowHost::InitializePlatformWindowAndBackend(const NativeWindowConf
             if (pf != 0 && SetPixelFormat(hdc, pf, &pfd)) {
                 HMODULE glMod = LoadLibraryA("opengl32.dll");
                 if (glMod) {
+                    win32OpenglModule_ = static_cast<void*>(glMod);
                     auto wglCreateCtx = reinterpret_cast<HGLRC (WINAPI*)(HDC)>(
                         GetProcAddress(glMod, "wglCreateContext"));
                     auto wglMakeCur = reinterpret_cast<BOOL (WINAPI*)(HDC, HGLRC)>(
@@ -1141,9 +1521,19 @@ bool NativeWindowHost::InitializePlatformWindowAndBackend(const NativeWindowConf
                             gpuBackend_ = std::move(glBackend);
                             mode_ = NativeWindowMode::Win32WglOpenGL;
                             diagnostics_ = "Win32 HWND + WGL OpenGL 3.3 Core context initialized.";
+                            ShowWindow(hwnd, SW_SHOW);
                             return true;
                         }
+                        wglMakeCur(nullptr, nullptr);
+                        if (wglDelCtx) {
+                            wglDelCtx(finalRc);
+                        }
+                        win32Hglrc_ = nullptr;
+                    } else if (tempRc && wglDelCtx) {
+                        wglDelCtx(tempRc);
                     }
+                    FreeLibrary(glMod);
+                    win32OpenglModule_ = nullptr;
                 }
             }
         }
@@ -1153,8 +1543,16 @@ bool NativeWindowHost::InitializePlatformWindowAndBackend(const NativeWindowConf
             gpuBackend_ = std::move(sw);
             mode_ = NativeWindowMode::Win32GdiSoftware;
             diagnostics_ = "Win32 HWND initialized with GDI SoftwareSurfaceBackend presenter.";
+            ShowWindow(hwnd, SW_SHOW);
             return true;
         }
+        if (win32Hdc_) {
+            ReleaseDC(hwnd, static_cast<HDC>(win32Hdc_));
+            win32Hdc_ = nullptr;
+        }
+        win32Hwnd_ = nullptr;
+        SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
+        DestroyWindow(hwnd);
     }
 
     if (!config.allowHeadlessFallback) {
@@ -1403,7 +1801,7 @@ void NativeWindowHost::RequestClose() noexcept {
 
 void NativeWindowHost::WakeEventLoop() noexcept {
     const bool alreadySignaled = wakeSignaled_.exchange(true, std::memory_order_acq_rel);
-#if defined(__linux__) && !defined(__EMSCRIPTEN__)
+#if (defined(__linux__) || defined(__APPLE__)) && !defined(__EMSCRIPTEN__)
     if (!alreadySignaled && wakePipeFds_[1] >= 0) {
         const std::uint8_t wakeByte = 1u;
         const auto written = write(wakePipeFds_[1], &wakeByte, 1u);
@@ -1425,11 +1823,57 @@ void NativeWindowHost::DrainWakeSignal() noexcept {
     if (wakeSignaled_.exchange(false, std::memory_order_acq_rel)) {
         telemetry_.pipeOrEventWakeCount += 1u;
     }
-#if defined(__linux__) && !defined(__EMSCRIPTEN__)
+#if (defined(__linux__) || defined(__APPLE__)) && !defined(__EMSCRIPTEN__)
     if (wakePipeFds_[0] >= 0) {
         std::uint8_t drainBuf[64]{};
         while (read(wakePipeFds_[0], drainBuf, sizeof(drainBuf)) > 0) {}
     }
+#endif
+}
+
+bool NativeWindowHost::WaitForEventsOrWake(std::int32_t timeoutMs) noexcept {
+    if (timeoutMs == 0 || ShouldClose()) {
+        return false;
+    }
+#if (defined(__linux__) || defined(__APPLE__)) && !defined(__EMSCRIPTEN__)
+    struct pollfd fds[2]{};
+    nfds_t nfds = 0;
+    if (wakePipeFds_[0] >= 0) {
+        fds[nfds].fd = wakePipeFds_[0];
+        fds[nfds].events = POLLIN;
+        ++nfds;
+    }
+#if defined(__linux__)
+    if (x11_ && x11_->x11Fd >= 0) {
+        fds[nfds].fd = x11_->x11Fd;
+        fds[nfds].events = POLLIN;
+        ++nfds;
+    }
+#endif
+    if (nfds > 0) {
+        const int rc = poll(fds, nfds, timeoutMs);
+        return rc > 0;
+    }
+    if (timeoutMs > 0) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(timeoutMs));
+    }
+    return false;
+#elif defined(_WIN32)
+    const DWORD timeoutDw = (timeoutMs < 0) ? INFINITE : static_cast<DWORD>(timeoutMs);
+    HANDLE handles[1]{static_cast<HANDLE>(win32WakeEvent_)};
+    const DWORD handleCount = win32WakeEvent_ ? 1u : 0u;
+    const DWORD waitRes = MsgWaitForMultipleObjects(
+        handleCount,
+        handleCount > 0u ? handles : nullptr,
+        FALSE,
+        timeoutDw,
+        QS_ALLINPUT);
+    return waitRes != WAIT_TIMEOUT;
+#else
+    if (timeoutMs > 0) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(timeoutMs));
+    }
+    return false;
 #endif
 }
 
@@ -1559,6 +2003,28 @@ void NativeWindowHost::OnPlatformResize(std::uint32_t newWidth, std::uint32_t ne
     WakeEventLoop();
 }
 
+#if defined(_WIN32)
+bool NativeWindowHost::EnsureWin32ImmLoaded() noexcept {
+    if (!win32ImmProbed_) {
+        win32ImmProbed_ = true;
+        HMODULE immMod = LoadLibraryA("imm32.dll");
+        if (immMod) {
+            win32ImmModule_ = static_cast<void*>(immMod);
+            win32ImmGetContext_ = reinterpret_cast<void*>(GetProcAddress(immMod, "ImmGetContext"));
+            win32ImmSetCompositionWindow_ =
+                reinterpret_cast<void*>(GetProcAddress(immMod, "ImmSetCompositionWindow"));
+            win32ImmGetCompositionStringW_ =
+                reinterpret_cast<void*>(GetProcAddress(immMod, "ImmGetCompositionStringW"));
+            win32ImmReleaseContext_ = reinterpret_cast<void*>(GetProcAddress(immMod, "ImmReleaseContext"));
+        }
+    }
+    return win32ImmGetContext_ != nullptr &&
+           win32ImmSetCompositionWindow_ != nullptr &&
+           win32ImmGetCompositionStringW_ != nullptr &&
+           win32ImmReleaseContext_ != nullptr;
+}
+#endif
+
 void NativeWindowHost::SyncNativeImeSpot(Rect caretRect, bool active) noexcept {
     telemetry_.lastSyncedImeCaretRect = caretRect;
     telemetry_.lastImeActive = active;
@@ -1577,31 +2043,25 @@ void NativeWindowHost::SyncNativeImeSpot(Rect caretRect, bool active) noexcept {
         }
     }
 #elif defined(_WIN32)
-    if (active && win32Hwnd_) {
-        HMODULE immMod = LoadLibraryA("imm32.dll");
-        if (immMod) {
-            struct WinCompForm {
-                DWORD dwStyle;
-                POINT ptCurrentPos;
-                RECT rcArea;
-            };
-            using ImmGetCtxFn = HANDLE (WINAPI*)(HWND);
-            using ImmSetCompFn = BOOL (WINAPI*)(HANDLE, const WinCompForm*);
-            using ImmRelCtxFn = BOOL (WINAPI*)(HWND, HANDLE);
-            auto immGet = reinterpret_cast<ImmGetCtxFn>(GetProcAddress(immMod, "ImmGetContext"));
-            auto immSet = reinterpret_cast<ImmSetCompFn>(GetProcAddress(immMod, "ImmSetCompositionWindow"));
-            auto immRel = reinterpret_cast<ImmRelCtxFn>(GetProcAddress(immMod, "ImmReleaseContext"));
-            if (immGet && immSet && immRel) {
-                if (HANDLE himc = immGet(static_cast<HWND>(win32Hwnd_))) {
-                    WinCompForm cf{};
-                    cf.dwStyle = 0x0002u; // CFS_POINT
-                    cf.ptCurrentPos.x = static_cast<LONG>(caretRect.x);
-                    cf.ptCurrentPos.y = static_cast<LONG>(caretRect.y);
-                    (void)immSet(himc, &cf);
-                    (void)immRel(static_cast<HWND>(win32Hwnd_), himc);
-                }
-            }
-            FreeLibrary(immMod);
+    if (active && win32Hwnd_ && EnsureWin32ImmLoaded()) {
+        struct WinCompForm {
+            DWORD dwStyle;
+            POINT ptCurrentPos;
+            RECT rcArea;
+        };
+        using ImmGetCtxFn = HANDLE (WINAPI*)(HWND);
+        using ImmSetCompFn = BOOL (WINAPI*)(HANDLE, const WinCompForm*);
+        using ImmRelCtxFn = BOOL (WINAPI*)(HWND, HANDLE);
+        auto immGet = reinterpret_cast<ImmGetCtxFn>(win32ImmGetContext_);
+        auto immSet = reinterpret_cast<ImmSetCompFn>(win32ImmSetCompositionWindow_);
+        auto immRel = reinterpret_cast<ImmRelCtxFn>(win32ImmReleaseContext_);
+        if (HANDLE himc = immGet(static_cast<HWND>(win32Hwnd_))) {
+            WinCompForm cf{};
+            cf.dwStyle = 0x0002u; // CFS_POINT
+            cf.ptCurrentPos.x = static_cast<LONG>(caretRect.x);
+            cf.ptCurrentPos.y = static_cast<LONG>(caretRect.y);
+            (void)immSet(himc, &cf);
+            (void)immRel(static_cast<HWND>(win32Hwnd_), himc);
         }
     }
 #endif
@@ -1698,14 +2158,28 @@ GpuBackendFrameStats NativeWindowHost::TickAndPresentFrame(float dtSeconds, bool
     }
     ScopedUiResourceContext resourceScope(EffectiveResourceContext());
 
+    auto markAllTreePagesDirty = [](PagedRenderTree& tree) noexcept {
+        if (tree.DirtyPageCount() >= tree.PageCount()) {
+            return;
+        }
+        const auto totalNodes = static_cast<std::uint32_t>(tree.NodeCount());
+        for (std::uint32_t nid = 0u; nid < totalNodes; ++nid) {
+            if (const RenderNodeDescriptor* nd = tree.GetNode(nid)) {
+                if (!tree.IsPageDirty(nd->pageIndex)) {
+                    (void)tree.InvalidateNodePage(nid);
+                }
+            }
+        }
+    };
+
     if (desktopHost_) {
         if (forcePresent && desktopHost_->CanSleepIdle()) {
             desktopHost_->NotifyDirtyLayout();
         }
         desktopHost_->TickUi(dtSeconds, UiPhase_All);
         if (renderTree_) {
-            if (forcePresent && renderTree_->DirtyPageCount() == 0u && renderTree_->PageCount() > 0u) {
-                (void)renderTree_->InvalidateNodePage(0u);
+            if (forcePresent && renderTree_->PageCount() > 0u) {
+                markAllTreePagesDirty(*renderTree_);
             }
             const ZeroCopySubmissionStats subStats = desktopHost_->RecordGpuCommands(*renderTree_, *activeGpuStream_);
             if (forcePresent || needsInitialRender_ || subStats.dirtyPagesUploaded > 0u || subStats.drawCallCount > 0u) {
@@ -1722,22 +2196,36 @@ GpuBackendFrameStats NativeWindowHost::TickAndPresentFrame(float dtSeconds, bool
             }
         }
     } else if (webHost_) {
-        if (forcePresent) {
-            webHost_->RequestWakeFrame();
-        }
-        webHost_->TickUi(dtSeconds, UiPhase_All);
-        if (renderTree_) {
-            (void)webHost_->RecordGpuCommands(*renderTree_, *activeGpuStream_);
-            frameStats = gpuBackend_->PresentStream(
-                *renderTree_,
-                *activeGpuStream_,
-                width_,
-                height_,
-                clearColor_);
-            SwapOrBlitPlatformSurface();
-            needsInitialRender_ = false;
-            telemetry_.framesRendered += 1u;
-            telemetry_.lastBackendFrame = frameStats;
+        const bool skipIdleWebTick = !forcePresent && !needsInitialRender_ &&
+            webHost_->CanSleepIdle() &&
+            (!renderTree_ || renderTree_->DirtyPageCount() == 0u);
+        if (!skipIdleWebTick) {
+            if (forcePresent) {
+                webHost_->RequestWakeFrame();
+            }
+            webHost_->TickUi(dtSeconds, UiPhase_All);
+            if (renderTree_) {
+                if (forcePresent && renderTree_->PageCount() > 0u) {
+                    markAllTreePagesDirty(*renderTree_);
+                }
+                const bool shouldPresent = forcePresent || needsInitialRender_ || renderTree_->DirtyPageCount() > 0u;
+                if (shouldPresent) {
+                    const ZeroCopySubmissionStats subStats =
+                        webHost_->RecordGpuCommands(*renderTree_, *activeGpuStream_);
+                    if (forcePresent || needsInitialRender_ || subStats.dirtyPagesUploaded > 0u || subStats.drawCallCount > 0u) {
+                        frameStats = gpuBackend_->PresentStream(
+                            *renderTree_,
+                            *activeGpuStream_,
+                            width_,
+                            height_,
+                            clearColor_);
+                        SwapOrBlitPlatformSurface();
+                        needsInitialRender_ = false;
+                        telemetry_.framesRendered += 1u;
+                        telemetry_.lastBackendFrame = frameStats;
+                    }
+                }
+            }
         }
     } else if (renderTree_) {
         if (inputRouter_ && inputRouter_->HasPendingEvents()) {
@@ -1781,8 +2269,12 @@ bool NativeWindowHost::PumpEventsAndRender(float dtSeconds, std::int32_t maxWait
         return false;
     }
 
-#if defined(__linux__) && !defined(__EMSCRIPTEN__)
+    const auto iterationStart = std::chrono::steady_clock::now();
+    bool sleptIdleThisIteration = false;
+
+#if (defined(__linux__) || defined(__APPLE__)) && !defined(__EMSCRIPTEN__)
     auto drainX11Events = [&]() {
+#if defined(__linux__)
         if (!x11_ || !x11_->display || !x11_->XPending || !x11_->XNextEvent) {
             return;
         }
@@ -1872,29 +2364,17 @@ bool NativeWindowHost::PumpEventsAndRender(float dtSeconds, std::int32_t maxWait
                     break;
             }
         }
+#endif
     };
 
     drainX11Events();
 
     if (CanHostSleepIdle() && maxWaitMs != 0 && !ShouldClose()) {
+        sleptIdleThisIteration = true;
+        hasLastFrameTimestamp_ = false;
         telemetry_.idleSleepEntries += 1u;
-        struct pollfd fds[2]{};
-        nfds_t nfds = 0;
-        if (wakePipeFds_[0] >= 0) {
-            fds[nfds].fd = wakePipeFds_[0];
-            fds[nfds].events = POLLIN;
-            ++nfds;
-        }
-        if (x11_ && x11_->x11Fd >= 0) {
-            fds[nfds].fd = x11_->x11Fd;
-            fds[nfds].events = POLLIN;
-            ++nfds;
-        }
-        if (nfds > 0) {
-            const int rc = poll(fds, nfds, maxWaitMs);
-            if (rc > 0) {
-                telemetry_.eventLoopWakeCount += 1u;
-            }
+        if (WaitForEventsOrWake(maxWaitMs)) {
+            telemetry_.eventLoopWakeCount += 1u;
         }
         drainX11Events();
     } else if (!CanHostSleepIdle()) {
@@ -1919,17 +2399,10 @@ bool NativeWindowHost::PumpEventsAndRender(float dtSeconds, std::int32_t maxWait
     drainWin32Messages();
 
     if (CanHostSleepIdle() && maxWaitMs != 0 && !ShouldClose()) {
+        sleptIdleThisIteration = true;
+        hasLastFrameTimestamp_ = false;
         telemetry_.idleSleepEntries += 1u;
-        const DWORD timeoutDw = (maxWaitMs < 0) ? INFINITE : static_cast<DWORD>(maxWaitMs);
-        HANDLE handles[1]{static_cast<HANDLE>(win32WakeEvent_)};
-        const DWORD handleCount = win32WakeEvent_ ? 1u : 0u;
-        const DWORD waitRes = MsgWaitForMultipleObjects(
-            handleCount,
-            handleCount > 0u ? handles : nullptr,
-            FALSE,
-            timeoutDw,
-            QS_ALLINPUT);
-        if (waitRes != WAIT_TIMEOUT) {
+        if (WaitForEventsOrWake(maxWaitMs)) {
             telemetry_.eventLoopWakeCount += 1u;
         }
         drainWin32Messages();
@@ -1941,6 +2414,18 @@ bool NativeWindowHost::PumpEventsAndRender(float dtSeconds, std::int32_t maxWait
 
 #elif defined(__EMSCRIPTEN__)
     (void)maxWaitMs;
+    (void)iterationStart;
+    (void)sleptIdleThisIteration;
+    DrainWakeSignal();
+#else
+    if (CanHostSleepIdle() && maxWaitMs != 0 && !ShouldClose()) {
+        sleptIdleThisIteration = true;
+        hasLastFrameTimestamp_ = false;
+        telemetry_.idleSleepEntries += 1u;
+        (void)WaitForEventsOrWake(maxWaitMs);
+    } else if (!CanHostSleepIdle()) {
+        telemetry_.eventLoopWakeCount += 1u;
+    }
     DrainWakeSignal();
 #endif
 
@@ -1949,7 +2434,33 @@ bool NativeWindowHost::PumpEventsAndRender(float dtSeconds, std::int32_t maxWait
     }
 
     if (!CanHostSleepIdle()) {
-        (void)TickAndPresentFrame(dtSeconds, needsInitialRender_);
+        const auto now = std::chrono::steady_clock::now();
+        float effectiveDt = 0.016f;
+        if (!hasLastFrameTimestamp_) {
+            effectiveDt = (dtSeconds > 0.0f) ? std::clamp(dtSeconds, 0.0005f, 0.1f) : 0.016f;
+            hasLastFrameTimestamp_ = true;
+        } else {
+            const float wallDt = std::chrono::duration<float>(now - lastFrameTimestamp_).count();
+            effectiveDt = std::clamp(wallDt, 0.0005f, 0.1f);
+        }
+        lastFrameTimestamp_ = now;
+
+        (void)TickAndPresentFrame(effectiveDt, needsInitialRender_);
+
+#if !defined(__EMSCRIPTEN__)
+        // Frame pacing when animations/updates keep the host awake and caller supplied a positive frame budget
+        if (!sleptIdleThisIteration && maxWaitMs > 0 && !ShouldClose() && !CanHostSleepIdle()) {
+            const auto afterFrame = std::chrono::steady_clock::now();
+            const auto elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                afterFrame - iterationStart).count();
+            if (elapsedMs < static_cast<long long>(maxWaitMs)) {
+                const auto remainingMs = static_cast<std::int32_t>(maxWaitMs - elapsedMs);
+                (void)WaitForEventsOrWake(remainingMs);
+            }
+        }
+#endif
+    } else {
+        hasLastFrameTimestamp_ = false;
     }
 
     return !ShouldClose();
@@ -1971,7 +2482,7 @@ void NativeWindowHost::ScheduleEmscriptenRafIfNeeded() noexcept {
             const float nowMs = static_cast<float>(timeMs);
             float dtSec = 0.016f;
             if (self->lastRafTimeMs_ >= 0.0f && nowMs > self->lastRafTimeMs_) {
-                dtSec = std::clamp((nowMs - self->lastRafTimeMs_) * 0.001f, 0.001f, 0.1f);
+                dtSec = std::clamp((nowMs - self->lastRafTimeMs_) * 0.001f, 0.0005f, 0.1f);
             }
             self->lastRafTimeMs_ = nowMs;
 

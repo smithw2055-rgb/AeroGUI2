@@ -1,10 +1,13 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
+#include <filesystem>
 #include <fstream>
 #include <sstream>
 #include <string>
 #include <string_view>
+#include <system_error>
 #include <vector>
 
 #include "aero/compiler/AeroCompiler.hpp"
@@ -49,6 +52,41 @@ Rgba8 SamplePixel(
         return {};
     }
     return Rgba8{buf[idx + 0u], buf[idx + 1u], buf[idx + 2u], buf[idx + 3u]};
+}
+
+std::filesystem::path ResolveSamplesDir() {
+    std::error_code ec;
+    if (const char* envDir = std::getenv("AERO_SAMPLES_DIR"); envDir && envDir[0] != '\0') {
+        const std::filesystem::path p(envDir);
+        if (std::filesystem::is_directory(p, ec)) {
+            return p;
+        }
+    }
+#ifdef AERO_SAMPLES_DIR
+    {
+        const std::filesystem::path p(AERO_SAMPLES_DIR);
+        if (!p.empty() && std::filesystem::is_directory(p, ec)) {
+            return p;
+        }
+    }
+#endif
+    constexpr const char* kCandidates[] = {
+        "Samples",
+        "samples",
+        "../Samples",
+        "../samples",
+        "../../Samples",
+        "../../samples",
+        "../../../Samples",
+        "../../../samples",
+    };
+    for (const char* cand : kCandidates) {
+        const std::filesystem::path p(cand);
+        if (std::filesystem::is_directory(p, ec)) {
+            return p;
+        }
+    }
+    return std::filesystem::path("Samples");
 }
 
 std::string ReadFileText(const char* path) {
@@ -545,32 +583,34 @@ void TestExpanderTabControlAndGallerySamples() {
                    "TabControl renders Page 2 (#3366FF Blue) after clicking Tab 2");
 
     // 3. Official Gallery Sample XAMLs end-to-end compile + mount + layout + render smoke check
-    const char* kSampleFiles[] = {
-        "/working_dir/c_1a21a30fb41e1c84/scratch/samples/Gallery/Data/Samples/Brushes.xaml",
-        "/working_dir/c_1a21a30fb41e1c84/scratch/samples/Gallery/Data/Samples/UniformGrid.xaml",
-        "/working_dir/c_1a21a30fb41e1c84/scratch/samples/Gallery/Data/Samples/ProgressBar.xaml",
-        "/working_dir/c_1a21a30fb41e1c84/scratch/samples/Gallery/Data/Samples/Expander.xaml",
-        "/working_dir/c_1a21a30fb41e1c84/scratch/samples/Gallery/Data/Samples/TabControl.xaml",
-        "/working_dir/c_1a21a30fb41e1c84/scratch/samples/Gallery/Data/Samples/GroupBox.xaml",
+    const std::filesystem::path samplesDir = ResolveSamplesDir();
+    const char* kSampleRelFiles[] = {
+        "Gallery/Data/Samples/Brushes.xaml",
+        "Gallery/Data/Samples/UniformGrid.xaml",
+        "Gallery/Data/Samples/ProgressBar.xaml",
+        "Gallery/Data/Samples/Expander.xaml",
+        "Gallery/Data/Samples/TabControl.xaml",
+        "Gallery/Data/Samples/GroupBox.xaml",
     };
-    for (const char* samplePath : kSampleFiles) {
-        const std::string xaml = ReadFileText(samplePath);
-        if (xaml.empty()) {
-            continue;
-        }
+    for (const char* relPath : kSampleRelFiles) {
+        const std::string samplePath = (samplesDir / relPath).string();
+        const std::string xaml = ReadFileText(samplePath.c_str());
+        AERO_P13_CHECK(!xaml.empty(), samplePath.c_str());
         AeroCompileInput sIn{};
         sIn.xamlPath = samplePath;
         sIn.xamlContent = xaml;
         const AeroCompileResult sRes = compiler.Compile(sIn);
-        AERO_P13_CHECK(sRes.succeeded, samplePath);
+        AERO_P13_CHECK(sRes.succeeded, samplePath.c_str());
         auto sampleRoot = CreateElementByTypeName(sRes.axbPackage.rootTypeName);
         AERO_P13_CHECK(sampleRoot.Get() != nullptr && MountAxbTemplate(sampleRoot.Get(), sRes.axbPackage),
                        "Mounted official Gallery sample cleanly");
-        sampleRoot->Measure(Size{1280.0f, 960.0f});
-        sampleRoot->Arrange(Rect{0.0f, 0.0f, 1280.0f, 960.0f});
-        PagedRenderTree sampleTree;
-        const std::size_t nodeCount = sampleTree.BuildFromVisualTree(sampleRoot.Get());
-        AERO_P13_CHECK(nodeCount > 0u, "Built non-empty PagedRenderTree for official Gallery sample");
+        if (sampleRoot.Get() != nullptr) {
+            sampleRoot->Measure(Size{1280.0f, 960.0f});
+            sampleRoot->Arrange(Rect{0.0f, 0.0f, 1280.0f, 960.0f});
+            PagedRenderTree sampleTree;
+            const std::size_t nodeCount = sampleTree.BuildFromVisualTree(sampleRoot.Get());
+            AERO_P13_CHECK(nodeCount > 0u, "Built non-empty PagedRenderTree for official Gallery sample");
+        }
     }
 }
 

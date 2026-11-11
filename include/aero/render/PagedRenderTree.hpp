@@ -6,6 +6,7 @@
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "aero/binding/DualTrackBindingEngine.hpp"
@@ -538,6 +539,14 @@ public:
         return blurLayerSpans_;
     }
 
+    // Unified 1024x1024 UI atlas MTSDF lower-half region [y: 512..959] (1024 x 448 RGBA8)
+    [[nodiscard]] std::uint32_t MtsdfAtlasOwnerId() const noexcept { return mtsdfOwnerId_; }
+    [[nodiscard]] std::uint64_t MtsdfAtlasRevision() const noexcept { return mtsdfAtlasRevision_; }
+    [[nodiscard]] std::uint32_t MtsdfAtlasPopulatedRows() const noexcept { return mtsdfPopulatedRows_; }
+    [[nodiscard]] const std::vector<std::uint8_t>& MtsdfAtlasRgba8() const noexcept {
+        return mtsdfAtlasRgba8_;
+    }
+
     // Dirty 4KB page tracking
     [[nodiscard]] bool IsPageDirty(std::size_t pageIndex) const noexcept;
     [[nodiscard]] std::size_t DirtyPageCount() const noexcept;
@@ -572,6 +581,7 @@ private:
     };
 
     void InitPreCachedDigitGlyphs() noexcept;
+    void RegisterMtsdfInTreeAtlas(const AxbMtsdfPathEntry& entry);
     std::uint32_t EnsurePageForAllocation(
         std::uint32_t neededVertices,
         const Rect& clipRect,
@@ -647,6 +657,11 @@ private:
     std::vector<const UIElement*> activeComboPopupOwners_;
     std::unordered_map<std::uint32_t, StandaloneTextRunRecord> standaloneTextRuns_;
     std::array<GlyphUvRect, 128> preCachedGlyphs_{};
+    std::uint32_t mtsdfOwnerId_ = 0u;
+    std::uint64_t mtsdfAtlasRevision_ = 0u;
+    std::uint32_t mtsdfPopulatedRows_ = 0u;
+    std::vector<std::uint8_t> mtsdfAtlasRgba8_;
+    std::unordered_set<std::uint64_t> mtsdfRegisteredHashes_;
 };
 
 } // namespace aero

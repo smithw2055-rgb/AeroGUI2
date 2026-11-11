@@ -7,9 +7,11 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <iostream>
 #include <memory>
 #include <string>
+#include <system_error>
 #include <thread>
 #include <vector>
 
@@ -42,6 +44,32 @@ namespace aero::p0_2_tests {
 
 namespace {
 
+#ifndef AERO_GL_APIENTRY
+#if defined(_WIN32)
+#define AERO_GL_APIENTRY __stdcall
+#else
+#define AERO_GL_APIENTRY
+#endif
+#endif
+
+std::filesystem::path ResolveTestTempDir() {
+    std::error_code ec;
+    std::filesystem::path dir;
+    if (const char* envDir = std::getenv("AERO_TEST_TEMP_DIR"); envDir && envDir[0] != '\0') {
+        dir = std::filesystem::path(envDir);
+    }
+#ifdef AERO_TEST_TEMP_DIR
+    if (dir.empty()) {
+        dir = std::filesystem::path(AERO_TEST_TEMP_DIR);
+    }
+#endif
+    if (dir.empty()) {
+        dir = std::filesystem::temp_directory_path(ec) / "aerogui_tests";
+    }
+    std::filesystem::create_directories(dir, ec);
+    return dir;
+}
+
 // ============================================================================
 // Mock OpenGL 3.3 / WebGL2 Spy Driver for Deterministic GPU Pipeline Verification
 // ============================================================================
@@ -59,6 +87,9 @@ struct MockGlSpyState {
     std::size_t texSubImage2DCalls = 0;
     std::size_t attribFloatCalls = 0;
     std::size_t attribIntCalls = 0;
+    std::size_t uniform1iCalls = 0;
+    AeroGLenum activeTexUnit = 0x84C0u;
+    AeroGLuint boundTextureByUnit[8]{};
 
     AeroGLint lastViewportW = 0;
     AeroGLint lastViewportH = 0;
@@ -85,36 +116,36 @@ struct MockGlSpyState {
 MockGlSpyState* gSpy = nullptr;
 bool gSpyScissorCurrentlyEnabled = false;
 
-void SpyViewport(AeroGLint, AeroGLint, AeroGLsizei w, AeroGLsizei h) {
+void AERO_GL_APIENTRY SpyViewport(AeroGLint, AeroGLint, AeroGLsizei w, AeroGLsizei h) {
     gSpy->lastViewportW = w;
     gSpy->lastViewportH = h;
 }
-void SpyScissor(AeroGLint x, AeroGLint y, AeroGLsizei w, AeroGLsizei h) {
+void AERO_GL_APIENTRY SpyScissor(AeroGLint x, AeroGLint y, AeroGLsizei w, AeroGLsizei h) {
     gSpy->lastScissor = GlScissorBox{x, y, w, h};
 }
-void SpyEnable(AeroGLenum cap) {
+void AERO_GL_APIENTRY SpyEnable(AeroGLenum cap) {
     if (cap == 0x0BE2u) gSpy->blendEnabled = true;
     if (cap == 0x0C11u) gSpyScissorCurrentlyEnabled = true;
 }
-void SpyDisable(AeroGLenum cap) {
+void AERO_GL_APIENTRY SpyDisable(AeroGLenum cap) {
     if (cap == 0x0BE2u) gSpy->blendEnabled = false;
     if (cap == 0x0C11u) gSpyScissorCurrentlyEnabled = false;
 }
-void SpyBlendFuncSeparate(AeroGLenum, AeroGLenum, AeroGLenum, AeroGLenum) {}
-void SpyClearColor(AeroGLfloat, AeroGLfloat, AeroGLfloat, AeroGLfloat) {}
-void SpyClear(AeroGLbitfield) {}
+void AERO_GL_APIENTRY SpyBlendFuncSeparate(AeroGLenum, AeroGLenum, AeroGLenum, AeroGLenum) {}
+void AERO_GL_APIENTRY SpyClearColor(AeroGLfloat, AeroGLfloat, AeroGLfloat, AeroGLfloat) {}
+void AERO_GL_APIENTRY SpyClear(AeroGLbitfield) {}
 
-void SpyGenIds(AeroGLsizei n, AeroGLuint* out) {
+void AERO_GL_APIENTRY SpyGenIds(AeroGLsizei n, AeroGLuint* out) {
     for (AeroGLsizei i = 0; i < n; ++i) {
         out[i] = gSpy->nextId++;
     }
 }
-void SpyDeleteIds(AeroGLsizei, const AeroGLuint*) {}
+void AERO_GL_APIENTRY SpyDeleteIds(AeroGLsizei, const AeroGLuint*) {}
 AeroGLenum gBoundBufferTarget = 0;
-void SpyBindBuffer(AeroGLenum target, AeroGLuint) {
+void AERO_GL_APIENTRY SpyBindBuffer(AeroGLenum target, AeroGLuint) {
     gBoundBufferTarget = target;
 }
-void SpyBufferData(AeroGLenum target, AeroGLsizeiptr size, const void* data, AeroGLenum) {
+void AERO_GL_APIENTRY SpyBufferData(AeroGLenum target, AeroGLsizeiptr size, const void* data, AeroGLenum) {
     ++gSpy->bufferDataCalls;
     if (target == 0x8892u && size > 0) {
         gSpy->uploadedVboBytes.assign(static_cast<std::size_t>(size), 0u);
@@ -126,7 +157,7 @@ void SpyBufferData(AeroGLenum target, AeroGLsizeiptr size, const void* data, Aer
         gSpy->uploadedEboBytes.assign(bytes, bytes + static_cast<std::size_t>(size));
     }
 }
-void SpyBufferSubData(AeroGLenum target, AeroGLintptr offset, AeroGLsizeiptr size, const void* data) {
+void AERO_GL_APIENTRY SpyBufferSubData(AeroGLenum target, AeroGLintptr offset, AeroGLsizeiptr size, const void* data) {
     ++gSpy->bufferSubDataCalls;
     if (target == 0x8892u && data && offset >= 0 && size > 0 &&
         static_cast<std::size_t>(offset + size) <= gSpy->uploadedVboBytes.size()) {
@@ -136,17 +167,17 @@ void SpyBufferSubData(AeroGLenum target, AeroGLintptr offset, AeroGLsizeiptr siz
             static_cast<std::size_t>(size));
     }
 }
-void SpyBindVertexArray(AeroGLuint) {}
-void SpyEnableVertexAttribArray(AeroGLuint) {}
-void SpyVertexAttribPointer(AeroGLuint, AeroGLint, AeroGLenum, AeroGLboolean, AeroGLsizei, const void*) {
+void AERO_GL_APIENTRY SpyBindVertexArray(AeroGLuint) {}
+void AERO_GL_APIENTRY SpyEnableVertexAttribArray(AeroGLuint) {}
+void AERO_GL_APIENTRY SpyVertexAttribPointer(AeroGLuint, AeroGLint, AeroGLenum, AeroGLboolean, AeroGLsizei, const void*) {
     ++gSpy->attribFloatCalls;
 }
-void SpyVertexAttribIPointer(AeroGLuint, AeroGLint, AeroGLenum, AeroGLsizei, const void*) {
+void AERO_GL_APIENTRY SpyVertexAttribIPointer(AeroGLuint, AeroGLint, AeroGLenum, AeroGLsizei, const void*) {
     ++gSpy->attribIntCalls;
 }
-AeroGLuint SpyCreateShader(AeroGLenum) { return gSpy->nextId++; }
-void SpyDeleteShader(AeroGLuint) {}
-void SpyShaderSource(AeroGLuint, AeroGLsizei count, const AeroGLchar* const* strs, const AeroGLint* lens) {
+AeroGLuint AERO_GL_APIENTRY SpyCreateShader(AeroGLenum) { return gSpy->nextId++; }
+void AERO_GL_APIENTRY SpyDeleteShader(AeroGLuint) {}
+void AERO_GL_APIENTRY SpyShaderSource(AeroGLuint, AeroGLsizei count, const AeroGLchar* const* strs, const AeroGLint* lens) {
     if (count > 0 && strs && strs[0]) {
         const std::size_t n = (lens && lens[0] > 0)
             ? static_cast<std::size_t>(lens[0])
@@ -154,15 +185,15 @@ void SpyShaderSource(AeroGLuint, AeroGLsizei count, const AeroGLchar* const* str
         gSpy->lastShaderSource.assign(strs[0], n);
     }
 }
-void SpyCompileShader(AeroGLuint) { ++gSpy->compileCount; }
-void SpyGetShaderiv(AeroGLuint, AeroGLenum pname, AeroGLint* params) {
+void AERO_GL_APIENTRY SpyCompileShader(AeroGLuint) { ++gSpy->compileCount; }
+void AERO_GL_APIENTRY SpyGetShaderiv(AeroGLuint, AeroGLenum pname, AeroGLint* params) {
     if (pname == 0x8B81u) {
         *params = gSpy->forceVertexCompileFail ? 0 : 1;
     } else if (pname == 0x8B84u) {
         *params = 64;
     }
 }
-void SpyGetShaderInfoLog(AeroGLuint, AeroGLsizei maxLen, AeroGLsizei* len, AeroGLchar* log) {
+void AERO_GL_APIENTRY SpyGetShaderInfoLog(AeroGLuint, AeroGLsizei maxLen, AeroGLsizei* len, AeroGLchar* log) {
     constexpr const char* kMsg = "MOCK_GLSL_SYNTAX_ERR: line 12 unexpected token";
     const auto msgLen = static_cast<AeroGLsizei>(std::strlen(kMsg));
     const AeroGLsizei copyLen = std::min(maxLen - 1, msgLen);
@@ -172,18 +203,18 @@ void SpyGetShaderInfoLog(AeroGLuint, AeroGLsizei maxLen, AeroGLsizei* len, AeroG
     }
     if (len) *len = copyLen;
 }
-AeroGLuint SpyCreateProgram() { return gSpy->nextId++; }
-void SpyDeleteProgram(AeroGLuint) {}
-void SpyAttachShader(AeroGLuint, AeroGLuint) {}
-void SpyLinkProgram(AeroGLuint) { ++gSpy->linkCount; }
-void SpyGetProgramiv(AeroGLuint, AeroGLenum pname, AeroGLint* params) {
+AeroGLuint AERO_GL_APIENTRY SpyCreateProgram() { return gSpy->nextId++; }
+void AERO_GL_APIENTRY SpyDeleteProgram(AeroGLuint) {}
+void AERO_GL_APIENTRY SpyAttachShader(AeroGLuint, AeroGLuint) {}
+void AERO_GL_APIENTRY SpyLinkProgram(AeroGLuint) { ++gSpy->linkCount; }
+void AERO_GL_APIENTRY SpyGetProgramiv(AeroGLuint, AeroGLenum pname, AeroGLint* params) {
     if (pname == 0x8B82u) {
         *params = gSpy->forceProgramLinkFail ? 0 : 1;
     } else if (pname == 0x8B84u) {
         *params = 64;
     }
 }
-void SpyGetProgramInfoLog(AeroGLuint, AeroGLsizei maxLen, AeroGLsizei* len, AeroGLchar* log) {
+void AERO_GL_APIENTRY SpyGetProgramInfoLog(AeroGLuint, AeroGLsizei maxLen, AeroGLsizei* len, AeroGLchar* log) {
     constexpr const char* kMsg = "MOCK_GLSL_LINK_ERR: varying mismatch";
     const auto msgLen = static_cast<AeroGLsizei>(std::strlen(kMsg));
     const AeroGLsizei copyLen = std::min(maxLen - 1, msgLen);
@@ -193,26 +224,38 @@ void SpyGetProgramInfoLog(AeroGLuint, AeroGLsizei maxLen, AeroGLsizei* len, Aero
     }
     if (len) *len = copyLen;
 }
-void SpyUseProgram(AeroGLuint) {}
-AeroGLint SpyGetUniformLocation(AeroGLuint, const AeroGLchar* name) {
+void AERO_GL_APIENTRY SpyUseProgram(AeroGLuint) {}
+AeroGLint AERO_GL_APIENTRY SpyGetUniformLocation(AeroGLuint, const AeroGLchar* name) {
+    if (!name) return -1;
     if (std::strcmp(name, "u_ViewportSize") == 0) return 0;
     if (std::strcmp(name, "u_QuadHalfExtent") == 0) return 1;
     if (std::strcmp(name, "u_GlyphAndUiAtlas") == 0) return 2;
+    if (std::strcmp(name, "u_ImageAtlas") == 0) return 3;
+    if (std::strncmp(name, "u_", 2) == 0) return 4;
     return -1;
 }
-void SpyUniform1i(AeroGLint, AeroGLint) {}
-void SpyUniform2f(AeroGLint, AeroGLfloat, AeroGLfloat) {}
-void SpyActiveTexture(AeroGLenum) {}
-void SpyBindTexture(AeroGLenum, AeroGLuint) {}
-void SpyTexImage2D(AeroGLenum, AeroGLint, AeroGLint, AeroGLsizei, AeroGLsizei, AeroGLint, AeroGLenum, AeroGLenum, const void*) {
+void AERO_GL_APIENTRY SpyUniform1i(AeroGLint, AeroGLint) {
+    ++gSpy->uniform1iCalls;
+}
+void AERO_GL_APIENTRY SpyUniform2f(AeroGLint, AeroGLfloat, AeroGLfloat) {}
+void AERO_GL_APIENTRY SpyActiveTexture(AeroGLenum texUnit) {
+    gSpy->activeTexUnit = texUnit;
+}
+void AERO_GL_APIENTRY SpyBindTexture(AeroGLenum, AeroGLuint texId) {
+    const std::size_t unitIdx = (gSpy->activeTexUnit >= 0x84C0u && gSpy->activeTexUnit < 0x84C8u)
+        ? static_cast<std::size_t>(gSpy->activeTexUnit - 0x84C0u)
+        : 0u;
+    gSpy->boundTextureByUnit[unitIdx] = texId;
+}
+void AERO_GL_APIENTRY SpyTexImage2D(AeroGLenum, AeroGLint, AeroGLint, AeroGLsizei, AeroGLsizei, AeroGLint, AeroGLenum, AeroGLenum, const void*) {
     ++gSpy->texImage2DCalls;
 }
-void SpyTexSubImage2D(AeroGLenum, AeroGLint, AeroGLint, AeroGLint, AeroGLsizei, AeroGLsizei, AeroGLenum, AeroGLenum, const void*) {
+void AERO_GL_APIENTRY SpyTexSubImage2D(AeroGLenum, AeroGLint, AeroGLint, AeroGLint, AeroGLsizei, AeroGLsizei, AeroGLenum, AeroGLenum, const void*) {
     ++gSpy->texSubImage2DCalls;
 }
-void SpyTexParameteri(AeroGLenum, AeroGLenum, AeroGLint) {}
-void SpyPixelStorei(AeroGLenum, AeroGLint) {}
-void SpyDrawElements(AeroGLenum mode, AeroGLsizei count, AeroGLenum type, const void* indices) {
+void AERO_GL_APIENTRY SpyTexParameteri(AeroGLenum, AeroGLenum, AeroGLint) {}
+void AERO_GL_APIENTRY SpyPixelStorei(AeroGLenum, AeroGLint) {}
+void AERO_GL_APIENTRY SpyDrawElements(AeroGLenum mode, AeroGLsizei count, AeroGLenum type, const void* indices) {
     ++gSpy->drawElementsCalls;
     gSpy->lastDrawMode = mode;
     gSpy->lastDrawIndexCount = count;
@@ -222,13 +265,13 @@ void SpyDrawElements(AeroGLenum mode, AeroGLsizei count, AeroGLenum type, const 
         gSpy->scissorEnabledDuringDraw = true;
     }
 }
-void SpyReadPixels(AeroGLint, AeroGLint, AeroGLsizei w, AeroGLsizei h, AeroGLenum, AeroGLenum, void* data) {
+void AERO_GL_APIENTRY SpyReadPixels(AeroGLint, AeroGLint, AeroGLsizei w, AeroGLsizei h, AeroGLenum, AeroGLenum, void* data) {
     if (data && w > 0 && h > 0) {
         std::memset(data, 0x7Fu, static_cast<std::size_t>(w) * static_cast<std::size_t>(h) * 4u);
     }
 }
-AeroGLenum SpyGetError() { return 0u; }
-const std::uint8_t* SpyGetString(AeroGLenum) {
+AeroGLenum AERO_GL_APIENTRY SpyGetError() { return 0u; }
+const std::uint8_t* AERO_GL_APIENTRY SpyGetString(AeroGLenum) {
     return reinterpret_cast<const std::uint8_t*>("MockGL 3.3 Core AeroSpy");
 }
 
@@ -393,12 +436,14 @@ void TestOpenGlDeviceBackendPipelineAndDiagnostics() {
                "GPU EBO uploaded 672 * 6 uint32 indices");
 
     // Test UpdateAtlasSubRegion
+    const std::size_t subCountBefore = glBackend.Telemetry().atlasSubUpdateCount;
     std::vector<std::uint8_t> subPatch(16u * 16u * 4u, 0xEEu);
     AERO_CHECK(glBackend.UpdateAtlasSubRegion(8u, 8u, 16u, 16u, subPatch.data()),
                "UpdateAtlasSubRegion succeeded");
     AERO_CHECK(!glBackend.UpdateAtlasSubRegion(120u, 120u, 16u, 16u, subPatch.data()),
                "Out-of-bounds UpdateAtlasSubRegion safely rejected");
-    AERO_CHECK(glBackend.Telemetry().atlasSubUpdateCount == 1u, "Atlas sub-update telemetry incremented");
+    AERO_CHECK(glBackend.Telemetry().atlasSubUpdateCount == subCountBefore + 1u,
+               "Atlas sub-update telemetry incremented");
 
     // Build clipped ScrollViewer + children so scissor batch & multi-quad EBO draw are exercised
     auto root = MakeIntrusive<Canvas>();
@@ -625,7 +670,8 @@ public CommandDeckWindow CreateCommandDeck()
     AERO_CHECK(boostBtn && energyBar && titleBanner && callsignInput, "All named controls resolved");
     AERO_CHECK(std::fabs(energyBar->FinalRect().width - 120.0f) < 0.5f, "Initial EnergyFillBar width == 120px");
 
-    const std::string beforePpm = "/working_dir/c_1a21a30fb41e1c84/scratch/subagent_work/p0_2/test_frame_before.ppm";
+    const std::filesystem::path tempOutDir = ResolveTestTempDir();
+    const std::string beforePpm = (tempOutDir / "test_frame_before.ppm").string();
     AERO_CHECK(windowHost.SaveScreenshotPpm(beforePpm), "Exported initial frame PPM screenshot");
 
     std::vector<std::uint8_t> frameBeforeRgba;
@@ -707,8 +753,8 @@ public CommandDeckWindow CreateCommandDeck()
     AERO_CHECK(greenAfter > greenBefore + 120u,
                "Framebuffer pixel at expanded EnergyFillBar turned bright green (#2AD882) after RealScript click");
 
-    const std::string afterPpm = "/working_dir/c_1a21a30fb41e1c84/scratch/subagent_work/p0_2/test_frame_after.ppm";
-    const std::string afterBmp = "/working_dir/c_1a21a30fb41e1c84/scratch/subagent_work/p0_2/test_frame_after.bmp";
+    const std::string afterPpm = (tempOutDir / "test_frame_after.ppm").string();
+    const std::string afterBmp = (tempOutDir / "test_frame_after.bmp").string();
     AERO_CHECK(windowHost.SaveScreenshotPpm(afterPpm), "Saved post-click PPM screenshot");
     AERO_CHECK(windowHost.SaveScreenshotBmp(afterBmp), "Saved post-click BMP screenshot");
 

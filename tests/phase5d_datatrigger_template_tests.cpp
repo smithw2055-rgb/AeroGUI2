@@ -629,8 +629,21 @@ public LeaderboardEntry CreateLeaderboardEntry()
     AERO_CHECK(bindingSlotsAfterInitialLayout <= 12u,
                "Bounded Track A binding slots created only for realized virtual containers");
 
-    // Scroll deep into list (offset 15000px -> index ~500) and then to bottom (offset 29880px -> index ~996)
+    // Scroll into interior (offset 15000px -> index ~500, realizing full top+bottom overscan window),
+    // then scroll across interior & bottom (7500px -> 22500px -> 29880px) verifying 0 new Track A slots.
     rootSv->ScrollToVerticalOffset(15000.0f);
+    rootSv->Measure(aero::Size{300.0f, 120.0f});
+    rootSv->Arrange(aero::Rect{0.0f, 0.0f, 300.0f, 120.0f});
+
+    const std::size_t bindingSlotsAfterMidScroll = bindingEngine.ReactiveBindings().size();
+    AERO_CHECK(bindingSlotsAfterMidScroll >= bindingSlotsAfterInitialLayout && bindingSlotsAfterMidScroll <= 12u,
+               "Interior scroll window bounded by viewport + 2*overscan containers");
+
+    rootSv->ScrollToVerticalOffset(7500.0f);
+    rootSv->Measure(aero::Size{300.0f, 120.0f});
+    rootSv->Arrange(aero::Rect{0.0f, 0.0f, 300.0f, 120.0f});
+
+    rootSv->ScrollToVerticalOffset(22500.0f);
     rootSv->Measure(aero::Size{300.0f, 120.0f});
     rootSv->Arrange(aero::Rect{0.0f, 0.0f, 300.0f, 120.0f});
 
@@ -638,8 +651,8 @@ public LeaderboardEntry CreateLeaderboardEntry()
     rootSv->Measure(aero::Size{300.0f, 120.0f});
     rootSv->Arrange(aero::Rect{0.0f, 0.0f, 300.0f, 120.0f});
 
-    AERO_CHECK(bindingEngine.ReactiveBindings().size() == bindingSlotsAfterInitialLayout,
-               "RebindSubtreeRootObject recycled Track A binding slots in-place (0 new slots allocated on scroll)");
+    AERO_CHECK(bindingEngine.ReactiveBindings().size() == bindingSlotsAfterMidScroll,
+               "RebindSubtreeRootObject & recyclePool recycled Track A binding slots in-place (0 new slots allocated on scroll)");
 
     bool foundLastPlayer = false;
     for (aero::UIElement* c = board->FirstChild(); c != nullptr; c = c->NextSibling()) {

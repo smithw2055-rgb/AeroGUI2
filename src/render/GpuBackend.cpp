@@ -6,6 +6,8 @@
 #include <cstring>
 
 #include "aero/controls/Controls.hpp"
+#include "aero/render/FontAtlas.hpp"
+#include "aero/render/ImageAtlas.hpp"
 
 #if defined(__EMSCRIPTEN__)
 #include <GLES3/gl3.h>
@@ -52,7 +54,9 @@ constexpr AeroGLenum kGlTextureWrapT = 0x2803u;
 constexpr AeroGLenum kGlClampToEdge = 0x812Fu;
 constexpr AeroGLenum kGlRgba8 = 0x8058u;
 constexpr AeroGLenum kGlTexture0 = 0x84C0u;
+constexpr AeroGLenum kGlTexture1 = 0x84C1u;
 constexpr AeroGLenum kGlArrayBuffer = 0x8892u;
+constexpr std::uint32_t kUnifiedUiAtlasSize = 1024u;
 constexpr AeroGLenum kGlElementArrayBuffer = 0x8893u;
 constexpr AeroGLenum kGlStaticDraw = 0x88E4u;
 constexpr AeroGLenum kGlDynamicDraw = 0x88E8u;
@@ -171,6 +175,195 @@ void BakeSdfCellFrom5x7(
     }
 }
 
+void BakeProceduralGlyphHalf(
+    const PagedRenderTree& referenceTree,
+    std::uint32_t safeSize,
+    std::vector<std::uint8_t>& outRgba8) {
+    // Bake ASCII printable SDF glyphs into top-half 16x16 grid slots matching LookupPreCachedGlyph
+    for (std::uint32_t cp = 0x20u; cp <= 0x7Eu; ++cp) {
+        const GlyphUvRect uv = referenceTree.LookupPreCachedGlyph(static_cast<char>(cp));
+        if (!uv.valid) {
+            continue;
+        }
+        const auto cx = static_cast<std::uint32_t>(uv.u0 * static_cast<float>(safeSize) + 0.5f);
+        const auto cy = static_cast<std::uint32_t>(uv.v0 * static_cast<float>(safeSize) + 0.5f);
+        const auto cw = std::max<std::uint32_t>(
+            4u,
+            static_cast<std::uint32_t>((uv.u1 - uv.u0) * static_cast<float>(safeSize) + 0.5f));
+        const auto ch = std::max<std::uint32_t>(
+            4u,
+            static_cast<std::uint32_t>((uv.v1 - uv.v0) * static_cast<float>(safeSize) + 0.5f));
+        if (cx + cw <= safeSize && cy + ch <= safeSize) {
+            BakeSdfCellFrom5x7(static_cast<char>(cp), cx, cy, cw, ch, safeSize, outRgba8);
+        }
+    }
+
+    // Populate rows 6..7 generic CJK/Unicode hashed glyph fallback slots with a clean geometric glyph
+    for (std::uint32_t slot = 0; slot < 32u; ++slot) {
+        const std::uint32_t col = slot & 0x0Fu;
+        const std::uint32_t row = 6u + ((slot >> 4u) & 0x01u);
+        const auto cx = static_cast<std::uint32_t>(static_cast<float>(col) * 0.0625f * static_cast<float>(safeSize));
+        const auto cy = static_cast<std::uint32_t>(static_cast<float>(row) * 0.0625f * static_cast<float>(safeSize));
+        const auto cw = std::max<std::uint32_t>(4u, static_cast<std::uint32_t>(0.058f * static_cast<float>(safeSize)));
+        const auto ch = cw;
+        if (cx + cw <= safeSize && cy + ch <= safeSize) {
+            BakeSdfCellFrom5x7('#', cx, cy, cw, ch, safeSize, outRgba8);
+        }
+    }
+}
+
+void BakeGradientRowsIntoBuffer(
+    std::uint32_t atlasSize,
+    std::uint32_t bufferStartRow,
+    std::uint32_t bufferRowCount,
+    std::uint32_t minAllowedRow,
+    std::uint8_t* bufferRgba8,
+    std::uint32_t* outLowestWrittenRow = nullptr) {
+    if (!bufferRgba8 || atlasSize == 0u || bufferRowCount == 0u) {
+        if (outLowestWrittenRow) {
+            *outLowestWrittenRow = (atlasSize > 0u) ? (atlasSize - 1u) : 0u;
+        }
+        return;
+    }
+
+    // Fill neutral opaque white texel at bottom-right corner (atlasSize - 1, atlasSize - 1) for untextured fallbacks
+    const std::uint32_t bottomRow = atlasSize - 1u;
+    if (bottomRow >= bufferStartRow && (bottomRow - bufferStartRow) < bufferRowCount) {
+        const std::size_t lastTexel =
+            (static_cast<std::size_t>(bottomRow - bufferStartRow) * atlasSize + (atlasSize - 1u)) * 4u;
+        bufferRgba8[lastTexel + 0u] = 255u;
+        bufferRgba8[lastTexel + 1u] = 255u;
+        bufferRgba8[lastTexel + 2u] = 255u;
+        bufferRgba8[lastTexel + 3u] = 255u;
+    }
+
+    auto writeFloatTexel = [&](std::uint32_t tx, std::uint32_t atlasRow, float val) noexcept {
+        if (tx >= atlasSize || atlasRow < bufferStartRow || (atlasRow - bufferStartRow) >= bufferRowCount) {
+            return;
+        }
+        std::uint32_t bits = 0u;
+        std::memcpy(&bits, &val, sizeof(float));
+        const std::size_t off =
+            (static_cast<std::size_t>(atlasRow - bufferStartRow) * atlasSize + tx) * 4u;
+        bufferRgba8[off + 0u] = static_cast<std::uint8_t>(bits & 0xFFu);
+        bufferRgba8[off + 1u] = static_cast<std::uint8_t>((bits >> 8u) & 0xFFu);
+        bufferRgba8[off + 2u] = static_cast<std::uint8_t>((bits >> 16u) & 0xFFu);
+        bufferRgba8[off + 3u] = static_cast<std::uint8_t>((bits >> 24u) & 0xFFu);
+    };
+
+    std::uint32_t lowestRow = bottomRow;
+    const std::size_t brushCount = GradientBrushRegistry::Instance().BrushCount();
+    for (std::size_t idx = 0; idx < brushCount; ++idx) {
+        if (atlasSize < 4u + static_cast<std::uint32_t>(idx * 2u)) {
+            break;
+        }
+        const std::uint32_t rampRow = atlasSize - 2u - static_cast<std::uint32_t>(idx * 2u);
+        if (rampRow == 0u || rampRow - 1u < minAllowedRow) {
+            break;
+        }
+        const std::uint32_t metaRow = rampRow - 1u;
+        lowestRow = std::min(lowestRow, metaRow);
+
+        const auto brushId = static_cast<std::uint32_t>(idx + 1u);
+        const GradientBrushDesc* brush = GradientBrushRegistry::Instance().Find(brushId);
+        if (!brush) {
+            continue;
+        }
+
+        if (rampRow >= bufferStartRow && (rampRow - bufferStartRow) < bufferRowCount) {
+            const std::size_t localRampRow = static_cast<std::size_t>(rampRow - bufferStartRow);
+            const std::uint32_t rampWidth = std::min<std::uint32_t>(atlasSize, GradientBrushDesc::kLutWidth);
+            if (rampWidth == GradientBrushDesc::kLutWidth) {
+                std::memcpy(
+                    bufferRgba8 + localRampRow * atlasSize * 4u,
+                    brush->bakedRampRgba8.data(),
+                    GradientBrushDesc::kLutWidth * 4u);
+            } else if (rampWidth > 1u) {
+                for (std::uint32_t x = 0; x < rampWidth; ++x) {
+                    const float t = static_cast<float>(x) / static_cast<float>(rampWidth - 1u);
+                    const Color c = SampleGradientRampAtT(*brush, t);
+                    const std::uint32_t packed = PackColorRgba8(c, 1.0f);
+                    const std::size_t off = (localRampRow * atlasSize + x) * 4u;
+                    bufferRgba8[off + 0u] = static_cast<std::uint8_t>(packed & 0xFFu);
+                    bufferRgba8[off + 1u] = static_cast<std::uint8_t>((packed >> 8u) & 0xFFu);
+                    bufferRgba8[off + 2u] = static_cast<std::uint8_t>((packed >> 16u) & 0xFFu);
+                    bufferRgba8[off + 3u] = static_cast<std::uint8_t>((packed >> 24u) & 0xFFu);
+                }
+            }
+        }
+
+        if (metaRow >= bufferStartRow && (metaRow - bufferStartRow) < bufferRowCount) {
+            const std::size_t m0Off = static_cast<std::size_t>(metaRow - bufferStartRow) * atlasSize * 4u;
+            bufferRgba8[m0Off + 0u] = static_cast<std::uint8_t>(brush->kind);
+            bufferRgba8[m0Off + 1u] = static_cast<std::uint8_t>(brush->mappingMode);
+            bufferRgba8[m0Off + 2u] = static_cast<std::uint8_t>(brush->spreadMethod);
+            bufferRgba8[m0Off + 3u] = static_cast<std::uint8_t>(
+                std::clamp(brush->opacity, 0.0f, 1.0f) * 255.0f + 0.5f);
+
+            if (brush->kind == GradientBrushKind::Linear) {
+                writeFloatTexel(1u, metaRow, brush->startPoint.x);
+                writeFloatTexel(2u, metaRow, brush->startPoint.y);
+                writeFloatTexel(3u, metaRow, brush->endPoint.x);
+                writeFloatTexel(4u, metaRow, brush->endPoint.y);
+            } else {
+                writeFloatTexel(1u, metaRow, brush->center.x);
+                writeFloatTexel(2u, metaRow, brush->center.y);
+                writeFloatTexel(3u, metaRow, brush->gradientOrigin.x);
+                writeFloatTexel(4u, metaRow, brush->gradientOrigin.y);
+            }
+            writeFloatTexel(5u, metaRow, brush->radiusX);
+            writeFloatTexel(6u, metaRow, brush->radiusY);
+        }
+    }
+
+    if (outLowestWrittenRow) {
+        *outLowestWrittenRow = lowestRow;
+    }
+}
+
+void BuildUnifiedUiAtlas1024(
+    const PagedRenderTree& referenceTree,
+    std::vector<std::uint8_t>& outRgba8,
+    std::uint32_t* outLowestGradRow = nullptr) {
+    outRgba8.assign(static_cast<std::size_t>(kUnifiedUiAtlasSize) * kUnifiedUiAtlasSize * 4u, 0u);
+
+    // 1. Top half [y: 0..511]: live FontAtlas SDF glyphs (built-in ASCII + CJK + loaded TrueType + AGFS shards)
+    std::vector<std::uint8_t> fontRegion;
+    std::uint32_t fontW = 0u;
+    std::uint32_t fontRows = 0u;
+    FontAtlas::Instance().CopyGlyphRegionRgba8(512u, fontRegion, fontW, fontRows);
+    if (fontW == kUnifiedUiAtlasSize && fontRows > 0u) {
+        const std::size_t copyBytes =
+            static_cast<std::size_t>(kUnifiedUiAtlasSize) * std::min<std::uint32_t>(512u, fontRows) * 4u;
+        std::memcpy(outRgba8.data(), fontRegion.data(), copyBytes);
+    } else {
+        BakeProceduralGlyphHalf(referenceTree, kUnifiedUiAtlasSize, outRgba8);
+    }
+
+    // 2. Lower half [y: 512..959]: PagedRenderTree 4-channel MTSDF vector icon cells
+    const std::uint32_t mtsdfRows = std::min<std::uint32_t>(448u, referenceTree.MtsdfAtlasPopulatedRows());
+    if (mtsdfRows > 0u) {
+        const auto& mtsdfBuf = referenceTree.MtsdfAtlasRgba8();
+        const std::size_t mtsdfBytes = static_cast<std::size_t>(mtsdfRows) * kUnifiedUiAtlasSize * 4u;
+        if (mtsdfBuf.size() >= mtsdfBytes) {
+            std::memcpy(
+                outRgba8.data() + static_cast<std::size_t>(512u) * kUnifiedUiAtlasSize * 4u,
+                mtsdfBuf.data(),
+                mtsdfBytes);
+        }
+    }
+
+    // 3. Bottom band [y: minAllowedRow..1022]: GradientBrushRegistry 1D LUT & float32 metadata rows + (1023,1023) white texel
+    const std::uint32_t minAllowedRow = 512u + mtsdfRows;
+    BakeGradientRowsIntoBuffer(
+        kUnifiedUiAtlasSize,
+        0u,
+        kUnifiedUiAtlasSize,
+        minAllowedRow,
+        outRgba8.data(),
+        outLowestGradRow);
+}
+
 template <typename FnPtr>
 void AssignRawProc(FnPtr& outTyped, void* rawSym) noexcept {
     static_assert(sizeof(FnPtr) == sizeof(void*), "Function pointer must match pointer width");
@@ -274,119 +467,20 @@ void BuildDefaultUiAtlasRgba8(
     std::uint32_t atlasSize,
     std::vector<std::uint8_t>& outRgba8) {
     const std::uint32_t safeSize = std::max<std::uint32_t>(64u, atlasSize);
+    if (safeSize == kUnifiedUiAtlasSize) {
+        BuildUnifiedUiAtlas1024(referenceTree, outRgba8, nullptr);
+        return;
+    }
+
     outRgba8.assign(static_cast<std::size_t>(safeSize) * safeSize * 4u, 0u);
-
-    // Fill neutral opaque white texel at bottom-right corner (1,1) for untextured fallbacks
-    const std::size_t lastTexel = (static_cast<std::size_t>(safeSize) * safeSize - 1u) * 4u;
-    outRgba8[lastTexel + 0u] = 255u;
-    outRgba8[lastTexel + 1u] = 255u;
-    outRgba8[lastTexel + 2u] = 255u;
-    outRgba8[lastTexel + 3u] = 255u;
-
-    // Bake ASCII printable SDF glyphs into top-half 16x16 grid slots matching LookupPreCachedGlyph
-    for (std::uint32_t cp = 0x20u; cp <= 0x7Eu; ++cp) {
-        const GlyphUvRect uv = referenceTree.LookupPreCachedGlyph(static_cast<char>(cp));
-        if (!uv.valid) {
-            continue;
-        }
-        const auto cx = static_cast<std::uint32_t>(uv.u0 * static_cast<float>(safeSize) + 0.5f);
-        const auto cy = static_cast<std::uint32_t>(uv.v0 * static_cast<float>(safeSize) + 0.5f);
-        const auto cw = std::max<std::uint32_t>(
-            4u,
-            static_cast<std::uint32_t>((uv.u1 - uv.u0) * static_cast<float>(safeSize) + 0.5f));
-        const auto ch = std::max<std::uint32_t>(
-            4u,
-            static_cast<std::uint32_t>((uv.v1 - uv.v0) * static_cast<float>(safeSize) + 0.5f));
-        if (cx + cw <= safeSize && cy + ch <= safeSize) {
-            BakeSdfCellFrom5x7(static_cast<char>(cp), cx, cy, cw, ch, safeSize, outRgba8);
-        }
-    }
-
-    // Populate rows 6..7 generic CJK/Unicode hashed glyph fallback slots with a clean geometric glyph
-    for (std::uint32_t slot = 0; slot < 32u; ++slot) {
-        const std::uint32_t col = slot & 0x0Fu;
-        const std::uint32_t row = 6u + ((slot >> 4u) & 0x01u);
-        const auto cx = static_cast<std::uint32_t>(static_cast<float>(col) * 0.0625f * static_cast<float>(safeSize));
-        const auto cy = static_cast<std::uint32_t>(static_cast<float>(row) * 0.0625f * static_cast<float>(safeSize));
-        const auto cw = std::max<std::uint32_t>(4u, static_cast<std::uint32_t>(0.058f * static_cast<float>(safeSize)));
-        const auto ch = cw;
-        if (cx + cw <= safeSize && cy + ch <= safeSize) {
-            BakeSdfCellFrom5x7('#', cx, cy, cw, ch, safeSize, outRgba8);
-        }
-    }
-
-    // P1-3: Bake registered LinearGradientBrush / RadialGradientBrush 1D LUT rows + float32 descriptor rows
-    // into bottom half of the UI atlas so GL3.3 / WebGL2 / WGSL UberShaders sample multi-stop gradients in O(1).
-    const std::size_t brushCount = GradientBrushRegistry::Instance().BrushCount();
-    const std::uint32_t minAllowedRow = safeSize / 2u;
-    auto writeFloatTexel = [&](std::uint32_t tx, std::uint32_t ty, float val) noexcept {
-        if (tx >= safeSize || ty >= safeSize) {
-            return;
-        }
-        std::uint32_t bits = 0u;
-        std::memcpy(&bits, &val, sizeof(float));
-        const std::size_t off = (static_cast<std::size_t>(ty) * safeSize + tx) * 4u;
-        outRgba8[off + 0u] = static_cast<std::uint8_t>(bits & 0xFFu);
-        outRgba8[off + 1u] = static_cast<std::uint8_t>((bits >> 8u) & 0xFFu);
-        outRgba8[off + 2u] = static_cast<std::uint8_t>((bits >> 16u) & 0xFFu);
-        outRgba8[off + 3u] = static_cast<std::uint8_t>((bits >> 24u) & 0xFFu);
-    };
-
-    for (std::size_t idx = 0; idx < brushCount; ++idx) {
-        const auto brushId = static_cast<std::uint32_t>(idx + 1u);
-        if (safeSize < 4u + static_cast<std::uint32_t>(idx * 2u)) {
-            break;
-        }
-        const std::uint32_t rampRow = safeSize - 2u - static_cast<std::uint32_t>(idx * 2u);
-        if (rampRow == 0u || rampRow - 1u < minAllowedRow) {
-            break;
-        }
-        const std::uint32_t metaRow = rampRow - 1u;
-        const GradientBrushDesc* brush = GradientBrushRegistry::Instance().Find(brushId);
-        if (!brush) {
-            continue;
-        }
-
-        const std::uint32_t rampWidth = std::min<std::uint32_t>(safeSize, GradientBrushDesc::kLutWidth);
-        if (rampWidth == GradientBrushDesc::kLutWidth) {
-            std::memcpy(
-                outRgba8.data() + static_cast<std::size_t>(rampRow) * safeSize * 4u,
-                brush->bakedRampRgba8.data(),
-                GradientBrushDesc::kLutWidth * 4u);
-        } else if (rampWidth > 1u) {
-            for (std::uint32_t x = 0; x < rampWidth; ++x) {
-                const float t = static_cast<float>(x) / static_cast<float>(rampWidth - 1u);
-                const Color c = SampleGradientRampAtT(*brush, t);
-                const std::uint32_t packed = PackColorRgba8(c, 1.0f);
-                const std::size_t off = (static_cast<std::size_t>(rampRow) * safeSize + x) * 4u;
-                outRgba8[off + 0u] = static_cast<std::uint8_t>(packed & 0xFFu);
-                outRgba8[off + 1u] = static_cast<std::uint8_t>((packed >> 8u) & 0xFFu);
-                outRgba8[off + 2u] = static_cast<std::uint8_t>((packed >> 16u) & 0xFFu);
-                outRgba8[off + 3u] = static_cast<std::uint8_t>((packed >> 24u) & 0xFFu);
-            }
-        }
-
-        const std::size_t m0Off = static_cast<std::size_t>(metaRow) * safeSize * 4u;
-        outRgba8[m0Off + 0u] = static_cast<std::uint8_t>(brush->kind);
-        outRgba8[m0Off + 1u] = static_cast<std::uint8_t>(brush->mappingMode);
-        outRgba8[m0Off + 2u] = static_cast<std::uint8_t>(brush->spreadMethod);
-        outRgba8[m0Off + 3u] = static_cast<std::uint8_t>(
-            std::clamp(brush->opacity, 0.0f, 1.0f) * 255.0f + 0.5f);
-
-        if (brush->kind == GradientBrushKind::Linear) {
-            writeFloatTexel(1u, metaRow, brush->startPoint.x);
-            writeFloatTexel(2u, metaRow, brush->startPoint.y);
-            writeFloatTexel(3u, metaRow, brush->endPoint.x);
-            writeFloatTexel(4u, metaRow, brush->endPoint.y);
-        } else {
-            writeFloatTexel(1u, metaRow, brush->center.x);
-            writeFloatTexel(2u, metaRow, brush->center.y);
-            writeFloatTexel(3u, metaRow, brush->gradientOrigin.x);
-            writeFloatTexel(4u, metaRow, brush->gradientOrigin.y);
-        }
-        writeFloatTexel(5u, metaRow, brush->radiusX);
-        writeFloatTexel(6u, metaRow, brush->radiusY);
-    }
+    BakeProceduralGlyphHalf(referenceTree, safeSize, outRgba8);
+    BakeGradientRowsIntoBuffer(
+        safeSize,
+        0u,
+        safeSize,
+        safeSize / 2u,
+        outRgba8.data(),
+        nullptr);
 }
 
 GlDynamicProbeResult ProbeOpenGlDynamicLibrary() noexcept {
@@ -507,7 +601,7 @@ GlDynamicProbeResult ProbeOpenGlDynamicLibrary() noexcept {
     res.coreEntryPointsFound = (res.resolvedSymbolCount >= 20u);
 
     if (res.hasCurrentContext && glHandle) {
-        const std::uint8_t* (*glGetStr)(AeroGLenum) = nullptr;
+        const std::uint8_t* (AERO_GL_APIENTRY *glGetStr)(AeroGLenum) = nullptr;
         AssignRawProc(glGetStr, dlsym(glHandle, "glGetString"));
         if (glGetStr) {
             if (const auto* v = glGetStr(kGlVersion)) {
@@ -591,7 +685,12 @@ bool WriteRgba8ToBmp(
     std::uint32_t width,
     std::uint32_t height,
     const std::uint8_t* rgba8Pixels) noexcept {
-    if (filePath.empty() || width == 0u || height == 0u || !rgba8Pixels) {
+    if (filePath.empty() || width == 0u || height == 0u || !rgba8Pixels || height > 0x7FFFFFFFu) {
+        return false;
+    }
+    const std::uint64_t pixelBytes64 =
+        static_cast<std::uint64_t>(width) * static_cast<std::uint64_t>(height) * 4ULL;
+    if (pixelBytes64 > (0xFFFFFFFFULL - 54ULL)) {
         return false;
     }
     const std::string pathStr(filePath);
@@ -600,7 +699,7 @@ bool WriteRgba8ToBmp(
         return false;
     }
 
-    const std::uint32_t pixelDataBytes = width * height * 4u;
+    const auto pixelDataBytes = static_cast<std::uint32_t>(pixelBytes64);
     const std::uint32_t fileSize = 54u + pixelDataBytes;
 
     std::uint8_t bmpHeader[54]{};
@@ -1015,8 +1114,15 @@ bool OpenGlDeviceBackend::Initialize(const GpuBackendConfig& config) {
 
     if (config.autoBuildDefaultAtlas) {
         PagedRenderTree refTree;
+        const std::uint64_t fontRev = FontAtlas::Instance().Revision();
+        const std::uint32_t gradRev = GradientBrushRegistry::Instance().Revision();
+        std::uint32_t lowestGradRow = kUnifiedUiAtlasSize - 1u;
         std::vector<std::uint8_t> defaultAtlas;
-        BuildDefaultUiAtlasRgba8(refTree, config.defaultAtlasSize, defaultAtlas);
+        if (config.defaultAtlasSize == kUnifiedUiAtlasSize) {
+            BuildUnifiedUiAtlas1024(refTree, defaultAtlas, &lowestGradRow);
+        } else {
+            BuildDefaultUiAtlasRgba8(refTree, config.defaultAtlasSize, defaultAtlas);
+        }
         if (!UploadAtlasTexture(
                 config.defaultAtlasSize,
                 config.defaultAtlasSize,
@@ -1024,7 +1130,18 @@ bool OpenGlDeviceBackend::Initialize(const GpuBackendConfig& config) {
             Shutdown();
             return false;
         }
+        if (config.defaultAtlasSize == kUnifiedUiAtlasSize) {
+            syncedUiAtlasReady_ = true;
+            syncedFontRevision_ = fontRev;
+            syncedMtsdfOwnerId_ = refTree.MtsdfAtlasOwnerId();
+            syncedMtsdfRevision_ = refTree.MtsdfAtlasRevision();
+            syncedMtsdfRows_ = 0u;
+            syncedGradientRevision_ = gradRev;
+            syncedMinGradRow_ = lowestGradRow;
+        }
     }
+
+    (void)EnsureFallbackWhiteTexture();
 
     lastViewportWidth_ = config.initialViewportWidth;
     lastViewportHeight_ = config.initialViewportHeight;
@@ -1035,6 +1152,14 @@ bool OpenGlDeviceBackend::Initialize(const GpuBackendConfig& config) {
 
 void OpenGlDeviceBackend::Shutdown() noexcept {
     if (gl_.IsComplete()) {
+        for (const GlImageSlotState& slot : imageSlotTextures_) {
+            if (slot.texId != 0u) {
+                gl_.DeleteTextures(1, &slot.texId);
+            }
+        }
+        if (fallbackWhiteTexId_ != 0u) {
+            gl_.DeleteTextures(1, &fallbackWhiteTexId_);
+        }
         if (atlasTextureId_ != 0u) {
             gl_.DeleteTextures(1, &atlasTextureId_);
         }
@@ -1053,6 +1178,7 @@ void OpenGlDeviceBackend::Shutdown() noexcept {
     }
 
     atlasTextureId_ = 0u;
+    fallbackWhiteTexId_ = 0u;
     quadEboId_ = 0u;
     ringVboId_ = 0u;
     vaoId_ = 0u;
@@ -1060,11 +1186,22 @@ void OpenGlDeviceBackend::Shutdown() noexcept {
     uViewportSizeLoc_ = -1;
     uQuadHalfExtentLoc_ = -1;
     uAtlasSamplerLoc_ = -1;
+    uImageSamplerLoc_ = -1;
     maxPagesInRing_ = 0u;
     ringBufferBytes_ = 0u;
     quadCapacity_ = 0u;
     atlasWidth_ = 0u;
     atlasHeight_ = 0u;
+    syncedUiAtlasReady_ = false;
+    syncedFontRevision_ = 0u;
+    syncedMtsdfOwnerId_ = 0u;
+    syncedMtsdfRevision_ = 0u;
+    syncedMtsdfRows_ = 0u;
+    syncedGradientRevision_ = 0u;
+    syncedMinGradRow_ = kUnifiedUiAtlasSize - 1u;
+    imageSlotTextures_.clear();
+    uiAtlasScratchRgba8_.clear();
+    imageUploadScratchRgba8_.clear();
     quadIndexMirror_.clear();
     initialized_ = false;
 
@@ -1178,6 +1315,14 @@ bool OpenGlDeviceBackend::CompileAndLinkUberShader(
     uViewportSizeLoc_ = gl_.GetUniformLocation(programId_, "u_ViewportSize");
     uQuadHalfExtentLoc_ = gl_.GetUniformLocation(programId_, "u_QuadHalfExtent");
     uAtlasSamplerLoc_ = gl_.GetUniformLocation(programId_, "u_GlyphAndUiAtlas");
+    uImageSamplerLoc_ = gl_.GetUniformLocation(programId_, "u_ImageAtlas");
+    gl_.UseProgram(programId_);
+    if (uAtlasSamplerLoc_ >= 0) {
+        gl_.Uniform1i(uAtlasSamplerLoc_, 0);
+    }
+    if (uImageSamplerLoc_ >= 0) {
+        gl_.Uniform1i(uImageSamplerLoc_, 1);
+    }
     diagnostics_ = "UberShader compiled and linked cleanly.";
     return true;
 }
@@ -1218,6 +1363,7 @@ bool OpenGlDeviceBackend::UploadAtlasTexture(
 
     atlasWidth_ = width;
     atlasHeight_ = height;
+    syncedUiAtlasReady_ = false;
     telemetry_.atlasUploadCount += 1u;
     return true;
 }
@@ -1269,11 +1415,12 @@ bool OpenGlDeviceBackend::AllocateRingVertexBuffer(std::size_t maxPagesInRing) {
     if (vaoId_ != 0u) {
         gl_.BindVertexArray(vaoId_);
     }
+    std::vector<std::uint8_t> zeroInit(ringBufferBytes_, 0u);
     gl_.BindBuffer(kGlArrayBuffer, ringVboId_);
     gl_.BufferData(
         kGlArrayBuffer,
         static_cast<AeroGLsizeiptr>(ringBufferBytes_),
-        nullptr,
+        zeroInit.data(),
         kGlDynamicDraw);
 
     if (vaoId_ != 0u && quadEboId_ != 0u) {
@@ -1349,8 +1496,244 @@ void OpenGlDeviceBackend::BindAeroVertexLayout() noexcept {
     gl_.VertexAttribIPointer(3u, 1, kGlUnsignedInt, kStride, reinterpret_cast<const void*>(std::uintptr_t{20}));
 }
 
+void OpenGlDeviceBackend::SyncUnifiedUiAtlas(const PagedRenderTree& tree) {
+    if (!gl_.IsComplete()) {
+        return;
+    }
+
+    if (!syncedUiAtlasReady_ ||
+        atlasTextureId_ == 0u ||
+        atlasWidth_ != kUnifiedUiAtlasSize ||
+        atlasHeight_ != kUnifiedUiAtlasSize) {
+        const std::uint64_t fontRev = FontAtlas::Instance().Revision();
+        const std::uint32_t gradRev = GradientBrushRegistry::Instance().Revision();
+        std::uint32_t lowestGradRow = kUnifiedUiAtlasSize - 1u;
+        BuildUnifiedUiAtlas1024(tree, uiAtlasScratchRgba8_, &lowestGradRow);
+        if (UploadAtlasTexture(kUnifiedUiAtlasSize, kUnifiedUiAtlasSize, uiAtlasScratchRgba8_.data())) {
+            syncedUiAtlasReady_ = true;
+            syncedFontRevision_ = fontRev;
+            syncedMtsdfOwnerId_ = tree.MtsdfAtlasOwnerId();
+            syncedMtsdfRevision_ = tree.MtsdfAtlasRevision();
+            syncedMtsdfRows_ = std::min<std::uint32_t>(448u, tree.MtsdfAtlasPopulatedRows());
+            syncedGradientRevision_ = gradRev;
+            syncedMinGradRow_ = lowestGradRow;
+        }
+        return;
+    }
+
+    // 1. Incremental FontAtlas SDF glyph band sync [y: 0..511]
+    const std::uint64_t curFontRev = FontAtlas::Instance().Revision();
+    if (curFontRev != syncedFontRevision_) {
+        std::uint32_t fontW = 0u;
+        std::uint32_t fontRows = 0u;
+        std::uint64_t snapRev = curFontRev;
+        FontAtlas::Instance().CopyGlyphRegionRgba8(512u, uiAtlasScratchRgba8_, fontW, fontRows, &snapRev);
+        if (fontW == kUnifiedUiAtlasSize && fontRows > 0u) {
+            (void)UpdateAtlasSubRegion(
+                0u,
+                0u,
+                fontW,
+                std::min<std::uint32_t>(512u, fontRows),
+                uiAtlasScratchRgba8_.data());
+        }
+        syncedFontRevision_ = snapRev;
+    }
+
+    // 2. Incremental MTSDF vector path band sync [y: 512..959]
+    const std::uint32_t curMtsdfOwner = tree.MtsdfAtlasOwnerId();
+    const std::uint64_t curMtsdfRev = tree.MtsdfAtlasRevision();
+    const std::uint32_t newMtsdfRows = std::min<std::uint32_t>(448u, tree.MtsdfAtlasPopulatedRows());
+    if (curMtsdfOwner != syncedMtsdfOwnerId_ || curMtsdfRev != syncedMtsdfRevision_) {
+        const std::uint32_t dirtyRows = std::min<std::uint32_t>(448u, std::max(newMtsdfRows, syncedMtsdfRows_));
+        if (dirtyRows > 0u) {
+            const auto& mtsdfBuf = tree.MtsdfAtlasRgba8();
+            const std::size_t neededBytes = static_cast<std::size_t>(dirtyRows) * kUnifiedUiAtlasSize * 4u;
+            if (mtsdfBuf.size() >= neededBytes) {
+                (void)UpdateAtlasSubRegion(0u, 512u, kUnifiedUiAtlasSize, dirtyRows, mtsdfBuf.data());
+            } else {
+                uiAtlasScratchRgba8_.assign(neededBytes, 0u);
+                if (!mtsdfBuf.empty()) {
+                    std::memcpy(
+                        uiAtlasScratchRgba8_.data(),
+                        mtsdfBuf.data(),
+                        std::min(neededBytes, mtsdfBuf.size()));
+                }
+                (void)UpdateAtlasSubRegion(
+                    0u,
+                    512u,
+                    kUnifiedUiAtlasSize,
+                    dirtyRows,
+                    uiAtlasScratchRgba8_.data());
+            }
+        }
+        syncedMtsdfOwnerId_ = curMtsdfOwner;
+        syncedMtsdfRevision_ = curMtsdfRev;
+        syncedMtsdfRows_ = newMtsdfRows;
+    }
+
+    // 3. Incremental GradientBrushRegistry LUT & float32 metadata band sync [y: minAllowedRow..1023]
+    const std::uint32_t curGradRev = GradientBrushRegistry::Instance().Revision();
+    if (curGradRev != syncedGradientRevision_) {
+        const std::uint32_t minAllowedRow = 512u + syncedMtsdfRows_;
+        const std::size_t brushCount = GradientBrushRegistry::Instance().BrushCount();
+        std::uint32_t estMinRow = kUnifiedUiAtlasSize - 1u;
+        if (brushCount > 0u) {
+            const std::uint32_t maxFitBrushes =
+                (kUnifiedUiAtlasSize - 2u > minAllowedRow)
+                    ? ((kUnifiedUiAtlasSize - 1u - minAllowedRow) / 2u)
+                    : 0u;
+            const std::uint32_t applied = static_cast<std::uint32_t>(
+                std::min<std::size_t>(brushCount, maxFitBrushes));
+            if (applied > 0u) {
+                estMinRow = (kUnifiedUiAtlasSize - 2u - (applied - 1u) * 2u) - 1u;
+            }
+        }
+        const std::uint32_t subStartY = std::max(minAllowedRow, std::min(estMinRow, syncedMinGradRow_));
+        const std::uint32_t subRows = kUnifiedUiAtlasSize - subStartY;
+        uiAtlasScratchRgba8_.assign(static_cast<std::size_t>(subRows) * kUnifiedUiAtlasSize * 4u, 0u);
+        std::uint32_t newLowestRow = kUnifiedUiAtlasSize - 1u;
+        BakeGradientRowsIntoBuffer(
+            kUnifiedUiAtlasSize,
+            subStartY,
+            subRows,
+            minAllowedRow,
+            uiAtlasScratchRgba8_.data(),
+            &newLowestRow);
+        (void)UpdateAtlasSubRegion(0u, subStartY, kUnifiedUiAtlasSize, subRows, uiAtlasScratchRgba8_.data());
+        syncedMinGradRow_ = newLowestRow;
+        syncedGradientRevision_ = curGradRev;
+    }
+}
+
+AeroGLuint OpenGlDeviceBackend::EnsureFallbackWhiteTexture() {
+    if (fallbackWhiteTexId_ != 0u || !gl_.IsComplete()) {
+        return fallbackWhiteTexId_;
+    }
+    gl_.GenTextures(1, &fallbackWhiteTexId_);
+    if (fallbackWhiteTexId_ == 0u) {
+        return atlasTextureId_;
+    }
+    constexpr std::uint8_t kWhitePixel[4]{255u, 255u, 255u, 255u};
+    gl_.ActiveTexture(kGlTexture1);
+    gl_.BindTexture(kGlTexture2D, fallbackWhiteTexId_);
+    gl_.PixelStorei(kGlUnpackAlignment, 1);
+    gl_.TexParameteri(kGlTexture2D, kGlTextureMinFilter, static_cast<AeroGLint>(kGlLinear));
+    gl_.TexParameteri(kGlTexture2D, kGlTextureMagFilter, static_cast<AeroGLint>(kGlLinear));
+    gl_.TexParameteri(kGlTexture2D, kGlTextureWrapS, static_cast<AeroGLint>(kGlClampToEdge));
+    gl_.TexParameteri(kGlTexture2D, kGlTextureWrapT, static_cast<AeroGLint>(kGlClampToEdge));
+    gl_.TexImage2D(
+        kGlTexture2D,
+        0,
+        static_cast<AeroGLint>(kGlRgba8),
+        1,
+        1,
+        0,
+        kGlRgba,
+        kGlUnsignedByte,
+        kWhitePixel);
+    gl_.ActiveTexture(kGlTexture0);
+    return fallbackWhiteTexId_;
+}
+
+AeroGLuint OpenGlDeviceBackend::ResolveBatchImageTexture(std::uint32_t textureId) {
+    const AeroGLuint fallbackTex = EnsureFallbackWhiteTexture();
+    if (!gl_.IsComplete() || textureId > 16384u) {
+        return fallbackTex != 0u ? fallbackTex : atlasTextureId_;
+    }
+
+    const std::uint64_t globalRev = ImageAtlas::Instance().Revision();
+    if (textureId < imageSlotTextures_.size()) {
+        const GlImageSlotState& cached = imageSlotTextures_[textureId];
+        if (cached.texId != 0u && cached.lastGlobalRevision == globalRev) {
+            return cached.texId;
+        }
+    }
+
+    if (!ImageAtlas::Instance().HasTextureSlot(textureId)) {
+        return fallbackTex != 0u ? fallbackTex : atlasTextureId_;
+    }
+
+    if (textureId >= imageSlotTextures_.size()) {
+        imageSlotTextures_.resize(static_cast<std::size_t>(textureId) + 1u);
+    }
+    GlImageSlotState& slot = imageSlotTextures_[textureId];
+    std::uint32_t slotW = 0u;
+    std::uint32_t slotH = 0u;
+    bool wasUpdated = false;
+    if (!ImageAtlas::Instance().CopyTextureSlotIfModified(
+            textureId,
+            slot.slotRevision,
+            slotW,
+            slotH,
+            imageUploadScratchRgba8_,
+            wasUpdated) ||
+        slotW == 0u ||
+        slotH == 0u) {
+        return fallbackTex != 0u ? fallbackTex : atlasTextureId_;
+    }
+
+    slot.lastGlobalRevision = globalRev;
+    const bool needsAlloc = (slot.texId == 0u) || (slot.width != slotW) || (slot.height != slotH);
+    if (needsAlloc && !wasUpdated) {
+        // Re-fetch full pixel buffer if GL texture handle was recreated after Shutdown/Initialize
+        slot.slotRevision = 0u;
+        if (!ImageAtlas::Instance().CopyTextureSlotIfModified(
+                textureId,
+                slot.slotRevision,
+                slotW,
+                slotH,
+                imageUploadScratchRgba8_,
+                wasUpdated)) {
+            return fallbackTex != 0u ? fallbackTex : atlasTextureId_;
+        }
+    }
+
+    if (needsAlloc || wasUpdated) {
+        if (slot.texId == 0u) {
+            gl_.GenTextures(1, &slot.texId);
+            if (slot.texId == 0u) {
+                return fallbackTex != 0u ? fallbackTex : atlasTextureId_;
+            }
+        }
+        gl_.ActiveTexture(kGlTexture1);
+        gl_.BindTexture(kGlTexture2D, slot.texId);
+        gl_.PixelStorei(kGlUnpackAlignment, 1);
+        if (needsAlloc) {
+            gl_.TexParameteri(kGlTexture2D, kGlTextureMinFilter, static_cast<AeroGLint>(kGlLinear));
+            gl_.TexParameteri(kGlTexture2D, kGlTextureMagFilter, static_cast<AeroGLint>(kGlLinear));
+            gl_.TexParameteri(kGlTexture2D, kGlTextureWrapS, static_cast<AeroGLint>(kGlClampToEdge));
+            gl_.TexParameteri(kGlTexture2D, kGlTextureWrapT, static_cast<AeroGLint>(kGlClampToEdge));
+            gl_.TexImage2D(
+                kGlTexture2D,
+                0,
+                static_cast<AeroGLint>(kGlRgba8),
+                static_cast<AeroGLsizei>(slotW),
+                static_cast<AeroGLsizei>(slotH),
+                0,
+                kGlRgba,
+                kGlUnsignedByte,
+                imageUploadScratchRgba8_.data());
+            slot.width = slotW;
+            slot.height = slotH;
+        } else {
+            gl_.TexSubImage2D(
+                kGlTexture2D,
+                0,
+                0,
+                0,
+                static_cast<AeroGLsizei>(slotW),
+                static_cast<AeroGLsizei>(slotH),
+                kGlRgba,
+                kGlUnsignedByte,
+                imageUploadScratchRgba8_.data());
+        }
+    }
+
+    return slot.texId;
+}
+
 GpuBackendFrameStats OpenGlDeviceBackend::ExecuteSubmission(
-    const PagedRenderTree& /*tree*/,
+    const PagedRenderTree& tree,
     const std::vector<GlBufferSubDataSpan>& uploadSpans,
     const std::vector<GpuClipDrawBatch>& drawBatches,
     std::size_t ringPageCapacity,
@@ -1362,10 +1745,17 @@ GpuBackendFrameStats OpenGlDeviceBackend::ExecuteSubmission(
         return stats;
     }
 
-    if (ringPageCapacity > maxPagesInRing_) {
-        if (!AllocateRingVertexBuffer(ringPageCapacity)) {
+    const std::size_t targetRingPages = std::max(ringPageCapacity, tree.PageCount());
+    bool ringReallocated = false;
+    if (targetRingPages > maxPagesInRing_) {
+        std::size_t nextRingPages = std::max<std::size_t>(16u, maxPagesInRing_);
+        while (nextRingPages < targetRingPages) {
+            nextRingPages *= 2u;
+        }
+        if (!AllocateRingVertexBuffer(nextRingPages)) {
             return stats;
         }
+        ringReallocated = true;
     }
 
     const std::size_t effRingPages = std::max<std::size_t>(1u, maxPagesInRing_);
@@ -1373,6 +1763,11 @@ GpuBackendFrameStats OpenGlDeviceBackend::ExecuteSubmission(
     lastViewportHeight_ = viewportHeight;
 
     // 1. Stream dirty 4KB CommandPage vertex spans into the Ring VBO via glBufferSubData
+    std::vector<std::uint8_t> uploadedSlots;
+    if (ringReallocated) {
+        uploadedSlots.assign(effRingPages, 0u);
+    }
+
     gl_.BindVertexArray(vaoId_);
     gl_.BindBuffer(kGlArrayBuffer, ringVboId_);
     for (const GlBufferSubDataSpan& span : uploadSpans) {
@@ -1403,8 +1798,40 @@ GpuBackendFrameStats OpenGlDeviceBackend::ExecuteSubmission(
                 static_cast<AeroGLsizeiptr>(clampedBytes),
                 span.sourcePageVertexPtr);
         }
+        if (ringReallocated && slotIdx < uploadedSlots.size()) {
+            uploadedSlots[slotIdx] = 1u;
+        }
         stats.dirtySpansUploaded += 1u;
         stats.bytesUploaded += clampedBytes;
+    }
+
+    // If Ring VBO expanded this frame, re-upload any clean active pages from tree not already in uploadSpans
+    if (ringReallocated) {
+        const std::size_t treePages = tree.PageCount();
+        for (std::size_t p = 0; p < treePages; ++p) {
+            const std::size_t slotIdx = p % effRingPages;
+            if (slotIdx < uploadedSlots.size() && uploadedSlots[slotIdx] != 0u) {
+                continue;
+            }
+            const CommandPage& page = tree.GetPage(p);
+            const std::size_t activeVerts = std::min<std::size_t>(
+                page.header.vertexCount,
+                kVerticesPerCommandPage);
+            if (activeVerts == 0u) {
+                continue;
+            }
+            const std::size_t activeBytes = activeVerts * sizeof(AeroVertex);
+            const std::size_t dstOffset = slotIdx * kPageVertexBytes;
+            if (dstOffset + activeBytes <= ringBufferBytes_) {
+                gl_.BufferSubData(
+                    kGlArrayBuffer,
+                    static_cast<AeroGLintptr>(dstOffset),
+                    static_cast<AeroGLsizeiptr>(activeBytes),
+                    page.vertices.data());
+                stats.dirtySpansUploaded += 1u;
+                stats.bytesUploaded += activeBytes;
+            }
+        }
     }
 
     // 2. Ensure Static Quad Index Buffer (0,1,2, 0,2,3 ...) covers every batch's highest quad index
@@ -1419,7 +1846,9 @@ GpuBackendFrameStats OpenGlDeviceBackend::ExecuteSubmission(
     }
     stats.quadEboExpanded = (telemetry_.quadEboExpansionCount > expansionsBefore);
 
-    // 3. Configure viewport, clear target, pipeline state, and UberShader uniforms
+    // 3. Synchronize Unit 0 (1024x1024 Glyph/MTSDF/Gradient UI Atlas) & Unit 1 (ImageAtlas sprites/standalone slots)
+    SyncUnifiedUiAtlas(tree);
+
     gl_.Viewport(0, 0, static_cast<AeroGLsizei>(viewportWidth), static_cast<AeroGLsizei>(viewportHeight));
     gl_.Disable(kGlDepthTest);
     gl_.Disable(kGlCullFace);
@@ -1428,7 +1857,7 @@ GpuBackendFrameStats OpenGlDeviceBackend::ExecuteSubmission(
     gl_.Clear(kGlColorBufferBit);
 
     gl_.Enable(kGlBlend);
-    gl_.BlendFuncSeparate(kGlSrcAlpha, kGlOneMinusSrcAlpha, kGlOne, kGlOneMinusSrcAlpha);
+    gl_.BlendFuncSeparate(kGlOne, kGlOneMinusSrcAlpha, kGlOne, kGlOneMinusSrcAlpha);
 
     gl_.UseProgram(programId_);
     if (uViewportSizeLoc_ >= 0) {
@@ -1448,7 +1877,16 @@ GpuBackendFrameStats OpenGlDeviceBackend::ExecuteSubmission(
         }
     }
 
+    std::uint32_t boundBatchTextureId = 0u;
+    AeroGLuint boundUnit1Tex = ResolveBatchImageTexture(0u);
+    gl_.ActiveTexture(kGlTexture1);
+    gl_.BindTexture(kGlTexture2D, boundUnit1Tex);
+    if (uImageSamplerLoc_ >= 0) {
+        gl_.Uniform1i(uImageSamplerLoc_, 1);
+    }
+
     // 4. Issue indexed GL_TRIANGLES draw calls over coalesced GpuClipDrawBatches
+    gl_.BindVertexArray(vaoId_);
     gl_.BindBuffer(kGlElementArrayBuffer, quadEboId_);
     bool scissorCurrentlyEnabled = false;
 
@@ -1458,6 +1896,16 @@ GpuBackendFrameStats OpenGlDeviceBackend::ExecuteSubmission(
             continue;
         }
         stats.clipBatchesProcessed += 1u;
+
+        if (batch.textureId != boundBatchTextureId) {
+            const AeroGLuint nextTex = ResolveBatchImageTexture(batch.textureId);
+            if (nextTex != boundUnit1Tex) {
+                gl_.ActiveTexture(kGlTexture1);
+                gl_.BindTexture(kGlTexture2D, nextTex);
+                boundUnit1Tex = nextTex;
+            }
+            boundBatchTextureId = batch.textureId;
+        }
 
         if (batch.scissorActive) {
             if (!scissorCurrentlyEnabled) {
@@ -1498,6 +1946,7 @@ GpuBackendFrameStats OpenGlDeviceBackend::ExecuteSubmission(
     if (scissorCurrentlyEnabled) {
         gl_.Disable(kGlScissorTest);
     }
+    gl_.ActiveTexture(kGlTexture0);
 
     telemetry_.framesPresented += 1u;
     stats.frameIndex = telemetry_.framesPresented;
@@ -1581,6 +2030,8 @@ bool SoftwareSurfaceBackend::Initialize(const GpuBackendConfig& config) {
 
     framebufferWidth_ = config.initialViewportWidth;
     framebufferHeight_ = config.initialViewportHeight;
+    lastRenderedTreeId_ = 0xFFFFFFFFu;
+    lastRenderedNodeCount_ = 0u;
     initialized_ = true;
     diagnostics_ = "SoftwareSurfaceBackend initialized (CPU RGBA8 UberShader fallback active).";
     return true;
@@ -1595,7 +2046,8 @@ void SoftwareSurfaceBackend::Shutdown() noexcept {
     atlasHeight_ = 0u;
     framebufferWidth_ = 0u;
     framebufferHeight_ = 0u;
-    lastRenderedTreeId_ = 0u;
+    lastRenderedTreeId_ = 0xFFFFFFFFu;
+    lastRenderedNodeCount_ = 0u;
     ringMirrorBytes_.clear();
     quadIndexMirror_.clear();
     atlasRgba8_.clear();
@@ -1702,8 +2154,13 @@ GpuBackendFrameStats SoftwareSurfaceBackend::ExecuteSubmission(
         return stats;
     }
 
-    if (ringPageCapacity > maxPagesInRing_) {
-        (void)AllocateRingVertexBuffer(ringPageCapacity);
+    const std::size_t targetRingPages = std::max(ringPageCapacity, tree.PageCount());
+    if (targetRingPages > maxPagesInRing_) {
+        std::size_t nextRingPages = std::max<std::size_t>(16u, maxPagesInRing_);
+        while (nextRingPages < targetRingPages) {
+            nextRingPages *= 2u;
+        }
+        (void)AllocateRingVertexBuffer(nextRingPages);
     }
     const std::size_t effRingPages = std::max<std::size_t>(1u, maxPagesInRing_);
 
@@ -1757,8 +2214,14 @@ GpuBackendFrameStats SoftwareSurfaceBackend::ExecuteSubmission(
         (framebufferRgba8_.size() != static_cast<std::size_t>(viewportWidth) * viewportHeight * 4u);
     const bool clearChanged = !(lastClearColor_ == clearColor);
     const bool treeChanged = (lastRenderedTreeId_ != tree.TreeId());
+    const bool clearedToEmpty = (tree.NodeCount() == 0u && lastRenderedNodeCount_ > 0u);
 
-    if (stats.dirtySpansUploaded > 0u || viewportChanged || clearChanged || treeChanged || framebufferRgba8_.empty()) {
+    if (stats.dirtySpansUploaded > 0u ||
+        viewportChanged ||
+        clearChanged ||
+        treeChanged ||
+        clearedToEmpty ||
+        framebufferRgba8_.empty()) {
         ZeroCopyGpuStream::RasterizeTreeToRgba8(
             tree,
             viewportWidth,
@@ -1769,6 +2232,7 @@ GpuBackendFrameStats SoftwareSurfaceBackend::ExecuteSubmission(
         framebufferHeight_ = viewportHeight;
         lastClearColor_ = clearColor;
         lastRenderedTreeId_ = tree.TreeId();
+        lastRenderedNodeCount_ = tree.NodeCount();
     }
 
     telemetry_.framesPresented += 1u;

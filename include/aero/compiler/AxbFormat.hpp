@@ -60,7 +60,6 @@ enum AxbResourceLookupFlags : std::uint8_t {
     AxbResourceFlag_StaticResource = 0x00u,
     AxbResourceFlag_DynamicResource = 0x02u,
     AxbResourceFlag_Loc = 0x04u,
-    BindMultiProperty = 11,
 };
 
 // ============================================================================

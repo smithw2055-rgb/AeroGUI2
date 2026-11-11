@@ -75,6 +75,7 @@ public:
     explicit AnimationEngine(std::size_t initialReservedTracks = 64u);
     ~AnimationEngine() noexcept;
 
+    [[nodiscard]] static bool IsLiveInstance(const AnimationEngine* engine) noexcept;
     void Clear();
     void MarkValuesInPools() const noexcept;
     void SetWakeHostCallback(std::function<void()> callback) { wakeHostCallback_ = std::move(callback); }
@@ -224,7 +225,7 @@ public:
 
     [[nodiscard]] std::size_t ActiveTrackCount() const noexcept { return activeCount_; }
     [[nodiscard]] bool HasActiveAnimations() const noexcept {
-        return activeCount_ > 0u || ActiveStateMachineCount() > 0u;
+        return (activeCount_ > pausedCount_) || ActiveStateMachineCount() > 0u;
     }
     [[nodiscard]] float GetTrackVelocityX(std::uint16_t trackId) const noexcept;
     [[nodiscard]] std::uint16_t FindActiveTrackId(
@@ -354,6 +355,7 @@ private:
     std::vector<AnimationTrack> tracks_;
     std::vector<std::uint16_t> freeTrackIds_;
     std::size_t activeCount_ = 0u;
+    std::size_t pausedCount_ = 0u;
     std::vector<MotionStateMachineInstance> stateMachines_;
     std::function<void()> wakeHostCallback_{};
     std::function<void(const TimelineEventInvocation&)> timelineEventCallback_{};

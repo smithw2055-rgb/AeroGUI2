@@ -480,7 +480,7 @@ struct Matrix4x4 {
         if (outW) {
             *outW = wh;
         }
-        const float safeW = (std::fabs(wh) > 1e-5f) ? wh : (wh >= 0.0f ? 1e-5f : -1e-5f);
+        const float safeW = (std::isfinite(wh) && wh > 1e-3f) ? wh : 1e-3f;
         const float invW = 1.0f / safeW;
         return Point{xh * invW, yh * invW};
     }

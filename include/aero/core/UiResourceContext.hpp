@@ -43,6 +43,7 @@ public:
 
     // Non-null pointer if a ScopedUiResourceContext is currently pushed on this thread, else nullptr
     [[nodiscard]] static UiResourceContext* ActiveOverride() noexcept;
+    [[nodiscard]] static bool HasActiveThreadOverride() noexcept;
 
     // Number of live UiResourceContext instances (excluding or including Default once initialized)
     [[nodiscard]] static std::size_t LiveInstanceCount() noexcept;
@@ -118,7 +119,10 @@ public:
     [[nodiscard]] UiResourceContext* Context() const noexcept { return pushed_; }
 
 private:
+    friend class UiResourceContext;
+
     std::shared_ptr<UiResourceContext> pinned_{};
+    ScopedUiResourceContext* prevFrame_ = nullptr;
     UiResourceContext* previous_ = nullptr;
     UiResourceContext* pushed_ = nullptr;
     bool active_ = false;

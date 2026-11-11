@@ -11,6 +11,32 @@ namespace aero {
 
 namespace {
 
+constexpr std::size_t kMaxImeCommittedHistoryBytes = 4096u;
+
+void AppendBoundedImeCommittedText(std::string& ioHistory, std::string_view committed) {
+    if (committed.empty()) {
+        return;
+    }
+    if (committed.size() >= kMaxImeCommittedHistoryBytes) {
+        std::size_t start = committed.size() - kMaxImeCommittedHistoryBytes;
+        while (start < committed.size() &&
+               (static_cast<std::uint8_t>(committed[start]) & 0xC0u) == 0x80u) {
+            ++start;
+        }
+        ioHistory.assign(committed.substr(start));
+        return;
+    }
+    if (ioHistory.size() + committed.size() > kMaxImeCommittedHistoryBytes) {
+        std::size_t drop = (ioHistory.size() + committed.size()) - kMaxImeCommittedHistoryBytes;
+        while (drop < ioHistory.size() &&
+               (static_cast<std::uint8_t>(ioHistory[drop]) & 0xC0u) == 0x80u) {
+            ++drop;
+        }
+        ioHistory.erase(0u, drop);
+    }
+    ioHistory.append(committed);
+}
+
 AriaShadowNode BuildAriaNodeRecursive(const UIElement* elem) {
     AriaShadowNode node{};
     if (!elem) {
@@ -361,8 +387,15 @@ ZeroCopySubmissionStats DesktopEventHost::RecordGpuCommands(
 
 void DesktopImeAdapter::FocusTextInput(UIElement* focusedElement, Rect caretScreenRect) {
     if (focusedElement_ != focusedElement) {
+        if (isComposing_) {
+            if (auto* prevBox = focusedElement_ ? focusedElement_->DynamicCast<TextBox>() : nullptr) {
+                prevBox->SetText(compositionBaseText_);
+                prevBox->SetCaretIndex(compositionBaseCaret_);
+            }
+        }
         isComposing_ = false;
         preeditText_.clear();
+        committedText_.clear();
         caretOffset_ = 0u;
         if (const auto* tbox = focusedElement ? focusedElement->DynamicCast<TextBox>() : nullptr) {
             compositionBaseText_ = tbox->GetText();
@@ -382,10 +415,17 @@ void DesktopImeAdapter::FocusTextInput(UIElement* focusedElement, Rect caretScre
 }
 
 void DesktopImeAdapter::BlurTextInput() {
+    if (isComposing_) {
+        if (auto* tbox = focusedElement_ ? focusedElement_->DynamicCast<TextBox>() : nullptr) {
+            tbox->SetText(compositionBaseText_);
+            tbox->SetCaretIndex(compositionBaseCaret_);
+        }
+    }
     focusedElement_ = nullptr;
     imeFocused_ = false;
     isComposing_ = false;
     preeditText_.clear();
+    committedText_.clear();
     compositionBaseText_.clear();
     compositionBaseCaret_ = 0u;
     if (spotSyncCallback_) {
@@ -443,7 +483,7 @@ void DesktopImeAdapter::OnCompositionEnd(std::string_view committedText) {
     const bool wasComposing = isComposing_;
     isComposing_ = false;
     preeditText_.clear();
-    committedText_ += std::string(committedText);
+    AppendBoundedImeCommittedText(committedText_, committedText);
     caretOffset_ = 0u;
 
     if (auto* tbox = focusedElement_ ? focusedElement_->DynamicCast<TextBox>() : nullptr) {
@@ -464,6 +504,12 @@ void DesktopImeAdapter::OnCompositionEnd(std::string_view committedText) {
 
 void WebImeAdapter::FocusTextInput(UIElement* focusedElement, Rect caretScreenRect) {
     if (focusedElement_ != focusedElement) {
+        if (isComposing_) {
+            if (auto* prevBox = focusedElement_ ? focusedElement_->DynamicCast<TextBox>() : nullptr) {
+                prevBox->SetText(compositionBaseText_);
+                prevBox->SetCaretIndex(compositionBaseCaret_);
+            }
+        }
         isComposing_ = false;
         preeditText_.clear();
         committedText_.clear();
@@ -483,10 +529,17 @@ void WebImeAdapter::FocusTextInput(UIElement* focusedElement, Rect caretScreenRe
 }
 
 void WebImeAdapter::BlurTextInput() {
+    if (isComposing_) {
+        if (auto* tbox = focusedElement_ ? focusedElement_->DynamicCast<TextBox>() : nullptr) {
+            tbox->SetText(compositionBaseText_);
+            tbox->SetCaretIndex(compositionBaseCaret_);
+        }
+    }
     focusedElement_ = nullptr;
     imeFocused_ = false;
     isComposing_ = false;
     preeditText_.clear();
+    committedText_.clear();
     compositionBaseText_.clear();
     compositionBaseCaret_ = 0u;
 }
@@ -546,7 +599,7 @@ void WebImeAdapter::OnCompositionEnd(std::string_view committedText) {
     const bool wasComposing = isComposing_;
     isComposing_ = false;
     preeditText_.clear();
-    committedText_ += std::string(committedText);
+    AppendBoundedImeCommittedText(committedText_, committedText);
     caretOffset_ = 0;
     if (focusedElement_) {
         if (auto* tbox = focusedElement_->DynamicCast<TextBox>()) {
@@ -756,6 +809,9 @@ bool WebFontStreamProvider::OnShardDataArrived(
             ++reqIt;
         }
     }
+    if (wakeCallback_) {
+        wakeCallback_(wakeUserData_);
+    }
     return true;
 }
 
@@ -782,6 +838,11 @@ WebCanvasHost::WebCanvasHost(
     , resourceContext_(std::move(resourceContext))
     , webBackend_(webBackend) {
     fontStream_.SetResourceContext(resourceContext_);
+    fontStream_.SetWakeCallback(
+        [](void* ud) noexcept {
+            static_cast<WebCanvasHost*>(ud)->RequestWakeFrame();
+        },
+        this);
     wakeRegisteredRegistry_ = resourceContext_
         ? &resourceContext_->Templates()
         : &AxbTemplateRegistry::Instance();
@@ -794,10 +855,21 @@ WebCanvasHost::WebCanvasHost(
 }
 
 WebCanvasHost::~WebCanvasHost() {
+    fontStream_.SetWakeCallback(nullptr, nullptr);
     if (wakeRegisteredRegistry_ && AxbTemplateRegistry::IsLiveRegistry(wakeRegisteredRegistry_)) {
         wakeRegisteredRegistry_->UnregisterHostWakeListener(this);
     }
     wakeRegisteredRegistry_ = nullptr;
+}
+
+bool WebCanvasHost::OnFontShardLoaded(
+    std::uint32_t shardId,
+    const std::vector<std::uint8_t>& shardPayload) {
+    const bool loaded = fontStream_.OnShardDataArrived(shardId, shardPayload, renderTree_);
+    if (loaded) {
+        RequestWakeFrame();
+    }
+    return loaded;
 }
 
 void WebCanvasHost::SetResourceContext(std::shared_ptr<UiResourceContext> context) {
@@ -903,7 +975,7 @@ void WebCanvasHost::TickUi(float dt, std::uint32_t activePhaseMask) {
     }
 
     const bool animStillRunning = animationEngine_ && animationEngine_->HasActiveAnimations();
-    if (changes == 0 && !animStillRunning && !imeAdapter_.IsComposing() && fontStream_.PendingFetchRequests().empty()) {
+    if (changes == 0 && !animStillRunning && !imeAdapter_.IsComposing()) {
         rafState_ = WebRafState::SuspendedIdle;
     }
 }

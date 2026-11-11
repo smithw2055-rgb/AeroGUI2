@@ -455,6 +455,47 @@ void MergeDictionaryPackageInto(
         }
     }
 
+    for (const auto& ct : srcDictPkg.controlTemplates) {
+        bool replaced = false;
+        if (!ct.key.empty()) {
+            for (auto& dstCt : dstPkg.controlTemplates) {
+                if (dstCt.key == ct.key) {
+                    dstCt = ct;
+                    replaced = true;
+                    break;
+                }
+            }
+        } else if (!ct.targetTypeName.empty()) {
+            for (auto& dstCt : dstPkg.controlTemplates) {
+                if (dstCt.key.empty() && dstCt.targetTypeName == ct.targetTypeName) {
+                    dstCt = ct;
+                    replaced = true;
+                    break;
+                }
+            }
+        }
+        if (!replaced) {
+            dstPkg.controlTemplates.push_back(ct);
+        }
+    }
+
+    for (auto& dstSt : dstPkg.styles) {
+        if (dstSt.controlTemplateKey.empty()) {
+            for (const auto& setter : dstSt.setters) {
+                if (setter.propId == PropId_Template) {
+                    if (const auto* sv = std::get_if<StringValue>(&setter.value)) {
+                        dstSt.controlTemplateKey = sv->str();
+                    }
+                }
+            }
+        }
+        if (!dstSt.controlTemplateKey.empty()) {
+            if (const AxbControlTemplate* foundCt = dstPkg.FindControlTemplate(dstSt.controlTemplateKey)) {
+                dstSt.inlineControlTemplate = std::make_shared<AxbControlTemplate>(*foundCt);
+            }
+        }
+    }
+
     for (const auto& mp : srcDictPkg.mtsdfPaths) {
         if (mp.pathHash != 0 && bakedPathHashes.insert(mp.pathHash).second) {
             dstPkg.mtsdfPaths.push_back(mp);
@@ -916,8 +957,8 @@ enum class XmlScopeKind : std::uint8_t {
     TransformChildNode = 7,
     NonVisualSkip = 8,
     BindingPropertyElement = 9,
-    Transform3DPropertyElement = 9,
-    EffectPropertyElement = 10,
+    Transform3DPropertyElement = 10,
+    EffectPropertyElement = 11,
 };
 
 struct XmlScopeEntry {
@@ -2480,53 +2521,6 @@ AeroCompileResult AeroCompiler::CompileInternal(
     std::vector<ActiveInteractionActionScope> actionStack;
     std::size_t nonVisualDepth = 0;
 
-    auto emitPropertyBindingIfValid = [&](std::uint16_t targetPropId, std::string_view rawMarkupExpr) -> bool {
-        const std::string_view trimmedExpr = Trim(rawMarkupExpr);
-        if (trimmedExpr.size() <= 2 || trimmedExpr.front() != '{' || trimmedExpr.back() != '}') {
-            return false;
-        }
-        const ParsedBindingClause parsedBind = ParseBindingMarkupExpression(trimmedExpr);
-        if (!parsedBind.isValidBinding || parsedBind.pathPart.empty() || parsedBind.pathPart == ".") {
-            return false;
-        }
-        AxbCompiledBindingChain chain{};
-        chain.rawPath = std::string(parsedBind.pathPart);
-        chain.targetPropertyId = targetPropId;
-        chain.mode = parsedBind.mode;
-        if (!parsedBind.fallbackValue.empty()) {
-            chain.fallbackValue = ParseLiteralPropertyValue(targetPropId, parsedBind.fallbackValue);
-        }
-        chain.elementName = std::string(parsedBind.elementName);
-        chain.relativeAncestorType = parsedBind.relativeAncestorType;
-        chain.relativeSelf = parsedBind.relativeSelf || parsedBind.relativeTemplatedParent;
-        chain.converter = parsedBind.converter;
-
-        std::size_t segPos = 0u;
-        while (segPos < parsedBind.pathPart.size()) {
-            const std::size_t dot = parsedBind.pathPart.find('.', segPos);
-            const std::string_view seg = (dot == std::string_view::npos)
-                ? parsedBind.pathPart.substr(segPos)
-                : parsedBind.pathPart.substr(segPos, dot - segPos);
-            if (!seg.empty()) {
-                AxbCompiledHop hop{};
-                hop.memberName = std::string(seg);
-                chain.hops.push_back(std::move(hop));
-            }
-            if (dot == std::string_view::npos) break;
-            segPos = dot + 1u;
-        }
-        const auto chainIdx = static_cast<std::uint32_t>(pkg.bindingChains.size());
-        pkg.bindingChains.push_back(std::move(chain));
-
-        AxbInstruction bindInst{};
-        bindInst.opcode = AxbOpcode::BindProperty;
-        bindInst.propId = targetPropId;
-        bindInst.flags = static_cast<std::uint8_t>(parsedBind.mode);
-        bindInst.strIdx0 = chainIdx;
-        pkg.instructions.push_back(std::move(bindInst));
-        return true;
-    };
-
     auto findEnclosingTransformScope = [&]() noexcept -> XmlScopeEntry* {
         for (auto it = scopeStack.rbegin(); it != scopeStack.rend(); ++it) {
             if (it->kind == XmlScopeKind::TransformPropertyElement) {
@@ -2570,6 +2564,104 @@ AeroCompileResult AeroCompiler::CompileInternal(
         }
     };
 
+    auto splitPathIntoHops = [](std::string_view pathPart, std::vector<AxbCompiledHop>& outHops) {
+        if (pathPart.empty() || pathPart == ".") {
+            return;
+        }
+        std::size_t segPos = 0u;
+        while (segPos < pathPart.size()) {
+            const std::size_t dot = pathPart.find('.', segPos);
+            const std::string_view seg = (dot == std::string_view::npos)
+                ? pathPart.substr(segPos)
+                : pathPart.substr(segPos, dot - segPos);
+            if (!seg.empty()) {
+                AxbCompiledHop hop{};
+                hop.memberName = std::string(seg);
+                outHops.push_back(std::move(hop));
+            }
+            if (dot == std::string_view::npos) break;
+            segPos = dot + 1u;
+        }
+    };
+
+    auto emitPropertyBindingIfValid = [&](std::uint16_t targetPropId, std::string_view rawMarkupExpr) -> bool {
+        if (targetPropId == kUnmappedPropId) {
+            return false;
+        }
+        const std::string_view trimmedExpr = Trim(rawMarkupExpr);
+        if (trimmedExpr.size() <= 2 || trimmedExpr.front() != '{' || trimmedExpr.back() != '}') {
+            return false;
+        }
+        const ParsedBindingClause parsedBind = ParseBindingMarkupExpression(trimmedExpr);
+        if (!parsedBind.isValidBinding) {
+            return false;
+        }
+
+        if (parsedBind.relativeTemplatedParent) {
+            UnifiedValue parsedFallback{};
+            if (!parsedBind.fallbackValue.empty()) {
+                parsedFallback = ParseLiteralPropertyValue(targetPropId, parsedBind.fallbackValue);
+                AxbInstruction fbInst{};
+                fbInst.opcode = AxbOpcode::SetStaticProperty;
+                fbInst.propId = targetPropId;
+                fbInst.literalValue = parsedFallback;
+                pkg.instructions.push_back(std::move(fbInst));
+            }
+            const std::uint16_t srcPropId = ResolveTemplateBindingSourcePropId(parsedBind.pathPart);
+            if (srcPropId == kUnmappedPropId) {
+                return !parsedBind.fallbackValue.empty();
+            }
+            AxbInstruction tbInst{};
+            tbInst.opcode = AxbOpcode::BindTemplateParent;
+            tbInst.propId = targetPropId;
+            tbInst.flags = static_cast<std::uint8_t>(parsedBind.converter);
+            tbInst.strIdx0 = static_cast<std::uint32_t>(srcPropId);
+            tbInst.strIdx1 = pkg.InternString(parsedBind.pathPart);
+            tbInst.literalValue = std::move(parsedFallback);
+            pkg.instructions.push_back(std::move(tbInst));
+            return true;
+        }
+
+        UnifiedValue parsedFallback{};
+        if (!parsedBind.fallbackValue.empty()) {
+            parsedFallback = ParseLiteralPropertyValue(targetPropId, parsedBind.fallbackValue);
+            AxbInstruction fbInst{};
+            fbInst.opcode = AxbOpcode::SetStaticProperty;
+            fbInst.propId = targetPropId;
+            fbInst.literalValue = parsedFallback;
+            pkg.instructions.push_back(std::move(fbInst));
+        }
+        if (parsedBind.pathPart.empty() || parsedBind.pathPart == ".") {
+            return !parsedBind.fallbackValue.empty();
+        }
+
+        AxbCompiledBindingChain chain{};
+        chain.rawPath = std::string(parsedBind.pathPart);
+        chain.targetPropertyId = targetPropId;
+        chain.mode = parsedBind.mode;
+        chain.fallbackValue = std::move(parsedFallback);
+        chain.elementName = std::string(parsedBind.elementName);
+        chain.relativeAncestorType = parsedBind.relativeAncestorType;
+        chain.relativeSelf = parsedBind.relativeSelf;
+        chain.converter = parsedBind.converter;
+        chain.converterKey = parsedBind.converterKey;
+        chain.converterParameter = parsedBind.converterParameter;
+        chain.stringFormat = parsedBind.stringFormat;
+        resolveConverterResource(chain.converter, chain.converterKey);
+        splitPathIntoHops(parsedBind.pathPart, chain.hops);
+
+        const auto chainIdx = static_cast<std::uint32_t>(pkg.bindingChains.size());
+        pkg.bindingChains.push_back(std::move(chain));
+
+        AxbInstruction bindInst{};
+        bindInst.opcode = AxbOpcode::BindProperty;
+        bindInst.propId = targetPropId;
+        bindInst.flags = static_cast<std::uint8_t>(parsedBind.mode);
+        bindInst.strIdx0 = chainIdx;
+        pkg.instructions.push_back(std::move(bindInst));
+        return true;
+    };
+
     auto findEnclosingPropertyTargetId = [&]() noexcept -> std::uint16_t {
         for (auto it = scopeStack.rbegin(); it != scopeStack.rend(); ++it) {
             if (it->kind == XmlScopeKind::BindingPropertyElement ||
@@ -2599,26 +2691,6 @@ AeroCompileResult AeroCompiler::CompileInternal(
             }
         } else if (!eventTriggerStack.empty()) {
             eventTriggerStack.back().et.actions.push_back(std::move(act));
-        }
-    };
-
-    auto splitPathIntoHops = [](std::string_view pathPart, std::vector<AxbCompiledHop>& outHops) {
-        if (pathPart.empty() || pathPart == ".") {
-            return;
-        }
-        std::size_t segPos = 0u;
-        while (segPos < pathPart.size()) {
-            const std::size_t dot = pathPart.find('.', segPos);
-            const std::string_view seg = (dot == std::string_view::npos)
-                ? pathPart.substr(segPos)
-                : pathPart.substr(segPos, dot - segPos);
-            if (!seg.empty()) {
-                AxbCompiledHop hop{};
-                hop.memberName = std::string(seg);
-                outHops.push_back(std::move(hop));
-            }
-            if (dot == std::string_view::npos) break;
-            segPos = dot + 1u;
         }
     };
 
@@ -3653,7 +3725,16 @@ AeroCompileResult AeroCompiler::CompileInternal(
                         AeroCompileInput subIn{};
                         subIn.xamlPath = ctKey;
                         subIn.xamlContent = std::string(innerXml);
-                        AeroCompileResult subRes = this->Compile(subIn);
+                        subIn.externalXamlResolver = input.externalXamlResolver;
+                        subIn.resourceSearchRoot = input.resourceSearchRoot;
+                        subIn.resourceSearchPaths = input.resourceSearchPaths;
+                        subIn.autoMergeGlobalResources = false;
+                        AeroCompileResult subRes = this->CompileInternal(subIn, activeIncludeStack);
+                        if (!subRes.succeeded) {
+                            for (const auto& d : subRes.diagnostics) {
+                                result.diagnostics.push_back(d);
+                            }
+                        }
                         if (subRes.succeeded) {
                             AxbControlTemplate ct{};
                             ct.key = ctKey;
@@ -5150,34 +5231,7 @@ AeroCompileResult AeroCompiler::CompileInternal(
                                 pkg.instructions.push_back(std::move(setInst));
                                 parentScope.brushAssigned = true;
                             } else {
-                                const ParsedBindingClause pb = ParseBindingMarkupExpression(a.value);
-                                if (pb.isValidBinding && !pb.pathPart.empty() && pb.pathPart != ".") {
-                                    if (pb.relativeTemplatedParent) {
-                                        AxbInstruction tpInst{};
-                                        tpInst.opcode = AxbOpcode::BindTemplateParent;
-                                        tpInst.propId = parentScope.targetPropId;
-                                        tpInst.flags = static_cast<std::uint8_t>(pb.converter);
-                                        tpInst.strIdx0 = static_cast<std::uint32_t>(ResolveTemplateBindingSourcePropId(pb.pathPart));
-                                        tpInst.strIdx1 = pkg.InternString(pb.pathPart);
-                                        pkg.instructions.push_back(std::move(tpInst));
-                                    } else {
-                                        AxbCompiledBindingChain chain{};
-                                        chain.rawPath = std::string(pb.pathPart);
-                                        chain.targetPropertyId = parentScope.targetPropId;
-                                        chain.mode = pb.mode;
-                                        chain.elementName = std::string(pb.elementName);
-                                        chain.relativeAncestorType = pb.relativeAncestorType;
-                                        chain.relativeSelf = pb.relativeSelf;
-                                        chain.converter = pb.converter;
-                                        const auto cIdx = static_cast<std::uint32_t>(pkg.bindingChains.size());
-                                        pkg.bindingChains.push_back(std::move(chain));
-                                        AxbInstruction bindInst{};
-                                        bindInst.opcode = AxbOpcode::BindProperty;
-                                        bindInst.propId = parentScope.targetPropId;
-                                        bindInst.flags = static_cast<std::uint8_t>(pb.mode);
-                                        bindInst.strIdx0 = cIdx;
-                                        pkg.instructions.push_back(std::move(bindInst));
-                                    }
+                                if (emitPropertyBindingIfValid(parentScope.targetPropId, a.value)) {
                                     parentScope.brushAssigned = true;
                                 }
                             }
@@ -5950,6 +6004,23 @@ AeroCompileResult AeroCompiler::CompileInternal(
         }
     }
 
+    for (auto& st : pkg.styles) {
+        if (st.controlTemplateKey.empty()) {
+            for (const auto& setter : st.setters) {
+                if (setter.propId == PropId_Template) {
+                    if (const auto* sv = std::get_if<StringValue>(&setter.value)) {
+                        st.controlTemplateKey = sv->str();
+                    }
+                }
+            }
+        }
+        if (!st.controlTemplateKey.empty() && !st.inlineControlTemplate) {
+            if (const AxbControlTemplate* foundCt = pkg.FindControlTemplate(st.controlTemplateKey)) {
+                st.inlineControlTemplate = std::make_shared<AxbControlTemplate>(*foundCt);
+            }
+        }
+    }
+
     if (!pkg.mtsdfPaths.empty() && !isSvgInput && !isLottieInput && !isRiveInput) {
         PackMtsdfAtlasSkyline(pkg.mtsdfPaths, 256u);
     }
@@ -6283,11 +6354,63 @@ AeroViewAotCppOutput AeroCompiler::GenerateAotCppFromPackage(
     out.header = std::move(hdr);
 
     // 2. Emit C++17 Source (.cpp) - unrolled batch creation, static properties, MTSDF, Styles/Storyboards & bindings
+    bool hasNestedMultiInBindingChains = false;
+    for (const auto& ch : package.bindingChains) {
+        if (ch.nestedMultiBinding != nullptr) {
+            hasNestedMultiInBindingChains = true;
+            break;
+        }
+    }
+    bool hasP1StylePayload = false;
+    for (const auto& st : package.styles) {
+        if (!st.controlTemplateKey.empty() || st.inlineControlTemplate != nullptr) {
+            hasP1StylePayload = true;
+            break;
+        }
+        for (const auto& tr : st.triggers) {
+            if (!tr.enterActions.empty() || !tr.exitActions.empty()) {
+                hasP1StylePayload = true;
+                break;
+            }
+            for (const auto& c : tr.conditions) {
+                if (!c.converterKey.empty() || c.converterSymbolId != 0) {
+                    hasP1StylePayload = true;
+                    break;
+                }
+            }
+            if (hasP1StylePayload) break;
+        }
+        if (hasP1StylePayload) break;
+        for (const auto& et : st.eventTriggers) {
+            if (!et.actions.empty()) {
+                hasP1StylePayload = true;
+                break;
+            }
+        }
+        if (hasP1StylePayload) break;
+    }
+    const bool needSharedPkg =
+        !package.multiBindings.empty() ||
+        package.HasMotionSection() ||
+        !package.dataTemplates.empty() ||
+        !package.controlTemplates.empty() ||
+        hasNestedMultiInBindingChains ||
+        hasP1StylePayload;
+
+    std::vector<std::uint8_t> sharedPkgBytes;
+    if (needSharedPkg) {
+        sharedPkgBytes = package.Serialize();
+    }
+    const bool emitSharedPkg = needSharedPkg && !sharedPkgBytes.empty();
+
     std::string src;
     src += "// Auto-generated by aero-compiler --aot-cpp (Zero-XML C++17 Visual Tree & Binding Builder)\n";
     src += "#include <limits>\n";
+    src += "#include <mutex>\n";
+    src += "#include \"aero/animation/AnimationEngine.hpp\"\n";
     src += "#include \"aero/controls/Controls.hpp\"\n";
-    src += "#include \"aero/binding/DualTrackBindingEngine.hpp\"\n\n";
+    src += "#include \"aero/binding/DualTrackBindingEngine.hpp\"\n";
+    src += "#include \"realscript/runtime/Runtime.h\"\n\n";
     src += "namespace " + out.cppNamespace + " {\n\n";
     src += "bool " + out.builderFunctionName + "(\n";
     src += "    aero::UIElement* rootControl,\n";
@@ -6300,6 +6423,42 @@ AeroViewAotCppOutput AeroCompiler::GenerateAotCppFromPackage(
     src += "        return false;\n";
     src += "    }\n";
     src += "    aero::EnsureControlTypesRegistered();\n";
+
+    if (emitSharedPkg) {
+        src += "    static std::mutex sAotSharedPkgMutex;\n";
+        src += "    static const aero::ProgramImage* sAotBoundProgram = nullptr;\n";
+        src += "    static aero::AxbPackage* const sAotSharedPkgPtr = []() {\n";
+        src += "        auto* p = new aero::AxbPackage();\n";
+        src += "        static constexpr std::uint8_t kAotSharedPkgBytes[] = {";
+        for (std::size_t b = 0; b < sharedPkgBytes.size(); ++b) {
+            if (b > 0) src += ",";
+            src += std::to_string(static_cast<unsigned>(sharedPkgBytes[b])) + "u";
+        }
+        src += "};\n";
+        src += "        (void)aero::AxbPackage::Deserialize(kAotSharedPkgBytes, sizeof(kAotSharedPkgBytes), *p);\n";
+        src += "        p->PinValuesInPools();\n";
+        src += "        aero::rs_rt::registerExternalValuePoolRootMarker(\n";
+        src += "            p,\n";
+        src += "            [p]() noexcept {\n";
+        src += "                std::lock_guard<std::mutex> lock(sAotSharedPkgMutex);\n";
+        src += "                p->MarkValuesInPools();\n";
+        src += "            });\n";
+        src += "        return p;\n";
+        src += "    }();\n";
+        src += "    aero::AxbPackage& sAotSharedPkg = *sAotSharedPkgPtr;\n";
+        src += "    bool sAotReboundSharedPkg = false;\n";
+        src += "    {\n";
+        src += "        std::lock_guard<std::mutex> lock(sAotSharedPkgMutex);\n";
+        src += "        const aero::ProgramImage* liveProg = bindingEngine ? bindingEngine->Program() : nullptr;\n";
+        src += "        if (liveProg && liveProg != sAotBoundProgram) {\n";
+        src += "            (void)sAotSharedPkg.BindAgainstProgram(*liveProg, sAotSharedPkg.className, domains);\n";
+        src += "            sAotSharedPkg.PinValuesInPools();\n";
+        src += "            sAotBoundProgram = liveProg;\n";
+        src += "            sAotReboundSharedPkg = true;\n";
+        src += "        }\n";
+        src += "    }\n";
+        src += "    (void)sAotReboundSharedPkg;\n";
+    }
 
     // Emit pre-baked MTSDF vector path entries so pure C++17 AOT views have 0 runtime SVG parsing
     for (std::size_t mpIdx = 0; mpIdx < package.mtsdfPaths.size(); ++mpIdx) {
@@ -6362,9 +6521,11 @@ AeroViewAotCppOutput AeroCompiler::GenerateAotCppFromPackage(
         src += "    }\n";
     }
 
-    for (const auto& st : package.styles) {
+    for (std::size_t stIdx = 0; stIdx < package.styles.size(); ++stIdx) {
+        const auto& st = package.styles[stIdx];
         if (!st.key.empty()) {
-            src += "    if (!aero::AxbTemplateRegistry::Instance().FindStyle(\"" +
+            src += "    if (" + std::string(emitSharedPkg ? "sAotReboundSharedPkg || " : "") +
+                   "!aero::AxbTemplateRegistry::Instance().FindStyle(\"" +
                    EscapeAotCppString(st.key) + "\")) {\n";
         } else {
             src += "    {\n";
@@ -6378,6 +6539,9 @@ AeroViewAotCppOutput AeroCompiler::GenerateAotCppFromPackage(
         }
         if (!st.basedOnKey.empty()) {
             src += "        stDef.basedOnKey = \"" + EscapeAotCppString(st.basedOnKey) + "\";\n";
+        }
+        if (!st.controlTemplateKey.empty()) {
+            src += "        stDef.controlTemplateKey = \"" + EscapeAotCppString(st.controlTemplateKey) + "\";\n";
         }
         AppendSetterListPopulateCpp(src, st.setters, "stDef.setters", "        ");
         for (const auto& trig : st.triggers) {
@@ -6394,6 +6558,13 @@ AeroViewAotCppOutput AeroCompiler::GenerateAotCppFromPackage(
                        std::to_string(static_cast<unsigned>(cond.sourceKind)) + "u);\n";
                 src += "                tc.converter = static_cast<aero::ValueConverterKind>(" +
                        std::to_string(static_cast<unsigned>(cond.converter)) + "u);\n";
+                if (!cond.converterKey.empty()) {
+                    src += "                tc.converterKey = \"" + EscapeAotCppString(cond.converterKey) + "\";\n";
+                }
+                if (!cond.converterParameter.empty()) {
+                    src += "                tc.converterParameter = \"" + EscapeAotCppString(cond.converterParameter) + "\";\n";
+                }
+                src += "                tc.converterSymbolId = " + std::to_string(cond.converterSymbolId) + "ULL;\n";
                 src += "                tc.expectNull = " + std::string(cond.expectNull ? "true" : "false") + ";\n";
                 if (!cond.sourceName.empty()) {
                     src += "                tc.sourceName = \"" + EscapeAotCppString(cond.sourceName) + "\";\n";
@@ -6479,76 +6650,64 @@ AeroViewAotCppOutput AeroCompiler::GenerateAotCppFromPackage(
             src += "            stDef.eventTriggers.push_back(std::move(etDef));\n";
             src += "        }\n";
         }
-        src += "        aero::AxbTemplateRegistry::Instance().RegisterStyle(std::move(stDef));\n";
+        if (emitSharedPkg && hasP1StylePayload) {
+            src += "        if (" + std::to_string(stIdx) + "u < sAotSharedPkg.styles.size()) {\n";
+            src += "            aero::AxbTemplateRegistry::Instance().RegisterStyle(sAotSharedPkg.styles[" +
+                   std::to_string(stIdx) + "u]);\n";
+            src += "        } else {\n";
+            src += "            aero::AxbTemplateRegistry::Instance().RegisterStyle(std::move(stDef));\n";
+            src += "        }\n";
+        } else if (emitSharedPkg) {
+            src += "        if (sAotReboundSharedPkg && " + std::to_string(stIdx) + "u < sAotSharedPkg.styles.size()) {\n";
+            src += "            aero::AxbTemplateRegistry::Instance().RegisterStyle(sAotSharedPkg.styles[" +
+                   std::to_string(stIdx) + "u]);\n";
+            src += "        } else {\n";
+            src += "            aero::AxbTemplateRegistry::Instance().RegisterStyle(std::move(stDef));\n";
+            src += "        }\n";
+        } else {
+            src += "        aero::AxbTemplateRegistry::Instance().RegisterStyle(std::move(stDef));\n";
+        }
         src += "    }\n";
     }
 
-    for (std::size_t dtIdx = 0; dtIdx < package.dataTemplates.size(); ++dtIdx) {
-        const auto& dt = package.dataTemplates[dtIdx];
-        if (!dt.templatePackage) {
-            continue;
+    if (emitSharedPkg) {
+        for (std::size_t dtIdx = 0; dtIdx < package.dataTemplates.size(); ++dtIdx) {
+            const auto& dt = package.dataTemplates[dtIdx];
+            if (!dt.templatePackage) {
+                continue;
+            }
+            if (!dt.key.empty()) {
+                src += "    if (sAotReboundSharedPkg || !aero::AxbTemplateRegistry::Instance().FindDataTemplate(\"" +
+                       EscapeAotCppString(dt.key) + "\")) {\n";
+            } else {
+                src += "    {\n";
+            }
+            src += "        if (" + std::to_string(dtIdx) + "u < sAotSharedPkg.dataTemplates.size() && "
+                   "sAotSharedPkg.dataTemplates[" + std::to_string(dtIdx) + "u].templatePackage) {\n";
+            src += "            aero::AxbTemplateRegistry::Instance().RegisterDataTemplate(sAotSharedPkg.dataTemplates[" +
+                   std::to_string(dtIdx) + "u]);\n";
+            src += "        }\n";
+            src += "    }\n";
         }
-        const std::vector<std::uint8_t> dtBytes = dt.templatePackage->Serialize();
-        if (dtBytes.empty()) {
-            continue;
-        }
-        if (!dt.key.empty()) {
-            src += "    if (!aero::AxbTemplateRegistry::Instance().FindDataTemplate(\"" +
-                   EscapeAotCppString(dt.key) + "\")) {\n";
-        } else {
-            src += "    {\n";
-        }
-        const std::string dtArr = "kDataTplBytes_" + std::to_string(dtIdx);
-        src += "        static constexpr std::uint8_t " + dtArr + "[] = {";
-        for (std::size_t b = 0; b < dtBytes.size(); ++b) {
-            if (b > 0) src += ",";
-            src += std::to_string(static_cast<unsigned>(dtBytes[b])) + "u";
-        }
-        src += "};\n";
-        src += "        auto subPkg = std::make_shared<aero::AxbPackage>();\n";
-        src += "        if (aero::AxbPackage::Deserialize(" + dtArr + ", sizeof(" + dtArr + "), *subPkg)) {\n";
-        src += "            aero::AxbDataTemplate dtDef{};\n";
-        if (!dt.key.empty()) {
-            src += "            dtDef.key = \"" + EscapeAotCppString(dt.key) + "\";\n";
-        }
-        if (!dt.dataTypeName.empty()) {
-            src += "            dtDef.dataTypeName = \"" + EscapeAotCppString(dt.dataTypeName) + "\";\n";
-        }
-        src += "            dtDef.templatePackage = std::move(subPkg);\n";
-        src += "            aero::AxbTemplateRegistry::Instance().RegisterDataTemplate(std::move(dtDef));\n";
-        src += "        }\n";
-        src += "    }\n";
-    }
 
-    for (std::size_t ctIdx = 0; ctIdx < package.controlTemplates.size(); ++ctIdx) {
-        const auto& ct = package.controlTemplates[ctIdx];
-        if (!ct.templatePackage) {
-            continue;
+        for (std::size_t ctIdx = 0; ctIdx < package.controlTemplates.size(); ++ctIdx) {
+            const auto& ct = package.controlTemplates[ctIdx];
+            if (!ct.templatePackage) {
+                continue;
+            }
+            if (!ct.key.empty()) {
+                src += "    if (sAotReboundSharedPkg || !aero::AxbTemplateRegistry::Instance().FindControlTemplate(\"" +
+                       EscapeAotCppString(ct.key) + "\")) {\n";
+            } else {
+                src += "    {\n";
+            }
+            src += "        if (" + std::to_string(ctIdx) + "u < sAotSharedPkg.controlTemplates.size() && "
+                   "sAotSharedPkg.controlTemplates[" + std::to_string(ctIdx) + "u].templatePackage) {\n";
+            src += "            aero::AxbTemplateRegistry::Instance().RegisterControlTemplate(sAotSharedPkg.controlTemplates[" +
+                   std::to_string(ctIdx) + "u]);\n";
+            src += "        }\n";
+            src += "    }\n";
         }
-        AxbPackage wrapperPkg{};
-        wrapperPkg.controlTemplates.push_back(ct);
-        const std::vector<std::uint8_t> ctBytes = wrapperPkg.Serialize();
-        if (ctBytes.empty()) {
-            continue;
-        }
-        if (!ct.key.empty()) {
-            src += "    if (!aero::AxbTemplateRegistry::Instance().FindControlTemplate(\"" +
-                   EscapeAotCppString(ct.key) + "\")) {\n";
-        } else {
-            src += "    {\n";
-        }
-        const std::string ctArr = "kControlTplBytes_" + std::to_string(ctIdx);
-        src += "        static constexpr std::uint8_t " + ctArr + "[] = {";
-        for (std::size_t b = 0; b < ctBytes.size(); ++b) {
-            if (b > 0) src += ",";
-            src += std::to_string(static_cast<unsigned>(ctBytes[b])) + "u";
-        }
-        src += "};\n";
-        src += "        aero::AxbPackage ctWrapper{};\n";
-        src += "        if (aero::AxbPackage::Deserialize(" + ctArr + ", sizeof(" + ctArr + "), ctWrapper) && !ctWrapper.controlTemplates.empty()) {\n";
-        src += "            aero::AxbTemplateRegistry::Instance().RegisterControlTemplate(std::move(ctWrapper.controlTemplates[0]));\n";
-        src += "        }\n";
-        src += "    }\n";
     }
 
     src += "    aero::NativeHandleRegistry* registry = domains ? &domains->nativeHandles() : nullptr;\n";
@@ -6598,19 +6757,43 @@ AeroViewAotCppOutput AeroCompiler::GenerateAotCppFromPackage(
                     src += "    aero::UIElement* " + varName + " = " + varName + "_ptr.Get();\n";
                     src += "    if (" + parentVar + " && " + varName + ") {\n";
                     src += "        " + parentVar + "->AddChild(" + varName + ", registry, uiHeap);\n";
+                    if ((inst.flags & 0x01u) != 0u) {
+                        src += "        if (auto* hcc = " + parentVar + "->DynamicCast<aero::HeaderedContentControl>()) {\n";
+                        src += "            hcc->SetHeaderElement(" + varName + ");\n";
+                        src += "        }\n";
+                    }
                     src += "    }\n";
                 }
                 src += "    localElements.push_back(" + varName + ");\n";
+                src += "    if (" + varName + " && bindingEngine) {\n";
+                src += "        " + varName + "->BindTwoWayEngine(bindingEngine);\n";
+                src += "    }\n";
 
-                if (const auto probe = CreateElementByTypeName(typeName);
-                    probe && probe->IsA<ItemsControl>()) {
-                    src += "    if (auto* ic = " + varName + " ? " + varName + "->DynamicCast<aero::ItemsControl>() : nullptr) {\n";
-                    src += "        ic->SetDomains(domains);\n";
-                    src += "        ic->SetBindingEngine(bindingEngine);\n";
-                    src += "        if (bindingEngine) {\n";
-                    src += "            ic->SetAnimationEngine(bindingEngine->GetAnimationEngine());\n";
-                    src += "        }\n";
-                    src += "    }\n";
+                if (const auto probe = CreateElementByTypeName(typeName)) {
+                    if (probe->IsA<ItemsControl>()) {
+                        src += "    if (auto* ic = " + varName + " ? " + varName + "->DynamicCast<aero::ItemsControl>() : nullptr) {\n";
+                        src += "        ic->SetDomains(domains);\n";
+                        src += "        ic->SetBindingEngine(bindingEngine);\n";
+                        src += "        if (bindingEngine) {\n";
+                        src += "            ic->SetAnimationEngine(bindingEngine->GetAnimationEngine());\n";
+                        src += "        }\n";
+                        src += "    }\n";
+                    } else if (probe->IsA<TabControl>()) {
+                        src += "    if (auto* tc = " + varName + " ? " + varName + "->DynamicCast<aero::TabControl>() : nullptr) {\n";
+                        src += "        tc->SetDomains(domains);\n";
+                        src += "        tc->SetBindingEngine(bindingEngine);\n";
+                        src += "        if (bindingEngine) {\n";
+                        src += "            tc->SetAnimationEngine(bindingEngine->GetAnimationEngine());\n";
+                        src += "        }\n";
+                        src += "    }\n";
+                    }
+                    if (probe->IsA<RiveControl>()) {
+                        src += "    if (auto* rc = " + varName + " ? " + varName + "->DynamicCast<aero::RiveControl>() : nullptr) {\n";
+                        src += "        if (bindingEngine) {\n";
+                        src += "            rc->SetAnimationEngine(bindingEngine->GetAnimationEngine());\n";
+                        src += "        }\n";
+                        src += "    }\n";
+                    }
                 }
 
                 if (!elemName.empty()) {
@@ -6661,78 +6844,87 @@ AeroViewAotCppOutput AeroCompiler::GenerateAotCppFromPackage(
                                             chain.relativeSelf;
                     src += "    if (" + curVar + " && bindingEngine" +
                            std::string(isElemBind ? "" : " && effectiveContext.valid()") + ") {\n";
-                    src += "        aero::AxbCompiledBindingChain chain{};\n";
-                    src += "        chain.rawPath = \"" + EscapeAotCppString(chain.rawPath) + "\";\n";
-                    src += "        chain.targetPropertyId = " + std::to_string(chain.targetPropertyId) + "u;\n";
-                    src += "        chain.mode = static_cast<aero::BindingMode>(" +
-                           std::to_string(static_cast<unsigned>(chain.mode)) + "u);\n";
-                    src += "        chain.converter = static_cast<aero::ValueConverterKind>(" +
-                           std::to_string(static_cast<unsigned>(chain.converter)) + "u);\n";
-                    if (!chain.converterKey.empty()) {
-                        src += "        chain.converterKey = \"" + EscapeAotCppString(chain.converterKey) + "\";\n";
+                    if (chain.mode == BindingMode::TwoWay) {
+                        src += "        " + curVar + "->BindTwoWayEngine(bindingEngine);\n";
                     }
-                    if (!chain.converterParameter.empty()) {
-                        src += "        chain.converterParameter = \"" + EscapeAotCppString(chain.converterParameter) + "\";\n";
-                    }
-                    if (!chain.stringFormat.empty()) {
-                        src += "        chain.stringFormat = \"" + EscapeAotCppString(chain.stringFormat) + "\";\n";
-                    }
-                    src += "        chain.converterSymbolId = " + std::to_string(chain.converterSymbolId) + "ULL;\n";
-                    src += "        chain.convertBackSymbolId = " + std::to_string(chain.convertBackSymbolId) + "ULL;\n";
-                    if (!chain.elementName.empty()) {
-                        src += "        chain.elementName = \"" + EscapeAotCppString(chain.elementName) + "\";\n";
-                    }
-                    if (!chain.relativeAncestorType.empty()) {
-                        src += "        chain.relativeAncestorType = \"" + EscapeAotCppString(chain.relativeAncestorType) + "\";\n";
-                    }
-                    src += "        chain.relativeSelf = " + std::string(chain.relativeSelf ? "true" : "false") + ";\n";
-                    if (!std::holds_alternative<std::monostate>(chain.fallbackValue)) {
-                        src += "        chain.fallbackValue = " + EmitUnifiedValueLiteralCpp(chain.fallbackValue) + ";\n";
-                    }
-                    for (const auto& hop : chain.hops) {
-                        src += "        {\n";
-                        src += "            aero::AxbCompiledHop hop{};\n";
-                        src += "            hop.memberName = \"" + EscapeAotCppString(hop.memberName) + "\";\n";
-                        src += "            hop.declaringTypeId = " + std::to_string(hop.declaringTypeId) + "ULL;\n";
-                        src += "            hop.fieldIndex = " + std::to_string(hop.fieldIndex) + "u;\n";
-                        src += "            hop.observableBitIndex = " + std::to_string(static_cast<unsigned>(hop.observableBitIndex)) + "u;\n";
-                        src += "            hop.getterSymbolId = " + std::to_string(hop.getterSymbolId) + "ULL;\n";
-                        src += "            hop.setterSymbolId = " + std::to_string(hop.setterSymbolId) + "ULL;\n";
-                        src += "            hop.isAutoProperty = " + std::string(hop.isAutoProperty ? "true" : "false") + ";\n";
-                        src += "            hop.isObservable = " + std::string(hop.isObservable ? "true" : "false") + ";\n";
-                        src += "            hop.isReadOnly = " + std::string(hop.isReadOnly ? "true" : "false") + ";\n";
-                        src += "            hop.isSimState = " + std::string(hop.isSimState ? "true" : "false") + ";\n";
-                        src += "            hop.isSimCommand = " + std::string(hop.isSimCommand ? "true" : "false") + ";\n";
-                        src += "            chain.hops.push_back(std::move(hop));\n";
+                    if (emitSharedPkg && chain.nestedMultiBinding != nullptr) {
+                        src += "        if (" + std::to_string(inst.strIdx0) + "u < sAotSharedPkg.bindingChains.size()) {\n";
+                        if (isElemBind) {
+                            src += "            (void)bindingEngine->BindElementProperty(sAotSharedPkg.bindingChains[" +
+                                   std::to_string(inst.strIdx0) + "u], aero::IntrusivePtr<aero::UIElement>(" + curVar + ", true));\n";
+                        } else {
+                            src += "            (void)bindingEngine->BindChain(effectiveContext, sAotSharedPkg.bindingChains[" +
+                                   std::to_string(inst.strIdx0) + "u], aero::IntrusivePtr<aero::UIElement>(" + curVar + ", true));\n";
+                        }
                         src += "        }\n";
+                    } else {
+                        src += "        aero::AxbCompiledBindingChain chain{};\n";
+                        src += "        chain.rawPath = \"" + EscapeAotCppString(chain.rawPath) + "\";\n";
+                        src += "        chain.targetPropertyId = " + std::to_string(chain.targetPropertyId) + "u;\n";
+                        src += "        chain.mode = static_cast<aero::BindingMode>(" +
+                               std::to_string(static_cast<unsigned>(chain.mode)) + "u);\n";
+                        src += "        chain.converter = static_cast<aero::ValueConverterKind>(" +
+                               std::to_string(static_cast<unsigned>(chain.converter)) + "u);\n";
+                        if (!chain.converterKey.empty()) {
+                            src += "        chain.converterKey = \"" + EscapeAotCppString(chain.converterKey) + "\";\n";
+                        }
+                        if (!chain.converterParameter.empty()) {
+                            src += "        chain.converterParameter = \"" + EscapeAotCppString(chain.converterParameter) + "\";\n";
+                        }
+                        if (!chain.stringFormat.empty()) {
+                            src += "        chain.stringFormat = \"" + EscapeAotCppString(chain.stringFormat) + "\";\n";
+                        }
+                        src += "        chain.converterSymbolId = " + std::to_string(chain.converterSymbolId) + "ULL;\n";
+                        src += "        chain.convertBackSymbolId = " + std::to_string(chain.convertBackSymbolId) + "ULL;\n";
+                        if (!chain.elementName.empty()) {
+                            src += "        chain.elementName = \"" + EscapeAotCppString(chain.elementName) + "\";\n";
+                        }
+                        if (!chain.relativeAncestorType.empty()) {
+                            src += "        chain.relativeAncestorType = \"" + EscapeAotCppString(chain.relativeAncestorType) + "\";\n";
+                        }
+                        src += "        chain.relativeSelf = " + std::string(chain.relativeSelf ? "true" : "false") + ";\n";
+                        if (!std::holds_alternative<std::monostate>(chain.fallbackValue)) {
+                            src += "        chain.fallbackValue = " + EmitUnifiedValueLiteralCpp(chain.fallbackValue) + ";\n";
+                        }
+                        for (const auto& hop : chain.hops) {
+                            src += "        {\n";
+                            src += "            aero::AxbCompiledHop hop{};\n";
+                            src += "            hop.memberName = \"" + EscapeAotCppString(hop.memberName) + "\";\n";
+                            src += "            hop.declaringTypeId = " + std::to_string(hop.declaringTypeId) + "ULL;\n";
+                            src += "            hop.fieldIndex = " + std::to_string(hop.fieldIndex) + "u;\n";
+                            src += "            hop.observableBitIndex = " + std::to_string(static_cast<unsigned>(hop.observableBitIndex)) + "u;\n";
+                            src += "            hop.getterSymbolId = " + std::to_string(hop.getterSymbolId) + "ULL;\n";
+                            src += "            hop.setterSymbolId = " + std::to_string(hop.setterSymbolId) + "ULL;\n";
+                            src += "            hop.isAutoProperty = " + std::string(hop.isAutoProperty ? "true" : "false") + ";\n";
+                            src += "            hop.isObservable = " + std::string(hop.isObservable ? "true" : "false") + ";\n";
+                            src += "            hop.isReadOnly = " + std::string(hop.isReadOnly ? "true" : "false") + ";\n";
+                            src += "            hop.isSimState = " + std::string(hop.isSimState ? "true" : "false") + ";\n";
+                            src += "            hop.isSimCommand = " + std::string(hop.isSimCommand ? "true" : "false") + ";\n";
+                            src += "            chain.hops.push_back(std::move(hop));\n";
+                            src += "        }\n";
+                        }
+                        if (isElemBind) {
+                            src += "        (void)bindingEngine->BindElementProperty(chain, aero::IntrusivePtr<aero::UIElement>(" + curVar + ", true));\n";
+                        } else {
+                            src += "        (void)bindingEngine->BindChain(effectiveContext, chain, aero::IntrusivePtr<aero::UIElement>(" + curVar + ", true));\n";
+                        }
                     }
-                    src += "        (void)bindingEngine->BindChain(effectiveContext, chain, aero::IntrusivePtr<aero::UIElement>(" + curVar + ", true));\n";
                     src += "    }\n";
                 }
                 break;
             }
 
             case AxbOpcode::BindMultiProperty: {
-                if (!elemVarStack.empty() && inst.strIdx0 < package.multiBindings.size()) {
+                if (!elemVarStack.empty() && emitSharedPkg && inst.strIdx0 < package.multiBindings.size()) {
                     const std::string& curVar = elemVarStack.back();
-                    const std::vector<std::uint8_t> pkgBytes = package.Serialize();
+                    const auto& mb = package.multiBindings[inst.strIdx0];
                     src += "    if (" + curVar + " && bindingEngine) {\n";
-                    src += "        static constexpr std::uint8_t kAotMultiPkg_" + std::to_string(inst.strIdx0) + "[] = {";
-                    for (std::size_t b = 0; b < pkgBytes.size(); ++b) {
-                        if (b > 0) src += ",";
-                        src += std::to_string(static_cast<unsigned>(pkgBytes[b])) + "u";
+                    if (mb.mode == BindingMode::TwoWay) {
+                        src += "        " + curVar + "->BindTwoWayEngine(bindingEngine);\n";
                     }
-                    src += "};\n";
-                    src += "        static const aero::AxbPackage kDecodedMultiPkg_" + std::to_string(inst.strIdx0) + " = []() {\n";
-                    src += "            aero::AxbPackage p{};\n";
-                    src += "            (void)aero::AxbPackage::Deserialize(kAotMultiPkg_" + std::to_string(inst.strIdx0) +
-                           ", sizeof(kAotMultiPkg_" + std::to_string(inst.strIdx0) + "), p);\n";
-                    src += "            return p;\n";
-                    src += "        }();\n";
-                    src += "        if (" + std::to_string(inst.strIdx0) + "u < kDecodedMultiPkg_" + std::to_string(inst.strIdx0) + ".multiBindings.size()) {\n";
-                    src += "            (void)bindingEngine->BindMultiChain(effectiveContext, kDecodedMultiPkg_" +
-                           std::to_string(inst.strIdx0) + ".multiBindings[" + std::to_string(inst.strIdx0) +
-                           "u], aero::IntrusivePtr<aero::UIElement>(" + curVar + ", true));\n";
+                    src += "        if (" + std::to_string(inst.strIdx0) + "u < sAotSharedPkg.multiBindings.size()) {\n";
+                    src += "            (void)bindingEngine->BindMultiChain(effectiveContext, sAotSharedPkg.multiBindings[" +
+                           std::to_string(inst.strIdx0) + "u], aero::IntrusivePtr<aero::UIElement>(" + curVar + ", true));\n";
                     src += "        }\n";
                     src += "    }\n";
                 }
@@ -6870,29 +7062,14 @@ AeroViewAotCppOutput AeroCompiler::GenerateAotCppFromPackage(
         }
     }
 
-    if (package.HasMotionSection()) {
-        const std::vector<std::uint8_t> motPkgBytes = package.Serialize();
-        if (!motPkgBytes.empty()) {
-            src += "    if (bindingEngine && bindingEngine->GetAnimationEngine()) {\n";
-            src += "        static constexpr std::uint8_t kAotMotionPkgBytes[] = {";
-            for (std::size_t b = 0; b < motPkgBytes.size(); ++b) {
-                if (b > 0) src += ",";
-                src += std::to_string(static_cast<unsigned>(motPkgBytes[b])) + "u";
-            }
-            src += "};\n";
-            src += "        static const aero::AxbPackage kAotMotionPkg = []() {\n";
-            src += "            aero::AxbPackage p{};\n";
-            src += "            (void)aero::AxbPackage::Deserialize(kAotMotionPkgBytes, sizeof(kAotMotionPkgBytes), p);\n";
-            src += "            p.PinValuesInPools();\n";
-            src += "            return p;\n";
-            src += "        }();\n";
-            src += "        (void)bindingEngine->GetAnimationEngine()->InstantiatePackageMotion(\n";
-            src += "            rootControl,\n";
-            src += "            localElements.data(),\n";
-            src += "            localElements.size(),\n";
-            src += "            kAotMotionPkg);\n";
-            src += "    }\n";
-        }
+    if (emitSharedPkg && package.HasMotionSection()) {
+        src += "    if (bindingEngine && bindingEngine->GetAnimationEngine()) {\n";
+        src += "        (void)bindingEngine->GetAnimationEngine()->InstantiatePackageMotion(\n";
+        src += "            rootControl,\n";
+        src += "            localElements.data(),\n";
+        src += "            localElements.size(),\n";
+        src += "            sAotSharedPkg);\n";
+        src += "    }\n";
     }
 
     src += "    return " + std::string(rootVisited ? "true" : "false") + ";\n";

@@ -13,6 +13,7 @@
 #include "aero/controls/Controls.hpp"
 #include "aero/core/RsAliases.hpp"
 #include "aero/core/UIElement.hpp"
+#include "aero/input/InputEventRouter.hpp"
 #include "aero/style/StyleTriggerEngine.hpp"
 
 namespace {
@@ -674,12 +675,21 @@ public BagPanelVm Create10kBagVm()
         metrics.fullRebuildUs / std::max(0.01f, metrics.outOfViewAddUs),
         metrics.fullRebuildUs / std::max(0.01f, metrics.outOfViewReplaceUs));
 
+#if defined(NDEBUG)
     AERO_CHECK(metrics.outOfViewReplaceUs < 50.0f, "Out-of-view Replace is microsecond-level (< 50 us)");
     AERO_CHECK(metrics.inViewReplaceUs < 100.0f, "In-view Replace is microsecond-level (< 100 us)");
     AERO_CHECK(metrics.outOfViewAddUs < 50.0f, "Out-of-view Add+Layout is microsecond-level (< 50 us)");
     AERO_CHECK(metrics.outOfViewReplaceUs * 5.0f < metrics.fullRebuildUs &&
                metrics.outOfViewAddUs * 5.0f < metrics.fullRebuildUs,
                "Incremental sync is significantly faster than 10k full copy & rebuild");
+#else
+    AERO_CHECK(metrics.outOfViewReplaceUs < 5000.0f, "Out-of-view Replace within Debug budget (< 5000 us)");
+    AERO_CHECK(metrics.inViewReplaceUs < 10000.0f, "In-view Replace within Debug budget (< 10000 us)");
+    AERO_CHECK(metrics.outOfViewAddUs < 5000.0f, "Out-of-view Add+Layout within Debug budget (< 5000 us)");
+    AERO_CHECK(metrics.outOfViewReplaceUs < metrics.fullRebuildUs &&
+               metrics.outOfViewAddUs < metrics.fullRebuildUs,
+               "Incremental sync is faster than 10k full copy & rebuild in Debug");
+#endif
 
     // ------------------------------------------------------------------------
     // Operation 5: Clear on 10,201 items -> TotalItemCount == 0, ExtentHeight == 0, SelectedIndex == -1
@@ -852,6 +862,300 @@ public LobbyVm CreateLobbyVm()
                "Cross-collection property assignment cleanly switched array handle & rebuilt");
 }
 
+// ============================================================================
+// Suite 5: Regression Hardening:
+//   (a) ObservableList Nursery GC survival when item is Added & RemoveAt'd before collectYoung
+//   (b) ItemsControl::ApplyIncrementalChanges returning false without wiping items_ on Reset
+//   (c) ListBox interactive pointer click & KeyCode::Down/Up TwoWay ViewModel sync
+// ============================================================================
+void TestObservableListNurseryGcSurvivalOnAddAndRemoveAt() {
+    std::printf("--- [Suite 5a] ObservableList Nursery GC Survival on Add + RemoveAt ---\n");
+
+    aero::ExecutionDomainContext domains;
+    auto& heap = domains.uiHeap();
+
+    auto arrOpt = heap.allocateTypedArray(
+        0, aero::PrimitiveType::String, 0, 0u, *heap.allocateString(""));
+    AERO_CHECK(arrOpt.has_value(), "Allocated empty tracked string[] on UiHeap");
+    if (!arrOpt.has_value()) {
+        return;
+    }
+    const aero::ObjectRef arrRef = *arrOpt;
+    const auto pinArr = heap.retain(arrRef);
+    aero::ObservableListHelper::EnableTracking(heap, arrRef);
+
+    // Case 1: Nursery tracked array holds unrooted nursery item ONLY in delta ring
+    const std::uint64_t v0 = aero::ObservableListHelper::MutationVersion(heap, arrRef);
+    const aero::ObjectRef transientAlpha = *heap.allocateString("TransientNursery_Alpha_9001");
+    const aero::ObjectRef unreferencedDead = *heap.allocateString("UnreferencedGarbage_9001");
+
+    AERO_CHECK(aero::ObservableListHelper::Add(heap, arrRef, transientAlpha), "Add(transientAlpha)");
+    AERO_CHECK(aero::ObservableListHelper::RemoveAt(heap, arrRef, 0u), "RemoveAt(0) before minor GC");
+    AERO_CHECK(heap.arrayLength(arrRef).value_or(99u) == 0u, "Backing array is empty before collectYoung");
+
+    aero::ShadowStack emptyShadowStack;
+    (void)heap.collectYoung(emptyShadowStack);
+
+    AERO_CHECK(!heap.isAlive(unreferencedDead),
+               "Unreferenced nursery control string was reclaimed by collectYoung");
+    AERO_CHECK(heap.isAlive(transientAlpha),
+               "Nursery item Added & RemoveAt'd before collectYoung survived via delta ring");
+
+    std::vector<aero::CollectionChangeRecord> deltas;
+    std::uint64_t v1 = 0ULL;
+    bool requiresReset = false;
+    AERO_CHECK(
+        aero::ObservableListHelper::ReadChangesSince(heap, arrRef, v0, deltas, v1, requiresReset) &&
+        !requiresReset && deltas.size() == 2u,
+        "ReadChangesSince returned Add + RemoveAt deltas after collectYoung");
+    if (deltas.size() == 2u) {
+        const auto* addedRef = std::get_if<aero::ObjectRef>(&deltas[0].newValue);
+        const auto* removedRef = std::get_if<aero::ObjectRef>(&deltas[1].oldValue);
+        AERO_CHECK(
+            addedRef != nullptr && removedRef != nullptr &&
+            heap.stringView(*addedRef).value_or("") == "TransientNursery_Alpha_9001" &&
+            heap.stringView(*removedRef).value_or("") == "TransientNursery_Alpha_9001",
+            "Delta ring newValue/oldValue strings remain valid after minor GC");
+    }
+
+    // Case 2: Old-gen (promoted) tracked array receives new nursery item Added & RemoveAt'd before collectYoung
+    const aero::ObjectRef transientBeta = *heap.allocateString("TransientNursery_Beta_9002");
+    AERO_CHECK(aero::ObservableListHelper::Add(heap, arrRef, transientBeta), "Add(transientBeta) into old-gen array");
+    AERO_CHECK(aero::ObservableListHelper::RemoveAt(heap, arrRef, 0u), "RemoveAt(0) on old-gen array before minor GC");
+
+    (void)heap.collectYoung(emptyShadowStack);
+
+    AERO_CHECK(heap.isAlive(transientBeta),
+               "Nursery item in promoted array's delta ring survived collectYoung via remembered set");
+
+    std::uint64_t v2 = 0ULL;
+    AERO_CHECK(
+        aero::ObservableListHelper::ReadChangesSince(heap, arrRef, v1, deltas, v2, requiresReset) &&
+        !requiresReset && deltas.size() == 2u,
+        "ReadChangesSince on promoted array succeeded after second collectYoung");
+    if (deltas.size() == 2u) {
+        const auto* removedBeta = std::get_if<aero::ObjectRef>(&deltas[1].oldValue);
+        AERO_CHECK(
+            removedBeta != nullptr &&
+            heap.stringView(*removedBeta).value_or("") == "TransientNursery_Beta_9002",
+            "Promoted array delta ring preserved nursery oldValue across minor GC");
+    }
+}
+
+void TestItemsControlApplyIncrementalChangesRejectsResetWithoutWipingItems() {
+    std::printf("--- [Suite 5b] ItemsControl::ApplyIncrementalChanges Reset Safety ---\n");
+
+    aero::CollectionChangeRecord resetRec{};
+    resetRec.version = 1ULL;
+    resetRec.kind = aero::CollectionChangeKind::Reset;
+
+    // 1. Non-virtualized ItemsControl
+    auto plainIc = aero::MakeIntrusive<aero::ItemsControl>();
+    plainIc->SetAsRootVisual(true);
+    plainIc->SetItemsSource({
+        aero::value::FromString("One"),
+        aero::value::FromString("Two"),
+        aero::value::FromString("Three"),
+    });
+    AERO_CHECK(plainIc->Items().size() == 3u && plainIc->RealizedItemCount() == 3u,
+               "Populated non-virtualized ItemsControl with 3 items");
+
+    const bool plainApplied = plainIc->ApplyIncrementalChanges(&resetRec, 1u);
+    AERO_CHECK(!plainApplied,
+               "Non-virtualized ItemsControl::ApplyIncrementalChanges returns false on Reset");
+    AERO_CHECK(plainIc->Items().size() == 3u && plainIc->TotalItemCount() == 3u &&
+               plainIc->RealizedItemCount() == 3u,
+               "Non-virtualized ItemsControl preserved items_ and children when Reset was rejected");
+
+    // 2. Virtualized ListBox
+    auto virtLb = aero::MakeIntrusive<aero::ListBox>();
+    virtLb->SetAsRootVisual(true);
+    virtLb->SetIsVirtualizing(true);
+    virtLb->SetVirtualItemHeight(28.0f);
+    virtLb->SetItemsSource({
+        aero::value::FromString("Alpha"),
+        aero::value::FromString("Beta"),
+        aero::value::FromString("Gamma"),
+        aero::value::FromString("Delta"),
+    });
+    virtLb->Measure(aero::Size{200.0f, 120.0f});
+    virtLb->Arrange(aero::Rect{0.0f, 0.0f, 200.0f, 120.0f});
+    AERO_CHECK(virtLb->Items().size() == 4u && virtLb->RealizedItemCount() > 0u,
+               "Populated and arranged virtualized ListBox with 4 items");
+
+    const bool virtApplied = virtLb->ApplyIncrementalChanges(&resetRec, 1u);
+    AERO_CHECK(!virtApplied,
+               "Virtualized ListBox::ApplyIncrementalChanges returns false on Reset");
+    AERO_CHECK(virtLb->Items().size() == 4u && virtLb->TotalItemCount() == 4u &&
+               virtLb->RealizedItemCount() > 0u,
+               "Virtualized ListBox preserved items_ and realized slots when Reset was rejected");
+
+    // 3. ComboBox
+    auto combo = aero::MakeIntrusive<aero::ComboBox>();
+    combo->SetAsRootVisual(true);
+    combo->SetItemsSource({
+        aero::value::FromString("Ch1"),
+        aero::value::FromString("Ch2"),
+    });
+    const bool comboApplied = combo->ApplyIncrementalChanges(&resetRec, 1u);
+    AERO_CHECK(!comboApplied && combo->Items().size() == 2u && combo->ComboItemCount() == 2u,
+               "ComboBox::ApplyIncrementalChanges returns false without wiping items_ on Reset");
+}
+
+void TestListBoxInteractiveClickAndKeyboardTwoWaySync() {
+    std::printf("--- [Suite 5c] ListBox Interactive Pointer Click & KeyCode::Down/Up TwoWay Sync ---\n");
+    aero::AxbTemplateRegistry::Instance().Clear();
+
+    const char* rsCode = R"RS(
+module Game.InteractiveListP22;
+
+[Observable]
+public class PickerVm
+{
+    public string[] Options { get; set; } = null;
+    public int ChosenIndex { get; set; } = 0;
+    public string ChosenItem { get; set; } = "Sword";
+
+    public int ReadChosenIndex() { return ChosenIndex; }
+    public string ReadChosenItem() { return ChosenItem; }
+}
+
+public PickerVm CreatePickerVm()
+{
+    PickerVm vm = new PickerVm();
+    vm.Options = new string[3];
+    vm.Options[0] = "Sword";
+    vm.Options[1] = "Shield";
+    vm.Options[2] = "Potion";
+    vm.ChosenIndex = 0;
+    vm.ChosenItem = "Sword";
+    return vm;
+}
+)RS";
+
+    const char* xaml = R"XAML(
+<Grid xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+      xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+      x:DataType="Game.InteractiveListP22::PickerVm"
+      Width="240" Height="150">
+    <ListBox x:Name="PickerList"
+             Width="240" Height="150"
+             Background="#FF1E2430"
+             ItemsSource="{Binding Options}"
+             SelectedIndex="{Binding ChosenIndex, Mode=TwoWay}"
+             SelectedItem="{Binding ChosenItem, Mode=TwoWay}"/>
+</Grid>
+)XAML";
+
+    aero::AeroCompiler compiler;
+    aero::AeroCompileInput in{};
+    in.xamlPath = "Picker.xaml";
+    in.xamlContent = xaml;
+    in.scriptSources.push_back(aero::SourceFile{"PickerVm.rs", rsCode});
+
+    const aero::AeroCompileResult res = compiler.Compile(in);
+    AERO_CHECK(res.succeeded && res.programImage != nullptr, "Compiled Picker XAML + PickerVm");
+    if (!res.succeeded || !res.programImage) {
+        return;
+    }
+
+    aero::ExecutionDomainContext domains;
+    domains.registerProgramObservableMetadata(*res.programImage);
+    aero::Interpreter uiInterp(res.programImage, domains.uiHeapPtr());
+    uiInterp.setExecutionDomainContext(&domains, aero::DomainKind::UiPresentation);
+
+    const auto vmExec = uiInterp.invoke("Game.InteractiveListP22::CreatePickerVm");
+    AERO_CHECK(vmExec.succeeded, "Created PickerVm");
+    const aero::ObjectRef vmRef = std::get<aero::ObjectRef>(vmExec.value);
+    const auto pinVm = domains.uiHeap().retain(vmRef);
+
+    (void)domains.uiHeap().consumeDirtyObjects();
+    domains.uiHeap().clearDirtyFieldMask(vmRef);
+
+    aero::DualTrackBindingEngine bindingEngine(domains, res.programImage.get(), &uiInterp);
+    auto root = aero::MakeIntrusive<aero::Grid>();
+    root->SetAsRootVisual(true, &domains.nativeHandles(), &domains.uiHeap());
+    AERO_CHECK(
+        aero::MountAxbTemplate(root.Get(), res.axbPackage, &domains, &bindingEngine, vmRef, &uiInterp),
+        "Mounted Picker Grid + ListBox");
+
+    root->Measure(aero::Size{240.0f, 150.0f});
+    root->Arrange(aero::Rect{0.0f, 0.0f, 240.0f, 150.0f});
+
+    auto* listBox = root->FindName("PickerList")
+        ? root->FindName("PickerList")->DynamicCast<aero::ListBox>()
+        : nullptr;
+    AERO_CHECK(listBox != nullptr && listBox->RealizedItemCount() == 3u, "Resolved PickerList with 3 rows");
+    if (!listBox || listBox->RealizedItemCount() < 3u) {
+        return;
+    }
+
+    auto extractStr = [&](const aero::UnifiedValue& val) -> std::string {
+        if (const auto* ref = std::get_if<aero::ObjectRef>(&val)) {
+            if (const auto sv = domains.stringViewAcrossDomains(*ref)) {
+                return std::string(*sv);
+            }
+        }
+        if (const auto* sv = std::get_if<aero::StringValue>(&val)) {
+            return std::string(sv->str());
+        }
+        return aero::rs_rt::valueToString(val);
+    };
+
+    auto readVmIndex = [&]() -> std::int64_t {
+        const auto r = uiInterp.invoke("Game.InteractiveListP22::PickerVm.ReadChosenIndex", {vmRef});
+        return (r.succeeded && std::holds_alternative<std::int64_t>(r.value))
+            ? std::get<std::int64_t>(r.value)
+            : -999;
+    };
+
+    auto readVmItem = [&]() -> std::string {
+        const auto r = uiInterp.invoke("Game.InteractiveListP22::PickerVm.ReadChosenItem", {vmRef});
+        return r.succeeded ? extractStr(r.value) : std::string{};
+    };
+
+    AERO_CHECK(listBox->GetSelectedIndex() == 0 && readVmIndex() == 0 && readVmItem() == "Sword",
+               "Initial ListBox & ViewModel selection is index 0 ('Sword')");
+
+    aero::InputEventRouter router(root.Get());
+
+    // 1. Pointer click on row 1 ("Shield")
+    aero::UIElement* row0 = listBox->FirstChild();
+    aero::UIElement* row1 = row0 ? row0->NextSibling() : nullptr;
+    AERO_CHECK(row1 != nullptr && row1->FinalRect().height > 0.0f, "Row 1 has non-zero arranged bounds");
+    if (!row1) {
+        return;
+    }
+    const aero::Rect row1Screen = listBox->LocalToScreenBounds(row1->FinalRect());
+    const aero::Point clickRow1{
+        row1Screen.x + std::min(16.0f, row1Screen.width * 0.5f),
+        row1Screen.y + row1Screen.height * 0.5f};
+
+    (void)router.DispatchPointerDown(clickRow1, aero::PointerButton::Left);
+    (void)router.DispatchPointerUp(clickRow1, aero::PointerButton::Left);
+
+    AERO_CHECK(listBox->GetSelectedIndex() == 1 && extractStr(listBox->GetSelectedItem()) == "Shield",
+               "Pointer click on row 1 updated ListBox SelectedIndex=1 & SelectedItem='Shield'");
+    AERO_CHECK(readVmIndex() == 1 && readVmItem() == "Shield",
+               "Pointer click pushed SelectedIndex=1 & SelectedItem='Shield' to ViewModel via TwoWay binding");
+
+    // 2. Keyboard KeyCode::Down -> row 2 ("Potion")
+    AERO_CHECK(router.DispatchKeyDown(aero::KeyCode::Down), "ListBox handled KeyCode::Down");
+    (void)router.DispatchKeyUp(aero::KeyCode::Down);
+    AERO_CHECK(listBox->GetSelectedIndex() == 2 && extractStr(listBox->GetSelectedItem()) == "Potion",
+               "KeyCode::Down advanced ListBox selection to index 2 ('Potion')");
+    AERO_CHECK(readVmIndex() == 2 && readVmItem() == "Potion",
+               "KeyCode::Down pushed SelectedIndex=2 & SelectedItem='Potion' to ViewModel via TwoWay binding");
+
+    // 3. Keyboard KeyCode::Up -> back to row 1 ("Shield")
+    AERO_CHECK(router.DispatchKeyDown(aero::KeyCode::Up), "ListBox handled KeyCode::Up");
+    (void)router.DispatchKeyUp(aero::KeyCode::Up);
+    AERO_CHECK(listBox->GetSelectedIndex() == 1 && extractStr(listBox->GetSelectedItem()) == "Shield",
+               "KeyCode::Up moved ListBox selection back to index 1 ('Shield')");
+    AERO_CHECK(readVmIndex() == 1 && readVmItem() == "Shield",
+               "KeyCode::Up pushed SelectedIndex=1 & SelectedItem='Shield' to ViewModel via TwoWay binding");
+}
+
 } // namespace
 
 int main() {
@@ -859,6 +1163,9 @@ int main() {
     TestRealScriptDeltaRingAndRingOverflowFallback();
     (void)Test10kVirtualizedListBoxIncrementalSyncAndBenchmark();
     TestNativeArrayMethodsComboTabAndFallbackPaths();
+    TestObservableListNurseryGcSurvivalOnAddAndRemoveAt();
+    TestItemsControlApplyIncrementalChangesRejectsResetWithoutWipingItems();
+    TestListBoxInteractiveClickAndKeyboardTwoWaySync();
 
     std::printf("=== P2-2 Results: %d passed, %d failed ===\n", gPassed, gFailed);
     return (gFailed == 0) ? 0 : 1;

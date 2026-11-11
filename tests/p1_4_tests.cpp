@@ -1,9 +1,11 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <filesystem>
 #include <fstream>
 #include <sstream>
 #include <string>
+#include <system_error>
 #include <vector>
 
 #include "aero/animation/AnimationEngine.hpp"
@@ -700,10 +702,45 @@ public class ThermalConverters
 // Suite (d): Compile Official Samples (TicTacToe/Data/MainPage.xaml &
 //            Scoreboard/Data/MainPage.xaml + Inventory MultiBinding MathConverter)
 // ============================================================================
+std::filesystem::path ResolveSamplesDir() {
+    std::error_code ec;
+    if (const char* envDir = std::getenv("AERO_SAMPLES_DIR"); envDir && envDir[0] != '\0') {
+        const std::filesystem::path p(envDir);
+        if (std::filesystem::is_directory(p, ec)) {
+            return p;
+        }
+    }
+#ifdef AERO_SAMPLES_DIR
+    {
+        const std::filesystem::path p(AERO_SAMPLES_DIR);
+        if (!p.empty() && std::filesystem::is_directory(p, ec)) {
+            return p;
+        }
+    }
+#endif
+    constexpr const char* kCandidates[] = {
+        "Samples",
+        "samples",
+        "../Samples",
+        "../samples",
+        "../../Samples",
+        "../../samples",
+        "../../../Samples",
+        "../../../samples",
+    };
+    for (const char* cand : kCandidates) {
+        const std::filesystem::path p(cand);
+        if (std::filesystem::is_directory(p, ec)) {
+            return p;
+        }
+    }
+    return std::filesystem::path("Samples");
+}
+
 void TestOfficialSamplesCompilationAndExtraction() {
     std::printf("--- [Suite D] Compiling Official XAML Samples (TicTacToe & Scoreboard) ---\n");
 
-    const std::string samplesDir = "/working_dir/c_1a21a30fb41e1c84/scratch/samples";
+    const std::string samplesDir = ResolveSamplesDir().string();
     aero::AeroCompiler compiler;
 
     // 1. Official Sample: TicTacToe/Data/MainPage.xaml
@@ -874,20 +911,19 @@ void TestOfficialSamplesCompilationAndExtraction() {
     // 3. Bonus Official Sample Check: Inventory/Data/MainPage.xaml (9-source MultiBinding + MathConverter)
     {
         const std::string invXaml = ReadFileUtf8(samplesDir + "/Inventory/Data/MainPage.xaml");
-        if (!invXaml.empty()) {
-            aero::AeroCompileInput in{};
-            in.xamlPath = "Samples/Inventory/Data/MainPage.xaml";
-            in.xamlContent = invXaml;
-            const aero::AeroCompileResult res = compiler.Compile(in);
-            AERO_CHECK(res.succeeded && res.axbPackage.multiBindings.size() >= 4u,
-                       "Inventory/Data/MainPage.xaml extracted 4 nine-input MultiBindings with MathConverter");
-            if (!res.axbPackage.multiBindings.empty()) {
-                const auto& mb0 = res.axbPackage.multiBindings[0];
-                AERO_CHECK(
-                    mb0.converter == aero::ValueConverterKind::MathExpression &&
-                    mb0.sources.size() == 9u,
-                    "Inventory MultiBinding has 9 sources and MathExpression converter");
-            }
+        AERO_CHECK(!invXaml.empty(), "Loaded Samples/Inventory/Data/MainPage.xaml");
+        aero::AeroCompileInput in{};
+        in.xamlPath = "Samples/Inventory/Data/MainPage.xaml";
+        in.xamlContent = invXaml;
+        const aero::AeroCompileResult res = compiler.Compile(in);
+        AERO_CHECK(res.succeeded && res.axbPackage.multiBindings.size() >= 4u,
+                   "Inventory/Data/MainPage.xaml extracted 4 nine-input MultiBindings with MathConverter");
+        if (!res.axbPackage.multiBindings.empty()) {
+            const auto& mb0 = res.axbPackage.multiBindings[0];
+            AERO_CHECK(
+                mb0.converter == aero::ValueConverterKind::MathExpression &&
+                mb0.sources.size() == 9u,
+                "Inventory MultiBinding has 9 sources and MathExpression converter");
         }
     }
 

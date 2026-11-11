@@ -3,11 +3,13 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <filesystem>
 #include <fstream>
 #include <new>
 #include <sstream>
 #include <string>
 #include <string_view>
+#include <system_error>
 #include <vector>
 
 #include "aero/animation/AnimationEngine.hpp"
@@ -84,7 +86,7 @@ namespace {
            std::fabs(a.a - b.a) <= eps;
 }
 
-[[nodiscard]] std::string ReadFileText(const char* path) {
+[[nodiscard]] std::string ReadFileText(const std::filesystem::path& path) {
     std::ifstream ifs(path, std::ios::binary);
     if (!ifs.is_open()) {
         return {};
@@ -92,6 +94,41 @@ namespace {
     std::ostringstream oss;
     oss << ifs.rdbuf();
     return oss.str();
+}
+
+[[nodiscard]] std::filesystem::path ResolveSamplesDir() {
+    std::error_code ec;
+    if (const char* envDir = std::getenv("AERO_SAMPLES_DIR"); envDir && envDir[0] != '\0') {
+        const std::filesystem::path p(envDir);
+        if (std::filesystem::is_directory(p, ec)) {
+            return p;
+        }
+    }
+#ifdef AERO_SAMPLES_DIR
+    {
+        const std::filesystem::path p(AERO_SAMPLES_DIR);
+        if (!p.empty() && std::filesystem::is_directory(p, ec)) {
+            return p;
+        }
+    }
+#endif
+    constexpr const char* kCandidates[] = {
+        "Samples",
+        "samples",
+        "../Samples",
+        "../samples",
+        "../../Samples",
+        "../../samples",
+        "../../../Samples",
+        "../../../samples",
+    };
+    for (const char* cand : kCandidates) {
+        const std::filesystem::path p(cand);
+        if (std::filesystem::is_directory(p, ec)) {
+            return p;
+        }
+    }
+    return std::filesystem::path("Samples");
 }
 
 // (a) Style -> Setter(Template) -> ControlTemplate compile, .axb4 roundtrip & automatic mounting + PagedRenderTree switch
@@ -318,7 +355,6 @@ void TestTemplateBindingAndContentPresenterZeroAllocSync() {
     }
     gTrackHeapAllocs.store(false, std::memory_order_seq_cst);
 
-    const std::size_t hotAllocs = syncBindAllocs;
     AERO_CHECK(syncBindAllocs == 0u);
 
     // Also verify full end-to-end SetValue + PagedRenderTree::SyncVisualTree performs 0 heap allocations on color/border updates!
@@ -332,7 +368,8 @@ void TestTemplateBindingAndContentPresenterZeroAllocSync() {
         renderTree.ClearDirtyPages();
     }
     gTrackHeapAllocs.store(false, std::memory_order_seq_cst);
-    AERO_CHECK(gHeapAllocCount.load(std::memory_order_relaxed) == 0u);
+    const std::size_t colorSyncAllocs = gHeapAllocCount.load(std::memory_order_relaxed);
+    AERO_CHECK(colorSyncAllocs == 0u);
 
     AERO_CHECK(ColorNear(partBorder->GetBackground(), aero::Color{0.85f, 0.20f, 0.25f, 1.0f}));
     AERO_CHECK(ColorNear(partBorder->GetBorderBrush(), aero::Color{0.95f, 0.80f, 0.20f, 1.0f}));
@@ -340,7 +377,12 @@ void TestTemplateBindingAndContentPresenterZeroAllocSync() {
     AERO_CHECK(partContent->GetEffectiveText() == "HotSyncA");
     AERO_CHECK(ColorNear(partContent->GetEffectiveForeground(), aero::Color{1.0f, 0.95f, 0.80f, 1.0f}));
 
-    std::printf("[PASS] (b) TestTemplateBindingAndContentPresenterZeroAllocSync (hotAllocs=%zu)\n", hotAllocs);
+    std::printf(
+        "[PASS] (b) TestTemplateBindingAndContentPresenterZeroAllocSync "
+        "(syncBindAllocs=%zu, colorSyncAllocs=%zu, layoutRenderAllocs=%zu)\n",
+        syncBindAllocs,
+        colorSyncAllocs,
+        layoutRenderAllocs);
 }
 
 // (c) <ControlTemplate.Triggers> driven by InputEventRouter hover/press/check overriding TargetName elements & Storyboards
@@ -594,10 +636,11 @@ void TestPartContractLookupAndTemplatedSliderSync() {
 void TestOfficialButtonsSampleResourcesAndMainPageEndToEnd() {
     aero::AxbTemplateRegistry::Instance().Clear();
 
-    const std::string resXaml = ReadFileText(
-        "/working_dir/c_1a21a30fb41e1c84/scratch/samples/Buttons/Data/Resources.xaml");
-    const std::string pageXaml = ReadFileText(
-        "/working_dir/c_1a21a30fb41e1c84/scratch/samples/Buttons/Data/MainPage.xaml");
+    const std::filesystem::path samplesDir = ResolveSamplesDir();
+    const std::filesystem::path resPath = samplesDir / "Buttons" / "Data" / "Resources.xaml";
+    const std::filesystem::path pagePath = samplesDir / "Buttons" / "Data" / "MainPage.xaml";
+    const std::string resXaml = ReadFileText(resPath);
+    const std::string pageXaml = ReadFileText(pagePath);
     AERO_CHECK(!resXaml.empty());
     AERO_CHECK(!pageXaml.empty());
 
@@ -605,7 +648,7 @@ void TestOfficialButtonsSampleResourcesAndMainPageEndToEnd() {
 
     // 1. Compile Samples/Buttons/Data/Resources.xaml
     aero::AeroCompileInput resIn{};
-    resIn.xamlPath = "/working_dir/c_1a21a30fb41e1c84/scratch/samples/Buttons/Data/Resources.xaml";
+    resIn.xamlPath = resPath.string();
     resIn.xamlContent = resXaml;
     aero::AeroCompileResult resCompiled = compiler.Compile(resIn);
     AERO_CHECK(resCompiled.succeeded);
@@ -624,7 +667,7 @@ void TestOfficialButtonsSampleResourcesAndMainPageEndToEnd() {
     AERO_CHECK(deserResPkg.FindControlTemplate("ButtonTemplate") != nullptr);
 
     aero::AeroCompileInput pageIn{};
-    pageIn.xamlPath = "/working_dir/c_1a21a30fb41e1c84/scratch/samples/Buttons/Data/MainPage.xaml";
+    pageIn.xamlPath = pagePath.string();
     pageIn.xamlContent = pageXaml;
     aero::AeroCompileResult pageCompiled = compiler.Compile(pageIn);
     AERO_CHECK(pageCompiled.succeeded);
@@ -709,12 +752,16 @@ void TestOfficialLoginAndGalleryTemplatesAndAotCodegen() {
     aero::AxbTemplateRegistry::Instance().Clear();
     aero::AeroCompiler compiler;
 
+    const std::filesystem::path samplesDir = ResolveSamplesDir();
+    const std::filesystem::path loginResPath = samplesDir / "Login" / "Data" / "Resources.xaml";
+    const std::filesystem::path galBtnPath = samplesDir / "Gallery" / "Data" / "Samples" / "Button.xaml";
+    const std::filesystem::path galChkPath = samplesDir / "Gallery" / "Data" / "Samples" / "CheckBox.xaml";
+
     // 1. Login/Data/Resources.xaml (TextBox & PasswordBox ControlTemplates with RelativeSource TemplatedParent & MultiDataTrigger)
-    const std::string loginResXaml = ReadFileText(
-        "/working_dir/c_1a21a30fb41e1c84/scratch/samples/Login/Data/Resources.xaml");
+    const std::string loginResXaml = ReadFileText(loginResPath);
     AERO_CHECK(!loginResXaml.empty());
     aero::AeroCompileInput loginIn{};
-    loginIn.xamlPath = "/working_dir/c_1a21a30fb41e1c84/scratch/samples/Login/Data/Resources.xaml";
+    loginIn.xamlPath = loginResPath.string();
     loginIn.xamlContent = loginResXaml;
     loginIn.emitAotCpp = true;
     aero::AeroCompileResult loginRes = compiler.Compile(loginIn);
@@ -723,11 +770,10 @@ void TestOfficialLoginAndGalleryTemplatesAndAotCodegen() {
     AERO_CHECK(loginRes.aotCpp.source.find("RegisterControlTemplate") != std::string::npos);
 
     // 2. Gallery/Data/Samples/Button.xaml (inline <Setter Property="Template"><Setter.Value><ControlTemplate>...)
-    const std::string galleryBtnXaml = ReadFileText(
-        "/working_dir/c_1a21a30fb41e1c84/scratch/samples/Gallery/Data/Samples/Button.xaml");
+    const std::string galleryBtnXaml = ReadFileText(galBtnPath);
     AERO_CHECK(!galleryBtnXaml.empty());
     aero::AeroCompileInput galBtnIn{};
-    galBtnIn.xamlPath = "/working_dir/c_1a21a30fb41e1c84/scratch/samples/Gallery/Data/Samples/Button.xaml";
+    galBtnIn.xamlPath = galBtnPath.string();
     galBtnIn.xamlContent = galleryBtnXaml;
     aero::AeroCompileResult galBtnRes = compiler.Compile(galBtnIn);
     AERO_CHECK(galBtnRes.succeeded);
@@ -741,11 +787,10 @@ void TestOfficialLoginAndGalleryTemplatesAndAotCodegen() {
     }
 
     // 3. Gallery/Data/Samples/CheckBox.xaml
-    const std::string galleryChkXaml = ReadFileText(
-        "/working_dir/c_1a21a30fb41e1c84/scratch/samples/Gallery/Data/Samples/CheckBox.xaml");
+    const std::string galleryChkXaml = ReadFileText(galChkPath);
     AERO_CHECK(!galleryChkXaml.empty());
     aero::AeroCompileInput galChkIn{};
-    galChkIn.xamlPath = "/working_dir/c_1a21a30fb41e1c84/scratch/samples/Gallery/Data/Samples/CheckBox.xaml";
+    galChkIn.xamlPath = galChkPath.string();
     galChkIn.xamlContent = galleryChkXaml;
     aero::AeroCompileResult galChkRes = compiler.Compile(galChkIn);
     AERO_CHECK(galChkRes.succeeded);

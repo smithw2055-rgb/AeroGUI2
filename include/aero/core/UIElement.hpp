@@ -22,6 +22,7 @@ struct AxbControlTemplate;
 enum class ValueConverterKind : std::uint8_t;
 class ContentPresenter;
 class DualTrackBindingEngine;
+class StyleTriggerEngine;
 class AnimationEngine;
 
 struct UIEffectDescriptor {
@@ -209,6 +210,9 @@ public:
     [[nodiscard]] const std::string& Name() const noexcept { return name_; }
     void SetName(std::string name) noexcept { name_ = std::move(name); }
     [[nodiscard]] UIElement* FindName(std::string_view targetName) noexcept;
+    void SetNamescopeBoundary(bool boundary) noexcept { isNamescopeBoundary_ = boundary; }
+    [[nodiscard]] bool IsNamescopeBoundary() const noexcept { return isNamescopeBoundary_; }
+    [[nodiscard]] static UIElement* FindNamescopeRoot(UIElement* elem) noexcept;
 
     // Layout geometry & Measure/Arrange lifecycle
     void Measure(Size availableSize) noexcept;
@@ -340,6 +344,24 @@ public:
         return boundBindingEngine_;
     }
     bool NotifyTwoWayPropertyMutated(std::uint16_t propId, RuntimeError* error = nullptr);
+    void BindStyleEngine(StyleTriggerEngine* engine) noexcept {
+        boundStyleEngine_ = engine;
+    }
+    [[nodiscard]] StyleTriggerEngine* BoundStyleEngine() const noexcept {
+        return boundStyleEngine_;
+    }
+    void BindAnimationEngine(AnimationEngine* engine) noexcept {
+        boundAnimationEngine_ = engine;
+    }
+    [[nodiscard]] AnimationEngine* BoundAnimationEngine() const noexcept {
+        return boundAnimationEngine_;
+    }
+    void MarkReferencedAsElementSource() const noexcept {
+        referencedAsElementSource_ = true;
+    }
+    [[nodiscard]] bool IsReferencedAsElementSource() const noexcept {
+        return referencedAsElementSource_;
+    }
 
     // Virtual zero-RTTI input dispatch hooks invoked by InputEventRouter
     [[nodiscard]] virtual bool IsInteractiveControl() const noexcept {
@@ -811,10 +833,14 @@ private:
     NativeHandleRegistry* boundRegistry_ = nullptr;
     ManagedHeap* boundUiHeap_ = nullptr;
     DualTrackBindingEngine* boundBindingEngine_ = nullptr;
+    StyleTriggerEngine* boundStyleEngine_ = nullptr;
+    AnimationEngine* boundAnimationEngine_ = nullptr;
     ObjectRef boundWrapperRef_{};
     PersistentRoot pinnedWrapperRoot_{};
     bool isConnectedToRoot_ = false;
     bool registeredInValuePoolSet_ = false;
+    bool isNamescopeBoundary_ = false;
+    mutable bool referencedAsElementSource_ = false;
     std::uint16_t fastActiveAnimMask_ = 0u;
     std::array<std::uint8_t, kFastInlinePropertySlotCount> fastInlineRanks_{};
 

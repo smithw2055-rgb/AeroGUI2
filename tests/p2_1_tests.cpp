@@ -4,9 +4,11 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <filesystem>
 #include <iostream>
 #include <memory>
 #include <string>
+#include <system_error>
 #include <thread>
 #include <vector>
 
@@ -51,10 +53,48 @@ void CheckImpl(bool cond, const char* expr, int line, const char* msg = "") {
 
 #define AERO_CHECK(cond, msg) CheckImpl((cond), #cond, __LINE__, (msg))
 
-constexpr const char* kRobotoTtfPath =
-    "/working_dir/c_1a21a30fb41e1c84/scratch/samples/DataBinding/Data/Roboto-Regular.ttf";
-constexpr const char* kAeroMaticsTtfPath =
-    "/working_dir/c_1a21a30fb41e1c84/scratch/samples/HelloWorld/Data/Aero Matics Regular.ttf";
+std::filesystem::path ResolveSamplesDir() {
+    std::error_code ec;
+    if (const char* envDir = std::getenv("AERO_SAMPLES_DIR"); envDir && envDir[0] != '\0') {
+        const std::filesystem::path p(envDir);
+        if (std::filesystem::is_directory(p, ec)) {
+            return p;
+        }
+    }
+#ifdef AERO_SAMPLES_DIR
+    {
+        const std::filesystem::path p(AERO_SAMPLES_DIR);
+        if (!p.empty() && std::filesystem::is_directory(p, ec)) {
+            return p;
+        }
+    }
+#endif
+    constexpr const char* kCandidates[] = {
+        "Samples",
+        "samples",
+        "../Samples",
+        "../samples",
+        "../../Samples",
+        "../../samples",
+        "../../../Samples",
+        "../../../samples",
+    };
+    for (const char* cand : kCandidates) {
+        const std::filesystem::path p(cand);
+        if (std::filesystem::is_directory(p, ec)) {
+            return p;
+        }
+    }
+    return std::filesystem::path("Samples");
+}
+
+std::string RobotoTtfPath() {
+    return (ResolveSamplesDir() / "DataBinding" / "Data" / "Roboto-Regular.ttf").string();
+}
+
+std::string AeroMaticsTtfPath() {
+    return (ResolveSamplesDir() / "HelloWorld" / "Data" / "Aero Matics Regular.ttf").string();
+}
 
 aero::DecodedImage MakeSolidImage(
     std::uint32_t width,
@@ -311,7 +351,7 @@ void TestDualViewportZeroCrosstalkAndIndependentTeardown() {
     std::thread workerA([&]() {
         ScopedUiResourceContext scope(editorCtx);
         const bool fontOk = FontAtlas::Instance().LoadTrueTypeFontFromFile(
-            kRobotoTtfPath,
+            RobotoTtfPath(),
             "SharedViewportFont",
             true);
         // Pure crimson-cyan banner texture in Editor Viewport A: RGB(220, 30, 40)
@@ -333,7 +373,7 @@ void TestDualViewportZeroCrosstalkAndIndependentTeardown() {
     std::thread workerB([&]() {
         ScopedUiResourceContext scope(gameCtx);
         const bool fontOk = FontAtlas::Instance().LoadTrueTypeFontFromFile(
-            kAeroMaticsTtfPath,
+            AeroMaticsTtfPath(),
             "SharedViewportFont",
             true);
         // Pure azure banner texture in Game Viewport B: RGB(20, 180, 235)

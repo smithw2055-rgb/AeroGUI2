@@ -762,6 +762,18 @@ bool TrueTypeFontFace::ParseTables(std::string* outError) {
     glyfOffset_ = glyf.offset;
     glyfLength_ = glyf.length;
 
+    if (static_cast<std::uint64_t>(hmtxOffset_) + static_cast<std::uint64_t>(hmtxLength_) > data_.size()) {
+        if (outError) *outError = "TrueType hmtx table exceeds file bounds";
+        return false;
+    }
+    if (numberOfHMetrics_ > numGlyphs_) {
+        numberOfHMetrics_ = numGlyphs_;
+    }
+    if (hmtxLength_ < static_cast<std::size_t>(numberOfHMetrics_) * 4u) {
+        if (outError) *outError = "Truncated TrueType hmtx table";
+        return false;
+    }
+
     const std::size_t requiredLocaBytes = (indexToLocFormat_ == 0)
         ? (static_cast<std::size_t>(numGlyphs_) + 1u) * 2u
         : (static_cast<std::size_t>(numGlyphs_) + 1u) * 4u;
@@ -914,11 +926,16 @@ bool TrueTypeFontFace::ParseCmapTable(std::uint32_t offset, std::uint32_t length
             r.ReadU32BE(bestFmt12Off + 12u, numGroups) &&
             r.InBounds(bestFmt12Off + 16u, static_cast<std::size_t>(numGroups) * 12u)) {
             cmap12Groups_.resize(numGroups);
+            cmap12Sorted_ = true;
             for (std::uint32_t g = 0u; g < numGroups; ++g) {
                 const std::size_t gOff = bestFmt12Off + 16u + static_cast<std::size_t>(g) * 12u;
                 (void)r.ReadU32BE(gOff + 0u, cmap12Groups_[g].startCharCode);
                 (void)r.ReadU32BE(gOff + 4u, cmap12Groups_[g].endCharCode);
                 (void)r.ReadU32BE(gOff + 8u, cmap12Groups_[g].startGlyphId);
+                if (cmap12Groups_[g].startCharCode > cmap12Groups_[g].endCharCode ||
+                    (g > 0u && cmap12Groups_[g].endCharCode <= cmap12Groups_[g - 1u].endCharCode)) {
+                    cmap12Sorted_ = false;
+                }
             }
             hasFormat12_ = !cmap12Groups_.empty();
         }
@@ -936,6 +953,7 @@ bool TrueTypeFontFace::ParseCmapTable(std::uint32_t offset, std::uint32_t length
             const std::size_t idRangeBase = idDeltaBase + static_cast<std::size_t>(segCount) * 2u;
             if (r.InBounds(idRangeBase, static_cast<std::size_t>(segCount) * 2u)) {
                 cmap4Segments_.resize(segCount);
+                cmap4Sorted_ = true;
                 for (std::uint16_t s = 0u; s < segCount; ++s) {
                     const std::size_t wOff = static_cast<std::size_t>(s) * 2u;
                     (void)r.ReadU16BE(endCodeBase + wOff, cmap4Segments_[s].endCode);
@@ -943,6 +961,10 @@ bool TrueTypeFontFace::ParseCmapTable(std::uint32_t offset, std::uint32_t length
                     (void)r.ReadI16BE(idDeltaBase + wOff, cmap4Segments_[s].idDelta);
                     (void)r.ReadU16BE(idRangeBase + wOff, cmap4Segments_[s].idRangeOffset);
                     cmap4Segments_[s].idRangeOffsetBytePos = static_cast<std::uint32_t>(idRangeBase + wOff);
+                    if (cmap4Segments_[s].startCode > cmap4Segments_[s].endCode ||
+                        (s > 0u && cmap4Segments_[s].endCode <= cmap4Segments_[s - 1u].endCode)) {
+                        cmap4Sorted_ = false;
+                    }
                 }
                 hasFormat4_ = !cmap4Segments_.empty();
                 isSymbolCmap_ = bestFmt4Symbol;
@@ -1042,16 +1064,25 @@ std::uint32_t TrueTypeFontFace::FindGlyphIndex(std::uint32_t codePoint) const no
     }
 
     if (hasFormat12_) {
-        auto it = std::lower_bound(
-            cmap12Groups_.begin(),
-            cmap12Groups_.end(),
-            codePoint,
-            [](const CmapFormat12Group& g, std::uint32_t cp) {
-                return g.endCharCode < cp;
-            });
-        if (it != cmap12Groups_.end() && codePoint >= it->startCharCode && codePoint <= it->endCharCode) {
-            const std::uint32_t gid = it->startGlyphId + (codePoint - it->startCharCode);
-            return (gid < numGlyphs_) ? gid : 0u;
+        if (cmap12Sorted_) {
+            auto it = std::lower_bound(
+                cmap12Groups_.begin(),
+                cmap12Groups_.end(),
+                codePoint,
+                [](const CmapFormat12Group& g, std::uint32_t cp) {
+                    return g.endCharCode < cp;
+                });
+            if (it != cmap12Groups_.end() && codePoint >= it->startCharCode && codePoint <= it->endCharCode) {
+                const std::uint32_t gid = it->startGlyphId + (codePoint - it->startCharCode);
+                return (gid < numGlyphs_) ? gid : 0u;
+            }
+        } else {
+            for (const auto& grp : cmap12Groups_) {
+                if (codePoint >= grp.startCharCode && codePoint <= grp.endCharCode) {
+                    const std::uint32_t gid = grp.startGlyphId + (codePoint - grp.startCharCode);
+                    return (gid < numGlyphs_) ? gid : 0u;
+                }
+            }
         }
     }
 
@@ -1060,31 +1091,44 @@ std::uint32_t TrueTypeFontFace::FindGlyphIndex(std::uint32_t codePoint) const no
             return 0u;
         }
         const auto cp16 = static_cast<std::uint16_t>(cp);
-        auto it = std::lower_bound(
-            cmap4Segments_.begin(),
-            cmap4Segments_.end(),
-            cp16,
-            [](const CmapFormat4Segment& seg, std::uint16_t target) {
-                return seg.endCode < target;
-            });
-        if (it == cmap4Segments_.end() || cp16 < it->startCode) {
+        const CmapFormat4Segment* seg = nullptr;
+        if (cmap4Sorted_) {
+            auto it = std::lower_bound(
+                cmap4Segments_.begin(),
+                cmap4Segments_.end(),
+                cp16,
+                [](const CmapFormat4Segment& s, std::uint16_t target) {
+                    return s.endCode < target;
+                });
+            if (it != cmap4Segments_.end() && cp16 >= it->startCode) {
+                seg = &(*it);
+            }
+        } else {
+            for (const auto& s : cmap4Segments_) {
+                if (cp16 >= s.startCode && cp16 <= s.endCode) {
+                    seg = &s;
+                    break;
+                }
+            }
+        }
+        if (!seg) {
             return 0u;
         }
-        if (it->idRangeOffset == 0u) {
+        if (seg->idRangeOffset == 0u) {
             const std::uint32_t gid = static_cast<std::uint16_t>(
-                static_cast<std::int32_t>(cp16) + static_cast<std::int32_t>(it->idDelta));
+                static_cast<std::int32_t>(cp16) + static_cast<std::int32_t>(seg->idDelta));
             return (gid < numGlyphs_) ? gid : 0u;
         }
-        const std::size_t wordAddr = static_cast<std::size_t>(it->idRangeOffsetBytePos) +
-            static_cast<std::size_t>(it->idRangeOffset) +
-            static_cast<std::size_t>(cp16 - it->startCode) * 2u;
+        const std::size_t wordAddr = static_cast<std::size_t>(seg->idRangeOffsetBytePos) +
+            static_cast<std::size_t>(seg->idRangeOffset) +
+            static_cast<std::size_t>(cp16 - seg->startCode) * 2u;
         TtfReader r{data_.data(), data_.size()};
         std::uint16_t rawGid = 0u;
         if (!r.ReadU16BE(wordAddr, rawGid) || rawGid == 0u) {
             return 0u;
         }
         const std::uint32_t gid = static_cast<std::uint16_t>(
-            static_cast<std::int32_t>(rawGid) + static_cast<std::int32_t>(it->idDelta));
+            static_cast<std::int32_t>(rawGid) + static_cast<std::int32_t>(seg->idDelta));
         return (gid < numGlyphs_) ? gid : 0u;
     };
 
@@ -1118,7 +1162,10 @@ void TrueTypeFontFace::GetGlyphHorizontalMetrics(
         return;
     }
 
-    TtfReader r{data_.data(), data_.size()};
+    const std::size_t hmtxEnd = std::min<std::size_t>(
+        data_.size(),
+        static_cast<std::size_t>(hmtxOffset_) + static_cast<std::size_t>(hmtxLength_));
+    TtfReader r{data_.data(), hmtxEnd};
     const std::uint32_t clampedGlyph = (glyphIndex < numGlyphs_) ? glyphIndex : 0u;
     if (clampedGlyph < numberOfHMetrics_) {
         const std::size_t off = static_cast<std::size_t>(hmtxOffset_) + static_cast<std::size_t>(clampedGlyph) * 4u;
@@ -1201,9 +1248,10 @@ bool TrueTypeFontFace::GetGlyphDataSpan(
 bool TrueTypeFontFace::ExtractGlyphRecursive(
     std::uint32_t glyphIndex,
     std::uint32_t depth,
+    std::uint32_t& ioTotalVisitedComponents,
     std::vector<TtfContourSegment>& outSegments,
     std::vector<TtfPoint>* outRawPoints) const {
-    if (depth > 8u || glyphIndex >= numGlyphs_) {
+    if (depth > 8u || ++ioTotalVisitedComponents > 128u || glyphIndex >= numGlyphs_) {
         return false;
     }
 
@@ -1219,7 +1267,10 @@ bool TrueTypeFontFace::ExtractGlyphRecursive(
         return false;
     }
 
-    TtfReader r{data_.data(), data_.size()};
+    const std::size_t glyphEnd = std::min<std::size_t>(
+        data_.size(),
+        static_cast<std::size_t>(gOff) + static_cast<std::size_t>(gLen));
+    TtfReader r{data_.data(), glyphEnd};
     std::int16_t numContours = 0;
     if (!r.ReadI16BE(gOff, numContours)) {
         return false;
@@ -1404,7 +1455,6 @@ bool TrueTypeFontFace::ExtractGlyphRecursive(
     constexpr std::uint16_t kScaledComponentOffset = 0x0800u;
 
     std::size_t pos = static_cast<std::size_t>(gOff) + 10u;
-    const std::size_t glyphEnd = static_cast<std::size_t>(gOff) + gLen;
     std::vector<TtfPoint> compositePoints;
     std::uint16_t compFlags = kMoreComponents;
 
@@ -1468,7 +1518,7 @@ bool TrueTypeFontFace::ExtractGlyphRecursive(
 
         std::vector<TtfContourSegment> childSegs;
         std::vector<TtfPoint> childPts;
-        if (!ExtractGlyphRecursive(subGlyphIdx, depth + 1u, childSegs, &childPts)) {
+        if (!ExtractGlyphRecursive(subGlyphIdx, depth + 1u, ioTotalVisitedComponents, childSegs, &childPts)) {
             return false;
         }
 
@@ -1533,7 +1583,8 @@ bool TrueTypeFontFace::ExtractGlyphOutline(
 
     GetGlyphHorizontalMetrics(glyphIndex, outOutline.advanceWidth, outOutline.leftSideBearing);
 
-    if (!ExtractGlyphRecursive(glyphIndex, 0u, outOutline.segments, nullptr)) {
+    std::uint32_t totalVisitedComponents = 0u;
+    if (!ExtractGlyphRecursive(glyphIndex, 0u, totalVisitedComponents, outOutline.segments, nullptr)) {
         return false;
     }
 
@@ -1691,7 +1742,7 @@ void FontAtlas::BlitCellR8Locked(
             srcPixels + static_cast<std::size_t>(r) * cellW,
             copyW);
     }
-    ++revision_;
+    revision_.fetch_add(1u, std::memory_order_release);
 }
 
 void FontAtlas::InitBuiltInFallbackAscii() {
@@ -2116,10 +2167,11 @@ FontAtlasGlyph FontAtlas::EnsureGlyphLocked(
                         meta.u1 = (static_cast<float>(ax + meta.cellWidth) - 0.5f) * invW;
                         meta.v1 = (static_cast<float>(ay + meta.cellHeight) - 0.5f) * invH;
                     } else {
-                        // Atlas full fallback
+                        // Atlas full fallback — do NOT insert permanent tofu entry into glyphCache_
                         meta = (codePoint < 128u) ? builtInAscii_[codePoint] : builtInCjkBoxGlyph_;
                         meta.codePoint = codePoint;
                         meta.advanceEm = outline.advanceWidth / static_cast<float>(fontEntry->face->UnitsPerEm());
+                        return meta;
                     }
                 } else {
                     meta.u0 = 2.5f * invW;
@@ -2173,8 +2225,8 @@ FontAtlasGlyph FontAtlas::EnsureGlyphLocked(
         fallback.v0 = (static_cast<float>(fy) + 0.5f) * invH;
         fallback.u1 = (static_cast<float>(fx + 20u) - 0.5f) * invW;
         fallback.v1 = (static_cast<float>(fy + 24u) - 0.5f) * invH;
+        glyphCache_[fallbackKey] = fallback;
     }
-    glyphCache_[fallbackKey] = fallback;
     return fallback;
 }
 
@@ -2306,7 +2358,11 @@ bool FontAtlas::UnpackGlyphShard(
         !r.ReadF32(lineGapEm)) {
         return false;
     }
-    if (rangeEnd < rangeStart || familyLen > (r.size - r.offset)) {
+    if (rangeEnd < rangeStart || familyLen > (r.size - r.offset) ||
+        !std::isfinite(ascentEm) || !std::isfinite(descentEm) || !std::isfinite(lineGapEm) ||
+        ascentEm < -16.0f || ascentEm > 16.0f ||
+        descentEm < -16.0f || descentEm > 16.0f ||
+        lineGapEm < -16.0f || lineGapEm > 16.0f) {
         return false;
     }
 
@@ -2326,6 +2382,16 @@ bool FontAtlas::UnpackGlyphShard(
             !r.ReadU16(cw) || !r.ReadU16(ch) ||
             !r.ReadF32(adv) || !r.ReadF32(bx) || !r.ReadF32(by) ||
             !r.ReadF32(qw) || !r.ReadF32(qh) || !r.ReadF32(pxr)) {
+            return false;
+        }
+        if (!std::isfinite(adv) || !std::isfinite(bx) || !std::isfinite(by) ||
+            !std::isfinite(qw) || !std::isfinite(qh) || !std::isfinite(pxr) ||
+            adv < -32.0f || adv > 64.0f ||
+            bx < -32.0f || bx > 32.0f ||
+            by < -32.0f || by > 32.0f ||
+            qw < 0.0f || qw > 64.0f ||
+            qh < 0.0f || qh > 64.0f ||
+            pxr <= 0.0f || pxr > 128.0f) {
             return false;
         }
         const std::size_t pixBytes = ((flags & 0x0002u) != 0u)
@@ -2400,6 +2466,9 @@ bool FontAtlas::UnpackGlyphShard(
                 g.v0 = (static_cast<float>(ay) + 0.5f) * invH;
                 g.u1 = (static_cast<float>(ax + g.cellWidth) - 0.5f) * invW;
                 g.v1 = (static_cast<float>(ay + g.cellHeight) - 0.5f) * invH;
+            } else {
+                // Atlas full — do not cache empty tofu entry permanently
+                continue;
             }
         } else {
             g.u0 = 2.5f * invW;
@@ -2433,9 +2502,11 @@ TextLayoutResult FontAtlas::MeasureLayout(
 
     std::unique_lock<std::mutex> lock(mutex_);
     const RegisteredFontEntry* fontEntry = ResolveFontEntryLocked(fontFamily);
-    const TrueTypeFontFace* face = (fontEntry && fontEntry->face && fontEntry->face->IsValid())
-        ? fontEntry->face.get()
+    std::shared_ptr<TrueTypeFontFace> faceHolder =
+        (fontEntry && fontEntry->face && fontEntry->face->IsValid())
+        ? fontEntry->face
         : nullptr;
+    const TrueTypeFontFace* face = faceHolder.get();
     const bool hasCustomFont = (fontEntry != nullptr);
     result.usedTrueTypeMetrics = hasCustomFont;
 
@@ -2641,7 +2712,45 @@ TextLayoutResult FontAtlas::MeasureLayout(
     return result;
 }
 
+void FontAtlas::CopyGlyphRegionRgba8(
+    std::uint32_t maxRows,
+    std::vector<std::uint8_t>& outRgba8,
+    std::uint32_t& outWidth,
+    std::uint32_t& outRows,
+    std::uint64_t* outRevision) const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    outWidth = atlasWidth_;
+    const std::uint32_t limitRows = std::min<std::uint32_t>(
+        maxRows,
+        std::min<std::uint32_t>(glyphRegionHeight_, atlasHeight_));
+    outRows = limitRows;
+    if (outRevision) {
+        *outRevision = revision_.load(std::memory_order_relaxed);
+    }
+    const std::size_t pixelCount = static_cast<std::size_t>(outWidth) * outRows;
+    outRgba8.resize(pixelCount * 4u);
+    const std::size_t avail = std::min(pixelCount, sdfPixels_.size());
+    std::uint8_t* __restrict dst = outRgba8.data();
+    const std::uint8_t* __restrict src = sdfPixels_.data();
+    for (std::size_t i = 0u; i < avail; ++i) {
+        const std::uint8_t sd = src[i];
+        const std::size_t base = i * 4u;
+        dst[base + 0u] = sd;
+        dst[base + 1u] = sd;
+        dst[base + 2u] = sd;
+        dst[base + 3u] = 255u;
+    }
+    for (std::size_t i = avail; i < pixelCount; ++i) {
+        const std::size_t base = i * 4u;
+        dst[base + 0u] = 0u;
+        dst[base + 1u] = 0u;
+        dst[base + 2u] = 0u;
+        dst[base + 3u] = 255u;
+    }
+}
+
 float FontAtlas::SampleSdfBilinear(float u, float v) const noexcept {
+    std::lock_guard<std::mutex> lock(mutex_);
     if (sdfPixels_.empty() || atlasWidth_ == 0u || atlasHeight_ == 0u) {
         return 0.0f;
     }

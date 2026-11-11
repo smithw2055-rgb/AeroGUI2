@@ -103,6 +103,7 @@ private:
     std::size_t maxPagesInRing_ = 256;
     std::size_t ringCapacityBytes_ = 0;
     std::vector<std::uint8_t> ownedRingStorage_;
+    std::vector<std::size_t> prevUploadedBytes_;
     std::uint8_t* mappedRingBase_ = nullptr;
     std::vector<GlBufferSubDataSpan> subDataSpans_;
     std::vector<GpuClipDrawBatch> clipDrawBatches_;

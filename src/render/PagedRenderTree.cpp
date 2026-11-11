@@ -387,6 +387,15 @@ struct SurfaceFillBorderPlan {
     return plan;
 }
 
+[[nodiscard]] std::uint32_t ExtractGradBrushId(const UnifiedValue& v) noexcept {
+    if (const auto* i = std::get_if<std::int64_t>(&v)) {
+        if (*i > 0) {
+            return static_cast<std::uint32_t>(*i);
+        }
+    }
+    return 0u;
+}
+
 [[nodiscard]] SurfaceFillBorderPlan ComputeContainerFillBorderPlan(
     const UIElement* elem,
     const Rect& outerRect) noexcept {
@@ -398,6 +407,7 @@ struct SurfaceFillBorderPlan {
     // and never fall back to an opaque default backdrop when unbacked.
     const auto bgOpt = value::TryGetColor(elem->GetValue(PropId_Background));
     const bool hasVisibleBg = bgOpt.has_value() && (bgOpt->a > 0.0f);
+    const bool hasGradientBg = ExtractGradBrushId(elem->GetValue(PropId_BackgroundGradientId)) != 0u;
     const Color fillCol = hasVisibleBg ? *bgOpt : Color{0.0f, 0.0f, 0.0f, 0.0f};
 
     const CornerRadius cr = value::TryGetCornerRadius(elem->GetValue(PropId_CornerRadius))
@@ -409,20 +419,11 @@ struct SurfaceFillBorderPlan {
     return BuildSurfaceFillBorderPlan(
         outerRect,
         cr,
-        hasVisibleBg,
+        hasVisibleBg || hasGradientBg,
         fillCol,
         bbOpt.has_value(),
         bbOpt.value_or(Color{0.0f, 0.0f, 0.0f, 0.0f}),
         bt);
-}
-
-[[nodiscard]] std::uint32_t ExtractGradBrushId(const UnifiedValue& v) noexcept {
-    if (const auto* i = std::get_if<std::int64_t>(&v)) {
-        if (*i > 0) {
-            return static_cast<std::uint32_t>(*i);
-        }
-    }
-    return 0u;
 }
 
 void ConfigureRoundedRectDescriptor(
@@ -977,8 +978,92 @@ void UnpackGradientRoundedRectVertexParams(
 }
 
 PagedRenderTree::PagedRenderTree()
-    : treeId_(gNextRenderTreeId.fetch_add(1u, std::memory_order_relaxed)) {
+    : treeId_(gNextRenderTreeId.fetch_add(1u, std::memory_order_relaxed)),
+      mtsdfOwnerId_(treeId_) {
     InitPreCachedDigitGlyphs();
+}
+
+void PagedRenderTree::RegisterMtsdfInTreeAtlas(const AxbMtsdfPathEntry& entry) {
+    if (entry.pathHash == 0u ||
+        entry.cellWidth == 0u ||
+        entry.cellHeight == 0u ||
+        entry.mtsdfRgbaPixels.size() < static_cast<std::size_t>(entry.cellWidth) * entry.cellHeight * 4u) {
+        return;
+    }
+    if (mtsdfRegisteredHashes_.find(entry.pathHash) != mtsdfRegisteredHashes_.end()) {
+        return;
+    }
+
+    constexpr std::uint32_t kAtlasWidth = 1024u;
+    constexpr std::uint32_t kMtsdfBaseY = 512u;
+    constexpr std::uint32_t kMtsdfMaxRows = 448u; // y in [512 .. 959], leaving [960 .. 1023] for gradients
+    const std::size_t totalBytes = static_cast<std::size_t>(kAtlasWidth) * kMtsdfMaxRows * 4u;
+    if (mtsdfAtlasRgba8_.size() != totalBytes) {
+        mtsdfAtlasRgba8_.assign(totalBytes, 0u);
+    }
+
+    const int rawOriginX = static_cast<int>(std::lround(entry.u0 * static_cast<float>(kAtlasWidth) - 0.5f));
+    const int rawOriginY = static_cast<int>(std::lround(entry.v0 * static_cast<float>(kAtlasWidth) - 0.5f));
+    const int rawEndX = static_cast<int>(std::lround(entry.u1 * static_cast<float>(kAtlasWidth) + 0.5f));
+    const int rawEndY = static_cast<int>(std::lround(entry.v1 * static_cast<float>(kAtlasWidth) + 0.5f));
+
+    const int dstX0 = std::clamp(rawOriginX, 0, static_cast<int>(kAtlasWidth));
+    const int dstY0 = std::clamp(rawOriginY, static_cast<int>(kMtsdfBaseY), static_cast<int>(kMtsdfBaseY + kMtsdfMaxRows));
+    const int dstX1 = std::clamp(std::max(dstX0, rawEndX), 0, static_cast<int>(kAtlasWidth));
+    const int dstY1 = std::clamp(std::max(dstY0, rawEndY), static_cast<int>(kMtsdfBaseY), static_cast<int>(kMtsdfBaseY + kMtsdfMaxRows));
+
+    const int dstW = dstX1 - dstX0;
+    const int dstH = dstY1 - dstY0;
+    if (dstW <= 0 || dstH <= 0) {
+        return;
+    }
+
+    if (dstW == static_cast<int>(entry.cellWidth) && dstH == static_cast<int>(entry.cellHeight)) {
+        for (int cy = 0; cy < dstH; ++cy) {
+            const std::size_t localRow = static_cast<std::size_t>(dstY0 - static_cast<int>(kMtsdfBaseY) + cy);
+            std::uint8_t* dstRow = mtsdfAtlasRgba8_.data() +
+                (localRow * kAtlasWidth + static_cast<std::size_t>(dstX0)) * 4u;
+            const std::uint8_t* srcRow = entry.mtsdfRgbaPixels.data() +
+                static_cast<std::size_t>(cy) * entry.cellWidth * 4u;
+            std::memcpy(dstRow, srcRow, static_cast<std::size_t>(dstW) * 4u);
+        }
+    } else {
+        for (int cy = 0; cy < dstH; ++cy) {
+            const float v = (static_cast<float>(cy) + 0.5f) / static_cast<float>(dstH) *
+                static_cast<float>(entry.cellHeight) - 0.5f;
+            const int sy0 = std::clamp(static_cast<int>(std::floor(v)), 0, static_cast<int>(entry.cellHeight) - 1);
+            const int sy1 = std::min(sy0 + 1, static_cast<int>(entry.cellHeight) - 1);
+            const float fy = std::clamp(v - std::floor(v), 0.0f, 1.0f);
+            const std::size_t localRow = static_cast<std::size_t>(dstY0 - static_cast<int>(kMtsdfBaseY) + cy);
+            for (int cx = 0; cx < dstW; ++cx) {
+                const float u = (static_cast<float>(cx) + 0.5f) / static_cast<float>(dstW) *
+                    static_cast<float>(entry.cellWidth) - 0.5f;
+                const int sx0 = std::clamp(static_cast<int>(std::floor(u)), 0, static_cast<int>(entry.cellWidth) - 1);
+                const int sx1 = std::min(sx0 + 1, static_cast<int>(entry.cellWidth) - 1);
+                const float fx = std::clamp(u - std::floor(u), 0.0f, 1.0f);
+                std::uint8_t* dstPx = mtsdfAtlasRgba8_.data() +
+                    (localRow * kAtlasWidth + static_cast<std::size_t>(dstX0 + cx)) * 4u;
+                for (std::size_t ch = 0; ch < 4u; ++ch) {
+                    const float c00 = static_cast<float>(
+                        entry.mtsdfRgbaPixels[(static_cast<std::size_t>(sy0) * entry.cellWidth + sx0) * 4u + ch]);
+                    const float c10 = static_cast<float>(
+                        entry.mtsdfRgbaPixels[(static_cast<std::size_t>(sy0) * entry.cellWidth + sx1) * 4u + ch]);
+                    const float c01 = static_cast<float>(
+                        entry.mtsdfRgbaPixels[(static_cast<std::size_t>(sy1) * entry.cellWidth + sx0) * 4u + ch]);
+                    const float c11 = static_cast<float>(
+                        entry.mtsdfRgbaPixels[(static_cast<std::size_t>(sy1) * entry.cellWidth + sx1) * 4u + ch]);
+                    const float top = c00 + (c10 - c00) * fx;
+                    const float bot = c01 + (c11 - c01) * fx;
+                    dstPx[ch] = static_cast<std::uint8_t>(std::clamp(top + (bot - top) * fy + 0.5f, 0.0f, 255.0f));
+                }
+            }
+        }
+    }
+
+    mtsdfRegisteredHashes_.insert(entry.pathHash);
+    const std::uint32_t endLocalRow = static_cast<std::uint32_t>(dstY1 - static_cast<int>(kMtsdfBaseY));
+    mtsdfPopulatedRows_ = std::max(mtsdfPopulatedRows_, std::min(kMtsdfMaxRows, endLocalRow));
+    ++mtsdfAtlasRevision_;
 }
 
 void PagedRenderTree::InitPreCachedDigitGlyphs() noexcept {
@@ -1475,6 +1560,7 @@ std::uint32_t PagedRenderTree::AllocateMtsdfPathNode(
     float strokeThickness,
     float opacity,
     const UIElement* owner) {
+    RegisterMtsdfInTreeAtlas(mtsdfEntry);
     const std::uint32_t pageIdx = EnsurePageForAllocation(4u, activeClipRect_, activeClipEnabled_);
     CommandPage& page = pages_[pageIdx];
     const auto vOffset = static_cast<std::uint16_t>(page.header.vertexCount);
@@ -2106,57 +2192,121 @@ bool PagedRenderTree::UpdateDirtyElement(const UIElement* element) noexcept {
         return false;
     }
 
-    // Reconstruct ancestor state along parent chain in O(depth) with 0 heap allocations
-    const UIElement* chain[64]{};
-    std::size_t depth = 0;
-    for (const UIElement* anc = element->Parent(); anc != nullptr && depth < 64u; anc = anc->Parent()) {
-        chain[depth++] = anc;
-    }
-
-    RenderTraversalState parentState{};
-    for (std::size_t idx = depth; idx > 0u; --idx) {
-        const UIElement* anc = chain[idx - 1u];
-        const Visibility ancVis = anc->GetVisibility();
-        if (ancVis != Visibility::Visible) {
-            parentState.inheritedOpacity = 0.0f;
-        } else {
-            parentState.inheritedOpacity *= std::clamp(anc->GetOpacity(), 0.0f, 1.0f);
+    try {
+        // Reconstruct ancestor state along parent chain in O(depth) with 0 heap allocations
+        const UIElement* chain[64]{};
+        std::size_t depth = 0;
+        for (const UIElement* anc = element->Parent(); anc != nullptr && depth < 64u; anc = anc->Parent()) {
+            chain[depth++] = anc;
         }
-        const Rect ar = anc->FinalRect();
-        const float aw = (ar.width > 0.0f) ? ar.width : std::max(0.0f, anc->GetWidth());
-        const float ah = (ar.height > 0.0f) ? ar.height : std::max(0.0f, anc->GetHeight());
-        ApplyStateMatrix(
-            parentState.m00, parentState.m01, parentState.m10, parentState.m11, parentState.tx, parentState.ty,
-            anc->ComputeLocalEffectiveTransform2D());
-        const UnifiedValue clipVal = anc->GetValue(PropId_ClipToBounds);
-        if (const auto* clipBool = std::get_if<bool>(&clipVal); clipBool && *clipBool) {
-            const Matrix2D ancWorldM = MatrixFromState(
-                parentState.m00, parentState.m01, parentState.m10, parentState.m11, parentState.tx, parentState.ty);
-            Rect rawClip = anc->GetLocalClipBounds();
-            if (ar.width <= 0.0f && ar.height <= 0.0f && (aw > 0.0f || ah > 0.0f)) {
-                rawClip = Rect{ar.x, ar.y, aw, ah};
+
+        RenderTraversalState parentState{};
+        for (std::size_t idx = depth; idx > 0u; --idx) {
+            const UIElement* anc = chain[idx - 1u];
+            const Visibility ancVis = anc->GetVisibility();
+            if (ancVis != Visibility::Visible) {
+                parentState.inheritedOpacity = 0.0f;
+            } else {
+                parentState.inheritedOpacity *= std::clamp(anc->GetOpacity(), 0.0f, 1.0f);
             }
-            const Rect bounds = ancWorldM.TransformRectBounds(rawClip);
-            parentState.clipRect = parentState.clipActive ? IntersectRect(parentState.clipRect, bounds) : bounds;
-            parentState.clipActive = true;
+            const Rect ar = anc->FinalRect();
+            const float aw = (ar.width > 0.0f) ? ar.width : std::max(0.0f, anc->GetWidth());
+            const float ah = (ar.height > 0.0f) ? ar.height : std::max(0.0f, anc->GetHeight());
+            const Matrix2D ancLocal2D = anc->ComputeLocalEffectiveTransform2D();
+            ApplyStateMatrix(
+                parentState.m00, parentState.m01, parentState.m10, parentState.m11, parentState.tx, parentState.ty,
+                ancLocal2D);
+            if (anc->HasActiveTransform3D()) {
+                parentState.world3D = Matrix4x4::ComposePlanarHomography(
+                    parentState.world3D,
+                    anc->ComputeLocalEffectiveTransform3D());
+                parentState.hasPerspective3D = true;
+            } else if (parentState.hasPerspective3D) {
+                if (!ancLocal2D.IsIdentity()) {
+                    parentState.world3D = Matrix4x4::ComposePlanarHomography(
+                        parentState.world3D,
+                        Matrix4x4::FromMatrix2D(ancLocal2D));
+                }
+            } else {
+                parentState.world3D = Matrix4x4::FromMatrix2D(
+                    MatrixFromState(
+                        parentState.m00, parentState.m01, parentState.m10, parentState.m11, parentState.tx, parentState.ty));
+            }
+
+            const UnifiedValue clipVal = anc->GetValue(PropId_ClipToBounds);
+            if (const auto* clipBool = std::get_if<bool>(&clipVal); clipBool && *clipBool) {
+                const Matrix2D ancWorldM = MatrixFromState(
+                    parentState.m00, parentState.m01, parentState.m10, parentState.m11, parentState.tx, parentState.ty);
+                Rect rawClip = anc->GetLocalClipBounds();
+                if (ar.width <= 0.0f && ar.height <= 0.0f && (aw > 0.0f || ah > 0.0f)) {
+                    rawClip = Rect{ar.x, ar.y, aw, ah};
+                }
+                const Rect bounds = ancWorldM.TransformRectBounds(rawClip);
+                parentState.clipRect = parentState.clipActive ? IntersectRect(parentState.clipRect, bounds) : bounds;
+                parentState.clipActive = true;
+            }
+
+            const Matrix2D childContainer2D = anc->GetChildContainerTransform2D();
+            ApplyStateMatrix(
+                parentState.m00, parentState.m01, parentState.m10, parentState.m11, parentState.tx, parentState.ty,
+                childContainer2D);
+            if (parentState.hasPerspective3D) {
+                if (!childContainer2D.IsIdentity()) {
+                    parentState.world3D = Matrix4x4::ComposePlanarHomography(
+                        parentState.world3D,
+                        Matrix4x4::FromMatrix2D(childContainer2D));
+                }
+            } else {
+                parentState.world3D = Matrix4x4::FromMatrix2D(
+                    MatrixFromState(
+                        parentState.m00, parentState.m01, parentState.m10, parentState.m11, parentState.tx, parentState.ty));
+            }
         }
+
+        RenderTraversalState curState = parentState;
+        const Visibility vis = element->GetVisibility();
+        if (vis != Visibility::Visible) {
+            curState.inheritedOpacity = 0.0f;
+        } else {
+            curState.inheritedOpacity *= std::clamp(element->GetOpacity(), 0.0f, 1.0f);
+        }
+        const Matrix2D elemLocal2D = element->ComputeLocalEffectiveTransform2D();
         ApplyStateMatrix(
-            parentState.m00, parentState.m01, parentState.m10, parentState.m11, parentState.tx, parentState.ty,
-            anc->GetChildContainerTransform2D());
-    }
+            curState.m00, curState.m01, curState.m10, curState.m11, curState.tx, curState.ty,
+            elemLocal2D);
+        if (element->HasActiveTransform3D()) {
+            curState.world3D = Matrix4x4::ComposePlanarHomography(
+                curState.world3D,
+                element->ComputeLocalEffectiveTransform3D());
+            curState.hasPerspective3D = true;
+        } else if (curState.hasPerspective3D) {
+            if (!elemLocal2D.IsIdentity()) {
+                curState.world3D = Matrix4x4::ComposePlanarHomography(
+                    curState.world3D,
+                    Matrix4x4::FromMatrix2D(elemLocal2D));
+            }
+        } else {
+            curState.world3D = Matrix4x4::FromMatrix2D(
+                MatrixFromState(curState.m00, curState.m01, curState.m10, curState.m11, curState.tx, curState.ty));
+        }
 
-    RenderTraversalState curState = parentState;
-    const Visibility vis = element->GetVisibility();
-    if (vis != Visibility::Visible) {
-        curState.inheritedOpacity = 0.0f;
-    } else {
-        curState.inheritedOpacity *= std::clamp(element->GetOpacity(), 0.0f, 1.0f);
-    }
-    ApplyStateMatrix(
-        curState.m00, curState.m01, curState.m10, curState.m11, curState.tx, curState.ty,
-        element->ComputeLocalEffectiveTransform2D());
+        if (UpdateElementInPlace(element, curState)) {
+            return true;
+        }
 
-    return UpdateElementInPlace(element, curState);
+        // Element grew beyond its in-page span capacity or structurally changed -> rebuild cleanly
+        // to preserve 100% exact Painter's Algorithm Z-order with zero leaked dead nodes.
+        const UIElement* rebuildRoot = (boundRootElement_ != nullptr)
+            ? boundRootElement_
+            : ((depth > 0u) ? chain[depth - 1u] : element);
+        if (rebuildRoot != nullptr && !nodes_.empty()) {
+            (void)BuildFromVisualTree(rebuildRoot);
+            return true;
+        }
+        return false;
+    } catch (...) {
+        return false;
+    }
 }
 
 bool PagedRenderTree::UpdateElementInPlace(
@@ -2193,6 +2343,9 @@ bool PagedRenderTree::UpdateElementInPlace(
     if (firstId == UIElement::InvalidRenderNodeId || span == 0u) {
         return false;
     }
+    if (element->GetEffectDescriptor().kind == UIEffectKind::DropShadow) {
+        return false;
+    }
 
     const Visibility vis = element->GetVisibility();
     const Rect r = element->FinalRect();
@@ -2214,6 +2367,8 @@ bool PagedRenderTree::UpdateElementInPlace(
         nd.tx = curState.tx + nd.x * (curState.m00 - 1.0f) + nd.y * curState.m01;
         nd.ty = curState.ty + nd.x * curState.m10 + nd.y * (curState.m11 - 1.0f);
         nd.inheritedOpacity = curState.inheritedOpacity;
+        nd.hasPerspective3D = curState.hasPerspective3D;
+        nd.worldMatrix3D = curState.world3D;
     };
 
     // Specialized Path update
@@ -2286,45 +2441,7 @@ bool PagedRenderTree::UpdateElementInPlace(
         }
 
         if (CountLayoutVisibleGlyphs(cpLayout) > totalGlyphCap) {
-            const Rect prevClip = activeClipRect_;
-            const bool prevClipOn = activeClipEnabled_;
-            activeClipRect_ = curState.clipRect;
-            activeClipEnabled_ = curState.clipActive;
-
-            for (std::uint16_t k = 0u; k < span; ++k) {
-                ZeroOutNodeVertices(nodes_[firstId + k]);
-            }
-
-            const std::uint32_t newSpanStart = static_cast<std::uint32_t>(nodes_.size());
-            const std::uint32_t anchorId = AllocateRenderNode(
-                r.x, r.y, 0.0f, 0.0f, Color{0.0f, 0.0f, 0.0f, 0.0f}, 0.0f, 0.0f, element);
-            nodes_[anchorId].opacity = 0.0f;
-            syncQuadTransform(nodes_[anchorId]);
-            WriteQuadVertices(nodes_[anchorId]);
-            MarkPageDirty(nodes_[anchorId].pageIndex, nodes_[anchorId].vertexOffsetInPage);
-
-            const std::uint16_t textSpan = EmitTextRunNodes(
-                textOrigin.x,
-                textOrigin.y,
-                fontSize,
-                activeText,
-                fgColor,
-                effOpacity,
-                curState,
-                element,
-                fontFamily,
-                maxTextW,
-                wrapMode);
-
-            activeClipRect_ = prevClip;
-            activeClipEnabled_ = prevClipOn;
-
-            element->BindRenderNodeSpan(
-                treeId_,
-                newSpanStart,
-                static_cast<std::uint16_t>(1u + textSpan));
-            element->ClearLayoutDirtyFlags(RenderDirty);
-            return true;
+            return false;
         }
 
         {
@@ -2351,6 +2468,8 @@ bool PagedRenderTree::UpdateElementInPlace(
             node.baseTx = curState.tx;
             node.baseTy = curState.ty;
             node.inheritedOpacity = curState.inheritedOpacity;
+            node.hasPerspective3D = curState.hasPerspective3D;
+            node.worldMatrix3D = curState.world3D;
             (void)WriteLayoutGlyphSlice(
                 firstId + k,
                 textOrigin.x,
@@ -2382,6 +2501,8 @@ bool PagedRenderTree::UpdateElementInPlace(
             return true;
         }
 
+        RegisterMtsdfInTreeAtlas(*entry);
+
         bool emitFill = true;
         bool emitSeparateStroke = false;
         ClassifyPathEmission(*pathElem, emitFill, emitSeparateStroke);
@@ -2391,11 +2512,15 @@ bool PagedRenderTree::UpdateElementInPlace(
             return false;
         }
 
-        const Rect fitted = ComputeStretchedDestRect(
+        Rect fitted = ComputeStretchedDestRect(
             Rect{r.x, r.y, boxW, boxH},
             entry->boundsW,
             entry->boundsH,
             pathElem->GetStretch());
+        if (pathElem->GetStretch() == Stretch::None) {
+            fitted.x += entry->boundsX;
+            fitted.y += entry->boundsY;
+        }
         const float strokeW = pathElem->GetStrokeThickness();
         const float worldScaleX = std::sqrt(curState.m00 * curState.m00 + curState.m10 * curState.m10);
         const float worldScaleY = std::sqrt(curState.m01 * curState.m01 + curState.m11 * curState.m11);
@@ -2581,7 +2706,7 @@ bool PagedRenderTree::UpdateElementInPlace(
             boxNode.y = r.y;
             boxNode.width = boxW;
             boxNode.height = boxH;
-            boxNode.opacity = effAlpha;
+            boxNode.opacity = (boxBg.a > 0.0f) ? effAlpha : 0.0f;
             boxNode.baseRgba = PackColorRgba8(boxBg, 1.0f);
             const float legacyBt = IsUniformCornerRadius(cr) ? btRaw.left : 0.0f;
             ConfigureRoundedRectDescriptor(boxNode, cr, Thickness{legacyBt}, false);
@@ -2613,6 +2738,8 @@ bool PagedRenderTree::UpdateElementInPlace(
             tNode.baseTx = curState.tx;
             tNode.baseTy = curState.ty;
             tNode.inheritedOpacity = curState.inheritedOpacity;
+            tNode.hasPerspective3D = curState.hasPerspective3D;
+            tNode.worldMatrix3D = curState.world3D;
             (void)WriteLayoutGlyphSlice(
                 firstId + k,
                 textX,
@@ -2733,6 +2860,8 @@ bool PagedRenderTree::UpdateElementInPlace(
             tn.baseTx = curState.tx;
             tn.baseTy = curState.ty;
             tn.inheritedOpacity = curState.inheritedOpacity;
+            tn.hasPerspective3D = curState.hasPerspective3D;
+            tn.worldMatrix3D = curState.world3D;
             (void)WriteLayoutGlyphSlice(
                 firstId + k, tx, ty, fontSize, selLayout, glyphCursor, fg, effAlpha);
         }
@@ -2826,6 +2955,8 @@ bool PagedRenderTree::UpdateElementInPlace(
                 tn.baseTx = curState.tx;
                 tn.baseTy = curState.ty;
                 tn.inheritedOpacity = curState.inheritedOpacity;
+                tn.hasPerspective3D = curState.hasPerspective3D;
+                tn.worldMatrix3D = curState.world3D;
                 (void)WriteLayoutGlyphSlice(
                     firstId + k, lx, ly, fontSize, chkLayout, glyphCursor, fg, effAlpha);
             }
@@ -2895,70 +3026,7 @@ bool PagedRenderTree::UpdateElementInPlace(
             bt);
 
         if (CountLayoutVisibleGlyphs(tbLayout) > totalGlyphCap) {
-            // Text grew past reserved span capacity -> zero entire old span and emit contiguous expanded span
-            // while preserving exact parent scissor clip state!
-            const Rect prevClip = activeClipRect_;
-            const bool prevClipOn = activeClipEnabled_;
-            activeClipRect_ = curState.clipRect;
-            activeClipEnabled_ = curState.clipActive;
-
-            for (std::uint16_t k = 0; k < span; ++k) {
-                ZeroOutNodeVertices(nodes_[firstId + k]);
-            }
-
-            const std::uint32_t newSpanStart = static_cast<std::uint32_t>(nodes_.size());
-            std::uint16_t newSpanCount = 0u;
-            if (wantsBgNode) {
-                const std::uint32_t bgId = AllocateRoundedRectNode(
-                    plan.fillRect.x,
-                    plan.fillRect.y,
-                    plan.fillRect.width,
-                    plan.fillRect.height,
-                    plan.fillColor,
-                    plan.fillRadii,
-                    element);
-                nodes_[bgId].opacity = effOpacity;
-                syncQuadTransform(nodes_[bgId]);
-                WriteQuadVertices(nodes_[bgId]);
-                MarkPageDirty(nodes_[bgId].pageIndex, nodes_[bgId].vertexOffsetInPage);
-                ++newSpanCount;
-            }
-            if (bbOpt.has_value()) {
-                const std::uint32_t brdId = AllocateBorderRingNode(
-                    plan.borderRect.x,
-                    plan.borderRect.y,
-                    wantsBorderNode ? plan.borderRect.width : 0.0f,
-                    wantsBorderNode ? plan.borderRect.height : 0.0f,
-                    plan.borderColor,
-                    plan.borderRadii,
-                    plan.borderThickness,
-                    element);
-                nodes_[brdId].opacity = wantsBorderNode ? effOpacity : 0.0f;
-                syncQuadTransform(nodes_[brdId]);
-                WriteQuadVertices(nodes_[brdId]);
-                MarkPageDirty(nodes_[brdId].pageIndex, nodes_[brdId].vertexOffsetInPage);
-                ++newSpanCount;
-            }
-            newSpanCount = static_cast<std::uint16_t>(
-                newSpanCount + EmitTextRunNodes(
-                    r.x + pad.left,
-                    r.y + pad.top,
-                    fontSize,
-                    activeText,
-                    fgColor,
-                    effOpacity,
-                    curState,
-                    element,
-                    fontFamily,
-                    maxTextW,
-                    wrapMode));
-
-            activeClipRect_ = prevClip;
-            activeClipEnabled_ = prevClipOn;
-
-            element->BindRenderNodeSpan(treeId_, newSpanStart, newSpanCount);
-            element->ClearLayoutDirtyFlags(RenderDirty);
-            return true;
+            return false;
         }
 
         std::uint16_t quadSlot = 0u;
@@ -3003,6 +3071,8 @@ bool PagedRenderTree::UpdateElementInPlace(
             node.baseTx = curState.tx;
             node.baseTy = curState.ty;
             node.inheritedOpacity = curState.inheritedOpacity;
+            node.hasPerspective3D = curState.hasPerspective3D;
+            node.worldMatrix3D = curState.world3D;
             (void)WriteLayoutGlyphSlice(
                 firstId + k,
                 r.x + pad.left,
@@ -3080,72 +3150,7 @@ bool PagedRenderTree::UpdateElementInPlace(
         const float ly = r.y + std::max(2.0f, (boxH - fontSize * 1.2f) * 0.5f);
 
         if (CountLayoutVisibleGlyphs(btnLayout) > totalLabelGlyphCap) {
-            const Rect prevClip = activeClipRect_;
-            const bool prevClipOn = activeClipEnabled_;
-            activeClipRect_ = curState.clipRect;
-            activeClipEnabled_ = curState.clipActive;
-
-            for (std::uint16_t k = 0; k < span; ++k) {
-                ZeroOutNodeVertices(nodes_[firstId + k]);
-            }
-
-            const std::uint32_t newSpanStart = static_cast<std::uint32_t>(nodes_.size());
-            std::uint16_t newBoxCount = 0u;
-            if (bbOpt.has_value()) {
-                const SurfaceFillBorderPlan plan = BuildSurfaceFillBorderPlan(
-                    Rect{r.x, r.y, boxW, boxH},
-                    cr,
-                    btnBg.a > 0.0f,
-                    btnBg,
-                    true,
-                    *bbOpt,
-                    btRaw);
-                const std::uint32_t fillId = AllocateRoundedRectNode(
-                    plan.fillRect.x, plan.fillRect.y, plan.fillRect.width, plan.fillRect.height,
-                    plan.fillColor, plan.fillRadii, element);
-                nodes_[fillId].opacity = plan.hasVisibleFill ? btnAlpha : 0.0f;
-                syncQuadTransform(nodes_[fillId]);
-                WriteQuadVertices(nodes_[fillId]);
-                MarkPageDirty(nodes_[fillId].pageIndex, nodes_[fillId].vertexOffsetInPage);
-
-                const std::uint32_t brdId = AllocateBorderRingNode(
-                    plan.borderRect.x,
-                    plan.borderRect.y,
-                    plan.hasVisibleBorder ? plan.borderRect.width : 0.0f,
-                    plan.hasVisibleBorder ? plan.borderRect.height : 0.0f,
-                    plan.borderColor,
-                    plan.borderRadii,
-                    plan.borderThickness,
-                    element);
-                nodes_[brdId].opacity = plan.hasVisibleBorder ? btnAlpha : 0.0f;
-                syncQuadTransform(nodes_[brdId]);
-                WriteQuadVertices(nodes_[brdId]);
-                MarkPageDirty(nodes_[brdId].pageIndex, nodes_[brdId].vertexOffsetInPage);
-                newBoxCount = 2u;
-            } else {
-                const float legacyBt = IsUniformCornerRadius(cr) ? btRaw.left : 0.0f;
-                const std::uint32_t boxId = AllocateRoundedRectNode(
-                    r.x, r.y, boxW, boxH, btnBg, cr, element);
-                ConfigureRoundedRectDescriptor(nodes_[boxId], cr, Thickness{legacyBt}, false);
-                nodes_[boxId].opacity = (btnBg.a > 0.0f) ? btnAlpha : 0.0f;
-                syncQuadTransform(nodes_[boxId]);
-                WriteQuadVertices(nodes_[boxId]);
-                MarkPageDirty(nodes_[boxId].pageIndex, nodes_[boxId].vertexOffsetInPage);
-                newBoxCount = 1u;
-            }
-
-            const std::uint16_t textSpan = EmitTextRunNodes(
-                lx, ly, fontSize, activeLabel, fg, btnAlpha, curState, element, btnFont);
-
-            activeClipRect_ = prevClip;
-            activeClipEnabled_ = prevClipOn;
-
-            element->BindRenderNodeSpan(
-                treeId_,
-                newSpanStart,
-                static_cast<std::uint16_t>(newBoxCount + textSpan));
-            element->ClearLayoutDirtyFlags(RenderDirty);
-            return true;
+            return false;
         }
 
         if (boxNodeCount >= 2u) {
@@ -3205,6 +3210,8 @@ bool PagedRenderTree::UpdateElementInPlace(
             node.baseTx = curState.tx;
             node.baseTy = curState.ty;
             node.inheritedOpacity = curState.inheritedOpacity;
+            node.hasPerspective3D = curState.hasPerspective3D;
+            node.worldMatrix3D = curState.world3D;
             (void)WriteLayoutGlyphSlice(
                 firstId + k,
                 lx,
@@ -3308,53 +3315,7 @@ bool PagedRenderTree::UpdateElementInPlace(
     const std::uint16_t neededSpan = plan.reserveBorderNode ? 2u : 1u;
 
     if (span < neededSpan) {
-        if (element->FirstChild() != nullptr) {
-            // Non-leaf container newly gained BorderBrush -> rebuild cleanly so parent stays behind children
-            return false;
-        }
-        const Rect prevClip = activeClipRect_;
-        const bool prevClipOn = activeClipEnabled_;
-        activeClipRect_ = curState.clipRect;
-        activeClipEnabled_ = curState.clipActive;
-
-        for (std::uint16_t k = 0; k < span; ++k) {
-            ZeroOutNodeVertices(nodes_[firstId + k]);
-        }
-
-        const std::uint32_t newSpanStart = static_cast<std::uint32_t>(nodes_.size());
-        const std::uint32_t fillId = AllocateRoundedRectNode(
-            plan.fillRect.x,
-            plan.fillRect.y,
-            plan.fillRect.width,
-            plan.fillRect.height,
-            plan.fillColor,
-            plan.fillRadii,
-            element);
-        nodes_[fillId].opacity = plan.hasVisibleFill ? effOpacity : 0.0f;
-        syncQuadTransform(nodes_[fillId]);
-        WriteQuadVertices(nodes_[fillId]);
-        MarkPageDirty(nodes_[fillId].pageIndex, nodes_[fillId].vertexOffsetInPage);
-
-        const std::uint32_t borderId = AllocateBorderRingNode(
-            plan.borderRect.x,
-            plan.borderRect.y,
-            plan.hasVisibleBorder ? plan.borderRect.width : 0.0f,
-            plan.hasVisibleBorder ? plan.borderRect.height : 0.0f,
-            plan.borderColor,
-            plan.borderRadii,
-            plan.borderThickness,
-            element);
-        nodes_[borderId].opacity = plan.hasVisibleBorder ? effOpacity : 0.0f;
-        syncQuadTransform(nodes_[borderId]);
-        WriteQuadVertices(nodes_[borderId]);
-        MarkPageDirty(nodes_[borderId].pageIndex, nodes_[borderId].vertexOffsetInPage);
-
-        activeClipRect_ = prevClip;
-        activeClipEnabled_ = prevClipOn;
-
-        element->BindRenderNodeSpan(treeId_, newSpanStart, 2u);
-        element->ClearLayoutDirtyFlags(RenderDirty);
-        return true;
+        return false;
     }
 
     {
@@ -3778,29 +3739,9 @@ bool PagedRenderTree::SyncDirtySubtreeRecursive(
     }
 
     if (forceSubtreeSync || (flags & RenderDirty) != 0u) {
-        const std::uint32_t oldFirstId = elem->RenderNodeId();
-        const std::uint16_t oldSpan = elem->RenderNodeSpan();
-        const std::size_t oldNodeCount = nodes_.size();
-        const bool hadLaterNodes = (oldFirstId + oldSpan) < oldNodeCount;
         if (!UpdateElementInPlace(elem, curState)) {
             outNeedsFullRebuild = true;
             return false;
-        }
-        if (hadLaterNodes && elem->RenderNodeId() != oldFirstId && elem->RenderNodeId() < nodes_.size()) {
-            const RenderNodeDescriptor& newN = nodes_[elem->RenderNodeId()];
-            for (std::size_t laterIdx = static_cast<std::size_t>(oldFirstId) + oldSpan;
-                 laterIdx < oldNodeCount;
-                 ++laterIdx) {
-                const RenderNodeDescriptor& ln = nodes_[laterIdx];
-                if (ln.vertexCount == 0u || ln.width <= 0.0f || ln.height <= 0.0f) {
-                    continue;
-                }
-                if (ln.x < newN.x + newN.width && ln.x + ln.width > newN.x &&
-                    ln.y < newN.y + newN.height && ln.y + ln.height > newN.y) {
-                    outNeedsFullRebuild = true;
-                    return false;
-                }
-            }
         }
         ++ioUpdatedNodes;
         elem->ClearLayoutDirtyFlags(RenderDirty);
@@ -4015,13 +3956,13 @@ void PagedRenderTree::TraverseAndEmitElement(
             r.x, r.y, 0.0f, 0.0f, Color{0.0f, 0.0f, 0.0f, 0.0f}, 0.0f, 0.0f, elem);
         nodes_[anchorId].opacity = 0.0f;
         applyNodeTransform(anchorId);
-        emittedCount = 1u;
+        ++emittedCount;
     } else if (const auto* cp = elem->DynamicCast<ContentPresenter>()) {
         const std::uint32_t anchorId = AllocateRenderNode(
             r.x, r.y, 0.0f, 0.0f, Color{0.0f, 0.0f, 0.0f, 0.0f}, 0.0f, 0.0f, elem);
         nodes_[anchorId].opacity = 0.0f;
         applyNodeTransform(anchorId);
-        emittedCount = 1u;
+        ++emittedCount;
 
         if (cp->FirstChild() == nullptr) {
             const std::string text = cp->GetEffectiveText();
@@ -4169,15 +4110,24 @@ void PagedRenderTree::TraverseAndEmitElement(
             ++emittedCount;
         }
     } else if (const auto* lineElem = elem->DynamicCast<Line>()) {
-        const float x1 = r.x + lineElem->GetX1();
-        const float y1 = r.y + lineElem->GetY1();
-        const float x2 = r.x + lineElem->GetX2();
-        const float y2 = r.y + lineElem->GetY2();
+        float x1 = r.x + lineElem->GetX1();
+        float y1 = r.y + lineElem->GetY1();
+        float x2 = r.x + lineElem->GetX2();
+        float y2 = r.y + lineElem->GetY2();
+        const bool projected3D = curState.hasPerspective3D;
+        if (projected3D) {
+            const Point p1 = curState.world3D.ProjectPoint2D(Point{x1, y1});
+            const Point p2 = curState.world3D.ProjectPoint2D(Point{x2, y2});
+            x1 = p1.x;
+            y1 = p1.y;
+            x2 = p2.x;
+            y2 = p2.y;
+        }
         const float dx = x2 - x1;
         const float dy = y2 - y1;
         const float segLen = std::sqrt(dx * dx + dy * dy);
         const float strokeW = std::max(1.0f, lineElem->GetStrokeThickness());
-        const bool hasVis = lineElem->HasStroke() && (segLen > 1e-3f);
+        const bool hasVis = lineElem->HasStroke() && std::isfinite(segLen) && (segLen > 1e-3f);
         const Color strokeCol = lineElem->GetStroke();
 
         const float ux = (segLen > 1e-4f) ? (dx / segLen) : 1.0f;
@@ -4202,9 +4152,11 @@ void PagedRenderTree::TraverseAndEmitElement(
             ux,
             px0 - (ux * px0 - uy * py0),
             py0 - (uy * px0 + ux * py0)};
-        const Matrix2D worldM = Matrix2D::Multiply(
-            MatrixFromState(curState.m00, curState.m01, curState.m10, curState.m11, curState.tx, curState.ty),
-            segM);
+        const Matrix2D worldM = projected3D
+            ? segM
+            : Matrix2D::Multiply(
+                  MatrixFromState(curState.m00, curState.m01, curState.m10, curState.m11, curState.tx, curState.ty),
+                  segM);
         nd.m00 = worldM.m00;
         nd.m01 = worldM.m01;
         nd.m10 = worldM.m10;
@@ -4214,9 +4166,10 @@ void PagedRenderTree::TraverseAndEmitElement(
         nd.tx = worldM.tx + nd.x * (worldM.m00 - 1.0f) + nd.y * worldM.m01;
         nd.ty = worldM.ty + nd.x * worldM.m10 + nd.y * (worldM.m11 - 1.0f);
         nd.inheritedOpacity = curState.inheritedOpacity;
+        nd.hasPerspective3D = false;
         WriteQuadVertices(nd);
         MarkPageDirty(nd.pageIndex, nd.vertexOffsetInPage);
-        emittedCount = 1u;
+        ++emittedCount;
     } else if (const auto* pb = elem->DynamicCast<ProgressBar>()) {
         const float effAlpha = pb->IsEffectivelyEnabled() ? effOpacity : (effOpacity * 0.55f);
         const CornerRadius cr = SanitizeCornerRadius(
@@ -4574,7 +4527,7 @@ void PagedRenderTree::TraverseAndEmitElement(
                 r.x, r.y, 0.0f, 0.0f, pathElem->GetFill(), 0.0f, 0.0f, elem);
             nodes_[nid].opacity = 0.0f;
             applyNodeTransform(nid);
-            emittedCount = 1u;
+            ++emittedCount;
         }
     } else if (const auto* imgElem = elem->DynamicCast<Image>()) {
         const Thickness pad = imgElem->GetPadding();
@@ -4616,7 +4569,7 @@ void PagedRenderTree::TraverseAndEmitElement(
                     elem,
                     atlasEntry->textureId);
                 applyNodeTransform(nid);
-                emittedCount = 1u;
+                ++emittedCount;
             } else {
                 const std::uint32_t nid = AllocateTexturedNode(
                     contentBox.x,
@@ -4632,7 +4585,7 @@ void PagedRenderTree::TraverseAndEmitElement(
                     elem,
                     atlasEntry->textureId);
                 applyNodeTransform(nid);
-                emittedCount = 1u;
+                ++emittedCount;
             }
         } else {
             const std::uint32_t nid = AllocateTexturedNode(
@@ -4649,7 +4602,7 @@ void PagedRenderTree::TraverseAndEmitElement(
                 elem,
                 0u);
             applyNodeTransform(nid);
-            emittedCount = 1u;
+            ++emittedCount;
         }
     } else if (const auto* slider = elem->DynamicCast<Slider>()) {
         const SliderVisualGeometry geom = ComputeSliderVisualGeometry(*slider, r, w, h);
@@ -4681,7 +4634,7 @@ void PagedRenderTree::TraverseAndEmitElement(
         nodes_[thumbId].opacity = effAlpha;
         applyNodeTransform(thumbId);
 
-        emittedCount = 3u;
+        emittedCount = static_cast<std::uint16_t>(emittedCount + 3u);
     } else if (const auto* tbox = elem->DynamicCast<TextBox>()) {
         const float effAlpha = tbox->IsEffectivelyEnabled() ? effOpacity : (effOpacity * 0.55f);
         Color boxBg = value::TryGetColor(tbox->GetValue(PropId_Background))
@@ -4734,7 +4687,7 @@ void PagedRenderTree::TraverseAndEmitElement(
             const std::uint32_t boxId = AllocateRoundedRectNode(
                 r.x, r.y, w, h, boxBg, cr, elem);
             ConfigureRoundedRectDescriptor(nodes_[boxId], cr, Thickness{legacyBt}, false);
-            nodes_[boxId].opacity = effAlpha;
+            nodes_[boxId].opacity = (boxBg.a > 0.0f) ? effAlpha : 0.0f;
             applyNodeTransform(boxId);
             ++emittedCount;
         }
@@ -5060,7 +5013,7 @@ void PagedRenderTree::TraverseAndEmitElement(
                 effOpacity,
                 elem);
             applyNodeTransform(fillId);
-            emittedCount = 1u;
+            ++emittedCount;
         } else {
             const std::uint32_t fillId = AllocateRoundedRectNode(
                 plan.fillRect.x,
@@ -5072,7 +5025,7 @@ void PagedRenderTree::TraverseAndEmitElement(
                 elem);
             nodes_[fillId].opacity = plan.hasVisibleFill ? effOpacity : 0.0f;
             applyNodeTransform(fillId);
-            emittedCount = 1u;
+            ++emittedCount;
         }
 
         if (plan.reserveBorderNode) {
@@ -5087,7 +5040,7 @@ void PagedRenderTree::TraverseAndEmitElement(
                 elem);
             nodes_[borderId].opacity = plan.hasVisibleBorder ? effOpacity : 0.0f;
             applyNodeTransform(borderId);
-            emittedCount = 2u;
+            ++emittedCount;
         }
     }
 

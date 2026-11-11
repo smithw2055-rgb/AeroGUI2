@@ -8,6 +8,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
 set(REALSCRIPT_SLIM_RUNTIME ON CACHE BOOL "Build slim RealScript runtime for Wasm" FORCE)
+set(REALSCRIPT_INSTALL_SDK OFF CACHE BOOL "Disable RealScript SDK install targets in Wasm slim build" FORCE)
 set(AERO_BUILD_COMPILER_TOOLS OFF CACHE BOOL "Omit host XAML/RealScript compiler in Wasm runtime build" FORCE)
 set(AERO_BUILD_TESTS OFF CACHE BOOL "Disable desktop tests during Wasm cross-build" FORCE)
 set(REALSCRIPT_BUILD_TESTS OFF CACHE BOOL "Disable desktop tests during Wasm cross-build" FORCE)

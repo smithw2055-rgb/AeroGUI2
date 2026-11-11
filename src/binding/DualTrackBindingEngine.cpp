@@ -1,6 +1,7 @@
 #include "aero/binding/DualTrackBindingEngine.hpp"
 #include "aero/animation/AnimationEngine.hpp"
 #include "aero/controls/Controls.hpp"
+#include "aero/core/UiResourceContext.hpp"
 
 #include <algorithm>
 #include <cctype>
@@ -8,11 +9,42 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
 #include "realscript/bytecode/Bytecode.h"
 
 namespace aero {
 
 namespace {
+
+struct LiveBindingEngineRegistry {
+    std::mutex mutex;
+    std::vector<DualTrackBindingEngine*> engines;
+
+    static LiveBindingEngineRegistry& Instance() noexcept {
+        static LiveBindingEngineRegistry reg;
+        return reg;
+    }
+
+    void Register(DualTrackBindingEngine* eng) {
+        if (!eng) return;
+        std::lock_guard<std::mutex> lock(mutex);
+        if (std::find(engines.begin(), engines.end(), eng) == engines.end()) {
+            engines.push_back(eng);
+        }
+    }
+
+    void Unregister(DualTrackBindingEngine* eng) noexcept {
+        if (!eng) return;
+        std::lock_guard<std::mutex> lock(mutex);
+        engines.erase(std::remove(engines.begin(), engines.end(), eng), engines.end());
+    }
+
+    template <typename Fn>
+    void ForEachLocked(Fn&& fn) noexcept {
+        std::lock_guard<std::mutex> lock(mutex);
+        fn(engines);
+    }
+};
 
 [[nodiscard]] std::string_view ShortTypeNameOf(std::string_view raw) noexcept {
     if (const auto colon = raw.rfind(':'); colon != std::string_view::npos) {
@@ -190,12 +222,14 @@ DualTrackBindingEngine::DualTrackBindingEngine(
     : domains_(domains),
       program_(program),
       uiInterpreter_(uiInterpreter) {
+    LiveBindingEngineRegistry::Instance().Register(this);
     rs_rt::registerExternalValuePoolRootMarker(this, [this]() {
         MarkValuesInPools();
     });
 }
 
 DualTrackBindingEngine::~DualTrackBindingEngine() noexcept {
+    LiveBindingEngineRegistry::Instance().Unregister(this);
     rs_rt::unregisterExternalValuePoolRootMarker(this);
     for (auto& binding : trackABindings_) {
         if (binding.targetElement && binding.targetElement->BoundTwoWayEngine() == this) {
@@ -225,12 +259,88 @@ DualTrackBindingEngine::~DualTrackBindingEngine() noexcept {
         }
         ReleaseMultiBindingObservers(mb);
     }
+    registeredConverters_.clear();
+}
+
+void DualTrackBindingEngine::NotifyElementDestroyedGlobal(const UIElement* element) noexcept {
+    if (!element) {
+        return;
+    }
+    LiveBindingEngineRegistry::Instance().ForEachLocked(
+        [element](const std::vector<DualTrackBindingEngine*>& liveEngines) noexcept {
+            for (DualTrackBindingEngine* eng : liveEngines) {
+                if (eng) {
+                    eng->ScrubDestroyedSourceElement(element);
+                }
+            }
+        });
+}
+
+void DualTrackBindingEngine::ScrubDestroyedSourceElement(const UIElement* elem) noexcept {
+    if (!elem) {
+        return;
+    }
+    for (auto& eb : elementBindings_) {
+        if (eb.cachedSourceElement == elem) {
+            eb.cachedSourceElement = nullptr;
+        }
+    }
+    auto scrubMultiRec = [elem](auto& self, MultiBindingInstance& mb) noexcept -> void {
+        for (auto& sl : mb.sources) {
+            if (sl.cachedSourceElement == elem) {
+                sl.cachedSourceElement = nullptr;
+            }
+            if (sl.nestedMulti) {
+                self(self, *sl.nestedMulti);
+            }
+        }
+    };
+    for (auto& mb : multiBindings_) {
+        scrubMultiRec(scrubMultiRec, mb);
+    }
+}
+
+bool DualTrackBindingEngine::HasAnyBindingTargeting(const UIElement* elem) const noexcept {
+    if (!elem) {
+        return false;
+    }
+    for (const auto& b : trackABindings_) {
+        if (b.targetElement.Get() == elem) {
+            return true;
+        }
+    }
+    for (const auto& eb : elementBindings_) {
+        if (eb.targetElement.Get() == elem) {
+            return true;
+        }
+    }
+    for (const auto& mb : multiBindings_) {
+        if (mb.targetElement.Get() == elem) {
+            return true;
+        }
+    }
+    for (const auto& ch : trackBChannels_) {
+        for (const auto& te : ch.targetElements) {
+            if (te.Get() == elem) {
+                return true;
+            }
+        }
+    }
+    return false;
 }
 
 bool DualTrackBindingEngine::HasPendingDirtyObjects() const noexcept {
     for (const auto& b : trackABindings_) {
         if (b.mode == BindingMode::OneTime && b.initialized) {
             continue;
+        }
+        if (b.syncedCollectionRef.valid()) {
+            if (const auto* colHeap = domains_.heapForObject(b.syncedCollectionRef);
+                colHeap && colHeap->isAlive(b.syncedCollectionRef)) {
+                if (colHeap->arrayMutationVersion(b.syncedCollectionRef) != b.lastSeenMutationVersion) {
+                    return true;
+                }
+            }
         }
         for (const auto& hopRef : b.resolvedHopObjects) {
             if (!hopRef.valid()) {
@@ -331,6 +441,12 @@ void DualTrackBindingEngine::RegisterScriptValueConverter(
     entry.convertSymbolId = convertSymbolId;
     entry.convertBackSymbolId = convertBackSymbolId;
     entry.receiverObject = receiverObject;
+    entry.receiverRoot.reset();
+    if (receiverObject.valid()) {
+        if (auto* heap = domains_.heapForObject(receiverObject); heap && heap->isAlive(receiverObject)) {
+            entry.receiverRoot = std::make_shared<PersistentRoot>(heap->retain(receiverObject));
+        }
+    }
     const std::string shortName(ShortTypeNameOf(name));
     if (!shortName.empty() && shortName != name) {
         registeredConverters_[shortName] = entry;
@@ -830,46 +946,59 @@ bool DualTrackBindingEngine::EvaluateAndSyncChain(
                         const ObjectRef backingArr =
                             ObservableListHelper::ResolveBackingArray(*colHeap, *colObjRef);
                         if (backingArr.valid()) {
-                            const std::uint8_t effBit = (hop.observableBitIndex < 64u)
-                                ? hop.observableBitIndex
-                                : static_cast<std::uint8_t>(
-                                      (hop.fieldIndex != PropertySlotHandle::InvalidIndex && hop.fieldIndex < 63u)
-                                          ? hop.fieldIndex
-                                          : 63u);
                             const ObjectRef wrapperRef =
                                 (colObjRef->kind == ObjectKind::Record && !(*colObjRef == backingArr))
                                     ? *colObjRef
                                     : ObjectRef{};
 
                             if (binding.initialized && binding.syncedCollectionRef == backingArr) {
+                                std::vector<CollectionChangeRecord> localDeltas;
+                                localDeltas.swap(scratchCollectionDeltas_);
+                                auto recycleLocalDeltas = [&]() noexcept {
+                                    if (scratchCollectionDeltas_.capacity() == 0u &&
+                                        localDeltas.capacity() > 0u) {
+                                        localDeltas.clear();
+                                        scratchCollectionDeltas_.swap(localDeltas);
+                                    }
+                                };
+
                                 std::uint64_t latestVer = 0ULL;
                                 bool requiresReset = false;
                                 if (colHeap->readArrayChangesSince(
                                         backingArr,
                                         binding.lastSeenMutationVersion,
-                                        scratchCollectionDeltas_,
+                                        localDeltas,
                                         latestVer,
                                         requiresReset)) {
                                     if (!requiresReset) {
-                                        if (scratchCollectionDeltas_.empty()) {
+                                        if (localDeltas.empty()) {
+                                            recycleLocalDeltas();
                                             return false;
                                         }
                                         binding.lastSeenMutationVersion = latestVer;
                                         const IntrusivePtr<UIElement> targetElem = binding.targetElement;
+                                        bool appliedIncrementally = false;
                                         if (auto* ic = targetElem->DynamicCast<ItemsControl>()) {
-                                            return ic->ApplyIncrementalChanges(
-                                                scratchCollectionDeltas_.data(),
-                                                scratchCollectionDeltas_.size());
+                                            appliedIncrementally = ic->ApplyIncrementalChanges(
+                                                localDeltas.data(),
+                                                localDeltas.size());
+                                        } else if (auto* tc = targetElem->DynamicCast<TabControl>()) {
+                                            appliedIncrementally = tc->ApplyIncrementalChanges(
+                                                localDeltas.data(),
+                                                localDeltas.size());
                                         }
-                                        if (auto* tc = targetElem->DynamicCast<TabControl>()) {
-                                            return tc->ApplyIncrementalChanges(
-                                                scratchCollectionDeltas_.data(),
-                                                scratchCollectionDeltas_.size());
+                                        if (appliedIncrementally) {
+                                            recycleLocalDeltas();
+                                            return true;
                                         }
                                     }
-                                    // Overflow or explicit Reset: fall through to full collection sync!
+                                    // Overflow, explicit Reset, or unsupported incremental change:
+                                    // fall through to full collection sync!
+                                    recycleLocalDeltas();
                                     binding.lastSeenMutationVersion = latestVer;
                                     hopVal = UnifiedValue{backingArr};
+                                } else {
+                                    recycleLocalDeltas();
                                 }
                             } else {
                                 ReleaseCollectionObserver(binding);
@@ -878,11 +1007,15 @@ bool DualTrackBindingEngine::EvaluateAndSyncChain(
                                         colHeap->addUiObserver(wrapperRef);
                                         binding.syncedCollectionWrapperRef = wrapperRef;
                                     }
-                                    if (currentObj.valid() &&
+                                    if (hop.observableBitIndex < 64u &&
+                                        currentObj.valid() &&
                                         currentObj.heapId == backingArr.heapId) {
-                                        colHeap->addArrayPropertyObserver(backingArr, currentObj, effBit);
+                                        colHeap->addArrayPropertyObserver(
+                                            backingArr,
+                                            currentObj,
+                                            hop.observableBitIndex);
                                         binding.syncedCollectionOwnerRef = currentObj;
-                                        binding.syncedCollectionBitIndex = effBit;
+                                        binding.syncedCollectionBitIndex = hop.observableBitIndex;
                                     } else {
                                         colHeap->enableArrayChangeTracking(backingArr);
                                     }
@@ -968,9 +1101,12 @@ bool DualTrackBindingEngine::EvaluateAndSyncElementBinding(ElementPropertyBindin
                 }
             }
         } else if (!eb.elementName.empty()) {
-            if (UIElement* root = FindVisualRoot(target)) {
-                eb.cachedSourceElement = root->FindName(eb.elementName);
+            if (UIElement* scopeRoot = UIElement::FindNamescopeRoot(target)) {
+                eb.cachedSourceElement = scopeRoot->FindName(eb.elementName);
             }
+        }
+        if (eb.cachedSourceElement) {
+            eb.cachedSourceElement->MarkReferencedAsElementSource();
         }
     }
 
@@ -1380,9 +1516,12 @@ UnifiedValue DualTrackBindingEngine::EvaluateMultiBindingValue(
                         }
                     }
                 } else if (!slot.elementName.empty()) {
-                    if (UIElement* root = FindVisualRoot(target)) {
-                        slot.cachedSourceElement = root->FindName(slot.elementName);
+                    if (UIElement* scopeRoot = UIElement::FindNamescopeRoot(target)) {
+                        slot.cachedSourceElement = scopeRoot->FindName(slot.elementName);
                     }
+                }
+                if (slot.cachedSourceElement) {
+                    slot.cachedSourceElement->MarkReferencedAsElementSource();
                 }
             }
             if (slot.cachedSourceElement && slot.sourcePropertyId != 0u) {
@@ -1481,6 +1620,14 @@ bool DualTrackBindingEngine::EvaluateAndSyncMultiBinding(
     bool anyValid = false;
     UnifiedValue outVal = EvaluateMultiBindingValue(mb, error, anyValid);
     if (!anyValid && std::holds_alternative<std::monostate>(outVal)) {
+        if (!std::holds_alternative<std::monostate>(mb.lastSyncedOutput)) {
+            const IntrusivePtr<UIElement> targetElem = mb.targetElement;
+            const std::uint16_t targetPropId = mb.targetPropertyId;
+            mb.lastSyncedOutput = UnifiedValue{};
+            mb.initialized = true;
+            targetElem->ClearValue(targetPropId);
+            return true;
+        }
         mb.initialized = true;
         return false;
     }
@@ -1650,13 +1797,14 @@ std::size_t DualTrackBindingEngine::UnbindSubtree(const UIElement* subtreeRoot) 
         return false;
     };
 
+    std::vector<IntrusivePtr<UIElement>> unboundTargets;
     std::size_t removedCount = 0u;
     std::size_t writeIdx = 0u;
     for (std::size_t i = 0u; i < trackABindings_.size(); ++i) {
         auto& b = trackABindings_[i];
         if (b.targetElement && isInSubtree(b.targetElement.Get())) {
             if (b.targetElement->BoundTwoWayEngine() == this) {
-                b.targetElement->BindTwoWayEngine(nullptr);
+                unboundTargets.push_back(b.targetElement);
             }
             ReleaseCollectionObserver(b);
             for (const auto& hopRef : b.resolvedHopObjects) {
@@ -1681,7 +1829,7 @@ std::size_t DualTrackBindingEngine::UnbindSubtree(const UIElement* subtreeRoot) 
         auto& eb = elementBindings_[i];
         if (eb.targetElement && isInSubtree(eb.targetElement.Get())) {
             if (eb.targetElement->BoundTwoWayEngine() == this) {
-                eb.targetElement->BindTwoWayEngine(nullptr);
+                unboundTargets.push_back(eb.targetElement);
             }
             ++removedCount;
             continue;
@@ -1696,28 +1844,41 @@ std::size_t DualTrackBindingEngine::UnbindSubtree(const UIElement* subtreeRoot) 
     }
     elementBindings_.resize(ebWriteIdx);
 
+    auto scrubMultiSubtreeRec = [&](auto& self, MultiBindingInstance& inst) noexcept -> void {
+        for (auto& sl : inst.sources) {
+            if (sl.cachedSourceElement && isInSubtree(sl.cachedSourceElement)) {
+                sl.cachedSourceElement = nullptr;
+            }
+            if (sl.nestedMulti) {
+                self(self, *sl.nestedMulti);
+            }
+        }
+    };
+
     std::size_t mbWriteIdx = 0u;
     for (std::size_t i = 0u; i < multiBindings_.size(); ++i) {
         auto& mb = multiBindings_[i];
         if (mb.targetElement && isInSubtree(mb.targetElement.Get())) {
             if (mb.targetElement->BoundTwoWayEngine() == this) {
-                mb.targetElement->BindTwoWayEngine(nullptr);
+                unboundTargets.push_back(mb.targetElement);
             }
             ReleaseMultiBindingObservers(mb);
             ++removedCount;
             continue;
         }
-        for (auto& sl : mb.sources) {
-            if (sl.cachedSourceElement && isInSubtree(sl.cachedSourceElement)) {
-                sl.cachedSourceElement = nullptr;
-            }
-        }
+        scrubMultiSubtreeRec(scrubMultiSubtreeRec, mb);
         if (mbWriteIdx != i) {
             multiBindings_[mbWriteIdx] = std::move(mb);
         }
         ++mbWriteIdx;
     }
     multiBindings_.resize(mbWriteIdx);
+
+    for (const auto& elem : unboundTargets) {
+        if (elem && elem->BoundTwoWayEngine() == this && !HasAnyBindingTargeting(elem.Get())) {
+            elem->BindTwoWayEngine(nullptr);
+        }
+    }
     return removedCount;
 }
 
@@ -1727,9 +1888,8 @@ bool DualTrackBindingEngine::UnbindSlot(std::uint16_t bindingSlotId) noexcept {
     }
     for (auto it = trackABindings_.begin(); it != trackABindings_.end(); ++it) {
         if (it->bindingSlotId == bindingSlotId) {
-            if (it->targetElement && it->targetElement->BoundTwoWayEngine() == this) {
-                it->targetElement->BindTwoWayEngine(nullptr);
-            }
+            IntrusivePtr<UIElement> targetElem = it->targetElement;
+            ReleaseCollectionObserver(*it);
             for (const auto& hopRef : it->resolvedHopObjects) {
                 if (hopRef.valid() && it->mode != BindingMode::OneTime) {
                     if (auto* heap = domains_.heapForObject(hopRef)) {
@@ -1738,25 +1898,33 @@ bool DualTrackBindingEngine::UnbindSlot(std::uint16_t bindingSlotId) noexcept {
                 }
             }
             trackABindings_.erase(it);
+            if (targetElem && targetElem->BoundTwoWayEngine() == this &&
+                !HasAnyBindingTargeting(targetElem.Get())) {
+                targetElem->BindTwoWayEngine(nullptr);
+            }
             return true;
         }
     }
     for (auto it = elementBindings_.begin(); it != elementBindings_.end(); ++it) {
         if (it->bindingSlotId == bindingSlotId) {
-            if (it->targetElement && it->targetElement->BoundTwoWayEngine() == this) {
-                it->targetElement->BindTwoWayEngine(nullptr);
-            }
+            IntrusivePtr<UIElement> targetElem = it->targetElement;
             elementBindings_.erase(it);
+            if (targetElem && targetElem->BoundTwoWayEngine() == this &&
+                !HasAnyBindingTargeting(targetElem.Get())) {
+                targetElem->BindTwoWayEngine(nullptr);
+            }
             return true;
         }
     }
     for (auto it = multiBindings_.begin(); it != multiBindings_.end(); ++it) {
         if (it->bindingSlotId == bindingSlotId) {
-            if (it->targetElement && it->targetElement->BoundTwoWayEngine() == this) {
-                it->targetElement->BindTwoWayEngine(nullptr);
-            }
+            IntrusivePtr<UIElement> targetElem = it->targetElement;
             ReleaseMultiBindingObservers(*it);
             multiBindings_.erase(it);
+            if (targetElem && targetElem->BoundTwoWayEngine() == this &&
+                !HasAnyBindingTargeting(targetElem.Get())) {
+                targetElem->BindTwoWayEngine(nullptr);
+            }
             return true;
         }
     }
@@ -1767,6 +1935,12 @@ std::size_t DualTrackBindingEngine::FlushTrackA(RuntimeError* error) {
     if (trackABindings_.empty() && elementBindings_.empty() && multiBindings_.empty()) {
         return 0;
     }
+    std::shared_ptr<UiResourceContext> domainCtx =
+        !UiResourceContext::HasActiveThreadOverride()
+            ? UiResourceContext::FindForDomains(&domains_)
+            : nullptr;
+    ScopedUiResourceContext ctxGuard(std::move(domainCtx));
+
     std::size_t updatedCount = 0;
 
     auto processHeap = [&](ManagedHeap& heap) {
@@ -1818,6 +1992,24 @@ std::size_t DualTrackBindingEngine::FlushTrackA(RuntimeError* error) {
 
     processHeap(domains_.simHeap());
     processHeap(domains_.uiHeap());
+
+    // Sync any non-[Observable] or cross-heap ObservableList / array mutations tracked via arrayMutationVersion
+    const std::size_t colSnapshotCount = trackABindings_.size();
+    for (std::size_t bIdx = 0u; bIdx < colSnapshotCount && bIdx < trackABindings_.size(); ++bIdx) {
+        const auto& b = trackABindings_[bIdx];
+        if (!b.syncedCollectionRef.valid() || (b.mode == BindingMode::OneTime && b.initialized) ||
+            b.hops.empty()) {
+            continue;
+        }
+        if (const auto* colHeap = domains_.heapForObject(b.syncedCollectionRef);
+            colHeap && colHeap->isAlive(b.syncedCollectionRef)) {
+            if (colHeap->arrayMutationVersion(b.syncedCollectionRef) != b.lastSeenMutationVersion) {
+                if (EvaluateAndSyncChain(trackABindings_[bIdx], b.hops.size() - 1u, error)) {
+                    ++updatedCount;
+                }
+            }
+        }
+    }
 
     // Sync ElementName / RelativeSource UIElement-to-UIElement bindings & MultiBindings with element sources
     for (int elemPass = 0; elemPass < 2; ++elemPass) {
@@ -1892,6 +2084,51 @@ std::size_t DualTrackBindingEngine::FlushTrackA(RuntimeError* error) {
                 ReleaseCollectionObserver(trackABindings_[bIdx]);
                 ApplyFallbackOrClear(trackABindings_[bIdx]);
                 ++updatedCount;
+            }
+        }
+
+        auto sweepMultiDeadHops = [&](auto& self, MultiBindingInstance& inst) noexcept -> bool {
+            bool anyDeadHop = false;
+            for (auto& sl : inst.sources) {
+                if (sl.nestedMulti) {
+                    if (self(self, *sl.nestedMulti)) {
+                        anyDeadHop = true;
+                    }
+                    continue;
+                }
+                for (std::size_t h = 0u; h < sl.resolvedHopObjects.size(); ++h) {
+                    const ObjectRef ref = sl.resolvedHopObjects[h];
+                    if (!ref.valid()) {
+                        continue;
+                    }
+                    auto* heap = domains_.heapForObject(ref);
+                    if (!heap || !heap->isAlive(ref)) {
+                        anyDeadHop = true;
+                        for (std::size_t clearIdx = h; clearIdx < sl.resolvedHopObjects.size(); ++clearIdx) {
+                            const ObjectRef oldRef = sl.resolvedHopObjects[clearIdx];
+                            if (oldRef.valid()) {
+                                if (auto* oldHeap = domains_.heapForObject(oldRef)) {
+                                    oldHeap->removeUiObserver(oldRef);
+                                }
+                                sl.resolvedHopObjects[clearIdx] = ObjectRef{};
+                            }
+                        }
+                        break;
+                    }
+                }
+            }
+            return anyDeadHop;
+        };
+        const std::size_t gcMultiSnapshot = multiBindings_.size();
+        for (std::size_t mIdx = 0u; mIdx < gcMultiSnapshot && mIdx < multiBindings_.size(); ++mIdx) {
+            auto& mb = multiBindings_[mIdx];
+            if (!mb.initialized || !mb.targetElement || mb.mode == BindingMode::OneTime) {
+                continue;
+            }
+            if (sweepMultiDeadHops(sweepMultiDeadHops, mb)) {
+                if (EvaluateAndSyncMultiBinding(multiBindings_[mIdx], error)) {
+                    ++updatedCount;
+                }
             }
         }
     }
@@ -2082,6 +2319,19 @@ std::size_t DualTrackBindingEngine::ApplyHotReloadMigration(
         }
         return false;
     };
+
+    for (auto& kv : registeredConverters_) {
+        if (kv.second.receiverObject.valid() && mapObjectRef(kv.second.receiverObject)) {
+            kv.second.receiverRoot.reset();
+            if (kv.second.receiverObject.valid()) {
+                if (auto* heap = domains_.heapForObject(kv.second.receiverObject);
+                    heap && heap->isAlive(kv.second.receiverObject)) {
+                    kv.second.receiverRoot = std::make_shared<PersistentRoot>(
+                        heap->retain(kv.second.receiverObject));
+                }
+            }
+        }
+    }
 
     const std::size_t bSnapshotCount = trackABindings_.size();
     for (std::size_t bIdx = 0u; bIdx < bSnapshotCount && bIdx < trackABindings_.size(); ++bIdx) {

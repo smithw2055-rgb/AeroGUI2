@@ -54,6 +54,7 @@ flat in uint v_Flags;
 flat in vec2 v_QuadHalfSize;
 
 uniform sampler2D u_GlyphAndUiAtlas;
+uniform sampler2D u_ImageAtlas;
 uniform vec2 u_QuadHalfExtent;
 
 out vec4 o_FragColor;
@@ -108,14 +109,20 @@ float applyGradientSpread(float rawT, uint spreadMethod) {
 }
 
 void main() {
-    // 0: SolidQuad
+    // 0: SolidQuad (outputs premultiplied RGBA; respects AeroVertexFlag_PremultipliedAlpha = 4u)
     if (v_PrimType == 0u) {
-        o_FragColor = v_Color;
+        bool isPremul = (v_Flags & 4u) != 0u;
+        vec3 rgb = isPremul ? v_Color.rgb : (v_Color.rgb * v_Color.a);
+        o_FragColor = vec4(rgb, v_Color.a);
         return;
     }
 
     // 1: SdfRoundedRect (Uniform fast path + Soft DropShadow + Asymmetric 4-corner sdRoundedBox4 + Hollow BorderBrush Ring)
     if (v_PrimType == 1u) {
+        if (v_Color.a <= 0.0001) {
+            o_FragColor = vec4(0.0);
+            return;
+        }
         vec2 halfSize = max(abs(u_QuadHalfExtent), v_QuadHalfSize);
         uint sdfMode = (v_Flags >> 16u) & 0x3u;
         uint payload27 = (v_Flags & 0xFFFFu) | (((v_Flags >> 18u) & 0x7FFu) << 16u);
@@ -127,13 +134,16 @@ void main() {
             float dist = sdRoundedBox(v_UvOrLocalPos, boxHalf, cornerRadius);
             float aa = max(max(fwidth(dist) * 0.75, softShadowPad * 0.8), 1e-4);
             float outerCoverage = smoothstep(aa, -aa, dist);
+            float outA = v_Color.a * outerCoverage;
             if (borderThickness > 0.0) {
                 float innerDist = dist + borderThickness;
                 float innerCoverage = smoothstep(aa, -aa, innerDist);
-                float borderMask = clamp(outerCoverage - innerCoverage * 0.35, 0.0, 1.0);
-                o_FragColor = vec4(v_Color.rgb, v_Color.a * borderMask);
+                float ringCov = clamp(outerCoverage - innerCoverage, 0.0, 1.0);
+                vec3 hiRgb = min(vec3(1.0), v_Color.rgb * 1.25 + vec3(0.08));
+                vec3 rgb = mix(v_Color.rgb, hiRgb, ringCov);
+                o_FragColor = vec4(rgb * outA, outA);
             } else {
-                o_FragColor = vec4(v_Color.rgb, v_Color.a * outerCoverage);
+                o_FragColor = vec4(v_Color.rgb * outA, outA);
             }
             return;
         }
@@ -162,7 +172,8 @@ void main() {
             float innerCoverage = (innerHalf.x > 0.0 && innerHalf.y > 0.0)
                 ? smoothstep(aa, -aa, sdRoundedBox4(v_UvOrLocalPos - innerCenter, innerHalf, innerRadii))
                 : 0.0;
-            o_FragColor = vec4(v_Color.rgb, v_Color.a * clamp(outerCoverage - innerCoverage, 0.0, 1.0));
+            float outA = v_Color.a * clamp(outerCoverage - innerCoverage, 0.0, 1.0);
+            o_FragColor = vec4(v_Color.rgb * outA, outA);
             return;
         }
         if (sdfMode == 2u) {
@@ -174,7 +185,8 @@ void main() {
             float bl = float((payload27 >> 18u) & 0x3Fu) * rStep;
             float dist = sdRoundedBox4(v_UvOrLocalPos, halfSize, vec4(tr, br, tl, bl));
             float aa = max(fwidth(dist) * 0.75, 1e-4);
-            o_FragColor = vec4(v_Color.rgb, v_Color.a * smoothstep(aa, -aa, dist));
+            float outA = v_Color.a * smoothstep(aa, -aa, dist);
+            o_FragColor = vec4(v_Color.rgb * outA, outA);
             return;
         }
         float rStep = (((payload27 >> 26u) & 1u) != 0u) ? 2.0 : 1.0;
@@ -191,16 +203,30 @@ void main() {
         float innerCoverage = (innerHalf.x > 0.0 && innerHalf.y > 0.0)
             ? smoothstep(aa, -aa, sdRoundedBox4(v_UvOrLocalPos, innerHalf, max(vec4(0.0), outerRadii - vec4(borderThickness))))
             : 0.0;
-        o_FragColor = vec4(v_Color.rgb, v_Color.a * clamp(outerCoverage - innerCoverage, 0.0, 1.0));
+        float outA = v_Color.a * clamp(outerCoverage - innerCoverage, 0.0, 1.0);
+        o_FragColor = vec4(v_Color.rgb * outA, outA);
         return;
     }
 
-    // 2: SdfTextGlyph (Analytical SDF Font AA)
+    // 2: SdfTextGlyph (Analytical SDF Font AA on u_GlyphAndUiAtlas)
     if (v_PrimType == 2u) {
         float sdfSample = texture(u_GlyphAndUiAtlas, v_UvOrLocalPos).r;
         float edgeWidth = max(fwidth(sdfSample), 0.04);
         float alpha = smoothstep(0.5 - edgeWidth, 0.5 + edgeWidth, sdfSample);
-        o_FragColor = vec4(v_Color.rgb, v_Color.a * alpha);
+        bool isPremul = (v_Flags & 4u) != 0u;
+        float outA = v_Color.a * alpha;
+        vec3 rgb = isPremul ? (v_Color.rgb * alpha) : (v_Color.rgb * outA);
+        o_FragColor = vec4(rgb, outA);
+        return;
+    }
+
+    // 3: TexturedQuad (<Image> sprites & standalone textures on u_ImageAtlas)
+    if (v_PrimType == 3u) {
+        vec4 texel = texture(u_ImageAtlas, v_UvOrLocalPos);
+        bool isPremul = (v_Flags & 4u) != 0u;
+        float outA = texel.a * v_Color.a;
+        vec3 rgb = isPremul ? (texel.rgb * v_Color.rgb) : (texel.rgb * v_Color.rgb * outA);
+        o_FragColor = vec4(rgb, outA);
         return;
     }
 
@@ -219,7 +245,8 @@ void main() {
             float strokeCov = clamp(0.5 + strokePx * 0.5 - abs(trueDistPx), 0.0, 1.0);
             fillCov = max(fillCov, strokeCov);
         }
-        o_FragColor = vec4(v_Color.rgb, v_Color.a * fillCov);
+        float outA = v_Color.a * fillCov;
+        o_FragColor = vec4(v_Color.rgb * outA, outA);
         return;
     }
 
@@ -246,7 +273,8 @@ void main() {
             : (length(q - sc * midR) - halfThick);
         float aa = max(fwidth(dist) * 0.75, 1e-4);
         float cov = (sweepRad <= 0.001) ? 0.0 : smoothstep(aa, -aa, dist);
-        o_FragColor = vec4(v_Color.rgb, v_Color.a * cov);
+        float outA = v_Color.a * cov;
+        o_FragColor = vec4(v_Color.rgb * outA, outA);
         return;
     }
 
@@ -259,15 +287,16 @@ void main() {
         float dist = sdEllipseApprox(v_UvOrLocalPos, halfSize);
         float aa = max(fwidth(dist) * 0.75, 1e-4);
         float outerCov = smoothstep(aa, -aa, dist);
+        float cov = outerCov;
         if (hollowStroke) {
             vec2 innerAb = halfSize - vec2(strokeThickness);
             float innerCov = (innerAb.x > 0.0 && innerAb.y > 0.0)
                 ? smoothstep(aa, -aa, sdEllipseApprox(v_UvOrLocalPos, innerAb))
                 : 0.0;
-            o_FragColor = vec4(v_Color.rgb, v_Color.a * clamp(outerCov - innerCov, 0.0, 1.0));
-        } else {
-            o_FragColor = vec4(v_Color.rgb, v_Color.a * outerCov);
+            cov = clamp(outerCov - innerCov, 0.0, 1.0);
         }
+        float outA = v_Color.a * cov;
+        o_FragColor = vec4(v_Color.rgb * outA, outA);
         return;
     }
 
@@ -334,13 +363,17 @@ void main() {
             gradSample = textureLod(u_GlyphAndUiAtlas, vec2(uTex, vTex), 0.0);
             gradSample.a *= brushOpacity;
         }
-        o_FragColor = vec4(gradSample.rgb * v_Color.rgb, gradSample.a * v_Color.a * shapeCov);
+        float outA = gradSample.a * v_Color.a * shapeCov;
+        o_FragColor = vec4(gradSample.rgb * v_Color.rgb * outA, outA);
         return;
     }
 
-    // 3: TexturedQuad / 6: DynamicMesh
+    // 6: DynamicMesh fallback on u_GlyphAndUiAtlas
     vec4 texel = texture(u_GlyphAndUiAtlas, v_UvOrLocalPos);
-    o_FragColor = texel * v_Color;
+    bool isPremul = (v_Flags & 4u) != 0u;
+    float outA = texel.a * v_Color.a;
+    vec3 rgb = isPremul ? (texel.rgb * v_Color.rgb) : (texel.rgb * v_Color.rgb * outA);
+    o_FragColor = vec4(rgb, outA);
 }
 )";
 
@@ -392,6 +425,7 @@ flat in uint v_Flags;
 flat in vec2 v_QuadHalfSize;
 
 uniform sampler2D u_GlyphAndUiAtlas;
+uniform sampler2D u_ImageAtlas;
 uniform vec2 u_QuadHalfExtent;
 
 out vec4 o_FragColor;
@@ -447,11 +481,17 @@ float applyGradientSpread(float rawT, uint spreadMethod) {
 
 void main() {
     if (v_PrimType == 0u) {
-        o_FragColor = v_Color;
+        bool isPremul = (v_Flags & 4u) != 0u;
+        vec3 rgb = isPremul ? v_Color.rgb : (v_Color.rgb * v_Color.a);
+        o_FragColor = vec4(rgb, v_Color.a);
         return;
     }
 
     if (v_PrimType == 1u) {
+        if (v_Color.a <= 0.0001) {
+            o_FragColor = vec4(0.0);
+            return;
+        }
         vec2 halfSize = max(abs(u_QuadHalfExtent), v_QuadHalfSize);
         uint sdfMode = (v_Flags >> 16u) & 0x3u;
         uint payload27 = (v_Flags & 0xFFFFu) | (((v_Flags >> 18u) & 0x7FFu) << 16u);
@@ -463,12 +503,16 @@ void main() {
             float dist = sdRoundedBox(v_UvOrLocalPos, boxHalf, cornerRadius);
             float aa = max(max(fwidth(dist) * 0.75, softShadowPad * 0.8), 1e-4);
             float outerCoverage = smoothstep(aa, -aa, dist);
+            float outA = v_Color.a * outerCoverage;
             if (borderThickness > 0.0) {
                 float innerDist = dist + borderThickness;
                 float innerCoverage = smoothstep(aa, -aa, innerDist);
-                o_FragColor = vec4(v_Color.rgb, v_Color.a * clamp(outerCoverage - innerCoverage * 0.35, 0.0, 1.0));
+                float ringCov = clamp(outerCoverage - innerCoverage, 0.0, 1.0);
+                vec3 hiRgb = min(vec3(1.0), v_Color.rgb * 1.25 + vec3(0.08));
+                vec3 rgb = mix(v_Color.rgb, hiRgb, ringCov);
+                o_FragColor = vec4(rgb * outA, outA);
             } else {
-                o_FragColor = vec4(v_Color.rgb, v_Color.a * outerCoverage);
+                o_FragColor = vec4(v_Color.rgb * outA, outA);
             }
             return;
         }
@@ -497,7 +541,8 @@ void main() {
             float innerCoverage = (innerHalf.x > 0.0 && innerHalf.y > 0.0)
                 ? smoothstep(aa, -aa, sdRoundedBox4(v_UvOrLocalPos - innerCenter, innerHalf, innerRadii))
                 : 0.0;
-            o_FragColor = vec4(v_Color.rgb, v_Color.a * clamp(outerCoverage - innerCoverage, 0.0, 1.0));
+            float outA = v_Color.a * clamp(outerCoverage - innerCoverage, 0.0, 1.0);
+            o_FragColor = vec4(v_Color.rgb * outA, outA);
             return;
         }
         if (sdfMode == 2u) {
@@ -509,7 +554,8 @@ void main() {
             float bl = float((payload27 >> 18u) & 0x3Fu) * rStep;
             float dist = sdRoundedBox4(v_UvOrLocalPos, halfSize, vec4(tr, br, tl, bl));
             float aa = max(fwidth(dist) * 0.75, 1e-4);
-            o_FragColor = vec4(v_Color.rgb, v_Color.a * smoothstep(aa, -aa, dist));
+            float outA = v_Color.a * smoothstep(aa, -aa, dist);
+            o_FragColor = vec4(v_Color.rgb * outA, outA);
             return;
         }
         float rStep = (((payload27 >> 26u) & 1u) != 0u) ? 2.0 : 1.0;
@@ -526,7 +572,8 @@ void main() {
         float innerCoverage = (innerHalf.x > 0.0 && innerHalf.y > 0.0)
             ? smoothstep(aa, -aa, sdRoundedBox4(v_UvOrLocalPos, innerHalf, max(vec4(0.0), outerRadii - vec4(borderThickness))))
             : 0.0;
-        o_FragColor = vec4(v_Color.rgb, v_Color.a * clamp(outerCoverage - innerCoverage, 0.0, 1.0));
+        float outA = v_Color.a * clamp(outerCoverage - innerCoverage, 0.0, 1.0);
+        o_FragColor = vec4(v_Color.rgb * outA, outA);
         return;
     }
 
@@ -535,7 +582,19 @@ void main() {
         float sdfDist = texture(u_GlyphAndUiAtlas, v_UvOrLocalPos).r;
         float fw = clamp(fwidth(sdfDist) * 0.85, 0.025, 0.22);
         float grayscaleAlpha = smoothstep(0.5 - fw, 0.5 + fw, sdfDist);
-        o_FragColor = vec4(v_Color.rgb, v_Color.a * grayscaleAlpha);
+        bool isPremul = (v_Flags & 4u) != 0u;
+        float outA = v_Color.a * grayscaleAlpha;
+        vec3 rgb = isPremul ? (v_Color.rgb * grayscaleAlpha) : (v_Color.rgb * outA);
+        o_FragColor = vec4(rgb, outA);
+        return;
+    }
+
+    if (v_PrimType == 3u) {
+        vec4 texel = texture(u_ImageAtlas, v_UvOrLocalPos);
+        bool isPremul = (v_Flags & 4u) != 0u;
+        float outA = texel.a * v_Color.a;
+        vec3 rgb = isPremul ? (texel.rgb * v_Color.rgb) : (texel.rgb * v_Color.rgb * outA);
+        o_FragColor = vec4(rgb, outA);
         return;
     }
 
@@ -552,7 +611,8 @@ void main() {
             float trueDistPx = (mtsdf.a - 0.5) * screenPxRange;
             fillCov = max(fillCov, clamp(0.5 + strokePx * 0.5 - abs(trueDistPx), 0.0, 1.0));
         }
-        o_FragColor = vec4(v_Color.rgb, v_Color.a * fillCov);
+        float outA = v_Color.a * fillCov;
+        o_FragColor = vec4(v_Color.rgb * outA, outA);
         return;
     }
 
@@ -578,7 +638,8 @@ void main() {
             : (length(q - sc * midR) - halfThick);
         float aa = max(fwidth(dist) * 0.75, 1e-4);
         float cov = (sweepRad <= 0.001) ? 0.0 : smoothstep(aa, -aa, dist);
-        o_FragColor = vec4(v_Color.rgb, v_Color.a * cov);
+        float outA = v_Color.a * cov;
+        o_FragColor = vec4(v_Color.rgb * outA, outA);
         return;
     }
 
@@ -591,15 +652,16 @@ void main() {
         float dist = sdEllipseApprox(v_UvOrLocalPos, halfSize);
         float aa = max(fwidth(dist) * 0.75, 1e-4);
         float outerCov = smoothstep(aa, -aa, dist);
+        float cov = outerCov;
         if (hollowStroke) {
             vec2 innerAb = halfSize - vec2(strokeThickness);
             float innerCov = (innerAb.x > 0.0 && innerAb.y > 0.0)
                 ? smoothstep(aa, -aa, sdEllipseApprox(v_UvOrLocalPos, innerAb))
                 : 0.0;
-            o_FragColor = vec4(v_Color.rgb, v_Color.a * clamp(outerCov - innerCov, 0.0, 1.0));
-        } else {
-            o_FragColor = vec4(v_Color.rgb, v_Color.a * outerCov);
+            cov = clamp(outerCov - innerCov, 0.0, 1.0);
         }
+        float outA = v_Color.a * cov;
+        o_FragColor = vec4(v_Color.rgb * outA, outA);
         return;
     }
 
@@ -666,11 +728,16 @@ void main() {
             gradSample = textureLod(u_GlyphAndUiAtlas, vec2(uTex, vTex), 0.0);
             gradSample.a *= brushOpacity;
         }
-        o_FragColor = vec4(gradSample.rgb * v_Color.rgb, gradSample.a * v_Color.a * shapeCov);
+        float outA = gradSample.a * v_Color.a * shapeCov;
+        o_FragColor = vec4(gradSample.rgb * v_Color.rgb * outA, outA);
         return;
     }
 
-    o_FragColor = texture(u_GlyphAndUiAtlas, v_UvOrLocalPos) * v_Color;
+    vec4 texel = texture(u_GlyphAndUiAtlas, v_UvOrLocalPos);
+    bool isPremul = (v_Flags & 4u) != 0u;
+    float outA = texel.a * v_Color.a;
+    vec3 rgb = isPremul ? (texel.rgb * v_Color.rgb) : (texel.rgb * v_Color.rgb * outA);
+    o_FragColor = vec4(rgb, outA);
 }
 )";
 
@@ -682,6 +749,8 @@ struct AeroUniforms {
 @group(0) @binding(0) var<uniform> u_Globals : AeroUniforms;
 @group(0) @binding(1) var u_AtlasSampler : sampler;
 @group(0) @binding(2) var u_AtlasTex : texture_2d<f32>;
+@group(0) @binding(3) var u_ImageSampler : sampler;
+@group(0) @binding(4) var u_ImageTex : texture_2d<f32>;
 
 struct VertexIn {
     @location(0) position : vec2<f32>,
@@ -773,9 +842,14 @@ fn vs_main(in : VertexIn) -> VertexOut {
 @fragment
 fn fs_main(in : VertexOut) -> @location(0) vec4<f32> {
     if (in.primType == 0u) {
-        return in.color;
+        let isPremul = (in.flags & 4u) != 0u;
+        let rgb = select(in.color.rgb * in.color.a, in.color.rgb, isPremul);
+        return vec4<f32>(rgb, in.color.a);
     }
     if (in.primType == 1u) {
+        if (in.color.a <= 0.0001) {
+            return vec4<f32>(0.0, 0.0, 0.0, 0.0);
+        }
         let halfSize = max(abs(u_Globals.quadHalfExtent), in.quadHalfSize);
         let sdfMode = (in.flags >> 16u) & 0x3u;
         let payload27 = (in.flags & 0xFFFFu) | (((in.flags >> 18u) & 0x7FFu) << 16u);
@@ -787,12 +861,16 @@ fn fs_main(in : VertexOut) -> @location(0) vec4<f32> {
             let dist = sdRoundedBox(in.uvOrLocal, boxHalf, radius);
             let aa = max(max(fwidth(dist) * 0.75, softShadowPad * 0.8), 1e-4);
             let outerCov = smoothstep(aa, -aa, dist);
+            let outA = in.color.a * outerCov;
             if (borderThickness > 0.0) {
                 let innerDist = dist + borderThickness;
                 let innerCov = smoothstep(aa, -aa, innerDist);
-                return vec4<f32>(in.color.rgb, in.color.a * clamp(outerCov - innerCov * 0.35, 0.0, 1.0));
+                let ringCov = clamp(outerCov - innerCov, 0.0, 1.0);
+                let hiRgb = min(vec3<f32>(1.0), in.color.rgb * 1.25 + vec3<f32>(0.08));
+                let rgb = mix(in.color.rgb, hiRgb, ringCov);
+                return vec4<f32>(rgb * outA, outA);
             }
-            return vec4<f32>(in.color.rgb, in.color.a * outerCov);
+            return vec4<f32>(in.color.rgb * outA, outA);
         }
         if (sdfMode == 1u) {
             let asymBt = (payload27 >> 26u) & 1u;
@@ -821,7 +899,8 @@ fn fs_main(in : VertexOut) -> @location(0) vec4<f32> {
             if (innerHalf.x > 0.0 && innerHalf.y > 0.0) {
                 innerCov = smoothstep(aa, -aa, sdRoundedBox4(in.uvOrLocal - innerCenter, innerHalf, innerRadii));
             }
-            return vec4<f32>(in.color.rgb, in.color.a * clamp(outerCov - innerCov, 0.0, 1.0));
+            let outA = in.color.a * clamp(outerCov - innerCov, 0.0, 1.0);
+            return vec4<f32>(in.color.rgb * outA, outA);
         }
         if (sdfMode == 2u) {
             let scaleSel = (payload27 >> 24u) & 0x3u;
@@ -832,7 +911,8 @@ fn fs_main(in : VertexOut) -> @location(0) vec4<f32> {
             let bl = f32((payload27 >> 18u) & 0x3Fu) * rStep;
             let dist = sdRoundedBox4(in.uvOrLocal, halfSize, vec4<f32>(tr, br, tl, bl));
             let aa = max(fwidth(dist) * 0.75, 1e-4);
-            return vec4<f32>(in.color.rgb, in.color.a * smoothstep(aa, -aa, dist));
+            let outA = in.color.a * smoothstep(aa, -aa, dist);
+            return vec4<f32>(in.color.rgb * outA, outA);
         }
         let rStep = select(1.0, 2.0, ((payload27 >> 26u) & 1u) != 0u);
         let tl = f32((payload27 >>  0u) & 0x1Fu) * rStep;
@@ -852,13 +932,24 @@ fn fs_main(in : VertexOut) -> @location(0) vec4<f32> {
                 -aa,
                 sdRoundedBox4(in.uvOrLocal, innerHalf, max(vec4<f32>(0.0), outerRadii - vec4<f32>(borderThickness))));
         }
-        return vec4<f32>(in.color.rgb, in.color.a * clamp(outerCov - innerCov, 0.0, 1.0));
+        let outA = in.color.a * clamp(outerCov - innerCov, 0.0, 1.0);
+        return vec4<f32>(in.color.rgb * outA, outA);
     }
     if (in.primType == 2u) {
         let sdf = textureSample(u_AtlasTex, u_AtlasSampler, in.uvOrLocal).r;
         let fw = max(fwidth(sdf), 0.04);
         let alpha = smoothstep(0.5 - fw, 0.5 + fw, sdf);
-        return vec4<f32>(in.color.rgb, in.color.a * alpha);
+        let isPremul = (in.flags & 4u) != 0u;
+        let outA = in.color.a * alpha;
+        let rgb = select(in.color.rgb * outA, in.color.rgb * alpha, isPremul);
+        return vec4<f32>(rgb, outA);
+    }
+    if (in.primType == 3u) {
+        let texel = textureSample(u_ImageTex, u_ImageSampler, in.uvOrLocal);
+        let isPremul = (in.flags & 4u) != 0u;
+        let outA = texel.a * in.color.a;
+        let rgb = select(texel.rgb * in.color.rgb * outA, texel.rgb * in.color.rgb, isPremul);
+        return vec4<f32>(rgb, outA);
     }
     if (in.primType == 4u) {
         let mtsdf = textureSample(u_AtlasTex, u_AtlasSampler, in.uvOrLocal);
@@ -873,7 +964,8 @@ fn fs_main(in : VertexOut) -> @location(0) vec4<f32> {
             let trueDistPx = (mtsdf.a - 0.5) * screenPxRange;
             fillCov = max(fillCov, clamp(0.5 + strokePx * 0.5 - abs(trueDistPx), 0.0, 1.0));
         }
-        return vec4<f32>(in.color.rgb, in.color.a * fillCov);
+        let outA = in.color.a * fillCov;
+        return vec4<f32>(in.color.rgb * outA, outA);
     }
     if (in.primType == 5u) {
         let startRad = f32(in.flags & 0x3Fu) * (6.2831853 / 64.0);
@@ -898,7 +990,8 @@ fn fs_main(in : VertexOut) -> @location(0) vec4<f32> {
             sc.y * q.x > sc.x * q.y);
         let aa = max(fwidth(dist) * 0.75, 1e-4);
         let cov = select(smoothstep(aa, -aa, dist), 0.0, sweepRad <= 0.001);
-        return vec4<f32>(in.color.rgb, in.color.a * cov);
+        let outA = in.color.a * cov;
+        return vec4<f32>(in.color.rgb * outA, outA);
     }
     if (in.primType == 7u) {
         let halfSize = max(abs(u_Globals.quadHalfExtent), in.quadHalfSize);
@@ -907,15 +1000,17 @@ fn fs_main(in : VertexOut) -> @location(0) vec4<f32> {
         let dist = sdEllipseApprox(in.uvOrLocal, halfSize);
         let aa = max(fwidth(dist) * 0.75, 1e-4);
         let outerCov = smoothstep(aa, -aa, dist);
+        var cov = outerCov;
         if (hollowStroke) {
             let innerAb = halfSize - vec2<f32>(strokeThickness, strokeThickness);
             var innerCov = 0.0;
             if (innerAb.x > 0.0 && innerAb.y > 0.0) {
                 innerCov = smoothstep(aa, -aa, sdEllipseApprox(in.uvOrLocal, innerAb));
             }
-            return vec4<f32>(in.color.rgb, in.color.a * clamp(outerCov - innerCov, 0.0, 1.0));
+            cov = clamp(outerCov - innerCov, 0.0, 1.0);
         }
-        return vec4<f32>(in.color.rgb, in.color.a * outerCov);
+        let outA = in.color.a * cov;
+        return vec4<f32>(in.color.rgb * outA, outA);
     }
     if (in.primType == 8u) {
         let halfSize = max(abs(u_Globals.quadHalfExtent), in.quadHalfSize);
@@ -984,9 +1079,14 @@ fn fs_main(in : VertexOut) -> @location(0) vec4<f32> {
             gradSample = textureSampleLevel(u_AtlasTex, u_AtlasSampler, vec2<f32>(uTex, vTex), 0.0);
             gradSample.a = gradSample.a * brushOpacity;
         }
-        return vec4<f32>(gradSample.rgb * in.color.rgb, gradSample.a * in.color.a * shapeCov);
+        let outA = gradSample.a * in.color.a * shapeCov;
+        return vec4<f32>(gradSample.rgb * in.color.rgb * outA, outA);
     }
-    return textureSample(u_AtlasTex, u_AtlasSampler, in.uvOrLocal) * in.color;
+    let texel = textureSample(u_AtlasTex, u_AtlasSampler, in.uvOrLocal);
+    let isPremul = (in.flags & 4u) != 0u;
+    let outA = texel.a * in.color.a;
+    let rgb = select(texel.rgb * in.color.rgb * outA, texel.rgb * in.color.rgb, isPremul);
+    return vec4<f32>(rgb, outA);
 }
 )";
 
@@ -1021,7 +1121,35 @@ void BlendPixelOver(
     dstRgba[0] = static_cast<std::uint8_t>(std::clamp(static_cast<float>(srcR) * a + static_cast<float>(dstRgba[0]) * invA + 0.5f, 0.0f, 255.0f));
     dstRgba[1] = static_cast<std::uint8_t>(std::clamp(static_cast<float>(srcG) * a + static_cast<float>(dstRgba[1]) * invA + 0.5f, 0.0f, 255.0f));
     dstRgba[2] = static_cast<std::uint8_t>(std::clamp(static_cast<float>(srcB) * a + static_cast<float>(dstRgba[2]) * invA + 0.5f, 0.0f, 255.0f));
-    dstRgba[3] = 255u;
+    dstRgba[3] = static_cast<std::uint8_t>(std::clamp(a * 255.0f + static_cast<float>(dstRgba[3]) * invA + 0.5f, 0.0f, 255.0f));
+}
+
+[[nodiscard]] int SafeFloorToInt(float v, int lo, int hi) noexcept {
+    if (!std::isfinite(v)) {
+        return lo;
+    }
+    const float f = std::floor(v);
+    if (f <= static_cast<float>(lo)) {
+        return lo;
+    }
+    if (f >= static_cast<float>(hi)) {
+        return hi;
+    }
+    return static_cast<int>(f);
+}
+
+[[nodiscard]] int SafeCeilToInt(float v, int lo, int hi) noexcept {
+    if (!std::isfinite(v)) {
+        return lo;
+    }
+    const float c = std::ceil(v);
+    if (c <= static_cast<float>(lo)) {
+        return lo;
+    }
+    if (c >= static_cast<float>(hi)) {
+        return hi;
+    }
+    return static_cast<int>(c);
 }
 
 struct PremulOffscreenLayer {
@@ -1145,19 +1273,26 @@ void RasterizeSingleNode(
     std::uint8_t* outRgba8,
     PremulOffscreenLayer* optPremulLayer) {
     const RenderNodeDescriptor* nd = tree.GetNode(nid);
-    if (!nd || nd->pageIndex >= tree.PageCount() || nd->opacity <= 0.001f) {
+    if (!nd || nd->pageIndex >= tree.PageCount() || !std::isfinite(nd->opacity) || nd->opacity <= 0.001f) {
         return;
     }
+    const int vpW = static_cast<int>(std::min<std::uint32_t>(viewportWidth, 0x3FFFFFFFu));
+    const int vpH = static_cast<int>(std::min<std::uint32_t>(viewportHeight, 0x3FFFFFFFu));
     const CommandPage& page = tree.GetPage(nd->pageIndex);
     const bool clipOn = (page.header.flags & CommandPageFlag_ScissorClipActive) != 0u;
-    int clipMinX = clipOn ? std::max(0, static_cast<int>(std::floor(page.header.clipX))) : 0;
-    int clipMinY = clipOn ? std::max(0, static_cast<int>(std::floor(page.header.clipY))) : 0;
+    if (clipOn &&
+        (!std::isfinite(page.header.clipX) || !std::isfinite(page.header.clipY) ||
+         !std::isfinite(page.header.clipW) || !std::isfinite(page.header.clipH))) {
+        return;
+    }
+    int clipMinX = clipOn ? SafeFloorToInt(page.header.clipX, 0, vpW) : 0;
+    int clipMinY = clipOn ? SafeFloorToInt(page.header.clipY, 0, vpH) : 0;
     int clipMaxX = clipOn
-        ? std::min(static_cast<int>(viewportWidth), static_cast<int>(std::ceil(page.header.clipX + page.header.clipW)))
-        : static_cast<int>(viewportWidth);
+        ? SafeCeilToInt(page.header.clipX + std::max(0.0f, page.header.clipW), 0, vpW)
+        : vpW;
     int clipMaxY = clipOn
-        ? std::min(static_cast<int>(viewportHeight), static_cast<int>(std::ceil(page.header.clipY + page.header.clipH)))
-        : static_cast<int>(viewportHeight);
+        ? SafeCeilToInt(page.header.clipY + std::max(0.0f, page.header.clipH), 0, vpH)
+        : vpH;
 
     if (optPremulLayer) {
         clipMinX = std::max(clipMinX, optPremulLayer->originX);
@@ -1180,6 +1315,12 @@ void RasterizeSingleNode(
         const AeroVertex& v2 = page.vertices[vIdx + 2u];
         const AeroVertex& v3 = page.vertices[vIdx + 3u];
         if (((v0.rgba | v1.rgba | v2.rgba | v3.rgba) & 0xFF000000u) == 0u) {
+            continue;
+        }
+        if (!std::isfinite(v0.x) || !std::isfinite(v0.y) ||
+            !std::isfinite(v1.x) || !std::isfinite(v1.y) ||
+            !std::isfinite(v2.x) || !std::isfinite(v2.y) ||
+            !std::isfinite(v3.x) || !std::isfinite(v3.y)) {
             continue;
         }
         const bool uniformVertexColor =
@@ -1210,7 +1351,7 @@ void RasterizeSingleNode(
             e3y = 0.5f * ((v3.y - v0.y) + (v2.y - v1.y));
         }
         const float det = e1x * e3y - e1y * e3x;
-        if (std::fabs(det) <= 1e-4f) {
+        if (!std::isfinite(det) || std::fabs(det) <= 1e-4f) {
             continue;
         }
         const float invDet = 1.0f / det;
@@ -1245,10 +1386,10 @@ void RasterizeSingleNode(
             }
         }
 
-        const int pxStart = std::max(clipMinX, static_cast<int>(std::floor(minX)));
-        const int pyStart = std::max(clipMinY, static_cast<int>(std::floor(minY)));
-        const int pxEnd = std::min(clipMaxX, static_cast<int>(std::ceil(maxX)));
-        const int pyEnd = std::min(clipMaxY, static_cast<int>(std::ceil(maxY)));
+        const int pxStart = SafeFloorToInt(minX, clipMinX, clipMaxX);
+        const int pyStart = SafeFloorToInt(minY, clipMinY, clipMaxY);
+        const int pxEnd = SafeCeilToInt(maxX, clipMinX, clipMaxX);
+        const int pyEnd = SafeCeilToInt(maxY, clipMinY, clipMaxY);
 
         const AxbMtsdfPathEntry* mtsdfEntry = (nd->primType == AeroPrimType::MsdfVectorPath && nd->mtsdfPathHash != 0)
             ? AxbTemplateRegistry::Instance().FindMtsdfPath(nd->mtsdfPathHash)
@@ -1293,6 +1434,9 @@ void RasterizeSingleNode(
                     continue;
                 }
 
+                std::uint8_t shadeR = r8;
+                std::uint8_t shadeG = g8;
+                std::uint8_t shadeB = b8;
                 float coverage = 1.0f;
                 if (prim == AeroPrimType::SdfRoundedRect) {
                     const float unscaledHalfW = std::max(std::fabs(v0.u), std::fabs(v2.u));
@@ -1353,7 +1497,19 @@ void RasterizeSingleNode(
                             const float innerCov = (innerHalfW > 0.0f && innerHalfH > 0.0f)
                                 ? EvaluateSdfRoundedRectCoverage(localX, localY, innerHalfW, innerHalfH, innerRad, aaFeather)
                                 : 0.0f;
-                            coverage = std::clamp(outerCov - innerCov * 0.35f, 0.0f, 1.0f);
+                            const float ringCov = std::clamp(outerCov - innerCov, 0.0f, 1.0f);
+                            if (ringCov > 0.001f) {
+                                auto accentCh = [&](std::uint8_t ch) noexcept -> std::uint8_t {
+                                    const float cf = static_cast<float>(ch) * (1.0f / 255.0f);
+                                    const float acc = std::min(cf * 1.35f + 0.08f, 1.0f);
+                                    const float mixed = cf + (acc - cf) * ringCov;
+                                    return static_cast<std::uint8_t>(std::clamp(mixed * 255.0f + 0.5f, 0.0f, 255.0f));
+                                };
+                                shadeR = accentCh(r8);
+                                shadeG = accentCh(g8);
+                                shadeB = accentCh(b8);
+                            }
+                            coverage = outerCov;
                         } else {
                             coverage = outerCov;
                         }
@@ -1545,7 +1701,7 @@ void RasterizeSingleNode(
                                 dst[0] = static_cast<std::uint8_t>(std::clamp(static_cast<float>(outR) + static_cast<float>(dst[0]) * invA + 0.5f, 0.0f, 255.0f));
                                 dst[1] = static_cast<std::uint8_t>(std::clamp(static_cast<float>(outG) + static_cast<float>(dst[1]) * invA + 0.5f, 0.0f, 255.0f));
                                 dst[2] = static_cast<std::uint8_t>(std::clamp(static_cast<float>(outB) + static_cast<float>(dst[2]) * invA + 0.5f, 0.0f, 255.0f));
-                                dst[3] = 255u;
+                                dst[3] = static_cast<std::uint8_t>(std::clamp(finalAlpha * 255.0f + static_cast<float>(dst[3]) * invA + 0.5f, 0.0f, 255.0f));
                             } else {
                                 BlendPixelOver(dst, outR, outG, outB, finalAlpha);
                             }
@@ -1665,21 +1821,47 @@ void RasterizeSingleNode(
                 }
 
                 if (coverage > 0.002f) {
+                    const bool isPremulPrim =
+                        (prim == AeroPrimType::SolidQuad ||
+                         prim == AeroPrimType::SdfTextGlyph ||
+                         prim == AeroPrimType::DynamicMesh) &&
+                        ((v0.flags & AeroVertexFlag_PremultipliedAlpha) != 0u);
                     const float effAlpha = std::clamp(baseAlpha * coverage, 0.0f, 1.0f);
                     if (optPremulLayer) {
                         const float inv255 = 1.0f / 255.0f;
+                        const float rgbScale = isPremulPrim ? (inv255 * coverage) : (inv255 * effAlpha);
                         BlendPremulOver(
                             *optPremulLayer,
                             px,
                             py,
-                            static_cast<float>(r8) * inv255 * effAlpha,
-                            static_cast<float>(g8) * inv255 * effAlpha,
-                            static_cast<float>(b8) * inv255 * effAlpha,
+                            static_cast<float>(shadeR) * rgbScale,
+                            static_cast<float>(shadeG) * rgbScale,
+                            static_cast<float>(shadeB) * rgbScale,
                             effAlpha);
+                    } else if (isPremulPrim) {
+                        std::uint8_t* dst = outRgba8 +
+                            (static_cast<std::size_t>(py) * viewportWidth + static_cast<std::size_t>(px)) * 4u;
+                        const float invA = 1.0f - effAlpha;
+                        dst[0] = static_cast<std::uint8_t>(std::clamp(
+                            static_cast<float>(shadeR) * coverage + static_cast<float>(dst[0]) * invA + 0.5f,
+                            0.0f,
+                            255.0f));
+                        dst[1] = static_cast<std::uint8_t>(std::clamp(
+                            static_cast<float>(shadeG) * coverage + static_cast<float>(dst[1]) * invA + 0.5f,
+                            0.0f,
+                            255.0f));
+                        dst[2] = static_cast<std::uint8_t>(std::clamp(
+                            static_cast<float>(shadeB) * coverage + static_cast<float>(dst[2]) * invA + 0.5f,
+                            0.0f,
+                            255.0f));
+                        dst[3] = static_cast<std::uint8_t>(std::clamp(
+                            effAlpha * 255.0f + static_cast<float>(dst[3]) * invA + 0.5f,
+                            0.0f,
+                            255.0f));
                     } else {
                         std::uint8_t* dst = outRgba8 +
                             (static_cast<std::size_t>(py) * viewportWidth + static_cast<std::size_t>(px)) * 4u;
-                        BlendPixelOver(dst, r8, g8, b8, effAlpha);
+                        BlendPixelOver(dst, shadeR, shadeG, shadeB, effAlpha);
                     }
                 }
             }
@@ -1702,10 +1884,24 @@ bool ComputeNodeRangeScreenBounds(
     float maxY = -1e9f;
     for (std::uint32_t nid = startNodeId; nid < endNodeId; ++nid) {
         const RenderNodeDescriptor* nd = tree.GetNode(nid);
-        if (!nd || nd->pageIndex >= tree.PageCount() || nd->opacity <= 0.001f) {
+        if (!nd || nd->pageIndex >= tree.PageCount() || !std::isfinite(nd->opacity) || nd->opacity <= 0.001f) {
             continue;
         }
         const CommandPage& page = tree.GetPage(nd->pageIndex);
+        const bool pageClip = (page.header.flags & CommandPageFlag_ScissorClipActive) != 0u;
+        if (pageClip &&
+            (!std::isfinite(page.header.clipX) || !std::isfinite(page.header.clipY) ||
+             !std::isfinite(page.header.clipW) || !std::isfinite(page.header.clipH))) {
+            continue;
+        }
+        const float pClipX0 = page.header.clipX;
+        const float pClipY0 = page.header.clipY;
+        const float pClipX1 = page.header.clipX + std::max(0.0f, page.header.clipW);
+        const float pClipY1 = page.header.clipY + std::max(0.0f, page.header.clipH);
+        if (pageClip && (pClipX1 <= pClipX0 || pClipY1 <= pClipY0)) {
+            continue;
+        }
+
         const std::size_t quadCount = nd->vertexCount / 4u;
         for (std::size_t q = 0; q < quadCount; ++q) {
             const std::size_t vIdx = nd->vertexOffsetInPage + q * 4u;
@@ -1719,10 +1915,29 @@ bool ComputeNodeRangeScreenBounds(
             if (((v0.rgba | v1.rgba | v2.rgba | v3.rgba) & 0xFF000000u) == 0u) {
                 continue;
             }
-            minX = std::min(minX, std::min(std::min(v0.x, v1.x), std::min(v2.x, v3.x)));
-            maxX = std::max(maxX, std::max(std::max(v0.x, v1.x), std::max(v2.x, v3.x)));
-            minY = std::min(minY, std::min(std::min(v0.y, v1.y), std::min(v2.y, v3.y)));
-            maxY = std::max(maxY, std::max(std::max(v0.y, v1.y), std::max(v2.y, v3.y)));
+            if (!std::isfinite(v0.x) || !std::isfinite(v0.y) ||
+                !std::isfinite(v1.x) || !std::isfinite(v1.y) ||
+                !std::isfinite(v2.x) || !std::isfinite(v2.y) ||
+                !std::isfinite(v3.x) || !std::isfinite(v3.y)) {
+                continue;
+            }
+            float qMinX = std::min(std::min(v0.x, v1.x), std::min(v2.x, v3.x));
+            float qMaxX = std::max(std::max(v0.x, v1.x), std::max(v2.x, v3.x));
+            float qMinY = std::min(std::min(v0.y, v1.y), std::min(v2.y, v3.y));
+            float qMaxY = std::max(std::max(v0.y, v1.y), std::max(v2.y, v3.y));
+            if (pageClip) {
+                qMinX = std::max(qMinX, pClipX0);
+                qMaxX = std::min(qMaxX, pClipX1);
+                qMinY = std::max(qMinY, pClipY0);
+                qMaxY = std::min(qMaxY, pClipY1);
+                if (qMaxX <= qMinX || qMaxY <= qMinY) {
+                    continue;
+                }
+            }
+            minX = std::min(minX, qMinX);
+            maxX = std::max(maxX, qMaxX);
+            minY = std::min(minY, qMinY);
+            maxY = std::max(maxY, qMaxY);
             any = true;
         }
     }
@@ -1742,6 +1957,8 @@ void RasterizeNodeSpanRecursive(
     std::uint32_t viewportHeight,
     std::uint8_t* outRgba8,
     PremulOffscreenLayer* optPremulLayer) {
+    const int vpW = static_cast<int>(std::min<std::uint32_t>(viewportWidth, 0x3FFFFFFFu));
+    const int vpH = static_cast<int>(std::min<std::uint32_t>(viewportHeight, 0x3FFFFFFFu));
     const auto& blurSpans = tree.BlurLayerSpans();
     std::uint32_t nid = startNodeId;
     while (nid < endNodeId) {
@@ -1754,6 +1971,7 @@ void RasterizeNodeSpanRecursive(
             blurSpans[ioBlurCursor].firstNodeId == nid &&
             blurSpans[ioBlurCursor].endNodeId > nid &&
             blurSpans[ioBlurCursor].endNodeId <= endNodeId &&
+            std::isfinite(blurSpans[ioBlurCursor].radiusPx) &&
             blurSpans[ioBlurCursor].radiusPx > 0.25f) {
             const BlurLayerSpan span = blurSpans[ioBlurCursor];
             ++ioBlurCursor;
@@ -1766,10 +1984,10 @@ void RasterizeNodeSpanRecursive(
                 const float clampedRadius = std::clamp(span.radiusPx, 0.5f, 128.0f);
                 const int boxR = std::max(1, static_cast<int>(std::lround(clampedRadius * 0.5f)));
                 const int padPx = boxR * 3 + 2;
-                const int bx0 = std::max(0, static_cast<int>(std::floor(uMinX)) - padPx);
-                const int by0 = std::max(0, static_cast<int>(std::floor(uMinY)) - padPx);
-                const int bx1 = std::min(static_cast<int>(viewportWidth), static_cast<int>(std::ceil(uMaxX)) + padPx);
-                const int by1 = std::min(static_cast<int>(viewportHeight), static_cast<int>(std::ceil(uMaxY)) + padPx);
+                const int bx0 = std::clamp(SafeFloorToInt(uMinX, -padPx, vpW + padPx) - padPx, 0, vpW);
+                const int by0 = std::clamp(SafeFloorToInt(uMinY, -padPx, vpH + padPx) - padPx, 0, vpH);
+                const int bx1 = std::clamp(SafeCeilToInt(uMaxX, -padPx, vpW + padPx) + padPx, 0, vpW);
+                const int by1 = std::clamp(SafeCeilToInt(uMaxY, -padPx, vpH + padPx) + padPx, 0, vpH);
 
                 if (bx1 > bx0 && by1 > by0) {
                     PremulOffscreenLayer subLayer{};
@@ -1798,10 +2016,30 @@ void RasterizeNodeSpanRecursive(
                     int compX1 = bx1;
                     int compY1 = by1;
                     if (span.clipActive) {
-                        compX0 = std::max(compX0, static_cast<int>(std::floor(span.clipRect.x)));
-                        compY0 = std::max(compY0, static_cast<int>(std::floor(span.clipRect.y)));
-                        compX1 = std::min(compX1, static_cast<int>(std::ceil(span.clipRect.x + span.clipRect.width)));
-                        compY1 = std::min(compY1, static_cast<int>(std::ceil(span.clipRect.y + span.clipRect.height)));
+                        if (!std::isfinite(span.clipRect.x) || !std::isfinite(span.clipRect.y) ||
+                            !std::isfinite(span.clipRect.width) || !std::isfinite(span.clipRect.height)) {
+                            compX1 = compX0;
+                        } else {
+                            compX0 = std::max(compX0, SafeFloorToInt(span.clipRect.x, 0, vpW));
+                            compY0 = std::max(compY0, SafeFloorToInt(span.clipRect.y, 0, vpH));
+                            compX1 = std::min(compX1, SafeCeilToInt(span.clipRect.x + std::max(0.0f, span.clipRect.width), 0, vpW));
+                            compY1 = std::min(compY1, SafeCeilToInt(span.clipRect.y + std::max(0.0f, span.clipRect.height), 0, vpH));
+                        }
+                    }
+                    if (const RenderNodeDescriptor* firstNd = tree.GetNode(span.firstNodeId);
+                        firstNd && firstNd->pageIndex < tree.PageCount()) {
+                        const CommandPage& firstPage = tree.GetPage(firstNd->pageIndex);
+                        if ((firstPage.header.flags & CommandPageFlag_ScissorClipActive) != 0u) {
+                            if (!std::isfinite(firstPage.header.clipX) || !std::isfinite(firstPage.header.clipY) ||
+                                !std::isfinite(firstPage.header.clipW) || !std::isfinite(firstPage.header.clipH)) {
+                                compX1 = compX0;
+                            } else {
+                                compX0 = std::max(compX0, SafeFloorToInt(firstPage.header.clipX, 0, vpW));
+                                compY0 = std::max(compY0, SafeFloorToInt(firstPage.header.clipY, 0, vpH));
+                                compX1 = std::min(compX1, SafeCeilToInt(firstPage.header.clipX + std::max(0.0f, firstPage.header.clipW), 0, vpW));
+                                compY1 = std::min(compY1, SafeCeilToInt(firstPage.header.clipY + std::max(0.0f, firstPage.header.clipH), 0, vpH));
+                            }
+                        }
                     }
                     if (optPremulLayer) {
                         compX0 = std::max(compX0, optPremulLayer->originX);
@@ -1831,7 +2069,8 @@ void RasterizeNodeSpanRecursive(
                                     std::clamp(sp[1] * 255.0f + static_cast<float>(dst[1]) * invA + 0.5f, 0.0f, 255.0f));
                                 dst[2] = static_cast<std::uint8_t>(
                                     std::clamp(sp[2] * 255.0f + static_cast<float>(dst[2]) * invA + 0.5f, 0.0f, 255.0f));
-                                dst[3] = 255u;
+                                dst[3] = static_cast<std::uint8_t>(
+                                    std::clamp(pa * 255.0f + static_cast<float>(dst[3]) * invA + 0.5f, 0.0f, 255.0f));
                             }
                         }
                     }
@@ -1854,6 +2093,7 @@ ZeroCopyGpuStream::ZeroCopyGpuStream(ShaderBackend backend, std::size_t maxPages
     ringCapacityBytes_ = maxPagesInRing_ * pageVertexBytes;
     ownedRingStorage_.resize(ringCapacityBytes_, 0u);
     mappedRingBase_ = ownedRingStorage_.data();
+    prevUploadedBytes_.assign(maxPagesInRing_, pageVertexBytes);
     subDataSpans_.reserve(maxPagesInRing_);
     clipDrawBatches_.reserve(16u);
     SetBackend(backend);
@@ -1875,14 +2115,19 @@ void ZeroCopyGpuStream::SetBackend(ShaderBackend backend) noexcept {
 }
 
 void ZeroCopyGpuStream::BindExternalMappedRing(void* mappedPtr, std::size_t capacityBytes) noexcept {
-    if (mappedPtr && capacityBytes >= kVerticesPerCommandPage * sizeof(AeroVertex)) {
+    constexpr std::size_t kPageVertexBytes = kVerticesPerCommandPage * sizeof(AeroVertex);
+    if (mappedPtr && capacityBytes >= kPageVertexBytes) {
         mappedRingBase_ = static_cast<std::uint8_t*>(mappedPtr);
         ringCapacityBytes_ = capacityBytes;
-        maxPagesInRing_ = capacityBytes / (kVerticesPerCommandPage * sizeof(AeroVertex));
+        maxPagesInRing_ = capacityBytes / kPageVertexBytes;
     } else {
         mappedRingBase_ = ownedRingStorage_.data();
         ringCapacityBytes_ = ownedRingStorage_.size();
-        maxPagesInRing_ = ringCapacityBytes_ / (kVerticesPerCommandPage * sizeof(AeroVertex));
+        maxPagesInRing_ = ringCapacityBytes_ / kPageVertexBytes;
+    }
+    try {
+        prevUploadedBytes_.assign(maxPagesInRing_, kPageVertexBytes);
+    } catch (...) {
     }
 }
 
@@ -1893,94 +2138,135 @@ ZeroCopySubmissionStats ZeroCopyGpuStream::SubmitDirtyPages(PagedRenderTree& tre
     stats.mechanism = uploadMechanism_;
     stats.grayscaleSdfTextActive = IsGrayscaleSdfTextRouted();
 
-    const auto& dirtyIndices = tree.DirtyPageIndices();
-    const std::size_t dirtyCount = dirtyIndices.size();
-    if (dirtyCount > subDataSpans_.capacity()) {
-        subDataSpans_.reserve(dirtyCount);
-    }
-    subDataSpans_.resize(dirtyCount);
+    try {
+        constexpr std::size_t kPageVertexBytes = kVerticesPerCommandPage * sizeof(AeroVertex);
+        const auto* pagesPtr = tree.Pages().data();
+        const std::size_t totalTreePages = tree.PageCount();
 
-    constexpr std::size_t kPageVertexBytes = kVerticesPerCommandPage * sizeof(AeroVertex);
-    const auto* pagesPtr = tree.Pages().data();
-    const std::size_t totalTreePages = tree.PageCount();
-
-    for (std::size_t i = 0; i < dirtyCount; ++i) {
-        const std::uint32_t pageIdx = dirtyIndices[i];
-        if (pageIdx >= totalTreePages) {
-            continue;
-        }
-        const CommandPage& srcPage = pagesPtr[pageIdx];
-        const std::size_t activeVerts = std::min<std::size_t>(
-            srcPage.header.vertexCount,
-            kVerticesPerCommandPage);
-        const std::size_t activeBytes = activeVerts * sizeof(AeroVertex);
-        const std::size_t slotIdx = pageIdx % maxPagesInRing_;
-        const std::size_t byteOffset = slotIdx * kPageVertexBytes;
-
-        if (mappedRingBase_ && (byteOffset + kPageVertexBytes <= ringCapacityBytes_)) {
-            if (activeBytes > 0u) {
-                std::memcpy(
-                    mappedRingBase_ + byteOffset,
-                    srcPage.vertices.data(),
-                    activeBytes);
+        // Auto-grow internal ring buffer when tree.PageCount() exceeds maxPagesInRing_ so pageIndex % maxPagesInRing_ never aliases
+        bool fullRingReupload = false;
+        const bool usingOwnedRing =
+            !ownedRingStorage_.empty() && (mappedRingBase_ == ownedRingStorage_.data());
+        if (totalTreePages > maxPagesInRing_ && usingOwnedRing) {
+            std::size_t newCap = std::max<std::size_t>(16u, maxPagesInRing_);
+            while (newCap < totalTreePages) {
+                newCap *= 2u;
             }
-            if (activeBytes < kPageVertexBytes) {
-                std::memset(
-                    mappedRingBase_ + byteOffset + activeBytes,
-                    0,
-                    kPageVertexBytes - activeBytes);
-            }
+            ownedRingStorage_.assign(newCap * kPageVertexBytes, 0u);
+            mappedRingBase_ = ownedRingStorage_.data();
+            ringCapacityBytes_ = ownedRingStorage_.size();
+            maxPagesInRing_ = newCap;
+            prevUploadedBytes_.assign(newCap, kPageVertexBytes);
+            fullRingReupload = true;
+        } else if (prevUploadedBytes_.size() < maxPagesInRing_) {
+            prevUploadedBytes_.resize(maxPagesInRing_, kPageVertexBytes);
         }
 
-        subDataSpans_[i] = GlBufferSubDataSpan{
-            pageIdx,
-            byteOffset,
-            activeBytes,
-            srcPage.vertices.data()};
-
-        stats.dirtyPagesUploaded += 1u;
-        stats.verticesStreamed += activeVerts;
-        stats.bytesStreamed += activeBytes;
-    }
-
-    // Coalesce strictly contiguous CommandPages sharing identical scissor clip state into UberShader draw batches,
-    // accounting for fixed 168-vertex page stride across multi-page spans so trailing quads are never truncated.
-    clipDrawBatches_.clear();
-    if (tree.NodeCount() > 0 && totalTreePages > 0) {
-        if (totalTreePages > clipDrawBatches_.capacity()) {
-            clipDrawBatches_.reserve(totalTreePages);
+        const auto& dirtyIndices = tree.DirtyPageIndices();
+        const std::size_t candidateCount = fullRingReupload ? totalTreePages : dirtyIndices.size();
+        subDataSpans_.clear();
+        if (candidateCount > subDataSpans_.capacity()) {
+            subDataSpans_.reserve(candidateCount);
         }
-        std::size_t lastMergedPage = static_cast<std::size_t>(-1);
-        std::uint32_t lastMergedPageVerts = 0u;
-        for (std::size_t p = 0; p < totalTreePages; ++p) {
-            const CommandPageHeader& hdr = pagesPtr[p].header;
-            const std::uint32_t clampedVerts = std::min<std::uint32_t>(
-                hdr.vertexCount,
-                static_cast<std::uint32_t>(kVerticesPerCommandPage));
-            if (clampedVerts == 0u) {
+
+        for (std::size_t i = 0; i < candidateCount; ++i) {
+            const std::uint32_t pageIdx = fullRingReupload
+                ? static_cast<std::uint32_t>(i)
+                : dirtyIndices[i];
+            if (pageIdx >= totalTreePages) {
                 continue;
             }
-            const bool ringContiguous = !clipDrawBatches_.empty() &&
-                (p == lastMergedPage + 1u) &&
-                ((p % maxPagesInRing_) == ((lastMergedPage % maxPagesInRing_) + 1u));
-            if (ringContiguous && SameBatchScissor(clipDrawBatches_.back(), hdr)) {
-                const std::uint32_t prevTailPad =
-                    static_cast<std::uint32_t>(kVerticesPerCommandPage) - lastMergedPageVerts;
-                clipDrawBatches_.back().pageCount += 1u;
-                clipDrawBatches_.back().vertexCount += prevTailPad + clampedVerts;
-            } else {
-                GpuClipDrawBatch batch{};
-                batch.firstPageIndex = static_cast<std::uint32_t>(p);
-                batch.pageCount = 1u;
-                batch.vertexCount = clampedVerts;
-                batch.textureId = hdr.reserved[0];
-                batch.scissorActive = (hdr.flags & CommandPageFlag_ScissorClipActive) != 0u;
-                batch.scissorRect = Rect{hdr.clipX, hdr.clipY, hdr.clipW, hdr.clipH};
-                clipDrawBatches_.push_back(batch);
+            const CommandPage& srcPage = pagesPtr[pageIdx];
+            const std::size_t activeVerts = std::min<std::size_t>(
+                srcPage.header.vertexCount,
+                kVerticesPerCommandPage);
+            const std::size_t activeBytes = activeVerts * sizeof(AeroVertex);
+            const std::size_t slotIdx = pageIdx % std::max<std::size_t>(1u, maxPagesInRing_);
+            const std::size_t byteOffset = slotIdx * kPageVertexBytes;
+            const bool hasRingSlot =
+                mappedRingBase_ != nullptr &&
+                (byteOffset + kPageVertexBytes <= ringCapacityBytes_) &&
+                (slotIdx < prevUploadedBytes_.size());
+
+            if (hasRingSlot) {
+                if (activeBytes > 0u) {
+                    std::memcpy(
+                        mappedRingBase_ + byteOffset,
+                        srcPage.vertices.data(),
+                        activeBytes);
+                }
+                if (activeBytes < kPageVertexBytes) {
+                    std::memset(
+                        mappedRingBase_ + byteOffset + activeBytes,
+                        0,
+                        kPageVertexBytes - activeBytes);
+                }
             }
-            lastMergedPage = p;
-            lastMergedPageVerts = clampedVerts;
+
+            const std::size_t uploadBytes = hasRingSlot
+                ? std::max(activeBytes, prevUploadedBytes_[slotIdx])
+                : activeBytes;
+            const void* uploadSrcPtr = hasRingSlot
+                ? static_cast<const void*>(mappedRingBase_ + byteOffset)
+                : static_cast<const void*>(srcPage.vertices.data());
+            if (hasRingSlot) {
+                prevUploadedBytes_[slotIdx] = activeBytes;
+            }
+
+            subDataSpans_.push_back(GlBufferSubDataSpan{
+                pageIdx,
+                byteOffset,
+                uploadBytes,
+                uploadSrcPtr});
+
+            stats.dirtyPagesUploaded += 1u;
+            stats.verticesStreamed += activeVerts;
+            stats.bytesStreamed += activeBytes;
         }
+
+        // Coalesce strictly contiguous CommandPages sharing identical scissor clip & texture state into UberShader draw batches,
+        // accounting for fixed 168-vertex page stride across multi-page spans so trailing quads are never truncated.
+        clipDrawBatches_.clear();
+        if (tree.NodeCount() > 0 && totalTreePages > 0) {
+            if (totalTreePages > clipDrawBatches_.capacity()) {
+                clipDrawBatches_.reserve(totalTreePages);
+            }
+            const std::size_t effRing = std::max<std::size_t>(1u, maxPagesInRing_);
+            std::size_t lastMergedPage = static_cast<std::size_t>(-1);
+            std::uint32_t lastMergedPageVerts = 0u;
+            for (std::size_t p = 0; p < totalTreePages; ++p) {
+                const CommandPageHeader& hdr = pagesPtr[p].header;
+                const std::uint32_t clampedVerts = std::min<std::uint32_t>(
+                    hdr.vertexCount,
+                    static_cast<std::uint32_t>(kVerticesPerCommandPage));
+                if (clampedVerts == 0u) {
+                    continue;
+                }
+                const bool ringContiguous = !clipDrawBatches_.empty() &&
+                    (p == lastMergedPage + 1u) &&
+                    ((p % effRing) == ((lastMergedPage % effRing) + 1u));
+                if (ringContiguous && SameBatchScissor(clipDrawBatches_.back(), hdr)) {
+                    const std::uint32_t prevTailPad =
+                        static_cast<std::uint32_t>(kVerticesPerCommandPage) - lastMergedPageVerts;
+                    clipDrawBatches_.back().pageCount += 1u;
+                    clipDrawBatches_.back().vertexCount += prevTailPad + clampedVerts;
+                } else {
+                    GpuClipDrawBatch batch{};
+                    batch.firstPageIndex = static_cast<std::uint32_t>(p);
+                    batch.pageCount = 1u;
+                    batch.vertexCount = clampedVerts;
+                    batch.textureId = hdr.reserved[0];
+                    batch.scissorActive = (hdr.flags & CommandPageFlag_ScissorClipActive) != 0u;
+                    batch.scissorRect = Rect{hdr.clipX, hdr.clipY, hdr.clipW, hdr.clipH};
+                    clipDrawBatches_.push_back(batch);
+                }
+                lastMergedPage = p;
+                lastMergedPageVerts = clampedVerts;
+            }
+        }
+    } catch (...) {
+        subDataSpans_.clear();
+        clipDrawBatches_.clear();
     }
 
     stats.drawCallCount = clipDrawBatches_.size();
