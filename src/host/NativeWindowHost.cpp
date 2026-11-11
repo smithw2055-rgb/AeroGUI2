@@ -1166,6 +1166,19 @@ bool NativeWindowHost::InitializePlatformWindowAndBackend(const NativeWindowConf
             case WM_CLOSE:
                 self->RequestClose();
                 return 0;
+            case WM_ERASEBKGND:
+                return 1;
+            case WM_PAINT: {
+                PAINTSTRUCT ps{};
+                (void)BeginPaint(hwnd, &ps);
+                EndPaint(hwnd, &ps);
+                self->needsInitialRender_ = true;
+                if (self->desktopHost_) {
+                    self->desktopHost_->NotifyDirtyLayout();
+                }
+                self->WakeEventLoop();
+                return 0;
+            }
             case WM_SIZE: {
                 const std::uint32_t nw = static_cast<std::uint32_t>(LOWORD(lParam));
                 const std::uint32_t nh = static_cast<std::uint32_t>(HIWORD(lParam));
@@ -1454,15 +1467,25 @@ bool NativeWindowHost::InitializePlatformWindowAndBackend(const NativeWindowConf
 
     RECT wr{0, 0, static_cast<LONG>(width_), static_cast<LONG>(height_)};
     AdjustWindowRect(&wr, WS_OVERLAPPEDWINDOW, FALSE);
+    const int outerW = wr.right - wr.left;
+    const int outerH = wr.bottom - wr.top;
+    int posX = CW_USEDEFAULT;
+    int posY = CW_USEDEFAULT;
+    const int screenW = GetSystemMetrics(SM_CXSCREEN);
+    const int screenH = GetSystemMetrics(SM_CYSCREEN);
+    if (screenW > 0 && screenH > 0) {
+        posX = std::max(0, (screenW - outerW) / 2);
+        posY = std::max(0, (screenH - outerH) / 2);
+    }
     HWND hwnd = CreateWindowExW(
         0,
         kWndClassName,
         wideTitle.c_str(),
         WS_OVERLAPPEDWINDOW,
-        CW_USEDEFAULT,
-        CW_USEDEFAULT,
-        wr.right - wr.left,
-        wr.bottom - wr.top,
+        posX,
+        posY,
+        outerW,
+        outerH,
         nullptr,
         nullptr,
         hInst,
@@ -1522,6 +1545,7 @@ bool NativeWindowHost::InitializePlatformWindowAndBackend(const NativeWindowConf
                             mode_ = NativeWindowMode::Win32WglOpenGL;
                             diagnostics_ = "Win32 HWND + WGL OpenGL 3.3 Core context initialized.";
                             ShowWindow(hwnd, SW_SHOW);
+                            UpdateWindow(hwnd);
                             return true;
                         }
                         wglMakeCur(nullptr, nullptr);
@@ -2513,15 +2537,20 @@ std::uint64_t NativeWindowHost::RunEventLoop(std::uint64_t maxFrames) {
 #endif
 
     const std::uint64_t startFrames = telemetry_.framesRendered;
+    const float frameDtSec = config_.animationFrameIntervalMs * 0.001f;
     while (!ShouldClose()) {
         if (maxFrames > 0u && (telemetry_.framesRendered - startFrames) >= maxFrames) {
             break;
         }
+        const std::uint64_t beforeIterFrames = telemetry_.framesRendered;
         const std::int32_t waitMs = CanHostSleepIdle()
-            ? -1
+            ? (maxFrames > 0u ? 0 : -1)
             : static_cast<std::int32_t>(std::max(1.0f, config_.animationFrameIntervalMs));
-        if (!PumpEventsAndRender(config_.animationFrameIntervalMs * 0.001f, waitMs)) {
+        if (!PumpEventsAndRender(frameDtSec, waitMs)) {
             break;
+        }
+        if (maxFrames > 0u && !ShouldClose() && telemetry_.framesRendered == beforeIterFrames) {
+            (void)TickAndPresentFrame(frameDtSec, true);
         }
     }
     return telemetry_.framesRendered - startFrames;
@@ -2534,6 +2563,28 @@ bool NativeWindowHost::CaptureFramebufferRgba8(
     if (!gpuBackend_) {
         return false;
     }
+#if defined(_WIN32)
+    if (mode_ == NativeWindowMode::Win32WglOpenGL && win32OpenglModule_ && win32Hdc_ && win32Hglrc_) {
+        auto wglMakeCur = reinterpret_cast<BOOL (WINAPI*)(HDC, HGLRC)>(
+            GetProcAddress(static_cast<HMODULE>(win32OpenglModule_), "wglMakeCurrent"));
+        if (wglMakeCur) {
+            (void)wglMakeCur(static_cast<HDC>(win32Hdc_), static_cast<HGLRC>(win32Hglrc_));
+        }
+        if (renderTree_ && activeGpuStream_) {
+            ScopedUiResourceContext resourceScope(EffectiveResourceContext());
+            (void)gpuBackend_->PresentStream(*renderTree_, *activeGpuStream_, width_, height_, clearColor_);
+        }
+    }
+#elif defined(__linux__) && !defined(__EMSCRIPTEN__)
+    if (mode_ == NativeWindowMode::LinuxX11OpenGL && x11_ && x11_->display && x11_->window != 0 &&
+        x11_->glxContext && x11_->glXMakeCurrent) {
+        (void)x11_->glXMakeCurrent(x11_->display, x11_->window, x11_->glxContext);
+        if (renderTree_ && activeGpuStream_) {
+            ScopedUiResourceContext resourceScope(EffectiveResourceContext());
+            (void)gpuBackend_->PresentStream(*renderTree_, *activeGpuStream_, width_, height_, clearColor_);
+        }
+    }
+#endif
     return gpuBackend_->ReadbackFramebufferRgba8(outRgba8, outWidth, outHeight);
 }
 

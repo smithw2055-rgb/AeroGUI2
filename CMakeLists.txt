@@ -128,6 +128,20 @@ if(AERO_BUILD_COMPILER_TOOLS)
             aerogui_compiler_lib
     )
 
+    add_executable(aero-viewer
+        tools/aero_viewer/main.cpp
+    )
+
+    target_link_libraries(aero-viewer
+        PRIVATE
+            aerocore
+    )
+
+    target_compile_definitions(aero-viewer
+        PRIVATE
+            AERO_SAMPLES_DIR="${CMAKE_CURRENT_SOURCE_DIR}/Samples"
+    )
+
     if(AERO_BUILD_TESTS)
         # Helper function to register test targets with strict source existence verification
         function(aero_register_core_test target_name source_rel_path)
