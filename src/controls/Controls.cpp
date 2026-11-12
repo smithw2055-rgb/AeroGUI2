@@ -7,6 +7,7 @@
 #include "realscript/aot_cpp/AotRuntime.h"
 
 #include <algorithm>
+#include <charconv>
 #include <cmath>
 #include <fstream>
 #include <limits>
@@ -1925,11 +1926,13 @@ void SyncHostContentTemplateChildImpl(
     };
 
     std::string ctKey;
-    if (const auto* sv = std::get_if<StringValue>(&hostContainer->GetValue(PropId_ContentTemplate));
+    const UnifiedValue hostCtVal = hostContainer->GetValue(PropId_ContentTemplate);
+    if (const auto* sv = std::get_if<StringValue>(&hostCtVal);
         sv && !sv->view().empty()) {
         ctKey = sv->str();
     } else if (contentSourceHost && contentSourceHost != hostContainer) {
-        if (const auto* svHost = std::get_if<StringValue>(&contentSourceHost->GetValue(PropId_ContentTemplate));
+        const UnifiedValue srcHostCtVal = contentSourceHost->GetValue(PropId_ContentTemplate);
+        if (const auto* svHost = std::get_if<StringValue>(&srcHostCtVal);
             svHost && !svHost->view().empty()) {
             ctKey = svHost->str();
         }
@@ -4294,17 +4297,23 @@ UnifiedValue TabControl::NormalizeTabItemValue(const UnifiedValue& raw) {
 
 void TabControl::ReleaseTabChildResources(UIElement* child) {
     if (!child) return;
-    AnimationEngine* effAnim = animationEngine_
+    DualTrackBindingEngine* liveBind =
+        DualTrackBindingEngine::IsLiveInstance(bindingEngine_) ? bindingEngine_ : nullptr;
+    StyleTriggerEngine* liveStyle =
+        StyleTriggerEngine::IsLiveInstance(styleEngine_) ? styleEngine_ : nullptr;
+    AnimationEngine* candAnim = animationEngine_
         ? animationEngine_
-        : (bindingEngine_ ? bindingEngine_->GetAnimationEngine() : nullptr);
+        : (liveBind ? liveBind->GetAnimationEngine() : nullptr);
+    AnimationEngine* effAnim =
+        AnimationEngine::IsLiveInstance(candAnim) ? candAnim : nullptr;
     if (effAnim) {
         effAnim->StopSubtreeAnimations(child, false);
     }
-    if (bindingEngine_) {
-        (void)bindingEngine_->UnbindSubtree(child);
+    if (liveBind) {
+        (void)liveBind->UnbindSubtree(child);
     }
-    if (styleEngine_) {
-        (void)styleEngine_->UnbindSubtreeStyles(child);
+    if (liveStyle) {
+        (void)liveStyle->UnbindSubtreeStyles(child);
     }
 }
 
@@ -6117,17 +6126,23 @@ std::int32_t ItemsControl::FindMatchingItemIndex(const UnifiedValue& target) con
 
 void ItemsControl::ReleaseChildSubtreeResources(UIElement* ch) {
     if (!ch) return;
-    AnimationEngine* effAnimEngine = animationEngine_
+    DualTrackBindingEngine* liveBind =
+        DualTrackBindingEngine::IsLiveInstance(bindingEngine_) ? bindingEngine_ : nullptr;
+    StyleTriggerEngine* liveStyle =
+        StyleTriggerEngine::IsLiveInstance(styleEngine_) ? styleEngine_ : nullptr;
+    AnimationEngine* candAnim = animationEngine_
         ? animationEngine_
-        : (bindingEngine_ ? bindingEngine_->GetAnimationEngine() : nullptr);
+        : (liveBind ? liveBind->GetAnimationEngine() : nullptr);
+    AnimationEngine* effAnimEngine =
+        AnimationEngine::IsLiveInstance(candAnim) ? candAnim : nullptr;
     if (effAnimEngine) {
         effAnimEngine->StopSubtreeAnimations(ch, false);
     }
-    if (bindingEngine_) {
-        (void)bindingEngine_->UnbindSubtree(ch);
+    if (liveBind) {
+        (void)liveBind->UnbindSubtree(ch);
     }
-    if (styleEngine_) {
-        (void)styleEngine_->UnbindSubtreeStyles(ch);
+    if (liveStyle) {
+        (void)liveStyle->UnbindSubtreeStyles(ch);
     }
 }
 
@@ -9463,9 +9478,8 @@ bool Window::MountTemplate(
     return templateMounted_;
 }
 
-IntrusivePtr<UIElement> CreateElementByTypeName(std::string_view typeName) {
-    EnsureControlTypesRegistered();
-    const std::string_view shortName = StripNamespacePrefix(typeName);
+namespace {
+IntrusivePtr<UIElement> CreateElementByTypeNameCore(std::string_view typeName, std::string_view shortName) {
     if (shortName == "Window") return MakeIntrusive<Window>();
     if (shortName == "Panel" || shortName == "ResourceDictionary") return MakeIntrusive<Panel>();
     if (shortName == "DockPanel") return MakeIntrusive<DockPanel>();
@@ -9553,6 +9567,17 @@ IntrusivePtr<UIElement> CreateElementByTypeName(std::string_view typeName) {
         return MakeIntrusive<UserControl>(typeName);
     }
     return MakeIntrusive<UIElement>();
+}
+} // namespace
+
+IntrusivePtr<UIElement> CreateElementByTypeName(std::string_view typeName) {
+    EnsureControlTypesRegistered();
+    const std::string_view shortName = StripNamespacePrefix(typeName);
+    IntrusivePtr<UIElement> elem = CreateElementByTypeNameCore(typeName, shortName);
+    if (elem && !shortName.empty()) {
+        elem->SetDeclaredTypeName(std::string(shortName));
+    }
+    return elem;
 }
 
 namespace {
@@ -9796,8 +9821,11 @@ bool MountAxbInstructionsInternal(
                         const ObjectRef wrapperObj = rootControl->BoundScriptWrapper().valid()
                             ? rootControl->BoundScriptWrapper()
                             : effectiveContext;
-                        if (domains && registry && wrapperObj.valid() &&
-                            package.rootHandleFieldIndex != PropertySlotHandle::InvalidIndex) {
+                        if (domains && registry && uiHeap && wrapperObj.valid() &&
+                            uiHeap->isAlive(wrapperObj) &&
+                            package.rootHandleFieldIndex != PropertySlotHandle::InvalidIndex &&
+                            (package.fieldsOwnerTypeId == 0 ||
+                             uiHeap->objectTypeIdFast(wrapperObj) == package.fieldsOwnerTypeId)) {
                             const auto rootH = rootControl->ToNativeHandle(*registry);
                             (void)domains->writeObjectField(
                                 DomainKind::Ui,
@@ -9870,7 +9898,10 @@ bool MountAxbInstructionsInternal(
                         const ObjectRef wrapperObj = rootControl->BoundScriptWrapper().valid()
                             ? rootControl->BoundScriptWrapper()
                             : effectiveContext;
-                        if (domains && registry && wrapperObj.valid()) {
+                        if (domains && registry && uiHeap && wrapperObj.valid() &&
+                            uiHeap->isAlive(wrapperObj) &&
+                            (package.fieldsOwnerTypeId == 0 ||
+                             uiHeap->objectTypeIdFast(wrapperObj) == package.fieldsOwnerTypeId)) {
                             for (const auto& namedSlot : package.namedControls) {
                                 if (namedSlot.name == elemName &&
                                     namedSlot.fieldIndexInClass != PropertySlotHandle::InvalidIndex) {
@@ -10165,6 +10196,26 @@ bool MountAxbInstructionsInternal(
                                             pos = endSeg + 1u;
                                         }
                                         leaf = handlerCopy.substr(dot + 1u);
+                                    }
+
+                                    UnifiedValue rawCmdParam = b.GetValue(PropId_CommandParameter);
+                                    const bool hasCmdParam = !std::holds_alternative<std::monostate>(rawCmdParam);
+                                    if (TryInvokeCommandObjectOnOwner(
+                                            domains, prog, eventInterpreter, eventAotContext,
+                                            dcTarget, leaf, rawCmdParam, hasCmdParam)) {
+                                        if (DualTrackBindingEngine::IsLiveInstance(bindingEngine)) {
+                                            (void)bindingEngine->FlushTrackA();
+                                        }
+                                        return;
+                                    }
+                                    if (handlerCopy.find('.') == std::string::npos && wrapTarget.valid() && wrapTarget != dcTarget &&
+                                        TryInvokeCommandObjectOnOwner(
+                                            domains, prog, eventInterpreter, eventAotContext,
+                                            wrapTarget, leaf, rawCmdParam, hasCmdParam)) {
+                                        if (DualTrackBindingEngine::IsLiveInstance(bindingEngine)) {
+                                            (void)bindingEngine->FlushTrackA();
+                                        }
+                                        return;
                                     }
 
                                     ObjectRef callObj{};

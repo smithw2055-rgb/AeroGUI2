@@ -5,6 +5,9 @@ import Aero.UI;
 [Observable]
 public class ViewModel
 {
+    private DelegateCommand _loginCommand;
+
+    public DelegateCommand LoginCommand { get { return this._loginCommand; } }
     public string AccountName { get; set; } = "";
     public string Message { get; set; } = "";
     public bool LoginSuccessful { get; set; } = false;
@@ -12,10 +15,19 @@ public class ViewModel
 
     public ViewModel()
     {
+        this._loginCommand = new DelegateCommand();
+        this._loginCommand.SetExecuteFunc(this.Login);
+
         this.AccountName = "";
         this.Message = "";
         this.LoginSuccessful = false;
         this.LoginAttempts = 0;
+    }
+
+    public void Login(handle passBox)
+    {
+        string password = PasswordBox_GetPassword(passBox);
+        this.CheckCredentials(password);
     }
 
     public bool ValidateLogin(string password)
@@ -60,83 +72,37 @@ public class ViewModel
 [Observable]
 public partial class MainWindow
 {
-    public ViewModel ViewModel { get; set; }
-    private handle _emptyHandle;
+    public ViewModel DataContext { get; set; } = null;
+    public ViewModel ViewModel { get { return this.DataContext; } }
 
     public MainWindow()
     {
-        this.ViewModel = new ViewModel();
+        Application_SetResources("Resources.xaml");
+        this.InitializeComponent();
+
+        this.DataContext = new ViewModel();
+        this.SetDataContext<ViewModel>(this.DataContext);
     }
 
     public void OnInitialized()
     {
     }
 
-    public void Login(handle passBox)
-    {
-        if (this.ViewModel == null)
-        {
-            return;
-        }
-
-        handle target = passBox;
-        if (target == this._emptyHandle)
-        {
-            target = this.PassBox;
-        }
-
-        string password = PasswordBox_GetPassword(target);
-        bool ok = this.ViewModel.ValidateLogin(password);
-
-        if (ok)
-        {
-            Storyboard_Begin(this.__nativeRootHandle, "ShowLoginMessage");
-            Storyboard_Begin(this.__nativeRootHandle, "LoginSuccesful");
-        }
-        else
-        {
-            Storyboard_Begin(this.__nativeRootHandle, "ShowErrorMessage");
-            if (this.ViewModel.AccountName == null || this.ViewModel.AccountName == "")
-            {
-                UIElement_Focus(this.UserBox);
-            }
-            else
-            {
-                UIElement_Focus(target);
-            }
-        }
-    }
-
     public void SubmitLogin()
     {
-        this.Login(this.PassBox);
+        this.DataContext.Login(this.PassBox);
     }
 
     public bool LoginWithPassword(string password)
     {
-        if (this.ViewModel == null)
-        {
-            return false;
-        }
-
-        bool ok = this.ViewModel.ValidateLogin(password);
-        if (ok)
-        {
-            Storyboard_Begin(this.__nativeRootHandle, "ShowLoginMessage");
-            Storyboard_Begin(this.__nativeRootHandle, "LoginSuccesful");
-        }
-        else
-        {
-            Storyboard_Begin(this.__nativeRootHandle, "ShowErrorMessage");
-        }
-        return ok;
+        return this.DataContext.CheckCredentials(password);
     }
 
     public void ClearCredentials()
     {
-        if (this.ViewModel != null)
+        if (this.DataContext != null)
         {
-            this.ViewModel.Reset();
+            this.DataContext.Reset();
         }
         PasswordBox_ClearPassword(this.PassBox);
         UIElement_Focus(this.UserBox);

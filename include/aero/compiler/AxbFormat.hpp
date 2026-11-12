@@ -392,11 +392,14 @@ enum class RoutedTriggerEvent : std::uint8_t {
     Unchecked = 5,
     SelectionChanged = 6,
     ValueChanged = 7,
+    StoryboardCompleted = 8,
+    PropertyChanged = 9,
 };
 
 struct AxbEventTrigger {
     RoutedTriggerEvent eventKind = RoutedTriggerEvent::Loaded;
     std::string sourceName;
+    std::vector<AxbTriggerCondition> conditions;
     std::vector<AxbStoryboard> storyboards;
     std::vector<AxbInteractionAction> actions;
 };
@@ -664,8 +667,10 @@ struct AxbStateMachineDesc {
 
 struct AxbPackage {
     std::string className;
+    std::string hostWrapperClassName;
     std::string rootTypeName;
     std::string rootDataTypeName;
+    SymbolId fieldsOwnerTypeId = 0;
     std::uint32_t rootHandleFieldIndex = PropertySlotHandle::InvalidIndex;
     std::vector<std::string> stringTable;
     std::vector<AxbNamedControlSlot> namedControls;

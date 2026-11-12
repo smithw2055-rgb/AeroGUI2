@@ -32,11 +32,28 @@ public class Language
 [Observable]
 public class ViewModel
 {
+    private Language _selectedLanguage = null;
+
     public ObservableList<Language> Languages { get; set; }
-    public Language SelectedLanguage { get; set; }
     public int Level { get; set; } = 1;
     public float SoundLevel { get; set; } = 100.0f;
     public float MusicLevel { get; set; } = 70.0f;
+
+    public Language SelectedLanguage
+    {
+        get { return this._selectedLanguage; }
+        set
+        {
+            if (this._selectedLanguage != value && value != null)
+            {
+                this._selectedLanguage = value;
+                if (value.Source != null && value.Source != "")
+                {
+                    Application_ApplyDictionary(value.Source);
+                }
+            }
+        }
+    }
 
     public ViewModel()
     {
@@ -46,7 +63,7 @@ public class ViewModel
         this.Languages.Add(new Language("日本語", "Language-jp.xaml", "Flag-jp.png", FlowDirection.LeftToRight));
         this.Languages.Add(new Language("عربي", "Language-ar.xaml", "Flag-ar.png", FlowDirection.RightToLeft));
 
-        this.SelectedLanguage = this.Languages.Get(0);
+        this._selectedLanguage = this.Languages.Get(0);
         this.Level = 1;
         this.SoundLevel = 100.0f;
         this.MusicLevel = 70.0f;
@@ -91,45 +108,33 @@ public class ViewModel
 
     public void SetSound(float level)
     {
-        if (level < 0.0f)
-        {
-            this.SoundLevel = 0.0f;
-        }
-        else if (level > 100.0f)
-        {
-            this.SoundLevel = 100.0f;
-        }
-        else
-        {
-            this.SoundLevel = level;
-        }
+        if (level < 0.0f) { this.SoundLevel = 0.0f; }
+        else if (level > 100.0f) { this.SoundLevel = 100.0f; }
+        else { this.SoundLevel = level; }
     }
 
     public void SetMusic(float level)
     {
-        if (level < 0.0f)
-        {
-            this.MusicLevel = 0.0f;
-        }
-        else if (level > 100.0f)
-        {
-            this.MusicLevel = 100.0f;
-        }
-        else
-        {
-            this.MusicLevel = level;
-        }
+        if (level < 0.0f) { this.MusicLevel = 0.0f; }
+        else if (level > 100.0f) { this.MusicLevel = 100.0f; }
+        else { this.MusicLevel = level; }
     }
 }
 
 [Observable]
 public partial class MainWindow
 {
-    public ViewModel ViewModel { get; set; }
+    public ViewModel DataContext { get; set; } = null;
+    public ViewModel ViewModel { get { return this.DataContext; } }
 
     public MainWindow()
     {
-        this.ViewModel = new ViewModel();
+        Application_SetResources("Resources.xaml");
+        this.LoadResources("Language-en.xaml");
+        this.InitializeComponent();
+
+        this.DataContext = new ViewModel();
+        this.SetDataContext<ViewModel>(this.DataContext);
     }
 
     public void OnInitialized()
@@ -138,49 +143,49 @@ public partial class MainWindow
 
     public void SelectLanguageByIndex(int index)
     {
-        if (this.ViewModel != null)
+        if (this.DataContext != null)
         {
-            this.ViewModel.SelectLanguageByIndex(index);
+            this.DataContext.SelectLanguageByIndex(index);
         }
     }
 
     public void SelectLanguage(Language language)
     {
-        if (this.ViewModel != null)
+        if (this.DataContext != null)
         {
-            this.ViewModel.SelectLanguage(language);
+            this.DataContext.SelectLanguage(language);
         }
     }
 
     public void NextLanguage()
     {
-        if (this.ViewModel != null)
+        if (this.DataContext != null)
         {
-            this.ViewModel.NextLanguage();
+            this.DataContext.NextLanguage();
         }
     }
 
     public void LevelUp()
     {
-        if (this.ViewModel != null)
+        if (this.DataContext != null)
         {
-            this.ViewModel.LevelUp();
+            this.DataContext.LevelUp();
         }
     }
 
     public void SetSoundLevel(float level)
     {
-        if (this.ViewModel != null)
+        if (this.DataContext != null)
         {
-            this.ViewModel.SetSound(level);
+            this.DataContext.SetSound(level);
         }
     }
 
     public void SetMusicLevel(float level)
     {
-        if (this.ViewModel != null)
+        if (this.DataContext != null)
         {
-            this.ViewModel.SetMusic(level);
+            this.DataContext.SetMusic(level);
         }
     }
 

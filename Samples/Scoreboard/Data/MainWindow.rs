@@ -54,7 +54,7 @@ public class Player
 }
 
 [Observable]
-public class ViewModel
+public class Game
 {
     public string Name { get; set; }
     public int ElapsedTime { get; set; }
@@ -70,7 +70,7 @@ public class ViewModel
         set { this.Name = value; }
     }
 
-    public ViewModel()
+    public Game()
     {
         this.Name = "Silvershard Mines";
         this.ElapsedTime = 16;
@@ -202,13 +202,25 @@ public class ViewModel
 }
 
 [Observable]
+public class ViewModel : Game
+{
+    public ViewModel()
+    {
+    }
+}
+
+[Observable]
 public partial class MainWindow
 {
-    public ViewModel ViewModel { get; set; }
+    public Game DataContext { get; set; } = null;
+    public Game ViewModel { get { return this.DataContext; } }
 
     public MainWindow()
     {
-        this.ViewModel = new ViewModel();
+        this.InitializeComponent();
+
+        this.DataContext = new Game();
+        this.SetDataContext<Game>(this.DataContext);
     }
 
     public void OnInitialized()

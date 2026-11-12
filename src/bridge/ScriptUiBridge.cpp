@@ -1,8 +1,11 @@
 #include "aero/bridge/ScriptUiBridge.hpp"
 
+#include <algorithm>
 #include <cctype>
 #include <cmath>
+#include <mutex>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -30,6 +33,97 @@ namespace {
     return true;
 }
 
+struct PendingScriptUiState {
+    struct DcEntry {
+        const ExecutionDomainContext* domains = nullptr;
+        std::uint32_t ownerSlot = 0;
+        std::uint32_t ownerGen = 0;
+        ObjectRef dataContext{};
+    };
+    std::mutex mutex;
+    std::vector<DcEntry> dcEntries;
+    std::unordered_map<const ExecutionDomainContext*, std::vector<std::string>> pendingDictionaries;
+
+    PendingScriptUiState() {
+        rs_rt::registerExternalValuePoolRootMarker(this, [this]() {
+            MarkValuesInPools();
+        });
+    }
+
+    ~PendingScriptUiState() noexcept {
+        rs_rt::unregisterExternalValuePoolRootMarker(this);
+    }
+
+    static PendingScriptUiState& Instance() noexcept {
+        static PendingScriptUiState s;
+        return s;
+    }
+
+    void MarkValuesInPools() noexcept {
+        std::lock_guard<std::mutex> lock(mutex);
+        for (const auto& e : dcEntries) {
+            if (e.dataContext.valid()) {
+                rs_rt::markValueInPools(UnifiedValue{e.dataContext});
+            }
+        }
+    }
+
+    void SetDataContext(const ExecutionDomainContext* dom, ObjectRef owner, ObjectRef dc) {
+        if (!dom || !owner.valid()) return;
+        std::lock_guard<std::mutex> lock(mutex);
+        for (auto& e : dcEntries) {
+            if (e.domains == dom && e.ownerSlot == owner.slot && e.ownerGen == owner.generation) {
+                e.dataContext = dc;
+                return;
+            }
+        }
+        dcEntries.push_back(DcEntry{dom, owner.slot, owner.generation, dc});
+    }
+
+    [[nodiscard]] ObjectRef FindDataContext(const ExecutionDomainContext* dom, ObjectRef owner) noexcept {
+        if (!dom || !owner.valid()) return ObjectRef{};
+        std::lock_guard<std::mutex> lock(mutex);
+        for (auto it = dcEntries.rbegin(); it != dcEntries.rend(); ++it) {
+            if (it->domains == dom && it->ownerSlot == owner.slot && it->ownerGen == owner.generation) {
+                return it->dataContext;
+            }
+        }
+        return ObjectRef{};
+    }
+
+    void RecordDictionary(const ExecutionDomainContext* dom, const std::string& uri) {
+        if (!dom || uri.empty()) return;
+        std::lock_guard<std::mutex> lock(mutex);
+        auto& vec = pendingDictionaries[dom];
+        if (std::find(vec.begin(), vec.end(), uri) == vec.end()) {
+            vec.push_back(uri);
+        }
+    }
+
+    [[nodiscard]] std::vector<std::string> ConsumeDictionaries(const ExecutionDomainContext* dom) {
+        std::vector<std::string> out;
+        if (!dom) return out;
+        std::lock_guard<std::mutex> lock(mutex);
+        if (auto it = pendingDictionaries.find(dom); it != pendingDictionaries.end()) {
+            out = std::move(it->second);
+            pendingDictionaries.erase(it);
+        }
+        return out;
+    }
+
+    void ClearForDomain(const ExecutionDomainContext* dom) noexcept {
+        if (!dom) return;
+        std::lock_guard<std::mutex> lock(mutex);
+        dcEntries.erase(
+            std::remove_if(
+                dcEntries.begin(),
+                dcEntries.end(),
+                [dom](const DcEntry& e) noexcept { return e.domains == dom; }),
+            dcEntries.end());
+        pendingDictionaries.erase(dom);
+    }
+};
+
 [[nodiscard]] std::uint16_t ResolveSdkPropertyIdByName(std::string_view propName) noexcept {
     while (!propName.empty() && std::isspace(static_cast<unsigned char>(propName.front()))) {
         propName.remove_prefix(1u);
@@ -40,8 +134,15 @@ namespace {
     if (propName.empty()) {
         return 0xFFFFu;
     }
-    if (EqualsAsciiIgnoreCase(propName, "Width")) {
-        return PropId_Width;
+    if (EqualsAsciiIgnoreCase(propName, "Width")) return PropId_Width;
+    if (EqualsAsciiIgnoreCase(propName, "Height")) return PropId_Height;
+    if (EqualsAsciiIgnoreCase(propName, "Value")) return PropId_Value;
+    if (EqualsAsciiIgnoreCase(propName, "Minimum") || EqualsAsciiIgnoreCase(propName, "MinValue")) return PropId_Minimum;
+    if (EqualsAsciiIgnoreCase(propName, "Maximum") || EqualsAsciiIgnoreCase(propName, "MaxValue")) return PropId_Maximum;
+    if (EqualsAsciiIgnoreCase(propName, "SmallChange") || EqualsAsciiIgnoreCase(propName, "StepValue")) return PropId_SmallChange;
+    const std::uint16_t builtin = ResolveBuiltinPropertyId(propName);
+    if (builtin != 0xFFFFu && builtin != 0u) {
+        return builtin;
     }
     return ResolveTriggerConditionPropertyId(propName);
 }
@@ -94,8 +195,27 @@ void AttachStyleEngineAcrossSubtree(UIElement* subtreeRoot, StyleTriggerEngine* 
         return false;
     };
 
+    // 0. Check SetDataContext(vm) recorded via Aero.UI::GUI_SetDataContext during MainWindow construction!
+    {
+        const ObjectRef explicitDc = PendingScriptUiState::Instance().FindDataContext(&domains, mainWinRef);
+        if (explicitDc.valid()) {
+            if (auto* rh = domains.heapForObject(explicitDc); rh && rh->isAlive(explicitDc)) {
+                return explicitDc;
+            }
+        }
+    }
+
     const SymbolId typeId = heap->objectTypeId(mainWinRef).value_or(0);
     if (program && typeId != 0) {
+        if (const auto dcSlot = domains.resolvePropertySlot(*program, typeId, "DataContext")) {
+            UnifiedValue propVal{};
+            if (domains.readPropertySlotFast(DomainKind::Ui, mainWinRef, *dcSlot, propVal, nullptr, uiInterpreter)) {
+                ObjectRef vmRef{};
+                if (acceptIfAliveObject(propVal, vmRef)) {
+                    return vmRef;
+                }
+            }
+        }
         if (const auto slot = domains.resolvePropertySlot(*program, typeId, "ViewModel")) {
             UnifiedValue propVal{};
             if (domains.readPropertySlotFast(DomainKind::Ui, mainWinRef, *slot, propVal, nullptr, uiInterpreter)) {
@@ -115,9 +235,13 @@ void AttachStyleEngineAcrossSubtree(UIElement* subtreeRoot, StyleTriggerEngine* 
                 break;
             }
             for (const auto& f : ts->fields) {
-                if (f.name == "ViewModel" ||
+                if (f.name == "DataContext" ||
+                    f.name == "<DataContext>k__BackingField" ||
+                    f.name == "_dataContext" ||
+                    f.name == "ViewModel" ||
                     f.name == "<ViewModel>k__BackingField" ||
-                    f.name == "_ViewModel") {
+                    f.name == "_ViewModel" ||
+                    f.name == "_viewModel") {
                     UnifiedValue fieldVal{};
                     if (domains.readObjectField(DomainKind::Ui, mainWinRef, f.index, fieldVal)) {
                         ObjectRef vmRef{};
@@ -277,11 +401,28 @@ bool MountAndWireMainWindow(
         (void)rootControl->SetValue(PropId_DataContext, vmRef, ValueSourceRank::Local);
     }
 
+    // Apply any application/component resource dictionaries queued during MainWindow construction
+    const std::vector<std::string> pendingDicts = PendingScriptUiState::Instance().ConsumeDictionaries(&domains);
+    for (const std::string& dictUri : pendingDicts) {
+        (void)AxbTemplateRegistry::Instance().ApplyRegisteredDictionary(dictUri, nullptr);
+    }
+
     AxbPackage boundPkg;
     const AxbPackage* effPkg = &package;
     if (program) {
         boundPkg = package;
-        (void)boundPkg.BindAgainstProgram(*program, boundPkg.className, &domains);
+        std::string actualVmTypeName;
+        if (vmRef.valid()) {
+            if (auto* vh = domains.heapForObject(vmRef); vh && vh->isAlive(vmRef)) {
+                const SymbolId vmTid = vh->objectTypeId(vmRef).value_or(0);
+                if (const auto* vmTs = (vmTid != 0) ? program->resolveType(vmTid) : nullptr) {
+                    actualVmTypeName = vmTs->moduleName.empty()
+                        ? vmTs->name
+                        : (vmTs->moduleName + "::" + vmTs->name);
+                }
+            }
+        }
+        (void)boundPkg.BindAgainstProgram(*program, actualVmTypeName, &domains);
         boundPkg.PinValuesInPools();
         effPkg = &boundPkg;
     }
@@ -326,6 +467,13 @@ bool MountAndWireMainWindow(
         }
     }
 
+    for (const std::string& dictUri : pendingDicts) {
+        (void)AxbTemplateRegistry::Instance().ApplyRegisteredDictionary(dictUri, rootControl);
+    }
+    if (!pendingDicts.empty()) {
+        styleEngine.ImportRegistryStyles();
+        (void)styleEngine.BindSubtreeStyles(rootControl, true);
+    }
     AttachStyleEngineAcrossSubtree(rootControl, &styleEngine);
     (void)bindingEngine.FlushTrackA();
     (void)styleEngine.EvaluateAndApply();
@@ -379,6 +527,7 @@ ScriptUiBridge::ScriptUiBridge(DualTrackBindingEngine& externalEngine) noexcept
     , sharedEngineSlot_(std::make_shared<DualTrackBindingEngine*>(engine_)) {}
 
 ScriptUiBridge::~ScriptUiBridge() noexcept {
+    PendingScriptUiState::Instance().ClearForDomain(&domains_);
     if (sharedEngineSlot_) {
         *sharedEngineSlot_ = nullptr;
     }
@@ -781,7 +930,18 @@ void ScriptUiBridge::RegisterCoreUiBindings(BindingRegistry& bindings) {
             }
 
             if (bindEng && bindEng->Program()) {
-                (void)subPkg.BindAgainstProgram(*bindEng->Program(), subPkg.className, domPtr);
+                std::string inheritedDcType;
+                if (inheritedDc.valid()) {
+                    if (auto* ih = domPtr->heapForObject(inheritedDc); ih && ih->isAlive(inheritedDc)) {
+                        const SymbolId dcTid = ih->objectTypeId(inheritedDc).value_or(0);
+                        if (const auto* dcTs = (dcTid != 0) ? bindEng->Program()->resolveType(dcTid) : nullptr) {
+                            inheritedDcType = dcTs->moduleName.empty()
+                                ? dcTs->name
+                                : (dcTs->moduleName + "::" + dcTs->name);
+                        }
+                    }
+                }
+                (void)subPkg.BindAgainstProgram(*bindEng->Program(), inheritedDcType, domPtr);
                 subPkg.PinValuesInPools();
             }
             AxbTemplateRegistry::Instance().RegisterResources(subPkg);
@@ -824,6 +984,311 @@ void ScriptUiBridge::RegisterCoreUiBindings(BindingRegistry& bindings) {
                 (void)styleEng->EvaluateSubtree(child.Get(), false);
             }
             return UnifiedValue{true};
+        });
+
+    // GUI_LoadXaml(handle container, string xamlUri) -> bool (C++ Noesis::GUI::LoadXaml equivalent)
+    if (const auto existingLoadXaml = bindings.resolve(rs_bc::FunctionReference{0, "Aero.UI::ContentControl_LoadXaml"})) {
+        if (existingLoadXaml->function) {
+            bindSdkFn("GUI_LoadXaml", *existingLoadXaml->function);
+        }
+    }
+
+    // GUI_LoadComponent<T>(T component, string uri) -> bool (WPF / C++ InitializeComponent equivalent)
+    bindSdkFn(
+        "GUI_LoadComponent",
+        [domPtr](
+            const rs_bc::FunctionReference&,
+            ValueSpan args,
+            RuntimeError&)
+            -> std::optional<UnifiedValue> {
+            if (args.size() < 2 || !domPtr) {
+                return UnifiedValue{false};
+            }
+            const std::string uri = FormatBindingString({}, &args[1], 1u, domPtr);
+            if (uri.empty()) {
+                return UnifiedValue{false};
+            }
+            std::shared_ptr<UiResourceContext> domainCtx =
+                !UiResourceContext::HasActiveThreadOverride()
+                    ? UiResourceContext::FindForDomains(domPtr)
+                    : nullptr;
+            ScopedUiResourceContext ctxGuard(std::move(domainCtx));
+            if (AxbTemplateRegistry::Instance().Find(uri) != nullptr) {
+                return UnifiedValue{true};
+            }
+            if (const auto compileFn = GetRuntimeXamlCompileHook()) {
+                AxbPackage compiledPkg{};
+                const auto searchDirs = UiResourceContext::Current().XamlSearchDirectoriesSnapshot();
+                if (compileFn(uri, searchDirs, compiledPkg)) {
+                    AxbTemplateRegistry::Instance().Register(uri, compiledPkg);
+                    AxbTemplateRegistry::Instance().RegisterResources(compiledPkg);
+                    return UnifiedValue{true};
+                }
+            }
+            return UnifiedValue{true};
+        });
+
+    if (const auto existingLoadComp = bindings.resolve(rs_bc::FunctionReference{0, "Aero.UI::GUI_LoadComponent"})) {
+        if (existingLoadComp->function) {
+            bindSdkFn("Aero_LoadComponent", *existingLoadComp->function);
+        }
+    }
+
+    // GUI_SetDataContext<TOwner, TContext>(TOwner owner, TContext dataContext) -> bool (WPF / C++ FrameworkElement::SetDataContext)
+    bindSdkFn(
+        "GUI_SetDataContext",
+        [handlesPtr, domPtr, engineSlot](
+            const rs_bc::FunctionReference&,
+            ValueSpan args,
+            RuntimeError&)
+            -> std::optional<UnifiedValue> {
+            if (args.size() < 2 || !domPtr) {
+                return UnifiedValue{false};
+            }
+            ObjectRef dcRef{};
+            if (const auto* r1 = std::get_if<ObjectRef>(&args[1]); r1 && r1->valid()) {
+                dcRef = *r1;
+            }
+            if (const auto* ownerRef = std::get_if<ObjectRef>(&args[0]); ownerRef && ownerRef->valid()) {
+                PendingScriptUiState::Instance().SetDataContext(domPtr, *ownerRef, dcRef);
+                std::uint32_t rootHandleFieldIdx = PropertySlotHandle::InvalidIndex;
+                const DualTrackBindingEngine* liveEng = (engineSlot && *engineSlot) ? *engineSlot : nullptr;
+                const ProgramImage* prog = liveEng ? liveEng->Program() : nullptr;
+                if (prog) {
+                    if (auto* ownerHeap = domPtr->heapForObject(*ownerRef); ownerHeap && ownerHeap->isAlive(*ownerRef)) {
+                        const SymbolId ownerTid = ownerHeap->objectTypeId(*ownerRef).value_or(0);
+                        if (const auto* ts = (ownerTid != 0) ? prog->resolveType(ownerTid) : nullptr) {
+                            for (std::size_t fIdx = 0; fIdx < ts->fields.size(); ++fIdx) {
+                                if (ts->fields[fIdx].name == "__nativeRootHandle" &&
+                                    ts->fields[fIdx].type == rs_sem::PrimitiveType::Handle) {
+                                    rootHandleFieldIdx = static_cast<std::uint32_t>(fIdx);
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+                UnifiedValue rootHandleVal{};
+                bool gotHandle = false;
+                if (rootHandleFieldIdx != PropertySlotHandle::InvalidIndex) {
+                    gotHandle = domPtr->readObjectField(DomainKind::Ui, *ownerRef, rootHandleFieldIdx, rootHandleVal);
+                } else if (handlesPtr) {
+                    for (std::uint32_t fIdx = 0u; fIdx < 64u; ++fIdx) {
+                        UnifiedValue cand{};
+                        if (!domPtr->readObjectField(DomainKind::Ui, *ownerRef, fIdx, cand)) {
+                            break;
+                        }
+                        NativeHandle candNh{};
+                        if (cand.tryGetNativeHandle(candNh) && candNh.valid()) {
+                            if (auto* candElem = UIElement::FromNativeHandle(*handlesPtr, candNh);
+                                candElem && candElem->BoundScriptWrapper() == *ownerRef) {
+                                rootHandleVal = cand;
+                                gotHandle = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+                if (gotHandle) {
+                    NativeHandle nh{};
+                    if (handlesPtr && rootHandleVal.tryGetNativeHandle(nh) && nh.valid()) {
+                        if (auto* elem = UIElement::FromNativeHandle(*handlesPtr, nh)) {
+                            (void)elem->SetValue(PropId_DataContext, dcRef, ValueSourceRank::Local);
+                            DualTrackBindingEngine* bindEng = elem->BoundTwoWayEngine()
+                                ? elem->BoundTwoWayEngine()
+                                : (engineSlot ? *engineSlot : nullptr);
+                            if (bindEng) {
+                                (void)bindEng->RebindSubtreeRootObject(elem, dcRef);
+                                (void)bindEng->FlushTrackA();
+                            }
+                        }
+                    }
+                }
+                return UnifiedValue{true};
+            }
+            NativeHandle directHandle{};
+            if (handlesPtr && args[0].tryGetNativeHandle(directHandle) && directHandle.valid()) {
+                if (auto* elem = UIElement::FromNativeHandle(*handlesPtr, directHandle)) {
+                    (void)elem->SetValue(PropId_DataContext, dcRef, ValueSourceRank::Local);
+                    DualTrackBindingEngine* bindEng = elem->BoundTwoWayEngine()
+                        ? elem->BoundTwoWayEngine()
+                        : (engineSlot ? *engineSlot : nullptr);
+                    if (bindEng) {
+                        (void)bindEng->RebindSubtreeRootObject(elem, dcRef);
+                        (void)bindEng->FlushTrackA();
+                    }
+                    return UnifiedValue{true};
+                }
+            }
+            return UnifiedValue{false};
+        });
+
+    if (const auto existingSetDc = bindings.resolve(rs_bc::FunctionReference{0, "Aero.UI::GUI_SetDataContext"})) {
+        if (existingSetDc->function) {
+            bindSdkFn("__Aero_SetDataContext", *existingSetDc->function);
+            bindSdkFn("Aero_SetDataContext", *existingSetDc->function);
+        }
+    }
+
+    // Application_LoadResources(handle root, string uri) -> bool
+    bindSdkFn(
+        "Application_LoadResources",
+        [handlesPtr, domPtr](
+            const rs_bc::FunctionReference&,
+            ValueSpan args,
+            RuntimeError&)
+            -> std::optional<UnifiedValue> {
+            if (args.size() < 2 || !domPtr) {
+                return UnifiedValue{false};
+            }
+            UIElement* scopeRoot = nullptr;
+            NativeHandle handle{};
+            if (handlesPtr && args[0].tryGetNativeHandle(handle) && handle.valid()) {
+                scopeRoot = UIElement::FromNativeHandle(*handlesPtr, handle);
+            }
+            const std::string uri = FormatBindingString({}, &args[1], 1u, domPtr);
+            if (uri.empty()) {
+                return UnifiedValue{false};
+            }
+            std::shared_ptr<UiResourceContext> domainCtx =
+                !UiResourceContext::HasActiveThreadOverride()
+                    ? UiResourceContext::FindForDomains(domPtr)
+                    : nullptr;
+            ScopedUiResourceContext ctxGuard(std::move(domainCtx));
+            const std::size_t applied = AxbTemplateRegistry::Instance().ApplyRegisteredDictionary(uri, scopeRoot);
+            if (!scopeRoot) {
+                PendingScriptUiState::Instance().RecordDictionary(domPtr, uri);
+            }
+            if (scopeRoot) {
+                if (auto* se = scopeRoot->BoundStyleEngine()) {
+                    se->ImportRegistryStyles();
+                    (void)se->BindSubtreeStyles(scopeRoot, true);
+                    (void)se->EvaluateSubtree(scopeRoot, false);
+                }
+            }
+            return UnifiedValue{applied > 0u || !scopeRoot};
+        });
+
+    if (const auto existingLoadRes = bindings.resolve(rs_bc::FunctionReference{0, "Aero.UI::Application_LoadResources"})) {
+        if (existingLoadRes->function) {
+            bindSdkFn("Aero_LoadResources", *existingLoadRes->function);
+        }
+    }
+
+    // Application_SetResources(string uri) -> bool (C++ ApplicationLauncher::SetApplicationResources)
+    bindSdkFn(
+        "Application_SetResources",
+        [domPtr](
+            const rs_bc::FunctionReference&,
+            ValueSpan args,
+            RuntimeError&)
+            -> std::optional<UnifiedValue> {
+            if (args.empty() || !domPtr) {
+                return UnifiedValue{false};
+            }
+            const std::string uri = FormatBindingString({}, &args[0], 1u, domPtr);
+            if (uri.empty()) {
+                return UnifiedValue{false};
+            }
+            std::shared_ptr<UiResourceContext> domainCtx =
+                !UiResourceContext::HasActiveThreadOverride()
+                    ? UiResourceContext::FindForDomains(domPtr)
+                    : nullptr;
+            ScopedUiResourceContext ctxGuard(std::move(domainCtx));
+            (void)AxbTemplateRegistry::Instance().ApplyRegisteredDictionary(uri, nullptr);
+            PendingScriptUiState::Instance().RecordDictionary(domPtr, uri);
+            return UnifiedValue{true};
+        });
+
+    // UIElement_GetInt(handle elem, string propName) -> int
+    bindSdkFn(
+        "UIElement_GetInt",
+        [handlesPtr, domPtr](
+            const rs_bc::FunctionReference&,
+            ValueSpan args,
+            RuntimeError&)
+            -> std::optional<UnifiedValue> {
+            if (args.size() < 2 || !handlesPtr) {
+                return value::FromInt(0);
+            }
+            NativeHandle handle{};
+            if (!args[0].tryGetNativeHandle(handle) || !handle.valid()) {
+                return value::FromInt(0);
+            }
+            auto* elem = UIElement::FromNativeHandle(*handlesPtr, handle);
+            if (!elem) {
+                return value::FromInt(0);
+            }
+            const std::string propName = FormatBindingString({}, &args[1], 1u, domPtr);
+            const std::uint16_t propId = ResolveSdkPropertyIdByName(propName);
+            if (propId == 0xFFFFu) {
+                return value::FromInt(0);
+            }
+            const UnifiedValue raw = elem->GetValue(propId);
+            std::int64_t iv = 0;
+            if (raw.tryGetInt64(iv)) {
+                return value::FromInt(iv);
+            }
+            EnumValue ev{};
+            if (raw.tryGetEnum(ev)) {
+                return value::FromInt(ev.value);
+            }
+            float f = 0.0f;
+            if (TryGetFloat(raw, f)) {
+                return value::FromInt(static_cast<std::int64_t>(std::llround(f)));
+            }
+            return value::FromInt(0);
+        });
+
+    // UIElement_SetInt(handle elem, string propName, int val) -> bool
+    bindSdkFn(
+        "UIElement_SetInt",
+        [handlesPtr, domPtr, engineSlot](
+            const rs_bc::FunctionReference&,
+            ValueSpan args,
+            RuntimeError& error)
+            -> std::optional<UnifiedValue> {
+            if (args.size() < 3 || !handlesPtr) {
+                return UnifiedValue{false};
+            }
+            NativeHandle handle{};
+            if (!args[0].tryGetNativeHandle(handle) || !handle.valid()) {
+                return UnifiedValue{false};
+            }
+            auto* elem = UIElement::FromNativeHandle(*handlesPtr, handle);
+            if (!elem) {
+                return UnifiedValue{false};
+            }
+            const std::string propName = FormatBindingString({}, &args[1], 1u, domPtr);
+            const std::uint16_t propId = ResolveSdkPropertyIdByName(propName);
+            if (propId == 0xFFFFu) {
+                return UnifiedValue{false};
+            }
+            std::int64_t iv = 0;
+            if (!args[2].tryGetInt64(iv)) {
+                float f = 0.0f;
+                if (!TryGetFloat(args[2], f)) {
+                    return UnifiedValue{false};
+                }
+                iv = static_cast<std::int64_t>(std::llround(f));
+            }
+            const UnifiedValue v = (propId == PropId_Value || propId == PropId_Minimum ||
+                                    propId == PropId_Maximum || propId == PropId_SmallChange)
+                ? MakeFloat(static_cast<float>(iv))
+                : value::FromInt(iv);
+            const bool ok = elem->SetValue(propId, v, ValueSourceRank::Local);
+            if (ok) {
+                DualTrackBindingEngine* bindEng = elem->BoundTwoWayEngine()
+                    ? elem->BoundTwoWayEngine()
+                    : (engineSlot ? *engineSlot : nullptr);
+                if (elem->BoundTwoWayEngine() != nullptr) {
+                    (void)elem->NotifyTwoWayPropertyMutated(propId, &error);
+                }
+                if (bindEng != nullptr) {
+                    (void)bindEng->FlushTrackA();
+                }
+            }
+            return UnifiedValue{ok};
         });
 
     // Application_ApplyDictionary(string uri) -> bool

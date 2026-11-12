@@ -860,15 +860,30 @@ namespace {
 
 } // namespace
 
+namespace {
+[[nodiscard]] std::uint64_t HashStoryboardKeyFnv1a(std::string_view key) noexcept {
+    if (key.empty()) return 0ULL;
+    std::uint64_t h = 14695981039346656037ULL;
+    for (unsigned char c : key) {
+        h ^= static_cast<std::uint64_t>(c);
+        h *= 1099511628211ULL;
+    }
+    return h == 0ULL ? 1ULL : h;
+}
+} // namespace
+
 std::size_t AnimationEngine::BeginStoryboard(
     UIElement* scopeRoot,
     const AxbStoryboard& storyboard) {
     if (!scopeRoot) {
         return 0u;
     }
+    const std::uint64_t sbHash = HashStoryboardKeyFnv1a(storyboard.key);
     std::size_t started = 0u;
     for (const auto& tl : storyboard.timelines) {
-        if (StartTimeline(scopeRoot, tl) != InvalidTrackId) {
+        const std::uint16_t tid = StartTimeline(scopeRoot, tl);
+        if (tid != InvalidTrackId && tid < tracks_.size()) {
+            tracks_[tid].storyboardHash = sbHash;
             ++started;
         }
     }
@@ -960,6 +975,29 @@ bool AnimationEngine::IsStoryboardActive(
         const std::uint16_t id = FindActiveTrackId(target, tl.targetPropertyId);
         if (id != InvalidTrackId && id < tracks_.size() &&
             tracks_[id].kind != AnimationTrackKind::Inactive) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool AnimationEngine::IsStoryboardKeyActive(
+    UIElement* scopeRoot,
+    std::string_view storyboardKey,
+    const AxbStoryboard& storyboard) const noexcept {
+    if (!scopeRoot || storyboardKey.empty()) {
+        return false;
+    }
+    const std::uint64_t wantedHash = HashStoryboardKeyFnv1a(storyboardKey);
+    for (const auto& tl : storyboard.timelines) {
+        UIElement* target = ResolveStoryboardTimelineTarget(scopeRoot, tl.targetName);
+        if (!target) {
+            continue;
+        }
+        const std::uint16_t id = FindActiveTrackId(target, tl.targetPropertyId);
+        if (id != InvalidTrackId && id < tracks_.size() &&
+            tracks_[id].kind != AnimationTrackKind::Inactive &&
+            tracks_[id].storyboardHash == wantedHash) {
             return true;
         }
     }

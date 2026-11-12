@@ -1,4 +1,5 @@
 module TicTacToe;
+
 import Aero.UI;
 
 public enum State
@@ -20,6 +21,12 @@ public enum State
 [Observable]
 public class ViewModel
 {
+    private DelegateCommand _startCommand;
+    private DelegateCommand _checkCommand;
+
+    public DelegateCommand StartCommand { get { return this._startCommand; } }
+    public DelegateCommand CheckCommand { get { return this._checkCommand; } }
+
     public State State { get; set; } = State.Player1;
     public int ScorePlayer1 { get; set; } = 0;
     public int ScorePlayer2 { get; set; } = 0;
@@ -38,6 +45,11 @@ public class ViewModel
 
     public ViewModel()
     {
+        this._startCommand = new DelegateCommand();
+        this._checkCommand = new DelegateCommand();
+        this._startCommand.SetExecuteFunc(this.OnStart);
+        this._checkCommand.SetExecuteFunc(this.OnCheck);
+
         this.ScorePlayer1 = 0;
         this.ScorePlayer2 = 0;
         this.ScoreTies = 0;
@@ -72,6 +84,11 @@ public class ViewModel
         else if (index == 8) { this.Cell8 = playerMark; }
     }
 
+    public void OnStart()
+    {
+        this.Start();
+    }
+
     public void Start()
     {
         this.Cell0 = 0;
@@ -88,9 +105,9 @@ public class ViewModel
         this.State = (numGames % 2 == 0) ? State.Player1 : State.Player2;
     }
 
-    public void StartCommand()
+    public void OnCheck(int index)
     {
-        this.Start();
+        this.Check(index);
     }
 
     public void Check(int index)
@@ -111,11 +128,6 @@ public class ViewModel
         int mark = (this.State == State.Player1) ? 1 : 2;
         this.SetCell(index, mark);
         this.State = this.CheckWin(mark);
-    }
-
-    public void CheckCommand(int index)
-    {
-        this.Check(index);
     }
 
     private State CheckWin(int mark)
@@ -215,47 +227,20 @@ public class ViewModel
 [Observable]
 public partial class MainWindow
 {
-    public ViewModel ViewModel { get; set; } = null;
+    public ViewModel DataContext { get; set; } = null;
+    public ViewModel ViewModel { get { return this.DataContext; } }
 
     public MainWindow()
     {
-        this.ViewModel = new ViewModel();
+        Application_SetResources("Resources.xaml");
+        this.InitializeComponent();
+
+        this.DataContext = new ViewModel();
+        this.SetDataContext<ViewModel>(this.DataContext);
     }
 
     public void OnInitialized()
     {
-    }
-
-    // Note: MainPage.xaml defines <Button x:Name="Start">, so MainWindow.g.rs emits
-    // `public handle Start;`. StartCommand / OnStart / StartGame avoid colliding with that field.
-    public void StartCommand()
-    {
-        this.ViewModel.Start();
-    }
-
-    public void OnStart()
-    {
-        this.ViewModel.Start();
-    }
-
-    public void StartGame()
-    {
-        this.ViewModel.Start();
-    }
-
-    public void CheckCommand(int index)
-    {
-        this.ViewModel.Check(index);
-    }
-
-    public void Check(int index)
-    {
-        this.ViewModel.Check(index);
-    }
-
-    public void OnCheck(int index)
-    {
-        this.ViewModel.Check(index);
     }
 }
 

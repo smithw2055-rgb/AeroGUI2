@@ -102,7 +102,11 @@ public partial class MainWindow
 
     public MainWindow()
     {
+        Application_SetResources("Resources.xaml");
+        this.InitializeComponent();
+
         this.ViewModel = new ViewModel();
+        this.SetDataContext<ViewModel>(this.ViewModel);
     }
 
     public void OnInitialized()

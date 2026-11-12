@@ -162,6 +162,8 @@ public:
         const Interpreter* uiInterpreter = nullptr) noexcept;
     ~DualTrackBindingEngine() noexcept;
 
+    [[nodiscard]] static bool IsLiveInstance(const DualTrackBindingEngine* engine) noexcept;
+
     void SetProgramImage(const ProgramImage* program) noexcept { program_ = program; }
     void SetUiInterpreter(const Interpreter* uiInterpreter) noexcept { uiInterpreter_ = uiInterpreter; }
     void SetAnimationEngine(AnimationEngine* animationEngine) noexcept { animationEngine_ = animationEngine; }

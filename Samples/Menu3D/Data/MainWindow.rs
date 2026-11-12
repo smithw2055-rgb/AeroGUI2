@@ -1,4 +1,5 @@
 module Menu3D;
+
 import Aero.UI;
 
 public enum Platform
@@ -11,15 +12,12 @@ public enum Platform
 [Observable]
 public class MenuDescription
 {
-    public string Description { get; set; }
-    public string AcceptText { get; set; }
-    public string CancelText { get; set; }
+    public string Description { get; set; } = "";
+    public string AcceptText { get; set; } = "";
+    public string CancelText { get; set; } = "";
 
     public MenuDescription()
     {
-        this.Description = "";
-        this.AcceptText = "";
-        this.CancelText = "";
     }
 
     public MenuDescription(string desc, string accept, string cancel)
@@ -33,98 +31,70 @@ public class MenuDescription
 [Observable]
 public class MainMenu
 {
+    private DelegateCommand _exit;
+
     public MenuDescription Description { get; set; }
-    public MainWindow Window { get; set; }
-    public ViewModel Owner { get; set; }
+    public DelegateCommand Exit { get { return this._exit; } }
+    public ViewModel Owner { get; set; } = null;
 
     public MainMenu()
     {
         this.Description = new MenuDescription("MAIN MENU", "ACCEPT", "EXIT");
-        this.Window = null;
-        this.Owner = null;
-    }
-
-    public void Exit()
-    {
-        if (this.Window != null)
-        {
-            this.Window.Exit();
-        }
-        else if (this.Owner != null)
-        {
-            this.Owner.OnExit();
-        }
+        this._exit = new DelegateCommand(this.OnExit);
     }
 
     public void OnExit()
     {
-        this.Exit();
+        if (this.Owner != null)
+        {
+            this.Owner.OnExit();
+        }
     }
 }
 
 [Observable]
 public class StartMenu
 {
+    private DelegateCommand _startCasual;
+    private DelegateCommand _startNormal;
+    private DelegateCommand _startExpert;
+
     public MenuDescription Description { get; set; }
-    public MainWindow Window { get; set; }
-    public ViewModel Owner { get; set; }
+    public DelegateCommand StartCasual { get { return this._startCasual; } }
+    public DelegateCommand StartNormal { get { return this._startNormal; } }
+    public DelegateCommand StartExpert { get { return this._startExpert; } }
+    public ViewModel Owner { get; set; } = null;
 
     public StartMenu()
     {
         this.Description = new MenuDescription("SELECT DIFFICULTY", "ACCEPT", "BACK");
-        this.Window = null;
-        this.Owner = null;
+        this._startCasual = new DelegateCommand(this.OnStartCasual);
+        this._startNormal = new DelegateCommand(this.OnStartNormal);
+        this._startExpert = new DelegateCommand(this.OnStartExpert);
     }
 
-    public void StartCasual()
+    public void OnStartCasual()
     {
-        if (this.Window != null)
-        {
-            this.Window.StartCasual();
-        }
-        else if (this.Owner != null)
+        if (this.Owner != null)
         {
             this.Owner.OnStartCasual();
         }
     }
 
-    public void StartNormal()
+    public void OnStartNormal()
     {
-        if (this.Window != null)
-        {
-            this.Window.StartNormal();
-        }
-        else if (this.Owner != null)
+        if (this.Owner != null)
         {
             this.Owner.OnStartNormal();
         }
     }
 
-    public void StartExpert()
+    public void OnStartExpert()
     {
-        if (this.Window != null)
-        {
-            this.Window.StartExpert();
-        }
-        else if (this.Owner != null)
+        if (this.Owner != null)
         {
             this.Owner.OnStartExpert();
         }
-    }
-
-    public void OnStartCasual()
-    {
-        this.StartCasual();
-    }
-
-    public void OnStartNormal()
-    {
-        this.StartNormal();
-    }
-
-    public void OnStartExpert()
-    {
-        this.StartExpert();
     }
 }
 
@@ -132,26 +102,17 @@ public class StartMenu
 public class SettingsMenu
 {
     public MenuDescription Description { get; set; }
-    public MainWindow Window { get; set; }
-    public ViewModel Owner { get; set; }
-    public int TextureDetailIndex { get; set; }
-    public bool AntiAliasing { get; set; }
-    public int SoundVolume { get; set; }
-    public int VideoResolutionIndex { get; set; }
-    public int GammaCorrection { get; set; }
-    public bool Subtitles { get; set; }
+    public ViewModel Owner { get; set; } = null;
+    public int TextureDetailIndex { get; set; } = 1;
+    public bool AntiAliasing { get; set; } = false;
+    public int SoundVolume { get; set; } = 5;
+    public int VideoResolutionIndex { get; set; } = 2;
+    public int GammaCorrection { get; set; } = 5;
+    public bool Subtitles { get; set; } = false;
 
     public SettingsMenu()
     {
         this.Description = new MenuDescription("SETTINGS", "ACCEPT", "BACK");
-        this.Window = null;
-        this.Owner = null;
-        this.TextureDetailIndex = 1;
-        this.AntiAliasing = false;
-        this.SoundVolume = 5;
-        this.VideoResolutionIndex = 2;
-        this.GammaCorrection = 5;
-        this.Subtitles = false;
     }
 }
 
@@ -161,11 +122,11 @@ public class ViewModel
     public MainMenu MainMenu { get; set; }
     public StartMenu StartMenu { get; set; }
     public SettingsMenu SettingsMenu { get; set; }
-    public Platform Platform { get; set; }
-    public string CurrentDifficulty { get; set; }
-    public string ActiveMenu { get; set; }
-    public bool Exited { get; set; }
-    public int StartCount { get; set; }
+    public Platform Platform { get; set; } = Platform.PC;
+    public string CurrentDifficulty { get; set; } = "";
+    public string ActiveMenu { get; set; } = "Main";
+    public bool Exited { get; set; } = false;
+    public int StartCount { get; set; } = 0;
 
     public ViewModel()
     {
@@ -175,12 +136,6 @@ public class ViewModel
         this.MainMenu.Owner = this;
         this.StartMenu.Owner = this;
         this.SettingsMenu.Owner = this;
-
-        this.Platform = Platform.PC;
-        this.CurrentDifficulty = "";
-        this.ActiveMenu = "Main";
-        this.Exited = false;
-        this.StartCount = 0;
     }
 
     public void OnExit()
@@ -220,78 +175,60 @@ public class ViewModel
 [Observable]
 public partial class MainWindow
 {
-    public ViewModel ViewModel { get; set; }
+    public ViewModel DataContext { get; set; } = null;
+    public ViewModel ViewModel { get { return this.DataContext; } }
 
     public MainWindow()
     {
-        this.ViewModel = new ViewModel();
-        this.ViewModel.MainMenu.Window = this;
-        this.ViewModel.StartMenu.Window = this;
-        this.ViewModel.SettingsMenu.Window = this;
+        Application_SetResources("Resources.xaml");
+        this.InitializeComponent();
+
+        this.DataContext = new ViewModel();
+        this.SetDataContext<ViewModel>(this.DataContext);
     }
 
     public void OnInitialized()
     {
     }
 
-    public void Exit()
-    {
-        this.ViewModel.OnExit();
-    }
-
-    public void OnExit()
-    {
-        this.ViewModel.OnExit();
-    }
-
-    public void StartCasual()
-    {
-        this.ViewModel.OnStartCasual();
-    }
-
-    public void OnStartCasual()
-    {
-        this.ViewModel.OnStartCasual();
-    }
-
-    public void StartNormal()
-    {
-        this.ViewModel.OnStartNormal();
-    }
-
-    public void OnStartNormal()
-    {
-        this.ViewModel.OnStartNormal();
-    }
-
-    public void StartExpert()
-    {
-        this.ViewModel.OnStartExpert();
-    }
-
-    public void OnStartExpert()
-    {
-        this.ViewModel.OnStartExpert();
-    }
-
     public void NavigateToMain()
     {
-        this.ViewModel.SetActiveMenu("Main");
+        this.DataContext.SetActiveMenu("Main");
     }
 
     public void NavigateToStart()
     {
-        this.ViewModel.SetActiveMenu("Start");
+        this.DataContext.SetActiveMenu("Start");
     }
 
     public void NavigateToSettings()
     {
-        this.ViewModel.SetActiveMenu("Settings");
+        this.DataContext.SetActiveMenu("Settings");
     }
 
     public void SetPlatform(Platform platform)
     {
-        this.ViewModel.SetPlatform(platform);
+        this.DataContext.SetPlatform(platform);
+    }
+
+    public void StartCasual()
+    {
+        this.DataContext.StartMenu.StartCasual.Execute();
+    }
+
+    public void StartNormal()
+    {
+        this.DataContext.StartMenu.StartNormal.Execute();
+    }
+
+    public void StartExpert()
+    {
+        this.DataContext.StartMenu.StartExpert.Execute();
+    }
+
+    public void Exit()
+    {
+        this.DataContext.MainMenu.Exit.Execute();
     }
 }
 

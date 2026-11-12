@@ -277,8 +277,12 @@ public partial class MainWindow
 
     public MainWindow()
     {
+        Application_SetResources("Resources.xaml");
+        this.InitializeComponent();
+
         this._lastLoadSucceeded = false;
         this.ViewModel = new ViewModel(this);
+        this.SetDataContext<ViewModel>(this.ViewModel);
     }
 
     public void OnInitialized()
@@ -298,7 +302,7 @@ public partial class MainWindow
         bool loaded = false;
         if (useFirst)
         {
-            loaded = ContentControl_LoadXaml(this.SampleContainer1, xamlUri);
+            loaded = GUI_LoadXaml(this.SampleContainer1, xamlUri);
             if (loaded)
             {
                 this.ActiveContainerIndex = 1;
@@ -311,7 +315,7 @@ public partial class MainWindow
         }
         else
         {
-            loaded = ContentControl_LoadXaml(this.SampleContainer2, xamlUri);
+            loaded = GUI_LoadXaml(this.SampleContainer2, xamlUri);
             if (loaded)
             {
                 this.ActiveContainerIndex = 2;

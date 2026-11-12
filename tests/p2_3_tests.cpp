@@ -303,7 +303,7 @@ int main(int argc, char** argv) {
     for (const auto& dirEntry : fs::directory_iterator(samplesRoot)) {
         if (dirEntry.is_directory()) {
             const std::string dirName = dirEntry.path().filename().string();
-            if (!dirName.empty() && dirName[0] != '.') {
+            if (!dirName.empty() && dirName[0] != '.' && dirName != "Theme") {
                 projectDirs.push_back(dirName);
             }
         }
@@ -344,7 +344,7 @@ int main(int argc, char** argv) {
         rivPaths.size());
 
     AERO_P23_CHECK_MSG(projectDirs.size() == 21u, "Expected exactly 21 official sample projects");
-    AERO_P23_CHECK_MSG(xamlPaths.size() == 74u, "Expected exactly 74 official .xaml files");
+    AERO_P23_CHECK_MSG(xamlPaths.size() == 116u, "Expected 116 official .xaml files (74 sample + 42 Theme)");
     AERO_P23_CHECK_MSG(rivPaths.size() == 9u, "Expected exactly 9 official .riv binary files");
 
     // ------------------------------------------------------------------------
@@ -430,7 +430,7 @@ int main(int argc, char** argv) {
         totalXamlCompileMs,
         totalXamlRoundTripMs,
         totalAxbBytes);
-    AERO_P23_CHECK_MSG(xamlPassedCount == 74u, "All 74 .xaml files must pass Compile + .axb4 round-trip");
+    AERO_P23_CHECK_MSG(xamlPassedCount == 116u, "All 116 .xaml files must pass Compile + .axb4 round-trip");
 
     // ------------------------------------------------------------------------
     // Phase 3: Full 9/9 Official .riv Binary Import & .axb4 Lowering Verification
@@ -499,22 +499,22 @@ int main(int argc, char** argv) {
     //             -> ZeroCopyGpuStream::RasterizeTreeToRgba8(320x180)
     // ------------------------------------------------------------------------
     static constexpr GoldenSceneCase kGoldenScenes[] = {
-        {"HelloWorld",       "HelloWorld/Data/MainPage.xaml",         nullptr,                                1.2f, 0x7863b040a6dc4444ULL, 50000u, 300u},
-        {"Login",            "Login/Data/MainPage.xaml",              "Login/Data/Resources.xaml",            1.0f, 0xe52312950e1871afULL, 50000u, 600u},
-        {"Buttons",          "Buttons/Data/MainPage.xaml",            "Buttons/Data/Resources.xaml",          1.0f, 0x1dc81e85638e4134ULL, 50000u, 600u},
-        {"QuestLog",         "QuestLog/Data/MainPage.xaml",           "QuestLog/Data/Resources.xaml",         1.0f, 0x57a28126d5c058efULL, 20000u, 600u},
-        {"Inventory",        "Inventory/Data/MainPage.xaml",          "Inventory/Data/Resources.xaml",        3.2f, 0xba7af8d631f7197eULL, 40000u, 300u},
-        {"Scoreboard",       "Scoreboard/Data/MainPage.xaml",         nullptr,                                1.0f, 0x063ca2044a4f5443ULL, 50000u, 600u},
-        {"TicTacToe",        "TicTacToe/Data/MainPage.xaml",          "TicTacToe/Data/Resources.xaml",        1.0f, 0xdf6758fc356ab321ULL, 50000u, 1000u},
-        {"Localization",     "Localization/Data/MainPage.xaml",       "Localization/Data/Language-en.xaml",   1.0f, 0xa3d3d035b759cae9ULL, 50000u, 800u},
-        {"Gallery",          "Gallery/Data/MainWindow.xaml",          "Gallery/Data/Resources.xaml",          1.0f, 0x2161a2275cd34a67ULL, 50000u, 600u},
-        {"Brushes",          "Gallery/Data/Samples/Brushes.xaml",     "Gallery/Data/Resources.xaml",          1.0f, 0xda9ff0aaf2c54343ULL,  5000u, 600u},
-        {"Gallery_Blending", "Gallery/Data/Samples/Blending.xaml",    "Gallery/Data/Resources.xaml",          1.0f, 0xef9800ddaa2f77e3ULL,  7000u, 500u},
-        {"Rive",             "Rive/Data/MainPage.xaml",               nullptr,                                1.0f, 0xb5434a846c223365ULL, 50000u, 3000u},
-        {"Effects",          "Gallery/Data/Samples/Effects.xaml",     "Gallery/Data/Resources.xaml",          1.0f, 0x1433ba1eb55d06e9ULL,  8000u, 2000u},
-        {"BackgroundBlur",   "BackgroundBlur/Data/MainPage.xaml",     "BackgroundBlur/Data/Resources.xaml",   1.0f, 0x637465c308a7b16cULL, 40000u, 800u},
-        {"BrushShaders",     "BrushShaders/Data/MainPage.xaml",       nullptr,                                1.0f, 0x9ca3061feedf5fd5ULL, 50000u, 300u},
-        {"UserControl",      "UserControl/Data/MainPage.xaml",        "UserControl/Data/Resources.xaml",      1.0f, 0x261e72f064aeb55cULL, 50000u, 800u},
+        {"HelloWorld", "HelloWorld/Data/MainPage.xaml", nullptr, 1.2f, 0x7863b040a6dc4444ULL, 50000u, 300u},
+        {"Login", "Login/Data/MainPage.xaml", "Login/Data/Resources.xaml", 1.0f, 0xe52312950e1871afULL, 50000u, 600u},
+        {"Buttons", "Buttons/Data/MainPage.xaml", "Buttons/Data/Resources.xaml", 1.0f, 0x1dc81e85638e4134ULL, 50000u, 600u},
+        {"QuestLog", "QuestLog/Data/MainPage.xaml", "QuestLog/Data/Resources.xaml", 1.0f, 0x57a28126d5c058efULL, 20000u, 600u},
+        {"Inventory", "Inventory/Data/MainPage.xaml", "Inventory/Data/Resources.xaml", 3.2f, 0x1fa7d27c66a6b3aeULL, 40000u, 300u},
+        {"Scoreboard", "Scoreboard/Data/MainPage.xaml", nullptr, 1.0f, 0x063ca2044a4f5443ULL, 50000u, 600u},
+        {"TicTacToe", "TicTacToe/Data/MainPage.xaml", "TicTacToe/Data/Resources.xaml", 1.0f, 0xdf6758fc356ab321ULL, 50000u, 1000u},
+        {"Localization", "Localization/Data/MainPage.xaml", "Localization/Data/Language-en.xaml", 1.0f, 0xa3d3d035b759cae9ULL, 50000u, 800u},
+        {"Gallery", "Gallery/Data/MainWindow.xaml", "Gallery/Data/Resources.xaml", 1.0f, 0x97982bf0a0b5c10aULL, 50000u, 600u},
+        {"Brushes", "Gallery/Data/Samples/Brushes.xaml", "Gallery/Data/Resources.xaml", 1.0f, 0x5c1288863f0dba6bULL, 5000u, 600u},
+        {"Gallery_Blending", "Gallery/Data/Samples/Blending.xaml", "Gallery/Data/Resources.xaml", 1.0f, 0x5379a9caa15d97a8ULL, 7000u, 500u},
+        {"Rive", "Rive/Data/MainPage.xaml", nullptr, 1.0f, 0xb5434a846c223365ULL, 50000u, 3000u},
+        {"Effects", "Gallery/Data/Samples/Effects.xaml", "Gallery/Data/Resources.xaml", 1.0f, 0xbc145dcab875c3ddULL, 8000u, 2000u},
+        {"BackgroundBlur", "BackgroundBlur/Data/MainPage.xaml", "BackgroundBlur/Data/Resources.xaml", 1.0f, 0x637465c308a7b16cULL, 40000u, 800u},
+        {"BrushShaders", "BrushShaders/Data/MainPage.xaml", nullptr, 1.0f, 0x9ca3061feedf5fd5ULL, 50000u, 300u},
+        {"UserControl", "UserControl/Data/MainPage.xaml", "UserControl/Data/Resources.xaml", 1.0f, 0x261e72f064aeb55cULL, 50000u, 800u},
     };
 
     constexpr std::uint32_t kLayoutW = 1280u;

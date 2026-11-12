@@ -305,12 +305,23 @@ struct MountedSampleHarness {
         AERO_MW_CHECK_MSG(
             compileResult.diagnostics.empty(),
             sampleName + " unexpected diagnostics count=" + std::to_string(compileResult.diagnostics.size()));
+        {
+            std::string rawXamlText;
+            AERO_MW_CHECK(ReadTextFile(xamlPath, rawXamlText));
+            AERO_MW_CHECK_MSG(
+                rawXamlText.find("x:DataType") == std::string::npos,
+                sampleName + " XAML must not contain x:DataType (must rely purely on x:Class)");
+        }
+        const std::string expectedVmClass =
+            (sampleName == "DataBinding") ? "SolarSystem"
+            : ((sampleName == "Scoreboard") ? "Game" : "ViewModel");
         AERO_MW_CHECK_MSG(
             compileResult.axbPackage.className == sampleName + ".MainWindow",
             sampleName + " className actual='" + compileResult.axbPackage.className + "'");
         AERO_MW_CHECK_MSG(
-            compileResult.axbPackage.rootDataTypeName == sampleName + "::ViewModel",
-            sampleName + " rootDataTypeName actual='" + compileResult.axbPackage.rootDataTypeName + "'");
+            compileResult.axbPackage.rootDataTypeName == sampleName + "::" + expectedVmClass,
+            sampleName + " rootDataTypeName actual='" + compileResult.axbPackage.rootDataTypeName +
+                "' expected='" + sampleName + "::" + expectedVmClass + "'");
         AERO_MW_CHECK_MSG(
             compileResult.axbPackage.rootTypeName == expectedRootType,
             sampleName + " rootTypeName actual='" + compileResult.axbPackage.rootTypeName + "'");
@@ -419,7 +430,7 @@ struct MountedSampleHarness {
         const auto* mwType = compileResult.programImage->resolveType(mwTid);
         const auto* vmType = compileResult.programImage->resolveType(vmTid);
         AERO_MW_CHECK_MSG(mwType != nullptr && EndsWith(mwType->name, "MainWindow"), sampleName + " MainWindow runtime type mismatch");
-        AERO_MW_CHECK_MSG(vmType != nullptr && EndsWith(vmType->name, "ViewModel"), sampleName + " ViewModel runtime type mismatch");
+        AERO_MW_CHECK_MSG(vmType != nullptr && EndsWith(vmType->name, expectedVmClass), sampleName + " DataContext runtime type mismatch");
 
         // Verify BoundScriptWrapper == MainWindow and DataContext == ViewModel
         AERO_MW_CHECK_MSG(
@@ -434,6 +445,7 @@ struct MountedSampleHarness {
         if (hasExtraDictPkg) {
             (void)AxbTemplateRegistry::Instance().ApplyDynamicDictionary(extraDictPkg, root.Get());
             styleEngine.ImportRegistryStyles();
+            (void)styleEngine.BindSubtreeStyles(root.Get(), true);
             (void)styleEngine.EvaluateAndApply();
         }
 
@@ -970,15 +982,15 @@ void TestInventorySample(const fs::path& samplesRoot) {
     AERO_MW_CHECK(h.ReadInt(playerRef, "TotalArmor") == 351);
     AERO_MW_CHECK(SubtreeContainsText(h.root.Get(), "1588"));
 
-    // Unequip Head (KnightHelmet, Life=25) -> bag becomes 38, TotalLife becomes 1563, SlotHead updates to Defaults[0]
+    // Unequip Head (KnightHelmet, Life=20 per Src/ViewModel.cpp:127) -> bag becomes 38, TotalLife becomes 1568, SlotHead updates to Defaults[0]
     const auto unequipRes = h.InvokeMethod(h.mainWinRef, "UnequipSlot", {value::FromInt(0)});
     h.PumpSeconds(0.45f);
     AERO_MW_CHECK(unequipRes.has_value() && std::holds_alternative<bool>(*unequipRes) && std::get<bool>(*unequipRes));
     AERO_MW_CHECK(h.ReadList(h.vmRef, "Inventory").size() == 38u);
-    AERO_MW_CHECK(h.ReadInt(playerRef, "TotalLife") == 1563);
+    AERO_MW_CHECK(h.ReadInt(playerRef, "TotalLife") == 1568);
     AERO_MW_CHECK_MSG(
-        SubtreeContainsText(h.root.Get(), "1563"),
-        "LIFE MultiBinding over Player.Slots[0..7] did not update to 1563 after UnequipSlot(0)");
+        SubtreeContainsText(h.root.Get(), "1568"),
+        "LIFE MultiBinding over Player.Slots[0..7] did not update to 1568 after UnequipSlot(0)");
 
     // Re-equip KnightHelmet from Inventory[37] into Slot 0
     const auto equipRes = h.InvokeMethod(

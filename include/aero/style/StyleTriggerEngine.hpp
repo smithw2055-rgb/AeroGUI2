@@ -34,6 +34,7 @@ public:
         DualTrackBindingEngine* bindingEngine = nullptr);
     ~StyleTriggerEngine() noexcept;
 
+    [[nodiscard]] static bool IsLiveInstance(const StyleTriggerEngine* engine) noexcept;
     void MarkValuesInPools() const noexcept;
 
     void SetAnimationEngine(AnimationEngine* animationEngine) noexcept {
@@ -129,11 +130,14 @@ private:
 
     struct EventTriggerRuntimeState {
         IntrusivePtr<UIElement> cachedSource{};
+        UnifiedValue prevWatchedValue{};
         std::uint32_t lastClickGen = 0u;
         std::int64_t prevSelectedIndex = -1;
         float prevNumericValue = 0.0f;
+        std::uint16_t watchedPropId = 0xFFFFu;
         bool prevHovered = false;
         bool prevChecked = false;
+        bool prevStoryboardActive = false;
         bool initialized = false;
     };
 
@@ -187,5 +191,15 @@ private:
     std::vector<StyledElementInstance> instances_;
     bool inAttachStyle_ = false;
 };
+
+[[nodiscard]] bool TryInvokeCommandObjectOnOwner(
+    ExecutionDomainContext* domains,
+    const ProgramImage* prog,
+    const Interpreter* interp,
+    rs_aot::ExecutionContext* aotCtx,
+    ObjectRef ownerObj,
+    std::string_view propName,
+    const UnifiedValue& rawParam,
+    bool hasParam);
 
 } // namespace aero

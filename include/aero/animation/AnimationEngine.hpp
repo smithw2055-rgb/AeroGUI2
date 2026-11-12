@@ -160,6 +160,7 @@ public:
     std::size_t StopStoryboard(UIElement* scopeRoot, const AxbStoryboard& storyboard, bool restoreBaseValue = true) noexcept;
     std::size_t TogglePlayPauseStoryboard(UIElement* scopeRoot, const AxbStoryboard& storyboard);
     [[nodiscard]] bool IsStoryboardActive(UIElement* scopeRoot, const AxbStoryboard& storyboard) const noexcept;
+    [[nodiscard]] bool IsStoryboardKeyActive(UIElement* scopeRoot, std::string_view storyboardKey, const AxbStoryboard& storyboard) const noexcept;
     [[nodiscard]] bool IsStoryboardPaused(UIElement* scopeRoot, const AxbStoryboard& storyboard) const noexcept;
     bool StopPropertyAnimation(UIElement* target, std::uint16_t propId, bool restoreBaseValue = true) noexcept;
     std::size_t StopSubtreeAnimations(const UIElement* subtreeRoot, bool restoreBaseValue = false) noexcept;
@@ -265,6 +266,7 @@ private:
         const AxbFlatKeyframe* sliceFrames = nullptr;
         std::uint32_t sliceCount = 0u;
         std::uint32_t cachedSegmentIdx = 0u;
+        std::uint64_t storyboardHash = 0ULL;
 
         std::array<InlineTrackKeyFrame, kMaxInlineKeyFrames> keyFrames{};
     };

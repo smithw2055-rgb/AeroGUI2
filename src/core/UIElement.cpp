@@ -2085,6 +2085,14 @@ bool UIElement::SetValue(
                     rank);
             }
             break;
+        case PropId_CustomIndexInt32:
+        case PropId_CustomStateInt32: {
+            EnumValue ev{};
+            if (value.tryGetEnum(ev)) {
+                return SetValue(propId, value::FromInt(ev.value), rank);
+            }
+            break;
+        }
         case PropId_Background:
         case PropId_Foreground:
         case PropId_BorderBrush: {

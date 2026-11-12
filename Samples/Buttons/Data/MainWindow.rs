@@ -5,6 +5,14 @@ import Aero.UI;
 [Observable]
 public class ViewModel
 {
+    private DelegateCommand _startCommand;
+    private DelegateCommand _settingsCommand;
+    private DelegateCommand _exitCommand;
+
+    public DelegateCommand StartCommand { get { return this._startCommand; } }
+    public DelegateCommand SettingsCommand { get { return this._settingsCommand; } }
+    public DelegateCommand ExitCommand { get { return this._exitCommand; } }
+
     public string LastAction { get; set; } = "";
     public string State { get; set; } = "Menu";
     public int StartCount { get; set; } = 0;
@@ -14,12 +22,14 @@ public class ViewModel
 
     public ViewModel()
     {
-        this.LastAction = "";
-        this.State = "Menu";
-        this.StartCount = 0;
-        this.SettingsCount = 0;
-        this.ExitCount = 0;
-        this.IsExited = false;
+        this._startCommand = new DelegateCommand();
+        this._settingsCommand = new DelegateCommand();
+        this._exitCommand = new DelegateCommand();
+        this._startCommand.SetExecuteFunc(this.Start);
+        this._settingsCommand.SetExecuteFunc(this.Settings);
+        this._exitCommand.SetExecuteFunc(this.Exit);
+
+        this.Reset();
     }
 
     public void Start()
@@ -58,54 +68,20 @@ public class ViewModel
 [Observable]
 public partial class MainWindow
 {
-    public ViewModel ViewModel { get; set; }
+    public ViewModel DataContext { get; set; } = null;
+    public ViewModel ViewModel { get { return this.DataContext; } }
 
     public MainWindow()
     {
-        this.ViewModel = new ViewModel();
+        Application_SetResources("Resources.xaml");
+        this.InitializeComponent();
+
+        this.DataContext = new ViewModel();
+        this.SetDataContext<ViewModel>(this.DataContext);
     }
 
     public void OnInitialized()
     {
-    }
-
-    public void Start()
-    {
-        if (this.ViewModel != null)
-        {
-            this.ViewModel.Start();
-        }
-    }
-
-    public void Settings()
-    {
-        if (this.ViewModel != null)
-        {
-            this.ViewModel.Settings();
-        }
-    }
-
-    public void Exit()
-    {
-        if (this.ViewModel != null)
-        {
-            this.ViewModel.Exit();
-        }
-    }
-
-    public void StartCommand()
-    {
-        this.Start();
-    }
-
-    public void SettingsCommand()
-    {
-        this.Settings();
-    }
-
-    public void ExitCommand()
-    {
-        this.Exit();
     }
 
     public void PlayIntro()

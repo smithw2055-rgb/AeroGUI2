@@ -39,6 +39,12 @@ struct LiveBindingEngineRegistry {
         engines.erase(std::remove(engines.begin(), engines.end(), eng), engines.end());
     }
 
+    [[nodiscard]] bool Contains(const DualTrackBindingEngine* eng) noexcept {
+        if (!eng) return false;
+        std::lock_guard<std::mutex> lock(mutex);
+        return std::find(engines.begin(), engines.end(), eng) != engines.end();
+    }
+
     template <typename Fn>
     void ForEachLocked(Fn&& fn) noexcept {
         std::lock_guard<std::mutex> lock(mutex);
@@ -98,6 +104,20 @@ struct LiveBindingEngineRegistry {
             return UnifiedValue{elem->IsFocused()};
         case PropId_TriggerIsKeyboardFocusWithin:
             return UnifiedValue{HasFocusedChildRecursive(elem)};
+        case PropId_Content: {
+            const UnifiedValue v = elem->GetValue(PropId_Content);
+            if (!std::holds_alternative<std::monostate>(v)) {
+                return v;
+            }
+            return elem->GetValue(PropId_Text);
+        }
+        case PropId_Text: {
+            const UnifiedValue v = elem->GetValue(PropId_Text);
+            if (!std::holds_alternative<std::monostate>(v)) {
+                return v;
+            }
+            return elem->GetValue(PropId_Content);
+        }
         default:
             return elem->GetValue(propId);
     }
@@ -435,6 +455,10 @@ DualTrackBindingEngine::DualTrackBindingEngine(
     rs_rt::registerExternalValuePoolRootMarker(this, [this]() {
         MarkValuesInPools();
     });
+}
+
+bool DualTrackBindingEngine::IsLiveInstance(const DualTrackBindingEngine* engine) noexcept {
+    return LiveBindingEngineRegistry::Instance().Contains(engine);
 }
 
 DualTrackBindingEngine::~DualTrackBindingEngine() noexcept {

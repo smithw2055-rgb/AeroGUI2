@@ -3348,6 +3348,9 @@ void VisitPackageValues(const AxbPackage& pkg, Fn&& fn) noexcept {
             visitInteractionActions(trig.exitActions);
         }
         for (const auto& et : ct.eventTriggers) {
+            for (const auto& cond : et.conditions) {
+                if (cond.expectedValue.isTraceable()) fn(cond.expectedValue);
+            }
             visitStoryboards(et.storyboards);
             visitInteractionActions(et.actions);
         }
@@ -3386,6 +3389,9 @@ void VisitPackageValues(const AxbPackage& pkg, Fn&& fn) noexcept {
             visitInteractionActions(trig.exitActions);
         }
         for (const auto& et : st.eventTriggers) {
+            for (const auto& cond : et.conditions) {
+                if (cond.expectedValue.isTraceable()) fn(cond.expectedValue);
+            }
             visitStoryboards(et.storyboards);
             visitInteractionActions(et.actions);
         }
@@ -3475,22 +3481,116 @@ bool AxbPackage::BindAgainstProgram(
         return 0;
     };
 
+    fieldsOwnerTypeId = 0;
+    rootHandleFieldIndex = PropertySlotHandle::InvalidIndex;
+    for (auto& nc : namedControls) {
+        nc.fieldIndexInClass = PropertySlotHandle::InvalidIndex;
+    }
+
+    const std::string effectiveWrapperClassName = !className.empty()
+        ? className
+        : hostWrapperClassName;
+    const SymbolId ownClassTypeId = !className.empty()
+        ? resolveTypeIdByName(className)
+        : 0;
+    const rs_sem::TypeSymbol* preOwnClassSym =
+        (ownClassTypeId != 0) ? program.resolveType(ownClassTypeId) : nullptr;
+
+    auto inferDataContextTypeFromXClass = [&](const rs_sem::TypeSymbol* clsSym) -> std::string {
+        if (!clsSym) {
+            return {};
+        }
+        // 1. Inspect SetDataContext<T> specialization generated on this x:Class!
+        for (const auto& m : clsSym->methods) {
+            const std::string_view mName = m.name;
+            if (mName.rfind("SetDataContext__", 0) == 0 && m.parameters.size() >= 2u) {
+                const std::string& dcParamType = m.parameters[1].typeName;
+                if (!dcParamType.empty() && resolveTypeIdByName(dcParamType) != 0) {
+                    return dcParamType;
+                }
+            }
+        }
+        // 2. Inspect Aero.UI::GUI_SetDataContext__<Owner>__<TContext> in compiled modules
+        for (const auto& mod : program.modules()) {
+            for (const auto& fn : mod.functions) {
+                if ((fn.name.find("GUI_SetDataContext__") != std::string::npos || fn.name.find("__Aero_SetDataContext__") != std::string::npos) &&
+                    fn.parameterTypeIds.size() >= 2u &&
+                    fn.parameterTypeIds[0] == clsSym->id &&
+                    fn.parameterTypeIds[1] != 0) {
+                    if (const auto* dcTs = program.resolveType(fn.parameterTypeIds[1])) {
+                        return dcTs->moduleName.empty()
+                            ? dcTs->name
+                            : (dcTs->moduleName + "::" + dcTs->name);
+                    }
+                }
+            }
+        }
+        // 3. Inspect DataContext / ViewModel property or field on x:Class
+        for (const auto& pr : clsSym->properties) {
+            if ((pr.name == "DataContext" || pr.name == "ViewModel") &&
+                !pr.typeName.empty() && resolveTypeIdByName(pr.typeName) != 0) {
+                return pr.typeName;
+            }
+        }
+        for (const auto& fl : clsSym->fields) {
+            if ((fl.name == "DataContext" || fl.name == "ViewModel" ||
+                 fl.name == "_dataContext" || fl.name == "_viewModel" ||
+                 fl.name == "_ViewModel" || fl.name == "<ViewModel>k__BackingField" ||
+                 fl.name == "<DataContext>k__BackingField") &&
+                !fl.typeName.empty() && resolveTypeIdByName(fl.typeName) != 0) {
+                return fl.typeName;
+            }
+        }
+        // 4. Same-module ViewModel fallback if x:Class doesn't directly declare bound properties
+        if (!clsSym->moduleName.empty()) {
+            const std::string candVm = clsSym->moduleName + "::ViewModel";
+            const SymbolId vmTid = resolveTypeIdByName(candVm);
+            if (vmTid != 0 && vmTid != clsSym->id) {
+                bool clsHasFirstHop = false;
+                for (const auto& ch : bindingChains) {
+                    if (!ch.hops.empty() && ch.elementName.empty() && !ch.relativeSelf &&
+                        ch.relativeAncestorType.empty() &&
+                        domains->resolvePropertySlot(program, clsSym->id, ch.hops[0].memberName).has_value()) {
+                        clsHasFirstHop = true;
+                        break;
+                    }
+                }
+                if (!clsHasFirstHop) {
+                    return candVm;
+                }
+            }
+        }
+        return {};
+    };
+
+    if (rootDataTypeOverride.empty() && rootDataTypeName.empty() && preOwnClassSym) {
+        const std::string inferredDc = inferDataContextTypeFromXClass(preOwnClassSym);
+        if (!inferredDc.empty()) {
+            rootDataTypeName = inferredDc;
+        }
+    }
+
     const std::string effectiveDataTypeName = !rootDataTypeOverride.empty()
         ? std::string(rootDataTypeOverride)
         : (!rootDataTypeName.empty() ? rootDataTypeName : className);
 
-    const SymbolId wrapperTypeId = !className.empty()
-        ? resolveTypeIdByName(className)
+    const SymbolId wrapperTypeId = !effectiveWrapperClassName.empty()
+        ? resolveTypeIdByName(effectiveWrapperClassName)
         : 0;
     const SymbolId dataTypeId = !effectiveDataTypeName.empty()
         ? resolveTypeIdByName(effectiveDataTypeName)
-        : wrapperTypeId;
+        : ownClassTypeId;
 
+    const rs_sem::TypeSymbol* ownClassTypeSym =
+        (ownClassTypeId != 0) ? program.resolveType(ownClassTypeId) : nullptr;
     const rs_sem::TypeSymbol* wrapperTypeSym =
         (wrapperTypeId != 0) ? program.resolveType(wrapperTypeId) : nullptr;
     const rs_sem::TypeSymbol* dataTypeSym =
         (dataTypeId != 0) ? program.resolveType(dataTypeId) : nullptr;
-    const rs_sem::TypeSymbol* fieldsOwnerSym = wrapperTypeSym ? wrapperTypeSym : dataTypeSym;
+    // Nested DataTemplate / ControlTemplate sub-packages do NOT own MainWindow's x:Class fields!
+    const rs_sem::TypeSymbol* fieldsOwnerSym = ownClassTypeSym
+        ? ownClassTypeSym
+        : (hostWrapperClassName.empty() ? dataTypeSym : nullptr);
 
     auto findMethodOnTypeHierarchy = [&](const rs_sem::TypeSymbol* startSym,
                                          std::string_view methodName) -> SymbolId {
@@ -3521,10 +3621,12 @@ bool AxbPackage::BindAgainstProgram(
         return 0;
     };
 
-    // 1. Bind __nativeRootHandle and x:Name control field indices ALWAYS on MainWindow (wrapperTypeSym) when present
+    // 1. Bind __nativeRootHandle and x:Name control field indices ONLY when the field is a 'handle' on fieldsOwnerSym
     if (fieldsOwnerSym) {
+        fieldsOwnerTypeId = fieldsOwnerSym->id;
         for (std::size_t fIdx = 0; fIdx < fieldsOwnerSym->fields.size(); ++fIdx) {
-            if (fieldsOwnerSym->fields[fIdx].name == "__nativeRootHandle") {
+            if (fieldsOwnerSym->fields[fIdx].name == "__nativeRootHandle" &&
+                fieldsOwnerSym->fields[fIdx].type == rs_sem::PrimitiveType::Handle) {
                 rootHandleFieldIndex = static_cast<std::uint32_t>(fIdx);
                 break;
             }
@@ -3534,7 +3636,8 @@ bool AxbPackage::BindAgainstProgram(
                 continue;
             }
             for (std::size_t fIdx = 0; fIdx < fieldsOwnerSym->fields.size(); ++fIdx) {
-                if (fieldsOwnerSym->fields[fIdx].name == nc.name) {
+                if (fieldsOwnerSym->fields[fIdx].name == nc.name &&
+                    fieldsOwnerSym->fields[fIdx].type == rs_sem::PrimitiveType::Handle) {
                     nc.fieldIndexInClass = static_cast<std::uint32_t>(fIdx);
                     break;
                 }
@@ -3654,11 +3757,47 @@ bool AxbPackage::BindAgainstProgram(
         }
     };
 
-    // 2. Bind event handler method SymbolIds: check MainWindow (wrapperTypeSym) FIRST, then ViewModel / sub-object path
+    auto typeHasCommandPropertyOrField = [&](const rs_sem::TypeSymbol* startSym, std::string_view propName) -> bool {
+        if (!startSym || propName.empty()) return false;
+        const rs_sem::TypeSymbol* walk = startSym;
+        for (std::uint32_t d = 0u; walk && d < 16u; ++d) {
+            auto isCmdType = [&](const std::string& tn) -> bool {
+                if (tn.empty()) return false;
+                if (tn.find("DelegateCommand") != std::string::npos || tn.find("ICommand") != std::string::npos) {
+                    return true;
+                }
+                const SymbolId tid = resolveTypeIdByName(tn);
+                if (const auto* ts = (tid != 0) ? program.resolveType(tid) : nullptr) {
+                    for (const auto& m : ts->methods) {
+                        if (m.name == "Execute") return true;
+                    }
+                }
+                return false;
+            };
+            for (const auto& pr : walk->properties) {
+                if (pr.name == propName && isCmdType(pr.typeName)) return true;
+            }
+            for (const auto& fl : walk->fields) {
+                if (fl.name == propName && isCmdType(fl.typeName)) return true;
+            }
+            walk = (walk->baseTypeId != 0 && walk->baseTypeId != walk->id)
+                ? program.resolveType(walk->baseTypeId)
+                : nullptr;
+        }
+        return false;
+    };
+
+    // 2. Bind event handler method SymbolIds: check MainWindow (wrapperTypeSym) FIRST (unless Command binds to ICommand property on DataContext!), then ViewModel / sub-object path
     if (wrapperTypeSym || dataTypeSym) {
         for (auto& ev : eventBindings) {
+            ev.handlerSymbolId = 0;
             ev.targetIsWrapper = false;
             ev.prefixHops.clear();
+            if (ev.eventName == "Command" && dataTypeSym && ev.handlerMethodName.find('.') == std::string::npos &&
+                typeHasCommandPropertyOrField(dataTypeSym, ev.handlerMethodName)) {
+                // Leave handlerSymbolId == 0 so runtime Button dispatches DelegateCommand / ICommand on DataContext!
+                continue;
+            }
             if (wrapperTypeSym && ev.handlerMethodName.find('.') == std::string::npos) {
                 const SymbolId mId = findMethodOnTypeHierarchy(wrapperTypeSym, ev.handlerMethodName);
                 if (mId != 0) {
@@ -3874,9 +4013,12 @@ bool AxbPackage::BindAgainstProgram(
             leafCmd = leafCmd.substr(dot + 1u);
         }
 
-        // Check MainWindow (wrapperTypeSym) FIRST for single-hop InvokeCommandAction!
+        // Check DataContext ICommand/DelegateCommand property FIRST, else MainWindow (wrapperTypeSym) for single-hop InvokeCommandAction!
+        act.commandMethodSymbolId = 0;
         act.commandTargetsWrapper = false;
-        if (wrapperTypeSym && act.commandHops.size() <= 1u && !leafCmd.empty()) {
+        const bool dcHasCmdProp = (dataTypeSym && act.commandHops.size() <= 1u && !leafCmd.empty() &&
+                                   typeHasCommandPropertyOrField(dataTypeSym, leafCmd));
+        if (!dcHasCmdProp && wrapperTypeSym && act.commandHops.size() <= 1u && !leafCmd.empty()) {
             const SymbolId wrapperMethodId = findMethodOnTypeHierarchy(wrapperTypeSym, leafCmd);
             if (wrapperMethodId != 0) {
                 act.commandMethodSymbolId = wrapperMethodId;
@@ -4016,13 +4158,30 @@ bool AxbPackage::BindAgainstProgram(
             }
         }
         for (auto& et : ct.eventTriggers) {
+            for (auto& cond : et.conditions) {
+                SymbolId dummyBack = 0;
+                resolveConverterSymbols(
+                    cond.converter,
+                    cond.converterKey,
+                    cond.converterSymbolId,
+                    dummyBack);
+                for (auto& h : cond.compiledHops) {
+                    normalizeHopIndexedName(h);
+                }
+                if (dataTypeId != 0 &&
+                    cond.sourceKind == TriggerConditionSource::DataContextBinding &&
+                    !cond.compiledHops.empty()) {
+                    bindHopVector(cond.compiledHops, dataTypeId);
+                    bindConditionEnumLiteral(cond);
+                }
+            }
             for (auto& act : et.actions) {
                 bindActionCommand(act);
             }
         }
         if (ct.templatePackage) {
-            if (ct.templatePackage->className.empty() && !className.empty()) {
-                ct.templatePackage->className = className;
+            if (ct.templatePackage->className.empty() && !effectiveWrapperClassName.empty()) {
+                ct.templatePackage->hostWrapperClassName = effectiveWrapperClassName;
             }
             (void)ct.templatePackage->BindAgainstProgram(program, effectiveDataTypeName, domains);
         }
@@ -4058,6 +4217,23 @@ bool AxbPackage::BindAgainstProgram(
             }
         }
         for (auto& et : style.eventTriggers) {
+            for (auto& cond : et.conditions) {
+                SymbolId dummyBack = 0;
+                resolveConverterSymbols(
+                    cond.converter,
+                    cond.converterKey,
+                    cond.converterSymbolId,
+                    dummyBack);
+                for (auto& h : cond.compiledHops) {
+                    normalizeHopIndexedName(h);
+                }
+                if (dataTypeId != 0 &&
+                    cond.sourceKind == TriggerConditionSource::DataContextBinding &&
+                    !cond.compiledHops.empty()) {
+                    bindHopVector(cond.compiledHops, dataTypeId);
+                    bindConditionEnumLiteral(cond);
+                }
+            }
             for (auto& act : et.actions) {
                 bindActionCommand(act);
             }
@@ -4067,11 +4243,11 @@ bool AxbPackage::BindAgainstProgram(
         }
     }
 
-    // 5. Bind nested DataTemplate & ControlTemplate sub-packages (propagating MainWindow className for wrapper commands!)
+    // 5. Bind nested DataTemplate & ControlTemplate sub-packages (propagating hostWrapperClassName for wrapper commands without clobbering className!)
     for (auto& dt : dataTemplates) {
         if (dt.templatePackage) {
-            if (dt.templatePackage->className.empty() && !className.empty()) {
-                dt.templatePackage->className = className;
+            if (dt.templatePackage->className.empty() && !effectiveWrapperClassName.empty()) {
+                dt.templatePackage->hostWrapperClassName = effectiveWrapperClassName;
             }
             const std::string subDataType = !dt.dataTypeName.empty()
                 ? dt.dataTypeName
@@ -4111,7 +4287,7 @@ bool AxbPackage::HasP14Section() const noexcept {
             }
         }
         for (const auto& et : st.eventTriggers) {
-            if (!et.actions.empty()) {
+            if (!et.actions.empty() || !et.conditions.empty()) {
                 return true;
             }
         }
@@ -4130,7 +4306,7 @@ bool AxbPackage::HasP14Section() const noexcept {
             }
         }
         for (const auto& et : ct.eventTriggers) {
-            if (!et.actions.empty()) {
+            if (!et.actions.empty() || !et.conditions.empty()) {
                 return true;
             }
         }
@@ -4757,6 +4933,24 @@ std::vector<std::uint8_t> AxbPackage::Serialize() const {
             }
         };
 
+        auto writeFullConditionList = [&](const std::vector<AxbTriggerCondition>& conds) {
+            WriteU32(out, static_cast<std::uint32_t>(conds.size()));
+            for (const auto& cond : conds) {
+                WriteU16(out, cond.propId);
+                WriteValue(out, cond.expectedValue);
+                WriteU8(out, static_cast<std::uint8_t>(cond.sourceKind));
+                WriteU8(out, static_cast<std::uint8_t>(cond.converter));
+                WriteU8(out, cond.expectNull ? 1u : 0u);
+                WriteString(out, cond.sourceName);
+                WriteString(out, cond.bindingPath);
+                writeHopVec(cond.compiledHops);
+                WriteU8(out, static_cast<std::uint8_t>(cond.comparison));
+                WriteString(out, cond.converterKey);
+                WriteString(out, cond.converterParameter);
+                WriteU64(out, cond.converterSymbolId);
+            }
+        };
+
         // 1. P1-4 extensions on top-level bindingChains
         WriteU32(out, static_cast<std::uint32_t>(bindingChains.size()));
         for (const auto& ch : bindingChains) {
@@ -4796,6 +4990,7 @@ std::vector<std::uint8_t> AxbPackage::Serialize() const {
             WriteU32(out, static_cast<std::uint32_t>(st.eventTriggers.size()));
             for (const auto& et : st.eventTriggers) {
                 writeActionList(et.actions);
+                writeFullConditionList(et.conditions);
             }
         }
 
@@ -4818,6 +5013,7 @@ std::vector<std::uint8_t> AxbPackage::Serialize() const {
             WriteU32(out, static_cast<std::uint32_t>(ct.eventTriggers.size()));
             for (const auto& et : ct.eventTriggers) {
                 writeActionList(et.actions);
+                writeFullConditionList(et.conditions);
             }
         }
     }
@@ -5228,7 +5424,7 @@ bool DeserializeAxbPackageWithDepth(
             constexpr std::uint8_t kMaxConditionSourceRaw =
                 static_cast<std::uint8_t>(TriggerConditionSource::AncestorProperty);
             constexpr std::uint8_t kMaxRoutedEventRaw =
-                static_cast<std::uint8_t>(RoutedTriggerEvent::ValueChanged);
+                static_cast<std::uint8_t>(RoutedTriggerEvent::PropertyChanged);
 
             std::uint32_t bcExtCount = 0;
             if (!r.ReadU32(bcExtCount) || bcExtCount != pkg.bindingChains.size()) {
@@ -5628,7 +5824,7 @@ bool DeserializeAxbPackageWithDepth(
         constexpr std::uint8_t kMaxCtpCondSrcRaw =
             static_cast<std::uint8_t>(TriggerConditionSource::AncestorProperty);
         constexpr std::uint8_t kMaxCtpRoutedEventRaw =
-            static_cast<std::uint8_t>(RoutedTriggerEvent::ValueChanged);
+            static_cast<std::uint8_t>(RoutedTriggerEvent::PropertyChanged);
 
         auto readCtpSetterList = [&](std::vector<AxbPropertySetter>& setters) -> bool {
             std::uint32_t sc = 0;
@@ -5980,6 +6176,40 @@ bool DeserializeAxbPackageWithDepth(
             return true;
         };
 
+        auto readFullConditionList = [&](std::vector<AxbTriggerCondition>& conds) -> bool {
+            std::uint32_t condCount = 0u;
+            if (!r.ReadU32(condCount) || condCount > (r.size - r.offset) / 16u) {
+                return false;
+            }
+            conds.resize(condCount);
+            for (std::uint32_t ci = 0u; ci < condCount; ++ci) {
+                auto& cond = conds[ci];
+                std::uint8_t sk = 0u, cv = 0u, expNull = 0u, cmpRaw = 0u;
+                if (!r.ReadU16(cond.propId) ||
+                    !r.ReadValue(cond.expectedValue) ||
+                    !r.ReadU8(sk) ||
+                    !r.ReadU8(cv) ||
+                    !r.ReadU8(expNull) ||
+                    sk > static_cast<std::uint8_t>(TriggerConditionSource::AncestorProperty) ||
+                    cv > static_cast<std::uint8_t>(ValueConverterKind::CustomScriptOrHost) ||
+                    !r.ReadString(cond.sourceName) ||
+                    !r.ReadString(cond.bindingPath) ||
+                    !readHopVec(cond.compiledHops) ||
+                    !r.ReadU8(cmpRaw) ||
+                    cmpRaw > static_cast<std::uint8_t>(TriggerComparisonOp::GreaterThanOrEqual) ||
+                    !r.ReadString(cond.converterKey) ||
+                    !r.ReadString(cond.converterParameter) ||
+                    !r.ReadU64(cond.converterSymbolId)) {
+                    return false;
+                }
+                cond.sourceKind = static_cast<TriggerConditionSource>(sk);
+                cond.converter = static_cast<ValueConverterKind>(cv);
+                cond.expectNull = (expNull != 0u);
+                cond.comparison = static_cast<TriggerComparisonOp>(cmpRaw);
+            }
+            return true;
+        };
+
         std::uint32_t bcP14Count = 0u;
         if (!r.ReadU32(bcP14Count) || bcP14Count != pkg.bindingChains.size()) {
             return failStcSection("corrupted AXB4 AP14 bindingChains header");
@@ -6056,7 +6286,8 @@ bool DeserializeAxbPackageWithDepth(
                 return failStcSection("corrupted AXB4 AP14 eventTriggers header");
             }
             for (std::uint32_t ei = 0u; ei < etP14Count; ++ei) {
-                if (!readActionList(st.eventTriggers[ei].actions)) {
+                if (!readActionList(st.eventTriggers[ei].actions) ||
+                    !readFullConditionList(st.eventTriggers[ei].conditions)) {
                     return failStcSection("corrupted AXB4 AP14 eventTrigger action list");
                 }
             }
@@ -6103,7 +6334,8 @@ bool DeserializeAxbPackageWithDepth(
                 return failStcSection("corrupted AXB4 AP14 controlTemplate eventTriggers header");
             }
             for (std::uint32_t ei = 0u; ei < etP14Count; ++ei) {
-                if (!readActionList(ct.eventTriggers[ei].actions)) {
+                if (!readActionList(ct.eventTriggers[ei].actions) ||
+                    !readFullConditionList(ct.eventTriggers[ei].conditions)) {
                     return failStcSection("corrupted AXB4 AP14 controlTemplate eventTrigger action list");
                 }
             }

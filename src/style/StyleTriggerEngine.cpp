@@ -1,6 +1,7 @@
 #include "aero/style/StyleTriggerEngine.hpp"
 
 #include <algorithm>
+#include <mutex>
 #include <cctype>
 #include <charconv>
 #include <cmath>
@@ -30,6 +31,9 @@ namespace {
     std::string_view wantedType) noexcept {
     if (!anc || wantedType.empty()) {
         return false;
+    }
+    if (!anc->DeclaredTypeName().empty() && anc->DeclaredTypeName() == wantedType) {
+        return true;
     }
     for (const TypeClass* tc = anc->GetTypeClass(); tc != nullptr; tc = tc->baseClass) {
         if (tc->typeName && ShortTypeNameView(tc->typeName) == wantedType) {
@@ -127,6 +131,11 @@ namespace {
     if (const auto* as = std::get_if<StringValue>(&a)) {
         if (const auto* bs = std::get_if<StringValue>(&b)) {
             return as->view() == bs->view();
+        }
+    }
+    if (const auto* ao = std::get_if<ObjectRef>(&a)) {
+        if (const auto* bo = std::get_if<ObjectRef>(&b)) {
+            return *ao == *bo;
         }
     }
     return a.index() == b.index() && std::holds_alternative<std::monostate>(a);
@@ -695,10 +704,43 @@ void VisitStyleValues(const AxbStyleDefinition& st, Fn&& fn) noexcept {
 
 } // namespace
 
+namespace {
+struct LiveStyleEngineRegistry {
+    std::mutex mutex;
+    std::vector<const StyleTriggerEngine*> engines;
+
+    static LiveStyleEngineRegistry& Instance() noexcept {
+        static LiveStyleEngineRegistry reg;
+        return reg;
+    }
+
+    void Register(const StyleTriggerEngine* eng) {
+        if (!eng) return;
+        std::lock_guard<std::mutex> lock(mutex);
+        if (std::find(engines.begin(), engines.end(), eng) == engines.end()) {
+            engines.push_back(eng);
+        }
+    }
+
+    void Unregister(const StyleTriggerEngine* eng) noexcept {
+        if (!eng) return;
+        std::lock_guard<std::mutex> lock(mutex);
+        engines.erase(std::remove(engines.begin(), engines.end(), eng), engines.end());
+    }
+
+    [[nodiscard]] bool Contains(const StyleTriggerEngine* eng) noexcept {
+        if (!eng) return false;
+        std::lock_guard<std::mutex> lock(mutex);
+        return std::find(engines.begin(), engines.end(), eng) != engines.end();
+    }
+};
+} // namespace
+
 StyleTriggerEngine::StyleTriggerEngine(
     AnimationEngine* animationEngine,
     DualTrackBindingEngine* bindingEngine)
     : animationEngine_(animationEngine) {
+    LiveStyleEngineRegistry::Instance().Register(this);
     SetBindingEngine(bindingEngine);
     rs_rt::registerExternalValuePoolRootMarker(this, [this]() {
         MarkValuesInPools();
@@ -706,12 +748,17 @@ StyleTriggerEngine::StyleTriggerEngine(
 }
 
 StyleTriggerEngine::~StyleTriggerEngine() noexcept {
+    LiveStyleEngineRegistry::Instance().Unregister(this);
     rs_rt::unregisterExternalValuePoolRootMarker(this);
     for (auto& inst : instances_) {
         if (inst.element && inst.element->BoundStyleEngine() == this) {
             inst.element->BindStyleEngine(nullptr);
         }
     }
+}
+
+bool StyleTriggerEngine::IsLiveInstance(const StyleTriggerEngine* engine) noexcept {
+    return LiveStyleEngineRegistry::Instance().Contains(engine);
 }
 
 void StyleTriggerEngine::MarkValuesInPools() const noexcept {
@@ -747,6 +794,11 @@ void StyleTriggerEngine::MarkValuesInPools() const noexcept {
         for (const auto& slot : inst.propertySnapshots) {
             if (slot.captured && slot.hadBaseValue && slot.baseValue.isTraceable()) {
                 rs_rt::markValueInPools(slot.baseValue);
+            }
+        }
+        for (const auto& es : inst.eventStates) {
+            if (es.prevWatchedValue.isTraceable()) {
+                rs_rt::markValueInPools(es.prevWatchedValue);
             }
         }
     }
@@ -1207,14 +1259,18 @@ std::size_t StyleTriggerEngine::BindSubtreeStyles(
             attachedHere = true;
         }
     } else if (applyImplicitTypeStyles) {
-        const char* fullTypeName = rootElement->GetTypeClass()->typeName;
-        if (fullTypeName) {
-            if (const AxbStyleDefinition* imp = FindImplicitStyle(ShortTypeNameView(fullTypeName))) {
-                if (AttachStyle(rootElement, *imp)) {
-                    ++attachedCount;
-                    attachedHere = true;
-                }
+        const AxbStyleDefinition* imp = nullptr;
+        if (!rootElement->DeclaredTypeName().empty()) {
+            imp = FindImplicitStyle(rootElement->DeclaredTypeName());
+        }
+        if (!imp) {
+            if (const char* fullTypeName = rootElement->GetTypeClass()->typeName) {
+                imp = FindImplicitStyle(ShortTypeNameView(fullTypeName));
             }
+        }
+        if (imp && AttachStyle(rootElement, *imp)) {
+            ++attachedCount;
+            attachedHere = true;
         }
     }
 
@@ -1804,6 +1860,241 @@ namespace {
 
 } // namespace
 
+[[nodiscard]] bool TryInvokeCommandObjectOnOwner(
+    ExecutionDomainContext* domains,
+    const ProgramImage* prog,
+    const Interpreter* interp,
+    rs_aot::ExecutionContext* aotCtx,
+    ObjectRef ownerObj,
+    std::string_view propName,
+    const UnifiedValue& rawParam,
+    bool hasParam) {
+    if (!domains || !prog || !ownerObj.valid() || propName.empty()) {
+        return false;
+    }
+    auto* ownerHeap = domains->heapForObject(ownerObj);
+    if (!ownerHeap || !ownerHeap->isAlive(ownerObj)) {
+        return false;
+    }
+    const SymbolId ownerTid = ownerHeap->objectTypeId(ownerObj).value_or(0);
+    if (ownerTid == 0) {
+        return false;
+    }
+
+    ObjectRef cmdObj{};
+    if (const auto slot = domains->resolvePropertySlot(*prog, ownerTid, propName)) {
+        UnifiedValue v{};
+        if (domains->readPropertySlotFast(DomainKind::Ui, ownerObj, *slot, v, nullptr, interp)) {
+            if (const auto* r = std::get_if<ObjectRef>(&v); r && r->valid()) {
+                cmdObj = *r;
+            }
+        }
+    }
+    if (!cmdObj.valid()) {
+        SymbolId walkTid = ownerTid;
+        for (int d = 0; d < 16 && walkTid != 0 && !cmdObj.valid(); ++d) {
+            const auto* ts = prog->resolveType(walkTid);
+            if (!ts) break;
+            std::string privName = "_";
+            privName.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(propName[0]))));
+            privName.append(propName.substr(1));
+            for (const auto& f : ts->fields) {
+                if (f.name == propName || f.name == privName ||
+                    f.name == ("<" + std::string(propName) + ">k__BackingField")) {
+                    UnifiedValue fv{};
+                    if (domains->readObjectField(DomainKind::Ui, ownerObj, f.index, fv)) {
+                        if (const auto* r = std::get_if<ObjectRef>(&fv); r && r->valid()) {
+                            cmdObj = *r;
+                            break;
+                        }
+                    }
+                }
+            }
+            if (!cmdObj.valid()) {
+                const std::string getterName = "get_" + std::string(propName);
+                const std::string cGetterName = "Get" + std::string(propName);
+                for (const auto& m : ts->methods) {
+                    if ((m.name == getterName || m.name == cGetterName) && !m.staticMethod && m.parameters.size() == 1u && m.id != 0) {
+                        if (interp) {
+                            rs_rt::ExecutionOptions gOpts{};
+                            gOpts.limits.instructionBudget = 1'000'000;
+                            const auto gRes = interp->invoke(m.id, {ownerObj}, gOpts);
+                            if (gRes.succeeded) {
+                                if (const auto* r = std::get_if<ObjectRef>(&gRes.value); r && r->valid()) {
+                                    cmdObj = *r;
+                                    break;
+                                }
+                            }
+                        } else if (aotCtx) {
+                            UnifiedValue arg0 = ownerObj;
+                            UnifiedValue ret{};
+                            if (aotCtx->invoke(m.id, &arg0, 1u, ret)) {
+                                if (const auto* r = std::get_if<ObjectRef>(&ret); r && r->valid()) {
+                                    cmdObj = *r;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            walkTid = ts->baseTypeId;
+        }
+    }
+    if (!cmdObj.valid()) {
+        return false;
+    }
+    auto* cmdHeap = domains->heapForObject(cmdObj);
+    if (!cmdHeap || !cmdHeap->isAlive(cmdObj)) {
+        return false;
+    }
+    const SymbolId cmdTid = cmdHeap->objectTypeId(cmdObj).value_or(0);
+    const auto* cmdTs = (cmdTid != 0) ? prog->resolveType(cmdTid) : nullptr;
+    if (!cmdTs) {
+        return false;
+    }
+
+    // Check which active delegate field is populated on DelegateCommand (if applicable)
+    auto hasNonNullField = [&](std::string_view fn) -> bool {
+        for (const auto& f : cmdTs->fields) {
+            if (f.name == fn) {
+                UnifiedValue v{};
+                if (domains->readObjectField(DomainKind::Ui, cmdObj, f.index, v)) {
+                    if (const auto* r = std::get_if<ObjectRef>(&v); r && r->valid() && cmdHeap->isAlive(*r)) {
+                        return true;
+                    }
+                }
+                return false;
+            }
+        }
+        return false;
+    };
+
+    const bool hasExecInt = hasNonNullField("_execInt");
+    const bool hasExecStr = hasNonNullField("_execStr");
+    const bool hasExecHandle = hasNonNullField("_execHandle");
+    const bool hasExec0 = hasNonNullField("_exec0");
+
+    auto findExecMethod = [&](rs_sem::PrimitiveType expectedParamType, bool zeroArg) -> SymbolId {
+        SymbolId walk = cmdTid;
+        for (int d = 0; d < 16 && walk != 0; ++d) {
+            const auto* ts = prog->resolveType(walk);
+            if (!ts) break;
+            for (const auto& m : ts->methods) {
+                if (m.name != "Execute" || m.staticMethod || m.id == 0) continue;
+                if (zeroArg && m.parameters.size() == 1u) return m.id;
+                if (!zeroArg && m.parameters.size() == 2u && m.parameters[1].type == expectedParamType) {
+                    return m.id;
+                }
+            }
+            walk = ts->baseTypeId;
+        }
+        return 0;
+    };
+
+    auto invokeCmdMethod = [&](SymbolId mSym, const std::vector<UnifiedValue>& callArgs) -> bool {
+        if (mSym == 0) return false;
+        if (interp) {
+            rs_rt::ExecutionOptions opts{};
+            opts.limits.instructionBudget = 5'000'000;
+            return interp->invoke(mSym, callArgs, opts).succeeded;
+        }
+        if (aotCtx) {
+            UnifiedValue ret{};
+            return aotCtx->invoke(mSym, callArgs.data(), callArgs.size(), ret);
+        }
+        return false;
+    };
+
+    auto coerceIntParam = [&](const UnifiedValue& p) -> std::int64_t {
+        std::int64_t iv = 0;
+        if (p.tryGetInt64(iv)) return iv;
+        EnumValue ev{};
+        if (p.tryGetEnum(ev)) return ev.value;
+        float fv = 0.0f;
+        if (TryGetFloat(p, fv)) return static_cast<std::int64_t>(std::llround(fv));
+        if (const auto* sv = std::get_if<StringValue>(&p)) {
+            const std::string_view v = sv->view();
+            const auto [ptr, ec] = std::from_chars(v.data(), v.data() + v.size(), iv);
+            if (ec == std::errc{} && ptr == v.data() + v.size()) return iv;
+            for (const auto& mod : prog->modules()) {
+                for (const auto& ets : mod.types) {
+                    if (ets.kind == rs_sem::TypeKind::Enum &&
+                        TryResolveEnumMemberByName(prog, ets.id, v, iv)) {
+                        return iv;
+                    }
+                }
+            }
+        }
+        if (const auto* sref = std::get_if<ObjectRef>(&p); sref && sref->valid()) {
+            if (const auto sv = domains->stringViewAcrossDomains(*sref)) {
+                const auto [ptr, ec] = std::from_chars(sv->data(), sv->data() + sv->size(), iv);
+                if (ec == std::errc{} && ptr == sv->data() + sv->size()) return iv;
+            }
+        }
+        return 0;
+    };
+
+    if (hasExecInt) {
+        const SymbolId mSym = findExecMethod(rs_sem::PrimitiveType::Int, false);
+        return invokeCmdMethod(mSym, {cmdObj, value::FromInt(hasParam ? coerceIntParam(rawParam) : 0)});
+    }
+    if (hasExecHandle) {
+        const SymbolId mSym = findExecMethod(rs_sem::PrimitiveType::Handle, false);
+        NativeHandle nh{};
+        if (hasParam) {
+            (void)rawParam.tryGetNativeHandle(nh);
+        }
+        return invokeCmdMethod(mSym, {cmdObj, UnifiedValue{nh}});
+    }
+    if (hasExecStr) {
+        const SymbolId mSym = findExecMethod(rs_sem::PrimitiveType::String, false);
+        UnifiedValue strArg{};
+        if (hasParam) {
+            if (const auto* sref = std::get_if<ObjectRef>(&rawParam); sref && sref->valid() && sref->kind == ObjectKind::String) {
+                strArg = *sref;
+            } else {
+                const std::string s = FormatBindingString({}, &rawParam, 1u, domains);
+                if (auto alloc = domains->uiHeap().allocateString(s)) strArg = *alloc;
+            }
+        } else if (auto alloc = domains->uiHeap().allocateString("")) {
+            strArg = *alloc;
+        }
+        return invokeCmdMethod(mSym, {cmdObj, strArg});
+    }
+    if (hasExec0) {
+        const SymbolId mSym = findExecMethod(rs_sem::PrimitiveType::Void, true);
+        return invokeCmdMethod(mSym, {cmdObj});
+    }
+
+    // Custom ICommand implementation (not built-in DelegateCommand)
+    if (hasParam) {
+        NativeHandle nh{};
+        if (rawParam.tryGetNativeHandle(nh)) {
+            if (const SymbolId mSym = findExecMethod(rs_sem::PrimitiveType::Handle, false)) {
+                return invokeCmdMethod(mSym, {cmdObj, UnifiedValue{nh}});
+            }
+        }
+        std::int64_t iv = 0;
+        EnumValue ev{};
+        if (rawParam.tryGetInt64(iv) || rawParam.tryGetEnum(ev)) {
+            if (const SymbolId mSym = findExecMethod(rs_sem::PrimitiveType::Int, false)) {
+                return invokeCmdMethod(mSym, {cmdObj, value::FromInt(coerceIntParam(rawParam))});
+            }
+        }
+        if (const SymbolId mSym = findExecMethod(rs_sem::PrimitiveType::String, false)) {
+            const std::string s = FormatBindingString({}, &rawParam, 1u, domains);
+            if (auto alloc = domains->uiHeap().allocateString(s)) {
+                return invokeCmdMethod(mSym, {cmdObj, *alloc});
+            }
+        }
+    }
+    if (const SymbolId mSym = findExecMethod(rs_sem::PrimitiveType::Void, true)) {
+        return invokeCmdMethod(mSym, {cmdObj});
+    }
+    return false;
+}
+
 void StyleTriggerEngine::ExecuteSingleInteractionAction(
     StyledElementInstance& inst,
     AxbInteractionAction& action) {
@@ -1945,7 +2236,16 @@ void StyleTriggerEngine::ExecuteSingleInteractionAction(
                 }
             }
 
-            (void)target->SetValue(action.propId, newVal, ValueSourceRank::Local);
+            for (auto& sInst : instances_) {
+                for (auto& slot : sInst.propertySnapshots) {
+                    if (slot.resolvedTarget.Get() == target && slot.propId == action.propId) {
+                        slot.baseValue = newVal;
+                        slot.hadBaseValue = true;
+                        slot.baseRank = ValueSourceRank::Local;
+                    }
+                }
+            }
+            (void)target->ForceEffectiveValue(action.propId, newVal, ValueSourceRank::Local);
             if (target->BoundTwoWayEngine() != nullptr) {
                 (void)target->NotifyTwoWayPropertyMutated(action.propId);
             }
@@ -2127,6 +2427,40 @@ void StyleTriggerEngine::ExecuteSingleInteractionAction(
             }
 
             if (!targetObj.valid() || methodSym == 0) {
+                UnifiedValue earlyParamVal{};
+                bool earlyHasParam = false;
+                if (action.hasCommandParameterBinding) {
+                    earlyHasParam = EvaluateRuntimeBindingOnce(
+                        elem, domains_, program_, uiInterpreter_, bindingEngine_,
+                        action.commandParameterBinding, earlyParamVal);
+                } else if (action.hasCommandParameter) {
+                    earlyParamVal = action.commandParameter;
+                    earlyHasParam = true;
+                } else {
+                    const UnifiedValue hostParam = elem->GetValue(PropId_CommandParameter);
+                    if (!std::holds_alternative<std::monostate>(hostParam)) {
+                        earlyParamVal = hostParam;
+                        earlyHasParam = true;
+                    }
+                }
+                ObjectRef cmdOwner = (action.commandHops.size() > 1u) ? targetObj : dcObj;
+                if (TryInvokeCommandObjectOnOwner(
+                        domains_, program_, uiInterpreter_, aotContext_,
+                        cmdOwner, leafName, earlyParamVal, earlyHasParam)) {
+                    if (bindingEngine_ && DualTrackBindingEngine::IsLiveInstance(bindingEngine_)) {
+                        (void)bindingEngine_->FlushTrackA();
+                    }
+                    break;
+                }
+                if (action.commandHops.size() <= 1u && wrapperObj.valid() && wrapperObj != cmdOwner &&
+                    TryInvokeCommandObjectOnOwner(
+                        domains_, program_, uiInterpreter_, aotContext_,
+                        wrapperObj, leafName, earlyParamVal, earlyHasParam)) {
+                    if (bindingEngine_ && DualTrackBindingEngine::IsLiveInstance(bindingEngine_)) {
+                        (void)bindingEngine_->FlushTrackA();
+                    }
+                    break;
+                }
                 break;
             }
 
@@ -2298,14 +2632,70 @@ bool StyleTriggerEngine::EvaluateEventTriggers(StyledElementInstance& inst) {
         auto& et = inst.resolvedStyle.eventTriggers[i];
         auto& rt = inst.eventStates[i];
 
+        if (et.eventKind == RoutedTriggerEvent::StoryboardCompleted) {
+            const AxbStoryboard* watchedSb = !et.sourceName.empty() ? FindStoryboard(et.sourceName) : nullptr;
+            bool curSbActive = false;
+            if (animationEngine_ && watchedSb) {
+                curSbActive = animationEngine_->IsStoryboardKeyActive(elem, et.sourceName, *watchedSb);
+                if (!curSbActive) {
+                    if (UIElement* scopeRoot = UIElement::FindNamescopeRoot(elem); scopeRoot && scopeRoot != elem) {
+                        curSbActive = animationEngine_->IsStoryboardKeyActive(scopeRoot, et.sourceName, *watchedSb);
+                    }
+                }
+            }
+            bool fire = false;
+            if (!rt.initialized) {
+                rt.initialized = true;
+                rt.prevStoryboardActive = curSbActive;
+            } else {
+                if (rt.prevStoryboardActive && !curSbActive) {
+                    fire = true;
+                }
+                rt.prevStoryboardActive = curSbActive;
+            }
+            if (fire && !et.conditions.empty()) {
+                for (auto& cond : et.conditions) {
+                    if (!EvaluateSingleCondition(elem, cond)) {
+                        fire = false;
+                        break;
+                    }
+                }
+            }
+            if (fire) {
+                if (animationEngine_) {
+                    for (const auto& sb : et.storyboards) {
+                        (void)animationEngine_->BeginStoryboard(elem, sb);
+                    }
+                }
+                if (!et.actions.empty()) {
+                    ExecuteInteractionActions(inst, et.actions);
+                }
+                anyFired = true;
+            }
+            continue;
+        }
+
         if (!rt.cachedSource) {
-            if (et.sourceName.empty()) {
+            std::string lookupName = et.sourceName;
+            if (et.eventKind == RoutedTriggerEvent::PropertyChanged) {
+                const auto bar = et.sourceName.find('|');
+                if (bar != std::string::npos) {
+                    lookupName = et.sourceName.substr(0u, bar);
+                    int parsedPid = 0;
+                    const std::string_view pidSv = std::string_view(et.sourceName).substr(bar + 1u);
+                    for (char ch : pidSv) {
+                        if (ch >= '0' && ch <= '9') parsedPid = parsedPid * 10 + (ch - '0');
+                    }
+                    rt.watchedPropId = static_cast<std::uint16_t>(parsedPid);
+                }
+            }
+            if (lookupName.empty()) {
                 rt.cachedSource.Reset(elem, true);
             } else {
-                UIElement* found = elem->FindName(et.sourceName);
+                UIElement* found = elem->FindName(lookupName);
                 if (!found) {
                     if (UIElement* scopeRoot = UIElement::FindNamescopeRoot(elem)) {
-                        found = scopeRoot->FindName(et.sourceName);
+                        found = scopeRoot->FindName(lookupName);
                     }
                 }
                 rt.cachedSource.Reset(found, true);
@@ -2332,7 +2722,12 @@ bool StyleTriggerEngine::EvaluateEventTriggers(StyledElementInstance& inst) {
             curSelectedIdx = *selI;
         }
         float curNumVal = 0.0f;
-        (void)TryGetFloat(src->GetValue(PropId_Value), curNumVal);
+        const std::uint16_t numericPid =
+            (et.eventKind == RoutedTriggerEvent::PropertyChanged && rt.watchedPropId != 0xFFFFu)
+                ? rt.watchedPropId
+                : static_cast<std::uint16_t>(PropId_Value);
+        const UnifiedValue curWatchedVal = src->GetValue(numericPid);
+        (void)TryGetFloat(curWatchedVal, curNumVal);
 
         bool fire = false;
         if (!rt.initialized) {
@@ -2342,12 +2737,17 @@ bool StyleTriggerEngine::EvaluateEventTriggers(StyledElementInstance& inst) {
             rt.prevChecked = curChecked;
             rt.prevSelectedIndex = curSelectedIdx;
             rt.prevNumericValue = curNumVal;
+            rt.prevWatchedValue = curWatchedVal;
             if (et.eventKind == RoutedTriggerEvent::Loaded) {
+                fire = true;
+            } else if (et.eventKind == RoutedTriggerEvent::PropertyChanged &&
+                       std::fabs(curNumVal) > 1e-5f) {
                 fire = true;
             }
         } else {
             switch (et.eventKind) {
                 case RoutedTriggerEvent::Loaded:
+                case RoutedTriggerEvent::StoryboardCompleted:
                     break;
                 case RoutedTriggerEvent::Click:
                     if (curClickGen != rt.lastClickGen) {
@@ -2384,12 +2784,27 @@ bool StyleTriggerEngine::EvaluateEventTriggers(StyledElementInstance& inst) {
                         fire = true;
                     }
                     break;
+                case RoutedTriggerEvent::PropertyChanged:
+                    if (!UnifiedValuesEqual(curWatchedVal, rt.prevWatchedValue)) {
+                        fire = true;
+                    }
+                    break;
             }
             rt.lastClickGen = curClickGen;
             rt.prevHovered = curHovered;
             rt.prevChecked = curChecked;
             rt.prevSelectedIndex = curSelectedIdx;
             rt.prevNumericValue = curNumVal;
+            rt.prevWatchedValue = curWatchedVal;
+        }
+
+        if (fire && !et.conditions.empty()) {
+            for (auto& cond : et.conditions) {
+                if (!EvaluateSingleCondition(elem, cond)) {
+                    fire = false;
+                    break;
+                }
+            }
         }
 
         if (fire) {
@@ -2634,18 +3049,23 @@ std::size_t StyleTriggerEngine::EvaluateSubtree(UIElement* subtreeRoot, bool res
         return false;
     };
 
-    const std::size_t instSnapshotCount = instances_.size();
-    for (std::size_t instIdx = 0u; instIdx < instSnapshotCount && instIdx < instances_.size(); ++instIdx) {
-        UIElement* elem = instances_[instIdx].element.Get();
-        if (!elem || !isInSubtree(elem)) {
-            continue;
-        }
-        if (resetEventStates) {
-            instances_[instIdx].eventStates = {};
-        }
+    for (int settlePass = 0; settlePass < 3; ++settlePass) {
+        bool anyCascadeMutation = false;
+        const std::size_t instSnapshotCount = instances_.size();
+        for (std::size_t instIdx = 0u; instIdx < instSnapshotCount && instIdx < instances_.size(); ++instIdx) {
+            UIElement* elem = instances_[instIdx].element.Get();
+            if (!elem || !isInSubtree(elem)) {
+                continue;
+            }
+            if (settlePass == 0 && resetEventStates) {
+                instances_[instIdx].eventStates = {};
+            }
 
-        // Note: do NOT skip Collapsed elements if a DataTrigger on Visibility itself could un-collapse them!
-        const bool eventFired = EvaluateEventTriggers(instances_[instIdx]);
+            // Note: do NOT skip Collapsed elements if a DataTrigger on Visibility itself could un-collapse them!
+            const bool eventFired = EvaluateEventTriggers(instances_[instIdx]);
+            if (eventFired) {
+                anyCascadeMutation = true;
+            }
 
         // 1. Compute 64-bit active trigger bitmask
         std::uint64_t nextMask = 0ULL;
@@ -2718,10 +3138,18 @@ std::size_t StyleTriggerEngine::EvaluateSubtree(UIElement* subtreeRoot, bool res
             continue;
         }
 
-        const bool firstPass = !instances_[instIdx].initialized;
-        instances_[instIdx].initialized = true;
-        ReapplyActiveOverrides(instances_[instIdx], nextMask, !firstPass, firstPass);
-        ++changedElements;
+            const bool firstPass = !instances_[instIdx].initialized;
+            const std::uint64_t prevMaskForCascade = instances_[instIdx].activeTriggerMask;
+            instances_[instIdx].initialized = true;
+            ReapplyActiveOverrides(instances_[instIdx], nextMask, !firstPass, firstPass);
+            ++changedElements;
+            if (nextMask != prevMaskForCascade || firstPass) {
+                anyCascadeMutation = true;
+            }
+        }
+        if (!anyCascadeMutation) {
+            break;
+        }
     }
 
     return changedElements;

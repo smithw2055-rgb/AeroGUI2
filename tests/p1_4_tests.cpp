@@ -1002,6 +1002,68 @@ void TestOfficialSamplesCompilationAndExtraction() {
         }
         AERO_CHECK(f1Formats >= 7u, "Gallery/Animation extracted standalone F0/F1 StringFormats");
     }
+
+    // 6. Verify EventTrigger.conditions .axb4 round-trip & non-numeric PropertyChangedTrigger
+    {
+        const char* etCondXaml = R"XAML(
+<Page xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+      xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+      xmlns:b="http://schemas.microsoft.com/xaml/behaviors">
+  <StackPanel>
+    <TextBox x:Name="SrcBox" Text="Initial"/>
+    <TextBlock x:Name="OutLabel" Text="Idle">
+      <b:Interaction.Triggers>
+        <b:PropertyChangedTrigger Binding="{Binding Text, ElementName=SrcBox}">
+          <b:ComparisonCondition LeftOperand="{Binding Text, ElementName=SrcBox}" Operator="Equal" RightOperand="Ready"/>
+          <b:ChangePropertyAction TargetName="OutLabel" PropertyName="Text" Value="Triggered!"/>
+        </b:PropertyChangedTrigger>
+      </b:Interaction.Triggers>
+    </TextBlock>
+  </StackPanel>
+</Page>
+)XAML";
+        aero::AeroCompileInput etIn{};
+        etIn.xamlPath = "EventTriggerCondRoundTrip.xaml";
+        etIn.xamlContent = etCondXaml;
+        const aero::AeroCompileResult etRes = compiler.Compile(etIn);
+        AERO_CHECK(etRes.succeeded, "Compiled EventTriggerCondRoundTrip.xaml cleanly");
+
+        const std::vector<std::uint8_t> wire = etRes.axbPackage.Serialize();
+        aero::AxbPackage deser{};
+        const bool deserOk = aero::AxbPackage::Deserialize(wire, deser);
+        AERO_CHECK(deserOk && !deser.styles.empty() && !deser.styles[0].eventTriggers.empty() &&
+                   deser.styles[0].eventTriggers[0].conditions.size() == 1u,
+                   "AxbEventTrigger::conditions preserved across .axb4 Serialize/Deserialize round-trip");
+
+        aero::ExecutionDomainContext domains;
+        aero::AnimationEngine animEngine;
+        aero::DualTrackBindingEngine bindingEngine(domains);
+        aero::StyleTriggerEngine styleEngine(&animEngine, &bindingEngine);
+        styleEngine.RegisterPackageStyles(deser);
+
+        auto root = aero::CreateElementByTypeName(deser.rootTypeName);
+        AERO_CHECK(aero::MountAxbTemplate(root.Get(), deser, &domains, &bindingEngine, aero::ObjectRef{}, nullptr, nullptr, &animEngine),
+                   "Mounted deserialized EventTriggerCondRoundTrip package");
+        (void)styleEngine.BindSubtreeStyles(root.Get(), true);
+        (void)styleEngine.EvaluateAndApply();
+
+        auto* srcBox = root->FindName("SrcBox");
+        auto* outLabel = root->FindName("OutLabel");
+        AERO_CHECK(srcBox != nullptr && outLabel != nullptr, "Found SrcBox and OutLabel");
+        if (srcBox && outLabel) {
+            (void)srcBox->SetValue(aero::PropId_Text, aero::value::FromString("Pending"), aero::ValueSourceRank::Local);
+            (void)styleEngine.EvaluateAndApply();
+            const auto v1 = outLabel->GetValue(aero::PropId_Text);
+            AERO_CHECK(std::holds_alternative<aero::StringValue>(v1) && std::get<aero::StringValue>(v1).view() == "Idle",
+                       "PropertyChangedTrigger gated by ComparisonCondition did not fire when Text='Pending'");
+
+            (void)srcBox->SetValue(aero::PropId_Text, aero::value::FromString("Ready"), aero::ValueSourceRank::Local);
+            (void)styleEngine.EvaluateAndApply();
+            const auto v2 = outLabel->GetValue(aero::PropId_Text);
+            AERO_CHECK(std::holds_alternative<aero::StringValue>(v2) && std::get<aero::StringValue>(v2).view() == "Triggered!",
+                       "Non-numeric PropertyChangedTrigger fired when Text changed to 'Ready'");
+        }
+    }
 }
 
 } // namespace

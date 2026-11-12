@@ -209,6 +209,8 @@ public:
     // Element x:Name and O(N) subtree lookup (only for dynamic debugging; compiled code uses O(1) slots)
     [[nodiscard]] const std::string& Name() const noexcept { return name_; }
     void SetName(std::string name) noexcept { name_ = std::move(name); }
+    [[nodiscard]] const std::string& DeclaredTypeName() const noexcept { return declaredTypeName_; }
+    void SetDeclaredTypeName(std::string typeName) noexcept { declaredTypeName_ = std::move(typeName); }
     [[nodiscard]] UIElement* FindName(std::string_view targetName) noexcept;
     void SetNamescopeBoundary(bool boundary) noexcept { isNamescopeBoundary_ = boundary; }
     [[nodiscard]] bool IsNamescopeBoundary() const noexcept { return isNamescopeBoundary_; }
@@ -827,6 +829,7 @@ private:
     Size desiredSize_{0.0f, 0.0f};
     Rect finalRect_{0.0f, 0.0f, 0.0f, 0.0f};
     std::string name_;
+    std::string declaredTypeName_;
 
     // Zero-hash NativeHandle slot, binding engine backlink & generation cache
     NativeHandle cachedNativeHandle_{};
