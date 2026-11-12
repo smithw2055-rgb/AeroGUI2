@@ -23,6 +23,8 @@ TypeClass gViewboxTypeClass{};
 TypeClass gLayoutScalerTypeClass{};
 TypeClass gLabelTypeClass{};
 TypeClass gBoxShadowTypeClass{};
+TypeClass gDecoratorTypeClass{};
+TypeClass gPopupTypeClass{};
 TypeClass gScrollViewerTypeClass{};
 TypeClass gGridTypeClass{};
 TypeClass gCanvasTypeClass{};
@@ -162,6 +164,8 @@ void EnsureControlTypesRegistered() noexcept {
     reg.RegisterType(gLayoutScalerTypeClass, "Aero.UI.LayoutScaler", &gViewboxTypeClass);
     reg.RegisterType(gLabelTypeClass, "Aero.UI.Label", &gTextBlockTypeClass);
     reg.RegisterType(gBoxShadowTypeClass, "Aero.UI.BoxShadow", &gBorderTypeClass);
+    reg.RegisterType(gDecoratorTypeClass, "Aero.UI.Decorator", &gBorderTypeClass);
+    reg.RegisterType(gPopupTypeClass, "Aero.UI.Popup", panel);
     reg.RegisterType(gScrollViewerTypeClass, "Aero.UI.ScrollViewer", panel);
     reg.RegisterType(gGridTypeClass, "Aero.UI.Grid", panel);
     reg.RegisterType(gCanvasTypeClass, "Aero.UI.Canvas", panel);
@@ -223,6 +227,16 @@ const TypeClass* LayoutScaler::StaticTypeClass() noexcept {
 const TypeClass* Label::StaticTypeClass() noexcept {
     EnsureControlTypesRegistered();
     return &gLabelTypeClass;
+}
+
+const TypeClass* Decorator::StaticTypeClass() noexcept {
+    EnsureControlTypesRegistered();
+    return &gDecoratorTypeClass;
+}
+
+const TypeClass* Popup::StaticTypeClass() noexcept {
+    EnsureControlTypesRegistered();
+    return &gPopupTypeClass;
 }
 
 const TypeClass* BoxShadow::StaticTypeClass() noexcept {
@@ -1746,19 +1760,60 @@ float Canvas::GetTop(const UIElement* element) noexcept {
     return 0.0f;
 }
 
+void Canvas::SetRight(UIElement* element, float right) {
+    if (element) {
+        element->SetValue(PropId_CanvasRight, MakeFloat(right), ValueSourceRank::Local);
+    }
+}
+
+float Canvas::GetRight(const UIElement* element) noexcept {
+    if (!element) return 0.0f;
+    float out = 0.0f;
+    if (TryGetFloat(element->GetValue(PropId_CanvasRight), out)) {
+        return out;
+    }
+    return 0.0f;
+}
+
+void Canvas::SetBottom(UIElement* element, float bottom) {
+    if (element) {
+        element->SetValue(PropId_CanvasBottom, MakeFloat(bottom), ValueSourceRank::Local);
+    }
+}
+
+float Canvas::GetBottom(const UIElement* element) noexcept {
+    if (!element) return 0.0f;
+    float out = 0.0f;
+    if (TryGetFloat(element->GetValue(PropId_CanvasBottom), out)) {
+        return out;
+    }
+    return 0.0f;
+}
+
 Size Canvas::MeasureCore(Size availableSize) noexcept {
+    (void)availableSize;
     for (UIElement* c = FirstChild(); c != nullptr; c = c->NextSibling()) {
-        c->Measure(availableSize);
+        c->Measure(Size{kUnconstrainedSpace, kUnconstrainedSpace});
     }
     return Size{0.0f, 0.0f};
 }
 
 void Canvas::ArrangeCore(Rect finalRect) noexcept {
     for (UIElement* c = FirstChild(); c != nullptr; c = c->NextSibling()) {
-        const float left = GetLeft(c);
-        const float top = GetTop(c);
         const Size d = c->DesiredSize();
-        c->Arrange(Rect{finalRect.x + left, finalRect.y + top, d.width, d.height});
+        float x = finalRect.x;
+        if (c->GetPropertySourceRank(PropId_CanvasLeft) != ValueSourceRank::Default) {
+            x = finalRect.x + GetLeft(c);
+        } else if (c->GetPropertySourceRank(PropId_CanvasRight) != ValueSourceRank::Default) {
+            x = finalRect.x + finalRect.width - d.width - GetRight(c);
+        }
+        float y = finalRect.y;
+        if (c->GetPropertySourceRank(PropId_CanvasTop) != ValueSourceRank::Default) {
+            y = finalRect.y + GetTop(c);
+        } else if (c->GetPropertySourceRank(PropId_CanvasBottom) != ValueSourceRank::Default) {
+            y = finalRect.y + finalRect.height - d.height - GetBottom(c);
+        }
+        c->Arrange(Rect{x, y, d.width, d.height});
     }
 }
 
@@ -1925,13 +1980,18 @@ void SyncHostContentTemplateChildImpl(
         hasActiveObj = false;
     };
 
+    bool isHeaderSource = false;
+    if (const auto* asCp = hostContainer->DynamicCast<ContentPresenter>()) {
+        isHeaderSource = (asCp->GetContentSource() == "Header");
+    }
     std::string ctKey;
     const UnifiedValue hostCtVal = hostContainer->GetValue(PropId_ContentTemplate);
     if (const auto* sv = std::get_if<StringValue>(&hostCtVal);
         sv && !sv->view().empty()) {
         ctKey = sv->str();
     } else if (contentSourceHost && contentSourceHost != hostContainer) {
-        const UnifiedValue srcHostCtVal = contentSourceHost->GetValue(PropId_ContentTemplate);
+        const std::uint16_t hostTplProp = isHeaderSource ? PropId_HeaderTemplate : PropId_ContentTemplate;
+        const UnifiedValue srcHostCtVal = contentSourceHost->GetValue(hostTplProp);
         if (const auto* svHost = std::get_if<StringValue>(&srcHostCtVal);
             svHost && !svHost->view().empty()) {
             ctKey = svHost->str();
@@ -1956,7 +2016,9 @@ void SyncHostContentTemplateChildImpl(
 
     auto inspectContentOn = [&](const UIElement* el) -> bool {
         if (!el) return false;
-        for (const std::uint16_t pid : {PropId_Content, PropId_Text}) {
+        const std::uint16_t p0 = isHeaderSource ? PropId_Header : PropId_Content;
+        const std::uint16_t p1 = isHeaderSource ? PropId_Title : PropId_Text;
+        for (const std::uint16_t pid : {p0, p1}) {
             if (const auto* entry = el->FindCompactEntry(pid)) {
                 if (entry->sourceRank == static_cast<std::uint8_t>(ValueSourceRank::Default) &&
                     std::holds_alternative<std::monostate>(entry->effectiveValue)) {
@@ -2551,6 +2613,14 @@ ContentPresenter::ContentPresenter() {
     EnsureControlTypesRegistered();
 }
 
+std::string ContentPresenter::GetContentSource() const {
+    const UnifiedValue v = GetValue(PropId_ContentSource);
+    if (const auto* sv = std::get_if<StringValue>(&v); sv && !sv->view().empty()) {
+        return sv->str();
+    }
+    return "Content";
+}
+
 std::string ContentPresenter::GetEffectiveText() const {
     if (FirstChild() != nullptr) {
         return {};
@@ -2577,6 +2647,22 @@ std::string ContentPresenter::GetEffectiveText() const {
         }
     }
     if (const UIElement* tp = TemplatedParent()) {
+        const std::string cs = GetContentSource();
+        if (cs == "Header") {
+            for (const std::uint16_t hostProp : {PropId_Header, PropId_Title}) {
+                if (const auto* entry = tp->FindCompactEntry(hostProp)) {
+                    if (tryExtractScalarOrString(entry->effectiveValue, resolved)) {
+                        return resolved;
+                    }
+                }
+            }
+            return {};
+        }
+        if (cs == "SelectionBoxItem") {
+            if (const auto* combo = tp->DynamicCast<ComboBox>()) {
+                return combo->GetSelectedItemText();
+            }
+        }
         for (const std::uint16_t hostProp : {PropId_Content, PropId_Text, PropId_Title}) {
             if (const auto* entry = tp->FindCompactEntry(hostProp)) {
                 if (tryExtractScalarOrString(entry->effectiveValue, resolved)) {
@@ -2902,14 +2988,29 @@ Size Path::MeasureCore(Size availableSize) noexcept {
         bw = b.width;
         bh = b.height;
     }
+    const float padW = p.left + p.right;
+    const float padH = p.top + p.bottom;
     if (stretch == Stretch::None) {
         return Size{
-            std::max(1.0f, std::max(bw, bx + bw)) + p.left + p.right,
-            std::max(1.0f, std::max(bh, by + bh)) + p.top + p.bottom};
+            std::max(1.0f, std::max(bw, bx + bw)) + padW,
+            std::max(1.0f, std::max(bh, by + bh)) + padH};
+    }
+    if ((stretch == Stretch::Uniform || stretch == Stretch::UniformToFill) &&
+        bw > 1e-4f && bh > 1e-4f) {
+        if (GetWidth() >= 0.0f && GetHeight() < 0.0f &&
+            std::isfinite(availableSize.width) && availableSize.width < kUnconstrainedSpace * 0.5f) {
+            const float wAvail = std::max(0.0f, availableSize.width - padW);
+            return Size{wAvail + padW, std::max(1.0f, bh * (wAvail / bw)) + padH};
+        }
+        if (GetHeight() >= 0.0f && GetWidth() < 0.0f &&
+            std::isfinite(availableSize.height) && availableSize.height < kUnconstrainedSpace * 0.5f) {
+            const float hAvail = std::max(0.0f, availableSize.height - padH);
+            return Size{std::max(1.0f, bw * (hAvail / bh)) + padW, hAvail + padH};
+        }
     }
     return Size{
-        std::max(1.0f, bw) + p.left + p.right,
-        std::max(1.0f, bh) + p.top + p.bottom};
+        std::max(1.0f, bw) + padW,
+        std::max(1.0f, bh) + padH};
 }
 
 // ============================================================================
@@ -3624,7 +3725,9 @@ void HeaderedContentControl::SetHeaderElement(UIElement* headerElem) noexcept {
 }
 
 UIElement* HeaderedContentControl::GetHeaderElement() const noexcept {
-    if (headerElement_ && headerElement_->Parent() == this) {
+    if (headerElement_ &&
+        (headerElement_->Parent() == this ||
+         (HasControlTemplate() && headerElement_->Parent() != nullptr))) {
         return headerElement_;
     }
     return nullptr;
@@ -3635,6 +3738,9 @@ bool HeaderedContentControl::HasHeader() const noexcept {
 }
 
 Size HeaderedContentControl::MeasureCore(Size availableSize) noexcept {
+    if (HasControlTemplate()) {
+        return UIElement::MeasureCore(availableSize);
+    }
     const Thickness p = GetPadding();
     const float padW = p.left + p.right;
     const float padH = p.top + p.bottom;
@@ -3681,6 +3787,10 @@ Size HeaderedContentControl::MeasureCore(Size availableSize) noexcept {
 }
 
 void HeaderedContentControl::ArrangeCore(Rect finalRect) noexcept {
+    if (HasControlTemplate()) {
+        UIElement::ArrangeCore(finalRect);
+        return;
+    }
     const Thickness p = GetPadding();
     const float startX = finalRect.x + p.left;
     const float startY = finalRect.y + p.top;
@@ -3725,6 +3835,9 @@ GroupBox::GroupBox() {
 }
 
 Size GroupBox::MeasureCore(Size availableSize) noexcept {
+    if (HasControlTemplate()) {
+        return UIElement::MeasureCore(availableSize);
+    }
     const Thickness p = GetPadding();
     const float frameInsetX = (p.left + p.right > 0.0f) ? (p.left + p.right) : 16.0f;
     const float frameInsetY = (p.top + p.bottom > 0.0f) ? (p.top + p.bottom) : 16.0f;
@@ -3770,6 +3883,10 @@ Size GroupBox::MeasureCore(Size availableSize) noexcept {
 }
 
 void GroupBox::ArrangeCore(Rect finalRect) noexcept {
+    if (HasControlTemplate()) {
+        UIElement::ArrangeCore(finalRect);
+        return;
+    }
     const Thickness p = GetPadding();
     const float padL = (p.left > 0.0f) ? p.left : 8.0f;
     const float padT = (p.top > 0.0f) ? p.top : 8.0f;
@@ -3859,7 +3976,7 @@ ExpandDirection Expander::GetExpandDirection() const noexcept {
 }
 
 bool Expander::IsBodyChildHidden(const UIElement* child) const noexcept {
-    if (!child || child->Parent() != this) {
+    if (HasControlTemplate() || !child || child->Parent() != this) {
         return false;
     }
     if (child == GetHeaderElement()) {
@@ -3914,6 +4031,9 @@ bool Expander::OnKeyDown(KeyCode key, std::uint8_t modifiers) {
 }
 
 Size Expander::MeasureCore(Size availableSize) noexcept {
+    if (HasControlTemplate()) {
+        return UIElement::MeasureCore(availableSize);
+    }
     const Thickness p = GetPadding();
     const float padW = p.left + p.right;
     const float padH = p.top + p.bottom;
@@ -3978,6 +4098,10 @@ Size Expander::MeasureCore(Size availableSize) noexcept {
 }
 
 void Expander::ArrangeCore(Rect finalRect) noexcept {
+    if (HasControlTemplate()) {
+        UIElement::ArrangeCore(finalRect);
+        return;
+    }
     const Thickness p = GetPadding();
     const float startX = finalRect.x + p.left;
     const float startY = finalRect.y + p.top;
@@ -4062,6 +4186,50 @@ void Expander::ArrangeCore(Rect finalRect) noexcept {
         }
         c->Arrange(bodySlot);
     }
+}
+
+Decorator::Decorator() {
+    EnsureControlTypesRegistered();
+}
+
+Popup::Popup() {
+    EnsureControlTypesRegistered();
+}
+
+void Popup::SetIsOpen(bool open) {
+    SetValue(PropId_IsOpen, value::FromBool(open), ValueSourceRank::Local);
+}
+
+bool Popup::IsOpen() const noexcept {
+    return CoerceBoolProperty(GetValue(PropId_IsOpen), false);
+}
+
+void Popup::OnPropertyChanged(std::uint16_t propId, const UnifiedValue& newValue) {
+    Panel::OnPropertyChanged(propId, newValue);
+    if (propId == PropId_IsOpen) {
+        InvalidateLayout();
+        MarkSubtreeRenderDirtyRecursive(this);
+    }
+}
+
+Size Popup::MeasureCore(Size availableSize) noexcept {
+    if (!IsOpen()) {
+        for (UIElement* c = FirstChild(); c != nullptr; c = c->NextSibling()) {
+            c->Measure(Size{0.0f, 0.0f});
+        }
+        return Size{0.0f, 0.0f};
+    }
+    return UIElement::MeasureCore(availableSize);
+}
+
+void Popup::ArrangeCore(Rect finalRect) noexcept {
+    if (!IsOpen()) {
+        for (UIElement* c = FirstChild(); c != nullptr; c = c->NextSibling()) {
+            c->Arrange(Rect{finalRect.x, finalRect.y, 0.0f, 0.0f});
+        }
+        return;
+    }
+    UIElement::ArrangeCore(finalRect);
 }
 
 TabItem::TabItem() {
@@ -4320,34 +4488,108 @@ void TabControl::ReleaseTabChildResources(UIElement* child) {
 IntrusivePtr<UIElement> TabControl::InstantiateTabItemForValue(const UnifiedValue& itemVal) {
     auto tab = MakeIntrusive<TabItem>();
     tab->SetValue(PropId_DataContext, itemVal, ValueSourceRank::Local);
-    const UnifiedValue tplKeyVal = GetValue(PropId_ItemTemplate);
-    const AxbPackage* tplPkg = nullptr;
-    if (const auto* sv = std::get_if<StringValue>(&tplKeyVal); sv && !sv->view().empty()) {
-        tplPkg = AxbTemplateRegistry::Instance().FindDataTemplate(sv->view());
+    const UnifiedValue itemTplVal = GetValue(PropId_ItemTemplate);
+    const UnifiedValue contentTplVal = GetValue(PropId_ContentTemplate);
+    const AxbPackage* itemTplPkg = nullptr;
+    const AxbPackage* contentTplPkg = nullptr;
+    if (const auto* sv = std::get_if<StringValue>(&itemTplVal); sv && !sv->view().empty()) {
+        itemTplPkg = AxbTemplateRegistry::Instance().FindDataTemplate(sv->view());
     }
-    if (!tplPkg) {
-        const UnifiedValue ctKeyVal = GetValue(PropId_ContentTemplate);
-        if (const auto* sv = std::get_if<StringValue>(&ctKeyVal); sv && !sv->view().empty()) {
-            tplPkg = AxbTemplateRegistry::Instance().FindDataTemplate(sv->view());
+    if (const auto* sv = std::get_if<StringValue>(&contentTplVal); sv && !sv->view().empty()) {
+        contentTplPkg = AxbTemplateRegistry::Instance().FindDataTemplate(sv->view());
+    }
+    ObjectRef itemObj{};
+    if (const auto* ref = std::get_if<ObjectRef>(&itemVal)) {
+        itemObj = *ref;
+    }
+    AnimationEngine* effAnim = animationEngine_
+        ? animationEngine_
+        : (bindingEngine_ ? bindingEngine_->GetAnimationEngine() : nullptr);
+    NativeHandleRegistry* reg = domains_ ? &domains_->nativeHandles() : nullptr;
+    ManagedHeap* heap = domains_ ? &domains_->uiHeap() : nullptr;
+
+    auto resolveTabDisplayStr = [&]() -> std::string {
+        std::string hdrStr = rs_rt::valueToString(itemVal);
+        if (itemObj.valid() && domains_ && bindingEngine_ && bindingEngine_->Program()) {
+            if (const auto* oh = domains_->heapForObject(itemObj)) {
+                const SymbolId tid = oh->objectTypeId(itemObj).value_or(0);
+                for (const char* cand : {"Header", "Name", "Title", "Label", "Text"}) {
+                    if (auto slot = domains_->resolvePropertySlot(*bindingEngine_->Program(), tid, cand)) {
+                        if (auto fv = oh->fieldGet(itemObj, slot->backingFieldIndex)) {
+                            hdrStr = FormatBindingString({}, &(*fv), 1u, domains_);
+                            break;
+                        }
+                    }
+                }
+            }
         }
-    }
-    if (tplPkg) {
+        return hdrStr;
+    };
+    auto isTabItemRootTemplate = [](const AxbPackage* pkg) noexcept -> bool {
+        if (!pkg) return false;
+        if (pkg->rootTypeName == "TabItem") return true;
+        int depth = 0;
+        for (const auto& inst : pkg->instructions) {
+            if (inst.opcode == AxbOpcode::BeginElement) {
+                ++depth;
+            } else if (inst.opcode == AxbOpcode::EndElement) {
+                --depth;
+            } else if (depth == 1 &&
+                       (inst.opcode == AxbOpcode::SetStaticProperty || inst.opcode == AxbOpcode::BindProperty) &&
+                       (inst.propId == PropId_Header || inst.propId == PropId_Title)) {
+                return true;
+            }
+        }
+        return false;
+    };
+
+    if (itemTplPkg && (contentTplPkg || !isTabItemRootTemplate(itemTplPkg))) {
+        auto hdrRoot = !itemTplPkg->rootTypeName.empty()
+            ? CreateElementByTypeName(itemTplPkg->rootTypeName)
+            : MakeIntrusive<Border>();
+        if (hdrRoot) {
+            hdrRoot->SetNamescopeBoundary(true);
+            hdrRoot->SetValue(PropId_DataContext, itemVal, ValueSourceRank::Local);
+            tab->AddChild(hdrRoot.Get(), reg, heap);
+            tab->SetHeaderElement(hdrRoot.Get());
+            (void)MountAxbTemplate(hdrRoot.Get(), *itemTplPkg, domains_, bindingEngine_, itemObj, nullptr, nullptr, effAnim);
+        }
+        if (contentTplPkg) {
+            auto bodyRoot = !contentTplPkg->rootTypeName.empty()
+                ? CreateElementByTypeName(contentTplPkg->rootTypeName)
+                : MakeIntrusive<Border>();
+            if (bodyRoot) {
+                bodyRoot->SetNamescopeBoundary(true);
+                bodyRoot->SetValue(PropId_DataContext, itemVal, ValueSourceRank::Local);
+                tab->AddChild(bodyRoot.Get(), reg, heap);
+                (void)MountAxbTemplate(bodyRoot.Get(), *contentTplPkg, domains_, bindingEngine_, itemObj, nullptr, nullptr, effAnim);
+            }
+        } else {
+            auto bodyTb = MakeIntrusive<TextBlock>();
+            bodyTb->SetText(resolveTabDisplayStr());
+            tab->AddChild(bodyTb.Get(), reg, heap);
+        }
+        if (styleEngine_) {
+            styleEngine_->RegisterPackageStyles(*itemTplPkg);
+            if (contentTplPkg) {
+                styleEngine_->RegisterPackageStyles(*contentTplPkg);
+            }
+            (void)styleEngine_->BindSubtreeStyles(tab.Get());
+            (void)styleEngine_->EvaluateSubtree(tab.Get());
+        }
+    } else if (const AxbPackage* tplPkg = itemTplPkg ? itemTplPkg : contentTplPkg) {
         tab->SetNamescopeBoundary(true);
-        ObjectRef itemObj{};
-        if (const auto* ref = std::get_if<ObjectRef>(&itemVal)) {
-            itemObj = *ref;
-        }
-        AnimationEngine* effAnim = animationEngine_
-            ? animationEngine_
-            : (bindingEngine_ ? bindingEngine_->GetAnimationEngine() : nullptr);
         (void)MountAxbTemplate(tab.Get(), *tplPkg, domains_, bindingEngine_, itemObj, nullptr, nullptr, effAnim);
+        if (contentTplPkg && !itemTplPkg && tab->GetHeader().empty()) {
+            tab->SetHeader(resolveTabDisplayStr());
+        }
         if (styleEngine_) {
             styleEngine_->RegisterPackageStyles(*tplPkg);
             (void)styleEngine_->BindSubtreeStyles(tab.Get());
             (void)styleEngine_->EvaluateSubtree(tab.Get());
         }
     } else {
-        tab->SetHeader(rs_rt::valueToString(itemVal));
+        tab->SetHeader(resolveTabDisplayStr());
     }
     return tab;
 }
@@ -6190,6 +6432,164 @@ void ItemsControl::MoveVirtualSlotsToRecyclePool(NativeHandleRegistry* registry,
     }
 }
 
+namespace {
+
+std::string ResolveSmartObjectDisplayText(
+    const UIElement* hostCtrl,
+    ExecutionDomainContext* dom,
+    DualTrackBindingEngine* bindEng,
+    const UnifiedValue& itemVal) {
+    if (const auto* sv = std::get_if<StringValue>(&itemVal)) {
+        return sv->str();
+    }
+    const auto* oref = std::get_if<ObjectRef>(&itemVal);
+    if (!oref || !oref->valid()) {
+        return rs_rt::valueToString(itemVal);
+    }
+    if (!bindEng && hostCtrl) {
+        for (const UIElement* cur = hostCtrl; cur != nullptr && !bindEng;
+             cur = cur->Parent() ? cur->Parent() : cur->TemplatedParent()) {
+            bindEng = cur->BoundTwoWayEngine();
+            if (!bindEng && cur->BoundStyleEngine()) {
+                bindEng = cur->BoundStyleEngine()->GetBindingEngine();
+            }
+        }
+    }
+    if (!dom && bindEng) {
+        dom = &bindEng->Domains();
+    }
+    if (dom && oref->kind == ObjectKind::String) {
+        if (const auto sv = dom->stringViewAcrossDomains(*oref)) {
+            return std::string(*sv);
+        }
+    }
+    if (dom && bindEng && bindEng->Program()) {
+        const ProgramImage* prog = bindEng->Program();
+        if (const auto* heap = dom->heapForObject(*oref); heap && heap->isAlive(*oref)) {
+            const SymbolId tid = heap->objectTypeId(*oref).value_or(0);
+            if (tid != 0) {
+                if (hostCtrl) {
+                    const UnifiedValue dmpVal = hostCtrl->GetValue(PropId_DisplayMemberPath);
+                    if (const auto* dmpSv = std::get_if<StringValue>(&dmpVal); dmpSv && !dmpSv->view().empty()) {
+                        if (auto slot = dom->resolvePropertySlot(*prog, tid, std::string(dmpSv->view()))) {
+                            UnifiedValue fv{};
+                            if (dom->readPropertySlotFast(DomainKind::Ui, *oref, *slot, fv, nullptr, bindEng->UiInterpreter())) {
+                                return FormatBindingString({}, &fv, 1u, dom);
+                            }
+                        }
+                    }
+                }
+                for (const char* cand : {"Name", "Title", "Header", "Label", "Text", "Description", "Key"}) {
+                    if (auto slot = dom->resolvePropertySlot(*prog, tid, cand)) {
+                        UnifiedValue fv{};
+                        if (dom->readPropertySlotFast(DomainKind::Ui, *oref, *slot, fv, nullptr, bindEng->UiInterpreter())) {
+                            const std::string formatted = FormatBindingString({}, &fv, 1u, dom);
+                            if (!formatted.empty() && formatted.rfind("<object:", 0) != 0) {
+                                return formatted;
+                            }
+                        }
+                    }
+                }
+                if (const auto* ts = prog->resolveType(tid)) {
+                    for (const auto& f : ts->fields) {
+                        if (!f.staticField) {
+                            if (auto fv = heap->fieldGet(*oref, f.index)) {
+                                if (std::holds_alternative<StringValue>(*fv) ||
+                                    (std::holds_alternative<ObjectRef>(*fv) && std::get<ObjectRef>(*fv).kind == ObjectKind::String)) {
+                                    const std::string formatted = FormatBindingString({}, &(*fv), 1u, dom);
+                                    if (!formatted.empty()) return formatted;
+                                }
+                            }
+                        }
+                    }
+                    if (!ts->name.empty()) {
+                        const std::size_t col = ts->name.rfind("::");
+                        return (col != std::string::npos) ? ts->name.substr(col + 2u) : ts->name;
+                    }
+                }
+            }
+        }
+    }
+    return rs_rt::valueToString(itemVal);
+}
+
+enum class ItemsPanelMode : std::uint8_t {
+    VerticalStack = 0,
+    HorizontalStack = 1,
+    UniformGrid = 2,
+    WrapHorizontal = 3,
+    WrapVertical = 4,
+    Canvas = 5,
+};
+
+struct ParsedItemsPanelConfig {
+    ItemsPanelMode mode = ItemsPanelMode::VerticalStack;
+    std::int32_t rows = 0;
+    std::int32_t cols = 0;
+    std::int32_t firstCol = 0;
+    float spacing = 0.0f;
+    float itemWidth = -1.0f;
+    float itemHeight = -1.0f;
+};
+
+ParsedItemsPanelConfig ResolveItemsPanelConfig(const ItemsControl* ic) noexcept {
+    ParsedItemsPanelConfig cfg{};
+    if (!ic) return cfg;
+    std::string spec;
+    const UnifiedValue raw = ic->GetValue(PropId_ItemsPanel);
+    if (const auto* sv = std::get_if<StringValue>(&raw); sv && !sv->view().empty()) {
+        spec = sv->str();
+        if (spec.rfind("AERO_PANEL:", 0) != 0) {
+            if (const UnifiedValue* res = AxbTemplateRegistry::Instance().FindResourceForElement(spec, ic)) {
+                if (const auto* rsv = std::get_if<StringValue>(res)) {
+                    spec = rsv->str();
+                }
+            }
+        }
+    }
+    if (spec.rfind("AERO_PANEL:", 0) != 0) {
+        return cfg;
+    }
+    std::string_view rest = std::string_view(spec).substr(11u);
+    auto nextTok = [&]() -> std::string_view {
+        const std::size_t c = rest.find(':');
+        if (c == std::string_view::npos) {
+            std::string_view t = rest;
+            rest = {};
+            return t;
+        }
+        std::string_view t = rest.substr(0u, c);
+        rest = rest.substr(c + 1u);
+        return t;
+    };
+    const std::string_view kind = nextTok();
+    if (kind == "Canvas") {
+        cfg.mode = ItemsPanelMode::Canvas;
+    } else if (kind == "UniformGrid") {
+        cfg.mode = ItemsPanelMode::UniformGrid;
+        cfg.rows = std::max<std::int32_t>(0, CoerceInt32Property(value::FromString(std::string(nextTok())), 0));
+        cfg.cols = std::max<std::int32_t>(0, CoerceInt32Property(value::FromString(std::string(nextTok())), 0));
+        cfg.firstCol = std::max<std::int32_t>(0, CoerceInt32Property(value::FromString(std::string(nextTok())), 0));
+    } else if (kind == "WrapPanel") {
+        const std::string_view ori = nextTok();
+        cfg.mode = (ori == "Vertical" || ori == "vertical") ? ItemsPanelMode::WrapVertical : ItemsPanelMode::WrapHorizontal;
+        (void)TryGetFloat(ParseBuiltinLiteralPropertyValue(PropId_Width, nextTok()), cfg.itemWidth);
+        (void)TryGetFloat(ParseBuiltinLiteralPropertyValue(PropId_Height, nextTok()), cfg.itemHeight);
+    } else if (kind == "StackPanel" || kind == "VirtualizingStackPanel") {
+        const std::string_view ori = nextTok();
+        if (ori == "Horizontal" || ori == "horizontal") {
+            cfg.mode = ItemsPanelMode::HorizontalStack;
+        }
+        const std::string_view sp = nextTok();
+        if (!sp.empty()) {
+            (void)TryGetFloat(ParseBuiltinLiteralPropertyValue(PropId_Spacing, sp), cfg.spacing);
+        }
+    }
+    return cfg;
+}
+
+} // namespace
+
 IntrusivePtr<UIElement> ItemsControl::CreateMaterializedItemVisual(
     std::size_t index,
     const UnifiedValue& itemVal,
@@ -6198,31 +6598,170 @@ IntrusivePtr<UIElement> ItemsControl::CreateMaterializedItemVisual(
     if (itemGenerator_) {
         return itemGenerator_(index, itemVal);
     }
-    if (const AxbPackage* tplPkg = ResolveActiveItemTemplate(itemVal)) {
-        outAppliedTemplate = tplPkg;
-        return InstantiateTemplatedItem(*tplPkg, itemVal);
-    }
-    auto tb = MakeIntrusive<TextBlock>();
-    std::string displayStr = rs_rt::valueToString(itemVal);
-    if (const auto* oref = std::get_if<ObjectRef>(&itemVal)) {
-        if (oref->valid() && domains_ && bindingEngine_ && bindingEngine_->Program()) {
-            if (const auto* heap = domains_->heapForObject(*oref)) {
-                const SymbolId tid = heap->objectTypeId(*oref).value_or(0);
-                if (tid != 0) {
-                    for (const char* propCandidate : {"Title", "Name", "Header", "Label"}) {
-                        if (auto slot = domains_->resolvePropertySlot(*bindingEngine_->Program(), tid, propCandidate)) {
-                            if (auto fv = heap->fieldGet(*oref, slot->backingFieldIndex)) {
-                                displayStr = FormatBindingString({}, &(*fv), 1u, domains_);
-                                break;
-                            }
-                        }
+
+    IntrusivePtr<UIElement> innerVisual;
+    // Check ListView GridViewColumnsSpec multi-column row generation first
+    const UnifiedValue gvVal = GetValue(PropId_GridViewColumnsSpec);
+    if (const auto* gvSv = std::get_if<StringValue>(&gvVal); gvSv && !gvSv->view().empty()) {
+        auto rowGrid = MakeIntrusive<Grid>();
+        rowGrid->SetValue(PropId_DataContext, itemVal, ValueSourceRank::Local);
+        rowGrid->SetPadding(Thickness{4.0f, 3.0f, 4.0f, 3.0f});
+        NativeHandleRegistry* reg = domains_ ? &domains_->nativeHandles() : nullptr;
+        ManagedHeap* heap = domains_ ? &domains_->uiHeap() : nullptr;
+        const std::string_view allCols = gvSv->view();
+        std::size_t pos = 0u;
+        std::int32_t colIdx = 0;
+        while (pos <= allCols.size()) {
+            const std::size_t recEnd = allCols.find('\x1e', pos);
+            const std::string_view rec = (recEnd == std::string_view::npos)
+                ? allCols.substr(pos)
+                : allCols.substr(pos, recEnd - pos);
+            if (!rec.empty()) {
+                std::string_view fields[5]{};
+                std::size_t fp = 0u;
+                for (int fi = 0; fi < 5; ++fi) {
+                    const std::size_t fn = rec.find('\x1f', fp);
+                    if (fn == std::string_view::npos) {
+                        fields[fi] = rec.substr(fp);
+                        break;
+                    }
+                    fields[fi] = rec.substr(fp, fn - fp);
+                    fp = fn + 1u;
+                }
+                float colW = 100.0f;
+                if (!fields[1].empty() && fields[1] != "Auto" && fields[1] != "NaN") {
+                    (void)TryGetFloat(ParseBuiltinLiteralPropertyValue(PropId_Width, fields[1]), colW);
+                }
+                rowGrid->AddColumnDefinition(GridUnitType::Pixel, std::max(24.0f, colW));
+
+                IntrusivePtr<UIElement> cellEl;
+                if (!fields[4].empty()) {
+                    if (const AxbPackage* cellDt = AxbTemplateRegistry::Instance().FindDataTemplate(fields[4])) {
+                        cellEl = InstantiateTemplatedItem(*cellDt, itemVal);
                     }
                 }
+                if (!cellEl) {
+                    auto cellTb = MakeIntrusive<TextBlock>();
+                    std::string cellText;
+                    if (!fields[2].empty()) {
+                        if (const auto* oref = std::get_if<ObjectRef>(&itemVal);
+                            oref && oref->valid() && domains_ && bindingEngine_ && bindingEngine_->Program()) {
+                            if (const auto* oh = domains_->heapForObject(*oref)) {
+                                const SymbolId tid = oh->objectTypeId(*oref).value_or(0);
+                                if (auto slot = domains_->resolvePropertySlot(*bindingEngine_->Program(), tid, std::string(fields[2]))) {
+                                    UnifiedValue fv{};
+                                    if (domains_->readPropertySlotFast(DomainKind::Ui, *oref, *slot, fv, nullptr, bindingEngine_->UiInterpreter())) {
+                                        cellText = FormatBindingString(fields[3], &fv, 1u, domains_);
+                                    }
+                                }
+                            }
+                        }
+                    } else {
+                        cellText = ResolveSmartObjectDisplayText(this, domains_, bindingEngine_, itemVal);
+                    }
+                    cellTb->SetText(cellText);
+                    cellTb->SetVerticalAlignment(VerticalAlignment::Center);
+                    cellEl = cellTb;
+                }
+                if (cellEl) {
+                    Grid::SetColumn(cellEl.Get(), colIdx);
+                    rowGrid->AddChild(cellEl.Get(), reg, heap);
+                }
+                ++colIdx;
             }
+            if (recEnd == std::string_view::npos) break;
+            pos = recEnd + 1u;
+        }
+        innerVisual = rowGrid;
+    } else if (const AxbPackage* tplPkg = ResolveActiveItemTemplate(itemVal)) {
+        outAppliedTemplate = tplPkg;
+        innerVisual = InstantiateTemplatedItem(*tplPkg, itemVal);
+    } else {
+        auto tb = MakeIntrusive<TextBlock>();
+        tb->SetText(ResolveSmartObjectDisplayText(this, domains_, bindingEngine_, itemVal));
+        innerVisual = tb;
+    }
+
+    if (!innerVisual) {
+        return {};
+    }
+
+    const std::int32_t altCount = CoerceInt32Property(GetValue(PropId_AlternationCount), 0);
+    const std::int64_t altIdx = (altCount > 1) ? static_cast<std::int64_t>(index % static_cast<std::size_t>(altCount)) : 0;
+    if (altCount > 1) {
+        innerVisual->SetValue(PropId_AlternationIndex, value::FromInt(altIdx), ValueSourceRank::Local);
+    }
+
+    // Wrap in ListBoxItem/ContentControl container when ItemContainerStyle is specified
+    const UnifiedValue icsVal = GetValue(PropId_ItemContainerStyle);
+    if (const auto* icsSv = std::get_if<StringValue>(&icsVal); icsSv && !icsSv->view().empty()) {
+        const std::string styleKey = icsSv->str();
+        if (const AxbStyleDefinition* stDef = AxbTemplateRegistry::Instance().FindStyle(styleKey)) {
+            auto container = MakeIntrusive<Border>();
+            container->SetDeclaredTypeName(IsA<ListBox>() ? "ListBoxItem" : "ContentControl");
+            container->SetValue(PropId_DataContext, itemVal, ValueSourceRank::Local);
+            container->SetValue(PropId_Style, value::FromString(styleKey), ValueSourceRank::Local);
+            if (altCount > 1) {
+                container->SetValue(PropId_AlternationIndex, value::FromInt(altIdx), ValueSourceRank::Local);
+            }
+            if (bindingEngine_) container->BindTwoWayEngine(bindingEngine_);
+            if (animationEngine_) container->BindAnimationEngine(animationEngine_);
+            NativeHandleRegistry* reg = domains_ ? &domains_->nativeHandles() : nullptr;
+            ManagedHeap* heap = domains_ ? &domains_->uiHeap() : nullptr;
+            container->AddChild(innerVisual.Get(), reg, heap);
+
+            ObjectRef itemObj{};
+            if (const auto* ref = std::get_if<ObjectRef>(&itemVal)) itemObj = *ref;
+            if (!styleEngine_) {
+                const AxbControlTemplate* ctToMount = !stDef->controlTemplateKey.empty()
+                    ? AxbTemplateRegistry::Instance().FindControlTemplate(stDef->controlTemplateKey)
+                    : stDef->inlineControlTemplate.get();
+                if (ctToMount) {
+                    (void)container->ApplyControlTemplate(
+                        *ctToMount,
+                        domains_,
+                        bindingEngine_,
+                        itemObj,
+                        bindingEngine_ ? bindingEngine_->UiInterpreter() : nullptr,
+                        nullptr,
+                        animationEngine_);
+                }
+            }
+            for (const auto& setter : stDef->setters) {
+                if (setter.propId == PropId_Template) continue;
+                if (setter.hasBinding && setter.binding && bindingEngine_ && itemObj.valid()) {
+                    AxbCompiledBindingChain bc = *setter.binding;
+                    if (bindingEngine_->Program()) {
+                        AxbPackage tmpPkg{};
+                        if (auto* ih = domains_ ? domains_->heapForObject(itemObj) : nullptr; ih && ih->isAlive(itemObj)) {
+                            if (const auto tid = ih->objectTypeId(itemObj)) {
+                                if (const auto* ts = bindingEngine_->Program()->resolveType(*tid)) {
+                                    tmpPkg.rootDataTypeName = ts->name;
+                                }
+                            }
+                        }
+                        tmpPkg.bindingChains.push_back(bc);
+                        tmpPkg.BindAgainstProgram(*bindingEngine_->Program());
+                        bc = std::move(tmpPkg.bindingChains[0]);
+                    }
+                    if (!bc.hops.empty()) {
+                        (void)bindingEngine_->BindChain(itemObj, bc, container);
+                    } else if (!bc.rawPath.empty()) {
+                        (void)bindingEngine_->BindPath(itemObj, bc.rawPath, container, setter.propId, bc.mode);
+                    }
+                } else if (!setter.hasBinding && !styleEngine_) {
+                    (void)container->SetValue(setter.propId, setter.value, ValueSourceRank::ThemeStyle);
+                }
+            }
+            if (styleEngine_) {
+                (void)styleEngine_->BindSubtreeStyles(container.Get());
+                (void)styleEngine_->EvaluateSubtree(container.Get());
+            }
+            return container;
         }
     }
-    tb->SetText(displayStr);
-    return tb;
+
+    return innerVisual;
 }
 
 bool ItemsControl::RebindMaterializedItemInPlace(
@@ -6233,6 +6772,14 @@ bool ItemsControl::RebindMaterializedItemInPlace(
     if (!elem) return false;
     if (elem->GetVisibility() != Visibility::Visible) {
         elem->SetVisibility(Visibility::Visible);
+    }
+    const std::int32_t altCount = CoerceInt32Property(GetValue(PropId_AlternationCount), 0);
+    if (altCount > 1) {
+        const auto altIdx = static_cast<std::int64_t>(index % static_cast<std::size_t>(altCount));
+        elem->SetValue(PropId_AlternationIndex, value::FromInt(altIdx), ValueSourceRank::Local);
+        for (UIElement* ch = elem->FirstChild(); ch != nullptr; ch = ch->NextSibling()) {
+            ch->SetValue(PropId_AlternationIndex, value::FromInt(altIdx), ValueSourceRank::Local);
+        }
     }
     if (itemBinder_) {
         itemBinder_(index, itemVal, *elem);
@@ -6256,7 +6803,7 @@ bool ItemsControl::RebindMaterializedItemInPlace(
         }
         if (tplPkg == nullptr && appliedTpl == nullptr) {
             if (auto* tb = elem->DynamicCast<TextBlock>()) {
-                tb->SetText(rs_rt::valueToString(itemVal));
+                tb->SetText(ResolveSmartObjectDisplayText(this, domains_, bindingEngine_, itemVal));
                 return true;
             }
         }
@@ -6567,7 +7114,8 @@ void ItemsControl::SetItemsSource(
         }
     }
 
-    if (IsVirtualizing() && !IsA<ComboBox>()) {
+    if (IsVirtualizing() && !IsA<ComboBox>() &&
+        ResolveItemsPanelConfig(this).mode == ItemsPanelMode::VerticalStack) {
         MoveVirtualSlotsToRecyclePool(registry, uiHeap);
         InvalidateLayout();
         return;
@@ -6640,7 +7188,7 @@ bool ItemsControl::ApplyIncrementalChanges(
     }
 
     // 2. Virtualized ItemsControl / ListBox O(1) incremental path
-    if (IsVirtualizing()) {
+    if (IsVirtualizing() && ResolveItemsPanelConfig(this).mode == ItemsPanelMode::VerticalStack) {
         if (virtualSlots_.empty()) {
             // Window not yet realized by initial layout: apply deltas directly to items_
             for (std::size_t c = 0u; c < changeCount; ++c) {
@@ -7017,7 +7565,9 @@ void ItemsControl::OnPropertyChanged(std::uint16_t propId, const UnifiedValue& n
         return;
     }
 
-    if ((propId == PropId_IsVirtualizing || propId == PropId_ItemTemplate) &&
+    if ((propId == PropId_IsVirtualizing || propId == PropId_ItemTemplate ||
+         propId == PropId_ItemsPanel || propId == PropId_ItemContainerStyle ||
+         propId == PropId_DisplayMemberPath || propId == PropId_GridViewColumnsSpec) &&
         !IsA<ComboBox>()) {
         NativeHandleRegistry* registry = domains_ ? &domains_->nativeHandles() : nullptr;
         ManagedHeap* uiHeap = domains_ ? &domains_->uiHeap() : nullptr;
@@ -7118,7 +7668,9 @@ Size ItemsControl::MeasureCore(Size availableSize) noexcept {
     lastChildAvailableSize_ = childAvail;
     hasValidMeasureConstraint_ = true;
 
-    if (IsVirtualizing() && !IsA<ComboBox>()) {
+    const ParsedItemsPanelConfig panelCfg = ResolveItemsPanelConfig(this);
+    if (IsVirtualizing() && !IsA<ComboBox>() && panelCfg.mode == ItemsPanelMode::VerticalStack &&
+        (!items_.empty() || hasBoundItemsSource_ || FirstChild() == nullptr)) {
         if (items_.empty()) {
             return Size{padW, padH};
         }
@@ -7171,6 +7723,84 @@ Size ItemsControl::MeasureCore(Size availableSize) noexcept {
         return Size{estimatedMaxItemWidth_ + padW, totalLogicalH + padH};
     }
 
+    if (panelCfg.mode == ItemsPanelMode::Canvas) {
+        for (UIElement* c = FirstChild(); c != nullptr; c = c->NextSibling()) {
+            c->Measure(Size{kUnconstrainedSpace, kUnconstrainedSpace});
+        }
+        return Size{padW, padH};
+    }
+    if (panelCfg.mode == ItemsPanelMode::HorizontalStack) {
+        float totalW = 0.0f, maxH = 0.0f;
+        bool first = true;
+        for (UIElement* c = FirstChild(); c != nullptr; c = c->NextSibling()) {
+            c->Measure(Size{kUnconstrainedSpace, childAvail.height});
+            if (c->GetVisibility() == Visibility::Collapsed) continue;
+            if (!first) totalW += panelCfg.spacing;
+            first = false;
+            totalW += c->DesiredSize().width;
+            maxH = std::max(maxH, c->DesiredSize().height);
+        }
+        return Size{totalW + padW, maxH + padH};
+    }
+    if (panelCfg.mode == ItemsPanelMode::UniformGrid) {
+        std::size_t visCount = 0u;
+        for (UIElement* c = FirstChild(); c != nullptr; c = c->NextSibling()) {
+            if (c->GetVisibility() != Visibility::Collapsed) ++visCount;
+        }
+        std::int32_t cols = panelCfg.cols;
+        std::int32_t rows = panelCfg.rows;
+        std::int32_t firstCol = panelCfg.firstCol;
+        if (cols <= 0) {
+            cols = (rows > 0 && visCount > 0u)
+                ? static_cast<std::int32_t>((visCount + firstCol + rows - 1) / rows)
+                : std::max<std::int32_t>(1, static_cast<std::int32_t>(std::ceil(std::sqrt(static_cast<float>(std::max<std::size_t>(1u, visCount))))));
+        }
+        if (firstCol >= cols) firstCol = 0;
+        if (rows <= 0) {
+            rows = std::max<std::int32_t>(1, static_cast<std::int32_t>((visCount + firstCol + cols - 1) / cols));
+        }
+        const Size cellAvail{
+            (childAvail.width < kUnconstrainedSpace * 0.5f) ? (childAvail.width / static_cast<float>(cols)) : kUnconstrainedSpace,
+            (childAvail.height < kUnconstrainedSpace * 0.5f) ? (childAvail.height / static_cast<float>(rows)) : kUnconstrainedSpace};
+        float maxCW = 0.0f, maxCH = 0.0f;
+        for (UIElement* c = FirstChild(); c != nullptr; c = c->NextSibling()) {
+            c->Measure(cellAvail);
+            if (c->GetVisibility() != Visibility::Collapsed) {
+                maxCW = std::max(maxCW, c->DesiredSize().width);
+                maxCH = std::max(maxCH, c->DesiredSize().height);
+            }
+        }
+        return Size{maxCW * static_cast<float>(cols) + padW, maxCH * static_cast<float>(rows) + padH};
+    }
+    if (panelCfg.mode == ItemsPanelMode::WrapHorizontal || panelCfg.mode == ItemsPanelMode::WrapVertical) {
+        const bool horiz = (panelCfg.mode == ItemsPanelMode::WrapHorizontal);
+        const float lineLimit = horiz ? childAvail.width : childAvail.height;
+        float lineMain = 0.0f, lineCross = 0.0f, maxMain = 0.0f, totalCross = 0.0f;
+        for (UIElement* c = FirstChild(); c != nullptr; c = c->NextSibling()) {
+            const Size cAvail{
+                (panelCfg.itemWidth > 0.0f) ? panelCfg.itemWidth : kUnconstrainedSpace,
+                (panelCfg.itemHeight > 0.0f) ? panelCfg.itemHeight : kUnconstrainedSpace};
+            c->Measure(cAvail);
+            if (c->GetVisibility() == Visibility::Collapsed) continue;
+            const float cw = (panelCfg.itemWidth > 0.0f) ? panelCfg.itemWidth : c->DesiredSize().width;
+            const float ch = (panelCfg.itemHeight > 0.0f) ? panelCfg.itemHeight : c->DesiredSize().height;
+            const float m = horiz ? cw : ch;
+            const float cr = horiz ? ch : cw;
+            if (lineMain > 0.0f && lineMain + m > lineLimit) {
+                maxMain = std::max(maxMain, lineMain);
+                totalCross += lineCross;
+                lineMain = m;
+                lineCross = cr;
+            } else {
+                lineMain += m;
+                lineCross = std::max(lineCross, cr);
+            }
+        }
+        maxMain = std::max(maxMain, lineMain);
+        totalCross += lineCross;
+        return horiz ? Size{maxMain + padW, totalCross + padH} : Size{totalCross + padW, maxMain + padH};
+    }
+
     float totalH = 0.0f;
     float maxW = 0.0f;
     for (UIElement* c = FirstChild(); c != nullptr; c = c->NextSibling()) {
@@ -7188,7 +7818,9 @@ void ItemsControl::ArrangeCore(Rect finalRect) noexcept {
     const float startY = finalRect.y + p.top;
     const float innerW = std::max(0.0f, finalRect.width - (p.left + p.right));
 
-    if (IsVirtualizing() && !IsA<ComboBox>()) {
+    const ParsedItemsPanelConfig panelCfg = ResolveItemsPanelConfig(this);
+    if (IsVirtualizing() && !IsA<ComboBox>() && panelCfg.mode == ItemsPanelMode::VerticalStack &&
+        (!items_.empty() || hasBoundItemsSource_ || FirstChild() == nullptr)) {
         if (items_.empty()) {
             return;
         }
@@ -7240,6 +7872,100 @@ void ItemsControl::ArrangeCore(Rect finalRect) noexcept {
                     break;
                 }
             }
+        }
+        return;
+    }
+
+    const float innerH = std::max(0.0f, finalRect.height - (p.top + p.bottom));
+    if (panelCfg.mode == ItemsPanelMode::Canvas) {
+        for (UIElement* c = FirstChild(); c != nullptr; c = c->NextSibling()) {
+            const Size d = c->DesiredSize();
+            float cx = startX;
+            if (c->GetPropertySourceRank(PropId_CanvasLeft) != ValueSourceRank::Default) {
+                cx = startX + Canvas::GetLeft(c);
+            } else if (c->GetPropertySourceRank(PropId_CanvasRight) != ValueSourceRank::Default) {
+                cx = startX + innerW - d.width - Canvas::GetRight(c);
+            }
+            float cy = startY;
+            if (c->GetPropertySourceRank(PropId_CanvasTop) != ValueSourceRank::Default) {
+                cy = startY + Canvas::GetTop(c);
+            } else if (c->GetPropertySourceRank(PropId_CanvasBottom) != ValueSourceRank::Default) {
+                cy = startY + innerH - d.height - Canvas::GetBottom(c);
+            }
+            c->Arrange(Rect{cx, cy, d.width, d.height});
+        }
+        return;
+    }
+    if (panelCfg.mode == ItemsPanelMode::HorizontalStack) {
+        float cursorX = startX;
+        for (UIElement* c = FirstChild(); c != nullptr; c = c->NextSibling()) {
+            if (c->GetVisibility() == Visibility::Collapsed) {
+                c->Arrange(Rect{cursorX, startY, 0.0f, 0.0f});
+                continue;
+            }
+            const Size d = c->DesiredSize();
+            c->Arrange(Rect{cursorX, startY, d.width, innerH});
+            cursorX += d.width + panelCfg.spacing;
+        }
+        return;
+    }
+    if (panelCfg.mode == ItemsPanelMode::UniformGrid) {
+        std::size_t visCount = 0u;
+        for (UIElement* c = FirstChild(); c != nullptr; c = c->NextSibling()) {
+            if (c->GetVisibility() != Visibility::Collapsed) ++visCount;
+        }
+        std::int32_t cols = panelCfg.cols;
+        std::int32_t rows = panelCfg.rows;
+        std::int32_t firstCol = panelCfg.firstCol;
+        if (cols <= 0) {
+            cols = (rows > 0 && visCount > 0u)
+                ? static_cast<std::int32_t>((visCount + firstCol + rows - 1) / rows)
+                : std::max<std::int32_t>(1, static_cast<std::int32_t>(std::ceil(std::sqrt(static_cast<float>(std::max<std::size_t>(1u, visCount))))));
+        }
+        if (firstCol >= cols) firstCol = 0;
+        if (rows <= 0) {
+            rows = std::max<std::int32_t>(1, static_cast<std::int32_t>((visCount + firstCol + cols - 1) / cols));
+        }
+        const float cellW = innerW / static_cast<float>(cols);
+        const float cellH = innerH / static_cast<float>(rows);
+        std::int32_t slot = firstCol;
+        for (UIElement* c = FirstChild(); c != nullptr; c = c->NextSibling()) {
+            if (c->GetVisibility() == Visibility::Collapsed) {
+                c->Arrange(Rect{startX, startY, 0.0f, 0.0f});
+                continue;
+            }
+            const std::int32_t rIdx = slot / cols;
+            const std::int32_t cIdx = slot % cols;
+            c->Arrange(Rect{startX + cIdx * cellW, startY + rIdx * cellH, cellW, cellH});
+            ++slot;
+        }
+        return;
+    }
+    if (panelCfg.mode == ItemsPanelMode::WrapHorizontal || panelCfg.mode == ItemsPanelMode::WrapVertical) {
+        const bool horiz = (panelCfg.mode == ItemsPanelMode::WrapHorizontal);
+        const float limit = horiz ? innerW : innerH;
+        float curMain = 0.0f, curCross = 0.0f, lineCross = 0.0f;
+        for (UIElement* c = FirstChild(); c != nullptr; c = c->NextSibling()) {
+            if (c->GetVisibility() == Visibility::Collapsed) {
+                c->Arrange(Rect{startX, startY, 0.0f, 0.0f});
+                continue;
+            }
+            const float cw = (panelCfg.itemWidth > 0.0f) ? panelCfg.itemWidth : c->DesiredSize().width;
+            const float ch = (panelCfg.itemHeight > 0.0f) ? panelCfg.itemHeight : c->DesiredSize().height;
+            const float m = horiz ? cw : ch;
+            const float cr = horiz ? ch : cw;
+            if (curMain > 0.0f && curMain + m > limit) {
+                curCross += lineCross;
+                curMain = 0.0f;
+                lineCross = 0.0f;
+            }
+            if (horiz) {
+                c->Arrange(Rect{startX + curMain, startY + curCross, cw, ch});
+            } else {
+                c->Arrange(Rect{startX + curCross, startY + curMain, cw, ch});
+            }
+            curMain += m;
+            lineCross = std::max(lineCross, cr);
         }
         return;
     }
@@ -7382,7 +8108,9 @@ bool ListBox::OnPointerDown(
             continue;
         }
         const Rect cr = c->FinalRect();
-        if (cr.height > 0.0f && localPoint.y >= cr.y && localPoint.y < cr.y + cr.height) {
+        if (cr.width > 0.0f && cr.height > 0.0f &&
+            localPoint.x >= cr.x && localPoint.x < cr.x + cr.width &&
+            localPoint.y >= cr.y && localPoint.y < cr.y + cr.height) {
             const std::size_t logicalIdx = IsVirtualizing()
                 ? (FirstRealizedItemIndex() + childOffset)
                 : childOffset;
@@ -7515,10 +8243,14 @@ UnifiedValue ComboBox::GetComboItemValue(std::size_t index) const {
     return UnifiedValue{};
 }
 
+std::string ComboBox::FormatItemDisplayText(const UnifiedValue& val) const {
+    return ResolveSmartObjectDisplayText(this, Domains(), BoundTwoWayEngine(), val);
+}
+
 std::string ComboBox::GetComboItemText(std::size_t index) const {
     if (!Items().empty()) {
         if (index < Items().size()) {
-            return rs_rt::valueToString(Items()[index]);
+            return FormatItemDisplayText(Items()[index]);
         }
         return {};
     }
@@ -7562,7 +8294,7 @@ std::string ComboBox::GetSelectedItemText() const {
     }
     const UnifiedValue itemVal = GetValue(PropId_SelectedItem);
     if (!std::holds_alternative<std::monostate>(itemVal)) {
-        return rs_rt::valueToString(itemVal);
+        return FormatItemDisplayText(itemVal);
     }
     return {};
 }
@@ -9537,8 +10269,18 @@ IntrusivePtr<UIElement> CreateElementByTypeNameCore(std::string_view typeName, s
     if (shortName == "BoxShadow") {
         return MakeIntrusive<BoxShadow>();
     }
+    if (shortName == "Popup" || shortName == "ToolTip") {
+        return MakeIntrusive<Popup>();
+    }
+    if (shortName == "Decorator" || shortName == "ViewboxDecorator" ||
+        shortName == "AdornerDecorator" || shortName == "BulletDecorator" ||
+        shortName == "ScrollContentPresenter") {
+        return MakeIntrusive<Decorator>();
+    }
     if (shortName == "Border" ||
         shortName == "ContentControl" ||
+        shortName == "Separator" || shortName == "StatusBarItem" ||
+        shortName == "Control" || shortName == "FrameworkElement" ||
         shortName == "ComboBoxItem" || shortName == "ListBoxItem" ||
         shortName == "ListViewItem" || shortName == "TreeViewItem") {
         return MakeIntrusive<Border>();

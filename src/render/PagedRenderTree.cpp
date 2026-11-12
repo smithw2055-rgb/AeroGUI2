@@ -795,12 +795,50 @@ float EvaluateMtsdfCoverage(
     const float u = std::clamp(normX01, 0.0f, 1.0f) * static_cast<float>(entry.cellWidth) - 0.5f;
     const float v = std::clamp(normY01, 0.0f, 1.0f) * static_cast<float>(entry.cellHeight) - 0.5f;
 
-    const int x0 = std::clamp(static_cast<int>(std::floor(u)), 0, static_cast<int>(entry.cellWidth) - 1);
-    const int y0 = std::clamp(static_cast<int>(std::floor(v)), 0, static_cast<int>(entry.cellHeight) - 1);
-    const int x1 = std::min(x0 + 1, static_cast<int>(entry.cellWidth) - 1);
-    const int y1 = std::min(y0 + 1, static_cast<int>(entry.cellHeight) - 1);
-    const float fx = std::clamp(u - std::floor(u), 0.0f, 1.0f);
-    const float fy = std::clamp(v - std::floor(v), 0.0f, 1.0f);
+    const int maxX = static_cast<int>(entry.cellWidth) - 1;
+    const int maxY = static_cast<int>(entry.cellHeight) - 1;
+    const float fu = std::floor(u);
+    const float fv = std::floor(v);
+    const int x0 = std::clamp(static_cast<int>(fu), 0, maxX);
+    const int y0 = std::clamp(static_cast<int>(fv), 0, maxY);
+    const int x1 = std::min(x0 + 1, maxX);
+    const int y1 = std::min(y0 + 1, maxY);
+
+    const std::uint8_t* basePtr = entry.mtsdfRgbaPixels.data();
+    const std::size_t rowStride = static_cast<std::size_t>(entry.cellWidth) * 4u;
+    const std::uint8_t* p00 = basePtr + static_cast<std::size_t>(y0) * rowStride + static_cast<std::size_t>(x0) * 4u;
+    const std::uint8_t* p10 = basePtr + static_cast<std::size_t>(y0) * rowStride + static_cast<std::size_t>(x1) * 4u;
+    const std::uint8_t* p01 = basePtr + static_cast<std::size_t>(y1) * rowStride + static_cast<std::size_t>(x0) * 4u;
+    const std::uint8_t* p11 = basePtr + static_cast<std::size_t>(y1) * rowStride + static_cast<std::size_t>(x1) * 4u;
+
+    if (!singleChannelTrueSdfOnly) {
+        const std::uint8_t orRgb =
+            p00[0] | p00[1] | p00[2] |
+            p10[0] | p10[1] | p10[2] |
+            p01[0] | p01[1] | p01[2] |
+            p11[0] | p11[1] | p11[2];
+        if (orRgb == 0u) {
+            return 0.0f;
+        }
+        const std::uint8_t andRgb =
+            p00[0] & p00[1] & p00[2] &
+            p10[0] & p10[1] & p10[2] &
+            p01[0] & p01[1] & p01[2] &
+            p11[0] & p11[1] & p11[2];
+        if (andRgb == 255u) {
+            return 1.0f;
+        }
+    } else {
+        if ((p00[3] | p10[3] | p01[3] | p11[3]) == 0u) {
+            return 0.0f;
+        }
+        if ((p00[3] & p10[3] & p01[3] & p11[3]) == 255u) {
+            return 1.0f;
+        }
+    }
+
+    const float fx = std::clamp(u - fu, 0.0f, 1.0f);
+    const float fy = std::clamp(v - fv, 0.0f, 1.0f);
 
     auto sampleChannel = [&](int cx, int cy, std::size_t ch) noexcept -> float {
         const std::size_t idx = (static_cast<std::size_t>(cy) * entry.cellWidth + static_cast<std::size_t>(cx)) * 4u + ch;
@@ -3962,6 +4000,10 @@ bool PagedRenderTree::SyncDirtySubtreeRecursive(
         CollapseSubtreeRenderNodesRecursive(elem, ioUpdatedNodes);
         return true;
     }
+    if (const auto* pop = elem->DynamicCast<Popup>(); pop && !pop->IsOpen()) {
+        CollapseSubtreeRenderNodesRecursive(elem, ioUpdatedNodes);
+        return true;
+    }
 
     if (elem->HasActiveTransform3D() || parentState.hasPerspective3D ||
         elem->GetEffectKind() != UIEffectKind::None || !blurLayerSpans_.empty()) {
@@ -4089,6 +4131,11 @@ void PagedRenderTree::TraverseAndEmitElement(
         return;
     }
     if (elem->GetVisibility() == Visibility::Collapsed) {
+        std::size_t dummy = 0;
+        CollapseSubtreeRenderNodesRecursive(elem, dummy);
+        return;
+    }
+    if (const auto* pop = elem->DynamicCast<Popup>(); pop && !pop->IsOpen()) {
         std::size_t dummy = 0;
         CollapseSubtreeRenderNodesRecursive(elem, dummy);
         return;
@@ -5680,11 +5727,26 @@ void PagedRenderTree::TraverseAndEmitElement(
             }
         }
 
+        auto readChildZ = [](const UIElement* ch) noexcept -> std::int64_t {
+            if (const auto* ze = ch->FindCompactEntry(PropId_ZIndex)) {
+                if (const auto* zi = std::get_if<std::int64_t>(&ze->effectiveValue)) return *zi;
+                float zf = 0.0f;
+                if (TryGetFloat(ze->effectiveValue, zf)) return static_cast<std::int64_t>(std::lround(zf));
+            }
+            return 0;
+        };
+        bool hasNonZeroZ = false;
         for (const UIElement* child = elem->FirstChild(); child != nullptr; child = child->NextSibling()) {
+            if (readChildZ(child) != 0) {
+                hasNonZeroZ = true;
+                break;
+            }
+        }
+        auto emitOneChild = [&](const UIElement* child) {
             if (selfExpander && selfExpander->IsBodyChildHidden(child)) {
                 std::size_t dummy = 0u;
                 CollapseSubtreeRenderNodesRecursive(child, dummy);
-                continue;
+                return;
             }
             if (selfTabControl && selfTabControl->IsChildInactiveTabPage(child)) {
                 std::size_t dummy = 0u;
@@ -5694,14 +5756,29 @@ void PagedRenderTree::TraverseAndEmitElement(
                         TraverseAndEmitElement(hdrElem, childState);
                     }
                 }
-                continue;
+                return;
             }
             if (tabItemHostedInTabControl && child == tabItemHeaderElem) {
-                // Active TabItem's rich HeaderElement is emitted in tab strip order (or right here)
                 TraverseAndEmitElement(child, childState);
-                continue;
+                return;
             }
             TraverseAndEmitElement(child, childState);
+        };
+        if (!hasNonZeroZ) {
+            for (const UIElement* child = elem->FirstChild(); child != nullptr; child = child->NextSibling()) {
+                emitOneChild(child);
+            }
+        } else {
+            std::vector<const UIElement*> zSorted;
+            for (const UIElement* child = elem->FirstChild(); child != nullptr; child = child->NextSibling()) {
+                zSorted.push_back(child);
+            }
+            std::stable_sort(zSorted.begin(), zSorted.end(), [&](const UIElement* a, const UIElement* b) noexcept {
+                return readChildZ(a) < readChildZ(b);
+            });
+            for (const UIElement* child : zSorted) {
+                emitOneChild(child);
+            }
         }
     }
 

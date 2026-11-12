@@ -1396,6 +1396,49 @@ void BlendPremulOver(
     dst[3] = a + dst[3] * invA;
 }
 
+[[nodiscard]] Color SampleTextureSlotBilinear(
+    const TextureSlotBuffer& slot,
+    float u,
+    float v) noexcept {
+    if (slot.width == 0u || slot.height == 0u ||
+        slot.rgbaPixels.size() < static_cast<std::size_t>(slot.width) * slot.height * 4u) {
+        return Color{0.0f, 0.0f, 0.0f, 0.0f};
+    }
+    const float clampedU = std::clamp(u, 0.0f, 1.0f);
+    const float clampedV = std::clamp(v, 0.0f, 1.0f);
+    const float texX = clampedU * static_cast<float>(slot.width) - 0.5f;
+    const float texY = clampedV * static_cast<float>(slot.height) - 0.5f;
+
+    const int maxX = static_cast<int>(slot.width) - 1;
+    const int maxY = static_cast<int>(slot.height) - 1;
+    const float flX = std::floor(texX);
+    const float flY = std::floor(texY);
+    const int x0 = std::clamp(static_cast<int>(flX), 0, maxX);
+    const int y0 = std::clamp(static_cast<int>(flY), 0, maxY);
+    const int x1 = std::min(x0 + 1, maxX);
+    const int y1 = std::min(y0 + 1, maxY);
+    const float fx = std::clamp(texX - flX, 0.0f, 1.0f);
+    const float fy = std::clamp(texY - flY, 0.0f, 1.0f);
+
+    const std::size_t stride = static_cast<std::size_t>(slot.width) * 4u;
+    const std::uint8_t* p00 = slot.rgbaPixels.data() + static_cast<std::size_t>(y0) * stride + static_cast<std::size_t>(x0) * 4u;
+    const std::uint8_t* p10 = slot.rgbaPixels.data() + static_cast<std::size_t>(y0) * stride + static_cast<std::size_t>(x1) * 4u;
+    const std::uint8_t* p01 = slot.rgbaPixels.data() + static_cast<std::size_t>(y1) * stride + static_cast<std::size_t>(x0) * 4u;
+    const std::uint8_t* p11 = slot.rgbaPixels.data() + static_cast<std::size_t>(y1) * stride + static_cast<std::size_t>(x1) * 4u;
+
+    constexpr float kInv255 = 1.0f / 255.0f;
+    auto bilerpCh = [&](std::size_t ch) noexcept -> float {
+        const float c00 = static_cast<float>(p00[ch]);
+        const float c10 = static_cast<float>(p10[ch]);
+        const float c01 = static_cast<float>(p01[ch]);
+        const float c11 = static_cast<float>(p11[ch]);
+        const float top = c00 + (c10 - c00) * fx;
+        const float bot = c01 + (c11 - c01) * fx;
+        return (top + (bot - top) * fy) * kInv255;
+    };
+    return Color{bilerpCh(0u), bilerpCh(1u), bilerpCh(2u), bilerpCh(3u)};
+}
+
 void SeparableBoxBlurPremul3Pass(PremulOffscreenLayer& layer, int boxRadius) {
     if (boxRadius <= 0 || layer.width <= 0 || layer.height <= 0) {
         return;
@@ -1403,13 +1446,22 @@ void SeparableBoxBlurPremul3Pass(PremulOffscreenLayer& layer, int boxRadius) {
     const int w = layer.width;
     const int h = layer.height;
     const float invKernel = 1.0f / static_cast<float>(boxRadius * 2 + 1);
-    std::vector<float> scratch(static_cast<std::size_t>(w) * static_cast<std::size_t>(h) * 4u, 0.0f);
+    const std::size_t rowFloats = static_cast<std::size_t>(w) * 4u;
+    thread_local std::vector<float> tlScratch;
+    thread_local std::vector<float> tlColSums;
+    const std::size_t totalFloats = rowFloats * static_cast<std::size_t>(h);
+    if (tlScratch.size() < totalFloats) {
+        tlScratch.resize(totalFloats);
+    }
+    if (tlColSums.size() < rowFloats) {
+        tlColSums.resize(rowFloats);
+    }
 
     for (int pass = 0; pass < 3; ++pass) {
-        // Horizontal 1D sliding-window box blur: premulRgba -> scratch
+        // Horizontal 1D sliding-window box blur: premulRgba -> tlScratch
         for (int y = 0; y < h; ++y) {
-            const float* srcRow = layer.premulRgba.data() + static_cast<std::size_t>(y) * static_cast<std::size_t>(w) * 4u;
-            float* dstRow = scratch.data() + static_cast<std::size_t>(y) * static_cast<std::size_t>(w) * 4u;
+            const float* srcRow = layer.premulRgba.data() + static_cast<std::size_t>(y) * rowFloats;
+            float* dstRow = tlScratch.data() + static_cast<std::size_t>(y) * rowFloats;
             float sumR = 0.0f;
             float sumG = 0.0f;
             float sumB = 0.0f;
@@ -1440,36 +1492,25 @@ void SeparableBoxBlurPremul3Pass(PremulOffscreenLayer& layer, int boxRadius) {
             }
         }
 
-        // Vertical 1D sliding-window box blur: scratch -> premulRgba
-        const std::size_t rowFloats = static_cast<std::size_t>(w) * 4u;
-        for (int x = 0; x < w; ++x) {
-            float sumR = 0.0f;
-            float sumG = 0.0f;
-            float sumB = 0.0f;
-            float sumA = 0.0f;
-            for (int k = -boxRadius; k <= boxRadius; ++k) {
-                const int sy = std::clamp(k, 0, h - 1);
-                const float* p = scratch.data() + static_cast<std::size_t>(sy) * rowFloats + static_cast<std::size_t>(x) * 4u;
-                sumR += p[0];
-                sumG += p[1];
-                sumB += p[2];
-                sumA += p[3];
+        // Cache-friendly row-major vertical 1D sliding-window box blur: tlScratch -> premulRgba
+        float* colSums = tlColSums.data();
+        std::fill_n(colSums, rowFloats, 0.0f);
+        for (int k = -boxRadius; k <= boxRadius; ++k) {
+            const int sy = std::clamp(k, 0, h - 1);
+            const float* srcRow = tlScratch.data() + static_cast<std::size_t>(sy) * rowFloats;
+            for (std::size_t i = 0u; i < rowFloats; ++i) {
+                colSums[i] += srcRow[i];
             }
-            for (int y = 0; y < h; ++y) {
-                float* outP = layer.premulRgba.data() + static_cast<std::size_t>(y) * rowFloats + static_cast<std::size_t>(x) * 4u;
-                outP[0] = sumR * invKernel;
-                outP[1] = sumG * invKernel;
-                outP[2] = sumB * invKernel;
-                outP[3] = sumA * invKernel;
-
-                const int removeY = std::clamp(y - boxRadius, 0, h - 1);
-                const int addY = std::clamp(y + boxRadius + 1, 0, h - 1);
-                const float* remP = scratch.data() + static_cast<std::size_t>(removeY) * rowFloats + static_cast<std::size_t>(x) * 4u;
-                const float* addP = scratch.data() + static_cast<std::size_t>(addY) * rowFloats + static_cast<std::size_t>(x) * 4u;
-                sumR += addP[0] - remP[0];
-                sumG += addP[1] - remP[1];
-                sumB += addP[2] - remP[2];
-                sumA += addP[3] - remP[3];
+        }
+        for (int y = 0; y < h; ++y) {
+            float* dstRow = layer.premulRgba.data() + static_cast<std::size_t>(y) * rowFloats;
+            const int removeY = std::clamp(y - boxRadius, 0, h - 1);
+            const int addY = std::clamp(y + boxRadius + 1, 0, h - 1);
+            const float* remRow = tlScratch.data() + static_cast<std::size_t>(removeY) * rowFloats;
+            const float* addRow = tlScratch.data() + static_cast<std::size_t>(addY) * rowFloats;
+            for (std::size_t i = 0u; i < rowFloats; ++i) {
+                dstRow[i] = colSums[i] * invKernel;
+                colSums[i] += addRow[i] - remRow[i];
             }
         }
     }
@@ -1540,8 +1581,12 @@ void RasterizeSingleNode(
         const std::uint8_t g8 = static_cast<std::uint8_t>((v0.rgba >> 8u) & 0xFFu);
         const std::uint8_t b8 = static_cast<std::uint8_t>((v0.rgba >> 16u) & 0xFFu);
         const float baseAlpha = static_cast<float>(a8) / 255.0f;
+        const AeroPrimType primPreCheck = DecodeVertexPrimType(v0.primType);
         const std::uint32_t boundTextureId = page.header.reserved[0];
-        const bool hasBoundTexture = ImageAtlas::Instance().HasTextureSlot(boundTextureId);
+        const TextureSlotBuffer* boundTexSlot = (primPreCheck == AeroPrimType::TexturedQuad)
+            ? ImageAtlas::Instance().GetTextureSlot(boundTextureId)
+            : nullptr;
+        const bool hasBoundTexture = (boundTexSlot != nullptr);
 
         const float minX = std::min(std::min(v0.x, v1.x), std::min(v2.x, v3.x));
         const float maxX = std::max(std::max(v0.x, v1.x), std::max(v2.x, v3.x));
@@ -1621,6 +1666,75 @@ void RasterizeSingleNode(
             }
         }
 
+        if (pxEnd <= pxStart || pyEnd <= pyStart) {
+            continue;
+        }
+        const float quadUnscaledHalfW = std::max(std::fabs(v0.u), std::fabs(v2.u));
+        const float quadUnscaledHalfH = std::max(std::fabs(v0.v), std::fabs(v2.v));
+        const float quadHalfW = (quadUnscaledHalfW > 1e-4f) ? quadUnscaledHalfW : (localQuadW * 0.5f);
+        const float quadHalfH = (quadUnscaledHalfH > 1e-4f) ? quadUnscaledHalfH : (localQuadH * 0.5f);
+        const float quadAaFeather = std::max(
+            1e-4f,
+            (quadHalfW * localQuadH + quadHalfH * localQuadW) * std::fabs(invDet));
+        const float perpQuadW = std::fabs(det) / std::max(localQuadH, 1e-4f);
+        const float perpQuadH = std::fabs(det) / std::max(localQuadW, 1e-4f);
+        const bool uniformSdfCr = IsUniformCornerRadius(sdfRadii);
+
+        const std::uint32_t pathGradId = (prim == AeroPrimType::MsdfVectorPath)
+            ? ((nd->gradientBrushId != 0u)
+                   ? nd->gradientBrushId
+                   : static_cast<std::uint32_t>((v0.primType >> 4u) & 0x0FFFu))
+            : 0u;
+        const GradientBrushDesc* hoistedPathGradBrush = (pathGradId != 0u)
+            ? GradientBrushRegistry::Instance().Find(pathGradId)
+            : nullptr;
+
+        std::uint32_t hoistedRectGradId = 0u;
+        float hoistedGradRadius = 0.0f;
+        bool hoistedGradIsEllipse = false;
+        const GradientBrushDesc* hoistedRectGradBrush = nullptr;
+        if (prim == AeroPrimType::GradientRoundedRect) {
+            UnpackGradientRoundedRectVertexParams(
+                v0.primType,
+                v0.flags,
+                hoistedRectGradId,
+                hoistedGradRadius,
+                hoistedGradIsEllipse);
+            if (hoistedRectGradId == 0u) {
+                hoistedRectGradId = nd->gradientBrushId;
+            }
+            if (hoistedRectGradId != 0u) {
+                hoistedRectGradBrush = GradientBrushRegistry::Instance().Find(hoistedRectGradId);
+            }
+        }
+
+        float hoistedMtsdfStrokePx = 0.0f;
+        bool hoistedMtsdfStrokeOnly = false;
+        float hoistedFullCellW = 0.0f;
+        float hoistedFullCellH = 0.0f;
+        float hoistedEntrySpanU = 1.0f;
+        float hoistedEntrySpanV = 1.0f;
+        if (prim == AeroPrimType::MsdfVectorPath && mtsdfEntry &&
+            mtsdfEntry->cellWidth > 0 && mtsdfEntry->cellHeight > 0) {
+            float dummyUvRange = 0.0f;
+            UnpackMtsdfParams(v0.flags, dummyUvRange, hoistedMtsdfStrokePx);
+            hoistedMtsdfStrokeOnly = IsMtsdfStrokeOnly(v0.flags);
+            const float cellW = static_cast<float>(mtsdfEntry->cellWidth);
+            const float cellH = static_cast<float>(mtsdfEntry->cellHeight);
+            const float uMin = std::min(v0.u, v2.u);
+            const float uMax = std::max(v0.u, v2.u);
+            const float vMin = std::min(v0.v, v2.v);
+            const float vMax = std::max(v0.v, v2.v);
+            hoistedEntrySpanU = std::max(1e-6f, mtsdfEntry->u1 - mtsdfEntry->u0);
+            hoistedEntrySpanV = std::max(1e-6f, mtsdfEntry->v1 - mtsdfEntry->v0);
+            const float quadTexSpanX = std::max(1e-3f, ((uMax - uMin) / hoistedEntrySpanU) * std::max(1.0f, cellW - 1.0f));
+            const float quadTexSpanY = std::max(1e-3f, ((vMax - vMin) / hoistedEntrySpanV) * std::max(1.0f, cellH - 1.0f));
+            hoistedFullCellW = cellW * (perpQuadW / quadTexSpanX);
+            hoistedFullCellH = cellH * (perpQuadH / quadTexSpanY);
+        }
+
+        const FontAtlas& fontAtlasRef = FontAtlas::Instance();
+
         for (int py = pyStart; py < pyEnd; ++py) {
             for (int px = pxStart; px < pxEnd; ++px) {
                 const float sx = static_cast<float>(px) + 0.5f;
@@ -1649,22 +1763,18 @@ void RasterizeSingleNode(
                 std::uint8_t shadeB = b8;
                 float coverage = 1.0f;
                 if (prim == AeroPrimType::SdfRoundedRect) {
-                    const float unscaledHalfW = std::max(std::fabs(v0.u), std::fabs(v2.u));
-                    const float unscaledHalfH = std::max(std::fabs(v0.v), std::fabs(v2.v));
-                    const float halfW = (unscaledHalfW > 1e-4f) ? unscaledHalfW : (localQuadW * 0.5f);
-                    const float halfH = (unscaledHalfH > 1e-4f) ? unscaledHalfH : (localQuadH * 0.5f);
+                    const float halfW = quadHalfW;
+                    const float halfH = quadHalfH;
                     const float localX = (su - 0.5f) * (2.0f * halfW);
                     const float localY = (sv - 0.5f) * (2.0f * halfH);
-                    const float aaFeather = std::max(
-                        1e-4f,
-                        (halfW * localQuadH + halfH * localQuadW) * std::fabs(invDet));
+                    const float aaFeather = quadAaFeather;
 
                     if (nd->softFeatherPx > 0.0f) {
                         const float pad = std::max(0.0f, nd->sdfPadPx);
                         const float boxHalfW = std::max(0.5f, halfW - pad);
                         const float boxHalfH = std::max(0.5f, halfH - pad);
                         const float softFeather = std::max(aaFeather, nd->softFeatherPx * 1.6f);
-                        if (IsUniformCornerRadius(sdfRadii)) {
+                        if (uniformSdfCr) {
                             coverage = EvaluateSdfRoundedRectCoverage(
                                 localX,
                                 localY,
@@ -1690,7 +1800,7 @@ void RasterizeSingleNode(
                             sdfRadii,
                             sdfBorder,
                             aaFeather);
-                    } else if (IsUniformCornerRadius(sdfRadii)) {
+                    } else if (uniformSdfCr) {
                         const float rad = sdfRadii.topLeft;
                         const float border = sdfBorder.left;
                         const float outerCov = EvaluateSdfRoundedRectCoverage(
@@ -1738,31 +1848,16 @@ void RasterizeSingleNode(
                                static_cast<std::size_t>(mtsdfEntry->cellWidth) * mtsdfEntry->cellHeight * 4u) {
                     const float cellW = static_cast<float>(mtsdfEntry->cellWidth);
                     const float cellH = static_cast<float>(mtsdfEntry->cellHeight);
-                    const float uMin = std::min(v0.u, v2.u);
-                    const float uMax = std::max(v0.u, v2.u);
-                    const float vMin = std::min(v0.v, v2.v);
-                    const float vMax = std::max(v0.v, v2.v);
                     const float uInterp = v0.u + su * (v1.u - v0.u) + sv * (v3.u - v0.u);
                     const float vInterp = v0.v + su * (v1.v - v0.v) + sv * (v3.v - v0.v);
-
-                    const float entrySpanU = std::max(1e-6f, mtsdfEntry->u1 - mtsdfEntry->u0);
-                    const float entrySpanV = std::max(1e-6f, mtsdfEntry->v1 - mtsdfEntry->v0);
-                    const float cellTexX = 0.5f + ((uInterp - mtsdfEntry->u0) / entrySpanU) * std::max(1.0f, cellW - 1.0f);
-                    const float cellTexY = 0.5f + ((vInterp - mtsdfEntry->v0) / entrySpanV) * std::max(1.0f, cellH - 1.0f);
+                    const float cellTexX = 0.5f + ((uInterp - mtsdfEntry->u0) / hoistedEntrySpanU) * std::max(1.0f, cellW - 1.0f);
+                    const float cellTexY = 0.5f + ((vInterp - mtsdfEntry->v0) / hoistedEntrySpanV) * std::max(1.0f, cellH - 1.0f);
                     const float normX = std::clamp(cellTexX / cellW, 0.0f, 1.0f);
                     const float normY = std::clamp(cellTexY / cellH, 0.0f, 1.0f);
-
-                    const float perpQuadW = std::fabs(det) / std::max(localQuadH, 1e-4f);
-                    const float perpQuadH = std::fabs(det) / std::max(localQuadW, 1e-4f);
-                    const float quadTexSpanX = std::max(1e-3f, ((uMax - uMin) / entrySpanU) * std::max(1.0f, cellW - 1.0f));
-                    const float quadTexSpanY = std::max(1e-3f, ((vMax - vMin) / entrySpanV) * std::max(1.0f, cellH - 1.0f));
-                    const float fullCellW = cellW * (perpQuadW / quadTexSpanX);
-                    const float fullCellH = cellH * (perpQuadH / quadTexSpanY);
-
-                    float unpackedUvRange = 0.0f;
-                    float strokePx = 0.0f;
-                    UnpackMtsdfParams(v0.flags, unpackedUvRange, strokePx);
-                    const bool strokeOnly = IsMtsdfStrokeOnly(v0.flags);
+                    const float fullCellW = hoistedFullCellW;
+                    const float fullCellH = hoistedFullCellH;
+                    const float strokePx = hoistedMtsdfStrokePx;
+                    const bool strokeOnly = hoistedMtsdfStrokeOnly;
 
                     if (nd->softFeatherPx > 0.0f) {
                         const float u = normX * cellW - 0.5f;
@@ -1819,12 +1914,8 @@ void RasterizeSingleNode(
                         }
                         coverage = fillCov;
                     }
-                    const std::uint32_t pathGradId =
-                        (nd->gradientBrushId != 0u)
-                            ? nd->gradientBrushId
-                            : static_cast<std::uint32_t>((v0.primType >> 4u) & 0x0FFFu);
-                    if (pathGradId != 0u && coverage > 0.0f) {
-                        if (const GradientBrushDesc* gBrush = GradientBrushRegistry::Instance().Find(pathGradId)) {
+                    if (hoistedPathGradBrush != nullptr && coverage > 0.0f) {
+                        if (const GradientBrushDesc* gBrush = hoistedPathGradBrush) {
                             const Color gc = EvaluateGradientBrushAtNormalizedUv(
                                 *gBrush,
                                 std::clamp(su, 0.0f, 1.0f),
@@ -1842,15 +1933,11 @@ void RasterizeSingleNode(
                     float sweepDeg = 0.0f;
                     float innerRatio = 0.0f;
                     UnpackSdfRadialArcParams(v0.flags, startDeg, sweepDeg, innerRatio);
-                    const float unscaledHalfW = std::max(std::fabs(v0.u), std::fabs(v2.u));
-                    const float unscaledHalfH = std::max(std::fabs(v0.v), std::fabs(v2.v));
-                    const float halfW = (unscaledHalfW > 1e-4f) ? unscaledHalfW : (localQuadW * 0.5f);
-                    const float halfH = (unscaledHalfH > 1e-4f) ? unscaledHalfH : (localQuadH * 0.5f);
+                    const float halfW = quadHalfW;
+                    const float halfH = quadHalfH;
                     const float localX = (su - 0.5f) * (2.0f * halfW);
                     const float localY = (sv - 0.5f) * (2.0f * halfH);
-                    const float aaFeather = std::max(
-                        1e-4f,
-                        (halfW * localQuadH + halfH * localQuadW) * std::fabs(invDet));
+                    const float aaFeather = quadAaFeather;
                     coverage = EvaluateSdfRadialArcCoverage(
                         localX,
                         localY,
@@ -1865,9 +1952,7 @@ void RasterizeSingleNode(
                     const float vInterp = v0.v + su * (v1.v - v0.v) + sv * (v3.v - v0.v);
                     const float uSpan = v1.u - v0.u;
                     const float vSpan = v3.v - v0.v;
-                    const float perpQuadW = std::fabs(det) / std::max(localQuadH, 1e-4f);
-                    const float perpQuadH = std::fabs(det) / std::max(localQuadW, 1e-4f);
-                    coverage = FontAtlas::Instance().EvaluateGlyphSdfCoverage(
+                    coverage = fontAtlasRef.EvaluateGlyphSdfCoverage(
                         uInterp,
                         vInterp,
                         uSpan,
@@ -1884,7 +1969,7 @@ void RasterizeSingleNode(
                     const float vInterp = topV + sv * (botV - topV);
 
                     const Color texel = hasBoundTexture
-                        ? ImageAtlas::Instance().SampleBilinearRgba(boundTextureId, uInterp, vInterp)
+                        ? SampleTextureSlotBilinear(*boundTexSlot, uInterp, vInterp)
                         : Color{1.0f, 1.0f, 1.0f, 1.0f};
 
                     float vertR = static_cast<float>(r8) * (1.0f / 255.0f);
@@ -1940,15 +2025,11 @@ void RasterizeSingleNode(
                     float strokePx = 0.0f;
                     bool hollowStroke = false;
                     UnpackSdfEllipseParams(v0.flags, strokePx, hollowStroke);
-                    const float unscaledHalfW = std::max(std::fabs(v0.u), std::fabs(v2.u));
-                    const float unscaledHalfH = std::max(std::fabs(v0.v), std::fabs(v2.v));
-                    const float halfW = (unscaledHalfW > 1e-4f) ? unscaledHalfW : (localQuadW * 0.5f);
-                    const float halfH = (unscaledHalfH > 1e-4f) ? unscaledHalfH : (localQuadH * 0.5f);
+                    const float halfW = quadHalfW;
+                    const float halfH = quadHalfH;
                     const float localX = (su - 0.5f) * (2.0f * halfW);
                     const float localY = (sv - 0.5f) * (2.0f * halfH);
-                    const float aaFeather = std::max(
-                        1e-4f,
-                        (halfW * localQuadH + halfH * localQuadW) * std::fabs(invDet));
+                    const float aaFeather = quadAaFeather;
                     coverage = EvaluateSdfEllipseCoverage(
                         localX,
                         localY,
@@ -1958,27 +2039,13 @@ void RasterizeSingleNode(
                         hollowStroke,
                         aaFeather);
                 } else if (prim == AeroPrimType::GradientRoundedRect) {
-                    std::uint32_t brushId = 0u;
-                    float gradRadius = 0.0f;
-                    bool isEllipse = false;
-                    UnpackGradientRoundedRectVertexParams(
-                        v0.primType,
-                        v0.flags,
-                        brushId,
-                        gradRadius,
-                        isEllipse);
-                    if (brushId == 0u) {
-                        brushId = nd->gradientBrushId;
-                    }
-                    const float unscaledHalfW = std::max(std::fabs(v0.u), std::fabs(v2.u));
-                    const float unscaledHalfH = std::max(std::fabs(v0.v), std::fabs(v2.v));
-                    const float halfW = (unscaledHalfW > 1e-4f) ? unscaledHalfW : (localQuadW * 0.5f);
-                    const float halfH = (unscaledHalfH > 1e-4f) ? unscaledHalfH : (localQuadH * 0.5f);
+                    const float gradRadius = hoistedGradRadius;
+                    const bool isEllipse = hoistedGradIsEllipse;
+                    const float halfW = quadHalfW;
+                    const float halfH = quadHalfH;
                     const float localX = (su - 0.5f) * (2.0f * halfW);
                     const float localY = (sv - 0.5f) * (2.0f * halfH);
-                    const float aaFeather = std::max(
-                        1e-4f,
-                        (halfW * localQuadH + halfH * localQuadW) * std::fabs(invDet));
+                    const float aaFeather = quadAaFeather;
 
                     float shapeCov = 1.0f;
                     if (isEllipse || nd->isEllipseShape) {
@@ -2009,7 +2076,7 @@ void RasterizeSingleNode(
                     }
 
                     if (shapeCov > 0.002f) {
-                        const GradientBrushDesc* brush = GradientBrushRegistry::Instance().Find(brushId);
+                        const GradientBrushDesc* brush = hoistedRectGradBrush;
                         const Color gradCol = brush
                             ? EvaluateGradientBrushAtNormalizedUv(
                                   *brush,

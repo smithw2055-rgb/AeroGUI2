@@ -158,6 +158,16 @@ void DetachSubtreeRenderNodes(UIElement* elem) noexcept {
         case PropId_ContentTemplate:
         case PropId_RichText:
         case PropId_RefResolution:
+        case PropId_CanvasRight:
+        case PropId_CanvasBottom:
+        case PropId_ContentSource:
+        case PropId_DisplayMemberPath:
+        case PropId_ItemsPanel:
+        case PropId_ItemContainerStyle:
+        case PropId_IsOpen:
+        case PropId_HeaderTemplate:
+        case PropId_TextTrimming:
+        case PropId_GridViewColumnsSpec:
             return true;
         default:
             return false;
@@ -207,6 +217,8 @@ void DetachSubtreeRenderNodes(UIElement* elem) noexcept {
         case PropId_GridColumnSpan:
         case PropId_CanvasLeft:
         case PropId_CanvasTop:
+        case PropId_CanvasRight:
+        case PropId_CanvasBottom:
         case PropId_Dock:
         case PropId_MaxWidth:
         case PropId_MaxHeight:
@@ -1303,6 +1315,7 @@ void UIElement::ClearEffect() {
     (void)ClearValue(PropId_EffectColor, ValueSourceRank::Local);
     (void)ClearValue(PropId_EffectBlurRadius, ValueSourceRank::Local);
     (void)ClearValue(PropId_EffectShadowDepth, ValueSourceRank::Local);
+    (void)ClearValue(PropId_EffectOpacity, ValueSourceRank::Local);
 }
 
 UIEffectKind UIElement::GetEffectKind() const noexcept {
@@ -1335,6 +1348,12 @@ UIEffectDescriptor UIElement::GetEffectDescriptor() const noexcept {
             }
             desc.directionDeg = f4.z;
             desc.opacity = std::clamp(f4.w, 0.0f, 1.0f);
+        }
+    }
+    if (const auto* opEntry = FindCompactEntry(PropId_EffectOpacity)) {
+        float eop = desc.opacity;
+        if (TryGetFloat(opEntry->effectiveValue, eop)) {
+            desc.opacity = std::clamp(eop, 0.0f, 1.0f);
         }
     }
 
@@ -1478,6 +1497,9 @@ UIElement* UIElement::HitTest(Point point) noexcept {
     if (GetVisibility() != Visibility::Visible || GetOpacity() <= 0.0f) {
         return nullptr;
     }
+    if (const auto* pop = DynamicCast<Popup>(); pop && !pop->IsOpen()) {
+        return nullptr;
+    }
 
     // Invert this element's 3D perspective planar homography (when Transform3D is active)
     // or full 2D affine RenderTransform (+ RenderTransformOrigin + Projection3D)
@@ -1530,19 +1552,69 @@ UIElement* UIElement::HitTest(Point point) noexcept {
         }
     }
 
-    // Traverse children in reverse Z-order (lastChild_ -> firstChild_), skipping hidden Expander/TabControl slots
+    // Traverse children in reverse Z-order (highest Panel.ZIndex / lastChild_ -> firstChild_), skipping hidden Expander/TabControl slots
     if (childrenReachable) {
         const auto* selfExpander = DynamicCast<Expander>();
         const auto* selfTabControl = DynamicCast<TabControl>();
-        for (UIElement* child = lastChild_; child != nullptr; child = child->prevSibling_) {
-            if (selfExpander && selfExpander->IsBodyChildHidden(child)) {
-                continue;
+        auto readChildZ = [](const UIElement* ch) noexcept -> std::int64_t {
+            if (const auto* ze = ch->FindCompactEntry(PropId_ZIndex)) {
+                if (const auto* zi = std::get_if<std::int64_t>(&ze->effectiveValue)) {
+                    return *zi;
+                }
+                float zf = 0.0f;
+                if (TryGetFloat(ze->effectiveValue, zf)) {
+                    return static_cast<std::int64_t>(std::lround(zf));
+                }
             }
-            if (selfTabControl && selfTabControl->IsChildInactiveTabPage(child)) {
-                continue;
+            return 0;
+        };
+        bool hasNonZeroZ = false;
+        for (const UIElement* child = firstChild_; child != nullptr; child = child->nextSibling_) {
+            if (readChildZ(child) != 0) {
+                hasNonZeroZ = true;
+                break;
             }
-            if (UIElement* hit = child->HitTest(childPt)) {
-                return hit;
+        }
+        if (!hasNonZeroZ) {
+            for (UIElement* child = lastChild_; child != nullptr; child = child->prevSibling_) {
+                if (selfExpander && selfExpander->IsBodyChildHidden(child)) {
+                    continue;
+                }
+                if (selfTabControl && selfTabControl->IsChildInactiveTabPage(child)) {
+                    continue;
+                }
+                if (UIElement* hit = child->HitTest(childPt)) {
+                    return hit;
+                }
+            }
+        } else {
+            struct ZHitChild {
+                UIElement* elem;
+                std::int64_t z;
+                std::size_t domOrder;
+            };
+            std::vector<ZHitChild> sorted;
+            std::size_t idx = 0u;
+            for (UIElement* child = firstChild_; child != nullptr; child = child->nextSibling_) {
+                sorted.push_back(ZHitChild{child, readChildZ(child), idx++});
+            }
+            std::stable_sort(sorted.begin(), sorted.end(), [](const ZHitChild& a, const ZHitChild& b) {
+                if (a.z != b.z) {
+                    return a.z < b.z;
+                }
+                return a.domOrder < b.domOrder;
+            });
+            for (auto it = sorted.rbegin(); it != sorted.rend(); ++it) {
+                UIElement* child = it->elem;
+                if (selfExpander && selfExpander->IsBodyChildHidden(child)) {
+                    continue;
+                }
+                if (selfTabControl && selfTabControl->IsChildInactiveTabPage(child)) {
+                    continue;
+                }
+                if (UIElement* hit = child->HitTest(childPt)) {
+                    return hit;
+                }
             }
         }
     }
@@ -2166,6 +2238,10 @@ bool UIElement::SetValue(
             (void)ClearValue(gradPropId, rank);
         }
         InvalidateRender();
+        if (propId == PropId_ZIndex && parent_) {
+            parent_->DetachRenderNodeSpan();
+            parent_->InvalidateRender();
+        }
         if (IsLayoutAffectingSparseProperty(propId)) {
             InvalidateLayout();
             if (IsParentLayoutAttachedProperty(propId) && parent_) {
@@ -2198,6 +2274,10 @@ bool UIElement::SetValue(
         (void)ClearValue(gradPropId, rank);
     }
     InvalidateRender();
+    if (propId == PropId_ZIndex && parent_) {
+        parent_->DetachRenderNodeSpan();
+        parent_->InvalidateRender();
+    }
     if (IsLayoutAffectingSparseProperty(propId)) {
         InvalidateLayout();
         if (IsParentLayoutAttachedProperty(propId) && parent_) {
@@ -2320,6 +2400,10 @@ bool UIElement::ForceEffectiveValue(
         (void)ForceClearSparseEntry(gradPropId);
     }
     InvalidateRender();
+    if (propId == PropId_ZIndex && parent_) {
+        parent_->DetachRenderNodeSpan();
+        parent_->InvalidateRender();
+    }
     if (IsLayoutAffectingSparseProperty(propId)) {
         InvalidateLayout();
         if (IsParentLayoutAttachedProperty(propId) && parent_) {
@@ -2356,6 +2440,10 @@ bool UIElement::ForceClearSparseEntry(std::uint16_t propId) {
         (void)ForceClearSparseEntry(gradPropId);
     }
     InvalidateRender();
+    if (propId == PropId_ZIndex && parent_) {
+        parent_->DetachRenderNodeSpan();
+        parent_->InvalidateRender();
+    }
     if (IsLayoutAffectingSparseProperty(propId)) {
         InvalidateLayout();
         if (IsParentLayoutAttachedProperty(propId) && parent_) {
@@ -2467,6 +2555,10 @@ bool UIElement::ClearValue(std::uint16_t propId, ValueSourceRank rank) {
         (void)ClearValue(gradPropId, rank);
     }
     InvalidateRender();
+    if (propId == PropId_ZIndex && parent_) {
+        parent_->DetachRenderNodeSpan();
+        parent_->InvalidateRender();
+    }
     if (IsLayoutAffectingSparseProperty(propId)) {
         InvalidateLayout();
         if (IsParentLayoutAttachedProperty(propId) && parent_) {
@@ -3055,7 +3147,8 @@ void UIElement::SyncTemplateBindingsForProperty(std::uint16_t changedPropId) noe
 
     const bool isContentGroup =
         (changedPropId == PropId_Content || changedPropId == PropId_Text ||
-         changedPropId == PropId_Title || changedPropId == PropId_ContentTemplate);
+         changedPropId == PropId_Title || changedPropId == PropId_ContentTemplate ||
+         changedPropId == PropId_Header || changedPropId == PropId_HeaderTemplate);
 
     for (const auto& link : mountedTemplate_->bindings) {
         if (!link.target) {
@@ -3096,7 +3189,8 @@ void UIElement::SyncTemplateBindingsForProperty(std::uint16_t changedPropId) noe
         for (const auto& cp : mountedTemplate_->contentPresenters) {
             if (!cp) continue;
             if (changedPropId == PropId_Content || changedPropId == PropId_Text ||
-                changedPropId == PropId_ContentTemplate) {
+                changedPropId == PropId_ContentTemplate ||
+                changedPropId == PropId_Header || changedPropId == PropId_HeaderTemplate) {
                 cp->SyncContentTemplateChild();
             }
             if (affectsMetrics) {
@@ -3466,12 +3560,34 @@ bool UIElement::ApplyControlTemplate(
             : (AnimationEngine::IsLiveInstance(boundAnimationEngine_) ? boundAnimationEngine_ : nullptr));
 
     if (mountedOk && mountedTemplate_) {
-        // Host logical UIElement content inside the primary ContentPresenter if present
+        // Host logical UIElement content (and HeaderedContentControl headerElement) inside matching ContentPresenters
         if (!mountedTemplate_->logicalChildren.empty() && !mountedTemplate_->contentPresenters.empty()) {
-            ContentPresenter* primaryCp = mountedTemplate_->contentPresenters.front().Get();
+            UIElement* hdrLogical = nullptr;
+            if (const auto* hcc = DynamicCast<HeaderedContentControl>()) {
+                hdrLogical = hcc->GetRawHeaderElement();
+            }
+            ContentPresenter* headerCp = nullptr;
+            ContentPresenter* contentCp = nullptr;
+            for (const auto& cpRef : mountedTemplate_->contentPresenters) {
+                if (!cpRef) continue;
+                const std::string cs = cpRef->GetContentSource();
+                if (cs == "Header") {
+                    if (!headerCp) headerCp = cpRef.Get();
+                } else if (cs.empty() || cs == "Content") {
+                    if (!contentCp) contentCp = cpRef.Get();
+                }
+            }
+            if (!contentCp && mountedTemplate_->contentPresenters.size() == 1u && !headerCp) {
+                contentCp = mountedTemplate_->contentPresenters.front().Get();
+            }
             for (const auto& lc : mountedTemplate_->logicalChildren) {
-                if (lc && primaryCp) {
-                    (void)primaryCp->AddChild(lc.Get(), reg, heap);
+                if (!lc) continue;
+                if (lc.Get() == hdrLogical) {
+                    if (headerCp) {
+                        (void)headerCp->AddChild(lc.Get(), reg, heap);
+                    }
+                } else if (contentCp) {
+                    (void)contentCp->AddChild(lc.Get(), reg, heap);
                 }
             }
         }

@@ -503,15 +503,15 @@ int main(int argc, char** argv) {
         {"Login", "Login/Data/MainPage.xaml", "Login/Data/Resources.xaml", 1.0f, 0xe52312950e1871afULL, 50000u, 600u},
         {"Buttons", "Buttons/Data/MainPage.xaml", "Buttons/Data/Resources.xaml", 1.0f, 0x1dc81e85638e4134ULL, 50000u, 600u},
         {"QuestLog", "QuestLog/Data/MainPage.xaml", "QuestLog/Data/Resources.xaml", 1.0f, 0x57a28126d5c058efULL, 20000u, 600u},
-        {"Inventory", "Inventory/Data/MainPage.xaml", "Inventory/Data/Resources.xaml", 3.2f, 0x1fa7d27c66a6b3aeULL, 40000u, 300u},
+        {"Inventory", "Inventory/Data/MainPage.xaml", "Inventory/Data/Resources.xaml", 3.2f, 0xdc85cde6a258c5e5ULL, 40000u, 300u},
         {"Scoreboard", "Scoreboard/Data/MainPage.xaml", nullptr, 1.0f, 0x063ca2044a4f5443ULL, 50000u, 600u},
         {"TicTacToe", "TicTacToe/Data/MainPage.xaml", "TicTacToe/Data/Resources.xaml", 1.0f, 0xdf6758fc356ab321ULL, 50000u, 1000u},
         {"Localization", "Localization/Data/MainPage.xaml", "Localization/Data/Language-en.xaml", 1.0f, 0xa3d3d035b759cae9ULL, 50000u, 800u},
         {"Gallery", "Gallery/Data/MainWindow.xaml", "Gallery/Data/Resources.xaml", 1.0f, 0x97982bf0a0b5c10aULL, 50000u, 600u},
-        {"Brushes", "Gallery/Data/Samples/Brushes.xaml", "Gallery/Data/Resources.xaml", 1.0f, 0x5c1288863f0dba6bULL, 5000u, 600u},
-        {"Gallery_Blending", "Gallery/Data/Samples/Blending.xaml", "Gallery/Data/Resources.xaml", 1.0f, 0x5379a9caa15d97a8ULL, 7000u, 500u},
+        {"Brushes", "Gallery/Data/Samples/Brushes.xaml", "Gallery/Data/Resources.xaml", 1.0f, 0xf5fbaa4f98c890f5ULL, 5000u, 600u},
+        {"Gallery_Blending", "Gallery/Data/Samples/Blending.xaml", "Gallery/Data/Resources.xaml", 1.0f, 0xf81782644ae39d27ULL, 7000u, 500u},
         {"Rive", "Rive/Data/MainPage.xaml", nullptr, 1.0f, 0xb5434a846c223365ULL, 50000u, 3000u},
-        {"Effects", "Gallery/Data/Samples/Effects.xaml", "Gallery/Data/Resources.xaml", 1.0f, 0xbc145dcab875c3ddULL, 8000u, 2000u},
+        {"Effects", "Gallery/Data/Samples/Effects.xaml", "Gallery/Data/Resources.xaml", 1.0f, 0x625000cc7552dd34ULL, 8000u, 2000u},
         {"BackgroundBlur", "BackgroundBlur/Data/MainPage.xaml", "BackgroundBlur/Data/Resources.xaml", 1.0f, 0x637465c308a7b16cULL, 40000u, 800u},
         {"BrushShaders", "BrushShaders/Data/MainPage.xaml", nullptr, 1.0f, 0x9ca3061feedf5fd5ULL, 50000u, 300u},
         {"UserControl", "UserControl/Data/MainPage.xaml", "UserControl/Data/Resources.xaml", 1.0f, 0x261e72f064aeb55cULL, 50000u, 800u},
@@ -561,7 +561,7 @@ int main(int argc, char** argv) {
             std::transform(ext.begin(), ext.end(), ext.begin(), [](unsigned char c) {
                 return static_cast<char>(std::tolower(c));
             });
-            if (ext == ".ttf") {
+            if (ext == ".ttf" || ext == ".otf") {
                 fontFiles.push_back(entry.path());
             }
         }
@@ -811,7 +811,7 @@ int main(int argc, char** argv) {
             ofs << lineBuf;
 
             ofs << "### 测试覆盖边界说明（Honest Scope Notes）\n\n";
-            ofs << "- **编译与 `.axb4` 二进制往返校验（21 个官方示例工程目录，74 个 `.xaml` + 9 个 `.riv`）**：全部 21 个官方示例目录均纳入扫描，其中所有 74 个 `.xaml` 资产 100% 通过 `AeroCompiler::Compile` 与 `.axb4` 序列化/反序列化字节级一致性校验，9 个 `.riv` 资产 100% 通过 `RiveImporter::ImportBytesToAxb`。\n";
+            ofs << "- **编译与 `.axb4` 二进制往返校验（21 个官方示例工程目录，116 个 `.xaml` + 9 个 `.riv`）**：全部 21 个官方示例目录均纳入扫描，其中所有 116 个 `.xaml` 资产 100% 通过 `AeroCompiler::Compile` 与 `.axb4` 序列化/反序列化字节级一致性校验，9 个 `.riv` 资产 100% 通过 `RiveImporter::ImportBytesToAxb`。\n";
             ofs << "- **CPU 黄金像素光栅化覆盖（13 个工程共 16 个静态/动画 XAML 场景）**：覆盖 `BackgroundBlur`、`BrushShaders`、`Buttons`、`Gallery`（含 `Gallery` 主窗体、`Brushes`、`Gallery_Blending`、`Effects` 共 4 个场景）、`HelloWorld`、`Inventory`、`Localization`、`Login`、`QuestLog`、`Rive`、`Scoreboard`、`TicTacToe`、`UserControl`。\n";
             ofs << "- **仅做 `.xaml -> .axb4` 编译往返、未纳入纯 CPU 黄金像素光栅化的 8 个示例工程**：`CustomAnimation`、`CustomControl`、`CustomRender`、`DataBinding`、`Integration`、`IntegrationGLUT`、`Menu3D`、`VideoEffect`。这些工程依赖外部宿主 C++ 自定义控件/自定义渲染器/自定义动画类、GLUT/引擎宿主集成循环、C++ Code-Behind 动态 ViewModel 数据源或外部视频流与自定义 Shader 特效。\n";
             ofs << "- **静态 `DataContext` 挂载范围**：CPU 黄金光栅化在推进指定 `settleAnimSeconds` 入场动画后以空/静态 `DataContext`（`ObjectRef{}`）执行确定性软件光栅化，用于锁定 XAML 布局、样式字典、矢量图元、Rive 画板与混合模式的像素回归，不等同于运行示例原始 C++ ViewModel 业务逻辑或原生 GPU 自定义 Shader。\n\n";
@@ -862,7 +862,7 @@ int main(int argc, char** argv) {
                 ofs << lineBuf;
             }
 
-            ofs << "\n## 4. 全部 74 个官方 `.xaml` 编译与 `.axb4` 往返明细表\n\n";
+            ofs << "\n## 4. 全部 116 个官方 `.xaml` 编译与 `.axb4` 往返明细表\n\n";
             ofs << "| # | `.xaml` 相对路径 | 指令条数 | 样式数 | `.axb4` 字节数 | 编译耗时 (ms) | 往返校验耗时 (ms) | 结果 |\n";
             ofs << "| ---: | :--- | ---: | ---: | ---: | ---: | ---: | :--- |\n";
             for (std::size_t idx = 0u; idx < xamlRecords.size(); ++idx) {

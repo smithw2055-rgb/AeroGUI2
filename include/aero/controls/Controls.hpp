@@ -323,6 +323,10 @@ public:
     [[nodiscard]] static float GetLeft(const UIElement* element) noexcept;
     static void SetTop(UIElement* element, float top);
     [[nodiscard]] static float GetTop(const UIElement* element) noexcept;
+    static void SetRight(UIElement* element, float right);
+    [[nodiscard]] static float GetRight(const UIElement* element) noexcept;
+    static void SetBottom(UIElement* element, float bottom);
+    [[nodiscard]] static float GetBottom(const UIElement* element) noexcept;
 
     Size MeasureCore(Size availableSize) noexcept override;
     void ArrangeCore(Rect finalRect) noexcept override;
@@ -404,6 +408,7 @@ public:
         return StaticTypeClass();
     }
 
+    [[nodiscard]] std::string GetContentSource() const;
     [[nodiscard]] std::string GetEffectiveText() const;
     [[nodiscard]] Color GetEffectiveForeground() const noexcept;
     [[nodiscard]] float GetEffectiveFontSize() const noexcept;
@@ -871,6 +876,7 @@ public:
 
     void SetHeaderElement(UIElement* headerElem) noexcept;
     [[nodiscard]] UIElement* GetHeaderElement() const noexcept;
+    [[nodiscard]] UIElement* GetRawHeaderElement() const noexcept { return headerElement_; }
     [[nodiscard]] bool HasHeader() const noexcept;
 
     [[nodiscard]] Rect HeaderLocalRect() const noexcept { return headerLocalRect_; }
@@ -1273,6 +1279,7 @@ public:
     [[nodiscard]] std::string GetSelectedItemText() const;
 
     [[nodiscard]] std::size_t ComboItemCount() const noexcept;
+    [[nodiscard]] std::string FormatItemDisplayText(const UnifiedValue& val) const;
     [[nodiscard]] std::string GetComboItemText(std::size_t index) const;
     [[nodiscard]] UnifiedValue GetComboItemValue(std::size_t index) const;
 
@@ -1548,6 +1555,33 @@ public:
     [[nodiscard]] const TypeClass* GetTypeClass() const noexcept override {
         return StaticTypeClass();
     }
+};
+
+class Decorator : public Border {
+public:
+    Decorator();
+    ~Decorator() override = default;
+    static const TypeClass* StaticTypeClass() noexcept;
+    [[nodiscard]] const TypeClass* GetTypeClass() const noexcept override {
+        return StaticTypeClass();
+    }
+};
+
+class Popup : public Panel {
+public:
+    Popup();
+    ~Popup() override = default;
+    static const TypeClass* StaticTypeClass() noexcept;
+    [[nodiscard]] const TypeClass* GetTypeClass() const noexcept override {
+        return StaticTypeClass();
+    }
+
+    void SetIsOpen(bool open);
+    [[nodiscard]] bool IsOpen() const noexcept;
+
+    void OnPropertyChanged(std::uint16_t propId, const UnifiedValue& newValue) override;
+    Size MeasureCore(Size availableSize) noexcept override;
+    void ArrangeCore(Rect finalRect) noexcept override;
 };
 
 [[nodiscard]] std::string StripAndResolveRichTextBbCode(

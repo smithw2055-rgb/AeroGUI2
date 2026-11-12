@@ -276,6 +276,20 @@ enum BuiltinPropertyId : std::uint16_t {
     PropId_RefResolution = 151,             // Float4Value{refWidth, refHeight, 0, 0} (LayoutScaler.RefResolution)
     PropId_CustomIndexInt32 = 152,          // Int64 (Custom.Index_Int32 attached integer property)
     PropId_CustomStateInt32 = 153,          // Int64 (Custom.State_Int32 attached integer property)
+    PropId_CanvasRight = 154,               // float (Canvas.Right attached property)
+    PropId_CanvasBottom = 155,              // float (Canvas.Bottom attached property)
+    PropId_ZIndex = 156,                    // Int64 (Panel.ZIndex / Canvas.ZIndex attached property)
+    PropId_ContentSource = 157,             // StringValue (ContentPresenter.ContentSource: Content/Header/SelectionBoxItem)
+    PropId_DisplayMemberPath = 158,         // StringValue (ItemsControl.DisplayMemberPath)
+    PropId_ItemsPanel = 159,                // StringValue (ItemsControl.ItemsPanel key or serialized panel descriptor)
+    PropId_ItemContainerStyle = 160,        // StringValue (ItemsControl.ItemContainerStyle key)
+    PropId_IsOpen = 161,                    // bool (Popup.IsOpen / ToolTip.IsOpen)
+    PropId_EffectOpacity = 162,             // float [0..1] (DropShadowEffect.Opacity animatable override)
+    PropId_HeaderTemplate = 163,            // StringValue (HeaderedContentControl.HeaderTemplate)
+    PropId_TextTrimming = 164,              // Int64 (TextBlock.TextTrimming: 0=None, 1=CharacterEllipsis, 2=WordEllipsis)
+    PropId_AlternationCount = 165,          // Int64 (ItemsControl.AlternationCount)
+    PropId_AlternationIndex = 166,          // Int64 (ItemsControl.AlternationIndex)
+    PropId_GridViewColumnsSpec = 167,       // StringValue (ListView GridView serialized columns spec)
     PropId_FirstContractInput = 0x1000u,    // Dynamic/Contract input bridge slot range [0x1000 .. 0x1FFFu]
     // Pseudo-property IDs for zero-allocation inline interactive Trigger conditions
     PropId_TriggerIsMouseOver = 0xFF01u,

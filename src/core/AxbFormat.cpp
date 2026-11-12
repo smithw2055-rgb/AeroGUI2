@@ -7,6 +7,8 @@
 #include <cctype>
 #include <charconv>
 #include <cmath>
+#include <mutex>
+#include <unordered_map>
 #include <cstdlib>
 #include <cstring>
 #include <limits>
@@ -1064,6 +1066,11 @@ std::uint16_t ResolveBuiltinPropertyId(std::string_view propertyName) noexcept {
     if (propertyName == "Grid.ColumnSpan" || propertyName == "ColumnSpan") return PropId_GridColumnSpan;
     if (propertyName == "Canvas.Left" || propertyName == "Left") return PropId_CanvasLeft;
     if (propertyName == "Canvas.Top" || propertyName == "Top") return PropId_CanvasTop;
+    if (propertyName == "Canvas.Right" || propertyName == "Right") return PropId_CanvasRight;
+    if (propertyName == "Canvas.Bottom" || propertyName == "Bottom") return PropId_CanvasBottom;
+    if (propertyName == "Panel.ZIndex" || propertyName == "Canvas.ZIndex" || propertyName == "ZIndex") {
+        return PropId_ZIndex;
+    }
     if (propertyName == "DockPanel.Dock" || propertyName == "Dock") return PropId_Dock;
     if (propertyName == "LastChildFill") return PropId_LastChildFill;
     if (propertyName == "ItemWidth") return PropId_ItemWidth;
@@ -1186,6 +1193,41 @@ std::uint16_t ResolveBuiltinPropertyId(std::string_view propertyName) noexcept {
         propertyName == "RichText") return PropId_RichText;
     if (propertyName == "RefResolution" || propertyName == "LayoutScaler.RefResolution" ||
         propertyName == "noesis:LayoutScaler.RefResolution") return PropId_RefResolution;
+    if (propertyName == "Custom.Index_Int32" || propertyName == "Index_Int32") return PropId_CustomIndexInt32;
+    if (propertyName == "Custom.State_Int32" || propertyName == "State_Int32") return PropId_CustomStateInt32;
+    if (propertyName == "ContentSource" || propertyName == "ContentPresenter.ContentSource") {
+        return PropId_ContentSource;
+    }
+    if (propertyName == "DisplayMemberPath" || propertyName == "ItemsControl.DisplayMemberPath") {
+        return PropId_DisplayMemberPath;
+    }
+    if (propertyName == "ItemsPanel" || propertyName == "ItemsControl.ItemsPanel") {
+        return PropId_ItemsPanel;
+    }
+    if (propertyName == "ItemContainerStyle" || propertyName == "ItemsControl.ItemContainerStyle") {
+        return PropId_ItemContainerStyle;
+    }
+    if (propertyName == "IsOpen" || propertyName == "Popup.IsOpen" || propertyName == "ToolTip.IsOpen") {
+        return PropId_IsOpen;
+    }
+    if (propertyName == "EffectOpacity" || propertyName == "DropShadowEffect.Opacity") {
+        return PropId_EffectOpacity;
+    }
+    if (propertyName == "HeaderTemplate" || propertyName == "HeaderedContentControl.HeaderTemplate") {
+        return PropId_HeaderTemplate;
+    }
+    if (propertyName == "TextTrimming" || propertyName == "TextBlock.TextTrimming") {
+        return PropId_TextTrimming;
+    }
+    if (propertyName == "AlternationCount" || propertyName == "ItemsControl.AlternationCount") {
+        return PropId_AlternationCount;
+    }
+    if (propertyName == "AlternationIndex" || propertyName == "ItemsControl.AlternationIndex") {
+        return PropId_AlternationIndex;
+    }
+    if (propertyName == "GridViewColumnsSpec") {
+        return PropId_GridViewColumnsSpec;
+    }
     return PropId_Tag;
 }
 
@@ -1252,6 +1294,10 @@ std::uint16_t ResolveAnimationTargetPropertyId(std::string_view targetPropertyPa
     }
     if (s.find("ShadowDepth") != std::string_view::npos) {
         return PropId_EffectShadowDepth;
+    }
+    if (s.find("DropShadowEffect.Opacity") != std::string_view::npos ||
+        s.find("Effect.Opacity") != std::string_view::npos) {
+        return PropId_EffectOpacity;
     }
 
     const bool mentionsRenderTransform =
@@ -2469,6 +2515,9 @@ UnifiedValue ParseBuiltinLiteralPropertyValue(
         case PropId_FontSize:
         case PropId_CanvasLeft:
         case PropId_CanvasTop:
+        case PropId_CanvasRight:
+        case PropId_CanvasBottom:
+        case PropId_EffectOpacity:
         case PropId_Projection3DYaw:
         case PropId_Projection3DPitch:
         case PropId_Spacing:
@@ -2540,6 +2589,7 @@ UnifiedValue ParseBuiltinLiteralPropertyValue(
         case PropId_IsPassword:
         case PropId_IsExpanded:
         case PropId_IsIndeterminate:
+        case PropId_IsOpen:
         case PropId_TriggerIsMouseOver:
         case PropId_TriggerIsPressed:
         case PropId_TriggerIsFocused:
@@ -2630,6 +2680,11 @@ UnifiedValue ParseBuiltinLiteralPropertyValue(
             if (EqualsIgnoreCase(rawValue, "Visible") || rawValue == "3") return value::FromInt(3);
             return value::FromInt(propId == PropId_HorizontalScrollBarVisibility ? 0 : 1);
 
+        case PropId_TextTrimming:
+            if (EqualsIgnoreCase(rawValue, "CharacterEllipsis") || rawValue == "1") return value::FromInt(1);
+            if (EqualsIgnoreCase(rawValue, "WordEllipsis") || rawValue == "2") return value::FromInt(2);
+            return value::FromInt(0);
+
         case PropId_GridRow:
         case PropId_GridColumn:
         case PropId_GridRowSpan:
@@ -2643,6 +2698,9 @@ UnifiedValue ParseBuiltinLiteralPropertyValue(
         case PropId_BackgroundGradientId:
         case PropId_ForegroundGradientId:
         case PropId_BorderGradientId:
+        case PropId_ZIndex:
+        case PropId_AlternationCount:
+        case PropId_AlternationIndex:
         case PropId_CustomIndexInt32:
         case PropId_CustomStateInt32: {
             std::int64_t iv = 0;
@@ -2760,22 +2818,89 @@ std::uint64_t ComputeSvgPathHash(std::string_view pathData) noexcept {
     return hash;
 }
 
+namespace {
+
+struct CachedSvgSummary {
+    Rect bounds{};
+    std::size_t segCount = 0u;
+    ParsedSvgGeometry geom{};
+};
+
+struct CachedBakedMtsdfCell {
+    float boundsX = 0.0f;
+    float boundsY = 0.0f;
+    float boundsW = 0.0f;
+    float boundsH = 0.0f;
+    std::vector<std::uint8_t> rgbaPixels;
+};
+
+struct MtsdfProcessCache {
+    std::mutex mutex;
+    std::unordered_map<std::uint64_t, std::shared_ptr<const CachedSvgSummary>> geomByHash;
+    std::unordered_map<std::uint64_t, CachedBakedMtsdfCell> bakedCells;
+};
+
+MtsdfProcessCache& GetMtsdfProcessCache() {
+    static MtsdfProcessCache sCache;
+    return sCache;
+}
+
+std::shared_ptr<const CachedSvgSummary> GetOrParseSvgGeometryCached(std::string_view pathData, std::uint64_t hash) {
+    if (hash != 0u) {
+        auto& cache = GetMtsdfProcessCache();
+        std::lock_guard<std::mutex> lock(cache.mutex);
+        const auto it = cache.geomByHash.find(hash);
+        if (it != cache.geomByHash.end()) {
+            return it->second;
+        }
+    }
+    auto summary = std::make_shared<CachedSvgSummary>();
+    summary->geom = ParseSvgPathGeometry(pathData);
+    summary->bounds = summary->geom.bounds;
+    std::size_t segCount = 0u;
+    for (const auto& contour : summary->geom.contours) {
+        if (contour.points.size() >= 2u) {
+            segCount += (contour.points.size() - 1u);
+        }
+    }
+    summary->segCount = segCount;
+    if (hash != 0u) {
+        auto& cache = GetMtsdfProcessCache();
+        std::lock_guard<std::mutex> lock(cache.mutex);
+        if (cache.geomByHash.size() > 4096u) {
+            cache.geomByHash.clear();
+        }
+        cache.geomByHash.emplace(hash, summary);
+    }
+    return summary;
+}
+
+[[nodiscard]] std::uint64_t MakeBakedMtsdfCacheKey(
+    std::uint64_t pathHash,
+    std::uint16_t safeCell,
+    float safeRange) noexcept {
+    const auto qRange = static_cast<std::uint64_t>(std::lround(safeRange * 256.0f)) & 0xFFFFULL;
+    std::uint64_t k = pathHash;
+    k ^= (static_cast<std::uint64_t>(safeCell) << 16u) | qRange;
+    k *= 1099511628211ULL;
+    return k;
+}
+
+} // namespace
+
 Rect MeasureSvgPathBounds(std::string_view pathData) {
-    return ParseSvgPathGeometry(pathData).bounds;
+    const std::uint64_t h = ComputeSvgPathHash(pathData);
+    return GetOrParseSvgGeometryCached(pathData, h)->bounds;
 }
 
 std::uint16_t SelectAdaptiveMtsdfCellSize(
     std::string_view pathData,
     float designMaxSpanPx,
     float* outRecommendedPxRange) noexcept {
-    const ParsedSvgGeometry geom = ParseSvgPathGeometry(pathData);
-    std::size_t segCount = 0;
-    for (const auto& contour : geom.contours) {
-        if (contour.points.size() >= 2u) {
-            segCount += (contour.points.size() - 1u);
-        }
-    }
-    const float span = std::max(designMaxSpanPx, std::max(geom.bounds.width, geom.bounds.height));
+    const std::uint64_t h = ComputeSvgPathHash(pathData);
+    const auto summary = GetOrParseSvgGeometryCached(pathData, h);
+    const std::size_t segCount = summary->segCount;
+    const float span = std::max(designMaxSpanPx, std::max(summary->bounds.width, summary->bounds.height));
     std::uint16_t cell = 32u;
     float range = 4.0f;
     if (span <= 40.0f && segCount <= 16u) {
@@ -2899,16 +3024,10 @@ AxbMtsdfPathEntry BakeSvgPathToMtsdfEntry(
     const std::uint16_t safeCell = std::clamp<std::uint16_t>(cellSize, 8u, 128u);
     const std::uint16_t safeAtlas = std::max<std::uint16_t>(atlasSize, safeCell);
     const float safeRange = std::max(pxRange, 1.0f);
-
-    const ParsedSvgGeometry geom = ParseSvgPathGeometry(pathData);
-    const std::vector<ColoredSegment> coloredSegs = BuildCornerColoredSegments(geom);
+    const std::uint64_t pathHash = ComputeSvgPathHash(pathData);
 
     AxbMtsdfPathEntry entry{};
-    entry.pathHash = ComputeSvgPathHash(pathData);
-    entry.boundsX = geom.bounds.x;
-    entry.boundsY = geom.bounds.y;
-    entry.boundsW = geom.bounds.width;
-    entry.boundsH = geom.bounds.height;
+    entry.pathHash = pathHash;
     entry.atlasWidth = safeAtlas;
     entry.atlasHeight = safeAtlas;
     entry.cellWidth = safeCell;
@@ -2930,6 +3049,29 @@ AxbMtsdfPathEntry BakeSvgPathToMtsdfEntry(
     entry.u1 = (static_cast<float>((slotCol + 1u) * safeCell) - 0.5f) * invAtlas;
     entry.v1 = (static_cast<float>((slotRow + 1u) * safeCell) - 0.5f) * invAtlas;
 
+    const std::uint64_t cacheKey = MakeBakedMtsdfCacheKey(pathHash, safeCell, safeRange);
+    if (pathHash != 0u) {
+        auto& cache = GetMtsdfProcessCache();
+        std::lock_guard<std::mutex> lock(cache.mutex);
+        const auto it = cache.bakedCells.find(cacheKey);
+        if (it != cache.bakedCells.end()) {
+            entry.boundsX = it->second.boundsX;
+            entry.boundsY = it->second.boundsY;
+            entry.boundsW = it->second.boundsW;
+            entry.boundsH = it->second.boundsH;
+            entry.mtsdfRgbaPixels = it->second.rgbaPixels;
+            return entry;
+        }
+    }
+
+    const auto summary = GetOrParseSvgGeometryCached(pathData, pathHash);
+    const ParsedSvgGeometry& geom = summary->geom;
+    const std::vector<ColoredSegment> coloredSegs = BuildCornerColoredSegments(geom);
+
+    entry.boundsX = geom.bounds.x;
+    entry.boundsY = geom.bounds.y;
+    entry.boundsW = geom.bounds.width;
+    entry.boundsH = geom.bounds.height;
     entry.mtsdfRgbaPixels.resize(static_cast<std::size_t>(safeCell) * safeCell * 4u, 0u);
 
     if (coloredSegs.empty()) {
@@ -2942,22 +3084,28 @@ AxbMtsdfPathEntry BakeSvgPathToMtsdfEntry(
     const float scaleX = usableTexels / std::max(1e-3f, geom.bounds.width);
     const float scaleY = usableTexels / std::max(1e-3f, geom.bounds.height);
     const float uniformScale = std::min(scaleX, scaleY);
+    const float invUniformScale = 1.0f / uniformScale;
 
     const float scaledW = geom.bounds.width * uniformScale;
     const float scaledH = geom.bounds.height * uniformScale;
     const float offsetX = (static_cast<float>(safeCell) - scaledW) * 0.5f - geom.bounds.x * uniformScale;
     const float offsetY = (static_cast<float>(safeCell) - scaledH) * 0.5f - geom.bounds.y * uniformScale;
 
-    // Precompute cell-space segment geometry & midpoint inside/outside orientation once (O(S))
+    // Precompute cell-space segment geometry, AABB & midpoint orientation once (O(S))
     struct PreparedCellSegment {
         float ax = 0.0f;
         float ay = 0.0f;
         float abx = 0.0f;
         float aby = 0.0f;
-        float lenSq = 0.0f;
+        float invLenSq = 0.0f;
         float dirX = 0.0f;
         float dirY = 0.0f;
+        float minX = 0.0f;
+        float maxX = 0.0f;
+        float minY = 0.0f;
+        float maxY = 0.0f;
         float leftSign = 1.0f;
+        std::uint32_t origIdx = 0u;
         std::uint8_t channelMask = 0x07u;
         bool inClosedContour = true;
     };
@@ -2978,7 +3126,8 @@ AxbMtsdfPathEntry BakeSvgPathToMtsdfEntry(
         if (lenSq <= 1e-10f) {
             continue;
         }
-        const float invLen = 1.0f / std::sqrt(lenSq);
+        const float invLenSq = 1.0f / lenSq;
+        const float invLen = std::sqrt(invLenSq);
         const float dirX = abx * invLen;
         const float dirY = aby * invLen;
 
@@ -3000,22 +3149,96 @@ AxbMtsdfPathEntry BakeSvgPathToMtsdfEntry(
             leftSign = leftSideInside ? 1.0f : -1.0f;
         }
 
+        const auto origIdx = static_cast<std::uint32_t>(preparedSegs.size());
         preparedSegs.push_back(PreparedCellSegment{
-            ax, ay, abx, aby, lenSq, dirX, dirY, leftSign, seg.channelMask, seg.inClosedContour});
+            ax, ay, abx, aby, invLenSq, dirX, dirY,
+            std::min(ax, bx), std::max(ax, bx),
+            std::min(ay, by), std::max(ay, by),
+            leftSign, origIdx, seg.channelMask, seg.inClosedContour});
     }
 
     if (preparedSegs.empty()) {
         return entry;
     }
 
+    // Collect closed-contour SVG edges once for fast per-row straddling-edge filtering
+    struct ClosedSvgEdge {
+        SvgVec2 a{};
+        SvgVec2 b{};
+    };
+    std::vector<ClosedSvgEdge> closedEdges;
+    if (anyClosedContour) {
+        closedEdges.reserve(summary->segCount);
+        for (const auto& contour : geom.contours) {
+            if (!contour.closed) continue;
+            for (std::size_t i = 0u; i + 1u < contour.points.size(); ++i) {
+                const SvgVec2 a = contour.points[i];
+                const SvgVec2 b = contour.points[i + 1u];
+                if (a.y != b.y) {
+                    closedEdges.push_back(ClosedSvgEdge{a, b});
+                }
+            }
+        }
+    }
+
+    struct RowSegEntry {
+        float rowDySq = 0.0f;
+        std::uint32_t segIdx = 0u;
+    };
+    std::vector<RowSegEntry> rowOrder(preparedSegs.size());
+    std::vector<ClosedSvgEdge> rowCrossEdges;
+    rowCrossEdges.reserve(32u);
+
     for (std::uint16_t py = 0; py < safeCell; ++py) {
+        const float cellY = static_cast<float>(py) + 0.5f;
+        const float svgY = (cellY - offsetY) * invUniformScale;
+
+        rowCrossEdges.clear();
+        if (anyClosedContour) {
+            for (const auto& e : closedEdges) {
+                if ((e.a.y <= svgY && e.b.y > svgY) || (e.b.y <= svgY && e.a.y > svgY)) {
+                    rowCrossEdges.push_back(e);
+                }
+            }
+        }
+
+        for (std::size_t i = 0u; i < preparedSegs.size(); ++i) {
+            const auto& s = preparedSegs[i];
+            float dy = 0.0f;
+            if (cellY < s.minY) dy = s.minY - cellY;
+            else if (cellY > s.maxY) dy = cellY - s.maxY;
+            rowOrder[i] = RowSegEntry{dy * dy, static_cast<std::uint32_t>(i)};
+        }
+        std::sort(rowOrder.begin(), rowOrder.end(), [](const RowSegEntry& lhs, const RowSegEntry& rhs) noexcept {
+            return (lhs.rowDySq != rhs.rowDySq) ? (lhs.rowDySq < rhs.rowDySq) : (lhs.segIdx < rhs.segIdx);
+        });
+
         for (std::uint16_t px = 0; px < safeCell; ++px) {
             const float cellX = static_cast<float>(px) + 0.5f;
-            const float cellY = static_cast<float>(py) + 0.5f;
-            const float svgX = (cellX - offsetX) / uniformScale;
-            const float svgY = (cellY - offsetY) / uniformScale;
+            const float svgX = (cellX - offsetX) * invUniformScale;
 
-            const bool inside = anyClosedContour && IsPointInsideSvgGeometry(geom, svgX, svgY);
+            bool inside = false;
+            if (anyClosedContour && !rowCrossEdges.empty()) {
+                int winding = 0;
+                int crossings = 0;
+                for (const auto& e : rowCrossEdges) {
+                    const float vt = (svgY - e.a.y) / (e.b.y - e.a.y);
+                    const float xIntersect = e.a.x + vt * (e.b.x - e.a.x);
+                    if (svgX < xIntersect) {
+                        ++crossings;
+                    }
+                    if (e.a.y <= svgY) {
+                        if (((e.b.x - e.a.x) * (svgY - e.a.y) - (svgX - e.a.x) * (e.b.y - e.a.y)) > 0.0f) {
+                            ++winding;
+                        }
+                    } else {
+                        if (((e.b.x - e.a.x) * (svgY - e.a.y) - (svgX - e.a.x) * (e.b.y - e.a.y)) < 0.0f) {
+                            --winding;
+                        }
+                    }
+                }
+                inside = geom.nonZeroFill ? (winding != 0) : ((crossings & 1) != 0);
+            }
             const float globalSign = inside ? 1.0f : -1.0f;
 
             float minTrueDistSq = 1e30f;
@@ -3024,14 +3247,27 @@ AxbMtsdfPathEntry BakeSvgPathToMtsdfEntry(
                 float minDistSq = 1e30f;
                 float bestOrtho = 1e30f;
                 float pseudoDist = 1e30f;
+                std::uint32_t origIdx = 0xFFFFFFFFu;
                 bool found = false;
             };
             ChannelBest chBest[3]{};
 
-            for (const auto& seg : preparedSegs) {
+            float upperBoundSq = 1e30f;
+            for (const auto& re : rowOrder) {
+                if (re.rowDySq > upperBoundSq) {
+                    break;
+                }
+                const auto& seg = preparedSegs[re.segIdx];
+                float dxBox = 0.0f;
+                if (cellX < seg.minX) dxBox = seg.minX - cellX;
+                else if (cellX > seg.maxX) dxBox = cellX - seg.maxX;
+                if (re.rowDySq + dxBox * dxBox > upperBoundSq) {
+                    continue;
+                }
+
                 const float apx = cellX - seg.ax;
                 const float apy = cellY - seg.ay;
-                const float proj = (apx * seg.abx + apy * seg.aby) / seg.lenSq;
+                const float proj = (apx * seg.abx + apy * seg.aby) * seg.invLenSq;
                 const float clampedT = std::clamp(proj, 0.0f, 1.0f);
                 const float dx = cellX - (seg.ax + clampedT * seg.abx);
                 const float dy = cellY - (seg.ay + clampedT * seg.aby);
@@ -3039,6 +3275,9 @@ AxbMtsdfPathEntry BakeSvgPathToMtsdfEntry(
                 minTrueDistSq = std::min(minTrueDistSq, distSq);
 
                 if (!seg.inClosedContour) {
+                    if (!anyClosedContour) {
+                        upperBoundSq = minTrueDistSq + 1e-3f;
+                    }
                     continue;
                 }
 
@@ -3053,16 +3292,24 @@ AxbMtsdfPathEntry BakeSvgPathToMtsdfEntry(
                     if ((seg.channelMask & (1u << c)) != 0u) {
                         const bool closer = (distSq + 1e-4f < chBest[c].minDistSq) ||
                             (std::fabs(distSq - chBest[c].minDistSq) <= 1e-4f &&
-                             orthoScore > chBest[c].bestOrtho);
+                             (orthoScore > chBest[c].bestOrtho + 1e-7f ||
+                              (std::fabs(orthoScore - chBest[c].bestOrtho) <= 1e-7f &&
+                               seg.origIdx < chBest[c].origIdx)));
                         if (!chBest[c].found || closer) {
                             chBest[c].found = true;
                             chBest[c].minDistSq = distSq;
                             chBest[c].bestOrtho = orthoScore;
+                            chBest[c].origIdx = seg.origIdx;
                             chBest[c].pseudoDist = (proj >= 0.0f && proj <= 1.0f)
                                 ? (std::sqrt(distSq) * sampleOnLeft * seg.leftSign)
                                 : pseudoSigned;
                         }
                     }
+                }
+
+                if (chBest[0].found && chBest[1].found && chBest[2].found) {
+                    const float maxChSq = std::max(chBest[0].minDistSq, std::max(chBest[1].minDistSq, chBest[2].minDistSq));
+                    upperBoundSq = std::max(minTrueDistSq, maxChSq) + 1e-3f;
                 }
             }
 
@@ -3092,6 +3339,22 @@ AxbMtsdfPathEntry BakeSvgPathToMtsdfEntry(
             entry.mtsdfRgbaPixels[pixIdx + 2u] = QuantizeNormalizedSdf(bDist, safeRange);
             entry.mtsdfRgbaPixels[pixIdx + 3u] = QuantizeNormalizedSdf(trueSignedDist, safeRange);
         }
+    }
+
+    if (pathHash != 0u) {
+        auto& cache = GetMtsdfProcessCache();
+        std::lock_guard<std::mutex> lock(cache.mutex);
+        if (cache.bakedCells.size() > 4096u) {
+            cache.bakedCells.clear();
+        }
+        cache.bakedCells.emplace(
+            cacheKey,
+            CachedBakedMtsdfCell{
+                entry.boundsX,
+                entry.boundsY,
+                entry.boundsW,
+                entry.boundsH,
+                entry.mtsdfRgbaPixels});
     }
 
     return entry;

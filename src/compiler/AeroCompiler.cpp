@@ -989,10 +989,126 @@ struct XmlScopeEntry {
     std::uint8_t imageBrushStretch = 1u;
     bool isItemTemplateContainer = false;
     bool isControlTemplateContainer = false;
+    bool isItemsPanelContainer = false;
+    bool isListViewViewContainer = false;
     bool isMergedDictSourceElement = false;
+    bool hasInlineRichFormatting = false;
     Matrix2D accumulatedTransform = Matrix2D::Identity();
     std::string accumulatedText;
+    std::string accumulatedRichText;
+    std::string gridViewColumnsSpec;
 };
+
+[[nodiscard]] std::string ParseItemsPanelInnerXmlToSpec(std::string_view innerXml, bool& outIsVirtualizing) {
+    outIsVirtualizing = false;
+    std::size_t pos = 0u;
+    while (pos < innerXml.size()) {
+        const std::size_t lt = innerXml.find('<', pos);
+        if (lt == std::string_view::npos) break;
+        if (lt + 3u < innerXml.size() && innerXml.substr(lt, 4u) == "<!--") {
+            const std::size_t cend = innerXml.find("-->", lt + 4u);
+            if (cend == std::string_view::npos) break;
+            pos = cend + 3u;
+            continue;
+        }
+        if (lt + 1u < innerXml.size() && (innerXml[lt + 1u] == '/' || innerXml[lt + 1u] == '?' || innerXml[lt + 1u] == '!')) {
+            const std::size_t gt = innerXml.find('>', lt + 1u);
+            if (gt == std::string_view::npos) break;
+            pos = gt + 1u;
+            continue;
+        }
+        std::size_t tEnd = lt + 1u;
+        while (tEnd < innerXml.size() &&
+               !std::isspace(static_cast<unsigned char>(innerXml[tEnd])) &&
+               innerXml[tEnd] != '>' && innerXml[tEnd] != '/') {
+            ++tEnd;
+        }
+        const std::string_view st = StripXmlPrefix(innerXml.substr(lt + 1u, tEnd - (lt + 1u)));
+        if (st.find('.') != std::string_view::npos) {
+            const std::size_t gt = innerXml.find('>', tEnd);
+            if (gt == std::string_view::npos) break;
+            pos = gt + 1u;
+            continue;
+        }
+        std::size_t gt = tEnd;
+        char qCh = 0;
+        while (gt < innerXml.size()) {
+            const char c = innerXml[gt];
+            if (qCh != 0) {
+                if (c == qCh) qCh = 0;
+            } else if (c == '"' || c == '\'') {
+                qCh = c;
+            } else if (c == '>') {
+                break;
+            }
+            ++gt;
+        }
+        const std::string_view attrSlice = innerXml.substr(tEnd, (gt < innerXml.size() ? gt : innerXml.size()) - tEnd);
+        auto readAttr = [&](std::string_view wanted) -> std::string_view {
+            std::size_t ap = 0u;
+            while (ap < attrSlice.size()) {
+                while (ap < attrSlice.size() && std::isspace(static_cast<unsigned char>(attrSlice[ap]))) ++ap;
+                if (ap >= attrSlice.size() || attrSlice[ap] == '/' || attrSlice[ap] == '>') break;
+                const std::size_t ns = ap;
+                while (ap < attrSlice.size() && attrSlice[ap] != '=' &&
+                       !std::isspace(static_cast<unsigned char>(attrSlice[ap])) &&
+                       attrSlice[ap] != '/' && attrSlice[ap] != '>') ++ap;
+                const std::string_view nm = attrSlice.substr(ns, ap - ns);
+                while (ap < attrSlice.size() && std::isspace(static_cast<unsigned char>(attrSlice[ap]))) ++ap;
+                std::string_view vl{};
+                if (ap < attrSlice.size() && attrSlice[ap] == '=') {
+                    ++ap;
+                    while (ap < attrSlice.size() && std::isspace(static_cast<unsigned char>(attrSlice[ap]))) ++ap;
+                    if (ap < attrSlice.size() && (attrSlice[ap] == '"' || attrSlice[ap] == '\'')) {
+                        const char qc = attrSlice[ap++];
+                        const std::size_t vs = ap;
+                        while (ap < attrSlice.size() && attrSlice[ap] != qc) ++ap;
+                        vl = attrSlice.substr(vs, ap - vs);
+                        if (ap < attrSlice.size()) ++ap;
+                    }
+                }
+                if (nm == wanted) return Trim(vl);
+            }
+            return {};
+        };
+
+        if (st == "VirtualizingStackPanel") {
+            outIsVirtualizing = true;
+            const std::string_view ori = readAttr("Orientation");
+            return std::string("AERO_PANEL:VirtualizingStackPanel:") + (ori.empty() ? "Vertical" : std::string(ori));
+        }
+        if (st == "UniformGrid") {
+            const std::string_view rows = readAttr("Rows");
+            const std::string_view cols = readAttr("Columns");
+            const std::string_view fc = readAttr("FirstColumn");
+            return "AERO_PANEL:UniformGrid:" +
+                   std::string(rows.empty() ? "0" : rows) + ":" +
+                   std::string(cols.empty() ? "0" : cols) + ":" +
+                   std::string(fc.empty() ? "0" : fc);
+        }
+        if (st == "WrapPanel" || st == "VirtualizingWrapPanel") {
+            const std::string_view ori = readAttr("Orientation");
+            const std::string_view iw = readAttr("ItemWidth");
+            const std::string_view ih = readAttr("ItemHeight");
+            return "AERO_PANEL:WrapPanel:" +
+                   std::string(ori.empty() ? "Horizontal" : ori) + ":" +
+                   std::string(iw.empty() ? "-1" : iw) + ":" +
+                   std::string(ih.empty() ? "-1" : ih);
+        }
+        if (st == "Canvas") {
+            return "AERO_PANEL:Canvas";
+        }
+        if (st == "StackPanel") {
+            const std::string_view ori = readAttr("Orientation");
+            const std::string_view sp = readAttr("Spacing");
+            return "AERO_PANEL:StackPanel:" +
+                   std::string(ori.empty() ? "Vertical" : ori) + ":" +
+                   std::string(sp.empty() ? "0" : sp);
+        }
+        pos = (gt < innerXml.size()) ? (gt + 1u) : innerXml.size();
+    }
+    return {};
+}
 
 [[nodiscard]] std::uint8_t ParseImageBrushStretchCode(std::string_view rawStretch) noexcept {
     const std::string_view s = Trim(rawStretch);
@@ -3134,8 +3250,17 @@ AeroCompileResult AeroCompiler::CompileInternal(
                 if (top.kind == XmlScopeKind::KeyedResourceItem ||
                     top.kind == XmlScopeKind::RunInline ||
                     top.isMergedDictSourceElement) {
-                    if (!top.accumulatedText.empty()) top.accumulatedText.push_back(' ');
-                    top.accumulatedText += DecodeXamlXmlEntities(rawInner);
+                    const std::string decInner = DecodeXamlXmlEntities(rawInner);
+                    if (!top.accumulatedText.empty() && top.accumulatedText.back() != '\n') {
+                        top.accumulatedText.push_back(' ');
+                    }
+                    top.accumulatedText += decInner;
+                    if (top.kind == XmlScopeKind::RunInline) {
+                        if (!top.accumulatedRichText.empty() && top.accumulatedRichText.back() != '\n') {
+                            top.accumulatedRichText.push_back(' ');
+                        }
+                        top.accumulatedRichText += decInner;
+                    }
                 } else if (top.kind == XmlScopeKind::NonVisualSkip &&
                            top.tagName.find('.') != std::string::npos &&
                            scopeStack.size() >= 2u &&
@@ -3153,8 +3278,17 @@ AeroCompileResult AeroCompiler::CompileInternal(
                         st == "RepeatButton" || st == "ToggleButton" ||
                         st == "CheckBox" || st == "RadioButton" || st == "Hyperlink" ||
                         st == "ComboBoxItem" || st == "ListBoxItem") {
-                        if (!top.accumulatedText.empty()) top.accumulatedText.push_back(' ');
-                        top.accumulatedText += DecodeXamlXmlEntities(rawInner);
+                        const std::string decInner = DecodeXamlXmlEntities(rawInner);
+                        if (!top.accumulatedText.empty() && top.accumulatedText.back() != '\n') {
+                            top.accumulatedText.push_back(' ');
+                        }
+                        top.accumulatedText += decInner;
+                        if (st == "TextBlock") {
+                            if (!top.accumulatedRichText.empty() && top.accumulatedRichText.back() != '\n') {
+                                top.accumulatedRichText.push_back(' ');
+                            }
+                            top.accumulatedRichText += decInner;
+                        }
                     }
                 }
             }
@@ -3530,9 +3664,33 @@ AeroCompileResult AeroCompiler::CompileInternal(
                             break;
                         }
                     }
+                } else if (closed.isListViewViewContainer && !closed.gridViewColumnsSpec.empty()) {
+                    AxbInstruction gvInst{};
+                    gvInst.opcode = AxbOpcode::SetStaticProperty;
+                    gvInst.propId = PropId_GridViewColumnsSpec;
+                    gvInst.literalValue = value::FromString(std::move(closed.gridViewColumnsSpec));
+                    pkg.instructions.push_back(std::move(gvInst));
                 } else if (closed.kind == XmlScopeKind::RunInline && !closed.accumulatedText.empty()) {
+                    const std::string_view closedSt = StripXmlPrefix(closed.tagName);
+                    std::string richChunk = closed.accumulatedRichText.empty()
+                        ? closed.accumulatedText
+                        : closed.accumulatedRichText;
+                    bool makesRich = closed.hasInlineRichFormatting;
+                    if (closedSt == "Bold" || closedSt == "RunBold" || closedSt == "RunBoldItalic") {
+                        richChunk = "[b]" + richChunk + "[/b]";
+                        makesRich = true;
+                    }
+                    if (closedSt == "Italic" || closedSt == "RunItalic" || closedSt == "RunBoldItalic") {
+                        richChunk = "[i]" + richChunk + "[/i]";
+                        makesRich = true;
+                    }
+                    if (closedSt == "Underline") {
+                        richChunk = "[u]" + richChunk + "[/u]";
+                        makesRich = true;
+                    }
                     for (auto it = scopeStack.rbegin(); it != scopeStack.rend(); ++it) {
-                        if (it->kind == XmlScopeKind::VisualElement) {
+                        if (it->kind == XmlScopeKind::RunInline || it->kind == XmlScopeKind::VisualElement) {
+                            bool insertSpace = false;
                             if (!it->accumulatedText.empty() && !closed.accumulatedText.empty()) {
                                 const char prevCh = it->accumulatedText.back();
                                 const char nextCh = closed.accumulatedText.front();
@@ -3542,10 +3700,23 @@ AeroCompileResult AeroCompiler::CompileInternal(
                                                        nextCh == '"' || nextCh == '\'' || nextCh == ')' || nextCh == ']' ||
                                                        nextCh == '.' || nextCh == ',' || nextCh == ':' || nextCh == ';');
                                 if (!prevGlue && !nextGlue) {
-                                    it->accumulatedText.push_back(' ');
+                                    insertSpace = true;
                                 }
                             }
+                            if (insertSpace) {
+                                it->accumulatedText.push_back(' ');
+                                if (!it->accumulatedRichText.empty()) {
+                                    it->accumulatedRichText.push_back(' ');
+                                }
+                            }
+                            if (it->accumulatedRichText.empty() && !it->accumulatedText.empty()) {
+                                it->accumulatedRichText = it->accumulatedText;
+                            }
                             it->accumulatedText += closed.accumulatedText;
+                            it->accumulatedRichText += richChunk;
+                            if (makesRich) {
+                                it->hasInlineRichFormatting = true;
+                            }
                             break;
                         }
                     }
@@ -3556,6 +3727,15 @@ AeroCompileResult AeroCompiler::CompileInternal(
                         textInst.propId = PropId_Text;
                         textInst.literalValue = value::FromString(std::move(closed.accumulatedText));
                         pkg.instructions.push_back(std::move(textInst));
+                        if (closed.hasInlineRichFormatting &&
+                            !closed.accumulatedRichText.empty() &&
+                            StripXmlPrefix(closed.tagName) == "TextBlock") {
+                            AxbInstruction richInst{};
+                            richInst.opcode = AxbOpcode::SetStaticProperty;
+                            richInst.propId = PropId_RichText;
+                            richInst.literalValue = value::FromString(std::move(closed.accumulatedRichText));
+                            pkg.instructions.push_back(std::move(richInst));
+                        }
                     }
                     AxbInstruction endInst{};
                     endInst.opcode = AxbOpcode::EndElement;
@@ -4016,10 +4196,99 @@ AeroCompileResult AeroCompiler::CompileInternal(
                 }
             }
 
-            // Phase 5D: Compile <DataTemplate> inside ResourceDictionary or <ItemsControl.ItemTemplate>
+            // Compile <ItemsPanelTemplate> inside ResourceDictionary, <*.ItemsPanel>, or <Setter Property="ItemsPanel">
+            {
+                const bool isSetterIp =
+                    (shortTag == "ItemsPanelTemplate" && !setterStack.empty() &&
+                     !setterStack.back().hasValue && setterStack.back().setter.propId == PropId_ItemsPanel);
+                if (shortTag == "ItemsPanelTemplate" &&
+                    (parentScope.kind == XmlScopeKind::ResourceContainer ||
+                     parentScope.isItemsPanelContainer ||
+                     isSetterIp)) {
+                    if (!selfClosing) {
+                        std::size_t innerEnd = 0u;
+                        std::size_t afterClose = 0u;
+                        if (FindMatchingClosingTag(src, pos, "ItemsPanelTemplate", innerEnd, afterClose)) {
+                            bool isVirt = false;
+                            const std::string spec = ParseItemsPanelInnerXmlToSpec(
+                                src.substr(pos, innerEnd - pos), isVirt);
+                            if (!spec.empty()) {
+                                if (isSetterIp) {
+                                    setterStack.back().setter.value = value::FromString(spec);
+                                    setterStack.back().hasValue = true;
+                                } else if (parentScope.isItemsPanelContainer) {
+                                    pkg.instructions.push_back(AxbInstruction{
+                                        AxbOpcode::SetStaticProperty, PropId_ItemsPanel, 0, 0, 0, 0,
+                                        value::FromString(spec)});
+                                    if (isVirt) {
+                                        pkg.instructions.push_back(AxbInstruction{
+                                            AxbOpcode::SetStaticProperty, PropId_IsVirtualizing, 0, 0, 0, 0,
+                                            UnifiedValue{true}});
+                                    }
+                                } else if (!xKey.empty()) {
+                                    UpsertPackageResource(pkg, xKey, value::FromString(spec));
+                                }
+                            }
+                            pos = afterClose;
+                            continue;
+                        }
+                    } else {
+                        continue;
+                    }
+                }
+            }
+
+            // Collect <GridViewColumn> inside <ListView.View><GridView>...</GridView></ListView.View>
+            if (shortTag == "GridViewColumn") {
+                XmlScopeEntry* lvViewScope = nullptr;
+                for (auto it = scopeStack.rbegin(); it != scopeStack.rend(); ++it) {
+                    if (it->kind == XmlScopeKind::VisualElement) break;
+                    if (it->isListViewViewContainer) {
+                        lvViewScope = &(*it);
+                        break;
+                    }
+                }
+                if (lvViewScope != nullptr) {
+                    std::string colHeader, colWidth = "100", colBindPath, colFormat, colCellTpl;
+                    for (const auto& a : attrs) {
+                        if (a.name == "Header") {
+                            colHeader = DecodeXamlXmlEntities(a.value);
+                        } else if (a.name == "Width") {
+                            colWidth = std::string(Trim(a.value));
+                        } else if (a.name == "DisplayMemberBinding") {
+                            const auto parsedB = ParseBindingMarkupExpression(a.value);
+                            if (parsedB.isValidBinding) {
+                                colBindPath = std::string(parsedB.pathPart);
+                                colFormat = parsedB.stringFormat;
+                            }
+                        } else if (a.name == "CellTemplate") {
+                            std::string_view rk = ExtractMarkupResourceKey(a.value);
+                            colCellTpl = rk.empty() ? DecodeXamlXmlEntities(a.value) : std::string(rk);
+                        }
+                    }
+                    if (!lvViewScope->gridViewColumnsSpec.empty()) {
+                        lvViewScope->gridViewColumnsSpec.push_back('\x1e');
+                    }
+                    lvViewScope->gridViewColumnsSpec +=
+                        colHeader + "\x1f" + colWidth + "\x1f" + colBindPath + "\x1f" + colFormat + "\x1f" + colCellTpl;
+                    if (!selfClosing) {
+                        (void)pushNonVisualScope();
+                    }
+                    continue;
+                }
+            }
+
+            // Phase 5D: Compile <DataTemplate> inside ResourceDictionary, <*.ItemTemplate/ContentTemplate/HeaderTemplate>, or <Setter>
+            const bool isInlineSetterDt =
+                (shortTag == "DataTemplate" && !setterStack.empty() && !setterStack.back().hasValue &&
+                 (setterStack.back().setter.propId == PropId_ItemTemplate ||
+                  setterStack.back().setter.propId == PropId_ContentTemplate ||
+                  setterStack.back().setter.propId == PropId_HeaderTemplate));
             if (shortTag == "DataTemplate" &&
-                (parentScope.kind == XmlScopeKind::ResourceContainer || parentScope.isItemTemplateContainer) &&
-                styleStack.empty()) {
+                (parentScope.kind == XmlScopeKind::ResourceContainer ||
+                 parentScope.isItemTemplateContainer ||
+                 isInlineSetterDt) &&
+                (styleStack.empty() || isInlineSetterDt)) {
                 std::string dtDataType;
                 for (const auto& a : attrs) {
                     if (a.name == "DataType") {
@@ -4035,7 +4304,7 @@ AeroCompileResult AeroCompiler::CompileInternal(
                             ? pkg.className
                             : (!input.xamlPath.empty() ? input.xamlPath : pkg.rootTypeName);
                         std::string dtKey;
-                        if (parentScope.isItemTemplateContainer) {
+                        if (parentScope.isItemTemplateContainer || isInlineSetterDt) {
                             dtKey = "__item_tpl_" + outerScopeName + "_" +
                                     std::to_string(nextInlineDataTplId++);
                         } else if (!xKey.empty()) {
@@ -4054,12 +4323,25 @@ AeroCompileResult AeroCompiler::CompileInternal(
                         subIn.autoMergeGlobalResources = false;
                         AeroCompileResult subRes = this->CompileInternal(subIn, activeIncludeStack);
                         if (subRes.succeeded && !subRes.axbPackage.instructions.empty()) {
+                            for (const auto& mp : subRes.axbPackage.mtsdfPaths) {
+                                if (mp.pathHash != 0 && bakedPathHashes.insert(mp.pathHash).second) {
+                                    pkg.mtsdfPaths.push_back(mp);
+                                }
+                            }
                             AxbDataTemplate dt{};
-                            if (parentScope.isItemTemplateContainer) {
+                            if (isInlineSetterDt) {
+                                dt.key = dtKey.empty()
+                                    ? ("__setter_dt_" + outerScopeName + "_" + std::to_string(nextInlineDataTplId++))
+                                    : dtKey;
+                                setterStack.back().setter.value = value::FromString(dt.key);
+                                setterStack.back().hasValue = true;
+                            } else if (parentScope.isItemTemplateContainer) {
                                 dt.key = dtKey;
                                 AxbInstruction setTplInst{};
                                 setTplInst.opcode = AxbOpcode::SetStaticProperty;
-                                setTplInst.propId = PropId_ItemTemplate;
+                                setTplInst.propId = (parentScope.targetPropId != 0 && parentScope.targetPropId != PropId_Background)
+                                    ? parentScope.targetPropId
+                                    : static_cast<std::uint16_t>(PropId_ItemTemplate);
                                 setTplInst.literalValue = value::FromString(dt.key);
                                 pkg.instructions.push_back(std::move(setTplInst));
                             } else {
@@ -4067,6 +4349,7 @@ AeroCompileResult AeroCompiler::CompileInternal(
                             }
                             dt.dataTypeName = std::move(dtDataType);
                             dt.templatePackage = std::make_shared<AxbPackage>(std::move(subRes.axbPackage));
+                            AxbTemplateRegistry::Instance().RegisterDataTemplate(dt);
                             pkg.dataTemplates.push_back(std::move(dt));
                         }
                         pos = afterClose;
@@ -6143,14 +6426,48 @@ AeroCompileResult AeroCompiler::CompileInternal(
             continue;
         }
 
-        // Inline <ItemsControl.ItemTemplate><DataTemplate>...</DataTemplate></ItemsControl.ItemTemplate>
-        if (EndsWith(shortTag, ".ItemTemplate") && !scopeStack.empty()) {
+        // Inline <*.ItemTemplate>, <*.ContentTemplate>, or <*.HeaderTemplate>
+        if ((EndsWith(shortTag, ".ItemTemplate") ||
+             EndsWith(shortTag, ".ContentTemplate") ||
+             EndsWith(shortTag, ".HeaderTemplate")) &&
+            !scopeStack.empty()) {
             if (!selfClosing) {
                 XmlScopeEntry itScope{};
                 itScope.kind = XmlScopeKind::NonVisualSkip;
                 itScope.tagName = std::string(tagName);
                 itScope.isItemTemplateContainer = true;
+                itScope.targetPropId = EndsWith(shortTag, ".ContentTemplate")
+                    ? static_cast<std::uint16_t>(PropId_ContentTemplate)
+                    : (EndsWith(shortTag, ".HeaderTemplate")
+                           ? static_cast<std::uint16_t>(PropId_HeaderTemplate)
+                           : static_cast<std::uint16_t>(PropId_ItemTemplate));
                 scopeStack.push_back(std::move(itScope));
+                ++nonVisualDepth;
+            }
+            continue;
+        }
+
+        // Inline <ItemsControl.ItemsPanel><ItemsPanelTemplate>...</ItemsPanelTemplate></ItemsControl.ItemsPanel>
+        if (EndsWith(shortTag, ".ItemsPanel") && !scopeStack.empty()) {
+            if (!selfClosing) {
+                XmlScopeEntry ipScope{};
+                ipScope.kind = XmlScopeKind::NonVisualSkip;
+                ipScope.tagName = std::string(tagName);
+                ipScope.isItemsPanelContainer = true;
+                scopeStack.push_back(std::move(ipScope));
+                ++nonVisualDepth;
+            }
+            continue;
+        }
+
+        // Inline <ListView.View><GridView>...</GridView></ListView.View>
+        if (EndsWith(shortTag, ".View") && !scopeStack.empty()) {
+            if (!selfClosing) {
+                XmlScopeEntry vwScope{};
+                vwScope.kind = XmlScopeKind::NonVisualSkip;
+                vwScope.tagName = std::string(tagName);
+                vwScope.isListViewViewContainer = true;
+                scopeStack.push_back(std::move(vwScope));
                 ++nonVisualDepth;
             }
             continue;
@@ -6219,18 +6536,61 @@ AeroCompileResult AeroCompiler::CompileInternal(
             continue;
         }
 
-        if (shortTag == "Run") {
-            std::string runText;
-            for (const auto& a : attrs) {
-                if (a.name == "Text") {
-                    runText = DecodeXamlXmlEntities(a.value);
+        if (shortTag == "LineBreak") {
+            for (auto it = scopeStack.rbegin(); it != scopeStack.rend(); ++it) {
+                if (it->kind == XmlScopeKind::RunInline || it->kind == XmlScopeKind::VisualElement) {
+                    if (it->accumulatedRichText.empty() && !it->accumulatedText.empty()) {
+                        it->accumulatedRichText = it->accumulatedText;
+                    }
+                    it->accumulatedText.push_back('\n');
+                    it->accumulatedRichText.push_back('\n');
                     break;
                 }
             }
+            if (!selfClosing) {
+                XmlScopeEntry lbScope{};
+                lbScope.kind = XmlScopeKind::RunInline;
+                lbScope.tagName = "LineBreak";
+                scopeStack.push_back(std::move(lbScope));
+            }
+            continue;
+        }
+
+        if (shortTag == "Run" || shortTag == "Span" || shortTag == "Bold" ||
+            shortTag == "Italic" || shortTag == "Underline") {
+            std::string runText;
+            bool attrBold = false;
+            bool attrItalic = false;
+            for (const auto& a : attrs) {
+                if (a.name == "Text") {
+                    runText = DecodeXamlXmlEntities(a.value);
+                } else if (a.name == "FontWeight") {
+                    const std::string_view fw = Trim(a.value);
+                    if (EqualsIgnoreCase(fw, "Bold") || EqualsIgnoreCase(fw, "SemiBold") ||
+                        EqualsIgnoreCase(fw, "DemiBold") || EqualsIgnoreCase(fw, "ExtraBold") ||
+                        EqualsIgnoreCase(fw, "Black") || EqualsIgnoreCase(fw, "Heavy")) {
+                        attrBold = true;
+                    }
+                } else if (a.name == "FontStyle") {
+                    const std::string_view fs = Trim(a.value);
+                    if (EqualsIgnoreCase(fs, "Italic") || EqualsIgnoreCase(fs, "Oblique")) {
+                        attrItalic = true;
+                    }
+                }
+            }
+            const bool isBold = (shortTag == "Bold") || attrBold;
+            const bool isItalic = (shortTag == "Italic") || attrItalic;
+            const bool isUnderline = (shortTag == "Underline");
             if (selfClosing) {
                 if (!runText.empty()) {
+                    std::string richSeg = runText;
+                    const bool isRichTag = isBold || isItalic || isUnderline;
+                    if (isBold) richSeg = "[b]" + richSeg + "[/b]";
+                    if (isItalic) richSeg = "[i]" + richSeg + "[/i]";
+                    if (isUnderline) richSeg = "[u]" + richSeg + "[/u]";
                     for (auto it = scopeStack.rbegin(); it != scopeStack.rend(); ++it) {
-                        if (it->kind == XmlScopeKind::VisualElement) {
+                        if (it->kind == XmlScopeKind::RunInline || it->kind == XmlScopeKind::VisualElement) {
+                            bool insertSpace = false;
                             if (!it->accumulatedText.empty()) {
                                 const char prevCh = it->accumulatedText.back();
                                 const char nextCh = runText.front();
@@ -6240,10 +6600,23 @@ AeroCompileResult AeroCompiler::CompileInternal(
                                                        nextCh == '"' || nextCh == '\'' || nextCh == ')' || nextCh == ']' ||
                                                        nextCh == '.' || nextCh == ',' || nextCh == ':' || nextCh == ';');
                                 if (!prevGlue && !nextGlue) {
-                                    it->accumulatedText.push_back(' ');
+                                    insertSpace = true;
                                 }
                             }
+                            if (insertSpace) {
+                                it->accumulatedText.push_back(' ');
+                                if (!it->accumulatedRichText.empty()) {
+                                    it->accumulatedRichText.push_back(' ');
+                                }
+                            }
+                            if (it->accumulatedRichText.empty() && !it->accumulatedText.empty()) {
+                                it->accumulatedRichText = it->accumulatedText;
+                            }
                             it->accumulatedText += runText;
+                            it->accumulatedRichText += richSeg;
+                            if (isRichTag) {
+                                it->hasInlineRichFormatting = true;
+                            }
                             break;
                         }
                     }
@@ -6251,7 +6624,16 @@ AeroCompileResult AeroCompiler::CompileInternal(
             } else {
                 XmlScopeEntry runScope{};
                 runScope.kind = XmlScopeKind::RunInline;
-                runScope.tagName = "Run";
+                if (isBold && isItalic) {
+                    runScope.tagName = "RunBoldItalic";
+                } else if (isBold && shortTag != "Bold") {
+                    runScope.tagName = "RunBold";
+                } else if (isItalic && shortTag != "Italic") {
+                    runScope.tagName = "RunItalic";
+                } else {
+                    runScope.tagName = std::string(shortTag);
+                }
+                runScope.accumulatedRichText = runText;
                 runScope.accumulatedText = std::move(runText);
                 scopeStack.push_back(std::move(runScope));
             }
