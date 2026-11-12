@@ -7,10 +7,129 @@
 #include "aero/controls/Controls.hpp"
 #include "aero/render/FontAtlas.hpp"
 #include "aero/render/ImageAtlas.hpp"
+#include "aero/core/UiResourceContext.hpp"
+#include <condition_variable>
+#include <functional>
+#include <thread>
 
 namespace aero {
 
 namespace {
+
+thread_local int gRasterBandY0 = 0;
+thread_local int gRasterBandY1 = 0x3FFFFFFF;
+thread_local bool gInScanlineBand = false;
+
+class ScanlineWorkerPool {
+public:
+    static constexpr std::size_t kNumWorkers = 3u; // +1 caller thread = 4 parallel horizontal bands
+
+    static ScanlineWorkerPool& Instance() {
+        static ScanlineWorkerPool pool;
+        return pool;
+    }
+
+    template <typename Fn>
+    void ParallelBands4(int totalHeight, Fn&& bandFn) {
+        if (totalHeight < 64 || gInScanlineBand) {
+            bandFn(0, totalHeight);
+            return;
+        }
+        std::unique_lock<std::mutex> dispatchLock(dispatchMtx_, std::try_to_lock);
+        if (!dispatchLock.owns_lock()) {
+            bandFn(0, totalHeight);
+            return;
+        }
+        const int step = (totalHeight + 3) / 4;
+        std::function<void(int)> taskFn = [&](int bandIdx) {
+            const int y0 = bandIdx * step;
+            const int y1 = std::min(totalHeight, y0 + step);
+            if (y0 < y1) {
+                bandFn(y0, y1);
+            }
+        };
+        {
+            std::lock_guard<std::mutex> lk(mtx_);
+            currentTask_ = &taskFn;
+            remaining_.store(static_cast<int>(kNumWorkers), std::memory_order_release);
+            ++epoch_;
+        }
+        cvStart_.notify_all();
+
+        // Band 0 on calling thread
+        gInScanlineBand = true;
+        try {
+            taskFn(0);
+        } catch (...) {
+            gInScanlineBand = false;
+            std::unique_lock<std::mutex> lk(mtx_);
+            cvDone_.wait(lk, [&]() { return remaining_.load(std::memory_order_acquire) == 0; });
+            currentTask_ = nullptr;
+            throw;
+        }
+        gInScanlineBand = false;
+
+        // Wait for bands 1..3
+        {
+            std::unique_lock<std::mutex> lk(mtx_);
+            cvDone_.wait(lk, [&]() { return remaining_.load(std::memory_order_acquire) == 0; });
+            currentTask_ = nullptr;
+        }
+    }
+
+private:
+    ScanlineWorkerPool() {
+        for (std::size_t i = 0u; i < kNumWorkers; ++i) {
+            const int bandIdx = static_cast<int>(i + 1u);
+            workers_[i] = std::thread([this, bandIdx]() {
+                std::uint64_t seenEpoch = 0u;
+                for (;;) {
+                    const std::function<void(int)>* fn = nullptr;
+                    {
+                        std::unique_lock<std::mutex> lk(mtx_);
+                        cvStart_.wait(lk, [&]() { return stop_ || epoch_ != seenEpoch; });
+                        if (stop_) return;
+                        seenEpoch = epoch_;
+                        fn = currentTask_;
+                    }
+                    if (fn) {
+                        gInScanlineBand = true;
+                        try {
+                            (*fn)(bandIdx);
+                        } catch (...) {
+                        }
+                        gInScanlineBand = false;
+                    }
+                    if (remaining_.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+                        std::lock_guard<std::mutex> lk(mtx_);
+                        cvDone_.notify_one();
+                    }
+                }
+            });
+        }
+    }
+
+    ~ScanlineWorkerPool() {
+        {
+            std::lock_guard<std::mutex> lk(mtx_);
+            stop_ = true;
+        }
+        cvStart_.notify_all();
+        for (auto& t : workers_) {
+            if (t.joinable()) t.join();
+        }
+    }
+
+    std::thread workers_[kNumWorkers];
+    std::mutex dispatchMtx_;
+    std::mutex mtx_;
+    std::condition_variable cvStart_;
+    std::condition_variable cvDone_;
+    const std::function<void(int)>* currentTask_ = nullptr;
+    std::uint64_t epoch_ = 0u;
+    std::atomic<int> remaining_{0};
+    bool stop_ = false;
+};
 
 constexpr std::string_view kUberVertexShaderGL33 = R"(#version 330 core
 // AeroGUI 2.0 Zero-Copy 24B Vertex UberShader (Desktop OpenGL 3.3 Core)
@@ -1735,7 +1854,12 @@ void RasterizeSingleNode(
 
         const FontAtlas& fontAtlasRef = FontAtlas::Instance();
 
-        for (int py = pyStart; py < pyEnd; ++py) {
+        const int bandClampedPyStart = (optPremulLayer == nullptr) ? std::max(pyStart, gRasterBandY0) : pyStart;
+        const int bandClampedPyEnd = (optPremulLayer == nullptr) ? std::min(pyEnd, gRasterBandY1) : pyEnd;
+        if (bandClampedPyStart >= bandClampedPyEnd) {
+            continue;
+        }
+        for (int py = bandClampedPyStart; py < bandClampedPyEnd; ++py) {
             for (int px = pxStart; px < pxEnd; ++px) {
                 const float sx = static_cast<float>(px) + 0.5f;
                 const float sy = static_cast<float>(py) + 0.5f;
@@ -2746,6 +2870,29 @@ void ZeroCopyGpuStream::RasterizeTreeToRgba8(
         outRgba8[i * 4u + 1u] = cg;
         outRgba8[i * 4u + 2u] = cb;
         outRgba8[i * 4u + 3u] = ca;
+    }
+
+    if (!UiResourceContext::HasActiveThreadOverride() &&
+        tree.BlurLayerSpans().empty() &&
+        pixelCount >= 16384u &&
+        tree.NodeCount() >= 8u &&
+        viewportHeight >= 64u) {
+        std::uint8_t* rawOut = outRgba8.data();
+        const std::uint32_t nNodes = static_cast<std::uint32_t>(tree.NodeCount());
+        ScanlineWorkerPool::Instance().ParallelBands4(
+            static_cast<int>(viewportHeight),
+            [&](int y0, int y1) {
+                const int prevY0 = gRasterBandY0;
+                const int prevY1 = gRasterBandY1;
+                gRasterBandY0 = y0;
+                gRasterBandY1 = y1;
+                std::size_t localBlurCursor = 0u;
+                RasterizeNodeSpanRecursive(
+                    tree, 0u, nNodes, localBlurCursor, viewportWidth, viewportHeight, rawOut, nullptr);
+                gRasterBandY0 = prevY0;
+                gRasterBandY1 = prevY1;
+            });
+        return;
     }
 
     std::size_t blurCursor = 0u;

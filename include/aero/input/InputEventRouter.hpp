@@ -127,6 +127,7 @@ private:
     void UpdateHoveredTarget(UIElement* newHovered) noexcept;
     void SyncImeFocusState();
     void CloseActiveComboBoxIfOpen();
+    void CloseActiveContextMenuIfOpen();
 
     UIElement* rootVisual_ = nullptr;
     ITextInputMethodHost* imeHost_ = nullptr;
@@ -136,6 +137,7 @@ private:
     IntrusivePtr<UIElement> capturedElement_{};
     IntrusivePtr<UIElement> focusedElement_{};
     IntrusivePtr<ComboBox> openComboBox_{};
+    IntrusivePtr<ContextMenu> openContextMenu_{};
 
     Point lastPointerPos_{0.0f, 0.0f};
     std::array<QueuedInputEvent, kEventQueueCapacity> eventRing_{};

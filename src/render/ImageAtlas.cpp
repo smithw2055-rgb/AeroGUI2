@@ -2940,16 +2940,76 @@ const ImageAtlasEntry* ImageAtlas::LoadOrGet(
         }
     }
 
+    struct GlobalDecodedFileCache {
+        std::mutex mutex;
+        std::unordered_map<std::string, DecodedImage> byKey;
+        std::size_t totalBytes = 0u;
+
+        void InsertBounded(const std::string& key, const DecodedImage& img) {
+            constexpr std::size_t kMaxCacheEntries = 96u;
+            constexpr std::size_t kMaxCacheBytes = 64u * 1024u * 1024u;
+            const std::size_t imgBytes = img.rgbaPixels.size();
+            if (imgBytes > 32u * 1024u * 1024u || imgBytes > kMaxCacheBytes) {
+                return;
+            }
+            std::lock_guard<std::mutex> dLock(mutex);
+            const auto existing = byKey.find(key);
+            if (existing != byKey.end()) {
+                const std::size_t oldBytes = existing->second.rgbaPixels.size();
+                totalBytes = (totalBytes >= oldBytes) ? (totalBytes - oldBytes) : 0u;
+                byKey.erase(existing);
+            }
+            if (byKey.size() >= kMaxCacheEntries || totalBytes + imgBytes > kMaxCacheBytes) {
+                byKey.clear();
+                totalBytes = 0u;
+            }
+            byKey.emplace(key, img);
+            totalBytes += imgBytes;
+        }
+    };
+    static GlobalDecodedFileCache sDecodedFileCache;
+
     DecodedImage decoded{};
     std::string canonicalKey;
     if (!memCopy.empty()) {
-        if (!DecodeImageFromMemory(memCopy.data(), memCopy.size(), decoded)) {
-            return nullptr;
+        std::uint64_t h64 = 1469598103934665603ULL;
+        for (std::uint8_t b : memCopy) {
+            h64 ^= static_cast<std::uint64_t>(b);
+            h64 *= 1099511628211ULL;
+        }
+        const std::string memCacheKey = "mem:" + std::to_string(memCopy.size()) + ":" + std::to_string(h64);
+        bool hitMemCache = false;
+        {
+            std::lock_guard<std::mutex> dLock(sDecodedFileCache.mutex);
+            const auto cit = sDecodedFileCache.byKey.find(memCacheKey);
+            if (cit != sDecodedFileCache.byKey.end()) {
+                decoded = cit->second;
+                hitMemCache = true;
+            }
+        }
+        if (!hitMemCache) {
+            if (!DecodeImageFromMemory(memCopy.data(), memCopy.size(), decoded)) {
+                return nullptr;
+            }
+            sDecodedFileCache.InsertBounded(memCacheKey, decoded);
         }
         canonicalKey = clean;
     } else if (!resolvedDiskPath.empty()) {
-        if (!DecodeImageFromFile(resolvedDiskPath, decoded)) {
-            return nullptr;
+        const std::string diskCacheKey = "file:" + resolvedDiskPath;
+        bool hitDiskCache = false;
+        {
+            std::lock_guard<std::mutex> dLock(sDecodedFileCache.mutex);
+            const auto cit = sDecodedFileCache.byKey.find(diskCacheKey);
+            if (cit != sDecodedFileCache.byKey.end()) {
+                decoded = cit->second;
+                hitDiskCache = true;
+            }
+        }
+        if (!hitDiskCache) {
+            if (!DecodeImageFromFile(resolvedDiskPath, decoded)) {
+                return nullptr;
+            }
+            sDecodedFileCache.InsertBounded(diskCacheKey, decoded);
         }
         canonicalKey = resolvedDiskPath;
     } else {
@@ -3004,16 +3064,43 @@ bool ImageAtlas::CopyTextureSlotIfModified(
 }
 
 Color ImageAtlas::SampleBilinearRgba(std::uint32_t textureId, float u, float v) const noexcept {
-    std::lock_guard<std::mutex> lock(mutex_);
-    const auto it = textureSlots_.find(textureId);
-    if (it == textureSlots_.end()) {
-        return Color{1.0f, 1.0f, 1.0f, 1.0f};
+    struct TlsTexSampleSlot {
+        const ImageAtlas* owner = nullptr;
+        std::uint64_t rev = 0u;
+        std::uint32_t texId = 0xFFFFFFFFu;
+        std::uint32_t width = 0u;
+        std::uint32_t height = 0u;
+        const std::uint8_t* pixels = nullptr;
+    };
+    thread_local std::array<TlsTexSampleSlot, 16> tlsTex{};
+    const std::uint64_t curRev = revision_.load(std::memory_order_acquire);
+    auto& ts = tlsTex[textureId & 15u];
+    if (ts.owner != this || ts.rev != curRev || ts.texId != textureId) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        const auto it = textureSlots_.find(textureId);
+        if (it == textureSlots_.end()) {
+            return Color{1.0f, 1.0f, 1.0f, 1.0f};
+        }
+        const TextureSlotBuffer& sBuf = it->second;
+        if (sBuf.width == 0u || sBuf.height == 0u ||
+            sBuf.rgbaPixels.size() < static_cast<std::size_t>(sBuf.width) * sBuf.height * 4u) {
+            return Color{0.0f, 0.0f, 0.0f, 0.0f};
+        }
+        ts.owner = this;
+        ts.rev = curRev;
+        ts.texId = textureId;
+        ts.width = sBuf.width;
+        ts.height = sBuf.height;
+        ts.pixels = sBuf.rgbaPixels.data();
     }
-    const TextureSlotBuffer& slot = it->second;
-    if (slot.width == 0u || slot.height == 0u ||
-        slot.rgbaPixels.size() < static_cast<std::size_t>(slot.width) * slot.height * 4u) {
-        return Color{0.0f, 0.0f, 0.0f, 0.0f};
-    }
+    struct SlotView {
+        std::uint32_t width;
+        std::uint32_t height;
+        struct PtrWrap {
+            const std::uint8_t* p;
+            const std::uint8_t* data() const noexcept { return p; }
+        } rgbaPixels;
+    } const slot{ts.width, ts.height, {ts.pixels}};
 
     const float clampedU = std::clamp(u, 0.0f, 1.0f);
     const float clampedV = std::clamp(v, 0.0f, 1.0f);

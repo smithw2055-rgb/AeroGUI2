@@ -1829,6 +1829,7 @@ void FontAtlas::ClearCustomFonts() {
     nextFontId_ = 1u;
     std::fill(skyline_.begin(), skyline_.end(), 2u);
     std::fill(sdfPixels_.begin(), sdfPixels_.end(), 0u);
+    revision_.fetch_add(1u, std::memory_order_release);
     InitBuiltInFallbackAscii();
 }
 
@@ -2756,10 +2757,29 @@ void FontAtlas::CopyGlyphRegionRgba8(
 }
 
 float FontAtlas::SampleSdfBilinear(float u, float v) const noexcept {
-    std::lock_guard<std::mutex> lock(mutex_);
-    if (sdfPixels_.empty() || atlasWidth_ == 0u || atlasHeight_ == 0u) {
-        return 0.0f;
+    struct TlsFontView {
+        const FontAtlas* owner = nullptr;
+        std::uint64_t rev = 0u;
+        std::uint16_t w = 0u;
+        std::uint16_t h = 0u;
+        const std::uint8_t* data = nullptr;
+    };
+    thread_local TlsFontView tlsView{};
+    const std::uint64_t curRev = revision_.load(std::memory_order_acquire);
+    if (tlsView.owner != this || tlsView.rev != curRev) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (sdfPixels_.empty() || atlasWidth_ == 0u || atlasHeight_ == 0u) {
+            return 0.0f;
+        }
+        tlsView.owner = this;
+        tlsView.rev = curRev;
+        tlsView.w = atlasWidth_;
+        tlsView.h = atlasHeight_;
+        tlsView.data = sdfPixels_.data();
     }
+    const std::uint16_t atlasWidth_ = tlsView.w;
+    const std::uint16_t atlasHeight_ = tlsView.h;
+    const std::uint8_t* const sdfPixels_ = tlsView.data;
     const float tx = std::clamp(u, 0.0f, 1.0f) * static_cast<float>(atlasWidth_) - 0.5f;
     const float ty = std::clamp(v, 0.0f, 1.0f) * static_cast<float>(atlasHeight_) - 0.5f;
 

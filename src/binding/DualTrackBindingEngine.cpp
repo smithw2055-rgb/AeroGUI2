@@ -118,6 +118,19 @@ struct LiveBindingEngineRegistry {
             }
             return elem->GetValue(PropId_Content);
         }
+        case PropId_Header: {
+            const UnifiedValue v = elem->GetValue(PropId_Header);
+            if (std::holds_alternative<StringValue>(v)) {
+                return v;
+            }
+            if (const auto* tvi = elem->DynamicCast<TreeViewItem>()) {
+                const std::string hdr = tvi->GetHeader();
+                if (!hdr.empty()) {
+                    return value::FromString(hdr);
+                }
+            }
+            return v;
+        }
         default:
             return elem->GetValue(propId);
     }
@@ -1543,12 +1556,45 @@ bool DualTrackBindingEngine::EvaluateAndSyncElementBinding(ElementPropertyBindin
         val = UnifiedValue{eb.cachedSourceElement->ToNativeHandle(domains_.nativeHandles())};
     } else {
         val = ReadElementPropertyOrState(eb.cachedSourceElement, eb.sourcePropertyId);
-        if (!eb.subHops.empty()) {
+        if (eb.subHops.empty()) {
+            if (const auto* nh = std::get_if<NativeHandle>(&val)) {
+                if (const UIElement* selElem = UIElement::FromNativeHandle(domains_.nativeHandles(), *nh)) {
+                    if (const auto* tvi = selElem->DynamicCast<TreeViewItem>()) {
+                        if (eb.targetPropertyId == PropId_Text ||
+                            eb.targetPropertyId == PropId_Content ||
+                            eb.targetPropertyId == PropId_Header ||
+                            !eb.stringFormat.empty()) {
+                            val = value::FromString(tvi->GetHeader());
+                        }
+                    }
+                }
+            }
+        } else {
             if (eb.resolvedHopObjects.size() != eb.subHops.size()) {
                 eb.resolvedHopObjects.assign(eb.subHops.size(), ObjectRef{});
             }
             const auto* startRef = std::get_if<ObjectRef>(&val);
-            if (!startRef || !startRef->valid()) {
+            if (const auto* nh = std::get_if<NativeHandle>(&val)) {
+                unbindEbRange(0u);
+                UIElement* curElem = UIElement::FromNativeHandle(domains_.nativeHandles(), *nh);
+                bool nhOk = (curElem != nullptr);
+                for (std::size_t h = 0u; h < eb.subHops.size() && nhOk; ++h) {
+                    const std::uint16_t subPid = ResolveTriggerConditionPropertyId(eb.subHops[h].memberName);
+                    if (subPid == PropId_Tag && eb.subHops[h].memberName != "Tag") {
+                        nhOk = false;
+                        break;
+                    }
+                    val = ReadElementPropertyOrState(curElem, subPid);
+                    if (h + 1u < eb.subHops.size()) {
+                        const auto* nextNh = std::get_if<NativeHandle>(&val);
+                        curElem = nextNh ? UIElement::FromNativeHandle(domains_.nativeHandles(), *nextNh) : nullptr;
+                        nhOk = (curElem != nullptr);
+                    }
+                }
+                if (!nhOk) {
+                    val = UnifiedValue{};
+                }
+            } else if (!startRef || !startRef->valid()) {
                 unbindEbRange(0u);
                 val = UnifiedValue{};
             } else {

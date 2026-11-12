@@ -290,6 +290,22 @@ enum BuiltinPropertyId : std::uint16_t {
     PropId_AlternationCount = 165,          // Int64 (ItemsControl.AlternationCount)
     PropId_AlternationIndex = 166,          // Int64 (ItemsControl.AlternationIndex)
     PropId_GridViewColumnsSpec = 167,       // StringValue (ListView GridView serialized columns spec)
+    PropId_IsThreeState = 168,              // bool (ToggleButton/CheckBox.IsThreeState)
+    PropId_RepeatDelay = 169,               // float ms (RepeatButton.Delay)
+    PropId_RepeatInterval = 170,            // float ms (RepeatButton.Interval)
+    PropId_ClickMode = 171,                 // Int64 (ButtonBase.ClickMode: 0=Release, 1=Press, 2=Hover)
+    PropId_InputGestureText = 172,          // StringValue (MenuItem.InputGestureText)
+    PropId_IsCheckable = 173,               // bool (MenuItem.IsCheckable)
+    PropId_IsSubmenuOpen = 174,             // bool (MenuItem.IsSubmenuOpen)
+    PropId_NavigateUri = 175,               // StringValue (Hyperlink.NavigateUri)
+    PropId_ToolTipText = 176,               // StringValue (ToolTipService.ToolTip / FrameworkElement.ToolTip)
+    PropId_HasItems = 177,                  // bool (ItemsControl/TreeViewItem.HasItems)
+    PropId_TreeDepthIndent = 178,           // float px (TreeViewItem depth indent)
+    PropId_ContextMenuKey = 179,            // StringValue (FrameworkElement.ContextMenu template key)
+    PropId_ActualWidth = 180,               // float px (FrameworkElement.ActualWidth read-only)
+    PropId_ActualHeight = 181,              // float px (FrameworkElement.ActualHeight read-only)
+    PropId_PlacementTarget = 182,           // NativeHandle (ContextMenu/Popup.PlacementTarget)
+    PropId_RoutedCommandName = 183,         // StringValue (Built-in routed command e.g. ScrollBar.LineLeftCommand)
     PropId_FirstContractInput = 0x1000u,    // Dynamic/Contract input bridge slot range [0x1000 .. 0x1FFFu]
     // Pseudo-property IDs for zero-allocation inline interactive Trigger conditions
     PropId_TriggerIsMouseOver = 0xFF01u,

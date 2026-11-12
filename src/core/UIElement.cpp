@@ -1945,6 +1945,18 @@ UnifiedValue UIElement::GetValue(std::uint16_t propId) const {
             return IsEnabled();
         case PropId_Focusable:
             return IsFocusable();
+        case PropId_ActualWidth: {
+            if (finalRect_.width > 0.0f || finalRect_.height > 0.0f) {
+                return MakeFloat(finalRect_.width);
+            }
+            return GetValue(PropId_Width);
+        }
+        case PropId_ActualHeight: {
+            if (finalRect_.width > 0.0f || finalRect_.height > 0.0f) {
+                return MakeFloat(finalRect_.height);
+            }
+            return GetValue(PropId_Height);
+        }
         default:
             break;
     }
@@ -2775,11 +2787,26 @@ bool Button::PerformClick(RuntimeError* error) {
                 res.error.code == ErrorCode::InvalidArguments &&
                 res.statistics.instructionsExecuted == 0u) {
                 if (args.size() == 1u) {
-                    args.push_back(value::FromInt(0));
+                    args.push_back(UnifiedValue{NullObject{}});
+                    args.push_back(UnifiedValue{NullObject{}});
                     res = scriptInterpreter_->invoke(scriptClickMethodId_, args);
+                    if (!res.succeeded &&
+                        res.error.code == ErrorCode::InvalidArguments &&
+                        res.statistics.instructionsExecuted == 0u) {
+                        args.resize(1u);
+                        args.push_back(value::FromInt(0));
+                        res = scriptInterpreter_->invoke(scriptClickMethodId_, args);
+                    }
                 } else if (args.size() > 1u) {
                     args.resize(1u);
                     res = scriptInterpreter_->invoke(scriptClickMethodId_, args);
+                    if (!res.succeeded &&
+                        res.error.code == ErrorCode::InvalidArguments &&
+                        res.statistics.instructionsExecuted == 0u) {
+                        args.push_back(UnifiedValue{NullObject{}});
+                        args.push_back(UnifiedValue{NullObject{}});
+                        res = scriptInterpreter_->invoke(scriptClickMethodId_, args);
+                    }
                 }
             }
             if (!res.succeeded) {

@@ -74,6 +74,7 @@ void InputEventRouter::SetRootVisual(UIElement* root) noexcept {
         CancelPointerInteraction();
         ClearFocus();
         CloseActiveComboBoxIfOpen();
+        CloseActiveContextMenuIfOpen();
         UpdateHoveredTarget(nullptr);
         rootVisual_ = root;
     }
@@ -341,6 +342,15 @@ void InputEventRouter::CloseActiveComboBoxIfOpen() {
     }
 }
 
+void InputEventRouter::CloseActiveContextMenuIfOpen() {
+    if (openContextMenu_) {
+        if (openContextMenu_->Parent()) {
+            (void)openContextMenu_->Parent()->RemoveChild(openContextMenu_.Get());
+        }
+        openContextMenu_.Reset();
+    }
+}
+
 void InputEventRouter::SyncImeFocusState() {
     if (!imeHost_) {
         return;
@@ -449,6 +459,19 @@ bool InputEventRouter::DispatchPointerDown(
     }
     PruneDisconnectedTargets();
 
+    // 0. Check active open ContextMenu popup first
+    if (openContextMenu_) {
+        const UnifiedValue openVal = openContextMenu_->GetValue(PropId_IsOpen);
+        if (std::holds_alternative<bool>(openVal) && !std::get<bool>(openVal)) {
+            CloseActiveContextMenuIfOpen();
+        } else {
+            const Point cmLocal = openContextMenu_->ScreenToLocal(position);
+            if (!PointInsideElementLocalBounds(openContextMenu_.Get(), cmLocal)) {
+                CloseActiveContextMenuIfOpen();
+            }
+        }
+    }
+
     // 1. Check active open ComboBox overlay popup first (Z-topmost over sibling controls)
     if (openComboBox_ && openComboBox_->IsDropDownOpen()) {
         const std::int32_t hitItemIdx = openComboBox_->HitTestPopupItemIndex(position);
@@ -469,6 +492,54 @@ bool InputEventRouter::DispatchPointerDown(
     UIElement* rawHit = rootVisual_->HitTest(position);
     UIElement* target = ResolveInteractiveTarget(rawHit);
     UpdateHoveredTarget(target);
+
+    if (button == PointerButton::Right && rootVisual_) {
+        for (UIElement* walk = rawHit ? rawHit : target; walk != nullptr; walk = walk->Parent()) {
+            const UnifiedValue cmVal = walk->GetValue(PropId_ContextMenuKey);
+            if (const auto* sv = std::get_if<StringValue>(&cmVal); sv && !sv->view().empty()) {
+                if (const AxbControlTemplate* cmTpl = AxbTemplateRegistry::Instance().FindControlTemplate(sv->view());
+                    cmTpl && cmTpl->templatePackage) {
+                    CloseActiveContextMenuIfOpen();
+                    auto cmElem = MakeIntrusive<ContextMenu>();
+                    DualTrackBindingEngine* be = walk->BoundTwoWayEngine();
+                    StyleTriggerEngine* se = walk->BoundStyleEngine();
+                    for (UIElement* anc = walk->Parent(); anc != nullptr && (!be || !se); anc = anc->Parent()) {
+                        if (!be) be = anc->BoundTwoWayEngine();
+                        if (!se) se = anc->BoundStyleEngine();
+                    }
+                    ExecutionDomainContext* dom = be ? &be->Domains() : nullptr;
+                    ObjectRef dcObj{};
+                    for (UIElement* anc = walk; anc != nullptr && !dcObj.valid(); anc = anc->Parent()) {
+                        const UnifiedValue dcVal = anc->GetValue(PropId_DataContext);
+                        if (const auto* o = std::get_if<ObjectRef>(&dcVal); o && o->valid()) dcObj = *o;
+                    }
+                    if (MountAxbTemplate(cmElem.Get(), *cmTpl->templatePackage, dom, be, dcObj,
+                                         be ? be->UiInterpreter() : nullptr, nullptr, animationEngine_)) {
+                        if (dom) {
+                            cmElem->SetValue(
+                                PropId_PlacementTarget,
+                                UnifiedValue{walk->ToNativeHandle(dom->nativeHandles())},
+                                ValueSourceRank::Local);
+                        }
+                        cmElem->SetValue(PropId_IsOpen, UnifiedValue{true}, ValueSourceRank::Local);
+                        cmElem->SetHorizontalAlignment(HorizontalAlignment::Left);
+                        cmElem->SetVerticalAlignment(VerticalAlignment::Top);
+                        cmElem->SetMargin(Thickness{position.x, position.y, 0.0f, 0.0f});
+                        cmElem->SetValue(PropId_ZIndex, value::FromInt(10000), ValueSourceRank::Local);
+                        (void)rootVisual_->AddChild(cmElem.Get());
+                        if (se) {
+                            se->RegisterPackageStyles(*cmTpl->templatePackage);
+                            (void)se->BindSubtreeStyles(cmElem.Get(), true);
+                            cmElem->BindStyleEngine(se);
+                        }
+                        openContextMenu_ = cmElem;
+                        return true;
+                    }
+                }
+            }
+            if (walk == rootVisual_) break;
+        }
+    }
 
     if (!target || !target->IsEffectivelyEnabled()) {
         if (button == PointerButton::Left && (!target || target == rootVisual_)) {
@@ -543,6 +614,15 @@ bool InputEventRouter::DispatchPointerUp(
         }
         if (target->IsEffectivelyEnabled()) {
             handled = target->OnPointerUp(localPt, button, modifiers, inside);
+        }
+        if (openContextMenu_) {
+            const UnifiedValue openVal = openContextMenu_->GetValue(PropId_IsOpen);
+            if (std::holds_alternative<bool>(openVal) && !std::get<bool>(openVal)) {
+                if (StyleTriggerEngine* se = openContextMenu_->BoundStyleEngine()) {
+                    (void)se->EvaluateAndApply();
+                }
+                CloseActiveContextMenuIfOpen();
+            }
         }
     }
 

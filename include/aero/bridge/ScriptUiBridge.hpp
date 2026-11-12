@@ -46,6 +46,13 @@ bool MountAndWireMainWindow(
     AnimationEngine* animationEngine = nullptr,
     ObjectRef* outViewModelRef = nullptr);
 
+void SetPendingMainWindowMountTarget(
+    const ExecutionDomainContext* domains,
+    UIElement* rootControl,
+    const AxbPackage* package);
+
+void ClearPendingMainWindowMountTarget(const ExecutionDomainContext* domains) noexcept;
+
 struct ReactivePropertyBinding {
     ObjectRef sourceObject{};
     PropertySlotHandle sourceSlot{};

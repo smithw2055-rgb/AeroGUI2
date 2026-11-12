@@ -1023,8 +1023,8 @@ std::uint16_t ResolveBuiltinPropertyId(std::string_view propertyName) noexcept {
     if (propertyName.size() >= 2u && propertyName.front() == '(' && propertyName.back() == ')') {
         propertyName = TrimWs(propertyName.substr(1u, propertyName.size() - 2u));
     }
-    if (propertyName == "Width" || propertyName == "ActualWidth") return PropId_Width;
-    if (propertyName == "Height" || propertyName == "ActualHeight") return PropId_Height;
+    if (propertyName == "Width") return PropId_Width;
+    if (propertyName == "Height") return PropId_Height;
     if (propertyName == "Custom.Number_Single" || propertyName == "Number_Single") return PropId_Value;
     if (propertyName == "Custom.Index_Int32" || propertyName == "Index_Int32") return PropId_CustomIndexInt32;
     if (propertyName == "Custom.State_Int32" || propertyName == "State_Int32") return PropId_CustomStateInt32;
@@ -1227,6 +1227,59 @@ std::uint16_t ResolveBuiltinPropertyId(std::string_view propertyName) noexcept {
     }
     if (propertyName == "GridViewColumnsSpec") {
         return PropId_GridViewColumnsSpec;
+    }
+    if (propertyName == "IsThreeState" || propertyName == "ToggleButton.IsThreeState" ||
+        propertyName == "CheckBox.IsThreeState") {
+        return PropId_IsThreeState;
+    }
+    if (propertyName == "Delay" || propertyName == "RepeatDelay" || propertyName == "RepeatButton.Delay") {
+        return PropId_RepeatDelay;
+    }
+    if (propertyName == "Interval" || propertyName == "RepeatInterval" || propertyName == "RepeatButton.Interval") {
+        return PropId_RepeatInterval;
+    }
+    if (propertyName == "ClickMode" || propertyName == "ButtonBase.ClickMode") {
+        return PropId_ClickMode;
+    }
+    if (propertyName == "InputGestureText" || propertyName == "MenuItem.InputGestureText") {
+        return PropId_InputGestureText;
+    }
+    if (propertyName == "IsCheckable" || propertyName == "MenuItem.IsCheckable") {
+        return PropId_IsCheckable;
+    }
+    if (propertyName == "IsSubmenuOpen" || propertyName == "MenuItem.IsSubmenuOpen") {
+        return PropId_IsSubmenuOpen;
+    }
+    if (propertyName == "NavigateUri" || propertyName == "Hyperlink.NavigateUri") {
+        return PropId_NavigateUri;
+    }
+    if (propertyName == "ToolTip" || propertyName == "ToolTipService.ToolTip" ||
+        propertyName == "FrameworkElement.ToolTip") {
+        return PropId_ToolTipText;
+    }
+    if (propertyName == "HasItems" || propertyName == "ItemsControl.HasItems" ||
+        propertyName == "TreeViewItem.HasItems") {
+        return PropId_HasItems;
+    }
+    if (propertyName == "TreeDepthIndent") {
+        return PropId_TreeDepthIndent;
+    }
+    if (propertyName == "ContextMenu" || propertyName == "FrameworkElement.ContextMenu" ||
+        propertyName == "ContextMenuService.ContextMenu") {
+        return PropId_ContextMenuKey;
+    }
+    if (propertyName == "ActualWidth" || propertyName == "FrameworkElement.ActualWidth") {
+        return PropId_ActualWidth;
+    }
+    if (propertyName == "ActualHeight" || propertyName == "FrameworkElement.ActualHeight") {
+        return PropId_ActualHeight;
+    }
+    if (propertyName == "PlacementTarget" || propertyName == "ContextMenu.PlacementTarget" ||
+        propertyName == "Popup.PlacementTarget") {
+        return PropId_PlacementTarget;
+    }
+    if (propertyName == "RoutedCommandName") {
+        return PropId_RoutedCommandName;
     }
     return PropId_Tag;
 }
@@ -2478,9 +2531,26 @@ RoutedTriggerEvent ParseRoutedTriggerEvent(
         outRecognized = true;
         return RoutedTriggerEvent::SelectionChanged;
     }
-    if (EqualsIgnoreCase(s, "ValueChanged")) {
+    if (EqualsIgnoreCase(s, "ValueChanged") || EqualsIgnoreCase(s, "TextChanged") ||
+        EqualsIgnoreCase(s, "PasswordChanged")) {
         outRecognized = true;
         return RoutedTriggerEvent::ValueChanged;
+    }
+    if (EqualsIgnoreCase(s, "SelectedItemChanged")) {
+        outRecognized = true;
+        return RoutedTriggerEvent::SelectionChanged;
+    }
+    if (EqualsIgnoreCase(s, "Expanded")) {
+        outRecognized = true;
+        return RoutedTriggerEvent::Checked;
+    }
+    if (EqualsIgnoreCase(s, "Collapsed")) {
+        outRecognized = true;
+        return RoutedTriggerEvent::Unchecked;
+    }
+    if (EqualsIgnoreCase(s, "Indeterminate")) {
+        outRecognized = true;
+        return RoutedTriggerEvent::Indeterminate;
     }
     return RoutedTriggerEvent::Loaded;
 }
@@ -2550,6 +2620,11 @@ UnifiedValue ParseBuiltinLiteralPropertyValue(
         case PropId_AnimTranslate3DZ:
         case PropId_EffectBlurRadius:
         case PropId_EffectShadowDepth:
+        case PropId_RepeatDelay:
+        case PropId_RepeatInterval:
+        case PropId_TreeDepthIndent:
+        case PropId_ActualWidth:
+        case PropId_ActualHeight:
             return MakeFloat(ParseFloat32Fast(rawValue));
 
         case PropId_EffectKind: {
@@ -2582,6 +2657,16 @@ UnifiedValue ParseBuiltinLiteralPropertyValue(
         }
 
         case PropId_IsChecked:
+            if (EqualsIgnoreCase(rawValue, "{x:Null}") || EqualsIgnoreCase(rawValue, "x:Null") ||
+                EqualsIgnoreCase(rawValue, "null")) {
+                return UnifiedValue{NullObject{}};
+            }
+            return EqualsIgnoreCase(rawValue, "true") || rawValue == "1";
+
+        case PropId_IsThreeState:
+        case PropId_IsCheckable:
+        case PropId_IsSubmenuOpen:
+        case PropId_HasItems:
         case PropId_ClipToBounds:
         case PropId_IsReadOnly:
         case PropId_IsDropDownOpen:
@@ -2683,6 +2768,11 @@ UnifiedValue ParseBuiltinLiteralPropertyValue(
         case PropId_TextTrimming:
             if (EqualsIgnoreCase(rawValue, "CharacterEllipsis") || rawValue == "1") return value::FromInt(1);
             if (EqualsIgnoreCase(rawValue, "WordEllipsis") || rawValue == "2") return value::FromInt(2);
+            return value::FromInt(0);
+
+        case PropId_ClickMode:
+            if (EqualsIgnoreCase(rawValue, "Press") || rawValue == "1") return value::FromInt(1);
+            if (EqualsIgnoreCase(rawValue, "Hover") || rawValue == "2") return value::FromInt(2);
             return value::FromInt(0);
 
         case PropId_GridRow:
@@ -3898,8 +3988,10 @@ bool AxbPackage::BindAgainstProgram(
             if (!IsValidRealScriptFieldIdentifier(nc.name)) {
                 continue;
             }
+            const std::string typedBackingField = "__aero_handle_" + nc.name;
             for (std::size_t fIdx = 0; fIdx < fieldsOwnerSym->fields.size(); ++fIdx) {
-                if (fieldsOwnerSym->fields[fIdx].name == nc.name &&
+                if ((fieldsOwnerSym->fields[fIdx].name == nc.name ||
+                     fieldsOwnerSym->fields[fIdx].name == typedBackingField) &&
                     fieldsOwnerSym->fields[fIdx].type == rs_sem::PrimitiveType::Handle) {
                     nc.fieldIndexInClass = static_cast<std::uint32_t>(fIdx);
                     break;
@@ -4523,6 +4615,46 @@ bool AxbPackage::BindAgainstProgram(
     }
 
     return true;
+}
+
+namespace {
+constexpr std::uint32_t kAxb4P15SectionMagic = 0x35315041u; // "AP15"
+} // namespace
+
+bool AxbPackage::HasP15Section() const noexcept {
+    if (!startupUri.empty()) {
+        return true;
+    }
+    for (const auto& dt : dataTemplates) {
+        if (!dt.itemsSourcePath.empty() || !dt.childItemTemplateKey.empty()) {
+            return true;
+        }
+    }
+    auto checkActs = [](const std::vector<AxbInteractionAction>& acts) -> bool {
+        for (const auto& a : acts) {
+            if (a.targetObjectBinding != nullptr) {
+                return true;
+            }
+        }
+        return false;
+    };
+    for (const auto& st : styles) {
+        for (const auto& tr : st.triggers) {
+            if (checkActs(tr.enterActions) || checkActs(tr.exitActions)) return true;
+        }
+        for (const auto& et : st.eventTriggers) {
+            if (checkActs(et.actions)) return true;
+        }
+    }
+    for (const auto& ct : controlTemplates) {
+        for (const auto& tr : ct.triggers) {
+            if (checkActs(tr.enterActions) || checkActs(tr.exitActions)) return true;
+        }
+        for (const auto& et : ct.eventTriggers) {
+            if (checkActs(et.actions)) return true;
+        }
+    }
+    return false;
 }
 
 bool AxbPackage::HasP14Section() const noexcept {
@@ -5281,6 +5413,54 @@ std::vector<std::uint8_t> AxbPackage::Serialize() const {
         }
     }
 
+    if (HasP15Section()) {
+        WriteU32(out, kAxb4P15SectionMagic);
+        WriteString(out, startupUri);
+        WriteU32(out, static_cast<std::uint32_t>(dataTemplates.size()));
+        for (const auto& dt : dataTemplates) {
+            WriteString(out, dt.itemsSourcePath);
+            WriteString(out, dt.childItemTemplateKey);
+        }
+        auto writeActTargetObj = [&](const std::vector<AxbInteractionAction>& acts) {
+            WriteU32(out, static_cast<std::uint32_t>(acts.size()));
+            for (const auto& act : acts) {
+                if (act.targetObjectBinding) {
+                    WriteU8(out, 1u);
+                    WriteString(out, act.targetObjectBinding->rawPath);
+                    WriteString(out, act.targetObjectBinding->elementName);
+                    WriteString(out, act.targetObjectBinding->relativeAncestorType);
+                    WriteU8(out, act.targetObjectBinding->relativeSelf ? 1u : 0u);
+                } else {
+                    WriteU8(out, 0u);
+                }
+            }
+        };
+        WriteU32(out, static_cast<std::uint32_t>(styles.size()));
+        for (const auto& st : styles) {
+            WriteU32(out, static_cast<std::uint32_t>(st.triggers.size()));
+            for (const auto& tr : st.triggers) {
+                writeActTargetObj(tr.enterActions);
+                writeActTargetObj(tr.exitActions);
+            }
+            WriteU32(out, static_cast<std::uint32_t>(st.eventTriggers.size()));
+            for (const auto& et : st.eventTriggers) {
+                writeActTargetObj(et.actions);
+            }
+        }
+        WriteU32(out, static_cast<std::uint32_t>(controlTemplates.size()));
+        for (const auto& ct : controlTemplates) {
+            WriteU32(out, static_cast<std::uint32_t>(ct.triggers.size()));
+            for (const auto& tr : ct.triggers) {
+                writeActTargetObj(tr.enterActions);
+                writeActTargetObj(tr.exitActions);
+            }
+            WriteU32(out, static_cast<std::uint32_t>(ct.eventTriggers.size()));
+            for (const auto& et : ct.eventTriggers) {
+                writeActTargetObj(et.actions);
+            }
+        }
+    }
+
     return out;
 }
 
@@ -5516,6 +5696,7 @@ bool DeserializeAxbPackageWithDepth(
     constexpr std::uint32_t kSecBit_CTP1 = 1u << 4;
     constexpr std::uint32_t kSecBit_MR12 = 1u << 5;
     constexpr std::uint32_t kSecBit_AP14 = 1u << 6;
+    constexpr std::uint32_t kSecBit_AP15 = 1u << 7;
     std::uint32_t seenSectionMask = 0u;
 
     while (r.offset < r.size) {
@@ -5687,7 +5868,7 @@ bool DeserializeAxbPackageWithDepth(
             constexpr std::uint8_t kMaxConditionSourceRaw =
                 static_cast<std::uint8_t>(TriggerConditionSource::AncestorProperty);
             constexpr std::uint8_t kMaxRoutedEventRaw =
-                static_cast<std::uint8_t>(RoutedTriggerEvent::PropertyChanged);
+                static_cast<std::uint8_t>(RoutedTriggerEvent::Indeterminate);
 
             std::uint32_t bcExtCount = 0;
             if (!r.ReadU32(bcExtCount) || bcExtCount != pkg.bindingChains.size()) {
@@ -6087,7 +6268,7 @@ bool DeserializeAxbPackageWithDepth(
         constexpr std::uint8_t kMaxCtpCondSrcRaw =
             static_cast<std::uint8_t>(TriggerConditionSource::AncestorProperty);
         constexpr std::uint8_t kMaxCtpRoutedEventRaw =
-            static_cast<std::uint8_t>(RoutedTriggerEvent::PropertyChanged);
+            static_cast<std::uint8_t>(RoutedTriggerEvent::Indeterminate);
 
         auto readCtpSetterList = [&](std::vector<AxbPropertySetter>& setters) -> bool {
             std::uint32_t sc = 0;
@@ -6404,7 +6585,7 @@ bool DeserializeAxbPackageWithDepth(
                 auto& act = acts[i];
                 std::uint8_t kindRaw = 0u, actFlags = 0u, sbOptRaw = 0u;
                 if (!r.ReadU8(kindRaw) ||
-                    kindRaw > static_cast<std::uint8_t>(InteractionActionKind::PlaySound) ||
+                    kindRaw > static_cast<std::uint8_t>(InteractionActionKind::RemoveElement) ||
                     !r.ReadString(act.actionName) ||
                     !r.ReadU8(actFlags) ||
                     !r.ReadString(act.targetName) ||
@@ -6610,6 +6791,80 @@ bool DeserializeAxbPackageWithDepth(
                 }
             }
         }
+        } else if (trailMagic == kAxb4P15SectionMagic) {
+            if ((seenSectionMask & kSecBit_AP15) != 0u) {
+                return failStcSection("corrupted AXB4 duplicate AP15 section");
+            }
+            seenSectionMask |= kSecBit_AP15;
+            if (!r.ReadString(pkg.startupUri)) {
+                return failStcSection("corrupted AXB4 AP15 startupUri");
+            }
+            std::uint32_t dtP15Count = 0u;
+            if (!r.ReadU32(dtP15Count) || dtP15Count != pkg.dataTemplates.size()) {
+                return failStcSection("corrupted AXB4 AP15 dataTemplates count");
+            }
+            for (std::uint32_t i = 0u; i < dtP15Count; ++i) {
+                if (!r.ReadString(pkg.dataTemplates[i].itemsSourcePath) ||
+                    !r.ReadString(pkg.dataTemplates[i].childItemTemplateKey)) {
+                    return failStcSection("corrupted AXB4 AP15 dataTemplate fields");
+                }
+            }
+            auto readActTargetObj = [&](std::vector<AxbInteractionAction>& acts) -> bool {
+                std::uint32_t ac = 0u;
+                if (!r.ReadU32(ac) || ac != acts.size()) return false;
+                for (std::uint32_t i = 0u; i < ac; ++i) {
+                    std::uint8_t hasObj = 0u;
+                    if (!r.ReadU8(hasObj)) return false;
+                    if (hasObj != 0u) {
+                        auto bc = std::make_shared<AxbCompiledBindingChain>();
+                        std::uint8_t relS = 0u;
+                        if (!r.ReadString(bc->rawPath) ||
+                            !r.ReadString(bc->elementName) ||
+                            !r.ReadString(bc->relativeAncestorType) ||
+                            !r.ReadU8(relS)) {
+                            return false;
+                        }
+                        bc->relativeSelf = (relS != 0u);
+                        if (!bc->rawPath.empty() && bc->rawPath != ".") {
+                            AxbCompiledHop hop{};
+                            hop.memberName = bc->rawPath;
+                            bc->hops.push_back(std::move(hop));
+                        }
+                        acts[i].targetObjectBinding = std::move(bc);
+                    }
+                }
+                return true;
+            };
+            std::uint32_t stC = 0u;
+            if (!r.ReadU32(stC) || stC != pkg.styles.size()) return false;
+            for (std::uint32_t si = 0u; si < stC; ++si) {
+                std::uint32_t trC = 0u;
+                if (!r.ReadU32(trC) || trC != pkg.styles[si].triggers.size()) return false;
+                for (std::uint32_t ti = 0u; ti < trC; ++ti) {
+                    if (!readActTargetObj(pkg.styles[si].triggers[ti].enterActions) ||
+                        !readActTargetObj(pkg.styles[si].triggers[ti].exitActions)) return false;
+                }
+                std::uint32_t etC = 0u;
+                if (!r.ReadU32(etC) || etC != pkg.styles[si].eventTriggers.size()) return false;
+                for (std::uint32_t ei = 0u; ei < etC; ++ei) {
+                    if (!readActTargetObj(pkg.styles[si].eventTriggers[ei].actions)) return false;
+                }
+            }
+            std::uint32_t ctC = 0u;
+            if (!r.ReadU32(ctC) || ctC != pkg.controlTemplates.size()) return false;
+            for (std::uint32_t ci = 0u; ci < ctC; ++ci) {
+                std::uint32_t trC = 0u;
+                if (!r.ReadU32(trC) || trC != pkg.controlTemplates[ci].triggers.size()) return false;
+                for (std::uint32_t ti = 0u; ti < trC; ++ti) {
+                    if (!readActTargetObj(pkg.controlTemplates[ci].triggers[ti].enterActions) ||
+                        !readActTargetObj(pkg.controlTemplates[ci].triggers[ti].exitActions)) return false;
+                }
+                std::uint32_t etC = 0u;
+                if (!r.ReadU32(etC) || etC != pkg.controlTemplates[ci].eventTriggers.size()) return false;
+                for (std::uint32_t ei = 0u; ei < etC; ++ei) {
+                    if (!readActTargetObj(pkg.controlTemplates[ci].eventTriggers[ei].actions)) return false;
+                }
+            }
         } else {
             return failStcSection("corrupted AXB4 unknown trailing section magic");
         }

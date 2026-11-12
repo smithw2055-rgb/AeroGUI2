@@ -2252,6 +2252,52 @@ void StyleTriggerEngine::ExecuteSingleInteractionAction(
             break;
         }
 
+        case InteractionActionKind::RemoveElement: {
+            UIElement* toRemove = nullptr;
+            if (action.targetObjectBinding && domains_) {
+                if (!action.targetObjectBinding->relativeAncestorType.empty()) {
+                    for (UIElement* anc = elem; anc != nullptr; anc = anc->Parent()) {
+                        std::string_view st;
+                        if (anc->GetTypeClass() && anc->GetTypeClass()->typeName) {
+                            st = anc->GetTypeClass()->typeName;
+                            if (const auto dot = st.rfind('.'); dot != std::string_view::npos) st = st.substr(dot + 1u);
+                        }
+                        if (st == action.targetObjectBinding->relativeAncestorType ||
+                            anc->DeclaredTypeName() == action.targetObjectBinding->relativeAncestorType) {
+                            if (action.targetObjectBinding->rawPath == "PlacementTarget") {
+                                const UnifiedValue ptv = anc->GetValue(PropId_PlacementTarget);
+                                NativeHandle nh{};
+                                if (ptv.tryGetNativeHandle(nh) && nh.valid()) {
+                                    toRemove = UIElement::FromNativeHandle(domains_->nativeHandles(), nh);
+                                }
+                            } else {
+                                toRemove = anc;
+                            }
+                            break;
+                        }
+                    }
+                } else if (!action.targetObjectBinding->elementName.empty()) {
+                    if (UIElement* sr = UIElement::FindNamescopeRoot(elem)) {
+                        toRemove = sr->FindName(action.targetObjectBinding->elementName);
+                    }
+                } else if (action.targetObjectBinding->relativeSelf) {
+                    toRemove = elem;
+                }
+            }
+            if (!toRemove && !action.targetName.empty()) {
+                if (UIElement* sr = UIElement::FindNamescopeRoot(elem)) {
+                    toRemove = sr->FindName(action.targetName);
+                }
+            }
+            if (!toRemove) {
+                toRemove = elem;
+            }
+            if (toRemove && toRemove->Parent()) {
+                (void)toRemove->Parent()->RemoveChild(toRemove);
+            }
+            break;
+        }
+
         case InteractionActionKind::ControlStoryboard: {
             if (!animationEngine_) {
                 break;
@@ -2725,7 +2771,9 @@ bool StyleTriggerEngine::EvaluateEventTriggers(StyledElementInstance& inst) {
         const std::uint16_t numericPid =
             (et.eventKind == RoutedTriggerEvent::PropertyChanged && rt.watchedPropId != 0xFFFFu)
                 ? rt.watchedPropId
-                : static_cast<std::uint16_t>(PropId_Value);
+                : ((et.eventKind == RoutedTriggerEvent::Indeterminate)
+                    ? static_cast<std::uint16_t>(PropId_IsChecked)
+                    : static_cast<std::uint16_t>(PropId_Value));
         const UnifiedValue curWatchedVal = src->GetValue(numericPid);
         (void)TryGetFloat(curWatchedVal, curNumVal);
 
@@ -2789,6 +2837,14 @@ bool StyleTriggerEngine::EvaluateEventTriggers(StyledElementInstance& inst) {
                         fire = true;
                     }
                     break;
+                case RoutedTriggerEvent::Indeterminate: {
+                    const bool curInd = std::holds_alternative<NullObject>(curWatchedVal);
+                    const bool prevInd = std::holds_alternative<NullObject>(rt.prevWatchedValue);
+                    if (curInd && !prevInd) {
+                        fire = true;
+                    }
+                    break;
+                }
             }
             rt.lastClickGen = curClickGen;
             rt.prevHovered = curHovered;

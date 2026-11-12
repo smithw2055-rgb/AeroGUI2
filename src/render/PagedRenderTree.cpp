@@ -4477,6 +4477,46 @@ void PagedRenderTree::TraverseAndEmitElement(
         nodes_[anchorId].opacity = 0.0f;
         applyNodeTransform(anchorId);
         ++emittedCount;
+    } else if (const auto* tvi = elem->DynamicCast<TreeViewItem>(); tvi != nullptr && !tvi->HasControlTemplate()) {
+        const float hdrH = 24.0f;
+        if (tvi->IsSelected() || tvi->IsHovered()) {
+            const Color selBg = tvi->IsSelected()
+                ? Color{0.20f, 0.44f, 0.82f, 0.42f}
+                : Color{1.0f, 1.0f, 1.0f, 0.08f};
+            const std::uint32_t bgId = AllocateRoundedRectNode(
+                r.x, r.y, w, std::min(h, hdrH), selBg, CornerRadius{4.0f}, elem);
+            nodes_[bgId].opacity = effOpacity;
+            applyNodeTransform(bgId);
+            ++emittedCount;
+        }
+        const UnifiedValue hiVal = tvi->GetValue(PropId_HasItems);
+        const bool hasSub = std::holds_alternative<bool>(hiVal) && std::get<bool>(hiVal);
+        const Color fg = value::TryGetColor(tvi->GetValue(PropId_Foreground))
+            .value_or(Color{0.90f, 0.93f, 0.98f, 1.0f});
+        float fs = 14.0f;
+        (void)TryGetFloat(tvi->GetValue(PropId_FontSize), fs);
+        if (hasSub) {
+            const std::string glyph = tvi->IsExpanded() ? "v" : ">";
+            emittedCount = static_cast<std::uint16_t>(
+                emittedCount + EmitTextRunNodes(
+                    r.x + 6.0f, r.y + 4.0f, fs * 0.85f, glyph, fg, effOpacity * 0.85f, curState, elem));
+        }
+        bool hasHeaderElem = false;
+        for (const UIElement* c = tvi->FirstChild(); c != nullptr; c = c->NextSibling()) {
+            const UnifiedValue chv = c->GetValue(PropId_Header);
+            if (std::holds_alternative<bool>(chv) && std::get<bool>(chv)) {
+                hasHeaderElem = true;
+                break;
+            }
+        }
+        if (!hasHeaderElem) {
+            const std::string hdrText = tvi->GetHeader();
+            if (!hdrText.empty()) {
+                emittedCount = static_cast<std::uint16_t>(
+                    emittedCount + EmitTextRunNodes(
+                        r.x + 22.0f, r.y + 3.0f, fs, hdrText, fg, effOpacity, curState, elem));
+            }
+        }
     } else if (const auto* cp = elem->DynamicCast<ContentPresenter>()) {
         const std::uint32_t anchorId = AllocateRenderNode(
             r.x, r.y, 0.0f, 0.0f, Color{0.0f, 0.0f, 0.0f, 0.0f}, 0.0f, 0.0f, elem);
@@ -5414,6 +5454,7 @@ void PagedRenderTree::TraverseAndEmitElement(
         const auto* rb = elem->DynamicCast<RadioButton>();
         const bool isRadio = (rb != nullptr);
         const bool checked = isRadio ? rb->IsChecked() : cb->IsChecked();
+        const bool indeterminate = !isRadio && cb && std::holds_alternative<NullObject>(cb->GetValue(PropId_IsChecked));
         const float effAlpha = elem->IsEffectivelyEnabled() ? effOpacity : (effOpacity * 0.55f);
 
         const Thickness pad = elem->GetPadding();
@@ -5434,17 +5475,20 @@ void PagedRenderTree::TraverseAndEmitElement(
 
         const float markSize = isRadio ? 8.0f : 10.0f;
         const float markInset = (boxSize - markSize) * 0.5f;
-        const float markCr = isRadio ? 4.0f : 2.0f;
+        const float markCr = isRadio ? 4.0f : (indeterminate ? 1.5f : 2.0f);
+        const float markW = (checked || indeterminate) ? markSize : 0.0f;
+        const float markH = checked ? markSize : (indeterminate ? 3.0f : 0.0f);
+        const float markY = indeterminate ? (iy + (boxSize - 3.0f) * 0.5f) : (iy + markInset);
         const std::uint32_t markId = AllocateRenderNode(
             ix + markInset,
-            iy + markInset,
-            checked ? markSize : 0.0f,
-            checked ? markSize : 0.0f,
+            markY,
+            markW,
+            markH,
             Color{0.26f, 0.66f, 1.0f, 1.0f},
             markCr,
             0.0f,
             elem);
-        nodes_[markId].opacity = checked ? effAlpha : 0.0f;
+        nodes_[markId].opacity = (checked || indeterminate) ? effAlpha : 0.0f;
         applyNodeTransform(markId);
         ++emittedCount;
 
@@ -5742,11 +5786,20 @@ void PagedRenderTree::TraverseAndEmitElement(
                 break;
             }
         }
+        const auto* selfTreeItem = (!elem->HasControlTemplate()) ? elem->DynamicCast<TreeViewItem>() : nullptr;
         auto emitOneChild = [&](const UIElement* child) {
             if (selfExpander && selfExpander->IsBodyChildHidden(child)) {
                 std::size_t dummy = 0u;
                 CollapseSubtreeRenderNodesRecursive(child, dummy);
                 return;
+            }
+            if (selfTreeItem && !selfTreeItem->IsExpanded()) {
+                const UnifiedValue chv = child->GetValue(PropId_Header);
+                if (!(std::holds_alternative<bool>(chv) && std::get<bool>(chv))) {
+                    std::size_t dummy = 0u;
+                    CollapseSubtreeRenderNodesRecursive(child, dummy);
+                    return;
+                }
             }
             if (selfTabControl && selfTabControl->IsChildInactiveTabPage(child)) {
                 std::size_t dummy = 0u;

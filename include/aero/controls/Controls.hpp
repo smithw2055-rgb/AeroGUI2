@@ -1156,6 +1156,7 @@ public:
 
 protected:
     [[nodiscard]] ExecutionDomainContext* Domains() const noexcept { return domains_; }
+    [[nodiscard]] DualTrackBindingEngine* BindingEngine() const noexcept { return bindingEngine_; }
     [[nodiscard]] bool IsDeferringSelectionNotify() const noexcept { return deferSelectionNotify_; }
     [[nodiscard]] bool ComputeLiveScrollViewport(float& outViewTop, float& outViewH) const noexcept;
     void MarkExtraValuesInPools() const noexcept override;
@@ -1194,6 +1195,8 @@ private:
         std::size_t targetEndExclusive,
         Size measureConstraint);
     [[nodiscard]] const ScrollViewer* FindAncestorScrollViewer() const noexcept;
+    [[nodiscard]] std::size_t FirstItemChildOffset() const noexcept;
+    [[nodiscard]] const AxbDataTemplate* ResolveActiveDataTemplateEntry(const UnifiedValue& sampleItem) const noexcept;
     [[nodiscard]] const AxbPackage* ResolveActiveItemTemplate(const UnifiedValue& sampleItem) const noexcept;
     [[nodiscard]] IntrusivePtr<UIElement> InstantiateTemplatedItem(
         const AxbPackage& tplPkg,
@@ -1382,7 +1385,9 @@ public:
     [[nodiscard]] const AxbStyleDefinition* FindImplicitStyle(std::string_view targetTypeName) const noexcept;
     [[nodiscard]] const AxbStoryboard* FindStoryboard(std::string_view key) const noexcept;
     [[nodiscard]] const AxbPackage* FindDataTemplate(std::string_view key) const noexcept;
+    [[nodiscard]] const AxbDataTemplate* FindDataTemplateEntry(std::string_view key) const noexcept;
     [[nodiscard]] const AxbPackage* FindImplicitDataTemplate(std::string_view shortDataTypeName) const noexcept;
+    [[nodiscard]] const AxbDataTemplate* FindImplicitDataTemplateEntry(std::string_view shortDataTypeName) const noexcept;
     [[nodiscard]] const AxbControlTemplate* FindControlTemplate(std::string_view key) const noexcept;
     [[nodiscard]] const AxbControlTemplate* FindImplicitControlTemplate(std::string_view targetTypeName) const noexcept;
     [[nodiscard]] std::vector<AxbStyleDefinition> RegisteredStyles() const;
@@ -1440,7 +1445,10 @@ public:
         implicitStyles_.clear();
         storyboards_.clear();
         dataTemplates_.clear();
+        dataTemplateEntries_.clear();
+        mtsdfLookupEpoch_.fetch_add(1u, std::memory_order_relaxed);
         implicitDataTemplates_.clear();
+        implicitDataTemplateEntries_.clear();
         controlTemplates_.clear();
         implicitControlTemplates_.clear();
         customWakeCallback_ = nullptr;
@@ -1489,7 +1497,10 @@ private:
     std::unordered_map<std::string, AxbStyleDefinition> implicitStyles_;
     std::unordered_map<std::string, AxbStoryboard> storyboards_;
     std::unordered_map<std::string, std::shared_ptr<AxbPackage>> dataTemplates_;
+    std::unordered_map<std::string, AxbDataTemplate> dataTemplateEntries_;
+    std::atomic<std::uint64_t> mtsdfLookupEpoch_{1u};
     std::unordered_map<std::string, std::shared_ptr<AxbPackage>> implicitDataTemplates_;
+    std::unordered_map<std::string, AxbDataTemplate> implicitDataTemplateEntries_;
     std::unordered_map<std::string, AxbControlTemplate> controlTemplates_;
     std::unordered_map<std::string, AxbControlTemplate> implicitControlTemplates_;
     std::uint32_t nextMtsdfAtlasSlot_ = 0u;
@@ -1665,12 +1676,190 @@ private:
     bool reloadingSource_ = false;
 };
 
+
+class Separator : public Border {
+public:
+    Separator();
+    ~Separator() override = default;
+    static const TypeClass* StaticTypeClass() noexcept;
+    [[nodiscard]] const TypeClass* GetTypeClass() const noexcept override { return StaticTypeClass(); }
+    Size MeasureCore(Size availableSize) noexcept override;
+};
+
+class StatusBar : public DockPanel {
+public:
+    StatusBar();
+    ~StatusBar() override = default;
+    static const TypeClass* StaticTypeClass() noexcept;
+    [[nodiscard]] const TypeClass* GetTypeClass() const noexcept override { return StaticTypeClass(); }
+};
+
+class StatusBarItem : public ContentPresenter {
+public:
+    StatusBarItem();
+    ~StatusBarItem() override = default;
+    static const TypeClass* StaticTypeClass() noexcept;
+    [[nodiscard]] const TypeClass* GetTypeClass() const noexcept override { return StaticTypeClass(); }
+};
+
+class ToolBar : public StackPanel {
+public:
+    ToolBar();
+    ~ToolBar() override = default;
+    static const TypeClass* StaticTypeClass() noexcept;
+    [[nodiscard]] const TypeClass* GetTypeClass() const noexcept override { return StaticTypeClass(); }
+};
+
+class Menu : public StackPanel {
+public:
+    Menu();
+    ~Menu() override = default;
+    static const TypeClass* StaticTypeClass() noexcept;
+    [[nodiscard]] const TypeClass* GetTypeClass() const noexcept override { return StaticTypeClass(); }
+};
+
+class ContextMenu : public StackPanel {
+public:
+    ContextMenu();
+    ~ContextMenu() override = default;
+    static const TypeClass* StaticTypeClass() noexcept;
+    [[nodiscard]] const TypeClass* GetTypeClass() const noexcept override { return StaticTypeClass(); }
+};
+
+class MenuItem : public Button {
+public:
+    MenuItem();
+    ~MenuItem() override = default;
+    static const TypeClass* StaticTypeClass() noexcept;
+    [[nodiscard]] const TypeClass* GetTypeClass() const noexcept override { return StaticTypeClass(); }
+    void OnPropertyChanged(std::uint16_t propId, const UnifiedValue& newValue) override;
+    bool ActivateFromInput(RuntimeError* error = nullptr) override;
+    Size MeasureCore(Size availableSize) noexcept override;
+    void ArrangeCore(Rect finalRect) noexcept override;
+};
+
+class RepeatButton : public Button {
+public:
+    RepeatButton();
+    ~RepeatButton() override = default;
+    static const TypeClass* StaticTypeClass() noexcept;
+    [[nodiscard]] const TypeClass* GetTypeClass() const noexcept override { return StaticTypeClass(); }
+    bool ActivateFromInput(RuntimeError* error = nullptr) override;
+    bool OnPointerMove(Point localPoint, std::uint8_t modifiers) override;
+};
+
+class Hyperlink : public Button {
+public:
+    Hyperlink();
+    ~Hyperlink() override = default;
+    static const TypeClass* StaticTypeClass() noexcept;
+    [[nodiscard]] const TypeClass* GetTypeClass() const noexcept override { return StaticTypeClass(); }
+};
+
+class ToolTip : public Popup {
+public:
+    ToolTip();
+    ~ToolTip() override = default;
+    static const TypeClass* StaticTypeClass() noexcept;
+    [[nodiscard]] const TypeClass* GetTypeClass() const noexcept override { return StaticTypeClass(); }
+    void OnPropertyChanged(std::uint16_t propId, const UnifiedValue& newValue) override;
+    Size MeasureCore(Size availableSize) noexcept override;
+    void ArrangeCore(Rect finalRect) noexcept override;
+};
+
+class GridSplitter : public Border {
+public:
+    GridSplitter();
+    ~GridSplitter() override = default;
+    static const TypeClass* StaticTypeClass() noexcept;
+    [[nodiscard]] const TypeClass* GetTypeClass() const noexcept override { return StaticTypeClass(); }
+    [[nodiscard]] bool IsInteractiveControl() const noexcept override { return true; }
+    bool OnPointerDown(Point localPoint, PointerButton button, std::uint8_t modifiers, bool& outRequestCapture) override;
+    bool OnPointerMove(Point localPoint, std::uint8_t modifiers) override;
+    bool OnPointerUp(Point localPoint, PointerButton button, std::uint8_t modifiers, bool insideBounds) override;
+    Size MeasureCore(Size availableSize) noexcept override;
+
+private:
+    bool dragging_ = false;
+    Point dragStartScreen_{0.0f, 0.0f};
+};
+
+class TreeView;
+
+class TreeViewItem : public ItemsControl {
+public:
+    TreeViewItem();
+    ~TreeViewItem() override = default;
+    static const TypeClass* StaticTypeClass() noexcept;
+    [[nodiscard]] const TypeClass* GetTypeClass() const noexcept override { return StaticTypeClass(); }
+    [[nodiscard]] bool IsInteractiveControl() const noexcept override { return true; }
+
+    void SetHeader(std::string_view header);
+    [[nodiscard]] std::string GetHeader() const;
+
+    void SetIsExpanded(bool expanded);
+    [[nodiscard]] bool IsExpanded() const noexcept;
+
+    void SetIsSelected(bool selected);
+    [[nodiscard]] bool IsSelected() const noexcept;
+
+    [[nodiscard]] TreeView* FindAncestorTreeView() noexcept;
+    void SyncHasItemsFlag() noexcept;
+
+    void OnPropertyChanged(std::uint16_t propId, const UnifiedValue& newValue) override;
+    bool OnPointerDown(Point localPoint, PointerButton button, std::uint8_t modifiers, bool& outRequestCapture) override;
+    Size MeasureCore(Size availableSize) noexcept override;
+    void ArrangeCore(Rect finalRect) noexcept override;
+};
+
+class TreeView : public ItemsControl {
+public:
+    using SelectedItemChangedCallback = std::function<void(TreeView&, TreeViewItem*)>;
+
+    TreeView();
+    ~TreeView() override = default;
+    static const TypeClass* StaticTypeClass() noexcept;
+    [[nodiscard]] const TypeClass* GetTypeClass() const noexcept override { return StaticTypeClass(); }
+
+    void SelectContainer(TreeViewItem* item);
+    [[nodiscard]] TreeViewItem* SelectedContainer() const noexcept { return selectedContainer_; }
+    [[nodiscard]] std::string GetSelectedHeader() const;
+    void SetSelectedItemChangedCallback(SelectedItemChangedCallback cb) { selectedItemChangedCallback_ = std::move(cb); }
+
+private:
+    TreeViewItem* selectedContainer_ = nullptr;
+    SelectedItemChangedCallback selectedItemChangedCallback_;
+    bool selecting_ = false;
+};
+
 // Factory and self-contained .axb4 instruction VM mounting
 [[nodiscard]] IntrusivePtr<UIElement> CreateElementByTypeName(std::string_view typeName);
 
 bool MountAxbTemplate(
     UIElement* rootControl,
     const AxbPackage& package,
+    ExecutionDomainContext* domains = nullptr,
+    DualTrackBindingEngine* bindingEngine = nullptr,
+    ObjectRef dataContext = {},
+    const Interpreter* eventInterpreter = nullptr,
+    rs_aot::ExecutionContext* eventAotContext = nullptr,
+    AnimationEngine* animationEngine = nullptr);
+
+bool PreMountAxbTemplateStructure(
+    UIElement* rootControl,
+    const AxbPackage& package,
+    ExecutionDomainContext* domains,
+    DualTrackBindingEngine* bindingEngine,
+    ObjectRef wrapperContext,
+    std::vector<IntrusivePtr<UIElement>>& outMountedElements,
+    const Interpreter* eventInterpreter = nullptr,
+    rs_aot::ExecutionContext* eventAotContext = nullptr,
+    AnimationEngine* animationEngine = nullptr);
+
+bool RebindMountedAxbTemplate(
+    UIElement* rootControl,
+    const AxbPackage& package,
+    std::vector<IntrusivePtr<UIElement>>& mountedElements,
     ExecutionDomainContext* domains = nullptr,
     DualTrackBindingEngine* bindingEngine = nullptr,
     ObjectRef dataContext = {},

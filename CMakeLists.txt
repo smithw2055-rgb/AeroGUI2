@@ -88,6 +88,7 @@ add_library(AeroGUI::Runtime ALIAS aerogui_runtime)
 if(AERO_BUILD_COMPILER_TOOLS)
     add_library(aerogui_compiler_lib STATIC
         src/compiler/AeroCompiler.cpp
+        src/compiler/XamlApplication.cpp
     )
 
     if(MSVC)
@@ -196,6 +197,7 @@ if(AERO_BUILD_COMPILER_TOOLS)
 
         # End-to-end 11-sample MainWindow + ViewModel verification suite
         aero_register_core_test(samples_mainwindow_tests tests/samples_mainwindow_tests.cpp)
+        aero_register_core_test(wpf_controls_and_script_tests tests/wpf_controls_and_script_tests.cpp)
     endif()
 else()
     # In Wasm / REALSCRIPT_SLIM_RUNTIME mode, aerocore & aerogui_core alias the pure runtime

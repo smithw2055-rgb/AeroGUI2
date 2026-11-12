@@ -319,6 +319,7 @@ enum class InteractionActionKind : std::uint8_t {
     ControlStoryboard = 1,
     InvokeCommand = 2,
     PlaySound = 3,
+    RemoveElement = 4,
 };
 
 struct AxbInteractionAction {
@@ -351,6 +352,8 @@ struct AxbInteractionAction {
     // PlaySoundAction
     std::string soundSource;
     float volume = 1.0f;
+    // RemoveElementAction TargetObject binding
+    std::shared_ptr<AxbCompiledBindingChain> targetObjectBinding{};
 };
 
 struct AxbTriggerCondition {
@@ -394,6 +397,7 @@ enum class RoutedTriggerEvent : std::uint8_t {
     ValueChanged = 7,
     StoryboardCompleted = 8,
     PropertyChanged = 9,
+    Indeterminate = 10,
 };
 
 struct AxbEventTrigger {
@@ -491,6 +495,8 @@ struct AxbMtsdfPathEntry {
 struct AxbDataTemplate {
     std::string key;
     std::string dataTypeName;
+    std::string itemsSourcePath;
+    std::string childItemTemplateKey;
     std::shared_ptr<AxbPackage> templatePackage;
 };
 
@@ -670,6 +676,7 @@ struct AxbPackage {
     std::string hostWrapperClassName;
     std::string rootTypeName;
     std::string rootDataTypeName;
+    std::string startupUri;
     SymbolId fieldsOwnerTypeId = 0;
     std::uint32_t rootHandleFieldIndex = PropertySlotHandle::InvalidIndex;
     std::vector<std::string> stringTable;
@@ -725,6 +732,7 @@ struct AxbPackage {
     }
 
     [[nodiscard]] bool HasP14Section() const noexcept;
+    [[nodiscard]] bool HasP15Section() const noexcept;
 
     void PinValuesInPools() const noexcept;
     void MarkValuesInPools() const noexcept;

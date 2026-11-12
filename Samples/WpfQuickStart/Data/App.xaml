@@ -1,0 +1,11 @@
+<Application xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             StartupUri="MainWindow.xaml">
+  <Application.Resources>
+    <SolidColorBrush x:Key="AppSurfaceBrush" Color="#141824"/>
+    <SolidColorBrush x:Key="CardSurfaceBrush" Color="#1D2334"/>
+    <SolidColorBrush x:Key="AccentBrush" Color="#3B82F6"/>
+    <SolidColorBrush x:Key="PrimaryTextBrush" Color="#E8EEF8"/>
+    <SolidColorBrush x:Key="MutedTextBrush" Color="#94A3B8"/>
+  </Application.Resources>
+</Application>

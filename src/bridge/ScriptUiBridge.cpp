@@ -40,9 +40,22 @@ struct PendingScriptUiState {
         std::uint32_t ownerGen = 0;
         ObjectRef dataContext{};
     };
+    struct PendingMountTarget {
+        IntrusivePtr<UIElement> rootControl{};
+        const AxbPackage* package = nullptr;
+    };
+    struct PreMountedWindowEntry {
+        const ExecutionDomainContext* domains = nullptr;
+        std::uint32_t ownerSlot = 0;
+        std::uint32_t ownerGen = 0;
+        IntrusivePtr<UIElement> rootControl{};
+        std::vector<IntrusivePtr<UIElement>> mountedElements{};
+    };
     std::mutex mutex;
     std::vector<DcEntry> dcEntries;
     std::unordered_map<const ExecutionDomainContext*, std::vector<std::string>> pendingDictionaries;
+    std::unordered_map<const ExecutionDomainContext*, PendingMountTarget> pendingMountTargets;
+    std::vector<PreMountedWindowEntry> preMountedWindows;
 
     PendingScriptUiState() {
         rs_rt::registerExternalValuePoolRootMarker(this, [this]() {
@@ -91,6 +104,92 @@ struct PendingScriptUiState {
         return ObjectRef{};
     }
 
+    void SetPendingMountTarget(
+        const ExecutionDomainContext* dom,
+        UIElement* rootControl,
+        const AxbPackage* package) {
+        if (!dom) return;
+        std::lock_guard<std::mutex> lock(mutex);
+        if (!rootControl && !package) {
+            pendingMountTargets.erase(dom);
+            return;
+        }
+        pendingMountTargets[dom] = PendingMountTarget{
+            IntrusivePtr<UIElement>(rootControl, true),
+            package};
+    }
+
+    [[nodiscard]] PendingMountTarget FindPendingMountTarget(const ExecutionDomainContext* dom) noexcept {
+        if (!dom) return {};
+        std::lock_guard<std::mutex> lock(mutex);
+        const auto it = pendingMountTargets.find(dom);
+        return (it != pendingMountTargets.end()) ? it->second : PendingMountTarget{};
+    }
+
+    [[nodiscard]] bool HasPreMountedWindow(const ExecutionDomainContext* dom, ObjectRef owner) noexcept {
+        if (!dom || !owner.valid()) return false;
+        std::lock_guard<std::mutex> lock(mutex);
+        for (const auto& e : preMountedWindows) {
+            if (e.domains == dom && e.ownerSlot == owner.slot && e.ownerGen == owner.generation) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    void RecordPreMountedWindow(
+        const ExecutionDomainContext* dom,
+        ObjectRef owner,
+        IntrusivePtr<UIElement> rootControl,
+        std::vector<IntrusivePtr<UIElement>> mountedElements) {
+        if (!dom || !owner.valid() || !rootControl) return;
+        std::lock_guard<std::mutex> lock(mutex);
+        for (auto& e : preMountedWindows) {
+            if (e.domains == dom && e.ownerSlot == owner.slot && e.ownerGen == owner.generation) {
+                e.rootControl = std::move(rootControl);
+                e.mountedElements = std::move(mountedElements);
+                return;
+            }
+        }
+        preMountedWindows.push_back(PreMountedWindowEntry{
+            dom,
+            owner.slot,
+            owner.generation,
+            std::move(rootControl),
+            std::move(mountedElements)});
+    }
+
+    [[nodiscard]] IntrusivePtr<UIElement> PeekPreMountedRoot(
+        const ExecutionDomainContext* dom,
+        ObjectRef owner) noexcept {
+        if (!dom || !owner.valid()) return {};
+        std::lock_guard<std::mutex> lock(mutex);
+        for (auto it = preMountedWindows.rbegin(); it != preMountedWindows.rend(); ++it) {
+            if (it->domains == dom && it->ownerSlot == owner.slot && it->ownerGen == owner.generation) {
+                return it->rootControl;
+            }
+        }
+        return {};
+    }
+
+    [[nodiscard]] bool ConsumePreMountedWindow(
+        const ExecutionDomainContext* dom,
+        ObjectRef owner,
+        IntrusivePtr<UIElement>& outRootControl,
+        std::vector<IntrusivePtr<UIElement>>& outMountedElements) {
+        if (!dom || !owner.valid()) return false;
+        std::lock_guard<std::mutex> lock(mutex);
+        for (auto it = preMountedWindows.begin(); it != preMountedWindows.end(); ++it) {
+            if (it->domains == dom && it->ownerSlot == owner.slot && it->ownerGen == owner.generation) {
+                outRootControl = std::move(it->rootControl);
+                outMountedElements = std::move(it->mountedElements);
+                preMountedWindows.erase(it);
+                return true;
+            }
+        }
+        return false;
+    }
+
     void RecordDictionary(const ExecutionDomainContext* dom, const std::string& uri) {
         if (!dom || uri.empty()) return;
         std::lock_guard<std::mutex> lock(mutex);
@@ -120,6 +219,13 @@ struct PendingScriptUiState {
                 dcEntries.end(),
                 [dom](const DcEntry& e) noexcept { return e.domains == dom; }),
             dcEntries.end());
+        preMountedWindows.erase(
+            std::remove_if(
+                preMountedWindows.begin(),
+                preMountedWindows.end(),
+                [dom](const PreMountedWindowEntry& e) noexcept { return e.domains == dom; }),
+            preMountedWindows.end());
+        pendingMountTargets.erase(dom);
         pendingDictionaries.erase(dom);
     }
 };
@@ -337,6 +443,17 @@ void AttachStyleEngineAcrossSubtree(UIElement* subtreeRoot, StyleTriggerEngine* 
 
 } // namespace
 
+void SetPendingMainWindowMountTarget(
+    const ExecutionDomainContext* domains,
+    UIElement* rootControl,
+    const AxbPackage* package) {
+    PendingScriptUiState::Instance().SetPendingMountTarget(domains, rootControl, package);
+}
+
+void ClearPendingMainWindowMountTarget(const ExecutionDomainContext* domains) noexcept {
+    PendingScriptUiState::Instance().SetPendingMountTarget(domains, nullptr, nullptr);
+}
+
 bool MountAndWireMainWindow(
     UIElement* rootControl,
     const AxbPackage& package,
@@ -431,16 +548,89 @@ bool MountAndWireMainWindow(
     styleEngine.ImportRegistryStyles();
     styleEngine.RegisterPackageStyles(*effPkg);
 
-    if (!MountAxbTemplate(
-            rootControl,
-            *effPkg,
+    IntrusivePtr<UIElement> preMountedRoot{};
+    std::vector<IntrusivePtr<UIElement>> preMountedElements{};
+    if (mainWinRef.valid() &&
+        PendingScriptUiState::Instance().ConsumePreMountedWindow(
             &domains,
-            &bindingEngine,
-            vmRef,
-            effInterp,
-            aotContext,
-            effAnim)) {
-        return false;
+            mainWinRef,
+            preMountedRoot,
+            preMountedElements)) {
+        if (preMountedRoot && preMountedRoot.Get() != rootControl) {
+            constexpr std::uint16_t kTransferProps[] = {
+                PropId_Title,
+                PropId_Width,
+                PropId_Height,
+                PropId_MinWidth,
+                PropId_MinHeight,
+                PropId_MaxWidth,
+                PropId_MaxHeight,
+                PropId_Background,
+                PropId_Foreground,
+                PropId_Padding,
+                PropId_Margin,
+                PropId_BorderBrush,
+                PropId_BorderThickness,
+                PropId_CornerRadius,
+                PropId_Opacity,
+                PropId_Visibility,
+                PropId_FontSize,
+                PropId_Tag,
+                PropId_ToolTipText,
+            };
+            for (const std::uint16_t pid : kTransferProps) {
+                const UnifiedValue v = preMountedRoot->GetValue(pid);
+                if (!std::holds_alternative<std::monostate>(v)) {
+                    (void)rootControl->SetValue(pid, v, ValueSourceRank::Local);
+                }
+            }
+            if (auto* srcGrid = preMountedRoot->DynamicCast<Grid>()) {
+                if (auto* dstGrid = rootControl->DynamicCast<Grid>()) {
+                    if (dstGrid->Rows().empty()) {
+                        for (const auto& r : srcGrid->Rows()) {
+                            dstGrid->AddRowDefinition(r.unit, r.value);
+                        }
+                    }
+                    if (dstGrid->Columns().empty()) {
+                        for (const auto& c : srcGrid->Columns()) {
+                            dstGrid->AddColumnDefinition(c.unit, c.value);
+                        }
+                    }
+                }
+            }
+            while (UIElement* ch = preMountedRoot->FirstChild()) {
+                IntrusivePtr<UIElement> keepAlive(ch, true);
+                preMountedRoot->RemoveChild(ch, &domains.nativeHandles(), &domains.uiHeap());
+                rootControl->AddChild(keepAlive.Get(), &domains.nativeHandles(), &domains.uiHeap());
+            }
+            if (!preMountedElements.empty()) {
+                preMountedElements[0] = IntrusivePtr<UIElement>(rootControl, true);
+            }
+        }
+        if (!RebindMountedAxbTemplate(
+                rootControl,
+                *effPkg,
+                preMountedElements,
+                &domains,
+                &bindingEngine,
+                vmRef,
+                effInterp,
+                aotContext,
+                effAnim)) {
+            return false;
+        }
+    } else {
+        if (!MountAxbTemplate(
+                rootControl,
+                *effPkg,
+                &domains,
+                &bindingEngine,
+                vmRef,
+                effInterp,
+                aotContext,
+                effAnim)) {
+            return false;
+        }
     }
 
     (void)styleEngine.BindSubtreeStyles(rootControl, true);
@@ -491,7 +681,11 @@ IntrusivePtr<UIElement> MountAndWireMainWindow(
     rs_aot::ExecutionContext* aotContext,
     AnimationEngine* animationEngine,
     ObjectRef* outViewModelRef) {
-    IntrusivePtr<UIElement> root = CreateElementByTypeName(package.rootTypeName);
+    IntrusivePtr<UIElement> root =
+        PendingScriptUiState::Instance().PeekPreMountedRoot(&domains, mainWinRef);
+    if (!root) {
+        root = CreateElementByTypeName(package.rootTypeName);
+    }
     if (!root) {
         root = MakeIntrusive<UserControl>();
     }
@@ -996,7 +1190,7 @@ void ScriptUiBridge::RegisterCoreUiBindings(BindingRegistry& bindings) {
     // GUI_LoadComponent<T>(T component, string uri) -> bool (WPF / C++ InitializeComponent equivalent)
     bindSdkFn(
         "GUI_LoadComponent",
-        [domPtr](
+        [handlesPtr, domPtr, engineSlot](
             const rs_bc::FunctionReference&,
             ValueSpan args,
             RuntimeError&)
@@ -1005,24 +1199,138 @@ void ScriptUiBridge::RegisterCoreUiBindings(BindingRegistry& bindings) {
                 return UnifiedValue{false};
             }
             const std::string uri = FormatBindingString({}, &args[1], 1u, domPtr);
-            if (uri.empty()) {
-                return UnifiedValue{false};
-            }
             std::shared_ptr<UiResourceContext> domainCtx =
                 !UiResourceContext::HasActiveThreadOverride()
                     ? UiResourceContext::FindForDomains(domPtr)
                     : nullptr;
             ScopedUiResourceContext ctxGuard(std::move(domainCtx));
-            if (AxbTemplateRegistry::Instance().Find(uri) != nullptr) {
+
+            DualTrackBindingEngine* liveEng = (engineSlot && *engineSlot) ? *engineSlot : nullptr;
+            const ProgramImage* prog = liveEng ? liveEng->Program() : nullptr;
+
+            std::string strippedUri = uri;
+            if (const auto slash = strippedUri.find_last_of("/\\"); slash != std::string::npos) {
+                strippedUri = strippedUri.substr(slash + 1u);
+            }
+            if (strippedUri.size() > 5u &&
+                EqualsAsciiIgnoreCase(strippedUri.substr(strippedUri.size() - 5u), ".xaml")) {
+                strippedUri.resize(strippedUri.size() - 5u);
+            }
+
+            if (const auto* ownerRef = std::get_if<ObjectRef>(&args[0]); ownerRef && ownerRef->valid()) {
+                if (PendingScriptUiState::Instance().HasPreMountedWindow(domPtr, *ownerRef)) {
+                    return UnifiedValue{true};
+                }
+
+                std::string ownerShortTypeName;
+                std::string ownerFullTypeName;
+                std::uint32_t rootHandleFieldIdx = PropertySlotHandle::InvalidIndex;
+                if (prog) {
+                    if (auto* ownerHeap = domPtr->heapForObject(*ownerRef); ownerHeap && ownerHeap->isAlive(*ownerRef)) {
+                        const SymbolId ownerTid = ownerHeap->objectTypeId(*ownerRef).value_or(0);
+                        if (const auto* ts = (ownerTid != 0) ? prog->resolveType(ownerTid) : nullptr) {
+                            ownerShortTypeName = ts->name;
+                            ownerFullTypeName = ts->moduleName.empty() ? ts->name : (ts->moduleName + "." + ts->name);
+                            for (std::size_t fIdx = 0; fIdx < ts->fields.size(); ++fIdx) {
+                                if (ts->fields[fIdx].name == "__nativeRootHandle" &&
+                                    ts->fields[fIdx].type == rs_sem::PrimitiveType::Handle) {
+                                    rootHandleFieldIdx = static_cast<std::uint32_t>(fIdx);
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                const auto pendingTarget = PendingScriptUiState::Instance().FindPendingMountTarget(domPtr);
+                const AxbPackage* pkg = pendingTarget.package;
+                if (!pkg && !uri.empty()) {
+                    pkg = AxbTemplateRegistry::Instance().Find(uri);
+                }
+                if (!pkg && !strippedUri.empty()) {
+                    pkg = AxbTemplateRegistry::Instance().Find(strippedUri);
+                }
+                if (!pkg && !ownerFullTypeName.empty()) {
+                    pkg = AxbTemplateRegistry::Instance().Find(ownerFullTypeName);
+                }
+                if (!pkg && !ownerShortTypeName.empty()) {
+                    pkg = AxbTemplateRegistry::Instance().Find(ownerShortTypeName);
+                }
+                if (!pkg && !uri.empty()) {
+                    if (const auto compileFn = GetRuntimeXamlCompileHook()) {
+                        AxbPackage compiledPkg{};
+                        const auto searchDirs = UiResourceContext::Current().XamlSearchDirectoriesSnapshot();
+                        if (compileFn(uri, searchDirs, compiledPkg)) {
+                            AxbTemplateRegistry::Instance().Register(
+                                !compiledPkg.className.empty() ? compiledPkg.className : uri,
+                                compiledPkg);
+                            AxbTemplateRegistry::Instance().RegisterResources(compiledPkg);
+                            pkg = AxbTemplateRegistry::Instance().Find(
+                                !compiledPkg.className.empty() ? compiledPkg.className : uri);
+                        }
+                    }
+                }
+
+                if (pkg) {
+                    if (rootHandleFieldIdx != PropertySlotHandle::InvalidIndex && handlesPtr) {
+                        UnifiedValue rootHandleVal{};
+                        if (domPtr->readObjectField(DomainKind::Ui, *ownerRef, rootHandleFieldIdx, rootHandleVal)) {
+                            if (const auto* nh = std::get_if<NativeHandle>(&rootHandleVal); nh && nh->valid()) {
+                                if (UIElement::FromNativeHandle(*handlesPtr, *nh) != nullptr) {
+                                    return UnifiedValue{true};
+                                }
+                            }
+                        }
+                    }
+                    IntrusivePtr<UIElement> targetRoot = pendingTarget.rootControl;
+                    if (!targetRoot) {
+                        const std::string_view rootType = pkg->rootTypeName.empty()
+                            ? std::string_view("Grid")
+                            : std::string_view(pkg->rootTypeName);
+                        targetRoot = CreateElementByTypeName(rootType);
+                    }
+                    if (targetRoot) {
+                        targetRoot->SetAsRootVisual(true, &domPtr->nativeHandles(), &domPtr->uiHeap());
+                        (void)targetRoot->BindScriptWrapper(domPtr->nativeHandles(), domPtr->uiHeap(), *ownerRef);
+                        AxbPackage boundPkg = *pkg;
+                        if (prog) {
+                            (void)boundPkg.BindAgainstProgram(*prog, "", domPtr);
+                            boundPkg.PinValuesInPools();
+                        }
+                        std::vector<IntrusivePtr<UIElement>> mountedElements;
+                        if (PreMountAxbTemplateStructure(
+                                targetRoot.Get(),
+                                boundPkg,
+                                domPtr,
+                                liveEng,
+                                *ownerRef,
+                                mountedElements,
+                                liveEng ? liveEng->UiInterpreter() : nullptr,
+                                nullptr,
+                                liveEng ? liveEng->GetAnimationEngine() : nullptr)) {
+                            PendingScriptUiState::Instance().RecordPreMountedWindow(
+                                domPtr,
+                                *ownerRef,
+                                targetRoot,
+                                std::move(mountedElements));
+                            return UnifiedValue{true};
+                        }
+                    }
+                }
+            }
+
+            if (!uri.empty() && AxbTemplateRegistry::Instance().Find(uri) != nullptr) {
                 return UnifiedValue{true};
             }
-            if (const auto compileFn = GetRuntimeXamlCompileHook()) {
-                AxbPackage compiledPkg{};
-                const auto searchDirs = UiResourceContext::Current().XamlSearchDirectoriesSnapshot();
-                if (compileFn(uri, searchDirs, compiledPkg)) {
-                    AxbTemplateRegistry::Instance().Register(uri, compiledPkg);
-                    AxbTemplateRegistry::Instance().RegisterResources(compiledPkg);
-                    return UnifiedValue{true};
+            if (!uri.empty()) {
+                if (const auto compileFn = GetRuntimeXamlCompileHook()) {
+                    AxbPackage compiledPkg{};
+                    const auto searchDirs = UiResourceContext::Current().XamlSearchDirectoriesSnapshot();
+                    if (compileFn(uri, searchDirs, compiledPkg)) {
+                        AxbTemplateRegistry::Instance().Register(uri, compiledPkg);
+                        AxbTemplateRegistry::Instance().RegisterResources(compiledPkg);
+                        return UnifiedValue{true};
+                    }
                 }
             }
             return UnifiedValue{true};
@@ -1626,6 +1934,292 @@ void ScriptUiBridge::RegisterCoreUiBindings(BindingRegistry& bindings) {
             }
             const std::size_t stopped = animEng->StopStoryboard(scopeRoot, *sb, true);
             return UnifiedValue{stopped > 0u};
+        });
+
+    // UIElement_GetString(handle elem, string propName) -> string
+    bindSdkFn(
+        "UIElement_GetString",
+        [handlesPtr, uiHeapPtr, domPtr](
+            const rs_bc::FunctionReference&,
+            ValueSpan args,
+            RuntimeError& error)
+            -> std::optional<UnifiedValue> {
+            if (!uiHeapPtr) {
+                error.code = ErrorCode::InvalidObjectReference;
+                error.message = "UiHeap unavailable for UIElement_GetString";
+                return std::nullopt;
+            }
+            if (args.size() < 2 || !handlesPtr) {
+                return uiHeapPtr->allocateString("", &error);
+            }
+            NativeHandle handle{};
+            if (!args[0].tryGetNativeHandle(handle) || !handle.valid()) {
+                return uiHeapPtr->allocateString("", &error);
+            }
+            auto* elem = UIElement::FromNativeHandle(*handlesPtr, handle);
+            if (!elem) {
+                return uiHeapPtr->allocateString("", &error);
+            }
+            const std::string propName = FormatBindingString({}, &args[1], 1u, domPtr);
+            const std::uint16_t propId = ResolveSdkPropertyIdByName(propName);
+            std::string outStr;
+            if (propId != 0xFFFFu) {
+                const UnifiedValue v = elem->GetValue(propId);
+                if (const auto* sv = std::get_if<StringValue>(&v)) {
+                    outStr = sv->str();
+                } else if (propId == PropId_Content || propId == PropId_Text) {
+                    if (const auto* btn = elem->DynamicCast<Button>()) {
+                        outStr = btn->GetContentText();
+                    } else if (const auto* tb = elem->DynamicCast<TextBlock>()) {
+                        outStr = tb->GetText();
+                    }
+                }
+            }
+            return uiHeapPtr->allocateString(outStr, &error);
+        });
+
+    // UIElement_SetString(handle elem, string propName, string val) -> bool
+    bindSdkFn(
+        "UIElement_SetString",
+        [handlesPtr, domPtr, engineSlot](
+            const rs_bc::FunctionReference&,
+            ValueSpan args,
+            RuntimeError& error)
+            -> std::optional<UnifiedValue> {
+            if (args.size() < 3 || !handlesPtr) {
+                return UnifiedValue{false};
+            }
+            NativeHandle handle{};
+            if (!args[0].tryGetNativeHandle(handle) || !handle.valid()) {
+                return UnifiedValue{false};
+            }
+            auto* elem = UIElement::FromNativeHandle(*handlesPtr, handle);
+            if (!elem) {
+                return UnifiedValue{false};
+            }
+            const std::string propName = FormatBindingString({}, &args[1], 1u, domPtr);
+            const std::uint16_t propId = ResolveSdkPropertyIdByName(propName);
+            if (propId == 0xFFFFu) {
+                return UnifiedValue{false};
+            }
+            const std::string valStr = FormatBindingString({}, &args[2], 1u, domPtr);
+            const bool ok = elem->SetValue(propId, value::FromString(valStr), ValueSourceRank::Local);
+            if (ok) {
+                DualTrackBindingEngine* bindEng = elem->BoundTwoWayEngine()
+                    ? elem->BoundTwoWayEngine()
+                    : (engineSlot ? *engineSlot : nullptr);
+                if (elem->BoundTwoWayEngine() != nullptr) {
+                    (void)elem->NotifyTwoWayPropertyMutated(propId, &error);
+                }
+                if (bindEng != nullptr) {
+                    (void)bindEng->FlushTrackA();
+                }
+            }
+            return UnifiedValue{ok};
+        });
+
+    // UIElement_GetBool(handle elem, string propName) -> bool
+    bindSdkFn(
+        "UIElement_GetBool",
+        [handlesPtr, domPtr](
+            const rs_bc::FunctionReference&,
+            ValueSpan args,
+            RuntimeError&)
+            -> std::optional<UnifiedValue> {
+            if (args.size() < 2 || !handlesPtr) {
+                return UnifiedValue{false};
+            }
+            NativeHandle handle{};
+            if (!args[0].tryGetNativeHandle(handle) || !handle.valid()) {
+                return UnifiedValue{false};
+            }
+            auto* elem = UIElement::FromNativeHandle(*handlesPtr, handle);
+            if (!elem) {
+                return UnifiedValue{false};
+            }
+            const std::string propName = FormatBindingString({}, &args[1], 1u, domPtr);
+            const std::uint16_t propId = ResolveSdkPropertyIdByName(propName);
+            if (propId == 0xFFFFu) {
+                return UnifiedValue{false};
+            }
+            const UnifiedValue raw = elem->GetValue(propId);
+            if (const auto* b = std::get_if<bool>(&raw)) {
+                return UnifiedValue{*b};
+            }
+            std::int64_t iv = 0;
+            if (raw.tryGetInt64(iv)) {
+                return UnifiedValue{iv != 0};
+            }
+            return UnifiedValue{false};
+        });
+
+    // UIElement_SetBool(handle elem, string propName, bool val) -> bool
+    bindSdkFn(
+        "UIElement_SetBool",
+        [handlesPtr, domPtr, engineSlot](
+            const rs_bc::FunctionReference&,
+            ValueSpan args,
+            RuntimeError& error)
+            -> std::optional<UnifiedValue> {
+            if (args.size() < 3 || !handlesPtr) {
+                return UnifiedValue{false};
+            }
+            NativeHandle handle{};
+            if (!args[0].tryGetNativeHandle(handle) || !handle.valid()) {
+                return UnifiedValue{false};
+            }
+            auto* elem = UIElement::FromNativeHandle(*handlesPtr, handle);
+            if (!elem) {
+                return UnifiedValue{false};
+            }
+            const std::string propName = FormatBindingString({}, &args[1], 1u, domPtr);
+            const std::uint16_t propId = ResolveSdkPropertyIdByName(propName);
+            if (propId == 0xFFFFu) {
+                return UnifiedValue{false};
+            }
+            bool bv = false;
+            if (const auto* bp = std::get_if<bool>(&args[2])) {
+                bv = *bp;
+            } else {
+                std::int64_t iv = 0;
+                if (args[2].tryGetInt64(iv)) bv = (iv != 0);
+            }
+            const bool ok = elem->SetValue(propId, UnifiedValue{bv}, ValueSourceRank::Local);
+            if (ok) {
+                DualTrackBindingEngine* bindEng = elem->BoundTwoWayEngine()
+                    ? elem->BoundTwoWayEngine()
+                    : (engineSlot ? *engineSlot : nullptr);
+                if (elem->BoundTwoWayEngine() != nullptr) {
+                    (void)elem->NotifyTwoWayPropertyMutated(propId, &error);
+                }
+                if (bindEng != nullptr) {
+                    (void)bindEng->FlushTrackA();
+                }
+            }
+            return UnifiedValue{ok};
+        });
+
+    // UIElement_GetFloat(handle elem, string propName) -> float
+    bindSdkFn(
+        "UIElement_GetFloat",
+        [handlesPtr, domPtr](
+            const rs_bc::FunctionReference&,
+            ValueSpan args,
+            RuntimeError&)
+            -> std::optional<UnifiedValue> {
+            if (args.size() < 2 || !handlesPtr) {
+                return MakeFloat(0.0f);
+            }
+            NativeHandle handle{};
+            if (!args[0].tryGetNativeHandle(handle) || !handle.valid()) {
+                return MakeFloat(0.0f);
+            }
+            auto* elem = UIElement::FromNativeHandle(*handlesPtr, handle);
+            if (!elem) {
+                return MakeFloat(0.0f);
+            }
+            const std::string propName = FormatBindingString({}, &args[1], 1u, domPtr);
+            const std::uint16_t propId = ResolveSdkPropertyIdByName(propName);
+            if (propId == 0xFFFFu) {
+                return MakeFloat(0.0f);
+            }
+            float f = 0.0f;
+            (void)TryGetFloat(elem->GetValue(propId), f);
+            return MakeFloat(f);
+        });
+
+    // UIElement_SetFloat(handle elem, string propName, float val) -> bool
+    bindSdkFn(
+        "UIElement_SetFloat",
+        [handlesPtr, domPtr, engineSlot](
+            const rs_bc::FunctionReference&,
+            ValueSpan args,
+            RuntimeError& error)
+            -> std::optional<UnifiedValue> {
+            if (args.size() < 3 || !handlesPtr) {
+                return UnifiedValue{false};
+            }
+            NativeHandle handle{};
+            if (!args[0].tryGetNativeHandle(handle) || !handle.valid()) {
+                return UnifiedValue{false};
+            }
+            auto* elem = UIElement::FromNativeHandle(*handlesPtr, handle);
+            if (!elem) {
+                return UnifiedValue{false};
+            }
+            const std::string propName = FormatBindingString({}, &args[1], 1u, domPtr);
+            const std::uint16_t propId = ResolveSdkPropertyIdByName(propName);
+            if (propId == 0xFFFFu) {
+                return UnifiedValue{false};
+            }
+            float f = 0.0f;
+            if (!TryGetFloat(args[2], f)) {
+                return UnifiedValue{false};
+            }
+            const bool ok = elem->SetValue(propId, MakeFloat(f), ValueSourceRank::Local);
+            if (ok) {
+                DualTrackBindingEngine* bindEng = elem->BoundTwoWayEngine()
+                    ? elem->BoundTwoWayEngine()
+                    : (engineSlot ? *engineSlot : nullptr);
+                if (elem->BoundTwoWayEngine() != nullptr) {
+                    (void)elem->NotifyTwoWayPropertyMutated(propId, &error);
+                }
+                if (bindEng != nullptr) {
+                    (void)bindEng->FlushTrackA();
+                }
+            }
+            return UnifiedValue{ok};
+        });
+
+    // TreeView_GetSelectedHeader(handle elem) -> string
+    bindSdkFn(
+        "TreeView_GetSelectedHeader",
+        [handlesPtr, uiHeapPtr](
+            const rs_bc::FunctionReference&,
+            ValueSpan args,
+            RuntimeError& error)
+            -> std::optional<UnifiedValue> {
+            if (!uiHeapPtr) {
+                error.code = ErrorCode::InvalidObjectReference;
+                error.message = "UiHeap unavailable";
+                return std::nullopt;
+            }
+            if (args.empty() || !handlesPtr) {
+                return uiHeapPtr->allocateString("", &error);
+            }
+            NativeHandle handle{};
+            if (!args[0].tryGetNativeHandle(handle) || !handle.valid()) {
+                return uiHeapPtr->allocateString("", &error);
+            }
+            auto* elem = UIElement::FromNativeHandle(*handlesPtr, handle);
+            std::string hdr;
+            if (const auto* tv = elem ? elem->DynamicCast<TreeView>() : nullptr) {
+                hdr = tv->GetSelectedHeader();
+            }
+            return uiHeapPtr->allocateString(hdr, &error);
+        });
+
+    // Window_Close(handle elem) -> bool
+    bindSdkFn(
+        "Window_Close",
+        [handlesPtr](
+            const rs_bc::FunctionReference&,
+            ValueSpan args,
+            RuntimeError&)
+            -> std::optional<UnifiedValue> {
+            if (args.empty() || !handlesPtr) {
+                return UnifiedValue{false};
+            }
+            NativeHandle handle{};
+            if (!args[0].tryGetNativeHandle(handle) || !handle.valid()) {
+                return UnifiedValue{false};
+            }
+            auto* elem = UIElement::FromNativeHandle(*handlesPtr, handle);
+            if (!elem) {
+                return UnifiedValue{false};
+            }
+            elem->SetVisibility(Visibility::Collapsed);
+            return UnifiedValue{true};
         });
 }
 

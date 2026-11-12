@@ -64,6 +64,7 @@ constexpr SamplePreset kPresets[] = {
     {"UserControl",      "UserControl/Data/MainPage.xaml",        "UserControl/Data/Resources.xaml",      1.0f, "Composable NumericUpDown UserControl"},
     {"DataBinding",      "DataBinding/Data/MainPage.xaml",        "DataBinding/Data/Resources.xaml",      1.0f, "Solar system master-detail data binding"},
     {"Menu3D",           "Menu3D/Data/MainPage.xaml",             "Menu3D/Data/Resources.xaml",           1.0f, "3D perspective game menu & sub-menus"},
+    {"WpfQuickStart",    "WpfQuickStart/Data/MainWindow.xaml",    "WpfQuickStart/Data/App.xaml",               0.2f, "WPF C#-style MVVM + typed x:Name + TreeView/Menu/StatusBar"},
 };
 
 std::string ToLowerAscii(std::string_view sv) {
@@ -223,7 +224,7 @@ bool ResolveTarget(
             return true;
         }
         if (fs::is_directory(underSamples, ec)) {
-            for (const char* mainCandidate : {"Data/MainPage.xaml", "Data/MainWindow.xaml"}) {
+            for (const char* mainCandidate : {"MainWindow.xaml", "Data/MainPage.xaml", "Data/MainWindow.xaml"}) {
                 if (fs::is_regular_file(underSamples / mainCandidate, ec)) {
                     outTarget.filePath = underSamples / mainCandidate;
                     outTarget.displayName = underSamples.filename().string();
