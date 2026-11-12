@@ -1,0 +1,8 @@
+<Class Name="ScoreboardViewModel">
+  <Property Name="Players" Type="Collection" SubType="Scoreboard.Player" CollectionMinItemCount="15" CollectionMaxItemCount="20"/>
+  <Property Name="Name" Type="String" StringMinWordCount="2" StringMaxWordCount="2"/>
+  <Property Name="ElapsedTime" Type="Number" NumberMinValue="0" NumberMaxValue="99" NumberDecimalCount="0"/>
+  <Property Name="AllianceScore" Type="Number" NumberMinValue="0" NumberMaxValue="9999" NumberDecimalCount="0"/>
+  <Property Name="HordeScore" Type="Number" NumberMinValue="0" NumberMaxValue="9999" NumberDecimalCount="0"/>
+  <Property Name="VisibleTeams" Type="Collection" SubType="String" CollectionMinItemCount="3" CollectionMaxItemCount="3"/>
+</Class>

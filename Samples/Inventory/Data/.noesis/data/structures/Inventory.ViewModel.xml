@@ -1,0 +1,6 @@
+<Class Name="ViewModel" Namespace="Inventory">
+  <Property Name="Player" Type="Object" SubType="Inventory.Player"/>
+  <Property Name="Inventory" Type="Collection" SubType="Inventory.Item" CollectionMinItemCount="45" CollectionMaxItemCount="45"/>
+  <Property Name="Platform" Type="Enum" SubType="Inventory.Platform"/>
+  <Property Name="Defaults" Type="Collection" SubType="Inventory.Item" CollectionMinItemCount="7" CollectionMaxItemCount="7"/>
+</Class>

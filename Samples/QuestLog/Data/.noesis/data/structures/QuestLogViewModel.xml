@@ -1,0 +1,4 @@
+<Class Name="QuestLogViewModel">
+  <Property Name="Quests" Type="Collection" SubType="QuestLog.Quest" CollectionMinItemCount="2" CollectionMaxItemCount="10"/>
+  <Property Name="SelectedQuest" Type="Object" SubType="QuestLog.Quest"/>
+</Class>

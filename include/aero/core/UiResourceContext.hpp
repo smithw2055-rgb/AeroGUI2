@@ -84,6 +84,10 @@ public:
     void ClearRiveSearchDirectories() noexcept;
     [[nodiscard]] std::vector<std::string> RiveSearchDirectoriesSnapshot() const;
 
+    void AddXamlSearchDirectory(std::string_view directory);
+    void ClearXamlSearchDirectories() noexcept;
+    [[nodiscard]] std::vector<std::string> XamlSearchDirectoriesSnapshot() const;
+
     // Clear all mutable resources, styles, custom fonts, textures, and gradient brushes in this context
     void ClearAll() noexcept;
 
@@ -96,6 +100,8 @@ private:
     GradientBrushRegistry gradientBrushes_;
     mutable std::mutex riveDirMutex_;
     std::vector<std::string> riveSearchDirs_;
+    mutable std::mutex xamlDirMutex_;
+    std::vector<std::string> xamlSearchDirs_;
 };
 
 // ============================================================================

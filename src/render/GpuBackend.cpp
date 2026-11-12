@@ -1160,8 +1160,14 @@ void OpenGlDeviceBackend::Shutdown() noexcept {
         if (fallbackWhiteTexId_ != 0u) {
             gl_.DeleteTextures(1, &fallbackWhiteTexId_);
         }
+        if (effectScratchTexId_ != 0u) {
+            gl_.DeleteTextures(1, &effectScratchTexId_);
+        }
         if (atlasTextureId_ != 0u) {
             gl_.DeleteTextures(1, &atlasTextureId_);
+        }
+        if (effectQuadVboId_ != 0u) {
+            gl_.DeleteBuffers(1, &effectQuadVboId_);
         }
         if (quadEboId_ != 0u) {
             gl_.DeleteBuffers(1, &quadEboId_);
@@ -1179,6 +1185,10 @@ void OpenGlDeviceBackend::Shutdown() noexcept {
 
     atlasTextureId_ = 0u;
     fallbackWhiteTexId_ = 0u;
+    effectScratchTexId_ = 0u;
+    effectQuadVboId_ = 0u;
+    effectScratchTexW_ = 0u;
+    effectScratchTexH_ = 0u;
     quadEboId_ = 0u;
     ringVboId_ = 0u;
     vaoId_ = 0u;
@@ -1202,6 +1212,9 @@ void OpenGlDeviceBackend::Shutdown() noexcept {
     imageSlotTextures_.clear();
     uiAtlasScratchRgba8_.clear();
     imageUploadScratchRgba8_.clear();
+    effectReadbackBottomUp_.clear();
+    effectReadbackTopDown_.clear();
+    effectPatchScratch_.clear();
     quadIndexMirror_.clear();
     initialized_ = false;
 
@@ -1889,60 +1902,433 @@ GpuBackendFrameStats OpenGlDeviceBackend::ExecuteSubmission(
     gl_.BindVertexArray(vaoId_);
     gl_.BindBuffer(kGlElementArrayBuffer, quadEboId_);
     bool scissorCurrentlyEnabled = false;
+    BlendingMode activeGlBlend = BlendingMode::Normal;
+    constexpr AeroGLenum kGlDstColor = 0x0306u;
+    constexpr AeroGLenum kGlOneMinusSrcColor = 0x0301u;
 
-    for (const GpuClipDrawBatch& batch : drawBatches) {
-        const std::size_t quadCount = batch.vertexCount / 4u;
-        if (quadCount == 0u) {
-            continue;
+    auto setGlBlendMode = [&](BlendingMode mode) noexcept {
+        if (mode == activeGlBlend) {
+            return;
         }
-        stats.clipBatchesProcessed += 1u;
-
-        if (batch.textureId != boundBatchTextureId) {
-            const AeroGLuint nextTex = ResolveBatchImageTexture(batch.textureId);
-            if (nextTex != boundUnit1Tex) {
-                gl_.ActiveTexture(kGlTexture1);
-                gl_.BindTexture(kGlTexture2D, nextTex);
-                boundUnit1Tex = nextTex;
-            }
-            boundBatchTextureId = batch.textureId;
+        switch (mode) {
+            case BlendingMode::Multiply:
+                gl_.BlendFuncSeparate(kGlDstColor, kGlOneMinusSrcAlpha, kGlOne, kGlOneMinusSrcAlpha);
+                break;
+            case BlendingMode::Screen:
+                gl_.BlendFuncSeparate(kGlOne, kGlOneMinusSrcColor, kGlOne, kGlOneMinusSrcAlpha);
+                break;
+            case BlendingMode::Additive:
+                gl_.BlendFuncSeparate(kGlOne, kGlOne, kGlOne, kGlOneMinusSrcAlpha);
+                break;
+            case BlendingMode::Normal:
+            default:
+                gl_.BlendFuncSeparate(kGlOne, kGlOneMinusSrcAlpha, kGlOne, kGlOneMinusSrcAlpha);
+                break;
         }
+        activeGlBlend = mode;
+    };
 
-        if (batch.scissorActive) {
-            if (!scissorCurrentlyEnabled) {
-                gl_.Enable(kGlScissorTest);
-                scissorCurrentlyEnabled = true;
-            }
-            const GlScissorBox sc = ComputeGlScissorBox(
-                batch.scissorRect,
-                viewportWidth,
-                viewportHeight);
-            gl_.Scissor(sc.x, sc.y, sc.width, sc.height);
-            stats.scissorBatchCount += 1u;
-            if (sc.width <= 0 || sc.height <= 0) {
+    if (tree.BlurLayerSpans().empty()) {
+        for (const GpuClipDrawBatch& batch : drawBatches) {
+            const std::size_t quadCount = batch.vertexCount / 4u;
+            if (quadCount == 0u) {
                 continue;
             }
-        } else if (scissorCurrentlyEnabled) {
-            gl_.Disable(kGlScissorTest);
-            scissorCurrentlyEnabled = false;
+            stats.clipBatchesProcessed += 1u;
+
+            setGlBlendMode(batch.blendMode);
+
+            if (batch.textureId != boundBatchTextureId) {
+                const AeroGLuint nextTex = ResolveBatchImageTexture(batch.textureId);
+                if (nextTex != boundUnit1Tex) {
+                    gl_.ActiveTexture(kGlTexture1);
+                    gl_.BindTexture(kGlTexture2D, nextTex);
+                    boundUnit1Tex = nextTex;
+                }
+                boundBatchTextureId = batch.textureId;
+            }
+
+            if (batch.scissorActive) {
+                if (!scissorCurrentlyEnabled) {
+                    gl_.Enable(kGlScissorTest);
+                    scissorCurrentlyEnabled = true;
+                }
+                const GlScissorBox sc = ComputeGlScissorBox(
+                    batch.scissorRect,
+                    viewportWidth,
+                    viewportHeight);
+                gl_.Scissor(sc.x, sc.y, sc.width, sc.height);
+                stats.scissorBatchCount += 1u;
+                if (sc.width <= 0 || sc.height <= 0) {
+                    continue;
+                }
+            } else if (scissorCurrentlyEnabled) {
+                gl_.Disable(kGlScissorTest);
+                scissorCurrentlyEnabled = false;
+            }
+
+            const std::size_t firstSlot = batch.firstPageIndex % effRingPages;
+            const std::size_t firstQuad = firstSlot * kQuadsPerPage;
+            const std::size_t indexCount = quadCount * 6u;
+            const std::uintptr_t indexByteOffset = firstQuad * 6u * sizeof(std::uint32_t);
+
+            gl_.DrawElements(
+                kGlTriangles,
+                static_cast<AeroGLsizei>(indexCount),
+                kGlUnsignedInt,
+                reinterpret_cast<const void*>(indexByteOffset));
+
+            stats.drawCallsIssued += 1u;
+            stats.quadsSubmitted += quadCount;
+            stats.indicesSubmitted += indexCount;
+            stats.trianglesSubmitted += quadCount * 2u;
+        }
+    } else {
+        auto flushPageQuadSubBatch = [&](std::size_t pageIdx, std::size_t absQuadStart, std::size_t quadCount) {
+            if (quadCount == 0u || pageIdx >= tree.PageCount()) {
+                return;
+            }
+            if (!EnsureQuadIndexCapacity(absQuadStart + quadCount)) {
+                return;
+            }
+            stats.clipBatchesProcessed += 1u;
+            const CommandPageHeader& hdr = tree.GetPage(pageIdx).header;
+            const BlendingMode bm = (hdr.reserved[1] <= 3u)
+                ? static_cast<BlendingMode>(hdr.reserved[1])
+                : BlendingMode::Normal;
+            setGlBlendMode(bm);
+
+            const std::uint32_t texId = hdr.reserved[0];
+            if (texId != boundBatchTextureId) {
+                const AeroGLuint nextTex = ResolveBatchImageTexture(texId);
+                if (nextTex != boundUnit1Tex) {
+                    gl_.ActiveTexture(kGlTexture1);
+                    gl_.BindTexture(kGlTexture2D, nextTex);
+                    boundUnit1Tex = nextTex;
+                }
+                boundBatchTextureId = texId;
+            }
+
+            const bool scActive = (hdr.flags & CommandPageFlag_ScissorClipActive) != 0u;
+            if (scActive) {
+                if (!scissorCurrentlyEnabled) {
+                    gl_.Enable(kGlScissorTest);
+                    scissorCurrentlyEnabled = true;
+                }
+                const GlScissorBox sc = ComputeGlScissorBox(
+                    Rect{hdr.clipX, hdr.clipY, hdr.clipW, hdr.clipH},
+                    viewportWidth,
+                    viewportHeight);
+                gl_.Scissor(sc.x, sc.y, sc.width, sc.height);
+                stats.scissorBatchCount += 1u;
+                if (sc.width <= 0 || sc.height <= 0) {
+                    return;
+                }
+            } else if (scissorCurrentlyEnabled) {
+                gl_.Disable(kGlScissorTest);
+                scissorCurrentlyEnabled = false;
+            }
+
+            const std::size_t indexCount = quadCount * 6u;
+            const std::uintptr_t indexByteOffset = absQuadStart * 6u * sizeof(std::uint32_t);
+            gl_.DrawElements(
+                kGlTriangles,
+                static_cast<AeroGLsizei>(indexCount),
+                kGlUnsignedInt,
+                reinterpret_cast<const void*>(indexByteOffset));
+
+            stats.drawCallsIssued += 1u;
+            stats.quadsSubmitted += quadCount;
+            stats.indicesSubmitted += indexCount;
+            stats.trianglesSubmitted += quadCount * 2u;
+        };
+
+        auto flushNodeRange = [&](std::uint32_t rangeStart, std::uint32_t rangeEnd) {
+            bool hasPending = false;
+            std::size_t pendingPage = 0u;
+            std::size_t pendingQuadStart = 0u;
+            std::size_t pendingQuadCount = 0u;
+
+            for (std::uint32_t i = rangeStart; i < rangeEnd; ++i) {
+                const RenderNodeDescriptor* nd = tree.GetNode(i);
+                if (!nd || nd->pageIndex >= tree.PageCount() || nd->vertexCount < 4u) {
+                    continue;
+                }
+                const std::size_t qInPage = nd->vertexOffsetInPage / 4u;
+                if (qInPage >= kQuadsPerPage) {
+                    continue;
+                }
+                const std::size_t qCount = std::min<std::size_t>(nd->vertexCount / 4u, kQuadsPerPage - qInPage);
+                if (qCount == 0u) {
+                    continue;
+                }
+                const std::size_t absQuad = (nd->pageIndex % effRingPages) * kQuadsPerPage + qInPage;
+                if (hasPending &&
+                    nd->pageIndex == pendingPage &&
+                    absQuad == pendingQuadStart + pendingQuadCount) {
+                    pendingQuadCount += qCount;
+                } else {
+                    if (hasPending) {
+                        flushPageQuadSubBatch(pendingPage, pendingQuadStart, pendingQuadCount);
+                    }
+                    hasPending = true;
+                    pendingPage = nd->pageIndex;
+                    pendingQuadStart = absQuad;
+                    pendingQuadCount = qCount;
+                }
+            }
+            if (hasPending) {
+                flushPageQuadSubBatch(pendingPage, pendingQuadStart, pendingQuadCount);
+            }
+        };
+
+        auto drawPremulEffectPatch = [&](int patchX, int patchY, int patchW, int patchH, const std::uint8_t* premulRgba8) {
+            if (patchW <= 0 || patchH <= 0 || !premulRgba8 || !EnsureQuadIndexCapacity(1u)) {
+                return;
+            }
+            if (effectScratchTexId_ == 0u) {
+                gl_.GenTextures(1, &effectScratchTexId_);
+                if (effectScratchTexId_ == 0u) {
+                    return;
+                }
+                effectScratchTexW_ = 0u;
+                effectScratchTexH_ = 0u;
+            }
+            if (effectQuadVboId_ == 0u) {
+                gl_.GenBuffers(1, &effectQuadVboId_);
+                if (effectQuadVboId_ == 0u) {
+                    return;
+                }
+                gl_.BindBuffer(kGlArrayBuffer, effectQuadVboId_);
+                gl_.BufferData(
+                    kGlArrayBuffer,
+                    static_cast<AeroGLsizeiptr>(4u * sizeof(AeroVertex)),
+                    nullptr,
+                    kGlDynamicDraw);
+            }
+
+            gl_.ActiveTexture(kGlTexture1);
+            gl_.BindTexture(kGlTexture2D, effectScratchTexId_);
+            gl_.PixelStorei(kGlUnpackAlignment, 1);
+            const auto uw = static_cast<std::uint32_t>(patchW);
+            const auto uh = static_cast<std::uint32_t>(patchH);
+            if (effectScratchTexW_ != uw || effectScratchTexH_ != uh) {
+                gl_.TexParameteri(kGlTexture2D, kGlTextureMinFilter, static_cast<AeroGLint>(kGlLinear));
+                gl_.TexParameteri(kGlTexture2D, kGlTextureMagFilter, static_cast<AeroGLint>(kGlLinear));
+                gl_.TexParameteri(kGlTexture2D, kGlTextureWrapS, static_cast<AeroGLint>(kGlClampToEdge));
+                gl_.TexParameteri(kGlTexture2D, kGlTextureWrapT, static_cast<AeroGLint>(kGlClampToEdge));
+                gl_.TexImage2D(
+                    kGlTexture2D,
+                    0,
+                    static_cast<AeroGLint>(kGlRgba8),
+                    static_cast<AeroGLsizei>(patchW),
+                    static_cast<AeroGLsizei>(patchH),
+                    0,
+                    kGlRgba,
+                    kGlUnsignedByte,
+                    premulRgba8);
+                effectScratchTexW_ = uw;
+                effectScratchTexH_ = uh;
+            } else {
+                gl_.TexSubImage2D(
+                    kGlTexture2D,
+                    0,
+                    0,
+                    0,
+                    static_cast<AeroGLsizei>(patchW),
+                    static_cast<AeroGLsizei>(patchH),
+                    kGlRgba,
+                    kGlUnsignedByte,
+                    premulRgba8);
+            }
+            boundUnit1Tex = effectScratchTexId_;
+            boundBatchTextureId = 0xFFFFFFFFu;
+
+            setGlBlendMode(BlendingMode::Normal);
+            if (scissorCurrentlyEnabled) {
+                gl_.Disable(kGlScissorTest);
+                scissorCurrentlyEnabled = false;
+            }
+
+            const float x0 = static_cast<float>(patchX);
+            const float y0 = static_cast<float>(patchY);
+            const float x1 = static_cast<float>(patchX + patchW);
+            const float y1 = static_cast<float>(patchY + patchH);
+            const auto prim = static_cast<std::uint16_t>(AeroPrimType::TexturedQuad);
+            const AeroVertex quadVerts[4]{
+                {x0, y0, 0.0f, 0.0f, 0xFFFFFFFFu, prim, AeroVertexFlag_PremultipliedAlpha},
+                {x1, y0, 1.0f, 0.0f, 0xFFFFFFFFu, prim, AeroVertexFlag_PremultipliedAlpha},
+                {x1, y1, 1.0f, 1.0f, 0xFFFFFFFFu, prim, AeroVertexFlag_PremultipliedAlpha},
+                {x0, y1, 0.0f, 1.0f, 0xFFFFFFFFu, prim, AeroVertexFlag_PremultipliedAlpha},
+            };
+
+            gl_.BindVertexArray(vaoId_);
+            gl_.BindBuffer(kGlArrayBuffer, effectQuadVboId_);
+            gl_.BufferSubData(
+                kGlArrayBuffer,
+                0,
+                static_cast<AeroGLsizeiptr>(sizeof(quadVerts)),
+                quadVerts);
+
+            constexpr auto kStride = static_cast<AeroGLsizei>(sizeof(AeroVertex));
+            gl_.VertexAttribPointer(0u, 2, kGlFloat, 0u, kStride, reinterpret_cast<const void*>(std::uintptr_t{0}));
+            gl_.VertexAttribPointer(1u, 2, kGlFloat, 0u, kStride, reinterpret_cast<const void*>(std::uintptr_t{8}));
+            gl_.VertexAttribIPointer(2u, 1, kGlUnsignedInt, kStride, reinterpret_cast<const void*>(std::uintptr_t{16}));
+            gl_.VertexAttribIPointer(3u, 1, kGlUnsignedInt, kStride, reinterpret_cast<const void*>(std::uintptr_t{20}));
+
+            gl_.BindBuffer(kGlElementArrayBuffer, quadEboId_);
+            gl_.DrawElements(kGlTriangles, 6, kGlUnsignedInt, nullptr);
+
+            BindAeroVertexLayout();
+
+            stats.clipBatchesProcessed += 1u;
+            stats.drawCallsIssued += 1u;
+            stats.quadsSubmitted += 1u;
+            stats.indicesSubmitted += 6u;
+            stats.trianglesSubmitted += 2u;
+        };
+
+        auto executeBackdropBlurOnGpu = [&](const BlurLayerSpan& span) {
+            if (!gl_.ReadPixels || !std::isfinite(span.radiusPx) || span.radiusPx <= 0.25f) {
+                return;
+            }
+            const Rect mr = span.maskDestRect;
+            if (!std::isfinite(mr.x) || !std::isfinite(mr.y) ||
+                !std::isfinite(mr.width) || !std::isfinite(mr.height) ||
+                mr.width <= 1.0f || mr.height <= 1.0f) {
+                return;
+            }
+            const int vpW = static_cast<int>(std::min<std::uint32_t>(viewportWidth, 0x3FFFFFFFu));
+            const int vpH = static_cast<int>(std::min<std::uint32_t>(viewportHeight, 0x3FFFFFFFu));
+            const float clampedRadius = std::clamp(span.radiusPx, 0.5f, 128.0f);
+            const int boxR = std::max(1, static_cast<int>(std::lround(clampedRadius * 0.5f)));
+            const int padPx = boxR * 3 + 2;
+            const int bx0 = std::clamp(static_cast<int>(std::floor(mr.x)) - padPx, 0, vpW);
+            const int by0 = std::clamp(static_cast<int>(std::floor(mr.y)) - padPx, 0, vpH);
+            const int bx1 = std::clamp(static_cast<int>(std::ceil(mr.x + mr.width)) + padPx, 0, vpW);
+            const int by1 = std::clamp(static_cast<int>(std::ceil(mr.y + mr.height)) + padPx, 0, vpH);
+            const int bw = bx1 - bx0;
+            const int bh = by1 - by0;
+            if (bw <= 0 || bh <= 0) {
+                return;
+            }
+
+            if (scissorCurrentlyEnabled) {
+                gl_.Disable(kGlScissorTest);
+                scissorCurrentlyEnabled = false;
+            }
+            if (gl_.PixelStorei) {
+                gl_.PixelStorei(kGlPackAlignment, 1);
+            }
+            const std::size_t rowBytes = static_cast<std::size_t>(bw) * 4u;
+            effectReadbackBottomUp_.resize(rowBytes * static_cast<std::size_t>(bh));
+            gl_.ReadPixels(
+                static_cast<AeroGLint>(bx0),
+                static_cast<AeroGLint>(vpH - by1),
+                static_cast<AeroGLsizei>(bw),
+                static_cast<AeroGLsizei>(bh),
+                kGlRgba,
+                kGlUnsignedByte,
+                effectReadbackBottomUp_.data());
+
+            effectReadbackTopDown_.resize(effectReadbackBottomUp_.size());
+            for (int ry = 0; ry < bh; ++ry) {
+                const int srcRow = (bh - 1) - ry;
+                std::memcpy(
+                    effectReadbackTopDown_.data() + static_cast<std::size_t>(ry) * rowBytes,
+                    effectReadbackBottomUp_.data() + static_cast<std::size_t>(srcRow) * rowBytes,
+                    rowBytes);
+            }
+
+            int patchX = 0, patchY = 0, patchW = 0, patchH = 0;
+            if (ZeroCopyGpuStream::ComputeBackdropBlurPatchPremulRgba8(
+                    span,
+                    viewportWidth,
+                    viewportHeight,
+                    bx0,
+                    by0,
+                    bw,
+                    bh,
+                    effectReadbackTopDown_.data(),
+                    patchX,
+                    patchY,
+                    patchW,
+                    patchH,
+                    effectPatchScratch_)) {
+                drawPremulEffectPatch(patchX, patchY, patchW, patchH, effectPatchScratch_.data());
+            }
+        };
+
+        const auto& blurSpans = tree.BlurLayerSpans();
+        const auto totalNodes = static_cast<std::uint32_t>(tree.NodeCount());
+        std::size_t blurCursor = 0u;
+        std::uint32_t regularSegStart = 0u;
+        std::uint32_t nid = 0u;
+
+        while (nid < totalNodes) {
+            while (blurCursor < blurSpans.size() &&
+                   (blurSpans[blurCursor].firstNodeId < nid ||
+                    (blurSpans[blurCursor].endNodeId <= nid &&
+                     blurSpans[blurCursor].effectMode != UIEffectKind::BackdropBlur))) {
+                ++blurCursor;
+            }
+            if (blurCursor < blurSpans.size() &&
+                blurSpans[blurCursor].firstNodeId == nid &&
+                (blurSpans[blurCursor].endNodeId > nid ||
+                 blurSpans[blurCursor].effectMode == UIEffectKind::BackdropBlur) &&
+                blurSpans[blurCursor].endNodeId <= totalNodes &&
+                std::isfinite(blurSpans[blurCursor].radiusPx) &&
+                blurSpans[blurCursor].radiusPx > 0.25f) {
+                const BlurLayerSpan span = blurSpans[blurCursor];
+                ++blurCursor;
+
+                flushNodeRange(regularSegStart, nid);
+
+                if (span.effectMode == UIEffectKind::BackdropBlur) {
+                    executeBackdropBlurOnGpu(span);
+                    regularSegStart = nid;
+                    continue;
+                }
+
+                int patchX = 0, patchY = 0, patchW = 0, patchH = 0;
+                if (ZeroCopyGpuStream::RasterizeBlurSpanPatchPremulRgba8(
+                        tree,
+                        span,
+                        blurCursor,
+                        viewportWidth,
+                        viewportHeight,
+                        patchX,
+                        patchY,
+                        patchW,
+                        patchH,
+                        effectPatchScratch_)) {
+                    drawPremulEffectPatch(patchX, patchY, patchW, patchH, effectPatchScratch_.data());
+                }
+                while (blurCursor < blurSpans.size() &&
+                       blurSpans[blurCursor].firstNodeId < span.endNodeId) {
+                    ++blurCursor;
+                }
+                nid = span.endNodeId;
+                regularSegStart = nid;
+                continue;
+            }
+            ++nid;
         }
 
-        const std::size_t firstSlot = batch.firstPageIndex % effRingPages;
-        const std::size_t firstQuad = firstSlot * kQuadsPerPage;
-        const std::size_t indexCount = quadCount * 6u;
-        const std::uintptr_t indexByteOffset = firstQuad * 6u * sizeof(std::uint32_t);
+        flushNodeRange(regularSegStart, totalNodes);
 
-        gl_.DrawElements(
-            kGlTriangles,
-            static_cast<AeroGLsizei>(indexCount),
-            kGlUnsignedInt,
-            reinterpret_cast<const void*>(indexByteOffset));
-
-        stats.drawCallsIssued += 1u;
-        stats.quadsSubmitted += quadCount;
-        stats.indicesSubmitted += indexCount;
-        stats.trianglesSubmitted += quadCount * 2u;
+        while (blurCursor < blurSpans.size()) {
+            const BlurLayerSpan& span = blurSpans[blurCursor++];
+            if (span.effectMode == UIEffectKind::BackdropBlur &&
+                span.firstNodeId == totalNodes) {
+                executeBackdropBlurOnGpu(span);
+            }
+        }
     }
 
+    if (activeGlBlend != BlendingMode::Normal) {
+        gl_.BlendFuncSeparate(kGlOne, kGlOneMinusSrcAlpha, kGlOne, kGlOneMinusSrcAlpha);
+    }
     if (scissorCurrentlyEnabled) {
         gl_.Disable(kGlScissorTest);
     }

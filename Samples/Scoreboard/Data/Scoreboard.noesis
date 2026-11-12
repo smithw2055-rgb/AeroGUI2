@@ -1,0 +1,5 @@
+<Project>
+  <Assembly>Scoreboard</Assembly>
+  <DefaultDataNamespace>Scoreboard</DefaultDataNamespace>
+  <StartupDocument>MainPage.xaml</StartupDocument>
+</Project>

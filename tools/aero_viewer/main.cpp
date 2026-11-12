@@ -16,11 +16,13 @@
 #include <vector>
 
 #include "aero/animation/AnimationEngine.hpp"
+#include "aero/bridge/ScriptUiBridge.hpp"
 #include "aero/binding/DualTrackBindingEngine.hpp"
 #include "aero/compiler/AeroCompiler.hpp"
 #include "aero/compiler/AxbFormat.hpp"
 #include "aero/controls/Controls.hpp"
 #include "aero/core/UIElement.hpp"
+#include "aero/core/UiResourceContext.hpp"
 #include "aero/host/HostDrivers.hpp"
 #include "aero/host/NativeWindowHost.hpp"
 #include "aero/input/InputEventRouter.hpp"
@@ -44,7 +46,7 @@ struct SamplePreset {
 };
 
 constexpr SamplePreset kPresets[] = {
-    {"HelloWorld",       "HelloWorld/Data/MainPage.xaml",         nullptr,                                1.2f, "Minimal XAML typography & layout"},
+    {"HelloWorld",       "HelloWorld/Data/MainPage.xaml",         nullptr,                                1.8f, "Minimal XAML typography & layout"},
     {"Login",            "Login/Data/MainPage.xaml",              "Login/Data/Resources.xaml",            1.0f, "Animated login card, TextBox, PasswordBox & Button"},
     {"Buttons",          "Buttons/Data/MainPage.xaml",            "Buttons/Data/Resources.xaml",          1.0f, "Styled interactive game menu buttons"},
     {"QuestLog",         "QuestLog/Data/MainPage.xaml",           "QuestLog/Data/Resources.xaml",         1.0f, "RPG quest panel with vector badges & gradients"},
@@ -60,6 +62,8 @@ constexpr SamplePreset kPresets[] = {
     {"BackgroundBlur",   "BackgroundBlur/Data/MainPage.xaml",     "BackgroundBlur/Data/Resources.xaml",   1.0f, "Frosted glass panel & layered blur"},
     {"BrushShaders",     "BrushShaders/Data/MainPage.xaml",       nullptr,                                1.0f, "Procedural brush shader surface"},
     {"UserControl",      "UserControl/Data/MainPage.xaml",        "UserControl/Data/Resources.xaml",      1.0f, "Composable NumericUpDown UserControl"},
+    {"DataBinding",      "DataBinding/Data/MainPage.xaml",        "DataBinding/Data/Resources.xaml",      1.0f, "Solar system master-detail data binding"},
+    {"Menu3D",           "Menu3D/Data/MainPage.xaml",             "Menu3D/Data/Resources.xaml",           1.0f, "3D perspective game menu & sub-menus"},
 };
 
 std::string ToLowerAscii(std::string_view sv) {
@@ -116,8 +120,6 @@ fs::path DiscoverSamplesRoot() {
 void RegisterContainerPassThroughShims() {
     aero::AxbPackage passThrough{};
     passThrough.rootTypeName = "UserControl";
-    aero::AxbTemplateRegistry::Instance().Register("noesis:LayoutScaler", passThrough);
-    aero::AxbTemplateRegistry::Instance().Register("LayoutScaler", passThrough);
     aero::AxbTemplateRegistry::Instance().Register("Decorator", passThrough);
     aero::AxbTemplateRegistry::Instance().Register("ViewboxDecorator", passThrough);
 }
@@ -290,6 +292,7 @@ int MountAndRunSingleTarget(
     aero::FontAtlas::Instance().ClearCustomFonts();
     aero::ImageAtlas::Instance().Clear();
     aero::RiveControl::ClearAssetSearchDirectories();
+    aero::UiResourceContext::Current().ClearXamlSearchDirectories();
     RegisterContainerPassThroughShims();
 
     fs::path projDataDir = target.filePath.parent_path();
@@ -300,11 +303,29 @@ int MountAndRunSingleTarget(
         projDataDir = target.filePath.parent_path();
     }
 
+    std::error_code ec;
+    fs::path themeDataDir;
+    for (fs::path cur = projDataDir; cur.has_parent_path(); cur = cur.parent_path()) {
+        if (fs::is_directory(cur / "Theme" / "Data", ec)) {
+            themeDataDir = cur / "Theme" / "Data";
+            break;
+        }
+        if (cur == cur.parent_path()) break;
+    }
+    if (themeDataDir.empty()) {
+        const fs::path sr = DiscoverSamplesRoot();
+        if (!sr.empty() && fs::is_directory(sr.parent_path() / "Theme" / "Data", ec)) {
+            themeDataDir = sr.parent_path() / "Theme" / "Data";
+        }
+    }
+
     aero::ImageAtlas::Instance().SetBaseDirectory(target.filePath.parent_path().string());
     aero::ImageAtlas::Instance().AddSearchDirectory(projDataDir.string());
-    std::error_code ec;
     if (fs::is_directory(projDataDir / "Samples", ec)) {
         aero::ImageAtlas::Instance().AddSearchDirectory((projDataDir / "Samples").string());
+    }
+    if (fs::is_directory(projDataDir / "Images", ec)) {
+        aero::ImageAtlas::Instance().AddSearchDirectory((projDataDir / "Images").string());
     }
     aero::RiveControl::AddAssetSearchDirectory(target.filePath.parent_path().string());
     aero::RiveControl::AddAssetSearchDirectory(projDataDir.string());
@@ -325,7 +346,18 @@ int MountAndRunSingleTarget(
             fontFiles.push_back(it->path());
         }
     }
-    std::sort(fontFiles.begin(), fontFiles.end());
+    // CourierPrime deprioritize: sort UI sans-serif fonts ahead of monospace code-viewer fonts like CourierPrime
+    std::sort(fontFiles.begin(), fontFiles.end(), [](const fs::path& a, const fs::path& b) {
+        const bool aMono = a.stem().string().find("Courier") != std::string::npos;
+        const bool bMono = b.stem().string().find("Courier") != std::string::npos;
+        if (aMono != bMono) return !aMono;
+        return a < b;
+    });
+    if (projDataDir.parent_path().filename() == "Gallery" &&
+        !themeDataDir.empty() &&
+        fs::is_regular_file(themeDataDir / "Theme" / "Fonts" / "PT Root UI_Regular.otf", ec)) {
+        fontFiles.insert(fontFiles.begin(), themeDataDir / "Theme" / "Fonts" / "PT Root UI_Regular.otf");
+    }
     std::size_t fontsLoaded = 0u;
     bool isFirstFont = true;
     for (const auto& fp : fontFiles) {
@@ -335,13 +367,45 @@ int MountAndRunSingleTarget(
             isFirstFont = false;
         }
     }
+    if (!themeDataDir.empty() && fs::is_directory(themeDataDir / "Theme" / "Fonts", ec)) {
+        std::vector<fs::path> themeFonts;
+        for (const auto& entry : fs::directory_iterator(themeDataDir / "Theme" / "Fonts", ec)) {
+            if (entry.is_regular_file()) {
+                const std::string ext = ToLowerAscii(entry.path().extension().string());
+                if (ext == ".ttf" || ext == ".otf") {
+                    themeFonts.push_back(entry.path());
+                }
+            }
+        }
+        std::sort(themeFonts.begin(), themeFonts.end(), [](const fs::path& a, const fs::path& b) {
+            const bool aReg = a.stem().string().find("Regular") != std::string::npos;
+            const bool bReg = b.stem().string().find("Regular") != std::string::npos;
+            if (aReg != bReg) return aReg;
+            return a < b;
+        });
+        for (const auto& tf : themeFonts) {
+            if (aero::FontAtlas::Instance().LoadTrueTypeFontFromFile(
+                    tf.string(), tf.stem().string(), isFirstFont)) {
+                ++fontsLoaded;
+                isFirstFont = false;
+            }
+            if (tf.stem().string().find("PT Root UI_Regular") != std::string::npos) {
+                (void)aero::FontAtlas::Instance().LoadTrueTypeFontFromFile(
+                    tf.string(), "PT Root UI", false);
+            }
+        }
+    }
 
     aero::ExecutionDomainContext domains;
     aero::AnimationEngine animEngine;
+    std::shared_ptr<aero::BindingRegistry> nativeBindings;
+    std::unique_ptr<aero::ScriptUiBridge> scriptBridge;
     std::unique_ptr<aero::Interpreter> uiInterpreter;
     std::unique_ptr<aero::DualTrackBindingEngine> bindingEngine;
     aero::StyleTriggerEngine styleEngine(&animEngine, nullptr);
     aero::IntrusivePtr<aero::UIElement> root;
+    aero::ObjectRef mainWinRef{};
+    aero::PersistentRoot mainWinPin;
     aero::ObjectRef vmRef{};
     aero::PersistentRoot vmPin;
 
@@ -365,6 +429,49 @@ int MountAndRunSingleTarget(
     } else {
         aero::AeroCompiler compiler;
 
+        std::vector<std::string> commonSearchPaths{
+            target.filePath.parent_path().string(),
+            projDataDir.string(),
+        };
+        if (fs::is_directory(projDataDir / "Samples", ec)) {
+            commonSearchPaths.push_back((projDataDir / "Samples").string());
+        }
+        if (!themeDataDir.empty()) {
+            commonSearchPaths.push_back(themeDataDir.string());
+            commonSearchPaths.push_back((themeDataDir / "Theme").string());
+        }
+        for (const auto& sp : commonSearchPaths) {
+            aero::UiResourceContext::Current().AddXamlSearchDirectory(sp);
+        }
+
+        // Pre-load global NoesisTheme dictionary as baseline fallback styles/brushes before sample overrides,
+        // and register both DarkBlue and LightBlue dictionaries once for dynamic runtime switching.
+        if (!themeDataDir.empty()) {
+            const bool preferLightBlue =
+                (projDataDir.parent_path().filename() == "Gallery") ||
+                (target.displayName == "UserControl") ||
+                (target.displayName == "DataBinding");
+            const char* preferredThemeName =
+                preferLightBlue ? "NoesisTheme.LightBlue.xaml" : "NoesisTheme.DarkBlue.xaml";
+            for (const char* tName : {"NoesisTheme.DarkBlue.xaml", "NoesisTheme.LightBlue.xaml"}) {
+                const fs::path tp = themeDataDir / "Theme" / tName;
+                if (fs::is_regular_file(tp, ec)) {
+                    aero::AeroCompileInput tIn{};
+                    tIn.xamlPath = tp.string();
+                    tIn.resourceSearchRoot = themeDataDir.string();
+                    tIn.resourceSearchPaths = commonSearchPaths;
+                    const aero::AeroCompileResult tRes = compiler.Compile(tIn);
+                    if (tRes.succeeded) {
+                        if (std::strcmp(tName, preferredThemeName) == 0) {
+                            aero::AxbTemplateRegistry::Instance().RegisterResources(tRes.axbPackage);
+                        }
+                        aero::AxbTemplateRegistry::Instance().RegisterDictionary(tName, tRes.axbPackage);
+                        aero::AxbTemplateRegistry::Instance().RegisterDictionary(tp.string(), tRes.axbPackage);
+                    }
+                }
+            }
+        }
+
         // Register sibling ResourceDictionaries and local UserControls in Data/
         std::vector<fs::path> siblingXamls;
         for (const auto& entry : fs::directory_iterator(projDataDir, ec)) {
@@ -379,11 +486,20 @@ int MountAndRunSingleTarget(
             aero::AeroCompileInput sibIn{};
             sibIn.xamlPath = sibPath.string();
             sibIn.resourceSearchRoot = projDataDir.string();
+            sibIn.resourceSearchPaths = commonSearchPaths;
             const aero::AeroCompileResult sibRes = compiler.Compile(sibIn);
             if (sibRes.succeeded) {
-                aero::AxbTemplateRegistry::Instance().RegisterResources(sibRes.axbPackage);
                 const std::string stem = sibPath.stem().string();
-                if (stem != "Resources" && stem.rfind("Language-", 0) != 0) {
+                aero::AxbTemplateRegistry::Instance().RegisterDictionary(
+                    sibPath.filename().string(), sibRes.axbPackage);
+                aero::AxbTemplateRegistry::Instance().RegisterDictionary(
+                    sibPath.string(), sibRes.axbPackage);
+                const bool isLangDict = (stem.rfind("Language-", 0) == 0);
+                if (!isLangDict || sibPath == target.extraDictPath ||
+                    (target.extraDictPath.empty() && stem == "Language-en")) {
+                    aero::AxbTemplateRegistry::Instance().RegisterResources(sibRes.axbPackage);
+                }
+                if (stem != "Resources" && !isLangDict) {
                     if (!sibRes.axbPackage.className.empty()) {
                         aero::AxbTemplateRegistry::Instance().Register(
                             sibRes.axbPackage.className, sibRes.axbPackage);
@@ -397,11 +513,30 @@ int MountAndRunSingleTarget(
         aero::AeroCompileInput mainIn{};
         mainIn.xamlPath = target.filePath.string();
         mainIn.resourceSearchRoot = projDataDir.string();
-        mainIn.resourceSearchPaths = {
-            target.filePath.parent_path().string(),
-            projDataDir.string(),
-        };
-        for (const auto& rsFile : opts.rsPaths) {
+        mainIn.resourceSearchPaths = commonSearchPaths;
+        std::vector<std::string> effectiveRsPaths = opts.rsPaths;
+        if (effectiveRsPaths.empty()) {
+            // Auto-discover sample RealScript (*.rs) MainWindow/ViewModel files in projDataDir
+            std::vector<fs::path> discoveredRs;
+            for (const auto& entry : fs::directory_iterator(projDataDir, ec)) {
+                if (entry.is_regular_file() &&
+                    ToLowerAscii(entry.path().extension().string()) == ".rs") {
+                    // For Gallery sub-samples (like Blending.xaml, Effects.xaml, Brushes.xaml),
+                    // skip Gallery shell's MainWindow.rs / ViewModel.rs
+                    if (target.filePath.parent_path() != projDataDir &&
+                        (entry.path().filename() == "MainWindow.rs" ||
+                         entry.path().filename() == "ViewModel.rs")) {
+                        continue;
+                    }
+                    discoveredRs.push_back(entry.path());
+                }
+            }
+            std::sort(discoveredRs.begin(), discoveredRs.end());
+            for (const auto& rp : discoveredRs) {
+                effectiveRsPaths.push_back(rp.string());
+            }
+        }
+        for (const auto& rsFile : effectiveRsPaths) {
             std::string rsCode;
             if (!ReadTextFile(rsFile, rsCode)) {
                 std::cerr << "[aero-viewer] Failed to read RealScript file: " << rsFile << "\n";
@@ -420,57 +555,113 @@ int MountAndRunSingleTarget(
         }
         aero::AxbTemplateRegistry::Instance().RegisterResources(mainRes.axbPackage);
 
-        if (mainRes.programImage) {
-            domains.registerProgramObservableMetadata(*mainRes.programImage);
-            uiInterpreter = std::make_unique<aero::Interpreter>(mainRes.programImage, domains.uiHeapPtr());
-            uiInterpreter->setExecutionDomainContext(&domains, aero::DomainKind::UiPresentation);
-            bindingEngine = std::make_unique<aero::DualTrackBindingEngine>(
-                domains, mainRes.programImage.get(), uiInterpreter.get());
-        } else {
-            bindingEngine = std::make_unique<aero::DualTrackBindingEngine>(domains);
-        }
-        bindingEngine->SetAnimationEngine(&animEngine);
-        styleEngine.SetBindingEngine(bindingEngine.get());
-        styleEngine.ImportRegistryStyles();
-        styleEngine.RegisterPackageStyles(mainRes.axbPackage);
-
-        root = aero::CreateElementByTypeName(mainRes.axbPackage.rootTypeName);
-        if (!root) {
-            root = aero::MakeIntrusive<aero::UserControl>();
-        }
-        if (!aero::MountAxbTemplate(
-                root.Get(),
-                mainRes.axbPackage,
-                &domains,
-                bindingEngine.get(),
-                vmRef,
-                uiInterpreter.get(),
-                nullptr,
-                &animEngine)) {
-            std::cerr << "[aero-viewer] MountAxbTemplate failed for " << target.filePath.string() << "\n";
-            return 1;
-        }
-
         fs::path dictToApply = target.extraDictPath;
         if (dictToApply.empty() && fs::is_regular_file(projDataDir / "Resources.xaml", ec) &&
             (projDataDir / "Resources.xaml") != target.filePath) {
             dictToApply = projDataDir / "Resources.xaml";
         }
+        aero::AxbPackage extraDictPkg{};
+        bool hasExtraDictPkg = false;
         if (!dictToApply.empty() && fs::is_regular_file(dictToApply, ec)) {
             aero::AeroCompileInput dictIn{};
             dictIn.xamlPath = dictToApply.string();
             dictIn.resourceSearchRoot = projDataDir.string();
+            dictIn.resourceSearchPaths = commonSearchPaths;
             const aero::AeroCompileResult dictRes = compiler.Compile(dictIn);
             if (dictRes.succeeded) {
-                aero::AxbTemplateRegistry::Instance().RegisterResources(dictRes.axbPackage);
-                (void)aero::AxbTemplateRegistry::Instance().ApplyDynamicDictionary(
-                    dictRes.axbPackage, root.Get());
-                styleEngine.ImportRegistryStyles();
+                extraDictPkg = dictRes.axbPackage;
+                hasExtraDictPkg = true;
+                aero::AxbTemplateRegistry::Instance().RegisterResources(extraDictPkg);
             }
         }
 
-        (void)styleEngine.BindSubtreeStyles(root.Get(), true);
-        (void)styleEngine.EvaluateAndApply();
+        if (mainRes.programImage) {
+            domains.registerProgramObservableMetadata(*mainRes.programImage);
+            nativeBindings = std::make_shared<aero::BindingRegistry>();
+            scriptBridge = std::make_unique<aero::ScriptUiBridge>(domains);
+            scriptBridge->RegisterCoreUiBindings(*nativeBindings);
+
+            uiInterpreter = std::make_unique<aero::Interpreter>(mainRes.programImage, domains.uiHeapPtr());
+            uiInterpreter->setExecutionDomainContext(&domains, aero::DomainKind::UiPresentation);
+            uiInterpreter->setBindingRegistry(nativeBindings);
+
+            const std::string sampleFolder = projDataDir.parent_path().filename().string();
+            std::string classModulePrefix;
+            if (const auto dotPos = mainRes.axbPackage.className.rfind('.'); dotPos != std::string::npos) {
+                classModulePrefix = mainRes.axbPackage.className.substr(0u, dotPos);
+            }
+
+            // Discover and invoke CreateMainWindow() first, falling back to CreateViewModel()
+            std::vector<std::string> factoryCandidates;
+            if (!classModulePrefix.empty()) {
+                factoryCandidates.push_back(classModulePrefix + "::CreateMainWindow");
+            }
+            factoryCandidates.push_back(sampleFolder + "::CreateMainWindow");
+            factoryCandidates.push_back(target.displayName + "::CreateMainWindow");
+            factoryCandidates.push_back("Samples." + sampleFolder + "::CreateMainWindow");
+            factoryCandidates.push_back("Samples." + target.displayName + "::CreateMainWindow");
+            factoryCandidates.push_back("CreateMainWindow");
+            if (!classModulePrefix.empty()) {
+                factoryCandidates.push_back(classModulePrefix + "::CreateViewModel");
+            }
+            factoryCandidates.push_back("Samples." + target.displayName + "::CreateViewModel");
+            factoryCandidates.push_back("Samples." + sampleFolder + "::CreateViewModel");
+            factoryCandidates.push_back(sampleFolder + "::CreateViewModel");
+            factoryCandidates.push_back(target.displayName + "::CreateViewModel");
+            factoryCandidates.push_back("CreateViewModel");
+
+            for (const auto& fnName : factoryCandidates) {
+                if (auto fnSym = mainRes.programImage->findFunction(fnName)) {
+                    aero::rs_rt::ExecutionOptions execOpts{};
+                    execOpts.limits.instructionBudget = 5'000'000;
+                    const auto vmExec = uiInterpreter->invoke(*fnSym, {}, execOpts);
+                    if (vmExec.succeeded) {
+                        if (const auto* oref = std::get_if<aero::ObjectRef>(&vmExec.value); oref && oref->valid()) {
+                            mainWinRef = *oref;
+                            mainWinPin = domains.uiHeap().retain(mainWinRef);
+                            (void)domains.uiHeap().consumeDirtyObjects();
+                            domains.uiHeap().clearDirtyFieldMask(mainWinRef);
+                            break;
+                        }
+                    }
+                }
+            }
+
+            bindingEngine = std::make_unique<aero::DualTrackBindingEngine>(
+                domains, mainRes.programImage.get(), uiInterpreter.get());
+            scriptBridge->SetUnderlyingEngine(bindingEngine.get());
+        } else {
+            bindingEngine = std::make_unique<aero::DualTrackBindingEngine>(domains);
+        }
+
+        root = aero::CreateElementByTypeName(mainRes.axbPackage.rootTypeName);
+        if (!root) {
+            root = aero::MakeIntrusive<aero::UserControl>();
+        }
+        if (!aero::MountAndWireMainWindow(
+                root.Get(),
+                mainRes.axbPackage,
+                domains,
+                *bindingEngine,
+                styleEngine,
+                mainWinRef,
+                uiInterpreter.get(),
+                nullptr,
+                &animEngine,
+                &vmRef)) {
+            std::cerr << "[aero-viewer] MountAndWireMainWindow failed for " << target.filePath.string() << "\n";
+            return 1;
+        }
+        if (vmRef.valid()) {
+            vmPin = domains.uiHeap().retain(vmRef);
+        }
+
+        if (hasExtraDictPkg) {
+            (void)aero::AxbTemplateRegistry::Instance().ApplyDynamicDictionary(
+                extraDictPkg, root.Get());
+            styleEngine.ImportRegistryStyles();
+            (void)styleEngine.EvaluateAndApply();
+        }
     }
 
     root->SetAsRootVisual(true, &domains.nativeHandles(), &domains.uiHeap());

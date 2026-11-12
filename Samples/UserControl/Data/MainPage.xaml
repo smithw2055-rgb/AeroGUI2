@@ -1,0 +1,360 @@
+<Page
+  xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+  xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+  x:Class="UserControl.MainWindow"
+  x:DataType="UserControl::ViewModel"
+  xmlns:b="http://schemas.microsoft.com/xaml/behaviors"
+  xmlns:noesis="clr-namespace:NoesisGUIExtensions"
+  xmlns:local="clr-namespace:UserControls"
+  Title="NoesisGUI - UserControl"
+  Foreground="Silver"
+  FontFamily="./#Aero Matics">
+
+  <Page.Resources>
+    <ResourceDictionary>
+      <Storyboard x:Key="UserControl.Anim.Loaded">
+        <DoubleAnimationUsingKeyFrames Storyboard.TargetName="BarStr" Storyboard.TargetProperty="Value">
+          <EasingDoubleKeyFrame KeyTime="0:0:0.4" Value="{Binding Value, ElementName=StatStr}">
+            <EasingDoubleKeyFrame.EasingFunction>
+              <CubicEase EasingMode="EaseOut"/>
+            </EasingDoubleKeyFrame.EasingFunction>
+          </EasingDoubleKeyFrame>
+        </DoubleAnimationUsingKeyFrames>
+        <DoubleAnimationUsingKeyFrames Storyboard.TargetName="BarAgi" Storyboard.TargetProperty="Value">
+          <EasingDoubleKeyFrame KeyTime="0:0:0.4" Value="{Binding Value, ElementName=StatAgi}">
+            <EasingDoubleKeyFrame.EasingFunction>
+              <CubicEase EasingMode="EaseOut"/>
+            </EasingDoubleKeyFrame.EasingFunction>
+          </EasingDoubleKeyFrame>
+        </DoubleAnimationUsingKeyFrames>
+        <DoubleAnimationUsingKeyFrames Storyboard.TargetName="BarInt" Storyboard.TargetProperty="Value">
+          <EasingDoubleKeyFrame KeyTime="0:0:0.4" Value="{Binding Value, ElementName=StatInt}">
+            <EasingDoubleKeyFrame.EasingFunction>
+              <CubicEase EasingMode="EaseOut"/>
+            </EasingDoubleKeyFrame.EasingFunction>
+          </EasingDoubleKeyFrame>
+        </DoubleAnimationUsingKeyFrames>
+        <DoubleAnimationUsingKeyFrames Storyboard.TargetName="BarCha" Storyboard.TargetProperty="Value">
+          <EasingDoubleKeyFrame KeyTime="0:0:0.4" Value="{Binding Value, ElementName=StatCha}">
+            <EasingDoubleKeyFrame.EasingFunction>
+              <CubicEase EasingMode="EaseOut"/>
+            </EasingDoubleKeyFrame.EasingFunction>
+          </EasingDoubleKeyFrame>
+        </DoubleAnimationUsingKeyFrames>
+      </Storyboard>
+
+      <Storyboard x:Key="UserControl.Anim.Str.ValueChanged">
+        <DoubleAnimationUsingKeyFrames Storyboard.TargetName="BarStr" Storyboard.TargetProperty="Value">
+          <EasingDoubleKeyFrame KeyTime="0:0:0.2" Value="{Binding Value, ElementName=StatStr}">
+            <EasingDoubleKeyFrame.EasingFunction>
+              <QuadraticEase EasingMode="EaseOut"/>
+            </EasingDoubleKeyFrame.EasingFunction>
+          </EasingDoubleKeyFrame>
+        </DoubleAnimationUsingKeyFrames>
+        <DoubleAnimationUsingKeyFrames Storyboard.TargetName="BarStr" Storyboard.TargetProperty="Effect.BlurRadius">
+          <EasingDoubleKeyFrame KeyTime="0:0:0.1" Value="15">
+            <EasingDoubleKeyFrame.EasingFunction>
+              <QuadraticEase EasingMode="EaseOut"/>
+            </EasingDoubleKeyFrame.EasingFunction>
+          </EasingDoubleKeyFrame>
+          <EasingDoubleKeyFrame KeyTime="0:0:0.6" Value="0">
+            <EasingDoubleKeyFrame.EasingFunction>
+              <CubicEase EasingMode="EaseOut"/>
+            </EasingDoubleKeyFrame.EasingFunction>
+          </EasingDoubleKeyFrame>
+        </DoubleAnimationUsingKeyFrames>
+        <DoubleAnimationUsingKeyFrames Storyboard.TargetName="BarStr" Storyboard.TargetProperty="Effect.Opacity">
+          <EasingDoubleKeyFrame KeyTime="0:0:0.1" Value="0.6">
+            <EasingDoubleKeyFrame.EasingFunction>
+              <QuadraticEase EasingMode="EaseOut"/>
+            </EasingDoubleKeyFrame.EasingFunction>
+          </EasingDoubleKeyFrame>
+          <EasingDoubleKeyFrame KeyTime="0:0:0.3" Value="0.6"/>
+          <EasingDoubleKeyFrame KeyTime="0:0:0.6" Value="0">
+            <EasingDoubleKeyFrame.EasingFunction>
+              <CubicEase EasingMode="EaseOut"/>
+            </EasingDoubleKeyFrame.EasingFunction>
+          </EasingDoubleKeyFrame>
+        </DoubleAnimationUsingKeyFrames>
+      </Storyboard>
+
+      <Storyboard x:Key="UserControl.Anim.Agi.ValueChanged">
+        <DoubleAnimationUsingKeyFrames Storyboard.TargetName="BarAgi" Storyboard.TargetProperty="Value">
+          <EasingDoubleKeyFrame KeyTime="0:0:0.2" Value="{Binding Value, ElementName=StatAgi}">
+            <EasingDoubleKeyFrame.EasingFunction>
+              <QuadraticEase EasingMode="EaseOut"/>
+            </EasingDoubleKeyFrame.EasingFunction>
+          </EasingDoubleKeyFrame>
+        </DoubleAnimationUsingKeyFrames>
+        <DoubleAnimationUsingKeyFrames Storyboard.TargetName="BarAgi" Storyboard.TargetProperty="Effect.BlurRadius">
+          <EasingDoubleKeyFrame KeyTime="0:0:0.1" Value="15">
+            <EasingDoubleKeyFrame.EasingFunction>
+              <QuadraticEase EasingMode="EaseOut"/>
+            </EasingDoubleKeyFrame.EasingFunction>
+          </EasingDoubleKeyFrame>
+          <EasingDoubleKeyFrame KeyTime="0:0:0.6" Value="0">
+            <EasingDoubleKeyFrame.EasingFunction>
+              <CubicEase EasingMode="EaseOut"/>
+            </EasingDoubleKeyFrame.EasingFunction>
+          </EasingDoubleKeyFrame>
+        </DoubleAnimationUsingKeyFrames>
+        <DoubleAnimationUsingKeyFrames Storyboard.TargetName="BarAgi" Storyboard.TargetProperty="Effect.Opacity">
+          <EasingDoubleKeyFrame KeyTime="0:0:0.1" Value="0.6">
+            <EasingDoubleKeyFrame.EasingFunction>
+              <QuadraticEase EasingMode="EaseOut"/>
+            </EasingDoubleKeyFrame.EasingFunction>
+          </EasingDoubleKeyFrame>
+          <EasingDoubleKeyFrame KeyTime="0:0:0.3" Value="0.6"/>
+          <EasingDoubleKeyFrame KeyTime="0:0:0.6" Value="0">
+            <EasingDoubleKeyFrame.EasingFunction>
+              <CubicEase EasingMode="EaseOut"/>
+            </EasingDoubleKeyFrame.EasingFunction>
+          </EasingDoubleKeyFrame>
+        </DoubleAnimationUsingKeyFrames>
+      </Storyboard>
+
+      <Storyboard x:Key="UserControl.Anim.Int.ValueChanged">
+        <DoubleAnimationUsingKeyFrames Storyboard.TargetName="BarInt" Storyboard.TargetProperty="Value">
+          <EasingDoubleKeyFrame KeyTime="0:0:0.2" Value="{Binding Value, ElementName=StatInt}">
+            <EasingDoubleKeyFrame.EasingFunction>
+              <QuadraticEase EasingMode="EaseOut"/>
+            </EasingDoubleKeyFrame.EasingFunction>
+          </EasingDoubleKeyFrame>
+        </DoubleAnimationUsingKeyFrames>
+        <DoubleAnimationUsingKeyFrames Storyboard.TargetName="BarInt" Storyboard.TargetProperty="Effect.BlurRadius">
+          <EasingDoubleKeyFrame KeyTime="0:0:0.1" Value="15">
+            <EasingDoubleKeyFrame.EasingFunction>
+              <QuadraticEase EasingMode="EaseOut"/>
+            </EasingDoubleKeyFrame.EasingFunction>
+          </EasingDoubleKeyFrame>
+          <EasingDoubleKeyFrame KeyTime="0:0:0.6" Value="0">
+            <EasingDoubleKeyFrame.EasingFunction>
+              <CubicEase EasingMode="EaseOut"/>
+            </EasingDoubleKeyFrame.EasingFunction>
+          </EasingDoubleKeyFrame>
+        </DoubleAnimationUsingKeyFrames>
+        <DoubleAnimationUsingKeyFrames Storyboard.TargetName="BarInt" Storyboard.TargetProperty="Effect.Opacity">
+          <EasingDoubleKeyFrame KeyTime="0:0:0.1" Value="0.6">
+            <EasingDoubleKeyFrame.EasingFunction>
+              <QuadraticEase EasingMode="EaseOut"/>
+            </EasingDoubleKeyFrame.EasingFunction>
+          </EasingDoubleKeyFrame>
+          <EasingDoubleKeyFrame KeyTime="0:0:0.3" Value="0.6"/>
+          <EasingDoubleKeyFrame KeyTime="0:0:0.6" Value="0">
+            <EasingDoubleKeyFrame.EasingFunction>
+              <CubicEase EasingMode="EaseOut"/>
+            </EasingDoubleKeyFrame.EasingFunction>
+          </EasingDoubleKeyFrame>
+        </DoubleAnimationUsingKeyFrames>
+      </Storyboard>
+
+      <Storyboard x:Key="UserControl.Anim.Cha.ValueChanged">
+        <DoubleAnimationUsingKeyFrames Storyboard.TargetName="BarCha" Storyboard.TargetProperty="Value">
+          <EasingDoubleKeyFrame KeyTime="0:0:0.2" Value="{Binding Value, ElementName=StatCha}">
+            <EasingDoubleKeyFrame.EasingFunction>
+              <QuadraticEase EasingMode="EaseOut"/>
+            </EasingDoubleKeyFrame.EasingFunction>
+          </EasingDoubleKeyFrame>
+        </DoubleAnimationUsingKeyFrames>
+        <DoubleAnimationUsingKeyFrames Storyboard.TargetName="BarCha" Storyboard.TargetProperty="Effect.BlurRadius">
+          <EasingDoubleKeyFrame KeyTime="0:0:0.1" Value="15">
+            <EasingDoubleKeyFrame.EasingFunction>
+              <QuadraticEase EasingMode="EaseOut"/>
+            </EasingDoubleKeyFrame.EasingFunction>
+          </EasingDoubleKeyFrame>
+          <EasingDoubleKeyFrame KeyTime="0:0:0.6" Value="0">
+            <EasingDoubleKeyFrame.EasingFunction>
+              <CubicEase EasingMode="EaseOut"/>
+            </EasingDoubleKeyFrame.EasingFunction>
+          </EasingDoubleKeyFrame>
+        </DoubleAnimationUsingKeyFrames>
+        <DoubleAnimationUsingKeyFrames Storyboard.TargetName="BarCha" Storyboard.TargetProperty="Effect.Opacity">
+          <EasingDoubleKeyFrame KeyTime="0:0:0.1" Value="0.6">
+            <EasingDoubleKeyFrame.EasingFunction>
+              <QuadraticEase EasingMode="EaseOut"/>
+            </EasingDoubleKeyFrame.EasingFunction>
+          </EasingDoubleKeyFrame>
+          <EasingDoubleKeyFrame KeyTime="0:0:0.3" Value="0.6"/>
+          <EasingDoubleKeyFrame KeyTime="0:0:0.6" Value="0">
+            <EasingDoubleKeyFrame.EasingFunction>
+              <CubicEase EasingMode="EaseOut"/>
+            </EasingDoubleKeyFrame.EasingFunction>
+          </EasingDoubleKeyFrame>
+        </DoubleAnimationUsingKeyFrames>
+      </Storyboard>
+    </ResourceDictionary>
+  </Page.Resources>
+
+  <Page.Background>
+    <RadialGradientBrush GradientOrigin="0.25,0.2" RadiusY="1" RadiusX="1" Center="0.25,0.2">
+      <GradientStop Offset="0.0" Color="#FF207F7F"/>
+      <GradientStop Offset="0.3" Color="#FF124D7A"/>
+      <GradientStop Offset="0.8" Color="#FF0C3452"/>
+      <GradientStop Offset="1.0" Color="#FF0B2D47"/>
+    </RadialGradientBrush>
+  </Page.Background>
+
+  <Viewbox>
+    <Border Background="#E50A263D" BorderThickness="1" CornerRadius="8" Margin="50" Padding="40" Width="500">
+      <Border.BorderBrush>
+        <LinearGradientBrush StartPoint="0,0" EndPoint="0,1">
+          <GradientStop Offset="0.0" Color="#FF154A6B"/>
+          <GradientStop Offset="1.0" Color="#FF103952"/>
+        </LinearGradientBrush>
+      </Border.BorderBrush>
+
+      <Border.Effect>
+        <DropShadowEffect Color="#000000" BlurRadius="40" ShadowDepth="15" Opacity="0.3"/>
+      </Border.Effect>
+
+      <b:Interaction.Triggers>
+        <b:EventTrigger x:Name="OnPageLoaded" EventName="Loaded">
+          <b:ControlStoryboardAction Storyboard="{StaticResource UserControl.Anim.Loaded}"/>
+        </b:EventTrigger>
+      </b:Interaction.Triggers>
+
+      <StackPanel>
+        <TextBlock Text="CUSTOMIZE ATTRIBUTES" FontSize="28" FontWeight="Bold" Foreground="#FFFFFF" HorizontalAlignment="Center" Margin="0,0,0,5"/>
+        <TextBlock Text="Distribute your starting skill points" FontSize="14" Foreground="#8A95A5" HorizontalAlignment="Center" Margin="0,0,0,20"/>
+
+        <Border Background="#FF061B2B" BorderBrush="#FF087599" BorderThickness="1" CornerRadius="6" Width="200" HorizontalAlignment="Center" Margin="0,0,0,30" Padding="10">
+          <StackPanel Orientation="Horizontal">
+            <TextBlock Text="POINTS AVAILABLE:" FontSize="16" FontWeight="Bold" Foreground="#8A95A5" VerticalAlignment="Center" Margin="14,0,10,0"/>
+            <TextBlock FontSize="22" FontWeight="Bold" VerticalAlignment="Center">
+              <TextBlock.Text>
+                <MultiBinding>
+                  <MultiBinding.Converter>
+                    <noesis:MathConverter Expression="50 - ({0} + {1} + {2} + {3})"/>
+                  </MultiBinding.Converter>
+                  <Binding Path="Value" ElementName="StatStr"/>
+                  <Binding Path="Value" ElementName="StatAgi"/>
+                  <Binding Path="Value" ElementName="StatInt"/>
+                  <Binding Path="Value" ElementName="StatCha"/>
+                </MultiBinding>
+              </TextBlock.Text>
+            </TextBlock>
+          </StackPanel>
+        </Border>
+
+        <Grid>
+          <Grid.ColumnDefinitions>
+            <ColumnDefinition Width="105"/>
+            <ColumnDefinition Width="85"/>
+            <ColumnDefinition Width="1*"/>
+          </Grid.ColumnDefinitions>
+          <Grid.RowDefinitions>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
+          </Grid.RowDefinitions>
+
+          <TextBlock Text="STRENGTH" FontSize="16" FontWeight="Bold" Foreground="#FF5E5E" VerticalAlignment="Center" Grid.Row="0" Grid.Column="0"/>
+
+          <local:NumericUpDown x:Name="StatStr" MinValue="3" Value="10" Grid.Row="0" Grid.Column="1" Margin="0,10">
+            <local:NumericUpDown.MaxValue>
+              <MultiBinding>
+                <MultiBinding.Converter>
+                  <noesis:MathConverter Expression="min(20, 50 - ({0} + {1} + {2}))"/>
+                </MultiBinding.Converter>
+                <Binding Path="Value" ElementName="StatAgi"/>
+                <Binding Path="Value" ElementName="StatInt"/>
+                <Binding Path="Value" ElementName="StatCha"/>
+              </MultiBinding>
+            </local:NumericUpDown.MaxValue>
+            <b:Interaction.Triggers>
+              <b:EventTrigger x:Name="OnStrValueChanged" EventName="ValueChanged">
+                <b:ControlStoryboardAction ControlStoryboardOption="Play" Storyboard="{StaticResource UserControl.Anim.Str.ValueChanged}"/>
+              </b:EventTrigger>
+            </b:Interaction.Triggers>
+          </local:NumericUpDown>
+
+          <ProgressBar x:Name="BarStr" Foreground="#FF5E5E" Grid.Row="0" Grid.Column="2" Style="{StaticResource UserControl.Style.Progress}">
+            <ProgressBar.Effect>
+              <DropShadowEffect Color="#FF5E5E" BlurRadius="0" ShadowDepth="0" Opacity="0"/>
+            </ProgressBar.Effect>
+          </ProgressBar>
+
+          <TextBlock Text="AGILITY" FontSize="16" FontWeight="Bold" Foreground="#42E596" VerticalAlignment="Center" Grid.Row="1" Grid.Column="0"/>
+
+          <local:NumericUpDown x:Name="StatAgi" MinValue="3" Value="14" Grid.Row="1" Grid.Column="1" Margin="0,10">
+            <local:NumericUpDown.MaxValue>
+              <MultiBinding>
+                <MultiBinding.Converter>
+                  <noesis:MathConverter Expression="min(20, 50 - ({0} + {1} + {2}))"/>
+                </MultiBinding.Converter>
+                <Binding Path="Value" ElementName="StatStr"/>
+                <Binding Path="Value" ElementName="StatInt"/>
+                <Binding Path="Value" ElementName="StatCha"/>
+              </MultiBinding>
+            </local:NumericUpDown.MaxValue>
+            <b:Interaction.Triggers>
+              <b:EventTrigger x:Name="OnAgiValueChanged" EventName="ValueChanged">
+                <b:ControlStoryboardAction ControlStoryboardOption="Play" Storyboard="{StaticResource UserControl.Anim.Agi.ValueChanged}"/>
+              </b:EventTrigger>
+            </b:Interaction.Triggers>
+          </local:NumericUpDown>
+
+          <ProgressBar x:Name="BarAgi" Foreground="#42E596" Grid.Row="1" Grid.Column="2" Style="{StaticResource UserControl.Style.Progress}">
+            <ProgressBar.Effect>
+              <DropShadowEffect Color="#42E596" BlurRadius="0" ShadowDepth="0" Opacity="0"/>
+            </ProgressBar.Effect>
+          </ProgressBar>
+
+          <TextBlock Text="INTELLIGENCE" FontSize="16" FontWeight="Bold" Foreground="#4DB4FF" VerticalAlignment="Center" Grid.Row="2" Grid.Column="0"/>
+
+          <local:NumericUpDown x:Name="StatInt" MinValue="3" Value="8" Grid.Row="2" Grid.Column="1" Margin="0,10">
+            <local:NumericUpDown.MaxValue>
+              <MultiBinding>
+                <MultiBinding.Converter>
+                  <noesis:MathConverter Expression="min(20, 50 - ({0} + {1} + {2}))"/>
+                </MultiBinding.Converter>
+                <Binding Path="Value" ElementName="StatStr"/>
+                <Binding Path="Value" ElementName="StatAgi"/>
+                <Binding Path="Value" ElementName="StatCha"/>
+              </MultiBinding>
+            </local:NumericUpDown.MaxValue>
+            <b:Interaction.Triggers>
+              <b:EventTrigger x:Name="OnIntValueChanged" EventName="ValueChanged">
+                <b:ControlStoryboardAction ControlStoryboardOption="Play" Storyboard="{StaticResource UserControl.Anim.Int.ValueChanged}"/>
+              </b:EventTrigger>
+            </b:Interaction.Triggers>
+          </local:NumericUpDown>
+
+          <ProgressBar x:Name="BarInt" Foreground="#4DB4FF" Grid.Row="2" Grid.Column="2" Style="{StaticResource UserControl.Style.Progress}">
+            <ProgressBar.Effect>
+              <DropShadowEffect Color="#4DB4FF" BlurRadius="0" ShadowDepth="0" Opacity="0"/>
+            </ProgressBar.Effect>
+          </ProgressBar>
+
+          <TextBlock Text="CHARISMA" FontSize="16" FontWeight="Bold" Foreground="#FFB84D" VerticalAlignment="Center" Grid.Row="3" Grid.Column="0"/>
+
+          <local:NumericUpDown x:Name="StatCha" MinValue="3" Value="12" Grid.Row="3" Grid.Column="1" Margin="0,10">
+            <local:NumericUpDown.MaxValue>
+              <MultiBinding>
+                <MultiBinding.Converter>
+                  <noesis:MathConverter Expression="min(20, 50 - ({0} + {1} + {2}))"/>
+                </MultiBinding.Converter>
+                <Binding Path="Value" ElementName="StatStr"/>
+                <Binding Path="Value" ElementName="StatAgi"/>
+                <Binding Path="Value" ElementName="StatInt"/>
+              </MultiBinding>
+            </local:NumericUpDown.MaxValue>
+            <b:Interaction.Triggers>
+              <b:EventTrigger x:Name="OnChaValueChanged" EventName="ValueChanged">
+                <b:ControlStoryboardAction ControlStoryboardOption="Play" Storyboard="{StaticResource UserControl.Anim.Cha.ValueChanged}"/>
+              </b:EventTrigger>
+            </b:Interaction.Triggers>
+          </local:NumericUpDown>
+
+          <ProgressBar x:Name="BarCha" Foreground="#FFB84D" Grid.Row="3" Grid.Column="2" Style="{StaticResource UserControl.Style.Progress}">
+            <ProgressBar.Effect>
+              <DropShadowEffect Color="#FFB84D" BlurRadius="0" ShadowDepth="0" Opacity="0"/>
+            </ProgressBar.Effect>
+          </ProgressBar>
+
+        </Grid>
+      </StackPanel>
+    </Border>
+  </Viewbox>
+</Page>

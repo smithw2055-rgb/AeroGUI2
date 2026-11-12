@@ -1,0 +1,5 @@
+<Enum Name="Platform" Namespace="Inventory">
+  <Item Name="PC" Value="0"/>
+  <Item Name="XBOX" Value="1"/>
+  <Item Name="PS4" Value="2"/>
+</Enum>

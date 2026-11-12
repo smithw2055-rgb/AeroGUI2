@@ -1,0 +1,3 @@
+<vdctx:Quest xmlns:vdctx="clr-namespace:QuestLog"
+             Title="Legacy of the Past" Image="studio:///QuestLog;component/Images/Image1.png" Completed="True" Description="&quot;I think he said he hid it in a tall tree east of the River Falls in the Autumn Valley. Beware of the Necromancer!&quot;" Difficulty="Normal">
+</vdctx:Quest>

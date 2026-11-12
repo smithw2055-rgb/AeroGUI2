@@ -1,0 +1,5 @@
+<Project>
+  <Assembly>HelloWorld</Assembly>
+  <DefaultDataNamespace>HelloWorld</DefaultDataNamespace>
+  <StartupDocument>MainPage.xaml</StartupDocument>
+</Project>

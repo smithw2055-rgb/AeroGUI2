@@ -46,6 +46,8 @@ enum class UIEffectKind : std::uint8_t {
     None = 0,
     Blur = 1,
     DropShadow = 2,
+    Pixelate = 3,
+    BackdropBlur = 4,
 };
 
 enum class PointerButton : std::uint8_t {
@@ -77,6 +79,20 @@ enum KeyModifierFlags : std::uint8_t {
     KeyMod_Shift = 1u << 0u,
     KeyMod_Ctrl = 1u << 1u,
     KeyMod_Alt = 1u << 2u,
+};
+
+enum class TextAlignment : std::uint8_t {
+    Left = 0,
+    Center = 1,
+    Right = 2,
+    Justify = 3,
+};
+
+enum class BlendingMode : std::uint8_t {
+    Normal = 0,
+    Multiply = 1,
+    Screen = 2,
+    Additive = 3,
 };
 
 enum class FocusDirection : std::uint8_t {
@@ -252,6 +268,14 @@ enum BuiltinPropertyId : std::uint16_t {
     PropId_AnimTranslate3DZ = 143,          // float px (3D Z translation channel)
     PropId_EffectBlurRadius = 144,          // float px (bindable/animatable BlurRadius / Radius override)
     PropId_EffectShadowDepth = 145,         // float px (bindable/animatable ShadowDepth override)
+    PropId_BackgroundOpacity = 146,         // float [0..1] (Brush.Opacity on Background / Shape.Fill)
+    PropId_BorderOpacity = 147,             // float [0..1] (Brush.Opacity on BorderBrush / Shape.Stroke)
+    PropId_TextAlignment = 148,             // Int64 / TextAlignment enum (0=Left, 1=Center, 2=Right, 3=Justify)
+    PropId_BlendingMode = 149,              // Int64 / BlendingMode enum (0=Normal, 1=Multiply, 2=Screen, 3=Additive)
+    PropId_RichText = 150,                  // StringValue (noesis:RichText.Text BBCode string)
+    PropId_RefResolution = 151,             // Float4Value{refWidth, refHeight, 0, 0} (LayoutScaler.RefResolution)
+    PropId_CustomIndexInt32 = 152,          // Int64 (Custom.Index_Int32 attached integer property)
+    PropId_CustomStateInt32 = 153,          // Int64 (Custom.State_Int32 attached integer property)
     PropId_FirstContractInput = 0x1000u,    // Dynamic/Contract input bridge slot range [0x1000 .. 0x1FFFu]
     // Pseudo-property IDs for zero-allocation inline interactive Trigger conditions
     PropId_TriggerIsMouseOver = 0xFF01u,

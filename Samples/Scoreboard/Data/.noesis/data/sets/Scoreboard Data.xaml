@@ -1,0 +1,25 @@
+<vdctx:ScoreboardViewModel xmlns:vdctx="clr-namespace:Scoreboard" ElapsedTime="38" HordeScore="8442" xmlns:system="clr-namespace:System;assembly=mscorlib" Name="Silvershard Mines" AllianceScore="9127">
+  <vdctx:ScoreboardViewModel.VisibleTeams>
+    <system:String>Overall</system:String>
+    <system:String>Alliance</system:String>
+    <system:String>Horde</system:String>
+  </vdctx:ScoreboardViewModel.VisibleTeams>
+  <vdctx:ScoreboardViewModel.Players>
+    <vdctx:Player Team="Alliance" Class="Fighter" Name="Tincidunt" Score="939" Kills="99" Deaths="72" Damage="3877" Heal="336"/>
+    <vdctx:Player Team="Horde" Class="Fighter" Kills="5" Deaths="86" Damage="6869" Heal="391" Score="863" Name="Rhoncus Mattis"/>
+    <vdctx:Player Team="Alliance" Class="Mage" Kills="59" Deaths="17" Damage="9169" Heal="10" Score="792" Name="Gavida"/>
+    <vdctx:Player Team="Alliance" Class="Cleric" Kills="70" Deaths="70" Damage="8711" Heal="241" Score="715" Name="Hendrerit"/>
+    <vdctx:Player Class="Hunter" Name="Adipiscing" Kills="6" Deaths="60" Damage="6870" Heal="940" Score="641" Team="Horde"/>
+    <vdctx:Player Team="Horde" Class="Mage" Kills="20" Deaths="61" Damage="6149" Heal="82" Score="628" Name="Urna Cursus"/>
+    <vdctx:Player Team="Alliance" Class="Fighter" Score="611" Kills="35" Deaths="55" Damage="9032" Heal="969" Name="Quam Nulla"/>
+    <vdctx:Player Team="Horde" Class="Mage" Kills="45" Deaths="74" Damage="9456" Heal="21" Score="587" Name="Faucibus"/>
+    <vdctx:Player Class="Rogue" Name="Lobortis" Score="545" Kills="26" Deaths="70" Damage="4729" Heal="832" Team="Alliance"/>
+    <vdctx:Player Team="Horde" Class="Rogue" Kills="18" Deaths="9" Damage="1673" Heal="243" Score="481" Name="Elitadi"/>
+    <vdctx:Player Team="Alliance" Class="Fighter" Kills="28" Deaths="13" Damage="1836" Heal="373" Score="479" Name="Handolor"/>
+    <vdctx:Player Team="Alliance" Class="Hunter" Kills="90" Deaths="97" Damage="1559" Heal="824" Score="392" Name="Blandit Volutpat"/>
+    <vdctx:Player Team="Horde" Class="Rogue" Kills="28" Deaths="21" Damage="9935" Heal="532" Score="358" Name="Dreritida"/>
+    <vdctx:Player Class="Cleric" Name="Amet" Kills="52" Deaths="89" Damage="8346" Heal="826" Score="312" Team="Horde"/>
+    <vdctx:Player Class="Rogue" Kills="86" Deaths="37" Damage="1249" Heal="572" Score="307" Team="Alliance" Name="Laboret"/>
+    <vdctx:Player Team="Horde" Class="Rogue" Name="Odio" Kills="29" Deaths="53" Damage="8802" Heal="494" Score="298"/>
+  </vdctx:ScoreboardViewModel.Players>
+</vdctx:ScoreboardViewModel>

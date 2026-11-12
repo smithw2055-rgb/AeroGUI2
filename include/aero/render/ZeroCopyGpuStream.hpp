@@ -33,6 +33,7 @@ struct GpuClipDrawBatch {
     std::uint32_t pageCount = 0;
     std::uint32_t vertexCount = 0;
     std::uint32_t textureId = 0; // 0 = default font/UI Skyline atlas, >0 = standalone texture handle
+    BlendingMode blendMode = BlendingMode::Normal;
     bool scissorActive = false;
     Rect scissorRect{0.0f, 0.0f, 16384.0f, 16384.0f};
 };
@@ -91,6 +92,35 @@ public:
         std::uint32_t viewportHeight,
         std::vector<std::uint8_t>& outRgba8,
         Color clearColor = Color{0.06f, 0.08f, 0.11f, 1.0f});
+
+    // Rasterize a Blur / Pixelate node span into a tight premultiplied RGBA8 patch for GPU composition.
+    static bool RasterizeBlurSpanPatchPremulRgba8(
+        const PagedRenderTree& tree,
+        const BlurLayerSpan& span,
+        std::size_t& ioBlurCursor,
+        std::uint32_t viewportWidth,
+        std::uint32_t viewportHeight,
+        int& outPatchX,
+        int& outPatchY,
+        int& outPatchW,
+        int& outPatchH,
+        std::vector<std::uint8_t>& outPremulRgba8);
+
+    // Blur a top-down RGBA8 backdrop readback sub-rect and mask it into a tight premultiplied RGBA8 patch.
+    static bool ComputeBackdropBlurPatchPremulRgba8(
+        const BlurLayerSpan& span,
+        std::uint32_t viewportWidth,
+        std::uint32_t viewportHeight,
+        int readX,
+        int readY,
+        int readW,
+        int readH,
+        const std::uint8_t* topDownReadbackRgba8,
+        int& outPatchX,
+        int& outPatchY,
+        int& outPatchW,
+        int& outPatchH,
+        std::vector<std::uint8_t>& outPremulRgba8);
 
     // Built-in unified UberShader sources (Desktop GL 3.3, WebGL2 #version 300 es, WebGPU WGSL)
     [[nodiscard]] static std::string_view UberVertexShaderSource(ShaderBackend backend) noexcept;

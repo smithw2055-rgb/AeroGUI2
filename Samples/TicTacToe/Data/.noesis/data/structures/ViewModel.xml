@@ -1,0 +1,17 @@
+<Class Name="ViewModel">
+  <Property Name="StartCommand" Type="Command"/>
+  <Property Name="CheckCommand" Type="Command"/>
+  <Property Name="State" Type="Enum" SubType="TicTacToe.State"/>
+  <Property Name="ScorePlayer1" Type="Number" NumberMinValue="0" NumberMaxValue="10" NumberDecimalCount="0"/>
+  <Property Name="ScorePlayer2" Type="Number" NumberMinValue="0" NumberMaxValue="10" NumberDecimalCount="0"/>
+  <Property Name="ScoreTies" Type="Number" NumberMinValue="0" NumberMaxValue="10" NumberDecimalCount="0"/>
+  <Property Name="Cell0" Type="Number" NumberMinValue="0" NumberMaxValue="2" NumberDecimalCount="0"/>
+  <Property Name="Cell1" Type="Number" NumberMinValue="0" NumberMaxValue="2" NumberDecimalCount="0"/>
+  <Property Name="Cell2" Type="Number" NumberMinValue="0" NumberMaxValue="2" NumberDecimalCount="0"/>
+  <Property Name="Cell3" Type="Number" NumberMinValue="0" NumberMaxValue="2" NumberDecimalCount="0"/>
+  <Property Name="Cell4" Type="Number" NumberMinValue="0" NumberMaxValue="2" NumberDecimalCount="0"/>
+  <Property Name="Cell5" Type="Number" NumberMinValue="0" NumberMaxValue="2" NumberDecimalCount="0"/>
+  <Property Name="Cell6" Type="Number" NumberMinValue="0" NumberMaxValue="2" NumberDecimalCount="0"/>
+  <Property Name="Cell7" Type="Number" NumberMinValue="0" NumberMaxValue="2" NumberDecimalCount="0"/>
+  <Property Name="Cell8" Type="Number" NumberMinValue="0" NumberMaxValue="2" NumberDecimalCount="0"/>
+</Class>

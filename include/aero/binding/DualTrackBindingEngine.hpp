@@ -18,6 +18,13 @@ namespace aero {
 
 class AnimationEngine;
 
+struct ObservedIndexedArray {
+    ObjectRef arrayRef{};
+    ObjectRef wrapperRef{};
+    std::size_t hopIndex = 0;
+    std::uint64_t lastSeenVersion = 0;
+};
+
 struct ReactiveBindingInstance {
     std::uint16_t bindingSlotId = 0;
     std::string rawPath;
@@ -32,6 +39,7 @@ struct ReactiveBindingInstance {
     UnifiedValue fallbackValue{};
     std::vector<AxbCompiledHop> hops;
     std::vector<ObjectRef> resolvedHopObjects;
+    std::vector<ObservedIndexedArray> indexedArrays;
     IntrusivePtr<UIElement> targetElement{};
     std::uint16_t targetPropertyId = 0;
     ObjectRef syncedCollectionRef{};
@@ -58,6 +66,9 @@ struct ElementPropertyBindingInstance {
     std::uint16_t sourcePropertyId = 0;
     std::uint16_t targetPropertyId = 0;
     UIElement* cachedSourceElement = nullptr;
+    std::vector<AxbCompiledHop> subHops;
+    std::vector<ObjectRef> resolvedHopObjects;
+    std::vector<ObservedIndexedArray> indexedArrays;
     IntrusivePtr<UIElement> targetElement{};
     UnifiedValue fallbackValue{};
     UnifiedValue lastSyncedValue{};
@@ -78,6 +89,7 @@ struct MultiBindingSourceSlot {
     UIElement* cachedSourceElement = nullptr;
     std::vector<AxbCompiledHop> hops;
     std::vector<ObjectRef> resolvedHopObjects;
+    std::vector<ObservedIndexedArray> indexedArrays;
     ValueConverterKind converter = ValueConverterKind::None;
     std::string converterKey;
     std::string converterParameter;
@@ -238,9 +250,13 @@ public:
     // Detach a single binding instance by its bindingSlotId
     bool UnbindSlot(std::uint16_t bindingSlotId) noexcept;
 
+    // Register a RichText element containing inline [bind]...[/bind] tokens for reactive invalidation.
+    void RegisterRichTextDependent(const IntrusivePtr<UIElement>& targetElement);
+
     // Flush dirty [Observable] objects across SimHeap and UiHeap + MultiBindings + ElementName bindings,
     // re-connecting any intermediate hop whose reference changed, and writing terminal slots in O(1).
     std::size_t FlushTrackA(RuntimeError* error = nullptr);
+    std::size_t SyncDirtyBindings(RuntimeError* error = nullptr) { return FlushTrackA(error); }
 
     // Push a TwoWay-bound UIElement property change back to the terminal ViewModel slot
     // (or ElementName source property, or SimCommandEnvelope if marked [SimCommand]).
@@ -345,9 +361,16 @@ private:
     std::uint64_t lastObservedGcEpoch_ = 0;
     std::unordered_map<std::string, RegisteredConverterEntry> registeredConverters_;
     std::vector<CollectionChangeRecord> scratchCollectionDeltas_;
+    struct RichTextDependentEntry {
+        IntrusivePtr<UIElement> targetElement{};
+        ObjectRef observedDcRef{};
+        std::string lastResolvedText;
+    };
+
     std::vector<ReactiveBindingInstance> trackABindings_;
     std::vector<ElementPropertyBindingInstance> elementBindings_;
     std::vector<MultiBindingInstance> multiBindings_;
+    std::vector<RichTextDependentEntry> richTextDependents_;
     std::vector<EcsColumnBindingChannel> trackBChannels_;
 };
 

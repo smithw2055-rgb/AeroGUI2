@@ -1,0 +1,5 @@
+<Project>
+  <Assembly>BrushShaders</Assembly>
+  <DefaultDataNamespace>BrushShaders</DefaultDataNamespace>
+  <StartupDocument>MainPage.xaml</StartupDocument>
+</Project>

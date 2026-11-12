@@ -2534,6 +2534,7 @@ TextLayoutResult FontAtlas::MeasureLayout(
 
     struct TokenGlyph {
         std::uint32_t cp = 0u;
+        std::uint32_t sourceCodePointIndex = 0u;
         FontAtlasGlyph meta{};
         bool explicitNewline = false;
     };
@@ -2542,19 +2543,23 @@ TextLayoutResult FontAtlas::MeasureLayout(
     decoded.reserve(utf8Text.size());
     std::size_t cursor = 0u;
     std::uint32_t cp = 0u;
+    std::uint32_t rawCodePointIdx = 0u;
     while (DecodeNextUtf8CodePoint(utf8Text, cursor, cp)) {
+        const std::uint32_t curCpIdx = rawCodePointIdx++;
         if (cp == '\r') {
             continue;
         }
         if (cp == '\n') {
             TokenGlyph nl{};
             nl.cp = '\n';
+            nl.sourceCodePointIndex = curCpIdx;
             nl.explicitNewline = true;
             decoded.push_back(nl);
             continue;
         }
         TokenGlyph tg{};
         tg.cp = cp;
+        tg.sourceCodePointIndex = curCpIdx;
         tg.meta = EnsureGlyphLocked(fontEntry, cp);
         decoded.push_back(tg);
     }
@@ -2667,6 +2672,7 @@ TextLayoutResult FontAtlas::MeasureLayout(
         pg.codePoint = tg.cp;
         pg.glyphIndex = tg.meta.glyphIndex;
         pg.lineIndex = curLineIdx;
+        pg.sourceCodePointIndex = tg.sourceCodePointIndex;
         pg.penX = penStart;
         pg.baselineY = baselineY;
         pg.advanceX = advPx;

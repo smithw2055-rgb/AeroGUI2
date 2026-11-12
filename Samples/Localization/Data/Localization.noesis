@@ -1,0 +1,6 @@
+<Project>
+  <Assembly>Localization</Assembly>
+  <DefaultDataNamespace>Localization</DefaultDataNamespace>
+  <StartupDocument>MainPage.xaml</StartupDocument>
+  <GlobalResources>Resources.xaml</GlobalResources>
+</Project>

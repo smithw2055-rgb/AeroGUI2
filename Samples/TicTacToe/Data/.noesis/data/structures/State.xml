@@ -1,0 +1,14 @@
+<Enum Name="State">
+  <Item Name="None" Value="0"/>
+  <Item Name="Player1" Value="1"/>
+  <Item Name="Player2" Value="2"/>
+  <Item Name="Tie" Value="3"/>
+  <Item Name="WinRow0" Value="4"/>
+  <Item Name="WinRow1" Value="5"/>
+  <Item Name="WinRow2" Value="6"/>
+  <Item Name="WinCol0" Value="7"/>
+  <Item Name="WinCol1" Value="8"/>
+  <Item Name="WinCol2" Value="9"/>
+  <Item Name="WinDiag1" Value="10"/>
+  <Item Name="WinDiag2" Value="11"/>
+</Enum>

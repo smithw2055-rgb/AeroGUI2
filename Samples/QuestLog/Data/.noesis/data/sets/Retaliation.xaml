@@ -1,0 +1,3 @@
+<vdctx:Quest xmlns:vdctx="clr-namespace:QuestLog"
+             Image="studio:///QuestLog;component/Images/Image1.png" Title="Retaliation" Completed="True" Description="&quot;The goblins are among the most ancient and bitter rivals of the Dwarven brethen, and yet again we should clash.&quot;" Difficulty="Hard">
+</vdctx:Quest>

@@ -711,14 +711,26 @@ std::uint16_t AnimationEngine::StartTimeline(
         tr.keyFrameCount = static_cast<std::uint8_t>(kfCount);
         for (std::size_t i = 0u; i < kfCount; ++i) {
             const auto& srcKf = timeline.keyFrames[i];
+            UnifiedValue kfVal = srcKf.value;
+            if (!srcKf.bindingElementName.empty() && srcKf.bindingPropId != 0xFFFFu) {
+                UIElement* bindSrc = scopeRoot->FindName(srcKf.bindingElementName);
+                if (!bindSrc) {
+                    UIElement* nsRoot = UIElement::FindNamescopeRoot(scopeRoot);
+                    if (nsRoot && nsRoot != scopeRoot) {
+                        bindSrc = nsRoot->FindName(srcKf.bindingElementName);
+                    }
+                }
+                if (bindSrc) {
+                    kfVal = bindSrc->GetValue(srcKf.bindingPropId);
+                }
+            }
             float dummyScalar = 0.0f;
             Float4Value dummyF4{};
             const bool isInterpolable =
-                srcKf.value.tryGetFloat4(dummyF4) ||
-                (!std::holds_alternative<bool>(srcKf.value) &&
-                 !std::holds_alternative<std::int64_t>(srcKf.value) &&
-                 TryGetFloat(srcKf.value, dummyScalar));
-            UnifiedValue kfVal = srcKf.value;
+                kfVal.tryGetFloat4(dummyF4) ||
+                (!std::holds_alternative<bool>(kfVal) &&
+                 !std::holds_alternative<std::int64_t>(kfVal) &&
+                 TryGetFloat(kfVal, dummyScalar));
             if (kfVal.isTraceable()) {
                 rs_rt::pinValueInPools(kfVal);
             }

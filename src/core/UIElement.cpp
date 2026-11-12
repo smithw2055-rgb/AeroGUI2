@@ -156,6 +156,8 @@ void DetachSubtreeRenderNodes(UIElement* elem) noexcept {
         case PropId_ExpandDirection:
         case PropId_TabStripPlacement:
         case PropId_ContentTemplate:
+        case PropId_RichText:
+        case PropId_RefResolution:
             return true;
         default:
             return false;
@@ -1315,6 +1317,8 @@ UIEffectDescriptor UIElement::GetEffectDescriptor() const noexcept {
             hasExplicitKind = true;
             if (*iv == 1) desc.kind = UIEffectKind::Blur;
             else if (*iv == 2) desc.kind = UIEffectKind::DropShadow;
+            else if (*iv == 3) desc.kind = UIEffectKind::Pixelate;
+            else if (*iv == 4) desc.kind = UIEffectKind::BackdropBlur;
             else desc.kind = UIEffectKind::None;
         }
     }
@@ -1338,7 +1342,8 @@ UIEffectDescriptor UIElement::GetEffectDescriptor() const noexcept {
         float br = desc.blurRadius;
         if (TryGetFloat(brEntry->effectiveValue, br)) {
             desc.blurRadius = std::max(0.0f, br);
-            if (!hasExplicitKind && desc.kind == UIEffectKind::None && desc.blurRadius > 0.0f) {
+            if (!hasExplicitKind && desc.kind == UIEffectKind::None && desc.blurRadius > 0.0f &&
+                !IsA<BoxShadow>()) {
                 desc.kind = UIEffectKind::Blur;
             }
         }
@@ -3041,7 +3046,8 @@ void UIElement::SyncTemplateBindingsForProperty(std::uint16_t changedPropId) noe
     }
 
     const bool isContentGroup =
-        (changedPropId == PropId_Content || changedPropId == PropId_Text || changedPropId == PropId_Title);
+        (changedPropId == PropId_Content || changedPropId == PropId_Text ||
+         changedPropId == PropId_Title || changedPropId == PropId_ContentTemplate);
 
     for (const auto& link : mountedTemplate_->bindings) {
         if (!link.target) {
@@ -3081,6 +3087,10 @@ void UIElement::SyncTemplateBindingsForProperty(std::uint16_t changedPropId) noe
             changedPropId == PropId_VerticalContentAlignment;
         for (const auto& cp : mountedTemplate_->contentPresenters) {
             if (!cp) continue;
+            if (changedPropId == PropId_Content || changedPropId == PropId_Text ||
+                changedPropId == PropId_ContentTemplate) {
+                cp->SyncContentTemplateChild();
+            }
             if (affectsMetrics) {
                 cp->InvalidateLayout();
             } else {
@@ -3282,6 +3292,29 @@ bool UIElement::ApplyControlTemplate(
         controlTemplate.templatePackage->instructions.empty()) {
         return false;
     }
+    // Skip unimplemented WPF presenter shells (ScrollContentPresenter / ItemsPresenter / Popup / Track)
+    // so ScrollViewer, ItemsControl/ListBox, ComboBox, and Track-based Sliders preserve live children & native rendering.
+    {
+        const auto& strs = controlTemplate.templatePackage->stringTable;
+        auto hasStr = [&](std::string_view needle) {
+            for (const auto& s : strs) {
+                if (s == needle) return true;
+            }
+            return false;
+        };
+        if (IsA<ScrollViewer>() && (hasStr("ScrollContentPresenter") || hasStr("PART_ScrollContentPresenter") || FirstChild() != nullptr)) {
+            return false;
+        }
+        if (IsA<ComboBox>() && (hasStr("Popup") || hasStr("PART_Popup") || hasStr("ItemsPresenter"))) {
+            return false;
+        }
+        if (IsA<ItemsControl>() && !IsA<ComboBox>() && (hasStr("ItemsPresenter") || hasStr("ScrollViewer"))) {
+            return false;
+        }
+        if (IsA<Slider>() && hasStr("Track") && !hasStr("PART_Indicator") && !hasStr("PART_Thumb")) {
+            return false;
+        }
+    }
 
     // Prevent infinite self-template recursion when a template contains a child of the same control type
     for (const UIElement* anc = templatedParent_; anc != nullptr; anc = anc->TemplatedParent()) {
@@ -3436,6 +3469,11 @@ bool UIElement::ApplyControlTemplate(
         }
         CollectTemplateTextBlocksRecursive(tplRoot.Get(), this, mountedTemplate_->inheritedTextNodes);
         RefreshAllTemplateBindings();
+        for (const auto& cp : mountedTemplate_->contentPresenters) {
+            if (cp) {
+                cp->SyncContentTemplateChild();
+            }
+        }
     }
 
     applyingControlTemplate_ = false;

@@ -19,6 +19,9 @@ TypeClass gStackPanelTypeClass{};
 TypeClass gDockPanelTypeClass{};
 TypeClass gWrapPanelTypeClass{};
 TypeClass gViewboxTypeClass{};
+TypeClass gLayoutScalerTypeClass{};
+TypeClass gLabelTypeClass{};
+TypeClass gBoxShadowTypeClass{};
 TypeClass gScrollViewerTypeClass{};
 TypeClass gGridTypeClass{};
 TypeClass gCanvasTypeClass{};
@@ -155,6 +158,9 @@ void EnsureControlTypesRegistered() noexcept {
     reg.RegisterType(gDockPanelTypeClass, "Aero.UI.DockPanel", panel);
     reg.RegisterType(gWrapPanelTypeClass, "Aero.UI.WrapPanel", panel);
     reg.RegisterType(gViewboxTypeClass, "Aero.UI.Viewbox", panel);
+    reg.RegisterType(gLayoutScalerTypeClass, "Aero.UI.LayoutScaler", &gViewboxTypeClass);
+    reg.RegisterType(gLabelTypeClass, "Aero.UI.Label", &gTextBlockTypeClass);
+    reg.RegisterType(gBoxShadowTypeClass, "Aero.UI.BoxShadow", &gBorderTypeClass);
     reg.RegisterType(gScrollViewerTypeClass, "Aero.UI.ScrollViewer", panel);
     reg.RegisterType(gGridTypeClass, "Aero.UI.Grid", panel);
     reg.RegisterType(gCanvasTypeClass, "Aero.UI.Canvas", panel);
@@ -206,6 +212,21 @@ const TypeClass* WrapPanel::StaticTypeClass() noexcept {
 const TypeClass* Viewbox::StaticTypeClass() noexcept {
     EnsureControlTypesRegistered();
     return &gViewboxTypeClass;
+}
+
+const TypeClass* LayoutScaler::StaticTypeClass() noexcept {
+    EnsureControlTypesRegistered();
+    return &gLayoutScalerTypeClass;
+}
+
+const TypeClass* Label::StaticTypeClass() noexcept {
+    EnsureControlTypesRegistered();
+    return &gLabelTypeClass;
+}
+
+const TypeClass* BoxShadow::StaticTypeClass() noexcept {
+    EnsureControlTypesRegistered();
+    return &gBoxShadowTypeClass;
 }
 
 const TypeClass* ScrollViewer::StaticTypeClass() noexcept {
@@ -1005,6 +1026,114 @@ void Viewbox::ArrangeCore(Rect finalRect) noexcept {
 }
 
 // ============================================================================
+// LayoutScaler (NoesisGUIExtensions reference-resolution proportional scaler)
+// ============================================================================
+
+LayoutScaler::LayoutScaler() {
+    EnsureControlTypesRegistered();
+}
+
+void LayoutScaler::SetRefResolution(Size refRes) {
+    SetValue(
+        PropId_RefResolution,
+        UnifiedValue{Float4Value{std::max(1.0f, refRes.width), std::max(1.0f, refRes.height), 0.0f, 0.0f}},
+        ValueSourceRank::Local);
+}
+
+Size LayoutScaler::GetRefResolution() const noexcept {
+    const UnifiedValue v = GetValue(PropId_RefResolution);
+    if (const auto* f4 = std::get_if<Float4Value>(&v)) {
+        if (f4->x >= 1.0f && f4->y >= 1.0f) {
+            return Size{f4->x, f4->y};
+        }
+    }
+    return Size{960.0f, 540.0f};
+}
+
+Size LayoutScaler::MeasureCore(Size availableSize) noexcept {
+    const Thickness p = GetPadding();
+    const float padW = p.left + p.right;
+    const float padH = p.top + p.bottom;
+    UIElement* child = FirstChild();
+    if (!child) {
+        return Size{padW, padH};
+    }
+    const Size refRes = GetRefResolution();
+    const bool hasW = std::isfinite(availableSize.width) && (availableSize.width < kUnconstrainedSpace * 0.5f);
+    const bool hasH = std::isfinite(availableSize.height) && (availableSize.height < kUnconstrainedSpace * 0.5f);
+    const float availW = hasW ? std::max(1.0f, availableSize.width - padW) : refRes.width;
+    const float availH = hasH ? std::max(1.0f, availableSize.height - padH) : refRes.height;
+    float scale = std::min(availW / std::max(1.0f, refRes.width), availH / std::max(1.0f, refRes.height));
+    if (!std::isfinite(scale) || scale <= 1e-4f) {
+        scale = 1.0f;
+    }
+    const Size childAvail{availW / scale, availH / scale};
+    for (UIElement* c = child; c != nullptr; c = c->NextSibling()) {
+        c->Measure(childAvail);
+    }
+    if (child->GetVisibility() == Visibility::Collapsed) {
+        return Size{padW, padH};
+    }
+    return Size{
+        hasW ? (availW + padW) : (child->DesiredSize().width * scale + padW),
+        hasH ? (availH + padH) : (child->DesiredSize().height * scale + padH)};
+}
+
+void LayoutScaler::ArrangeCore(Rect finalRect) noexcept {
+    const Thickness p = GetPadding();
+    const float startX = finalRect.x + p.left;
+    const float startY = finalRect.y + p.top;
+    const float innerW = std::max(0.0f, finalRect.width - (p.left + p.right));
+    const float innerH = std::max(0.0f, finalRect.height - (p.top + p.bottom));
+    UIElement* child = FirstChild();
+    if (!child || child->GetVisibility() == Visibility::Collapsed || innerW <= 0.0f || innerH <= 0.0f) {
+        const bool resetChanged =
+            (std::fabs(childScaleX_ - 1.0f) > 1e-5f) ||
+            (std::fabs(childScaleY_ - 1.0f) > 1e-5f) ||
+            (std::fabs(childOriginX_ - startX) > 1e-3f) ||
+            (std::fabs(childOriginY_ - startY) > 1e-3f);
+        childScaleX_ = 1.0f;
+        childScaleY_ = 1.0f;
+        childOriginX_ = startX;
+        childOriginY_ = startY;
+        for (UIElement* c = child; c != nullptr; c = c->NextSibling()) {
+            c->Arrange(Rect{startX, startY, 0.0f, 0.0f});
+        }
+        if (resetChanged) {
+            InvalidateRender();
+            for (UIElement* c = FirstChild(); c != nullptr; c = c->NextSibling()) {
+                MarkSubtreeRenderDirtyRecursive(c);
+            }
+        }
+        return;
+    }
+    const Size refRes = GetRefResolution();
+    float scale = std::min(innerW / std::max(1.0f, refRes.width), innerH / std::max(1.0f, refRes.height));
+    if (!std::isfinite(scale) || scale <= 1e-4f) {
+        scale = 1.0f;
+    }
+    const bool scaleChanged =
+        (std::fabs(childScaleX_ - scale) > 1e-5f) ||
+        (std::fabs(childScaleY_ - scale) > 1e-5f) ||
+        (std::fabs(childOriginX_ - startX) > 1e-3f) ||
+        (std::fabs(childOriginY_ - startY) > 1e-3f);
+    childScaleX_ = scale;
+    childScaleY_ = scale;
+    childOriginX_ = startX;
+    childOriginY_ = startY;
+    const Rect logicalSlot{startX, startY, innerW / scale, innerH / scale};
+    for (UIElement* c = child; c != nullptr; c = c->NextSibling()) {
+        c->Arrange(logicalSlot);
+    }
+    if (scaleChanged) {
+        InvalidateRender();
+        for (UIElement* c = FirstChild(); c != nullptr; c = c->NextSibling()) {
+            MarkSubtreeRenderDirtyRecursive(c);
+        }
+    }
+}
+
+// ============================================================================
 // ScrollViewer
 // ============================================================================
 
@@ -1705,9 +1834,483 @@ void Border::ArrangeCore(Rect finalRect) noexcept {
     UIElement::ArrangeCore(innerRect);
 }
 
+namespace {
+
+void SyncHostContentTemplateChildImpl(
+    UIElement* hostContainer,
+    const UIElement* contentSourceHost,
+    IntrusivePtr<UIElement>& trackedChild,
+    std::string& activeKey,
+    ObjectRef& activeObj,
+    bool& hasActiveObj,
+    bool& syncingGuard) {
+    if (!hostContainer || syncingGuard) {
+        return;
+    }
+    syncingGuard = true;
+
+    auto findEngines = [&](ExecutionDomainContext*& outDom,
+                           DualTrackBindingEngine*& outBind,
+                           StyleTriggerEngine*& outStyle,
+                           AnimationEngine*& outAnim,
+                           const Interpreter*& outInterp,
+                           ObjectRef& outRootWrapper) {
+        outDom = nullptr;
+        outBind = nullptr;
+        outStyle = nullptr;
+        outAnim = nullptr;
+        outInterp = nullptr;
+        outRootWrapper = ObjectRef{};
+        for (const UIElement* cur = hostContainer;
+             cur != nullptr;
+             cur = cur->Parent() ? cur->Parent() : cur->TemplatedParent()) {
+            if (!outBind && cur->BoundTwoWayEngine()) {
+                outBind = cur->BoundTwoWayEngine();
+            }
+            if (!outStyle && cur->BoundStyleEngine()) {
+                outStyle = cur->BoundStyleEngine();
+                if (!outBind && outStyle->GetBindingEngine()) {
+                    outBind = outStyle->GetBindingEngine();
+                }
+            }
+            if (!outAnim && cur->BoundAnimationEngine()) {
+                outAnim = cur->BoundAnimationEngine();
+            }
+            if (cur->BoundScriptWrapper().valid()) {
+                outRootWrapper = cur->BoundScriptWrapper();
+            }
+        }
+        if (outBind) {
+            outDom = &outBind->Domains();
+            outInterp = outBind->UiInterpreter();
+            if (!outAnim) {
+                outAnim = outBind->GetAnimationEngine();
+            }
+        }
+        if (!outAnim && outStyle) {
+            outAnim = outStyle->GetAnimationEngine();
+        }
+    };
+
+    auto clearTracked = [&]() {
+        if (!trackedChild) {
+            activeKey.clear();
+            activeObj = ObjectRef{};
+            hasActiveObj = false;
+            return;
+        }
+        ExecutionDomainContext* dom = nullptr;
+        DualTrackBindingEngine* bindEng = nullptr;
+        StyleTriggerEngine* styleEng = nullptr;
+        AnimationEngine* animEng = nullptr;
+        const Interpreter* interp = nullptr;
+        ObjectRef rootWrap{};
+        findEngines(dom, bindEng, styleEng, animEng, interp, rootWrap);
+        if (animEng) {
+            (void)animEng->StopSubtreeAnimations(trackedChild.Get(), false);
+        }
+        if (bindEng) {
+            (void)bindEng->UnbindSubtree(trackedChild.Get());
+        }
+        if (styleEng) {
+            (void)styleEng->UnbindSubtreeStyles(trackedChild.Get());
+        }
+        NativeHandleRegistry* reg = dom ? &dom->nativeHandles() : nullptr;
+        ManagedHeap* heap = dom ? &dom->uiHeap() : nullptr;
+        (void)hostContainer->RemoveChild(trackedChild.Get(), reg, heap);
+        trackedChild.Reset();
+        activeKey.clear();
+        activeObj = ObjectRef{};
+        hasActiveObj = false;
+    };
+
+    std::string ctKey;
+    if (const auto* sv = std::get_if<StringValue>(&hostContainer->GetValue(PropId_ContentTemplate));
+        sv && !sv->view().empty()) {
+        ctKey = sv->str();
+    } else if (contentSourceHost && contentSourceHost != hostContainer) {
+        if (const auto* svHost = std::get_if<StringValue>(&contentSourceHost->GetValue(PropId_ContentTemplate));
+            svHost && !svHost->view().empty()) {
+            ctKey = svHost->str();
+        }
+    }
+
+    if (ctKey.empty()) {
+        clearTracked();
+        syncingGuard = false;
+        return;
+    }
+
+    const AxbPackage* dtPkg = AxbTemplateRegistry::Instance().FindDataTemplate(ctKey);
+    if (!dtPkg) {
+        syncingGuard = false;
+        return;
+    }
+
+    bool hasExplicitContentEntry = false;
+    bool explicitNullContent = false;
+    ObjectRef itemObj{};
+
+    auto inspectContentOn = [&](const UIElement* el) -> bool {
+        if (!el) return false;
+        for (const std::uint16_t pid : {PropId_Content, PropId_Text}) {
+            if (const auto* entry = el->FindCompactEntry(pid)) {
+                if (entry->sourceRank == static_cast<std::uint8_t>(ValueSourceRank::Default) &&
+                    std::holds_alternative<std::monostate>(entry->effectiveValue)) {
+                    continue;
+                }
+                if (std::holds_alternative<NullObject>(entry->effectiveValue)) {
+                    hasExplicitContentEntry = true;
+                    explicitNullContent = true;
+                    return true;
+                }
+                if (const auto* ref = std::get_if<ObjectRef>(&entry->effectiveValue)) {
+                    hasExplicitContentEntry = true;
+                    if (ref->valid()) {
+                        itemObj = *ref;
+                    } else {
+                        explicitNullContent = true;
+                    }
+                    return true;
+                }
+                if (!std::holds_alternative<std::monostate>(entry->effectiveValue)) {
+                    hasExplicitContentEntry = true;
+                    return true;
+                }
+            }
+        }
+        return false;
+    };
+
+    if (!inspectContentOn(hostContainer) && contentSourceHost && contentSourceHost != hostContainer) {
+        (void)inspectContentOn(contentSourceHost);
+    }
+
+    if (explicitNullContent) {
+        clearTracked();
+        syncingGuard = false;
+        return;
+    }
+
+    if (!hasExplicitContentEntry) {
+        for (const UIElement* cur = hostContainer;
+             cur != nullptr;
+             cur = cur->Parent() ? cur->Parent() : cur->TemplatedParent()) {
+            const UnifiedValue dcVal = cur->GetValue(PropId_DataContext);
+            if (const auto* ref = std::get_if<ObjectRef>(&dcVal); ref && ref->valid()) {
+                itemObj = *ref;
+                break;
+            }
+        }
+    }
+
+    if (trackedChild &&
+        activeKey == ctKey &&
+        hasActiveObj == hasExplicitContentEntry &&
+        activeObj == itemObj) {
+        syncingGuard = false;
+        return;
+    }
+
+    clearTracked();
+
+    ExecutionDomainContext* dom = nullptr;
+    DualTrackBindingEngine* bindEng = nullptr;
+    StyleTriggerEngine* styleEng = nullptr;
+    AnimationEngine* animEng = nullptr;
+    const Interpreter* interp = nullptr;
+    ObjectRef rootWrap{};
+    findEngines(dom, bindEng, styleEng, animEng, interp, rootWrap);
+
+    AxbPackage boundCopy = *dtPkg;
+    if (bindEng && bindEng->Program() && dom) {
+        const ProgramImage* prog = bindEng->Program();
+        if (boundCopy.className.empty() && rootWrap.valid()) {
+            if (auto* wHeap = dom->heapForObject(rootWrap); wHeap && wHeap->isAlive(rootWrap)) {
+                if (const auto wTid = wHeap->objectTypeId(rootWrap)) {
+                    if (const auto* wTs = prog->resolveType(*wTid)) {
+                        boundCopy.className = wTs->name;
+                    }
+                }
+            }
+        }
+        if (itemObj.valid()) {
+            if (auto* iHeap = dom->heapForObject(itemObj); iHeap && iHeap->isAlive(itemObj)) {
+                if (const auto iTid = iHeap->objectTypeId(itemObj)) {
+                    if (const auto* iTs = prog->resolveType(*iTid)) {
+                        boundCopy.rootDataTypeName = iTs->name;
+                    }
+                }
+            }
+        }
+        boundCopy.BindAgainstProgram(*prog);
+    }
+
+    IntrusivePtr<UIElement> dtRoot = !boundCopy.rootTypeName.empty()
+        ? CreateElementByTypeName(boundCopy.rootTypeName)
+        : MakeIntrusive<Grid>();
+    if (!dtRoot) {
+        dtRoot = MakeIntrusive<Grid>();
+    }
+    dtRoot->SetNamescopeBoundary(true);
+    if (itemObj.valid()) {
+        (void)dtRoot->SetValue(PropId_DataContext, itemObj, ValueSourceRank::Local);
+    }
+
+    NativeHandleRegistry* reg = dom ? &dom->nativeHandles() : nullptr;
+    ManagedHeap* heap = dom ? &dom->uiHeap() : nullptr;
+    (void)hostContainer->AddChild(dtRoot.Get(), reg, heap);
+
+    (void)MountAxbTemplate(
+        dtRoot.Get(),
+        boundCopy,
+        dom,
+        bindEng,
+        itemObj,
+        interp,
+        styleEng ? styleEng->GetAotExecutionContext() : nullptr,
+        animEng);
+
+    if (styleEng) {
+        styleEng->RegisterPackageStyles(boundCopy);
+        (void)styleEng->BindSubtreeStyles(dtRoot.Get(), true);
+        (void)styleEng->EvaluateSubtree(dtRoot.Get());
+    }
+
+    trackedChild = std::move(dtRoot);
+    activeKey = std::move(ctKey);
+    activeObj = itemObj;
+    hasActiveObj = hasExplicitContentEntry;
+    syncingGuard = false;
+}
+
+} // namespace
+
+void Border::SyncContentTemplateChild() {
+    if (HasControlTemplate() || !GetControlTemplateKey().empty()) {
+        if (contentTemplateChild_) {
+            // ControlTemplate's ContentPresenter owns ContentTemplate instantiation instead
+            const UnifiedValue savedCt = GetValue(PropId_ContentTemplate);
+            (void)ForceClearSparseEntry(PropId_ContentTemplate);
+            SyncHostContentTemplateChildImpl(
+                this,
+                this,
+                contentTemplateChild_,
+                activeContentTemplateKey_,
+                activeContentTemplateObj_,
+                hasActiveContentTemplateObj_,
+                syncingContentTemplate_);
+            if (!std::holds_alternative<std::monostate>(savedCt)) {
+                (void)SetValue(PropId_ContentTemplate, savedCt, ValueSourceRank::ThemeStyle);
+            }
+        }
+        return;
+    }
+    SyncHostContentTemplateChildImpl(
+        this,
+        this,
+        contentTemplateChild_,
+        activeContentTemplateKey_,
+        activeContentTemplateObj_,
+        hasActiveContentTemplateObj_,
+        syncingContentTemplate_);
+}
+
+void Border::OnPropertyChanged(std::uint16_t propId, const UnifiedValue& newValue) {
+    Panel::OnPropertyChanged(propId, newValue);
+    if (RefCount() > 0u &&
+        (propId == PropId_ContentTemplate || propId == PropId_Content || propId == PropId_Text)) {
+        if (!HasControlTemplate() && GetControlTemplateKey().empty() &&
+            (BoundStyleEngine() != nullptr || GetStyleKey().empty())) {
+            SyncContentTemplateChild();
+        }
+    }
+}
+
 // ============================================================================
 // TextBlock
 // ============================================================================
+
+
+namespace {
+
+std::string ResolveRichTextBindToken(
+    std::string_view propPath,
+    std::string_view formatSpec,
+    const UIElement* owner) {
+    UnifiedValue foundVal{};
+    bool hasVal = false;
+    auto tryReadFromObj = [&](const ObjectRef& objRef, DualTrackBindingEngine* eng) -> bool {
+        if (!objRef.valid() || !eng || !eng->Program()) return false;
+        const auto* heap = eng->Domains().heapForObject(objRef);
+        if (!heap) return false;
+        const SymbolId typeId = heap->objectTypeId(objRef).value_or(0);
+        if (typeId == 0) return false;
+        if (auto resolved = eng->Domains().resolvePropertySlot(*eng->Program(), typeId, std::string(propPath))) {
+            if (auto fv = heap->fieldGet(objRef, resolved->backingFieldIndex)) {
+                foundVal = *fv;
+                return true;
+            }
+        }
+        return false;
+    };
+    DualTrackBindingEngine* foundEng = nullptr;
+    for (const UIElement* cur = owner; cur != nullptr && !foundEng; cur = cur->Parent()) {
+        foundEng = cur->BoundTwoWayEngine();
+        if (!foundEng && cur->TemplatedParent()) {
+            foundEng = cur->TemplatedParent()->BoundTwoWayEngine();
+        }
+    }
+    if (foundEng != nullptr && owner != nullptr && owner->RefCount() > 0u) {
+        foundEng->RegisterRichTextDependent(IntrusivePtr<UIElement>(const_cast<UIElement*>(owner)));
+    }
+    for (const UIElement* cur = owner; cur != nullptr && !hasVal; cur = cur->Parent()) {
+        const UnifiedValue dcVal = cur->GetValue(PropId_DataContext);
+        if (const auto* objRef = std::get_if<ObjectRef>(&dcVal)) {
+            if (tryReadFromObj(*objRef, foundEng)) {
+                hasVal = true;
+                break;
+            }
+        }
+        if (!hasVal && cur->TemplatedParent() != nullptr) {
+            const UIElement* tp = cur->TemplatedParent();
+            const UnifiedValue tpDc = tp->GetValue(PropId_DataContext);
+            if (const auto* objRef = std::get_if<ObjectRef>(&tpDc)) {
+                if (tryReadFromObj(*objRef, foundEng)) {
+                    hasVal = true;
+                    break;
+                }
+            }
+        }
+    }
+
+    // Fallback: look for Slider named propPath or default sample value so unmounted XAML still formats cleanly
+    if (!hasVal && owner != nullptr) {
+        const UIElement* root = owner;
+        while (root->Parent() != nullptr) root = root->Parent();
+        std::vector<const UIElement*> stack{root};
+        while (!stack.empty() && !hasVal) {
+            const UIElement* n = stack.back();
+            stack.pop_back();
+            if (n->Name() == propPath) {
+                foundVal = n->GetValue(PropId_Value);
+                if (!std::holds_alternative<std::monostate>(foundVal)) {
+                    hasVal = true;
+                    break;
+                }
+            }
+            for (const UIElement* c = n->FirstChild(); c != nullptr; c = c->NextSibling()) {
+                stack.push_back(c);
+            }
+        }
+    }
+    if (!hasVal) {
+        if (!formatSpec.empty()) {
+            foundVal = MakeFloat(0.0f);
+            hasVal = true;
+        } else {
+            return {};
+        }
+    }
+
+    float numVal = 0.0f;
+    const bool isNum = TryGetFloat(foundVal, numVal);
+    if (isNum && !formatSpec.empty()) {
+        // Handle '{0:0}%' or '{0:F1}' style Noesis StringFormat
+        const std::size_t braceOpen = formatSpec.find("{0");
+        const std::size_t braceClose = (braceOpen != std::string_view::npos)
+            ? formatSpec.find('}', braceOpen)
+            : std::string_view::npos;
+        if (braceOpen != std::string_view::npos && braceClose != std::string_view::npos) {
+            std::string out(formatSpec.substr(0, braceOpen));
+            char buf[64]{};
+            const std::string_view fmtInner = formatSpec.substr(braceOpen + 2, braceClose - (braceOpen + 2));
+            if (fmtInner == ":0" || fmtInner.empty()) {
+                std::snprintf(buf, sizeof(buf), "%.0f", static_cast<double>(std::round(numVal)));
+            } else if (fmtInner == ":0.0" || fmtInner == ":F1") {
+                std::snprintf(buf, sizeof(buf), "%.1f", static_cast<double>(numVal));
+            } else {
+                std::snprintf(buf, sizeof(buf), "%g", static_cast<double>(numVal));
+            }
+            out += buf;
+            out.append(formatSpec.substr(braceClose + 1));
+            return out;
+        }
+    }
+    return rs_rt::valueToString(foundVal);
+}
+
+} // namespace
+
+std::string StripAndResolveRichTextBbCode(
+    std::string_view rawBbCode,
+    const UIElement* owner) {
+    std::string out;
+    out.reserve(rawBbCode.size());
+    std::size_t i = 0u;
+    while (i < rawBbCode.size()) {
+        if (rawBbCode[i] == '[') {
+            const std::size_t closeBracket = rawBbCode.find(']', i + 1u);
+            if (closeBracket != std::string_view::npos) {
+                const std::string_view tagContent = rawBbCode.substr(i + 1u, closeBracket - i - 1u);
+                if (tagContent == "br" || tagContent == "br/") {
+                    out.push_back('\n');
+                    i = closeBracket + 1u;
+                    continue;
+                }
+                if (tagContent.rfind("bind", 0) == 0 &&
+                    (tagContent.size() == 4u || tagContent[4] == ' ' || tagContent[4] == '=')) {
+                    std::string_view fmtSpec;
+                    const std::size_t fmtPos = tagContent.find("format=");
+                    if (fmtPos != std::string_view::npos) {
+                        std::size_t qStart = fmtPos + 7u;
+                        if (qStart < tagContent.size() && (tagContent[qStart] == '\'' || tagContent[qStart] == '"')) {
+                            const char qCh = tagContent[qStart++];
+                            const std::size_t qEnd = tagContent.find(qCh, qStart);
+                            if (qEnd != std::string_view::npos) {
+                                fmtSpec = tagContent.substr(qStart, qEnd - qStart);
+                            }
+                        }
+                    }
+                    const std::size_t endBind = rawBbCode.find("[/bind]", closeBracket + 1u);
+                    if (endBind != std::string_view::npos) {
+                        const std::string_view bindPath = rawBbCode.substr(closeBracket + 1u, endBind - (closeBracket + 1u));
+                        out += ResolveRichTextBindToken(bindPath, fmtSpec, owner);
+                        i = endBind + 7u;
+                        continue;
+                    }
+                }
+                if (tagContent.rfind("img", 0) == 0) {
+                    const std::size_t endImg = rawBbCode.find("[/img]", closeBracket + 1u);
+                    if (endImg != std::string_view::npos) {
+                        i = endImg + 6u;
+                        continue;
+                    }
+                }
+                // Known BBCode opening/closing formatting tags: [b], [/b], [i], [/i], [u], [/u], [style=...], [/style], [color=...], [/color], [size=...], [/size], [url=...], [/url]
+                const bool isClosing = !tagContent.empty() && tagContent.front() == '/';
+                const std::string_view bare = isClosing ? tagContent.substr(1u) : tagContent;
+                const std::size_t eqPos = bare.find('=');
+                const std::string_view tagName = (eqPos != std::string_view::npos) ? bare.substr(0u, eqPos) : bare;
+                if (tagName == "b" || tagName == "i" || tagName == "u" || tagName == "s" ||
+                    tagName == "style" || tagName == "color" || tagName == "size" || tagName == "url") {
+                    i = closeBracket + 1u;
+                    continue;
+                }
+            }
+        }
+        out.push_back(rawBbCode[i++]);
+    }
+    return out;
+}
+
+Label::Label() {
+    EnsureControlTypesRegistered();
+}
+
+BoxShadow::BoxShadow() {
+    EnsureControlTypesRegistered();
+}
 
 TextBlock::TextBlock() {
     EnsureControlTypesRegistered();
@@ -1717,14 +2320,57 @@ void TextBlock::SetText(std::string_view text) {
     SetValue(PropId_Text, value::FromString(std::string(text)), ValueSourceRank::Local);
 }
 
+bool TextBlock::HasRichText() const noexcept {
+    const UnifiedValue rv = GetValue(PropId_RichText);
+    if (const auto* s = std::get_if<StringValue>(&rv)) {
+        return !s->view().empty();
+    }
+    if (const UIElement* tp = TemplatedParent()) {
+        if (FindCompactEntry(PropId_RichText) != nullptr) {
+            const UnifiedValue tpContent = tp->GetValue(PropId_Content);
+            if (const auto* cs = std::get_if<StringValue>(&tpContent)) {
+                return !cs->view().empty();
+            }
+        }
+    }
+    return false;
+}
+
+std::string TextBlock::GetRawRichText() const {
+    const UnifiedValue rv = GetValue(PropId_RichText);
+    if (const auto* s = std::get_if<StringValue>(&rv); s && !s->view().empty()) {
+        return s->str();
+    }
+    if (const UIElement* tp = TemplatedParent()) {
+        const UnifiedValue tpContent = tp->GetValue(PropId_Content);
+        if (const auto* cs = std::get_if<StringValue>(&tpContent); cs && !cs->view().empty()) {
+            return cs->str();
+        }
+    }
+    return {};
+}
+
 std::string TextBlock::GetText() const {
     const auto v = GetValue(PropId_Text);
-    if (const auto* s = std::get_if<StringValue>(&v)) {
+    if (const auto* s = std::get_if<StringValue>(&v); s && !s->view().empty()) {
         return s->str();
     }
     if (!std::holds_alternative<std::monostate>(v) &&
-        !std::holds_alternative<NullObject>(v)) {
+        !std::holds_alternative<NullObject>(v) &&
+        !std::holds_alternative<StringValue>(v)) {
         return rs_rt::valueToString(v);
+    }
+    if (HasRichText()) {
+        return StripAndResolveRichTextBbCode(GetRawRichText(), this);
+    }
+    const UnifiedValue cv = GetValue(PropId_Content);
+    if (const auto* cs = std::get_if<StringValue>(&cv); cs && !cs->view().empty()) {
+        return cs->str();
+    }
+    if (!std::holds_alternative<std::monostate>(cv) &&
+        !std::holds_alternative<NullObject>(cv) &&
+        !std::holds_alternative<StringValue>(cv)) {
+        return rs_rt::valueToString(cv);
     }
     return {};
 }
@@ -1735,21 +2381,13 @@ void TextBlock::SetFontSize(float fontSize) {
 
 float TextBlock::GetFontSize() const noexcept {
     float out = 14.0f;
-    if (TryGetFloat(GetValue(PropId_FontSize), out)) {
-        return out;
-    }
-    if (const UIElement* tp = TemplatedParent()) {
-        if (TryGetFloat(tp->GetValue(PropId_FontSize), out)) {
+    for (const UIElement* cur = this; cur != nullptr; cur = cur->Parent()) {
+        if (TryGetFloat(cur->GetValue(PropId_FontSize), out)) {
             return out;
         }
-    }
-    for (const UIElement* anc = Parent(); anc != nullptr; anc = anc->Parent()) {
-        if (anc->IsA<ContentPresenter>()) {
-            if (TryGetFloat(anc->GetValue(PropId_FontSize), out)) {
-                return out;
-            }
-            if (const UIElement* ancTp = anc->TemplatedParent()) {
-                if (TryGetFloat(ancTp->GetValue(PropId_FontSize), out)) {
+        if (cur == this || cur->IsA<ContentPresenter>()) {
+            if (const UIElement* tp = cur->TemplatedParent()) {
+                if (TryGetFloat(tp->GetValue(PropId_FontSize), out)) {
                     return out;
                 }
             }
@@ -1816,22 +2454,40 @@ void TextBlock::SetForeground(const Color& color) {
     SetValue(PropId_Foreground, value::FromColor(color), ValueSourceRank::Local);
 }
 
-Color TextBlock::GetForeground() const noexcept {
-    if (auto c = value::TryGetColor(GetValue(PropId_Foreground))) {
-        return *c;
+void TextBlock::SetTextAlignment(TextAlignment alignment) {
+    SetValue(
+        PropId_TextAlignment,
+        value::FromInt(static_cast<std::int64_t>(alignment)),
+        ValueSourceRank::Local);
+}
+
+TextAlignment TextBlock::GetTextAlignment() const noexcept {
+    const UnifiedValue v = GetValue(PropId_TextAlignment);
+    if (const auto* i = std::get_if<std::int64_t>(&v)) {
+        if (*i == 1) return TextAlignment::Center;
+        if (*i == 2) return TextAlignment::Right;
+        if (*i == 3) return TextAlignment::Justify;
+        return TextAlignment::Left;
     }
-    if (const UIElement* tp = TemplatedParent()) {
-        if (auto c = value::TryGetColor(tp->GetValue(PropId_Foreground))) {
-            return *c;
+    if (const auto* sv = std::get_if<StringValue>(&v)) {
+        const UnifiedValue parsed = ParseBuiltinLiteralPropertyValue(PropId_TextAlignment, sv->view());
+        if (const auto* pi = std::get_if<std::int64_t>(&parsed)) {
+            if (*pi == 1) return TextAlignment::Center;
+            if (*pi == 2) return TextAlignment::Right;
+            if (*pi == 3) return TextAlignment::Justify;
         }
     }
-    for (const UIElement* anc = Parent(); anc != nullptr; anc = anc->Parent()) {
-        if (anc->IsA<ContentPresenter>()) {
-            if (auto c = value::TryGetColor(anc->GetValue(PropId_Foreground))) {
-                return *c;
-            }
-            if (const UIElement* ancTp = anc->TemplatedParent()) {
-                if (auto c = value::TryGetColor(ancTp->GetValue(PropId_Foreground))) {
+    return TextAlignment::Left;
+}
+
+Color TextBlock::GetForeground() const noexcept {
+    for (const UIElement* cur = this; cur != nullptr; cur = cur->Parent()) {
+        if (auto c = value::TryGetColor(cur->GetValue(PropId_Foreground))) {
+            return *c;
+        }
+        if (cur == this || cur->IsA<ContentPresenter>()) {
+            if (const UIElement* tp = cur->TemplatedParent()) {
+                if (auto c = value::TryGetColor(tp->GetValue(PropId_Foreground))) {
                     return *c;
                 }
             }
@@ -1840,7 +2496,29 @@ Color TextBlock::GetForeground() const noexcept {
     return Color{0.94f, 0.96f, 0.98f, 1.0f};
 }
 
+void TextBlock::OnPropertyChanged(std::uint16_t propId, const UnifiedValue& newValue) {
+    UIElement::OnPropertyChanged(propId, newValue);
+    if ((propId == PropId_RichText || propId == PropId_DataContext) && RefCount() > 0u) {
+        const std::string rawRt = GetRawRichText();
+        if (rawRt.find("[bind") != std::string::npos) {
+            DualTrackBindingEngine* foundEng = nullptr;
+            for (const UIElement* cur = this; cur != nullptr && !foundEng; cur = cur->Parent()) {
+                foundEng = cur->BoundTwoWayEngine();
+                if (!foundEng && cur->TemplatedParent()) {
+                    foundEng = cur->TemplatedParent()->BoundTwoWayEngine();
+                }
+            }
+            if (foundEng != nullptr) {
+                foundEng->RegisterRichTextDependent(IntrusivePtr<UIElement>(this));
+            }
+        }
+    }
+}
+
 Size TextBlock::MeasureCore(Size availableSize) noexcept {
+    if (HasControlTemplate() || FirstChild() != nullptr) {
+        return UIElement::MeasureCore(availableSize);
+    }
     const Thickness p = GetPadding();
     const float padW = p.left + p.right;
     const float padH = p.top + p.bottom;
@@ -2049,6 +2727,25 @@ Point ContentPresenter::ComputeTextOrigin(const Rect& boxRect, Size textSize) co
     return Point{tx, ty};
 }
 
+void ContentPresenter::SyncContentTemplateChild() {
+    SyncHostContentTemplateChildImpl(
+        this,
+        TemplatedParent(),
+        contentTemplateChild_,
+        activeContentTemplateKey_,
+        activeContentTemplateObj_,
+        hasActiveContentTemplateObj_,
+        syncingContentTemplate_);
+}
+
+void ContentPresenter::OnPropertyChanged(std::uint16_t propId, const UnifiedValue& newValue) {
+    Panel::OnPropertyChanged(propId, newValue);
+    if (RefCount() > 0u &&
+        (propId == PropId_ContentTemplate || propId == PropId_Content || propId == PropId_Text)) {
+        SyncContentTemplateChild();
+    }
+}
+
 Size ContentPresenter::MeasureCore(Size availableSize) noexcept {
     if (FirstChild() != nullptr) {
         return UIElement::MeasureCore(availableSize);
@@ -2095,21 +2792,31 @@ void Path::SetFill(const Color& color) {
 }
 
 bool Path::HasExplicitFill() const noexcept {
+    const UnifiedValue gv = GetValue(PropId_BackgroundGradientId); if (const auto* iv = std::get_if<std::int64_t>(&gv); iv && *iv > 0) {
+        return true;
+    }
     return value::TryGetColor(GetValue(PropId_Background)).has_value() ||
            value::TryGetColor(GetValue(PropId_Foreground)).has_value();
 }
 
 Color Path::GetFill() const noexcept {
+    float bgOp = 1.0f;
+    (void)TryGetFloat(GetValue(PropId_BackgroundOpacity), bgOp);
+    bgOp = std::clamp(bgOp, 0.0f, 1.0f);
+    const UnifiedValue gv = GetValue(PropId_BackgroundGradientId); if (const auto* iv = std::get_if<std::int64_t>(&gv); iv && *iv > 0) {
+        return Color{1.0f, 1.0f, 1.0f, bgOp};
+    }
     if (auto c = value::TryGetColor(GetValue(PropId_Background))) {
-        return *c;
+        Color out = *c;
+        out.a = std::clamp(out.a * bgOp, 0.0f, 1.0f);
+        return out;
     }
     if (auto fg = value::TryGetColor(GetValue(PropId_Foreground))) {
-        return *fg;
+        Color out = *fg;
+        out.a = std::clamp(out.a * bgOp, 0.0f, 1.0f);
+        return out;
     }
-    if (HasExplicitStroke() && GetStrokeThickness() > 0.0f) {
-        return Color{0.0f, 0.0f, 0.0f, 0.0f};
-    }
-    return Color{0.92f, 0.95f, 1.0f, 1.0f};
+    return Color{0.0f, 0.0f, 0.0f, 0.0f};
 }
 
 void Path::SetStroke(const Color& color) {
@@ -2117,15 +2824,23 @@ void Path::SetStroke(const Color& color) {
 }
 
 bool Path::HasExplicitStroke() const noexcept {
-    if (auto c = value::TryGetColor(GetValue(PropId_BorderBrush))) {
-        return c->a > 0.0f;
+    const UnifiedValue gv = GetValue(PropId_BorderGradientId); if (const auto* iv = std::get_if<std::int64_t>(&gv); iv && *iv > 0) {
+        return true;
     }
-    return false;
+    return value::TryGetColor(GetValue(PropId_BorderBrush)).has_value();
 }
 
 Color Path::GetStroke() const noexcept {
+    float brdOp = 1.0f;
+    (void)TryGetFloat(GetValue(PropId_BorderOpacity), brdOp);
+    brdOp = std::clamp(brdOp, 0.0f, 1.0f);
+    const UnifiedValue gv = GetValue(PropId_BorderGradientId); if (const auto* iv = std::get_if<std::int64_t>(&gv); iv && *iv > 0) {
+        return Color{1.0f, 1.0f, 1.0f, brdOp};
+    }
     if (auto c = value::TryGetColor(GetValue(PropId_BorderBrush))) {
-        return *c;
+        Color out = *c;
+        out.a = std::clamp(out.a * brdOp, 0.0f, 1.0f);
+        return out;
     }
     return Color{0.0f, 0.0f, 0.0f, 0.0f};
 }
@@ -2159,10 +2874,7 @@ Stretch Path::GetStretch() const noexcept {
             return static_cast<Stretch>(*i);
         }
     }
-    if (IsA(Polygon::StaticTypeClass()) || IsA(Polyline::StaticTypeClass())) {
-        return Stretch::None;
-    }
-    return Stretch::Uniform;
+    return Stretch::None;
 }
 
 Size Path::MeasureCore(Size availableSize) noexcept {
@@ -4006,6 +4718,11 @@ void Image::SetSource(std::string_view sourceUri) {
 std::string Image::GetSource() const {
     const auto v = GetValue(PropId_ImageSource);
     if (const auto* s = std::get_if<StringValue>(&v)) {
+        const std::string_view sv = s->view();
+        if (sv.size() > 16u && sv.rfind("AERO_IMGBRUSH:", 0) == 0 &&
+            sv[15] == ':' && sv[14] >= '0' && sv[14] <= '3') {
+            return std::string(sv.substr(16u));
+        }
         return s->str();
     }
     return {};
@@ -5471,7 +6188,25 @@ IntrusivePtr<UIElement> ItemsControl::CreateMaterializedItemVisual(
         return InstantiateTemplatedItem(*tplPkg, itemVal);
     }
     auto tb = MakeIntrusive<TextBlock>();
-    tb->SetText(rs_rt::valueToString(itemVal));
+    std::string displayStr = rs_rt::valueToString(itemVal);
+    if (const auto* oref = std::get_if<ObjectRef>(&itemVal)) {
+        if (oref->valid() && domains_ && bindingEngine_ && bindingEngine_->Program()) {
+            if (const auto* heap = domains_->heapForObject(*oref)) {
+                const SymbolId tid = heap->objectTypeId(*oref).value_or(0);
+                if (tid != 0) {
+                    for (const char* propCandidate : {"Title", "Name", "Header", "Label"}) {
+                        if (auto slot = domains_->resolvePropertySlot(*bindingEngine_->Program(), tid, propCandidate)) {
+                            if (auto fv = heap->fieldGet(*oref, slot->backingFieldIndex)) {
+                                displayStr = FormatBindingString({}, &(*fv), 1u, domains_);
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    tb->SetText(displayStr);
     return tb;
 }
 
@@ -7323,7 +8058,11 @@ AxbTemplateRegistry::AxbTemplateRegistry() noexcept {
                 for (const UIElement* cur = elem;
                      cur != nullptr;
                      cur = NextResourceScopeAncestor(cur)) {
-                    if (DualTrackBindingEngine* engine = cur->BoundTwoWayEngine()) {
+                    DualTrackBindingEngine* engine = cur->BoundTwoWayEngine();
+                    if (!engine && cur->BoundStyleEngine()) {
+                        engine = cur->BoundStyleEngine()->GetBindingEngine();
+                    }
+                    if (engine) {
                         if (std::shared_ptr<UiResourceContext> domainCtx =
                                 UiResourceContext::FindForDomains(&engine->Domains())) {
                             ScopedUiResourceContext scope(std::move(domainCtx));
@@ -7379,6 +8118,7 @@ AxbTemplateRegistry::AxbTemplateRegistry() noexcept {
                         handledUnderSetLock = true;
                     });
                 if (!handledUnderSetLock) {
+                    (void)AxbTemplateRegistry::Instance().ApplyRegisteredDictionary(locSourceUri, elem);
                     return;
                 }
                 for (const auto& upd : updates) {
@@ -8429,6 +9169,14 @@ std::size_t AxbTemplateRegistry::ApplyDynamicDictionary(
     std::vector<HostWakeEntry> wakeList;
     CollectDynamicDictionaryUpdates(dictPkg, scopeRoot, updates, wakeList);
 
+    for (const auto& upd : updates) {
+        if (upd.propId == PropId_PathData) {
+            if (const auto* sv = std::get_if<StringValue>(&upd.newValue)) {
+                (void)FindOrBakeMtsdfPath(sv->view());
+            }
+        }
+    }
+
     {
         ScopedUiResourceContext ownerScope(
             UiResourceContext::HasActiveThreadOverride() ? nullptr : ownerContext_);
@@ -8508,6 +9256,15 @@ std::size_t AxbTemplateRegistry::ApplyRegisteredDictionary(
         if (it != registeredDictionaries_.end()) {
             dictCopy = it->second;
             found = true;
+        }
+    }
+    if (!found) {
+        if (const auto compileHook = GetRuntimeXamlCompileHook()) {
+            const auto searchDirs = UiResourceContext::Current().XamlSearchDirectoriesSnapshot();
+            if (compileHook(sourceUri, searchDirs, dictCopy)) {
+                RegisterDictionary(std::string(sourceUri), dictCopy);
+                found = true;
+            }
         }
     }
     if (!found) {
@@ -8714,6 +9471,7 @@ IntrusivePtr<UIElement> CreateElementByTypeName(std::string_view typeName) {
     if (shortName == "DockPanel") return MakeIntrusive<DockPanel>();
     if (shortName == "WrapPanel") return MakeIntrusive<WrapPanel>();
     if (shortName == "Viewbox") return MakeIntrusive<Viewbox>();
+    if (shortName == "LayoutScaler") return MakeIntrusive<LayoutScaler>();
     if (shortName == "ScrollViewer") return MakeIntrusive<ScrollViewer>();
     if (shortName == "HeaderedContentControl") return MakeIntrusive<HeaderedContentControl>();
     if (shortName == "GroupBox") return MakeIntrusive<GroupBox>();
@@ -8756,20 +9514,25 @@ IntrusivePtr<UIElement> CreateElementByTypeName(std::string_view typeName) {
     if (shortName == "ComboBox") {
         return MakeIntrusive<ComboBox>();
     }
-    if (shortName == "ContentPresenter") {
+    if (shortName == "ContentPresenter" || shortName == "TransitionContentPresenter") {
         return MakeIntrusive<ContentPresenter>();
     }
     if (shortName == "RiveControl") {
         return MakeIntrusive<RiveControl>();
     }
+    if (shortName == "BoxShadow") {
+        return MakeIntrusive<BoxShadow>();
+    }
     if (shortName == "Border" ||
         shortName == "ContentControl" ||
-        shortName == "BoxShadow" ||
         shortName == "ComboBoxItem" || shortName == "ListBoxItem" ||
         shortName == "ListViewItem" || shortName == "TreeViewItem") {
         return MakeIntrusive<Border>();
     }
-    if (shortName == "TextBlock" || shortName == "Label") {
+    if (shortName == "Label") {
+        return MakeIntrusive<Label>();
+    }
+    if (shortName == "TextBlock") {
         return MakeIntrusive<TextBlock>();
     }
     if (shortName == "Button" || shortName == "RepeatButton" ||
@@ -8924,7 +9687,7 @@ void AutoApplyControlStyleTemplate(
             // at ValueSourceRank::ThemeStyle so TemplateBindings & ContentPresenters receive style defaults!
             for (auto it = chain.rbegin(); it != chain.rend(); ++it) {
                 for (const auto& setter : (*it)->setters) {
-                    if (setter.propId == PropId_Template) {
+                    if (setter.propId == PropId_Template || setter.hasBinding) {
                         continue;
                     }
                     UIElement* target = setter.targetName.empty()
@@ -9219,11 +9982,236 @@ bool MountAxbInstructionsInternal(
             case AxbOpcode::BindEvent: {
                 if (!elementStack.empty() && elementStack.back()) {
                     UIElement* elem = elementStack.back();
-                    const ObjectRef targetObj = rootControl->BoundScriptWrapper().valid()
-                        ? rootControl->BoundScriptWrapper()
-                        : effectiveContext;
-                    const SymbolId methodId = inst.symbolId;
-                    const bool isSimCommand = (inst.flags & 0x01u) != 0u;
+                    const AxbEventBindingRecord* evRec =
+                        (inst.strIdx0 < package.eventBindings.size())
+                            ? &package.eventBindings[inst.strIdx0]
+                            : nullptr;
+
+                    auto findRootWrapper = [&](const UIElement* startEl) -> ObjectRef {
+                        ObjectRef found{};
+                        for (const UIElement* cur = startEl;
+                             cur != nullptr;
+                             cur = cur->Parent() ? cur->Parent() : cur->TemplatedParent()) {
+                            if (cur->BoundScriptWrapper().valid()) {
+                                found = cur->BoundScriptWrapper();
+                            }
+                        }
+                        return found;
+                    };
+
+                    const ObjectRef rootWrapObj = findRootWrapper(rootControl);
+                    ObjectRef targetObj{};
+                    if (evRec && evRec->targetIsWrapper && rootWrapObj.valid()) {
+                        targetObj = rootWrapObj;
+                    } else if (evRec && !evRec->targetIsWrapper && effectiveContext.valid()) {
+                        targetObj = effectiveContext;
+                        if (!evRec->prefixHops.empty() && domains) {
+                            for (const auto& phop : evRec->prefixHops) {
+                                AxbCompiledHop tmpHop = phop;
+                                UnifiedValue nextVal{};
+                                bool okHop = false;
+                                if (tmpHop.isAutoProperty || tmpHop.getterSymbolId == 0) {
+                                    if (tmpHop.fieldIndex != PropertySlotHandle::InvalidIndex) {
+                                        okHop = domains->readObjectField(DomainKind::Ui, targetObj, tmpHop.fieldIndex, nextVal);
+                                    }
+                                } else if (eventInterpreter) {
+                                    std::vector<UnifiedValue> gArgs{targetObj};
+                                    const auto gRes = eventInterpreter->invoke(tmpHop.getterSymbolId, gArgs);
+                                    if (gRes.succeeded) {
+                                        nextVal = gRes.value;
+                                        okHop = true;
+                                    }
+                                }
+                                const auto* nextRef = okHop ? std::get_if<ObjectRef>(&nextVal) : nullptr;
+                                if (!nextRef || !nextRef->valid()) {
+                                    targetObj = ObjectRef{};
+                                    break;
+                                }
+                                targetObj = *nextRef;
+                            }
+                        }
+                    } else {
+                        targetObj = rootWrapObj.valid() ? rootWrapObj : effectiveContext;
+                    }
+
+                    const SymbolId methodId = (evRec && evRec->handlerSymbolId != 0)
+                        ? evRec->handlerSymbolId
+                        : inst.symbolId;
+                    bool isSimCommand = ((inst.flags & 0x01u) != 0u);
+                    if (!isSimCommand && methodId != 0 && bindingEngine && bindingEngine->Program()) {
+                        if (const auto* loc = bindingEngine->Program()->resolveFunction(methodId);
+                            loc && loc->function && loc->function->simCommand) {
+                            isSimCommand = true;
+                        }
+                    }
+                    if ((!targetObj.valid() || methodId == 0) &&
+                        evRec != nullptr &&
+                        rootControl != nullptr) {
+                        const std::string& hName = evRec->handlerMethodName;
+                        if ((hName == "UpButton_Click" || hName == "DownButton_Click") &&
+                            elem->IsA<Button>()) {
+                            const float sign = (hName == "UpButton_Click") ? 1.0f : -1.0f;
+                            static_cast<Button*>(elem)->SetClickCallback([sign](Button& btn) {
+                                UIElement* hostCtrl = nullptr;
+                                for (UIElement* anc = btn.Parent(); anc != nullptr; anc = anc->Parent()) {
+                                    if (anc->IsA<UserControl>()) {
+                                        hostCtrl = anc;
+                                        break;
+                                    }
+                                }
+                                if (hostCtrl == nullptr) {
+                                    for (UIElement* anc = btn.Parent(); anc != nullptr; anc = anc->Parent()) {
+                                        hostCtrl = anc;
+                                    }
+                                }
+                                if (hostCtrl == nullptr) {
+                                    return;
+                                }
+                                float curVal = 0.0f;
+                                (void)TryGetFloat(hostCtrl->GetValue(PropId_Value), curVal);
+                                float minVal = -1e9f;
+                                (void)TryGetFloat(hostCtrl->GetValue(PropId_Minimum), minVal);
+                                float maxVal = 1e9f;
+                                (void)TryGetFloat(hostCtrl->GetValue(PropId_Maximum), maxVal);
+                                float step = 1.0f;
+                                if (!TryGetFloat(hostCtrl->GetValue(PropId_SmallChange), step) || step <= 0.0f) {
+                                    step = 1.0f;
+                                }
+                                const float nextVal = std::clamp(curVal + sign * step, minVal, maxVal);
+                                if (std::fabs(nextVal - curVal) > 1e-5f) {
+                                    hostCtrl->SetValue(PropId_Value, MakeFloat(nextVal), ValueSourceRank::Local);
+                                    if (hostCtrl->BoundTwoWayEngine() != nullptr) {
+                                        (void)hostCtrl->NotifyTwoWayPropertyMutated(PropId_Value, nullptr);
+                                    }
+                                }
+                            });
+                        } else if (elem->IsA<Button>() && !hName.empty() && bindingEngine && domains) {
+                            const std::string handlerCopy = hName;
+                            static_cast<Button*>(elem)->SetClickCallback(
+                                [domains, bindingEngine, eventInterpreter, eventAotContext, handlerCopy](Button& b) {
+                                    const ProgramImage* prog = bindingEngine->Program();
+                                    if (!prog) return;
+
+                                    auto findMethodOn = [&](ObjectRef obj, std::string_view rawMethod, SymbolId& outSym, bool& outSim) -> bool {
+                                        outSym = 0;
+                                        outSim = false;
+                                        if (!obj.valid()) return false;
+                                        auto* heap = domains->heapForObject(obj);
+                                        if (!heap || !heap->isAlive(obj)) return false;
+                                        SymbolId curTid = heap->objectTypeId(obj).value_or(0);
+                                        std::string cands[3];
+                                        std::size_t nCands = 0u;
+                                        cands[nCands++] = std::string(rawMethod);
+                                        if (rawMethod.size() > 7u && rawMethod.substr(rawMethod.size() - 7u) == "Command") {
+                                            cands[nCands++] = std::string(rawMethod.substr(0u, rawMethod.size() - 7u));
+                                            cands[nCands++] = "On" + cands[1];
+                                        } else {
+                                            cands[nCands++] = std::string(rawMethod) + "Command";
+                                            cands[nCands++] = "On" + std::string(rawMethod);
+                                        }
+                                        for (std::size_t ci = 0u; ci < nCands; ++ci) {
+                                            SymbolId walkTid = curTid;
+                                            for (int d = 0; d < 16 && walkTid != 0; ++d) {
+                                                const auto* ts = prog->resolveType(walkTid);
+                                                if (!ts) break;
+                                                for (const auto& m : ts->methods) {
+                                                    if (m.name == cands[ci] && !m.staticMethod && m.id != 0) {
+                                                        outSym = m.id;
+                                                        outSim = m.simCommand;
+                                                        return true;
+                                                    }
+                                                }
+                                                walkTid = ts->baseTypeId;
+                                            }
+                                        }
+                                        return false;
+                                    };
+
+                                    ObjectRef wrapTarget{};
+                                    ObjectRef dcTarget{};
+                                    for (const UIElement* cur = &b;
+                                         cur != nullptr;
+                                         cur = cur->Parent() ? cur->Parent() : cur->TemplatedParent()) {
+                                        if (!dcTarget.valid()) {
+                                            const UnifiedValue dcV = cur->GetValue(PropId_DataContext);
+                                            if (const auto* r = std::get_if<ObjectRef>(&dcV); r && r->valid()) {
+                                                dcTarget = *r;
+                                            }
+                                        }
+                                        if (cur->BoundScriptWrapper().valid()) {
+                                            wrapTarget = cur->BoundScriptWrapper();
+                                        }
+                                    }
+
+                                    std::string leaf = handlerCopy;
+                                    if (const auto dot = leaf.rfind('.'); dot != std::string::npos) {
+                                        std::size_t pos = 0u;
+                                        while (pos < dot && dcTarget.valid()) {
+                                            const std::size_t nextDot = handlerCopy.find('.', pos);
+                                            const std::size_t endSeg = (nextDot == std::string::npos || nextDot > dot) ? dot : nextDot;
+                                            const std::string seg = handlerCopy.substr(pos, endSeg - pos);
+                                            auto* h = domains->heapForObject(dcTarget);
+                                            const SymbolId tid = (h && h->isAlive(dcTarget)) ? h->objectTypeId(dcTarget).value_or(0) : 0;
+                                            if (auto slot = domains->resolvePropertySlot(*prog, tid, seg)) {
+                                                UnifiedValue nv{};
+                                                if (domains->readPropertySlotFast(DomainKind::Ui, dcTarget, *slot, nv, nullptr, eventInterpreter)) {
+                                                    if (const auto* nr = std::get_if<ObjectRef>(&nv); nr && nr->valid()) {
+                                                        dcTarget = *nr;
+                                                    } else {
+                                                        dcTarget = ObjectRef{};
+                                                    }
+                                                }
+                                            }
+                                            pos = endSeg + 1u;
+                                        }
+                                        leaf = handlerCopy.substr(dot + 1u);
+                                    }
+
+                                    ObjectRef callObj{};
+                                    SymbolId callSym = 0;
+                                    bool callSim = false;
+                                    if (handlerCopy.find('.') == std::string::npos &&
+                                        findMethodOn(wrapTarget, leaf, callSym, callSim)) {
+                                        callObj = wrapTarget;
+                                    } else if (findMethodOn(dcTarget, leaf, callSym, callSim)) {
+                                        callObj = dcTarget;
+                                    }
+                                    if (!callObj.valid() || callSym == 0) return;
+
+                                    std::vector<UnifiedValue> args{callObj};
+                                    UnifiedValue cmdParam = b.GetValue(PropId_CommandParameter);
+                                    if (!std::holds_alternative<std::monostate>(cmdParam)) {
+                                        if (const auto* sv = std::get_if<StringValue>(&cmdParam)) {
+                                            RuntimeError allocErr{};
+                                            if (auto sref = domains->uiHeap().allocateString(std::string(sv->view()), &allocErr)) {
+                                                cmdParam = *sref;
+                                            }
+                                        }
+                                        args.push_back(cmdParam);
+                                    }
+                                    if (callSim) {
+                                        std::vector<UnifiedValue> payload;
+                                        if (args.size() > 1u) payload.push_back(args[1]);
+                                        domains->enqueueSimCommand(SimCommandEnvelope{callSym, callObj, std::move(payload), 0ULL});
+                                    } else if (eventInterpreter) {
+                                        auto res = eventInterpreter->invoke(callSym, args);
+                                        if (!res.succeeded &&
+                                            res.error.code == ErrorCode::InvalidArguments &&
+                                            res.statistics.instructionsExecuted == 0u &&
+                                            args.size() > 1u) {
+                                            args.resize(1u);
+                                            (void)eventInterpreter->invoke(callSym, args);
+                                        }
+                                    } else if (eventAotContext) {
+                                        UnifiedValue ret{};
+                                        if (!eventAotContext->invoke(callSym, args.data(), args.size(), ret) &&
+                                            args.size() > 1u) {
+                                            (void)eventAotContext->invoke(callSym, args.data(), 1u, ret);
+                                        }
+                                    }
+                                });
+                        }
+                    }
                     if (targetObj.valid() && methodId != 0) {
                         auto invokeBoundHandler = [eventInterpreter, eventAotContext, domains, targetObj, methodId, isSimCommand](
                                                       const UnifiedValue& argVal,
@@ -9429,6 +10417,17 @@ bool MountAxbInstructionsInternal(
             eventInterpreter,
             eventAotContext,
             animationEngine);
+    }
+
+    // Instantiate ContentTemplates on direct ContentControl (Border) and ContentPresenter elements
+    for (std::size_t i = startIdx; i < localElements.size(); ++i) {
+        if (UIElement* el = localElements[i]) {
+            if (auto* bdr = el->DynamicCast<Border>()) {
+                bdr->SyncContentTemplateChild();
+            } else if (auto* cp = el->DynamicCast<ContentPresenter>()) {
+                cp->SyncContentTemplateChild();
+            }
+        }
     }
 
     if (rootVisited && animationEngine && package.HasMotionSection()) {

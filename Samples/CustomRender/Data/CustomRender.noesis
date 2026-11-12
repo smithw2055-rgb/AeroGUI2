@@ -1,0 +1,5 @@
+<Project>
+  <Assembly>CustomRender</Assembly>
+  <DefaultDataNamespace>CustomRender</DefaultDataNamespace>
+  <StartupDocument>MainWindow.xaml</StartupDocument>
+</Project>

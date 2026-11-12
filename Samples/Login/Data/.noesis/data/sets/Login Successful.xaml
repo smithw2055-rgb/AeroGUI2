@@ -1,0 +1,6 @@
+<vdctx:ViewModel xmlns:vdctx="clr-namespace:Login"
+                 Message="LOGIN SUCCESSFUL" LoginSuccessful="True">
+  <vdctx:ViewModel.LoginCommand>
+    <MessageCommand Message="Login Successful"/>
+  </vdctx:ViewModel.LoginCommand>
+</vdctx:ViewModel>

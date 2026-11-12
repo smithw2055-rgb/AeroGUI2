@@ -1,0 +1,73 @@
+<vdctx:ViewModel xmlns:vdctx="clr-namespace:Inventory">
+  <vdctx:ViewModel.Inventory>
+    <vdctx:Item Category="Hand" Name="Sword" Icon="studio:///Inventory;component/Images/Items/Sword.png" Description="A well-balanced steel blade." Life="0" Mana="0" Dps="15" Armor="0"/>
+    <vdctx:Item Category="Hand" Name="Club" Icon="studio:///Inventory;component/Images/Items/Club.png" Description="A crude wooden bludgeon." Life="0" Mana="0" Dps="8" Armor="0"/>
+    <vdctx:Item Category="Hand" Name="Mace" Icon="studio:///Inventory;component/Images/Items/Mace.png" Description="A heavy metal mace." Life="0" Mana="0" Dps="12" Armor="0"/>
+    <vdctx:Item Category="Hand" Name="Morning Star" Icon="studio:///Inventory;component/Images/Items/MorningStar.png" Description="A spiked ball on a wooden shaft." Life="0" Mana="0" Dps="16" Armor="0"/>
+    <vdctx:Item Category="Hand" Name="Hammer" Icon="studio:///Inventory;component/Images/Items/Hammer.png" Description="A standard forging tool repurposed for war." Life="0" Mana="0" Dps="10" Armor="0"/>
+    <vdctx:Item Category="Hand" Name="War Hammer" Icon="studio:///Inventory;component/Images/Items/WarHammer.png" Description="A massive hammer requiring two hands." Life="0" Mana="0" Dps="25" Armor="-5"/>
+    <vdctx:Item Category="Hand" Name="Mallet" Icon="studio:///Inventory;component/Images/Items/Mallet.png" Description="A wooden mallet, not very threatening." Life="0" Mana="0" Dps="5" Armor="0"/>
+    <vdctx:Item Category="Hand" Name="Axe" Icon="studio:///Inventory;component/Images/Items/Axe.png" Description="A sharp chopping tool." Life="0" Mana="0" Dps="14" Armor="0"/>
+    <vdctx:Item Category="Hand" Name="Halberd" Icon="studio:///Inventory;component/Images/Items/Halberd.png" Description="A polearm combining a spear and an axe." Life="0" Mana="0" Dps="20" Armor="0"/>
+    <vdctx:Item Category="Hand" Name="Battle Axe" Icon="studio:///Inventory;component/Images/Items/BattleAxe.png" Description="A devastating double-bladed axe." Life="0" Mana="0" Dps="24" Armor="0"/>
+    <vdctx:Item Category="Hand" Name="Short Sword" Icon="studio:///Inventory;component/Images/Items/ShortSword.png" Description="A lightweight, quick blade." Life="0" Mana="0" Dps="11" Armor="0"/>
+    <vdctx:Item Category="Hand" Name="Wooden Shield" Icon="studio:///Inventory;component/Images/Items/WoodenShield.png" Description="A basic shield of reinforced oak." Life="0" Mana="0" Dps="0" Armor="10"/>
+    <vdctx:Item Category="Hand" Name="Metal Shield" Icon="studio:///Inventory;component/Images/Items/MetalShield.png" Description="A sturdy shield of polished steel." Life="0" Mana="0" Dps="0" Armor="25"/>
+    <vdctx:Item Category="Ring" Name="Silver Ring" Icon="studio:///Inventory;component/Images/Items/SilverRing.png" Description="A simple ring of tarnished silver." Life="0" Mana="20" Dps="0" Armor="0"/>
+    <vdctx:Item Category="Ring" Name="Golden Ring" Icon="studio:///Inventory;component/Images/Items/GoldRing.png" Description="An elegant gold band." Life="25" Mana="0" Dps="0" Armor="0"/>
+    <vdctx:Item Category="Ring" Name="Dwarven Ring" Icon="studio:///Inventory;component/Images/Items/DwarvenRing.png" Description="Forged in the deep mines." Life="30" Mana="0" Dps="0" Armor="10"/>
+    <vdctx:Item Category="Ring" Name="Elven Ring" Icon="studio:///Inventory;component/Images/Items/ElvenRing.png" Description="Humming with ancient forest magic." Life="10" Mana="50" Dps="0" Armor="0"/>
+    <vdctx:Item Category="Ring" Name="Ouroboros Ring" Icon="studio:///Inventory;component/Images/Items/OuroborosRing.png" Description="The snake consumes its own tail." Life="40" Mana="40" Dps="0" Armor="0"/>
+    <vdctx:Item Category="Ring" Name="Sage Ring" Icon="studio:///Inventory;component/Images/Items/SageRing.png" Description="Worn by the scholars of old." Life="0" Mana="100" Dps="0" Armor="0"/>
+    <vdctx:Item Category="Ring" Name="Enchanted Ring" Icon="studio:///Inventory;component/Images/Items/EnchantedRing.png" Description="Glows with a faint blue light." Life="0" Mana="30" Dps="5" Armor="0"/>
+    <vdctx:Item Category="Ring" Name="Guardian Ring" Icon="studio:///Inventory;component/Images/Items/GuardianRing.png" Description="Radiates a protective aura." Life="40" Mana="0" Dps="0" Armor="15"/>
+    <vdctx:Item Category="Chest" Name="Wool Shirt" Icon="studio:///Inventory;component/Images/Items/WoolShirt.png" Description="Itches slightly, but keeps you warm." Life="5" Mana="0" Dps="0" Armor="2"/>
+    <vdctx:Item Category="Arms" Name="Leather Gloves" Icon="studio:///Inventory;component/Images/Items/LeatherGloves.png" Description="Supple leather offering good grip." Life="0" Mana="0" Dps="0" Armor="3"/>
+    <vdctx:Item Category="Legs" Name="Breeches" Icon="studio:///Inventory;component/Images/Items/Breeches.png" Description="Standard linen trousers." Life="0" Mana="0" Dps="0" Armor="2"/>
+    <vdctx:Item Category="Feet" Name="Sandals" Icon="studio:///Inventory;component/Images/Items/Sandals.png" Description="Better than walking barefoot." Life="0" Mana="5" Dps="0" Armor="1"/>
+    <vdctx:Item Category="Head" Name="Hood" Icon="studio:///Inventory;component/Images/Items/Hood.png" Description="Conceals your identity." Life="0" Mana="10" Dps="0" Armor="2"/>
+    <vdctx:Item Category="Chest" Name="Vest" Icon="studio:///Inventory;component/Images/Items/Vest.png" Description="A lightweight sleeveless garment." Life="0" Mana="0" Dps="0" Armor="3"/>
+    <vdctx:Item Category="Arms" Name="Frock" Icon="studio:///Inventory;component/Images/Items/Frock.png" Description="A loose outer garment." Life="0" Mana="15" Dps="0" Armor="2"/>
+    <vdctx:Item Category="Legs" Name="Breacan" Icon="studio:///Inventory;component/Images/Items/Breacan.png" Description="A traditional tartan cloth." Life="10" Mana="0" Dps="0" Armor="3"/>
+    <vdctx:Item Category="Feet" Name="Boots" Icon="studio:///Inventory;component/Images/Items/Boots.png" Description="Sturdy leather walking boots." Life="0" Mana="0" Dps="0" Armor="4"/>
+    <vdctx:Item Category="Head" Name="Cowl" Icon="studio:///Inventory;component/Images/Items/Cowl.png" Description="A heavy draped hood." Life="0" Mana="20" Dps="0" Armor="3"/>
+    <vdctx:Item Category="Chest" Name="Jerkin" Icon="studio:///Inventory;component/Images/Items/Jerkin.png" Description="A close-fitting leather jacket." Life="10" Mana="0" Dps="0" Armor="6"/>
+    <vdctx:Item Category="Arms" Name="Leather Vambrace" Icon="studio:///Inventory;component/Images/Items/LeatherVambrace.png" Description="Thickened leather for forearm protection." Life="0" Mana="0" Dps="0" Armor="5"/>
+    <vdctx:Item Category="Legs" Name="Pantaloons" Icon="studio:///Inventory;component/Images/Items/Pantaloons.png" Description="Baggy and comfortable." Life="0" Mana="10" Dps="0" Armor="2"/>
+    <vdctx:Item Category="Feet" Name="Padded Greaves" Icon="studio:///Inventory;component/Images/Items/PaddedGreaves.png" Description="Quilted leg guards." Life="10" Mana="0" Dps="0" Armor="6"/>
+    <vdctx:Item Category="Head" Name="Mail Hood" Icon="studio:///Inventory;component/Images/Items/MailHood.png" Description="Interlocking steel rings for the head." Life="0" Mana="0" Dps="0" Armor="12"/>
+    <vdctx:Item Category="Chest" Name="Mail Chemise" Icon="studio:///Inventory;component/Images/Items/MailChemise.png" Description="A full shirt of chainmail." Life="0" Mana="0" Dps="0" Armor="15"/>
+    <vdctx:Item Category="Arms" Name="Mail Vambrace" Icon="studio:///Inventory;component/Images/Items/MailVambrace.png" Description="Chainmail arm protection." Life="0" Mana="0" Dps="0" Armor="10"/>
+    <vdctx:Item Category="Legs" Name="Mail Skirt" Icon="studio:///Inventory;component/Images/Items/MailSkirt.png" Description="A skirt made of heavy chainmail." Life="0" Mana="0" Dps="0" Armor="12"/>
+    <vdctx:Item Category="Feet" Name="Mail Greaves" Icon="studio:///Inventory;component/Images/Items/MailGreaves.png" Description="Chainmail for the lower legs." Life="0" Mana="0" Dps="0" Armor="10"/>
+    <vdctx:Item Category="Head" Name="Knight Helmet" Icon="studio:///Inventory;component/Images/Items/KnightHelmet.png" Description="A closed helm with a visor." Life="20" Mana="0" Dps="0" Armor="20"/>
+    <vdctx:Item Category="Chest" Name="Plate Armor" Icon="studio:///Inventory;component/Images/Items/PlateArmor.png" Description="A mastercrafted steel breastplate." Life="50" Mana="0" Dps="0" Armor="35"/>
+    <vdctx:Item Category="Arms" Name="Plate Vambrace" Icon="studio:///Inventory;component/Images/Items/PlateVambrace.png" Description="Solid steel arm guards." Life="15" Mana="0" Dps="0" Armor="15"/>
+    <vdctx:Item Category="Legs" Name="Plate Cuisses" Icon="studio:///Inventory;component/Images/Items/PlateCuisses.png" Description="Articulated thigh armor." Life="25" Mana="0" Dps="0" Armor="20"/>
+    <vdctx:Item Category="Feet" Name="Plate Greaves sed" Icon="studio:///Inventory;component/Images/Items/PlateGreaves.png" Description="Heavy steel boots and shin guards." Life="20" Mana="0" Dps="0" Armor="18"/>
+  </vdctx:ViewModel.Inventory>
+  <vdctx:ViewModel.Defaults>
+    <vdctx:Item Category="Head"/>
+    <vdctx:Item Category="Chest"/>
+    <vdctx:Item Category="Arms"/>
+    <vdctx:Item Category="Legs"/>
+    <vdctx:Item Category="Feet"/>
+    <vdctx:Item Category="Hand"/>
+    <vdctx:Item Category="Ring"/>
+    <vdctx:Item Category="All"/>
+  </vdctx:ViewModel.Defaults>
+  <vdctx:ViewModel.Player>
+    <vdctx:Player Name="MORGAN HEARSON" Life="1423" Mana="345" Dps="2164" Armor="218">
+      <vdctx:Player.Slots>
+        <vdctx:Item Category="Head"/>
+        <vdctx:Item Category="Chest"/>
+        <vdctx:Item Category="Hand"/>
+        <vdctx:Item Category="Legs"/>
+        <vdctx:Item Category="Ring"/>
+        <vdctx:Item Category="Arms"/>
+        <vdctx:Item Category="Hand"/>
+        <vdctx:Item Category="Feet"/>
+      </vdctx:Player.Slots>
+    </vdctx:Player>
+  </vdctx:ViewModel.Player>
+</vdctx:ViewModel>

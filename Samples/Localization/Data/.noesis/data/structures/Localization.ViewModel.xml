@@ -1,0 +1,6 @@
+<Class Name="ViewModel" Namespace="Localization">
+  <Property Name="Languages" Type="Collection" SubType="Localization.Language" CollectionMinItemCount="4" CollectionMaxItemCount="4"/>
+  <Property Name="SelectedLanguage" Type="Object" SubType="Localization.Language"/>
+  <Property Name="SoundLevel" Type="Number" NumberMinValue="0" NumberMaxValue="100" NumberDecimalCount="0"/>
+  <Property Name="MusicLevel" Type="Number" NumberMinValue="0" NumberMaxValue="100" NumberDecimalCount="0"/>
+</Class>

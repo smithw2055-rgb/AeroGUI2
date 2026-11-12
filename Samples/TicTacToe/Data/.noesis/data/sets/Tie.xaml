@@ -1,0 +1,3 @@
+<vdctx:ViewModel xmlns:vdctx="clr-namespace:TicTacToe"
+                 Cell0="1" Cell1="2" Cell2="1" Cell3="1" Cell4="1" Cell5="2" Cell6="2" Cell7="1" Cell8="2" State="Tie">
+</vdctx:ViewModel>

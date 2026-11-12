@@ -1,0 +1,103 @@
+<ResourceDictionary
+  xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+  xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+  xmlns:noesis="clr-namespace:NoesisGUIExtensions">
+  <ControlTemplate x:Key="UserControl.Template.Progress" TargetType="ProgressBar">
+    <Border Margin="-1" Background="{Binding Path=Background, RelativeSource={RelativeSource TemplatedParent}}" BorderBrush="{Binding Path=BorderBrush, RelativeSource={RelativeSource TemplatedParent}}" BorderThickness="1">
+      <Grid x:Name="PART_Track">
+        <Border x:Name="PART_Indicator" HorizontalAlignment="Left" Background="{Binding Path=Foreground, RelativeSource={RelativeSource TemplatedParent}}"/>
+      </Grid>
+    </Border>
+  </ControlTemplate>
+  <Style x:Key="UserControl.Style.Progress" TargetType="ProgressBar" BasedOn="{StaticResource {x:Type ProgressBar}}">
+    <Setter Property="BorderThickness" Value="1"/>
+    <Setter Property="BorderBrush">
+      <Setter.Value>
+        <SolidColorBrush Color="#FF154A6B" Opacity="0.2"/>
+      </Setter.Value>
+    </Setter>
+    <Setter Property="Background">
+      <Setter.Value>
+        <SolidColorBrush Color="#FF061B2B" Opacity="0.8"/>
+      </Setter.Value>
+    </Setter>
+    <Setter Property="Height" Value="12"/>
+    <Setter Property="Margin" Value="15,0,0,0"/>
+    <Setter Property="VerticalAlignment" Value="Center"/>
+    <Setter Property="Maximum" Value="20"/>
+    <Setter Property="Template" Value="{DynamicResource UserControl.Template.Progress}"/>
+  </Style>
+  <Style x:Key="UserControl.Style.Focus" TargetType="Control">
+    <Setter Property="Template">
+      <Setter.Value>
+        <ControlTemplate>
+          <Border Margin="-2" BorderBrush="#FF087599" BorderThickness="2" CornerRadius="6">
+            <Border.Effect>
+              <DropShadowEffect Color="#FF0099CC" BlurRadius="10" ShadowDepth="0" Opacity="0.8"/>
+            </Border.Effect>
+          </Border>
+        </ControlTemplate>
+      </Setter.Value>
+    </Setter>
+  </Style>
+  <ControlTemplate x:Key="UserControl.Template.RepeatButton" TargetType="RepeatButton">
+    <Border x:Name="Border" Background="Transparent" CornerRadius="6,6,6,6">
+      <ContentPresenter Margin="8,6" HorizontalAlignment="Center" VerticalAlignment="Center"/>
+    </Border>
+    <ControlTemplate.Triggers>
+      <Trigger Property="IsMouseOver" Value="True">
+        <Setter TargetName="Border" Property="Background">
+          <Setter.Value>
+            <SolidColorBrush Color="#FF154A6B" Opacity="0.9"/>
+          </Setter.Value>
+        </Setter>
+      </Trigger>
+      <Trigger Property="IsPressed" Value="True">
+        <Setter TargetName="Border" Property="Background">
+          <Setter.Value>
+            <SolidColorBrush Color="#FF154A6B" Opacity="0.6"/>
+          </Setter.Value>
+        </Setter>
+      </Trigger>
+      <Trigger Property="IsEnabled" Value="False">
+        <Setter Property="Opacity" Value="0.2"/>
+      </Trigger>
+    </ControlTemplate.Triggers>
+  </ControlTemplate>
+  <Style x:Key="RepeatButton" TargetType="RepeatButton" BasedOn="{StaticResource {x:Type RepeatButton}}">
+    <Setter Property="Template" Value="{StaticResource UserControl.Template.RepeatButton}"/>
+    <Setter Property="FocusVisualStyle" Value="{StaticResource UserControl.Style.Focus}"/>
+  </Style>
+  <Style x:Key="MinRepeatButton" TargetType="RepeatButton" BasedOn="{StaticResource {x:Type RepeatButton}}">
+    <Style.Triggers>
+      <DataTrigger Value="0">
+        <DataTrigger.Binding>
+          <MultiBinding>
+            <MultiBinding.Converter>
+              <noesis:MathConverter Expression="{}{0} - {1}"/>
+            </MultiBinding.Converter>
+            <Binding Path="Value" ElementName="NumericUpDownControl"/>
+            <Binding Path="MinValue" ElementName="NumericUpDownControl"/>
+          </MultiBinding>
+        </DataTrigger.Binding>
+        <Setter Property="IsEnabled" Value="False"/>
+      </DataTrigger>
+    </Style.Triggers>
+  </Style>
+  <Style x:Key="MaxRepeatButton" TargetType="RepeatButton" BasedOn="{StaticResource {x:Type RepeatButton}}">
+    <Style.Triggers>
+      <DataTrigger Value="0">
+        <DataTrigger.Binding>
+          <MultiBinding>
+            <MultiBinding.Converter>
+              <noesis:MathConverter Expression="{}{1} - {0}"/>
+            </MultiBinding.Converter>
+            <Binding Path="Value" ElementName="NumericUpDownControl"/>
+            <Binding Path="MaxValue" ElementName="NumericUpDownControl"/>
+          </MultiBinding>
+        </DataTrigger.Binding>
+        <Setter Property="IsEnabled" Value="False"/>
+      </DataTrigger>
+    </Style.Triggers>
+  </Style>
+</ResourceDictionary>

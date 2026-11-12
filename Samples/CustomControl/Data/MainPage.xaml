@@ -1,0 +1,200 @@
+<Page
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    xmlns:local="clr-namespace:CustomControl"
+    xmlns:noesis="clr-namespace:NoesisGUIExtensions"
+    xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
+    xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+    mc:Ignorable="d"
+    Title="NoesisGUI - CustomControl"
+    Background="White"
+    FontFamily="./#Aero Matics">
+
+  <Page.Resources>
+
+    <!-- Digital clock style -->
+    <ControlTemplate x:Key="DigitalDateTimeTemplate" TargetType="{x:Type local:DateTime}">
+      <Viewbox>
+        <StackPanel>
+          <StackPanel Orientation="Horizontal" HorizontalAlignment="Center" TextElement.FontSize="40">
+            <TextBlock>
+              <TextBlock.Text>
+                <Binding Path="Hour" StringFormat="G" RelativeSource="{RelativeSource TemplatedParent}">
+                  <Binding.Converter>
+                    <noesis:MathConverter Expression="floor({0})"/>
+                  </Binding.Converter>
+                </Binding>
+              </TextBlock.Text>
+            </TextBlock>
+            <TextBlock Text=":"/>
+            <TextBlock>
+              <TextBlock.Text>
+                <Binding Path="Minute" StringFormat="{}{0:00}" RelativeSource="{RelativeSource TemplatedParent}">
+                  <Binding.Converter>
+                    <noesis:MathConverter Expression="floor({0})"/>
+                  </Binding.Converter>
+                </Binding>
+              </TextBlock.Text>
+            </TextBlock>
+          </StackPanel>
+          <StackPanel Orientation="Horizontal" HorizontalAlignment="Center" TextElement.FontSize="16">
+            <TextBlock Text="{Binding Day, StringFormat={}{0:00}, RelativeSource={RelativeSource TemplatedParent}}"/>
+            <TextBlock Text="/"/>
+            <TextBlock Text="{Binding Month, StringFormat={}{0:00}, RelativeSource={RelativeSource TemplatedParent}}"/>
+            <TextBlock Text="/"/>
+            <TextBlock Text="{Binding Year, StringFormat=G, RelativeSource={RelativeSource TemplatedParent}}"/>
+          </StackPanel>
+        </StackPanel>
+      </Viewbox>
+    </ControlTemplate>
+    <Style x:Key="DigitalStyle" TargetType="{x:Type local:DateTime}">
+      <Setter Property="Template" Value="{StaticResource DigitalDateTimeTemplate}"/>
+    </Style>
+
+    <!-- Analog clock style -->
+    <ControlTemplate x:Key="AnalogDateTimeTemplate" TargetType="{x:Type local:DateTime}">
+      <Viewbox>
+        <Grid Width="400" Height="400">
+
+          <Ellipse Margin="20">
+            <Ellipse.Fill>
+              <RadialGradientBrush GradientOrigin="0.5,0.55" Center="0.5,0.55">
+                <GradientStop Color="#FFFFFFFF" Offset="0.0" />
+                <GradientStop Offset="0.8" Color="#FFEBEBEB"/>
+                <GradientStop Offset="1.0" Color="#FFD1D1D1"/>
+              </RadialGradientBrush>
+            </Ellipse.Fill>
+          </Ellipse>
+
+          <noesis:RadialTicks TickLength="10" Minimum="0" Maximum="60" Spacing="1" MinAngle="0"
+            MaxAngle="360" TickWidth="3" Padding="25" Brush="#FF333333" />
+
+          <noesis:RadialTicks TickLength="23" Minimum="0" Maximum="60" Spacing="5" MinAngle="0" MaxAngle="360" 
+            TickWidth="8" Padding="25" Brush="#FF222222" />
+
+          <noesis:RadialNeedle MinAngle="0" MaxAngle="360" Minimum="0" Maximum="12">
+            <noesis:RadialNeedle.Value>
+              <Binding Path="Hour" RelativeSource="{RelativeSource TemplatedParent}">
+                <Binding.Converter>
+                  <noesis:MathConverter Expression="{}{0}%12"/>
+                </Binding.Converter>
+              </Binding>
+            </noesis:RadialNeedle.Value>
+            <Grid>
+              <Path Data="M14.2155,0C16.4246,0 18.2154,1.79086 18.2154,4L20,146C20,148.209 18.2091,150 16,150L4,150C1.79086,150 0,148.209 0,146L1.78491,4C1.78491,1.79086 3.57571,0 5.78485,0z" Stretch="Fill" Width="20" Height="150" Margin="0,0,0,-30">
+                <Path.Fill>
+                  <LinearGradientBrush StartPoint="0.5,0" EndPoint="0.5,1">
+                    <GradientStop Offset="0" Color="#FF333333"/>
+                    <GradientStop Offset="1" Color="#FF1A1A1A"/>
+                  </LinearGradientBrush>
+                </Path.Fill>
+                <Path.Effect>
+                  <DropShadowEffect BlurRadius="4" ShadowDepth="1" Opacity="0.5"/>
+                </Path.Effect>
+              </Path>
+            </Grid>
+          </noesis:RadialNeedle>
+
+          <noesis:RadialNeedle Value="{Binding Path=Minute, RelativeSource={RelativeSource TemplatedParent}}" Minimum="0" Maximum="60" MinAngle="0" MaxAngle="360">
+            <Grid>
+              <Path Data="M12.4308,0C13.5354,0 14.4308,0.895555 14.4308,2.00012L18,188C18,189.105 17.1046,190 16,190L2,190C0.89543,190 0,189.105 0,188L3.56958,2.00012C3.56958,0.895555 4.46507,0 5.56964,0z" Stretch="Fill" Width="18" Height="190" Margin="0,0,0,-30" Fill="#FF333333">
+                <Path.Effect>
+                  <DropShadowEffect BlurRadius="4" ShadowDepth="1" Opacity="0.4"/>
+                </Path.Effect>
+              </Path>
+            </Grid>
+          </noesis:RadialNeedle>
+
+          <noesis:RadialNeedle Value="{Binding Path=Second, RelativeSource={RelativeSource TemplatedParent}}" Minimum="0" Maximum="60" MinAngle="0" MaxAngle="360">
+            <Grid>
+              <Grid.Effect>
+                <DropShadowEffect BlurRadius="4" ShadowDepth="1" Opacity="0.3"/>
+              </Grid.Effect>
+              <Rectangle Width="4" Height="210" Margin="0,0,0,-40" Fill="#FFD01010"/>
+              <Ellipse Width="20" Height="20" Margin="0,0,0,-50" VerticalAlignment="Bottom" Fill="#FFD01010"/>
+              <Ellipse Width="14" Height="14" Margin="0,0,0,-7" HorizontalAlignment="Center" VerticalAlignment="Bottom" Fill="#FFD01010"/>
+              <Ellipse Width="6" Height="6" Margin="0,0,0,-3" HorizontalAlignment="Center" VerticalAlignment="Bottom" Fill="#FFF0F0F0"/>
+            </Grid>
+          </noesis:RadialNeedle>
+          <Ellipse StrokeThickness="20">
+            <Ellipse.Stroke>
+              <LinearGradientBrush StartPoint="0,0.5" EndPoint="1,0.5">
+                <GradientStop Offset="0" Color="#FF8A8A8A"/>
+                <GradientStop Offset="1" Color="#FF939496"/>
+                <GradientStop Color="#c9c9c9" Offset="0.5"/>
+              </LinearGradientBrush>
+            </Ellipse.Stroke>
+          </Ellipse>
+          <Ellipse Margin="2,2,2,2" StrokeThickness="18">
+            <Ellipse.Stroke>
+              <LinearGradientBrush StartPoint="0.51,0" EndPoint="0.49,1">
+                <GradientStop Offset="0" Color="#FFF2F2F2"/>
+                <GradientStop Offset="0.46" Color="#00898989"/>
+                <GradientStop Offset="0.47" Color="#686868"/>
+                <GradientStop Offset="1" Color="#00939496"/>
+              </LinearGradientBrush>
+            </Ellipse.Stroke>
+          </Ellipse>
+          <Ellipse Margin="20,20,20,20" StrokeThickness="6">
+            <Ellipse.Stroke>
+              <LinearGradientBrush StartPoint="0.5,0" EndPoint="0.5,1" Opacity="0.8">
+                <GradientStop Offset="0" Color="#FF666669"/>
+                <GradientStop Offset="1" Color="#FFB9BBBE"/>
+              </LinearGradientBrush>
+            </Ellipse.Stroke>
+            <Ellipse.Effect>
+              <BlurEffect Radius="4"/>
+            </Ellipse.Effect>
+          </Ellipse>
+          <Ellipse Margin="20,20,20,20" StrokeThickness="2">
+            <Ellipse.Stroke>
+              <LinearGradientBrush StartPoint="0.5,0" EndPoint="0.5,1">
+                <GradientStop Offset="0" Color="#FF59595C"/>
+                <GradientStop Offset="1" Color="#FFDADCE0"/>
+              </LinearGradientBrush>
+            </Ellipse.Stroke>
+          </Ellipse>
+          <Ellipse Margin="19,19,19,19">
+            <Ellipse.Stroke>
+              <LinearGradientBrush EndPoint="0.135546,0.848263" StartPoint="0.863652,0.145145" Opacity="0.9">
+                <GradientStop Color="#FF4A4A4D" Offset="0.8"/>
+                <GradientStop Color="#FFD0D2D6" Offset="1"/>
+              </LinearGradientBrush>
+            </Ellipse.Stroke>
+          </Ellipse>
+
+        </Grid>
+      </Viewbox>
+    </ControlTemplate>
+    <Style TargetType="{x:Type local:DateTime}">
+      <Setter Property="Template" Value="{StaticResource AnalogDateTimeTemplate}"/>
+    </Style>
+
+  </Page.Resources>
+
+  <Viewbox>
+    <StackPanel Margin="50">
+
+      <TextBlock Text="DateTime Custom Control" Background="DodgerBlue" Foreground="White"
+                FontSize="40" Padding="0,20" TextAlignment="Center"/>
+
+      <Border Background="WhiteSmoke" Padding="40">
+        <StackPanel>
+          <StackPanel Orientation="Horizontal" Margin="0,0,0,40">
+            <TextBlock Text="Analog Clock Template: " VerticalAlignment="Center" FontSize="20" Width="230"/>
+            <local:DateTime Day="6" Month="2" Year="2012" Hour="19" Minute="12" Second="51" Width="200"/>
+          </StackPanel>
+
+          <StackPanel Orientation="Horizontal">
+            <TextBlock Text="Digital Clock Template: " VerticalAlignment="Center" FontSize="20" Width="230"/>
+            <local:DateTime Day="6" Month="2" Year="2012" Hour="19" Minute="12" Second="51"
+              Style="{StaticResource DigitalStyle}" Width="200" Height="70"/>
+          </StackPanel>
+        </StackPanel>
+      </Border>
+
+    </StackPanel>
+  </Viewbox>
+
+</Page>
+  

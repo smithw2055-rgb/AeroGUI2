@@ -1,0 +1,4 @@
+<Enum Name="Team">
+  <Item Name="Alliance" Value="0"/>
+  <Item Name="Horde" Value="1"/>
+</Enum>

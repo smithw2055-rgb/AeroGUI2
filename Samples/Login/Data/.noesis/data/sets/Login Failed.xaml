@@ -1,0 +1,7 @@
+<vdctx:ViewModel xmlns:system="clr-namespace:System"
+  xmlns:vdctx="clr-namespace:Login"
+                 Message="ACCOUNT NAME OR PASSWORD IS INCORRECT">
+  <vdctx:ViewModel.LoginCommand>
+    <MessageCommand Message="Login Failed"/>
+  </vdctx:ViewModel.LoginCommand>
+</vdctx:ViewModel>

@@ -1,0 +1,45 @@
+<Window
+  xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+  xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+  xmlns:local="clr-namespace:CustomRender"
+  Title="NoesisGUI - CustomRender"
+  SizeToContent="WidthAndHeight"
+  ResizeMode="NoResize"
+  Background="Black"
+  FontFamily="./#Orbitron">
+
+  <Grid Width="800" Height="600">
+    <local:Game x:Name="GameControl"/>
+    <Grid IsHitTestVisible="False" Margin="20">
+      <StackPanel Orientation="Horizontal" HorizontalAlignment="Left" VerticalAlignment="Top">
+        <TextBlock Text="SCORE: " Foreground="White" FontSize="28" >
+          <TextBlock.Effect>
+            <DropShadowEffect Color="Black" BlurRadius="5" ShadowDepth="2"/>
+          </TextBlock.Effect>
+        </TextBlock>
+        <TextBlock Text="{Binding Score, ElementName=GameControl}" Foreground="White" FontSize="28">
+          <TextBlock.Effect>
+            <DropShadowEffect Color="Black" BlurRadius="5" ShadowDepth="2"/>
+          </TextBlock.Effect>
+        </TextBlock>
+      </StackPanel>
+
+      <StackPanel HorizontalAlignment="Center" VerticalAlignment="Top" Margin="0, 270, 0, 0">
+        <TextBlock Text="{Binding StatusText, ElementName=GameControl}" 
+                   Foreground="Red" FontSize="48"
+                   HorizontalAlignment="Center" Margin="0, 0, 0, 10">
+          <TextBlock.Effect>
+            <DropShadowEffect Color="Black" BlurRadius="15" ShadowDepth="4"/>
+          </TextBlock.Effect>
+        </TextBlock>
+        <TextBlock Text="{Binding ActionText, ElementName=GameControl}" 
+                   Foreground="White" FontSize="36"
+                   HorizontalAlignment="Center">
+          <TextBlock.Effect>
+            <DropShadowEffect Color="Black" BlurRadius="15" ShadowDepth="4"/>
+          </TextBlock.Effect>
+        </TextBlock>
+      </StackPanel>
+    </Grid>
+  </Grid>
+</Window>

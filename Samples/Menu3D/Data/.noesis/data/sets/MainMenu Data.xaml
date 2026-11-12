@@ -1,0 +1,8 @@
+<vdctx:MainMenu xmlns:vdctx="clr-namespace:Menu3D">
+  <vdctx:MainMenu.Description>
+    <vdctx:MenuDescription Description="MAIN MENU" AcceptText="ACCEPT" CancelText="EXIT"/>
+  </vdctx:MainMenu.Description>
+  <vdctx:MainMenu.Exit>
+    <MessageCommand Message="Exiting game"/>
+  </vdctx:MainMenu.Exit>
+</vdctx:MainMenu>

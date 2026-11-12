@@ -6,6 +6,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
+#include <fstream>
+#include <iterator>
 #include <limits>
 #include <string>
 #include <system_error>
@@ -13,6 +15,7 @@
 
 #include "aero/controls/Controls.hpp"
 #include "aero/core/TypeClass.hpp"
+#include "aero/core/UiResourceContext.hpp"
 #include "realscript/aot_cpp/AotCpp.h"
 #include "realscript/bytecode/Bytecode.h"
 
@@ -302,6 +305,10 @@ bool ResolveExternalXamlSource(
             addCandidate(baseDir / parsed.assemblyName / relSub);
             addCandidate(baseDir / parsed.assemblyName / "Data" / relSub);
         }
+        if (!relSub.empty()) {
+            addCandidate(baseDir / "Data" / relSub);
+            addCandidate(baseDir / "Theme" / "Data" / relSub);
+        }
     };
 
     appendUnderBase(curDir);
@@ -318,10 +325,16 @@ bool ResolveExternalXamlSource(
         if (!parentUp.empty()) {
             addCandidate(parentUp / parsed.assemblyName / relSub);
             addCandidate(parentUp / parsed.assemblyName / "Data" / relSub);
+            addCandidate(parentUp / "Theme" / "Data" / relSub);
             const std::filesystem::path parentUp2 = parentUp.parent_path();
             if (!parentUp2.empty()) {
                 addCandidate(parentUp2 / parsed.assemblyName / relSub);
                 addCandidate(parentUp2 / parsed.assemblyName / "Data" / relSub);
+                addCandidate(parentUp2 / "Theme" / "Data" / relSub);
+                const std::filesystem::path parentUp3 = parentUp2.parent_path();
+                if (!parentUp3.empty()) {
+                    addCandidate(parentUp3 / "Theme" / "Data" / relSub);
+                }
             }
         }
     }
@@ -677,6 +690,8 @@ std::string NormalizeXamlFormatOrExpr(std::string_view raw) {
 
 struct ParsedBindingClause {
     bool isValidBinding = false;
+    bool hasExplicitMode = false;
+    bool isAttachedPropertyPath = false;
     BindingMode mode = BindingMode::OneWay;
     std::string_view pathPart;
     std::string_view fallbackValue;
@@ -816,6 +831,7 @@ ParsedBindingClause ParseBindingMarkupExpression(std::string_view rawExpr) {
         if (clause.rfind("Path=", 0) == 0) {
             out.pathPart = Trim(clause.substr(5u));
         } else if (clause.rfind("Mode=", 0) == 0) {
+            out.hasExplicitMode = true;
             const std::string_view mStr = Trim(clause.substr(5u));
             if (mStr == "TwoWay") out.mode = BindingMode::TwoWay;
             else if (mStr == "OneTime") out.mode = BindingMode::OneTime;
@@ -868,6 +884,7 @@ ParsedBindingClause ParseBindingMarkupExpression(std::string_view rawExpr) {
     // Strip parentheses around attached property paths like "(noesis:DragDrop.IsContentEmpty)"
     if (out.pathPart.size() > 2u && out.pathPart.front() == '(' && out.pathPart.back() == ')') {
         out.pathPart = Trim(out.pathPart.substr(1u, out.pathPart.size() - 2u));
+        out.isAttachedPropertyPath = true;
     }
     return out;
 }
@@ -968,12 +985,44 @@ struct XmlScopeEntry {
     std::string inlineStyleKey;
     std::uint16_t targetPropId = PropId_Background;
     bool brushAssigned = false;
+    bool isImageBrushScope = false;
+    std::uint8_t imageBrushStretch = 1u;
     bool isItemTemplateContainer = false;
     bool isControlTemplateContainer = false;
     bool isMergedDictSourceElement = false;
     Matrix2D accumulatedTransform = Matrix2D::Identity();
     std::string accumulatedText;
 };
+
+[[nodiscard]] std::uint8_t ParseImageBrushStretchCode(std::string_view rawStretch) noexcept {
+    const std::string_view s = Trim(rawStretch);
+    if (EqualsIgnoreCase(s, "None")) return 0u;
+    if (EqualsIgnoreCase(s, "Fill")) return 1u;
+    if (EqualsIgnoreCase(s, "Uniform")) return 2u;
+    if (EqualsIgnoreCase(s, "UniformToFill")) return 3u;
+    return 1u; // WPF/Noesis TileBrush.Stretch default is Fill
+}
+
+[[nodiscard]] std::string_view StripImageBrushSpecPrefix(std::string_view sv) noexcept {
+    if (sv.size() > 16u && sv.rfind("AERO_IMGBRUSH:", 0) == 0 &&
+        sv[15] == ':' && sv[14] >= '0' && sv[14] <= '3') {
+        return sv.substr(16u);
+    }
+    return sv;
+}
+
+[[nodiscard]] std::string EncodeImageBrushSpec(std::uint8_t stretchCode, std::string_view bareUri) {
+    if (stretchCode == 1u) {
+        return std::string(bareUri);
+    }
+    std::string out;
+    out.reserve(16u + bareUri.size());
+    out.append("AERO_IMGBRUSH:");
+    out.push_back(static_cast<char>('0' + (stretchCode <= 3u ? stretchCode : 1u)));
+    out.push_back(':');
+    out.append(bareUri);
+    return out;
+}
 
 enum class SetterOwnerKind : std::uint8_t {
     Style = 0,
@@ -2564,23 +2613,47 @@ AeroCompileResult AeroCompiler::CompileInternal(
         }
     };
 
-    auto splitPathIntoHops = [](std::string_view pathPart, std::vector<AxbCompiledHop>& outHops) {
+    auto splitPathIntoHops = [](std::string_view pathPart,
+                                std::vector<AxbCompiledHop>& outHops,
+                                bool keepSingleAttachedPropertyHop = false) {
+        pathPart = Trim(pathPart);
         if (pathPart.empty() || pathPart == ".") {
             return;
         }
-        std::size_t segPos = 0u;
-        while (segPos < pathPart.size()) {
-            const std::size_t dot = pathPart.find('.', segPos);
-            const std::string_view seg = (dot == std::string_view::npos)
-                ? pathPart.substr(segPos)
-                : pathPart.substr(segPos, dot - segPos);
-            if (!seg.empty()) {
-                AxbCompiledHop hop{};
-                hop.memberName = std::string(seg);
-                outHops.push_back(std::move(hop));
+        auto pushHopSegment = [&](std::string_view rawSeg) {
+            std::string_view seg = Trim(rawSeg);
+            if (seg.size() >= 2u && seg.front() == '(' && seg.back() == ')') {
+                seg = Trim(seg.substr(1u, seg.size() - 2u));
             }
-            if (dot == std::string_view::npos) break;
-            segPos = dot + 1u;
+            if (seg.empty()) {
+                return;
+            }
+            AxbCompiledHop hop{};
+            std::string baseName;
+            std::int32_t parsedIdx = -1;
+            if (SplitIndexedMemberName(seg, baseName, parsedIdx)) {
+                hop.memberName = std::move(baseName);
+                hop.collectionIndex = parsedIdx;
+            } else {
+                hop.memberName = std::string(seg);
+            }
+            outHops.push_back(std::move(hop));
+        };
+        if (keepSingleAttachedPropertyHop) {
+            pushHopSegment(pathPart);
+            return;
+        }
+        std::size_t segStart = 0u;
+        int parenDepth = 0;
+        for (std::size_t i = 0u; i <= pathPart.size(); ++i) {
+            if (i < pathPart.size()) {
+                if (pathPart[i] == '(') ++parenDepth;
+                else if (pathPart[i] == ')' && parenDepth > 0) --parenDepth;
+            }
+            if (i == pathPart.size() || (pathPart[i] == '.' && parenDepth == 0)) {
+                pushHopSegment(pathPart.substr(segStart, i - segStart));
+                segStart = i + 1u;
+            }
         }
     };
 
@@ -2631,7 +2704,11 @@ AeroCompileResult AeroCompiler::CompileInternal(
             fbInst.literalValue = parsedFallback;
             pkg.instructions.push_back(std::move(fbInst));
         }
-        if (parsedBind.pathPart.empty() || parsedBind.pathPart == ".") {
+        const bool hasElementOrRelSource =
+            !parsedBind.elementName.empty() ||
+            !parsedBind.relativeAncestorType.empty() ||
+            parsedBind.relativeSelf;
+        if ((parsedBind.pathPart.empty() || parsedBind.pathPart == ".") && !hasElementOrRelSource) {
             return !parsedBind.fallbackValue.empty();
         }
 
@@ -2648,7 +2725,11 @@ AeroCompileResult AeroCompiler::CompileInternal(
         chain.converterParameter = parsedBind.converterParameter;
         chain.stringFormat = parsedBind.stringFormat;
         resolveConverterResource(chain.converter, chain.converterKey);
-        splitPathIntoHops(parsedBind.pathPart, chain.hops);
+        const bool keepAttachedSingle = parsedBind.isAttachedPropertyPath ||
+            (hasElementOrRelSource &&
+             parsedBind.pathPart.find('.') != std::string_view::npos &&
+             ResolveMappedSetterPropertyId(parsedBind.pathPart) != kUnmappedPropId);
+        splitPathIntoHops(parsedBind.pathPart, chain.hops, keepAttachedSingle);
 
         const auto chainIdx = static_cast<std::uint32_t>(pkg.bindingChains.size());
         pkg.bindingChains.push_back(std::move(chain));
@@ -2705,7 +2786,10 @@ AeroCompileResult AeroCompiler::CompileInternal(
             fbInst.literalValue = chain.fallbackValue;
             pkg.instructions.push_back(std::move(fbInst));
         }
-        if (chain.rawPath.empty() || chain.rawPath == ".") {
+        const bool hasElemSrc = !chain.elementName.empty() ||
+                                !chain.relativeAncestorType.empty() ||
+                                chain.relativeSelf;
+        if ((chain.rawPath.empty() || chain.rawPath == ".") && !hasElemSrc) {
             return;
         }
         const std::uint16_t propId = chain.targetPropertyId;
@@ -2754,7 +2838,8 @@ AeroCompileResult AeroCompiler::CompileInternal(
         if (trimmed.size() > 2u && trimmed.front() == '{' && trimmed.back() == '}') {
             const std::string_view resKey = ExtractMarkupResourceKey(trimmed);
             if (!resKey.empty()) {
-                if (propId == PropId_Template || propId == PropId_ItemTemplate || propId == PropId_Style) {
+                if (propId == PropId_Template || propId == PropId_ItemTemplate ||
+                    propId == PropId_ContentTemplate || propId == PropId_Style) {
                     outValid = true;
                     return value::FromString(std::string(resKey));
                 }
@@ -2781,7 +2866,8 @@ AeroCompileResult AeroCompiler::CompileInternal(
     };
 
     auto commitSetterToOwner = [&](AxbPropertySetter&& s, SetterOwnerKind owner) {
-        if (s.propId == kUnmappedPropId || std::holds_alternative<std::monostate>(s.value)) {
+        if (s.propId == kUnmappedPropId ||
+            (!s.hasBinding && std::holds_alternative<std::monostate>(s.value))) {
             return;
         }
         if (owner == SetterOwnerKind::VisualState && !visualStateStack.empty()) {
@@ -2837,14 +2923,59 @@ AeroCompileResult AeroCompiler::CompileInternal(
             }
         }
 
+        auto splitSubObjectHopsAfterFirstDot = [&](std::string_view pathView, std::string_view& outFirstSeg) {
+            outFirstSeg = pathView;
+            if (pathView.empty() || pathView.front() == '(') {
+                return;
+            }
+            const std::size_t firstDot = pathView.find('.');
+            if (firstDot == std::string_view::npos) {
+                return;
+            }
+            const std::string_view candFirst = pathView.substr(0u, firstDot);
+            if (candFirst != "DataContext" && candFirst != "Content" &&
+                candFirst != "SelectedItem" && candFirst != "Tag") {
+                return;
+            }
+            outFirstSeg = candFirst;
+            std::size_t segPos = firstDot + 1u;
+            while (segPos < pathView.size()) {
+                const std::size_t dot = pathView.find('.', segPos);
+                const std::string_view seg = (dot == std::string_view::npos)
+                    ? pathView.substr(segPos)
+                    : pathView.substr(segPos, dot - segPos);
+                if (!seg.empty()) {
+                    AxbCompiledHop hop{};
+                    std::string baseMem;
+                    std::int32_t collIdx = -1;
+                    if (SplitIndexedMemberName(seg, baseMem, collIdx)) {
+                        hop.memberName = std::move(baseMem);
+                        hop.collectionIndex = collIdx;
+                    } else {
+                        hop.memberName = std::string(seg);
+                    }
+                    outCond.compiledHops.push_back(std::move(hop));
+                }
+                if (dot == std::string_view::npos) break;
+                segPos = dot + 1u;
+            }
+        };
+
         if (parsed.relativeSelf || parsed.relativeTemplatedParent) {
             outCond.sourceKind = TriggerConditionSource::SelfProperty;
-            outCond.propId = ResolveMappedTriggerConditionId(parsed.pathPart);
+            outCond.bindingPath = std::string(parsed.pathPart);
+            std::string_view firstSeg;
+            splitSubObjectHopsAfterFirstDot(parsed.pathPart, firstSeg);
+            outCond.propId = ResolveMappedTriggerConditionId(firstSeg);
             if (outCond.propId == kUnmappedPropId) return false;
             if (!outCond.expectNull && std::holds_alternative<std::monostate>(outCond.expectedValue)) {
-                bool ok = false;
-                outCond.expectedValue = parseStyleOrAnimationValue(outCond.propId, trimmedVal, ok);
-                if (!ok) outCond.expectedValue = value::FromString(DecodeXamlXmlEntities(trimmedVal));
+                if (!outCond.compiledHops.empty()) {
+                    outCond.expectedValue = value::FromString(DecodeXamlXmlEntities(trimmedVal));
+                } else {
+                    bool ok = false;
+                    outCond.expectedValue = parseStyleOrAnimationValue(outCond.propId, trimmedVal, ok);
+                    if (!ok) outCond.expectedValue = value::FromString(DecodeXamlXmlEntities(trimmedVal));
+                }
             }
             return true;
         }
@@ -2852,10 +2983,14 @@ AeroCompileResult AeroCompiler::CompileInternal(
         if (!parsed.elementName.empty()) {
             outCond.sourceKind = TriggerConditionSource::ElementNameProperty;
             outCond.sourceName = std::string(parsed.elementName);
-            outCond.propId = ResolveMappedTriggerConditionId(parsed.pathPart);
+            outCond.bindingPath = std::string(parsed.pathPart);
+            std::string_view firstSeg;
+            splitSubObjectHopsAfterFirstDot(parsed.pathPart, firstSeg);
+            outCond.propId = ResolveMappedTriggerConditionId(firstSeg);
             if (outCond.propId == kUnmappedPropId) return false;
             if (!outCond.expectNull && std::holds_alternative<std::monostate>(outCond.expectedValue)) {
-                if (outCond.propId == PropId_SelectedItem || outCond.propId == PropId_Text ||
+                if (!outCond.compiledHops.empty() ||
+                    outCond.propId == PropId_SelectedItem || outCond.propId == PropId_Text ||
                     outCond.propId == PropId_Content || outCond.propId == PropId_Tag) {
                     outCond.expectedValue = value::FromString(DecodeXamlXmlEntities(trimmedVal));
                 } else {
@@ -2870,12 +3005,19 @@ AeroCompileResult AeroCompiler::CompileInternal(
         if (!parsed.relativeAncestorType.empty()) {
             outCond.sourceKind = TriggerConditionSource::AncestorProperty;
             outCond.sourceName = parsed.relativeAncestorType;
-            outCond.propId = ResolveMappedTriggerConditionId(parsed.pathPart);
+            outCond.bindingPath = std::string(parsed.pathPart);
+            std::string_view firstSeg;
+            splitSubObjectHopsAfterFirstDot(parsed.pathPart, firstSeg);
+            outCond.propId = ResolveMappedTriggerConditionId(firstSeg);
             if (outCond.propId == kUnmappedPropId) return false;
             if (!outCond.expectNull && std::holds_alternative<std::monostate>(outCond.expectedValue)) {
-                bool ok = false;
-                outCond.expectedValue = parseStyleOrAnimationValue(outCond.propId, trimmedVal, ok);
-                if (!ok) outCond.expectedValue = value::FromString(DecodeXamlXmlEntities(trimmedVal));
+                if (!outCond.compiledHops.empty()) {
+                    outCond.expectedValue = value::FromString(DecodeXamlXmlEntities(trimmedVal));
+                } else {
+                    bool ok = false;
+                    outCond.expectedValue = parseStyleOrAnimationValue(outCond.propId, trimmedVal, ok);
+                    if (!ok) outCond.expectedValue = value::FromString(DecodeXamlXmlEntities(trimmedVal));
+                }
             }
             return true;
         }
@@ -2892,7 +3034,14 @@ AeroCompileResult AeroCompiler::CompileInternal(
                     : parsed.pathPart.substr(segPos, dot - segPos);
                 if (!seg.empty()) {
                     AxbCompiledHop hop{};
-                    hop.memberName = std::string(seg);
+                    std::string baseMem;
+                    std::int32_t collIdx = -1;
+                    if (SplitIndexedMemberName(seg, baseMem, collIdx)) {
+                        hop.memberName = std::move(baseMem);
+                        hop.collectionIndex = collIdx;
+                    } else {
+                        hop.memberName = std::string(seg);
+                    }
                     outCond.compiledHops.push_back(std::move(hop));
                 }
                 if (dot == std::string_view::npos) break;
@@ -2934,6 +3083,8 @@ AeroCompileResult AeroCompiler::CompileInternal(
                shortTag == "PlaneProjection" ||
                shortTag == "BlurEffect" ||
                shortTag == "DropShadowEffect" ||
+               shortTag == "PixelateEffect" ||
+               shortTag == "BackgroundEffectBehavior" ||
                shortTag == "RiveInput" ||
                IsAnimationTimelineTag(shortTag) ||
                IsAnimationKeyFrameTag(shortTag) ||
@@ -3033,7 +3184,8 @@ AeroCompileResult AeroCompiler::CompileInternal(
                     ActiveKeyFrameScope finishedKf = std::move(keyFrameStack.back());
                     keyFrameStack.pop_back();
                     if (!timelineStack.empty() &&
-                        !std::holds_alternative<std::monostate>(finishedKf.kf.value)) {
+                        (!std::holds_alternative<std::monostate>(finishedKf.kf.value) ||
+                         !finishedKf.kf.bindingElementName.empty())) {
                         timelineStack.back().tl.keyFrames.push_back(std::move(finishedKf.kf));
                     }
                 }
@@ -3093,6 +3245,16 @@ AeroCompileResult AeroCompiler::CompileInternal(
                         finishedGrad.desc.stops.push_back(GradientStop{0.0f, Color{0.0f, 0.0f, 0.0f, 1.0f}});
                         finishedGrad.desc.stops.push_back(GradientStop{1.0f, Color{1.0f, 1.0f, 1.0f, 1.0f}});
                     }
+                    float separatedBrushOpacity = 1.0f;
+                    bool emitSeparatedBrushOpacity = false;
+                    if (finishedGrad.owner == GradientScopeOwner::PropertyElement &&
+                        (finishedGrad.targetPropId == PropId_Background ||
+                         finishedGrad.targetPropId == PropId_BorderBrush) &&
+                        std::fabs(finishedGrad.desc.opacity - 1.0f) > 1e-5f) {
+                        separatedBrushOpacity = std::clamp(finishedGrad.desc.opacity, 0.0f, 1.0f);
+                        finishedGrad.desc.opacity = 1.0f;
+                        emitSeparatedBrushOpacity = true;
+                    }
                     BakeGradientBrushRamp(finishedGrad.desc);
                     const std::string spec = SerializeGradientBrushSpec(finishedGrad.desc);
                     (void)GradientBrushRegistry::Instance().RegisterOrResolveSpec(spec);
@@ -3103,6 +3265,15 @@ AeroCompileResult AeroCompiler::CompileInternal(
                         setInst.propId = finishedGrad.targetPropId;
                         setInst.literalValue = value::FromString(spec);
                         pkg.instructions.push_back(std::move(setInst));
+                        if (emitSeparatedBrushOpacity) {
+                            AxbInstruction opInst{};
+                            opInst.opcode = AxbOpcode::SetStaticProperty;
+                            opInst.propId = (finishedGrad.targetPropId == PropId_BorderBrush)
+                                ? static_cast<std::uint16_t>(PropId_BorderOpacity)
+                                : static_cast<std::uint16_t>(PropId_BackgroundOpacity);
+                            opInst.literalValue = MakeFloat(separatedBrushOpacity);
+                            pkg.instructions.push_back(std::move(opInst));
+                        }
                     } else if (finishedGrad.owner == GradientScopeOwner::KeyedResource &&
                                !finishedGrad.resourceKey.empty()) {
                         pkg.resources.emplace_back(
@@ -3346,10 +3517,31 @@ AeroCompileResult AeroCompiler::CompileInternal(
                     propTextInst.propId = closed.targetPropId;
                     propTextInst.literalValue = value::FromString(std::move(closed.accumulatedText));
                     pkg.instructions.push_back(std::move(propTextInst));
+                } else if (closed.tagName == "PathFigure:Closed") {
+                    for (auto it = scopeStack.rbegin(); it != scopeStack.rend(); ++it) {
+                        if (it->kind == XmlScopeKind::VisualElement) break;
+                        if ((it->kind == XmlScopeKind::TransparentContainer && it->targetPropId == PropId_PathData) ||
+                            (it->kind == XmlScopeKind::KeyedResourceItem &&
+                             (StripXmlPrefix(it->tagName) == "PathGeometry" || StripXmlPrefix(it->tagName) == "Geometry"))) {
+                            it->accumulatedText += " Z";
+                            break;
+                        }
+                    }
                 } else if (closed.kind == XmlScopeKind::RunInline && !closed.accumulatedText.empty()) {
                     for (auto it = scopeStack.rbegin(); it != scopeStack.rend(); ++it) {
                         if (it->kind == XmlScopeKind::VisualElement) {
-                            if (!it->accumulatedText.empty()) it->accumulatedText.push_back(' ');
+                            if (!it->accumulatedText.empty() && !closed.accumulatedText.empty()) {
+                                const char prevCh = it->accumulatedText.back();
+                                const char nextCh = closed.accumulatedText.front();
+                                const bool prevGlue = (prevCh == ' ' || prevCh == '\n' || prevCh == '\t' ||
+                                                       prevCh == '"' || prevCh == '\'' || prevCh == '(' || prevCh == '[' || prevCh == '=');
+                                const bool nextGlue = (nextCh == ' ' || nextCh == '\n' || nextCh == '\t' ||
+                                                       nextCh == '"' || nextCh == '\'' || nextCh == ')' || nextCh == ']' ||
+                                                       nextCh == '.' || nextCh == ',' || nextCh == ':' || nextCh == ';');
+                                if (!prevGlue && !nextGlue) {
+                                    it->accumulatedText.push_back(' ');
+                                }
+                            }
                             it->accumulatedText += closed.accumulatedText;
                             break;
                         }
@@ -4063,6 +4255,7 @@ AeroCompileResult AeroCompiler::CompileInternal(
             if ((shortTag == "ChangePropertyAction" ||
                  shortTag == "ControlStoryboardAction" ||
                  shortTag == "InvokeCommandAction" ||
+                 shortTag == "NavigateToAction" ||
                  shortTag == "PlaySoundAction") &&
                 (!eventTriggerStack.empty() || !triggerStack.empty())) {
                 const bool preferEt = !eventTriggerStack.empty() &&
@@ -4092,7 +4285,32 @@ AeroCompileResult AeroCompiler::CompileInternal(
                         }
                     }
                     if (hasValAttr) {
-                        if (act.propId != kUnmappedPropId) {
+                        const std::string_view trimRaw = Trim(rawVal);
+                        const std::string_view innerNull =
+                            (trimRaw.size() > 2u && trimRaw.front() == '{' && trimRaw.back() == '}')
+                                ? Trim(trimRaw.substr(1u, trimRaw.size() - 2u))
+                                : std::string_view{};
+                        const ParsedBindingClause valBind = ParseBindingMarkupExpression(trimRaw);
+                        if (!innerNull.empty() && innerNull.rfind("x:Null", 0) == 0) {
+                            act.isNullValue = true;
+                        } else if (valBind.isValidBinding) {
+                            act.hasValueBinding = true;
+                            auto bc = std::make_shared<AxbCompiledBindingChain>();
+                            bc->targetPropertyId = act.propId;
+                            bc->rawPath = std::string(valBind.pathPart);
+                            bc->elementName = std::string(valBind.elementName);
+                            bc->relativeAncestorType = valBind.relativeAncestorType;
+                            bc->relativeSelf = valBind.relativeSelf || valBind.relativeTemplatedParent;
+                            bc->converter = valBind.converter;
+                            bc->converterKey = valBind.converterKey;
+                            bc->converterParameter = valBind.converterParameter;
+                            resolveConverterResource(bc->converter, bc->converterKey);
+                            bc->stringFormat = valBind.stringFormat;
+                            if (!valBind.pathPart.empty() && valBind.pathPart != ".") {
+                                splitPathIntoHops(valBind.pathPart, bc->hops);
+                            }
+                            act.valueBinding = std::move(bc);
+                        } else if (act.propId != kUnmappedPropId) {
                             bool ok = false;
                             act.value = parseStyleOrAnimationValue(act.propId, rawVal, ok);
                             if (!ok) {
@@ -4161,6 +4379,13 @@ AeroCompileResult AeroCompiler::CompileInternal(
                                     act.commandParameter = value::FromString(DecodeXamlXmlEntities(cpTrim));
                                 }
                             }
+                        }
+                    }
+                } else if (shortTag == "NavigateToAction") {
+                    act.kind = InteractionActionKind::InvokeCommand;
+                    for (const auto& a : attrs) {
+                        if (a.name == "DestinationId") {
+                            act.commandPath = "__NavigateTo:" + std::string(Trim(a.value));
                         }
                     }
                 } else if (shortTag == "PlaySoundAction") {
@@ -4234,7 +4459,7 @@ AeroCompileResult AeroCompiler::CompileInternal(
                 continue;
             }
 
-            if (shortTag == "Binding" && styleStack.empty()) {
+            if (shortTag == "Binding" && (styleStack.empty() || !actionStack.empty())) {
                 const bool insideMulti = !multiBindingStack.empty() &&
                     (bindingElemStack.empty() || multiBindingStack.back().scopeDepth > bindingElemStack.back().scopeDepth);
                 AxbCompiledBindingChain ch{};
@@ -4243,11 +4468,13 @@ AeroCompileResult AeroCompiler::CompileInternal(
                 for (const auto& a : attrs) {
                     if (a.name == "Path") {
                         std::string_view pp = Trim(a.value);
+                        bool isAttachedParen = false;
                         if (pp.size() > 2u && pp.front() == '(' && pp.back() == ')') {
                             pp = Trim(pp.substr(1u, pp.size() - 2u));
+                            isAttachedParen = true;
                         }
                         ch.rawPath = std::string(pp);
-                        splitPathIntoHops(pp, ch.hops);
+                        splitPathIntoHops(pp, ch.hops, isAttachedParen);
                     } else if (a.name == "Mode") {
                         const std::string_view mStr = Trim(a.value);
                         if (mStr == "TwoWay") ch.mode = BindingMode::TwoWay;
@@ -4566,15 +4793,24 @@ AeroCompileResult AeroCompiler::CompileInternal(
                     if (a.name == "KeyTime") {
                         kf.timeSeconds = ParseXamlTimeSpanSeconds(a.value, 0.0f);
                     } else if (a.name == "Value" && targetPropId != kUnmappedPropId) {
-                        bool ok = false;
-                        UnifiedValue parsed = parseStyleOrAnimationValue(targetPropId, a.value, ok);
-                        if (ok) {
-                            kf.value = std::move(parsed);
+                        const std::string_view trimVal = Trim(a.value);
+                        const ParsedBindingClause bm = ParseBindingMarkupExpression(trimVal);
+                        if (bm.isValidBinding && !bm.elementName.empty() && !bm.pathPart.empty() && bm.pathPart != ".") {
+                            kf.bindingElementName = std::string(bm.elementName);
+                            const std::uint16_t bp = ResolveMappedSetterPropertyId(bm.pathPart);
+                            kf.bindingPropId = (bp != kUnmappedPropId) ? bp : 0u;
+                        } else {
+                            bool ok = false;
+                            UnifiedValue parsed = parseStyleOrAnimationValue(targetPropId, a.value, ok);
+                            if (ok) {
+                                kf.value = std::move(parsed);
+                            }
                         }
                     }
                 }
                 if (selfClosing) {
-                    if (!std::holds_alternative<std::monostate>(kf.value)) {
+                    if (!std::holds_alternative<std::monostate>(kf.value) ||
+                        !kf.bindingElementName.empty()) {
                         timelineStack.back().tl.keyFrames.push_back(std::move(kf));
                     }
                 } else {
@@ -4639,7 +4875,13 @@ AeroCompileResult AeroCompiler::CompileInternal(
                 bool hasValAttr = false;
                 for (const auto& a : attrs) {
                     if (a.name == "Property") {
-                        setter.propId = ResolveMappedSetterPropertyId(a.value);
+                        const std::string_view pTrim = Trim(a.value);
+                        if (pTrim == "Color" && !styleStack.empty() &&
+                            StripXmlPrefix(styleStack.back().def.targetTypeName) == "BoxShadow") {
+                            setter.propId = PropId_EffectColor;
+                        } else {
+                            setter.propId = ResolveMappedSetterPropertyId(a.value);
+                        }
                     } else if (a.name == "TargetName") {
                         setter.targetName = std::string(Trim(a.value));
                     } else if (a.name == "Value") {
@@ -4650,7 +4892,37 @@ AeroCompileResult AeroCompiler::CompileInternal(
 
                 bool hasValidVal = false;
                 if (setter.propId != kUnmappedPropId && hasValAttr) {
-                    setter.value = parseStyleOrAnimationValue(setter.propId, rawVal, hasValidVal);
+                    const ParsedBindingClause setterBind = ParseBindingMarkupExpression(rawVal);
+                    if (setterBind.isValidBinding && owner == SetterOwnerKind::Style) {
+                        auto sb = std::make_shared<AxbCompiledBindingChain>();
+                        sb->rawPath = std::string(setterBind.pathPart);
+                        sb->targetPropertyId = setter.propId;
+                        sb->mode = setterBind.mode;
+                        sb->elementName = std::string(setterBind.elementName);
+                        sb->relativeAncestorType = setterBind.relativeAncestorType;
+                        sb->relativeSelf = setterBind.relativeSelf || setterBind.relativeTemplatedParent;
+                        sb->converter = setterBind.converter;
+                        sb->converterKey = setterBind.converterKey;
+                        sb->converterParameter = setterBind.converterParameter;
+                        sb->stringFormat = setterBind.stringFormat;
+                        if (!setterBind.fallbackValue.empty()) {
+                            sb->fallbackValue = ParseLiteralPropertyValue(setter.propId, setterBind.fallbackValue);
+                        }
+                        resolveConverterResource(sb->converter, sb->converterKey);
+                        const bool hasSbElemSrc = !sb->elementName.empty() ||
+                                                  !sb->relativeAncestorType.empty() ||
+                                                  sb->relativeSelf;
+                        const bool keepSbAttached = setterBind.isAttachedPropertyPath ||
+                            (hasSbElemSrc &&
+                             setterBind.pathPart.find('.') != std::string_view::npos &&
+                             ResolveMappedSetterPropertyId(setterBind.pathPart) != kUnmappedPropId);
+                        splitPathIntoHops(setterBind.pathPart, sb->hops, keepSbAttached);
+                        setter.hasBinding = true;
+                        setter.binding = std::move(sb);
+                        hasValidVal = true;
+                    } else {
+                        setter.value = parseStyleOrAnimationValue(setter.propId, rawVal, hasValidVal);
+                    }
                 }
 
                 if (selfClosing) {
@@ -4778,6 +5050,68 @@ AeroCompileResult AeroCompiler::CompileInternal(
                     gs.scopeDepth = scopeStack.size();
                     gradientStack.push_back(std::move(gs));
                     continue;
+                } else if (shortTag == "ImageBrush" || shortTag == "BitmapImage") {
+                    bool isSetterImgBrush = (shortTag == "ImageBrush");
+                    std::uint8_t setterIbStretch = 1u;
+                    if (!isSetterImgBrush) {
+                        for (auto it = scopeStack.rbegin(); it != scopeStack.rend(); ++it) {
+                            if (it->kind == XmlScopeKind::VisualElement) break;
+                            if (it->isImageBrushScope) {
+                                isSetterImgBrush = true;
+                                setterIbStretch = it->imageBrushStretch;
+                                break;
+                            }
+                        }
+                    } else {
+                        for (const auto& a : attrs) {
+                            if (a.name == "Stretch") {
+                                setterIbStretch = ParseImageBrushStretchCode(a.value);
+                            }
+                        }
+                    }
+                    for (const auto& a : attrs) {
+                        if ((a.name == "ImageSource" || a.name == "UriSource" || a.name == "Source") &&
+                            !Trim(a.value).empty()) {
+                            const std::string_view rawU = Trim(a.value);
+                            if (rawU.front() == '{') {
+                                const std::string_view refKey = ExtractMarkupResourceKey(rawU);
+                                if (!refKey.empty()) {
+                                    if (const UnifiedValue* rv = findLocalOrGlobalResource(refKey)) {
+                                        if (isSetterImgBrush) {
+                                            if (const auto* sv = std::get_if<StringValue>(rv)) {
+                                                setterStack.back().setter.value = value::FromString(
+                                                    EncodeImageBrushSpec(setterIbStretch, StripImageBrushSpecPrefix(sv->view())));
+                                            } else {
+                                                setterStack.back().setter.value = *rv;
+                                            }
+                                        } else {
+                                            setterStack.back().setter.value = *rv;
+                                        }
+                                        setterStack.back().hasValue = true;
+                                        break;
+                                    }
+                                }
+                            } else {
+                                const std::string decoded = DecodeXamlXmlEntities(rawU);
+                                setterStack.back().setter.value = value::FromString(
+                                    isSetterImgBrush
+                                        ? EncodeImageBrushSpec(setterIbStretch, StripImageBrushSpecPrefix(decoded))
+                                        : decoded);
+                                setterStack.back().hasValue = true;
+                                break;
+                            }
+                        }
+                    }
+                    if (!selfClosing && shortTag == "ImageBrush" && !setterStack.back().hasValue) {
+                        XmlScopeEntry ibXml{};
+                        ibXml.kind = XmlScopeKind::NonVisualSkip;
+                        ibXml.tagName = std::string(tagName);
+                        ibXml.isImageBrushScope = true;
+                        ibXml.imageBrushStretch = setterIbStretch;
+                        scopeStack.push_back(std::move(ibXml));
+                        ++nonVisualDepth;
+                        continue;
+                    }
                 }
             }
 
@@ -4880,9 +5214,190 @@ AeroCompileResult AeroCompiler::CompileInternal(
                 continue;
             }
 
-            // 2c. P1-5: Active <UIElement.Effect> (<BlurEffect/> / <DropShadowEffect/>)
+            // 2c-pre: <noesis:BackgroundEffectBehavior> containing <BlurEffect Radius="..."/>
+            if (shortTag == "BlurEffect" && parentScope.kind != XmlScopeKind::EffectPropertyElement &&
+                parentScope.kind != XmlScopeKind::ResourceContainer) {
+                bool insideBgEffectBehavior = false;
+                for (auto it = scopeStack.rbegin(); it != scopeStack.rend(); ++it) {
+                    if (it->kind == XmlScopeKind::VisualElement) break;
+                    if (StripXmlPrefix(it->tagName) == "BackgroundEffectBehavior") {
+                        insideBgEffectBehavior = true;
+                        break;
+                    }
+                }
+                if (insideBgEffectBehavior) {
+                    float radius = 10.0f;
+                    for (const auto& a : attrs) {
+                        if (a.name == "Radius") {
+                            const std::string_view v = Trim(a.value);
+                            if (!v.empty() && v.front() == '{') {
+                                (void)emitPropertyBindingIfValid(PropId_EffectBlurRadius, v);
+                            } else {
+                                radius = std::max(0.0f, ParseFloat32(v, 10.0f));
+                            }
+                        }
+                    }
+                    pkg.instructions.push_back(AxbInstruction{
+                        AxbOpcode::SetStaticProperty, PropId_EffectKind, 0, 0, 0, 0, value::FromInt(4)});
+                    pkg.instructions.push_back(AxbInstruction{
+                        AxbOpcode::SetStaticProperty, PropId_EffectParams, 0, 0, 0, 0,
+                        MakeFloat4InlineFast(radius, -1.0f, 0.0f, 1.0f)});
+                    if (!selfClosing) {
+                        (void)pushNonVisualScope();
+                    }
+                    continue;
+                }
+            }
+
+            // 2c-path: Structured <PathGeometry> -> <PathFigure> -> <LineSegment>/<BezierSegment>/<ArcSegment>
+            if (shortTag == "PathFigure" || shortTag == "LineSegment" || shortTag == "PolyLineSegment" ||
+                shortTag == "BezierSegment" || shortTag == "QuadraticBezierSegment" || shortTag == "ArcSegment") {
+                XmlScopeEntry* geomOwner = nullptr;
+                for (auto it = scopeStack.rbegin(); it != scopeStack.rend(); ++it) {
+                    if (it->kind == XmlScopeKind::VisualElement) break;
+                    if ((it->kind == XmlScopeKind::TransparentContainer && it->targetPropId == PropId_PathData) ||
+                        (it->kind == XmlScopeKind::KeyedResourceItem &&
+                         (StripXmlPrefix(it->tagName) == "PathGeometry" || StripXmlPrefix(it->tagName) == "Geometry"))) {
+                        geomOwner = &(*it);
+                        break;
+                    }
+                }
+                if (geomOwner != nullptr) {
+                    if (shortTag == "PathFigure") {
+                        std::string startPt = "0,0";
+                        bool isClosed = false;
+                        for (const auto& a : attrs) {
+                            if (a.name == "StartPoint") startPt = std::string(Trim(a.value));
+                            else if (a.name == "IsClosed") {
+                                const std::string_view tv = Trim(a.value);
+                                isClosed = EqualsIgnoreCase(tv, "true") || tv == "1";
+                            }
+                        }
+                        if (!geomOwner->accumulatedText.empty()) geomOwner->accumulatedText.push_back(' ');
+                        geomOwner->accumulatedText += "M " + startPt;
+                        if (!selfClosing) {
+                            XmlScopeEntry figScope{};
+                            figScope.kind = XmlScopeKind::NonVisualSkip;
+                            figScope.tagName = isClosed ? "PathFigure:Closed" : "PathFigure";
+                            scopeStack.push_back(std::move(figScope));
+                            ++nonVisualDepth;
+                        } else if (isClosed) {
+                            geomOwner->accumulatedText += " Z";
+                        }
+                        continue;
+                    } else if (shortTag == "LineSegment") {
+                        for (const auto& a : attrs) {
+                            if (a.name == "Point" && !Trim(a.value).empty()) {
+                                geomOwner->accumulatedText += " L " + std::string(Trim(a.value));
+                            }
+                        }
+                        if (!selfClosing) (void)pushNonVisualScope();
+                        continue;
+                    } else if (shortTag == "PolyLineSegment") {
+                        for (const auto& a : attrs) {
+                            if (a.name == "Points" && !Trim(a.value).empty()) {
+                                geomOwner->accumulatedText += " L " + std::string(Trim(a.value));
+                            }
+                        }
+                        if (!selfClosing) (void)pushNonVisualScope();
+                        continue;
+                    } else if (shortTag == "BezierSegment") {
+                        std::string p1 = "0,0", p2 = "0,0", p3 = "0,0";
+                        for (const auto& a : attrs) {
+                            if (a.name == "Point1") p1 = std::string(Trim(a.value));
+                            else if (a.name == "Point2") p2 = std::string(Trim(a.value));
+                            else if (a.name == "Point3") p3 = std::string(Trim(a.value));
+                        }
+                        geomOwner->accumulatedText += " C " + p1 + " " + p2 + " " + p3;
+                        if (!selfClosing) (void)pushNonVisualScope();
+                        continue;
+                    } else if (shortTag == "QuadraticBezierSegment") {
+                        std::string p1 = "0,0", p2 = "0,0";
+                        for (const auto& a : attrs) {
+                            if (a.name == "Point1") p1 = std::string(Trim(a.value));
+                            else if (a.name == "Point2") p2 = std::string(Trim(a.value));
+                        }
+                        geomOwner->accumulatedText += " Q " + p1 + " " + p2;
+                        if (!selfClosing) (void)pushNonVisualScope();
+                        continue;
+                    } else if (shortTag == "ArcSegment") {
+                        std::string pt = "0,0", sz = "1,1", rot = "0";
+                        int largeArc = 0, sweep = 0;
+                        for (const auto& a : attrs) {
+                            if (a.name == "Point") pt = std::string(Trim(a.value));
+                            else if (a.name == "Size") sz = std::string(Trim(a.value));
+                            else if (a.name == "RotationAngle") rot = std::string(Trim(a.value));
+                            else if (a.name == "IsLargeArc") largeArc = EqualsIgnoreCase(Trim(a.value), "true") ? 1 : 0;
+                            else if (a.name == "SweepDirection") sweep = EqualsIgnoreCase(Trim(a.value), "Clockwise") ? 1 : 0;
+                        }
+                        geomOwner->accumulatedText += " A " + sz + " " + rot + " " +
+                            std::to_string(largeArc) + " " + std::to_string(sweep) + " " + pt;
+                        if (!selfClosing) (void)pushNonVisualScope();
+                        continue;
+                    }
+                }
+            }
+
+            // 2c-shader: <noesis:PlasmaBrush/> / <noesis:ConicGradientBrush/> / <noesis:WavesBrush/> inside <noesis:Brush.Shader>
+            if (shortTag == "PlasmaBrush" || shortTag == "ConicGradientBrush" ||
+                shortTag == "WavesBrush" || shortTag == "MonochromeBrush") {
+                XmlScopeEntry* brushOwner = nullptr;
+                for (auto it = scopeStack.rbegin(); it != scopeStack.rend(); ++it) {
+                    if (it->kind == XmlScopeKind::VisualElement) break;
+                    if (it->kind == XmlScopeKind::BrushPropertyElement) {
+                        brushOwner = &(*it);
+                        break;
+                    }
+                }
+                if (brushOwner != nullptr && !brushOwner->brushAssigned) {
+                    GradientBrushDesc gd{};
+                    gd.kind = (shortTag == "PlasmaBrush" || shortTag == "ConicGradientBrush") ? GradientBrushKind::Radial : GradientBrushKind::Linear;
+                    gd.startPoint = Point{0.15f, 0.1f};
+                    gd.endPoint = Point{0.95f, 0.9f};
+                    gd.center = Point{0.55f, 0.5f};
+                    gd.gradientOrigin = Point{0.4f, 0.4f};
+                    gd.radiusX = 0.75f;
+                    gd.radiusY = 0.75f;
+                    gd.stops.push_back(GradientStop{0.0f, Color{0.52f, 0.96f, 1.0f, 0.85f}});
+                    gd.stops.push_back(GradientStop{0.45f, Color{0.01f, 0.74f, 1.0f, 0.55f}});
+                    gd.stops.push_back(GradientStop{1.0f, Color{0.05f, 0.22f, 0.36f, 0.05f}});
+                    BakeGradientBrushRamp(gd);
+                    const std::string spec = SerializeGradientBrushSpec(gd);
+                    (void)GradientBrushRegistry::Instance().RegisterOrResolveSpec(spec);
+                    AxbInstruction setInst{};
+                    setInst.opcode = AxbOpcode::SetStaticProperty;
+                    setInst.propId = brushOwner->targetPropId;
+                    setInst.literalValue = value::FromString(spec);
+                    pkg.instructions.push_back(std::move(setInst));
+                    brushOwner->brushAssigned = true;
+                }
+                if (!selfClosing) (void)pushNonVisualScope();
+                continue;
+            }
+
+            // 2c. P1-5: Active <UIElement.Effect> (<BlurEffect/> / <DropShadowEffect/> / <PixelateEffect/>)
             if (parentScope.kind == XmlScopeKind::EffectPropertyElement &&
-                (shortTag == "BlurEffect" || shortTag == "DropShadowEffect")) {
+                (shortTag == "BlurEffect" || shortTag == "DropShadowEffect" || shortTag == "PixelateEffect")) {
+                if (shortTag == "PixelateEffect") {
+                    float pxSize = 6.0f;
+                    for (const auto& a : attrs) {
+                        if (a.name == "Size") {
+                            const std::string_view v = Trim(a.value);
+                            if (!v.empty() && v.front() == '{') {
+                                (void)emitPropertyBindingIfValid(PropId_EffectBlurRadius, v);
+                            } else {
+                                pxSize = std::max(1.0f, ParseFloat32(v, 6.0f));
+                            }
+                        }
+                    }
+                    pkg.instructions.push_back(AxbInstruction{
+                        AxbOpcode::SetStaticProperty, PropId_EffectKind, 0, 0, 0, 0, value::FromInt(3)});
+                    pkg.instructions.push_back(AxbInstruction{
+                        AxbOpcode::SetStaticProperty, PropId_EffectParams, 0, 0, 0, 0,
+                        MakeFloat4InlineFast(pxSize, -1.0f, 0.0f, 1.0f)});
+                    if (!selfClosing) (void)pushNonVisualScope();
+                    continue;
+                }
                 if (shortTag == "BlurEffect") {
                     float radius = 5.0f;
                     for (const auto& a : attrs) {
@@ -5073,6 +5588,15 @@ AeroCompileResult AeroCompiler::CompileInternal(
                             continue;
                         }
                     } else if (shortTag == "ImageBrush" || shortTag == "BitmapImage" || shortTag == "ImageSource") {
+                        const bool isImgBrushItem = (shortTag == "ImageBrush");
+                        std::uint8_t ibStretch = 1u;
+                        if (isImgBrushItem) {
+                            for (const auto& a : attrs) {
+                                if (a.name == "Stretch") {
+                                    ibStretch = ParseImageBrushStretchCode(a.value);
+                                }
+                            }
+                        }
                         bool assignedUri = false;
                         for (const auto& a : attrs) {
                             if ((a.name == "ImageSource" || a.name == "UriSource" || a.name == "Source") &&
@@ -5082,16 +5606,32 @@ AeroCompileResult AeroCompiler::CompileInternal(
                                     const std::string_view refKey = ExtractMarkupResourceKey(rawU);
                                     if (!refKey.empty()) {
                                         if (const UnifiedValue* rv = findLocalOrGlobalResource(refKey)) {
-                                            UpsertPackageResource(pkg, xKey, *rv);
+                                            if (isImgBrushItem) {
+                                                if (const auto* sv = std::get_if<StringValue>(rv)) {
+                                                    UpsertPackageResource(
+                                                        pkg,
+                                                        xKey,
+                                                        value::FromString(EncodeImageBrushSpec(
+                                                            ibStretch,
+                                                            StripImageBrushSpecPrefix(sv->view()))));
+                                                } else {
+                                                    UpsertPackageResource(pkg, xKey, *rv);
+                                                }
+                                            } else {
+                                                UpsertPackageResource(pkg, xKey, *rv);
+                                            }
                                             assignedUri = true;
                                             break;
                                         }
                                     }
                                 } else {
+                                    const std::string decoded = DecodeXamlXmlEntities(rawU);
                                     UpsertPackageResource(
                                         pkg,
                                         xKey,
-                                        value::FromString(DecodeXamlXmlEntities(rawU)));
+                                        value::FromString(isImgBrushItem
+                                            ? EncodeImageBrushSpec(ibStretch, StripImageBrushSpecPrefix(decoded))
+                                            : decoded));
                                     assignedUri = true;
                                     break;
                                 }
@@ -5103,6 +5643,8 @@ AeroCompileResult AeroCompiler::CompileInternal(
                             itemScope.tagName = std::string(tagName);
                             itemScope.resourceKey = std::string(xKey);
                             itemScope.brushAssigned = assignedUri;
+                            itemScope.isImageBrushScope = isImgBrushItem;
+                            itemScope.imageBrushStretch = ibStretch;
                             scopeStack.push_back(std::move(itemScope));
                             ++nonVisualDepth;
                             continue;
@@ -5154,16 +5696,65 @@ AeroCompileResult AeroCompiler::CompileInternal(
                 }
                 continue;
             }
-            if (parentScope.kind == XmlScopeKind::KeyedResourceItem && !parentScope.brushAssigned &&
-                (shortTag == "BitmapImage" || shortTag == "ImageBrush")) {
-                for (const auto& a : attrs) {
-                    if ((a.name == "UriSource" || a.name == "ImageSource") && !Trim(a.value).empty()) {
-                        UpsertPackageResource(
-                            pkg,
-                            parentScope.resourceKey,
-                            value::FromString(DecodeXamlXmlEntities(Trim(a.value))));
-                        parentScope.brushAssigned = true;
+            if (shortTag == "BitmapImage" || shortTag == "ImageBrush") {
+                XmlScopeEntry* keyedItemOwner = nullptr;
+                for (auto it = scopeStack.rbegin(); it != scopeStack.rend(); ++it) {
+                    if (it->kind == XmlScopeKind::ResourceContainer || it->kind == XmlScopeKind::VisualElement) {
                         break;
+                    }
+                    if (it->kind == XmlScopeKind::KeyedResourceItem) {
+                        keyedItemOwner = &(*it);
+                        break;
+                    }
+                }
+                if (keyedItemOwner != nullptr && !keyedItemOwner->brushAssigned) {
+                    const bool isImgBrushItem = keyedItemOwner->isImageBrushScope || (shortTag == "ImageBrush");
+                    std::uint8_t ibStretch = keyedItemOwner->imageBrushStretch;
+                    if (shortTag == "ImageBrush") {
+                        for (const auto& a : attrs) {
+                            if (a.name == "Stretch") {
+                                ibStretch = ParseImageBrushStretchCode(a.value);
+                            }
+                        }
+                    }
+                    for (const auto& a : attrs) {
+                        if ((a.name == "UriSource" || a.name == "ImageSource" || a.name == "Source") &&
+                            !Trim(a.value).empty()) {
+                            const std::string_view rawU = Trim(a.value);
+                            if (rawU.front() == '{') {
+                                const std::string_view refKey = ExtractMarkupResourceKey(rawU);
+                                if (!refKey.empty()) {
+                                    if (const UnifiedValue* rv = findLocalOrGlobalResource(refKey)) {
+                                        if (isImgBrushItem) {
+                                            if (const auto* sv = std::get_if<StringValue>(rv)) {
+                                                UpsertPackageResource(
+                                                    pkg,
+                                                    keyedItemOwner->resourceKey,
+                                                    value::FromString(EncodeImageBrushSpec(
+                                                        ibStretch,
+                                                        StripImageBrushSpecPrefix(sv->view()))));
+                                            } else {
+                                                UpsertPackageResource(pkg, keyedItemOwner->resourceKey, *rv);
+                                            }
+                                        } else {
+                                            UpsertPackageResource(pkg, keyedItemOwner->resourceKey, *rv);
+                                        }
+                                        keyedItemOwner->brushAssigned = true;
+                                        break;
+                                    }
+                                }
+                            } else {
+                                const std::string decoded = DecodeXamlXmlEntities(rawU);
+                                UpsertPackageResource(
+                                    pkg,
+                                    keyedItemOwner->resourceKey,
+                                    value::FromString(isImgBrushItem
+                                        ? EncodeImageBrushSpec(ibStretch, StripImageBrushSpecPrefix(decoded))
+                                        : decoded));
+                                keyedItemOwner->brushAssigned = true;
+                                break;
+                            }
+                        }
                     }
                 }
             }
@@ -5223,12 +5814,27 @@ AeroCompileResult AeroCompiler::CompileInternal(
                                 parentScope.brushAssigned = true;
                             } else if (a.value.empty() || a.value.front() != '{') {
                                 Color c = ParseXamlColorLiteral(a.value);
-                                c.a *= brushAlphaMul;
+                                const bool splitOp =
+                                    (parentScope.targetPropId == PropId_Background ||
+                                     parentScope.targetPropId == PropId_BorderBrush) &&
+                                    (std::fabs(brushAlphaMul - 1.0f) > 1e-5f);
+                                if (!splitOp) {
+                                    c.a *= brushAlphaMul;
+                                }
                                 AxbInstruction setInst{};
                                 setInst.opcode = AxbOpcode::SetStaticProperty;
                                 setInst.propId = parentScope.targetPropId;
                                 setInst.literalValue = value::FromColor(c);
                                 pkg.instructions.push_back(std::move(setInst));
+                                if (splitOp) {
+                                    AxbInstruction opInst{};
+                                    opInst.opcode = AxbOpcode::SetStaticProperty;
+                                    opInst.propId = (parentScope.targetPropId == PropId_BorderBrush)
+                                        ? static_cast<std::uint16_t>(PropId_BorderOpacity)
+                                        : static_cast<std::uint16_t>(PropId_BackgroundOpacity);
+                                    opInst.literalValue = MakeFloat(brushAlphaMul);
+                                    pkg.instructions.push_back(std::move(opInst));
+                                }
                                 parentScope.brushAssigned = true;
                             } else {
                                 if (emitPropertyBindingIfValid(parentScope.targetPropId, a.value)) {
@@ -5270,33 +5876,84 @@ AeroCompileResult AeroCompiler::CompileInternal(
                     gradientStack.push_back(std::move(gs));
                     continue;
                 } else if (shortTag == "BitmapImage" || shortTag == "ImageBrush") {
+                    const bool isImgBrush = (shortTag == "ImageBrush") || parentScope.isImageBrushScope;
+                    std::uint8_t ibStretch = parentScope.imageBrushStretch;
+                    if (shortTag == "ImageBrush") {
+                        ibStretch = 1u;
+                        for (const auto& a : attrs) {
+                            if (a.name == "Stretch") {
+                                ibStretch = ParseImageBrushStretchCode(a.value);
+                            }
+                        }
+                    }
+                    bool hadDirectUri = false;
                     for (const auto& a : attrs) {
-                        if ((a.name == "UriSource" || a.name == "ImageSource") && !Trim(a.value).empty()) {
+                        if ((a.name == "UriSource" || a.name == "ImageSource" || a.name == "Source") &&
+                            !Trim(a.value).empty()) {
+                            hadDirectUri = true;
+                            break;
+                        }
+                    }
+                    if (!hadDirectUri && !selfClosing && shortTag == "ImageBrush") {
+                        XmlScopeEntry ibScope{};
+                        ibScope.kind = XmlScopeKind::BrushPropertyElement;
+                        ibScope.tagName = std::string(tagName);
+                        ibScope.targetPropId = parentScope.targetPropId;
+                        ibScope.isImageBrushScope = true;
+                        ibScope.imageBrushStretch = ibStretch;
+                        scopeStack.push_back(std::move(ibScope));
+                        ++nonVisualDepth;
+                        continue;
+                    }
+                    const std::uint16_t destPropId = isImgBrush
+                        ? parentScope.targetPropId
+                        : ((shortTag == "BitmapImage")
+                            ? static_cast<std::uint16_t>(PropId_ImageSource)
+                            : parentScope.targetPropId);
+                    for (const auto& a : attrs) {
+                        if ((a.name == "UriSource" || a.name == "ImageSource" || a.name == "Source") &&
+                            !Trim(a.value).empty()) {
                             const std::string_view rawUri = Trim(a.value);
                             std::string_view resK{};
                             std::uint8_t resF = 0u;
                             if (TryParseResourceMarkupExtension(rawUri, resK, resF)) {
-                                AxbInstruction rInst{};
-                                rInst.opcode = AxbOpcode::SetResourceProperty;
-                                rInst.propId = (shortTag == "BitmapImage")
-                                    ? static_cast<std::uint16_t>(PropId_ImageSource)
-                                    : parentScope.targetPropId;
-                                rInst.flags = resF;
-                                rInst.strIdx0 = pkg.InternString(resK);
-                                if (const UnifiedValue* rv = findLocalOrGlobalResource(resK)) {
-                                    rInst.literalValue = *rv;
+                                const UnifiedValue* rv = findLocalOrGlobalResource(resK);
+                                const auto* rvStr = rv ? std::get_if<StringValue>(rv) : nullptr;
+                                if (isImgBrush && rvStr != nullptr && resF == AxbResourceFlag_StaticResource) {
+                                    AxbInstruction setInst{};
+                                    setInst.opcode = AxbOpcode::SetStaticProperty;
+                                    setInst.propId = destPropId;
+                                    setInst.literalValue = value::FromString(
+                                        EncodeImageBrushSpec(ibStretch, StripImageBrushSpecPrefix(rvStr->view())));
+                                    pkg.instructions.push_back(std::move(setInst));
+                                } else {
+                                    AxbInstruction rInst{};
+                                    rInst.opcode = AxbOpcode::SetResourceProperty;
+                                    rInst.propId = destPropId;
+                                    rInst.flags = resF;
+                                    rInst.strIdx0 = pkg.InternString(resK);
+                                    if (rv != nullptr) {
+                                        rInst.literalValue = *rv;
+                                    }
+                                    pkg.instructions.push_back(std::move(rInst));
                                 }
-                                pkg.instructions.push_back(std::move(rInst));
                             } else {
+                                const std::string decoded = DecodeXamlXmlEntities(rawUri);
                                 AxbInstruction setInst{};
                                 setInst.opcode = AxbOpcode::SetStaticProperty;
-                                setInst.propId = (shortTag == "BitmapImage")
-                                    ? static_cast<std::uint16_t>(PropId_ImageSource)
-                                    : parentScope.targetPropId;
-                                setInst.literalValue = value::FromString(DecodeXamlXmlEntities(rawUri));
+                                setInst.propId = destPropId;
+                                setInst.literalValue = value::FromString(
+                                    isImgBrush
+                                        ? EncodeImageBrushSpec(ibStretch, StripImageBrushSpecPrefix(decoded))
+                                        : decoded);
                                 pkg.instructions.push_back(std::move(setInst));
                             }
-                            parentScope.brushAssigned = true;
+                            for (auto it = scopeStack.rbegin(); it != scopeStack.rend(); ++it) {
+                                if (it->kind == XmlScopeKind::VisualElement) break;
+                                if (it->kind == XmlScopeKind::BrushPropertyElement) {
+                                    it->brushAssigned = true;
+                                }
+                            }
                             break;
                         }
                     }
@@ -5310,6 +5967,8 @@ AeroCompileResult AeroCompiler::CompileInternal(
                 skipScope.tagName = std::string(tagName);
                 skipScope.targetPropId = parentScope.targetPropId;
                 skipScope.brushAssigned = parentScope.brushAssigned;
+                skipScope.isImageBrushScope = parentScope.isImageBrushScope;
+                skipScope.imageBrushStretch = parentScope.imageBrushStretch;
                 scopeStack.push_back(std::move(skipScope));
                 ++nonVisualDepth;
             }
@@ -5519,7 +6178,18 @@ AeroCompileResult AeroCompiler::CompileInternal(
                 if (!runText.empty()) {
                     for (auto it = scopeStack.rbegin(); it != scopeStack.rend(); ++it) {
                         if (it->kind == XmlScopeKind::VisualElement) {
-                            if (!it->accumulatedText.empty()) it->accumulatedText.push_back(' ');
+                            if (!it->accumulatedText.empty()) {
+                                const char prevCh = it->accumulatedText.back();
+                                const char nextCh = runText.front();
+                                const bool prevGlue = (prevCh == ' ' || prevCh == '\n' || prevCh == '\t' ||
+                                                       prevCh == '"' || prevCh == '\'' || prevCh == '(' || prevCh == '[' || prevCh == '=');
+                                const bool nextGlue = (nextCh == ' ' || nextCh == '\n' || nextCh == '\t' ||
+                                                       nextCh == '"' || nextCh == '\'' || nextCh == ')' || nextCh == ']' ||
+                                                       nextCh == '.' || nextCh == ',' || nextCh == ':' || nextCh == ';');
+                                if (!prevGlue && !nextGlue) {
+                                    it->accumulatedText.push_back(' ');
+                                }
+                            }
                             it->accumulatedText += runText;
                             break;
                         }
@@ -5646,6 +6316,23 @@ AeroCompileResult AeroCompiler::CompileInternal(
         if (!seenRoot) {
             seenRoot = true;
             pkg.rootTypeName = std::string(tagName);
+            if (activeIncludeStack.size() <= 1u) {
+                if (!effectiveXamlPath.empty()) {
+                    const std::filesystem::path xDir =
+                        std::filesystem::path(NormalizeSlashes(effectiveXamlPath)).parent_path();
+                    if (!xDir.empty()) {
+                        UiResourceContext::Current().AddXamlSearchDirectory(xDir.string());
+                    }
+                }
+                if (!input.resourceSearchRoot.empty()) {
+                    UiResourceContext::Current().AddXamlSearchDirectory(input.resourceSearchRoot);
+                }
+                for (const auto& sp : input.resourceSearchPaths) {
+                    if (!sp.empty()) {
+                        UiResourceContext::Current().AddXamlSearchDirectory(sp);
+                    }
+                }
+            }
             if (input.autoMergeGlobalResources && activeIncludeStack.size() <= 1u &&
                 !effectiveXamlPath.empty()) {
                 const std::filesystem::path xamlDir =
@@ -5684,11 +6371,10 @@ AeroCompileResult AeroCompiler::CompileInternal(
             if (a.name == "Height") hasExplicitHeight = true;
         }
 
+        (void)hasExplicitWidth;
+        (void)hasExplicitHeight;
         for (const auto& attr : attrs) {
-            if (attr.name == "d:DesignWidth" && (!isRootElement || hasExplicitWidth)) {
-                continue;
-            }
-            if (attr.name == "d:DesignHeight" && (!isRootElement || hasExplicitHeight)) {
+            if (attr.name == "d:DesignWidth" || attr.name == "d:DesignHeight") {
                 continue;
             }
             if (attr.name == "Click" || attr.name == "OnClick") {
@@ -5733,7 +6419,10 @@ AeroCompileResult AeroCompiler::CompileInternal(
                 continue;
             }
 
-            const std::uint16_t propId = ResolvePropertyId(attr.name);
+            const std::uint16_t propId =
+                (shortTag == "BoxShadow" && attr.name == "Color")
+                    ? static_cast<std::uint16_t>(PropId_EffectColor)
+                    : ResolvePropertyId(attr.name);
 
             if (trimmedVal.size() > 2 && trimmedVal.front() == '{' && trimmedVal.back() == '}') {
                 std::string_view inner = Trim(trimmedVal.substr(1, trimmedVal.size() - 2));
@@ -5766,7 +6455,8 @@ AeroCompileResult AeroCompiler::CompileInternal(
                     std::string_view keyPart{};
                     std::uint8_t resFlags = AxbResourceFlag_StaticResource;
                     if (TryParseResourceMarkupExtension(trimmedVal, keyPart, resFlags)) {
-                        if (propId == PropId_Style || propId == PropId_ItemTemplate || propId == PropId_Template) {
+                        if (propId == PropId_Style || propId == PropId_ItemTemplate ||
+                            propId == PropId_Template || propId == PropId_ContentTemplate) {
                             if (propId == PropId_Style) {
                                 attachedStyleKey = std::string(keyPart);
                             }
@@ -5853,7 +6543,12 @@ AeroCompileResult AeroCompiler::CompileInternal(
                     continue;
                 }
 
-                const BindingMode mode = parsedBind.mode;
+                BindingMode mode = parsedBind.mode;
+                if (!parsedBind.hasExplicitMode &&
+                    shortTag == "TextBox" &&
+                    propId == PropId_Text) {
+                    mode = BindingMode::TwoWay;
+                }
                 const std::string_view pathPart = parsedBind.pathPart;
                 const std::string_view fallbackValue = parsedBind.fallbackValue;
 
@@ -5867,7 +6562,10 @@ AeroCompileResult AeroCompiler::CompileInternal(
                     pkg.instructions.push_back(std::move(fbInst));
                 }
 
-                if (pathPart.empty() || pathPart == ".") {
+                const bool hasAttrElemSrc = !parsedBind.elementName.empty() ||
+                                            !parsedBind.relativeAncestorType.empty() ||
+                                            parsedBind.relativeSelf;
+                if ((pathPart.empty() || pathPart == ".") && !hasAttrElemSrc) {
                     continue;
                 }
 
@@ -5885,20 +6583,11 @@ AeroCompileResult AeroCompiler::CompileInternal(
                 chain.stringFormat = parsedBind.stringFormat;
                 resolveConverterResource(chain.converter, chain.converterKey);
 
-                std::size_t segPos = 0;
-                while (segPos < pathPart.size()) {
-                    const std::size_t dot = pathPart.find('.', segPos);
-                    const std::string_view seg = (dot == std::string_view::npos)
-                        ? pathPart.substr(segPos)
-                        : pathPart.substr(segPos, dot - segPos);
-                    if (!seg.empty()) {
-                        AxbCompiledHop hop{};
-                        hop.memberName = std::string(seg);
-                        chain.hops.push_back(std::move(hop));
-                    }
-                    if (dot == std::string_view::npos) break;
-                    segPos = dot + 1;
-                }
+                const bool keepAttrAttached = parsedBind.isAttachedPropertyPath ||
+                    (hasAttrElemSrc &&
+                     pathPart.find('.') != std::string_view::npos &&
+                     ResolveMappedSetterPropertyId(pathPart) != kUnmappedPropId);
+                splitPathIntoHops(pathPart, chain.hops, keepAttrAttached);
 
                 const auto chainIdx = static_cast<std::uint32_t>(pkg.bindingChains.size());
                 pkg.bindingChains.push_back(std::move(chain));
@@ -6047,8 +6736,17 @@ AeroCompileResult AeroCompiler::CompileInternal(
         stub += "module " + moduleName + ";\n\n";
         stub += "public partial class " + shortClassName + "\n{\n";
         stub += "    public handle __nativeRootHandle;\n";
-        for (const auto& nc : pkg.namedControls) {
-            stub += "    public handle " + nc.name + ";\n";
+        {
+            std::unordered_set<std::string> emittedFieldNames;
+            for (const auto& nc : pkg.namedControls) {
+                if (!IsValidRealScriptFieldIdentifier(nc.name)) {
+                    continue;
+                }
+                if (!emittedFieldNames.insert(nc.name).second) {
+                    continue;
+                }
+                stub += "    public handle " + nc.name + ";\n";
+            }
         }
         stub += "}\n";
         result.generatedPartialRsCode = stub;
@@ -6069,6 +6767,42 @@ AeroCompileResult AeroCompiler::CompileInternal(
             if (!alreadyHasPartialStub) {
                 allSources.push_back(SourceFile{result.generatedPartialRsPath, result.generatedPartialRsCode});
             }
+        }
+    }
+
+    // Auto-provide built-in Aero.UI native SDK declarations when imported by user scripts
+    if (!allSources.empty()) {
+        bool importsAeroUi = false;
+        bool definesAeroUi = false;
+        for (const auto& sf : allSources) {
+            if (sf.content.find("module Aero.UI;") != std::string::npos) {
+                definesAeroUi = true;
+            }
+            if (sf.content.find("import Aero.UI;") != std::string::npos) {
+                importsAeroUi = true;
+            }
+        }
+        if (importsAeroUi && !definesAeroUi) {
+            std::string sdkCode =
+                "module Aero.UI;\n"
+                "public float UIElement_GetWidth(handle elem) { return 0.0f; }\n"
+                "public bool UIElement_SetWidth(handle elem, float width) { return false; }\n"
+                "public float UIElement_GetProperty(handle elem, int propId) { return 0.0f; }\n"
+                "public bool UIElement_SetProperty(handle elem, int propId, float val) { return false; }\n"
+                "public double UIElement_GetDouble(handle elem, string propName) { return 0.0; }\n"
+                "public bool UIElement_SetDouble(handle elem, string propName, double val) { return false; }\n"
+                "public string PasswordBox_GetPassword(handle elem) { return \"\"; }\n"
+                "public bool PasswordBox_ClearPassword(handle elem) { return false; }\n"
+                "public bool ContentControl_LoadXaml(handle container, string xamlUri) { return false; }\n"
+                "public bool Application_ApplyDictionary(string uri) { return false; }\n"
+                "public bool Application_LoadTheme(handle root, string colorName, string accentName) { return false; }\n"
+                "public bool UIElement_SetVisibility(handle elem, int visibility) { return false; }\n"
+                "public int UIElement_GetVisibility(handle elem) { return 0; }\n"
+                "public bool UIElement_Focus(handle elem) { return false; }\n"
+                "public handle UIElement_FindName(handle root, string name) { return root; }\n"
+                "public bool Storyboard_Begin(handle root, string storyboardKey) { return false; }\n"
+                "public bool Storyboard_Stop(handle root, string storyboardKey) { return false; }\n";
+            allSources.insert(allSources.begin(), SourceFile{"__AeroUiSdk.rs", std::move(sdkCode)});
         }
     }
 
@@ -7078,5 +7812,108 @@ AeroViewAotCppOutput AeroCompiler::GenerateAotCppFromPackage(
     out.source = std::move(src);
     return out;
 }
+
+namespace {
+
+bool CompileRuntimeXamlFromUriHook(
+    std::string_view uriOrPath,
+    const std::vector<std::string>& searchDirs,
+    AxbPackage& outPackage) {
+    if (uriOrPath.empty()) {
+        return false;
+    }
+    std::string cleaned = NormalizeSlashes(uriOrPath);
+    if (const auto compPos = cleaned.find(";component/"); compPos != std::string::npos) {
+        cleaned = cleaned.substr(compPos + 11u);
+    }
+    while (!cleaned.empty() && (cleaned.front() == '/' || cleaned.front() == '\\')) {
+        cleaned.erase(cleaned.begin());
+    }
+    if (cleaned.rfind("./", 0) == 0) {
+        cleaned.erase(0, 2u);
+    }
+
+    std::filesystem::path resolvedFile;
+    std::error_code ec;
+    const std::filesystem::path directCand(uriOrPath);
+    if (std::filesystem::exists(directCand, ec) && !ec &&
+        std::filesystem::is_regular_file(directCand, ec) && !ec) {
+        resolvedFile = directCand;
+    } else {
+        for (const auto& dirStr : searchDirs) {
+            if (dirStr.empty()) continue;
+            const std::filesystem::path baseDir(dirStr);
+            const std::filesystem::path cand1 = baseDir / cleaned;
+            ec.clear();
+            if (std::filesystem::exists(cand1, ec) && !ec &&
+                std::filesystem::is_regular_file(cand1, ec) && !ec) {
+                resolvedFile = cand1;
+                break;
+            }
+            if (const auto lastSlash = cleaned.rfind('/'); lastSlash != std::string::npos) {
+                const std::filesystem::path candLeaf = baseDir / cleaned.substr(lastSlash + 1u);
+                ec.clear();
+                if (std::filesystem::exists(candLeaf, ec) && !ec &&
+                    std::filesystem::is_regular_file(candLeaf, ec) && !ec) {
+                    resolvedFile = candLeaf;
+                    break;
+                }
+            }
+        }
+    }
+    if (resolvedFile.empty()) {
+        static constexpr std::string_view kSampleFallbacks[] = {
+            "Data",
+            "Samples/Gallery/Data",
+            "Samples/Localization/Data",
+            "../Samples/Gallery/Data",
+            "../Samples/Localization/Data",
+        };
+        for (std::string_view fb : kSampleFallbacks) {
+            const std::filesystem::path cand = std::filesystem::path(fb) / cleaned;
+            ec.clear();
+            if (std::filesystem::exists(cand, ec) && !ec &&
+                std::filesystem::is_regular_file(cand, ec) && !ec) {
+                resolvedFile = cand;
+                break;
+            }
+        }
+    }
+    if (resolvedFile.empty()) {
+        return false;
+    }
+
+    std::ifstream ifs(resolvedFile, std::ios::binary);
+    if (!ifs) {
+        return false;
+    }
+    std::string xamlText((std::istreambuf_iterator<char>(ifs)), std::istreambuf_iterator<char>());
+    if (xamlText.empty()) {
+        return false;
+    }
+
+    AeroCompiler compiler;
+    AeroCompileInput in{};
+    in.xamlPath = resolvedFile.string();
+    in.xamlContent = std::move(xamlText);
+    in.resourceSearchRoot = resolvedFile.parent_path().string();
+    in.resourceSearchPaths = searchDirs;
+    AeroCompileResult res = compiler.Compile(in);
+    if (!res.succeeded) {
+        return false;
+    }
+    outPackage = std::move(res.axbPackage);
+    return true;
+}
+
+struct AutoRegisterRuntimeXamlCompileHook {
+    AutoRegisterRuntimeXamlCompileHook() noexcept {
+        RegisterRuntimeXamlCompileHook(&CompileRuntimeXamlFromUriHook);
+    }
+};
+
+const AutoRegisterRuntimeXamlCompileHook gAutoRegisterRuntimeXamlCompileHook{};
+
+} // namespace
 
 } // namespace aero

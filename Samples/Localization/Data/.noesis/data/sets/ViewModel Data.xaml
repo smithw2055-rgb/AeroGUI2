@@ -1,0 +1,10 @@
+<vdctx:ViewModel xmlns:noesis="clr-namespace:NoesisGUIExtensions"
+  xmlns:vdctx="clr-namespace:Localization"
+  SelectedLanguage="{noesis:DataSet English}" SoundLevel="90" MusicLevel="73">
+  <vdctx:ViewModel.Languages>
+    <noesis:DataSet Name="English"/>
+    <noesis:DataSet Name="French"/>
+    <noesis:DataSet Name="Japanese"/>
+    <noesis:DataSet Name="Arabic"/>
+  </vdctx:ViewModel.Languages>
+</vdctx:ViewModel>

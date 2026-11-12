@@ -1,0 +1,5 @@
+<Enum Name="QuestDifficulty">
+  <Item Name="Easy" Value="0"/>
+  <Item Name="Normal" Value="1"/>
+  <Item Name="Hard" Value="2"/>
+</Enum>

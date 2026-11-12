@@ -1,0 +1,1006 @@
+<ResourceDictionary
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    xmlns:b="http://schemas.microsoft.com/xaml/behaviors"
+    xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
+    xmlns:inventory="clr-namespace:Inventory"
+    xmlns:local="clr-namespace:NoesisStudioInternals"
+    xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+    xmlns:noesis="clr-namespace:NoesisGUIExtensions"
+    xmlns:system="clr-namespace:System"
+    mc:Ignorable="d">
+
+  <!-- Brushes -->
+  <SolidColorBrush x:Key="Inventory.Brush.TitleBarText" Color="#FFEAC067"/>
+  <SolidColorBrush x:Key="Inventory.Brush.StatsIcon" Color="#E5CC934B"/>
+  <SolidColorBrush x:Key="Inventory.Brush.StatsLabelText" Color="#E5FFFFFF"/>
+  <SolidColorBrush x:Key="Inventory.Brush.StatsValueText" Color="#7FFFFFFF"/>
+  <SolidColorBrush x:Key="Inventory.Brush.SlotBorder" Color="#FFEBA147"/>
+  <SolidColorBrush x:Key="Inventory.Brush.EquipSlotText" Color="#CCC6C4B9"/>
+  <LinearGradientBrush x:Key="Inventory.Brush.StatsValueBackground" StartPoint="0,0" EndPoint="1,0">
+    <GradientStop Offset="0" Color="#00000000"/>
+    <GradientStop Offset="0.9" Color="#7F000000"/>
+    <GradientStop Offset="1" Color="#33000000"/>
+  </LinearGradientBrush>
+
+  <!-- Titles Style -->
+  <Style x:Key="Inventory.Style.TitleBarText" TargetType="{x:Type TextBlock}">
+    <Setter Property="FontFamily" Value="Fonts/#Sequel"/>
+    <Setter Property="Foreground" Value="{StaticResource Inventory.Brush.TitleBarText}"/>
+    <Setter Property="Margin" Value="0,2"/>
+  </Style>
+
+  <!-- Stats Styles -->
+  <Style x:Key="Inventory.Style.StatsIcon" TargetType="{x:Type Path}">
+    <Setter Property="Fill" Value="{StaticResource Inventory.Brush.StatsIcon}"/>
+    <Setter Property="Margin" Value="0,4,4,0"/>
+    <Setter Property="Stretch" Value="Uniform"/>
+    <Setter Property="Width" Value="10"/>
+    <Setter Property="Height" Value="9"/>
+    <Setter Property="noesis:Element.Transform3D">
+      <Setter.Value>
+        <noesis:CompositeTransform3D CenterX="5"/>
+      </Setter.Value>
+    </Setter>
+  </Style>
+  <Style x:Key="Inventory.Style.StatsLabelText" TargetType="{x:Type TextBlock}">
+    <Setter Property="Foreground" Value="{StaticResource Inventory.Brush.StatsLabelText}"/>
+    <Setter Property="Margin" Value="0,4,0,0"/>
+  </Style>
+  <Style x:Key="Inventory.Style.StatsValueText" TargetType="{x:Type TextBlock}">
+    <Setter Property="Foreground" Value="{StaticResource Inventory.Brush.StatsValueText}"/>
+    <Setter Property="FontSize" Value="12"/>
+    <Setter Property="TextWrapping" Value="NoWrap"/>
+  </Style>
+  <ControlTemplate x:Key="Inventory.Template.AnimatedNumber" TargetType="Control">
+    <ControlTemplate.CustomProperties>
+      <CustomProperty Name="Number" Type="system:Single"/>
+    </ControlTemplate.CustomProperties>
+    <ControlTemplate.Resources>
+      <Storyboard x:Key="Anim.Number">
+        <DoubleAnimationUsingKeyFrames Storyboard.TargetName="Reference" Storyboard.TargetProperty="(FrameworkElement.MaxHeight)">
+          <SplineDoubleKeyFrame KeySpline="0.4,0,0.6,1" Value="{Binding Path=MaxWidth, ElementName=Reference}" KeyTime="0:0:0.300"/>
+        </DoubleAnimationUsingKeyFrames>
+      </Storyboard>
+    </ControlTemplate.Resources>
+    <Grid>
+      <b:Interaction.Triggers>
+        <b:PropertyChangedTrigger x:Name="OnNumberChanged" Binding="{Binding Path=MaxWidth, ElementName=Reference}">
+          <b:ControlStoryboardAction Storyboard="{StaticResource Anim.Number}"/>
+        </b:PropertyChangedTrigger>
+      </b:Interaction.Triggers>
+      <Decorator x:Name="Reference" MaxWidth="{Binding Path=(Custom.Number_Single), RelativeSource={RelativeSource TemplatedParent}}" MaxHeight="0"/>
+      <TextBlock Text="{Binding Path=MaxHeight, ElementName=Reference, StringFormat=F0}" HorizontalAlignment="Center" VerticalAlignment="Center" TextWrapping="Wrap"/>
+    </Grid>
+  </ControlTemplate>
+  <Style x:Key="Inventory.Style.AnimatedNumber" TargetType="Control">
+    <Setter Property="FontSize" Value="12"/>
+    <Setter Property="Foreground" Value="{StaticResource Inventory.Brush.StatsValueText}"/>
+    <Setter Property="Template" Value="{StaticResource Inventory.Template.AnimatedNumber}"/>
+  </Style>
+
+  <!-- Inventory list -->
+  <ControlTemplate x:Key="Inventory.Template.ScrollBar.Vertical" TargetType="ScrollBar">
+    <ControlTemplate.Resources>
+      <Style x:Key="ThumbStyle" TargetType="Thumb">
+        <Setter Property="Template">
+          <Setter.Value>
+            <ControlTemplate TargetType="Thumb">
+              <Border x:Name="Thumb" CornerRadius="5,5,5,5" Background="{StaticResource Inventory.Brush.TitleBarText}"/>
+              <ControlTemplate.Triggers>
+                <Trigger Property="IsMouseOver" Value="True">
+                  <Setter TargetName="Thumb" Property="Background" Value="#FFF9D280"/>
+                </Trigger>
+                <Trigger Property="IsDragging" Value="True">
+                  <Setter TargetName="Thumb" Property="Background" Value="#FFFFDA8C"/>
+                </Trigger>
+              </ControlTemplate.Triggers>
+            </ControlTemplate>
+          </Setter.Value>
+        </Setter>
+      </Style>
+      <Style x:Key="PageButtonStyle" TargetType="RepeatButton">
+        <Setter Property="IsTabStop" Value="False"/>
+        <Setter Property="Focusable" Value="False"/>
+        <Setter Property="ClickMode" Value="Press"/>
+        <Setter Property="Delay" Value="250"/>
+        <Setter Property="Interval" Value="100"/>
+        <Setter Property="Template">
+          <Setter.Value>
+            <ControlTemplate TargetType="RepeatButton">
+              <Border Background="#00FFFFFF"/>
+            </ControlTemplate>
+          </Setter.Value>
+        </Setter>
+      </Style>
+    </ControlTemplate.Resources>
+    <Track x:Name="PART_Track">
+      <Track.Thumb>
+        <Thumb x:Name="Thumb" Width="Auto" Height="10" Style="{StaticResource ThumbStyle}"/>
+      </Track.Thumb>
+      <Track.DecreaseRepeatButton>
+        <RepeatButton x:Name="DecreaseButton" Command="ScrollBar.PageLeftCommand" Style="{StaticResource PageButtonStyle}"/>
+      </Track.DecreaseRepeatButton>
+      <Track.IncreaseRepeatButton>
+        <RepeatButton x:Name="IncreaseButton" Command="ScrollBar.PageRightCommand" Style="{StaticResource PageButtonStyle}"/>
+      </Track.IncreaseRepeatButton>
+    </Track>
+    <ControlTemplate.Triggers>
+      <Trigger Property="Orientation" Value="Vertical">
+        <Setter TargetName="PART_Track" Property="IsDirectionReversed" Value="True"/>
+        <Setter TargetName="Thumb" Property="Width" Value="10"/>
+        <Setter TargetName="Thumb" Property="Height" Value="Auto"/>
+        <Setter TargetName="DecreaseButton" Property="Command" Value="ScrollBar.PageUpCommand"/>
+        <Setter TargetName="IncreaseButton" Property="Command" Value="ScrollBar.PageDownCommand"/>
+      </Trigger>
+    </ControlTemplate.Triggers>
+  </ControlTemplate>
+  <ControlTemplate x:Key="Inventory.Template.ScrollViewer" TargetType="{x:Type ScrollViewer}">
+    <Grid Background="Transparent">
+      <Grid.ColumnDefinitions>
+        <ColumnDefinition Width="100*"/>
+        <ColumnDefinition Width="2*"/>
+      </Grid.ColumnDefinitions>
+      <ScrollBar
+                x:Name="PART_VerticalScrollBar"
+                Grid.Column="1"
+                Maximum="{TemplateBinding ScrollableHeight}"
+                Minimum="0"
+                Orientation="Vertical"
+                Template="{StaticResource Inventory.Template.ScrollBar.Vertical}"
+                ViewportSize="{TemplateBinding ViewportHeight}"
+                Visibility="{TemplateBinding ComputedVerticalScrollBarVisibility}"
+                Value="{Binding VerticalOffset, Mode=OneWay, RelativeSource={RelativeSource TemplatedParent}}">
+        <ScrollBar.Transform3D>
+          <noesis:CompositeTransform3D TranslateZ="10"/>
+        </ScrollBar.Transform3D>
+      </ScrollBar>
+      <ScrollContentPresenter
+                Grid.Column="0"
+                Margin="{TemplateBinding Padding}"
+                CanContentScroll="{TemplateBinding CanContentScroll}"
+                Content="{TemplateBinding Content}"
+                ContentTemplate="{TemplateBinding ContentTemplate}"
+                ContentTemplateSelector="{TemplateBinding ContentTemplateSelector}">
+        <noesis:Element.Transform3D>
+          <noesis:CompositeTransform3D TranslateZ="10"/>
+        </noesis:Element.Transform3D>
+      </ScrollContentPresenter>
+    </Grid>
+  </ControlTemplate>
+
+  <!--Item ToolTip-->
+  <ControlTemplate x:Key="Inventory.Template.ItemToolTip" TargetType="{x:Type ContentControl}">
+    <ControlTemplate.Resources>
+      <Storyboard x:Key="Anim.Show">
+        <DoubleAnimationUsingKeyFrames Storyboard.TargetProperty="(Border.Background).(Brush.Opacity)" Storyboard.TargetName="ItemInfo">
+          <EasingDoubleKeyFrame KeyTime="0" Value="0"/>
+          <EasingDoubleKeyFrame KeyTime="0:0:0.5" Value="0"/>
+          <EasingDoubleKeyFrame KeyTime="0:0:0.8" Value="1">
+            <EasingDoubleKeyFrame.EasingFunction>
+              <CubicEase EasingMode="EaseInOut"/>
+            </EasingDoubleKeyFrame.EasingFunction>
+          </EasingDoubleKeyFrame>
+        </DoubleAnimationUsingKeyFrames>
+        <DoubleAnimationUsingKeyFrames Storyboard.TargetProperty="(Border.BorderBrush).(Brush.Opacity)" Storyboard.TargetName="ItemInfo">
+          <EasingDoubleKeyFrame KeyTime="0" Value="0"/>
+          <EasingDoubleKeyFrame KeyTime="0:0:0.5" Value="0"/>
+          <EasingDoubleKeyFrame KeyTime="0:0:0.8" Value="1">
+            <EasingDoubleKeyFrame.EasingFunction>
+              <CubicEase EasingMode="EaseInOut"/>
+            </EasingDoubleKeyFrame.EasingFunction>
+          </EasingDoubleKeyFrame>
+        </DoubleAnimationUsingKeyFrames>
+        <DoubleAnimationUsingKeyFrames Storyboard.TargetProperty="(TextElement.Foreground).(Brush.Opacity)" Storyboard.TargetName="Name">
+          <EasingDoubleKeyFrame KeyTime="0" Value="0"/>
+          <EasingDoubleKeyFrame KeyTime="0:0:0.5" Value="0"/>
+          <EasingDoubleKeyFrame KeyTime="0:0:0.8" Value="1">
+            <EasingDoubleKeyFrame.EasingFunction>
+              <CubicEase EasingMode="EaseInOut"/>
+            </EasingDoubleKeyFrame.EasingFunction>
+          </EasingDoubleKeyFrame>
+        </DoubleAnimationUsingKeyFrames>
+        <DoubleAnimationUsingKeyFrames Storyboard.TargetProperty="(TextElement.Foreground).(Brush.Opacity)" Storyboard.TargetName="Desc">
+          <EasingDoubleKeyFrame KeyTime="0" Value="0"/>
+          <EasingDoubleKeyFrame KeyTime="0:0:0.5" Value="0"/>
+          <EasingDoubleKeyFrame KeyTime="0:0:1" Value="1">
+            <EasingDoubleKeyFrame.EasingFunction>
+              <CubicEase EasingMode="EaseInOut"/>
+            </EasingDoubleKeyFrame.EasingFunction>
+          </EasingDoubleKeyFrame>
+        </DoubleAnimationUsingKeyFrames>
+        <DoubleAnimationUsingKeyFrames Storyboard.TargetProperty="(TextElement.Foreground).(Brush.Opacity)" Storyboard.TargetName="LifeLabel">
+          <EasingDoubleKeyFrame KeyTime="0" Value="0"/>
+          <EasingDoubleKeyFrame KeyTime="0:0:0.5" Value="0"/>
+          <EasingDoubleKeyFrame KeyTime="0:0:0.8" Value="1">
+            <EasingDoubleKeyFrame.EasingFunction>
+              <CubicEase EasingMode="EaseInOut"/>
+            </EasingDoubleKeyFrame.EasingFunction>
+          </EasingDoubleKeyFrame>
+        </DoubleAnimationUsingKeyFrames>
+        <DoubleAnimationUsingKeyFrames Storyboard.TargetProperty="(UIElement.RenderTransform).(TransformGroup.Children)[3].(TranslateTransform.X)" Storyboard.TargetName="LifeLabel">
+          <EasingDoubleKeyFrame KeyTime="0" Value="-10"/>
+          <EasingDoubleKeyFrame KeyTime="0:0:0.5" Value="-10"/>
+          <EasingDoubleKeyFrame KeyTime="0:0:0.8" Value="0">
+            <EasingDoubleKeyFrame.EasingFunction>
+              <CircleEase EasingMode="EaseOut"/>
+            </EasingDoubleKeyFrame.EasingFunction>
+          </EasingDoubleKeyFrame>
+        </DoubleAnimationUsingKeyFrames>
+        <DoubleAnimationUsingKeyFrames Storyboard.TargetProperty="(TextElement.Foreground).(Brush.Opacity)" Storyboard.TargetName="Life">
+          <EasingDoubleKeyFrame KeyTime="0" Value="0"/>
+          <EasingDoubleKeyFrame KeyTime="0:0:0.55" Value="0"/>
+          <EasingDoubleKeyFrame KeyTime="0:0:0.85" Value="1">
+            <EasingDoubleKeyFrame.EasingFunction>
+              <CubicEase EasingMode="EaseInOut"/>
+            </EasingDoubleKeyFrame.EasingFunction>
+          </EasingDoubleKeyFrame>
+        </DoubleAnimationUsingKeyFrames>
+        <DoubleAnimationUsingKeyFrames Storyboard.TargetProperty="(UIElement.RenderTransform).(TransformGroup.Children)[3].(TranslateTransform.X)" Storyboard.TargetName="Life">
+          <EasingDoubleKeyFrame KeyTime="0" Value="-10"/>
+          <EasingDoubleKeyFrame KeyTime="0:0:0.55" Value="-10"/>
+          <EasingDoubleKeyFrame KeyTime="0:0:0.85" Value="0">
+            <EasingDoubleKeyFrame.EasingFunction>
+              <CircleEase EasingMode="EaseOut"/>
+            </EasingDoubleKeyFrame.EasingFunction>
+          </EasingDoubleKeyFrame>
+        </DoubleAnimationUsingKeyFrames>
+        <DoubleAnimationUsingKeyFrames Storyboard.TargetProperty="(TextElement.Foreground).(Brush.Opacity)" Storyboard.TargetName="ManaLabel">
+          <EasingDoubleKeyFrame KeyTime="0" Value="0"/>
+          <EasingDoubleKeyFrame KeyTime="0:0:0.55" Value="0"/>
+          <EasingDoubleKeyFrame KeyTime="0:0:0.85" Value="1">
+            <EasingDoubleKeyFrame.EasingFunction>
+              <CubicEase EasingMode="EaseInOut"/>
+            </EasingDoubleKeyFrame.EasingFunction>
+          </EasingDoubleKeyFrame>
+        </DoubleAnimationUsingKeyFrames>
+        <DoubleAnimationUsingKeyFrames Storyboard.TargetProperty="(UIElement.RenderTransform).(TransformGroup.Children)[3].(TranslateTransform.X)" Storyboard.TargetName="ManaLabel">
+          <EasingDoubleKeyFrame KeyTime="0" Value="-10"/>
+          <EasingDoubleKeyFrame KeyTime="0:0:0.55" Value="-10"/>
+          <EasingDoubleKeyFrame KeyTime="0:0:0.85" Value="0">
+            <EasingDoubleKeyFrame.EasingFunction>
+              <CircleEase EasingMode="EaseOut"/>
+            </EasingDoubleKeyFrame.EasingFunction>
+          </EasingDoubleKeyFrame>
+        </DoubleAnimationUsingKeyFrames>
+        <DoubleAnimationUsingKeyFrames Storyboard.TargetProperty="(TextElement.Foreground).(Brush.Opacity)" Storyboard.TargetName="Mana">
+          <EasingDoubleKeyFrame KeyTime="0" Value="0"/>
+          <EasingDoubleKeyFrame KeyTime="0:0:0.6" Value="0"/>
+          <EasingDoubleKeyFrame KeyTime="0:0:0.9" Value="1">
+            <EasingDoubleKeyFrame.EasingFunction>
+              <CubicEase EasingMode="EaseInOut"/>
+            </EasingDoubleKeyFrame.EasingFunction>
+          </EasingDoubleKeyFrame>
+        </DoubleAnimationUsingKeyFrames>
+        <DoubleAnimationUsingKeyFrames Storyboard.TargetProperty="(UIElement.RenderTransform).(TransformGroup.Children)[3].(TranslateTransform.X)" Storyboard.TargetName="Mana">
+          <EasingDoubleKeyFrame KeyTime="0" Value="-10"/>
+          <EasingDoubleKeyFrame KeyTime="0:0:0.6" Value="-10"/>
+          <EasingDoubleKeyFrame KeyTime="0:0:0.9" Value="0">
+            <EasingDoubleKeyFrame.EasingFunction>
+              <CircleEase EasingMode="EaseOut"/>
+            </EasingDoubleKeyFrame.EasingFunction>
+          </EasingDoubleKeyFrame>
+        </DoubleAnimationUsingKeyFrames>
+        <DoubleAnimationUsingKeyFrames Storyboard.TargetProperty="(TextElement.Foreground).(Brush.Opacity)" Storyboard.TargetName="DpsLabel">
+          <EasingDoubleKeyFrame KeyTime="0" Value="0"/>
+          <EasingDoubleKeyFrame KeyTime="0:0:0.6" Value="0"/>
+          <EasingDoubleKeyFrame KeyTime="0:0:0.9" Value="1">
+            <EasingDoubleKeyFrame.EasingFunction>
+              <CubicEase EasingMode="EaseInOut"/>
+            </EasingDoubleKeyFrame.EasingFunction>
+          </EasingDoubleKeyFrame>
+        </DoubleAnimationUsingKeyFrames>
+        <DoubleAnimationUsingKeyFrames Storyboard.TargetProperty="(UIElement.RenderTransform).(TransformGroup.Children)[3].(TranslateTransform.X)" Storyboard.TargetName="DpsLabel">
+          <EasingDoubleKeyFrame KeyTime="0" Value="-10"/>
+          <EasingDoubleKeyFrame KeyTime="0:0:0.6" Value="-10"/>
+          <EasingDoubleKeyFrame KeyTime="0:0:0.9" Value="0">
+            <EasingDoubleKeyFrame.EasingFunction>
+              <CircleEase EasingMode="EaseOut"/>
+            </EasingDoubleKeyFrame.EasingFunction>
+          </EasingDoubleKeyFrame>
+        </DoubleAnimationUsingKeyFrames>
+        <DoubleAnimationUsingKeyFrames Storyboard.TargetProperty="(TextElement.Foreground).(Brush.Opacity)" Storyboard.TargetName="Dps">
+          <EasingDoubleKeyFrame KeyTime="0" Value="0"/>
+          <EasingDoubleKeyFrame KeyTime="0:0:0.65" Value="0"/>
+          <EasingDoubleKeyFrame KeyTime="0:0:0.95" Value="1">
+            <EasingDoubleKeyFrame.EasingFunction>
+              <CubicEase EasingMode="EaseInOut"/>
+            </EasingDoubleKeyFrame.EasingFunction>
+          </EasingDoubleKeyFrame>
+        </DoubleAnimationUsingKeyFrames>
+        <DoubleAnimationUsingKeyFrames Storyboard.TargetProperty="(UIElement.RenderTransform).(TransformGroup.Children)[3].(TranslateTransform.X)" Storyboard.TargetName="Dps">
+          <EasingDoubleKeyFrame KeyTime="0" Value="-10"/>
+          <EasingDoubleKeyFrame KeyTime="0:0:0.65" Value="-10"/>
+          <EasingDoubleKeyFrame KeyTime="0:0:0.95" Value="0">
+            <EasingDoubleKeyFrame.EasingFunction>
+              <CircleEase EasingMode="EaseOut"/>
+            </EasingDoubleKeyFrame.EasingFunction>
+          </EasingDoubleKeyFrame>
+        </DoubleAnimationUsingKeyFrames>
+        <DoubleAnimationUsingKeyFrames Storyboard.TargetProperty="(TextElement.Foreground).(Brush.Opacity)" Storyboard.TargetName="ArmorLabel">
+          <EasingDoubleKeyFrame KeyTime="0" Value="0"/>
+          <EasingDoubleKeyFrame KeyTime="0:0:0.65" Value="0"/>
+          <EasingDoubleKeyFrame KeyTime="0:0:0.95" Value="1">
+            <EasingDoubleKeyFrame.EasingFunction>
+              <CubicEase EasingMode="EaseInOut"/>
+            </EasingDoubleKeyFrame.EasingFunction>
+          </EasingDoubleKeyFrame>
+        </DoubleAnimationUsingKeyFrames>
+        <DoubleAnimationUsingKeyFrames Storyboard.TargetProperty="(UIElement.RenderTransform).(TransformGroup.Children)[3].(TranslateTransform.X)" Storyboard.TargetName="ArmorLabel">
+          <EasingDoubleKeyFrame KeyTime="0" Value="-10"/>
+          <EasingDoubleKeyFrame KeyTime="0:0:0.65" Value="-10"/>
+          <EasingDoubleKeyFrame KeyTime="0:0:0.95" Value="0">
+            <EasingDoubleKeyFrame.EasingFunction>
+              <CircleEase EasingMode="EaseOut"/>
+            </EasingDoubleKeyFrame.EasingFunction>
+          </EasingDoubleKeyFrame>
+        </DoubleAnimationUsingKeyFrames>
+        <DoubleAnimationUsingKeyFrames Storyboard.TargetProperty="(TextElement.Foreground).(Brush.Opacity)" Storyboard.TargetName="Armor">
+          <EasingDoubleKeyFrame KeyTime="0" Value="0"/>
+          <EasingDoubleKeyFrame KeyTime="0:0:0.7" Value="0"/>
+          <EasingDoubleKeyFrame KeyTime="0:0:1" Value="1">
+            <EasingDoubleKeyFrame.EasingFunction>
+              <CubicEase EasingMode="EaseInOut"/>
+            </EasingDoubleKeyFrame.EasingFunction>
+          </EasingDoubleKeyFrame>
+        </DoubleAnimationUsingKeyFrames>
+        <DoubleAnimationUsingKeyFrames Storyboard.TargetProperty="(UIElement.RenderTransform).(TransformGroup.Children)[3].(TranslateTransform.X)" Storyboard.TargetName="Armor">
+          <EasingDoubleKeyFrame KeyTime="0" Value="-10"/>
+          <EasingDoubleKeyFrame KeyTime="0:0:0.7" Value="-10"/>
+          <EasingDoubleKeyFrame KeyTime="0:0:1" Value="0">
+            <EasingDoubleKeyFrame.EasingFunction>
+              <CircleEase EasingMode="EaseOut"/>
+            </EasingDoubleKeyFrame.EasingFunction>
+          </EasingDoubleKeyFrame>
+        </DoubleAnimationUsingKeyFrames>
+        <DoubleAnimationUsingKeyFrames Storyboard.TargetProperty="(UIElement.RenderTransform).(TransformGroup.Children)[0].(ScaleTransform.ScaleX)" Storyboard.TargetName="FadeIn">
+          <EasingDoubleKeyFrame KeyTime="0" Value="0"/>
+          <EasingDoubleKeyFrame KeyTime="0:0:0.1" Value="0"/>
+          <EasingDoubleKeyFrame KeyTime="0:0:0.3" Value="1">
+            <EasingDoubleKeyFrame.EasingFunction>
+              <SineEase EasingMode="EaseIn"/>
+            </EasingDoubleKeyFrame.EasingFunction>
+          </EasingDoubleKeyFrame>
+          <EasingDoubleKeyFrame KeyTime="0:0:0.35" Value="1"/>
+          <EasingDoubleKeyFrame KeyTime="0:0:0.6" Value="0">
+            <EasingDoubleKeyFrame.EasingFunction>
+              <SineEase EasingMode="EaseIn"/>
+            </EasingDoubleKeyFrame.EasingFunction>
+          </EasingDoubleKeyFrame>
+        </DoubleAnimationUsingKeyFrames>
+        <DoubleAnimationUsingKeyFrames Storyboard.TargetProperty="(UIElement.RenderTransform).(TransformGroup.Children)[0].(ScaleTransform.ScaleY)" Storyboard.TargetName="FadeIn">
+          <EasingDoubleKeyFrame KeyTime="0" Value="0"/>
+          <EasingDoubleKeyFrame KeyTime="0:0:0.1" Value="0"/>
+          <EasingDoubleKeyFrame KeyTime="0:0:0.3" Value="1">
+            <EasingDoubleKeyFrame.EasingFunction>
+              <SineEase EasingMode="EaseIn"/>
+            </EasingDoubleKeyFrame.EasingFunction>
+          </EasingDoubleKeyFrame>
+          <EasingDoubleKeyFrame KeyTime="0:0:0.35" Value="1"/>
+          <EasingDoubleKeyFrame KeyTime="0:0:0.6" Value="0">
+            <EasingDoubleKeyFrame.EasingFunction>
+              <SineEase EasingMode="EaseOut"/>
+            </EasingDoubleKeyFrame.EasingFunction>
+          </EasingDoubleKeyFrame>
+        </DoubleAnimationUsingKeyFrames>
+        <ColorAnimationUsingKeyFrames Storyboard.TargetProperty="(Panel.Background).(SolidColorBrush.Color)" Storyboard.TargetName="FadeIn">
+          <EasingColorKeyFrame KeyTime="0:0:0.3" Value="#CC554222"/>
+          <EasingColorKeyFrame KeyTime="0:0:0.325" Value="#E5554222"/>
+          <EasingColorKeyFrame KeyTime="0:0:0.35" Value="#CC554222"/>
+        </ColorAnimationUsingKeyFrames>
+        <PointAnimationUsingKeyFrames Storyboard.TargetProperty="(UIElement.RenderTransformOrigin)" Storyboard.TargetName="FadeIn">
+          <DiscretePointKeyFrame KeyTime="0" Value="0,0"/>
+          <DiscretePointKeyFrame KeyTime="0:0:0.3" Value="1,1"/>
+        </PointAnimationUsingKeyFrames>
+      </Storyboard>
+    </ControlTemplate.Resources>
+    <Grid x:Name="Root" Width="{Binding ActualWidth, ElementName=ToolTipRef}">
+      <Grid.ColumnDefinitions>
+        <ColumnDefinition Width="3*"/>
+        <ColumnDefinition Width="30*"/>
+        <ColumnDefinition Width="970*"/>
+        <ColumnDefinition Width="30*"/>
+        <ColumnDefinition Width="3*"/>
+      </Grid.ColumnDefinitions>
+      <Decorator x:Name="BorderRef" Grid.Column="0"/>
+      <Decorator x:Name="MarginRef" Grid.Column="1"/>
+      <Viewbox Grid.Column="2">
+        <noesis:Element.Transform3D>
+          <noesis:CompositeTransform3D TranslateZ="10"/>
+        </noesis:Element.Transform3D>
+        <Grid>
+          <Border x:Name="ItemInfo" CornerRadius="2"
+                        BorderThickness="{Binding ActualWidth, ElementName=BorderRef}"
+                        Padding="{Binding ActualWidth, ElementName=MarginRef}" Background="#E532280F">
+            <Border.BorderBrush>
+              <LinearGradientBrush EndPoint="0.5,1" StartPoint="0.5,0">
+                <GradientStop Color="#66554222" Offset="0"/>
+                <GradientStop Color="#FF554222" Offset="0.6"/>
+                <GradientStop Color="#26554222" Offset="1"/>
+              </LinearGradientBrush>
+            </Border.BorderBrush>
+            <StackPanel>
+              <noesis:Element.Transform3D>
+                <noesis:CompositeTransform3D TranslateZ="5"/>
+              </noesis:Element.Transform3D>
+              <TextBlock x:Name="Name" Text="{Binding Name}" Foreground="#FFF3CF54" FontSize="11">
+                                <noesis:Element.Transform3D>
+                                    <noesis:CompositeTransform3D TranslateZ="5"/>
+                                </noesis:Element.Transform3D>
+              </TextBlock>
+              <TextBlock x:Name="Desc" Text="{Binding Description}" FontSize="8" Width="100" TextWrapping="Wrap" Foreground="#CCF9E7B9"/>
+              <StackPanel Orientation="Horizontal" Margin="10,5,0,0">
+                <TextBlock x:Name="LifeLabel" Width="30" Text="Life:" Foreground="#F2C6C4B9" RenderTransformOrigin="0.5,0.5">
+                  <TextBlock.RenderTransform>
+                    <TransformGroup>
+                      <ScaleTransform/>
+                      <SkewTransform/>
+                      <RotateTransform/>
+                      <TranslateTransform/>
+                    </TransformGroup>
+                  </TextBlock.RenderTransform>
+                </TextBlock>
+                <TextBlock x:Name="Life" Width="50" Foreground="#FFBCEE52" TextAlignment="Right" RenderTransformOrigin="0.5,0.5">
+                  <TextBlock.RenderTransform>
+                    <TransformGroup>
+                      <ScaleTransform/>
+                      <SkewTransform/>
+                      <RotateTransform/>
+                      <TranslateTransform/>
+                    </TransformGroup>
+                  </TextBlock.RenderTransform>
+                                    <Run Text="+"/><Run Text="{Binding Life}"/>
+                </TextBlock>
+              </StackPanel>
+              <StackPanel Orientation="Horizontal" Margin="10,0,0,0">
+                <TextBlock x:Name="ManaLabel" Width="30" Text="Mana:" Foreground="#F2C6C4B9" RenderTransformOrigin="0.5,0.5">
+                  <TextBlock.RenderTransform>
+                    <TransformGroup>
+                      <ScaleTransform/>
+                      <SkewTransform/>
+                      <RotateTransform/>
+                      <TranslateTransform/>
+                    </TransformGroup>
+                  </TextBlock.RenderTransform>
+                </TextBlock>
+                <TextBlock x:Name="Mana" Width="50" Foreground="#FFBCEE52" TextAlignment="Right" RenderTransformOrigin="0.5,0.5">
+                  <TextBlock.RenderTransform>
+                    <TransformGroup>
+                      <ScaleTransform/>
+                      <SkewTransform/>
+                      <RotateTransform/>
+                      <TranslateTransform/>
+                    </TransformGroup>
+                  </TextBlock.RenderTransform>
+                                    <Run Text="+"/><Run Text="{Binding Mana}"/>
+                </TextBlock>
+              </StackPanel>
+              <StackPanel Orientation="Horizontal" Margin="10,0,0,0">
+                <TextBlock x:Name="DpsLabel" Width="30" Text="Dps:" Foreground="#F2C6C4B9" RenderTransformOrigin="0.5,0.5">
+                  <TextBlock.RenderTransform>
+                    <TransformGroup>
+                      <ScaleTransform/>
+                      <SkewTransform/>
+                      <RotateTransform/>
+                      <TranslateTransform/>
+                    </TransformGroup>
+                  </TextBlock.RenderTransform>
+                </TextBlock>
+                <TextBlock x:Name="Dps" Width="50" Foreground="#FFBCEE52" TextAlignment="Right" RenderTransformOrigin="0.5,0.5">
+                  <TextBlock.RenderTransform>
+                    <TransformGroup>
+                      <ScaleTransform/>
+                      <SkewTransform/>
+                      <RotateTransform/>
+                      <TranslateTransform/>
+                    </TransformGroup>
+                  </TextBlock.RenderTransform>
+                                    <Run Text="+"/><Run Text="{Binding Dps}"/>
+                </TextBlock>
+              </StackPanel>
+              <StackPanel Orientation="Horizontal" Margin="10,0,0,0">
+                <TextBlock x:Name="ArmorLabel" Width="30" Text="Armor:" Foreground="#F2C6C4B9" RenderTransformOrigin="0.5,0.5">
+                  <TextBlock.RenderTransform>
+                    <TransformGroup>
+                      <ScaleTransform/>
+                      <SkewTransform/>
+                      <RotateTransform/>
+                      <TranslateTransform/>
+                    </TransformGroup>
+                  </TextBlock.RenderTransform>
+                </TextBlock>
+                <TextBlock x:Name="Armor" Width="50" Foreground="#FFBCEE52" TextAlignment="Right" RenderTransformOrigin="0.5,0.5">
+                  <TextBlock.RenderTransform>
+                    <TransformGroup>
+                      <ScaleTransform/>
+                      <SkewTransform/>
+                      <RotateTransform/>
+                      <TranslateTransform/>
+                    </TransformGroup>
+                  </TextBlock.RenderTransform>
+                                    <Run Text="+"/><Run Text="{Binding Armor}"/>
+                </TextBlock>
+              </StackPanel>
+            </StackPanel>
+          </Border>
+          <Border x:Name="FadeIn" CornerRadius="2" Background="#CC554222" RenderTransformOrigin="0,0" d:IsHidden="True">
+            <Border.RenderTransform>
+              <TransformGroup>
+                <ScaleTransform/>
+                <SkewTransform/>
+                <RotateTransform/>
+                <TranslateTransform/>
+              </TransformGroup>
+            </Border.RenderTransform>
+          </Border>
+        </Grid>
+      </Viewbox>
+    </Grid>
+    <ControlTemplate.Triggers>
+      <EventTrigger RoutedEvent="FrameworkElement.Loaded" SourceName="Root">
+        <BeginStoryboard Storyboard="{StaticResource Anim.Show}"/>
+      </EventTrigger>
+    </ControlTemplate.Triggers>
+  </ControlTemplate>
+  <Style x:Key="Inventory.Style.ItemToolTip" TargetType="{x:Type ContentControl}">
+    <Setter Property="Focusable" Value="False"/>
+    <Setter Property="IsHitTestVisible" Value="False"/>
+    <Setter Property="FontSize" Value="10"/>
+    <Setter Property="Template" Value="{StaticResource Inventory.Template.ItemToolTip}"/>
+  </Style>
+
+  <!-- Inventory -->
+  <DataTemplate x:Key="Inventory.Template.ListBox.Item">
+    <Grid x:Name="Root" Margin="5" Background="#00FFFFFF" RenderTransformOrigin="0.5,0.5">
+      <VisualStateManager.VisualStateGroups>
+        <VisualStateGroup x:Name="HoverStates">
+          <VisualStateGroup.Transitions>
+            <VisualTransition GeneratedDuration="00:00:00.2000000"/>
+          </VisualStateGroup.Transitions>
+          <VisualState x:Name="Base">
+            <Storyboard>
+              <DoubleAnimationUsingKeyFrames Storyboard.TargetName="Border0" Storyboard.TargetProperty="(UIElement.RenderTransform).(TransformGroup.Children)[0].(ScaleTransform.ScaleX)">
+                <EasingDoubleKeyFrame KeyTime="0:0:0.200" Value="1">
+                  <EasingDoubleKeyFrame.EasingFunction>
+                    <CircleEase EasingMode="EaseOut"/>
+                  </EasingDoubleKeyFrame.EasingFunction>
+                </EasingDoubleKeyFrame>
+              </DoubleAnimationUsingKeyFrames>
+              <DoubleAnimationUsingKeyFrames Storyboard.TargetName="Border0" Storyboard.TargetProperty="(UIElement.RenderTransform).(TransformGroup.Children)[0].(ScaleTransform.ScaleY)">
+                <EasingDoubleKeyFrame KeyTime="0:0:0.200" Value="1">
+                  <EasingDoubleKeyFrame.EasingFunction>
+                    <CircleEase EasingMode="EaseOut"/>
+                  </EasingDoubleKeyFrame.EasingFunction>
+                </EasingDoubleKeyFrame>
+              </DoubleAnimationUsingKeyFrames>
+            </Storyboard>
+          </VisualState>
+          <VisualState x:Name="Hover">
+            <Storyboard>
+              <DoubleAnimationUsingKeyFrames Storyboard.TargetName="Border0" Storyboard.TargetProperty="(UIElement.RenderTransform).(TransformGroup.Children)[0].(ScaleTransform.ScaleX)">
+                <EasingDoubleKeyFrame KeyTime="0:0:0" Value="1.1">
+                  <EasingDoubleKeyFrame.EasingFunction>
+                    <CircleEase EasingMode="EaseOut"/>
+                  </EasingDoubleKeyFrame.EasingFunction>
+                </EasingDoubleKeyFrame>
+              </DoubleAnimationUsingKeyFrames>
+              <DoubleAnimationUsingKeyFrames Storyboard.TargetName="Border0" Storyboard.TargetProperty="(UIElement.RenderTransform).(TransformGroup.Children)[0].(ScaleTransform.ScaleY)">
+                <EasingDoubleKeyFrame KeyTime="0:0:0" Value="1.1">
+                  <EasingDoubleKeyFrame.EasingFunction>
+                    <CircleEase EasingMode="EaseOut"/>
+                  </EasingDoubleKeyFrame.EasingFunction>
+                </EasingDoubleKeyFrame>
+              </DoubleAnimationUsingKeyFrames>
+              <DoubleAnimationUsingKeyFrames Storyboard.TargetName="Border0" Storyboard.TargetProperty="(UIElement.Transform3D).(NoesisGUIExtensions.CompositeTransform3D.TranslateZ)">
+                <EasingDoubleKeyFrame KeyTime="0:0:0" Value="10">
+                  <EasingDoubleKeyFrame.EasingFunction>
+                    <CircleEase EasingMode="EaseOut"/>
+                  </EasingDoubleKeyFrame.EasingFunction>
+                </EasingDoubleKeyFrame>
+              </DoubleAnimationUsingKeyFrames>
+              <DoubleAnimationUsingKeyFrames Storyboard.TargetName="Bd" Storyboard.TargetProperty="(Border.BorderBrush).(Brush.Opacity)">
+                <LinearDoubleKeyFrame KeyTime="0:0:0" Value="1"/>
+              </DoubleAnimationUsingKeyFrames>
+              <ColorAnimationUsingKeyFrames Storyboard.TargetName="Bg" Storyboard.TargetProperty="(Panel.Background).(GradientBrush.GradientStops)[1].(GradientStop.Color)">
+                <LinearColorKeyFrame KeyTime="0:0:0" Value="#78DA9858"/>
+              </ColorAnimationUsingKeyFrames>
+              <DoubleAnimationUsingKeyFrames Storyboard.TargetName="Bg" Storyboard.TargetProperty="(UIElement.Transform3D).(NoesisGUIExtensions.CompositeTransform3D.TranslateZ)">
+                <EasingDoubleKeyFrame KeyTime="0:0:0" Value="5">
+                  <EasingDoubleKeyFrame.EasingFunction>
+                    <CubicEase EasingMode="EaseIn"/>
+                  </EasingDoubleKeyFrame.EasingFunction>
+                </EasingDoubleKeyFrame>
+              </DoubleAnimationUsingKeyFrames>
+            </Storyboard>
+          </VisualState>
+        </VisualStateGroup>
+      </VisualStateManager.VisualStateGroups>
+      <Grid.ColumnDefinitions>
+        <ColumnDefinition Width="1*"/>
+        <ColumnDefinition Width="50*"/>
+      </Grid.ColumnDefinitions>
+      <Grid.RenderTransform>
+        <ScaleTransform />
+      </Grid.RenderTransform>
+      <noesis:Element.Transform3D>
+        <noesis:CompositeTransform3D TranslateZ="0"/>
+      </noesis:Element.Transform3D>
+      <b:Interaction.Triggers>
+        <b:EventTrigger x:Name="Load base">
+          <b:GoToStateAction StateName="Base"/>
+        </b:EventTrigger>
+        <b:EventTrigger x:Name="Hover On" EventName="MouseEnter">
+          <b:GoToStateAction StateName="Hover"/>
+        </b:EventTrigger>
+        <b:EventTrigger x:Name="Hover Off" EventName="MouseLeave">
+          <b:GoToStateAction StateName="Base"/>
+        </b:EventTrigger>
+        <b:DataTrigger x:Name="Hover On (Focused)" Binding="{Binding Path=IsKeyboardFocused, RelativeSource={RelativeSource AncestorType=ContentControl}}" Value="True">
+          <b:GoToStateAction StateName="Hover"/>
+        </b:DataTrigger>
+        <b:DataTrigger x:Name="Hover Off (Unfocused)" Binding="{Binding Path=IsKeyboardFocused, RelativeSource={RelativeSource AncestorType=ContentControl}}" Value="False">
+          <b:GoToStateAction StateName="Base"/>
+        </b:DataTrigger>
+      </b:Interaction.Triggers>
+      <Decorator x:Name="SlotBorderRef"/>
+      <Border x:Name="Bg" Grid.ColumnSpan="2" Height="{Binding ActualWidth, Mode=OneWay, RelativeSource={RelativeSource Self}}" CornerRadius="4">
+        <Border.Background>
+          <RadialGradientBrush>
+            <GradientStop Offset="0" Color="#3FDA9858"/>
+            <GradientStop Offset="1" Color="#3FDA9858"/>
+          </RadialGradientBrush>
+        </Border.Background>
+        <Border.Transform3D>
+          <noesis:CompositeTransform3D />
+        </Border.Transform3D>
+        <Grid>
+          <Grid.RowDefinitions>
+            <RowDefinition Height="2*"/>
+            <RowDefinition Height="6*"/>
+            <RowDefinition Height="2*"/>
+          </Grid.RowDefinitions>
+          <Grid.ColumnDefinitions>
+            <ColumnDefinition Width="2*"/>
+            <ColumnDefinition Width="6*"/>
+            <ColumnDefinition Width="2*"/>
+          </Grid.ColumnDefinitions>
+          <Border x:Name="Bd" Grid.RowSpan="3" Grid.ColumnSpan="3" BorderThickness="{Binding ActualWidth, ElementName=SlotBorderRef, Mode=OneWay}" CornerRadius="4">
+            <Border.BorderBrush>
+              <SolidColorBrush Opacity="0" Color="#FFEBA147"/>
+            </Border.BorderBrush>
+          </Border>
+          <Border x:Name="InvalidDropBorder"
+                        Grid.RowSpan="3"
+                        Grid.ColumnSpan="3"
+                        CornerRadius="4">
+            <Border.Background>
+              <SolidColorBrush Opacity="0" Color="#66F04029"/>
+            </Border.Background>
+          </Border>
+          <Border x:Name="Border0" Grid.Row="1" Grid.Column="1" RenderTransformOrigin="0.5,0.5">
+            <Border.Background>
+              <ImageBrush ImageSource="{Binding Path=Icon}" Stretch="Uniform"/>
+            </Border.Background>
+            <Border.Transform3D>
+              <noesis:CompositeTransform3D TranslateZ="5"/>
+            </Border.Transform3D>
+            <Border.RenderTransform>
+              <TransformGroup>
+                <ScaleTransform />
+                <SkewTransform />
+                <RotateTransform />
+                <TranslateTransform />
+              </TransformGroup>
+            </Border.RenderTransform>
+          </Border>
+        </Grid>
+      </Border>
+      <Popup x:Name="ToolTip" AllowsTransparency="True" VerticalOffset="0"
+                   Placement="{Binding Path=(ToolTipService.Placement), RelativeSource={RelativeSource AncestorType=ContentControl}}">
+        <ContentControl x:Name="ToolTipContent" Grid.ColumnSpan="2" Content="{Binding}" Style="{StaticResource Inventory.Style.ItemToolTip}"/>
+      </Popup>
+    </Grid>
+    <DataTemplate.Triggers>
+      <MultiDataTrigger>
+        <MultiDataTrigger.Conditions>
+          <Condition Binding="{Binding Path=(noesis:DragDrop.IsContentEmpty), RelativeSource={RelativeSource AncestorType=ContentControl}}" Value="True"/>
+        </MultiDataTrigger.Conditions>
+        <Setter TargetName="ToolTipContent" Property="Visibility" Value="Collapsed"/>
+      </MultiDataTrigger>
+      <MultiDataTrigger>
+        <MultiDataTrigger.Conditions>
+          <Condition Binding="{Binding Path=IsKeyboardFocused, RelativeSource={RelativeSource AncestorType=ContentControl}}" Value="True"/>
+        </MultiDataTrigger.Conditions>
+        <Setter TargetName="ToolTip" Property="IsOpen" Value="True"/>
+      </MultiDataTrigger>
+    </DataTemplate.Triggers>
+  </DataTemplate>
+  <ControlTemplate x:Key="Inventory.Template.ListBox" TargetType="ListBox">
+    <Grid>
+      <ItemsPresenter />
+    </Grid>
+  </ControlTemplate>
+  <ItemsPanelTemplate x:Key="Inventory.Template.ListBox.ItemsPanel">
+    <UniformGrid Margin="5,5,5,5" VerticalAlignment="Top" Columns="5"/>
+  </ItemsPanelTemplate>
+  <ControlTemplate x:Key="Inventory.Template.ListBox.ItemContainer" TargetType="ListBoxItem">
+    <Border x:Name="ItemBorder" Width="131" Height="131">
+      <ContentPresenter HorizontalAlignment="{TemplateBinding HorizontalContentAlignment}" VerticalAlignment="{TemplateBinding VerticalContentAlignment}"/>
+    </Border>
+  </ControlTemplate>
+  <Style x:Key="Inventory.Style.ListBox.ItemContainer" TargetType="ListBoxItem" BasedOn="{StaticResource {x:Type ListBoxItem}}">
+    <Setter Property="FocusVisualStyle" Value="{x:Null}"/>
+    <Setter Property="Template" Value="{StaticResource Inventory.Template.ListBox.ItemContainer}"/>
+    <Setter Property="HorizontalContentAlignment" Value="Stretch"/>
+    <Setter Property="VerticalContentAlignment" Value="Stretch"/>
+    <Setter Property="ToolTipService.Placement" Value="Left"/>
+    <Setter Property="noesis:DragDrop.Role" Value="DragAndDrop"/>
+    <Setter Property="noesis:DragDrop.Kind" Value="{Binding Path=Category}"/>
+    <Setter Property="noesis:DragDrop.MatchKind" Value="False"/>
+    <Setter Property="noesis:DragDrop.Transfer" Value="Swap"/>
+    <Setter Property="noesis:DragDrop.EmptyContentPath" Value="Name"/>
+    <Setter Property="noesis:DragDrop.DefaultContent" Value="{Binding Path=DataContext.Defaults[7], RelativeSource={RelativeSource AncestorType={x:Type ListBox}}}"/>
+    <Setter Property="noesis:StyleInteraction.Triggers">
+      <Setter.Value>
+        <noesis:StyleTriggerCollection>
+          <b:EventTrigger EventName="MouseEnter">
+            <noesis:SetFocusAction/>
+          </b:EventTrigger>
+        </noesis:StyleTriggerCollection>
+      </Setter.Value>
+    </Setter>
+  </Style>
+
+  <!-- Equip Slot -->
+  <DataTemplate x:Key="Inventory.Template.EquipSlot.Item">
+    <DataTemplate.Resources>
+      <Geometry x:Key="Geometry.SlotBorder">M8.9999981,50.893192 L4.7217236,50.893192 C2.5125842,50.893188 0.72172329,49.102325 0.72172329,46.893188 L0.72172329,4.7217235 C0.72172329,2.512588 2.5125842,0.72172704 4.7217236,0.72172329 L8.9999981,0.72172329</Geometry>
+    </DataTemplate.Resources>
+    <Grid x:Name="Root" Background="Transparent" Margin="5" ToolTipService.BetweenShowDelay="200" ToolTipService.InitialShowDelay="200" ToolTipService.Placement="Right" ToolTipService.ShowDuration="8000">
+      <VisualStateManager.VisualStateGroups>
+        <VisualStateGroup x:Name="HoverStates">
+          <VisualState x:Name="Base">
+            <Storyboard>
+              <DoubleAnimationUsingKeyFrames Storyboard.TargetName="Icon" Storyboard.TargetProperty="(UIElement.RenderTransform).(TransformGroup.Children)[0].(ScaleTransform.ScaleX)">
+                <EasingDoubleKeyFrame KeyTime="0:0:0.200" Value="1">
+                  <EasingDoubleKeyFrame.EasingFunction>
+                    <CircleEase EasingMode="EaseOut"/>
+                  </EasingDoubleKeyFrame.EasingFunction>
+                </EasingDoubleKeyFrame>
+              </DoubleAnimationUsingKeyFrames>
+              <DoubleAnimationUsingKeyFrames Storyboard.TargetName="Icon" Storyboard.TargetProperty="(UIElement.RenderTransform).(TransformGroup.Children)[0].(ScaleTransform.ScaleY)">
+                <EasingDoubleKeyFrame KeyTime="0:0:0.200" Value="1">
+                  <EasingDoubleKeyFrame.EasingFunction>
+                    <CircleEase EasingMode="EaseOut"/>
+                  </EasingDoubleKeyFrame.EasingFunction>
+                </EasingDoubleKeyFrame>
+              </DoubleAnimationUsingKeyFrames>
+              <DoubleAnimationUsingKeyFrames Storyboard.TargetName="Icon" Storyboard.TargetProperty="(UIElement.Transform3D).(NoesisGUIExtensions.CompositeTransform3D.TranslateZ)">
+                <EasingDoubleKeyFrame KeyTime="0:0:0.200" Value="0">
+                  <EasingDoubleKeyFrame.EasingFunction>
+                    <CircleEase EasingMode="EaseOut"/>
+                  </EasingDoubleKeyFrame.EasingFunction>
+                </EasingDoubleKeyFrame>
+              </DoubleAnimationUsingKeyFrames>
+              <DoubleAnimationUsingKeyFrames Storyboard.TargetName="Viewbox0" Storyboard.TargetProperty="(UIElement.Transform3D).(NoesisGUIExtensions.CompositeTransform3D.TranslateZ)">
+                <EasingDoubleKeyFrame KeyTime="0:0:0.200" Value="0">
+                  <EasingDoubleKeyFrame.EasingFunction>
+                    <CircleEase EasingMode="EaseOut"/>
+                  </EasingDoubleKeyFrame.EasingFunction>
+                </EasingDoubleKeyFrame>
+              </DoubleAnimationUsingKeyFrames>
+              <DoubleAnimationUsingKeyFrames Storyboard.TargetName="Border0" Storyboard.TargetProperty="(UIElement.Transform3D).(NoesisGUIExtensions.CompositeTransform3D.TranslateZ)">
+                <EasingDoubleKeyFrame KeyTime="0:0:0.200" Value="0">
+                  <EasingDoubleKeyFrame.EasingFunction>
+                    <CircleEase EasingMode="EaseOut"/>
+                  </EasingDoubleKeyFrame.EasingFunction>
+                </EasingDoubleKeyFrame>
+              </DoubleAnimationUsingKeyFrames>
+            </Storyboard>
+          </VisualState>
+          <VisualState x:Name="Hover">
+            <Storyboard>
+              <DoubleAnimationUsingKeyFrames Storyboard.TargetName="Root" Storyboard.TargetProperty="(UIElement.Transform3D).(NoesisGUIExtensions.CompositeTransform3D.TranslateZ)">
+                <EasingDoubleKeyFrame KeyTime="0:0:0.200" Value="10">
+                  <EasingDoubleKeyFrame.EasingFunction>
+                    <CircleEase EasingMode="EaseOut"/>
+                  </EasingDoubleKeyFrame.EasingFunction>
+                </EasingDoubleKeyFrame>
+              </DoubleAnimationUsingKeyFrames>
+              <DoubleAnimationUsingKeyFrames Storyboard.TargetName="Border0" Storyboard.TargetProperty="(UIElement.Transform3D).(NoesisGUIExtensions.CompositeTransform3D.TranslateZ)">
+                <EasingDoubleKeyFrame KeyTime="0:0:0.200" Value="20">
+                  <EasingDoubleKeyFrame.EasingFunction>
+                    <CircleEase EasingMode="EaseOut"/>
+                  </EasingDoubleKeyFrame.EasingFunction>
+                </EasingDoubleKeyFrame>
+              </DoubleAnimationUsingKeyFrames>
+              <DoubleAnimationUsingKeyFrames Storyboard.TargetName="Icon" Storyboard.TargetProperty="(UIElement.RenderTransform).(TransformGroup.Children)[0].(ScaleTransform.ScaleX)">
+                <EasingDoubleKeyFrame KeyTime="0:0:0.200" Value="1.1">
+                  <EasingDoubleKeyFrame.EasingFunction>
+                    <CircleEase EasingMode="EaseOut"/>
+                  </EasingDoubleKeyFrame.EasingFunction>
+                </EasingDoubleKeyFrame>
+              </DoubleAnimationUsingKeyFrames>
+              <DoubleAnimationUsingKeyFrames Storyboard.TargetName="Icon" Storyboard.TargetProperty="(UIElement.RenderTransform).(TransformGroup.Children)[0].(ScaleTransform.ScaleY)">
+                <EasingDoubleKeyFrame KeyTime="0:0:0.200" Value="1.1">
+                  <EasingDoubleKeyFrame.EasingFunction>
+                    <CircleEase EasingMode="EaseOut"/>
+                  </EasingDoubleKeyFrame.EasingFunction>
+                </EasingDoubleKeyFrame>
+              </DoubleAnimationUsingKeyFrames>
+              <DoubleAnimationUsingKeyFrames Storyboard.TargetName="Icon" Storyboard.TargetProperty="(UIElement.Transform3D).(NoesisGUIExtensions.CompositeTransform3D.TranslateZ)">
+                <EasingDoubleKeyFrame KeyTime="0:0:0.200" Value="40">
+                  <EasingDoubleKeyFrame.EasingFunction>
+                    <CircleEase EasingMode="EaseOut"/>
+                  </EasingDoubleKeyFrame.EasingFunction>
+                </EasingDoubleKeyFrame>
+              </DoubleAnimationUsingKeyFrames>
+              <DoubleAnimationUsingKeyFrames Storyboard.TargetName="Viewbox0" Storyboard.TargetProperty="(UIElement.Transform3D).(NoesisGUIExtensions.CompositeTransform3D.TranslateZ)">
+                <EasingDoubleKeyFrame KeyTime="0:0:0.200" Value="30">
+                  <EasingDoubleKeyFrame.EasingFunction>
+                    <CircleEase EasingMode="EaseOut"/>
+                  </EasingDoubleKeyFrame.EasingFunction>
+                </EasingDoubleKeyFrame>
+              </DoubleAnimationUsingKeyFrames>
+            </Storyboard>
+          </VisualState>
+        </VisualStateGroup>
+        <VisualStateGroup x:Name="CompatibilityStates">
+          <VisualStateGroup.Transitions>
+            <VisualTransition GeneratedDuration="00:00:00.1000000"/>
+          </VisualStateGroup.Transitions>
+          <VisualState x:Name="Compatible"/>
+          <VisualState x:Name="NonCompatible">
+            <Storyboard>
+              <DoubleAnimationUsingKeyFrames Storyboard.TargetName="InvalidDropBorder" Storyboard.TargetProperty="(Panel.Background).(Brush.Opacity)">
+                <EasingDoubleKeyFrame KeyTime="0:0:0" Value="0.5">
+                  <EasingDoubleKeyFrame.EasingFunction>
+                    <CircleEase EasingMode="EaseOut"/>
+                  </EasingDoubleKeyFrame.EasingFunction>
+                </EasingDoubleKeyFrame>
+              </DoubleAnimationUsingKeyFrames>
+            </Storyboard>
+          </VisualState>
+        </VisualStateGroup>
+      </VisualStateManager.VisualStateGroups>
+      <Grid.RowDefinitions>
+        <RowDefinition Height="2*"/>
+        <RowDefinition Height="12*"/>
+        <RowDefinition Height="120*"/>
+        <RowDefinition Height="24*"/>
+      </Grid.RowDefinitions>
+      <noesis:Element.Transform3D>
+        <noesis:CompositeTransform3D TranslateZ="0"/>
+      </noesis:Element.Transform3D>
+      <b:Interaction.Triggers>
+        <b:EventTrigger x:Name="Load base">
+          <b:GoToStateAction StateName="Base"/>
+        </b:EventTrigger>
+        <b:EventTrigger x:Name="Hover On" EventName="MouseEnter">
+          <b:GoToStateAction StateName="Hover"/>
+        </b:EventTrigger>
+        <b:EventTrigger x:Name="Hover Off" EventName="MouseLeave">
+          <b:GoToStateAction StateName="Base"/>
+        </b:EventTrigger>
+        <b:DataTrigger x:Name="Is Compatible" Binding="{Binding Path=(noesis:DragDrop.IsDropCompatible), RelativeSource={RelativeSource AncestorType=ContentControl}}">
+          <b:GoToStateAction StateName="Compatible"/>
+        </b:DataTrigger>
+        <b:DataTrigger x:Name="Non Compatible" Binding="{Binding Path=(noesis:DragDrop.IsDropCompatible), RelativeSource={RelativeSource AncestorType=ContentControl}}" Value="False">
+          <b:GoToStateAction StateName="NonCompatible"/>
+        </b:DataTrigger>
+        <b:DataTrigger x:Name="Hover On (Focused)" Binding="{Binding Path=IsKeyboardFocused, RelativeSource={RelativeSource AncestorType=ContentControl}}" Value="True">
+          <b:GoToStateAction StateName="Hover"/>
+        </b:DataTrigger>
+        <b:DataTrigger x:Name="Hover Off (Unfocused)" Binding="{Binding Path=IsKeyboardFocused, RelativeSource={RelativeSource AncestorType=ContentControl}}" Value="False">
+          <b:GoToStateAction StateName="Base"/>
+        </b:DataTrigger>
+      </b:Interaction.Triggers>
+      <Decorator x:Name="SlotBorderRef"/>
+      <Viewbox Grid.RowSpan="3">
+        <Grid>
+          <Border x:Name="Border0" Height="{Binding ActualWidth, Mode=OneWay, RelativeSource={RelativeSource Self}}" VerticalAlignment="Bottom" Background="#3FDA9858" CornerRadius="7">
+            <Border.Transform3D>
+              <noesis:CompositeTransform3D />
+            </Border.Transform3D>
+            <Grid x:Name="SlotBorder">
+              <Grid.ColumnDefinitions>
+                <ColumnDefinition />
+                <ColumnDefinition Width="4*"/>
+                <ColumnDefinition />
+              </Grid.ColumnDefinitions>
+              <Path Grid.Column="0" Data="{StaticResource Geometry.SlotBorder}" Stretch="Fill" Stroke="{StaticResource Inventory.Brush.SlotBorder}" StrokeThickness="{Binding ActualHeight, ElementName=SlotBorderRef}"/>
+              <Path Grid.Column="2" Data="{StaticResource Geometry.SlotBorder}" RenderTransformOrigin="0.5,0.5" Stretch="Fill" Stroke="{StaticResource Inventory.Brush.SlotBorder}" StrokeThickness="{Binding ActualHeight, ElementName=SlotBorderRef}">
+                <Path.RenderTransform>
+                  <ScaleTransform ScaleX="-1"/>
+                </Path.RenderTransform>
+              </Path>
+            </Grid>
+          </Border>
+          <Border x:Name="InvalidDropBorder" Height="{Binding ActualWidth, Mode=OneWay, RelativeSource={RelativeSource Self}}" VerticalAlignment="Bottom" CornerRadius="7">
+            <Border.Background>
+              <SolidColorBrush Opacity="0" Color="#66F04029"/>
+            </Border.Background>
+          </Border>
+          <Viewbox x:Name="Icon" Margin="{Binding ActualHeight, ElementName=ContentHost}" VerticalAlignment="Bottom" RenderTransformOrigin="0.5,0.5">
+            <Viewbox.RenderTransform>
+              <TransformGroup>
+                <ScaleTransform />
+                <SkewTransform />
+                <RotateTransform />
+                <TranslateTransform />
+              </TransformGroup>
+            </Viewbox.RenderTransform>
+            <Viewbox.Transform3D>
+              <noesis:CompositeTransform3D />
+            </Viewbox.Transform3D>
+            <Image x:Name="Image0" Width="60" Height="60" Source="{Binding Path=Icon}">
+              <Image.RenderTransform>
+                <TransformGroup>
+                  <ScaleTransform />
+                  <SkewTransform />
+                  <RotateTransform />
+                  <TranslateTransform />
+                </TransformGroup>
+              </Image.RenderTransform>
+              <Image.Transform3D>
+                <noesis:CompositeTransform3D />
+              </Image.Transform3D>
+            </Image>
+          </Viewbox>
+        </Grid>
+      </Viewbox>
+      <Viewbox x:Name="Viewbox0" Grid.Row="3">
+        <Viewbox.Transform3D>
+          <noesis:CompositeTransform3D />
+        </Viewbox.Transform3D>
+        <TextBlock x:Name="ContentHost" Text="{Binding Path=Category}" Foreground="{StaticResource Inventory.Brush.EquipSlotText}"/>
+      </Viewbox>
+      <Popup x:Name="ToolTip" AllowsTransparency="True" VerticalOffset="0"
+                   Placement="{Binding Path=(ToolTipService.Placement), RelativeSource={RelativeSource AncestorType=ContentControl}}">
+        <ContentControl x:Name="ToolTipContent" Grid.ColumnSpan="2" Content="{Binding}" Style="{StaticResource Inventory.Style.ItemToolTip}"/>
+      </Popup>
+    </Grid>
+    <DataTemplate.Triggers>
+      <MultiDataTrigger>
+        <MultiDataTrigger.Conditions>
+          <Condition Binding="{Binding Path=(noesis:DragDrop.IsContentEmpty), RelativeSource={RelativeSource AncestorType=ContentControl}}" Value="True"/>
+        </MultiDataTrigger.Conditions>
+        <Setter TargetName="ToolTipContent" Property="Visibility" Value="Collapsed"/>
+      </MultiDataTrigger>
+      <MultiDataTrigger>
+        <MultiDataTrigger.Conditions>
+          <Condition Binding="{Binding Path=IsKeyboardFocused, RelativeSource={RelativeSource AncestorType=ContentControl}}" Value="True"/>
+        </MultiDataTrigger.Conditions>
+        <Setter TargetName="ToolTip" Property="IsOpen" Value="True"/>
+      </MultiDataTrigger>
+    </DataTemplate.Triggers>
+  </DataTemplate>
+  <Style x:Key="Inventory.Style.EquipSlot" TargetType="ContentControl" BasedOn="{StaticResource {x:Type ContentControl}}">
+    <Setter Property="ContentTemplate" Value="{StaticResource Inventory.Template.EquipSlot.Item}"/>
+    <Setter Property="noesis:DragDrop.Role" Value="DragAndDrop"/>
+    <Setter Property="noesis:DragDrop.EmptyContentPath" Value="Name"/>
+    <Setter Property="noesis:StyleInteraction.Triggers">
+      <Setter.Value>
+        <noesis:StyleTriggerCollection>
+          <b:EventTrigger EventName="MouseEnter">
+            <noesis:SetFocusAction/>
+          </b:EventTrigger>
+        </noesis:StyleTriggerCollection>
+      </Setter.Value>
+    </Setter>
+    <Style.Triggers>
+      <MultiDataTrigger>
+        <MultiDataTrigger.Conditions>
+          <Condition Value="False" Binding="{Binding Path=(noesis:DragDrop.IsDropCompatible), RelativeSource={RelativeSource Self}}"/>
+        </MultiDataTrigger.Conditions>
+        <Setter Property="IsEnabled" Value="False"/>
+      </MultiDataTrigger>
+    </Style.Triggers>
+  </Style>
+  <Style x:Key="Inventory.Style.EquipSlot.Left" TargetType="ContentControl" BasedOn="{StaticResource Inventory.Style.EquipSlot}">
+    <Setter Property="ToolTipService.Placement" Value="Right"/>
+  </Style>
+  <Style x:Key="Inventory.Style.EquipSlot.Right" TargetType="ContentControl" BasedOn="{StaticResource Inventory.Style.EquipSlot}">
+    <Setter Property="ToolTipService.Placement" Value="Left"/>
+  </Style>
+</ResourceDictionary>

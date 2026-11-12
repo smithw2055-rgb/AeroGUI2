@@ -1,0 +1,5 @@
+<Project>
+  <Assembly>CustomAnimation</Assembly>
+  <DefaultDataNamespace>CustomAnimation</DefaultDataNamespace>
+  <StartupDocument>MainPage.xaml</StartupDocument>
+</Project>

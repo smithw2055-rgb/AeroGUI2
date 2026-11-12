@@ -1,0 +1,6 @@
+<Project>
+  <Assembly>UserControl</Assembly>
+  <DefaultDataNamespace>UserControl</DefaultDataNamespace>
+  <StartupDocument>MainPage.xaml</StartupDocument>
+  <GlobalResources>Resources.xaml</GlobalResources>
+</Project>

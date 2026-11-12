@@ -90,6 +90,8 @@ struct CommandPageHeader {
 
     [[nodiscard]] constexpr std::uint32_t TextureId() const noexcept { return reserved[0]; }
     constexpr void SetTextureId(std::uint32_t texId) noexcept { reserved[0] = texId; }
+    [[nodiscard]] constexpr std::uint32_t BlendMode() const noexcept { return reserved[1]; }
+    constexpr void SetBlendMode(std::uint32_t bm) noexcept { reserved[1] = bm; }
 };
 
 static_assert(sizeof(CommandPageHeader) == 64, "CommandPageHeader must be exactly 64 bytes.");
@@ -152,6 +154,7 @@ struct RenderNodeDescriptor {
     Thickness borderThicknesses{};
     // P1-5: 3D perspective planar homography & soft SDF shadow/blur parameters
     bool hasPerspective3D = false;
+    BlendingMode blendMode = BlendingMode::Normal;
     float softFeatherPx = 0.0f;
     float sdfPadPx = 0.0f;
     Matrix4x4 worldMatrix3D{};
@@ -163,6 +166,17 @@ struct BlurLayerSpan {
     float radiusPx = 0.0f;
     Rect clipRect{0.0f, 0.0f, 16384.0f, 16384.0f};
     bool clipActive = false;
+    UIEffectKind effectMode = UIEffectKind::Blur;
+    std::uint64_t maskMtsdfHash = 0u;
+    Rect maskDestRect{};
+    float maskOpacity = 1.0f;
+};
+
+struct RichGlyphStyle {
+    Color color{1.0f, 1.0f, 1.0f, 1.0f};
+    bool hasCustomColor = false;
+    bool bold = false;
+    bool italic = false;
 };
 
 // Pack RGBA [0..1] floats into ABGR/RGBA 32-bit uint
@@ -577,6 +591,13 @@ private:
         float tx = 0.0f;
         float ty = 0.0f;
         bool hasPerspective3D = false;
+        BlendingMode blendMode = BlendingMode::Normal;
+        bool hasInheritedDropShadow = false;
+        bool shadowOnlyPass = false;
+        float shadowWorldDx = 0.0f;
+        float shadowWorldDy = 0.0f;
+        float shadowWorldBlurR = 0.0f;
+        Color shadowColor{0.0f, 0.0f, 0.0f, 0.0f};
         Matrix4x4 world3D{};
     };
 
@@ -598,7 +619,8 @@ private:
         const TextLayoutResult& layout,
         std::size_t& ioGlyphCursor,
         const Color& color,
-        float opacity) noexcept;
+        float opacity,
+        const std::vector<RichGlyphStyle>* optRichStyles = nullptr) noexcept;
     std::uint16_t EmitTextRunNodes(
         float x,
         float y,
@@ -610,7 +632,10 @@ private:
         const UIElement* owner,
         std::string_view fontFamily = {},
         float maxWidth = 1000000.0f,
-        TextWrapping wrapMode = TextWrapping::NoWrap);
+        TextWrapping wrapMode = TextWrapping::NoWrap,
+        TextAlignment textAlign = TextAlignment::Left,
+        float alignBoxWidth = 0.0f,
+        const std::vector<RichGlyphStyle>* optRichStyles = nullptr);
     bool UpdateElementInPlace(
         const UIElement* element,
         const RenderTraversalState& curState);
@@ -636,6 +661,7 @@ private:
     const UIElement* boundRootElement_ = nullptr;
     Rect activeClipRect_{0.0f, 0.0f, 16384.0f, 16384.0f};
     bool activeClipEnabled_ = false;
+    BlendingMode activeBlendMode_ = BlendingMode::Normal;
     std::vector<CommandPage> pages_;
     std::vector<RenderNodeDescriptor> nodes_;
     std::vector<std::uint8_t> pageDirtyFlags_;

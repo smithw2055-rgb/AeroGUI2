@@ -178,15 +178,29 @@ void ClassifyPathEmission(
     const float strokeW = pathElem.GetStrokeThickness();
     const bool hasStrokeBrush = pathElem.HasExplicitStroke() && strokeW > 0.0f;
     const bool hasFillBrush = pathElem.HasExplicitFill();
-    if (!hasFillBrush && hasStrokeBrush) {
-        outEmitFillNode = false;
-        outEmitSeparateStrokeNode = true;
-    } else if (hasFillBrush && hasStrokeBrush) {
-        outEmitFillNode = true;
-        outEmitSeparateStrokeNode = true;
-    } else {
-        outEmitFillNode = true;
-        outEmitSeparateStrokeNode = false;
+    outEmitFillNode = hasFillBrush;
+    outEmitSeparateStrokeNode = hasStrokeBrush;
+}
+
+void ApplyTextAlignmentToLayout(
+    TextLayoutResult& layout,
+    TextAlignment align,
+    float alignBoxWidth) noexcept {
+    if (align == TextAlignment::Left || alignBoxWidth <= 0.0f || layout.lines.empty()) {
+        return;
+    }
+    for (PositionedGlyph& pg : layout.glyphs) {
+        if (pg.lineIndex >= layout.lines.size()) continue;
+        const float lw = layout.lines[pg.lineIndex].width;
+        float dx = 0.0f;
+        if (align == TextAlignment::Center) {
+            dx = (alignBoxWidth - lw) * 0.5f;
+        } else if (align == TextAlignment::Right) {
+            dx = (alignBoxWidth - lw);
+        }
+        pg.penX += dx;
+        pg.x0 += dx;
+        pg.x1 += dx;
     }
 }
 
@@ -405,16 +419,24 @@ struct SurfaceFillBorderPlan {
     // Containers (Panel/Grid/StackPanel/DockPanel/WrapPanel/Canvas/ScrollViewer/ItemsControl/
     // UserControl/Window/Border) strictly use PropId_Background only — never PropId_Foreground,
     // and never fall back to an opaque default backdrop when unbacked.
-    const auto bgOpt = value::TryGetColor(elem->GetValue(PropId_Background));
+    float bgOpMul = 1.0f;
+    (void)TryGetFloat(elem->GetValue(PropId_BackgroundOpacity), bgOpMul);
+    bgOpMul = std::clamp(bgOpMul, 0.0f, 1.0f);
+    float brdOpMul = 1.0f;
+    (void)TryGetFloat(elem->GetValue(PropId_BorderOpacity), brdOpMul);
+    brdOpMul = std::clamp(brdOpMul, 0.0f, 1.0f);
+    auto bgOpt = value::TryGetColor(elem->GetValue(PropId_Background));
+    if (bgOpt) bgOpt->a = std::clamp(bgOpt->a * bgOpMul, 0.0f, 1.0f);
     const bool hasVisibleBg = bgOpt.has_value() && (bgOpt->a > 0.0f);
-    const bool hasGradientBg = ExtractGradBrushId(elem->GetValue(PropId_BackgroundGradientId)) != 0u;
+    const bool hasGradientBg = (ExtractGradBrushId(elem->GetValue(PropId_BackgroundGradientId)) != 0u) && (bgOpMul > 0.0f);
     const Color fillCol = hasVisibleBg ? *bgOpt : Color{0.0f, 0.0f, 0.0f, 0.0f};
 
     const CornerRadius cr = value::TryGetCornerRadius(elem->GetValue(PropId_CornerRadius))
         .value_or(CornerRadius{});
     const Thickness bt = value::TryGetThickness(elem->GetValue(PropId_BorderThickness))
         .value_or(Thickness{});
-    const auto bbOpt = value::TryGetColor(elem->GetValue(PropId_BorderBrush));
+    auto bbOpt = value::TryGetColor(elem->GetValue(PropId_BorderBrush));
+    if (bbOpt) bbOpt->a = std::clamp(bbOpt->a * brdOpMul, 0.0f, 1.0f);
 
     return BuildSurfaceFillBorderPlan(
         outerRect,
@@ -1124,10 +1146,12 @@ std::uint32_t PagedRenderTree::EnsurePageForAllocation(
     const Rect& clipRect,
     bool clipActive,
     std::uint32_t textureId) {
+    const auto desiredBlend = static_cast<std::uint32_t>(activeBlendMode_);
     const bool needNewPage = pages_.empty() ||
         (pages_.back().header.vertexCount + neededVertices > kVerticesPerCommandPage) ||
         !SameClipRect(pages_.back().header, clipRect, clipActive) ||
-        (pages_.back().header.reserved[0] != textureId);
+        (pages_.back().header.reserved[0] != textureId) ||
+        (pages_.back().header.reserved[1] != desiredBlend);
 
     if (needNewPage) {
         const auto newPageIdx = static_cast<std::uint32_t>(pages_.size());
@@ -1135,6 +1159,7 @@ std::uint32_t PagedRenderTree::EnsurePageForAllocation(
         newPage.header.pageIndex = newPageIdx;
         newPage.header.firstNodeId = static_cast<std::uint32_t>(nodes_.size());
         newPage.header.reserved[0] = textureId;
+        newPage.header.reserved[1] = desiredBlend;
         if (clipActive) {
             newPage.header.clipX = clipRect.x;
             newPage.header.clipY = clipRect.y;
@@ -1872,6 +1897,178 @@ bool PagedRenderTree::UpdateHudDigitsText(
     return true;
 }
 
+
+namespace {
+
+std::string ExtractContainerImageBrushUri(const UIElement* elem, Stretch* outStretch = nullptr) {
+    if (outStretch != nullptr) {
+        *outStretch = Stretch::Fill;
+    }
+    if (!elem) return {};
+    auto hasImageExtCI = [](std::string_view sv) noexcept -> bool {
+        const std::size_t dot = sv.rfind('.');
+        if (dot == std::string_view::npos || dot + 1u >= sv.size()) {
+            return false;
+        }
+        std::string_view ext = sv.substr(dot + 1u);
+        const std::size_t q = ext.find_first_of("?#");
+        if (q != std::string_view::npos) {
+            ext = ext.substr(0u, q);
+        }
+        auto eqCI = [](std::string_view a, std::string_view b) noexcept -> bool {
+            if (a.size() != b.size()) return false;
+            for (std::size_t i = 0u; i < a.size(); ++i) {
+                const char ca = (a[i] >= 'A' && a[i] <= 'Z')
+                    ? static_cast<char>(a[i] - 'A' + 'a')
+                    : a[i];
+                if (ca != b[i]) return false;
+            }
+            return true;
+        };
+        return eqCI(ext, "png") || eqCI(ext, "jpg") || eqCI(ext, "jpeg") ||
+               eqCI(ext, "bmp") || eqCI(ext, "tga") || eqCI(ext, "webp");
+    };
+    for (const std::uint16_t pid : {PropId_ImageSource, PropId_Background}) {
+        const UnifiedValue v = elem->GetValue(pid);
+        if (const auto* sv = std::get_if<StringValue>(&v)) {
+            const std::string_view raw = sv->view();
+            if (raw.empty()) continue;
+            if (raw.front() == '#' || raw.rfind("AERO_GRAD:", 0) == 0) {
+                continue;
+            }
+            if (raw.size() > 16u && raw.rfind("AERO_IMGBRUSH:", 0) == 0 &&
+                raw[15] == ':' && raw[14] >= '0' && raw[14] <= '3') {
+                if (outStretch != nullptr) {
+                    *outStretch = static_cast<Stretch>(raw[14] - '0');
+                }
+                return std::string(raw.substr(16u));
+            }
+            if (hasImageExtCI(raw)) {
+                return std::string(raw);
+            }
+        }
+    }
+    return {};
+}
+
+void ParseRichTextToPlainAndStyles(
+    std::string_view rawBbCode,
+    const Color& baseColor,
+    const UIElement* owner,
+    std::string& outPlainUtf8,
+    std::vector<RichGlyphStyle>& outCodePointStyles) {
+    outPlainUtf8.clear();
+    outCodePointStyles.clear();
+
+    struct StyleFrame {
+        Color color;
+        bool hasCustomColor = false;
+        bool bold = false;
+        bool italic = false;
+    };
+    std::vector<StyleFrame> stack;
+    stack.push_back(StyleFrame{baseColor, false, false, false});
+
+    auto appendPlainSegment = [&](std::string_view seg) {
+        const StyleFrame& cur = stack.back();
+        outPlainUtf8.append(seg);
+        std::size_t k = 0u;
+        std::uint32_t dummyCp = 0u;
+        while (DecodeNextUtf8CodePoint(seg, k, dummyCp)) {
+            outCodePointStyles.push_back(RichGlyphStyle{
+                cur.color, cur.hasCustomColor, cur.bold, cur.italic});
+        }
+    };
+
+    std::size_t i = 0u;
+    while (i < rawBbCode.size()) {
+        if (rawBbCode[i] == '[') {
+            const std::size_t closeBracket = rawBbCode.find(']', i + 1u);
+            if (closeBracket != std::string_view::npos) {
+                const std::string_view tagContent = rawBbCode.substr(i + 1u, closeBracket - i - 1u);
+                if (tagContent == "br" || tagContent == "br/") {
+                    appendPlainSegment("\n");
+                    i = closeBracket + 1u;
+                    continue;
+                }
+                if (tagContent.rfind("bind", 0) == 0 &&
+                    (tagContent.size() == 4u || tagContent[4] == ' ' || tagContent[4] == '=')) {
+                    const std::size_t endBind = rawBbCode.find("[/bind]", closeBracket + 1u);
+                    if (endBind != std::string_view::npos) {
+                        const std::string resolved = StripAndResolveRichTextBbCode(
+                            rawBbCode.substr(i, (endBind + 7u) - i),
+                            owner);
+                        appendPlainSegment(resolved);
+                        i = endBind + 7u;
+                        continue;
+                    }
+                }
+                if (tagContent.rfind("img", 0) == 0) {
+                    const std::size_t endImg = rawBbCode.find("[/img]", closeBracket + 1u);
+                    if (endImg != std::string_view::npos) {
+                        i = endImg + 6u;
+                        continue;
+                    }
+                }
+                const bool isClosing = !tagContent.empty() && tagContent.front() == '/';
+                const std::string_view bare = isClosing ? tagContent.substr(1u) : tagContent;
+                const std::size_t eqPos = bare.find('=');
+                const std::string_view tagName = (eqPos != std::string_view::npos) ? bare.substr(0u, eqPos) : bare;
+                std::string_view tagArg = (eqPos != std::string_view::npos) ? bare.substr(eqPos + 1u) : std::string_view{};
+                if (tagArg.size() >= 2u &&
+                    ((tagArg.front() == '\'' && tagArg.back() == '\'') ||
+                     (tagArg.front() == '"' && tagArg.back() == '"'))) {
+                    tagArg = tagArg.substr(1u, tagArg.size() - 2u);
+                }
+                if (tagName == "b" || tagName == "i" || tagName == "u" || tagName == "s" ||
+                    tagName == "style" || tagName == "color" || tagName == "size" || tagName == "url") {
+                    if (isClosing) {
+                        if (stack.size() > 1u) stack.pop_back();
+                    } else {
+                        StyleFrame next = stack.back();
+                        if (tagName == "b") {
+                            next.bold = true;
+                        } else if (tagName == "i") {
+                            next.italic = true;
+                        } else if (tagName == "color" && !tagArg.empty()) {
+                            next.color = ParseXamlColorLiteral(tagArg);
+                            next.hasCustomColor = true;
+                        } else if (tagName == "style" && !tagArg.empty()) {
+                            bool matchedStyle = false;
+                            if (const AxbStyleDefinition* st = AxbTemplateRegistry::Instance().FindStyle(tagArg)) {
+                                for (const auto& setter : st->setters) {
+                                    if (setter.propId == PropId_Foreground) {
+                                        if (auto cOpt = value::TryGetColor(setter.value)) {
+                                            next.color = *cOpt;
+                                            next.hasCustomColor = true;
+                                            matchedStyle = true;
+                                        }
+                                        if (tagArg == "ColoredText") next.bold = true;
+                                    }
+                                }
+                            }
+                            if (!matchedStyle && tagArg == "ColoredText") {
+                                next.color = Color{0.165f, 0.651f, 0.886f, 1.0f}; // #FF2AA6E2
+                                next.hasCustomColor = true;
+                                next.bold = true;
+                            }
+                        }
+                        stack.push_back(next);
+                    }
+                    i = closeBracket + 1u;
+                    continue;
+                }
+            }
+        }
+        std::size_t nextBracket = rawBbCode.find('[', i + 1u);
+        if (nextBracket == std::string_view::npos) nextBracket = rawBbCode.size();
+        appendPlainSegment(rawBbCode.substr(i, nextBracket - i));
+        i = nextBracket;
+    }
+}
+
+} // namespace
+
 bool PagedRenderTree::WriteLayoutGlyphSlice(
     std::uint32_t nodeId,
     float x,
@@ -1880,7 +2077,8 @@ bool PagedRenderTree::WriteLayoutGlyphSlice(
     const TextLayoutResult& layout,
     std::size_t& ioGlyphCursor,
     const Color& color,
-    float opacity) noexcept {
+    float opacity,
+    const std::vector<RichGlyphStyle>* optRichStyles) noexcept {
     if (nodeId >= nodes_.size()) {
         return false;
     }
@@ -1914,38 +2112,58 @@ bool PagedRenderTree::WriteLayoutGlyphSlice(
         AeroVertex* __restrict q = vBase + (slot * 4u);
         bool emitted = false;
         while (ioGlyphCursor < layout.glyphs.size()) {
-            const PositionedGlyph& pg = layout.glyphs[ioGlyphCursor++];
+            const std::size_t gIndex = ioGlyphCursor++;
+            const PositionedGlyph& pg = layout.glyphs[gIndex];
             if (pg.isWhitespace) {
                 continue;
             }
-            const float gw = std::max(0.0f, pg.x1 - pg.x0);
+            std::uint32_t glyphPackedColor = packedColor;
+            float italicTopShear = 0.0f;
+            float boldPadX = 0.0f;
+            if (optRichStyles != nullptr && pg.sourceCodePointIndex < optRichStyles->size()) {
+                const RichGlyphStyle& st = (*optRichStyles)[pg.sourceCodePointIndex];
+                if (st.hasCustomColor) {
+                    glyphPackedColor = ScalePackedRgbaAlpha(PackColorRgba8(st.color, 1.0f), node.opacity);
+                }
+                if (st.italic) {
+                    italicTopShear = 0.18f * std::max(0.0f, pg.y1 - pg.y0);
+                }
+                if (st.bold) {
+                    boldPadX = 0.35f;
+                }
+            }
+            const float lx0 = pg.x0 - boldPadX * 0.5f;
+            const float lx1 = pg.x1 + boldPadX * 0.5f;
+            const float gw = std::max(0.0f, lx1 - lx0);
             const float gh = std::max(0.0f, pg.y1 - pg.y0);
             float gx0 = 0.0f, gy0 = 0.0f, gx1 = 0.0f, gy1 = 0.0f;
             float gx2 = 0.0f, gy2 = 0.0f, gx3 = 0.0f, gy3 = 0.0f;
             if (node.hasPerspective3D) {
-                const Point p0 = node.worldMatrix3D.ProjectPoint2D(Point{node.x + pg.x0, node.y + pg.y0});
-                const Point p1 = node.worldMatrix3D.ProjectPoint2D(Point{node.x + pg.x1, node.y + pg.y0});
-                const Point p2 = node.worldMatrix3D.ProjectPoint2D(Point{node.x + pg.x1, node.y + pg.y1});
-                const Point p3 = node.worldMatrix3D.ProjectPoint2D(Point{node.x + pg.x0, node.y + pg.y1});
+                const Point p0 = node.worldMatrix3D.ProjectPoint2D(Point{node.x + lx0 + italicTopShear, node.y + pg.y0});
+                const Point p1 = node.worldMatrix3D.ProjectPoint2D(Point{node.x + lx1 + italicTopShear, node.y + pg.y0});
+                const Point p2 = node.worldMatrix3D.ProjectPoint2D(Point{node.x + lx1, node.y + pg.y1});
+                const Point p3 = node.worldMatrix3D.ProjectPoint2D(Point{node.x + lx0, node.y + pg.y1});
                 gx0 = p0.x; gy0 = p0.y;
                 gx1 = p1.x; gy1 = p1.y;
                 gx2 = p2.x; gy2 = p2.y;
                 gx3 = p3.x; gy3 = p3.y;
             } else {
-                gx0 = originX + pg.x0 * node.m00 + pg.y0 * node.m01;
-                gy0 = originY + pg.x0 * node.m10 + pg.y0 * node.m11;
+                gx0 = originX + (lx0 + italicTopShear) * node.m00 + pg.y0 * node.m01;
+                gy0 = originY + (lx0 + italicTopShear) * node.m10 + pg.y0 * node.m11;
                 gx1 = gx0 + gw * node.m00;
                 gy1 = gy0 + gw * node.m10;
-                gx2 = gx1 + gh * node.m01;
-                gy2 = gy1 + gh * node.m11;
-                gx3 = gx0 + gh * node.m01;
-                gy3 = gy0 + gh * node.m11;
+                const float botX0 = originX + lx0 * node.m00 + pg.y1 * node.m01;
+                const float botY0 = originY + lx0 * node.m10 + pg.y1 * node.m11;
+                gx3 = botX0;
+                gy3 = botY0;
+                gx2 = botX0 + gw * node.m00;
+                gy2 = botY0 + gw * node.m10;
             }
 
-            q[0] = AeroVertex{gx0, gy0, pg.u0, pg.v0, packedColor, prim, flags};
-            q[1] = AeroVertex{gx1, gy1, pg.u1, pg.v0, packedColor, prim, flags};
-            q[2] = AeroVertex{gx2, gy2, pg.u1, pg.v1, packedColor, prim, flags};
-            q[3] = AeroVertex{gx3, gy3, pg.u0, pg.v1, packedColor, prim, flags};
+            q[0] = AeroVertex{gx0, gy0, pg.u0, pg.v0, glyphPackedColor, prim, flags};
+            q[1] = AeroVertex{gx1, gy1, pg.u1, pg.v0, glyphPackedColor, prim, flags};
+            q[2] = AeroVertex{gx2, gy2, pg.u1, pg.v1, glyphPackedColor, prim, flags};
+            q[3] = AeroVertex{gx3, gy3, pg.u0, pg.v1, glyphPackedColor, prim, flags};
             emitted = true;
             break;
         }
@@ -2024,9 +2242,13 @@ std::uint16_t PagedRenderTree::EmitTextRunNodes(
     const UIElement* owner,
     std::string_view fontFamily,
     float maxWidth,
-    TextWrapping wrapMode) {
+    TextWrapping wrapMode,
+    TextAlignment textAlign,
+    float alignBoxWidth,
+    const std::vector<RichGlyphStyle>* optRichStyles) {
     const std::uint32_t maxQuadsPerPage = static_cast<std::uint32_t>(kVerticesPerCommandPage / 4u);
-    const TextLayoutResult layout = MeasureTextLayout(utf8Text, fontFamily, fontSize, maxWidth, wrapMode);
+    TextLayoutResult layout = MeasureTextLayout(utf8Text, fontFamily, fontSize, maxWidth, wrapMode);
+    ApplyTextAlignmentToLayout(layout, textAlign, alignBoxWidth);
     const std::size_t visibleGlyphs = CountLayoutVisibleGlyphs(layout);
     const std::size_t totalDesiredSlots = std::max<std::size_t>(visibleGlyphs + 8u, 16u);
     const std::size_t chunkCount = std::max<std::size_t>(
@@ -2077,6 +2299,7 @@ std::uint16_t PagedRenderTree::EmitTextRunNodes(
         desc.ty = curState.ty + x * curState.m10 + y * (curState.m11 - 1.0f);
         desc.inheritedOpacity = curState.inheritedOpacity;
         desc.hasPerspective3D = curState.hasPerspective3D;
+        desc.blendMode = curState.blendMode;
         desc.worldMatrix3D = curState.world3D;
         desc.baseRgba = PackColorRgba8(color, 1.0f);
         desc.sourceElement = owner;
@@ -2090,7 +2313,8 @@ std::uint16_t PagedRenderTree::EmitTextRunNodes(
             layout,
             glyphCursor,
             color,
-            opacity);
+            opacity,
+            optRichStyles);
         ++emittedNodes;
     }
     return emittedNodes;
@@ -2201,8 +2425,12 @@ bool PagedRenderTree::UpdateDirtyElement(const UIElement* element) noexcept {
         }
 
         RenderTraversalState parentState{};
+        bool ancestorHasDropShadow = false;
         for (std::size_t idx = depth; idx > 0u; --idx) {
             const UIElement* anc = chain[idx - 1u];
+            if (anc->GetEffectDescriptor().kind == UIEffectKind::DropShadow) {
+                ancestorHasDropShadow = true;
+            }
             const Visibility ancVis = anc->GetVisibility();
             if (ancVis != Visibility::Visible) {
                 parentState.inheritedOpacity = 0.0f;
@@ -2290,7 +2518,7 @@ bool PagedRenderTree::UpdateDirtyElement(const UIElement* element) noexcept {
                 MatrixFromState(curState.m00, curState.m01, curState.m10, curState.m11, curState.tx, curState.ty));
         }
 
-        if (UpdateElementInPlace(element, curState)) {
+        if (!ancestorHasDropShadow && UpdateElementInPlace(element, curState)) {
             return true;
         }
 
@@ -2343,7 +2571,9 @@ bool PagedRenderTree::UpdateElementInPlace(
     if (firstId == UIElement::InvalidRenderNodeId || span == 0u) {
         return false;
     }
-    if (element->GetEffectDescriptor().kind == UIEffectKind::DropShadow) {
+    if (element->GetEffectDescriptor().kind != UIEffectKind::None ||
+        element->IsA<BoxShadow>() ||
+        element->FindCompactEntry(PropId_BlendingMode) != nullptr) {
         return false;
     }
 
@@ -2506,10 +2736,25 @@ bool PagedRenderTree::UpdateElementInPlace(
         bool emitFill = true;
         bool emitSeparateStroke = false;
         ClassifyPathEmission(*pathElem, emitFill, emitSeparateStroke);
-        const std::uint16_t neededNodes = static_cast<std::uint16_t>((emitFill ? 1u : 0u) + (emitSeparateStroke ? 1u : 0u));
+        const std::uint16_t neededNodes = std::max<std::uint16_t>(
+            1u,
+            static_cast<std::uint16_t>((emitFill ? 1u : 0u) + (emitSeparateStroke ? 1u : 0u)));
         if (neededNodes != span) {
             // Structural transition between 1-node and 2-node fill+stroke Path -> rebuild cleanly
             return false;
+        }
+        if (!emitFill && !emitSeparateStroke) {
+            RenderNodeDescriptor& nd = nodes_[firstId];
+            nd.x = r.x;
+            nd.y = r.y;
+            nd.width = 0.0f;
+            nd.height = 0.0f;
+            nd.opacity = 0.0f;
+            syncQuadTransform(nd);
+            WriteQuadVertices(nd);
+            MarkPageDirty(nd.pageIndex, nd.vertexOffsetInPage);
+            element->ClearLayoutDirtyFlags(RenderDirty);
+            return true;
         }
 
         Rect fitted = ComputeStretchedDestRect(
@@ -2525,23 +2770,29 @@ bool PagedRenderTree::UpdateElementInPlace(
         const float worldScaleX = std::sqrt(curState.m00 * curState.m00 + curState.m10 * curState.m10);
         const float worldScaleY = std::sqrt(curState.m01 * curState.m01 + curState.m11 * curState.m11);
         const float worldStrokeScale = std::max(0.0f, 0.5f * (worldScaleX + worldScaleY));
-        const MtsdfMappedQuad mapped = ComputeMtsdfMappedPlacement(fitted, *entry, strokeW);
+        const std::uint32_t fillGradId = ExtractGradBrushId(pathElem->GetValue(PropId_BackgroundGradientId));
+        const std::uint32_t strokeGradId = ExtractGradBrushId(pathElem->GetValue(PropId_BorderGradientId));
 
         std::uint16_t k = 0;
         if (emitFill) {
+            const float inlineStrokeW = emitSeparateStroke ? 0.0f : strokeW;
+            const MtsdfMappedQuad fillMapped = ComputeMtsdfMappedPlacement(fitted, *entry, inlineStrokeW);
             RenderNodeDescriptor& nd = nodes_[firstId + k];
-            nd.x = mapped.quadRect.x;
-            nd.y = mapped.quadRect.y;
-            nd.width = mapped.quadRect.width;
-            nd.height = mapped.quadRect.height;
+            nd.x = fillMapped.quadRect.x;
+            nd.y = fillMapped.quadRect.y;
+            nd.width = fillMapped.quadRect.width;
+            nd.height = fillMapped.quadRect.height;
             nd.opacity = effOpacity;
             nd.primType = AeroPrimType::MsdfVectorPath;
-            nd.uv0X = mapped.u0;
-            nd.uv0Y = mapped.v0;
-            nd.uv1X = mapped.u1;
-            nd.uv1Y = mapped.v1;
-            const float inlineStrokeW = emitSeparateStroke ? 0.0f : strokeW;
+            nd.uv0X = fillMapped.u0;
+            nd.uv0Y = fillMapped.v0;
+            nd.uv1X = fillMapped.u1;
+            nd.uv1Y = fillMapped.v1;
             nd.borderThickness = inlineStrokeW;
+            nd.gradientBrushId = fillGradId;
+            nd.encodedPrimExtra = (fillGradId != 0u)
+                ? static_cast<std::uint16_t>((std::min<std::uint32_t>(fillGradId, GradientBrushRegistry::kMaxBrushId) & 0x0FFFu) << 4u)
+                : 0u;
             nd.encodedSdfParams = PackMtsdfParams(
                 entry->pxRange,
                 entry->atlasWidth,
@@ -2555,18 +2806,23 @@ bool PagedRenderTree::UpdateElementInPlace(
             ++k;
         }
         if (emitSeparateStroke && k < span) {
+            const MtsdfMappedQuad strokeMapped = ComputeMtsdfMappedPlacement(fitted, *entry, strokeW);
             RenderNodeDescriptor& nd = nodes_[firstId + k];
-            nd.x = mapped.quadRect.x;
-            nd.y = mapped.quadRect.y;
-            nd.width = mapped.quadRect.width;
-            nd.height = mapped.quadRect.height;
+            nd.x = strokeMapped.quadRect.x;
+            nd.y = strokeMapped.quadRect.y;
+            nd.width = strokeMapped.quadRect.width;
+            nd.height = strokeMapped.quadRect.height;
             nd.opacity = effOpacity;
             nd.primType = AeroPrimType::MsdfVectorPath;
-            nd.uv0X = mapped.u0;
-            nd.uv0Y = mapped.v0;
-            nd.uv1X = mapped.u1;
-            nd.uv1Y = mapped.v1;
+            nd.uv0X = strokeMapped.u0;
+            nd.uv0Y = strokeMapped.v0;
+            nd.uv1X = strokeMapped.u1;
+            nd.uv1Y = strokeMapped.v1;
             nd.borderThickness = strokeW;
+            nd.gradientBrushId = strokeGradId;
+            nd.encodedPrimExtra = (strokeGradId != 0u)
+                ? static_cast<std::uint16_t>((std::min<std::uint32_t>(strokeGradId, GradientBrushRegistry::kMaxBrushId) & 0x0FFFu) << 4u)
+                : 0u;
             nd.encodedSdfParams = PackMtsdfParams(
                 entry->pxRange,
                 entry->atlasWidth,
@@ -2967,6 +3223,9 @@ bool PagedRenderTree::UpdateElementInPlace(
 
     // Specialized TextBlock update (optional background quad + optional border ring + 1..N SdfTextGlyph run nodes)
     if (const auto* tb = element->DynamicCast<TextBlock>()) {
+        if (tb->HasRichText() || tb->HasControlTemplate() || tb->FirstChild() != nullptr) {
+            return false;
+        }
         const auto bgOpt = value::TryGetColor(element->GetValue(PropId_Background));
         const bool wantsBgNode = bgOpt.has_value() && bgOpt->a > 0.0f;
         const auto bbOpt = value::TryGetColor(element->GetValue(PropId_BorderBrush));
@@ -2988,17 +3247,27 @@ bool PagedRenderTree::UpdateElementInPlace(
         }
 
         const Thickness pad = tb->GetPadding();
+        const Color fgColor = tb->GetForeground();
         std::string txt = tb->GetText();
+        std::vector<RichGlyphStyle> richStyles;
+        const std::vector<RichGlyphStyle>* richPtr = nullptr;
+        if (tb->HasRichText()) {
+            const std::string rawRich = tb->GetRawRichText();
+            if (!rawRich.empty()) {
+                ParseRichTextToPlainAndStyles(rawRich, fgColor, element, txt, richStyles);
+                richPtr = &richStyles;
+            }
+        }
         if (txt.empty()) {
             const UnifiedValue phVal = tb->GetValue(PropId_Placeholder);
             if (const auto* ph = std::get_if<StringValue>(&phVal)) {
                 txt = ph->str();
+                richPtr = nullptr;
             }
         }
         const std::string_view activeText = (vis == Visibility::Collapsed)
             ? std::string_view{}
             : std::string_view{txt};
-        const Color fgColor = tb->GetForeground();
         const float fontSize = tb->GetFontSize();
         const std::string fontFamily = tb->GetFontFamily();
         const TextWrapping wrapMode = tb->GetTextWrapping();
@@ -3006,8 +3275,10 @@ bool PagedRenderTree::UpdateElementInPlace(
         const float maxTextW = (wrapMode != TextWrapping::NoWrap && effBoxW > 0.0f)
             ? std::max(1.0f, effBoxW - (pad.left + pad.right))
             : 1000000.0f;
-        const TextLayoutResult tbLayout = MeasureTextLayout(
+        TextLayoutResult tbLayout = MeasureTextLayout(
             activeText, fontFamily, fontSize, maxTextW, wrapMode);
+        const float innerAlignW = std::max(0.0f, effBoxW - (pad.left + pad.right));
+        ApplyTextAlignmentToLayout(tbLayout, tb->GetTextAlignment(), innerAlignW);
 
         std::size_t totalGlyphCap = 0;
         for (std::uint16_t k = prefixQuads; k < span; ++k) {
@@ -3081,7 +3352,8 @@ bool PagedRenderTree::UpdateElementInPlace(
                 tbLayout,
                 glyphCursor,
                 fgColor,
-                effOpacity);
+                effOpacity,
+                (vis == Visibility::Collapsed) ? nullptr : richPtr);
         }
         element->ClearLayoutDirtyFlags(RenderDirty);
         return true;
@@ -3309,6 +3581,12 @@ bool PagedRenderTree::UpdateElementInPlace(
     }
 
     // Generic Quad / Border / Panel update
+    if (ExtractGradBrushId(element->GetValue(PropId_BackgroundGradientId)) != 0u ||
+        !ExtractContainerImageBrushUri(element).empty() ||
+        nodes_[firstId].primType == AeroPrimType::GradientRoundedRect ||
+        nodes_[firstId].primType == AeroPrimType::TexturedQuad) {
+        return false;
+    }
     const SurfaceFillBorderPlan plan = ComputeContainerFillBorderPlan(
         element,
         Rect{r.x, r.y, boxW, boxH});
@@ -3850,20 +4128,68 @@ void PagedRenderTree::TraverseAndEmitElement(
             MatrixFromState(curState.m00, curState.m01, curState.m10, curState.m11, curState.tx, curState.ty));
     }
 
-    // Apply current clip state for this element's own primitives
+    // Resolve BlendingMode (element override or inherited)
+    {
+        const UnifiedValue bmVal = elem->GetValue(PropId_BlendingMode);
+        if (const auto* bmi = std::get_if<std::int64_t>(&bmVal)) {
+            if (*bmi >= 0 && *bmi <= 3) {
+                curState.blendMode = static_cast<BlendingMode>(*bmi);
+            }
+        } else if (const auto* bms = std::get_if<StringValue>(&bmVal)) {
+            const UnifiedValue parsed = ParseBuiltinLiteralPropertyValue(PropId_BlendingMode, bms->view());
+            if (const auto* pi = std::get_if<std::int64_t>(&parsed); pi && *pi >= 0 && *pi <= 3) {
+                curState.blendMode = static_cast<BlendingMode>(*pi);
+            }
+        }
+    }
+
+    // Apply current clip & blend state for this element's own primitives
     activeClipRect_ = curState.clipRect;
     activeClipEnabled_ = curState.clipActive;
+    activeBlendMode_ = curState.blendMode;
 
     const UIEffectDescriptor fx = elem->GetEffectDescriptor();
-    const bool wantsBlurSpan = (fx.kind == UIEffectKind::Blur && fx.blurRadius > 0.25f && effOpacity > 0.001f);
+    const bool wantsBlurSpan =
+        !curState.shadowOnlyPass &&
+        ((fx.kind == UIEffectKind::Blur && fx.blurRadius > 0.25f) ||
+         (fx.kind == UIEffectKind::Pixelate && fx.blurRadius >= 1.5f) ||
+         (fx.kind == UIEffectKind::BackdropBlur && fx.blurRadius > 0.25f)) &&
+        effOpacity > 0.001f;
     const std::size_t blurSpanSlot = wantsBlurSpan ? blurLayerSpans_.size() : static_cast<std::size_t>(-1);
     if (wantsBlurSpan) {
-        blurLayerSpans_.push_back(BlurLayerSpan{
-            static_cast<std::uint32_t>(nodes_.size()),
-            static_cast<std::uint32_t>(nodes_.size()),
-            fx.blurRadius,
-            curState.clipRect,
-            curState.clipActive});
+        BlurLayerSpan bSpan{};
+        bSpan.firstNodeId = static_cast<std::uint32_t>(nodes_.size());
+        bSpan.endNodeId = static_cast<std::uint32_t>(nodes_.size());
+        bSpan.radiusPx = fx.blurRadius;
+        bSpan.clipRect = curState.clipRect;
+        bSpan.clipActive = curState.clipActive;
+        bSpan.effectMode = fx.kind;
+        bSpan.maskOpacity = effOpacity;
+        if (fx.kind == UIEffectKind::BackdropBlur) {
+            const Matrix2D worldM = MatrixFromState(
+                curState.m00, curState.m01, curState.m10, curState.m11, curState.tx, curState.ty);
+            if (const auto* pathElem = elem->DynamicCast<Path>()) {
+                const std::string pathStr = pathElem->GetData();
+                if (const AxbMtsdfPathEntry* mtsdf = AxbTemplateRegistry::Instance().FindOrBakeMtsdfPath(pathStr)) {
+                    RegisterMtsdfInTreeAtlas(*mtsdf);
+                    Rect fitted = ComputeStretchedDestRect(
+                        Rect{r.x, r.y, w, h}, mtsdf->boundsW, mtsdf->boundsH, pathElem->GetStretch());
+                    if (pathElem->GetStretch() == Stretch::None) {
+                        fitted.x += mtsdf->boundsX;
+                        fitted.y += mtsdf->boundsY;
+                    }
+                    bSpan.maskMtsdfHash = mtsdf->pathHash;
+                    bSpan.maskDestRect = curState.hasPerspective3D
+                        ? curState.world3D.TransformRectBounds(fitted)
+                        : worldM.TransformRectBounds(fitted);
+                }
+            } else {
+                bSpan.maskDestRect = curState.hasPerspective3D
+                    ? curState.world3D.TransformRectBounds(Rect{r.x, r.y, w, h})
+                    : worldM.TransformRectBounds(Rect{r.x, r.y, w, h});
+            }
+        }
+        blurLayerSpans_.push_back(bSpan);
     }
 
     const std::uint32_t spanStartId = static_cast<std::uint32_t>(nodes_.size());
@@ -3881,36 +4207,83 @@ void PagedRenderTree::TraverseAndEmitElement(
         nd.ty = curState.ty + nd.x * curState.m10 + nd.y * (curState.m11 - 1.0f);
         nd.inheritedOpacity = curState.inheritedOpacity;
         nd.hasPerspective3D = curState.hasPerspective3D;
+        nd.blendMode = curState.blendMode;
         nd.worldMatrix3D = curState.world3D;
         if (nd.primType != AeroPrimType::SdfTextGlyph) {
             WriteQuadVertices(nd);
         }
     };
 
-    // P1-5: Pre-emit soft-feathered SDF shadow node when DropShadowEffect is active on this element
-    if (fx.kind == UIEffectKind::DropShadow &&
-        fx.opacity > 0.001f &&
-        fx.color.a > 0.001f &&
-        effOpacity > 0.001f) {
+    // Determine effective DropShadow (own DropShadowEffect or inherited shadow-only pass from a transparent container)
+    bool hasActiveShadow = false;
+    float worldSdx = 0.0f, worldSdy = 0.0f, worldBlurR = 1.0f;
+    Color shCol{0.0f, 0.0f, 0.0f, 0.0f};
+    bool propagateShadowToChildren = false;
+
+    if (curState.shadowOnlyPass) {
+        if (curState.hasInheritedDropShadow && effOpacity > 0.001f) {
+            worldSdx = curState.shadowWorldDx;
+            worldSdy = curState.shadowWorldDy;
+            worldBlurR = curState.shadowWorldBlurR;
+            shCol = curState.shadowColor;
+            hasActiveShadow = true;
+        }
+    } else if (fx.kind == UIEffectKind::DropShadow &&
+               fx.opacity > 0.001f &&
+               fx.color.a > 0.001f &&
+               effOpacity > 0.001f) {
         constexpr float kDegToRad = 3.14159265358979323846f / 180.0f;
         const float dirRad = fx.directionDeg * kDegToRad;
-        const float sdx = std::cos(dirRad) * fx.shadowDepth;
-        const float sdy = -std::sin(dirRad) * fx.shadowDepth;
-        const Color shCol{
+        const float rawSdx = std::cos(dirRad) * fx.shadowDepth;
+        const float rawSdy = -std::sin(dirRad) * fx.shadowDepth;
+        worldSdx = curState.m00 * rawSdx + curState.m01 * rawSdy;
+        worldSdy = curState.m10 * rawSdx + curState.m11 * rawSdy;
+        const float elemScaleX = std::sqrt(curState.m00 * curState.m00 + curState.m10 * curState.m10);
+        const float elemScaleY = std::sqrt(curState.m01 * curState.m01 + curState.m11 * curState.m11);
+        const float elemAvgScale = std::max(1e-4f, 0.5f * (elemScaleX + elemScaleY));
+        worldBlurR = std::max(1.0f, fx.blurRadius) * elemAvgScale;
+        shCol = Color{
             fx.color.r,
             fx.color.g,
             fx.color.b,
             std::clamp(fx.color.a * fx.opacity, 0.0f, 1.0f)};
-        const float blurR = std::max(1.0f, fx.blurRadius);
+        hasActiveShadow = true;
+    }
+
+    if (hasActiveShadow) {
+        const float leafScaleX = std::sqrt(curState.m00 * curState.m00 + curState.m10 * curState.m10);
+        const float leafScaleY = std::sqrt(curState.m01 * curState.m01 + curState.m11 * curState.m11);
+        const float leafAvgScale = std::max(1e-4f, 0.5f * (leafScaleX + leafScaleY));
+        const float det = curState.m00 * curState.m11 - curState.m01 * curState.m10;
+        float sdx = worldSdx;
+        float sdy = worldSdy;
+        if (std::fabs(det) > 1e-6f) {
+            const float invDet = 1.0f / det;
+            sdx = (curState.m11 * worldSdx - curState.m01 * worldSdy) * invDet;
+            sdy = (-curState.m10 * worldSdx + curState.m00 * worldSdy) * invDet;
+        }
+        const float localBlurR = std::max(0.5f, worldBlurR / leafAvgScale);
+        const float screenBlurR = std::max(1.0f, worldBlurR);
+        const UIElement* shadowOwner = curState.shadowOnlyPass ? nullptr : elem;
 
         if (const auto* pathElem = elem->DynamicCast<Path>()) {
-            const std::string pathStr = pathElem->GetData();
+            std::string pathStr = pathElem->GetData();
+            if (pathStr.empty()) {
+                const UnifiedValue ptsVal = pathElem->GetValue(PropId_ShapePoints);
+                if (const auto* sv = std::get_if<StringValue>(&ptsVal); sv && !sv->view().empty()) {
+                    pathStr = ConvertPointsToSvgPath(sv->view(), elem->IsA<Polygon>());
+                }
+            }
             if (const AxbMtsdfPathEntry* mtsdf = AxbTemplateRegistry::Instance().FindOrBakeMtsdfPath(pathStr)) {
-                const Rect fitted = ComputeStretchedDestRect(
+                Rect fitted = ComputeStretchedDestRect(
                     Rect{r.x + sdx, r.y + sdy, w, h},
                     mtsdf->boundsW,
                     mtsdf->boundsH,
                     pathElem->GetStretch());
+                if (pathElem->GetStretch() == Stretch::None) {
+                    fitted.x += mtsdf->boundsX;
+                    fitted.y += mtsdf->boundsY;
+                }
                 const std::uint32_t shId = AllocateMtsdfPathNode(
                     fitted.x,
                     fitted.y,
@@ -3918,37 +4291,137 @@ void PagedRenderTree::TraverseAndEmitElement(
                     fitted.height,
                     *mtsdf,
                     shCol,
-                    std::max(pathElem->GetStrokeThickness(), blurR * 0.25f),
+                    std::max(pathElem->GetStrokeThickness(), localBlurR * 0.25f),
                     effOpacity,
-                    elem);
-                nodes_[shId].softFeatherPx = blurR;
+                    shadowOwner);
+                nodes_[shId].softFeatherPx = screenBlurR;
                 applyNodeTransform(shId);
                 ++emittedCount;
             }
-        } else if (w > 0.0f && h > 0.0f) {
-            const float pad = std::ceil(blurR);
-            const CornerRadius cr = SanitizeCornerRadius(
-                value::TryGetCornerRadius(elem->GetValue(PropId_CornerRadius))
-                    .value_or(CornerRadius{}));
-            const std::uint32_t shId = AllocateRoundedRectNode(
-                r.x + sdx - pad,
-                r.y + sdy - pad,
-                w + 2.0f * pad,
-                h + 2.0f * pad,
-                shCol,
-                cr,
-                elem);
-            nodes_[shId].primType = AeroPrimType::SdfRoundedRect;
-            nodes_[shId].opacity = effOpacity;
-            nodes_[shId].softFeatherPx = blurR;
-            nodes_[shId].sdfPadPx = pad;
-            if (IsUniformCornerRadius(cr)) {
-                const auto qPad = static_cast<std::uint16_t>(std::clamp(pad * 2.0f + 0.5f, 0.0f, 2047.0f)) & 0x07FFu;
-                nodes_[shId].encodedPrimExtra = static_cast<std::uint16_t>(qPad << 5u);
+        } else if (const auto* tbShadow = elem->DynamicCast<TextBlock>();
+                   tbShadow != nullptr && !tbShadow->HasControlTemplate() && tbShadow->FirstChild() == nullptr) {
+            const std::string shText = tbShadow->GetText();
+            if (!shText.empty()) {
+                const Thickness pad = tbShadow->GetPadding();
+                const float fs = tbShadow->GetFontSize();
+                const std::string ff = tbShadow->GetFontFamily();
+                const TextWrapping wm = tbShadow->GetTextWrapping();
+                const float effBoxW = (w > 0.0f) ? w : tbShadow->DesiredSize().width;
+                const float maxTW = (wm != TextWrapping::NoWrap && effBoxW > 0.0f)
+                    ? std::max(1.0f, effBoxW - (pad.left + pad.right))
+                    : 1000000.0f;
+                const float innerAlignW = std::max(0.0f, effBoxW - (pad.left + pad.right));
+                emittedCount = static_cast<std::uint16_t>(
+                    emittedCount + EmitTextRunNodes(
+                        r.x + pad.left + sdx,
+                        r.y + pad.top + sdy,
+                        fs,
+                        shText,
+                        shCol,
+                        effOpacity,
+                        curState,
+                        shadowOwner,
+                        ff,
+                        maxTW,
+                        wm,
+                        tbShadow->GetTextAlignment(),
+                        innerAlignW));
             }
-            applyNodeTransform(shId);
-            ++emittedCount;
+        } else {
+            const bool hasOwnOpaqueSurface =
+                !elem->HasControlTemplate() &&
+                (elem->IsA<Rectangle>() || elem->IsA<Ellipse>() || elem->IsA<Image>() || elem->IsA<Button>() ||
+                 (ExtractGradBrushId(elem->GetValue(PropId_BackgroundGradientId)) != 0u) ||
+                 !ExtractContainerImageBrushUri(elem).empty() ||
+                 (value::TryGetColor(elem->GetValue(PropId_Background)).value_or(Color{0, 0, 0, 0}).a > 0.01f));
+            if (hasOwnOpaqueSurface && w > 0.0f && h > 0.0f) {
+                const float pad = std::ceil(localBlurR);
+                const CornerRadius cr = SanitizeCornerRadius(
+                    value::TryGetCornerRadius(elem->GetValue(PropId_CornerRadius))
+                        .value_or(CornerRadius{}));
+                const std::uint32_t shId = AllocateRoundedRectNode(
+                    r.x + sdx - pad,
+                    r.y + sdy - pad,
+                    w + 2.0f * pad,
+                    h + 2.0f * pad,
+                    shCol,
+                    cr,
+                    shadowOwner);
+                nodes_[shId].primType = AeroPrimType::SdfRoundedRect;
+                nodes_[shId].opacity = effOpacity;
+                nodes_[shId].softFeatherPx = localBlurR;
+                nodes_[shId].sdfPadPx = pad;
+                if (IsUniformCornerRadius(cr)) {
+                    const auto qPad = static_cast<std::uint16_t>(std::clamp(pad * 2.0f + 0.5f, 0.0f, 2047.0f)) & 0x07FFu;
+                    nodes_[shId].encodedPrimExtra = static_cast<std::uint16_t>(qPad << 5u);
+                }
+                applyNodeTransform(shId);
+                ++emittedCount;
+            } else {
+                // Transparent container (e.g. Viewbox/Canvas/StackPanel/templated Control): propagate shadow to child shapes!
+                propagateShadowToChildren = true;
+            }
         }
+    }
+
+    if (curState.shadowOnlyPass) {
+        if (propagateShadowToChildren) {
+            RenderTraversalState childShadowState = curState;
+            const UnifiedValue clipVal = elem->GetValue(PropId_ClipToBounds);
+            if (const auto* clipBool = std::get_if<bool>(&clipVal); clipBool && *clipBool) {
+                const Matrix2D worldM = MatrixFromState(
+                    curState.m00, curState.m01, curState.m10, curState.m11, curState.tx, curState.ty);
+                Rect rawClip = elem->GetLocalClipBounds();
+                if (r.width <= 0.0f && r.height <= 0.0f && (w > 0.0f || h > 0.0f)) {
+                    rawClip = Rect{r.x, r.y, w, h};
+                }
+                const Rect localBounds = curState.hasPerspective3D
+                    ? curState.world3D.TransformRectBounds(rawClip)
+                    : worldM.TransformRectBounds(rawClip);
+                childShadowState.clipRect = childShadowState.clipActive
+                    ? IntersectRect(childShadowState.clipRect, localBounds)
+                    : localBounds;
+                childShadowState.clipActive = true;
+            }
+            const Matrix2D childContainerTf = elem->GetChildContainerTransform2D();
+            ApplyStateMatrix(
+                childShadowState.m00, childShadowState.m01, childShadowState.m10, childShadowState.m11,
+                childShadowState.tx, childShadowState.ty,
+                childContainerTf);
+            if (!childContainerTf.IsIdentity()) {
+                if (childShadowState.hasPerspective3D) {
+                    childShadowState.world3D = Matrix4x4::ComposePlanarHomography(
+                        childShadowState.world3D,
+                        Matrix4x4::FromMatrix2D(childContainerTf));
+                } else {
+                    childShadowState.world3D = Matrix4x4::FromMatrix2D(
+                        MatrixFromState(
+                            childShadowState.m00, childShadowState.m01,
+                            childShadowState.m10, childShadowState.m11,
+                            childShadowState.tx, childShadowState.ty));
+                }
+            }
+            if (!elem->IsA<ComboBox>() || elem->HasControlTemplate()) {
+                const auto* selfExpander = elem->DynamicCast<Expander>();
+                const auto* selfTabControl = elem->DynamicCast<TabControl>();
+                for (const UIElement* child = elem->FirstChild(); child != nullptr; child = child->NextSibling()) {
+                    if (selfExpander && selfExpander->IsBodyChildHidden(child)) continue;
+                    if (selfTabControl && selfTabControl->IsChildInactiveTabPage(child)) {
+                        if (const auto* childHcc = child->DynamicCast<HeaderedContentControl>()) {
+                            if (const UIElement* hdrElem = childHcc->GetHeaderElement()) {
+                                TraverseAndEmitElement(hdrElem, childShadowState);
+                            }
+                        }
+                        continue;
+                    }
+                    TraverseAndEmitElement(child, childShadowState);
+                }
+            }
+        }
+        activeClipRect_ = parentState.clipRect;
+        activeClipEnabled_ = parentState.clipActive;
+        activeBlendMode_ = parentState.blendMode;
+        return;
     }
 
     if (elem->HasControlTemplate()) {
@@ -4482,7 +4955,16 @@ void PagedRenderTree::TraverseAndEmitElement(
             bool emitFill = true;
             bool emitSeparateStroke = false;
             ClassifyPathEmission(*pathElem, emitFill, emitSeparateStroke);
+            const std::uint32_t fillGradId = ExtractGradBrushId(pathElem->GetValue(PropId_BackgroundGradientId));
+            const std::uint32_t strokeGradId = ExtractGradBrushId(pathElem->GetValue(PropId_BorderGradientId));
 
+            if (!emitFill && !emitSeparateStroke) {
+                const std::uint32_t nid = AllocateRenderNode(
+                    r.x, r.y, w, h, Color{0.0f, 0.0f, 0.0f, 0.0f}, 0.0f, 0.0f, elem);
+                nodes_[nid].opacity = 0.0f;
+                applyNodeTransform(nid);
+                ++emittedCount;
+            }
             if (emitFill) {
                 const float inlineStrokeW = emitSeparateStroke ? 0.0f : strokeW;
                 const std::uint32_t nid = AllocateMtsdfPathNode(
@@ -4495,6 +4977,10 @@ void PagedRenderTree::TraverseAndEmitElement(
                     inlineStrokeW,
                     effOpacity,
                     elem);
+                nodes_[nid].gradientBrushId = fillGradId;
+                nodes_[nid].encodedPrimExtra = (fillGradId != 0u)
+                    ? static_cast<std::uint16_t>((std::min<std::uint32_t>(fillGradId, GradientBrushRegistry::kMaxBrushId) & 0x0FFFu) << 4u)
+                    : 0u;
                 nodes_[nid].encodedSdfParams = PackMtsdfParams(
                     mtsdf->pxRange,
                     mtsdf->atlasWidth,
@@ -4514,6 +5000,10 @@ void PagedRenderTree::TraverseAndEmitElement(
                     strokeW,
                     effOpacity,
                     elem);
+                nodes_[strokeNid].gradientBrushId = strokeGradId;
+                nodes_[strokeNid].encodedPrimExtra = (strokeGradId != 0u)
+                    ? static_cast<std::uint16_t>((std::min<std::uint32_t>(strokeGradId, GradientBrushRegistry::kMaxBrushId) & 0x0FFFu) << 4u)
+                    : 0u;
                 nodes_[strokeNid].encodedSdfParams = PackMtsdfParams(
                     mtsdf->pxRange,
                     mtsdf->atlasWidth,
@@ -4774,35 +5264,56 @@ void PagedRenderTree::TraverseAndEmitElement(
             applyNodeTransform(brdId);
             ++emittedCount;
         }
-        std::string text = tb->GetText();
-        if (text.empty()) {
-            const UnifiedValue phVal = tb->GetValue(PropId_Placeholder);
-            if (const auto* ph = std::get_if<StringValue>(&phVal)) {
-                text = ph->str();
+        if (tb->FirstChild() == nullptr) {
+            std::string text = tb->GetText();
+            if (text.empty()) {
+                const UnifiedValue phVal = tb->GetValue(PropId_Placeholder);
+                if (const auto* ph = std::get_if<StringValue>(&phVal)) {
+                    text = ph->str();
+                }
             }
+            const Thickness pad = tb->GetPadding();
+            const float fontSize = tb->GetFontSize();
+            const Color fg = tb->GetForeground();
+            const std::string fontFamily = tb->GetFontFamily();
+            const TextWrapping wrapMode = tb->GetTextWrapping();
+            const float effBoxW = (w > 0.0f) ? w : tb->DesiredSize().width;
+            const float maxTextW = (wrapMode != TextWrapping::NoWrap && effBoxW > 0.0f)
+                ? std::max(1.0f, effBoxW - (pad.left + pad.right))
+                : 1000000.0f;
+            const float innerAlignW = std::max(0.0f, effBoxW - (pad.left + pad.right));
+            std::vector<RichGlyphStyle> richStyles;
+            const std::vector<RichGlyphStyle>* richPtr = nullptr;
+            if (tb->HasRichText()) {
+                const std::string rawRich = tb->GetRawRichText();
+                if (!rawRich.empty()) {
+                    ParseRichTextToPlainAndStyles(rawRich, fg, elem, text, richStyles);
+                    richPtr = &richStyles;
+                }
+            }
+            emittedCount = static_cast<std::uint16_t>(
+                emittedCount + EmitTextRunNodes(
+                    r.x + pad.left,
+                    r.y + pad.top,
+                    fontSize,
+                    text,
+                    fg,
+                    effOpacity,
+                    curState,
+                    elem,
+                    fontFamily,
+                    maxTextW,
+                    wrapMode,
+                    tb->GetTextAlignment(),
+                    innerAlignW,
+                    richPtr));
+        } else if (emittedCount == 0u) {
+            const std::uint32_t anchorId = AllocateRenderNode(
+                r.x, r.y, 0.0f, 0.0f, Color{0.0f, 0.0f, 0.0f, 0.0f}, 0.0f, 0.0f, elem);
+            nodes_[anchorId].opacity = 0.0f;
+            applyNodeTransform(anchorId);
+            ++emittedCount;
         }
-        const Thickness pad = tb->GetPadding();
-        const float fontSize = tb->GetFontSize();
-        const Color fg = tb->GetForeground();
-        const std::string fontFamily = tb->GetFontFamily();
-        const TextWrapping wrapMode = tb->GetTextWrapping();
-        const float effBoxW = (w > 0.0f) ? w : tb->DesiredSize().width;
-        const float maxTextW = (wrapMode != TextWrapping::NoWrap && effBoxW > 0.0f)
-            ? std::max(1.0f, effBoxW - (pad.left + pad.right))
-            : 1000000.0f;
-        emittedCount = static_cast<std::uint16_t>(
-            emittedCount + EmitTextRunNodes(
-                r.x + pad.left,
-                r.y + pad.top,
-                fontSize,
-                text,
-                fg,
-                effOpacity,
-                curState,
-                elem,
-                fontFamily,
-                maxTextW,
-                wrapMode));
     } else if (const auto* combo = elem->DynamicCast<ComboBox>()) {
         const float effAlpha = combo->IsEffectivelyEnabled() ? effOpacity : (effOpacity * 0.55f);
         Color hdrBg = value::TryGetColor(combo->GetValue(PropId_Background))
@@ -4995,11 +5506,41 @@ void PagedRenderTree::TraverseAndEmitElement(
                         btnFont));
             }
         }
+    } else if (elem->IsA<BoxShadow>()) {
+        float boxBlurR = 8.0f;
+        (void)TryGetFloat(elem->GetValue(PropId_EffectBlurRadius), boxBlurR);
+        boxBlurR = std::max(1.0f, boxBlurR);
+        const Color boxCol = value::TryGetColor(elem->GetValue(PropId_EffectColor))
+            .value_or(value::TryGetColor(elem->GetValue(PropId_Background))
+                .value_or(Color{0.0f, 0.0f, 0.0f, 0.5f}));
+        const CornerRadius cr = SanitizeCornerRadius(
+            value::TryGetCornerRadius(elem->GetValue(PropId_CornerRadius)).value_or(CornerRadius{}));
+        const float pad = std::ceil(boxBlurR);
+        const std::uint32_t shId = AllocateRoundedRectNode(
+            r.x - pad, r.y - pad, w + 2.0f * pad, h + 2.0f * pad, boxCol, cr, elem);
+        nodes_[shId].primType = AeroPrimType::SdfRoundedRect;
+        nodes_[shId].opacity = (w > 0.0f && h > 0.0f) ? effOpacity : 0.0f;
+        nodes_[shId].softFeatherPx = boxBlurR;
+        nodes_[shId].sdfPadPx = pad;
+        if (IsUniformCornerRadius(cr)) {
+            const auto qPad = static_cast<std::uint16_t>(std::clamp(pad * 2.0f + 0.5f, 0.0f, 2047.0f)) & 0x07FFu;
+            nodes_[shId].encodedPrimExtra = static_cast<std::uint16_t>(qPad << 5u);
+        }
+        applyNodeTransform(shId);
+        ++emittedCount;
     } else {
         const SurfaceFillBorderPlan plan = ComputeContainerFillBorderPlan(
             elem,
             Rect{r.x, r.y, w, h});
         const std::uint32_t bgGradId = ExtractGradBrushId(elem->GetValue(PropId_BackgroundGradientId));
+        Stretch imgStretch = Stretch::Fill;
+        const std::string bgImgUri = (bgGradId == 0u)
+            ? ExtractContainerImageBrushUri(elem, &imgStretch)
+            : std::string{};
+        const ImageAtlasEntry* bgAtlas = bgImgUri.empty() ? nullptr : ImageAtlas::Instance().LoadOrGet(bgImgUri);
+        float bgGradOp = 1.0f;
+        (void)TryGetFloat(elem->GetValue(PropId_BackgroundOpacity), bgGradOp);
+        bgGradOp = std::clamp(bgGradOp, 0.0f, 1.0f);
         if (bgGradId != 0u) {
             const std::uint32_t fillId = AllocateGradientRoundedRectNode(
                 plan.fillRect.x,
@@ -5010,8 +5551,30 @@ void PagedRenderTree::TraverseAndEmitElement(
                 plan.fillRadii,
                 false,
                 Color{1.0f, 1.0f, 1.0f, 1.0f},
-                effOpacity,
+                effOpacity * bgGradOp,
                 elem);
+            applyNodeTransform(fillId);
+            ++emittedCount;
+        } else if (bgAtlas && bgAtlas->width > 0u && bgAtlas->height > 0u &&
+                   plan.fillRect.width > 0.0f && plan.fillRect.height > 0.0f) {
+            const ImageStretchPlacement pl = ComputeImageStretchPlacement(
+                plan.fillRect,
+                static_cast<float>(bgAtlas->width),
+                static_cast<float>(bgAtlas->height),
+                imgStretch,
+                StretchDirection::Both,
+                bgAtlas->u0, bgAtlas->v0, bgAtlas->u1, bgAtlas->v1);
+            const Rect dr = pl.valid ? pl.destRect : plan.fillRect;
+            const std::uint32_t fillId = AllocateTexturedNode(
+                dr.x, dr.y, dr.width, dr.height,
+                pl.valid ? pl.u0 : bgAtlas->u0,
+                pl.valid ? pl.v0 : bgAtlas->v0,
+                pl.valid ? pl.u1 : bgAtlas->u1,
+                pl.valid ? pl.v1 : bgAtlas->v1,
+                Color{1.0f, 1.0f, 1.0f, 1.0f},
+                effOpacity * bgGradOp,
+                elem,
+                bgAtlas->textureId);
             applyNodeTransform(fillId);
             ++emittedCount;
         } else {
@@ -5049,6 +5612,8 @@ void PagedRenderTree::TraverseAndEmitElement(
 
     // If this container specifies ClipToBounds=true, intersect transformed child clip rect before descending
     RenderTraversalState childState = curState;
+    childState.hasInheritedDropShadow = false;
+    childState.shadowOnlyPass = false;
     const UnifiedValue clipVal = elem->GetValue(PropId_ClipToBounds);
     if (const auto* clipBool = std::get_if<bool>(&clipVal); clipBool && *clipBool) {
         const Matrix2D worldM = MatrixFromState(
@@ -5091,6 +5656,30 @@ void PagedRenderTree::TraverseAndEmitElement(
             ? selfTabItem->GetHeaderElement()
             : nullptr;
 
+        if (propagateShadowToChildren) {
+            RenderTraversalState shadowPassState = childState;
+            shadowPassState.hasInheritedDropShadow = true;
+            shadowPassState.shadowOnlyPass = true;
+            shadowPassState.shadowWorldDx = worldSdx;
+            shadowPassState.shadowWorldDy = worldSdy;
+            shadowPassState.shadowWorldBlurR = worldBlurR;
+            shadowPassState.shadowColor = shCol;
+            for (const UIElement* child = elem->FirstChild(); child != nullptr; child = child->NextSibling()) {
+                if (selfExpander && selfExpander->IsBodyChildHidden(child)) {
+                    continue;
+                }
+                if (selfTabControl && selfTabControl->IsChildInactiveTabPage(child)) {
+                    if (const auto* childHcc = child->DynamicCast<HeaderedContentControl>()) {
+                        if (const UIElement* hdrElem = childHcc->GetHeaderElement()) {
+                            TraverseAndEmitElement(hdrElem, shadowPassState);
+                        }
+                    }
+                    continue;
+                }
+                TraverseAndEmitElement(child, shadowPassState);
+            }
+        }
+
         for (const UIElement* child = elem->FirstChild(); child != nullptr; child = child->NextSibling()) {
             if (selfExpander && selfExpander->IsBodyChildHidden(child)) {
                 std::size_t dummy = 0u;
@@ -5120,9 +5709,10 @@ void PagedRenderTree::TraverseAndEmitElement(
         blurLayerSpans_[blurSpanSlot].endNodeId = static_cast<std::uint32_t>(nodes_.size());
     }
 
-    // Restore active clip state after visiting children
+    // Restore active clip & blend state after visiting children
     activeClipRect_ = parentState.clipRect;
     activeClipEnabled_ = parentState.clipActive;
+    activeBlendMode_ = parentState.blendMode;
 }
 
 bool PagedRenderTree::IsPageDirty(std::size_t pageIndex) const noexcept {

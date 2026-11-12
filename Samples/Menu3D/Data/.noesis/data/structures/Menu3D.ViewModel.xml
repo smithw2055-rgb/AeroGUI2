@@ -1,0 +1,6 @@
+<Class Name="ViewModel" Namespace="Menu3D">
+  <Property Name="MainMenu" Type="Object" SubType="Menu3D.MainMenu"/>
+  <Property Name="StartMenu" Type="Object" SubType="Menu3D.StartMenu"/>
+  <Property Name="SettingsMenu" Type="Object" SubType="Menu3D.SettingsMenu"/>
+  <Property Name="Platform" Type="Enum" SubType="Menu3D.Platform"/>
+</Class>

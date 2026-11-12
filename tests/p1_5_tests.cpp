@@ -2,22 +2,27 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <memory>
 #include <string>
 #include <string_view>
 #include <system_error>
 #include <vector>
 
 #include "aero/animation/AnimationEngine.hpp"
+#include "aero/binding/DualTrackBindingEngine.hpp"
 #include "aero/compiler/AeroCompiler.hpp"
 #include "aero/compiler/AxbFormat.hpp"
 #include "aero/controls/Controls.hpp"
 #include "aero/core/DependencyProperty.hpp"
 #include "aero/core/UIElement.hpp"
 #include "aero/core/UnifiedValue.hpp"
+#include "aero/render/GpuBackend.hpp"
 #include "aero/render/PagedRenderTree.hpp"
 #include "aero/render/ZeroCopyGpuStream.hpp"
+#include "aero/style/StyleTriggerEngine.hpp"
 
 using namespace aero;
 
@@ -569,6 +574,661 @@ void TestDropShadowAndBlurEffectsRasterization() {
     }
 }
 
+// ============================================================================
+// 4. Regression: Templated Label Layout Delegation & Literal Content Text
+// ============================================================================
+void TestTemplatedLabelLayoutAndLiteralContent() {
+    const int startFails = gFailureCount;
+
+    AeroCompiler compiler;
+    AeroCompileInput xamlIn{};
+    xamlIn.xamlPath = "TemplatedLabelRegression.xaml";
+    xamlIn.xamlContent = R"(
+<StackPanel xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+            xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+            xmlns:noesis="clr-namespace:NoesisGUIExtensions"
+            Width="200">
+    <StackPanel.Resources>
+        <ControlTemplate x:Key="LblTpl" TargetType="{x:Type Label}">
+            <Grid>
+                <TextBlock TextWrapping="Wrap" FontSize="16"
+                           noesis:RichText.Text="{TemplateBinding Content}"/>
+            </Grid>
+        </ControlTemplate>
+        <Style TargetType="{x:Type Label}">
+            <Setter Property="Template" Value="{StaticResource LblTpl}"/>
+        </Style>
+    </StackPanel.Resources>
+    <Label x:Name="WrappedLbl" Width="70"
+           Content="[b]Alpha[/b] Beta Gamma Delta Epsilon Zeta Eta"/>
+</StackPanel>
+)";
+    const AeroCompileResult res = compiler.Compile(xamlIn);
+    AERO_P15_CHECK(res.succeeded && res.diagnostics.empty(),
+                   "Templated Label XAML compiles cleanly");
+
+    AnimationEngine animEngine;
+    StyleTriggerEngine styleEngine(&animEngine, nullptr);
+    auto root = CreateElementByTypeName(res.axbPackage.rootTypeName);
+    AERO_P15_CHECK(MountAxbTemplate(root.Get(), res.axbPackage, nullptr, nullptr, ObjectRef{}, nullptr, nullptr, &animEngine),
+                   "Mounted TemplatedLabelRegression scene");
+
+    styleEngine.RegisterPackageStyles(res.axbPackage);
+    (void)styleEngine.BindSubtreeStyles(root.Get(), true);
+    (void)styleEngine.EvaluateAndApply();
+
+    UIElement* wrappedLbl = root->FindName("WrappedLbl");
+    AERO_P15_CHECK(wrappedLbl != nullptr && wrappedLbl->HasControlTemplate(),
+                   "WrappedLbl mounted its ControlTemplate via implicit Label Style");
+
+    root->Measure(Size{200.0f, 400.0f});
+    root->Arrange(Rect{0.0f, 0.0f, 200.0f, 400.0f});
+    AERO_P15_CHECK(wrappedLbl != nullptr && wrappedLbl->DesiredSize().height > 40.0f,
+                   "Templated Label delegates MeasureCore to wrapped template child instead of single-line self");
+
+    PagedRenderTree tree;
+    (void)tree.BuildFromVisualTree(root.Get());
+    const RenderNodeDescriptor* lblAnchor = wrappedLbl ? tree.GetNode(wrappedLbl->RenderNodeId()) : nullptr;
+    AERO_P15_CHECK(wrappedLbl != nullptr && wrappedLbl->RenderNodeSpan() == 1u &&
+                       lblAnchor != nullptr && lblAnchor->opacity == 0.0f &&
+                       lblAnchor->primType != AeroPrimType::SdfTextGlyph,
+                   "Templated Label emits only a 0-opacity anchor node and never double-renders SdfTextGlyph");
+
+    // Untemplated Label with literal bracket text in Content must NOT strip BBCode tags
+    auto plainLbl = MakeIntrusive<Label>();
+    plainLbl->SetValue(PropId_Content, StringValue(std::string_view("[b]LiteralBracket[/b]")));
+    AERO_P15_CHECK(plainLbl->GetText() == "[b]LiteralBracket[/b]",
+                   "TextBlock::GetText preserves PropId_Content verbatim when PropId_RichText is unset");
+
+    if (gFailureCount == startFails) {
+        std::printf("[PASS] TestTemplatedLabelLayoutAndLiteralContent\n");
+    }
+}
+
+// ============================================================================
+// 5. Regression: RichText sourceCodePointIndex Style Alignment & Reactive [bind]
+// ============================================================================
+void TestRichTextGlyphStyleAlignmentAndReactiveBind() {
+    const int startFails = gFailureCount;
+
+    const char* rsCode = R"(
+module Game.RichRegression;
+
+public class RichVm
+{
+    [Observable] public int SoundLevel;
+}
+)";
+
+    const char* xamlCode = R"(
+<StackPanel xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+            xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+            xmlns:noesis="clr-namespace:NoesisGUIExtensions"
+            x:DataType="Game.RichRegression::RichVm"
+            Width="220">
+    <TextBlock x:Name="StyledWrapTb" Width="64" FontSize="16" TextWrapping="Wrap"
+               Foreground="#FFFFFFFF"
+               noesis:RichText.Text="Hello   [br/][color=#FF00FF00]World[/color]"/>
+    <TextBlock x:Name="BoundRichTb" FontSize="16"
+               noesis:RichText.Text="Vol: [bind format='{0:0}%']SoundLevel[/bind]"/>
+</StackPanel>
+)";
+
+    AeroCompiler compiler;
+    AeroCompileInput in{};
+    in.xamlPath = "RichTextRegression.xaml";
+    in.xamlContent = xamlCode;
+    in.scriptSources.push_back({"RichVm.rs", rsCode});
+
+    const AeroCompileResult compiled = compiler.Compile(in);
+    AERO_P15_CHECK(compiled.succeeded && compiled.programImage != nullptr,
+                   "RichText + RealScript ViewModel XAML compiled cleanly");
+    if (!compiled.succeeded || !compiled.programImage) {
+        return;
+    }
+
+    ExecutionDomainContext domains;
+    domains.registerProgramObservableMetadata(*compiled.programImage);
+    auto uiHeapPtr = std::shared_ptr<ManagedHeap>(&domains.uiHeap(), [](ManagedHeap*) {});
+    Interpreter uiInterp(compiled.programImage, uiHeapPtr);
+    uiInterp.setExecutionDomainContext(&domains, DomainKind::Ui);
+
+    const SymbolId vmTypeId = rs_sem::stableTypeId("Game.RichRegression::RichVm");
+    const auto* vmTypeSym = compiled.programImage->resolveType(vmTypeId);
+    auto vmObjOpt = domains.uiHeap().allocateObject(
+        vmTypeId, std::vector<UnifiedValue>(vmTypeSym ? vmTypeSym->fields.size() : 1u), {});
+    AERO_P15_CHECK(vmObjOpt.has_value(), "Allocated RichVm on UiHeap");
+    const ObjectRef vmObj = *vmObjOpt;
+
+    auto soundSlot = domains.resolvePropertySlot(*compiled.programImage, vmTypeId, "SoundLevel");
+    AERO_P15_CHECK(soundSlot.has_value(), "Resolved RichVm::SoundLevel slot");
+    (void)domains.writePropertySlotFast(DomainKind::Ui, vmObj, *soundSlot, value::FromInt(25), &uiInterp);
+
+    DualTrackBindingEngine bindingEngine(domains, compiled.programImage.get(), &uiInterp);
+    auto root = CreateElementByTypeName(compiled.axbPackage.rootTypeName);
+    root->SetValue(PropId_DataContext, vmObj, ValueSourceRank::Local);
+    AERO_P15_CHECK(
+        MountAxbTemplate(root.Get(), compiled.axbPackage, &domains, &bindingEngine, vmObj, &uiInterp),
+        "Mounted RichTextRegression scene");
+
+    auto* styledTb = root->FindName("StyledWrapTb")
+        ? root->FindName("StyledWrapTb")->DynamicCast<TextBlock>()
+        : nullptr;
+    auto* boundTb = root->FindName("BoundRichTb")
+        ? root->FindName("BoundRichTb")->DynamicCast<TextBlock>()
+        : nullptr;
+    AERO_P15_CHECK(styledTb != nullptr && boundTb != nullptr, "Located StyledWrapTb and BoundRichTb");
+
+    root->Measure(Size{220.0f, 300.0f});
+    root->Arrange(Rect{0.0f, 0.0f, 220.0f, 300.0f});
+
+    PagedRenderTree tree;
+    (void)tree.BuildFromVisualTree(root.Get());
+
+    // 1. Verify wrapped spaces + [br/] do NOT shift RichGlyphStyle colors on "World"
+    AERO_P15_CHECK(styledTb->RenderNodeSpan() == 1u,
+                   "StyledWrapTb emits batched SdfTextGlyph chunk node");
+    const std::uint32_t whitePacked = PackColorRgba8(Color{1.0f, 1.0f, 1.0f, 1.0f});
+    const std::uint32_t greenPacked = PackColorRgba8(Color{0.0f, 1.0f, 0.0f, 1.0f});
+    auto verifyGlyphColors = [&]() -> bool {
+        const RenderNodeDescriptor* nd = tree.GetNode(styledTb->RenderNodeId());
+        if (!nd || nd->primType != AeroPrimType::SdfTextGlyph || nd->vertexCount < 40u) {
+            return false;
+        }
+        const CommandPage& pg = tree.GetPage(nd->pageIndex);
+        for (std::size_t q = 0u; q < 10u; ++q) {
+            const std::uint32_t expected = (q < 5u) ? whitePacked : greenPacked;
+            if (pg.vertices[nd->vertexOffsetInPage + q * 4u].rgba != expected) {
+                return false;
+            }
+        }
+        return true;
+    };
+    AERO_P15_CHECK(verifyGlyphColors(),
+                   "Initial build aligns RichGlyphStyle via sourceCodePointIndex ('Hello'=white, 'World'=green)");
+
+    styledTb->InvalidateRender();
+    AERO_P15_CHECK(tree.UpdateDirtyElement(styledTb) && verifyGlyphColors(),
+                   "UpdateDirtyElement preserves sourceCodePointIndex RichGlyphStyle alignment");
+
+    // 2. Verify reactive [bind] resolves real DataContext property and invalidates on Track A flush
+    AERO_P15_CHECK(boundTb->GetText() == "Vol: 25%",
+                   "RichText [bind] resolves live SoundLevel=25 from DataContext");
+    boundTb->ClearLayoutDirtyFlags();
+    (void)domains.writePropertySlotFast(DomainKind::Ui, vmObj, *soundSlot, value::FromInt(80), &uiInterp);
+    AERO_P15_CHECK(bindingEngine.HasPendingDirtyObjects(),
+                   "HasPendingDirtyObjects detects dirty RichText [bind] dependent");
+    (void)bindingEngine.FlushTrackA();
+    AERO_P15_CHECK(boundTb->GetText() == "Vol: 80%" &&
+                       (boundTb->GetLayoutDirtyFlags() & RenderDirty) != 0u,
+                   "FlushTrackA reactively updates RichText [bind] to 'Vol: 80%' without recursion");
+
+    if (gFailureCount == startFails) {
+        std::printf("[PASS] TestRichTextGlyphStyleAlignmentAndReactiveBind\n");
+    }
+}
+
+// ============================================================================
+// 6. Regression: BackdropBlur Foreground Preservation & GL Interleaved Execution
+// ============================================================================
+struct MockBlurGlSpy {
+    AeroGLuint nextId = 1u;
+    std::size_t readPixelsCalls = 0u;
+    std::size_t texImage2DCalls = 0u;
+    std::size_t texSubImage2DCalls = 0u;
+    std::size_t drawElementsCalls = 0u;
+    AeroGLenum lastBlendSrcRgb = 0u;
+    AeroGLenum lastBlendDstRgb = 0u;
+    AeroGLenum lastBlendSrcAlpha = 0u;
+    AeroGLenum lastBlendDstAlpha = 0u;
+};
+
+MockBlurGlSpy* gBlurGlSpy = nullptr;
+
+void AERO_GL_APIENTRY MockBlurViewport(AeroGLint, AeroGLint, AeroGLsizei, AeroGLsizei) {}
+void AERO_GL_APIENTRY MockBlurScissor(AeroGLint, AeroGLint, AeroGLsizei, AeroGLsizei) {}
+void AERO_GL_APIENTRY MockBlurEnable(AeroGLenum) {}
+void AERO_GL_APIENTRY MockBlurDisable(AeroGLenum) {}
+void AERO_GL_APIENTRY MockBlurBlendFuncSeparate(
+    AeroGLenum srcRgb, AeroGLenum dstRgb, AeroGLenum srcA, AeroGLenum dstA) {
+    gBlurGlSpy->lastBlendSrcRgb = srcRgb;
+    gBlurGlSpy->lastBlendDstRgb = dstRgb;
+    gBlurGlSpy->lastBlendSrcAlpha = srcA;
+    gBlurGlSpy->lastBlendDstAlpha = dstA;
+}
+void AERO_GL_APIENTRY MockBlurClearColor(AeroGLfloat, AeroGLfloat, AeroGLfloat, AeroGLfloat) {}
+void AERO_GL_APIENTRY MockBlurClear(AeroGLbitfield) {}
+void AERO_GL_APIENTRY MockBlurGenIds(AeroGLsizei n, AeroGLuint* out) {
+    for (AeroGLsizei i = 0; i < n; ++i) out[i] = gBlurGlSpy->nextId++;
+}
+void AERO_GL_APIENTRY MockBlurDeleteIds(AeroGLsizei, const AeroGLuint*) {}
+void AERO_GL_APIENTRY MockBlurBindBuffer(AeroGLenum, AeroGLuint) {}
+void AERO_GL_APIENTRY MockBlurBufferData(AeroGLenum, AeroGLsizeiptr, const void*, AeroGLenum) {}
+void AERO_GL_APIENTRY MockBlurBufferSubData(AeroGLenum, AeroGLintptr, AeroGLsizeiptr, const void*) {}
+void AERO_GL_APIENTRY MockBlurBindVertexArray(AeroGLuint) {}
+void AERO_GL_APIENTRY MockBlurEnableVertexAttribArray(AeroGLuint) {}
+void AERO_GL_APIENTRY MockBlurVertexAttribPointer(
+    AeroGLuint, AeroGLint, AeroGLenum, AeroGLboolean, AeroGLsizei, const void*) {}
+void AERO_GL_APIENTRY MockBlurVertexAttribIPointer(
+    AeroGLuint, AeroGLint, AeroGLenum, AeroGLsizei, const void*) {}
+AeroGLuint AERO_GL_APIENTRY MockBlurCreateShader(AeroGLenum) { return gBlurGlSpy->nextId++; }
+void AERO_GL_APIENTRY MockBlurDeleteShader(AeroGLuint) {}
+void AERO_GL_APIENTRY MockBlurShaderSource(
+    AeroGLuint, AeroGLsizei, const AeroGLchar* const*, const AeroGLint*) {}
+void AERO_GL_APIENTRY MockBlurCompileShader(AeroGLuint) {}
+void AERO_GL_APIENTRY MockBlurGetShaderiv(AeroGLuint, AeroGLenum pname, AeroGLint* params) {
+    if (params) *params = (pname == 0x8B81u) ? 1 : 0;
+}
+void AERO_GL_APIENTRY MockBlurGetShaderInfoLog(
+    AeroGLuint, AeroGLsizei, AeroGLsizei* len, AeroGLchar* log) {
+    if (len) *len = 0;
+    if (log) log[0] = '\0';
+}
+AeroGLuint AERO_GL_APIENTRY MockBlurCreateProgram() { return gBlurGlSpy->nextId++; }
+void AERO_GL_APIENTRY MockBlurDeleteProgram(AeroGLuint) {}
+void AERO_GL_APIENTRY MockBlurAttachShader(AeroGLuint, AeroGLuint) {}
+void AERO_GL_APIENTRY MockBlurLinkProgram(AeroGLuint) {}
+void AERO_GL_APIENTRY MockBlurGetProgramiv(AeroGLuint, AeroGLenum pname, AeroGLint* params) {
+    if (params) *params = (pname == 0x8B82u) ? 1 : 0;
+}
+void AERO_GL_APIENTRY MockBlurGetProgramInfoLog(
+    AeroGLuint, AeroGLsizei, AeroGLsizei* len, AeroGLchar* log) {
+    if (len) *len = 0;
+    if (log) log[0] = '\0';
+}
+void AERO_GL_APIENTRY MockBlurUseProgram(AeroGLuint) {}
+AeroGLint AERO_GL_APIENTRY MockBlurGetUniformLocation(AeroGLuint, const AeroGLchar*) { return 0; }
+void AERO_GL_APIENTRY MockBlurUniform1i(AeroGLint, AeroGLint) {}
+void AERO_GL_APIENTRY MockBlurUniform2f(AeroGLint, AeroGLfloat, AeroGLfloat) {}
+void AERO_GL_APIENTRY MockBlurActiveTexture(AeroGLenum) {}
+void AERO_GL_APIENTRY MockBlurBindTexture(AeroGLenum, AeroGLuint) {}
+void AERO_GL_APIENTRY MockBlurTexImage2D(
+    AeroGLenum, AeroGLint, AeroGLint, AeroGLsizei, AeroGLsizei, AeroGLint, AeroGLenum, AeroGLenum, const void*) {
+    ++gBlurGlSpy->texImage2DCalls;
+}
+void AERO_GL_APIENTRY MockBlurTexSubImage2D(
+    AeroGLenum, AeroGLint, AeroGLint, AeroGLint, AeroGLsizei, AeroGLsizei, AeroGLenum, AeroGLenum, const void*) {
+    ++gBlurGlSpy->texSubImage2DCalls;
+}
+void AERO_GL_APIENTRY MockBlurTexParameteri(AeroGLenum, AeroGLenum, AeroGLint) {}
+void AERO_GL_APIENTRY MockBlurPixelStorei(AeroGLenum, AeroGLint) {}
+void AERO_GL_APIENTRY MockBlurDrawElements(AeroGLenum, AeroGLsizei, AeroGLenum, const void*) {
+    ++gBlurGlSpy->drawElementsCalls;
+}
+void AERO_GL_APIENTRY MockBlurReadPixels(
+    AeroGLint, AeroGLint, AeroGLsizei w, AeroGLsizei h, AeroGLenum, AeroGLenum, void* data) {
+    ++gBlurGlSpy->readPixelsCalls;
+    if (data && w > 0 && h > 0) {
+        std::memset(data, 0x80u, static_cast<std::size_t>(w) * static_cast<std::size_t>(h) * 4u);
+    }
+}
+AeroGLenum AERO_GL_APIENTRY MockBlurGetError() { return 0u; }
+const std::uint8_t* AERO_GL_APIENTRY MockBlurGetString(AeroGLenum) {
+    return reinterpret_cast<const std::uint8_t*>("MockBlurGL 3.3");
+}
+
+GlFunctionTable MakeMockBlurGlTable() noexcept {
+    GlFunctionTable t{};
+    t.Viewport = &MockBlurViewport;
+    t.Scissor = &MockBlurScissor;
+    t.Enable = &MockBlurEnable;
+    t.Disable = &MockBlurDisable;
+    t.BlendFuncSeparate = &MockBlurBlendFuncSeparate;
+    t.ClearColor = &MockBlurClearColor;
+    t.Clear = &MockBlurClear;
+    t.GenBuffers = &MockBlurGenIds;
+    t.DeleteBuffers = &MockBlurDeleteIds;
+    t.BindBuffer = &MockBlurBindBuffer;
+    t.BufferData = &MockBlurBufferData;
+    t.BufferSubData = &MockBlurBufferSubData;
+    t.GenVertexArrays = &MockBlurGenIds;
+    t.DeleteVertexArrays = &MockBlurDeleteIds;
+    t.BindVertexArray = &MockBlurBindVertexArray;
+    t.EnableVertexAttribArray = &MockBlurEnableVertexAttribArray;
+    t.VertexAttribPointer = &MockBlurVertexAttribPointer;
+    t.VertexAttribIPointer = &MockBlurVertexAttribIPointer;
+    t.CreateShader = &MockBlurCreateShader;
+    t.DeleteShader = &MockBlurDeleteShader;
+    t.ShaderSource = &MockBlurShaderSource;
+    t.CompileShader = &MockBlurCompileShader;
+    t.GetShaderiv = &MockBlurGetShaderiv;
+    t.GetShaderInfoLog = &MockBlurGetShaderInfoLog;
+    t.CreateProgram = &MockBlurCreateProgram;
+    t.DeleteProgram = &MockBlurDeleteProgram;
+    t.AttachShader = &MockBlurAttachShader;
+    t.LinkProgram = &MockBlurLinkProgram;
+    t.GetProgramiv = &MockBlurGetProgramiv;
+    t.GetProgramInfoLog = &MockBlurGetProgramInfoLog;
+    t.UseProgram = &MockBlurUseProgram;
+    t.GetUniformLocation = &MockBlurGetUniformLocation;
+    t.Uniform1i = &MockBlurUniform1i;
+    t.Uniform2f = &MockBlurUniform2f;
+    t.GenTextures = &MockBlurGenIds;
+    t.DeleteTextures = &MockBlurDeleteIds;
+    t.ActiveTexture = &MockBlurActiveTexture;
+    t.BindTexture = &MockBlurBindTexture;
+    t.TexImage2D = &MockBlurTexImage2D;
+    t.TexSubImage2D = &MockBlurTexSubImage2D;
+    t.TexParameteri = &MockBlurTexParameteri;
+    t.PixelStorei = &MockBlurPixelStorei;
+    t.DrawElements = &MockBlurDrawElements;
+    t.ReadPixels = &MockBlurReadPixels;
+    t.GetError = &MockBlurGetError;
+    t.GetString = &MockBlurGetString;
+    return t;
+}
+
+void TestBackdropBlurForegroundAndGlInterleavedExecution() {
+    const int startFails = gFailureCount;
+
+    AeroCompiler compiler;
+    AeroCompileInput xamlIn{};
+    xamlIn.xamlPath = "BackdropBlurRegression.xaml";
+    xamlIn.xamlContent = R"(
+<Canvas xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:b="http://schemas.microsoft.com/xaml/behaviors"
+        xmlns:noesis="clr-namespace:NoesisGUIExtensions"
+        Width="200" Height="120">
+    <Border Canvas.Left="0" Canvas.Top="0" Width="100" Height="120" Background="#FFFF0000"/>
+    <Border Canvas.Left="100" Canvas.Top="0" Width="100" Height="120" Background="#FF0000FF"/>
+    <Border x:Name="GlassPanel" Canvas.Left="60" Canvas.Top="20" Width="80" Height="80"
+            Background="#6600FF00">
+        <b:Interaction.Behaviors>
+            <noesis:BackgroundEffectBehavior>
+                <BlurEffect Radius="12"/>
+            </noesis:BackgroundEffectBehavior>
+        </b:Interaction.Behaviors>
+        <Border x:Name="CrispChild" Width="24" Height="24"
+                HorizontalAlignment="Center" VerticalAlignment="Center"
+                Background="#FFFFFFFF"/>
+    </Border>
+</Canvas>
+)";
+    const AeroCompileResult res = compiler.Compile(xamlIn);
+    AERO_P15_CHECK(res.succeeded && res.diagnostics.empty(),
+                   "BackdropBlur BackgroundEffectBehavior XAML compiles cleanly");
+
+    auto root = CreateElementByTypeName(res.axbPackage.rootTypeName);
+    AERO_P15_CHECK(MountAxbTemplate(root.Get(), res.axbPackage), "Mounted BackdropBlur scene");
+
+    UIElement* glassPanel = root->FindName("GlassPanel");
+    AERO_P15_CHECK(glassPanel != nullptr && glassPanel->GetEffectKind() == UIEffectKind::BackdropBlur,
+                   "GlassPanel carries UIEffectKind::BackdropBlur");
+
+    root->Measure(Size{200.0f, 120.0f});
+    root->Arrange(Rect{0.0f, 0.0f, 200.0f, 120.0f});
+
+    PagedRenderTree tree;
+    (void)tree.BuildFromVisualTree(root.Get());
+    AERO_P15_CHECK(tree.BlurLayerSpans().size() == 1u &&
+                       tree.BlurLayerSpans()[0].effectMode == UIEffectKind::BackdropBlur,
+                   "PagedRenderTree records BackdropBlur BlurLayerSpan");
+
+    std::vector<std::uint8_t> rgba;
+    ZeroCopyGpuStream::RasterizeTreeToRgba8(tree, 200u, 120u, rgba, Color{0.0f, 0.0f, 0.0f, 1.0f});
+
+    const RgbaSample unblurredLeft = SamplePixel(rgba, 200u, 96u, 8u);
+    const RgbaSample unblurredRight = SamplePixel(rgba, 200u, 104u, 8u);
+    const RgbaSample frostedSeam = SamplePixel(rgba, 200u, 99u, 28u);
+    const RgbaSample crispChildPx = SamplePixel(rgba, 200u, 100u, 60u);
+
+    AERO_P15_CHECK(unblurredLeft.r > 240u && unblurredLeft.b < 10u &&
+                       unblurredRight.b > 240u && unblurredRight.r < 10u,
+                   "Outside GlassPanel, red/blue background split remains sharp");
+    AERO_P15_CHECK(frostedSeam.r > 35u && frostedSeam.b > 35u && frostedSeam.g > 80u,
+                   "Inside GlassPanel, BackdropBlur blurs red/blue backdrop AND composites GlassPanel #6600FF00 tint");
+    AERO_P15_CHECK(crispChildPx.r > 245u && crispChildPx.g > 245u && crispChildPx.b > 245u,
+                   "BackdropBlur renders crisp foreground child [firstNodeId..endNodeId) on top of frosted backdrop");
+
+    // Verify OpenGlDeviceBackend interleaved BackdropBlur execution & end-of-frame blend restoration
+    MockBlurGlSpy spy{};
+    gBlurGlSpy = &spy;
+    OpenGlDeviceBackend glBackend(MakeMockBlurGlTable());
+    GpuBackendConfig cfg{};
+    cfg.initialViewportWidth = 200u;
+    cfg.initialViewportHeight = 120u;
+    AERO_P15_CHECK(glBackend.Initialize(cfg), "Initialized mock OpenGlDeviceBackend");
+    spy.readPixelsCalls = 0u;
+    spy.texImage2DCalls = 0u;
+    spy.texSubImage2DCalls = 0u;
+    spy.drawElementsCalls = 0u;
+
+    ZeroCopyGpuStream stream(ShaderBackend::DesktopGL33);
+    const GpuBackendFrameStats stats = glBackend.SubmitAndPresent(tree, stream, 200u, 120u);
+    AERO_P15_CHECK(stats.succeeded, "OpenGlDeviceBackend::SubmitAndPresent succeeded on BackdropBlur scene");
+    AERO_P15_CHECK(spy.readPixelsCalls >= 1u &&
+                       (spy.texImage2DCalls + spy.texSubImage2DCalls) >= 1u &&
+                       spy.drawElementsCalls >= 3u,
+                   "OpenGlDeviceBackend captures backdrop via glReadPixels, uploads blurred patch, and draws foreground");
+    // GL_ONE = 1 (premul UberShader output), GL_ONE_MINUS_SRC_ALPHA = 0x0303 (P2-2 Normal blend mode restored)
+    AERO_P15_CHECK(spy.lastBlendSrcRgb == 1u && spy.lastBlendDstRgb == 0x0303u,
+                   "OpenGlDeviceBackend restores BlendingMode::Normal at end of frame");
+    glBackend.Shutdown();
+    gBlurGlSpy = nullptr;
+
+    if (gFailureCount == startFails) {
+        std::printf("[PASS] TestBackdropBlurForegroundAndGlInterleavedExecution\n");
+    }
+}
+
+// ============================================================================
+// 7. Regression: <Path> GradientBrush In-Place Update & WebGL2/WGSL UberShader
+// ============================================================================
+void TestVectorPathGradientInPlaceUpdateAndShaders() {
+    const int startFails = gFailureCount;
+
+    const std::string_view webgl2Ps = ZeroCopyGpuStream::UberPixelShaderSource(ShaderBackend::WebGL2);
+    const std::string_view wgslPs = ZeroCopyGpuStream::UberPixelShaderSource(ShaderBackend::WebGPU_WGSL);
+    const std::size_t webgl2Prim4 = webgl2Ps.find("v_PrimType == 4u");
+    const std::size_t webgl2Prim5 = webgl2Ps.find("v_PrimType == 5u");
+    AERO_P15_CHECK(
+        webgl2Prim4 != std::string_view::npos && webgl2Prim5 != std::string_view::npos &&
+            webgl2Ps.substr(webgl2Prim4, webgl2Prim5 - webgl2Prim4).find("sampleAtlasGradientBrush") !=
+                std::string_view::npos,
+        "WebGL2 UberShader MsdfVectorPath (PrimType == 4) samples sampleAtlasGradientBrush");
+
+    const std::size_t wgslPrim4 = wgslPs.find("in.primType == 4u");
+    const std::size_t wgslPrim5 = wgslPs.find("in.primType == 5u");
+    AERO_P15_CHECK(
+        wgslPrim4 != std::string_view::npos && wgslPrim5 != std::string_view::npos &&
+            wgslPs.substr(wgslPrim4, wgslPrim5 - wgslPrim4).find("sampleAtlasGradientBrush") !=
+                std::string_view::npos,
+        "WebGPU WGSL UberShader MsdfVectorPath (primType == 4) samples sampleAtlasGradientBrush");
+
+    AeroCompiler compiler;
+    AeroCompileInput xamlIn{};
+    xamlIn.xamlPath = "PathGradientUpdateRegression.xaml";
+    xamlIn.xamlContent = R"(
+<Canvas xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Width="160" Height="100">
+    <Path x:Name="GradPath" Canvas.Left="20" Canvas.Top="15" Width="120" Height="70"
+          Stretch="Fill" Data="M 0,0 L 100,0 L 100,60 L 0,60 Z" StrokeThickness="4">
+        <Path.Fill>
+            <LinearGradientBrush StartPoint="0,0" EndPoint="1,0">
+                <GradientStop Offset="0" Color="#FFFF1010"/>
+                <GradientStop Offset="1" Color="#FF1060FF"/>
+            </LinearGradientBrush>
+        </Path.Fill>
+        <Path.Stroke>
+            <SolidColorBrush Color="#FFFFFFFF"/>
+        </Path.Stroke>
+    </Path>
+</Canvas>
+)";
+    const AeroCompileResult res = compiler.Compile(xamlIn);
+    AERO_P15_CHECK(res.succeeded && res.diagnostics.empty(),
+                   "Path with LinearGradientBrush Fill and Stroke compiles cleanly");
+
+    auto root = CreateElementByTypeName(res.axbPackage.rootTypeName);
+    AERO_P15_CHECK(MountAxbTemplate(root.Get(), res.axbPackage), "Mounted PathGradientUpdateRegression");
+    UIElement* gradPath = root->FindName("GradPath");
+    AERO_P15_CHECK(gradPath != nullptr, "Located GradPath");
+
+    root->Measure(Size{160.0f, 100.0f});
+    root->Arrange(Rect{0.0f, 0.0f, 160.0f, 100.0f});
+
+    PagedRenderTree tree;
+    (void)tree.BuildFromVisualTree(root.Get());
+    AERO_P15_CHECK(gradPath->RenderNodeSpan() == 2u,
+                   "GradPath allocates separate fill + stroke MTSDF nodes");
+
+    const RenderNodeDescriptor* beforeFill = tree.GetNode(gradPath->RenderNodeId());
+    AERO_P15_CHECK(beforeFill != nullptr && beforeFill->gradientBrushId != 0u &&
+                       static_cast<std::uint32_t>(beforeFill->encodedPrimExtra >> 4u) ==
+                           beforeFill->gradientBrushId,
+                   "Initial build encodes gradientBrushId on MsdfVectorPath fill node");
+
+    gradPath->SetOpacity(0.85f);
+    AERO_P15_CHECK(tree.UpdateDirtyElement(gradPath),
+                   "PagedRenderTree::UpdateDirtyElement succeeds in-place for gradient Path");
+
+    const RenderNodeDescriptor* afterFill = tree.GetNode(gradPath->RenderNodeId());
+    AERO_P15_CHECK(afterFill != nullptr && afterFill->gradientBrushId != 0u &&
+                       static_cast<std::uint32_t>(afterFill->encodedPrimExtra >> 4u) ==
+                           afterFill->gradientBrushId,
+                   "UpdateDirtyElement preserves gradientBrushId & encodedPrimExtra on MsdfVectorPath");
+
+    std::vector<std::uint8_t> rgba;
+    ZeroCopyGpuStream::RasterizeTreeToRgba8(tree, 160u, 100u, rgba, Color{0.0f, 0.0f, 0.0f, 1.0f});
+    const RgbaSample leftSample = SamplePixel(rgba, 160u, 35u, 50u);
+    const RgbaSample rightSample = SamplePixel(rgba, 160u, 125u, 50u);
+    AERO_P15_CHECK(leftSample.r > 160u && leftSample.r > leftSample.b + 80 &&
+                       rightSample.b > 160u && rightSample.b > rightSample.r + 80,
+                   "Rasterized gradient Path retains red->blue ramp after UpdateDirtyElement");
+
+    if (gFailureCount == startFails) {
+        std::printf("[PASS] TestVectorPathGradientInPlaceUpdateAndShaders\n");
+    }
+}
+
+// ============================================================================
+// 8. Regression: BoxShadow Untinted Guard, Container DropShadow Z-Order & Mirror
+//                Offset, ImageBrush Stretch Encoding, and LayoutScaler RefResolution
+// ============================================================================
+void TestBoxShadowContainerDropShadowAndImageBrushStretch() {
+    const int startFails = gFailureCount;
+
+    // 1. BoxShadow without Color must stay UIEffectKind::None (never UIEffectKind::Blur)
+    auto untintedBoxShadow = MakeIntrusive<BoxShadow>();
+    untintedBoxShadow->SetValue(PropId_EffectBlurRadius, value::FromFloat(14.0f));
+    AERO_P15_CHECK(untintedBoxShadow->GetEffectKind() == UIEffectKind::None,
+                   "BoxShadow with BlurRadius but no Color stays UIEffectKind::None instead of blurring children");
+
+    // 2. Style TargetType=BoxShadow maps Color -> PropId_EffectColor; unrelated Style does NOT
+    AeroCompiler compiler;
+    AeroCompileInput styleIn{};
+    styleIn.xamlPath = "BoxShadowAndImageBrush.xaml";
+    styleIn.xamlContent = R"(
+<Canvas xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:noesis="clr-namespace:NoesisGUIExtensions"
+        Width="240" Height="140">
+    <Canvas.Resources>
+        <Style x:Key="ShadowStyle" TargetType="{x:Type noesis:BoxShadow}">
+            <Setter Property="Color" Value="#80000000"/>
+        </Style>
+        <Style x:Key="TbStyle" TargetType="{x:Type TextBlock}">
+            <Setter Property="Color" Value="#FFFF0000"/>
+        </Style>
+        <ImageBrush x:Key="FillBrush" ImageSource="Flag-en.png" Stretch="Fill"/>
+        <ImageBrush x:Key="UniformBrush" ImageSource="Flag-en.png" Stretch="Uniform"/>
+    </Canvas.Resources>
+
+    <Grid x:Name="MirroredShadowGroup" Canvas.Left="80" Canvas.Top="30" Width="60" Height="60">
+        <Grid.Effect>
+            <DropShadowEffect Direction="0" ShadowDepth="18" BlurRadius="6" Color="#FF000000" Opacity="0.9"/>
+        </Grid.Effect>
+        <Border x:Name="ChildA" Width="60" Height="60" Background="#FF2090FF"
+                RenderTransformOrigin="0.5,0.5">
+            <Border.RenderTransform>
+                <ScaleTransform ScaleX="-1" ScaleY="1"/>
+            </Border.RenderTransform>
+        </Border>
+        <Border x:Name="ChildB" Width="30" Height="30" HorizontalAlignment="Left" VerticalAlignment="Top"
+                Background="#FFFFD020"/>
+    </Grid>
+</Canvas>
+)";
+    const AeroCompileResult styleRes = compiler.Compile(styleIn);
+    AERO_P15_CHECK(styleRes.succeeded, "BoxShadow style, ImageBrush Stretch, and mirrored DropShadow XAML compiled");
+
+    bool foundShadowColorSetter = false;
+    bool leakedGlobalEffectColorSetter = false;
+    for (const auto& st : styleRes.axbPackage.styles) {
+        for (const auto& setter : st.setters) {
+            if (st.targetTypeName == "BoxShadow" && setter.propId == PropId_EffectColor) {
+                foundShadowColorSetter = true;
+            }
+            if (st.targetTypeName == "TextBlock" && setter.propId == PropId_EffectColor) {
+                leakedGlobalEffectColorSetter = true;
+            }
+        }
+    }
+    AERO_P15_CHECK(foundShadowColorSetter && !leakedGlobalEffectColorSetter,
+                   "Color maps to PropId_EffectColor on BoxShadow Style without polluting global ResolveBuiltinPropertyId");
+
+    // 3. Verify ImageBrush Stretch encoding ("Flag-en.png" for Fill vs "AERO_IMGBRUSH:2:Flag-en.png" for Uniform)
+    const UnifiedValue* fillRes = nullptr;
+    const UnifiedValue* uniformRes = nullptr;
+    for (const auto& r : styleRes.axbPackage.resources) {
+        if (r.first == "FillBrush") fillRes = &r.second;
+        if (r.first == "UniformBrush") uniformRes = &r.second;
+    }
+    AERO_P15_CHECK(fillRes != nullptr && std::holds_alternative<StringValue>(*fillRes) &&
+                       std::get<StringValue>(*fillRes).view() == "Flag-en.png",
+                   "Default Stretch='Fill' ImageBrush stays unprefixed for resource compatibility");
+    AERO_P15_CHECK(uniformRes != nullptr && std::holds_alternative<StringValue>(*uniformRes) &&
+                       std::get<StringValue>(*uniformRes).view() == "AERO_IMGBRUSH:2:Flag-en.png",
+                   "Stretch='Uniform' ImageBrush encodes AERO_IMGBRUSH:2:<uri>");
+
+    auto img = MakeIntrusive<Image>();
+    img->SetSource("AERO_IMGBRUSH:2:Flag-en.png");
+    AERO_P15_CHECK(img->GetSource() == "Flag-en.png",
+                   "Image::GetSource strips AERO_IMGBRUSH:<stretch>: prefix");
+
+    // 4. Verify container DropShadowEffect pre-pass Z-order and world-space +X offset under ScaleX=-1
+    auto root = CreateElementByTypeName(styleRes.axbPackage.rootTypeName);
+    AERO_P15_CHECK(MountAxbTemplate(root.Get(), styleRes.axbPackage), "Mounted MirroredShadowGroup scene");
+    root->Measure(Size{240.0f, 140.0f});
+    root->Arrange(Rect{0.0f, 0.0f, 240.0f, 140.0f});
+
+    PagedRenderTree tree;
+    (void)tree.BuildFromVisualTree(root.Get());
+
+    std::vector<std::uint8_t> rgba;
+    ZeroCopyGpuStream::RasterizeTreeToRgba8(tree, 240u, 140u, rgba, Color{0.94f, 0.95f, 0.97f, 1.0f});
+    const RgbaSample bgPx = SamplePixel(rgba, 240u, 5u, 5u);
+    const RgbaSample rightWorldShadow = SamplePixel(rgba, 240u, 150u, 60u); // +X world side of x=80..140
+    const RgbaSample leftUnmirroredBg = SamplePixel(rgba, 240u, 70u, 60u);  // -X world side must stay clear
+    const RgbaSample childABlueSurface = SamplePixel(rgba, 240u, 95u, 75u); // inside ChildA, below ChildB: must NOT be darkened by ChildB's shadow!
+
+    AERO_P15_CHECK(rightWorldShadow.r < bgPx.r - 80 && leftUnmirroredBg.r >= bgPx.r - 4,
+                   "Container DropShadowEffect(Direction=0) casts shadow toward +X in world space despite ScaleX=-1");
+    AERO_P15_CHECK(childABlueSurface.b > 235u && childABlueSurface.g > 130u,
+                   "Two-pass container DropShadowEffect emits all child shadows behind ChildA foreground");
+
+    // 5. Verify LayoutScaler::GetRefResolution & scaled ArrangeCore
+    auto scaler = MakeIntrusive<LayoutScaler>();
+    scaler->SetRefResolution(Size{1920.0f, 1080.0f});
+    AERO_P15_CHECK(std::fabs(scaler->GetRefResolution().width - 1920.0f) < 0.01f &&
+                       std::fabs(scaler->GetRefResolution().height - 1080.0f) < 0.01f,
+                   "LayoutScaler::GetRefResolution reads PropId_RefResolution accurately");
+    auto scalerChild = MakeIntrusive<Border>();
+    scaler->AddChild(scalerChild.Get());
+    scaler->Measure(Size{960.0f, 540.0f});
+    scaler->Arrange(Rect{0.0f, 0.0f, 960.0f, 540.0f});
+    AERO_P15_CHECK(std::fabs(scaler->ChildScaleX() - 0.5f) < 0.01f &&
+                       std::fabs(scaler->ChildScaleY() - 0.5f) < 0.01f &&
+                       std::fabs(scalerChild->FinalRect().width - 1920.0f) < 0.1f,
+                   "LayoutScaler scales 1920x1080 RefResolution child by 0.5x into 960x540 viewport");
+
+    if (gFailureCount == startFails) {
+        std::printf("[PASS] TestBoxShadowContainerDropShadowAndImageBrushStretch\n");
+    }
+}
+
 } // namespace
 
 int main() {
@@ -580,6 +1240,11 @@ int main() {
     TestRealRiveV7BinaryImportersAndRiveControl();
     TestTrue3DPerspectiveTransformAndHitTest();
     TestDropShadowAndBlurEffectsRasterization();
+    TestTemplatedLabelLayoutAndLiteralContent();
+    TestRichTextGlyphStyleAlignmentAndReactiveBind();
+    TestBackdropBlurForegroundAndGlInterleavedExecution();
+    TestVectorPathGradientInPlaceUpdateAndShaders();
+    TestBoxShadowContainerDropShadowAndImageBrushStretch();
 
     if (gFailureCount != 0) {
         std::fprintf(stderr, "=== P1-5 TESTS FAILED (%d failures) ===\n", gFailureCount);

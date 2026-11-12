@@ -499,22 +499,22 @@ int main(int argc, char** argv) {
     //             -> ZeroCopyGpuStream::RasterizeTreeToRgba8(320x180)
     // ------------------------------------------------------------------------
     static constexpr GoldenSceneCase kGoldenScenes[] = {
-        {"HelloWorld",       "HelloWorld/Data/MainPage.xaml",         nullptr,                                1.2f, 0x3422245a225e0984ULL, 50000u, 300u},
-        {"Login",            "Login/Data/MainPage.xaml",              "Login/Data/Resources.xaml",            1.0f, 0x196a5d7ab1036412ULL, 50000u, 600u},
-        {"Buttons",          "Buttons/Data/MainPage.xaml",            "Buttons/Data/Resources.xaml",          1.0f, 0xdec7ee98a01f875bULL, 50000u, 600u},
-        {"QuestLog",         "QuestLog/Data/MainPage.xaml",           "QuestLog/Data/Resources.xaml",         1.0f, 0x5ae8f767d6ecdc3fULL, 20000u, 600u},
-        {"Inventory",        "Inventory/Data/MainPage.xaml",          "Inventory/Data/Resources.xaml",        3.2f, 0x677fa6b917c91341ULL, 40000u, 300u},
-        {"Scoreboard",       "Scoreboard/Data/MainPage.xaml",         nullptr,                                1.0f, 0xeb6ec3ac036ee02cULL, 50000u, 600u},
-        {"TicTacToe",        "TicTacToe/Data/MainPage.xaml",          "TicTacToe/Data/Resources.xaml",        1.0f, 0xb0c11338899af61eULL, 50000u, 1000u},
-        {"Localization",     "Localization/Data/MainPage.xaml",       "Localization/Data/Language-en.xaml",   1.0f, 0xa8910ee269be3e72ULL, 50000u, 800u},
-        {"Gallery",          "Gallery/Data/MainWindow.xaml",          "Gallery/Data/Resources.xaml",          1.0f, 0x59dbf91e923281d3ULL, 50000u, 600u},
-        {"Brushes",          "Gallery/Data/Samples/Brushes.xaml",     "Gallery/Data/Resources.xaml",          1.0f, 0x74e53e72579708e7ULL,  5000u, 600u},
-        {"Gallery_Blending", "Gallery/Data/Samples/Blending.xaml",    "Gallery/Data/Resources.xaml",          1.0f, 0x87d878f3cf0570c5ULL,  7000u, 500u},
-        {"Rive",             "Rive/Data/MainPage.xaml",               nullptr,                                1.0f, 0xa6e4fad4dcdc9ac2ULL, 50000u, 3000u},
-        {"Effects",          "Gallery/Data/Samples/Effects.xaml",     "Gallery/Data/Resources.xaml",          1.0f, 0x06bc32d3bf2cc0c9ULL,  8000u, 2000u},
-        {"BackgroundBlur",   "BackgroundBlur/Data/MainPage.xaml",     "BackgroundBlur/Data/Resources.xaml",   1.0f, 0x69c6a59c4451f65dULL, 40000u, 800u},
-        {"BrushShaders",     "BrushShaders/Data/MainPage.xaml",       nullptr,                                1.0f, 0x4538f05c4e2e2fd0ULL, 50000u, 300u},
-        {"UserControl",      "UserControl/Data/MainPage.xaml",        "UserControl/Data/Resources.xaml",      1.0f, 0x15e59a6fe76b2a47ULL, 50000u, 800u},
+        {"HelloWorld",       "HelloWorld/Data/MainPage.xaml",         nullptr,                                1.2f, 0x7863b040a6dc4444ULL, 50000u, 300u},
+        {"Login",            "Login/Data/MainPage.xaml",              "Login/Data/Resources.xaml",            1.0f, 0xe52312950e1871afULL, 50000u, 600u},
+        {"Buttons",          "Buttons/Data/MainPage.xaml",            "Buttons/Data/Resources.xaml",          1.0f, 0x1dc81e85638e4134ULL, 50000u, 600u},
+        {"QuestLog",         "QuestLog/Data/MainPage.xaml",           "QuestLog/Data/Resources.xaml",         1.0f, 0x57a28126d5c058efULL, 20000u, 600u},
+        {"Inventory",        "Inventory/Data/MainPage.xaml",          "Inventory/Data/Resources.xaml",        3.2f, 0xba7af8d631f7197eULL, 40000u, 300u},
+        {"Scoreboard",       "Scoreboard/Data/MainPage.xaml",         nullptr,                                1.0f, 0x063ca2044a4f5443ULL, 50000u, 600u},
+        {"TicTacToe",        "TicTacToe/Data/MainPage.xaml",          "TicTacToe/Data/Resources.xaml",        1.0f, 0xdf6758fc356ab321ULL, 50000u, 1000u},
+        {"Localization",     "Localization/Data/MainPage.xaml",       "Localization/Data/Language-en.xaml",   1.0f, 0xa3d3d035b759cae9ULL, 50000u, 800u},
+        {"Gallery",          "Gallery/Data/MainWindow.xaml",          "Gallery/Data/Resources.xaml",          1.0f, 0x2161a2275cd34a67ULL, 50000u, 600u},
+        {"Brushes",          "Gallery/Data/Samples/Brushes.xaml",     "Gallery/Data/Resources.xaml",          1.0f, 0xda9ff0aaf2c54343ULL,  5000u, 600u},
+        {"Gallery_Blending", "Gallery/Data/Samples/Blending.xaml",    "Gallery/Data/Resources.xaml",          1.0f, 0xef9800ddaa2f77e3ULL,  7000u, 500u},
+        {"Rive",             "Rive/Data/MainPage.xaml",               nullptr,                                1.0f, 0xb5434a846c223365ULL, 50000u, 3000u},
+        {"Effects",          "Gallery/Data/Samples/Effects.xaml",     "Gallery/Data/Resources.xaml",          1.0f, 0x1433ba1eb55d06e9ULL,  8000u, 2000u},
+        {"BackgroundBlur",   "BackgroundBlur/Data/MainPage.xaml",     "BackgroundBlur/Data/Resources.xaml",   1.0f, 0x637465c308a7b16cULL, 40000u, 800u},
+        {"BrushShaders",     "BrushShaders/Data/MainPage.xaml",       nullptr,                                1.0f, 0x9ca3061feedf5fd5ULL, 50000u, 300u},
+        {"UserControl",      "UserControl/Data/MainPage.xaml",        "UserControl/Data/Resources.xaml",      1.0f, 0x261e72f064aeb55cULL, 50000u, 800u},
     };
 
     constexpr std::uint32_t kLayoutW = 1280u;

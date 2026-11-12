@@ -1,0 +1,5 @@
+<Project>
+  <Assembly>CustomControl</Assembly>
+  <DefaultDataNamespace>CustomControl</DefaultDataNamespace>
+  <StartupDocument>MainPage.xaml</StartupDocument>
+</Project>

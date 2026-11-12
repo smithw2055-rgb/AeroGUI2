@@ -1,0 +1,11 @@
+<vdctx:ButtonsViewModel xmlns:vdctx="clr-namespace:Buttons">
+  <vdctx:ButtonsViewModel.SettingsCommand>
+    <MessageCommand Message="Change Settings" IsEnabled="True"/>
+  </vdctx:ButtonsViewModel.SettingsCommand>
+  <vdctx:ButtonsViewModel.StartCommand>
+    <MessageCommand Message="Start Game" IsEnabled="True"/>
+  </vdctx:ButtonsViewModel.StartCommand>
+  <vdctx:ButtonsViewModel.ExitCommand>
+    <MessageCommand Message="Exit Game" IsEnabled="True"/>
+  </vdctx:ButtonsViewModel.ExitCommand>
+</vdctx:ButtonsViewModel>

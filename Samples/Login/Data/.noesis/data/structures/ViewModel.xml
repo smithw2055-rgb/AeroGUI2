@@ -1,0 +1,6 @@
+<Class Name="ViewModel">
+  <Property Name="AccountName" Type="String" StringMinWordCount="1" StringMaxWordCount="1"/>
+  <Property Name="Message" Type="String" StringMinWordCount="2" StringMaxWordCount="6"/>
+  <Property Name="LoginCommand" Type="Command"/>
+  <Property Name="LoginSuccessful" Type="Boolean"/>
+</Class>

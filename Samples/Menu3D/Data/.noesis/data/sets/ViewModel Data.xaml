@@ -1,0 +1,9 @@
+<vdctx:ViewModel
+  xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+  xmlns:noesis="clr-namespace:NoesisGUIExtensions"
+  xmlns:vdctx="clr-namespace:Menu3D"
+  MainMenu="{noesis:DataSet MainMenu Data}"
+  StartMenu="{noesis:DataSet StartMenu Data}"
+  SettingsMenu="{noesis:DataSet SettingsMenu Data}"
+  Platform="PC">
+</vdctx:ViewModel>

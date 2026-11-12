@@ -45,6 +45,7 @@ using Float4Value = rs_rt::Float4Value;
 using FloatValue = rs_rt::FloatValue;
 using StringValue = rs_rt::StringValue;
 using StructValue = rs_rt::StructValue;
+using EnumValue = rs_rt::EnumValue;
 using NullObject = rs_rt::NullObject;
 using NullString = rs_rt::NullString;
 using NullArray = rs_rt::NullArray;

@@ -639,6 +639,11 @@ struct CornerRadius {
     if (v.tryGetFloat(out)) {
         return true;
     }
+    double d = 0.0;
+    if (v.tryGetDouble(d)) {
+        out = static_cast<float>(d);
+        return true;
+    }
     std::int64_t i = 0;
     if (v.tryGetInt64(i)) {
         out = static_cast<float>(i);

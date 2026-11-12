@@ -1,0 +1,8 @@
+<Class Name="Player" Namespace="Inventory">
+  <Property Name="Name" Type="String" StringMinWordCount="1" StringMaxWordCount="2"/>
+  <Property Name="Life" Type="Number" NumberMinValue="0" NumberMaxValue="100" NumberDecimalCount="0"/>
+  <Property Name="Mana" Type="Number" NumberMinValue="0" NumberMaxValue="100" NumberDecimalCount="0"/>
+  <Property Name="Dps" Type="Number" NumberMinValue="0" NumberMaxValue="100" NumberDecimalCount="0"/>
+  <Property Name="Armor" Type="Number" NumberMinValue="0" NumberMaxValue="100" NumberDecimalCount="0"/>
+  <Property Name="Slots" Type="Collection" SubType="Inventory.Item" CollectionMinItemCount="8" CollectionMaxItemCount="8"/>
+</Class>

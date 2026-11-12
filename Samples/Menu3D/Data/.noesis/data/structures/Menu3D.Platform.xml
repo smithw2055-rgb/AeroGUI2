@@ -1,0 +1,5 @@
+<Enum Name="Platform" Namespace="Menu3D">
+  <Item Name="PC" Value="0"/>
+  <Item Name="PS4" Value="1"/>
+  <Item Name="XBOX" Value="2"/>
+</Enum>

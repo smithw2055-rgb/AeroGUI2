@@ -1,0 +1,4 @@
+<Class Name="Language" Namespace="Localization">
+  <Property Name="Name" Type="String" StringMinWordCount="1" StringMaxWordCount="1"/>
+  <Property Name="Source" Type="Uri" UriAssetType="ResourceDictionary"/>
+</Class>

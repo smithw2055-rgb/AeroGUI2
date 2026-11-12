@@ -1,0 +1,5 @@
+<Class Name="MenuDescription" Namespace="Menu3D">
+  <Property Name="Description" Type="String" StringMinWordCount="0" StringMaxWordCount="10"/>
+  <Property Name="AcceptText" Type="String" StringMinWordCount="0" StringMaxWordCount="10"/>
+  <Property Name="CancelText" Type="String" StringMinWordCount="0" StringMaxWordCount="10"/>
+</Class>

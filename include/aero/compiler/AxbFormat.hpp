@@ -189,6 +189,8 @@ struct AxbKeyFrame {
     EasingFunctionKind easingKind = EasingFunctionKind::Linear;
     EasingMode easingMode = EasingMode::EaseOut;
     bool isDiscrete = false;
+    std::string bindingElementName;
+    std::uint16_t bindingPropId = 0xFFFFu;
 };
 
 struct AxbAnimationTimeline {
@@ -214,10 +216,15 @@ struct AxbStoryboard {
     std::vector<AxbAnimationTimeline> timelines;
 };
 
+struct AxbCompiledBindingChain;
+struct AxbCompiledMultiBinding;
+
 struct AxbPropertySetter {
     std::string targetName;
     std::uint16_t propId = 0;
     UnifiedValue value{};
+    bool hasBinding = false;
+    std::shared_ptr<AxbCompiledBindingChain> binding{};
 };
 
 struct AxbCompiledHop {
@@ -232,6 +239,9 @@ struct AxbCompiledHop {
     bool isReadOnly = false;
     bool isSimState = false;
     bool isSimCommand = false;
+    std::int32_t collectionIndex = -1;
+    SymbolId targetTypeId = 0;
+    bool targetIsEnum = false;
 
     [[nodiscard]] PropertySlotHandle ToSlotHandle() const noexcept {
         PropertySlotHandle slot;
@@ -248,8 +258,6 @@ struct AxbCompiledHop {
         return slot;
     }
 };
-
-struct AxbCompiledMultiBinding;
 
 struct AxbCompiledBindingChain {
     std::string rawPath;
@@ -322,6 +330,10 @@ struct AxbInteractionAction {
     std::uint16_t propId = 0;
     std::string propertyName;
     UnifiedValue value{};
+    bool isNullValue = false;
+    bool hasValueBinding = false;
+    std::shared_ptr<AxbCompiledBindingChain> valueBinding{};
+    std::shared_ptr<AxbCompiledMultiBinding> valueMultiBinding{};
     // ControlStoryboardAction
     std::string storyboardKey;
     AxbStoryboard inlineStoryboard{};
@@ -330,6 +342,7 @@ struct AxbInteractionAction {
     std::string commandPath;
     std::vector<AxbCompiledHop> commandHops;
     SymbolId commandMethodSymbolId = 0;
+    bool commandTargetsWrapper = false;
     bool isSimCommand = false;
     bool hasCommandParameter = false;
     UnifiedValue commandParameter{};
@@ -437,6 +450,8 @@ struct AxbEventBindingRecord {
     std::string eventName;
     std::string handlerMethodName;
     SymbolId handlerSymbolId = 0;
+    bool targetIsWrapper = false;
+    std::vector<AxbCompiledHop> prefixHops;
 };
 
 struct AxbInstruction {
@@ -650,6 +665,7 @@ struct AxbStateMachineDesc {
 struct AxbPackage {
     std::string className;
     std::string rootTypeName;
+    std::string rootDataTypeName;
     std::uint32_t rootHandleFieldIndex = PropertySlotHandle::InvalidIndex;
     std::vector<std::string> stringTable;
     std::vector<AxbNamedControlSlot> namedControls;
@@ -822,5 +838,32 @@ struct DecomposedTransform2D {
     float maxWidth = 1000000.0f,
     TextWrapping wrapMode = TextWrapping::NoWrap) noexcept;
 [[nodiscard]] std::size_t CountVisibleUtf8Glyphs(std::string_view utf8Text) noexcept;
+
+// RealScript identifier validation, indexed collection hop helpers & enum metadata helpers
+[[nodiscard]] bool IsValidRealScriptFieldIdentifier(std::string_view name) noexcept;
+[[nodiscard]] bool SplitIndexedMemberName(
+    std::string_view raw,
+    std::string& outBaseMember,
+    std::int32_t& outIndex);
+[[nodiscard]] bool TryResolveEnumMemberByName(
+    const ProgramImage* program,
+    SymbolId enumTypeId,
+    std::string_view rawName,
+    std::int64_t& outValue) noexcept;
+[[nodiscard]] bool TryFormatEnumValueName(
+    const ProgramImage* program,
+    SymbolId enumTypeId,
+    std::int64_t intVal,
+    std::string& outName);
+
+// Optional compiler hook registered by aerogui_compiler so runtime helpers (ContentControl_LoadXaml,
+// live Loc.Source dictionary switching, theme loading) can compile XAML on demand without linking
+// AeroCompiler into slim aerogui_runtime targets.
+using RuntimeXamlCompileHook = bool (*)(
+    std::string_view uriOrPath,
+    const std::vector<std::string>& searchDirs,
+    AxbPackage& outPackage);
+void RegisterRuntimeXamlCompileHook(RuntimeXamlCompileHook hook) noexcept;
+[[nodiscard]] RuntimeXamlCompileHook GetRuntimeXamlCompileHook() noexcept;
 
 } // namespace aero

@@ -12,6 +12,40 @@
 
 namespace aero {
 
+struct AxbPackage;
+class StyleTriggerEngine;
+class AnimationEngine;
+
+// Mount and wire a compiled x:Class MainWindow (or ViewModel fallback) package:
+// 1) Binds mainWinRef via rootControl->BindScriptWrapper(...)
+// 2) Extracts mainWinRef.ViewModel ObjectRef if present/alive (falling back to mainWinRef)
+//    and assigns PropId_DataContext = vmRef
+// 3) Mounts package against vmRef while BoundScriptWrapper() is mainWinRef (populating
+//    __nativeRootHandle & namedControls on mainWinRef), wiring StyleTriggerEngine & DualTrackBindingEngine
+// 4) Invokes zero-arg mainWinRef.OnInitialized() if defined, followed by initial dirty-binding & trigger sync.
+bool MountAndWireMainWindow(
+    UIElement* rootControl,
+    const AxbPackage& package,
+    ExecutionDomainContext& domains,
+    DualTrackBindingEngine& bindingEngine,
+    StyleTriggerEngine& styleEngine,
+    ObjectRef mainWinRef,
+    const Interpreter* uiInterpreter = nullptr,
+    rs_aot::ExecutionContext* aotContext = nullptr,
+    AnimationEngine* animationEngine = nullptr,
+    ObjectRef* outViewModelRef = nullptr);
+
+[[nodiscard]] IntrusivePtr<UIElement> MountAndWireMainWindow(
+    const AxbPackage& package,
+    ExecutionDomainContext& domains,
+    DualTrackBindingEngine& bindingEngine,
+    StyleTriggerEngine& styleEngine,
+    ObjectRef mainWinRef,
+    const Interpreter* uiInterpreter = nullptr,
+    rs_aot::ExecutionContext* aotContext = nullptr,
+    AnimationEngine* animationEngine = nullptr,
+    ObjectRef* outViewModelRef = nullptr);
+
 struct ReactivePropertyBinding {
     ObjectRef sourceObject{};
     PropertySlotHandle sourceSlot{};
@@ -33,7 +67,7 @@ public:
 
     explicit ScriptUiBridge(DualTrackBindingEngine& externalEngine) noexcept;
 
-    ~ScriptUiBridge() noexcept = default;
+    ~ScriptUiBridge() noexcept;
 
     ScriptUiBridge(const ScriptUiBridge&) = delete;
     ScriptUiBridge& operator=(const ScriptUiBridge&) = delete;
@@ -97,6 +131,7 @@ private:
     ExecutionDomainContext& domains_;
     std::unique_ptr<DualTrackBindingEngine> ownedEngine_;
     DualTrackBindingEngine* engine_ = nullptr;
+    std::shared_ptr<DualTrackBindingEngine*> sharedEngineSlot_;
 };
 
 } // namespace aero

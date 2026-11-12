@@ -1,0 +1,10 @@
+<Class Name="Player">
+  <Property Name="Team" Type="Enum" SubType="Scoreboard.Team"/>
+  <Property Name="Class" Type="Enum" SubType="Scoreboard.Class"/>
+  <Property Name="Name" Type="String" StringMinWordCount="1" StringMaxWordCount="2"/>
+  <Property Name="Score" Type="Number" NumberMinValue="0" NumberMaxValue="999" NumberDecimalCount="0"/>
+  <Property Name="Kills" Type="Number" NumberMinValue="0" NumberMaxValue="99" NumberDecimalCount="0"/>
+  <Property Name="Deaths" Type="Number" NumberMinValue="0" NumberMaxValue="99" NumberDecimalCount="0"/>
+  <Property Name="Damage" Type="Number" NumberMinValue="0" NumberMaxValue="9999" NumberDecimalCount="0"/>
+  <Property Name="Heal" Type="Number" NumberMinValue="0" NumberMaxValue="999" NumberDecimalCount="0"/>
+</Class>

@@ -25,6 +25,45 @@ namespace {
     return raw;
 }
 
+[[nodiscard]] bool MatchesXamlAncestorType(
+    const UIElement* anc,
+    std::string_view wantedType) noexcept {
+    if (!anc || wantedType.empty()) {
+        return false;
+    }
+    for (const TypeClass* tc = anc->GetTypeClass(); tc != nullptr; tc = tc->baseClass) {
+        if (tc->typeName && ShortTypeNameView(tc->typeName) == wantedType) {
+            return true;
+        }
+    }
+    if (wantedType == "ToggleButton") {
+        return anc->IsA<CheckBox>() || anc->IsA<RadioButton>();
+    }
+    if (wantedType == "Page") {
+        return anc->IsA<UserControl>() || anc->IsA<Window>();
+    }
+    if (wantedType == "ContentControl" ||
+        wantedType == "ListBoxItem" ||
+        wantedType == "ComboBoxItem" ||
+        wantedType == "ListViewItem" ||
+        wantedType == "TreeViewItem") {
+        return anc->IsA<Border>() || anc->IsA<ContentPresenter>() || anc->IsA<UserControl>();
+    }
+    if (wantedType == "RepeatButton" || wantedType == "Hyperlink" || wantedType == "MenuItem") {
+        return anc->IsA<Button>();
+    }
+    if (wantedType == "ListView") {
+        return anc->IsA<ListBox>();
+    }
+    if (wantedType == "TreeView") {
+        return anc->IsA<ItemsControl>();
+    }
+    if (wantedType == "FrameworkElement" || wantedType == "Control") {
+        return true;
+    }
+    return false;
+}
+
 [[nodiscard]] bool EqualsAsciiIgnoreCase(std::string_view a, std::string_view b) noexcept {
     if (a.size() != b.size()) return false;
     for (std::size_t i = 0u; i < a.size(); ++i) {
@@ -49,14 +88,30 @@ namespace {
     return true;
 }
 
+[[nodiscard]] bool TryExtractIntOrEnum(const UnifiedValue& v, std::int64_t& outInt) noexcept {
+    if (const auto* iv = std::get_if<std::int64_t>(&v)) {
+        outInt = *iv;
+        return true;
+    }
+    EnumValue ev{};
+    if (v.tryGetEnum(ev)) {
+        outInt = ev.value;
+        return true;
+    }
+    return false;
+}
+
 [[nodiscard]] bool UnifiedValuesEqual(const UnifiedValue& a, const UnifiedValue& b) noexcept {
     if (const auto* ab = std::get_if<bool>(&a)) {
         if (const auto* bb = std::get_if<bool>(&b)) return *ab == *bb;
-        if (const auto* bi = std::get_if<std::int64_t>(&b)) return *ab == (*bi != 0);
+        std::int64_t bi = 0;
+        if (TryExtractIntOrEnum(b, bi)) return *ab == (bi != 0);
     }
-    if (const auto* ai = std::get_if<std::int64_t>(&a)) {
-        if (const auto* bi = std::get_if<std::int64_t>(&b)) return *ai == *bi;
-        if (const auto* bb = std::get_if<bool>(&b)) return (*ai != 0) == *bb;
+    std::int64_t ai = 0;
+    if (TryExtractIntOrEnum(a, ai)) {
+        std::int64_t bi = 0;
+        if (TryExtractIntOrEnum(b, bi)) return ai == bi;
+        if (const auto* bb = std::get_if<bool>(&b)) return (ai != 0) == *bb;
     }
     float af = 0.0f;
     float bf = 0.0f;
@@ -79,20 +134,22 @@ namespace {
 
 [[nodiscard]] bool TriggerValuesEqual(
     const UnifiedValue& actualVal,
-    const AxbTriggerCondition& cond,
-    const ExecutionDomainContext* domains) noexcept {
+    const UnifiedValue& expectedVal,
+    bool expectNull,
+    const ExecutionDomainContext* domains,
+    const ProgramImage* program = nullptr) noexcept {
     const bool actualIsNull =
         std::holds_alternative<std::monostate>(actualVal) ||
         std::holds_alternative<NullObject>(actualVal) ||
         (std::holds_alternative<ObjectRef>(actualVal) && !std::get<ObjectRef>(actualVal).valid());
 
-    if (cond.expectNull) {
+    if (expectNull) {
         return actualIsNull;
     }
     if (actualIsNull) {
         return false;
     }
-    if (UnifiedValuesEqual(actualVal, cond.expectedValue)) {
+    if (UnifiedValuesEqual(actualVal, expectedVal)) {
         return true;
     }
 
@@ -100,7 +157,7 @@ namespace {
     if (const auto* objRef = std::get_if<ObjectRef>(&actualVal)) {
         if (objRef->kind == ObjectKind::String && domains) {
             if (const auto actualSv = domains->stringViewAcrossDomains(*objRef)) {
-                if (const auto* expSv = std::get_if<StringValue>(&cond.expectedValue)) {
+                if (const auto* expSv = std::get_if<StringValue>(&expectedVal)) {
                     return *actualSv == expSv->view();
                 }
             }
@@ -109,22 +166,30 @@ namespace {
     }
 
     // Untyped XAML string literal comparison against bool, int64_t, float, or enum
-    if (const auto* expStr = std::get_if<StringValue>(&cond.expectedValue)) {
+    if (const auto* expStr = std::get_if<StringValue>(&expectedVal)) {
         const std::string_view sv = expStr->view();
         if (const auto* ab = std::get_if<bool>(&actualVal)) {
             if (EqualsAsciiIgnoreCase(sv, "true") || sv == "1") return *ab;
             if (EqualsAsciiIgnoreCase(sv, "false") || sv == "0") return !(*ab);
             return false;
         }
-        if (const auto* ai = std::get_if<std::int64_t>(&actualVal)) {
+        std::int64_t ai = 0;
+        if (TryExtractIntOrEnum(actualVal, ai)) {
             std::int64_t parsedInt = 0;
             const auto [ptr, ec] = std::from_chars(sv.data(), sv.data() + sv.size(), parsedInt);
             if (ec == std::errc{} && ptr == sv.data() + sv.size()) {
-                return *ai == parsedInt;
+                return ai == parsedInt;
             }
-            if (EqualsAsciiIgnoreCase(sv, "Visible")) return *ai == 0;
-            if (EqualsAsciiIgnoreCase(sv, "Hidden")) return *ai == 1;
-            if (EqualsAsciiIgnoreCase(sv, "Collapsed")) return *ai == 2;
+            if (EqualsAsciiIgnoreCase(sv, "Visible")) return ai == 0;
+            if (EqualsAsciiIgnoreCase(sv, "Hidden")) return ai == 1;
+            if (EqualsAsciiIgnoreCase(sv, "Collapsed")) return ai == 2;
+            EnumValue ev{};
+            if (actualVal.tryGetEnum(ev) && ev.typeId != 0 && program) {
+                std::int64_t enumInt = 0;
+                if (TryResolveEnumMemberByName(program, ev.typeId, sv, enumInt)) {
+                    return ai == enumInt;
+                }
+            }
         }
         float af = 0.0f;
         float parsedFloat = 0.0f;
@@ -142,6 +207,11 @@ namespace {
     float& outVal) noexcept {
     if (std::holds_alternative<bool>(v)) {
         outVal = std::get<bool>(v) ? 1.0f : 0.0f;
+        return true;
+    }
+    EnumValue ev{};
+    if (v.tryGetEnum(ev)) {
+        outVal = static_cast<float>(ev.value);
         return true;
     }
     if (TryGetFloat(v, outVal)) {
@@ -183,13 +253,16 @@ namespace {
 // GreaterThan, and GreaterThanOrEqual across typed scalars, enums, and strings!
 [[nodiscard]] bool TriggerConditionValueMatches(
     const UnifiedValue& actualVal,
-    const AxbTriggerCondition& cond,
-    const ExecutionDomainContext* domains) noexcept {
-    const bool isEq = TriggerValuesEqual(actualVal, cond, domains);
-    if (cond.comparison == TriggerComparisonOp::Equal) {
+    const UnifiedValue& expectedVal,
+    bool expectNull,
+    TriggerComparisonOp comparison,
+    const ExecutionDomainContext* domains,
+    const ProgramImage* program = nullptr) noexcept {
+    const bool isEq = TriggerValuesEqual(actualVal, expectedVal, expectNull, domains, program);
+    if (comparison == TriggerComparisonOp::Equal) {
         return isEq;
     }
-    if (cond.comparison == TriggerComparisonOp::NotEqual) {
+    if (comparison == TriggerComparisonOp::NotEqual) {
         return !isEq;
     }
 
@@ -197,15 +270,15 @@ namespace {
         std::holds_alternative<std::monostate>(actualVal) ||
         std::holds_alternative<NullObject>(actualVal) ||
         (std::holds_alternative<ObjectRef>(actualVal) && !std::get<ObjectRef>(actualVal).valid());
-    if (actualIsNull || cond.expectNull) {
+    if (actualIsNull || expectNull) {
         return false;
     }
 
     float lhsF = 0.0f;
     float rhsF = 0.0f;
     if (TryExtractComparableFloat(actualVal, domains, lhsF) &&
-        TryExtractComparableFloat(cond.expectedValue, domains, rhsF)) {
-        switch (cond.comparison) {
+        TryExtractComparableFloat(expectedVal, domains, rhsF)) {
+        switch (comparison) {
             case TriggerComparisonOp::LessThan:
                 return lhsF < rhsF - 1e-6f;
             case TriggerComparisonOp::LessThanOrEqual:
@@ -222,8 +295,8 @@ namespace {
     std::string_view lhsSv{};
     std::string_view rhsSv{};
     if (TryExtractComparableString(actualVal, domains, lhsSv) &&
-        TryExtractComparableString(cond.expectedValue, domains, rhsSv)) {
-        switch (cond.comparison) {
+        TryExtractComparableString(expectedVal, domains, rhsSv)) {
+        switch (comparison) {
             case TriggerComparisonOp::LessThan:
                 return lhsSv < rhsSv;
             case TriggerComparisonOp::LessThanOrEqual:
@@ -240,16 +313,14 @@ namespace {
     return false;
 }
 
-[[nodiscard]] UIElement* FindTreeRoot(UIElement* elem) noexcept {
-    UIElement* cur = elem;
-    while (cur && cur->Parent() != nullptr) {
-        cur = cur->Parent();
-    }
-    return cur;
+[[nodiscard]] const UIElement* NextContextParent(const UIElement* cur) noexcept {
+    if (!cur) return nullptr;
+    if (cur->Parent()) return cur->Parent();
+    return cur->TemplatedParent();
 }
 
 [[nodiscard]] ObjectRef ResolveEffectiveDataContext(const UIElement* elem) noexcept {
-    for (const UIElement* cur = elem; cur != nullptr; cur = cur->Parent()) {
+    for (const UIElement* cur = elem; cur != nullptr; cur = NextContextParent(cur)) {
         const UnifiedValue dcVal = cur->GetValue(PropId_DataContext);
         if (const auto* ref = std::get_if<ObjectRef>(&dcVal)) {
             if (ref->valid()) {
@@ -261,6 +332,245 @@ namespace {
         }
     }
     return ObjectRef{};
+}
+
+[[nodiscard]] ObjectRef ResolveRootScriptWrapper(const UIElement* elem) noexcept {
+    ObjectRef topWrapper{};
+    for (const UIElement* cur = elem; cur != nullptr; cur = NextContextParent(cur)) {
+        if (cur->BoundScriptWrapper().valid()) {
+            topWrapper = cur->BoundScriptWrapper();
+        }
+    }
+    return topWrapper;
+}
+
+void ResolveHopTargetType(
+    const ProgramImage* program,
+    SymbolId ownerTypeId,
+    AxbCompiledHop& hop) noexcept {
+    if (!program || ownerTypeId == 0 || hop.targetTypeId != 0) {
+        return;
+    }
+    std::string rawTypeName;
+    SymbolId curTypeId = ownerTypeId;
+    for (int depth = 0; depth < 16 && curTypeId != 0; ++depth) {
+        const auto* ts = program->resolveType(curTypeId);
+        if (!ts) break;
+        for (const auto& p : ts->properties) {
+            if (p.name == hop.memberName) {
+                rawTypeName = p.typeName;
+                break;
+            }
+        }
+        if (!rawTypeName.empty()) break;
+        for (const auto& f : ts->fields) {
+            if (f.name == hop.memberName) {
+                rawTypeName = f.typeName;
+                break;
+            }
+        }
+        if (!rawTypeName.empty()) break;
+        curTypeId = ts->baseTypeId;
+    }
+    if (rawTypeName.empty()) {
+        return;
+    }
+    std::string lookupName = rawTypeName;
+    if (hop.collectionIndex >= 0) {
+        const auto lt = lookupName.find('<');
+        const auto gt = lookupName.rfind('>');
+        if (lt != std::string::npos && gt != std::string::npos && gt > lt + 1u) {
+            lookupName = lookupName.substr(lt + 1u, gt - lt - 1u);
+        } else if (lookupName.size() > 2u && lookupName.compare(lookupName.size() - 2u, 2u, "[]") == 0) {
+            lookupName.erase(lookupName.size() - 2u);
+        }
+    }
+    std::string normalized;
+    normalized.reserve(lookupName.size() + 2u);
+    for (std::size_t i = 0; i < lookupName.size(); ++i) {
+        if (lookupName[i] == '.' && (i + 1u >= lookupName.size() || lookupName[i + 1u] != '.')) {
+            normalized += "::";
+        } else if (!std::isspace(static_cast<unsigned char>(lookupName[i]))) {
+            normalized.push_back(lookupName[i]);
+        }
+    }
+    std::string_view shortTarget = ShortTypeNameView(normalized);
+    const rs_sem::TypeSymbol* bestMatch = nullptr;
+    for (const auto& mod : program->modules()) {
+        for (const auto& cand : mod.types) {
+            const std::string canon = rs_sem::canonicalTypeName(cand);
+            if (canon == normalized || cand.name == normalized) {
+                bestMatch = &cand;
+                break;
+            }
+            if (!bestMatch && cand.name == shortTarget) {
+                bestMatch = &cand;
+            }
+        }
+        if (bestMatch && (rs_sem::canonicalTypeName(*bestMatch) == normalized || bestMatch->name == normalized)) {
+            break;
+        }
+    }
+    if (bestMatch) {
+        hop.targetTypeId = bestMatch->id;
+        hop.targetIsEnum = (bestMatch->kind == rs_sem::TypeKind::Enum);
+    }
+}
+
+[[nodiscard]] bool ReadSingleHopOnObject(
+    ExecutionDomainContext* domains,
+    const ProgramImage* program,
+    const Interpreter* uiInterpreter,
+    ObjectRef curObj,
+    AxbCompiledHop& hop,
+    UnifiedValue& outVal) {
+    if (!domains || !curObj.valid()) {
+        return false;
+    }
+    auto* heap = domains->heapForObject(curObj);
+    if (!heap || !heap->isAlive(curObj)) {
+        return false;
+    }
+    const SymbolId runtimeTypeId = heap->objectTypeId(curObj).value_or(0);
+    if (program && runtimeTypeId != 0) {
+        if (hop.declaringTypeId != runtimeTypeId || !hop.ToSlotHandle().valid()) {
+            if (auto resolved = domains->resolvePropertySlot(*program, runtimeTypeId, hop.memberName)) {
+                hop.declaringTypeId = resolved->typeId;
+                hop.fieldIndex = resolved->backingFieldIndex;
+                hop.observableBitIndex = resolved->observableBitIndex;
+                hop.getterSymbolId = resolved->getterSymbolId;
+                hop.setterSymbolId = resolved->setterSymbolId;
+                hop.isAutoProperty = resolved->isAutoProperty;
+                hop.isObservable = resolved->isObservable;
+                hop.isReadOnly = resolved->isReadOnly;
+                hop.isSimState = resolved->isSimState;
+                hop.isSimCommand = resolved->isSimCommand;
+            }
+        }
+        ResolveHopTargetType(program, runtimeTypeId, hop);
+    }
+
+    const PropertySlotHandle slot = hop.ToSlotHandle();
+    UnifiedValue hopVal{};
+    if (slot.valid()) {
+        if (!domains->readPropertySlotFast(DomainKind::Ui, curObj, slot, hopVal, nullptr, uiInterpreter)) {
+            return false;
+        }
+    } else if (hop.fieldIndex != PropertySlotHandle::InvalidIndex) {
+        if (!domains->readObjectField(DomainKind::Ui, curObj, hop.fieldIndex, hopVal, nullptr)) {
+            return false;
+        }
+    } else {
+        return false;
+    }
+
+    if (hop.collectionIndex >= 0) {
+        const auto* collRef = std::get_if<ObjectRef>(&hopVal);
+        if (!collRef || !collRef->valid()) {
+            outVal = NullObject{};
+            return true;
+        }
+        auto* collHeap = domains->heapForObject(*collRef);
+        if (!collHeap || !collHeap->isAlive(*collRef)) {
+            return false;
+        }
+        const ObjectRef backingArr = ObservableListHelper::ResolveBackingArray(*collHeap, *collRef);
+        if (!backingArr.valid()) {
+            outVal = NullObject{};
+            return true;
+        }
+        auto* arrHeap = domains->heapForObject(backingArr);
+        if (!arrHeap || !arrHeap->isAlive(backingArr)) {
+            return false;
+        }
+        const std::size_t idx = static_cast<std::size_t>(hop.collectionIndex);
+        if (idx >= arrHeap->arrayLength(backingArr).value_or(0u)) {
+            outVal = NullObject{};
+            return true;
+        }
+        if (auto elemOpt = arrHeap->arrayGet(backingArr, idx)) {
+            outVal = *elemOpt;
+        } else {
+            outVal = NullObject{};
+        }
+        return true;
+    }
+
+    outVal = hopVal;
+    return true;
+}
+
+[[nodiscard]] SymbolId FindMethodInHierarchy(
+    const ProgramImage* program,
+    SymbolId startTypeId,
+    std::string_view leafName,
+    bool& outIsSimCmd) {
+    outIsSimCmd = false;
+    if (!program || startTypeId == 0 || leafName.empty()) {
+        return 0;
+    }
+    const std::string exact(leafName);
+    const std::string withCommand = exact + "Command";
+    const std::string withOn = "On" + exact;
+    std::string strippedBase;
+    std::string onStrippedBase;
+    if (exact.size() > 7u && exact.compare(exact.size() - 7u, 7u, "Command") == 0) {
+        strippedBase = exact.substr(0u, exact.size() - 7u);
+        onStrippedBase = "On" + strippedBase;
+    }
+
+    SymbolId foundSym = 0;
+    SymbolId curTypeId = startTypeId;
+    for (int depth = 0; depth < 16 && curTypeId != 0 && foundSym == 0; ++depth) {
+        const auto* ts = program->resolveType(curTypeId);
+        if (!ts) break;
+        for (const auto& m : ts->methods) {
+            if (m.name == exact) {
+                foundSym = m.id;
+                break;
+            }
+        }
+        if (foundSym == 0) {
+            for (const auto& m : ts->methods) {
+                if (m.name == withCommand || m.name == withOn ||
+                    (!strippedBase.empty() && (m.name == strippedBase || m.name == onStrippedBase))) {
+                    foundSym = m.id;
+                    break;
+                }
+            }
+        }
+        curTypeId = ts->baseTypeId;
+    }
+
+    if (foundSym != 0) {
+        if (const auto* loc = program->resolveFunction(foundSym)) {
+            if (loc->function && loc->function->simCommand) {
+                outIsSimCmd = true;
+            }
+        }
+    }
+    return foundSym;
+}
+
+[[nodiscard]] bool DoesTypeOwnOrInheritMethod(
+    const ProgramImage* program,
+    SymbolId startTypeId,
+    SymbolId methodSym) noexcept {
+    if (!program || startTypeId == 0 || methodSym == 0) {
+        return false;
+    }
+    SymbolId curTypeId = startTypeId;
+    for (int depth = 0; depth < 16 && curTypeId != 0; ++depth) {
+        const auto* ts = program->resolveType(curTypeId);
+        if (!ts) break;
+        for (const auto& m : ts->methods) {
+            if (m.id == methodSym) {
+                return true;
+            }
+        }
+        curTypeId = ts->baseTypeId;
+    }
+    return false;
 }
 
 [[nodiscard]] std::int16_t FindStateIndexByName(
@@ -290,9 +600,33 @@ void VisitStoryboardValues(const AxbStoryboard& sb, Fn&& fn) noexcept {
 }
 
 template <typename Fn>
+void VisitActionValues(const AxbInteractionAction& act, Fn&& fn) noexcept {
+    if (act.value.isTraceable()) fn(act.value);
+    if (act.valueBinding && act.valueBinding->fallbackValue.isTraceable()) {
+        fn(act.valueBinding->fallbackValue);
+    }
+    if (act.valueMultiBinding) {
+        if (act.valueMultiBinding->fallbackValue.isTraceable()) {
+            fn(act.valueMultiBinding->fallbackValue);
+        }
+        for (const auto& cb : act.valueMultiBinding->sources) {
+            if (cb.fallbackValue.isTraceable()) fn(cb.fallbackValue);
+        }
+    }
+    if (act.commandParameter.isTraceable()) fn(act.commandParameter);
+    if (act.commandParameterBinding.fallbackValue.isTraceable()) {
+        fn(act.commandParameterBinding.fallbackValue);
+    }
+    VisitStoryboardValues(act.inlineStoryboard, fn);
+}
+
+template <typename Fn>
 void VisitStyleValues(const AxbStyleDefinition& st, Fn&& fn) noexcept {
     for (const auto& s : st.setters) {
         if (s.value.isTraceable()) fn(s.value);
+        if (s.binding && s.binding->fallbackValue.isTraceable()) {
+            fn(s.binding->fallbackValue);
+        }
     }
     for (const auto& trig : st.triggers) {
         for (const auto& cond : trig.conditions) {
@@ -300,41 +634,26 @@ void VisitStyleValues(const AxbStyleDefinition& st, Fn&& fn) noexcept {
         }
         for (const auto& s : trig.setters) {
             if (s.value.isTraceable()) fn(s.value);
+            if (s.binding && s.binding->fallbackValue.isTraceable()) {
+                fn(s.binding->fallbackValue);
+            }
         }
         for (const auto& sb : trig.enterStoryboards) VisitStoryboardValues(sb, fn);
         for (const auto& sb : trig.exitStoryboards) VisitStoryboardValues(sb, fn);
-        for (const auto& act : trig.enterActions) {
-            if (act.value.isTraceable()) fn(act.value);
-            if (act.commandParameter.isTraceable()) fn(act.commandParameter);
-            if (act.commandParameterBinding.fallbackValue.isTraceable()) {
-                fn(act.commandParameterBinding.fallbackValue);
-            }
-            VisitStoryboardValues(act.inlineStoryboard, fn);
-        }
-        for (const auto& act : trig.exitActions) {
-            if (act.value.isTraceable()) fn(act.value);
-            if (act.commandParameter.isTraceable()) fn(act.commandParameter);
-            if (act.commandParameterBinding.fallbackValue.isTraceable()) {
-                fn(act.commandParameterBinding.fallbackValue);
-            }
-            VisitStoryboardValues(act.inlineStoryboard, fn);
-        }
+        for (const auto& act : trig.enterActions) VisitActionValues(act, fn);
+        for (const auto& act : trig.exitActions) VisitActionValues(act, fn);
     }
     for (const auto& et : st.eventTriggers) {
         for (const auto& sb : et.storyboards) VisitStoryboardValues(sb, fn);
-        for (const auto& act : et.actions) {
-            if (act.value.isTraceable()) fn(act.value);
-            if (act.commandParameter.isTraceable()) fn(act.commandParameter);
-            if (act.commandParameterBinding.fallbackValue.isTraceable()) {
-                fn(act.commandParameterBinding.fallbackValue);
-            }
-            VisitStoryboardValues(act.inlineStoryboard, fn);
-        }
+        for (const auto& act : et.actions) VisitActionValues(act, fn);
     }
     for (const auto& vsg : st.visualStateGroups) {
         for (const auto& vs : vsg.states) {
             for (const auto& s : vs.setters) {
                 if (s.value.isTraceable()) fn(s.value);
+                if (s.binding && s.binding->fallbackValue.isTraceable()) {
+                    fn(s.binding->fallbackValue);
+                }
             }
             VisitStoryboardValues(vs.storyboard, fn);
         }
@@ -347,41 +666,26 @@ void VisitStyleValues(const AxbStyleDefinition& st, Fn&& fn) noexcept {
             }
             for (const auto& s : trig.setters) {
                 if (s.value.isTraceable()) fn(s.value);
+                if (s.binding && s.binding->fallbackValue.isTraceable()) {
+                    fn(s.binding->fallbackValue);
+                }
             }
             for (const auto& sb : trig.enterStoryboards) VisitStoryboardValues(sb, fn);
             for (const auto& sb : trig.exitStoryboards) VisitStoryboardValues(sb, fn);
-            for (const auto& act : trig.enterActions) {
-                if (act.value.isTraceable()) fn(act.value);
-                if (act.commandParameter.isTraceable()) fn(act.commandParameter);
-                if (act.commandParameterBinding.fallbackValue.isTraceable()) {
-                    fn(act.commandParameterBinding.fallbackValue);
-                }
-                VisitStoryboardValues(act.inlineStoryboard, fn);
-            }
-            for (const auto& act : trig.exitActions) {
-                if (act.value.isTraceable()) fn(act.value);
-                if (act.commandParameter.isTraceable()) fn(act.commandParameter);
-                if (act.commandParameterBinding.fallbackValue.isTraceable()) {
-                    fn(act.commandParameterBinding.fallbackValue);
-                }
-                VisitStoryboardValues(act.inlineStoryboard, fn);
-            }
+            for (const auto& act : trig.enterActions) VisitActionValues(act, fn);
+            for (const auto& act : trig.exitActions) VisitActionValues(act, fn);
         }
         for (const auto& et : ct.eventTriggers) {
             for (const auto& sb : et.storyboards) VisitStoryboardValues(sb, fn);
-            for (const auto& act : et.actions) {
-                if (act.value.isTraceable()) fn(act.value);
-                if (act.commandParameter.isTraceable()) fn(act.commandParameter);
-                if (act.commandParameterBinding.fallbackValue.isTraceable()) {
-                    fn(act.commandParameterBinding.fallbackValue);
-                }
-                VisitStoryboardValues(act.inlineStoryboard, fn);
-            }
+            for (const auto& act : et.actions) VisitActionValues(act, fn);
         }
         for (const auto& vsg : ct.visualStateGroups) {
             for (const auto& vs : vsg.states) {
                 for (const auto& s : vs.setters) {
                     if (s.value.isTraceable()) fn(s.value);
+                    if (s.binding && s.binding->fallbackValue.isTraceable()) {
+                        fn(s.binding->fallbackValue);
+                    }
                 }
                 VisitStoryboardValues(vs.storyboard, fn);
             }
@@ -577,7 +881,7 @@ AxbStyleDefinition StyleTriggerEngine::FlattenStyleChain(const AxbStyleDefinitio
             bool replaced = false;
             for (auto& existing : merged.setters) {
                 if (existing.propId == setter.propId && existing.targetName == setter.targetName) {
-                    existing.value = setter.value;
+                    existing = setter;
                     replaced = true;
                     break;
                 }
@@ -752,6 +1056,18 @@ bool StyleTriggerEngine::AttachStyle(UIElement* element, const AxbStyleDefinitio
             ? element
             : element->FindName(setter.targetName);
         if (!target) {
+            continue;
+        }
+        if (setter.hasBinding && setter.binding) {
+            if (bindingEngine_ && target->GetPropertySourceRank(setter.propId) < ValueSourceRank::Local) {
+                const auto& bc = *setter.binding;
+                IntrusivePtr<UIElement> targetPtr(target, true);
+                if (!bc.elementName.empty() || !bc.relativeAncestorType.empty() || bc.relativeSelf) {
+                    (void)bindingEngine_->BindElementProperty(bc, targetPtr);
+                } else {
+                    (void)bindingEngine_->BindChain(ResolveEffectiveDataContext(target), bc, targetPtr);
+                }
+            }
             continue;
         }
         if (IsFastInlinePropertyId(setter.propId)) {
@@ -1205,10 +1521,10 @@ bool StyleTriggerEngine::EvaluateSingleCondition(
         }
 
         case TriggerConditionSource::AncestorProperty: {
+            const std::string_view wantedType = ShortTypeNameView(cond.sourceName);
             const UIElement* matchedAnc = nullptr;
-            for (const UIElement* anc = elem->Parent(); anc != nullptr; anc = anc->Parent()) {
-                const char* tn = anc->GetTypeClass()->typeName;
-                if (tn && ShortTypeNameView(tn) == cond.sourceName) {
+            for (const UIElement* anc = elem; anc != nullptr; anc = NextContextParent(anc)) {
+                if (MatchesXamlAncestorType(anc, wantedType)) {
                     matchedAnc = anc;
                     break;
                 }
@@ -1235,45 +1551,9 @@ bool StyleTriggerEngine::EvaluateSingleCondition(
             ObjectRef curObj = dcObj;
             bool chainOk = true;
             for (std::size_t h = 0u; h < cond.compiledHops.size(); ++h) {
-                auto* heap = domains_->heapForObject(curObj);
-                if (!heap || !heap->isAlive(curObj)) {
-                    chainOk = false;
-                    break;
-                }
                 auto& hop = cond.compiledHops[h];
-                const SymbolId runtimeTypeId = heap->objectTypeId(curObj).value_or(0);
-                if (program_ && runtimeTypeId != 0 &&
-                    (hop.declaringTypeId != runtimeTypeId || !hop.ToSlotHandle().valid())) {
-                    if (auto resolved = domains_->resolvePropertySlot(
-                            *program_, runtimeTypeId, hop.memberName)) {
-                        hop.declaringTypeId = resolved->typeId;
-                        hop.fieldIndex = resolved->backingFieldIndex;
-                        hop.observableBitIndex = resolved->observableBitIndex;
-                        hop.getterSymbolId = resolved->getterSymbolId;
-                        hop.setterSymbolId = resolved->setterSymbolId;
-                        hop.isAutoProperty = resolved->isAutoProperty;
-                        hop.isObservable = resolved->isObservable;
-                        hop.isReadOnly = resolved->isReadOnly;
-                        hop.isSimState = resolved->isSimState;
-                        hop.isSimCommand = resolved->isSimCommand;
-                    }
-                }
-
-                const PropertySlotHandle slot = hop.ToSlotHandle();
                 UnifiedValue hopVal{};
-                if (slot.valid()) {
-                    if (!domains_->readPropertySlotFast(
-                            DomainKind::Ui, curObj, slot, hopVal, nullptr, uiInterpreter_)) {
-                        chainOk = false;
-                        break;
-                    }
-                } else if (hop.fieldIndex != PropertySlotHandle::InvalidIndex) {
-                    if (!domains_->readObjectField(
-                            DomainKind::Ui, curObj, hop.fieldIndex, hopVal, nullptr)) {
-                        chainOk = false;
-                        break;
-                    }
-                } else {
+                if (!ReadSingleHopOnObject(domains_, program_, uiInterpreter_, curObj, hop, hopVal)) {
                     chainOk = false;
                     break;
                 }
@@ -1294,6 +1574,53 @@ bool StyleTriggerEngine::EvaluateSingleCondition(
                 return false;
             }
             break;
+        }
+    }
+
+    if (cond.sourceKind != TriggerConditionSource::DataContextBinding &&
+        !cond.compiledHops.empty()) {
+        const auto* startRef = std::get_if<ObjectRef>(&actualVal);
+        if (!startRef || !startRef->valid() || !domains_) {
+            actualVal = NullObject{};
+        } else {
+            ObjectRef curObj = *startRef;
+            for (std::size_t h = 0u; h < cond.compiledHops.size(); ++h) {
+                auto& hop = cond.compiledHops[h];
+                UnifiedValue hopVal{};
+                if (!ReadSingleHopOnObject(domains_, program_, uiInterpreter_, curObj, hop, hopVal)) {
+                    return false;
+                }
+                if (h + 1u < cond.compiledHops.size()) {
+                    const auto* nextRef = std::get_if<ObjectRef>(&hopVal);
+                    if (!nextRef || !nextRef->valid()) {
+                        actualVal = NullObject{};
+                        break;
+                    }
+                    curObj = *nextRef;
+                } else {
+                    actualVal = hopVal;
+                }
+            }
+        }
+    }
+
+    UnifiedValue resolvedExpected = cond.expectedValue;
+    if (cond.converter == ValueConverterKind::None && !cond.expectNull && program_) {
+        SymbolId leafEnumTypeId = 0;
+        if (!cond.compiledHops.empty() && cond.compiledHops.back().targetIsEnum) {
+            leafEnumTypeId = cond.compiledHops.back().targetTypeId;
+        }
+        EnumValue ev{};
+        if (actualVal.tryGetEnum(ev) && ev.typeId != 0) {
+            leafEnumTypeId = ev.typeId;
+        }
+        if (leafEnumTypeId != 0) {
+            if (const auto* expStr = std::get_if<StringValue>(&resolvedExpected)) {
+                std::int64_t enumInt = 0;
+                if (TryResolveEnumMemberByName(program_, leafEnumTypeId, expStr->view(), enumInt)) {
+                    resolvedExpected = value::FromInt(enumInt);
+                }
+            }
         }
     }
 
@@ -1319,8 +1646,163 @@ bool StyleTriggerEngine::EvaluateSingleCondition(
         }
     }
 
-    return TriggerConditionValueMatches(actualVal, cond, domains_);
+    return TriggerConditionValueMatches(
+        actualVal,
+        resolvedExpected,
+        cond.expectNull,
+        cond.comparison,
+        domains_,
+        program_);
 }
+
+namespace {
+
+[[nodiscard]] bool EvaluateRuntimeBindingOnce(
+    UIElement* elem,
+    ExecutionDomainContext* domains,
+    const ProgramImage* program,
+    const Interpreter* uiInterpreter,
+    DualTrackBindingEngine* bindingEngine,
+    AxbCompiledBindingChain& bc,
+    UnifiedValue& outVal) {
+    if (!elem) {
+        return false;
+    }
+    bool haveRaw = false;
+    UnifiedValue rawVal{};
+
+    if (!bc.elementName.empty() || !bc.relativeAncestorType.empty() || bc.relativeSelf) {
+        UIElement* srcEl = nullptr;
+        if (bc.relativeSelf) {
+            srcEl = elem;
+        } else if (!bc.relativeAncestorType.empty()) {
+            const std::string_view wantedType = ShortTypeNameView(bc.relativeAncestorType);
+            for (UIElement* anc = elem; anc != nullptr; anc = const_cast<UIElement*>(NextContextParent(anc))) {
+                if (MatchesXamlAncestorType(anc, wantedType)) {
+                    srcEl = anc;
+                    break;
+                }
+            }
+        } else {
+            srcEl = elem->FindName(bc.elementName);
+            if (!srcEl) {
+                if (UIElement* scopeRoot = UIElement::FindNamescopeRoot(elem)) {
+                    srcEl = scopeRoot->FindName(bc.elementName);
+                }
+            }
+        }
+        if (!srcEl) {
+            return false;
+        }
+
+        if ((bc.rawPath.empty() || bc.rawPath == ".") && bc.hops.empty()) {
+            if (!domains) {
+                return false;
+            }
+            rawVal = UnifiedValue{srcEl->ToNativeHandle(domains->nativeHandles())};
+            haveRaw = true;
+        } else if (bc.hops.size() > 1u && domains) {
+            const std::uint16_t firstProp = ResolveTriggerConditionPropertyId(bc.hops.front().memberName);
+            UnifiedValue firstVal = (firstProp != 0u) ? srcEl->GetValue(firstProp) : UnifiedValue{};
+            const auto* curRef = std::get_if<ObjectRef>(&firstVal);
+            if (curRef && curRef->valid()) {
+                ObjectRef curObj = *curRef;
+                bool ok = true;
+                for (std::size_t h = 1u; h < bc.hops.size(); ++h) {
+                    UnifiedValue hv{};
+                    if (!ReadSingleHopOnObject(domains, program, uiInterpreter, curObj, bc.hops[h], hv)) {
+                        ok = false;
+                        break;
+                    }
+                    if (h + 1u < bc.hops.size()) {
+                        const auto* nr = std::get_if<ObjectRef>(&hv);
+                        if (!nr || !nr->valid()) {
+                            rawVal = NullObject{};
+                            haveRaw = true;
+                            ok = false;
+                            break;
+                        }
+                        curObj = *nr;
+                    } else {
+                        rawVal = hv;
+                        haveRaw = true;
+                    }
+                }
+                (void)ok;
+            }
+        } else {
+            const std::uint16_t spId = ResolveTriggerConditionPropertyId(
+                !bc.hops.empty() ? std::string_view(bc.hops.front().memberName) : std::string_view(bc.rawPath));
+            if (spId != 0u) {
+                rawVal = srcEl->GetValue(spId);
+                haveRaw = !std::holds_alternative<std::monostate>(rawVal);
+            }
+        }
+    } else {
+        ObjectRef cur = ResolveEffectiveDataContext(elem);
+        if (bc.hops.empty()) {
+            if (cur.valid()) {
+                rawVal = cur;
+                haveRaw = true;
+            }
+        } else if (cur.valid() && domains) {
+            for (std::size_t h = 0u; h < bc.hops.size(); ++h) {
+                UnifiedValue hv{};
+                if (!ReadSingleHopOnObject(domains, program, uiInterpreter, cur, bc.hops[h], hv)) {
+                    break;
+                }
+                if (h + 1u < bc.hops.size()) {
+                    const auto* nr = std::get_if<ObjectRef>(&hv);
+                    if (!nr || !nr->valid()) {
+                        rawVal = NullObject{};
+                        haveRaw = true;
+                        break;
+                    }
+                    cur = *nr;
+                } else {
+                    rawVal = hv;
+                    haveRaw = true;
+                }
+            }
+        }
+    }
+
+    if (!haveRaw) {
+        if (!std::holds_alternative<std::monostate>(bc.fallbackValue)) {
+            rawVal = bc.fallbackValue;
+            haveRaw = true;
+        } else {
+            return false;
+        }
+    }
+
+    if (bc.converter != ValueConverterKind::None) {
+        if (bindingEngine) {
+            rawVal = bindingEngine->ApplySingleValueConversion(
+                bc.converter,
+                bc.converterKey,
+                bc.converterParameter,
+                bc.converterSymbolId,
+                bc.convertBackSymbolId,
+                rawVal,
+                false);
+        } else if (bc.converter == ValueConverterKind::MathExpression) {
+            float paramF = 0.0f;
+            (void)TryParseStackFloat(bc.converterParameter, paramF);
+            float mathOut = 0.0f;
+            if (EvaluateMathConverterExpression(bc.converterKey, &rawVal, 1u, paramF, mathOut)) {
+                rawVal = MakeFloat(mathOut);
+            }
+        } else {
+            rawVal = ApplyBuiltinValueConverter(bc.converter, rawVal, false);
+        }
+    }
+
+    outVal = rawVal;
+    return true;
+}
+
+} // namespace
 
 void StyleTriggerEngine::ExecuteSingleInteractionAction(
     StyledElementInstance& inst,
@@ -1388,7 +1870,82 @@ void StyleTriggerEngine::ExecuteSingleInteractionAction(
             if (animationEngine_) {
                 (void)animationEngine_->StopPropertyAnimation(target, action.propId, false);
             }
-            (void)target->SetValue(action.propId, action.value, ValueSourceRank::Local);
+
+            if (action.isNullValue) {
+                if ((action.propId == PropId_Content || action.propId == PropId_Text) &&
+                    (target->IsA<Border>() || target->IsA<ContentPresenter>() || target->IsA<UserControl>())) {
+                    for (UIElement* ch = target->FirstChild(); ch != nullptr;) {
+                        UIElement* next = ch->NextSibling();
+                        if (ch != target->TemplateRoot()) {
+                            if (StyleTriggerEngine* ste = ch->BoundStyleEngine()) {
+                                (void)ste->UnbindSubtreeStyles(ch);
+                            }
+                            if (bindingEngine_) {
+                                (void)bindingEngine_->UnbindSubtree(ch);
+                            }
+                            (void)target->RemoveChild(ch);
+                        }
+                        ch = next;
+                    }
+                    (void)target->ForceClearSparseEntry(PropId_Content);
+                    (void)target->ForceClearSparseEntry(PropId_Text);
+                    break;
+                }
+                if (IsFastInlinePropertyId(action.propId)) {
+                    (void)target->ClearValue(action.propId, ValueSourceRank::Animation);
+                } else {
+                    (void)target->ForceClearSparseEntry(action.propId);
+                }
+                if (target->BoundTwoWayEngine() != nullptr) {
+                    (void)target->NotifyTwoWayPropertyMutated(action.propId);
+                }
+                break;
+            }
+
+            UnifiedValue newVal = action.value;
+            if (action.hasValueBinding) {
+                if (action.valueMultiBinding) {
+                    auto& mb = *action.valueMultiBinding;
+                    std::vector<UnifiedValue> args;
+                    args.reserve(mb.sources.size());
+                    for (auto& childBc : mb.sources) {
+                        UnifiedValue cv{};
+                        if (!EvaluateRuntimeBindingOnce(
+                                elem, domains_, program_, uiInterpreter_, bindingEngine_, childBc, cv)) {
+                            cv = !std::holds_alternative<std::monostate>(childBc.fallbackValue)
+                                ? childBc.fallbackValue
+                                : MakeFloat(0.0f);
+                        }
+                        args.push_back(cv);
+                    }
+                    if (bindingEngine_) {
+                        newVal = bindingEngine_->ApplyMultiValueConversion(
+                            mb.converter,
+                            mb.converterKey,
+                            mb.converterParameter,
+                            mb.converterSymbolId,
+                            args.data(),
+                            args.size());
+                    } else if (mb.converter == ValueConverterKind::MathExpression) {
+                        float paramF = 0.0f;
+                        (void)TryParseStackFloat(mb.converterParameter, paramF);
+                        float mathOut = 0.0f;
+                        if (EvaluateMathConverterExpression(
+                                mb.converterKey, args.data(), args.size(), paramF, mathOut)) {
+                            newVal = MakeFloat(mathOut);
+                        }
+                    }
+                } else if (action.valueBinding) {
+                    UnifiedValue evalVal{};
+                    if (!EvaluateRuntimeBindingOnce(
+                            elem, domains_, program_, uiInterpreter_, bindingEngine_, *action.valueBinding, evalVal)) {
+                        break;
+                    }
+                    newVal = evalVal;
+                }
+            }
+
+            (void)target->SetValue(action.propId, newVal, ValueSourceRank::Local);
             if (target->BoundTwoWayEngine() != nullptr) {
                 (void)target->NotifyTwoWayPropertyMutated(action.propId);
             }
@@ -1423,46 +1980,153 @@ void StyleTriggerEngine::ExecuteSingleInteractionAction(
         }
 
         case InteractionActionKind::InvokeCommand: {
-            ObjectRef targetObj = ResolveEffectiveDataContext(elem);
-            if (action.commandHops.size() > 1u && targetObj.valid() && domains_) {
-                for (std::size_t h = 0u; h + 1u < action.commandHops.size(); ++h) {
-                    auto* heap = domains_->heapForObject(targetObj);
-                    if (!heap || !heap->isAlive(targetObj)) {
-                        targetObj = ObjectRef{};
-                        break;
-                    }
-                    auto& hop = action.commandHops[h];
-                    const SymbolId rtTypeId = heap->objectTypeId(targetObj).value_or(0);
-                    if (program_ && rtTypeId != 0 &&
-                        (hop.declaringTypeId != rtTypeId || !hop.ToSlotHandle().valid())) {
-                        if (auto resolved = domains_->resolvePropertySlot(*program_, rtTypeId, hop.memberName)) {
-                            hop.declaringTypeId = resolved->typeId;
-                            hop.fieldIndex = resolved->backingFieldIndex;
-                            hop.observableBitIndex = resolved->observableBitIndex;
-                            hop.getterSymbolId = resolved->getterSymbolId;
-                            hop.setterSymbolId = resolved->setterSymbolId;
-                            hop.isAutoProperty = resolved->isAutoProperty;
-                            hop.isObservable = resolved->isObservable;
-                            hop.isReadOnly = resolved->isReadOnly;
-                            hop.isSimState = resolved->isSimState;
-                            hop.isSimCommand = resolved->isSimCommand;
+            const ObjectRef wrapperObj = ResolveRootScriptWrapper(elem);
+            const ObjectRef dcObj = ResolveEffectiveDataContext(elem);
+
+            if (action.commandPath.rfind("__NavigateTo:", 0) == 0) {
+                const std::string destId = action.commandPath.substr(13u);
+                // 1. Invoke MainWindow.NavigateTo<DestId>() if defined
+                if (wrapperObj.valid() && domains_ && program_) {
+                    if (auto* heap = domains_->heapForObject(wrapperObj); heap && heap->isAlive(wrapperObj)) {
+                        const SymbolId wrapTid = heap->objectTypeId(wrapperObj).value_or(0);
+                        const std::string navMethod = "NavigateTo" + destId;
+                        bool isSim = false;
+                        const SymbolId mSym = FindMethodInHierarchy(program_, wrapTid, navMethod, isSim);
+                        if (mSym != 0) {
+                            std::vector<UnifiedValue> args{wrapperObj};
+                            if (uiInterpreter_) {
+                                (void)uiInterpreter_->invoke(mSym, args);
+                            } else if (aotContext_) {
+                                UnifiedValue ret{};
+                                (void)aotContext_->invoke(mSym, args.data(), args.size(), ret);
+                            }
                         }
                     }
-                    UnifiedValue nextVal{};
-                    const PropertySlotHandle sh = hop.ToSlotHandle();
-                    const bool ok = sh.valid()
-                        ? domains_->readPropertySlotFast(DomainKind::Ui, targetObj, sh, nextVal, nullptr, uiInterpreter_)
-                        : (hop.fieldIndex != PropertySlotHandle::InvalidIndex &&
-                           domains_->readObjectField(DomainKind::Ui, targetObj, hop.fieldIndex, nextVal, nullptr));
-                    const auto* nextRef = ok ? std::get_if<ObjectRef>(&nextVal) : nullptr;
-                    if (!nextRef || !nextRef->valid()) {
-                        targetObj = ObjectRef{};
-                        break;
+                }
+                // 2. Switch NavigationRoot's Content + ContentTemplate to the matching destination
+                UIElement* topRoot = elem;
+                while (const UIElement* nxt = NextContextParent(topRoot)) {
+                    topRoot = const_cast<UIElement*>(nxt);
+                }
+                UIElement* navRoot = topRoot ? topRoot->FindName("NavigationRoot") : nullptr;
+                if (navRoot && domains_) {
+                    ObjectRef rootVm{};
+                    const UnifiedValue rootDc = topRoot->GetValue(PropId_DataContext);
+                    if (const auto* rRef = std::get_if<ObjectRef>(&rootDc); rRef && rRef->valid()) {
+                        rootVm = *rRef;
                     }
-                    targetObj = *nextRef;
+                    if (rootVm.valid()) {
+                        AxbCompiledHop destHop{};
+                        destHop.memberName = destId + "Menu";
+                        UnifiedValue destMenuVal{};
+                        if (ReadSingleHopOnObject(domains_, program_, uiInterpreter_, rootVm, destHop, destMenuVal)) {
+                            (void)navRoot->SetValue(PropId_Content, destMenuVal, ValueSourceRank::Local);
+                            (void)navRoot->SetValue(PropId_Text, destMenuVal, ValueSourceRank::Local);
+                        }
+                    }
+                    const std::string tplKey = "Menu3D.Template." + destId + "Menu";
+                    if (AxbTemplateRegistry::Instance().FindDataTemplate(tplKey) != nullptr) {
+                        (void)navRoot->SetValue(
+                            PropId_ContentTemplate,
+                            value::FromString(tplKey),
+                            ValueSourceRank::Local);
+                    }
+                }
+                break;
+            }
+
+            std::string leafName = action.commandPath;
+            if (const auto dot = leafName.rfind('.'); dot != std::string::npos) {
+                leafName = leafName.substr(dot + 1u);
+            }
+            if (leafName.empty() && !action.commandHops.empty()) {
+                leafName = action.commandHops.back().memberName;
+            }
+
+            ObjectRef targetObj{};
+            SymbolId methodSym = 0;
+            bool isSimCmd = false;
+
+            auto resolveRuntimeTypeId = [&](ObjectRef obj) -> SymbolId {
+                if (!domains_ || !obj.valid()) return 0;
+                if (auto* heap = domains_->heapForObject(obj)) {
+                    if (heap->isAlive(obj)) {
+                        return heap->objectTypeId(obj).value_or(0);
+                    }
+                }
+                return 0;
+            };
+
+            if (action.commandHops.size() <= 1u) {
+                // 1. Check MainWindow (BoundScriptWrapper) FIRST when present!
+                if (wrapperObj.valid()) {
+                    const SymbolId wrapTypeId = resolveRuntimeTypeId(wrapperObj);
+                    if (action.commandTargetsWrapper && action.commandMethodSymbolId != 0 &&
+                        DoesTypeOwnOrInheritMethod(program_, wrapTypeId, action.commandMethodSymbolId)) {
+                        targetObj = wrapperObj;
+                        methodSym = action.commandMethodSymbolId;
+                        isSimCmd = action.isSimCommand;
+                    } else if (program_ && wrapTypeId != 0) {
+                        bool sim = false;
+                        const SymbolId found = FindMethodInHierarchy(program_, wrapTypeId, leafName, sim);
+                        if (found != 0) {
+                            targetObj = wrapperObj;
+                            methodSym = found;
+                            isSimCmd = sim;
+                        }
+                    }
+                }
+
+                // 2. Fall back to effective DataContext (ViewModel or DataTemplate item / sub-menu)
+                if (methodSym == 0 && dcObj.valid()) {
+                    const SymbolId dcTypeId = resolveRuntimeTypeId(dcObj);
+                    if (!action.commandTargetsWrapper && action.commandMethodSymbolId != 0 &&
+                        DoesTypeOwnOrInheritMethod(program_, dcTypeId, action.commandMethodSymbolId)) {
+                        targetObj = dcObj;
+                        methodSym = action.commandMethodSymbolId;
+                        isSimCmd = action.isSimCommand;
+                    } else if (program_ && dcTypeId != 0) {
+                        bool sim = false;
+                        const SymbolId found = FindMethodInHierarchy(program_, dcTypeId, leafName, sim);
+                        if (found != 0) {
+                            targetObj = dcObj;
+                            methodSym = found;
+                            isSimCmd = sim;
+                        }
+                    }
+                }
+            } else if (domains_) {
+                auto stepPrefixFrom = [&](ObjectRef root) -> ObjectRef {
+                    ObjectRef cur = root;
+                    for (std::size_t h = 0u; h + 1u < action.commandHops.size() && cur.valid(); ++h) {
+                        UnifiedValue nextVal{};
+                        if (!ReadSingleHopOnObject(
+                                domains_, program_, uiInterpreter_, cur, action.commandHops[h], nextVal)) {
+                            return ObjectRef{};
+                        }
+                        const auto* nextRef = std::get_if<ObjectRef>(&nextVal);
+                        cur = (nextRef && nextRef->valid()) ? *nextRef : ObjectRef{};
+                    }
+                    return cur;
+                };
+
+                targetObj = stepPrefixFrom(dcObj);
+                if (!targetObj.valid() && wrapperObj.valid() && wrapperObj != dcObj) {
+                    targetObj = stepPrefixFrom(wrapperObj);
+                }
+                if (targetObj.valid()) {
+                    const SymbolId subTypeId = resolveRuntimeTypeId(targetObj);
+                    if (action.commandMethodSymbolId != 0 &&
+                        DoesTypeOwnOrInheritMethod(program_, subTypeId, action.commandMethodSymbolId)) {
+                        methodSym = action.commandMethodSymbolId;
+                        isSimCmd = action.isSimCommand;
+                    } else if (program_ && subTypeId != 0) {
+                        methodSym = FindMethodInHierarchy(program_, subTypeId, leafName, isSimCmd);
+                    }
                 }
             }
-            if (!targetObj.valid()) {
+
+            if (!targetObj.valid() || methodSym == 0) {
                 break;
             }
 
@@ -1470,86 +2134,14 @@ void StyleTriggerEngine::ExecuteSingleInteractionAction(
             UnifiedValue paramVal{};
             bool hasParam = false;
             if (action.hasCommandParameterBinding) {
-                auto& cpb = action.commandParameterBinding;
-                if (!cpb.elementName.empty() || !cpb.relativeAncestorType.empty() || cpb.relativeSelf) {
-                    UIElement* srcEl = nullptr;
-                    if (cpb.relativeSelf) {
-                        srcEl = elem;
-                    } else if (!cpb.relativeAncestorType.empty()) {
-                        for (UIElement* anc = elem->Parent(); anc != nullptr; anc = anc->Parent()) {
-                            const char* tn = anc->GetTypeClass()->typeName;
-                            if (tn && ShortTypeNameView(tn) == ShortTypeNameView(cpb.relativeAncestorType)) {
-                                srcEl = anc;
-                                break;
-                            }
-                        }
-                    } else {
-                        srcEl = elem->FindName(cpb.elementName);
-                        if (!srcEl) {
-                            if (UIElement* scopeRoot = UIElement::FindNamescopeRoot(elem)) {
-                                srcEl = scopeRoot->FindName(cpb.elementName);
-                            }
-                        }
-                    }
-                    const std::uint16_t spId = ResolveTriggerConditionPropertyId(cpb.rawPath);
-                    if (srcEl && spId != 0u) {
-                        paramVal = srcEl->GetValue(spId);
-                        hasParam = !std::holds_alternative<std::monostate>(paramVal);
-                    }
-                } else if (domains_) {
-                    ObjectRef cur = ResolveEffectiveDataContext(elem);
-                    if (cpb.hops.empty()) {
-                        paramVal = cur;
-                        hasParam = cur.valid();
-                    } else {
-                        for (std::size_t h = 0u; h < cpb.hops.size() && cur.valid(); ++h) {
-                            auto* heap = domains_->heapForObject(cur);
-                            if (!heap || !heap->isAlive(cur)) break;
-                            auto& hop = cpb.hops[h];
-                            const SymbolId rtTypeId = heap->objectTypeId(cur).value_or(0);
-                            if (program_ && rtTypeId != 0 &&
-                                (hop.declaringTypeId != rtTypeId || !hop.ToSlotHandle().valid())) {
-                                if (auto resolved = domains_->resolvePropertySlot(*program_, rtTypeId, hop.memberName)) {
-                                    hop.declaringTypeId = resolved->typeId;
-                                    hop.fieldIndex = resolved->backingFieldIndex;
-                                    hop.observableBitIndex = resolved->observableBitIndex;
-                                    hop.getterSymbolId = resolved->getterSymbolId;
-                                    hop.setterSymbolId = resolved->setterSymbolId;
-                                    hop.isAutoProperty = resolved->isAutoProperty;
-                                    hop.isObservable = resolved->isObservable;
-                                    hop.isReadOnly = resolved->isReadOnly;
-                                    hop.isSimState = resolved->isSimState;
-                                    hop.isSimCommand = resolved->isSimCommand;
-                                }
-                            }
-                            UnifiedValue hv{};
-                            const PropertySlotHandle sh = hop.ToSlotHandle();
-                            if (!(sh.valid()
-                                      ? domains_->readPropertySlotFast(DomainKind::Ui, cur, sh, hv, nullptr, uiInterpreter_)
-                                      : (hop.fieldIndex != PropertySlotHandle::InvalidIndex &&
-                                         domains_->readObjectField(DomainKind::Ui, cur, hop.fieldIndex, hv, nullptr)))) {
-                                break;
-                            }
-                            if (h + 1u < cpb.hops.size()) {
-                                const auto* nr = std::get_if<ObjectRef>(&hv);
-                                cur = (nr && nr->valid()) ? *nr : ObjectRef{};
-                            } else {
-                                paramVal = hv;
-                                hasParam = true;
-                            }
-                        }
-                    }
-                }
-                if (hasParam && cpb.converter != ValueConverterKind::None && bindingEngine_) {
-                    paramVal = bindingEngine_->ApplySingleValueConversion(
-                        cpb.converter,
-                        cpb.converterKey,
-                        cpb.converterParameter,
-                        cpb.converterSymbolId,
-                        cpb.convertBackSymbolId,
-                        paramVal,
-                        false);
-                }
+                hasParam = EvaluateRuntimeBindingOnce(
+                    elem,
+                    domains_,
+                    program_,
+                    uiInterpreter_,
+                    bindingEngine_,
+                    action.commandParameterBinding,
+                    paramVal);
             } else if (action.hasCommandParameter) {
                 paramVal = action.commandParameter;
                 hasParam = true;
@@ -1561,52 +2153,7 @@ void StyleTriggerEngine::ExecuteSingleInteractionAction(
                 }
             }
 
-            // Dynamic runtime fallback for commandMethodSymbolId if package wasn't pre-bound against concrete DataContext type
-            SymbolId methodSym = action.commandMethodSymbolId;
-            bool isSimCmd = action.isSimCommand;
-            if (methodSym == 0 && domains_ && program_) {
-                if (auto* heap = domains_->heapForObject(targetObj)) {
-                    const SymbolId rtTypeId = heap->objectTypeId(targetObj).value_or(0);
-                    if (const auto* typeSym = (rtTypeId != 0) ? program_->resolveType(rtTypeId) : nullptr) {
-                        std::string leafName = action.commandPath;
-                        if (const auto dot = leafName.rfind('.'); dot != std::string::npos) {
-                            leafName = leafName.substr(dot + 1u);
-                        }
-                        for (const auto& m : typeSym->methods) {
-                            if (m.name == leafName) {
-                                methodSym = m.id;
-                                break;
-                            }
-                        }
-                        if (methodSym == 0 && leafName.size() > 7u &&
-                            leafName.compare(leafName.size() - 7u, 7u, "Command") == 0) {
-                            const std::string baseCmd = leafName.substr(0u, leafName.size() - 7u);
-                            const std::string onBaseCmd = "On" + baseCmd;
-                            for (const auto& m : typeSym->methods) {
-                                if (m.name == baseCmd || m.name == onBaseCmd) {
-                                    methodSym = m.id;
-                                    break;
-                                }
-                            }
-                        }
-                        action.commandMethodSymbolId = methodSym;
-                    }
-                }
-                if (methodSym != 0) {
-                    if (const auto* loc = program_->resolveFunction(methodSym)) {
-                        if (loc->function && loc->function->simCommand) {
-                            isSimCmd = true;
-                            action.isSimCommand = true;
-                        }
-                    }
-                }
-            }
-
-            if (methodSym == 0) {
-                break;
-            }
-
-            // Coerce CommandParameter (e.g. XAML string literal "50") to match target method's parameter type
+            // Coerce CommandParameter (e.g. XAML string literal "50" or enum name) to match target method's parameter type
             if (hasParam && program_ && domains_) {
                 if (const auto* loc = program_->resolveFunction(methodSym)) {
                     if (loc->function && loc->function->parameterTypes.size() >= 2u) {
@@ -1620,9 +2167,29 @@ void StyleTriggerEngine::ExecuteSingleInteractionAction(
                                 const auto [ptr, ec] = std::from_chars(v.data(), v.data() + v.size(), iv);
                                 if (ec == std::errc{} && ptr == v.data() + v.size()) {
                                     paramVal = value::FromInt(iv);
+                                } else if (pt == rs_sem::PrimitiveType::Enum) {
+                                    bool resolvedEnum = false;
+                                    for (const auto& mod : program_->modules()) {
+                                        for (const auto& ts : mod.types) {
+                                            if (ts.kind == rs_sem::TypeKind::Enum &&
+                                                TryResolveEnumMemberByName(program_, ts.id, v, iv)) {
+                                                paramVal = value::FromInt(iv);
+                                                resolvedEnum = true;
+                                                break;
+                                            }
+                                        }
+                                        if (resolvedEnum) {
+                                            break;
+                                        }
+                                    }
                                 }
                             } else if (const auto* fv = std::get_if<FloatValue>(&paramVal)) {
                                 paramVal = value::FromInt(static_cast<std::int64_t>(std::llround(fv->value)));
+                            } else {
+                                EnumValue ev{};
+                                if (paramVal.tryGetEnum(ev)) {
+                                    paramVal = value::FromInt(ev.value);
+                                }
                             }
                         } else if (pt == rs_sem::PrimitiveType::Float) {
                             if (const auto* sv = std::get_if<StringValue>(&paramVal)) {

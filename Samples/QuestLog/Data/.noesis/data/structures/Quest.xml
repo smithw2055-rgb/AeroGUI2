@@ -1,0 +1,7 @@
+<Class Name="Quest">
+  <Property Name="Title" Type="String" StringMinWordCount="1" StringMaxWordCount="1"/>
+  <Property Name="Image" Type="Object" SubType="ImageSource" ImageSourcePath=""/>
+  <Property Name="Difficulty" Type="Enum" SubType="QuestLog.QuestDifficulty"/>
+  <Property Name="Description" Type="String" StringMinWordCount="3" StringMaxWordCount="10"/>
+  <Property Name="Completed" Type="Boolean"/>
+</Class>

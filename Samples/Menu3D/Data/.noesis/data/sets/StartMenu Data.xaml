@@ -1,0 +1,14 @@
+<vdctx:StartMenu xmlns:vdctx="clr-namespace:Menu3D">
+  <vdctx:StartMenu.Description>
+    <vdctx:MenuDescription Description="SELECT DIFFICULTY" AcceptText="ACCEPT" CancelText="BACK"/>
+  </vdctx:StartMenu.Description>
+  <vdctx:StartMenu.StartCasual>
+    <MessageCommand Message="Start Casual"/>
+  </vdctx:StartMenu.StartCasual>
+  <vdctx:StartMenu.StartNormal>
+    <MessageCommand Message="Start Normal"/>
+  </vdctx:StartMenu.StartNormal>
+  <vdctx:StartMenu.StartExpert>
+    <MessageCommand Message="Start Expert"/>
+  </vdctx:StartMenu.StartExpert>
+</vdctx:StartMenu>

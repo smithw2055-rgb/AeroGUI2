@@ -3,6 +3,7 @@
 #include "aero/render/FontAtlas.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <charconv>
 #include <cmath>
@@ -1016,9 +1017,15 @@ Matrix2D ParseXamlMatrix2DLiteral(std::string_view raw) noexcept {
 }
 
 std::uint16_t ResolveBuiltinPropertyId(std::string_view propertyName) noexcept {
-    if (propertyName == "Width" || propertyName == "ActualWidth" || propertyName == "d:DesignWidth") return PropId_Width;
-    if (propertyName == "Height" || propertyName == "ActualHeight" || propertyName == "d:DesignHeight") return PropId_Height;
+    propertyName = TrimWs(propertyName);
+    if (propertyName.size() >= 2u && propertyName.front() == '(' && propertyName.back() == ')') {
+        propertyName = TrimWs(propertyName.substr(1u, propertyName.size() - 2u));
+    }
+    if (propertyName == "Width" || propertyName == "ActualWidth") return PropId_Width;
+    if (propertyName == "Height" || propertyName == "ActualHeight") return PropId_Height;
     if (propertyName == "Custom.Number_Single" || propertyName == "Number_Single") return PropId_Value;
+    if (propertyName == "Custom.Index_Int32" || propertyName == "Index_Int32") return PropId_CustomIndexInt32;
+    if (propertyName == "Custom.State_Int32" || propertyName == "State_Int32") return PropId_CustomStateInt32;
     if (propertyName == "MinWidth") return PropId_MinWidth;
     if (propertyName == "MinHeight") return PropId_MinHeight;
     if (propertyName == "MaxWidth") return PropId_MaxWidth;
@@ -1115,7 +1122,7 @@ std::uint16_t ResolveBuiltinPropertyId(std::string_view propertyName) noexcept {
     if (propertyName == "MaxLength") return PropId_MaxLength;
     if (propertyName == "CaretIndex") return PropId_CaretIndex;
     if (propertyName == "IsDropDownOpen") return PropId_IsDropDownOpen;
-    if (propertyName == "SmallChange") return PropId_SmallChange;
+    if (propertyName == "SmallChange" || propertyName == "StepValue") return PropId_SmallChange;
     if (propertyName == "LargeChange") return PropId_LargeChange;
     if (propertyName == "IsVirtualizing" ||
         propertyName == "VirtualizingStackPanel.IsVirtualizing") {
@@ -1164,14 +1171,38 @@ std::uint16_t ResolveBuiltinPropertyId(std::string_view propertyName) noexcept {
     }
     if (propertyName == "Effect" || propertyName == "UIElement.Effect") return PropId_EffectParams;
     if (propertyName == "EffectKind") return PropId_EffectKind;
-    if (propertyName == "EffectColor") return PropId_EffectColor;
+    if (propertyName == "EffectColor" || propertyName == "BoxShadow.Color" ||
+        propertyName == "noesis:BoxShadow.Color" || propertyName == "DropShadowEffect.Color") {
+        return PropId_EffectColor;
+    }
     if (propertyName == "BlurRadius" || propertyName == "EffectBlurRadius") return PropId_EffectBlurRadius;
     if (propertyName == "ShadowDepth" || propertyName == "EffectShadowDepth") return PropId_EffectShadowDepth;
+    if (propertyName == "BackgroundOpacity" || propertyName == "FillOpacity") return PropId_BackgroundOpacity;
+    if (propertyName == "BorderOpacity" || propertyName == "StrokeOpacity") return PropId_BorderOpacity;
+    if (propertyName == "TextAlignment" || propertyName == "TextBlock.TextAlignment") return PropId_TextAlignment;
+    if (propertyName == "BlendingMode" || propertyName == "Element.BlendingMode" ||
+        propertyName == "noesis:Element.BlendingMode") return PropId_BlendingMode;
+    if (propertyName == "RichText.Text" || propertyName == "noesis:RichText.Text" ||
+        propertyName == "RichText") return PropId_RichText;
+    if (propertyName == "RefResolution" || propertyName == "LayoutScaler.RefResolution" ||
+        propertyName == "noesis:LayoutScaler.RefResolution") return PropId_RefResolution;
     return PropId_Tag;
 }
 
 std::uint16_t ResolveTriggerConditionPropertyId(std::string_view propertyName) noexcept {
     propertyName = TrimWs(propertyName);
+    while (!propertyName.empty() && propertyName.front() == '(') {
+        propertyName.remove_prefix(1);
+    }
+    while (!propertyName.empty() &&
+           (propertyName.back() == ')' || std::isspace(static_cast<unsigned char>(propertyName.back())))) {
+        propertyName.remove_suffix(1);
+    }
+    propertyName = TrimWs(propertyName);
+    const std::uint16_t fullBuiltin = ResolveBuiltinPropertyId(propertyName);
+    if (fullBuiltin != PropId_Tag || propertyName == "Tag") {
+        return fullBuiltin;
+    }
     if (const auto dot = propertyName.rfind('.'); dot != std::string_view::npos) {
         propertyName = propertyName.substr(dot + 1);
     }
@@ -1215,7 +1246,8 @@ std::uint16_t ResolveAnimationTargetPropertyId(std::string_view targetPropertyPa
         }
     }
     if (s.find("BlurRadius") != std::string_view::npos ||
-        (s.find("BlurEffect") != std::string_view::npos && s.find("Radius") != std::string_view::npos)) {
+        (s.find("BlurEffect") != std::string_view::npos && s.find("Radius") != std::string_view::npos) ||
+        (s.find("PixelateEffect") != std::string_view::npos && s.find("Size") != std::string_view::npos)) {
         return PropId_EffectBlurRadius;
     }
     if (s.find("ShadowDepth") != std::string_view::npos) {
@@ -1245,6 +1277,18 @@ std::uint16_t ResolveAnimationTargetPropertyId(std::string_view targetPropertyPa
         }
         if (s.find(".Y)") != std::string_view::npos || s.rfind(".Y") == s.size() - 2u) {
             return PropId_AnimTranslateY;
+        }
+    }
+    const bool mentionsBrushOpacity =
+        (s.find("Brush.Opacity") != std::string_view::npos) ||
+        (s.find(".Opacity") != std::string_view::npos && s.find("UIElement.Opacity") == std::string_view::npos &&
+         s.find("Effect.Opacity") == std::string_view::npos);
+    if (mentionsBrushOpacity) {
+        if (s.find("BorderBrush") != std::string_view::npos || s.find("Stroke") != std::string_view::npos) {
+            return PropId_BorderOpacity;
+        }
+        if (s.find("Background") != std::string_view::npos || s.find("Fill") != std::string_view::npos) {
+            return PropId_BackgroundOpacity;
         }
     }
     if (s.find("Background") != std::string_view::npos || s.find("Fill") != std::string_view::npos) {
@@ -1474,6 +1518,9 @@ namespace {
     }
     if (const auto* i = std::get_if<std::int64_t>(&v)) {
         return static_cast<float>(*i);
+    }
+    if (const auto* ev = std::get_if<EnumValue>(&v)) {
+        return static_cast<float>(ev->value);
     }
     if (const auto* b = std::get_if<bool>(&v)) {
         return *b ? 1.0f : 0.0f;
@@ -2024,6 +2071,9 @@ std::string FormatSingleBindingArgument(
             AppendFixedFloat32(s, fv->value, 1u, 0u, 4u);
             return s;
         }
+        if (const auto* ev = std::get_if<EnumValue>(&rawVal)) {
+            return std::to_string(ev->value);
+        }
         return rs_rt::valueToString(rawVal);
     }
 
@@ -2035,6 +2085,9 @@ std::string FormatSingleBindingArgument(
         hasNum = true;
     } else if (const auto* iv = std::get_if<std::int64_t>(&rawVal)) {
         numVal = static_cast<float>(*iv);
+        hasNum = true;
+    } else if (const auto* ev = std::get_if<EnumValue>(&rawVal)) {
+        numVal = static_cast<float>(ev->value);
         hasNum = true;
     } else if (const auto* b = std::get_if<bool>(&rawVal)) {
         numVal = *b ? 1.0f : 0.0f;
@@ -2457,6 +2510,12 @@ UnifiedValue ParseBuiltinLiteralPropertyValue(
             if (EqualsIgnoreCase(rawValue, "DropShadow") || EqualsIgnoreCase(rawValue, "DropShadowEffect") || rawValue == "2") {
                 return value::FromInt(2);
             }
+            if (EqualsIgnoreCase(rawValue, "Pixelate") || EqualsIgnoreCase(rawValue, "PixelateEffect") || rawValue == "3") {
+                return value::FromInt(3);
+            }
+            if (EqualsIgnoreCase(rawValue, "BackdropBlur") || rawValue == "4") {
+                return value::FromInt(4);
+            }
             return value::FromInt(0);
         }
 
@@ -2525,6 +2584,32 @@ UnifiedValue ParseBuiltinLiteralPropertyValue(
             if (EqualsIgnoreCase(rawValue, "Wrap") || rawValue == "1") return value::FromInt(1);
             if (EqualsIgnoreCase(rawValue, "WrapWithOverflow") || rawValue == "2") return value::FromInt(2);
             return value::FromInt(0); // NoWrap
+        case PropId_TextAlignment: {
+            const std::string_view t = TrimWs(rawValue);
+            if (EqualsIgnoreCase(t, "Center")) return value::FromInt(1);
+            if (EqualsIgnoreCase(t, "Right")) return value::FromInt(2);
+            if (EqualsIgnoreCase(t, "Justify")) return value::FromInt(3);
+            return value::FromInt(0);
+        }
+        case PropId_BlendingMode: {
+            const std::string_view t = TrimWs(rawValue);
+            if (EqualsIgnoreCase(t, "Multiply")) return value::FromInt(1);
+            if (EqualsIgnoreCase(t, "Screen")) return value::FromInt(2);
+            if (EqualsIgnoreCase(t, "Additive") || EqualsIgnoreCase(t, "Add") || EqualsIgnoreCase(t, "Plus")) return value::FromInt(3);
+            return value::FromInt(0);
+        }
+        case PropId_BackgroundOpacity:
+        case PropId_BorderOpacity:
+            return MakeFloat(std::clamp(ParseFloat32Fast(rawValue, 1.0f), 0.0f, 1.0f));
+        case PropId_RichText:
+            return value::FromString(std::string(rawValue));
+        case PropId_RefResolution: {
+            const auto nums = ParseFloatListFast(rawValue);
+            if (nums.size() >= 2u) {
+                return UnifiedValue{Float4Value{std::max(1.0f, nums[0]), std::max(1.0f, nums[1]), 0.0f, 0.0f}};
+            }
+            return UnifiedValue{Float4Value{960.0f, 540.0f, 0.0f, 0.0f}};
+        }
 
         case PropId_Stretch:
             if (EqualsIgnoreCase(rawValue, "None") || rawValue == "0") return value::FromInt(0);
@@ -2557,7 +2642,9 @@ UnifiedValue ParseBuiltinLiteralPropertyValue(
         case PropId_FirstColumn:
         case PropId_BackgroundGradientId:
         case PropId_ForegroundGradientId:
-        case PropId_BorderGradientId: {
+        case PropId_BorderGradientId:
+        case PropId_CustomIndexInt32:
+        case PropId_CustomStateInt32: {
             std::int64_t iv = 0;
             const auto [ptr, ec] = std::from_chars(rawValue.data(), rawValue.data() + rawValue.size(), iv);
             if (ec != std::errc{} || ptr == rawValue.data()) {
@@ -3222,6 +3309,12 @@ void VisitPackageValues(const AxbPackage& pkg, Fn&& fn) noexcept {
     auto visitInteractionActions = [&](const std::vector<AxbInteractionAction>& acts) noexcept {
         for (const auto& act : acts) {
             if (act.value.isTraceable()) fn(act.value);
+            if (act.valueBinding && act.valueBinding->fallbackValue.isTraceable()) {
+                fn(act.valueBinding->fallbackValue);
+            }
+            if (act.valueMultiBinding) {
+                visitMultiBindingRec(visitMultiBindingRec, *act.valueMultiBinding);
+            }
             if (act.commandParameter.isTraceable()) fn(act.commandParameter);
             if (act.commandParameterBinding.fallbackValue.isTraceable()) {
                 fn(act.commandParameterBinding.fallbackValue);
@@ -3276,6 +3369,9 @@ void VisitPackageValues(const AxbPackage& pkg, Fn&& fn) noexcept {
     for (const auto& st : pkg.styles) {
         for (const auto& setter : st.setters) {
             if (setter.value.isTraceable()) fn(setter.value);
+            if (setter.binding && setter.binding->fallbackValue.isTraceable()) {
+                fn(setter.binding->fallbackValue);
+            }
         }
         for (const auto& trig : st.triggers) {
             for (const auto& cond : trig.conditions) {
@@ -3342,7 +3438,7 @@ void AxbPackage::MarkValuesInPools() const noexcept {
 
 bool AxbPackage::BindAgainstProgram(
     const ProgramImage& program,
-    std::string_view rootDataTypeName,
+    std::string_view rootDataTypeOverride,
     const ExecutionDomainContext* domains) {
     ExecutionDomainContext localDomains;
     if (!domains) {
@@ -3350,78 +3446,98 @@ bool AxbPackage::BindAgainstProgram(
         domains = &localDomains;
     }
 
-    const std::string effectiveClassName = !rootDataTypeName.empty()
-        ? std::string(rootDataTypeName)
-        : className;
-
-    SymbolId classTypeId = 0;
-    if (!effectiveClassName.empty()) {
-        std::string canonical = effectiveClassName;
+    auto resolveTypeIdByName = [&](std::string_view rawName) -> SymbolId {
+        std::string trimmed(TrimWs(rawName));
+        if (trimmed.empty()) {
+            return 0;
+        }
+        std::string canonical = trimmed;
         if (canonical.find("::") == std::string::npos) {
             if (const auto lastDot = canonical.rfind('.'); lastDot != std::string::npos) {
                 canonical = canonical.substr(0, lastDot) + "::" + canonical.substr(lastDot + 1);
             }
         }
-        classTypeId = rs_sem::stableTypeId(canonical);
-        if (!program.resolveType(classTypeId)) {
-            for (const auto& mod : program.modules()) {
-                for (const auto& t : mod.types) {
-                    if (t.name == effectiveClassName ||
-                        (mod.name + "." + t.name) == effectiveClassName ||
-                        (mod.name + "::" + t.name) == effectiveClassName) {
-                        classTypeId = t.id;
-                        break;
-                    }
+        SymbolId foundId = rs_sem::stableTypeId(canonical);
+        if (program.resolveType(foundId)) {
+            return foundId;
+        }
+        for (const auto& mod : program.modules()) {
+            for (const auto& t : mod.types) {
+                if (t.name == trimmed ||
+                    (mod.name + "." + t.name) == trimmed ||
+                    (mod.name + "::" + t.name) == trimmed ||
+                    t.name == canonical ||
+                    (mod.name + "::" + t.name) == canonical) {
+                    return t.id;
                 }
             }
         }
-    }
+        return 0;
+    };
 
-    const rs_sem::TypeSymbol* rootTypeSym =
-        (classTypeId != 0) ? program.resolveType(classTypeId) : nullptr;
+    const std::string effectiveDataTypeName = !rootDataTypeOverride.empty()
+        ? std::string(rootDataTypeOverride)
+        : (!rootDataTypeName.empty() ? rootDataTypeName : className);
 
-    // 1. Bind __nativeRootHandle and x:Name control field indices on the partial class
-    if (rootTypeSym) {
-        for (std::size_t fIdx = 0; fIdx < rootTypeSym->fields.size(); ++fIdx) {
-            if (rootTypeSym->fields[fIdx].name == "__nativeRootHandle") {
+    const SymbolId wrapperTypeId = !className.empty()
+        ? resolveTypeIdByName(className)
+        : 0;
+    const SymbolId dataTypeId = !effectiveDataTypeName.empty()
+        ? resolveTypeIdByName(effectiveDataTypeName)
+        : wrapperTypeId;
+
+    const rs_sem::TypeSymbol* wrapperTypeSym =
+        (wrapperTypeId != 0) ? program.resolveType(wrapperTypeId) : nullptr;
+    const rs_sem::TypeSymbol* dataTypeSym =
+        (dataTypeId != 0) ? program.resolveType(dataTypeId) : nullptr;
+    const rs_sem::TypeSymbol* fieldsOwnerSym = wrapperTypeSym ? wrapperTypeSym : dataTypeSym;
+
+    auto findMethodOnTypeHierarchy = [&](const rs_sem::TypeSymbol* startSym,
+                                         std::string_view methodName) -> SymbolId {
+        if (!startSym || methodName.empty()) {
+            return 0;
+        }
+        const rs_sem::TypeSymbol* walkSym = startSym;
+        for (std::uint32_t depth = 0u; walkSym && depth < 16u; ++depth) {
+            for (const auto& m : walkSym->methods) {
+                if (m.name == methodName) {
+                    return m.id;
+                }
+            }
+            if (methodName.size() > 7u &&
+                methodName.compare(methodName.size() - 7u, 7u, "Command") == 0) {
+                const std::string baseCmd(methodName.substr(0u, methodName.size() - 7u));
+                const std::string onBaseCmd = "On" + baseCmd;
+                for (const auto& m : walkSym->methods) {
+                    if (m.name == baseCmd || m.name == onBaseCmd) {
+                        return m.id;
+                    }
+                }
+            }
+            walkSym = (walkSym->baseTypeId != 0 && walkSym->baseTypeId != walkSym->id)
+                ? program.resolveType(walkSym->baseTypeId)
+                : nullptr;
+        }
+        return 0;
+    };
+
+    // 1. Bind __nativeRootHandle and x:Name control field indices ALWAYS on MainWindow (wrapperTypeSym) when present
+    if (fieldsOwnerSym) {
+        for (std::size_t fIdx = 0; fIdx < fieldsOwnerSym->fields.size(); ++fIdx) {
+            if (fieldsOwnerSym->fields[fIdx].name == "__nativeRootHandle") {
                 rootHandleFieldIndex = static_cast<std::uint32_t>(fIdx);
                 break;
             }
         }
         for (auto& nc : namedControls) {
-            for (std::size_t fIdx = 0; fIdx < rootTypeSym->fields.size(); ++fIdx) {
-                if (rootTypeSym->fields[fIdx].name == nc.name) {
+            if (!IsValidRealScriptFieldIdentifier(nc.name)) {
+                continue;
+            }
+            for (std::size_t fIdx = 0; fIdx < fieldsOwnerSym->fields.size(); ++fIdx) {
+                if (fieldsOwnerSym->fields[fIdx].name == nc.name) {
                     nc.fieldIndexInClass = static_cast<std::uint32_t>(fIdx);
                     break;
                 }
-            }
-        }
-    }
-
-    // 2. Bind event handler method SymbolIds on the partial class (including Command -> Start/OnStart fallback)
-    if (rootTypeSym) {
-        for (auto& ev : eventBindings) {
-            for (const auto& m : rootTypeSym->methods) {
-                if (m.name == ev.handlerMethodName) {
-                    ev.handlerSymbolId = m.id;
-                    break;
-                }
-            }
-            if (ev.handlerSymbolId == 0 && ev.handlerMethodName.size() > 7 &&
-                ev.handlerMethodName.compare(ev.handlerMethodName.size() - 7, 7, "Command") == 0) {
-                const std::string baseCmd = ev.handlerMethodName.substr(0, ev.handlerMethodName.size() - 7);
-                const std::string onBaseCmd = "On" + baseCmd;
-                for (const auto& m : rootTypeSym->methods) {
-                    if (m.name == baseCmd || m.name == onBaseCmd) {
-                        ev.handlerSymbolId = m.id;
-                        break;
-                    }
-                }
-            }
-        }
-        for (auto& inst : instructions) {
-            if (inst.opcode == AxbOpcode::BindEvent && inst.strIdx0 < eventBindings.size()) {
-                inst.symbolId = eventBindings[inst.strIdx0].handlerSymbolId;
             }
         }
     }
@@ -3464,30 +3580,34 @@ bool AxbPackage::BindAgainstProgram(
         if (rawNextTypeName.empty()) {
             return 0;
         }
-        std::string canonicalNext = rawNextTypeName;
-        if (canonicalNext.find("::") == std::string::npos) {
-            if (const auto lastDot = canonicalNext.rfind('.'); lastDot != std::string::npos) {
-                canonicalNext = canonicalNext.substr(0, lastDot) + "::" + canonicalNext.substr(lastDot + 1);
+
+        auto unwrapCollectionElementType = [&](std::string_view containerTypeName) -> SymbolId {
+            std::string_view elemName = TrimWs(containerTypeName);
+            if (elemName.size() > 2u && elemName.substr(elemName.size() - 2u) == "[]") {
+                return resolveTypeIdByName(elemName.substr(0u, elemName.size() - 2u));
             }
-        }
-        SymbolId nextTypeId = rs_sem::stableTypeId(canonicalNext);
-        if (!program.resolveType(nextTypeId)) {
-            nextTypeId = 0;
-            for (const auto& mod : program.modules()) {
-                for (const auto& t : mod.types) {
-                    if (t.name == rawNextTypeName ||
-                        (mod.name + "." + t.name) == rawNextTypeName ||
-                        (mod.name + "::" + t.name) == rawNextTypeName) {
-                        nextTypeId = t.id;
-                        break;
+            const auto lt = elemName.find('<');
+            const auto gt = elemName.rfind('>');
+            if (lt != std::string_view::npos && gt != std::string_view::npos && gt > lt + 1u) {
+                return resolveTypeIdByName(elemName.substr(lt + 1u, gt - lt - 1u));
+            }
+            const SymbolId containerId = resolveTypeIdByName(elemName);
+            if (const rs_sem::TypeSymbol* cSym = (containerId != 0) ? program.resolveType(containerId) : nullptr) {
+                for (const auto& f : cSym->fields) {
+                    if (f.name == "_items" && f.typeName.size() > 2u &&
+                        f.typeName.compare(f.typeName.size() - 2u, 2u, "[]") == 0) {
+                        return resolveTypeIdByName(
+                            std::string_view(f.typeName).substr(0u, f.typeName.size() - 2u));
                     }
                 }
-                if (nextTypeId != 0 && program.resolveType(nextTypeId)) {
-                    break;
-                }
             }
+            return 0;
+        };
+
+        if (hop.collectionIndex >= 0) {
+            return unwrapCollectionElementType(rawNextTypeName);
         }
-        return program.resolveType(nextTypeId) ? nextTypeId : 0;
+        return resolveTypeIdByName(rawNextTypeName);
     };
 
     auto applyResolvedSlotToHop = [](AxbCompiledHop& hop, const PropertySlotHandle& slot) noexcept {
@@ -3503,33 +3623,111 @@ bool AxbPackage::BindAgainstProgram(
         hop.isSimCommand = slot.isSimCommand;
     };
 
+    auto normalizeHopIndexedName = [](AxbCompiledHop& hop) {
+        if (hop.collectionIndex < 0 && hop.memberName.find('[') != std::string::npos) {
+            std::string baseName;
+            std::int32_t parsedIdx = -1;
+            if (SplitIndexedMemberName(hop.memberName, baseName, parsedIdx)) {
+                hop.memberName = std::move(baseName);
+                hop.collectionIndex = parsedIdx;
+            }
+        }
+    };
+
     auto bindHopVector = [&](std::vector<AxbCompiledHop>& hops, SymbolId rootOwnerId) {
         SymbolId currentHopOwnerId = rootOwnerId;
         for (auto& hop : hops) {
+            normalizeHopIndexedName(hop);
             if (currentHopOwnerId == 0) {
-                break;
+                continue;
             }
             if (auto slotOpt = domains->resolvePropertySlot(
                     program, currentHopOwnerId, hop.memberName)) {
                 applyResolvedSlotToHop(hop, *slotOpt);
             }
             currentHopOwnerId = resolveMemberTargetTypeId(currentHopOwnerId, hop);
+            hop.targetTypeId = currentHopOwnerId;
+            if (const rs_sem::TypeSymbol* tSym =
+                    (currentHopOwnerId != 0) ? program.resolveType(currentHopOwnerId) : nullptr) {
+                hop.targetIsEnum = (tSym->kind == rs_sem::TypeKind::Enum);
+            }
         }
     };
 
-    // 2b. Bind timeline motionEvents handler method SymbolIds on the partial class
-    if (rootTypeSym) {
+    // 2. Bind event handler method SymbolIds: check MainWindow (wrapperTypeSym) FIRST, then ViewModel / sub-object path
+    if (wrapperTypeSym || dataTypeSym) {
+        for (auto& ev : eventBindings) {
+            ev.targetIsWrapper = false;
+            ev.prefixHops.clear();
+            if (wrapperTypeSym && ev.handlerMethodName.find('.') == std::string::npos) {
+                const SymbolId mId = findMethodOnTypeHierarchy(wrapperTypeSym, ev.handlerMethodName);
+                if (mId != 0) {
+                    ev.handlerSymbolId = mId;
+                    ev.targetIsWrapper = true;
+                    continue;
+                }
+            }
+            if (dataTypeSym) {
+                if (ev.handlerMethodName.find('.') == std::string::npos) {
+                    const SymbolId mId = findMethodOnTypeHierarchy(dataTypeSym, ev.handlerMethodName);
+                    if (mId != 0) {
+                        ev.handlerSymbolId = mId;
+                    }
+                } else {
+                    std::size_t segPos = 0u;
+                    std::vector<std::string_view> segs;
+                    while (segPos < ev.handlerMethodName.size()) {
+                        const std::size_t dot = ev.handlerMethodName.find('.', segPos);
+                        const std::string_view seg = (dot == std::string::npos)
+                            ? std::string_view(ev.handlerMethodName).substr(segPos)
+                            : std::string_view(ev.handlerMethodName).substr(segPos, dot - segPos);
+                        if (!seg.empty()) {
+                            segs.push_back(seg);
+                        }
+                        if (dot == std::string::npos) break;
+                        segPos = dot + 1u;
+                    }
+                    if (segs.size() >= 2u) {
+                        for (std::size_t si = 0u; si + 1u < segs.size(); ++si) {
+                            AxbCompiledHop hop{};
+                            hop.memberName = std::string(segs[si]);
+                            normalizeHopIndexedName(hop);
+                            ev.prefixHops.push_back(std::move(hop));
+                        }
+                        bindHopVector(ev.prefixHops, dataTypeId);
+                        const SymbolId subOwnerId = !ev.prefixHops.empty()
+                            ? ev.prefixHops.back().targetTypeId
+                            : dataTypeId;
+                        const rs_sem::TypeSymbol* subOwnerSym =
+                            (subOwnerId != 0) ? program.resolveType(subOwnerId) : nullptr;
+                        if (subOwnerSym) {
+                            ev.handlerSymbolId = findMethodOnTypeHierarchy(subOwnerSym, segs.back());
+                        }
+                    }
+                }
+            }
+        }
+        for (auto& inst : instructions) {
+            if (inst.opcode == AxbOpcode::BindEvent && inst.strIdx0 < eventBindings.size()) {
+                inst.symbolId = eventBindings[inst.strIdx0].handlerSymbolId;
+            }
+        }
+    }
+
+    // 2b. Bind timeline motionEvents handler method SymbolIds (MainWindow first, then ViewModel)
+    if (wrapperTypeSym || dataTypeSym) {
         for (auto& mev : motionEvents) {
             const std::string_view evName = GetString(mev.eventNameStrIdx);
             if (evName.empty()) {
                 continue;
             }
             const std::string onEvName = "On" + std::string(evName);
-            for (const auto& m : rootTypeSym->methods) {
-                if (m.name == evName || m.name == onEvName) {
-                    mev.handlerSymbolId = m.id;
-                    break;
-                }
+            SymbolId mId = findMethodOnTypeHierarchy(wrapperTypeSym, evName);
+            if (mId == 0) mId = findMethodOnTypeHierarchy(wrapperTypeSym, onEvName);
+            if (mId == 0) mId = findMethodOnTypeHierarchy(dataTypeSym, evName);
+            if (mId == 0) mId = findMethodOnTypeHierarchy(dataTypeSym, onEvName);
+            if (mId != 0) {
+                mev.handlerSymbolId = mId;
             }
         }
     }
@@ -3590,13 +3788,39 @@ bool AxbPackage::BindAgainstProgram(
                 srcCh.converterKey,
                 srcCh.converterSymbolId,
                 srcCh.convertBackSymbolId);
+            for (auto& h : srcCh.hops) {
+                normalizeHopIndexedName(h);
+            }
             if (srcCh.elementName.empty() && srcCh.relativeAncestorType.empty() && !srcCh.relativeSelf) {
-                bindHopVector(srcCh.hops, classTypeId);
+                bindHopVector(srcCh.hops, dataTypeId);
             }
         }
     };
 
     auto bindActionCommand = [&](AxbInteractionAction& act) {
+        if (act.kind == InteractionActionKind::ChangeProperty) {
+            if (act.valueBinding) {
+                resolveConverterSymbols(
+                    act.valueBinding->converter,
+                    act.valueBinding->converterKey,
+                    act.valueBinding->converterSymbolId,
+                    act.valueBinding->convertBackSymbolId);
+                for (auto& h : act.valueBinding->hops) {
+                    normalizeHopIndexedName(h);
+                }
+                if (act.valueBinding->nestedMultiBinding) {
+                    bindMultiRec(bindMultiRec, *act.valueBinding->nestedMultiBinding);
+                } else if (act.valueBinding->elementName.empty() &&
+                           act.valueBinding->relativeAncestorType.empty() &&
+                           !act.valueBinding->relativeSelf) {
+                    bindHopVector(act.valueBinding->hops, dataTypeId);
+                }
+            }
+            if (act.valueMultiBinding) {
+                bindMultiRec(bindMultiRec, *act.valueMultiBinding);
+            }
+            return;
+        }
         if (act.kind != InteractionActionKind::InvokeCommand) {
             return;
         }
@@ -3606,13 +3830,16 @@ bool AxbPackage::BindAgainstProgram(
                 act.commandParameterBinding.converterKey,
                 act.commandParameterBinding.converterSymbolId,
                 act.commandParameterBinding.convertBackSymbolId);
+            for (auto& h : act.commandParameterBinding.hops) {
+                normalizeHopIndexedName(h);
+            }
             if (act.commandParameterBinding.nestedMultiBinding) {
                 bindMultiRec(bindMultiRec, *act.commandParameterBinding.nestedMultiBinding);
             }
             if (act.commandParameterBinding.elementName.empty() &&
                 act.commandParameterBinding.relativeAncestorType.empty() &&
                 !act.commandParameterBinding.relativeSelf) {
-                bindHopVector(act.commandParameterBinding.hops, classTypeId);
+                bindHopVector(act.commandParameterBinding.hops, dataTypeId);
             }
         }
         if (act.commandPath.empty() && act.commandHops.empty()) {
@@ -3628,13 +3855,42 @@ bool AxbPackage::BindAgainstProgram(
                 if (!seg.empty()) {
                     AxbCompiledHop hop{};
                     hop.memberName = std::string(seg);
+                    normalizeHopIndexedName(hop);
                     act.commandHops.push_back(std::move(hop));
                 }
                 if (dot == std::string::npos) break;
                 segPos = dot + 1u;
             }
+        } else {
+            for (auto& h : act.commandHops) {
+                normalizeHopIndexedName(h);
+            }
         }
-        SymbolId ownerTypeId = classTypeId;
+
+        std::string leafCmd = !act.commandHops.empty()
+            ? act.commandHops.back().memberName
+            : act.commandPath;
+        if (const auto dot = leafCmd.rfind('.'); dot != std::string::npos) {
+            leafCmd = leafCmd.substr(dot + 1u);
+        }
+
+        // Check MainWindow (wrapperTypeSym) FIRST for single-hop InvokeCommandAction!
+        act.commandTargetsWrapper = false;
+        if (wrapperTypeSym && act.commandHops.size() <= 1u && !leafCmd.empty()) {
+            const SymbolId wrapperMethodId = findMethodOnTypeHierarchy(wrapperTypeSym, leafCmd);
+            if (wrapperMethodId != 0) {
+                act.commandMethodSymbolId = wrapperMethodId;
+                act.commandTargetsWrapper = true;
+                if (const auto* loc = program.resolveFunction(act.commandMethodSymbolId)) {
+                    if (loc->function && loc->function->simCommand) {
+                        act.isSimCommand = true;
+                    }
+                }
+                return;
+            }
+        }
+
+        SymbolId ownerTypeId = dataTypeId;
         if (act.commandHops.size() > 1u) {
             for (std::size_t hi = 0u; hi + 1u < act.commandHops.size(); ++hi) {
                 auto& hop = act.commandHops[hi];
@@ -3645,6 +3901,7 @@ bool AxbPackage::BindAgainstProgram(
                     applyResolvedSlotToHop(hop, *slotOpt);
                 }
                 ownerTypeId = resolveMemberTargetTypeId(ownerTypeId, hop);
+                hop.targetTypeId = ownerTypeId;
             }
         }
         if (!act.commandHops.empty() && ownerTypeId != 0) {
@@ -3658,38 +3915,8 @@ bool AxbPackage::BindAgainstProgram(
         }
         const rs_sem::TypeSymbol* methodOwnerSym =
             (ownerTypeId != 0) ? program.resolveType(ownerTypeId) : nullptr;
-
-        std::string leafCmd = !act.commandHops.empty()
-            ? act.commandHops.back().memberName
-            : act.commandPath;
-        if (const auto dot = leafCmd.rfind('.'); dot != std::string::npos) {
-            leafCmd = leafCmd.substr(dot + 1u);
-        }
         if (methodOwnerSym && !leafCmd.empty()) {
-            act.commandMethodSymbolId = 0;
-            const rs_sem::TypeSymbol* walkSym = methodOwnerSym;
-            for (std::uint32_t baseDepth = 0u; walkSym && baseDepth < 16u && act.commandMethodSymbolId == 0; ++baseDepth) {
-                for (const auto& m : walkSym->methods) {
-                    if (m.name == leafCmd) {
-                        act.commandMethodSymbolId = m.id;
-                        break;
-                    }
-                }
-                if (act.commandMethodSymbolId == 0 && leafCmd.size() > 7u &&
-                    leafCmd.compare(leafCmd.size() - 7u, 7u, "Command") == 0) {
-                    const std::string baseCmd = leafCmd.substr(0u, leafCmd.size() - 7u);
-                    const std::string onBaseCmd = "On" + baseCmd;
-                    for (const auto& m : walkSym->methods) {
-                        if (m.name == baseCmd || m.name == onBaseCmd) {
-                            act.commandMethodSymbolId = m.id;
-                            break;
-                        }
-                    }
-                }
-                walkSym = (walkSym->baseTypeId != 0 && walkSym->baseTypeId != walkSym->id)
-                    ? program.resolveType(walkSym->baseTypeId)
-                    : nullptr;
-            }
+            act.commandMethodSymbolId = findMethodOnTypeHierarchy(methodOwnerSym, leafCmd);
         }
         if (act.commandMethodSymbolId != 0) {
             if (const auto* loc = program.resolveFunction(act.commandMethodSymbolId)) {
@@ -3700,27 +3927,70 @@ bool AxbPackage::BindAgainstProgram(
         }
     };
 
-    // 3. Bind multi-hop PropertySlotHandles & converter symbols in bindingChains and multiBindings
+    auto bindConditionEnumLiteral = [&](AxbTriggerCondition& cond) {
+        if (cond.sourceKind != TriggerConditionSource::DataContextBinding ||
+            cond.compiledHops.empty()) {
+            return;
+        }
+        const auto& leafHop = cond.compiledHops.back();
+        if (!leafHop.targetIsEnum || leafHop.targetTypeId == 0) {
+            return;
+        }
+        if (const auto* sv = std::get_if<StringValue>(&cond.expectedValue)) {
+            std::int64_t enumVal = 0;
+            if (TryResolveEnumMemberByName(&program, leafHop.targetTypeId, sv->view(), enumVal)) {
+                cond.expectedValue = value::FromInt(enumVal);
+            }
+        }
+    };
+
+    // 3. Bind multi-hop PropertySlotHandles & converter symbols in bindingChains and multiBindings (against ViewModel!)
     for (auto& chain : bindingChains) {
         resolveConverterSymbols(
             chain.converter,
             chain.converterKey,
             chain.converterSymbolId,
             chain.convertBackSymbolId);
+        for (auto& h : chain.hops) {
+            normalizeHopIndexedName(h);
+        }
         if (chain.nestedMultiBinding) {
             bindMultiRec(bindMultiRec, *chain.nestedMultiBinding);
         }
         if (!chain.elementName.empty() || !chain.relativeAncestorType.empty() || chain.relativeSelf) {
             continue;
         }
-        bindHopVector(chain.hops, classTypeId);
+        bindHopVector(chain.hops, dataTypeId);
     }
     for (auto& mb : multiBindings) {
         bindMultiRec(bindMultiRec, mb);
     }
 
+    auto bindSetterBindings = [&](std::vector<AxbPropertySetter>& setters) {
+        for (auto& setter : setters) {
+            if (setter.hasBinding && setter.binding) {
+                resolveConverterSymbols(
+                    setter.binding->converter,
+                    setter.binding->converterKey,
+                    setter.binding->converterSymbolId,
+                    setter.binding->convertBackSymbolId);
+                for (auto& h : setter.binding->hops) {
+                    normalizeHopIndexedName(h);
+                }
+                if (setter.binding->nestedMultiBinding) {
+                    bindMultiRec(bindMultiRec, *setter.binding->nestedMultiBinding);
+                } else if (setter.binding->elementName.empty() &&
+                           setter.binding->relativeAncestorType.empty() &&
+                           !setter.binding->relativeSelf) {
+                    bindHopVector(setter.binding->hops, dataTypeId);
+                }
+            }
+        }
+    };
+
     auto bindControlTemplate = [&](AxbControlTemplate& ct) {
         for (auto& trig : ct.triggers) {
+            bindSetterBindings(trig.setters);
             for (auto& cond : trig.conditions) {
                 SymbolId dummyBack = 0;
                 resolveConverterSymbols(
@@ -3728,10 +3998,14 @@ bool AxbPackage::BindAgainstProgram(
                     cond.converterKey,
                     cond.converterSymbolId,
                     dummyBack);
-                if (classTypeId != 0 &&
+                for (auto& h : cond.compiledHops) {
+                    normalizeHopIndexedName(h);
+                }
+                if (dataTypeId != 0 &&
                     cond.sourceKind == TriggerConditionSource::DataContextBinding &&
                     !cond.compiledHops.empty()) {
-                    bindHopVector(cond.compiledHops, classTypeId);
+                    bindHopVector(cond.compiledHops, dataTypeId);
+                    bindConditionEnumLiteral(cond);
                 }
             }
             for (auto& act : trig.enterActions) {
@@ -3747,13 +4021,18 @@ bool AxbPackage::BindAgainstProgram(
             }
         }
         if (ct.templatePackage) {
-            (void)ct.templatePackage->BindAgainstProgram(program, effectiveClassName, domains);
+            if (ct.templatePackage->className.empty() && !className.empty()) {
+                ct.templatePackage->className = className;
+            }
+            (void)ct.templatePackage->BindAgainstProgram(program, effectiveDataTypeName, domains);
         }
     };
 
-    // 4. Bind DataTrigger / MultiDataTrigger compiledHops & Interaction actions against root DataType
+    // 4. Bind DataTrigger / MultiDataTrigger compiledHops & Interaction actions against root DataType (ViewModel)
     for (auto& style : styles) {
+        bindSetterBindings(style.setters);
         for (auto& trig : style.triggers) {
+            bindSetterBindings(trig.setters);
             for (auto& cond : trig.conditions) {
                 SymbolId dummyBack = 0;
                 resolveConverterSymbols(
@@ -3761,10 +4040,14 @@ bool AxbPackage::BindAgainstProgram(
                     cond.converterKey,
                     cond.converterSymbolId,
                     dummyBack);
-                if (classTypeId != 0 &&
+                for (auto& h : cond.compiledHops) {
+                    normalizeHopIndexedName(h);
+                }
+                if (dataTypeId != 0 &&
                     cond.sourceKind == TriggerConditionSource::DataContextBinding &&
                     !cond.compiledHops.empty()) {
-                    bindHopVector(cond.compiledHops, classTypeId);
+                    bindHopVector(cond.compiledHops, dataTypeId);
+                    bindConditionEnumLiteral(cond);
                 }
             }
             for (auto& act : trig.enterActions) {
@@ -3784,10 +4067,16 @@ bool AxbPackage::BindAgainstProgram(
         }
     }
 
-    // 5. Bind nested DataTemplate & ControlTemplate sub-packages
+    // 5. Bind nested DataTemplate & ControlTemplate sub-packages (propagating MainWindow className for wrapper commands!)
     for (auto& dt : dataTemplates) {
         if (dt.templatePackage) {
-            (void)dt.templatePackage->BindAgainstProgram(program, dt.dataTypeName, domains);
+            if (dt.templatePackage->className.empty() && !className.empty()) {
+                dt.templatePackage->className = className;
+            }
+            const std::string subDataType = !dt.dataTypeName.empty()
+                ? dt.dataTypeName
+                : effectiveDataTypeName;
+            (void)dt.templatePackage->BindAgainstProgram(program, subDataType, domains);
         }
     }
     for (auto& ct : controlTemplates) {
@@ -3878,7 +4167,11 @@ std::vector<std::uint8_t> AxbPackage::Serialize() const {
         WriteU8(out, static_cast<std::uint8_t>(chain.mode));
         WriteU32(out, static_cast<std::uint32_t>(chain.hops.size()));
         for (const auto& hop : chain.hops) {
-            WriteString(out, hop.memberName);
+            const std::string wireMemberName =
+                (hop.collectionIndex >= 0 && hop.memberName.find('[') == std::string::npos)
+                    ? (hop.memberName + "[" + std::to_string(hop.collectionIndex) + "]")
+                    : hop.memberName;
+            WriteString(out, wireMemberName);
             WriteU64(out, hop.declaringTypeId);
             WriteU32(out, hop.fieldIndex);
             WriteU8(out, hop.observableBitIndex);
@@ -4086,7 +4379,11 @@ std::vector<std::uint8_t> AxbPackage::Serialize() const {
                     WriteString(out, cond.bindingPath);
                     WriteU32(out, static_cast<std::uint32_t>(cond.compiledHops.size()));
                     for (const auto& hop : cond.compiledHops) {
-                        WriteString(out, hop.memberName);
+                        const std::string wireMemberName =
+                            (hop.collectionIndex >= 0 && hop.memberName.find('[') == std::string::npos)
+                                ? (hop.memberName + "[" + std::to_string(hop.collectionIndex) + "]")
+                                : hop.memberName;
+                        WriteString(out, wireMemberName);
                         WriteU64(out, hop.declaringTypeId);
                         WriteU32(out, hop.fieldIndex);
                         WriteU8(out, hop.observableBitIndex);
@@ -4307,7 +4604,11 @@ std::vector<std::uint8_t> AxbPackage::Serialize() const {
                     WriteString(out, cond.bindingPath);
                     WriteU32(out, static_cast<std::uint32_t>(cond.compiledHops.size()));
                     for (const auto& hop : cond.compiledHops) {
-                        WriteString(out, hop.memberName);
+                        const std::string wireMemberName =
+                            (hop.collectionIndex >= 0 && hop.memberName.find('[') == std::string::npos)
+                                ? (hop.memberName + "[" + std::to_string(hop.collectionIndex) + "]")
+                                : hop.memberName;
+                        WriteString(out, wireMemberName);
                         WriteU64(out, hop.declaringTypeId);
                         WriteU32(out, hop.fieldIndex);
                         WriteU8(out, hop.observableBitIndex);
@@ -4369,7 +4670,11 @@ std::vector<std::uint8_t> AxbPackage::Serialize() const {
         auto writeHopVec = [&](const std::vector<AxbCompiledHop>& hops) {
             WriteU32(out, static_cast<std::uint32_t>(hops.size()));
             for (const auto& hop : hops) {
-                WriteString(out, hop.memberName);
+                const std::string wireMemberName =
+                    (hop.collectionIndex >= 0 && hop.memberName.find('[') == std::string::npos)
+                        ? (hop.memberName + "[" + std::to_string(hop.collectionIndex) + "]")
+                        : hop.memberName;
+                WriteString(out, wireMemberName);
                 WriteU64(out, hop.declaringTypeId);
                 WriteU32(out, hop.fieldIndex);
                 WriteU8(out, hop.observableBitIndex);
@@ -4605,6 +4910,14 @@ bool DeserializeAxbPackageWithDepth(
             hop.isReadOnly = (hopFlags & 0x04u) != 0;
             hop.isSimState = (hopFlags & 0x08u) != 0;
             hop.isSimCommand = (hopFlags & 0x10u) != 0;
+            {
+                std::string baseName;
+                std::int32_t parsedIdx = -1;
+                if (SplitIndexedMemberName(hop.memberName, baseName, parsedIdx)) {
+                    hop.memberName = std::move(baseName);
+                    hop.collectionIndex = parsedIdx;
+                }
+            }
         }
     }
 
@@ -4986,6 +5299,14 @@ bool DeserializeAxbPackageWithDepth(
                             hop.isReadOnly = (hopFlags & 0x04u) != 0u;
                             hop.isSimState = (hopFlags & 0x08u) != 0u;
                             hop.isSimCommand = (hopFlags & 0x10u) != 0u;
+                            {
+                                std::string baseName;
+                                std::int32_t parsedIdx = -1;
+                                if (SplitIndexedMemberName(hop.memberName, baseName, parsedIdx)) {
+                                    hop.memberName = std::move(baseName);
+                                    hop.collectionIndex = parsedIdx;
+                                }
+                            }
                         }
                     }
                 }
@@ -5401,6 +5722,14 @@ bool DeserializeAxbPackageWithDepth(
                         hop.isReadOnly = (hopFlags & 0x04u) != 0u;
                         hop.isSimState = (hopFlags & 0x08u) != 0u;
                         hop.isSimCommand = (hopFlags & 0x10u) != 0u;
+                        {
+                            std::string baseName;
+                            std::int32_t parsedIdx = -1;
+                            if (SplitIndexedMemberName(hop.memberName, baseName, parsedIdx)) {
+                                hop.memberName = std::move(baseName);
+                                hop.collectionIndex = parsedIdx;
+                            }
+                        }
                     }
                 }
                 if (!readCtpSetterList(trig.setters) ||
@@ -5527,6 +5856,14 @@ bool DeserializeAxbPackageWithDepth(
                 hop.isReadOnly = (hopFlags & 0x04u) != 0u;
                 hop.isSimState = (hopFlags & 0x08u) != 0u;
                 hop.isSimCommand = (hopFlags & 0x10u) != 0u;
+                {
+                    std::string baseName;
+                    std::int32_t parsedIdx = -1;
+                    if (SplitIndexedMemberName(hop.memberName, baseName, parsedIdx)) {
+                        hop.memberName = std::move(baseName);
+                        hop.collectionIndex = parsedIdx;
+                    }
+                }
             }
             return true;
         };
@@ -6728,11 +7065,68 @@ struct RiveCubicVertex {
 
 struct RiveResolvedPaint {
     bool hasFill = false;
+    bool evenOddFill = false;
     Color fillColor{1.0f, 1.0f, 1.0f, 1.0f};
     bool hasStroke = false;
     Color strokeColor{0.0f, 0.0f, 0.0f, 1.0f};
     float strokeThickness = 0.0f;
 };
+
+[[nodiscard]] std::string TransformRiveAbsoluteSvgPath(
+    std::string_view svg,
+    float tx,
+    float ty,
+    float rotRad,
+    float sx,
+    float sy) {
+    const bool isIdentity =
+        (std::fabs(tx) <= 1e-4f) && (std::fabs(ty) <= 1e-4f) &&
+        (std::fabs(rotRad) <= 1e-5f) && (std::fabs(sx - 1.0f) <= 1e-4f) &&
+        (std::fabs(sy - 1.0f) <= 1e-4f);
+    if (isIdentity || svg.empty()) {
+        return std::string(svg);
+    }
+    const float cs = std::cos(rotRad);
+    const float sn = std::sin(rotRad);
+    const float m00 = cs * sx;
+    const float m01 = -sn * sy;
+    const float m10 = sn * sx;
+    const float m11 = cs * sy;
+    std::string out;
+    out.reserve(svg.size() + 32u);
+    std::size_t pos = 0u;
+    while (pos < svg.size()) {
+        SkipSvgDelimiters(svg, pos);
+        if (pos >= svg.size()) break;
+        const char ch = svg[pos];
+        if (ch == 'M' || ch == 'L') {
+            ++pos;
+            float x = 0.0f, y = 0.0f;
+            if (TryReadSvgFloat(svg, pos, x) && TryReadSvgFloat(svg, pos, y)) {
+                if (!out.empty() && out.back() != ' ') out.push_back(' ');
+                out.push_back(ch);
+                AppendSvgPt(out, m00 * x + m01 * y + tx, m10 * x + m11 * y + ty);
+            }
+        } else if (ch == 'C') {
+            ++pos;
+            float x1 = 0.0f, y1 = 0.0f, x2 = 0.0f, y2 = 0.0f, x = 0.0f, y = 0.0f;
+            if (TryReadSvgFloat(svg, pos, x1) && TryReadSvgFloat(svg, pos, y1) &&
+                TryReadSvgFloat(svg, pos, x2) && TryReadSvgFloat(svg, pos, y2) &&
+                TryReadSvgFloat(svg, pos, x) && TryReadSvgFloat(svg, pos, y)) {
+                out.push_back('C');
+                AppendSvgPt(out, m00 * x1 + m01 * y1 + tx, m10 * x1 + m11 * y1 + ty); out.push_back(' ');
+                AppendSvgPt(out, m00 * x2 + m01 * y2 + tx, m10 * x2 + m11 * y2 + ty); out.push_back(' ');
+                AppendSvgPt(out, m00 * x + m01 * y + tx, m10 * x + m11 * y + ty);
+            }
+        } else if (ch == 'Z' || ch == 'z') {
+            ++pos;
+            out.push_back('Z');
+        } else {
+            ++pos;
+        }
+    }
+    return out;
+}
 
 [[nodiscard]] bool ResolveRivePaintNodeColor(
     const RiveDecodedArtboard& ab,
@@ -6799,6 +7193,7 @@ struct RiveResolvedPaint {
             Color fc{};
             if (ResolveRivePaintNodeColor(ab, cIdx, childrenMap, fc)) {
                 res.hasFill = true;
+                res.evenOddFill = (co.GetU64(40u, 0u) == 1u);
                 res.fillColor = fc;
             }
         } else if (co.typeKey == 24u) {
@@ -7150,10 +7545,26 @@ bool DecodeRiveBinaryToAxbPackage(
         }
 
         std::vector<std::vector<std::size_t>> childrenMap(ab.objects.size());
+        std::vector<std::uint8_t> hasAnimatedOrConstrainedObj(ab.objects.size(), 0u);
         for (std::size_t i = 1u; i < ab.objects.size(); ++i) {
-            const std::uint64_t pid = ab.objects[i].GetU64(5u, 0xFFFFFFFFULL);
+            const RiveDecodedObject& co = ab.objects[i];
+            const std::uint64_t pid = co.GetU64(5u, 0xFFFFFFFFULL);
             if (pid < ab.objects.size()) {
                 childrenMap[static_cast<std::size_t>(pid)].push_back(i);
+            }
+            if (co.typeKey == 25u) {
+                const std::uint64_t keyedId = co.GetU64(51u, 0xFFFFFFFFULL);
+                if (keyedId < ab.objects.size()) {
+                    hasAnimatedOrConstrainedObj[static_cast<std::size_t>(keyedId)] = 1u;
+                }
+            } else if (co.typeKey == 87u || co.typeKey == 88u || co.typeKey == 89u) {
+                if (pid < ab.objects.size()) {
+                    hasAnimatedOrConstrainedObj[static_cast<std::size_t>(pid)] = 1u;
+                }
+                const std::uint64_t targetId = co.GetU64(173u, 0xFFFFFFFFULL);
+                if (targetId < ab.objects.size()) {
+                    hasAnimatedOrConstrainedObj[static_cast<std::size_t>(targetId)] = 1u;
+                }
             }
         }
 
@@ -7228,11 +7639,69 @@ bool DecodeRiveBinaryToAxbPackage(
             if (std::fabs(sy - 1.0f) > 1e-4f) pushStaticProp(PropId_AnimScaleY, MakeFloat(sy));
             if (std::fabs(op - 1.0f) > 1e-4f) pushStaticProp(PropId_Opacity, MakeFloat(op));
 
-            // If Shape (typeKey = 3), emit MTSDF <Path> elements for all geometry path children
+            // If Shape (typeKey = 3), combine multi-subpath compound shapes (e.g. letter cutouts in logo.riv)
             if (tk == 3u) {
                 const RiveResolvedPaint paint = ResolveRiveShapePaints(ab, objIdx, childrenMap);
                 if (paint.hasFill || paint.hasStroke) {
+                    std::vector<std::size_t> geomChildIndices;
+                    bool anyAnimatedOrNamedSubpath = false;
                     for (std::size_t cIdx : childrenMap[objIdx]) {
+                        if (IsRiveGeometryPathType(ab.objects[cIdx].typeKey)) {
+                            geomChildIndices.push_back(cIdx);
+                            if (hasAnimatedOrConstrainedObj[cIdx] != 0u ||
+                                (recordMainIndices && !ab.objects[cIdx].GetStr(4u).empty())) {
+                                anyAnimatedOrNamedSubpath = true;
+                            }
+                        }
+                    }
+                    bool mergedCompoundEmitted = false;
+                    if (geomChildIndices.size() >= 2u && !anyAnimatedOrNamedSubpath) {
+                        std::string compoundSvg = paint.evenOddFill ? "F0 " : "F1 ";
+                        std::size_t validSubpaths = 0u;
+                        for (std::size_t cIdx : geomChildIndices) {
+                            const RiveDecodedObject& pathObj = ab.objects[cIdx];
+                            const std::string subSvg = BuildRivePathSvg(ab, cIdx, childrenMap);
+                            if (subSvg.empty()) continue;
+                            const float px = pathObj.GetF32(13u, 0.0f);
+                            const float py = pathObj.GetF32(14u, 0.0f);
+                            const float pRotRad = pathObj.GetF32(15u, 0.0f);
+                            const float psx = pathObj.GetF32(16u, 1.0f);
+                            const float psy = pathObj.GetF32(17u, 1.0f);
+                            const std::string tfSvg = TransformRiveAbsoluteSvgPath(subSvg, px, py, pRotRad, psx, psy);
+                            if (!tfSvg.empty()) {
+                                if (validSubpaths > 0u) compoundSvg.push_back(' ');
+                                compoundSvg += tfSvg;
+                                ++validSubpaths;
+                            }
+                        }
+                        Rect compoundBounds{};
+                        if (validSubpaths >= 2u && ensurePathBaked(compoundSvg, compoundBounds)) {
+                            const std::uint32_t pathElemIdx = nextLocalElemIdx++;
+                            for (std::size_t cIdx : geomChildIndices) {
+                                if (recordMainIndices && cIdx < mainObjToElemIdx.size()) {
+                                    mainObjToElemIdx[cIdx] = pathElemIdx;
+                                }
+                            }
+                            pkg.instructions.push_back(AxbInstruction{
+                                AxbOpcode::BeginElement, 0, 0, pkg.InternString("Path"), pkg.InternString(""), 0, {}});
+                            pushStaticProp(PropId_CanvasLeft, MakeFloat(compoundBounds.x));
+                            pushStaticProp(PropId_CanvasTop, MakeFloat(compoundBounds.y));
+                            pushStaticProp(PropId_Width, MakeFloat(std::max(1.0f, compoundBounds.width)));
+                            pushStaticProp(PropId_Height, MakeFloat(std::max(1.0f, compoundBounds.height)));
+                            pushStaticProp(PropId_Stretch, value::FromInt(1));
+                            pushStaticProp(PropId_PathData, value::FromString(compoundSvg));
+                            if (paint.hasFill) {
+                                pushStaticProp(PropId_Background, value::FromColor(paint.fillColor));
+                            }
+                            if (paint.hasStroke) {
+                                pushStaticProp(PropId_BorderBrush, value::FromColor(paint.strokeColor));
+                                pushStaticProp(PropId_BorderThickness, value::FromThickness(Thickness{paint.strokeThickness}));
+                            }
+                            pkg.instructions.push_back(AxbInstruction{AxbOpcode::EndElement});
+                            mergedCompoundEmitted = true;
+                        }
+                    }
+                    if (!mergedCompoundEmitted) for (std::size_t cIdx : childrenMap[objIdx]) {
                         const RiveDecodedObject& pathObj = ab.objects[cIdx];
                         if (!IsRiveGeometryPathType(pathObj.typeKey)) {
                             continue;
@@ -7811,6 +8280,131 @@ bool DecodeRiveBinaryToAxbPackage(
     pkg.PinValuesInPools();
     outPackage = std::move(pkg);
     return true;
+}
+
+bool IsValidRealScriptFieldIdentifier(std::string_view name) noexcept {
+    if (name.empty() || name == "__nativeRootHandle") {
+        return false;
+    }
+    const unsigned char c0 = static_cast<unsigned char>(name[0]);
+    if (!(std::isalpha(c0) || c0 == '_')) {
+        return false;
+    }
+    for (std::size_t i = 1u; i < name.size(); ++i) {
+        const unsigned char c = static_cast<unsigned char>(name[i]);
+        if (!(std::isalnum(c) || c == '_')) {
+            return false;
+        }
+    }
+    static constexpr std::string_view kKeywords[] = {
+        "class", "partial", "module", "import", "public", "private", "protected", "internal",
+        "static", "const", "readonly", "override", "virtual", "abstract", "sealed",
+        "return", "int", "float", "double", "bool", "string", "void", "handle", "object",
+        "var", "let", "null", "true", "false", "this", "base", "super", "new",
+        "if", "else", "for", "foreach", "in", "while", "do", "switch", "case", "default",
+        "break", "continue", "enum", "struct", "interface", "delegate", "event",
+        "get", "set", "value", "async", "await", "try", "catch", "finally", "throw",
+        "sequence", "yield"
+    };
+    for (const auto kw : kKeywords) {
+        if (name == kw) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool SplitIndexedMemberName(
+    std::string_view raw,
+    std::string& outBaseMember,
+    std::int32_t& outIndex) {
+    raw = TrimWs(raw);
+    const std::size_t lb = raw.find('[');
+    if (lb == std::string_view::npos || lb == 0u || raw.back() != ']') {
+        return false;
+    }
+    const std::string_view base = TrimWs(raw.substr(0u, lb));
+    const std::string_view idxSlice = TrimWs(raw.substr(lb + 1u, raw.size() - lb - 2u));
+    if (base.empty() || idxSlice.empty()) {
+        return false;
+    }
+    std::int32_t parsed = -1;
+    const auto [ptr, ec] = std::from_chars(idxSlice.data(), idxSlice.data() + idxSlice.size(), parsed);
+    if (ec != std::errc{} || ptr != idxSlice.data() + idxSlice.size() || parsed < 0) {
+        return false;
+    }
+    outBaseMember.assign(base.data(), base.size());
+    outIndex = parsed;
+    return true;
+}
+
+bool TryResolveEnumMemberByName(
+    const ProgramImage* program,
+    SymbolId enumTypeId,
+    std::string_view rawName,
+    std::int64_t& outValue) noexcept {
+    if (!program || enumTypeId == 0) {
+        return false;
+    }
+    const rs_sem::TypeSymbol* tSym = program->resolveType(enumTypeId);
+    if (!tSym || tSym->kind != rs_sem::TypeKind::Enum) {
+        return false;
+    }
+    std::string_view memberName = TrimWs(rawName);
+    if (memberName.empty()) {
+        return false;
+    }
+    if (const auto sep = memberName.rfind("::"); sep != std::string_view::npos) {
+        memberName = memberName.substr(sep + 2u);
+    } else if (const auto dot = memberName.rfind('.'); dot != std::string_view::npos) {
+        memberName = memberName.substr(dot + 1u);
+    }
+    for (const auto& em : tSym->enumMembers) {
+        if (em.name == memberName) {
+            outValue = em.value;
+            return true;
+        }
+    }
+    std::int64_t parsed = 0;
+    const auto [ptr, ec] = std::from_chars(memberName.data(), memberName.data() + memberName.size(), parsed);
+    if (ec == std::errc{} && ptr == memberName.data() + memberName.size()) {
+        outValue = parsed;
+        return true;
+    }
+    return false;
+}
+
+bool TryFormatEnumValueName(
+    const ProgramImage* program,
+    SymbolId enumTypeId,
+    std::int64_t intVal,
+    std::string& outName) {
+    if (!program || enumTypeId == 0) {
+        return false;
+    }
+    const rs_sem::TypeSymbol* tSym = program->resolveType(enumTypeId);
+    if (!tSym || tSym->kind != rs_sem::TypeKind::Enum) {
+        return false;
+    }
+    for (const auto& em : tSym->enumMembers) {
+        if (em.value == intVal) {
+            outName = em.name;
+            return true;
+        }
+    }
+    return false;
+}
+
+namespace {
+std::atomic<RuntimeXamlCompileHook> gRuntimeXamlCompileHook{nullptr};
+} // namespace
+
+void RegisterRuntimeXamlCompileHook(RuntimeXamlCompileHook hook) noexcept {
+    gRuntimeXamlCompileHook.store(hook, std::memory_order_release);
+}
+
+RuntimeXamlCompileHook GetRuntimeXamlCompileHook() noexcept {
+    return gRuntimeXamlCompileHook.load(std::memory_order_acquire);
 }
 
 } // namespace aero

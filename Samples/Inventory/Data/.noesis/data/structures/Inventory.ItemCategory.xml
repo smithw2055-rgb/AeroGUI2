@@ -1,0 +1,10 @@
+<Enum Name="ItemCategory" Namespace="Inventory">
+  <Item Name="Head" Value="0"/>
+  <Item Name="Chest" Value="1"/>
+  <Item Name="Arms" Value="2"/>
+  <Item Name="Legs" Value="3"/>
+  <Item Name="Feet" Value="4"/>
+  <Item Name="Hand" Value="5"/>
+  <Item Name="Ring" Value="6"/>
+  <Item Name="All" Value="7"/>
+</Enum>

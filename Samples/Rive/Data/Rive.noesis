@@ -1,0 +1,5 @@
+<Project>
+  <Assembly>Rive</Assembly>
+  <DefaultDataNamespace>Rive</DefaultDataNamespace>
+  <StartupDocument>MainPage.xaml</StartupDocument>
+</Project>

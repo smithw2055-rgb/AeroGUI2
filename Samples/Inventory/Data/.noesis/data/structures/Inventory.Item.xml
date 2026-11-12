@@ -1,0 +1,10 @@
+<Class Name="Item" Namespace="Inventory">
+  <Property Name="Name" Type="String" StringMinWordCount="1" StringMaxWordCount="2"/>
+  <Property Name="Description" Type="String" StringMinWordCount="4" StringMaxWordCount="7"/>
+  <Property Name="Category" Type="Enum" SubType="Inventory.ItemCategory"/>
+  <Property Name="Life" Type="Number" NumberMinValue="0" NumberMaxValue="100" NumberDecimalCount="0"/>
+  <Property Name="Mana" Type="Number" NumberMinValue="0" NumberMaxValue="100" NumberDecimalCount="0"/>
+  <Property Name="Dps" Type="Number" NumberMinValue="0" NumberMaxValue="100" NumberDecimalCount="0"/>
+  <Property Name="Armor" Type="Number" NumberMinValue="0" NumberMaxValue="100" NumberDecimalCount="0"/>
+  <Property Name="Icon" Type="Object" SubType="ImageSource" ImageSourcePath="Images/Items"/>
+</Class>

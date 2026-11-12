@@ -1550,9 +1550,8 @@ public MigratedSamplePage CreateMigratedSamplePage()
     auto pageNoVm = CreateElementByTypeName(res.axbPackage.rootTypeName);
     AERO_CHECK(MountAxbTemplate(pageNoVm.Get(), res.axbPackage, &domains, nullptr),
                "Mounted MigratedSamplePage without ViewModel");
-    AERO_CHECK(std::fabs(pageNoVm->GetWidth() - 1280.0f) < 1e-4f &&
-               std::fabs(pageNoVm->GetHeight() - 720.0f) < 1e-4f,
-               "d:DesignWidth=1280 and d:DesignHeight=720 applied to root Page");
+    AERO_CHECK(pageNoVm->GetWidth() < 0.0f && pageNoVm->GetHeight() < 0.0f,
+               "d:DesignWidth and d:DesignHeight remain design-time only (root Page Auto-sizes to host viewport)");
 
     auto* layoutRoot = pageNoVm->FindName("LayoutRoot")->DynamicCast<Grid>();
     AERO_CHECK(layoutRoot != nullptr, "Resolved LayoutRoot Grid");
@@ -1800,11 +1799,10 @@ public void SetHardenedQuest(HardenedView v, QuestRowItem q)
     AERO_CHECK(page->FindName("LeakedTemplateButton") == nullptr,
                "ContentControl.ContentTemplate properly skipped (not treated as .Content)");
 
-    // Verify child d:DesignWidth on RootGrid was ignored while root Page kept d:DesignWidth=1024
+    // Verify both root Page and child Grid ignore design-time d:DesignWidth at runtime
     auto* rootGrid = page->FindName("RootGrid")->DynamicCast<Grid>();
-    AERO_CHECK(rootGrid != nullptr && rootGrid->GetWidth() < 0.0f &&
-               std::fabs(page->GetWidth() - 1024.0f) < 1e-4f,
-               "d:DesignWidth applied only to root Page, leaving child Grid Auto-sized");
+    AERO_CHECK(rootGrid != nullptr && rootGrid->GetWidth() < 0.0f && page->GetWidth() < 0.0f,
+               "d:DesignWidth ignored on both root Page and child Grid at runtime");
 
     // Verify <GroupBox.Header> and <Button.Content> plain text extraction
     auto* settingsGroup = page->FindName("SettingsGroup");

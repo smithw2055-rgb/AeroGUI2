@@ -1,0 +1,7 @@
+<Enum Name="Class">
+  <Item Name="Fighter" Value="0"/>
+  <Item Name="Rogue" Value="1"/>
+  <Item Name="Hunter" Value="2"/>
+  <Item Name="Mage" Value="3"/>
+  <Item Name="Cleric" Value="4"/>
+</Enum>

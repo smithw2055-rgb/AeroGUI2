@@ -1,0 +1,5 @@
+<vdctx:ViewModel xmlns:vdctx="clr-namespace:TicTacToe"
+                 ScorePlayer1="7" ScorePlayer2="8" ScoreTies="9"
+                 Cell0="1" Cell2="2" Cell4="2" Cell5="2" Cell6="1" Cell8="1"
+                 State="Player1">
+</vdctx:ViewModel>

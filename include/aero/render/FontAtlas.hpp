@@ -191,6 +191,7 @@ struct PositionedGlyph {
     std::uint32_t codePoint = 0u;
     std::uint32_t glyphIndex = 0u;
     std::uint32_t lineIndex = 0u;
+    std::uint32_t sourceCodePointIndex = 0u;
     float penX = 0.0f;
     float baselineY = 0.0f;
     float x0 = 0.0f;

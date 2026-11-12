@@ -1,0 +1,6 @@
+<Project>
+  <Assembly>Login</Assembly>
+  <DefaultDataNamespace>Login</DefaultDataNamespace>
+  <StartupDocument>MainPage.xaml</StartupDocument>
+  <GlobalResources>Resources.xaml</GlobalResources>
+</Project>

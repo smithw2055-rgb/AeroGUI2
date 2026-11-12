@@ -1,0 +1,17 @@
+<vdctx:QuestLogViewModel xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" xmlns:noesis="clr-namespace:NoesisGUIExtensions" xmlns:vdctx="clr-namespace:QuestLog"
+                         SelectedQuest="{noesis:DataSet Nature s Uprising}">
+  <vdctx:QuestLogViewModel.Quests>
+    <noesis:DataSet Name="Nature s Uprising"/>
+    <noesis:DataSet Name="Calming the Wake"/>
+    <noesis:DataSet Name="Tomen s Curiosity"/>
+    <noesis:DataSet Name="Forest of Dispair"/>
+    <noesis:DataSet Name="Retaliation"/>
+    <noesis:DataSet Name="Living Hearts"/>
+    <noesis:DataSet Name="Scout their Defenses"/>
+    <noesis:DataSet Name="Rescue the Leader"/>
+    <noesis:DataSet Name="Golden Opportunity"/>
+    <noesis:DataSet Name="Loyal Subordinates"/>
+    <noesis:DataSet Name="Legacy of the Past"/>
+    <noesis:DataSet Name="Purging the Dead"/>
+  </vdctx:QuestLogViewModel.Quests>
+</vdctx:QuestLogViewModel>

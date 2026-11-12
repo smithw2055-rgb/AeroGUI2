@@ -1,0 +1,2 @@
+<vdctx:Language xmlns:vdctx="clr-namespace:Localization"
+  Name="English" Source="studio:///Localization;component/Language-en.xaml"/>

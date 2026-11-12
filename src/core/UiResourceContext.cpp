@@ -147,12 +147,36 @@ std::vector<std::string> UiResourceContext::RiveSearchDirectoriesSnapshot() cons
     return riveSearchDirs_;
 }
 
+void UiResourceContext::AddXamlSearchDirectory(std::string_view directory) {
+    if (directory.empty()) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(xamlDirMutex_);
+    for (const auto& existing : xamlSearchDirs_) {
+        if (existing == directory) {
+            return;
+        }
+    }
+    xamlSearchDirs_.emplace_back(directory);
+}
+
+void UiResourceContext::ClearXamlSearchDirectories() noexcept {
+    std::lock_guard<std::mutex> lock(xamlDirMutex_);
+    xamlSearchDirs_.clear();
+}
+
+std::vector<std::string> UiResourceContext::XamlSearchDirectoriesSnapshot() const {
+    std::lock_guard<std::mutex> lock(xamlDirMutex_);
+    return xamlSearchDirs_;
+}
+
 void UiResourceContext::ClearAll() noexcept {
     templates_.Clear();
     fontAtlas_.ClearCustomFonts();
     imageAtlas_.Clear();
     gradientBrushes_.Clear();
     ClearRiveSearchDirectories();
+    ClearXamlSearchDirectories();
 }
 
 ScopedUiResourceContext::ScopedUiResourceContext(UiResourceContext& context) noexcept

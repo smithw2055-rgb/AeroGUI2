@@ -1,0 +1,7 @@
+<Class Name="SolarSystemObject">
+  <Property Name="Name" Type="String" StringMinWordCount="1" StringMaxWordCount="1"/>
+  <Property Name="Orbit" Type="Number" NumberMinValue="0" NumberMaxValue="40"/>
+  <Property Name="Diameter" Type="Number" NumberMinValue="2200" NumberMaxValue="1500000"/>
+  <Property Name="Details" Type="String" StringMinWordCount="10" StringMaxWordCount="30"/>
+  <Property Name="Image" Type="Object" SubType="ImageSource"/>
+</Class>

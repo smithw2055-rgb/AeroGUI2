@@ -193,6 +193,9 @@ if(AERO_BUILD_COMPILER_TOOLS)
         aero_register_core_test(p2_1_tests tests/p2_1_tests.cpp)
         aero_register_core_test(p2_2_tests tests/p2_2_tests.cpp)
         aero_register_core_test(p2_3_tests tests/p2_3_tests.cpp)
+
+        # End-to-end 11-sample MainWindow + ViewModel verification suite
+        aero_register_core_test(samples_mainwindow_tests tests/samples_mainwindow_tests.cpp)
     endif()
 else()
     # In Wasm / REALSCRIPT_SLIM_RUNTIME mode, aerocore & aerogui_core alias the pure runtime

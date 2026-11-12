@@ -434,6 +434,10 @@ private:
     AeroGLuint quadEboId_ = 0;
     AeroGLuint atlasTextureId_ = 0;
     AeroGLuint fallbackWhiteTexId_ = 0;
+    AeroGLuint effectScratchTexId_ = 0;
+    AeroGLuint effectQuadVboId_ = 0;
+    std::uint32_t effectScratchTexW_ = 0;
+    std::uint32_t effectScratchTexH_ = 0;
 
     AeroGLint uViewportSizeLoc_ = -1;
     AeroGLint uQuadHalfExtentLoc_ = -1;
@@ -459,6 +463,9 @@ private:
     std::vector<GlImageSlotState> imageSlotTextures_;
     std::vector<std::uint8_t> uiAtlasScratchRgba8_;
     std::vector<std::uint8_t> imageUploadScratchRgba8_;
+    std::vector<std::uint8_t> effectReadbackBottomUp_;
+    std::vector<std::uint8_t> effectReadbackTopDown_;
+    std::vector<std::uint8_t> effectPatchScratch_;
     std::vector<std::uint32_t> quadIndexMirror_;
     std::string diagnostics_;
     GpuBackendTelemetry telemetry_{};

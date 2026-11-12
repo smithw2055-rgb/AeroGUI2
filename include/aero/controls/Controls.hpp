@@ -182,11 +182,28 @@ public:
     Size MeasureCore(Size availableSize) noexcept override;
     void ArrangeCore(Rect finalRect) noexcept override;
 
-private:
+protected:
     float childScaleX_ = 1.0f;
     float childScaleY_ = 1.0f;
     float childOriginX_ = 0.0f;
     float childOriginY_ = 0.0f;
+};
+
+class LayoutScaler : public Viewbox {
+public:
+    LayoutScaler();
+    ~LayoutScaler() override = default;
+
+    static const TypeClass* StaticTypeClass() noexcept;
+    [[nodiscard]] const TypeClass* GetTypeClass() const noexcept override {
+        return StaticTypeClass();
+    }
+
+    void SetRefResolution(Size refRes);
+    [[nodiscard]] Size GetRefResolution() const noexcept;
+
+    Size MeasureCore(Size availableSize) noexcept override;
+    void ArrangeCore(Rect finalRect) noexcept override;
 };
 
 class ScrollViewer : public Panel {
@@ -330,8 +347,17 @@ public:
     void SetCornerRadius(const CornerRadius& radius);
     [[nodiscard]] CornerRadius GetCornerRadius() const noexcept;
 
+    void SyncContentTemplateChild();
+    void OnPropertyChanged(std::uint16_t propId, const UnifiedValue& newValue) override;
     Size MeasureCore(Size availableSize) noexcept override;
     void ArrangeCore(Rect finalRect) noexcept override;
+
+private:
+    IntrusivePtr<UIElement> contentTemplateChild_;
+    std::string activeContentTemplateKey_;
+    ObjectRef activeContentTemplateObj_{};
+    bool hasActiveContentTemplateObj_ = false;
+    bool syncingContentTemplate_ = false;
 };
 
 class TextBlock : public UIElement {
@@ -356,9 +382,15 @@ public:
     void SetTextWrapping(TextWrapping wrapping);
     [[nodiscard]] TextWrapping GetTextWrapping() const noexcept;
 
+    void SetTextAlignment(TextAlignment alignment);
+    [[nodiscard]] TextAlignment GetTextAlignment() const noexcept;
+    [[nodiscard]] bool HasRichText() const noexcept;
+    [[nodiscard]] std::string GetRawRichText() const;
+
     void SetForeground(const Color& color);
     [[nodiscard]] Color GetForeground() const noexcept;
 
+    void OnPropertyChanged(std::uint16_t propId, const UnifiedValue& newValue) override;
     Size MeasureCore(Size availableSize) noexcept override;
 };
 
@@ -381,7 +413,16 @@ public:
     [[nodiscard]] VerticalAlignment GetEffectiveVerticalContentAlignment() const noexcept;
     [[nodiscard]] Point ComputeTextOrigin(const Rect& boxRect, Size textSize) const noexcept;
 
+    void SyncContentTemplateChild();
+    void OnPropertyChanged(std::uint16_t propId, const UnifiedValue& newValue) override;
     Size MeasureCore(Size availableSize) noexcept override;
+
+private:
+    IntrusivePtr<UIElement> contentTemplateChild_;
+    std::string activeContentTemplateKey_;
+    ObjectRef activeContentTemplateObj_{};
+    bool hasActiveContentTemplateObj_ = false;
+    bool syncingContentTemplate_ = false;
 };
 
 // ============================================================================
@@ -1488,6 +1529,30 @@ private:
     std::string controlClassName_;
     bool templateMounted_ = false;
 };
+
+class Label : public TextBlock {
+public:
+    Label();
+    ~Label() override = default;
+    static const TypeClass* StaticTypeClass() noexcept;
+    [[nodiscard]] const TypeClass* GetTypeClass() const noexcept override {
+        return StaticTypeClass();
+    }
+};
+
+class BoxShadow : public Border {
+public:
+    BoxShadow();
+    ~BoxShadow() override = default;
+    static const TypeClass* StaticTypeClass() noexcept;
+    [[nodiscard]] const TypeClass* GetTypeClass() const noexcept override {
+        return StaticTypeClass();
+    }
+};
+
+[[nodiscard]] std::string StripAndResolveRichTextBbCode(
+    std::string_view rawBbCode,
+    const UIElement* owner);
 
 class RiveControl : public UserControl {
 public:
