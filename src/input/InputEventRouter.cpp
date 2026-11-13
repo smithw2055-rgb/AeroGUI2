@@ -1,5 +1,6 @@
 #include "aero/input/InputEventRouter.hpp"
 #include "aero/animation/AnimationEngine.hpp"
+#include "aero/style/StyleTriggerEngine.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -75,6 +76,7 @@ void InputEventRouter::SetRootVisual(UIElement* root) noexcept {
         ClearFocus();
         CloseActiveComboBoxIfOpen();
         CloseActiveContextMenuIfOpen();
+        CloseActiveToolTipIfOpen();
         UpdateHoveredTarget(nullptr);
         rootVisual_ = root;
     }
@@ -268,6 +270,12 @@ void InputEventRouter::PruneDisconnectedTargets() noexcept {
         openComboBox_->SetHighlightedPopupIndex(-1);
         openComboBox_.Reset();
     }
+    if (activeToolTip_ &&
+        (!BelongsToRoot(activeToolTipOwner_.Get()) ||
+         !IsEffectivelyVisibleInTree(activeToolTipOwner_.Get(), rootVisual_) ||
+         !activeToolTipOwner_->IsEffectivelyEnabled())) {
+        CloseActiveToolTipIfOpen();
+    }
 }
 
 UIElement* InputEventRouter::ResolveInteractiveTarget(UIElement* hitLeaf) const noexcept {
@@ -283,6 +291,17 @@ UIElement* InputEventRouter::ResolveInteractiveTarget(UIElement* hitLeaf) const 
         }
     }
     return hitLeaf;
+}
+
+void InputEventRouter::CloseActiveToolTipIfOpen() noexcept {
+    if (activeToolTip_) {
+        activeToolTip_->SetValue(PropId_IsOpen, UnifiedValue{false}, ValueSourceRank::Local);
+        if (activeToolTip_->Parent() && activeToolTip_->DeclaredTypeName() == "__AutoToolTip") {
+            (void)activeToolTip_->Parent()->RemoveChild(activeToolTip_.Get());
+        }
+        activeToolTip_.Reset();
+    }
+    activeToolTipOwner_.Reset();
 }
 
 void InputEventRouter::UpdateHoveredTarget(UIElement* newHovered) noexcept {
@@ -301,6 +320,12 @@ void InputEventRouter::UpdateHoveredTarget(UIElement* newHovered) noexcept {
         }
     }
     hoveredElement_.Reset(newHovered, true);
+    repeatHoldElapsedMs_ = 0.0f;
+    repeatNextFireMs_ = 0.0f;
+
+    UIElement* newOwner = nullptr;
+    ToolTip* explicitTt = nullptr;
+    std::string autoTipText;
     if (hoveredElement_) {
         hoveredElement_->SetHovered(true);
         if (animationEngine_) {
@@ -308,6 +333,70 @@ void InputEventRouter::UpdateHoveredTarget(UIElement* newHovered) noexcept {
                 hoveredElement_.Get(),
                 SmListenerEventKind::PointerEnter);
         }
+        for (UIElement* anc = hoveredElement_.Get(); anc != nullptr; anc = anc->Parent()) {
+            for (UIElement* c = anc->FirstChild(); c != nullptr; c = c->NextSibling()) {
+                if (auto* tt = c->DynamicCast<ToolTip>()) {
+                    newOwner = anc;
+                    explicitTt = tt;
+                    break;
+                }
+            }
+            if (newOwner) {
+                break;
+            }
+            const UnifiedValue ttVal = anc->GetValue(PropId_ToolTipText);
+            if (const auto* sv = std::get_if<StringValue>(&ttVal); sv && !sv->view().empty()) {
+                newOwner = anc;
+                autoTipText = sv->str();
+                break;
+            }
+            if (anc == rootVisual_) {
+                break;
+            }
+        }
+    }
+
+    if (newOwner != nullptr && newOwner == activeToolTipOwner_.Get() && activeToolTip_.Get() != nullptr) {
+        return;
+    }
+
+    CloseActiveToolTipIfOpen();
+
+    if (explicitTt != nullptr) {
+        explicitTt->SetValue(PropId_IsOpen, UnifiedValue{true}, ValueSourceRank::Local);
+        activeToolTip_.Reset(explicitTt, true);
+        activeToolTipOwner_.Reset(newOwner, true);
+    } else if (!autoTipText.empty() && rootVisual_) {
+        auto autoTt = MakeIntrusive<ToolTip>();
+        autoTt->SetDeclaredTypeName("__AutoToolTip");
+        autoTt->SetIsHitTestVisible(false);
+        auto tb = MakeIntrusive<TextBlock>();
+        tb->SetIsHitTestVisible(false);
+        tb->SetText(autoTipText);
+        tb->SetFontSize(12.5f);
+        autoTt->SetPadding(Thickness{8.0f, 4.0f, 8.0f, 4.0f});
+        autoTt->SetValue(PropId_Background, value::FromColor(Color{0.12f, 0.14f, 0.18f, 0.96f}), ValueSourceRank::Local);
+        autoTt->SetValue(PropId_BorderBrush, value::FromColor(Color{0.35f, 0.42f, 0.55f, 1.0f}), ValueSourceRank::Local);
+        autoTt->SetValue(PropId_BorderThickness, value::FromThickness(Thickness{1.0f}), ValueSourceRank::Local);
+        autoTt->SetValue(PropId_CornerRadius, value::FromCornerRadius(CornerRadius{4.0f}), ValueSourceRank::Local);
+        autoTt->AddChild(tb.Get());
+        autoTt->SetValue(PropId_IsOpen, UnifiedValue{true}, ValueSourceRank::Local);
+        autoTt->SetHorizontalAlignment(HorizontalAlignment::Left);
+        autoTt->SetVerticalAlignment(VerticalAlignment::Top);
+        const Rect rootRect = rootVisual_->FinalRect();
+        float marginX = lastPointerPos_.x + 8.0f;
+        float marginY = lastPointerPos_.y + 16.0f;
+        if (rootRect.width > 0.0f && rootRect.height > 0.0f) {
+            const float localX = marginX - rootRect.x;
+            const float localY = marginY - rootRect.y;
+            marginX = std::clamp(localX, 0.0f, std::max(0.0f, rootRect.width - 120.0f));
+            marginY = std::clamp(localY, 0.0f, std::max(0.0f, rootRect.height - 28.0f));
+        }
+        autoTt->SetMargin(Thickness{marginX, marginY, 0.0f, 0.0f});
+        autoTt->SetValue(PropId_ZIndex, value::FromInt(10001), ValueSourceRank::Local);
+        rootVisual_->AddChild(autoTt.Get());
+        activeToolTip_ = autoTt;
+        activeToolTipOwner_.Reset(newOwner, true);
     }
 }
 
@@ -323,6 +412,7 @@ void InputEventRouter::ReleasePointerCapture() noexcept {
 }
 
 void InputEventRouter::CancelPointerInteraction() noexcept {
+    CloseActiveToolTipIfOpen();
     if (capturedElement_) {
         capturedElement_->SetPressed(false);
         capturedElement_.Reset();
@@ -579,6 +669,12 @@ bool InputEventRouter::DispatchPointerDown(
 
     if (requestCapture && button == PointerButton::Left) {
         CapturePointer(target);
+        if (auto* rb = target->DynamicCast<RepeatButton>()) {
+            float delayMs = 400.0f;
+            if (!TryGetFloat(rb->GetValue(PropId_RepeatDelay), delayMs) || delayMs <= 0.0f) delayMs = 400.0f;
+            repeatHoldElapsedMs_ = 0.0f;
+            repeatNextFireMs_ = delayMs;
+        }
     }
     SyncImeFocusState();
     return handled;
@@ -687,6 +783,94 @@ bool InputEventRouter::DispatchKeyDown(KeyCode key, std::uint8_t modifiers) {
         return true;
     }
 
+    for (UIElement* cur = focusedElement_ ? focusedElement_.Get() : rootVisual_; cur != nullptr; cur = cur->Parent()) {
+        if (cur->InvokeKeyDownCallback(key, modifiers)) {
+            return true;
+        }
+        if (cur == rootVisual_) break;
+    }
+    auto findEngineInSubtree = [](UIElement* start) -> DualTrackBindingEngine* {
+        if (!start) return nullptr;
+        for (UIElement* a = start; a != nullptr; a = a->Parent()) {
+            if (a->BoundTwoWayEngine()) return a->BoundTwoWayEngine();
+        }
+        std::array<UIElement*, 64> q{};
+        std::size_t qh = 0u, qt = 0u;
+        q[qt++] = start;
+        while (qh < qt) {
+            UIElement* u = q[qh++];
+            if (u->BoundTwoWayEngine()) return u->BoundTwoWayEngine();
+            for (UIElement* c = u->FirstChild(); c != nullptr && qt < q.size(); c = c->NextSibling()) {
+                q[qt++] = c;
+            }
+        }
+        return nullptr;
+    };
+    auto tryFireKeyBindingsOn = [&](UIElement* host) -> bool {
+        if (!host) return false;
+        const UnifiedValue kbVal = host->GetValue(PropId_KeyBindingsSpec);
+        const auto* sv = std::get_if<StringValue>(&kbVal);
+        if (!sv || sv->view().empty()) return false;
+        std::string_view allSpecs = sv->view();
+        std::size_t lineStart = 0u;
+        while (lineStart < allSpecs.size()) {
+            const std::size_t nl = allSpecs.find('\n', lineStart);
+            const std::string_view spec = (nl == std::string_view::npos)
+                ? allSpecs.substr(lineStart)
+                : allSpecs.substr(lineStart, nl - lineStart);
+            lineStart = (nl == std::string_view::npos) ? allSpecs.size() : (nl + 1u);
+            if (spec.empty()) continue;
+
+            std::size_t p0 = spec.find('|');
+            if (p0 == std::string_view::npos) continue;
+            std::size_t p1 = spec.find('|', p0 + 1u);
+            if (p1 == std::string_view::npos) continue;
+            std::size_t p2 = spec.find('|', p1 + 1u);
+            const int wantKey = std::atoi(std::string(spec.substr(0u, p0)).c_str());
+            const int wantMod = std::atoi(std::string(spec.substr(p0 + 1u, p1 - (p0 + 1u))).c_str());
+            if (wantKey != static_cast<int>(key) || wantMod != static_cast<int>(modifiers)) continue;
+
+            const std::string cmdName(spec.substr(p1 + 1u, (p2 == std::string_view::npos) ? std::string_view::npos : (p2 - (p1 + 1u))));
+            const std::string cmdParam = (p2 == std::string_view::npos) ? std::string() : std::string(spec.substr(p2 + 1u));
+            DualTrackBindingEngine* be = findEngineInSubtree(host);
+            if (be && be->Program()) {
+                ObjectRef dc{};
+                ObjectRef wrap{};
+                for (UIElement* a = host; a != nullptr; a = a->Parent()) {
+                    if (!dc.valid()) {
+                        const UnifiedValue dcv = a->GetValue(PropId_DataContext);
+                        if (const auto* r = std::get_if<ObjectRef>(&dcv); r && r->valid()) dc = *r;
+                    }
+                    if (a->BoundScriptWrapper().valid()) wrap = a->BoundScriptWrapper();
+                }
+                const bool hasParam = !cmdParam.empty();
+                const UnifiedValue rawParam = hasParam ? value::FromString(cmdParam) : UnifiedValue{};
+                if (dc.valid() &&
+                    TryInvokeCommandObjectOnOwner(
+                        &be->Domains(), be->Program(), be->UiInterpreter(), nullptr,
+                        dc, cmdName, rawParam, hasParam)) {
+                    (void)be->FlushTrackA();
+                    return true;
+                }
+                if (wrap.valid() && wrap != dc &&
+                    TryInvokeCommandObjectOnOwner(
+                        &be->Domains(), be->Program(), be->UiInterpreter(), nullptr,
+                        wrap, cmdName, rawParam, hasParam)) {
+                    (void)be->FlushTrackA();
+                    return true;
+                }
+            }
+        }
+        return false;
+    };
+    for (UIElement* cur = focusedElement_ ? focusedElement_.Get() : rootVisual_; cur != nullptr; cur = cur->Parent()) {
+        if (tryFireKeyBindingsOn(cur)) return true;
+        if (cur == rootVisual_) break;
+    }
+    for (UIElement* c = rootVisual_->FirstChild(); c != nullptr; c = c->NextSibling()) {
+        if (tryFireKeyBindingsOn(c)) return true;
+    }
+
     if (key == KeyCode::Tab) {
         const bool reverse = (modifiers & KeyMod_Shift) != 0u;
         return MoveFocus(reverse ? FocusDirection::Previous : FocusDirection::Next);
@@ -722,9 +906,44 @@ bool InputEventRouter::DispatchKeyDown(KeyCode key, std::uint8_t modifiers) {
     return false;
 }
 
+void InputEventRouter::Tick(float dtSeconds) {
+    if (!rootVisual_ || dtSeconds <= 0.0f) return;
+    const float dtMs = dtSeconds * 1000.0f;
+    RepeatButton* activeRb = nullptr;
+    if (capturedElement_) {
+        if (auto* rb = capturedElement_->DynamicCast<RepeatButton>(); rb && rb->IsPressed() && rb->IsEffectivelyEnabled()) {
+            activeRb = rb;
+        }
+    } else if (hoveredElement_) {
+        if (auto* rb = hoveredElement_->DynamicCast<RepeatButton>(); rb && rb->IsEffectivelyEnabled()) {
+            const UnifiedValue cmVal = rb->GetValue(PropId_ClickMode);
+            if (const auto* iv = std::get_if<std::int64_t>(&cmVal); iv && *iv == 2) {
+                activeRb = rb;
+            }
+        }
+    }
+    if (!activeRb) return;
+    float delayMs = 400.0f;
+    if (!TryGetFloat(activeRb->GetValue(PropId_RepeatDelay), delayMs) || delayMs < 1.0f) delayMs = 400.0f;
+    float intervalMs = 100.0f;
+    if (!TryGetFloat(activeRb->GetValue(PropId_RepeatInterval), intervalMs) || intervalMs < 5.0f) intervalMs = 100.0f;
+    if (repeatNextFireMs_ <= 0.0f) repeatNextFireMs_ = delayMs;
+    repeatHoldElapsedMs_ += dtMs;
+    int safety = 0;
+    while (repeatHoldElapsedMs_ >= repeatNextFireMs_ && safety++ < 8) {
+        (void)activeRb->ActivateFromInput();
+        repeatNextFireMs_ += intervalMs;
+    }
+}
+
 bool InputEventRouter::DispatchKeyUp(KeyCode key, std::uint8_t modifiers) {
-    (void)key;
-    (void)modifiers;
+    if (!rootVisual_ || key == KeyCode::None) return false;
+    for (UIElement* cur = focusedElement_ ? focusedElement_.Get() : rootVisual_; cur != nullptr; cur = cur->Parent()) {
+        if (cur->InvokeKeyUpCallback(key, modifiers)) {
+            return true;
+        }
+        if (cur == rootVisual_) break;
+    }
     return false;
 }
 

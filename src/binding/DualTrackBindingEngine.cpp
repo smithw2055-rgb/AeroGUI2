@@ -131,6 +131,38 @@ struct LiveBindingEngineRegistry {
             }
             return v;
         }
+        case PropId_DataContext: {
+            for (const UIElement* cur = elem; cur != nullptr;
+                 cur = cur->Parent() ? cur->Parent() : cur->TemplatedParent()) {
+                const UnifiedValue dc = cur->GetValue(PropId_DataContext);
+                if (!std::holds_alternative<std::monostate>(dc)) {
+                    return dc;
+                }
+            }
+            return UnifiedValue{};
+        }
+        case PropId_SelectedItem: {
+            const UnifiedValue v = elem->GetValue(PropId_SelectedItem);
+            const UnifiedValue svp = elem->GetValue(PropId_SelectedValuePath);
+            if (const auto* svpStr = std::get_if<StringValue>(&svp); svpStr && !svpStr->view().empty()) {
+                if (const auto* nh = std::get_if<NativeHandle>(&v)) {
+                    if (const UIElement* itemEl = UIElement::FromNativeHandle(FallbackVisualHandleRegistry(), *nh)) {
+                        const std::uint16_t spid = ResolveTriggerConditionPropertyId(svpStr->view());
+                        const UnifiedValue sub = itemEl->GetValue(spid);
+                        if (!std::holds_alternative<std::monostate>(sub)) return sub;
+                    }
+                }
+            }
+            if (const auto* nh = std::get_if<NativeHandle>(&v)) {
+                if (const UIElement* itemEl = UIElement::FromNativeHandle(FallbackVisualHandleRegistry(), *nh)) {
+                    const UnifiedValue c = itemEl->GetValue(PropId_Content);
+                    if (std::holds_alternative<StringValue>(c)) return c;
+                    const UnifiedValue t = itemEl->GetValue(PropId_Text);
+                    if (std::holds_alternative<StringValue>(t)) return t;
+                }
+            }
+            return v;
+        }
         default:
             return elem->GetValue(propId);
     }
@@ -924,6 +956,32 @@ UnifiedValue DualTrackBindingEngine::ApplySingleValueConversion(
         return rawVal;
     }
     if (kind == ValueConverterKind::CustomScriptOrHost) {
+        if (converterKey.rfind("__aero_alt_conv__:", 0) == 0) {
+            if (!inverseForTwoWay) {
+                const std::string_view body = converterKey.substr(18u);
+                std::vector<std::string_view> parts;
+                std::size_t p = 0u;
+                while (p <= body.size()) {
+                    const std::size_t sep = body.find('|', p);
+                    const std::string_view item = (sep == std::string_view::npos) ? body.substr(p) : body.substr(p, sep - p);
+                    if (!item.empty()) parts.push_back(item);
+                    if (sep == std::string_view::npos) break;
+                    p = sep + 1u;
+                }
+                if (!parts.empty()) {
+                    std::int64_t idx = 0;
+                    if (const auto* iv = std::get_if<std::int64_t>(&rawVal)) idx = *iv;
+                    else {
+                        float fv = 0.0f;
+                        if (TryGetFloat(rawVal, fv)) idx = static_cast<std::int64_t>(std::llround(fv));
+                    }
+                    if (idx < 0) idx = 0;
+                    const std::string_view chosen = parts[static_cast<std::size_t>(idx) % parts.size()];
+                    return value::FromColor(ParseXamlColorLiteral(chosen));
+                }
+            }
+            return rawVal;
+        }
         const RegisteredConverterEntry* found = nullptr;
         if (!converterKey.empty()) {
             const auto it = registeredConverters_.find(std::string(converterKey));
@@ -1557,8 +1615,18 @@ bool DualTrackBindingEngine::EvaluateAndSyncElementBinding(ElementPropertyBindin
     } else {
         val = ReadElementPropertyOrState(eb.cachedSourceElement, eb.sourcePropertyId);
         if (eb.subHops.empty()) {
+            if (eb.sourcePropertyId == PropId_EffectColor &&
+                (eb.targetPropertyId == PropId_Text ||
+                 eb.targetPropertyId == PropId_Content ||
+                 eb.targetPropertyId == PropId_Header)) {
+                if (const auto col = value::TryGetColor(val)) {
+                    val = value::FromString(FormatColorHexArgb(*col));
+                }
+            }
             if (const auto* nh = std::get_if<NativeHandle>(&val)) {
-                if (const UIElement* selElem = UIElement::FromNativeHandle(domains_.nativeHandles(), *nh)) {
+                const UIElement* selElem = UIElement::FromNativeHandle(domains_.nativeHandles(), *nh);
+                if (!selElem) selElem = UIElement::FromNativeHandle(FallbackVisualHandleRegistry(), *nh);
+                if (selElem) {
                     if (const auto* tvi = selElem->DynamicCast<TreeViewItem>()) {
                         if (eb.targetPropertyId == PropId_Text ||
                             eb.targetPropertyId == PropId_Content ||
@@ -1577,6 +1645,9 @@ bool DualTrackBindingEngine::EvaluateAndSyncElementBinding(ElementPropertyBindin
             if (const auto* nh = std::get_if<NativeHandle>(&val)) {
                 unbindEbRange(0u);
                 UIElement* curElem = UIElement::FromNativeHandle(domains_.nativeHandles(), *nh);
+                if (!curElem) {
+                    curElem = UIElement::FromNativeHandle(FallbackVisualHandleRegistry(), *nh);
+                }
                 bool nhOk = (curElem != nullptr);
                 for (std::size_t h = 0u; h < eb.subHops.size() && nhOk; ++h) {
                     const std::uint16_t subPid = ResolveTriggerConditionPropertyId(eb.subHops[h].memberName);
@@ -1588,7 +1659,17 @@ bool DualTrackBindingEngine::EvaluateAndSyncElementBinding(ElementPropertyBindin
                     if (h + 1u < eb.subHops.size()) {
                         const auto* nextNh = std::get_if<NativeHandle>(&val);
                         curElem = nextNh ? UIElement::FromNativeHandle(domains_.nativeHandles(), *nextNh) : nullptr;
+                        if (!curElem && nextNh) {
+                            curElem = UIElement::FromNativeHandle(FallbackVisualHandleRegistry(), *nextNh);
+                        }
                         nhOk = (curElem != nullptr);
+                    } else if (subPid == PropId_EffectColor &&
+                               (eb.targetPropertyId == PropId_Text ||
+                                eb.targetPropertyId == PropId_Content ||
+                                eb.targetPropertyId == PropId_Header)) {
+                        if (const auto col = value::TryGetColor(val)) {
+                            val = value::FromString(FormatColorHexArgb(*col));
+                        }
                     }
                 }
                 if (!nhOk) {

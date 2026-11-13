@@ -58,6 +58,7 @@ public:
     bool LoadFromFile(std::string_view filePath, std::string* outError = nullptr);
 
     [[nodiscard]] bool IsValid() const noexcept { return valid_; }
+    [[nodiscard]] std::uint64_t ContentHash() const noexcept { return contentHash_; }
     [[nodiscard]] const std::string& FamilyName() const noexcept { return familyName_; }
     [[nodiscard]] const std::string& FullName() const noexcept { return fullName_; }
 
@@ -132,6 +133,7 @@ private:
         std::vector<TtfPoint>* outRawPoints) const;
 
     std::vector<std::uint8_t> data_;
+    std::uint64_t contentHash_ = 0u;
     bool valid_ = false;
     std::string familyName_;
     std::string fullName_;

@@ -267,6 +267,9 @@ public:
         return true;
     }
 
+    [[nodiscard]] bool IsHitTestVisible() const noexcept { return isHitTestVisible_; }
+    void SetIsHitTestVisible(bool visible) noexcept { isHitTestVisible_ = visible; }
+
     [[nodiscard]] bool IsHovered() const noexcept {
         return (fastProps_.reserved & InteractiveState_Hovered) != 0u;
     }
@@ -380,6 +383,22 @@ public:
         PointerButton button,
         std::uint8_t modifiers,
         bool insideBounds);
+    using KeyEventCallback = std::function<bool(UIElement&, KeyCode, std::uint8_t)>;
+    void SetKeyDownCallback(KeyEventCallback cb) { keyDownCallback_ = std::move(cb); }
+    void SetKeyUpCallback(KeyEventCallback cb) { keyUpCallback_ = std::move(cb); }
+    bool InvokeKeyDownCallback(KeyCode key, std::uint8_t modifiers) {
+        return keyDownCallback_ ? keyDownCallback_(*this, key, modifiers) : false;
+    }
+    bool InvokeKeyUpCallback(KeyCode key, std::uint8_t modifiers) {
+        return keyUpCallback_ ? keyUpCallback_(*this, key, modifiers) : false;
+    }
+    [[nodiscard]] std::uint32_t BubbledClickGeneration() const noexcept { return bubbledClickGen_; }
+    void NotifyBubbledClick() noexcept {
+        for (UIElement* cur = this; cur != nullptr; cur = cur->Parent() ? cur->Parent() : cur->TemplatedParent()) {
+            ++cur->bubbledClickGen_;
+        }
+    }
+
     virtual bool OnKeyDown(KeyCode key, std::uint8_t modifiers);
     virtual bool OnTextInput(std::string_view utf8Text);
     virtual void OnFocusChanged(bool focused);
@@ -830,6 +849,9 @@ private:
     Rect finalRect_{0.0f, 0.0f, 0.0f, 0.0f};
     std::string name_;
     std::string declaredTypeName_;
+    std::uint32_t bubbledClickGen_ = 0u;
+    KeyEventCallback keyDownCallback_;
+    KeyEventCallback keyUpCallback_;
 
     // Zero-hash NativeHandle slot, binding engine backlink & generation cache
     NativeHandle cachedNativeHandle_{};
@@ -843,6 +865,7 @@ private:
     bool isConnectedToRoot_ = false;
     bool registeredInValuePoolSet_ = false;
     bool isNamescopeBoundary_ = false;
+    bool isHitTestVisible_ = true;
     mutable bool referencedAsElementSource_ = false;
     std::uint16_t fastActiveAnimMask_ = 0u;
     std::array<std::uint8_t, kFastInlinePropertySlotCount> fastInlineRanks_{};

@@ -452,6 +452,14 @@ public:
 
     void SetCheckedChangedCallback(CheckedChangedCallback callback) {
         checkedChangedCallback_ = std::move(callback);
+        extraCheckedCallbacks_.clear();
+    }
+    void AddCheckedChangedCallback(CheckedChangedCallback callback) {
+        if (!checkedChangedCallback_) {
+            checkedChangedCallback_ = std::move(callback);
+        } else {
+            extraCheckedCallbacks_.push_back(std::move(callback));
+        }
     }
 
     bool ActivateFromInput(RuntimeError* error = nullptr);
@@ -460,6 +468,7 @@ public:
 
 private:
     CheckedChangedCallback checkedChangedCallback_;
+    std::vector<CheckedChangedCallback> extraCheckedCallbacks_;
 };
 
 class RadioButton : public Button {
@@ -1046,6 +1055,7 @@ private:
     StyleTriggerEngine* styleEngine_ = nullptr;
     AnimationEngine* animationEngine_ = nullptr;
     std::vector<UnifiedValue> items_;
+    IntrusivePtr<UIElement> retainedVisualResourceHolder_;
     SelectionChangedCallback selectionChangedCallback_;
     std::vector<Rect> tabHeaderRects_;
     Rect tabStripLocalRect_{};
@@ -1209,6 +1219,7 @@ private:
     ItemGeneratorFn itemGenerator_;
     ItemBinderFn itemBinder_;
     std::vector<UnifiedValue> items_;
+    IntrusivePtr<UIElement> retainedVisualResourceHolder_;
     std::vector<RealizedVirtualSlot> virtualSlots_;
     std::vector<RealizedVirtualSlot> recyclePool_;
     std::size_t firstRealizedIndex_ = 0;
@@ -1250,6 +1261,7 @@ public:
     bool OnKeyDown(KeyCode key, std::uint8_t modifiers) override;
 
 protected:
+    [[nodiscard]] virtual float ItemsAreaTopInset() const noexcept { return 0.0f; }
     void MarkExtraValuesInPools() const noexcept override;
 
 private:
@@ -1259,6 +1271,35 @@ private:
     std::int32_t lastNotifiedSelectedIndex_ = -1;
     UnifiedValue lastNotifiedSelectedItem_{};
     bool hasNotifiedSelection_ = false;
+};
+
+class ListView : public ListBox {
+public:
+    static constexpr float kHeaderBarHeight = 26.0f;
+
+    ListView();
+    ~ListView() override = default;
+
+    static const TypeClass* StaticTypeClass() noexcept;
+    [[nodiscard]] const TypeClass* GetTypeClass() const noexcept override {
+        return StaticTypeClass();
+    }
+
+    [[nodiscard]] bool HasGridViewHeader() const noexcept;
+    [[nodiscard]] float HeaderBarHeight() const noexcept {
+        return HasGridViewHeader() ? kHeaderBarHeight : 0.0f;
+    }
+    [[nodiscard]] float ItemsAreaTopInset() const noexcept override {
+        return HeaderBarHeight();
+    }
+
+    Size MeasureCore(Size availableSize) noexcept override;
+    void ArrangeCore(Rect finalRect) noexcept override;
+    bool OnPointerDown(
+        Point localPoint,
+        PointerButton button,
+        std::uint8_t modifiers,
+        bool& outRequestCapture) override;
 };
 
 class ComboBox : public ItemsControl {
@@ -1708,6 +1749,9 @@ public:
     ~ToolBar() override = default;
     static const TypeClass* StaticTypeClass() noexcept;
     [[nodiscard]] const TypeClass* GetTypeClass() const noexcept override { return StaticTypeClass(); }
+    [[nodiscard]] std::string GetHeaderText() const;
+    Size MeasureCore(Size availableSize) noexcept override;
+    void ArrangeCore(Rect finalRect) noexcept override;
 };
 
 class Menu : public StackPanel {
@@ -1729,6 +1773,21 @@ public:
 class MenuItem : public Button {
 public:
     MenuItem();
+    [[nodiscard]] bool IsCheckable() const noexcept {
+        bool v = false;
+        (void)GetValue(PropId_IsCheckable).tryGetBool(v);
+        return v;
+    }
+    [[nodiscard]] bool IsChecked() const noexcept {
+        bool v = false;
+        (void)GetValue(PropId_IsChecked).tryGetBool(v);
+        return v;
+    }
+    [[nodiscard]] bool IsSubmenuOpen() const noexcept {
+        bool v = false;
+        (void)GetValue(PropId_IsSubmenuOpen).tryGetBool(v);
+        return v;
+    }
     ~MenuItem() override = default;
     static const TypeClass* StaticTypeClass() noexcept;
     [[nodiscard]] const TypeClass* GetTypeClass() const noexcept override { return StaticTypeClass(); }
@@ -1820,8 +1879,10 @@ public:
     ~TreeView() override = default;
     static const TypeClass* StaticTypeClass() noexcept;
     [[nodiscard]] const TypeClass* GetTypeClass() const noexcept override { return StaticTypeClass(); }
+    [[nodiscard]] bool DefaultFocusable() const noexcept override { return true; }
 
     void SelectContainer(TreeViewItem* item);
+    bool OnKeyDown(KeyCode key, std::uint8_t modifiers) override;
     [[nodiscard]] TreeViewItem* SelectedContainer() const noexcept { return selectedContainer_; }
     [[nodiscard]] std::string GetSelectedHeader() const;
     void SetSelectedItemChangedCallback(SelectedItemChangedCallback cb) { selectedItemChangedCallback_ = std::move(cb); }

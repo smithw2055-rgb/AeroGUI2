@@ -2,24 +2,33 @@
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         x:Class="WpfQuickStart.MainWindow"
         Title="AeroGUI WPF QuickStart"
-        Width="960" Height="600"
+        Width="960" Height="640"
         Background="{StaticResource AppSurfaceBrush}">
+  <Window.InputBindings>
+    <KeyBinding Key="N" Modifiers="Ctrl" Command="{Binding QuickAddCommand}" CommandParameter="Shortcut Task"/>
+  </Window.InputBindings>
+
   <DockPanel LastChildFill="True">
     <Menu DockPanel.Dock="Top" Background="#191F2E" Padding="8,4,8,4">
       <MenuItem Header="File" InputGestureText="Alt+F">
-        <MenuItem x:Name="ResetMenuItem" Header="Reset Board" Command="{Binding ResetBoardCommand}"/>
+        <MenuItem x:Name="ResetMenuItem" Header="Reset Board" Command="{Binding ResetBoardCommand}">
+          <MenuItem.Icon>
+            <Border Width="10" Height="10" CornerRadius="2" Background="#4C9AFF"/>
+          </MenuItem.Icon>
+        </MenuItem>
         <Separator/>
         <MenuItem Header="Close Window"/>
       </MenuItem>
       <MenuItem Header="View">
-        <MenuItem Header="Compact Mode" IsCheckable="True" IsChecked="False"/>
+        <MenuItem x:Name="CompactModeMenuItem" IsCheckable="True" IsChecked="False" Header="Compact Mode"/>
       </MenuItem>
     </Menu>
 
-    <ToolBar DockPanel.Dock="Top" Background="#1B2233" Padding="8,6,8,6">
-      <Button x:Name="QuickFillButton" Content="Quick Fill" Click="QuickFillButton_Click" Padding="10,4,10,4"/>
+    <ToolBar x:Name="MainToolBar" Header="Actions" DockPanel.Dock="Top" Background="#1B2233" Padding="8,6,8,6">
+      <Button x:Name="QuickFillButton" Content="Quick Fill" ToolTip="Fill sample task title" Click="QuickFillButton_Click" Padding="10,4,10,4"/>
       <Separator Width="1" Height="18" Margin="6,0,6,0"/>
       <Button x:Name="AddTaskButton" Content="Add Task" Command="{Binding AddTaskCommand}" Padding="10,4,10,4"/>
+      <Button x:Name="QuickPresetButton" Content="+ Hotfix" Command="{Binding QuickAddCommand}" CommandParameter="Urgent Hotfix" Padding="10,4,10,4" Margin="6,0,0,0"/>
       <CheckBox x:Name="TriStateCheck" Content="Tri-State Gate" IsThreeState="True" Margin="12,0,0,0" Foreground="{StaticResource PrimaryTextBrush}"/>
     </ToolBar>
 
@@ -63,7 +72,17 @@
 
           <TextBox x:Name="NewTaskInput" Text="{Binding NewTaskTitle, Mode=TwoWay}" Placeholder="Enter new task title..." Padding="8,6,8,6"/>
 
-          <ListBox x:Name="TasksList" ItemsSource="{Binding ActiveTasks}" Height="320"/>
+          <ListBox x:Name="TasksList" ItemsSource="{Binding ActiveTasks}" SelectionChanged="TasksList_SelectionChanged" Height="150"/>
+
+          <ListView x:Name="TasksGrid" ItemsSource="{Binding TaskRows}" Height="180">
+            <ListView.View>
+              <GridView>
+                <GridViewColumn Header="Task" Width="280" DisplayMemberBinding="{Binding Title}"/>
+                <GridViewColumn Header="Track" Width="130" DisplayMemberBinding="{Binding Track}"/>
+                <GridViewColumn Header="Priority" Width="100" DisplayMemberBinding="{Binding Priority}"/>
+              </GridView>
+            </ListView.View>
+          </ListView>
         </StackPanel>
       </Border>
     </Grid>

@@ -1199,6 +1199,24 @@ bool DecodePngFromMemory(
                                     std::uint32_t dstStartX,
                                     std::uint32_t dstStepX,
                                     std::uint32_t dstY) noexcept {
+        if (dstStartX == 0u && dstStepX == 1u && bitDepth == 8u) {
+            std::uint8_t* dstRow = outImage.rgbaPixels.data() + static_cast<std::size_t>(dstY) * width * 4u;
+            if (colorType == 6u) {
+                std::memcpy(dstRow, scanRow, static_cast<std::size_t>(subWidth) * 4u);
+                return;
+            }
+            if (colorType == 2u && !hasKeyTransparency) {
+                for (std::uint32_t sx = 0u; sx < subWidth; ++sx) {
+                    const std::uint8_t* p = scanRow + sx * 3u;
+                    std::uint8_t* d = dstRow + sx * 4u;
+                    d[0] = p[0];
+                    d[1] = p[1];
+                    d[2] = p[2];
+                    d[3] = 255u;
+                }
+                return;
+            }
+        }
         for (std::uint32_t sx = 0u; sx < subWidth; ++sx) {
             const std::uint32_t dx = dstStartX + sx * dstStepX;
             std::uint8_t* dst = outImage.rgbaPixels.data() +
@@ -1993,23 +2011,88 @@ bool DecodeJpegFromMemory(
         return true;
     }
 
-    auto sampleSubsampledPlane = [&](const JpegComponent& comp, std::uint32_t px, std::uint32_t py) noexcept -> int {
-        if (comp.hSamp == maxHSamp && comp.vSamp == maxVSamp) {
+    struct UpsampleAxisTable {
+        bool fullRes = true;
+        std::vector<int> i0;
+        std::vector<int> i1;
+        std::vector<float> frac;
+    };
+    auto buildAxisTable = [&](std::uint32_t dim, std::uint32_t samp, std::uint32_t maxSamp) -> UpsampleAxisTable {
+        UpsampleAxisTable t{};
+        t.fullRes = (samp == maxSamp);
+        if (t.fullRes) return t;
+        t.i0.resize(dim);
+        t.i1.resize(dim);
+        t.frac.resize(dim);
+        const float scale = static_cast<float>(samp) / static_cast<float>(maxSamp);
+        const int maxCoord = std::max(0, static_cast<int>((dim * samp + maxSamp - 1u) / maxSamp) - 1);
+        for (std::uint32_t i = 0u; i < dim; ++i) {
+            const float s = (static_cast<float>(i) + 0.5f) * scale - 0.5f;
+            const float fl = std::floor(s);
+            const int c0 = std::clamp(static_cast<int>(fl), 0, maxCoord);
+            t.i0[i] = c0;
+            t.i1[i] = std::clamp(c0 + 1, 0, maxCoord);
+            t.frac[i] = std::clamp(s - fl, 0.0f, 1.0f);
+        }
+        return t;
+    };
+
+    const UpsampleAxisTable yAxisX = buildAxisTable(width, cY.hSamp, maxHSamp);
+    const UpsampleAxisTable yAxisY = buildAxisTable(height, cY.vSamp, maxVSamp);
+    const UpsampleAxisTable cbAxisX = buildAxisTable(width, cCb.hSamp, maxHSamp);
+    const UpsampleAxisTable cbAxisY = buildAxisTable(height, cCb.vSamp, maxVSamp);
+    const UpsampleAxisTable crAxisX = buildAxisTable(width, cCr.hSamp, maxHSamp);
+    const UpsampleAxisTable crAxisY = buildAxisTable(height, cCr.vSamp, maxVSamp);
+
+    if (yAxisX.fullRes && yAxisY.fullRes &&
+        !cbAxisX.fullRes && !cbAxisY.fullRes &&
+        cCb.hSamp == cCr.hSamp && cCb.vSamp == cCr.vSamp) {
+        // Fast path for standard 4:2:0 / 4:2:2 JPEGs (Cb & Cr share identical subsampling factors)
+        const int* x0Lut = cbAxisX.i0.data();
+        const int* x1Lut = cbAxisX.i1.data();
+        const float* fxLut = cbAxisX.frac.data();
+        for (std::uint32_t y = 0u; y < height; ++y) {
+            const std::uint8_t* yRow = cY.planePixels.data() + static_cast<std::size_t>(y) * cY.planeStride;
+            const int cy0 = cbAxisY.i0[y];
+            const int cy1 = cbAxisY.i1[y];
+            const float fy = cbAxisY.frac[y];
+            const std::uint8_t* cbR0 = cCb.planePixels.data() + static_cast<std::size_t>(cy0) * cCb.planeStride;
+            const std::uint8_t* cbR1 = cCb.planePixels.data() + static_cast<std::size_t>(cy1) * cCb.planeStride;
+            const std::uint8_t* crR0 = cCr.planePixels.data() + static_cast<std::size_t>(cy0) * cCr.planeStride;
+            const std::uint8_t* crR1 = cCr.planePixels.data() + static_cast<std::size_t>(cy1) * cCr.planeStride;
+            std::uint8_t* dst = outImage.rgbaPixels.data() + static_cast<std::size_t>(y) * width * 4u;
+            for (std::uint32_t x = 0u; x < width; ++x) {
+                const int cx0 = x0Lut[x];
+                const int cx1 = x1Lut[x];
+                const float fx = fxLut[x];
+                const float cbTop = static_cast<float>(cbR0[cx0]) + (static_cast<float>(cbR0[cx1]) - static_cast<float>(cbR0[cx0])) * fx;
+                const float cbBot = static_cast<float>(cbR1[cx0]) + (static_cast<float>(cbR1[cx1]) - static_cast<float>(cbR1[cx0])) * fx;
+                const int cb = static_cast<int>(cbTop + (cbBot - cbTop) * fy + 0.5f) - 128;
+
+                const float crTop = static_cast<float>(crR0[cx0]) + (static_cast<float>(crR0[cx1]) - static_cast<float>(crR0[cx0])) * fx;
+                const float crBot = static_cast<float>(crR1[cx0]) + (static_cast<float>(crR1[cx1]) - static_cast<float>(crR1[cx0])) * fx;
+                const int cr = static_cast<int>(crTop + (crBot - crTop) * fy + 0.5f) - 128;
+
+                const int yv = static_cast<int>(yRow[x]);
+                dst[x * 4u + 0u] = ClampIntToByte(yv + ((91881 * cr + 32768) >> 16));
+                dst[x * 4u + 1u] = ClampIntToByte(yv - ((22554 * cb + 46802 * cr + 32768) >> 16));
+                dst[x * 4u + 2u] = ClampIntToByte(yv + ((116130 * cb + 32768) >> 16));
+                dst[x * 4u + 3u] = 255u;
+            }
+        }
+        return true;
+    }
+
+    auto samplePlaneLut = [](const JpegComponent& comp, const UpsampleAxisTable& ax, const UpsampleAxisTable& ay, std::uint32_t px, std::uint32_t py) noexcept -> int {
+        if (ax.fullRes && ay.fullRes) {
             return static_cast<int>(comp.planePixels[static_cast<std::size_t>(py) * comp.planeStride + px]);
         }
-        const float scaleX = static_cast<float>(comp.hSamp) / static_cast<float>(maxHSamp);
-        const float scaleY = static_cast<float>(comp.vSamp) / static_cast<float>(maxVSamp);
-        const float sx = (static_cast<float>(px) + 0.5f) * scaleX - 0.5f;
-        const float sy = (static_cast<float>(py) + 0.5f) * scaleY - 0.5f;
-        const int maxCx = static_cast<int>((width * comp.hSamp + maxHSamp - 1u) / maxHSamp) - 1;
-        const int maxCy = static_cast<int>((height * comp.vSamp + maxVSamp - 1u) / maxVSamp) - 1;
-        const int x0 = std::clamp(static_cast<int>(std::floor(sx)), 0, std::max(0, maxCx));
-        const int y0 = std::clamp(static_cast<int>(std::floor(sy)), 0, std::max(0, maxCy));
-        const int x1 = std::clamp(x0 + 1, 0, std::max(0, maxCx));
-        const int y1 = std::clamp(y0 + 1, 0, std::max(0, maxCy));
-        const float fx = std::clamp(sx - std::floor(sx), 0.0f, 1.0f);
-        const float fy = std::clamp(sy - std::floor(sy), 0.0f, 1.0f);
-
+        const int x0 = ax.fullRes ? static_cast<int>(px) : ax.i0[px];
+        const int x1 = ax.fullRes ? static_cast<int>(px) : ax.i1[px];
+        const float fx = ax.fullRes ? 0.0f : ax.frac[px];
+        const int y0 = ay.fullRes ? static_cast<int>(py) : ay.i0[py];
+        const int y1 = ay.fullRes ? static_cast<int>(py) : ay.i1[py];
+        const float fy = ay.fullRes ? 0.0f : ay.frac[py];
         const std::uint8_t* r0 = comp.planePixels.data() + static_cast<std::size_t>(y0) * comp.planeStride;
         const std::uint8_t* r1 = comp.planePixels.data() + static_cast<std::size_t>(y1) * comp.planeStride;
         const float top = static_cast<float>(r0[x0]) + (static_cast<float>(r0[x1]) - static_cast<float>(r0[x0])) * fx;
@@ -2020,9 +2103,9 @@ bool DecodeJpegFromMemory(
     for (std::uint32_t y = 0u; y < height; ++y) {
         std::uint8_t* dst = outImage.rgbaPixels.data() + static_cast<std::size_t>(y) * width * 4u;
         for (std::uint32_t x = 0u; x < width; ++x) {
-            const int yv = sampleSubsampledPlane(cY, x, y);
-            const int cb = sampleSubsampledPlane(cCb, x, y) - 128;
-            const int cr = sampleSubsampledPlane(cCr, x, y) - 128;
+            const int yv = samplePlaneLut(cY, yAxisX, yAxisY, x, y);
+            const int cb = samplePlaneLut(cCb, cbAxisX, cbAxisY, x, y) - 128;
+            const int cr = samplePlaneLut(cCr, crAxisX, crAxisY, x, y) - 128;
             dst[x * 4u + 0u] = ClampIntToByte(yv + ((91881 * cr + 32768) >> 16));
             dst[x * 4u + 1u] = ClampIntToByte(yv - ((22554 * cb + 46802 * cr + 32768) >> 16));
             dst[x * 4u + 2u] = ClampIntToByte(yv + ((116130 * cb + 32768) >> 16));

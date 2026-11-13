@@ -605,6 +605,7 @@ bool TrueTypeFontFace::LoadFromMemory(
     std::size_t size,
     std::string* outError) {
     valid_ = false;
+    contentHash_ = 0u;
     data_.clear();
     familyName_.clear();
     fullName_.clear();
@@ -623,6 +624,15 @@ bool TrueTypeFontFace::LoadFromMemory(
         return false;
     }
 
+    std::uint64_t h = 14695981039346656037ULL;
+    const std::size_t stride = (size > 65536u) ? (size / 16384u) : 1u;
+    for (std::size_t i = 0u; i < size; i += stride) {
+        h ^= static_cast<std::uint64_t>(data[i]);
+        h *= 1099511628211ULL;
+    }
+    h ^= static_cast<std::uint64_t>(size);
+    h *= 1099511628211ULL;
+    contentHash_ = (h == 0u) ? 1u : h;
     data_.assign(data, data + size);
     if (!ParseTables(outError)) {
         data_.clear();
@@ -1947,16 +1957,41 @@ void FontAtlas::BakeOutlineToSdfCell(
     const float maxCutoffDist = safeRange + 1.5f;
     const float maxCutoffSq = maxCutoffDist * maxCutoffDist;
 
+    std::vector<YMonotonicSeg> rowWindSegs;
+    rowWindSegs.reserve(windSegs.size());
+    std::vector<const CellDistCurve*> rowDistCurves;
+    rowDistCurves.reserve(distCurves.size());
+
     for (std::uint16_t py = 0u; py < cellH; ++py) {
         const float sy = static_cast<float>(py) + 0.5f;
+        rowWindSegs.clear();
+        for (const auto& ws : windSegs) {
+            if (sy >= ws.minY && sy <= ws.maxY) {
+                rowWindSegs.push_back(ws);
+            }
+        }
+        rowDistCurves.clear();
+        for (const auto& c : distCurves) {
+            const float ady = std::max({c.minY - sy, 0.0f, sy - c.maxY});
+            if (ady * ady < maxCutoffSq) {
+                rowDistCurves.push_back(&c);
+            }
+        }
+        if (rowWindSegs.empty() && rowDistCurves.empty()) {
+            // Entire row is outside and beyond maxCutoffDist -> QuantizeSdfByte(-maxCutoffDist, safeRange) == 0u
+            continue;
+        }
         for (std::uint16_t px = 0u; px < cellW; ++px) {
             const float sx = static_cast<float>(px) + 0.5f;
-            const bool inside = (EvaluateWindingNumber(windSegs, sx, sy) != 0);
+            const bool inside = !rowWindSegs.empty() && (EvaluateWindingNumber(rowWindSegs, sx, sy) != 0);
 
-            float bestDistSq = inside ? maxCutoffSq : maxCutoffSq;
-            for (const auto& c : distCurves) {
-                // Fast AABB lower-bound cull
+            float bestDistSq = maxCutoffSq;
+            for (const CellDistCurve* cp : rowDistCurves) {
+                const auto& c = *cp;
                 const float adx = std::max({c.minX - sx, 0.0f, sx - c.maxX});
+                if (adx * adx >= bestDistSq) {
+                    continue;
+                }
                 const float ady = std::max({c.minY - sy, 0.0f, sy - c.maxY});
                 if (adx * adx + ady * ady >= bestDistSq) {
                     continue;
@@ -1974,15 +2009,76 @@ void FontAtlas::BakeOutlineToSdfCell(
     }
 }
 
+namespace {
+
+struct ProcessFontFaceCache {
+    std::mutex mtx;
+    std::unordered_map<std::uint64_t, std::shared_ptr<TrueTypeFontFace>> faces;
+
+    static ProcessFontFaceCache& Instance() noexcept {
+        static ProcessFontFaceCache inst;
+        return inst;
+    }
+};
+
+struct ProcessBakedGlyphEntry {
+    FontAtlasGlyph meta{};
+    std::vector<std::uint8_t> pixels;
+};
+
+struct ProcessBakedGlyphCache {
+    std::mutex mtx;
+    std::unordered_map<std::uint64_t, ProcessBakedGlyphEntry> entries;
+
+    static ProcessBakedGlyphCache& Instance() noexcept {
+        static ProcessBakedGlyphCache inst;
+        return inst;
+    }
+};
+
+[[nodiscard]] std::uint64_t ComputeFontBlobKey(const std::uint8_t* data, std::size_t size) noexcept {
+    if (!data || size == 0u) return 0u;
+    std::uint64_t h = 14695981039346656037ULL;
+    const std::size_t stride = (size > 65536u) ? (size / 16384u) : 1u;
+    for (std::size_t i = 0u; i < size; i += stride) {
+        h ^= static_cast<std::uint64_t>(data[i]);
+        h *= 1099511628211ULL;
+    }
+    h ^= static_cast<std::uint64_t>(size);
+    h *= 1099511628211ULL;
+    return (h == 0u) ? 1u : h;
+}
+
+} // namespace
+
 bool FontAtlas::LoadTrueTypeFontFromMemory(
     const std::uint8_t* data,
     std::size_t size,
     std::string_view familyAlias,
     bool setAsDefault,
     std::string* outError) {
-    auto face = std::make_shared<TrueTypeFontFace>();
-    if (!face->LoadFromMemory(data, size, outError)) {
-        return false;
+    const std::uint64_t blobKey = ComputeFontBlobKey(data, size);
+    std::shared_ptr<TrueTypeFontFace> face;
+    if (blobKey != 0u) {
+        auto& fc = ProcessFontFaceCache::Instance();
+        std::lock_guard<std::mutex> g(fc.mtx);
+        auto it = fc.faces.find(blobKey);
+        if (it != fc.faces.end()) {
+            face = it->second;
+        }
+    }
+    if (!face) {
+        auto parsed = std::make_shared<TrueTypeFontFace>();
+        if (!parsed->LoadFromMemory(data, size, outError)) {
+            return false;
+        }
+        face = std::move(parsed);
+        if (blobKey != 0u) {
+            auto& fc = ProcessFontFaceCache::Instance();
+            std::lock_guard<std::mutex> g(fc.mtx);
+            if (fc.faces.size() >= 64u) fc.faces.clear();
+            fc.faces.emplace(blobKey, face);
+        }
     }
 
     std::lock_guard<std::mutex> lock(mutex_);
@@ -2142,18 +2238,47 @@ FontAtlasGlyph FontAtlas::EnsureGlyphLocked(
     if (fontEntry && fontEntry->face && fontEntry->face->IsValid()) {
         const std::uint32_t gid = fontEntry->face->FindGlyphIndex(codePoint);
         if (gid != 0u || codePoint == 0x20u || codePoint == 0x09u) {
-            TtfGlyphOutline outline{};
-            if (fontEntry->face->ExtractGlyphOutline(gid, outline)) {
-                FontAtlasGlyph meta{};
-                meta.codePoint = codePoint;
-                std::vector<std::uint8_t> cellPixels;
-                BakeOutlineToSdfCell(
-                    outline,
-                    fontEntry->face->UnitsPerEm(),
-                    kDefaultBakeEmPixels,
-                    kDefaultSdfPxRange,
-                    meta,
-                    cellPixels);
+            const std::uint64_t faceHash = fontEntry->face->ContentHash();
+            const std::uint64_t procGlyphKey = (faceHash != 0u)
+                ? ((faceHash ^ (static_cast<std::uint64_t>(gid) * 0x9E3779B97F4A7C15ULL)) ^
+                   (static_cast<std::uint64_t>(codePoint) << 1u))
+                : 0u;
+            FontAtlasGlyph meta{};
+            std::vector<std::uint8_t> cellPixels;
+            bool bakedOk = false;
+            if (procGlyphKey != 0u) {
+                auto& pgc = ProcessBakedGlyphCache::Instance();
+                std::lock_guard<std::mutex> g(pgc.mtx);
+                const auto hit = pgc.entries.find(procGlyphKey);
+                if (hit != pgc.entries.end()) {
+                    meta = hit->second.meta;
+                    meta.codePoint = codePoint;
+                    cellPixels = hit->second.pixels;
+                    bakedOk = true;
+                }
+            }
+            if (!bakedOk) {
+                TtfGlyphOutline outline{};
+                if (fontEntry->face->ExtractGlyphOutline(gid, outline)) {
+                    meta = FontAtlasGlyph{};
+                    meta.codePoint = codePoint;
+                    BakeOutlineToSdfCell(
+                        outline,
+                        fontEntry->face->UnitsPerEm(),
+                        kDefaultBakeEmPixels,
+                        kDefaultSdfPxRange,
+                        meta,
+                        cellPixels);
+                    bakedOk = true;
+                    if (procGlyphKey != 0u) {
+                        auto& pgc = ProcessBakedGlyphCache::Instance();
+                        std::lock_guard<std::mutex> g(pgc.mtx);
+                        if (pgc.entries.size() >= 8192u) pgc.entries.clear();
+                        pgc.entries.emplace(procGlyphKey, ProcessBakedGlyphEntry{meta, cellPixels});
+                    }
+                }
+            }
+            if (bakedOk) {
 
                 const float invW = 1.0f / static_cast<float>(atlasWidth_);
                 const float invH = 1.0f / static_cast<float>(atlasHeight_);
@@ -2168,10 +2293,11 @@ FontAtlasGlyph FontAtlas::EnsureGlyphLocked(
                         meta.u1 = (static_cast<float>(ax + meta.cellWidth) - 0.5f) * invW;
                         meta.v1 = (static_cast<float>(ay + meta.cellHeight) - 0.5f) * invH;
                     } else {
-                        // Atlas full fallback — do NOT insert permanent tofu entry into glyphCache_
+                        // meta.advanceEm already computed by BakeOutlineToSdfCell
+                        const float savedAdv = meta.advanceEm;
                         meta = (codePoint < 128u) ? builtInAscii_[codePoint] : builtInCjkBoxGlyph_;
                         meta.codePoint = codePoint;
-                        meta.advanceEm = outline.advanceWidth / static_cast<float>(fontEntry->face->UnitsPerEm());
+                        meta.advanceEm = savedAdv;
                         return meta;
                     }
                 } else {

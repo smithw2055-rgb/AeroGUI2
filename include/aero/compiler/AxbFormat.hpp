@@ -795,6 +795,11 @@ struct AxbPackage {
     std::uint16_t propId,
     std::string_view rawValue);
 [[nodiscard]] Color ParseXamlColorLiteral(std::string_view raw) noexcept;
+[[nodiscard]] std::string FormatColorHexArgb(const Color& c);
+[[nodiscard]] KeyCode ParseXamlKeyCode(std::string_view raw) noexcept;
+[[nodiscard]] std::uint8_t ParseXamlKeyModifiers(std::string_view raw) noexcept;
+[[nodiscard]] std::string KeyCodeToName(KeyCode key);
+[[nodiscard]] rs_rt::NativeHandleRegistry& FallbackVisualHandleRegistry() noexcept;
 [[nodiscard]] Matrix2D ParseXamlMatrix2DLiteral(std::string_view raw) noexcept;
 [[nodiscard]] std::string DecodeXamlXmlEntities(std::string_view raw);
 

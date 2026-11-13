@@ -3071,7 +3071,7 @@ bool PagedRenderTree::UpdateElementInPlace(
     if (element->IsA<Rectangle>() || element->IsA<Ellipse>() || element->IsA<Line>() ||
         element->IsA<Polygon>() || element->IsA<Polyline>() ||
         element->IsA<ProgressBar>() || element->IsA<HeaderedContentControl>() ||
-        element->IsA<TabControl>() ||
+        element->IsA<TabControl>() || element->IsA<ListView>() || element->IsA<ToolBar>() ||
         ExtractGradBrushId(element->GetValue(PropId_BackgroundGradientId)) != 0u ||
         ExtractGradBrushId(element->GetValue(PropId_ForegroundGradientId)) != 0u ||
         ExtractGradBrushId(element->GetValue(PropId_BorderGradientId)) != 0u) {
@@ -3397,9 +3397,28 @@ bool PagedRenderTree::UpdateElementInPlace(
         return true;
     }
 
-    // Specialized Button update (fill box + optional BorderBrush ring + optional centered SdfTextGlyph label span)
+    // Specialized Button update (fill box + optional BorderBrush ring + optional SdfTextGlyph label span)
     if (const auto* btn = element->DynamicCast<Button>()) {
-        const std::string label = (!btn->FirstChild()) ? btn->GetContentText() : std::string{};
+        const bool isMenuItem = btn->IsA<MenuItem>();
+        bool menuHasIcon = false;
+        if (isMenuItem) {
+            for (const UIElement* mc = btn->FirstChild(); mc != nullptr; mc = mc->NextSibling()) {
+                if (!mc->IsA<MenuItem>() && !mc->IsA<Separator>()) {
+                    menuHasIcon = true;
+                    break;
+                }
+            }
+        }
+        std::string label;
+        if (!btn->FirstChild() || isMenuItem) {
+            label = btn->GetContentText();
+            if (label.empty() && isMenuItem) {
+                const UnifiedValue hv = btn->GetValue(PropId_Header);
+                if (const auto* sv = std::get_if<StringValue>(&hv)) {
+                    label = sv->str();
+                }
+            }
+        }
         const std::string_view activeLabel = (vis == Visibility::Collapsed)
             ? std::string_view{}
             : std::string_view{label};
@@ -3456,8 +3475,11 @@ bool PagedRenderTree::UpdateElementInPlace(
         const std::string btnFont = ResolveElementFontFamily(btn);
         const TextLayoutResult btnLayout = MeasureTextLayout(
             activeLabel, btnFont, fontSize, 1000000.0f, TextWrapping::NoWrap);
-        const float lx = r.x + std::max(4.0f, (boxW - btnLayout.totalWidth) * 0.5f);
-        const float ly = r.y + std::max(2.0f, (boxH - fontSize * 1.2f) * 0.5f);
+        const float lx = isMenuItem
+            ? (r.x + (menuHasIcon ? 28.0f : 10.0f))
+            : (r.x + std::max(4.0f, (boxW - btnLayout.totalWidth) * 0.5f));
+        const float rowBoxH = isMenuItem ? std::min(boxH, 26.0f) : boxH;
+        const float ly = r.y + std::max(2.0f, (rowBoxH - fontSize * 1.2f) * 0.5f);
 
         if (CountLayoutVisibleGlyphs(btnLayout) > totalLabelGlyphCap) {
             return false;
@@ -5571,8 +5593,19 @@ void PagedRenderTree::TraverseAndEmitElement(
             ++emittedCount;
         }
 
-        if (!btn->FirstChild()) {
-            const std::string label = btn->GetContentText();
+        const bool isMenuItem = btn->IsA<MenuItem>();
+        bool menuHasIcon = false;
+        if (isMenuItem) {
+            for (const UIElement* mc = btn->FirstChild(); mc != nullptr; mc = mc->NextSibling()) {
+                if (!mc->IsA<MenuItem>() && !mc->IsA<Separator>()) { menuHasIcon = true; break; }
+            }
+        }
+        if (!btn->FirstChild() || isMenuItem) {
+            std::string label = btn->GetContentText();
+            if (label.empty() && isMenuItem) {
+                const UnifiedValue hv = btn->GetValue(PropId_Header);
+                if (const auto* sv = std::get_if<StringValue>(&hv)) label = sv->str();
+            }
             if (!label.empty()) {
                 Color fg{0.96f, 0.98f, 1.0f, 1.0f};
                 if (auto fgOpt = value::TryGetColor(btn->GetValue(PropId_Foreground))) {
@@ -5582,8 +5615,11 @@ void PagedRenderTree::TraverseAndEmitElement(
                 (void)TryGetFloat(btn->GetValue(PropId_FontSize), fontSize);
                 const std::string btnFont = ResolveElementFontFamily(btn);
                 const Size labelMetrics = MeasureUtf8TextRun(label, fontSize, btnFont);
-                const float lx = r.x + std::max(4.0f, (w - labelMetrics.width) * 0.5f);
-                const float ly = r.y + std::max(2.0f, (h - fontSize * 1.2f) * 0.5f);
+                const float lx = isMenuItem
+                    ? (r.x + (menuHasIcon ? 28.0f : 10.0f))
+                    : (r.x + std::max(4.0f, (w - labelMetrics.width) * 0.5f));
+                const float rowBoxH = isMenuItem ? std::min(h, 26.0f) : h;
+                const float ly = r.y + std::max(2.0f, (rowBoxH - fontSize * 1.2f) * 0.5f);
                 emittedCount = static_cast<std::uint16_t>(
                     emittedCount + EmitTextRunNodes(
                         lx,
@@ -5682,6 +5718,53 @@ void PagedRenderTree::TraverseAndEmitElement(
             ++emittedCount;
         }
 
+        if (const auto* lv = elem->DynamicCast<ListView>(); lv && lv->HasGridViewHeader()) {
+            const float hdrH = ListView::kHeaderBarHeight;
+            const std::uint32_t hdrBgId = AllocateRoundedRectNode(
+                r.x + 1.0f, r.y + 1.0f, std::max(0.0f, w - 2.0f), std::min(hdrH, h),
+                Color{0.20f, 0.28f, 0.38f, 0.85f}, CornerRadius{2.0f}, elem);
+            nodes_[hdrBgId].opacity = effOpacity;
+            applyNodeTransform(hdrBgId);
+            ++emittedCount;
+            const UnifiedValue gv = lv->GetValue(PropId_GridViewColumnsSpec);
+            if (const auto* sv = std::get_if<StringValue>(&gv)) {
+                const std::string_view allCols = sv->view();
+                float colX = r.x + 6.0f;
+                std::size_t pos = 0u;
+                while (pos <= allCols.size()) {
+                    const std::size_t recEnd = allCols.find('\x1e', pos);
+                    const std::string_view rec = (recEnd == std::string_view::npos) ? allCols.substr(pos) : allCols.substr(pos, recEnd - pos);
+                    const std::size_t f0 = rec.find('\x1f');
+                    const std::string_view colTitle = (f0 == std::string_view::npos) ? rec : rec.substr(0u, f0);
+                    float colW = 100.0f;
+                    if (f0 != std::string_view::npos) {
+                        const std::size_t f1 = rec.find('\x1f', f0 + 1u);
+                        const std::string_view wStr = (f1 == std::string_view::npos) ? rec.substr(f0 + 1u) : rec.substr(f0 + 1u, f1 - (f0 + 1u));
+                        if (!wStr.empty() && wStr != "Auto" && wStr != "NaN") {
+                            float parsedW = 0.0f;
+                            if (TryGetFloat(ParseBuiltinLiteralPropertyValue(PropId_Width, wStr), parsedW) && parsedW > 0.0f) {
+                                colW = parsedW;
+                            }
+                        }
+                    }
+                    if (!colTitle.empty()) {
+                        emittedCount = static_cast<std::uint16_t>(emittedCount + EmitTextRunNodes(
+                            colX, r.y + 5.0f, 12.5f, std::string(colTitle),
+                            Color{0.92f, 0.96f, 1.0f, 1.0f}, effOpacity, curState, elem));
+                    }
+                    colX += std::max(24.0f, colW);
+                    if (recEnd == std::string_view::npos) break;
+                    pos = recEnd + 1u;
+                }
+            }
+        } else if (const auto* toolBar = elem->DynamicCast<ToolBar>()) {
+            const std::string tbHdr = toolBar->GetHeaderText();
+            if (!tbHdr.empty()) {
+                emittedCount = static_cast<std::uint16_t>(emittedCount + EmitTextRunNodes(
+                    r.x + 6.0f, r.y + std::max(2.0f, (h - 15.0f) * 0.5f), 13.0f, tbHdr,
+                    Color{0.82f, 0.88f, 0.96f, 1.0f}, effOpacity, curState, elem));
+            }
+        }
         if (plan.reserveBorderNode) {
             const std::uint32_t borderId = AllocateBorderRingNode(
                 plan.borderRect.x,

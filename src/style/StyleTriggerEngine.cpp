@@ -1594,6 +1594,33 @@ bool StyleTriggerEngine::EvaluateSingleCondition(
 
         case TriggerConditionSource::DataContextBinding: {
             const ObjectRef dcObj = ResolveEffectiveDataContext(elem);
+            if (!dcObj.valid()) {
+                for (const UIElement* cur = elem; cur != nullptr; cur = NextContextParent(cur)) {
+                    const UnifiedValue rawDc = cur->GetValue(PropId_DataContext);
+                    if (const auto* nh = std::get_if<NativeHandle>(&rawDc)) {
+                        const UIElement* dcEl = domains_
+                            ? UIElement::FromNativeHandle(domains_->nativeHandles(), *nh)
+                            : nullptr;
+                        if (!dcEl) dcEl = UIElement::FromNativeHandle(FallbackVisualHandleRegistry(), *nh);
+                        if (dcEl) {
+                            if (cond.compiledHops.empty()) {
+                                actualVal = rawDc;
+                            } else {
+                                const std::uint16_t pid = ResolveTriggerConditionPropertyId(cond.compiledHops.front().memberName);
+                                actualVal = dcEl->GetValue(pid);
+                            }
+                            break;
+                        }
+                    }
+                    if (!std::holds_alternative<std::monostate>(rawDc) && cond.compiledHops.empty()) {
+                        actualVal = rawDc;
+                        break;
+                    }
+                }
+                if (!std::holds_alternative<std::monostate>(actualVal)) {
+                    break;
+                }
+            }
             if (cond.compiledHops.empty()) {
                 // "{Binding}" empty path binds directly to DataContext itself (e.g. Value="{x:Null}")
                 actualVal = dcObj.valid() ? UnifiedValue{dcObj} : UnifiedValue{NullObject{}};
@@ -2067,27 +2094,131 @@ namespace {
         return invokeCmdMethod(mSym, {cmdObj});
     }
 
-    // Custom ICommand implementation (not built-in DelegateCommand)
-    if (hasParam) {
-        NativeHandle nh{};
-        if (rawParam.tryGetNativeHandle(nh)) {
-            if (const SymbolId mSym = findExecMethod(rs_sem::PrimitiveType::Handle, false)) {
-                return invokeCmdMethod(mSym, {cmdObj, UnifiedValue{nh}});
-            }
+    // TypedRelayCommand<T> / TypedDelegateCommand<T> or custom ICommand implementation
+    // Pass 1: exact runtime parameter-type match (or 0-arg match when no parameter was provided)
+    if (!hasParam) {
+        if (const SymbolId mSym = findExecMethod(rs_sem::PrimitiveType::Void, true)) {
+            return invokeCmdMethod(mSym, {cmdObj});
         }
-        std::int64_t iv = 0;
-        EnumValue ev{};
-        if (rawParam.tryGetInt64(iv) || rawParam.tryGetEnum(ev)) {
+    } else {
+        if (std::holds_alternative<bool>(rawParam)) {
+            if (const SymbolId mSym = findExecMethod(rs_sem::PrimitiveType::Bool, false)) {
+                return invokeCmdMethod(mSym, {cmdObj, rawParam});
+            }
+        } else if (std::holds_alternative<std::int64_t>(rawParam) ||
+                   std::holds_alternative<EnumValue>(rawParam)) {
             if (const SymbolId mSym = findExecMethod(rs_sem::PrimitiveType::Int, false)) {
                 return invokeCmdMethod(mSym, {cmdObj, value::FromInt(coerceIntParam(rawParam))});
             }
-        }
-        if (const SymbolId mSym = findExecMethod(rs_sem::PrimitiveType::String, false)) {
-            const std::string s = FormatBindingString({}, &rawParam, 1u, domains);
-            if (auto alloc = domains->uiHeap().allocateString(s)) {
-                return invokeCmdMethod(mSym, {cmdObj, *alloc});
+        } else if (std::holds_alternative<FloatValue>(rawParam)) {
+            if (const SymbolId mSym = findExecMethod(rs_sem::PrimitiveType::Float, false)) {
+                return invokeCmdMethod(mSym, {cmdObj, rawParam});
+            }
+            if (const SymbolId mSym = findExecMethod(rs_sem::PrimitiveType::Double, false)) {
+                float fv = 0.0f;
+                (void)TryGetFloat(rawParam, fv);
+                return invokeCmdMethod(mSym, {cmdObj, UnifiedValue(static_cast<double>(fv))});
+            }
+        } else if (std::holds_alternative<double>(rawParam)) {
+            if (const SymbolId mSym = findExecMethod(rs_sem::PrimitiveType::Double, false)) {
+                return invokeCmdMethod(mSym, {cmdObj, rawParam});
+            }
+            if (const SymbolId mSym = findExecMethod(rs_sem::PrimitiveType::Float, false)) {
+                return invokeCmdMethod(mSym, {cmdObj, value::FromFloat(static_cast<float>(std::get<double>(rawParam)))});
+            }
+        } else if (std::holds_alternative<NativeHandle>(rawParam)) {
+            if (const SymbolId mSym = findExecMethod(rs_sem::PrimitiveType::Handle, false)) {
+                return invokeCmdMethod(mSym, {cmdObj, rawParam});
+            }
+        } else if (std::holds_alternative<StringValue>(rawParam)) {
+            if (const SymbolId mSym = findExecMethod(rs_sem::PrimitiveType::String, false)) {
+                UnifiedValue strArg{};
+                if (auto alloc = domains->uiHeap().allocateString(std::string(std::get<StringValue>(rawParam).view()))) {
+                    strArg = *alloc;
+                }
+                return invokeCmdMethod(mSym, {cmdObj, strArg});
+            }
+        } else if (const auto* oref = std::get_if<ObjectRef>(&rawParam); oref && oref->valid()) {
+            if (oref->kind == ObjectKind::String) {
+                if (const SymbolId mSym = findExecMethod(rs_sem::PrimitiveType::String, false)) {
+                    return invokeCmdMethod(mSym, {cmdObj, *oref});
+                }
+            } else {
+                if (const SymbolId mSym = findExecMethod(rs_sem::PrimitiveType::Object, false)) {
+                    return invokeCmdMethod(mSym, {cmdObj, *oref});
+                }
             }
         }
+    }
+
+    // Pass 2: TypedRelayCommand<T> / coercion fallback (e.g. XAML CommandParameter="42" -> RelayCommand<int>)
+    if (const SymbolId mSym = findExecMethod(rs_sem::PrimitiveType::String, false)) {
+        UnifiedValue strArg{};
+        if (hasParam) {
+            if (const auto* sref = std::get_if<ObjectRef>(&rawParam); sref && sref->valid() && sref->kind == ObjectKind::String) {
+                strArg = *sref;
+            } else {
+                const std::string s = FormatBindingString({}, &rawParam, 1u, domains);
+                if (auto alloc = domains->uiHeap().allocateString(s)) strArg = *alloc;
+            }
+        } else if (auto alloc = domains->uiHeap().allocateString("")) {
+            strArg = *alloc;
+        }
+        return invokeCmdMethod(mSym, {cmdObj, strArg});
+    }
+    if (const SymbolId mSym = findExecMethod(rs_sem::PrimitiveType::Int, false)) {
+        return invokeCmdMethod(mSym, {cmdObj, value::FromInt(hasParam ? coerceIntParam(rawParam) : 0)});
+    }
+    if (const SymbolId mSym = findExecMethod(rs_sem::PrimitiveType::Float, false)) {
+        float fv = 0.0f;
+        if (hasParam) {
+            if (!TryGetFloat(rawParam, fv)) {
+                fv = static_cast<float>(coerceIntParam(rawParam));
+            }
+        }
+        return invokeCmdMethod(mSym, {cmdObj, value::FromFloat(fv)});
+    }
+    if (const SymbolId mSym = findExecMethod(rs_sem::PrimitiveType::Double, false)) {
+        float fv = 0.0f;
+        if (hasParam) {
+            if (!TryGetFloat(rawParam, fv)) {
+                fv = static_cast<float>(coerceIntParam(rawParam));
+            }
+        }
+        return invokeCmdMethod(mSym, {cmdObj, UnifiedValue(static_cast<double>(fv))});
+    }
+    if (const SymbolId mSym = findExecMethod(rs_sem::PrimitiveType::Bool, false)) {
+        bool bv = false;
+        if (hasParam) {
+            if (!rawParam.tryGetBool(bv)) {
+                if (const auto* sv = std::get_if<StringValue>(&rawParam)) {
+                    bv = (sv->view() == "True" || sv->view() == "true" || sv->view() == "1");
+                } else {
+                    bv = (coerceIntParam(rawParam) != 0);
+                }
+            }
+        }
+        return invokeCmdMethod(mSym, {cmdObj, value::FromBool(bv)});
+    }
+    if (const SymbolId mSym = findExecMethod(rs_sem::PrimitiveType::Handle, false)) {
+        NativeHandle nh{};
+        if (hasParam) {
+            (void)rawParam.tryGetNativeHandle(nh);
+        }
+        return invokeCmdMethod(mSym, {cmdObj, UnifiedValue{nh}});
+    }
+    if (const SymbolId mSym = findExecMethod(rs_sem::PrimitiveType::Object, false)) {
+        UnifiedValue objArg{NullObject{}};
+        if (hasParam) {
+            if (const auto* oref = std::get_if<ObjectRef>(&rawParam); oref && oref->valid()) {
+                objArg = *oref;
+            } else if (const auto* sv = std::get_if<StringValue>(&rawParam)) {
+                if (auto alloc = domains->uiHeap().allocateString(std::string(sv->view()))) {
+                    objArg = *alloc;
+                }
+            }
+        }
+        return invokeCmdMethod(mSym, {cmdObj, objArg});
     }
     if (const SymbolId mSym = findExecMethod(rs_sem::PrimitiveType::Void, true)) {
         return invokeCmdMethod(mSym, {cmdObj});
@@ -2758,10 +2889,7 @@ bool StyleTriggerEngine::EvaluateEventTriggers(StyledElementInstance& inst) {
         if (const auto* b = std::get_if<bool>(&chkVal)) {
             curChecked = *b;
         }
-        std::uint32_t curClickGen = 0u;
-        if (const auto* btn = src->DynamicCast<Button>()) {
-            curClickGen = btn->ClickGeneration();
-        }
+        const std::uint32_t curClickGen = src->BubbledClickGeneration();
         std::int64_t curSelectedIdx = -1;
         const UnifiedValue selVal = src->GetValue(PropId_SelectedIndex);
         if (const auto* selI = std::get_if<std::int64_t>(&selVal)) {
@@ -2773,7 +2901,9 @@ bool StyleTriggerEngine::EvaluateEventTriggers(StyledElementInstance& inst) {
                 ? rt.watchedPropId
                 : ((et.eventKind == RoutedTriggerEvent::Indeterminate)
                     ? static_cast<std::uint16_t>(PropId_IsChecked)
-                    : static_cast<std::uint16_t>(PropId_Value));
+                    : ((et.eventKind == RoutedTriggerEvent::SelectionChanged)
+                        ? static_cast<std::uint16_t>(PropId_SelectedItem)
+                        : static_cast<std::uint16_t>(PropId_Value)));
         const UnifiedValue curWatchedVal = src->GetValue(numericPid);
         (void)TryGetFloat(curWatchedVal, curNumVal);
 
@@ -2823,7 +2953,8 @@ bool StyleTriggerEngine::EvaluateEventTriggers(StyledElementInstance& inst) {
                     }
                     break;
                 case RoutedTriggerEvent::SelectionChanged:
-                    if (curSelectedIdx != rt.prevSelectedIndex) {
+                    if (curSelectedIdx != rt.prevSelectedIndex ||
+                        !UnifiedValuesEqual(curWatchedVal, rt.prevWatchedValue)) {
                         fire = true;
                     }
                     break;

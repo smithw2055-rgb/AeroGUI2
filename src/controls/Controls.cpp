@@ -40,6 +40,7 @@ TypeClass gTextBoxTypeClass{};
 TypeClass gPasswordBoxTypeClass{};
 TypeClass gItemsControlTypeClass{};
 TypeClass gListBoxTypeClass{};
+TypeClass gListViewTypeClass{};
 TypeClass gComboBoxTypeClass{};
 TypeClass gUserControlTypeClass{};
 TypeClass gRectangleTypeClass{};
@@ -196,6 +197,7 @@ void EnsureControlTypesRegistered() noexcept {
     reg.RegisterType(gPasswordBoxTypeClass, "Aero.UI.PasswordBox", &gTextBoxTypeClass);
     reg.RegisterType(gItemsControlTypeClass, "Aero.UI.ItemsControl", panel);
     reg.RegisterType(gListBoxTypeClass, "Aero.UI.ListBox", &gItemsControlTypeClass);
+    reg.RegisterType(gListViewTypeClass, "Aero.UI.ListView", &gListBoxTypeClass);
     reg.RegisterType(gComboBoxTypeClass, "Aero.UI.ComboBox", &gItemsControlTypeClass);
     reg.RegisterType(gUserControlTypeClass, "Aero.UI.UserControl", panel);
     reg.RegisterType(gRectangleTypeClass, "Aero.UI.Rectangle", uiElem);
@@ -346,6 +348,11 @@ const TypeClass* ListBox::StaticTypeClass() noexcept {
     return &gListBoxTypeClass;
 }
 
+const TypeClass* ListView::StaticTypeClass() noexcept {
+    EnsureControlTypesRegistered();
+    return &gListViewTypeClass;
+}
+
 const TypeClass* ComboBox::StaticTypeClass() noexcept {
     EnsureControlTypesRegistered();
     return &gComboBoxTypeClass;
@@ -434,6 +441,14 @@ const TypeClass* GridSplitter::StaticTypeClass() noexcept { EnsureControlTypesRe
 const TypeClass* TreeView::StaticTypeClass() noexcept { EnsureControlTypesRegistered(); return &gTreeViewTypeClass; }
 const TypeClass* TreeViewItem::StaticTypeClass() noexcept { EnsureControlTypesRegistered(); return &gTreeViewItemTypeClass; }
 
+namespace {
+
+[[nodiscard]] inline bool IsFloatingPopupOverlay(const UIElement* elem) noexcept {
+    return elem != nullptr && (elem->IsA<ToolTip>() || elem->IsA<ContextMenu>());
+}
+
+} // namespace
+
 // ============================================================================
 // StackPanel
 // ============================================================================
@@ -485,6 +500,10 @@ Size StackPanel::MeasureCore(Size availableSize) noexcept {
     std::size_t visibleCount = 0;
 
     for (UIElement* c = FirstChild(); c != nullptr; c = c->NextSibling()) {
+        if (IsFloatingPopupOverlay(c)) {
+            c->Measure(childAvail);
+            continue;
+        }
         if (c->GetVisibility() == Visibility::Collapsed) {
             c->Measure(childAvail);
             continue;
@@ -523,6 +542,10 @@ void StackPanel::ArrangeCore(Rect finalRect) noexcept {
 
     float cursor = (orient == Orientation::Vertical) ? startY : startX;
     for (UIElement* c = FirstChild(); c != nullptr; c = c->NextSibling()) {
+        if (IsFloatingPopupOverlay(c)) {
+            c->Arrange(finalRect);
+            continue;
+        }
         if (c->GetVisibility() == Visibility::Collapsed) {
             c->Arrange(Rect{startX, startY, 0.0f, 0.0f});
             continue;
@@ -591,7 +614,7 @@ Size DockPanel::MeasureCore(Size availableSize) noexcept {
     UIElement* lastVisible = nullptr;
     if (lastFill) {
         for (UIElement* c = FirstChild(); c != nullptr; c = c->NextSibling()) {
-            if (c->GetVisibility() != Visibility::Collapsed) {
+            if (!IsFloatingPopupOverlay(c) && c->GetVisibility() != Visibility::Collapsed) {
                 lastVisible = c;
             }
         }
@@ -603,6 +626,10 @@ Size DockPanel::MeasureCore(Size availableSize) noexcept {
     float parentH = 0.0f;
 
     for (UIElement* c = FirstChild(); c != nullptr; c = c->NextSibling()) {
+        if (IsFloatingPopupOverlay(c)) {
+            c->Measure(Size{innerAvailW, innerAvailH});
+            continue;
+        }
         const Size childConstraint{
             std::max(0.0f, innerAvailW - accumW),
             std::max(0.0f, innerAvailH - accumH)};
@@ -646,13 +673,17 @@ void DockPanel::ArrangeCore(Rect finalRect) noexcept {
     UIElement* lastVisible = nullptr;
     if (lastFill) {
         for (UIElement* c = FirstChild(); c != nullptr; c = c->NextSibling()) {
-            if (c->GetVisibility() != Visibility::Collapsed) {
+            if (!IsFloatingPopupOverlay(c) && c->GetVisibility() != Visibility::Collapsed) {
                 lastVisible = c;
             }
         }
     }
 
     for (UIElement* c = FirstChild(); c != nullptr; c = c->NextSibling()) {
+        if (IsFloatingPopupOverlay(c)) {
+            c->Arrange(finalRect);
+            continue;
+        }
         if (c->GetVisibility() == Visibility::Collapsed) {
             c->Arrange(Rect{left, top, 0.0f, 0.0f});
             continue;
@@ -785,6 +816,10 @@ Size WrapPanel::MeasureCore(Size availableSize) noexcept {
     std::size_t completedLines = 0u;
 
     for (UIElement* c = FirstChild(); c != nullptr; c = c->NextSibling()) {
+        if (IsFloatingPopupOverlay(c)) {
+            c->Measure(Size{innerW, innerH});
+            continue;
+        }
         c->Measure(childConstraint);
         if (c->GetVisibility() == Visibility::Collapsed) {
             continue;
@@ -840,6 +875,10 @@ void WrapPanel::ArrangeCore(Rect finalRect) noexcept {
     auto flushLine = [&](UIElement* lineFirst, UIElement* lineEndExclusive, float crossOffset, float lineCross) noexcept {
         float mainCursor = 0.0f;
         for (UIElement* it = lineFirst; it != lineEndExclusive; it = it->NextSibling()) {
+            if (IsFloatingPopupOverlay(it)) {
+                it->Arrange(finalRect);
+                continue;
+            }
             if (it->GetVisibility() == Visibility::Collapsed) {
                 it->Arrange(Rect{startX, startY, 0.0f, 0.0f});
                 continue;
@@ -864,7 +903,7 @@ void WrapPanel::ArrangeCore(Rect finalRect) noexcept {
     std::size_t itemsInCurLine = 0u;
 
     for (UIElement* c = FirstChild(); c != nullptr; c = c->NextSibling()) {
-        if (c->GetVisibility() == Visibility::Collapsed) {
+        if (IsFloatingPopupOverlay(c) || c->GetVisibility() == Visibility::Collapsed) {
             continue;
         }
         const Size d = c->DesiredSize();
@@ -1478,6 +1517,9 @@ Size Grid::MeasureCore(Size availableSize) noexcept {
     bool hasMultiSpan = false;
     for (UIElement* child = FirstChild(); child != nullptr; child = child->NextSibling()) {
         child->Measure(innerAvail);
+        if (IsFloatingPopupOverlay(child)) {
+            continue;
+        }
         const std::size_t rIdx = std::min<std::size_t>(
             static_cast<std::size_t>(GetRow(child)), rowCount - 1);
         const std::size_t cIdx = std::min<std::size_t>(
@@ -1505,6 +1547,9 @@ Size Grid::MeasureCore(Size availableSize) noexcept {
 
     if (hasMultiSpan) {
         for (UIElement* child = FirstChild(); child != nullptr; child = child->NextSibling()) {
+            if (IsFloatingPopupOverlay(child)) {
+                continue;
+            }
             const std::size_t rIdx = std::min<std::size_t>(
                 static_cast<std::size_t>(GetRow(child)), rowCount - 1);
             const std::size_t cIdx = std::min<std::size_t>(
@@ -1641,6 +1686,9 @@ void Grid::ArrangeCore(Rect finalRect) noexcept {
 
     bool hasMultiSpan = false;
     for (UIElement* child = FirstChild(); child != nullptr; child = child->NextSibling()) {
+        if (IsFloatingPopupOverlay(child)) {
+            continue;
+        }
         const std::size_t rIdx = std::min<std::size_t>(
             static_cast<std::size_t>(GetRow(child)), workRows.size() - 1);
         const std::size_t cIdx = std::min<std::size_t>(
@@ -1668,6 +1716,9 @@ void Grid::ArrangeCore(Rect finalRect) noexcept {
 
     if (hasMultiSpan) {
         for (UIElement* child = FirstChild(); child != nullptr; child = child->NextSibling()) {
+            if (IsFloatingPopupOverlay(child)) {
+                continue;
+            }
             const std::size_t rIdx = std::min<std::size_t>(
                 static_cast<std::size_t>(GetRow(child)), workRows.size() - 1);
             const std::size_t cIdx = std::min<std::size_t>(
@@ -1756,6 +1807,10 @@ void Grid::ArrangeCore(Rect finalRect) noexcept {
     }
 
     for (UIElement* child = FirstChild(); child != nullptr; child = child->NextSibling()) {
+        if (IsFloatingPopupOverlay(child)) {
+            child->Arrange(finalRect);
+            continue;
+        }
         const std::size_t rIdx = std::min<std::size_t>(
             static_cast<std::size_t>(GetRow(child)), workRows.size() - 1);
         const std::size_t cIdx = std::min<std::size_t>(
@@ -2057,6 +2112,46 @@ void SyncHostContentTemplateChildImpl(
     }
 
     if (ctKey.empty()) {
+        const UnifiedValue rawContent = hostContainer->GetValue(PropId_Content);
+        const UnifiedValue rawText = hostContainer->GetValue(PropId_Text);
+        const auto* svRes = std::get_if<StringValue>(&rawContent);
+        if (!svRes || svRes->view().rfind("__aero_visual_res__:", 0) != 0) {
+            svRes = std::get_if<StringValue>(&rawText);
+        }
+        if (svRes && svRes->view().rfind("__aero_visual_res__:", 0) == 0) {
+            const std::string resKey = svRes->str();
+            if (trackedChild && activeKey == resKey) {
+                syncingGuard = false;
+                return;
+            }
+            clearTracked();
+            if (const AxbPackage* vPkg = AxbTemplateRegistry::Instance().FindDataTemplate(resKey)) {
+                ExecutionDomainContext* dom = nullptr;
+                DualTrackBindingEngine* bindEng = nullptr;
+                StyleTriggerEngine* styleEng = nullptr;
+                AnimationEngine* animEng = nullptr;
+                const Interpreter* interp = nullptr;
+                ObjectRef rootWrap{};
+                findEngines(dom, bindEng, styleEng, animEng, interp, rootWrap);
+                const std::string_view rt = !vPkg->rootTypeName.empty() ? std::string_view(vPkg->rootTypeName) : std::string_view("Border");
+                IntrusivePtr<UIElement> built = CreateElementByTypeName(rt);
+                if (built) {
+                    (void)MountAxbTemplate(built.Get(), *vPkg, dom, bindEng, ObjectRef{}, interp, nullptr, animEng);
+                    if (styleEng) {
+                        styleEng->RegisterPackageStyles(*vPkg);
+                        (void)styleEng->BindSubtreeStyles(built.Get());
+                        (void)styleEng->EvaluateSubtree(built.Get());
+                    }
+                    NativeHandleRegistry* reg = dom ? &dom->nativeHandles() : nullptr;
+                    ManagedHeap* heap = dom ? &dom->uiHeap() : nullptr;
+                    hostContainer->AddChild(built.Get(), reg, heap);
+                    trackedChild = built;
+                    activeKey = resKey;
+                }
+            }
+            syncingGuard = false;
+            return;
+        }
         clearTracked();
         syncingGuard = false;
         return;
@@ -2096,6 +2191,10 @@ void SyncHostContentTemplateChildImpl(
                     }
                     return true;
                 }
+                if (std::holds_alternative<NativeHandle>(entry->effectiveValue)) {
+                    hasExplicitContentEntry = true;
+                    return true;
+                }
                 if (!std::holds_alternative<std::monostate>(entry->effectiveValue)) {
                     hasExplicitContentEntry = true;
                     return true;
@@ -2127,7 +2226,17 @@ void SyncHostContentTemplateChildImpl(
         }
     }
 
-    if (trackedChild &&
+    NativeHandle explicitNh{};
+    bool hasExplicitNh = false;
+    {
+        const UnifiedValue hc = hostContainer->GetValue(isHeaderSource ? PropId_Header : PropId_Content);
+        if (hc.tryGetNativeHandle(explicitNh)) hasExplicitNh = true;
+        else if (contentSourceHost && contentSourceHost != hostContainer) {
+            const UnifiedValue sc = contentSourceHost->GetValue(isHeaderSource ? PropId_Header : PropId_Content);
+            if (sc.tryGetNativeHandle(explicitNh)) hasExplicitNh = true;
+        }
+    }
+    if (!hasExplicitNh && trackedChild &&
         activeKey == ctKey &&
         hasActiveObj == hasExplicitContentEntry &&
         activeObj == itemObj) {
@@ -4806,14 +4915,32 @@ void TabControl::OnPropertyChanged(std::uint16_t propId, const UnifiedValue& new
                             extracted.push_back(heap->arrayGet(arrRef, i).value_or(UnifiedValue{}));
                         }
                         SetItemsSource(extracted, registry, uiHeap);
+                        retainedVisualResourceHolder_.Reset();
                         return;
                     }
+                }
+            }
+        } else if (const auto* svRes = std::get_if<StringValue>(&newValue);
+                   svRes && svRes->view().rfind("__aero_visual_res__:", 0) == 0) {
+            if (const AxbPackage* vPkg = AxbTemplateRegistry::Instance().FindDataTemplate(svRes->view())) {
+                auto holder = CreateElementByTypeName(!vPkg->rootTypeName.empty() ? vPkg->rootTypeName : "StackPanel");
+                if (holder) {
+                    (void)MountAxbTemplate(holder.Get(), *vPkg, domains_, BoundTwoWayEngine(), ObjectRef{}, nullptr, nullptr, BoundAnimationEngine());
+                    NativeHandleRegistry& regRef = registry ? *registry : FallbackVisualHandleRegistry();
+                    std::vector<UnifiedValue> extracted;
+                    for (UIElement* c = holder->FirstChild(); c != nullptr; c = c->NextSibling()) {
+                        extracted.push_back(UnifiedValue{c->ToNativeHandle(regRef)});
+                    }
+                    SetItemsSource(extracted, registry, uiHeap);
+                    retainedVisualResourceHolder_ = std::move(holder);
+                    return;
                 }
             }
         } else if (std::holds_alternative<std::monostate>(newValue) ||
                    std::holds_alternative<NullObject>(newValue) ||
                    std::holds_alternative<NullArray>(newValue)) {
             SetItemsSource({}, registry, uiHeap);
+            retainedVisualResourceHolder_.Reset();
             return;
         }
     }
@@ -5237,6 +5364,9 @@ void CheckBox::Toggle() {
     }
     if (checkedChangedCallback_) {
         checkedChangedCallback_(*this, IsChecked());
+    }
+    for (const auto& extraCb : extraCheckedCallbacks_) {
+        if (extraCb) extraCb(*this, IsChecked());
     }
     (void)NotifyTwoWayPropertyMutated(PropId_IsChecked);
 }
@@ -6354,6 +6484,16 @@ const AxbDataTemplate* ItemsControl::ResolveActiveDataTemplateEntry(const Unifie
             return found;
         }
     }
+    if (const auto* nh = std::get_if<NativeHandle>(&sampleItem)) {
+        const UIElement* itemEl = domains_ ? UIElement::FromNativeHandle(domains_->nativeHandles(), *nh) : nullptr;
+        if (!itemEl) itemEl = UIElement::FromNativeHandle(FallbackVisualHandleRegistry(), *nh);
+        if (itemEl && !itemEl->DeclaredTypeName().empty()) {
+            if (const AxbDataTemplate* found =
+                    AxbTemplateRegistry::Instance().FindImplicitDataTemplateEntry(itemEl->DeclaredTypeName())) {
+                return found;
+            }
+        }
+    }
     if (const auto* objRef = std::get_if<ObjectRef>(&sampleItem)) {
         if (objRef->valid() && domains_ && bindingEngine_ && bindingEngine_->Program()) {
             if (auto* heap = domains_->heapForObject(*objRef)) {
@@ -6803,7 +6943,17 @@ IntrusivePtr<UIElement> ItemsControl::CreateMaterializedItemVisual(
                     auto cellTb = MakeIntrusive<TextBlock>();
                     std::string cellText;
                     if (!fields[2].empty()) {
-                        if (const auto* oref = std::get_if<ObjectRef>(&itemVal);
+                        if (const auto* nh = std::get_if<NativeHandle>(&itemVal)) {
+                            const UIElement* rowEl = domains_ ? UIElement::FromNativeHandle(domains_->nativeHandles(), *nh) : nullptr;
+                            if (!rowEl) rowEl = UIElement::FromNativeHandle(FallbackVisualHandleRegistry(), *nh);
+                            if (rowEl) {
+                                const std::uint16_t pid = ResolveTriggerConditionPropertyId(fields[2]);
+                                const UnifiedValue fv = rowEl->GetValue(pid);
+                                if (!std::holds_alternative<std::monostate>(fv)) {
+                                    cellText = FormatBindingString(fields[3], &fv, 1u, domains_);
+                                }
+                            }
+                        } else if (const auto* oref = std::get_if<ObjectRef>(&itemVal);
                             oref && oref->valid() && domains_ && bindingEngine_ && bindingEngine_->Program()) {
                             if (const auto* oh = domains_->heapForObject(*oref)) {
                                 const SymbolId tid = oh->objectTypeId(*oref).value_or(0);
@@ -6881,14 +7031,28 @@ IntrusivePtr<UIElement> ItemsControl::CreateMaterializedItemVisual(
         } else if (!GetItemTemplateKey().empty()) {
             tvi->SetItemTemplateKey(GetItemTemplateKey());
         }
-        if (dtEntry && !dtEntry->itemsSourcePath.empty() && bindingEngine_) {
-            if (const auto* itemObj = std::get_if<ObjectRef>(&itemVal); itemObj && itemObj->valid()) {
-                (void)bindingEngine_->BindPath(
-                    *itemObj,
-                    dtEntry->itemsSourcePath,
-                    IntrusivePtr<UIElement>(tvi.Get(), true),
-                    PropId_ItemsSource,
-                    BindingMode::OneWay);
+        if (dtEntry && !dtEntry->itemsSourcePath.empty()) {
+            if (const auto* nh = std::get_if<NativeHandle>(&itemVal);
+                nh && dtEntry->itemsSourcePath == "Children") {
+                UIElement* nodeEl = domains_ ? UIElement::FromNativeHandle(domains_->nativeHandles(), *nh) : nullptr;
+                if (!nodeEl) nodeEl = UIElement::FromNativeHandle(FallbackVisualHandleRegistry(), *nh);
+                if (nodeEl && nodeEl->FirstChild()) {
+                    NativeHandleRegistry& regRef = domains_ ? domains_->nativeHandles() : FallbackVisualHandleRegistry();
+                    std::vector<UnifiedValue> subItems;
+                    for (UIElement* c = nodeEl->FirstChild(); c != nullptr; c = c->NextSibling()) {
+                        subItems.push_back(UnifiedValue{c->ToNativeHandle(regRef)});
+                    }
+                    tvi->SetItemsSource(subItems, domains_ ? &domains_->nativeHandles() : nullptr, domains_ ? &domains_->uiHeap() : nullptr);
+                }
+            } else if (bindingEngine_) {
+                if (const auto* itemObj = std::get_if<ObjectRef>(&itemVal); itemObj && itemObj->valid()) {
+                    (void)bindingEngine_->BindPath(
+                        *itemObj,
+                        dtEntry->itemsSourcePath,
+                        IntrusivePtr<UIElement>(tvi.Get(), true),
+                        PropId_ItemsSource,
+                        BindingMode::OneWay);
+                }
             }
         }
         tvi->SyncHasItemsFlag();
@@ -6957,6 +7121,22 @@ IntrusivePtr<UIElement> ItemsControl::CreateMaterializedItemVisual(
                         (void)bindingEngine_->BindChain(itemObj, bc, container);
                     } else if (!bc.rawPath.empty()) {
                         (void)bindingEngine_->BindPath(itemObj, bc.rawPath, container, setter.propId, bc.mode);
+                    }
+                } else if (setter.hasBinding && setter.binding && std::holds_alternative<NativeHandle>(itemVal)) {
+                    const auto nh = std::get<NativeHandle>(itemVal);
+                    const UIElement* nhEl = domains_ ? UIElement::FromNativeHandle(domains_->nativeHandles(), nh) : nullptr;
+                    if (!nhEl) nhEl = UIElement::FromNativeHandle(FallbackVisualHandleRegistry(), nh);
+                    if (nhEl) {
+                        const std::uint16_t spid = ResolveTriggerConditionPropertyId(setter.binding->rawPath);
+                        UnifiedValue sv = nhEl->GetValue(spid);
+                        if (setter.binding->converter != ValueConverterKind::None && bindingEngine_) {
+                            sv = bindingEngine_->ApplySingleValueConversion(
+                                setter.binding->converter, setter.binding->converterKey, setter.binding->converterParameter,
+                                setter.binding->converterSymbolId, setter.binding->convertBackSymbolId, sv, false);
+                        }
+                        if (!std::holds_alternative<std::monostate>(sv)) {
+                            (void)container->SetValue(setter.propId, sv, ValueSourceRank::ThemeStyle);
+                        }
                     }
                 } else if (!setter.hasBinding && !styleEngine_) {
                     (void)container->SetValue(setter.propId, setter.value, ValueSourceRank::ThemeStyle);
@@ -7854,8 +8034,34 @@ void ItemsControl::OnPropertyChanged(std::uint16_t propId, const UnifiedValue& n
                             extracted.push_back(std::move(elem));
                         }
                         SetItemsSource(extracted, registry, uiHeap);
+                        retainedVisualResourceHolder_.Reset();
                         return;
                     }
+                }
+            }
+        } else if (const auto* svRes = std::get_if<StringValue>(&newValue);
+                   svRes && svRes->view().rfind("__aero_visual_res__:", 0) == 0) {
+            if (const AxbPackage* vPkg = AxbTemplateRegistry::Instance().FindDataTemplate(svRes->view())) {
+                auto holder = CreateElementByTypeName(
+                    !vPkg->rootTypeName.empty() ? vPkg->rootTypeName : "StackPanel");
+                if (holder) {
+                    (void)MountAxbTemplate(
+                        holder.Get(),
+                        *vPkg,
+                        domains_,
+                        bindingEngine_,
+                        ObjectRef{},
+                        bindingEngine_ ? bindingEngine_->UiInterpreter() : nullptr,
+                        nullptr,
+                        animationEngine_);
+                    NativeHandleRegistry& regRef = registry ? *registry : FallbackVisualHandleRegistry();
+                    std::vector<UnifiedValue> extracted;
+                    for (UIElement* c = holder->FirstChild(); c != nullptr; c = c->NextSibling()) {
+                        extracted.push_back(UnifiedValue{c->ToNativeHandle(regRef)});
+                    }
+                    SetItemsSource(extracted, registry, uiHeap);
+                    retainedVisualResourceHolder_ = std::move(holder);
+                    return;
                 }
             }
         } else if (const auto* sv = std::get_if<StringValue>(&newValue)) {
@@ -7874,11 +8080,13 @@ void ItemsControl::OnPropertyChanged(std::uint16_t propId, const UnifiedValue& n
                 start = sep + 1;
             }
             SetItemsSource(extracted, registry, uiHeap);
+            retainedVisualResourceHolder_.Reset();
             return;
         } else if (std::holds_alternative<std::monostate>(newValue) ||
                    std::holds_alternative<NullObject>(newValue) ||
                    std::holds_alternative<NullArray>(newValue)) {
             SetItemsSource({}, registry, uiHeap);
+            retainedVisualResourceHolder_.Reset();
             return;
         }
     }
@@ -8239,11 +8447,12 @@ void ListBox::ScrollItemIntoView(std::int32_t index) noexcept {
     while (svChild->Parent() != nullptr && svChild->Parent() != sv) {
         svChild = svChild->Parent();
     }
-    float staticRowStartInContent = GetMargin().top + p.top;
+    const float topInset = p.top + ItemsAreaTopInset();
+    float staticRowStartInContent = GetMargin().top + topInset;
     if (this != svChild) {
         if (FinalRect().height > 0.0f || svChild->FinalRect().height > 0.0f) {
             staticRowStartInContent =
-                (FinalRect().y - (svChild->FinalRect().y - svChild->GetMargin().top)) + p.top;
+                (FinalRect().y - (svChild->FinalRect().y - svChild->GetMargin().top)) + topInset;
         } else {
             for (const UIElement* cur = Parent(); cur != nullptr && cur != sv; cur = cur->Parent()) {
                 staticRowStartInContent += cur->GetMargin().top + cur->GetPadding().top;
@@ -8265,7 +8474,7 @@ void ListBox::ScrollItemIntoView(std::int32_t index) noexcept {
                 : ((c->DesiredSize().height > 0.0f) ? c->DesiredSize().height : rowH);
             if (curIdx == index) {
                 if (c->FinalRect().height > 0.0f && FinalRect().height > 0.0f) {
-                    relTop = c->FinalRect().y - (FinalRect().y + p.top);
+                    relTop = c->FinalRect().y - (FinalRect().y + topInset);
                 } else {
                     relTop = accumY;
                 }
@@ -8347,10 +8556,10 @@ bool ListBox::OnPointerDown(
         }
     }
 
-    // 2. Fallback to (localPoint.y - (FinalRect().y + Padding.top)) / GetVirtualItemHeight() or unarranged child heights
+    // 2. Fallback to (localPoint.y - (FinalRect().y + Padding.top + ItemsAreaTopInset())) / GetVirtualItemHeight() or unarranged child heights
     const Rect r = FinalRect();
     const Thickness p = GetPadding();
-    const float relY = localPoint.y - (r.y + p.top);
+    const float relY = localPoint.y - (r.y + p.top + ItemsAreaTopInset());
     if (relY < 0.0f) {
         return false;
     }
@@ -8439,6 +8648,90 @@ void ListBox::OnPropertyChanged(std::uint16_t propId, const UnifiedValue& newVal
             }
         }
     }
+}
+
+// ============================================================================
+// ListView
+// ============================================================================
+
+ListView::ListView() {
+    EnsureControlTypesRegistered();
+}
+
+bool ListView::HasGridViewHeader() const noexcept {
+    const UnifiedValue gv = GetValue(PropId_GridViewColumnsSpec);
+    const auto* sv = std::get_if<StringValue>(&gv);
+    return sv && !sv->view().empty();
+}
+
+Size ListView::MeasureCore(Size availableSize) noexcept {
+    const float hdrH = HeaderBarHeight();
+    const Size innerAvail{
+        availableSize.width,
+        std::isfinite(availableSize.height) ? std::max(0.0f, availableSize.height - hdrH) : availableSize.height};
+    const Size baseSize = ListBox::MeasureCore(innerAvail);
+    float minHeaderW = 0.0f;
+    if (hdrH > 0.0f) {
+        const UnifiedValue gv = GetValue(PropId_GridViewColumnsSpec);
+        if (const auto* sv = std::get_if<StringValue>(&gv)) {
+            const std::string_view allCols = sv->view();
+            std::size_t pos = 0u;
+            while (pos <= allCols.size()) {
+                const std::size_t recEnd = allCols.find('\x1e', pos);
+                const std::string_view rec = (recEnd == std::string_view::npos) ? allCols.substr(pos) : allCols.substr(pos, recEnd - pos);
+                const std::size_t f0 = rec.find('\x1f');
+                if (f0 != std::string_view::npos) {
+                    const std::size_t f1 = rec.find('\x1f', f0 + 1u);
+                    const std::string_view wStr = (f1 == std::string_view::npos) ? rec.substr(f0 + 1u) : rec.substr(f0 + 1u, f1 - (f0 + 1u));
+                    auto eqAsciiNoCase = [](std::string_view a, std::string_view b) noexcept {
+                        if (a.size() != b.size()) return false;
+                        for (std::size_t i = 0; i < a.size(); ++i) {
+                            if (std::tolower(static_cast<unsigned char>(a[i])) !=
+                                std::tolower(static_cast<unsigned char>(b[i]))) {
+                                return false;
+                            }
+                        }
+                        return true;
+                    };
+                    float cw = 100.0f;
+                    if (!wStr.empty() && !eqAsciiNoCase(wStr, "Auto") && !eqAsciiNoCase(wStr, "NaN")) {
+                        float parsedW = 0.0f;
+                        if (TryGetFloat(ParseBuiltinLiteralPropertyValue(PropId_Width, wStr), parsedW) &&
+                            std::isfinite(parsedW) && parsedW > 0.0f) {
+                            cw = parsedW;
+                        }
+                    }
+                    minHeaderW += std::max(24.0f, cw);
+                }
+                if (recEnd == std::string_view::npos) break;
+                pos = recEnd + 1u;
+            }
+        }
+    }
+    return Size{std::max(baseSize.width, minHeaderW + 8.0f), baseSize.height + hdrH};
+}
+
+void ListView::ArrangeCore(Rect finalRect) noexcept {
+    const float hdrH = HeaderBarHeight();
+    const Rect rowsRect{
+        finalRect.x,
+        finalRect.y + hdrH,
+        finalRect.width,
+        std::max(0.0f, finalRect.height - hdrH)};
+    ListBox::ArrangeCore(rowsRect);
+}
+
+bool ListView::OnPointerDown(
+    Point localPoint,
+    PointerButton button,
+    std::uint8_t modifiers,
+    bool& outRequestCapture) {
+    const float hdrH = HeaderBarHeight();
+    if (hdrH > 0.0f && localPoint.y < FinalRect().y + GetPadding().top + hdrH) {
+        outRequestCapture = false;
+        return true;
+    }
+    return ListBox::OnPointerDown(localPoint, button, modifiers, outRequestCapture);
 }
 
 // ============================================================================
@@ -10593,8 +10886,13 @@ IntrusivePtr<UIElement> CreateElementByTypeNameCore(std::string_view typeName, s
     if (shortName == "Button") {
         return MakeIntrusive<Button>();
     }
-    if (shortName == "ListBox" || shortName == "ListView") {
-        return MakeIntrusive<ListBox>();
+    if (shortName == "ListView") return MakeIntrusive<ListView>();
+    if (shortName == "ListBox") return MakeIntrusive<ListBox>();
+    if (shortName == "TransformGroup") return MakeIntrusive<StackPanel>();
+    if (shortName == "TranslateTransform" || shortName == "RotateTransform" ||
+        shortName == "ScaleTransform" || shortName == "SkewTransform" ||
+        shortName == "GradientStop") {
+        return MakeIntrusive<Border>();
     }
     if (shortName == "ItemsControl" || shortName == "ItemsPresenter") {
         return MakeIntrusive<ItemsControl>();
@@ -10648,6 +10946,42 @@ ToolBar::ToolBar() {
     (void)SetValue(PropId_Padding, value::FromThickness(Thickness{4.0f, 2.0f, 4.0f, 2.0f}), ValueSourceRank::Default);
 }
 
+std::string ToolBar::GetHeaderText() const {
+    const UnifiedValue hv = GetValue(PropId_Header);
+    if (const auto* sv = std::get_if<StringValue>(&hv)) return sv->str();
+    return {};
+}
+
+Size ToolBar::MeasureCore(Size availableSize) noexcept {
+    const std::string hdr = GetHeaderText();
+    float hdrW = 0.0f;
+    float hdrH = 0.0f;
+    if (!hdr.empty()) {
+        float fs = 13.0f;
+        (void)TryGetFloat(GetValue(PropId_FontSize), fs);
+        const Size tm = MeasureUtf8TextRun(hdr, fs);
+        hdrW = tm.width + 12.0f;
+        hdrH = std::max(24.0f, tm.height + 6.0f);
+    }
+    const Size inner = StackPanel::MeasureCore(Size{std::max(0.0f, availableSize.width - hdrW), availableSize.height});
+    return Size{inner.width + hdrW, std::max(inner.height, hdrH)};
+}
+
+void ToolBar::ArrangeCore(Rect finalRect) noexcept {
+    const std::string hdr = GetHeaderText();
+    float hdrW = 0.0f;
+    if (!hdr.empty()) {
+        float fs = 13.0f;
+        (void)TryGetFloat(GetValue(PropId_FontSize), fs);
+        hdrW = MeasureUtf8TextRun(hdr, fs).width + 12.0f;
+    }
+    StackPanel::ArrangeCore(Rect{
+        finalRect.x + hdrW,
+        finalRect.y,
+        std::max(0.0f, finalRect.width - hdrW),
+        finalRect.height});
+}
+
 Menu::Menu() {
     EnsureControlTypesRegistered();
     SetOrientation(Orientation::Horizontal);
@@ -10673,7 +11007,7 @@ MenuItem::MenuItem() {
 
 void MenuItem::OnPropertyChanged(std::uint16_t propId, const UnifiedValue& newValue) {
     Button::OnPropertyChanged(propId, newValue);
-    if (propId == PropId_Header || propId == PropId_InputGestureText || propId == PropId_IsChecked) {
+    if (propId == PropId_Header || propId == PropId_InputGestureText || propId == PropId_IsChecked || propId == PropId_IsCheckable) {
         std::string label;
         const UnifiedValue hv = GetValue(PropId_Header);
         if (const auto* sv = std::get_if<StringValue>(&hv)) {
@@ -10710,6 +11044,13 @@ bool MenuItem::ActivateFromInput(RuntimeError* error) {
     if (hasSubItems) {
         const UnifiedValue ov = GetValue(PropId_IsSubmenuOpen);
         const bool nextOpen = !(std::holds_alternative<bool>(ov) && std::get<bool>(ov));
+        if (nextOpen && Parent()) {
+            for (UIElement* sib = Parent()->FirstChild(); sib != nullptr; sib = sib->NextSibling()) {
+                if (sib != this && sib->IsA<MenuItem>()) {
+                    sib->SetValue(PropId_IsSubmenuOpen, UnifiedValue{false}, ValueSourceRank::Local);
+                }
+            }
+        }
         SetValue(PropId_IsSubmenuOpen, UnifiedValue{nextOpen}, ValueSourceRank::Local);
         InvalidateMeasure();
         return PerformClick(error);
@@ -10723,6 +11064,9 @@ bool MenuItem::ActivateFromInput(RuntimeError* error) {
     }
     const bool ok = PerformClick(error);
     for (UIElement* anc = Parent(); anc != nullptr; anc = anc->Parent()) {
+        if (anc->IsA<MenuItem>()) {
+            anc->SetValue(PropId_IsSubmenuOpen, UnifiedValue{false}, ValueSourceRank::Local);
+        }
         if (anc->IsA<ContextMenu>()) {
             anc->SetValue(PropId_IsOpen, UnifiedValue{false}, ValueSourceRank::Local);
             break;
@@ -10795,13 +11139,15 @@ void MenuItem::ArrangeCore(Rect finalRect) noexcept {
                 c->Arrange(Rect{finalRect.x, finalRect.y, 0.0f, 0.0f});
             }
         } else {
-            c->Arrange(finalRect);
+            const float iconSz = std::min(18.0f, std::max(12.0f, finalRect.height - 6.0f));
+            c->Arrange(Rect{finalRect.x + 6.0f, finalRect.y + std::max(2.0f, (24.0f - iconSz) * 0.5f), iconSz, iconSz});
         }
     }
 }
 
 RepeatButton::RepeatButton() {
     EnsureControlTypesRegistered();
+    SetValue(PropId_ClickMode, value::FromInt(1), ValueSourceRank::Default);
 }
 
 bool RepeatButton::ActivateFromInput(RuntimeError* error) {
@@ -10852,6 +11198,7 @@ Hyperlink::Hyperlink() {
 
 ToolTip::ToolTip() {
     EnsureControlTypesRegistered();
+    SetIsHitTestVisible(false);
 }
 
 void ToolTip::OnPropertyChanged(std::uint16_t propId, const UnifiedValue& newValue) {
@@ -11275,6 +11622,61 @@ std::string TreeView::GetSelectedHeader() const {
     return {};
 }
 
+bool TreeView::OnKeyDown(KeyCode key, std::uint8_t modifiers) {
+    (void)modifiers;
+    if (!IsEffectivelyEnabled()) return false;
+    std::vector<TreeViewItem*> visibleItems;
+    auto collectVisible = [&](auto& self, UIElement* node) -> void {
+        for (UIElement* c = node->FirstChild(); c != nullptr; c = c->NextSibling()) {
+            if (c->GetVisibility() == Visibility::Collapsed) continue;
+            if (auto* tvi = c->DynamicCast<TreeViewItem>()) {
+                visibleItems.push_back(tvi);
+                if (tvi->IsExpanded()) {
+                    self(self, tvi);
+                }
+            }
+        }
+    };
+    collectVisible(collectVisible, this);
+    if (visibleItems.empty()) return false;
+    std::ptrdiff_t curIdx = -1;
+    for (std::size_t i = 0u; i < visibleItems.size(); ++i) {
+        if (visibleItems[i] == selectedContainer_) {
+            curIdx = static_cast<std::ptrdiff_t>(i);
+            break;
+        }
+    }
+    if (key == KeyCode::Down) {
+        const std::size_t nextIdx = (curIdx < 0) ? 0u : std::min<std::size_t>(visibleItems.size() - 1u, static_cast<std::size_t>(curIdx + 1));
+        SelectContainer(visibleItems[nextIdx]);
+        return true;
+    }
+    if (key == KeyCode::Up) {
+        const std::size_t prevIdx = (curIdx <= 0) ? 0u : static_cast<std::size_t>(curIdx - 1);
+        SelectContainer(visibleItems[prevIdx]);
+        return true;
+    }
+    if (key == KeyCode::Right && selectedContainer_) {
+        selectedContainer_->SyncHasItemsFlag();
+        const UnifiedValue hi = selectedContainer_->GetValue(PropId_HasItems);
+        if (std::holds_alternative<bool>(hi) && std::get<bool>(hi) && !selectedContainer_->IsExpanded()) {
+            selectedContainer_->SetIsExpanded(true);
+            return true;
+        }
+    }
+    if (key == KeyCode::Left && selectedContainer_) {
+        if (selectedContainer_->IsExpanded()) {
+            selectedContainer_->SetIsExpanded(false);
+            return true;
+        }
+        if (auto* parentTvi = selectedContainer_->Parent() ? selectedContainer_->Parent()->DynamicCast<TreeViewItem>() : nullptr) {
+            SelectContainer(parentTvi);
+            return true;
+        }
+    }
+    return false;
+}
+
 IntrusivePtr<UIElement> CreateElementByTypeName(std::string_view typeName) {
     EnsureControlTypesRegistered();
     const std::string_view shortName = StripNamespacePrefix(typeName);
@@ -11525,6 +11927,7 @@ bool MountAxbInstructionsInternal(
     std::vector<UIElement*> elementStack;
     std::vector<UIElement*> localElements;
     std::vector<std::string_view> localDeclaredTypes;
+    std::vector<std::function<void()>> deferredLoadedHandlers;
     bool rootVisited = false;
     std::size_t mountedElemCursor = 0u;
     if (structureOnly && ioMountedElements) {
@@ -11703,6 +12106,21 @@ bool MountAxbInstructionsInternal(
 
             case AxbOpcode::SetStaticProperty: {
                 if (!bindingsOnly && !elementStack.empty() && elementStack.back()) {
+                    if (inst.propId == PropId_KeyBindingsSpec) {
+                        const UnifiedValue prevKb = elementStack.back()->GetValue(PropId_KeyBindingsSpec);
+                        const auto* prevSv = std::get_if<StringValue>(&prevKb);
+                        const auto* newSv = std::get_if<StringValue>(&inst.literalValue);
+                        if (prevSv && !prevSv->view().empty() && newSv && !newSv->view().empty()) {
+                            std::string merged(prevSv->view());
+                            merged.push_back('\n');
+                            merged.append(newSv->view());
+                            elementStack.back()->SetValue(
+                                PropId_KeyBindingsSpec,
+                                value::FromString(merged),
+                                ValueSourceRank::Local);
+                            break;
+                        }
+                    }
                     elementStack.back()->SetValue(
                         inst.propId,
                         inst.literalValue,
@@ -11720,6 +12138,36 @@ bool MountAxbInstructionsInternal(
                         !chain.relativeAncestorType.empty() ||
                         chain.relativeSelf) {
                         (void)bindingEngine->BindElementProperty(chain, targetPtr);
+                    } else if (!effectiveContext.valid() &&
+                               std::holds_alternative<NativeHandle>(elementStack.back()->GetValue(PropId_DataContext))) {
+                        const auto nh = std::get<NativeHandle>(elementStack.back()->GetValue(PropId_DataContext));
+                        const UIElement* nhEl = domains ? UIElement::FromNativeHandle(domains->nativeHandles(), nh) : nullptr;
+                        if (!nhEl) nhEl = UIElement::FromNativeHandle(FallbackVisualHandleRegistry(), nh);
+                        if (nhEl) {
+                            const std::string_view nhMember = !chain.hops.empty() ? std::string_view(chain.hops.front().memberName) : std::string_view(chain.rawPath);
+                            const std::uint16_t spid = (nhMember == "Color")
+                                ? static_cast<std::uint16_t>(PropId_EffectColor)
+                                : ResolveTriggerConditionPropertyId(nhMember);
+                            UnifiedValue v = nhEl->GetValue(spid);
+                            if (spid == PropId_EffectColor &&
+                                (inst.propId == PropId_Text || inst.propId == PropId_Content || inst.propId == PropId_Header)) {
+                                if (const auto col = value::TryGetColor(v)) v = value::FromString(FormatColorHexArgb(*col));
+                            }
+                            if (chain.converter != ValueConverterKind::None && bindingEngine) {
+                                v = bindingEngine->ApplySingleValueConversion(
+                                    chain.converter, chain.converterKey, chain.converterParameter,
+                                    chain.converterSymbolId, chain.convertBackSymbolId, v, false);
+                            }
+                            if (!chain.stringFormat.empty() && !std::holds_alternative<std::monostate>(v)) {
+                                v = value::FromString(FormatBindingString(chain.stringFormat, &v, 1u, domains));
+                            } else if ((inst.propId == PropId_Text || inst.propId == PropId_Header) &&
+                                       !std::holds_alternative<StringValue>(v) && !std::holds_alternative<std::monostate>(v)) {
+                                v = value::FromString(FormatBindingString({}, &v, 1u, domains));
+                            }
+                            if (!std::holds_alternative<std::monostate>(v)) {
+                                targetPtr->SetValue(inst.propId, v, ValueSourceRank::Local);
+                            }
+                        }
                     } else if (effectiveContext.valid()) {
                         if (!chain.hops.empty()) {
                             (void)bindingEngine->BindChain(
@@ -12066,13 +12514,24 @@ bool MountAxbInstructionsInternal(
                                 }
                                 cachedSenderSym = findProgType("Aero.UI", shortTag);
                                 if (!cachedSenderSym) cachedSenderSym = findProgType("Aero.UI", "FrameworkElement");
-                                cachedEventArgsSym = findProgType("Aero.UI", "RoutedEventArgs");
+                                if (const auto* loc = prog->resolveFunction(methodId);
+                                    loc && loc->function && loc->function->parameterTypeIds.size() >= 3u &&
+                                    loc->function->parameterTypeIds[2] != 0) {
+                                    cachedEventArgsSym = prog->resolveType(loc->function->parameterTypeIds[2]);
+                                }
+                                if (!cachedEventArgsSym) {
+                                    if (evNameCopy == "SelectionChanged") cachedEventArgsSym = findProgType("Aero.UI", "SelectionChangedEventArgs");
+                                    else if (evNameCopy == "TextChanged" || evNameCopy == "PasswordChanged") cachedEventArgsSym = findProgType("Aero.UI", "TextChangedEventArgs");
+                                    else if (evNameCopy == "KeyDown" || evNameCopy == "KeyUp") cachedEventArgsSym = findProgType("Aero.UI", "KeyEventArgs");
+                                }
+                                if (!cachedEventArgsSym) cachedEventArgsSym = findProgType("Aero.UI", "RoutedEventArgs");
                             }
                         }
 
                         auto invokeBoundHandler = [eventInterpreter, eventAotContext, domains, prog, bindingEngine, targetObj, methodId, isSimCommand, evNameCopy, senderGuard, expectedParamCount, cachedSenderSym, cachedEventArgsSym](
                                                       const UnifiedValue& argVal,
-                                                      bool hasArg) {
+                                                      bool hasArg) -> bool {
+                            UnifiedValue invokedEventArgs{NullObject{}};
                             auto buildWpfSenderAndArgs = [&](UnifiedValue& outSender, UnifiedValue& outEvArgs) {
                                 outSender = UnifiedValue(NullObject{});
                                 outEvArgs = UnifiedValue(NullObject{});
@@ -12112,6 +12571,35 @@ bool MountAxbInstructionsInternal(
                                             }
                                         } else if (eSym->fields[fi].name == "Handled") {
                                             eFields[fi] = UnifiedValue(false);
+                                        } else if (eSym->fields[fi].name == "SelectedIndex") {
+                                            std::int64_t si = -1;
+                                            if (hasArg && std::holds_alternative<std::int64_t>(argVal)) si = std::get<std::int64_t>(argVal);
+                                            eFields[fi] = value::FromInt(si);
+                                        } else if (eSym->fields[fi].name == "Text" || eSym->fields[fi].name == "NewText") {
+                                            const std::string s = hasArg ? rs_rt::valueToString(argVal) : std::string();
+                                            if (auto sr = domains->uiHeap().allocateString(s, &aErr)) eFields[fi] = UnifiedValue(*sr);
+                                        } else if (eSym->fields[fi].name == "NewValue") {
+                                            float fv = 0.0f;
+                                            if (hasArg) (void)TryGetFloat(argVal, fv);
+                                            eFields[fi] = MakeFloat(fv);
+                                        } else if (eSym->fields[fi].name == "KeyCode") {
+                                            std::int64_t kc = 0;
+                                            if (hasArg && std::holds_alternative<std::int64_t>(argVal)) kc = std::get<std::int64_t>(argVal) & 0xFFFF;
+                                            eFields[fi] = value::FromInt(kc);
+                                        } else if (eSym->fields[fi].name == "Key") {
+                                            std::int64_t kc = (hasArg && std::holds_alternative<std::int64_t>(argVal)) ? (std::get<std::int64_t>(argVal) & 0xFFFF) : 0;
+                                            if (auto sr = domains->uiHeap().allocateString(KeyCodeToName(static_cast<KeyCode>(kc)), &aErr)) {
+                                                eFields[fi] = UnifiedValue(*sr);
+                                            }
+                                        } else if (eSym->fields[fi].name == "IsCtrlDown") {
+                                            const std::int64_t m = (hasArg && std::holds_alternative<std::int64_t>(argVal)) ? ((std::get<std::int64_t>(argVal) >> 16) & 0xFF) : 0;
+                                            eFields[fi] = UnifiedValue((m & KeyMod_Ctrl) != 0);
+                                        } else if (eSym->fields[fi].name == "IsShiftDown") {
+                                            const std::int64_t m = (hasArg && std::holds_alternative<std::int64_t>(argVal)) ? ((std::get<std::int64_t>(argVal) >> 16) & 0xFF) : 0;
+                                            eFields[fi] = UnifiedValue((m & KeyMod_Shift) != 0);
+                                        } else if (eSym->fields[fi].name == "IsAltDown") {
+                                            const std::int64_t m = (hasArg && std::holds_alternative<std::int64_t>(argVal)) ? ((std::get<std::int64_t>(argVal) >> 16) & 0xFF) : 0;
+                                            eFields[fi] = UnifiedValue((m & KeyMod_Alt) != 0);
                                         }
                                         if (eSym->fields[fi].type == rs_sem::PrimitiveType::Object ||
                                             eSym->fields[fi].type == rs_sem::PrimitiveType::String ||
@@ -12123,6 +12611,7 @@ bool MountAxbInstructionsInternal(
                                         outEvArgs = UnifiedValue(*eRef);
                                     }
                                 }
+                                invokedEventArgs = outEvArgs;
                             };
                             if (isSimCommand && domains) {
                                 std::vector<UnifiedValue> payload;
@@ -12134,7 +12623,7 @@ bool MountAxbInstructionsInternal(
                                     targetObj,
                                     std::move(payload),
                                     0ULL});
-                                return;
+                                return false;
                             }
                             auto convertStringArgIfNeeded = [&](UnifiedValue& v) {
                                 if (domains) {
@@ -12208,23 +12697,61 @@ bool MountAxbInstructionsInternal(
                                         args.push_back(callArg);
                                     }
                                     if (!eventAotContext->invoke(
-                                            methodId, args.data(), args.size(), ret) &&
-                                        args.size() > 1u) {
-                                        (void)eventAotContext->invoke(
-                                            methodId, args.data(), 1u, ret);
+                                            methodId, args.data(), args.size(), ret)) {
+                                        bool okFallback = false;
+                                        if (args.size() > 1u) {
+                                            okFallback = eventAotContext->invoke(
+                                                methodId, args.data(), 1u, ret);
+                                        }
+                                        if (!okFallback) {
+                                            UnifiedValue sVal{}, eVal{};
+                                            buildWpfSenderAndArgs(sVal, eVal);
+                                            UnifiedValue a3[3]{targetObj, sVal, eVal};
+                                            (void)eventAotContext->invoke(methodId, a3, 3u, ret);
+                                        }
                                     }
                                 }
                             }
-                            if (expectedParamCount == 3) {
-                                if (bindingEngine && DualTrackBindingEngine::IsLiveInstance(bindingEngine)) {
-                                    (void)bindingEngine->FlushTrackA();
-                                } else if (senderGuard && senderGuard->BoundTwoWayEngine()) {
-                                    (void)senderGuard->BoundTwoWayEngine()->FlushTrackA();
+                            if (bindingEngine && DualTrackBindingEngine::IsLiveInstance(bindingEngine)) {
+                                (void)bindingEngine->FlushTrackA();
+                            } else if (senderGuard && senderGuard->BoundTwoWayEngine()) {
+                                (void)senderGuard->BoundTwoWayEngine()->FlushTrackA();
+                            }
+                            if (domains && cachedEventArgsSym) {
+                                if (const auto* eRef = std::get_if<ObjectRef>(&invokedEventArgs);
+                                    eRef && eRef->valid() && domains->uiHeap().isAlive(*eRef)) {
+                                    for (std::size_t fi = 0u; fi < cachedEventArgsSym->fields.size(); ++fi) {
+                                        if (cachedEventArgsSym->fields[fi].name == "Handled") {
+                                            if (const auto hv = domains->uiHeap().fieldGet(*eRef, fi)) {
+                                                if (const auto* hb = std::get_if<bool>(&*hv)) {
+                                                    return *hb;
+                                                }
+                                            }
+                                            break;
+                                        }
+                                    }
                                 }
                             }
+                            return false;
                         };
 
-                        if (auto* slider = elem->DynamicCast<Slider>()) {
+                        if (evNameCopy == "Loaded") {
+                            if (!structureOnly) {
+                                deferredLoadedHandlers.push_back([invokeBoundHandler]() {
+                                    (void)invokeBoundHandler(UnifiedValue{}, false);
+                                });
+                            }
+                        } else if (evNameCopy == "KeyDown") {
+                            elem->SetKeyDownCallback([invokeBoundHandler](UIElement&, KeyCode k, std::uint8_t mods) -> bool {
+                                const std::int64_t packed = static_cast<std::int64_t>(static_cast<std::uint32_t>(k) | (static_cast<std::uint32_t>(mods) << 16u));
+                                return invokeBoundHandler(value::FromInt(packed), true);
+                            });
+                        } else if (evNameCopy == "KeyUp") {
+                            elem->SetKeyUpCallback([invokeBoundHandler](UIElement&, KeyCode k, std::uint8_t mods) -> bool {
+                                const std::int64_t packed = static_cast<std::int64_t>(static_cast<std::uint32_t>(k) | (static_cast<std::uint32_t>(mods) << 16u));
+                                return invokeBoundHandler(value::FromInt(packed), true);
+                            });
+                        } else if (auto* slider = elem->DynamicCast<Slider>()) {
                             slider->SetValueChangedCallback(
                                 [invokeBoundHandler](Slider&, float val) {
                                     invokeBoundHandler(MakeFloat(val), true);
@@ -12262,7 +12789,7 @@ bool MountAxbInstructionsInternal(
                         } else if (auto* chkCtrl = elem->DynamicCast<CheckBox>();
                                    chkCtrl && (evNameCopy == "Checked" || evNameCopy == "Unchecked" || evNameCopy == "Indeterminate")) {
                             const std::string wantEv = evNameCopy;
-                            chkCtrl->SetCheckedChangedCallback(
+                            chkCtrl->AddCheckedChangedCallback(
                                 [invokeBoundHandler, wantEv](CheckBox& cb, bool checked) {
                                     const bool isInd = std::holds_alternative<NullObject>(cb.GetValue(PropId_IsChecked));
                                     if ((wantEv == "Indeterminate" && isInd) ||
@@ -12431,6 +12958,12 @@ bool MountAxbInstructionsInternal(
             localElements.data(),
             localElements.size(),
             package);
+    }
+
+    for (const auto& fn : deferredLoadedHandlers) {
+        if (fn) {
+            fn();
+        }
     }
 
     return rootVisited;

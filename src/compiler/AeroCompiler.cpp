@@ -2746,6 +2746,21 @@ AeroCompileResult AeroCompiler::CompileInternal(
             if (const auto* sv = std::get_if<StringValue>(rv)) {
                 ioKind = ValueConverterKind::MathExpression;
                 ioKey = sv->str();
+                return;
+            }
+        }
+        if (const UnifiedValue* rv = findLocalOrGlobalResource(ioKey)) {
+            if (const auto* sv = std::get_if<StringValue>(rv)) {
+                if (sv->view().rfind("__aero_alt_conv__:", 0) == 0) {
+                    ioKind = ValueConverterKind::CustomScriptOrHost;
+                    ioKey = sv->str();
+                } else if (sv->view() == "__aero_builtin_conv__:BooleanToVisibility") {
+                    ioKind = ValueConverterKind::BooleanToVisibility;
+                } else if (sv->view() == "__aero_builtin_conv__:InverseBooleanToVisibility") {
+                    ioKind = ValueConverterKind::InverseBooleanToVisibility;
+                } else if (sv->view() == "__aero_builtin_conv__:InverseBoolean") {
+                    ioKind = ValueConverterKind::InverseBoolean;
+                }
             }
         }
     };
@@ -2841,22 +2856,26 @@ AeroCompileResult AeroCompiler::CompileInternal(
             fbInst.literalValue = parsedFallback;
             pkg.instructions.push_back(std::move(fbInst));
         }
+        const bool isSelfDcBind =
+            (parsedBind.pathPart.empty() || parsedBind.pathPart == ".") &&
+            parsedBind.elementName.empty() &&
+            parsedBind.relativeAncestorType.empty() &&
+            !parsedBind.relativeSelf;
         const bool hasElementOrRelSource =
             !parsedBind.elementName.empty() ||
             !parsedBind.relativeAncestorType.empty() ||
-            parsedBind.relativeSelf;
-        if ((parsedBind.pathPart.empty() || parsedBind.pathPart == ".") && !hasElementOrRelSource) {
-            return !parsedBind.fallbackValue.empty();
-        }
+            parsedBind.relativeSelf ||
+            isSelfDcBind;
+        const std::string_view effPathPart = isSelfDcBind ? std::string_view("DataContext") : parsedBind.pathPart;
 
         AxbCompiledBindingChain chain{};
-        chain.rawPath = std::string(parsedBind.pathPart);
+        chain.rawPath = std::string(effPathPart);
         chain.targetPropertyId = targetPropId;
         chain.mode = parsedBind.mode;
         chain.fallbackValue = std::move(parsedFallback);
         chain.elementName = std::string(parsedBind.elementName);
         chain.relativeAncestorType = parsedBind.relativeAncestorType;
-        chain.relativeSelf = parsedBind.relativeSelf;
+        chain.relativeSelf = parsedBind.relativeSelf || isSelfDcBind;
         chain.converter = parsedBind.converter;
         chain.converterKey = parsedBind.converterKey;
         chain.converterParameter = parsedBind.converterParameter;
@@ -2864,9 +2883,9 @@ AeroCompileResult AeroCompiler::CompileInternal(
         resolveConverterResource(chain.converter, chain.converterKey);
         const bool keepAttachedSingle = parsedBind.isAttachedPropertyPath ||
             (hasElementOrRelSource &&
-             parsedBind.pathPart.find('.') != std::string_view::npos &&
-             !IsInstanceSubHopPropertyPath(parsedBind.pathPart) && ResolveMappedSetterPropertyId(parsedBind.pathPart) != kUnmappedPropId);
-        splitPathIntoHops(parsedBind.pathPart, chain.hops, keepAttachedSingle);
+             effPathPart.find('.') != std::string_view::npos &&
+             !IsInstanceSubHopPropertyPath(effPathPart) && ResolveMappedSetterPropertyId(effPathPart) != kUnmappedPropId);
+        splitPathIntoHops(effPathPart, chain.hops, keepAttachedSingle);
 
         const auto chainIdx = static_cast<std::uint32_t>(pkg.bindingChains.size());
         pkg.bindingChains.push_back(std::move(chain));
@@ -2927,7 +2946,12 @@ AeroCompileResult AeroCompiler::CompileInternal(
                                 !chain.relativeAncestorType.empty() ||
                                 chain.relativeSelf;
         if ((chain.rawPath.empty() || chain.rawPath == ".") && !hasElemSrc) {
-            return;
+            chain.relativeSelf = true;
+            chain.rawPath = "DataContext";
+            chain.hops.clear();
+            AxbCompiledHop dcHop{};
+            dcHop.memberName = "DataContext";
+            chain.hops.push_back(std::move(dcHop));
         }
         const std::uint16_t propId = chain.targetPropertyId;
         const BindingMode mode = chain.mode;
@@ -3192,7 +3216,15 @@ AeroCompileResult AeroCompiler::CompileInternal(
         return true;
     };
 
-    auto isNonVisualElementTag = [](std::string_view shortTag) noexcept -> bool {
+    const bool isCompilingVisualResourceMock =
+        (effectiveXamlPath.rfind("__aero_visual_res__:", 0) == 0);
+    auto isNonVisualElementTag = [isCompilingVisualResourceMock](std::string_view shortTag) noexcept -> bool {
+        if (isCompilingVisualResourceMock &&
+            (shortTag == "GradientStop" || shortTag == "TransformGroup" ||
+             shortTag == "TranslateTransform" || shortTag == "RotateTransform" ||
+             shortTag == "ScaleTransform" || shortTag == "SkewTransform")) {
+            return false;
+        }
         return shortTag == "Style" ||
                shortTag == "ControlTemplate" ||
                shortTag == "DataTemplate" ||
@@ -3298,10 +3330,29 @@ AeroCompileResult AeroCompiler::CompileInternal(
                     top.accumulatedText += DecodeXamlXmlEntities(rawInner);
                 } else if (top.kind == XmlScopeKind::VisualElement && nonVisualDepth == 0) {
                     const std::string_view st = StripXmlPrefix(top.tagName);
-                    if (st == "TextBlock" || st == "Label" || st == "Button" ||
+                    if (st == "ItemsControl" || st == "ListBox" || st == "ListView" || st == "ComboBox") {
+                        const std::string decItemText = DecodeXamlXmlEntities(rawInner);
+                        if (!decItemText.empty()) {
+                            AxbInstruction bInst{};
+                            bInst.opcode = AxbOpcode::BeginElement;
+                            bInst.strIdx0 = pkg.InternString("TextBlock");
+                            bInst.strIdx1 = pkg.InternString("");
+                            pkg.instructions.push_back(std::move(bInst));
+                            AxbInstruction tInst{};
+                            tInst.opcode = AxbOpcode::SetStaticProperty;
+                            tInst.propId = PropId_Text;
+                            tInst.literalValue = value::FromString(decItemText);
+                            pkg.instructions.push_back(std::move(tInst));
+                            AxbInstruction eInst{};
+                            eInst.opcode = AxbOpcode::EndElement;
+                            pkg.instructions.push_back(std::move(eInst));
+                        }
+                    } else if (st == "TextBlock" || st == "Label" || st == "Button" ||
                         st == "RepeatButton" || st == "ToggleButton" ||
                         st == "CheckBox" || st == "RadioButton" || st == "Hyperlink" ||
-                        st == "ComboBoxItem" || st == "ListBoxItem") {
+                        st == "ComboBoxItem" || st == "ListBoxItem" ||
+                        st == "Double" || st == "Single" || st == "Int32" ||
+                        st == "Int64" || st == "Boolean" || st == "String") {
                         const std::string decInner = DecodeXamlXmlEntities(rawInner);
                         if (!top.accumulatedText.empty() && top.accumulatedText.back() != '\n') {
                             top.accumulatedText.push_back(' ');
@@ -4281,6 +4332,45 @@ AeroCompileResult AeroCompiler::CompileInternal(
                         continue;
                     }
                 }
+            }
+
+            // Collect <KeyBinding> inside <*.InputBindings>
+            if (shortTag == "KeyBinding") {
+                std::string kbKey, kbMods, kbCmd, kbParam;
+                for (const auto& a : attrs) {
+                    if (a.name == "Key") kbKey = std::string(Trim(a.value));
+                    else if (a.name == "Modifiers") kbMods = std::string(Trim(a.value));
+                    else if (a.name == "Gesture") {
+                        const std::string_view g = Trim(a.value);
+                        if (const auto plus = g.rfind('+'); plus != std::string_view::npos) {
+                            kbMods = std::string(g.substr(0u, plus));
+                            kbKey = std::string(g.substr(plus + 1u));
+                        } else {
+                            kbKey = std::string(g);
+                        }
+                    } else if (a.name == "Command") {
+                        const auto pb = ParseBindingMarkupExpression(a.value);
+                        kbCmd = pb.isValidBinding ? std::string(pb.pathPart) : DecodeXamlXmlEntities(a.value);
+                    } else if (a.name == "CommandParameter") {
+                        kbParam = DecodeXamlXmlEntities(a.value);
+                    }
+                }
+                const KeyCode kc = ParseXamlKeyCode(kbKey);
+                const std::uint8_t km = ParseXamlKeyModifiers(kbMods);
+                if (kc != KeyCode::None && !kbCmd.empty()) {
+                    const std::string rec = std::to_string(static_cast<unsigned>(kc)) + "|" +
+                                            std::to_string(static_cast<unsigned>(km)) + "|" +
+                                            kbCmd + "|" + kbParam;
+                    AxbInstruction kbInst{};
+                    kbInst.opcode = AxbOpcode::SetStaticProperty;
+                    kbInst.propId = PropId_KeyBindingsSpec;
+                    kbInst.literalValue = value::FromString(rec);
+                    pkg.instructions.push_back(std::move(kbInst));
+                }
+                if (!selfClosing) {
+                    (void)pushNonVisualScope();
+                }
+                continue;
             }
 
             // Collect <GridViewColumn> inside <ListView.View><GridView>...</GridView></ListView.View>
@@ -6149,6 +6239,106 @@ AeroCompileResult AeroCompiler::CompileInternal(
                             ++nonVisualDepth;
                             continue;
                         }
+                    } else if (shortTag == "BooleanToVisibilityConverter") {
+                        UpsertPackageResource(pkg, xKey, value::FromString("__aero_builtin_conv__:BooleanToVisibility"));
+                        if (!selfClosing) {
+                            (void)pushNonVisualScope();
+                        }
+                        continue;
+                    } else if (shortTag == "InverseBooleanToVisibilityConverter") {
+                        UpsertPackageResource(pkg, xKey, value::FromString("__aero_builtin_conv__:InverseBooleanToVisibility"));
+                        if (!selfClosing) {
+                            (void)pushNonVisualScope();
+                        }
+                        continue;
+                    } else if (shortTag == "AlternationConverter" && !selfClosing) {
+                        std::size_t innerEnd = 0u, afterClose = 0u;
+                        if (FindMatchingClosingTag(src, pos, tagName, innerEnd, afterClose)) {
+                            const std::string_view innerXml = src.substr(pos, innerEnd - pos);
+                            std::string joined = "__aero_alt_conv__:";
+                            bool firstC = true;
+                            std::size_t scan = 0u;
+                            while (scan < innerXml.size()) {
+                                const std::size_t cp = innerXml.find("Color=", scan);
+                                if (cp == std::string_view::npos) break;
+                                std::size_t q = cp + 6u;
+                                if (q < innerXml.size() && (innerXml[q] == '"' || innerXml[q] == '\'')) {
+                                    const char qc = innerXml[q++];
+                                    const std::size_t qe = innerXml.find(qc, q);
+                                    if (qe != std::string_view::npos) {
+                                        if (!firstC) joined.push_back('|');
+                                        joined.append(innerXml.substr(q, qe - q));
+                                        firstC = false;
+                                        scan = qe + 1u;
+                                        continue;
+                                    }
+                                }
+                                scan = cp + 6u;
+                            }
+                            UpsertPackageResource(pkg, xKey, value::FromString(joined));
+                            pos = afterClose;
+                            continue;
+                        }
+                    } else if (shortTag == "GradientStopCollection" && !selfClosing) {
+                        std::size_t innerEnd = 0u, afterClose = 0u;
+                        if (FindMatchingClosingTag(src, pos, tagName, innerEnd, afterClose)) {
+                            const std::string_view innerXml = src.substr(pos, innerEnd - pos);
+                            std::string synthXml = "<StackPanel>";
+                            synthXml.append(innerXml);
+                            synthXml += "</StackPanel>";
+                            const std::string resTplKey = "__aero_visual_res__:" + std::string(xKey);
+                            AeroCompileInput subIn{};
+                            subIn.xamlPath = resTplKey;
+                            subIn.xamlContent = std::move(synthXml);
+                            subIn.externalXamlResolver = input.externalXamlResolver;
+                            subIn.resourceSearchRoot = input.resourceSearchRoot;
+                            subIn.resourceSearchPaths = input.resourceSearchPaths;
+                            subIn.autoMergeGlobalResources = false;
+                            AeroCompileResult subRes = this->CompileInternal(subIn, activeIncludeStack);
+                            if (subRes.succeeded) {
+                                AxbDataTemplate dt{};
+                                dt.key = resTplKey;
+                                dt.templatePackage = std::make_shared<AxbPackage>(std::move(subRes.axbPackage));
+                                AxbTemplateRegistry::Instance().RegisterDataTemplate(dt);
+                                pkg.dataTemplates.push_back(std::move(dt));
+                                UpsertPackageResource(pkg, xKey, value::FromString(resTplKey));
+                            }
+                            pos = afterClose;
+                            continue;
+                        }
+                    } else if (!selfClosing &&
+                               (shortTag == "Grid" || shortTag == "Border" || shortTag == "StackPanel" ||
+                                shortTag == "TransformGroup" || shortTag == "ContentControl" ||
+                                shortTag == "Canvas" || shortTag == "WrapPanel" || shortTag == "DockPanel")) {
+                        std::size_t innerEnd = 0u, afterClose = 0u;
+                        if (FindMatchingClosingTag(src, pos, tagName, innerEnd, afterClose)) {
+                            const std::string_view fullElemXml = src.substr(lt, afterClose - lt);
+                            const std::string resTplKey = "__aero_visual_res__:" + std::string(xKey);
+                            AxbTemplateRegistry::Instance().RegisterResources(pkg);
+                            AeroCompileInput subIn{};
+                            subIn.xamlPath = resTplKey;
+                            subIn.xamlContent = std::string(fullElemXml);
+                            subIn.externalXamlResolver = input.externalXamlResolver;
+                            subIn.resourceSearchRoot = input.resourceSearchRoot;
+                            subIn.resourceSearchPaths = input.resourceSearchPaths;
+                            subIn.autoMergeGlobalResources = false;
+                            AeroCompileResult subRes = this->CompileInternal(subIn, activeIncludeStack);
+                            if (subRes.succeeded) {
+                                for (const auto& mp : subRes.axbPackage.mtsdfPaths) {
+                                    if (mp.pathHash != 0 && bakedPathHashes.insert(mp.pathHash).second) {
+                                        pkg.mtsdfPaths.push_back(mp);
+                                    }
+                                }
+                                AxbDataTemplate dt{};
+                                dt.key = resTplKey;
+                                dt.templatePackage = std::make_shared<AxbPackage>(std::move(subRes.axbPackage));
+                                AxbTemplateRegistry::Instance().RegisterDataTemplate(dt);
+                                pkg.dataTemplates.push_back(std::move(dt));
+                                UpsertPackageResource(pkg, xKey, value::FromString(resTplKey));
+                            }
+                            pos = afterClose;
+                            continue;
+                        }
                     } else if (shortTag == "String" && selfClosing) {
                         UpsertPackageResource(pkg, xKey, value::FromString(""));
                     } else if (!selfClosing &&
@@ -6291,6 +6481,8 @@ AeroCompileResult AeroCompiler::CompileInternal(
                                     resInst.literalValue = *rv;
                                 }
                                 pkg.instructions.push_back(std::move(resInst));
+                                parentScope.brushAssigned = true;
+                            } else if (emitPropertyBindingIfValid(parentScope.targetPropId, a.value)) {
                                 parentScope.brushAssigned = true;
                             } else if (a.value.empty() || a.value.front() != '{') {
                                 Color c = ParseXamlColorLiteral(a.value);
@@ -6649,6 +6841,7 @@ AeroCompileResult AeroCompiler::CompileInternal(
             EndsWith(shortTag, ".Header") ||
             EndsWith(shortTag, ".Content") ||
             EndsWith(shortTag, ".ToolTip") ||
+            EndsWith(shortTag, ".Icon") ||
             EndsWith(shortTag, ".Data")) {
             if (!selfClosing) {
                 XmlScopeEntry trans{};
@@ -7020,10 +7213,13 @@ AeroCompileResult AeroCompiler::CompileInternal(
             scopeStack.back().kind == XmlScopeKind::TransparentContainer &&
             EndsWith(StripXmlPrefix(scopeStack.back().tagName), ".Header");
 
+        const bool isInlinePrimitiveVisualItem =
+            (shortTag == "Double" || shortTag == "Single" || shortTag == "Int32" ||
+             shortTag == "Int64" || shortTag == "Boolean" || shortTag == "String");
         AxbInstruction beginInst{};
         beginInst.opcode = AxbOpcode::BeginElement;
         beginInst.flags = isDirectHeaderChild ? 0x01u : 0x00u;
-        beginInst.strIdx0 = pkg.InternString(tagName);
+        beginInst.strIdx0 = pkg.InternString(isInlinePrimitiveVisualItem ? std::string_view("TextBlock") : tagName);
         beginInst.strIdx1 = pkg.InternString(xName);
         pkg.instructions.push_back(std::move(beginInst));
 
@@ -7111,7 +7307,7 @@ AeroCompileResult AeroCompiler::CompileInternal(
             }
 
             const std::uint16_t propId =
-                (shortTag == "BoxShadow" && attr.name == "Color")
+                ((shortTag == "BoxShadow" || shortTag == "GradientStop") && attr.name == "Color")
                     ? static_cast<std::uint16_t>(PropId_EffectColor)
                     : ((shortTag == "ContentControl" && attr.name == "Content")
                         ? static_cast<std::uint16_t>(PropId_Content)
@@ -7201,8 +7397,35 @@ AeroCompileResult AeroCompiler::CompileInternal(
                     continue;
                 }
 
+                if (inner.rfind("x:Static", 0) == 0) {
+                    std::string_view memberExpr = Trim(inner.substr(8u));
+                    if (memberExpr.rfind("Member=", 0) == 0) {
+                        memberExpr = Trim(memberExpr.substr(7u));
+                    }
+                    if (!memberExpr.empty() && (memberExpr.front() == '\'' || memberExpr.front() == '"') &&
+                        memberExpr.back() == memberExpr.front() && memberExpr.size() >= 2u) {
+                        memberExpr = memberExpr.substr(1u, memberExpr.size() - 2u);
+                    }
+                    const std::string_view bareMem = StripXmlPrefix(memberExpr);
+                    std::string resolvedStaticStr;
+                    bool hasStaticResolved = false;
+                    if (bareMem == "Visibility.Collapsed") { resolvedStaticStr = "Collapsed"; hasStaticResolved = true; }
+                    else if (bareMem == "Visibility.Hidden") { resolvedStaticStr = "Hidden"; hasStaticResolved = true; }
+                    else if (bareMem == "Visibility.Visible") { resolvedStaticStr = "Visible"; hasStaticResolved = true; }
+                    else if (bareMem == "String.Empty" || bareMem == "string.Empty") { resolvedStaticStr = ""; hasStaticResolved = true; }
+                    else if (bareMem == "Double.NaN" || bareMem == "Single.NaN") { resolvedStaticStr = "Auto"; hasStaticResolved = true; }
+                    else if (bareMem == "Boolean.TrueString") { resolvedStaticStr = "True"; hasStaticResolved = true; }
+                    else if (bareMem == "Boolean.FalseString") { resolvedStaticStr = "False"; hasStaticResolved = true; }
+                    if (hasStaticResolved) {
+                        AxbInstruction stInst{};
+                        stInst.opcode = AxbOpcode::SetStaticProperty;
+                        stInst.propId = propId;
+                        stInst.literalValue = ParseLiteralPropertyValue(propId, resolvedStaticStr);
+                        pkg.instructions.push_back(std::move(stInst));
+                    }
+                    continue;
+                }
                 if (inner.rfind("x:Type", 0) == 0 ||
-                    inner.rfind("x:Static", 0) == 0 ||
                     inner.rfind("x:Null", 0) == 0 ||
                     inner.rfind("RelativeSource", 0) == 0) {
                     continue;
@@ -7214,7 +7437,7 @@ AeroCompileResult AeroCompiler::CompileInternal(
                 }
 
                 if (!parsedBind.staticResourceSourceKey.empty() &&
-                    (parsedBind.pathPart.empty() || parsedBind.pathPart == ".")) {
+                    (parsedBind.pathPart.empty() || parsedBind.pathPart == "." || parsedBind.pathPart == "Children")) {
                     AxbInstruction resInst{};
                     resInst.opcode = AxbOpcode::SetResourceProperty;
                     resInst.propId = propId;
@@ -7278,21 +7501,25 @@ AeroCompileResult AeroCompiler::CompileInternal(
                     pkg.instructions.push_back(std::move(fbInst));
                 }
 
+                const bool isAttrSelfDc =
+                    (pathPart.empty() || pathPart == ".") &&
+                    parsedBind.elementName.empty() &&
+                    parsedBind.relativeAncestorType.empty() &&
+                    !parsedBind.relativeSelf;
                 const bool hasAttrElemSrc = !parsedBind.elementName.empty() ||
                                             !parsedBind.relativeAncestorType.empty() ||
-                                            parsedBind.relativeSelf;
-                if ((pathPart.empty() || pathPart == ".") && !hasAttrElemSrc) {
-                    continue;
-                }
+                                            parsedBind.relativeSelf ||
+                                            isAttrSelfDc;
+                const std::string_view effAttrPath = isAttrSelfDc ? std::string_view("DataContext") : pathPart;
 
                 AxbCompiledBindingChain chain{};
-                chain.rawPath = std::string(pathPart);
+                chain.rawPath = std::string(effAttrPath);
                 chain.targetPropertyId = propId;
                 chain.mode = mode;
                 chain.fallbackValue = std::move(parsedFallback);
                 chain.elementName = std::string(parsedBind.elementName);
                 chain.relativeAncestorType = parsedBind.relativeAncestorType;
-                chain.relativeSelf = parsedBind.relativeSelf;
+                chain.relativeSelf = parsedBind.relativeSelf || isAttrSelfDc;
                 chain.converter = parsedBind.converter;
                 chain.converterKey = parsedBind.converterKey;
                 chain.converterParameter = parsedBind.converterParameter;
@@ -7301,9 +7528,9 @@ AeroCompileResult AeroCompiler::CompileInternal(
 
                 const bool keepAttrAttached = parsedBind.isAttachedPropertyPath ||
                     (hasAttrElemSrc &&
-                     pathPart.find('.') != std::string_view::npos &&
-                     !IsInstanceSubHopPropertyPath(pathPart) && ResolveMappedSetterPropertyId(pathPart) != kUnmappedPropId);
-                splitPathIntoHops(pathPart, chain.hops, keepAttrAttached);
+                     effAttrPath.find('.') != std::string_view::npos &&
+                     !IsInstanceSubHopPropertyPath(effAttrPath) && ResolveMappedSetterPropertyId(effAttrPath) != kUnmappedPropId);
+                splitPathIntoHops(effAttrPath, chain.hops, keepAttrAttached);
 
                 const auto chainIdx = static_cast<std::uint32_t>(pkg.bindingChains.size());
                 pkg.bindingChains.push_back(std::move(chain));
@@ -7434,8 +7661,127 @@ AeroCompileResult AeroCompiler::CompileInternal(
         PopulateSceneIrFromPackage(pkg, FrontendSourceFormat::Xaml, effectiveXamlPath, result.sceneIr);
     }
 
+    // Rewrite generic RelayCommand<T> / DelegateCommand<T> in user scripts to TypedRelayCommand<T> / TypedDelegateCommand<T>
+    // so both arity-0 RelayCommand and generic RelayCommand<T> coexist cleanly in module Aero.UI.
+    auto rewriteGenericCommandNames = [](std::string_view src) -> std::string {
+        std::string out;
+        out.reserve(src.size() + 32u);
+        bool inStr = false;
+        bool inChar = false;
+        for (std::size_t i = 0; i < src.size();) {
+            const char c = src[i];
+            if (inStr) {
+                out.push_back(c);
+                if (c == '\\' && i + 1u < src.size()) {
+                    out.push_back(src[i + 1u]);
+                    i += 2u;
+                    continue;
+                }
+                if (c == '"') inStr = false;
+                ++i;
+                continue;
+            }
+            if (inChar) {
+                out.push_back(c);
+                if (c == '\\' && i + 1u < src.size()) {
+                    out.push_back(src[i + 1u]);
+                    i += 2u;
+                    continue;
+                }
+                if (c == '\'') inChar = false;
+                ++i;
+                continue;
+            }
+            {
+                std::size_t verbatimPrefix = 0u;
+                if (c == '@' && i + 1u < src.size() && src[i + 1u] == '"') {
+                    verbatimPrefix = 2u;
+                } else if (i + 2u < src.size() && src[i + 2u] == '"' &&
+                           ((c == '$' && src[i + 1u] == '@') ||
+                            (c == '@' && src[i + 1u] == '$'))) {
+                    verbatimPrefix = 3u;
+                }
+                if (verbatimPrefix != 0u) {
+                    out.append(src.substr(i, verbatimPrefix));
+                    i += verbatimPrefix;
+                    while (i < src.size()) {
+                        const char vc = src[i++];
+                        out.push_back(vc);
+                        if (vc == '"') {
+                            if (i < src.size() && src[i] == '"') {
+                                out.push_back(src[i++]);
+                                continue;
+                            }
+                            break;
+                        }
+                    }
+                    continue;
+                }
+            }
+            if (c == '"') {
+                inStr = true;
+                out.push_back(c);
+                ++i;
+                continue;
+            }
+            if (c == '\'') {
+                inChar = true;
+                out.push_back(c);
+                ++i;
+                continue;
+            }
+            if (c == '/' && i + 1u < src.size() && src[i + 1u] == '/') {
+                while (i < src.size() && src[i] != '\n') {
+                    out.push_back(src[i++]);
+                }
+                continue;
+            }
+            if (c == '/' && i + 1u < src.size() && src[i + 1u] == '*') {
+                out.push_back(src[i++]);
+                out.push_back(src[i++]);
+                while (i < src.size()) {
+                    if (src[i] == '*' && i + 1u < src.size() && src[i + 1u] == '/') {
+                        out.push_back(src[i++]);
+                        out.push_back(src[i++]);
+                        break;
+                    }
+                    out.push_back(src[i++]);
+                }
+                continue;
+            }
+            if (std::isalpha(static_cast<unsigned char>(c)) || c == '_') {
+                const std::size_t start = i;
+                while (i < src.size() && (std::isalnum(static_cast<unsigned char>(src[i])) || src[i] == '_')) {
+                    ++i;
+                }
+                const std::string_view ident = src.substr(start, i - start);
+                if (ident == "RelayCommand" || ident == "DelegateCommand") {
+                    std::size_t look = i;
+                    while (look < src.size() && (src[look] == ' ' || src[look] == '\t')) {
+                        ++look;
+                    }
+                    if (look < src.size() && src[look] == '<') {
+                        out.append(ident == "RelayCommand" ? "TypedRelayCommand" : "TypedDelegateCommand");
+                        continue;
+                    }
+                }
+                out.append(ident);
+                continue;
+            }
+            out.push_back(c);
+            ++i;
+        }
+        return out;
+    };
+
     // Generate *.g.rs partial class stub when x:Class is specified
     std::vector<SourceFile> allSources = input.scriptSources;
+    for (auto& sf : allSources) {
+        if (sf.content.find("RelayCommand") != std::string::npos ||
+            sf.content.find("DelegateCommand") != std::string::npos) {
+            sf.content = rewriteGenericCommandNames(sf.content);
+        }
+    }
     if (!pkg.className.empty()) {
         std::string moduleName = "Aero.UI";
         std::string shortClassName = pkg.className;
@@ -7553,7 +7899,27 @@ AeroCompileResult AeroCompiler::CompileInternal(
             if (st == "PasswordBox") return "PasswordBox";
             if (st == "Slider") return "Slider";
             if (st == "ProgressBar") return "ProgressBar";
-            if (st == "ListBox" || st == "ListView") return "ListBox";
+            if (st == "ListView") return "ListView";
+            if (st == "ListBox") return "ListBox";
+            if (st == "Border") return "Border";
+            if (st == "Grid") return "Grid";
+            if (st == "StackPanel" || st == "VirtualizingStackPanel") return "StackPanel";
+            if (st == "DockPanel") return "DockPanel";
+            if (st == "WrapPanel") return "WrapPanel";
+            if (st == "UniformGrid") return "UniformGrid";
+            if (st == "ScrollViewer") return "ScrollViewer";
+            if (st == "Canvas") return "Canvas";
+            if (st == "Image") return "Image";
+            if (st == "GroupBox" || st == "HeaderedContentControl") return "GroupBox";
+            if (st == "TabItem") return "TabItem";
+            if (st == "Menu") return "Menu";
+            if (st == "ToolBar") return "ToolBar";
+            if (st == "StatusBar") return "StatusBar";
+            if (st == "Popup") return "Popup";
+            if (st == "ToolTip") return "ToolTip";
+            if (st == "ContextMenu") return "ContextMenu";
+            if (st == "GridSplitter") return "GridSplitter";
+            if (st == "RiveControl") return "RiveControl";
             if (st == "ComboBox") return "ComboBox";
             if (st == "TabControl") return "TabControl";
             if (st == "Expander") return "Expander";
@@ -7568,6 +7934,10 @@ AeroCompileResult AeroCompiler::CompileInternal(
         const std::string partialStubSuffix = shortClassName + ".g.rs";
         std::unordered_set<std::string> userDeclaredHandleFields;
         bool userInheritsSdkBase = false;
+        bool userDefinesDataContextProp = false;
+        bool userDefinesCreateMainWindow = false;
+        bool userDeclaresConstructors = false;
+        bool userDeclaresParameterlessConstructor = false;
         for (const auto& sf : input.scriptSources) {
             if (sf.path == partialStubSuffix ||
                 (sf.path.size() >= partialStubSuffix.size() &&
@@ -7575,6 +7945,10 @@ AeroCompileResult AeroCompiler::CompileInternal(
                 continue;
             }
             const std::string cleanSrc = stripRsComments(sf.content);
+            if (cleanSrc.find("CreateMainWindow(") != std::string::npos ||
+                cleanSrc.find("CreateMainWindow (") != std::string::npos) {
+                userDefinesCreateMainWindow = true;
+            }
             if (classDeclHasBaseClass(cleanSrc, shortClassName)) {
                 userInheritsSdkBase = true;
                 userDefinesRootHandle = true;
@@ -7582,6 +7956,83 @@ AeroCompileResult AeroCompiler::CompileInternal(
             const std::string classBody = extractClassBodies(cleanSrc, shortClassName);
             if (classBody.empty()) {
                 continue;
+            }
+            {
+                int depth = 0;
+                bool inBodyStr = false;
+                for (std::size_t ci = 0; ci < classBody.size(); ++ci) {
+                    const char bc = classBody[ci];
+                    if (inBodyStr) {
+                        if (bc == '\\' && ci + 1u < classBody.size()) {
+                            ++ci;
+                            continue;
+                        }
+                        if (bc == '"') inBodyStr = false;
+                        continue;
+                    }
+                    if (bc == '"') {
+                        inBodyStr = true;
+                        continue;
+                    }
+                    if (bc == '{') {
+                        ++depth;
+                        continue;
+                    }
+                    if (bc == '}') {
+                        --depth;
+                        continue;
+                    }
+                    if (depth == 1 &&
+                        ci + shortClassName.size() < classBody.size() &&
+                        classBody.compare(ci, shortClassName.size(), shortClassName) == 0) {
+                        const bool okBefore = (ci == 0u) ||
+                            !(std::isalnum(static_cast<unsigned char>(classBody[ci - 1u])) ||
+                              classBody[ci - 1u] == '_' || classBody[ci - 1u] == '.' ||
+                              classBody[ci - 1u] == ':' || classBody[ci - 1u] == '~');
+                        if (!okBefore) continue;
+                        std::size_t prevEnd = ci;
+                        while (prevEnd > 0u && std::isspace(static_cast<unsigned char>(classBody[prevEnd - 1u]))) {
+                            --prevEnd;
+                        }
+                        std::size_t prevStart = prevEnd;
+                        while (prevStart > 0u && (std::isalnum(static_cast<unsigned char>(classBody[prevStart - 1u])) || classBody[prevStart - 1u] == '_')) {
+                            --prevStart;
+                        }
+                        const std::string_view prevTok(classBody.data() + prevStart, prevEnd - prevStart);
+                        if (prevTok == "new") continue;
+                        std::size_t look = ci + shortClassName.size();
+                        while (look < classBody.size() && std::isspace(static_cast<unsigned char>(classBody[look]))) {
+                            ++look;
+                        }
+                        if (look < classBody.size() && classBody[look] == '(') {
+                            userDeclaresConstructors = true;
+                            std::size_t p = look + 1u;
+                            int pDepth = 1;
+                            bool pStr = false;
+                            bool hasParamToken = false;
+                            while (p < classBody.size() && pDepth > 0) {
+                                const char pc = classBody[p++];
+                                if (pStr) {
+                                    hasParamToken = true;
+                                    if (pc == '\\' && p < classBody.size()) ++p;
+                                    else if (pc == '"') pStr = false;
+                                    continue;
+                                }
+                                if (pc == '"') {
+                                    pStr = true;
+                                    hasParamToken = true;
+                                    continue;
+                                }
+                                if (pc == '(') { ++pDepth; hasParamToken = true; }
+                                else if (pc == ')') { --pDepth; }
+                                else if (!std::isspace(static_cast<unsigned char>(pc))) { hasParamToken = true; }
+                            }
+                            if (!hasParamToken) {
+                                userDeclaresParameterlessConstructor = true;
+                            }
+                        }
+                    }
+                }
             }
             if (classBody.find("handle __nativeRootHandle") != std::string::npos) {
                 userDefinesRootHandle = true;
@@ -7591,6 +8042,33 @@ AeroCompileResult AeroCompiler::CompileInternal(
             }
             if (classBody.find("void SetDataContext") != std::string::npos) {
                 userDefinesSetDc = true;
+            }
+            {
+                std::size_t dPos = 0u;
+                while ((dPos = classBody.find("DataContext", dPos)) != std::string::npos) {
+                    const std::size_t afterDc = dPos + 11u;
+                    const bool wordStart = (dPos == 0u) || !(std::isalnum(static_cast<unsigned char>(classBody[dPos - 1u])) || classBody[dPos - 1u] == '_' || classBody[dPos - 1u] == '.');
+                    const bool wordEnd = (afterDc >= classBody.size()) || !(std::isalnum(static_cast<unsigned char>(classBody[afterDc])) || classBody[afterDc] == '_');
+                    if (wordStart && wordEnd) {
+                        // Walk backwards before whitespace to see if preceded by a type identifier (e.g. `MyVm DataContext` or `object DataContext`)
+                        std::size_t prevEnd = dPos;
+                        while (prevEnd > 0u && std::isspace(static_cast<unsigned char>(classBody[prevEnd - 1u]))) {
+                            --prevEnd;
+                        }
+                        if (prevEnd > 0u && (std::isalnum(static_cast<unsigned char>(classBody[prevEnd - 1u])) || classBody[prevEnd - 1u] == '_' || classBody[prevEnd - 1u] == '>' || classBody[prevEnd - 1u] == ']')) {
+                            std::size_t prevStart = prevEnd;
+                            while (prevStart > 0u && (std::isalnum(static_cast<unsigned char>(classBody[prevStart - 1u])) || classBody[prevStart - 1u] == '_')) {
+                                --prevStart;
+                            }
+                            const std::string_view prevWord(classBody.data() + prevStart, prevEnd - prevStart);
+                            if (prevWord != "return" && prevWord != "else" && prevWord != "case") {
+                                userDefinesDataContextProp = true;
+                                break;
+                            }
+                        }
+                    }
+                    dPos = afterDc;
+                }
             }
             if (classBody.find("bool LoadResources(") != std::string::npos) {
                 userDefinesLoadRes = true;
@@ -7623,7 +8101,7 @@ AeroCompileResult AeroCompiler::CompileInternal(
         if (userInheritsSdkBase && moduleName != "Aero.UI") {
             stub += "import Aero.UI;\n";
         }
-        stub += "\npublic partial class " + shortClassName + "\n{\n";
+        stub += "\n[Observable]\npublic partial class " + shortClassName + "\n{\n";
         if (!userDefinesRootHandle) {
             stub += "    public handle __nativeRootHandle;\n";
         }
@@ -7670,7 +8148,16 @@ AeroCompileResult AeroCompiler::CompileInternal(
             stub += "    public bool LoadResources(string uri) { return Aero_LoadResources__" + shortClassName +
                     "(this.__nativeRootHandle, uri); }\n";
         }
+        if (userInheritsSdkBase && !userDefinesDataContextProp) {
+            stub += "    public object DataContext { get { return GUI_GetDataContextObject(this); } set { GUI_SetDataContextObject(this, value); } }\n";
+        }
         stub += "}\n";
+        if (userInheritsSdkBase && (!userDeclaresConstructors || userDeclaresParameterlessConstructor)) {
+            stub += "public " + shortClassName + " __AeroCreateInstance_" + shortClassName + "() { return new " + shortClassName + "(); }\n";
+            if (shortClassName == "MainWindow" && !userDefinesCreateMainWindow) {
+                stub += "public MainWindow CreateMainWindow() { return new MainWindow(); }\n";
+            }
+        }
         stub += "public bool Aero_LoadComponent__" + shortClassName + "(" + shortClassName + " component, string uri) { return false; }\n";
         if (!userDefinesSetDc) {
             stub += "public bool Aero_SetDataContext__" + shortClassName + "<TOwner, TContext>(TOwner owner, TContext dataContext) where TOwner : class where TContext : class { return false; }\n";
@@ -7714,6 +8201,8 @@ AeroCompileResult AeroCompiler::CompileInternal(
                 sf.content.find("using System.Collections.ObjectModel") != std::string::npos ||
                 sf.content.find("using System.Windows") != std::string::npos ||
                 sf.content.find("ObservableObject") != std::string::npos ||
+                sf.content.find("ViewModelBase") != std::string::npos ||
+                sf.content.find("BindableBase") != std::string::npos ||
                 sf.content.find("INotifyPropertyChanged") != std::string::npos ||
                 sf.content.find("RelayCommand") != std::string::npos ||
                 sf.content.find("DelegateCommand") != std::string::npos) {
@@ -7775,6 +8264,8 @@ AeroCompileResult AeroCompiler::CompileInternal(
                 "}\n"
                 "public bool GUI_LoadComponent(handle root, string uri) { return false; }\n"
                 "public bool GUI_SetDataContext<TOwner, TContext>(TOwner owner, TContext dataContext) where TOwner : class where TContext : class { return false; }\n"
+                "public bool GUI_SetDataContextObject(object owner, object dataContext) { return false; }\n"
+                "public object GUI_GetDataContextObject(object owner) { return null; }\n"
                 "public bool GUI_LoadXaml(handle container, string xamlUri) { return false; }\n"
                 "public bool Application_LoadResources(handle root, string uri) { return false; }\n"
                 "public bool Application_SetResources(string uri) { return false; }\n"
@@ -7827,16 +8318,73 @@ AeroCompileResult AeroCompiler::CompileInternal(
                 "{\n"
                 "    void OnPropertyChanged(string propertyName);\n"
                 "}\n"
+                "public delegate void ExecuteGenericFunc<T>(T param);\n"
+                "public delegate bool CanExecuteGenericFunc<T>(T param);\n"
+                "public class TypedRelayCommand<T>\n"
+                "{\n"
+                "    public ExecuteGenericFunc<T> _exec = null;\n"
+                "    public CanExecuteGenericFunc<T> _canExec = null;\n"
+                "    public TypedRelayCommand() { }\n"
+                "    public TypedRelayCommand(ExecuteGenericFunc<T> exec) { _exec = exec; }\n"
+                "    public TypedRelayCommand(ExecuteGenericFunc<T> exec, CanExecuteGenericFunc<T> canExec) { _exec = exec; _canExec = canExec; }\n"
+                "    public void RaiseCanExecuteChanged() { }\n"
+                "    public bool CanExecute(T param) { if (_canExec != null) { return _canExec(param); } return true; }\n"
+                "    public void Execute(T param) { if (!CanExecute(param)) { return; } if (_exec != null) { _exec(param); } }\n"
+                "}\n"
+                "public class TypedDelegateCommand<T>\n"
+                "{\n"
+                "    public ExecuteGenericFunc<T> _exec = null;\n"
+                "    public CanExecuteGenericFunc<T> _canExec = null;\n"
+                "    public TypedDelegateCommand() { }\n"
+                "    public TypedDelegateCommand(ExecuteGenericFunc<T> exec) { _exec = exec; }\n"
+                "    public TypedDelegateCommand(ExecuteGenericFunc<T> exec, CanExecuteGenericFunc<T> canExec) { _exec = exec; _canExec = canExec; }\n"
+                "    public void RaiseCanExecuteChanged() { }\n"
+                "    public bool CanExecute(T param) { if (_canExec != null) { return _canExec(param); } return true; }\n"
+                "    public void Execute(T param) { if (!CanExecute(param)) { return; } if (_exec != null) { _exec(param); } }\n"
+                "}\n"
                 "public class ObservableObject : INotifyPropertyChanged\n"
                 "{\n"
-                "    public void OnPropertyChanged(string propertyName) { }\n"
+                "    public void OnPropertyChanged(string propertyName = \"\") { }\n"
+                "    public void RaisePropertyChanged(string propertyName = \"\") { }\n"
+                "    public bool SetProperty(ref int storage, int value, string propertyName = \"\") { if (storage == value) { return false; } storage = value; return true; }\n"
+                "    public bool SetProperty(ref float storage, float value, string propertyName = \"\") { if (storage == value) { return false; } storage = value; return true; }\n"
+                "    public bool SetProperty(ref double storage, double value, string propertyName = \"\") { if (storage == value) { return false; } storage = value; return true; }\n"
+                "    public bool SetProperty(ref bool storage, bool value, string propertyName = \"\") { if (storage == value) { return false; } storage = value; return true; }\n"
+                "    public bool SetProperty(ref string storage, string value, string propertyName = \"\") { if (storage == value) { return false; } storage = value; return true; }\n"
+                "    public bool SetProperty<T>(ref T storage, T value) { storage = value; return true; }\n"
+                "    public bool SetProperty<T>(ref T storage, T value, string propertyName) { storage = value; return true; }\n"
                 "}\n"
+                "public class ViewModelBase : ObservableObject { }\n"
+                "public class BindableBase : ObservableObject { }\n"
                 "public class RoutedEventArgs\n"
                 "{\n"
                 "    public handle OriginalSource;\n"
                 "    public string EventName = \"\";\n"
                 "    public bool Handled = false;\n"
                 "}\n"
+                "public class TextChangedEventArgs : RoutedEventArgs\n"
+                "{\n"
+                "    public string Text = \"\";\n"
+                "}\n"
+                "public class SelectionChangedEventArgs : RoutedEventArgs\n"
+                "{\n"
+                "    public int SelectedIndex = -1;\n"
+                "}\n"
+                "public class KeyEventArgs : RoutedEventArgs\n"
+                "{\n"
+                "    public int KeyCode = 0;\n"
+                "    public string Key = \"\";\n"
+                "    public bool IsCtrlDown = false;\n"
+                "    public bool IsShiftDown = false;\n"
+                "    public bool IsAltDown = false;\n"
+                "}\n"
+                "public class MouseButtonEventArgs : RoutedEventArgs { }\n"
+                "public class RoutedPropertyChangedEventArgs : RoutedEventArgs\n"
+                "{\n"
+                "    public float NewValue = 0.0f;\n"
+                "    public string NewText = \"\";\n"
+                "}\n"
+                "[Observable]\n"
                 "public class DependencyObject\n"
                 "{\n"
                 "    public handle __nativeRootHandle;\n"
@@ -7944,6 +8492,36 @@ AeroCompileResult AeroCompiler::CompileInternal(
                 "    public bool IsChecked { get { return UIElement_GetBool(this.__nativeRootHandle, \"IsChecked\"); } set { UIElement_SetBool(this.__nativeRootHandle, \"IsChecked\", value); } }\n"
                 "}\n"
                 "public class StatusBarItem : ContentControl { }\n"
+                "public class ListView : ListBox { }\n"
+                "public class Border : FrameworkElement { }\n"
+                "public class Panel : FrameworkElement { }\n"
+                "public class Grid : Panel { }\n"
+                "public class StackPanel : Panel { }\n"
+                "public class DockPanel : Panel { }\n"
+                "public class WrapPanel : Panel { }\n"
+                "public class UniformGrid : Panel { }\n"
+                "public class Canvas : Panel { }\n"
+                "public class ScrollViewer : ContentControl { }\n"
+                "public class Image : FrameworkElement\n"
+                "{\n"
+                "    public string Source { get { return UIElement_GetString(this.__nativeRootHandle, \"Source\"); } set { UIElement_SetString(this.__nativeRootHandle, \"Source\", value); } }\n"
+                "}\n"
+                "public class GroupBox : Expander { }\n"
+                "public class TabItem : Expander { }\n"
+                "public class Menu : Control { }\n"
+                "public class ToolBar : Control\n"
+                "{\n"
+                "    public string Header { get { return UIElement_GetString(this.__nativeRootHandle, \"Header\"); } set { UIElement_SetString(this.__nativeRootHandle, \"Header\", value); } }\n"
+                "}\n"
+                "public class StatusBar : Control { }\n"
+                "public class Popup : FrameworkElement\n"
+                "{\n"
+                "    public bool IsOpen { get { return UIElement_GetBool(this.__nativeRootHandle, \"IsOpen\"); } set { UIElement_SetBool(this.__nativeRootHandle, \"IsOpen\", value); } }\n"
+                "}\n"
+                "public class ToolTip : Popup { }\n"
+                "public class ContextMenu : Control { }\n"
+                "public class GridSplitter : Control { }\n"
+                "public class RiveControl : FrameworkElement { }\n"
                 "public class Application\n"
                 "{\n"
                 "    public string StartupUri = \"\";\n"
@@ -7988,7 +8566,12 @@ AeroCompileResult AeroCompiler::CompileInternal(
                             const std::string_view local = (sep != std::string::npos)
                                 ? std::string_view(fn.name).substr(sep + 2u)
                                 : std::string_view(fn.name);
-                            // Keep class methods (e.g., DelegateCommand.*), strip free native SDK stubs
+                            // Keep class methods and generated factory helpers, strip free native SDK stubs
+                            if (local.rfind("__AeroCreateInstance_", 0) == 0 ||
+                                local == "CreateMainWindow" ||
+                                local == "CreateViewModel") {
+                                return false;
+                            }
                             return local.find('.') == std::string_view::npos;
                         }),
                     bc.functions.end());
@@ -8042,6 +8625,11 @@ AeroCompileResult AeroCompiler::CompileInternal(
                                 const std::string_view local = (sep != std::string::npos)
                                     ? std::string_view(fn.name).substr(sep + 2u)
                                     : std::string_view(fn.name);
+                                if (local.rfind("__AeroCreateInstance_", 0) == 0 ||
+                                    local == "CreateMainWindow" ||
+                                    local == "CreateViewModel") {
+                                    return false;
+                                }
                                 return local.find('.') == std::string_view::npos;
                             }),
                         m.functions.end());

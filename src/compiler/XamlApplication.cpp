@@ -27,13 +27,127 @@ void CollectRsFilesRecursive(const fs::path& rootDir, std::vector<fs::path>& out
     if (!fs::is_directory(rootDir, ec)) return;
     for (const auto& entry : fs::recursive_directory_iterator(rootDir, ec)) {
         if (!entry.is_regular_file(ec)) continue;
+        const std::string fullStr = entry.path().generic_string();
+        if (fullStr.find("/obj/") != std::string::npos ||
+            fullStr.find("/bin/") != std::string::npos ||
+            fullStr.find("/Properties/") != std::string::npos) {
+            continue;
+        }
         const std::string fn = entry.path().filename().string();
-        if (fn.size() > 5u && fn.substr(fn.size() - 5u) == ".g.rs") continue;
-        if (entry.path().extension() == ".rs") {
+        if ((fn.size() > 5u && fn.substr(fn.size() - 5u) == ".g.rs") ||
+            (fn.size() > 5u && fn.substr(fn.size() - 5u) == ".g.cs") ||
+            (fn.size() > 12u && fn.substr(fn.size() - 12u) == ".Designer.cs") ||
+            fn == "AssemblyInfo.cs") {
+            continue;
+        }
+        const fs::path ext = entry.path().extension();
+        if (ext == ".rs" || ext == ".cs") {
             outFiles.push_back(entry.path());
         }
     }
     std::sort(outFiles.begin(), outFiles.end());
+}
+
+void PreRegisterLocalUserControlsAndDictionaries(
+    AeroCompiler& compiler,
+    const fs::path& searchDir,
+    const fs::path& skipMainXaml,
+    const fs::path& skipAppXaml,
+    const std::vector<std::string>& resourceSearchPaths) {
+    std::error_code ec;
+    if (!fs::is_directory(searchDir, ec)) return;
+    std::vector<fs::path> xamls;
+    for (const auto& entry : fs::recursive_directory_iterator(searchDir, ec)) {
+        if (!entry.is_regular_file(ec) || entry.path().extension() != ".xaml") continue;
+        bool skipDir = false;
+        const fs::path rel = entry.path().lexically_relative(searchDir);
+        for (const auto& comp : rel) {
+            const std::string compStr = comp.string();
+            if (compStr == "obj" || compStr == "bin" || compStr == ".git" || compStr == ".vs") {
+                skipDir = true;
+                break;
+            }
+        }
+        if (skipDir) continue;
+        if (fs::equivalent(entry.path(), skipMainXaml, ec)) continue;
+        if (!skipAppXaml.empty() && fs::equivalent(entry.path(), skipAppXaml, ec)) continue;
+        xamls.push_back(entry.path());
+    }
+    std::sort(xamls.begin(), xamls.end());
+    auto extractXmlRootTag = [](std::string_view xml) -> std::string_view {
+        std::size_t pos = 0u;
+        if (xml.size() >= 3u &&
+            static_cast<unsigned char>(xml[0]) == 0xEF &&
+            static_cast<unsigned char>(xml[1]) == 0xBB &&
+            static_cast<unsigned char>(xml[2]) == 0xBF) {
+            pos = 3u;
+        }
+        while (pos < xml.size()) {
+            while (pos < xml.size() && std::isspace(static_cast<unsigned char>(xml[pos]))) {
+                ++pos;
+            }
+            if (pos >= xml.size() || xml[pos] != '<') break;
+            if (xml.compare(pos, 4u, "<!--") == 0) {
+                const std::size_t end = xml.find("-->", pos + 4u);
+                if (end == std::string_view::npos) break;
+                pos = end + 3u;
+                continue;
+            }
+            if (pos + 1u < xml.size() && (xml[pos + 1u] == '?' || xml[pos + 1u] == '!')) {
+                const std::size_t end = xml.find('>', pos + 2u);
+                if (end == std::string_view::npos) break;
+                pos = end + 1u;
+                continue;
+            }
+            const std::size_t nameStart = pos + 1u;
+            std::size_t nameEnd = nameStart;
+            while (nameEnd < xml.size() &&
+                   !std::isspace(static_cast<unsigned char>(xml[nameEnd])) &&
+                   xml[nameEnd] != '>' &&
+                   xml[nameEnd] != '/') {
+                ++nameEnd;
+            }
+            std::string_view tag = xml.substr(nameStart, nameEnd - nameStart);
+            if (const std::size_t colon = tag.rfind(':'); colon != std::string_view::npos) {
+                tag = tag.substr(colon + 1u);
+            }
+            return tag;
+        }
+        return {};
+    };
+    for (const auto& xp : xamls) {
+        std::string xml;
+        if (!ReadUtf8File(xp, xml)) continue;
+        const std::string_view rootTag = extractXmlRootTag(xml);
+        if (rootTag != "UserControl" && rootTag != "ResourceDictionary") continue;
+        AeroCompileInput subIn{};
+        subIn.xamlPath = xp.string();
+        subIn.xamlContent = std::move(xml);
+        subIn.resourceSearchRoot = xp.parent_path().string();
+        subIn.resourceSearchPaths = resourceSearchPaths;
+        subIn.autoMergeGlobalResources = false;
+        AeroCompileResult subRes = compiler.Compile(subIn);
+        if (!subRes.succeeded) continue;
+        AxbTemplateRegistry::Instance().Register(xp.filename().string(), subRes.axbPackage);
+        if (!subRes.axbPackage.className.empty()) {
+            AxbTemplateRegistry::Instance().Register(subRes.axbPackage.className, subRes.axbPackage);
+        }
+        if (subRes.axbPackage.rootTypeName == "ResourceDictionary") {
+            const std::string leaf = xp.filename().string();
+            AxbTemplateRegistry::Instance().RegisterDictionary(leaf, subRes.axbPackage);
+            const std::string relUri = xp.lexically_relative(searchDir).generic_string();
+            if (!relUri.empty() && relUri != leaf) {
+                AxbTemplateRegistry::Instance().RegisterDictionary(relUri, subRes.axbPackage);
+            }
+            std::string lowerLeaf = leaf;
+            for (char& ch : lowerLeaf) {
+                ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+            }
+            if (skipAppXaml.empty() && lowerLeaf == "resources.xaml") {
+                AxbTemplateRegistry::Instance().RegisterResources(subRes.axbPackage);
+            }
+        }
+    }
 }
 
 } // namespace
@@ -125,6 +239,9 @@ bool XamlApplication::Load(const XamlApplicationOptions& options, std::string* o
         return false;
     }
 
+    PreRegisterLocalUserControlsAndDictionaries(
+        compiler, windowXamlPath.parent_path(), windowXamlPath, appXamlPath, options.resourceSearchPaths);
+
     AeroCompileInput winIn{};
     winIn.xamlPath = windowXamlPath.string();
     winIn.xamlContent = std::move(winXml);
@@ -199,6 +316,12 @@ bool XamlApplication::Load(const XamlApplicationOptions& options, std::string* o
         }
 
         std::vector<std::string> factoryCands;
+        if (!shortClassName.empty()) {
+            if (!classModulePrefix.empty()) {
+                factoryCands.push_back(classModulePrefix + "::__AeroCreateInstance_" + shortClassName);
+            }
+            factoryCands.push_back("__AeroCreateInstance_" + shortClassName);
+        }
         if (!classModulePrefix.empty()) factoryCands.push_back(classModulePrefix + "::CreateMainWindow");
         factoryCands.push_back("CreateMainWindow");
         if (!classModulePrefix.empty()) factoryCands.push_back(classModulePrefix + "::CreateViewModel");
@@ -311,6 +434,7 @@ void XamlApplication::Tick(float dtSeconds) {
     if (!rootElement_) return;
     if (inputRouter_) {
         (void)inputRouter_->FlushQueuedEvents();
+        inputRouter_->Tick(dtSeconds);
     }
     if (bindingEngine_) {
         (void)bindingEngine_->FlushTrackA();

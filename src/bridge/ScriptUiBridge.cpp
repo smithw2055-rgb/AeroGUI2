@@ -500,6 +500,7 @@ bool MountAndWireMainWindow(
     styleEngine.SetAotExecutionContext(aotContext);
 
     rootControl->SetAsRootVisual(true, &domains.nativeHandles(), &domains.uiHeap());
+    rootControl->BindTwoWayEngine(&bindingEngine);
 
     if (mainWinRef.valid()) {
         (void)rootControl->BindScriptWrapper(domains.nativeHandles(), domains.uiHeap(), mainWinRef);
@@ -1435,8 +1436,54 @@ void ScriptUiBridge::RegisterCoreUiBindings(BindingRegistry& bindings) {
         if (existingSetDc->function) {
             bindSdkFn("__Aero_SetDataContext", *existingSetDc->function);
             bindSdkFn("Aero_SetDataContext", *existingSetDc->function);
+            bindSdkFn("GUI_SetDataContextObject", *existingSetDc->function);
         }
     }
+
+    bindSdkFn(
+        "GUI_GetDataContextObject",
+        [handlesPtr, domPtr, engineSlot](
+            const rs_bc::FunctionReference&,
+            ValueSpan args,
+            RuntimeError&)
+            -> std::optional<UnifiedValue> {
+            if (args.empty() || !domPtr) {
+                return UnifiedValue{NullObject{}};
+            }
+            if (const auto* ownerRef = std::get_if<ObjectRef>(&args[0]); ownerRef && ownerRef->valid()) {
+                const DualTrackBindingEngine* liveEng = (engineSlot && *engineSlot) ? *engineSlot : nullptr;
+                const ProgramImage* prog = liveEng ? liveEng->Program() : nullptr;
+                if (prog && handlesPtr) {
+                    if (auto* ownerHeap = domPtr->heapForObject(*ownerRef); ownerHeap && ownerHeap->isAlive(*ownerRef)) {
+                        const SymbolId ownerTid = ownerHeap->objectTypeId(*ownerRef).value_or(0);
+                        if (const auto* ts = (ownerTid != 0) ? prog->resolveType(ownerTid) : nullptr) {
+                            for (std::size_t fIdx = 0; fIdx < ts->fields.size(); ++fIdx) {
+                                if (ts->fields[fIdx].name == "__nativeRootHandle" &&
+                                    ts->fields[fIdx].type == rs_sem::PrimitiveType::Handle) {
+                                    UnifiedValue hv{};
+                                    NativeHandle nh{};
+                                    if (domPtr->readObjectField(DomainKind::Ui, *ownerRef, static_cast<std::uint32_t>(fIdx), hv) &&
+                                        hv.tryGetNativeHandle(nh) && nh.valid()) {
+                                        if (auto* elem = UIElement::FromNativeHandle(*handlesPtr, nh)) {
+                                            const UnifiedValue dcVal = elem->GetValue(PropId_DataContext);
+                                            if (const auto* dcObj = std::get_if<ObjectRef>(&dcVal); dcObj && dcObj->valid()) {
+                                                return UnifiedValue{*dcObj};
+                                            }
+                                        }
+                                    }
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+                const ObjectRef pendingDc = PendingScriptUiState::Instance().FindDataContext(domPtr, *ownerRef);
+                if (pendingDc.valid()) {
+                    return UnifiedValue{pendingDc};
+                }
+            }
+            return UnifiedValue{NullObject{}};
+        });
 
     // Application_LoadResources(handle root, string uri) -> bool
     bindSdkFn(

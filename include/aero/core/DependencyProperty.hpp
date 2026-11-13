@@ -72,6 +72,13 @@ enum class KeyCode : std::uint16_t {
     End = 12,
     PageUp = 13,
     PageDown = 14,
+    A = 15, B = 16, C = 17, D = 18, E = 19, F = 20, G = 21, H = 22, I = 23,
+    J = 24, K = 25, L = 26, M = 27, N = 28, O = 29, P = 30, Q = 31, R = 32,
+    S = 33, T = 34, U = 35, V = 36, W = 37, X = 38, Y = 39, Z = 40,
+    D0 = 41, D1 = 42, D2 = 43, D3 = 44, D4 = 45,
+    D5 = 46, D6 = 47, D7 = 48, D8 = 49, D9 = 50,
+    F1 = 51, F2 = 52, F3 = 53, F4 = 54, F5 = 55, F6 = 56,
+    F7 = 57, F8 = 58, F9 = 59, F10 = 60, F11 = 61, F12 = 62,
 };
 
 enum KeyModifierFlags : std::uint8_t {
@@ -306,6 +313,9 @@ enum BuiltinPropertyId : std::uint16_t {
     PropId_ActualHeight = 181,              // float px (FrameworkElement.ActualHeight read-only)
     PropId_PlacementTarget = 182,           // NativeHandle (ContextMenu/Popup.PlacementTarget)
     PropId_RoutedCommandName = 183,         // StringValue (Built-in routed command e.g. ScrollBar.LineLeftCommand)
+    PropId_TabIndex = 184,                  // Int64 (Control.TabIndex / KeyboardNavigation.TabIndex)
+    PropId_KeyBindingsSpec = 185,           // StringValue (Serialized <KeyBinding> shortcuts)
+    PropId_SelectedValuePath = 186,         // StringValue (Selector.SelectedValuePath)
     PropId_FirstContractInput = 0x1000u,    // Dynamic/Contract input bridge slot range [0x1000 .. 0x1FFFu]
     // Pseudo-property IDs for zero-allocation inline interactive Trigger conditions
     PropId_TriggerIsMouseOver = 0xFF01u,

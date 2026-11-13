@@ -40,8 +40,10 @@ public:
             bandFn(0, totalHeight);
             return;
         }
+        UiResourceContext* const callerResourceCtx = UiResourceContext::ActiveOverride();
         const int step = (totalHeight + 3) / 4;
         std::function<void(int)> taskFn = [&](int bandIdx) {
+            ScopedUiResourceContext workerCtxScope(bandIdx > 0 ? callerResourceCtx : nullptr);
             const int y0 = bandIdx * step;
             const int y1 = std::min(totalHeight, y0 + step);
             if (y0 < y1) {
@@ -1578,37 +1580,45 @@ void SeparableBoxBlurPremul3Pass(PremulOffscreenLayer& layer, int boxRadius) {
 
     for (int pass = 0; pass < 3; ++pass) {
         // Horizontal 1D sliding-window box blur: premulRgba -> tlScratch
-        for (int y = 0; y < h; ++y) {
-            const float* srcRow = layer.premulRgba.data() + static_cast<std::size_t>(y) * rowFloats;
-            float* dstRow = tlScratch.data() + static_cast<std::size_t>(y) * rowFloats;
-            float sumR = 0.0f;
-            float sumG = 0.0f;
-            float sumB = 0.0f;
-            float sumA = 0.0f;
-            for (int k = -boxRadius; k <= boxRadius; ++k) {
-                const int sx = std::clamp(k, 0, w - 1);
-                const float* p = srcRow + static_cast<std::size_t>(sx) * 4u;
-                sumR += p[0];
-                sumG += p[1];
-                sumB += p[2];
-                sumA += p[3];
+        float* const scratchBase = tlScratch.data();
+        const float* const srcBase = layer.premulRgba.data();
+        auto blurRowsFn = [&](int yStart, int yEnd) {
+            for (int y = yStart; y < yEnd; ++y) {
+                const float* srcRow = srcBase + static_cast<std::size_t>(y) * rowFloats;
+                float* dstRow = scratchBase + static_cast<std::size_t>(y) * rowFloats;
+                float sumR = 0.0f;
+                float sumG = 0.0f;
+                float sumB = 0.0f;
+                float sumA = 0.0f;
+                for (int k = -boxRadius; k <= boxRadius; ++k) {
+                    const int sx = std::clamp(k, 0, w - 1);
+                    const float* p = srcRow + static_cast<std::size_t>(sx) * 4u;
+                    sumR += p[0];
+                    sumG += p[1];
+                    sumB += p[2];
+                    sumA += p[3];
+                }
+                for (int x = 0; x < w; ++x) {
+                    float* dp = dstRow + static_cast<std::size_t>(x) * 4u;
+                    dp[0] = sumR * invKernel;
+                    dp[1] = sumG * invKernel;
+                    dp[2] = sumB * invKernel;
+                    dp[3] = sumA * invKernel;
+                    const int removeX = std::clamp(x - boxRadius, 0, w - 1);
+                    const int addX = std::clamp(x + boxRadius + 1, 0, w - 1);
+                    const float* remP = srcRow + static_cast<std::size_t>(removeX) * 4u;
+                    const float* addP = srcRow + static_cast<std::size_t>(addX) * 4u;
+                    sumR += addP[0] - remP[0];
+                    sumG += addP[1] - remP[1];
+                    sumB += addP[2] - remP[2];
+                    sumA += addP[3] - remP[3];
+                }
             }
-            for (int x = 0; x < w; ++x) {
-                float* outP = dstRow + static_cast<std::size_t>(x) * 4u;
-                outP[0] = sumR * invKernel;
-                outP[1] = sumG * invKernel;
-                outP[2] = sumB * invKernel;
-                outP[3] = sumA * invKernel;
-
-                const int removeX = std::clamp(x - boxRadius, 0, w - 1);
-                const int addX = std::clamp(x + boxRadius + 1, 0, w - 1);
-                const float* remP = srcRow + static_cast<std::size_t>(removeX) * 4u;
-                const float* addP = srcRow + static_cast<std::size_t>(addX) * 4u;
-                sumR += addP[0] - remP[0];
-                sumG += addP[1] - remP[1];
-                sumB += addP[2] - remP[2];
-                sumA += addP[3] - remP[3];
-            }
+        };
+        if (static_cast<std::size_t>(w) * static_cast<std::size_t>(h) >= 16384u) {
+            ScanlineWorkerPool::Instance().ParallelBands4(h, blurRowsFn);
+        } else {
+            blurRowsFn(0, h);
         }
 
         // Cache-friendly row-major vertical 1D sliding-window box blur: tlScratch -> premulRgba
@@ -1854,15 +1864,68 @@ void RasterizeSingleNode(
 
         const FontAtlas& fontAtlasRef = FontAtlas::Instance();
 
-        const int bandClampedPyStart = (optPremulLayer == nullptr) ? std::max(pyStart, gRasterBandY0) : pyStart;
-        const int bandClampedPyEnd = (optPremulLayer == nullptr) ? std::min(pyEnd, gRasterBandY1) : pyEnd;
+        float sdfSafeInteriorHalfW = -1.0f;
+        float sdfSafeInteriorHalfH = -1.0f;
+        if (prim == AeroPrimType::SdfRoundedRect && nd->softFeatherPx <= 0.0f && !sdfHollowBorder) {
+            const float maxRad = std::max(
+                std::max(sdfRadii.topLeft, sdfRadii.topRight),
+                std::max(sdfRadii.bottomRight, sdfRadii.bottomLeft));
+            const float maxBdr = std::max(
+                std::max(sdfBorder.left, sdfBorder.right),
+                std::max(sdfBorder.top, sdfBorder.bottom));
+            sdfSafeInteriorHalfW = quadHalfW - maxRad - maxBdr - quadAaFeather - 0.5f;
+            sdfSafeInteriorHalfH = quadHalfH - maxRad - maxBdr - quadAaFeather - 0.5f;
+        }
+
+        const int bandClampedPyStart = std::max(pyStart, gRasterBandY0);
+        const int bandClampedPyEnd = std::min(pyEnd, gRasterBandY1);
         if (bandClampedPyStart >= bandClampedPyEnd) {
             continue;
         }
+        const float stepSuX = e3y * invDet;
+        const float stepSvX = -e1y * invDet;
+        auto narrowLinearInterval = [](float a0, float slope, int& ioX0, int& ioX1) noexcept {
+            // Restrict px so that a0 + (px + 0.5f) * slope in [0, 1] (with 1px safety margin)
+            if (std::fabs(slope) > 1e-6f) {
+                const float invS = 1.0f / slope;
+                const float pA = (-a0) * invS - 0.5f;
+                const float pB = (1.0f - a0) * invS - 0.5f;
+                const float lo = std::min(pA, pB);
+                const float hi = std::max(pA, pB);
+                if (std::isfinite(lo) && std::isfinite(hi)) {
+                    const int boundLo = ioX0 - 2;
+                    const int boundHi = ioX1 + 2;
+                    ioX0 = std::max(ioX0, SafeFloorToInt(lo, boundLo, boundHi) - 1);
+                    ioX1 = std::min(ioX1, SafeCeilToInt(hi, boundLo, boundHi) + 2);
+                    ioX0 = std::clamp(ioX0, boundLo, boundHi);
+                    ioX1 = std::clamp(ioX1, boundLo, boundHi);
+                }
+            } else if (a0 < -1e-4f || a0 > 1.0001f) {
+                ioX1 = ioX0;
+            }
+        };
+
         for (int py = bandClampedPyStart; py < bandClampedPyEnd; ++py) {
-            for (int px = pxStart; px < pxEnd; ++px) {
+            const float sy = static_cast<float>(py) + 0.5f;
+            const float dy = sy - v0.y;
+            int rowPxStart = pxStart;
+            int rowPxEnd = pxEnd;
+            if (!usePerspectiveInverse) {
+                const float baseSu = (-v0.x * e3y - dy * e3x) * invDet;
+                const float baseSv = (e1x * dy + e1y * v0.x) * invDet;
+                narrowLinearInterval(baseSu, stepSuX, rowPxStart, rowPxEnd);
+                if (rowPxStart < rowPxEnd) {
+                    narrowLinearInterval(baseSv, stepSvX, rowPxStart, rowPxEnd);
+                }
+                rowPxStart = std::max(pxStart, rowPxStart);
+                rowPxEnd = std::min(pxEnd, rowPxEnd);
+                if (rowPxStart >= rowPxEnd) {
+                    continue;
+                }
+            }
+
+            for (int px = rowPxStart; px < rowPxEnd; ++px) {
                 const float sx = static_cast<float>(px) + 0.5f;
-                const float sy = static_cast<float>(py) + 0.5f;
                 float su = 0.0f;
                 float sv = 0.0f;
                 if (usePerspectiveInverse) {
@@ -1874,7 +1937,6 @@ void RasterizeSingleNode(
                     sv = (localPt.y - perspOrigY) / perspSpanH;
                 } else {
                     const float dx = sx - v0.x;
-                    const float dy = sy - v0.y;
                     su = (dx * e3y - dy * e3x) * invDet;
                     sv = (e1x * dy - e1y * dx) * invDet;
                 }
@@ -1915,6 +1977,10 @@ void RasterizeSingleNode(
                                 sdfRadii,
                                 softFeather);
                         }
+                    } else if (sdfSafeInteriorHalfW > 0.0f && sdfSafeInteriorHalfH > 0.0f &&
+                               std::fabs(localX) <= sdfSafeInteriorHalfW &&
+                               std::fabs(localY) <= sdfSafeInteriorHalfH) {
+                        coverage = 1.0f;
                     } else if (sdfHollowBorder) {
                         coverage = EvaluateSdfRoundedBorderCoverage(
                             localX,
@@ -2133,7 +2199,12 @@ void RasterizeSingleNode(
                                 std::clamp(texel.b * vertB * 255.0f + 0.5f, 0.0f, 255.0f));
                             std::uint8_t* dst = outRgba8 +
                                 (static_cast<std::size_t>(py) * viewportWidth + static_cast<std::size_t>(px)) * 4u;
-                            if (isPremul) {
+                            if (!isPremul && finalAlpha >= 1.0f && nd->blendMode == BlendingMode::Normal) {
+                                dst[0] = outR;
+                                dst[1] = outG;
+                                dst[2] = outB;
+                                dst[3] = 255u;
+                            } else if (isPremul) {
                                 const float invA = 1.0f - finalAlpha;
                                 dst[0] = static_cast<std::uint8_t>(std::clamp(static_cast<float>(outR) + static_cast<float>(dst[0]) * invA + 0.5f, 0.0f, 255.0f));
                                 dst[1] = static_cast<std::uint8_t>(std::clamp(static_cast<float>(outG) + static_cast<float>(dst[1]) * invA + 0.5f, 0.0f, 255.0f));
@@ -2172,6 +2243,10 @@ void RasterizeSingleNode(
                     const float aaFeather = quadAaFeather;
 
                     float shapeCov = 1.0f;
+                    const float maxGradCr = IsUniformCornerRadius(nd->cornerRadii)
+                        ? gradRadius
+                        : std::max(std::max(nd->cornerRadii.topLeft, nd->cornerRadii.topRight),
+                                   std::max(nd->cornerRadii.bottomRight, nd->cornerRadii.bottomLeft));
                     if (isEllipse || nd->isEllipseShape) {
                         shapeCov = EvaluateSdfEllipseCoverage(
                             localX,
@@ -2181,6 +2256,9 @@ void RasterizeSingleNode(
                             0.0f,
                             false,
                             aaFeather);
+                    } else if (std::fabs(localX) <= (halfW - maxGradCr - aaFeather - 0.5f) &&
+                               std::fabs(localY) <= (halfH - maxGradCr - aaFeather - 0.5f)) {
+                        shapeCov = 1.0f;
                     } else if (!IsUniformCornerRadius(nd->cornerRadii)) {
                         shapeCov = EvaluateSdfRoundedRectCoverage(
                             localX,
@@ -2232,7 +2310,14 @@ void RasterizeSingleNode(
                                     std::clamp(gradCol.b * modB * 255.0f + 0.5f, 0.0f, 255.0f));
                                 std::uint8_t* dst = outRgba8 +
                                     (static_cast<std::size_t>(py) * viewportWidth + static_cast<std::size_t>(px)) * 4u;
-                                BlendPixelOver(dst, outR, outG, outB, finalAlpha, nd->blendMode);
+                                if (finalAlpha >= 1.0f && nd->blendMode == BlendingMode::Normal) {
+                                    dst[0] = outR;
+                                    dst[1] = outG;
+                                    dst[2] = outB;
+                                    dst[3] = 255u;
+                                } else {
+                                    BlendPixelOver(dst, outR, outG, outB, finalAlpha, nd->blendMode);
+                                }
                             }
                         }
                     }
@@ -2280,7 +2365,14 @@ void RasterizeSingleNode(
                     } else {
                         std::uint8_t* dst = outRgba8 +
                             (static_cast<std::size_t>(py) * viewportWidth + static_cast<std::size_t>(px)) * 4u;
-                        BlendPixelOver(dst, shadeR, shadeG, shadeB, effAlpha, nd->blendMode);
+                        if (a8 == 255u && coverage >= 1.0f && nd->blendMode == BlendingMode::Normal) {
+                            dst[0] = shadeR;
+                            dst[1] = shadeG;
+                            dst[2] = shadeB;
+                            dst[3] = 255u;
+                        } else {
+                            BlendPixelOver(dst, shadeR, shadeG, shadeB, effAlpha, nd->blendMode);
+                        }
                     }
                 }
             }
@@ -2367,6 +2459,133 @@ bool ComputeNodeRangeScreenBounds(
     return any;
 }
 
+void ExecuteBackdropBlurSpan(
+    const BlurLayerSpan& span,
+    std::uint32_t viewportWidth,
+    std::uint32_t viewportHeight,
+    std::uint8_t* outRgba8,
+    PremulOffscreenLayer* optPremulLayer) {
+    if (!std::isfinite(span.radiusPx) || span.radiusPx <= 0.25f ||
+        (outRgba8 == nullptr && optPremulLayer == nullptr)) {
+        return;
+    }
+    const int vpW = static_cast<int>(std::min<std::uint32_t>(viewportWidth, 0x3FFFFFFFu));
+    const int vpH = static_cast<int>(std::min<std::uint32_t>(viewportHeight, 0x3FFFFFFFu));
+    const Rect mr = span.maskDestRect;
+    if (mr.width <= 1.0f || mr.height <= 1.0f) {
+        return;
+    }
+    const int surfX0 = optPremulLayer ? optPremulLayer->originX : 0;
+    const int surfY0 = optPremulLayer ? optPremulLayer->originY : 0;
+    const int surfX1 = optPremulLayer ? (optPremulLayer->originX + optPremulLayer->width) : vpW;
+    const int surfY1 = optPremulLayer ? (optPremulLayer->originY + optPremulLayer->height) : vpH;
+    const float clampedRadius = std::clamp(span.radiusPx, 0.5f, 128.0f);
+    const int boxR = std::max(1, static_cast<int>(std::lround(clampedRadius * 0.5f)));
+    const int padPx = boxR * 3 + 2;
+    const int bx0 = std::clamp(SafeFloorToInt(mr.x, surfX0 - padPx, surfX1 + padPx) - padPx, surfX0, surfX1);
+    const int by0 = std::clamp(SafeFloorToInt(mr.y, surfY0 - padPx, surfY1 + padPx) - padPx, surfY0, surfY1);
+    const int bx1 = std::clamp(SafeCeilToInt(mr.x + mr.width, surfX0 - padPx, surfX1 + padPx) + padPx, surfX0, surfX1);
+    const int by1 = std::clamp(SafeCeilToInt(mr.y + mr.height, surfY0 - padPx, surfY1 + padPx) + padPx, surfY0, surfY1);
+    if (bx1 <= bx0 || by1 <= by0) {
+        return;
+    }
+    PremulOffscreenLayer bgLayer{};
+    bgLayer.originX = bx0;
+    bgLayer.originY = by0;
+    bgLayer.width = bx1 - bx0;
+    bgLayer.height = by1 - by0;
+    bgLayer.premulRgba.resize(
+        static_cast<std::size_t>(bgLayer.width) * static_cast<std::size_t>(bgLayer.height) * 4u);
+    for (int py = by0; py < by1; ++py) {
+        float* dstRow = bgLayer.premulRgba.data() +
+            static_cast<std::size_t>(py - by0) * static_cast<std::size_t>(bgLayer.width) * 4u;
+        if (optPremulLayer) {
+            const float* srcRow = optPremulLayer->premulRgba.data() +
+                static_cast<std::size_t>(py - optPremulLayer->originY) *
+                    static_cast<std::size_t>(optPremulLayer->width) * 4u;
+            for (int px = bx0; px < bx1; ++px) {
+                const float* sp = srcRow + static_cast<std::size_t>(px - optPremulLayer->originX) * 4u;
+                float* dp = dstRow + static_cast<std::size_t>(px - bx0) * 4u;
+                dp[0] = sp[0];
+                dp[1] = sp[1];
+                dp[2] = sp[2];
+                dp[3] = sp[3];
+            }
+        } else {
+            const std::uint8_t* srcRow = outRgba8 +
+                static_cast<std::size_t>(py) * viewportWidth * 4u;
+            for (int px = bx0; px < bx1; ++px) {
+                const std::uint8_t* sp = srcRow + static_cast<std::size_t>(px) * 4u;
+                float* dp = dstRow + static_cast<std::size_t>(px - bx0) * 4u;
+                dp[0] = static_cast<float>(sp[0]) / 255.0f;
+                dp[1] = static_cast<float>(sp[1]) / 255.0f;
+                dp[2] = static_cast<float>(sp[2]) / 255.0f;
+                dp[3] = static_cast<float>(sp[3]) / 255.0f;
+            }
+        }
+    }
+    SeparableBoxBlurPremul3Pass(bgLayer, boxR);
+    const AxbMtsdfPathEntry* maskEntry = (span.maskMtsdfHash != 0u)
+        ? AxbTemplateRegistry::Instance().FindMtsdfPath(span.maskMtsdfHash)
+        : nullptr;
+    int mx0 = std::clamp(SafeFloorToInt(mr.x, surfX0, surfX1), bx0, bx1);
+    int my0 = std::clamp(SafeFloorToInt(mr.y, surfY0, surfY1), by0, by1);
+    int mx1 = std::clamp(SafeCeilToInt(mr.x + mr.width, surfX0, surfX1), bx0, bx1);
+    int my1 = std::clamp(SafeCeilToInt(mr.y + mr.height, surfY0, surfY1), by0, by1);
+    if (span.clipActive) {
+        if (!std::isfinite(span.clipRect.x) || !std::isfinite(span.clipRect.y) ||
+            !std::isfinite(span.clipRect.width) || !std::isfinite(span.clipRect.height)) {
+            mx1 = mx0;
+        } else {
+            mx0 = std::max(mx0, SafeFloorToInt(span.clipRect.x, surfX0, surfX1));
+            my0 = std::max(my0, SafeFloorToInt(span.clipRect.y, surfY0, surfY1));
+            mx1 = std::min(mx1, SafeCeilToInt(span.clipRect.x + std::max(0.0f, span.clipRect.width), surfX0, surfX1));
+            my1 = std::min(my1, SafeCeilToInt(span.clipRect.y + std::max(0.0f, span.clipRect.height), surfY0, surfY1));
+        }
+    }
+    if (gInScanlineBand) {
+        my0 = std::max(my0, gRasterBandY0);
+        my1 = std::min(my1, gRasterBandY1);
+    }
+    const float screenScale = std::max(1.0f, 0.5f * (mr.width / std::max(1.0f, maskEntry ? maskEntry->boundsW : mr.width) +
+                                                     mr.height / std::max(1.0f, maskEntry ? maskEntry->boundsH : mr.height)));
+    for (int py = my0; py < my1; ++py) {
+        const float normY = ((static_cast<float>(py) + 0.5f) - mr.y) / std::max(1.0f, mr.height);
+        const float* blurRow = bgLayer.premulRgba.data() +
+            static_cast<std::size_t>(py - by0) * static_cast<std::size_t>(bgLayer.width) * 4u;
+        for (int px = mx0; px < mx1; ++px) {
+            const float normX = ((static_cast<float>(px) + 0.5f) - mr.x) / std::max(1.0f, mr.width);
+            float cov = 1.0f;
+            if (maskEntry) {
+                cov = EvaluateMtsdfCoverage(*maskEntry, normX, normY, screenScale, 0.0f, false);
+            }
+            const float effMask = std::clamp(cov * span.maskOpacity, 0.0f, 1.0f);
+            if (effMask <= 0.002f) continue;
+            const float* bp = blurRow + static_cast<std::size_t>(px - bx0) * 4u;
+            const float pa = std::clamp(bp[3] * effMask, 0.0f, 1.0f);
+            if (pa <= 0.001f) continue;
+            const float pr = bp[0] * effMask;
+            const float pg = bp[1] * effMask;
+            const float pb = bp[2] * effMask;
+            if (optPremulLayer) {
+                BlendPremulOver(*optPremulLayer, px, py, pr, pg, pb, pa);
+            } else {
+                std::uint8_t* dst = outRgba8 +
+                    (static_cast<std::size_t>(py) * viewportWidth + static_cast<std::size_t>(px)) * 4u;
+                const float invA = 1.0f - pa;
+                dst[0] = static_cast<std::uint8_t>(
+                    std::clamp(pr * 255.0f + static_cast<float>(dst[0]) * invA + 0.5f, 0.0f, 255.0f));
+                dst[1] = static_cast<std::uint8_t>(
+                    std::clamp(pg * 255.0f + static_cast<float>(dst[1]) * invA + 0.5f, 0.0f, 255.0f));
+                dst[2] = static_cast<std::uint8_t>(
+                    std::clamp(pb * 255.0f + static_cast<float>(dst[2]) * invA + 0.5f, 0.0f, 255.0f));
+                dst[3] = static_cast<std::uint8_t>(
+                    std::clamp(pa * 255.0f + static_cast<float>(dst[3]) * invA + 0.5f, 0.0f, 255.0f));
+            }
+        }
+    }
+}
+
 void RasterizeNodeSpanRecursive(
     const PagedRenderTree& tree,
     std::uint32_t startNodeId,
@@ -2398,113 +2617,7 @@ void RasterizeNodeSpanRecursive(
             ++ioBlurCursor;
 
             if (span.effectMode == UIEffectKind::BackdropBlur && (outRgba8 != nullptr || optPremulLayer != nullptr)) {
-                const Rect mr = span.maskDestRect;
-                if (mr.width > 1.0f && mr.height > 1.0f) {
-                    const int surfX0 = optPremulLayer ? optPremulLayer->originX : 0;
-                    const int surfY0 = optPremulLayer ? optPremulLayer->originY : 0;
-                    const int surfX1 = optPremulLayer ? (optPremulLayer->originX + optPremulLayer->width) : vpW;
-                    const int surfY1 = optPremulLayer ? (optPremulLayer->originY + optPremulLayer->height) : vpH;
-                    const float clampedRadius = std::clamp(span.radiusPx, 0.5f, 128.0f);
-                    const int boxR = std::max(1, static_cast<int>(std::lround(clampedRadius * 0.5f)));
-                    const int padPx = boxR * 3 + 2;
-                    const int bx0 = std::clamp(SafeFloorToInt(mr.x, surfX0 - padPx, surfX1 + padPx) - padPx, surfX0, surfX1);
-                    const int by0 = std::clamp(SafeFloorToInt(mr.y, surfY0 - padPx, surfY1 + padPx) - padPx, surfY0, surfY1);
-                    const int bx1 = std::clamp(SafeCeilToInt(mr.x + mr.width, surfX0 - padPx, surfX1 + padPx) + padPx, surfX0, surfX1);
-                    const int by1 = std::clamp(SafeCeilToInt(mr.y + mr.height, surfY0 - padPx, surfY1 + padPx) + padPx, surfY0, surfY1);
-                    if (bx1 > bx0 && by1 > by0) {
-                        PremulOffscreenLayer bgLayer{};
-                        bgLayer.originX = bx0;
-                        bgLayer.originY = by0;
-                        bgLayer.width = bx1 - bx0;
-                        bgLayer.height = by1 - by0;
-                        bgLayer.premulRgba.resize(
-                            static_cast<std::size_t>(bgLayer.width) * static_cast<std::size_t>(bgLayer.height) * 4u);
-                        for (int py = by0; py < by1; ++py) {
-                            float* dstRow = bgLayer.premulRgba.data() +
-                                static_cast<std::size_t>(py - by0) * static_cast<std::size_t>(bgLayer.width) * 4u;
-                            if (optPremulLayer) {
-                                const float* srcRow = optPremulLayer->premulRgba.data() +
-                                    static_cast<std::size_t>(py - optPremulLayer->originY) *
-                                        static_cast<std::size_t>(optPremulLayer->width) * 4u;
-                                for (int px = bx0; px < bx1; ++px) {
-                                    const float* sp = srcRow + static_cast<std::size_t>(px - optPremulLayer->originX) * 4u;
-                                    float* dp = dstRow + static_cast<std::size_t>(px - bx0) * 4u;
-                                    dp[0] = sp[0];
-                                    dp[1] = sp[1];
-                                    dp[2] = sp[2];
-                                    dp[3] = sp[3];
-                                }
-                            } else {
-                                const std::uint8_t* srcRow = outRgba8 +
-                                    static_cast<std::size_t>(py) * viewportWidth * 4u;
-                                for (int px = bx0; px < bx1; ++px) {
-                                    const std::uint8_t* sp = srcRow + static_cast<std::size_t>(px) * 4u;
-                                    float* dp = dstRow + static_cast<std::size_t>(px - bx0) * 4u;
-                                    dp[0] = static_cast<float>(sp[0]) / 255.0f;
-                                    dp[1] = static_cast<float>(sp[1]) / 255.0f;
-                                    dp[2] = static_cast<float>(sp[2]) / 255.0f;
-                                    dp[3] = static_cast<float>(sp[3]) / 255.0f;
-                                }
-                            }
-                        }
-                        SeparableBoxBlurPremul3Pass(bgLayer, boxR);
-                        const AxbMtsdfPathEntry* maskEntry = (span.maskMtsdfHash != 0u)
-                            ? AxbTemplateRegistry::Instance().FindMtsdfPath(span.maskMtsdfHash)
-                            : nullptr;
-                        int mx0 = std::clamp(SafeFloorToInt(mr.x, surfX0, surfX1), bx0, bx1);
-                        int my0 = std::clamp(SafeFloorToInt(mr.y, surfY0, surfY1), by0, by1);
-                        int mx1 = std::clamp(SafeCeilToInt(mr.x + mr.width, surfX0, surfX1), bx0, bx1);
-                        int my1 = std::clamp(SafeCeilToInt(mr.y + mr.height, surfY0, surfY1), by0, by1);
-                        if (span.clipActive) {
-                            if (!std::isfinite(span.clipRect.x) || !std::isfinite(span.clipRect.y) ||
-                                !std::isfinite(span.clipRect.width) || !std::isfinite(span.clipRect.height)) {
-                                mx1 = mx0;
-                            } else {
-                                mx0 = std::max(mx0, SafeFloorToInt(span.clipRect.x, surfX0, surfX1));
-                                my0 = std::max(my0, SafeFloorToInt(span.clipRect.y, surfY0, surfY1));
-                                mx1 = std::min(mx1, SafeCeilToInt(span.clipRect.x + std::max(0.0f, span.clipRect.width), surfX0, surfX1));
-                                my1 = std::min(my1, SafeCeilToInt(span.clipRect.y + std::max(0.0f, span.clipRect.height), surfY0, surfY1));
-                            }
-                        }
-                        const float screenScale = std::max(1.0f, 0.5f * (mr.width / std::max(1.0f, maskEntry ? maskEntry->boundsW : mr.width) +
-                                                                         mr.height / std::max(1.0f, maskEntry ? maskEntry->boundsH : mr.height)));
-                        for (int py = my0; py < my1; ++py) {
-                            const float normY = ((static_cast<float>(py) + 0.5f) - mr.y) / std::max(1.0f, mr.height);
-                            const float* blurRow = bgLayer.premulRgba.data() +
-                                static_cast<std::size_t>(py - by0) * static_cast<std::size_t>(bgLayer.width) * 4u;
-                            for (int px = mx0; px < mx1; ++px) {
-                                const float normX = ((static_cast<float>(px) + 0.5f) - mr.x) / std::max(1.0f, mr.width);
-                                float cov = 1.0f;
-                                if (maskEntry) {
-                                    cov = EvaluateMtsdfCoverage(*maskEntry, normX, normY, screenScale, 0.0f, false);
-                                }
-                                const float effMask = std::clamp(cov * span.maskOpacity, 0.0f, 1.0f);
-                                if (effMask <= 0.002f) continue;
-                                const float* bp = blurRow + static_cast<std::size_t>(px - bx0) * 4u;
-                                const float pa = std::clamp(bp[3] * effMask, 0.0f, 1.0f);
-                                if (pa <= 0.001f) continue;
-                                const float pr = bp[0] * effMask;
-                                const float pg = bp[1] * effMask;
-                                const float pb = bp[2] * effMask;
-                                if (optPremulLayer) {
-                                    BlendPremulOver(*optPremulLayer, px, py, pr, pg, pb, pa);
-                                } else {
-                                    std::uint8_t* dst = outRgba8 +
-                                        (static_cast<std::size_t>(py) * viewportWidth + static_cast<std::size_t>(px)) * 4u;
-                                    const float invA = 1.0f - pa;
-                                    dst[0] = static_cast<std::uint8_t>(
-                                        std::clamp(pr * 255.0f + static_cast<float>(dst[0]) * invA + 0.5f, 0.0f, 255.0f));
-                                    dst[1] = static_cast<std::uint8_t>(
-                                        std::clamp(pg * 255.0f + static_cast<float>(dst[1]) * invA + 0.5f, 0.0f, 255.0f));
-                                    dst[2] = static_cast<std::uint8_t>(
-                                        std::clamp(pb * 255.0f + static_cast<float>(dst[2]) * invA + 0.5f, 0.0f, 255.0f));
-                                    dst[3] = static_cast<std::uint8_t>(
-                                        std::clamp(pa * 255.0f + static_cast<float>(dst[3]) * invA + 0.5f, 0.0f, 255.0f));
-                                }
-                            }
-                        }
-                    }
-                }
+                ExecuteBackdropBlurSpan(span, viewportWidth, viewportHeight, outRgba8, optPremulLayer);
                 // Do NOT skip [span.firstNodeId, span.endNodeId): the frosted-glass element's own
                 // tint/border and child controls must still render on top of the blurred backdrop.
                 continue;
@@ -2533,15 +2646,54 @@ void RasterizeNodeSpanRecursive(
                         static_cast<std::size_t>(subLayer.width) * static_cast<std::size_t>(subLayer.height) * 4u,
                         0.0f);
 
-                    RasterizeNodeSpanRecursive(
-                        tree,
-                        span.firstNodeId,
-                        span.endNodeId,
-                        ioBlurCursor,
-                        viewportWidth,
-                        viewportHeight,
-                        outRgba8,
-                        &subLayer);
+                    const int savedBandY0 = gRasterBandY0;
+                    const int savedBandY1 = gRasterBandY1;
+                    gRasterBandY0 = subLayer.originY;
+                    gRasterBandY1 = subLayer.originY + subLayer.height;
+                    const std::size_t baseSubCursor = ioBlurCursor;
+                    const bool hasInnerBlurSpan =
+                        (baseSubCursor < blurSpans.size() && blurSpans[baseSubCursor].firstNodeId < span.endNodeId);
+                    const bool canParallelSub =
+                        !gInScanlineBand &&
+                        !hasInnerBlurSpan &&
+                        (static_cast<std::size_t>(subLayer.width) * static_cast<std::size_t>(subLayer.height) >= 16384u) &&
+                        (span.endNodeId - span.firstNodeId >= 4u) &&
+                        (subLayer.height >= 64);
+                    if (canParallelSub) {
+                        std::size_t endSubCursor = baseSubCursor;
+                        ScanlineWorkerPool::Instance().ParallelBands4(
+                            subLayer.height,
+                            [&](int relY0, int relY1) {
+                                const int p0 = gRasterBandY0;
+                                const int p1 = gRasterBandY1;
+                                gRasterBandY0 = subLayer.originY + relY0;
+                                gRasterBandY1 = subLayer.originY + relY1;
+                                std::size_t localC = baseSubCursor;
+                                RasterizeNodeSpanRecursive(
+                                    tree,
+                                    span.firstNodeId,
+                                    span.endNodeId,
+                                    localC,
+                                    viewportWidth,
+                                    viewportHeight,
+                                    outRgba8,
+                                    &subLayer);
+                                if (relY0 == 0) {
+                                    endSubCursor = localC;
+                                }
+                                gRasterBandY0 = p0;
+                                gRasterBandY1 = p1;
+                            });
+                        ioBlurCursor = endSubCursor;
+                        while (ioBlurCursor < blurSpans.size() && blurSpans[ioBlurCursor].firstNodeId < span.endNodeId) {
+                            ++ioBlurCursor;
+                        }
+                    } else {
+                        RasterizeNodeSpanRecursive(
+                            tree, span.firstNodeId, span.endNodeId, ioBlurCursor, viewportWidth, viewportHeight, outRgba8, &subLayer);
+                    }
+                    gRasterBandY0 = savedBandY0;
+                    gRasterBandY1 = savedBandY1;
 
                     if (span.effectMode == UIEffectKind::Pixelate) {
                         const int blockSz = std::max(2, static_cast<int>(std::lround(span.radiusPx)));
@@ -2603,6 +2755,10 @@ void RasterizeNodeSpanRecursive(
                         compY0 = std::max(compY0, optPremulLayer->originY);
                         compX1 = std::min(compX1, optPremulLayer->originX + optPremulLayer->width);
                         compY1 = std::min(compY1, optPremulLayer->originY + optPremulLayer->height);
+                    }
+                    if (gInScanlineBand) {
+                        compY0 = std::max(compY0, gRasterBandY0);
+                        compY1 = std::min(compY1, gRasterBandY1);
                     }
 
                     for (int py = compY0; py < compY1; ++py) {
@@ -2682,6 +2838,8 @@ void ZeroCopyGpuStream::BindExternalMappedRing(void* mappedPtr, std::size_t capa
         ringCapacityBytes_ = ownedRingStorage_.size();
         maxPagesInRing_ = ringCapacityBytes_ / kPageVertexBytes;
     }
+    cachedBatchTreeId_ = 0u;
+    cachedBatchPageCount_ = 0u;
     try {
         prevUploadedBytes_.assign(maxPagesInRing_, kPageVertexBytes);
     } catch (...) {
@@ -2781,9 +2939,23 @@ ZeroCopySubmissionStats ZeroCopyGpuStream::SubmitDirtyPages(PagedRenderTree& tre
             stats.bytesStreamed += activeBytes;
         }
 
+        // Fast O(1) clean-frame short-circuit: if zero pages were dirty and tree topology matches, reuse cached draw batches!
+        if (candidateCount == 0u &&
+            !fullRingReupload &&
+            cachedBatchTreeId_ == tree.TreeId() &&
+            cachedBatchPageCount_ == totalTreePages &&
+            (tree.NodeCount() == 0u) == clipDrawBatches_.empty()) {
+            stats.drawCallCount = clipDrawBatches_.size();
+            lastStats_ = stats;
+            tree.ClearDirtyPages();
+            return stats;
+        }
+
         // Coalesce strictly contiguous CommandPages sharing identical scissor clip & texture state into UberShader draw batches,
         // accounting for fixed 168-vertex page stride across multi-page spans so trailing quads are never truncated.
         clipDrawBatches_.clear();
+        cachedBatchTreeId_ = tree.TreeId();
+        cachedBatchPageCount_ = totalTreePages;
         if (tree.NodeCount() > 0 && totalTreePages > 0) {
             if (totalTreePages > clipDrawBatches_.capacity()) {
                 clipDrawBatches_.reserve(totalTreePages);
@@ -2861,37 +3033,103 @@ void ZeroCopyGpuStream::RasterizeTreeToRgba8(
     }
 
     const std::uint32_t clearPacked = PackColorRgba8(clearColor, 1.0f);
-    const auto cr = static_cast<std::uint8_t>(clearPacked & 0xFFu);
-    const auto cg = static_cast<std::uint8_t>((clearPacked >> 8u) & 0xFFu);
-    const auto cb = static_cast<std::uint8_t>((clearPacked >> 16u) & 0xFFu);
-    const auto ca = static_cast<std::uint8_t>((clearPacked >> 24u) & 0xFFu);
-    for (std::size_t i = 0; i < pixelCount; ++i) {
-        outRgba8[i * 4u + 0u] = cr;
-        outRgba8[i * 4u + 1u] = cg;
-        outRgba8[i * 4u + 2u] = cb;
-        outRgba8[i * 4u + 3u] = ca;
+    const std::uint8_t cr = static_cast<std::uint8_t>(clearPacked & 0xFFu);
+    const std::uint8_t cg = static_cast<std::uint8_t>((clearPacked >> 8u) & 0xFFu);
+    const std::uint8_t cb = static_cast<std::uint8_t>((clearPacked >> 16u) & 0xFFu);
+    const std::uint8_t ca = static_cast<std::uint8_t>((clearPacked >> 24u) & 0xFFu);
+    if (cr == cg && cg == cb && cb == ca) {
+        std::memset(outRgba8.data(), cr, outRgba8.size());
+    } else {
+        const std::uint8_t clearRgba[4]{cr, cg, cb, ca};
+        std::uint8_t* dst = outRgba8.data();
+        for (std::size_t i = 0u; i < pixelCount; ++i) {
+            std::memcpy(dst + i * 4u, clearRgba, 4u);
+        }
     }
 
-    if (!UiResourceContext::HasActiveThreadOverride() &&
-        tree.BlurLayerSpans().empty() &&
-        pixelCount >= 16384u &&
-        tree.NodeCount() >= 8u &&
-        viewportHeight >= 64u) {
+    const std::uint32_t nNodes = static_cast<std::uint32_t>(tree.NodeCount());
+    if (nNodes == 0u) {
+        return;
+    }
+
+    if (pixelCount >= 16384u && viewportHeight >= 64u) {
         std::uint8_t* rawOut = outRgba8.data();
-        const std::uint32_t nNodes = static_cast<std::uint32_t>(tree.NodeCount());
-        ScanlineWorkerPool::Instance().ParallelBands4(
-            static_cast<int>(viewportHeight),
-            [&](int y0, int y1) {
-                const int prevY0 = gRasterBandY0;
-                const int prevY1 = gRasterBandY1;
-                gRasterBandY0 = y0;
-                gRasterBandY1 = y1;
-                std::size_t localBlurCursor = 0u;
-                RasterizeNodeSpanRecursive(
-                    tree, 0u, nNodes, localBlurCursor, viewportWidth, viewportHeight, rawOut, nullptr);
-                gRasterBandY0 = prevY0;
-                gRasterBandY1 = prevY1;
-            });
+        const auto& blurSpans = tree.BlurLayerSpans();
+        auto runParallelNodeSlice = [&](std::uint32_t sliceStart, std::uint32_t sliceEnd, std::size_t startCursor) {
+            if (sliceEnd <= sliceStart) return;
+            if (sliceEnd - sliceStart < 2u && pixelCount < 65536u) {
+                std::size_t c = startCursor;
+                RasterizeNodeSpanRecursive(tree, sliceStart, sliceEnd, c, viewportWidth, viewportHeight, rawOut, nullptr);
+                return;
+            }
+            ScanlineWorkerPool::Instance().ParallelBands4(
+                static_cast<int>(viewportHeight),
+                [&](int y0, int y1) {
+                    const int prevY0 = gRasterBandY0;
+                    const int prevY1 = gRasterBandY1;
+                    gRasterBandY0 = y0;
+                    gRasterBandY1 = y1;
+                    std::size_t localBlurCursor = startCursor;
+                    RasterizeNodeSpanRecursive(
+                        tree, sliceStart, sliceEnd, localBlurCursor, viewportWidth, viewportHeight, rawOut, nullptr);
+                    gRasterBandY0 = prevY0;
+                    gRasterBandY1 = prevY1;
+                });
+        };
+
+        if (blurSpans.empty()) {
+            runParallelNodeSlice(0u, nNodes, 0u);
+            return;
+        }
+
+        // Partition top-level execution at BlurLayerSpans so non-blur ranges run across all 4 parallel bands,
+        // each Blur span executes coherently once, and each BackdropBlur executes before its node range
+        // while still allowing child nodes inside frosted containers to run in parallel bands.
+        std::uint32_t curNode = 0u;
+        std::size_t cursor = 0u;
+        while (curNode < nNodes) {
+            while (cursor < blurSpans.size() &&
+                   (blurSpans[cursor].firstNodeId < curNode ||
+                    (blurSpans[cursor].endNodeId <= curNode &&
+                     blurSpans[cursor].effectMode != UIEffectKind::BackdropBlur))) {
+                ++cursor;
+            }
+            if (cursor >= blurSpans.size()) {
+                runParallelNodeSlice(curNode, nNodes, cursor);
+                break;
+            }
+            const BlurLayerSpan& nextSpan = blurSpans[cursor];
+            if (nextSpan.firstNodeId > curNode) {
+                runParallelNodeSlice(curNode, std::min(nextSpan.firstNodeId, nNodes), cursor);
+                curNode = std::min(nextSpan.firstNodeId, nNodes);
+                if (curNode >= nNodes) break;
+            }
+            if (nextSpan.firstNodeId <= curNode) {
+                if (nextSpan.effectMode == UIEffectKind::BackdropBlur) {
+                    ExecuteBackdropBlurSpan(nextSpan, viewportWidth, viewportHeight, rawOut, nullptr);
+                    ++cursor;
+                    continue;
+                }
+                if (nextSpan.endNodeId <= curNode ||
+                    !std::isfinite(nextSpan.radiusPx) ||
+                    nextSpan.radiusPx <= 0.25f) {
+                    ++cursor;
+                    continue;
+                }
+                const std::uint32_t spanStop = std::min(nextSpan.endNodeId, nNodes);
+                std::size_t stepCursor = cursor;
+                RasterizeNodeSpanRecursive(tree, curNode, spanStop, stepCursor, viewportWidth, viewportHeight, rawOut, nullptr);
+                curNode = spanStop;
+                cursor = stepCursor;
+            }
+        }
+        while (cursor < blurSpans.size()) {
+            if (blurSpans[cursor].effectMode == UIEffectKind::BackdropBlur &&
+                blurSpans[cursor].firstNodeId <= nNodes) {
+                ExecuteBackdropBlurSpan(blurSpans[cursor], viewportWidth, viewportHeight, rawOut, nullptr);
+            }
+            ++cursor;
+        }
         return;
     }
 
@@ -2899,7 +3137,7 @@ void ZeroCopyGpuStream::RasterizeTreeToRgba8(
     RasterizeNodeSpanRecursive(
         tree,
         0u,
-        static_cast<std::uint32_t>(tree.NodeCount()),
+        nNodes,
         blurCursor,
         viewportWidth,
         viewportHeight,

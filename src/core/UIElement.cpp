@@ -1494,7 +1494,7 @@ UIElement* UIElement::FindNamescopeRoot(UIElement* elem) noexcept {
 }
 
 UIElement* UIElement::HitTest(Point point) noexcept {
-    if (GetVisibility() != Visibility::Visible || GetOpacity() <= 0.0f) {
+    if (!isHitTestVisible_ || GetVisibility() != Visibility::Visible || GetOpacity() <= 0.0f) {
         return nullptr;
     }
     if (const auto* pop = DynamicCast<Popup>(); pop && !pop->IsOpen()) {
@@ -2769,6 +2769,7 @@ bool Button::PerformClick(RuntimeError* error) {
     }
     IntrusivePtr<Button> selfGuard(this, true);
     ++clickGeneration_;
+    NotifyBubbledClick();
     if (clickCallback_) {
         clickCallback_(*this);
     }
@@ -2866,6 +2867,10 @@ bool Button::OnPointerDown(
     (void)modifiers;
     if (button == PointerButton::Left && IsEffectivelyEnabled()) {
         outRequestCapture = true;
+        const UnifiedValue cmVal = GetValue(PropId_ClickMode);
+        if (const auto* iv = std::get_if<std::int64_t>(&cmVal); iv && *iv == 1) {
+            (void)ActivateFromInput();
+        }
         return true;
     }
     outRequestCapture = false;
@@ -2880,6 +2885,10 @@ bool Button::OnPointerUp(
     (void)localPoint;
     (void)modifiers;
     if (button == PointerButton::Left && insideBounds && IsEffectivelyEnabled()) {
+        const UnifiedValue cmVal = GetValue(PropId_ClickMode);
+        if (const auto* iv = std::get_if<std::int64_t>(&cmVal); iv && (*iv == 1 || *iv == 2)) {
+            return true;
+        }
         return ActivateFromInput();
     }
     return false;

@@ -137,6 +137,8 @@ private:
     std::uint8_t* mappedRingBase_ = nullptr;
     std::vector<GlBufferSubDataSpan> subDataSpans_;
     std::vector<GpuClipDrawBatch> clipDrawBatches_;
+    std::uint32_t cachedBatchTreeId_ = 0u;
+    std::size_t cachedBatchPageCount_ = 0u;
     ZeroCopySubmissionStats lastStats_{};
 };
 

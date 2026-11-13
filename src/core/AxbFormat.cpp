@@ -1281,6 +1281,28 @@ std::uint16_t ResolveBuiltinPropertyId(std::string_view propertyName) noexcept {
     if (propertyName == "RoutedCommandName") {
         return PropId_RoutedCommandName;
     }
+    if (propertyName == "TabIndex" || propertyName == "KeyboardNavigation.TabIndex") {
+        return PropId_TabIndex;
+    }
+    if (propertyName == "KeyBindingsSpec") {
+        return PropId_KeyBindingsSpec;
+    }
+    if (propertyName == "SelectedValuePath") {
+        return PropId_SelectedValuePath;
+    }
+    if (propertyName == "SelectedValue") {
+        return PropId_SelectedItem;
+    }
+    if (propertyName == "Offset") {
+        return PropId_Value;
+    }
+    if (propertyName == "Storyboard.TargetName" || propertyName == "TargetName") {
+        return PropId_Header;
+    }
+    if (propertyName == "Selector.IsSelected" || propertyName == "ListBoxItem.IsSelected" ||
+        propertyName == "TreeViewItem.IsSelected" || propertyName == "ListViewItem.IsSelected") {
+        return PropId_IsChecked;
+    }
     return PropId_Tag;
 }
 
@@ -2791,6 +2813,7 @@ UnifiedValue ParseBuiltinLiteralPropertyValue(
         case PropId_ZIndex:
         case PropId_AlternationCount:
         case PropId_AlternationIndex:
+        case PropId_TabIndex:
         case PropId_CustomIndexInt32:
         case PropId_CustomStateInt32: {
             std::int64_t iv = 0;
@@ -2885,6 +2908,120 @@ UnifiedValue ParseBuiltinLiteralPropertyValue(
 
         default:
             return value::FromString(DecodeXamlXmlEntities(rawValue));
+    }
+}
+
+rs_rt::NativeHandleRegistry& FallbackVisualHandleRegistry() noexcept {
+    static rs_rt::NativeHandleRegistry sReg;
+    return sReg;
+}
+
+std::string FormatColorHexArgb(const Color& c) {
+    const auto toByte = [](float v) -> unsigned int {
+        return static_cast<unsigned int>(std::clamp(std::lround(v * 255.0f), 0L, 255L));
+    };
+    char buf[16]{};
+    std::snprintf(buf, sizeof(buf), "#%02X%02X%02X%02X", toByte(c.a), toByte(c.r), toByte(c.g), toByte(c.b));
+    return std::string(buf);
+}
+
+KeyCode ParseXamlKeyCode(std::string_view raw) noexcept {
+    std::string_view s = TrimWs(raw);
+    if (const auto dot = s.rfind('.'); dot != std::string_view::npos) {
+        s = s.substr(dot + 1u);
+    }
+    if (s.size() == 1u) {
+        const char ch = static_cast<char>(std::toupper(static_cast<unsigned char>(s[0])));
+        if (ch >= 'A' && ch <= 'Z') {
+            return static_cast<KeyCode>(static_cast<std::uint16_t>(KeyCode::A) + static_cast<std::uint16_t>(ch - 'A'));
+        }
+        if (ch >= '0' && ch <= '9') {
+            return static_cast<KeyCode>(static_cast<std::uint16_t>(KeyCode::D0) + static_cast<std::uint16_t>(ch - '0'));
+        }
+    }
+    if (s.size() == 2u && (s[0] == 'D' || s[0] == 'd') && s[1] >= '0' && s[1] <= '9') {
+        return static_cast<KeyCode>(static_cast<std::uint16_t>(KeyCode::D0) + static_cast<std::uint16_t>(s[1] - '0'));
+    }
+    if ((s.size() == 2u || s.size() == 3u) && (s[0] == 'F' || s[0] == 'f')) {
+        int fn = 0;
+        for (std::size_t i = 1u; i < s.size(); ++i) {
+            if (!std::isdigit(static_cast<unsigned char>(s[i]))) { fn = 0; break; }
+            fn = fn * 10 + (s[i] - '0');
+        }
+        if (fn >= 1 && fn <= 12) {
+            return static_cast<KeyCode>(static_cast<std::uint16_t>(KeyCode::F1) + static_cast<std::uint16_t>(fn - 1));
+        }
+    }
+    if (EqualsIgnoreCase(s, "Tab")) return KeyCode::Tab;
+    if (EqualsIgnoreCase(s, "Enter") || EqualsIgnoreCase(s, "Return")) return KeyCode::Enter;
+    if (EqualsIgnoreCase(s, "Space")) return KeyCode::Space;
+    if (EqualsIgnoreCase(s, "Escape") || EqualsIgnoreCase(s, "Esc")) return KeyCode::Escape;
+    if (EqualsIgnoreCase(s, "Back") || EqualsIgnoreCase(s, "Backspace")) return KeyCode::Backspace;
+    if (EqualsIgnoreCase(s, "Delete") || EqualsIgnoreCase(s, "Del")) return KeyCode::Delete;
+    if (EqualsIgnoreCase(s, "Left")) return KeyCode::Left;
+    if (EqualsIgnoreCase(s, "Right")) return KeyCode::Right;
+    if (EqualsIgnoreCase(s, "Up")) return KeyCode::Up;
+    if (EqualsIgnoreCase(s, "Down")) return KeyCode::Down;
+    if (EqualsIgnoreCase(s, "Home")) return KeyCode::Home;
+    if (EqualsIgnoreCase(s, "End")) return KeyCode::End;
+    if (EqualsIgnoreCase(s, "PageUp") || EqualsIgnoreCase(s, "Prior")) return KeyCode::PageUp;
+    if (EqualsIgnoreCase(s, "PageDown") || EqualsIgnoreCase(s, "Next")) return KeyCode::PageDown;
+    return KeyCode::None;
+}
+
+std::uint8_t ParseXamlKeyModifiers(std::string_view raw) noexcept {
+    std::uint8_t mask = KeyMod_None;
+    std::size_t pos = 0u;
+    while (pos < raw.size()) {
+        while (pos < raw.size() && (raw[pos] == '+' || raw[pos] == ',' || raw[pos] == '|' ||
+                                    std::isspace(static_cast<unsigned char>(raw[pos])))) {
+            ++pos;
+        }
+        if (pos >= raw.size()) break;
+        std::size_t end = pos;
+        while (end < raw.size() && raw[end] != '+' && raw[end] != ',' && raw[end] != '|' &&
+               !std::isspace(static_cast<unsigned char>(raw[end]))) {
+            ++end;
+        }
+        std::string_view tok = raw.substr(pos, end - pos);
+        if (const auto dot = tok.rfind('.'); dot != std::string_view::npos) {
+            tok = tok.substr(dot + 1u);
+        }
+        if (EqualsIgnoreCase(tok, "Ctrl") || EqualsIgnoreCase(tok, "Control")) mask |= KeyMod_Ctrl;
+        else if (EqualsIgnoreCase(tok, "Shift")) mask |= KeyMod_Shift;
+        else if (EqualsIgnoreCase(tok, "Alt") || EqualsIgnoreCase(tok, "Menu")) mask |= KeyMod_Alt;
+        pos = end;
+    }
+    return mask;
+}
+
+std::string KeyCodeToName(KeyCode key) {
+    const auto kv = static_cast<std::uint16_t>(key);
+    if (kv >= static_cast<std::uint16_t>(KeyCode::A) && kv <= static_cast<std::uint16_t>(KeyCode::Z)) {
+        return std::string(1u, static_cast<char>('A' + (kv - static_cast<std::uint16_t>(KeyCode::A))));
+    }
+    if (kv >= static_cast<std::uint16_t>(KeyCode::D0) && kv <= static_cast<std::uint16_t>(KeyCode::D9)) {
+        return "D" + std::to_string(kv - static_cast<std::uint16_t>(KeyCode::D0));
+    }
+    if (kv >= static_cast<std::uint16_t>(KeyCode::F1) && kv <= static_cast<std::uint16_t>(KeyCode::F12)) {
+        return "F" + std::to_string(1 + kv - static_cast<std::uint16_t>(KeyCode::F1));
+    }
+    switch (key) {
+        case KeyCode::Tab: return "Tab";
+        case KeyCode::Enter: return "Enter";
+        case KeyCode::Space: return "Space";
+        case KeyCode::Escape: return "Escape";
+        case KeyCode::Backspace: return "Backspace";
+        case KeyCode::Delete: return "Delete";
+        case KeyCode::Left: return "Left";
+        case KeyCode::Right: return "Right";
+        case KeyCode::Up: return "Up";
+        case KeyCode::Down: return "Down";
+        case KeyCode::Home: return "Home";
+        case KeyCode::End: return "End";
+        case KeyCode::PageUp: return "PageUp";
+        case KeyCode::PageDown: return "PageDown";
+        default: return "None";
     }
 }
 
@@ -3275,8 +3412,17 @@ AxbMtsdfPathEntry BakeSvgPathToMtsdfEntry(
         float rowDySq = 0.0f;
         std::uint32_t segIdx = 0u;
     };
+    struct PrecomputedRowCross {
+        float ax = 0.0f;
+        float ay = 0.0f;
+        float dx = 0.0f;
+        float dy = 0.0f;
+        float dySvg = 0.0f;
+        float xIntersect = 0.0f;
+        bool upward = true;
+    };
     std::vector<RowSegEntry> rowOrder(preparedSegs.size());
-    std::vector<ClosedSvgEdge> rowCrossEdges;
+    std::vector<PrecomputedRowCross> rowCrossEdges;
     rowCrossEdges.reserve(32u);
 
     for (std::uint16_t py = 0; py < safeCell; ++py) {
@@ -3287,7 +3433,12 @@ AxbMtsdfPathEntry BakeSvgPathToMtsdfEntry(
         if (anyClosedContour) {
             for (const auto& e : closedEdges) {
                 if ((e.a.y <= svgY && e.b.y > svgY) || (e.b.y <= svgY && e.a.y > svgY)) {
-                    rowCrossEdges.push_back(e);
+                    const float dx = e.b.x - e.a.x;
+                    const float dy = e.b.y - e.a.y;
+                    const float dySvg = svgY - e.a.y;
+                    const float vt = dySvg / dy;
+                    rowCrossEdges.push_back(PrecomputedRowCross{
+                        e.a.x, e.a.y, dx, dy, dySvg, e.a.x + vt * dx, (e.a.y <= svgY)});
                 }
             }
         }
@@ -3312,19 +3463,14 @@ AxbMtsdfPathEntry BakeSvgPathToMtsdfEntry(
                 int winding = 0;
                 int crossings = 0;
                 for (const auto& e : rowCrossEdges) {
-                    const float vt = (svgY - e.a.y) / (e.b.y - e.a.y);
-                    const float xIntersect = e.a.x + vt * (e.b.x - e.a.x);
-                    if (svgX < xIntersect) {
+                    if (svgX < e.xIntersect) {
                         ++crossings;
                     }
-                    if (e.a.y <= svgY) {
-                        if (((e.b.x - e.a.x) * (svgY - e.a.y) - (svgX - e.a.x) * (e.b.y - e.a.y)) > 0.0f) {
-                            ++winding;
-                        }
+                    const float side = e.dx * e.dySvg - (svgX - e.ax) * e.dy;
+                    if (e.upward) {
+                        if (side > 0.0f) ++winding;
                     } else {
-                        if (((e.b.x - e.a.x) * (svgY - e.a.y) - (svgX - e.a.x) * (e.b.y - e.a.y)) < 0.0f) {
-                            --winding;
-                        }
+                        if (side < 0.0f) --winding;
                     }
                 }
                 inside = geom.nonZeroFill ? (winding != 0) : ((crossings & 1) != 0);
@@ -3337,7 +3483,9 @@ AxbMtsdfPathEntry BakeSvgPathToMtsdfEntry(
                 float minDistSq = 1e30f;
                 float bestOrtho = 1e30f;
                 float pseudoDist = 1e30f;
+                float signFactor = 1.0f;
                 std::uint32_t origIdx = 0xFFFFFFFFu;
+                bool inInteriorProj = false;
                 bool found = false;
             };
             ChannelBest chBest[3]{};
@@ -3390,9 +3538,9 @@ AxbMtsdfPathEntry BakeSvgPathToMtsdfEntry(
                             chBest[c].minDistSq = distSq;
                             chBest[c].bestOrtho = orthoScore;
                             chBest[c].origIdx = seg.origIdx;
-                            chBest[c].pseudoDist = (proj >= 0.0f && proj <= 1.0f)
-                                ? (std::sqrt(distSq) * sampleOnLeft * seg.leftSign)
-                                : pseudoSigned;
+                            chBest[c].inInteriorProj = (proj >= 0.0f && proj <= 1.0f);
+                            chBest[c].signFactor = sampleOnLeft * seg.leftSign;
+                            chBest[c].pseudoDist = pseudoSigned;
                         }
                     }
                 }
@@ -3409,6 +3557,11 @@ AxbMtsdfPathEntry BakeSvgPathToMtsdfEntry(
             float bDist = -safeRange;
 
             if (anyClosedContour) {
+                for (int c = 0; c < 3; ++c) {
+                    if (chBest[c].found && chBest[c].inInteriorProj) {
+                        chBest[c].pseudoDist = std::sqrt(chBest[c].minDistSq) * chBest[c].signFactor;
+                    }
+                }
                 rDist = chBest[0].found ? chBest[0].pseudoDist : trueSignedDist;
                 gDist = chBest[1].found ? chBest[1].pseudoDist : trueSignedDist;
                 bDist = chBest[2].found ? chBest[2].pseudoDist : trueSignedDist;

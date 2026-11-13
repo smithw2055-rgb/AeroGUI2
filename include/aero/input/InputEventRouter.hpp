@@ -102,6 +102,7 @@ public:
     bool DispatchKeyDown(KeyCode key, std::uint8_t modifiers = KeyMod_None);
     bool DispatchKeyUp(KeyCode key, std::uint8_t modifiers = KeyMod_None);
     bool DispatchTextInput(std::string_view utf8Text);
+    void Tick(float dtSeconds);
 
     // Pointer capture & active visual target inspection
     void CapturePointer(UIElement* element) noexcept;
@@ -128,6 +129,7 @@ private:
     void SyncImeFocusState();
     void CloseActiveComboBoxIfOpen();
     void CloseActiveContextMenuIfOpen();
+    void CloseActiveToolTipIfOpen() noexcept;
 
     UIElement* rootVisual_ = nullptr;
     ITextInputMethodHost* imeHost_ = nullptr;
@@ -138,6 +140,10 @@ private:
     IntrusivePtr<UIElement> focusedElement_{};
     IntrusivePtr<ComboBox> openComboBox_{};
     IntrusivePtr<ContextMenu> openContextMenu_{};
+    IntrusivePtr<ToolTip> activeToolTip_{};
+    IntrusivePtr<UIElement> activeToolTipOwner_{};
+    float repeatHoldElapsedMs_ = 0.0f;
+    float repeatNextFireMs_ = 0.0f;
 
     Point lastPointerPos_{0.0f, 0.0f};
     std::array<QueuedInputEvent, kEventQueueCapacity> eventRing_{};
