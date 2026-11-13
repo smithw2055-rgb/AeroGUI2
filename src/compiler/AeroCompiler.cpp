@@ -705,6 +705,8 @@ struct ParsedBindingClause {
     BindingMode mode = BindingMode::OneWay;
     std::string_view pathPart;
     std::string_view fallbackValue;
+    bool hasTargetNullValue = false;
+    std::string_view targetNullValue;
     std::string_view elementName;
     std::string relativeAncestorType;
     bool relativeSelf = false;
@@ -852,6 +854,13 @@ ParsedBindingClause ParseBindingMarkupExpression(std::string_view rawExpr) {
                 fv = fv.substr(1u, fv.size() - 2u);
             }
             out.fallbackValue = fv;
+        } else if (clause.rfind("TargetNullValue=", 0) == 0) {
+            std::string_view tnv = Trim(clause.substr(16u));
+            if (tnv.size() >= 2u && tnv.front() == '\'' && tnv.back() == '\'') {
+                tnv = tnv.substr(1u, tnv.size() - 2u);
+            }
+            out.hasTargetNullValue = true;
+            out.targetNullValue = tnv;
         } else if (clause.rfind("ElementName=", 0) == 0) {
             out.elementName = Trim(clause.substr(12u));
         } else if (clause.rfind("Source=", 0) == 0) {
@@ -2808,6 +2817,9 @@ AeroCompileResult AeroCompiler::CompileInternal(
                     ioKind = ValueConverterKind::InverseBooleanToVisibility;
                 } else if (sv->view() == "__aero_builtin_conv__:InverseBoolean") {
                     ioKind = ValueConverterKind::InverseBoolean;
+                } else if (sv->view().rfind("__aero_script_conv__:", 0) == 0) {
+                    ioKind = ValueConverterKind::CustomScriptOrHost;
+                    ioKey = std::string(sv->view().substr(21u));
                 }
             }
         }
@@ -2916,11 +2928,18 @@ AeroCompileResult AeroCompiler::CompileInternal(
             isSelfDcBind;
         const std::string_view effPathPart = isSelfDcBind ? std::string_view("DataContext") : parsedBind.pathPart;
 
+        UnifiedValue parsedTargetNull{};
+        if (parsedBind.hasTargetNullValue) {
+            parsedTargetNull = parsedBind.targetNullValue.empty()
+                ? value::FromString("")
+                : ParseLiteralPropertyValue(targetPropId, parsedBind.targetNullValue);
+        }
         AxbCompiledBindingChain chain{};
         chain.rawPath = std::string(effPathPart);
         chain.targetPropertyId = targetPropId;
         chain.mode = parsedBind.mode;
         chain.fallbackValue = std::move(parsedFallback);
+        chain.targetNullValue = std::move(parsedTargetNull);
         chain.elementName = std::string(parsedBind.elementName);
         chain.relativeAncestorType = parsedBind.relativeAncestorType;
         chain.relativeSelf = parsedBind.relativeSelf || isSelfDcBind;
@@ -3935,6 +3954,7 @@ AeroCompileResult AeroCompiler::CompileInternal(
         std::string_view xName;
         std::string_view xKey;
         bool selfClosing = false;
+        bool closedTagBracket = false;
 
         while (pos < src.size()) {
             while (pos < src.size() && std::isspace(static_cast<unsigned char>(src[pos]))) {
@@ -3942,10 +3962,12 @@ AeroCompileResult AeroCompiler::CompileInternal(
             }
             if (pos >= src.size()) break;
             if (src[pos] == '>') {
+                closedTagBracket = true;
                 ++pos;
                 break;
             }
             if (src.substr(pos, 2) == "/>") {
+                closedTagBracket = true;
                 selfClosing = true;
                 pos += 2;
                 break;
@@ -3998,6 +4020,12 @@ AeroCompileResult AeroCompiler::CompileInternal(
                     attrs.push_back(ParsedAttr{attrName, attrVal});
                 }
             }
+        }
+        if (!closedTagBracket) {
+            result.diagnostics.push_back(
+                "AERO_XAML_SYNTAX_ERROR: Unterminated XML tag '<" + std::string(tagName) + ">'");
+            result.succeeded = false;
+            return result;
         }
 
         // Helper to push a NonVisualSkip scope and return the new scopeStack depth
@@ -4443,6 +4471,33 @@ AeroCompileResult AeroCompiler::CompileInternal(
                 continue;
             }
 
+            // Collect <CommandBinding> inside <*.CommandBindings>
+            if (shortTag == "CommandBinding") {
+                std::string cbCmd, cbExec, cbCanExec;
+                for (const auto& a : attrs) {
+                    if (a.name == "Command") {
+                        const auto pb = ParseBindingMarkupExpression(a.value);
+                        cbCmd = pb.isValidBinding ? std::string(pb.pathPart) : DecodeXamlXmlEntities(a.value);
+                    } else if (a.name == "Executed") {
+                        cbExec = std::string(Trim(a.value));
+                    } else if (a.name == "CanExecute") {
+                        cbCanExec = std::string(Trim(a.value));
+                    }
+                }
+                if (!cbCmd.empty() && (!cbExec.empty() || !cbCanExec.empty())) {
+                    const std::string rec = cbCmd + "|" + cbExec + "|" + cbCanExec;
+                    AxbInstruction cbInst{};
+                    cbInst.opcode = AxbOpcode::SetStaticProperty;
+                    cbInst.propId = PropId_CommandBindingsSpec;
+                    cbInst.literalValue = value::FromString(rec);
+                    pkg.instructions.push_back(std::move(cbInst));
+                }
+                if (!selfClosing) {
+                    (void)pushNonVisualScope();
+                }
+                continue;
+            }
+
             // Collect <GridViewColumn> inside <ListView.View><GridView>...</GridView></ListView.View>
             if (shortTag == "GridViewColumn") {
                 XmlScopeEntry* lvViewScope = nullptr;
@@ -4471,12 +4526,111 @@ AeroCompileResult AeroCompiler::CompileInternal(
                             colCellTpl = rk.empty() ? DecodeXamlXmlEntities(a.value) : std::string(rk);
                         }
                     }
+                    bool consumedFullColumn = false;
+                    if (!selfClosing) {
+                        std::size_t colInnerEnd = 0u;
+                        std::size_t colAfterClose = 0u;
+                        if (FindMatchingClosingTag(src, pos, "GridViewColumn", colInnerEnd, colAfterClose)) {
+                            const std::string_view colBody = src.substr(pos, colInnerEnd - pos);
+                            std::size_t dtPos = std::string_view::npos;
+                            {
+                                std::size_t searchPos = 0u;
+                                while (searchPos < colBody.size()) {
+                                    const std::size_t cand = colBody.find("<DataTemplate", searchPos);
+                                    if (cand == std::string_view::npos) break;
+                                    const std::size_t afterName = cand + 13u;
+                                    if (afterName >= colBody.size() ||
+                                        colBody[afterName] == '>' ||
+                                        colBody[afterName] == '/' ||
+                                        std::isspace(static_cast<unsigned char>(colBody[afterName]))) {
+                                        dtPos = cand;
+                                        break;
+                                    }
+                                    searchPos = afterName;
+                                }
+                            }
+                            if (dtPos != std::string_view::npos) {
+                                std::size_t dtTagGt = std::string_view::npos;
+                                {
+                                    char quote = '\0';
+                                    for (std::size_t k = dtPos + 13u; k < colBody.size(); ++k) {
+                                        const char c = colBody[k];
+                                        if (quote != '\0') {
+                                            if (c == quote) quote = '\0';
+                                        } else {
+                                            if (c == '\'' || c == '"') {
+                                                quote = c;
+                                            } else if (c == '>') {
+                                                dtTagGt = k;
+                                                break;
+                                            }
+                                        }
+                                    }
+                                }
+                                bool dtSelfClosing = false;
+                                if (dtTagGt != std::string_view::npos) {
+                                    std::size_t checkIdx = dtTagGt;
+                                    while (checkIdx > dtPos + 13u &&
+                                           std::isspace(static_cast<unsigned char>(colBody[checkIdx - 1u]))) {
+                                        --checkIdx;
+                                    }
+                                    dtSelfClosing = (checkIdx > dtPos + 13u && colBody[checkIdx - 1u] == '/');
+                                }
+                                if (dtTagGt != std::string_view::npos && !dtSelfClosing) {
+                                    std::size_t dtInnerEnd = 0u;
+                                    std::size_t dtAfterClose = 0u;
+                                    const std::size_t absDtAfterOpen = pos + dtTagGt + 1u;
+                                    if (FindMatchingClosingTag(src, absDtAfterOpen, "DataTemplate", dtInnerEnd, dtAfterClose)) {
+                                        const std::string_view dtInnerXml = src.substr(absDtAfterOpen, dtInnerEnd - absDtAfterOpen);
+                                        if (!Trim(dtInnerXml).empty()) {
+                                            AxbTemplateRegistry::Instance().RegisterResources(pkg);
+                                            AeroCompileInput subIn{};
+                                            subIn.xamlPath = input.xamlPath;
+                                            subIn.xamlContent = std::string(dtInnerXml);
+                                            subIn.externalXamlResolver = input.externalXamlResolver;
+                                            subIn.resourceSearchRoot = input.resourceSearchRoot;
+                                            subIn.resourceSearchPaths = input.resourceSearchPaths;
+                                            subIn.autoMergeGlobalResources = false;
+                                            AeroCompileResult subRes = this->CompileInternal(subIn, activeIncludeStack);
+                                            for (const auto& d : subRes.diagnostics) {
+                                                result.diagnostics.push_back(d);
+                                            }
+                                            if (!subRes.succeeded) {
+                                                result.succeeded = false;
+                                                return result;
+                                            }
+                                            for (const auto& mp : subRes.axbPackage.mtsdfPaths) {
+                                                if (mp.pathHash != 0 && bakedPathHashes.insert(mp.pathHash).second) {
+                                                    pkg.mtsdfPaths.push_back(mp);
+                                                }
+                                            }
+                                            const std::string genKey = "__aero_gvc_dt__:" +
+                                                pkg.className + ":" + std::to_string(pkg.dataTemplates.size());
+                                            AxbDataTemplate dt{};
+                                            dt.key = genKey;
+                                            dt.templatePackage = std::make_shared<AxbPackage>(std::move(subRes.axbPackage));
+                                            AxbTemplateRegistry::Instance().RegisterDataTemplate(dt);
+                                            pkg.dataTemplates.push_back(std::move(dt));
+                                            colCellTpl = genKey;
+                                        }
+                                    } else {
+                                        result.diagnostics.push_back(
+                                            "AERO_XAML_UNCLOSED_TAG: Unclosed <DataTemplate> in <GridViewColumn>");
+                                        result.succeeded = false;
+                                        return result;
+                                    }
+                                }
+                            }
+                            pos = colAfterClose;
+                            consumedFullColumn = true;
+                        }
+                    }
                     if (!lvViewScope->gridViewColumnsSpec.empty()) {
                         lvViewScope->gridViewColumnsSpec.push_back('\x1e');
                     }
                     lvViewScope->gridViewColumnsSpec +=
                         colHeader + "\x1f" + colWidth + "\x1f" + colBindPath + "\x1f" + colFormat + "\x1f" + colCellTpl;
-                    if (!selfClosing) {
+                    if (!selfClosing && !consumedFullColumn) {
                         (void)pushNonVisualScope();
                     }
                     continue;
@@ -4931,6 +5085,18 @@ AeroCompileResult AeroCompiler::CompileInternal(
                             bc->converterParameter = valBind.converterParameter;
                             resolveConverterResource(bc->converter, bc->converterKey);
                             bc->stringFormat = valBind.stringFormat;
+                            if (!valBind.fallbackValue.empty()) {
+                                bc->fallbackValue = (act.propId != kUnmappedPropId)
+                                    ? ParseLiteralPropertyValue(act.propId, valBind.fallbackValue)
+                                    : value::FromString(DecodeXamlXmlEntities(valBind.fallbackValue));
+                            }
+                            if (valBind.hasTargetNullValue) {
+                                bc->targetNullValue = valBind.targetNullValue.empty()
+                                    ? value::FromString("")
+                                    : ((act.propId != kUnmappedPropId)
+                                        ? ParseLiteralPropertyValue(act.propId, valBind.targetNullValue)
+                                        : value::FromString(DecodeXamlXmlEntities(valBind.targetNullValue)));
+                            }
                             if (!valBind.pathPart.empty() && valBind.pathPart != ".") {
                                 const bool hasValElemSrc = !bc->elementName.empty() ||
                                                            !bc->relativeAncestorType.empty() ||
@@ -5127,6 +5293,8 @@ AeroCompileResult AeroCompiler::CompileInternal(
                 AxbCompiledBindingChain ch{};
                 ch.targetPropertyId = insideMulti ? 0u : findEnclosingPropertyTargetId();
                 std::string_view fbRaw;
+                bool hasTnRaw = false;
+                std::string_view tnRaw{};
                 for (const auto& a : attrs) {
                     if (a.name == "Path") {
                         std::string_view pp = Trim(a.value);
@@ -5174,6 +5342,9 @@ AeroCompileResult AeroCompiler::CompileInternal(
                         ch.stringFormat = NormalizeXamlFormatOrExpr(a.value);
                     } else if (a.name == "FallbackValue") {
                         fbRaw = Trim(a.value);
+                    } else if (a.name == "TargetNullValue") {
+                        hasTnRaw = true;
+                        tnRaw = Trim(a.value);
                     }
                 }
                 if (!fbRaw.empty()) {
@@ -5181,6 +5352,15 @@ AeroCompileResult AeroCompiler::CompileInternal(
                         ch.fallbackValue = ParseLiteralPropertyValue(ch.targetPropertyId, fbRaw);
                     } else {
                         ch.fallbackValue = value::FromString(DecodeXamlXmlEntities(fbRaw));
+                    }
+                }
+                if (hasTnRaw) {
+                    if (tnRaw.empty()) {
+                        ch.targetNullValue = value::FromString("");
+                    } else if (ch.targetPropertyId != 0u && ch.targetPropertyId != kUnmappedPropId) {
+                        ch.targetNullValue = ParseLiteralPropertyValue(ch.targetPropertyId, tnRaw);
+                    } else {
+                        ch.targetNullValue = value::FromString(DecodeXamlXmlEntities(tnRaw));
                     }
                 }
                 if (selfClosing) {
@@ -5608,6 +5788,11 @@ AeroCompileResult AeroCompiler::CompileInternal(
                         sb->stringFormat = setterBind.stringFormat;
                         if (!setterBind.fallbackValue.empty()) {
                             sb->fallbackValue = ParseLiteralPropertyValue(setter.propId, setterBind.fallbackValue);
+                        }
+                        if (setterBind.hasTargetNullValue) {
+                            sb->targetNullValue = setterBind.targetNullValue.empty()
+                                ? value::FromString("")
+                                : ParseLiteralPropertyValue(setter.propId, setterBind.targetNullValue);
                         }
                         resolveConverterResource(sb->converter, sb->converterKey);
                         const bool hasSbElemSrc = !sb->elementName.empty() ||
@@ -6495,6 +6680,11 @@ AeroCompileResult AeroCompiler::CompileInternal(
                         scopeStack.push_back(std::move(itemScope));
                         ++nonVisualDepth;
                         continue;
+                    } else if (tagName.find(':') != std::string_view::npos) {
+                        UpsertPackageResource(
+                            pkg,
+                            xKey,
+                            value::FromString("__aero_script_conv__:" + std::string(shortTag)));
                     }
                 }
                 if (!selfClosing) {
@@ -6672,10 +6862,11 @@ AeroCompileResult AeroCompiler::CompileInternal(
                         pkg.instructions.push_back(std::move(setInst));
                         continue;
                     }
+                    const std::uint16_t gradTargetPropId = parentScope.targetPropId;
                     XmlScopeEntry gradScope{};
                     gradScope.kind = XmlScopeKind::BrushPropertyElement;
                     gradScope.tagName = std::string(tagName);
-                    gradScope.targetPropId = parentScope.targetPropId;
+                    gradScope.targetPropId = gradTargetPropId;
                     gradScope.brushAssigned = true;
                     scopeStack.push_back(std::move(gradScope));
                     ++nonVisualDepth;
@@ -6684,7 +6875,7 @@ AeroCompileResult AeroCompiler::CompileInternal(
                     gs.desc = std::move(gd);
                     gs.owner = GradientScopeOwner::PropertyElement;
                     gs.scopeDepth = scopeStack.size();
-                    gs.targetPropId = parentScope.targetPropId;
+                    gs.targetPropId = gradTargetPropId;
                     gradientStack.push_back(std::move(gs));
                     continue;
                 } else if (shortTag == "BitmapImage" || shortTag == "ImageBrush") {
@@ -7392,6 +7583,7 @@ AeroCompileResult AeroCompiler::CompileInternal(
                          attr.name == "MouseLeave" || attr.name == "MouseDown" ||
                          attr.name == "MouseLeftButtonDown" || attr.name == "MouseUp" ||
                          attr.name == "MouseLeftButtonUp" || attr.name == "KeyDown" ||
+                         attr.name == "KeyUp" || attr.name == "RequestNavigate" ||
                          attr.name == "GotFocus" || attr.name == "LostFocus") {
                     canonicalEvent = std::string(attr.name);
                 }
@@ -7641,6 +7833,7 @@ AeroCompileResult AeroCompiler::CompileInternal(
                 if (!parsedBind.hasExplicitMode &&
                     ((shortTag == "TextBox" && propId == PropId_Text) ||
                      propId == PropId_SelectedItem ||
+                     propId == PropId_SelectedValue ||
                      propId == PropId_SelectedIndex)) {
                     mode = BindingMode::TwoWay;
                 }
@@ -7668,11 +7861,18 @@ AeroCompileResult AeroCompiler::CompileInternal(
                                             isAttrSelfDc;
                 const std::string_view effAttrPath = isAttrSelfDc ? std::string_view("DataContext") : pathPart;
 
+                UnifiedValue parsedTargetNull{};
+                if (parsedBind.hasTargetNullValue) {
+                    parsedTargetNull = parsedBind.targetNullValue.empty()
+                        ? value::FromString("")
+                        : ParseLiteralPropertyValue(propId, parsedBind.targetNullValue);
+                }
                 AxbCompiledBindingChain chain{};
                 chain.rawPath = std::string(effAttrPath);
                 chain.targetPropertyId = propId;
                 chain.mode = mode;
                 chain.fallbackValue = std::move(parsedFallback);
+                chain.targetNullValue = std::move(parsedTargetNull);
                 chain.elementName = std::string(parsedBind.elementName);
                 chain.relativeAncestorType = parsedBind.relativeAncestorType;
                 chain.relativeSelf = parsedBind.relativeSelf || isAttrSelfDc;
@@ -7747,6 +7947,13 @@ AeroCompileResult AeroCompiler::CompileInternal(
             visScope.resourceKey = std::move(attachedStyleKey);
             scopeStack.push_back(std::move(visScope));
         }
+    }
+
+    if (!isSvgInput && !isLottieInput && !isRiveInput && !scopeStack.empty()) {
+        result.diagnostics.push_back(
+            "AERO_XAML_UNCLOSED_TAG: Unclosed XML element '<" + scopeStack.back().tagName + ">'");
+        result.succeeded = false;
+        return result;
     }
 
     // If <DataTemplate.Triggers> was parsed at top level of a DataTemplate, attach it to the root element
@@ -8735,6 +8942,7 @@ AeroCompileResult AeroCompiler::CompileInternal(
                 sf.content.find("using Aero.UI;") != std::string::npos ||
                 sf.content.find("using System.ComponentModel;") != std::string::npos ||
                 sf.content.find("using System.Collections.ObjectModel") != std::string::npos ||
+                sf.content.find("using System.Globalization;") != std::string::npos ||
                 sf.content.find("using System.Windows") != std::string::npos ||
                 sf.content.find("ObservableObject") != std::string::npos ||
                 sf.content.find("ViewModelBase") != std::string::npos ||
@@ -8748,6 +8956,13 @@ AeroCompileResult AeroCompiler::CompileInternal(
         if ((importsAeroUi || !pkg.className.empty()) && !definesAeroUi) {
             std::string sdkCode =
                 "module Aero.UI;\n"
+                "public delegate void Action();\n"
+                "public delegate void Action<T>(T arg);\n"
+                "public delegate TResult Func<TResult>();\n"
+                "public delegate TResult Func<T, TResult>(T arg);\n"
+                "public class Type { }\n"
+                "public class CultureInfo { }\n"
+                "public interface IValueConverter { }\n"
                 "public delegate void ExecuteFunc();\n"
                 "public delegate bool CanExecuteFunc();\n"
                 "public delegate void ExecuteIntFunc(int param);\n"
@@ -8833,8 +9048,18 @@ AeroCompileResult AeroCompiler::CompileInternal(
                 "public string TreeView_GetSelectedHeader(handle elem) { return \"\"; }\n"
                 "public bool UIElement_RegisterWrapper(handle elem, object wrapper) { return false; }\n"
                 "public bool Command_NotifyCanExecuteChanged(object cmd) { return false; }\n"
+                "public bool Observable_NotifyPropertyChanged(object source, string propertyName) { return false; }\n"
                 "public bool TextBox_Clear(handle elem) { return false; }\n"
                 "public bool TextBox_SelectAll(handle elem) { return false; }\n"
+                "public bool TextBox_Select(handle elem, int start, int length) { return false; }\n"
+                "public string TextBox_GetSelectedText(handle elem) { return \"\"; }\n"
+                "public bool TextBox_SetSelectedText(handle elem, string text) { return false; }\n"
+                "public bool TextBox_Copy(handle elem) { return false; }\n"
+                "public bool TextBox_Cut(handle elem) { return false; }\n"
+                "public bool TextBox_Paste(handle elem) { return false; }\n"
+                "public string UIElement_FindResourceString(handle elem, string key) { return \"\"; }\n"
+                "public bool UIElement_SetDynamicResourceString(handle elem, string key, string val) { return false; }\n"
+                
                 "public string ListBox_GetSelectedItemText(handle elem) { return \"\"; }\n"
                 "public bool Window_Close(handle elem) { return false; }\n"
                 "public class RelayCommand : DelegateCommand\n"
@@ -8861,7 +9086,7 @@ AeroCompileResult AeroCompiler::CompileInternal(
                 "}\n"
                 "public delegate void ExecuteGenericFunc<T>(T param);\n"
                 "public delegate bool CanExecuteGenericFunc<T>(T param);\n"
-                "public class TypedRelayCommand<T>\n"
+                "public class TypedRelayCommand<T> : ICommand\n"
                 "{\n"
                 "    public ExecuteGenericFunc<T> _exec = null;\n"
                 "    public CanExecuteGenericFunc<T> _canExec = null;\n"
@@ -8869,10 +9094,12 @@ AeroCompileResult AeroCompiler::CompileInternal(
                 "    public TypedRelayCommand(ExecuteGenericFunc<T> exec) { _exec = exec; }\n"
                 "    public TypedRelayCommand(ExecuteGenericFunc<T> exec, CanExecuteGenericFunc<T> canExec) { _exec = exec; _canExec = canExec; }\n"
                 "    public void RaiseCanExecuteChanged() { Command_NotifyCanExecuteChanged(this); }\n"
+                "    public bool CanExecute() { return true; }\n"
+                "    public void Execute() { }\n"
                 "    public bool CanExecute(T param) { if (_canExec != null) { return _canExec(param); } return true; }\n"
                 "    public void Execute(T param) { if (!CanExecute(param)) { return; } if (_exec != null) { _exec(param); } }\n"
                 "}\n"
-                "public class TypedDelegateCommand<T>\n"
+                "public class TypedDelegateCommand<T> : ICommand\n"
                 "{\n"
                 "    public ExecuteGenericFunc<T> _exec = null;\n"
                 "    public CanExecuteGenericFunc<T> _canExec = null;\n"
@@ -8880,20 +9107,22 @@ AeroCompileResult AeroCompiler::CompileInternal(
                 "    public TypedDelegateCommand(ExecuteGenericFunc<T> exec) { _exec = exec; }\n"
                 "    public TypedDelegateCommand(ExecuteGenericFunc<T> exec, CanExecuteGenericFunc<T> canExec) { _exec = exec; _canExec = canExec; }\n"
                 "    public void RaiseCanExecuteChanged() { Command_NotifyCanExecuteChanged(this); }\n"
+                "    public bool CanExecute() { return true; }\n"
+                "    public void Execute() { }\n"
                 "    public bool CanExecute(T param) { if (_canExec != null) { return _canExec(param); } return true; }\n"
                 "    public void Execute(T param) { if (!CanExecute(param)) { return; } if (_exec != null) { _exec(param); } }\n"
                 "}\n"
                 "public class ObservableObject : INotifyPropertyChanged\n"
                 "{\n"
-                "    public void OnPropertyChanged(string propertyName = \"\") { }\n"
-                "    public void RaisePropertyChanged(string propertyName = \"\") { }\n"
-                "    public bool SetProperty(ref int storage, int value, string propertyName = \"\") { if (storage == value) { return false; } storage = value; return true; }\n"
-                "    public bool SetProperty(ref float storage, float value, string propertyName = \"\") { if (storage == value) { return false; } storage = value; return true; }\n"
-                "    public bool SetProperty(ref double storage, double value, string propertyName = \"\") { if (storage == value) { return false; } storage = value; return true; }\n"
-                "    public bool SetProperty(ref bool storage, bool value, string propertyName = \"\") { if (storage == value) { return false; } storage = value; return true; }\n"
-                "    public bool SetProperty(ref string storage, string value, string propertyName = \"\") { if (storage == value) { return false; } storage = value; return true; }\n"
-                "    public bool SetProperty<T>(ref T storage, T value) { storage = value; return true; }\n"
-                "    public bool SetProperty<T>(ref T storage, T value, string propertyName) { storage = value; return true; }\n"
+                "    public void OnPropertyChanged(string propertyName = \"\") { Observable_NotifyPropertyChanged(this, propertyName); }\n"
+                "    public void RaisePropertyChanged(string propertyName = \"\") { Observable_NotifyPropertyChanged(this, propertyName); }\n"
+                "    public bool SetProperty(ref int storage, int value, string propertyName = \"\") { if (storage == value) { return false; } storage = value; Observable_NotifyPropertyChanged(this, propertyName); return true; }\n"
+                "    public bool SetProperty(ref float storage, float value, string propertyName = \"\") { if (storage == value) { return false; } storage = value; Observable_NotifyPropertyChanged(this, propertyName); return true; }\n"
+                "    public bool SetProperty(ref double storage, double value, string propertyName = \"\") { if (storage == value) { return false; } storage = value; Observable_NotifyPropertyChanged(this, propertyName); return true; }\n"
+                "    public bool SetProperty(ref bool storage, bool value, string propertyName = \"\") { if (storage == value) { return false; } storage = value; Observable_NotifyPropertyChanged(this, propertyName); return true; }\n"
+                "    public bool SetProperty(ref string storage, string value, string propertyName = \"\") { if (storage == value) { return false; } storage = value; Observable_NotifyPropertyChanged(this, propertyName); return true; }\n"
+                "    public bool SetProperty<T>(ref T storage, T value) { storage = value; Observable_NotifyPropertyChanged(this, \"\"); return true; }\n"
+                "    public bool SetProperty<T>(ref T storage, T value, string propertyName) { storage = value; Observable_NotifyPropertyChanged(this, propertyName); return true; }\n"
                 "}\n"
                 "public class ViewModelBase : ObservableObject { }\n"
                 "public class BindableBase : ObservableObject { }\n"
@@ -8921,6 +9150,21 @@ AeroCompileResult AeroCompiler::CompileInternal(
                 "}\n"
                 "public class MouseButtonEventArgs : RoutedEventArgs { }\n"
                 "public class StartupEventArgs : RoutedEventArgs { }\n"
+                "public class RequestNavigateEventArgs : RoutedEventArgs\n"
+                "{\n"
+                "    public string Uri = \"\";\n"
+                "}\n"
+                "public class ExecutedRoutedEventArgs : RoutedEventArgs\n"
+                "{\n"
+                "    public string Command = \"\";\n"
+                "    public string Parameter = \"\";\n"
+                "}\n"
+                "public class CanExecuteRoutedEventArgs : RoutedEventArgs\n"
+                "{\n"
+                "    public string Command = \"\";\n"
+                "    public string Parameter = \"\";\n"
+                "    public bool CanExecute = true;\n"
+                "}\n"
                 "public class RoutedPropertyChangedEventArgs : RoutedEventArgs\n"
                 "{\n"
                 "    public float NewValue = 0.0f;\n"
@@ -8932,7 +9176,13 @@ AeroCompileResult AeroCompiler::CompileInternal(
                 "public enum VerticalAlignment { Top = 0, Center = 1, Bottom = 2, Stretch = 3 }\n"
                 "public enum SelectionMode { Single = 0, Multiple = 1, Extended = 2 }\n"
                 "public enum ClickMode { Release = 0, Press = 1, Hover = 2 }\n"
+                "public enum ExpandDirection { Down = 0, Up = 1, Left = 2, Right = 3 }\n"
+                "public enum Dock { Left = 0, Top = 1, Right = 2, Bottom = 3 }\n"
+                "public enum TabStripPlacement { Top = 0, Bottom = 1, Left = 2, Right = 3 }\n"
                 "public delegate void RoutedEventHandler(object sender, RoutedEventArgs e);\n"
+                "public delegate void RequestNavigateEventHandler(object sender, RequestNavigateEventArgs e);\n"
+                "public delegate void ExecutedRoutedEventHandler(object sender, ExecutedRoutedEventArgs e);\n"
+                "public delegate void CanExecuteRoutedEventHandler(object sender, CanExecuteRoutedEventArgs e);\n"
                 "public delegate void TextChangedEventHandler(object sender, TextChangedEventArgs e);\n"
                 "public delegate void SelectionChangedEventHandler(object sender, SelectionChangedEventArgs e);\n"
                 "public delegate void KeyEventHandler(object sender, KeyEventArgs e);\n"
@@ -8952,6 +9202,10 @@ AeroCompileResult AeroCompiler::CompileInternal(
                 "    public static int __FromSelMode(SelectionMode v) { if (v == SelectionMode.Multiple) { return 1; } if (v == SelectionMode.Extended) { return 2; } return 0; }\n"
                 "    public static ClickMode __ToClickMode(int v) { if (v == 1) { return ClickMode.Press; } if (v == 2) { return ClickMode.Hover; } return ClickMode.Release; }\n"
                 "    public static int __FromClickMode(ClickMode v) { if (v == ClickMode.Press) { return 1; } if (v == ClickMode.Hover) { return 2; } return 0; }\n"
+                "    public static TabStripPlacement __ToTabPlacement(int v) { if (v == 1) { return TabStripPlacement.Bottom; } if (v == 2) { return TabStripPlacement.Left; } if (v == 3) { return TabStripPlacement.Right; } return TabStripPlacement.Top; }\n"
+                "    public static int __FromTabPlacement(TabStripPlacement v) { if (v == TabStripPlacement.Bottom) { return 1; } if (v == TabStripPlacement.Left) { return 2; } if (v == TabStripPlacement.Right) { return 3; } return 0; }\n"
+                "    public static ExpandDirection __ToExpandDir(int v) { if (v == 1) { return ExpandDirection.Up; } if (v == 2) { return ExpandDirection.Left; } if (v == 3) { return ExpandDirection.Right; } return ExpandDirection.Down; }\n"
+                "    public static int __FromExpandDir(ExpandDirection v) { if (v == ExpandDirection.Up) { return 1; } if (v == ExpandDirection.Left) { return 2; } if (v == ExpandDirection.Right) { return 3; } return 0; }\n"
                 "}\n"
                 "public class UIElement : DependencyObject\n"
                 "{\n"
@@ -8990,6 +9244,8 @@ AeroCompileResult AeroCompiler::CompileInternal(
                 "    public string Tag { get { return UIElement_GetString(this.__nativeRootHandle, \"Tag\"); } set { UIElement_SetString(this.__nativeRootHandle, \"Tag\", value); } }\n"
                 "    public string ToolTip { get { return UIElement_GetString(this.__nativeRootHandle, \"ToolTip\"); } set { UIElement_SetString(this.__nativeRootHandle, \"ToolTip\", value); } }\n"
                 "    public handle FindName(string name) { return UIElement_FindName(this.__nativeRootHandle, name); }\n"
+                "    public string FindResource(string key) { return UIElement_FindResourceString(this.__nativeRootHandle, key); }\n"
+                "    public bool SetDynamicResource(string key, string val) { return UIElement_SetDynamicResourceString(this.__nativeRootHandle, key, val); }\n"
                 "    public bool BeginStoryboard(string storyboardKey) { return Storyboard_Begin(this.__nativeRootHandle, storyboardKey); }\n"
                 "    public bool StopStoryboard(string storyboardKey) { return Storyboard_Stop(this.__nativeRootHandle, storyboardKey); }\n"
                 "}\n"
@@ -9018,6 +9274,8 @@ AeroCompileResult AeroCompiler::CompileInternal(
                 "public class RepeatButton : Button { }\n"
                 "public class Hyperlink : Button\n"
                 "{\n"
+                "    public event RequestNavigateEventHandler RequestNavigate;\n"
+                "    public void __RaiseRequestNavigate(RequestNavigateEventArgs e) { RequestNavigate(this, e); }\n"
                 "    public string NavigateUri { get { return UIElement_GetString(this.__nativeRootHandle, \"NavigateUri\"); } set { UIElement_SetString(this.__nativeRootHandle, \"NavigateUri\", value); } }\n"
                 "}\n"
                 "public class ToggleButton : Button\n"
@@ -9047,8 +9305,16 @@ AeroCompileResult AeroCompiler::CompileInternal(
                 "    public bool AcceptsReturn { get { return UIElement_GetBool(this.__nativeRootHandle, \"AcceptsReturn\"); } set { UIElement_SetBool(this.__nativeRootHandle, \"AcceptsReturn\", value); } }\n"
                 "    public int MaxLength { get { return UIElement_GetInt(this.__nativeRootHandle, \"MaxLength\"); } set { UIElement_SetInt(this.__nativeRootHandle, \"MaxLength\", value); } }\n"
                 "    public int MaxLines { get { return UIElement_GetInt(this.__nativeRootHandle, \"MaxLines\"); } set { UIElement_SetInt(this.__nativeRootHandle, \"MaxLines\", value); } }\n"
+                "    public int CaretIndex { get { return UIElement_GetInt(this.__nativeRootHandle, \"CaretIndex\"); } set { UIElement_SetInt(this.__nativeRootHandle, \"CaretIndex\", value); } }\n"
+                "    public int SelectionStart { get { return UIElement_GetInt(this.__nativeRootHandle, \"SelectionStart\"); } set { UIElement_SetInt(this.__nativeRootHandle, \"SelectionStart\", value); } }\n"
+                "    public int SelectionLength { get { return UIElement_GetInt(this.__nativeRootHandle, \"SelectionLength\"); } set { UIElement_SetInt(this.__nativeRootHandle, \"SelectionLength\", value); } }\n"
+                "    public string SelectedText { get { return TextBox_GetSelectedText(this.__nativeRootHandle); } set { TextBox_SetSelectedText(this.__nativeRootHandle, value); } }\n"
                 "    public void Clear() { TextBox_Clear(this.__nativeRootHandle); }\n"
                 "    public void SelectAll() { TextBox_SelectAll(this.__nativeRootHandle); }\n"
+                "    public void Select(int start, int length) { TextBox_Select(this.__nativeRootHandle, start, length); }\n"
+                "    public bool Copy() { return TextBox_Copy(this.__nativeRootHandle); }\n"
+                "    public bool Cut() { return TextBox_Cut(this.__nativeRootHandle); }\n"
+                "    public bool Paste() { return TextBox_Paste(this.__nativeRootHandle); }\n"
                 "}\n"
                 "public class PasswordBox : Control\n"
                 "{\n"
@@ -9092,7 +9358,10 @@ AeroCompileResult AeroCompiler::CompileInternal(
                 "    public string Placeholder { get { return UIElement_GetString(this.__nativeRootHandle, \"Placeholder\"); } set { UIElement_SetString(this.__nativeRootHandle, \"Placeholder\", value); } }\n"
                 "    public float MaxDropDownHeight { get { return UIElement_GetFloat(this.__nativeRootHandle, \"MaxDropDownHeight\"); } set { UIElement_SetFloat(this.__nativeRootHandle, \"MaxDropDownHeight\", value); } }\n"
                 "}\n"
-                "public class TabControl : ListBox { }\n"
+                "public class TabControl : ListBox\n"
+                "{\n"
+                "    public TabStripPlacement TabStripPlacement { get { return DependencyObject.__ToTabPlacement(UIElement_GetInt(this.__nativeRootHandle, \"TabStripPlacement\")); } set { UIElement_SetInt(this.__nativeRootHandle, \"TabStripPlacement\", DependencyObject.__FromTabPlacement(value)); } }\n"
+                "}\n"
                 "public class Expander : ContentControl\n"
                 "{\n"
                 "    public event RoutedEventHandler Expanded;\n"
@@ -9101,6 +9370,7 @@ AeroCompileResult AeroCompiler::CompileInternal(
                 "    public void __RaiseCollapsed(RoutedEventArgs e) { Collapsed(this, e); }\n"
                 "    public string Header { get { return UIElement_GetString(this.__nativeRootHandle, \"Header\"); } set { UIElement_SetString(this.__nativeRootHandle, \"Header\", value); } }\n"
                 "    public bool IsExpanded { get { return UIElement_GetBool(this.__nativeRootHandle, \"IsExpanded\"); } set { UIElement_SetBool(this.__nativeRootHandle, \"IsExpanded\", value); } }\n"
+                "    public ExpandDirection ExpandDirection { get { return DependencyObject.__ToExpandDir(UIElement_GetInt(this.__nativeRootHandle, \"ExpandDirection\")); } set { UIElement_SetInt(this.__nativeRootHandle, \"ExpandDirection\", DependencyObject.__FromExpandDir(value)); } }\n"
                 "}\n"
                 "public class TreeView : Control\n"
                 "{\n"
@@ -9114,10 +9384,12 @@ AeroCompileResult AeroCompiler::CompileInternal(
                 "    public bool IsExpanded { get { return UIElement_GetBool(this.__nativeRootHandle, \"IsExpanded\"); } set { UIElement_SetBool(this.__nativeRootHandle, \"IsExpanded\", value); } }\n"
                 "    public bool IsSelected { get { return UIElement_GetBool(this.__nativeRootHandle, \"IsSelected\"); } set { UIElement_SetBool(this.__nativeRootHandle, \"IsSelected\", value); } }\n"
                 "}\n"
-                "public class MenuItem : ContentControl\n"
+                "public class MenuItem : Button\n"
                 "{\n"
                 "    public string Header { get { return UIElement_GetString(this.__nativeRootHandle, \"Header\"); } set { UIElement_SetString(this.__nativeRootHandle, \"Header\", value); } }\n"
+                "    public bool IsCheckable { get { return UIElement_GetBool(this.__nativeRootHandle, \"IsCheckable\"); } set { UIElement_SetBool(this.__nativeRootHandle, \"IsCheckable\", value); } }\n"
                 "    public bool IsChecked { get { return UIElement_GetBool(this.__nativeRootHandle, \"IsChecked\"); } set { UIElement_SetBool(this.__nativeRootHandle, \"IsChecked\", value); } }\n"
+                "    public bool IsSubmenuOpen { get { return UIElement_GetBool(this.__nativeRootHandle, \"IsSubmenuOpen\"); } set { UIElement_SetBool(this.__nativeRootHandle, \"IsSubmenuOpen\", value); } }\n"
                 "}\n"
                 "public class StatusBarItem : ContentControl { }\n"
                 "public class ListView : ListBox { }\n"
@@ -9150,8 +9422,10 @@ AeroCompileResult AeroCompiler::CompileInternal(
                 "public class ContextMenu : Control { }\n"
                 "public class GridSplitter : Control { }\n"
                 "public class RiveControl : FrameworkElement { }\n"
+                "public Application Application_GetCurrent() { return null; }\n"
                 "public class Application\n"
                 "{\n"
+                "    public static Application Current { get { return Application_GetCurrent(); } }\n"
                 "    public string StartupUri = \"\";\n"
                 "    public virtual void OnStartup(StartupEventArgs e) { }\n"
                 "    public bool LoadResources(handle root, string uri) { return Application_LoadResources(root, uri); }\n"
@@ -10044,6 +10318,9 @@ AeroViewAotCppOutput AeroCompiler::GenerateAotCppFromPackage(
                         src += "        chain.relativeSelf = " + std::string(chain.relativeSelf ? "true" : "false") + ";\n";
                         if (!std::holds_alternative<std::monostate>(chain.fallbackValue)) {
                             src += "        chain.fallbackValue = " + EmitUnifiedValueLiteralCpp(chain.fallbackValue) + ";\n";
+                        }
+                        if (!std::holds_alternative<std::monostate>(chain.targetNullValue)) {
+                            src += "        chain.targetNullValue = " + EmitUnifiedValueLiteralCpp(chain.targetNullValue) + ";\n";
                         }
                         for (const auto& hop : chain.hops) {
                             src += "        {\n";

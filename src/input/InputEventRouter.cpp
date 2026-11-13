@@ -606,6 +606,36 @@ bool InputEventRouter::DispatchPointerDown(
 
     UIElement* rawHit = rootVisual_->HitTest(position);
     UIElement* target = ResolveInteractiveTarget(rawHit);
+    if (MenuItem::HasAnyOpenSubmenu()) {
+        auto closeOpenMenusOutsideHit = [&](auto& self, UIElement* node) -> void {
+            if (!node) return;
+            if (node->IsA<Menu>()) {
+                bool hitInsideMenu = false;
+                for (const UIElement* w = rawHit; w != nullptr; w = w->Parent()) {
+                    if (w == node) {
+                        hitInsideMenu = true;
+                        break;
+                    }
+                }
+                if (!hitInsideMenu) {
+                    auto closeSubRec = [](auto& closeSelf, UIElement* mi) -> void {
+                        for (UIElement* ch = mi->FirstChild(); ch != nullptr; ch = ch->NextSibling()) {
+                            if (ch->IsA<MenuItem>()) {
+                                ch->SetValue(PropId_IsSubmenuOpen, UnifiedValue{false}, ValueSourceRank::Local);
+                                closeSelf(closeSelf, ch);
+                            }
+                        }
+                    };
+                    closeSubRec(closeSubRec, node);
+                }
+                return;
+            }
+            for (UIElement* c = node->FirstChild(); c != nullptr; c = c->NextSibling()) {
+                self(self, c);
+            }
+        };
+        closeOpenMenusOutsideHit(closeOpenMenusOutsideHit, rootVisual_);
+    }
     UpdateHoveredTarget(target);
 
     if (button == PointerButton::Right && rootVisual_) {
@@ -783,20 +813,24 @@ bool InputEventRouter::DispatchMouseWheel(
     float scrollDeltaX,
     float scrollDeltaY,
     std::uint8_t modifiers) {
-    (void)modifiers;
     lastPointerPos_ = position;
     if (!rootVisual_ || (scrollDeltaX == 0.0f && scrollDeltaY == 0.0f)) {
         return false;
     }
     PruneDisconnectedTargets();
 
+    const bool shiftHeld = (modifiers & KeyMod_Shift) != 0u;
     UIElement* hit = rootVisual_->HitTest(position);
     for (UIElement* cur = hit; cur != nullptr; cur = cur->Parent()) {
         if (auto* sv = cur->DynamicCast<ScrollViewer>(); sv && sv->IsEffectivelyEnabled()) {
             const bool allowH = (sv->GetHorizontalScrollBarVisibility() != ScrollBarVisibility::Disabled);
             const bool allowV = (sv->GetVerticalScrollBarVisibility() != ScrollBarVisibility::Disabled);
-            const float effDx = allowH ? scrollDeltaX : 0.0f;
-            const float effDy = allowV ? scrollDeltaY : 0.0f;
+            float effDx = allowH ? scrollDeltaX : 0.0f;
+            float effDy = allowV ? scrollDeltaY : 0.0f;
+            if (shiftHeld && scrollDeltaX == 0.0f && scrollDeltaY != 0.0f && allowH) {
+                effDx = scrollDeltaY;
+                effDy = 0.0f;
+            }
             if (effDx == 0.0f && effDy == 0.0f) {
                 continue;
             }
@@ -823,9 +857,15 @@ bool InputEventRouter::DispatchKeyDown(KeyCode key, std::uint8_t modifiers) {
     }
     PruneDisconnectedTargets();
 
-    if (key == KeyCode::Escape && openComboBox_ && openComboBox_->IsDropDownOpen()) {
-        CloseActiveComboBoxIfOpen();
-        return true;
+    if (key == KeyCode::Escape) {
+        if (openComboBox_ && openComboBox_->IsDropDownOpen()) {
+            CloseActiveComboBoxIfOpen();
+            return true;
+        }
+        if (openContextMenu_) {
+            CloseActiveContextMenuIfOpen();
+            return true;
+        }
     }
 
     for (UIElement* cur = focusedElement_ ? focusedElement_.Get() : rootVisual_; cur != nullptr; cur = cur->Parent()) {
@@ -905,6 +945,11 @@ bool InputEventRouter::DispatchKeyDown(KeyCode key, std::uint8_t modifiers) {
                     return true;
                 }
             }
+            const bool hasParamFallback = !cmdParam.empty();
+            const UnifiedValue rawParamFallback = hasParamFallback ? value::FromString(cmdParam) : UnifiedValue{};
+            if (TryExecuteRoutedCommandBubble(host, cmdName, rawParamFallback, hasParamFallback)) {
+                return true;
+            }
         }
         return false;
     };
@@ -916,9 +961,21 @@ bool InputEventRouter::DispatchKeyDown(KeyCode key, std::uint8_t modifiers) {
         if (tryFireKeyBindingsOn(c)) return true;
     }
 
-    if (key == KeyCode::Tab) {
+    if (key == KeyCode::Tab && (modifiers & KeyMod_Ctrl) == 0u) {
         const bool reverse = (modifiers & KeyMod_Shift) != 0u;
         return MoveFocus(reverse ? FocusDirection::Previous : FocusDirection::Next);
+    }
+    if (key == KeyCode::Tab && (modifiers & KeyMod_Ctrl) != 0u) {
+        for (UIElement* cur = focusedElement_ ? focusedElement_.Get() : rootVisual_;
+             cur != nullptr;
+             cur = cur->Parent()) {
+            if (auto* tc = cur->DynamicCast<TabControl>()) {
+                if (tc->OnKeyDown(key, modifiers)) {
+                    return true;
+                }
+            }
+            if (cur == rootVisual_) break;
+        }
     }
 
     if (focusedElement_ && focusedElement_->CanReceiveFocus()) {
@@ -933,6 +990,18 @@ bool InputEventRouter::DispatchKeyDown(KeyCode key, std::uint8_t modifiers) {
             SyncImeFocusState();
             return true;
         }
+    }
+
+    // Bubble unhandled scroll keys to enclosing ScrollViewer
+    for (UIElement* cur = focusedElement_ ? focusedElement_->Parent() : rootVisual_;
+         cur != nullptr;
+         cur = cur->Parent()) {
+        if (auto* sv = cur->DynamicCast<ScrollViewer>()) {
+            if (sv->OnKeyDown(key, modifiers)) {
+                return true;
+            }
+        }
+        if (cur == rootVisual_) break;
     }
 
     // Fallback spatial directional navigation (Gamepad D-Pad / Arrow keys)

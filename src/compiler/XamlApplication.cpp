@@ -345,6 +345,9 @@ bool XamlApplication::Load(std::string_view appOrWindowOrDirPath, std::string* o
 bool XamlApplication::Load(const XamlApplicationOptions& options, std::string* outError) {
     viewportW_ = options.viewportWidth;
     viewportH_ = options.viewportHeight;
+    ImageAtlas::Instance().ClearSearchDirectories();
+    RiveControl::ClearAssetSearchDirectories();
+    UiResourceContext::Current().ClearXamlSearchDirectories();
 
     std::error_code ec;
     fs::path targetPath(options.appOrWindowXamlPath);
@@ -352,21 +355,110 @@ bool XamlApplication::Load(const XamlApplicationOptions& options, std::string* o
     fs::path appXamlPath;
     fs::path windowXamlPath;
 
+    auto tryResolveXamlInDir = [&](const fs::path& dir) -> bool {
+        if (fs::is_regular_file(dir / "App.xaml", ec)) {
+            appXamlPath = dir / "App.xaml";
+            baseDir = dir;
+            return true;
+        }
+        if (fs::is_regular_file(dir / "Data/App.xaml", ec)) {
+            appXamlPath = dir / "Data/App.xaml";
+            baseDir = dir / "Data";
+            return true;
+        }
+        if (fs::is_regular_file(dir / "MainWindow.xaml", ec)) {
+            windowXamlPath = dir / "MainWindow.xaml";
+            baseDir = dir;
+            return true;
+        }
+        if (fs::is_regular_file(dir / "Data/MainWindow.xaml", ec)) {
+            windowXamlPath = dir / "Data/MainWindow.xaml";
+            baseDir = dir / "Data";
+            return true;
+        }
+        if (fs::is_regular_file(dir / "Data/MainPage.xaml", ec)) {
+            windowXamlPath = dir / "Data/MainPage.xaml";
+            baseDir = dir / "Data";
+            return true;
+        }
+        return false;
+    };
+
+    auto tryResolveFromSln = [&](const fs::path& slnFile) -> bool {
+        std::string slnText;
+        if (!ReadUtf8File(slnFile, slnText)) return false;
+        const fs::path slnDir = slnFile.parent_path();
+        std::vector<fs::path> candidateDirs;
+        std::size_t scan = 0u;
+        while (scan < slnText.size()) {
+            const std::size_t csPos = slnText.find(".csproj\"", scan);
+            if (csPos == std::string::npos) break;
+            const std::size_t quoteStart = slnText.rfind('"', csPos);
+            if (quoteStart != std::string::npos) {
+                std::string rel = slnText.substr(quoteStart + 1u, (csPos + 7u) - (quoteStart + 1u));
+                std::replace(rel.begin(), rel.end(), '\\', '/');
+                if (!rel.empty()) {
+                    candidateDirs.push_back((slnDir / fs::path(rel)).parent_path());
+                }
+            }
+            scan = csPos + 8u;
+        }
+        for (const fs::path& projDir : candidateDirs) {
+            if (fs::is_directory(projDir, ec) && tryResolveXamlInDir(projDir)) {
+                return true;
+            }
+        }
+        return false;
+    };
+
+    auto tryResolveInSubdirs = [&](const fs::path& rootDir) -> bool {
+        std::vector<fs::path> subdirs;
+        for (const auto& entry : fs::directory_iterator(rootDir, ec)) {
+            if (entry.is_directory(ec)) {
+                subdirs.push_back(entry.path());
+            }
+        }
+        std::sort(subdirs.begin(), subdirs.end());
+        for (const fs::path& sub : subdirs) {
+            if (tryResolveXamlInDir(sub)) {
+                return true;
+            }
+        }
+        return false;
+    };
+
     if (fs::is_directory(targetPath, ec)) {
         baseDir = targetPath;
-        if (fs::is_regular_file(baseDir / "App.xaml", ec)) {
-            appXamlPath = baseDir / "App.xaml";
-        } else if (fs::is_regular_file(baseDir / "Data/App.xaml", ec)) {
-            appXamlPath = baseDir / "Data/App.xaml";
-            baseDir = baseDir / "Data";
-        } else if (fs::is_regular_file(baseDir / "MainWindow.xaml", ec)) {
-            windowXamlPath = baseDir / "MainWindow.xaml";
-        } else if (fs::is_regular_file(baseDir / "Data/MainWindow.xaml", ec)) {
-            windowXamlPath = baseDir / "Data/MainWindow.xaml";
-            baseDir = baseDir / "Data";
-        } else if (fs::is_regular_file(baseDir / "Data/MainPage.xaml", ec)) {
-            windowXamlPath = baseDir / "Data/MainPage.xaml";
-            baseDir = baseDir / "Data";
+        if (!tryResolveXamlInDir(targetPath)) {
+            std::vector<fs::path> slns;
+            for (const auto& entry : fs::directory_iterator(targetPath, ec)) {
+                if (entry.is_regular_file(ec) && entry.path().extension() == ".sln") {
+                    slns.push_back(entry.path());
+                }
+            }
+            std::sort(slns.begin(), slns.end());
+            bool resolved = false;
+            for (const fs::path& sln : slns) {
+                if (tryResolveFromSln(sln)) {
+                    resolved = true;
+                    break;
+                }
+            }
+            if (!resolved) {
+                (void)tryResolveInSubdirs(targetPath);
+            }
+        }
+    } else if (fs::is_regular_file(targetPath, ec) &&
+               (targetPath.extension() == ".csproj" || targetPath.extension() == ".sln")) {
+        baseDir = targetPath.parent_path();
+        if (!tryResolveXamlInDir(baseDir)) {
+            if (targetPath.extension() == ".sln") {
+                if (!tryResolveFromSln(targetPath)) {
+                    (void)tryResolveInSubdirs(baseDir);
+                }
+            } else {
+                (void)tryResolveInSubdirs(baseDir);
+            }
         }
     } else if (fs::is_regular_file(targetPath, ec)) {
         baseDir = targetPath.parent_path();
@@ -412,6 +504,44 @@ bool XamlApplication::Load(const XamlApplicationOptions& options, std::string* o
     if (windowXamlPath.empty() || !fs::is_regular_file(windowXamlPath, ec)) {
         if (outError) *outError = "Resolved StartupUri/Window XAML not found: " + windowXamlPath.string();
         return false;
+    }
+
+    {
+        const fs::path winDir = windowXamlPath.parent_path();
+        ImageAtlas::Instance().SetBaseDirectory(winDir.string());
+        ImageAtlas::Instance().AddSearchDirectory(winDir.string());
+        RiveControl::AddAssetSearchDirectory(winDir.string());
+        UiResourceContext::Current().AddXamlSearchDirectory(winDir.string());
+        if (!baseDir.empty() && baseDir != winDir) {
+            ImageAtlas::Instance().AddSearchDirectory(baseDir.string());
+            RiveControl::AddAssetSearchDirectory(baseDir.string());
+            UiResourceContext::Current().AddXamlSearchDirectory(baseDir.string());
+        }
+        for (const auto& extraDir : options.resourceSearchPaths) {
+            if (!extraDir.empty()) {
+                ImageAtlas::Instance().AddSearchDirectory(extraDir);
+                RiveControl::AddAssetSearchDirectory(extraDir);
+                UiResourceContext::Current().AddXamlSearchDirectory(extraDir);
+            }
+        }
+        for (const char* sub : {"Fonts", "Assets", "Assets/Fonts", "Images", "Resources"}) {
+            const fs::path cand = winDir / sub;
+            if (fs::is_directory(cand, ec)) {
+                ImageAtlas::Instance().AddSearchDirectory(cand.string());
+                RiveControl::AddAssetSearchDirectory(cand.string());
+                for (const auto& fe : fs::directory_iterator(cand, ec)) {
+                    if (!fe.is_regular_file(ec)) continue;
+                    std::string fext = fe.path().extension().string();
+                    for (char& ch : fext) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+                    if (fext == ".ttf" || fext == ".otf") {
+                        (void)FontAtlas::Instance().LoadTrueTypeFontFromFile(
+                            fe.path().string(),
+                            fe.path().stem().string(),
+                            false);
+                    }
+                }
+            }
+        }
     }
 
     std::string winXml;
@@ -557,6 +687,7 @@ bool XamlApplication::Load(const XamlApplicationOptions& options, std::string* o
                 if (auto appOpt = domains_.uiHeap().allocateObject(appSym->id, std::move(initF), std::move(refF), &aErr)) {
                     appObj_ = *appOpt;
                     appPin_ = domains_.uiHeap().retain(appObj_);
+                    SetActiveApplicationObject(&domains_, appObj_);
                     rs_rt::ExecutionOptions execOpts{};
                     execOpts.limits.instructionBudget = 5'000'000;
                     for (const auto& m : appSym->methods) {

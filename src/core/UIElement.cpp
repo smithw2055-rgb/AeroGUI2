@@ -2883,6 +2883,13 @@ bool Button::PerformClick(RuntimeError* error) {
         clickCallback_(*this);
     }
     (void)DispatchWrapperRoutedEvent("Click");
+    const UnifiedValue routedCmdVal = GetValue(PropId_RoutedCommandName);
+    if (const auto* rcmdSv = std::get_if<StringValue>(&routedCmdVal);
+        rcmdSv && !rcmdSv->view().empty()) {
+        const UnifiedValue cp = GetValue(PropId_CommandParameter);
+        const bool hasCp = !std::holds_alternative<std::monostate>(cp);
+        (void)TryExecuteRoutedCommandBubble(this, rcmdSv->view(), cp, hasCp);
+    }
     if (scriptTargetObject_.valid() && scriptClickMethodId_ != 0) {
         std::vector<UnifiedValue> args;
         args.push_back(scriptTargetObject_);

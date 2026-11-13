@@ -53,6 +53,7 @@ void SetPendingMainWindowMountTarget(
 
 void ClearPendingMainWindowMountTarget(const ExecutionDomainContext* domains) noexcept;
 void ClearScriptUiDomainState(const ExecutionDomainContext* domains) noexcept;
+void SetActiveApplicationObject(const ExecutionDomainContext* domains, ObjectRef appObj);
 void DispatchLoadedToRegisteredDescendants(UIElement* root, bool skipNestedUserControls = true);
 
 struct ReactivePropertyBinding {

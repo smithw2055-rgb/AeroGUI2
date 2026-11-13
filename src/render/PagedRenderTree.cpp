@@ -2927,7 +2927,7 @@ bool PagedRenderTree::UpdateElementInPlace(
 
     // Specialized TextBox / PasswordBox update (box quad + optional border ring + 1..N SdfTextGlyph nodes + caret quad)
     if (const auto* tbox = element->DynamicCast<TextBox>()) {
-        if (span < 3u) {
+        if (span < 3u || tbox->GetSelectionLength() > 0u) {
             return false;
         }
         const bool hasSeparateBorderNode =
@@ -2947,9 +2947,10 @@ bool PagedRenderTree::UpdateElementInPlace(
 
         std::size_t totalGlyphCap = 0u;
         for (std::uint16_t k = boxSpan; k + 1u < span; ++k) {
-            if (nodes_[firstId + k].primType == AeroPrimType::SdfTextGlyph) {
-                totalGlyphCap += nodes_[firstId + k].vertexCount / 4u;
+            if (nodes_[firstId + k].primType != AeroPrimType::SdfTextGlyph) {
+                return false;
             }
+            totalGlyphCap += nodes_[firstId + k].vertexCount / 4u;
         }
         if (CountVisibleUtf8Glyphs(activeText) > totalGlyphCap) {
             return false;
@@ -3023,10 +3024,13 @@ bool PagedRenderTree::UpdateElementInPlace(
         // Nodes [boxSpan .. span-2]: UTF-8 text or muted placeholder
         const Thickness pad = tbox->GetPadding();
         const float padLeft = (pad.left > 0.0f) ? pad.left : 6.0f;
+        const float padTop = (pad.top > 0.0f) ? pad.top : 4.0f;
         const float scrollX = showingPlaceholder ? 0.0f : tbox->HorizontalTextScrollOffset();
         const float textX = r.x + padLeft - scrollX;
         const float fontSize = tbox->GetFontSize();
-        const float textY = r.y + std::max(2.0f, (boxH - fontSize * 1.2f) * 0.5f);
+        const float textY = (renderedText.find('\n') != std::string::npos)
+            ? (r.y + padTop)
+            : (r.y + std::max(2.0f, (boxH - fontSize * 1.2f) * 0.5f));
         const Color textColor = showingPlaceholder
             ? Color{0.55f, 0.60f, 0.68f, 0.85f}
             : tbox->GetForeground();
@@ -4904,14 +4908,28 @@ void PagedRenderTree::TraverseAndEmitElement(
         const Color pageBrd = value::TryGetColor(tabCtrl->GetValue(PropId_BorderBrush))
             .value_or(Color{0.28f, 0.36f, 0.48f, 1.0f});
 
+        const TabStripPlacement tabPlacement = tabCtrl->GetTabStripPlacement();
+        CornerRadius pageCr{0.0f, 4.0f, 4.0f, 4.0f};
+        CornerRadius tabCr{5.0f, 5.0f, 0.0f, 0.0f};
+        if (tabPlacement == TabStripPlacement::Bottom) {
+            pageCr = CornerRadius{4.0f, 4.0f, 4.0f, 0.0f};
+            tabCr = CornerRadius{0.0f, 0.0f, 5.0f, 5.0f};
+        } else if (tabPlacement == TabStripPlacement::Left) {
+            pageCr = CornerRadius{0.0f, 4.0f, 4.0f, 4.0f};
+            tabCr = CornerRadius{5.0f, 0.0f, 0.0f, 5.0f};
+        } else if (tabPlacement == TabStripPlacement::Right) {
+            pageCr = CornerRadius{4.0f, 0.0f, 4.0f, 4.0f};
+            tabCr = CornerRadius{0.0f, 5.0f, 5.0f, 0.0f};
+        }
+
         const std::uint32_t pageBgId = AllocateRoundedRectNode(
-            pageR.x, pageR.y, pageR.width, pageR.height, pageBg, CornerRadius{0.0f, 4.0f, 4.0f, 4.0f}, elem);
+            pageR.x, pageR.y, pageR.width, pageR.height, pageBg, pageCr, elem);
         nodes_[pageBgId].opacity = (pageBg.a > 0.0f) ? effAlpha : 0.0f;
         applyNodeTransform(pageBgId);
         ++emittedCount;
 
         const std::uint32_t pageBrdId = AllocateBorderRingNode(
-            pageR.x, pageR.y, pageR.width, pageR.height, pageBrd, CornerRadius{0.0f, 4.0f, 4.0f, 4.0f}, Thickness{1.0f}, elem);
+            pageR.x, pageR.y, pageR.width, pageR.height, pageBrd, pageCr, Thickness{1.0f}, elem);
         nodes_[pageBrdId].opacity = effAlpha;
         applyNodeTransform(pageBrdId);
         ++emittedCount;
@@ -4921,6 +4939,8 @@ void PagedRenderTree::TraverseAndEmitElement(
         float fontSize = 14.0f;
         (void)TryGetFloat(tabCtrl->GetValue(PropId_FontSize), fontSize);
         const std::string tabFont = ResolveElementFontFamily(tabCtrl);
+        const bool isVertTabs =
+            (tabPlacement == TabStripPlacement::Left || tabPlacement == TabStripPlacement::Right);
 
         for (std::size_t i = 0u; i < tabCount; ++i) {
             const Rect tr = tabCtrl->GetTabHeaderLocalRect(i);
@@ -4931,10 +4951,10 @@ void PagedRenderTree::TraverseAndEmitElement(
             const std::uint32_t tid = AllocateRoundedRectNode(
                 tr.x,
                 tr.y,
-                std::max(0.0f, tr.width - 2.0f),
-                tr.height,
+                isVertTabs ? tr.width : std::max(0.0f, tr.width - 2.0f),
+                isVertTabs ? std::max(0.0f, tr.height - 2.0f) : tr.height,
                 tabBg,
-                CornerRadius{5.0f, 5.0f, 0.0f, 0.0f},
+                tabCr,
                 elem);
             nodes_[tid].opacity = effAlpha;
             applyNodeTransform(tid);
@@ -5367,13 +5387,102 @@ void PagedRenderTree::TraverseAndEmitElement(
         const std::string renderedText = showingPlaceholder ? tbox->GetPlaceholder() : displayStr;
         const Thickness pad = tbox->GetPadding();
         const float padLeft = (pad.left > 0.0f) ? pad.left : 6.0f;
+        const float padTop = (pad.top > 0.0f) ? pad.top : 4.0f;
         const float scrollX = showingPlaceholder ? 0.0f : tbox->HorizontalTextScrollOffset();
         const float textX = r.x + padLeft - scrollX;
         const float fontSize = tbox->GetFontSize();
-        const float textY = r.y + std::max(2.0f, (h - fontSize * 1.2f) * 0.5f);
+        const float textY = (renderedText.find('\n') != std::string::npos)
+            ? (r.y + padTop)
+            : (r.y + std::max(2.0f, (h - fontSize * 1.2f) * 0.5f));
         const Color textColor = showingPlaceholder
             ? Color{0.55f, 0.60f, 0.68f, 0.85f}
             : tbox->GetForeground();
+
+        if (!showingPlaceholder && tbox->GetSelectionLength() > 0u) {
+            auto byteOffAtCp = [](std::string_view s, std::size_t cpTarget) noexcept -> std::size_t {
+                std::size_t cnt = 0u, cur = 0u;
+                std::uint32_t cp = 0u;
+                while (cnt < cpTarget && DecodeNextUtf8CodePoint(s, cur, cp)) ++cnt;
+                return cur;
+            };
+            const std::size_t selS = tbox->GetSelectionStart();
+            const std::size_t selE = selS + tbox->GetSelectionLength();
+            const std::string fontFam = tbox->GetFontFamily();
+            const float padRight = (pad.right > 0.0f) ? pad.right : 6.0f;
+            const float clipL = r.x + padLeft;
+            const float clipR = std::max(clipL, r.x + w - padRight);
+            if (displayStr.find('\n') != std::string::npos) {
+                const float lineH = std::max(
+                    12.0f,
+                    MeasureTextLayout(renderedText, fontFam, std::max(1.0f, fontSize), 1000000.0f, TextWrapping::NoWrap).lineHeight);
+                std::size_t scanCursor = 0u;
+                std::size_t totalCp = 0u;
+                std::size_t lineStartCp = 0u;
+                std::size_t lineByteStart = 0u;
+                std::size_t lineIdx = 0u;
+                std::uint32_t cp = 0u;
+                auto emitLineSel = [&](std::size_t lIdx, std::size_t lStartCp, std::size_t lEndCp, std::size_t lByteS, std::size_t lByteE) {
+                    const std::size_t overlapS = std::max(selS, lStartCp);
+                    const std::size_t overlapE = std::min(selE, lEndCp);
+                    if (overlapE <= overlapS) return;
+                    const std::string_view lv(displayStr.data() + lByteS, lByteE - lByteS);
+                    const std::size_t lb0 = byteOffAtCp(lv, overlapS - lStartCp);
+                    const std::size_t lb1 = byteOffAtCp(lv, overlapE - lStartCp);
+                    const float x0 = textX + MeasureUtf8TextRun(lv.substr(0u, lb0), fontSize, fontFam).width;
+                    const float x1 = textX + MeasureUtf8TextRun(lv.substr(0u, lb1), fontSize, fontFam).width;
+                    const float sx0 = std::clamp(x0, clipL, clipR);
+                    const float sx1 = std::clamp(x1, clipL, clipR);
+                    if (sx1 > sx0 + 0.5f) {
+                        const std::uint32_t selId = AllocateRoundedRectNode(
+                            sx0,
+                            textY + static_cast<float>(lIdx) * lineH,
+                            sx1 - sx0,
+                            lineH,
+                            Color{0.24f, 0.52f, 0.88f, 0.44f},
+                            CornerRadius{2.0f},
+                            elem);
+                        nodes_[selId].opacity = effAlpha;
+                        applyNodeTransform(selId);
+                        ++emittedCount;
+                    }
+                };
+                while (scanCursor < displayStr.size()) {
+                    const std::size_t prevCursor = scanCursor;
+                    if (!DecodeNextUtf8CodePoint(displayStr, scanCursor, cp)) break;
+                    if (cp == '\n') {
+                        emitLineSel(lineIdx, lineStartCp, totalCp, lineByteStart, prevCursor);
+                        ++lineIdx;
+                        ++totalCp;
+                        lineStartCp = totalCp;
+                        lineByteStart = scanCursor;
+                    } else {
+                        ++totalCp;
+                    }
+                }
+                emitLineSel(lineIdx, lineStartCp, totalCp, lineByteStart, displayStr.size());
+            } else {
+                const std::size_t b0 = byteOffAtCp(displayStr, selS);
+                const std::size_t b1 = byteOffAtCp(displayStr, selE);
+                const float x0 = textX + MeasureUtf8TextRun(std::string_view(displayStr).substr(0u, b0), fontSize, fontFam).width;
+                const float x1 = textX + MeasureUtf8TextRun(std::string_view(displayStr).substr(0u, b1), fontSize, fontFam).width;
+                const float sx0 = std::clamp(x0, clipL, clipR);
+                const float sx1 = std::clamp(x1, clipL, clipR);
+                if (sx1 > sx0 + 0.5f) {
+                    const Rect cRect = tbox->CaretLocalRect();
+                    const std::uint32_t selId = AllocateRoundedRectNode(
+                        sx0,
+                        cRect.y,
+                        sx1 - sx0,
+                        cRect.height,
+                        Color{0.24f, 0.52f, 0.88f, 0.44f},
+                        CornerRadius{2.0f},
+                        elem);
+                    nodes_[selId].opacity = effAlpha;
+                    applyNodeTransform(selId);
+                    ++emittedCount;
+                }
+            }
+        }
 
         emittedCount = static_cast<std::uint16_t>(
             emittedCount + EmitTextRunNodes(

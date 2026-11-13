@@ -273,6 +273,7 @@ struct AxbCompiledBindingChain {
     std::uint16_t targetPropertyId = 0;
     BindingMode mode = BindingMode::OneWay;
     UnifiedValue fallbackValue{};
+    UnifiedValue targetNullValue{};
     std::vector<AxbCompiledHop> hops;
     // Phase 5D: ElementName / RelativeSource & zero-allocation built-in value converter
     std::string elementName;

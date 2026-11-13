@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cmath>
+#include <cstdio>
 #include <mutex>
 #include <string>
 #include <unordered_map>
@@ -60,6 +61,7 @@ struct PendingScriptUiState {
     std::mutex mutex;
     std::vector<DcEntry> dcEntries;
     std::vector<ControlWrapperEntry> controlWrappers;
+    std::unordered_map<const ExecutionDomainContext*, ObjectRef> appInstances;
     std::unordered_map<const ExecutionDomainContext*, std::vector<std::string>> pendingDictionaries;
     std::unordered_map<const ExecutionDomainContext*, PendingMountTarget> pendingMountTargets;
     std::vector<PreMountedWindowEntry> preMountedWindows;
@@ -89,6 +91,11 @@ struct PendingScriptUiState {
         for (const auto& cw : controlWrappers) {
             if (cw.wrapper.valid()) {
                 rs_rt::markValueInPools(UnifiedValue{cw.wrapper});
+            }
+        }
+        for (const auto& kv : appInstances) {
+            if (kv.second.valid()) {
+                rs_rt::markValueInPools(UnifiedValue{kv.second});
             }
         }
     }
@@ -300,6 +307,7 @@ struct PendingScriptUiState {
             }
             pendingMountTargets.erase(dom);
             pendingDictionaries.erase(dom);
+            appInstances.erase(dom);
         }
     }
 };
@@ -633,6 +641,7 @@ bool DispatchScriptWrapperRoutedEventImpl(
         else if (eventName == "TextChanged") evArgsTypeName = "TextChangedEventArgs";
         else if (eventName == "ValueChanged" || eventName == "SelectedItemChanged") evArgsTypeName = "RoutedPropertyChangedEventArgs";
         else if (eventName == "KeyDown" || eventName == "KeyUp") evArgsTypeName = "KeyEventArgs";
+        else if (eventName == "RequestNavigate") evArgsTypeName = "RequestNavigateEventArgs";
         else if (eventName == "MouseLeftButtonDown" || eventName == "MouseLeftButtonUp") evArgsTypeName = "MouseButtonEventArgs";
 
         const rs_sem::TypeSymbol* eSym = nullptr;
@@ -667,7 +676,7 @@ bool DispatchScriptWrapperRoutedEventImpl(
                 std::int64_t si = -1;
                 if (hasArg && std::holds_alternative<std::int64_t>(argVal)) si = std::get<std::int64_t>(argVal);
                 eFields[fi] = value::FromInt(si);
-            } else if (fn == "Text" || fn == "NewText") {
+            } else if (fn == "Text" || fn == "NewText" || fn == "Uri") {
                 const std::string s = hasArg ? FormatBindingString({}, &argVal, 1u, domains) : std::string();
                 if (auto sr = domains->uiHeap().allocateString(s, &aErr)) eFields[fi] = UnifiedValue(*sr);
             } else if (fn == "NewValue") {
@@ -735,6 +744,16 @@ void ClearPendingMainWindowMountTarget(const ExecutionDomainContext* domains) no
 
 void ClearScriptUiDomainState(const ExecutionDomainContext* domains) noexcept {
     PendingScriptUiState::Instance().ClearForDomain(domains);
+}
+
+void SetActiveApplicationObject(const ExecutionDomainContext* domains, ObjectRef appObj) {
+    if (!domains) return;
+    std::lock_guard<std::mutex> lock(PendingScriptUiState::Instance().mutex);
+    if (appObj.valid()) {
+        PendingScriptUiState::Instance().appInstances[domains] = appObj;
+    } else {
+        PendingScriptUiState::Instance().appInstances.erase(domains);
+    }
 }
 
 bool MountAndWireMainWindow(
@@ -2665,6 +2684,204 @@ void ScriptUiBridge::RegisterCoreUiBindings(BindingRegistry& bindings) {
             }
             elem->SetVisibility(Visibility::Collapsed);
             return UnifiedValue{true};
+        });
+
+    bindSdkFn(
+        "Observable_NotifyPropertyChanged",
+        [domPtr, engineSlot](
+            const rs_bc::FunctionReference&,
+            ValueSpan args,
+            RuntimeError&)
+            -> std::optional<UnifiedValue> {
+            if (args.empty()) return UnifiedValue{false};
+            const auto* srcRef = std::get_if<ObjectRef>(&args[0]);
+            if (!srcRef || !srcRef->valid()) return UnifiedValue{false};
+            std::string propName;
+            if (args.size() >= 2u && domPtr) {
+                propName = FormatBindingString({}, &args[1], 1u, domPtr);
+            }
+            DualTrackBindingEngine* liveEng = (engineSlot && *engineSlot) ? *engineSlot : nullptr;
+            if (liveEng && DualTrackBindingEngine::IsLiveInstance(liveEng)) {
+                (void)liveEng->NotifyScriptObjectPropertyChanged(*srcRef, propName);
+                return UnifiedValue{true};
+            }
+            return UnifiedValue{false};
+        });
+
+    bindSdkFn(
+        "TextBox_Select",
+        [handlesPtr](
+            const rs_bc::FunctionReference&,
+            ValueSpan args,
+            RuntimeError&)
+            -> std::optional<UnifiedValue> {
+            if (args.size() < 3u || !handlesPtr) return UnifiedValue{false};
+            NativeHandle handle{};
+            std::int64_t start = 0, len = 0;
+            if (!args[0].tryGetNativeHandle(handle) || !handle.valid()) return UnifiedValue{false};
+            (void)args[1].tryGetInt64(start);
+            (void)args[2].tryGetInt64(len);
+            auto* elem = UIElement::FromNativeHandle(*handlesPtr, handle);
+            if (auto* tb = elem ? elem->DynamicCast<TextBox>() : nullptr) {
+                tb->Select(
+                    static_cast<std::size_t>(std::max<std::int64_t>(0, start)),
+                    static_cast<std::size_t>(std::max<std::int64_t>(0, len)));
+                return UnifiedValue{true};
+            }
+            return UnifiedValue{false};
+        });
+
+    bindSdkFn(
+        "TextBox_GetSelectedText",
+        [handlesPtr, uiHeapPtr](
+            const rs_bc::FunctionReference&,
+            ValueSpan args,
+            RuntimeError& error)
+            -> std::optional<UnifiedValue> {
+            if (!uiHeapPtr) {
+                error.code = ErrorCode::InvalidObjectReference;
+                return std::nullopt;
+            }
+            if (args.empty() || !handlesPtr) return uiHeapPtr->allocateString("", &error);
+            NativeHandle handle{};
+            if (!args[0].tryGetNativeHandle(handle) || !handle.valid()) return uiHeapPtr->allocateString("", &error);
+            auto* elem = UIElement::FromNativeHandle(*handlesPtr, handle);
+            std::string sel;
+            if (const auto* tb = elem ? elem->DynamicCast<TextBox>() : nullptr) {
+                sel = tb->GetSelectedText();
+            }
+            return uiHeapPtr->allocateString(sel, &error);
+        });
+
+    bindSdkFn(
+        "TextBox_SetSelectedText",
+        [handlesPtr, domPtr](
+            const rs_bc::FunctionReference&,
+            ValueSpan args,
+            RuntimeError&)
+            -> std::optional<UnifiedValue> {
+            if (args.size() < 2u || !handlesPtr) return UnifiedValue{false};
+            NativeHandle handle{};
+            if (!args[0].tryGetNativeHandle(handle) || !handle.valid()) return UnifiedValue{false};
+            auto* elem = UIElement::FromNativeHandle(*handlesPtr, handle);
+            if (auto* tb = elem ? elem->DynamicCast<TextBox>() : nullptr) {
+                tb->SetSelectedText(FormatBindingString({}, &args[1], 1u, domPtr));
+                return UnifiedValue{true};
+            }
+            return UnifiedValue{false};
+        });
+
+    bindSdkFn(
+        "TextBox_Copy",
+        [handlesPtr](const rs_bc::FunctionReference&, ValueSpan args, RuntimeError&) -> std::optional<UnifiedValue> {
+            if (args.empty() || !handlesPtr) return UnifiedValue{false};
+            NativeHandle handle{};
+            if (!args[0].tryGetNativeHandle(handle) || !handle.valid()) return UnifiedValue{false};
+            auto* elem = UIElement::FromNativeHandle(*handlesPtr, handle);
+            if (const auto* tb = elem ? elem->DynamicCast<TextBox>() : nullptr) {
+                return UnifiedValue{tb->Copy()};
+            }
+            return UnifiedValue{false};
+        });
+
+    bindSdkFn(
+        "TextBox_Cut",
+        [handlesPtr](const rs_bc::FunctionReference&, ValueSpan args, RuntimeError&) -> std::optional<UnifiedValue> {
+            if (args.empty() || !handlesPtr) return UnifiedValue{false};
+            NativeHandle handle{};
+            if (!args[0].tryGetNativeHandle(handle) || !handle.valid()) return UnifiedValue{false};
+            auto* elem = UIElement::FromNativeHandle(*handlesPtr, handle);
+            if (auto* tb = elem ? elem->DynamicCast<TextBox>() : nullptr) {
+                return UnifiedValue{tb->Cut()};
+            }
+            return UnifiedValue{false};
+        });
+
+    bindSdkFn(
+        "TextBox_Paste",
+        [handlesPtr](const rs_bc::FunctionReference&, ValueSpan args, RuntimeError&) -> std::optional<UnifiedValue> {
+            if (args.empty() || !handlesPtr) return UnifiedValue{false};
+            NativeHandle handle{};
+            if (!args[0].tryGetNativeHandle(handle) || !handle.valid()) return UnifiedValue{false};
+            auto* elem = UIElement::FromNativeHandle(*handlesPtr, handle);
+            if (auto* tb = elem ? elem->DynamicCast<TextBox>() : nullptr) {
+                return UnifiedValue{tb->Paste()};
+            }
+            return UnifiedValue{false};
+        });
+
+    bindSdkFn(
+        "UIElement_FindResourceString",
+        [handlesPtr, uiHeapPtr, domPtr](
+            const rs_bc::FunctionReference&,
+            ValueSpan args,
+            RuntimeError& error)
+            -> std::optional<UnifiedValue> {
+            if (!uiHeapPtr) {
+                error.code = ErrorCode::InvalidObjectReference;
+                return std::nullopt;
+            }
+            if (args.size() < 2u) return uiHeapPtr->allocateString("", &error);
+            UIElement* elem = nullptr;
+            NativeHandle handle{};
+            if (handlesPtr && args[0].tryGetNativeHandle(handle) && handle.valid()) {
+                elem = UIElement::FromNativeHandle(*handlesPtr, handle);
+            }
+            const std::string key = FormatBindingString({}, &args[1], 1u, domPtr);
+            std::string outStr;
+            if (!key.empty()) {
+                const UnifiedValue* found = AxbTemplateRegistry::Instance().FindDynamicResourceForElement(key, elem);
+                if (!found) found = AxbTemplateRegistry::Instance().FindResource(key);
+                if (found) {
+                    if (const auto col = value::TryGetColor(*found)) {
+                        char hexBuf[16]{};
+                        const auto toB = [](float c) noexcept -> unsigned {
+                            const float cl = (c < 0.0f) ? 0.0f : ((c > 1.0f) ? 1.0f : c);
+                            return static_cast<unsigned>(cl * 255.0f + 0.5f);
+                        };
+                        std::snprintf(hexBuf, sizeof(hexBuf), "#%02X%02X%02X%02X", toB(col->a), toB(col->r), toB(col->g), toB(col->b));
+                        outStr = hexBuf;
+                    } else {
+                        outStr = FormatBindingString({}, found, 1u, domPtr);
+                    }
+                }
+            }
+            return uiHeapPtr->allocateString(outStr, &error);
+        });
+
+    bindSdkFn(
+        "UIElement_SetDynamicResourceString",
+        [handlesPtr, domPtr](
+            const rs_bc::FunctionReference&,
+            ValueSpan args,
+            RuntimeError&)
+            -> std::optional<UnifiedValue> {
+            if (args.size() < 3u) return UnifiedValue{false};
+            UIElement* elem = nullptr;
+            NativeHandle handle{};
+            if (handlesPtr && args[0].tryGetNativeHandle(handle) && handle.valid()) {
+                elem = UIElement::FromNativeHandle(*handlesPtr, handle);
+            }
+            const std::string key = FormatBindingString({}, &args[1], 1u, domPtr);
+            const std::string valStr = FormatBindingString({}, &args[2], 1u, domPtr);
+            if (key.empty()) return UnifiedValue{false};
+            UnifiedValue uv = (!valStr.empty() && valStr.front() == '#')
+                ? ParseBuiltinLiteralPropertyValue(PropId_Background, valStr)
+                : value::FromString(valStr);
+            const std::size_t n = AxbTemplateRegistry::Instance().SetDynamicResource(key, uv, elem);
+            return UnifiedValue{n > 0u || !key.empty()};
+        });
+
+    bindSdkFn(
+        "Application_GetCurrent",
+        [domPtr](const rs_bc::FunctionReference&, ValueSpan, RuntimeError&) -> std::optional<UnifiedValue> {
+            if (!domPtr) return UnifiedValue{NullObject{}};
+            std::lock_guard<std::mutex> lock(PendingScriptUiState::Instance().mutex);
+            const auto it = PendingScriptUiState::Instance().appInstances.find(domPtr);
+            if (it != PendingScriptUiState::Instance().appInstances.end() && it->second.valid()) {
+                return UnifiedValue{it->second};
+            }
+            return UnifiedValue{NullObject{}};
         });
 }
 

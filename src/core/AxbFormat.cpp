@@ -1291,7 +1291,16 @@ std::uint16_t ResolveBuiltinPropertyId(std::string_view propertyName) noexcept {
         return PropId_SelectedValuePath;
     }
     if (propertyName == "SelectedValue") {
-        return PropId_SelectedItem;
+        return PropId_SelectedValue;
+    }
+    if (propertyName == "CommandBindingsSpec") {
+        return PropId_CommandBindingsSpec;
+    }
+    if (propertyName == "SelectionStart" || propertyName == "TextBox.SelectionStart") {
+        return PropId_SelectionStart;
+    }
+    if (propertyName == "SelectionLength" || propertyName == "TextBox.SelectionLength") {
+        return PropId_SelectionLength;
     }
     if (propertyName == "Offset") {
         return PropId_Value;
@@ -3896,26 +3905,27 @@ void VisitPackageValues(const AxbPackage& pkg, Fn&& fn) noexcept {
             fn(res.second);
         }
     }
+    auto visitBindingChain = [&](auto& selfMulti, const AxbCompiledBindingChain& ch) noexcept -> void {
+        if (ch.fallbackValue.isTraceable()) {
+            fn(ch.fallbackValue);
+        }
+        if (ch.targetNullValue.isTraceable()) {
+            fn(ch.targetNullValue);
+        }
+        if (ch.nestedMultiBinding) {
+            selfMulti(selfMulti, *ch.nestedMultiBinding);
+        }
+    };
     auto visitMultiBindingRec = [&](auto& self, const AxbCompiledMultiBinding& mb) noexcept -> void {
         if (mb.fallbackValue.isTraceable()) {
             fn(mb.fallbackValue);
         }
         for (const auto& srcCh : mb.sources) {
-            if (srcCh.fallbackValue.isTraceable()) {
-                fn(srcCh.fallbackValue);
-            }
-            if (srcCh.nestedMultiBinding) {
-                self(self, *srcCh.nestedMultiBinding);
-            }
+            visitBindingChain(self, srcCh);
         }
     };
     for (const auto& ch : pkg.bindingChains) {
-        if (ch.fallbackValue.isTraceable()) {
-            fn(ch.fallbackValue);
-        }
-        if (ch.nestedMultiBinding) {
-            visitMultiBindingRec(visitMultiBindingRec, *ch.nestedMultiBinding);
-        }
+        visitBindingChain(visitMultiBindingRec, ch);
     }
     for (const auto& mb : pkg.multiBindings) {
         visitMultiBindingRec(visitMultiBindingRec, mb);
@@ -3938,12 +3948,18 @@ void VisitPackageValues(const AxbPackage& pkg, Fn&& fn) noexcept {
             if (act.valueBinding && act.valueBinding->fallbackValue.isTraceable()) {
                 fn(act.valueBinding->fallbackValue);
             }
+            if (act.valueBinding && act.valueBinding->targetNullValue.isTraceable()) {
+                fn(act.valueBinding->targetNullValue);
+            }
             if (act.valueMultiBinding) {
                 visitMultiBindingRec(visitMultiBindingRec, *act.valueMultiBinding);
             }
             if (act.commandParameter.isTraceable()) fn(act.commandParameter);
             if (act.commandParameterBinding.fallbackValue.isTraceable()) {
                 fn(act.commandParameterBinding.fallbackValue);
+            }
+            if (act.commandParameterBinding.targetNullValue.isTraceable()) {
+                fn(act.commandParameterBinding.targetNullValue);
             }
             if (act.commandParameterBinding.nestedMultiBinding) {
                 visitMultiBindingRec(visitMultiBindingRec, *act.commandParameterBinding.nestedMultiBinding);
@@ -3967,6 +3983,7 @@ void VisitPackageValues(const AxbPackage& pkg, Fn&& fn) noexcept {
             }
             for (const auto& setter : trig.setters) {
                 if (setter.value.isTraceable()) fn(setter.value);
+                if (setter.binding) visitBindingChain(visitMultiBindingRec, *setter.binding);
             }
             visitStoryboards(trig.enterStoryboards);
             visitStoryboards(trig.exitStoryboards);
@@ -3984,6 +4001,7 @@ void VisitPackageValues(const AxbPackage& pkg, Fn&& fn) noexcept {
             for (const auto& vs : vsg.states) {
                 for (const auto& setter : vs.setters) {
                     if (setter.value.isTraceable()) fn(setter.value);
+                    if (setter.binding) visitBindingChain(visitMultiBindingRec, *setter.binding);
                 }
                 for (const auto& tl : vs.storyboard.timelines) {
                     if (tl.fromValue.isTraceable()) fn(tl.fromValue);
@@ -3998,9 +4016,7 @@ void VisitPackageValues(const AxbPackage& pkg, Fn&& fn) noexcept {
     for (const auto& st : pkg.styles) {
         for (const auto& setter : st.setters) {
             if (setter.value.isTraceable()) fn(setter.value);
-            if (setter.binding && setter.binding->fallbackValue.isTraceable()) {
-                fn(setter.binding->fallbackValue);
-            }
+            if (setter.binding) visitBindingChain(visitMultiBindingRec, *setter.binding);
         }
         for (const auto& trig : st.triggers) {
             for (const auto& cond : trig.conditions) {
@@ -4008,6 +4024,7 @@ void VisitPackageValues(const AxbPackage& pkg, Fn&& fn) noexcept {
             }
             for (const auto& setter : trig.setters) {
                 if (setter.value.isTraceable()) fn(setter.value);
+                if (setter.binding) visitBindingChain(visitMultiBindingRec, *setter.binding);
             }
             visitStoryboards(trig.enterStoryboards);
             visitStoryboards(trig.exitStoryboards);
@@ -4025,6 +4042,7 @@ void VisitPackageValues(const AxbPackage& pkg, Fn&& fn) noexcept {
             for (const auto& vs : vsg.states) {
                 for (const auto& setter : vs.setters) {
                     if (setter.value.isTraceable()) fn(setter.value);
+                    if (setter.binding) visitBindingChain(visitMultiBindingRec, *setter.binding);
                 }
                 for (const auto& tl : vs.storyboard.timelines) {
                     if (tl.fromValue.isTraceable()) fn(tl.fromValue);
@@ -4051,6 +4069,133 @@ void VisitPackageValues(const AxbPackage& pkg, Fn&& fn) noexcept {
     }
     for (const auto& ct : pkg.controlTemplates) {
         visitControlTemplate(ct);
+    }
+}
+
+template <typename Package, typename Fn>
+void VisitAllPackageSetters(Package& pkg, Fn&& fn) {
+    for (auto& st : pkg.styles) {
+        for (auto& setter : st.setters) fn(setter);
+        for (auto& trig : st.triggers) {
+            for (auto& setter : trig.setters) fn(setter);
+        }
+        for (auto& vsg : st.visualStateGroups) {
+            for (auto& vs : vsg.states) {
+                for (auto& setter : vs.setters) fn(setter);
+            }
+        }
+    }
+    for (auto& ct : pkg.controlTemplates) {
+        for (auto& trig : ct.triggers) {
+            for (auto& setter : trig.setters) fn(setter);
+        }
+        for (auto& vsg : ct.visualStateGroups) {
+            for (auto& vs : vsg.states) {
+                for (auto& setter : vs.setters) fn(setter);
+            }
+        }
+    }
+}
+
+template <typename Package, typename Fn>
+void VisitAllPackageActions(Package& pkg, Fn&& fn) {
+    for (auto& st : pkg.styles) {
+        for (auto& trig : st.triggers) {
+            for (auto& act : trig.enterActions) fn(act);
+            for (auto& act : trig.exitActions) fn(act);
+        }
+        for (auto& et : st.eventTriggers) {
+            for (auto& act : et.actions) fn(act);
+        }
+    }
+    for (auto& ct : pkg.controlTemplates) {
+        for (auto& trig : ct.triggers) {
+            for (auto& act : trig.enterActions) fn(act);
+            for (auto& act : trig.exitActions) fn(act);
+        }
+        for (auto& et : ct.eventTriggers) {
+            for (auto& act : et.actions) fn(act);
+        }
+    }
+}
+
+template <typename Package, typename Fn>
+void VisitAllNestedBindingChains(Package& pkg, Fn&& fn) {
+    auto visitMulti = [&](auto& selfMulti, auto& selfChain, auto& mb) -> void {
+        for (auto& srcCh : mb.sources) {
+            selfChain(selfMulti, selfChain, srcCh);
+        }
+    };
+    auto visitChain = [&](auto& selfMulti, auto& selfChain, auto& ch) -> void {
+        fn(ch);
+        if (ch.nestedMultiBinding) {
+            selfMulti(selfMulti, selfChain, *ch.nestedMultiBinding);
+        }
+    };
+    auto visitActions = [&](auto& acts) {
+        for (auto& act : acts) {
+            if (act.valueBinding) {
+                visitChain(visitMulti, visitChain, *act.valueBinding);
+            }
+            if (act.valueMultiBinding) {
+                visitMulti(visitMulti, visitChain, *act.valueMultiBinding);
+            }
+            if (act.hasCommandParameterBinding) {
+                visitChain(visitMulti, visitChain, act.commandParameterBinding);
+            } else {
+                fn(act.commandParameterBinding);
+            }
+            if (act.targetObjectBinding) {
+                visitChain(visitMulti, visitChain, *act.targetObjectBinding);
+            }
+        }
+    };
+    auto visitSetters = [&](auto& setters) {
+        for (auto& setter : setters) {
+            if (setter.binding) {
+                visitChain(visitMulti, visitChain, *setter.binding);
+            }
+        }
+    };
+
+    for (auto& ch : pkg.bindingChains) {
+        if (ch.nestedMultiBinding) {
+            visitMulti(visitMulti, visitChain, *ch.nestedMultiBinding);
+        }
+    }
+    for (auto& mb : pkg.multiBindings) {
+        visitMulti(visitMulti, visitChain, mb);
+    }
+    for (auto& st : pkg.styles) {
+        visitSetters(st.setters);
+        for (auto& trig : st.triggers) {
+            visitSetters(trig.setters);
+            visitActions(trig.enterActions);
+            visitActions(trig.exitActions);
+        }
+        for (auto& et : st.eventTriggers) {
+            visitActions(et.actions);
+        }
+        for (auto& vsg : st.visualStateGroups) {
+            for (auto& vs : vsg.states) {
+                visitSetters(vs.setters);
+            }
+        }
+    }
+    for (auto& ct : pkg.controlTemplates) {
+        for (auto& trig : ct.triggers) {
+            visitSetters(trig.setters);
+            visitActions(trig.enterActions);
+            visitActions(trig.exitActions);
+        }
+        for (auto& et : ct.eventTriggers) {
+            visitActions(et.actions);
+        }
+        for (auto& vsg : ct.visualStateGroups) {
+            for (auto& vs : vsg.states) {
+                visitSetters(vs.setters);
+            }
+        }
     }
 }
 
@@ -4517,8 +4662,10 @@ bool AxbPackage::BindAgainstProgram(
         }();
         const std::string fwd1 = shortKey + "_Convert";
         const std::string fwd2 = shortKey + "::Convert";
+        const std::string fwd3 = shortKey + ".Convert";
         const std::string back1 = shortKey + "_ConvertBack";
         const std::string back2 = shortKey + "::ConvertBack";
+        const std::string back3 = shortKey + ".ConvertBack";
 
         for (const auto& mod : program.modules()) {
             for (const auto& fn : mod.functions) {
@@ -4528,11 +4675,15 @@ bool AxbPackage::BindAgainstProgram(
                 }
                 if (ioConvSym == 0 &&
                     (fn.name == convKey || leafName == shortKey ||
-                     leafName == fwd1 || fn.name.find(fwd2) != std::string::npos)) {
+                     leafName == fwd1 || leafName == fwd3 ||
+                     fn.name.find(fwd2) != std::string::npos ||
+                     fn.name.find(fwd3) != std::string::npos)) {
                     ioConvSym = fn.symbolId;
                 }
                 if (ioBackSym == 0 &&
-                    (leafName == back1 || fn.name.find(back2) != std::string::npos)) {
+                    (leafName == back1 || leafName == back3 ||
+                     fn.name.find(back2) != std::string::npos ||
+                     fn.name.find(back3) != std::string::npos)) {
                     ioBackSym = fn.symbolId;
                 }
             }
@@ -4892,6 +5043,8 @@ bool AxbPackage::BindAgainstProgram(
 
 namespace {
 constexpr std::uint32_t kAxb4P15SectionMagic = 0x35315041u; // "AP15"
+constexpr std::uint32_t kAxb4SetterActionBindSectionMagic = 0x34414253u; // "SBA4"
+constexpr std::uint32_t kAxb4TargetNullExtSectionMagic = 0x34454E54u; // "TNE4"
 } // namespace
 
 bool AxbPackage::HasP15Section() const noexcept {
@@ -5059,6 +5212,22 @@ std::vector<std::uint8_t> AxbPackage::Serialize() const {
     WriteU32(out, static_cast<std::uint32_t>(bindingChains.size()));
     for (const auto& chain : bindingChains) {
         WriteValue(out, chain.fallbackValue);
+    }
+    {
+        bool hasAnyTargetNull = false;
+        for (const auto& chain : bindingChains) {
+            if (!std::holds_alternative<std::monostate>(chain.targetNullValue)) {
+                hasAnyTargetNull = true;
+                break;
+            }
+        }
+        if (hasAnyTargetNull) {
+            WriteU32(out, 0x344E5441u);
+            WriteU32(out, static_cast<std::uint32_t>(bindingChains.size()));
+            for (const auto& chain : bindingChains) {
+                WriteValue(out, chain.targetNullValue);
+            }
+        }
     }
 
     if (!mtsdfPaths.empty()) {
@@ -5526,68 +5695,68 @@ std::vector<std::uint8_t> AxbPackage::Serialize() const {
         }
     }
 
+    auto writeHopVec = [&](const std::vector<AxbCompiledHop>& hops) {
+        WriteU32(out, static_cast<std::uint32_t>(hops.size()));
+        for (const auto& hop : hops) {
+            const std::string wireMemberName =
+                (hop.collectionIndex >= 0 && hop.memberName.find('[') == std::string::npos)
+                    ? (hop.memberName + "[" + std::to_string(hop.collectionIndex) + "]")
+                    : hop.memberName;
+            WriteString(out, wireMemberName);
+            WriteU64(out, hop.declaringTypeId);
+            WriteU32(out, hop.fieldIndex);
+            WriteU8(out, hop.observableBitIndex);
+            WriteU64(out, hop.getterSymbolId);
+            WriteU64(out, hop.setterSymbolId);
+            std::uint8_t hopFlags = 0u;
+            if (hop.isAutoProperty) hopFlags |= 0x01u;
+            if (hop.isObservable) hopFlags |= 0x02u;
+            if (hop.isReadOnly) hopFlags |= 0x04u;
+            if (hop.isSimState) hopFlags |= 0x08u;
+            if (hop.isSimCommand) hopFlags |= 0x10u;
+            WriteU8(out, hopFlags);
+        }
+    };
+
+    auto writeFullChainRec = [&](auto& selfChain, auto& selfMulti, const AxbCompiledBindingChain& ch) -> void {
+        WriteString(out, ch.rawPath);
+        WriteU16(out, ch.targetPropertyId);
+        WriteU8(out, static_cast<std::uint8_t>(ch.mode));
+        WriteValue(out, ch.fallbackValue);
+        writeHopVec(ch.hops);
+        WriteString(out, ch.elementName);
+        WriteString(out, ch.relativeAncestorType);
+        WriteU8(out, ch.relativeSelf ? 1u : 0u);
+        WriteU8(out, static_cast<std::uint8_t>(ch.converter));
+        WriteString(out, ch.converterKey);
+        WriteString(out, ch.converterParameter);
+        WriteString(out, ch.stringFormat);
+        WriteU64(out, ch.converterSymbolId);
+        WriteU64(out, ch.convertBackSymbolId);
+        WriteU8(out, ch.nestedMultiBinding ? 1u : 0u);
+        if (ch.nestedMultiBinding) {
+            selfMulti(selfChain, selfMulti, *ch.nestedMultiBinding);
+        }
+    };
+
+    auto writeMultiBindingRec = [&](auto& selfChain, auto& selfMulti, const AxbCompiledMultiBinding& mb) -> void {
+        WriteU16(out, mb.targetPropertyId);
+        WriteU8(out, static_cast<std::uint8_t>(mb.mode));
+        WriteU8(out, static_cast<std::uint8_t>(mb.converter));
+        WriteString(out, mb.converterKey);
+        WriteString(out, mb.converterParameter);
+        WriteString(out, mb.stringFormat);
+        WriteValue(out, mb.fallbackValue);
+        WriteU64(out, mb.converterSymbolId);
+        WriteU64(out, mb.convertBackSymbolId);
+        WriteU32(out, static_cast<std::uint32_t>(mb.sources.size()));
+        for (const auto& srcCh : mb.sources) {
+            selfChain(selfChain, selfMulti, srcCh);
+        }
+    };
+
     if (HasP14Section()) {
         WriteU32(out, kAxb4P14SectionMagic);
-
-        auto writeHopVec = [&](const std::vector<AxbCompiledHop>& hops) {
-            WriteU32(out, static_cast<std::uint32_t>(hops.size()));
-            for (const auto& hop : hops) {
-                const std::string wireMemberName =
-                    (hop.collectionIndex >= 0 && hop.memberName.find('[') == std::string::npos)
-                        ? (hop.memberName + "[" + std::to_string(hop.collectionIndex) + "]")
-                        : hop.memberName;
-                WriteString(out, wireMemberName);
-                WriteU64(out, hop.declaringTypeId);
-                WriteU32(out, hop.fieldIndex);
-                WriteU8(out, hop.observableBitIndex);
-                WriteU64(out, hop.getterSymbolId);
-                WriteU64(out, hop.setterSymbolId);
-                std::uint8_t hopFlags = 0u;
-                if (hop.isAutoProperty) hopFlags |= 0x01u;
-                if (hop.isObservable) hopFlags |= 0x02u;
-                if (hop.isReadOnly) hopFlags |= 0x04u;
-                if (hop.isSimState) hopFlags |= 0x08u;
-                if (hop.isSimCommand) hopFlags |= 0x10u;
-                WriteU8(out, hopFlags);
-            }
-        };
-
-        auto writeFullChainRec = [&](auto& selfChain, auto& selfMulti, const AxbCompiledBindingChain& ch) -> void {
-            WriteString(out, ch.rawPath);
-            WriteU16(out, ch.targetPropertyId);
-            WriteU8(out, static_cast<std::uint8_t>(ch.mode));
-            WriteValue(out, ch.fallbackValue);
-            writeHopVec(ch.hops);
-            WriteString(out, ch.elementName);
-            WriteString(out, ch.relativeAncestorType);
-            WriteU8(out, ch.relativeSelf ? 1u : 0u);
-            WriteU8(out, static_cast<std::uint8_t>(ch.converter));
-            WriteString(out, ch.converterKey);
-            WriteString(out, ch.converterParameter);
-            WriteString(out, ch.stringFormat);
-            WriteU64(out, ch.converterSymbolId);
-            WriteU64(out, ch.convertBackSymbolId);
-            WriteU8(out, ch.nestedMultiBinding ? 1u : 0u);
-            if (ch.nestedMultiBinding) {
-                selfMulti(selfChain, selfMulti, *ch.nestedMultiBinding);
-            }
-        };
-
-        auto writeMultiBindingRec = [&](auto& selfChain, auto& selfMulti, const AxbCompiledMultiBinding& mb) -> void {
-            WriteU16(out, mb.targetPropertyId);
-            WriteU8(out, static_cast<std::uint8_t>(mb.mode));
-            WriteU8(out, static_cast<std::uint8_t>(mb.converter));
-            WriteString(out, mb.converterKey);
-            WriteString(out, mb.converterParameter);
-            WriteString(out, mb.stringFormat);
-            WriteValue(out, mb.fallbackValue);
-            WriteU64(out, mb.converterSymbolId);
-            WriteU64(out, mb.convertBackSymbolId);
-            WriteU32(out, static_cast<std::uint32_t>(mb.sources.size()));
-            for (const auto& srcCh : mb.sources) {
-                selfChain(selfChain, selfMulti, srcCh);
-            }
-        };
 
         auto writeActionList = [&](const std::vector<AxbInteractionAction>& acts) {
             WriteU32(out, static_cast<std::uint32_t>(acts.size()));
@@ -5748,6 +5917,82 @@ std::vector<std::uint8_t> AxbPackage::Serialize() const {
             WriteU32(out, static_cast<std::uint32_t>(ct.eventTriggers.size()));
             for (const auto& et : ct.eventTriggers) {
                 writeActTargetObj(et.actions);
+            }
+        }
+    }
+
+    {
+        struct SetterBindEntry {
+            std::uint32_t ordinal = 0u;
+            const AxbCompiledBindingChain* chain = nullptr;
+        };
+        struct ActionBindEntry {
+            std::uint32_t ordinal = 0u;
+            const AxbCompiledBindingChain* valueBinding = nullptr;
+            const AxbCompiledMultiBinding* valueMultiBinding = nullptr;
+        };
+        std::vector<SetterBindEntry> setterBindEntries;
+        std::uint32_t setterOrdinal = 0u;
+        VisitAllPackageSetters(*this, [&](const AxbPropertySetter& setter) {
+            if (setter.binding) {
+                setterBindEntries.push_back(SetterBindEntry{setterOrdinal, setter.binding.get()});
+            }
+            ++setterOrdinal;
+        });
+        std::vector<ActionBindEntry> actionBindEntries;
+        std::uint32_t actionOrdinal = 0u;
+        VisitAllPackageActions(*this, [&](const AxbInteractionAction& act) {
+            if (act.valueBinding || act.valueMultiBinding) {
+                actionBindEntries.push_back(ActionBindEntry{
+                    actionOrdinal,
+                    act.valueBinding.get(),
+                    act.valueMultiBinding.get()});
+            }
+            ++actionOrdinal;
+        });
+        if (!setterBindEntries.empty() || !actionBindEntries.empty()) {
+            WriteU32(out, kAxb4SetterActionBindSectionMagic);
+            WriteU32(out, static_cast<std::uint32_t>(setterBindEntries.size()));
+            for (const auto& entry : setterBindEntries) {
+                WriteU32(out, entry.ordinal);
+                writeFullChainRec(writeFullChainRec, writeMultiBindingRec, *entry.chain);
+            }
+            WriteU32(out, static_cast<std::uint32_t>(actionBindEntries.size()));
+            for (const auto& entry : actionBindEntries) {
+                WriteU32(out, entry.ordinal);
+                std::uint8_t flags = 0u;
+                if (entry.valueBinding) flags |= 0x01u;
+                if (entry.valueMultiBinding) flags |= 0x02u;
+                WriteU8(out, flags);
+                if (entry.valueBinding) {
+                    writeFullChainRec(writeFullChainRec, writeMultiBindingRec, *entry.valueBinding);
+                }
+                if (entry.valueMultiBinding) {
+                    writeMultiBindingRec(writeFullChainRec, writeMultiBindingRec, *entry.valueMultiBinding);
+                }
+            }
+        }
+    }
+
+    {
+        struct TargetNullExtEntry {
+            std::uint32_t ordinal = 0u;
+            UnifiedValue value{};
+        };
+        std::vector<TargetNullExtEntry> extEntries;
+        std::uint32_t ordinal = 0u;
+        VisitAllNestedBindingChains(*this, [&](const AxbCompiledBindingChain& ch) {
+            if (!std::holds_alternative<std::monostate>(ch.targetNullValue)) {
+                extEntries.push_back(TargetNullExtEntry{ordinal, ch.targetNullValue});
+            }
+            ++ordinal;
+        });
+        if (!extEntries.empty()) {
+            WriteU32(out, kAxb4TargetNullExtSectionMagic);
+            WriteU32(out, static_cast<std::uint32_t>(extEntries.size()));
+            for (const auto& entry : extEntries) {
+                WriteU32(out, entry.ordinal);
+                WriteValue(out, entry.value);
             }
         }
     }
@@ -5916,6 +6161,26 @@ bool DeserializeAxbPackageWithDepth(
                 return false;
             }
         }
+        if (r.offset + 4u <= r.size) {
+            const std::size_t savedOff = r.offset;
+            std::uint32_t tnMagic = 0u;
+            if (r.ReadU32(tnMagic) && tnMagic == 0x344E5441u) {
+                std::uint32_t tnCount = 0u;
+                if (!r.ReadU32(tnCount) || tnCount > pkg.bindingChains.size() ||
+                    tnCount > (r.size - r.offset)) {
+                    if (errorMessage) *errorMessage = "corrupted AXB4 TargetNullValue section";
+                    return false;
+                }
+                for (std::uint32_t i = 0u; i < tnCount; ++i) {
+                    if (!r.ReadValue(pkg.bindingChains[i].targetNullValue)) {
+                        if (errorMessage) *errorMessage = "corrupted AXB4 TargetNullValue entry";
+                        return false;
+                    }
+                }
+            } else {
+                r.offset = savedOff;
+            }
+        }
     }
     auto failStcSection = [&](const char* msg) -> bool {
         if (errorMessage) *errorMessage = msg;
@@ -6001,7 +6266,111 @@ bool DeserializeAxbPackageWithDepth(
     constexpr std::uint32_t kSecBit_MR12 = 1u << 5;
     constexpr std::uint32_t kSecBit_AP14 = 1u << 6;
     constexpr std::uint32_t kSecBit_AP15 = 1u << 7;
+    constexpr std::uint32_t kSecBit_TNE4 = 1u << 8;
+    constexpr std::uint32_t kSecBit_SBA4 = 1u << 9;
     std::uint32_t seenSectionMask = 0u;
+
+    auto readHopVec = [&](std::vector<AxbCompiledHop>& hops) -> bool {
+        std::uint32_t hopCount = 0;
+        if (!r.ReadU32(hopCount) || hopCount > (r.size - r.offset) / 34u) {
+            return false;
+        }
+        hops.resize(hopCount);
+        for (std::uint32_t h = 0; h < hopCount; ++h) {
+            auto& hop = hops[h];
+            std::uint8_t hopFlags = 0u;
+            if (!r.ReadString(hop.memberName) ||
+                !r.ReadU64(hop.declaringTypeId) ||
+                !r.ReadU32(hop.fieldIndex) ||
+                !r.ReadU8(hop.observableBitIndex) ||
+                !r.ReadU64(hop.getterSymbolId) ||
+                !r.ReadU64(hop.setterSymbolId) ||
+                !r.ReadU8(hopFlags)) {
+                return false;
+            }
+            hop.isAutoProperty = (hopFlags & 0x01u) != 0u;
+            hop.isObservable = (hopFlags & 0x02u) != 0u;
+            hop.isReadOnly = (hopFlags & 0x04u) != 0u;
+            hop.isSimState = (hopFlags & 0x08u) != 0u;
+            hop.isSimCommand = (hopFlags & 0x10u) != 0u;
+            {
+                std::string baseName;
+                std::int32_t parsedIdx = -1;
+                if (SplitIndexedMemberName(hop.memberName, baseName, parsedIdx)) {
+                    hop.memberName = std::move(baseName);
+                    hop.collectionIndex = parsedIdx;
+                }
+            }
+        }
+        return true;
+    };
+
+    auto readFullChainRec = [&](auto& selfChain, auto& selfMulti, AxbCompiledBindingChain& ch, int depth) -> bool {
+        if (depth > 8) return false;
+        std::uint8_t modeRaw = 0u, relSelf = 0u, convRaw = 0u, hasNested = 0u;
+        if (!r.ReadString(ch.rawPath) ||
+            !r.ReadU16(ch.targetPropertyId) ||
+            !r.ReadU8(modeRaw) ||
+            modeRaw > static_cast<std::uint8_t>(BindingMode::OneTime) ||
+            !r.ReadValue(ch.fallbackValue) ||
+            !readHopVec(ch.hops) ||
+            !r.ReadString(ch.elementName) ||
+            !r.ReadString(ch.relativeAncestorType) ||
+            !r.ReadU8(relSelf) ||
+            !r.ReadU8(convRaw) ||
+            convRaw > static_cast<std::uint8_t>(ValueConverterKind::CustomScriptOrHost) ||
+            !r.ReadString(ch.converterKey) ||
+            !r.ReadString(ch.converterParameter) ||
+            !r.ReadString(ch.stringFormat) ||
+            !r.ReadU64(ch.converterSymbolId) ||
+            !r.ReadU64(ch.convertBackSymbolId) ||
+            !r.ReadU8(hasNested)) {
+            return false;
+        }
+        ch.mode = static_cast<BindingMode>(modeRaw);
+        ch.relativeSelf = (relSelf != 0u);
+        ch.converter = static_cast<ValueConverterKind>(convRaw);
+        if (hasNested != 0u) {
+            auto nested = std::make_shared<AxbCompiledMultiBinding>();
+            if (!selfMulti(selfChain, selfMulti, *nested, depth + 1)) {
+                return false;
+            }
+            ch.nestedMultiBinding = std::move(nested);
+        } else {
+            ch.nestedMultiBinding.reset();
+        }
+        return true;
+    };
+
+    auto readMultiBindingRec = [&](auto& selfChain, auto& selfMulti, AxbCompiledMultiBinding& mb, int depth) -> bool {
+        if (depth > 8) return false;
+        std::uint8_t modeRaw = 0u, convRaw = 0u;
+        std::uint32_t srcCount = 0u;
+        if (!r.ReadU16(mb.targetPropertyId) ||
+            !r.ReadU8(modeRaw) ||
+            modeRaw > static_cast<std::uint8_t>(BindingMode::OneTime) ||
+            !r.ReadU8(convRaw) ||
+            convRaw > static_cast<std::uint8_t>(ValueConverterKind::CustomScriptOrHost) ||
+            !r.ReadString(mb.converterKey) ||
+            !r.ReadString(mb.converterParameter) ||
+            !r.ReadString(mb.stringFormat) ||
+            !r.ReadValue(mb.fallbackValue) ||
+            !r.ReadU64(mb.converterSymbolId) ||
+            !r.ReadU64(mb.convertBackSymbolId) ||
+            !r.ReadU32(srcCount) ||
+            srcCount > (r.size - r.offset) / 16u) {
+            return false;
+        }
+        mb.mode = static_cast<BindingMode>(modeRaw);
+        mb.converter = static_cast<ValueConverterKind>(convRaw);
+        mb.sources.resize(srcCount);
+        for (std::uint32_t i = 0u; i < srcCount; ++i) {
+            if (!selfChain(selfChain, selfMulti, mb.sources[i], depth + 1)) {
+                return false;
+            }
+        }
+        return true;
+    };
 
     while (r.offset < r.size) {
         std::uint32_t trailMagic = 0;
@@ -6778,108 +7147,6 @@ bool DeserializeAxbPackageWithDepth(
         }
         seenSectionMask |= kSecBit_AP14;
 
-        auto readHopVec = [&](std::vector<AxbCompiledHop>& hops) -> bool {
-            std::uint32_t hopCount = 0;
-            if (!r.ReadU32(hopCount) || hopCount > (r.size - r.offset) / 34u) {
-                return false;
-            }
-            hops.resize(hopCount);
-            for (std::uint32_t h = 0; h < hopCount; ++h) {
-                auto& hop = hops[h];
-                std::uint8_t hopFlags = 0u;
-                if (!r.ReadString(hop.memberName) ||
-                    !r.ReadU64(hop.declaringTypeId) ||
-                    !r.ReadU32(hop.fieldIndex) ||
-                    !r.ReadU8(hop.observableBitIndex) ||
-                    !r.ReadU64(hop.getterSymbolId) ||
-                    !r.ReadU64(hop.setterSymbolId) ||
-                    !r.ReadU8(hopFlags)) {
-                    return false;
-                }
-                hop.isAutoProperty = (hopFlags & 0x01u) != 0u;
-                hop.isObservable = (hopFlags & 0x02u) != 0u;
-                hop.isReadOnly = (hopFlags & 0x04u) != 0u;
-                hop.isSimState = (hopFlags & 0x08u) != 0u;
-                hop.isSimCommand = (hopFlags & 0x10u) != 0u;
-                {
-                    std::string baseName;
-                    std::int32_t parsedIdx = -1;
-                    if (SplitIndexedMemberName(hop.memberName, baseName, parsedIdx)) {
-                        hop.memberName = std::move(baseName);
-                        hop.collectionIndex = parsedIdx;
-                    }
-                }
-            }
-            return true;
-        };
-
-        auto readFullChainRec = [&](auto& selfChain, auto& selfMulti, AxbCompiledBindingChain& ch, int depth) -> bool {
-            if (depth > 8) return false;
-            std::uint8_t modeRaw = 0u, relSelf = 0u, convRaw = 0u, hasNested = 0u;
-            if (!r.ReadString(ch.rawPath) ||
-                !r.ReadU16(ch.targetPropertyId) ||
-                !r.ReadU8(modeRaw) ||
-                modeRaw > static_cast<std::uint8_t>(BindingMode::OneTime) ||
-                !r.ReadValue(ch.fallbackValue) ||
-                !readHopVec(ch.hops) ||
-                !r.ReadString(ch.elementName) ||
-                !r.ReadString(ch.relativeAncestorType) ||
-                !r.ReadU8(relSelf) ||
-                !r.ReadU8(convRaw) ||
-                convRaw > static_cast<std::uint8_t>(ValueConverterKind::CustomScriptOrHost) ||
-                !r.ReadString(ch.converterKey) ||
-                !r.ReadString(ch.converterParameter) ||
-                !r.ReadString(ch.stringFormat) ||
-                !r.ReadU64(ch.converterSymbolId) ||
-                !r.ReadU64(ch.convertBackSymbolId) ||
-                !r.ReadU8(hasNested)) {
-                return false;
-            }
-            ch.mode = static_cast<BindingMode>(modeRaw);
-            ch.relativeSelf = (relSelf != 0u);
-            ch.converter = static_cast<ValueConverterKind>(convRaw);
-            if (hasNested != 0u) {
-                auto nested = std::make_shared<AxbCompiledMultiBinding>();
-                if (!selfMulti(selfChain, selfMulti, *nested, depth + 1)) {
-                    return false;
-                }
-                ch.nestedMultiBinding = std::move(nested);
-            } else {
-                ch.nestedMultiBinding.reset();
-            }
-            return true;
-        };
-
-        auto readMultiBindingRec = [&](auto& selfChain, auto& selfMulti, AxbCompiledMultiBinding& mb, int depth) -> bool {
-            if (depth > 8) return false;
-            std::uint8_t modeRaw = 0u, convRaw = 0u;
-            std::uint32_t srcCount = 0u;
-            if (!r.ReadU16(mb.targetPropertyId) ||
-                !r.ReadU8(modeRaw) ||
-                modeRaw > static_cast<std::uint8_t>(BindingMode::OneTime) ||
-                !r.ReadU8(convRaw) ||
-                convRaw > static_cast<std::uint8_t>(ValueConverterKind::CustomScriptOrHost) ||
-                !r.ReadString(mb.converterKey) ||
-                !r.ReadString(mb.converterParameter) ||
-                !r.ReadString(mb.stringFormat) ||
-                !r.ReadValue(mb.fallbackValue) ||
-                !r.ReadU64(mb.converterSymbolId) ||
-                !r.ReadU64(mb.convertBackSymbolId) ||
-                !r.ReadU32(srcCount) ||
-                srcCount > (r.size - r.offset) / 16u) {
-                return false;
-            }
-            mb.mode = static_cast<BindingMode>(modeRaw);
-            mb.converter = static_cast<ValueConverterKind>(convRaw);
-            mb.sources.resize(srcCount);
-            for (std::uint32_t i = 0u; i < srcCount; ++i) {
-                if (!selfChain(selfChain, selfMulti, mb.sources[i], depth + 1)) {
-                    return false;
-                }
-            }
-            return true;
-        };
-
         auto readActionList = [&](std::vector<AxbInteractionAction>& acts) -> bool {
             std::uint32_t actCount = 0u;
             if (!r.ReadU32(actCount) || actCount > (r.size - r.offset) / 16u) {
@@ -7169,6 +7436,90 @@ bool DeserializeAxbPackageWithDepth(
                 for (std::uint32_t ei = 0u; ei < etC; ++ei) {
                     if (!readActTargetObj(pkg.controlTemplates[ci].eventTriggers[ei].actions)) return false;
                 }
+            }
+        } else if (trailMagic == kAxb4SetterActionBindSectionMagic) {
+            if ((seenSectionMask & kSecBit_SBA4) != 0u) {
+                return failStcSection("corrupted AXB4 duplicate SBA4 section");
+            }
+            if ((seenSectionMask & kSecBit_TNE4) != 0u) {
+                return failStcSection("corrupted AXB4 out-of-order SBA4 section after TNE4");
+            }
+            seenSectionMask |= kSecBit_SBA4;
+            std::vector<AxbPropertySetter*> allSetters;
+            VisitAllPackageSetters(pkg, [&](AxbPropertySetter& setter) {
+                allSetters.push_back(&setter);
+            });
+            std::uint32_t sbCount = 0u;
+            if (!r.ReadU32(sbCount) || sbCount > allSetters.size() || sbCount > (r.size - r.offset) / 8u) {
+                return failStcSection("corrupted AXB4 SBA4 setter header");
+            }
+            for (std::uint32_t i = 0u; i < sbCount; ++i) {
+                std::uint32_t ordinal = 0u;
+                if (!r.ReadU32(ordinal) || ordinal >= allSetters.size()) {
+                    return failStcSection("corrupted AXB4 SBA4 setter ordinal");
+                }
+                auto bc = std::make_shared<AxbCompiledBindingChain>();
+                if (!readFullChainRec(readFullChainRec, readMultiBindingRec, *bc, 0)) {
+                    return failStcSection("corrupted AXB4 SBA4 setter binding");
+                }
+                allSetters[ordinal]->hasBinding = true;
+                allSetters[ordinal]->binding = std::move(bc);
+            }
+            std::vector<AxbInteractionAction*> allActions;
+            VisitAllPackageActions(pkg, [&](AxbInteractionAction& act) {
+                allActions.push_back(&act);
+            });
+            std::uint32_t abCount = 0u;
+            if (!r.ReadU32(abCount) || abCount > allActions.size() || abCount > (r.size - r.offset) / 5u) {
+                return failStcSection("corrupted AXB4 SBA4 action header");
+            }
+            for (std::uint32_t i = 0u; i < abCount; ++i) {
+                std::uint32_t ordinal = 0u;
+                std::uint8_t flags = 0u;
+                if (!r.ReadU32(ordinal) || ordinal >= allActions.size() ||
+                    !r.ReadU8(flags) || flags == 0u || (flags & ~0x03u) != 0u) {
+                    return failStcSection("corrupted AXB4 SBA4 action entry");
+                }
+                if ((flags & 0x01u) != 0u) {
+                    auto bc = std::make_shared<AxbCompiledBindingChain>();
+                    if (!readFullChainRec(readFullChainRec, readMultiBindingRec, *bc, 0)) {
+                        return failStcSection("corrupted AXB4 SBA4 action valueBinding");
+                    }
+                    allActions[ordinal]->hasValueBinding = true;
+                    allActions[ordinal]->valueBinding = std::move(bc);
+                }
+                if ((flags & 0x02u) != 0u) {
+                    auto mb = std::make_shared<AxbCompiledMultiBinding>();
+                    if (!readMultiBindingRec(readFullChainRec, readMultiBindingRec, *mb, 0)) {
+                        return failStcSection("corrupted AXB4 SBA4 action valueMultiBinding");
+                    }
+                    allActions[ordinal]->valueMultiBinding = std::move(mb);
+                }
+            }
+        } else if (trailMagic == kAxb4TargetNullExtSectionMagic) {
+            if ((seenSectionMask & kSecBit_TNE4) != 0u) {
+                return failStcSection("corrupted AXB4 duplicate TNE4 section");
+            }
+            seenSectionMask |= kSecBit_TNE4;
+            std::vector<AxbCompiledBindingChain*> nestedChains;
+            VisitAllNestedBindingChains(pkg, [&](AxbCompiledBindingChain& ch) {
+                nestedChains.push_back(&ch);
+            });
+            std::uint32_t tneCount = 0u;
+            if (!r.ReadU32(tneCount) ||
+                tneCount > nestedChains.size() ||
+                tneCount > (r.size - r.offset) / 5u) {
+                return failStcSection("corrupted AXB4 TNE4 header");
+            }
+            for (std::uint32_t i = 0u; i < tneCount; ++i) {
+                std::uint32_t ordinal = 0u;
+                UnifiedValue val{};
+                if (!r.ReadU32(ordinal) ||
+                    ordinal >= nestedChains.size() ||
+                    !r.ReadValue(val)) {
+                    return failStcSection("corrupted AXB4 TNE4 entry");
+                }
+                nestedChains[ordinal]->targetNullValue = std::move(val);
             }
         } else {
             return failStcSection("corrupted AXB4 unknown trailing section magic");

@@ -37,6 +37,7 @@ struct ReactiveBindingInstance {
     SymbolId convertBackSymbolId = 0;
     ObjectRef rootObject{};
     UnifiedValue fallbackValue{};
+    UnifiedValue targetNullValue{};
     std::vector<AxbCompiledHop> hops;
     std::vector<ObjectRef> resolvedHopObjects;
     std::vector<ObservedIndexedArray> indexedArrays;
@@ -71,6 +72,7 @@ struct ElementPropertyBindingInstance {
     std::vector<ObservedIndexedArray> indexedArrays;
     IntrusivePtr<UIElement> targetElement{};
     UnifiedValue fallbackValue{};
+    UnifiedValue targetNullValue{};
     UnifiedValue lastSyncedValue{};
     bool initialized = false;
 };
@@ -97,6 +99,7 @@ struct MultiBindingSourceSlot {
     SymbolId converterSymbolId = 0;
     SymbolId convertBackSymbolId = 0;
     UnifiedValue fallbackValue{};
+    UnifiedValue targetNullValue{};
     UnifiedValue lastEvaluatedValue{};
     std::shared_ptr<MultiBindingInstance> nestedMulti{};
 };
@@ -175,6 +178,7 @@ public:
 
     void RegisterCommandCanExecuteWatcher(UIElement* target, std::function<void()> watcher);
     void EvaluateCommandCanExecuteWatchers();
+    std::size_t NotifyScriptObjectPropertyChanged(ObjectRef sourceObj, std::string_view propertyName = {});
 
     [[nodiscard]] ExecutionDomainContext& Domains() noexcept { return domains_; }
     [[nodiscard]] const ExecutionDomainContext& Domains() const noexcept { return domains_; }
@@ -369,6 +373,7 @@ private:
     std::uint16_t nextBindingSlotId_ = 1;
     std::uint64_t lastObservedGcEpoch_ = 0;
     std::unordered_map<std::string, RegisteredConverterEntry> registeredConverters_;
+    mutable std::unordered_map<SymbolId, std::pair<ObjectRef, std::shared_ptr<PersistentRoot>>> lazyConverterInstances_;
     std::vector<CollectionChangeRecord> scratchCollectionDeltas_;
     struct RichTextDependentEntry {
         IntrusivePtr<UIElement> targetElement{};

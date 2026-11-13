@@ -150,6 +150,7 @@ namespace {
     const bool actualIsNull =
         std::holds_alternative<std::monostate>(actualVal) ||
         std::holds_alternative<NullObject>(actualVal) ||
+        std::holds_alternative<NullString>(actualVal) ||
         (std::holds_alternative<ObjectRef>(actualVal) && !std::get<ObjectRef>(actualVal).valid());
 
     if (expectNull) {
@@ -278,6 +279,7 @@ namespace {
     const bool actualIsNull =
         std::holds_alternative<std::monostate>(actualVal) ||
         std::holds_alternative<NullObject>(actualVal) ||
+        std::holds_alternative<NullString>(actualVal) ||
         (std::holds_alternative<ObjectRef>(actualVal) && !std::get<ObjectRef>(actualVal).valid());
     if (actualIsNull || expectNull) {
         return false;
@@ -609,22 +611,37 @@ void VisitStoryboardValues(const AxbStoryboard& sb, Fn&& fn) noexcept {
 }
 
 template <typename Fn>
+void VisitBindingChainValues(const AxbCompiledBindingChain& bc, Fn&& fn) noexcept {
+    if (bc.fallbackValue.isTraceable()) fn(bc.fallbackValue);
+    if (bc.targetNullValue.isTraceable()) fn(bc.targetNullValue);
+    if (bc.nestedMultiBinding) {
+        if (bc.nestedMultiBinding->fallbackValue.isTraceable()) {
+            fn(bc.nestedMultiBinding->fallbackValue);
+        }
+        for (const auto& src : bc.nestedMultiBinding->sources) {
+            VisitBindingChainValues(src, fn);
+        }
+    }
+}
+
+template <typename Fn>
 void VisitActionValues(const AxbInteractionAction& act, Fn&& fn) noexcept {
     if (act.value.isTraceable()) fn(act.value);
-    if (act.valueBinding && act.valueBinding->fallbackValue.isTraceable()) {
-        fn(act.valueBinding->fallbackValue);
+    if (act.valueBinding) {
+        VisitBindingChainValues(*act.valueBinding, fn);
     }
     if (act.valueMultiBinding) {
         if (act.valueMultiBinding->fallbackValue.isTraceable()) {
             fn(act.valueMultiBinding->fallbackValue);
         }
         for (const auto& cb : act.valueMultiBinding->sources) {
-            if (cb.fallbackValue.isTraceable()) fn(cb.fallbackValue);
+            VisitBindingChainValues(cb, fn);
         }
     }
     if (act.commandParameter.isTraceable()) fn(act.commandParameter);
-    if (act.commandParameterBinding.fallbackValue.isTraceable()) {
-        fn(act.commandParameterBinding.fallbackValue);
+    VisitBindingChainValues(act.commandParameterBinding, fn);
+    if (act.targetObjectBinding) {
+        VisitBindingChainValues(*act.targetObjectBinding, fn);
     }
     VisitStoryboardValues(act.inlineStoryboard, fn);
 }
@@ -633,8 +650,8 @@ template <typename Fn>
 void VisitStyleValues(const AxbStyleDefinition& st, Fn&& fn) noexcept {
     for (const auto& s : st.setters) {
         if (s.value.isTraceable()) fn(s.value);
-        if (s.binding && s.binding->fallbackValue.isTraceable()) {
-            fn(s.binding->fallbackValue);
+        if (s.binding) {
+            VisitBindingChainValues(*s.binding, fn);
         }
     }
     for (const auto& trig : st.triggers) {
@@ -643,8 +660,8 @@ void VisitStyleValues(const AxbStyleDefinition& st, Fn&& fn) noexcept {
         }
         for (const auto& s : trig.setters) {
             if (s.value.isTraceable()) fn(s.value);
-            if (s.binding && s.binding->fallbackValue.isTraceable()) {
-                fn(s.binding->fallbackValue);
+            if (s.binding) {
+                VisitBindingChainValues(*s.binding, fn);
             }
         }
         for (const auto& sb : trig.enterStoryboards) VisitStoryboardValues(sb, fn);
@@ -660,8 +677,8 @@ void VisitStyleValues(const AxbStyleDefinition& st, Fn&& fn) noexcept {
         for (const auto& vs : vsg.states) {
             for (const auto& s : vs.setters) {
                 if (s.value.isTraceable()) fn(s.value);
-                if (s.binding && s.binding->fallbackValue.isTraceable()) {
-                    fn(s.binding->fallbackValue);
+                if (s.binding) {
+                    VisitBindingChainValues(*s.binding, fn);
                 }
             }
             VisitStoryboardValues(vs.storyboard, fn);
@@ -675,8 +692,8 @@ void VisitStyleValues(const AxbStyleDefinition& st, Fn&& fn) noexcept {
             }
             for (const auto& s : trig.setters) {
                 if (s.value.isTraceable()) fn(s.value);
-                if (s.binding && s.binding->fallbackValue.isTraceable()) {
-                    fn(s.binding->fallbackValue);
+                if (s.binding) {
+                    VisitBindingChainValues(*s.binding, fn);
                 }
             }
             for (const auto& sb : trig.enterStoryboards) VisitStoryboardValues(sb, fn);
@@ -692,8 +709,8 @@ void VisitStyleValues(const AxbStyleDefinition& st, Fn&& fn) noexcept {
             for (const auto& vs : vsg.states) {
                 for (const auto& s : vs.setters) {
                     if (s.value.isTraceable()) fn(s.value);
-                    if (s.binding && s.binding->fallbackValue.isTraceable()) {
-                        fn(s.binding->fallbackValue);
+                    if (s.binding) {
+                        VisitBindingChainValues(*s.binding, fn);
                     }
                 }
                 VisitStoryboardValues(vs.storyboard, fn);
@@ -1912,6 +1929,16 @@ namespace {
         } else {
             rawVal = ApplyBuiltinValueConverter(bc.converter, rawVal, false);
         }
+    }
+
+    const bool isNullAfterConversion =
+        std::holds_alternative<NullObject>(rawVal) ||
+        std::holds_alternative<NullString>(rawVal) ||
+        std::holds_alternative<NullArray>(rawVal) ||
+        (std::holds_alternative<ObjectRef>(rawVal) && !std::get<ObjectRef>(rawVal).valid());
+    if (isNullAfterConversion &&
+        !std::holds_alternative<std::monostate>(bc.targetNullValue)) {
+        rawVal = bc.targetNullValue;
     }
 
     outVal = rawVal;

@@ -247,6 +247,8 @@ public:
             : 0.0f;
     }
 
+    [[nodiscard]] bool DefaultFocusable() const noexcept override { return false; }
+    bool OnKeyDown(KeyCode key, std::uint8_t modifiers) override;
     Size MeasureCore(Size availableSize) noexcept override;
     void ArrangeCore(Rect finalRect) noexcept override;
 
@@ -626,7 +628,19 @@ public:
     [[nodiscard]] std::int32_t GetMaxLines() const noexcept;
     void Clear();
     void SelectAll();
-    [[nodiscard]] bool HasAllSelected() const noexcept { return hasAllSelected_; }
+    void SetSelectionStart(std::size_t codePointIndex);
+    [[nodiscard]] std::size_t GetSelectionStart() const noexcept;
+    void SetSelectionLength(std::size_t codePointLength);
+    [[nodiscard]] std::size_t GetSelectionLength() const noexcept;
+    void Select(std::size_t startCodePoint, std::size_t lengthCodePoints);
+    [[nodiscard]] std::string GetSelectedText() const;
+    void SetSelectedText(std::string_view replacement);
+    bool Copy() const;
+    bool Cut();
+    bool Paste();
+    static void SetClipboardText(std::string_view utf8Text);
+    [[nodiscard]] static std::string GetClipboardText();
+    [[nodiscard]] bool HasAllSelected() const noexcept;
 
     [[nodiscard]] std::string GetDisplayString() const;
     [[nodiscard]] float HorizontalTextScrollOffset() const noexcept;
@@ -661,6 +675,7 @@ private:
     bool CommitEditedText(std::string newText, std::size_t newCaretCodePoint);
 
     TextChangedCallback textChangedCallback_;
+    std::size_t selectionAnchorCp_ = 0u;
     bool hasAllSelected_ = false;
 };
 
@@ -1394,6 +1409,9 @@ public:
     bool OnTextInput(std::string_view utf8Text) override;
 
     bool SelectIndexInteractive(std::int32_t index);
+    bool ResolvePendingSelectedValue() {
+        return hasPendingSelectedValue_ && TryResolveSelectedValue(pendingSelectedValue_);
+    }
 
     [[nodiscard]] std::int32_t HighlightedPopupIndex() const noexcept {
         return highlightedPopupIndex_;
@@ -1427,10 +1445,13 @@ public:
 
 private:
     void SyncSelectedItemFromIndex();
+    bool TryResolveSelectedValue(const UnifiedValue& targetVal);
 
     SelectionChangedCallback selectionChangedCallback_;
+    UnifiedValue pendingSelectedValue_{};
     std::int32_t highlightedPopupIndex_ = -1;
     bool syncingSelection_ = false;
+    bool hasPendingSelectedValue_ = false;
 };
 
 // Self-contained template & MTSDF vector icon registry for automatic .axb4 mounting
@@ -1851,13 +1872,18 @@ public:
         (void)GetValue(PropId_IsSubmenuOpen).tryGetBool(v);
         return v;
     }
-    ~MenuItem() override = default;
+    ~MenuItem() override;
+    [[nodiscard]] static bool HasAnyOpenSubmenu() noexcept;
     static const TypeClass* StaticTypeClass() noexcept;
     [[nodiscard]] const TypeClass* GetTypeClass() const noexcept override { return StaticTypeClass(); }
     void OnPropertyChanged(std::uint16_t propId, const UnifiedValue& newValue) override;
     bool ActivateFromInput(RuntimeError* error = nullptr) override;
+    bool OnKeyDown(KeyCode key, std::uint8_t modifiers) override;
     Size MeasureCore(Size availableSize) noexcept override;
     void ArrangeCore(Rect finalRect) noexcept override;
+
+private:
+    bool submenuCounted_ = false;
 };
 
 class RepeatButton : public Button {
@@ -1872,11 +1898,34 @@ public:
 
 class Hyperlink : public Button {
 public:
+    using RequestNavigateCallback = std::function<void(Hyperlink&, const std::string&)>;
+
     Hyperlink();
     ~Hyperlink() override = default;
     static const TypeClass* StaticTypeClass() noexcept;
     [[nodiscard]] const TypeClass* GetTypeClass() const noexcept override { return StaticTypeClass(); }
+
+    void SetNavigateUri(std::string_view uri);
+    [[nodiscard]] std::string GetNavigateUri() const;
+    void SetRequestNavigateCallback(RequestNavigateCallback cb) { requestNavigateCallback_ = std::move(cb); }
+    bool ActivateFromInput(RuntimeError* error = nullptr) override;
+
+private:
+    RequestNavigateCallback requestNavigateCallback_;
 };
+
+bool TryExecuteRoutedCommandBubble(
+    UIElement* source,
+    std::string_view commandName,
+    const UnifiedValue& parameter = {},
+    bool hasParameter = false);
+
+bool QueryRoutedCommandCanExecuteBubble(
+    const UIElement* source,
+    std::string_view commandName,
+    const UnifiedValue& parameter,
+    bool hasParameter,
+    bool& outHandled);
 
 class ToolTip : public Popup {
 public:

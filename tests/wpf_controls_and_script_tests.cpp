@@ -2090,7 +2090,711 @@ keep_literal";
     }
 }
 
+
+static void TestWpfDeveloperErgonomicsAndEnhancedControls() {
+    using namespace aero;
+    auto Check = [](bool cond, const std::string& msg) {
+        if (cond) {
+            ++gPassed;
+        } else {
+            ++gFailed;
+            std::cerr << "[FAIL] " << msg << std::endl;
+        }
+    };
+    // 1. Load WpfQuickStart directly via .csproj!
+    {
+        XamlApplication csprojApp;
+        std::string err;
+        const std::string csprojPath = (fs::path(AERO_SAMPLES_DIR) / "WpfQuickStart" / "Data" / "WpfQuickStart.csproj").string();
+        Check(csprojApp.Load(csprojPath, &err), "XamlApplication::Load(.csproj) succeeded: " + err);
+        Check(csprojApp.MainWindowElement() != nullptr, ".csproj loaded MainWindow root");
+    }
+
+    // 2. End-to-end WPF C# idioms + XAML enhancements + backend controls
+    const std::string xaml = R"XAML(
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:local="clr-namespace:WpfDemo"
+        x:Class="WpfDemo.MainWindow"
+        Title="WPF Ergonomics Suite" Width="900" Height="620">
+    <Window.Resources>
+        <local:StatusBadgeConverter x:Key="BadgeConv"/>
+        <local:AlertBrushConverter x:Key="AlertBrushConv"/>
+    </Window.Resources>
+    <Window.CommandBindings>
+        <CommandBinding Command="ApplicationCommands.Save" Executed="OnSaveCommandExecuted" CanExecute="OnSaveCommandCanExecute"/>
+    </Window.CommandBindings>
+    <Window.InputBindings>
+        <KeyBinding Gesture="Ctrl+S" Command="ApplicationCommands.Save" CommandParameter="ShortcutSave"/>
+    </Window.InputBindings>
+    <StackPanel Spacing="6" Padding="8">
+        <Menu x:Name="TopMenu" Height="28">
+            <MenuItem x:Name="FileMenu" Header="File">
+                <MenuItem x:Name="ExportSubMenu" Header="Export">
+                    <MenuItem x:Name="ExportJsonItem" Header="JSON" Command="ApplicationCommands.Save" CommandParameter="MenuSave"/>
+                </MenuItem>
+            </MenuItem>
+        </Menu>
+        <TextBlock x:Name="ComputedBanner" Text="{Binding BannerText}"/>
+        <TextBlock x:Name="NullTargetLabel" Text="{Binding OptionalNote, TargetNullValue='(No Note)', FallbackValue='BROKEN'}"/>
+        <TextBlock x:Name="ConvertedLabel" Text="{Binding PriorityLevel, Converter={StaticResource BadgeConv}, ConverterParameter=P}"
+                   Foreground="{Binding PriorityLevel, Converter={StaticResource AlertBrushConv}}"/>
+        <ComboBox x:Name="RoleCombo" ItemsSource="{Binding Roles}" DisplayMemberPath="Title"
+                  SelectedValuePath="Code" SelectedValue="{Binding SelectedRoleCode}"/>
+        <TextBlock x:Name="RoleEcho" Text="{Binding SelectedValue, ElementName=RoleCombo}"/>
+        <TextBox x:Name="EditorBox" Width="260" Height="30" Text="Hello Aero WPF"/>
+        <Hyperlink x:Name="DocsLink" Content="Open Docs" NavigateUri="https://aerogui.dev/wpf" RequestNavigate="OnDocsNavigate"/>
+        <Button x:Name="SaveRoutedBtn" Content="Save" Command="ApplicationCommands.Save" CommandParameter="BtnSave"/>
+        <Slider x:Name="PageSlider" Width="200" Height="24" Minimum="0" Maximum="100" Value="20" LargeChange="15" IsMoveToPointEnabled="False"/>
+        <TabControl x:Name="SideTabs" TabStripPlacement="Left" Width="420" Height="120">
+            <TabItem Header="Overview"><TextBlock Text="Page0"/></TabItem>
+            <TabItem Header="Metrics"><TextBlock Text="Page1"/></TabItem>
+            <TabItem Header="Logs"><TextBlock Text="Page2"/></TabItem>
+        </TabControl>
+        <ListView x:Name="TaskGrid" ItemsSource="{Binding Rows}" Width="460" Height="110">
+            <ListView.View>
+                <GridView>
+                    <GridViewColumn Header="Name" Width="160" DisplayMemberBinding="{Binding Name}"/>
+                    <GridViewColumn Header="Badge" Width="180">
+                        <GridViewColumn.CellTemplate>
+                            <DataTemplate>
+                                <TextBlock Text="{Binding TagLabel}"/>
+                            </DataTemplate>
+                        </GridViewColumn.CellTemplate>
+                    </GridViewColumn>
+                </GridView>
+            </ListView.View>
+        </ListView>
+        <ScrollViewer x:Name="HorizScroller" Width="120" Height="40" HorizontalScrollBarVisibility="Auto" VerticalScrollBarVisibility="Auto">
+            <Border Width="400" Height="160"/>
+        </ScrollViewer>
+    </StackPanel>
+</Window>
+)XAML";
+
+    const std::string csCode = R"CS(
+using System;
+using System.Collections.ObjectModel;
+using System.Windows;
+using System.Windows.Controls;
+using System.Windows.Data;
+using System.Windows.Input;
+
+namespace WpfDemo
+{
+    public class StatusBadgeConverter : IValueConverter
+    {
+        public string Convert(int level, string prefix) => $@"[{prefix}:{level}]";
+        public int ConvertBack(string text, string prefix) => 0;
+    }
+
+    public class AlertBrushConverter : IValueConverter
+    {
+        public string Convert(int level, string param) => level >= 2 ? "#FFE74C3C" : "#FF2ECC71";
+    }
+
+    [Observable]
+    public class RoleOption
+    {
+        public string Code { get; set; } = "";
+        public string Title { get; set; } = "";
+        public RoleOption() : this("DEV", "Developer") { }
+        public RoleOption(string code, string title) { Code = code; Title = title; }
+    }
+
+    [Observable]
+    public class TaskRow
+    {
+        public string Name { get; set; } = "";
+        public string TagLabel => $"#{Name}";
+        public TaskRow() { }
+        public TaskRow(string n) { Name = n; }
+    }
+
+    [Observable]
+    public class DemoViewModel : ViewModelBase
+    {
+        private int _manualCounter = 1;
+        public int ManualCounter
+        {
+            get => _manualCounter;
+            set
+            {
+                if (SetProperty(ref _manualCounter, value, nameof(ManualCounter)))
+                {
+                    OnPropertyChanged(nameof(BannerText));
+                }
+            }
+        }
+
+        public string BannerText => $"Count={ManualCounter}";
+        public string OptionalNote { get; set; } = null;
+        public int PriorityLevel { get; set; } = 2;
+        public string SelectedRoleCode { get; set; } = "QA";
+        public bool AllowSave { get; set; } = true;
+        public string LastSavedParam { get; set; } = "";
+        public string LastNavigatedUri { get; set; } = "";
+        public ObservableCollection<RoleOption> Roles { get; set; } = new ObservableCollection<RoleOption>();
+        public ObservableCollection<TaskRow> Rows { get; set; } = new ObservableCollection<TaskRow>();
+
+        public DemoViewModel()
+        {
+            Roles.Add(new RoleOption("DEV", "Developer"));
+            Roles.Add(new RoleOption("QA", "Quality"));
+            Roles.Add(new RoleOption("PM", "Product"));
+            Rows.Add(new TaskRow("Alpha"));
+        }
+
+        public void BumpCounter() => ManualCounter = ManualCounter + 4;
+    }
+
+    public partial class MainWindow : Window
+    {
+        public DemoViewModel VM { get; set; } = new DemoViewModel();
+
+        public MainWindow()
+        {
+            InitializeComponent();
+            DataContext = VM;
+            this.DocsLink.RequestNavigate += (object s, RequestNavigateEventArgs e) =>
+            {
+                VM.LastNavigatedUri = $"WRAP:{e.Uri}";
+            };
+        }
+
+        public void OnDocsNavigate(object sender, RequestNavigateEventArgs e)
+        {
+            VM.OptionalNote = e.Uri;
+        }
+
+        public void OnSaveCommandCanExecute(object sender, CanExecuteRoutedEventArgs e)
+        {
+            e.CanExecute = VM.AllowSave;
+        }
+
+        public void OnSaveCommandExecuted(object sender, ExecutedRoutedEventArgs e)
+        {
+            VM.LastSavedParam = e.Parameter;
+            VM.BumpCounter();
+        }
+    }
+}
+)CS";
+
+    std::filesystem::path tmpDir = std::filesystem::temp_directory_path() / "aero_wpf_ergonomics_suite";
+    std::filesystem::create_directories(tmpDir);
+    {
+        std::ofstream fx(tmpDir / "MainWindow.xaml", std::ios::binary);
+        fx << xaml;
+        std::ofstream fc(tmpDir / "MainWindow.xaml.cs", std::ios::binary);
+        fc << csCode;
+    }
+
+    XamlApplication app;
+    std::string loadErr;
+    Check(app.Load(tmpDir.string(), &loadErr), "Loaded WPF Ergonomics Suite: " + loadErr);
+    if (!app.MainWindowElement()) return;
+
+    // Verify .axb4 TargetNullValue round-trip
+    {
+        const auto bytes = app.MainPackage().Serialize();
+        AxbPackage decoded{};
+        std::string decErr;
+        Check(AxbPackage::Deserialize(bytes.data(), bytes.size(), decoded, &decErr), "AXB4 TargetNullValue deserialize: " + decErr);
+        bool foundTargetNull = false;
+        for (const auto& ch : decoded.bindingChains) {
+            if (const auto* sv = std::get_if<StringValue>(&ch.targetNullValue); sv && sv->view() == "(No Note)") {
+                foundTargetNull = true;
+                break;
+            }
+        }
+        Check(foundTargetNull, "AXB4 round-tripped TargetNullValue='(No Note)'");
+    }
+
+    auto* root = app.MainWindowElement();
+    auto* bannerTb = root->FindName("ComputedBanner") ? root->FindName("ComputedBanner")->DynamicCast<TextBlock>() : nullptr;
+    auto* nullTb = root->FindName("NullTargetLabel") ? root->FindName("NullTargetLabel")->DynamicCast<TextBlock>() : nullptr;
+    auto* convTb = root->FindName("ConvertedLabel") ? root->FindName("ConvertedLabel")->DynamicCast<TextBlock>() : nullptr;
+    auto* roleCombo = root->FindName("RoleCombo") ? root->FindName("RoleCombo")->DynamicCast<ComboBox>() : nullptr;
+    auto* roleEcho = root->FindName("RoleEcho") ? root->FindName("RoleEcho")->DynamicCast<TextBlock>() : nullptr;
+    auto* editor = root->FindName("EditorBox") ? root->FindName("EditorBox")->DynamicCast<TextBox>() : nullptr;
+    auto* docsLink = root->FindName("DocsLink") ? root->FindName("DocsLink")->DynamicCast<Hyperlink>() : nullptr;
+    auto* saveBtn = root->FindName("SaveRoutedBtn") ? root->FindName("SaveRoutedBtn")->DynamicCast<Button>() : nullptr;
+    auto* pageSlider = root->FindName("PageSlider") ? root->FindName("PageSlider")->DynamicCast<Slider>() : nullptr;
+    auto* sideTabs = root->FindName("SideTabs") ? root->FindName("SideTabs")->DynamicCast<TabControl>() : nullptr;
+    auto* fileMenu = root->FindName("FileMenu") ? root->FindName("FileMenu")->DynamicCast<MenuItem>() : nullptr;
+    auto* exportSub = root->FindName("ExportSubMenu") ? root->FindName("ExportSubMenu")->DynamicCast<MenuItem>() : nullptr;
+    auto* scroller = root->FindName("HorizScroller") ? root->FindName("HorizScroller")->DynamicCast<ScrollViewer>() : nullptr;
+
+    Check(bannerTb && bannerTb->GetText() == "Count=1", "Initial => computed BannerText");
+    Check(nullTb && nullTb->GetText() == "(No Note)", "TargetNullValue applied when OptionalNote is null");
+    Check(convTb && convTb->GetText() == "[P:2]", "Keyed C# IValueConverter formatted [P:2]");
+    Check(convTb && convTb->GetForeground().r > 0.8f, "String-to-Color coercion applied #FFE74C3C");
+    Check(roleCombo && roleCombo->GetSelectedIndex() == 1, "SelectedValue='QA' selected index 1 via SelectedValuePath='Code'");
+    Check(roleEcho && roleEcho->GetText() == "QA", "ElementName SelectedValue resolved 'QA'");
+
+    // TwoWay SelectedValue push back to ViewModel
+    if (roleCombo) {
+        (void)roleCombo->SelectIndexInteractive(2);
+        app.Tick(0.016f);
+        Check(roleEcho && roleEcho->GetText() == "PM", "ComboBox SelectedValue updated to 'PM'");
+    }
+
+    // CommandBinding execution via Button & Ctrl+S KeyBinding + SetProperty/OnPropertyChanged refresh
+    if (saveBtn) {
+        (void)saveBtn->ActivateFromInput();
+        app.Tick(0.016f);
+        Check(bannerTb && bannerTb->GetText() == "Count=5", "CommandBinding Executed + SetProperty refreshed computed BannerText to Count=5");
+    }
+    (void)app.InputRouter().DispatchKeyDown(KeyCode::S, KeyMod_Ctrl);
+    app.Tick(0.016f);
+    Check(bannerTb && bannerTb->GetText() == "Count=9", "Ctrl+S KeyBinding routed through CommandBinding to Count=9");
+
+    // Hyperlink RequestNavigate updates OptionalNote (clears TargetNullValue!)
+    if (docsLink) {
+        (void)docsLink->ActivateFromInput();
+        app.Tick(0.016f);
+        Check(nullTb && nullTb->GetText() == "https://aerogui.dev/wpf", "Hyperlink RequestNavigate fired and replaced TargetNullValue");
+    }
+
+    // TextBox selection, clipboard & word jump + selection highlight render node
+    if (editor) {
+        (void)app.InputRouter().SetFocus(editor);
+        editor->Select(6u, 4u); // "Aero" in "Hello Aero WPF"
+        Check(editor->GetSelectedText() == "Aero", "TextBox Select(6,4) -> 'Aero'");
+        app.RenderTree().BuildFromVisualTree(root);
+        Check(editor->Copy(), "TextBox Copy()");
+        editor->SetCaretIndex(14u);
+        (void)editor->InsertText("!");
+        (void)editor->OnKeyDown(KeyCode::Left, KeyMod_Ctrl);
+        Check(editor->GetCaretIndex() == 11u, "TextBox Ctrl+Left jumped to word start");
+        editor->Select(0u, 5u);
+        Check(editor->Cut() && editor->GetText() == " Aero WPF!", "TextBox Cut() removed 'Hello'");
+        editor->SetCaretIndex(0u);
+        Check(editor->Paste() && editor->GetText() == "Hello Aero WPF!", "TextBox Paste() restored 'Hello'");
+    }
+
+    // TabControl Left vertical strip + Ctrl+Tab cycling
+    if (sideTabs) {
+        Check(sideTabs->ContentPanelLocalRect().x > sideTabs->TabStripLocalRect().x, "TabControl Left strip placed left of content panel");
+        (void)app.InputRouter().SetFocus(sideTabs);
+        (void)app.InputRouter().DispatchKeyDown(KeyCode::Tab, KeyMod_Ctrl);
+        Check(sideTabs->GetSelectedIndex() == 1, "TabControl Ctrl+Tab advanced to tab 1");
+    }
+
+    // MenuItem cascading submenu offset & click-outside auto-close
+    if (fileMenu && exportSub) {
+        (void)fileMenu->ActivateFromInput();
+        (void)exportSub->ActivateFromInput();
+        app.Tick(0.016f);
+        Check(fileMenu->IsSubmenuOpen() && exportSub->IsSubmenuOpen(), "Cascading MenuItems opened");
+        if (UIElement* jsonItem = root->FindName("ExportJsonItem")) {
+            Check(jsonItem->FinalRect().x > exportSub->FinalRect().x + 80.0f, "Cascading submenu arranged horizontally to the right");
+        }
+        (void)app.InputRouter().DispatchPointerDown(Point{850.0f, 580.0f}, PointerButton::Left, 0u);
+        Check(!fileMenu->IsSubmenuOpen(), "Click outside Menu auto-closed open submenus");
+    }
+
+    // Slider IsMoveToPointEnabled=False steps by LargeChange (15) instead of jumping to 100
+    if (pageSlider) {
+        const Rect sr = pageSlider->FinalRect();
+        bool reqCap = false;
+        (void)pageSlider->OnPointerDown(Point{sr.x + sr.width - 4.0f, sr.y + sr.height * 0.5f}, PointerButton::Left, 0u, reqCap);
+        Check(std::fabs(pageSlider->GetSliderValue() - 35.0f) < 1e-3f, "Slider IsMoveToPointEnabled=False stepped +LargeChange (20 -> 35)");
+    }
+
+    // ScrollViewer Shift+MouseWheel horizontal scroll
+    if (scroller) {
+        const Rect svr = scroller->LocalToScreenBounds(scroller->FinalRect());
+        (void)app.InputRouter().DispatchMouseWheel(Point{svr.x + 10.0f, svr.y + 10.0f}, 0.0f, 40.0f, KeyMod_Shift);
+        app.Tick(0.016f);
+        Check(scroller->GetHorizontalOffset() > 10.0f, "ScrollViewer Shift+MouseWheel scrolled horizontally");
+    }
+
+    std::error_code ec;
+    std::filesystem::remove_all(tmpDir, ec);
+}
+
+void TestPostPatchReviewFixes() {
+    using namespace aero;
+
+    // 1. AXB4 backward compatibility (no TNE4 when no targetNullValue) + TNE4 round-trip for nested Style Setter & MultiBinding
+    {
+        AxbPackage plainPkg{};
+        AxbCompiledBindingChain plainChain;
+        plainChain.rawPath = "Name";
+        plainChain.targetPropertyId = PropId_Text;
+        plainPkg.bindingChains.push_back(plainChain);
+
+        const auto plainBytes = plainPkg.Serialize();
+        const std::string plainRaw(reinterpret_cast<const char*>(plainBytes.data()), plainBytes.size());
+        CHECK(plainRaw.find("TNE4") == std::string::npos);
+
+        AxbPackage plainDecoded{};
+        std::string err;
+        CHECK(AxbPackage::Deserialize(plainBytes.data(), plainBytes.size(), plainDecoded, &err));
+        CHECK(plainDecoded.bindingChains.size() == 1u);
+        CHECK(std::holds_alternative<std::monostate>(plainDecoded.bindingChains[0].targetNullValue));
+
+        AxbPackage nullExtPkg{};
+
+        AxbCompiledBindingChain topChain;
+        topChain.rawPath = "Top";
+        topChain.targetPropertyId = PropId_Text;
+        topChain.targetNullValue = value::FromString("TopNull");
+        nullExtPkg.bindingChains.push_back(topChain);
+
+        AxbCompiledMultiBinding mb;
+        mb.targetPropertyId = PropId_Text;
+        AxbCompiledBindingChain mbSrc;
+        mbSrc.rawPath = "Sub";
+        mbSrc.targetNullValue = value::FromString("MultiSrcNull");
+        mb.sources.push_back(mbSrc);
+        nullExtPkg.multiBindings.push_back(mb);
+
+        AxbStyleDefinition style;
+        style.key = "NullExtStyle";
+        style.targetTypeName = "TextBlock";
+        AxbPropertySetter setter;
+        setter.propId = PropId_Text;
+        setter.hasBinding = true;
+        setter.binding = std::make_shared<AxbCompiledBindingChain>();
+        setter.binding->rawPath = "Styled";
+        setter.binding->targetPropertyId = PropId_Text;
+        setter.binding->targetNullValue = value::FromString("StyleSetterNull");
+        style.setters.push_back(setter);
+        nullExtPkg.styles.push_back(style);
+
+        const auto extBytes = nullExtPkg.Serialize();
+        AxbPackage extDecoded{};
+        const bool deserExtOk = AxbPackage::Deserialize(extBytes.data(), extBytes.size(), extDecoded, &err);
+        CHECK(deserExtOk);
+        auto targetNullEquals = [](const UnifiedValue& v, std::string_view expected) -> bool {
+            const auto* sv = std::get_if<StringValue>(&v);
+            return sv != nullptr && sv->view() == expected;
+        };
+        if (deserExtOk) {
+            CHECK(extDecoded.bindingChains.size() == 1u);
+            if (extDecoded.bindingChains.size() == 1u) {
+                CHECK(targetNullEquals(extDecoded.bindingChains[0].targetNullValue, "TopNull"));
+            }
+            CHECK(extDecoded.multiBindings.size() == 1u && extDecoded.multiBindings[0].sources.size() == 1u);
+            if (extDecoded.multiBindings.size() == 1u && extDecoded.multiBindings[0].sources.size() == 1u) {
+                CHECK(targetNullEquals(extDecoded.multiBindings[0].sources[0].targetNullValue, "MultiSrcNull"));
+            }
+            CHECK(extDecoded.styles.size() == 1u && extDecoded.styles[0].setters.size() == 1u && extDecoded.styles[0].setters[0].binding != nullptr);
+            if (extDecoded.styles.size() == 1u && extDecoded.styles[0].setters.size() == 1u && extDecoded.styles[0].setters[0].binding != nullptr) {
+                CHECK(targetNullEquals(extDecoded.styles[0].setters[0].binding->targetNullValue, "StyleSetterNull"));
+            }
+        }
+    }
+
+    // 2. Converter runs BEFORE TargetNullValue, TargetNullValue bypasses StringFormat, and uninitialized converter int/bool fields default to zero
+    {
+        const std::string xaml = R"XAML(
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:local="clr-namespace:PostPatchConvTest"
+        x:Class="PostPatchConvTest.MainWindow"
+        Width="400" Height="300">
+    <Window.Resources>
+        <local:NullAndFieldConverter x:Key="Conv"/>
+    </Window.Resources>
+    <StackPanel>
+        <TextBlock x:Name="NullInOutText"
+                   Text="{Binding NullableA, Converter={StaticResource Conv}, TargetNullValue='FALLBACK'}"/>
+        <TextBlock x:Name="ConvToNullFormatText"
+                   Text="{Binding ValB, Converter={StaticResource Conv}, TargetNullValue='FALLBACK', StringFormat='FMT:{0}'}"/>
+        <ComboBox x:Name="LateCombo"
+                  SelectedValue="B"
+                  SelectedValuePath="Code"
+                  ItemsSource="{Binding Roles}"/>
+    </StackPanel>
+</Window>
+)XAML";
+
+        const std::string csCode = R"CS(
+using System;
+using System.Collections.ObjectModel;
+using System.Globalization;
+using System.Windows;
+using System.Windows.Data;
+
+namespace PostPatchConvTest
+{
+    public class NullAndFieldConverter : IValueConverter
+    {
+        private int count;
+        private bool flag;
+
+        public string Convert(string value, Type targetType, object parameter, CultureInfo culture)
+        {
+            if (value == null)
+            {
+                return $"DEF:{count}:{flag}";
+            }
+            if (value == "MAKE_NULL")
+            {
+                return null;
+            }
+            return value;
+        }
+
+        public string ConvertBack(string value, Type targetType, object parameter, CultureInfo culture)
+        {
+            return value;
+        }
+    }
+
+    [Observable]
+    public class RoleItem
+    {
+        public string Code { get; set; } = "";
+        public RoleItem() { }
+        public RoleItem(string code) { Code = code; }
+    }
+
+    [Observable]
+    public class ConvVm
+    {
+        public string NullableA { get; set; } = null;
+        public string ValB { get; set; } = "MAKE_NULL";
+        public ObservableCollection<RoleItem> Roles { get; set; } = new ObservableCollection<RoleItem>();
+
+        public ConvVm()
+        {
+            Roles.Add(new RoleItem("A"));
+            Roles.Add(new RoleItem("B"));
+        }
+    }
+
+    public partial class MainWindow : Window
+    {
+        public MainWindow()
+        {
+            InitializeComponent();
+            DataContext = new ConvVm();
+        }
+    }
+}
+)CS";
+
+        const fs::path tmpDir = fs::temp_directory_path() / "aero_post_patch_conv_test";
+        std::error_code ec;
+        fs::remove_all(tmpDir, ec);
+        fs::create_directories(tmpDir, ec);
+        {
+            std::ofstream fx(tmpDir / "MainWindow.xaml", std::ios::binary);
+            fx << xaml;
+            std::ofstream fc(tmpDir / "MainWindow.xaml.cs", std::ios::binary);
+            fc << csCode;
+        }
+
+        XamlApplication app;
+        std::string loadErr;
+        CHECK(app.Load(tmpDir.string(), &loadErr));
+        if (auto* root = app.MainWindowElement()) {
+            auto* nullInOut = root->FindName("NullInOutText") ? root->FindName("NullInOutText")->DynamicCast<TextBlock>() : nullptr;
+            auto* convToNull = root->FindName("ConvToNullFormatText") ? root->FindName("ConvToNullFormatText")->DynamicCast<TextBlock>() : nullptr;
+            auto* lateCombo = root->FindName("LateCombo") ? root->FindName("LateCombo")->DynamicCast<ComboBox>() : nullptr;
+            CHECK(nullInOut && nullInOut->GetText() == "DEF:0:false");
+            CHECK(convToNull && convToNull->GetText() == "FALLBACK");
+            CHECK(lateCombo && lateCombo->GetSelectedIndex() == 1);
+        }
+        fs::remove_all(tmpDir, ec);
+    }
+
+    // 3. ComboBox SelectedValue set before ItemsSource resolves when ItemsSource arrives
+    {
+        auto combo = MakeIntrusive<ComboBox>();
+        combo->SetValue(PropId_SelectedValue, value::FromString("Beta"), ValueSourceRank::Local);
+        CHECK(combo->GetSelectedIndex() == -1);
+        combo->SetItemsSource({value::FromString("Alpha"), value::FromString("Beta"), value::FromString("Gamma")});
+        CHECK(combo->GetSelectedIndex() == 1);
+    }
+
+    // 4. TextBox click at caret clears selection, Shift+Click extends selection, and multiline '\n' layout/hit-test
+    {
+        auto root = MakeIntrusive<StackPanel>();
+        auto singleTb = MakeIntrusive<TextBox>();
+        singleTb->SetText("HelloWorld");
+        singleTb->SetWidth(200.0f);
+        singleTb->SetHeight(32.0f);
+        root->AddChild(singleTb.Get());
+
+        root->Measure(Size{300.0f, 300.0f});
+        root->Arrange(Rect{0.0f, 0.0f, 300.0f, 300.0f});
+
+        singleTb->Select(2u, 4u); // caret at 6
+        CHECK(singleTb->GetSelectionLength() == 4u);
+        const Rect caret6 = singleTb->CaretLocalRect();
+        bool reqCap = false;
+        (void)singleTb->OnPointerDown(
+            Point{caret6.x, caret6.y + caret6.height * 0.5f},
+            PointerButton::Left,
+            0u,
+            reqCap);
+        CHECK(singleTb->GetSelectionLength() == 0u);
+
+        singleTb->Select(2u, 3u); // anchor=2, active/caret=5
+        const Rect endClickPt{190.0f, caret6.y + caret6.height * 0.5f, 1.0f, 1.0f};
+        (void)singleTb->OnPointerDown(Point{endClickPt.x, endClickPt.y}, PointerButton::Left, KeyMod_Shift, reqCap);
+        CHECK(singleTb->GetSelectionStart() == 2u);
+        CHECK(singleTb->GetSelectionLength() == 8u);
+
+        (void)singleTb->OnPointerDown(Point{2.0f, caret6.y + caret6.height * 0.5f}, PointerButton::Left, KeyMod_Shift, reqCap);
+        CHECK(singleTb->GetSelectionStart() == 0u);
+        CHECK(singleTb->GetSelectionLength() == 2u);
+
+        auto multiTb = MakeIntrusive<TextBox>();
+        multiTb->SetAcceptsReturn(true);
+        multiTb->SetText("LineOne\nLineTwo");
+        multiTb->SetWidth(220.0f);
+        multiTb->SetHeight(120.0f);
+        root->AddChild(multiTb.Get());
+
+        root->Measure(Size{300.0f, 300.0f});
+        root->Arrange(Rect{0.0f, 0.0f, 300.0f, 300.0f});
+
+        multiTb->SetCaretIndex(1u);
+        const Rect line1Caret = multiTb->CaretLocalRect();
+        multiTb->SetCaretIndex(9u);
+        const Rect line2Caret = multiTb->CaretLocalRect();
+        CHECK(line2Caret.y > line1Caret.y + 4.0f);
+
+        (void)multiTb->OnPointerDown(
+            Point{line2Caret.x + 12.0f, line2Caret.y + line2Caret.height * 0.5f},
+            PointerButton::Left,
+            0u,
+            reqCap);
+        CHECK(multiTb->GetCaretIndex() >= 8u);
+
+        multiTb->Select(4u, 7u); // spans across '\n'
+        PagedRenderTree renderTree;
+        renderTree.BuildFromVisualTree(root.Get());
+        CHECK(renderTree.NodeCount() > 0u);
+    }
+
+    // 5. MenuItem::HasAnyOpenSubmenu() open/close/destroy lifecycle
+    {
+        const bool baseline = MenuItem::HasAnyOpenSubmenu();
+        CHECK(!baseline);
+        {
+            auto menuItem = MakeIntrusive<MenuItem>();
+            menuItem->SetValue(PropId_IsSubmenuOpen, UnifiedValue{true}, ValueSourceRank::Local);
+            CHECK(MenuItem::HasAnyOpenSubmenu());
+            menuItem->SetValue(PropId_IsSubmenuOpen, UnifiedValue{false}, ValueSourceRank::Local);
+            CHECK(!MenuItem::HasAnyOpenSubmenu());
+            menuItem->SetValue(PropId_IsSubmenuOpen, UnifiedValue{true}, ValueSourceRank::Local);
+            CHECK(MenuItem::HasAnyOpenSubmenu());
+        } // destroyed while still open
+        CHECK(!MenuItem::HasAnyOpenSubmenu());
+    }
+
+    // 6. GridViewColumn inline DataTemplate quote-aware '>' scan & diagnostic propagation
+    {
+        AeroCompiler compiler;
+        AeroCompileInput goodInput;
+        goodInput.xamlPath = "GridViewQuotedTemplate.xaml";
+        goodInput.xamlContent = R"XAML(
+<Grid xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+      xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
+    <ListView>
+        <ListView.View>
+            <GridView>
+                <GridViewColumn Header="Col">
+                    <GridViewColumn.CellTemplate>
+                        <DataTemplate DataType="A>B">
+                            <TextBlock Text="{Binding Name}"/>
+                        </DataTemplate>
+                    </GridViewColumn.CellTemplate>
+                </GridViewColumn>
+            </GridView>
+        </ListView.View>
+    </ListView>
+</Grid>
+)XAML";
+        const auto goodRes = compiler.Compile(goodInput);
+        CHECK(goodRes.succeeded);
+
+        AeroCompileInput badInput;
+        badInput.xamlPath = "GridViewInvalidTemplate.xaml";
+        badInput.xamlContent = R"XAML(
+<Grid xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+      xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
+    <ListView>
+        <ListView.View>
+            <GridView>
+                <GridViewColumn Header="Col">
+                    <GridViewColumn.CellTemplate>
+                        <DataTemplate>
+                            <Border><TextBlock Text="Unclosed"/>
+                        </DataTemplate>
+                    </GridViewColumn.CellTemplate>
+                </GridViewColumn>
+            </GridView>
+        </ListView.View>
+    </ListView>
+</Grid>
+)XAML";
+        const auto badRes = compiler.Compile(badInput);
+        CHECK(!badRes.succeeded);
+        CHECK(!badRes.diagnostics.empty());
+    }
+
+    // 7. XamlApplication::Load .sln subdirectory discovery & search directory cleanup across loads
+    {
+        const fs::path dir1 = fs::temp_directory_path() / "aero_post_patch_dir1";
+        const fs::path dir2 = fs::temp_directory_path() / "aero_post_patch_sln2";
+        std::error_code ec;
+        fs::remove_all(dir1, ec);
+        fs::remove_all(dir2, ec);
+        fs::create_directories(dir1, ec);
+        fs::create_directories(dir2 / "SubApp", ec);
+
+        {
+            std::ofstream f(dir1 / "MainWindow.xaml", std::ios::binary);
+            f << R"XAML(<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"><TextBlock Text="One"/></Window>)XAML";
+        }
+        {
+            std::ofstream f(dir2 / "Demo.sln", std::ios::binary);
+            f << "Microsoft Visual Studio Solution File, Format Version 12.00\n"
+              << "Project(\"{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}\") = \"SubApp\", \"SubApp\\Demo.csproj\", \"{11111111-1111-1111-1111-111111111111}\"\n"
+              << "EndProject\n";
+        }
+        {
+            std::ofstream f(dir2 / "SubApp" / "MainWindow.xaml", std::ios::binary);
+            f << R"XAML(<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"><TextBlock x:Name="SlnHello" Text="FromSln"/></Window>)XAML";
+        }
+
+        XamlApplication app;
+        std::string err;
+        CHECK(app.Load(dir1.string(), &err));
+        const std::string dir1Str = dir1.string();
+
+        CHECK(app.Load(dir2.string(), &err));
+        auto* root = app.MainWindowElement();
+        auto* slnHello = (root && root->FindName("SlnHello")) ? root->FindName("SlnHello")->DynamicCast<TextBlock>() : nullptr;
+        CHECK(slnHello && slnHello->GetText() == "FromSln");
+
+        const auto xamlDirs = UiResourceContext::Default().XamlSearchDirectoriesSnapshot();
+        bool stillHasDir1 = false;
+        for (const auto& d : xamlDirs) {
+            if (d == dir1Str) {
+                stillHasDir1 = true;
+                break;
+            }
+        }
+        CHECK(!stillHasDir1);
+
+        fs::remove_all(dir1, ec);
+        fs::remove_all(dir2, ec);
+    }
+}
+
 int main() {
+    TestWpfDeveloperErgonomicsAndEnhancedControls();
+    TestPostPatchReviewFixes();
     RunMilestone2And3VerificationSuite();
     TestPatchAuditRegressions();
 

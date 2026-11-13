@@ -333,6 +333,10 @@ enum BuiltinPropertyId : std::uint16_t {
     PropId_MaxDropDownHeight = 201,         // float (ComboBox.MaxDropDownHeight)
     PropId_SelectionMode = 202,             // Int64 (ListBox.SelectionMode: 0=Single, 1=Multiple, 2=Extended)
     PropId_StrokeDashArray = 203,           // StringValue (Shape.StrokeDashArray)
+    PropId_SelectedValue = 204,             // UnifiedValue (Selector.SelectedValue)
+    PropId_CommandBindingsSpec = 205,       // StringValue (Serialized <CommandBinding> entries)
+    PropId_SelectionStart = 206,            // Int64 (TextBox.SelectionStart)
+    PropId_SelectionLength = 207,           // Int64 (TextBox.SelectionLength)
     PropId_FirstContractInput = 0x1000u,    // Dynamic/Contract input bridge slot range [0x1000 .. 0x1FFFu]
     // Pseudo-property IDs for zero-allocation inline interactive Trigger conditions
     PropId_TriggerIsMouseOver = 0xFF01u,
