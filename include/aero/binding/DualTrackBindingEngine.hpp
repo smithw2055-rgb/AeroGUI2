@@ -168,6 +168,13 @@ public:
     void SetUiInterpreter(const Interpreter* uiInterpreter) noexcept { uiInterpreter_ = uiInterpreter; }
     void SetAnimationEngine(AnimationEngine* animationEngine) noexcept { animationEngine_ = animationEngine; }
     void SetWakeHostCallback(std::function<void()> callback) { wakeHostCallback_ = std::move(callback); }
+    struct CommandCanExecuteWatcherEntry {
+        UIElement* target = nullptr;
+        std::function<void()> watcher;
+    };
+
+    void RegisterCommandCanExecuteWatcher(UIElement* target, std::function<void()> watcher);
+    void EvaluateCommandCanExecuteWatchers();
 
     [[nodiscard]] ExecutionDomainContext& Domains() noexcept { return domains_; }
     [[nodiscard]] const ExecutionDomainContext& Domains() const noexcept { return domains_; }
@@ -373,6 +380,7 @@ private:
     std::vector<ElementPropertyBindingInstance> elementBindings_;
     std::vector<MultiBindingInstance> multiBindings_;
     std::vector<RichTextDependentEntry> richTextDependents_;
+    std::vector<CommandCanExecuteWatcherEntry> commandCanExecuteWatchers_;
     std::vector<EcsColumnBindingChannel> trackBChannels_;
 };
 

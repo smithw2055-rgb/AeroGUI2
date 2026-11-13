@@ -51,8 +51,15 @@ struct PendingScriptUiState {
         IntrusivePtr<UIElement> rootControl{};
         std::vector<IntrusivePtr<UIElement>> mountedElements{};
     };
+    struct ControlWrapperEntry {
+        ExecutionDomainContext* domains = nullptr;
+        const UIElement* elemPtr = nullptr;
+        ObjectRef wrapper{};
+        std::shared_ptr<rs_rt::PersistentRoot> wrapperPin{};
+    };
     std::mutex mutex;
     std::vector<DcEntry> dcEntries;
+    std::vector<ControlWrapperEntry> controlWrappers;
     std::unordered_map<const ExecutionDomainContext*, std::vector<std::string>> pendingDictionaries;
     std::unordered_map<const ExecutionDomainContext*, PendingMountTarget> pendingMountTargets;
     std::vector<PreMountedWindowEntry> preMountedWindows;
@@ -77,6 +84,59 @@ struct PendingScriptUiState {
         for (const auto& e : dcEntries) {
             if (e.dataContext.valid()) {
                 rs_rt::markValueInPools(UnifiedValue{e.dataContext});
+            }
+        }
+        for (const auto& cw : controlWrappers) {
+            if (cw.wrapper.valid()) {
+                rs_rt::markValueInPools(UnifiedValue{cw.wrapper});
+            }
+        }
+    }
+
+    void RegisterControlWrapper(ExecutionDomainContext* dom, UIElement* elem, ObjectRef wrap) {
+        if (!dom || !elem || !wrap.valid()) return;
+        elem->SetHasRegisteredScriptWrapper(true);
+        std::shared_ptr<rs_rt::PersistentRoot> pin;
+        if (dom->heapForObject(wrap) == &dom->uiHeap() && dom->uiHeap().isAlive(wrap)) {
+            pin = std::make_shared<rs_rt::PersistentRoot>(dom->uiHeap().retain(wrap));
+        }
+        std::lock_guard<std::mutex> lock(mutex);
+        for (auto& cw : controlWrappers) {
+            if (cw.domains == dom && cw.elemPtr == elem && cw.wrapper == wrap) {
+                if (!cw.wrapperPin && pin) {
+                    cw.wrapperPin = std::move(pin);
+                }
+                return;
+            }
+        }
+        controlWrappers.push_back(ControlWrapperEntry{dom, elem, wrap, std::move(pin)});
+    }
+
+    void UnregisterElement(const UIElement* elem) noexcept {
+        if (!elem) return;
+        std::vector<ControlWrapperEntry> removed;
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            for (std::size_t i = 0u; i < controlWrappers.size();) {
+                if (controlWrappers[i].elemPtr == elem) {
+                    removed.push_back(std::move(controlWrappers[i]));
+                    if (i + 1u < controlWrappers.size()) {
+                        controlWrappers[i] = std::move(controlWrappers.back());
+                    }
+                    controlWrappers.pop_back();
+                } else {
+                    ++i;
+                }
+            }
+        }
+    }
+
+    void CollectControlWrappers(const UIElement* elem, std::vector<ControlWrapperEntry>& out) {
+        if (!elem) return;
+        std::lock_guard<std::mutex> lock(mutex);
+        for (const auto& cw : controlWrappers) {
+            if (cw.elemPtr == elem && cw.wrapper.valid()) {
+                out.push_back(cw);
             }
         }
     }
@@ -212,21 +272,35 @@ struct PendingScriptUiState {
 
     void ClearForDomain(const ExecutionDomainContext* dom) noexcept {
         if (!dom) return;
-        std::lock_guard<std::mutex> lock(mutex);
-        dcEntries.erase(
-            std::remove_if(
-                dcEntries.begin(),
-                dcEntries.end(),
-                [dom](const DcEntry& e) noexcept { return e.domains == dom; }),
-            dcEntries.end());
-        preMountedWindows.erase(
-            std::remove_if(
-                preMountedWindows.begin(),
-                preMountedWindows.end(),
-                [dom](const PreMountedWindowEntry& e) noexcept { return e.domains == dom; }),
-            preMountedWindows.end());
-        pendingMountTargets.erase(dom);
-        pendingDictionaries.erase(dom);
+        std::vector<ControlWrapperEntry> removedWrappers;
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            dcEntries.erase(
+                std::remove_if(
+                    dcEntries.begin(),
+                    dcEntries.end(),
+                    [dom](const DcEntry& e) noexcept { return e.domains == dom; }),
+                dcEntries.end());
+            preMountedWindows.erase(
+                std::remove_if(
+                    preMountedWindows.begin(),
+                    preMountedWindows.end(),
+                    [dom](const PreMountedWindowEntry& e) noexcept { return e.domains == dom; }),
+                preMountedWindows.end());
+            for (std::size_t i = 0u; i < controlWrappers.size();) {
+                if (controlWrappers[i].domains == dom) {
+                    removedWrappers.push_back(std::move(controlWrappers[i]));
+                    if (i + 1u < controlWrappers.size()) {
+                        controlWrappers[i] = std::move(controlWrappers.back());
+                    }
+                    controlWrappers.pop_back();
+                } else {
+                    ++i;
+                }
+            }
+            pendingMountTargets.erase(dom);
+            pendingDictionaries.erase(dom);
+        }
     }
 };
 
@@ -441,7 +515,212 @@ void AttachStyleEngineAcrossSubtree(UIElement* subtreeRoot, StyleTriggerEngine* 
     return std::nullopt;
 }
 
+void UnregisterScriptWrapperOnElementDestroy(const UIElement* elem) noexcept {
+    PendingScriptUiState::Instance().UnregisterElement(elem);
+}
+
 } // namespace
+
+void DispatchLoadedToRegisteredDescendants(UIElement* root, bool skipNestedUserControls) {
+    if (!root) return;
+    std::vector<IntrusivePtr<UIElement>> queue;
+    for (UIElement* c = root->FirstChild(); c != nullptr; c = c->NextSibling()) {
+        queue.emplace_back(c, true);
+    }
+    for (std::size_t i = 0u; i < queue.size(); ++i) {
+        UIElement* cur = queue[i].Get();
+        if (!cur) continue;
+        const bool isNestedUc = skipNestedUserControls && (cur->DynamicCast<UserControl>() != nullptr);
+        if (isNestedUc) {
+            continue;
+        }
+        if (cur->HasRegisteredScriptWrapper()) {
+            (void)cur->DispatchWrapperRoutedEvent("Loaded");
+        }
+        for (UIElement* ch = cur->FirstChild(); ch != nullptr; ch = ch->NextSibling()) {
+            queue.emplace_back(ch, true);
+        }
+    }
+}
+
+bool DispatchScriptWrapperRoutedEventImpl(
+    UIElement* elem,
+    std::string_view eventName,
+    const UnifiedValue& argVal,
+    bool hasArg) {
+    if (!elem || eventName.empty()) {
+        return false;
+    }
+    std::vector<PendingScriptUiState::ControlWrapperEntry> entries;
+    PendingScriptUiState::Instance().CollectControlWrappers(elem, entries);
+    if (entries.empty() && elem->BoundScriptWrapper().valid()) {
+        DualTrackBindingEngine* be = elem->BoundTwoWayEngine();
+        for (const UIElement* anc = elem->Parent(); anc != nullptr && !be; anc = anc->Parent()) {
+            be = anc->BoundTwoWayEngine();
+        }
+        if (be) {
+            entries.push_back(PendingScriptUiState::ControlWrapperEntry{
+                &be->Domains(), elem, elem->BoundScriptWrapper(), nullptr});
+        }
+    }
+    if (entries.empty()) {
+        return false;
+    }
+
+    const std::string fieldWanted = "$event_" + std::string(eventName) + "_delegate";
+    const std::string raiseMethodWanted = "__Raise" + std::string(eventName);
+    bool anyHandled = false;
+
+    for (const auto& entry : entries) {
+        ExecutionDomainContext* domains = entry.domains;
+        if (!domains) continue;
+        auto* heap = domains->heapForObject(entry.wrapper);
+        if (!heap || !heap->isAlive(entry.wrapper)) continue;
+
+        DualTrackBindingEngine* bindEng = elem->BoundTwoWayEngine();
+        StyleTriggerEngine* styleEng = elem->BoundStyleEngine();
+        for (const UIElement* anc = elem->Parent() ? elem->Parent() : elem->TemplatedParent();
+             anc != nullptr && (!bindEng || !styleEng);
+             anc = anc->Parent() ? anc->Parent() : anc->TemplatedParent()) {
+            if (!bindEng) bindEng = anc->BoundTwoWayEngine();
+            if (!styleEng) styleEng = anc->BoundStyleEngine();
+        }
+        if (!bindEng || !DualTrackBindingEngine::IsLiveInstance(bindEng)) continue;
+        const ProgramImage* prog = bindEng->Program();
+        const Interpreter* interp = bindEng->UiInterpreter();
+        rs_aot::ExecutionContext* aotCtx = styleEng ? styleEng->GetAotExecutionContext() : nullptr;
+        if (!prog || (!interp && !aotCtx)) continue;
+
+        const SymbolId wrapTid = heap->objectTypeId(entry.wrapper).value_or(0);
+        const auto* wrapTs = (wrapTid != 0) ? prog->resolveType(wrapTid) : nullptr;
+        if (!wrapTs) continue;
+
+        bool hasNonNullDelegate = false;
+        for (const auto& f : wrapTs->fields) {
+            if (f.name == fieldWanted) {
+                UnifiedValue dv{};
+                if (domains->readObjectField(DomainKind::Ui, entry.wrapper, f.index, dv)) {
+                    if (const auto* dref = std::get_if<ObjectRef>(&dv); dref && dref->valid() && heap->isAlive(*dref)) {
+                        hasNonNullDelegate = true;
+                    }
+                }
+                break;
+            }
+        }
+        if (!hasNonNullDelegate) {
+            continue;
+        }
+
+        SymbolId raiseSym = 0;
+        SymbolId walkTid = wrapTid;
+        for (int d = 0; d < 16 && walkTid != 0 && raiseSym == 0; ++d) {
+            const auto* ts = prog->resolveType(walkTid);
+            if (!ts) break;
+            for (const auto& m : ts->methods) {
+                if (m.name == raiseMethodWanted && !m.staticMethod && m.parameters.size() == 2u && m.id != 0) {
+                    raiseSym = m.id;
+                    break;
+                }
+            }
+            walkTid = ts->baseTypeId;
+        }
+        if (raiseSym == 0) {
+            continue;
+        }
+
+        const char* evArgsTypeName = "RoutedEventArgs";
+        if (eventName == "SelectionChanged") evArgsTypeName = "SelectionChangedEventArgs";
+        else if (eventName == "TextChanged") evArgsTypeName = "TextChangedEventArgs";
+        else if (eventName == "ValueChanged" || eventName == "SelectedItemChanged") evArgsTypeName = "RoutedPropertyChangedEventArgs";
+        else if (eventName == "KeyDown" || eventName == "KeyUp") evArgsTypeName = "KeyEventArgs";
+        else if (eventName == "MouseLeftButtonDown" || eventName == "MouseLeftButtonUp") evArgsTypeName = "MouseButtonEventArgs";
+
+        const rs_sem::TypeSymbol* eSym = nullptr;
+        for (const auto& mod : prog->modules()) {
+            if (mod.name != "Aero.UI") continue;
+            for (const auto& ts : mod.types) {
+                if (ts.name == evArgsTypeName) {
+                    eSym = &ts;
+                    break;
+                }
+            }
+        }
+        if (!eSym) continue;
+
+        RuntimeError aErr{};
+        const NativeHandle nh = elem->ToNativeHandle(domains->nativeHandles());
+        std::vector<UnifiedValue> eFields(eSym->fields.size(), UnifiedValue(NullObject{}));
+        std::vector<std::size_t> eRefFields;
+        std::size_t handledFieldIdx = static_cast<std::size_t>(-1);
+        for (std::size_t fi = 0u; fi < eSym->fields.size(); ++fi) {
+            const std::string& fn = eSym->fields[fi].name;
+            if (fn == "OriginalSource") {
+                eFields[fi] = UnifiedValue(nh);
+            } else if (fn == "EventName") {
+                if (auto sr = domains->uiHeap().allocateString(std::string(eventName), &aErr)) {
+                    eFields[fi] = UnifiedValue(*sr);
+                }
+            } else if (fn == "Handled") {
+                eFields[fi] = UnifiedValue(false);
+                handledFieldIdx = fi;
+            } else if (fn == "SelectedIndex") {
+                std::int64_t si = -1;
+                if (hasArg && std::holds_alternative<std::int64_t>(argVal)) si = std::get<std::int64_t>(argVal);
+                eFields[fi] = value::FromInt(si);
+            } else if (fn == "Text" || fn == "NewText") {
+                const std::string s = hasArg ? FormatBindingString({}, &argVal, 1u, domains) : std::string();
+                if (auto sr = domains->uiHeap().allocateString(s, &aErr)) eFields[fi] = UnifiedValue(*sr);
+            } else if (fn == "NewValue") {
+                float fv = 0.0f;
+                if (hasArg) (void)TryGetFloat(argVal, fv);
+                eFields[fi] = MakeFloat(fv);
+            } else if (fn == "KeyCode") {
+                std::int64_t kc = (hasArg && std::holds_alternative<std::int64_t>(argVal)) ? (std::get<std::int64_t>(argVal) & 0xFFFF) : 0;
+                eFields[fi] = value::FromInt(kc);
+            } else if (fn == "Key") {
+                std::int64_t kc = (hasArg && std::holds_alternative<std::int64_t>(argVal)) ? (std::get<std::int64_t>(argVal) & 0xFFFF) : 0;
+                if (auto sr = domains->uiHeap().allocateString(KeyCodeToName(static_cast<KeyCode>(kc)), &aErr)) eFields[fi] = UnifiedValue(*sr);
+            } else if (fn == "IsCtrlDown") {
+                const std::uint8_t m = static_cast<std::uint8_t>((hasArg && std::holds_alternative<std::int64_t>(argVal)) ? ((std::get<std::int64_t>(argVal) >> 16) & 0xFF) : 0);
+                eFields[fi] = UnifiedValue((m & KeyMod_Ctrl) != 0);
+            } else if (fn == "IsShiftDown") {
+                const std::uint8_t m = static_cast<std::uint8_t>((hasArg && std::holds_alternative<std::int64_t>(argVal)) ? ((std::get<std::int64_t>(argVal) >> 16) & 0xFF) : 0);
+                eFields[fi] = UnifiedValue((m & KeyMod_Shift) != 0);
+            } else if (fn == "IsAltDown") {
+                const std::uint8_t m = static_cast<std::uint8_t>((hasArg && std::holds_alternative<std::int64_t>(argVal)) ? ((std::get<std::int64_t>(argVal) >> 16) & 0xFF) : 0);
+                eFields[fi] = UnifiedValue((m & KeyMod_Alt) != 0);
+            }
+            if (eSym->fields[fi].type == rs_sem::PrimitiveType::Object ||
+                eSym->fields[fi].type == rs_sem::PrimitiveType::String ||
+                eSym->fields[fi].type == rs_sem::PrimitiveType::Array) {
+                eRefFields.push_back(fi);
+            }
+        }
+        auto eRefOpt = domains->uiHeap().allocateObject(eSym->id, std::move(eFields), std::move(eRefFields), &aErr);
+        if (!eRefOpt) continue;
+
+        if (interp) {
+            rs_rt::ExecutionOptions execOpts{};
+            execOpts.limits.instructionBudget = 5'000'000;
+            (void)interp->invoke(raiseSym, {entry.wrapper, *eRefOpt}, execOpts);
+        } else if (aotCtx) {
+            UnifiedValue callArgs[2]{entry.wrapper, *eRefOpt};
+            UnifiedValue ret{};
+            (void)aotCtx->invoke(raiseSym, callArgs, 2u, ret);
+        }
+        if (DualTrackBindingEngine::IsLiveInstance(bindEng)) {
+            (void)bindEng->FlushTrackA();
+        }
+        if (handledFieldIdx != static_cast<std::size_t>(-1) && domains->uiHeap().isAlive(*eRefOpt)) {
+            if (const auto hv = domains->uiHeap().fieldGet(*eRefOpt, handledFieldIdx)) {
+                if (const auto* hb = std::get_if<bool>(&*hv); hb && *hb) {
+                    anyHandled = true;
+                }
+            }
+        }
+    }
+    return anyHandled;
+}
 
 void SetPendingMainWindowMountTarget(
     const ExecutionDomainContext* domains,
@@ -452,6 +731,10 @@ void SetPendingMainWindowMountTarget(
 
 void ClearPendingMainWindowMountTarget(const ExecutionDomainContext* domains) noexcept {
     PendingScriptUiState::Instance().SetPendingMountTarget(domains, nullptr, nullptr);
+}
+
+void ClearScriptUiDomainState(const ExecutionDomainContext* domains) noexcept {
+    PendingScriptUiState::Instance().ClearForDomain(domains);
 }
 
 bool MountAndWireMainWindow(
@@ -502,8 +785,11 @@ bool MountAndWireMainWindow(
     rootControl->SetAsRootVisual(true, &domains.nativeHandles(), &domains.uiHeap());
     rootControl->BindTwoWayEngine(&bindingEngine);
 
+    UIElement::SetWrapperRoutedEventDispatcher(&DispatchScriptWrapperRoutedEventImpl);
+    UIElement::SetWrapperDestroyCallback(&UnregisterScriptWrapperOnElementDestroy);
     if (mainWinRef.valid()) {
         (void)rootControl->BindScriptWrapper(domains.nativeHandles(), domains.uiHeap(), mainWinRef);
+        PendingScriptUiState::Instance().RegisterControlWrapper(&domains, rootControl, mainWinRef);
     }
 
     const ObjectRef vmRef = ExtractViewModelFromMainWindow(
@@ -639,6 +925,8 @@ bool MountAndWireMainWindow(
 
     (void)bindingEngine.FlushTrackA();
     (void)styleEngine.EvaluateAndApply();
+    (void)rootControl->DispatchWrapperRoutedEvent("Loaded");
+    DispatchLoadedToRegisteredDescendants(rootControl, true);
 
     if (mainWinRef.valid() && program) {
         if (auto* heap = domains.heapForObject(mainWinRef); heap && heap->isAlive(mainWinRef)) {
@@ -2244,6 +2532,116 @@ void ScriptUiBridge::RegisterCoreUiBindings(BindingRegistry& bindings) {
                 hdr = tv->GetSelectedHeader();
             }
             return uiHeapPtr->allocateString(hdr, &error);
+        });
+
+    UIElement::SetWrapperRoutedEventDispatcher(&DispatchScriptWrapperRoutedEventImpl);
+    UIElement::SetWrapperDestroyCallback(&UnregisterScriptWrapperOnElementDestroy);
+
+    // UIElement_RegisterWrapper(handle elem, object wrapper) -> bool
+    bindSdkFn(
+        "UIElement_RegisterWrapper",
+        [handlesPtr, domPtr](
+            const rs_bc::FunctionReference&,
+            ValueSpan args,
+            RuntimeError&)
+            -> std::optional<UnifiedValue> {
+            if (args.size() < 2 || !handlesPtr || !domPtr) {
+                return UnifiedValue{false};
+            }
+            NativeHandle handle{};
+            if (!args[0].tryGetNativeHandle(handle) || !handle.valid()) {
+                return UnifiedValue{false};
+            }
+            auto* elem = UIElement::FromNativeHandle(*handlesPtr, handle);
+            const auto* wrapRef = std::get_if<ObjectRef>(&args[1]);
+            if (!elem || !wrapRef || !wrapRef->valid()) {
+                return UnifiedValue{false};
+            }
+            PendingScriptUiState::Instance().RegisterControlWrapper(domPtr, elem, *wrapRef);
+            return UnifiedValue{true};
+        });
+
+    // Command_NotifyCanExecuteChanged(object cmd) -> bool
+    bindSdkFn(
+        "Command_NotifyCanExecuteChanged",
+        [engineSlot](
+            const rs_bc::FunctionReference&,
+            ValueSpan,
+            RuntimeError&)
+            -> std::optional<UnifiedValue> {
+            DualTrackBindingEngine* liveEng = (engineSlot && *engineSlot) ? *engineSlot : nullptr;
+            if (liveEng && DualTrackBindingEngine::IsLiveInstance(liveEng)) {
+                liveEng->EvaluateCommandCanExecuteWatchers();
+                return UnifiedValue{true};
+            }
+            return UnifiedValue{false};
+        });
+
+    // TextBox_Clear(handle elem) -> bool
+    bindSdkFn(
+        "TextBox_Clear",
+        [handlesPtr](
+            const rs_bc::FunctionReference&,
+            ValueSpan args,
+            RuntimeError&)
+            -> std::optional<UnifiedValue> {
+            if (args.empty() || !handlesPtr) return UnifiedValue{false};
+            NativeHandle handle{};
+            if (!args[0].tryGetNativeHandle(handle) || !handle.valid()) return UnifiedValue{false};
+            auto* elem = UIElement::FromNativeHandle(*handlesPtr, handle);
+            if (auto* tb = elem ? elem->DynamicCast<TextBox>() : nullptr) {
+                tb->Clear();
+                return UnifiedValue{true};
+            }
+            return UnifiedValue{false};
+        });
+
+    // TextBox_SelectAll(handle elem) -> bool
+    bindSdkFn(
+        "TextBox_SelectAll",
+        [handlesPtr](
+            const rs_bc::FunctionReference&,
+            ValueSpan args,
+            RuntimeError&)
+            -> std::optional<UnifiedValue> {
+            if (args.empty() || !handlesPtr) return UnifiedValue{false};
+            NativeHandle handle{};
+            if (!args[0].tryGetNativeHandle(handle) || !handle.valid()) return UnifiedValue{false};
+            auto* elem = UIElement::FromNativeHandle(*handlesPtr, handle);
+            if (auto* tb = elem ? elem->DynamicCast<TextBox>() : nullptr) {
+                tb->SelectAll();
+                return UnifiedValue{true};
+            }
+            return UnifiedValue{false};
+        });
+
+    // ListBox_GetSelectedItemText(handle elem) -> string
+    bindSdkFn(
+        "ListBox_GetSelectedItemText",
+        [handlesPtr, uiHeapPtr, domPtr](
+            const rs_bc::FunctionReference&,
+            ValueSpan args,
+            RuntimeError& error)
+            -> std::optional<UnifiedValue> {
+            if (!uiHeapPtr) {
+                error.code = ErrorCode::InvalidObjectReference;
+                error.message = "UiHeap unavailable";
+                return std::nullopt;
+            }
+            if (args.empty() || !handlesPtr) return uiHeapPtr->allocateString("", &error);
+            NativeHandle handle{};
+            if (!args[0].tryGetNativeHandle(handle) || !handle.valid()) return uiHeapPtr->allocateString("", &error);
+            auto* elem = UIElement::FromNativeHandle(*handlesPtr, handle);
+            std::string txt;
+            if (const auto* cb = elem ? elem->DynamicCast<ComboBox>() : nullptr) {
+                txt = cb->GetDisplayText();
+            } else if (const auto* lb = elem ? elem->DynamicCast<ListBox>() : nullptr) {
+                const UnifiedValue siVal = lb->GetValue(PropId_SelectedItem);
+                if (!std::holds_alternative<std::monostate>(siVal)) {
+                    txt = FormatBindingString({}, &siVal, 1u, domPtr);
+                }
+            }
+            return uiHeapPtr->allocateString(txt, &error);
         });
 
     // Window_Close(handle elem) -> bool

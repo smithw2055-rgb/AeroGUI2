@@ -316,6 +316,23 @@ enum BuiltinPropertyId : std::uint16_t {
     PropId_TabIndex = 184,                  // Int64 (Control.TabIndex / KeyboardNavigation.TabIndex)
     PropId_KeyBindingsSpec = 185,           // StringValue (Serialized <KeyBinding> shortcuts)
     PropId_SelectedValuePath = 186,         // StringValue (Selector.SelectedValuePath)
+    PropId_IsHitTestVisible = 187,          // bool (UIElement.IsHitTestVisible)
+    PropId_IsDirectionReversed = 188,       // bool (Slider.IsDirectionReversed)
+    PropId_IsSnapToTickEnabled = 189,       // bool (Slider.IsSnapToTickEnabled)
+    PropId_TickFrequency = 190,             // float (Slider.TickFrequency)
+    PropId_TickPlacement = 191,             // Int64 (Slider.TickPlacement: 0=None, 1=TopLeft, 2=BottomRight, 3=Both)
+    PropId_Ticks = 192,                     // StringValue (Slider.Ticks space/comma list)
+    PropId_IsMoveToPointEnabled = 193,      // bool (Slider.IsMoveToPointEnabled)
+    PropId_PasswordChar = 194,              // StringValue (PasswordBox.PasswordChar)
+    PropId_AcceptsReturn = 195,             // bool (TextBox.AcceptsReturn)
+    PropId_MaxLines = 196,                  // Int64 (TextBlock/TextBox.MaxLines)
+    PropId_LineHeight = 197,                // float (TextBlock.LineHeight)
+    PropId_CharacterSpacing = 198,          // float (Text.CharacterSpacing)
+    PropId_TextDecorations = 199,           // Int64 bitmask (0=None, 1=Underline, 2=Strikethrough, 4=Overline)
+    PropId_IsEditable = 200,                // bool (ComboBox.IsEditable)
+    PropId_MaxDropDownHeight = 201,         // float (ComboBox.MaxDropDownHeight)
+    PropId_SelectionMode = 202,             // Int64 (ListBox.SelectionMode: 0=Single, 1=Multiple, 2=Extended)
+    PropId_StrokeDashArray = 203,           // StringValue (Shape.StrokeDashArray)
     PropId_FirstContractInput = 0x1000u,    // Dynamic/Contract input bridge slot range [0x1000 .. 0x1FFFu]
     // Pseudo-property IDs for zero-allocation inline interactive Trigger conditions
     PropId_TriggerIsMouseOver = 0xFF01u,

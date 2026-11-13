@@ -1527,8 +1527,28 @@ bool StyleTriggerEngine::EvaluateSingleCondition(
                 return UnifiedValue{StyleTriggerEngine::HasFocusedDescendant(target)};
             case PropId_IsEnabled:
                 return UnifiedValue{target->IsEffectivelyEnabled()};
-            default:
-                return target->GetValue(propId);
+            default: {
+                UnifiedValue v = target->GetValue(propId);
+                if (std::holds_alternative<std::monostate>(v)) {
+                    switch (propId) {
+                        case PropId_ExpandDirection:
+                        case PropId_Orientation:
+                        case PropId_SelectionMode:
+                        case PropId_TickPlacement:
+                        case PropId_ClickMode:
+                            return value::FromInt(0);
+                        case PropId_IsExpanded:
+                        case PropId_IsChecked:
+                        case PropId_IsReadOnly:
+                        case PropId_IsEditable:
+                        case PropId_IsDropDownOpen:
+                            return UnifiedValue{false};
+                        default:
+                            break;
+                    }
+                }
+                return v;
+            }
         }
     };
 
@@ -1688,6 +1708,19 @@ bool StyleTriggerEngine::EvaluateSingleCondition(
     }
 
     UnifiedValue resolvedExpected = cond.expectedValue;
+    if (cond.converter == ValueConverterKind::None && !cond.expectNull &&
+        cond.sourceKind != TriggerConditionSource::DataContextBinding &&
+        cond.compiledHops.empty() && cond.propId != 0) {
+        if (const auto* expStr = std::get_if<StringValue>(&resolvedExpected)) {
+            if (std::holds_alternative<std::int64_t>(actualVal)) {
+                const UnifiedValue parsedBuiltin =
+                    ParseBuiltinLiteralPropertyValue(cond.propId, expStr->view());
+                if (std::holds_alternative<std::int64_t>(parsedBuiltin)) {
+                    resolvedExpected = parsedBuiltin;
+                }
+            }
+        }
+    }
     if (cond.converter == ValueConverterKind::None && !cond.expectNull && program_) {
         SymbolId leafEnumTypeId = 0;
         if (!cond.compiledHops.empty() && cond.compiledHops.back().targetIsEnum) {
@@ -2222,6 +2255,203 @@ namespace {
     }
     if (const SymbolId mSym = findExecMethod(rs_sem::PrimitiveType::Void, true)) {
         return invokeCmdMethod(mSym, {cmdObj});
+    }
+    return false;
+}
+
+bool TryEvaluateCommandCanExecuteOnOwner(
+    ExecutionDomainContext* domains,
+    const ProgramImage* prog,
+    const Interpreter* interp,
+    rs_aot::ExecutionContext* aotCtx,
+    ObjectRef ownerObj,
+    std::string_view propName,
+    const UnifiedValue& rawParam,
+    bool hasParam,
+    bool& outCanExecute) {
+    outCanExecute = true;
+    if (!domains || !prog || !ownerObj.valid() || propName.empty()) {
+        return false;
+    }
+    auto* ownerHeap = domains->heapForObject(ownerObj);
+    if (!ownerHeap || !ownerHeap->isAlive(ownerObj)) {
+        return false;
+    }
+    const SymbolId ownerTid = ownerHeap->objectTypeId(ownerObj).value_or(0);
+    if (ownerTid == 0) {
+        return false;
+    }
+
+    ObjectRef cmdObj{};
+    if (const auto slot = domains->resolvePropertySlot(*prog, ownerTid, propName)) {
+        UnifiedValue v{};
+        if (domains->readPropertySlotFast(DomainKind::Ui, ownerObj, *slot, v, nullptr, interp)) {
+            if (const auto* r = std::get_if<ObjectRef>(&v); r && r->valid()) {
+                cmdObj = *r;
+            }
+        }
+    }
+    if (!cmdObj.valid()) {
+        SymbolId walkTid = ownerTid;
+        for (int d = 0; d < 16 && walkTid != 0 && !cmdObj.valid(); ++d) {
+            const auto* ts = prog->resolveType(walkTid);
+            if (!ts) break;
+            std::string privName = "_";
+            privName.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(propName[0]))));
+            privName.append(propName.substr(1));
+            for (const auto& f : ts->fields) {
+                if (f.name == propName || f.name == privName ||
+                    f.name == ("<" + std::string(propName) + ">k__BackingField")) {
+                    UnifiedValue fv{};
+                    if (domains->readObjectField(DomainKind::Ui, ownerObj, f.index, fv)) {
+                        if (const auto* r = std::get_if<ObjectRef>(&fv); r && r->valid()) {
+                            cmdObj = *r;
+                            break;
+                        }
+                    }
+                }
+            }
+            if (!cmdObj.valid()) {
+                const std::string getterName = "get_" + std::string(propName);
+                for (const auto& m : ts->methods) {
+                    if (m.name == getterName && !m.staticMethod && m.parameters.size() == 1u && m.id != 0) {
+                        if (interp) {
+                            rs_rt::ExecutionOptions gOpts{};
+                            gOpts.limits.instructionBudget = 500'000;
+                            const auto gRes = interp->invoke(m.id, {ownerObj}, gOpts);
+                            if (gRes.succeeded) {
+                                if (const auto* r = std::get_if<ObjectRef>(&gRes.value); r && r->valid()) {
+                                    cmdObj = *r;
+                                    break;
+                                }
+                            }
+                        } else if (aotCtx) {
+                            UnifiedValue arg0 = ownerObj;
+                            UnifiedValue ret{};
+                            if (aotCtx->invoke(m.id, &arg0, 1u, ret)) {
+                                if (const auto* r = std::get_if<ObjectRef>(&ret); r && r->valid()) {
+                                    cmdObj = *r;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            walkTid = ts->baseTypeId;
+        }
+    }
+    if (!cmdObj.valid()) {
+        return false;
+    }
+    auto* cmdHeap = domains->heapForObject(cmdObj);
+    if (!cmdHeap || !cmdHeap->isAlive(cmdObj)) {
+        return false;
+    }
+    const SymbolId cmdTid = cmdHeap->objectTypeId(cmdObj).value_or(0);
+    const auto* cmdTs = (cmdTid != 0) ? prog->resolveType(cmdTid) : nullptr;
+    if (!cmdTs) {
+        return false;
+    }
+
+    auto hasNonNullField = [&](std::string_view fn) -> bool {
+        for (const auto& f : cmdTs->fields) {
+            if (f.name == fn) {
+                UnifiedValue v{};
+                if (domains->readObjectField(DomainKind::Ui, cmdObj, f.index, v)) {
+                    if (const auto* r = std::get_if<ObjectRef>(&v); r && r->valid() && cmdHeap->isAlive(*r)) {
+                        return true;
+                    }
+                }
+                return false;
+            }
+        }
+        return false;
+    };
+
+    const bool hasCanInt = hasNonNullField("_canExecInt");
+    const bool hasCanStr = hasNonNullField("_canExecStr");
+    const bool hasCanHandle = hasNonNullField("_canExecHandle");
+    const bool hasCan0 = hasNonNullField("_canExec0");
+    const bool hasGenericCan = hasNonNullField("_canExec");
+    if (!hasCanInt && !hasCanStr && !hasCanHandle && !hasCan0 && !hasGenericCan) {
+        return false; // No CanExecute predicate supplied -> leave XAML/style IsEnabled untouched
+    }
+
+    auto findCanMethod = [&](rs_sem::PrimitiveType expectedParamType, bool zeroArg) -> SymbolId {
+        SymbolId walk = cmdTid;
+        for (int d = 0; d < 16 && walk != 0; ++d) {
+            const auto* ts = prog->resolveType(walk);
+            if (!ts) break;
+            for (const auto& m : ts->methods) {
+                if (m.name != "CanExecute" || m.staticMethod || m.id == 0) continue;
+                if (zeroArg && m.parameters.size() == 1u) return m.id;
+                if (!zeroArg && m.parameters.size() == 2u && m.parameters[1].type == expectedParamType) {
+                    return m.id;
+                }
+            }
+            walk = ts->baseTypeId;
+        }
+        return 0;
+    };
+
+    auto invokeCanMethod = [&](SymbolId mSym, const std::vector<UnifiedValue>& callArgs) -> bool {
+        if (mSym == 0) return false;
+        if (interp) {
+            rs_rt::ExecutionOptions opts{};
+            opts.limits.instructionBudget = 1'000'000;
+            const auto r = interp->invoke(mSym, callArgs, opts);
+            if (r.succeeded) {
+                if (const auto* b = std::get_if<bool>(&r.value)) {
+                    outCanExecute = *b;
+                    return true;
+                }
+            }
+        } else if (aotCtx) {
+            UnifiedValue ret{};
+            if (aotCtx->invoke(mSym, callArgs.data(), callArgs.size(), ret)) {
+                if (const auto* b = std::get_if<bool>(&ret)) {
+                    outCanExecute = *b;
+                    return true;
+                }
+            }
+        }
+        return false;
+    };
+
+    if (hasCan0) {
+        return invokeCanMethod(findCanMethod(rs_sem::PrimitiveType::Void, true), {cmdObj});
+    }
+    if (hasCanInt) {
+        std::int64_t iv = 0;
+        if (hasParam) (void)rawParam.tryGetInt64(iv);
+        return invokeCanMethod(findCanMethod(rs_sem::PrimitiveType::Int, false), {cmdObj, value::FromInt(iv)});
+    }
+    if (hasCanStr || hasGenericCan) {
+        if (const SymbolId mSym = findCanMethod(rs_sem::PrimitiveType::String, false)) {
+            UnifiedValue strArg{};
+            if (hasParam) {
+                if (const auto* sref = std::get_if<ObjectRef>(&rawParam); sref && sref->valid() && sref->kind == ObjectKind::String) {
+                    strArg = *sref;
+                } else {
+                    const std::string s = FormatBindingString({}, &rawParam, 1u, domains);
+                    if (auto alloc = domains->uiHeap().allocateString(s)) strArg = *alloc;
+                }
+            } else if (auto alloc = domains->uiHeap().allocateString("")) {
+                strArg = *alloc;
+            }
+            return invokeCanMethod(mSym, {cmdObj, strArg});
+        }
+        if (const SymbolId mSym = findCanMethod(rs_sem::PrimitiveType::Int, false)) {
+            std::int64_t iv = 0;
+            if (hasParam) (void)rawParam.tryGetInt64(iv);
+            return invokeCanMethod(mSym, {cmdObj, value::FromInt(iv)});
+        }
+    }
+    if (hasCanHandle) {
+        NativeHandle nh{};
+        if (hasParam) (void)rawParam.tryGetNativeHandle(nh);
+        return invokeCanMethod(findCanMethod(rs_sem::PrimitiveType::Handle, false), {cmdObj, UnifiedValue{nh}});
     }
     return false;
 }
@@ -3124,8 +3354,8 @@ void StyleTriggerEngine::ReapplyActiveOverrides(
             }
         }
 
-        if (animationEngine_ && !isInitialPass) {
-            if ((exitedBits & bit) != 0ULL) {
+        if (animationEngine_) {
+            if (!isInitialPass && (exitedBits & bit) != 0ULL) {
                 for (const auto& sb : trig.exitStoryboards) {
                     (void)animationEngine_->BeginStoryboard(elem, sb);
                 }

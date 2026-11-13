@@ -1,4 +1,5 @@
 #include "aero/controls/Controls.hpp"
+#include "aero/bridge/ScriptUiBridge.hpp"
 #include "aero/core/UiResourceContext.hpp"
 #include "aero/render/FontAtlas.hpp"
 #include "aero/render/ImageAtlas.hpp"
@@ -11,6 +12,7 @@
 #include <cmath>
 #include <fstream>
 #include <limits>
+#include <sstream>
 
 namespace aero {
 
@@ -4118,6 +4120,7 @@ void Expander::ToggleExpanded() {
     if (expandedChangedCallback_) {
         expandedChangedCallback_(*this, next);
     }
+    (void)DispatchWrapperRoutedEvent(next ? "Expanded" : "Collapsed", value::FromBool(next), true);
 }
 
 void Expander::SetExpandDirection(ExpandDirection dir) {
@@ -4533,8 +4536,11 @@ bool TabControl::SelectTabInteractive(std::int32_t index) {
     SetSelectedIndex(clamped);
     SyncTabSelectionStates();
     (void)NotifyTwoWayPropertyMutated(PropId_SelectedIndex);
-    if (clamped != prev && selectionChangedCallback_) {
-        selectionChangedCallback_(*this, clamped);
+    if (clamped != prev) {
+        if (selectionChangedCallback_) {
+            selectionChangedCallback_(*this, clamped);
+        }
+        (void)DispatchWrapperRoutedEvent("SelectionChanged", value::FromInt(clamped), true);
     }
     return true;
 }
@@ -5368,6 +5374,11 @@ void CheckBox::Toggle() {
     for (const auto& extraCb : extraCheckedCallbacks_) {
         if (extraCb) extraCb(*this, IsChecked());
     }
+    {
+        const bool isInd = std::holds_alternative<NullObject>(GetValue(PropId_IsChecked));
+        const char* evN = isInd ? "Indeterminate" : (IsChecked() ? "Checked" : "Unchecked");
+        (void)DispatchWrapperRoutedEvent(evN, value::FromBool(IsChecked()), true);
+    }
     (void)NotifyTwoWayPropertyMutated(PropId_IsChecked);
 }
 
@@ -5602,13 +5613,17 @@ float Slider::GetSliderValue() const noexcept {
 bool Slider::SetSliderValueInteractive(float val) {
     const float minV = GetMinimum();
     const float maxV = GetMaximum();
-    const float clamped = std::clamp(val, minV, maxV);
+    float clamped = std::clamp(val, minV, maxV);
+    if (IsSnapToTickEnabled()) {
+        clamped = SnapValueToTicks(clamped);
+    }
     const float prev = GetSliderValue();
     SetSliderValue(clamped);
     if (std::fabs(clamped - prev) > 1e-6f) {
         if (valueChangedCallback_) {
             valueChangedCallback_(*this, clamped);
         }
+        (void)DispatchWrapperRoutedEvent("ValueChanged", MakeFloat(clamped), true);
         (void)NotifyTwoWayPropertyMutated(PropId_Value);
         return true;
     }
@@ -5656,6 +5671,156 @@ Orientation Slider::GetOrientation() const noexcept {
     return Orientation::Horizontal;
 }
 
+void Slider::SetIsDirectionReversed(bool reversed) {
+    SetValue(PropId_IsDirectionReversed, UnifiedValue{reversed}, ValueSourceRank::Local);
+}
+
+bool Slider::IsDirectionReversed() const noexcept {
+    const UnifiedValue v = GetValue(PropId_IsDirectionReversed);
+    if (const auto* b = std::get_if<bool>(&v)) return *b;
+    return false;
+}
+
+void Slider::SetIsSnapToTickEnabled(bool snap) {
+    SetValue(PropId_IsSnapToTickEnabled, UnifiedValue{snap}, ValueSourceRank::Local);
+}
+
+bool Slider::IsSnapToTickEnabled() const noexcept {
+    const UnifiedValue v = GetValue(PropId_IsSnapToTickEnabled);
+    if (const auto* b = std::get_if<bool>(&v)) return *b;
+    return false;
+}
+
+void Slider::SetTickFrequency(float freq) {
+    SetValue(PropId_TickFrequency, MakeFloat(std::max(0.0f, freq)), ValueSourceRank::Local);
+}
+
+float Slider::GetTickFrequency() const noexcept {
+    float out = 1.0f;
+    if (TryGetFloat(GetValue(PropId_TickFrequency), out) && std::isfinite(out) && out > 0.0f) {
+        return out;
+    }
+    return 1.0f;
+}
+
+void Slider::SetTickPlacement(std::int32_t placement) {
+    SetValue(PropId_TickPlacement, value::FromInt(std::clamp<std::int32_t>(placement, 0, 3)), ValueSourceRank::Local);
+}
+
+std::int32_t Slider::GetTickPlacement() const noexcept {
+    const UnifiedValue v = GetValue(PropId_TickPlacement);
+    if (const auto* i = std::get_if<std::int64_t>(&v)) {
+        return std::clamp<std::int32_t>(static_cast<std::int32_t>(*i), 0, 3);
+    }
+    return 0;
+}
+
+void Slider::SetTicks(std::string_view ticksSpec) {
+    SetValue(PropId_Ticks, value::FromString(std::string(ticksSpec)), ValueSourceRank::Local);
+}
+
+std::string Slider::GetTicks() const {
+    const UnifiedValue v = GetValue(PropId_Ticks);
+    if (const auto* sv = std::get_if<StringValue>(&v)) {
+        return sv->str();
+    }
+    return {};
+}
+
+void Slider::CollectNormalizedTicks(std::vector<float>& outTicks) const {
+    outTicks.clear();
+    const float minV = GetMinimum();
+    const float maxV = GetMaximum();
+    const float span = maxV - minV;
+    if (span <= 1e-6f) return;
+    const bool rev = IsDirectionReversed();
+
+    const UnifiedValue ticksVal = GetValue(PropId_Ticks);
+    if (const auto* sv = std::get_if<StringValue>(&ticksVal); sv && !sv->view().empty()) {
+        std::string buf(sv->view());
+        for (char& ch : buf) {
+            if (ch == ',' || ch == ';') ch = ' ';
+        }
+        std::istringstream iss(buf);
+        float tv = 0.0f;
+        while (iss >> tv) {
+            if (std::isfinite(tv) && tv >= minV - 1e-4f && tv <= maxV + 1e-4f) {
+                const float norm = std::clamp((tv - minV) / span, 0.0f, 1.0f);
+                outTicks.push_back(rev ? (1.0f - norm) : norm);
+            }
+        }
+        if (!outTicks.empty()) {
+            return;
+        }
+    }
+
+    const float freq = GetTickFrequency();
+    if (freq > 1e-5f) {
+        const std::size_t maxSteps = std::min<std::size_t>(128u, static_cast<std::size_t>(std::floor(span / freq)) + 2u);
+        outTicks.reserve(maxSteps);
+        for (std::size_t k = 0u; k < maxSteps; ++k) {
+            const float tv = minV + static_cast<float>(k) * freq;
+            if (tv > maxV + 1e-4f) break;
+            const float norm = std::clamp((tv - minV) / span, 0.0f, 1.0f);
+            outTicks.push_back(rev ? (1.0f - norm) : norm);
+        }
+        const float lastNorm = rev ? 0.0f : 1.0f;
+        if (outTicks.empty() || std::fabs(outTicks.back() - lastNorm) > 1e-3f) {
+            outTicks.push_back(lastNorm);
+        }
+    }
+}
+
+void Slider::SetIsMoveToPointEnabled(bool enabled) {
+    SetValue(PropId_IsMoveToPointEnabled, UnifiedValue{enabled}, ValueSourceRank::Local);
+}
+
+bool Slider::IsMoveToPointEnabled() const noexcept {
+    const UnifiedValue v = GetValue(PropId_IsMoveToPointEnabled);
+    if (const auto* b = std::get_if<bool>(&v)) return *b;
+    return true;
+}
+
+float Slider::SnapValueToTicks(float rawVal) const noexcept {
+    const float minV = GetMinimum();
+    const float maxV = GetMaximum();
+    const float clamped = std::clamp(rawVal, minV, maxV);
+    const UnifiedValue ticksVal = GetValue(PropId_Ticks);
+    if (const auto* sv = std::get_if<StringValue>(&ticksVal); sv && !sv->view().empty()) {
+        std::string buf(sv->view());
+        for (char& ch : buf) {
+            if (ch == ',' || ch == ';') ch = ' ';
+        }
+        std::istringstream iss(buf);
+        float best = clamped;
+        float bestDist = 1e30f;
+        float tv = 0.0f;
+        while (iss >> tv) {
+            if (std::isfinite(tv)) {
+                const float tc = std::clamp(tv, minV, maxV);
+                const float d = std::fabs(tc - clamped);
+                if (d < bestDist) {
+                    bestDist = d;
+                    best = tc;
+                }
+            }
+        }
+        if (bestDist < 1e29f) {
+            return best;
+        }
+    }
+    const float freq = GetTickFrequency();
+    if (freq > 1e-5f) {
+        const float steps = std::round((clamped - minV) / freq);
+        const float snapped = minV + steps * freq;
+        if (std::fabs(maxV - clamped) < std::fabs(snapped - clamped)) {
+            return maxV;
+        }
+        return std::clamp(snapped, minV, maxV);
+    }
+    return clamped;
+}
+
 float Slider::NormalizedPosition() const noexcept {
     const float minV = GetMinimum();
     const float maxV = GetMaximum();
@@ -5664,6 +5829,11 @@ float Slider::NormalizedPosition() const noexcept {
         return 0.0f;
     }
     return std::clamp((GetSliderValue() - minV) / span, 0.0f, 1.0f);
+}
+
+float Slider::VisualNormalizedPosition() const noexcept {
+    const float t = NormalizedPosition();
+    return IsDirectionReversed() ? (1.0f - t) : t;
 }
 
 bool Slider::UpdateValueFromLocalPoint(Point localPt) {
@@ -5680,6 +5850,9 @@ bool Slider::UpdateValueFromLocalPoint(Point localPt) {
         const float trackH = std::max(1.0f, r.height - (p.top + p.bottom));
         // Standard vertical slider: bottom = Minimum (t=0), top = Maximum (t=1)
         t = std::clamp(1.0f - ((localPt.y - trackY) / trackH), 0.0f, 1.0f);
+    }
+    if (IsDirectionReversed()) {
+        t = 1.0f - t;
     }
     const float minV = GetMinimum();
     const float maxV = GetMaximum();
@@ -5751,28 +5924,30 @@ bool Slider::OnKeyDown(KeyCode key, std::uint8_t modifiers) {
     }
     const float cur = GetSliderValue();
     const Orientation orient = GetOrientation();
+    const float dirSign = IsDirectionReversed() ? -1.0f : 1.0f;
+    const float step = (IsSnapToTickEnabled() && GetTickFrequency() > 1e-5f) ? GetTickFrequency() : GetSmallChange();
     switch (key) {
         case KeyCode::Right:
             if (orient == Orientation::Horizontal) {
-                (void)SetSliderValueInteractive(cur + GetSmallChange());
+                (void)SetSliderValueInteractive(cur + dirSign * step);
                 return true;
             }
             return false;
         case KeyCode::Left:
             if (orient == Orientation::Horizontal) {
-                (void)SetSliderValueInteractive(cur - GetSmallChange());
+                (void)SetSliderValueInteractive(cur - dirSign * step);
                 return true;
             }
             return false;
         case KeyCode::Up:
             if (orient == Orientation::Vertical) {
-                (void)SetSliderValueInteractive(cur + GetSmallChange());
+                (void)SetSliderValueInteractive(cur + dirSign * step);
                 return true;
             }
             return false;
         case KeyCode::Down:
             if (orient == Orientation::Vertical) {
-                (void)SetSliderValueInteractive(cur - GetSmallChange());
+                (void)SetSliderValueInteractive(cur - dirSign * step);
                 return true;
             }
             return false;
@@ -5795,7 +5970,8 @@ bool Slider::OnKeyDown(KeyCode key, std::uint8_t modifiers) {
 
 void Slider::OnPropertyChanged(std::uint16_t propId, const UnifiedValue& newValue) {
     UIElement::OnPropertyChanged(propId, newValue);
-    if (propId == PropId_Value || propId == PropId_Minimum || propId == PropId_Maximum) {
+    if (propId == PropId_Value || propId == PropId_Minimum || propId == PropId_Maximum ||
+        propId == PropId_IsDirectionReversed) {
         SyncTemplateParts();
     }
 }
@@ -5810,7 +5986,7 @@ void Slider::SyncTemplateParts() noexcept {
         return;
     }
     UIElement* track = GetTemplateChild("PART_Track");
-    const float t = NormalizedPosition();
+    const float t = VisualNormalizedPosition();
     if (GetOrientation() == Orientation::Vertical) {
         float fullH = 0.0f;
         if (track && track->FinalRect().height > 0.0f) fullH = track->FinalRect().height;
@@ -5983,6 +6159,7 @@ std::int32_t TextBox::GetMaxLength() const noexcept {
 }
 
 void TextBox::SetCaretIndex(std::size_t codePointIndex) {
+    hasAllSelected_ = false;
     const std::size_t maxCp = CountUtf8CodePointsSafe(GetText());
     const std::size_t clamped = std::min(codePointIndex, maxCp);
     SetValue(PropId_CaretIndex, value::FromInt(static_cast<std::int64_t>(clamped)), ValueSourceRank::Local);
@@ -6010,12 +6187,96 @@ bool TextBox::IsPassword() const noexcept {
     return false;
 }
 
+void TextBox::SetAcceptsReturn(bool accepts) {
+    SetValue(PropId_AcceptsReturn, UnifiedValue{accepts}, ValueSourceRank::Local);
+}
+
+bool TextBox::AcceptsReturn() const noexcept {
+    const UnifiedValue v = GetValue(PropId_AcceptsReturn);
+    if (const auto* b = std::get_if<bool>(&v)) {
+        return *b;
+    }
+    return false;
+}
+
+std::int32_t TextBox::GetMaxLines() const noexcept {
+    const UnifiedValue v = GetValue(PropId_MaxLines);
+    if (const auto* i = std::get_if<std::int64_t>(&v)) {
+        return (*i > 0) ? static_cast<std::int32_t>(*i) : 0;
+    }
+    return 0;
+}
+
+void TextBox::Clear() {
+    hasAllSelected_ = false;
+    (void)CommitEditedText("", 0u);
+}
+
+void TextBox::SelectAll() {
+    const std::size_t len = CountUtf8CodePointsSafe(GetText());
+    SetCaretIndex(len);
+    hasAllSelected_ = (len > 0u);
+}
+
+void PasswordBox::SetPassword(std::string_view password) {
+    SetText(password);
+    SetCaretIndex(CountUtf8CodePointsSafe(password));
+}
+
+void PasswordBox::SetPasswordChar(std::string_view ch) {
+    SetValue(PropId_PasswordChar, value::FromString(std::string(ch)), ValueSourceRank::Local);
+}
+
+std::string PasswordBox::GetPasswordChar() const {
+    const UnifiedValue v = GetValue(PropId_PasswordChar);
+    if (const auto* sv = std::get_if<StringValue>(&v); sv && !sv->view().empty()) {
+        std::size_t cur = 0u;
+        std::uint32_t dummy = 0u;
+        if (DecodeNextUtf8CodePoint(sv->view(), cur, dummy) && cur > 0u) {
+            return std::string(sv->view().substr(0u, cur));
+        }
+    }
+    return "*";
+}
+
+void PasswordBox::OnPropertyChanged(std::uint16_t propId, const UnifiedValue& newValue) {
+    TextBox::OnPropertyChanged(propId, newValue);
+    if (propId == PropId_Text) {
+        const std::string curPwd = GetText();
+        if (curPwd != lastNotifiedPassword_) {
+            lastNotifiedPassword_ = curPwd;
+            if (passwordChangedCallback_) {
+                passwordChangedCallback_(*this, curPwd);
+            }
+            (void)DispatchWrapperRoutedEvent("PasswordChanged", value::FromString(curPwd), true);
+        }
+    }
+}
+
 std::string TextBox::GetDisplayString() const {
     const std::string raw = GetText();
     if (raw.empty() || !IsPassword()) {
         return raw;
     }
-    return std::string(CountUtf8CodePointsSafe(raw), '*');
+    std::string maskUnit = "*";
+    const UnifiedValue pcVal = GetValue(PropId_PasswordChar);
+    if (const auto* sv = std::get_if<StringValue>(&pcVal); sv && !sv->view().empty()) {
+        std::size_t cur = 0u;
+        std::uint32_t dummy = 0u;
+        if (DecodeNextUtf8CodePoint(sv->view(), cur, dummy) && cur > 0u) {
+            maskUnit.assign(sv->view().substr(0u, cur));
+        }
+    }
+    const std::size_t cpCount = CountUtf8CodePointsSafe(raw);
+    if (maskUnit.size() == 1u) {
+        return std::string(cpCount, maskUnit[0]);
+    }
+    std::string out;
+    out.reserve(cpCount * maskUnit.size());
+    for (std::size_t i = 0u; i < cpCount; ++i) {
+        out.append(maskUnit);
+    }
+    return out;
 }
 
 float TextBox::HorizontalTextScrollOffset() const noexcept {
@@ -6076,7 +6337,15 @@ void TextBox::OnPropertyChanged(std::uint16_t propId, const UnifiedValue& newVal
     }
 }
 
+void TextBox::OnFocusChanged(bool focused) {
+    TextBlock::OnFocusChanged(focused);
+    if (!focused) {
+        hasAllSelected_ = false;
+    }
+}
+
 bool TextBox::CommitEditedText(std::string newText, std::size_t newCaretCodePoint) {
+    hasAllSelected_ = false;
     const std::string prevText = GetText();
     SetText(newText);
     SetCaretIndex(newCaretCodePoint);
@@ -6084,6 +6353,7 @@ bool TextBox::CommitEditedText(std::string newText, std::size_t newCaretCodePoin
         if (textChangedCallback_) {
             textChangedCallback_(*this, newText);
         }
+        (void)DispatchWrapperRoutedEvent("TextChanged", value::FromString(newText), true);
         (void)NotifyTwoWayPropertyMutated(PropId_Text);
         return true;
     }
@@ -6093,6 +6363,10 @@ bool TextBox::CommitEditedText(std::string newText, std::size_t newCaretCodePoin
 bool TextBox::InsertText(std::string_view utf8Text) {
     if (IsReadOnly() || !IsEffectivelyEnabled() || utf8Text.empty()) {
         return false;
+    }
+    if (hasAllSelected_) {
+        hasAllSelected_ = false;
+        return ReplaceAllTextInteractive(utf8Text);
     }
 
     const std::string cur = GetText();
@@ -6115,6 +6389,11 @@ bool TextBox::InsertText(std::string_view utf8Text) {
         const std::size_t cpStart = cursor;
         if (!DecodeNextUtf8CodePoint(utf8Text, cursor, cp)) {
             break;
+        }
+        if (cp == '\n' && AcceptsReturn() && !IsPassword()) {
+            filtered.push_back('\n');
+            ++insertedCpCount;
+            continue;
         }
         if (cp < 0x20u || cp == 0x7Fu) {
             continue;
@@ -6147,6 +6426,11 @@ bool TextBox::ReplaceAllTextInteractive(std::string_view utf8Text) {
         if (!DecodeNextUtf8CodePoint(utf8Text, cursor, cp)) {
             break;
         }
+        if (cp == '\n' && AcceptsReturn() && !IsPassword()) {
+            filtered.push_back('\n');
+            ++cpCount;
+            continue;
+        }
         if (cp < 0x20u || cp == 0x7Fu) {
             continue;
         }
@@ -6159,6 +6443,10 @@ bool TextBox::ReplaceAllTextInteractive(std::string_view utf8Text) {
 bool TextBox::Backspace() {
     if (IsReadOnly() || !IsEffectivelyEnabled()) {
         return false;
+    }
+    if (hasAllSelected_) {
+        hasAllSelected_ = false;
+        return CommitEditedText("", 0u);
     }
     const std::size_t caretCp = GetCaretIndex();
     if (caretCp == 0u) {
@@ -6175,6 +6463,10 @@ bool TextBox::DeleteForward() {
     if (IsReadOnly() || !IsEffectivelyEnabled()) {
         return false;
     }
+    if (hasAllSelected_) {
+        hasAllSelected_ = false;
+        return CommitEditedText("", 0u);
+    }
     const std::string cur = GetText();
     const std::size_t totalCp = CountUtf8CodePointsSafe(cur);
     const std::size_t caretCp = GetCaretIndex();
@@ -6188,6 +6480,11 @@ bool TextBox::DeleteForward() {
 }
 
 bool TextBox::MoveCaretLeft() {
+    if (hasAllSelected_) {
+        hasAllSelected_ = false;
+        SetCaretIndex(0u);
+        return true;
+    }
     const std::size_t cur = GetCaretIndex();
     if (cur == 0u) {
         return false;
@@ -6197,6 +6494,11 @@ bool TextBox::MoveCaretLeft() {
 }
 
 bool TextBox::MoveCaretRight() {
+    if (hasAllSelected_) {
+        hasAllSelected_ = false;
+        SetCaretIndex(CountUtf8CodePointsSafe(GetText()));
+        return true;
+    }
     const std::size_t cur = GetCaretIndex();
     const std::size_t total = CountUtf8CodePointsSafe(GetText());
     if (cur >= total) {
@@ -6207,6 +6509,11 @@ bool TextBox::MoveCaretRight() {
 }
 
 bool TextBox::MoveCaretHome() {
+    if (hasAllSelected_) {
+        hasAllSelected_ = false;
+        SetCaretIndex(0u);
+        return true;
+    }
     if (GetCaretIndex() == 0u) {
         return false;
     }
@@ -6215,6 +6522,11 @@ bool TextBox::MoveCaretHome() {
 }
 
 bool TextBox::MoveCaretEnd() {
+    if (hasAllSelected_) {
+        hasAllSelected_ = false;
+        SetCaretIndex(CountUtf8CodePointsSafe(GetText()));
+        return true;
+    }
     const std::size_t total = CountUtf8CodePointsSafe(GetText());
     if (GetCaretIndex() == total) {
         return false;
@@ -6289,6 +6601,11 @@ bool TextBox::OnKeyDown(KeyCode key, std::uint8_t modifiers) {
         case KeyCode::End:
             (void)MoveCaretEnd();
             return true;
+        case KeyCode::Enter:
+            if (AcceptsReturn() && !IsPassword()) {
+                return InsertText("\n");
+            }
+            return false;
         default:
             return false;
     }
@@ -8506,7 +8823,38 @@ void ListBox::ScrollItemIntoView(std::int32_t index) noexcept {
     }
 }
 
-bool ListBox::SelectIndexInteractive(std::int32_t index) {
+void ListBox::SetSelectionMode(std::int32_t mode) {
+    SetValue(PropId_SelectionMode, value::FromInt(std::clamp<std::int32_t>(mode, 0, 2)), ValueSourceRank::Local);
+}
+
+std::int32_t ListBox::GetSelectionMode() const noexcept {
+    const UnifiedValue v = GetValue(PropId_SelectionMode);
+    if (const auto* i = std::get_if<std::int64_t>(&v)) {
+        return std::clamp<std::int32_t>(static_cast<std::int32_t>(*i), 0, 2);
+    }
+    if (const auto* sv = std::get_if<StringValue>(&v)) {
+        const UnifiedValue parsed = ParseBuiltinLiteralPropertyValue(PropId_SelectionMode, sv->view());
+        if (const auto* pi = std::get_if<std::int64_t>(&parsed)) {
+            return std::clamp<std::int32_t>(static_cast<std::int32_t>(*pi), 0, 2);
+        }
+    }
+    return 0;
+}
+
+bool ListBox::IsIndexSelected(std::int32_t index) const noexcept {
+    if (index < 0) return false;
+    if (GetSelectedIndex() == index) return true;
+    return std::find(selectedIndices_.begin(), selectedIndices_.end(), index) != selectedIndices_.end();
+}
+
+void ListBox::ClearSelection() {
+    selectedIndices_.clear();
+    selectionAnchorIndex_ = -1;
+    SetSelectedIndex(-1);
+    InvalidateRender();
+}
+
+bool ListBox::SelectIndexWithModifiers(std::int32_t index, std::uint8_t modifiers) {
     const std::size_t count = TotalItemCount();
     if (count == 0u) {
         return false;
@@ -8515,10 +8863,87 @@ bool ListBox::SelectIndexInteractive(std::int32_t index) {
         index,
         0,
         static_cast<std::int32_t>(count - 1u));
+    const std::vector<std::int32_t> prevSelectedIndices = selectedIndices_;
+    const std::int32_t prevPrimary = GetSelectedIndex();
+    auto emitMultiSelectChangedIfNeeded = [&]() {
+        if (selectedIndices_ != prevSelectedIndices && GetSelectedIndex() == prevPrimary) {
+            const std::int32_t curIdx = GetSelectedIndex();
+            lastNotifiedSelectedIndex_ = curIdx;
+            lastNotifiedSelectedItem_ = GetSelectedItem();
+            if (lastNotifiedSelectedItem_.isTraceable()) {
+                rs_rt::pinValueInPools(lastNotifiedSelectedItem_);
+                EnsureRegisteredInValuePoolSet();
+            }
+            if (selectionChangedCallback_) {
+                selectionChangedCallback_(*this, curIdx);
+            }
+            (void)DispatchWrapperRoutedEvent("SelectionChanged", value::FromInt(curIdx), true);
+        }
+    };
+    const std::int32_t mode = GetSelectionMode();
+    if (mode == 1) { // Multiple: click toggles item membership without modifier
+        auto it = std::find(selectedIndices_.begin(), selectedIndices_.end(), clamped);
+        if (it != selectedIndices_.end()) {
+            selectedIndices_.erase(it);
+            const std::int32_t nextPrimary = selectedIndices_.empty() ? -1 : selectedIndices_.front();
+            SetSelectedIndex(nextPrimary);
+        } else {
+            selectedIndices_.push_back(clamped);
+            std::sort(selectedIndices_.begin(), selectedIndices_.end());
+            SetSelectedIndex(clamped);
+        }
+        selectionAnchorIndex_ = clamped;
+        ScrollItemIntoView(clamped);
+        InvalidateRender();
+        emitMultiSelectChangedIfNeeded();
+        return selectedIndices_ != prevSelectedIndices;
+    }
+    if (mode == 2) { // Extended: Shift = range, Ctrl = toggle, plain = single
+        if ((modifiers & KeyMod_Shift) != 0u && selectionAnchorIndex_ >= 0) {
+            const std::int32_t lo = std::min(selectionAnchorIndex_, clamped);
+            const std::int32_t hi = std::max(selectionAnchorIndex_, clamped);
+            if ((modifiers & KeyMod_Ctrl) == 0u) {
+                selectedIndices_.clear();
+            }
+            for (std::int32_t k = lo; k <= hi; ++k) {
+                if (std::find(selectedIndices_.begin(), selectedIndices_.end(), k) == selectedIndices_.end()) {
+                    selectedIndices_.push_back(k);
+                }
+            }
+            std::sort(selectedIndices_.begin(), selectedIndices_.end());
+            SetSelectedIndex(clamped);
+            ScrollItemIntoView(clamped);
+            InvalidateRender();
+            emitMultiSelectChangedIfNeeded();
+            return selectedIndices_ != prevSelectedIndices;
+        }
+        if ((modifiers & KeyMod_Ctrl) != 0u) {
+            auto it = std::find(selectedIndices_.begin(), selectedIndices_.end(), clamped);
+            if (it != selectedIndices_.end()) {
+                selectedIndices_.erase(it);
+                SetSelectedIndex(selectedIndices_.empty() ? -1 : selectedIndices_.front());
+            } else {
+                selectedIndices_.push_back(clamped);
+                std::sort(selectedIndices_.begin(), selectedIndices_.end());
+                SetSelectedIndex(clamped);
+            }
+            selectionAnchorIndex_ = clamped;
+            ScrollItemIntoView(clamped);
+            InvalidateRender();
+            emitMultiSelectChangedIfNeeded();
+            return selectedIndices_ != prevSelectedIndices;
+        }
+    }
+    selectedIndices_.assign(1u, clamped);
+    selectionAnchorIndex_ = clamped;
     const std::int32_t prev = GetSelectedIndex();
     SetSelectedIndex(clamped);
     ScrollItemIntoView(clamped);
     return clamped != prev;
+}
+
+bool ListBox::SelectIndexInteractive(std::int32_t index) {
+    return SelectIndexWithModifiers(index, 0u);
 }
 
 bool ListBox::OnPointerDown(
@@ -8546,11 +8971,14 @@ bool ListBox::OnPointerDown(
         if (cr.width > 0.0f && cr.height > 0.0f &&
             localPoint.x >= cr.x && localPoint.x < cr.x + cr.width &&
             localPoint.y >= cr.y && localPoint.y < cr.y + cr.height) {
+            if (!c->IsEnabled()) {
+                return true;
+            }
             const std::size_t logicalIdx = IsVirtualizing()
                 ? (FirstRealizedItemIndex() + childOffset)
                 : childOffset;
             if (logicalIdx < count) {
-                (void)SelectIndexInteractive(static_cast<std::int32_t>(logicalIdx));
+                (void)SelectIndexWithModifiers(static_cast<std::int32_t>(logicalIdx), modifiers);
                 return true;
             }
         }
@@ -8567,7 +8995,7 @@ bool ListBox::OnPointerDown(
         const float itemH = std::max(1.0f, GetVirtualItemHeight());
         const auto hitIdx = static_cast<std::int32_t>(std::floor(relY / itemH));
         if (hitIdx >= 0 && static_cast<std::size_t>(hitIdx) < count) {
-            (void)SelectIndexInteractive(hitIdx);
+            (void)SelectIndexWithModifiers(hitIdx, modifiers);
             return true;
         }
         return false;
@@ -8581,7 +9009,10 @@ bool ListBox::OnPointerDown(
         }
         const float chH = (c->DesiredSize().height > 0.0f) ? c->DesiredSize().height : GetVirtualItemHeight();
         if (relY >= accumY && relY < accumY + chH) {
-            (void)SelectIndexInteractive(static_cast<std::int32_t>(idx));
+            if (!c->IsEnabled()) {
+                return true;
+            }
+            (void)SelectIndexWithModifiers(static_cast<std::int32_t>(idx), modifiers);
             return true;
         }
         accumY += chH;
@@ -8646,6 +9077,7 @@ void ListBox::OnPropertyChanged(std::uint16_t propId, const UnifiedValue& newVal
             if (selectionChangedCallback_) {
                 selectionChangedCallback_(*this, curIdx);
             }
+            (void)DispatchWrapperRoutedEvent("SelectionChanged", value::FromInt(curIdx), true);
         }
     }
 }
@@ -8796,7 +9228,8 @@ std::int32_t ComboBox::GetSelectedIndex() const noexcept {
 
 UnifiedValue ComboBox::GetSelectedItem() const {
     const UnifiedValue explicitItem = GetValue(PropId_SelectedItem);
-    if (!std::holds_alternative<std::monostate>(explicitItem)) {
+    if (!std::holds_alternative<std::monostate>(explicitItem) &&
+        !std::holds_alternative<NullObject>(explicitItem)) {
         return explicitItem;
     }
     const std::int32_t idx = GetSelectedIndex();
@@ -8812,7 +9245,8 @@ std::string ComboBox::GetSelectedItemText() const {
         return GetComboItemText(static_cast<std::size_t>(idx));
     }
     const UnifiedValue itemVal = GetValue(PropId_SelectedItem);
-    if (!std::holds_alternative<std::monostate>(itemVal)) {
+    if (!std::holds_alternative<std::monostate>(itemVal) &&
+        !std::holds_alternative<NullObject>(itemVal)) {
         return FormatItemDisplayText(itemVal);
     }
     return {};
@@ -8830,6 +9264,70 @@ bool ComboBox::IsDropDownOpen() const noexcept {
     return false;
 }
 
+void ComboBox::SetIsEditable(bool editable) {
+    SetValue(PropId_IsEditable, UnifiedValue{editable}, ValueSourceRank::Local);
+}
+
+bool ComboBox::IsEditable() const noexcept {
+    const UnifiedValue v = GetValue(PropId_IsEditable);
+    if (const auto* b = std::get_if<bool>(&v)) {
+        return *b;
+    }
+    return false;
+}
+
+float ComboBox::GetMaxDropDownHeight() const noexcept {
+    float h = 0.0f;
+    if (TryGetFloat(GetValue(PropId_MaxDropDownHeight), h) && std::isfinite(h) && h > 0.0f) {
+        return h;
+    }
+    return 0.0f;
+}
+
+std::string ComboBox::GetDisplayText() const {
+    if (IsEditable()) {
+        const UnifiedValue tv = GetValue(PropId_Text);
+        if (const auto* sv = std::get_if<StringValue>(&tv); sv && !sv->view().empty()) {
+            return sv->str();
+        }
+    }
+    const std::string sel = GetSelectedItemText();
+    if (!sel.empty()) {
+        return sel;
+    }
+    const UnifiedValue tv = GetValue(PropId_Text);
+    if (const auto* sv = std::get_if<StringValue>(&tv); sv && !sv->view().empty()) {
+        return sv->str();
+    }
+    return {};
+}
+
+bool ComboBox::OnTextInput(std::string_view utf8Text) {
+    if (!IsEditable() || !IsEffectivelyEnabled() || utf8Text.empty()) {
+        return false;
+    }
+    std::string cur = GetDisplayText();
+    for (char ch : utf8Text) {
+        if (static_cast<unsigned char>(ch) >= 0x20u && ch != 0x7F) {
+            cur.push_back(ch);
+        }
+    }
+    syncingSelection_ = true;
+    SetValue(PropId_Text, value::FromString(cur), ValueSourceRank::Local);
+    const std::size_t count = ComboItemCount();
+    for (std::size_t i = 0u; i < count; ++i) {
+        if (GetComboItemText(i) == cur) {
+            SetSelectedIndex(static_cast<std::int32_t>(i));
+            SetValue(PropId_SelectedItem, GetComboItemValue(i), ValueSourceRank::Local);
+            break;
+        }
+    }
+    syncingSelection_ = false;
+    (void)NotifyTwoWayPropertyMutated(PropId_Text);
+    InvalidateRender();
+    return true;
+}
+
 void ComboBox::SyncSelectedItemFromIndex() {
     if (syncingSelection_) {
         return;
@@ -8839,6 +9337,7 @@ void ComboBox::SyncSelectedItemFromIndex() {
     if (idx >= 0 && static_cast<std::size_t>(idx) < count) {
         syncingSelection_ = true;
         SetValue(PropId_SelectedItem, GetComboItemValue(static_cast<std::size_t>(idx)), ValueSourceRank::Local);
+        SetValue(PropId_Text, value::FromString(GetComboItemText(static_cast<std::size_t>(idx))), ValueSourceRank::Local);
         syncingSelection_ = false;
     }
 }
@@ -8863,8 +9362,10 @@ bool ComboBox::SelectIndexInteractive(std::int32_t index) {
         if (selectionChangedCallback_) {
             selectionChangedCallback_(*this, clamped);
         }
+        (void)DispatchWrapperRoutedEvent("SelectionChanged", value::FromInt(clamped), true);
         (void)NotifyTwoWayPropertyMutated(PropId_SelectedIndex);
         (void)NotifyTwoWayPropertyMutated(PropId_SelectedItem);
+        (void)NotifyTwoWayPropertyMutated(PropId_Text);
         return true;
     }
     return false;
@@ -8881,11 +9382,16 @@ Rect ComboBox::DropDownPopupLocalRect() const noexcept {
     const Rect r = FinalRect();
     const float w = (r.width > 0.0f) ? r.width : std::max(100.0f, GetWidth());
     const float h = (r.height > 0.0f) ? r.height : std::max(28.0f, GetHeight());
+    float popupH = static_cast<float>(count) * kPopupRowHeight;
+    const float maxDropH = GetMaxDropDownHeight();
+    if (maxDropH > 0.0f) {
+        popupH = std::min(popupH, maxDropH);
+    }
     return Rect{
         r.x,
         r.y + h + 2.0f,
         w,
-        static_cast<float>(count) * kPopupRowHeight};
+        popupH};
 }
 
 Rect ComboBox::DropDownPopupScreenRect() const noexcept {
@@ -8981,6 +9487,42 @@ bool ComboBox::OnKeyDown(KeyCode key, std::uint8_t modifiers) {
             highlightedPopupIndex_ = GetSelectedIndex();
         }
         return true;
+    }
+    if (IsEditable() && key == KeyCode::Backspace) {
+        std::string cur = GetDisplayText();
+        const std::size_t cpCount = CountUtf8CodePointsSafe(cur);
+        if (cpCount > 0u) {
+            cur.resize(Utf8ByteOffsetAtCodePoint(cur, cpCount - 1u));
+            const std::int32_t prevIdx = GetSelectedIndex();
+            std::int32_t matchedIdx = -1;
+            const std::size_t comboCount = ComboItemCount();
+            for (std::size_t i = 0u; i < comboCount; ++i) {
+                if (GetComboItemText(i) == cur) {
+                    matchedIdx = static_cast<std::int32_t>(i);
+                    break;
+                }
+            }
+            syncingSelection_ = true;
+            SetValue(PropId_Text, value::FromString(cur), ValueSourceRank::Local);
+            SetSelectedIndex(matchedIdx);
+            if (matchedIdx >= 0) {
+                SetValue(PropId_SelectedItem, GetComboItemValue(static_cast<std::size_t>(matchedIdx)), ValueSourceRank::Local);
+            } else {
+                ClearValue(PropId_SelectedItem, ValueSourceRank::Local);
+            }
+            syncingSelection_ = false;
+            if (matchedIdx != prevIdx) {
+                if (selectionChangedCallback_) {
+                    selectionChangedCallback_(*this, matchedIdx);
+                }
+                (void)DispatchWrapperRoutedEvent("SelectionChanged", value::FromInt(matchedIdx), true);
+                (void)NotifyTwoWayPropertyMutated(PropId_SelectedIndex);
+                (void)NotifyTwoWayPropertyMutated(PropId_SelectedItem);
+            }
+            (void)NotifyTwoWayPropertyMutated(PropId_Text);
+            InvalidateRender();
+            return true;
+        }
     }
     if (key == KeyCode::Escape && IsDropDownOpen()) {
         SetIsDropDownOpen(false);
@@ -10728,15 +11270,144 @@ bool UserControl::MountTemplate(
             ? UiResourceContext::FindForDomains(domains)
             : nullptr;
     ScopedUiResourceContext domainScope(domainCtx);
+
+    const Interpreter* effInterp = eventInterpreter
+        ? eventInterpreter
+        : (bindingEngine ? bindingEngine->UiInterpreter() : nullptr);
+    const ProgramImage* prog = bindingEngine ? bindingEngine->Program() : nullptr;
+
+    AxbPackage boundPkg;
+    const AxbPackage* effPkg = &package;
+    ObjectRef ucCodeBehind{};
+    rs_rt::PersistentRoot ucCtorPin{};
+    const rs_sem::TypeSymbol* ucClsSym = nullptr;
+
+    if (!package.className.empty() && domains && prog) {
+        std::string modPrefix;
+        std::string shortCls = package.className;
+        if (const auto sep = shortCls.find("::"); sep != std::string::npos) {
+            modPrefix = shortCls.substr(0u, sep);
+            shortCls = shortCls.substr(sep + 2u);
+        } else if (const auto dot = shortCls.rfind('.'); dot != std::string::npos) {
+            modPrefix = shortCls.substr(0u, dot);
+            shortCls = shortCls.substr(dot + 1u);
+        }
+        for (const auto& mod : prog->modules()) {
+            if (!modPrefix.empty() && mod.name != modPrefix) continue;
+            for (const auto& ts : mod.types) {
+                if (ts.name == shortCls) {
+                    ucClsSym = &ts;
+                    break;
+                }
+            }
+            if (ucClsSym) break;
+        }
+        bool dcIsAlreadyUcType = false;
+        if (ucClsSym && dataContext.valid()) {
+            if (auto* dh = domains->heapForObject(dataContext); dh && dh->isAlive(dataContext)) {
+                dcIsAlreadyUcType = (dh->objectTypeId(dataContext).value_or(0) == ucClsSym->id);
+            }
+        }
+        if (ucClsSym && !BoundScriptWrapper().valid() && !dcIsAlreadyUcType) {
+            RuntimeError allocErr{};
+            const NativeHandle rootNh = ToNativeHandle(domains->nativeHandles());
+            std::vector<UnifiedValue> initFields(ucClsSym->fields.size(), UnifiedValue(NullObject{}));
+            std::vector<std::size_t> refFields;
+            for (std::size_t fi = 0u; fi < ucClsSym->fields.size(); ++fi) {
+                const auto fType = ucClsSym->fields[fi].type;
+                if (fType == rs_sem::PrimitiveType::Int || fType == rs_sem::PrimitiveType::Enum) {
+                    initFields[fi] = UnifiedValue(std::int64_t{0});
+                } else if (fType == rs_sem::PrimitiveType::Float) {
+                    initFields[fi] = UnifiedValue(0.0);
+                } else if (fType == rs_sem::PrimitiveType::Bool) {
+                    initFields[fi] = UnifiedValue(false);
+                } else if (fType == rs_sem::PrimitiveType::Handle) {
+                    initFields[fi] = UnifiedValue(NativeHandle{});
+                }
+                if (ucClsSym->fields[fi].name == "__nativeRootHandle") {
+                    initFields[fi] = UnifiedValue(rootNh);
+                } else if (ucClsSym->fields[fi].name == "__aero_premounted" ||
+                           ucClsSym->fields[fi].name == "__aero_component_loaded") {
+                    initFields[fi] = UnifiedValue(true);
+                }
+                if (fType == rs_sem::PrimitiveType::Object ||
+                    fType == rs_sem::PrimitiveType::String ||
+                    fType == rs_sem::PrimitiveType::Array) {
+                    refFields.push_back(fi);
+                }
+            }
+            if (auto objOpt = domains->uiHeap().allocateObject(ucClsSym->id, std::move(initFields), std::move(refFields), &allocErr)) {
+                ucCodeBehind = *objOpt;
+                ucCtorPin = domains->uiHeap().retain(ucCodeBehind);
+                (void)BindScriptWrapper(domains->nativeHandles(), domains->uiHeap(), ucCodeBehind);
+                SetHasRegisteredScriptWrapper(true);
+            }
+        }
+        boundPkg = package;
+        std::string actualVmType;
+        if (dataContext.valid()) {
+            if (auto* vh = domains->heapForObject(dataContext); vh && vh->isAlive(dataContext)) {
+                const SymbolId vmTid = vh->objectTypeId(dataContext).value_or(0);
+                if (const auto* vmTs = (vmTid != 0) ? prog->resolveType(vmTid) : nullptr) {
+                    actualVmType = vmTs->moduleName.empty() ? vmTs->name : (vmTs->moduleName + "::" + vmTs->name);
+                }
+            }
+        }
+        (void)boundPkg.BindAgainstProgram(*prog, actualVmType, domains);
+        boundPkg.PinValuesInPools();
+        effPkg = &boundPkg;
+    }
+
     templateMounted_ = MountAxbTemplate(
         this,
-        package,
+        *effPkg,
         domains,
         bindingEngine,
         dataContext,
-        eventInterpreter,
+        effInterp,
         eventAotContext,
         animationEngine);
+
+    if (templateMounted_ && ucCodeBehind.valid() && ucClsSym && (effInterp || eventAotContext)) {
+        rs_sem::SymbolId ctorId = 0;
+        for (const auto& c : ucClsSym->constructors) {
+            const bool isZeroArgInstance =
+                !c.staticMethod &&
+                (c.parameters.empty() || (c.parameters.size() == 1u && c.parameters[0].name == "this"));
+            if (isZeroArgInstance && c.id != 0) {
+                ctorId = c.id;
+                break;
+            }
+        }
+        if (ctorId == 0) {
+            for (const auto& m : ucClsSym->methods) {
+                if ((m.name == ".ctor" || m.name == ucClsSym->name) && !m.staticMethod &&
+                    (m.parameters.empty() || (m.parameters.size() == 1u && m.parameters[0].name == "this")) && m.id != 0) {
+                    ctorId = m.id;
+                    break;
+                }
+            }
+        }
+        if (ctorId != 0) {
+            bool invoked = false;
+            if (eventAotContext != nullptr) {
+                UnifiedValue ctorArg(ucCodeBehind);
+                UnifiedValue ctorOut{};
+                invoked = eventAotContext->invoke(ctorId, &ctorArg, 1u, ctorOut);
+            }
+            if (!invoked && effInterp != nullptr) {
+                rs_rt::ExecutionOptions execOpts{};
+                execOpts.limits.instructionBudget = 5'000'000;
+                (void)effInterp->invoke(ctorId, {ucCodeBehind}, execOpts);
+            }
+        }
+        if (bindingEngine) {
+            (void)bindingEngine->FlushTrackA();
+        }
+        (void)DispatchWrapperRoutedEvent("Loaded");
+        DispatchLoadedToRegisteredDescendants(this, true);
+    }
+
     return templateMounted_;
 }
 
@@ -11610,8 +12281,11 @@ void TreeView::SelectContainer(TreeViewItem* item) {
     if (be) {
         (void)be->FlushTrackA();
     }
-    if (selectedItemChangedCallback_ && prevSelected != selectedContainer_) {
-        selectedItemChangedCallback_(*this, selectedContainer_);
+    if (prevSelected != selectedContainer_) {
+        if (selectedItemChangedCallback_) {
+            selectedItemChangedCallback_(*this, selectedContainer_);
+        }
+        (void)DispatchWrapperRoutedEvent("SelectedItemChanged", value::FromString(GetSelectedHeader()), true);
     }
 }
 
@@ -12098,6 +12772,30 @@ bool MountAxbInstructionsInternal(
                                     tv->SelectContainer(tvi);
                                 }
                             }
+                        } else if (auto* lb = endedElem->DynamicCast<ListBox>()) {
+                            if (lb->GetSelectedIndex() < 0) {
+                                std::int32_t cIdx = 0;
+                                for (UIElement* ch = lb->FirstChild(); ch != nullptr; ch = ch->NextSibling(), ++cIdx) {
+                                    const UnifiedValue selV = ch->GetValue(PropId_IsChecked);
+                                    if (const auto* b = std::get_if<bool>(&selV); b && *b) {
+                                        lb->SetSelectedIndex(cIdx);
+                                        break;
+                                    }
+                                }
+                            }
+                        } else if (auto* cb = endedElem->DynamicCast<ComboBox>()) {
+                            if (cb->GetSelectedIndex() >= 0) {
+                                cb->OnPropertyChanged(PropId_SelectedIndex, value::FromInt(cb->GetSelectedIndex()));
+                            } else {
+                                std::int32_t cIdx = 0;
+                                for (UIElement* ch = cb->FirstChild(); ch != nullptr; ch = ch->NextSibling(), ++cIdx) {
+                                    const UnifiedValue selV = ch->GetValue(PropId_IsChecked);
+                                    if (const auto* b = std::get_if<bool>(&selV); b && *b) {
+                                        cb->SetSelectedIndex(cIdx);
+                                        break;
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -12236,15 +12934,14 @@ bool MountAxbInstructionsInternal(
                             : nullptr;
 
                     auto findRootWrapper = [&](const UIElement* startEl) -> ObjectRef {
-                        ObjectRef found{};
                         for (const UIElement* cur = startEl;
                              cur != nullptr;
                              cur = cur->Parent() ? cur->Parent() : cur->TemplatedParent()) {
                             if (cur->BoundScriptWrapper().valid()) {
-                                found = cur->BoundScriptWrapper();
+                                return cur->BoundScriptWrapper();
                             }
                         }
-                        return found;
+                        return ObjectRef{};
                     };
 
                     const ObjectRef rootWrapObj = findRootWrapper(rootControl);
@@ -12386,7 +13083,7 @@ bool MountAxbInstructionsInternal(
                                                 dcTarget = *r;
                                             }
                                         }
-                                        if (cur->BoundScriptWrapper().valid()) {
+                                        if (!wrapTarget.valid() && cur->BoundScriptWrapper().valid()) {
                                             wrapTarget = cur->BoundScriptWrapper();
                                         }
                                     }
@@ -12481,6 +13178,49 @@ bool MountAxbInstructionsInternal(
                                         (void)bindingEngine->FlushTrackA();
                                     }
                                 });
+
+                            if (evRec->eventName == "Command") {
+                                if (auto* btnPtr = elem->DynamicCast<Button>()) {
+                                    auto evalCanExec = [domains, bindingEngine, eventInterpreter, eventAotContext, handlerCopy, btnPtr]() {
+                                        if (!btnPtr || !DualTrackBindingEngine::IsLiveInstance(bindingEngine)) return;
+                                        const ProgramImage* prog = bindingEngine->Program();
+                                        if (!prog) return;
+                                        ObjectRef wrapT{};
+                                        ObjectRef dcT{};
+                                        for (const UIElement* cur = btnPtr;
+                                             cur != nullptr;
+                                             cur = cur->Parent() ? cur->Parent() : cur->TemplatedParent()) {
+                                            if (!dcT.valid()) {
+                                                const UnifiedValue dcV = cur->GetValue(PropId_DataContext);
+                                                if (const auto* r = std::get_if<ObjectRef>(&dcV); r && r->valid()) dcT = *r;
+                                            }
+                                            if (!wrapT.valid() && cur->BoundScriptWrapper().valid()) {
+                                                wrapT = cur->BoundScriptWrapper();
+                                            }
+                                        }
+                                        std::string leaf = handlerCopy;
+                                        if (const auto dot = leaf.rfind('.'); dot != std::string::npos) {
+                                            leaf = leaf.substr(dot + 1u);
+                                        }
+                                        const UnifiedValue rawCp = btnPtr->GetValue(PropId_CommandParameter);
+                                        const bool hasCp = !std::holds_alternative<std::monostate>(rawCp);
+                                        bool canExec = true;
+                                        if (TryEvaluateCommandCanExecuteOnOwner(
+                                                domains, prog, eventInterpreter, eventAotContext,
+                                                dcT, leaf, rawCp, hasCp, canExec) ||
+                                            (handlerCopy.find('.') == std::string::npos && wrapT.valid() && wrapT != dcT &&
+                                             TryEvaluateCommandCanExecuteOnOwner(
+                                                 domains, prog, eventInterpreter, eventAotContext,
+                                                 wrapT, leaf, rawCp, hasCp, canExec))) {
+                                            if (btnPtr->IsEnabled() != canExec) {
+                                                btnPtr->SetIsEnabled(canExec);
+                                            }
+                                        }
+                                    };
+                                    evalCanExec();
+                                    bindingEngine->RegisterCommandCanExecuteWatcher(btnPtr, std::move(evalCanExec));
+                                }
+                            }
                         }
                     }
                     if (targetObj.valid() && methodId != 0) {
@@ -12751,10 +13491,40 @@ bool MountAxbInstructionsInternal(
                                 const std::int64_t packed = static_cast<std::int64_t>(static_cast<std::uint32_t>(k) | (static_cast<std::uint32_t>(mods) << 16u));
                                 return invokeBoundHandler(value::FromInt(packed), true);
                             });
+                        } else if (evNameCopy == "MouseEnter") {
+                            elem->SetMouseEnterCallback([invokeBoundHandler](UIElement&) -> bool {
+                                return invokeBoundHandler(UnifiedValue{}, false);
+                            });
+                        } else if (evNameCopy == "MouseLeave") {
+                            elem->SetMouseLeaveCallback([invokeBoundHandler](UIElement&) -> bool {
+                                return invokeBoundHandler(UnifiedValue{}, false);
+                            });
+                        } else if (evNameCopy == "MouseDown" || evNameCopy == "MouseLeftButtonDown") {
+                            elem->SetMouseDownCallback([invokeBoundHandler](UIElement&) -> bool {
+                                return invokeBoundHandler(UnifiedValue{}, false);
+                            });
+                        } else if (evNameCopy == "MouseUp" || evNameCopy == "MouseLeftButtonUp") {
+                            elem->SetMouseUpCallback([invokeBoundHandler](UIElement&) -> bool {
+                                return invokeBoundHandler(UnifiedValue{}, false);
+                            });
+                        } else if (evNameCopy == "GotFocus") {
+                            elem->SetGotFocusCallback([invokeBoundHandler](UIElement&) -> bool {
+                                return invokeBoundHandler(UnifiedValue{}, false);
+                            });
+                        } else if (evNameCopy == "LostFocus") {
+                            elem->SetLostFocusCallback([invokeBoundHandler](UIElement&) -> bool {
+                                return invokeBoundHandler(UnifiedValue{}, false);
+                            });
                         } else if (auto* slider = elem->DynamicCast<Slider>()) {
                             slider->SetValueChangedCallback(
                                 [invokeBoundHandler](Slider&, float val) {
                                     invokeBoundHandler(MakeFloat(val), true);
+                                });
+                        } else if (auto* pwd = elem->DynamicCast<PasswordBox>();
+                                   pwd && evNameCopy == "PasswordChanged") {
+                            pwd->SetPasswordChangedCallback(
+                                [invokeBoundHandler](PasswordBox&, const std::string& secret) {
+                                    invokeBoundHandler(value::FromString(secret), true);
                                 });
                         } else if (auto* tb = elem->DynamicCast<TextBox>()) {
                             tb->SetTextChangedCallback(
@@ -12777,9 +13547,14 @@ bool MountAxbInstructionsInternal(
                                     invokeBoundHandler(value::FromInt(idx), true);
                                 });
                         } else if (auto* expCtrl = elem->DynamicCast<Expander>()) {
+                            const std::string wantExpEv = evNameCopy;
                             expCtrl->SetExpandedChangedCallback(
-                                [invokeBoundHandler](Expander&, bool expanded) {
-                                    invokeBoundHandler(value::FromBool(expanded), true);
+                                [invokeBoundHandler, wantExpEv](Expander&, bool expanded) {
+                                    if ((wantExpEv == "Expanded" && expanded) ||
+                                        (wantExpEv == "Collapsed" && !expanded) ||
+                                        (wantExpEv != "Expanded" && wantExpEv != "Collapsed")) {
+                                        invokeBoundHandler(value::FromBool(expanded), true);
+                                    }
                                 });
                         } else if (auto* treeCtrl = elem->DynamicCast<TreeView>()) {
                             treeCtrl->SetSelectedItemChangedCallback(

@@ -202,4 +202,15 @@ private:
     const UnifiedValue& rawParam,
     bool hasParam);
 
+[[nodiscard]] bool TryEvaluateCommandCanExecuteOnOwner(
+    ExecutionDomainContext* domains,
+    const ProgramImage* prog,
+    const Interpreter* interp,
+    rs_aot::ExecutionContext* aotCtx,
+    ObjectRef ownerObj,
+    std::string_view propName,
+    const UnifiedValue& rawParam,
+    bool hasParam,
+    bool& outCanExecute);
+
 } // namespace aero

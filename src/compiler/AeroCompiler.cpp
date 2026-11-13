@@ -1,3 +1,4 @@
+#include <thread>
 #include "aero/compiler/AeroCompiler.hpp"
 
 #include <algorithm>
@@ -9,6 +10,7 @@
 #include <fstream>
 #include <iterator>
 #include <limits>
+#include <sstream>
 #include <string>
 #include <system_error>
 #include <unordered_set>
@@ -2651,6 +2653,52 @@ AeroCompileResult AeroCompiler::CompileInternal(
         }
     };
 
+    struct DeferredMtsdfJob {
+        std::string svg;
+        std::uint16_t adaptiveDim = 32u;
+        std::uint16_t slotIdx = 0u;
+    };
+    std::vector<DeferredMtsdfJob> deferredMtsdfJobs;
+    auto flushDeferredMtsdfJobs = [&]() {
+        if (deferredMtsdfJobs.empty()) {
+            return;
+        }
+        const std::size_t baseIdx = pkg.mtsdfPaths.size();
+        const std::size_t jobCount = deferredMtsdfJobs.size();
+        pkg.mtsdfPaths.resize(baseIdx + jobCount);
+        if (jobCount >= 4u) {
+            const unsigned int hw = std::max(1u, std::min(8u, std::thread::hardware_concurrency()));
+            const std::size_t workerCount = std::min<std::size_t>(hw, jobCount);
+            std::atomic<std::size_t> nextJob{0u};
+            std::vector<std::thread> workers;
+            workers.reserve(workerCount);
+            for (std::size_t w = 0u; w < workerCount; ++w) {
+                workers.emplace_back([&]() {
+                    while (true) {
+                        const std::size_t idx = nextJob.fetch_add(1u, std::memory_order_relaxed);
+                        if (idx >= jobCount) break;
+                        const auto& jb = deferredMtsdfJobs[idx];
+                        if (baseIdx + idx < pkg.mtsdfPaths.size()) {
+                            pkg.mtsdfPaths[baseIdx + idx] =
+                                BakeSvgPathToMtsdfEntry(jb.svg, jb.adaptiveDim, 4.0f, jb.slotIdx, 256u);
+                        }
+                    }
+                });
+            }
+            for (auto& th : workers) {
+                th.join();
+            }
+        } else {
+            for (std::size_t idx = 0u; idx < jobCount; ++idx) {
+                const auto& jb = deferredMtsdfJobs[idx];
+                if (baseIdx + idx < pkg.mtsdfPaths.size()) {
+                    pkg.mtsdfPaths[baseIdx + idx] =
+                        BakeSvgPathToMtsdfEntry(jb.svg, jb.adaptiveDim, 4.0f, jb.slotIdx, 256u);
+                }
+            }
+        }
+        deferredMtsdfJobs.clear();
+    };
     auto ensurePathBakedIntoPackage = [&](std::string_view svgPathData) {
         svgPathData = Trim(svgPathData);
         if (svgPathData.empty()) {
@@ -2661,8 +2709,8 @@ AeroCompileResult AeroCompiler::CompileInternal(
             return;
         }
         const std::uint16_t adaptiveDim = SelectAdaptiveMtsdfCellSize(svgPathData);
-        const auto slotIdx = static_cast<std::uint16_t>(pkg.mtsdfPaths.size());
-        pkg.mtsdfPaths.push_back(BakeSvgPathToMtsdfEntry(svgPathData, adaptiveDim, 4.0f, slotIdx, 256u));
+        const auto slotIdx = static_cast<std::uint16_t>(pkg.mtsdfPaths.size() + deferredMtsdfJobs.size());
+        deferredMtsdfJobs.push_back(DeferredMtsdfJob{std::string(svgPathData), adaptiveDim, slotIdx});
     };
 
     auto emitStaticRenderTransform = [&](const Matrix2D& m) {
@@ -2997,6 +3045,26 @@ AeroCompileResult AeroCompiler::CompileInternal(
         }
         const std::string_view trimmed = Trim(rawVal);
         if (trimmed.size() > 2u && trimmed.front() == '{' && trimmed.back() == '}') {
+            const std::string_view innerMarkup = Trim(trimmed.substr(1u, trimmed.size() - 2u));
+            if (innerMarkup == "x:Null" || innerMarkup.rfind("x:Null ", 0) == 0) {
+                outValid = true;
+                return NullObject{};
+            }
+            if (innerMarkup.rfind("x:Static ", 0) == 0 || innerMarkup.rfind("x:Static	", 0) == 0) {
+                std::string_view arg = Trim(innerMarkup.substr(8u));
+                if (arg.rfind("Member=", 0) == 0) {
+                    arg = Trim(arg.substr(7u));
+                }
+                if (arg.size() >= 2u && ((arg.front() == '\'' && arg.back() == '\'') || (arg.front() == '"' && arg.back() == '"'))) {
+                    arg = arg.substr(1u, arg.size() - 2u);
+                }
+                const auto dotPos = arg.rfind('.');
+                const std::string_view memberName = (dotPos != std::string_view::npos) ? arg.substr(dotPos + 1u) : arg;
+                if (!memberName.empty()) {
+                    outValid = true;
+                    return ParseLiteralPropertyValue(propId, memberName);
+                }
+            }
             const std::string_view resKey = ExtractMarkupResourceKey(trimmed);
             if (!resKey.empty()) {
                 if (propId == PropId_Template || propId == PropId_ItemTemplate ||
@@ -3231,6 +3299,7 @@ AeroCompileResult AeroCompiler::CompileInternal(
                shortTag == "HierarchicalDataTemplate" ||
                shortTag == "ItemsPanelTemplate" ||
                shortTag == "Storyboard" ||
+               shortTag == "StaticResource" ||
                shortTag == "BeginStoryboard" ||
                shortTag == "VisualStateGroup" ||
                shortTag == "VisualState" ||
@@ -4192,6 +4261,7 @@ AeroCompileResult AeroCompiler::CompileInternal(
                             ctKey = "__implicit_ct_" + outerScopeName + "_" +
                                     (ctTargetType.empty() ? std::to_string(nextInlineControlTplId++) : ctTargetType);
                         }
+                        flushDeferredMtsdfJobs();
                         AxbTemplateRegistry::Instance().RegisterResources(pkg);
                         AeroCompileInput subIn{};
                         subIn.xamlPath = ctKey;
@@ -4432,6 +4502,7 @@ AeroCompileResult AeroCompiler::CompileInternal(
                         const std::string cmKey = !xKey.empty()
                             ? std::string(xKey)
                             : ("__ctx_menu_" + outerScopeName + "_" + std::to_string(nextInlineControlTplId++));
+                        flushDeferredMtsdfJobs();
                         AxbTemplateRegistry::Instance().RegisterResources(pkg);
                         AeroCompileInput subIn{};
                         subIn.xamlPath = cmKey;
@@ -4520,6 +4591,7 @@ AeroCompileResult AeroCompiler::CompileInternal(
                             dtKey = "__implicit_dt_" + outerScopeName + "_" +
                                     (dtDataType.empty() ? std::to_string(nextInlineDataTplId++) : dtDataType);
                         }
+                        flushDeferredMtsdfJobs();
                         AxbTemplateRegistry::Instance().RegisterResources(pkg);
                         AeroCompileInput subIn{};
                         subIn.xamlPath = dtKey;
@@ -4644,8 +4716,18 @@ AeroCompileResult AeroCompiler::CompileInternal(
                         }
                     }
                     const std::uint16_t condPropId = ResolveMappedTriggerConditionId(propAttr);
+                    const std::string_view trimTrigVal = Trim(valAttr);
+                    const bool isNullTrigVal =
+                        trimTrigVal.size() > 2u && trimTrigVal.front() == '{' && trimTrigVal.back() == '}' &&
+                        Trim(trimTrigVal.substr(1u, trimTrigVal.size() - 2u)).rfind("x:Null", 0) == 0;
                     if (condPropId == kUnmappedPropId || !hasValAttr) {
                         unsupportedCond = true;
+                    } else if (isNullTrigVal) {
+                        AxbTriggerCondition c{};
+                        c.propId = condPropId;
+                        c.expectNull = true;
+                        c.expectedValue = UnifiedValue{NullObject{}};
+                        trig.conditions.push_back(std::move(c));
                     } else {
                         bool ok = false;
                         UnifiedValue expVal = parseStyleOrAnimationValue(condPropId, valAttr, ok);
@@ -4726,8 +4808,18 @@ AeroCompileResult AeroCompiler::CompileInternal(
                         }
                     } else {
                         const std::uint16_t condPropId = ResolveMappedTriggerConditionId(propAttr);
+                        const std::string_view trimCondVal = Trim(valAttr);
+                        const bool isNullCondVal =
+                            trimCondVal.size() > 2u && trimCondVal.front() == '{' && trimCondVal.back() == '}' &&
+                            Trim(trimCondVal.substr(1u, trimCondVal.size() - 2u)).rfind("x:Null", 0) == 0;
                         if (condPropId == kUnmappedPropId || !hasValAttr) {
                             triggerStack.back().hasUnsupportedCondition = true;
+                        } else if (isNullCondVal) {
+                            AxbTriggerCondition c{};
+                            c.propId = condPropId;
+                            c.expectNull = true;
+                            c.expectedValue = UnifiedValue{NullObject{}};
+                            triggerStack.back().trig.conditions.push_back(std::move(c));
                         } else {
                             bool ok = false;
                             UnifiedValue expVal = parseStyleOrAnimationValue(condPropId, valAttr, ok);
@@ -5274,6 +5366,23 @@ AeroCompileResult AeroCompiler::CompileInternal(
                 continue;
             }
 
+            if (shortTag == "StaticResource" && !storyboardStack.empty()) {
+                for (const auto& a : attrs) {
+                    if (a.name == "ResourceKey") {
+                        const std::string_view refKey = Trim(a.value);
+                        if (const AxbStoryboard* refSb = findLocalOrGlobalStoryboard(refKey)) {
+                            for (const auto& refTl : refSb->timelines) {
+                                storyboardStack.back().sb.timelines.push_back(refTl);
+                            }
+                        }
+                    }
+                }
+                if (!selfClosing) {
+                    (void)pushNonVisualScope();
+                }
+                continue;
+            }
+
             if (IsAnimationTimelineTag(shortTag) && !storyboardStack.empty()) {
                 AxbAnimationTimeline tl{};
                 tl.targetName = storyboardStack.back().defaultTargetName;
@@ -5311,6 +5420,12 @@ AeroCompileResult AeroCompiler::CompileInternal(
                         tl.fillBehavior = EqualsIgnoreCase(Trim(a.value), "Stop")
                             ? FillBehavior::Stop
                             : FillBehavior::HoldEnd;
+                    } else if (a.name == "SpeedRatio") {
+                        tl.speedRatio = std::max(0.01f, ParseFloat32(a.value, 1.0f));
+                    } else if (a.name == "AccelerationRatio") {
+                        tl.accelerationRatio = std::clamp(ParseFloat32(a.value, 0.0f), 0.0f, 1.0f);
+                    } else if (a.name == "DecelerationRatio") {
+                        tl.decelerationRatio = std::clamp(ParseFloat32(a.value, 0.0f), 0.0f, 1.0f);
                     }
                 }
 
@@ -5362,6 +5477,22 @@ AeroCompileResult AeroCompiler::CompileInternal(
                 for (const auto& a : attrs) {
                     if (a.name == "KeyTime") {
                         kf.timeSeconds = ParseXamlTimeSpanSeconds(a.value, 0.0f);
+                    } else if (a.name == "KeySpline") {
+                        // Parse "x1,y1 x2,y2" or "x1,y1,x2,y2"
+                        std::string normSpline(a.value);
+                        for (char& ch : normSpline) {
+                            if (ch == ',' || ch == ';') ch = ' ';
+                        }
+                        std::istringstream iss(normSpline);
+                        float sx1 = 0.0f, sy1 = 0.0f, sx2 = 1.0f, sy2 = 1.0f;
+                        if (iss >> sx1 >> sy1 >> sx2 >> sy2) {
+                            kf.hasKeySpline = true;
+                            kf.easingKind = EasingFunctionKind::Spline;
+                            kf.splineX1 = std::clamp(sx1, 0.0f, 1.0f);
+                            kf.splineY1 = sy1;
+                            kf.splineX2 = std::clamp(sx2, 0.0f, 1.0f);
+                            kf.splineY2 = sy2;
+                        }
                     } else if (a.name == "Value" && targetPropId != kUnmappedPropId) {
                         const std::string_view trimVal = Trim(a.value);
                         const ParsedBindingClause bm = ParseBindingMarkupExpression(trimVal);
@@ -5491,7 +5622,15 @@ AeroCompileResult AeroCompiler::CompileInternal(
                         setter.binding = std::move(sb);
                         hasValidVal = true;
                     } else {
-                        setter.value = parseStyleOrAnimationValue(setter.propId, rawVal, hasValidVal);
+                        const std::string_view trimSetVal = Trim(rawVal);
+                        if (setter.propId == PropId_IsChecked &&
+                            trimSetVal.size() > 2u && trimSetVal.front() == '{' && trimSetVal.back() == '}' &&
+                            Trim(trimSetVal.substr(1u, trimSetVal.size() - 2u)).rfind("x:Null", 0) == 0) {
+                            setter.value = UnifiedValue{NullObject{}};
+                            hasValidVal = true;
+                        } else {
+                            setter.value = parseStyleOrAnimationValue(setter.propId, rawVal, hasValidVal);
+                        }
                     }
                 }
 
@@ -6314,6 +6453,7 @@ AeroCompileResult AeroCompiler::CompileInternal(
                         if (FindMatchingClosingTag(src, pos, tagName, innerEnd, afterClose)) {
                             const std::string_view fullElemXml = src.substr(lt, afterClose - lt);
                             const std::string resTplKey = "__aero_visual_res__:" + std::string(xKey);
+                            flushDeferredMtsdfJobs();
                             AxbTemplateRegistry::Instance().RegisterResources(pkg);
                             AeroCompileInput subIn{};
                             subIn.xamlPath = resTplKey;
@@ -7409,10 +7549,15 @@ AeroCompileResult AeroCompiler::CompileInternal(
                     const std::string_view bareMem = StripXmlPrefix(memberExpr);
                     std::string resolvedStaticStr;
                     bool hasStaticResolved = false;
+                    bool isExplicitEmptyString = false;
                     if (bareMem == "Visibility.Collapsed") { resolvedStaticStr = "Collapsed"; hasStaticResolved = true; }
                     else if (bareMem == "Visibility.Hidden") { resolvedStaticStr = "Hidden"; hasStaticResolved = true; }
                     else if (bareMem == "Visibility.Visible") { resolvedStaticStr = "Visible"; hasStaticResolved = true; }
-                    else if (bareMem == "String.Empty" || bareMem == "string.Empty") { resolvedStaticStr = ""; hasStaticResolved = true; }
+                    else if (bareMem == "String.Empty" || bareMem == "System.String.Empty" || bareMem == "string.Empty") {
+                        resolvedStaticStr = "";
+                        hasStaticResolved = true;
+                        isExplicitEmptyString = true;
+                    }
                     else if (bareMem == "Double.NaN" || bareMem == "Single.NaN") { resolvedStaticStr = "Auto"; hasStaticResolved = true; }
                     else if (bareMem == "Boolean.TrueString") { resolvedStaticStr = "True"; hasStaticResolved = true; }
                     else if (bareMem == "Boolean.FalseString") { resolvedStaticStr = "False"; hasStaticResolved = true; }
@@ -7420,13 +7565,24 @@ AeroCompileResult AeroCompiler::CompileInternal(
                         AxbInstruction stInst{};
                         stInst.opcode = AxbOpcode::SetStaticProperty;
                         stInst.propId = propId;
-                        stInst.literalValue = ParseLiteralPropertyValue(propId, resolvedStaticStr);
+                        stInst.literalValue = isExplicitEmptyString
+                            ? value::FromString("")
+                            : ParseLiteralPropertyValue(propId, resolvedStaticStr);
                         pkg.instructions.push_back(std::move(stInst));
                     }
                     continue;
                 }
+                if (inner.rfind("x:Null", 0) == 0) {
+                    if (propId == PropId_IsChecked) {
+                        AxbInstruction nullInst{};
+                        nullInst.opcode = AxbOpcode::SetStaticProperty;
+                        nullInst.propId = propId;
+                        nullInst.literalValue = UnifiedValue{NullObject{}};
+                        pkg.instructions.push_back(std::move(nullInst));
+                    }
+                    continue;
+                }
                 if (inner.rfind("x:Type", 0) == 0 ||
-                    inner.rfind("x:Null", 0) == 0 ||
                     inner.rfind("RelativeSource", 0) == 0) {
                     continue;
                 }
@@ -7653,6 +7809,7 @@ AeroCompileResult AeroCompiler::CompileInternal(
         }
     }
 
+    flushDeferredMtsdfJobs();
     if (!pkg.mtsdfPaths.empty() && !isSvgInput && !isLottieInput && !isRiveInput) {
         PackMtsdfAtlasSkyline(pkg.mtsdfPaths, 256u);
     }
@@ -7774,13 +7931,389 @@ AeroCompileResult AeroCompiler::CompileInternal(
         return out;
     };
 
-    // Generate *.g.rs partial class stub when x:Class is specified
-    std::vector<SourceFile> allSources = input.scriptSources;
-    for (auto& sf : allSources) {
-        if (sf.content.find("RelayCommand") != std::string::npos ||
-            sf.content.find("DelegateCommand") != std::string::npos) {
-            sf.content = rewriteGenericCommandNames(sf.content);
+    // Preprocess C# conditional compilation (#define/#undef/#if/#elif/#else/#endif)
+    auto preprocessCSharpDirectives = [](std::string_view raw) -> std::string {
+        if (raw.size() >= 3u &&
+            static_cast<unsigned char>(raw[0]) == 0xEFu &&
+            static_cast<unsigned char>(raw[1]) == 0xBBu &&
+            static_cast<unsigned char>(raw[2]) == 0xBFu) {
+            raw.remove_prefix(3u);
         }
+        if (raw.find('#') == std::string_view::npos) {
+            return std::string(raw);
+        }
+        std::unordered_set<std::string> definedSymbols{
+            "AERO", "AEROGUI", "WPF", "DEBUG", "TRACE"
+        };
+        auto stripLineComment = [](std::string_view expr) noexcept -> std::string {
+            std::string cleaned;
+            cleaned.reserve(expr.size());
+            bool inBlock = false;
+            for (std::size_t i = 0u; i < expr.size(); ++i) {
+                if (inBlock) {
+                    if (expr[i] == '*' && i + 1u < expr.size() && expr[i + 1u] == '/') {
+                        inBlock = false;
+                        ++i;
+                        cleaned.push_back(' ');
+                    }
+                    continue;
+                }
+                if (expr[i] == '/' && i + 1u < expr.size() && expr[i + 1u] == '/') {
+                    break;
+                }
+                if (expr[i] == '/' && i + 1u < expr.size() && expr[i + 1u] == '*') {
+                    inBlock = true;
+                    ++i;
+                    continue;
+                }
+                cleaned.push_back(expr[i]);
+            }
+            return cleaned;
+        };
+        auto evalCond = [&definedSymbols, &stripLineComment](std::string_view rawExpr) -> bool {
+            const std::string exprStr = stripLineComment(rawExpr);
+            std::string_view s(exprStr);
+            std::size_t pos = 0u;
+            auto skipWs = [&]() noexcept {
+                while (pos < s.size() && std::isspace(static_cast<unsigned char>(s[pos]))) {
+                    ++pos;
+                }
+            };
+            auto isIdentStart = [](unsigned char c) noexcept {
+                return std::isalpha(c) || c == '_';
+            };
+            auto isIdentCont = [](unsigned char c) noexcept {
+                return std::isalnum(c) || c == '_';
+            };
+            auto parseIdent = [&]() -> std::string_view {
+                skipWs();
+                const std::size_t start = pos;
+                if (pos < s.size() && isIdentCont(static_cast<unsigned char>(s[pos]))) {
+                    while (pos < s.size() && isIdentCont(static_cast<unsigned char>(s[pos]))) {
+                        ++pos;
+                    }
+                }
+                return s.substr(start, pos - start);
+            };
+            std::function<bool()> parseOr;
+            std::function<bool()> parseAnd;
+            std::function<bool()> parseEq;
+            std::function<bool()> parseUnary;
+            std::function<bool()> parsePrimary;
+
+            parsePrimary = [&]() -> bool {
+                skipWs();
+                if (pos >= s.size()) {
+                    return false;
+                }
+                if (s[pos] == '(') {
+                    ++pos;
+                    const bool v = parseOr();
+                    skipWs();
+                    if (pos < s.size() && s[pos] == ')') {
+                        ++pos;
+                    }
+                    return v;
+                }
+                if (isIdentCont(static_cast<unsigned char>(s[pos]))) {
+                    const std::string_view id = parseIdent();
+                    if (id == "true" || id == "1") return true;
+                    if (id == "false" || id == "0") return false;
+                    if (id == "defined") {
+                        skipWs();
+                        bool hasParen = false;
+                        if (pos < s.size() && s[pos] == '(') {
+                            hasParen = true;
+                            ++pos;
+                        }
+                        const std::string_view sym = parseIdent();
+                        if (hasParen) {
+                            skipWs();
+                            if (pos < s.size() && s[pos] == ')') ++pos;
+                        }
+                        return !sym.empty() && definedSymbols.count(std::string(sym)) > 0u;
+                    }
+                    if (!id.empty() && isIdentStart(static_cast<unsigned char>(id.front()))) {
+                        return definedSymbols.count(std::string(id)) > 0u;
+                    }
+                    return false;
+                }
+                return false;
+            };
+            parseUnary = [&]() -> bool {
+                skipWs();
+                if (pos < s.size() && s[pos] == '!') {
+                    ++pos;
+                    return !parseUnary();
+                }
+                return parsePrimary();
+            };
+            parseEq = [&]() -> bool {
+                bool lhs = parseUnary();
+                while (true) {
+                    skipWs();
+                    if (pos + 1u < s.size() && s[pos] == '=' && s[pos + 1u] == '=') {
+                        pos += 2u;
+                        const bool rhs = parseUnary();
+                        lhs = (lhs == rhs);
+                    } else if (pos + 1u < s.size() && s[pos] == '!' && s[pos + 1u] == '=') {
+                        pos += 2u;
+                        const bool rhs = parseUnary();
+                        lhs = (lhs != rhs);
+                    } else {
+                        break;
+                    }
+                }
+                return lhs;
+            };
+            parseAnd = [&]() -> bool {
+                bool lhs = parseEq();
+                while (true) {
+                    skipWs();
+                    if (pos + 1u < s.size() && s[pos] == '&' && s[pos + 1u] == '&') {
+                        pos += 2u;
+                        const bool rhs = parseEq();
+                        lhs = lhs && rhs;
+                    } else {
+                        break;
+                    }
+                }
+                return lhs;
+            };
+            parseOr = [&]() -> bool {
+                bool lhs = parseAnd();
+                while (true) {
+                    skipWs();
+                    if (pos + 1u < s.size() && s[pos] == '|' && s[pos + 1u] == '|') {
+                        pos += 2u;
+                        const bool rhs = parseAnd();
+                        lhs = lhs || rhs;
+                    } else {
+                        break;
+                    }
+                }
+                return lhs;
+            };
+            return parseOr();
+        };
+        struct CondFrame {
+            bool parentActive = true;
+            bool branchTaken = false;
+            bool currentActive = true;
+        };
+        std::vector<CondFrame> condStack;
+        std::string out;
+        out.reserve(raw.size());
+        bool inBlockComment = false;
+        bool inVerbatimString = false;
+        bool inRawString = false;
+        std::size_t rawQuoteLen = 0u;
+        auto advanceLexerState = [&](std::string_view line) noexcept {
+            bool inString = false;
+            bool inChar = false;
+            for (std::size_t i = 0u; i < line.size(); ++i) {
+                const char c = line[i];
+                if (inBlockComment) {
+                    if (c == '*' && i + 1u < line.size() && line[i + 1u] == '/') {
+                        inBlockComment = false;
+                        ++i;
+                    }
+                    continue;
+                }
+                if (inRawString) {
+                    if (c == '"') {
+                        std::size_t q = 0u;
+                        while (i + q < line.size() && line[i + q] == '"') ++q;
+                        if (q >= rawQuoteLen) {
+                            inRawString = false;
+                            i += rawQuoteLen - 1u;
+                            rawQuoteLen = 0u;
+                            continue;
+                        }
+                        i += q - 1u;
+                    }
+                    continue;
+                }
+                if (inVerbatimString) {
+                    if (c == '"') {
+                        if (i + 1u < line.size() && line[i + 1u] == '"') {
+                            ++i;
+                        } else {
+                            inVerbatimString = false;
+                        }
+                    }
+                    continue;
+                }
+                if (inString) {
+                    if (c == '\\' && i + 1u < line.size()) {
+                        ++i;
+                    } else if (c == '"') {
+                        inString = false;
+                    }
+                    continue;
+                }
+                if (inChar) {
+                    if (c == '\\' && i + 1u < line.size()) {
+                        ++i;
+                    } else if (c == '\'') {
+                        inChar = false;
+                    }
+                    continue;
+                }
+                if (c == '/' && i + 1u < line.size() && line[i + 1u] == '/') {
+                    break;
+                }
+                if (c == '/' && i + 1u < line.size() && line[i + 1u] == '*') {
+                    inBlockComment = true;
+                    ++i;
+                    continue;
+                }
+                if ((c == '@' || (c == '$' && i + 1u < line.size() && line[i + 1u] == '@') ||
+                     (c == '@' && i + 1u < line.size() && line[i + 1u] == '$')) &&
+                    ((c == '@' && i + 1u < line.size() && line[i + 1u] == '"') ||
+                     (i + 2u < line.size() && line[i + 2u] == '"'))) {
+                    const std::size_t qPos = (line[i + 1u] == '"') ? (i + 1u) : (i + 2u);
+                    inVerbatimString = true;
+                    i = qPos;
+                    continue;
+                }
+                if (c == '"') {
+                    std::size_t q = 0u;
+                    while (i + q < line.size() && line[i + q] == '"') ++q;
+                    if (q >= 3u) {
+                        inRawString = true;
+                        rawQuoteLen = q;
+                        i += q - 1u;
+                    } else {
+                        inString = true;
+                    }
+                    continue;
+                }
+                if (c == '\'') {
+                    inChar = true;
+                    continue;
+                }
+            }
+        };
+        std::size_t lineStart = 0u;
+        while (lineStart < raw.size()) {
+            std::size_t lineEnd = raw.find('\n', lineStart);
+            const bool hasNl = (lineEnd != std::string_view::npos);
+            if (!hasNl) lineEnd = raw.size();
+            std::string_view line = raw.substr(lineStart, lineEnd - lineStart);
+            std::string_view trimmed = line;
+            while (!trimmed.empty() && (trimmed.front() == ' ' || trimmed.front() == '\t')) {
+                trimmed.remove_prefix(1u);
+            }
+            if (!inBlockComment && !inVerbatimString && !inRawString &&
+                !trimmed.empty() && trimmed.front() == '#') {
+                std::string_view rest = trimmed.substr(1u);
+                while (!rest.empty() && (rest.front() == ' ' || rest.front() == '\t')) rest.remove_prefix(1u);
+                std::size_t kwLen = 0u;
+                while (kwLen < rest.size() && std::isalpha(static_cast<unsigned char>(rest[kwLen]))) ++kwLen;
+                const std::string_view kw = rest.substr(0u, kwLen);
+                const std::string_view arg = rest.substr(kwLen);
+                const bool active = condStack.empty() ? true : condStack.back().currentActive;
+                if (kw == "define") {
+                    if (active) {
+                        const std::string symClean = stripLineComment(arg);
+                        std::string_view sym(symClean);
+                        while (!sym.empty() && std::isspace(static_cast<unsigned char>(sym.front()))) sym.remove_prefix(1u);
+                        std::size_t slen = 0u;
+                        while (slen < sym.size() && (std::isalnum(static_cast<unsigned char>(sym[slen])) || sym[slen] == '_')) {
+                            ++slen;
+                        }
+                        if (slen > 0u) {
+                            definedSymbols.insert(std::string(sym.substr(0u, slen)));
+                        }
+                    }
+                    if (hasNl) out.push_back('\n');
+                    lineStart = lineEnd + 1u;
+                    continue;
+                }
+                if (kw == "undef") {
+                    if (active) {
+                        const std::string symClean = stripLineComment(arg);
+                        std::string_view sym(symClean);
+                        while (!sym.empty() && std::isspace(static_cast<unsigned char>(sym.front()))) sym.remove_prefix(1u);
+                        std::size_t slen = 0u;
+                        while (slen < sym.size() && (std::isalnum(static_cast<unsigned char>(sym[slen])) || sym[slen] == '_')) {
+                            ++slen;
+                        }
+                        if (slen > 0u) {
+                            definedSymbols.erase(std::string(sym.substr(0u, slen)));
+                        }
+                    }
+                    if (hasNl) out.push_back('\n');
+                    lineStart = lineEnd + 1u;
+                    continue;
+                }
+                if (kw == "if") {
+                    const bool pAct = active;
+                    const bool cVal = pAct && evalCond(arg);
+                    condStack.push_back(CondFrame{pAct, cVal, cVal});
+                    if (hasNl) out.push_back('\n');
+                    lineStart = lineEnd + 1u;
+                    continue;
+                }
+                if (kw == "elif" && !condStack.empty()) {
+                    auto& top = condStack.back();
+                    if (!top.parentActive || top.branchTaken) {
+                        top.currentActive = false;
+                    } else {
+                        const bool cVal = evalCond(arg);
+                        top.currentActive = cVal;
+                        top.branchTaken = cVal;
+                    }
+                    if (hasNl) out.push_back('\n');
+                    lineStart = lineEnd + 1u;
+                    continue;
+                }
+                if (kw == "else" && !condStack.empty()) {
+                    auto& top = condStack.back();
+                    top.currentActive = top.parentActive && !top.branchTaken;
+                    top.branchTaken = true;
+                    if (hasNl) out.push_back('\n');
+                    lineStart = lineEnd + 1u;
+                    continue;
+                }
+                if (kw == "endif" && !condStack.empty()) {
+                    condStack.pop_back();
+                    if (hasNl) out.push_back('\n');
+                    lineStart = lineEnd + 1u;
+                    continue;
+                }
+            }
+            const bool active = condStack.empty() ? true : condStack.back().currentActive;
+            if (active) {
+                advanceLexerState(line);
+                out.append(line);
+            }
+            if (hasNl) out.push_back('\n');
+            lineStart = lineEnd + 1u;
+        }
+        return out;
+    };
+
+    auto isPureNativeExtensionMetadataFile = [](std::string_view content) noexcept -> bool {
+        return content.find("namespace NoesisGUIExtensions") != std::string_view::npos &&
+               (content.find("DependencyProperty.Register") != std::string_view::npos ||
+                content.find("Animatable") != std::string_view::npos);
+    };
+
+    // Generate *.g.rs partial class stub when x:Class is specified
+    std::vector<SourceFile> allSources;
+    allSources.reserve(input.scriptSources.size() + 2u);
+    for (const auto& rawSf : input.scriptSources) {
+        std::string cleaned = preprocessCSharpDirectives(rawSf.content);
+        if (isPureNativeExtensionMetadataFile(cleaned)) {
+            continue;
+        }
+        if (cleaned.find("RelayCommand") != std::string::npos ||
+            cleaned.find("DelegateCommand") != std::string::npos) {
+            cleaned = rewriteGenericCommandNames(cleaned);
+        }
+        allSources.push_back(SourceFile{rawSf.path, std::move(cleaned)});
     }
     if (!pkg.className.empty()) {
         std::string moduleName = "Aero.UI";
@@ -7938,7 +8471,7 @@ AeroCompileResult AeroCompiler::CompileInternal(
         bool userDefinesCreateMainWindow = false;
         bool userDeclaresConstructors = false;
         bool userDeclaresParameterlessConstructor = false;
-        for (const auto& sf : input.scriptSources) {
+        for (const auto& sf : allSources) {
             if (sf.path == partialStubSuffix ||
                 (sf.path.size() >= partialStubSuffix.size() &&
                  sf.path.compare(sf.path.size() - partialStubSuffix.size(), partialStubSuffix.size(), partialStubSuffix) == 0)) {
@@ -8105,8 +8638,9 @@ AeroCompileResult AeroCompiler::CompileInternal(
         if (!userDefinesRootHandle) {
             stub += "    public handle __nativeRootHandle;\n";
         }
+        stub += "    private bool __aero_premounted;\n";
         stub += "    private bool __aero_component_loaded = false;\n";
-        stub += "    private void __AeroEnsureLoaded() { if (!this.__aero_component_loaded) { this.__aero_component_loaded = true; Aero_LoadComponent__" +
+        stub += "    private void __AeroEnsureLoaded() { if (!this.__aero_component_loaded && !this.__aero_premounted) { this.__aero_component_loaded = true; Aero_LoadComponent__" +
                 shortClassName + "(this, \"" + escapedLeaf + "\"); } }\n";
         {
             std::unordered_set<std::string> emittedFieldNames;
@@ -8129,8 +8663,10 @@ AeroCompileResult AeroCompiler::CompileInternal(
                             "if (this.__aero_cache_" + nc.name + " == null) { " +
                             sdkType + " w = new " + sdkType + "(); "
                             "w.__nativeRootHandle = this.__aero_handle_" + nc.name + "; "
+                            "UIElement_RegisterWrapper(this.__aero_handle_" + nc.name + ", w); "
                             "this.__aero_cache_" + nc.name + " = w; } else { "
-                            "this.__aero_cache_" + nc.name + ".__nativeRootHandle = this.__aero_handle_" + nc.name + "; } "
+                            "this.__aero_cache_" + nc.name + ".__nativeRootHandle = this.__aero_handle_" + nc.name + "; "
+                            "UIElement_RegisterWrapper(this.__aero_handle_" + nc.name + ", this.__aero_cache_" + nc.name + "); } "
                             "return this.__aero_cache_" + nc.name + "; } }\n";
                 } else {
                     stub += "    public handle " + nc.name + ";\n";
@@ -8167,7 +8703,7 @@ AeroCompileResult AeroCompiler::CompileInternal(
         }
         result.generatedPartialRsCode = stub;
 
-        if (!input.scriptSources.empty()) {
+        if (!allSources.empty()) {
             bool alreadyHasPartialStub = false;
             for (const auto& sf : allSources) {
                 if (sf.path == result.generatedPartialRsPath ||
@@ -8252,7 +8788,7 @@ AeroCompileResult AeroCompiler::CompileInternal(
                 "    public void SetCanExecuteFunc(CanExecuteStringFunc canExec) { _canExecStr = canExec; }\n"
                 "    public void SetExecuteFunc(ExecuteHandleFunc exec) { _execHandle = exec; }\n"
                 "    public void SetCanExecuteFunc(CanExecuteHandleFunc canExec) { _canExecHandle = canExec; }\n"
-                "    public void RaiseCanExecuteChanged() { }\n"
+                "    public void RaiseCanExecuteChanged() { Command_NotifyCanExecuteChanged(this); }\n"
                 "    public bool CanExecute() { if (_canExec0 != null) { return _canExec0(); } return true; }\n"
                 "    public bool CanExecute(int param) { if (_canExecInt != null) { return _canExecInt(param); } if (_canExec0 != null) { return _canExec0(); } return true; }\n"
                 "    public bool CanExecute(string param) { if (_canExecStr != null) { return _canExecStr(param); } if (_canExec0 != null) { return _canExec0(); } return true; }\n"
@@ -8295,6 +8831,11 @@ AeroCompileResult AeroCompiler::CompileInternal(
                 "public float UIElement_GetFloat(handle elem, string propName) { return 0.0f; }\n"
                 "public bool UIElement_SetFloat(handle elem, string propName, float val) { return false; }\n"
                 "public string TreeView_GetSelectedHeader(handle elem) { return \"\"; }\n"
+                "public bool UIElement_RegisterWrapper(handle elem, object wrapper) { return false; }\n"
+                "public bool Command_NotifyCanExecuteChanged(object cmd) { return false; }\n"
+                "public bool TextBox_Clear(handle elem) { return false; }\n"
+                "public bool TextBox_SelectAll(handle elem) { return false; }\n"
+                "public string ListBox_GetSelectedItemText(handle elem) { return \"\"; }\n"
                 "public bool Window_Close(handle elem) { return false; }\n"
                 "public class RelayCommand : DelegateCommand\n"
                 "{\n"
@@ -8327,7 +8868,7 @@ AeroCompileResult AeroCompiler::CompileInternal(
                 "    public TypedRelayCommand() { }\n"
                 "    public TypedRelayCommand(ExecuteGenericFunc<T> exec) { _exec = exec; }\n"
                 "    public TypedRelayCommand(ExecuteGenericFunc<T> exec, CanExecuteGenericFunc<T> canExec) { _exec = exec; _canExec = canExec; }\n"
-                "    public void RaiseCanExecuteChanged() { }\n"
+                "    public void RaiseCanExecuteChanged() { Command_NotifyCanExecuteChanged(this); }\n"
                 "    public bool CanExecute(T param) { if (_canExec != null) { return _canExec(param); } return true; }\n"
                 "    public void Execute(T param) { if (!CanExecute(param)) { return; } if (_exec != null) { _exec(param); } }\n"
                 "}\n"
@@ -8338,7 +8879,7 @@ AeroCompileResult AeroCompiler::CompileInternal(
                 "    public TypedDelegateCommand() { }\n"
                 "    public TypedDelegateCommand(ExecuteGenericFunc<T> exec) { _exec = exec; }\n"
                 "    public TypedDelegateCommand(ExecuteGenericFunc<T> exec, CanExecuteGenericFunc<T> canExec) { _exec = exec; _canExec = canExec; }\n"
-                "    public void RaiseCanExecuteChanged() { }\n"
+                "    public void RaiseCanExecuteChanged() { Command_NotifyCanExecuteChanged(this); }\n"
                 "    public bool CanExecute(T param) { if (_canExec != null) { return _canExec(param); } return true; }\n"
                 "    public void Execute(T param) { if (!CanExecute(param)) { return; } if (_exec != null) { _exec(param); } }\n"
                 "}\n"
@@ -8379,20 +8920,62 @@ AeroCompileResult AeroCompiler::CompileInternal(
                 "    public bool IsAltDown = false;\n"
                 "}\n"
                 "public class MouseButtonEventArgs : RoutedEventArgs { }\n"
+                "public class StartupEventArgs : RoutedEventArgs { }\n"
                 "public class RoutedPropertyChangedEventArgs : RoutedEventArgs\n"
                 "{\n"
                 "    public float NewValue = 0.0f;\n"
                 "    public string NewText = \"\";\n"
                 "}\n"
+                "public enum Visibility { Visible = 0, Hidden = 1, Collapsed = 2 }\n"
+                "public enum Orientation { Horizontal = 0, Vertical = 1 }\n"
+                "public enum HorizontalAlignment { Left = 0, Center = 1, Right = 2, Stretch = 3 }\n"
+                "public enum VerticalAlignment { Top = 0, Center = 1, Bottom = 2, Stretch = 3 }\n"
+                "public enum SelectionMode { Single = 0, Multiple = 1, Extended = 2 }\n"
+                "public enum ClickMode { Release = 0, Press = 1, Hover = 2 }\n"
+                "public delegate void RoutedEventHandler(object sender, RoutedEventArgs e);\n"
+                "public delegate void TextChangedEventHandler(object sender, TextChangedEventArgs e);\n"
+                "public delegate void SelectionChangedEventHandler(object sender, SelectionChangedEventArgs e);\n"
+                "public delegate void KeyEventHandler(object sender, KeyEventArgs e);\n"
+                "public delegate void MouseButtonEventHandler(object sender, MouseButtonEventArgs e);\n"
+                "public delegate void RoutedPropertyChangedFloatHandler(object sender, RoutedPropertyChangedEventArgs e);\n"
                 "[Observable]\n"
                 "public class DependencyObject\n"
                 "{\n"
                 "    public handle __nativeRootHandle;\n"
+                "    public static Visibility __ToVis(int v) { if (v == 1) { return Visibility.Hidden; } if (v == 2) { return Visibility.Collapsed; } return Visibility.Visible; }\n"
+                "    public static int __FromVis(Visibility v) { if (v == Visibility.Hidden) { return 1; } if (v == Visibility.Collapsed) { return 2; } return 0; }\n"
+                "    public static HorizontalAlignment __ToHAlign(int v) { if (v == 0) { return HorizontalAlignment.Left; } if (v == 1) { return HorizontalAlignment.Center; } if (v == 2) { return HorizontalAlignment.Right; } return HorizontalAlignment.Stretch; }\n"
+                "    public static int __FromHAlign(HorizontalAlignment v) { if (v == HorizontalAlignment.Left) { return 0; } if (v == HorizontalAlignment.Center) { return 1; } if (v == HorizontalAlignment.Right) { return 2; } return 3; }\n"
+                "    public static VerticalAlignment __ToVAlign(int v) { if (v == 0) { return VerticalAlignment.Top; } if (v == 1) { return VerticalAlignment.Center; } if (v == 2) { return VerticalAlignment.Bottom; } return VerticalAlignment.Stretch; }\n"
+                "    public static int __FromVAlign(VerticalAlignment v) { if (v == VerticalAlignment.Top) { return 0; } if (v == VerticalAlignment.Center) { return 1; } if (v == VerticalAlignment.Bottom) { return 2; } return 3; }\n"
+                "    public static SelectionMode __ToSelMode(int v) { if (v == 1) { return SelectionMode.Multiple; } if (v == 2) { return SelectionMode.Extended; } return SelectionMode.Single; }\n"
+                "    public static int __FromSelMode(SelectionMode v) { if (v == SelectionMode.Multiple) { return 1; } if (v == SelectionMode.Extended) { return 2; } return 0; }\n"
+                "    public static ClickMode __ToClickMode(int v) { if (v == 1) { return ClickMode.Press; } if (v == 2) { return ClickMode.Hover; } return ClickMode.Release; }\n"
+                "    public static int __FromClickMode(ClickMode v) { if (v == ClickMode.Press) { return 1; } if (v == ClickMode.Hover) { return 2; } return 0; }\n"
                 "}\n"
                 "public class UIElement : DependencyObject\n"
                 "{\n"
-                "    public int Visibility { get { return UIElement_GetVisibility(this.__nativeRootHandle); } set { UIElement_SetVisibility(this.__nativeRootHandle, value); } }\n"
+                "    public event RoutedEventHandler Loaded;\n"
+                "    public event RoutedEventHandler GotFocus;\n"
+                "    public event RoutedEventHandler LostFocus;\n"
+                "    public event RoutedEventHandler MouseEnter;\n"
+                "    public event RoutedEventHandler MouseLeave;\n"
+                "    public event MouseButtonEventHandler MouseLeftButtonDown;\n"
+                "    public event MouseButtonEventHandler MouseLeftButtonUp;\n"
+                "    public event KeyEventHandler KeyDown;\n"
+                "    public event KeyEventHandler KeyUp;\n"
+                "    public void __RaiseLoaded(RoutedEventArgs e) { Loaded(this, e); }\n"
+                "    public void __RaiseGotFocus(RoutedEventArgs e) { GotFocus(this, e); }\n"
+                "    public void __RaiseLostFocus(RoutedEventArgs e) { LostFocus(this, e); }\n"
+                "    public void __RaiseMouseEnter(RoutedEventArgs e) { MouseEnter(this, e); }\n"
+                "    public void __RaiseMouseLeave(RoutedEventArgs e) { MouseLeave(this, e); }\n"
+                "    public void __RaiseMouseLeftButtonDown(MouseButtonEventArgs e) { MouseLeftButtonDown(this, e); }\n"
+                "    public void __RaiseMouseLeftButtonUp(MouseButtonEventArgs e) { MouseLeftButtonUp(this, e); }\n"
+                "    public void __RaiseKeyDown(KeyEventArgs e) { KeyDown(this, e); }\n"
+                "    public void __RaiseKeyUp(KeyEventArgs e) { KeyUp(this, e); }\n"
+                "    public Visibility Visibility { get { return DependencyObject.__ToVis(UIElement_GetVisibility(this.__nativeRootHandle)); } set { UIElement_SetVisibility(this.__nativeRootHandle, DependencyObject.__FromVis(value)); } }\n"
                 "    public bool IsEnabled { get { return UIElement_GetBool(this.__nativeRootHandle, \"IsEnabled\"); } set { UIElement_SetBool(this.__nativeRootHandle, \"IsEnabled\", value); } }\n"
+                "    public bool IsHitTestVisible { get { return UIElement_GetBool(this.__nativeRootHandle, \"IsHitTestVisible\"); } set { UIElement_SetBool(this.__nativeRootHandle, \"IsHitTestVisible\", value); } }\n"
                 "    public float Opacity { get { return UIElement_GetFloat(this.__nativeRootHandle, \"Opacity\"); } set { UIElement_SetFloat(this.__nativeRootHandle, \"Opacity\", value); } }\n"
                 "    public bool Focus() { return UIElement_Focus(this.__nativeRootHandle); }\n"
                 "}\n"
@@ -8402,9 +8985,13 @@ AeroCompileResult AeroCompiler::CompileInternal(
                 "    public float Height { get { return UIElement_GetFloat(this.__nativeRootHandle, \"Height\"); } set { UIElement_SetFloat(this.__nativeRootHandle, \"Height\", value); } }\n"
                 "    public float ActualWidth { get { return UIElement_GetFloat(this.__nativeRootHandle, \"ActualWidth\"); } }\n"
                 "    public float ActualHeight { get { return UIElement_GetFloat(this.__nativeRootHandle, \"ActualHeight\"); } }\n"
+                "    public HorizontalAlignment HorizontalAlignment { get { return DependencyObject.__ToHAlign(UIElement_GetInt(this.__nativeRootHandle, \"HorizontalAlignment\")); } set { UIElement_SetInt(this.__nativeRootHandle, \"HorizontalAlignment\", DependencyObject.__FromHAlign(value)); } }\n"
+                "    public VerticalAlignment VerticalAlignment { get { return DependencyObject.__ToVAlign(UIElement_GetInt(this.__nativeRootHandle, \"VerticalAlignment\")); } set { UIElement_SetInt(this.__nativeRootHandle, \"VerticalAlignment\", DependencyObject.__FromVAlign(value)); } }\n"
                 "    public string Tag { get { return UIElement_GetString(this.__nativeRootHandle, \"Tag\"); } set { UIElement_SetString(this.__nativeRootHandle, \"Tag\", value); } }\n"
                 "    public string ToolTip { get { return UIElement_GetString(this.__nativeRootHandle, \"ToolTip\"); } set { UIElement_SetString(this.__nativeRootHandle, \"ToolTip\", value); } }\n"
                 "    public handle FindName(string name) { return UIElement_FindName(this.__nativeRootHandle, name); }\n"
+                "    public bool BeginStoryboard(string storyboardKey) { return Storyboard_Begin(this.__nativeRootHandle, storyboardKey); }\n"
+                "    public bool StopStoryboard(string storyboardKey) { return Storyboard_Stop(this.__nativeRootHandle, storyboardKey); }\n"
                 "}\n"
                 "public class Control : FrameworkElement\n"
                 "{\n"
@@ -8422,7 +9009,12 @@ AeroCompileResult AeroCompiler::CompileInternal(
                 "}\n"
                 "public class UserControl : ContentControl { }\n"
                 "public class Page : ContentControl { }\n"
-                "public class Button : ContentControl { }\n"
+                "public class Button : ContentControl\n"
+                "{\n"
+                "    public event RoutedEventHandler Click;\n"
+                "    public void __RaiseClick(RoutedEventArgs e) { Click(this, e); }\n"
+                "    public ClickMode ClickMode { get { return DependencyObject.__ToClickMode(UIElement_GetInt(this.__nativeRootHandle, \"ClickMode\")); } set { UIElement_SetInt(this.__nativeRootHandle, \"ClickMode\", DependencyObject.__FromClickMode(value)); } }\n"
+                "}\n"
                 "public class RepeatButton : Button { }\n"
                 "public class Hyperlink : Button\n"
                 "{\n"
@@ -8430,6 +9022,12 @@ AeroCompileResult AeroCompiler::CompileInternal(
                 "}\n"
                 "public class ToggleButton : Button\n"
                 "{\n"
+                "    public event RoutedEventHandler Checked;\n"
+                "    public event RoutedEventHandler Unchecked;\n"
+                "    public event RoutedEventHandler Indeterminate;\n"
+                "    public void __RaiseChecked(RoutedEventArgs e) { Checked(this, e); }\n"
+                "    public void __RaiseUnchecked(RoutedEventArgs e) { Unchecked(this, e); }\n"
+                "    public void __RaiseIndeterminate(RoutedEventArgs e) { Indeterminate(this, e); }\n"
                 "    public bool IsChecked { get { return UIElement_GetBool(this.__nativeRootHandle, \"IsChecked\"); } set { UIElement_SetBool(this.__nativeRootHandle, \"IsChecked\", value); } }\n"
                 "    public bool IsThreeState { get { return UIElement_GetBool(this.__nativeRootHandle, \"IsThreeState\"); } set { UIElement_SetBool(this.__nativeRootHandle, \"IsThreeState\", value); } }\n"
                 "}\n"
@@ -8441,20 +9039,36 @@ AeroCompileResult AeroCompiler::CompileInternal(
                 "}\n"
                 "public class TextBox : Control\n"
                 "{\n"
+                "    public event TextChangedEventHandler TextChanged;\n"
+                "    public void __RaiseTextChanged(TextChangedEventArgs e) { TextChanged(this, e); }\n"
                 "    public string Text { get { return UIElement_GetString(this.__nativeRootHandle, \"Text\"); } set { UIElement_SetString(this.__nativeRootHandle, \"Text\", value); } }\n"
                 "    public string Placeholder { get { return UIElement_GetString(this.__nativeRootHandle, \"Placeholder\"); } set { UIElement_SetString(this.__nativeRootHandle, \"Placeholder\", value); } }\n"
                 "    public bool IsReadOnly { get { return UIElement_GetBool(this.__nativeRootHandle, \"IsReadOnly\"); } set { UIElement_SetBool(this.__nativeRootHandle, \"IsReadOnly\", value); } }\n"
+                "    public bool AcceptsReturn { get { return UIElement_GetBool(this.__nativeRootHandle, \"AcceptsReturn\"); } set { UIElement_SetBool(this.__nativeRootHandle, \"AcceptsReturn\", value); } }\n"
+                "    public int MaxLength { get { return UIElement_GetInt(this.__nativeRootHandle, \"MaxLength\"); } set { UIElement_SetInt(this.__nativeRootHandle, \"MaxLength\", value); } }\n"
+                "    public int MaxLines { get { return UIElement_GetInt(this.__nativeRootHandle, \"MaxLines\"); } set { UIElement_SetInt(this.__nativeRootHandle, \"MaxLines\", value); } }\n"
+                "    public void Clear() { TextBox_Clear(this.__nativeRootHandle); }\n"
+                "    public void SelectAll() { TextBox_SelectAll(this.__nativeRootHandle); }\n"
                 "}\n"
                 "public class PasswordBox : Control\n"
                 "{\n"
+                "    public event RoutedEventHandler PasswordChanged;\n"
+                "    public void __RaisePasswordChanged(RoutedEventArgs e) { PasswordChanged(this, e); }\n"
                 "    public string Password { get { return PasswordBox_GetPassword(this.__nativeRootHandle); } set { UIElement_SetString(this.__nativeRootHandle, \"Text\", value); } }\n"
+                "    public string PasswordChar { get { return UIElement_GetString(this.__nativeRootHandle, \"PasswordChar\"); } set { UIElement_SetString(this.__nativeRootHandle, \"PasswordChar\", value); } }\n"
                 "    public bool Clear() { return PasswordBox_ClearPassword(this.__nativeRootHandle); }\n"
                 "}\n"
                 "public class Slider : Control\n"
                 "{\n"
+                "    public event RoutedPropertyChangedFloatHandler ValueChanged;\n"
+                "    public void __RaiseValueChanged(RoutedPropertyChangedEventArgs e) { ValueChanged(this, e); }\n"
                 "    public float Value { get { return UIElement_GetFloat(this.__nativeRootHandle, \"Value\"); } set { UIElement_SetFloat(this.__nativeRootHandle, \"Value\", value); } }\n"
                 "    public float Minimum { get { return UIElement_GetFloat(this.__nativeRootHandle, \"Minimum\"); } set { UIElement_SetFloat(this.__nativeRootHandle, \"Minimum\", value); } }\n"
                 "    public float Maximum { get { return UIElement_GetFloat(this.__nativeRootHandle, \"Maximum\"); } set { UIElement_SetFloat(this.__nativeRootHandle, \"Maximum\", value); } }\n"
+                "    public float SmallChange { get { return UIElement_GetFloat(this.__nativeRootHandle, \"SmallChange\"); } set { UIElement_SetFloat(this.__nativeRootHandle, \"SmallChange\", value); } }\n"
+                "    public float TickFrequency { get { return UIElement_GetFloat(this.__nativeRootHandle, \"TickFrequency\"); } set { UIElement_SetFloat(this.__nativeRootHandle, \"TickFrequency\", value); } }\n"
+                "    public bool IsSnapToTickEnabled { get { return UIElement_GetBool(this.__nativeRootHandle, \"IsSnapToTickEnabled\"); } set { UIElement_SetBool(this.__nativeRootHandle, \"IsSnapToTickEnabled\", value); } }\n"
+                "    public bool IsDirectionReversed { get { return UIElement_GetBool(this.__nativeRootHandle, \"IsDirectionReversed\"); } set { UIElement_SetBool(this.__nativeRootHandle, \"IsDirectionReversed\", value); } }\n"
                 "}\n"
                 "public class ProgressBar : Control\n"
                 "{\n"
@@ -8464,20 +9078,34 @@ AeroCompileResult AeroCompiler::CompileInternal(
                 "}\n"
                 "public class ListBox : Control\n"
                 "{\n"
+                "    public event SelectionChangedEventHandler SelectionChanged;\n"
+                "    public void __RaiseSelectionChanged(SelectionChangedEventArgs e) { SelectionChanged(this, e); }\n"
                 "    public int SelectedIndex { get { return UIElement_GetInt(this.__nativeRootHandle, \"SelectedIndex\"); } set { UIElement_SetInt(this.__nativeRootHandle, \"SelectedIndex\", value); } }\n"
+                "    public SelectionMode SelectionMode { get { return DependencyObject.__ToSelMode(UIElement_GetInt(this.__nativeRootHandle, \"SelectionMode\")); } set { UIElement_SetInt(this.__nativeRootHandle, \"SelectionMode\", DependencyObject.__FromSelMode(value)); } }\n"
+                "    public string SelectedItemText { get { return ListBox_GetSelectedItemText(this.__nativeRootHandle); } }\n"
                 "}\n"
                 "public class ComboBox : ListBox\n"
                 "{\n"
                 "    public bool IsDropDownOpen { get { return UIElement_GetBool(this.__nativeRootHandle, \"IsDropDownOpen\"); } set { UIElement_SetBool(this.__nativeRootHandle, \"IsDropDownOpen\", value); } }\n"
+                "    public bool IsEditable { get { return UIElement_GetBool(this.__nativeRootHandle, \"IsEditable\"); } set { UIElement_SetBool(this.__nativeRootHandle, \"IsEditable\", value); } }\n"
+                "    public string Text { get { return UIElement_GetString(this.__nativeRootHandle, \"Text\"); } set { UIElement_SetString(this.__nativeRootHandle, \"Text\", value); } }\n"
+                "    public string Placeholder { get { return UIElement_GetString(this.__nativeRootHandle, \"Placeholder\"); } set { UIElement_SetString(this.__nativeRootHandle, \"Placeholder\", value); } }\n"
+                "    public float MaxDropDownHeight { get { return UIElement_GetFloat(this.__nativeRootHandle, \"MaxDropDownHeight\"); } set { UIElement_SetFloat(this.__nativeRootHandle, \"MaxDropDownHeight\", value); } }\n"
                 "}\n"
                 "public class TabControl : ListBox { }\n"
                 "public class Expander : ContentControl\n"
                 "{\n"
+                "    public event RoutedEventHandler Expanded;\n"
+                "    public event RoutedEventHandler Collapsed;\n"
+                "    public void __RaiseExpanded(RoutedEventArgs e) { Expanded(this, e); }\n"
+                "    public void __RaiseCollapsed(RoutedEventArgs e) { Collapsed(this, e); }\n"
                 "    public string Header { get { return UIElement_GetString(this.__nativeRootHandle, \"Header\"); } set { UIElement_SetString(this.__nativeRootHandle, \"Header\", value); } }\n"
                 "    public bool IsExpanded { get { return UIElement_GetBool(this.__nativeRootHandle, \"IsExpanded\"); } set { UIElement_SetBool(this.__nativeRootHandle, \"IsExpanded\", value); } }\n"
                 "}\n"
                 "public class TreeView : Control\n"
                 "{\n"
+                "    public event RoutedPropertyChangedFloatHandler SelectedItemChanged;\n"
+                "    public void __RaiseSelectedItemChanged(RoutedPropertyChangedEventArgs e) { SelectedItemChanged(this, e); }\n"
                 "    public string SelectedHeader { get { return TreeView_GetSelectedHeader(this.__nativeRootHandle); } }\n"
                 "}\n"
                 "public class TreeViewItem : Control\n"
@@ -8525,6 +9153,7 @@ AeroCompileResult AeroCompiler::CompileInternal(
                 "public class Application\n"
                 "{\n"
                 "    public string StartupUri = \"\";\n"
+                "    public virtual void OnStartup(StartupEventArgs e) { }\n"
                 "    public bool LoadResources(handle root, string uri) { return Application_LoadResources(root, uri); }\n"
                 "    public bool ApplyDictionary(string uri) { return Application_ApplyDictionary(uri); }\n"
                 "    public bool LoadTheme(handle root, string colorName, string accentName) { return Application_LoadTheme(root, colorName, accentName); }\n"

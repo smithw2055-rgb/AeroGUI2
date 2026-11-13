@@ -64,13 +64,18 @@ struct InlineTrackKeyFrame {
     EasingFunctionKind easingKind = EasingFunctionKind::Linear;
     EasingMode easingMode = EasingMode::EaseOut;
     bool isDiscrete = false;
+    bool hasKeySpline = false;
+    float splineX1 = 0.0f;
+    float splineY1 = 0.0f;
+    float splineX2 = 1.0f;
+    float splineY2 = 1.0f;
 };
 
 // Zero-allocation AnimationEngine backed by CompactPropertyEntry::animationTrackId & MotionStateMachineBank
 class AnimationEngine {
 public:
     static constexpr std::uint16_t InvalidTrackId = 0xFFFFu;
-    static constexpr std::size_t kMaxInlineKeyFrames = 8u;
+    static constexpr std::size_t kMaxInlineKeyFrames = 24u;
 
     explicit AnimationEngine(std::size_t initialReservedTracks = 64u);
     ~AnimationEngine() noexcept;
@@ -255,6 +260,9 @@ private:
         float beginTime = 0.0f;
         float duration = 0.25f;
         float elapsed = 0.0f;
+        float speedRatio = 1.0f;
+        float accelerationRatio = 0.0f;
+        float decelerationRatio = 0.0f;
         std::int32_t repeatCount = 1;
 
         Float4Value fromF4{};

@@ -280,6 +280,7 @@ public:
         if (fastProps_.reserved != next) {
             fastProps_.reserved = next;
             InvalidateRender();
+            OnHoveredChanged(hovered);
         }
     }
 
@@ -384,13 +385,62 @@ public:
         std::uint8_t modifiers,
         bool insideBounds);
     using KeyEventCallback = std::function<bool(UIElement&, KeyCode, std::uint8_t)>;
+    using SimpleUiEventCallback = std::function<bool(UIElement&)>;
+    using WrapperRoutedEventFn = bool (*)(
+        UIElement* elem,
+        std::string_view eventName,
+        const UnifiedValue& argVal,
+        bool hasArg);
+    using WrapperDestroyFn = void (*)(const UIElement* elem) noexcept;
+
+    struct RareEventCallbacks {
+        SimpleUiEventCallback mouseEnter;
+        SimpleUiEventCallback mouseLeave;
+        SimpleUiEventCallback mouseDown;
+        SimpleUiEventCallback mouseUp;
+        SimpleUiEventCallback gotFocus;
+        SimpleUiEventCallback lostFocus;
+    };
+
+    static void SetWrapperRoutedEventDispatcher(WrapperRoutedEventFn fn) noexcept;
+    static void SetWrapperDestroyCallback(WrapperDestroyFn fn) noexcept;
+    bool DispatchWrapperRoutedEvent(
+        std::string_view eventName,
+        const UnifiedValue& argVal = {},
+        bool hasArg = false);
+    void SetHasRegisteredScriptWrapper(bool v) noexcept { hasRegisteredScriptWrapper_ = v; }
+    [[nodiscard]] bool HasRegisteredScriptWrapper() const noexcept { return hasRegisteredScriptWrapper_; }
+
+    void SetMouseEnterCallback(SimpleUiEventCallback cb) { EnsureRareEvents().mouseEnter = std::move(cb); }
+    void SetMouseLeaveCallback(SimpleUiEventCallback cb) { EnsureRareEvents().mouseLeave = std::move(cb); }
+    void SetMouseDownCallback(SimpleUiEventCallback cb) { EnsureRareEvents().mouseDown = std::move(cb); }
+    void SetMouseUpCallback(SimpleUiEventCallback cb) { EnsureRareEvents().mouseUp = std::move(cb); }
+    void SetGotFocusCallback(SimpleUiEventCallback cb) { EnsureRareEvents().gotFocus = std::move(cb); }
+    void SetLostFocusCallback(SimpleUiEventCallback cb) { EnsureRareEvents().lostFocus = std::move(cb); }
+    bool InvokeMouseEnterBubble();
+    bool InvokeMouseLeaveBubble();
+    bool InvokeMouseDownCallback();
+    bool InvokeMouseUpCallback();
+
     void SetKeyDownCallback(KeyEventCallback cb) { keyDownCallback_ = std::move(cb); }
     void SetKeyUpCallback(KeyEventCallback cb) { keyUpCallback_ = std::move(cb); }
     bool InvokeKeyDownCallback(KeyCode key, std::uint8_t modifiers) {
-        return keyDownCallback_ ? keyDownCallback_(*this, key, modifiers) : false;
+        bool handled = keyDownCallback_ ? keyDownCallback_(*this, key, modifiers) : false;
+        if (hasRegisteredScriptWrapper_) {
+            const std::int64_t packed = static_cast<std::int64_t>(
+                static_cast<std::uint32_t>(key) | (static_cast<std::uint32_t>(modifiers) << 16u));
+            handled = DispatchWrapperRoutedEvent("KeyDown", value::FromInt(packed), true) || handled;
+        }
+        return handled;
     }
     bool InvokeKeyUpCallback(KeyCode key, std::uint8_t modifiers) {
-        return keyUpCallback_ ? keyUpCallback_(*this, key, modifiers) : false;
+        bool handled = keyUpCallback_ ? keyUpCallback_(*this, key, modifiers) : false;
+        if (hasRegisteredScriptWrapper_) {
+            const std::int64_t packed = static_cast<std::int64_t>(
+                static_cast<std::uint32_t>(key) | (static_cast<std::uint32_t>(modifiers) << 16u));
+            handled = DispatchWrapperRoutedEvent("KeyUp", value::FromInt(packed), true) || handled;
+        }
+        return handled;
     }
     [[nodiscard]] std::uint32_t BubbledClickGeneration() const noexcept { return bubbledClickGen_; }
     void NotifyBubbledClick() noexcept {
@@ -866,7 +916,14 @@ private:
     bool registeredInValuePoolSet_ = false;
     bool isNamescopeBoundary_ = false;
     bool isHitTestVisible_ = true;
+    bool hasRegisteredScriptWrapper_ = false;
     mutable bool referencedAsElementSource_ = false;
+    std::unique_ptr<RareEventCallbacks> rareEvents_;
+    RareEventCallbacks& EnsureRareEvents() {
+        if (!rareEvents_) rareEvents_ = std::make_unique<RareEventCallbacks>();
+        return *rareEvents_;
+    }
+    void OnHoveredChanged(bool hovered) noexcept;
     std::uint16_t fastActiveAnimMask_ = 0u;
     std::array<std::uint8_t, kFastInlinePropertySlotCount> fastInlineRanks_{};
 

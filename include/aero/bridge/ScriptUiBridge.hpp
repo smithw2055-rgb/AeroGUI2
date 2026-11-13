@@ -52,6 +52,8 @@ void SetPendingMainWindowMountTarget(
     const AxbPackage* package);
 
 void ClearPendingMainWindowMountTarget(const ExecutionDomainContext* domains) noexcept;
+void ClearScriptUiDomainState(const ExecutionDomainContext* domains) noexcept;
+void DispatchLoadedToRegisteredDescendants(UIElement* root, bool skipNestedUserControls = true);
 
 struct ReactivePropertyBinding {
     ObjectRef sourceObject{};

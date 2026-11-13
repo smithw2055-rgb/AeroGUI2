@@ -39,7 +39,7 @@ namespace WpfQuickStart
         public string PriorityFilter
         {
             get { return _priorityFilter; }
-            set { SetProperty(ref _priorityFilter, value); }
+            set { SetProperty(ref _priorityFilter, value, nameof(PriorityFilter)); }
         }
 
         public string NewTaskTitle { get; set; } = "";

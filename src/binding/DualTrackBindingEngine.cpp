@@ -1,5 +1,6 @@
 #include "aero/binding/DualTrackBindingEngine.hpp"
 #include "aero/animation/AnimationEngine.hpp"
+#include "aero/bridge/ScriptUiBridge.hpp"
 #include "aero/controls/Controls.hpp"
 #include "aero/core/UiResourceContext.hpp"
 
@@ -508,6 +509,20 @@ bool DualTrackBindingEngine::IsLiveInstance(const DualTrackBindingEngine* engine
 
 DualTrackBindingEngine::~DualTrackBindingEngine() noexcept {
     LiveBindingEngineRegistry::Instance().Unregister(this);
+    bool anyOtherEngineForDomain = false;
+    LiveBindingEngineRegistry::Instance().ForEachLocked(
+        [this, &anyOtherEngineForDomain](const std::vector<DualTrackBindingEngine*>& liveEngines) noexcept {
+            for (const DualTrackBindingEngine* eng : liveEngines) {
+                if (eng && &eng->Domains() == &domains_) {
+                    anyOtherEngineForDomain = true;
+                    break;
+                }
+            }
+        });
+    if (!anyOtherEngineForDomain) {
+        ClearScriptUiDomainState(&domains_);
+    }
+    commandCanExecuteWatchers_.clear();
     rs_rt::unregisterExternalValuePoolRootMarker(this);
     for (auto& binding : trackABindings_) {
         if (binding.targetElement && binding.targetElement->BoundTwoWayEngine() == this) {
@@ -601,6 +616,14 @@ void DualTrackBindingEngine::ScrubDestroyedSourceElement(const UIElement* elem) 
     for (auto& mb : multiBindings_) {
         scrubMultiRec(scrubMultiRec, mb);
     }
+    commandCanExecuteWatchers_.erase(
+        std::remove_if(
+            commandCanExecuteWatchers_.begin(),
+            commandCanExecuteWatchers_.end(),
+            [elem](const CommandCanExecuteWatcherEntry& entry) noexcept {
+                return entry.target == elem;
+            }),
+        commandCanExecuteWatchers_.end());
 }
 
 bool DualTrackBindingEngine::HasAnyBindingTargeting(const UIElement* elem) const noexcept {
@@ -2709,6 +2732,20 @@ std::size_t DualTrackBindingEngine::UnbindSubtree(const UIElement* subtreeRoot) 
     }
     richTextDependents_.resize(rtWriteIdx);
 
+    std::size_t cmdWriteIdx = 0u;
+    for (std::size_t i = 0u; i < commandCanExecuteWatchers_.size(); ++i) {
+        auto& w = commandCanExecuteWatchers_[i];
+        if (w.target && isInSubtree(w.target)) {
+            ++removedCount;
+            continue;
+        }
+        if (cmdWriteIdx != i) {
+            commandCanExecuteWatchers_[cmdWriteIdx] = std::move(w);
+        }
+        ++cmdWriteIdx;
+    }
+    commandCanExecuteWatchers_.resize(cmdWriteIdx);
+
     for (const auto& elem : unboundTargets) {
         if (elem && elem->BoundTwoWayEngine() == this && !HasAnyBindingTargeting(elem.Get())) {
             elem->BindTwoWayEngine(nullptr);
@@ -2819,9 +2856,40 @@ void DualTrackBindingEngine::RegisterRichTextDependent(
     }
 }
 
+void DualTrackBindingEngine::RegisterCommandCanExecuteWatcher(
+    UIElement* target,
+    std::function<void()> watcher) {
+    if (!watcher) {
+        return;
+    }
+    if (target) {
+        target->MarkReferencedAsElementSource();
+        for (auto& existing : commandCanExecuteWatchers_) {
+            if (existing.target == target) {
+                existing.watcher = std::move(watcher);
+                return;
+            }
+        }
+    }
+    commandCanExecuteWatchers_.push_back(CommandCanExecuteWatcherEntry{target, std::move(watcher)});
+}
+
+void DualTrackBindingEngine::EvaluateCommandCanExecuteWatchers() {
+    if (commandCanExecuteWatchers_.empty()) {
+        return;
+    }
+    const std::vector<CommandCanExecuteWatcherEntry> snapshot = commandCanExecuteWatchers_;
+    for (const auto& entry : snapshot) {
+        if (entry.watcher) {
+            entry.watcher();
+        }
+    }
+}
+
 std::size_t DualTrackBindingEngine::FlushTrackA(RuntimeError* error) {
     if (trackABindings_.empty() && elementBindings_.empty() &&
-        multiBindings_.empty() && richTextDependents_.empty()) {
+        multiBindings_.empty() && richTextDependents_.empty() &&
+        commandCanExecuteWatchers_.empty()) {
         return 0;
     }
     std::shared_ptr<UiResourceContext> domainCtx =
@@ -3111,6 +3179,9 @@ std::size_t DualTrackBindingEngine::FlushTrackA(RuntimeError* error) {
         }
     }
 
+    if (!commandCanExecuteWatchers_.empty()) {
+        EvaluateCommandCanExecuteWatchers();
+    }
     if (updatedCount > 0u && wakeHostCallback_) {
         wakeHostCallback_();
     }

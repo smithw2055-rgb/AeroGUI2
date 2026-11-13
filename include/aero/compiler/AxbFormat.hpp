@@ -170,6 +170,7 @@ enum class EasingFunctionKind : std::uint8_t {
     Back = 8,
     Bounce = 9,
     Elastic = 10,
+    Spline = 11,
 };
 
 enum class EasingMode : std::uint8_t {
@@ -189,6 +190,11 @@ struct AxbKeyFrame {
     EasingFunctionKind easingKind = EasingFunctionKind::Linear;
     EasingMode easingMode = EasingMode::EaseOut;
     bool isDiscrete = false;
+    bool hasKeySpline = false;
+    float splineX1 = 0.0f;
+    float splineY1 = 0.0f;
+    float splineX2 = 1.0f;
+    float splineY2 = 1.0f;
     std::string bindingElementName;
     std::uint16_t bindingPropId = 0xFFFFu;
 };
@@ -198,6 +204,9 @@ struct AxbAnimationTimeline {
     std::uint16_t targetPropertyId = 0;
     float beginTimeSeconds = 0.0f;
     float durationSeconds = 0.25f;
+    float speedRatio = 1.0f;
+    float accelerationRatio = 0.0f;
+    float decelerationRatio = 0.0f;
     bool hasFrom = false;
     UnifiedValue fromValue{};
     bool hasTo = false;
@@ -490,6 +499,37 @@ struct AxbMtsdfPathEntry {
     float pxRange = 4.0f;
     // 4-channel RGBA8 MTSDF cell (R,G,B = corner-preserving directional SDF, A = true Euclidean SDF)
     std::vector<std::uint8_t> mtsdfRgbaPixels;
+    // Cached per-row non-zero RGB bounds (transient runtime cache; not serialized into .axb4)
+    std::vector<std::int16_t> rowMinX;
+    std::vector<std::int16_t> rowMaxX;
+
+    void ComputeRowBounds() noexcept {
+        if (cellWidth == 0u || cellHeight == 0u ||
+            mtsdfRgbaPixels.size() < static_cast<std::size_t>(cellWidth) * cellHeight * 4u) {
+            rowMinX.clear();
+            rowMaxX.clear();
+            return;
+        }
+        const int cw = static_cast<int>(cellWidth);
+        const int ch = static_cast<int>(cellHeight);
+        rowMinX.resize(static_cast<std::size_t>(ch));
+        rowMaxX.resize(static_cast<std::size_t>(ch));
+        const std::uint8_t* mBase = mtsdfRgbaPixels.data();
+        for (int ry = 0; ry < ch; ++ry) {
+            const std::uint8_t* rPtr = mBase + static_cast<std::size_t>(ry) * static_cast<std::size_t>(cw) * 4u;
+            std::int16_t rMin = static_cast<std::int16_t>(cw);
+            std::int16_t rMax = -1;
+            for (int rx = 0; rx < cw; ++rx) {
+                const std::uint8_t* p = rPtr + static_cast<std::size_t>(rx) * 4u;
+                if ((p[0] | p[1] | p[2]) != 0u) {
+                    if (rx < rMin) rMin = static_cast<std::int16_t>(rx);
+                    rMax = static_cast<std::int16_t>(rx);
+                }
+            }
+            rowMinX[static_cast<std::size_t>(ry)] = rMin;
+            rowMaxX[static_cast<std::size_t>(ry)] = rMax;
+        }
+    }
 };
 
 struct AxbDataTemplate {

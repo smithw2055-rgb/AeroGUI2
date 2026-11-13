@@ -286,7 +286,8 @@ struct SliderVisualGeometry {
     const float iy = r.y + pad.top;
     const float iw = std::max(0.0f, boxW - (pad.left + pad.right));
     const float ih = std::max(0.0f, boxH - (pad.top + pad.bottom));
-    const float t = slider.NormalizedPosition();
+    const float t = slider.VisualNormalizedPosition();
+    const bool rev = slider.IsDirectionReversed();
 
     SliderVisualGeometry g{};
     if (slider.GetOrientation() == Orientation::Vertical) {
@@ -297,7 +298,9 @@ struct SliderVisualGeometry {
         const float thumbY = iy + (1.0f - t) * usableH;
         const float centerThumbY = thumbY + thumbSize * 0.5f;
         g.trackRect = Rect{trackX, iy, trackThickness, ih};
-        g.fillRect = Rect{trackX, centerThumbY, trackThickness, std::max(0.0f, (iy + ih) - centerThumbY)};
+        g.fillRect = rev
+            ? Rect{trackX, iy, trackThickness, std::max(0.0f, centerThumbY - iy)}
+            : Rect{trackX, centerThumbY, trackThickness, std::max(0.0f, (iy + ih) - centerThumbY)};
         g.thumbRect = Rect{ix + (iw - thumbSize) * 0.5f, thumbY, thumbSize, thumbSize};
     } else {
         const float thumbSize = std::min(16.0f, std::max(8.0f, ih));
@@ -307,7 +310,9 @@ struct SliderVisualGeometry {
         const float thumbX = ix + t * usableW;
         const float centerThumbX = thumbX + thumbSize * 0.5f;
         g.trackRect = Rect{ix, trackY, iw, trackThickness};
-        g.fillRect = Rect{ix, trackY, std::max(0.0f, centerThumbX - ix), trackThickness};
+        g.fillRect = rev
+            ? Rect{centerThumbX, trackY, std::max(0.0f, (ix + iw) - centerThumbX), trackThickness}
+            : Rect{ix, trackY, std::max(0.0f, centerThumbX - ix), trackThickness};
         g.thumbRect = Rect{thumbX, iy + (ih - thumbSize) * 0.5f, thumbSize, thumbSize};
     }
     return g;
@@ -2003,9 +2008,11 @@ void ParseRichTextToPlainAndStyles(
         bool hasCustomColor = false;
         bool bold = false;
         bool italic = false;
+        bool underline = false;
+        bool strikethrough = false;
     };
     std::vector<StyleFrame> stack;
-    stack.push_back(StyleFrame{baseColor, false, false, false});
+    stack.push_back(StyleFrame{baseColor, false, false, false, false, false});
 
     auto appendPlainSegment = [&](std::string_view seg) {
         const StyleFrame& cur = stack.back();
@@ -2014,7 +2021,7 @@ void ParseRichTextToPlainAndStyles(
         std::uint32_t dummyCp = 0u;
         while (DecodeNextUtf8CodePoint(seg, k, dummyCp)) {
             outCodePointStyles.push_back(RichGlyphStyle{
-                cur.color, cur.hasCustomColor, cur.bold, cur.italic});
+                cur.color, cur.hasCustomColor, cur.bold, cur.italic, cur.underline, cur.strikethrough});
         }
     };
 
@@ -2068,6 +2075,10 @@ void ParseRichTextToPlainAndStyles(
                             next.bold = true;
                         } else if (tagName == "i") {
                             next.italic = true;
+                        } else if (tagName == "u") {
+                            next.underline = true;
+                        } else if (tagName == "s") {
+                            next.strikethrough = true;
                         } else if (tagName == "color" && !tagArg.empty()) {
                             next.color = ParseXamlColorLiteral(tagArg);
                             next.hasCustomColor = true;
@@ -4028,9 +4039,24 @@ bool PagedRenderTree::SyncDirtySubtreeRecursive(
     }
 
     if (elem->HasActiveTransform3D() || parentState.hasPerspective3D ||
-        elem->GetEffectKind() != UIEffectKind::None || !blurLayerSpans_.empty()) {
+        elem->GetEffectKind() != UIEffectKind::None) {
         outNeedsFullRebuild = true;
         return false;
+    }
+    if (!blurLayerSpans_.empty() && elem->RenderTreeId() == treeId_ && elem->RenderNodeSpan() > 0u) {
+        const std::uint32_t n0 = elem->RenderNodeId();
+        const std::uint32_t n1 = n0 + elem->RenderNodeSpan();
+        for (const auto& sp : blurLayerSpans_) {
+            if (sp.effectMode == UIEffectKind::BackdropBlur) {
+                if (n0 <= sp.firstNodeId) {
+                    outNeedsFullRebuild = true;
+                    return false;
+                }
+            } else if (n0 < sp.endNodeId && n1 > sp.firstNodeId) {
+                outNeedsFullRebuild = true;
+                return false;
+            }
+        }
     }
 
     // If a new child was dynamically added, a sibling was removed (parent detached), or Visibility transitioned
@@ -4089,7 +4115,7 @@ bool PagedRenderTree::SyncDirtySubtreeRecursive(
         elem->ClearLayoutDirtyFlags(RenderDirty);
     }
 
-    if (elem->IsA<Expander>() || elem->IsA<TabControl>()) {
+    if ((elem->IsA<Expander>() || elem->IsA<TabControl>()) && (flags & RenderDirty) != 0u) {
         outNeedsFullRebuild = true;
         return false;
     }
@@ -5227,6 +5253,51 @@ void PagedRenderTree::TraverseAndEmitElement(
         nodes_[fillId].opacity = effAlpha;
         applyNodeTransform(fillId);
 
+        const std::int32_t tickPlace = slider->GetTickPlacement();
+        if (tickPlace != 0) {
+            std::vector<float> normTicks;
+            slider->CollectNormalizedTicks(normTicks);
+            const Color tickColor{0.68f, 0.74f, 0.84f, 0.85f};
+            const bool isVert = (slider->GetOrientation() == Orientation::Vertical);
+            for (const float nt : normTicks) {
+                if (isVert) {
+                    const float usableH = std::max(0.0f, geom.trackRect.height - geom.thumbRect.height);
+                    const float ty = geom.trackRect.y + geom.thumbRect.height * 0.5f + (1.0f - nt) * usableH;
+                    if ((tickPlace & 1) != 0) {
+                        const std::uint32_t tid = AllocateRenderNode(
+                            geom.trackRect.x - 6.0f, ty - 0.5f, 4.0f, 1.0f, tickColor, 0.0f, 0.0f, elem);
+                        nodes_[tid].opacity = effAlpha;
+                        applyNodeTransform(tid);
+                        ++emittedCount;
+                    }
+                    if ((tickPlace & 2) != 0) {
+                        const std::uint32_t tid = AllocateRenderNode(
+                            geom.trackRect.x + geom.trackRect.width + 2.0f, ty - 0.5f, 4.0f, 1.0f, tickColor, 0.0f, 0.0f, elem);
+                        nodes_[tid].opacity = effAlpha;
+                        applyNodeTransform(tid);
+                        ++emittedCount;
+                    }
+                } else {
+                    const float usableW = std::max(0.0f, geom.trackRect.width - geom.thumbRect.width);
+                    const float tx = geom.trackRect.x + geom.thumbRect.width * 0.5f + nt * usableW;
+                    if ((tickPlace & 1) != 0) {
+                        const std::uint32_t tid = AllocateRenderNode(
+                            tx - 0.5f, geom.trackRect.y - 6.0f, 1.0f, 4.0f, tickColor, 0.0f, 0.0f, elem);
+                        nodes_[tid].opacity = effAlpha;
+                        applyNodeTransform(tid);
+                        ++emittedCount;
+                    }
+                    if ((tickPlace & 2) != 0) {
+                        const std::uint32_t tid = AllocateRenderNode(
+                            tx - 0.5f, geom.trackRect.y + geom.trackRect.height + 2.0f, 1.0f, 4.0f, tickColor, 0.0f, 0.0f, elem);
+                        nodes_[tid].opacity = effAlpha;
+                        applyNodeTransform(tid);
+                        ++emittedCount;
+                    }
+                }
+            }
+        }
+
         const std::uint32_t thumbId = AllocateRenderNode(
             geom.thumbRect.x, geom.thumbRect.y, geom.thumbRect.width, geom.thumbRect.height,
             thumbColor, geom.thumbRect.width * 0.5f, thumbBorder, elem);
@@ -5416,6 +5487,100 @@ void PagedRenderTree::TraverseAndEmitElement(
                     tb->GetTextAlignment(),
                     innerAlignW,
                     richPtr));
+
+            std::int64_t textDeco = 0;
+            const UnifiedValue tdVal = tb->GetValue(PropId_TextDecorations);
+            if (const auto* tdi = std::get_if<std::int64_t>(&tdVal)) {
+                textDeco = *tdi;
+            } else if (const auto* tds = std::get_if<StringValue>(&tdVal)) {
+                const UnifiedValue ptd = ParseBuiltinLiteralPropertyValue(PropId_TextDecorations, tds->view());
+                if (const auto* pi = std::get_if<std::int64_t>(&ptd)) textDeco = *pi;
+            }
+            bool anyRichLine = false;
+            if (richPtr) {
+                for (const auto& rs : *richPtr) {
+                    if (rs.underline || rs.strikethrough) {
+                        anyRichLine = true;
+                        break;
+                    }
+                }
+            }
+            if (!text.empty() && (textDeco != 0 || anyRichLine)) {
+                TextLayoutResult decLayout = MeasureTextLayout(text, fontFamily, fontSize, maxTextW, wrapMode);
+                ApplyTextAlignmentToLayout(decLayout, tb->GetTextAlignment(), innerAlignW);
+                const float lineThick = std::max(1.0f, fontSize * 0.075f);
+                if (!decLayout.glyphs.empty()) {
+                    const std::uint8_t baseMask = static_cast<std::uint8_t>(textDeco & 0x7);
+                    std::size_t cpIdx = 0u;
+                    std::size_t gIdx = 0u;
+                    std::size_t curByte = 0u;
+                    std::uint32_t cp = 0u;
+                    bool inSpan = false;
+                    std::uint8_t curSpanMask = 0u;
+                    float spanX0 = 0.0f, spanX1 = 0.0f, spanBaseY = 0.0f;
+                    auto flushSpan = [&]() {
+                        if (inSpan && curSpanMask != 0u && spanX1 > spanX0 + 0.5f) {
+                            auto emitDecoLine = [&](float ly) {
+                                const std::uint32_t ulId = AllocateRenderNode(
+                                    r.x + pad.left + spanX0, ly, spanX1 - spanX0, lineThick, fg, 0.0f, 0.0f, elem);
+                                nodes_[ulId].opacity = effOpacity;
+                                applyNodeTransform(ulId);
+                                ++emittedCount;
+                            };
+                            if ((curSpanMask & 1u) != 0u) {
+                                emitDecoLine(r.y + pad.top + spanBaseY + fontSize * 0.12f);
+                            }
+                            if ((curSpanMask & 2u) != 0u) {
+                                emitDecoLine(r.y + pad.top + spanBaseY - fontSize * 0.30f);
+                            }
+                            if ((curSpanMask & 4u) != 0u) {
+                                emitDecoLine(r.y + pad.top + spanBaseY - fontSize * 0.82f);
+                            }
+                        }
+                        inSpan = false;
+                        curSpanMask = 0u;
+                    };
+                    while (DecodeNextUtf8CodePoint(text, curByte, cp)) {
+                        if (cp == '\r' || cp == '\n') {
+                            flushSpan();
+                            ++cpIdx;
+                            continue;
+                        }
+                        if (gIdx < decLayout.glyphs.size()) {
+                            const auto& gl = decLayout.glyphs[gIdx++];
+                            const bool richUl = richPtr && cpIdx < richPtr->size() && (*richPtr)[cpIdx].underline;
+                            const bool richSt = richPtr && cpIdx < richPtr->size() && (*richPtr)[cpIdx].strikethrough;
+                            const std::uint8_t gMask = static_cast<std::uint8_t>(
+                                baseMask | (richUl ? 1u : 0u) | (richSt ? 2u : 0u));
+                            if (gMask != 0u) {
+                                if (!inSpan || std::fabs(gl.baselineY - spanBaseY) > 1.0f || gMask != curSpanMask) {
+                                    flushSpan();
+                                    inSpan = true;
+                                    curSpanMask = gMask;
+                                    spanX0 = gl.penX;
+                                    spanBaseY = gl.baselineY;
+                                }
+                                spanX1 = gl.penX + gl.advanceX;
+                            } else {
+                                flushSpan();
+                            }
+                        }
+                        ++cpIdx;
+                    }
+                    flushSpan();
+                } else if (textDeco != 0 && decLayout.totalWidth > 0.5f) {
+                    auto emitFallbackDeco = [&](float lineY) {
+                        const std::uint32_t ulId = AllocateRenderNode(
+                            r.x + pad.left, lineY, decLayout.totalWidth, lineThick, fg, 0.0f, 0.0f, elem);
+                        nodes_[ulId].opacity = effOpacity;
+                        applyNodeTransform(ulId);
+                        ++emittedCount;
+                    };
+                    if ((textDeco & 1) != 0) emitFallbackDeco(r.y + pad.top + fontSize * 1.05f);
+                    if ((textDeco & 2) != 0) emitFallbackDeco(r.y + pad.top + fontSize * 0.58f);
+                    if ((textDeco & 4) != 0) emitFallbackDeco(r.y + pad.top + fontSize * 0.08f);
+                }
+            }
         } else if (emittedCount == 0u) {
             const std::uint32_t anchorId = AllocateRenderNode(
                 r.x, r.y, 0.0f, 0.0f, Color{0.0f, 0.0f, 0.0f, 0.0f}, 0.0f, 0.0f, elem);
@@ -5451,9 +5616,17 @@ void PagedRenderTree::TraverseAndEmitElement(
 
         float fontSize = 14.0f;
         (void)TryGetFloat(combo->GetValue(PropId_FontSize), fontSize);
-        const Color fg = value::TryGetColor(combo->GetValue(PropId_Foreground))
+        Color fg = value::TryGetColor(combo->GetValue(PropId_Foreground))
             .value_or(Color{0.95f, 0.97f, 1.0f, 1.0f});
-        const std::string selText = combo->GetSelectedItemText();
+        std::string selText = combo->GetDisplayText();
+        float textAlpha = effAlpha;
+        if (selText.empty()) {
+            const UnifiedValue phVal = combo->GetValue(PropId_Placeholder);
+            if (const auto* ph = std::get_if<StringValue>(&phVal); ph && !ph->view().empty()) {
+                selText = ph->str();
+                textAlpha = effAlpha * 0.52f;
+            }
+        }
         emittedCount = static_cast<std::uint16_t>(
             emittedCount + EmitTextRunNodes(
                 r.x + 8.0f,
@@ -5461,7 +5634,7 @@ void PagedRenderTree::TraverseAndEmitElement(
                 fontSize,
                 selText,
                 fg,
-                effAlpha,
+                textAlpha,
                 curState,
                 elem,
                 ResolveElementFontFamily(combo)));

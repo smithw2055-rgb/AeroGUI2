@@ -6,6 +6,9 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
+#include <mutex>
+#include <unordered_map>
 
 namespace aero {
 
@@ -2411,13 +2414,66 @@ bool DecodeImageFromFile(
     std::string_view filePath,
     DecodedImage& outImage,
     std::string* outError) {
+    struct CachedDecodedEntry {
+        std::uintmax_t fileSize = 0u;
+        std::int64_t mtimeTick = 0;
+        DecodedImage image{};
+    };
+    static std::mutex sDecodeCacheMutex;
+    static std::unordered_map<std::string, CachedDecodedEntry> sDecodeCache;
+
+    std::error_code ec;
+    const std::filesystem::path fsPath(filePath);
+    std::filesystem::path normPath = std::filesystem::weakly_canonical(fsPath, ec);
+    if (ec) {
+        ec.clear();
+        normPath = fsPath.lexically_normal();
+    }
+    std::string keyStr = normPath.generic_string();
+#ifdef _WIN32
+    for (char& ch : keyStr) {
+        if (ch >= 'A' && ch <= 'Z') {
+            ch = static_cast<char>(ch - 'A' + 'a');
+        }
+    }
+#endif
+    const std::uintmax_t fSize = std::filesystem::file_size(fsPath, ec);
+    std::int64_t mtimeTick = 0;
+    if (!ec) {
+        const auto ftime = std::filesystem::last_write_time(fsPath, ec);
+        if (!ec) {
+            mtimeTick = static_cast<std::int64_t>(ftime.time_since_epoch().count());
+        }
+    }
+    if (!ec && fSize > 0u) {
+        std::lock_guard<std::mutex> lock(sDecodeCacheMutex);
+        const auto it = sDecodeCache.find(keyStr);
+        if (it != sDecodeCache.end() &&
+            it->second.fileSize == fSize &&
+            it->second.mtimeTick == mtimeTick &&
+            it->second.image.width > 0u) {
+            outImage = it->second.image;
+            return true;
+        }
+    }
+
     std::vector<std::uint8_t> bytes;
     if (!ReadAllFileBytes(std::string(filePath), bytes)) {
         outImage = DecodedImage{};
         SetError(outError, "Failed to open or read image file.");
         return false;
     }
-    return DecodeImageFromMemory(bytes.data(), bytes.size(), outImage, outError);
+    if (!DecodeImageFromMemory(bytes.data(), bytes.size(), outImage, outError)) {
+        return false;
+    }
+    if (!ec && fSize > 0u && outImage.rgbaPixels.size() <= 32u * 1024u * 1024u) {
+        std::lock_guard<std::mutex> lock(sDecodeCacheMutex);
+        if (sDecodeCache.size() >= 64u) {
+            sDecodeCache.clear();
+        }
+        sDecodeCache[keyStr] = CachedDecodedEntry{fSize, mtimeTick, outImage};
+    }
+    return true;
 }
 
 // ============================================================================

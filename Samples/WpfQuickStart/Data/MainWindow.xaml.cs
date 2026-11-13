@@ -7,12 +7,25 @@ namespace WpfQuickStart
     public partial class MainWindow : Window
     {
         private TaskBoardViewModel _vm;
+        public int ProgrammaticClickCount { get; set; } = 0;
 
         public MainWindow()
         {
             InitializeComponent();
             _vm = new TaskBoardViewModel();
             DataContext = _vm;
+
+            QuickFillButton.Click += OnQuickFillProgrammatic;
+        }
+
+        private void OnQuickFillProgrammatic(object sender, RoutedEventArgs e)
+        {
+            ProgrammaticClickCount = ProgrammaticClickCount + 1;
+        }
+
+        public void ToggleNavVisibility(bool visible)
+        {
+            NavBorder.Visibility = visible ? Visibility.Visible : Visibility.Collapsed;
         }
 
         public void QuickFillButton_Click(object sender, RoutedEventArgs e)

@@ -65,6 +65,7 @@ TypeClass gButtonTypeClass{};
 bool gBuiltinTypesInitialized = false;
 std::atomic<UIElementDestroyHook> gElementDestroyHook{nullptr};
 std::atomic<UIElementLocSourceHook> gElementLocSourceHook{nullptr};
+std::atomic<UIElement::WrapperDestroyFn> gWrapperDestroyCallback{nullptr};
 std::atomic<std::uint64_t> gTotalConstructedUIElements{0};
 std::atomic<std::uint64_t> gTotalDestroyedUIElements{0};
 
@@ -381,6 +382,12 @@ UIElement::~UIElement() {
     if (registeredInValuePoolSet_) {
         LiveTraceableUIElementRegistry::Instance().Unregister(this);
         registeredInValuePoolSet_ = false;
+    }
+    if (hasRegisteredScriptWrapper_) {
+        if (const auto wrapperDestroyFn = gWrapperDestroyCallback.load(std::memory_order_acquire)) {
+            wrapperDestroyFn(this);
+        }
+        hasRegisteredScriptWrapper_ = false;
     }
     DetachRenderNodeSpan();
     boundBindingEngine_ = nullptr;
@@ -853,8 +860,100 @@ bool UIElement::OnTextInput(std::string_view utf8Text) {
     return false;
 }
 
+namespace {
+UIElement::WrapperRoutedEventFn gWrapperRoutedEventDispatcher = nullptr;
+} // namespace
+
+void UIElement::SetWrapperRoutedEventDispatcher(WrapperRoutedEventFn fn) noexcept {
+    gWrapperRoutedEventDispatcher = fn;
+}
+
+void UIElement::SetWrapperDestroyCallback(WrapperDestroyFn fn) noexcept {
+    gWrapperDestroyCallback.store(fn, std::memory_order_release);
+}
+
+bool UIElement::DispatchWrapperRoutedEvent(
+    std::string_view eventName,
+    const UnifiedValue& argVal,
+    bool hasArg) {
+    if (!hasRegisteredScriptWrapper_ || !gWrapperRoutedEventDispatcher) {
+        return false;
+    }
+    return gWrapperRoutedEventDispatcher(this, eventName, argVal, hasArg);
+}
+
+void UIElement::OnHoveredChanged(bool hovered) noexcept {
+    if (!rareEvents_ && !hasRegisteredScriptWrapper_) {
+        return;
+    }
+    if (hovered) {
+        if (rareEvents_ && rareEvents_->mouseEnter) {
+            (void)rareEvents_->mouseEnter(*this);
+        }
+        (void)DispatchWrapperRoutedEvent("MouseEnter");
+    } else {
+        if (rareEvents_ && rareEvents_->mouseLeave) {
+            (void)rareEvents_->mouseLeave(*this);
+        }
+        (void)DispatchWrapperRoutedEvent("MouseLeave");
+    }
+}
+
+bool UIElement::InvokeMouseEnterBubble() {
+    bool h = false;
+    if (rareEvents_ && rareEvents_->mouseEnter) {
+        h = rareEvents_->mouseEnter(*this) || h;
+    }
+    if (hasRegisteredScriptWrapper_) {
+        h = DispatchWrapperRoutedEvent("MouseEnter") || h;
+    }
+    return h;
+}
+
+bool UIElement::InvokeMouseLeaveBubble() {
+    bool h = false;
+    if (rareEvents_ && rareEvents_->mouseLeave) {
+        h = rareEvents_->mouseLeave(*this) || h;
+    }
+    if (hasRegisteredScriptWrapper_) {
+        h = DispatchWrapperRoutedEvent("MouseLeave") || h;
+    }
+    return h;
+}
+
+bool UIElement::InvokeMouseDownCallback() {
+    bool h = false;
+    if (rareEvents_ && rareEvents_->mouseDown) {
+        h = rareEvents_->mouseDown(*this) || h;
+    }
+    if (hasRegisteredScriptWrapper_) {
+        h = DispatchWrapperRoutedEvent("MouseLeftButtonDown") || h;
+    }
+    return h;
+}
+
+bool UIElement::InvokeMouseUpCallback() {
+    bool h = false;
+    if (rareEvents_ && rareEvents_->mouseUp) {
+        h = rareEvents_->mouseUp(*this) || h;
+    }
+    if (hasRegisteredScriptWrapper_) {
+        h = DispatchWrapperRoutedEvent("MouseLeftButtonUp") || h;
+    }
+    return h;
+}
+
 void UIElement::OnFocusChanged(bool focused) {
-    (void)focused;
+    if (rareEvents_) {
+        if (focused && rareEvents_->gotFocus) {
+            (void)rareEvents_->gotFocus(*this);
+        } else if (!focused && rareEvents_->lostFocus) {
+            (void)rareEvents_->lostFocus(*this);
+        }
+    }
+    if (hasRegisteredScriptWrapper_) {
+        (void)DispatchWrapperRoutedEvent(focused ? "GotFocus" : "LostFocus");
+    }
 }
 
 void UIElement::OnPointerCaptureLost() noexcept {}
@@ -1945,6 +2044,8 @@ UnifiedValue UIElement::GetValue(std::uint16_t propId) const {
             return IsEnabled();
         case PropId_Focusable:
             return IsFocusable();
+        case PropId_IsHitTestVisible:
+            return IsHitTestVisible();
         case PropId_ActualWidth: {
             if (finalRect_.width > 0.0f || finalRect_.height > 0.0f) {
                 return MakeFloat(finalRect_.width);
@@ -2136,6 +2237,11 @@ bool UIElement::SetValue(
                 return true;
             }
             return false;
+        case PropId_IsHitTestVisible:
+            if (TryCoerceBoolValue(value, boolVal)) {
+                SetIsHitTestVisible(boolVal);
+            }
+            break;
         case PropId_RenderTransform:
             if (const auto* sv = std::get_if<StringValue>(&value)) {
                 const Matrix2D m = ParseXamlMatrix2DLiteral(sv->str());
@@ -2537,6 +2643,9 @@ bool UIElement::ClearValue(std::uint16_t propId, ValueSourceRank rank) {
         fastInlineRanks_[11] = static_cast<std::uint8_t>(ValueSourceRank::Default);
         OnPropertyChanged(propId, std::monostate{});
         return true;
+    case PropId_IsHitTestVisible:
+        SetIsHitTestVisible(true);
+        break;
     default:
         break;
     }
@@ -2773,6 +2882,7 @@ bool Button::PerformClick(RuntimeError* error) {
     if (clickCallback_) {
         clickCallback_(*this);
     }
+    (void)DispatchWrapperRoutedEvent("Click");
     if (scriptTargetObject_.valid() && scriptClickMethodId_ != 0) {
         std::vector<UnifiedValue> args;
         args.push_back(scriptTargetObject_);

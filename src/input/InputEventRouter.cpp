@@ -311,6 +311,19 @@ void InputEventRouter::UpdateHoveredTarget(UIElement* newHovered) noexcept {
     if (hoveredElement_.Get() == newHovered) {
         return;
     }
+    UIElement* const prevHovered = hoveredElement_.Get();
+    UIElement* oldChain[64];
+    std::size_t oldLen = 0u;
+    for (UIElement* c = hoveredElement_ ? hoveredElement_->Parent() : nullptr; c != nullptr && oldLen < 64u; c = c->Parent()) {
+        oldChain[oldLen++] = c;
+        if (c == rootVisual_) break;
+    }
+    UIElement* newChain[64];
+    std::size_t newLen = 0u;
+    for (UIElement* c = newHovered ? newHovered->Parent() : nullptr; c != nullptr && newLen < 64u; c = c->Parent()) {
+        newChain[newLen++] = c;
+        if (c == rootVisual_) break;
+    }
     if (hoveredElement_) {
         hoveredElement_->SetHovered(false);
         if (animationEngine_) {
@@ -326,12 +339,24 @@ void InputEventRouter::UpdateHoveredTarget(UIElement* newHovered) noexcept {
     UIElement* newOwner = nullptr;
     ToolTip* explicitTt = nullptr;
     std::string autoTipText;
+    for (std::size_t oi = 0u; oi < oldLen; ++oi) {
+        UIElement* oc = oldChain[oi];
+        if (oc != newHovered && std::find(newChain, newChain + newLen, oc) == newChain + newLen) {
+            (void)oc->InvokeMouseLeaveBubble();
+        }
+    }
     if (hoveredElement_) {
         hoveredElement_->SetHovered(true);
         if (animationEngine_) {
             (void)animationEngine_->DispatchPointerListenerEvent(
                 hoveredElement_.Get(),
                 SmListenerEventKind::PointerEnter);
+        }
+        for (std::size_t ni = 0u; ni < newLen; ++ni) {
+            UIElement* nc = newChain[ni];
+            if (nc != prevHovered && std::find(oldChain, oldChain + oldLen, nc) == oldChain + oldLen) {
+                (void)nc->InvokeMouseEnterBubble();
+            }
         }
         for (UIElement* anc = hoveredElement_.Get(); anc != nullptr; anc = anc->Parent()) {
             for (UIElement* c = anc->FirstChild(); c != nullptr; c = c->NextSibling()) {
@@ -654,7 +679,18 @@ bool InputEventRouter::DispatchPointerDown(
 
     bool requestCapture = false;
     const Point localPt = target->ScreenToLocal(position);
-    const bool handled = target->OnPointerDown(localPt, button, modifiers, requestCapture);
+    const bool targetHandled = target->OnPointerDown(localPt, button, modifiers, requestCapture);
+    bool bubbledDownHandled = false;
+    if (button == PointerButton::Left) {
+        for (UIElement* walk = rawHit ? rawHit : target; walk != nullptr; walk = walk->Parent()) {
+            if (walk->InvokeMouseDownCallback()) {
+                bubbledDownHandled = true;
+                break;
+            }
+            if (walk == rootVisual_) break;
+        }
+    }
+    const bool handled = targetHandled || bubbledDownHandled;
 
     if (auto* combo = target->DynamicCast<ComboBox>()) {
         if (combo->IsDropDownOpen()) {
@@ -710,6 +746,15 @@ bool InputEventRouter::DispatchPointerUp(
         }
         if (target->IsEffectivelyEnabled()) {
             handled = target->OnPointerUp(localPt, button, modifiers, inside);
+            if (button == PointerButton::Left) {
+                for (UIElement* walk = target.Get(); walk != nullptr; walk = walk->Parent()) {
+                    if (walk->InvokeMouseUpCallback()) {
+                        handled = true;
+                        break;
+                    }
+                    if (walk == rootVisual_) break;
+                }
+            }
         }
         if (openContextMenu_) {
             const UnifiedValue openVal = openContextMenu_->GetValue(PropId_IsOpen);

@@ -53,7 +53,9 @@ void PreRegisterLocalUserControlsAndDictionaries(
     const fs::path& searchDir,
     const fs::path& skipMainXaml,
     const fs::path& skipAppXaml,
-    const std::vector<std::string>& resourceSearchPaths) {
+    const std::vector<std::string>& resourceSearchPaths,
+    const std::vector<SourceFile>& discoveredScripts,
+    std::vector<SourceFile>& outGeneratedUserControlStubs) {
     std::error_code ec;
     if (!fs::is_directory(searchDir, ec)) return;
     std::vector<fs::path> xamls;
@@ -128,6 +130,185 @@ void PreRegisterLocalUserControlsAndDictionaries(
         subIn.autoMergeGlobalResources = false;
         AeroCompileResult subRes = compiler.Compile(subIn);
         if (!subRes.succeeded) continue;
+        if (rootTag == "UserControl" && !subRes.axbPackage.className.empty() && !discoveredScripts.empty()) {
+            std::string shortUc = subRes.axbPackage.className;
+            std::string modUc = "Aero.UI";
+            if (const auto dot = shortUc.rfind('.'); dot != std::string::npos) {
+                modUc = shortUc.substr(0u, dot);
+                shortUc = shortUc.substr(dot + 1u);
+            }
+            auto isIdentCh = [](unsigned char c) noexcept -> bool {
+                return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_';
+            };
+            auto stripCommentsAndStrings = [](std::string_view src) -> std::string {
+                std::string out;
+                out.reserve(src.size());
+                bool inStr = false;
+                for (std::size_t i = 0u; i < src.size(); ++i) {
+                    if (inStr) {
+                        out.push_back(' ');
+                        if (src[i] == '\\' && i + 1u < src.size()) {
+                            out.push_back(' ');
+                            ++i;
+                        } else if (src[i] == '"') {
+                            inStr = false;
+                        }
+                        continue;
+                    }
+                    if (src[i] == '"') {
+                        inStr = true;
+                        out.push_back(' ');
+                    } else if (src[i] == '/' && i + 1u < src.size() && src[i + 1u] == '/') {
+                        while (i < src.size() && src[i] != '\n') ++i;
+                        out.push_back('\n');
+                    } else if (src[i] == '/' && i + 1u < src.size() && src[i + 1u] == '*') {
+                        i += 2u;
+                        while (i + 1u < src.size() && !(src[i] == '*' && src[i + 1u] == '/')) ++i;
+                        ++i;
+                        out.push_back(' ');
+                    } else {
+                        out.push_back(src[i]);
+                    }
+                }
+                return out;
+            };
+            const std::string needle = "class " + shortUc;
+            bool ucHasUserCs = false;
+            bool ucUserHasBase = false;
+            bool ucUserDefinesInitComp = false;
+            bool ucUserDefinesDataContext = false;
+            for (const auto& usf : discoveredScripts) {
+                const std::string clean = stripCommentsAndStrings(usf.content);
+                std::size_t pos = 0u;
+                while ((pos = clean.find(needle, pos)) != std::string::npos) {
+                    const bool leftOk = (pos == 0u) || !isIdentCh(static_cast<unsigned char>(clean[pos - 1u]));
+                    const std::size_t after = pos + needle.size();
+                    const bool rightOk = (after >= clean.size()) || !isIdentCh(static_cast<unsigned char>(clean[after]));
+                    pos = after;
+                    if (!leftOk || !rightOk) {
+                        continue;
+                    }
+                    ucHasUserCs = true;
+                    const std::size_t openBrace = clean.find('{', after);
+                    if (openBrace != std::string::npos) {
+                        std::string_view header = std::string_view(clean).substr(after, openBrace - after);
+                        while (!header.empty() && (header.front() == ' ' || header.front() == '\t' || header.front() == '\r' || header.front() == '\n')) {
+                            header.remove_prefix(1u);
+                        }
+                        if (!header.empty() && header.front() == ':') {
+                            ucUserHasBase = true;
+                        }
+                        int depth = 1;
+                        std::size_t bi = openBrace + 1u;
+                        for (; bi < clean.size() && depth > 0; ++bi) {
+                            if (clean[bi] == '{') ++depth;
+                            else if (clean[bi] == '}') --depth;
+                        }
+                        const std::string_view body = std::string_view(clean).substr(openBrace, bi - openBrace);
+                        if (body.find("void InitializeComponent(") != std::string_view::npos ||
+                            body.find("void InitializeComponent (") != std::string_view::npos) {
+                            ucUserDefinesInitComp = true;
+                        }
+                        std::size_t dPos = 0u;
+                        while ((dPos = body.find("DataContext", dPos)) != std::string_view::npos) {
+                            const bool dl = (dPos == 0u) || !isIdentCh(static_cast<unsigned char>(body[dPos - 1u]));
+                            const std::size_t da = dPos + 11u;
+                            const bool dr = (da >= body.size()) || !isIdentCh(static_cast<unsigned char>(body[da]));
+                            dPos = da;
+                            if (!dl || !dr) continue;
+                            std::size_t k = da;
+                            while (k < body.size() && (body[k] == ' ' || body[k] == '\t' || body[k] == '\r' || body[k] == '\n')) ++k;
+                            if (k < body.size() && body[k] == '{') {
+                                ucUserDefinesDataContext = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            if (ucHasUserCs) {
+                const std::string ucLeaf = xp.filename().string();
+                std::string ucStub = "// Auto-generated UserControl stub for " + xp.string() + "\n";
+                ucStub += "module " + modUc + ";\n";
+                if (modUc != "Aero.UI") ucStub += "import Aero.UI;\n";
+                ucStub += "\n[Observable]\npublic partial class " + shortUc + (ucUserHasBase ? "\n{\n" : " : UserControl\n{\n");
+                ucStub += "    private bool __aero_premounted = false;\n";
+                ucStub += "    private bool __aero_component_loaded = false;\n";
+                ucStub += "    private void __AeroEnsureLoaded() { if (!this.__aero_component_loaded && !this.__aero_premounted) { this.__aero_component_loaded = true; Aero_LoadComponent__" +
+                          shortUc + "(this, \"" + ucLeaf + "\"); } }\n";
+                auto mapUcTag = [](std::string_view rt) -> std::string {
+                    if (const auto c = rt.rfind(':'); c != std::string_view::npos) rt = rt.substr(c + 1u);
+                    if (rt == "Window") return "Window";
+                    if (rt == "UserControl") return "UserControl";
+                    if (rt == "Page") return "Page";
+                    if (rt == "Button") return "Button";
+                    if (rt == "RepeatButton") return "RepeatButton";
+                    if (rt == "CheckBox") return "CheckBox";
+                    if (rt == "RadioButton") return "RadioButton";
+                    if (rt == "ToggleButton") return "ToggleButton";
+                    if (rt == "Hyperlink") return "Hyperlink";
+                    if (rt == "TextBlock" || rt == "Label") return "TextBlock";
+                    if (rt == "TextBox") return "TextBox";
+                    if (rt == "PasswordBox") return "PasswordBox";
+                    if (rt == "Slider") return "Slider";
+                    if (rt == "ProgressBar") return "ProgressBar";
+                    if (rt == "ListBox") return "ListBox";
+                    if (rt == "ListView") return "ListView";
+                    if (rt == "ComboBox") return "ComboBox";
+                    if (rt == "Expander") return "Expander";
+                    if (rt == "Border") return "Border";
+                    if (rt == "Grid") return "Grid";
+                    if (rt == "StackPanel" || rt == "VirtualizingStackPanel") return "StackPanel";
+                    if (rt == "DockPanel") return "DockPanel";
+                    if (rt == "WrapPanel") return "WrapPanel";
+                    if (rt == "UniformGrid") return "UniformGrid";
+                    if (rt == "ScrollViewer") return "ScrollViewer";
+                    if (rt == "Canvas") return "Canvas";
+                    if (rt == "Image") return "Image";
+                    if (rt == "GroupBox" || rt == "HeaderedContentControl") return "GroupBox";
+                    if (rt == "TabControl") return "TabControl";
+                    if (rt == "TabItem") return "TabItem";
+                    if (rt == "TreeView") return "TreeView";
+                    if (rt == "TreeViewItem") return "TreeViewItem";
+                    if (rt == "Menu") return "Menu";
+                    if (rt == "MenuItem") return "MenuItem";
+                    if (rt == "ToolBar") return "ToolBar";
+                    if (rt == "StatusBar") return "StatusBar";
+                    if (rt == "StatusBarItem") return "StatusBarItem";
+                    if (rt == "Popup") return "Popup";
+                    if (rt == "ToolTip") return "ToolTip";
+                    if (rt == "ContextMenu") return "ContextMenu";
+                    if (rt == "GridSplitter") return "GridSplitter";
+                    if (rt == "RiveControl") return "RiveControl";
+                    if (rt == "ContentControl") return "ContentControl";
+                    return "FrameworkElement";
+                };
+                for (const auto& nc : subRes.axbPackage.namedControls) {
+                    if (nc.name.empty()) continue;
+                    const std::string st = mapUcTag(nc.typeName);
+                    ucStub += "    public handle __aero_handle_" + nc.name + ";\n";
+                    ucStub += "    private " + st + " __aero_cache_" + nc.name + " = null;\n";
+                    ucStub += "    public " + st + " " + nc.name + " { get { "
+                              "this.__AeroEnsureLoaded(); "
+                              "if (this.__aero_cache_" + nc.name + " == null) { " + st + " w = new " + st + "(); "
+                              "w.__nativeRootHandle = this.__aero_handle_" + nc.name + "; "
+                              "UIElement_RegisterWrapper(this.__aero_handle_" + nc.name + ", w); "
+                              "this.__aero_cache_" + nc.name + " = w; } else { "
+                              "this.__aero_cache_" + nc.name + ".__nativeRootHandle = this.__aero_handle_" + nc.name + "; "
+                              "UIElement_RegisterWrapper(this.__aero_handle_" + nc.name + ", this.__aero_cache_" + nc.name + "); } "
+                              "return this.__aero_cache_" + nc.name + "; } }\n";
+                }
+                if (!ucUserDefinesInitComp) {
+                    ucStub += "    public void InitializeComponent() { }\n";
+                }
+                if (!ucUserDefinesDataContext) {
+                    ucStub += "    public object DataContext { get { return GUI_GetDataContextObject(this); } set { GUI_SetDataContextObject(this, value); } }\n";
+                }
+                ucStub += "}\n";
+                ucStub += "public bool Aero_LoadComponent__" + shortUc + "(" + shortUc + " component, string uri) { return false; }\n";
+                outGeneratedUserControlStubs.push_back(SourceFile{shortUc + ".g.rs", std::move(ucStub)});
+            }
+        }
         AxbTemplateRegistry::Instance().Register(xp.filename().string(), subRes.axbPackage);
         if (!subRes.axbPackage.className.empty()) {
             AxbTemplateRegistry::Instance().Register(subRes.axbPackage.className, subRes.axbPackage);
@@ -239,9 +420,6 @@ bool XamlApplication::Load(const XamlApplicationOptions& options, std::string* o
         return false;
     }
 
-    PreRegisterLocalUserControlsAndDictionaries(
-        compiler, windowXamlPath.parent_path(), windowXamlPath, appXamlPath, options.resourceSearchPaths);
-
     AeroCompileInput winIn{};
     winIn.xamlPath = windowXamlPath.string();
     winIn.xamlContent = std::move(winXml);
@@ -263,6 +441,19 @@ bool XamlApplication::Load(const XamlApplicationOptions& options, std::string* o
         if (ReadUtf8File(extraPath, rsContent)) {
             winIn.scriptSources.push_back(SourceFile{extraPath, std::move(rsContent)});
         }
+    }
+
+    std::vector<SourceFile> ucStubs;
+    PreRegisterLocalUserControlsAndDictionaries(
+        compiler,
+        windowXamlPath.parent_path(),
+        windowXamlPath,
+        appXamlPath,
+        options.resourceSearchPaths,
+        winIn.scriptSources,
+        ucStubs);
+    for (auto& us : ucStubs) {
+        winIn.scriptSources.push_back(std::move(us));
     }
 
     compileResult_ = compiler.Compile(winIn);
@@ -326,6 +517,79 @@ bool XamlApplication::Load(const XamlApplicationOptions& options, std::string* o
         factoryCands.push_back("CreateMainWindow");
         if (!classModulePrefix.empty()) factoryCands.push_back(classModulePrefix + "::CreateViewModel");
         factoryCands.push_back("CreateViewModel");
+
+        // Instantiate WPF App : Application (App.xaml.cs) if present and invoke OnStartup(StartupEventArgs)
+        if (!appDictPkg.className.empty() || hasAppDict) {
+            std::string appModPrefix;
+            std::string appShortName = appDictPkg.className.empty() ? std::string("App") : appDictPkg.className;
+            if (const auto dotPos = appShortName.rfind('.'); dotPos != std::string::npos) {
+                appModPrefix = appShortName.substr(0u, dotPos);
+                appShortName = appShortName.substr(dotPos + 1u);
+            }
+            const rs_sem::TypeSymbol* appSym = nullptr;
+            const rs_sem::TypeSymbol* startupArgsSym = nullptr;
+            for (const auto& mod : compileResult_.programImage->modules()) {
+                for (const auto& ts : mod.types) {
+                    if (mod.name == "Aero.UI" && ts.name == "StartupEventArgs") {
+                        startupArgsSym = &ts;
+                    }
+                    if ((appModPrefix.empty() || mod.name == appModPrefix) && ts.name == appShortName) {
+                        appSym = &ts;
+                    }
+                }
+            }
+            if (appSym) {
+                RuntimeError aErr{};
+                std::vector<UnifiedValue> initF(appSym->fields.size(), UnifiedValue(NullObject{}));
+                std::vector<std::size_t> refF;
+                for (std::size_t fi = 0u; fi < appSym->fields.size(); ++fi) {
+                    if (appSym->fields[fi].name == "StartupUri") {
+                        if (auto sr = domains_.uiHeap().allocateString(resolvedStartupUri_, &aErr)) {
+                            initF[fi] = UnifiedValue(*sr);
+                        }
+                    }
+                    if (appSym->fields[fi].type == rs_sem::PrimitiveType::Object ||
+                        appSym->fields[fi].type == rs_sem::PrimitiveType::String ||
+                        appSym->fields[fi].type == rs_sem::PrimitiveType::Array) {
+                        refF.push_back(fi);
+                    }
+                }
+                if (auto appOpt = domains_.uiHeap().allocateObject(appSym->id, std::move(initF), std::move(refF), &aErr)) {
+                    appObj_ = *appOpt;
+                    appPin_ = domains_.uiHeap().retain(appObj_);
+                    rs_rt::ExecutionOptions execOpts{};
+                    execOpts.limits.instructionBudget = 5'000'000;
+                    for (const auto& m : appSym->methods) {
+                        if ((m.name == ".ctor" || m.name == appSym->name) && !m.staticMethod && m.parameters.empty() && m.id != 0) {
+                            (void)interpreter_->invoke(m.id, {appObj_}, execOpts);
+                            break;
+                        }
+                    }
+                    for (const auto& m : appSym->methods) {
+                        if (m.name == "OnStartup" && !m.staticMethod && m.id != 0) {
+                            if (m.parameters.size() == 1u) {
+                                (void)interpreter_->invoke(m.id, {appObj_}, execOpts);
+                            } else if (m.parameters.size() == 2u && startupArgsSym) {
+                                std::vector<UnifiedValue> sf(startupArgsSym->fields.size(), UnifiedValue(NullObject{}));
+                                std::vector<std::size_t> srf;
+                                for (std::size_t fi = 0u; fi < startupArgsSym->fields.size(); ++fi) {
+                                    if (startupArgsSym->fields[fi].name == "Handled") sf[fi] = UnifiedValue(false);
+                                    if (startupArgsSym->fields[fi].type == rs_sem::PrimitiveType::Object ||
+                                        startupArgsSym->fields[fi].type == rs_sem::PrimitiveType::String ||
+                                        startupArgsSym->fields[fi].type == rs_sem::PrimitiveType::Array) {
+                                        srf.push_back(fi);
+                                    }
+                                }
+                                if (auto sArg = domains_.uiHeap().allocateObject(startupArgsSym->id, std::move(sf), std::move(srf), &aErr)) {
+                                    (void)interpreter_->invoke(m.id, {appObj_, *sArg}, execOpts);
+                                }
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
+        }
 
         SetPendingMainWindowMountTarget(&domains_, rootElement_.Get(), &compileResult_.axbPackage);
 
@@ -425,6 +689,8 @@ bool XamlApplication::Load(const XamlApplicationOptions& options, std::string* o
 
     inputRouter_ = std::make_unique<InputEventRouter>(rootElement_.Get());
     inputRouter_->SetAnimationEngine(animationEngine_.get());
+    initialLayoutDone_ = false;
+    renderTree_.Clear();
 
     Tick(0.0f);
     return true;
@@ -432,24 +698,58 @@ bool XamlApplication::Load(const XamlApplicationOptions& options, std::string* o
 
 void XamlApplication::Tick(float dtSeconds) {
     if (!rootElement_) return;
+    std::size_t inputCount = 0u;
     if (inputRouter_) {
-        (void)inputRouter_->FlushQueuedEvents();
+        inputCount = inputRouter_->FlushQueuedEvents();
         inputRouter_->Tick(dtSeconds);
     }
+    std::size_t bindUpdates = 0u;
     if (bindingEngine_) {
-        (void)bindingEngine_->FlushTrackA();
+        bindUpdates = bindingEngine_->FlushTrackA();
     }
+    std::size_t animUpdates = 0u;
     if (animationEngine_ && dtSeconds > 0.0f) {
-        animationEngine_->Tick(dtSeconds);
+        (void)animationEngine_->EvaluateStateMachines(dtSeconds);
+        animUpdates = animationEngine_->Tick(dtSeconds);
     }
-    if (styleEngine_) {
+    const std::uint8_t preFlags = rootElement_->GetLayoutDirtyFlags();
+    if (styleEngine_ && (!initialLayoutDone_ || inputCount > 0u || bindUpdates > 0u || animUpdates > 0u || preFlags != 0u)) {
         (void)styleEngine_->EvaluateAndApply();
     }
-    rootElement_->Measure(Size{viewportW_, viewportH_});
-    rootElement_->Arrange(Rect{0.0f, 0.0f, viewportW_, viewportH_});
-    if (bindingEngine_) {
-        (void)bindingEngine_->FlushTrackA();
+    const std::uint8_t layFlags = rootElement_->GetLayoutDirtyFlags();
+    if (!initialLayoutDone_ ||
+        (layFlags & (MeasureDirty | ArrangeDirty | SubtreeLayoutDirty)) != 0u) {
+        rootElement_->Measure(Size{viewportW_, viewportH_});
+        rootElement_->Arrange(Rect{0.0f, 0.0f, viewportW_, viewportH_});
+        initialLayoutDone_ = true;
+        if (bindingEngine_) {
+            (void)bindingEngine_->FlushTrackA();
+        }
     }
+    if (renderTree_.NodeCount() > 0u) {
+        (void)renderTree_.SyncVisualTree(rootElement_.Get());
+    }
+}
+
+void XamlApplication::RasterizeToRgba8(std::vector<std::uint8_t>& outRgba8, Color clearColor) {
+    if (!rootElement_) {
+        outRgba8.clear();
+        return;
+    }
+    if (!initialLayoutDone_) {
+        Tick(0.0f);
+    }
+    if (renderTree_.NodeCount() == 0u) {
+        renderTree_.BuildFromVisualTree(rootElement_.Get());
+    } else {
+        (void)renderTree_.SyncVisualTree(rootElement_.Get());
+    }
+    ZeroCopyGpuStream::RasterizeTreeToRgba8(
+        renderTree_,
+        static_cast<std::uint32_t>(std::max(1.0f, viewportW_)),
+        static_cast<std::uint32_t>(std::max(1.0f, viewportH_)),
+        outRgba8,
+        clearColor);
 }
 
 } // namespace aero

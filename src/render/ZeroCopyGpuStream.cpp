@@ -1621,26 +1621,42 @@ void SeparableBoxBlurPremul3Pass(PremulOffscreenLayer& layer, int boxRadius) {
             blurRowsFn(0, h);
         }
 
-        // Cache-friendly row-major vertical 1D sliding-window box blur: tlScratch -> premulRgba
-        float* colSums = tlColSums.data();
-        std::fill_n(colSums, rowFloats, 0.0f);
-        for (int k = -boxRadius; k <= boxRadius; ++k) {
-            const int sy = std::clamp(k, 0, h - 1);
-            const float* srcRow = tlScratch.data() + static_cast<std::size_t>(sy) * rowFloats;
-            for (std::size_t i = 0u; i < rowFloats; ++i) {
-                colSums[i] += srcRow[i];
+        // Cache-friendly parallel column-striped vertical 1D sliding-window box blur: tlScratch -> premulRgba
+        float* const dstBase = layer.premulRgba.data();
+        auto blurColsStripeFn = [&](int cStart, int cEnd) {
+            const std::size_t c0 = static_cast<std::size_t>(std::max(0, cStart));
+            const std::size_t c1 = static_cast<std::size_t>(std::min(static_cast<int>(rowFloats), cEnd));
+            if (c1 <= c0) return;
+            const std::size_t stripeLen = c1 - c0;
+            thread_local std::vector<float> tlStripeSums;
+            if (tlStripeSums.size() < stripeLen) {
+                tlStripeSums.resize(stripeLen);
             }
-        }
-        for (int y = 0; y < h; ++y) {
-            float* dstRow = layer.premulRgba.data() + static_cast<std::size_t>(y) * rowFloats;
-            const int removeY = std::clamp(y - boxRadius, 0, h - 1);
-            const int addY = std::clamp(y + boxRadius + 1, 0, h - 1);
-            const float* remRow = tlScratch.data() + static_cast<std::size_t>(removeY) * rowFloats;
-            const float* addRow = tlScratch.data() + static_cast<std::size_t>(addY) * rowFloats;
-            for (std::size_t i = 0u; i < rowFloats; ++i) {
-                dstRow[i] = colSums[i] * invKernel;
-                colSums[i] += addRow[i] - remRow[i];
+            float* sums = tlStripeSums.data();
+            std::fill_n(sums, stripeLen, 0.0f);
+            for (int k = -boxRadius; k <= boxRadius; ++k) {
+                const int sy = std::clamp(k, 0, h - 1);
+                const float* srcRow = scratchBase + static_cast<std::size_t>(sy) * rowFloats + c0;
+                for (std::size_t i = 0u; i < stripeLen; ++i) {
+                    sums[i] += srcRow[i];
+                }
             }
+            for (int y = 0; y < h; ++y) {
+                float* dstRow = dstBase + static_cast<std::size_t>(y) * rowFloats + c0;
+                const int removeY = std::clamp(y - boxRadius, 0, h - 1);
+                const int addY = std::clamp(y + boxRadius + 1, 0, h - 1);
+                const float* remRow = scratchBase + static_cast<std::size_t>(removeY) * rowFloats + c0;
+                const float* addRow = scratchBase + static_cast<std::size_t>(addY) * rowFloats + c0;
+                for (std::size_t i = 0u; i < stripeLen; ++i) {
+                    dstRow[i] = sums[i] * invKernel;
+                    sums[i] += addRow[i] - remRow[i];
+                }
+            }
+        };
+        if (!gInScanlineBand && static_cast<std::size_t>(w) * static_cast<std::size_t>(h) >= 16384u && rowFloats >= 64u) {
+            ScanlineWorkerPool::Instance().ParallelBands4(static_cast<int>(rowFloats), blurColsStripeFn);
+        } else {
+            blurColsStripeFn(0, static_cast<int>(rowFloats));
         }
     }
 }
@@ -1680,9 +1696,18 @@ void RasterizeSingleNode(
         clipMaxX = std::min(clipMaxX, optPremulLayer->originX + optPremulLayer->width);
         clipMaxY = std::min(clipMaxY, optPremulLayer->originY + optPremulLayer->height);
     }
-    if (clipMaxX <= clipMinX || clipMaxY <= clipMinY) {
+    const int effClipMinY = std::max(clipMinY, gRasterBandY0);
+    const int effClipMaxY = std::min(clipMaxY, gRasterBandY1);
+    if (clipMaxX <= clipMinX || effClipMaxY <= effClipMinY) {
         return;
     }
+
+    const FontAtlas& fontAtlasRef = FontAtlas::Instance();
+    const std::uint32_t boundTextureId = page.header.reserved[0];
+    bool resolvedNodeTex = false;
+    const TextureSlotBuffer* cachedNodeTexSlot = nullptr;
+    bool resolvedNodeMtsdf = false;
+    const AxbMtsdfPathEntry* cachedNodeMtsdf = nullptr;
 
     const std::size_t quadCount = nd->vertexCount / 4u;
     for (std::size_t q = 0; q < quadCount; ++q) {
@@ -1703,6 +1728,25 @@ void RasterizeSingleNode(
             !std::isfinite(v3.x) || !std::isfinite(v3.y)) {
             continue;
         }
+
+        const float minY = std::min(std::min(v0.y, v1.y), std::min(v2.y, v3.y));
+        const float maxY = std::max(std::max(v0.y, v1.y), std::max(v2.y, v3.y));
+        const int pyStart = SafeFloorToInt(minY, clipMinY, clipMaxY);
+        const int pyEnd = SafeCeilToInt(maxY, clipMinY, clipMaxY);
+        const int quadBandPyStart = std::max(pyStart, gRasterBandY0);
+        const int quadBandPyEnd = std::min(pyEnd, gRasterBandY1);
+        if (quadBandPyStart >= quadBandPyEnd) {
+            continue;
+        }
+
+        const float minX = std::min(std::min(v0.x, v1.x), std::min(v2.x, v3.x));
+        const float maxX = std::max(std::max(v0.x, v1.x), std::max(v2.x, v3.x));
+        const int pxStart = SafeFloorToInt(minX, clipMinX, clipMaxX);
+        const int pxEnd = SafeCeilToInt(maxX, clipMinX, clipMaxX);
+        if (pxEnd <= pxStart) {
+            continue;
+        }
+
         const bool uniformVertexColor =
             (v0.rgba == v1.rgba) && (v0.rgba == v2.rgba) && (v0.rgba == v3.rgba);
         const std::uint8_t a8 = static_cast<std::uint8_t>((v0.rgba >> 24u) & 0xFFu);
@@ -1710,19 +1754,13 @@ void RasterizeSingleNode(
         const std::uint8_t g8 = static_cast<std::uint8_t>((v0.rgba >> 8u) & 0xFFu);
         const std::uint8_t b8 = static_cast<std::uint8_t>((v0.rgba >> 16u) & 0xFFu);
         const float baseAlpha = static_cast<float>(a8) / 255.0f;
-        const AeroPrimType primPreCheck = DecodeVertexPrimType(v0.primType);
-        const std::uint32_t boundTextureId = page.header.reserved[0];
-        const TextureSlotBuffer* boundTexSlot = (primPreCheck == AeroPrimType::TexturedQuad)
-            ? ImageAtlas::Instance().GetTextureSlot(boundTextureId)
-            : nullptr;
-        const bool hasBoundTexture = (boundTexSlot != nullptr);
-
-        const float minX = std::min(std::min(v0.x, v1.x), std::min(v2.x, v3.x));
-        const float maxX = std::max(std::max(v0.x, v1.x), std::max(v2.x, v3.x));
-        const float minY = std::min(std::min(v0.y, v1.y), std::min(v2.y, v3.y));
-        const float maxY = std::max(std::max(v0.y, v1.y), std::max(v2.y, v3.y));
-
         const AeroPrimType prim = DecodeVertexPrimType(v0.primType);
+        if (prim == AeroPrimType::TexturedQuad && !resolvedNodeTex) {
+            cachedNodeTexSlot = ImageAtlas::Instance().GetTextureSlot(boundTextureId);
+            resolvedNodeTex = true;
+        }
+        const TextureSlotBuffer* boundTexSlot = cachedNodeTexSlot;
+        const bool hasBoundTexture = (boundTexSlot != nullptr);
 
         float e1x = v1.x - v0.x;
         float e1y = v1.y - v0.y;
@@ -1770,14 +1808,11 @@ void RasterizeSingleNode(
             }
         }
 
-        const int pxStart = SafeFloorToInt(minX, clipMinX, clipMaxX);
-        const int pyStart = SafeFloorToInt(minY, clipMinY, clipMaxY);
-        const int pxEnd = SafeCeilToInt(maxX, clipMinX, clipMaxX);
-        const int pyEnd = SafeCeilToInt(maxY, clipMinY, clipMaxY);
-
-        const AxbMtsdfPathEntry* mtsdfEntry = (nd->primType == AeroPrimType::MsdfVectorPath && nd->mtsdfPathHash != 0)
-            ? AxbTemplateRegistry::Instance().FindMtsdfPath(nd->mtsdfPathHash)
-            : nullptr;
+        if (nd->primType == AeroPrimType::MsdfVectorPath && nd->mtsdfPathHash != 0 && !resolvedNodeMtsdf) {
+            cachedNodeMtsdf = AxbTemplateRegistry::Instance().FindMtsdfPath(nd->mtsdfPathHash);
+            resolvedNodeMtsdf = true;
+        }
+        const AxbMtsdfPathEntry* mtsdfEntry = cachedNodeMtsdf;
 
         CornerRadius sdfRadii = nd->cornerRadii;
         Thickness sdfBorder = nd->borderThicknesses;
@@ -1795,9 +1830,7 @@ void RasterizeSingleNode(
             }
         }
 
-        if (pxEnd <= pxStart || pyEnd <= pyStart) {
-            continue;
-        }
+
         const float quadUnscaledHalfW = std::max(std::fabs(v0.u), std::fabs(v2.u));
         const float quadUnscaledHalfH = std::max(std::fabs(v0.v), std::fabs(v2.v));
         const float quadHalfW = (quadUnscaledHalfW > 1e-4f) ? quadUnscaledHalfW : (localQuadW * 0.5f);
@@ -1862,7 +1895,7 @@ void RasterizeSingleNode(
             hoistedFullCellH = cellH * (perpQuadH / quadTexSpanY);
         }
 
-        const FontAtlas& fontAtlasRef = FontAtlas::Instance();
+
 
         float sdfSafeInteriorHalfW = -1.0f;
         float sdfSafeInteriorHalfH = -1.0f;
@@ -1877,13 +1910,61 @@ void RasterizeSingleNode(
             sdfSafeInteriorHalfH = quadHalfH - maxRad - maxBdr - quadAaFeather - 0.5f;
         }
 
-        const int bandClampedPyStart = std::max(pyStart, gRasterBandY0);
-        const int bandClampedPyEnd = std::min(pyEnd, gRasterBandY1);
-        if (bandClampedPyStart >= bandClampedPyEnd) {
-            continue;
-        }
+        const int bandClampedPyStart = quadBandPyStart;
+        const int bandClampedPyEnd = quadBandPyEnd;
         const float stepSuX = e3y * invDet;
         const float stepSvX = -e1y * invDet;
+
+        // Precompute non-zero RGB texel X bounds per MTSDF row for O(1) empty-space skipping on large vector artboards!
+        std::int16_t mtsdfRowMinX[128];
+        std::int16_t mtsdfRowMaxX[128];
+        const std::int16_t* rowMinPtr = mtsdfRowMinX;
+        const std::int16_t* rowMaxPtr = mtsdfRowMaxX;
+        bool hasAxisAlignedMtsdfBounds = false;
+        float mtsdfAxisTexX0 = 0.0f;
+        float mtsdfAxisTexStepX = 0.0f;
+        float mtsdfInvAxisTexStepX = 0.0f;
+        if (prim == AeroPrimType::MsdfVectorPath && mtsdfEntry &&
+            !usePerspectiveInverse && nd->softFeatherPx <= 0.0f && hoistedMtsdfStrokePx <= 0.0f && !hoistedMtsdfStrokeOnly &&
+            mtsdfEntry->cellWidth > 0 && mtsdfEntry->cellWidth <= 128 &&
+            mtsdfEntry->cellHeight > 0 && mtsdfEntry->cellHeight <= 128 &&
+            mtsdfEntry->mtsdfRgbaPixels.size() >= static_cast<std::size_t>(mtsdfEntry->cellWidth) * mtsdfEntry->cellHeight * 4u &&
+            std::fabs(e1y) <= 1e-6f && std::fabs(e3x) <= 1e-6f &&
+            std::fabs(v3.u - v0.u) <= 1e-6f && std::fabs(v1.v - v0.v) <= 1e-6f &&
+            (pxEnd - pxStart) * (bandClampedPyEnd - bandClampedPyStart) >= 256) {
+            const int cw = static_cast<int>(mtsdfEntry->cellWidth);
+            const int ch = static_cast<int>(mtsdfEntry->cellHeight);
+            if (mtsdfEntry->rowMinX.size() == static_cast<std::size_t>(ch) &&
+                mtsdfEntry->rowMaxX.size() == static_cast<std::size_t>(ch)) {
+                rowMinPtr = mtsdfEntry->rowMinX.data();
+                rowMaxPtr = mtsdfEntry->rowMaxX.data();
+            } else {
+                const std::uint8_t* mBase = mtsdfEntry->mtsdfRgbaPixels.data();
+                for (int ry = 0; ry < ch; ++ry) {
+                    const std::uint8_t* rPtr = mBase + static_cast<std::size_t>(ry) * static_cast<std::size_t>(cw) * 4u;
+                    std::int16_t rMin = static_cast<std::int16_t>(cw);
+                    std::int16_t rMax = -1;
+                    for (int rx = 0; rx < cw; ++rx) {
+                        const std::uint8_t* p = rPtr + static_cast<std::size_t>(rx) * 4u;
+                        if ((p[0] | p[1] | p[2]) != 0u) {
+                            if (rx < rMin) rMin = static_cast<std::int16_t>(rx);
+                            rMax = static_cast<std::int16_t>(rx);
+                        }
+                    }
+                    mtsdfRowMinX[ry] = rMin;
+                    mtsdfRowMaxX[ry] = rMax;
+                }
+            }
+            const float cellW = static_cast<float>(cw);
+            const float duSu = ((v1.u - v0.u) / hoistedEntrySpanU) * std::max(1.0f, cellW - 1.0f);
+            mtsdfAxisTexStepX = stepSuX * duSu;
+            if (std::fabs(mtsdfAxisTexStepX) > 1e-6f) {
+                const float baseU0 = 0.5f + ((v0.u - mtsdfEntry->u0) / hoistedEntrySpanU) * std::max(1.0f, cellW - 1.0f);
+                mtsdfAxisTexX0 = baseU0 + (-v0.x * stepSuX) * duSu - 0.5f;
+                mtsdfInvAxisTexStepX = 1.0f / mtsdfAxisTexStepX;
+                hasAxisAlignedMtsdfBounds = true;
+            }
+        }
         auto narrowLinearInterval = [](float a0, float slope, int& ioX0, int& ioX1) noexcept {
             // Restrict px so that a0 + (px + 0.5f) * slope in [0, 1] (with 1px safety margin)
             if (std::fabs(slope) > 1e-6f) {
@@ -1920,6 +2001,90 @@ void RasterizeSingleNode(
                 rowPxStart = std::max(pxStart, rowPxStart);
                 rowPxEnd = std::min(pxEnd, rowPxEnd);
                 if (rowPxStart >= rowPxEnd) {
+                    continue;
+                }
+                if (hasAxisAlignedMtsdfBounds) {
+                    const float svRow = (e1x * dy) * invDet;
+                    if (svRow < 0.0f || svRow > 1.0f) {
+                        continue;
+                    }
+                    const float cellH = static_cast<float>(mtsdfEntry->cellHeight);
+                    const float vInterpRow = v0.v + svRow * (v3.v - v0.v);
+                    const float cellTexY = 0.5f + ((vInterpRow - mtsdfEntry->v0) / hoistedEntrySpanV) * std::max(1.0f, cellH - 1.0f);
+                    const float normY = std::clamp(cellTexY / cellH, 0.0f, 1.0f);
+                    const float tv = normY * cellH - 0.5f;
+                    const int maxTexY = static_cast<int>(mtsdfEntry->cellHeight) - 1;
+                    const int ty0 = std::clamp(static_cast<int>(std::floor(tv)), 0, maxTexY);
+                    const int ty1 = std::min(ty0 + 1, maxTexY);
+                    const std::int16_t maxX0 = rowMaxPtr[ty0];
+                    const std::int16_t maxX1 = rowMaxPtr[ty1];
+                    if (maxX0 < 0 && maxX1 < 0) {
+                        continue; // Entire 1280px scanline is 100% transparent exterior!
+                    }
+                    const int activeMinTexX = std::min<int>(
+                        (maxX0 >= 0) ? rowMinPtr[ty0] : 32767,
+                        (maxX1 >= 0) ? rowMinPtr[ty1] : 32767);
+                    const int activeMaxTexX = std::max<int>(maxX0, maxX1);
+                    if (activeMinTexX > 0 || activeMaxTexX + 1 < static_cast<int>(mtsdfEntry->cellWidth) - 1) {
+                        // Safe texel interval [activeMinTexX - 1, activeMaxTexX + 2] guarantees x0 & x1 outside have 0 RGB
+                        const float tLo = static_cast<float>(activeMinTexX) - 1.01f;
+                        const float tHi = static_cast<float>(activeMaxTexX) + 2.01f;
+                        const float pA = (tLo - mtsdfAxisTexX0) * mtsdfInvAxisTexStepX - 0.5f;
+                        const float pB = (tHi - mtsdfAxisTexX0) * mtsdfInvAxisTexStepX - 0.5f;
+                        if (std::isfinite(pA) && std::isfinite(pB)) {
+                            if (mtsdfAxisTexStepX > 0.0f) {
+                                if (activeMinTexX > 0) {
+                                    rowPxStart = std::max(rowPxStart, SafeFloorToInt(pA, rowPxStart - 2, rowPxEnd + 2));
+                                }
+                                if (activeMaxTexX + 1 < static_cast<int>(mtsdfEntry->cellWidth) - 1) {
+                                    rowPxEnd = std::min(rowPxEnd, SafeCeilToInt(pB, rowPxStart - 2, rowPxEnd + 2));
+                                }
+                            } else {
+                                if (activeMaxTexX + 1 < static_cast<int>(mtsdfEntry->cellWidth) - 1) {
+                                    rowPxStart = std::max(rowPxStart, SafeFloorToInt(pB, rowPxStart - 2, rowPxEnd + 2));
+                                }
+                                if (activeMinTexX > 0) {
+                                    rowPxEnd = std::min(rowPxEnd, SafeCeilToInt(pA, rowPxStart - 2, rowPxEnd + 2));
+                                }
+                            }
+                            if (rowPxStart >= rowPxEnd) {
+                                continue;
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Fast contiguous span fill for axis-aligned opaque SolidQuad
+            if (!usePerspectiveInverse && !optPremulLayer &&
+                prim == AeroPrimType::SolidQuad &&
+                a8 == 255u && nd->blendMode == BlendingMode::Normal &&
+                ((v0.flags & AeroVertexFlag_PremultipliedAlpha) == 0u) &&
+                std::fabs(e1y) <= 1e-6f && std::fabs(e3x) <= 1e-6f) {
+                const float svConst = (e1x * dy) * invDet;
+                if (svConst >= 0.0f && svConst <= 1.0f) {
+                    const std::uint32_t packedPixel =
+                        static_cast<std::uint32_t>(r8) |
+                        (static_cast<std::uint32_t>(g8) << 8u) |
+                        (static_cast<std::uint32_t>(b8) << 16u) |
+                        0xFF000000u;
+                    int xSpan0 = rowPxStart;
+                    while (xSpan0 < rowPxEnd) {
+                        const float su0 = (((static_cast<float>(xSpan0) + 0.5f) - v0.x) * e3y) * invDet;
+                        if (su0 >= 0.0f && su0 <= 1.0f) break;
+                        ++xSpan0;
+                    }
+                    int xSpan1 = rowPxEnd;
+                    while (xSpan1 > xSpan0) {
+                        const float su1 = (((static_cast<float>(xSpan1 - 1) + 0.5f) - v0.x) * e3y) * invDet;
+                        if (su1 >= 0.0f && su1 <= 1.0f) break;
+                        --xSpan1;
+                    }
+                    if (xSpan1 > xSpan0) {
+                        auto* dst32 = reinterpret_cast<std::uint32_t*>(
+                            outRgba8 + (static_cast<std::size_t>(py) * viewportWidth + static_cast<std::size_t>(xSpan0)) * 4u);
+                        std::fill_n(dst32, static_cast<std::size_t>(xSpan1 - xSpan0), packedPixel);
+                    }
                     continue;
                 }
             }
@@ -2074,9 +2239,60 @@ void RasterizeSingleNode(
                         const float t = std::clamp(0.5f + (trueDistPx / feather), 0.0f, 1.0f);
                         coverage = t * t * (3.0f - 2.0f * t);
                     } else {
-                        float fillCov = strokeOnly
-                            ? 0.0f
-                            : EvaluateMtsdfCoverage(*mtsdfEntry, normX, normY, fullCellW, fullCellH, false);
+                        float fillCov = 0.0f;
+                        if (!strokeOnly) {
+                            const float mu = normX * cellW - 0.5f;
+                            const float mv = normY * cellH - 0.5f;
+                            const int maxMX = static_cast<int>(mtsdfEntry->cellWidth) - 1;
+                            const int maxMY = static_cast<int>(mtsdfEntry->cellHeight) - 1;
+                            const float fmu = std::floor(mu);
+                            const float fmv = std::floor(mv);
+                            const int mx0 = std::clamp(static_cast<int>(fmu), 0, maxMX);
+                            const int my0 = std::clamp(static_cast<int>(fmv), 0, maxMY);
+                            const int mx1 = std::min(mx0 + 1, maxMX);
+                            const int my1 = std::min(my0 + 1, maxMY);
+                            const std::uint8_t* mBase = mtsdfEntry->mtsdfRgbaPixels.data();
+                            const std::size_t mStride = static_cast<std::size_t>(mtsdfEntry->cellWidth) * 4u;
+                            const std::uint8_t* mp00 = mBase + static_cast<std::size_t>(my0) * mStride + static_cast<std::size_t>(mx0) * 4u;
+                            const std::uint8_t* mp10 = mBase + static_cast<std::size_t>(my0) * mStride + static_cast<std::size_t>(mx1) * 4u;
+                            const std::uint8_t* mp01 = mBase + static_cast<std::size_t>(my1) * mStride + static_cast<std::size_t>(mx0) * 4u;
+                            const std::uint8_t* mp11 = mBase + static_cast<std::size_t>(my1) * mStride + static_cast<std::size_t>(mx1) * 4u;
+                            const std::uint8_t orRgb =
+                                mp00[0] | mp00[1] | mp00[2] |
+                                mp10[0] | mp10[1] | mp10[2] |
+                                mp01[0] | mp01[1] | mp01[2] |
+                                mp11[0] | mp11[1] | mp11[2];
+                            if (orRgb != 0u) {
+                                const std::uint8_t andRgb =
+                                    mp00[0] & mp00[1] & mp00[2] &
+                                    mp10[0] & mp10[1] & mp10[2] &
+                                    mp01[0] & mp01[1] & mp01[2] &
+                                    mp11[0] & mp11[1] & mp11[2];
+                                if (andRgb == 255u) {
+                                    fillCov = 1.0f;
+                                } else {
+                                    const float mfx = std::clamp(mu - fmu, 0.0f, 1.0f);
+                                    const float mfy = std::clamp(mv - fmv, 0.0f, 1.0f);
+                                    auto bilerpM = [&](std::size_t ch) noexcept -> float {
+                                        const float c00 = static_cast<float>(mp00[ch]) / 255.0f;
+                                        const float c10 = static_cast<float>(mp10[ch]) / 255.0f;
+                                        const float c01 = static_cast<float>(mp01[ch]) / 255.0f;
+                                        const float c11 = static_cast<float>(mp11[ch]) / 255.0f;
+                                        const float top = c00 + (c10 - c00) * mfx;
+                                        const float bot = c01 + (c11 - c01) * mfx;
+                                        return top + (bot - top) * mfy;
+                                    };
+                                    const float mr = bilerpM(0u);
+                                    const float mg = bilerpM(1u);
+                                    const float mb = bilerpM(2u);
+                                    const float sd = std::max(std::min(mr, mg), std::min(std::max(mr, mg), mb));
+                                    const float scaleX = std::max(1.0f, fullCellW) / cellW;
+                                    const float scaleY = std::max(1.0f, fullCellH) / cellH;
+                                    const float screenPxRange = std::max(0.5f * mtsdfEntry->pxRange * (scaleX + scaleY), 1.0f);
+                                    fillCov = std::clamp(screenPxRange * (sd - 0.5f) + 0.5f, 0.0f, 1.0f);
+                                }
+                            }
+                        }
 
                         if (strokePx > 0.0f) {
                             const float u = normX * cellW - 0.5f;
@@ -2496,33 +2712,30 @@ void ExecuteBackdropBlurSpan(
     bgLayer.height = by1 - by0;
     bgLayer.premulRgba.resize(
         static_cast<std::size_t>(bgLayer.width) * static_cast<std::size_t>(bgLayer.height) * 4u);
-    for (int py = by0; py < by1; ++py) {
-        float* dstRow = bgLayer.premulRgba.data() +
-            static_cast<std::size_t>(py - by0) * static_cast<std::size_t>(bgLayer.width) * 4u;
-        if (optPremulLayer) {
-            const float* srcRow = optPremulLayer->premulRgba.data() +
-                static_cast<std::size_t>(py - optPremulLayer->originY) *
-                    static_cast<std::size_t>(optPremulLayer->width) * 4u;
-            for (int px = bx0; px < bx1; ++px) {
-                const float* sp = srcRow + static_cast<std::size_t>(px - optPremulLayer->originX) * 4u;
-                float* dp = dstRow + static_cast<std::size_t>(px - bx0) * 4u;
-                dp[0] = sp[0];
-                dp[1] = sp[1];
-                dp[2] = sp[2];
-                dp[3] = sp[3];
-            }
-        } else {
-            const std::uint8_t* srcRow = outRgba8 +
-                static_cast<std::size_t>(py) * viewportWidth * 4u;
-            for (int px = bx0; px < bx1; ++px) {
-                const std::uint8_t* sp = srcRow + static_cast<std::size_t>(px) * 4u;
-                float* dp = dstRow + static_cast<std::size_t>(px - bx0) * 4u;
-                dp[0] = static_cast<float>(sp[0]) / 255.0f;
-                dp[1] = static_cast<float>(sp[1]) / 255.0f;
-                dp[2] = static_cast<float>(sp[2]) / 255.0f;
-                dp[3] = static_cast<float>(sp[3]) / 255.0f;
+    auto copyBackdropRowsFn = [&](int relY0, int relY1) {
+        for (int ry = relY0; ry < relY1; ++ry) {
+            const int py = by0 + ry;
+            float* dstRow = bgLayer.premulRgba.data() +
+                static_cast<std::size_t>(ry) * static_cast<std::size_t>(bgLayer.width) * 4u;
+            if (optPremulLayer) {
+                const float* srcRow = optPremulLayer->premulRgba.data() +
+                    static_cast<std::size_t>(py - optPremulLayer->originY) *
+                        static_cast<std::size_t>(optPremulLayer->width) * 4u +
+                    static_cast<std::size_t>(bx0 - optPremulLayer->originX) * 4u;
+                std::memcpy(dstRow, srcRow, static_cast<std::size_t>(bgLayer.width) * 4u * sizeof(float));
+            } else {
+                const std::uint8_t* srcRow = outRgba8 +
+                    (static_cast<std::size_t>(py) * viewportWidth + static_cast<std::size_t>(bx0)) * 4u;
+                for (int i = 0; i < bgLayer.width * 4; ++i) {
+                    dstRow[i] = static_cast<float>(srcRow[i]) / 255.0f;
+                }
             }
         }
+    };
+    if (!gInScanlineBand && static_cast<std::size_t>(bgLayer.width) * static_cast<std::size_t>(bgLayer.height) >= 16384u) {
+        ScanlineWorkerPool::Instance().ParallelBands4(bgLayer.height, copyBackdropRowsFn);
+    } else {
+        copyBackdropRowsFn(0, bgLayer.height);
     }
     SeparableBoxBlurPremul3Pass(bgLayer, boxR);
     const AxbMtsdfPathEntry* maskEntry = (span.maskMtsdfHash != 0u)
@@ -2549,39 +2762,50 @@ void ExecuteBackdropBlurSpan(
     }
     const float screenScale = std::max(1.0f, 0.5f * (mr.width / std::max(1.0f, maskEntry ? maskEntry->boundsW : mr.width) +
                                                      mr.height / std::max(1.0f, maskEntry ? maskEntry->boundsH : mr.height)));
-    for (int py = my0; py < my1; ++py) {
-        const float normY = ((static_cast<float>(py) + 0.5f) - mr.y) / std::max(1.0f, mr.height);
-        const float* blurRow = bgLayer.premulRgba.data() +
-            static_cast<std::size_t>(py - by0) * static_cast<std::size_t>(bgLayer.width) * 4u;
-        for (int px = mx0; px < mx1; ++px) {
-            const float normX = ((static_cast<float>(px) + 0.5f) - mr.x) / std::max(1.0f, mr.width);
-            float cov = 1.0f;
-            if (maskEntry) {
-                cov = EvaluateMtsdfCoverage(*maskEntry, normX, normY, screenScale, 0.0f, false);
+    if (my1 > my0 && mx1 > mx0) {
+        const int maskRows = my1 - my0;
+        auto compositeBackdropFn = [&](int relY0, int relY1) {
+            for (int ry = relY0; ry < relY1; ++ry) {
+                const int py = my0 + ry;
+                const float normY = ((static_cast<float>(py) + 0.5f) - mr.y) / std::max(1.0f, mr.height);
+                const float* blurRow = bgLayer.premulRgba.data() +
+                    static_cast<std::size_t>(py - by0) * static_cast<std::size_t>(bgLayer.width) * 4u;
+                for (int px = mx0; px < mx1; ++px) {
+                    const float normX = ((static_cast<float>(px) + 0.5f) - mr.x) / std::max(1.0f, mr.width);
+                    float cov = 1.0f;
+                    if (maskEntry) {
+                        cov = EvaluateMtsdfCoverage(*maskEntry, normX, normY, screenScale, 0.0f, false);
+                    }
+                    const float effMask = std::clamp(cov * span.maskOpacity, 0.0f, 1.0f);
+                    if (effMask <= 0.002f) continue;
+                    const float* bp = blurRow + static_cast<std::size_t>(px - bx0) * 4u;
+                    const float pa = std::clamp(bp[3] * effMask, 0.0f, 1.0f);
+                    if (pa <= 0.001f) continue;
+                    const float pr = bp[0] * effMask;
+                    const float pg = bp[1] * effMask;
+                    const float pb = bp[2] * effMask;
+                    if (optPremulLayer) {
+                        BlendPremulOver(*optPremulLayer, px, py, pr, pg, pb, pa);
+                    } else {
+                        std::uint8_t* dst = outRgba8 +
+                            (static_cast<std::size_t>(py) * viewportWidth + static_cast<std::size_t>(px)) * 4u;
+                        const float invA = 1.0f - pa;
+                        dst[0] = static_cast<std::uint8_t>(
+                            std::clamp(pr * 255.0f + static_cast<float>(dst[0]) * invA + 0.5f, 0.0f, 255.0f));
+                        dst[1] = static_cast<std::uint8_t>(
+                            std::clamp(pg * 255.0f + static_cast<float>(dst[1]) * invA + 0.5f, 0.0f, 255.0f));
+                        dst[2] = static_cast<std::uint8_t>(
+                            std::clamp(pb * 255.0f + static_cast<float>(dst[2]) * invA + 0.5f, 0.0f, 255.0f));
+                        dst[3] = static_cast<std::uint8_t>(
+                            std::clamp(pa * 255.0f + static_cast<float>(dst[3]) * invA + 0.5f, 0.0f, 255.0f));
+                    }
+                }
             }
-            const float effMask = std::clamp(cov * span.maskOpacity, 0.0f, 1.0f);
-            if (effMask <= 0.002f) continue;
-            const float* bp = blurRow + static_cast<std::size_t>(px - bx0) * 4u;
-            const float pa = std::clamp(bp[3] * effMask, 0.0f, 1.0f);
-            if (pa <= 0.001f) continue;
-            const float pr = bp[0] * effMask;
-            const float pg = bp[1] * effMask;
-            const float pb = bp[2] * effMask;
-            if (optPremulLayer) {
-                BlendPremulOver(*optPremulLayer, px, py, pr, pg, pb, pa);
-            } else {
-                std::uint8_t* dst = outRgba8 +
-                    (static_cast<std::size_t>(py) * viewportWidth + static_cast<std::size_t>(px)) * 4u;
-                const float invA = 1.0f - pa;
-                dst[0] = static_cast<std::uint8_t>(
-                    std::clamp(pr * 255.0f + static_cast<float>(dst[0]) * invA + 0.5f, 0.0f, 255.0f));
-                dst[1] = static_cast<std::uint8_t>(
-                    std::clamp(pg * 255.0f + static_cast<float>(dst[1]) * invA + 0.5f, 0.0f, 255.0f));
-                dst[2] = static_cast<std::uint8_t>(
-                    std::clamp(pb * 255.0f + static_cast<float>(dst[2]) * invA + 0.5f, 0.0f, 255.0f));
-                dst[3] = static_cast<std::uint8_t>(
-                    std::clamp(pa * 255.0f + static_cast<float>(dst[3]) * invA + 0.5f, 0.0f, 255.0f));
-            }
+        };
+        if (!gInScanlineBand && static_cast<std::size_t>(mx1 - mx0) * static_cast<std::size_t>(maskRows) >= 16384u) {
+            ScanlineWorkerPool::Instance().ParallelBands4(maskRows, compositeBackdropFn);
+        } else {
+            compositeBackdropFn(0, maskRows);
         }
     }
 }

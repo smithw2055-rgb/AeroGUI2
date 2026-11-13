@@ -177,6 +177,8 @@ struct RichGlyphStyle {
     bool hasCustomColor = false;
     bool bold = false;
     bool italic = false;
+    bool underline = false;
+    bool strikethrough = false;
 };
 
 // Pack RGBA [0..1] floats into ABGR/RGBA 32-bit uint

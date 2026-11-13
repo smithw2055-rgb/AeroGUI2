@@ -1299,9 +1299,70 @@ std::uint16_t ResolveBuiltinPropertyId(std::string_view propertyName) noexcept {
     if (propertyName == "Storyboard.TargetName" || propertyName == "TargetName") {
         return PropId_Header;
     }
-    if (propertyName == "Selector.IsSelected" || propertyName == "ListBoxItem.IsSelected" ||
-        propertyName == "TreeViewItem.IsSelected" || propertyName == "ListViewItem.IsSelected") {
+    if (propertyName == "IsSelected" || propertyName == "Selector.IsSelected" ||
+        propertyName == "ListBoxItem.IsSelected" || propertyName == "ComboBoxItem.IsSelected" ||
+        propertyName == "TreeViewItem.IsSelected" || propertyName == "ListViewItem.IsSelected" ||
+        propertyName == "TabItem.IsSelected") {
         return PropId_IsChecked;
+    }
+    if (propertyName == "IsHitTestVisible" || propertyName == "UIElement.IsHitTestVisible") {
+        return PropId_IsHitTestVisible;
+    }
+    if (propertyName == "IsDirectionReversed" || propertyName == "Slider.IsDirectionReversed" ||
+        propertyName == "Track.IsDirectionReversed") {
+        return PropId_IsDirectionReversed;
+    }
+    if (propertyName == "IsSnapToTickEnabled" || propertyName == "Slider.IsSnapToTickEnabled") {
+        return PropId_IsSnapToTickEnabled;
+    }
+    if (propertyName == "TickFrequency" || propertyName == "Slider.TickFrequency") {
+        return PropId_TickFrequency;
+    }
+    if (propertyName == "TickPlacement" || propertyName == "Slider.TickPlacement") {
+        return PropId_TickPlacement;
+    }
+    if (propertyName == "Ticks" || propertyName == "Slider.Ticks") {
+        return PropId_Ticks;
+    }
+    if (propertyName == "IsMoveToPointEnabled" || propertyName == "Slider.IsMoveToPointEnabled") {
+        return PropId_IsMoveToPointEnabled;
+    }
+    if (propertyName == "Password" || propertyName == "PasswordBox.Password") {
+        return PropId_Text;
+    }
+    if (propertyName == "PasswordChar" || propertyName == "PasswordBox.PasswordChar") {
+        return PropId_PasswordChar;
+    }
+    if (propertyName == "AcceptsReturn" || propertyName == "TextBox.AcceptsReturn") {
+        return PropId_AcceptsReturn;
+    }
+    if (propertyName == "MaxLines" || propertyName == "TextBox.MaxLines" || propertyName == "TextBlock.MaxLines") {
+        return PropId_MaxLines;
+    }
+    if (propertyName == "LineHeight" || propertyName == "TextBlock.LineHeight") {
+        return PropId_LineHeight;
+    }
+    if (propertyName == "CharacterSpacing" || propertyName == "Text.CharacterSpacing" ||
+        propertyName == "noesis:Text.CharacterSpacing" || propertyName == "local:Text.CharacterSpacing") {
+        return PropId_CharacterSpacing;
+    }
+    if (propertyName == "TextDecorations" || propertyName == "TextBlock.TextDecorations") {
+        return PropId_TextDecorations;
+    }
+    if (propertyName == "IsEditable" || propertyName == "ComboBox.IsEditable") {
+        return PropId_IsEditable;
+    }
+    if (propertyName == "MaxDropDownHeight" || propertyName == "ComboBox.MaxDropDownHeight") {
+        return PropId_MaxDropDownHeight;
+    }
+    if (propertyName == "SelectionMode" || propertyName == "ListBox.SelectionMode" || propertyName == "ListView.SelectionMode") {
+        return PropId_SelectionMode;
+    }
+    if (propertyName == "StrokeDashArray" || propertyName == "Shape.StrokeDashArray" || propertyName == "Path.StrokeDashArray") {
+        return PropId_StrokeDashArray;
+    }
+    if (propertyName == "local:Text.Placeholder") {
+        return PropId_Placeholder;
     }
     return PropId_Tag;
 }
@@ -2906,6 +2967,63 @@ UnifiedValue ParseBuiltinLiteralPropertyValue(
         case PropId_EffectColor:
             return value::FromColor(ParseXamlColorLiteral(rawValue));
 
+        case PropId_IsHitTestVisible:
+        case PropId_IsDirectionReversed:
+        case PropId_IsSnapToTickEnabled:
+        case PropId_IsMoveToPointEnabled:
+        case PropId_AcceptsReturn:
+        case PropId_IsEditable: {
+            const std::string_view tv = TrimWs(rawValue);
+            return UnifiedValue{EqualsIgnoreCase(tv, "true") || tv == "1"};
+        }
+
+        case PropId_TickFrequency:
+        case PropId_LineHeight:
+        case PropId_CharacterSpacing:
+        case PropId_MaxDropDownHeight:
+            return MakeFloat(ParseFloat32Fast(TrimWs(rawValue), 0.0f));
+
+        case PropId_MaxLines:
+            return value::FromInt(static_cast<std::int64_t>(std::llround(ParseFloat32Fast(TrimWs(rawValue), 0.0f))));
+
+        case PropId_TickPlacement: {
+            const std::string_view tv = TrimWs(rawValue);
+            if (EqualsIgnoreCase(tv, "TopLeft")) return value::FromInt(1);
+            if (EqualsIgnoreCase(tv, "BottomRight")) return value::FromInt(2);
+            if (EqualsIgnoreCase(tv, "Both")) return value::FromInt(3);
+            return value::FromInt(0);
+        }
+
+        case PropId_TextDecorations: {
+            std::int64_t mask = 0;
+            std::string_view rem = TrimWs(rawValue);
+            while (!rem.empty()) {
+                const auto sep = rem.find_first_of(", \t\r\n");
+                const std::string_view tok = (sep == std::string_view::npos) ? rem : rem.substr(0u, sep);
+                if (EqualsIgnoreCase(tok, "Underline")) {
+                    mask |= 1;
+                } else if (EqualsIgnoreCase(tok, "Strikethrough")) {
+                    mask |= 2;
+                } else if (EqualsIgnoreCase(tok, "OverLine") || EqualsIgnoreCase(tok, "Overline")) {
+                    mask |= 4;
+                } else if (EqualsIgnoreCase(tok, "None")) {
+                    return value::FromInt(0);
+                }
+                if (sep == std::string_view::npos) {
+                    break;
+                }
+                rem = TrimWs(rem.substr(sep + 1u));
+            }
+            return value::FromInt(mask);
+        }
+
+        case PropId_SelectionMode: {
+            const std::string_view tv = TrimWs(rawValue);
+            if (EqualsIgnoreCase(tv, "Multiple")) return value::FromInt(1);
+            if (EqualsIgnoreCase(tv, "Extended")) return value::FromInt(2);
+            return value::FromInt(0);
+        }
+
         default:
             return value::FromString(DecodeXamlXmlEntities(rawValue));
     }
@@ -3287,6 +3405,7 @@ AxbMtsdfPathEntry BakeSvgPathToMtsdfEntry(
             entry.boundsW = it->second.boundsW;
             entry.boundsH = it->second.boundsH;
             entry.mtsdfRgbaPixels = it->second.rgbaPixels;
+            entry.ComputeRowBounds();
             return entry;
         }
     }
@@ -3600,6 +3719,7 @@ AxbMtsdfPathEntry BakeSvgPathToMtsdfEntry(
                 entry.mtsdfRgbaPixels});
     }
 
+    entry.ComputeRowBounds();
     return entry;
 }
 
@@ -4972,13 +5092,23 @@ std::vector<std::uint8_t> AxbPackage::Serialize() const {
             WriteU16(out, tl.targetPropertyId);
             WriteF32(out, tl.beginTimeSeconds);
             WriteF32(out, tl.durationSeconds);
+            const bool hasRatios =
+                (std::fabs(tl.speedRatio - 1.0f) > 1e-5f) ||
+                (tl.accelerationRatio > 1e-5f) ||
+                (tl.decelerationRatio > 1e-5f);
             std::uint8_t tlFlags = 0u;
             if (tl.hasFrom) tlFlags |= 0x01u;
             if (tl.hasTo) tlFlags |= 0x02u;
             if (tl.autoReverse) tlFlags |= 0x04u;
             if (tl.fillBehavior == FillBehavior::Stop) tlFlags |= 0x08u;
             if (tl.isBy) tlFlags |= 0x10u;
+            if (hasRatios) tlFlags |= 0x20u;
             WriteU8(out, tlFlags);
+            if (hasRatios) {
+                WriteF32(out, tl.speedRatio);
+                WriteF32(out, tl.accelerationRatio);
+                WriteF32(out, tl.decelerationRatio);
+            }
             WriteValue(out, tl.fromValue);
             WriteValue(out, tl.toValue);
             WriteU8(out, static_cast<std::uint8_t>(tl.easingKind));
@@ -4990,7 +5120,15 @@ std::vector<std::uint8_t> AxbPackage::Serialize() const {
                 WriteValue(out, kf.value);
                 WriteU8(out, static_cast<std::uint8_t>(kf.easingKind));
                 WriteU8(out, static_cast<std::uint8_t>(kf.easingMode));
-                WriteU8(out, kf.isDiscrete ? 1u : 0u);
+                std::uint8_t kfFlags = kf.isDiscrete ? 0x01u : 0x00u;
+                if (kf.hasKeySpline) kfFlags |= 0x02u;
+                WriteU8(out, kfFlags);
+                if (kf.hasKeySpline) {
+                    WriteF32(out, kf.splineX1);
+                    WriteF32(out, kf.splineY1);
+                    WriteF32(out, kf.splineX2);
+                    WriteF32(out, kf.splineY2);
+                }
             }
         }
     };
@@ -5784,7 +5922,7 @@ bool DeserializeAxbPackageWithDepth(
         return false;
     };
 
-    constexpr std::uint8_t kMaxEasingKindRaw = static_cast<std::uint8_t>(EasingFunctionKind::Elastic);
+    constexpr std::uint8_t kMaxEasingKindRaw = static_cast<std::uint8_t>(EasingFunctionKind::Spline);
     constexpr std::uint8_t kMaxEasingModeRaw = static_cast<std::uint8_t>(EasingMode::EaseInOut);
 
     auto readStoryboard = [&](AxbStoryboard& sb) -> bool {
@@ -5802,6 +5940,10 @@ bool DeserializeAxbPackageWithDepth(
                 !r.ReadF32(tl.beginTimeSeconds) ||
                 !r.ReadF32(tl.durationSeconds) ||
                 !r.ReadU8(tlFlags) ||
+                (((tlFlags & 0x20u) != 0u) &&
+                 (!r.ReadF32(tl.speedRatio) ||
+                  !r.ReadF32(tl.accelerationRatio) ||
+                  !r.ReadF32(tl.decelerationRatio))) ||
                 !r.ReadValue(tl.fromValue) ||
                 !r.ReadValue(tl.toValue) ||
                 !r.ReadU8(ek) ||
@@ -5836,7 +5978,16 @@ bool DeserializeAxbPackageWithDepth(
                 }
                 kf.easingKind = static_cast<EasingFunctionKind>(kek);
                 kf.easingMode = static_cast<EasingMode>(kem);
-                kf.isDiscrete = (kdisc != 0u);
+                kf.isDiscrete = (kdisc & 0x01u) != 0u;
+                kf.hasKeySpline = (kdisc & 0x02u) != 0u;
+                if (kf.hasKeySpline) {
+                    if (!r.ReadF32(kf.splineX1) ||
+                        !r.ReadF32(kf.splineY1) ||
+                        !r.ReadF32(kf.splineX2) ||
+                        !r.ReadF32(kf.splineY2)) {
+                        return failStcSection("corrupted AXB4 KeySpline entry");
+                    }
+                }
             }
         }
         return true;
@@ -5886,6 +6037,7 @@ bool DeserializeAxbPackageWithDepth(
                     !r.ReadBytes(mp.mtsdfRgbaPixels)) {
                     return failStcSection("corrupted AXB4 MTSDF entry");
                 }
+                mp.ComputeRowBounds();
             }
         } else if (trailMagic == kAxb4StyleAnimSectionMagic) {
             if ((seenSectionMask & kSecBit_STC5) != 0u) {

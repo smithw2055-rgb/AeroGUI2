@@ -1479,7 +1479,621 @@ namespace VerbatimDemo
 
 } // namespace
 
+
+static void RunMilestone2And3VerificationSuite() {
+    {
+        // 1. Samples/Theme C# WPF Project (UTF-8 BOM, #region, App.xaml.cs, NoesisGUIExtensions DP shims,
+        //    {x:Null} 3-State CheckBox, PasswordBox, Reversed/Ticked Slider, ListBox IsSelected)
+        aero::XamlApplication themeApp;
+        std::string themeErr;
+        const bool themeLoaded = themeApp.Load(std::string(AERO_SAMPLES_DIR) + "/Theme", &themeErr);
+        if (!themeLoaded) {
+            std::fprintf(stderr, "Theme load error: %s\n", themeErr.c_str());
+        }
+        CHECK(themeLoaded);
+        CHECK(themeApp.MainWindowElement() != nullptr);
+        CHECK(themeApp.ApplicationObject().valid());
+        std::vector<std::uint8_t> themeRgba;
+        themeApp.RasterizeToRgba8(themeRgba);
+        CHECK(themeRgba.size() == 1280u * 720u * 4u);
+        CHECK(themeApp.RenderTree().NodeCount() > 40u);
+
+        const std::size_t cleanSync = themeApp.RenderTree().SyncVisualTree(themeApp.MainWindowElement());
+        CHECK(cleanSync == 0u);
+    }
+    aero::AxbTemplateRegistry::Instance().Clear();
+
+    {
+        // 2. Full WPF C# Ergonomics: UTF-8 BOM + #region + #if/#else + nameof(...) + Visibility enum
+        //    + Code-behind += Method & Lambda subscriptions + CanExecuteChanged + Custom C# UserControl
+        //    + Slider IsDirectionReversed/SnapToTick + PasswordBox PasswordChar/PasswordChanged
+        //    + ComboBox IsEditable/Text + ListBox Extended SelectionMode + KeySpline Animation
+        const std::filesystem::path tmpDir = std::filesystem::path(AERO_TEST_TEMP_DIR) / "wpf_csharp_ergonomics";
+        std::filesystem::create_directories(tmpDir / "Controls");
+
+        {
+            std::ofstream ofs(tmpDir / "Controls/CounterCard.xaml", std::ios::binary);
+            ofs << R"(<UserControl xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             x:Class="ErgonomicsDemo.CounterCard" Width="220" Height="44">
+  <StackPanel Orientation="Horizontal" Spacing="8">
+    <TextBlock x:Name="CardReadout" Text="Card:0"/>
+    <Button x:Name="CardPingBtn" Content="Ping" Click="CardPingBtn_Click" Width="60" Height="28"/>
+  </StackPanel>
+</UserControl>)";
+        }
+        {
+            std::ofstream ofs(tmpDir / "Controls/CounterCard.xaml.cs", std::ios::binary);
+            ofs << "\xEF\xBB\xBF" << R"(using System;
+using System.Windows;
+using Aero.UI;
+
+namespace ErgonomicsDemo
+{
+    public partial class CounterCard : UserControl
+    {
+        #region Fields
+        private int _pings = 0;
+        #endregion
+
+        public CounterCard()
+        {
+            InitializeComponent();
+            Loaded += (s, e) => { CardLoadedCount = CardLoadedCount + 1; };
+            CardPingBtn.Loaded += (s, e) => { CardBtnLoadedCount = CardBtnLoadedCount + 1; };
+            CardPingBtn.Click += (s, e) =>
+            {
+                _pings = _pings + 10;
+                CardReadout.Text = $"Card:{_pings}";
+            };
+        }
+        public int CardLoadedCount { get; set; } = 0;
+        public int CardBtnLoadedCount { get; set; } = 0;
+
+        public void CardPingBtn_Click(object sender, RoutedEventArgs e)
+        {
+            _pings = _pings + 1;
+            CardReadout.Text = $"Card:{_pings}";
+        }
+    }
+}
+)";
+        }
+        {
+            std::ofstream ofs(tmpDir / "App.xaml", std::ios::binary);
+            ofs << R"(<Application x:Class="ErgonomicsDemo.App"
+             xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             StartupUri="MainWindow.xaml">
+</Application>)";
+        }
+        {
+            std::ofstream ofs(tmpDir / "App.xaml.cs", std::ios::binary);
+            ofs << "\xEF\xBB\xBF" << R"(using System.Windows;
+using Aero.UI;
+
+namespace ErgonomicsDemo
+{
+    public partial class App : Application
+    {
+        public bool StartupCalled { get; set; } = false;
+        public override void OnStartup(StartupEventArgs e)
+        {
+            StartupCalled = true;
+        }
+    }
+}
+)";
+        }
+        {
+            std::ofstream ofs(tmpDir / "MainWindow.xaml", std::ios::binary);
+            ofs << R"(<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:local="clr-namespace:ErgonomicsDemo"
+        x:Class="ErgonomicsDemo.MainWindow"
+        Width="800" Height="600">
+  <Window.Resources>
+    <Storyboard x:Key="SplineAnim">
+      <DoubleAnimationUsingKeyFrames Storyboard.TargetName="AnimBox" Storyboard.TargetProperty="Opacity">
+        <SplineDoubleKeyFrame KeyTime="0:0:0" Value="0.2"/>
+        <SplineDoubleKeyFrame KeyTime="0:0:1" Value="1.0" KeySpline="0.4,0.0 0.2,1.0"/>
+      </DoubleAnimationUsingKeyFrames>
+    </Storyboard>
+  </Window.Resources>
+  <StackPanel Spacing="6">
+    <Border x:Name="SecretPanel" Width="200" Height="24" Background="#223344"/>
+    <Button x:Name="SubmitBtn" Content="Submit" Command="{Binding SubmitCommand}" Width="100" Height="30"/>
+    <Button x:Name="ToggleVisBtn" Content="Toggle" Width="100" Height="30"/>
+    <PasswordBox x:Name="PinBox" Password="12" PasswordChar="*" PasswordChanged="PinBox_PasswordChanged" Width="140" Height="28"/>
+    <Slider x:Name="SnapSlider" Minimum="0" Maximum="100" TickFrequency="25" IsSnapToTickEnabled="True" IsDirectionReversed="True" TickPlacement="Both" Value="0" Width="200" Height="24"/>
+    <ComboBox x:Name="EditCombo" IsEditable="True" Placeholder="Pick or type..." Width="180" Height="28">
+      <ComboBoxItem Content="Alpha"/>
+      <ComboBoxItem Content="Beta" IsSelected="True"/>
+    </ComboBox>
+    <ListBox x:Name="MultiList" SelectionMode="Extended" Width="180" Height="90">
+      <ListBoxItem Content="Row0"/>
+      <ListBoxItem Content="Row1"/>
+      <ListBoxItem Content="Row2"/>
+      <ListBoxItem Content="Row3" IsEnabled="False"/>
+    </ListBox>
+    <Border x:Name="AnimBox" Width="60" Height="20" Opacity="0.2" Background="#4488FF"/>
+    <local:CounterCard x:Name="EmbeddedCard"/>
+    <TextBlock x:Name="StatusOut" Text="{Binding LastChangedProp}"/>
+  </StackPanel>
+</Window>)";
+        }
+        {
+            std::ofstream ofs(tmpDir / "MainWindow.xaml.cs", std::ios::binary);
+            ofs << "\xEF\xBB\xBF" << R"(using System;
+using System.ComponentModel;
+using System.Windows;
+using Aero.UI;
+
+namespace ErgonomicsDemo
+{
+#if NOESIS
+    public class IgnoredNoesisClass { invalid_syntax_if_compiled }
+#else
+    public class DemoVm : ViewModelBase
+    {
+        private string _draft = "";
+        private RelayCommand _submitCommand;
+        public string LastChangedProp { get; set; } = "Init";
+        public int SubmitCount { get; set; } = 0;
+
+        public RelayCommand SubmitCommand { get { return _submitCommand; } }
+
+        public string Draft
+        {
+            get { return _draft; }
+            set
+            {
+                if (_draft != value)
+                {
+                    _draft = value;
+                    LastChangedProp = nameof(Draft);
+                    OnPropertyChanged(nameof(Draft));
+                    _submitCommand.RaiseCanExecuteChanged();
+                }
+            }
+        }
+
+        public DemoVm()
+        {
+            _submitCommand = new RelayCommand(DoSubmit, () => _draft != "");
+        }
+
+        private void DoSubmit()
+        {
+            SubmitCount = SubmitCount + 1;
+            LastChangedProp = $"{nameof(SubmitCount)}:{SubmitCount}";
+        }
+    }
+
+    public delegate int IntMapper(int x);
+
+    public partial class MainWindow : Window
+    {
+        public DemoVm Vm { get; set; }
+        public bool WindowLoadedFired { get; set; } = false;
+        public int ChildBtnLoadedCount { get; set; } = 0;
+        public int PinChangeEvents { get; set; } = 0;
+        public float LastSliderVal { get; set; } = -1.0f;
+
+        private int _secretBase = 40;
+        private int ComputeSecret(int x) { return _secretBase + x; }
+
+        public MainWindow()
+        {
+            InitializeComponent();
+            Vm = new DemoVm();
+            DataContext = Vm;
+
+            Loaded += (s, e) => { WindowLoadedFired = true; };
+            ToggleVisBtn.Loaded += (s, e) => { ChildBtnLoadedCount = ChildBtnLoadedCount + 1; };
+            ToggleVisBtn.Click += OnToggleVisClicked;
+            SnapSlider.ValueChanged += (s, e) => { LastSliderVal = e.NewValue; };
+        }
+
+        public string GetErgonomicsAudit()
+        {
+            IntMapper fn = (delta) => ComputeSecret(delta);
+            return $"{WindowLoadedFired}|{ChildBtnLoadedCount}|{(int)LastSliderVal}|{fn(2)}";
+        }
+
+        private void OnToggleVisClicked(object sender, RoutedEventArgs e)
+        {
+            if (SecretPanel.Visibility == Visibility.Visible)
+            {
+                SecretPanel.Visibility = Visibility.Collapsed;
+            }
+            else
+            {
+                SecretPanel.Visibility = Visibility.Visible;
+            }
+        }
+
+        public void PinBox_PasswordChanged(object sender, RoutedEventArgs e)
+        {
+            PinChangeEvents = PinChangeEvents + 1;
+            Vm.Draft = PinBox.Password;
+        }
+    }
+#endif
+}
+)";
+        }
+
+        aero::XamlApplication app;
+        std::string err;
+        const bool ok = app.Load(tmpDir.string(), &err);
+        if (!ok) {
+            std::fprintf(stderr, "ErgonomicsDemo load failed: %s\n", err.c_str());
+        }
+        CHECK(ok);
+        auto* root = app.MainWindowElement();
+        CHECK(root != nullptr);
+        if (!ok || !root) {
+            aero::AxbTemplateRegistry::Instance().Clear();
+            return;
+        }
+
+        auto* secretPanel = root->FindName("SecretPanel");
+        auto* submitBtn = root->FindName("SubmitBtn") ? root->FindName("SubmitBtn")->DynamicCast<aero::Button>() : nullptr;
+        auto* toggleVisBtn = root->FindName("ToggleVisBtn") ? root->FindName("ToggleVisBtn")->DynamicCast<aero::Button>() : nullptr;
+        auto* pinBox = root->FindName("PinBox") ? root->FindName("PinBox")->DynamicCast<aero::PasswordBox>() : nullptr;
+        auto* snapSlider = root->FindName("SnapSlider") ? root->FindName("SnapSlider")->DynamicCast<aero::Slider>() : nullptr;
+        auto* editCombo = root->FindName("EditCombo") ? root->FindName("EditCombo")->DynamicCast<aero::ComboBox>() : nullptr;
+        auto* multiList = root->FindName("MultiList") ? root->FindName("MultiList")->DynamicCast<aero::ListBox>() : nullptr;
+        auto* statusOut = root->FindName("StatusOut") ? root->FindName("StatusOut")->DynamicCast<aero::TextBlock>() : nullptr;
+        auto* animBox = root->FindName("AnimBox");
+        auto* embeddedCard = root->FindName("EmbeddedCard");
+        CHECK(secretPanel && submitBtn && toggleVisBtn && pinBox && snapSlider && editCombo && multiList && statusOut && animBox && embeddedCard);
+
+        CHECK(!submitBtn->IsEnabled());
+        CHECK(secretPanel->GetVisibility() == aero::Visibility::Visible);
+        (void)toggleVisBtn->PerformClick();
+        app.Tick(0.016f);
+        CHECK(secretPanel->GetVisibility() == aero::Visibility::Collapsed);
+        (void)toggleVisBtn->PerformClick();
+        app.Tick(0.016f);
+        CHECK(secretPanel->GetVisibility() == aero::Visibility::Visible);
+
+        CHECK(pinBox->GetDisplayString() == "**");
+        pinBox->SetFocused(true);
+        (void)pinBox->InsertText("9");
+        app.Tick(0.016f);
+        CHECK(pinBox->GetPassword() == "129");
+        CHECK(pinBox->GetDisplayString() == "***");
+        CHECK(statusOut->GetText() == "Draft");
+        CHECK(submitBtn->IsEnabled());
+
+        (void)submitBtn->PerformClick();
+        app.Tick(0.016f);
+        CHECK(statusOut->GetText() == "SubmitCount:1");
+
+        (void)snapSlider->SetSliderValueInteractive(36.0f);
+        app.Tick(0.016f);
+        CHECK(std::fabs(snapSlider->GetSliderValue() - 25.0f) < 0.01f);
+        CHECK(std::fabs(snapSlider->VisualNormalizedPosition() - 0.75f) < 0.01f);
+
+        CHECK(editCombo->GetSelectedIndex() == 1);
+        CHECK(editCombo->GetDisplayText() == "Beta");
+        editCombo->SetFocused(true);
+        (void)editCombo->OnTextInput("CustomTag");
+        CHECK(editCombo->GetDisplayText().find("CustomTag") != std::string::npos);
+
+        (void)multiList->SelectIndexWithModifiers(0, 0u);
+        (void)multiList->SelectIndexWithModifiers(2, aero::KeyMod_Shift);
+        CHECK(multiList->IsIndexSelected(0) && multiList->IsIndexSelected(1) && multiList->IsIndexSelected(2));
+        (void)multiList->SelectIndexWithModifiers(1, aero::KeyMod_Ctrl);
+        CHECK(multiList->IsIndexSelected(0) && !multiList->IsIndexSelected(1) && multiList->IsIndexSelected(2));
+
+        auto* cardPingBtn = embeddedCard->FindName("CardPingBtn") ? embeddedCard->FindName("CardPingBtn")->DynamicCast<aero::Button>() : nullptr;
+        auto* cardReadout = embeddedCard->FindName("CardReadout") ? embeddedCard->FindName("CardReadout")->DynamicCast<aero::TextBlock>() : nullptr;
+        CHECK(cardPingBtn && cardReadout);
+        (void)cardPingBtn->PerformClick();
+        app.Tick(0.016f);
+        CHECK(cardReadout->GetText() == "Card:11");
+
+        // Verify Window.Loaded, child ToggleVisBtn.Loaded, Slider.ValueChanged -> LastSliderVal, and RS-1 private closure capture
+        if (const auto auditSym = app.Program() ? app.Program()->findFunction("ErgonomicsDemo::MainWindow.GetErgonomicsAudit") : std::nullopt) {
+            if (app.ScriptInterpreter() && app.CodeBehindObject().valid()) {
+                const auto auditRes = app.ScriptInterpreter()->invoke(*auditSym, {aero::UnifiedValue(app.CodeBehindObject())});
+                CHECK(auditRes.succeeded);
+                const std::string auditStr = aero::rs_rt::valueToString(auditRes.value, app.ScriptInterpreter()->heap().get());
+                CHECK(auditStr == "true|1|25|42" || auditStr == "True|1|25|42");
+            }
+        }
+        // Verify UserControl CounterCard.Loaded & child CardPingBtn.Loaded
+        auto* embeddedUc = embeddedCard->DynamicCast<aero::UserControl>();
+        if (embeddedUc && embeddedUc->BoundScriptWrapper().valid() && app.Program() && app.ScriptInterpreter()) {
+            const auto cardObj = embeddedUc->BoundScriptWrapper();
+            const auto getCardLoaded = app.Program()->findFunction("ErgonomicsDemo::CounterCard.get_CardLoadedCount");
+            const auto getBtnLoaded = app.Program()->findFunction("ErgonomicsDemo::CounterCard.get_CardBtnLoadedCount");
+            if (getCardLoaded && getBtnLoaded) {
+                const auto r1 = app.ScriptInterpreter()->invoke(*getCardLoaded, {aero::UnifiedValue(cardObj)});
+                const auto r2 = app.ScriptInterpreter()->invoke(*getBtnLoaded, {aero::UnifiedValue(cardObj)});
+                CHECK(r1.succeeded && std::holds_alternative<std::int64_t>(r1.value) && std::get<std::int64_t>(r1.value) == 1);
+                CHECK(r2.succeeded && std::holds_alternative<std::int64_t>(r2.value) && std::get<std::int64_t>(r2.value) == 1);
+            }
+        }
+
+        const auto* sb = app.StyleEngine().FindStoryboard("SplineAnim");
+        if (!sb) sb = aero::AxbTemplateRegistry::Instance().FindStoryboard("SplineAnim");
+        CHECK(sb != nullptr);
+        if (sb) {
+            (void)app.Animations().BeginStoryboard(root, *sb);
+            app.Tick(0.5f);
+            CHECK(animBox->GetOpacity() > 0.65f && animBox->GetOpacity() < 0.99f);
+        }
+    }
+    aero::AxbTemplateRegistry::Instance().Clear();
+}
+
+static void TestPatchAuditRegressions() {
+    // 1. AG-3 (compound #define/#undef/#if & verbatim #if 0) + AG-9.2 (System.String.Empty)
+    //    + RS-1/RS-2/RS-3 (ternary/try/for/nested lambda captures & Action vs Func<int> overload)
+    {
+        const char* xaml = R"(<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        x:Class="AuditDemo.MainWindow"
+        Width="400" Height="240">
+  <StackPanel>
+    <TextBlock x:Name="EmptyStat" Text="{x:Static System.String.Empty}"/>
+    <TextBlock x:Name="Out" Text="init"/>
+  </StackPanel>
+</Window>)";
+        const char* script = R"CS(
+#define FLAG_ON
+#define FLAG_TEMP
+#undef FLAG_TEMP
+using System;
+using Aero.UI;
+
+namespace AuditDemo
+{
+    public delegate void IntAction(int x);
+    public delegate int IntMapper(int x);
+    public delegate int IntThunk();
+
+    public partial class MainWindow : Window
+    {
+        private int _secret = 7;
+        private int SecretMul(int k) { return _secret * k; }
+
+        private int InvokeOverload(IntAction a) { a(3); return 10; }
+        private int InvokeOverload(IntMapper f) { return f(4); }
+
+        public MainWindow()
+        {
+            InitializeComponent();
+        }
+
+        public string RunAudit()
+        {
+#if (AERO && !NOESIS) && (defined(FLAG_ON) && !FLAG_TEMP) && !UNKNOWN_DEFINE
+            string verb = @"#if 0
+keep_literal";
+            int total = 0;
+            bool cond = true;
+            int outerA = 5;
+            int outerB = 9;
+            IntMapper ternFn = (x) => cond ? (x + outerA) : outerB;
+            total = total + ternFn(1);
+
+            for (int i = 0; i < 2; i = i + 1)
+            {
+                int localStep = i + 1;
+                IntThunk nested = () =>
+                {
+                    IntThunk inner = () => SecretMul(1) + localStep;
+                    return inner();
+                };
+                total = total + nested();
+            }
+
+            try
+            {
+                int inTry = 100;
+                IntThunk tryFn = () => outerA + inTry;
+                total = total + (tryFn() - inTry);
+            }
+            catch
+            {
+                total = -999;
+            }
+
+            int ovAct = InvokeOverload((x) => { total = total + x; });
+            int ovFunc = InvokeOverload((x) => { return x * 2; });
+            return $"{total}|{ovAct}|{ovFunc}|{verb.Length}";
+#else
+            return "wrong_branch";
+#endif
+        }
+    }
+}
+)CS";
+        aero::AeroCompiler compiler;
+        aero::AeroCompileInput in{};
+        in.xamlPath = "MainWindow.xaml";
+        in.xamlContent = xaml;
+        in.scriptSources.push_back(aero::SourceFile{"MainWindow.xaml.cs", script});
+        const auto res = compiler.Compile(in);
+        if (!res.succeeded) {
+            for (const auto& d : res.diagnostics) std::cerr << "  audit diag: " << d << std::endl;
+        }
+        CHECK(res.succeeded);
+        if (res.succeeded) {
+            aero::ExecutionDomainContext domains;
+            domains.registerProgramObservableMetadata(*res.programImage);
+            auto nativeBindings = std::make_shared<aero::BindingRegistry>();
+            aero::ScriptUiBridge bridge(domains);
+            bridge.RegisterCoreUiBindings(*nativeBindings);
+            aero::Interpreter interp(res.programImage, domains.uiHeapPtr());
+            interp.setExecutionDomainContext(&domains, aero::DomainKind::UiPresentation);
+            interp.setBindingRegistry(nativeBindings);
+            aero::DualTrackBindingEngine binding(domains, res.programImage.get(), &interp);
+            bridge.SetUnderlyingEngine(&binding);
+            aero::StyleTriggerEngine style;
+            style.SetBindingEngine(&binding);
+
+            const auto createSym = res.programImage->findFunction("AuditDemo::CreateMainWindow");
+            CHECK(createSym.has_value());
+            if (createSym) {
+                const auto execRes = interp.invoke(*createSym, {});
+                CHECK(execRes.succeeded);
+                if (const auto* mainWinRef = std::get_if<aero::ObjectRef>(&execRes.value); mainWinRef && mainWinRef->valid()) {
+                    auto pin = domains.uiHeap().retain(*mainWinRef);
+                    auto root = aero::MountAndWireMainWindow(res.axbPackage, domains, binding, style, *mainWinRef, &interp);
+                    CHECK(root.Get() != nullptr);
+                    if (root) {
+                        auto* emptyStat = dynamic_cast<aero::TextBlock*>(root->FindName("EmptyStat"));
+                        CHECK(emptyStat && emptyStat->GetText().empty());
+                    }
+                    const auto auditSym = res.programImage->findFunction("AuditDemo::MainWindow.RunAudit");
+                    CHECK(auditSym.has_value());
+                    if (auditSym) {
+                        const auto runRes = interp.invoke(*auditSym, {aero::UnifiedValue(*mainWinRef)});
+                        CHECK(runRes.succeeded);
+                        // ternFn(1)=6; loop=(7+1)+(7+2)=17; try=5; ovAct sets total+=3 -> 31, ret 10; ovFunc ret 8; verb len=18 (\n) or 19 (\r\n)
+                        const std::string val = aero::rs_rt::valueToString(runRes.value, interp.heap().get());
+                        CHECK(val.rfind("31|10|8|", 0) == 0);
+                    }
+                }
+            }
+        }
+    }
+
+    // 2. AG-4 (ComboBox UTF-8 Backspace & SelectedIndex) + AG-8.4 (ListBox Extended Ctrl-toggle)
+    //    + AG-8.5 (TextBox SelectAll) + AG-8.3 (PointerDown target before MouseDown bubble) + AG-7 (TextDecorations)
+    {
+        auto root = aero::MakeIntrusive<aero::StackPanel>();
+        root->SetOrientation(aero::Orientation::Vertical);
+        root->SetWidth(400.0f);
+        root->SetHeight(300.0f);
+
+        // AG-4: ComboBox UTF-8 Backspace & SelectedIndex sync
+        auto combo = aero::MakeIntrusive<aero::ComboBox>();
+        combo->SetIsEditable(true);
+        combo->SetItemsSource({
+            aero::value::FromString("中"),
+            aero::value::FromString("中文"),
+            aero::value::FromString("Alpha")
+        });
+        combo->SetFocused(true);
+        CHECK(combo->OnTextInput("中文"));
+        CHECK(combo->GetSelectedIndex() == 1);
+        CHECK(combo->OnKeyDown(aero::KeyCode::Backspace, 0u));
+        CHECK(combo->GetDisplayText() == "中");
+        CHECK(combo->GetSelectedIndex() == 0);
+        CHECK(combo->OnKeyDown(aero::KeyCode::Backspace, 0u));
+        CHECK(combo->GetDisplayText().empty());
+        CHECK(combo->GetSelectedIndex() == -1);
+
+        // AG-8.4: ListBox Extended Ctrl-toggle non-primary fires SelectionChanged
+        auto lb = aero::MakeIntrusive<aero::ListBox>();
+        lb->SetSelectionMode(2); // Extended
+        lb->SetItemsSource({
+            aero::value::FromString("A"),
+            aero::value::FromString("B"),
+            aero::value::FromString("C")
+        });
+        int lbNotifyCount = 0;
+        lb->SetSelectionChangedCallback([&](aero::ListBox&, std::int32_t) { ++lbNotifyCount; });
+        CHECK(lb->SelectIndexWithModifiers(0, 0u));
+        CHECK(lb->SelectIndexWithModifiers(2, aero::KeyMod_Shift));
+        const int beforeToggle = lbNotifyCount;
+        CHECK(lb->SelectIndexWithModifiers(1, aero::KeyMod_Ctrl)); // unselects 1 while primary stays 0
+        CHECK(lbNotifyCount == beforeToggle + 1);
+        CHECK(lb->IsIndexSelected(0) && !lb->IsIndexSelected(1) && lb->IsIndexSelected(2));
+
+        // AG-8.5: TextBox SelectAll replace & delete
+        auto tbEdit = aero::MakeIntrusive<aero::TextBox>();
+        tbEdit->SetText("Hello");
+        tbEdit->SelectAll();
+        CHECK(tbEdit->HasAllSelected());
+        CHECK(tbEdit->InsertText("World"));
+        CHECK(tbEdit->GetText() == "World");
+        CHECK(!tbEdit->HasAllSelected());
+        tbEdit->SelectAll();
+        CHECK(tbEdit->OnKeyDown(aero::KeyCode::Backspace, 0u));
+        CHECK(tbEdit->GetText().empty());
+        tbEdit->SetText("Abc");
+        tbEdit->SelectAll();
+        CHECK(tbEdit->OnKeyDown(aero::KeyCode::Delete, 0u));
+        CHECK(tbEdit->GetText().empty());
+
+        // AG-8.3: DispatchPointerDown updates target state (OnPointerDown) before MouseDown callback runs
+        auto tbClick = aero::MakeIntrusive<aero::TextBox>();
+        tbClick->SetWidth(160.0f);
+        tbClick->SetHeight(32.0f);
+        tbClick->SetFontSize(14.0f);
+        tbClick->SetText("HelloWorld");
+        tbClick->SetCaretIndex(0u);
+        std::size_t caretInMouseDown = 0u;
+        tbClick->SetMouseDownCallback([&](aero::UIElement&) -> bool {
+            caretInMouseDown = tbClick->GetCaretIndex();
+            return true;
+        });
+        root->AddChild(tbClick.Get());
+
+        // AG-7: TextDecorations bitmask & overline rendering
+        const auto tdMask = aero::ParseBuiltinLiteralPropertyValue(
+            aero::PropId_TextDecorations, "Underline, Strikethrough, Overline");
+        CHECK(std::holds_alternative<std::int64_t>(tdMask) && std::get<std::int64_t>(tdMask) == 7);
+        auto decoTb = aero::MakeIntrusive<aero::TextBlock>();
+        decoTb->SetText("HelloDeco");
+        decoTb->SetFontSize(16.0f);
+        decoTb->SetValue(aero::PropId_TextDecorations, tdMask, aero::ValueSourceRank::Local);
+        root->AddChild(decoTb.Get());
+
+        root->Measure(aero::Size{400.0f, 300.0f});
+        root->Arrange(aero::Rect{0.0f, 0.0f, 400.0f, 300.0f});
+
+        aero::InputEventRouter router(root.Get());
+        const aero::Rect br = tbClick->FinalRect();
+        CHECK(router.DispatchPointerDown(
+            aero::Point{br.x + br.width - 8.0f, br.y + br.height * 0.5f},
+            aero::PointerButton::Left,
+            0u));
+        CHECK(caretInMouseDown > 0u);
+
+        aero::PagedRenderTree decoTree;
+        decoTree.BuildFromVisualTree(decoTb.Get());
+        CHECK(decoTree.NodeCount() >= 3u);
+    }
+
+    // 3. AG-1 & AG-2: Dynamic Button Command.CanExecute watcher + wrapper cleanup without crash/leak
+    {
+        aero::ExecutionDomainContext domains;
+        aero::DualTrackBindingEngine engine(domains, nullptr, nullptr);
+        int canExecCalls = 0;
+        {
+            auto dynBtn = aero::MakeIntrusive<aero::Button>();
+            dynBtn->SetHasRegisteredScriptWrapper(true);
+            engine.RegisterCommandCanExecuteWatcher(dynBtn.Get(), [&]() {
+                ++canExecCalls;
+            });
+            engine.EvaluateCommandCanExecuteWatchers();
+            CHECK(canExecCalls == 1);
+            engine.UnbindSubtree(dynBtn.Get());
+            engine.EvaluateCommandCanExecuteWatchers();
+            CHECK(canExecCalls == 1);
+
+            engine.RegisterCommandCanExecuteWatcher(dynBtn.Get(), [&]() {
+                ++canExecCalls;
+            });
+        } // dynBtn destroyed here -> ~UIElement scrubs watcher & unregisters wrapper
+        engine.EvaluateCommandCanExecuteWatchers();
+        CHECK(canExecCalls == 1);
+    }
+}
+
 int main() {
+    RunMilestone2And3VerificationSuite();
+    TestPatchAuditRegressions();
+
     TestThreeStateCheckBoxAndIndeterminateRender();
     TestDeclarativeTreeViewAndSelectedItemSubHopBinding();
     TestDeclarativeTreeViewItemIsSelectedOnMount();

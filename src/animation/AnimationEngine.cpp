@@ -507,7 +507,8 @@ std::uint16_t AnimationEngine::StartFloatTween(
     tr.repeatCount = repeatCount;
     tr.fromF4.x = fromValue;
     tr.toF4.x = toValue;
-    tr.posF4.x = fromValue;
+    const float initScalar = (tr.duration <= 0.0f && !tr.autoReverse) ? toValue : fromValue;
+    tr.posF4.x = initScalar;
 
     if (!IsFastInlinePropertyId(propId)) {
         const std::uint16_t bindSlot = target->FindCompactEntry(propId)
@@ -516,7 +517,7 @@ std::uint16_t AnimationEngine::StartFloatTween(
         (void)target->SetPropertyMetadata(propId, bindSlot, id);
     }
     if (tr.beginTime <= 0.0f) {
-        (void)target->SetValue(propId, MakeFloat(fromValue), ValueSourceRank::Animation);
+        (void)target->SetValue(propId, MakeFloat(initScalar), ValueSourceRank::Animation);
     }
     return id;
 }
@@ -551,7 +552,8 @@ std::uint16_t AnimationEngine::StartFloat4Tween(
     tr.repeatCount = repeatCount;
     tr.fromF4 = fromValue;
     tr.toF4 = toValue;
-    tr.posF4 = fromValue;
+    const Float4Value initF4 = (tr.duration <= 0.0f && !tr.autoReverse) ? toValue : fromValue;
+    tr.posF4 = initF4;
 
     if (!IsFastInlinePropertyId(propId)) {
         const std::uint16_t bindSlot = target->FindCompactEntry(propId)
@@ -560,7 +562,7 @@ std::uint16_t AnimationEngine::StartFloat4Tween(
         (void)target->SetPropertyMetadata(propId, bindSlot, id);
     }
     if (tr.beginTime <= 0.0f) {
-        (void)target->SetValue(propId, MakeFloat4InlineFast(fromValue), ValueSourceRank::Animation);
+        (void)target->SetValue(propId, MakeFloat4InlineFast(initF4), ValueSourceRank::Animation);
     }
     if (wakeHostCallback_) {
         wakeHostCallback_();
@@ -706,6 +708,9 @@ std::uint16_t AnimationEngine::StartTimeline(
         tr.beginTime = std::max(0.0f, timeline.beginTimeSeconds);
         tr.repeatCount = timeline.repeatCount;
         tr.elapsed = 0.0f;
+        tr.speedRatio = (timeline.speedRatio > 1e-4f) ? timeline.speedRatio : 1.0f;
+        tr.accelerationRatio = std::clamp(timeline.accelerationRatio, 0.0f, 1.0f);
+        tr.decelerationRatio = std::clamp(timeline.decelerationRatio, 0.0f, 1.0f - tr.accelerationRatio);
 
         const std::size_t kfCount = std::min(timeline.keyFrames.size(), kMaxInlineKeyFrames);
         tr.keyFrameCount = static_cast<std::uint8_t>(kfCount);
@@ -739,7 +744,12 @@ std::uint16_t AnimationEngine::StartTimeline(
                 std::move(kfVal),
                 srcKf.easingKind,
                 srcKf.easingMode,
-                srcKf.isDiscrete || !isInterpolable};
+                srcKf.isDiscrete || !isInterpolable,
+                srcKf.hasKeySpline,
+                srcKf.splineX1,
+                srcKf.splineY1,
+                srcKf.splineX2,
+                srcKf.splineY2};
         }
         std::sort(
             tr.keyFrames.begin(),
@@ -801,7 +811,7 @@ std::uint16_t AnimationEngine::StartTimeline(
                       fromV.w + parsedToF4.w}
                 : parsedToF4;
         }
-        return StartFloat4Tween(
+        const std::uint16_t tid4 = StartFloat4Tween(
             target,
             timeline.targetPropertyId,
             fromV,
@@ -813,6 +823,12 @@ std::uint16_t AnimationEngine::StartTimeline(
             timeline.beginTimeSeconds,
             timeline.autoReverse,
             timeline.repeatCount);
+        if (tid4 < tracks_.size()) {
+            tracks_[tid4].speedRatio = (timeline.speedRatio > 1e-4f) ? timeline.speedRatio : 1.0f;
+            tracks_[tid4].accelerationRatio = std::clamp(timeline.accelerationRatio, 0.0f, 1.0f);
+            tracks_[tid4].decelerationRatio = std::clamp(timeline.decelerationRatio, 0.0f, 1.0f - tracks_[tid4].accelerationRatio);
+        }
+        return tid4;
     }
 
     const float cur = ReadCurrentScalar(target, timeline.targetPropertyId);
@@ -826,7 +842,7 @@ std::uint16_t AnimationEngine::StartTimeline(
             toS = fromS + toS;
         }
     }
-    return StartFloatTween(
+    const std::uint16_t tid1 = StartFloatTween(
         target,
         timeline.targetPropertyId,
         fromS,
@@ -838,6 +854,12 @@ std::uint16_t AnimationEngine::StartTimeline(
         timeline.beginTimeSeconds,
         timeline.autoReverse,
         timeline.repeatCount);
+    if (tid1 < tracks_.size()) {
+        tracks_[tid1].speedRatio = (timeline.speedRatio > 1e-4f) ? timeline.speedRatio : 1.0f;
+        tracks_[tid1].accelerationRatio = std::clamp(timeline.accelerationRatio, 0.0f, 1.0f);
+        tracks_[tid1].decelerationRatio = std::clamp(timeline.decelerationRatio, 0.0f, 1.0f - tracks_[tid1].accelerationRatio);
+    }
+    return tid1;
 }
 
 namespace {
@@ -2303,7 +2325,7 @@ std::size_t AnimationEngine::Tick(float dtSeconds) noexcept {
         }
 
         // 2. Timed Tween, Multi-KeyFrame & CompiledClipSlice Tracks
-        tr.elapsed += dtSeconds;
+        tr.elapsed += dtSeconds * ((tr.speedRatio > 1e-4f) ? tr.speedRatio : 1.0f);
         if (tr.elapsed < tr.beginTime) {
             continue;
         }
@@ -2332,6 +2354,25 @@ std::size_t AnimationEngine::Tick(float dtSeconds) noexcept {
                     ? (fullCycleDur - inCycle)
                     : inCycle;
             }
+        }
+
+        auto warpAccelDecel = [](float t01, float acc, float dec) noexcept -> float {
+            if (acc <= 1e-5f && dec <= 1e-5f) return t01;
+            const float a = std::clamp(acc, 0.0f, 1.0f);
+            const float d = std::clamp(dec, 0.0f, 1.0f - a);
+            const float vmax = 2.0f / std::max(1e-5f, 2.0f - a - d);
+            if (t01 < a && a > 1e-5f) {
+                return 0.5f * (vmax / a) * t01 * t01;
+            }
+            if (t01 > 1.0f - d && d > 1e-5f) {
+                const float rem = 1.0f - t01;
+                return 1.0f - 0.5f * (vmax / d) * rem * rem;
+            }
+            return vmax * (t01 - 0.5f * a);
+        };
+        if (singleCycleDur > 1e-6f && (tr.accelerationRatio > 1e-5f || tr.decelerationRatio > 1e-5f)) {
+            const float raw01 = std::clamp(localCycleTime / singleCycleDur, 0.0f, 1.0f);
+            localCycleTime = warpAccelDecel(raw01, tr.accelerationRatio, tr.decelerationRatio) * singleCycleDur;
         }
 
         if (tr.kind == AnimationTrackKind::TweenFloat) {
@@ -2410,7 +2451,9 @@ std::size_t AnimationEngine::Tick(float dtSeconds) noexcept {
                         startF4 = pf4;
                     }
                 }
-                const float eased = EvaluateEasing(endKf.easingKind, endKf.easingMode, segNorm);
+                const float eased = endKf.hasKeySpline
+                    ? EvaluateCubicBezier1D(endKf.splineX1, endKf.splineY1, endKf.splineX2, endKf.splineY2, segNorm)
+                    : EvaluateEasing(endKf.easingKind, endKf.easingMode, segNorm);
                 const Float4Value curVal = LerpFloat4(startF4, endF4, eased);
                 tr.posF4 = curVal;
                 (void)target->SetValue(tr.propId, MakeFloat4InlineFast(curVal), ValueSourceRank::Animation);
@@ -2421,7 +2464,9 @@ std::size_t AnimationEngine::Tick(float dtSeconds) noexcept {
                 if (segIdx > 0u) {
                     (void)TryGetFloat(tr.keyFrames[segIdx - 1u].value, startS);
                 }
-                const float eased = EvaluateEasing(endKf.easingKind, endKf.easingMode, segNorm);
+                const float eased = endKf.hasKeySpline
+                    ? EvaluateCubicBezier1D(endKf.splineX1, endKf.splineY1, endKf.splineX2, endKf.splineY2, segNorm)
+                    : EvaluateEasing(endKf.easingKind, endKf.easingMode, segNorm);
                 const float curVal = startS + (endS - startS) * eased;
                 tr.posF4.x = curVal;
                 (void)target->SetValue(tr.propId, MakeFloat(curVal), ValueSourceRank::Animation);

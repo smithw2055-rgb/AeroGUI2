@@ -538,7 +538,28 @@ public:
     void SetOrientation(Orientation o);
     [[nodiscard]] Orientation GetOrientation() const noexcept;
 
+    void SetIsDirectionReversed(bool reversed);
+    [[nodiscard]] bool IsDirectionReversed() const noexcept;
+
+    void SetIsSnapToTickEnabled(bool snap);
+    [[nodiscard]] bool IsSnapToTickEnabled() const noexcept;
+
+    void SetTickFrequency(float freq);
+    [[nodiscard]] float GetTickFrequency() const noexcept;
+
+    void SetTickPlacement(std::int32_t placement);
+    [[nodiscard]] std::int32_t GetTickPlacement() const noexcept;
+
+    void SetTicks(std::string_view ticksSpec);
+    [[nodiscard]] std::string GetTicks() const;
+    void CollectNormalizedTicks(std::vector<float>& outTicks) const;
+
+    void SetIsMoveToPointEnabled(bool enabled);
+    [[nodiscard]] bool IsMoveToPointEnabled() const noexcept;
+
+    [[nodiscard]] float SnapValueToTicks(float rawVal) const noexcept;
     [[nodiscard]] float NormalizedPosition() const noexcept;
+    [[nodiscard]] float VisualNormalizedPosition() const noexcept;
     [[nodiscard]] bool IsDraggingThumb() const noexcept { return isDragging_; }
 
     void SetValueChangedCallback(ValueChangedCallback callback) {
@@ -600,6 +621,13 @@ public:
     void SetIsPassword(bool isPassword);
     [[nodiscard]] bool IsPassword() const noexcept;
 
+    void SetAcceptsReturn(bool accepts);
+    [[nodiscard]] bool AcceptsReturn() const noexcept;
+    [[nodiscard]] std::int32_t GetMaxLines() const noexcept;
+    void Clear();
+    void SelectAll();
+    [[nodiscard]] bool HasAllSelected() const noexcept { return hasAllSelected_; }
+
     [[nodiscard]] std::string GetDisplayString() const;
     [[nodiscard]] float HorizontalTextScrollOffset() const noexcept;
     [[nodiscard]] Rect CaretLocalRect() const noexcept;
@@ -619,6 +647,7 @@ public:
     }
 
     void OnPropertyChanged(std::uint16_t propId, const UnifiedValue& newValue) override;
+    void OnFocusChanged(bool focused) override;
     bool OnPointerDown(
         Point localPoint,
         PointerButton button,
@@ -632,10 +661,13 @@ private:
     bool CommitEditedText(std::string newText, std::size_t newCaretCodePoint);
 
     TextChangedCallback textChangedCallback_;
+    bool hasAllSelected_ = false;
 };
 
 class PasswordBox : public TextBox {
 public:
+    using PasswordChangedCallback = std::function<void(PasswordBox&, const std::string&)>;
+
     PasswordBox();
     ~PasswordBox() override = default;
 
@@ -643,6 +675,22 @@ public:
     [[nodiscard]] const TypeClass* GetTypeClass() const noexcept override {
         return StaticTypeClass();
     }
+
+    void SetPassword(std::string_view password);
+    [[nodiscard]] std::string GetPassword() const { return GetText(); }
+
+    void SetPasswordChar(std::string_view ch);
+    [[nodiscard]] std::string GetPasswordChar() const;
+
+    void SetPasswordChangedCallback(PasswordChangedCallback callback) {
+        passwordChangedCallback_ = std::move(callback);
+    }
+
+    void OnPropertyChanged(std::uint16_t propId, const UnifiedValue& newValue) override;
+
+private:
+    PasswordChangedCallback passwordChangedCallback_;
+    std::string lastNotifiedPassword_;
 };
 
 class Path : public UIElement {
@@ -1251,6 +1299,13 @@ public:
     }
 
     bool SelectIndexInteractive(std::int32_t index);
+    bool SelectIndexWithModifiers(std::int32_t index, std::uint8_t modifiers);
+
+    void SetSelectionMode(std::int32_t mode);
+    [[nodiscard]] std::int32_t GetSelectionMode() const noexcept;
+    [[nodiscard]] const std::vector<std::int32_t>& SelectedIndices() const noexcept { return selectedIndices_; }
+    [[nodiscard]] bool IsIndexSelected(std::int32_t index) const noexcept;
+    void ClearSelection();
 
     void OnPropertyChanged(std::uint16_t propId, const UnifiedValue& newValue) override;
     bool OnPointerDown(
@@ -1268,6 +1323,8 @@ private:
     void ScrollItemIntoView(std::int32_t index) noexcept;
 
     SelectionChangedCallback selectionChangedCallback_;
+    std::vector<std::int32_t> selectedIndices_;
+    std::int32_t selectionAnchorIndex_ = -1;
     std::int32_t lastNotifiedSelectedIndex_ = -1;
     UnifiedValue lastNotifiedSelectedItem_{};
     bool hasNotifiedSelection_ = false;
@@ -1329,6 +1386,12 @@ public:
 
     void SetIsDropDownOpen(bool open);
     [[nodiscard]] bool IsDropDownOpen() const noexcept;
+
+    void SetIsEditable(bool editable);
+    [[nodiscard]] bool IsEditable() const noexcept;
+    [[nodiscard]] float GetMaxDropDownHeight() const noexcept;
+    [[nodiscard]] std::string GetDisplayText() const;
+    bool OnTextInput(std::string_view utf8Text) override;
 
     bool SelectIndexInteractive(std::int32_t index);
 
