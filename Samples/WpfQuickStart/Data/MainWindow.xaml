@@ -1,5 +1,6 @@
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:controls="clr-namespace:WpfQuickStart"
         x:Class="WpfQuickStart.MainWindow"
         Title="AeroGUI WPF QuickStart"
         Width="960" Height="640"
@@ -72,9 +73,9 @@
 
           <TextBox x:Name="NewTaskInput" Text="{Binding NewTaskTitle, Mode=TwoWay}" Placeholder="Enter new task title..." Padding="8,6,8,6"/>
 
-          <ListBox x:Name="TasksList" ItemsSource="{Binding ActiveTasks}" SelectionChanged="TasksList_SelectionChanged" Height="150"/>
+          <ListBox x:Name="TasksList" ItemsSource="{Binding ActiveTasks}" SelectionChanged="TasksList_SelectionChanged" Height="130"/>
 
-          <ListView x:Name="TasksGrid" ItemsSource="{Binding TaskRows}" Height="180">
+          <ListView x:Name="TasksGrid" ItemsSource="{Binding TaskRows}" Height="145">
             <ListView.View>
               <GridView>
                 <GridViewColumn Header="Task" Width="280" DisplayMemberBinding="{Binding Title}"/>
@@ -83,6 +84,8 @@
               </GridView>
             </ListView.View>
           </ListView>
+
+          <controls:SprintSummaryCard x:Name="SprintSummary" HorizontalAlignment="Left"/>
         </StackPanel>
       </Border>
     </Grid>

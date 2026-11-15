@@ -33,6 +33,10 @@
 #include "aero/render/ZeroCopyGpuStream.hpp"
 #include "aero/style/StyleTriggerEngine.hpp"
 
+#include "../../Samples/CustomAnimation/AeroCustomAnimationSample.hpp"
+#include "../../Samples/CustomControl/AeroCustomControlSample.hpp"
+#include "../../Samples/CustomRender/AeroCustomRenderSample.hpp"
+
 namespace fs = std::filesystem;
 
 namespace {
@@ -64,7 +68,13 @@ constexpr SamplePreset kPresets[] = {
     {"UserControl",      "UserControl/Data/MainPage.xaml",        "UserControl/Data/Resources.xaml",      1.0f, "Composable NumericUpDown UserControl"},
     {"DataBinding",      "DataBinding/Data/MainPage.xaml",        "DataBinding/Data/Resources.xaml",      1.0f, "Solar system master-detail data binding"},
     {"Menu3D",           "Menu3D/Data/MainPage.xaml",             "Menu3D/Data/Resources.xaml",           1.0f, "3D perspective game menu & sub-menus"},
-    {"WpfQuickStart",    "WpfQuickStart/Data/MainWindow.xaml",    "WpfQuickStart/Data/App.xaml",               0.2f, "WPF C#-style MVVM + typed x:Name + TreeView/Menu/StatusBar"},
+    {"WpfQuickStart",    "WpfQuickStart/Data/MainWindow.xaml",    "WpfQuickStart/Data/App.xaml",          0.2f, "WPF C#-style MVVM + typed x:Name + TreeView/Menu/StatusBar"},
+    {"CustomAnimation",  "CustomAnimation/Data/MainPage.xaml",    nullptr,                                1.0f, "Custom Bounce/Elastic/Back/Exp/Circle/Shake animations"},
+    {"CustomControl",    "CustomControl/Data/MainPage.xaml",      nullptr,                                0.5f, "Templated DateTime clock with RadialTicks & RadialNeedle"},
+    {"CustomRender",     "CustomRender/Data/MainWindow.xaml",     nullptr,                                0.5f, "Custom OnRender interactive Breakout arcade game"},
+    {"Integration",      "Integration/Data/MainPage.xaml",        nullptr,                                1.0f, "Settings UI with sliders, combo boxes & checkboxes"},
+    {"Theme",            "Theme/Data/MainWindow.xaml",            "Theme/Data/App.xaml",                  0.5f, "NoesisTheme DarkBlue control styles & typography preview"},
+    {"VideoEffect",      "VideoEffect/Data/MainPage.xaml",        nullptr,                                1.0f, "Animated shader & blur title sequence"},
 };
 
 std::string ToLowerAscii(std::string_view sv) {
@@ -139,7 +149,7 @@ void PrintUsage(const fs::path& samplesRoot) {
         << "  --settle <sec>          Pre-advance animations by <sec> before showing\n"
         << "  --frames <count>        Render <count> frames and exit automatically (0 = interactive)\n"
         << "  --screenshot <out.bmp>  Capture rendered framebuffer to BMP file\n"
-        << "  --export-all <dir>      Render all 16 official presets to <dir>/*.bmp and exit\n"
+        << "  --export-all <dir>      Render all " << std::size(kPresets) << " official presets to <dir>/*.bmp and exit\n"
         << "  --software              Prefer GDI/Software surface instead of OpenGL 3.3\n"
         << "  --headless              Run offscreen headless software rasterizer (no OS window)\n"
         << "  --help                  Show this help message\n";
@@ -149,7 +159,7 @@ void PrintUsage(const fs::path& samplesRoot) {
 }
 
 void PrintPresetList(const fs::path& samplesRoot) {
-    std::cout << "=== 16 Built-in Official Sample Presets ===\n";
+    std::cout << "=== " << std::size(kPresets) << " Built-in Official Sample Presets ===\n";
     for (const auto& p : kPresets) {
         std::printf("  %-18s -> %-36s (%s)\n", p.name, p.relXamlPath, p.description);
     }
@@ -186,7 +196,7 @@ bool ResolveTarget(
     ResolvedTarget& outTarget) {
     const std::string specLower = ToLowerAscii(targetSpec);
 
-    // 1. Check built-in 16 presets (plus "Blending" alias for "Gallery_Blending")
+    // 1. Check built-in presets (plus "Blending" alias for "Gallery_Blending")
     for (const auto& p : kPresets) {
         if (ToLowerAscii(p.name) == specLower ||
             (specLower == "blending" && std::strcmp(p.name, "Gallery_Blending") == 0)) {
@@ -204,10 +214,32 @@ bool ResolveTarget(
         }
     }
 
-    // 2. Direct path on disk
     std::error_code ec;
+    auto resolveCsprojTarget = [&](const fs::path& csprojPath, const std::string& fallbackName) -> bool {
+        const fs::path projDir = csprojPath.parent_path();
+        const fs::path appXaml = projDir / "App.xaml";
+        if (fs::is_regular_file(appXaml, ec)) {
+            outTarget.extraDictPath = appXaml;
+        } else if (fs::is_regular_file(projDir / "Resources.xaml", ec)) {
+            outTarget.extraDictPath = projDir / "Resources.xaml";
+        }
+        for (const char* mainCandidate : {"MainWindow.xaml", "MainPage.xaml"}) {
+            if (fs::is_regular_file(projDir / mainCandidate, ec)) {
+                outTarget.filePath = projDir / mainCandidate;
+                outTarget.displayName = !fallbackName.empty() ? fallbackName : csprojPath.stem().string();
+                outTarget.isRiveFile = false;
+                return true;
+            }
+        }
+        return false;
+    };
+
+    // 2. Direct path on disk
     fs::path direct(targetSpec);
     if (fs::is_regular_file(direct, ec)) {
+        if (ToLowerAscii(direct.extension().string()) == ".csproj") {
+            return resolveCsprojTarget(direct, direct.stem().string());
+        }
         outTarget.filePath = direct;
         outTarget.displayName = direct.stem().string();
         outTarget.isRiveFile = (ToLowerAscii(direct.extension().string()) == ".riv");
@@ -218,6 +250,9 @@ bool ResolveTarget(
         // 3. Relative to Samples root (e.g. "Menu3D/Data/MainPage.xaml" or "Menu3D")
         fs::path underSamples = samplesRoot / targetSpec;
         if (fs::is_regular_file(underSamples, ec)) {
+            if (ToLowerAscii(underSamples.extension().string()) == ".csproj") {
+                return resolveCsprojTarget(underSamples, underSamples.stem().string());
+            }
             outTarget.filePath = underSamples;
             outTarget.displayName = underSamples.stem().string();
             outTarget.isRiveFile = (ToLowerAscii(underSamples.extension().string()) == ".riv");
@@ -230,6 +265,8 @@ bool ResolveTarget(
                     outTarget.displayName = underSamples.filename().string();
                     if (fs::is_regular_file(underSamples / "Data/Resources.xaml", ec)) {
                         outTarget.extraDictPath = underSamples / "Data/Resources.xaml";
+                    } else if (fs::is_regular_file(underSamples / "Data/App.xaml", ec)) {
+                        outTarget.extraDictPath = underSamples / "Data/App.xaml";
                     }
                     return true;
                 }
@@ -473,13 +510,30 @@ int MountAndRunSingleTarget(
             }
         }
 
-        // Register sibling ResourceDictionaries and local UserControls in Data/
+        // Register sibling ResourceDictionaries and local UserControls in Data/ (including nested Controls/)
+        struct SiblingControlInfo {
+            fs::path path;
+            aero::AxbPackage pkg;
+        };
         std::vector<fs::path> siblingXamls;
-        for (const auto& entry : fs::directory_iterator(projDataDir, ec)) {
-            if (entry.is_regular_file() &&
-                ToLowerAscii(entry.path().extension().string()) == ".xaml" &&
-                entry.path() != target.filePath) {
-                siblingXamls.push_back(entry.path());
+        std::vector<SiblingControlInfo> siblingControls;
+        for (auto it = fs::recursive_directory_iterator(projDataDir, ec);
+             it != fs::recursive_directory_iterator();
+             ++it) {
+            const std::string fn = it->path().filename().string();
+            const std::string fnLower = ToLowerAscii(fn);
+            if (it->is_directory()) {
+                if ((!fn.empty() && fn[0] == '.') ||
+                    fnLower == "obj" || fnLower == "bin" || fnLower == "theme" ||
+                    fnLower == "samples" || fnLower == "pagepreviews") {
+                    it.disable_recursion_pending();
+                }
+                continue;
+            }
+            if (it->is_regular_file() &&
+                ToLowerAscii(it->path().extension().string()) == ".xaml" &&
+                it->path() != target.filePath) {
+                siblingXamls.push_back(it->path());
             }
         }
         std::sort(siblingXamls.begin(), siblingXamls.end());
@@ -500,13 +554,19 @@ int MountAndRunSingleTarget(
                     (target.extraDictPath.empty() && stem == "Language-en")) {
                     aero::AxbTemplateRegistry::Instance().RegisterResources(sibRes.axbPackage);
                 }
-                if (stem != "Resources" && !isLangDict) {
+                if (stem != "Resources" && stem != "App" && !isLangDict) {
                     if (!sibRes.axbPackage.className.empty()) {
                         aero::AxbTemplateRegistry::Instance().Register(
                             sibRes.axbPackage.className, sibRes.axbPackage);
                     }
                     aero::AxbTemplateRegistry::Instance().Register(stem, sibRes.axbPackage);
                     aero::AxbTemplateRegistry::Instance().Register("local:" + stem, sibRes.axbPackage);
+                    aero::AxbTemplateRegistry::Instance().Register("controls:" + stem, sibRes.axbPackage);
+                    if ((sibRes.axbPackage.rootTypeName == "UserControl" ||
+                         sibRes.axbPackage.rootTypeName == "Page") &&
+                        !sibRes.axbPackage.className.empty()) {
+                        siblingControls.push_back(SiblingControlInfo{sibPath, sibRes.axbPackage});
+                    }
                 }
             }
         }
@@ -517,11 +577,16 @@ int MountAndRunSingleTarget(
         mainIn.resourceSearchPaths = commonSearchPaths;
         std::vector<std::string> effectiveRsPaths = opts.rsPaths;
         if (effectiveRsPaths.empty()) {
-            // Auto-discover sample RealScript (*.rs) MainWindow/ViewModel files in projDataDir
+            // Auto-discover sample RealScript (*.rs) and C# (*.csproj / *.cs) scripts in projDataDir
             std::vector<fs::path> discoveredRs;
+            bool hasAnyCsproj = false;
+            bool hasSdkCsproj = false;
             for (const auto& entry : fs::directory_iterator(projDataDir, ec)) {
-                if (entry.is_regular_file() &&
-                    ToLowerAscii(entry.path().extension().string()) == ".rs") {
+                if (!entry.is_regular_file()) {
+                    continue;
+                }
+                const std::string ext = ToLowerAscii(entry.path().extension().string());
+                if (ext == ".rs") {
                     // For Gallery sub-samples (like Blending.xaml, Effects.xaml, Brushes.xaml),
                     // skip Gallery shell's MainWindow.rs / ViewModel.rs
                     if (target.filePath.parent_path() != projDataDir &&
@@ -530,6 +595,45 @@ int MountAndRunSingleTarget(
                         continue;
                     }
                     discoveredRs.push_back(entry.path());
+                } else if (ext == ".csproj") {
+                    hasAnyCsproj = true;
+                    std::string projText;
+                    if (ReadTextFile(entry.path(), projText) &&
+                        projText.find("Sdk=") != std::string::npos) {
+                        hasSdkCsproj = true;
+                    }
+                }
+            }
+            if (discoveredRs.empty() &&
+                target.filePath.parent_path() == projDataDir &&
+                (hasSdkCsproj || !hasAnyCsproj)) {
+                for (auto it = fs::recursive_directory_iterator(projDataDir, ec);
+                     it != fs::recursive_directory_iterator();
+                     ++it) {
+                    const std::string fn = it->path().filename().string();
+                    const std::string fnLower = ToLowerAscii(fn);
+                    if (it->is_directory()) {
+                        if ((!fn.empty() && fn[0] == '.') ||
+                            fnLower == "obj" || fnLower == "bin" || fnLower == "properties") {
+                            it.disable_recursion_pending();
+                        }
+                        continue;
+                    }
+                    if (!it->is_regular_file() ||
+                        ToLowerAscii(it->path().extension().string()) != ".cs") {
+                        continue;
+                    }
+                    if (fnLower.size() >= 5u && fnLower.rfind(".g.cs") == fnLower.size() - 5u) {
+                        continue;
+                    }
+                    if (fnLower.size() >= 12u &&
+                        fnLower.rfind(".designer.cs") == fnLower.size() - 12u) {
+                        continue;
+                    }
+                    if (fnLower == "assemblyinfo.cs") {
+                        continue;
+                    }
+                    discoveredRs.push_back(it->path());
                 }
             }
             std::sort(discoveredRs.begin(), discoveredRs.end());
@@ -544,6 +648,162 @@ int MountAndRunSingleTarget(
                 return 1;
             }
             mainIn.scriptSources.push_back(aero::SourceFile{rsFile, std::move(rsCode)});
+        }
+        if (!effectiveRsPaths.empty() && !siblingControls.empty()) {
+            auto isIdentCh = [](unsigned char c) noexcept -> bool {
+                return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                       (c >= '0' && c <= '9') || c == '_';
+            };
+            auto stripCommentsAndStrings = [](std::string_view src) -> std::string {
+                std::string out;
+                out.reserve(src.size());
+                bool inStr = false;
+                for (std::size_t i = 0u; i < src.size(); ++i) {
+                    if (inStr) {
+                        out.push_back(' ');
+                        if (src[i] == '\\' && i + 1u < src.size()) {
+                            out.push_back(' ');
+                            ++i;
+                        } else if (src[i] == '"') {
+                            inStr = false;
+                        }
+                        continue;
+                    }
+                    if (src[i] == '"') {
+                        inStr = true;
+                        out.push_back(' ');
+                    } else if (src[i] == '/' && i + 1u < src.size() && src[i + 1u] == '/') {
+                        while (i < src.size() && src[i] != '\n') ++i;
+                        out.push_back('\n');
+                    } else if (src[i] == '/' && i + 1u < src.size() && src[i + 1u] == '*') {
+                        i += 2u;
+                        while (i + 1u < src.size() && !(src[i] == '*' && src[i + 1u] == '/')) ++i;
+                        ++i;
+                        out.push_back(' ');
+                    } else {
+                        out.push_back(src[i]);
+                    }
+                }
+                return out;
+            };
+            auto mapUcTag = [](std::string_view rt) -> std::string {
+                if (const auto c = rt.rfind(':'); c != std::string_view::npos) rt = rt.substr(c + 1u);
+                if (rt == "Window" || rt == "UserControl" || rt == "Page" || rt == "Button" ||
+                    rt == "RepeatButton" || rt == "CheckBox" || rt == "RadioButton" ||
+                    rt == "ToggleButton" || rt == "Hyperlink" || rt == "TextBox" ||
+                    rt == "PasswordBox" || rt == "Slider" || rt == "ProgressBar" ||
+                    rt == "ListBox" || rt == "ListView" || rt == "ComboBox" ||
+                    rt == "Expander" || rt == "Border" || rt == "Grid" || rt == "DockPanel" ||
+                    rt == "WrapPanel" || rt == "UniformGrid" || rt == "ScrollViewer" ||
+                    rt == "Canvas" || rt == "Image" || rt == "TabControl" || rt == "TabItem" ||
+                    rt == "TreeView" || rt == "TreeViewItem" || rt == "Menu" || rt == "MenuItem" ||
+                    rt == "ToolBar" || rt == "StatusBar" || rt == "StatusBarItem" ||
+                    rt == "Popup" || rt == "ToolTip" || rt == "ContextMenu" ||
+                    rt == "GridSplitter" || rt == "RiveControl" || rt == "ContentControl") {
+                    return std::string(rt);
+                }
+                if (rt == "TextBlock" || rt == "Label") return "TextBlock";
+                if (rt == "StackPanel" || rt == "VirtualizingStackPanel") return "StackPanel";
+                if (rt == "GroupBox" || rt == "HeaderedContentControl") return "GroupBox";
+                return "FrameworkElement";
+            };
+            for (const auto& sc : siblingControls) {
+                std::string shortUc = sc.pkg.className;
+                std::string modUc = "Aero.UI";
+                if (const auto dot = shortUc.rfind('.'); dot != std::string::npos) {
+                    modUc = shortUc.substr(0u, dot);
+                    shortUc = shortUc.substr(dot + 1u);
+                }
+                const std::string needle = "class " + shortUc;
+                bool ucHasUserCs = false;
+                bool ucUserHasBase = false;
+                bool ucUserDefinesInitComp = false;
+                bool ucUserDefinesDataContext = false;
+                for (const auto& sf : mainIn.scriptSources) {
+                    const std::string clean = stripCommentsAndStrings(sf.content);
+                    std::size_t pos = 0u;
+                    while ((pos = clean.find(needle, pos)) != std::string::npos) {
+                        const bool leftOk = (pos == 0u) || !isIdentCh(static_cast<unsigned char>(clean[pos - 1u]));
+                        const std::size_t after = pos + needle.size();
+                        const bool rightOk = (after >= clean.size()) || !isIdentCh(static_cast<unsigned char>(clean[after]));
+                        pos = after;
+                        if (!leftOk || !rightOk) continue;
+                        ucHasUserCs = true;
+                        const std::size_t openBrace = clean.find('{', after);
+                        if (openBrace != std::string::npos) {
+                            std::string_view header = std::string_view(clean).substr(after, openBrace - after);
+                            while (!header.empty() && (header.front() == ' ' || header.front() == '\t' ||
+                                   header.front() == '\r' || header.front() == '\n')) {
+                                header.remove_prefix(1u);
+                            }
+                            if (!header.empty() && header.front() == ':') {
+                                ucUserHasBase = true;
+                            }
+                            int depth = 1;
+                            std::size_t bi = openBrace + 1u;
+                            for (; bi < clean.size() && depth > 0; ++bi) {
+                                if (clean[bi] == '{') ++depth;
+                                else if (clean[bi] == '}') --depth;
+                            }
+                            const std::string_view body = std::string_view(clean).substr(openBrace, bi - openBrace);
+                            if (body.find("void InitializeComponent(") != std::string_view::npos ||
+                                body.find("void InitializeComponent (") != std::string_view::npos) {
+                                ucUserDefinesInitComp = true;
+                            }
+                            std::size_t dPos = 0u;
+                            while ((dPos = body.find("DataContext", dPos)) != std::string_view::npos) {
+                                const bool dl = (dPos == 0u) || !isIdentCh(static_cast<unsigned char>(body[dPos - 1u]));
+                                const std::size_t da = dPos + 11u;
+                                const bool dr = (da >= body.size()) || !isIdentCh(static_cast<unsigned char>(body[da]));
+                                dPos = da;
+                                if (!dl || !dr) continue;
+                                std::size_t k = da;
+                                while (k < body.size() && (body[k] == ' ' || body[k] == '\t' ||
+                                       body[k] == '\r' || body[k] == '\n')) ++k;
+                                if (k < body.size() && body[k] == '{') {
+                                    ucUserDefinesDataContext = true;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+                if (!ucHasUserCs) continue;
+                const std::string ucLeaf = sc.path.filename().string();
+                std::string ucStub = "// Auto-generated UserControl stub for " + sc.path.string() + "\n";
+                ucStub += "module " + modUc + ";\n";
+                if (modUc != "Aero.UI") ucStub += "import Aero.UI;\n";
+                ucStub += "\n[Observable]\npublic partial class " + shortUc +
+                          (ucUserHasBase ? "\n{\n" : " : UserControl\n{\n");
+                ucStub += "    private bool __aero_premounted = false;\n";
+                ucStub += "    private bool __aero_component_loaded = false;\n";
+                ucStub += "    private void __AeroEnsureLoaded() { if (!this.__aero_component_loaded && !this.__aero_premounted) { this.__aero_component_loaded = true; Aero_LoadComponent__" +
+                          shortUc + "(this, \"" + ucLeaf + "\"); } }\n";
+                for (const auto& nc : sc.pkg.namedControls) {
+                    if (nc.name.empty()) continue;
+                    const std::string st = mapUcTag(nc.typeName);
+                    ucStub += "    public handle __aero_handle_" + nc.name + ";\n";
+                    ucStub += "    private " + st + " __aero_cache_" + nc.name + " = null;\n";
+                    ucStub += "    public " + st + " " + nc.name + " { get { "
+                              "this.__AeroEnsureLoaded(); "
+                              "if (this.__aero_cache_" + nc.name + " == null) { " + st + " w = new " + st + "(); "
+                              "w.__nativeRootHandle = this.__aero_handle_" + nc.name + "; "
+                              "UIElement_RegisterWrapper(this.__aero_handle_" + nc.name + ", w); "
+                              "this.__aero_cache_" + nc.name + " = w; } else { "
+                              "this.__aero_cache_" + nc.name + ".__nativeRootHandle = this.__aero_handle_" + nc.name + "; "
+                              "UIElement_RegisterWrapper(this.__aero_handle_" + nc.name + ", this.__aero_cache_" + nc.name + "); } "
+                              "return this.__aero_cache_" + nc.name + "; } }\n";
+                }
+                if (!ucUserDefinesInitComp) {
+                    ucStub += "    public void InitializeComponent() { }\n";
+                }
+                if (!ucUserDefinesDataContext) {
+                    ucStub += "    public object DataContext { get { return GUI_GetDataContextObject(this); } set { GUI_SetDataContextObject(this, value); } }\n";
+                }
+                ucStub += "}\n";
+                ucStub += "public bool Aero_LoadComponent__" + shortUc + "(" + shortUc + " component, string uri) { return false; }\n";
+                mainIn.scriptSources.push_back(aero::SourceFile{shortUc + ".g.rs", std::move(ucStub)});
+            }
         }
 
         const aero::AeroCompileResult mainRes = compiler.Compile(mainIn);
@@ -758,6 +1018,10 @@ int MountAndRunSingleTarget(
 } // namespace
 
 int main(int argc, char** argv) {
+    aero::samples::RegisterCustomControlSampleTypes();
+    aero::samples::RegisterCustomRenderSampleTypes();
+    aero::samples::RegisterCustomAnimationSampleTypes();
+
     const fs::path samplesRoot = DiscoverSamplesRoot();
 
     std::string targetSpec;
@@ -837,7 +1101,7 @@ int main(int argc, char** argv) {
             }
             std::cout << "  [OK] " << singleOpts.screenshotBmpPath << "\n";
         }
-        std::cout << "[aero-viewer] All 16 screenshots exported successfully.\n";
+        std::cout << "[aero-viewer] All " << std::size(kPresets) << " screenshots exported successfully.\n";
         return 0;
     }
 

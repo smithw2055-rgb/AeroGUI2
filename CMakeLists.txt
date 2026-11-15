@@ -58,6 +58,7 @@ add_library(aerogui_runtime STATIC
 
 if(MSVC)
     target_compile_options(aerogui_runtime PUBLIC /utf-8)
+    add_link_options(/STACK:8388608)
 endif()
 
 target_include_directories(aerogui_runtime
@@ -201,6 +202,7 @@ if(AERO_BUILD_COMPILER_TOOLS)
         # End-to-end 11-sample MainWindow + ViewModel verification suite
         aero_register_core_test(samples_mainwindow_tests tests/samples_mainwindow_tests.cpp)
         aero_register_core_test(wpf_controls_and_script_tests tests/wpf_controls_and_script_tests.cpp)
+        aero_register_core_test(samples_completeness_tests tests/samples_completeness_tests.cpp)
     endif()
 else()
     # In Wasm / REALSCRIPT_SLIM_RUNTIME mode, aerocore & aerogui_core alias the pure runtime
