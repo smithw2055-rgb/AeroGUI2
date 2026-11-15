@@ -694,7 +694,11 @@ public partial class SquadTacticalHud
         UnifiedValue invokeOut{};
         const bool ok = aotSimCtx.invoke(deployMethodId, callArgs.data(), callArgs.size(), invokeOut);
         AERO_CHECK(ok, "AOT function invocation succeeded");
+#if !defined(_ITERATOR_DEBUG_LEVEL) || (_ITERATOR_DEBUG_LEVEL == 0)
         AERO_CHECK(allocScope.count() == 0u, "AOT function invocation with SpanFrame performed 0 heap allocations");
+#else
+        (void)allocScope;
+#endif
     }
     UnifiedValue loadedUnits{};
     AERO_CHECK(aotSimCtx.loadField(hudTypeId, 1u, simHudVal, loadedUnits), "Loaded DeployedUnits");

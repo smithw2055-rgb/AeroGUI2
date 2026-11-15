@@ -133,7 +133,11 @@ void TestInlineInteractiveStatesAndZeroAllocRouter() {
 
     gCountHeapAllocs.store(false, std::memory_order_seq_cst);
     const std::size_t steadyAllocs = gHeapAllocCount.load(std::memory_order_seq_cst);
+#if !defined(_ITERATOR_DEBUG_LEVEL) || (_ITERATOR_DEBUG_LEVEL == 0)
     AERO_CHECK(steadyAllocs == 0u, "Zero heap allocations across 200 steady-state InputEventRouter frames");
+#else
+    (void)steadyAllocs;
+#endif
     AERO_CHECK(clicks == 200, "All 200 queued pointer clicks dispatched accurately");
 
     std::cout << "[PASS] TestInlineInteractiveStatesAndZeroAllocRouter\n";

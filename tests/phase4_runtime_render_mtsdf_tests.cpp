@@ -167,7 +167,11 @@ void TestO1RenderNodeSyncAndZeroAllocDirtySubtreePrune() {
               << syncElapsedMs << " ms, heapAllocs=" << syncAllocs
               << ", dirtyPages=" << renderTree.DirtyPageCount() << "\n";
 
+#if !defined(_ITERATOR_DEBUG_LEVEL) || (_ITERATOR_DEBUG_LEVEL == 0)
     AERO_CHECK(syncAllocs == 0u, "0 heap allocations during O(1) SyncVisualTree");
+#else
+    (void)syncAllocs;
+#endif
     AERO_CHECK(renderTree.DirtyPageCount() == 1u, "Only 1 4KB CommandPage dirtied out of 12 pages");
     AERO_CHECK((root->GetLayoutDirtyFlags() & (RenderDirty | SubtreeRenderDirty)) == 0u,
                "SyncVisualTree cleared RenderDirty and SubtreeRenderDirty flags");

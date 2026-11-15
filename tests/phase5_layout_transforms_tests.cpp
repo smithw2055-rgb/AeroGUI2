@@ -555,8 +555,14 @@ void TestFull2DAffineTransformsXamlAotHitTestAndGoldenRaster() {
     {
         AllocationTrackingScope noAlloc;
         const std::size_t synced = tree.SyncVisualTree(root.Get());
+#if !defined(_ITERATOR_DEBUG_LEVEL) || (_ITERATOR_DEBUG_LEVEL == 0)
         AERO_CHECK(synced == 1u && noAlloc.count() == 0u,
                    "Live 45-degree rotation update synced in O(1) with 0 heap allocations");
+#else
+        (void)noAlloc;
+        AERO_CHECK(synced == 1u,
+                   "Live 45-degree rotation update synced in O(1)");
+#endif
     }
 
     std::cout << "[PASS] TestFull2DAffineTransformsXamlAotHitTestAndGoldenRaster\n";

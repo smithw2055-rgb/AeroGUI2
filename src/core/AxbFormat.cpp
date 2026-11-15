@@ -1882,6 +1882,12 @@ std::uint16_t ResolveAnimationTargetPropertyId(std::string_view targetPropertyPa
     if (s.find("TrimEnd") != std::string_view::npos) {
         return PropId_PathTrimEnd;
     }
+    if (s.find("ShaderTime") != std::string_view::npos ||
+        s.find("PlasmaBrush.Time") != std::string_view::npos ||
+        s.find(".Time)") != std::string_view::npos ||
+        s == "Time") {
+        return PropId_ShaderTime;
+    }
 
     const bool mentionsRenderTransform =
         (s.find("RenderTransform") != std::string_view::npos) ||
@@ -1922,7 +1928,8 @@ std::uint16_t ResolveAnimationTargetPropertyId(std::string_view targetPropertyPa
     }
     const bool isSubPropertyBrushPath =
         (s.find("RelativeTransform") != std::string_view::npos) ||
-        (s.find(".Transform.") != std::string_view::npos);
+        (s.find(".Transform.") != std::string_view::npos) ||
+        (s.find("Brush.Shader") != std::string_view::npos);
     if (!isSubPropertyBrushPath &&
         (s.find("Background") != std::string_view::npos || s.find("Fill") != std::string_view::npos)) {
         return PropId_Background;

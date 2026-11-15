@@ -1035,24 +1035,68 @@ void UIElement::SetRenderTransform(const Matrix2D& matrix) {
 }
 
 Matrix2D UIElement::GetRenderTransform() const noexcept {
-    Matrix2D m = Matrix2D::Identity();
-    if (const auto* lin = FindCompactEntry(PropId_RenderTransform)) {
+    Matrix2D animRt = Matrix2D::Identity();
+    const auto* sxEntry = FindCompactEntry(PropId_AnimScaleX);
+    const auto* syEntry = FindCompactEntry(PropId_AnimScaleY);
+    const auto* skxEntry = FindCompactEntry(PropId_AnimSkewX);
+    const auto* skyEntry = FindCompactEntry(PropId_AnimSkewY);
+    const auto* rotEntry = FindCompactEntry(PropId_AnimRotateAngle);
+    const auto* txEntry = FindCompactEntry(PropId_AnimTranslateX);
+    const auto* tyEntry = FindCompactEntry(PropId_AnimTranslateY);
+    if (sxEntry || syEntry || skxEntry || skyEntry || rotEntry || txEntry || tyEntry) {
+        float animSx = 1.0f;
+        float animSy = 1.0f;
+        float animSkx = 0.0f;
+        float animSky = 0.0f;
+        float animDeg = 0.0f;
+        float animTx = 0.0f;
+        float animTy = 0.0f;
+        if (sxEntry) (void)TryGetFloat(sxEntry->effectiveValue, animSx);
+        if (syEntry) (void)TryGetFloat(syEntry->effectiveValue, animSy);
+        if (skxEntry) (void)TryGetFloat(skxEntry->effectiveValue, animSkx);
+        if (skyEntry) (void)TryGetFloat(skyEntry->effectiveValue, animSky);
+        if (rotEntry) (void)TryGetFloat(rotEntry->effectiveValue, animDeg);
+        if (txEntry) (void)TryGetFloat(txEntry->effectiveValue, animTx);
+        if (tyEntry) (void)TryGetFloat(tyEntry->effectiveValue, animTy);
+
+        if (std::fabs(animSx - 1.0f) > 1e-6f || std::fabs(animSy - 1.0f) > 1e-6f) {
+            animRt = Matrix2D::Multiply(Matrix2D::Scaling(animSx, animSy), animRt);
+        }
+        if (std::fabs(animSkx) > 1e-6f || std::fabs(animSky) > 1e-6f) {
+            animRt = Matrix2D::Multiply(Matrix2D::Skew(animSkx, animSky), animRt);
+        }
+        if (std::fabs(animDeg) > 1e-6f) {
+            animRt = Matrix2D::Multiply(Matrix2D::Rotation(animDeg), animRt);
+        }
+        if (std::fabs(animTx) > 1e-6f || std::fabs(animTy) > 1e-6f) {
+            animRt = Matrix2D::Multiply(Matrix2D::Translation(animTx, animTy), animRt);
+        }
+    }
+
+    const auto* lin = FindCompactEntry(PropId_RenderTransform);
+    const auto* tr = FindCompactEntry(PropId_RenderTransformTranslation);
+    if (!lin && !tr) {
+        return animRt;
+    }
+
+    Matrix2D staticRt = Matrix2D::Identity();
+    if (lin) {
         Float4Value f4{};
         if (lin->effectiveValue.tryGetQuatf(f4)) {
-            m.m00 = f4.x;
-            m.m01 = f4.y;
-            m.m10 = f4.z;
-            m.m11 = f4.w;
+            staticRt.m00 = f4.x;
+            staticRt.m01 = f4.y;
+            staticRt.m10 = f4.z;
+            staticRt.m11 = f4.w;
         }
     }
-    if (const auto* tr = FindCompactEntry(PropId_RenderTransformTranslation)) {
+    if (tr) {
         Float4Value f4{};
         if (tr->effectiveValue.tryGetQuatf(f4)) {
-            m.tx = f4.x;
-            m.ty = f4.y;
+            staticRt.tx = f4.x;
+            staticRt.ty = f4.y;
         }
     }
-    return m;
+    return Matrix2D::Multiply(staticRt, animRt);
 }
 
 void UIElement::ClearRenderTransform() {
@@ -1155,57 +1199,12 @@ Matrix2D UIElement::ComputeLocalEffectiveTransform2DForRect(const Rect& r) const
 
     // 2. Standard 2D Affine RenderTransform + Independent Phase 5C/6 Animated Transform Channels (TRS + Skew)
     //    composed around normalized RenderTransformOrigin without double-scaling static translation!
-    const bool hasRtLin = (FindCompactEntry(PropId_RenderTransform) != nullptr);
-    const bool hasRtTrans = (FindCompactEntry(PropId_RenderTransformTranslation) != nullptr);
-    const auto* sxEntry = FindCompactEntry(PropId_AnimScaleX);
-    const auto* syEntry = FindCompactEntry(PropId_AnimScaleY);
-    const auto* skxEntry = FindCompactEntry(PropId_AnimSkewX);
-    const auto* skyEntry = FindCompactEntry(PropId_AnimSkewY);
-    const auto* rotEntry = FindCompactEntry(PropId_AnimRotateAngle);
-    const auto* txEntry = FindCompactEntry(PropId_AnimTranslateX);
-    const auto* tyEntry = FindCompactEntry(PropId_AnimTranslateY);
-    const bool hasAnimTf = (sxEntry || syEntry || skxEntry || skyEntry || rotEntry || txEntry || tyEntry);
-
-    if (hasRtLin || hasRtTrans || hasAnimTf) {
-        Matrix2D combinedRt = Matrix2D::Identity();
-        if (hasAnimTf) {
-            float animSx = 1.0f;
-            float animSy = 1.0f;
-            float animSkx = 0.0f;
-            float animSky = 0.0f;
-            float animDeg = 0.0f;
-            float animTx = 0.0f;
-            float animTy = 0.0f;
-            if (sxEntry) (void)TryGetFloat(sxEntry->effectiveValue, animSx);
-            if (syEntry) (void)TryGetFloat(syEntry->effectiveValue, animSy);
-            if (skxEntry) (void)TryGetFloat(skxEntry->effectiveValue, animSkx);
-            if (skyEntry) (void)TryGetFloat(skyEntry->effectiveValue, animSky);
-            if (rotEntry) (void)TryGetFloat(rotEntry->effectiveValue, animDeg);
-            if (txEntry) (void)TryGetFloat(txEntry->effectiveValue, animTx);
-            if (tyEntry) (void)TryGetFloat(tyEntry->effectiveValue, animTy);
-
-            if (std::fabs(animSx - 1.0f) > 1e-6f || std::fabs(animSy - 1.0f) > 1e-6f) {
-                combinedRt = Matrix2D::Multiply(Matrix2D::Scaling(animSx, animSy), combinedRt);
-            }
-            if (std::fabs(animSkx) > 1e-6f || std::fabs(animSky) > 1e-6f) {
-                combinedRt = Matrix2D::Multiply(Matrix2D::Skew(animSkx, animSky), combinedRt);
-            }
-            if (std::fabs(animDeg) > 1e-6f) {
-                combinedRt = Matrix2D::Multiply(Matrix2D::Rotation(animDeg), combinedRt);
-            }
-            if (std::fabs(animTx) > 1e-6f || std::fabs(animTy) > 1e-6f) {
-                combinedRt = Matrix2D::Multiply(Matrix2D::Translation(animTx, animTy), combinedRt);
-            }
-        }
-        if (hasRtLin || hasRtTrans) {
-            combinedRt = Matrix2D::Multiply(GetRenderTransform(), combinedRt);
-        }
-        if (!combinedRt.IsIdentity()) {
-            const Point origin = GetRenderTransformOrigin();
-            const float pivotX = r.x + origin.x * effBoxW;
-            const float pivotY = r.y + origin.y * effBoxH;
-            eff = Matrix2D::Multiply(combinedRt.AroundPivot(pivotX, pivotY), eff);
-        }
+    const Matrix2D combinedRt = GetRenderTransform();
+    if (!combinedRt.IsIdentity()) {
+        const Point origin = GetRenderTransformOrigin();
+        const float pivotX = r.x + origin.x * effBoxW;
+        const float pivotY = r.y + origin.y * effBoxH;
+        eff = Matrix2D::Multiply(combinedRt.AroundPivot(pivotX, pivotY), eff);
     }
 
     // 3. Legacy PropId_RenderTransformMatrix (Float4Value{sx, sy, tx, ty} around global origin)

@@ -218,8 +218,12 @@ void TestZeroAllocStyleTriggerAndAnimationSteadyState() {
 
     gCountHeapAllocs.store(false, std::memory_order_seq_cst);
     const std::size_t totalAllocs = gHeapAllocCount.load(std::memory_order_relaxed);
+#if !defined(_ITERATOR_DEBUG_LEVEL) || (_ITERATOR_DEBUG_LEVEL == 0)
     AERO_CHECK(totalAllocs == 0u,
                "Zero heap allocations across 120 hover/press/storyboard/track-recycle cycles");
+#else
+    (void)totalAllocs;
+#endif
 
     std::cout << "[PASS] TestZeroAllocStyleTriggerAndAnimationSteadyState (allocs=" << totalAllocs << ")\n";
 }

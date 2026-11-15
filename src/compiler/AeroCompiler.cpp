@@ -3041,13 +3041,23 @@ void SplitPathIntoHopsHelper(
 }
 
 bool TemplatedParentNeedsCompiledChain(const ParsedBindingClause& parsedBind) noexcept {
+    const std::string_view p = parsedBind.pathPart;
+    const std::size_t dot = p.find('.');
+    // ParseBindingMarkupExpression strips outer parentheses on attached properties and sets isAttachedPropertyPath.
+    const bool isSingleAttachedProp =
+        parsedBind.isAttachedPropertyPath &&
+        dot != std::string_view::npos &&
+        p.find('.', dot + 1u) == std::string_view::npos &&
+        p.find('(') == std::string_view::npos &&
+        p.find(')') == std::string_view::npos &&
+        p.find('[') == std::string_view::npos;
     return !parsedBind.stringFormat.empty() ||
            !parsedBind.converterKey.empty() ||
            !parsedBind.converterParameter.empty() ||
            parsedBind.converter != ValueConverterKind::None ||
            parsedBind.hasTargetNullValue ||
            parsedBind.mode == BindingMode::TwoWay ||
-           (parsedBind.pathPart.find('.') != std::string_view::npos);
+           (!isSingleAttachedProp && p.find('.') != std::string_view::npos);
 }
 
 AERO_NOINLINE AxbCompiledBindingChain BuildCompiledBindingChainHelper(
@@ -8727,6 +8737,8 @@ AERO_NOINLINE void HandleClosingTagNoInline(XamlCtx& ctx) {
         if (closed->targetPropId == PropId_LayoutTransform) {
             EmitStaticLayoutTransformMatrix(pkg, closed->accumulatedTransform);
         } else if (closed->hasAnyRtStep && closed->canDecomposeStaticRt) {
+            // Reset any prior attribute RenderTransform="m11,..." before emitting decomposed channels.
+            EmitStaticRenderTransformMatrix(pkg, Matrix2D::Identity());
             if (closed->hasRtScale) {
                 pkg.instructions.push_back(AxbInstruction{
                     AxbOpcode::SetStaticProperty, PropId_AnimScaleX, 0, 0, 0, 0, MakeFloat(closed->rtScaleX)});

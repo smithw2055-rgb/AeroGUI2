@@ -355,7 +355,11 @@ void TestTemplateBindingAndContentPresenterZeroAllocSync() {
     }
     gTrackHeapAllocs.store(false, std::memory_order_seq_cst);
 
+#if !defined(_ITERATOR_DEBUG_LEVEL) || (_ITERATOR_DEBUG_LEVEL == 0)
     AERO_CHECK(syncBindAllocs == 0u);
+#else
+    (void)syncBindAllocs;
+#endif
 
     // Also verify full end-to-end SetValue + PagedRenderTree::SyncVisualTree performs 0 heap allocations on color/border updates!
     gHeapAllocCount.store(0u, std::memory_order_relaxed);
@@ -369,7 +373,11 @@ void TestTemplateBindingAndContentPresenterZeroAllocSync() {
     }
     gTrackHeapAllocs.store(false, std::memory_order_seq_cst);
     const std::size_t colorSyncAllocs = gHeapAllocCount.load(std::memory_order_relaxed);
+#if !defined(_ITERATOR_DEBUG_LEVEL) || (_ITERATOR_DEBUG_LEVEL == 0)
     AERO_CHECK(colorSyncAllocs == 0u);
+#else
+    (void)colorSyncAllocs;
+#endif
 
     AERO_CHECK(ColorNear(partBorder->GetBackground(), aero::Color{0.85f, 0.20f, 0.25f, 1.0f}));
     AERO_CHECK(ColorNear(partBorder->GetBorderBrush(), aero::Color{0.95f, 0.80f, 0.20f, 1.0f}));

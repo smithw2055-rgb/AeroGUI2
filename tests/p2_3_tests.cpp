@@ -513,7 +513,7 @@ int main(int argc, char** argv) {
         {"Rive", "Rive/Data/MainPage.xaml", nullptr, 1.0f, 0xb5434a846c223365ULL, 50000u, 3000u},
         {"Effects", "Gallery/Data/Samples/Effects.xaml", "Gallery/Data/Resources.xaml", 1.0f, 0x63c53ebcb5fc3432ULL, 8000u, 2000u},
         {"BackgroundBlur", "BackgroundBlur/Data/MainPage.xaml", "BackgroundBlur/Data/Resources.xaml", 1.0f, 0x637465c308a7b16cULL, 40000u, 800u},
-        {"BrushShaders", "BrushShaders/Data/MainPage.xaml", nullptr, 1.0f, 0x9ca3061feedf5fd5ULL, 50000u, 300u},
+        {"BrushShaders", "BrushShaders/Data/MainPage.xaml", nullptr, 1.0f, 0x6e903983482a68a8ULL, 50000u, 300u},
         {"UserControl", "UserControl/Data/MainPage.xaml", "UserControl/Data/Resources.xaml", 1.0f, 0x261e72f064aeb55cULL, 50000u, 800u},
     };
 

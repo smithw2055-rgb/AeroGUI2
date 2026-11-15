@@ -349,6 +349,16 @@ public:
         return FirstChild() == nullptr;
     }
 
+    Size MeasureCore(Size availableSize) noexcept override {
+        SyncRotateTransformFromChildState();
+        return Panel::MeasureCore(availableSize);
+    }
+
+    void ArrangeCore(Rect finalRect) noexcept override {
+        SyncRotateTransformFromChildState();
+        Panel::ArrangeCore(finalRect);
+    }
+
     [[nodiscard]] float GetComputedAngle() const noexcept {
         const auto& ids = GetCustomControlSamplePropIds();
         float ang = 0.0f;
@@ -412,6 +422,20 @@ public:
     }
 
 private:
+    void SyncRotateTransformFromChildState() noexcept {
+        if (updatingAngle_) {
+            return;
+        }
+        const float target = (FirstChild() != nullptr) ? GetComputedAngle() : 0.0f;
+        float current = 0.0f;
+        const bool hasCur = value::TryGetFloat(GetValue(PropId_AnimRotateAngle), current) && std::isfinite(current);
+        if (std::fabs((hasCur ? current : 0.0f) - target) > 1e-4f) {
+            updatingAngle_ = true;
+            (void)SetValue(PropId_AnimRotateAngle, value::FromFloat(target), ValueSourceRank::Local);
+            updatingAngle_ = false;
+        }
+    }
+
     void UpdateAngle() {
         const auto& ids = GetCustomControlSamplePropIds();
         const float minVal = ReadFloatWithFallback(PropId_Minimum, ids.needleMinimum, 0.0f);
@@ -428,7 +452,8 @@ private:
         if (ids.needleAngle != 0xFFFFu) {
             (void)SetValue(ids.needleAngle, value::FromFloat(angle), ValueSourceRank::Local);
         }
-        (void)SetValue(PropId_AnimRotateAngle, value::FromFloat(angle), ValueSourceRank::Local);
+        const float transformAngle = (FirstChild() != nullptr) ? angle : 0.0f;
+        (void)SetValue(PropId_AnimRotateAngle, value::FromFloat(transformAngle), ValueSourceRank::Local);
         updatingAngle_ = false;
         InvalidateVisual();
     }
