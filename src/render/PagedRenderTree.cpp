@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <charconv>
 #include <cmath>
 #include <cstring>
 
@@ -268,6 +269,466 @@ void ApplyTextAlignmentToLayout(
             base.a};
     }
     return base;
+}
+
+[[nodiscard]] bool ParseSvgFloat(std::string_view s, std::size_t& pos, float& outVal) noexcept {
+    while (pos < s.size() && (s[pos] == ' ' || s[pos] == '\t' || s[pos] == '\r' || s[pos] == '\n' || s[pos] == ',')) {
+        ++pos;
+    }
+    if (pos >= s.size()) {
+        return false;
+    }
+    const std::size_t start = pos;
+    if (s[pos] == '+' || s[pos] == '-') {
+        ++pos;
+    }
+    bool anyDigit = false;
+    while (pos < s.size() && s[pos] >= '0' && s[pos] <= '9') {
+        anyDigit = true;
+        ++pos;
+    }
+    if (pos < s.size() && s[pos] == '.') {
+        ++pos;
+        while (pos < s.size() && s[pos] >= '0' && s[pos] <= '9') {
+            anyDigit = true;
+            ++pos;
+        }
+    }
+    if (!anyDigit) {
+        pos = start;
+        return false;
+    }
+    if (pos < s.size() && (s[pos] == 'e' || s[pos] == 'E')) {
+        const std::size_t expSave = pos++;
+        if (pos < s.size() && (s[pos] == '+' || s[pos] == '-')) {
+            ++pos;
+        }
+        bool expDigits = false;
+        while (pos < s.size() && s[pos] >= '0' && s[pos] <= '9') {
+            expDigits = true;
+            ++pos;
+        }
+        if (!expDigits) {
+            pos = expSave;
+        }
+    }
+    float parsed = 0.0f;
+    const auto res = std::from_chars(s.data() + start, s.data() + pos, parsed);
+    if (res.ec != std::errc{} || !std::isfinite(parsed)) {
+        pos = start;
+        return false;
+    }
+    outVal = parsed;
+    return true;
+}
+
+[[nodiscard]] bool ParseSvgFlag(std::string_view s, std::size_t& pos, int& outFlag) noexcept {
+    while (pos < s.size() && (s[pos] == ' ' || s[pos] == '\t' || s[pos] == '\r' || s[pos] == '\n' || s[pos] == ',')) {
+        ++pos;
+    }
+    if (pos >= s.size() || (s[pos] != '0' && s[pos] != '1')) {
+        return false;
+    }
+    outFlag = (s[pos] == '1') ? 1 : 0;
+    ++pos;
+    return true;
+}
+
+void AppendSvgArcPoints(
+    float x1,
+    float y1,
+    float rxIn,
+    float ryIn,
+    float angleDeg,
+    int largeArcFlag,
+    int sweepFlag,
+    float x2,
+    float y2,
+    std::vector<Point>& outPts) {
+    if (std::hypot(x2 - x1, y2 - y1) <= 1e-5f) {
+        return;
+    }
+    float rx = std::fabs(rxIn);
+    float ry = std::fabs(ryIn);
+    if (rx <= 1e-5f || ry <= 1e-5f) {
+        outPts.push_back(Point{x2, y2});
+        return;
+    }
+
+    constexpr float kPi = 3.14159265358979323846f;
+    const float phi = angleDeg * (kPi / 180.0f);
+    const float cosPhi = std::cos(phi);
+    const float sinPhi = std::sin(phi);
+    const float dx2 = (x1 - x2) * 0.5f;
+    const float dy2 = (y1 - y2) * 0.5f;
+    const float x1p = cosPhi * dx2 + sinPhi * dy2;
+    const float y1p = -sinPhi * dx2 + cosPhi * dy2;
+
+    const float lambda = (x1p * x1p) / (rx * rx) + (y1p * y1p) / (ry * ry);
+    if (lambda > 1.0f) {
+        const float s = std::sqrt(lambda);
+        rx *= s;
+        ry *= s;
+    }
+
+    const float rx2 = rx * rx;
+    const float ry2 = ry * ry;
+    const float x1p2 = x1p * x1p;
+    const float y1p2 = y1p * y1p;
+    const float num = std::max(0.0f, rx2 * ry2 - rx2 * y1p2 - ry2 * x1p2);
+    const float den = std::max(1e-8f, rx2 * y1p2 + ry2 * x1p2);
+    const float sign = (largeArcFlag == sweepFlag) ? -1.0f : 1.0f;
+    const float coef = sign * std::sqrt(num / den);
+    const float cxp = coef * ((rx * y1p) / ry);
+    const float cyp = coef * (-(ry * x1p) / rx);
+
+    const float cx = cosPhi * cxp - sinPhi * cyp + (x1 + x2) * 0.5f;
+    const float cy = sinPhi * cxp + cosPhi * cyp + (y1 + y2) * 0.5f;
+
+    auto vecAngle = [](float ux, float uy, float vx, float vy) noexcept -> float {
+        const float dot = ux * vx + uy * vy;
+        const float len = std::max(1e-8f, std::hypot(ux, uy) * std::hypot(vx, vy));
+        const float c = std::clamp(dot / len, -1.0f, 1.0f);
+        const float cross = ux * vy - uy * vx;
+        return (cross < 0.0f) ? -std::acos(c) : std::acos(c);
+    };
+
+    const float vx0 = (x1p - cxp) / rx;
+    const float vy0 = (y1p - cyp) / ry;
+    const float vx1 = (-x1p - cxp) / rx;
+    const float vy1 = (-y1p - cyp) / ry;
+    const float theta1 = vecAngle(1.0f, 0.0f, vx0, vy0);
+    float dTheta = vecAngle(vx0, vy0, vx1, vy1);
+    if (sweepFlag == 0 && dTheta > 0.0f) {
+        dTheta -= 2.0f * kPi;
+    } else if (sweepFlag != 0 && dTheta < 0.0f) {
+        dTheta += 2.0f * kPi;
+    }
+
+    const int steps = std::clamp(static_cast<int>(std::ceil(std::fabs(dTheta) / (kPi / 16.0f))), 4, 64);
+    for (int s = 1; s <= steps; ++s) {
+        const float t = static_cast<float>(s) / static_cast<float>(steps);
+        const float ang = theta1 + dTheta * t;
+        const float lx = rx * std::cos(ang);
+        const float ly = ry * std::sin(ang);
+        outPts.push_back(Point{
+            cosPhi * lx - sinPhi * ly + cx,
+            sinPhi * lx + cosPhi * ly + cy});
+    }
+}
+
+[[nodiscard]] std::vector<std::vector<Point>> ParseSvgPathToSubpaths(std::string_view pathStr) {
+    std::vector<std::vector<Point>> subpaths;
+    std::vector<Point> cur;
+    std::size_t pos = 0u;
+    float curX = 0.0f;
+    float curY = 0.0f;
+    float startX = 0.0f;
+    float startY = 0.0f;
+    float lastCtrlX = 0.0f;
+    float lastCtrlY = 0.0f;
+    char cmd = 0;
+    char prevCmd = 0;
+
+    auto flushCur = [&]() {
+        if (cur.size() >= 2u) {
+            subpaths.push_back(std::move(cur));
+        }
+        cur.clear();
+    };
+    auto skipWs = [&]() {
+        while (pos < pathStr.size() &&
+               (pathStr[pos] == ' ' || pathStr[pos] == '\t' || pathStr[pos] == '\r' ||
+                pathStr[pos] == '\n' || pathStr[pos] == ',')) {
+            ++pos;
+        }
+    };
+    auto appendCubic = [&](float x1, float y1, float x2, float y2, float x3, float y3) {
+        constexpr int kSteps = 16;
+        const float x0 = curX;
+        const float y0 = curY;
+        for (int i = 1; i <= kSteps; ++i) {
+            const float t = static_cast<float>(i) / static_cast<float>(kSteps);
+            const float u = 1.0f - t;
+            const float b0 = u * u * u;
+            const float b1 = 3.0f * u * u * t;
+            const float b2 = 3.0f * u * t * t;
+            const float b3 = t * t * t;
+            cur.push_back(Point{
+                b0 * x0 + b1 * x1 + b2 * x2 + b3 * x3,
+                b0 * y0 + b1 * y1 + b2 * y2 + b3 * y3});
+        }
+    };
+    auto appendQuad = [&](float x1, float y1, float x2, float y2) {
+        constexpr int kSteps = 12;
+        const float x0 = curX;
+        const float y0 = curY;
+        for (int i = 1; i <= kSteps; ++i) {
+            const float t = static_cast<float>(i) / static_cast<float>(kSteps);
+            const float u = 1.0f - t;
+            cur.push_back(Point{
+                u * u * x0 + 2.0f * u * t * x1 + t * t * x2,
+                u * u * y0 + 2.0f * u * t * y1 + t * t * y2});
+        }
+    };
+
+    while (pos < pathStr.size()) {
+        skipWs();
+        if (pos >= pathStr.size()) {
+            break;
+        }
+        const char ch = pathStr[pos];
+        if ((ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z')) {
+            cmd = ch;
+            ++pos;
+        } else if (cmd == 0) {
+            ++pos;
+            continue;
+        }
+
+        const bool rel = (cmd >= 'a' && cmd <= 'z');
+        const char upper = rel ? static_cast<char>(cmd - ('a' - 'A')) : cmd;
+
+        if (upper == 'Z') {
+            if (!cur.empty() && std::hypot(startX - curX, startY - curY) > 1e-4f) {
+                cur.push_back(Point{startX, startY});
+            }
+            curX = startX;
+            curY = startY;
+            lastCtrlX = curX;
+            lastCtrlY = curY;
+            prevCmd = upper;
+            flushCur();
+            cmd = 0;
+            continue;
+        }
+
+        if (upper == 'F') {
+            // Optional WPF fill rule prefix (F0/F1)
+            float ruleVal = 0.0f;
+            (void)ParseSvgFloat(pathStr, pos, ruleVal);
+            cmd = 0;
+            continue;
+        }
+
+        if (upper == 'M') {
+            float nx = 0.0f, ny = 0.0f;
+            if (!ParseSvgFloat(pathStr, pos, nx) || !ParseSvgFloat(pathStr, pos, ny)) {
+                break;
+            }
+            if (rel) {
+                nx += curX;
+                ny += curY;
+            }
+            flushCur();
+            curX = nx;
+            curY = ny;
+            startX = nx;
+            startY = ny;
+            lastCtrlX = nx;
+            lastCtrlY = ny;
+            cur.push_back(Point{nx, ny});
+            prevCmd = 'M';
+            cmd = rel ? 'l' : 'L';
+        } else if (upper == 'L') {
+            float nx = 0.0f, ny = 0.0f;
+            if (!ParseSvgFloat(pathStr, pos, nx) || !ParseSvgFloat(pathStr, pos, ny)) {
+                cmd = 0;
+                continue;
+            }
+            if (rel) {
+                nx += curX;
+                ny += curY;
+            }
+            if (cur.empty()) cur.push_back(Point{curX, curY});
+            cur.push_back(Point{nx, ny});
+            curX = nx;
+            curY = ny;
+            lastCtrlX = curX;
+            lastCtrlY = curY;
+            prevCmd = 'L';
+        } else if (upper == 'H') {
+            float nx = 0.0f;
+            if (!ParseSvgFloat(pathStr, pos, nx)) {
+                cmd = 0;
+                continue;
+            }
+            if (rel) nx += curX;
+            if (cur.empty()) cur.push_back(Point{curX, curY});
+            cur.push_back(Point{nx, curY});
+            curX = nx;
+            lastCtrlX = curX;
+            lastCtrlY = curY;
+            prevCmd = 'H';
+        } else if (upper == 'V') {
+            float ny = 0.0f;
+            if (!ParseSvgFloat(pathStr, pos, ny)) {
+                cmd = 0;
+                continue;
+            }
+            if (rel) ny += curY;
+            if (cur.empty()) cur.push_back(Point{curX, curY});
+            cur.push_back(Point{curX, ny});
+            curY = ny;
+            lastCtrlX = curX;
+            lastCtrlY = curY;
+            prevCmd = 'V';
+        } else if (upper == 'C') {
+            float x1 = 0.0f, y1 = 0.0f, x2 = 0.0f, y2 = 0.0f, x3 = 0.0f, y3 = 0.0f;
+            if (!ParseSvgFloat(pathStr, pos, x1) || !ParseSvgFloat(pathStr, pos, y1) ||
+                !ParseSvgFloat(pathStr, pos, x2) || !ParseSvgFloat(pathStr, pos, y2) ||
+                !ParseSvgFloat(pathStr, pos, x3) || !ParseSvgFloat(pathStr, pos, y3)) {
+                cmd = 0;
+                continue;
+            }
+            if (rel) {
+                x1 += curX; y1 += curY;
+                x2 += curX; y2 += curY;
+                x3 += curX; y3 += curY;
+            }
+            if (cur.empty()) cur.push_back(Point{curX, curY});
+            appendCubic(x1, y1, x2, y2, x3, y3);
+            lastCtrlX = x2;
+            lastCtrlY = y2;
+            curX = x3;
+            curY = y3;
+            prevCmd = 'C';
+        } else if (upper == 'S') {
+            float x2 = 0.0f, y2 = 0.0f, x3 = 0.0f, y3 = 0.0f;
+            if (!ParseSvgFloat(pathStr, pos, x2) || !ParseSvgFloat(pathStr, pos, y2) ||
+                !ParseSvgFloat(pathStr, pos, x3) || !ParseSvgFloat(pathStr, pos, y3)) {
+                cmd = 0;
+                continue;
+            }
+            if (rel) {
+                x2 += curX; y2 += curY;
+                x3 += curX; y3 += curY;
+            }
+            const float x1 = (prevCmd == 'C' || prevCmd == 'S') ? (2.0f * curX - lastCtrlX) : curX;
+            const float y1 = (prevCmd == 'C' || prevCmd == 'S') ? (2.0f * curY - lastCtrlY) : curY;
+            if (cur.empty()) cur.push_back(Point{curX, curY});
+            appendCubic(x1, y1, x2, y2, x3, y3);
+            lastCtrlX = x2;
+            lastCtrlY = y2;
+            curX = x3;
+            curY = y3;
+            prevCmd = 'S';
+        } else if (upper == 'Q') {
+            float x1 = 0.0f, y1 = 0.0f, x2 = 0.0f, y2 = 0.0f;
+            if (!ParseSvgFloat(pathStr, pos, x1) || !ParseSvgFloat(pathStr, pos, y1) ||
+                !ParseSvgFloat(pathStr, pos, x2) || !ParseSvgFloat(pathStr, pos, y2)) {
+                cmd = 0;
+                continue;
+            }
+            if (rel) {
+                x1 += curX; y1 += curY;
+                x2 += curX; y2 += curY;
+            }
+            if (cur.empty()) cur.push_back(Point{curX, curY});
+            appendQuad(x1, y1, x2, y2);
+            lastCtrlX = x1;
+            lastCtrlY = y1;
+            curX = x2;
+            curY = y2;
+            prevCmd = 'Q';
+        } else if (upper == 'T') {
+            float x2 = 0.0f, y2 = 0.0f;
+            if (!ParseSvgFloat(pathStr, pos, x2) || !ParseSvgFloat(pathStr, pos, y2)) {
+                cmd = 0;
+                continue;
+            }
+            if (rel) {
+                x2 += curX; y2 += curY;
+            }
+            const float x1 = (prevCmd == 'Q' || prevCmd == 'T') ? (2.0f * curX - lastCtrlX) : curX;
+            const float y1 = (prevCmd == 'Q' || prevCmd == 'T') ? (2.0f * curY - lastCtrlY) : curY;
+            if (cur.empty()) cur.push_back(Point{curX, curY});
+            appendQuad(x1, y1, x2, y2);
+            lastCtrlX = x1;
+            lastCtrlY = y1;
+            curX = x2;
+            curY = y2;
+            prevCmd = 'T';
+        } else if (upper == 'A') {
+            float rx = 0.0f, ry = 0.0f, rot = 0.0f, x2 = 0.0f, y2 = 0.0f;
+            int largeArc = 0, sweep = 0;
+            if (!ParseSvgFloat(pathStr, pos, rx) || !ParseSvgFloat(pathStr, pos, ry) ||
+                !ParseSvgFloat(pathStr, pos, rot) || !ParseSvgFlag(pathStr, pos, largeArc) ||
+                !ParseSvgFlag(pathStr, pos, sweep) || !ParseSvgFloat(pathStr, pos, x2) ||
+                !ParseSvgFloat(pathStr, pos, y2)) {
+                cmd = 0;
+                continue;
+            }
+            if (rel) {
+                x2 += curX;
+                y2 += curY;
+            }
+            if (cur.empty()) cur.push_back(Point{curX, curY});
+            AppendSvgArcPoints(curX, curY, rx, ry, rot, largeArc, sweep, x2, y2, cur);
+            curX = x2;
+            curY = y2;
+            lastCtrlX = curX;
+            lastCtrlY = curY;
+            prevCmd = 'A';
+        } else {
+            cmd = 0;
+        }
+    }
+    flushCur();
+    return subpaths;
+}
+
+[[nodiscard]] std::vector<Point> TrimSubpathPolyline(
+    const std::vector<Point>& pts,
+    float trimStart01,
+    float trimEnd01) {
+    std::vector<Point> out;
+    if (pts.size() < 2u || trimEnd01 <= trimStart01) {
+        return out;
+    }
+    std::vector<float> cum(pts.size(), 0.0f);
+    for (std::size_t i = 1u; i < pts.size(); ++i) {
+        const float seg = std::hypot(pts[i].x - pts[i - 1u].x, pts[i].y - pts[i - 1u].y);
+        cum[i] = cum[i - 1u] + seg;
+    }
+    const float total = cum.back();
+    if (total <= 1e-5f) {
+        return out;
+    }
+    const float d0 = std::clamp(trimStart01, 0.0f, 1.0f) * total;
+    const float d1 = std::clamp(trimEnd01, 0.0f, 1.0f) * total;
+    if (d1 <= d0 + 1e-5f) {
+        return out;
+    }
+    for (std::size_t i = 0u; i + 1u < pts.size(); ++i) {
+        const float a = cum[i];
+        const float b = cum[i + 1u];
+        const float segLen = b - a;
+        if (segLen <= 1e-6f || b < d0 || a > d1) {
+            continue;
+        }
+        const float tA = (a < d0) ? std::clamp((d0 - a) / segLen, 0.0f, 1.0f) : 0.0f;
+        const float tB = (b > d1) ? std::clamp((d1 - a) / segLen, 0.0f, 1.0f) : 1.0f;
+        if (tB <= tA + 1e-6f) {
+            continue;
+        }
+        const Point pA{
+            pts[i].x + (pts[i + 1u].x - pts[i].x) * tA,
+            pts[i].y + (pts[i + 1u].y - pts[i].y) * tA};
+        const Point pB{
+            pts[i].x + (pts[i + 1u].x - pts[i].x) * tB,
+            pts[i].y + (pts[i + 1u].y - pts[i].y) * tB};
+        if (out.empty()) {
+            out.push_back(pA);
+        } else if (std::hypot(pA.x - out.back().x, pA.y - out.back().y) > 1e-4f) {
+            out.push_back(pA);
+        }
+        out.push_back(pB);
+    }
+    if (out.size() < 2u) {
+        out.clear();
+    }
+    return out;
 }
 
 struct SliderVisualGeometry {
@@ -2622,8 +3083,18 @@ bool PagedRenderTree::UpdateElementInPlace(
     }
     if (element->GetEffectDescriptor().kind != UIEffectKind::None ||
         element->IsA<BoxShadow>() ||
+        element->HasCustomRender() ||
+        element->IsA<MediaElement>() ||
         element->FindCompactEntry(PropId_BlendingMode) != nullptr) {
         return false;
+    }
+    if (element->IsA<Ellipse>()) {
+        float ts = 0.0f, te = 1.0f;
+        (void)TryGetFloat(element->GetValue(PropId_PathTrimStart), ts);
+        (void)TryGetFloat(element->GetValue(PropId_PathTrimEnd), te);
+        if (ts > 0.0f || te < 1.0f || nodes_[firstId].primType == AeroPrimType::SdfRadialArc) {
+            return false;
+        }
     }
 
     const Visibility vis = element->GetVisibility();
@@ -2764,6 +3235,11 @@ bool PagedRenderTree::UpdateElementInPlace(
     }
 
     if (const auto* pathElem = element->DynamicCast<Path>()) {
+        const float trimStart = std::clamp(pathElem->GetTrimStart(), 0.0f, 1.0f);
+        const float trimEnd = std::clamp(pathElem->GetTrimEnd(), 0.0f, 1.0f);
+        if (trimStart > 0.0f || trimEnd < 1.0f || nodes_[firstId].primType == AeroPrimType::SdfRoundedRect) {
+            return false;
+        }
         const std::string pathStr = pathElem->GetData();
         const AxbMtsdfPathEntry* entry = AxbTemplateRegistry::Instance().FindOrBakeMtsdfPath(pathStr);
         if (!entry || vis == Visibility::Collapsed) {
@@ -4176,6 +4652,631 @@ bool PagedRenderTree::SyncDirtySubtreeRecursive(
     return true;
 }
 
+class PagedCustomDrawingContext final : public CustomDrawingContext {
+public:
+    PagedCustomDrawingContext(
+        PagedRenderTree& tree,
+        const PagedRenderTree::RenderTraversalState& state,
+        const UIElement* owner,
+        float originX,
+        float originY,
+        float effOpacity) noexcept
+        : tree_(tree),
+          state_(state),
+          owner_(owner),
+          originX_(originX),
+          originY_(originY),
+          effOpacity_(effOpacity) {}
+
+    [[nodiscard]] std::uint16_t EmittedCount() const noexcept {
+        return emittedCount_;
+    }
+
+    static void ApplyNodeTransform(
+        PagedRenderTree& tree,
+        std::uint32_t nid,
+        const PagedRenderTree::RenderTraversalState& curState) noexcept {
+        RenderNodeDescriptor& nd = tree.nodes_[nid];
+        nd.m00 = curState.m00;
+        nd.m01 = curState.m01;
+        nd.m10 = curState.m10;
+        nd.m11 = curState.m11;
+        nd.baseTx = curState.tx;
+        nd.baseTy = curState.ty;
+        nd.tx = curState.tx + nd.x * (curState.m00 - 1.0f) + nd.y * curState.m01;
+        nd.ty = curState.ty + nd.x * curState.m10 + nd.y * (curState.m11 - 1.0f);
+        nd.inheritedOpacity = curState.inheritedOpacity;
+        nd.hasPerspective3D = curState.hasPerspective3D;
+        nd.blendMode = curState.blendMode;
+        nd.worldMatrix3D = curState.world3D;
+        if (nd.primType != AeroPrimType::SdfTextGlyph) {
+            tree.WriteQuadVertices(nd);
+        }
+    }
+
+    static std::uint16_t EmitCapsuleLine(
+        PagedRenderTree& tree,
+        float x1,
+        float y1,
+        float x2,
+        float y2,
+        float strokeW,
+        const Color& strokeCol,
+        float effOpacity,
+        bool emitEvenIfInvisible,
+        bool roundCapExtend,
+        const PagedRenderTree::RenderTraversalState& curState,
+        const UIElement* owner) {
+        float wx1 = x1;
+        float wy1 = y1;
+        float wx2 = x2;
+        float wy2 = y2;
+        const bool projected3D = curState.hasPerspective3D;
+        if (projected3D) {
+            const Point p1 = curState.world3D.ProjectPoint2D(Point{wx1, wy1});
+            const Point p2 = curState.world3D.ProjectPoint2D(Point{wx2, wy2});
+            wx1 = p1.x;
+            wy1 = p1.y;
+            wx2 = p2.x;
+            wy2 = p2.y;
+        }
+        const float dx = wx2 - wx1;
+        const float dy = wy2 - wy1;
+        const float segLen = std::sqrt(dx * dx + dy * dy);
+        const bool hasVis = (strokeW > 0.0f) && (strokeCol.a > 0.0f) && (effOpacity > 0.0f) &&
+                            std::isfinite(segLen) && (segLen > 1e-3f);
+        if (!hasVis && !emitEvenIfInvisible) {
+            return 0u;
+        }
+
+        const float ux = (segLen > 1e-4f) ? (dx / segLen) : 1.0f;
+        const float uy = (segLen > 1e-4f) ? (dy / segLen) : 0.0f;
+        const float capExt = (hasVis && roundCapExtend) ? (0.5f * strokeW) : 0.0f;
+        const float sx = wx1 - capExt * ux;
+        const float sy = wy1 - capExt * uy;
+        const float boxLen = segLen + 2.0f * capExt;
+        const float px0 = sx + 0.5f * strokeW * uy;
+        const float py0 = sy - 0.5f * strokeW * ux;
+
+        const std::uint32_t segId = tree.AllocateRoundedRectNode(
+            px0,
+            py0,
+            hasVis ? boxLen : 0.0f,
+            hasVis ? strokeW : 0.0f,
+            strokeCol,
+            CornerRadius{strokeW * 0.5f},
+            owner);
+        RenderNodeDescriptor& nd = tree.nodes_[segId];
+        nd.opacity = hasVis ? effOpacity : 0.0f;
+        const Matrix2D segM{
+            ux,
+            -uy,
+            uy,
+            ux,
+            px0 - (ux * px0 - uy * py0),
+            py0 - (uy * px0 + ux * py0)};
+        const Matrix2D worldM = projected3D
+            ? segM
+            : Matrix2D::Multiply(
+                  MatrixFromState(curState.m00, curState.m01, curState.m10, curState.m11, curState.tx, curState.ty),
+                  segM);
+        nd.m00 = worldM.m00;
+        nd.m01 = worldM.m01;
+        nd.m10 = worldM.m10;
+        nd.m11 = worldM.m11;
+        nd.baseTx = worldM.tx;
+        nd.baseTy = worldM.ty;
+        nd.tx = worldM.tx + nd.x * (worldM.m00 - 1.0f) + nd.y * worldM.m01;
+        nd.ty = worldM.ty + nd.x * worldM.m10 + nd.y * (worldM.m11 - 1.0f);
+        nd.inheritedOpacity = curState.inheritedOpacity;
+        nd.hasPerspective3D = false;
+        nd.blendMode = curState.blendMode;
+        tree.WriteQuadVertices(nd);
+        tree.MarkPageDirty(nd.pageIndex, nd.vertexOffsetInPage);
+        return 1u;
+    }
+
+    static std::uint16_t EmitTrimmedPathSubpaths(
+        PagedRenderTree& tree,
+        std::string_view pathStr,
+        const Rect& box,
+        Stretch stretch,
+        float strokeW,
+        const Color& strokeCol,
+        std::uint32_t strokeGradId,
+        float effOpacity,
+        const PagedRenderTree::RenderTraversalState& curState,
+        const UIElement* owner,
+        float trimStart,
+        float trimEnd) {
+        if (pathStr.empty() || trimEnd <= trimStart + 1e-5f || strokeW <= 0.0f || effOpacity <= 0.0f) {
+            return 0u;
+        }
+        if (strokeGradId == 0u && strokeCol.a <= 0.0f) {
+            return 0u;
+        }
+        const std::vector<std::vector<Point>> subpaths = ParseSvgPathToSubpaths(pathStr);
+        if (subpaths.empty()) {
+            return 0u;
+        }
+
+        float minX = 0.0f;
+        float minY = 0.0f;
+        float maxX = 0.0f;
+        float maxY = 0.0f;
+        bool hasAnyPt = false;
+        for (const auto& sp : subpaths) {
+            for (const Point& pt : sp) {
+                if (!hasAnyPt) {
+                    minX = maxX = pt.x;
+                    minY = maxY = pt.y;
+                    hasAnyPt = true;
+                } else {
+                    minX = std::min(minX, pt.x);
+                    minY = std::min(minY, pt.y);
+                    maxX = std::max(maxX, pt.x);
+                    maxY = std::max(maxY, pt.y);
+                }
+            }
+        }
+        if (!hasAnyPt) {
+            return 0u;
+        }
+        const float natW = maxX - minX;
+        const float natH = maxY - minY;
+
+        auto mapPoint = [&](const Point& pt) noexcept -> Point {
+            if (stretch == Stretch::None || box.width <= 0.0f || box.height <= 0.0f) {
+                return Point{box.x + pt.x, box.y + pt.y};
+            }
+            if (stretch == Stretch::Fill) {
+                const float u = (natW > 1e-4f) ? ((pt.x - minX) / natW) : 0.5f;
+                const float v = (natH > 1e-4f) ? ((pt.y - minY) / natH) : 0.5f;
+                return Point{box.x + u * box.width, box.y + v * box.height};
+            }
+            float s = 1.0f;
+            if (natW > 1e-4f && natH > 1e-4f) {
+                s = (stretch == Stretch::UniformToFill)
+                    ? std::max(box.width / natW, box.height / natH)
+                    : std::min(box.width / natW, box.height / natH);
+            } else if (natW > 1e-4f) {
+                s = box.width / natW;
+            } else if (natH > 1e-4f) {
+                s = box.height / natH;
+            }
+            const float dw = natW * s;
+            const float dh = natH * s;
+            const float ox = box.x + (box.width - dw) * 0.5f;
+            const float oy = box.y + (box.height - dh) * 0.5f;
+            return Point{ox + (pt.x - minX) * s, oy + (pt.y - minY) * s};
+        };
+
+        const GradientBrushDesc* gradBrush = (strokeGradId != 0u)
+            ? GradientBrushRegistry::Instance().Find(strokeGradId)
+            : nullptr;
+        const float safeW = std::max(1.0f, box.width);
+        const float safeH = std::max(1.0f, box.height);
+        std::uint16_t emitted = 0u;
+
+        for (const auto& sp : subpaths) {
+            const std::vector<Point> trimmed = TrimSubpathPolyline(sp, trimStart, trimEnd);
+            if (trimmed.size() < 2u) {
+                continue;
+            }
+            for (std::size_t i = 0u; i + 1u < trimmed.size(); ++i) {
+                if (emitted >= 0xFFF0u) {
+                    return emitted;
+                }
+                const Point a = mapPoint(trimmed[i]);
+                const Point b = mapPoint(trimmed[i + 1u]);
+                Color segCol = strokeCol;
+                if (gradBrush != nullptr) {
+                    const float mx = 0.5f * (a.x + b.x);
+                    const float my = 0.5f * (a.y + b.y);
+                    const float u = std::clamp((mx - box.x) / safeW, 0.0f, 1.0f);
+                    const float v = std::clamp((my - box.y) / safeH, 0.0f, 1.0f);
+                    segCol = EvaluateGradientBrushAtNormalizedUv(*gradBrush, u, v, safeW, safeH);
+                    segCol.a = std::clamp(segCol.a * strokeCol.a, 0.0f, 1.0f);
+                }
+                emitted = static_cast<std::uint16_t>(
+                    emitted + EmitCapsuleLine(
+                        tree,
+                        a.x,
+                        a.y,
+                        b.x,
+                        b.y,
+                        strokeW,
+                        segCol,
+                        effOpacity,
+                        false,
+                        true,
+                        curState,
+                        owner));
+            }
+        }
+        return emitted;
+    }
+
+    static std::uint16_t EmitProceduralMediaFrame(
+        PagedRenderTree& tree,
+        const MediaElement& mediaElem,
+        const Rect& bounds,
+        float effOpacity,
+        const PagedRenderTree::RenderTraversalState& curState) {
+        const float w = bounds.width;
+        const float h = bounds.height;
+        if (w <= 0.0f || h <= 0.0f) {
+            const std::uint32_t anchorId = tree.AllocateRenderNode(
+                bounds.x, bounds.y, 0.0f, 0.0f, Color{0.0f, 0.0f, 0.0f, 0.0f}, 0.0f, 0.0f, &mediaElem);
+            tree.nodes_[anchorId].opacity = 0.0f;
+            ApplyNodeTransform(tree, anchorId, curState);
+            return 1u;
+        }
+
+        const std::string srcUri = mediaElem.GetSource();
+        const ImageAtlasEntry* atlasEntry = srcUri.empty()
+            ? nullptr
+            : ImageAtlas::Instance().LoadOrGet(srcUri);
+        if (atlasEntry != nullptr && atlasEntry->width > 0u && atlasEntry->height > 0u) {
+            const Color tintColor = value::TryGetColor(mediaElem.GetValue(PropId_Foreground))
+                .value_or(Color{1.0f, 1.0f, 1.0f, 1.0f});
+            const ImageStretchPlacement placement = ComputeImageStretchPlacement(
+                bounds,
+                static_cast<float>(atlasEntry->width),
+                static_cast<float>(atlasEntry->height),
+                mediaElem.GetStretch(),
+                StretchDirection::Both,
+                atlasEntry->u0,
+                atlasEntry->v0,
+                atlasEntry->u1,
+                atlasEntry->v1);
+            if (placement.valid) {
+                const std::uint32_t nid = tree.AllocateTexturedNode(
+                    placement.destRect.x,
+                    placement.destRect.y,
+                    placement.destRect.width,
+                    placement.destRect.height,
+                    placement.u0,
+                    placement.v0,
+                    placement.u1,
+                    placement.v1,
+                    tintColor,
+                    effOpacity,
+                    &mediaElem,
+                    atlasEntry->textureId);
+                ApplyNodeTransform(tree, nid, curState);
+                return 1u;
+            }
+            const std::uint32_t nid = tree.AllocateTexturedNode(
+                bounds.x,
+                bounds.y,
+                0.0f,
+                0.0f,
+                atlasEntry->u0,
+                atlasEntry->v0,
+                atlasEntry->u1,
+                atlasEntry->v1,
+                tintColor,
+                0.0f,
+                &mediaElem,
+                atlasEntry->textureId);
+            ApplyNodeTransform(tree, nid, curState);
+            return 1u;
+        }
+
+        // Procedural animated video frame when source is a video path/stream or empty
+        std::uint16_t emitted = 0u;
+        auto emitRect = [&](float rx, float ry, float rw, float rh, const Color& col, float cr = 0.0f, float opScale = 1.0f) {
+            if (rw <= 0.0f || rh <= 0.0f) return;
+            const std::uint32_t nid = tree.AllocateRoundedRectNode(
+                rx, ry, rw, rh, col, CornerRadius{cr}, &mediaElem);
+            tree.nodes_[nid].opacity = effOpacity * opScale;
+            ApplyNodeTransform(tree, nid, curState);
+            ++emitted;
+        };
+
+        const double posSec = std::max(0.0, static_cast<double>(mediaElem.PositionSeconds()));
+        const double durSec = static_cast<double>(mediaElem.DurationSeconds());
+        const bool isPlaying = mediaElem.IsPlaying();
+
+        // Dark backing frame
+        emitRect(bounds.x, bounds.y, w, h, Color{0.07f, 0.09f, 0.14f, 1.0f}, 0.0f);
+
+        // High-contrast vertical SMPTE-inspired color bars driven by PositionSeconds()
+        const float fieldH = std::max(2.0f, h * 0.74f);
+        static constexpr std::array<Color, 6> kBaseBars{{
+            Color{0.92f, 0.22f, 0.26f, 1.0f},
+            Color{0.96f, 0.84f, 0.18f, 1.0f},
+            Color{0.18f, 0.86f, 0.44f, 1.0f},
+            Color{0.16f, 0.82f, 0.94f, 1.0f},
+            Color{0.26f, 0.46f, 0.96f, 1.0f},
+            Color{0.88f, 0.28f, 0.84f, 1.0f},
+        }};
+        const float barW = w / static_cast<float>(kBaseBars.size());
+        for (std::size_t i = 0u; i < kBaseBars.size(); ++i) {
+            const float pulse = 0.84f + 0.16f * static_cast<float>(
+                std::sin(posSec * 2.4 + static_cast<double>(i) * 1.05));
+            const Color base = kBaseBars[i];
+            const Color modulated{
+                std::clamp(base.r * pulse, 0.0f, 1.0f),
+                std::clamp(base.g * pulse, 0.0f, 1.0f),
+                std::clamp(base.b * pulse, 0.0f, 1.0f),
+                1.0f};
+            const float bx0 = bounds.x + static_cast<float>(i) * barW;
+            const float bx1 = (i + 1u == kBaseBars.size()) ? (bounds.x + w) : (bx0 + barW);
+            emitRect(bx0, bounds.y, std::max(0.0f, bx1 - bx0), fieldH, modulated, 0.0f);
+        }
+
+        // Animated sweeping vertical scanline + horizontal raster indicator
+        const double scanPhaseX = std::fmod(posSec * 0.5, 1.0);
+        const float scanW = std::clamp(w * 0.03f, 2.0f, std::max(2.0f, w));
+        const float scanX = bounds.x + static_cast<float>(scanPhaseX) * std::max(0.0f, w - scanW);
+        emitRect(scanX, bounds.y, scanW, fieldH, Color{0.98f, 0.99f, 1.0f, 0.92f}, 0.0f);
+
+        const double scanPhaseY = std::fmod(posSec * 0.35 + (isPlaying ? 0.12 : 0.0), 1.0);
+        const float hBarH = std::clamp(fieldH * 0.05f, 1.5f, 6.0f);
+        const float hBarY = bounds.y + static_cast<float>(scanPhaseY) * std::max(0.0f, fieldH - hBarH);
+        emitRect(bounds.x, hBarY, w, hBarH, Color{0.98f, 0.99f, 1.0f, 0.55f}, 0.0f);
+
+        // Transport bar + play/pause indicator strip at bottom
+        const float stripY = bounds.y + fieldH;
+        const float stripH = std::max(0.0f, h - fieldH);
+        if (stripH >= 4.0f) {
+            const float padX = std::clamp(w * 0.04f, 4.0f, 16.0f);
+            const float dotSz = std::clamp(stripH * 0.55f, 4.0f, 18.0f);
+            const float dotX = bounds.x + padX;
+            const float dotY = stripY + (stripH - dotSz) * 0.5f;
+            const Color badgeCol = isPlaying
+                ? Color{0.20f, 0.88f, 0.52f, 1.0f}
+                : Color{0.96f, 0.64f, 0.20f, 1.0f};
+            const std::uint32_t dotId = tree.AllocateEllipseNode(
+                dotX, dotY, dotSz, dotSz, badgeCol, 0.0f, false, effOpacity, &mediaElem);
+            ApplyNodeTransform(tree, dotId, curState);
+            ++emitted;
+
+            const float trackX = dotX + dotSz + padX * 0.6f;
+            const float trackW = std::max(0.0f, (bounds.x + w - padX) - trackX);
+            if (trackW >= 4.0f) {
+                const float trackH = std::clamp(stripH * 0.28f, 3.0f, 8.0f);
+                const float trackY = stripY + (stripH - trackH) * 0.5f;
+                emitRect(trackX, trackY, trackW, trackH, Color{0.20f, 0.25f, 0.34f, 1.0f}, trackH * 0.5f);
+                const float progress01 = (durSec > 1e-4)
+                    ? static_cast<float>(std::clamp(posSec / durSec, 0.0, 1.0))
+                    : static_cast<float>(scanPhaseX);
+                const float fillW = std::max(2.0f, trackW * progress01);
+                emitRect(
+                    trackX,
+                    trackY,
+                    std::min(trackW, fillW),
+                    trackH,
+                    isPlaying ? Color{0.24f, 0.78f, 0.98f, 1.0f} : Color{0.94f, 0.66f, 0.24f, 1.0f},
+                    trackH * 0.5f);
+            }
+        }
+        return emitted;
+    }
+
+    void FillRect(const Rect& rect, const Color& color) override {
+        if (rect.width <= 0.0f || rect.height <= 0.0f || color.a <= 0.0f || effOpacity_ <= 0.0f ||
+            emittedCount_ >= 0xFFFEu) {
+            return;
+        }
+        const std::uint32_t nid = tree_.AllocateRoundedRectNode(
+            originX_ + rect.x,
+            originY_ + rect.y,
+            rect.width,
+            rect.height,
+            color,
+            CornerRadius{},
+            owner_);
+        tree_.nodes_[nid].opacity = effOpacity_;
+        ApplyNodeTransform(tree_, nid, state_);
+        ++emittedCount_;
+    }
+
+    void DrawRect(const Rect& rect, const Color& strokeColor, float strokeWidth) override {
+        if (rect.width <= 0.0f || rect.height <= 0.0f || strokeWidth <= 0.0f ||
+            strokeColor.a <= 0.0f || effOpacity_ <= 0.0f || emittedCount_ >= 0xFFFEu) {
+            return;
+        }
+        const std::uint32_t nid = tree_.AllocateBorderRingNode(
+            originX_ + rect.x,
+            originY_ + rect.y,
+            rect.width,
+            rect.height,
+            strokeColor,
+            CornerRadius{},
+            Thickness{strokeWidth},
+            owner_);
+        tree_.nodes_[nid].opacity = effOpacity_;
+        ApplyNodeTransform(tree_, nid, state_);
+        ++emittedCount_;
+    }
+
+    void FillRoundedRect(const Rect& rect, float radiusX, float radiusY, const Color& color) override {
+        if (rect.width <= 0.0f || rect.height <= 0.0f || color.a <= 0.0f || effOpacity_ <= 0.0f ||
+            emittedCount_ >= 0xFFFEu) {
+            return;
+        }
+        const float maxR = std::min(rect.width, rect.height) * 0.5f;
+        const float rEff = std::max(0.0f, std::min(0.5f * (std::max(0.0f, radiusX) + std::max(0.0f, radiusY)), maxR));
+        const std::uint32_t nid = tree_.AllocateRoundedRectNode(
+            originX_ + rect.x,
+            originY_ + rect.y,
+            rect.width,
+            rect.height,
+            color,
+            CornerRadius{rEff},
+            owner_);
+        tree_.nodes_[nid].opacity = effOpacity_;
+        ApplyNodeTransform(tree_, nid, state_);
+        ++emittedCount_;
+    }
+
+    void DrawRoundedRect(
+        const Rect& rect,
+        float radiusX,
+        float radiusY,
+        const Color& strokeColor,
+        float strokeWidth) override {
+        if (rect.width <= 0.0f || rect.height <= 0.0f || strokeWidth <= 0.0f ||
+            strokeColor.a <= 0.0f || effOpacity_ <= 0.0f || emittedCount_ >= 0xFFFEu) {
+            return;
+        }
+        const float maxR = std::min(rect.width, rect.height) * 0.5f;
+        const float rEff = std::max(0.0f, std::min(0.5f * (std::max(0.0f, radiusX) + std::max(0.0f, radiusY)), maxR));
+        const std::uint32_t nid = tree_.AllocateBorderRingNode(
+            originX_ + rect.x,
+            originY_ + rect.y,
+            rect.width,
+            rect.height,
+            strokeColor,
+            CornerRadius{rEff},
+            Thickness{strokeWidth},
+            owner_);
+        tree_.nodes_[nid].opacity = effOpacity_;
+        ApplyNodeTransform(tree_, nid, state_);
+        ++emittedCount_;
+    }
+
+    void FillEllipse(const Point& center, float radiusX, float radiusY, const Color& color) override {
+        if (radiusX <= 0.0f || radiusY <= 0.0f || color.a <= 0.0f || effOpacity_ <= 0.0f ||
+            emittedCount_ >= 0xFFFEu) {
+            return;
+        }
+        const std::uint32_t nid = tree_.AllocateEllipseNode(
+            originX_ + center.x - radiusX,
+            originY_ + center.y - radiusY,
+            radiusX * 2.0f,
+            radiusY * 2.0f,
+            color,
+            0.0f,
+            false,
+            effOpacity_,
+            owner_);
+        ApplyNodeTransform(tree_, nid, state_);
+        ++emittedCount_;
+    }
+
+    void DrawEllipse(
+        const Point& center,
+        float radiusX,
+        float radiusY,
+        const Color& strokeColor,
+        float strokeWidth) override {
+        if (radiusX <= 0.0f || radiusY <= 0.0f || strokeWidth <= 0.0f ||
+            strokeColor.a <= 0.0f || effOpacity_ <= 0.0f || emittedCount_ >= 0xFFFEu) {
+            return;
+        }
+        const float halfStroke = 0.5f * strokeWidth;
+        const float outerRx = radiusX + halfStroke;
+        const float outerRy = radiusY + halfStroke;
+        const std::uint32_t nid = tree_.AllocateEllipseNode(
+            originX_ + center.x - outerRx,
+            originY_ + center.y - outerRy,
+            outerRx * 2.0f,
+            outerRy * 2.0f,
+            strokeColor,
+            strokeWidth,
+            true,
+            effOpacity_,
+            owner_);
+        ApplyNodeTransform(tree_, nid, state_);
+        ++emittedCount_;
+    }
+
+    void DrawLine(const Point& start, const Point& end, const Color& strokeColor, float strokeWidth) override {
+        if (strokeWidth <= 0.0f || strokeColor.a <= 0.0f || effOpacity_ <= 0.0f || emittedCount_ >= 0xFFFEu) {
+            return;
+        }
+        const std::uint16_t added = EmitCapsuleLine(
+            tree_,
+            originX_ + start.x,
+            originY_ + start.y,
+            originX_ + end.x,
+            originY_ + end.y,
+            strokeWidth,
+            strokeColor,
+            effOpacity_,
+            false,
+            true,
+            state_,
+            owner_);
+        emittedCount_ = static_cast<std::uint16_t>(std::min<std::uint32_t>(0xFFFFu, emittedCount_ + added));
+    }
+
+    void DrawText(
+        std::string_view text,
+        const Rect& layoutRect,
+        const Color& color,
+        float fontSize,
+        HorizontalAlignment hAlign,
+        VerticalAlignment vAlign) override {
+        if (text.empty() || color.a <= 0.0f || effOpacity_ <= 0.0f || fontSize <= 0.0f ||
+            emittedCount_ >= 0xFFFEu) {
+            return;
+        }
+        const std::string fontFamily = ResolveElementFontFamily(owner_);
+        const Size metrics = MeasureUtf8TextRun(text, fontSize, fontFamily, 1000000.0f, TextWrapping::NoWrap);
+        TextAlignment tAlign = TextAlignment::Left;
+        float alignBoxWidth = layoutRect.width;
+        float drawX = originX_ + layoutRect.x;
+        if (layoutRect.width > 0.0f) {
+            if (hAlign == HorizontalAlignment::Center) {
+                tAlign = TextAlignment::Center;
+            } else if (hAlign == HorizontalAlignment::Right) {
+                tAlign = TextAlignment::Right;
+            }
+        } else {
+            alignBoxWidth = 0.0f;
+            if (hAlign == HorizontalAlignment::Center) {
+                drawX -= metrics.width * 0.5f;
+            } else if (hAlign == HorizontalAlignment::Right) {
+                drawX -= metrics.width;
+            }
+        }
+        const float textH = (metrics.height > 0.0f) ? metrics.height : (fontSize * 1.2f);
+        float drawY = originY_ + layoutRect.y;
+        switch (vAlign) {
+            case VerticalAlignment::Center:
+                drawY += (layoutRect.height - textH) * 0.5f;
+                break;
+            case VerticalAlignment::Bottom:
+                drawY += (layoutRect.height - textH);
+                break;
+            case VerticalAlignment::Top:
+            case VerticalAlignment::Stretch:
+            default:
+                break;
+        }
+        const std::uint16_t added = tree_.EmitTextRunNodes(
+            drawX,
+            drawY,
+            fontSize,
+            text,
+            color,
+            effOpacity_,
+            state_,
+            owner_,
+            fontFamily,
+            1000000.0f,
+            TextWrapping::NoWrap,
+            tAlign,
+            alignBoxWidth);
+        const std::uint32_t sum = static_cast<std::uint32_t>(emittedCount_) + static_cast<std::uint32_t>(added);
+        emittedCount_ = static_cast<std::uint16_t>(std::min<std::uint32_t>(sum, 0xFFFFu));
+    }
+
+private:
+    PagedRenderTree& tree_;
+    const PagedRenderTree::RenderTraversalState& state_;
+    const UIElement* owner_ = nullptr;
+    float originX_ = 0.0f;
+    float originY_ = 0.0f;
+    float effOpacity_ = 1.0f;
+    std::uint16_t emittedCount_ = 0u;
+};
+
 void PagedRenderTree::TraverseAndEmitElement(
     const UIElement* elem,
     const RenderTraversalState& parentState) {
@@ -4252,7 +5353,12 @@ void PagedRenderTree::TraverseAndEmitElement(
         !curState.shadowOnlyPass &&
         ((fx.kind == UIEffectKind::Blur && fx.blurRadius > 0.25f) ||
          (fx.kind == UIEffectKind::Pixelate && fx.blurRadius >= 1.5f) ||
-         (fx.kind == UIEffectKind::BackdropBlur && fx.blurRadius > 0.25f)) &&
+         (fx.kind == UIEffectKind::Tint) ||
+         (fx.kind == UIEffectKind::ChromaticAberration && std::fabs(fx.amountX) > 0.01f) ||
+         (fx.kind == UIEffectKind::DirectionalBlur && fx.blurRadius > 0.25f) ||
+         (fx.kind == UIEffectKind::Saturation && std::fabs(fx.saturation - 1.0f) > 0.001f) ||
+         (fx.kind == UIEffectKind::BackdropBlur &&
+          (fx.blurRadius > 0.25f || std::fabs(fx.saturation - 1.0f) > 0.001f))) &&
         effOpacity > 0.001f;
     const std::size_t blurSpanSlot = wantsBlurSpan ? blurLayerSpans_.size() : static_cast<std::size_t>(-1);
     if (wantsBlurSpan) {
@@ -4264,6 +5370,11 @@ void PagedRenderTree::TraverseAndEmitElement(
         bSpan.clipActive = curState.clipActive;
         bSpan.effectMode = fx.kind;
         bSpan.maskOpacity = effOpacity;
+        bSpan.amountX = fx.amountX;
+        bSpan.angleDeg = fx.angleDeg;
+        bSpan.saturation = fx.saturation;
+        bSpan.effectColor = fx.color;
+        bSpan.effectOpacity = fx.opacity;
         if (fx.kind == UIEffectKind::BackdropBlur) {
             const Matrix2D worldM = MatrixFromState(
                 curState.m00, curState.m01, curState.m10, curState.m11, curState.tx, curState.ty);
@@ -4373,7 +5484,28 @@ void PagedRenderTree::TraverseAndEmitElement(
                     pathStr = ConvertPointsToSvgPath(sv->view(), elem->IsA<Polygon>());
                 }
             }
-            if (const AxbMtsdfPathEntry* mtsdf = AxbTemplateRegistry::Instance().FindOrBakeMtsdfPath(pathStr)) {
+            const float shTrimStart = std::clamp(pathElem->GetTrimStart(), 0.0f, 1.0f);
+            const float shTrimEnd = std::clamp(pathElem->GetTrimEnd(), 0.0f, 1.0f);
+            if (shTrimStart > 0.0f || shTrimEnd < 1.0f) {
+                const std::uint32_t strokeGradId = ExtractGradBrushId(pathElem->GetValue(PropId_BorderGradientId));
+                const float shStrokeW = std::max(pathElem->GetStrokeThickness(), localBlurR * 0.25f);
+                if (pathElem->HasExplicitStroke() || pathElem->HasExplicitFill()) {
+                    emittedCount = static_cast<std::uint16_t>(
+                        emittedCount + PagedCustomDrawingContext::EmitTrimmedPathSubpaths(
+                            *this,
+                            pathStr,
+                            Rect{r.x + sdx, r.y + sdy, w, h},
+                            pathElem->GetStretch(),
+                            shStrokeW,
+                            shCol,
+                            strokeGradId != 0u ? 0u : 0u,
+                            effOpacity,
+                            curState,
+                            shadowOwner,
+                            shTrimStart,
+                            shTrimEnd));
+                }
+            } else if (const AxbMtsdfPathEntry* mtsdf = AxbTemplateRegistry::Instance().FindOrBakeMtsdfPath(pathStr)) {
                 Rect fitted = ComputeStretchedDestRect(
                     Rect{r.x + sdx, r.y + sdy, w, h},
                     mtsdf->boundsW,
@@ -4429,7 +5561,8 @@ void PagedRenderTree::TraverseAndEmitElement(
         } else {
             const bool hasOwnOpaqueSurface =
                 !elem->HasControlTemplate() &&
-                (elem->IsA<Rectangle>() || elem->IsA<Ellipse>() || elem->IsA<Image>() || elem->IsA<Button>() ||
+                (elem->IsA<Rectangle>() || elem->IsA<Ellipse>() || elem->IsA<Image>() ||
+                 elem->IsA<MediaElement>() || elem->IsA<Button>() ||
                  (ExtractGradBrushId(elem->GetValue(PropId_BackgroundGradientId)) != 0u) ||
                  !ExtractContainerImageBrushUri(elem).empty() ||
                  (value::TryGetColor(elem->GetValue(PropId_Background)).value_or(Color{0, 0, 0, 0}).a > 0.01f));
@@ -4523,7 +5656,18 @@ void PagedRenderTree::TraverseAndEmitElement(
         return;
     }
 
-    if (elem->HasControlTemplate()) {
+    if (elem->HasCustomRender()) {
+        PagedCustomDrawingContext customDc(*this, curState, elem, r.x, r.y, effOpacity);
+        const_cast<UIElement*>(elem)->OnRender(customDc);
+        emittedCount = customDc.EmittedCount();
+        if (emittedCount == 0u) {
+            const std::uint32_t anchorId = AllocateRenderNode(
+                r.x, r.y, 0.0f, 0.0f, Color{0.0f, 0.0f, 0.0f, 0.0f}, 0.0f, 0.0f, elem);
+            nodes_[anchorId].opacity = 0.0f;
+            applyNodeTransform(anchorId);
+            ++emittedCount;
+        }
+    } else if (elem->HasControlTemplate()) {
         const std::uint32_t anchorId = AllocateRenderNode(
             r.x, r.y, 0.0f, 0.0f, Color{0.0f, 0.0f, 0.0f, 0.0f}, 0.0f, 0.0f, elem);
         nodes_[anchorId].opacity = 0.0f;
@@ -4664,124 +5808,114 @@ void PagedRenderTree::TraverseAndEmitElement(
             ++emittedCount;
         }
     } else if (const auto* ellElem = elem->DynamicCast<Ellipse>()) {
+        float ellTrimStart = 0.0f;
+        float ellTrimEnd = 1.0f;
+        (void)TryGetFloat(ellElem->GetValue(PropId_PathTrimStart), ellTrimStart);
+        (void)TryGetFloat(ellElem->GetValue(PropId_PathTrimEnd), ellTrimEnd);
+        ellTrimStart = std::clamp(ellTrimStart, 0.0f, 1.0f);
+        ellTrimEnd = std::clamp(ellTrimEnd, 0.0f, 1.0f);
+        const bool isTrimmedEll = (ellTrimStart > 0.0f) || (ellTrimEnd < 1.0f);
         const std::uint32_t fillGradId = ellElem->GetFillGradientBrushId();
         const bool hasFill = ellElem->HasFill();
         const Color fillCol = ellElem->GetFill();
         const float strokeW = ellElem->GetStrokeThickness();
         const bool hasStroke = ellElem->HasStroke() && (strokeW > 0.0f);
         const Color strokeCol = ellElem->GetStroke();
-        const float fillInset = (hasFill && hasStroke)
-            ? ((strokeCol.a >= 0.999f && strokeW >= 1.0f) ? (0.5f * strokeW) : strokeW)
-            : 0.0f;
-        const Rect fillRect{
-            r.x + fillInset,
-            r.y + fillInset,
-            std::max(0.0f, w - 2.0f * fillInset),
-            std::max(0.0f, h - 2.0f * fillInset)};
-
-        if (fillGradId != 0u) {
-            const std::uint32_t fillId = AllocateGradientRoundedRectNode(
-                fillRect.x,
-                fillRect.y,
-                fillRect.width,
-                fillRect.height,
-                fillGradId,
-                CornerRadius{},
-                true,
-                Color{1.0f, 1.0f, 1.0f, 1.0f},
-                hasFill ? effOpacity : 0.0f,
-                elem);
-            applyNodeTransform(fillId);
-            ++emittedCount;
+        if (isTrimmedEll) {
+            const float sweepFrac = ellTrimEnd - ellTrimStart;
+            if (hasStroke && sweepFrac > 1e-4f && w > 0.0f && h > 0.0f) {
+                const float minDim = std::min(w, h);
+                const float innerRatio = (minDim > 1e-3f)
+                    ? std::clamp(1.0f - (2.0f * strokeW) / minDim, 0.0f, 0.995f)
+                    : 0.0f;
+                const std::uint32_t arcId = AllocateRadialArcNode(
+                    r.x,
+                    r.y,
+                    w,
+                    h,
+                    ellTrimStart * 360.0f,
+                    sweepFrac * 360.0f,
+                    innerRatio,
+                    strokeCol,
+                    effOpacity,
+                    elem);
+                applyNodeTransform(arcId);
+                ++emittedCount;
+            } else {
+                const std::uint32_t anchorId = AllocateRenderNode(
+                    r.x, r.y, 0.0f, 0.0f, Color{0.0f, 0.0f, 0.0f, 0.0f}, 0.0f, 0.0f, elem);
+                nodes_[anchorId].opacity = 0.0f;
+                applyNodeTransform(anchorId);
+                ++emittedCount;
+            }
         } else {
-            const std::uint32_t fillId = AllocateEllipseNode(
-                fillRect.x,
-                fillRect.y,
-                fillRect.width,
-                fillRect.height,
-                fillCol,
-                0.0f,
-                false,
-                hasFill ? effOpacity : 0.0f,
-                elem);
-            applyNodeTransform(fillId);
-            ++emittedCount;
-        }
-        if (hasStroke) {
-            const std::uint32_t strokeId = AllocateEllipseNode(
-                r.x,
-                r.y,
-                w,
-                h,
-                strokeCol,
-                strokeW,
-                true,
-                effOpacity,
-                elem);
-            applyNodeTransform(strokeId);
-            ++emittedCount;
+            const float fillInset = (hasFill && hasStroke)
+                ? ((strokeCol.a >= 0.999f && strokeW >= 1.0f) ? (0.5f * strokeW) : strokeW)
+                : 0.0f;
+            const Rect fillRect{
+                r.x + fillInset,
+                r.y + fillInset,
+                std::max(0.0f, w - 2.0f * fillInset),
+                std::max(0.0f, h - 2.0f * fillInset)};
+
+            if (fillGradId != 0u) {
+                const std::uint32_t fillId = AllocateGradientRoundedRectNode(
+                    fillRect.x,
+                    fillRect.y,
+                    fillRect.width,
+                    fillRect.height,
+                    fillGradId,
+                    CornerRadius{},
+                    true,
+                    Color{1.0f, 1.0f, 1.0f, 1.0f},
+                    hasFill ? effOpacity : 0.0f,
+                    elem);
+                applyNodeTransform(fillId);
+                ++emittedCount;
+            } else {
+                const std::uint32_t fillId = AllocateEllipseNode(
+                    fillRect.x,
+                    fillRect.y,
+                    fillRect.width,
+                    fillRect.height,
+                    fillCol,
+                    0.0f,
+                    false,
+                    hasFill ? effOpacity : 0.0f,
+                    elem);
+                applyNodeTransform(fillId);
+                ++emittedCount;
+            }
+            if (hasStroke) {
+                const std::uint32_t strokeId = AllocateEllipseNode(
+                    r.x,
+                    r.y,
+                    w,
+                    h,
+                    strokeCol,
+                    strokeW,
+                    true,
+                    effOpacity,
+                    elem);
+                applyNodeTransform(strokeId);
+                ++emittedCount;
+            }
         }
     } else if (const auto* lineElem = elem->DynamicCast<Line>()) {
-        float x1 = r.x + lineElem->GetX1();
-        float y1 = r.y + lineElem->GetY1();
-        float x2 = r.x + lineElem->GetX2();
-        float y2 = r.y + lineElem->GetY2();
-        const bool projected3D = curState.hasPerspective3D;
-        if (projected3D) {
-            const Point p1 = curState.world3D.ProjectPoint2D(Point{x1, y1});
-            const Point p2 = curState.world3D.ProjectPoint2D(Point{x2, y2});
-            x1 = p1.x;
-            y1 = p1.y;
-            x2 = p2.x;
-            y2 = p2.y;
-        }
-        const float dx = x2 - x1;
-        const float dy = y2 - y1;
-        const float segLen = std::sqrt(dx * dx + dy * dy);
-        const float strokeW = std::max(1.0f, lineElem->GetStrokeThickness());
-        const bool hasVis = lineElem->HasStroke() && std::isfinite(segLen) && (segLen > 1e-3f);
-        const Color strokeCol = lineElem->GetStroke();
-
-        const float ux = (segLen > 1e-4f) ? (dx / segLen) : 1.0f;
-        const float uy = (segLen > 1e-4f) ? (dy / segLen) : 0.0f;
-        const float px0 = x1 + 0.5f * strokeW * uy;
-        const float py0 = y1 - 0.5f * strokeW * ux;
-
-        const std::uint32_t segId = AllocateRoundedRectNode(
-            px0,
-            py0,
-            hasVis ? segLen : 0.0f,
-            hasVis ? strokeW : 0.0f,
-            strokeCol,
-            CornerRadius{strokeW * 0.5f},
+        const std::uint16_t lineEmitted = PagedCustomDrawingContext::EmitCapsuleLine(
+            *this,
+            r.x + lineElem->GetX1(),
+            r.y + lineElem->GetY1(),
+            r.x + lineElem->GetX2(),
+            r.y + lineElem->GetY2(),
+            std::max(1.0f, lineElem->GetStrokeThickness()),
+            lineElem->GetStroke(),
+            lineElem->HasStroke() ? effOpacity : 0.0f,
+            true,
+            false,
+            curState,
             elem);
-        RenderNodeDescriptor& nd = nodes_[segId];
-        nd.opacity = hasVis ? effOpacity : 0.0f;
-        const Matrix2D segM{
-            ux,
-            -uy,
-            uy,
-            ux,
-            px0 - (ux * px0 - uy * py0),
-            py0 - (uy * px0 + ux * py0)};
-        const Matrix2D worldM = projected3D
-            ? segM
-            : Matrix2D::Multiply(
-                  MatrixFromState(curState.m00, curState.m01, curState.m10, curState.m11, curState.tx, curState.ty),
-                  segM);
-        nd.m00 = worldM.m00;
-        nd.m01 = worldM.m01;
-        nd.m10 = worldM.m10;
-        nd.m11 = worldM.m11;
-        nd.baseTx = worldM.tx;
-        nd.baseTy = worldM.ty;
-        nd.tx = worldM.tx + nd.x * (worldM.m00 - 1.0f) + nd.y * worldM.m01;
-        nd.ty = worldM.ty + nd.x * worldM.m10 + nd.y * (worldM.m11 - 1.0f);
-        nd.inheritedOpacity = curState.inheritedOpacity;
-        nd.hasPerspective3D = false;
-        WriteQuadVertices(nd);
-        MarkPageDirty(nd.pageIndex, nd.vertexOffsetInPage);
-        ++emittedCount;
+        emittedCount = static_cast<std::uint16_t>(emittedCount + lineEmitted);
     } else if (const auto* pb = elem->DynamicCast<ProgressBar>()) {
         const float effAlpha = pb->IsEffectivelyEnabled() ? effOpacity : (effOpacity * 0.55f);
         const CornerRadius cr = SanitizeCornerRadius(
@@ -5093,7 +6227,70 @@ void PagedRenderTree::TraverseAndEmitElement(
                 pathStr = ConvertPointsToSvgPath(sv->view(), elem->IsA<Polygon>());
             }
         }
-        if (const AxbMtsdfPathEntry* mtsdf = AxbTemplateRegistry::Instance().FindOrBakeMtsdfPath(pathStr)) {
+        const float trimStart = std::clamp(pathElem->GetTrimStart(), 0.0f, 1.0f);
+        const float trimEnd = std::clamp(pathElem->GetTrimEnd(), 0.0f, 1.0f);
+        const bool isTrimmed = (trimStart > 0.0f) || (trimEnd < 1.0f);
+        if (isTrimmed) {
+            const float strokeW = pathElem->GetStrokeThickness();
+            bool emitFill = true;
+            bool emitSeparateStroke = false;
+            ClassifyPathEmission(*pathElem, emitFill, emitSeparateStroke);
+            const std::uint32_t fillGradId = ExtractGradBrushId(pathElem->GetValue(PropId_BackgroundGradientId));
+            const std::uint32_t strokeGradId = ExtractGradBrushId(pathElem->GetValue(PropId_BorderGradientId));
+            std::uint16_t trimmedEmitted = 0u;
+            if (emitSeparateStroke) {
+                trimmedEmitted = PagedCustomDrawingContext::EmitTrimmedPathSubpaths(
+                    *this,
+                    pathStr,
+                    Rect{r.x, r.y, w, h},
+                    pathElem->GetStretch(),
+                    strokeW,
+                    pathElem->GetStroke(),
+                    strokeGradId,
+                    effOpacity,
+                    curState,
+                    elem,
+                    trimStart,
+                    trimEnd);
+            } else if (emitFill && pathElem->HasExplicitStroke()) {
+                trimmedEmitted = PagedCustomDrawingContext::EmitTrimmedPathSubpaths(
+                    *this,
+                    pathStr,
+                    Rect{r.x, r.y, w, h},
+                    pathElem->GetStretch(),
+                    1.0f,
+                    pathElem->GetStroke(),
+                    strokeGradId,
+                    effOpacity,
+                    curState,
+                    elem,
+                    trimStart,
+                    trimEnd);
+            } else if (emitFill) {
+                trimmedEmitted = PagedCustomDrawingContext::EmitTrimmedPathSubpaths(
+                    *this,
+                    pathStr,
+                    Rect{r.x, r.y, w, h},
+                    pathElem->GetStretch(),
+                    (strokeW > 0.0f) ? strokeW : 2.0f,
+                    pathElem->GetFill(),
+                    fillGradId,
+                    effOpacity,
+                    curState,
+                    elem,
+                    trimStart,
+                    trimEnd);
+            }
+            if (trimmedEmitted > 0u) {
+                emittedCount = static_cast<std::uint16_t>(emittedCount + trimmedEmitted);
+            } else {
+                const std::uint32_t nid = AllocateRenderNode(
+                    r.x, r.y, 0.0f, 0.0f, Color{0.0f, 0.0f, 0.0f, 0.0f}, 0.0f, 0.0f, elem);
+                nodes_[nid].opacity = 0.0f;
+                applyNodeTransform(nid);
+                ++emittedCount;
+            }
+        } else if (const AxbMtsdfPathEntry* mtsdf = AxbTemplateRegistry::Instance().FindOrBakeMtsdfPath(pathStr)) {
             Rect fitted = ComputeStretchedDestRect(
                 Rect{r.x, r.y, w, h},
                 mtsdf->boundsW,
@@ -5249,6 +6446,11 @@ void PagedRenderTree::TraverseAndEmitElement(
             applyNodeTransform(nid);
             ++emittedCount;
         }
+    } else if (const auto* mediaElem = elem->DynamicCast<MediaElement>()) {
+        const Rect contentBox{r.x, r.y, std::max(0.0f, w), std::max(0.0f, h)};
+        const std::uint16_t mediaEmitted = PagedCustomDrawingContext::EmitProceduralMediaFrame(
+            *this, *mediaElem, contentBox, effOpacity, curState);
+        emittedCount = static_cast<std::uint16_t>(emittedCount + mediaEmitted);
     } else if (const auto* slider = elem->DynamicCast<Slider>()) {
         const SliderVisualGeometry geom = ComputeSliderVisualGeometry(*slider, r, w, h);
         const float effAlpha = slider->IsEffectivelyEnabled() ? effOpacity : (effOpacity * 0.55f);

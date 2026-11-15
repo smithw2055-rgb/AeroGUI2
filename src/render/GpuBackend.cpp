@@ -2188,8 +2188,29 @@ GpuBackendFrameStats OpenGlDeviceBackend::ExecuteSubmission(
             stats.trianglesSubmitted += 2u;
         };
 
+        auto spanHasActiveEffect = [](const BlurLayerSpan& span) noexcept -> bool {
+            switch (span.effectMode) {
+                case UIEffectKind::Blur:
+                case UIEffectKind::DirectionalBlur:
+                    return std::isfinite(span.radiusPx) && span.radiusPx > 0.25f;
+                case UIEffectKind::Pixelate:
+                    return std::isfinite(span.radiusPx) && span.radiusPx >= 1.5f;
+                case UIEffectKind::Tint:
+                    return true;
+                case UIEffectKind::ChromaticAberration:
+                    return std::isfinite(span.amountX) && std::fabs(span.amountX) > 0.01f;
+                case UIEffectKind::Saturation:
+                    return std::isfinite(span.saturation) && std::fabs(span.saturation - 1.0f) > 0.001f;
+                case UIEffectKind::BackdropBlur:
+                    return (std::isfinite(span.radiusPx) && span.radiusPx > 0.25f) ||
+                           (std::isfinite(span.saturation) && std::fabs(span.saturation - 1.0f) > 0.001f);
+                default:
+                    return false;
+            }
+        };
+
         auto executeBackdropBlurOnGpu = [&](const BlurLayerSpan& span) {
-            if (!gl_.ReadPixels || !std::isfinite(span.radiusPx) || span.radiusPx <= 0.25f) {
+            if (!gl_.ReadPixels || !spanHasActiveEffect(span)) {
                 return;
             }
             const Rect mr = span.maskDestRect;
@@ -2200,9 +2221,10 @@ GpuBackendFrameStats OpenGlDeviceBackend::ExecuteSubmission(
             }
             const int vpW = static_cast<int>(std::min<std::uint32_t>(viewportWidth, 0x3FFFFFFFu));
             const int vpH = static_cast<int>(std::min<std::uint32_t>(viewportHeight, 0x3FFFFFFFu));
-            const float clampedRadius = std::clamp(span.radiusPx, 0.5f, 128.0f);
-            const int boxR = std::max(1, static_cast<int>(std::lround(clampedRadius * 0.5f)));
-            const int padPx = boxR * 3 + 2;
+            const int boxR = (std::isfinite(span.radiusPx) && span.radiusPx > 0.25f)
+                ? std::max(1, static_cast<int>(std::lround(std::clamp(span.radiusPx, 0.5f, 128.0f) * 0.5f)))
+                : 0;
+            const int padPx = (boxR > 0) ? (boxR * 3 + 2) : 0;
             const int bx0 = std::clamp(static_cast<int>(std::floor(mr.x)) - padPx, 0, vpW);
             const int by0 = std::clamp(static_cast<int>(std::floor(mr.y)) - padPx, 0, vpH);
             const int bx1 = std::clamp(static_cast<int>(std::ceil(mr.x + mr.width)) + padPx, 0, vpW);
@@ -2277,8 +2299,7 @@ GpuBackendFrameStats OpenGlDeviceBackend::ExecuteSubmission(
                 (blurSpans[blurCursor].endNodeId > nid ||
                  blurSpans[blurCursor].effectMode == UIEffectKind::BackdropBlur) &&
                 blurSpans[blurCursor].endNodeId <= totalNodes &&
-                std::isfinite(blurSpans[blurCursor].radiusPx) &&
-                blurSpans[blurCursor].radiusPx > 0.25f) {
+                spanHasActiveEffect(blurSpans[blurCursor])) {
                 const BlurLayerSpan span = blurSpans[blurCursor];
                 ++blurCursor;
 

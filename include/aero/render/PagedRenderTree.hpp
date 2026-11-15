@@ -170,6 +170,11 @@ struct BlurLayerSpan {
     std::uint64_t maskMtsdfHash = 0u;
     Rect maskDestRect{};
     float maskOpacity = 1.0f;
+    float amountX = 0.0f;
+    float angleDeg = 0.0f;
+    float saturation = 1.0f;
+    Color effectColor{1.0f, 1.0f, 1.0f, 1.0f};
+    float effectOpacity = 1.0f;
 };
 
 struct RichGlyphStyle {
@@ -644,6 +649,8 @@ private:
     void CollapseSubtreeRenderNodesRecursive(
         const UIElement* elem,
         std::size_t& ioUpdatedNodes) noexcept;
+    friend class PagedCustomDrawingContext;
+
     struct DeferredComboPopup {
         const class ComboBox* combo = nullptr;
         RenderTraversalState state{};

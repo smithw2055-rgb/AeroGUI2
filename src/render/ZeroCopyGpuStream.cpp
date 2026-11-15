@@ -259,6 +259,16 @@ vec4 sampleAtlasGradientBrush(uint brushId, vec2 normUv, vec2 quadSize) {
         vec2 dir = vec2(p1x - p0x, p1y - p0y);
         float lenSq = dot(dir, dir);
         rawT = (lenSq > 1e-8) ? (dot(samplePt - vec2(p0x, p0y), dir) / lenSq) : 0.0;
+    } else if (kind == 2u) {
+        float dx = samplePt.x - p0x;
+        float dy = samplePt.y - p0y;
+        if (abs(dx) + abs(dy) > 1e-6) {
+            float angle = atan(dy, dx);
+            if (angle < 0.0) {
+                angle += 6.283185307179586;
+            }
+            rawT = angle / 6.283185307179586;
+        }
     } else {
         vec2 safeRad = max(abs(vec2(rx, ry)), vec2(1e-5));
         vec2 sp = (samplePt - vec2(p0x, p0y)) / safeRad;
@@ -517,6 +527,16 @@ void main() {
                 vec2 dir = vec2(p1x - p0x, p1y - p0y);
                 float lenSq = dot(dir, dir);
                 rawT = (lenSq > 1e-8) ? (dot(samplePt - vec2(p0x, p0y), dir) / lenSq) : 0.0;
+            } else if (kind == 2u) {
+                float dx = samplePt.x - p0x;
+                float dy = samplePt.y - p0y;
+                if (abs(dx) + abs(dy) > 1e-6) {
+                    float angle = atan(dy, dx);
+                    if (angle < 0.0) {
+                        angle += 6.283185307179586;
+                    }
+                    rawT = angle / 6.283185307179586;
+                }
             } else {
                 vec2 safeRad = max(abs(vec2(rx, ry)), vec2(1e-5));
                 vec2 sp = (samplePt - vec2(p0x, p0y)) / safeRad;
@@ -686,6 +706,16 @@ vec4 sampleAtlasGradientBrush(uint brushId, vec2 normUv, vec2 quadSize) {
         vec2 dir = vec2(p1x - p0x, p1y - p0y);
         float lenSq = dot(dir, dir);
         rawT = (lenSq > 1e-8) ? (dot(samplePt - vec2(p0x, p0y), dir) / lenSq) : 0.0;
+    } else if (kind == 2u) {
+        float dx = samplePt.x - p0x;
+        float dy = samplePt.y - p0y;
+        if (abs(dx) + abs(dy) > 1e-6) {
+            float angle = atan(dy, dx);
+            if (angle < 0.0) {
+                angle += 6.283185307179586;
+            }
+            rawT = angle / 6.283185307179586;
+        }
     } else {
         vec2 safeRad = max(abs(vec2(rx, ry)), vec2(1e-5));
         vec2 sp = (samplePt - vec2(p0x, p0y)) / safeRad;
@@ -938,6 +968,16 @@ void main() {
                 vec2 dir = vec2(p1x - p0x, p1y - p0y);
                 float lenSq = dot(dir, dir);
                 rawT = (lenSq > 1e-8) ? (dot(samplePt - vec2(p0x, p0y), dir) / lenSq) : 0.0;
+            } else if (kind == 2u) {
+                float dx = samplePt.x - p0x;
+                float dy = samplePt.y - p0y;
+                if (abs(dx) + abs(dy) > 1e-6) {
+                    float angle = atan(dy, dx);
+                    if (angle < 0.0) {
+                        angle += 6.283185307179586;
+                    }
+                    rawT = angle / 6.283185307179586;
+                }
             } else {
                 vec2 safeRad = max(abs(vec2(rx, ry)), vec2(1e-5));
                 vec2 sp = (samplePt - vec2(p0x, p0y)) / safeRad;
@@ -1080,6 +1120,16 @@ fn sampleAtlasGradientBrush(brushId : u32, normUv : vec2<f32>, quadSize : vec2<f
         let lenSq = dot(dir, dir);
         if (lenSq > 1e-8) {
             rawT = dot(samplePt - vec2<f32>(p0x, p0y), dir) / lenSq;
+        }
+    } else if (kind == 2u) {
+        let dx = samplePt.x - p0x;
+        let dy = samplePt.y - p0y;
+        if (abs(dx) + abs(dy) > 1e-6) {
+            var angle = atan2(dy, dx);
+            if (angle < 0.0) {
+                angle = angle + 6.2831853;
+            }
+            rawT = angle / 6.2831853;
         }
     } else {
         let safeRad = max(abs(vec2<f32>(rx, ry)), vec2<f32>(1e-5, 1e-5));
@@ -1353,6 +1403,16 @@ fn fs_main(in : VertexOut) -> @location(0) vec4<f32> {
                 let lenSq = dot(dir, dir);
                 if (lenSq > 1e-8) {
                     rawT = dot(samplePt - vec2<f32>(p0x, p0y), dir) / lenSq;
+                }
+            } else if (kind == 2u) {
+                let dx = samplePt.x - p0x;
+                let dy = samplePt.y - p0y;
+                if (abs(dx) + abs(dy) > 1e-6) {
+                    var angle = atan2(dy, dx);
+                    if (angle < 0.0) {
+                        angle = angle + 6.2831853;
+                    }
+                    rawT = angle / 6.2831853;
                 }
             } else {
                 let safeRad = max(abs(vec2<f32>(rx, ry)), vec2<f32>(1e-5, 1e-5));
@@ -1699,6 +1759,311 @@ void SeparableBoxBlurPremul3Pass(PremulOffscreenLayer& layer, int boxRadius) {
         } else {
             blurColsStripeFn(0, static_cast<int>(rowFloats));
         }
+    }
+}
+
+[[nodiscard]] Color EvaluateGradientBrushSafe(
+    const GradientBrushDesc& brush,
+    float normU,
+    float normV,
+    float quadWidthPx,
+    float quadHeightPx) noexcept {
+    if (brush.kind == GradientBrushKind::Conic) {
+        const float effW = std::max(1e-4f, quadWidthPx);
+        const float effH = std::max(1e-4f, quadHeightPx);
+        const float sampleX = (brush.mappingMode == BrushMappingMode::Absolute) ? (normU * effW) : normU;
+        const float sampleY = (brush.mappingMode == BrushMappingMode::Absolute) ? (normV * effH) : normV;
+        const float dx = sampleX - brush.center.x;
+        const float dy = sampleY - brush.center.y;
+        if (std::fabs(dx) + std::fabs(dy) <= 1e-6f) {
+            const float nudgeU = (brush.mappingMode == BrushMappingMode::Absolute)
+                ? (brush.center.x + 1e-3f) / effW
+                : (brush.center.x + 1e-3f);
+            const float safeV = (brush.mappingMode == BrushMappingMode::Absolute)
+                ? (brush.center.y / effH)
+                : brush.center.y;
+            return EvaluateGradientBrushAtNormalizedUv(brush, nudgeU, safeV, quadWidthPx, quadHeightPx);
+        }
+    }
+    return EvaluateGradientBrushAtNormalizedUv(brush, normU, normV, quadWidthPx, quadHeightPx);
+}
+
+[[nodiscard]] bool SpanNeedsEffectPass(const BlurLayerSpan& span) noexcept {
+    switch (span.effectMode) {
+        case UIEffectKind::Blur:
+        case UIEffectKind::DirectionalBlur:
+            return std::isfinite(span.radiusPx) && span.radiusPx > 0.25f;
+        case UIEffectKind::Pixelate:
+            return std::isfinite(span.radiusPx) && span.radiusPx >= 1.5f;
+        case UIEffectKind::Tint:
+            return true;
+        case UIEffectKind::ChromaticAberration:
+            return std::isfinite(span.amountX) && std::fabs(span.amountX) > 0.01f;
+        case UIEffectKind::Saturation:
+            return std::isfinite(span.saturation) && std::fabs(span.saturation - 1.0f) > 0.001f;
+        case UIEffectKind::BackdropBlur:
+            return (std::isfinite(span.radiusPx) && span.radiusPx > 0.25f) ||
+                   (std::isfinite(span.saturation) && std::fabs(span.saturation - 1.0f) > 0.001f);
+        default:
+            return false;
+    }
+}
+
+[[nodiscard]] int ComputeSpanBoxRadius(const BlurLayerSpan& span) noexcept {
+    if (std::isfinite(span.radiusPx) && span.radiusPx > 0.25f) {
+        return std::max(1, static_cast<int>(std::lround(std::clamp(span.radiusPx, 0.5f, 128.0f) * 0.5f)));
+    }
+    return 0;
+}
+
+[[nodiscard]] int ComputeSpanPaddingPx(const BlurLayerSpan& span) noexcept {
+    switch (span.effectMode) {
+        case UIEffectKind::Blur:
+        case UIEffectKind::BackdropBlur:
+        case UIEffectKind::Pixelate: {
+            const int boxR = ComputeSpanBoxRadius(span);
+            return (boxR > 0) ? (boxR * 3 + 2) : 0;
+        }
+        case UIEffectKind::DirectionalBlur: {
+            const float r = std::clamp(std::isfinite(span.radiusPx) ? span.radiusPx : 0.0f, 0.0f, 128.0f);
+            return static_cast<int>(std::ceil(r)) + 2;
+        }
+        case UIEffectKind::ChromaticAberration: {
+            const float s = std::clamp(std::fabs(std::isfinite(span.amountX) ? span.amountX : 0.0f), 0.0f, 64.0f);
+            return static_cast<int>(std::ceil(s)) + 2;
+        }
+        case UIEffectKind::Tint:
+        case UIEffectKind::Saturation:
+        default:
+            return 0;
+    }
+}
+
+void SamplePremulBilinear(
+    const float* src,
+    int w,
+    int h,
+    float fx,
+    float fy,
+    float out[4]) noexcept {
+    const float cx = std::clamp(fx, 0.0f, static_cast<float>(w - 1));
+    const float cy = std::clamp(fy, 0.0f, static_cast<float>(h - 1));
+    const int x0 = static_cast<int>(std::floor(cx));
+    const int y0 = static_cast<int>(std::floor(cy));
+    const int x1 = std::min(x0 + 1, w - 1);
+    const int y1 = std::min(y0 + 1, h - 1);
+    const float tx = cx - static_cast<float>(x0);
+    const float ty = cy - static_cast<float>(y0);
+    const std::size_t rowFloats = static_cast<std::size_t>(w) * 4u;
+    const float* p00 = src + static_cast<std::size_t>(y0) * rowFloats + static_cast<std::size_t>(x0) * 4u;
+    const float* p10 = src + static_cast<std::size_t>(y0) * rowFloats + static_cast<std::size_t>(x1) * 4u;
+    const float* p01 = src + static_cast<std::size_t>(y1) * rowFloats + static_cast<std::size_t>(x0) * 4u;
+    const float* p11 = src + static_cast<std::size_t>(y1) * rowFloats + static_cast<std::size_t>(x1) * 4u;
+    for (int ch = 0; ch < 4; ++ch) {
+        const float top = p00[ch] + (p10[ch] - p00[ch]) * tx;
+        const float bot = p01[ch] + (p11[ch] - p01[ch]) * tx;
+        out[ch] = top + (bot - top) * ty;
+    }
+}
+
+void ApplySaturationPremulLayer(PremulOffscreenLayer& layer, float saturationVal) noexcept {
+    const float sat = std::clamp(std::isfinite(saturationVal) ? saturationVal : 1.0f, 0.0f, 4.0f);
+    if (std::fabs(sat - 1.0f) <= 0.001f || layer.width <= 0 || layer.height <= 0) {
+        return;
+    }
+    const std::size_t pxCount = static_cast<std::size_t>(layer.width) * static_cast<std::size_t>(layer.height);
+    float* p = layer.premulRgba.data();
+    for (std::size_t i = 0u; i < pxCount; ++i) {
+        float* px = p + i * 4u;
+        const float pa = std::clamp(px[3], 0.0f, 1.0f);
+        if (pa <= 0.0005f) {
+            continue;
+        }
+        const float lum = 0.2126f * px[0] + 0.7152f * px[1] + 0.0722f * px[2];
+        px[0] = std::clamp(lum + sat * (px[0] - lum), 0.0f, pa);
+        px[1] = std::clamp(lum + sat * (px[1] - lum), 0.0f, pa);
+        px[2] = std::clamp(lum + sat * (px[2] - lum), 0.0f, pa);
+    }
+}
+
+void ApplySpanPostProcessEffect(PremulOffscreenLayer& layer, const BlurLayerSpan& span) {
+    if (layer.width <= 0 || layer.height <= 0) {
+        return;
+    }
+    const int w = layer.width;
+    const int h = layer.height;
+    switch (span.effectMode) {
+        case UIEffectKind::Pixelate: {
+            const int blockSz = std::max(2, static_cast<int>(std::lround(span.radiusPx)));
+            for (int by = 0; by < h; by += blockSz) {
+                const int bh = std::min(blockSz, h - by);
+                for (int bx = 0; bx < w; bx += blockSz) {
+                    const int bw = std::min(blockSz, w - bx);
+                    const int cx = bx + bw / 2;
+                    const int cy = by + bh / 2;
+                    const float* cp = layer.premulRgba.data() +
+                        (static_cast<std::size_t>(cy) * static_cast<std::size_t>(w) +
+                         static_cast<std::size_t>(cx)) * 4u;
+                    const float cr = cp[0], cg = cp[1], cb = cp[2], ca = cp[3];
+                    for (int yy = by; yy < by + bh; ++yy) {
+                        float* row = layer.premulRgba.data() +
+                            static_cast<std::size_t>(yy) * static_cast<std::size_t>(w) * 4u;
+                        for (int xx = bx; xx < bx + bw; ++xx) {
+                            float* dp = row + static_cast<std::size_t>(xx) * 4u;
+                            dp[0] = cr;
+                            dp[1] = cg;
+                            dp[2] = cb;
+                            dp[3] = ca;
+                        }
+                    }
+                }
+            }
+            break;
+        }
+        case UIEffectKind::Blur: {
+            const int boxR = ComputeSpanBoxRadius(span);
+            if (boxR > 0) {
+                SeparableBoxBlurPremul3Pass(layer, boxR);
+            }
+            break;
+        }
+        case UIEffectKind::BackdropBlur: {
+            const int boxR = ComputeSpanBoxRadius(span);
+            if (boxR > 0) {
+                SeparableBoxBlurPremul3Pass(layer, boxR);
+            }
+            if (std::isfinite(span.saturation) && std::fabs(span.saturation - 1.0f) > 0.001f) {
+                ApplySaturationPremulLayer(layer, span.saturation);
+            }
+            break;
+        }
+        case UIEffectKind::Tint: {
+            const float effA = std::clamp(
+                (std::isfinite(span.effectColor.a) ? span.effectColor.a : 1.0f) *
+                    (std::isfinite(span.effectOpacity) ? span.effectOpacity : 1.0f),
+                0.0f,
+                1.0f);
+            if (effA <= 0.0005f) {
+                break;
+            }
+            const float mr = 1.0f + (std::clamp(span.effectColor.r, 0.0f, 1.0f) - 1.0f) * effA;
+            const float mg = 1.0f + (std::clamp(span.effectColor.g, 0.0f, 1.0f) - 1.0f) * effA;
+            const float mb = 1.0f + (std::clamp(span.effectColor.b, 0.0f, 1.0f) - 1.0f) * effA;
+            const std::size_t pxCount = static_cast<std::size_t>(w) * static_cast<std::size_t>(h);
+            float* p = layer.premulRgba.data();
+            for (std::size_t i = 0u; i < pxCount; ++i) {
+                float* px = p + i * 4u;
+                px[0] = std::clamp(px[0] * mr, 0.0f, px[3]);
+                px[1] = std::clamp(px[1] * mg, 0.0f, px[3]);
+                px[2] = std::clamp(px[2] * mb, 0.0f, px[3]);
+            }
+            break;
+        }
+        case UIEffectKind::Saturation:
+            ApplySaturationPremulLayer(layer, span.saturation);
+            break;
+        case UIEffectKind::ChromaticAberration: {
+            const float shift = std::clamp(
+                std::isfinite(span.amountX) ? span.amountX : 0.0f, -64.0f, 64.0f);
+            if (std::fabs(shift) <= 0.01f) {
+                break;
+            }
+            constexpr float kDegToRad = 3.14159265358979323846f / 180.0f;
+            const float ang = (std::isfinite(span.angleDeg) ? span.angleDeg : 0.0f) * kDegToRad;
+            const float dx = std::cos(ang) * shift;
+            const float dy = std::sin(ang) * shift;
+            const std::size_t totalFloats = static_cast<std::size_t>(w) * static_cast<std::size_t>(h) * 4u;
+            thread_local std::vector<float> tlCaSrc;
+            if (tlCaSrc.size() < totalFloats) {
+                tlCaSrc.resize(totalFloats);
+            }
+            std::memcpy(tlCaSrc.data(), layer.premulRgba.data(), totalFloats * sizeof(float));
+            const float* src = tlCaSrc.data();
+            auto caBandFn = [&](int y0, int y1) {
+                for (int y = y0; y < y1; ++y) {
+                    float* dstRow = layer.premulRgba.data() +
+                        static_cast<std::size_t>(y) * static_cast<std::size_t>(w) * 4u;
+                    const float* centerRow = src +
+                        static_cast<std::size_t>(y) * static_cast<std::size_t>(w) * 4u;
+                    for (int x = 0; x < w; ++x) {
+                        const float* cp = centerRow + static_cast<std::size_t>(x) * 4u;
+                        float sR[4]{};
+                        float sB[4]{};
+                        SamplePremulBilinear(src, w, h, static_cast<float>(x) - dx, static_cast<float>(y) - dy, sR);
+                        SamplePremulBilinear(src, w, h, static_cast<float>(x) + dx, static_cast<float>(y) + dy, sB);
+                        const float outA = std::clamp(std::max({cp[3], sR[3], sB[3]}), 0.0f, 1.0f);
+                        float* dp = dstRow + static_cast<std::size_t>(x) * 4u;
+                        dp[0] = std::clamp(sR[0], 0.0f, outA);
+                        dp[1] = std::clamp(cp[1], 0.0f, outA);
+                        dp[2] = std::clamp(sB[2], 0.0f, outA);
+                        dp[3] = outA;
+                    }
+                }
+            };
+            if (!gInScanlineBand && static_cast<std::size_t>(w) * static_cast<std::size_t>(h) >= 16384u) {
+                ScanlineWorkerPool::Instance().ParallelBands4(h, caBandFn);
+            } else {
+                caBandFn(0, h);
+            }
+            break;
+        }
+        case UIEffectKind::DirectionalBlur: {
+            const float radius = std::clamp(
+                std::isfinite(span.radiusPx) ? span.radiusPx : 0.0f, 0.0f, 128.0f);
+            if (radius <= 0.25f) {
+                break;
+            }
+            constexpr float kDegToRad = 3.14159265358979323846f / 180.0f;
+            const float ang = (std::isfinite(span.angleDeg) ? span.angleDeg : 0.0f) * kDegToRad;
+            const float ux = std::cos(ang);
+            const float uy = std::sin(ang);
+            const int halfTaps = std::clamp(static_cast<int>(std::ceil(radius)), 1, 32);
+            const float step = radius / static_cast<float>(halfTaps);
+            const float invTaps = 1.0f / static_cast<float>(halfTaps * 2 + 1);
+            const std::size_t totalFloats = static_cast<std::size_t>(w) * static_cast<std::size_t>(h) * 4u;
+            thread_local std::vector<float> tlDbSrc;
+            if (tlDbSrc.size() < totalFloats) {
+                tlDbSrc.resize(totalFloats);
+            }
+            std::memcpy(tlDbSrc.data(), layer.premulRgba.data(), totalFloats * sizeof(float));
+            const float* src = tlDbSrc.data();
+            auto dbBandFn = [&](int y0, int y1) {
+                for (int y = y0; y < y1; ++y) {
+                    float* dstRow = layer.premulRgba.data() +
+                        static_cast<std::size_t>(y) * static_cast<std::size_t>(w) * 4u;
+                    for (int x = 0; x < w; ++x) {
+                        float accR = 0.0f, accG = 0.0f, accB = 0.0f, accA = 0.0f;
+                        for (int k = -halfTaps; k <= halfTaps; ++k) {
+                            const float off = static_cast<float>(k) * step;
+                            float sp[4]{};
+                            SamplePremulBilinear(
+                                src, w, h,
+                                static_cast<float>(x) + off * ux,
+                                static_cast<float>(y) + off * uy,
+                                sp);
+                            accR += sp[0];
+                            accG += sp[1];
+                            accB += sp[2];
+                            accA += sp[3];
+                        }
+                        float* dp = dstRow + static_cast<std::size_t>(x) * 4u;
+                        const float outA = std::clamp(accA * invTaps, 0.0f, 1.0f);
+                        dp[0] = std::clamp(accR * invTaps, 0.0f, outA);
+                        dp[1] = std::clamp(accG * invTaps, 0.0f, outA);
+                        dp[2] = std::clamp(accB * invTaps, 0.0f, outA);
+                        dp[3] = outA;
+                    }
+                }
+            };
+            if (!gInScanlineBand && static_cast<std::size_t>(w) * static_cast<std::size_t>(h) >= 16384u) {
+                ScanlineWorkerPool::Instance().ParallelBands4(h, dbBandFn);
+            } else {
+                dbBandFn(0, h);
+            }
+            break;
+        }
+        default:
+            break;
     }
 }
 
@@ -2463,7 +2828,7 @@ void RasterizeSingleNode(
                     }
                     if (hoistedPathGradBrush != nullptr && coverage > 0.0f) {
                         if (const GradientBrushDesc* gBrush = hoistedPathGradBrush) {
-                            const Color gc = EvaluateGradientBrushAtNormalizedUv(
+                            const Color gc = EvaluateGradientBrushSafe(
                                 *gBrush,
                                 std::clamp(su, 0.0f, 1.0f),
                                 std::clamp(sv, 0.0f, 1.0f),
@@ -2635,7 +3000,7 @@ void RasterizeSingleNode(
                     if (shapeCov > 0.002f) {
                         const GradientBrushDesc* brush = hoistedRectGradBrush;
                         const Color gradCol = brush
-                            ? EvaluateGradientBrushAtNormalizedUv(
+                            ? EvaluateGradientBrushSafe(
                                   *brush,
                                   su,
                                   sv,
@@ -2820,7 +3185,7 @@ void ExecuteBackdropBlurSpan(
     std::uint32_t viewportHeight,
     std::uint8_t* outRgba8,
     PremulOffscreenLayer* optPremulLayer) {
-    if (!std::isfinite(span.radiusPx) || span.radiusPx <= 0.25f ||
+    if (!SpanNeedsEffectPass(span) ||
         (outRgba8 == nullptr && optPremulLayer == nullptr)) {
         return;
     }
@@ -2834,9 +3199,7 @@ void ExecuteBackdropBlurSpan(
     const int surfY0 = optPremulLayer ? optPremulLayer->originY : 0;
     const int surfX1 = optPremulLayer ? (optPremulLayer->originX + optPremulLayer->width) : vpW;
     const int surfY1 = optPremulLayer ? (optPremulLayer->originY + optPremulLayer->height) : vpH;
-    const float clampedRadius = std::clamp(span.radiusPx, 0.5f, 128.0f);
-    const int boxR = std::max(1, static_cast<int>(std::lround(clampedRadius * 0.5f)));
-    const int padPx = boxR * 3 + 2;
+    const int padPx = ComputeSpanPaddingPx(span);
     const int bx0 = std::clamp(SafeFloorToInt(mr.x, surfX0 - padPx, surfX1 + padPx) - padPx, surfX0, surfX1);
     const int by0 = std::clamp(SafeFloorToInt(mr.y, surfY0 - padPx, surfY1 + padPx) - padPx, surfY0, surfY1);
     const int bx1 = std::clamp(SafeCeilToInt(mr.x + mr.width, surfX0 - padPx, surfX1 + padPx) + padPx, surfX0, surfX1);
@@ -2879,7 +3242,7 @@ void ExecuteBackdropBlurSpan(
     } else {
         copyBackdropRowsFn(0, bgLayer.height);
     }
-    SeparableBoxBlurPremul3Pass(bgLayer, boxR);
+    ApplySpanPostProcessEffect(bgLayer, span);
     const AxbMtsdfPathEntry* maskEntry = (span.maskMtsdfHash != 0u)
         ? AxbTemplateRegistry::Instance().FindMtsdfPath(span.maskMtsdfHash)
         : nullptr;
@@ -2977,8 +3340,7 @@ void RasterizeNodeSpanRecursive(
             (blurSpans[ioBlurCursor].endNodeId > nid ||
              blurSpans[ioBlurCursor].effectMode == UIEffectKind::BackdropBlur) &&
             blurSpans[ioBlurCursor].endNodeId <= endNodeId &&
-            std::isfinite(blurSpans[ioBlurCursor].radiusPx) &&
-            blurSpans[ioBlurCursor].radiusPx > 0.25f) {
+            SpanNeedsEffectPass(blurSpans[ioBlurCursor])) {
             const BlurLayerSpan span = blurSpans[ioBlurCursor];
             ++ioBlurCursor;
 
@@ -2994,9 +3356,7 @@ void RasterizeNodeSpanRecursive(
             float uMaxX = 0.0f;
             float uMaxY = 0.0f;
             if (ComputeNodeRangeScreenBounds(tree, span.firstNodeId, span.endNodeId, uMinX, uMinY, uMaxX, uMaxY)) {
-                const float clampedRadius = std::clamp(span.radiusPx, 0.5f, 128.0f);
-                const int boxR = std::max(1, static_cast<int>(std::lround(clampedRadius * 0.5f)));
-                const int padPx = boxR * 3 + 2;
+                const int padPx = ComputeSpanPaddingPx(span);
                 const int bx0 = std::clamp(SafeFloorToInt(uMinX, -padPx, vpW + padPx) - padPx, 0, vpW);
                 const int by0 = std::clamp(SafeFloorToInt(uMinY, -padPx, vpH + padPx) - padPx, 0, vpH);
                 const int bx1 = std::clamp(SafeCeilToInt(uMaxX, -padPx, vpW + padPx) + padPx, 0, vpW);
@@ -3063,30 +3423,7 @@ void RasterizeNodeSpanRecursive(
                     gRasterBandY0 = savedBandY0;
                     gRasterBandY1 = savedBandY1;
 
-                    if (span.effectMode == UIEffectKind::Pixelate) {
-                        const int blockSz = std::max(2, static_cast<int>(std::lround(span.radiusPx)));
-                        for (int by = 0; by < subLayer.height; by += blockSz) {
-                            const int bh = std::min(blockSz, subLayer.height - by);
-                            for (int bx = 0; bx < subLayer.width; bx += blockSz) {
-                                const int bw = std::min(blockSz, subLayer.width - bx);
-                                const int cx = bx + bw / 2;
-                                const int cy = by + bh / 2;
-                                const float* cp = subLayer.premulRgba.data() +
-                                    (static_cast<std::size_t>(cy) * subLayer.width + cx) * 4u;
-                                const float cr = cp[0], cg = cp[1], cb = cp[2], ca = cp[3];
-                                for (int yy = by; yy < by + bh; ++yy) {
-                                    float* row = subLayer.premulRgba.data() +
-                                        static_cast<std::size_t>(yy) * subLayer.width * 4u;
-                                    for (int xx = bx; xx < bx + bw; ++xx) {
-                                        float* dp = row + static_cast<std::size_t>(xx) * 4u;
-                                        dp[0] = cr; dp[1] = cg; dp[2] = cb; dp[3] = ca;
-                                    }
-                                }
-                            }
-                        }
-                    } else {
-                        SeparableBoxBlurPremul3Pass(subLayer, boxR);
-                    }
+                    ApplySpanPostProcessEffect(subLayer, span);
 
                     int compX0 = bx0;
                     int compY0 = by0;
@@ -3553,9 +3890,7 @@ void ZeroCopyGpuStream::RasterizeTreeToRgba8(
                     ++cursor;
                     continue;
                 }
-                if (nextSpan.endNodeId <= curNode ||
-                    !std::isfinite(nextSpan.radiusPx) ||
-                    nextSpan.radiusPx <= 0.25f) {
+                if (nextSpan.endNodeId <= curNode || !SpanNeedsEffectPass(nextSpan)) {
                     ++cursor;
                     continue;
                 }
@@ -3606,7 +3941,7 @@ bool ZeroCopyGpuStream::RasterizeBlurSpanPatchPremulRgba8(
     outPremulRgba8.clear();
     if (viewportWidth == 0u || viewportHeight == 0u ||
         span.endNodeId <= span.firstNodeId ||
-        !std::isfinite(span.radiusPx) || span.radiusPx <= 0.25f) {
+        !SpanNeedsEffectPass(span)) {
         return false;
     }
 
@@ -3620,9 +3955,7 @@ bool ZeroCopyGpuStream::RasterizeBlurSpanPatchPremulRgba8(
         return false;
     }
 
-    const float clampedRadius = std::clamp(span.radiusPx, 0.5f, 128.0f);
-    const int boxR = std::max(1, static_cast<int>(std::lround(clampedRadius * 0.5f)));
-    const int padPx = boxR * 3 + 2;
+    const int padPx = ComputeSpanPaddingPx(span);
     const int bx0 = std::clamp(SafeFloorToInt(uMinX, -padPx, vpW + padPx) - padPx, 0, vpW);
     const int by0 = std::clamp(SafeFloorToInt(uMinY, -padPx, vpH + padPx) - padPx, 0, vpH);
     const int bx1 = std::clamp(SafeCeilToInt(uMaxX, -padPx, vpW + padPx) + padPx, 0, vpW);
@@ -3658,30 +3991,7 @@ bool ZeroCopyGpuStream::RasterizeBlurSpanPatchPremulRgba8(
         nullptr,
         &subLayer);
 
-    if (span.effectMode == UIEffectKind::Pixelate) {
-        const int blockSz = std::max(2, static_cast<int>(std::lround(span.radiusPx)));
-        for (int by = 0; by < subLayer.height; by += blockSz) {
-            const int bh = std::min(blockSz, subLayer.height - by);
-            for (int bx = 0; bx < subLayer.width; bx += blockSz) {
-                const int bw = std::min(blockSz, subLayer.width - bx);
-                const int cx = bx + bw / 2;
-                const int cy = by + bh / 2;
-                const float* cp = subLayer.premulRgba.data() +
-                    (static_cast<std::size_t>(cy) * static_cast<std::size_t>(subLayer.width) + static_cast<std::size_t>(cx)) * 4u;
-                const float cr = cp[0], cg = cp[1], cb = cp[2], ca = cp[3];
-                for (int yy = by; yy < by + bh; ++yy) {
-                    float* row = subLayer.premulRgba.data() +
-                        static_cast<std::size_t>(yy) * static_cast<std::size_t>(subLayer.width) * 4u;
-                    for (int xx = bx; xx < bx + bw; ++xx) {
-                        float* dp = row + static_cast<std::size_t>(xx) * 4u;
-                        dp[0] = cr; dp[1] = cg; dp[2] = cb; dp[3] = ca;
-                    }
-                }
-            }
-        }
-    } else {
-        SeparableBoxBlurPremul3Pass(subLayer, boxR);
-    }
+    ApplySpanPostProcessEffect(subLayer, span);
 
     int compX0 = bx0;
     int compY0 = by0;
@@ -3768,7 +4078,7 @@ bool ZeroCopyGpuStream::ComputeBackdropBlurPatchPremulRgba8(
     outPremulRgba8.clear();
     if (!topDownReadbackRgba8 || readW <= 0 || readH <= 0 ||
         viewportWidth == 0u || viewportHeight == 0u ||
-        !std::isfinite(span.radiusPx) || span.radiusPx <= 0.25f) {
+        !SpanNeedsEffectPass(span)) {
         return false;
     }
     const Rect mr = span.maskDestRect;
@@ -3780,8 +4090,6 @@ bool ZeroCopyGpuStream::ComputeBackdropBlurPatchPremulRgba8(
 
     const int vpW = static_cast<int>(std::min<std::uint32_t>(viewportWidth, 0x3FFFFFFFu));
     const int vpH = static_cast<int>(std::min<std::uint32_t>(viewportHeight, 0x3FFFFFFFu));
-    const float clampedRadius = std::clamp(span.radiusPx, 0.5f, 128.0f);
-    const int boxR = std::max(1, static_cast<int>(std::lround(clampedRadius * 0.5f)));
 
     PremulOffscreenLayer bgLayer{};
     bgLayer.originX = readX;
@@ -3804,7 +4112,7 @@ bool ZeroCopyGpuStream::ComputeBackdropBlurPatchPremulRgba8(
             dp[3] = static_cast<float>(sp[3]) / 255.0f;
         }
     }
-    SeparableBoxBlurPremul3Pass(bgLayer, boxR);
+    ApplySpanPostProcessEffect(bgLayer, span);
 
     int mx0 = std::clamp(SafeFloorToInt(mr.x, 0, vpW), readX, readX + readW);
     int my0 = std::clamp(SafeFloorToInt(mr.y, 0, vpH), readY, readY + readH);
