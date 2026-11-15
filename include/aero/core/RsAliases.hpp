@@ -1,6 +1,7 @@
 #pragma once
 
-#include "realscript/runtime/ExecutionDomain.h"
+#include "aero/runtime/AeroExecutionDomains.hpp"
+#include "aero/runtime/AeroObservableList.hpp"
 #include "realscript/runtime/Runtime.h"
 #include "realscript/semantic/Semantic.h"
 
@@ -14,9 +15,7 @@ namespace hot_reload {}
 namespace mir {}
 namespace optimization {}
 namespace aot {}
-namespace game {
-using PropertySlotHandle = ::realscript::runtime::PropertySlotHandle;
-} // namespace game
+namespace bindgen {}
 } // namespace realscript
 
 namespace aero {
@@ -27,7 +26,7 @@ namespace rs_rt = ::realscript::runtime;
 namespace rs_sem = ::realscript::semantic;
 namespace rs_bc = ::realscript::bytecode;
 namespace rs_diag = ::realscript::diagnostics;
-namespace rs_game = ::realscript::game;
+namespace rs_bind = ::realscript::bindgen;
 namespace rs_comp = ::realscript::compiler;
 namespace rs_hr = ::realscript::hot_reload;
 namespace rs_mir = ::realscript::mir;
@@ -41,7 +40,7 @@ using PrimitiveType = rs_sem::PrimitiveType;
 // Unified 16-byte value model (RealScript RuntimeAbiMajor = 2) & primitive wrappers
 using UnifiedValue = rs_rt::Value;
 using ValueTag = rs_rt::ValueTag;
-using Float4Value = rs_rt::Float4Value;
+using Float4Value = rs_rt::QuatfValue;
 using FloatValue = rs_rt::FloatValue;
 using StringValue = rs_rt::StringValue;
 using StructValue = rs_rt::StructValue;
@@ -70,14 +69,5 @@ using BindingRegistry = rs_rt::BindingRegistry;
 using ValueSpan = rs_rt::ValueSpan;
 using RuntimeError = rs_rt::RuntimeError;
 using ErrorCode = rs_rt::ErrorCode;
-
-// Dual execution domains (SimDomain + UiDomain) & zero-boxing property slot handle
-using DomainKind = rs_rt::DomainKind;
-using ExecutionDomainContext = rs_rt::ExecutionDomainContext;
-using SimCommandEnvelope = rs_rt::SimCommandEnvelope;
-using PropertySlotHandle = rs_game::PropertySlotHandle;
-using CollectionChangeKind = rs_rt::CollectionChangeKind;
-using CollectionChangeRecord = rs_rt::CollectionChangeRecord;
-using ObservableListHelper = rs_rt::ObservableListHelper;
 
 } // namespace aero

@@ -716,7 +716,7 @@ namespace value {
 
 [[nodiscard]] inline std::optional<Color> TryGetColor(const UnifiedValue& v) noexcept {
     Float4Value f4{};
-    if (v.tryGetFloat4(f4)) {
+    if (v.tryGetQuatf(f4)) {
         return Color::FromFloat4(f4);
     }
     return std::nullopt;
@@ -724,7 +724,7 @@ namespace value {
 
 [[nodiscard]] inline std::optional<Point> TryGetPoint(const UnifiedValue& v) noexcept {
     Float4Value f4{};
-    if (v.tryGetFloat4(f4)) {
+    if (v.tryGetQuatf(f4)) {
         return Point::FromFloat4(f4);
     }
     return std::nullopt;
@@ -732,7 +732,7 @@ namespace value {
 
 [[nodiscard]] inline std::optional<Rect> TryGetRect(const UnifiedValue& v) noexcept {
     Float4Value f4{};
-    if (v.tryGetFloat4(f4)) {
+    if (v.tryGetQuatf(f4)) {
         return Rect::FromFloat4(f4);
     }
     return std::nullopt;
@@ -740,7 +740,7 @@ namespace value {
 
 [[nodiscard]] inline std::optional<Thickness> TryGetThickness(const UnifiedValue& v) noexcept {
     Float4Value f4{};
-    if (v.tryGetFloat4(f4)) {
+    if (v.tryGetQuatf(f4)) {
         return Thickness::FromFloat4(f4);
     }
     return std::nullopt;
@@ -749,7 +749,7 @@ namespace value {
 [[nodiscard]] inline std::optional<CornerRadius> TryGetCornerRadius(
     const UnifiedValue& v) noexcept {
     Float4Value f4{};
-    if (v.tryGetFloat4(f4)) {
+    if (v.tryGetQuatf(f4)) {
         return CornerRadius::FromFloat4(f4);
     }
     return std::nullopt;

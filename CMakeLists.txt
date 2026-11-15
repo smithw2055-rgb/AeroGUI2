@@ -31,6 +31,8 @@ endif()
 # 1. Pure Runtime Library (Zero XML Parser, Zero Compiler Frontend, Wasm-Ready)
 # ============================================================================
 set(AERO_RUNTIME_SOURCES
+    src/runtime/AeroObservableList.cpp
+    src/runtime/AeroExecutionDomains.cpp
     src/core/UIElement.cpp
     src/core/AxbFormat.cpp
     src/core/UiResourceContext.cpp
@@ -88,6 +90,7 @@ add_library(AeroGUI::Runtime ALIAS aerogui_runtime)
 if(AERO_BUILD_COMPILER_TOOLS)
     add_library(aerogui_compiler_lib STATIC
         src/compiler/AeroCompiler.cpp
+        src/compiler/CSharpCompatLowerer.cpp
         src/compiler/XamlApplication.cpp
     )
 

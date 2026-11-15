@@ -616,13 +616,13 @@ public CommandDeckWindow CreateCommandDeck()
     ExecutionDomainContext domains;
     domains.registerProgramObservableMetadata(*compiled.programImage);
     Interpreter uiInterpreter(compiled.programImage, domains.uiHeapPtr());
-    uiInterpreter.setExecutionDomainContext(&domains, DomainKind::UiPresentation);
+    domains.attachInterpreter(uiInterpreter, DomainKind::UiPresentation);
 
     const auto createRes = uiInterpreter.invoke("Aero.Demo::CreateCommandDeck");
     AERO_CHECK(createRes.succeeded, "Instantiated CommandDeckWindow ViewModel on UiHeap");
     const ObjectRef vmRef = std::get<ObjectRef>(createRes.value);
     auto vmRoot = domains.uiHeap().retain(vmRef);
-    domains.uiHeap().clearDirtyFieldMask(vmRef);
+    (void)domains.uiHeap().consumeDirtyMask(vmRef);
     (void)domains.uiHeap().consumeDirtyObjects();
 
     DualTrackBindingEngine bindingEngine(domains, compiled.programImage.get(), &uiInterpreter);

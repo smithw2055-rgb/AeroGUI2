@@ -362,7 +362,7 @@ struct MountedSampleHarness {
         scriptBridge->RegisterCoreUiBindings(*nativeBindings);
 
         uiInterpreter = std::make_unique<Interpreter>(compileResult.programImage, domains.uiHeapPtr());
-        uiInterpreter->setExecutionDomainContext(&domains, DomainKind::UiPresentation);
+        domains.attachInterpreter(*uiInterpreter, DomainKind::UiPresentation);
         uiInterpreter->setBindingRegistry(nativeBindings);
 
         const std::string factoryFnName = sampleName + "::CreateMainWindow";
@@ -390,7 +390,7 @@ struct MountedSampleHarness {
         mainWinRef = *oref;
         mainWinPin = domains.uiHeap().retain(mainWinRef);
         (void)domains.uiHeap().consumeDirtyObjects();
-        domains.uiHeap().clearDirtyFieldMask(mainWinRef);
+        (void)domains.uiHeap().consumeDirtyMask(mainWinRef);
 
         bindingEngine = std::make_unique<DualTrackBindingEngine>(
             domains, compileResult.programImage.get(), uiInterpreter.get());

@@ -72,7 +72,7 @@ void WriteValue(std::vector<std::uint8_t>& out, const UnifiedValue& val) {
     } else if (const auto* f = std::get_if<FloatValue>(&val)) {
         WriteU8(out, static_cast<std::uint8_t>(AxbLiteralTag::Float32));
         WriteF32(out, f->value);
-    } else if (Float4Value f4{}; val.tryGetFloat4(f4)) {
+    } else if (Float4Value f4{}; val.tryGetQuatf(f4)) {
         WriteU8(out, static_cast<std::uint8_t>(AxbLiteralTag::Float4));
         WriteF32(out, f4.x);
         WriteF32(out, f4.y);
@@ -4295,6 +4295,21 @@ bool AxbPackage::BindAgainstProgram(
                     }
                 }
             }
+            for (const auto& fref : mod.functionReferences) {
+                if ((fref.name == "Aero.UI::GUI_SetDataContext" ||
+                     fref.name.find("GUI_SetDataContext__") != std::string::npos ||
+                     fref.name.find("__Aero_SetDataContext") != std::string::npos ||
+                     fref.name.find("Aero_SetDataContext__") != std::string::npos) &&
+                    fref.parameterTypeIds.size() >= 2u &&
+                    fref.parameterTypeIds[0] == clsSym->id &&
+                    fref.parameterTypeIds[1] != 0) {
+                    if (const auto* dcTs = program.resolveType(fref.parameterTypeIds[1])) {
+                        return dcTs->moduleName.empty()
+                            ? dcTs->name
+                            : (dcTs->moduleName + "::" + dcTs->name);
+                    }
+                }
+            }
         }
         // 3. Inspect DataContext / ViewModel property or field on x:Class
         for (const auto& pr : clsSym->properties) {
@@ -4802,10 +4817,8 @@ bool AxbPackage::BindAgainstProgram(
             if (wrapperMethodId != 0) {
                 act.commandMethodSymbolId = wrapperMethodId;
                 act.commandTargetsWrapper = true;
-                if (const auto* loc = program.resolveFunction(act.commandMethodSymbolId)) {
-                    if (loc->function && loc->function->simCommand) {
-                        act.isSimCommand = true;
-                    }
+                if (domains->isSimCommandFunction(act.commandMethodSymbolId)) {
+                    act.isSimCommand = true;
                 }
                 return;
             }
@@ -4839,12 +4852,9 @@ bool AxbPackage::BindAgainstProgram(
         if (methodOwnerSym && !leafCmd.empty()) {
             act.commandMethodSymbolId = findMethodOnTypeHierarchy(methodOwnerSym, leafCmd);
         }
-        if (act.commandMethodSymbolId != 0) {
-            if (const auto* loc = program.resolveFunction(act.commandMethodSymbolId)) {
-                if (loc->function && loc->function->simCommand) {
-                    act.isSimCommand = true;
-                }
-            }
+        if (act.commandMethodSymbolId != 0 &&
+            domains->isSimCommandFunction(act.commandMethodSymbolId)) {
+            act.isSimCommand = true;
         }
     };
 

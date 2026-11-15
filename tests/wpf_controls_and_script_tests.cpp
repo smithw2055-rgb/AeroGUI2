@@ -392,7 +392,7 @@ namespace HierDemo
     aero::ScriptUiBridge bridge(domains);
     bridge.RegisterCoreUiBindings(*nativeBindings);
     aero::Interpreter interp(res.programImage, domains.uiHeapPtr());
-    interp.setExecutionDomainContext(&domains, aero::DomainKind::UiPresentation);
+    domains.attachInterpreter(interp, aero::DomainKind::UiPresentation);
     interp.setBindingRegistry(nativeBindings);
     aero::DualTrackBindingEngine binding(domains, res.programImage.get(), &interp);
     bridge.SetUnderlyingEngine(&binding);
@@ -549,7 +549,7 @@ namespace CtorDemo
     aero::ScriptUiBridge bridge(domains);
     bridge.RegisterCoreUiBindings(*nativeBindings);
     aero::Interpreter interp(res.programImage, domains.uiHeapPtr());
-    interp.setExecutionDomainContext(&domains, aero::DomainKind::UiPresentation);
+    domains.attachInterpreter(interp, aero::DomainKind::UiPresentation);
     interp.setBindingRegistry(nativeBindings);
     aero::DualTrackBindingEngine binding(domains, res.programImage.get(), &interp);
     bridge.SetUnderlyingEngine(&binding);
@@ -767,7 +767,7 @@ namespace TypedEventsDemo
     aero::ScriptUiBridge bridge(domains);
     bridge.RegisterCoreUiBindings(*nativeBindings);
     aero::Interpreter interp(res.programImage, domains.uiHeapPtr());
-    interp.setExecutionDomainContext(&domains, aero::DomainKind::UiPresentation);
+    domains.attachInterpreter(interp, aero::DomainKind::UiPresentation);
     interp.setBindingRegistry(nativeBindings);
     aero::DualTrackBindingEngine binding(domains, res.programImage.get(), &interp);
     bridge.SetUnderlyingEngine(&binding);
@@ -1432,7 +1432,7 @@ namespace VerbatimDemo
     aero::ScriptUiBridge bridge(domains);
     bridge.RegisterCoreUiBindings(*nativeBindings);
     aero::Interpreter interp(res.programImage, domains.uiHeapPtr());
-    interp.setExecutionDomainContext(&domains, aero::DomainKind::UiPresentation);
+    domains.attachInterpreter(interp, aero::DomainKind::UiPresentation);
     interp.setBindingRegistry(nativeBindings);
     aero::DualTrackBindingEngine binding(domains, res.programImage.get(), &interp);
     bridge.SetUnderlyingEngine(&binding);
@@ -1931,7 +1931,7 @@ keep_literal";
             aero::ScriptUiBridge bridge(domains);
             bridge.RegisterCoreUiBindings(*nativeBindings);
             aero::Interpreter interp(res.programImage, domains.uiHeapPtr());
-            interp.setExecutionDomainContext(&domains, aero::DomainKind::UiPresentation);
+            domains.attachInterpreter(interp, aero::DomainKind::UiPresentation);
             interp.setBindingRegistry(nativeBindings);
             aero::DualTrackBindingEngine binding(domains, res.programImage.get(), &interp);
             bridge.SetUnderlyingEngine(&binding);

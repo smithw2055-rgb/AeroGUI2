@@ -620,7 +620,7 @@ bool XamlApplication::Load(const XamlApplicationOptions& options, std::string* o
         scriptBridge_->RegisterCoreUiBindings(*nativeBindings_);
 
         interpreter_ = std::make_unique<Interpreter>(compileResult_.programImage, domains_.uiHeapPtr());
-        interpreter_->setExecutionDomainContext(&domains_, DomainKind::UiPresentation);
+        domains_.attachInterpreter(*interpreter_, DomainKind::UiPresentation);
         interpreter_->setBindingRegistry(nativeBindings_);
 
         bindingEngine_ = std::make_unique<DualTrackBindingEngine>(
@@ -734,7 +734,7 @@ bool XamlApplication::Load(const XamlApplicationOptions& options, std::string* o
                         codeBehindObj_ = *oref;
                         codeBehindPin_ = domains_.uiHeap().retain(codeBehindObj_);
                         (void)domains_.uiHeap().consumeDirtyObjects();
-                        domains_.uiHeap().clearDirtyFieldMask(codeBehindObj_);
+                        (void)domains_.uiHeap().consumeDirtyMask(codeBehindObj_);
                         break;
                     }
                 }
@@ -780,7 +780,7 @@ bool XamlApplication::Load(const XamlApplicationOptions& options, std::string* o
                         }
                     }
                     (void)domains_.uiHeap().consumeDirtyObjects();
-                    domains_.uiHeap().clearDirtyFieldMask(codeBehindObj_);
+                    (void)domains_.uiHeap().consumeDirtyMask(codeBehindObj_);
                 }
             }
         }

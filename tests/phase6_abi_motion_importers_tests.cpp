@@ -51,7 +51,7 @@ void Test16ByteValueAbiAndValuePoolGcSweepSurvival() {
     // Verify MakeFloat4InlineFast round-trips without pool allocation
     const UnifiedValue fastColor = MakeFloat4InlineFast(0.15f, 0.45f, 0.85f, 1.0f);
     Float4Value f4{};
-    AERO_CHECK(fastColor.tryGetFloat4(f4), "MakeFloat4InlineFast tryGetFloat4 succeeded");
+    AERO_CHECK(fastColor.tryGetQuatf(f4), "MakeFloat4InlineFast tryGetQuatf succeeded");
     AERO_CHECK(ApproxEq(f4.x, 0.15f) && ApproxEq(f4.y, 0.45f) && ApproxEq(f4.z, 0.85f) && ApproxEq(f4.w, 1.0f),
                "MakeFloat4InlineFast components match");
 

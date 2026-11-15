@@ -600,8 +600,8 @@ public partial class SquadTacticalHud
     const SymbolId deployMethodId = res.axbPackage.eventBindings.front().handlerSymbolId;
 
     static const rs_aot::FieldDescriptor kHudFields[] = {
-        {"SquadTitle", PrimitiveType::String, 0u, 0u, false, true, 0u, true},
-        {"DeployedUnits", PrimitiveType::Int, 0u, 1u, false, true, 1u, true},
+        {"SquadTitle", PrimitiveType::String, 0u, 0u, false, false, false},
+        {"DeployedUnits", PrimitiveType::Int, 0u, 1u, false, false, false},
     };
     static const rs_aot::TypeDescriptor kHudTypes[] = {
         {hudTypeId,
@@ -619,8 +619,7 @@ public partial class SquadTacticalHud
          nullptr,
          0u,
          false,
-         true,  // observable
-         true,  // simState
+         false,
          true}, // partialType
     };
 
@@ -641,8 +640,12 @@ public partial class SquadTacticalHud
          kDeployParamTypeIds,
          2u,
          &DeployCommandAotEntry,
-         nullptr,
-         true}, // simCommand
+         nullptr},
+    };
+    static const rs_aot::AttributeDescriptor kHudAttributes[] = {
+        {"Game.UI::SquadTacticalHud", "Observable"},
+        {"Game.UI::SquadTacticalHud", "SimState"},
+        {"Game.UI::SquadTacticalHud::method:RequestDeploy#1", "SimCommand"},
     };
     static const char* const kModuleNames[] = {"Game.UI"};
     static const rs_aot::ProgramDescriptor kAotProgramDesc{
@@ -657,10 +660,12 @@ public partial class SquadTacticalHud
         kHudFunctions,
         1u,
         nullptr,
-        0u};
+        0u,
+        kHudAttributes,
+        3u};
 
     rs_aot::ExecutionContext aotSimCtx(kAotProgramDesc, domains.simHeapPtr(), nullptr);
-    aotSimCtx.setDomainContext(&domains, DomainKind::SimDeterministic);
+    domains.attachAotContext(aotSimCtx, DomainKind::SimDeterministic);
 
     // Allocate SquadTacticalHud instance on SimHeap via AOT ExecutionContext
     UnifiedValue simHudVal{};
@@ -671,12 +676,12 @@ public partial class SquadTacticalHud
     AERO_CHECK(aotSimCtx.storeField(hudTypeId, 1u, simHudVal, value::FromInt(2)),
                "Initialized DeployedUnits");
     (void)domains.simHeap().consumeDirtyObjects();
-    domains.simHeap().clearDirtyFieldMask(simHudObj);
+    (void)domains.simHeap().consumeDirtyMask(simHudObj);
 
     // Mutate [Observable] field in Simulation AOT context -> weaves 64-bit dirtyFieldMask!
     AERO_CHECK(aotSimCtx.storeField(hudTypeId, 1u, simHudVal, value::FromInt(5)),
                "AOT storeField succeeded on SimHeap");
-    AERO_CHECK((domains.simHeap().dirtyFieldMask(simHudObj) & (1ULL << 1u)) != 0ULL,
+    AERO_CHECK((domains.simHeap().peekDirtyMask(simHudObj) & (1ULL << 1u)) != 0ULL,
                "AOT storeField wove bit 1 into 64-bit dirtyFieldMask");
     const auto dirtyObjs = domains.simHeap().consumeDirtyObjects();
     AERO_CHECK(dirtyObjs.size() == 1u && dirtyObjs[0] == simHudObj,
@@ -697,7 +702,7 @@ public partial class SquadTacticalHud
 
     // Now create a UiPresentation AOT context sharing the ExecutionDomainContext
     rs_aot::ExecutionContext aotUiCtx(kAotProgramDesc, domains.uiHeapPtr(), nullptr);
-    aotUiCtx.setDomainContext(&domains, DomainKind::UiPresentation);
+    domains.attachAotContext(aotUiCtx, DomainKind::UiPresentation);
 
     // 1) Cross-Heap Read-Only: UiPresentation can read SimHeap object fields in O(1)
     UnifiedValue uiReadUnits{};
@@ -734,32 +739,30 @@ public partial class SquadTacticalHud
     {
         rs_mir::Module modA;
         modA.name = "Game.UI";
+        modA.languageMetadata.attributes.push_back(
+            {"Game.UI::SquadTacticalHud", "Observable", {}, "", 0});
         rs_sem::TypeSymbol partA{};
         partA.id = hudTypeId;
         partA.moduleName = "Game.UI";
         partA.name = "SquadTacticalHud";
         partA.kind = rs_sem::TypeKind::Class;
-        partA.observable = true;
-        partA.simState = false;
         partA.partialType = true;
         rs_sem::FieldSymbol fA1{};
         fA1.name = "FieldA";
         fA1.type = PrimitiveType::Int;
         fA1.index = 0u;
-        fA1.observable = true;
-        fA1.observableBitIndex = 0u;
         partA.fields.push_back(fA1);
         modA.types.push_back(partA);
 
         rs_mir::Module modB;
         modB.name = "Game.UI.Generated";
+        modB.languageMetadata.attributes.push_back(
+            {"Game.UI::SquadTacticalHud", "SimState", {}, "", 0});
         rs_sem::TypeSymbol partB{};
         partB.id = hudTypeId;
         partB.moduleName = "Game.UI";
         partB.name = "SquadTacticalHud";
         partB.kind = rs_sem::TypeKind::Class;
-        partB.observable = false;
-        partB.simState = true;
         partB.partialType = true;
         rs_sem::FieldSymbol fB1{};
         fB1.name = "FieldA";
@@ -769,7 +772,6 @@ public partial class SquadTacticalHud
         fB2.name = "FieldB";
         fB2.type = PrimitiveType::Float;
         fB2.index = 1u;
-        fB2.simState = true;
         partB.fields.push_back(fB1);
         partB.fields.push_back(fB2);
         modB.types.push_back(partB);
@@ -795,17 +797,19 @@ public partial class SquadTacticalHud
         AERO_CHECK(mergedOut.source.find("\"FieldA\"") != std::string::npos &&
                    mergedOut.source.find("\"FieldB\"") != std::string::npos,
                    "Merged partial class TypeDescriptor contains both FieldA and FieldB");
-        AERO_CHECK(mergedOut.source.find("true, true, true") != std::string::npos,
-                   "Merged partial class TypeDescriptor preserved observable=true, simState=true, partialType=true");
         AERO_CHECK(mergedOut.source.find("65535u") == std::string::npos &&
-                   mergedOut.source.find("\"FieldB\", semantic::PrimitiveType::Float, 0x0000000000000000ULL, 1u, false, true, 1u, true") != std::string::npos,
-                   "Merged partial class assigned valid observableBitIndex=1u (not 65535u) to FieldB");
+                   mergedOut.source.find("\"FieldB\", semantic::PrimitiveType::Float, 0x0000000000000000ULL, 1u") != std::string::npos,
+                   "Merged partial class assigned valid field index 1u (not 65535u) to FieldB");
+        AERO_CHECK(mergedOut.source.find("programAttributes") != std::string::npos &&
+                   mergedOut.source.find("\"Game.UI::SquadTacticalHud\", \"Observable\"") != std::string::npos &&
+                   mergedOut.source.find("\"Game.UI::SquadTacticalHud\", \"SimState\"") != std::string::npos,
+                   "Merged partial class AOT emission preserved Observable and SimState programAttributes");
     }
 
     // 2) Cross-Heap Write Protection: UiPresentation direct storeField to SimHeap is rejected!
     {
         rs_aot::ExecutionContext aotUiWriteAttempt(kAotProgramDesc, domains.uiHeapPtr(), nullptr);
-        aotUiWriteAttempt.setDomainContext(&domains, DomainKind::UiPresentation);
+        domains.attachAotContext(aotUiWriteAttempt, DomainKind::UiPresentation);
         const bool writeAllowed = aotUiWriteAttempt.storeField(
             hudTypeId, 1u, simHudVal, value::FromInt(999));
         AERO_CHECK(!writeAllowed,

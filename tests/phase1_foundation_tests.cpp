@@ -18,7 +18,6 @@
 #include "aero/core/UnifiedValue.hpp"
 #include "realscript/bytecode/Bytecode.h"
 #include "realscript/compiler/Compilation.h"
-#include "realscript/game/GameScripting.h"
 
 namespace {
 
@@ -171,7 +170,7 @@ void TestUnifiedValueAndFloat4() {
         rs_rt::valueType(vc) == PrimitiveType::Struct,
         "Float4Value should report PrimitiveType::Struct");
     AERO_CHECK(
-        rs_rt::valueToString(vc).find("<Float4:") == 0,
+        rs_rt::valueToString(vc).find("<Quatf:") == 0,
         "Float4Value valueToString formatting");
 
     std::cout << "[PASS] TestUnifiedValueAndFloat4\n";
@@ -799,7 +798,7 @@ public void MutateViewModel(HugeSquadViewModel vm, float newWidth, float newOpac
         "SquadTitle assigned independent observableBitIndex 2 (< 64)");
 
     // Clear initial construction dirty state before binding
-    domains.simHeap().clearDirtyFieldMask(vmRef);
+    (void)domains.simHeap().consumeDirtyMask(vmRef);
     (void)domains.simHeap().consumeDirtyObjects();
 
     // Bind HugeSquadViewModel properties on SimHeap to an AeroGUI Button on the UI side
@@ -832,7 +831,7 @@ public void MutateViewModel(HugeSquadViewModel vm, float newWidth, float newOpac
         domains.writePropertySlotFast(DomainKind::Sim, vmRef, widthSlot, MakeFloat(120.0f), &err),
         "Wrote identical value 120.0f to HealthWidth");
     AERO_CHECK(
-        domains.simHeap().dirtyFieldMask(vmRef) == 0ULL,
+        domains.simHeap().peekDirtyMask(vmRef) == 0ULL,
         "Equality short-circuit keeps dirtyFieldMask == 0");
     AERO_CHECK(
         bridge.FlushReactiveBindings(&err) == 0u,
@@ -845,7 +844,7 @@ public void MutateViewModel(HugeSquadViewModel vm, float newWidth, float newOpac
     AERO_CHECK(dmgRes.succeeded, "Invoke MutateViewModel(vm, 280.0f, 0.9f) on SimHeap ViewModel");
 
     // Verify bits 0 and 1 are set in dirtyFieldMask
-    const std::uint64_t mask = domains.simHeap().dirtyFieldMask(vmRef);
+    const std::uint64_t mask = domains.simHeap().peekDirtyMask(vmRef);
     AERO_CHECK(
         mask == ((1ULL << 0u) | (1ULL << 1u)),
         "dirtyFieldMask has exact bits 0 and 1 set after script property mutation");
@@ -858,7 +857,7 @@ public void MutateViewModel(HugeSquadViewModel vm, float newWidth, float newOpac
         std::fabs(healthBarBtn->GetOpacity() - 0.9f) < 1e-5f,
         "Button.Opacity updated to 0.9");
     AERO_CHECK(
-        domains.simHeap().dirtyFieldMask(vmRef) == 0ULL,
+        domains.simHeap().peekDirtyMask(vmRef) == 0ULL,
         "dirtyFieldMask cleared after FlushReactiveBindings");
 
     // Verify .rsbc binary serialization/deserialization round-trip preserves [Observable] bit indices

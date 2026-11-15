@@ -224,7 +224,7 @@ struct LiveBindingEngineRegistry {
     }
     Float4Value af4{};
     Float4Value bf4{};
-    if (a.tryGetFloat4(af4) && b.tryGetFloat4(bf4)) {
+    if (a.tryGetQuatf(af4) && b.tryGetQuatf(bf4)) {
         return af4 == bf4;
     }
     if (const auto* as = std::get_if<StringValue>(&a)) {
@@ -347,7 +347,7 @@ void ReleaseIndexedArrayObserversFrom(
         if (entry.hopIndex >= fromHopIndex) {
             if (observeEnabled && entry.wrapperRef.valid()) {
                 if (auto* heap = domains.heapForObject(entry.wrapperRef)) {
-                    heap->removeUiObserver(entry.wrapperRef);
+                    ObservableListHelper::RemoveUiObserver(*heap, entry.wrapperRef);
                 }
             }
             continue;
@@ -376,21 +376,21 @@ void UpsertIndexedArrayObserver(
         return;
     }
     if (observeEnabled) {
-        heap->enableArrayChangeTracking(backingArr);
+        ObservableListHelper::EnableTracking(*heap, backingArr);
     }
-    const std::uint64_t ver = heap->arrayMutationVersion(backingArr);
+    const std::uint64_t ver = ObservableListHelper::MutationVersion(*heap, backingArr);
     for (auto& entry : list) {
         if (entry.hopIndex == hopIndex) {
             if (!(entry.wrapperRef == wrapperRef)) {
                 if (observeEnabled && entry.wrapperRef.valid()) {
                     if (auto* oldHeap = domains.heapForObject(entry.wrapperRef)) {
-                        oldHeap->removeUiObserver(entry.wrapperRef);
+                        ObservableListHelper::RemoveUiObserver(*oldHeap, entry.wrapperRef);
                     }
                 }
                 entry.wrapperRef = wrapperRef;
                 if (observeEnabled && wrapperRef.valid()) {
                     if (auto* wHeap = domains.heapForObject(wrapperRef)) {
-                        wHeap->addUiObserver(wrapperRef);
+                        ObservableListHelper::AddUiObserver(*wHeap, wrapperRef);
                     }
                 }
             }
@@ -401,7 +401,7 @@ void UpsertIndexedArrayObserver(
     }
     if (observeEnabled && wrapperRef.valid()) {
         if (auto* wHeap = domains.heapForObject(wrapperRef)) {
-            wHeap->addUiObserver(wrapperRef);
+            ObservableListHelper::AddUiObserver(*wHeap, wrapperRef);
         }
     }
     list.push_back(ObservedIndexedArray{backingArr, wrapperRef, hopIndex, ver});
@@ -419,7 +419,7 @@ void UpsertIndexedArrayObserver(
         }
         if (const auto* heap = domains.heapForObject(entry.arrayRef);
             heap && heap->isAlive(entry.arrayRef)) {
-            if (heap->arrayMutationVersion(entry.arrayRef) != entry.lastSeenVersion) {
+            if (ObservableListHelper::MutationVersion(*heap, entry.arrayRef) != entry.lastSeenVersion) {
                 changed = true;
                 if (entry.hopIndex < earliest) {
                     earliest = entry.hopIndex;
@@ -501,7 +501,7 @@ void UpsertIndexedArrayObserver(
                 continue;
             }
             if (const auto* heap = domains.heapForObject(hopRef)) {
-                if (heap->dirtyFieldMask(hopRef) != 0ULL) {
+                if (heap->peekDirtyMask(hopRef) != 0ULL) {
                     return true;
                 }
             }
@@ -520,9 +520,19 @@ DualTrackBindingEngine::DualTrackBindingEngine(
       program_(program),
       uiInterpreter_(uiInterpreter) {
     LiveBindingEngineRegistry::Instance().Register(this);
+    if (program_ != nullptr) {
+        domains_.registerProgramObservableMetadata(*program_);
+    }
     rs_rt::registerExternalValuePoolRootMarker(this, [this]() {
         MarkValuesInPools();
     });
+}
+
+void DualTrackBindingEngine::SetProgramImage(const ProgramImage* program) {
+    program_ = program;
+    if (program_ != nullptr) {
+        domains_.registerProgramObservableMetadata(*program_);
+    }
 }
 
 bool DualTrackBindingEngine::IsLiveInstance(const DualTrackBindingEngine* engine) noexcept {
@@ -560,7 +570,7 @@ DualTrackBindingEngine::~DualTrackBindingEngine() noexcept {
         for (auto& hopRef : binding.resolvedHopObjects) {
             if (hopRef.valid()) {
                 if (auto* heap = domains_.heapForObject(hopRef)) {
-                    heap->removeUiObserver(hopRef);
+                    ObservableListHelper::RemoveUiObserver(*heap, hopRef);
                 }
                 hopRef = ObjectRef{};
             }
@@ -576,7 +586,7 @@ DualTrackBindingEngine::~DualTrackBindingEngine() noexcept {
             for (auto& hopRef : eb.resolvedHopObjects) {
                 if (hopRef.valid()) {
                     if (auto* heap = domains_.heapForObject(hopRef)) {
-                        heap->removeUiObserver(hopRef);
+                        ObservableListHelper::RemoveUiObserver(*heap, hopRef);
                     }
                     hopRef = ObjectRef{};
                 }
@@ -595,7 +605,7 @@ DualTrackBindingEngine::~DualTrackBindingEngine() noexcept {
         }
         if (rt.observedDcRef.valid()) {
             if (auto* heap = domains_.heapForObject(rt.observedDcRef)) {
-                heap->removeUiObserver(rt.observedDcRef);
+                ObservableListHelper::RemoveUiObserver(*heap, rt.observedDcRef);
             }
             rt.observedDcRef = ObjectRef{};
         }
@@ -686,7 +696,7 @@ bool DualTrackBindingEngine::HasPendingDirtyObjects() const noexcept {
         if (b.syncedCollectionRef.valid()) {
             if (const auto* colHeap = domains_.heapForObject(b.syncedCollectionRef);
                 colHeap && colHeap->isAlive(b.syncedCollectionRef)) {
-                if (colHeap->arrayMutationVersion(b.syncedCollectionRef) != b.lastSeenMutationVersion) {
+                if (ObservableListHelper::MutationVersion(*colHeap, b.syncedCollectionRef) != b.lastSeenMutationVersion) {
                     return true;
                 }
             }
@@ -699,7 +709,7 @@ bool DualTrackBindingEngine::HasPendingDirtyObjects() const noexcept {
                 continue;
             }
             if (const auto* heap = domains_.heapForObject(hopRef)) {
-                if (heap->dirtyFieldMask(hopRef) != 0ULL) {
+                if (heap->peekDirtyMask(hopRef) != 0ULL) {
                     return true;
                 }
             }
@@ -717,7 +727,7 @@ bool DualTrackBindingEngine::HasPendingDirtyObjects() const noexcept {
                 continue;
             }
             if (const auto* heap = domains_.heapForObject(hopRef)) {
-                if (heap->dirtyFieldMask(hopRef) != 0ULL) {
+                if (heap->peekDirtyMask(hopRef) != 0ULL) {
                     return true;
                 }
             }
@@ -731,7 +741,7 @@ bool DualTrackBindingEngine::HasPendingDirtyObjects() const noexcept {
     for (const auto& rt : richTextDependents_) {
         if (rt.observedDcRef.valid()) {
             if (const auto* heap = domains_.heapForObject(rt.observedDcRef)) {
-                if (heap->dirtyFieldMask(rt.observedDcRef) != 0ULL) {
+                if (heap->peekDirtyMask(rt.observedDcRef) != 0ULL) {
                     return true;
                 }
             }
@@ -1323,7 +1333,8 @@ void DualTrackBindingEngine::ReleaseCollectionObserver(ReactiveBindingInstance& 
     if (binding.syncedCollectionRef.valid()) {
         if (binding.mode != BindingMode::OneTime && binding.syncedCollectionOwnerRef.valid()) {
             if (auto* arrHeap = domains_.heapForObject(binding.syncedCollectionRef)) {
-                arrHeap->removeArrayPropertyObserver(
+                ObservableListHelper::UnbindOwnerProperty(
+                    *arrHeap,
                     binding.syncedCollectionRef,
                     binding.syncedCollectionOwnerRef,
                     binding.syncedCollectionBitIndex);
@@ -1334,7 +1345,7 @@ void DualTrackBindingEngine::ReleaseCollectionObserver(ReactiveBindingInstance& 
     if (binding.syncedCollectionWrapperRef.valid()) {
         if (binding.mode != BindingMode::OneTime) {
             if (auto* wrapHeap = domains_.heapForObject(binding.syncedCollectionWrapperRef)) {
-                wrapHeap->removeUiObserver(binding.syncedCollectionWrapperRef);
+                ObservableListHelper::RemoveUiObserver(*wrapHeap, binding.syncedCollectionWrapperRef);
             }
         }
         binding.syncedCollectionWrapperRef = ObjectRef{};
@@ -1412,7 +1423,7 @@ bool DualTrackBindingEngine::EvaluateAndSyncChain(
             if (oldRef.valid()) {
                 if (binding.mode != BindingMode::OneTime) {
                     if (auto* oldHeap = domains_.heapForObject(oldRef)) {
-                        oldHeap->removeUiObserver(oldRef);
+                        ObservableListHelper::RemoveUiObserver(*oldHeap, oldRef);
                     }
                 }
                 binding.resolvedHopObjects[clearIdx] = ObjectRef{};
@@ -1432,12 +1443,12 @@ bool DualTrackBindingEngine::EvaluateAndSyncChain(
         if (!(binding.resolvedHopObjects[h] == currentObj)) {
             if (binding.resolvedHopObjects[h].valid() && binding.mode != BindingMode::OneTime) {
                 if (auto* oldHeap = domains_.heapForObject(binding.resolvedHopObjects[h])) {
-                    oldHeap->removeUiObserver(binding.resolvedHopObjects[h]);
+                    ObservableListHelper::RemoveUiObserver(*oldHeap, binding.resolvedHopObjects[h]);
                 }
             }
             binding.resolvedHopObjects[h] = currentObj;
             if (binding.mode != BindingMode::OneTime) {
-                heap->addUiObserver(currentObj);
+                ObservableListHelper::AddUiObserver(*heap, currentObj);
             }
         }
 
@@ -1591,7 +1602,8 @@ bool DualTrackBindingEngine::EvaluateAndSyncChain(
 
                                 std::uint64_t latestVer = 0ULL;
                                 bool requiresReset = false;
-                                if (colHeap->readArrayChangesSince(
+                                if (ObservableListHelper::ReadChangesSince(
+                                        *colHeap,
                                         backingArr,
                                         binding.lastSeenMutationVersion,
                                         localDeltas,
@@ -1631,24 +1643,25 @@ bool DualTrackBindingEngine::EvaluateAndSyncChain(
                                 ReleaseCollectionObserver(binding);
                                 if (binding.mode != BindingMode::OneTime) {
                                     if (wrapperRef.valid()) {
-                                        colHeap->addUiObserver(wrapperRef);
+                                        ObservableListHelper::AddUiObserver(*colHeap, wrapperRef);
                                         binding.syncedCollectionWrapperRef = wrapperRef;
                                     }
                                     if (hop.observableBitIndex < 64u &&
                                         currentObj.valid() &&
                                         currentObj.heapId == backingArr.heapId) {
-                                        colHeap->addArrayPropertyObserver(
+                                        ObservableListHelper::BindOwnerProperty(
+                                            *colHeap,
                                             backingArr,
                                             currentObj,
                                             hop.observableBitIndex);
                                         binding.syncedCollectionOwnerRef = currentObj;
                                         binding.syncedCollectionBitIndex = hop.observableBitIndex;
                                     } else {
-                                        colHeap->enableArrayChangeTracking(backingArr);
+                                        ObservableListHelper::EnableTracking(*colHeap, backingArr);
                                     }
                                 }
                                 binding.syncedCollectionRef = backingArr;
-                                binding.lastSeenMutationVersion = colHeap->arrayMutationVersion(backingArr);
+                                binding.lastSeenMutationVersion = ObservableListHelper::MutationVersion(*colHeap, backingArr);
                                 hopVal = UnifiedValue{backingArr};
                             }
                         } else {
@@ -1804,7 +1817,7 @@ bool DualTrackBindingEngine::EvaluateAndSyncElementBinding(ElementPropertyBindin
             if (oldRef.valid()) {
                 if (eb.mode != BindingMode::OneTime) {
                     if (auto* oldHeap = domains_.heapForObject(oldRef)) {
-                        oldHeap->removeUiObserver(oldRef);
+                        ObservableListHelper::RemoveUiObserver(*oldHeap, oldRef);
                     }
                 }
                 eb.resolvedHopObjects[cIdx] = ObjectRef{};
@@ -1926,12 +1939,12 @@ bool DualTrackBindingEngine::EvaluateAndSyncElementBinding(ElementPropertyBindin
                     if (!(eb.resolvedHopObjects[h] == curObj)) {
                         if (eb.resolvedHopObjects[h].valid() && eb.mode != BindingMode::OneTime) {
                             if (auto* oldHeap = domains_.heapForObject(eb.resolvedHopObjects[h])) {
-                                oldHeap->removeUiObserver(eb.resolvedHopObjects[h]);
+                                ObservableListHelper::RemoveUiObserver(*oldHeap, eb.resolvedHopObjects[h]);
                             }
                         }
                         eb.resolvedHopObjects[h] = curObj;
                         if (eb.mode != BindingMode::OneTime) {
-                            heap->addUiObserver(curObj);
+                            ObservableListHelper::AddUiObserver(*heap, curObj);
                         }
                     }
                     auto& hop = eb.subHops[h];
@@ -2333,7 +2346,7 @@ void DualTrackBindingEngine::ReleaseMultiBindingObservers(MultiBindingInstance& 
         for (auto& hopRef : slot.resolvedHopObjects) {
             if (hopRef.valid()) {
                 if (auto* heap = domains_.heapForObject(hopRef)) {
-                    heap->removeUiObserver(hopRef);
+                    ObservableListHelper::RemoveUiObserver(*heap, hopRef);
                 }
                 hopRef = ObjectRef{};
             }
@@ -2392,7 +2405,7 @@ UnifiedValue DualTrackBindingEngine::EvaluateMultiBindingValue(
                 if (oldRef.valid()) {
                     if (mb.mode != BindingMode::OneTime) {
                         if (auto* oldHeap = domains_.heapForObject(oldRef)) {
-                            oldHeap->removeUiObserver(oldRef);
+                            ObservableListHelper::RemoveUiObserver(*oldHeap, oldRef);
                         }
                     }
                     slot.resolvedHopObjects[cIdx] = ObjectRef{};
@@ -2422,12 +2435,12 @@ UnifiedValue DualTrackBindingEngine::EvaluateMultiBindingValue(
                 if (!(slot.resolvedHopObjects[h] == curObj)) {
                     if (slot.resolvedHopObjects[h].valid() && mb.mode != BindingMode::OneTime) {
                         if (auto* oldHeap = domains_.heapForObject(slot.resolvedHopObjects[h])) {
-                            oldHeap->removeUiObserver(slot.resolvedHopObjects[h]);
+                            ObservableListHelper::RemoveUiObserver(*oldHeap, slot.resolvedHopObjects[h]);
                         }
                     }
                     slot.resolvedHopObjects[h] = curObj;
                     if (mb.mode != BindingMode::OneTime) {
-                        heap->addUiObserver(curObj);
+                        ObservableListHelper::AddUiObserver(*heap, curObj);
                     }
                 }
                 auto& hop = slot.hops[h];
@@ -2829,7 +2842,7 @@ std::size_t DualTrackBindingEngine::RebindSubtreeRootObject(
             if (hopRef.valid()) {
                 if (binding.mode != BindingMode::OneTime) {
                     if (auto* oldHeap = domains_.heapForObject(hopRef)) {
-                        oldHeap->removeUiObserver(hopRef);
+                        ObservableListHelper::RemoveUiObserver(*oldHeap, hopRef);
                     }
                 }
                 hopRef = ObjectRef{};
@@ -2900,7 +2913,7 @@ std::size_t DualTrackBindingEngine::UnbindSubtree(const UIElement* subtreeRoot) 
             for (const auto& hopRef : b.resolvedHopObjects) {
                 if (hopRef.valid() && b.mode != BindingMode::OneTime) {
                     if (auto* heap = domains_.heapForObject(hopRef)) {
-                        heap->removeUiObserver(hopRef);
+                        ObservableListHelper::RemoveUiObserver(*heap, hopRef);
                     }
                 }
             }
@@ -2926,7 +2939,7 @@ std::size_t DualTrackBindingEngine::UnbindSubtree(const UIElement* subtreeRoot) 
             for (const auto& hopRef : eb.resolvedHopObjects) {
                 if (hopRef.valid() && eb.mode != BindingMode::OneTime) {
                     if (auto* heap = domains_.heapForObject(hopRef)) {
-                        heap->removeUiObserver(hopRef);
+                        ObservableListHelper::RemoveUiObserver(*heap, hopRef);
                     }
                 }
             }
@@ -2979,7 +2992,7 @@ std::size_t DualTrackBindingEngine::UnbindSubtree(const UIElement* subtreeRoot) 
         if (rt.targetElement && isInSubtree(rt.targetElement.Get())) {
             if (rt.observedDcRef.valid()) {
                 if (auto* heap = domains_.heapForObject(rt.observedDcRef)) {
-                    heap->removeUiObserver(rt.observedDcRef);
+                    ObservableListHelper::RemoveUiObserver(*heap, rt.observedDcRef);
                 }
             }
             ++removedCount;
@@ -3027,7 +3040,7 @@ bool DualTrackBindingEngine::UnbindSlot(std::uint16_t bindingSlotId) noexcept {
             for (const auto& hopRef : it->resolvedHopObjects) {
                 if (hopRef.valid() && it->mode != BindingMode::OneTime) {
                     if (auto* heap = domains_.heapForObject(hopRef)) {
-                        heap->removeUiObserver(hopRef);
+                        ObservableListHelper::RemoveUiObserver(*heap, hopRef);
                     }
                 }
             }
@@ -3047,7 +3060,7 @@ bool DualTrackBindingEngine::UnbindSlot(std::uint16_t bindingSlotId) noexcept {
             for (const auto& hopRef : it->resolvedHopObjects) {
                 if (hopRef.valid() && it->mode != BindingMode::OneTime) {
                     if (auto* heap = domains_.heapForObject(hopRef)) {
-                        heap->removeUiObserver(hopRef);
+                        ObservableListHelper::RemoveUiObserver(*heap, hopRef);
                     }
                 }
             }
@@ -3099,7 +3112,7 @@ void DualTrackBindingEngine::RegisterRichTextDependent(
     }
     if (dcRef.valid()) {
         if (auto* heap = domains_.heapForObject(dcRef)) {
-            heap->addUiObserver(dcRef);
+            ObservableListHelper::AddUiObserver(*heap, dcRef);
         }
     }
     RichTextDependentEntry entry{};
@@ -3230,13 +3243,12 @@ std::size_t DualTrackBindingEngine::FlushTrackA(RuntimeError* error) {
     auto processHeap = [&](ManagedHeap& heap) {
         auto dirtyObjects = heap.consumeDirtyObjects();
         for (const auto& dirtyObj : dirtyObjects) {
-            const std::uint64_t mask = heap.dirtyFieldMask(dirtyObj);
+            // Atomically consume dirty mask BEFORE EvaluateAndSyncChain so any secondary mutations
+            // triggered inside SetValue / OnPropertyChanged are preserved for subsequent flushes!
+            const std::uint64_t mask = heap.consumeDirtyMask(dirtyObj);
             if (mask == 0ULL) {
                 continue;
             }
-            // Clear dirty mask BEFORE EvaluateAndSyncChain so any secondary mutations
-            // triggered inside SetValue / OnPropertyChanged are preserved for subsequent flushes!
-            heap.clearDirtyFieldMask(dirtyObj);
             // Index-based scan so nested BindChain calls during SetValue never invalidate iterators!
             const std::size_t bindingSnapshotCount = trackABindings_.size();
             for (std::size_t bIdx = 0; bIdx < bindingSnapshotCount && bIdx < trackABindings_.size(); ++bIdx) {
@@ -3308,7 +3320,7 @@ std::size_t DualTrackBindingEngine::FlushTrackA(RuntimeError* error) {
         }
         if (const auto* colHeap = domains_.heapForObject(b.syncedCollectionRef);
             colHeap && colHeap->isAlive(b.syncedCollectionRef)) {
-            if (colHeap->arrayMutationVersion(b.syncedCollectionRef) != b.lastSeenMutationVersion) {
+            if (ObservableListHelper::MutationVersion(*colHeap, b.syncedCollectionRef) != b.lastSeenMutationVersion) {
                 if (EvaluateAndSyncChain(trackABindings_[bIdx], b.hops.size() - 1u, error)) {
                     ++updatedCount;
                 }
@@ -3402,7 +3414,7 @@ std::size_t DualTrackBindingEngine::FlushTrackA(RuntimeError* error) {
                         const ObjectRef oldRef = binding.resolvedHopObjects[clearIdx];
                         if (oldRef.valid()) {
                             if (auto* oldHeap = domains_.heapForObject(oldRef)) {
-                                oldHeap->removeUiObserver(oldRef);
+                                ObservableListHelper::RemoveUiObserver(*oldHeap, oldRef);
                             }
                             binding.resolvedHopObjects[clearIdx] = ObjectRef{};
                         }
@@ -3439,7 +3451,7 @@ std::size_t DualTrackBindingEngine::FlushTrackA(RuntimeError* error) {
                             const ObjectRef oldRef = sl.resolvedHopObjects[clearIdx];
                             if (oldRef.valid()) {
                                 if (auto* oldHeap = domains_.heapForObject(oldRef)) {
-                                    oldHeap->removeUiObserver(oldRef);
+                                    ObservableListHelper::RemoveUiObserver(*oldHeap, oldRef);
                                 }
                                 sl.resolvedHopObjects[clearIdx] = ObjectRef{};
                             }
@@ -3485,13 +3497,13 @@ std::size_t DualTrackBindingEngine::FlushTrackA(RuntimeError* error) {
             if (!(curDc == richTextDependents_[rIdx].observedDcRef)) {
                 if (richTextDependents_[rIdx].observedDcRef.valid()) {
                     if (auto* oldHeap = domains_.heapForObject(richTextDependents_[rIdx].observedDcRef)) {
-                        oldHeap->removeUiObserver(richTextDependents_[rIdx].observedDcRef);
+                        ObservableListHelper::RemoveUiObserver(*oldHeap, richTextDependents_[rIdx].observedDcRef);
                     }
                 }
                 richTextDependents_[rIdx].observedDcRef = curDc;
                 if (curDc.valid()) {
                     if (auto* newHeap = domains_.heapForObject(curDc)) {
-                        newHeap->addUiObserver(curDc);
+                        ObservableListHelper::AddUiObserver(*newHeap, curDc);
                     }
                 }
             }
@@ -3651,7 +3663,7 @@ bool DualTrackBindingEngine::PushTwoWayToSource(
                     }
                 }
             }
-            if (ObservableListHelper::Replace(*colHeap, *colObjRef, idx, uiValue, error)) {
+            if (ObservableListHelper::Replace(*colHeap, *colObjRef, idx, uiValue)) {
                 anyPushed = true;
             }
             continue;
@@ -3814,7 +3826,7 @@ std::size_t DualTrackBindingEngine::ApplyHotReloadMigration(
                 }
                 if (binding.mode != BindingMode::OneTime) {
                     if (auto* oldHeap = domains_.heapForObject(hopObj)) {
-                        oldHeap->removeUiObserver(hopObj);
+                        ObservableListHelper::RemoveUiObserver(*oldHeap, hopObj);
                     }
                 }
                 hopObj = ObjectRef{};

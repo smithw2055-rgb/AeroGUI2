@@ -14207,11 +14207,9 @@ bool MountAxbInstructionsInternal(
                         ? evRec->handlerSymbolId
                         : inst.symbolId;
                     bool isSimCommand = ((inst.flags & 0x01u) != 0u);
-                    if (!isSimCommand && methodId != 0 && bindingEngine && bindingEngine->Program()) {
-                        if (const auto* loc = bindingEngine->Program()->resolveFunction(methodId);
-                            loc && loc->function && loc->function->simCommand) {
-                            isSimCommand = true;
-                        }
+                    if (!isSimCommand && methodId != 0 && domains &&
+                        domains->isSimCommandFunction(methodId)) {
+                        isSimCommand = true;
                     }
                     if ((!targetObj.valid() || methodId == 0) &&
                         evRec != nullptr &&
@@ -14286,7 +14284,7 @@ bool MountAxbInstructionsInternal(
                                                 for (const auto& m : ts->methods) {
                                                     if (m.name == cands[ci] && !m.staticMethod && m.id != 0) {
                                                         outSym = m.id;
-                                                        outSim = m.simCommand;
+                                                        outSim = domains->isSimCommandFunction(m.id);
                                                         return true;
                                                     }
                                                 }

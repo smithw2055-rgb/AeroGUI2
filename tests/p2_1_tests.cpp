@@ -662,8 +662,8 @@ public void UpdatePlayerHud(PlayerHudVm vm, float nextShield, string nextRank)
     auto vmRoot = domains.uiHeap().retain(vmRef);
 
     // Clear initial allocation dirty state
-    domains.uiHeap().clearDirtyFieldMask(subRef);
-    domains.uiHeap().clearDirtyFieldMask(vmRef);
+    (void)domains.uiHeap().consumeDirtyMask(subRef);
+    (void)domains.uiHeap().consumeDirtyMask(vmRef);
     (void)domains.uiHeap().consumeDirtyObjects();
 
     const auto shieldSlot = domains.resolvePropertySlot(*program, vmTypeId, "Shield");
@@ -762,7 +762,7 @@ public void UpdatePlayerHud(PlayerHudVm vm, float nextShield, string nextRank)
 
     auto sharedLabel = MakeIntrusive<Border>();
     (void)domains.uiHeap().consumeDirtyObjects();
-    domains.uiHeap().clearDirtyFieldMask(vmRef);
+    (void)domains.uiHeap().consumeDirtyMask(vmRef);
     AERO_CHECK(
         externalFacade.BindObservableProperty(vmRef, *shieldSlot, sharedLabel, PropId_Height, &err),
         "Bound Shield -> Border.Height on shared engine facade");

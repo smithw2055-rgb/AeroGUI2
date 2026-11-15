@@ -186,7 +186,7 @@ public QuestNode CreateQuestNode()
     aero::ExecutionDomainContext domains;
     domains.registerProgramObservableMetadata(*res.programImage);
     aero::Interpreter uiInterp(res.programImage, domains.uiHeapPtr());
-    uiInterp.setExecutionDomainContext(&domains, aero::DomainKind::UiPresentation);
+    domains.attachInterpreter(uiInterp, aero::DomainKind::UiPresentation);
 
     const auto vmExec = uiInterp.invoke("Samples.Phase5D::CreateQuestHudVm");
     const auto questExec = uiInterp.invoke("Samples.Phase5D::CreateQuestNode");
@@ -463,7 +463,7 @@ public SquadRosterView CreateSquadRosterVm()
     aero::ExecutionDomainContext domains;
     domains.registerProgramObservableMetadata(*res.programImage);
     aero::Interpreter uiInterp(res.programImage, domains.uiHeapPtr());
-    uiInterp.setExecutionDomainContext(&domains, aero::DomainKind::UiPresentation);
+    domains.attachInterpreter(uiInterp, aero::DomainKind::UiPresentation);
 
     const auto vmExec = uiInterp.invoke("Samples.Phase5D::CreateSquadRosterVm");
     AERO_CHECK(vmExec.succeeded, "Executed CreateSquadRosterVm in RealScript");
@@ -587,7 +587,7 @@ public LeaderboardEntry CreateLeaderboardEntry()
     aero::ExecutionDomainContext domains;
     domains.registerProgramObservableMetadata(*res.programImage);
     aero::Interpreter uiInterp(res.programImage, domains.uiHeapPtr());
-    uiInterp.setExecutionDomainContext(&domains, aero::DomainKind::UiPresentation);
+    domains.attachInterpreter(uiInterp, aero::DomainKind::UiPresentation);
 
     const auto vmExec = uiInterp.invoke("Samples.Phase5D::CreateLeaderboardVm");
     AERO_CHECK(vmExec.succeeded, "Created LeaderboardView with 1,000-slot array");
@@ -941,7 +941,7 @@ public RowItem CreateRowItem()
     aero::ExecutionDomainContext domains;
     domains.registerProgramObservableMetadata(*res.programImage);
     aero::Interpreter uiInterp(res.programImage, domains.uiHeapPtr());
-    uiInterp.setExecutionDomainContext(&domains, aero::DomainKind::UiPresentation);
+    domains.attachInterpreter(uiInterp, aero::DomainKind::UiPresentation);
 
     const auto vmExec = uiInterp.invoke("Samples.Phase5DReview::CreateReviewHostVm");
     AERO_CHECK(vmExec.succeeded, "Created ReviewHostVm with 20-slot array");

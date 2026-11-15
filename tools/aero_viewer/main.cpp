@@ -583,7 +583,7 @@ int MountAndRunSingleTarget(
             scriptBridge->RegisterCoreUiBindings(*nativeBindings);
 
             uiInterpreter = std::make_unique<aero::Interpreter>(mainRes.programImage, domains.uiHeapPtr());
-            uiInterpreter->setExecutionDomainContext(&domains, aero::DomainKind::UiPresentation);
+            domains.attachInterpreter(*uiInterpreter, aero::DomainKind::UiPresentation);
             uiInterpreter->setBindingRegistry(nativeBindings);
 
             const std::string sampleFolder = projDataDir.parent_path().filename().string();
@@ -621,7 +621,7 @@ int MountAndRunSingleTarget(
                             mainWinRef = *oref;
                             mainWinPin = domains.uiHeap().retain(mainWinRef);
                             (void)domains.uiHeap().consumeDirtyObjects();
-                            domains.uiHeap().clearDirtyFieldMask(mainWinRef);
+                            (void)domains.uiHeap().consumeDirtyMask(mainWinRef);
                             break;
                         }
                     }

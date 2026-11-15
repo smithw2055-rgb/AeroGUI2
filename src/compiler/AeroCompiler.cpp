@@ -1,5 +1,6 @@
 #include <thread>
 #include "aero/compiler/AeroCompiler.hpp"
+#include "aero/compiler/CSharpCompatLowerer.hpp"
 
 #include <algorithm>
 #include <cctype>
@@ -1278,7 +1279,7 @@ struct ActiveGradientBrushScope {
 Point ParseXamlPoint2D(std::string_view raw, Point fallback) noexcept {
     const UnifiedValue pv = ParseBuiltinLiteralPropertyValue(PropId_RenderTransformOrigin, raw);
     Float4Value f4{};
-    if (pv.tryGetFloat4(f4)) {
+    if (pv.tryGetQuatf(f4)) {
         return Point{f4.x, f4.y};
     }
     return fallback;
@@ -2292,7 +2293,7 @@ bool RiveFrontendImporter::ImportToSceneIR(
                 kf.timeSec = ParseFloat32(FindJsonFieldValue(kfObj, "t"), 0.0f);
                 const std::string_view vRaw = FindJsonFieldValue(kfObj, "v");
                 const UnifiedValue parsedV = ParseBuiltinLiteralPropertyValue(propId, vRaw);
-                if (! parsedV.tryGetFloat4(kf.value)) {
+                if (! parsedV.tryGetQuatf(kf.value)) {
                     float sf = 0.0f;
                     (void)TryGetFloat(parsedV, sf);
                     kf.value = Float4Value{sf, 0.0f, 0.0f, 0.0f};
@@ -8508,6 +8509,55 @@ AeroCompileResult AeroCompiler::CompileInternal(
                 content.find("Animatable") != std::string_view::npos);
     };
 
+    auto hasWholeWord = [](std::string_view text, std::string_view word) noexcept -> bool {
+        if (word.empty()) return false;
+        std::size_t pos = 0;
+        while ((pos = text.find(word, pos)) != std::string_view::npos) {
+            const bool leftOk =
+                (pos == 0) ||
+                (!std::isalnum(static_cast<unsigned char>(text[pos - 1])) &&
+                 text[pos - 1] != '_');
+            const std::size_t endPos = pos + word.size();
+            const bool rightOk =
+                (endPos == text.size()) ||
+                (!std::isalnum(static_cast<unsigned char>(text[endPos])) &&
+                 text[endPos] != '_');
+            if (leftOk && rightOk) {
+                return true;
+            }
+            pos = endPos;
+        }
+        return false;
+    };
+
+    bool preLoweredImportsAeroUi = false;
+    bool preLoweredDefinesAeroUi = false;
+    auto checkAeroUiMarkers = [&](std::string_view text) {
+        if (text.find("module Aero.UI;") != std::string_view::npos ||
+            text.find("namespace Aero.UI") != std::string_view::npos) {
+            preLoweredDefinesAeroUi = true;
+        }
+        if (text.find("import Aero.UI;") != std::string_view::npos ||
+            text.find("using Aero.UI;") != std::string_view::npos ||
+            text.find("using System.ComponentModel;") != std::string_view::npos ||
+            text.find("using System.Collections.ObjectModel") != std::string_view::npos ||
+            text.find("using System.Globalization;") != std::string_view::npos ||
+            text.find("using System.Windows") != std::string_view::npos ||
+            hasWholeWord(text, "ObservableObject") ||
+            hasWholeWord(text, "ViewModelBase") ||
+            hasWholeWord(text, "BindableBase") ||
+            hasWholeWord(text, "INotifyPropertyChanged") ||
+            hasWholeWord(text, "RelayCommand") ||
+            hasWholeWord(text, "DelegateCommand") ||
+            text.find("ObservableList<") != std::string_view::npos ||
+            text.find("ObservableCollection<") != std::string_view::npos ||
+            hasWholeWord(text, "Action") ||
+            hasWholeWord(text, "Func") ||
+            hasWholeWord(text, "ICommand")) {
+            preLoweredImportsAeroUi = true;
+        }
+    };
+
     // Generate *.g.rs partial class stub when x:Class is specified
     std::vector<SourceFile> allSources;
     allSources.reserve(input.scriptSources.size() + 2u);
@@ -8516,6 +8566,8 @@ AeroCompileResult AeroCompiler::CompileInternal(
         if (isPureNativeExtensionMetadataFile(cleaned)) {
             continue;
         }
+        checkAeroUiMarkers(rawSf.content);
+        checkAeroUiMarkers(cleaned);
         if (cleaned.find("RelayCommand") != std::string::npos ||
             cleaned.find("DelegateCommand") != std::string::npos) {
             cleaned = rewriteGenericCommandNames(cleaned);
@@ -8929,37 +8981,302 @@ AeroCompileResult AeroCompiler::CompileInternal(
         }
     }
 
-    // Auto-provide built-in Aero.UI native SDK declarations when imported by user scripts
+    // Auto-provide built-in Aero.UI native SDK declarations when imported by user scripts,
+    // and run L2 C# compatibility syntax lowering across all script units.
     if (!allSources.empty()) {
-        bool importsAeroUi = false;
-        bool definesAeroUi = false;
+        bool importsAeroUi = preLoweredImportsAeroUi;
+        bool definesAeroUi = preLoweredDefinesAeroUi;
         for (const auto& sf : allSources) {
-            if (sf.content.find("module Aero.UI;") != std::string::npos ||
-                sf.content.find("namespace Aero.UI") != std::string::npos) {
-                definesAeroUi = true;
+            checkAeroUiMarkers(sf.content);
+            importsAeroUi = importsAeroUi || preLoweredImportsAeroUi;
+            definesAeroUi = definesAeroUi || preLoweredDefinesAeroUi;
+        }
+        const bool injectSdk = (importsAeroUi || !pkg.className.empty()) && !definesAeroUi;
+
+        auto extractDeclaredModule = [](std::string_view src) -> std::string {
+            auto skipWsAndComments = [&](std::size_t p) -> std::size_t {
+                while (p < src.size()) {
+                    const char ch = src[p];
+                    if (ch == ' ' || ch == '\t' || ch == '\r' || ch == '\n') {
+                        ++p;
+                        continue;
+                    }
+                    if (ch == '/' && p + 1 < src.size() && src[p + 1] == '/') {
+                        p += 2;
+                        while (p < src.size() && src[p] != '\n') ++p;
+                        continue;
+                    }
+                    if (ch == '/' && p + 1 < src.size() && src[p + 1] == '*') {
+                        p += 2;
+                        while (p + 1 < src.size() && !(src[p] == '*' && src[p + 1] == '/')) ++p;
+                        p = (p + 1 < src.size()) ? (p + 2) : src.size();
+                        continue;
+                    }
+                    break;
+                }
+                return p;
+            };
+            int depth = 0;
+            std::size_t i = 0;
+            while (i < src.size()) {
+                i = skipWsAndComments(i);
+                if (i >= src.size()) break;
+                const char c = src[i];
+                if (c == '"') {
+                    ++i;
+                    while (i < src.size()) {
+                        if (src[i] == '\\' && i + 1 < src.size()) {
+                            i += 2;
+                            continue;
+                        }
+                        if (src[i++] == '"') break;
+                    }
+                    continue;
+                }
+                if (c == '{') { ++depth; ++i; continue; }
+                if (c == '}') { if (depth > 0) --depth; ++i; continue; }
+                if (depth == 0 && (std::isalpha(static_cast<unsigned char>(c)) || c == '_')) {
+                    const std::size_t start = i;
+                    while (i < src.size() && (std::isalnum(static_cast<unsigned char>(src[i])) || src[i] == '_')) ++i;
+                    const std::string_view kw = src.substr(start, i - start);
+                    if (kw == "module" || kw == "namespace") {
+                        std::size_t p = skipWsAndComments(i);
+                        std::string mod;
+                        while (p < src.size()) {
+                            if (std::isalpha(static_cast<unsigned char>(src[p])) || src[p] == '_') {
+                                const std::size_t segStart = p;
+                                while (p < src.size() && (std::isalnum(static_cast<unsigned char>(src[p])) || src[p] == '_')) ++p;
+                                mod.append(src.substr(segStart, p - segStart));
+                                p = skipWsAndComments(p);
+                                if (p < src.size() && src[p] == '.') {
+                                    mod.push_back('.');
+                                    p = skipWsAndComments(p + 1);
+                                    continue;
+                                }
+                                if (p < src.size() && ((kw == "module" && src[p] == ';') ||
+                                                       (kw == "namespace" && (src[p] == ';' || src[p] == '{')))) {
+                                    return mod;
+                                }
+                                break;
+                            }
+                            break;
+                        }
+                    }
+                    continue;
+                }
+                ++i;
             }
-            if (sf.content.find("import Aero.UI;") != std::string::npos ||
-                sf.content.find("using Aero.UI;") != std::string::npos ||
-                sf.content.find("using System.ComponentModel;") != std::string::npos ||
-                sf.content.find("using System.Collections.ObjectModel") != std::string::npos ||
-                sf.content.find("using System.Globalization;") != std::string::npos ||
-                sf.content.find("using System.Windows") != std::string::npos ||
-                sf.content.find("ObservableObject") != std::string::npos ||
-                sf.content.find("ViewModelBase") != std::string::npos ||
-                sf.content.find("BindableBase") != std::string::npos ||
-                sf.content.find("INotifyPropertyChanged") != std::string::npos ||
-                sf.content.find("RelayCommand") != std::string::npos ||
-                sf.content.find("DelegateCommand") != std::string::npos) {
-                importsAeroUi = true;
+            return {};
+        };
+
+        std::unordered_set<std::string> availableModules;
+        if (injectSdk) {
+            availableModules.insert("Aero.UI");
+        }
+        for (const auto& sf : allSources) {
+            const std::string mod = extractDeclaredModule(sf.content);
+            if (!mod.empty()) {
+                availableModules.insert(mod);
             }
         }
-        if ((importsAeroUi || !pkg.className.empty()) && !definesAeroUi) {
+
+        auto ensureImportsAeroUiAfterModule = [](std::string& content) {
+            auto skipWsAndComments = [&](std::size_t p) -> std::size_t {
+                while (p < content.size()) {
+                    const char ch = content[p];
+                    if (ch == ' ' || ch == '\t' || ch == '\r' || ch == '\n') {
+                        ++p;
+                        continue;
+                    }
+                    if (ch == '/' && p + 1 < content.size() && content[p + 1] == '/') {
+                        p += 2;
+                        while (p < content.size() && content[p] != '\n') ++p;
+                        continue;
+                    }
+                    if (ch == '/' && p + 1 < content.size() && content[p + 1] == '*') {
+                        p += 2;
+                        while (p + 1 < content.size() && !(content[p] == '*' && content[p + 1] == '/')) ++p;
+                        p = (p + 1 < content.size()) ? (p + 2) : content.size();
+                        continue;
+                    }
+                    break;
+                }
+                return p;
+            };
+            bool hasImportAeroUi = false;
+            std::size_t moduleSemiAfter = std::string::npos;
+            std::string moduleName;
+            int depth = 0;
+            std::size_t i = 0;
+            while (i < content.size()) {
+                i = skipWsAndComments(i);
+                if (i >= content.size()) break;
+                const char c = content[i];
+                if (c == '"') {
+                    ++i;
+                    while (i < content.size()) {
+                        if (content[i] == '\\' && i + 1 < content.size()) {
+                            i += 2;
+                            continue;
+                        }
+                        if (content[i++] == '"') break;
+                    }
+                    continue;
+                }
+                if (c == '{') { ++depth; ++i; continue; }
+                if (c == '}') { if (depth > 0) --depth; ++i; continue; }
+                if (depth == 0 && (std::isalpha(static_cast<unsigned char>(c)) || c == '_')) {
+                    const std::size_t start = i;
+                    while (i < content.size() && (std::isalnum(static_cast<unsigned char>(content[i])) || content[i] == '_')) ++i;
+                    const std::string_view kw = std::string_view(content).substr(start, i - start);
+                    if (kw == "module" || kw == "import") {
+                        std::size_t p = skipWsAndComments(i);
+                        std::string qname;
+                        while (p < content.size() && (std::isalpha(static_cast<unsigned char>(content[p])) || content[p] == '_')) {
+                            const std::size_t s0 = p;
+                            while (p < content.size() && (std::isalnum(static_cast<unsigned char>(content[p])) || content[p] == '_')) ++p;
+                            qname.append(std::string_view(content).substr(s0, p - s0));
+                            p = skipWsAndComments(p);
+                            if (p < content.size() && content[p] == '.') {
+                                qname.push_back('.');
+                                p = skipWsAndComments(p + 1);
+                                continue;
+                            }
+                            if (p < content.size() && content[p] == ';') {
+                                if (kw == "module" && moduleSemiAfter == std::string::npos) {
+                                    moduleSemiAfter = p + 1;
+                                    moduleName = qname;
+                                } else if (kw == "import" && qname == "Aero.UI") {
+                                    hasImportAeroUi = true;
+                                }
+                            }
+                            break;
+                        }
+                    }
+                    continue;
+                }
+                ++i;
+            }
+            if (hasImportAeroUi) {
+                return;
+            }
+            if (moduleSemiAfter != std::string::npos) {
+                if (moduleName != "Aero.UI") {
+                    content.insert(moduleSemiAfter, " import Aero.UI;");
+                }
+            } else {
+                content.insert(0, "import Aero.UI; ");
+            }
+        };
+
+        for (auto& sf : allSources) {
+            sf.content = LowerCSharpCompatSyntax(sf.content, &availableModules);
+            if (injectSdk) {
+                ensureImportsAeroUiAfterModule(sf.content);
+            }
+        }
+
+        if (injectSdk) {
             std::string sdkCode =
                 "module Aero.UI;\n"
                 "public delegate void Action();\n"
                 "public delegate void Action<T>(T arg);\n"
+                "public delegate void Action<T1, T2>(T1 arg1, T2 arg2);\n"
+                "public delegate void Action<T1, T2, T3>(T1 arg1, T2 arg2, T3 arg3);\n"
                 "public delegate TResult Func<TResult>();\n"
                 "public delegate TResult Func<T, TResult>(T arg);\n"
+                "public delegate TResult Func<T1, T2, TResult>(T1 arg1, T2 arg2);\n"
+                "public delegate TResult Func<T1, T2, T3, TResult>(T1 arg1, T2 arg2, T3 arg3);\n"
+                "public class ObservableListEnumerator<T>\n"
+                "{\n"
+                "    public T[] _items;\n"
+                "    public int _index;\n"
+                "    public ObservableListEnumerator(T[] items) { _items = items; _index = -1; }\n"
+                "    public bool MoveNext() { _index = _index + 1; return _index < _items.length; }\n"
+                "    public T Current() { return _items[_index]; }\n"
+                "}\n"
+                "public class ObservableList<T>\n"
+                "{\n"
+                "    public T[] items;\n"
+                "    public ObservableList() { items = new T[0]; }\n"
+                "    public ObservableList(int capacity) { items = new T[0]; items.reserve(capacity); }\n"
+                "    public int Count() { return items.length; }\n"
+                "    public int Length() { return items.length; }\n"
+                "    public bool IsEmpty() { return items.length == 0; }\n"
+                "    public T Get(int index) { return items[index]; }\n"
+                "    public void Set(int index, T value) { items[index] = value; }\n"
+                "    public T First() { return items[0]; }\n"
+                "    public T Last() { return items[items.length - 1]; }\n"
+                "    public void Reserve(int capacity) { items.reserve(capacity); }\n"
+                "    public void reserve(int capacity) { items.reserve(capacity); }\n"
+                "    public void Add(T value) { items.push(value); }\n"
+                "    public void add(T value) { items.push(value); }\n"
+                "    public void Push(T value) { items.push(value); }\n"
+                "    public void push(T value) { items.push(value); }\n"
+                "    public void Insert(int index, T value) { items.insert(index, value); }\n"
+                "    public void insert(int index, T value) { items.insert(index, value); }\n"
+                "    public void RemoveAt(int index) { items.removeAt(index); }\n"
+                "    public void removeAt(int index) { items.removeAt(index); }\n"
+                "    public bool Remove(T value) { int idx = items.IndexOf(value); if (idx < 0) { return false; } items.removeAt(idx); return true; }\n"
+                "    public bool remove(T value) { return Remove(value); }\n"
+                "    public void Move(int oldIndex, int newIndex) { if (oldIndex == newIndex || oldIndex < 0 || oldIndex >= items.length || newIndex < 0 || newIndex >= items.length) { return; } T val = items[oldIndex]; items.removeAt(oldIndex); items.insert(newIndex, val); }\n"
+                "    public int IndexOf(T value) { return items.IndexOf(value); }\n"
+                "    public int indexOf(T value) { return items.IndexOf(value); }\n"
+                "    public int LastIndexOf(T value) { return items.LastIndexOf(value); }\n"
+                "    public int lastIndexOf(T value) { return items.LastIndexOf(value); }\n"
+                "    public bool Contains(T value) { return items.Contains(value); }\n"
+                "    public bool contains(T value) { return items.Contains(value); }\n"
+                "    public void Reverse() { items.Reverse(); }\n"
+                "    public void reverse() { items.Reverse(); }\n"
+                "    public void Sort() { items.Sort(); }\n"
+                "    public void sort() { items.Sort(); }\n"
+                "    public T[] AsArray() { return items; }\n"
+                "    public T[] ToArray() { T[] copy = new T[items.length]; int i = 0; while (i < items.length) { copy[i] = items[i]; i = i + 1; } return copy; }\n"
+                "    public void Clear() { items.clear(); }\n"
+                "    public void clear() { items.clear(); }\n"
+                "    public ObservableListEnumerator<T> GetEnumerator() { return new ObservableListEnumerator<T>(items); }\n"
+                "}\n"
+                "public class ObservableCollection<T>\n"
+                "{\n"
+                "    public T[] items;\n"
+                "    public ObservableCollection() { items = new T[0]; }\n"
+                "    public ObservableCollection(int capacity) { items = new T[0]; items.reserve(capacity); }\n"
+                "    public int Count() { return items.length; }\n"
+                "    public int Length() { return items.length; }\n"
+                "    public bool IsEmpty() { return items.length == 0; }\n"
+                "    public T Get(int index) { return items[index]; }\n"
+                "    public void Set(int index, T value) { items[index] = value; }\n"
+                "    public T First() { return items[0]; }\n"
+                "    public T Last() { return items[items.length - 1]; }\n"
+                "    public void Reserve(int capacity) { items.reserve(capacity); }\n"
+                "    public void reserve(int capacity) { items.reserve(capacity); }\n"
+                "    public void Add(T value) { items.push(value); }\n"
+                "    public void add(T value) { items.push(value); }\n"
+                "    public void Push(T value) { items.push(value); }\n"
+                "    public void push(T value) { items.push(value); }\n"
+                "    public void Insert(int index, T value) { items.insert(index, value); }\n"
+                "    public void insert(int index, T value) { items.insert(index, value); }\n"
+                "    public void RemoveAt(int index) { items.removeAt(index); }\n"
+                "    public void removeAt(int index) { items.removeAt(index); }\n"
+                "    public bool Remove(T value) { int idx = items.IndexOf(value); if (idx < 0) { return false; } items.removeAt(idx); return true; }\n"
+                "    public bool remove(T value) { return Remove(value); }\n"
+                "    public void Move(int oldIndex, int newIndex) { if (oldIndex == newIndex || oldIndex < 0 || oldIndex >= items.length || newIndex < 0 || newIndex >= items.length) { return; } T val = items[oldIndex]; items.removeAt(oldIndex); items.insert(newIndex, val); }\n"
+                "    public int IndexOf(T value) { return items.IndexOf(value); }\n"
+                "    public int indexOf(T value) { return items.IndexOf(value); }\n"
+                "    public int LastIndexOf(T value) { return items.LastIndexOf(value); }\n"
+                "    public int lastIndexOf(T value) { return items.LastIndexOf(value); }\n"
+                "    public bool Contains(T value) { return items.Contains(value); }\n"
+                "    public bool contains(T value) { return items.Contains(value); }\n"
+                "    public void Reverse() { items.Reverse(); }\n"
+                "    public void reverse() { items.Reverse(); }\n"
+                "    public void Sort() { items.Sort(); }\n"
+                "    public void sort() { items.Sort(); }\n"
+                "    public T[] AsArray() { return items; }\n"
+                "    public T[] ToArray() { T[] copy = new T[items.length]; int i = 0; while (i < items.length) { copy[i] = items[i]; i = i + 1; } return copy; }\n"
+                "    public void Clear() { items.clear(); }\n"
+                "    public void clear() { items.clear(); }\n"
+                "    public ObservableListEnumerator<T> GetEnumerator() { return new ObservableListEnumerator<T>(items); }\n"
+                "}\n"
                 "public class Type { }\n"
                 "public class CultureInfo { }\n"
                 "public interface IValueConverter { }\n"
@@ -9484,9 +9801,36 @@ AeroCompileResult AeroCompiler::CompileInternal(
                         bc.functions.begin(),
                         bc.functions.end(),
                         [](const auto& fn) {
-                            return fn.name.find("__Aero_SetDataContext") != std::string::npos || fn.name.find("Aero_SetDataContext__") != std::string::npos || fn.name.find("Aero_LoadComponent__") != std::string::npos || fn.name.find("Aero_LoadResources__") != std::string::npos;
+                            return fn.name.find("__Aero_SetDataContext") != std::string::npos ||
+                                   fn.name.find("Aero_SetDataContext__") != std::string::npos ||
+                                   fn.name.find("GUI_SetDataContext__") != std::string::npos ||
+                                   fn.name.find("Aero_LoadComponent__") != std::string::npos ||
+                                   fn.name.find("GUI_LoadComponent__") != std::string::npos ||
+                                   fn.name.find("Aero_LoadResources__") != std::string::npos;
                         }),
                     bc.functions.end());
+            }
+            for (auto& fref : bc.functionReferences) {
+                const auto sep = fref.name.find("::");
+                const std::string_view local = (sep != std::string::npos)
+                    ? std::string_view(fref.name).substr(sep + 2u)
+                    : std::string_view(fref.name);
+                if (local == "Aero_LoadComponent" ||
+                    local.rfind("Aero_LoadComponent__", 0) == 0 ||
+                    local.rfind("GUI_LoadComponent__", 0) == 0) {
+                    fref.name = "Aero.UI::GUI_LoadComponent";
+                } else if (
+                    local == "Aero_SetDataContext" ||
+                    local == "__Aero_SetDataContext" ||
+                    local.rfind("Aero_SetDataContext__", 0) == 0 ||
+                    local.rfind("__Aero_SetDataContext__", 0) == 0 ||
+                    local.rfind("GUI_SetDataContext__", 0) == 0) {
+                    fref.name = "Aero.UI::GUI_SetDataContext";
+                } else if (
+                    local == "Aero_LoadResources" ||
+                    local.rfind("Aero_LoadResources__", 0) == 0) {
+                    fref.name = "Aero.UI::Application_LoadResources";
+                }
             }
             result.bytecodeModules.push_back(bc);
         }
@@ -9542,7 +9886,12 @@ AeroCompileResult AeroCompiler::CompileInternal(
                             m.functions.begin(),
                             m.functions.end(),
                             [](const auto& fn) {
-                                return fn.name.find("__Aero_SetDataContext") != std::string::npos || fn.name.find("Aero_SetDataContext__") != std::string::npos || fn.name.find("Aero_LoadComponent__") != std::string::npos || fn.name.find("Aero_LoadResources__") != std::string::npos;
+                                return fn.name.find("__Aero_SetDataContext") != std::string::npos ||
+                                       fn.name.find("Aero_SetDataContext__") != std::string::npos ||
+                                       fn.name.find("GUI_SetDataContext__") != std::string::npos ||
+                                       fn.name.find("Aero_LoadComponent__") != std::string::npos ||
+                                       fn.name.find("GUI_LoadComponent__") != std::string::npos ||
+                                       fn.name.find("Aero_LoadResources__") != std::string::npos;
                             }),
                         m.functions.end());
                 }
@@ -9659,7 +10008,7 @@ std::string EmitUnifiedValueLiteralCpp(const UnifiedValue& val) {
         return "aero::MakeFloat(" + FormatFloatLiteral(f->value) + ")";
     }
     Float4Value f4{};
-    if (val.tryGetFloat4(f4)) {
+    if (val.tryGetQuatf(f4)) {
         return "aero::MakeFloat4InlineFast(" +
                FormatFloatLiteral(f4.x) + ", " +
                FormatFloatLiteral(f4.y) + ", " +

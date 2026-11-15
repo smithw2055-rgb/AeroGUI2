@@ -187,10 +187,10 @@ public void TriggerCommandFromUi(CommanderUnit unit, int cost, float boost)
     domains.registerProgramObservableMetadata(*program);
 
     Interpreter simInterpreter(program, domains.simHeapPtr());
-    simInterpreter.setExecutionDomainContext(&domains, DomainKind::SimDeterministic);
+    domains.attachInterpreter(simInterpreter, DomainKind::SimDeterministic);
 
     Interpreter uiInterpreter(program, domains.uiHeapPtr());
-    uiInterpreter.setExecutionDomainContext(&domains, DomainKind::UiPresentation);
+    domains.attachInterpreter(uiInterpreter, DomainKind::UiPresentation);
 
     auto spawnRes = simInterpreter.invoke("Game.Sim::SpawnCommander");
     AERO_CHECK(spawnRes.succeeded, "Spawned CommanderUnit on SimHeap");
@@ -199,7 +199,7 @@ public void TriggerCommandFromUi(CommanderUnit unit, int cost, float boost)
 
     const SymbolId unitTypeId = rs_sem::stableTypeId("Game.Sim::CommanderUnit");
     const auto* unitTypeSym = program->resolveType(unitTypeId);
-    AERO_CHECK(unitTypeSym != nullptr && unitTypeSym->simState, "CommanderUnit recognized as [SimState]");
+    AERO_CHECK(unitTypeSym != nullptr && domains.isTypeSimState(unitTypeId), "CommanderUnit recognized as [SimState]");
 
     const auto staminaSlotOpt = domains.resolvePropertySlot(*program, unitTypeId, "Stamina");
     AERO_CHECK(
@@ -306,7 +306,7 @@ public CardAnimator CreateAnimator()
 
     ExecutionDomainContext domains;
     Interpreter uiInterpreter(program, domains.uiHeapPtr());
-    uiInterpreter.setExecutionDomainContext(&domains, DomainKind::UiPresentation);
+    domains.attachInterpreter(uiInterpreter, DomainKind::UiPresentation);
 
     auto createRes = uiInterpreter.invoke("Game.UI::CreateAnimator");
     AERO_CHECK(createRes.succeeded, "Created CardAnimator on UiHeap");
@@ -576,7 +576,7 @@ public TacticalHud CreateTacticalHud()
     ExecutionDomainContext domains;
     domains.registerProgramObservableMetadata(*compiled.programImage);
     Interpreter uiInterpreter(compiled.programImage, domains.uiHeapPtr());
-    uiInterpreter.setExecutionDomainContext(&domains, DomainKind::UiPresentation);
+    domains.attachInterpreter(uiInterpreter, DomainKind::UiPresentation);
 
     auto createHudRes = uiInterpreter.invoke("Game.UI::CreateTacticalHud");
     AERO_CHECK(createHudRes.succeeded, "Created TacticalHud script instance on UiHeap");
@@ -620,7 +620,7 @@ public TacticalHud CreateTacticalHud()
     }
 
     // Clear initial construction dirty state, then click StrikeButton!
-    domains.uiHeap().clearDirtyFieldMask(hudObj);
+    (void)domains.uiHeap().consumeDirtyMask(hudObj);
     (void)domains.uiHeap().consumeDirtyObjects();
 
     RuntimeError clickErr{};
@@ -731,7 +731,7 @@ public void UpdateQuestTitle(QuestItem q, string newTitle)
     ExecutionDomainContext domains;
     domains.registerProgramObservableMetadata(*program);
     Interpreter uiInterpreter(program, domains.uiHeapPtr());
-    uiInterpreter.setExecutionDomainContext(&domains, DomainKind::UiPresentation);
+    domains.attachInterpreter(uiInterpreter, DomainKind::UiPresentation);
 
     auto q1Res = uiInterpreter.invoke(
         "Game.UI::MakeQuest",
@@ -750,9 +750,9 @@ public void UpdateQuestTitle(QuestItem q, string newTitle)
     const ObjectRef playerVm = std::get<ObjectRef>(vmRes.value);
     auto vmRoot = domains.uiHeap().retain(playerVm);
 
-    domains.uiHeap().clearDirtyFieldMask(quest1);
-    domains.uiHeap().clearDirtyFieldMask(quest2);
-    domains.uiHeap().clearDirtyFieldMask(playerVm);
+    (void)domains.uiHeap().consumeDirtyMask(quest1);
+    (void)domains.uiHeap().consumeDirtyMask(quest2);
+    (void)domains.uiHeap().consumeDirtyMask(playerVm);
     (void)domains.uiHeap().consumeDirtyObjects();
 
     DualTrackBindingEngine engine(domains, program.get(), &uiInterpreter);
@@ -1091,13 +1091,13 @@ public void SetLocale(LocalizationView view, string code)
     ExecutionDomainContext domains;
     domains.registerProgramObservableMetadata(*locCompiled.programImage);
     Interpreter uiInterpreter(locCompiled.programImage, domains.uiHeapPtr());
-    uiInterpreter.setExecutionDomainContext(&domains, DomainKind::UiPresentation);
+    domains.attachInterpreter(uiInterpreter, DomainKind::UiPresentation);
 
     auto locObjRes = uiInterpreter.invoke("Game.UI::CreateLocalizationView");
     AERO_CHECK(locObjRes.succeeded, "Created LocalizationView instance");
     const ObjectRef locObj = std::get<ObjectRef>(locObjRes.value);
     auto locRoot = domains.uiHeap().retain(locObj);
-    domains.uiHeap().clearDirtyFieldMask(locObj);
+    (void)domains.uiHeap().consumeDirtyMask(locObj);
     (void)domains.uiHeap().consumeDirtyObjects();
 
     DualTrackBindingEngine bindingEngine(domains, locCompiled.programImage.get(), &uiInterpreter);
@@ -1187,13 +1187,13 @@ public Menu3DView CreateMenu3DView()
     ExecutionDomainContext menu3dDomains;
     menu3dDomains.registerProgramObservableMetadata(*menu3dCompiled.programImage);
     Interpreter menu3dInterp(menu3dCompiled.programImage, menu3dDomains.uiHeapPtr());
-    menu3dInterp.setExecutionDomainContext(&menu3dDomains, DomainKind::UiPresentation);
+    menu3dDomains.attachInterpreter(menu3dInterp, DomainKind::UiPresentation);
 
     auto menu3dObjRes = menu3dInterp.invoke("Game.UI::CreateMenu3DView");
     AERO_CHECK(menu3dObjRes.succeeded, "Created Menu3DView instance on UiHeap");
     const ObjectRef menu3dObj = std::get<ObjectRef>(menu3dObjRes.value);
     auto menu3dRoot = menu3dDomains.uiHeap().retain(menu3dObj);
-    menu3dDomains.uiHeap().clearDirtyFieldMask(menu3dObj);
+    (void)menu3dDomains.uiHeap().consumeDirtyMask(menu3dObj);
     (void)menu3dDomains.uiHeap().consumeDirtyObjects();
 
     DualTrackBindingEngine menu3dBindings(menu3dDomains, menu3dCompiled.programImage.get(), &menu3dInterp);
@@ -1307,9 +1307,9 @@ public InventoryView CreateInventoryView(SimInventoryBag bag)
     ExecutionDomainContext invDomains;
     invDomains.registerProgramObservableMetadata(*invCompiled.programImage);
     Interpreter invSimInterp(invCompiled.programImage, invDomains.simHeapPtr());
-    invSimInterp.setExecutionDomainContext(&invDomains, DomainKind::SimDeterministic);
+    invDomains.attachInterpreter(invSimInterp, DomainKind::SimDeterministic);
     Interpreter invUiInterp(invCompiled.programImage, invDomains.uiHeapPtr());
-    invUiInterp.setExecutionDomainContext(&invDomains, DomainKind::UiPresentation);
+    invDomains.attachInterpreter(invUiInterp, DomainKind::UiPresentation);
 
     auto bagRes = invSimInterp.invoke("Game.UI::CreateSimInventoryBag");
     AERO_CHECK(bagRes.succeeded, "Created [SimState] SimInventoryBag on SimHeap");
@@ -1321,9 +1321,9 @@ public InventoryView CreateInventoryView(SimInventoryBag bag)
     const ObjectRef invViewObj = std::get<ObjectRef>(invViewRes.value);
     auto invViewRoot = invDomains.uiHeap().retain(invViewObj);
 
-    invDomains.simHeap().clearDirtyFieldMask(simBagObj);
+    (void)invDomains.simHeap().consumeDirtyMask(simBagObj);
     (void)invDomains.simHeap().consumeDirtyObjects();
-    invDomains.uiHeap().clearDirtyFieldMask(invViewObj);
+    (void)invDomains.uiHeap().consumeDirtyMask(invViewObj);
     (void)invDomains.uiHeap().consumeDirtyObjects();
 
     DualTrackBindingEngine invBindings(invDomains, invCompiled.programImage.get(), &invUiInterp);
@@ -1381,7 +1381,7 @@ public LocalizationView CreateLocalizationViewV2()
 
     domains.registerProgramObservableMetadata(*v2Program);
     Interpreter v2Interpreter(v2Program, domains.uiHeapPtr());
-    v2Interpreter.setExecutionDomainContext(&domains, DomainKind::UiPresentation);
+    domains.attachInterpreter(v2Interpreter, DomainKind::UiPresentation);
 
     auto v2ObjRes = v2Interpreter.invoke("Game.UI::CreateLocalizationViewV2");
     AERO_CHECK(v2ObjRes.succeeded, "Allocated V2 LocalizationView instance");
@@ -1544,7 +1544,7 @@ public MigratedSamplePage CreateMigratedSamplePage()
     ExecutionDomainContext domains;
     domains.registerProgramObservableMetadata(*res.programImage);
     Interpreter uiInterp(res.programImage, domains.uiHeapPtr());
-    uiInterp.setExecutionDomainContext(&domains, DomainKind::UiPresentation);
+    domains.attachInterpreter(uiInterp, DomainKind::UiPresentation);
 
     // First mount WITHOUT a ViewModel to verify FallbackValue, StaticResource, noesis:Loc, Run & Grid definitions
     auto pageNoVm = CreateElementByTypeName(res.axbPackage.rootTypeName);
@@ -1782,7 +1782,7 @@ public void SetHardenedQuest(HardenedView v, QuestRowItem q)
         });
     Interpreter uiInterp(runtimeImg, domains.uiHeapPtr());
     uiInterp.setBindingRegistry(bindings);
-    uiInterp.setExecutionDomainContext(&domains, DomainKind::UiPresentation);
+    domains.attachInterpreter(uiInterp, DomainKind::UiPresentation);
 
     // Mount with ActiveQuest = null: FallbackValue MUST survive active DualTrackBindingEngine!
     const auto vmNullQuestExec = uiInterp.invoke("Game.UI::CreateHardenedView", {NullObject{}});
@@ -1868,17 +1868,17 @@ public void SetHardenedQuest(HardenedView v, QuestRowItem q)
     auto quest2Exec = uiInterp.invoke("Game.UI::CreateQuestRow", {value::FromString("Migrated Relay V2")});
     const ObjectRef migratedQuest = std::get<ObjectRef>(quest2Exec.value);
     auto migratedPin = domains.uiHeap().retain(migratedQuest);
-    AERO_CHECK(domains.uiHeap().uiObserverCount(liveQuest) >= 1u &&
-               domains.uiHeap().uiObserverCount(migratedQuest) == 0u,
+    AERO_CHECK(ObservableListHelper::UiObserverCount(domains.uiHeap(), liveQuest) >= 1u &&
+               ObservableListHelper::UiObserverCount(domains.uiHeap(), migratedQuest) == 0u,
                "Initial observer count on liveQuest before hot-reload migration");
     (void)uiInterp.invoke("Game.UI::SetHardenedQuest", {viewVm, migratedQuest});
     (void)domains.uiHeap().consumeDirtyObjects();
-    domains.uiHeap().clearDirtyFieldMask(viewVm);
+    (void)domains.uiHeap().consumeDirtyMask(viewVm);
     (void)bindingEngine.ApplyHotReloadMigration(
         *res.programImage,
         {HotReloadMigrationPair{liveQuest, migratedQuest}});
-    AERO_CHECK(domains.uiHeap().uiObserverCount(liveQuest) == 0u &&
-               domains.uiHeap().uiObserverCount(migratedQuest) >= 1u,
+    AERO_CHECK(ObservableListHelper::UiObserverCount(domains.uiHeap(), liveQuest) == 0u &&
+               ObservableListHelper::UiObserverCount(domains.uiHeap(), migratedQuest) >= 1u,
                "ApplyHotReloadMigration released oldRef observer and registered addUiObserver on newRef");
     AERO_CHECK(questStatusTb->GetText() == "Migrated Relay V2",
                "Hot-reload migrated hop synced Migrated Relay V2");
@@ -1886,7 +1886,7 @@ public void SetHardenedQuest(HardenedView v, QuestRowItem q)
     // Verify dead bound object after GC falls back to FallbackValue ("NO ACTIVE QUEST") instead of ""
     (void)uiInterp.invoke("Game.UI::SetHardenedQuest", {viewVm, NullObject{}});
     (void)domains.uiHeap().consumeDirtyObjects();
-    domains.uiHeap().clearDirtyFieldMask(viewVm);
+    (void)domains.uiHeap().consumeDirtyMask(viewVm);
     migratedPin.reset();
     ShadowStack emptyStack;
     domains.uiHeap().collectFull(emptyStack);

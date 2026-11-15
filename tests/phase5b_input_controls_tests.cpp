@@ -525,9 +525,9 @@ public SimTacticalRules CreateSimRules()
     aero::ExecutionDomainContext domains;
     domains.registerProgramObservableMetadata(*compiled.programImage);
     aero::Interpreter uiInterp(compiled.programImage, domains.uiHeapPtr());
-    uiInterp.setExecutionDomainContext(&domains, aero::DomainKind::UiPresentation);
+    domains.attachInterpreter(uiInterp, aero::DomainKind::UiPresentation);
     aero::Interpreter simInterp(compiled.programImage, domains.simHeapPtr());
-    simInterp.setExecutionDomainContext(&domains, aero::DomainKind::SimDeterministic);
+    domains.attachInterpreter(simInterp, aero::DomainKind::SimDeterministic);
 
     const auto vmExec = uiInterp.invoke("Game.Settings::CreateAudioVm");
     AERO_CHECK(vmExec.succeeded, "Created AudioConfigVm on UiHeap");

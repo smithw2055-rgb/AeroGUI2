@@ -573,7 +573,7 @@ public:
         if (const auto* rt = FindCompactEntry(PropId_RenderTransformTranslation);
             rt && rt->sourceRank == static_cast<std::uint8_t>(ValueSourceRank::Animation)) {
             Float4Value f4{};
-            if (rt->effectiveValue.tryGetFloat4(f4)) return f4.x;
+            if (rt->effectiveValue.tryGetQuatf(f4)) return f4.x;
         }
         float v = 0.0f;
         if (value::TryGetFloat(GetValue(PropId_AnimTranslateX), v)) return v;
@@ -583,7 +583,7 @@ public:
         if (const auto* rt = FindCompactEntry(PropId_RenderTransformTranslation);
             rt && rt->sourceRank == static_cast<std::uint8_t>(ValueSourceRank::Animation)) {
             Float4Value f4{};
-            if (rt->effectiveValue.tryGetFloat4(f4)) return f4.y;
+            if (rt->effectiveValue.tryGetQuatf(f4)) return f4.y;
         }
         float v = 0.0f;
         if (value::TryGetFloat(GetValue(PropId_AnimTranslateY), v)) return v;

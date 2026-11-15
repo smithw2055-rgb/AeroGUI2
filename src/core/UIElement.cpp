@@ -1032,7 +1032,7 @@ Matrix2D UIElement::GetRenderTransform() const noexcept {
     Matrix2D m = Matrix2D::Identity();
     if (const auto* lin = FindCompactEntry(PropId_RenderTransform)) {
         Float4Value f4{};
-        if (lin->effectiveValue.tryGetFloat4(f4)) {
+        if (lin->effectiveValue.tryGetQuatf(f4)) {
             m.m00 = f4.x;
             m.m01 = f4.y;
             m.m10 = f4.z;
@@ -1041,7 +1041,7 @@ Matrix2D UIElement::GetRenderTransform() const noexcept {
     }
     if (const auto* tr = FindCompactEntry(PropId_RenderTransformTranslation)) {
         Float4Value f4{};
-        if (tr->effectiveValue.tryGetFloat4(f4)) {
+        if (tr->effectiveValue.tryGetQuatf(f4)) {
             m.tx = f4.x;
             m.ty = f4.y;
         }
@@ -1065,7 +1065,7 @@ Matrix2D UIElement::GetLayoutTransform() const noexcept {
     Matrix2D m = Matrix2D::Identity();
     if (const auto* lt = FindCompactEntry(PropId_LayoutTransform)) {
         Float4Value f4{};
-        if (lt->effectiveValue.tryGetFloat4(f4)) {
+        if (lt->effectiveValue.tryGetQuatf(f4)) {
             m.m00 = f4.x;
             m.m01 = f4.y;
             m.m10 = f4.z;
@@ -1089,7 +1089,7 @@ void UIElement::SetRenderTransformOrigin(Point origin) {
 Point UIElement::GetRenderTransformOrigin() const noexcept {
     if (const auto* orig = FindCompactEntry(PropId_RenderTransformOrigin)) {
         Float4Value f4{};
-        if (orig->effectiveValue.tryGetFloat4(f4)) {
+        if (orig->effectiveValue.tryGetQuatf(f4)) {
             return Point{f4.x, f4.y};
         }
     }
@@ -1111,7 +1111,7 @@ Matrix2D UIElement::ComputeLocalEffectiveTransform2DForRect(const Rect& r) const
     // 0. LayoutTransform (maps unrotated [r.x..r.x+w]x[r.y..r.y+h] into post-layout AABB [r.x..r.x+effBoxW]x[r.y..r.y+effBoxH])
     if (const auto* ltEntry = FindCompactEntry(PropId_LayoutTransform)) {
         Float4Value f4{};
-        if (ltEntry->effectiveValue.tryGetFloat4(f4)) {
+        if (ltEntry->effectiveValue.tryGetQuatf(f4)) {
             const Matrix2D lt{f4.x, f4.y, f4.z, f4.w, 0.0f, 0.0f};
             if (!lt.IsIdentity()) {
                 const float minRelX = std::min(0.0f, lt.m00 * w) + std::min(0.0f, lt.m01 * h);
@@ -1205,7 +1205,7 @@ Matrix2D UIElement::ComputeLocalEffectiveTransform2DForRect(const Rect& r) const
     // 3. Legacy PropId_RenderTransformMatrix (Float4Value{sx, sy, tx, ty} around global origin)
     if (const auto* rtmEntry = FindCompactEntry(PropId_RenderTransformMatrix)) {
         Float4Value f4{};
-        if (rtmEntry->effectiveValue.tryGetFloat4(f4)) {
+        if (rtmEntry->effectiveValue.tryGetQuatf(f4)) {
             const Matrix2D legacyM{f4.x, 0.0f, 0.0f, f4.y, f4.z, f4.w};
             eff = Matrix2D::Multiply(legacyM, eff);
         }
@@ -1242,7 +1242,7 @@ CompositeTransform3DParams UIElement::GetTransform3D() const noexcept {
     CompositeTransform3DParams p{};
     if (const auto* rot = FindCompactEntry(PropId_Transform3DRotateXYZ)) {
         Float4Value f4{};
-        if (rot->effectiveValue.tryGetFloat4(f4)) {
+        if (rot->effectiveValue.tryGetQuatf(f4)) {
             p.rotationX = f4.x;
             p.rotationY = f4.y;
             p.rotationZ = f4.z;
@@ -1253,7 +1253,7 @@ CompositeTransform3DParams UIElement::GetTransform3D() const noexcept {
     }
     if (const auto* tr = FindCompactEntry(PropId_Transform3DTranslateXYZ)) {
         Float4Value f4{};
-        if (tr->effectiveValue.tryGetFloat4(f4)) {
+        if (tr->effectiveValue.tryGetQuatf(f4)) {
             p.translateX = f4.x;
             p.translateY = f4.y;
             p.translateZ = f4.z;
@@ -1261,7 +1261,7 @@ CompositeTransform3DParams UIElement::GetTransform3D() const noexcept {
     }
     if (const auto* sc = FindCompactEntry(PropId_Transform3DScaleXYZ)) {
         Float4Value f4{};
-        if (sc->effectiveValue.tryGetFloat4(f4)) {
+        if (sc->effectiveValue.tryGetQuatf(f4)) {
             p.scaleX = f4.x;
             p.scaleY = f4.y;
             p.scaleZ = f4.z;
@@ -1269,7 +1269,7 @@ CompositeTransform3DParams UIElement::GetTransform3D() const noexcept {
     }
     if (const auto* ctr = FindCompactEntry(PropId_Transform3DCenterXYZ)) {
         Float4Value f4{};
-        if (ctr->effectiveValue.tryGetFloat4(f4)) {
+        if (ctr->effectiveValue.tryGetQuatf(f4)) {
             p.centerX = f4.x;
             p.centerY = f4.y;
             p.centerZ = f4.z;
@@ -1437,7 +1437,7 @@ UIEffectDescriptor UIElement::GetEffectDescriptor() const noexcept {
 
     if (const auto* pEntry = FindCompactEntry(PropId_EffectParams)) {
         Float4Value f4{};
-        if (pEntry->effectiveValue.tryGetFloat4(f4)) {
+        if (pEntry->effectiveValue.tryGetQuatf(f4)) {
             if (!hasExplicitKind) {
                 desc.kind = (f4.y < -0.5f) ? UIEffectKind::Blur : UIEffectKind::DropShadow;
             }
@@ -1756,7 +1756,7 @@ void UIElement::Measure(Size availableSize) noexcept {
     bool hasLt = false;
     if (const auto* ltEntry = FindCompactEntry(PropId_LayoutTransform)) {
         Float4Value f4{};
-        if (ltEntry->effectiveValue.tryGetFloat4(f4)) {
+        if (ltEntry->effectiveValue.tryGetQuatf(f4)) {
             lt = Matrix2D{f4.x, f4.y, f4.z, f4.w, 0.0f, 0.0f};
             hasLt = !lt.IsIdentity();
         }
@@ -1855,7 +1855,7 @@ void UIElement::Arrange(Rect finalRect) noexcept {
     bool hasLt = false;
     if (const auto* ltEntry = FindCompactEntry(PropId_LayoutTransform)) {
         Float4Value f4{};
-        if (ltEntry->effectiveValue.tryGetFloat4(f4)) {
+        if (ltEntry->effectiveValue.tryGetQuatf(f4)) {
             lt = Matrix2D{f4.x, f4.y, f4.z, f4.w, 0.0f, 0.0f};
             hasLt = !lt.IsIdentity();
         }

@@ -315,7 +315,7 @@ Float4Value AnimationEngine::ReadCurrentFloat4(const UIElement* target, std::uin
     }
     const UnifiedValue v = target->GetValue(propId);
     Float4Value f4{};
-    if (v.tryGetFloat4(f4)) {
+    if (v.tryGetQuatf(f4)) {
         return f4;
     }
     return Float4Value{};
@@ -639,7 +639,7 @@ std::uint16_t AnimationEngine::StartValueTransition(
         return InvalidTrackId;
     }
     Float4Value toF4{};
-    const bool hasToF4 = toValue.tryGetFloat4(toF4);
+    const bool hasToF4 = toValue.tryGetQuatf(toF4);
     const bool isFloat4 =
         hasToF4 ||
         propId == PropId_Background ||
@@ -732,7 +732,7 @@ std::uint16_t AnimationEngine::StartTimeline(
             float dummyScalar = 0.0f;
             Float4Value dummyF4{};
             const bool isInterpolable =
-                kfVal.tryGetFloat4(dummyF4) ||
+                kfVal.tryGetQuatf(dummyF4) ||
                 (!std::holds_alternative<bool>(kfVal) &&
                  !std::holds_alternative<std::int64_t>(kfVal) &&
                  TryGetFloat(kfVal, dummyScalar));
@@ -762,7 +762,7 @@ std::uint16_t AnimationEngine::StartTimeline(
 
         // Seed initial From value for segment before keyframe[0] when keyframe[0].timeSeconds > 0
         Float4Value firstKfF4{};
-        if (kfCount > 0u && tr.keyFrames[0].value.tryGetFloat4(firstKfF4)) {
+        if (kfCount > 0u && tr.keyFrames[0].value.tryGetQuatf(firstKfF4)) {
             tr.fromF4 = ReadCurrentFloat4(target, timeline.targetPropertyId);
         } else {
             tr.fromF4.x = ReadCurrentScalar(target, timeline.targetPropertyId);
@@ -786,8 +786,8 @@ std::uint16_t AnimationEngine::StartTimeline(
     // Simple From -> To Tween (Float4 or Float)
     Float4Value parsedFromF4{};
     Float4Value parsedToF4{};
-    const bool hasFromF4 = timeline.hasFrom && timeline.fromValue.tryGetFloat4(parsedFromF4);
-    const bool hasToF4 = timeline.hasTo && timeline.toValue.tryGetFloat4(parsedToF4);
+    const bool hasFromF4 = timeline.hasFrom && timeline.fromValue.tryGetQuatf(parsedFromF4);
+    const bool hasToF4 = timeline.hasTo && timeline.toValue.tryGetQuatf(parsedToF4);
     const bool isFloat4 =
         hasFromF4 ||
         hasToF4 ||
@@ -1312,7 +1312,7 @@ bool AnimationEngine::InstantiatePackageMotion(
                     slot.scalarValue = *b ? 1.0f : 0.0f;
                 }
             }
-            (void)ciDesc.defaultValue.tryGetFloat4(slot.float4Value);
+            (void)ciDesc.defaultValue.tryGetQuatf(slot.float4Value);
             inst.contractInputs.push_back(std::move(slot));
         }
 
@@ -1428,7 +1428,7 @@ void AnimationEngine::SyncBridgePropertiesToContractInputs(MotionStateMachineIns
         }
         if (slot.valueKind == 4u) { // Color / Float4
             Float4Value f4{};
-            if (entry->effectiveValue.tryGetFloat4(f4) && !(f4 == slot.float4Value)) {
+            if (entry->effectiveValue.tryGetQuatf(f4) && !(f4 == slot.float4Value)) {
                 slot.float4Value = f4;
                 slot.dirtyThisFrame = true;
                 sm.isSettled = false;
@@ -2443,11 +2443,11 @@ std::size_t AnimationEngine::Tick(float dtSeconds) noexcept {
                     (void)target->SetValue(
                         tr.propId, tr.keyFrames[segIdx - 1u].value, ValueSourceRank::Animation);
                 }
-            } else if (endKf.value.tryGetFloat4(endF4)) {
+            } else if (endKf.value.tryGetQuatf(endF4)) {
                 Float4Value startF4 = tr.fromF4;
                 if (segIdx > 0u) {
                     Float4Value pf4{};
-                    if (tr.keyFrames[segIdx - 1u].value.tryGetFloat4(pf4)) {
+                    if (tr.keyFrames[segIdx - 1u].value.tryGetQuatf(pf4)) {
                         startF4 = pf4;
                     }
                 }

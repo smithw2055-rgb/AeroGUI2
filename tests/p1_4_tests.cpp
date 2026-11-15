@@ -206,7 +206,7 @@ public class BattleActionVm
     domains.registerProgramObservableMetadata(*compiled.programImage);
     auto uiHeapPtr = std::shared_ptr<aero::ManagedHeap>(&domains.uiHeap(), [](aero::ManagedHeap*) {});
     aero::Interpreter uiInterp(compiled.programImage, uiHeapPtr);
-    uiInterp.setExecutionDomainContext(&domains, aero::DomainKind::Ui);
+    domains.attachInterpreter(uiInterp, aero::DomainKind::Ui);
 
     const aero::SymbolId vmTypeId = aero::rs_sem::stableTypeId("Game.InteractionTest::BattleActionVm");
     const auto* vmTypeSym = compiled.programImage->resolveType(vmTypeId);
@@ -480,7 +480,7 @@ public class PlayerHudVm
     domains.registerProgramObservableMetadata(*compiled.programImage);
     auto uiHeapPtr = std::shared_ptr<aero::ManagedHeap>(&domains.uiHeap(), [](aero::ManagedHeap*) {});
     aero::Interpreter uiInterp(compiled.programImage, uiHeapPtr);
-    uiInterp.setExecutionDomainContext(&domains, aero::DomainKind::Ui);
+    domains.attachInterpreter(uiInterp, aero::DomainKind::Ui);
 
     const aero::SymbolId vmTypeId = aero::rs_sem::stableTypeId("Game.HudTest::PlayerHudVm");
     const auto* vmTypeSym = compiled.programImage->resolveType(vmTypeId);
@@ -497,7 +497,7 @@ public class PlayerHudVm
     (void)domains.writePropertySlotFast(aero::DomainKind::Ui, vmObj, *maxHpSlot, aero::MakeFloat(100.0f), &uiInterp);
     (void)domains.writePropertySlotFast(aero::DomainKind::Ui, vmObj, *scoreSlot, aero::value::FromInt(42), &uiInterp);
     (void)domains.uiHeap().consumeDirtyObjects();
-    domains.uiHeap().clearDirtyFieldMask(vmObj);
+    (void)domains.uiHeap().consumeDirtyMask(vmObj);
 
     aero::DualTrackBindingEngine bindingEngine(domains, compiled.programImage.get(), &uiInterp);
     auto root = aero::MakeIntrusive<aero::UserControl>();
@@ -615,7 +615,7 @@ public class ThermalConverters
     domains.registerProgramObservableMetadata(*compiled.programImage);
     auto uiHeapPtr = std::shared_ptr<aero::ManagedHeap>(&domains.uiHeap(), [](aero::ManagedHeap*) {});
     aero::Interpreter uiInterp(compiled.programImage, uiHeapPtr);
-    uiInterp.setExecutionDomainContext(&domains, aero::DomainKind::Ui);
+    domains.attachInterpreter(uiInterp, aero::DomainKind::Ui);
 
     const aero::SymbolId vmTypeId = aero::rs_sem::stableTypeId("Game.Converters::SettingsVm");
     const auto* vmTypeSym = compiled.programImage->resolveType(vmTypeId);
@@ -630,7 +630,7 @@ public class ThermalConverters
     (void)domains.writePropertySlotFast(aero::DomainKind::Ui, vmObj, *celsiusSlot, aero::MakeFloat(25.0f), &uiInterp);
     (void)domains.writePropertySlotFast(aero::DomainKind::Ui, vmObj, *rankSlot, aero::value::FromInt(2), &uiInterp);
     (void)domains.uiHeap().consumeDirtyObjects();
-    domains.uiHeap().clearDirtyFieldMask(vmObj);
+    (void)domains.uiHeap().consumeDirtyMask(vmObj);
 
     aero::DualTrackBindingEngine bindingEngine(domains, compiled.programImage.get(), &uiInterp);
 

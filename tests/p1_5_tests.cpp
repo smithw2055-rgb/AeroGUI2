@@ -691,7 +691,7 @@ public class RichVm
     domains.registerProgramObservableMetadata(*compiled.programImage);
     auto uiHeapPtr = std::shared_ptr<ManagedHeap>(&domains.uiHeap(), [](ManagedHeap*) {});
     Interpreter uiInterp(compiled.programImage, uiHeapPtr);
-    uiInterp.setExecutionDomainContext(&domains, DomainKind::Ui);
+    domains.attachInterpreter(uiInterp, DomainKind::Ui);
 
     const SymbolId vmTypeId = rs_sem::stableTypeId("Game.RichRegression::RichVm");
     const auto* vmTypeSym = compiled.programImage->resolveType(vmTypeId);

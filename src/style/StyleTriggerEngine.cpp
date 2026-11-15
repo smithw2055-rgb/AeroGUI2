@@ -125,7 +125,7 @@ namespace {
     }
     Float4Value af4{};
     Float4Value bf4{};
-    if (a.tryGetFloat4(af4) && b.tryGetFloat4(bf4)) {
+    if (a.tryGetQuatf(af4) && b.tryGetQuatf(bf4)) {
         return af4 == bf4;
     }
     if (const auto* as = std::get_if<StringValue>(&a)) {
@@ -513,6 +513,7 @@ void ResolveHopTargetType(
 
 [[nodiscard]] SymbolId FindMethodInHierarchy(
     const ProgramImage* program,
+    const ExecutionDomainContext* domains,
     SymbolId startTypeId,
     std::string_view leafName,
     bool& outIsSimCmd) {
@@ -553,12 +554,8 @@ void ResolveHopTargetType(
         curTypeId = ts->baseTypeId;
     }
 
-    if (foundSym != 0) {
-        if (const auto* loc = program->resolveFunction(foundSym)) {
-            if (loc->function && loc->function->simCommand) {
-                outIsSimCmd = true;
-            }
-        }
+    if (foundSym != 0 && domains && domains->isSimCommandFunction(foundSym)) {
+        outIsSimCmd = true;
     }
     return foundSym;
 }
@@ -2725,7 +2722,7 @@ void StyleTriggerEngine::ExecuteSingleInteractionAction(
                         const SymbolId wrapTid = heap->objectTypeId(wrapperObj).value_or(0);
                         const std::string navMethod = "NavigateTo" + destId;
                         bool isSim = false;
-                        const SymbolId mSym = FindMethodInHierarchy(program_, wrapTid, navMethod, isSim);
+                        const SymbolId mSym = FindMethodInHierarchy(program_, domains_, wrapTid, navMethod, isSim);
                         if (mSym != 0) {
                             std::vector<UnifiedValue> args{wrapperObj};
                             if (uiInterpreter_) {
@@ -2802,7 +2799,7 @@ void StyleTriggerEngine::ExecuteSingleInteractionAction(
                         isSimCmd = action.isSimCommand;
                     } else if (program_ && wrapTypeId != 0) {
                         bool sim = false;
-                        const SymbolId found = FindMethodInHierarchy(program_, wrapTypeId, leafName, sim);
+                        const SymbolId found = FindMethodInHierarchy(program_, domains_, wrapTypeId, leafName, sim);
                         if (found != 0) {
                             targetObj = wrapperObj;
                             methodSym = found;
@@ -2821,7 +2818,7 @@ void StyleTriggerEngine::ExecuteSingleInteractionAction(
                         isSimCmd = action.isSimCommand;
                     } else if (program_ && dcTypeId != 0) {
                         bool sim = false;
-                        const SymbolId found = FindMethodInHierarchy(program_, dcTypeId, leafName, sim);
+                        const SymbolId found = FindMethodInHierarchy(program_, domains_, dcTypeId, leafName, sim);
                         if (found != 0) {
                             targetObj = dcObj;
                             methodSym = found;
@@ -2855,7 +2852,7 @@ void StyleTriggerEngine::ExecuteSingleInteractionAction(
                         methodSym = action.commandMethodSymbolId;
                         isSimCmd = action.isSimCommand;
                     } else if (program_ && subTypeId != 0) {
-                        methodSym = FindMethodInHierarchy(program_, subTypeId, leafName, isSimCmd);
+                        methodSym = FindMethodInHierarchy(program_, domains_, subTypeId, leafName, isSimCmd);
                     }
                 }
             }

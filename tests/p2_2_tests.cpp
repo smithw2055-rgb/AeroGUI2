@@ -67,15 +67,17 @@ void TestRealScriptDeltaRingAndRingOverflowFallback() {
 
     // Create a mock owner Record to observe dirty bit wake-ups
     const aero::SymbolId ownerTid = aero::rs_sem::stableTypeId("Test.P22::MockVm");
-    heap.registerTypeObservableBits(ownerTid, {3u});
+    heap.enableTypeDirtyTracking(ownerTid, {3u});
     auto ownerOpt = heap.allocateObject(ownerTid, {aero::UnifiedValue{arrRef}}, {0u});
     AERO_CHECK(ownerOpt.has_value(), "Allocated owner ViewModel holding array field");
     const aero::ObjectRef ownerRef = *ownerOpt;
     const auto pinOwner = heap.retain(ownerRef);
+    aero::ObservableListHelper::EnableTracking(heap, arrRef);
+    aero::ObservableListHelper::BindOwnerProperty(heap, arrRef, ownerRef, 3u);
 
     // Clear initial dirty state
     (void)heap.consumeDirtyObjects();
-    heap.clearDirtyFieldMask(ownerRef);
+    (void)heap.consumeDirtyMask(ownerRef);
     const std::uint64_t v0 = aero::ObservableListHelper::MutationVersion(heap, arrRef);
     AERO_CHECK(v0 == 0ULL, "Initial mutationVersion is 0");
 
@@ -96,12 +98,12 @@ void TestRealScriptDeltaRingAndRingOverflowFallback() {
                "Array contents match [15, 25, 30]");
 
     // Verify owner dirty bit was automatically set!
-    AERO_CHECK((heap.dirtyFieldMask(ownerRef) & (1ULL << 3u)) != 0ULL,
+    AERO_CHECK((heap.peekDirtyMask(ownerRef) & (1ULL << 3u)) != 0ULL,
                "Array mutations automatically set owner ViewModel observable bit 3");
     const auto dirtyObjs = heap.consumeDirtyObjects();
     AERO_CHECK(dirtyObjs.size() == 1u && dirtyObjs[0] == ownerRef,
                "Owner ViewModel queued once in consumeDirtyObjects()");
-    heap.clearDirtyFieldMask(ownerRef);
+    (void)heap.consumeDirtyMask(ownerRef);
 
     // Read delta records since v0
     std::vector<aero::CollectionChangeRecord> deltas;
@@ -125,7 +127,7 @@ void TestRealScriptDeltaRingAndRingOverflowFallback() {
                "Delta[3] is RemoveAt at index 0 (old=10)");
 
     // Overflow ring (> 256 mutations without consuming) -> requiresReset == true
-    for (std::size_t i = 0; i < aero::ManagedHeap::kCollectionDeltaRingCapacity + 40u; ++i) {
+    for (std::size_t i = 0; i < aero::ObservableListHelper::kDeltaRingCapacity + 40u; ++i) {
         (void)aero::ObservableListHelper::Add(heap, arrRef, aero::value::FromInt(static_cast<std::int64_t>(100 + i)));
     }
     std::uint64_t overflowVer = 0ULL;
@@ -324,7 +326,7 @@ public BagPanelVm Create10kBagVm()
     aero::ExecutionDomainContext domains;
     domains.registerProgramObservableMetadata(*res.programImage);
     aero::Interpreter uiInterp(res.programImage, domains.uiHeapPtr());
-    uiInterp.setExecutionDomainContext(&domains, aero::DomainKind::UiPresentation);
+    domains.attachInterpreter(uiInterp, aero::DomainKind::UiPresentation);
 
     aero::rs_rt::ExecutionOptions bigBudget{};
     bigBudget.limits.instructionBudget = 50'000'000;
@@ -353,7 +355,7 @@ public BagPanelVm Create10kBagVm()
 
     // Clear initial setup dirty flags before mounting
     (void)domains.uiHeap().consumeDirtyObjects();
-    domains.uiHeap().clearDirtyFieldMask(vmRef);
+    (void)domains.uiHeap().consumeDirtyMask(vmRef);
 
     // 1. Mount Incremental Primary View (bound via DualTrackBindingEngine)
     aero::DualTrackBindingEngine incBindingEngine(domains, res.programImage.get(), &uiInterp);
@@ -778,7 +780,7 @@ public LobbyVm CreateLobbyVm()
     aero::ExecutionDomainContext domains;
     domains.registerProgramObservableMetadata(*res.programImage);
     aero::Interpreter uiInterp(res.programImage, domains.uiHeapPtr());
-    uiInterp.setExecutionDomainContext(&domains, aero::DomainKind::UiPresentation);
+    domains.attachInterpreter(uiInterp, aero::DomainKind::UiPresentation);
 
     const auto vmExec = uiInterp.invoke("Game.MultiControlsP22::CreateLobbyVm");
     AERO_CHECK(vmExec.succeeded, "Created LobbyVm");
@@ -786,7 +788,7 @@ public LobbyVm CreateLobbyVm()
     const auto pinVm = domains.uiHeap().retain(vmRef);
 
     (void)domains.uiHeap().consumeDirtyObjects();
-    domains.uiHeap().clearDirtyFieldMask(vmRef);
+    (void)domains.uiHeap().consumeDirtyMask(vmRef);
 
     aero::DualTrackBindingEngine bindingEngine(domains, res.programImage.get(), &uiInterp);
     auto root = aero::MakeIntrusive<aero::StackPanel>();
@@ -1062,7 +1064,7 @@ public PickerVm CreatePickerVm()
     aero::ExecutionDomainContext domains;
     domains.registerProgramObservableMetadata(*res.programImage);
     aero::Interpreter uiInterp(res.programImage, domains.uiHeapPtr());
-    uiInterp.setExecutionDomainContext(&domains, aero::DomainKind::UiPresentation);
+    domains.attachInterpreter(uiInterp, aero::DomainKind::UiPresentation);
 
     const auto vmExec = uiInterp.invoke("Game.InteractiveListP22::CreatePickerVm");
     AERO_CHECK(vmExec.succeeded, "Created PickerVm");
@@ -1070,7 +1072,7 @@ public PickerVm CreatePickerVm()
     const auto pinVm = domains.uiHeap().retain(vmRef);
 
     (void)domains.uiHeap().consumeDirtyObjects();
-    domains.uiHeap().clearDirtyFieldMask(vmRef);
+    (void)domains.uiHeap().consumeDirtyMask(vmRef);
 
     aero::DualTrackBindingEngine bindingEngine(domains, res.programImage.get(), &uiInterp);
     auto root = aero::MakeIntrusive<aero::Grid>();
