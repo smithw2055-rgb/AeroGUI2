@@ -1495,8 +1495,9 @@ std::optional<Value> ExecutionDomainContext::readPropertySlotFast(
         return crossHeapRead ? sanitizeCrossHeapValue(*targetHeap, *val) : *val;
     }
 
-    if (slot.getterSymbolId != 0 && interpreter) {
-        const auto exec = interpreter->invoke(slot.getterSymbolId, {Value{target}});
+    if (slot.getterSymbolId != 0 && (interpreter || hasDesktopJitInvoker())) {
+        const Value arg0{target};
+        const auto exec = invokeMethod(callerDomain, interpreter, slot.getterSymbolId, &arg0, 1u);
         if (!exec.succeeded) {
             if (error) *error = exec.error;
             return std::nullopt;
@@ -1610,8 +1611,9 @@ bool ExecutionDomainContext::writePropertySlotFast(
         return targetHeap->fieldSet(target, slot.backingFieldIndex, std::move(writeVal), error);
     }
 
-    if (slot.setterSymbolId != 0 && interpreter) {
-        const auto exec = interpreter->invoke(slot.setterSymbolId, {Value{target}, std::move(writeVal)});
+    if (slot.setterSymbolId != 0 && (interpreter || hasDesktopJitInvoker())) {
+        const Value callArgs[2]{Value{target}, std::move(writeVal)};
+        const auto exec = invokeMethod(callerDomain, interpreter, slot.setterSymbolId, callArgs, 2u);
         if (!exec.succeeded) {
             if (error) *error = exec.error;
             return false;
@@ -1681,7 +1683,12 @@ std::size_t ExecutionDomainContext::flushSimCommands(
             }
             args.push_back(std::move(val));
         }
-        const auto exec = simInterpreter.invoke(cmd.commandTypeId, args);
+        const auto exec = invokeMethod(
+            DomainKind::SimDeterministic,
+            &simInterpreter,
+            cmd.commandTypeId,
+            args.data(),
+            args.size());
         if (!exec.succeeded) {
             if (error && error->code == ErrorCode::None) {
                 *error = exec.error;
@@ -1994,9 +2001,20 @@ bool ExecutionDomainContext::stepUiTask(UiTaskId taskId, const Interpreter* uiIn
         if (!frame->sequenceEntryArgs.empty()) {
             frame->sequenceEntryArgs[0] = Value{targetObject};
         }
-        exec = uiInterpreter->invoke(frame->sequenceEntrySymbolId, frame->sequenceEntryArgs);
+        exec = invokeMethod(
+            DomainKind::UiPresentation,
+            uiInterpreter,
+            frame->sequenceEntrySymbolId,
+            frame->sequenceEntryArgs.data(),
+            frame->sequenceEntryArgs.size());
     } else {
-        exec = uiInterpreter->invoke(frame->sequenceStepSymbolId, {Value{targetObject}});
+        const Value arg0{targetObject};
+        exec = invokeMethod(
+            DomainKind::UiPresentation,
+            uiInterpreter,
+            frame->sequenceStepSymbolId,
+            &arg0,
+            1u);
     }
     ++frame->stepIndex;
 
@@ -2133,6 +2151,110 @@ std::size_t ExecutionDomainContext::stepUiIdleGc(
 std::size_t ExecutionDomainContext::stepUiIdleGc(double maxMilliseconds) {
     ShadowStack emptyStack;
     return stepUiIdleGc(emptyStack, maxMilliseconds);
+}
+
+void ExecutionDomainContext::setDesktopJitInvoker(DesktopJitInvokerFn invoker) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    desktopJitInvoker_ = std::move(invoker);
+}
+
+void ExecutionDomainContext::clearDesktopJitInvoker() noexcept {
+    std::lock_guard<std::mutex> lock(mutex_);
+    desktopJitInvoker_ = nullptr;
+}
+
+bool ExecutionDomainContext::hasDesktopJitInvoker() const noexcept {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return static_cast<bool>(desktopJitInvoker_);
+}
+
+bool ExecutionDomainContext::tryInvokeDesktopJit(
+    DomainKind domain,
+    SymbolId functionId,
+    const Value* arguments,
+    std::size_t argumentCount,
+    ExecutionResult& outResult) const {
+    if (functionId == 0) {
+        return false;
+    }
+    DesktopJitInvokerFn invoker;
+    bool simCmdBlockedOnUi = false;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        invoker = desktopJitInvoker_;
+        if (invoker && domain == DomainKind::UiPresentation) {
+            simCmdBlockedOnUi = (simCommandFunctions_.find(functionId) != simCommandFunctions_.end());
+        }
+    }
+    if (!invoker || simCmdBlockedOnUi) {
+        return false;
+    }
+
+    bool outSucceeded = false;
+    Value outVal{};
+    RuntimeError outErr{};
+    if (invoker(domain, functionId, arguments, argumentCount, outSucceeded, outVal, outErr)) {
+        desktopJitInvokeHits_.fetch_add(1u, std::memory_order_relaxed);
+        outResult = ExecutionResult{};
+        outResult.succeeded = outSucceeded;
+        outResult.value = std::move(outVal);
+        outResult.error = std::move(outErr);
+        return true;
+    }
+
+    desktopJitFallbackHits_.fetch_add(1u, std::memory_order_relaxed);
+    return false;
+}
+
+ExecutionResult ExecutionDomainContext::invokeMethod(
+    DomainKind domain,
+    const Interpreter* interpreter,
+    SymbolId functionId,
+    const Value* arguments,
+    std::size_t argumentCount,
+    realscript::runtime::ExecutionOptions options) const {
+    if (functionId == 0) {
+        ExecutionResult fail{};
+        fail.error.code = ErrorCode::FunctionNotFound;
+        fail.error.message = "cannot invoke functionId 0";
+        return fail;
+    }
+
+    if (domain == DomainKind::UiPresentation && isSimCommandFunction(functionId)) {
+        bool intercepted = false;
+        Value interceptedVal{};
+        RuntimeError interceptErr{};
+        if (uiPolicy_.interceptCall(
+                functionId,
+                ValueSpan{arguments, argumentCount},
+                intercepted,
+                interceptedVal,
+                interceptErr) &&
+            intercepted) {
+            ExecutionResult res{};
+            res.succeeded = true;
+            res.value = std::move(interceptedVal);
+            return res;
+        }
+    }
+
+    ExecutionResult jitExec{};
+    if (tryInvokeDesktopJit(domain, functionId, arguments, argumentCount, jitExec)) {
+        return jitExec;
+    }
+
+    if (interpreter) {
+        std::vector<Value> argVec;
+        if (arguments && argumentCount > 0u) {
+            argVec.assign(arguments, arguments + argumentCount);
+        }
+        return interpreter->invoke(functionId, argVec, std::move(options));
+    }
+
+    ExecutionResult missing{};
+    missing.error.code = ErrorCode::FunctionNotFound;
+    missing.error.message = "no desktop JIT or interpreter available for invokeMethod";
+    return missing;
 }
 
 } // namespace aero

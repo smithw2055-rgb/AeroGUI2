@@ -21,6 +21,9 @@
 #include "aero/core/UiResourceContext.hpp"
 #include "realscript/aot_cpp/AotCpp.h"
 #include "realscript/bytecode/Bytecode.h"
+#include "realscript/compiler/StandardMacros.h"
+#include "realscript/jit/StencilJit.h"
+#include "realscript/optimization/Optimizer.h"
 
 namespace aero {
 
@@ -9753,16 +9756,41 @@ AeroCompileResult AeroCompiler::CompileInternal(
         }
     }
 
-    // If RealScript sources were supplied, run single-pass Compilation + Bytecode Lowering + Link
+    // If RealScript sources were supplied, run single-pass Compilation (+ optional -O2 MIR Optimization) + Bytecode Lowering + Link
     if (!allSources.empty()) {
-        rs_comp::Compilation compilation(std::move(allSources));
-        const auto build = compilation.build();
+        rs_comp::CompilationOptions compOpts{};
+        if (input.compilerSession != nullptr) {
+            compOpts.session = std::shared_ptr<rs_comp::CompilerSession>(
+                input.compilerSession,
+                [](rs_comp::CompilerSession*) noexcept {});
+        }
+        if (input.enableReactiveMacros) {
+            compOpts.macroPlugins.push_back(rs_comp::createStandardReactiveMacroPlugin());
+        }
+        rs_comp::Compilation compilation(std::move(allSources), std::move(compOpts));
+        auto build = compilation.build();
         for (const auto& d : build.diagnostics.items()) {
             result.diagnostics.push_back(d.code + ": " + d.message);
         }
         if (build.diagnostics.hasErrors()) {
             result.succeeded = false;
             return result;
+        }
+
+        if (input.optimizeBytecode) {
+            realscript::optimization::Optimizer optimizer;
+            realscript::optimization::Options optOpts{};
+            optOpts.level = realscript::optimization::Level::Aggressive;
+            rs_diag::DiagnosticBag optDiag;
+            auto optRes = optimizer.optimize(std::move(build.modules), optDiag, optOpts);
+            for (const auto& d : optDiag.items()) {
+                result.diagnostics.push_back(d.code + ": " + d.message);
+            }
+            if (optDiag.hasErrors()) {
+                result.succeeded = false;
+                return result;
+            }
+            build.modules = std::move(optRes.modules);
         }
 
         rs_bc::Lowerer lowerer;
@@ -10972,5 +11000,59 @@ void EnsureDefaultRuntimeXamlHookInstalled() noexcept {
 }
 
 } // namespace
+
+bool AttachDesktopStencilJit(
+    ExecutionDomainContext& domains,
+    realscript::jit::StencilModule* uiModule,
+    realscript::jit::StencilModule* simModule) {
+    const bool uiValid = (uiModule != nullptr && uiModule->valid());
+    const bool simValid = (simModule != nullptr && simModule->valid());
+    if (!uiValid && !simValid) {
+        domains.clearDesktopJitInvoker();
+        return false;
+    }
+
+    if (uiValid && !uiModule->heap()) {
+        uiModule->setHeap(domains.uiHeapPtr());
+    }
+    if (simValid && !simModule->heap()) {
+        simModule->setHeap(domains.simHeapPtr());
+    }
+
+    ExecutionDomainContext* domainsPtr = &domains;
+    domains.setDesktopJitInvoker(
+        [domainsPtr, uiModule, simModule](
+            DomainKind domain,
+            rs_sem::SymbolId functionId,
+            const rs_rt::Value* arguments,
+            std::size_t argumentCount,
+            bool& outSucceeded,
+            rs_rt::Value& outResult,
+            rs_rt::RuntimeError& outError) -> bool {
+            realscript::jit::StencilModule* mod =
+                (domain == DomainKind::SimDeterministic) ? simModule : uiModule;
+            if (!mod || !mod->valid()) {
+                return false;
+            }
+            if (mod->functionTier(functionId) == realscript::jit::StencilTier::InterpreterFallback) {
+                return false;
+            }
+
+            std::vector<rs_rt::Value> argVec;
+            if (arguments != nullptr && argumentCount > 0u) {
+                argVec.assign(arguments, arguments + argumentCount);
+            }
+
+            rs_rt::ExecutionOptions execOpts{};
+            execOpts.limits.instructionBudget = 5'000'000;
+            execOpts.executionPolicy = domainsPtr->executionPolicy(domain);
+            const auto res = mod->invoke(functionId, argVec, std::move(execOpts));
+            outSucceeded = res.succeeded;
+            outResult = res.value;
+            outError = res.error;
+            return true;
+        });
+    return true;
+}
 
 } // namespace aero

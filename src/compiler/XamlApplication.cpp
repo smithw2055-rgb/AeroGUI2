@@ -55,6 +55,9 @@ void PreRegisterLocalUserControlsAndDictionaries(
     const fs::path& skipAppXaml,
     const std::vector<std::string>& resourceSearchPaths,
     const std::vector<SourceFile>& discoveredScripts,
+    rs_comp::CompilerSession* compilerSession,
+    bool optimizeBytecode,
+    bool enableReactiveMacros,
     std::vector<SourceFile>& outGeneratedUserControlStubs) {
     std::error_code ec;
     if (!fs::is_directory(searchDir, ec)) return;
@@ -128,6 +131,9 @@ void PreRegisterLocalUserControlsAndDictionaries(
         subIn.resourceSearchRoot = xp.parent_path().string();
         subIn.resourceSearchPaths = resourceSearchPaths;
         subIn.autoMergeGlobalResources = false;
+        subIn.compilerSession = compilerSession;
+        subIn.optimizeBytecode = optimizeBytecode;
+        subIn.enableReactiveMacros = enableReactiveMacros;
         AeroCompileResult subRes = compiler.Compile(subIn);
         if (!subRes.succeeded) continue;
         if (rootTag == "UserControl" && !subRes.axbPackage.className.empty() && !discoveredScripts.empty()) {
@@ -343,6 +349,9 @@ bool XamlApplication::Load(std::string_view appOrWindowOrDirPath, std::string* o
 }
 
 bool XamlApplication::Load(const XamlApplicationOptions& options, std::string* outError) {
+    if (!compilerSession_) {
+        compilerSession_ = std::make_shared<rs_comp::CompilerSession>();
+    }
     viewportW_ = options.viewportWidth;
     viewportH_ = options.viewportHeight;
     ImageAtlas::Instance().ClearSearchDirectories();
@@ -489,6 +498,9 @@ bool XamlApplication::Load(const XamlApplicationOptions& options, std::string* o
         appIn.xamlContent = std::move(appXml);
         appIn.resourceSearchRoot = baseDir.string();
         appIn.resourceSearchPaths = options.resourceSearchPaths;
+        appIn.compilerSession = compilerSession_.get();
+        appIn.optimizeBytecode = options.optimizeBytecode;
+        appIn.enableReactiveMacros = options.enableReactiveMacros;
         AeroCompileResult appRes = compiler.Compile(appIn);
         if (appRes.succeeded) {
             appDictPkg = appRes.axbPackage;
@@ -555,6 +567,9 @@ bool XamlApplication::Load(const XamlApplicationOptions& options, std::string* o
     winIn.xamlContent = std::move(winXml);
     winIn.resourceSearchRoot = windowXamlPath.parent_path().string();
     winIn.resourceSearchPaths = options.resourceSearchPaths;
+    winIn.compilerSession = compilerSession_.get();
+    winIn.optimizeBytecode = options.optimizeBytecode;
+    winIn.enableReactiveMacros = options.enableReactiveMacros;
 
     if (options.autoDiscoverScripts) {
         std::vector<fs::path> rsPaths;
@@ -581,6 +596,9 @@ bool XamlApplication::Load(const XamlApplicationOptions& options, std::string* o
         appXamlPath,
         options.resourceSearchPaths,
         winIn.scriptSources,
+        compilerSession_.get(),
+        options.optimizeBytecode,
+        options.enableReactiveMacros,
         ucStubs);
     for (auto& us : ucStubs) {
         winIn.scriptSources.push_back(std::move(us));

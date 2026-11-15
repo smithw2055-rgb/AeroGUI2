@@ -1010,7 +1010,9 @@ UnifiedValue DualTrackBindingEngine::InvokeScriptConverterSymbol(
                                 for (const auto& cm : ts.methods) {
                                     if ((cm.name == ".ctor" || cm.name == ts.name) &&
                                         !cm.staticMethod && cm.parameters.empty() && cm.id != 0) {
-                                        (void)uiInterpreter_->invoke(cm.id, {receiverObj});
+                                        const UnifiedValue ctorArg{receiverObj};
+                                        (void)domains_.invokeMethod(
+                                            DomainKind::UiPresentation, uiInterpreter_, cm.id, &ctorArg, 1u);
                                         break;
                                     }
                                 }
@@ -1075,11 +1077,11 @@ UnifiedValue DualTrackBindingEngine::InvokeScriptConverterSymbol(
         }
     }
 
-    auto res = uiInterpreter_->invoke(fnSym, callArgs);
+    auto res = domains_.invokeMethod(DomainKind::UiPresentation, uiInterpreter_, fnSym, callArgs);
     if (!res.succeeded && res.error.code == ErrorCode::InvalidArguments &&
         res.statistics.instructionsExecuted == 0u && !parameter.empty() && !callArgs.empty()) {
         callArgs.pop_back();
-        res = uiInterpreter_->invoke(fnSym, callArgs);
+        res = domains_.invokeMethod(DomainKind::UiPresentation, uiInterpreter_, fnSym, callArgs);
     }
     if (!res.succeeded) {
         return passthrough;

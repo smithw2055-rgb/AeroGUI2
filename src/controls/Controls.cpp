@@ -14183,9 +14183,10 @@ bool MountAxbInstructionsInternal(
                                     if (tmpHop.fieldIndex != PropertySlotHandle::InvalidIndex) {
                                         okHop = domains->readObjectField(DomainKind::Ui, targetObj, tmpHop.fieldIndex, nextVal);
                                     }
-                                } else if (eventInterpreter) {
-                                    std::vector<UnifiedValue> gArgs{targetObj};
-                                    const auto gRes = eventInterpreter->invoke(tmpHop.getterSymbolId, gArgs);
+                                } else if (eventInterpreter || domains->hasDesktopJitInvoker()) {
+                                    const UnifiedValue gArg0{targetObj};
+                                    const auto gRes = domains->invokeMethod(
+                                        DomainKind::UiPresentation, eventInterpreter, tmpHop.getterSymbolId, &gArg0, 1u);
                                     if (gRes.succeeded) {
                                         nextVal = gRes.value;
                                         okHop = true;
@@ -14380,14 +14381,16 @@ bool MountAxbInstructionsInternal(
                                         std::vector<UnifiedValue> payload;
                                         if (args.size() > 1u) payload.push_back(args[1]);
                                         domains->enqueueSimCommand(SimCommandEnvelope{callSym, callObj, std::move(payload), 0ULL});
-                                    } else if (eventInterpreter) {
-                                        auto res = eventInterpreter->invoke(callSym, args);
+                                    } else if (eventInterpreter || domains->hasDesktopJitInvoker()) {
+                                        auto res = domains->invokeMethod(
+                                            DomainKind::UiPresentation, eventInterpreter, callSym, args);
                                         if (!res.succeeded &&
                                             res.error.code == ErrorCode::InvalidArguments &&
                                             res.statistics.instructionsExecuted == 0u &&
                                             args.size() > 1u) {
                                             args.resize(1u);
-                                            (void)eventInterpreter->invoke(callSym, args);
+                                            (void)domains->invokeMethod(
+                                                DomainKind::UiPresentation, eventInterpreter, callSym, args);
                                         }
                                     } else if (eventAotContext) {
                                         UnifiedValue ret{};

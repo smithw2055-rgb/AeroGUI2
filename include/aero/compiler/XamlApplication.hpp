@@ -25,6 +25,8 @@ struct XamlApplicationOptions {
     float viewportWidth = 1280.0f;
     float viewportHeight = 720.0f;
     bool autoDiscoverScripts = true;
+    bool optimizeBytecode = false;
+    bool enableReactiveMacros = true;
 };
 
 // WPF-style one-line application & window loader (App.xaml StartupUri + automatic *.xaml.rs / ViewModels discovery)
@@ -54,6 +56,7 @@ public:
     [[nodiscard]] const PagedRenderTree& RenderTree() const noexcept { return renderTree_; }
     void RasterizeToRgba8(std::vector<std::uint8_t>& outRgba8, Color clearColor = Color{0.08f, 0.10f, 0.14f, 1.0f});
     [[nodiscard]] Interpreter* ScriptInterpreter() const noexcept { return interpreter_.get(); }
+    [[nodiscard]] rs_comp::CompilerSession* CompilerSession() const noexcept { return compilerSession_.get(); }
     [[nodiscard]] const ProgramImage* Program() const noexcept { return compileResult_.programImage.get(); }
     [[nodiscard]] const AxbPackage& MainPackage() const noexcept { return compileResult_.axbPackage; }
     [[nodiscard]] const std::string& StartupUri() const noexcept { return resolvedStartupUri_; }
@@ -61,6 +64,7 @@ public:
 
 private:
     ExecutionDomainContext domains_;
+    std::shared_ptr<rs_comp::CompilerSession> compilerSession_;
     AeroCompileResult compileResult_{};
     std::shared_ptr<BindingRegistry> nativeBindings_;
     std::unique_ptr<ScriptUiBridge> scriptBridge_;

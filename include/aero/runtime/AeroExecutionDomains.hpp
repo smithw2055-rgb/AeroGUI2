@@ -2,6 +2,7 @@
 
 #include "realscript/runtime/Runtime.h"
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -226,6 +227,69 @@ public:
         double maxMilliseconds);
     std::size_t stepUiIdleGc(double maxMilliseconds);
 
+    // Optional desktop-only fast-path method invoker hook (e.g. backed by RealScript::StencilJit).
+    // Returns true if the target function was handled by the hook (check outSucceeded/outError),
+    // or false to fall back cleanly to the Interpreter / SlimRuntime path.
+    using DesktopJitInvokerFn = std::function<bool(
+        DomainKind domain,
+        realscript::semantic::SymbolId functionId,
+        const realscript::runtime::Value* arguments,
+        std::size_t argumentCount,
+        bool& outSucceeded,
+        realscript::runtime::Value& outResult,
+        realscript::runtime::RuntimeError& outError)>;
+
+    void setDesktopJitInvoker(DesktopJitInvokerFn invoker);
+    void clearDesktopJitInvoker() noexcept;
+    [[nodiscard]] bool hasDesktopJitInvoker() const noexcept;
+
+    [[nodiscard]] realscript::runtime::IExecutionPolicy* executionPolicy(DomainKind domain) noexcept {
+        return (domain == DomainKind::SimDeterministic)
+            ? static_cast<realscript::runtime::IExecutionPolicy*>(&simPolicy_)
+            : static_cast<realscript::runtime::IExecutionPolicy*>(&uiPolicy_);
+    }
+
+    [[nodiscard]] bool tryInvokeDesktopJit(
+        DomainKind domain,
+        realscript::semantic::SymbolId functionId,
+        const realscript::runtime::Value* arguments,
+        std::size_t argumentCount,
+        realscript::runtime::ExecutionResult& outResult) const;
+
+    [[nodiscard]] realscript::runtime::ExecutionResult invokeMethod(
+        DomainKind domain,
+        const realscript::runtime::Interpreter* interpreter,
+        realscript::semantic::SymbolId functionId,
+        const realscript::runtime::Value* arguments,
+        std::size_t argumentCount,
+        realscript::runtime::ExecutionOptions options = {}) const;
+
+    [[nodiscard]] realscript::runtime::ExecutionResult invokeMethod(
+        DomainKind domain,
+        const realscript::runtime::Interpreter* interpreter,
+        realscript::semantic::SymbolId functionId,
+        const std::vector<realscript::runtime::Value>& arguments,
+        realscript::runtime::ExecutionOptions options = {}) const {
+        return invokeMethod(
+            domain,
+            interpreter,
+            functionId,
+            arguments.data(),
+            arguments.size(),
+            std::move(options));
+    }
+
+    [[nodiscard]] std::uint64_t desktopJitInvokeHits() const noexcept {
+        return desktopJitInvokeHits_.load(std::memory_order_relaxed);
+    }
+    [[nodiscard]] std::uint64_t desktopJitFallbackHits() const noexcept {
+        return desktopJitFallbackHits_.load(std::memory_order_relaxed);
+    }
+    void resetDesktopJitCounters() noexcept {
+        desktopJitInvokeHits_.store(0u, std::memory_order_relaxed);
+        desktopJitFallbackHits_.store(0u, std::memory_order_relaxed);
+    }
+
 private:
     class DomainPolicy final : public realscript::runtime::IExecutionPolicy {
     public:
@@ -329,8 +393,8 @@ private:
     std::shared_ptr<realscript::runtime::NativeHandleRegistry> nativeHandles_;
     DomainKind activeDomain_ = DomainKind::UiPresentation;
 
-    DomainPolicy simPolicy_;
-    DomainPolicy uiPolicy_;
+    mutable DomainPolicy simPolicy_;
+    mutable DomainPolicy uiPolicy_;
 
     mutable std::mutex mutex_;
     mutable std::unordered_map<realscript::semantic::SymbolId, TypeObservableMeta> typeMeta_;
@@ -345,6 +409,9 @@ private:
     UiTaskId nextUiTaskId_ = 1;
     std::vector<std::unique_ptr<UiAsyncTaskFrame>> uiTasks_;
     std::unordered_set<std::uint32_t> cancelledControlSlots_;
+    DesktopJitInvokerFn desktopJitInvoker_{};
+    mutable std::atomic<std::uint64_t> desktopJitInvokeHits_{0u};
+    mutable std::atomic<std::uint64_t> desktopJitFallbackHits_{0u};
 };
 
 } // namespace aero

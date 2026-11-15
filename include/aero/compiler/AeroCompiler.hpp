@@ -11,7 +11,13 @@
 #include "aero/core/RsAliases.hpp"
 #include "realscript/compiler/Compilation.h"
 
+namespace realscript::jit {
+class StencilModule;
+} // namespace realscript::jit
+
 namespace aero {
+
+class ExecutionDomainContext;
 
 using SourceFile = rs_comp::SourceFile;
 
@@ -34,6 +40,11 @@ struct AeroCompileInput {
     std::string resourceSearchRoot;
     std::vector<std::string> resourceSearchPaths;
     bool autoMergeGlobalResources = true;
+
+    // Wave 2B: MIR/bytecode optimization (-O2), shared CompilerSession, and standard reactive macros ([Signal]/[RelayCommand])
+    bool optimizeBytecode = false;
+    rs_comp::CompilerSession* compilerSession = nullptr;
+    bool enableReactiveMacros = true;
 };
 
 struct AeroViewAotCppOutput {
@@ -96,5 +107,12 @@ private:
         const AeroCompileInput& input,
         std::vector<std::string>& activeIncludeStack) const;
 };
+
+// Attaches an optional desktop-only RealScript::StencilJit invoker hook to ExecutionDomainContext.
+// Compiler/desktop host targets only (never linked into SlimRuntime / Wasm targets).
+bool AttachDesktopStencilJit(
+    ExecutionDomainContext& domains,
+    realscript::jit::StencilModule* uiModule,
+    realscript::jit::StencilModule* simModule = nullptr);
 
 } // namespace aero

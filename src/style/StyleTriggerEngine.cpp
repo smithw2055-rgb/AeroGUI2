@@ -1942,6 +1942,174 @@ namespace {
     return true;
 }
 
+[[nodiscard]] std::int64_t CoerceCommandIntParam(
+    const ExecutionDomainContext* domains,
+    const ProgramImage* prog,
+    const UnifiedValue& p) {
+    std::int64_t iv = 0;
+    if (p.tryGetInt64(iv)) return iv;
+    EnumValue ev{};
+    if (p.tryGetEnum(ev)) return ev.value;
+    float fv = 0.0f;
+    if (TryGetFloat(p, fv)) return static_cast<std::int64_t>(std::llround(fv));
+    if (const auto* sv = std::get_if<StringValue>(&p)) {
+        const std::string_view v = sv->view();
+        const auto [ptr, ec] = std::from_chars(v.data(), v.data() + v.size(), iv);
+        if (ec == std::errc{} && ptr == v.data() + v.size()) return iv;
+        if (prog) {
+            for (const auto& mod : prog->modules()) {
+                for (const auto& ets : mod.types) {
+                    if (ets.kind == rs_sem::TypeKind::Enum &&
+                        TryResolveEnumMemberByName(prog, ets.id, v, iv)) {
+                        return iv;
+                    }
+                }
+            }
+        }
+    }
+    if (domains) {
+        if (const auto* sref = std::get_if<ObjectRef>(&p); sref && sref->valid()) {
+            if (const auto sv = domains->stringViewAcrossDomains(*sref)) {
+                const auto [ptr, ec] = std::from_chars(sv->data(), sv->data() + sv->size(), iv);
+                if (ec == std::errc{} && ptr == sv->data() + sv->size()) return iv;
+            }
+        }
+    }
+    return 0;
+}
+
+template <typename FindMethodFn, typename InvokeMethodFn>
+[[nodiscard]] bool TryDispatchCommandMethodByParam(
+    ExecutionDomainContext* domains,
+    const ProgramImage* prog,
+    ObjectRef cmdObj,
+    const UnifiedValue& rawParam,
+    bool hasParam,
+    FindMethodFn&& findMethod,
+    InvokeMethodFn&& invokeMethod) {
+    // Pass 1: exact runtime parameter-type match (or 0-arg match when no parameter was provided)
+    if (!hasParam) {
+        if (const SymbolId mSym = findMethod(rs_sem::PrimitiveType::Void, true)) {
+            return invokeMethod(mSym, {cmdObj});
+        }
+    } else {
+        if (std::holds_alternative<bool>(rawParam)) {
+            if (const SymbolId mSym = findMethod(rs_sem::PrimitiveType::Bool, false)) {
+                return invokeMethod(mSym, {cmdObj, rawParam});
+            }
+        } else if (std::holds_alternative<std::int64_t>(rawParam) ||
+                   std::holds_alternative<EnumValue>(rawParam)) {
+            if (const SymbolId mSym = findMethod(rs_sem::PrimitiveType::Int, false)) {
+                return invokeMethod(mSym, {cmdObj, value::FromInt(CoerceCommandIntParam(domains, prog, rawParam))});
+            }
+        } else if (std::holds_alternative<FloatValue>(rawParam)) {
+            if (const SymbolId mSym = findMethod(rs_sem::PrimitiveType::Float, false)) {
+                return invokeMethod(mSym, {cmdObj, rawParam});
+            }
+            if (const SymbolId mSym = findMethod(rs_sem::PrimitiveType::Double, false)) {
+                float fv = 0.0f;
+                (void)TryGetFloat(rawParam, fv);
+                return invokeMethod(mSym, {cmdObj, UnifiedValue(static_cast<double>(fv))});
+            }
+        } else if (std::holds_alternative<double>(rawParam)) {
+            if (const SymbolId mSym = findMethod(rs_sem::PrimitiveType::Double, false)) {
+                return invokeMethod(mSym, {cmdObj, rawParam});
+            }
+            if (const SymbolId mSym = findMethod(rs_sem::PrimitiveType::Float, false)) {
+                return invokeMethod(mSym, {cmdObj, value::FromFloat(static_cast<float>(std::get<double>(rawParam)))});
+            }
+        } else if (std::holds_alternative<NativeHandle>(rawParam)) {
+            if (const SymbolId mSym = findMethod(rs_sem::PrimitiveType::Handle, false)) {
+                return invokeMethod(mSym, {cmdObj, rawParam});
+            }
+        } else if (std::holds_alternative<StringValue>(rawParam)) {
+            if (const SymbolId mSym = findMethod(rs_sem::PrimitiveType::String, false)) {
+                UnifiedValue strArg{};
+                if (auto alloc = domains->uiHeap().allocateString(std::string(std::get<StringValue>(rawParam).view()))) {
+                    strArg = *alloc;
+                }
+                return invokeMethod(mSym, {cmdObj, strArg});
+            }
+        } else if (const auto* oref = std::get_if<ObjectRef>(&rawParam); oref && oref->valid()) {
+            if (oref->kind == ObjectKind::String) {
+                if (const SymbolId mSym = findMethod(rs_sem::PrimitiveType::String, false)) {
+                    return invokeMethod(mSym, {cmdObj, *oref});
+                }
+            } else if (const SymbolId mSym = findMethod(rs_sem::PrimitiveType::Object, false)) {
+                return invokeMethod(mSym, {cmdObj, *oref});
+            }
+        }
+    }
+
+    // Pass 2: TypedRelayCommand<T> / coercion fallback (e.g. XAML CommandParameter="42" -> RelayCommand<int>)
+    if (const SymbolId mSym = findMethod(rs_sem::PrimitiveType::String, false)) {
+        UnifiedValue strArg{};
+        if (hasParam) {
+            if (const auto* sref = std::get_if<ObjectRef>(&rawParam); sref && sref->valid() && sref->kind == ObjectKind::String) {
+                strArg = *sref;
+            } else {
+                const std::string s = FormatBindingString({}, &rawParam, 1u, domains);
+                if (auto alloc = domains->uiHeap().allocateString(s)) strArg = *alloc;
+            }
+        } else if (auto alloc = domains->uiHeap().allocateString("")) {
+            strArg = *alloc;
+        }
+        return invokeMethod(mSym, {cmdObj, strArg});
+    }
+    if (const SymbolId mSym = findMethod(rs_sem::PrimitiveType::Int, false)) {
+        return invokeMethod(mSym, {cmdObj, value::FromInt(hasParam ? CoerceCommandIntParam(domains, prog, rawParam) : 0)});
+    }
+    if (const SymbolId mSym = findMethod(rs_sem::PrimitiveType::Float, false)) {
+        float fv = 0.0f;
+        if (hasParam && !TryGetFloat(rawParam, fv)) {
+            fv = static_cast<float>(CoerceCommandIntParam(domains, prog, rawParam));
+        }
+        return invokeMethod(mSym, {cmdObj, value::FromFloat(fv)});
+    }
+    if (const SymbolId mSym = findMethod(rs_sem::PrimitiveType::Double, false)) {
+        float fv = 0.0f;
+        if (hasParam && !TryGetFloat(rawParam, fv)) {
+            fv = static_cast<float>(CoerceCommandIntParam(domains, prog, rawParam));
+        }
+        return invokeMethod(mSym, {cmdObj, UnifiedValue(static_cast<double>(fv))});
+    }
+    if (const SymbolId mSym = findMethod(rs_sem::PrimitiveType::Bool, false)) {
+        bool bv = false;
+        if (hasParam && !rawParam.tryGetBool(bv)) {
+            if (const auto* sv = std::get_if<StringValue>(&rawParam)) {
+                bv = (sv->view() == "True" || sv->view() == "true" || sv->view() == "1");
+            } else {
+                bv = (CoerceCommandIntParam(domains, prog, rawParam) != 0);
+            }
+        }
+        return invokeMethod(mSym, {cmdObj, value::FromBool(bv)});
+    }
+    if (const SymbolId mSym = findMethod(rs_sem::PrimitiveType::Handle, false)) {
+        NativeHandle nh{};
+        if (hasParam) {
+            (void)rawParam.tryGetNativeHandle(nh);
+        }
+        return invokeMethod(mSym, {cmdObj, UnifiedValue{nh}});
+    }
+    if (const SymbolId mSym = findMethod(rs_sem::PrimitiveType::Object, false)) {
+        UnifiedValue objArg{NullObject{}};
+        if (hasParam) {
+            if (const auto* oref = std::get_if<ObjectRef>(&rawParam); oref && oref->valid()) {
+                objArg = *oref;
+            } else if (const auto* sv = std::get_if<StringValue>(&rawParam)) {
+                if (auto alloc = domains->uiHeap().allocateString(std::string(sv->view()))) {
+                    objArg = *alloc;
+                }
+            }
+        }
+        return invokeMethod(mSym, {cmdObj, objArg});
+    }
+    if (const SymbolId mSym = findMethod(rs_sem::PrimitiveType::Void, true)) {
+        return invokeMethod(mSym, {cmdObj});
+    }
+    return false;
+}
+
 } // namespace
 
 [[nodiscard]] bool TryInvokeCommandObjectOnOwner(
@@ -1999,10 +2167,12 @@ namespace {
                 const std::string cGetterName = "Get" + std::string(propName);
                 for (const auto& m : ts->methods) {
                     if ((m.name == getterName || m.name == cGetterName) && !m.staticMethod && m.parameters.size() == 1u && m.id != 0) {
-                        if (interp) {
+                        if (interp || domains->hasDesktopJitInvoker()) {
                             rs_rt::ExecutionOptions gOpts{};
                             gOpts.limits.instructionBudget = 1'000'000;
-                            const auto gRes = interp->invoke(m.id, {ownerObj}, gOpts);
+                            const UnifiedValue arg0{ownerObj};
+                            const auto gRes = domains->invokeMethod(
+                                DomainKind::Ui, interp, m.id, &arg0, 1u, gOpts);
                             if (gRes.succeeded) {
                                 if (const auto* r = std::get_if<ObjectRef>(&gRes.value); r && r->valid()) {
                                     cmdObj = *r;
@@ -2078,10 +2248,10 @@ namespace {
 
     auto invokeCmdMethod = [&](SymbolId mSym, const std::vector<UnifiedValue>& callArgs) -> bool {
         if (mSym == 0) return false;
-        if (interp) {
+        if (interp || domains->hasDesktopJitInvoker()) {
             rs_rt::ExecutionOptions opts{};
             opts.limits.instructionBudget = 5'000'000;
-            return interp->invoke(mSym, callArgs, opts).succeeded;
+            return domains->invokeMethod(DomainKind::Ui, interp, mSym, callArgs, opts).succeeded;
         }
         if (aotCtx) {
             UnifiedValue ret{};
@@ -2091,32 +2261,7 @@ namespace {
     };
 
     auto coerceIntParam = [&](const UnifiedValue& p) -> std::int64_t {
-        std::int64_t iv = 0;
-        if (p.tryGetInt64(iv)) return iv;
-        EnumValue ev{};
-        if (p.tryGetEnum(ev)) return ev.value;
-        float fv = 0.0f;
-        if (TryGetFloat(p, fv)) return static_cast<std::int64_t>(std::llround(fv));
-        if (const auto* sv = std::get_if<StringValue>(&p)) {
-            const std::string_view v = sv->view();
-            const auto [ptr, ec] = std::from_chars(v.data(), v.data() + v.size(), iv);
-            if (ec == std::errc{} && ptr == v.data() + v.size()) return iv;
-            for (const auto& mod : prog->modules()) {
-                for (const auto& ets : mod.types) {
-                    if (ets.kind == rs_sem::TypeKind::Enum &&
-                        TryResolveEnumMemberByName(prog, ets.id, v, iv)) {
-                        return iv;
-                    }
-                }
-            }
-        }
-        if (const auto* sref = std::get_if<ObjectRef>(&p); sref && sref->valid()) {
-            if (const auto sv = domains->stringViewAcrossDomains(*sref)) {
-                const auto [ptr, ec] = std::from_chars(sv->data(), sv->data() + sv->size(), iv);
-                if (ec == std::errc{} && ptr == sv->data() + sv->size()) return iv;
-            }
-        }
-        return 0;
+        return CoerceCommandIntParam(domains, prog, p);
     };
 
     if (hasExecInt) {
@@ -2151,136 +2296,9 @@ namespace {
         return invokeCmdMethod(mSym, {cmdObj});
     }
 
-    // TypedRelayCommand<T> / TypedDelegateCommand<T> or custom ICommand implementation
-    // Pass 1: exact runtime parameter-type match (or 0-arg match when no parameter was provided)
-    if (!hasParam) {
-        if (const SymbolId mSym = findExecMethod(rs_sem::PrimitiveType::Void, true)) {
-            return invokeCmdMethod(mSym, {cmdObj});
-        }
-    } else {
-        if (std::holds_alternative<bool>(rawParam)) {
-            if (const SymbolId mSym = findExecMethod(rs_sem::PrimitiveType::Bool, false)) {
-                return invokeCmdMethod(mSym, {cmdObj, rawParam});
-            }
-        } else if (std::holds_alternative<std::int64_t>(rawParam) ||
-                   std::holds_alternative<EnumValue>(rawParam)) {
-            if (const SymbolId mSym = findExecMethod(rs_sem::PrimitiveType::Int, false)) {
-                return invokeCmdMethod(mSym, {cmdObj, value::FromInt(coerceIntParam(rawParam))});
-            }
-        } else if (std::holds_alternative<FloatValue>(rawParam)) {
-            if (const SymbolId mSym = findExecMethod(rs_sem::PrimitiveType::Float, false)) {
-                return invokeCmdMethod(mSym, {cmdObj, rawParam});
-            }
-            if (const SymbolId mSym = findExecMethod(rs_sem::PrimitiveType::Double, false)) {
-                float fv = 0.0f;
-                (void)TryGetFloat(rawParam, fv);
-                return invokeCmdMethod(mSym, {cmdObj, UnifiedValue(static_cast<double>(fv))});
-            }
-        } else if (std::holds_alternative<double>(rawParam)) {
-            if (const SymbolId mSym = findExecMethod(rs_sem::PrimitiveType::Double, false)) {
-                return invokeCmdMethod(mSym, {cmdObj, rawParam});
-            }
-            if (const SymbolId mSym = findExecMethod(rs_sem::PrimitiveType::Float, false)) {
-                return invokeCmdMethod(mSym, {cmdObj, value::FromFloat(static_cast<float>(std::get<double>(rawParam)))});
-            }
-        } else if (std::holds_alternative<NativeHandle>(rawParam)) {
-            if (const SymbolId mSym = findExecMethod(rs_sem::PrimitiveType::Handle, false)) {
-                return invokeCmdMethod(mSym, {cmdObj, rawParam});
-            }
-        } else if (std::holds_alternative<StringValue>(rawParam)) {
-            if (const SymbolId mSym = findExecMethod(rs_sem::PrimitiveType::String, false)) {
-                UnifiedValue strArg{};
-                if (auto alloc = domains->uiHeap().allocateString(std::string(std::get<StringValue>(rawParam).view()))) {
-                    strArg = *alloc;
-                }
-                return invokeCmdMethod(mSym, {cmdObj, strArg});
-            }
-        } else if (const auto* oref = std::get_if<ObjectRef>(&rawParam); oref && oref->valid()) {
-            if (oref->kind == ObjectKind::String) {
-                if (const SymbolId mSym = findExecMethod(rs_sem::PrimitiveType::String, false)) {
-                    return invokeCmdMethod(mSym, {cmdObj, *oref});
-                }
-            } else {
-                if (const SymbolId mSym = findExecMethod(rs_sem::PrimitiveType::Object, false)) {
-                    return invokeCmdMethod(mSym, {cmdObj, *oref});
-                }
-            }
-        }
-    }
-
-    // Pass 2: TypedRelayCommand<T> / coercion fallback (e.g. XAML CommandParameter="42" -> RelayCommand<int>)
-    if (const SymbolId mSym = findExecMethod(rs_sem::PrimitiveType::String, false)) {
-        UnifiedValue strArg{};
-        if (hasParam) {
-            if (const auto* sref = std::get_if<ObjectRef>(&rawParam); sref && sref->valid() && sref->kind == ObjectKind::String) {
-                strArg = *sref;
-            } else {
-                const std::string s = FormatBindingString({}, &rawParam, 1u, domains);
-                if (auto alloc = domains->uiHeap().allocateString(s)) strArg = *alloc;
-            }
-        } else if (auto alloc = domains->uiHeap().allocateString("")) {
-            strArg = *alloc;
-        }
-        return invokeCmdMethod(mSym, {cmdObj, strArg});
-    }
-    if (const SymbolId mSym = findExecMethod(rs_sem::PrimitiveType::Int, false)) {
-        return invokeCmdMethod(mSym, {cmdObj, value::FromInt(hasParam ? coerceIntParam(rawParam) : 0)});
-    }
-    if (const SymbolId mSym = findExecMethod(rs_sem::PrimitiveType::Float, false)) {
-        float fv = 0.0f;
-        if (hasParam) {
-            if (!TryGetFloat(rawParam, fv)) {
-                fv = static_cast<float>(coerceIntParam(rawParam));
-            }
-        }
-        return invokeCmdMethod(mSym, {cmdObj, value::FromFloat(fv)});
-    }
-    if (const SymbolId mSym = findExecMethod(rs_sem::PrimitiveType::Double, false)) {
-        float fv = 0.0f;
-        if (hasParam) {
-            if (!TryGetFloat(rawParam, fv)) {
-                fv = static_cast<float>(coerceIntParam(rawParam));
-            }
-        }
-        return invokeCmdMethod(mSym, {cmdObj, UnifiedValue(static_cast<double>(fv))});
-    }
-    if (const SymbolId mSym = findExecMethod(rs_sem::PrimitiveType::Bool, false)) {
-        bool bv = false;
-        if (hasParam) {
-            if (!rawParam.tryGetBool(bv)) {
-                if (const auto* sv = std::get_if<StringValue>(&rawParam)) {
-                    bv = (sv->view() == "True" || sv->view() == "true" || sv->view() == "1");
-                } else {
-                    bv = (coerceIntParam(rawParam) != 0);
-                }
-            }
-        }
-        return invokeCmdMethod(mSym, {cmdObj, value::FromBool(bv)});
-    }
-    if (const SymbolId mSym = findExecMethod(rs_sem::PrimitiveType::Handle, false)) {
-        NativeHandle nh{};
-        if (hasParam) {
-            (void)rawParam.tryGetNativeHandle(nh);
-        }
-        return invokeCmdMethod(mSym, {cmdObj, UnifiedValue{nh}});
-    }
-    if (const SymbolId mSym = findExecMethod(rs_sem::PrimitiveType::Object, false)) {
-        UnifiedValue objArg{NullObject{}};
-        if (hasParam) {
-            if (const auto* oref = std::get_if<ObjectRef>(&rawParam); oref && oref->valid()) {
-                objArg = *oref;
-            } else if (const auto* sv = std::get_if<StringValue>(&rawParam)) {
-                if (auto alloc = domains->uiHeap().allocateString(std::string(sv->view()))) {
-                    objArg = *alloc;
-                }
-            }
-        }
-        return invokeCmdMethod(mSym, {cmdObj, objArg});
-    }
-    if (const SymbolId mSym = findExecMethod(rs_sem::PrimitiveType::Void, true)) {
-        return invokeCmdMethod(mSym, {cmdObj});
-    }
-    return false;
+    // TypedRelayCommand<T> / TypedDelegateCommand<T> / [RelayCommand] or custom ICommand
+    return TryDispatchCommandMethodByParam(
+        domains, prog, cmdObj, rawParam, hasParam, findExecMethod, invokeCmdMethod);
 }
 
 bool TryEvaluateCommandCanExecuteOnOwner(
@@ -2339,10 +2357,12 @@ bool TryEvaluateCommandCanExecuteOnOwner(
                 const std::string getterName = "get_" + std::string(propName);
                 for (const auto& m : ts->methods) {
                     if (m.name == getterName && !m.staticMethod && m.parameters.size() == 1u && m.id != 0) {
-                        if (interp) {
+                        if (interp || domains->hasDesktopJitInvoker()) {
                             rs_rt::ExecutionOptions gOpts{};
                             gOpts.limits.instructionBudget = 500'000;
-                            const auto gRes = interp->invoke(m.id, {ownerObj}, gOpts);
+                            const UnifiedValue arg0{ownerObj};
+                            const auto gRes = domains->invokeMethod(
+                                DomainKind::Ui, interp, m.id, &arg0, 1u, gOpts);
                             if (gRes.succeeded) {
                                 if (const auto* r = std::get_if<ObjectRef>(&gRes.value); r && r->valid()) {
                                     cmdObj = *r;
@@ -2393,12 +2413,33 @@ bool TryEvaluateCommandCanExecuteOnOwner(
         return false;
     };
 
+    auto hasDeclaredField = [&](std::string_view fn) -> bool {
+        SymbolId walk = cmdTid;
+        for (int d = 0; d < 16 && walk != 0; ++d) {
+            const auto* ts = prog->resolveType(walk);
+            if (!ts) break;
+            for (const auto& f : ts->fields) {
+                if (f.name == fn) return true;
+            }
+            walk = ts->baseTypeId;
+        }
+        return false;
+    };
+
     const bool hasCanInt = hasNonNullField("_canExecInt");
     const bool hasCanStr = hasNonNullField("_canExecStr");
     const bool hasCanHandle = hasNonNullField("_canExecHandle");
     const bool hasCan0 = hasNonNullField("_canExec0");
     const bool hasGenericCan = hasNonNullField("_canExec");
-    if (!hasCanInt && !hasCanStr && !hasCanHandle && !hasCan0 && !hasGenericCan) {
+    const bool hasDelegateCanField =
+        hasDeclaredField("_canExecInt") ||
+        hasDeclaredField("_canExecStr") ||
+        hasDeclaredField("_canExecHandle") ||
+        hasDeclaredField("_canExec0") ||
+        hasDeclaredField("_canExec");
+    const bool hasAnyDelegateCan =
+        hasCanInt || hasCanStr || hasCanHandle || hasCan0 || hasGenericCan;
+    if (hasDelegateCanField && !hasAnyDelegateCan) {
         return false; // No CanExecute predicate supplied -> leave XAML/style IsEnabled untouched
     }
 
@@ -2421,10 +2462,10 @@ bool TryEvaluateCommandCanExecuteOnOwner(
 
     auto invokeCanMethod = [&](SymbolId mSym, const std::vector<UnifiedValue>& callArgs) -> bool {
         if (mSym == 0) return false;
-        if (interp) {
+        if (interp || domains->hasDesktopJitInvoker()) {
             rs_rt::ExecutionOptions opts{};
             opts.limits.instructionBudget = 1'000'000;
-            const auto r = interp->invoke(mSym, callArgs, opts);
+            const auto r = domains->invokeMethod(DomainKind::Ui, interp, mSym, callArgs, opts);
             if (r.succeeded) {
                 if (const auto* b = std::get_if<bool>(&r.value)) {
                     outCanExecute = *b;
@@ -2447,9 +2488,9 @@ bool TryEvaluateCommandCanExecuteOnOwner(
         return invokeCanMethod(findCanMethod(rs_sem::PrimitiveType::Void, true), {cmdObj});
     }
     if (hasCanInt) {
-        std::int64_t iv = 0;
-        if (hasParam) (void)rawParam.tryGetInt64(iv);
-        return invokeCanMethod(findCanMethod(rs_sem::PrimitiveType::Int, false), {cmdObj, value::FromInt(iv)});
+        return invokeCanMethod(
+            findCanMethod(rs_sem::PrimitiveType::Int, false),
+            {cmdObj, value::FromInt(hasParam ? CoerceCommandIntParam(domains, prog, rawParam) : 0)});
     }
     if (hasCanStr || hasGenericCan) {
         if (const SymbolId mSym = findCanMethod(rs_sem::PrimitiveType::String, false)) {
@@ -2467,9 +2508,9 @@ bool TryEvaluateCommandCanExecuteOnOwner(
             return invokeCanMethod(mSym, {cmdObj, strArg});
         }
         if (const SymbolId mSym = findCanMethod(rs_sem::PrimitiveType::Int, false)) {
-            std::int64_t iv = 0;
-            if (hasParam) (void)rawParam.tryGetInt64(iv);
-            return invokeCanMethod(mSym, {cmdObj, value::FromInt(iv)});
+            return invokeCanMethod(
+                mSym,
+                {cmdObj, value::FromInt(hasParam ? CoerceCommandIntParam(domains, prog, rawParam) : 0)});
         }
     }
     if (hasCanHandle) {
@@ -2477,7 +2518,10 @@ bool TryEvaluateCommandCanExecuteOnOwner(
         if (hasParam) (void)rawParam.tryGetNativeHandle(nh);
         return invokeCanMethod(findCanMethod(rs_sem::PrimitiveType::Handle, false), {cmdObj, UnifiedValue{nh}});
     }
-    return false;
+
+    // [RelayCommand] macro-generated command types (<Type>__<Method>Command with _owner) or custom ICommand
+    return TryDispatchCommandMethodByParam(
+        domains, prog, cmdObj, rawParam, hasParam, findCanMethod, invokeCanMethod);
 }
 
 void StyleTriggerEngine::ExecuteSingleInteractionAction(
@@ -2725,8 +2769,8 @@ void StyleTriggerEngine::ExecuteSingleInteractionAction(
                         const SymbolId mSym = FindMethodInHierarchy(program_, domains_, wrapTid, navMethod, isSim);
                         if (mSym != 0) {
                             std::vector<UnifiedValue> args{wrapperObj};
-                            if (uiInterpreter_) {
-                                (void)uiInterpreter_->invoke(mSym, args);
+                            if (uiInterpreter_ || domains_->hasDesktopJitInvoker()) {
+                                (void)domains_->invokeMethod(DomainKind::Ui, uiInterpreter_, mSym, args);
                             } else if (aotContext_) {
                                 UnifiedValue ret{};
                                 (void)aotContext_->invoke(mSym, args.data(), args.size(), ret);
@@ -3012,11 +3056,15 @@ void StyleTriggerEngine::ExecuteSingleInteractionAction(
                         args.push_back(paramVal);
                     }
                 }
-                auto res = uiInterpreter_->invoke(methodSym, args);
+                auto res = domains_
+                    ? domains_->invokeMethod(DomainKind::Ui, uiInterpreter_, methodSym, args)
+                    : uiInterpreter_->invoke(methodSym, args);
                 if (!res.succeeded && res.error.code == ErrorCode::InvalidArguments &&
                     res.statistics.instructionsExecuted == 0u && args.size() > 1u) {
                     args.resize(1u);
-                    (void)uiInterpreter_->invoke(methodSym, args);
+                    (void)(domains_
+                        ? domains_->invokeMethod(DomainKind::Ui, uiInterpreter_, methodSym, args)
+                        : uiInterpreter_->invoke(methodSym, args));
                 }
             } else if (aotContext_) {
                 std::vector<UnifiedValue> args{targetObj};

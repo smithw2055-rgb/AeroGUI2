@@ -16,6 +16,7 @@
 #include "aero/render/PagedRenderTree.hpp"
 #include "aero/render/ZeroCopyGpuStream.hpp"
 #include "aero/style/StyleTriggerEngine.hpp"
+#include "realscript/jit/StencilJit.h"
 
 namespace fs = std::filesystem;
 
@@ -2792,6 +2793,502 @@ namespace PostPatchConvTest
     }
 }
 
+void TestThreeWayPartialReactiveMvvmWithSignalsRelayCommandAndSimCommand() {
+    using namespace aero;
+    std::error_code ec;
+    const fs::path tmpDir = fs::path(AERO_TEST_TEMP_DIR) / "wave2b_three_way_partial";
+    fs::remove_all(tmpDir, ec);
+    fs::create_directories(tmpDir, ec);
+
+    {
+        std::ofstream f(tmpDir / "MainWindow.xaml", std::ios::binary);
+        f << R"XAML(<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        x:Class="ReactiveWave2B.MainWindow"
+        Title="Wave2B Partial MVVM" Width="800" Height="480">
+  <StackPanel Margin="12">
+    <TextBlock x:Name="ScoreText" Text="{Binding Score}"/>
+    <TextBlock x:Name="StatusText" Text="{Binding LastTag}"/>
+    <Button x:Name="AttackBtn" Content="Attack" Command="{Binding AttackCommand}" CommandParameter="25"/>
+    <Button x:Name="PingBtn" Content="Ping" Command="{Binding PingCommand}"/>
+    <Button x:Name="ClassicBtn" Content="Classic" Command="{Binding ClassicCmd}"/>
+    <Button x:Name="BoostBtn" Content="Boost" Click="BoostBtn_Click"/>
+  </StackPanel>
+</Window>)XAML";
+    }
+
+    // 3-way partial ViewModel Part 1: [Observable], [Signal] declarations, classic RelayCommand
+    {
+        std::ofstream f(tmpDir / "BattleViewModel.Core.cs", std::ios::binary);
+        f << R"CS(using System;
+using Aero.UI;
+
+namespace ReactiveWave2B
+{
+    public partial class BattleViewModel
+    {
+        [Observable]
+        public int Score { get; set; } = 10;
+
+        [Observable]
+        public string LastTag { get; set; } = "idle";
+
+        public bool AttackUnlocked = false;
+        public int AttackTotal = 0;
+        public int PingCount = 0;
+        public int ClassicCount = 0;
+        public int SignalPowerSum = 0;
+        public int PulseSum = 0;
+        public int SimCommitted = 0;
+        public int CanExecChangedEvents = 0;
+
+        private RelayCommand _classicCmd;
+        public RelayCommand ClassicCmd { get { return _classicCmd; } }
+
+        [Signal]
+        public partial void StrikeLanded(int power, string tag);
+
+        [Signal]
+        partial void InternalPulse(int seq);
+
+        public BattleViewModel()
+        {
+            _classicCmd = new RelayCommand(() => { ClassicCount = ClassicCount + 1; });
+            SubscribeStrikeLanded((int p, string tag) => {
+                SignalPowerSum = SignalPowerSum + p;
+                LastTag = tag;
+            });
+            SubscribeInternalPulse((int s) => {
+                PulseSum = PulseSum + s;
+            });
+            AttackCommand.SubscribeCanExecuteChanged(() => {
+                CanExecChangedEvents = CanExecChangedEvents + 1;
+            });
+        }
+    }
+}
+)CS";
+    }
+
+    // 3-way partial ViewModel Part 2: [RelayCommand] + [SimCommand] (3rd partial emitted by StandardReactiveMacroPlugin)
+    {
+        std::ofstream f(tmpDir / "BattleViewModel.Commands.cs", std::ios::binary);
+        f << R"CS(using Aero.UI;
+
+namespace ReactiveWave2B
+{
+    public partial class BattleViewModel
+    {
+        [RelayCommand(CanExecute = "CanAttack")]
+        public void Attack(int power)
+        {
+            AttackTotal = AttackTotal + power;
+            Score = Score + power;
+            StrikeLanded(power, "crit");
+            InternalPulse(7);
+        }
+
+        private bool CanAttack(int power)
+        {
+            return AttackUnlocked && power > 0;
+        }
+
+        [RelayCommand]
+        public void Ping()
+        {
+            PingCount = PingCount + 1;
+            AttackUnlocked = true;
+            NotifyAttackCanExecuteChanged();
+        }
+
+        [SimCommand]
+        public void CommitSimStrike(int bonus)
+        {
+            SimCommitted = SimCommitted + bonus;
+        }
+    }
+}
+)CS";
+    }
+
+    // 3-way partial MainWindow: MainWindow.g.rs (XAML) + MainWindow.xaml.cs + StandardReactiveMacroPlugin
+    {
+        std::ofstream f(tmpDir / "MainWindow.xaml.cs", std::ios::binary);
+        f << R"CS(using System;
+using System.Windows;
+using Aero.UI;
+
+namespace ReactiveWave2B
+{
+    public partial class MainWindow : Window
+    {
+        public BattleViewModel Vm { get; set; }
+        public int WindowPingHits { get; set; } = 0;
+        public int WindowSignalCode { get; set; } = 0;
+
+        [Signal]
+        public partial void WindowReady(int code);
+
+        [RelayCommand]
+        public void WindowPing()
+        {
+            WindowPingHits = WindowPingHits + 1;
+        }
+
+        public MainWindow()
+        {
+            InitializeComponent();
+            Vm = new BattleViewModel();
+            DataContext = Vm;
+            SubscribeWindowReady((int c) => { WindowSignalCode = c; });
+            WindowReady(88);
+            WindowPingCommand.Execute();
+        }
+
+        public void BoostBtn_Click(object sender, RoutedEventArgs e)
+        {
+            if (Vm != null)
+            {
+                Vm.CommitSimStrike(15);
+            }
+        }
+    }
+}
+)CS";
+    }
+
+    XamlApplication app;
+    std::string err;
+    CHECK(app.Load((tmpDir / "MainWindow.xaml").string(), &err));
+    if (!app.MainWindowElement()) {
+        std::cerr << "[TestThreeWayPartial] Load error: " << err << std::endl;
+    }
+    auto* root = app.MainWindowElement();
+    CHECK(root != nullptr);
+    auto* scoreTb = root && root->FindName("ScoreText") ? root->FindName("ScoreText")->DynamicCast<TextBlock>() : nullptr;
+    auto* statusTb = root && root->FindName("StatusText") ? root->FindName("StatusText")->DynamicCast<TextBlock>() : nullptr;
+    auto* attackBtn = root && root->FindName("AttackBtn") ? root->FindName("AttackBtn")->DynamicCast<Button>() : nullptr;
+    auto* pingBtn = root && root->FindName("PingBtn") ? root->FindName("PingBtn")->DynamicCast<Button>() : nullptr;
+    auto* classicBtn = root && root->FindName("ClassicBtn") ? root->FindName("ClassicBtn")->DynamicCast<Button>() : nullptr;
+    auto* boostBtn = root && root->FindName("BoostBtn") ? root->FindName("BoostBtn")->DynamicCast<Button>() : nullptr;
+    CHECK(scoreTb && statusTb && attackBtn && pingBtn && classicBtn && boostBtn);
+
+    if (scoreTb && statusTb && attackBtn && pingBtn && classicBtn && boostBtn) {
+        CHECK(scoreTb->GetText() == "10");
+        CHECK(statusTb->GetText() == "idle");
+        // Initial CanAttack(25) == false disables AttackBtn; unconditional PingBtn & ClassicBtn remain enabled
+        CHECK(!attackBtn->IsEnabled());
+        CHECK(pingBtn->IsEnabled());
+        CHECK(classicBtn->IsEnabled());
+
+        // Clicking disabled AttackBtn must not execute Attack(25)
+        (void)attackBtn->PerformClick();
+        app.Tick();
+
+        // Read ViewModel helper
+        const auto* prog = app.Program();
+        CHECK(prog != nullptr);
+        const ObjectRef vmObj = app.DataContextObject();
+        const ObjectRef winObj = app.CodeBehindObject();
+        CHECK(vmObj.valid() && winObj.valid());
+
+        auto readInt = [&](ObjectRef obj, std::string_view member) -> std::int64_t {
+            if (!prog || !obj.valid()) return -999999;
+            auto* heap = app.Domains().heapForObject(obj);
+            if (!heap) return -999999;
+            const auto tid = heap->objectTypeId(obj).value_or(0);
+            if (auto slot = app.Domains().resolvePropertySlot(*prog, tid, member)) {
+                UnifiedValue v{};
+                if (app.Domains().readPropertySlotFast(DomainKind::Ui, obj, *slot, v, nullptr, app.ScriptInterpreter())) {
+                    std::int64_t out = 0;
+                    if (v.tryGetInt64(out)) return out;
+                }
+            }
+            if (const auto* ts = prog->resolveType(tid)) {
+                for (const auto& f : ts->fields) {
+                    if (f.name == member) {
+                        UnifiedValue fv{};
+                        if (app.Domains().readObjectField(DomainKind::Ui, obj, f.index, fv)) {
+                            std::int64_t out = 0;
+                            if (fv.tryGetInt64(out)) return out;
+                        }
+                    }
+                }
+            }
+            return -999999;
+        };
+
+        CHECK(readInt(winObj, "WindowSignalCode") == 88);
+        CHECK(readInt(winObj, "WindowPingHits") == 1);
+        CHECK(readInt(vmObj, "AttackTotal") == 0);
+
+        // Click PingBtn -> unlocks AttackUnlocked and fires NotifyAttackCanExecuteChanged
+        CHECK(pingBtn->PerformClick());
+        app.Tick();
+        CHECK(readInt(vmObj, "PingCount") == 1);
+        CHECK(readInt(vmObj, "CanExecChangedEvents") == 1);
+        CHECK(attackBtn->IsEnabled());
+
+        // Click AttackBtn -> invokes [RelayCommand] Attack(25), triggers [Signal] StrikeLanded + InternalPulse
+        CHECK(attackBtn->PerformClick());
+        app.Tick();
+        CHECK(readInt(vmObj, "AttackTotal") == 25);
+        CHECK(readInt(vmObj, "SignalPowerSum") == 25);
+        CHECK(readInt(vmObj, "PulseSum") == 7);
+        CHECK(scoreTb->GetText() == "35");
+        CHECK(statusTb->GetText() == "crit");
+
+        // Click Classic Aero.UI::RelayCommand button -> zero collision
+        CHECK(classicBtn->PerformClick());
+        app.Tick();
+        CHECK(readInt(vmObj, "ClassicCount") == 1);
+
+        // Click BoostBtn -> marshals [SimCommand] CommitSimStrike(15) into SimCommandEnvelope
+        CHECK(boostBtn->PerformClick());
+        CHECK(app.Domains().pendingSimCommandCount() == 1u);
+        auto simCommands = app.Domains().consumeSimCommands();
+        CHECK(simCommands.size() == 1u);
+        CHECK(simCommands[0].commandTypeId != 0u);
+        CHECK(simCommands[0].targetObject == vmObj);
+        CHECK(simCommands[0].payload.size() == 1u);
+        std::int64_t payloadBonus = 0;
+        CHECK(simCommands[0].payload[0].tryGetInt64(payloadBonus) && payloadBonus == 15);
+    }
+
+    fs::remove_all(tmpDir, ec);
+}
+
+void TestCompileInputOptimizeO2AndSharedCompilerSession() {
+    using namespace aero;
+    std::error_code ec;
+    const fs::path tmpDir = fs::path(AERO_TEST_TEMP_DIR) / "wave2b_opt_session";
+    fs::remove_all(tmpDir, ec);
+    fs::create_directories(tmpDir, ec);
+
+    {
+        std::ofstream f(tmpDir / "App.xaml", std::ios::binary);
+        f << R"XAML(<Application xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+             StartupUri="MainWindow.xaml">
+  <Application.Resources>
+    <SolidColorBrush x:Key="Wave2BAccent" Color="#FF33AAEE"/>
+  </Application.Resources>
+</Application>)XAML";
+    }
+    {
+        std::ofstream f(tmpDir / "WidgetCard.xaml", std::ios::binary);
+        f << R"XAML(<UserControl xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             x:Class="OptDemo.WidgetCard">
+  <TextBlock x:Name="CardLabel" Text="CardReady"/>
+</UserControl>)XAML";
+    }
+    {
+        std::ofstream f(tmpDir / "MainWindow.xaml", std::ios::binary);
+        f << R"XAML(<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        x:Class="OptDemo.MainWindow">
+  <TextBlock x:Name="OutText" Text="{Binding Summary}"/>
+</Window>)XAML";
+    }
+    {
+        std::ofstream f(tmpDir / "MainWindow.xaml.cs", std::ios::binary);
+        f << R"CS(using System.Windows;
+using Aero.UI;
+
+namespace OptDemo
+{
+    public partial class MainWindow : Window
+    {
+        public string Summary { get; set; } = "Init";
+
+        [Signal]
+        public partial void Computed(int value);
+
+        public static int ConstantFoldCheck()
+        {
+            int a = 10 * 3 + 5;
+            int b = a + 7;
+            return b;
+        }
+
+        public MainWindow()
+        {
+            InitializeComponent();
+            int v = ConstantFoldCheck();
+            Summary = "Fold=" + v;
+            Computed(v);
+        }
+    }
+}
+)CS";
+    }
+
+    XamlApplicationOptions appOpts{};
+    appOpts.appOrWindowXamlPath = (tmpDir / "App.xaml").string();
+    appOpts.optimizeBytecode = true;
+    appOpts.enableReactiveMacros = true;
+
+    XamlApplication app;
+    std::string err;
+    CHECK(app.Load(appOpts, &err));
+    CHECK(app.CompilerSession() != nullptr);
+    const std::size_t unitsAfterLoad = app.CompilerSession() ? app.CompilerSession()->parsedUnitCacheSize() : 0u;
+    const std::size_t modsAfterLoad = app.CompilerSession() ? app.CompilerSession()->moduleFrontendCacheSize() : 0u;
+    CHECK(unitsAfterLoad > 0u);
+    CHECK(modsAfterLoad > 0u);
+
+    auto* root = app.MainWindowElement();
+    auto* outTb = (root && root->FindName("OutText")) ? root->FindName("OutText")->DynamicCast<TextBlock>() : nullptr;
+    CHECK(outTb != nullptr && outTb->GetText() == "Fold=42");
+
+    // Re-compile using the same CompilerSession (-O2 and -O0 parity + cache hit reuse)
+    AeroCompiler compiler;
+    std::string winXml;
+    std::string mainCs;
+    {
+        std::ifstream ifs(tmpDir / "MainWindow.xaml", std::ios::binary);
+        winXml.assign((std::istreambuf_iterator<char>(ifs)), std::istreambuf_iterator<char>());
+    }
+    {
+        std::ifstream ifs(tmpDir / "MainWindow.xaml.cs", std::ios::binary);
+        mainCs.assign((std::istreambuf_iterator<char>(ifs)), std::istreambuf_iterator<char>());
+    }
+
+    AeroCompileInput inO2{};
+    inO2.xamlPath = (tmpDir / "MainWindow.xaml").string();
+    inO2.xamlContent = winXml;
+    inO2.scriptSources = {{(tmpDir / "MainWindow.xaml.cs").string(), mainCs}};
+    inO2.optimizeBytecode = true;
+    inO2.enableReactiveMacros = true;
+    inO2.compilerSession = app.CompilerSession();
+    const AeroCompileResult resO2 = compiler.Compile(inO2);
+    CHECK(resO2.succeeded && resO2.programImage != nullptr);
+    CHECK(app.CompilerSession()->parsedUnitCacheSize() >= unitsAfterLoad);
+
+    AeroCompileInput inO0 = inO2;
+    inO0.optimizeBytecode = false;
+    const AeroCompileResult resO0 = compiler.Compile(inO0);
+    CHECK(resO0.succeeded && resO0.programImage != nullptr);
+
+    if (resO2.programImage && resO0.programImage) {
+        ExecutionDomainContext domO2;
+        Interpreter interpO2(resO2.programImage, domO2.uiHeapPtr());
+        domO2.attachInterpreter(interpO2, DomainKind::UiPresentation);
+        auto r2 = interpO2.invoke("OptDemo::MainWindow.ConstantFoldCheck");
+        std::int64_t v2 = 0;
+        CHECK(r2.succeeded && r2.value.tryGetInt64(v2) && v2 == 42);
+
+        ExecutionDomainContext domO0;
+        Interpreter interpO0(resO0.programImage, domO0.uiHeapPtr());
+        domO0.attachInterpreter(interpO0, DomainKind::UiPresentation);
+        auto r0 = interpO0.invoke("OptDemo::MainWindow.ConstantFoldCheck");
+        std::int64_t v0 = 0;
+        CHECK(r0.succeeded && r0.value.tryGetInt64(v0) && v0 == 42);
+    }
+
+    fs::remove_all(tmpDir, ec);
+}
+
+void TestDesktopStencilJitInvokerHookAndFallback() {
+    using namespace aero;
+    const std::string src = R"CS(
+module JitWave2B;
+
+public int FastSum(int n) {
+    int acc = 0;
+    for (int i = 0; i < n; i = i + 1) {
+        acc = acc + (i * 2 + 1);
+    }
+    return acc;
+}
+
+public class CounterBox {
+    private int _baseVal = 10;
+    public int ComputedTotal {
+        get { return _baseVal + 32; }
+    }
+    public int ComputeWithFallback(string prefix) {
+        return _baseVal + prefix.Length;
+    }
+}
+)CS";
+
+    AeroCompiler compiler;
+    AeroCompileInput in{};
+    in.xamlPath = "JitDummy.xaml";
+    in.xamlContent = R"XAML(<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"><TextBlock Text="Jit"/></Window>)XAML";
+    in.scriptSources = {{"JitWave2B.rs", src}};
+    in.optimizeBytecode = true;
+    const AeroCompileResult res = compiler.Compile(in);
+    CHECK(res.succeeded && res.programImage != nullptr);
+    if (!res.programImage) return;
+
+    realscript::jit::StencilJit sjit;
+    realscript::jit::StencilJitOptions jitOpts{};
+    jitOpts.enableNativeCodegen = true;
+    auto jitCompiled = sjit.compile(res.programImage, jitOpts);
+    CHECK(jitCompiled.succeeded() && jitCompiled.module != nullptr);
+    if (!jitCompiled.module) return;
+
+    ExecutionDomainContext domains;
+    domains.registerProgramObservableMetadata(*res.programImage);
+    Interpreter uiInterp(res.programImage, domains.uiHeapPtr());
+    domains.attachInterpreter(uiInterp, DomainKind::UiPresentation);
+
+    CHECK(AttachDesktopStencilJit(domains, jitCompiled.module.get()));
+    CHECK(domains.hasDesktopJitInvoker());
+
+    const auto fastSym = res.programImage->findFunction("JitWave2B::FastSum");
+    CHECK(fastSym.has_value());
+    if (fastSym) {
+        const UnifiedValue arg0{std::int64_t{6}};
+        const auto jitRes = domains.invokeMethod(DomainKind::UiPresentation, &uiInterp, *fastSym, &arg0, 1u);
+        std::int64_t sumVal = 0;
+        CHECK(jitRes.succeeded && jitRes.value.tryGetInt64(sumVal) && sumVal == 36);
+        CHECK(domains.desktopJitInvokeHits() >= 1u);
+    }
+
+    // Exercise fallback path when a function requires InterpreterFallback or hook declines
+    const std::uint64_t hitsBeforeFallback = domains.desktopJitInvokeHits();
+    const auto fbSym = res.programImage->findFunction("JitWave2B::CounterBox.ComputeWithFallback");
+    const auto boxTid = rs_sem::stableTypeId("JitWave2B::CounterBox");
+    const auto* boxTs = res.programImage->resolveType(boxTid);
+    CHECK(fbSym.has_value() && boxTs != nullptr);
+    if (fbSym && boxTs) {
+        std::vector<UnifiedValue> initFields(boxTs->fields.size(), UnifiedValue{std::int64_t{0}});
+        initFields[0] = UnifiedValue{std::int64_t{10}};
+        auto boxObj = domains.uiHeap().allocateObject(boxTid, std::move(initFields), {});
+        auto prefixStr = domains.uiHeap().allocateString("Aero!");
+        CHECK(boxObj.has_value() && prefixStr.has_value());
+        if (boxObj && prefixStr) {
+            const UnifiedValue args[2]{*boxObj, *prefixStr};
+            const auto fbRes = domains.invokeMethod(DomainKind::UiPresentation, &uiInterp, *fbSym, args, 2u);
+            std::int64_t val = 0;
+            CHECK(fbRes.succeeded && fbRes.value.tryGetInt64(val) && val == 15);
+            // Also verify explicit decline hook triggers fallback counter + interpreter result
+            domains.resetDesktopJitCounters();
+            domains.setDesktopJitInvoker(
+                [](DomainKind, rs_sem::SymbolId, const UnifiedValue*, std::size_t, bool&, UnifiedValue&, RuntimeError&) -> bool {
+                    return false;
+                });
+            const auto explicitFbRes = domains.invokeMethod(DomainKind::UiPresentation, &uiInterp, *fbSym, args, 2u);
+            std::int64_t val2 = 0;
+            CHECK(explicitFbRes.succeeded && explicitFbRes.value.tryGetInt64(val2) && val2 == 15);
+            CHECK(domains.desktopJitFallbackHits() == 1u);
+            (void)hitsBeforeFallback;
+        }
+    }
+
+    domains.clearDesktopJitInvoker();
+    CHECK(!domains.hasDesktopJitInvoker());
+    if (fastSym) {
+        const UnifiedValue arg0{std::int64_t{5}};
+        const auto interpRes = domains.invokeMethod(DomainKind::UiPresentation, &uiInterp, *fastSym, &arg0, 1u);
+        std::int64_t sumVal = 0;
+        CHECK(interpRes.succeeded && interpRes.value.tryGetInt64(sumVal) && sumVal == 25);
+    }
+}
+
 int main() {
     TestWpfDeveloperErgonomicsAndEnhancedControls();
     TestPostPatchReviewFixes();
@@ -2817,6 +3314,9 @@ int main() {
     TestToolTipHoverStabilityAndLayoutIsolation();
     TestNestedBlurAndBackdropBlurParallelRasterization();
     TestVerbatimStringsTypedCommandLoadedAndKeyDownHandled();
+    TestThreeWayPartialReactiveMvvmWithSignalsRelayCommandAndSimCommand();
+    TestCompileInputOptimizeO2AndSharedCompilerSession();
+    TestDesktopStencilJitInvokerHookAndFallback();
 
     std::cout << "wpf_controls_and_script_tests: " << gPassed << " passed, " << gFailed << " failed" << std::endl;
     return (gFailed == 0) ? 0 : 1;

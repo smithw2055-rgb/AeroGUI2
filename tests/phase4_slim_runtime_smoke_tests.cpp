@@ -17,7 +17,15 @@
 #include "aero/layout/DepthBucketLayoutQueue.hpp"
 #include "aero/render/PagedRenderTree.hpp"
 #include "aero/render/ZeroCopyGpuStream.hpp"
+#include "aero/runtime/AeroExecutionDomains.hpp"
 #include "aero/style/StyleTriggerEngine.hpp"
+
+// Enforce Wave 2B / Wasm 16-byte Value & ObjectRef ABI invariants without RTTI/exceptions
+static_assert(
+    sizeof(realscript::runtime::Value) == 16 &&
+    alignof(realscript::runtime::Value) == 16 &&
+    sizeof(realscript::runtime::ObjectRef) == 16,
+    "SlimRuntime 16-byte Value/ObjectRef ABI invariant violated");
 
 #define AERO_SLIM_CHECK(cond, msg)                                                 \
     do {                                                                           \
@@ -354,6 +362,50 @@ void TestSlimRuntimePhase5DElementBindConverterAndEventTriggerNoRtti() {
     std::cout << "[PASS] TestSlimRuntimePhase5DElementBindConverterAndEventTriggerNoRtti\n";
 }
 
+void TestSlimRuntimeDesktopJitHookFallbackAndAbiNoRtti() {
+    aero::ExecutionDomainContext domains;
+    AERO_SLIM_CHECK(!domains.hasDesktopJitInvoker(), "Desktop JIT invoker unset by default in SlimRuntime");
+    AERO_SLIM_CHECK(domains.desktopJitInvokeHits() == 0u, "Zero JIT hits initially");
+    AERO_SLIM_CHECK(domains.desktopJitFallbackHits() == 0u, "Zero JIT fallback hits initially");
+
+    // Verify fallback cleanly handles decline (false) and missing interpreter without RTTI or exceptions
+    bool hookCalled = false;
+    domains.setDesktopJitInvoker(
+        [&](aero::DomainKind domain,
+            realscript::semantic::SymbolId functionId,
+            const realscript::runtime::Value* args,
+            std::size_t argCount,
+            bool& outSucceeded,
+            realscript::runtime::Value& outResult,
+            realscript::runtime::RuntimeError& outError) -> bool {
+            (void)args;
+            (void)argCount;
+            (void)outError;
+            hookCalled = true;
+            if (domain == aero::DomainKind::UiPresentation && functionId == 101u) {
+                outSucceeded = true;
+                outResult = aero::value::FromInt(42);
+                return true;
+            }
+            return false; // Decline to fall back cleanly
+        });
+
+    AERO_SLIM_CHECK(domains.hasDesktopJitInvoker(), "Desktop JIT hook attached");
+    const auto jitRes = domains.invokeMethod(aero::DomainKind::UiPresentation, nullptr, 101u, nullptr, 0u);
+    AERO_SLIM_CHECK(hookCalled && jitRes.succeeded, "Hook handled symbol 101");
+    std::int64_t jitVal = 0;
+    AERO_SLIM_CHECK(jitRes.value.tryGetInt64(jitVal) && jitVal == 42, "Hook returned expected integer");
+    AERO_SLIM_CHECK(domains.desktopJitInvokeHits() == 1u, "JIT hit counter incremented");
+
+    const auto missRes = domains.invokeMethod(aero::DomainKind::UiPresentation, nullptr, 202u, nullptr, 0u);
+    AERO_SLIM_CHECK(!missRes.succeeded, "Declined call without interpreter returns failure cleanly");
+    AERO_SLIM_CHECK(domains.desktopJitFallbackHits() == 1u, "JIT fallback counter incremented");
+
+    domains.clearDesktopJitInvoker();
+    AERO_SLIM_CHECK(!domains.hasDesktopJitInvoker(), "Desktop JIT hook cleared");
+    std::cout << "[PASS] TestSlimRuntimeDesktopJitHookFallbackAndAbiNoRtti\n";
+}
+
 } // namespace
 
 int main() {
@@ -364,6 +416,7 @@ int main() {
     TestSlimRuntimePhase5BInteractiveControlsAndRouterNoRtti();
     TestSlimRuntimePhase5CStyleTriggerAndSpringAnimationNoRtti();
     TestSlimRuntimePhase5DElementBindConverterAndEventTriggerNoRtti();
+    TestSlimRuntimeDesktopJitHookFallbackAndAbiNoRtti();
     std::cout << "AeroGUI 2.0 Slim Runtime (-fno-rtti, 0 Compiler Frontend) Smoke Tests Passed 100%!\n";
     return 0;
 }

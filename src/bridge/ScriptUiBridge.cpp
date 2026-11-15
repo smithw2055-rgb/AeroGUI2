@@ -441,10 +441,12 @@ void AttachStyleEngineAcrossSubtree(UIElement* subtreeRoot, StyleTriggerEngine* 
             }
             for (const auto& m : ts->methods) {
                 if (m.name == "get_ViewModel" && !m.staticMethod && m.id != 0) {
-                    if (uiInterpreter) {
+                    if (uiInterpreter || domains.hasDesktopJitInvoker()) {
                         rs_rt::ExecutionOptions opts{};
                         opts.limits.instructionBudget = 1'000'000;
-                        const auto res = uiInterpreter->invoke(m.id, {mainWinRef}, opts);
+                        const UnifiedValue arg0{mainWinRef};
+                        const auto res = domains.invokeMethod(
+                            DomainKind::UiPresentation, uiInterpreter, m.id, &arg0, 1u, opts);
                         if (res.succeeded) {
                             ObjectRef vmRef{};
                             if (acceptIfAliveObject(res.value, vmRef)) {
@@ -708,10 +710,16 @@ bool DispatchScriptWrapperRoutedEventImpl(
         auto eRefOpt = domains->uiHeap().allocateObject(eSym->id, std::move(eFields), std::move(eRefFields), &aErr);
         if (!eRefOpt) continue;
 
-        if (interp) {
+        if (interp || (domains && domains->hasDesktopJitInvoker())) {
             rs_rt::ExecutionOptions execOpts{};
             execOpts.limits.instructionBudget = 5'000'000;
-            (void)interp->invoke(raiseSym, {entry.wrapper, *eRefOpt}, execOpts);
+            const UnifiedValue callArgs[2]{entry.wrapper, *eRefOpt};
+            if (domains) {
+                (void)domains->invokeMethod(
+                    DomainKind::UiPresentation, interp, raiseSym, callArgs, 2u, execOpts);
+            } else {
+                (void)interp->invoke(raiseSym, {entry.wrapper, *eRefOpt}, execOpts);
+            }
         } else if (aotCtx) {
             UnifiedValue callArgs[2]{entry.wrapper, *eRefOpt};
             UnifiedValue ret{};
@@ -952,10 +960,12 @@ bool MountAndWireMainWindow(
             const SymbolId mainWinTid = heap->objectTypeId(mainWinRef).value_or(0);
             const SymbolId onInitSym = FindZeroArgMethodOnHierarchy(program, mainWinTid, "OnInitialized");
             if (onInitSym != 0) {
-                if (effInterp) {
+                if (effInterp || domains.hasDesktopJitInvoker()) {
                     rs_rt::ExecutionOptions execOpts{};
                     execOpts.limits.instructionBudget = 5'000'000;
-                    (void)effInterp->invoke(onInitSym, {mainWinRef}, execOpts);
+                    const UnifiedValue arg0{mainWinRef};
+                    (void)domains.invokeMethod(
+                        DomainKind::UiPresentation, effInterp, onInitSym, &arg0, 1u, execOpts);
                 } else if (aotContext) {
                     UnifiedValue arg0 = mainWinRef;
                     UnifiedValue ret{};
