@@ -55,7 +55,7 @@ void Check(bool cond, const char* expr, int line, const std::string& msg = {}) {
         ++gFailedChecks;
         std::fprintf(
             stderr,
-            "[FAIL] p2_3_tests.cpp:%d: %s%s%s\n",
+            "[FAIL] samples_golden_regression_tests.cpp:%d: %s%s%s\n",
             line,
             expr,
             msg.empty() ? "" : " — ",
@@ -284,7 +284,7 @@ int main(int argc, char** argv) {
         }
     }
 
-    std::printf("=== AeroGUI 2.0 + RealScript P2-3 Samples.zip Full Regression & Golden Pixel Suite ===\n");
+    std::printf("=== AeroGUI 2.0 + RealScript Samples Full Regression & Golden Pixel Suite ===\n");
 
     const fs::path samplesRoot = DiscoverSamplesRoot();
     AERO_P23_CHECK_MSG(!samplesRoot.empty(), "DiscoverSamplesRoot located official 21-sample directory");
@@ -885,7 +885,7 @@ int main(int argc, char** argv) {
     }
 
     std::printf(
-        "=== P2-3 Summary: %d / %d assertions passed (%d failed) ===\n",
+        "=== Samples Golden Regression Summary: %d / %d assertions passed (%d failed) ===\n",
         gTotalChecks - gFailedChecks,
         gTotalChecks,
         gFailedChecks);

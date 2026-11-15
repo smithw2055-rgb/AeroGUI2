@@ -7,12 +7,9 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
-set(REALSCRIPT_SLIM_RUNTIME ON CACHE BOOL "Build slim RealScript runtime for Wasm" FORCE)
-set(REALSCRIPT_INSTALL_SDK OFF CACHE BOOL "Disable RealScript SDK install targets in Wasm slim build" FORCE)
+set(REALSCRIPT_SLIM_RUNTIME ON CACHE BOOL "Consume slim RealScript runtime for Wasm" FORCE)
 set(AERO_BUILD_COMPILER_TOOLS OFF CACHE BOOL "Omit host XAML/RealScript compiler in Wasm runtime build" FORCE)
 set(AERO_BUILD_TESTS OFF CACHE BOOL "Disable desktop tests during Wasm cross-build" FORCE)
-set(REALSCRIPT_BUILD_TESTS OFF CACHE BOOL "Disable desktop tests during Wasm cross-build" FORCE)
-set(REALSCRIPT_ENABLE_TOOLCHAIN_JIT_TESTS OFF CACHE BOOL "Disable external JIT in Wasm" FORCE)
 
 set(AERO_WASM_COMPILE_FLAGS "-Oz -flto -fno-exceptions -fno-rtti -msimd128")
 set(AERO_WASM_LINK_FLAGS "-Oz -flto -fno-exceptions -fno-rtti -sWASM=1 -sUSE_WEBGL2=1 -sMAX_WEBGL_VERSION=2 -sMIN_WEBGL_VERSION=2 -sALLOW_MEMORY_GROWTH=1 -sASYNCIFY=0 -sFILESYSTEM=0")
