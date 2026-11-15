@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <string_view>
 
 #include "aero/core/UnifiedValue.hpp"
 
@@ -48,6 +49,10 @@ enum class UIEffectKind : std::uint8_t {
     DropShadow = 2,
     Pixelate = 3,
     BackdropBlur = 4,
+    Tint = 5,
+    ChromaticAberration = 6,
+    DirectionalBlur = 7,
+    Saturation = 8,
 };
 
 enum class PointerButton : std::uint8_t {
@@ -337,7 +342,23 @@ enum BuiltinPropertyId : std::uint16_t {
     PropId_CommandBindingsSpec = 205,       // StringValue (Serialized <CommandBinding> entries)
     PropId_SelectionStart = 206,            // Int64 (TextBox.SelectionStart)
     PropId_SelectionLength = 207,           // Int64 (TextBox.SelectionLength)
+    PropId_EffectAmountX = 208,             // float (ChromaticAberrationEffect.AmountX)
+    PropId_EffectAngle = 209,               // float (DirectionalBlurEffect.Angle)
+    PropId_LoadedBehavior = 210,            // StringValue (MediaElement.LoadedBehavior)
+    PropId_UnloadedBehavior = 211,          // StringValue (MediaElement.UnloadedBehavior)
+    PropId_Volume = 212,                    // float (MediaElement.Volume)
+    PropId_IsMuted = 213,                   // bool (MediaElement.IsMuted)
+    PropId_MediaPosition = 214,             // float seconds (MediaElement.Position)
+    PropId_MouseDragConstrain = 215,        // bool (MouseDragElementBehavior.ConstrainToParentBounds)
+    PropId_Saturation = 216,                // float (SaturationEffect.Saturation / SaturationBrush)
+    PropId_PathTrimStart = 217,             // float (Path.TrimStart)
+    PropId_PathTrimEnd = 218,               // float (Path.TrimEnd)
+    PropId_ShaderTime = 219,                // float (PlasmaBrush.Time / Shader Time)
+    PropId_VisualBrush = 220,               // StringValue / Object (VisualBrush.Visual)
+    PropId_EasingExponent = 221,            // float (ExponentialEase.Exponent)
     PropId_FirstContractInput = 0x1000u,    // Dynamic/Contract input bridge slot range [0x1000 .. 0x1FFFu]
+    PropId_FirstCustom = 0x2000u,           // Custom DependencyProperty registry range [0x2000 .. 0x2FFFu]
+    PropId_LastCustom = 0x2FFFu,
     // Pseudo-property IDs for zero-allocation inline interactive Trigger conditions
     PropId_TriggerIsMouseOver = 0xFF01u,
     PropId_TriggerIsPressed = 0xFF02u,
@@ -427,5 +448,55 @@ static_assert(
 static_assert(
     alignof(CompactPropertyEntry) == 16,
     "CompactPropertyEntry must be 16-byte aligned");
+
+// Generic Custom DependencyProperty Extensibility Registry [PropId_FirstCustom .. PropId_LastCustom]
+enum class CustomPropertyValueKind : std::uint8_t {
+    String = 0,
+    Float = 1,
+    Int = 2,
+    Bool = 3,
+    Color = 4,
+    Brush = 5,
+    Thickness = 6,
+};
+
+struct CustomPropertyDesc {
+    std::uint16_t propId = 0xFFFFu;
+    std::string_view ownerTypeName;
+    std::string_view propertyName;
+    CustomPropertyValueKind valueKind = CustomPropertyValueKind::String;
+    UnifiedValue defaultValue{};
+};
+
+[[nodiscard]] constexpr bool IsCustomPropertyId(std::uint16_t propId) noexcept {
+    return propId >= PropId_FirstCustom && propId <= PropId_LastCustom;
+}
+
+[[nodiscard]] std::uint16_t RegisterCustomProperty(
+    std::string_view ownerTypeName,
+    std::string_view propertyName,
+    CustomPropertyValueKind valueKind,
+    UnifiedValue defaultValue = {});
+
+[[nodiscard]] std::uint16_t FindCustomProperty(
+    std::string_view ownerTypeName,
+    std::string_view propertyName) noexcept;
+
+[[nodiscard]] std::uint16_t FindCustomPropertyByName(
+    std::string_view propertyName) noexcept;
+
+[[nodiscard]] bool TryGetCustomPropertyDesc(
+    std::uint16_t propId,
+    CustomPropertyDesc& outDesc) noexcept;
+
+[[nodiscard]] bool TryGetCustomPropertyDefaultValue(
+    std::uint16_t propId,
+    UnifiedValue& outDefaultValue) noexcept;
+
+[[nodiscard]] std::string_view GetCustomPropertyName(std::uint16_t propId) noexcept;
+
+[[nodiscard]] bool TryGetCustomPropertyValueKind(
+    std::uint16_t propId,
+    CustomPropertyValueKind& outKind) noexcept;
 
 } // namespace aero

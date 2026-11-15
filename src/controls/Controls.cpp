@@ -11,6 +11,7 @@
 #include <atomic>
 #include <charconv>
 #include <cmath>
+#include <ctime>
 #include <mutex>
 #include <fstream>
 #include <limits>
@@ -165,6 +166,7 @@ TypeClass gToolTipTypeClass{};
 TypeClass gGridSplitterTypeClass{};
 TypeClass gTreeViewTypeClass{};
 TypeClass gTreeViewItemTypeClass{};
+TypeClass gMediaElementTypeClass{};
 
 void EnsureControlTypesRegistered() noexcept {
     EnsureBuiltinTypesRegistered();
@@ -230,6 +232,7 @@ void EnsureControlTypesRegistered() noexcept {
     reg.RegisterType(gGridSplitterTypeClass, "Aero.UI.GridSplitter", &gBorderTypeClass);
     reg.RegisterType(gTreeViewTypeClass, "Aero.UI.TreeView", &gItemsControlTypeClass);
     reg.RegisterType(gTreeViewItemTypeClass, "Aero.UI.TreeViewItem", &gItemsControlTypeClass);
+    reg.RegisterType(gMediaElementTypeClass, "Aero.UI.MediaElement", uiElem);
 }
 
 const TypeClass* StackPanel::StaticTypeClass() noexcept {
@@ -3189,6 +3192,26 @@ Stretch Path::GetStretch() const noexcept {
         }
     }
     return Stretch::None;
+}
+
+void Path::SetTrimStart(float trimStart) {
+    SetValue(PropId_PathTrimStart, MakeFloat(trimStart), ValueSourceRank::Local);
+}
+
+float Path::GetTrimStart() const noexcept {
+    float v = 0.0f;
+    (void)TryGetFloat(GetValue(PropId_PathTrimStart), v);
+    return v;
+}
+
+void Path::SetTrimEnd(float trimEnd) {
+    SetValue(PropId_PathTrimEnd, MakeFloat(trimEnd), ValueSourceRank::Local);
+}
+
+float Path::GetTrimEnd() const noexcept {
+    float v = 1.0f;
+    (void)TryGetFloat(GetValue(PropId_PathTrimEnd), v);
+    return v;
 }
 
 Size Path::MeasureCore(Size availableSize) noexcept {
@@ -12243,11 +12266,81 @@ bool Window::MountTemplate(
 }
 
 namespace {
+
+struct RegisteredCustomControlEntry {
+    CustomControlFactory factory = nullptr;
+    bool isTemplatedControl = false;
+};
+
+struct CustomControlRegistryState {
+    std::mutex mutex;
+    std::unordered_map<std::string, RegisteredCustomControlEntry> byExactName;
+    std::unordered_map<std::string, RegisteredCustomControlEntry> byShortName;
+};
+
+CustomControlRegistryState& GetCustomControlRegistryState() noexcept {
+    static CustomControlRegistryState sState;
+    return sState;
+}
+
+[[nodiscard]] std::string_view TrimControlTypeName(std::string_view s) noexcept {
+    while (!s.empty() && std::isspace(static_cast<unsigned char>(s.front()))) {
+        s.remove_prefix(1u);
+    }
+    while (!s.empty() && std::isspace(static_cast<unsigned char>(s.back()))) {
+        s.remove_suffix(1u);
+    }
+    return s;
+}
+
+[[nodiscard]] IntrusivePtr<UIElement> CreateCustomControlByTypeName(
+    std::string_view typeName,
+    std::string_view shortName) {
+    CustomControlFactory factory = nullptr;
+    {
+        auto& state = GetCustomControlRegistryState();
+        std::lock_guard<std::mutex> lock(state.mutex);
+        const std::string_view cleanType = TrimControlTypeName(typeName);
+        if (!cleanType.empty()) {
+            if (const auto it = state.byExactName.find(std::string(cleanType));
+                it != state.byExactName.end()) {
+                factory = it->second.factory;
+            }
+        }
+        if (!factory && !shortName.empty()) {
+            if (const auto it = state.byShortName.find(std::string(shortName));
+                it != state.byShortName.end()) {
+                factory = it->second.factory;
+            }
+        }
+    }
+    if (!factory) {
+        return nullptr;
+    }
+    std::shared_ptr<UIElement> instance = factory();
+    if (!instance) {
+        return nullptr;
+    }
+    UIElement* rawPtr = instance.get();
+    rawPtr->AdoptSharedOwnership(std::move(instance));
+    return IntrusivePtr<UIElement>(rawPtr, true);
+}
+
 IntrusivePtr<UIElement> CreateElementByTypeNameCore(std::string_view typeName, std::string_view shortName) {
     if (shortName == "Window") return MakeIntrusive<Window>();
-    if (shortName == "Panel" || shortName == "ResourceDictionary") return MakeIntrusive<Panel>();
+    if (shortName == "Panel" || shortName == "ResourceDictionary" || shortName == "Track") {
+        return MakeIntrusive<Panel>();
+    }
     if (shortName == "DockPanel") return MakeIntrusive<DockPanel>();
-    if (shortName == "WrapPanel") return MakeIntrusive<WrapPanel>();
+    if (shortName == "WrapPanel" || shortName == "TabPanel" || shortName == "ToolBarOverflowPanel") {
+        return MakeIntrusive<WrapPanel>();
+    }
+    if (shortName == "ToolBarPanel") {
+        auto p = MakeIntrusive<StackPanel>();
+        (void)p->SetValue(PropId_Orientation, value::FromInt(1), ValueSourceRank::Default);
+        return p;
+    }
+    if (shortName == "MediaElement") return MakeIntrusive<MediaElement>();
     if (shortName == "Viewbox") return MakeIntrusive<Viewbox>();
     if (shortName == "LayoutScaler") return MakeIntrusive<LayoutScaler>();
     if (shortName == "ScrollViewer") return MakeIntrusive<ScrollViewer>();
@@ -12324,7 +12417,8 @@ IntrusivePtr<UIElement> CreateElementByTypeNameCore(std::string_view typeName, s
         shortName == "ContentControl" ||
         shortName == "Control" || shortName == "FrameworkElement" ||
         shortName == "ComboBoxItem" || shortName == "ListBoxItem" ||
-        shortName == "ListViewItem") {
+        shortName == "ListViewItem" ||
+        shortName == "ScrollBar" || shortName == "Thumb" || shortName == "TickBar") {
         return MakeIntrusive<Border>();
     }
     if (shortName == "Label") {
@@ -12350,12 +12444,66 @@ IntrusivePtr<UIElement> CreateElementByTypeNameCore(std::string_view typeName, s
     if (shortName == "UserControl" || shortName == "Page") {
         return MakeIntrusive<UserControl>();
     }
+    if (IntrusivePtr<UIElement> customCtrl = CreateCustomControlByTypeName(typeName, shortName)) {
+        return customCtrl;
+    }
     if (AxbTemplateRegistry::Instance().Find(typeName) != nullptr) {
         return MakeIntrusive<UserControl>(typeName);
     }
     return MakeIntrusive<UIElement>();
 }
 } // namespace
+
+void RegisterCustomControlType(
+    std::string_view typeName,
+    CustomControlFactory factory,
+    bool isTemplatedControl) {
+    const std::string_view cleanType = TrimControlTypeName(typeName);
+    if (cleanType.empty() || factory == nullptr) {
+        return;
+    }
+    const std::string_view shortType = StripNamespacePrefix(cleanType);
+    auto& state = GetCustomControlRegistryState();
+    std::lock_guard<std::mutex> lock(state.mutex);
+    const RegisteredCustomControlEntry entry{factory, isTemplatedControl};
+    state.byExactName[std::string(cleanType)] = entry;
+    if (!shortType.empty()) {
+        state.byShortName[std::string(shortType)] = entry;
+    }
+}
+
+bool IsCustomControlRegistered(
+    std::string_view typeName,
+    bool* outIsTemplatedControl) noexcept {
+    try {
+        const std::string_view cleanType = TrimControlTypeName(typeName);
+        if (cleanType.empty()) {
+            return false;
+        }
+        auto& state = GetCustomControlRegistryState();
+        std::lock_guard<std::mutex> lock(state.mutex);
+        if (const auto it = state.byExactName.find(std::string(cleanType));
+            it != state.byExactName.end()) {
+            if (outIsTemplatedControl) {
+                *outIsTemplatedControl = it->second.isTemplatedControl;
+            }
+            return true;
+        }
+        const std::string_view shortType = StripNamespacePrefix(cleanType);
+        if (!shortType.empty()) {
+            if (const auto it = state.byShortName.find(std::string(shortType));
+                it != state.byShortName.end()) {
+                if (outIsTemplatedControl) {
+                    *outIsTemplatedControl = it->second.isTemplatedControl;
+                }
+                return true;
+            }
+        }
+        return false;
+    } catch (...) {
+        return false;
+    }
+}
 
 
 // ============================================================================
@@ -13872,7 +14020,11 @@ bool MountAxbInstructionsInternal(
                     }
                 } else {
                     IntrusivePtr<UIElement> createdChild;
-                    if (AxbTemplateRegistry::Instance().Find(typeName) != nullptr &&
+                    bool isCustomTemplated = false;
+                    const bool isRegisteredCustom = IsCustomControlRegistered(typeName, &isCustomTemplated);
+                    const AxbPackage* subControlPkg = AxbTemplateRegistry::Instance().Find(typeName);
+                    if (!isRegisteredCustom &&
+                        subControlPkg != nullptr &&
                         StripNamespacePrefix(typeName) != "UserControl" &&
                         StripNamespacePrefix(typeName) != "Page") {
                         createdChild = MakeIntrusive<UserControl>(
@@ -13885,6 +14037,17 @@ bool MountAxbInstructionsInternal(
                             animationEngine);
                     } else {
                         createdChild = CreateElementByTypeName(typeName);
+                        if (isRegisteredCustom && !isCustomTemplated && subControlPkg != nullptr && createdChild) {
+                            (void)MountAxbTemplate(
+                                createdChild.Get(),
+                                *subControlPkg,
+                                domains,
+                                bindingEngine,
+                                effectiveContext,
+                                eventInterpreter,
+                                eventAotContext,
+                                animationEngine);
+                        }
                     }
                     if (!elementStack.empty() && elementStack.back() && createdChild) {
                         if (templatedHost) {
@@ -14043,9 +14206,26 @@ bool MountAxbInstructionsInternal(
                             }
                         }
                     }
+                    std::uint16_t effectivePropId = inst.propId;
+                    UnifiedValue effectiveValue = inst.literalValue;
+                    if (IsCustomPropertyId(effectivePropId) &&
+                        !elementStack.back()->DeclaredTypeName().empty()) {
+                        const std::string_view customName = GetCustomPropertyName(effectivePropId);
+                        if (!customName.empty()) {
+                            const std::uint16_t ownerPropId =
+                                FindCustomProperty(elementStack.back()->DeclaredTypeName(), customName);
+                            if (ownerPropId != 0xFFFFu && ownerPropId != effectivePropId) {
+                                effectivePropId = ownerPropId;
+                                if (const auto* rawSv = std::get_if<StringValue>(&inst.literalValue)) {
+                                    effectiveValue = ParseBuiltinLiteralPropertyValue(
+                                        effectivePropId, rawSv->view());
+                                }
+                            }
+                        }
+                    }
                     elementStack.back()->SetValue(
-                        inst.propId,
-                        inst.literalValue,
+                        effectivePropId,
+                        effectiveValue,
                         ValueSourceRank::Local);
                 }
                 break;
@@ -14919,9 +15099,34 @@ bool MountAxbInstructionsInternal(
                     UIElement* targetElem = elementStack.back();
                     UIElement* host = templatedHost ? templatedHost : targetElem->TemplatedParent();
                     if (host) {
+                        std::uint16_t sourcePropId = static_cast<std::uint16_t>(inst.strIdx0);
+                        if (sourcePropId == PropId_Tag || sourcePropId == 0xFFFFu ||
+                            IsCustomPropertyId(sourcePropId)) {
+                            const std::string_view strPath = package.GetString(inst.strIdx1);
+                            const std::string_view propPath =
+                                !strPath.empty() ? strPath
+                                                 : (IsCustomPropertyId(sourcePropId)
+                                                        ? GetCustomPropertyName(sourcePropId)
+                                                        : std::string_view{});
+                            if (!propPath.empty() && propPath != "Tag") {
+                                if (!host->DeclaredTypeName().empty()) {
+                                    const std::uint16_t ownerPropId =
+                                        FindCustomProperty(host->DeclaredTypeName(), propPath);
+                                    if (ownerPropId != 0xFFFFu) {
+                                        sourcePropId = ownerPropId;
+                                    }
+                                }
+                                if (sourcePropId == PropId_Tag || sourcePropId == 0xFFFFu) {
+                                    const std::uint16_t latePropId = ResolveBuiltinPropertyId(propPath);
+                                    if (latePropId != PropId_Tag) {
+                                        sourcePropId = latePropId;
+                                    }
+                                }
+                            }
+                        }
                         host->AddTemplateBinding(
                             targetElem,
-                            static_cast<std::uint16_t>(inst.strIdx0),
+                            sourcePropId,
                             inst.propId,
                             static_cast<ValueConverterKind>(inst.flags));
                     }
@@ -15523,6 +15728,181 @@ void RiveControl::ArrangeCore(Rect finalRect) noexcept {
         InvalidateRender();
         MarkSubtreeRenderDirtyRecursive(artboardRoot_.Get());
     }
+}
+
+// ============================================================================
+// Core MediaElement Control
+// ============================================================================
+
+const TypeClass* MediaElement::StaticTypeClass() noexcept {
+    EnsureControlTypesRegistered();
+    return &gMediaElementTypeClass;
+}
+
+MediaElement::MediaElement() {
+    EnsureControlTypesRegistered();
+    (void)SetValue(PropId_Stretch, value::FromInt(static_cast<std::int64_t>(Stretch::Uniform)), ValueSourceRank::Default);
+    (void)SetValue(PropId_LoadedBehavior, value::FromString("Play"), ValueSourceRank::Default);
+    (void)SetValue(PropId_UnloadedBehavior, value::FromString("Close"), ValueSourceRank::Default);
+    (void)SetValue(PropId_Volume, MakeFloat(1.0f), ValueSourceRank::Default);
+    (void)SetValue(PropId_IsMuted, UnifiedValue{false}, ValueSourceRank::Default);
+    (void)SetValue(PropId_MediaPosition, MakeFloat(0.0f), ValueSourceRank::Default);
+}
+
+void MediaElement::SetSource(std::string_view sourceUri) {
+    (void)SetValue(PropId_ImageSource, value::FromString(std::string(sourceUri)), ValueSourceRank::Local);
+}
+
+std::string MediaElement::GetSource() const {
+    const UnifiedValue v = GetValue(PropId_ImageSource);
+    if (const auto* sv = std::get_if<StringValue>(&v)) {
+        return sv->str();
+    }
+    return {};
+}
+
+void MediaElement::SetStretch(Stretch stretch) {
+    (void)SetValue(PropId_Stretch, value::FromInt(static_cast<std::int64_t>(stretch)), ValueSourceRank::Local);
+}
+
+Stretch MediaElement::GetStretch() const noexcept {
+    const UnifiedValue v = GetValue(PropId_Stretch);
+    if (const auto* iv = std::get_if<std::int64_t>(&v)) {
+        if (*iv >= 0 && *iv <= 3) {
+            return static_cast<Stretch>(*iv);
+        }
+    }
+    return Stretch::Uniform;
+}
+
+void MediaElement::SetLoadedBehavior(std::string_view behavior) {
+    (void)SetValue(PropId_LoadedBehavior, value::FromString(std::string(behavior)), ValueSourceRank::Local);
+}
+
+std::string MediaElement::GetLoadedBehavior() const {
+    const UnifiedValue v = GetValue(PropId_LoadedBehavior);
+    if (const auto* sv = std::get_if<StringValue>(&v)) {
+        return sv->str();
+    }
+    return "Play";
+}
+
+void MediaElement::SetUnloadedBehavior(std::string_view behavior) {
+    (void)SetValue(PropId_UnloadedBehavior, value::FromString(std::string(behavior)), ValueSourceRank::Local);
+}
+
+std::string MediaElement::GetUnloadedBehavior() const {
+    const UnifiedValue v = GetValue(PropId_UnloadedBehavior);
+    if (const auto* sv = std::get_if<StringValue>(&v)) {
+        return sv->str();
+    }
+    return "Close";
+}
+
+void MediaElement::SetVolume(float volume) {
+    (void)SetValue(PropId_Volume, MakeFloat(std::clamp(volume, 0.0f, 1.0f)), ValueSourceRank::Local);
+}
+
+float MediaElement::GetVolume() const noexcept {
+    float v = 1.0f;
+    if (TryGetFloat(GetValue(PropId_Volume), v)) {
+        return std::clamp(v, 0.0f, 1.0f);
+    }
+    return 1.0f;
+}
+
+void MediaElement::SetIsMuted(bool muted) {
+    (void)SetValue(PropId_IsMuted, UnifiedValue{muted}, ValueSourceRank::Local);
+}
+
+bool MediaElement::GetIsMuted() const noexcept {
+    const UnifiedValue v = GetValue(PropId_IsMuted);
+    if (const auto* bv = std::get_if<bool>(&v)) {
+        return *bv;
+    }
+    if (const auto* iv = std::get_if<std::int64_t>(&v)) {
+        return *iv != 0;
+    }
+    return false;
+}
+
+void MediaElement::SetPosition(float seconds) {
+    const float clamped = std::max(0.0f, seconds);
+    positionSeconds_ = clamped;
+    (void)SetValue(PropId_MediaPosition, MakeFloat(clamped), ValueSourceRank::Local);
+    InvalidateVisual();
+}
+
+float MediaElement::GetPosition() const noexcept {
+    return positionSeconds_;
+}
+
+void MediaElement::Play() {
+    isPlaying_ = true;
+    InvalidateVisual();
+}
+
+void MediaElement::Pause() {
+    isPlaying_ = false;
+    InvalidateVisual();
+}
+
+void MediaElement::Stop() {
+    isPlaying_ = false;
+    positionSeconds_ = 0.0f;
+    InvalidateVisual();
+}
+
+void MediaElement::SetDurationSeconds(float duration) {
+    durationSeconds_ = std::max(0.0f, duration);
+}
+
+void MediaElement::OnPropertyChanged(std::uint16_t propId, const UnifiedValue& newValue) {
+    UIElement::OnPropertyChanged(propId, newValue);
+    if (propId == PropId_LoadedBehavior || propId == PropId_ImageSource) {
+        const std::string behavior = GetLoadedBehavior();
+        if (behavior == "Manual" || behavior == "Pause") {
+            isPlaying_ = false;
+        } else if (behavior == "Stop" || behavior == "Close") {
+            isPlaying_ = false;
+            positionSeconds_ = 0.0f;
+        } else if (!GetSource().empty()) {
+            isPlaying_ = true;
+        }
+        InvalidateVisual();
+    } else if (propId == PropId_MediaPosition) {
+        float pos = 0.0f;
+        if (TryGetFloat(newValue, pos)) {
+            positionSeconds_ = std::max(0.0f, pos);
+            InvalidateVisual();
+        }
+    } else if (propId == PropId_Volume || propId == PropId_IsMuted) {
+        InvalidateVisual();
+    }
+}
+
+void MediaElement::TickControl(float dtSeconds) {
+    if (!isPlaying_ || dtSeconds <= 0.0f) {
+        return;
+    }
+    positionSeconds_ += dtSeconds;
+    if (durationSeconds_ > 0.0f && positionSeconds_ >= durationSeconds_) {
+        positionSeconds_ = durationSeconds_;
+        isPlaying_ = false;
+        ++mediaEndedGeneration_;
+        if (mediaEndedCallback_) {
+            mediaEndedCallback_(*this);
+        }
+    }
+    InvalidateVisual();
+}
+
+Size MediaElement::MeasureCore(Size availableSize) noexcept {
+    const float w = (GetWidth() > 0.0f) ? GetWidth() : 0.0f;
+    const float h = (GetHeight() > 0.0f) ? GetHeight() : 0.0f;
+    return Size{
+        std::min(availableSize.width, w),
+        std::min(availableSize.height, h)};
 }
 
 } // namespace aero

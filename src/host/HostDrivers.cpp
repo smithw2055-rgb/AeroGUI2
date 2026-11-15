@@ -126,6 +126,10 @@ void EmbeddedGameHost::TickUi(float dt, std::uint32_t activePhaseMask) {
         telemetry_.inputEventsDispatched += inputRouter_->FlushQueuedEvents();
     }
 
+    if (rootVisual_ && dt > 0.0f) {
+        (void)TickLiveControlsInSubtree(rootVisual_, dt);
+    }
+
     if ((activePhaseMask & UiPhase_TrackABinding) != 0u && bindingEngine_) {
         telemetry_.trackAUpdates += bindingEngine_->FlushTrackA();
     }
@@ -265,8 +269,10 @@ bool DesktopEventHost::CanSleepIdle() const noexcept {
     const bool routerPending = inputRouter_ && inputRouter_->HasPendingEvents();
     const bool bindingDirty = bindingEngine_ && bindingEngine_->HasPendingDirtyObjects();
     const bool animEngineActive = animationEngine_ && animationEngine_->HasActiveAnimations();
+    const bool liveControlsTick = SubtreeNeedsContinuousTick(rootVisual_);
     return !hasActiveAnimations_ &&
            !animEngineActive &&
+           !liveControlsTick &&
            !hasDirtyObjects_ &&
            !bindingDirty &&
            !hasDirtyLayout_ &&
@@ -297,6 +303,13 @@ void DesktopEventHost::TickUi(float dt, std::uint32_t activePhaseMask) {
         const std::size_t dispatched = inputRouter_->FlushQueuedEvents();
         telemetry_.inputEventsDispatched += dispatched;
         if (dispatched > 0u) {
+            hasDirtyObjects_ = true;
+            hasDirtyLayout_ = true;
+        }
+    }
+
+    if (rootVisual_ && dt > 0.0f && SubtreeNeedsContinuousTick(rootVisual_)) {
+        if (TickLiveControlsInSubtree(rootVisual_, dt) > 0u) {
             hasDirtyObjects_ = true;
             hasDirtyLayout_ = true;
         }
@@ -897,7 +910,8 @@ void WebCanvasHost::TickUi(float dt, std::uint32_t activePhaseMask) {
 
     if ((inputRouter_ && inputRouter_->HasPendingEvents()) ||
         (bindingEngine_ && bindingEngine_->HasPendingDirtyObjects()) ||
-        (animationEngine_ && animationEngine_->HasActiveAnimations())) {
+        (animationEngine_ && animationEngine_->HasActiveAnimations()) ||
+        SubtreeNeedsContinuousTick(rootVisual_)) {
         rafState_ = WebRafState::ActiveTicking;
     }
     if (rafState_ == WebRafState::SuspendedIdle) {
@@ -919,6 +933,9 @@ void WebCanvasHost::TickUi(float dt, std::uint32_t activePhaseMask) {
         const std::size_t dispatched = inputRouter_->FlushQueuedEvents();
         telemetry_.inputEventsDispatched += dispatched;
         changes += dispatched;
+    }
+    if (rootVisual_ && dt > 0.0f) {
+        changes += TickLiveControlsInSubtree(rootVisual_, dt);
     }
     if ((activePhaseMask & UiPhase_TrackABinding) != 0u && bindingEngine_) {
         const std::size_t a = bindingEngine_->FlushTrackA();
@@ -975,7 +992,8 @@ void WebCanvasHost::TickUi(float dt, std::uint32_t activePhaseMask) {
     }
 
     const bool animStillRunning = animationEngine_ && animationEngine_->HasActiveAnimations();
-    if (changes == 0 && !animStillRunning && !imeAdapter_.IsComposing()) {
+    const bool liveStillRunning = SubtreeNeedsContinuousTick(rootVisual_);
+    if (changes == 0 && !animStillRunning && !liveStillRunning && !imeAdapter_.IsComposing()) {
         rafState_ = WebRafState::SuspendedIdle;
     }
 }

@@ -855,6 +855,12 @@ bool UIElement::OnKeyDown(KeyCode key, std::uint8_t modifiers) {
     return false;
 }
 
+bool UIElement::OnKeyUp(KeyCode key, std::uint8_t modifiers) {
+    (void)key;
+    (void)modifiers;
+    return false;
+}
+
 bool UIElement::OnTextInput(std::string_view utf8Text) {
     (void)utf8Text;
     return false;
@@ -1415,6 +1421,9 @@ void UIElement::ClearEffect() {
     (void)ClearValue(PropId_EffectBlurRadius, ValueSourceRank::Local);
     (void)ClearValue(PropId_EffectShadowDepth, ValueSourceRank::Local);
     (void)ClearValue(PropId_EffectOpacity, ValueSourceRank::Local);
+    (void)ClearValue(PropId_EffectAmountX, ValueSourceRank::Local);
+    (void)ClearValue(PropId_EffectAngle, ValueSourceRank::Local);
+    (void)ClearValue(PropId_Saturation, ValueSourceRank::Local);
 }
 
 UIEffectKind UIElement::GetEffectKind() const noexcept {
@@ -1431,6 +1440,12 @@ UIEffectDescriptor UIElement::GetEffectDescriptor() const noexcept {
             else if (*iv == 2) desc.kind = UIEffectKind::DropShadow;
             else if (*iv == 3) desc.kind = UIEffectKind::Pixelate;
             else if (*iv == 4) desc.kind = UIEffectKind::BackdropBlur;
+            else if (*iv == 5) {
+                desc.kind = UIEffectKind::Tint;
+                desc.color = Color{1.0f, 1.0f, 1.0f, 1.0f};
+            } else if (*iv == 6) desc.kind = UIEffectKind::ChromaticAberration;
+            else if (*iv == 7) desc.kind = UIEffectKind::DirectionalBlur;
+            else if (*iv == 8) desc.kind = UIEffectKind::Saturation;
             else desc.kind = UIEffectKind::None;
         }
     }
@@ -1475,6 +1490,24 @@ UIEffectDescriptor UIElement::GetEffectDescriptor() const noexcept {
     if (const auto* cEntry = FindCompactEntry(PropId_EffectColor)) {
         if (const auto cOpt = value::TryGetColor(cEntry->effectiveValue)) {
             desc.color = *cOpt;
+        }
+    }
+    if (const auto* axEntry = FindCompactEntry(PropId_EffectAmountX)) {
+        float ax = desc.amountX;
+        if (TryGetFloat(axEntry->effectiveValue, ax)) {
+            desc.amountX = ax;
+        }
+    }
+    if (const auto* angEntry = FindCompactEntry(PropId_EffectAngle)) {
+        float ang = desc.angleDeg;
+        if (TryGetFloat(angEntry->effectiveValue, ang)) {
+            desc.angleDeg = ang;
+        }
+    }
+    if (const auto* satEntry = FindCompactEntry(PropId_Saturation)) {
+        float sat = desc.saturation;
+        if (TryGetFloat(satEntry->effectiveValue, sat)) {
+            desc.saturation = std::clamp(sat, 0.0f, 4.0f);
         }
     }
     return desc;
@@ -2062,7 +2095,9 @@ UnifiedValue UIElement::GetValue(std::uint16_t propId) const {
             break;
     }
     if (const auto* entry = FindCompactEntry(propId)) {
-        return entry->effectiveValue;
+        if (!std::holds_alternative<std::monostate>(entry->effectiveValue)) {
+            return entry->effectiveValue;
+        }
     }
     if (propId == PropId_Title) {
         if (const auto* hdrEntry = FindCompactEntry(PropId_Header)) {
@@ -2075,6 +2110,12 @@ UnifiedValue UIElement::GetValue(std::uint16_t propId) const {
             if (std::holds_alternative<StringValue>(titleEntry->effectiveValue)) {
                 return titleEntry->effectiveValue;
             }
+        }
+    }
+    if (IsCustomPropertyId(propId)) {
+        UnifiedValue defVal{};
+        if (TryGetCustomPropertyDefaultValue(propId, defVal)) {
+            return defVal;
         }
     }
     return std::monostate{};
@@ -2325,8 +2366,21 @@ bool UIElement::SetValue(
             }
             break;
         }
-        default:
+        default: {
+            if (IsCustomPropertyId(propId)) {
+                CustomPropertyValueKind kind = CustomPropertyValueKind::String;
+                if (TryGetCustomPropertyValueKind(propId, kind) &&
+                    kind != CustomPropertyValueKind::String) {
+                    if (const auto* sv = std::get_if<StringValue>(&value)) {
+                        const UnifiedValue parsed = ParseBuiltinLiteralPropertyValue(propId, sv->view());
+                        if (!std::holds_alternative<StringValue>(parsed)) {
+                            return SetValue(propId, parsed, rank);
+                        }
+                    }
+                }
+            }
             break;
+        }
     }
 
     if (value.isTraceable()) {
@@ -3083,7 +3137,8 @@ constexpr bool MightCarryTraceableString(std::uint16_t propId) noexcept {
            propId == PropId_FontFamily ||
            propId == PropId_Tag ||
            propId == PropId_PathData ||
-           propId == PropId_ImageSource;
+           propId == PropId_ImageSource ||
+           IsCustomPropertyId(propId);
 }
 
 } // namespace
@@ -3290,7 +3345,21 @@ bool UIElement::ReadTemplateSourceValueZeroAlloc(
         return false;
     }
 
-    return tryReadSparse(sourcePropId);
+    if (tryReadSparse(sourcePropId)) {
+        return true;
+    }
+    if (IsCustomPropertyId(sourcePropId)) {
+        if (const auto* e = FindCompactEntry(sourcePropId)) {
+            if (!std::holds_alternative<std::monostate>(e->effectiveValue)) {
+                outVal = e->effectiveValue;
+                return true;
+            }
+        }
+        if (TryGetCustomPropertyDefaultValue(sourcePropId, outVal)) {
+            return true;
+        }
+    }
+    return false;
 }
 
 void UIElement::SyncTemplateBindingsForProperty(std::uint16_t changedPropId) noexcept {
@@ -3760,6 +3829,36 @@ bool UIElement::ApplyControlTemplate(
     InvalidateLayout();
     InvalidateRender();
     return mountedOk;
+}
+
+std::size_t TickLiveControlsInSubtree(UIElement* root, float dtSeconds) {
+    if (!root || dtSeconds <= 0.0f) {
+        return 0u;
+    }
+    std::size_t updated = 0u;
+    if (root->NeedsContinuousTick()) {
+        root->TickControl(dtSeconds);
+        ++updated;
+    }
+    for (UIElement* child = root->FirstChild(); child != nullptr; child = child->NextSibling()) {
+        updated += TickLiveControlsInSubtree(child, dtSeconds);
+    }
+    return updated;
+}
+
+bool SubtreeNeedsContinuousTick(const UIElement* root) noexcept {
+    if (!root) {
+        return false;
+    }
+    if (root->NeedsContinuousTick()) {
+        return true;
+    }
+    for (const UIElement* child = root->FirstChild(); child != nullptr; child = child->NextSibling()) {
+        if (SubtreeNeedsContinuousTick(child)) {
+            return true;
+        }
+    }
+    return false;
 }
 
 } // namespace aero

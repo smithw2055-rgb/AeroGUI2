@@ -25,7 +25,8 @@ bool ReadUtf8File(const fs::path& p, std::string& out) {
 void CollectRsFilesRecursive(const fs::path& rootDir, std::vector<fs::path>& outFiles) {
     std::error_code ec;
     if (!fs::is_directory(rootDir, ec)) return;
-    for (const auto& entry : fs::recursive_directory_iterator(rootDir, ec)) {
+    for (const auto& entry : fs::recursive_directory_iterator(
+             rootDir, fs::directory_options::skip_permission_denied, ec)) {
         if (!entry.is_regular_file(ec)) continue;
         const std::string fullStr = entry.path().generic_string();
         if (fullStr.find("/obj/") != std::string::npos ||
@@ -62,7 +63,8 @@ void PreRegisterLocalUserControlsAndDictionaries(
     std::error_code ec;
     if (!fs::is_directory(searchDir, ec)) return;
     std::vector<fs::path> xamls;
-    for (const auto& entry : fs::recursive_directory_iterator(searchDir, ec)) {
+    for (const auto& entry : fs::recursive_directory_iterator(
+             searchDir, fs::directory_options::skip_permission_denied, ec)) {
         if (!entry.is_regular_file(ec) || entry.path().extension() != ".xaml") continue;
         bool skipDir = false;
         const fs::path rel = entry.path().lexically_relative(searchDir);
@@ -318,6 +320,15 @@ void PreRegisterLocalUserControlsAndDictionaries(
         AxbTemplateRegistry::Instance().Register(xp.filename().string(), subRes.axbPackage);
         if (!subRes.axbPackage.className.empty()) {
             AxbTemplateRegistry::Instance().Register(subRes.axbPackage.className, subRes.axbPackage);
+        }
+        if (subRes.axbPackage.rootTypeName == "UserControl" ||
+            subRes.axbPackage.rootTypeName == "Page") {
+            const std::string ucStem = xp.stem().string();
+            if (!ucStem.empty()) {
+                AxbTemplateRegistry::Instance().Register(ucStem, subRes.axbPackage);
+                AxbTemplateRegistry::Instance().Register("local:" + ucStem, subRes.axbPackage);
+                AxbTemplateRegistry::Instance().Register("controls:" + ucStem, subRes.axbPackage);
+            }
         }
         if (subRes.axbPackage.rootTypeName == "ResourceDictionary") {
             const std::string leaf = xp.filename().string();
@@ -852,6 +863,10 @@ void XamlApplication::Tick(float dtSeconds) {
         inputCount = inputRouter_->FlushQueuedEvents();
         inputRouter_->Tick(dtSeconds);
     }
+    std::size_t liveTickUpdates = 0u;
+    if (dtSeconds > 0.0f) {
+        liveTickUpdates = TickLiveControlsInSubtree(rootElement_.Get(), dtSeconds);
+    }
     std::size_t bindUpdates = 0u;
     if (bindingEngine_) {
         bindUpdates = bindingEngine_->FlushTrackA();
@@ -862,7 +877,7 @@ void XamlApplication::Tick(float dtSeconds) {
         animUpdates = animationEngine_->Tick(dtSeconds);
     }
     const std::uint8_t preFlags = rootElement_->GetLayoutDirtyFlags();
-    if (styleEngine_ && (!initialLayoutDone_ || inputCount > 0u || bindUpdates > 0u || animUpdates > 0u || preFlags != 0u)) {
+    if (styleEngine_ && (!initialLayoutDone_ || inputCount > 0u || liveTickUpdates > 0u || bindUpdates > 0u || animUpdates > 0u || preFlags != 0u)) {
         (void)styleEngine_->EvaluateAndApply();
     }
     const std::uint8_t layFlags = rootElement_->GetLayoutDirtyFlags();

@@ -7,6 +7,7 @@
 #include <cctype>
 #include <charconv>
 #include <cmath>
+#include <deque>
 #include <mutex>
 #include <unordered_map>
 #include <cstdlib>
@@ -951,6 +952,13 @@ Color ParseXamlColorLiteral(std::string_view raw) noexcept {
         {"AliceBlue", "FFF0F8FF"},
         {"Khaki", "FFF0E68C"},
         {"Orchid", "FFDA70D6"},
+        {"SlateGrey", "FF708090"},
+        {"LightSlateGray", "FF778899"},
+        {"LightSlateGrey", "FF778899"},
+        {"DarkSlateGrey", "FF2F4F4F"},
+        {"DimGray", "FF696969"},
+        {"DimGrey", "FF696969"},
+        {"Gainsboro", "FFDCDCDC"},
     };
     for (const auto& entry : kNamedColors) {
         if (EqualsIgnoreCase(raw, entry.name)) {
@@ -1016,6 +1024,321 @@ Matrix2D ParseXamlMatrix2DLiteral(std::string_view raw) noexcept {
         return Matrix2D::FromWpfMatrix(nums[0], nums[1], nums[2], nums[3], 0.0f, 0.0f);
     }
     return Matrix2D::Identity();
+}
+
+namespace {
+
+[[nodiscard]] std::string_view StripXmlnsPrefixLocal(std::string_view name) noexcept {
+    name = TrimWs(name);
+    if (const std::size_t colon = name.rfind(':'); colon != std::string_view::npos) {
+        return name.substr(colon + 1u);
+    }
+    return name;
+}
+
+struct CustomPropertyStorageEntry {
+    std::uint16_t propId = 0xFFFFu;
+    std::string ownerStorage;
+    std::string propertyStorage;
+    CustomPropertyValueKind valueKind = CustomPropertyValueKind::String;
+    UnifiedValue defaultValue{};
+    bool hasStringDefault = false;
+    std::string defaultStringCopy;
+};
+
+struct CustomPropertyRegistryState {
+    std::mutex mutex;
+    std::deque<CustomPropertyStorageEntry> entries;
+    std::unordered_map<std::string, std::uint16_t> byQualifiedKey;
+    std::unordered_map<std::string, std::uint16_t> byUnqualifiedName;
+};
+
+CustomPropertyRegistryState& GetCustomPropertyRegistryState() noexcept {
+    static CustomPropertyRegistryState sState;
+    return sState;
+}
+
+struct CustomAnimationStorageEntry {
+    std::string typeNameStorage;
+    std::string shortNameStorage;
+    CustomAnimationSpec spec{};
+};
+
+struct CustomAnimationRegistryState {
+    std::mutex mutex;
+    std::deque<CustomAnimationStorageEntry> entries;
+    std::unordered_map<std::string, std::uint16_t> byExactName;
+    std::unordered_map<std::string, std::uint16_t> byShortName;
+};
+
+CustomAnimationRegistryState& GetCustomAnimationRegistryState() noexcept {
+    static CustomAnimationRegistryState sState;
+    return sState;
+}
+
+[[nodiscard]] UnifiedValue CopyStoredDefaultValue(const CustomPropertyStorageEntry& entry) {
+    if (entry.hasStringDefault) {
+        return value::FromString(entry.defaultStringCopy);
+    }
+    return entry.defaultValue;
+}
+
+} // namespace
+
+std::uint16_t RegisterCustomProperty(
+    std::string_view ownerTypeName,
+    std::string_view propertyName,
+    CustomPropertyValueKind valueKind,
+    UnifiedValue defaultValue) {
+    const std::string_view cleanOwner = StripXmlnsPrefixLocal(ownerTypeName);
+    const std::string_view cleanProp = TrimWs(propertyName);
+    if (cleanOwner.empty() || cleanProp.empty()) {
+        return 0xFFFFu;
+    }
+
+    auto& state = GetCustomPropertyRegistryState();
+    std::lock_guard<std::mutex> lock(state.mutex);
+
+    std::string qualKey;
+    qualKey.reserve(cleanOwner.size() + 1u + cleanProp.size());
+    qualKey.append(cleanOwner);
+    qualKey.push_back('.');
+    qualKey.append(cleanProp);
+
+    if (const auto it = state.byQualifiedKey.find(qualKey); it != state.byQualifiedKey.end()) {
+        return it->second;
+    }
+
+    const std::size_t maxSlots =
+        static_cast<std::size_t>(PropId_LastCustom - PropId_FirstCustom) + 1u;
+    if (state.entries.size() >= maxSlots) {
+        return 0xFFFFu;
+    }
+
+    const std::uint16_t assignedId =
+        static_cast<std::uint16_t>(PropId_FirstCustom + state.entries.size());
+
+    CustomPropertyStorageEntry entry{};
+    entry.propId = assignedId;
+    entry.ownerStorage.assign(cleanOwner.data(), cleanOwner.size());
+    entry.propertyStorage.assign(cleanProp.data(), cleanProp.size());
+    entry.valueKind = valueKind;
+    if (const auto* sv = std::get_if<StringValue>(&defaultValue)) {
+        entry.hasStringDefault = true;
+        entry.defaultStringCopy = sv->str();
+    } else {
+        entry.defaultValue = std::move(defaultValue);
+    }
+    state.entries.push_back(std::move(entry));
+    state.byQualifiedKey.emplace(std::move(qualKey), assignedId);
+    state.byUnqualifiedName.try_emplace(std::string(cleanProp), assignedId);
+    return assignedId;
+}
+
+std::uint16_t FindCustomProperty(
+    std::string_view ownerTypeName,
+    std::string_view propertyName) noexcept {
+    try {
+        const std::string_view cleanOwner = StripXmlnsPrefixLocal(ownerTypeName);
+        const std::string_view cleanProp = TrimWs(propertyName);
+        if (cleanOwner.empty() || cleanProp.empty()) {
+            return 0xFFFFu;
+        }
+        auto& state = GetCustomPropertyRegistryState();
+        std::lock_guard<std::mutex> lock(state.mutex);
+        std::string qualKey;
+        qualKey.reserve(cleanOwner.size() + 1u + cleanProp.size());
+        qualKey.append(cleanOwner);
+        qualKey.push_back('.');
+        qualKey.append(cleanProp);
+        const auto it = state.byQualifiedKey.find(qualKey);
+        return (it != state.byQualifiedKey.end()) ? it->second : 0xFFFFu;
+    } catch (...) {
+        return 0xFFFFu;
+    }
+}
+
+std::uint16_t FindCustomPropertyByName(std::string_view propertyName) noexcept {
+    try {
+        const std::string_view cleanProp = TrimWs(propertyName);
+        if (cleanProp.empty()) {
+            return 0xFFFFu;
+        }
+        if (const std::size_t dot = cleanProp.rfind('.'); dot != std::string_view::npos) {
+            const std::uint16_t qualId =
+                FindCustomProperty(cleanProp.substr(0u, dot), cleanProp.substr(dot + 1u));
+            if (qualId != 0xFFFFu) {
+                return qualId;
+            }
+        }
+        auto& state = GetCustomPropertyRegistryState();
+        std::lock_guard<std::mutex> lock(state.mutex);
+        const auto it = state.byUnqualifiedName.find(std::string(cleanProp));
+        return (it != state.byUnqualifiedName.end()) ? it->second : 0xFFFFu;
+    } catch (...) {
+        return 0xFFFFu;
+    }
+}
+
+bool TryGetCustomPropertyDesc(
+    std::uint16_t propId,
+    CustomPropertyDesc& outDesc) noexcept {
+    if (!IsCustomPropertyId(propId)) {
+        return false;
+    }
+    try {
+        auto& state = GetCustomPropertyRegistryState();
+        std::lock_guard<std::mutex> lock(state.mutex);
+        const std::size_t idx = static_cast<std::size_t>(propId - PropId_FirstCustom);
+        if (idx >= state.entries.size()) {
+            return false;
+        }
+        const auto& e = state.entries[idx];
+        outDesc.propId = e.propId;
+        outDesc.ownerTypeName = e.ownerStorage;
+        outDesc.propertyName = e.propertyStorage;
+        outDesc.valueKind = e.valueKind;
+        outDesc.defaultValue = CopyStoredDefaultValue(e);
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
+bool TryGetCustomPropertyDefaultValue(
+    std::uint16_t propId,
+    UnifiedValue& outDefaultValue) noexcept {
+    if (!IsCustomPropertyId(propId)) {
+        return false;
+    }
+    try {
+        auto& state = GetCustomPropertyRegistryState();
+        std::lock_guard<std::mutex> lock(state.mutex);
+        const std::size_t idx = static_cast<std::size_t>(propId - PropId_FirstCustom);
+        if (idx >= state.entries.size()) {
+            return false;
+        }
+        outDefaultValue = CopyStoredDefaultValue(state.entries[idx]);
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
+std::string_view GetCustomPropertyName(std::uint16_t propId) noexcept {
+    if (!IsCustomPropertyId(propId)) {
+        return {};
+    }
+    try {
+        auto& state = GetCustomPropertyRegistryState();
+        std::lock_guard<std::mutex> lock(state.mutex);
+        const std::size_t idx = static_cast<std::size_t>(propId - PropId_FirstCustom);
+        if (idx >= state.entries.size()) {
+            return {};
+        }
+        return state.entries[idx].propertyStorage;
+    } catch (...) {
+        return {};
+    }
+}
+
+bool TryGetCustomPropertyValueKind(
+    std::uint16_t propId,
+    CustomPropertyValueKind& outKind) noexcept {
+    if (!IsCustomPropertyId(propId)) {
+        return false;
+    }
+    try {
+        auto& state = GetCustomPropertyRegistryState();
+        std::lock_guard<std::mutex> lock(state.mutex);
+        const std::size_t idx = static_cast<std::size_t>(propId - PropId_FirstCustom);
+        if (idx >= state.entries.size()) {
+            return false;
+        }
+        outKind = state.entries[idx].valueKind;
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
+std::uint16_t RegisterCustomAnimationType(const CustomAnimationSpec& spec) {
+    const std::string_view cleanType = TrimWs(spec.typeName);
+    const std::string_view shortType = StripXmlnsPrefixLocal(cleanType);
+    if (cleanType.empty() || shortType.empty()) {
+        return 0u;
+    }
+
+    auto& state = GetCustomAnimationRegistryState();
+    std::lock_guard<std::mutex> lock(state.mutex);
+
+    if (const auto it = state.byExactName.find(std::string(cleanType));
+        it != state.byExactName.end()) {
+        return it->second;
+    }
+    if (const auto it = state.byShortName.find(std::string(shortType));
+        it != state.byShortName.end()) {
+        return it->second;
+    }
+    if (state.entries.size() >= 0xFFFFu) {
+        return 0u;
+    }
+
+    const std::uint16_t assignedId = static_cast<std::uint16_t>(state.entries.size() + 1u);
+    CustomAnimationStorageEntry entry{};
+    entry.typeNameStorage.assign(cleanType.data(), cleanType.size());
+    entry.shortNameStorage.assign(shortType.data(), shortType.size());
+    entry.spec = spec;
+    entry.spec.typeName = entry.typeNameStorage;
+    entry.spec.defaultParams.animTypeId = assignedId;
+    entry.spec.defaultParams.reserved = 0u;
+
+    state.entries.push_back(std::move(entry));
+    state.byExactName.emplace(std::string(cleanType), assignedId);
+    state.byShortName.try_emplace(std::string(shortType), assignedId);
+    return assignedId;
+}
+
+const CustomAnimationSpec* FindCustomAnimationType(std::string_view typeName) noexcept {
+    try {
+        const std::string_view cleanType = TrimWs(typeName);
+        if (cleanType.empty()) {
+            return nullptr;
+        }
+        auto& state = GetCustomAnimationRegistryState();
+        std::lock_guard<std::mutex> lock(state.mutex);
+        if (const auto it = state.byExactName.find(std::string(cleanType));
+            it != state.byExactName.end()) {
+            const std::size_t idx = static_cast<std::size_t>(it->second - 1u);
+            return (idx < state.entries.size()) ? &state.entries[idx].spec : nullptr;
+        }
+        const std::string_view shortType = StripXmlnsPrefixLocal(cleanType);
+        if (const auto it = state.byShortName.find(std::string(shortType));
+            it != state.byShortName.end()) {
+            const std::size_t idx = static_cast<std::size_t>(it->second - 1u);
+            return (idx < state.entries.size()) ? &state.entries[idx].spec : nullptr;
+        }
+        return nullptr;
+    } catch (...) {
+        return nullptr;
+    }
+}
+
+const CustomAnimationSpec* GetCustomAnimationTypeById(std::uint16_t animTypeId) noexcept {
+    if (animTypeId == 0u) {
+        return nullptr;
+    }
+    try {
+        auto& state = GetCustomAnimationRegistryState();
+        std::lock_guard<std::mutex> lock(state.mutex);
+        const std::size_t idx = static_cast<std::size_t>(animTypeId - 1u);
+        if (idx >= state.entries.size()) {
+            return nullptr;
+        }
+        return &state.entries[idx].spec;
+    } catch (...) {
+        return nullptr;
+    }
 }
 
 std::uint16_t ResolveBuiltinPropertyId(std::string_view propertyName) noexcept {
@@ -1373,6 +1696,85 @@ std::uint16_t ResolveBuiltinPropertyId(std::string_view propertyName) noexcept {
     if (propertyName == "local:Text.Placeholder") {
         return PropId_Placeholder;
     }
+    if (propertyName == "AmountX" || propertyName == "EffectAmountX" || propertyName == "Effect.AmountX" ||
+        propertyName == "UIElement.Effect.AmountX" || propertyName == "ChromaticAberrationEffect.AmountX" ||
+        propertyName == "noesis:ChromaticAberrationEffect.AmountX") {
+        return PropId_EffectAmountX;
+    }
+    if (propertyName == "EffectAngle" || propertyName == "Effect.Angle" ||
+        propertyName == "UIElement.Effect.Angle" || propertyName == "DirectionalBlurEffect.Angle" ||
+        propertyName == "noesis:DirectionalBlurEffect.Angle") {
+        return PropId_EffectAngle;
+    }
+    if (propertyName == "Effect.Color" || propertyName == "UIElement.Effect.Color" ||
+        propertyName == "TintEffect.Color" || propertyName == "noesis:TintEffect.Color" ||
+        propertyName == "DropShadowEffect.Color") {
+        return PropId_EffectColor;
+    }
+    if (propertyName == "Effect.Radius" || propertyName == "Effect.Size" ||
+        propertyName == "UIElement.Effect.Radius" || propertyName == "UIElement.Effect.Size" ||
+        propertyName == "BlurEffect.Radius" || propertyName == "DirectionalBlurEffect.Radius" ||
+        propertyName == "noesis:DirectionalBlurEffect.Radius" ||
+        propertyName == "PixelateEffect.Size" || propertyName == "noesis:PixelateEffect.Size") {
+        return PropId_EffectBlurRadius;
+    }
+    if (propertyName == "Effect.Opacity" || propertyName == "DropShadowEffect.Opacity") {
+        return PropId_EffectOpacity;
+    }
+    if (propertyName == "Saturation" || propertyName == "SaturationEffect.Saturation" ||
+        propertyName == "noesis:SaturationEffect.Saturation" || propertyName == "SaturationBrush.Saturation" ||
+        propertyName == "noesis:SaturationBrush.Saturation") {
+        return PropId_Saturation;
+    }
+    if (propertyName == "LoadedBehavior" || propertyName == "MediaElement.LoadedBehavior") {
+        return PropId_LoadedBehavior;
+    }
+    if (propertyName == "UnloadedBehavior" || propertyName == "MediaElement.UnloadedBehavior") {
+        return PropId_UnloadedBehavior;
+    }
+    if (propertyName == "Volume" || propertyName == "MediaElement.Volume") {
+        return PropId_Volume;
+    }
+    if (propertyName == "IsMuted" || propertyName == "MediaElement.IsMuted") {
+        return PropId_IsMuted;
+    }
+    if (propertyName == "MediaPosition" || propertyName == "MediaElement.Position" || propertyName == "Position") {
+        return PropId_MediaPosition;
+    }
+    if (propertyName == "ConstrainToParentBounds" || propertyName == "MouseDragConstrain" ||
+        propertyName == "MouseDragElementBehavior.ConstrainToParentBounds") {
+        return PropId_MouseDragConstrain;
+    }
+    if (propertyName == "TrimStart" || propertyName == "Path.TrimStart" || propertyName == "noesis:Path.TrimStart") {
+        return PropId_PathTrimStart;
+    }
+    if (propertyName == "TrimEnd" || propertyName == "Path.TrimEnd" || propertyName == "noesis:Path.TrimEnd") {
+        return PropId_PathTrimEnd;
+    }
+    if (propertyName == "Time" || propertyName == "ShaderTime" || propertyName == "Brush.Time" ||
+        propertyName == "PlasmaBrush.Time" || propertyName == "noesis:PlasmaBrush.Time" ||
+        propertyName == "Shader.Time") {
+        return PropId_ShaderTime;
+    }
+    if (propertyName == "VisualBrush.Visual") {
+        return PropId_VisualBrush;
+    }
+    if (propertyName == "Exponent" || propertyName == "EasingExponent" ||
+        propertyName == "ExponentialEase.Exponent") {
+        return PropId_EasingExponent;
+    }
+    if (propertyName != "Tag") {
+        if (const std::size_t dot = propertyName.rfind('.'); dot != std::string_view::npos) {
+            const std::uint16_t customId =
+                FindCustomProperty(propertyName.substr(0u, dot), propertyName.substr(dot + 1u));
+            if (customId != 0xFFFFu) {
+                return customId;
+            }
+        }
+        if (const std::uint16_t customId = FindCustomPropertyByName(propertyName); customId != 0xFFFFu) {
+            return customId;
+        }
+    }
     return PropId_Tag;
 }
 
@@ -1413,6 +1815,22 @@ std::uint16_t ResolveAnimationTargetPropertyId(std::string_view targetPropertyPa
     if (s.empty()) {
         return PropId_Tag;
     }
+    // Check CustomPropertyRegistry first for single-hop qualified or unqualified custom properties
+    if (s.find(").(") == std::string_view::npos) {
+        std::string_view cleaned = s;
+        while (!cleaned.empty() && cleaned.front() == '(') cleaned.remove_prefix(1u);
+        while (!cleaned.empty() && cleaned.back() == ')') cleaned.remove_suffix(1u);
+        cleaned = TrimWs(cleaned);
+        if (const std::size_t dot = cleaned.rfind('.'); dot != std::string_view::npos) {
+            const std::uint16_t customId =
+                FindCustomProperty(cleaned.substr(0u, dot), cleaned.substr(dot + 1u));
+            if (customId != 0xFFFFu) {
+                return customId;
+            }
+        } else if (const std::uint16_t customId = FindCustomPropertyByName(cleaned); customId != 0xFFFFu) {
+            return customId;
+        }
+    }
     const bool mentionsTransform3D =
         (s.find("Transform3D") != std::string_view::npos) ||
         (s.find("Projection") != std::string_view::npos);
@@ -1434,7 +1852,9 @@ std::uint16_t ResolveAnimationTargetPropertyId(std::string_view targetPropertyPa
     }
     if (s.find("BlurRadius") != std::string_view::npos ||
         (s.find("BlurEffect") != std::string_view::npos && s.find("Radius") != std::string_view::npos) ||
-        (s.find("PixelateEffect") != std::string_view::npos && s.find("Size") != std::string_view::npos)) {
+        (s.find("PixelateEffect") != std::string_view::npos && s.find("Size") != std::string_view::npos) ||
+        (s.find("Effect") != std::string_view::npos &&
+         (s.find("Radius") != std::string_view::npos || s.find("Size") != std::string_view::npos))) {
         return PropId_EffectBlurRadius;
     }
     if (s.find("ShadowDepth") != std::string_view::npos) {
@@ -1443,6 +1863,24 @@ std::uint16_t ResolveAnimationTargetPropertyId(std::string_view targetPropertyPa
     if (s.find("DropShadowEffect.Opacity") != std::string_view::npos ||
         s.find("Effect.Opacity") != std::string_view::npos) {
         return PropId_EffectOpacity;
+    }
+    if (s.find("AmountX") != std::string_view::npos) {
+        return PropId_EffectAmountX;
+    }
+    if (s.find("Effect") != std::string_view::npos && s.find("Angle") != std::string_view::npos) {
+        return PropId_EffectAngle;
+    }
+    if (s.find("Effect") != std::string_view::npos && s.find("Color") != std::string_view::npos) {
+        return PropId_EffectColor;
+    }
+    if (s.find("Saturation") != std::string_view::npos) {
+        return PropId_Saturation;
+    }
+    if (s.find("TrimStart") != std::string_view::npos) {
+        return PropId_PathTrimStart;
+    }
+    if (s.find("TrimEnd") != std::string_view::npos) {
+        return PropId_PathTrimEnd;
     }
 
     const bool mentionsRenderTransform =
@@ -1482,13 +1920,18 @@ std::uint16_t ResolveAnimationTargetPropertyId(std::string_view targetPropertyPa
             return PropId_BackgroundOpacity;
         }
     }
-    if (s.find("Background") != std::string_view::npos || s.find("Fill") != std::string_view::npos) {
+    const bool isSubPropertyBrushPath =
+        (s.find("RelativeTransform") != std::string_view::npos) ||
+        (s.find(".Transform.") != std::string_view::npos);
+    if (!isSubPropertyBrushPath &&
+        (s.find("Background") != std::string_view::npos || s.find("Fill") != std::string_view::npos)) {
         return PropId_Background;
     }
     if (s.find("Foreground") != std::string_view::npos) {
         return PropId_Foreground;
     }
-    if (s.find("BorderBrush") != std::string_view::npos || s.find("Stroke") != std::string_view::npos) {
+    if (!isSubPropertyBrushPath &&
+        (s.find("BorderBrush") != std::string_view::npos || s.find("Stroke") != std::string_view::npos)) {
         return PropId_BorderBrush;
     }
     // Strip parens and take last leaf token e.g. "(UIElement.Opacity)" -> "Opacity"
@@ -1553,6 +1996,7 @@ EasingFunctionKind ParseEasingFunctionKind(std::string_view tagName) noexcept {
     if (tagName.find("Back") != std::string_view::npos) return EasingFunctionKind::Back;
     if (tagName.find("Bounce") != std::string_view::npos) return EasingFunctionKind::Bounce;
     if (tagName.find("Elastic") != std::string_view::npos) return EasingFunctionKind::Elastic;
+    if (tagName.find("Spline") != std::string_view::npos) return EasingFunctionKind::Spline;
     return EasingFunctionKind::Linear;
 }
 
@@ -2644,6 +3088,39 @@ RoutedTriggerEvent ParseRoutedTriggerEvent(
         outRecognized = true;
         return RoutedTriggerEvent::Indeterminate;
     }
+    if (EqualsIgnoreCase(s, "GotFocus") || EqualsIgnoreCase(s, "GotKeyboardFocus")) {
+        outRecognized = true;
+        return RoutedTriggerEvent::GotFocus;
+    }
+    if (EqualsIgnoreCase(s, "LostFocus") || EqualsIgnoreCase(s, "LostKeyboardFocus")) {
+        outRecognized = true;
+        return RoutedTriggerEvent::LostFocus;
+    }
+    if (EqualsIgnoreCase(s, "MouseDown") || EqualsIgnoreCase(s, "MouseLeftButtonDown") ||
+        EqualsIgnoreCase(s, "PreviewMouseDown") || EqualsIgnoreCase(s, "PreviewMouseLeftButtonDown")) {
+        outRecognized = true;
+        return RoutedTriggerEvent::MouseDown;
+    }
+    if (EqualsIgnoreCase(s, "MouseUp") || EqualsIgnoreCase(s, "MouseLeftButtonUp") ||
+        EqualsIgnoreCase(s, "PreviewMouseUp") || EqualsIgnoreCase(s, "PreviewMouseLeftButtonUp")) {
+        outRecognized = true;
+        return RoutedTriggerEvent::MouseUp;
+    }
+    if (EqualsIgnoreCase(s, "KeyDown") || EqualsIgnoreCase(s, "PreviewKeyDown") ||
+        EqualsIgnoreCase(s, "KeyTrigger") || EqualsIgnoreCase(s, "KeyDownTrigger") ||
+        EqualsIgnoreCase(s, "KeyUp") || EqualsIgnoreCase(s, "PreviewKeyUp")) {
+        outRecognized = true;
+        return RoutedTriggerEvent::KeyDownTrigger;
+    }
+    if (EqualsIgnoreCase(s, "TimerTrigger") || EqualsIgnoreCase(s, "TimerTick") ||
+        EqualsIgnoreCase(s, "Tick")) {
+        outRecognized = true;
+        return RoutedTriggerEvent::TimerTrigger;
+    }
+    if (EqualsIgnoreCase(s, "MediaEnded")) {
+        outRecognized = true;
+        return RoutedTriggerEvent::MediaEnded;
+    }
     return RoutedTriggerEvent::Loaded;
 }
 
@@ -2731,6 +3208,20 @@ UnifiedValue ParseBuiltinLiteralPropertyValue(
             }
             if (EqualsIgnoreCase(rawValue, "BackdropBlur") || rawValue == "4") {
                 return value::FromInt(4);
+            }
+            if (EqualsIgnoreCase(rawValue, "Tint") || EqualsIgnoreCase(rawValue, "TintEffect") || rawValue == "5") {
+                return value::FromInt(5);
+            }
+            if (EqualsIgnoreCase(rawValue, "ChromaticAberration") ||
+                EqualsIgnoreCase(rawValue, "ChromaticAberrationEffect") || rawValue == "6") {
+                return value::FromInt(6);
+            }
+            if (EqualsIgnoreCase(rawValue, "DirectionalBlur") ||
+                EqualsIgnoreCase(rawValue, "DirectionalBlurEffect") || rawValue == "7") {
+                return value::FromInt(7);
+            }
+            if (EqualsIgnoreCase(rawValue, "Saturation") || EqualsIgnoreCase(rawValue, "SaturationEffect") || rawValue == "8") {
+                return value::FromInt(8);
             }
             return value::FromInt(0);
         }
@@ -2981,7 +3472,9 @@ UnifiedValue ParseBuiltinLiteralPropertyValue(
         case PropId_IsSnapToTickEnabled:
         case PropId_IsMoveToPointEnabled:
         case PropId_AcceptsReturn:
-        case PropId_IsEditable: {
+        case PropId_IsEditable:
+        case PropId_IsMuted:
+        case PropId_MouseDragConstrain: {
             const std::string_view tv = TrimWs(rawValue);
             return UnifiedValue{EqualsIgnoreCase(tv, "true") || tv == "1"};
         }
@@ -2990,7 +3483,22 @@ UnifiedValue ParseBuiltinLiteralPropertyValue(
         case PropId_LineHeight:
         case PropId_CharacterSpacing:
         case PropId_MaxDropDownHeight:
+        case PropId_EffectAmountX:
+        case PropId_EffectAngle:
+        case PropId_PathTrimStart:
+        case PropId_ShaderTime:
             return MakeFloat(ParseFloat32Fast(TrimWs(rawValue), 0.0f));
+
+        case PropId_Volume:
+        case PropId_Saturation:
+        case PropId_PathTrimEnd:
+            return MakeFloat(ParseFloat32Fast(TrimWs(rawValue), 1.0f));
+
+        case PropId_EasingExponent:
+            return MakeFloat(ParseFloat32Fast(TrimWs(rawValue), 2.0f));
+
+        case PropId_MediaPosition:
+            return MakeFloat(ParseXamlTimeSpanSeconds(rawValue, 0.0f));
 
         case PropId_MaxLines:
             return value::FromInt(static_cast<std::int64_t>(std::llround(ParseFloat32Fast(TrimWs(rawValue), 0.0f))));
@@ -3033,8 +3541,49 @@ UnifiedValue ParseBuiltinLiteralPropertyValue(
             return value::FromInt(0);
         }
 
-        default:
+        default: {
+            if (IsCustomPropertyId(propId)) {
+                CustomPropertyValueKind kind = CustomPropertyValueKind::String;
+                if (TryGetCustomPropertyValueKind(propId, kind)) {
+                    switch (kind) {
+                        case CustomPropertyValueKind::Float:
+                            return MakeFloat(ParseFloat32Fast(TrimWs(rawValue), 0.0f));
+                        case CustomPropertyValueKind::Int: {
+                            const std::string_view tv = TrimWs(rawValue);
+                            std::int64_t iv = 0;
+                            const auto [ptr, ec] = std::from_chars(tv.data(), tv.data() + tv.size(), iv);
+                            if (ec != std::errc{} || ptr != tv.data() + tv.size()) {
+                                iv = static_cast<std::int64_t>(std::llround(ParseFloat32Fast(tv, 0.0f)));
+                            }
+                            return value::FromInt(iv);
+                        }
+                        case CustomPropertyValueKind::Bool: {
+                            const std::string_view tv = TrimWs(rawValue);
+                            return UnifiedValue{EqualsIgnoreCase(tv, "true") || tv == "1"};
+                        }
+                        case CustomPropertyValueKind::Color:
+                            return value::FromColor(ParseXamlColorLiteral(rawValue));
+                        case CustomPropertyValueKind::Brush:
+                            if (IsGradientBrushSpec(rawValue)) {
+                                return value::FromString(std::string(rawValue));
+                            }
+                            return value::FromColor(ParseXamlColorLiteral(rawValue));
+                        case CustomPropertyValueKind::Thickness: {
+                            const auto nums = ParseFloatListFast(rawValue);
+                            if (nums.size() == 1) return value::FromThickness(Thickness(nums[0]));
+                            if (nums.size() == 2) return value::FromThickness(Thickness(nums[0], nums[1]));
+                            if (nums.size() >= 4) {
+                                return value::FromThickness(Thickness(nums[0], nums[1], nums[2], nums[3]));
+                            }
+                            return value::FromThickness(Thickness{});
+                        }
+                        case CustomPropertyValueKind::String:
+                            break;
+                    }
+                }
+            }
             return value::FromString(DecodeXamlXmlEntities(rawValue));
+        }
     }
 }
 
@@ -4120,6 +4669,16 @@ void VisitAllPackageActions(Package& pkg, Fn&& fn) {
 }
 
 template <typename Package, typename Fn>
+void VisitAllPackageEventTriggers(Package& pkg, Fn&& fn) {
+    for (auto& st : pkg.styles) {
+        for (auto& et : st.eventTriggers) fn(et);
+    }
+    for (auto& ct : pkg.controlTemplates) {
+        for (auto& et : ct.eventTriggers) fn(et);
+    }
+}
+
+template <typename Package, typename Fn>
 void VisitAllNestedBindingChains(Package& pkg, Fn&& fn) {
     auto visitMulti = [&](auto& selfMulti, auto& selfChain, auto& mb) -> void {
         for (auto& srcCh : mb.sources) {
@@ -5055,6 +5614,7 @@ namespace {
 constexpr std::uint32_t kAxb4P15SectionMagic = 0x35315041u; // "AP15"
 constexpr std::uint32_t kAxb4SetterActionBindSectionMagic = 0x34414253u; // "SBA4"
 constexpr std::uint32_t kAxb4TargetNullExtSectionMagic = 0x34454E54u; // "TNE4"
+constexpr std::uint32_t kAxb4EventTrigExtSectionMagic = 0x34455445u; // "ETE4"
 } // namespace
 
 bool AxbPackage::HasP15Section() const noexcept {
@@ -5275,6 +5835,14 @@ std::vector<std::uint8_t> AxbPackage::Serialize() const {
                 (std::fabs(tl.speedRatio - 1.0f) > 1e-5f) ||
                 (tl.accelerationRatio > 1e-5f) ||
                 (tl.decelerationRatio > 1e-5f);
+            const bool hasCustomAnim =
+                (tl.customAnim.animTypeId != 0u) ||
+                (tl.customAnim.reserved != 0u) ||
+                (tl.customAnim.flags != 0u) ||
+                (std::fabs(tl.customAnim.params[0]) > 1e-6f) ||
+                (std::fabs(tl.customAnim.params[1]) > 1e-6f) ||
+                (std::fabs(tl.customAnim.params[2]) > 1e-6f) ||
+                (std::fabs(tl.customAnim.params[3]) > 1e-6f);
             std::uint8_t tlFlags = 0u;
             if (tl.hasFrom) tlFlags |= 0x01u;
             if (tl.hasTo) tlFlags |= 0x02u;
@@ -5282,11 +5850,20 @@ std::vector<std::uint8_t> AxbPackage::Serialize() const {
             if (tl.fillBehavior == FillBehavior::Stop) tlFlags |= 0x08u;
             if (tl.isBy) tlFlags |= 0x10u;
             if (hasRatios) tlFlags |= 0x20u;
+            if (hasCustomAnim) tlFlags |= 0x40u;
             WriteU8(out, tlFlags);
             if (hasRatios) {
                 WriteF32(out, tl.speedRatio);
                 WriteF32(out, tl.accelerationRatio);
                 WriteF32(out, tl.decelerationRatio);
+            }
+            if (hasCustomAnim) {
+                WriteU16(out, tl.customAnim.animTypeId);
+                WriteU16(out, tl.customAnim.reserved);
+                WriteU32(out, tl.customAnim.flags);
+                for (std::size_t pi = 0u; pi < kMaxCustomAnimationParams; ++pi) {
+                    WriteF32(out, tl.customAnim.params[pi]);
+                }
             }
             WriteValue(out, tl.fromValue);
             WriteValue(out, tl.toValue);
@@ -6007,6 +6584,63 @@ std::vector<std::uint8_t> AxbPackage::Serialize() const {
         }
     }
 
+    {
+        struct EventTrigExtEntry {
+            std::uint32_t ordinal = 0u;
+            const AxbEventTrigger* et = nullptr;
+        };
+        struct ActionExtEntry {
+            std::uint32_t ordinal = 0u;
+            const AxbInteractionAction* act = nullptr;
+        };
+        std::vector<EventTrigExtEntry> etEntries;
+        std::uint32_t etOrdinal = 0u;
+        VisitAllPackageEventTriggers(*this, [&](const AxbEventTrigger& et) {
+            if (et.keyCode != KeyCode::None ||
+                et.modifiers != KeyMod_None ||
+                et.activeOnFocus ||
+                et.firedOnKeyUp ||
+                et.timerIntervalMs != 0u ||
+                et.totalTicks != 0 ||
+                et.triggerSourceEvent != RoutedTriggerEvent::Loaded) {
+                etEntries.push_back(EventTrigExtEntry{etOrdinal, &et});
+            }
+            ++etOrdinal;
+        });
+        std::vector<ActionExtEntry> actEntries;
+        std::uint32_t actOrdinal = 0u;
+        VisitAllPackageActions(*this, [&](const AxbInteractionAction& act) {
+            if (act.isNullValue || act.commandTargetsWrapper) {
+                actEntries.push_back(ActionExtEntry{actOrdinal, &act});
+            }
+            ++actOrdinal;
+        });
+        if (!etEntries.empty() || !actEntries.empty()) {
+            WriteU32(out, kAxb4EventTrigExtSectionMagic);
+            WriteU32(out, static_cast<std::uint32_t>(etEntries.size()));
+            for (const auto& entry : etEntries) {
+                WriteU32(out, entry.ordinal);
+                WriteU16(out, static_cast<std::uint16_t>(entry.et->keyCode));
+                WriteU8(out, entry.et->modifiers);
+                std::uint8_t flags = 0u;
+                if (entry.et->activeOnFocus) flags |= 0x01u;
+                if (entry.et->firedOnKeyUp) flags |= 0x02u;
+                WriteU8(out, flags);
+                WriteU32(out, entry.et->timerIntervalMs);
+                WriteU32(out, static_cast<std::uint32_t>(entry.et->totalTicks));
+                WriteU8(out, static_cast<std::uint8_t>(entry.et->triggerSourceEvent));
+            }
+            WriteU32(out, static_cast<std::uint32_t>(actEntries.size()));
+            for (const auto& entry : actEntries) {
+                WriteU32(out, entry.ordinal);
+                std::uint8_t flags = 0u;
+                if (entry.act->isNullValue) flags |= 0x01u;
+                if (entry.act->commandTargetsWrapper) flags |= 0x02u;
+                WriteU8(out, flags);
+            }
+        }
+    }
+
     return out;
 }
 
@@ -6219,6 +6853,14 @@ bool DeserializeAxbPackageWithDepth(
                  (!r.ReadF32(tl.speedRatio) ||
                   !r.ReadF32(tl.accelerationRatio) ||
                   !r.ReadF32(tl.decelerationRatio))) ||
+                (((tlFlags & 0x40u) != 0u) &&
+                 (!r.ReadU16(tl.customAnim.animTypeId) ||
+                  !r.ReadU16(tl.customAnim.reserved) ||
+                  !r.ReadU32(tl.customAnim.flags) ||
+                  !r.ReadF32(tl.customAnim.params[0]) ||
+                  !r.ReadF32(tl.customAnim.params[1]) ||
+                  !r.ReadF32(tl.customAnim.params[2]) ||
+                  !r.ReadF32(tl.customAnim.params[3]))) ||
                 !r.ReadValue(tl.fromValue) ||
                 !r.ReadValue(tl.toValue) ||
                 !r.ReadU8(ek) ||
@@ -6278,6 +6920,7 @@ bool DeserializeAxbPackageWithDepth(
     constexpr std::uint32_t kSecBit_AP15 = 1u << 7;
     constexpr std::uint32_t kSecBit_TNE4 = 1u << 8;
     constexpr std::uint32_t kSecBit_SBA4 = 1u << 9;
+    constexpr std::uint32_t kSecBit_ETE4 = 1u << 10;
     std::uint32_t seenSectionMask = 0u;
 
     auto readHopVec = [&](std::vector<AxbCompiledHop>& hops) -> bool {
@@ -6552,7 +7195,7 @@ bool DeserializeAxbPackageWithDepth(
             constexpr std::uint8_t kMaxConditionSourceRaw =
                 static_cast<std::uint8_t>(TriggerConditionSource::AncestorProperty);
             constexpr std::uint8_t kMaxRoutedEventRaw =
-                static_cast<std::uint8_t>(RoutedTriggerEvent::Indeterminate);
+                static_cast<std::uint8_t>(RoutedTriggerEvent::MediaEnded);
 
             std::uint32_t bcExtCount = 0;
             if (!r.ReadU32(bcExtCount) || bcExtCount != pkg.bindingChains.size()) {
@@ -6952,7 +7595,7 @@ bool DeserializeAxbPackageWithDepth(
         constexpr std::uint8_t kMaxCtpCondSrcRaw =
             static_cast<std::uint8_t>(TriggerConditionSource::AncestorProperty);
         constexpr std::uint8_t kMaxCtpRoutedEventRaw =
-            static_cast<std::uint8_t>(RoutedTriggerEvent::Indeterminate);
+            static_cast<std::uint8_t>(RoutedTriggerEvent::MediaEnded);
 
         auto readCtpSetterList = [&](std::vector<AxbPropertySetter>& setters) -> bool {
             std::uint32_t sc = 0;
@@ -7167,7 +7810,7 @@ bool DeserializeAxbPackageWithDepth(
                 auto& act = acts[i];
                 std::uint8_t kindRaw = 0u, actFlags = 0u, sbOptRaw = 0u;
                 if (!r.ReadU8(kindRaw) ||
-                    kindRaw > static_cast<std::uint8_t>(InteractionActionKind::RemoveElement) ||
+                    kindRaw > static_cast<std::uint8_t>(InteractionActionKind::StopMedia) ||
                     !r.ReadString(act.actionName) ||
                     !r.ReadU8(actFlags) ||
                     !r.ReadString(act.targetName) ||
@@ -7531,6 +8174,68 @@ bool DeserializeAxbPackageWithDepth(
                 }
                 nestedChains[ordinal]->targetNullValue = std::move(val);
             }
+        } else if (trailMagic == kAxb4EventTrigExtSectionMagic) {
+            if ((seenSectionMask & kSecBit_ETE4) != 0u) {
+                return failStcSection("corrupted AXB4 duplicate ETE4 section");
+            }
+            seenSectionMask |= kSecBit_ETE4;
+            std::vector<AxbEventTrigger*> allEventTriggers;
+            VisitAllPackageEventTriggers(pkg, [&](AxbEventTrigger& et) {
+                allEventTriggers.push_back(&et);
+            });
+            std::uint32_t etExtCount = 0u;
+            if (!r.ReadU32(etExtCount) ||
+                etExtCount > allEventTriggers.size() ||
+                etExtCount > (r.size - r.offset) / 17u) {
+                return failStcSection("corrupted AXB4 ETE4 trigger header");
+            }
+            for (std::uint32_t i = 0u; i < etExtCount; ++i) {
+                std::uint32_t ordinal = 0u, intervalMs = 0u, totalTicksRaw = 0u;
+                std::uint16_t keyRaw = 0u;
+                std::uint8_t mods = 0u, flags = 0u, trigSrcRaw = 0u;
+                if (!r.ReadU32(ordinal) ||
+                    ordinal >= allEventTriggers.size() ||
+                    !r.ReadU16(keyRaw) ||
+                    !r.ReadU8(mods) ||
+                    !r.ReadU8(flags) ||
+                    !r.ReadU32(intervalMs) ||
+                    !r.ReadU32(totalTicksRaw) ||
+                    !r.ReadU8(trigSrcRaw) ||
+                    trigSrcRaw > static_cast<std::uint8_t>(RoutedTriggerEvent::MediaEnded)) {
+                    return failStcSection("corrupted AXB4 ETE4 trigger entry");
+                }
+                AxbEventTrigger* et = allEventTriggers[ordinal];
+                et->keyCode = static_cast<KeyCode>(keyRaw);
+                et->modifiers = mods;
+                et->activeOnFocus = (flags & 0x01u) != 0u;
+                et->firedOnKeyUp = (flags & 0x02u) != 0u;
+                et->timerIntervalMs = intervalMs;
+                et->totalTicks = static_cast<std::int32_t>(totalTicksRaw);
+                et->triggerSourceEvent = static_cast<RoutedTriggerEvent>(trigSrcRaw);
+            }
+
+            std::vector<AxbInteractionAction*> allActions;
+            VisitAllPackageActions(pkg, [&](AxbInteractionAction& act) {
+                allActions.push_back(&act);
+            });
+            std::uint32_t actExtCount = 0u;
+            if (!r.ReadU32(actExtCount) ||
+                actExtCount > allActions.size() ||
+                actExtCount > (r.size - r.offset) / 5u) {
+                return failStcSection("corrupted AXB4 ETE4 action header");
+            }
+            for (std::uint32_t i = 0u; i < actExtCount; ++i) {
+                std::uint32_t ordinal = 0u;
+                std::uint8_t flags = 0u;
+                if (!r.ReadU32(ordinal) ||
+                    ordinal >= allActions.size() ||
+                    !r.ReadU8(flags)) {
+                    return failStcSection("corrupted AXB4 ETE4 action entry");
+                }
+                AxbInteractionAction* act = allActions[ordinal];
+                act->isNullValue = (flags & 0x01u) != 0u;
+                act->commandTargetsWrapper = (flags & 0x02u) != 0u;
+            }
         } else {
             return failStcSection("corrupted AXB4 unknown trailing section magic");
         }
@@ -7716,6 +8421,15 @@ Color EvaluateGradientBrushAtNormalizedUv(
         if (lenSq > 1e-8f) {
             t = ((sampleX - brush.startPoint.x) * dx + (sampleY - brush.startPoint.y) * dy) / lenSq;
         }
+    } else if (brush.kind == GradientBrushKind::Conic) {
+        constexpr float kTwoPi = 6.2831853071795864769f;
+        const float dx = sampleX - brush.center.x;
+        const float dy = sampleY - brush.center.y;
+        float angle = std::atan2(dy, dx);
+        if (angle < 0.0f) {
+            angle += kTwoPi;
+        }
+        t = angle / kTwoPi;
     } else {
         const float rx = std::max(1e-4f, std::fabs(brush.radiusX));
         const float ry = std::max(1e-4f, std::fabs(brush.radiusY));
@@ -7757,7 +8471,10 @@ bool IsGradientBrushSpec(std::string_view raw) noexcept {
 
 std::string SerializeGradientBrushSpec(const GradientBrushDesc& brush) {
     std::string out(kGradientSpecPrefix);
-    out.push_back(brush.kind == GradientBrushKind::Radial ? 'R' : 'L');
+    char kindChar = 'L';
+    if (brush.kind == GradientBrushKind::Radial) kindChar = 'R';
+    else if (brush.kind == GradientBrushKind::Conic) kindChar = 'C';
+    out.push_back(kindChar);
     out.push_back(';');
     out.push_back(brush.mappingMode == BrushMappingMode::Absolute ? '1' : '0');
     out.push_back(',');
@@ -7821,9 +8538,13 @@ bool TryDeserializeGradientBrushSpec(std::string_view raw, GradientBrushDesc& ou
     }
 
     GradientBrushDesc parsed{};
-    parsed.kind = (!tokens[0].empty() && (tokens[0][0] == 'R' || tokens[0][0] == 'r'))
-        ? GradientBrushKind::Radial
-        : GradientBrushKind::Linear;
+    if (!tokens[0].empty() && (tokens[0][0] == 'R' || tokens[0][0] == 'r')) {
+        parsed.kind = GradientBrushKind::Radial;
+    } else if (!tokens[0].empty() && (tokens[0][0] == 'C' || tokens[0][0] == 'c')) {
+        parsed.kind = GradientBrushKind::Conic;
+    } else {
+        parsed.kind = GradientBrushKind::Linear;
+    }
 
     const auto hdrNums = ParseFloatListFast(tokens[1]);
     if (hdrNums.size() >= 1u) {

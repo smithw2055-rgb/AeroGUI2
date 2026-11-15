@@ -69,6 +69,7 @@ enum AxbResourceLookupFlags : std::uint8_t {
 enum class GradientBrushKind : std::uint8_t {
     Linear = 0,
     Radial = 1,
+    Conic = 2,
 };
 
 enum class BrushMappingMode : std::uint8_t {
@@ -199,6 +200,44 @@ struct AxbKeyFrame {
     std::uint16_t bindingPropId = 0xFFFFu;
 };
 
+inline constexpr std::size_t kMaxCustomAnimationParams = 4u;
+
+struct CustomAnimationParams {
+    std::uint16_t animTypeId = 0u;
+    std::uint16_t reserved = 0u;
+    std::uint32_t flags = 0u;
+    float params[kMaxCustomAnimationParams] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+    [[nodiscard]] bool IsActive() const noexcept {
+        return animTypeId != 0u;
+    }
+};
+
+using CustomAnimationParseAttrFn = bool (*)(
+    std::string_view attrName,
+    std::string_view attrValue,
+    CustomAnimationParams& inOutParams);
+
+using CustomAnimationEvalFn = float (*)(
+    const CustomAnimationParams& params,
+    EasingMode easingMode,
+    float normalizedT,
+    float startValue,
+    float endValue,
+    float defaultOriginValue);
+
+struct CustomAnimationSpec {
+    std::string_view typeName;
+    CustomAnimationParseAttrFn parseAttr = nullptr;
+    CustomAnimationEvalFn evaluate = nullptr;
+    CustomAnimationParams defaultParams{};
+    bool requiresFromTo = true;
+};
+
+[[nodiscard]] std::uint16_t RegisterCustomAnimationType(const CustomAnimationSpec& spec);
+[[nodiscard]] const CustomAnimationSpec* FindCustomAnimationType(std::string_view typeName) noexcept;
+[[nodiscard]] const CustomAnimationSpec* GetCustomAnimationTypeById(std::uint16_t animTypeId) noexcept;
+
 struct AxbAnimationTimeline {
     std::string targetName;
     std::uint16_t targetPropertyId = 0;
@@ -218,6 +257,7 @@ struct AxbAnimationTimeline {
     bool autoReverse = false;
     std::int32_t repeatCount = 1; // <= 0 denotes Forever loop
     std::vector<AxbKeyFrame> keyFrames;
+    CustomAnimationParams customAnim{};
 };
 
 struct AxbStoryboard {
@@ -330,6 +370,13 @@ enum class InteractionActionKind : std::uint8_t {
     InvokeCommand = 2,
     PlaySound = 3,
     RemoveElement = 4,
+    GoToState = 5,
+    SetFocus = 6,
+    Select = 7,
+    SelectAll = 8,
+    LaunchUri = 9,
+    PlayMedia = 10,
+    StopMedia = 11,
 };
 
 struct AxbInteractionAction {
@@ -408,6 +455,13 @@ enum class RoutedTriggerEvent : std::uint8_t {
     StoryboardCompleted = 8,
     PropertyChanged = 9,
     Indeterminate = 10,
+    GotFocus = 11,
+    LostFocus = 12,
+    MouseDown = 13,
+    MouseUp = 14,
+    KeyDownTrigger = 15,
+    TimerTrigger = 16,
+    MediaEnded = 17,
 };
 
 struct AxbEventTrigger {
@@ -416,6 +470,13 @@ struct AxbEventTrigger {
     std::vector<AxbTriggerCondition> conditions;
     std::vector<AxbStoryboard> storyboards;
     std::vector<AxbInteractionAction> actions;
+    KeyCode keyCode = KeyCode::None;
+    std::uint8_t modifiers = KeyMod_None;
+    bool activeOnFocus = false;
+    bool firedOnKeyUp = false;
+    std::uint32_t timerIntervalMs = 0u;
+    std::int32_t totalTicks = 0;
+    RoutedTriggerEvent triggerSourceEvent = RoutedTriggerEvent::Loaded;
 };
 
 struct AxbVisualState {

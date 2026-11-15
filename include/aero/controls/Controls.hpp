@@ -735,6 +735,12 @@ public:
     void SetStretch(Stretch stretch);
     [[nodiscard]] Stretch GetStretch() const noexcept;
 
+    void SetTrimStart(float trimStart);
+    [[nodiscard]] float GetTrimStart() const noexcept;
+
+    void SetTrimEnd(float trimEnd);
+    [[nodiscard]] float GetTrimEnd() const noexcept;
+
     Size MeasureCore(Size availableSize) noexcept override;
 };
 
@@ -2004,6 +2010,75 @@ private:
     SelectedItemChangedCallback selectedItemChangedCallback_;
     bool selecting_ = false;
 };
+
+class MediaElement : public UIElement {
+public:
+    using MediaEndedCallback = std::function<void(MediaElement&)>;
+
+    MediaElement();
+    ~MediaElement() override = default;
+
+    static const TypeClass* StaticTypeClass() noexcept;
+    [[nodiscard]] const TypeClass* GetTypeClass() const noexcept override {
+        return StaticTypeClass();
+    }
+
+    void SetSource(std::string_view sourceUri);
+    [[nodiscard]] std::string GetSource() const;
+
+    void SetStretch(Stretch stretch);
+    [[nodiscard]] Stretch GetStretch() const noexcept;
+
+    void SetLoadedBehavior(std::string_view behavior);
+    [[nodiscard]] std::string GetLoadedBehavior() const;
+
+    void SetUnloadedBehavior(std::string_view behavior);
+    [[nodiscard]] std::string GetUnloadedBehavior() const;
+
+    void SetVolume(float volume);
+    [[nodiscard]] float GetVolume() const noexcept;
+
+    void SetIsMuted(bool muted);
+    [[nodiscard]] bool GetIsMuted() const noexcept;
+
+    void SetPosition(float seconds);
+    [[nodiscard]] float GetPosition() const noexcept;
+
+    void Play();
+    void Pause();
+    void Stop();
+
+    [[nodiscard]] bool IsPlaying() const noexcept { return isPlaying_; }
+    [[nodiscard]] float PositionSeconds() const noexcept { return positionSeconds_; }
+    [[nodiscard]] float DurationSeconds() const noexcept { return durationSeconds_; }
+    void SetDurationSeconds(float duration);
+    [[nodiscard]] std::uint32_t MediaEndedGeneration() const noexcept { return mediaEndedGeneration_; }
+    void SetMediaEndedCallback(MediaEndedCallback cb) { mediaEndedCallback_ = std::move(cb); }
+
+    void OnPropertyChanged(std::uint16_t propId, const UnifiedValue& newValue) override;
+    void TickControl(float dtSeconds) override;
+    [[nodiscard]] bool NeedsContinuousTick() const override { return isPlaying_; }
+    Size MeasureCore(Size availableSize) noexcept override;
+
+private:
+    bool isPlaying_ = false;
+    float positionSeconds_ = 0.0f;
+    float durationSeconds_ = 10.0f;
+    std::uint32_t mediaEndedGeneration_ = 0u;
+    MediaEndedCallback mediaEndedCallback_;
+};
+
+// Generic Custom Control Factory Registry (zero sample-specific knowledge in core)
+using CustomControlFactory = std::shared_ptr<UIElement>(*)();
+
+void RegisterCustomControlType(
+    std::string_view typeName,
+    CustomControlFactory factory,
+    bool isTemplatedControl = false);
+
+[[nodiscard]] bool IsCustomControlRegistered(
+    std::string_view typeName,
+    bool* outIsTemplatedControl = nullptr) noexcept;
 
 // Factory and self-contained .axb4 instruction VM mounting
 [[nodiscard]] IntrusivePtr<UIElement> CreateElementByTypeName(std::string_view typeName);

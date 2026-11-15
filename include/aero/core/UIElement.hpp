@@ -32,6 +32,88 @@ struct UIEffectDescriptor {
     float directionDeg = 315.0f;
     float opacity = 1.0f;
     Color color{0.0f, 0.0f, 0.0f, 1.0f};
+    float amountX = 0.0f;
+    float angleDeg = 0.0f;
+    float saturation = 1.0f;
+};
+
+using RectF = Rect;
+using PointF = Point;
+
+class CustomDrawingContext {
+public:
+    virtual ~CustomDrawingContext() = default;
+
+    virtual void FillRect(const RectF& rect, const Color& color) {
+        (void)rect;
+        (void)color;
+    }
+    virtual void DrawRect(const RectF& rect, const Color& strokeColor, float strokeWidth = 1.0f) {
+        (void)rect;
+        (void)strokeColor;
+        (void)strokeWidth;
+    }
+    virtual void FillRoundedRect(
+        const RectF& rect,
+        float radiusX,
+        float radiusY,
+        const Color& color) {
+        (void)radiusX;
+        (void)radiusY;
+        FillRect(rect, color);
+    }
+    virtual void DrawRoundedRect(
+        const RectF& rect,
+        float radiusX,
+        float radiusY,
+        const Color& strokeColor,
+        float strokeWidth = 1.0f) {
+        (void)radiusX;
+        (void)radiusY;
+        DrawRect(rect, strokeColor, strokeWidth);
+    }
+    virtual void FillEllipse(const PointF& center, float radiusX, float radiusY, const Color& color) {
+        (void)center;
+        (void)radiusX;
+        (void)radiusY;
+        (void)color;
+    }
+    virtual void DrawEllipse(
+        const PointF& center,
+        float radiusX,
+        float radiusY,
+        const Color& strokeColor,
+        float strokeWidth = 1.0f) {
+        (void)center;
+        (void)radiusX;
+        (void)radiusY;
+        (void)strokeColor;
+        (void)strokeWidth;
+    }
+    virtual void DrawLine(
+        const PointF& start,
+        const PointF& end,
+        const Color& strokeColor,
+        float strokeWidth = 1.0f) {
+        (void)start;
+        (void)end;
+        (void)strokeColor;
+        (void)strokeWidth;
+    }
+    virtual void DrawText(
+        std::string_view text,
+        const RectF& layoutRect,
+        const Color& color,
+        float fontSize = 14.0f,
+        HorizontalAlignment hAlign = HorizontalAlignment::Left,
+        VerticalAlignment vAlign = VerticalAlignment::Top) {
+        (void)text;
+        (void)layoutRect;
+        (void)color;
+        (void)fontSize;
+        (void)hAlign;
+        (void)vAlign;
+    }
 };
 
 template <typename T>
@@ -123,8 +205,16 @@ public:
     }
     void Release() const noexcept {
         if (refCount_.fetch_sub(1u, std::memory_order_acq_rel) == 1u) {
+            if (ownedBySharedPtr_) {
+                auto holder = std::move(sharedSelfKeepAlive_);
+                return;
+            }
             delete this;
         }
+    }
+    void AdoptSharedOwnership(std::shared_ptr<UIElement> selfHolder) const noexcept {
+        ownedBySharedPtr_ = (selfHolder != nullptr);
+        sharedSelfKeepAlive_ = std::move(selfHolder);
     }
     [[nodiscard]] std::uint32_t RefCount() const noexcept {
         return refCount_.load(std::memory_order_relaxed);
@@ -440,6 +530,9 @@ public:
                 static_cast<std::uint32_t>(key) | (static_cast<std::uint32_t>(modifiers) << 16u));
             handled = DispatchWrapperRoutedEvent("KeyUp", value::FromInt(packed), true) || handled;
         }
+        if (!handled) {
+            handled = OnKeyUp(key, modifiers);
+        }
         return handled;
     }
     [[nodiscard]] std::uint32_t BubbledClickGeneration() const noexcept { return bubbledClickGen_; }
@@ -450,6 +543,7 @@ public:
     }
 
     virtual bool OnKeyDown(KeyCode key, std::uint8_t modifiers);
+    virtual bool OnKeyUp(KeyCode key, std::uint8_t modifiers);
     virtual bool OnTextInput(std::string_view utf8Text);
     virtual void OnFocusChanged(bool focused);
     virtual void OnPointerCaptureLost() noexcept;
@@ -715,6 +809,9 @@ public:
         fastProps_.layoutDirtyFlags |= RenderDirty;
         PropagateSubtreeDirty(SubtreeRenderDirty);
     }
+    void InvalidateVisual() noexcept {
+        InvalidateRender();
+    }
     void InvalidateLayout() noexcept {
         fastProps_.layoutDirtyFlags |= (MeasureDirty | ArrangeDirty | RenderDirty);
         PropagateSubtreeDirty(static_cast<std::uint8_t>(SubtreeLayoutDirty | SubtreeRenderDirty));
@@ -843,6 +940,12 @@ public:
     void MarkSparseValuesInPools() const noexcept;
     void MarkSubtreeValuesInPools() const noexcept;
 
+    [[nodiscard]] virtual bool HasCustomRender() const { return false; }
+    virtual void OnRender(CustomDrawingContext& dc) { (void)dc; }
+
+    virtual void TickControl(float deltaSeconds) { (void)deltaSeconds; }
+    [[nodiscard]] virtual bool NeedsContinuousTick() const { return false; }
+
 protected:
     void CoerceSparseFloatInPlace(std::uint16_t propId, float clampedValue) noexcept;
     void EnsureRegisteredInValuePoolSet() noexcept;
@@ -940,6 +1043,8 @@ private:
     // High-frequency properties inline + 32B compact sparse vector
     FastInlineStorage fastProps_{};
     std::vector<CompactPropertyEntry> sparseProps_;
+    mutable std::shared_ptr<UIElement> sharedSelfKeepAlive_;
+    mutable bool ownedBySharedPtr_ = false;
 };
 
 class Panel : public UIElement {
@@ -1059,6 +1164,9 @@ private:
 
 // Initialize built-in AeroGUI TypeClass hierarchy and Euler-tour intervals
 void EnsureBuiltinTypesRegistered() noexcept;
+
+std::size_t TickLiveControlsInSubtree(UIElement* root, float dtSeconds);
+[[nodiscard]] bool SubtreeNeedsContinuousTick(const UIElement* root) noexcept;
 
 // P1-2: Zero-ABI-overhead lifecycle & Loc.Source hooks for weak DynamicResource / Loc cleanup
 using UIElementDestroyHook = void (*)(const UIElement* element) noexcept;
