@@ -13,6 +13,7 @@ namespace aero {
 
 class ITextInputMethodHost;
 class AnimationEngine;
+class StyleTriggerEngine;
 
 enum class InputEventKind : std::uint8_t {
     PointerMove = 0,
@@ -61,6 +62,9 @@ public:
 
     void SetAnimationEngine(AnimationEngine* animationEngine) noexcept { animationEngine_ = animationEngine; }
     [[nodiscard]] AnimationEngine* GetAnimationEngine() const noexcept { return animationEngine_; }
+
+    void SetStyleTriggerEngine(StyleTriggerEngine* styleEngine) noexcept { styleEngine_ = styleEngine; }
+    [[nodiscard]] StyleTriggerEngine* GetStyleTriggerEngine() const noexcept { return styleEngine_; }
 
     // Non-allocating event ring queue API (for HostDrivers UiPhase_Input)
     bool QueuePointerMove(Point position, std::uint8_t modifiers = KeyMod_None) noexcept;
@@ -125,6 +129,9 @@ private:
     void PruneDisconnectedTargets() noexcept;
     [[nodiscard]] bool BelongsToRoot(const UIElement* elem) const noexcept;
     [[nodiscard]] UIElement* ResolveInteractiveTarget(UIElement* hitLeaf) const noexcept;
+    [[nodiscard]] StyleTriggerEngine* ResolveStyleEngine(const UIElement* hint) const noexcept;
+    [[nodiscard]] static UIElement* FindInitialFocusedInTree(UIElement* root) noexcept;
+    void SyncFocusedFromTreeIfNeeded() noexcept;
     void UpdateHoveredTarget(UIElement* newHovered) noexcept;
     void SyncImeFocusState();
     void CloseActiveComboBoxIfOpen();
@@ -134,6 +141,7 @@ private:
     UIElement* rootVisual_ = nullptr;
     ITextInputMethodHost* imeHost_ = nullptr;
     AnimationEngine* animationEngine_ = nullptr;
+    StyleTriggerEngine* styleEngine_ = nullptr;
 
     IntrusivePtr<UIElement> hoveredElement_{};
     IntrusivePtr<UIElement> capturedElement_{};
@@ -141,7 +149,13 @@ private:
     IntrusivePtr<ComboBox> openComboBox_{};
     IntrusivePtr<ContextMenu> openContextMenu_{};
     IntrusivePtr<ToolTip> activeToolTip_{};
+    IntrusivePtr<ToolTip> retiredAutoToolTip_{};
     IntrusivePtr<UIElement> activeToolTipOwner_{};
+    bool isDraggingBehavior_ = false;
+    bool dragConstrainToParent_ = false;
+    Point dragStartParentPos_{0.0f, 0.0f};
+    float dragStartTranslateX_ = 0.0f;
+    float dragStartTranslateY_ = 0.0f;
     float repeatHoldElapsedMs_ = 0.0f;
     float repeatNextFireMs_ = 0.0f;
 

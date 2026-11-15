@@ -1300,8 +1300,13 @@ UnifiedValue DualTrackBindingEngine::FinalizeTargetPropertyValue(
             }
         }
     }
+    CustomPropertyValueKind customKind = CustomPropertyValueKind::String;
+    const bool hasCustomKind =
+        IsCustomPropertyId(targetPropId) &&
+        TryGetCustomPropertyValueKind(targetPropId, customKind);
     if ((targetPropId == PropId_Background || targetPropId == PropId_Foreground ||
-         targetPropId == PropId_BorderBrush || targetPropId == PropId_EffectColor) &&
+         targetPropId == PropId_BorderBrush || targetPropId == PropId_EffectColor ||
+         (hasCustomKind && customKind == CustomPropertyValueKind::Color)) &&
         std::holds_alternative<StringValue>(val)) {
         const std::string_view sv = std::get<StringValue>(val).view();
         if (!sv.empty()) {
@@ -1310,7 +1315,8 @@ UnifiedValue DualTrackBindingEngine::FinalizeTargetPropertyValue(
     }
     if (targetPropId == PropId_Text || targetPropId == PropId_Title ||
         targetPropId == PropId_Placeholder || targetPropId == PropId_Header ||
-        targetPropId == PropId_RichText) {
+        targetPropId == PropId_RichText ||
+        (hasCustomKind && customKind == CustomPropertyValueKind::String)) {
         if (std::holds_alternative<NullString>(val)) {
             return value::FromString("");
         }
@@ -1759,6 +1765,8 @@ bool DualTrackBindingEngine::EvaluateAndSyncElementBinding(ElementPropertyBindin
     if (!eb.cachedSourceElement) {
         if (eb.relativeSelf) {
             eb.cachedSourceElement = target;
+        } else if (eb.relativeAncestorType == "$TemplatedParent") {
+            eb.cachedSourceElement = target->TemplatedParent();
         } else if (!eb.relativeAncestorType.empty()) {
             for (UIElement* anc = target; anc != nullptr; anc = anc->Parent()) {
                 bool matched = false;
@@ -2554,6 +2562,8 @@ UnifiedValue DualTrackBindingEngine::EvaluateMultiBindingValue(
             if (!slot.cachedSourceElement) {
                 if (slot.relativeSelf) {
                     slot.cachedSourceElement = target;
+                } else if (slot.relativeAncestorType == "$TemplatedParent") {
+                    slot.cachedSourceElement = target->TemplatedParent();
                 } else if (!slot.relativeAncestorType.empty()) {
                     for (UIElement* anc = target; anc != nullptr; anc = anc->Parent()) {
                         bool matched = false;

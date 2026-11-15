@@ -109,6 +109,17 @@ public:
     // Evaluate all bound Property/Data/Event/Interaction triggers & automatic CommonStates/FocusStates/CheckStates
     std::size_t EvaluateAndApply();
     std::size_t EvaluateSubtree(UIElement* subtreeRoot, bool resetEventStates = false);
+    [[nodiscard]] bool NotifyKeyTriggerEvent(
+        UIElement* focusedElement,
+        UIElement* rootVisual,
+        KeyCode key,
+        std::uint8_t modifiers,
+        bool isKeyUp);
+    void NotifyRoutedElementEvent(
+        UIElement* element,
+        RoutedTriggerEvent eventKind);
+    std::size_t TickTimers(float dtSeconds);
+    [[nodiscard]] const std::vector<std::string>& LaunchedUris() const noexcept { return launchedUris_; }
 
     [[nodiscard]] std::size_t BoundElementCount() const noexcept { return instances_.size(); }
 
@@ -132,12 +143,20 @@ private:
         IntrusivePtr<UIElement> cachedSource{};
         UnifiedValue prevWatchedValue{};
         std::uint32_t lastClickGen = 0u;
+        std::uint32_t lastMediaEndedGen = 0u;
         std::int64_t prevSelectedIndex = -1;
         float prevNumericValue = 0.0f;
+        float timerElapsedMs = 0.0f;
+        std::int32_t timerTicksFired = 0;
+        double lastAnimClockSec = -1.0;
         std::uint16_t watchedPropId = 0xFFFFu;
         bool prevHovered = false;
         bool prevChecked = false;
+        bool prevFocused = false;
+        bool prevPressed = false;
         bool prevStoryboardActive = false;
+        bool timerActive = false;
+        bool timerTickedExplicitly = false;
         bool initialized = false;
     };
 
@@ -152,16 +171,17 @@ private:
         std::vector<PropertySnapshotSlot> propertySnapshots;
     };
 
+    [[nodiscard]] std::size_t FindInstanceIndex(const UIElement* elem) const noexcept;
     [[nodiscard]] AxbStyleDefinition FlattenStyleChain(const AxbStyleDefinition& leaf) const;
     [[nodiscard]] bool EvaluateSingleCondition(
         UIElement* elem,
         AxbTriggerCondition& cond);
-    [[nodiscard]] bool EvaluateEventTriggers(StyledElementInstance& inst);
+    [[nodiscard]] bool EvaluateEventTriggers(std::size_t instIdx);
     void ExecuteInteractionActions(
-        StyledElementInstance& inst,
-        std::vector<AxbInteractionAction>& actions);
+        std::size_t instIdx,
+        std::vector<AxbInteractionAction> actions);
     void ExecuteSingleInteractionAction(
-        StyledElementInstance& inst,
+        std::size_t instIdx,
         AxbInteractionAction& action);
     [[nodiscard]] static bool HasFocusedDescendant(const UIElement* elem) noexcept;
     [[nodiscard]] static bool IsFastInlineAtDefault(const UIElement* elem, std::uint16_t propId) noexcept;
@@ -173,7 +193,7 @@ private:
     void CaptureSnapshotIfNeeded(PropertySnapshotSlot& slot);
     void RestoreAllCapturedSnapshots(StyledElementInstance& inst);
     void ReapplyActiveOverrides(
-        StyledElementInstance& inst,
+        std::size_t instIdx,
         std::uint64_t newTriggerMask,
         bool useTransitions,
         bool isInitialPass);
@@ -185,6 +205,7 @@ private:
     const Interpreter* uiInterpreter_ = nullptr;
     rs_aot::ExecutionContext* aotContext_ = nullptr;
     SoundActionCallback soundActionCallback_{};
+    std::vector<std::string> launchedUris_;
     std::unordered_map<std::string, AxbStyleDefinition> keyedStyles_;
     std::unordered_map<std::string, AxbStyleDefinition> implicitTypeStyles_;
     std::unordered_map<std::string, AxbStoryboard> keyedStoryboards_;

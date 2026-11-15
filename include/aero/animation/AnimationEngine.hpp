@@ -237,6 +237,7 @@ public:
     [[nodiscard]] std::uint16_t FindActiveTrackId(
         const UIElement* target,
         std::uint16_t propId) const noexcept;
+    [[nodiscard]] double CumulativeTimeSeconds() const noexcept { return cumulativeElapsedSec_; }
 
 private:
     struct AnimationTrack {
@@ -275,6 +276,9 @@ private:
         std::uint32_t sliceCount = 0u;
         std::uint32_t cachedSegmentIdx = 0u;
         std::uint64_t storyboardHash = 0ULL;
+
+        CustomAnimationParams customAnim{};
+        float defaultOriginScalar = 0.0f;
 
         std::array<InlineTrackKeyFrame, kMaxInlineKeyFrames> keyFrames{};
     };
@@ -366,6 +370,7 @@ private:
     std::vector<std::uint16_t> freeTrackIds_;
     std::size_t activeCount_ = 0u;
     std::size_t pausedCount_ = 0u;
+    double cumulativeElapsedSec_ = 0.0;
     std::vector<MotionStateMachineInstance> stateMachines_;
     std::function<void()> wakeHostCallback_{};
     std::function<void(const TimelineEventInvocation&)> timelineEventCallback_{};

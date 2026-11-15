@@ -68,7 +68,11 @@ InputEventRouter::InputEventRouter(
     UIElement* rootVisual,
     ITextInputMethodHost* imeHost) noexcept
     : rootVisual_(rootVisual),
-      imeHost_(imeHost) {}
+      imeHost_(imeHost) {
+    if (UIElement* initFocused = FindInitialFocusedInTree(rootVisual_)) {
+        focusedElement_.Reset(initFocused, true);
+    }
+}
 
 void InputEventRouter::SetRootVisual(UIElement* root) noexcept {
     if (rootVisual_ != root) {
@@ -77,8 +81,83 @@ void InputEventRouter::SetRootVisual(UIElement* root) noexcept {
         CloseActiveComboBoxIfOpen();
         CloseActiveContextMenuIfOpen();
         CloseActiveToolTipIfOpen();
+        retiredAutoToolTip_.Reset();
         UpdateHoveredTarget(nullptr);
         rootVisual_ = root;
+    }
+    if (!focusedElement_) {
+        if (UIElement* initFocused = FindInitialFocusedInTree(rootVisual_)) {
+            focusedElement_.Reset(initFocused, true);
+        }
+    }
+}
+
+UIElement* InputEventRouter::FindInitialFocusedInTree(UIElement* root) noexcept {
+    if (!root) {
+        return nullptr;
+    }
+    std::array<UIElement*, kMaxFocusableScan> stack{};
+    std::size_t sp = 0u;
+    stack[sp++] = root;
+    while (sp > 0u) {
+        UIElement* node = stack[--sp];
+        if (!node || node->GetVisibility() != Visibility::Visible || !node->IsEnabled()) {
+            continue;
+        }
+        if (node->IsFocused()) {
+            return node;
+        }
+        UIElement* child = node->LastChild();
+        while (child && sp < stack.size()) {
+            stack[sp++] = child;
+            child = child->PrevSibling();
+        }
+    }
+    return nullptr;
+}
+
+StyleTriggerEngine* InputEventRouter::ResolveStyleEngine(const UIElement* hint) const noexcept {
+    if (styleEngine_) {
+        return styleEngine_;
+    }
+    for (const UIElement* cur = hint; cur != nullptr; cur = cur->Parent()) {
+        if (cur->BoundStyleEngine()) {
+            return cur->BoundStyleEngine();
+        }
+        if (cur == rootVisual_) {
+            break;
+        }
+    }
+    if (rootVisual_) {
+        if (rootVisual_->BoundStyleEngine()) {
+            return rootVisual_->BoundStyleEngine();
+        }
+        std::array<const UIElement*, 64u> q{};
+        std::size_t qh = 0u;
+        std::size_t qt = 0u;
+        q[qt++] = rootVisual_;
+        while (qh < qt) {
+            const UIElement* cur = q[qh++];
+            if (cur->BoundStyleEngine()) {
+                return cur->BoundStyleEngine();
+            }
+            for (const UIElement* c = cur->FirstChild(); c != nullptr && qt < q.size(); c = c->NextSibling()) {
+                q[qt++] = c;
+            }
+        }
+    }
+    return nullptr;
+}
+
+void InputEventRouter::SyncFocusedFromTreeIfNeeded() noexcept {
+    if (!rootVisual_) {
+        return;
+    }
+    if (!focusedElement_ || !focusedElement_->IsFocused()) {
+        UIElement* liveFocused = FindInitialFocusedInTree(rootVisual_);
+        if (liveFocused != focusedElement_.Get()) {
+            focusedElement_.Reset(liveFocused, true);
+        }
     }
 }
 
@@ -252,6 +331,7 @@ void InputEventRouter::PruneDisconnectedTargets() noexcept {
                              !capturedElement_->IsEffectivelyEnabled())) {
         capturedElement_->SetPressed(false);
         capturedElement_.Reset();
+        isDraggingBehavior_ = false;
     }
     if (focusedElement_ && (!IsEffectivelyVisibleInTree(focusedElement_.Get(), rootVisual_) ||
                             !focusedElement_->CanReceiveFocus())) {
@@ -297,6 +377,7 @@ void InputEventRouter::CloseActiveToolTipIfOpen() noexcept {
     if (activeToolTip_) {
         activeToolTip_->SetValue(PropId_IsOpen, UnifiedValue{false}, ValueSourceRank::Local);
         if (activeToolTip_->Parent() && activeToolTip_->DeclaredTypeName() == "__AutoToolTip") {
+            retiredAutoToolTip_ = activeToolTip_;
             (void)activeToolTip_->Parent()->RemoveChild(activeToolTip_.Get());
         }
         activeToolTip_.Reset();
@@ -429,11 +510,13 @@ void InputEventRouter::CapturePointer(UIElement* element) noexcept {
     if (capturedElement_.Get() == element) {
         return;
     }
+    isDraggingBehavior_ = false;
     capturedElement_.Reset(element, true);
 }
 
 void InputEventRouter::ReleasePointerCapture() noexcept {
     capturedElement_.Reset();
+    isDraggingBehavior_ = false;
 }
 
 void InputEventRouter::CancelPointerInteraction() noexcept {
@@ -442,6 +525,7 @@ void InputEventRouter::CancelPointerInteraction() noexcept {
         capturedElement_->SetPressed(false);
         capturedElement_.Reset();
     }
+    isDraggingBehavior_ = false;
     if (hoveredElement_) {
         hoveredElement_->SetPressed(false);
     }
@@ -490,11 +574,15 @@ bool InputEventRouter::SetFocus(UIElement* element) {
         return element != nullptr;
     }
     if (focusedElement_) {
-        focusedElement_->SetFocused(false);
+        IntrusivePtr<UIElement> prevFocused = focusedElement_;
+        prevFocused->SetFocused(false);
         if (animationEngine_) {
             (void)animationEngine_->DispatchPointerListenerEvent(
-                focusedElement_.Get(),
+                prevFocused.Get(),
                 SmListenerEventKind::FocusLost);
+        }
+        if (StyleTriggerEngine* se = ResolveStyleEngine(prevFocused.Get())) {
+            se->NotifyRoutedElementEvent(prevFocused.Get(), RoutedTriggerEvent::LostFocus);
         }
     }
     focusedElement_.Reset(element, true);
@@ -505,6 +593,9 @@ bool InputEventRouter::SetFocus(UIElement* element) {
                 focusedElement_.Get(),
                 SmListenerEventKind::FocusGained);
         }
+        if (StyleTriggerEngine* se = ResolveStyleEngine(focusedElement_.Get())) {
+            se->NotifyRoutedElementEvent(focusedElement_.Get(), RoutedTriggerEvent::GotFocus);
+        }
     }
     SyncImeFocusState();
     return focusedElement_.Get() != nullptr;
@@ -512,11 +603,15 @@ bool InputEventRouter::SetFocus(UIElement* element) {
 
 void InputEventRouter::ClearFocus() {
     if (focusedElement_) {
-        focusedElement_->SetFocused(false);
+        IntrusivePtr<UIElement> prevFocused = focusedElement_;
+        prevFocused->SetFocused(false);
         if (animationEngine_) {
             (void)animationEngine_->DispatchPointerListenerEvent(
-                focusedElement_.Get(),
+                prevFocused.Get(),
                 SmListenerEventKind::FocusLost);
+        }
+        if (StyleTriggerEngine* se = ResolveStyleEngine(prevFocused.Get())) {
+            se->NotifyRoutedElementEvent(prevFocused.Get(), RoutedTriggerEvent::LostFocus);
         }
         focusedElement_.Reset();
     }
@@ -534,6 +629,34 @@ bool InputEventRouter::DispatchPointerMove(Point position, std::uint8_t modifier
 
     // 1. Active pointer capture routes exclusively to capturedElement_ (even outside bounds!)
     if (capturedElement_) {
+        if (isDraggingBehavior_) {
+            UIElement* elem = capturedElement_.Get();
+            UIElement* dragParent = elem->Parent();
+            const Point curParentPos = dragParent ? dragParent->ScreenToLocal(position) : position;
+            float newTx = dragStartTranslateX_ + (curParentPos.x - dragStartParentPos_.x);
+            float newTy = dragStartTranslateY_ + (curParentPos.y - dragStartParentPos_.y);
+            if (dragConstrainToParent_ && dragParent) {
+                const Rect pr = dragParent->FinalRect();
+                const Rect er = elem->FinalRect();
+                if (pr.width > 0.0f && pr.height > 0.0f) {
+                    float minTx = pr.x - er.x;
+                    float maxTx = (pr.x + pr.width) - (er.x + er.width);
+                    if (minTx > maxTx) {
+                        std::swap(minTx, maxTx);
+                    }
+                    float minTy = pr.y - er.y;
+                    float maxTy = (pr.y + pr.height) - (er.y + er.height);
+                    if (minTy > maxTy) {
+                        std::swap(minTy, maxTy);
+                    }
+                    newTx = std::clamp(newTx, minTx, maxTx);
+                    newTy = std::clamp(newTy, minTy, maxTy);
+                }
+            }
+            (void)elem->SetValue(PropId_AnimTranslateX, MakeFloat(newTx), ValueSourceRank::Local);
+            (void)elem->SetValue(PropId_AnimTranslateY, MakeFloat(newTy), ValueSourceRank::Local);
+            return true;
+        }
         const Point localPt = capturedElement_->ScreenToLocal(position);
         const bool inside = PointInsideElementLocalBounds(capturedElement_.Get(), localPt);
         UpdateHoveredTarget(inside ? capturedElement_.Get() : nullptr);
@@ -720,7 +843,39 @@ bool InputEventRouter::DispatchPointerDown(
             if (walk == rootVisual_) break;
         }
     }
-    const bool handled = targetHandled || bubbledDownHandled;
+    bool dragStarted = false;
+    if (!requestCapture && button == PointerButton::Left) {
+        for (UIElement* walk = rawHit ? rawHit : target; walk != nullptr; walk = walk->Parent()) {
+            const UnifiedValue dragVal = walk->GetValue(PropId_MouseDragConstrain);
+            if (std::holds_alternative<bool>(dragVal) && walk->IsEffectivelyEnabled()) {
+                CapturePointer(walk);
+                isDraggingBehavior_ = true;
+                dragConstrainToParent_ = std::get<bool>(dragVal);
+                UIElement* dragParent = walk->Parent();
+                dragStartParentPos_ = dragParent ? dragParent->ScreenToLocal(position) : position;
+                dragStartTranslateX_ = 0.0f;
+                dragStartTranslateY_ = 0.0f;
+                (void)TryGetFloat(walk->GetValue(PropId_AnimTranslateX), dragStartTranslateX_);
+                (void)TryGetFloat(walk->GetValue(PropId_AnimTranslateY), dragStartTranslateY_);
+                dragStarted = true;
+                break;
+            }
+            if (walk == rootVisual_) {
+                break;
+            }
+        }
+    }
+    if (button == PointerButton::Left) {
+        if (StyleTriggerEngine* se = ResolveStyleEngine(rawHit ? rawHit : target)) {
+            for (UIElement* walk = rawHit ? rawHit : target; walk != nullptr; walk = walk->Parent()) {
+                se->NotifyRoutedElementEvent(walk, RoutedTriggerEvent::MouseDown);
+                if (walk == rootVisual_) {
+                    break;
+                }
+            }
+        }
+    }
+    const bool handled = targetHandled || bubbledDownHandled || dragStarted;
 
     if (auto* combo = target->DynamicCast<ComboBox>()) {
         if (combo->IsDropDownOpen()) {
@@ -755,6 +910,7 @@ bool InputEventRouter::DispatchPointerUp(
         return false;
     }
     PruneDisconnectedTargets();
+    SyncFocusedFromTreeIfNeeded();
 
     IntrusivePtr<UIElement> target = capturedElement_;
     if (!target) {
@@ -784,6 +940,19 @@ bool InputEventRouter::DispatchPointerUp(
                     }
                     if (walk == rootVisual_) break;
                 }
+            }
+        }
+        if (button == PointerButton::Left) {
+            if (StyleTriggerEngine* se = ResolveStyleEngine(target.Get())) {
+                for (UIElement* walk = target.Get(); walk != nullptr; walk = walk->Parent()) {
+                    se->NotifyRoutedElementEvent(walk, RoutedTriggerEvent::MouseUp);
+                    if (walk == rootVisual_) {
+                        break;
+                    }
+                }
+            }
+            if (isDraggingBehavior_) {
+                handled = true;
             }
         }
         if (openContextMenu_) {
@@ -856,6 +1025,7 @@ bool InputEventRouter::DispatchKeyDown(KeyCode key, std::uint8_t modifiers) {
         return false;
     }
     PruneDisconnectedTargets();
+    SyncFocusedFromTreeIfNeeded();
 
     if (key == KeyCode::Escape) {
         if (openComboBox_ && openComboBox_->IsDropDownOpen()) {
@@ -873,6 +1043,13 @@ bool InputEventRouter::DispatchKeyDown(KeyCode key, std::uint8_t modifiers) {
             return true;
         }
         if (cur == rootVisual_) break;
+    }
+    if (StyleTriggerEngine* se = ResolveStyleEngine(focusedElement_ ? focusedElement_.Get() : rootVisual_)) {
+        if (se->NotifyKeyTriggerEvent(focusedElement_.Get(), rootVisual_, key, modifiers, false)) {
+            SyncFocusedFromTreeIfNeeded();
+            SyncImeFocusState();
+            return true;
+        }
     }
     auto findEngineInSubtree = [](UIElement* start) -> DualTrackBindingEngine* {
         if (!start) return nullptr;
@@ -1022,6 +1199,9 @@ bool InputEventRouter::DispatchKeyDown(KeyCode key, std::uint8_t modifiers) {
 
 void InputEventRouter::Tick(float dtSeconds) {
     if (!rootVisual_ || dtSeconds <= 0.0f) return;
+    if (StyleTriggerEngine* se = ResolveStyleEngine(rootVisual_)) {
+        (void)se->TickTimers(dtSeconds);
+    }
     const float dtMs = dtSeconds * 1000.0f;
     RepeatButton* activeRb = nullptr;
     if (capturedElement_) {
@@ -1052,11 +1232,27 @@ void InputEventRouter::Tick(float dtSeconds) {
 
 bool InputEventRouter::DispatchKeyUp(KeyCode key, std::uint8_t modifiers) {
     if (!rootVisual_ || key == KeyCode::None) return false;
-    for (UIElement* cur = focusedElement_ ? focusedElement_.Get() : rootVisual_; cur != nullptr; cur = cur->Parent()) {
+    PruneDisconnectedTargets();
+    SyncFocusedFromTreeIfNeeded();
+    UIElement* const initialFocused = focusedElement_.Get();
+    for (UIElement* cur = initialFocused ? initialFocused : rootVisual_; cur != nullptr; cur = cur->Parent()) {
         if (cur->InvokeKeyUpCallback(key, modifiers)) {
             return true;
         }
         if (cur == rootVisual_) break;
+    }
+    if (StyleTriggerEngine* se = ResolveStyleEngine(focusedElement_ ? focusedElement_.Get() : rootVisual_)) {
+        if (se->NotifyKeyTriggerEvent(focusedElement_.Get(), rootVisual_, key, modifiers, true)) {
+            SyncFocusedFromTreeIfNeeded();
+            SyncImeFocusState();
+            return true;
+        }
+    }
+    if (focusedElement_ && focusedElement_.Get() != initialFocused && focusedElement_->CanReceiveFocus()) {
+        if (focusedElement_->OnKeyUp(key, modifiers)) {
+            SyncImeFocusState();
+            return true;
+        }
     }
     return false;
 }
@@ -1066,6 +1262,7 @@ bool InputEventRouter::DispatchTextInput(std::string_view utf8Text) {
         return false;
     }
     PruneDisconnectedTargets();
+    SyncFocusedFromTreeIfNeeded();
     if (!focusedElement_ || !focusedElement_->CanReceiveFocus()) {
         return false;
     }

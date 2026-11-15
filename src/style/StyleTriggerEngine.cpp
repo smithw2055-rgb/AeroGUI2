@@ -1514,11 +1514,46 @@ bool StyleTriggerEngine::HasFocusedDescendant(const UIElement* elem) noexcept {
     return false;
 }
 
+[[nodiscard]] bool IsTimerIntervalCondition(const AxbTriggerCondition& cond) noexcept {
+    if (const auto* sv = std::get_if<StringValue>(&cond.expectedValue)) {
+        return sv->view() == "__TimerInterval";
+    }
+    return false;
+}
+
+[[nodiscard]] bool IsEffectivelyVisibleForTrigger(const UIElement* elem) noexcept {
+    for (const UIElement* cur = elem; cur != nullptr;
+         cur = cur->Parent() ? cur->Parent() : cur->TemplatedParent()) {
+        if (cur->GetVisibility() != Visibility::Visible) {
+            return false;
+        }
+    }
+    return true;
+}
+
+[[nodiscard]] bool IsElementOrAncestor(
+    const UIElement* candidate,
+    const UIElement* ancestor) noexcept {
+    if (!candidate || !ancestor) {
+        return false;
+    }
+    for (const UIElement* cur = candidate; cur != nullptr;
+         cur = cur->Parent() ? cur->Parent() : cur->TemplatedParent()) {
+        if (cur == ancestor) {
+            return true;
+        }
+    }
+    return false;
+}
+
 bool StyleTriggerEngine::EvaluateSingleCondition(
     UIElement* elem,
     AxbTriggerCondition& cond) {
     if (!elem) {
         return false;
+    }
+    if (IsTimerIntervalCondition(cond)) {
+        return true;
     }
 
     // Pull latest context from attached DualTrackBindingEngine if present
@@ -1611,12 +1646,16 @@ bool StyleTriggerEngine::EvaluateSingleCondition(
         }
 
         case TriggerConditionSource::AncestorProperty: {
-            const std::string_view wantedType = ShortTypeNameView(cond.sourceName);
             const UIElement* matchedAnc = nullptr;
-            for (const UIElement* anc = elem; anc != nullptr; anc = NextContextParent(anc)) {
-                if (MatchesXamlAncestorType(anc, wantedType)) {
-                    matchedAnc = anc;
-                    break;
+            if (cond.sourceName == "$TemplatedParent") {
+                matchedAnc = elem->TemplatedParent();
+            } else {
+                const std::string_view wantedType = ShortTypeNameView(cond.sourceName);
+                for (const UIElement* anc = elem; anc != nullptr; anc = NextContextParent(anc)) {
+                    if (MatchesXamlAncestorType(anc, wantedType)) {
+                        matchedAnc = anc;
+                        break;
+                    }
                 }
             }
             if (!matchedAnc) {
@@ -1805,6 +1844,8 @@ namespace {
         UIElement* srcEl = nullptr;
         if (bc.relativeSelf) {
             srcEl = elem;
+        } else if (bc.relativeAncestorType == "$TemplatedParent") {
+            srcEl = elem->TemplatedParent();
         } else if (!bc.relativeAncestorType.empty()) {
             const std::string_view wantedType = ShortTypeNameView(bc.relativeAncestorType);
             for (UIElement* anc = elem; anc != nullptr; anc = const_cast<UIElement*>(NextContextParent(anc))) {
@@ -1940,6 +1981,279 @@ namespace {
 
     outVal = rawVal;
     return true;
+}
+
+[[nodiscard]] float ResolveTimerIntervalMs(
+    UIElement* elem,
+    const AxbEventTrigger& et,
+    ExecutionDomainContext* domains,
+    const ProgramImage* program,
+    const Interpreter* uiInterpreter,
+    DualTrackBindingEngine* bindingEngine) {
+    for (const auto& cond : et.conditions) {
+        if (!IsTimerIntervalCondition(cond)) {
+            continue;
+        }
+        UnifiedValue evalVal{};
+        bool resolved = false;
+        if (cond.sourceKind == TriggerConditionSource::AncestorProperty &&
+            cond.sourceName == "$TemplatedParent") {
+            if (UIElement* tp = elem ? elem->TemplatedParent() : nullptr; tp && cond.propId != 0u) {
+                evalVal = tp->GetValue(cond.propId);
+                resolved = !std::holds_alternative<std::monostate>(evalVal);
+            }
+        } else if (cond.sourceKind == TriggerConditionSource::AncestorProperty) {
+            const std::string_view wantedType = ShortTypeNameView(cond.sourceName);
+            for (const UIElement* anc = elem; anc != nullptr; anc = NextContextParent(anc)) {
+                if (MatchesXamlAncestorType(anc, wantedType) && cond.propId != 0u) {
+                    evalVal = anc->GetValue(cond.propId);
+                    resolved = !std::holds_alternative<std::monostate>(evalVal);
+                    break;
+                }
+            }
+        } else if (cond.sourceKind == TriggerConditionSource::ElementNameProperty) {
+            UIElement* src = elem ? elem->FindName(cond.sourceName) : nullptr;
+            if (!src && elem) {
+                if (UIElement* scopeRoot = UIElement::FindNamescopeRoot(elem)) {
+                    src = scopeRoot->FindName(cond.sourceName);
+                }
+            }
+            if (src && cond.propId != 0u) {
+                evalVal = src->GetValue(cond.propId);
+                resolved = !std::holds_alternative<std::monostate>(evalVal);
+            }
+        } else if (cond.sourceKind == TriggerConditionSource::SelfProperty) {
+            if (elem && cond.propId != 0u) {
+                evalVal = elem->GetValue(cond.propId);
+                resolved = !std::holds_alternative<std::monostate>(evalVal);
+            }
+        } else if (elem) {
+            AxbCompiledBindingChain bc{};
+            bc.rawPath = cond.bindingPath;
+            bc.hops = cond.compiledHops;
+            bc.converter = cond.converter;
+            bc.converterKey = cond.converterKey;
+            bc.converterParameter = cond.converterParameter;
+            bc.converterSymbolId = cond.converterSymbolId;
+            resolved = EvaluateRuntimeBindingOnce(
+                elem, domains, program, uiInterpreter, bindingEngine, bc, evalVal);
+        }
+        if (resolved && cond.converter != ValueConverterKind::None &&
+            cond.sourceKind != TriggerConditionSource::DataContextBinding) {
+            if (bindingEngine) {
+                evalVal = bindingEngine->ApplySingleValueConversion(
+                    cond.converter,
+                    cond.converterKey,
+                    cond.converterParameter,
+                    cond.converterSymbolId,
+                    0,
+                    evalVal,
+                    false);
+            } else if (cond.converter == ValueConverterKind::MathExpression) {
+                float paramF = 0.0f;
+                (void)TryParseStackFloat(cond.converterParameter, paramF);
+                float mathOut = 0.0f;
+                if (EvaluateMathConverterExpression(cond.converterKey, &evalVal, 1u, paramF, mathOut)) {
+                    evalVal = MakeFloat(mathOut);
+                }
+            } else {
+                evalVal = ApplyBuiltinValueConverter(cond.converter, evalVal, false);
+            }
+        }
+        float ms = 0.0f;
+        if (resolved && TryGetFloat(evalVal, ms)) {
+            return std::max(0.0f, ms);
+        }
+        if (resolved) {
+            if (const auto* sv = std::get_if<StringValue>(&evalVal)) {
+                if (TryParseStackFloat(sv->view(), ms)) {
+                    return std::max(0.0f, ms);
+                }
+            }
+        }
+    }
+    return static_cast<float>(et.timerIntervalMs);
+}
+
+[[nodiscard]] UIElement* ResolveActionTargetElement(
+    UIElement* elem,
+    const AxbInteractionAction& action,
+    ExecutionDomainContext* domains,
+    const ProgramImage* program,
+    const Interpreter* uiInterpreter,
+    DualTrackBindingEngine* bindingEngine,
+    bool allowPlacementTarget = false) {
+    if (!elem) {
+        return nullptr;
+    }
+    if (action.targetObjectBinding) {
+        const auto& tb = *action.targetObjectBinding;
+        if (tb.relativeSelf) {
+            return elem;
+        }
+        if (tb.relativeAncestorType == "$TemplatedParent") {
+            return elem->TemplatedParent();
+        }
+        if (!tb.relativeAncestorType.empty()) {
+            const std::string_view wantedType = ShortTypeNameView(tb.relativeAncestorType);
+            for (UIElement* anc = elem; anc != nullptr; anc = anc->Parent()) {
+                if (MatchesXamlAncestorType(anc, wantedType)) {
+                    if (allowPlacementTarget && tb.rawPath == "PlacementTarget" && domains) {
+                        const UnifiedValue ptv = anc->GetValue(PropId_PlacementTarget);
+                        NativeHandle nh{};
+                        if (ptv.tryGetNativeHandle(nh) && nh.valid()) {
+                            return UIElement::FromNativeHandle(domains->nativeHandles(), nh);
+                        }
+                        return nullptr;
+                    }
+                    return anc;
+                }
+            }
+            return nullptr;
+        }
+        if (!tb.elementName.empty()) {
+            if (UIElement* found = elem->FindName(tb.elementName)) {
+                return found;
+            }
+            if (UIElement* sr = UIElement::FindNamescopeRoot(elem)) {
+                return sr->FindName(tb.elementName);
+            }
+            return nullptr;
+        }
+        UnifiedValue evalVal{};
+        AxbCompiledBindingChain tbCopy = tb;
+        if (EvaluateRuntimeBindingOnce(elem, domains, program, uiInterpreter, bindingEngine, tbCopy, evalVal)) {
+            NativeHandle nh{};
+            if (evalVal.tryGetNativeHandle(nh) && nh.valid()) {
+                UIElement* resolved = domains
+                    ? UIElement::FromNativeHandle(domains->nativeHandles(), nh)
+                    : nullptr;
+                if (!resolved) {
+                    resolved = UIElement::FromNativeHandle(FallbackVisualHandleRegistry(), nh);
+                }
+                if (resolved) {
+                    return resolved;
+                }
+            }
+        }
+        return nullptr;
+    }
+    if (!action.targetName.empty()) {
+        if (UIElement* found = elem->FindName(action.targetName)) {
+            return found;
+        }
+        if (UIElement* sr = UIElement::FindNamescopeRoot(elem)) {
+            return sr->FindName(action.targetName);
+        }
+        return nullptr;
+    }
+    return elem;
+}
+
+void ExecuteSelectActionOnTarget(UIElement* target) {
+    if (!target) {
+        return;
+    }
+    for (UIElement* cur = target; cur != nullptr;
+         cur = cur->Parent() ? cur->Parent() : cur->TemplatedParent()) {
+        if (auto* tvi = cur->DynamicCast<TreeViewItem>()) {
+            if (TreeView* tv = tvi->FindAncestorTreeView()) {
+                tv->SelectContainer(tvi);
+            } else {
+                tvi->SetIsSelected(true);
+            }
+            return;
+        }
+        if (auto* ti = cur->DynamicCast<TabItem>()) {
+            for (UIElement* p = ti->Parent(); p != nullptr; p = p->Parent()) {
+                if (auto* tc = p->DynamicCast<TabControl>()) {
+                    const std::size_t count = tc->TabCount();
+                    for (std::size_t idx = 0u; idx < count; ++idx) {
+                        if (tc->GetTabElement(idx) == ti) {
+                            (void)tc->SelectTabInteractive(static_cast<std::int32_t>(idx));
+                            return;
+                        }
+                    }
+                    break;
+                }
+            }
+            ti->SetIsSelected(true);
+            return;
+        }
+        if (auto* lb = cur->DynamicCast<ListBox>()) {
+            std::size_t childOffset = 0u;
+            for (UIElement* c = lb->FirstChild(); c != nullptr; c = c->NextSibling()) {
+                if (c == lb->TemplateRoot()) {
+                    continue;
+                }
+                if (IsElementOrAncestor(target, c)) {
+                    const std::size_t logicalIdx = lb->IsVirtualizing()
+                        ? (lb->FirstRealizedItemIndex() + childOffset)
+                        : childOffset;
+                    (void)lb->SelectIndexInteractive(static_cast<std::int32_t>(logicalIdx));
+                    return;
+                }
+                ++childOffset;
+            }
+            return;
+        }
+    }
+}
+
+[[nodiscard]] bool CheckRoutedEventEdgeForTriggerSource(
+    RoutedTriggerEvent sourceEvent,
+    UIElement* src,
+    bool curHovered,
+    bool prevHovered,
+    bool curChecked,
+    bool prevChecked,
+    bool curFocused,
+    bool prevFocused,
+    bool curPressed,
+    bool prevPressed,
+    std::uint32_t curClickGen,
+    std::uint32_t lastClickGen,
+    std::int64_t curSelectedIdx,
+    std::int64_t prevSelectedIdx,
+    const UnifiedValue& curWatchedVal,
+    const UnifiedValue& prevWatchedVal,
+    float curNumVal,
+    float prevNumVal,
+    std::uint32_t curMediaGen,
+    std::uint32_t lastMediaGen) noexcept {
+    switch (sourceEvent) {
+        case RoutedTriggerEvent::Click:
+            return curClickGen != lastClickGen;
+        case RoutedTriggerEvent::MouseEnter:
+            return curHovered && !prevHovered;
+        case RoutedTriggerEvent::MouseLeave:
+            return !curHovered && prevHovered;
+        case RoutedTriggerEvent::Checked:
+            return curChecked && !prevChecked;
+        case RoutedTriggerEvent::Unchecked:
+            return !curChecked && prevChecked;
+        case RoutedTriggerEvent::SelectionChanged:
+            return curSelectedIdx != prevSelectedIdx || !UnifiedValuesEqual(curWatchedVal, prevWatchedVal);
+        case RoutedTriggerEvent::ValueChanged:
+            return std::fabs(curNumVal - prevNumVal) > 1e-5f;
+        case RoutedTriggerEvent::PropertyChanged:
+            return !UnifiedValuesEqual(curWatchedVal, prevWatchedVal);
+        case RoutedTriggerEvent::Indeterminate:
+            return std::holds_alternative<NullObject>(curWatchedVal) &&
+                   !std::holds_alternative<NullObject>(prevWatchedVal);
+        case RoutedTriggerEvent::GotFocus:
+            return curFocused && !prevFocused;
+        case RoutedTriggerEvent::LostFocus:
+            return !curFocused && prevFocused;
+        case RoutedTriggerEvent::MouseDown:
+            return curPressed && !prevPressed;
+        case RoutedTriggerEvent::MouseUp:
+            return !curPressed && prevPressed;
+        case RoutedTriggerEvent::MediaEnded:
+            return src != nullptr && curMediaGen != lastMediaGen;
+        default:
+            return false;
+    }
 }
 
 [[nodiscard]] std::int64_t CoerceCommandIntParam(
@@ -2525,12 +2839,12 @@ bool TryEvaluateCommandCanExecuteOnOwner(
 }
 
 void StyleTriggerEngine::ExecuteSingleInteractionAction(
-    StyledElementInstance& inst,
+    std::size_t instIdx,
     AxbInteractionAction& action) {
-    if (!action.isEnabled) {
+    if (!action.isEnabled || instIdx >= instances_.size()) {
         return;
     }
-    UIElement* elem = inst.element.Get();
+    UIElement* elem = instances_[instIdx].element.Get();
     if (!elem) {
         return;
     }
@@ -2561,10 +2875,10 @@ void StyleTriggerEngine::ExecuteSingleInteractionAction(
                         }
                     }
                 };
-                for (auto& et : inst.resolvedStyle.eventTriggers) {
+                for (auto& et : instances_[instIdx].resolvedStyle.eventTriggers) {
                     updateSiblingList(et.actions);
                 }
-                for (auto& tr : inst.resolvedStyle.triggers) {
+                for (auto& tr : instances_[instIdx].resolvedStyle.triggers) {
                     updateSiblingList(tr.enterActions);
                     updateSiblingList(tr.exitActions);
                 }
@@ -2682,42 +2996,8 @@ void StyleTriggerEngine::ExecuteSingleInteractionAction(
         }
 
         case InteractionActionKind::RemoveElement: {
-            UIElement* toRemove = nullptr;
-            if (action.targetObjectBinding && domains_) {
-                if (!action.targetObjectBinding->relativeAncestorType.empty()) {
-                    for (UIElement* anc = elem; anc != nullptr; anc = anc->Parent()) {
-                        std::string_view st;
-                        if (anc->GetTypeClass() && anc->GetTypeClass()->typeName) {
-                            st = anc->GetTypeClass()->typeName;
-                            if (const auto dot = st.rfind('.'); dot != std::string_view::npos) st = st.substr(dot + 1u);
-                        }
-                        if (st == action.targetObjectBinding->relativeAncestorType ||
-                            anc->DeclaredTypeName() == action.targetObjectBinding->relativeAncestorType) {
-                            if (action.targetObjectBinding->rawPath == "PlacementTarget") {
-                                const UnifiedValue ptv = anc->GetValue(PropId_PlacementTarget);
-                                NativeHandle nh{};
-                                if (ptv.tryGetNativeHandle(nh) && nh.valid()) {
-                                    toRemove = UIElement::FromNativeHandle(domains_->nativeHandles(), nh);
-                                }
-                            } else {
-                                toRemove = anc;
-                            }
-                            break;
-                        }
-                    }
-                } else if (!action.targetObjectBinding->elementName.empty()) {
-                    if (UIElement* sr = UIElement::FindNamescopeRoot(elem)) {
-                        toRemove = sr->FindName(action.targetObjectBinding->elementName);
-                    }
-                } else if (action.targetObjectBinding->relativeSelf) {
-                    toRemove = elem;
-                }
-            }
-            if (!toRemove && !action.targetName.empty()) {
-                if (UIElement* sr = UIElement::FindNamescopeRoot(elem)) {
-                    toRemove = sr->FindName(action.targetName);
-                }
-            }
+            UIElement* toRemove = ResolveActionTargetElement(
+                elem, action, domains_, program_, uiInterpreter_, bindingEngine_, true);
             if (!toRemove) {
                 toRemove = elem;
             }
@@ -3085,31 +3365,211 @@ void StyleTriggerEngine::ExecuteSingleInteractionAction(
             }
             break;
         }
+
+        case InteractionActionKind::GoToState: {
+            std::string stateName = action.storyboardKey;
+            if (stateName.empty()) {
+                if (const auto* sv = std::get_if<StringValue>(&action.value)) {
+                    stateName = sv->str();
+                }
+            }
+            if (stateName.empty()) {
+                break;
+            }
+            const bool useTrans = (action.volume > 0.0f);
+            UIElement* target = ResolveActionTargetElement(
+                elem, action, domains_, program_, uiInterpreter_, bindingEngine_);
+            if (target && GoToVisualState(target, stateName, useTrans)) {
+                break;
+            }
+            if (action.targetName.empty() && !action.targetObjectBinding) {
+                if (UIElement* tp = elem->TemplatedParent(); tp && GoToVisualState(tp, stateName, useTrans)) {
+                    break;
+                }
+                for (UIElement* anc = elem->Parent(); anc != nullptr; anc = anc->Parent()) {
+                    if (GoToVisualState(anc, stateName, useTrans)) {
+                        break;
+                    }
+                    if (UIElement* atp = anc->TemplatedParent(); atp && GoToVisualState(atp, stateName, useTrans)) {
+                        break;
+                    }
+                }
+            }
+            break;
+        }
+
+        case InteractionActionKind::SetFocus: {
+            UIElement* target = ResolveActionTargetElement(
+                elem, action, domains_, program_, uiInterpreter_, bindingEngine_);
+            if (!target) {
+                break;
+            }
+            UIElement* focusTarget = target->CanReceiveFocus() ? target : nullptr;
+            if (!focusTarget) {
+                auto findFocusableDesc = [&](auto& self, UIElement* node) -> UIElement* {
+                    for (UIElement* ch = node->FirstChild(); ch != nullptr; ch = ch->NextSibling()) {
+                        if (ch->CanReceiveFocus()) {
+                            return ch;
+                        }
+                        if (UIElement* found = self(self, ch)) {
+                            return found;
+                        }
+                    }
+                    return nullptr;
+                };
+                focusTarget = findFocusableDesc(findFocusableDesc, target);
+            }
+            if (!focusTarget) {
+                break;
+            }
+            UIElement* root = focusTarget;
+            while (root->Parent() != nullptr) {
+                root = root->Parent();
+            }
+            auto clearOldFocus = [&](auto& self, UIElement* node) -> void {
+                if (!node) {
+                    return;
+                }
+                if (node != focusTarget && node->IsFocused()) {
+                    node->SetFocused(false);
+                    NotifyRoutedElementEvent(node, RoutedTriggerEvent::LostFocus);
+                }
+                for (UIElement* ch = node->FirstChild(); ch != nullptr; ch = ch->NextSibling()) {
+                    self(self, ch);
+                }
+            };
+            clearOldFocus(clearOldFocus, root);
+            if (!focusTarget->IsFocused()) {
+                focusTarget->SetFocused(true);
+                NotifyRoutedElementEvent(focusTarget, RoutedTriggerEvent::GotFocus);
+            }
+            break;
+        }
+
+        case InteractionActionKind::Select: {
+            UIElement* target = ResolveActionTargetElement(
+                elem, action, domains_, program_, uiInterpreter_, bindingEngine_);
+            ExecuteSelectActionOnTarget(target ? target : elem);
+            break;
+        }
+
+        case InteractionActionKind::SelectAll: {
+            UIElement* target = ResolveActionTargetElement(
+                elem, action, domains_, program_, uiInterpreter_, bindingEngine_);
+            if (!target) {
+                break;
+            }
+            if (auto* tb = target->DynamicCast<TextBox>()) {
+                tb->SelectAll();
+                break;
+            }
+            for (UIElement* anc = target->Parent(); anc != nullptr; anc = anc->Parent()) {
+                if (auto* tb = anc->DynamicCast<TextBox>()) {
+                    tb->SelectAll();
+                    break;
+                }
+            }
+            break;
+        }
+
+        case InteractionActionKind::LaunchUri: {
+            std::string uri;
+            if (action.hasValueBinding && action.valueBinding) {
+                UnifiedValue evalVal{};
+                if (EvaluateRuntimeBindingOnce(
+                        elem, domains_, program_, uiInterpreter_, bindingEngine_, *action.valueBinding, evalVal)) {
+                    if (const auto* sv = std::get_if<StringValue>(&evalVal)) {
+                        uri = sv->str();
+                    } else if (const auto* oref = std::get_if<ObjectRef>(&evalVal);
+                               oref && oref->valid() && oref->kind == ObjectKind::String && domains_) {
+                        if (const auto sv = domains_->stringViewAcrossDomains(*oref)) {
+                            uri = std::string(*sv);
+                        }
+                    } else if (!std::holds_alternative<std::monostate>(evalVal)) {
+                        uri = FormatBindingString({}, &evalVal, 1u, domains_);
+                    }
+                }
+            }
+            if (uri.empty()) {
+                if (const auto* sv = std::get_if<StringValue>(&action.value)) {
+                    uri = sv->str();
+                } else if (!action.soundSource.empty()) {
+                    uri = action.soundSource;
+                } else if (!action.targetName.empty()) {
+                    uri = action.targetName;
+                }
+            }
+            if (!uri.empty()) {
+                launchedUris_.push_back(std::move(uri));
+            }
+            break;
+        }
+
+        case InteractionActionKind::PlayMedia: {
+            UIElement* target = ResolveActionTargetElement(
+                elem, action, domains_, program_, uiInterpreter_, bindingEngine_);
+            if (auto* media = target ? target->DynamicCast<MediaElement>() : nullptr) {
+                media->Play();
+            }
+            break;
+        }
+
+        case InteractionActionKind::StopMedia: {
+            UIElement* target = ResolveActionTargetElement(
+                elem, action, domains_, program_, uiInterpreter_, bindingEngine_);
+            if (auto* media = target ? target->DynamicCast<MediaElement>() : nullptr) {
+                media->Stop();
+            }
+            break;
+        }
     }
 }
 
 void StyleTriggerEngine::ExecuteInteractionActions(
-    StyledElementInstance& inst,
-    std::vector<AxbInteractionAction>& actions) {
+    std::size_t instIdx,
+    std::vector<AxbInteractionAction> actions) {
+    if (instIdx >= instances_.size()) {
+        return;
+    }
+    UIElement* elem = instances_[instIdx].element.Get();
+    if (!elem) {
+        return;
+    }
     for (auto& act : actions) {
-        ExecuteSingleInteractionAction(inst, act);
+        const std::size_t curIdx = FindInstanceIndex(elem);
+        if (curIdx == ~std::size_t{0}) {
+            break;
+        }
+        ExecuteSingleInteractionAction(curIdx, act);
     }
 }
 
-bool StyleTriggerEngine::EvaluateEventTriggers(StyledElementInstance& inst) {
-    UIElement* elem = inst.element.Get();
-    if (!elem || inst.resolvedStyle.eventTriggers.empty()) {
+bool StyleTriggerEngine::EvaluateEventTriggers(std::size_t instIdx) {
+    if (instIdx >= instances_.size()) {
+        return false;
+    }
+    UIElement* elem = instances_[instIdx].element.Get();
+    if (!elem || instances_[instIdx].resolvedStyle.eventTriggers.empty()) {
         return false;
     }
 
     bool anyFired = false;
     const std::size_t limit = std::min(
-        inst.resolvedStyle.eventTriggers.size(),
+        instances_[instIdx].resolvedStyle.eventTriggers.size(),
         kMaxEventTriggersPerElement);
 
     for (std::size_t i = 0u; i < limit; ++i) {
-        auto& et = inst.resolvedStyle.eventTriggers[i];
-        auto& rt = inst.eventStates[i];
+        instIdx = FindInstanceIndex(elem);
+        if (instIdx == ~std::size_t{0} || i >= instances_[instIdx].resolvedStyle.eventTriggers.size()) {
+            break;
+        }
+        auto& et = instances_[instIdx].resolvedStyle.eventTriggers[i];
+        auto& rt = instances_[instIdx].eventStates[i];
+
+        if (et.eventKind == RoutedTriggerEvent::KeyDownTrigger) {
+            rt.initialized = true;
+            continue;
+        }
 
         if (et.eventKind == RoutedTriggerEvent::StoryboardCompleted) {
             const AxbStoryboard* watchedSb = !et.sourceName.empty() ? FindStoryboard(et.sourceName) : nullptr;
@@ -3142,12 +3602,26 @@ bool StyleTriggerEngine::EvaluateEventTriggers(StyledElementInstance& inst) {
             }
             if (fire) {
                 if (animationEngine_) {
-                    for (const auto& sb : et.storyboards) {
-                        (void)animationEngine_->BeginStoryboard(elem, sb);
+                    const std::size_t sbCount =
+                        instances_[instIdx].resolvedStyle.eventTriggers[i].storyboards.size();
+                    for (std::size_t sbIdx = 0u; sbIdx < sbCount; ++sbIdx) {
+                        instIdx = FindInstanceIndex(elem);
+                        if (instIdx == ~std::size_t{0} ||
+                            i >= instances_[instIdx].resolvedStyle.eventTriggers.size() ||
+                            sbIdx >= instances_[instIdx].resolvedStyle.eventTriggers[i].storyboards.size()) {
+                            break;
+                        }
+                        (void)animationEngine_->BeginStoryboard(
+                            elem,
+                            instances_[instIdx].resolvedStyle.eventTriggers[i].storyboards[sbIdx]);
                     }
                 }
-                if (!et.actions.empty()) {
-                    ExecuteInteractionActions(inst, et.actions);
+                instIdx = FindInstanceIndex(elem);
+                if (instIdx != ~std::size_t{0} &&
+                    i < instances_[instIdx].resolvedStyle.eventTriggers.size() &&
+                    !instances_[instIdx].resolvedStyle.eventTriggers[i].actions.empty()) {
+                    auto acts = instances_[instIdx].resolvedStyle.eventTriggers[i].actions;
+                    ExecuteInteractionActions(instIdx, std::move(acts));
                 }
                 anyFired = true;
             }
@@ -3156,7 +3630,9 @@ bool StyleTriggerEngine::EvaluateEventTriggers(StyledElementInstance& inst) {
 
         if (!rt.cachedSource) {
             std::string lookupName = et.sourceName;
-            if (et.eventKind == RoutedTriggerEvent::PropertyChanged) {
+            if (et.eventKind == RoutedTriggerEvent::PropertyChanged ||
+                (et.eventKind == RoutedTriggerEvent::TimerTrigger &&
+                 et.triggerSourceEvent == RoutedTriggerEvent::PropertyChanged)) {
                 const auto bar = et.sourceName.find('|');
                 if (bar != std::string::npos) {
                     lookupName = et.sourceName.substr(0u, bar);
@@ -3186,35 +3662,157 @@ bool StyleTriggerEngine::EvaluateEventTriggers(StyledElementInstance& inst) {
         }
 
         const bool curHovered = src->IsHovered();
+        const bool curFocused = src->IsFocused();
+        const bool curPressed = src->IsPressed();
         bool curChecked = false;
         const UnifiedValue chkVal = src->GetValue(PropId_IsChecked);
         if (const auto* b = std::get_if<bool>(&chkVal)) {
             curChecked = *b;
         }
         const std::uint32_t curClickGen = src->BubbledClickGeneration();
+        std::uint32_t curMediaGen = 0u;
+        if (const auto* mediaSrc = src->DynamicCast<MediaElement>()) {
+            curMediaGen = mediaSrc->MediaEndedGeneration();
+        }
         std::int64_t curSelectedIdx = -1;
         const UnifiedValue selVal = src->GetValue(PropId_SelectedIndex);
         if (const auto* selI = std::get_if<std::int64_t>(&selVal)) {
             curSelectedIdx = *selI;
         }
         float curNumVal = 0.0f;
+        const RoutedTriggerEvent effectiveEvent =
+            (et.eventKind == RoutedTriggerEvent::TimerTrigger) ? et.triggerSourceEvent : et.eventKind;
         const std::uint16_t numericPid =
-            (et.eventKind == RoutedTriggerEvent::PropertyChanged && rt.watchedPropId != 0xFFFFu)
+            (effectiveEvent == RoutedTriggerEvent::PropertyChanged && rt.watchedPropId != 0xFFFFu)
                 ? rt.watchedPropId
-                : ((et.eventKind == RoutedTriggerEvent::Indeterminate)
+                : ((effectiveEvent == RoutedTriggerEvent::Indeterminate)
                     ? static_cast<std::uint16_t>(PropId_IsChecked)
-                    : ((et.eventKind == RoutedTriggerEvent::SelectionChanged)
+                    : ((effectiveEvent == RoutedTriggerEvent::SelectionChanged)
                         ? static_cast<std::uint16_t>(PropId_SelectedItem)
                         : static_cast<std::uint16_t>(PropId_Value)));
         const UnifiedValue curWatchedVal = src->GetValue(numericPid);
         (void)TryGetFloat(curWatchedVal, curNumVal);
 
+        if (et.eventKind == RoutedTriggerEvent::TimerTrigger) {
+            const double curAnimClock = animationEngine_ ? animationEngine_->CumulativeTimeSeconds() : 0.0;
+            if (!rt.initialized) {
+                rt.initialized = true;
+                rt.lastClickGen = curClickGen;
+                rt.lastMediaEndedGen = curMediaGen;
+                rt.prevHovered = curHovered;
+                rt.prevChecked = curChecked;
+                rt.prevFocused = curFocused;
+                rt.prevPressed = curPressed;
+                rt.prevSelectedIndex = curSelectedIdx;
+                rt.prevNumericValue = curNumVal;
+                rt.prevWatchedValue = curWatchedVal;
+                rt.lastAnimClockSec = curAnimClock;
+                rt.timerElapsedMs = 0.0f;
+                rt.timerTicksFired = 0;
+                rt.timerTickedExplicitly = false;
+                rt.timerActive = (et.triggerSourceEvent == RoutedTriggerEvent::Loaded);
+            } else {
+                if (et.triggerSourceEvent != RoutedTriggerEvent::Loaded &&
+                    CheckRoutedEventEdgeForTriggerSource(
+                        et.triggerSourceEvent, src,
+                        curHovered, rt.prevHovered,
+                        curChecked, rt.prevChecked,
+                        curFocused, rt.prevFocused,
+                        curPressed, rt.prevPressed,
+                        curClickGen, rt.lastClickGen,
+                        curSelectedIdx, rt.prevSelectedIndex,
+                        curWatchedVal, rt.prevWatchedValue,
+                        curNumVal, rt.prevNumericValue,
+                        curMediaGen, rt.lastMediaEndedGen)) {
+                    rt.timerActive = true;
+                    rt.timerElapsedMs = 0.0f;
+                    rt.timerTicksFired = 0;
+                    rt.lastAnimClockSec = curAnimClock;
+                }
+                rt.lastClickGen = curClickGen;
+                rt.lastMediaEndedGen = curMediaGen;
+                rt.prevHovered = curHovered;
+                rt.prevChecked = curChecked;
+                rt.prevFocused = curFocused;
+                rt.prevPressed = curPressed;
+                rt.prevSelectedIndex = curSelectedIdx;
+                rt.prevNumericValue = curNumVal;
+                rt.prevWatchedValue = curWatchedVal;
+
+                if (rt.timerActive) {
+                    if (rt.timerTickedExplicitly) {
+                        rt.timerTickedExplicitly = false;
+                        rt.lastAnimClockSec = curAnimClock;
+                    } else if (animationEngine_) {
+                        const double deltaSec = std::max(0.0, curAnimClock - rt.lastAnimClockSec);
+                        rt.lastAnimClockSec = curAnimClock;
+                        rt.timerElapsedMs += static_cast<float>(deltaSec * 1000.0);
+                    }
+                }
+            }
+
+            if (rt.timerActive) {
+                const float intervalMs = ResolveTimerIntervalMs(
+                    elem, et, domains_, program_, uiInterpreter_, bindingEngine_);
+                const bool fireNow = (intervalMs <= 0.0f)
+                    ? (rt.timerTicksFired == 0)
+                    : (rt.timerElapsedMs + 1e-3f >= intervalMs);
+                if (fireNow) {
+                    bool condOk = true;
+                    if (!et.conditions.empty()) {
+                        for (auto& cond : et.conditions) {
+                            if (!EvaluateSingleCondition(elem, cond)) {
+                                condOk = false;
+                                break;
+                            }
+                        }
+                    }
+                    if (intervalMs > 0.0f) {
+                        rt.timerElapsedMs = std::max(0.0f, rt.timerElapsedMs - intervalMs);
+                    }
+                    ++rt.timerTicksFired;
+                    if (et.totalTicks > 0 && rt.timerTicksFired >= et.totalTicks) {
+                        rt.timerActive = false;
+                    }
+                    if (condOk) {
+                        if (animationEngine_) {
+                            const std::size_t sbCount =
+                                instances_[instIdx].resolvedStyle.eventTriggers[i].storyboards.size();
+                            for (std::size_t sbIdx = 0u; sbIdx < sbCount; ++sbIdx) {
+                                instIdx = FindInstanceIndex(elem);
+                                if (instIdx == ~std::size_t{0} ||
+                                    i >= instances_[instIdx].resolvedStyle.eventTriggers.size() ||
+                                    sbIdx >= instances_[instIdx].resolvedStyle.eventTriggers[i].storyboards.size()) {
+                                    break;
+                                }
+                                (void)animationEngine_->BeginStoryboard(
+                                    elem,
+                                    instances_[instIdx].resolvedStyle.eventTriggers[i].storyboards[sbIdx]);
+                            }
+                        }
+                        instIdx = FindInstanceIndex(elem);
+                        if (instIdx != ~std::size_t{0} &&
+                            i < instances_[instIdx].resolvedStyle.eventTriggers.size() &&
+                            !instances_[instIdx].resolvedStyle.eventTriggers[i].actions.empty()) {
+                            auto acts = instances_[instIdx].resolvedStyle.eventTriggers[i].actions;
+                            ExecuteInteractionActions(instIdx, std::move(acts));
+                        }
+                        anyFired = true;
+                    }
+                }
+            }
+            continue;
+        }
+
         bool fire = false;
         if (!rt.initialized) {
             rt.initialized = true;
             rt.lastClickGen = curClickGen;
+            rt.lastMediaEndedGen = curMediaGen;
             rt.prevHovered = curHovered;
             rt.prevChecked = curChecked;
+            rt.prevFocused = curFocused;
+            rt.prevPressed = curPressed;
             rt.prevSelectedIndex = curSelectedIdx;
             rt.prevNumericValue = curNumVal;
             rt.prevWatchedValue = curWatchedVal;
@@ -3225,63 +3823,23 @@ bool StyleTriggerEngine::EvaluateEventTriggers(StyledElementInstance& inst) {
                 fire = true;
             }
         } else {
-            switch (et.eventKind) {
-                case RoutedTriggerEvent::Loaded:
-                case RoutedTriggerEvent::StoryboardCompleted:
-                    break;
-                case RoutedTriggerEvent::Click:
-                    if (curClickGen != rt.lastClickGen) {
-                        fire = true;
-                    }
-                    break;
-                case RoutedTriggerEvent::MouseEnter:
-                    if (curHovered && !rt.prevHovered) {
-                        fire = true;
-                    }
-                    break;
-                case RoutedTriggerEvent::MouseLeave:
-                    if (!curHovered && rt.prevHovered) {
-                        fire = true;
-                    }
-                    break;
-                case RoutedTriggerEvent::Checked:
-                    if (curChecked && !rt.prevChecked) {
-                        fire = true;
-                    }
-                    break;
-                case RoutedTriggerEvent::Unchecked:
-                    if (!curChecked && rt.prevChecked) {
-                        fire = true;
-                    }
-                    break;
-                case RoutedTriggerEvent::SelectionChanged:
-                    if (curSelectedIdx != rt.prevSelectedIndex ||
-                        !UnifiedValuesEqual(curWatchedVal, rt.prevWatchedValue)) {
-                        fire = true;
-                    }
-                    break;
-                case RoutedTriggerEvent::ValueChanged:
-                    if (std::fabs(curNumVal - rt.prevNumericValue) > 1e-5f) {
-                        fire = true;
-                    }
-                    break;
-                case RoutedTriggerEvent::PropertyChanged:
-                    if (!UnifiedValuesEqual(curWatchedVal, rt.prevWatchedValue)) {
-                        fire = true;
-                    }
-                    break;
-                case RoutedTriggerEvent::Indeterminate: {
-                    const bool curInd = std::holds_alternative<NullObject>(curWatchedVal);
-                    const bool prevInd = std::holds_alternative<NullObject>(rt.prevWatchedValue);
-                    if (curInd && !prevInd) {
-                        fire = true;
-                    }
-                    break;
-                }
-            }
+            fire = CheckRoutedEventEdgeForTriggerSource(
+                et.eventKind, src,
+                curHovered, rt.prevHovered,
+                curChecked, rt.prevChecked,
+                curFocused, rt.prevFocused,
+                curPressed, rt.prevPressed,
+                curClickGen, rt.lastClickGen,
+                curSelectedIdx, rt.prevSelectedIndex,
+                curWatchedVal, rt.prevWatchedValue,
+                curNumVal, rt.prevNumericValue,
+                curMediaGen, rt.lastMediaEndedGen);
             rt.lastClickGen = curClickGen;
+            rt.lastMediaEndedGen = curMediaGen;
             rt.prevHovered = curHovered;
             rt.prevChecked = curChecked;
+            rt.prevFocused = curFocused;
+            rt.prevPressed = curPressed;
             rt.prevSelectedIndex = curSelectedIdx;
             rt.prevNumericValue = curNumVal;
             rt.prevWatchedValue = curWatchedVal;
@@ -3298,12 +3856,26 @@ bool StyleTriggerEngine::EvaluateEventTriggers(StyledElementInstance& inst) {
 
         if (fire) {
             if (animationEngine_) {
-                for (const auto& sb : et.storyboards) {
-                    (void)animationEngine_->BeginStoryboard(elem, sb);
+                const std::size_t sbCount =
+                    instances_[instIdx].resolvedStyle.eventTriggers[i].storyboards.size();
+                for (std::size_t sbIdx = 0u; sbIdx < sbCount; ++sbIdx) {
+                    instIdx = FindInstanceIndex(elem);
+                    if (instIdx == ~std::size_t{0} ||
+                        i >= instances_[instIdx].resolvedStyle.eventTriggers.size() ||
+                        sbIdx >= instances_[instIdx].resolvedStyle.eventTriggers[i].storyboards.size()) {
+                        break;
+                    }
+                    (void)animationEngine_->BeginStoryboard(
+                        elem,
+                        instances_[instIdx].resolvedStyle.eventTriggers[i].storyboards[sbIdx]);
                 }
             }
-            if (!et.actions.empty()) {
-                ExecuteInteractionActions(inst, et.actions);
+            instIdx = FindInstanceIndex(elem);
+            if (instIdx != ~std::size_t{0} &&
+                i < instances_[instIdx].resolvedStyle.eventTriggers.size() &&
+                !instances_[instIdx].resolvedStyle.eventTriggers[i].actions.empty()) {
+                auto acts = instances_[instIdx].resolvedStyle.eventTriggers[i].actions;
+                ExecuteInteractionActions(instIdx, std::move(acts));
             }
             anyFired = true;
         }
@@ -3313,25 +3885,28 @@ bool StyleTriggerEngine::EvaluateEventTriggers(StyledElementInstance& inst) {
 }
 
 void StyleTriggerEngine::ReapplyActiveOverrides(
-    StyledElementInstance& inst,
+    std::size_t instIdx,
     std::uint64_t newTriggerMask,
     bool useTransitions,
     bool isInitialPass) {
-    UIElement* elem = inst.element.Get();
+    if (instIdx >= instances_.size()) {
+        return;
+    }
+    UIElement* elem = instances_[instIdx].element.Get();
     if (!elem) {
         return;
     }
 
-    const std::uint64_t prevMask = inst.activeTriggerMask;
+    const std::uint64_t prevMask = instances_[instIdx].activeTriggerMask;
     const std::uint64_t exitedBits = prevMask & (~newTriggerMask);
     const std::uint64_t enteredBits = (~prevMask) & newTriggerMask;
 
-    for (auto& slot : inst.propertySnapshots) {
+    for (auto& slot : instances_[instIdx].propertySnapshots) {
         slot.touchedThisPass = false;
     }
 
-    auto findSnapshotSlot = [&](UIElement* target, std::uint16_t propId) -> PropertySnapshotSlot* {
-        for (auto& slot : inst.propertySnapshots) {
+    auto findSnapshotSlot = [&](std::size_t idx, UIElement* target, std::uint16_t propId) -> PropertySnapshotSlot* {
+        for (auto& slot : instances_[idx].propertySnapshots) {
             if (slot.resolvedTarget.Get() == target && slot.propId == propId) {
                 return &slot;
             }
@@ -3341,31 +3916,45 @@ void StyleTriggerEngine::ReapplyActiveOverrides(
 
     // 1. Apply active VisualStates across VisualStateGroups (preserving live values for smooth transitions!)
     const std::size_t groupLimit = std::min(
-        inst.resolvedStyle.visualStateGroups.size(),
+        instances_[instIdx].resolvedStyle.visualStateGroups.size(),
         kMaxVisualStateGroupsPerElement);
     for (std::size_t g = 0u; g < groupLimit; ++g) {
-        const auto& vsg = inst.resolvedStyle.visualStateGroups[g];
-        const std::int16_t stIdx = inst.groupStates[g].activeStateIndex;
-        if (stIdx < 0 || static_cast<std::size_t>(stIdx) >= vsg.states.size()) {
+        instIdx = FindInstanceIndex(elem);
+        if (instIdx == ~std::size_t{0}) return;
+        const std::int16_t stIdx = instances_[instIdx].groupStates[g].activeStateIndex;
+        if (stIdx < 0 || static_cast<std::size_t>(stIdx) >= instances_[instIdx].resolvedStyle.visualStateGroups[g].states.size()) {
             continue;
         }
-        const auto& vs = vsg.states[static_cast<std::size_t>(stIdx)];
-        for (const auto& setter : vs.setters) {
+        const float transDur = instances_[instIdx].resolvedStyle.visualStateGroups[g].defaultTransitionDuration;
+        const EasingFunctionKind transEase = instances_[instIdx].resolvedStyle.visualStateGroups[g].defaultEasingKind;
+        const EasingMode transMode = instances_[instIdx].resolvedStyle.visualStateGroups[g].defaultEasingMode;
+        const std::size_t setterCount =
+            instances_[instIdx].resolvedStyle.visualStateGroups[g].states[static_cast<std::size_t>(stIdx)].setters.size();
+
+        for (std::size_t sIdx = 0u; sIdx < setterCount; ++sIdx) {
+            instIdx = FindInstanceIndex(elem);
+            if (instIdx == ~std::size_t{0}) return;
+            if (g >= instances_[instIdx].resolvedStyle.visualStateGroups.size() ||
+                static_cast<std::size_t>(stIdx) >= instances_[instIdx].resolvedStyle.visualStateGroups[g].states.size() ||
+                sIdx >= instances_[instIdx].resolvedStyle.visualStateGroups[g].states[static_cast<std::size_t>(stIdx)].setters.size()) {
+                break;
+            }
+            const auto& setter =
+                instances_[instIdx].resolvedStyle.visualStateGroups[g].states[static_cast<std::size_t>(stIdx)].setters[sIdx];
             UIElement* target = setter.targetName.empty() ? elem : elem->FindName(setter.targetName);
             if (!target) continue;
-            if (PropertySnapshotSlot* slot = findSnapshotSlot(target, setter.propId)) {
+            if (PropertySnapshotSlot* slot = findSnapshotSlot(instIdx, target, setter.propId)) {
                 CaptureSnapshotIfNeeded(*slot);
                 slot->touchedThisPass = true;
             }
-            if (useTransitions && !isInitialPass && animationEngine_ &&
-                vsg.defaultTransitionDuration > 1e-4f) {
+            if (useTransitions && !isInitialPass && animationEngine_ && transDur > 1e-4f) {
                 (void)animationEngine_->StartValueTransition(
                     target,
                     setter.propId,
                     setter.value,
-                    vsg.defaultTransitionDuration,
-                    vsg.defaultEasingKind,
-                    vsg.defaultEasingMode);
+                    transDur,
+                    transEase,
+                    transMode);
             } else {
                 if (animationEngine_) {
                     (void)animationEngine_->StopPropertyAnimation(target, setter.propId, false);
@@ -3373,11 +3962,19 @@ void StyleTriggerEngine::ReapplyActiveOverrides(
                 (void)target->ForceEffectiveValue(setter.propId, setter.value, ValueSourceRank::TemplateTrigger);
             }
         }
-        if (!vs.storyboard.timelines.empty() && animationEngine_) {
-            for (const auto& tl : vs.storyboard.timelines) {
+
+        instIdx = FindInstanceIndex(elem);
+        if (instIdx == ~std::size_t{0}) return;
+        if (animationEngine_ &&
+            g < instances_[instIdx].resolvedStyle.visualStateGroups.size() &&
+            static_cast<std::size_t>(stIdx) < instances_[instIdx].resolvedStyle.visualStateGroups[g].states.size() &&
+            !instances_[instIdx].resolvedStyle.visualStateGroups[g].states[static_cast<std::size_t>(stIdx)].storyboard.timelines.empty()) {
+            const auto& storyboard =
+                instances_[instIdx].resolvedStyle.visualStateGroups[g].states[static_cast<std::size_t>(stIdx)].storyboard;
+            for (const auto& tl : storyboard.timelines) {
                 UIElement* target = tl.targetName.empty() ? elem : elem->FindName(tl.targetName);
                 if (!target) continue;
-                if (PropertySnapshotSlot* slot = findSnapshotSlot(target, tl.targetPropertyId)) {
+                if (PropertySnapshotSlot* slot = findSnapshotSlot(instIdx, target, tl.targetPropertyId)) {
                     CaptureSnapshotIfNeeded(*slot);
                     slot->touchedThisPass = true;
                 }
@@ -3396,28 +3993,43 @@ void StyleTriggerEngine::ReapplyActiveOverrides(
                 }
             }
             if (useTransitions && !isInitialPass) {
-                (void)animationEngine_->BeginStoryboard(elem, vs.storyboard);
+                (void)animationEngine_->BeginStoryboard(elem, storyboard);
             }
         }
     }
 
+    instIdx = FindInstanceIndex(elem);
+    if (instIdx == ~std::size_t{0}) return;
+
     // 2. Apply active Triggers in declaration order (last active trigger wins, matching WPF/Noesis!)
-    const std::size_t trigLimit = std::min<std::size_t>(inst.resolvedStyle.triggers.size(), 64u);
+    const std::size_t trigLimit = std::min<std::size_t>(instances_[instIdx].resolvedStyle.triggers.size(), 64u);
     for (std::size_t t = 0u; t < trigLimit; ++t) {
+        instIdx = FindInstanceIndex(elem);
+        if (instIdx == ~std::size_t{0} || t >= instances_[instIdx].resolvedStyle.triggers.size()) {
+            return;
+        }
         const std::uint64_t bit = (1ULL << t);
-        auto& trig = inst.resolvedStyle.triggers[t];
+        const bool overrideLocalValues = instances_[instIdx].resolvedStyle.triggers[t].overrideLocalValues;
 
         if ((newTriggerMask & bit) != 0ULL) {
-            const ValueSourceRank trigRank = trig.overrideLocalValues
+            const ValueSourceRank trigRank = overrideLocalValues
                 ? ValueSourceRank::TemplateTrigger
                 : ValueSourceRank::StyleTrigger;
-            for (const auto& setter : trig.setters) {
+            const std::size_t setterCount = instances_[instIdx].resolvedStyle.triggers[t].setters.size();
+            for (std::size_t sIdx = 0u; sIdx < setterCount; ++sIdx) {
+                instIdx = FindInstanceIndex(elem);
+                if (instIdx == ~std::size_t{0} ||
+                    t >= instances_[instIdx].resolvedStyle.triggers.size() ||
+                    sIdx >= instances_[instIdx].resolvedStyle.triggers[t].setters.size()) {
+                    return;
+                }
+                const auto& setter = instances_[instIdx].resolvedStyle.triggers[t].setters[sIdx];
                 UIElement* target = setter.targetName.empty() ? elem : elem->FindName(setter.targetName);
                 if (!target) continue;
-                PropertySnapshotSlot* slot = findSnapshotSlot(target, setter.propId);
+                PropertySnapshotSlot* slot = findSnapshotSlot(instIdx, target, setter.propId);
                 if (slot) {
                     CaptureSnapshotIfNeeded(*slot);
-                    if (!trig.overrideLocalValues && slot->hadBaseValue && slot->baseRank > trigRank) {
+                    if (!overrideLocalValues && slot->hadBaseValue && slot->baseRank > trigRank) {
                         continue;
                     }
                     slot->touchedThisPass = true;
@@ -3428,51 +4040,107 @@ void StyleTriggerEngine::ReapplyActiveOverrides(
 
         if (animationEngine_) {
             if (!isInitialPass && (exitedBits & bit) != 0ULL) {
-                for (const auto& sb : trig.exitStoryboards) {
-                    (void)animationEngine_->BeginStoryboard(elem, sb);
+                const std::size_t exitSbCount =
+                    instances_[instIdx].resolvedStyle.triggers[t].exitStoryboards.size();
+                for (std::size_t sbIdx = 0u; sbIdx < exitSbCount; ++sbIdx) {
+                    instIdx = FindInstanceIndex(elem);
+                    if (instIdx == ~std::size_t{0} ||
+                        t >= instances_[instIdx].resolvedStyle.triggers.size() ||
+                        sbIdx >= instances_[instIdx].resolvedStyle.triggers[t].exitStoryboards.size()) {
+                        return;
+                    }
+                    (void)animationEngine_->BeginStoryboard(
+                        elem,
+                        instances_[instIdx].resolvedStyle.triggers[t].exitStoryboards[sbIdx]);
                 }
             }
             if ((enteredBits & bit) != 0ULL) {
-                for (const auto& sb : trig.enterStoryboards) {
-                    (void)animationEngine_->BeginStoryboard(elem, sb);
+                const std::size_t enterSbCount =
+                    instances_[instIdx].resolvedStyle.triggers[t].enterStoryboards.size();
+                for (std::size_t sbIdx = 0u; sbIdx < enterSbCount; ++sbIdx) {
+                    instIdx = FindInstanceIndex(elem);
+                    if (instIdx == ~std::size_t{0} ||
+                        t >= instances_[instIdx].resolvedStyle.triggers.size() ||
+                        sbIdx >= instances_[instIdx].resolvedStyle.triggers[t].enterStoryboards.size()) {
+                        return;
+                    }
+                    (void)animationEngine_->BeginStoryboard(
+                        elem,
+                        instances_[instIdx].resolvedStyle.triggers[t].enterStoryboards[sbIdx]);
                 }
             }
         }
 
-        // Execute XAML Behaviors (<b:DataTrigger>) imperative actions on rising edge (including initial pass if matched!)
-        if (!isInitialPass && (exitedBits & bit) != 0ULL && !trig.exitActions.empty()) {
-            ExecuteInteractionActions(inst, trig.exitActions);
+        if (!isInitialPass && (exitedBits & bit) != 0ULL) {
+            instIdx = FindInstanceIndex(elem);
+            if (instIdx == ~std::size_t{0}) return;
+            if (t < instances_[instIdx].resolvedStyle.triggers.size() &&
+                !instances_[instIdx].resolvedStyle.triggers[t].exitActions.empty()) {
+                auto exitActions = instances_[instIdx].resolvedStyle.triggers[t].exitActions;
+                ExecuteInteractionActions(instIdx, std::move(exitActions));
+            }
         }
-        if ((enteredBits & bit) != 0ULL && !trig.enterActions.empty()) {
-            ExecuteInteractionActions(inst, trig.enterActions);
+        if ((enteredBits & bit) != 0ULL) {
+            instIdx = FindInstanceIndex(elem);
+            if (instIdx == ~std::size_t{0}) return;
+            if (t < instances_[instIdx].resolvedStyle.triggers.size() &&
+                !instances_[instIdx].resolvedStyle.triggers[t].enterActions.empty()) {
+                auto enterActions = instances_[instIdx].resolvedStyle.triggers[t].enterActions;
+                ExecuteInteractionActions(instIdx, std::move(enterActions));
+            }
         }
+    }
+
+    instIdx = FindInstanceIndex(elem);
+    if (instIdx == ~std::size_t{0}) {
+        return;
     }
 
     // 3. Restore any captured property snapshot that is no longer overridden by any active VisualState or Trigger
-    for (auto& slot : inst.propertySnapshots) {
+    for (std::size_t s = 0u; s < instances_[instIdx].propertySnapshots.size(); ++s) {
+        auto& slot = instances_[instIdx].propertySnapshots[s];
         if (!slot.captured || slot.touchedThisPass || !slot.resolvedTarget) {
             continue;
         }
-        if (animationEngine_) {
-            (void)animationEngine_->StopPropertyAnimation(slot.resolvedTarget.Get(), slot.propId, false);
-        }
-        if (slot.hadBaseValue) {
-            (void)slot.resolvedTarget->ForceEffectiveValue(
-                slot.propId,
-                slot.baseValue,
-                slot.baseRank);
-        } else if (IsFastInlinePropertyId(slot.propId)) {
-            (void)slot.resolvedTarget->ClearValue(slot.propId, ValueSourceRank::Animation);
-        } else {
-            (void)slot.resolvedTarget->ForceClearSparseEntry(slot.propId);
-        }
-        if (UIElement* tp = slot.resolvedTarget->TemplatedParent()) {
-            tp->SyncTemplateBindingsForTarget(slot.resolvedTarget.Get(), slot.propId);
-        }
+        IntrusivePtr<UIElement> targetRef = slot.resolvedTarget;
+        const std::uint16_t propId = slot.propId;
+        const bool hadBase = slot.hadBaseValue;
+        const UnifiedValue baseVal = slot.baseValue;
+        const ValueSourceRank baseRank = slot.baseRank;
         slot.captured = false;
+
+        if (animationEngine_) {
+            (void)animationEngine_->StopPropertyAnimation(targetRef.Get(), propId, false);
+        }
+        if (hadBase) {
+            (void)targetRef->ForceEffectiveValue(propId, baseVal, baseRank);
+        } else if (IsFastInlinePropertyId(propId)) {
+            (void)targetRef->ClearValue(propId, ValueSourceRank::Animation);
+        } else {
+            (void)targetRef->ForceClearSparseEntry(propId);
+        }
+        if (UIElement* tp = targetRef->TemplatedParent()) {
+            tp->SyncTemplateBindingsForTarget(targetRef.Get(), propId);
+        }
+        instIdx = FindInstanceIndex(elem);
+        if (instIdx == ~std::size_t{0}) {
+            return;
+        }
     }
 
-    inst.activeTriggerMask = newTriggerMask;
+    instances_[instIdx].activeTriggerMask = newTriggerMask;
+}
+
+std::size_t StyleTriggerEngine::FindInstanceIndex(const UIElement* elem) const noexcept {
+    if (!elem) {
+        return ~std::size_t{0};
+    }
+    for (std::size_t i = 0u; i < instances_.size(); ++i) {
+        if (instances_[i].element.Get() == elem) {
+            return i;
+        }
+    }
+    return ~std::size_t{0};
 }
 
 bool StyleTriggerEngine::GoToVisualState(
@@ -3499,7 +4167,7 @@ bool StyleTriggerEngine::GoToVisualState(
                 if (instances_[i].groupStates[g].activeStateIndex != foundIdx || !instances_[i].initialized) {
                     instances_[i].groupStates[g].activeStateIndex = foundIdx;
                     instances_[i].initialized = true;
-                    ReapplyActiveOverrides(instances_[i], instances_[i].activeTriggerMask, useTransitions, false);
+                    ReapplyActiveOverrides(i, instances_[i].activeTriggerMask, useTransitions, false);
                 }
                 return true;
             }
@@ -3541,96 +4209,101 @@ std::size_t StyleTriggerEngine::EvaluateSubtree(UIElement* subtreeRoot, bool res
     for (int settlePass = 0; settlePass < 3; ++settlePass) {
         bool anyCascadeMutation = false;
         const std::size_t instSnapshotCount = instances_.size();
-        for (std::size_t instIdx = 0u; instIdx < instSnapshotCount && instIdx < instances_.size(); ++instIdx) {
-            UIElement* elem = instances_[instIdx].element.Get();
+        for (std::size_t snapIdx = 0u; snapIdx < instSnapshotCount && snapIdx < instances_.size(); ++snapIdx) {
+            UIElement* elem = instances_[snapIdx].element.Get();
             if (!elem || !isInSubtree(elem)) {
                 continue;
             }
             if (settlePass == 0 && resetEventStates) {
-                instances_[instIdx].eventStates = {};
+                instances_[snapIdx].eventStates = {};
             }
 
             // Note: do NOT skip Collapsed elements if a DataTrigger on Visibility itself could un-collapse them!
-            const bool eventFired = EvaluateEventTriggers(instances_[instIdx]);
+            const bool eventFired = EvaluateEventTriggers(snapIdx);
             if (eventFired) {
                 anyCascadeMutation = true;
             }
 
-        // 1. Compute 64-bit active trigger bitmask
-        std::uint64_t nextMask = 0ULL;
-        const std::size_t trigLimit = std::min<std::size_t>(instances_[instIdx].resolvedStyle.triggers.size(), 64u);
-        for (std::size_t t = 0u; t < trigLimit; ++t) {
-            auto& trig = instances_[instIdx].resolvedStyle.triggers[t];
-            if (trig.conditions.empty()) {
+            const std::size_t curIdx = FindInstanceIndex(elem);
+            if (curIdx == ~std::size_t{0}) {
                 continue;
             }
-            bool allMet = true;
-            for (auto& cond : trig.conditions) {
-                if (!EvaluateSingleCondition(elem, cond)) {
-                    allMet = false;
-                    break;
+
+            // 1. Compute 64-bit active trigger bitmask
+            std::uint64_t nextMask = 0ULL;
+            const std::size_t trigLimit = std::min<std::size_t>(instances_[curIdx].resolvedStyle.triggers.size(), 64u);
+            for (std::size_t t = 0u; t < trigLimit; ++t) {
+                auto& trig = instances_[curIdx].resolvedStyle.triggers[t];
+                if (trig.conditions.empty()) {
+                    continue;
+                }
+                bool allMet = true;
+                for (auto& cond : trig.conditions) {
+                    if (!EvaluateSingleCondition(elem, cond)) {
+                        allMet = false;
+                        break;
+                    }
+                }
+                if (allMet) {
+                    nextMask |= (1ULL << t);
                 }
             }
-            if (allMet) {
-                nextMask |= (1ULL << t);
-            }
-        }
 
-        // 2. Compute automatic CommonStates / FocusStates / CheckStates indices
-        bool anyGroupChanged = false;
-        const std::size_t groupLimit = std::min(
-            instances_[instIdx].resolvedStyle.visualStateGroups.size(),
-            kMaxVisualStateGroupsPerElement);
-        for (std::size_t g = 0u; g < groupLimit; ++g) {
-            if (instances_[instIdx].groupStates[g].manualOverride) {
+            // 2. Compute automatic CommonStates / FocusStates / CheckStates indices
+            bool anyGroupChanged = false;
+            const std::size_t groupLimit = std::min(
+                instances_[curIdx].resolvedStyle.visualStateGroups.size(),
+                kMaxVisualStateGroupsPerElement);
+            for (std::size_t g = 0u; g < groupLimit; ++g) {
+                if (instances_[curIdx].groupStates[g].manualOverride) {
+                    continue;
+                }
+                const auto& vsg = instances_[curIdx].resolvedStyle.visualStateGroups[g];
+                std::int16_t desiredIdx = instances_[curIdx].groupStates[g].activeStateIndex;
+
+                if (vsg.name == "CommonStates" || vsg.name.empty()) {
+                    if (!elem->IsEffectivelyEnabled()) {
+                        desiredIdx = FindStateIndexByName(vsg, "Disabled");
+                    } else if (elem->IsPressed()) {
+                        desiredIdx = FindStateIndexByName(vsg, "Pressed");
+                    } else if (elem->IsHovered()) {
+                        desiredIdx = FindStateIndexByName(vsg, "MouseOver");
+                    } else {
+                        desiredIdx = FindStateIndexByName(vsg, "Normal");
+                    }
+                } else if (vsg.name == "FocusStates") {
+                    desiredIdx = elem->IsFocused()
+                        ? FindStateIndexByName(vsg, "Focused")
+                        : FindStateIndexByName(vsg, "Unfocused");
+                } else if (vsg.name == "CheckStates") {
+                    bool checked = false;
+                    const UnifiedValue chkVal = elem->GetValue(PropId_IsChecked);
+                    if (const auto* b = std::get_if<bool>(&chkVal)) {
+                        checked = *b;
+                    }
+                    desiredIdx = checked
+                        ? FindStateIndexByName(vsg, "Checked")
+                        : FindStateIndexByName(vsg, "Unchecked");
+                }
+
+                if (desiredIdx != instances_[curIdx].groupStates[g].activeStateIndex) {
+                    instances_[curIdx].groupStates[g].activeStateIndex = desiredIdx;
+                    anyGroupChanged = true;
+                }
+            }
+
+            // O(1) clean-frame short-circuit!
+            if (instances_[curIdx].initialized && nextMask == instances_[curIdx].activeTriggerMask && !anyGroupChanged) {
+                if (eventFired) {
+                    ++changedElements;
+                }
                 continue;
             }
-            const auto& vsg = instances_[instIdx].resolvedStyle.visualStateGroups[g];
-            std::int16_t desiredIdx = instances_[instIdx].groupStates[g].activeStateIndex;
 
-            if (vsg.name == "CommonStates" || vsg.name.empty()) {
-                if (!elem->IsEffectivelyEnabled()) {
-                    desiredIdx = FindStateIndexByName(vsg, "Disabled");
-                } else if (elem->IsPressed()) {
-                    desiredIdx = FindStateIndexByName(vsg, "Pressed");
-                } else if (elem->IsHovered()) {
-                    desiredIdx = FindStateIndexByName(vsg, "MouseOver");
-                } else {
-                    desiredIdx = FindStateIndexByName(vsg, "Normal");
-                }
-            } else if (vsg.name == "FocusStates") {
-                desiredIdx = elem->IsFocused()
-                    ? FindStateIndexByName(vsg, "Focused")
-                    : FindStateIndexByName(vsg, "Unfocused");
-            } else if (vsg.name == "CheckStates") {
-                bool checked = false;
-                const UnifiedValue chkVal = elem->GetValue(PropId_IsChecked);
-                if (const auto* b = std::get_if<bool>(&chkVal)) {
-                    checked = *b;
-                }
-                desiredIdx = checked
-                    ? FindStateIndexByName(vsg, "Checked")
-                    : FindStateIndexByName(vsg, "Unchecked");
-            }
-
-            if (desiredIdx != instances_[instIdx].groupStates[g].activeStateIndex) {
-                instances_[instIdx].groupStates[g].activeStateIndex = desiredIdx;
-                anyGroupChanged = true;
-            }
-        }
-
-        // O(1) clean-frame short-circuit!
-        if (instances_[instIdx].initialized && nextMask == instances_[instIdx].activeTriggerMask && !anyGroupChanged) {
-            if (eventFired) {
-                ++changedElements;
-            }
-            continue;
-        }
-
-            const bool firstPass = !instances_[instIdx].initialized;
-            const std::uint64_t prevMaskForCascade = instances_[instIdx].activeTriggerMask;
-            instances_[instIdx].initialized = true;
-            ReapplyActiveOverrides(instances_[instIdx], nextMask, !firstPass, firstPass);
+            const bool firstPass = !instances_[curIdx].initialized;
+            const std::uint64_t prevMaskForCascade = instances_[curIdx].activeTriggerMask;
+            instances_[curIdx].initialized = true;
+            ReapplyActiveOverrides(curIdx, nextMask, !firstPass, firstPass);
             ++changedElements;
             if (nextMask != prevMaskForCascade || firstPass) {
                 anyCascadeMutation = true;
@@ -3642,6 +4315,362 @@ std::size_t StyleTriggerEngine::EvaluateSubtree(UIElement* subtreeRoot, bool res
     }
 
     return changedElements;
+}
+
+bool StyleTriggerEngine::NotifyKeyTriggerEvent(
+    UIElement* focusedElement,
+    UIElement* rootVisual,
+    KeyCode key,
+    std::uint8_t modifiers,
+    bool isKeyUp) {
+    if (key == KeyCode::None || instances_.empty()) {
+        return false;
+    }
+    if (bindingEngine_) {
+        domains_ = &bindingEngine_->Domains();
+        if (bindingEngine_->Program()) program_ = bindingEngine_->Program();
+        if (bindingEngine_->UiInterpreter()) uiInterpreter_ = bindingEngine_->UiInterpreter();
+    }
+    std::shared_ptr<UiResourceContext> domainCtx =
+        (domains_ && !UiResourceContext::HasActiveThreadOverride())
+            ? UiResourceContext::FindForDomains(domains_)
+            : nullptr;
+    ScopedUiResourceContext ctxGuard(std::move(domainCtx));
+
+    bool anyFired = false;
+    for (int pass = 0; pass < 2; ++pass) {
+        const bool wantFocusBound = (pass == 0);
+        const std::size_t snapCount = instances_.size();
+        for (std::size_t snapIdx = 0u; snapIdx < snapCount && snapIdx < instances_.size(); ++snapIdx) {
+            UIElement* instElem = instances_[snapIdx].element.Get();
+            if (!instElem || !IsEffectivelyVisibleForTrigger(instElem) || !instElem->IsEffectivelyEnabled()) {
+                continue;
+            }
+            const std::size_t curIdxInit = FindInstanceIndex(instElem);
+            if (curIdxInit == ~std::size_t{0} || instances_[curIdxInit].resolvedStyle.eventTriggers.empty()) {
+                continue;
+            }
+            const std::size_t limit = std::min(
+                instances_[curIdxInit].resolvedStyle.eventTriggers.size(),
+                kMaxEventTriggersPerElement);
+            for (std::size_t t = 0u; t < limit; ++t) {
+                const std::size_t curIdx = FindInstanceIndex(instElem);
+                if (curIdx == ~std::size_t{0} || t >= instances_[curIdx].resolvedStyle.eventTriggers.size()) {
+                    break;
+                }
+                auto& et = instances_[curIdx].resolvedStyle.eventTriggers[t];
+                if (et.eventKind != RoutedTriggerEvent::KeyDownTrigger ||
+                    et.activeOnFocus != wantFocusBound ||
+                    et.firedOnKeyUp != isKeyUp ||
+                    et.keyCode != key) {
+                    continue;
+                }
+                if (et.modifiers != KeyMod_None) {
+                    if ((modifiers & et.modifiers) != et.modifiers) {
+                        continue;
+                    }
+                } else if ((modifiers & (KeyMod_Ctrl | KeyMod_Alt | KeyMod_Shift)) != 0u) {
+                    continue;
+                }
+                if (et.activeOnFocus) {
+                    if (!focusedElement || !IsElementOrAncestor(focusedElement, instElem)) {
+                        continue;
+                    }
+                } else if (rootVisual && !IsElementOrAncestor(instElem, rootVisual)) {
+                    continue;
+                }
+                bool condOk = true;
+                if (!et.conditions.empty()) {
+                    for (auto& cond : et.conditions) {
+                        if (!EvaluateSingleCondition(instElem, cond)) {
+                            condOk = false;
+                            break;
+                        }
+                    }
+                }
+                if (!condOk) {
+                    continue;
+                }
+                auto sbs = et.storyboards;
+                auto acts = et.actions;
+                if (animationEngine_) {
+                    for (const auto& sb : sbs) {
+                        (void)animationEngine_->BeginStoryboard(instElem, sb);
+                    }
+                }
+                if (!acts.empty()) {
+                    const std::size_t actIdx = FindInstanceIndex(instElem);
+                    if (actIdx != ~std::size_t{0}) {
+                        ExecuteInteractionActions(actIdx, std::move(acts));
+                    }
+                }
+                anyFired = true;
+            }
+        }
+    }
+    return anyFired;
+}
+
+void StyleTriggerEngine::NotifyRoutedElementEvent(
+    UIElement* element,
+    RoutedTriggerEvent eventKind) {
+    if (!element || instances_.empty()) {
+        return;
+    }
+    if (bindingEngine_) {
+        domains_ = &bindingEngine_->Domains();
+        if (bindingEngine_->Program()) program_ = bindingEngine_->Program();
+        if (bindingEngine_->UiInterpreter()) uiInterpreter_ = bindingEngine_->UiInterpreter();
+    }
+    std::shared_ptr<UiResourceContext> domainCtx =
+        (domains_ && !UiResourceContext::HasActiveThreadOverride())
+            ? UiResourceContext::FindForDomains(domains_)
+            : nullptr;
+    ScopedUiResourceContext ctxGuard(std::move(domainCtx));
+
+    const std::size_t snapCount = instances_.size();
+    for (std::size_t snapIdx = 0u; snapIdx < snapCount && snapIdx < instances_.size(); ++snapIdx) {
+        UIElement* instElem = instances_[snapIdx].element.Get();
+        if (!instElem) {
+            continue;
+        }
+        const std::size_t curIdxInit = FindInstanceIndex(instElem);
+        if (curIdxInit == ~std::size_t{0} || instances_[curIdxInit].resolvedStyle.eventTriggers.empty()) {
+            continue;
+        }
+        const std::size_t limit = std::min(
+            instances_[curIdxInit].resolvedStyle.eventTriggers.size(),
+            kMaxEventTriggersPerElement);
+        for (std::size_t i = 0u; i < limit; ++i) {
+            const std::size_t curIdx = FindInstanceIndex(instElem);
+            if (curIdx == ~std::size_t{0} || i >= instances_[curIdx].resolvedStyle.eventTriggers.size()) {
+                break;
+            }
+            auto& et = instances_[curIdx].resolvedStyle.eventTriggers[i];
+            auto& rt = instances_[curIdx].eventStates[i];
+            if (et.eventKind != eventKind &&
+                !(et.eventKind == RoutedTriggerEvent::TimerTrigger && et.triggerSourceEvent == eventKind)) {
+                continue;
+            }
+            if (!rt.cachedSource) {
+                if (et.sourceName.empty()) {
+                    rt.cachedSource.Reset(instElem, true);
+                } else {
+                    UIElement* found = instElem->FindName(et.sourceName);
+                    if (!found) {
+                        if (UIElement* scopeRoot = UIElement::FindNamescopeRoot(instElem)) {
+                            found = scopeRoot->FindName(et.sourceName);
+                        }
+                    }
+                    rt.cachedSource.Reset(found, true);
+                }
+            }
+            UIElement* src = rt.cachedSource.Get();
+            if (src != element) {
+                continue;
+            }
+            if (et.eventKind == RoutedTriggerEvent::TimerTrigger) {
+                rt.initialized = true;
+                rt.timerActive = true;
+                rt.timerElapsedMs = 0.0f;
+                rt.timerTicksFired = 0;
+                rt.lastAnimClockSec = animationEngine_ ? animationEngine_->CumulativeTimeSeconds() : 0.0;
+                const float intervalMs = ResolveTimerIntervalMs(
+                    instElem, et, domains_, program_, uiInterpreter_, bindingEngine_);
+                if (intervalMs <= 0.0f) {
+                    bool condOk = true;
+                    for (auto& cond : et.conditions) {
+                        if (!EvaluateSingleCondition(instElem, cond)) {
+                            condOk = false;
+                            break;
+                        }
+                    }
+                    rt.timerTicksFired = 1;
+                    if (et.totalTicks > 0 && rt.timerTicksFired >= et.totalTicks) {
+                        rt.timerActive = false;
+                    }
+                    if (condOk) {
+                        auto sbs = et.storyboards;
+                        auto acts = et.actions;
+                        if (animationEngine_) {
+                            for (const auto& sb : sbs) {
+                                (void)animationEngine_->BeginStoryboard(instElem, sb);
+                            }
+                        }
+                        if (!acts.empty()) {
+                            const std::size_t actIdx = FindInstanceIndex(instElem);
+                            if (actIdx != ~std::size_t{0}) {
+                                ExecuteInteractionActions(actIdx, std::move(acts));
+                            }
+                        }
+                    }
+                }
+                continue;
+            }
+
+            bool fire = false;
+            if (eventKind == RoutedTriggerEvent::GotFocus) {
+                if (!rt.initialized || !rt.prevFocused) {
+                    rt.initialized = true;
+                    rt.prevFocused = true;
+                    fire = true;
+                }
+            } else if (eventKind == RoutedTriggerEvent::LostFocus) {
+                if (!rt.initialized || rt.prevFocused) {
+                    rt.initialized = true;
+                    rt.prevFocused = false;
+                    fire = true;
+                }
+            } else if (eventKind == RoutedTriggerEvent::MouseDown) {
+                rt.initialized = true;
+                rt.prevPressed = src->IsPressed();
+                fire = true;
+            } else if (eventKind == RoutedTriggerEvent::MouseUp) {
+                rt.initialized = true;
+                rt.prevPressed = src->IsPressed();
+                fire = true;
+            }
+            if (!fire) {
+                continue;
+            }
+            bool condOk = true;
+            for (auto& cond : et.conditions) {
+                if (!EvaluateSingleCondition(instElem, cond)) {
+                    condOk = false;
+                    break;
+                }
+            }
+            if (!condOk) {
+                continue;
+            }
+            auto sbs = et.storyboards;
+            auto acts = et.actions;
+            if (animationEngine_) {
+                for (const auto& sb : sbs) {
+                    (void)animationEngine_->BeginStoryboard(instElem, sb);
+                }
+            }
+            if (!acts.empty()) {
+                const std::size_t actIdx = FindInstanceIndex(instElem);
+                if (actIdx != ~std::size_t{0}) {
+                    ExecuteInteractionActions(actIdx, std::move(acts));
+                }
+            }
+        }
+    }
+}
+
+std::size_t StyleTriggerEngine::TickTimers(float dtSeconds) {
+    if (dtSeconds < 0.0f || instances_.empty()) {
+        return 0u;
+    }
+    if (bindingEngine_) {
+        domains_ = &bindingEngine_->Domains();
+        if (bindingEngine_->Program()) program_ = bindingEngine_->Program();
+        if (bindingEngine_->UiInterpreter()) uiInterpreter_ = bindingEngine_->UiInterpreter();
+    }
+    std::shared_ptr<UiResourceContext> domainCtx =
+        (domains_ && !UiResourceContext::HasActiveThreadOverride())
+            ? UiResourceContext::FindForDomains(domains_)
+            : nullptr;
+    ScopedUiResourceContext ctxGuard(std::move(domainCtx));
+
+    std::size_t firedCount = 0u;
+    const std::size_t snapCount = instances_.size();
+    for (std::size_t snapIdx = 0u; snapIdx < snapCount && snapIdx < instances_.size(); ++snapIdx) {
+        UIElement* instElem = instances_[snapIdx].element.Get();
+        if (!instElem) {
+            continue;
+        }
+        const std::size_t curIdxInit = FindInstanceIndex(instElem);
+        if (curIdxInit == ~std::size_t{0} || instances_[curIdxInit].resolvedStyle.eventTriggers.empty()) {
+            continue;
+        }
+        const std::size_t limit = std::min(
+            instances_[curIdxInit].resolvedStyle.eventTriggers.size(),
+            kMaxEventTriggersPerElement);
+        for (std::size_t i = 0u; i < limit; ++i) {
+            const std::size_t curIdx = FindInstanceIndex(instElem);
+            if (curIdx == ~std::size_t{0} || i >= instances_[curIdx].resolvedStyle.eventTriggers.size()) {
+                break;
+            }
+            auto& et = instances_[curIdx].resolvedStyle.eventTriggers[i];
+            if (et.eventKind != RoutedTriggerEvent::TimerTrigger) {
+                continue;
+            }
+            auto& rt = instances_[curIdx].eventStates[i];
+            const double curAnimClock = animationEngine_ ? animationEngine_->CumulativeTimeSeconds() : 0.0;
+            if (!rt.initialized) {
+                rt.initialized = true;
+                rt.timerElapsedMs = 0.0f;
+                rt.timerTicksFired = 0;
+                rt.lastAnimClockSec = curAnimClock;
+                rt.timerActive = (et.triggerSourceEvent == RoutedTriggerEvent::Loaded);
+            }
+            if (!rt.timerActive) {
+                continue;
+            }
+            rt.timerElapsedMs += dtSeconds * 1000.0f;
+            rt.timerTickedExplicitly = true;
+            rt.lastAnimClockSec = curAnimClock;
+
+            const float intervalMs = ResolveTimerIntervalMs(
+                instElem, et, domains_, program_, uiInterpreter_, bindingEngine_);
+            int safetyTicks = 0;
+            while (safetyTicks < 16) {
+                const std::size_t loopIdx = FindInstanceIndex(instElem);
+                if (loopIdx == ~std::size_t{0} || i >= instances_[loopIdx].resolvedStyle.eventTriggers.size()) {
+                    break;
+                }
+                auto& loopEt = instances_[loopIdx].resolvedStyle.eventTriggers[i];
+                auto& loopRt = instances_[loopIdx].eventStates[i];
+                if (!loopRt.timerActive) {
+                    break;
+                }
+                const bool due = (intervalMs <= 0.0f)
+                    ? (safetyTicks == 0)
+                    : (loopRt.timerElapsedMs + 1e-3f >= intervalMs);
+                if (!due) {
+                    break;
+                }
+                ++safetyTicks;
+                if (intervalMs > 0.0f) {
+                    loopRt.timerElapsedMs = std::max(0.0f, loopRt.timerElapsedMs - intervalMs);
+                }
+                ++loopRt.timerTicksFired;
+                if (loopEt.totalTicks > 0 && loopRt.timerTicksFired >= loopEt.totalTicks) {
+                    loopRt.timerActive = false;
+                }
+                bool condOk = true;
+                for (auto& cond : loopEt.conditions) {
+                    if (!EvaluateSingleCondition(instElem, cond)) {
+                        condOk = false;
+                        break;
+                    }
+                }
+                if (condOk) {
+                    auto sbs = loopEt.storyboards;
+                    auto acts = loopEt.actions;
+                    if (animationEngine_) {
+                        for (const auto& sb : sbs) {
+                            (void)animationEngine_->BeginStoryboard(instElem, sb);
+                        }
+                    }
+                    if (!acts.empty()) {
+                        const std::size_t actIdx = FindInstanceIndex(instElem);
+                        if (actIdx != ~std::size_t{0}) {
+                            ExecuteInteractionActions(actIdx, std::move(acts));
+                        }
+                    }
+                    ++firedCount;
+                }
+                if (intervalMs <= 0.0f) {
+                    break;
+                }
+            }
+        }
+    }
+    return firedCount;
 }
 
 } // namespace aero

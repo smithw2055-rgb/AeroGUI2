@@ -60,6 +60,40 @@ constexpr float kPi = 3.14159265358979323846f;
     return t;
 }
 
+[[nodiscard]] float EvaluateExponentialEaseExponentCore(float exponent, float t) noexcept {
+    t = std::clamp(t, 0.0f, 1.0f);
+    if (t <= 0.0f) return 0.0f;
+    if (t >= 1.0f) return 1.0f;
+    const float clampedExp = std::clamp(exponent, -50.0f, 50.0f);
+    if (std::fabs(clampedExp) <= 1e-5f) {
+        return t;
+    }
+    const float denom = std::exp(clampedExp) - 1.0f;
+    if (std::fabs(denom) <= 1e-6f) {
+        return t;
+    }
+    return (std::exp(clampedExp * t) - 1.0f) / denom;
+}
+
+[[nodiscard]] float EvaluateExponentialEaseWithExponent(
+    float exponent,
+    EasingMode mode,
+    float normalizedTime01) noexcept {
+    const float t = std::clamp(normalizedTime01, 0.0f, 1.0f);
+    switch (mode) {
+        case EasingMode::EaseIn:
+            return EvaluateExponentialEaseExponentCore(exponent, t);
+        case EasingMode::EaseOut:
+            return 1.0f - EvaluateExponentialEaseExponentCore(exponent, 1.0f - t);
+        case EasingMode::EaseInOut:
+            if (t < 0.5f) {
+                return 0.5f * EvaluateExponentialEaseExponentCore(exponent, t * 2.0f);
+            }
+            return 1.0f - 0.5f * EvaluateExponentialEaseExponentCore(exponent, (1.0f - t) * 2.0f);
+    }
+    return t;
+}
+
 [[nodiscard]] Float4Value LerpFloat4(const Float4Value& a, const Float4Value& b, float t) noexcept {
     return Float4Value{
         a.x + (b.x - a.x) * t,
@@ -278,6 +312,7 @@ void AnimationEngine::Clear() {
     freeTrackIds_.clear();
     activeCount_ = 0u;
     pausedCount_ = 0u;
+    cumulativeElapsedSec_ = 0.0;
     stateMachines_.clear();
 }
 
@@ -711,6 +746,7 @@ std::uint16_t AnimationEngine::StartTimeline(
         tr.speedRatio = (timeline.speedRatio > 1e-4f) ? timeline.speedRatio : 1.0f;
         tr.accelerationRatio = std::clamp(timeline.accelerationRatio, 0.0f, 1.0f);
         tr.decelerationRatio = std::clamp(timeline.decelerationRatio, 0.0f, 1.0f - tr.accelerationRatio);
+        tr.customAnim = timeline.customAnim;
 
         const std::size_t kfCount = std::min(timeline.keyFrames.size(), kMaxInlineKeyFrames);
         tr.keyFrameCount = static_cast<std::uint8_t>(kfCount);
@@ -783,6 +819,66 @@ std::uint16_t AnimationEngine::StartTimeline(
         return id;
     }
 
+    if (timeline.customAnim.animTypeId != 0u) {
+        if (const CustomAnimationSpec* spec = GetCustomAnimationTypeById(timeline.customAnim.animTypeId);
+            spec && spec->evaluate) {
+            const float cur = ReadCurrentScalar(target, timeline.targetPropertyId);
+            float fromS = cur;
+            if (timeline.hasFrom) {
+                (void)TryGetFloat(timeline.fromValue, fromS);
+            }
+            float toS = cur;
+            if (timeline.hasTo && TryGetFloat(timeline.toValue, toS)) {
+                if (timeline.isBy) {
+                    toS = fromS + toS;
+                }
+            }
+            const std::uint16_t tidCustom = StartFloatTween(
+                target,
+                timeline.targetPropertyId,
+                fromS,
+                toS,
+                timeline.durationSeconds,
+                timeline.easingKind,
+                timeline.easingMode,
+                timeline.fillBehavior,
+                timeline.beginTimeSeconds,
+                timeline.autoReverse,
+                timeline.repeatCount);
+            if (tidCustom < tracks_.size()) {
+                AnimationTrack& tr = tracks_[tidCustom];
+                tr.speedRatio = (timeline.speedRatio > 1e-4f) ? timeline.speedRatio : 1.0f;
+                tr.accelerationRatio = std::clamp(timeline.accelerationRatio, 0.0f, 1.0f);
+                tr.decelerationRatio = std::clamp(timeline.decelerationRatio, 0.0f, 1.0f - tr.accelerationRatio);
+                tr.customAnim = timeline.customAnim;
+                float defaultOrigin = cur;
+                if (tr.hadBaseSnapshot) {
+                    (void)TryGetFloat(tr.baseSnapshot, defaultOrigin);
+                }
+                if (!timeline.hasFrom) {
+                    tr.fromF4.x = defaultOrigin;
+                }
+                if (!timeline.hasTo) {
+                    tr.toF4.x = defaultOrigin;
+                }
+                tr.defaultOriginScalar = defaultOrigin;
+                if (tr.beginTime <= 0.0f) {
+                    const float initNormT = (tr.duration <= 0.0f && !tr.autoReverse) ? 1.0f : 0.0f;
+                    const float initVal = spec->evaluate(
+                        tr.customAnim,
+                        tr.easingMode,
+                        initNormT,
+                        tr.fromF4.x,
+                        tr.toF4.x,
+                        tr.defaultOriginScalar);
+                    tr.posF4.x = initVal;
+                    (void)target->SetValue(timeline.targetPropertyId, MakeFloat(initVal), ValueSourceRank::Animation);
+                }
+            }
+            return tidCustom;
+        }
+    }
+
     // Simple From -> To Tween (Float4 or Float)
     Float4Value parsedFromF4{};
     Float4Value parsedToF4{};
@@ -827,6 +923,7 @@ std::uint16_t AnimationEngine::StartTimeline(
             tracks_[tid4].speedRatio = (timeline.speedRatio > 1e-4f) ? timeline.speedRatio : 1.0f;
             tracks_[tid4].accelerationRatio = std::clamp(timeline.accelerationRatio, 0.0f, 1.0f);
             tracks_[tid4].decelerationRatio = std::clamp(timeline.decelerationRatio, 0.0f, 1.0f - tracks_[tid4].accelerationRatio);
+            tracks_[tid4].customAnim = timeline.customAnim;
         }
         return tid4;
     }
@@ -858,6 +955,7 @@ std::uint16_t AnimationEngine::StartTimeline(
         tracks_[tid1].speedRatio = (timeline.speedRatio > 1e-4f) ? timeline.speedRatio : 1.0f;
         tracks_[tid1].accelerationRatio = std::clamp(timeline.accelerationRatio, 0.0f, 1.0f);
         tracks_[tid1].decelerationRatio = std::clamp(timeline.decelerationRatio, 0.0f, 1.0f - tracks_[tid1].accelerationRatio);
+        tracks_[tid1].customAnim = timeline.customAnim;
     }
     return tid1;
 }
@@ -2218,6 +2316,9 @@ std::size_t AnimationEngine::Tick(float dtSeconds) noexcept {
     if (dtSeconds < 0.0f) {
         return 0u;
     }
+    if (dtSeconds > 0.0f) {
+        cumulativeElapsedSec_ += static_cast<double>(dtSeconds);
+    }
     if (activeCount_ == 0u && stateMachines_.empty()) {
         return 0u;
     }
@@ -2375,12 +2476,41 @@ std::size_t AnimationEngine::Tick(float dtSeconds) noexcept {
             localCycleTime = warpAccelDecel(raw01, tr.accelerationRatio, tr.decelerationRatio) * singleCycleDur;
         }
 
+        auto evalTrackOrKeyFrameEasing = [](const AnimationTrack& track,
+                                            EasingFunctionKind ek,
+                                            EasingMode em,
+                                            float t01) noexcept -> float {
+            if (track.customAnim.animTypeId == 0u &&
+                (track.customAnim.flags & 1u) != 0u &&
+                ek == EasingFunctionKind::Exponential) {
+                return EvaluateExponentialEaseWithExponent(track.customAnim.params[0], em, t01);
+            }
+            return EvaluateEasing(ek, em, t01);
+        };
+
         if (tr.kind == AnimationTrackKind::TweenFloat) {
             const float normT = (singleCycleDur > 1e-6f)
                 ? std::clamp(localCycleTime / singleCycleDur, 0.0f, 1.0f)
                 : 1.0f;
-            const float eased = EvaluateEasing(tr.easingKind, tr.easingMode, normT);
-            const float val = tr.fromF4.x + (tr.toF4.x - tr.fromF4.x) * eased;
+            float val = 0.0f;
+            if (tr.customAnim.animTypeId != 0u) {
+                if (const CustomAnimationSpec* spec = GetCustomAnimationTypeById(tr.customAnim.animTypeId);
+                    spec && spec->evaluate) {
+                    val = spec->evaluate(
+                        tr.customAnim,
+                        tr.easingMode,
+                        normT,
+                        tr.fromF4.x,
+                        tr.toF4.x,
+                        tr.defaultOriginScalar);
+                } else {
+                    const float eased = EvaluateEasing(tr.easingKind, tr.easingMode, normT);
+                    val = tr.fromF4.x + (tr.toF4.x - tr.fromF4.x) * eased;
+                }
+            } else {
+                const float eased = evalTrackOrKeyFrameEasing(tr, tr.easingKind, tr.easingMode, normT);
+                val = tr.fromF4.x + (tr.toF4.x - tr.fromF4.x) * eased;
+            }
             tr.posF4.x = val;
             (void)target->SetValue(tr.propId, MakeFloat(val), ValueSourceRank::Animation);
             ++updates;
@@ -2388,7 +2518,7 @@ std::size_t AnimationEngine::Tick(float dtSeconds) noexcept {
             const float normT = (singleCycleDur > 1e-6f)
                 ? std::clamp(localCycleTime / singleCycleDur, 0.0f, 1.0f)
                 : 1.0f;
-            const float eased = EvaluateEasing(tr.easingKind, tr.easingMode, normT);
+            const float eased = evalTrackOrKeyFrameEasing(tr, tr.easingKind, tr.easingMode, normT);
             const Float4Value val = LerpFloat4(tr.fromF4, tr.toF4, eased);
             tr.posF4 = val;
             (void)target->SetValue(tr.propId, MakeFloat4InlineFast(val), ValueSourceRank::Animation);
@@ -2453,7 +2583,7 @@ std::size_t AnimationEngine::Tick(float dtSeconds) noexcept {
                 }
                 const float eased = endKf.hasKeySpline
                     ? EvaluateCubicBezier1D(endKf.splineX1, endKf.splineY1, endKf.splineX2, endKf.splineY2, segNorm)
-                    : EvaluateEasing(endKf.easingKind, endKf.easingMode, segNorm);
+                    : evalTrackOrKeyFrameEasing(tr, endKf.easingKind, endKf.easingMode, segNorm);
                 const Float4Value curVal = LerpFloat4(startF4, endF4, eased);
                 tr.posF4 = curVal;
                 (void)target->SetValue(tr.propId, MakeFloat4InlineFast(curVal), ValueSourceRank::Animation);
@@ -2466,7 +2596,7 @@ std::size_t AnimationEngine::Tick(float dtSeconds) noexcept {
                 }
                 const float eased = endKf.hasKeySpline
                     ? EvaluateCubicBezier1D(endKf.splineX1, endKf.splineY1, endKf.splineX2, endKf.splineY2, segNorm)
-                    : EvaluateEasing(endKf.easingKind, endKf.easingMode, segNorm);
+                    : evalTrackOrKeyFrameEasing(tr, endKf.easingKind, endKf.easingMode, segNorm);
                 const float curVal = startS + (endS - startS) * eased;
                 tr.posF4.x = curVal;
                 (void)target->SetValue(tr.propId, MakeFloat(curVal), ValueSourceRank::Animation);
