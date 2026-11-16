@@ -96,7 +96,7 @@ public:
     void SetDrawBuffer(DrawingCommandBuffer* drawBuffer) noexcept { drawBuffer_ = drawBuffer; }
     [[nodiscard]] DrawingCommandBuffer* GetDrawBuffer() const noexcept { return drawBuffer_; }
 
-    void SetRenderTree(PagedRenderTree* tree) noexcept { renderTree_ = tree; }
+    void SetRenderTree(PagedRenderTree* tree) noexcept;
     [[nodiscard]] PagedRenderTree* GetRenderTree() const noexcept { return renderTree_; }
 
     void SetInputRouter(VisualInputRouter* router) noexcept { inputRouter_ = router; }
@@ -185,6 +185,7 @@ protected:
     float dpiScale_ = 1.0f;
     Size viewportSize_{1920.0f, 1080.0f};
     Size lastLaidOutViewport_{-1.0f, -1.0f};
+    bool renderSyncDirty_ = true;
     HostFrameTelemetry telemetry_{};
 };
 

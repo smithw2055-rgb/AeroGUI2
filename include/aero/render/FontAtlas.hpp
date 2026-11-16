@@ -11,6 +11,7 @@
 #include <vector>
 
 #include "aero/core/UnifiedValue.hpp"
+#include "aero/render/SkylinePacker.hpp"
 
 namespace aero {
 
@@ -377,7 +378,7 @@ private:
     std::uint16_t atlasWidth_ = kDefaultAtlasSize;
     std::uint16_t atlasHeight_ = kDefaultAtlasSize;
     std::uint16_t glyphRegionHeight_ = kDefaultAtlasSize / 2u; // Top half v in [0.0..0.5)
-    std::vector<std::uint16_t> skyline_;
+    SkylinePacker skyline_;
     std::vector<std::uint8_t> sdfPixels_;
     std::atomic<std::uint64_t> revision_{1u};
 

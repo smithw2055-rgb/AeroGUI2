@@ -2759,8 +2759,7 @@ void ImageAtlas::EnsureSharedAtlasAllocatedLocked() {
         static_cast<std::size_t>(sharedAtlasSize_) * sharedAtlasSize_ * 4u, 0u);
     textureSlots_.emplace(kSharedUiAtlasTextureId, std::move(slot));
 
-    skyline_.clear();
-    skyline_.push_back(SkylineNode{0u, 0u, sharedAtlasSize_});
+    skyline_.Reset(sharedAtlasSize_, sharedAtlasSize_);
 }
 
 bool ImageAtlas::TryAllocateSkylineRectLocked(
@@ -2768,83 +2767,7 @@ bool ImageAtlas::TryAllocateSkylineRectLocked(
     std::uint32_t paddedH,
     std::uint32_t& outX,
     std::uint32_t& outY) noexcept {
-    if (paddedW > sharedAtlasSize_ || paddedH > sharedAtlasSize_ || skyline_.empty()) {
-        return false;
-    }
-
-    std::size_t bestIndex = static_cast<std::size_t>(-1);
-    std::uint32_t bestY = 0xFFFFFFFFu;
-    std::uint32_t bestWidth = 0xFFFFFFFFu;
-
-    for (std::size_t i = 0u; i < skyline_.size(); ++i) {
-        const std::uint32_t x = skyline_[i].x;
-        if (x + paddedW > sharedAtlasSize_) {
-            continue;
-        }
-        std::uint32_t y = skyline_[i].y;
-        std::int64_t widthLeft = static_cast<std::int64_t>(paddedW);
-        std::size_t j = i;
-        bool fits = true;
-        while (widthLeft > 0) {
-            if (j >= skyline_.size()) {
-                fits = false;
-                break;
-            }
-            y = std::max(y, skyline_[j].y);
-            if (y + paddedH > sharedAtlasSize_) {
-                fits = false;
-                break;
-            }
-            widthLeft -= static_cast<std::int64_t>(skyline_[j].width);
-            ++j;
-        }
-        if (fits) {
-            if (y < bestY || (y == bestY && skyline_[i].width < bestWidth)) {
-                bestIndex = i;
-                bestY = y;
-                bestWidth = skyline_[i].width;
-            }
-        }
-    }
-
-    if (bestIndex == static_cast<std::size_t>(-1)) {
-        return false;
-    }
-
-    const std::uint32_t placedX = skyline_[bestIndex].x;
-    const std::uint32_t placedY = bestY;
-    SkylineNode newNode{placedX, placedY + paddedH, paddedW};
-    skyline_.insert(skyline_.begin() + static_cast<std::ptrdiff_t>(bestIndex), newNode);
-
-    for (std::size_t i = bestIndex + 1u; i < skyline_.size(); ++i) {
-        const std::uint32_t prevRight = skyline_[i - 1u].x + skyline_[i - 1u].width;
-        if (skyline_[i].x < prevRight) {
-            const std::uint32_t shrink = prevRight - skyline_[i].x;
-            if (skyline_[i].width <= shrink) {
-                skyline_.erase(skyline_.begin() + static_cast<std::ptrdiff_t>(i));
-                --i;
-            } else {
-                skyline_[i].x += shrink;
-                skyline_[i].width -= shrink;
-                break;
-            }
-        } else {
-            break;
-        }
-    }
-
-    // Merge adjacent co-level skyline spans
-    for (std::size_t i = 0u; i + 1u < skyline_.size(); ++i) {
-        if (skyline_[i].y == skyline_[i + 1u].y) {
-            skyline_[i].width += skyline_[i + 1u].width;
-            skyline_.erase(skyline_.begin() + static_cast<std::ptrdiff_t>(i + 1u));
-            --i;
-        }
-    }
-
-    outX = placedX;
-    outY = placedY;
-    return true;
+    return skyline_.TryAllocate(paddedW, paddedH, outX, outY);
 }
 
 void ImageAtlas::BlitWithExtrudedBorderLocked(
@@ -3308,7 +3231,7 @@ std::size_t ImageAtlas::StandaloneTextureCount() const noexcept {
 
 void ImageAtlas::Clear() noexcept {
     std::lock_guard<std::mutex> lock(mutex_);
-    skyline_.clear();
+    skyline_.ClearToEmpty();
     memoryEncodedAssets_.clear();
     entries_.clear();
     textureSlots_.clear();

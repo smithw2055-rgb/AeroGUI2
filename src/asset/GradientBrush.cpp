@@ -365,6 +365,15 @@ const GradientBrushDesc* GradientBrushRegistry::Find(std::uint32_t brushId) cons
     return &brushes_[brushId - 1u];
 }
 
+bool GradientBrushRegistry::TryGetBrush(std::uint32_t brushId, GradientBrushDesc& outBrush) const noexcept {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (brushId == 0u || brushId > brushes_.size()) {
+        return false;
+    }
+    outBrush = brushes_[brushId - 1u];
+    return true;
+}
+
 std::size_t GradientBrushRegistry::BrushCount() const noexcept {
     std::lock_guard<std::mutex> lock(mutex_);
     return brushes_.size();

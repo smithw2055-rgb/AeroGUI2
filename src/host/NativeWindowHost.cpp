@@ -446,6 +446,22 @@ struct XImage {
 }
 
 [[nodiscard]] KeyCode TranslateX11KeySym(KeySym ks) noexcept {
+    if (ks >= 0x0041UL && ks <= 0x005AUL) {
+        return static_cast<KeyCode>(
+            static_cast<std::uint16_t>(KeyCode::A) + static_cast<std::uint16_t>(ks - 0x0041UL));
+    }
+    if (ks >= 0x0061UL && ks <= 0x007AUL) {
+        return static_cast<KeyCode>(
+            static_cast<std::uint16_t>(KeyCode::A) + static_cast<std::uint16_t>(ks - 0x0061UL));
+    }
+    if (ks >= 0x0030UL && ks <= 0x0039UL) {
+        return static_cast<KeyCode>(
+            static_cast<std::uint16_t>(KeyCode::D0) + static_cast<std::uint16_t>(ks - 0x0030UL));
+    }
+    if (ks >= 0xFFBEUL && ks <= 0xFFC9UL) {
+        return static_cast<KeyCode>(
+            static_cast<std::uint16_t>(KeyCode::F1) + static_cast<std::uint16_t>(ks - 0xFFBEUL));
+    }
     switch (ks) {
         case 0xFF09UL: case 0xFE20UL: return KeyCode::Tab; // XK_Tab / XK_ISO_Left_Tab
         case 0xFF0DUL: case 0xFF8DUL: return KeyCode::Enter;
@@ -638,6 +654,35 @@ using EmRafTimestamp = typename FirstCallbackParam<em_raf_callback_func>::Type;
 }
 
 [[nodiscard]] KeyCode TranslateDomKeyName(std::string_view domKey) noexcept {
+    if (domKey.size() == 1u) {
+        const char ch = domKey[0];
+        if (ch >= 'A' && ch <= 'Z') {
+            return static_cast<KeyCode>(
+                static_cast<std::uint16_t>(KeyCode::A) + static_cast<std::uint16_t>(ch - 'A'));
+        }
+        if (ch >= 'a' && ch <= 'z') {
+            return static_cast<KeyCode>(
+                static_cast<std::uint16_t>(KeyCode::A) + static_cast<std::uint16_t>(ch - 'a'));
+        }
+        if (ch >= '0' && ch <= '9') {
+            return static_cast<KeyCode>(
+                static_cast<std::uint16_t>(KeyCode::D0) + static_cast<std::uint16_t>(ch - '0'));
+        }
+    }
+    if ((domKey.size() == 2u || domKey.size() == 3u) && domKey[0] == 'F') {
+        int fnNum = 0;
+        for (std::size_t i = 1u; i < domKey.size(); ++i) {
+            if (domKey[i] < '0' || domKey[i] > '9') {
+                fnNum = 0;
+                break;
+            }
+            fnNum = fnNum * 10 + (domKey[i] - '0');
+        }
+        if (fnNum >= 1 && fnNum <= 12) {
+            return static_cast<KeyCode>(
+                static_cast<std::uint16_t>(KeyCode::F1) + static_cast<std::uint16_t>(fnNum - 1));
+        }
+    }
     if (domKey == "Tab") return KeyCode::Tab;
     if (domKey == "Enter") return KeyCode::Enter;
     if (domKey == " " || domKey == "Spacebar") return KeyCode::Space;
@@ -668,6 +713,9 @@ NativeWindowHost::NativeWindowHost() noexcept {
 }
 
 NativeWindowHost::~NativeWindowHost() {
+    if (inputRouter_ && inputRouter_->PlatformHooks() == &ownedPlatformHooks_) {
+        inputRouter_->SetPlatformHooks(nullptr);
+    }
     Shutdown();
 }
 
@@ -686,6 +734,144 @@ void NativeWindowHost::OnDesktopImeSpotSyncTrampoline(
     }
 }
 
+KeyCode NativeWindowHost::TranslateWin32VirtualKey(std::uint32_t vk) noexcept {
+    if (vk >= 0x41u && vk <= 0x5Au) { // 'A'..'Z'
+        return static_cast<KeyCode>(
+            static_cast<std::uint16_t>(KeyCode::A) + static_cast<std::uint16_t>(vk - 0x41u));
+    }
+    if (vk >= 0x30u && vk <= 0x39u) { // '0'..'9'
+        return static_cast<KeyCode>(
+            static_cast<std::uint16_t>(KeyCode::D0) + static_cast<std::uint16_t>(vk - 0x30u));
+    }
+    if (vk >= 0x70u && vk <= 0x7Bu) { // VK_F1..VK_F12
+        return static_cast<KeyCode>(
+            static_cast<std::uint16_t>(KeyCode::F1) + static_cast<std::uint16_t>(vk - 0x70u));
+    }
+    switch (vk) {
+        case 0x09u: return KeyCode::Tab;       // VK_TAB
+        case 0x0Du: return KeyCode::Enter;     // VK_RETURN
+        case 0x20u: return KeyCode::Space;     // VK_SPACE
+        case 0x1Bu: return KeyCode::Escape;    // VK_ESCAPE
+        case 0x08u: return KeyCode::Backspace; // VK_BACK
+        case 0x2Eu: return KeyCode::Delete;    // VK_DELETE
+        case 0x25u: return KeyCode::Left;      // VK_LEFT
+        case 0x27u: return KeyCode::Right;     // VK_RIGHT
+        case 0x26u: return KeyCode::Up;        // VK_UP
+        case 0x28u: return KeyCode::Down;      // VK_DOWN
+        case 0x24u: return KeyCode::Home;      // VK_HOME
+        case 0x23u: return KeyCode::End;       // VK_END
+        case 0x21u: return KeyCode::PageUp;    // VK_PRIOR
+        case 0x22u: return KeyCode::PageDown;  // VK_NEXT
+        default:    return KeyCode::None;
+    }
+}
+
+std::string NativeWindowHost::GetClipboardText() const {
+#if defined(_WIN32)
+    if (!IsHeadless() && win32Hwnd_ != nullptr) {
+        if (OpenClipboard(static_cast<HWND>(win32Hwnd_)) != FALSE) {
+            std::string result;
+            HANDLE hData = GetClipboardData(CF_UNICODETEXT);
+            if (hData != nullptr) {
+                if (const auto* wText = static_cast<const wchar_t*>(GlobalLock(hData))) {
+                    const int needed = WideCharToMultiByte(
+                        CP_UTF8, 0, wText, -1, nullptr, 0, nullptr, nullptr);
+                    if (needed > 1) {
+                        result.resize(static_cast<std::size_t>(needed - 1));
+                        (void)WideCharToMultiByte(
+                            CP_UTF8, 0, wText, -1, result.data(), needed, nullptr, nullptr);
+                    }
+                    GlobalUnlock(hData);
+                }
+            }
+            (void)CloseClipboard();
+            return result;
+        }
+    }
+#endif
+    std::lock_guard<std::mutex> lock(clipboardMutex_);
+    return clipboardFallbackBuffer_;
+}
+
+void NativeWindowHost::SetClipboardText(std::string_view text) {
+    {
+        std::lock_guard<std::mutex> lock(clipboardMutex_);
+        clipboardFallbackBuffer_.assign(text);
+    }
+#if defined(_WIN32)
+    if (!IsHeadless() && win32Hwnd_ != nullptr) {
+        if (OpenClipboard(static_cast<HWND>(win32Hwnd_)) != FALSE) {
+            (void)EmptyClipboard();
+            int wideCount = 1;
+            if (!text.empty()) {
+                const int req = MultiByteToWideChar(
+                    CP_UTF8, 0, text.data(), static_cast<int>(text.size()), nullptr, 0);
+                if (req > 0) {
+                    wideCount = req + 1;
+                }
+            }
+            HGLOBAL hMem = GlobalAlloc(GMEM_MOVEABLE, static_cast<SIZE_T>(wideCount) * sizeof(wchar_t));
+            if (hMem != nullptr) {
+                if (auto* dst = static_cast<wchar_t*>(GlobalLock(hMem))) {
+                    if (wideCount > 1) {
+                        (void)MultiByteToWideChar(
+                            CP_UTF8, 0, text.data(), static_cast<int>(text.size()), dst, wideCount - 1);
+                    }
+                    dst[wideCount - 1] = L'\0';
+                    GlobalUnlock(hMem);
+                    if (SetClipboardData(CF_UNICODETEXT, hMem) == nullptr) {
+                        GlobalFree(hMem);
+                    }
+                } else {
+                    GlobalFree(hMem);
+                }
+            }
+            (void)CloseClipboard();
+        }
+    }
+#endif
+}
+
+void NativeWindowHost::InstallPlatformHooks(UIHostPlatformHooks& hooks) noexcept {
+    if (!hooks.syncImeRect) {
+        hooks.syncImeRect = [this](Rect caretRect, bool active) {
+            SyncNativeImeSpot(caretRect, active);
+        };
+    }
+    if (!hooks.getClipboardText) {
+        hooks.getClipboardText = [this]() -> std::string {
+            return GetClipboardText();
+        };
+    }
+    if (!hooks.setClipboardText) {
+        hooks.setClipboardText = [this](std::string_view text) {
+            SetClipboardText(text);
+        };
+    }
+    if (!hooks.requestWake) {
+        hooks.requestWake = [this]() {
+            WakeEventLoop();
+        };
+    }
+    if (!hooks.closeWindow) {
+        hooks.closeWindow = [this]() {
+            RequestClose();
+        };
+    }
+}
+
+void NativeWindowHost::WireInputRouterHooks() noexcept {
+    if (!inputRouter_) {
+        return;
+    }
+    if (UIHostPlatformHooks* existingHooks = inputRouter_->PlatformHooks()) {
+        InstallPlatformHooks(*existingHooks);
+    } else {
+        InstallPlatformHooks(ownedPlatformHooks_);
+        inputRouter_->SetPlatformHooks(&ownedPlatformHooks_);
+    }
+}
+
 void NativeWindowHost::BindDesktopHost(
     DesktopEventHost* desktopHost,
     PagedRenderTree* renderTree,
@@ -693,6 +879,9 @@ void NativeWindowHost::BindDesktopHost(
     VisualInputRouter* inputRouter) noexcept {
     if (desktopHost_) {
         desktopHost_->SetWakeCallback(nullptr, nullptr);
+    }
+    if (inputRouter_ && inputRouter_ != inputRouter && inputRouter_->PlatformHooks() == &ownedPlatformHooks_) {
+        inputRouter_->SetPlatformHooks(nullptr);
     }
     desktopHost_ = desktopHost;
     webHost_ = nullptr;
@@ -719,6 +908,7 @@ void NativeWindowHost::BindDesktopHost(
     if (inputRouter_ && !inputRouter_->ImeHost()) {
         inputRouter_->SetImeHost(&desktopIme_);
     }
+    WireInputRouterHooks();
 }
 
 void NativeWindowHost::BindWebCanvasHost(
@@ -728,6 +918,9 @@ void NativeWindowHost::BindWebCanvasHost(
     VisualInputRouter* inputRouter) noexcept {
     if (webHost_) {
         webHost_->SetWakeCallback(nullptr, nullptr);
+    }
+    if (inputRouter_ && inputRouter_ != inputRouter && inputRouter_->PlatformHooks() == &ownedPlatformHooks_) {
+        inputRouter_->SetPlatformHooks(nullptr);
     }
     webHost_ = webHost;
     desktopHost_ = nullptr;
@@ -754,6 +947,7 @@ void NativeWindowHost::BindWebCanvasHost(
             inputRouter_->SetImeHost(&webHost_->ImeAdapter());
         }
     }
+    WireInputRouterHooks();
 }
 
 void NativeWindowHost::SetCustomGpuBackend(std::unique_ptr<IGpuDeviceBackend> customBackend) noexcept {
@@ -834,6 +1028,7 @@ bool NativeWindowHost::Initialize(const NativeWindowConfig& config) {
     if (inputRouter_ && !inputRouter_->ImeHost()) {
         inputRouter_->SetImeHost(webHost_ ? static_cast<ITextInputMethodHost*>(&webHost_->ImeAdapter()) : &desktopIme_);
     }
+    WireInputRouterHooks();
 
 #if (defined(__linux__) || defined(__APPLE__)) && !defined(__EMSCRIPTEN__)
     if (pipe(wakePipeFds_) == 0) {
@@ -1291,23 +1486,7 @@ bool NativeWindowHost::InitializePlatformWindowAndBackend(const NativeWindowConf
             return m;
         };
         auto mapVkToKey = [](WPARAM vk) noexcept -> KeyCode {
-            switch (vk) {
-                case VK_TAB:    return KeyCode::Tab;
-                case VK_RETURN: return KeyCode::Enter;
-                case VK_SPACE:  return KeyCode::Space;
-                case VK_ESCAPE: return KeyCode::Escape;
-                case VK_BACK:   return KeyCode::Backspace;
-                case VK_DELETE: return KeyCode::Delete;
-                case VK_LEFT:   return KeyCode::Left;
-                case VK_RIGHT:  return KeyCode::Right;
-                case VK_UP:     return KeyCode::Up;
-                case VK_DOWN:   return KeyCode::Down;
-                case VK_HOME:   return KeyCode::Home;
-                case VK_END:    return KeyCode::End;
-                case VK_PRIOR:  return KeyCode::PageUp;
-                case VK_NEXT:   return KeyCode::PageDown;
-                default:        return KeyCode::None;
-            }
+            return NativeWindowHost::TranslateWin32VirtualKey(static_cast<std::uint32_t>(vk));
         };
 
         switch (msg) {
@@ -1452,9 +1631,13 @@ bool NativeWindowHost::InitializePlatformWindowAndBackend(const NativeWindowConf
             case WM_KEYDOWN:
             case WM_SYSKEYDOWN: {
                 const KeyCode kc = mapVkToKey(wParam);
+                const std::uint8_t mods = queryWinMods();
+                const bool isAltF4 = (msg == WM_SYSKEYDOWN && wParam == VK_F4 && (mods & KeyMod_Alt) != 0u);
                 if (kc != KeyCode::None) {
-                    self->OnPlatformKey(kc, true, queryWinMods());
-                    return 0;
+                    self->OnPlatformKey(kc, true, mods);
+                    if (!isAltF4) {
+                        return 0;
+                    }
                 }
                 break;
             }

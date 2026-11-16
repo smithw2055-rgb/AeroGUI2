@@ -10,6 +10,7 @@
 #include <vector>
 
 #include "aero/core/UnifiedValue.hpp"
+#include "aero/render/SkylinePacker.hpp"
 
 namespace aero {
 
@@ -214,12 +215,6 @@ public:
     void Clear() noexcept;
 
 private:
-    struct SkylineNode {
-        std::uint32_t x = 0u;
-        std::uint32_t y = 0u;
-        std::uint32_t width = 0u;
-    };
-
     void EnsureSharedAtlasAllocatedLocked();
     bool TryAllocateSkylineRectLocked(
         std::uint32_t paddedW,
@@ -248,7 +243,7 @@ private:
 
     std::string baseDirectory_;
     std::vector<std::string> searchDirectories_;
-    std::vector<SkylineNode> skyline_;
+    SkylinePacker skyline_;
 
     std::unordered_map<std::string, std::vector<std::uint8_t>> memoryEncodedAssets_;
     std::unordered_map<std::string, ImageAtlasEntry> entries_;

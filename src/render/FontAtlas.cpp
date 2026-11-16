@@ -1669,7 +1669,11 @@ FontAtlas::FontAtlas(std::uint16_t atlasSize)
     : atlasWidth_(std::max<std::uint16_t>(atlasSize, 512u))
     , atlasHeight_(std::max<std::uint16_t>(atlasSize, 512u))
     , glyphRegionHeight_(static_cast<std::uint16_t>(std::max<std::uint16_t>(atlasSize, 512u) / 2u))
-    , skyline_(atlasWidth_, 2u)
+    , skyline_(
+          static_cast<std::uint32_t>(std::max<std::uint16_t>(atlasSize, 512u)) - 4u,
+          static_cast<std::uint32_t>(std::max<std::uint16_t>(atlasSize, 512u) / 2u) - 4u,
+          2u,
+          2u)
     , sdfPixels_(static_cast<std::size_t>(atlasWidth_) * atlasHeight_, 0u) {
     InitBuiltInFallbackAscii();
 }
@@ -1710,40 +1714,16 @@ bool FontAtlas::AllocateSkylineRectLocked(
     std::uint16_t cellH,
     std::uint16_t& outX,
     std::uint16_t& outY) noexcept {
-    // Add 1-texel right/bottom safety gutter and start at x=2, y=2 so u0 > 0.0f and v1 <= 0.5f strictly
-    const auto paddedW = static_cast<std::uint16_t>(cellW + 1u);
-    const auto paddedH = static_cast<std::uint16_t>(cellH + 1u);
-    if (paddedW + 4u > atlasWidth_ || paddedH + 4u > glyphRegionHeight_) {
+    // Add 1-texel right/bottom safety gutter inside the [2, atlasWidth_-2) x [2, glyphRegionHeight_-2) packer bounds.
+    const auto paddedW = static_cast<std::uint32_t>(cellW) + 1u;
+    const auto paddedH = static_cast<std::uint32_t>(cellH) + 1u;
+    std::uint32_t placedX = 0u;
+    std::uint32_t placedY = 0u;
+    if (!skyline_.TryAllocate(paddedW, paddedH, placedX, placedY)) {
         return false;
     }
-
-    std::uint16_t bestX = 0xFFFFu;
-    std::uint16_t bestY = 0xFFFFu;
-    const auto xLimit = static_cast<std::uint16_t>(atlasWidth_ - 2u - paddedW);
-
-    for (std::uint16_t x = 2u; x <= xLimit; x = static_cast<std::uint16_t>(x + 2u)) {
-        std::uint16_t maxY = 2u;
-        for (std::uint16_t k = 0u; k < paddedW; ++k) {
-            maxY = std::max(maxY, skyline_[x + k]);
-        }
-        if (maxY + paddedH <= glyphRegionHeight_ && maxY < bestY) {
-            bestY = maxY;
-            bestX = x;
-            if (bestY == 2u) {
-                break;
-            }
-        }
-    }
-
-    if (bestX == 0xFFFFu) {
-        return false;
-    }
-
-    for (std::uint16_t k = 0u; k < paddedW; ++k) {
-        skyline_[bestX + k] = static_cast<std::uint16_t>(bestY + paddedH);
-    }
-    outX = bestX;
-    outY = bestY;
+    outX = static_cast<std::uint16_t>(placedX);
+    outY = static_cast<std::uint16_t>(placedY);
     return true;
 }
 
@@ -1853,7 +1833,7 @@ void FontAtlas::ClearCustomFonts() {
     glyphCache_.clear();
     defaultFamilyKey_.clear();
     nextFontId_ = 1u;
-    std::fill(skyline_.begin(), skyline_.end(), 2u);
+    skyline_.Clear();
     std::fill(sdfPixels_.begin(), sdfPixels_.end(), 0u);
     revision_.fetch_add(1u, std::memory_order_release);
     InitBuiltInFallbackAscii();

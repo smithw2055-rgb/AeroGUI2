@@ -61,6 +61,9 @@ HostDriverBase::HostDriverBase(
     if (world_ && resourceStore_) {
         world_->SetResourceStore(resourceStore_.get());
     }
+    if (renderTree_ && resourceStore_) {
+        renderTree_->SetResourceStore(resourceStore_.get());
+    }
 }
 
 HostDriverBase::~HostDriverBase() = default;
@@ -73,6 +76,10 @@ void HostDriverBase::SetResourceStore(std::shared_ptr<UIResourceStore> store) {
     if (world_) {
         world_->SetResourceStore(resourceStore_.get());
     }
+    if (renderTree_) {
+        renderTree_->SetResourceStore(resourceStore_.get());
+    }
+    renderSyncDirty_ = true;
     OnResourceStoreChanged();
 }
 
@@ -82,12 +89,22 @@ void HostDriverBase::SetVisualWorld(VisualWorld* world) noexcept {
         world_->SetResourceStore(resourceStore_.get());
     }
     lastLaidOutViewport_ = Size{-1.0f, -1.0f};
+    renderSyncDirty_ = true;
     OnRootVisualChanged();
+}
+
+void HostDriverBase::SetRenderTree(PagedRenderTree* tree) noexcept {
+    renderTree_ = tree;
+    if (renderTree_ && resourceStore_) {
+        renderTree_->SetResourceStore(resourceStore_.get());
+    }
+    renderSyncDirty_ = true;
 }
 
 void HostDriverBase::SetViewportSize(Size viewport) noexcept {
     if (viewportSize_ != viewport) {
         viewportSize_ = viewport;
+        renderSyncDirty_ = true;
         OnViewportOrDpiChanged();
     }
 }
@@ -99,6 +116,7 @@ void HostDriverBase::SetDpiScale(float scale) noexcept {
     const bool changed = std::fabs(dpiScale_ - clamped) > 1e-4f;
     dpiScale_ = clamped;
     if (changed) {
+        renderSyncDirty_ = true;
         OnViewportOrDpiChanged();
     }
     if (renderTree_) {
@@ -152,7 +170,8 @@ HostDriverBase::UiPhaseRunResult HostDriverBase::RunUiPhases(
     if ((activePhaseMask & UiPhase_Layout) != 0u && world_) {
         const Size logicalViewport = LogicalViewportSize();
         const bool viewportChanged = (logicalViewport != lastLaidOutViewport_);
-        if (viewportChanged || world_->HasAnyDirty()) {
+        const bool dirtyLayout = config.ioHasDirtyLayout && *config.ioHasDirtyLayout;
+        if (!config.gatePhasesByDirtyFlags || viewportChanged || world_->HasAnyDirty() || dirtyLayout) {
             telemetry_.layoutPassesRun += 1u;
             world_->UpdateLayout(logicalViewport.width, logicalViewport.height);
             lastLaidOutViewport_ = logicalViewport;
@@ -160,12 +179,28 @@ HostDriverBase::UiPhaseRunResult HostDriverBase::RunUiPhases(
         }
     }
 
+    if (result.inputDispatched > 0u || result.trackBUpdates > 0u ||
+        result.animationUpdates > 0u || result.layoutUpdates > 0u) {
+        renderSyncDirty_ = true;
+    }
+
     if ((activePhaseMask & UiPhase_RenderRecord) != 0u && renderTree_ && world_ &&
         (!config.requireLayoutPhaseForRenderSync || (activePhaseMask & UiPhase_Layout) != 0u)) {
-        renderTree_->SetRootDpiScale(dpiScale_);
-        result.renderNodesSynced = renderAdapter_.SyncPagedRenderTree(
-            *world_, drawBuffer_, *renderTree_, resourceStore_.get());
-        telemetry_.renderNodesSynced += result.renderNodesSynced;
+        const bool dirtyObjects = config.ioHasDirtyObjects && *config.ioHasDirtyObjects;
+        const bool dirtyLayout = config.ioHasDirtyLayout && *config.ioHasDirtyLayout;
+        const bool needSync =
+            !config.gatePhasesByDirtyFlags ||
+            renderSyncDirty_ ||
+            world_->HasAnyDirty() ||
+            dirtyObjects ||
+            dirtyLayout;
+        if (needSync) {
+            renderTree_->SetRootDpiScale(dpiScale_);
+            result.renderNodesSynced = renderAdapter_.SyncPagedRenderTree(
+                *world_, drawBuffer_, *renderTree_, resourceStore_.get());
+            telemetry_.renderNodesSynced += result.renderNodesSynced;
+            renderSyncDirty_ = false;
+        }
     }
 
     return result;
@@ -633,12 +668,14 @@ void WebCanvasHost::TickUi(float dt, std::uint32_t activePhaseMask) {
     cfg.allowTrackBEcsFastPath = false;
     cfg.requireActiveAnimationsForTick = true;
     cfg.requireLayoutPhaseForRenderSync = false;
-    cfg.gatePhasesByDirtyFlags = false;
+    cfg.gatePhasesByDirtyFlags = true;
     const UiPhaseRunResult res = RunUiPhases(dt, activePhaseMask, cfg);
 
     const std::size_t changes = res.TotalChanges();
     const bool animStillRunning = animationEngine_ && animationEngine_->HasActiveAnimations();
-    if (changes == 0 && !animStillRunning && !imeAdapter_.IsComposing()) {
+    const bool stillDirty = world_ && world_->HasAnyDirty();
+    const bool pendingInput = inputRouter_ && inputRouter_->HasPendingEvents();
+    if (changes == 0 && !animStillRunning && !stillDirty && !pendingInput && !imeAdapter_.IsComposing()) {
         rafState_ = WebRafState::SuspendedIdle;
     }
 }

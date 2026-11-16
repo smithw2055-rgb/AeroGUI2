@@ -9,8 +9,6 @@
 #include <unordered_set>
 #include <vector>
 
-#include <unordered_map>
-
 #include "aero/asset/MtsdfPathBaker.hpp"
 #include "aero/core/UnifiedValue.hpp"
 #include "aero/render/FontAtlas.hpp"
@@ -468,6 +466,19 @@ public:
         float opacity = 1.0f,
         const void* owner = nullptr);
 
+    // Tessellate an SVG path into trimmed polyline stroke nodes via MtsdfPathBaker::ParseSvgPathToSubpaths
+    std::uint16_t AllocateSvgPathStrokeNodes(
+        std::string_view pathStr,
+        const Rect& box,
+        Stretch stretch,
+        float strokeWidth,
+        const Color& strokeColor,
+        std::uint32_t strokeGradId = 0u,
+        float opacity = 1.0f,
+        const void* owner = nullptr,
+        float trimStart01 = 0.0f,
+        float trimEnd01 = 1.0f);
+
     // Allocate a 4-vertex textured image quad (default textureId = 0 shared UI atlas)
     std::uint32_t AllocateTexturedNode(
         float x,
@@ -575,6 +586,7 @@ public:
     [[nodiscard]] const RenderNodeDescriptor* GetNode(std::uint32_t nodeId) const noexcept {
         return (nodeId < nodes_.size()) ? &nodes_[nodeId] : nullptr;
     }
+    void PushBlurLayerSpan(const BlurLayerSpan& span) { blurLayerSpans_.push_back(span); }
     [[nodiscard]] const std::vector<BlurLayerSpan>& BlurLayerSpans() const noexcept {
         return blurLayerSpans_;
     }
@@ -607,6 +619,12 @@ public:
 
 private:
     void InitPreCachedDigitGlyphs() noexcept;
+    [[nodiscard]] TextLayoutResult MeasureTextWithStore(
+        std::string_view utf8Text,
+        std::string_view fontFamily,
+        float fontSize,
+        float maxWidth,
+        TextWrapping wrapMode) const;
     void RegisterMtsdfInTreeAtlas(const AxbMtsdfPathEntry& entry);
     std::uint32_t EnsurePageForAllocation(
         std::uint32_t neededVertices,

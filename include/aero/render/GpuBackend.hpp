@@ -213,7 +213,20 @@ struct GlFunctionTable {
     AeroGLenum (AERO_GL_APIENTRY *GetError)() = nullptr;
     const std::uint8_t* (AERO_GL_APIENTRY *GetString)(AeroGLenum name) = nullptr;
 
+    // Optional offscreen framebuffer entry points (not required by IsComplete()).
+    void (AERO_GL_APIENTRY *GenFramebuffers)(AeroGLsizei n, AeroGLuint* framebuffers) = nullptr;
+    void (AERO_GL_APIENTRY *DeleteFramebuffers)(AeroGLsizei n, const AeroGLuint* framebuffers) = nullptr;
+    void (AERO_GL_APIENTRY *BindFramebuffer)(AeroGLenum target, AeroGLuint framebuffer) = nullptr;
+    void (AERO_GL_APIENTRY *FramebufferTexture2D)(
+        AeroGLenum target,
+        AeroGLenum attachment,
+        AeroGLenum textarget,
+        AeroGLuint texture,
+        AeroGLint level) = nullptr;
+    AeroGLenum (AERO_GL_APIENTRY *CheckFramebufferStatus)(AeroGLenum target) = nullptr;
+
     [[nodiscard]] bool IsComplete() const noexcept;
+    [[nodiscard]] bool HasFramebufferSupport() const noexcept;
 };
 
 // Build static Quad Index Buffer mapping each 4-vertex quad (v0, v1, v2, v3)
@@ -414,10 +427,17 @@ private:
     };
 
     bool LoadDynamicGlEntryPoints();
+    bool CompileShaderProgramInternal(
+        std::string_view vertexShaderSrc,
+        std::string_view pixelShaderSrc,
+        const char* shaderLabelPrefix,
+        AeroGLuint& outProgramId);
+    bool EnsureEffectGpuResources(std::uint32_t viewportWidth, std::uint32_t viewportHeight);
+    void DestroyEffectGpuResources() noexcept;
     void BindAeroVertexLayout() noexcept;
     void SyncUnifiedUiAtlas(const PagedRenderTree& tree);
     AeroGLuint EnsureFallbackWhiteTexture();
-    AeroGLuint ResolveBatchImageTexture(std::uint32_t textureId);
+    AeroGLuint ResolveBatchImageTexture(std::uint32_t textureId, const UIResourceStore* optStore = nullptr);
 
     GlFunctionTable gl_{};
     bool hasCustomTable_ = false;
@@ -438,6 +458,19 @@ private:
     AeroGLuint effectQuadVboId_ = 0;
     std::uint32_t effectScratchTexW_ = 0;
     std::uint32_t effectScratchTexH_ = 0;
+    AeroGLuint effectProgramId_ = 0;
+    AeroGLuint effectFboIds_[2]{0u, 0u};
+    AeroGLuint effectFboTexIds_[2]{0u, 0u};
+    std::uint32_t effectFboW_ = 0;
+    std::uint32_t effectFboH_ = 0;
+    bool effectGpuPipelineFailed_ = false;
+    AeroGLint uEffectViewportSizeLoc_ = -1;
+    AeroGLint uEffectSrcTexLoc_ = -1;
+    AeroGLint uEffectTexelSizeLoc_ = -1;
+    AeroGLint uEffectModeLoc_ = -1;
+    AeroGLint uEffectParamsLoc_ = -1;
+    AeroGLint uEffectUvMinLoc_ = -1;
+    AeroGLint uEffectUvMaxLoc_ = -1;
 
     AeroGLint uViewportSizeLoc_ = -1;
     AeroGLint uQuadHalfExtentLoc_ = -1;

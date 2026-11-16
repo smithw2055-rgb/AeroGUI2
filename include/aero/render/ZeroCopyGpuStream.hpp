@@ -120,7 +120,8 @@ public:
         int& outPatchY,
         int& outPatchW,
         int& outPatchH,
-        std::vector<std::uint8_t>& outPremulRgba8);
+        std::vector<std::uint8_t>& outPremulRgba8,
+        const UIResourceStore* optResourceStore = nullptr);
 
     // Built-in unified UberShader sources (Desktop GL 3.3, WebGL2 #version 300 es, WebGPU WGSL)
     [[nodiscard]] static std::string_view UberVertexShaderSource(ShaderBackend backend) noexcept;

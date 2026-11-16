@@ -3,6 +3,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <deque>
 #include <mutex>
 #include <string>
 #include <string_view>
@@ -91,13 +92,14 @@ public:
     std::uint32_t RegisterBrush(GradientBrushDesc desc);
     std::uint32_t RegisterOrResolveSpec(std::string_view serializedSpec);
     [[nodiscard]] const GradientBrushDesc* Find(std::uint32_t brushId) const noexcept;
+    [[nodiscard]] bool TryGetBrush(std::uint32_t brushId, GradientBrushDesc& outBrush) const noexcept;
     [[nodiscard]] std::size_t BrushCount() const noexcept;
     [[nodiscard]] std::uint32_t Revision() const noexcept;
     void Clear() noexcept;
 
 private:
     mutable std::mutex mutex_;
-    std::vector<GradientBrushDesc> brushes_;
+    std::deque<GradientBrushDesc> brushes_;
     std::unordered_map<std::string, std::uint32_t> specToId_;
     std::uint32_t revision_ = 1u;
 };

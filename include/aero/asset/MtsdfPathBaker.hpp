@@ -62,6 +62,46 @@ struct AxbMtsdfPathEntry {
     }
 };
 
+struct SvgPathContour {
+    std::vector<Point> points;
+    bool closed = false;
+};
+
+struct SvgPathTessellationOptions {
+    int cubicSteps = 8;
+    int quadSteps = 6;
+    float arcStepAngleRad = 3.14159265358979323846f / 10.0f;
+    int arcMinSteps = 2;
+    int arcMaxSteps = 48;
+};
+
+struct ParsedSvgGeometry {
+    bool nonZeroFill = false; // Default XAML F0 = EvenOdd, F1 = NonZero
+    std::vector<SvgPathContour> contours;
+    Rect bounds{0.0f, 0.0f, 0.0f, 0.0f};
+};
+
+// W3C SVG 1.1 Appendix F.6.5 & F.6.6 endpoint-to-center elliptical arc tessellation
+void AppendSvgArcPoints(
+    Point p0,
+    float rx,
+    float ry,
+    float xAxisRotDeg,
+    bool largeArc,
+    bool sweep,
+    Point p1,
+    std::vector<Point>& outPoints,
+    float stepAngleRad = 3.14159265358979323846f / 10.0f,
+    int minSteps = 2,
+    int maxSteps = 48);
+
+[[nodiscard]] ParsedSvgGeometry ParseSvgPathGeometry(
+    std::string_view pathData,
+    const SvgPathTessellationOptions& options = SvgPathTessellationOptions{});
+
+[[nodiscard]] std::vector<std::vector<Point>> ParseSvgPathToSubpaths(
+    std::string_view pathData);
+
 [[nodiscard]] std::string ConvertPointsToSvgPath(
     std::string_view rawPoints,
     bool closePath);
