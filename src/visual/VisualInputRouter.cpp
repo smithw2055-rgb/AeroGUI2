@@ -1,7 +1,10 @@
 #include "aero/visual/VisualInputRouter.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <cstring>
+#include <limits>
+#include <vector>
 
 namespace aero {
 
@@ -80,6 +83,9 @@ bool VisualInputRouter::EnqueueEvent(const NativeInputEvent& ev) noexcept {
     queue_[queueTail_] = ev;
     queueTail_ = (queueTail_ + 1u) % kEventQueueCapacity;
     ++queueCount_;
+    if (platformHooks_ && platformHooks_->requestWake) {
+        platformHooks_->requestWake();
+    }
     return true;
 }
 
@@ -175,40 +181,211 @@ std::size_t VisualInputRouter::FlushQueuedEvents() {
     return processed;
 }
 
-bool VisualInputRouter::DispatchPointerMove(Point position, std::uint8_t modifiers) {
-    lastPointerPos_ = position;
-    const VisualNodeId target = capturedNode_.IsValid() ? capturedNode_ : HitTest(position);
-    if (target != hoveredNode_) {
-        NativeInputEvent leaveEv{};
-        leaveEv.kind = NativeInputEventKind::PointerMove;
-        leaveEv.x = position.x;
-        leaveEv.y = position.y;
-        leaveEv.modifiers = modifiers;
-        if (hoveredNode_.IsValid() && scriptDispatcher_) {
-            (void)scriptDispatcher_(hoveredNode_, VisualCallback_PointerLeave, leaveEv);
-        }
-        hoveredNode_ = target;
-        if (hoveredNode_.IsValid() && scriptDispatcher_) {
-            (void)scriptDispatcher_(hoveredNode_, VisualCallback_PointerEnter, leaveEv);
+namespace {
+
+[[nodiscard]] std::vector<VisualNodeId> SortedChildrenByZOrder(
+    const VisualWorld& world,
+    const std::vector<VisualNodeId>& children) {
+    struct ZEntry {
+        VisualNodeId id{};
+        std::int32_t zIndex = 0;
+        std::size_t order = 0u;
+    };
+    std::vector<ZEntry> sorted;
+    sorted.reserve(children.size());
+    for (std::size_t i = 0u; i < children.size(); ++i) {
+        const VisualNode* child = world.GetNode(children[i]);
+        if (child) {
+            sorted.push_back(ZEntry{children[i], child->layout.zIndex, i});
         }
     }
-    if (target.IsValid() && scriptDispatcher_) {
+    std::sort(sorted.begin(), sorted.end(), [](const ZEntry& a, const ZEntry& b) {
+        if (a.zIndex != b.zIndex) {
+            return a.zIndex < b.zIndex;
+        }
+        return a.order < b.order;
+    });
+    std::vector<VisualNodeId> out;
+    out.reserve(sorted.size());
+    for (const ZEntry& e : sorted) {
+        out.push_back(e.id);
+    }
+    return out;
+}
+
+[[nodiscard]] VisualNodeId HitTestNodeRecursive(
+    const VisualWorld& world,
+    VisualNodeId id,
+    Point viewportPoint) noexcept {
+    const VisualNode* node = world.GetNode(id);
+    if (!node || node->layout.visibility != Visibility::Visible || !node->layout.isEnabled) {
+        return VisualNodeId{};
+    }
+
+    Point localPt{};
+    if (!world.TryScreenToLocal(id, viewportPoint, localPt)) {
+        return VisualNodeId{};
+    }
+    const bool inside = localPt.x >= 0.0f &&
+                        localPt.y >= 0.0f &&
+                        localPt.x <= node->layout.layoutRect.width &&
+                        localPt.y <= node->layout.layoutRect.height;
+    const bool clipsChildren =
+        node->layout.clipToBounds || (node->layout.layoutMode == LayoutMode::ScrollViewport);
+    if (clipsChildren && !inside) {
+        return VisualNodeId{};
+    }
+
+    if (!node->children.empty()) {
+        const std::vector<VisualNodeId> paintOrder = SortedChildrenByZOrder(world, node->children);
+        for (std::size_t i = paintOrder.size(); i > 0u; --i) {
+            const VisualNodeId childHit = HitTestNodeRecursive(world, paintOrder[i - 1u], viewportPoint);
+            if (childHit.IsValid()) {
+                return childHit;
+            }
+        }
+    }
+
+    if (inside && node->layout.isHitTestVisible) {
+        return id;
+    }
+    return VisualNodeId{};
+}
+
+[[nodiscard]] Point NodeViewportCenter(const VisualNode& node) noexcept {
+    const Rect& r = node.layout.layoutRect;
+    const Point untransformed{r.x + r.width * 0.5f, r.y + r.height * 0.5f};
+    if (node.layout.hasPerspective3D) {
+        return node.layout.worldMatrix3D.ProjectPoint2D(untransformed);
+    }
+    return node.layout.worldTransform.TransformPoint(untransformed);
+}
+
+void CollectFocusablesRecursive(
+    const VisualWorld& world,
+    VisualNodeId id,
+    std::vector<VisualNodeId>& outFocusables) {
+    const VisualNode* node = world.GetNode(id);
+    if (!node || node->layout.visibility != Visibility::Visible || !node->layout.isEnabled) {
+        return;
+    }
+    if (node->layout.isFocusable) {
+        outFocusables.push_back(id);
+    }
+    if (!node->children.empty()) {
+        const std::vector<VisualNodeId> paintOrder = SortedChildrenByZOrder(world, node->children);
+        for (VisualNodeId childId : paintOrder) {
+            CollectFocusablesRecursive(world, childId, outFocusables);
+        }
+    }
+}
+
+[[nodiscard]] bool DispatchWithCallbackMask(
+    VisualWorld* world,
+    const VisualInputRouter::ScriptEventDispatchFn& dispatcher,
+    VisualNodeId startTarget,
+    VisualCallbackFlags flag,
+    const NativeInputEvent& ev,
+    bool allowBubble) {
+    if (!dispatcher || !world || !startTarget.IsValid()) {
+        return false;
+    }
+
+    bool anyExplicitMaskInChain = false;
+    VisualNodeId cur = startTarget;
+    std::size_t hops = 0u;
+    const std::size_t maxHops = world->LiveNodeCount() + 1u;
+    while (cur.IsValid() && hops < maxHops) {
+        const VisualNode* node = world->GetNode(cur);
+        if (!node) {
+            break;
+        }
+        if (node->hasScriptOwner || node->callbackMask != VisualCallback_None) {
+            anyExplicitMaskInChain = true;
+            if ((node->callbackMask & flag) != 0u) {
+                if (dispatcher(cur, flag, ev)) {
+                    return true;
+                }
+            }
+        }
+        if (!allowBubble) {
+            break;
+        }
+        cur = node->parent;
+        ++hops;
+    }
+
+    if (!anyExplicitMaskInChain) {
+        return dispatcher(startTarget, flag, ev);
+    }
+    return false;
+}
+
+} // namespace
+
+bool VisualInputRouter::DispatchPointerMove(Point position, std::uint8_t modifiers) {
+    lastPointerPos_ = position;
+    if (world_ && hoveredNode_.IsValid() && !world_->IsAlive(hoveredNode_)) {
+        hoveredNode_ = VisualNodeId{};
+    }
+    if (world_ && capturedNode_.IsValid() && !world_->IsAlive(capturedNode_)) {
+        capturedNode_ = VisualNodeId{};
+    }
+    const VisualNodeId target = capturedNode_.IsValid() ? capturedNode_ : HitTest(position);
+    if (target != hoveredNode_) {
+        NativeInputEvent transitionEv{};
+        transitionEv.kind = NativeInputEventKind::PointerMove;
+        transitionEv.x = position.x;
+        transitionEv.y = position.y;
+        transitionEv.modifiers = modifiers;
+        if (hoveredNode_.IsValid()) {
+            (void)DispatchWithCallbackMask(
+                world_, scriptDispatcher_, hoveredNode_, VisualCallback_PointerLeave, transitionEv, false);
+        }
+        hoveredNode_ = target;
+        if (hoveredNode_.IsValid()) {
+            (void)DispatchWithCallbackMask(
+                world_, scriptDispatcher_, hoveredNode_, VisualCallback_PointerEnter, transitionEv, false);
+        }
+    }
+    if (target.IsValid()) {
         NativeInputEvent ev{};
         ev.kind = NativeInputEventKind::PointerMove;
         ev.x = position.x;
         ev.y = position.y;
         ev.modifiers = modifiers;
-        return scriptDispatcher_(target, VisualCallback_PointerMove, ev);
+        return DispatchWithCallbackMask(
+            world_, scriptDispatcher_, target, VisualCallback_PointerMove, ev, true);
     }
     return false;
 }
 
 bool VisualInputRouter::DispatchPointerDown(Point position, PointerButton button, std::uint8_t modifiers) {
     lastPointerPos_ = position;
+    if (world_ && capturedNode_.IsValid() && !world_->IsAlive(capturedNode_)) {
+        capturedNode_ = VisualNodeId{};
+    }
     const VisualNodeId target = capturedNode_.IsValid() ? capturedNode_ : HitTest(position);
-    if (!target.IsValid() || !scriptDispatcher_) {
+    if (!target.IsValid()) {
         return false;
     }
+
+    if (button == PointerButton::Left && world_) {
+        VisualNodeId cur = target;
+        std::size_t hops = 0u;
+        const std::size_t maxHops = world_->LiveNodeCount() + 1u;
+        while (cur.IsValid() && hops < maxHops) {
+            const VisualNode* n = world_->GetNode(cur);
+            if (!n) break;
+            if (n->layout.isFocusable && n->layout.isEnabled && n->layout.visibility == Visibility::Visible) {
+                (void)SetFocus(cur);
+                break;
+            }
+            cur = n->parent;
+            ++hops;
+        }
+    }
+
     NativeInputEvent ev{};
     ev.kind = NativeInputEventKind::PointerButton;
     ev.button = button;
@@ -216,13 +393,17 @@ bool VisualInputRouter::DispatchPointerDown(Point position, PointerButton button
     ev.x = position.x;
     ev.y = position.y;
     ev.modifiers = modifiers;
-    return scriptDispatcher_(target, VisualCallback_PointerDown, ev);
+    return DispatchWithCallbackMask(
+        world_, scriptDispatcher_, target, VisualCallback_PointerDown, ev, true);
 }
 
 bool VisualInputRouter::DispatchPointerUp(Point position, PointerButton button, std::uint8_t modifiers) {
     lastPointerPos_ = position;
+    if (world_ && capturedNode_.IsValid() && !world_->IsAlive(capturedNode_)) {
+        capturedNode_ = VisualNodeId{};
+    }
     const VisualNodeId target = capturedNode_.IsValid() ? capturedNode_ : HitTest(position);
-    if (!target.IsValid() || !scriptDispatcher_) {
+    if (!target.IsValid()) {
         return false;
     }
     NativeInputEvent ev{};
@@ -232,7 +413,8 @@ bool VisualInputRouter::DispatchPointerUp(Point position, PointerButton button, 
     ev.x = position.x;
     ev.y = position.y;
     ev.modifiers = modifiers;
-    return scriptDispatcher_(target, VisualCallback_PointerUp, ev);
+    return DispatchWithCallbackMask(
+        world_, scriptDispatcher_, target, VisualCallback_PointerUp, ev, true);
 }
 
 bool VisualInputRouter::DispatchMouseWheel(
@@ -242,7 +424,7 @@ bool VisualInputRouter::DispatchMouseWheel(
     std::uint8_t modifiers) {
     lastPointerPos_ = position;
     const VisualNodeId target = HitTest(position);
-    if (!target.IsValid() || !scriptDispatcher_) {
+    if (!target.IsValid()) {
         return false;
     }
     NativeInputEvent ev{};
@@ -252,26 +434,43 @@ bool VisualInputRouter::DispatchMouseWheel(
     ev.deltaX = scrollDeltaX;
     ev.deltaY = scrollDeltaY;
     ev.modifiers = modifiers;
-    return scriptDispatcher_(target, VisualCallback_MouseWheel, ev);
+    return DispatchWithCallbackMask(
+        world_, scriptDispatcher_, target, VisualCallback_MouseWheel, ev, true);
 }
 
 bool VisualInputRouter::DispatchKey(KeyCode key, bool isDown, std::uint8_t modifiers) {
-    if (!focusedNode_.IsValid() || !scriptDispatcher_) {
-        return false;
+    if (world_ && focusedNode_.IsValid() && !world_->IsAlive(focusedNode_)) {
+        focusedNode_ = VisualNodeId{};
     }
-    NativeInputEvent ev{};
-    ev.kind = NativeInputEventKind::Key;
-    ev.key = key;
-    ev.isDown = isDown;
-    ev.modifiers = modifiers;
-    return scriptDispatcher_(
-        focusedNode_,
-        isDown ? VisualCallback_KeyDown : VisualCallback_KeyUp,
-        ev);
+    bool handled = false;
+    if (focusedNode_.IsValid()) {
+        NativeInputEvent ev{};
+        ev.kind = NativeInputEventKind::Key;
+        ev.key = key;
+        ev.isDown = isDown;
+        ev.modifiers = modifiers;
+        handled = DispatchWithCallbackMask(
+            world_,
+            scriptDispatcher_,
+            focusedNode_,
+            isDown ? VisualCallback_KeyDown : VisualCallback_KeyUp,
+            ev,
+            true);
+    }
+    if (!handled && isDown && key == KeyCode::Tab) {
+        const FocusDirection dir = (modifiers & KeyMod_Shift) != 0u
+            ? FocusDirection::Previous
+            : FocusDirection::Next;
+        return MoveFocus(dir);
+    }
+    return handled;
 }
 
 bool VisualInputRouter::DispatchTextInput(std::string_view utf8Text) {
-    if (!focusedNode_.IsValid() || !scriptDispatcher_ || utf8Text.empty()) {
+    if (world_ && focusedNode_.IsValid() && !world_->IsAlive(focusedNode_)) {
+        focusedNode_ = VisualNodeId{};
+    }
+    if (!focusedNode_.IsValid() || utf8Text.empty()) {
         return false;
     }
     NativeInputEvent ev{};
@@ -279,36 +478,15 @@ bool VisualInputRouter::DispatchTextInput(std::string_view utf8Text) {
     const std::size_t len = std::min<std::size_t>(utf8Text.size(), ev.utf8Bytes.size());
     std::memcpy(ev.utf8Bytes.data(), utf8Text.data(), len);
     ev.utf8Length = static_cast<std::uint8_t>(len);
-    return scriptDispatcher_(focusedNode_, VisualCallback_TextInput, ev);
+    return DispatchWithCallbackMask(
+        world_, scriptDispatcher_, focusedNode_, VisualCallback_TextInput, ev, true);
 }
 
 VisualNodeId VisualInputRouter::HitTest(Point viewportPoint) const noexcept {
     if (!world_ || !world_->Root().IsValid()) {
         return VisualNodeId{};
     }
-    VisualNodeId hit{};
-    auto visit = [&](auto& self, VisualNodeId id) -> void {
-        const VisualNode* node = world_->GetNode(id);
-        if (!node || node->layout.visibility != Visibility::Visible || !node->layout.isEnabled) {
-            return;
-        }
-        const Rect& r = node->layout.layoutRect;
-        const bool inside = viewportPoint.x >= r.x &&
-                            viewportPoint.y >= r.y &&
-                            viewportPoint.x <= (r.x + r.width) &&
-                            viewportPoint.y <= (r.y + r.height);
-        if (node->layout.clipToBounds && !inside) {
-            return;
-        }
-        if (inside && node->layout.isHitTestVisible) {
-            hit = id;
-        }
-        for (VisualNodeId child : node->children) {
-            self(self, child);
-        }
-    };
-    visit(visit, world_->Root());
-    return hit;
+    return HitTestNodeRecursive(*world_, world_->Root(), viewportPoint);
 }
 
 void VisualInputRouter::SetPointerCapture(VisualNodeId node) noexcept {
@@ -332,30 +510,124 @@ void VisualInputRouter::CancelPointerInteraction() noexcept {
     if (capturedNode_.IsValid()) {
         ReleasePointerCapture(capturedNode_);
     }
+    if (hoveredNode_.IsValid() && world_ && world_->IsAlive(hoveredNode_)) {
+        NativeInputEvent leaveEv{};
+        leaveEv.kind = NativeInputEventKind::PointerMove;
+        (void)DispatchWithCallbackMask(
+            world_, scriptDispatcher_, hoveredNode_, VisualCallback_PointerLeave, leaveEv, false);
+    }
     hoveredNode_ = VisualNodeId{};
 }
 
 bool VisualInputRouter::SetFocus(VisualNodeId node) {
-    if (focusedNode_ == node) {
+    const VisualNodeId sanitized = (world_ && world_->IsAlive(node)) ? node : VisualNodeId{};
+    if (focusedNode_ == sanitized) {
         return true;
     }
     const VisualNodeId oldFocus = focusedNode_;
-    focusedNode_ = (world_ && world_->IsAlive(node)) ? node : VisualNodeId{};
-    if (oldFocus.IsValid() && scriptDispatcher_) {
+    focusedNode_ = sanitized;
+    if (oldFocus.IsValid() && world_ && world_->IsAlive(oldFocus)) {
         NativeInputEvent ev{};
-        (void)scriptDispatcher_(oldFocus, VisualCallback_FocusChanged, ev);
+        (void)DispatchWithCallbackMask(
+            world_, scriptDispatcher_, oldFocus, VisualCallback_FocusChanged, ev, false);
     }
-    if (focusedNode_.IsValid() && scriptDispatcher_) {
+    if (focusedNode_.IsValid()) {
         NativeInputEvent ev{};
         ev.isDown = true;
-        (void)scriptDispatcher_(focusedNode_, VisualCallback_FocusChanged, ev);
+        (void)DispatchWithCallbackMask(
+            world_, scriptDispatcher_, focusedNode_, VisualCallback_FocusChanged, ev, false);
+    } else if (imeActive_) {
+        SyncImeCaretRect(Rect{}, false);
     }
     return true;
 }
 
 bool VisualInputRouter::MoveFocus(FocusDirection direction) {
-    (void)direction;
-    return false;
+    if (!world_ || !world_->Root().IsValid()) {
+        return false;
+    }
+    std::vector<VisualNodeId> focusables;
+    CollectFocusablesRecursive(*world_, world_->Root(), focusables);
+    if (focusables.empty()) {
+        return false;
+    }
+
+    auto it = std::find(focusables.begin(), focusables.end(), focusedNode_);
+    if (direction == FocusDirection::Next) {
+        if (it == focusables.end()) {
+            return SetFocus(focusables.front());
+        }
+        const std::size_t idx = static_cast<std::size_t>(it - focusables.begin());
+        return SetFocus(focusables[(idx + 1u) % focusables.size()]);
+    }
+    if (direction == FocusDirection::Previous) {
+        if (it == focusables.end()) {
+            return SetFocus(focusables.back());
+        }
+        const std::size_t idx = static_cast<std::size_t>(it - focusables.begin());
+        const std::size_t prevIdx = (idx == 0u) ? (focusables.size() - 1u) : (idx - 1u);
+        return SetFocus(focusables[prevIdx]);
+    }
+
+    if (it == focusables.end()) {
+        return SetFocus(focusables.front());
+    }
+    const VisualNode* curNode = world_->GetNode(focusedNode_);
+    if (!curNode) {
+        return SetFocus(focusables.front());
+    }
+    const Point curCenter = NodeViewportCenter(*curNode);
+
+    VisualNodeId bestId{};
+    float bestScore = std::numeric_limits<float>::infinity();
+    for (VisualNodeId candId : focusables) {
+        if (candId == focusedNode_) {
+            continue;
+        }
+        const VisualNode* candNode = world_->GetNode(candId);
+        if (!candNode) {
+            continue;
+        }
+        const Point candCenter = NodeViewportCenter(*candNode);
+        const float dx = candCenter.x - curCenter.x;
+        const float dy = candCenter.y - curCenter.y;
+        float primary = 0.0f;
+        float cross = 0.0f;
+        bool validDir = false;
+        switch (direction) {
+            case FocusDirection::Left:
+                validDir = (dx < -1e-3f);
+                primary = -dx;
+                cross = std::fabs(dy);
+                break;
+            case FocusDirection::Right:
+                validDir = (dx > 1e-3f);
+                primary = dx;
+                cross = std::fabs(dy);
+                break;
+            case FocusDirection::Up:
+                validDir = (dy < -1e-3f);
+                primary = -dy;
+                cross = std::fabs(dx);
+                break;
+            case FocusDirection::Down:
+                validDir = (dy > 1e-3f);
+                primary = dy;
+                cross = std::fabs(dx);
+                break;
+            default:
+                break;
+        }
+        if (!validDir) {
+            continue;
+        }
+        const float score = primary * primary + 4.0f * cross * cross;
+        if (score < bestScore) {
+            bestScore = score;
+            bestId = candId;
+        }
+    }
+    return bestId.IsValid() ? SetFocus(bestId) : false;
 }
 
 void VisualInputRouter::SyncImeCaretRect(Rect caretScreenRect, bool active) noexcept {

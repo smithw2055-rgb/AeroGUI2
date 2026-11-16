@@ -7,6 +7,24 @@ namespace aero {
 
 namespace {
 
+[[nodiscard]] float EaseOutBounceCore(float u) noexcept {
+    constexpr float n1 = 7.5625f;
+    constexpr float d1 = 2.75f;
+    if (u < 1.0f / d1) {
+        return n1 * u * u;
+    }
+    if (u < 2.0f / d1) {
+        const float x = u - 1.5f / d1;
+        return n1 * x * x + 0.75f;
+    }
+    if (u < 2.5f / d1) {
+        const float x = u - 2.25f / d1;
+        return n1 * x * x + 0.9375f;
+    }
+    const float x = u - 2.625f / d1;
+    return n1 * x * x + 0.984375f;
+}
+
 [[nodiscard]] float EaseInCore(EasingFunctionKind kind, float t) noexcept {
     switch (kind) {
     case EasingFunctionKind::Linear: return t;
@@ -26,12 +44,42 @@ namespace {
         constexpr float p = 0.3f;
         return -std::pow(2.0f, 10.0f * (t - 1.0f)) * std::sin((t - 1.0f - p * 0.25f) * (6.28318530718f / p));
     }
-    case EasingFunctionKind::Bounce: {
-        return 1.0f - EaseInCore(EasingFunctionKind::Linear, 1.0f - t);
-    }
-    case EasingFunctionKind::Spline: return t;
+    case EasingFunctionKind::Bounce:
+        return 1.0f - EaseOutBounceCore(1.0f - t);
+    case EasingFunctionKind::Spline:
+        return t * t * (3.0f - 2.0f * t);
     }
     return t;
+}
+
+[[nodiscard]] bool IsColorProp(VisualAnimProp prop) noexcept {
+    return prop == VisualAnimProp::BgColor ||
+           prop == VisualAnimProp::FgColor ||
+           prop == VisualAnimProp::BorderColor;
+}
+
+[[nodiscard]] VisualDirtyFlags DirtyFlagsForScalarProp(VisualAnimProp prop) noexcept {
+    switch (prop) {
+    case VisualAnimProp::Width:
+    case VisualAnimProp::Height:
+        return static_cast<VisualDirtyFlags>(VisualDirty_Layout | VisualDirty_Visual);
+    case VisualAnimProp::TranslateX:
+    case VisualAnimProp::TranslateY:
+    case VisualAnimProp::ScaleX:
+    case VisualAnimProp::ScaleY:
+    case VisualAnimProp::RotateDeg:
+    case VisualAnimProp::SkewX:
+    case VisualAnimProp::SkewY:
+    case VisualAnimProp::Rot3DX:
+    case VisualAnimProp::Rot3DY:
+    case VisualAnimProp::Rot3DZ:
+    case VisualAnimProp::Trans3DX:
+    case VisualAnimProp::Trans3DY:
+    case VisualAnimProp::Trans3DZ:
+        return static_cast<VisualDirtyFlags>(VisualDirty_Transform | VisualDirty_Visual);
+    default:
+        return VisualDirty_Visual;
+    }
 }
 
 void ApplyScalarProp(VisualWorld& world, VisualNodeId id, VisualAnimProp prop, float value) noexcept {
@@ -121,7 +169,7 @@ void ApplyScalarProp(VisualWorld& world, VisualNodeId id, VisualAnimProp prop, f
     default:
         break;
     }
-    world.MarkDirty(id, VisualDirty_Visual);
+    world.MarkDirty(id, DirtyFlagsForScalarProp(prop));
 }
 
 void ApplyColorProp(VisualWorld& world, VisualNodeId id, VisualAnimProp prop, std::uint32_t rgba) noexcept {
@@ -153,6 +201,102 @@ void ApplyColorProp(VisualWorld& world, VisualNodeId id, VisualAnimProp prop, st
         out |= (ch << shift);
     }
     return out;
+}
+
+void StepSpringAnalytical(VisualAnimTrack& track, float dtSeconds) noexcept {
+    if (dtSeconds <= 0.0f) {
+        return;
+    }
+    const float k = std::max(1.0f, track.spring.stiffness);
+    const float c = std::max(0.0f, track.spring.damping);
+    const float m = std::max(0.01f, track.spring.mass);
+
+    const float x0 = track.currentVal - track.toVal;
+    const float v0 = track.velocity;
+    const float omega0 = std::sqrt(k / m);
+    const float zeta = c / (2.0f * std::sqrt(k * m));
+
+    float xNext = 0.0f;
+    float vNext = 0.0f;
+    if (zeta < 1.0f - 1e-4f) {
+        const float omegaD = omega0 * std::sqrt(std::max(1e-8f, 1.0f - zeta * zeta));
+        const float alpha = zeta * omega0;
+        const float decay = std::exp(-alpha * dtSeconds);
+        const float A = x0;
+        const float B = (v0 + alpha * x0) / omegaD;
+        const float cosW = std::cos(omegaD * dtSeconds);
+        const float sinW = std::sin(omegaD * dtSeconds);
+        xNext = decay * (A * cosW + B * sinW);
+        vNext = decay * ((B * omegaD - A * alpha) * cosW - (A * omegaD + B * alpha) * sinW);
+    } else if (zeta <= 1.0f + 1e-4f) {
+        const float decay = std::exp(-omega0 * dtSeconds);
+        const float c1 = x0;
+        const float c2 = v0 + omega0 * x0;
+        xNext = decay * (c1 + c2 * dtSeconds);
+        vNext = decay * (c2 - omega0 * (c1 + c2 * dtSeconds));
+    } else {
+        const float gamma = omega0 * std::sqrt(std::max(1e-8f, zeta * zeta - 1.0f));
+        const float r1 = -omega0 * zeta + gamma;
+        const float r2 = -omega0 * zeta - gamma;
+        const float denom = r1 - r2;
+        const float c1 = (std::fabs(denom) > 1e-6f) ? ((v0 - r2 * x0) / denom) : 0.0f;
+        const float c2 = x0 - c1;
+        const float e1 = std::exp(r1 * dtSeconds);
+        const float e2 = std::exp(r2 * dtSeconds);
+        xNext = c1 * e1 + c2 * e2;
+        vNext = c1 * r1 * e1 + c2 * r2 * e2;
+    }
+
+    track.currentVal = track.toVal + xNext;
+    track.velocity = vNext;
+}
+
+void EvaluateKeyFramesAtTime(VisualAnimTrack& track, VisualWorld& world, float localTimeSec) noexcept {
+    const auto& kfs = track.keyFrames;
+    if (kfs.empty()) {
+        return;
+    }
+    const bool colorProp = IsColorProp(track.prop);
+    auto applyKf = [&](const VisualKeyFrame& kf) {
+        if (colorProp) {
+            ApplyColorProp(world, track.targetNode, track.prop, kf.colorRgba);
+        } else {
+            track.currentVal = kf.scalarValue;
+            ApplyScalarProp(world, track.targetNode, track.prop, kf.scalarValue);
+        }
+    };
+
+    if (kfs.size() == 1u || localTimeSec <= kfs.front().timeSec) {
+        applyKf(kfs.front());
+        return;
+    }
+    if (localTimeSec >= kfs.back().timeSec) {
+        applyKf(kfs.back());
+        return;
+    }
+
+    for (std::size_t idx = 1u; idx < kfs.size(); ++idx) {
+        const VisualKeyFrame& kf0 = kfs[idx - 1u];
+        const VisualKeyFrame& kf1 = kfs[idx];
+        if (localTimeSec <= kf1.timeSec) {
+            const float span = kf1.timeSec - kf0.timeSec;
+            if (kf1.discrete || span <= 1e-6f) {
+                applyKf((localTimeSec >= kf1.timeSec) ? kf1 : kf0);
+                return;
+            }
+            const float u = std::clamp((localTimeSec - kf0.timeSec) / span, 0.0f, 1.0f);
+            const float eased = EvaluateEasing(kf1.easingKind, kf1.easingMode, u);
+            if (colorProp) {
+                ApplyColorProp(world, track.targetNode, track.prop, LerpRgba(kf0.colorRgba, kf1.colorRgba, eased));
+            } else {
+                const float val = kf0.scalarValue + (kf1.scalarValue - kf0.scalarValue) * eased;
+                track.currentVal = val;
+                ApplyScalarProp(world, track.targetNode, track.prop, val);
+            }
+            return;
+        }
+    }
+    applyKf(kfs.back());
 }
 
 } // namespace
@@ -270,6 +414,15 @@ std::int32_t VisualAnimationEngine::StartKeyFrames(
     bool autoReverse,
     std::int32_t repeatCount) {
     if (!node.IsValid() || keyFrames.empty()) return 0;
+    for (VisualKeyFrame& kf : keyFrames) {
+        kf.timeSec = std::max(0.0f, kf.timeSec);
+    }
+    std::stable_sort(
+        keyFrames.begin(),
+        keyFrames.end(),
+        [](const VisualKeyFrame& a, const VisualKeyFrame& b) {
+            return a.timeSec < b.timeSec;
+        });
     VisualAnimTrack track{};
     track.trackId = nextTrackId_++;
     track.targetNode = node;
@@ -318,48 +471,94 @@ bool VisualAnimationEngine::Tick(float dtSeconds, VisualWorld& world) {
             continue;
         }
         anyUpdated = true;
+        float activeDt = dtSeconds;
         if (track.delaySec > 0.0f) {
-            const float step = std::min(dtSeconds, track.delaySec);
+            const float step = std::min(activeDt, track.delaySec);
             track.delaySec -= step;
+            activeDt -= step;
             if (track.delaySec > 0.0f) {
                 continue;
             }
         }
-        track.elapsedSec += dtSeconds;
+        track.elapsedSec += activeDt;
 
         bool finished = false;
         if (track.kind == VisualAnimTrackKind::FloatSpring) {
-            const float force = -track.spring.stiffness * (track.currentVal - track.toVal);
-            const float accel = force / track.spring.mass;
-            track.velocity = (track.velocity + accel * dtSeconds) * std::max(0.0f, 1.0f - (track.spring.damping / track.spring.mass) * dtSeconds * 0.1f);
-            track.currentVal += track.velocity * dtSeconds;
+            StepSpringAnalytical(track, activeDt);
             if (std::abs(track.currentVal - track.toVal) <= track.spring.restPositionEpsilon &&
                 std::abs(track.velocity) <= track.spring.restVelocityEpsilon) {
                 track.currentVal = track.toVal;
+                track.velocity = 0.0f;
                 finished = true;
             }
             ApplyScalarProp(world, track.targetNode, track.prop, track.currentVal);
         } else {
-            const float dur = std::max(1e-5f, track.durationSec);
-            float t = std::clamp(track.elapsedSec / dur, 0.0f, 1.0f);
-            if (!track.forwardDirection) {
-                t = 1.0f - t;
+            const float rawDur = track.durationSec;
+            float normT = 1.0f;
+            float localTimeSec = rawDur;
+            if (rawDur <= 1e-5f) {
+                if (track.autoReverse) {
+                    normT = 0.0f;
+                    localTimeSec = 0.0f;
+                } else {
+                    normT = 1.0f;
+                    localTimeSec = rawDur;
+                }
+                ++track.completedCycles;
+                finished = (track.repeatCount > 0 && track.completedCycles >= track.repeatCount);
+            } else {
+                while (track.elapsedSec >= rawDur && !finished) {
+                    if (track.autoReverse) {
+                        if (track.forwardDirection) {
+                            track.forwardDirection = false;
+                            track.elapsedSec -= rawDur;
+                        } else {
+                            ++track.completedCycles;
+                            if (track.repeatCount > 0 && track.completedCycles >= track.repeatCount) {
+                                finished = true;
+                            } else {
+                                track.forwardDirection = true;
+                                track.elapsedSec -= rawDur;
+                            }
+                        }
+                    } else {
+                        ++track.completedCycles;
+                        if (track.repeatCount > 0 && track.completedCycles >= track.repeatCount) {
+                            finished = true;
+                        } else {
+                            track.elapsedSec -= rawDur;
+                        }
+                    }
+                }
+                if (finished) {
+                    normT = track.autoReverse ? 0.0f : 1.0f;
+                    localTimeSec = track.autoReverse ? 0.0f : rawDur;
+                } else {
+                    const float frac = std::clamp(track.elapsedSec / rawDur, 0.0f, 1.0f);
+                    normT = track.forwardDirection ? frac : (1.0f - frac);
+                    localTimeSec = normT * rawDur;
+                }
             }
-            const float eased = EvaluateEasing(track.easeKind, track.easeMode, t);
+
             if (track.kind == VisualAnimTrackKind::FloatTween) {
+                const float eased = EvaluateEasing(track.easeKind, track.easeMode, normT);
                 const float val = track.fromVal + (track.toVal - track.fromVal) * eased;
                 track.currentVal = val;
                 ApplyScalarProp(world, track.targetNode, track.prop, val);
             } else if (track.kind == VisualAnimTrackKind::ColorTween) {
+                const float eased = EvaluateEasing(track.easeKind, track.easeMode, normT);
                 ApplyColorProp(world, track.targetNode, track.prop, LerpRgba(track.fromRgba, track.toRgba, eased));
-            }
-            if (track.elapsedSec >= track.durationSec) {
-                finished = true;
+            } else if (track.kind == VisualAnimTrackKind::KeyFrames) {
+                EvaluateKeyFramesAtTime(track, world, localTimeSec);
             }
         }
+
         if (finished) {
             tracks_.erase(tracks_.begin() + static_cast<std::ptrdiff_t>(i - 1u));
         }
+    }
+    if (anyUpdated && wakeHostCallback_) {
+        wakeHostCallback_();
     }
     return anyUpdated;
 }

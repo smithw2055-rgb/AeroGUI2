@@ -1,0 +1,1202 @@
+#include <algorithm>
+#include <array>
+#include <cmath>
+#include <cstdint>
+#include <cstdio>
+#include <memory>
+#include <string>
+#include <vector>
+
+#include <realscript/aot_cpp/AotRuntime.h>
+#include <realscript/bytecode/Bytecode.h>
+#include <realscript/runtime/Runtime.h>
+#include <realscript/semantic/Semantic.h>
+
+#include "aero/asset/GradientBrush.hpp"
+#include "aero/core/UIResourceStore.hpp"
+#include "aero/render/FontAtlas.hpp"
+#include "aero/render/ImageAtlas.hpp"
+#include "aero/render/PagedRenderTree.hpp"
+#include "aero/render/ZeroCopyGpuStream.hpp"
+#include "aero/runtime/AeroExecutionDomains.hpp"
+#include "aero/visual/DrawingCommandBuffer.hpp"
+#include "aero/visual/VisualAnimationEngine.hpp"
+#include "aero/visual/VisualHostBindings.hpp"
+#include "aero/visual/VisualInputRouter.hpp"
+#include "aero/visual/VisualRenderAdapter.hpp"
+#include "aero/visual/VisualTree.hpp"
+
+namespace {
+
+int gFailureCount = 0;
+
+void CheckImpl(bool cond, const char* expr, int line) {
+    if (!cond) {
+        std::fprintf(stderr, "[FAIL] Line %d: %s\n", line, expr);
+        ++gFailureCount;
+    }
+}
+
+void CheckNearImpl(float actual, float expected, float eps, const char* expr, int line) {
+    if (!std::isfinite(actual) || std::fabs(actual - expected) > eps) {
+        std::fprintf(
+            stderr,
+            "[FAIL] Line %d: %s (actual=%.5f expected=%.5f eps=%.5f)\n",
+            line,
+            expr,
+            static_cast<double>(actual),
+            static_cast<double>(expected),
+            static_cast<double>(eps));
+        ++gFailureCount;
+    }
+}
+
+#define CHECK(expr) CheckImpl((expr), #expr, __LINE__)
+#define CHECK_NEAR(actual, expected, eps) CheckNearImpl((actual), (expected), (eps), #actual, __LINE__)
+
+[[nodiscard]] aero::rs_rt::Value MakeStrVal(std::string_view sv) {
+    return aero::rs_rt::Value{aero::rs_rt::StringValue{sv}};
+}
+
+void TestGenerationalHandlesAndCycleGuard() {
+    aero::rs_rt::NativeHandleRegistry handles;
+    aero::UIResourceStore store;
+    aero::VisualWorld world(&handles, &store);
+
+    const aero::VisualNodeId n1 = world.CreateNode(aero::VisualKind::Box);
+    const aero::VisualNodeId n2 = world.CreateNode(aero::VisualKind::Box);
+    const aero::VisualNodeId n3 = world.CreateNode(aero::VisualKind::Box);
+    CHECK(n1.IsValid() && n2.IsValid() && n3.IsValid());
+    CHECK(world.LiveNodeCount() == 3u);
+
+    const aero::rs_rt::NativeHandle h1 = world.HandleFor(n1);
+    CHECK(h1.valid());
+    CHECK(world.ResolveHandle(h1) == n1);
+
+    // Cycle guards & re-parenting invariants
+    world.SetRoot(n1);
+    CHECK(!world.AddChild(n1, n1));
+    CHECK(world.AddChild(n1, n2));
+    CHECK(world.AddChild(n2, n3));
+    CHECK(!world.AddChild(n3, n1));
+    CHECK(!world.AddChild(n2, n1));
+    CHECK(!world.InsertChild(n3, 0, n1));
+
+    // Re-parent n3 under n1 -> detaches from n2 cleanly
+    CHECK(world.InsertChild(n1, 0, n3));
+    CHECK(world.GetNode(n2)->children.empty());
+    CHECK(world.GetNode(n1)->children.size() == 2u);
+    CHECK(world.GetNode(n1)->children[0] == n3);
+    CHECK(world.GetNode(n1)->children[1] == n2);
+
+    // Generational slot reuse invalidates old handle & VisualNodeId
+    CHECK(world.DestroyNode(n2));
+    CHECK(!world.IsAlive(n2));
+    CHECK(!world.ResolveHandle(h1).IsValid() == false); // n1 still alive
+    CHECK(!world.GetNode(n2));
+
+    const aero::rs_rt::NativeHandle h3 = world.HandleFor(n3);
+    CHECK(world.DestroyNode(n3));
+    CHECK(!world.ResolveHandle(h3).IsValid());
+
+    const aero::VisualNodeId recycled = world.CreateNode(aero::VisualKind::Text);
+    CHECK(recycled.IsValid());
+    CHECK(recycled != n3);
+    CHECK(!world.ResolveHandle(h3).IsValid());
+    CHECK(world.ResolveHandle(world.HandleFor(recycled)) == recycled);
+}
+
+void TestGcRootSafetyAndExternalPools() {
+    auto heap = std::make_shared<aero::rs_rt::ManagedHeap>();
+    aero::rs_rt::NativeHandleRegistry handles;
+    aero::UIResourceStore store;
+    aero::VisualWorld world(&handles, &store, heap.get());
+
+    const aero::VisualNodeId node = world.CreateNode(aero::VisualKind::Box);
+    auto objOpt = heap->allocateObject(101u, {aero::rs_rt::Value{42LL}}, {});
+    CHECK(objOpt.has_value());
+    const aero::rs_rt::ObjectRef owner = *objOpt;
+    CHECK(heap->isAlive(owner));
+
+    CHECK(world.BindOwner(node, owner, aero::VisualCallback_PointerDown));
+    CHECK(world.GetOwner(node) == owner);
+
+    // Trigger GC with no stack roots: VisualWorld PersistentRoot + external pool marker keep owner alive
+    heap->collect();
+    CHECK(heap->isAlive(owner));
+
+    // Destroying node releases pin and allows subsequent GC to reclaim owner
+    CHECK(world.DestroyNode(node));
+    heap->collect();
+    CHECK(!heap->isAlive(owner));
+}
+
+void TestAllNineLayoutModes() {
+    aero::UIResourceStore store;
+
+    // 1. Manual
+    {
+        aero::VisualWorld w(nullptr, &store);
+        auto root = w.CreateNode(aero::VisualKind::Box);
+        auto box = w.CreateNode(aero::VisualKind::Box);
+        w.SetRoot(root);
+        w.AddChild(root, box);
+        w.SetSize(box, 100.0f, 40.0f);
+        w.SetMargin(box, 10.0f, 20.0f, 0.0f, 0.0f);
+        w.SetAlignment(box, aero::HorizontalAlignment::Center, aero::VerticalAlignment::Bottom);
+        w.UpdateLayout(400.0f, 200.0f);
+        CHECK_NEAR(w.GetLayoutRectScalar(box, aero::VisualLayoutRectQuery::X), 155.0f, 0.5f);
+        CHECK_NEAR(w.GetLayoutRectScalar(box, aero::VisualLayoutRectQuery::Y), 160.0f, 0.5f);
+        CHECK_NEAR(w.GetLayoutRectScalar(box, aero::VisualLayoutRectQuery::Width), 100.0f, 0.1f);
+        CHECK_NEAR(w.GetLayoutRectScalar(box, aero::VisualLayoutRectQuery::Height), 40.0f, 0.1f);
+    }
+
+    // 2. Stack (Horizontal & Vertical, with Collapsed middle child)
+    {
+        aero::VisualWorld w(nullptr, &store);
+        auto root = w.CreateNode(aero::VisualKind::Box);
+        auto c0 = w.CreateNode(aero::VisualKind::Box);
+        auto c1 = w.CreateNode(aero::VisualKind::Box);
+        auto c2 = w.CreateNode(aero::VisualKind::Box);
+        w.SetRoot(root);
+        w.AddChild(root, c0);
+        w.AddChild(root, c1);
+        w.AddChild(root, c2);
+        w.SetLayoutMode(root, aero::LayoutMode::Stack, 10.0f, 0.0f, 0, 0); // Horizontal, spacing=10
+        w.SetSize(c0, 50.0f, 20.0f);
+        w.SetSize(c1, 80.0f, 20.0f);
+        w.SetSize(c2, 60.0f, 20.0f);
+        w.SetVisibility(c1, aero::Visibility::Collapsed);
+        w.UpdateLayout(400.0f, 200.0f);
+        CHECK_NEAR(w.GetLayoutRectScalar(c0, aero::VisualLayoutRectQuery::X), 0.0f, 0.1f);
+        CHECK_NEAR(w.GetLayoutRectScalar(c2, aero::VisualLayoutRectQuery::X), 60.0f, 0.1f);
+
+        w.SetLayoutMode(root, aero::LayoutMode::Stack, 8.0f, 0.0f, 1, 0); // Vertical, spacing=8
+        w.UpdateLayout(400.0f, 200.0f);
+        CHECK_NEAR(w.GetLayoutRectScalar(c0, aero::VisualLayoutRectQuery::Y), 0.0f, 0.1f);
+        CHECK_NEAR(w.GetLayoutRectScalar(c2, aero::VisualLayoutRectQuery::Y), 28.0f, 0.1f);
+    }
+
+    // 3. Dock (Left, Top, Right, LastChildFill)
+    {
+        aero::VisualWorld w(nullptr, &store);
+        auto root = w.CreateNode(aero::VisualKind::Box);
+        auto top = w.CreateNode(aero::VisualKind::Box);
+        auto left = w.CreateNode(aero::VisualKind::Box);
+        auto fill = w.CreateNode(aero::VisualKind::Box);
+        w.SetRoot(root);
+        w.AddChild(root, top);
+        w.AddChild(root, left);
+        w.AddChild(root, fill);
+        w.SetLayoutMode(root, aero::LayoutMode::Dock, 0.0f, 0.0f, 1, 0);
+        w.SetDock(top, aero::Dock::Top);
+        w.SetSize(top, std::numeric_limits<float>::quiet_NaN(), 30.0f);
+        w.SetDock(left, aero::Dock::Left);
+        w.SetSize(left, 60.0f, std::numeric_limits<float>::quiet_NaN());
+        w.UpdateLayout(300.0f, 200.0f);
+        CHECK_NEAR(w.GetLayoutRectScalar(top, aero::VisualLayoutRectQuery::Height), 30.0f, 0.1f);
+        CHECK_NEAR(w.GetLayoutRectScalar(left, aero::VisualLayoutRectQuery::Y), 30.0f, 0.1f);
+        CHECK_NEAR(w.GetLayoutRectScalar(left, aero::VisualLayoutRectQuery::Height), 170.0f, 0.1f);
+        CHECK_NEAR(w.GetLayoutRectScalar(fill, aero::VisualLayoutRectQuery::X), 60.0f, 0.1f);
+        CHECK_NEAR(w.GetLayoutRectScalar(fill, aero::VisualLayoutRectQuery::Y), 30.0f, 0.1f);
+        CHECK_NEAR(w.GetLayoutRectScalar(fill, aero::VisualLayoutRectQuery::Width), 240.0f, 0.1f);
+        CHECK_NEAR(w.GetLayoutRectScalar(fill, aero::VisualLayoutRectQuery::Height), 170.0f, 0.1f);
+    }
+
+    // 4. Wrap (Horizontal wrapping with ItemWidth=80, ItemHeight=30, Spacing=10 -> 10000)
+    {
+        aero::VisualWorld w(nullptr, &store);
+        auto root = w.CreateNode(aero::VisualKind::Box);
+        w.SetRoot(root);
+        w.SetLayoutMode(root, aero::LayoutMode::Wrap, 80.0f, 30.0f, 0, 10000);
+        std::vector<aero::VisualNodeId> items;
+        for (int i = 0; i < 4; ++i) {
+            auto c = w.CreateNode(aero::VisualKind::Box);
+            w.AddChild(root, c);
+            items.push_back(c);
+        }
+        // Width 200: row 0 fits 2 items (80 + 10 + 80 = 170 <= 200), 3rd item wraps to y = 30 + 10 = 40
+        w.UpdateLayout(200.0f, 200.0f);
+        CHECK_NEAR(w.GetLayoutRectScalar(items[0], aero::VisualLayoutRectQuery::X), 0.0f, 0.1f);
+        CHECK_NEAR(w.GetLayoutRectScalar(items[1], aero::VisualLayoutRectQuery::X), 90.0f, 0.1f);
+        CHECK_NEAR(w.GetLayoutRectScalar(items[2], aero::VisualLayoutRectQuery::X), 0.0f, 0.1f);
+        CHECK_NEAR(w.GetLayoutRectScalar(items[2], aero::VisualLayoutRectQuery::Y), 40.0f, 0.1f);
+        CHECK_NEAR(w.GetLayoutRectScalar(items[3], aero::VisualLayoutRectQuery::X), 90.0f, 0.1f);
+        CHECK_NEAR(w.GetLayoutRectScalar(items[3], aero::VisualLayoutRectQuery::Y), 40.0f, 0.1f);
+    }
+
+    // 5. Grid (Pixel + Auto + Star + RowSpan/ColSpan)
+    {
+        aero::VisualWorld w(nullptr, &store);
+        auto root = w.CreateNode(aero::VisualKind::Box);
+        w.SetRoot(root);
+        w.SetLayoutMode(root, aero::LayoutMode::Grid, 0.0f, 0.0f, 0, 0);
+        w.GridClearDefs(root);
+        w.GridAddColDef(root, aero::GridUnitType::Pixel, 50.0f);
+        w.GridAddColDef(root, aero::GridUnitType::Auto, 0.0f);
+        w.GridAddColDef(root, aero::GridUnitType::Star, 1.0f);
+        w.GridAddColDef(root, aero::GridUnitType::Star, 2.0f);
+        w.GridAddRowDef(root, aero::GridUnitType::Pixel, 40.0f);
+        w.GridAddRowDef(root, aero::GridUnitType::Star, 1.0f);
+
+        auto autoItem = w.CreateNode(aero::VisualKind::Box);
+        auto spanItem = w.CreateNode(aero::VisualKind::Box);
+        w.AddChild(root, autoItem);
+        w.AddChild(root, spanItem);
+        w.SetSize(autoItem, 30.0f, 20.0f);
+        w.SetGridCell(autoItem, 0, 1, 1, 1);
+        w.SetGridCell(spanItem, 0, 2, 2, 2); // spans Star(1) + Star(2), both rows
+
+        // Viewport 380x240: Col0=50, Col1=30 -> remaining 300 -> Star(1)=100, Star(2)=200
+        w.UpdateLayout(380.0f, 240.0f);
+        CHECK_NEAR(w.GetLayoutRectScalar(autoItem, aero::VisualLayoutRectQuery::X), 50.0f, 0.1f);
+        CHECK_NEAR(w.GetLayoutRectScalar(spanItem, aero::VisualLayoutRectQuery::X), 80.0f, 0.1f);
+        CHECK_NEAR(w.GetLayoutRectScalar(spanItem, aero::VisualLayoutRectQuery::Width), 300.0f, 0.1f);
+        CHECK_NEAR(w.GetLayoutRectScalar(spanItem, aero::VisualLayoutRectQuery::Height), 240.0f, 0.1f);
+    }
+
+    // 6. UniformGrid with firstCol=1
+    {
+        aero::VisualWorld w(nullptr, &store);
+        auto root = w.CreateNode(aero::VisualKind::Box);
+        auto a = w.CreateNode(aero::VisualKind::Box);
+        auto b = w.CreateNode(aero::VisualKind::Box);
+        auto c = w.CreateNode(aero::VisualKind::Box);
+        w.SetRoot(root);
+        w.AddChild(root, a);
+        w.AddChild(root, b);
+        w.AddChild(root, c);
+        w.SetLayoutMode(root, aero::LayoutMode::UniformGrid, 1.0f, 0.0f, 2, 2); // 2x2, firstCol=1
+        w.UpdateLayout(200.0f, 100.0f);
+        CHECK_NEAR(w.GetLayoutRectScalar(a, aero::VisualLayoutRectQuery::X), 100.0f, 0.1f);
+        CHECK_NEAR(w.GetLayoutRectScalar(a, aero::VisualLayoutRectQuery::Y), 0.0f, 0.1f);
+        CHECK_NEAR(w.GetLayoutRectScalar(b, aero::VisualLayoutRectQuery::X), 0.0f, 0.1f);
+        CHECK_NEAR(w.GetLayoutRectScalar(b, aero::VisualLayoutRectQuery::Y), 50.0f, 0.1f);
+    }
+
+    // 7. Canvas
+    {
+        aero::VisualWorld w(nullptr, &store);
+        auto root = w.CreateNode(aero::VisualKind::Box);
+        auto a = w.CreateNode(aero::VisualKind::Box);
+        auto b = w.CreateNode(aero::VisualKind::Box);
+        w.SetRoot(root);
+        w.AddChild(root, a);
+        w.AddChild(root, b);
+        w.SetLayoutMode(root, aero::LayoutMode::Canvas, 0.0f, 0.0f, 0, 0);
+        w.SetSize(a, 40.0f, 20.0f);
+        w.SetCanvasOffsets(a, 15.0f, 25.0f, std::numeric_limits<float>::quiet_NaN(), std::numeric_limits<float>::quiet_NaN());
+        w.SetSize(b, 50.0f, 30.0f);
+        w.SetCanvasOffsets(b, std::numeric_limits<float>::quiet_NaN(), std::numeric_limits<float>::quiet_NaN(), 10.0f, 20.0f);
+        w.UpdateLayout(300.0f, 200.0f);
+        CHECK_NEAR(w.GetLayoutRectScalar(a, aero::VisualLayoutRectQuery::X), 15.0f, 0.1f);
+        CHECK_NEAR(w.GetLayoutRectScalar(a, aero::VisualLayoutRectQuery::Y), 25.0f, 0.1f);
+        CHECK_NEAR(w.GetLayoutRectScalar(b, aero::VisualLayoutRectQuery::X), 240.0f, 0.1f);
+        CHECK_NEAR(w.GetLayoutRectScalar(b, aero::VisualLayoutRectQuery::Y), 150.0f, 0.1f);
+    }
+
+    // 8. ScrollViewport
+    {
+        aero::VisualWorld w(nullptr, &store);
+        auto sv = w.CreateNode(aero::VisualKind::Box);
+        auto content = w.CreateNode(aero::VisualKind::Box);
+        w.SetRoot(sv);
+        w.AddChild(sv, content);
+        w.SetLayoutMode(sv, aero::LayoutMode::ScrollViewport, 0.0f, 0.0f, 0, 0);
+        w.SetSize(content, 1000.0f, 800.0f);
+        w.SetScrollOffsets(sv, 40.0f, 25.0f);
+        w.UpdateLayout(300.0f, 200.0f);
+        CHECK_NEAR(w.GetLayoutRectScalar(sv, aero::VisualLayoutRectQuery::ScrollExtentWidth), 1000.0f, 0.1f);
+        CHECK_NEAR(w.GetLayoutRectScalar(sv, aero::VisualLayoutRectQuery::ScrollExtentHeight), 800.0f, 0.1f);
+        CHECK_NEAR(w.GetLayoutRectScalar(content, aero::VisualLayoutRectQuery::X), -40.0f, 0.1f);
+        CHECK_NEAR(w.GetLayoutRectScalar(content, aero::VisualLayoutRectQuery::Y), -25.0f, 0.1f);
+    }
+
+    // 9. Viewbox (Uniform LayoutScaler refW=400, refH=200 inside 800x600 -> scale 2.0, centered Y=(600-400)/2=100)
+    {
+        aero::VisualWorld w(nullptr, &store);
+        auto vb = w.CreateNode(aero::VisualKind::Box);
+        auto child = w.CreateNode(aero::VisualKind::Box);
+        w.SetRoot(vb);
+        w.AddChild(vb, child);
+        w.SetLayoutMode(
+            vb,
+            aero::LayoutMode::Viewbox,
+            400.0f,
+            200.0f,
+            static_cast<std::int32_t>(aero::Stretch::Uniform),
+            static_cast<std::int32_t>(aero::StretchDirection::Both));
+        w.UpdateLayout(800.0f, 600.0f);
+        const aero::VisualNode* cNode = w.GetNode(child);
+        CHECK(cNode != nullptr);
+        CHECK_NEAR(cNode->layout.worldTransform.m00, 2.0f, 0.01f);
+        CHECK_NEAR(cNode->layout.worldTransform.m11, 2.0f, 0.01f);
+        const aero::Point loc = w.ScreenToLocal(child, aero::Point{400.0f, 300.0f});
+        CHECK_NEAR(loc.x, 200.0f, 0.5f);
+        CHECK_NEAR(loc.y, 100.0f, 0.5f);
+    }
+}
+
+void TestIncrementalDepthBuckets() {
+    aero::UIResourceStore store;
+    aero::VisualWorld w(nullptr, &store);
+    auto root = w.CreateNode(aero::VisualKind::Box);
+    auto panelA = w.CreateNode(aero::VisualKind::Box);
+    auto panelB = w.CreateNode(aero::VisualKind::Box);
+    auto leafA = w.CreateNode(aero::VisualKind::Box);
+    auto spyA = w.CreateNode(aero::VisualKind::Box);
+    auto spyB = w.CreateNode(aero::VisualKind::Box);
+    w.SetRoot(root);
+    w.SetLayoutMode(
+        root, aero::LayoutMode::Stack, 0.0f, 0.0f,
+        static_cast<std::int32_t>(aero::Orientation::Vertical), 0);
+    w.AddChild(root, panelA);
+    w.AddChild(root, panelB);
+    w.SetSize(panelA, 150.0f, 100.0f);
+    w.SetSize(panelB, 150.0f, 100.0f);
+    w.SetLayoutMode(
+        panelA, aero::LayoutMode::Stack, 0.0f, 0.0f,
+        static_cast<std::int32_t>(aero::Orientation::Vertical), 0);
+    w.SetLayoutMode(
+        panelB, aero::LayoutMode::Stack, 0.0f, 0.0f,
+        static_cast<std::int32_t>(aero::Orientation::Vertical), 0);
+    w.AddChild(panelA, leafA);
+    w.AddChild(panelA, spyA);
+    w.AddChild(panelB, spyB);
+    w.SetSize(leafA, 40.0f, 40.0f);
+    w.SetLayoutMode(spyA, aero::LayoutMode::CustomCallback, 0.0f, 0.0f, 0, 0);
+    w.SetLayoutMode(spyB, aero::LayoutMode::CustomCallback, 0.0f, 0.0f, 0, 0);
+
+    int measureA = 0, measureB = 0;
+    int arrangeA = 0, arrangeB = 0;
+    w.SetCustomLayoutCallbacks(
+        [&](aero::VisualWorld&, aero::VisualNodeId nid, aero::Size) -> aero::Size {
+            if (nid == spyA) ++measureA;
+            if (nid == spyB) ++measureB;
+            return aero::Size{30.0f, 20.0f};
+        },
+        [&](aero::VisualWorld&, aero::VisualNodeId nid, aero::Rect) {
+            if (nid == spyA) ++arrangeA;
+            if (nid == spyB) ++arrangeB;
+        });
+
+    w.UpdateLayout(800.0f, 600.0f);
+    CHECK(measureA == 1 && measureB == 1);
+    CHECK(arrangeA == 1 && arrangeB == 1);
+
+    // Clean frame: 0 calls
+    w.UpdateLayout(800.0f, 600.0f);
+    CHECK(measureA == 1 && measureB == 1);
+    CHECK(arrangeA == 1 && arrangeB == 1);
+
+    // Dirty only leafA directly: leafA's desiredSize changes, bubbling ONLY to fixed-size panelA;
+    // panelA's Stack re-arranges leafA (90x50) and shifts spyA (arrangeA -> 2),
+    // while root, panelB, and spyB remain completely untouched.
+    w.SetSize(leafA, 90.0f, 50.0f);
+    w.UpdateLayout(800.0f, 600.0f);
+    CHECK(measureA == 1 && arrangeA == 2);
+    CHECK(measureB == 1 && arrangeB == 1);
+    CHECK_NEAR(w.GetLayoutRectScalar(leafA, aero::VisualLayoutRectQuery::Width), 90.0f, 0.1f);
+    CHECK_NEAR(w.GetLayoutRectScalar(spyA, aero::VisualLayoutRectQuery::Y), 50.0f, 0.1f);
+
+    // Dirty spyA directly -> custom measure+arrange re-runs on spyA while spyB stays untouched
+    w.MarkDirty(spyA, aero::VisualDirty_Layout);
+    w.UpdateLayout(800.0f, 600.0f);
+    CHECK(measureA == 2 && arrangeA == 3);
+    CHECK(measureB == 1 && arrangeB == 1);
+}
+
+void TestDrawingCommandBuffer() {
+    aero::DrawingCommandBuffer buf;
+    const aero::VisualNodeId invalid{};
+    buf.Begin(invalid);
+    buf.FillRect(invalid, 0.0f, 0.0f, 10.0f, 10.0f, 0xFFFFFFFFu);
+    buf.End(invalid);
+    CHECK(!buf.HasCommands(invalid));
+
+    aero::VisualNodeId n{0u, 1u};
+    buf.Begin(n);
+    buf.Clear(n, 0xFF101010u);
+    buf.FillRect(n, 1.0f, 2.0f, 30.0f, 40.0f, 0xFFFF0000u);
+    buf.DrawRect(n, 1.0f, 2.0f, 30.0f, 40.0f, 0xFFFFFFFFu, 2.0f);
+    buf.FillRoundedRect(n, 4.0f, 4.0f, 20.0f, 20.0f, 6.0f, 6.0f, 0xFF00FF00u);
+    buf.DrawRoundedRect(n, 4.0f, 4.0f, 20.0f, 20.0f, 6.0f, 6.0f, 0xFFFFFFFFu, 1.5f);
+    buf.FillEllipse(n, 50.0f, 50.0f, 10.0f, 10.0f, 0xFF0000FFu);
+    buf.DrawEllipse(n, 50.0f, 50.0f, 12.0f, 12.0f, 0xFFFFFFFFu, 1.0f);
+    buf.DrawLine(n, 0.0f, 0.0f, 20.0f, 20.0f, 0xFFFFFFFFu, 2.0f);
+    buf.DrawPolyline(n, {aero::Point{0.0f, 0.0f}, aero::Point{10.0f, 5.0f}}, 0xFFFFFFFFu, 1.0f);
+    buf.DrawPath(n, "M 0,0 L 10,0 L 10,10 Z", 0.0f, 0.0f, 10.0f, 10.0f, 0xFFFFFFFFu, 0u, 0.0f);
+    buf.DrawImage(n, "mem://img", 0.0f, 0.0f, 8.0f, 8.0f, 0xFFFFFFFFu);
+    buf.DrawText(n, "Hello", 5.0f, 5.0f, 50.0f, 20.0f, "", 12.0f, 0xFFFFFFFFu,
+        aero::HorizontalAlignment::Left, aero::VerticalAlignment::Top);
+    buf.PushClip(n, 0.0f, 0.0f, 100.0f, 100.0f);
+    buf.PushTransform(n, 5.0f, 5.0f, 1.0f, 1.0f, 15.0f);
+    buf.PushOpacity(n, 0.5f);
+    buf.PopOpacity(n);
+    buf.PopTransform(n);
+    buf.PopClip(n);
+    buf.End(n);
+
+    const aero::DrawingCommandList* list = buf.FindCommands(n);
+    CHECK(list != nullptr);
+    CHECK(!list->recording);
+    CHECK(list->version == 1ull);
+    CHECK(list->commands.size() == 18u);
+
+    buf.Begin(n);
+    buf.End(n);
+    CHECK(buf.FindCommands(n)->version == 2ull);
+    CHECK(buf.FindCommands(n)->commands.empty());
+}
+
+void TestAnimationEngine() {
+    // 1. Verify all EasingFunctionKind x 3 modes + non-linear Bounce parabola
+    for (int k = 0; k <= 11; ++k) {
+        const auto kind = static_cast<aero::EasingFunctionKind>(k);
+        for (int m = 0; m <= 2; ++m) {
+            const auto mode = static_cast<aero::EasingMode>(m);
+            CHECK_NEAR(aero::EvaluateEasing(kind, mode, 0.0f), 0.0f, 0.01f);
+            CHECK_NEAR(aero::EvaluateEasing(kind, mode, 1.0f), 1.0f, 0.01f);
+        }
+    }
+    const float bounceMid = aero::EvaluateEasing(aero::EasingFunctionKind::Bounce, aero::EasingMode::EaseOut, 0.5f);
+    CHECK(bounceMid > 0.70f); // true parabolic Bounce hits >0.75 before settling, not linear 0.5
+
+    aero::VisualWorld w;
+    aero::VisualAnimationEngine anim;
+    int wakeCount = 0;
+    anim.SetWakeHostCallback([&]() { ++wakeCount; });
+    auto box = w.CreateNode(aero::VisualKind::Box);
+    w.SetRoot(box);
+
+    // 2. FloatTween with delay remainder + autoReverse + repeatCount=1
+    anim.StartFloat(
+        box, aero::VisualAnimProp::TranslateX, 0.0f, 100.0f, 1.0f,
+        aero::EasingFunctionKind::Linear, aero::EasingMode::EaseOut, 0.25f, true, 1);
+    CHECK(wakeCount == 1);
+    anim.Tick(0.75f, w); // 0.25 delay consumed, 0.5 active elapsed => half forward => x=50
+    CHECK_NEAR(w.GetNode(box)->transform2D.tx, 50.0f, 0.5f);
+    anim.Tick(0.50f, w); // hits 1.0 duration -> reverses to start of backward => x=100
+    CHECK_NEAR(w.GetNode(box)->transform2D.tx, 100.0f, 0.5f);
+    anim.Tick(0.50f, w); // halfway back => x=50
+    CHECK_NEAR(w.GetNode(box)->transform2D.tx, 50.0f, 0.5f);
+    anim.Tick(0.50f, w); // finished full autoReverse cycle => x=0 and stopped
+    CHECK_NEAR(w.GetNode(box)->transform2D.tx, 0.0f, 0.1f);
+    CHECK(!anim.HasActiveAnimations());
+
+    // 3. RepeatCount <= 0 repeats indefinitely
+    const std::int32_t infId = anim.StartFloat(
+        box, aero::VisualAnimProp::Opacity, 0.2f, 0.8f, 0.5f,
+        aero::EasingFunctionKind::Linear, aero::EasingMode::EaseOut, 0.0f, false, 0);
+    for (int s = 0; s < 10; ++s) {
+        anim.Tick(0.3f, w);
+        CHECK(anim.HasActiveAnimations());
+    }
+    anim.StopTrack(infId);
+    CHECK(!anim.HasActiveAnimations());
+
+    // 4. ColorTween RGBA lerp
+    anim.StartColor(box, aero::VisualAnimProp::BgColor, 0xFF000000u, 0xFFFFFFFFu, 1.0f,
+        aero::EasingFunctionKind::Linear, aero::EasingMode::EaseOut);
+    anim.Tick(0.5f, w);
+    const std::uint32_t midRgba = w.GetNode(box)->box.bgRgba;
+    CHECK((midRgba & 0xFFu) >= 127u && (midRgba & 0xFFu) <= 129u);
+    anim.StopAll(box);
+
+    // 5. Analytical C1 SpringFloat stability on large dt & small steps
+    anim.SpringFloat(box, aero::VisualAnimProp::TranslateY, 0.0f, 200.0f, 320.0f, 28.0f, 1.0f);
+    anim.Tick(0.016f, w);
+    CHECK(w.GetNode(box)->transform2D.ty > 0.0f && w.GetNode(box)->transform2D.ty < 200.0f);
+    anim.Tick(5.0f, w);
+    CHECK_NEAR(w.GetNode(box)->transform2D.ty, 200.0f, 0.05f);
+    CHECK(!anim.HasActiveAnimations());
+
+    // 6. KeyFrames (discrete + eased segment)
+    std::vector<aero::VisualKeyFrame> kfs;
+    kfs.push_back(aero::VisualKeyFrame{0.0f, 10.0f, 0u, aero::EasingFunctionKind::Linear, aero::EasingMode::EaseOut, false});
+    kfs.push_back(aero::VisualKeyFrame{1.0f, 110.0f, 0u, aero::EasingFunctionKind::Linear, aero::EasingMode::EaseOut, false});
+    kfs.push_back(aero::VisualKeyFrame{2.0f, 500.0f, 0u, aero::EasingFunctionKind::Linear, aero::EasingMode::EaseOut, true});
+    anim.StartKeyFrames(box, aero::VisualAnimProp::CustomScalar0, std::move(kfs), false, 1);
+    anim.Tick(0.5f, w);
+    CHECK_NEAR(w.GetNode(box)->customScalars[0], 60.0f, 0.5f);
+    anim.Tick(1.0f, w); // t=1.5 inside discrete segment [1,2] -> holds 110
+    CHECK_NEAR(w.GetNode(box)->customScalars[0], 110.0f, 0.5f);
+    anim.Tick(0.5f, w); // t=2.0 -> snaps to 500 and ends
+    CHECK_NEAR(w.GetNode(box)->customScalars[0], 500.0f, 0.5f);
+    CHECK(!anim.HasActiveAnimations());
+}
+
+void TestHitTestTransformsAndInputRouter() {
+    aero::VisualWorld w;
+    auto root = w.CreateNode(aero::VisualKind::Box);
+    auto rot2d = w.CreateNode(aero::VisualKind::Box);
+    auto card3d = w.CreateNode(aero::VisualKind::Box);
+    auto zLow = w.CreateNode(aero::VisualKind::Box);
+    auto zHigh = w.CreateNode(aero::VisualKind::Box);
+    auto clipBox = w.CreateNode(aero::VisualKind::Box);
+    auto clippedChild = w.CreateNode(aero::VisualKind::Box);
+
+    w.SetRoot(root);
+    w.SetLayoutMode(root, aero::LayoutMode::Canvas, 0.0f, 0.0f, 0, 0);
+    w.AddChild(root, rot2d);
+    w.AddChild(root, card3d);
+    w.AddChild(root, zHigh); // added BEFORE zLow, yet higher zIndex!
+    w.AddChild(root, zLow);
+    w.AddChild(root, clipBox);
+    w.AddChild(clipBox, clippedChild);
+
+    w.SetSize(rot2d, 100.0f, 40.0f);
+    w.SetCanvasOffsets(rot2d, 50.0f, 50.0f, std::numeric_limits<float>::quiet_NaN(), std::numeric_limits<float>::quiet_NaN());
+    w.SetTransform2D(rot2d, 0.0f, 0.0f, 1.0f, 1.0f, 90.0f, 0.0f, 0.0f, 0.5f, 0.5f);
+
+    w.SetSize(card3d, 120.0f, 80.0f);
+    w.SetCanvasOffsets(card3d, 220.0f, 60.0f, std::numeric_limits<float>::quiet_NaN(), std::numeric_limits<float>::quiet_NaN());
+    w.SetTransform3D(card3d, 0.0f, 35.0f, 0.0f, 0.0f, 0.0f, 0.0f, 600.0f);
+
+    w.SetSize(zHigh, 60.0f, 60.0f);
+    w.SetCanvasOffsets(zHigh, 50.0f, 200.0f, std::numeric_limits<float>::quiet_NaN(), std::numeric_limits<float>::quiet_NaN());
+    w.SetZIndex(zHigh, 10);
+
+    w.SetSize(zLow, 60.0f, 60.0f);
+    w.SetCanvasOffsets(zLow, 50.0f, 200.0f, std::numeric_limits<float>::quiet_NaN(), std::numeric_limits<float>::quiet_NaN());
+    w.SetZIndex(zLow, 1);
+
+    w.SetSize(clipBox, 40.0f, 40.0f);
+    w.SetCanvasOffsets(clipBox, 200.0f, 200.0f, std::numeric_limits<float>::quiet_NaN(), std::numeric_limits<float>::quiet_NaN());
+    w.SetClipToBounds(clipBox, true);
+    w.SetLayoutMode(clipBox, aero::LayoutMode::Canvas, 0.0f, 0.0f, 0, 0);
+    w.SetSize(clippedChild, 30.0f, 30.0f);
+    w.SetCanvasOffsets(clippedChild, 60.0f, 0.0f, std::numeric_limits<float>::quiet_NaN(), std::numeric_limits<float>::quiet_NaN());
+
+    w.SetInteractiveFlags(rot2d, true, true, true);
+    w.SetInteractiveFlags(card3d, true, true, true);
+    w.SetInteractiveFlags(zHigh, true, true, true);
+    w.SetInteractiveFlags(zLow, true, true, true);
+    w.SetInteractiveFlags(root, true, false, false);
+
+    w.UpdateLayout(500.0f, 400.0f);
+
+    std::string clipStorage = "clip";
+    int wakeCalled = 0;
+    aero::UIHostPlatformHooks hooks{};
+    hooks.requestWake = [&]() { ++wakeCalled; };
+    hooks.getClipboardText = [&]() { return clipStorage; };
+    hooks.setClipboardText = [&](std::string_view s) { clipStorage.assign(s); };
+
+    aero::ImeCompositionController ime;
+    aero::VisualInputRouter router(&w, nullptr, &hooks);
+
+    // 2D rotated box center is (100, 70); original size 100x40 rotated 90 deg spans x in [80..120], y in [20..120]
+    CHECK(router.HitTest(aero::Point{100.0f, 30.0f}) == rot2d);
+    CHECK(!router.HitTest(aero::Point{60.0f, 70.0f}).IsValid()); // outside vertical rotated strip
+
+    // 3D planar hit test at projected off-center corner point inside card3d
+    const aero::Point p3dScreen = w.GetNode(card3d)->layout.worldMatrix3D.ProjectPoint2D(aero::Point{250.0f, 90.0f});
+    CHECK(router.HitTest(p3dScreen) == card3d);
+
+    // zIndex ordering beats declaration order
+    CHECK(router.HitTest(aero::Point{80.0f, 230.0f}) == zHigh);
+
+    // clipToBounds prevents hitting clippedChild sticking outside clipBox
+    CHECK(!router.HitTest(aero::Point{270.0f, 210.0f}).IsValid());
+
+    // Script callback dispatch, hover enter/leave, capture, ring queue & focus navigation
+    int downCount = 0;
+    int enterCount = 0;
+    int leaveCount = 0;
+    router.SetScriptEventDispatcher([&](aero::VisualNodeId, aero::VisualCallbackFlags flag, const aero::NativeInputEvent&) -> bool {
+        if (flag == aero::VisualCallback_PointerDown) ++downCount;
+        if (flag == aero::VisualCallback_PointerEnter) ++enterCount;
+        if (flag == aero::VisualCallback_PointerLeave) ++leaveCount;
+        return true;
+    });
+
+    CHECK(router.QueuePointerMove(aero::Point{100.0f, 70.0f}));
+    CHECK(router.QueuePointerButton(aero::Point{100.0f, 70.0f}, aero::PointerButton::Left, true));
+    CHECK(router.QueuePointerMove(aero::Point{80.0f, 230.0f}));
+    CHECK(wakeCalled == 3);
+    CHECK(router.FlushQueuedEvents() == 3u);
+    CHECK(enterCount == 2 && leaveCount == 1 && downCount == 1);
+    CHECK(router.HoveredNode() == zHigh);
+    CHECK(router.FocusedNode() == rot2d);
+
+    // Directional focus navigation
+    CHECK(router.MoveFocus(aero::FocusDirection::Right));
+    CHECK(router.FocusedNode() == card3d);
+    CHECK(router.MoveFocus(aero::FocusDirection::Down));
+    CHECK(router.MoveFocus(aero::FocusDirection::Next));
+
+    // IME + Clipboard
+    ime.BeginFocus(rot2d);
+    ime.BeginComposition();
+    ime.UpdateComposition("ni", 2u);
+    CHECK(ime.IsComposing() && ime.PreeditText() == "ni");
+    ime.CommitComposition("你");
+    CHECK(!ime.IsComposing() && ime.CommittedText() == "你");
+    ime.EndBlur();
+    CHECK(!ime.IsImeFocused());
+
+    router.SetClipboardText("hello_aero");
+    CHECK(router.GetClipboardText() == "hello_aero");
+}
+
+void TestVisualRenderAdapterAndRasterizer() {
+    aero::UIResourceStore store;
+    aero::VisualWorld w(nullptr, &store);
+    aero::DrawingCommandBuffer drawBuf;
+
+    // Register decoded 4x4 checkerboard image
+    aero::DecodedImage chkImg{};
+    chkImg.width = 4u;
+    chkImg.height = 4u;
+    chkImg.format = aero::ImageFormat::Unknown;
+    chkImg.rgbaPixels.assign(4u * 4u * 4u, 255u);
+    for (std::uint32_t y = 0u; y < 4u; ++y) {
+        for (std::uint32_t x = 0u; x < 4u; ++x) {
+            const std::size_t off = (y * 4u + x) * 4u;
+            const bool dark = ((x + y) % 2u) == 0u;
+            chkImg.rgbaPixels[off + 0u] = dark ? 20u : 240u;
+            chkImg.rgbaPixels[off + 1u] = dark ? 180u : 80u;
+            chkImg.rgbaPixels[off + 2u] = 250u;
+            chkImg.rgbaPixels[off + 3u] = 255u;
+        }
+    }
+    const auto* imgEntry = store.Images().RegisterDecodedImage("mem://chk", std::move(chkImg), true);
+    CHECK(imgEntry != nullptr);
+
+    aero::GradientBrushDesc grad{};
+    grad.kind = aero::GradientBrushKind::Linear;
+    grad.stops = {
+        aero::GradientStop{0.0f, aero::Color{0.9f, 0.2f, 0.2f, 1.0f}},
+        aero::GradientStop{1.0f, aero::Color{0.2f, 0.3f, 0.95f, 1.0f}}};
+    const std::uint32_t gradId = aero::GradientBrushRegistry::Instance().RegisterBrush(grad);
+    CHECK(gradId > 0u);
+
+    auto root = w.CreateNode(aero::VisualKind::Box);
+    auto box = w.CreateNode(aero::VisualKind::Box);
+    auto textNode = w.CreateNode(aero::VisualKind::Text);
+    auto imgNode = w.CreateNode(aero::VisualKind::Image);
+    auto pathNode = w.CreateNode(aero::VisualKind::Vector);
+    auto trimPath = w.CreateNode(aero::VisualKind::Vector);
+    auto arcNode = w.CreateNode(aero::VisualKind::Vector);
+    auto blurNode = w.CreateNode(aero::VisualKind::Box);
+    auto blurChild = w.CreateNode(aero::VisualKind::Box);
+    auto canvasNode = w.CreateNode(aero::VisualKind::CanvasDraw);
+
+    w.SetRoot(root);
+    w.SetLayoutMode(root, aero::LayoutMode::Canvas, 0.0f, 0.0f, 0, 0);
+    w.SetBoxStyle(root, 0xFF181A22u, 0u, 0, 0, 0, 0, 0, 0, 0, 0);
+
+    w.AddChild(root, box);
+    w.SetCanvasOffsets(box, 20.0f, 20.0f, std::numeric_limits<float>::quiet_NaN(), std::numeric_limits<float>::quiet_NaN());
+    w.SetSize(box, 100.0f, 60.0f);
+    w.SetBoxStyle(box, 0xFFFFFFFFu, 0xFFFFFFFFu, 2.0f, 2.0f, 2.0f, 2.0f, 12.0f, 4.0f, 16.0f, 8.0f);
+    w.SetBoxGradients(box, static_cast<std::int32_t>(gradId), -1);
+    w.SetEffect(box, aero::UIEffectKind::DropShadow, 4.0f, 6.0f, 45.0f, 0xAA000000u, 1.0f);
+
+    w.AddChild(root, textNode);
+    w.SetCanvasOffsets(textNode, 140.0f, 20.0f, std::numeric_limits<float>::quiet_NaN(), std::numeric_limits<float>::quiet_NaN());
+    w.SetSize(textNode, 120.0f, 32.0f);
+    w.SetText(textNode, "Aero", "", 18.0f, 0xFFFFFFFFu, aero::TextWrapping::NoWrap, aero::TextAlignment::Left, aero::TextTrimming::None);
+    w.SetTextSelection(textNode, 1, 2, 2, true, 0x883399FFu, 0xFFFFFFFFu);
+
+    w.AddChild(root, imgNode);
+    w.SetCanvasOffsets(imgNode, 280.0f, 20.0f, std::numeric_limits<float>::quiet_NaN(), std::numeric_limits<float>::quiet_NaN());
+    w.SetSize(imgNode, 64.0f, 64.0f);
+    w.SetImage(imgNode, "mem://chk", aero::Stretch::Fill, aero::StretchDirection::Both, 0xFFFFFFFFu);
+
+    w.AddChild(root, pathNode);
+    w.SetCanvasOffsets(pathNode, 20.0f, 110.0f, std::numeric_limits<float>::quiet_NaN(), std::numeric_limits<float>::quiet_NaN());
+    w.SetSize(pathNode, 60.0f, 60.0f);
+    w.SetVectorShape(pathNode, aero::VectorShapeKind::SvgPath, "M 0,0 L 40,0 L 20,40 Z", 0xFF33EE88u, -1, 0u, -1, 0.0f, aero::Stretch::Uniform, 0.0f, 1.0f);
+
+    w.AddChild(root, trimPath);
+    w.SetCanvasOffsets(trimPath, 100.0f, 110.0f, std::numeric_limits<float>::quiet_NaN(), std::numeric_limits<float>::quiet_NaN());
+    w.SetSize(trimPath, 60.0f, 60.0f);
+    w.SetVectorShape(trimPath, aero::VectorShapeKind::SvgPath, "M 0,10 L 50,10 L 50,50", 0u, -1, 0xFFFFAA00u, -1, 4.0f, aero::Stretch::Uniform, 0.1f, 0.8f);
+
+    w.AddChild(root, arcNode);
+    w.SetCanvasOffsets(arcNode, 180.0f, 110.0f, std::numeric_limits<float>::quiet_NaN(), std::numeric_limits<float>::quiet_NaN());
+    w.SetSize(arcNode, 60.0f, 60.0f);
+    w.SetVectorShape(arcNode, aero::VectorShapeKind::RadialArc, "0,270,0.65", 0u, -1, 0xFF44DDFFu, -1, 4.0f, aero::Stretch::Uniform, 0.0f, 1.0f);
+
+    w.AddChild(root, blurNode);
+    w.SetCanvasOffsets(blurNode, 260.0f, 110.0f, std::numeric_limits<float>::quiet_NaN(), std::numeric_limits<float>::quiet_NaN());
+    w.SetSize(blurNode, 80.0f, 60.0f);
+    w.SetLayoutMode(blurNode, aero::LayoutMode::Canvas, 0.0f, 0.0f, 0, 0);
+    w.SetEffect(blurNode, aero::UIEffectKind::Blur, 6.0f, 0.0f, 0.0f, 0xFFFFFFFFu, 1.0f);
+    w.AddChild(blurNode, blurChild);
+    w.SetSize(blurChild, 50.0f, 30.0f);
+    w.SetCanvasOffsets(blurChild, 15.0f, 15.0f, std::numeric_limits<float>::quiet_NaN(), std::numeric_limits<float>::quiet_NaN());
+    w.SetBoxStyle(blurChild, 0xFFFF55AAu, 0u, 0, 0, 0, 0, 4, 4, 4, 4);
+
+    w.AddChild(root, canvasNode);
+    w.SetCanvasOffsets(canvasNode, 20.0f, 200.0f, std::numeric_limits<float>::quiet_NaN(), std::numeric_limits<float>::quiet_NaN());
+    w.SetSize(canvasNode, 200.0f, 80.0f);
+    drawBuf.Begin(canvasNode);
+    drawBuf.PushClip(canvasNode, 0.0f, 0.0f, 200.0f, 80.0f);
+    drawBuf.PushOpacity(canvasNode, 0.85f);
+    drawBuf.FillEllipse(canvasNode, 30.0f, 40.0f, 20.0f, 20.0f, 0xFF00FFAAu);
+    drawBuf.PushTransform(canvasNode, 70.0f, 10.0f, 1.0f, 1.0f, 0.0f);
+    drawBuf.FillRoundedRect(canvasNode, 0.0f, 0.0f, 60.0f, 40.0f, 8.0f, 8.0f, 0xFFFF4444u);
+    drawBuf.DrawText(canvasNode, "CV", 10.0f, 10.0f, 40.0f, 20.0f, "", 14.0f, 0xFFFFFFFFu,
+        aero::HorizontalAlignment::Left, aero::VerticalAlignment::Top);
+    drawBuf.PopTransform(canvasNode);
+    drawBuf.PopOpacity(canvasNode);
+    drawBuf.PopClip(canvasNode);
+    drawBuf.End(canvasNode);
+
+    w.UpdateLayout(400.0f, 300.0f);
+
+    aero::PagedRenderTree renderTree;
+    aero::VisualRenderAdapter adapter;
+    const std::size_t emitted = adapter.SyncPagedRenderTree(w, &drawBuf, renderTree, &store);
+    CHECK(emitted >= 10u);
+    CHECK(!w.HasAnyDirty());
+    CHECK(!renderTree.BlurLayerSpans().empty());
+
+    std::vector<std::uint8_t> rgba8;
+    aero::ZeroCopyGpuStream::RasterizeTreeToRgba8(renderTree, 400u, 300u, rgba8);
+    CHECK(rgba8.size() == 400u * 300u * 4u);
+
+    // Check gradient box pixel around (50, 45), checkerboard pixel at (300, 40), canvas ellipse pixel at (50, 240)
+    auto pixelAt = [&](std::uint32_t x, std::uint32_t y) {
+        const std::size_t idx = (static_cast<std::size_t>(y) * 400u + x) * 4u;
+        return std::array<std::uint8_t, 4>{rgba8[idx], rgba8[idx + 1u], rgba8[idx + 2u], rgba8[idx + 3u]};
+    };
+    const auto pBox = pixelAt(50u, 45u);
+    CHECK(pBox[0] > 40u || pBox[2] > 40u);
+    const auto pImg = pixelAt(300u, 40u);
+    CHECK(pImg[2] >= 200u);
+    const auto pEllipse = pixelAt(50u, 240u);
+    CHECK(pEllipse[1] >= 120u);
+}
+
+void TestTrackBEcsBindingZeroAlloc() {
+    aero::VisualWorld w;
+    auto root = w.CreateNode(aero::VisualKind::Box);
+    auto bar = w.CreateNode(aero::VisualKind::Box);
+    w.SetRoot(root);
+    w.AddChild(root, bar);
+    w.SetAlignment(bar, aero::HorizontalAlignment::Left, aero::VerticalAlignment::Top);
+    w.UpdateLayout(400.0f, 200.0f);
+
+    float colOpacity[2]{1.0f, 0.45f};
+    float colWidth[2]{10.0f, 180.0f};
+    float colHeight[2]{10.0f, 24.0f};
+    float colTx[2]{0.0f, 35.0f};
+    float colTy[2]{0.0f, 12.0f};
+
+    CHECK(w.BindEcsColumn(bar, static_cast<std::uint32_t>(aero::VisualAnimProp::Opacity), colOpacity, 1u, 2u));
+    CHECK(w.BindEcsColumn(bar, static_cast<std::uint32_t>(aero::VisualAnimProp::Width), colWidth, 1u, 2u));
+    CHECK(w.BindEcsColumn(bar, static_cast<std::uint32_t>(aero::VisualAnimProp::Height), colHeight, 1u, 2u));
+    CHECK(w.BindEcsColumn(bar, static_cast<std::uint32_t>(aero::VisualAnimProp::TranslateX), colTx, 1u, 2u));
+    CHECK(w.BindEcsColumn(bar, static_cast<std::uint32_t>(aero::VisualAnimProp::TranslateY), colTy, 1u, 2u));
+
+    CHECK(w.FlushTrackB() == 5u);
+    CHECK(w.FlushTrackB() == 0u); // unchanged values skip without touching dirty bits
+
+    w.UpdateLayout(400.0f, 200.0f);
+    const aero::VisualNode* n = w.GetNode(bar);
+    CHECK_NEAR(n->layout.opacity, 0.45f, 0.01f);
+    CHECK_NEAR(n->layout.layoutRect.width, 180.0f, 0.1f);
+    CHECK_NEAR(n->layout.layoutRect.height, 24.0f, 0.1f);
+    CHECK_NEAR(n->layout.worldTransform.tx, 35.0f, 0.1f);
+    CHECK_NEAR(n->layout.worldTransform.ty, 12.0f, 0.1f);
+}
+
+struct AotTestState {
+    int invokedCount = 0;
+    bool allowCommand = true;
+    std::string lastParam;
+};
+
+AotTestState* gAotState = nullptr;
+
+bool AotCanExecuteCommand(
+    aero::rs_aot::ExecutionContext&,
+    const aero::rs_rt::Value* args,
+    std::size_t argCount,
+    aero::rs_rt::Value& outRes) {
+    (void)args;
+    (void)argCount;
+    outRes = aero::rs_rt::Value{gAotState ? gAotState->allowCommand : true};
+    return true;
+}
+
+bool AotExecuteCommand(
+    aero::rs_aot::ExecutionContext& ctx,
+    const aero::rs_rt::Value* args,
+    std::size_t argCount,
+    aero::rs_rt::Value& outRes) {
+    if (gAotState) {
+        ++gAotState->invokedCount;
+        if (argCount >= 2u) {
+            if (const auto* sv = std::get_if<aero::rs_rt::StringValue>(&args[1])) {
+                gAotState->lastParam = sv->str();
+            } else if (const auto* ov = std::get_if<aero::rs_rt::ObjectRef>(&args[1]);
+                       ov && ov->valid() && ctx.heap()) {
+                if (const auto view = ctx.heap()->stringView(*ov)) {
+                    gAotState->lastParam.assign(*view);
+                }
+            }
+        }
+    }
+    outRes = aero::rs_rt::Value{};
+    return true;
+}
+
+void TestHostBindingsAndReflection() {
+    auto simHeap = std::make_shared<aero::rs_rt::ManagedHeap>();
+    auto uiHeap = std::make_shared<aero::rs_rt::ManagedHeap>();
+    auto handles = std::make_shared<aero::rs_rt::NativeHandleRegistry>();
+    aero::ExecutionDomainContext domains(simHeap, uiHeap, handles);
+    domains.setActiveDomain(aero::DomainKind::UiPresentation);
+
+    // 1. Test ProgramImage + Interpreter dot-separated reflection + dirty mask + Command
+    const aero::rs_sem::SymbolId kChildTypeId =
+        aero::rs_sem::stableTypeId(std::string("TestVm::ProfileVm"));
+    const aero::rs_sem::SymbolId kRootTypeId =
+        aero::rs_sem::stableTypeId(std::string("TestVm::MainVm"));
+    const aero::rs_sem::SymbolId kCmdTypeId =
+        aero::rs_sem::stableTypeId(std::string("TestVm::TestCmd"));
+    constexpr aero::rs_sem::SymbolId kCanExecFnId = 6001u;
+    constexpr aero::rs_sem::SymbolId kExecFnId = 6002u;
+
+    aero::rs_bc::Module mod{};
+    mod.name = "TestVm";
+    {
+        aero::rs_sem::TypeSymbol childType{};
+        childType.id = kChildTypeId;
+        childType.moduleName = "TestVm";
+        childType.name = "ProfileVm";
+        aero::rs_sem::FieldSymbol fTitle{};
+        fTitle.declaringTypeId = kChildTypeId;
+        fTitle.declaringTypeName = "TestVm::ProfileVm";
+        fTitle.index = 0u;
+        fTitle.name = "Title";
+        fTitle.type = aero::rs_sem::PrimitiveType::String;
+        aero::rs_sem::FieldSymbol fScore{};
+        fScore.declaringTypeId = kChildTypeId;
+        fScore.declaringTypeName = "TestVm::ProfileVm";
+        fScore.index = 1u;
+        fScore.name = "Score";
+        fScore.type = aero::rs_sem::PrimitiveType::Int;
+        aero::rs_sem::FieldSymbol fRatio{};
+        fRatio.declaringTypeId = kChildTypeId;
+        fRatio.declaringTypeName = "TestVm::ProfileVm";
+        fRatio.index = 2u;
+        fRatio.name = "Ratio";
+        fRatio.type = aero::rs_sem::PrimitiveType::Float;
+        aero::rs_sem::FieldSymbol fActive{};
+        fActive.declaringTypeId = kChildTypeId;
+        fActive.declaringTypeName = "TestVm::ProfileVm";
+        fActive.index = 3u;
+        fActive.name = "Active";
+        fActive.type = aero::rs_sem::PrimitiveType::Bool;
+        childType.fields = {fTitle, fScore, fRatio, fActive};
+        mod.types.push_back(std::move(childType));
+
+        aero::rs_sem::TypeSymbol rootType{};
+        rootType.id = kRootTypeId;
+        rootType.moduleName = "TestVm";
+        rootType.name = "MainVm";
+        aero::rs_sem::FieldSymbol fChild{};
+        fChild.declaringTypeId = kRootTypeId;
+        fChild.declaringTypeName = "TestVm::MainVm";
+        fChild.index = 0u;
+        fChild.name = "Profile";
+        fChild.type = aero::rs_sem::PrimitiveType::Object;
+        fChild.typeName = "TestVm::ProfileVm";
+        aero::rs_sem::FieldSymbol fCmd{};
+        fCmd.declaringTypeId = kRootTypeId;
+        fCmd.declaringTypeName = "TestVm::MainVm";
+        fCmd.index = 1u;
+        fCmd.name = "SubmitCommand";
+        fCmd.type = aero::rs_sem::PrimitiveType::Object;
+        fCmd.typeName = "TestVm::TestCmd";
+        rootType.fields = {fChild, fCmd};
+        mod.types.push_back(std::move(rootType));
+
+        aero::rs_sem::TypeSymbol cmdType{};
+        cmdType.id = kCmdTypeId;
+        cmdType.moduleName = "TestVm";
+        cmdType.name = "TestCmd";
+        mod.types.push_back(std::move(cmdType));
+    }
+
+    aero::rs_rt::RuntimeError linkErr{};
+    auto progImgOpt = aero::rs_rt::ProgramImage::link({std::move(mod)}, linkErr);
+    if (!progImgOpt.has_value()) {
+        std::fprintf(stderr, "ProgramImage::link error: %s\n", linkErr.message.c_str());
+    }
+    CHECK(progImgOpt.has_value());
+    if (!progImgOpt.has_value()) {
+        gAotState = nullptr;
+        return;
+    }
+    auto progImgPtr = std::make_shared<const aero::rs_rt::ProgramImage>(std::move(*progImgOpt));
+    domains.registerProgramObservableMetadata(*progImgPtr);
+
+    aero::UIResourceStore store;
+    aero::VisualWorld world(handles.get(), &store, uiHeap.get());
+    aero::DrawingCommandBuffer drawBuf;
+    aero::VisualAnimationEngine anim;
+    aero::VisualInputRouter router(&world);
+    aero::rs_rt::Interpreter interp(progImgPtr, uiHeap);
+
+    auto bindings = std::make_shared<aero::rs_rt::BindingRegistry>();
+    CHECK(aero::RegisterVisualHostBindings(
+        *bindings, world, drawBuf, anim, router, domains, progImgPtr.get(), &interp, nullptr, nullptr));
+
+    auto invokeBound = [&](const char* name, std::vector<aero::rs_rt::Value> args) {
+        aero::rs_bc::FunctionReference ref{};
+        ref.name = name;
+        aero::rs_rt::RuntimeError err{};
+        return bindings->invoke(ref, aero::rs_rt::ValueSpan(args), err);
+    };
+
+    // Check canonical, bare, and __rs_native_ aliases exist
+    {
+        aero::rs_bc::FunctionReference canonRef{};
+        canonRef.name = "Aero.Native::Visual_Create";
+        aero::rs_bc::FunctionReference bareRef{};
+        bareRef.name = "Visual_Create";
+        aero::rs_bc::FunctionReference nativeCanonRef{};
+        nativeCanonRef.name = "Aero.Native::__rs_native_Visual_Create";
+        aero::rs_bc::FunctionReference nativeBareRef{};
+        nativeBareRef.name = "__rs_native_Visual_Create";
+        CHECK(bindings->resolve(canonRef).has_value());
+        CHECK(bindings->resolve(bareRef).has_value());
+        CHECK(bindings->resolve(nativeCanonRef).has_value());
+        CHECK(bindings->resolve(nativeBareRef).has_value());
+    }
+
+    // Color_ParseRgba (#RGB, #ARGB, #RRGGBB, #AARRGGBB, named WPF CornflowerBlue)
+    {
+        const auto cRgb = invokeBound("Color_ParseRgba", {MakeStrVal("#F0A")});
+        CHECK(cRgb.has_value() && std::get<aero::rs_rt::UIntValue>(*cRgb).value == 0xFFAA00FFu);
+
+        const auto cArgb = invokeBound("Color_ParseRgba", {MakeStrVal("#80FF0000")});
+        CHECK(cArgb.has_value() && std::get<aero::rs_rt::UIntValue>(*cArgb).value == 0x800000FFu);
+
+        const auto cNamed = invokeBound("Color_ParseRgba", {MakeStrVal("CornflowerBlue")});
+        CHECK(cNamed.has_value() && std::get<aero::rs_rt::UIntValue>(*cNamed).value == 0xFFED9564u); // RGBA8 LE of #FF6495ED
+    }
+
+    // Invoke Visual_* bindings directly through BindingRegistry (bare & canonical)
+    {
+        const auto hOpt = invokeBound("Aero.Native::Visual_Create", {aero::rs_rt::Value{0LL}});
+        CHECK(hOpt.has_value());
+        aero::rs_rt::NativeHandle nh{};
+        CHECK(hOpt->tryGetNativeHandle(nh) && nh.valid());
+        const auto childOpt = invokeBound("Visual_Create", {aero::rs_rt::Value{0LL}});
+        CHECK(childOpt.has_value());
+        aero::rs_rt::NativeHandle ch{};
+        CHECK(childOpt->tryGetNativeHandle(ch));
+        (void)invokeBound("Visual_AddChild", {aero::rs_rt::Value{nh}, aero::rs_rt::Value{ch}});
+        (void)invokeBound("Visual_SetLayoutMode", {
+            aero::rs_rt::Value{nh},
+            aero::rs_rt::Value{static_cast<std::int64_t>(aero::LayoutMode::ScrollViewport)},
+            aero::rs_rt::Value{aero::rs_rt::FloatValue{0.0f}},
+            aero::rs_rt::Value{aero::rs_rt::FloatValue{0.0f}},
+            aero::rs_rt::Value{0LL},
+            aero::rs_rt::Value{0LL}});
+        (void)invokeBound("Visual_SetSize", {
+            aero::rs_rt::Value{ch},
+            aero::rs_rt::Value{aero::rs_rt::FloatValue{640.0f}},
+            aero::rs_rt::Value{aero::rs_rt::FloatValue{480.0f}}});
+        world.SetRoot(world.ResolveHandle(nh));
+        world.UpdateLayout(200.0f, 150.0f);
+        const auto extW = invokeBound("Visual_GetLayoutRect", {aero::rs_rt::Value{nh}, aero::rs_rt::Value{6LL}});
+        float extWVal = 0.0f;
+        CHECK(extW.has_value() && extW->tryGetFloat(extWVal));
+        CHECK_NEAR(extWVal, 640.0f, 0.1f);
+        const auto childW = invokeBound("Visual_GetLayoutRect", {aero::rs_rt::Value{ch}, aero::rs_rt::Value{2LL}});
+        float childWVal = 0.0f;
+        CHECK(childW.has_value() && childW->tryGetFloat(childWVal));
+        CHECK_NEAR(childWVal, 640.0f, 0.1f);
+
+        // Void host bindings must return engaged Value{int64_t{0}} (both canonical & __rs_native_)
+        const aero::VisualNodeId rootNid = world.ResolveHandle(nh);
+        const auto op1 = invokeBound("Aero.Native::Visual_SetOpacity", {
+            aero::rs_rt::Value{nh},
+            aero::rs_rt::Value{aero::rs_rt::FloatValue{0.42f}}});
+        std::int64_t op1Ret = -1;
+        CHECK(op1.has_value() && op1->tryGetInt64(op1Ret) && op1Ret == 0);
+        CHECK(world.GetNode(rootNid) != nullptr);
+        CHECK_NEAR(world.GetNode(rootNid)->layout.opacity, 0.42f, 0.001f);
+
+        const auto op2 = invokeBound("Aero.Native::__rs_native_Visual_SetOpacity", {
+            aero::rs_rt::Value{nh},
+            aero::rs_rt::Value{aero::rs_rt::FloatValue{0.84f}}});
+        std::int64_t op2Ret = -1;
+        CHECK(op2.has_value() && op2->tryGetInt64(op2Ret) && op2Ret == 0);
+        CHECK_NEAR(world.GetNode(rootNid)->layout.opacity, 0.84f, 0.001f);
+
+        // Stale/invalid handle no-op on void host binding must also return engaged Value{int64_t{0}}
+        const aero::rs_rt::NativeHandle staleNh{};
+        const auto opStale = invokeBound("Visual_SetOpacity", {
+            aero::rs_rt::Value{staleNh},
+            aero::rs_rt::Value{aero::rs_rt::FloatValue{0.1f}}});
+        std::int64_t opStaleRet = -1;
+        CHECK(opStale.has_value() && opStale->tryGetInt64(opStaleRet) && opStaleRet == 0);
+    }
+
+    // Allocate RootVm -> ChildVm on uiHeap & test dot-separated Reflect_GetProp* / SetProp* / DirtyMask
+    uiHeap->registerTypeHierarchy(*progImgPtr);
+    uiHeap->enableTypeDirtyTracking(kChildTypeId, {0u, 1u, 2u, 3u});
+
+    auto strInit = uiHeap->internString("Initial");
+    CHECK(strInit.has_value());
+    auto childObjOpt = uiHeap->allocateObject(
+        kChildTypeId,
+        {aero::rs_rt::Value{*strInit},
+         aero::rs_rt::Value{12LL},
+         aero::rs_rt::Value{aero::rs_rt::FloatValue{0.75f}},
+         aero::rs_rt::Value{true}},
+        {0u});
+    CHECK(childObjOpt.has_value());
+    auto rootObjOpt = uiHeap->allocateObject(
+        kRootTypeId,
+        {aero::rs_rt::Value{*childObjOpt}, aero::rs_rt::Value{aero::rs_rt::NullObject{}}},
+        {0u, 1u});
+    CHECK(rootObjOpt.has_value());
+
+    const auto gotStr = invokeBound("Reflect_GetPropString", {
+        aero::rs_rt::Value{*rootObjOpt},
+        MakeStrVal("Profile.Title")});
+    CHECK(gotStr.has_value() && std::get<aero::rs_rt::StringValue>(*gotStr).str() == "Initial");
+
+    const auto setOk = invokeBound("Reflect_SetPropString", {
+        aero::rs_rt::Value{*rootObjOpt},
+        MakeStrVal("Profile.Title"),
+        MakeStrVal("Updated")});
+    bool setOkB = false;
+    CHECK(setOk.has_value() && setOk->tryGetBool(setOkB) && setOkB);
+
+    const auto gotUpdated = invokeBound("Reflect_GetPropString", {
+        aero::rs_rt::Value{*rootObjOpt},
+        MakeStrVal("Profile.Title")});
+    CHECK(gotUpdated.has_value() && std::get<aero::rs_rt::StringValue>(*gotUpdated).str() == "Updated");
+
+    (void)invokeBound("Reflect_SetPropInt", {
+        aero::rs_rt::Value{*rootObjOpt},
+        MakeStrVal("Profile.Score"),
+        aero::rs_rt::Value{99LL}});
+    const auto gotInt = invokeBound("Reflect_GetPropInt", {
+        aero::rs_rt::Value{*rootObjOpt},
+        MakeStrVal("Profile.Score")});
+    std::int64_t scoreVal = 0;
+    CHECK(gotInt.has_value() && gotInt->tryGetInt64(scoreVal) && scoreVal == 99);
+
+    (void)invokeBound("Reflect_SetPropFloat", {
+        aero::rs_rt::Value{*rootObjOpt},
+        MakeStrVal("Profile.Ratio"),
+        aero::rs_rt::Value{aero::rs_rt::FloatValue{0.25f}}});
+    const auto gotFloat = invokeBound("Reflect_GetPropFloat", {
+        aero::rs_rt::Value{*rootObjOpt},
+        MakeStrVal("Profile.Ratio")});
+    float ratioVal = 0.0f;
+    CHECK(gotFloat.has_value() && gotFloat->tryGetFloat(ratioVal));
+    CHECK_NEAR(ratioVal, 0.25f, 0.001f);
+
+    (void)invokeBound("Reflect_SetPropBool", {
+        aero::rs_rt::Value{*rootObjOpt},
+        MakeStrVal("Profile.Active"),
+        aero::rs_rt::Value{false}});
+    const auto gotBool = invokeBound("Reflect_GetPropBool", {
+        aero::rs_rt::Value{*rootObjOpt},
+        MakeStrVal("Profile.Active")});
+    bool activeVal = true;
+    CHECK(gotBool.has_value() && gotBool->tryGetBool(activeVal) && !activeVal);
+
+    const auto dirtyMask = invokeBound("Reflect_GetDirtyMask", {aero::rs_rt::Value{*childObjOpt}});
+    std::int64_t maskBits = 0;
+    CHECK(dirtyMask.has_value() && dirtyMask->tryGetInt64(maskBits) && (maskBits & 0x0FLL) != 0LL);
+
+    // 2. Test AOT ExecutionContext Reflection & Command execution (CanExecute + Execute)
+    AotTestState aotState{};
+    gAotState = &aotState;
+
+    const aero::rs_aot::FieldDescriptor kAotRootFields[] = {
+        {"SubmitCommand", aero::rs_sem::PrimitiveType::Object, kCmdTypeId, 0u, false, false, false},
+        {"$Counter", aero::rs_sem::PrimitiveType::Int, 0u, 1u, true, false, false},
+    };
+    const aero::rs_aot::TypeDescriptor kAotTypes[] = {
+        {kRootTypeId, aero::rs_sem::TypeKind::Class, 0u, "TestAot", "AotVm", kAotRootFields, 2u, nullptr, 0u, nullptr, 0u, false, nullptr, 0u, false, false, false},
+        {kCmdTypeId, aero::rs_sem::TypeKind::Class, 0u, "TestAot", "AotCmd", nullptr, 0u, nullptr, 0u, nullptr, 0u, false, nullptr, 0u, false, false, false},
+    };
+    static const aero::rs_sem::PrimitiveType kCanExecParams[] = {aero::rs_sem::PrimitiveType::Object, aero::rs_sem::PrimitiveType::String};
+    static const aero::rs_sem::PrimitiveType kExecParams[] = {aero::rs_sem::PrimitiveType::Object, aero::rs_sem::PrimitiveType::String};
+    static const aero::rs_aot::FunctionDescriptor kAotFuncs[] = {
+        {kCanExecFnId, "TestAot::AotCmd.CanExecute", aero::rs_sem::PrimitiveType::Bool, 0u, kCanExecParams, nullptr, 2u, &AotCanExecuteCommand, nullptr, nullptr},
+        {kExecFnId, "TestAot::AotCmd.Execute", aero::rs_sem::PrimitiveType::Void, 0u, kExecParams, nullptr, 2u, &AotExecuteCommand, nullptr, nullptr},
+    };
+    aero::rs_aot::ProgramDescriptor aotDesc{};
+    aotDesc.name = "AotReflectTest";
+    aotDesc.types = kAotTypes;
+    aotDesc.typeCount = 2u;
+    aotDesc.functions = kAotFuncs;
+    aotDesc.functionCount = 2u;
+
+    auto aotBindings = std::make_shared<aero::rs_rt::BindingRegistry>();
+    aero::rs_aot::ExecutionContext aotCtx(aotDesc, uiHeap, aotBindings);
+    CHECK(aero::RegisterVisualHostBindings(
+        *aotBindings, world, drawBuf, anim, router, domains, nullptr, nullptr, &aotCtx, nullptr));
+
+    auto aotCmdOpt = uiHeap->allocateObject(kCmdTypeId, {}, {});
+    auto aotVmOpt = uiHeap->allocateObject(
+        kRootTypeId, {aero::rs_rt::Value{*aotCmdOpt}, aero::rs_rt::Value{7LL}}, {0u});
+    CHECK(aotCmdOpt.has_value() && aotVmOpt.has_value());
+
+    aero::rs_bc::FunctionReference aotGetInt{};
+    aotGetInt.name = "Reflect_GetPropInt";
+    aero::rs_rt::RuntimeError aotErr{};
+    std::vector<aero::rs_rt::Value> getArgs{
+        aero::rs_rt::Value{*aotVmOpt},
+        MakeStrVal("Counter")};
+    const auto gotAotInt = aotBindings->invoke(aotGetInt, aero::rs_rt::ValueSpan(getArgs), aotErr);
+    std::int64_t aotCounter = 0;
+    CHECK(gotAotInt.has_value() && gotAotInt->tryGetInt64(aotCounter) && aotCounter == 7);
+
+    aero::rs_bc::FunctionReference aotInvokeCmd{};
+    aotInvokeCmd.name = "Reflect_InvokeCommand";
+    std::vector<aero::rs_rt::Value> cmdArgs{
+        aero::rs_rt::Value{*aotVmOpt},
+        MakeStrVal("SubmitCommand"),
+        MakeStrVal("payload_42")};
+    const auto cmdOk = aotBindings->invoke(aotInvokeCmd, aero::rs_rt::ValueSpan(cmdArgs), aotErr);
+    bool cmdOkB = false;
+    CHECK(cmdOk.has_value() && cmdOk->tryGetBool(cmdOkB) && cmdOkB);
+    CHECK(aotState.invokedCount == 1 && aotState.lastParam == "payload_42");
+
+    aotState.allowCommand = false;
+    const auto cmdBlocked = aotBindings->invoke(aotInvokeCmd, aero::rs_rt::ValueSpan(cmdArgs), aotErr);
+    bool cmdBlockedB = true;
+    CHECK(cmdBlocked.has_value() && cmdBlocked->tryGetBool(cmdBlockedB) && !cmdBlockedB);
+    CHECK(aotState.invokedCount == 1);
+    gAotState = nullptr;
+}
+
+} // namespace
+
+int main() {
+    TestGenerationalHandlesAndCycleGuard();
+    TestGcRootSafetyAndExternalPools();
+    TestAllNineLayoutModes();
+    TestIncrementalDepthBuckets();
+    TestDrawingCommandBuffer();
+    TestAnimationEngine();
+    TestHitTestTransformsAndInputRouter();
+    TestVisualRenderAdapterAndRasterizer();
+    TestTrackBEcsBindingZeroAlloc();
+    TestHostBindingsAndReflection();
+
+    if (gFailureCount != 0) {
+        std::fprintf(stderr, "microkernel_tests FAILED (%d checks failed)\n", gFailureCount);
+        return 1;
+    }
+    std::printf("microkernel_tests PASSED all checks\n");
+    return 0;
+}

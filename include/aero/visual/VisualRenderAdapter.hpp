@@ -26,6 +26,106 @@ public:
         const DrawingCommandBuffer* drawBuffer,
         PagedRenderTree& outTree,
         UIResourceStore* resourceStore = nullptr) const;
+
+private:
+    static void ApplyNodeTransform(
+        PagedRenderTree& tree,
+        std::uint32_t beginNid,
+        std::uint32_t endNid,
+        const Matrix2D& world2D,
+        const Matrix4x4& world3D,
+        bool has3D,
+        BlendingMode blend) noexcept;
+
+    static std::size_t EmitLineSegment(
+        PagedRenderTree& tree,
+        Point a,
+        Point b,
+        float thickness,
+        const Color& color,
+        const void* owner,
+        const Matrix2D& world2D,
+        const Matrix4x4& world3D,
+        bool has3D,
+        BlendingMode blend);
+
+    static std::size_t EmitSvgPathPrimitive(
+        PagedRenderTree& tree,
+        const Rect& destBox,
+        std::string_view pathData,
+        std::uint32_t fillRgba,
+        std::int32_t fillGradId,
+        std::uint32_t strokeRgba,
+        float strokeWidth,
+        Stretch stretch,
+        float trimStart,
+        float trimEnd,
+        float effOpacity,
+        const void* owner,
+        const Matrix2D& world2D,
+        const Matrix4x4& world3D,
+        bool has3D,
+        BlendingMode blend);
+
+    static std::size_t EmitBoxVisual(
+        PagedRenderTree& tree,
+        const VisualNode& node,
+        const Rect& rect,
+        float effOpacity,
+        const Matrix2D& world2D,
+        const Matrix4x4& world3D,
+        bool has3D,
+        BlendingMode blend);
+
+    static std::size_t EmitTextVisual(
+        PagedRenderTree& tree,
+        const VisualNode& node,
+        const Rect& rect,
+        float effOpacity,
+        const Matrix2D& world2D,
+        const Matrix4x4& world3D,
+        bool has3D,
+        BlendingMode blend);
+
+    static std::size_t EmitImageVisual(
+        PagedRenderTree& tree,
+        const VisualNode& node,
+        const Rect& rect,
+        float effOpacity,
+        const Matrix2D& world2D,
+        const Matrix4x4& world3D,
+        bool has3D,
+        BlendingMode blend);
+
+    static std::size_t EmitVectorVisual(
+        PagedRenderTree& tree,
+        const VisualNode& node,
+        const Rect& rect,
+        float effOpacity,
+        const Matrix2D& world2D,
+        const Matrix4x4& world3D,
+        bool has3D,
+        BlendingMode blend);
+
+    static std::size_t EmitCanvasDrawVisual(
+        PagedRenderTree& tree,
+        const DrawingCommandBuffer* drawBuffer,
+        VisualNodeId id,
+        const VisualNode& node,
+        const Rect& rect,
+        float effOpacity,
+        const Matrix2D& world2D,
+        const Matrix4x4& world3D,
+        bool has3D,
+        BlendingMode blend);
+
+    static std::size_t EmitNodeRecursive(
+        VisualWorld* mutableWorld,
+        const VisualWorld& world,
+        const DrawingCommandBuffer* drawBuffer,
+        VisualNodeId id,
+        float parentOpacity,
+        PagedRenderTree& outTree);
 };
 
 } // namespace aero
