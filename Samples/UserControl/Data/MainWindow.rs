@@ -1,29 +1,70 @@
 module UserControl;
 
 import Aero.UI;
+import UserControls;
 
 [Observable]
-public class ViewModel
+public class ViewModel : ViewModelBase
 {
-    public int TotalBudget { get; set; } = 50;
-    public int MinStat { get; set; } = 3;
-    public int MaxStat { get; set; } = 20;
-    public int Strength { get; set; } = 10;
-    public int Agility { get; set; } = 14;
-    public int Intelligence { get; set; } = 8;
-    public int Charisma { get; set; } = 12;
-    public int PointsAvailable { get; set; } = 6;
+    private int _totalBudget = 50;
+    private int _minStat = 3;
+    private int _maxStat = 20;
+    private int _strength = 10;
+    private int _agility = 14;
+    private int _intelligence = 8;
+    private int _charisma = 12;
+    private int _pointsAvailable = 6;
+
+    public int TotalBudget
+    {
+        get { return this._totalBudget; }
+        set { this.SetProperty(ref this._totalBudget, value, "TotalBudget"); }
+    }
+
+    public int MinStat
+    {
+        get { return this._minStat; }
+        set { this.SetProperty(ref this._minStat, value, "MinStat"); }
+    }
+
+    public int MaxStat
+    {
+        get { return this._maxStat; }
+        set { this.SetProperty(ref this._maxStat, value, "MaxStat"); }
+    }
+
+    public int Strength
+    {
+        get { return this._strength; }
+        set { this.SetProperty(ref this._strength, value, "Strength"); }
+    }
+
+    public int Agility
+    {
+        get { return this._agility; }
+        set { this.SetProperty(ref this._agility, value, "Agility"); }
+    }
+
+    public int Intelligence
+    {
+        get { return this._intelligence; }
+        set { this.SetProperty(ref this._intelligence, value, "Intelligence"); }
+    }
+
+    public int Charisma
+    {
+        get { return this._charisma; }
+        set { this.SetProperty(ref this._charisma, value, "Charisma"); }
+    }
+
+    public int PointsAvailable
+    {
+        get { return this._pointsAvailable; }
+        set { this.SetProperty(ref this._pointsAvailable, value, "PointsAvailable"); }
+    }
 
     public ViewModel()
     {
-        this.TotalBudget = 50;
-        this.MinStat = 3;
-        this.MaxStat = 20;
-        this.Strength = 10;
-        this.Agility = 14;
-        this.Intelligence = 8;
-        this.Charisma = 12;
-        this.PointsAvailable = 6;
     }
 
     private int ClampStat(int requested, int otherSum)
@@ -95,18 +136,19 @@ public class ViewModel
     }
 }
 
-[Observable]
-public partial class MainWindow
+public partial class MainWindow : Page
 {
-    public ViewModel ViewModel { get; set; }
+    private ViewModel _vm;
+
+    public ViewModel VM { get { return this._vm; } }
+    public ViewModel ViewModel { get { return this._vm; } }
 
     public MainWindow()
     {
-        Application_SetResources("Resources.xaml");
+        this._vm = new ViewModel();
+        this.DataContext = this._vm;
         this.InitializeComponent();
-
-        this.ViewModel = new ViewModel();
-        this.SetDataContext<ViewModel>(this.ViewModel);
+        BindingEngine.Flush();
     }
 
     public void OnInitialized()
@@ -116,153 +158,136 @@ public partial class MainWindow
 
     public void SyncFromControls()
     {
-        if (this.ViewModel == null)
+        if (this.VM == null)
         {
             return;
         }
 
-        double rawStr = UIElement_GetDouble(this.StatStr, "Value");
-        double rawAgi = UIElement_GetDouble(this.StatAgi, "Value");
-        double rawInt = UIElement_GetDouble(this.StatInt, "Value");
-        double rawCha = UIElement_GetDouble(this.StatCha, "Value");
+        if (this.StatStr != null) { this.VM.Strength = this.StatStr.Value; }
+        if (this.StatAgi != null) { this.VM.Agility = this.StatAgi.Value; }
+        if (this.StatInt != null) { this.VM.Intelligence = this.StatInt.Value; }
+        if (this.StatCha != null) { this.VM.Charisma = this.StatCha.Value; }
 
-        if (rawStr > 0.0)
-        {
-            this.ViewModel.Strength = (int)(rawStr + 0.5);
-        }
-        if (rawAgi > 0.0)
-        {
-            this.ViewModel.Agility = (int)(rawAgi + 0.5);
-        }
-        if (rawInt > 0.0)
-        {
-            this.ViewModel.Intelligence = (int)(rawInt + 0.5);
-        }
-        if (rawCha > 0.0)
-        {
-            this.ViewModel.Charisma = (int)(rawCha + 0.5);
-        }
-
-        this.ViewModel.RecalculatePoints();
+        this.VM.RecalculatePoints();
     }
 
     public void SyncToControls()
     {
-        if (this.ViewModel == null)
+        if (this.VM == null)
         {
             return;
         }
 
-        UIElement_SetDouble(this.StatStr, "Value", (double)this.ViewModel.Strength);
-        UIElement_SetDouble(this.StatAgi, "Value", (double)this.ViewModel.Agility);
-        UIElement_SetDouble(this.StatInt, "Value", (double)this.ViewModel.Intelligence);
-        UIElement_SetDouble(this.StatCha, "Value", (double)this.ViewModel.Charisma);
+        if (this.StatStr != null) { this.StatStr.Value = this.VM.Strength; }
+        if (this.StatAgi != null) { this.StatAgi.Value = this.VM.Agility; }
+        if (this.StatInt != null) { this.StatInt.Value = this.VM.Intelligence; }
+        if (this.StatCha != null) { this.StatCha.Value = this.VM.Charisma; }
     }
 
     public void SetStrength(int v)
     {
-        if (this.ViewModel == null)
+        if (this.VM == null)
         {
             return;
         }
-        int actual = this.ViewModel.SetStrength(v);
-        UIElement_SetDouble(this.StatStr, "Value", (double)actual);
-        Storyboard_Begin(this.__nativeRootHandle, "UserControl.Anim.Str.ValueChanged");
+        int actual = this.VM.SetStrength(v);
+        if (this.StatStr != null) { this.StatStr.Value = actual; }
+        this.BeginStoryboard("UserControl.Anim.Str.ValueChanged");
     }
 
     public void SetAgility(int v)
     {
-        if (this.ViewModel == null)
+        if (this.VM == null)
         {
             return;
         }
-        int actual = this.ViewModel.SetAgility(v);
-        UIElement_SetDouble(this.StatAgi, "Value", (double)actual);
-        Storyboard_Begin(this.__nativeRootHandle, "UserControl.Anim.Agi.ValueChanged");
+        int actual = this.VM.SetAgility(v);
+        if (this.StatAgi != null) { this.StatAgi.Value = actual; }
+        this.BeginStoryboard("UserControl.Anim.Agi.ValueChanged");
     }
 
     public void SetIntelligence(int v)
     {
-        if (this.ViewModel == null)
+        if (this.VM == null)
         {
             return;
         }
-        int actual = this.ViewModel.SetIntelligence(v);
-        UIElement_SetDouble(this.StatInt, "Value", (double)actual);
-        Storyboard_Begin(this.__nativeRootHandle, "UserControl.Anim.Int.ValueChanged");
+        int actual = this.VM.SetIntelligence(v);
+        if (this.StatInt != null) { this.StatInt.Value = actual; }
+        this.BeginStoryboard("UserControl.Anim.Int.ValueChanged");
     }
 
     public void SetCharisma(int v)
     {
-        if (this.ViewModel == null)
+        if (this.VM == null)
         {
             return;
         }
-        int actual = this.ViewModel.SetCharisma(v);
-        UIElement_SetDouble(this.StatCha, "Value", (double)actual);
-        Storyboard_Begin(this.__nativeRootHandle, "UserControl.Anim.Cha.ValueChanged");
+        int actual = this.VM.SetCharisma(v);
+        if (this.StatCha != null) { this.StatCha.Value = actual; }
+        this.BeginStoryboard("UserControl.Anim.Cha.ValueChanged");
     }
 
     public void IncrementStrength()
     {
         this.SyncFromControls();
-        this.SetStrength(this.ViewModel.Strength + 1);
+        this.SetStrength(this.VM.Strength + 1);
     }
 
     public void DecrementStrength()
     {
         this.SyncFromControls();
-        this.SetStrength(this.ViewModel.Strength - 1);
+        this.SetStrength(this.VM.Strength - 1);
     }
 
     public void IncrementAgility()
     {
         this.SyncFromControls();
-        this.SetAgility(this.ViewModel.Agility + 1);
+        this.SetAgility(this.VM.Agility + 1);
     }
 
     public void DecrementAgility()
     {
         this.SyncFromControls();
-        this.SetAgility(this.ViewModel.Agility - 1);
+        this.SetAgility(this.VM.Agility - 1);
     }
 
     public void IncrementIntelligence()
     {
         this.SyncFromControls();
-        this.SetIntelligence(this.ViewModel.Intelligence + 1);
+        this.SetIntelligence(this.VM.Intelligence + 1);
     }
 
     public void DecrementIntelligence()
     {
         this.SyncFromControls();
-        this.SetIntelligence(this.ViewModel.Intelligence - 1);
+        this.SetIntelligence(this.VM.Intelligence - 1);
     }
 
     public void IncrementCharisma()
     {
         this.SyncFromControls();
-        this.SetCharisma(this.ViewModel.Charisma + 1);
+        this.SetCharisma(this.VM.Charisma + 1);
     }
 
     public void DecrementCharisma()
     {
         this.SyncFromControls();
-        this.SetCharisma(this.ViewModel.Charisma - 1);
+        this.SetCharisma(this.VM.Charisma - 1);
     }
 
     public void ResetStats()
     {
-        if (this.ViewModel == null)
+        if (this.VM == null)
         {
             return;
         }
-        this.ViewModel.Reset();
+        this.VM.Reset();
         this.SyncToControls();
     }
 }
 
-public MainWindow CreateMainWindow()
+public static MainWindow CreateMainWindow()
 {
     return new MainWindow();
 }

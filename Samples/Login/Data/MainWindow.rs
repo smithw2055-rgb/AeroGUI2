@@ -3,30 +3,62 @@ module Login;
 import Aero.UI;
 
 [Observable]
-public class ViewModel
+public class ViewModel : ViewModelBase
 {
     private DelegateCommand _loginCommand;
+    private string _accountName = "";
+    private string _message = "";
+    private bool _loginSuccessful = false;
+    private int _loginAttempts = 0;
 
     public DelegateCommand LoginCommand { get { return this._loginCommand; } }
-    public string AccountName { get; set; } = "";
-    public string Message { get; set; } = "";
-    public bool LoginSuccessful { get; set; } = false;
-    public int LoginAttempts { get; set; } = 0;
+
+    public string AccountName
+    {
+        get { return this._accountName; }
+        set { this.SetProperty(ref this._accountName, value, "AccountName"); }
+    }
+
+    public string Message
+    {
+        get { return this._message; }
+        set { this.SetProperty(ref this._message, value, "Message"); }
+    }
+
+    public bool LoginSuccessful
+    {
+        get { return this._loginSuccessful; }
+        set { this.SetProperty(ref this._loginSuccessful, value, "LoginSuccessful"); }
+    }
+
+    public int LoginAttempts
+    {
+        get { return this._loginAttempts; }
+        set { this.SetProperty(ref this._loginAttempts, value, "LoginAttempts"); }
+    }
 
     public ViewModel()
     {
-        this._loginCommand = new DelegateCommand();
-        this._loginCommand.SetExecuteFunc(this.Login);
-
-        this.AccountName = "";
-        this.Message = "";
-        this.LoginSuccessful = false;
-        this.LoginAttempts = 0;
+        this._loginCommand = new DelegateCommand((object param) => { this.Login(param); });
+        this._accountName = "";
+        this._message = "";
+        this._loginSuccessful = false;
+        this._loginAttempts = 0;
     }
 
-    public void Login(handle passBox)
+    public void Login(object passBox)
     {
-        string password = PasswordBox_GetPassword(passBox);
+        string password = "";
+        if (passBox is PasswordBox)
+        {
+            var box = (PasswordBox)passBox;
+            password = box.Password;
+        }
+        else if (passBox is BoxedString)
+        {
+            var boxed = (BoxedString)passBox;
+            password = boxed.Value;
+        }
         this.CheckCredentials(password);
     }
 
@@ -69,19 +101,19 @@ public class ViewModel
     }
 }
 
-[Observable]
-public partial class MainWindow
+public partial class MainWindow : Page
 {
-    public ViewModel DataContext { get; set; } = null;
-    public ViewModel ViewModel { get { return this.DataContext; } }
+    private ViewModel _vm;
+
+    public ViewModel VM { get { return this._vm; } }
+    public ViewModel ViewModel { get { return this._vm; } }
 
     public MainWindow()
     {
-        Application_SetResources("Resources.xaml");
+        this._vm = new ViewModel();
+        this.DataContext = this._vm;
         this.InitializeComponent();
-
-        this.DataContext = new ViewModel();
-        this.SetDataContext<ViewModel>(this.DataContext);
+        BindingEngine.Flush();
     }
 
     public void OnInitialized()
@@ -90,26 +122,35 @@ public partial class MainWindow
 
     public void SubmitLogin()
     {
-        this.DataContext.Login(this.PassBox);
+        if (this.VM != null)
+        {
+            this.VM.Login(this.PassBox);
+        }
     }
 
     public bool LoginWithPassword(string password)
     {
-        return this.DataContext.CheckCredentials(password);
+        return this.VM != null ? this.VM.CheckCredentials(password) : false;
     }
 
     public void ClearCredentials()
     {
-        if (this.DataContext != null)
+        if (this.VM != null)
         {
-            this.DataContext.Reset();
+            this.VM.Reset();
         }
-        PasswordBox_ClearPassword(this.PassBox);
-        UIElement_Focus(this.UserBox);
+        if (this.PassBox != null)
+        {
+            this.PassBox.Password = "";
+        }
+        if (this.UserBox != null)
+        {
+            this.UserBox.Focus();
+        }
     }
 }
 
-public MainWindow CreateMainWindow()
+public static MainWindow CreateMainWindow()
 {
     return new MainWindow();
 }

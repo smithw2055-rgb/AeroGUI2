@@ -1,6 +1,0 @@
-<Class Name="StartMenu" Namespace="Menu3D">
-  <Property Name="Description" Type="Object" SubType="Menu3D.MenuDescription"/>
-  <Property Name="StartCasual" Type="Command"/>
-  <Property Name="StartNormal" Type="Command"/>
-  <Property Name="StartExpert" Type="Command"/>
-</Class>

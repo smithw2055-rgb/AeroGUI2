@@ -9,12 +9,43 @@ public enum FlowDirection
 }
 
 [Observable]
-public class Language
+public class Language : ObservableObject
 {
-    public string Name { get; set; } = "";
-    public string Source { get; set; } = "";
-    public string Flag { get; set; } = "";
-    public FlowDirection FlowDirection { get; set; } = FlowDirection.LeftToRight;
+    private string _name = "";
+    private string _source = "";
+    private string _flag = "";
+    private FlowDirection _flowDirection = FlowDirection.LeftToRight;
+
+    public string Name
+    {
+        get { return this._name; }
+        set { this.SetProperty(ref this._name, value, "Name"); }
+    }
+
+    public string Source
+    {
+        get { return this._source; }
+        set { this.SetProperty(ref this._source, value, "Source"); }
+    }
+
+    public string Flag
+    {
+        get { return this._flag; }
+        set { this.SetProperty(ref this._flag, value, "Flag"); }
+    }
+
+    public FlowDirection FlowDirection
+    {
+        get { return this._flowDirection; }
+        set
+        {
+            if (this._flowDirection != value)
+            {
+                this._flowDirection = value;
+                this.NotifyPropertyChanged("FlowDirection");
+            }
+        }
+    }
 
     public Language()
     {
@@ -22,22 +53,41 @@ public class Language
 
     public Language(string name, string source, string flag, FlowDirection flow)
     {
-        this.Name = name;
-        this.Source = source;
-        this.Flag = flag;
-        this.FlowDirection = flow;
+        this._name = name == null ? "" : name;
+        this._source = source == null ? "" : source;
+        this._flag = flag == null ? "" : flag;
+        this._flowDirection = flow;
     }
 }
 
 [Observable]
-public class ViewModel
+public class ViewModel : ViewModelBase
 {
     private Language _selectedLanguage = null;
+    private int _level = 1;
+    private float _soundLevel = 100.0f;
+    private float _musicLevel = 70.0f;
+    private ObservableList<Language> _languages;
 
-    public ObservableList<Language> Languages { get; set; }
-    public int Level { get; set; } = 1;
-    public float SoundLevel { get; set; } = 100.0f;
-    public float MusicLevel { get; set; } = 70.0f;
+    public ObservableList<Language> Languages { get { return this._languages; } }
+
+    public int Level
+    {
+        get { return this._level; }
+        set { this.SetProperty(ref this._level, value, "Level"); }
+    }
+
+    public float SoundLevel
+    {
+        get { return this._soundLevel; }
+        set { this.SetProperty(ref this._soundLevel, value, "SoundLevel"); }
+    }
+
+    public float MusicLevel
+    {
+        get { return this._musicLevel; }
+        set { this.SetProperty(ref this._musicLevel, value, "MusicLevel"); }
+    }
 
     public Language SelectedLanguage
     {
@@ -47,26 +97,23 @@ public class ViewModel
             if (this._selectedLanguage != value && value != null)
             {
                 this._selectedLanguage = value;
-                if (value.Source != null && value.Source != "")
-                {
-                    Application_ApplyDictionary(value.Source);
-                }
+                this.NotifyPropertyChanged("SelectedLanguage");
             }
         }
     }
 
     public ViewModel()
     {
-        this.Languages = new ObservableList<Language>(4);
-        this.Languages.Add(new Language("English", "Language-en.xaml", "Flag-en.png", FlowDirection.LeftToRight));
-        this.Languages.Add(new Language("Français", "Language-fr.xaml", "Flag-fr.png", FlowDirection.LeftToRight));
-        this.Languages.Add(new Language("日本語", "Language-jp.xaml", "Flag-jp.png", FlowDirection.LeftToRight));
-        this.Languages.Add(new Language("عربي", "Language-ar.xaml", "Flag-ar.png", FlowDirection.RightToLeft));
+        this._languages = new ObservableList<Language>();
+        this._languages.Add(new Language("English", "Language-en.xaml", "Flag-en.png", FlowDirection.LeftToRight));
+        this._languages.Add(new Language("Français", "Language-fr.xaml", "Flag-fr.png", FlowDirection.LeftToRight));
+        this._languages.Add(new Language("日本語", "Language-jp.xaml", "Flag-jp.png", FlowDirection.LeftToRight));
+        this._languages.Add(new Language("عربي", "Language-ar.xaml", "Flag-ar.png", FlowDirection.RightToLeft));
 
-        this._selectedLanguage = this.Languages.Get(0);
-        this.Level = 1;
-        this.SoundLevel = 100.0f;
-        this.MusicLevel = 70.0f;
+        this._selectedLanguage = this._languages.Get(0);
+        this._level = 1;
+        this._soundLevel = 100.0f;
+        this._musicLevel = 70.0f;
     }
 
     public void SelectLanguageByIndex(int index)
@@ -121,20 +168,19 @@ public class ViewModel
     }
 }
 
-[Observable]
-public partial class MainWindow
+public partial class MainWindow : Page
 {
-    public ViewModel DataContext { get; set; } = null;
-    public ViewModel ViewModel { get { return this.DataContext; } }
+    private ViewModel _vm;
+
+    public ViewModel VM { get { return this._vm; } }
+    public ViewModel ViewModel { get { return this._vm; } }
 
     public MainWindow()
     {
-        Application_SetResources("Resources.xaml");
-        this.LoadResources("Language-en.xaml");
+        this._vm = new ViewModel();
+        this.DataContext = this._vm;
         this.InitializeComponent();
-
-        this.DataContext = new ViewModel();
-        this.SetDataContext<ViewModel>(this.DataContext);
+        BindingEngine.Flush();
     }
 
     public void OnInitialized()
@@ -143,59 +189,59 @@ public partial class MainWindow
 
     public void SelectLanguageByIndex(int index)
     {
-        if (this.DataContext != null)
+        if (this.VM != null)
         {
-            this.DataContext.SelectLanguageByIndex(index);
+            this.VM.SelectLanguageByIndex(index);
         }
     }
 
     public void SelectLanguage(Language language)
     {
-        if (this.DataContext != null)
+        if (this.VM != null)
         {
-            this.DataContext.SelectLanguage(language);
+            this.VM.SelectLanguage(language);
         }
     }
 
     public void NextLanguage()
     {
-        if (this.DataContext != null)
+        if (this.VM != null)
         {
-            this.DataContext.NextLanguage();
+            this.VM.NextLanguage();
         }
     }
 
     public void LevelUp()
     {
-        if (this.DataContext != null)
+        if (this.VM != null)
         {
-            this.DataContext.LevelUp();
+            this.VM.LevelUp();
         }
     }
 
     public void SetSoundLevel(float level)
     {
-        if (this.DataContext != null)
+        if (this.VM != null)
         {
-            this.DataContext.SetSound(level);
+            this.VM.SetSound(level);
         }
     }
 
     public void SetMusicLevel(float level)
     {
-        if (this.DataContext != null)
+        if (this.VM != null)
         {
-            this.DataContext.SetMusic(level);
+            this.VM.SetMusic(level);
         }
     }
 
     public void PlayIntro()
     {
-        Storyboard_Begin(this.__nativeRootHandle, "Intro");
+        this.BeginStoryboard("Intro");
     }
 }
 
-public MainWindow CreateMainWindow()
+public static MainWindow CreateMainWindow()
 {
     return new MainWindow();
 }

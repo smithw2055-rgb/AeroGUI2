@@ -10,11 +10,29 @@ public enum Platform
 }
 
 [Observable]
-public class MenuDescription
+public class MenuDescription : ObservableObject
 {
-    public string Description { get; set; } = "";
-    public string AcceptText { get; set; } = "";
-    public string CancelText { get; set; } = "";
+    private string _description = "";
+    private string _acceptText = "";
+    private string _cancelText = "";
+
+    public string Description
+    {
+        get { return this._description; }
+        set { this.SetProperty(ref this._description, value, "Description"); }
+    }
+
+    public string AcceptText
+    {
+        get { return this._acceptText; }
+        set { this.SetProperty(ref this._acceptText, value, "AcceptText"); }
+    }
+
+    public string CancelText
+    {
+        get { return this._cancelText; }
+        set { this.SetProperty(ref this._cancelText, value, "CancelText"); }
+    }
 
     public MenuDescription()
     {
@@ -22,120 +40,275 @@ public class MenuDescription
 
     public MenuDescription(string desc, string accept, string cancel)
     {
-        this.Description = desc;
-        this.AcceptText = accept;
-        this.CancelText = cancel;
+        this._description = desc == null ? "" : desc;
+        this._acceptText = accept == null ? "" : accept;
+        this._cancelText = cancel == null ? "" : cancel;
     }
 }
 
 [Observable]
-public class MainMenu
+public class MainMenu : ObservableObject
 {
     private DelegateCommand _exit;
+    private MenuDescription _description;
+    private ViewModel _owner = null;
 
-    public MenuDescription Description { get; set; }
+    public MenuDescription Description
+    {
+        get { return this._description; }
+        set
+        {
+            if (this._description != value)
+            {
+                this._description = value;
+                this.NotifyPropertyChanged("Description");
+            }
+        }
+    }
+
     public DelegateCommand Exit { get { return this._exit; } }
-    public ViewModel Owner { get; set; } = null;
+
+    public ViewModel Owner
+    {
+        get { return this._owner; }
+        set
+        {
+            if (this._owner != value)
+            {
+                this._owner = value;
+                this.NotifyPropertyChanged("Owner");
+            }
+        }
+    }
 
     public MainMenu()
     {
-        this.Description = new MenuDescription("MAIN MENU", "ACCEPT", "EXIT");
-        this._exit = new DelegateCommand(this.OnExit);
+        this._description = new MenuDescription("MAIN MENU", "ACCEPT", "EXIT");
+        this._exit = new DelegateCommand(() => { this.OnExit(); });
     }
 
     public void OnExit()
     {
-        if (this.Owner != null)
+        if (this._owner != null)
         {
-            this.Owner.OnExit();
+            this._owner.OnExit();
         }
     }
 }
 
 [Observable]
-public class StartMenu
+public class StartMenu : ObservableObject
 {
     private DelegateCommand _startCasual;
     private DelegateCommand _startNormal;
     private DelegateCommand _startExpert;
+    private MenuDescription _description;
+    private ViewModel _owner = null;
 
-    public MenuDescription Description { get; set; }
+    public MenuDescription Description
+    {
+        get { return this._description; }
+        set
+        {
+            if (this._description != value)
+            {
+                this._description = value;
+                this.NotifyPropertyChanged("Description");
+            }
+        }
+    }
+
     public DelegateCommand StartCasual { get { return this._startCasual; } }
     public DelegateCommand StartNormal { get { return this._startNormal; } }
     public DelegateCommand StartExpert { get { return this._startExpert; } }
-    public ViewModel Owner { get; set; } = null;
+
+    public ViewModel Owner
+    {
+        get { return this._owner; }
+        set
+        {
+            if (this._owner != value)
+            {
+                this._owner = value;
+                this.NotifyPropertyChanged("Owner");
+            }
+        }
+    }
 
     public StartMenu()
     {
-        this.Description = new MenuDescription("SELECT DIFFICULTY", "ACCEPT", "BACK");
-        this._startCasual = new DelegateCommand(this.OnStartCasual);
-        this._startNormal = new DelegateCommand(this.OnStartNormal);
-        this._startExpert = new DelegateCommand(this.OnStartExpert);
+        this._description = new MenuDescription("SELECT DIFFICULTY", "ACCEPT", "BACK");
+        this._startCasual = new DelegateCommand(() => { this.OnStartCasual(); });
+        this._startNormal = new DelegateCommand(() => { this.OnStartNormal(); });
+        this._startExpert = new DelegateCommand(() => { this.OnStartExpert(); });
     }
 
     public void OnStartCasual()
     {
-        if (this.Owner != null)
+        if (this._owner != null)
         {
-            this.Owner.OnStartCasual();
+            this._owner.OnStartCasual();
         }
     }
 
     public void OnStartNormal()
     {
-        if (this.Owner != null)
+        if (this._owner != null)
         {
-            this.Owner.OnStartNormal();
+            this._owner.OnStartNormal();
         }
     }
 
     public void OnStartExpert()
     {
-        if (this.Owner != null)
+        if (this._owner != null)
         {
-            this.Owner.OnStartExpert();
+            this._owner.OnStartExpert();
         }
     }
 }
 
 [Observable]
-public class SettingsMenu
+public class SettingsMenu : ObservableObject
 {
-    public MenuDescription Description { get; set; }
-    public ViewModel Owner { get; set; } = null;
-    public int TextureDetailIndex { get; set; } = 1;
-    public bool AntiAliasing { get; set; } = false;
-    public int SoundVolume { get; set; } = 5;
-    public int VideoResolutionIndex { get; set; } = 2;
-    public int GammaCorrection { get; set; } = 5;
-    public bool Subtitles { get; set; } = false;
+    private MenuDescription _description;
+    private ViewModel _owner = null;
+    private int _textureDetailIndex = 1;
+    private bool _antiAliasing = false;
+    private int _soundVolume = 5;
+    private int _videoResolutionIndex = 2;
+    private int _gammaCorrection = 5;
+    private bool _subtitles = false;
+
+    public MenuDescription Description
+    {
+        get { return this._description; }
+        set
+        {
+            if (this._description != value)
+            {
+                this._description = value;
+                this.NotifyPropertyChanged("Description");
+            }
+        }
+    }
+
+    public ViewModel Owner
+    {
+        get { return this._owner; }
+        set
+        {
+            if (this._owner != value)
+            {
+                this._owner = value;
+                this.NotifyPropertyChanged("Owner");
+            }
+        }
+    }
+
+    public int TextureDetailIndex
+    {
+        get { return this._textureDetailIndex; }
+        set { this.SetProperty(ref this._textureDetailIndex, value, "TextureDetailIndex"); }
+    }
+
+    public bool AntiAliasing
+    {
+        get { return this._antiAliasing; }
+        set { this.SetProperty(ref this._antiAliasing, value, "AntiAliasing"); }
+    }
+
+    public int SoundVolume
+    {
+        get { return this._soundVolume; }
+        set { this.SetProperty(ref this._soundVolume, value, "SoundVolume"); }
+    }
+
+    public int VideoResolutionIndex
+    {
+        get { return this._videoResolutionIndex; }
+        set { this.SetProperty(ref this._videoResolutionIndex, value, "VideoResolutionIndex"); }
+    }
+
+    public int GammaCorrection
+    {
+        get { return this._gammaCorrection; }
+        set { this.SetProperty(ref this._gammaCorrection, value, "GammaCorrection"); }
+    }
+
+    public bool Subtitles
+    {
+        get { return this._subtitles; }
+        set { this.SetProperty(ref this._subtitles, value, "Subtitles"); }
+    }
 
     public SettingsMenu()
     {
-        this.Description = new MenuDescription("SETTINGS", "ACCEPT", "BACK");
+        this._description = new MenuDescription("SETTINGS", "ACCEPT", "BACK");
     }
 }
 
 [Observable]
-public class ViewModel
+public class ViewModel : ViewModelBase
 {
-    public MainMenu MainMenu { get; set; }
-    public StartMenu StartMenu { get; set; }
-    public SettingsMenu SettingsMenu { get; set; }
-    public Platform Platform { get; set; } = Platform.PC;
-    public string CurrentDifficulty { get; set; } = "";
-    public string ActiveMenu { get; set; } = "Main";
-    public bool Exited { get; set; } = false;
-    public int StartCount { get; set; } = 0;
+    private Platform _platform = Platform.PC;
+    private string _currentDifficulty = "";
+    private string _activeMenu = "Main";
+    private bool _exited = false;
+    private int _startCount = 0;
+    private MainMenu _mainMenu;
+    private StartMenu _startMenu;
+    private SettingsMenu _settingsMenu;
+
+    public MainMenu MainMenu { get { return this._mainMenu; } }
+    public StartMenu StartMenu { get { return this._startMenu; } }
+    public SettingsMenu SettingsMenu { get { return this._settingsMenu; } }
+
+    public Platform Platform
+    {
+        get { return this._platform; }
+        set
+        {
+            if (this._platform != value)
+            {
+                this._platform = value;
+                this.NotifyPropertyChanged("Platform");
+            }
+        }
+    }
+
+    public string CurrentDifficulty
+    {
+        get { return this._currentDifficulty; }
+        set { this.SetProperty(ref this._currentDifficulty, value, "CurrentDifficulty"); }
+    }
+
+    public string ActiveMenu
+    {
+        get { return this._activeMenu; }
+        set { this.SetProperty(ref this._activeMenu, value, "ActiveMenu"); }
+    }
+
+    public bool Exited
+    {
+        get { return this._exited; }
+        set { this.SetProperty(ref this._exited, value, "Exited"); }
+    }
+
+    public int StartCount
+    {
+        get { return this._startCount; }
+        set { this.SetProperty(ref this._startCount, value, "StartCount"); }
+    }
 
     public ViewModel()
     {
-        this.MainMenu = new MainMenu();
-        this.StartMenu = new StartMenu();
-        this.SettingsMenu = new SettingsMenu();
-        this.MainMenu.Owner = this;
-        this.StartMenu.Owner = this;
-        this.SettingsMenu.Owner = this;
+        this._mainMenu = new MainMenu();
+        this._startMenu = new StartMenu();
+        this._settingsMenu = new SettingsMenu();
+        this._mainMenu.Owner = this;
+        this._startMenu.Owner = this;
+        this._settingsMenu.Owner = this;
     }
 
     public void OnExit()
@@ -172,19 +345,19 @@ public class ViewModel
     }
 }
 
-[Observable]
-public partial class MainWindow
+public partial class MainWindow : Page
 {
-    public ViewModel DataContext { get; set; } = null;
-    public ViewModel ViewModel { get { return this.DataContext; } }
+    private ViewModel _vm;
+
+    public ViewModel VM { get { return this._vm; } }
+    public ViewModel ViewModel { get { return this._vm; } }
 
     public MainWindow()
     {
-        Application_SetResources("Resources.xaml");
+        this._vm = new ViewModel();
+        this.DataContext = this._vm;
         this.InitializeComponent();
-
-        this.DataContext = new ViewModel();
-        this.SetDataContext<ViewModel>(this.DataContext);
+        BindingEngine.Flush();
     }
 
     public void OnInitialized()
@@ -193,46 +366,46 @@ public partial class MainWindow
 
     public void NavigateToMain()
     {
-        this.DataContext.SetActiveMenu("Main");
+        if (this.VM != null) { this.VM.SetActiveMenu("Main"); }
     }
 
     public void NavigateToStart()
     {
-        this.DataContext.SetActiveMenu("Start");
+        if (this.VM != null) { this.VM.SetActiveMenu("Start"); }
     }
 
     public void NavigateToSettings()
     {
-        this.DataContext.SetActiveMenu("Settings");
+        if (this.VM != null) { this.VM.SetActiveMenu("Settings"); }
     }
 
     public void SetPlatform(Platform platform)
     {
-        this.DataContext.SetPlatform(platform);
+        if (this.VM != null) { this.VM.SetPlatform(platform); }
     }
 
     public void StartCasual()
     {
-        this.DataContext.StartMenu.StartCasual.Execute();
+        if (this.VM != null) { this.VM.StartMenu.StartCasual.Execute(null); }
     }
 
     public void StartNormal()
     {
-        this.DataContext.StartMenu.StartNormal.Execute();
+        if (this.VM != null) { this.VM.StartMenu.StartNormal.Execute(null); }
     }
 
     public void StartExpert()
     {
-        this.DataContext.StartMenu.StartExpert.Execute();
+        if (this.VM != null) { this.VM.StartMenu.StartExpert.Execute(null); }
     }
 
     public void Exit()
     {
-        this.DataContext.MainMenu.Exit.Execute();
+        if (this.VM != null) { this.VM.MainMenu.Exit.Execute(null); }
     }
 }
 
-public MainWindow CreateMainWindow()
+public static MainWindow CreateMainWindow()
 {
     return new MainWindow();
 }

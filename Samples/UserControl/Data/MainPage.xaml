@@ -11,6 +11,9 @@
 
   <Page.Resources>
     <ResourceDictionary>
+      <ResourceDictionary.MergedDictionaries>
+        <ResourceDictionary Source="Resources.xaml"/>
+      </ResourceDictionary.MergedDictionaries>
       <Storyboard x:Key="UserControl.Anim.Loaded">
         <DoubleAnimationUsingKeyFrames Storyboard.TargetName="BarStr" Storyboard.TargetProperty="Value">
           <EasingDoubleKeyFrame KeyTime="0:0:0.4" Value="{Binding Value, ElementName=StatStr}">

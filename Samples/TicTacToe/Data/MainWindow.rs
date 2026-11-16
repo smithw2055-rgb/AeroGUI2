@@ -19,55 +19,98 @@ public enum State
 }
 
 [Observable]
-public class ViewModel
+public class ViewModel : ViewModelBase
 {
     private DelegateCommand _startCommand;
     private DelegateCommand _checkCommand;
+    private State _state = State.Player1;
+    private int _scorePlayer1 = 0;
+    private int _scorePlayer2 = 0;
+    private int _scoreTies = 0;
+    private int _scoreHalf = 0;
+    private int _cell0 = 0;
+    private int _cell1 = 0;
+    private int _cell2 = 0;
+    private int _cell3 = 0;
+    private int _cell4 = 0;
+    private int _cell5 = 0;
+    private int _cell6 = 0;
+    private int _cell7 = 0;
+    private int _cell8 = 0;
 
     public DelegateCommand StartCommand { get { return this._startCommand; } }
     public DelegateCommand CheckCommand { get { return this._checkCommand; } }
 
-    public State State { get; set; } = State.Player1;
-    public int ScorePlayer1 { get; set; } = 0;
-    public int ScorePlayer2 { get; set; } = 0;
-    public int ScoreTies { get; set; } = 0;
-    public int ScoreHalf { get; set; } = 0;
+    public State State
+    {
+        get { return this._state; }
+        set
+        {
+            if (this._state != value)
+            {
+                this._state = value;
+                this.NotifyPropertyChanged("State");
+            }
+        }
+    }
 
-    public int Cell0 { get; set; } = 0;
-    public int Cell1 { get; set; } = 0;
-    public int Cell2 { get; set; } = 0;
-    public int Cell3 { get; set; } = 0;
-    public int Cell4 { get; set; } = 0;
-    public int Cell5 { get; set; } = 0;
-    public int Cell6 { get; set; } = 0;
-    public int Cell7 { get; set; } = 0;
-    public int Cell8 { get; set; } = 0;
+    public int ScorePlayer1
+    {
+        get { return this._scorePlayer1; }
+        set { this.SetProperty(ref this._scorePlayer1, value, "ScorePlayer1"); }
+    }
+
+    public int ScorePlayer2
+    {
+        get { return this._scorePlayer2; }
+        set { this.SetProperty(ref this._scorePlayer2, value, "ScorePlayer2"); }
+    }
+
+    public int ScoreTies
+    {
+        get { return this._scoreTies; }
+        set { this.SetProperty(ref this._scoreTies, value, "ScoreTies"); }
+    }
+
+    public int ScoreHalf
+    {
+        get { return this._scoreHalf; }
+        set { this.SetProperty(ref this._scoreHalf, value, "ScoreHalf"); }
+    }
+
+    public int Cell0 { get { return this._cell0; } set { this.SetProperty(ref this._cell0, value, "Cell0"); } }
+    public int Cell1 { get { return this._cell1; } set { this.SetProperty(ref this._cell1, value, "Cell1"); } }
+    public int Cell2 { get { return this._cell2; } set { this.SetProperty(ref this._cell2, value, "Cell2"); } }
+    public int Cell3 { get { return this._cell3; } set { this.SetProperty(ref this._cell3, value, "Cell3"); } }
+    public int Cell4 { get { return this._cell4; } set { this.SetProperty(ref this._cell4, value, "Cell4"); } }
+    public int Cell5 { get { return this._cell5; } set { this.SetProperty(ref this._cell5, value, "Cell5"); } }
+    public int Cell6 { get { return this._cell6; } set { this.SetProperty(ref this._cell6, value, "Cell6"); } }
+    public int Cell7 { get { return this._cell7; } set { this.SetProperty(ref this._cell7, value, "Cell7"); } }
+    public int Cell8 { get { return this._cell8; } set { this.SetProperty(ref this._cell8, value, "Cell8"); } }
 
     public ViewModel()
     {
-        this._startCommand = new DelegateCommand();
-        this._checkCommand = new DelegateCommand();
-        this._startCommand.SetExecuteFunc(this.OnStart);
-        this._checkCommand.SetExecuteFunc(this.OnCheck);
+        this._startCommand = new DelegateCommand(() => { this.OnStart(); });
+        this._checkCommand = new DelegateCommand((object param) => { this.OnCheckParam(param); });
 
-        this.ScorePlayer1 = 0;
-        this.ScorePlayer2 = 0;
-        this.ScoreTies = 0;
-        this.ScoreHalf = 0;
+        this._scorePlayer1 = 0;
+        this._scorePlayer2 = 0;
+        this._scoreTies = 0;
+        this._scoreHalf = 0;
         this.Start();
     }
 
     public int GetCell(int index)
     {
-        if (index == 0) { return this.Cell0; }
-        if (index == 1) { return this.Cell1; }
-        if (index == 2) { return this.Cell2; }
-        if (index == 3) { return this.Cell3; }
-        if (index == 4) { return this.Cell4; }
-        if (index == 5) { return this.Cell5; }
-        if (index == 6) { return this.Cell6; }
-        if (index == 7) { return this.Cell7; }
-        if (index == 8) { return this.Cell8; }
+        if (index == 0) { return this._cell0; }
+        if (index == 1) { return this._cell1; }
+        if (index == 2) { return this._cell2; }
+        if (index == 3) { return this._cell3; }
+        if (index == 4) { return this._cell4; }
+        if (index == 5) { return this._cell5; }
+        if (index == 6) { return this._cell6; }
+        if (index == 7) { return this._cell7; }
+        if (index == 8) { return this._cell8; }
         return 0;
     }
 
@@ -103,6 +146,41 @@ public class ViewModel
 
         int numGames = this.ScorePlayer1 + this.ScorePlayer2 + this.ScoreTies;
         this.State = (numGames % 2 == 0) ? State.Player1 : State.Player2;
+    }
+
+    private void OnCheckParam(object param)
+    {
+        int index = -1;
+        if (param is BoxedInt)
+        {
+            var bi = (BoxedInt)param;
+            index = bi.Value;
+        }
+        else if (param is BoxedFloat)
+        {
+            var bf = (BoxedFloat)param;
+            index = (int)bf.Value;
+        }
+        else if (param is BoxedString)
+        {
+            var bs = (BoxedString)param;
+            string s = bs.Value;
+            if (s == "0") { index = 0; }
+            else if (s == "1") { index = 1; }
+            else if (s == "2") { index = 2; }
+            else if (s == "3") { index = 3; }
+            else if (s == "4") { index = 4; }
+            else if (s == "5") { index = 5; }
+            else if (s == "6") { index = 6; }
+            else if (s == "7") { index = 7; }
+            else if (s == "8") { index = 8; }
+        }
+        else
+        {
+            var dep = param as DependencyObject;
+            index = DependencyObject.UnboxInt(dep, -1);
+        }
+        this.OnCheck(index);
     }
 
     public void OnCheck(int index)
@@ -224,19 +302,19 @@ public class ViewModel
     }
 }
 
-[Observable]
-public partial class MainWindow
+public partial class MainWindow : Page
 {
-    public ViewModel DataContext { get; set; } = null;
-    public ViewModel ViewModel { get { return this.DataContext; } }
+    private ViewModel _vm;
+
+    public ViewModel VM { get { return this._vm; } }
+    public ViewModel ViewModel { get { return this._vm; } }
 
     public MainWindow()
     {
-        Application_SetResources("Resources.xaml");
+        this._vm = new ViewModel();
+        this.DataContext = this._vm;
         this.InitializeComponent();
-
-        this.DataContext = new ViewModel();
-        this.SetDataContext<ViewModel>(this.DataContext);
+        BindingEngine.Flush();
     }
 
     public void OnInitialized()
@@ -244,7 +322,7 @@ public partial class MainWindow
     }
 }
 
-public MainWindow CreateMainWindow()
+public static MainWindow CreateMainWindow()
 {
     return new MainWindow();
 }

@@ -1,4 +1,0 @@
-<Class Name="MainMenu" Namespace="Menu3D">
-  <Property Name="Description" Type="Object" SubType="Menu3D.MenuDescription"/>
-  <Property Name="Exit" Type="Command"/>
-</Class>
