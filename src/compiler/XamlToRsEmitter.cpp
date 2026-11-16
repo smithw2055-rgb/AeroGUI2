@@ -369,6 +369,9 @@ struct XamlNode final {
         if (s.find("BorderBrush") != std::string_view::npos) return "BorderBrush.Color";
         return "Background.Color";
     }
+    if (s.find("Brush.Opacity") != std::string_view::npos) {
+        return "Opacity";
+    }
     if (s.find("BlurEffect.Radius") != std::string_view::npos || s == "Radius" || s == "BlurRadius") {
         return "EffectRadius";
     }
@@ -2501,6 +2504,9 @@ private:
                 if (const auto* p0 = ext.FindPositional(0)) {
                     return EscapeRsString(p0->literal);
                 }
+                if (const auto* rk = ext.FindNamed("ResourceKey")) {
+                    return EscapeRsString(rk->literal);
+                }
             }
             if (ext.kind == MarkupExtensionKind::EscapedLiteral) {
                 return EscapeRsString(ext.literalValue);
@@ -2733,6 +2739,7 @@ private:
         if (aero::str::EndsWith(propName, "Text.Placeholder")) {
             propName = "Placeholder";
         }
+        std::string ownedRawVal;
         if (LooksLikeMarkupExtension(rawVal)) {
             const auto ext = ParseMarkupExtension(rawVal);
             if (!ext.IsOk()) {
@@ -2740,7 +2747,8 @@ private:
                 return;
             }
             if (ext.kind == MarkupExtensionKind::EscapedLiteral) {
-                rawVal = ext.literalValue;
+                ownedRawVal = ext.literalValue;
+                rawVal = ownedRawVal;
             } else if (ext.kind == MarkupExtensionKind::Binding ||
                        ext.kind == MarkupExtensionKind::TemplateBinding ||
                        ext.kind == MarkupExtensionKind::MultiBinding) {
@@ -2800,14 +2808,20 @@ private:
                 }
                 return;
             } else if (ext.kind == MarkupExtensionKind::XType) {
-                rawVal = StripTargetTypeName(rawVal);
+                ownedRawVal = StripTargetTypeName(rawVal);
+                rawVal = ownedRawVal;
             } else if (ext.kind == MarkupExtensionKind::XStatic) {
                 if (const auto* k = ext.FindPositional(0)) {
-                    rawVal = k->literal;
+                    ownedRawVal = k->literal;
+                    rawVal = ownedRawVal;
                 }
             } else if (ext.kind == MarkupExtensionKind::NoesisLoc) {
                 if (const auto* k = ext.FindPositional(0)) {
-                    rawVal = k->literal;
+                    ownedRawVal = k->literal;
+                    rawVal = ownedRawVal;
+                } else if (const auto* rk = ext.FindNamed("ResourceKey")) {
+                    ownedRawVal = rk->literal;
+                    rawVal = ownedRawVal;
                 }
             }
         }
@@ -3370,6 +3384,12 @@ private:
                 Indent(out, indent);
                 out << targetVar << ".Text = " << EscapeRsString(node.textContent) << ";\n";
             }
+            return;
+        }
+        if ((resolvedTypeName == "Path" || resolvedTypeName == "Geometry") &&
+            !node.textContent.empty() && node.FindAttribute("Data") == nullptr) {
+            Indent(out, indent);
+            out << targetVar << ".Data = " << EscapeRsString(aero::str::Trim(node.textContent)) << ";\n";
             return;
         }
 

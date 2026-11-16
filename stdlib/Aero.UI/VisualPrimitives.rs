@@ -554,6 +554,12 @@ public class Path : Shape {
     protected override string BuildVectorGeometrySpec() { return _data; }
 }
 
+public class Geometry : Path {
+    public Geometry() : base() { Stretch = Stretch.Uniform; }
+    public Geometry(string svgPath) : base(svgPath) { Stretch = Stretch.Uniform; }
+    public override string GetTypeName() { return "Geometry"; }
+}
+
 public class PolyShapeBase : Shape {
     private Point[] _points;
 

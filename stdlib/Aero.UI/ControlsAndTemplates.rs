@@ -332,6 +332,32 @@ public class ContentPresenter : FrameworkElement {
 
     public override string GetTypeName() { return "ContentPresenter"; }
 
+    public Brush Foreground {
+        get { return _foreground; }
+        set { _foreground = value; if (_textView != null) { _textView.Foreground = value; } }
+    }
+    public string FontFamily {
+        get { return _fontFamily; }
+        set {
+            _fontFamily = value == null ? "Segoe UI" : value;
+            if (_textView != null) { _textView.FontFamily = _fontFamily; }
+        }
+    }
+    public float FontSize {
+        get { return _fontSize; }
+        set {
+            _fontSize = value > 0.0f ? value : 14.0f;
+            if (_textView != null) { _textView.FontSize = _fontSize; }
+        }
+    }
+    public string FontWeight {
+        get { return _fontWeight; }
+        set {
+            _fontWeight = value == null ? "Normal" : value;
+            if (_textView != null) { _textView.FontWeight = _fontWeight; }
+        }
+    }
+
     public object Content {
         get { return DependencyObject.Unbox(_contentBox); }
         set { SetContentBox(DependencyObject.BoxObject(value)); }
@@ -420,7 +446,32 @@ public class ContentPresenter : FrameworkElement {
             ContentTemplate = value as DataTemplate;
             return true;
         }
+        if (propName == "Foreground" || propName == "TextElement.Foreground") {
+            Foreground = UIElement.CoerceBrush(value);
+            return true;
+        }
+        if (propName == "FontFamily" || propName == "TextElement.FontFamily") {
+            FontFamily = DependencyObject.UnboxString(value, "Segoe UI");
+            return true;
+        }
+        if (propName == "FontSize" || propName == "TextElement.FontSize") {
+            FontSize = DependencyObject.UnboxFloat(value, 14.0f);
+            return true;
+        }
+        if (propName == "FontWeight" || propName == "TextElement.FontWeight") {
+            FontWeight = DependencyObject.UnboxString(value, "Normal");
+            return true;
+        }
         return base.SetPropertyValue(propName, value);
+    }
+
+    public override DependencyObject GetPropertyValue(string propName) {
+        if (propName == "Content") { return _contentBox; }
+        if (propName == "Foreground" || propName == "TextElement.Foreground") { return _foreground; }
+        if (propName == "FontFamily" || propName == "TextElement.FontFamily") { return DependencyObject.BoxString(_fontFamily); }
+        if (propName == "FontSize" || propName == "TextElement.FontSize") { return DependencyObject.BoxFloat(_fontSize); }
+        if (propName == "FontWeight" || propName == "TextElement.FontWeight") { return DependencyObject.BoxString(_fontWeight); }
+        return base.GetPropertyValue(propName);
     }
 }
 
@@ -506,6 +557,15 @@ public class ContentControl : Control {
         if (propName == "Content") { return _contentBox; }
         return base.GetPropertyValue(propName);
     }
+}
+
+public class Label : ContentControl {
+    public Label() : base() {
+        Padding = new Thickness(4.0f, 2.0f, 4.0f, 2.0f);
+        HorizontalContentAlignment = HorizontalAlignment.Left;
+        VerticalContentAlignment = VerticalAlignment.Center;
+    }
+    public override string GetTypeName() { return "Label"; }
 }
 
 public class HeaderedContentControl : ContentControl {
