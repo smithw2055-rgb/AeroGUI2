@@ -1,10 +1,555 @@
-#include "aero/compiler/AeroCompilerV3.hpp"
+#include "aero/compiler/XmlPullLexer.hpp"
+
+#include <algorithm>
+#include <cctype>
 
 namespace aero {
-namespace detail::v3 {
+namespace {
 
-// Phase-0 placeholder compilation unit for Phase-2 streaming XmlPullLexer.
-void XmlPullLexerPhase0Anchor() noexcept {}
+void AppendUtf8CodePoint(std::uint32_t cp, std::string& out) {
+    if (cp <= 0x7Fu) {
+        out.push_back(static_cast<char>(cp));
+    } else if (cp <= 0x7FFu) {
+        out.push_back(static_cast<char>(0xC0u | (cp >> 6)));
+        out.push_back(static_cast<char>(0x80u | (cp & 0x3Fu)));
+    } else if (cp <= 0xFFFFu) {
+        out.push_back(static_cast<char>(0xE0u | (cp >> 12)));
+        out.push_back(static_cast<char>(0x80u | ((cp >> 6) & 0x3Fu)));
+        out.push_back(static_cast<char>(0x80u | (cp & 0x3Fu)));
+    } else if (cp <= 0x10FFFFu) {
+        out.push_back(static_cast<char>(0xF0u | (cp >> 18)));
+        out.push_back(static_cast<char>(0x80u | ((cp >> 12) & 0x3Fu)));
+        out.push_back(static_cast<char>(0x80u | ((cp >> 6) & 0x3Fu)));
+        out.push_back(static_cast<char>(0x80u | (cp & 0x3Fu)));
+    }
+}
 
-} // namespace detail::v3
+[[nodiscard]] bool IsXmlWhitespace(char ch) noexcept {
+    return ch == ' ' || ch == '\t' || ch == '\r' || ch == '\n';
+}
+
+[[nodiscard]] bool IsXmlNameStartChar(unsigned char ch) noexcept {
+    return std::isalpha(ch) != 0 || ch == '_' || ch == ':' || ch >= 0x80u;
+}
+
+[[nodiscard]] bool IsXmlNameChar(unsigned char ch) noexcept {
+    return IsXmlNameStartChar(ch) || std::isdigit(ch) != 0 || ch == '-' || ch == '.';
+}
+
+void SplitQualifiedName(
+    std::string_view rawName,
+    std::string& outPrefix,
+    std::string& outLocalName) {
+    const std::size_t colon = rawName.find(':');
+    if (colon == std::string_view::npos) {
+        outPrefix.clear();
+        outLocalName = std::string(rawName);
+        return;
+    }
+    outPrefix = std::string(rawName.substr(0, colon));
+    outLocalName = std::string(rawName.substr(colon + 1));
+}
+
+} // namespace
+
+std::string DecodeXmlEntities(std::string_view raw, std::string* outError) {
+    if (raw.find('&') == std::string_view::npos) {
+        return std::string(raw);
+    }
+
+    std::string result;
+    result.reserve(raw.size());
+
+    std::size_t i = 0;
+    while (i < raw.size()) {
+        if (raw[i] != '&') {
+            result.push_back(raw[i]);
+            ++i;
+            continue;
+        }
+
+        const std::size_t semi = raw.find(';', i + 1);
+        if (semi == std::string_view::npos) {
+            if (outError != nullptr && outError->empty()) {
+                *outError = "Unterminated XML character entity reference";
+            }
+            result.push_back(raw[i]);
+            ++i;
+            continue;
+        }
+
+        const std::string_view entity = raw.substr(i + 1, semi - (i + 1));
+        if (entity == "amp") {
+            result.push_back('&');
+        } else if (entity == "lt") {
+            result.push_back('<');
+        } else if (entity == "gt") {
+            result.push_back('>');
+        } else if (entity == "quot") {
+            result.push_back('"');
+        } else if (entity == "apos") {
+            result.push_back('\'');
+        } else if (!entity.empty() && entity[0] == '#') {
+            bool hex = false;
+            std::string_view digits = entity.substr(1);
+            if (!digits.empty() && (digits[0] == 'x' || digits[0] == 'X')) {
+                hex = true;
+                digits.remove_prefix(1);
+            }
+            std::uint32_t cp = 0;
+            bool ok = !digits.empty();
+            for (char ch : digits) {
+                std::uint32_t d = 0;
+                if (ch >= '0' && ch <= '9') {
+                    d = static_cast<std::uint32_t>(ch - '0');
+                } else if (hex && ch >= 'a' && ch <= 'f') {
+                    d = static_cast<std::uint32_t>(10 + (ch - 'a'));
+                } else if (hex && ch >= 'A' && ch <= 'F') {
+                    d = static_cast<std::uint32_t>(10 + (ch - 'A'));
+                } else {
+                    ok = false;
+                    break;
+                }
+                const std::uint32_t base = hex ? 16u : 10u;
+                if (cp > (0x10FFFFu - d) / base) {
+                    ok = false;
+                    break;
+                }
+                cp = cp * base + d;
+            }
+            if (ok && cp > 0u && cp <= 0x10FFFFu) {
+                AppendUtf8CodePoint(cp, result);
+            } else {
+                if (outError != nullptr && outError->empty()) {
+                    *outError = "Invalid numeric XML character reference '&" + std::string(entity) + ";'";
+                }
+                result.append(raw.substr(i, semi - i + 1));
+            }
+        } else {
+            if (outError != nullptr && outError->empty()) {
+                *outError = "Unknown XML entity reference '&" + std::string(entity) + ";'";
+            }
+            result.append(raw.substr(i, semi - i + 1));
+        }
+
+        i = semi + 1;
+    }
+
+    return result;
+}
+
+XmlPullLexer::XmlPullLexer(std::string_view input, bool emitCommentsAndPI)
+    : input_(input), emitCommentsAndPI_(emitCommentsAndPI) {
+    if (input_.size() >= 3 &&
+        static_cast<unsigned char>(input_[0]) == 0xEF &&
+        static_cast<unsigned char>(input_[1]) == 0xBB &&
+        static_cast<unsigned char>(input_[2]) == 0xBF) {
+        pos_ = 3;
+    }
+}
+
+char XmlPullLexer::Peek(std::size_t offset) const noexcept {
+    if (pos_ + offset >= input_.size()) {
+        return '\0';
+    }
+    return input_[pos_ + offset];
+}
+
+bool XmlPullLexer::StartsWith(std::string_view prefix) const noexcept {
+    return pos_ + prefix.size() <= input_.size() &&
+           input_.substr(pos_, prefix.size()) == prefix;
+}
+
+char XmlPullLexer::Advance() noexcept {
+    if (pos_ >= input_.size()) {
+        return '\0';
+    }
+    const char ch = input_[pos_++];
+    if (ch == '\r') {
+        if (pos_ < input_.size() && input_[pos_] == '\n') {
+            ++pos_;
+        }
+        ++line_;
+        column_ = 1;
+        return '\n';
+    }
+    if (ch == '\n') {
+        ++line_;
+        column_ = 1;
+    } else {
+        ++column_;
+    }
+    return ch;
+}
+
+void XmlPullLexer::SkipWhitespace() noexcept {
+    while (!AtEnd() && IsXmlWhitespace(Peek())) {
+        (void)Advance();
+    }
+}
+
+std::string XmlPullLexer::ReadName() {
+    if (AtEnd() || !IsXmlNameStartChar(static_cast<unsigned char>(Peek()))) {
+        return {};
+    }
+    std::string name;
+    while (!AtEnd() && IsXmlNameChar(static_cast<unsigned char>(Peek()))) {
+        name.push_back(Advance());
+    }
+    return name;
+}
+
+std::string XmlPullLexer::ResolveNamespace(std::string_view prefix) const {
+    if (prefix == "xml") {
+        return "http://www.w3.org/XML/1998/namespace";
+    }
+    if (prefix == "xmlns") {
+        return "http://www.w3.org/2000/xmlns/";
+    }
+    const std::string key(prefix);
+    for (auto it = scopeStack_.rbegin(); it != scopeStack_.rend(); ++it) {
+        const auto found = it->xmlnsBindings.find(key);
+        if (found != it->xmlnsBindings.end()) {
+            return found->second;
+        }
+    }
+    return {};
+}
+
+XmlToken XmlPullLexer::MakeError(int line, int col, std::string message) {
+    failed_ = true;
+    XmlToken tok;
+    tok.kind = XmlTokenKind::Error;
+    tok.line = line;
+    tok.column = col;
+    tok.text = std::move(message);
+    return tok;
+}
+
+XmlToken XmlPullLexer::Next() {
+    while (!AtEnd() && !failed_) {
+        if (Peek() == '<') {
+            XmlToken tok = LexLessThan();
+            if (!emitCommentsAndPI_ &&
+                (tok.kind == XmlTokenKind::Comment ||
+                 tok.kind == XmlTokenKind::ProcessingInstruction)) {
+                continue;
+            }
+            return tok;
+        }
+        XmlToken textTok = LexText(line_, column_);
+        if (!textTok.text.empty()) {
+            if (textTok.kind == XmlTokenKind::Text && scopeStack_.empty()) {
+                bool onlyWs = true;
+                for (char ch : textTok.text) {
+                    if (!IsXmlWhitespace(ch)) {
+                        onlyWs = false;
+                        break;
+                    }
+                }
+                if (onlyWs) {
+                    continue;
+                }
+            }
+            return textTok;
+        }
+    }
+
+    XmlToken eof;
+    eof.kind = XmlTokenKind::EndOfFile;
+    eof.line = line_;
+    eof.column = column_;
+    return eof;
+}
+
+std::vector<XmlToken> XmlPullLexer::LexAll() {
+    std::vector<XmlToken> tokens;
+    for (;;) {
+        XmlToken tok = Next();
+        const bool stop = (tok.kind == XmlTokenKind::EndOfFile || tok.kind == XmlTokenKind::Error);
+        tokens.push_back(std::move(tok));
+        if (stop) {
+            break;
+        }
+    }
+    return tokens;
+}
+
+XmlToken XmlPullLexer::LexLessThan() {
+    const int startLine = line_;
+    const int startCol = column_;
+    (void)Advance(); // consume '<'
+
+    if (StartsWith("!--")) {
+        return LexComment(startLine, startCol);
+    }
+    if (StartsWith("![CDATA[")) {
+        return LexCData(startLine, startCol);
+    }
+    if (Peek() == '?') {
+        return LexProcessingInstruction(startLine, startCol);
+    }
+    if (Peek() == '!') {
+        return LexDoctype(startLine, startCol);
+    }
+    if (Peek() == '/') {
+        return LexEndElement(startLine, startCol);
+    }
+    return LexStartElement(startLine, startCol);
+}
+
+XmlToken XmlPullLexer::LexComment(int startLine, int startCol) {
+    pos_ += 3;
+    column_ += 3;
+    std::string text;
+    while (!AtEnd()) {
+        if (StartsWith("-->")) {
+            pos_ += 3;
+            column_ += 3;
+            XmlToken tok;
+            tok.kind = XmlTokenKind::Comment;
+            tok.line = startLine;
+            tok.column = startCol;
+            tok.text = std::move(text);
+            return tok;
+        }
+        text.push_back(Advance());
+    }
+    return MakeError(startLine, startCol, "Unterminated XML comment '<!--'");
+}
+
+XmlToken XmlPullLexer::LexCData(int startLine, int startCol) {
+    pos_ += 8;
+    column_ += 8;
+    std::string text;
+    while (!AtEnd()) {
+        if (StartsWith("]]>")) {
+            pos_ += 3;
+            column_ += 3;
+            XmlToken tok;
+            tok.kind = XmlTokenKind::CData;
+            tok.line = startLine;
+            tok.column = startCol;
+            tok.text = std::move(text);
+            return tok;
+        }
+        text.push_back(Advance());
+    }
+    return MakeError(startLine, startCol, "Unterminated XML CDATA section");
+}
+
+XmlToken XmlPullLexer::LexProcessingInstruction(int startLine, int startCol) {
+    (void)Advance(); // consume '?'
+    std::string target = ReadName();
+    SkipWhitespace();
+    std::string data;
+    while (!AtEnd()) {
+        if (StartsWith("?>")) {
+            pos_ += 2;
+            column_ += 2;
+            XmlToken tok;
+            tok.kind = XmlTokenKind::ProcessingInstruction;
+            tok.rawName = std::move(target);
+            tok.text = std::move(data);
+            tok.line = startLine;
+            tok.column = startCol;
+            return tok;
+        }
+        data.push_back(Advance());
+    }
+    return MakeError(startLine, startCol, "Unterminated XML processing instruction '<?'");
+}
+
+XmlToken XmlPullLexer::LexDoctype(int startLine, int startCol) {
+    (void)Advance(); // consume '!'
+    int depth = 1;
+    char quote = '\0';
+    while (!AtEnd() && depth > 0) {
+        const char ch = Advance();
+        if (quote != '\0') {
+            if (ch == quote) {
+                quote = '\0';
+            }
+            continue;
+        }
+        if (ch == '"' || ch == '\'') {
+            quote = ch;
+        } else if (ch == '<') {
+            ++depth;
+        } else if (ch == '>') {
+            --depth;
+        }
+    }
+    if (depth > 0) {
+        return MakeError(startLine, startCol, "Unterminated XML <!DOCTYPE> declaration");
+    }
+    XmlToken tok;
+    tok.kind = XmlTokenKind::ProcessingInstruction;
+    tok.rawName = "!DOCTYPE";
+    tok.line = startLine;
+    tok.column = startCol;
+    return tok;
+}
+
+XmlToken XmlPullLexer::LexEndElement(int startLine, int startCol) {
+    (void)Advance(); // consume '/'
+    const std::string rawName = ReadName();
+    if (rawName.empty()) {
+        return MakeError(startLine, startCol, "Expected element name after '</'");
+    }
+    SkipWhitespace();
+    if (AtEnd() || Peek() != '>') {
+        return MakeError(line_, column_, "Expected '>' after closing element '</" + rawName + "'");
+    }
+    (void)Advance();
+
+    XmlToken tok;
+    tok.kind = XmlTokenKind::EndElement;
+    tok.rawName = rawName;
+    SplitQualifiedName(rawName, tok.prefix, tok.localName);
+    tok.namespaceUri = ResolveNamespace(tok.prefix);
+    tok.line = startLine;
+    tok.column = startCol;
+
+    if (scopeStack_.empty()) {
+        return MakeError(startLine, startCol, "Unexpected closing element '</" + rawName + ">'");
+    }
+    if (scopeStack_.back().rawName != rawName) {
+        return MakeError(
+            startLine,
+            startCol,
+            "Mismatched closing element '</" + rawName + ">', expected '</" + scopeStack_.back().rawName + ">'");
+    }
+    scopeStack_.pop_back();
+    return tok;
+}
+
+XmlToken XmlPullLexer::LexStartElement(int startLine, int startCol) {
+    const std::string rawName = ReadName();
+    if (rawName.empty()) {
+        return MakeError(startLine, startCol, "Expected element name after '<'");
+    }
+
+    ElementFrame frame;
+    frame.rawName = rawName;
+
+    std::vector<XmlAttribute> attrs;
+    for (;;) {
+        SkipWhitespace();
+        if (AtEnd()) {
+            return MakeError(startLine, startCol, "Unterminated start tag '<" + rawName + "'");
+        }
+        if (StartsWith("/>") || Peek() == '>') {
+            break;
+        }
+
+        const int attrLine = line_;
+        const int attrCol = column_;
+        const std::string attrRawName = ReadName();
+        if (attrRawName.empty()) {
+            return MakeError(attrLine, attrCol, "Expected attribute name inside '<" + rawName + "'");
+        }
+        SkipWhitespace();
+        if (AtEnd() || Peek() != '=') {
+            return MakeError(line_, column_, "Expected '=' after attribute '" + attrRawName + "'");
+        }
+        (void)Advance(); // consume '='
+        SkipWhitespace();
+
+        if (AtEnd() || (Peek() != '"' && Peek() != '\'')) {
+            return MakeError(line_, column_, "Expected quoted value for attribute '" + attrRawName + "'");
+        }
+        const char quote = Advance();
+        std::string rawValue;
+        bool closed = false;
+        while (!AtEnd()) {
+            const char ch = Advance();
+            if (ch == quote) {
+                closed = true;
+                break;
+            }
+            rawValue.push_back(ch);
+        }
+        if (!closed) {
+            return MakeError(attrLine, attrCol, "Unterminated quoted value for attribute '" + attrRawName + "'");
+        }
+
+        std::string entityErr;
+        XmlAttribute attr;
+        attr.rawName = attrRawName;
+        SplitQualifiedName(attrRawName, attr.prefix, attr.localName);
+        attr.value = DecodeXmlEntities(rawValue, &entityErr);
+        attr.line = attrLine;
+        attr.column = attrCol;
+
+        if (!entityErr.empty()) {
+            return MakeError(attrLine, attrCol, entityErr);
+        }
+
+        if (attr.rawName == "xmlns") {
+            attr.isXmlns = true;
+            frame.xmlnsBindings[""] = attr.value;
+        } else if (attr.prefix == "xmlns") {
+            attr.isXmlns = true;
+            frame.xmlnsBindings[attr.localName] = attr.value;
+        }
+
+        attrs.push_back(std::move(attr));
+    }
+
+    bool isEmpty = false;
+    if (StartsWith("/>")) {
+        pos_ += 2;
+        column_ += 2;
+        isEmpty = true;
+    } else if (Peek() == '>') {
+        (void)Advance();
+    } else {
+        return MakeError(startLine, startCol, "Expected '>' closing '<" + rawName + "'");
+    }
+
+    scopeStack_.push_back(std::move(frame));
+
+    XmlToken tok;
+    tok.kind = XmlTokenKind::StartElement;
+    tok.rawName = rawName;
+    SplitQualifiedName(rawName, tok.prefix, tok.localName);
+    tok.namespaceUri = ResolveNamespace(tok.prefix);
+    tok.isEmptyElement = isEmpty;
+    tok.line = startLine;
+    tok.column = startCol;
+
+    for (auto& attr : attrs) {
+        if (!attr.isXmlns && !attr.prefix.empty()) {
+            attr.namespaceUri = ResolveNamespace(attr.prefix);
+        }
+    }
+    tok.attributes = std::move(attrs);
+
+    if (isEmpty) {
+        scopeStack_.pop_back();
+    }
+    return tok;
+}
+
+XmlToken XmlPullLexer::LexText(int startLine, int startCol) {
+    std::string raw;
+    while (!AtEnd() && Peek() != '<') {
+        raw.push_back(Advance());
+    }
+
+    std::string entityErr;
+    std::string decoded = DecodeXmlEntities(raw, &entityErr);
+    if (!entityErr.empty()) {
+        return MakeError(startLine, startCol, entityErr);
+    }
+
+    XmlToken tok;
+    tok.kind = XmlTokenKind::Text;
+    tok.line = startLine;
+    tok.column = startCol;
+    tok.text = std::move(decoded);
+    return tok;
+}
+
 } // namespace aero

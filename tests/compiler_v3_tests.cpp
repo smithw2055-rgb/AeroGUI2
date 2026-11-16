@@ -1,0 +1,1046 @@
+#include <cstdio>
+#include <cstdlib>
+#include <filesystem>
+#include <iostream>
+#include <string>
+#include <string_view>
+#include <unordered_set>
+#include <variant>
+#include <vector>
+
+#include "aero/compiler/AeroCompilerV3.hpp"
+#include "aero/compiler/MarkupExtensionParser.hpp"
+#include "aero/compiler/StdlibModulePack.hpp"
+#include "aero/compiler/XamlToRsEmitter.hpp"
+#include "aero/compiler/XmlPullLexer.hpp"
+#include "realscript/bytecode/Bytecode.h"
+#include "realscript/compiler/Compilation.h"
+#include "realscript/runtime/Runtime.h"
+
+namespace {
+
+using aero::rs_bc::disassembleModule;
+using aero::rs_comp::CompilerSession;
+namespace rs_bc = aero::rs_bc;
+namespace rs_rt = aero::rs_rt;
+
+int gFailureCount = 0;
+
+void Require(bool cond, std::string_view message) {
+    if (!cond) {
+        std::cerr << "[FAIL] " << message << "\n";
+        ++gFailureCount;
+    }
+}
+
+[[nodiscard]] bool ContainsText(std::string_view haystack, std::string_view needle) {
+    return haystack.find(needle) != std::string_view::npos;
+}
+
+[[nodiscard]] bool RealStdlibHasUiClasses(const std::vector<aero::SourceFile>& stdlib) {
+    for (const auto& sf : stdlib) {
+        if (ContainsText(sf.content, "class UIElement")) {
+            return true;
+        }
+    }
+    return false;
+}
+
+[[nodiscard]] aero::SourceFile BuildPreMergeMockAeroUiModule() {
+    aero::SourceFile sf;
+    sf.path = "Mock/Aero.UI.Contract.rs";
+    sf.content = R"RS(
+module Aero.UI;
+
+import Aero.Native;
+
+public delegate void Action();
+public delegate void Action1<T>(T arg);
+public delegate void RoutedEventHandler(object sender, RoutedEventArgs e);
+public delegate void SelectionChangedEventHandler(object sender, SelectionChangedEventArgs e);
+public delegate R Func1<T, R>(T arg);
+
+public class RoutedEventArgs {
+    public bool Handled = false;
+    public RoutedEventArgs() { }
+}
+
+public class SelectionChangedEventArgs : RoutedEventArgs {
+    public int SelectedIndex = -1;
+    public SelectionChangedEventArgs() { }
+}
+
+public class DependencyObject {
+    public DependencyObject() { }
+}
+
+public class Thickness : DependencyObject {
+    public float Left = 0.0f;
+    public float Top = 0.0f;
+    public float Right = 0.0f;
+    public float Bottom = 0.0f;
+    public Thickness(float uniform) { Left = uniform; Top = uniform; Right = uniform; Bottom = uniform; }
+    public Thickness(float l, float t, float r, float b) { Left = l; Top = t; Right = r; Bottom = b; }
+}
+
+public class CornerRadius : DependencyObject {
+    public float TopLeft = 0.0f;
+    public float TopRight = 0.0f;
+    public float BottomRight = 0.0f;
+    public float BottomLeft = 0.0f;
+    public CornerRadius(float uniform) { TopLeft = uniform; TopRight = uniform; BottomRight = uniform; BottomLeft = uniform; }
+    public CornerRadius(float tl, float tr, float br, float bl) { TopLeft = tl; TopRight = tr; BottomRight = br; BottomLeft = bl; }
+}
+
+public class Brush : DependencyObject {
+    public float Opacity = 1.0f;
+    public Brush() { }
+}
+
+public class SolidColorBrush : Brush {
+    public string Color = "#FFFFFFFF";
+    public SolidColorBrush(string color) { Color = color; }
+    public SolidColorBrush(uint rgba) { Color = "#FFFFFFFF"; }
+}
+
+public class LinearGradientBrush : Brush {
+    public LinearGradientBrush(float x0, float y0, float x1, float y1) { }
+    public void AddStop(string color, float offset) { }
+    public void AddStop(uint rgba, float offset) { }
+}
+
+public class RadialGradientBrush : Brush {
+    public RadialGradientBrush(float cx, float cy, float ox, float oy, float rx, float ry) { }
+    public void AddStop(string color, float offset) { }
+    public void AddStop(uint rgba, float offset) { }
+}
+
+public class Transform : DependencyObject {
+    public Transform() { }
+}
+
+public class TranslateTransform : Transform {
+    public TranslateTransform(float x, float y) { }
+}
+
+public class ScaleTransform : Transform {
+    public ScaleTransform(float sx, float sy, float cx = 0.0f, float cy = 0.0f) { }
+}
+
+public class RotateTransform : Transform {
+    public RotateTransform(float angle, float cx = 0.0f, float cy = 0.0f) { }
+}
+
+public class SkewTransform : Transform {
+    public SkewTransform(float ax, float ay, float cx = 0.0f, float cy = 0.0f) { }
+}
+
+public class TransformGroup : Transform {
+    public TransformGroup() { }
+    public void Add(Transform t) { }
+}
+
+public class Effect : DependencyObject {
+    public Effect() { }
+}
+
+public class BlurEffect : Effect {
+    public float Radius = 5.0f;
+    public BlurEffect(float radius) { Radius = radius; }
+}
+
+public class DropShadowEffect : Effect {
+    public DropShadowEffect(float radius = 5.0f, float depth = 5.0f, float dir = 315.0f, string color = "#FF000000", float opacity = 1.0f) { }
+}
+
+public class BoolToVisibilityConverter : DependencyObject { public BoolToVisibilityConverter() { } }
+public class InverseBoolConverter : DependencyObject { public InverseBoolConverter() { } }
+public class MathConverter : DependencyObject { public MathConverter() { } }
+
+public class ResourceDictionary : DependencyObject {
+    public ResourceDictionary() { }
+    public void Set(string key, object val) { }
+    public void Set(string key, string val) { }
+    public void Set(string key, float val) { }
+    public void Set(string key, int val) { }
+    public void Set(string key, bool val) { }
+    public object Get(string key) { return null; }
+    public bool Contains(string key) { return false; }
+    public void Merge(ResourceDictionary other) { }
+}
+
+public class TriggerBase : DependencyObject {
+    public TriggerBase() { }
+    public void AddSetter(string prop, object val, string targetName = "") { }
+    public void AddSetter(string prop, string val, string targetName = "") { }
+    public void AddSetter(string prop, float val, string targetName = "") { }
+    public void AddSetter(string prop, int val, string targetName = "") { }
+    public void AddSetter(string prop, bool val, string targetName = "") { }
+    public void AddAction(Storyboard sb) { }
+}
+
+public class Trigger : TriggerBase {
+    public Trigger(string prop, object val) { }
+    public Trigger(string prop, string val) { }
+    public Trigger(string prop, float val) { }
+    public Trigger(string prop, int val) { }
+    public Trigger(string prop, bool val) { }
+}
+
+public class DataTrigger : TriggerBase {
+    public DataTrigger(string bindingPath, object val) { }
+    public DataTrigger(string bindingPath, string val) { }
+    public DataTrigger(string bindingPath, float val) { }
+    public DataTrigger(string bindingPath, int val) { }
+    public DataTrigger(string bindingPath, bool val) { }
+}
+
+public class EventTrigger : TriggerBase {
+    public EventTrigger(string eventName) { }
+}
+
+public class Style : DependencyObject {
+    public Style BasedOn = null;
+    public Style(string targetType) { }
+    public void AddSetter(string prop, object val, string targetName = "") { }
+    public void AddSetter(string prop, string val, string targetName = "") { }
+    public void AddSetter(string prop, float val, string targetName = "") { }
+    public void AddSetter(string prop, int val, string targetName = "") { }
+    public void AddSetter(string prop, bool val, string targetName = "") { }
+    public void AddTrigger(TriggerBase trigger) { }
+}
+
+public class ControlTemplate : DependencyObject {
+    public ControlTemplate(string targetType, Func1<Control, UIElement> factory) { }
+}
+
+public class DataTemplate : DependencyObject {
+    public DataTemplate(Func1<object, UIElement> factory) { }
+}
+
+public class Storyboard : DependencyObject {
+    public Storyboard() { }
+    public void AddDoubleAnimation(string targetName, string propPath, float fromVal, float toVal, float durationSec, int easeKind = 2, int easeMode = 0, float delaySec = 0.0f) { }
+    public void AddColorAnimation(string targetName, string propPath, uint fromRgba, uint toRgba, float durationSec, int easeKind = 2, int easeMode = 0, float delaySec = 0.0f) { }
+    public void Begin(UIElement scope) { }
+    public void Stop(UIElement scope) { }
+}
+
+public class ObservableObject : DependencyObject {
+    public ObservableObject() { }
+    protected bool SetProperty(ref string field, string value, string propName = "") {
+        field = value;
+        return true;
+    }
+    protected bool SetProperty(ref int field, int value, string propName = "") {
+        field = value;
+        return true;
+    }
+}
+
+public class ViewModelBase : ObservableObject {
+    public ViewModelBase() { }
+}
+
+public class ObservableList<T> {
+    private List<T> _items = new List<T>();
+    public ObservableList() { }
+    public void Add(T item) { _items.Add(item); }
+    public void Clear() { _items.Clear(); }
+    public int Count() { return _items.Count(); }
+}
+
+public class ObservableCollection<T> : ObservableList<T> {
+    public ObservableCollection() { }
+}
+
+public class RelayCommand {
+    public RelayCommand(Action execute) { }
+    public RelayCommand(Action1<object> execute) { }
+    public void Execute(object parameter) { }
+}
+
+public class RelayCommand<T> {
+    public RelayCommand(Action1<T> execute) { }
+    public void Execute(object parameter) { }
+}
+
+public class UIElement : DependencyObject {
+    public handle __nativeHandle;
+    public string Name = "";
+    public ResourceDictionary Resources = new ResourceDictionary();
+    public Style Style = null;
+    public float Width = 0.0f;
+    public float Height = 0.0f;
+    public float MinWidth = 0.0f;
+    public float MaxWidth = 0.0f;
+    public float MinHeight = 0.0f;
+    public float MaxHeight = 0.0f;
+    public Thickness Margin = new Thickness(0.0f);
+    public Thickness Padding = new Thickness(0.0f);
+    public HorizontalAlignment HorizontalAlignment = HorizontalAlignment.Stretch;
+    public VerticalAlignment VerticalAlignment = VerticalAlignment.Stretch;
+    public Visibility Visibility = Visibility.Visible;
+    public float Opacity = 1.0f;
+    public bool IsEnabled = true;
+    public bool IsHitTestVisible = true;
+    public bool Focusable = false;
+    public bool ClipToBounds = false;
+    public int ZIndex = 0;
+    public Brush Background = null;
+    public Brush Foreground = null;
+    public Transform RenderTransform = null;
+    public Effect Effect = null;
+
+    public object DataContext {
+        get { return null; }
+        set { }
+    }
+
+    public event RoutedEventHandler Loaded;
+
+    public UIElement() {
+        __nativeHandle = Visual_Create(0);
+    }
+
+    public void AddChild(UIElement child) { }
+    public void SetProperty(string prop, object val) { }
+    public void SetProperty(string prop, string val) { }
+    public void SetProperty(string prop, float val) { }
+    public void SetProperty(string prop, int val) { }
+    public void SetProperty(string prop, bool val) { }
+    public object FindName(string name) { return null; }
+    public object FindResource(string key) { return Resources.Get(key); }
+    public void BeginStoryboard(string key) { }
+    public void StopStoryboard(string key) { }
+
+    public static void SetGridRow(UIElement el, int row) { }
+    public static void SetGridColumn(UIElement el, int col) { }
+    public static void SetGridRowSpan(UIElement el, int span) { }
+    public static void SetGridColumnSpan(UIElement el, int span) { }
+    public static void SetDock(UIElement el, Dock d) { }
+    public static void SetCanvasLeft(UIElement el, float v) { }
+    public static void SetCanvasTop(UIElement el, float v) { }
+    public static void SetCanvasRight(UIElement el, float v) { }
+    public static void SetCanvasBottom(UIElement el, float v) { }
+}
+
+public class FrameworkElement : UIElement {
+    public FrameworkElement() { }
+}
+
+public class Control : FrameworkElement {
+    public Brush BorderBrush = null;
+    public Thickness BorderThickness = new Thickness(0.0f);
+    public CornerRadius CornerRadius = new CornerRadius(0.0f);
+    public HorizontalAlignment HorizontalContentAlignment = HorizontalAlignment.Center;
+    public VerticalAlignment VerticalContentAlignment = VerticalAlignment.Center;
+    public float FontSize = 14.0f;
+    public string FontFamily = "Default";
+    public ControlTemplate Template = null;
+    public Control() { }
+}
+
+public class ContentControl : Control {
+    public ContentControl() { }
+    public void SetContent(object content) { }
+    public void SetContent(string content) { }
+}
+
+public class HeaderedContentControl : ContentControl {
+    public HeaderedContentControl() { }
+    public void SetHeader(object header) { }
+    public void SetHeader(string header) { }
+}
+
+public class Window : ContentControl {
+    public string Title = "";
+    public Window() { }
+}
+
+public class Page : ContentControl {
+    public string Title = "";
+    public Page() { }
+}
+
+public class UserControl : ContentControl {
+    public UserControl() { }
+}
+
+public class Application : DependencyObject {
+    public ResourceDictionary Resources = new ResourceDictionary();
+    public Application() { }
+}
+
+public class Border : FrameworkElement {
+    public Brush BorderBrush = null;
+    public Thickness BorderThickness = new Thickness(0.0f);
+    public CornerRadius CornerRadius = new CornerRadius(0.0f);
+    public Border() { }
+}
+
+public class Panel : FrameworkElement {
+    public Panel() { }
+}
+
+public class Grid : Panel {
+    public bool ShowGridLines = false;
+    public Grid() { }
+    public void AddRowDefinition(GridUnitType u, float val) { }
+    public void AddColumnDefinition(GridUnitType u, float val) { }
+}
+
+public class StackPanel : Panel {
+    public Orientation Orientation = Orientation.Vertical;
+    public float Spacing = 0.0f;
+    public StackPanel() { }
+}
+
+public class DockPanel : Panel {
+    public bool LastChildFill = true;
+    public DockPanel() { }
+}
+
+public class Canvas : Panel {
+    public Canvas() { }
+}
+
+public class Run : UIElement {
+    public string Text = "";
+    public string FontWeight = "Normal";
+    public float FontSize = 14.0f;
+    public Run() { }
+}
+
+public class TextBlock : FrameworkElement {
+    public string Text = "";
+    public float FontSize = 14.0f;
+    public string FontFamily = "Default";
+    public TextWrapping TextWrapping = TextWrapping.NoWrap;
+    public TextAlignment TextAlignment = TextAlignment.Left;
+    public TextTrimming TextTrimming = TextTrimming.None;
+    public TextBlock() { }
+    public void AddRun(Run run) { }
+}
+
+public class TextBox : Control {
+    public string Text = "";
+    public string Placeholder = "";
+    public bool IsReadOnly = false;
+    public TextBox() { }
+}
+
+public class Button : ContentControl {
+    public DependencyObject CommandParameter = null;
+    public event RoutedEventHandler Click;
+    public Button() { }
+}
+
+public class CheckBox : ContentControl {
+    public bool IsChecked = false;
+    public bool IsThreeState = false;
+    public CheckBox() { }
+}
+
+public class ItemsControl : Control {
+    public DataTemplate ItemTemplate = null;
+    public ItemsControl() { }
+    public void AddItem(object item) { }
+    public void AddItem(string item) { }
+}
+
+public class ListBox : ItemsControl {
+    public int SelectedIndex = -1;
+    public SelectionMode SelectionMode = SelectionMode.Single;
+    public event SelectionChangedEventHandler SelectionChanged;
+    public ListBox() { }
+}
+
+public class GridViewColumn : DependencyObject {
+    public string Header = "";
+    public float Width = 100.0f;
+    public string DisplayMemberPath = "";
+    public GridViewColumn() { }
+}
+
+public class GridView : DependencyObject {
+    public GridView() { }
+    public void AddColumn(GridViewColumn col) { }
+}
+
+public class ListView : ListBox {
+    public GridView View = null;
+    public ListView() { }
+}
+
+public class Rectangle : FrameworkElement {
+    public Brush Fill = null;
+    public Brush Stroke = null;
+    public float StrokeThickness = 1.0f;
+    public float RadiusX = 0.0f;
+    public float RadiusY = 0.0f;
+    public Rectangle() { }
+}
+
+public class BindingEngine {
+    public static void BindPath(UIElement target, string targetProp, object source, string path, int mode = 0, string converterKey = "", string converterParam = "", string stringFormat = "") { }
+    public static void BindElement(UIElement target, string targetProp, string elementName, string sourceProp, int mode = 0) { }
+    public static void BindTemplateParent(UIElement target, string targetProp, Control templatedParent, string sourceProp) { }
+    public static void Flush() { }
+}
+)RS";
+    return sf;
+}
+
+void TestXmlPullLexer() {
+    const std::string_view xml = R"XML(<?xml version="1.0" encoding="utf-8"?>
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="Tom &amp; Jerry &lt;3&#x21;">
+  <!-- comment ignored -->
+  <StackPanel>
+    <TextBlock><![CDATA[Raw <Text> & Literal]]></TextBlock>
+    <Separator/>
+  </StackPanel>
+</Window>)XML";
+
+    aero::XmlPullLexer lexer(xml);
+    const auto tokens = lexer.LexAll();
+    Require(!tokens.empty() && tokens.back().kind == aero::XmlTokenKind::EndOfFile,
+        "XmlPullLexer should reach EndOfFile cleanly");
+    Require(tokens[0].kind == aero::XmlTokenKind::StartElement && tokens[0].localName == "Window",
+        "XmlPullLexer first token must be <Window>");
+    Require(tokens[0].namespaceUri == "http://schemas.microsoft.com/winfx/2006/xaml/presentation",
+        "XmlPullLexer default xmlns resolution failed");
+
+    bool foundTitle = false;
+    for (const auto& attr : tokens[0].attributes) {
+        if (attr.rawName == "Title") {
+            foundTitle = (attr.value == "Tom & Jerry <3!");
+        }
+    }
+    Require(foundTitle, "XmlPullLexer entity decoding failed on &amp;/&lt;/&#x21;");
+
+    bool foundCData = false;
+    bool foundEmptySep = false;
+    for (const auto& tok : tokens) {
+        if (tok.kind == aero::XmlTokenKind::CData && tok.text == "Raw <Text> & Literal") {
+            foundCData = true;
+        }
+        if (tok.kind == aero::XmlTokenKind::StartElement &&
+            tok.localName == "Separator" && tok.isEmptyElement) {
+            foundEmptySep = true;
+        }
+    }
+    Require(foundCData, "XmlPullLexer CDATA section failed");
+    Require(foundEmptySep, "XmlPullLexer empty element <Separator/> failed");
+
+    aero::XmlPullLexer badLexer("<Window><Grid></Window>");
+    const auto badTokens = badLexer.LexAll();
+    Require(!badTokens.empty() && badTokens.back().kind == aero::XmlTokenKind::Error &&
+            badTokens.back().line == 1,
+        "XmlPullLexer should diagnose mismatched closing tag with line/column");
+}
+
+void TestMarkupExtensionParser() {
+    {
+        const auto esc = aero::ParseMarkupExtension("{}{0:F2} ms");
+        Require(esc.kind == aero::MarkupExtensionKind::EscapedLiteral &&
+                esc.literalValue == "{0:F2} ms",
+            "MarkupExtensionParser failed '{}' literal escape");
+    }
+    {
+        const auto bind = aero::ParseMarkupExtension(
+            "{Binding User.Title, Mode=TwoWay, Converter={StaticResource BoolToVis}, "
+            "ConverterParameter='x,y', StringFormat='[{0}]', FallbackValue='Untitled', "
+            "TargetNullValue='None', ElementName=MainTree, "
+            "RelativeSource={RelativeSource FindAncestor, AncestorType={x:Type Window}, AncestorLevel=2}}");
+        Require(bind.IsOk() && bind.kind == aero::MarkupExtensionKind::Binding,
+            "MarkupExtensionParser failed nested Binding parse");
+
+        aero::ParsedBindingSpec spec;
+        Require(aero::TryExtractBindingSpec(bind, spec), "TryExtractBindingSpec failed");
+        Require(spec.path == "User.Title", "Binding path mismatch");
+        Require(spec.mode == "TwoWay", "Binding Mode mismatch");
+        Require(spec.converterKey == "BoolToVis", "Binding nested Converter key mismatch");
+        Require(spec.converterParam == "x,y", "Binding quoted ConverterParameter mismatch");
+        Require(spec.stringFormat == "[{0}]", "Binding StringFormat mismatch");
+        Require(spec.hasFallbackValue && spec.fallbackValue == "Untitled", "Binding FallbackValue mismatch");
+        Require(spec.hasTargetNullValue && spec.targetNullValue == "None", "Binding TargetNullValue mismatch");
+        Require(spec.elementName == "MainTree", "Binding ElementName mismatch");
+        Require(spec.hasRelativeSource && spec.relativeSourceMode == "FindAncestor" &&
+                spec.ancestorType == "Window" && spec.ancestorLevel == 2,
+            "Binding nested RelativeSource mismatch");
+    }
+    {
+        const auto tb = aero::ParseMarkupExtension("{TemplateBinding Background}");
+        aero::ParsedBindingSpec spec;
+        Require(aero::TryExtractBindingSpec(tb, spec) && spec.isTemplateBinding &&
+                spec.path == "Background",
+            "TemplateBinding extraction failed");
+    }
+    {
+        const auto xnull = aero::ParseMarkupExtension("{x:Null}");
+        const auto loc = aero::ParseMarkupExtension("{noesis:Loc IDS_TITLE}");
+        const auto dyn = aero::ParseMarkupExtension("{DynamicResource Brush.Accent}");
+        const auto mb = aero::ParseMarkupExtension("{MultiBinding StringFormat='{0}:{1}'}");
+        Require(xnull.kind == aero::MarkupExtensionKind::XNull, "x:Null classification failed");
+        Require(loc.kind == aero::MarkupExtensionKind::NoesisLoc &&
+                loc.FindPositional(0) != nullptr && loc.FindPositional(0)->literal == "IDS_TITLE",
+            "noesis:Loc classification failed");
+        Require(dyn.kind == aero::MarkupExtensionKind::DynamicResource &&
+                dyn.FindPositional(0) != nullptr && dyn.FindPositional(0)->literal == "Brush.Accent",
+            "DynamicResource classification failed");
+        Require(mb.kind == aero::MarkupExtensionKind::MultiBinding, "MultiBinding classification failed");
+    }
+    {
+        const auto bad = aero::ParseMarkupExtension("{Binding Path=Foo");
+        Require(!bad.IsOk(), "Unclosed markup extension must report error");
+    }
+}
+
+void TestCSharpCompatLowerer() {
+    const std::string_view cs = R"CS(
+using System;
+using System.Collections.ObjectModel;
+using System.Windows;
+using Aero.UI;
+
+namespace DemoApp
+{
+    public class SampleVM : ViewModelBase
+    {
+#if REALSCRIPT
+        private readonly int _activeBranch = 1;
+#else
+        private readonly int _activeBranch = 999;
+#endif
+        #region Properties
+        public string FilterText { get; private set; } = string.Empty;
+        public string Tagged { get; init; } = "#if not a directive";
+        public RelayCommand<string> QuickCmd { get; private set; }
+        #endregion
+
+        public void SetFilter(string val)
+        {
+            var k = nameof(FilterText);
+            if (val != string.Empty)
+            {
+                using (var g = MakeGuard()) { }
+                FilterText = val;
+            }
+            double scale = 1.5d;
+        }
+    }
+}
+)CS";
+
+    const std::unordered_set<std::string> avail = {"Aero.UI", "Aero.Native"};
+    const std::string lowered = aero::LowerCSharpCompatSyntax(cs, &avail);
+
+    Require(ContainsText(lowered, "module DemoApp;"), "Lowerer must emit module DemoApp;");
+    Require(ContainsText(lowered, "import Aero.UI;"), "Lowerer must keep import Aero.UI;");
+    Require(!ContainsText(lowered, "using System"), "Lowerer must strip .NET System using directives");
+    Require(ContainsText(lowered, "_activeBranch = 1;"), "Lowerer must keep #if REALSCRIPT branch");
+    Require(!ContainsText(lowered, "999"), "Lowerer must drop inactive #else branch");
+    Require(!ContainsText(lowered, "#region"), "Lowerer must strip #region");
+    Require(ContainsText(lowered, "\"#if not a directive\""), "Lowerer must not touch string literal contents");
+    Require(ContainsText(lowered, "using (var g = MakeGuard())"), "Lowerer must preserve C# using(...) statement");
+    Require(ContainsText(lowered, "{ get; set; } = \"\";"), "Lowerer must normalize private set & string.Empty");
+    Require(ContainsText(lowered, "string Tagged { get; set; }"), "Lowerer must normalize init -> set");
+    Require(ContainsText(lowered, "var k = \"FilterText\";"), "Lowerer must lower nameof(FilterText)");
+    Require(ContainsText(lowered, "double scale = 1.5;"), "Lowerer must strip numeric 'd' suffix");
+}
+
+void TestXamlToRsEmitterFeatures() {
+    const std::string_view mergedColors = R"XML(
+<ResourceDictionary xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+                    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
+  <Color x:Key="Color.Accent">#FF1098DF</Color>
+</ResourceDictionary>)XML";
+
+    const std::string_view mainXaml = R"XML(
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        x:Class="Showcase.MainWindow"
+        x:DataType="MainViewModel"
+        Title="AeroV3 Showcase"
+        Width="800" Height="600">
+  <Window.Resources>
+    <ResourceDictionary>
+      <ResourceDictionary.MergedDictionaries>
+        <ResourceDictionary Source="Colors.xaml"/>
+      </ResourceDictionary.MergedDictionaries>
+      <SolidColorBrush x:Key="AccentBrush" Color="{StaticResource Color.Accent}"/>
+      <Style x:Key="CardBtnStyle" TargetType="Button">
+        <Setter Property="Background" Value="{StaticResource AccentBrush}"/>
+        <Setter Property="Template">
+          <Setter.Value>
+            <ControlTemplate TargetType="Button">
+              <Border Background="{TemplateBinding Background}" CornerRadius="4">
+                <ContentPresenter/>
+              </Border>
+            </ControlTemplate>
+          </Setter.Value>
+        </Setter>
+        <Style.Triggers>
+          <Trigger Property="IsMouseOver" Value="True">
+            <Setter Property="Opacity" Value="0.85"/>
+          </Trigger>
+        </Style.Triggers>
+      </Style>
+      <DataTemplate x:Key="RowTemplate" x:DataType="RowItem">
+        <TextBlock Text="{Binding Title}"/>
+      </DataTemplate>
+      <Storyboard x:Key="Intro">
+        <DoubleAnimation Storyboard.TargetName="HeroRect" Storyboard.TargetProperty="Opacity"
+                         From="0" To="1" Duration="0:0:0.4"/>
+        <ColorAnimation Storyboard.TargetName="HeroRect" Storyboard.TargetProperty="Fill.Color"
+                        From="#FF000000" To="#FF1098DF" Duration="0:0:0.4"/>
+      </Storyboard>
+    </ResourceDictionary>
+  </Window.Resources>
+  <Grid>
+    <Grid.RowDefinitions>
+      <RowDefinition Height="Auto"/>
+      <RowDefinition Height="2*"/>
+    </Grid.RowDefinitions>
+    <Grid.ColumnDefinitions>
+      <ColumnDefinition Width="200"/>
+      <ColumnDefinition Width="*"/>
+    </Grid.ColumnDefinitions>
+    <DockPanel Grid.Row="0" Grid.ColumnSpan="2">
+      <Button x:Name="ActionBtn" DockPanel.Dock="Left" Content="Run" Style="{StaticResource CardBtnStyle}" Click="ActionBtn_Click"/>
+    </DockPanel>
+    <Canvas Grid.Row="1" Grid.Column="1">
+      <Rectangle x:Name="HeroRect" Canvas.Left="24" Canvas.Top="16" Width="120" Height="80">
+        <Rectangle.Fill>
+          <LinearGradientBrush StartPoint="0,0" EndPoint="1,1">
+            <GradientStop Color="#FF1098DF" Offset="0"/>
+            <GradientStop Color="#FF0864A1" Offset="1"/>
+          </LinearGradientBrush>
+        </Rectangle.Fill>
+        <Rectangle.RenderTransform>
+          <RotateTransform Angle="15" CenterX="60" CenterY="40"/>
+        </Rectangle.RenderTransform>
+        <Rectangle.Effect>
+          <BlurEffect Radius="4"/>
+        </Rectangle.Effect>
+      </Rectangle>
+      <TextBlock Canvas.Left="24" Canvas.Top="110" Text="{Binding Headline, Mode=OneWay, StringFormat='Hi {0}'}"/>
+    </Canvas>
+  </Grid>
+</Window>)XML";
+
+    aero::XamlEmitOptions opts;
+    opts.xamlPath = "Showcase/MainWindow.xaml";
+    opts.externalXamlResolver = [&](std::string_view req, std::string_view, std::string& resolved, std::string& content) {
+        if (req == "Colors.xaml") {
+            resolved = "Showcase/Colors.xaml";
+            content = std::string(mergedColors);
+            return true;
+        }
+        return false;
+    };
+
+    const auto res = aero::EmitXamlToRealScript(mainXaml, opts);
+    Require(res.succeeded, "XamlToRsEmitter failed on Showcase MainWindow");
+    Require(res.moduleName == "Showcase", "Expected module Showcase");
+    Require(res.rootClassName == "Showcase.MainWindow", "Expected rootClassName Showcase.MainWindow");
+    Require(ContainsText(res.generatedRsCode, "public partial class MainWindow : Window"),
+        "Missing partial class MainWindow");
+    Require(ContainsText(res.generatedRsCode, "public Button ActionBtn;"), "Missing typed x:Name ActionBtn field");
+    Require(ContainsText(res.generatedRsCode, "public Rectangle HeroRect;"), "Missing typed x:Name HeroRect field");
+    Require(ContainsText(res.generatedRsCode, "new SolidColorBrush(\"#FF1098DF\")"),
+        "StaticResource Color from MergedDictionaries should resolve cleanly");
+    Require(ContainsText(res.generatedRsCode, "AddRowDefinition(GridUnitType.Auto, 1.0f)"),
+        "Missing Grid.RowDefinitions Auto");
+    Require(ContainsText(res.generatedRsCode, "AddRowDefinition(GridUnitType.Star, 2.0f)"),
+        "Missing Grid.RowDefinitions Star");
+    Require(ContainsText(res.generatedRsCode, "UIElement.SetDock("), "Missing DockPanel.Dock");
+    Require(ContainsText(res.generatedRsCode, "UIElement.SetCanvasLeft("), "Missing Canvas.Left");
+    Require(ContainsText(res.generatedRsCode, "new LinearGradientBrush("), "Missing LinearGradientBrush");
+    Require(ContainsText(res.generatedRsCode, "new RotateTransform("), "Missing RotateTransform");
+    Require(ContainsText(res.generatedRsCode, "new BlurEffect("), "Missing BlurEffect");
+    Require(ContainsText(res.generatedRsCode, "ActionBtn.Click += this.ActionBtn_Click;") ||
+            ContainsText(res.generatedRsCode, ".Click += this.ActionBtn_Click;"),
+        "Missing Click event wiring");
+    Require(ContainsText(res.generatedRsCode, "new ControlTemplate(") &&
+            ContainsText(res.generatedRsCode, "BindingEngine.BindTemplateParent("),
+        "Missing ControlTemplate / TemplateBinding");
+    Require(ContainsText(res.generatedRsCode, "new DataTemplate(") &&
+            ContainsText(res.generatedRsCode, "is RowItem"),
+        "Missing DataTemplate / x:DataType typed fast-path");
+    Require(ContainsText(res.generatedRsCode, "AddDoubleAnimation(\"HeroRect\", \"Opacity\""),
+        "Missing Storyboard DoubleAnimation");
+    Require(ContainsText(res.generatedRsCode, "AddColorAnimation(\"HeroRect\", \"Fill.Color\""),
+        "Missing Storyboard ColorAnimation");
+}
+
+void TestNativeBodyStrippingUnderO2AndAot() {
+    const std::vector<aero::SourceFile> stdlib = aero::LoadStdlibModulePack();
+    Require(!stdlib.empty(), "LoadStdlibModulePack returned empty pack");
+
+    bool hasNative = false;
+    bool hasUi = false;
+    for (const auto& sf : stdlib) {
+        if (ContainsText(sf.content, "module Aero.Native;")) hasNative = true;
+        if (ContainsText(sf.content, "module Aero.UI;")) hasUi = true;
+    }
+    Require(hasNative && hasUi, "Stdlib pack must load Aero.Native and Aero.UI modules");
+
+    aero::SourceFile probe;
+    probe.path = "NativeProbe.rs";
+    probe.content = R"RS(
+module NativeProbe;
+import Aero.Native;
+import Aero.UI;
+
+public class ProbeHost {
+    public handle Node;
+    public uint Color;
+    public ProbeHost() {
+        Node = Visual_Create(0);
+        Color = Color_ParseRgba("#FF1098DF");
+    }
+}
+
+public uint RunNativeProbe() {
+    var host = new ProbeHost();
+    return host.Color;
+}
+
+public void RunVoidProbe(handle h) {
+    Visual_SetOpacity(h, 0.75f);
+}
+)RS";
+
+    aero::AeroV3CompileInput input;
+    input.includeStdlib = true;
+    input.optimizeBytecode = true;
+    input.emitAotCpp = true;
+    input.aotViewBuilderName = "BuildNativeProbe";
+    input.scriptSources.push_back(probe);
+
+    aero::rs_comp::CompilerSession session;
+    input.compilerSession = &session;
+
+    const aero::AeroCompilerV3 compiler;
+    const aero::AeroV3CompileResult result = compiler.Compile(input);
+    for (const auto& d : result.diagnostics) {
+        if (!result.succeeded) {
+            std::cerr << "  native probe diag: " << d << "\n";
+        }
+    }
+    Require(result.succeeded && result.programImage != nullptr,
+        "NativeProbe compilation with real stdlib and -O2 failed");
+    Require(!result.programImageBytes.empty(), "programImageBytes must not be empty");
+    Require(!result.aotCpp.scriptAotHeader.empty() && !result.aotCpp.scriptAotSource.empty(),
+        "CppGenerator must produce non-empty AOT header & source");
+    Require(ContainsText(result.aotCpp.scriptAotHeader, "BuildNativeProbeProgram"),
+        "AOT header missing BuildNativeProbeProgram");
+    if (!result.succeeded || !result.programImage) {
+        return;
+    }
+
+    // Verify Aero.Native bytecode module has ZERO compiled function bodies AND
+    // NativeProbe preserved external call to Aero.Native::Visual_Create under -O2!
+    std::string probeDisasm;
+    for (const auto& bcMod : result.bytecodeModules) {
+        if (bcMod.name == "Aero.Native") {
+            Require(bcMod.functions.empty(),
+                "Aero.Native MIR/bytecode functions must be stripped cleanly");
+        } else if (bcMod.name == "NativeProbe") {
+            probeDisasm = rs_bc::disassembleModule(bcMod);
+        }
+    }
+    Require(ContainsText(probeDisasm, "Visual_Create") &&
+            ContainsText(probeDisasm, "Color_ParseRgba") &&
+            ContainsText(probeDisasm, "Visual_SetOpacity"),
+        "-O2 must NOT inline Aero.Native dummy bodies; Call instructions must remain");
+
+    Require(ContainsText(result.aotCpp.scriptAotSource, "Visual_Create") &&
+            ContainsText(result.aotCpp.scriptAotSource, "Visual_SetOpacity"),
+        "AOT C++ source must preserve external Aero.Native calls");
+
+    // Execute compiled bytecode with mock native hooks to confirm live FFI dispatch
+    rs_rt::Interpreter interp(result.programImage);
+    bool sawVisualCreate = false;
+    bool sawColorParse = false;
+    interp.setExternalResolver(
+        [&](const rs_bc::FunctionReference& ref, rs_rt::ValueSpan, rs_rt::RuntimeError&)
+            -> std::optional<rs_rt::Value> {
+            if (ref.name == "Aero.Native::Visual_Create") {
+                sawVisualCreate = true;
+                return rs_rt::Value(rs_rt::NativeHandle{42u, 1u, 1u, 1u});
+            }
+            if (ref.name == "Aero.Native::Color_ParseRgba") {
+                sawColorParse = true;
+                return rs_rt::Value(rs_rt::UIntValue{0xFF1098DFu});
+            }
+            return std::nullopt;
+        });
+
+    const auto execRes = interp.invoke("NativeProbe::RunNativeProbe");
+    Require(execRes.succeeded, "Interpreter execution of NativeProbe::RunNativeProbe failed: " + execRes.error.message);
+    Require(sawVisualCreate && sawColorParse, "Interpreter did not invoke stripped Aero.Native hooks");
+    Require(std::holds_alternative<rs_rt::UIntValue>(execRes.value) &&
+            std::get<rs_rt::UIntValue>(execRes.value).value == 0xFF1098DFu,
+        "RunNativeProbe should return live native hook result 0xFF1098DFu, not inlined 0u");
+}
+
+void TestEndToEndXamlCompileAndSessionReuse() {
+    const auto realStdlib = aero::LoadStdlibModulePack();
+    const bool useFullRealStdlib = RealStdlibHasUiClasses(realStdlib);
+
+    const std::string xaml = R"XML(
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        x:Class="QuickApp.MainWindow"
+        Title="AeroV3 App" Width="640" Height="480">
+  <Window.Resources>
+    <ResourceDictionary>
+      <SolidColorBrush x:Key="BgBrush" Color="#182030"/>
+      <Style TargetType="Button">
+        <Setter Property="Background" Value="#2563EB"/>
+      </Style>
+    </ResourceDictionary>
+  </Window.Resources>
+  <Grid Margin="12">
+    <Grid.RowDefinitions>
+      <RowDefinition Height="Auto"/>
+      <RowDefinition Height="*"/>
+    </Grid.RowDefinitions>
+    <StackPanel Grid.Row="0" Orientation="Horizontal" Spacing="8">
+      <TextBlock x:Name="HeaderText" Text="{Binding TitleText}" FontSize="18"/>
+      <Button x:Name="ClickBtn" Content="Go" Click="OnGoClick"/>
+    </StackPanel>
+    <ListView x:Name="TaskGrid" Grid.Row="1">
+      <ListView.View>
+        <GridView>
+          <GridViewColumn Header="Task" Width="220" DisplayMemberBinding="{Binding Name}"/>
+        </GridView>
+      </ListView.View>
+    </ListView>
+  </Grid>
+</Window>)XML";
+
+    const std::string codeBehindCs = R"CS(
+using System;
+using System.Windows;
+using Aero.UI;
+
+namespace QuickApp
+{
+    public class AppVM : ViewModelBase
+    {
+        private string _title = "Initial";
+        public string TitleText
+        {
+            get { return _title; }
+            set { SetProperty(ref _title, value, nameof(TitleText)); }
+        }
+    }
+
+    public partial class MainWindow : Window
+    {
+        public int ClickCount { get; private set; } = 0;
+
+        public MainWindow()
+        {
+            InitializeComponent();
+            DataContext = new AppVM();
+        }
+
+        public void OnGoClick(object sender, RoutedEventArgs e)
+        {
+            ClickCount = ClickCount + 1;
+            HeaderText.Text = $"Clicked {ClickCount}";
+        }
+    }
+}
+)CS";
+
+    aero::rs_comp::CompilerSession session;
+    const aero::AeroCompilerV3 compiler;
+
+    aero::AeroV3CompileInput input;
+    input.xamlPath = "QuickApp/MainWindow.xaml";
+    input.xamlContent = xaml;
+    input.optimizeBytecode = true;
+    input.emitAotCpp = true;
+    input.aotViewBuilderName = "BuildQuickAppWindow";
+    input.compilerSession = &session;
+
+    if (useFullRealStdlib) {
+        input.includeStdlib = true;
+        input.scriptSources.push_back(aero::SourceFile{"QuickApp/MainWindow.xaml.cs", codeBehindCs});
+    } else {
+        input.includeStdlib = false;
+        for (const auto& sf : realStdlib) {
+            input.scriptSources.push_back(sf);
+        }
+        input.scriptSources.push_back(BuildPreMergeMockAeroUiModule());
+        input.scriptSources.push_back(aero::SourceFile{"QuickApp/MainWindow.xaml.cs", codeBehindCs});
+    }
+
+    const auto res1 = compiler.Compile(input);
+    for (const auto& d : res1.diagnostics) {
+        if (!res1.succeeded) {
+            std::cerr << "  diag: " << d << "\n";
+        }
+    }
+    Require(res1.succeeded, "End-to-end XAML + lowered C# compilation failed");
+    Require(res1.programImage != nullptr, "End-to-end compilation must produce linked ProgramImage");
+    Require(res1.programImage->findFunction("QuickApp.MainWindow::InitializeComponent").has_value() ||
+            ContainsText(res1.generatedPartialRsCode, "InitializeComponent"),
+        "Compiled program must include QuickApp::MainWindow::InitializeComponent");
+    Require(ContainsText(res1.aotCpp.scriptAotHeader, "BuildQuickAppWindowProgram"),
+        "End-to-end AOT C++ header missing BuildQuickAppWindowProgram");
+    Require(session.parsedUnitCacheSize() > 0,
+        "CompilerSession parsedUnitCache should be populated after first compile");
+
+    if (!res1.succeeded) {
+        return;
+    }
+
+    // Second compile sharing the same CompilerSession -> reuses cached parsed units cleanly
+    const auto res2 = compiler.Compile(input);
+    Require(res2.succeeded, "Second cached compilation with CompilerSession failed");
+    Require(session.parsedUnitCacheSize() > 0,
+        "CompilerSession parsedUnitCache should remain active on second compile");
+
+    // Verify CompilerSession moduleFrontendCache populates & hits for non-generic compilation units
+    {
+        aero::rs_comp::CompilerSession feSession;
+        aero::AeroV3CompileInput feInput;
+        feInput.includeStdlib = false;
+        feInput.compilerSession = &feSession;
+        feInput.scriptSources.push_back(aero::SourceFile{
+            "CacheProbe.rs",
+            "module CacheProbe;\npublic class Widget { public int Val() { return 7; } }\n"});
+        const auto fe1 = compiler.Compile(feInput);
+        const auto fe2 = compiler.Compile(feInput);
+        Require(fe1.succeeded && fe2.succeeded, "CacheProbe repeated compilation failed");
+        Require(feSession.parsedUnitCacheSize() > 0 && feSession.moduleFrontendCacheSize() > 0,
+            "CompilerSession moduleFrontendCache should populate across repeated compiles");
+    }
+}
+
+} // namespace
+
+int main() {
+    TestXmlPullLexer();
+    TestMarkupExtensionParser();
+    TestCSharpCompatLowerer();
+    TestXamlToRsEmitterFeatures();
+    TestNativeBodyStrippingUnderO2AndAot();
+    TestEndToEndXamlCompileAndSessionReuse();
+
+    if (gFailureCount > 0) {
+        std::cerr << gFailureCount << " compiler_v3_tests assertion(s) failed.\n";
+        return 1;
+    }
+    std::printf("All compiler_v3_tests passed!\n");
+    return 0;
+}
