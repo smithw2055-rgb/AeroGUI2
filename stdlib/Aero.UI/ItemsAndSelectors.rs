@@ -1,0 +1,1204 @@
+module Aero.UI;
+import Aero.Native;
+import RealScript.Math;
+
+// ============================================================================
+// 1. ItemsPresenter & ItemsControl (Real Panel Composition + Recycling)
+// ============================================================================
+
+public class ItemsPresenter : FrameworkElement {
+    private Panel _itemsPanel;
+    private Func<Panel> _panelFactory;
+
+    public ItemsPresenter() : base(VisualKind.Box) {}
+    public override string GetTypeName() { return "ItemsPresenter"; }
+
+    public Panel ItemsPanel {
+        get {
+            if (_itemsPanel == null) { EnsurePanel(); }
+            return _itemsPanel;
+        }
+    }
+
+    public Func<Panel> PanelFactory {
+        get { return _panelFactory; }
+        set {
+            _panelFactory = value;
+            RebuildPanel();
+        }
+    }
+
+    public Panel EnsurePanel() {
+        if (_itemsPanel != null) { return _itemsPanel; }
+        if (_panelFactory != null) {
+            var fn = _panelFactory;
+            _itemsPanel = fn();
+        }
+        if (_itemsPanel == null) {
+            var sp = new StackPanel(Orientation.Vertical, 2.0f);
+            sp.HorizontalAlignment = HorizontalAlignment.Stretch;
+            _itemsPanel = sp;
+        }
+        _itemsPanel.IsItemsHost = true;
+        ClearChildren();
+        AddChild(_itemsPanel);
+        return _itemsPanel;
+    }
+
+    public void RebuildPanel() {
+        UIElement[] existing = new UIElement[0];
+        if (_itemsPanel != null) {
+            for (int i = 0; i < _itemsPanel.ChildCount(); i += 1) {
+                existing.Push(_itemsPanel.ChildAt(i));
+            }
+            _itemsPanel.ClearChildren();
+        }
+        _itemsPanel = null;
+        Panel next = EnsurePanel();
+        for (int i = 0; i < existing.Length; i += 1) {
+            next.AddChild(existing[i]);
+        }
+    }
+}
+
+public class ItemsControl : Control {
+    private DependencyObject[] _manualItems;
+    private DependencyObject _itemsSourceBox;
+    private DataTemplate _itemTemplate;
+    private Func<Panel> _itemsPanelFactory;
+    private string _displayMemberPath = "";
+    private int _alternationCount = 0;
+
+    private bool _virtualizing = false;
+    private float _estimatedItemHeight = 32.0f;
+    private int _virtFirstIndex = 0;
+    private int _virtLastIndex = -1;
+
+    protected ItemsPresenter _itemsPresenter;
+    protected UIElement[] _activeContainers;
+    protected UIElement[] _recycledPool;
+    private Action _collectionChangedHook;
+
+    public ItemsControl() : base() {
+        _manualItems = new DependencyObject[0];
+        _activeContainers = new UIElement[0];
+        _recycledPool = new UIElement[0];
+    }
+
+    public override string GetTypeName() { return "ItemsControl"; }
+
+    public object ItemsSource {
+        get { return DependencyObject.Unbox(_itemsSourceBox); }
+        set { SetItemsSourceBox(DependencyObject.BoxObject(value)); }
+    }
+    public DependencyObject ItemsSourceBox {
+        get { return _itemsSourceBox; }
+        set { SetItemsSourceBox(value); }
+    }
+
+    public DataTemplate ItemTemplate {
+        get { return _itemTemplate; }
+        set { _itemTemplate = value; RefreshItems(); }
+    }
+    public Func<Panel> ItemsPanel {
+        get { return _itemsPanelFactory; }
+        set {
+            _itemsPanelFactory = value;
+            if (_itemsPresenter != null) { _itemsPresenter.PanelFactory = value; }
+            RefreshItems();
+        }
+    }
+    public Func<Panel> ItemsPanelFactory() { return _itemsPanelFactory; }
+    public string DisplayMemberPath {
+        get { return _displayMemberPath; }
+        set { _displayMemberPath = value == null ? "" : value; RefreshItems(); }
+    }
+    public int AlternationCount {
+        get { return _alternationCount; }
+        set { _alternationCount = value >= 0 ? value : 0; RefreshItems(); }
+    }
+    public bool IsVirtualizing {
+        get { return _virtualizing; }
+        set { _virtualizing = value; RefreshItems(); }
+    }
+    public float EstimatedItemHeight {
+        get { return _estimatedItemHeight; }
+        set { _estimatedItemHeight = value > 8.0f ? value : 32.0f; }
+    }
+
+    public int ItemCount() {
+        if (_itemsSourceBox != null) {
+            if (_itemsSourceBox is ICollectionNotifier) {
+                return (_itemsSourceBox as ICollectionNotifier).ItemCount();
+            }
+            object raw = DependencyObject.Unbox(_itemsSourceBox);
+            if (raw is ICollectionNotifier) {
+                return (raw as ICollectionNotifier).ItemCount();
+            }
+            return 0;
+        }
+        return _manualItems.Length;
+    }
+
+    public DependencyObject GetItemBoxAt(int index) {
+        if (index < 0 || index >= ItemCount()) { return null; }
+        if (_itemsSourceBox != null) {
+            if (_itemsSourceBox is ICollectionNotifier) {
+                return (_itemsSourceBox as ICollectionNotifier).BoxItemAt(index);
+            }
+            object raw = DependencyObject.Unbox(_itemsSourceBox);
+            if (raw is ICollectionNotifier) {
+                return (raw as ICollectionNotifier).BoxItemAt(index);
+            }
+            return null;
+        }
+        return _manualItems[index];
+    }
+
+    public object GetItemAt(int index) {
+        return DependencyObject.Unbox(GetItemBoxAt(index));
+    }
+
+    public int IndexOfItemBox(DependencyObject box) {
+        int n = ItemCount();
+        for (int i = 0; i < n; i += 1) {
+            if (GetItemBoxAt(i) == box) { return i; }
+        }
+        return -1;
+    }
+
+    public void AddItemBox(DependencyObject box) {
+        _manualItems.Push(box);
+        if (_itemsSourceBox == null) { RefreshItems(); }
+    }
+    public void AddItem(object item) { AddItemBox(DependencyObject.BoxObject(item)); }
+    public void AddItem(string item) { AddItemBox(DependencyObject.BoxString(item)); }
+    public void AddItem(int item) { AddItemBox(DependencyObject.BoxInt(item)); }
+    public void AddItem(float item) { AddItemBox(DependencyObject.BoxFloat(item)); }
+
+    public void RemoveItemAt(int index) {
+        if (index < 0 || index >= _manualItems.Length) { return; }
+        _manualItems.RemoveAt(index);
+        if (_itemsSourceBox == null) { RefreshItems(); }
+    }
+
+    public void ClearItems() {
+        _manualItems.Clear();
+        if (_itemsSourceBox == null) { RefreshItems(); }
+    }
+
+    public void SetItemsSourceBox(DependencyObject newSource) {
+        if (_itemsSourceBox != null && _collectionChangedHook != null) {
+            object oldObj = DependencyObject.Unbox(_itemsSourceBox);
+            CollectionChangeHub.Unsubscribe(oldObj, _collectionChangedHook);
+        }
+        _itemsSourceBox = newSource;
+        if (_itemsSourceBox != null) {
+            if (_collectionChangedHook == null) {
+                _collectionChangedHook = () => { OnItemsCollectionChanged(); };
+            }
+            object srcObj = DependencyObject.Unbox(_itemsSourceBox);
+            CollectionChangeHub.Subscribe(srcObj, _collectionChangedHook);
+        }
+        OnItemsSourceChanged();
+        RefreshItems();
+    }
+
+    protected virtual void OnItemsSourceChanged() {}
+    protected virtual void OnItemsCollectionChanged() { RefreshItems(); }
+
+    public int ContainerCount() { return _activeContainers.Length; }
+    public UIElement ContainerAt(int index) { return _activeContainers[index]; }
+
+    protected virtual bool IsItemItsOwnContainer(DependencyObject itemBox) {
+        return itemBox is UIElement;
+    }
+
+    protected virtual UIElement CreateContainerForItem() {
+        var cp = new ContentPresenter();
+        cp.HorizontalAlignment = HorizontalAlignment.Stretch;
+        return cp;
+    }
+
+    protected UIElement AcquireContainer() {
+        if (_recycledPool.Length > 0) {
+            int last = _recycledPool.Length - 1;
+            UIElement reused = _recycledPool[last];
+            _recycledPool.RemoveAt(last);
+            reused.Visibility = Visibility.Visible;
+            return reused;
+        }
+        return CreateContainerForItem();
+    }
+
+    protected virtual void PrepareContainerForItem(UIElement container, DependencyObject itemBox, int index) {
+        if (container == null) { return; }
+        object rawData = DependencyObject.Unbox(itemBox);
+        if (rawData != null) {
+            container.DataContext = rawData;
+        }
+        DependencyObject displayBox = itemBox;
+        if (_displayMemberPath.Length > 0 && rawData != null) {
+            DependencyObject memberBox = BindingEngine.ReadPathBox(rawData, _displayMemberPath);
+            if (memberBox != null) { displayBox = memberBox; }
+        }
+        if (container is ContentControl) {
+            ContentControl cc = container as ContentControl;
+            cc.ContentTemplate = _itemTemplate;
+            cc.SetContentBox(displayBox);
+        } else if (container is ContentPresenter) {
+            ContentPresenter cp = container as ContentPresenter;
+            cp.ContentTemplate = _itemTemplate;
+            cp.SetContentBox(displayBox);
+        }
+        if (_alternationCount > 0) {
+            container.Tag = DependencyObject.BoxInt(index % _alternationCount);
+        }
+    }
+
+    protected virtual void ClearContainerForItem(UIElement container) {
+        if (container == null) { return; }
+        container.ClearLocalDataContext();
+        if (container is ContentControl) { (container as ContentControl).SetContentBox(null); }
+        else if (container is ContentPresenter) { (container as ContentPresenter).SetContentBox(null); }
+    }
+
+    private void RecycleActiveContainers() {
+        Panel host = _itemsPresenter != null ? _itemsPresenter.EnsurePanel() : null;
+        if (host != null) { host.ClearChildren(); }
+        for (int i = 0; i < _activeContainers.Length; i += 1) {
+            UIElement c = _activeContainers[i];
+            if (!IsContainerRecyclable(c)) { continue; }
+            ClearContainerForItem(c);
+            _recycledPool.Push(c);
+        }
+        _activeContainers.Clear();
+    }
+
+    protected virtual bool IsContainerRecyclable(UIElement c) {
+        return true;
+    }
+
+    public void UpdateVirtualizedViewport(float scrollY, float viewportHeight) {
+        if (!_virtualizing || _itemsPresenter == null) {
+            RefreshItems();
+            return;
+        }
+        int total = ItemCount();
+        if (total == 0) {
+            RecycleActiveContainers();
+            _virtFirstIndex = 0;
+            _virtLastIndex = -1;
+            return;
+        }
+        float vh = viewportHeight > 0.0f ? viewportHeight : 400.0f;
+        int first = (int)(scrollY / _estimatedItemHeight) - 2;
+        if (first < 0) { first = 0; }
+        int visCount = (int)(vh / _estimatedItemHeight) + 5;
+        int last = first + visCount;
+        if (last >= total) { last = total - 1; }
+        if (first == _virtFirstIndex && last == _virtLastIndex && _activeContainers.Length > 0) {
+            return;
+        }
+        _virtFirstIndex = first;
+        _virtLastIndex = last;
+        BuildContainerRange(first, last);
+    }
+
+    public virtual void RefreshItems() {
+        if (_itemsPresenter == null) { return; }
+        int total = ItemCount();
+        if (_virtualizing && total > 32) {
+            UpdateVirtualizedViewport(0.0f, ActualHeight > 0.0f ? ActualHeight : 400.0f);
+            return;
+        }
+        BuildContainerRange(0, total - 1);
+    }
+
+    protected void BuildContainerRange(int firstIdx, int lastIdx) {
+        if (_itemsPresenter == null) { return; }
+        Panel host = _itemsPresenter.EnsurePanel();
+        RecycleActiveContainers();
+        if (lastIdx < firstIdx) { return; }
+
+        for (int i = firstIdx; i <= lastIdx; i += 1) {
+            DependencyObject box = GetItemBoxAt(i);
+            UIElement container = null;
+            if (IsItemItsOwnContainer(box)) {
+                container = box as UIElement;
+                PrepareOwnContainer(container, i);
+            } else {
+                container = AcquireContainer();
+                PrepareContainerForItem(container, box, i);
+            }
+            _activeContainers.Push(container);
+            host.AddChild(container);
+        }
+    }
+
+    protected virtual void PrepareOwnContainer(UIElement container, int index) {}
+
+    protected override UIElement CreateDefaultTemplate() {
+        _itemsPresenter = new ItemsPresenter();
+        _itemsPresenter.Name = "PART_ItemsPresenter";
+        if (_itemsPanelFactory != null) { _itemsPresenter.PanelFactory = _itemsPanelFactory; }
+        _itemsPresenter.EnsurePanel();
+        RefreshItems();
+        return _itemsPresenter;
+    }
+
+    public override bool SetPropertyValue(string propName, DependencyObject value) {
+        if (propName == "ItemsSource") { SetItemsSourceBox(value); return true; }
+        if (propName == "ItemTemplate" && value is DataTemplate) { ItemTemplate = value as DataTemplate; return true; }
+        if (propName == "DisplayMemberPath") { DisplayMemberPath = DependencyObject.UnboxString(value, ""); return true; }
+        if (propName == "AlternationCount") { AlternationCount = DependencyObject.UnboxInt(value, 0); return true; }
+        return base.SetPropertyValue(propName, value);
+    }
+}
+
+// ============================================================================
+// 2. SelectableItem, ListBoxItem, ComboBoxItem, ListViewItem, Selector, ListBox
+// ============================================================================
+
+public class SelectableItem : ContentControl {
+    private bool _isSelected = false;
+    private int _itemIndex = -1;
+    private Selector _ownerSelector;
+
+    public event RoutedEventHandler Selected;
+    public event RoutedEventHandler Unselected;
+
+    public SelectableItem() : base() {
+        Focusable = true;
+        HorizontalAlignment = HorizontalAlignment.Stretch;
+        HorizontalContentAlignment = HorizontalAlignment.Left;
+        Padding = new Thickness(10.0f, 6.0f, 10.0f, 6.0f);
+        CornerRadius = new CornerRadius(4.0f);
+    }
+
+    public override string GetTypeName() { return "SelectableItem"; }
+
+    public int ItemIndex {
+        get { return _itemIndex; }
+        set { _itemIndex = value; }
+    }
+    public Selector OwnerSelector {
+        get { return _ownerSelector; }
+        set { _ownerSelector = value; }
+    }
+
+    public bool IsSelected {
+        get { return _isSelected; }
+        set {
+            if (_isSelected == value) { return; }
+            _isSelected = value;
+            UpdateSelectionVisual();
+            if (_isSelected) { Selected(this, new RoutedEventArgs("Selected", this)); }
+            else { Unselected(this, new RoutedEventArgs("Unselected", this)); }
+        }
+    }
+
+    internal void SetSelectedSilent(bool sel) {
+        if (_isSelected == sel) { return; }
+        _isSelected = sel;
+        UpdateSelectionVisual();
+    }
+
+    protected override void OnVisualStatePropertyChanged() {
+        UpdateSelectionVisual();
+    }
+
+    protected virtual void UpdateSelectionVisual() {
+        if (Style != null) { return; }
+        if (_isSelected) {
+            Background = new SolidColorBrush(ParseUtil.PackArgb(255u, 37u, 99u, 235u));
+            Foreground = Brushes.White();
+        } else if (IsMouseOver) {
+            Background = new SolidColorBrush(ParseUtil.PackArgb(255u, 45u, 53u, 72u));
+            Foreground = Brushes.DefaultForeground();
+        } else {
+            Background = Brushes.Transparent();
+            Foreground = Brushes.DefaultForeground();
+        }
+    }
+
+    public override void OnMouseLeftButtonDown(MouseButtonEventArgs e) {
+        base.OnMouseLeftButtonDown(e);
+        if (!IsEnabled) { return; }
+        if (_ownerSelector != null) {
+            _ownerSelector.NotifyItemClicked(this, _itemIndex, e.Modifiers);
+            e.Handled = true;
+        } else {
+            IsSelected = !IsSelected;
+            e.Handled = true;
+        }
+    }
+}
+
+public class ListBoxItem : SelectableItem {
+    public ListBoxItem() : base() {}
+    public override string GetTypeName() { return "ListBoxItem"; }
+}
+
+public class ComboBoxItem : SelectableItem {
+    public ComboBoxItem() : base() {}
+    public override string GetTypeName() { return "ComboBoxItem"; }
+}
+
+public class ListViewItem : SelectableItem {
+    public ListViewItem() : base() {}
+    public override string GetTypeName() { return "ListViewItem"; }
+}
+
+public class Selector : ItemsControl {
+    private int _selectedIndex = -1;
+    private DependencyObject _selectedItemBox;
+    private SelectionMode _selectionMode = SelectionMode.Single;
+    private int[] _selectedIndices;
+    private int _anchorIndex = -1;
+    public string SelectedValuePath { get; set; } = "";
+
+    public event SelectionChangedEventHandler SelectionChanged;
+
+    public Selector() : base() {
+        _selectedIndices = new int[0];
+        Focusable = true;
+    }
+
+    public override string GetTypeName() { return "Selector"; }
+
+    public SelectionMode SelectionMode {
+        get { return _selectionMode; }
+        set { _selectionMode = value; }
+    }
+
+    public int SelectedIndex {
+        get { return _selectedIndex; }
+        set { SetSelectedIndexInternal(value, true); }
+    }
+
+    public object SelectedItem {
+        get { return DependencyObject.Unbox(_selectedItemBox); }
+        set {
+            DependencyObject box = DependencyObject.BoxObject(value);
+            int idx = IndexOfItemBox(box);
+            if (idx >= 0) { SetSelectedIndexInternal(idx, true); }
+            else {
+                _selectedItemBox = box;
+                _selectedIndex = -1;
+                SyncContainerSelectionStates();
+            }
+        }
+    }
+
+    public object SelectedValue {
+        get {
+            object item = SelectedItem;
+            if (item == null || SelectedValuePath.Length == 0) { return item; }
+            return DependencyObject.Unbox(BindingEngine.ReadPathBox(item, SelectedValuePath));
+        }
+    }
+
+    public int[] SelectedIndices() { return _selectedIndices; }
+
+    public void UnselectAll() {
+        _selectedIndices.Clear();
+        SetSelectedIndexInternal(-1, true);
+    }
+
+    protected virtual void OnSelectionChanged(int oldIdx, int newIdx, DependencyObject oldBox, DependencyObject newBox) {
+        SyncContainerSelectionStates();
+        SelectionChanged(this, new SelectionChangedEventArgs(this, newIdx, oldBox, newBox));
+        BindingEngine.NotifyTargetPropertyChanged(this, "SelectedIndex", DependencyObject.BoxInt(newIdx));
+        BindingEngine.NotifyTargetPropertyChanged(this, "SelectedItem", newBox);
+    }
+
+    protected void SetSelectedIndexInternal(int newIdx, bool replaceMultiSet) {
+        int count = ItemCount();
+        int clamped = (newIdx >= 0 && newIdx < count) ? newIdx : -1;
+        int oldIdx = _selectedIndex;
+        DependencyObject oldBox = _selectedItemBox;
+        DependencyObject newBox = clamped >= 0 ? GetItemBoxAt(clamped) : null;
+
+        if (replaceMultiSet) {
+            _selectedIndices.Clear();
+            if (clamped >= 0) { _selectedIndices.Push(clamped); }
+        }
+        if (oldIdx == clamped && oldBox == newBox && !replaceMultiSet) { return; }
+        _selectedIndex = clamped;
+        _selectedItemBox = newBox;
+        if (clamped >= 0) { _anchorIndex = clamped; }
+        OnSelectionChanged(oldIdx, clamped, oldBox, newBox);
+    }
+
+    public virtual void NotifyItemClicked(SelectableItem item, int index, int modifiers) {
+        int idx = index >= 0 ? index : IndexOfContainer(item);
+        if (idx < 0) { return; }
+        bool ctrl = KeyModifiers.Has(modifiers, KeyModifiers.Ctrl());
+        bool shift = KeyModifiers.Has(modifiers, KeyModifiers.Shift());
+
+        if (_selectionMode == SelectionMode.Single) {
+            SetSelectedIndexInternal(idx, true);
+            return;
+        }
+        if (_selectionMode == SelectionMode.Multiple || (_selectionMode == SelectionMode.Extended && ctrl)) {
+            int pos = _selectedIndices.IndexOf(idx);
+            if (pos >= 0) { _selectedIndices.RemoveAt(pos); }
+            else { _selectedIndices.Push(idx); }
+            int primary = _selectedIndices.Length > 0 ? _selectedIndices[_selectedIndices.Length - 1] : -1;
+            SetSelectedIndexInternal(primary, false);
+            return;
+        }
+        if (_selectionMode == SelectionMode.Extended && shift && _anchorIndex >= 0) {
+            int lo = _anchorIndex < idx ? _anchorIndex : idx;
+            int hi = _anchorIndex > idx ? _anchorIndex : idx;
+            _selectedIndices.Clear();
+            for (int k = lo; k <= hi; k += 1) { _selectedIndices.Push(k); }
+            SetSelectedIndexInternal(idx, false);
+            return;
+        }
+        SetSelectedIndexInternal(idx, true);
+    }
+
+    protected int IndexOfContainer(UIElement container) {
+        for (int i = 0; i < _activeContainers.Length; i += 1) {
+            if (_activeContainers[i] == container) { return i; }
+        }
+        return -1;
+    }
+
+    protected void SyncContainerSelectionStates() {
+        for (int i = 0; i < _activeContainers.Length; i += 1) {
+            UIElement c = _activeContainers[i];
+            if (c is SelectableItem) {
+                SelectableItem si = c as SelectableItem;
+                int itemIdx = si.ItemIndex >= 0 ? si.ItemIndex : i;
+                bool sel = (_selectionMode == SelectionMode.Single)
+                    ? (itemIdx == _selectedIndex)
+                    : _selectedIndices.Contains(itemIdx);
+                si.SetSelectedSilent(sel);
+            }
+        }
+    }
+
+    protected override UIElement CreateContainerForItem() {
+        return new ListBoxItem();
+    }
+
+    protected override void PrepareContainerForItem(UIElement container, DependencyObject itemBox, int index) {
+        base.PrepareContainerForItem(container, itemBox, index);
+        if (container is SelectableItem) {
+            SelectableItem si = container as SelectableItem;
+            si.ItemIndex = index;
+            si.OwnerSelector = this;
+            si.SetSelectedSilent(index == _selectedIndex || _selectedIndices.Contains(index));
+        }
+    }
+
+    protected override void PrepareOwnContainer(UIElement container, int index) {
+        if (container is SelectableItem) {
+            SelectableItem si = container as SelectableItem;
+            si.ItemIndex = index;
+            si.OwnerSelector = this;
+            si.SetSelectedSilent(index == _selectedIndex || _selectedIndices.Contains(index));
+        }
+    }
+
+    protected override void OnItemsCollectionChanged() {
+        base.OnItemsCollectionChanged();
+        if (_selectedIndex >= ItemCount()) {
+            SetSelectedIndexInternal(-1, true);
+        } else {
+            SyncContainerSelectionStates();
+        }
+    }
+
+    public override bool SetPropertyValue(string propName, DependencyObject value) {
+        if (propName == "SelectedIndex") { SelectedIndex = DependencyObject.UnboxInt(value, -1); return true; }
+        if (propName == "SelectedItem") {
+            int idx = IndexOfItemBox(value);
+            if (idx >= 0) { SetSelectedIndexInternal(idx, true); }
+            return true;
+        }
+        if (propName == "SelectedValuePath") { SelectedValuePath = DependencyObject.UnboxString(value, ""); return true; }
+        return base.SetPropertyValue(propName, value);
+    }
+    public override DependencyObject GetPropertyValue(string propName) {
+        if (propName == "SelectedIndex") { return DependencyObject.BoxInt(_selectedIndex); }
+        if (propName == "SelectedItem") { return _selectedItemBox; }
+        return base.GetPropertyValue(propName);
+    }
+}
+
+public class ListBox : Selector {
+    protected ScrollViewer _scrollViewer;
+
+    public ListBox() : base() {
+        Background = new SolidColorBrush("#FF171B24");
+        BorderBrush = new SolidColorBrush("#FF364054");
+        BorderThickness = new Thickness(1.0f);
+        CornerRadius = new CornerRadius(6.0f);
+        Padding = new Thickness(4.0f);
+    }
+
+    public override string GetTypeName() { return "ListBox"; }
+
+    public override void OnKeyDown(KeyEventArgs e) {
+        base.OnKeyDown(e);
+        int n = ItemCount();
+        if (n == 0) { return; }
+        if (e.Key == KeyCode.Down) {
+            SelectedIndex = SelectedIndex < n - 1 ? (SelectedIndex + 1) : 0;
+            e.Handled = true;
+        } else if (e.Key == KeyCode.Up) {
+            SelectedIndex = SelectedIndex > 0 ? (SelectedIndex - 1) : (n - 1);
+            e.Handled = true;
+        } else if (e.Key == KeyCode.Home) {
+            SelectedIndex = 0;
+            e.Handled = true;
+        } else if (e.Key == KeyCode.End) {
+            SelectedIndex = n - 1;
+            e.Handled = true;
+        }
+    }
+
+    protected override UIElement CreateDefaultTemplate() {
+        _scrollViewer = new ScrollViewer();
+        _scrollViewer.HorizontalScrollBarVisibility = ScrollBarVisibility.Disabled;
+        _scrollViewer.VerticalScrollBarVisibility = ScrollBarVisibility.Auto;
+        _scrollViewer.ScrollChanged += (object s, ScrollEventArgs e) => {
+            if (IsVirtualizing) {
+                UpdateVirtualizedViewport(_scrollViewer.VerticalOffset, _scrollViewer.ViewportHeight);
+            }
+        };
+
+        _itemsPresenter = new ItemsPresenter();
+        _itemsPresenter.Name = "PART_ItemsPresenter";
+        if (ItemsPanelFactory() != null) { _itemsPresenter.PanelFactory = ItemsPanelFactory(); }
+        _itemsPresenter.EnsurePanel();
+        _scrollViewer.Content = _itemsPresenter;
+        RefreshItems();
+        return _scrollViewer;
+    }
+}
+
+// ============================================================================
+// 3. GridViewColumn, GridView, ListView
+// ============================================================================
+
+public class GridViewColumn : DependencyObject {
+    public string Header { get; set; } = "";
+    public float Width { get; set; } = 120.0f;
+    public Binding DisplayMemberBinding { get; set; }
+    public DataTemplate CellTemplate { get; set; }
+    public string DisplayMemberPath {
+        get { return DisplayMemberBinding != null ? DisplayMemberBinding.Path : ""; }
+        set { DisplayMemberBinding = new Binding(value); }
+    }
+
+    public GridViewColumn() {}
+    public GridViewColumn(string header, string memberPath, float width = 120.0f) {
+        Header = header == null ? "" : header;
+        Width = width > 10.0f ? width : 120.0f;
+        if (memberPath != null && memberPath.Length > 0) {
+            DisplayMemberBinding = new Binding(memberPath);
+        }
+    }
+}
+
+public class GridView : DependencyObject {
+    private GridViewColumn[] _columns;
+
+    public GridView() { _columns = new GridViewColumn[0]; }
+    public GridViewColumn[] Columns() { return _columns; }
+    public void AddColumn(GridViewColumn col) { if (col != null) { _columns.Push(col); } }
+    public void ClearColumns() { _columns.Clear(); }
+}
+
+public class ListView : ListBox {
+    private GridView _view;
+    private Grid _headerRow;
+
+    public ListView() : base() {}
+    public override string GetTypeName() { return "ListView"; }
+
+    public GridView View {
+        get { return _view; }
+        set { _view = value; RebuildHeaderColumns(); RefreshItems(); }
+    }
+
+    private void RebuildHeaderColumns() {
+        if (_headerRow == null) { return; }
+        _headerRow.ClearChildren();
+        _headerRow.ClearColumnDefinitions();
+        if (_view == null) {
+            _headerRow.Visibility = Visibility.Collapsed;
+            return;
+        }
+        GridViewColumn[] cols = _view.Columns();
+        if (cols.Length == 0) {
+            _headerRow.Visibility = Visibility.Collapsed;
+            return;
+        }
+        _headerRow.Visibility = Visibility.Visible;
+        for (int i = 0; i < cols.Length; i += 1) {
+            _headerRow.AddColumnDefinition(GridUnitType.Pixel, cols[i].Width);
+            var hCell = new Border();
+            hCell.Background = new SolidColorBrush("#FF232A38");
+            hCell.Padding = new Thickness(8.0f, 6.0f, 8.0f, 6.0f);
+            hCell.BorderBrush = new SolidColorBrush("#FF364054");
+            hCell.BorderThickness = new Thickness(0.0f, 0.0f, 1.0f, 1.0f);
+            var hText = new TextBlock(cols[i].Header);
+            hText.FontWeight = "Bold";
+            hText.FontSize = 13.0f;
+            hText.Foreground = new SolidColorBrush("#FFCBD5E1");
+            hCell.Child = hText;
+            UIElement.SetGridColumn(hCell, i);
+            _headerRow.AddChild(hCell);
+        }
+    }
+
+    protected override UIElement CreateContainerForItem() {
+        return new ListViewItem();
+    }
+
+    protected override void PrepareContainerForItem(UIElement container, DependencyObject itemBox, int index) {
+        if (_view == null || _view.Columns().Length == 0) {
+            base.PrepareContainerForItem(container, itemBox, index);
+            return;
+        }
+        if (!(container is ListViewItem)) {
+            base.PrepareContainerForItem(container, itemBox, index);
+            return;
+        }
+        ListViewItem lvi = container as ListViewItem;
+        lvi.ItemIndex = index;
+        lvi.OwnerSelector = this;
+        lvi.SetSelectedSilent(index == SelectedIndex || SelectedIndices().Contains(index));
+        object rawData = DependencyObject.Unbox(itemBox);
+        if (rawData != null) { lvi.DataContext = rawData; }
+
+        GridViewColumn[] cols = _view.Columns();
+        var rowGrid = new Grid();
+        for (int i = 0; i < cols.Length; i += 1) {
+            GridViewColumn col = cols[i];
+            rowGrid.AddColumnDefinition(GridUnitType.Pixel, col.Width);
+            UIElement cellEl = null;
+            if (col.CellTemplate != null) {
+                cellEl = col.CellTemplate.Instantiate(rawData);
+            } else {
+                string path = col.DisplayMemberBinding != null ? col.DisplayMemberBinding.Path : "";
+                string text = "";
+                if (rawData != null && path.Length > 0) {
+                    text = DependencyObject.UnboxString(BindingEngine.ReadPathBox(rawData, path), "");
+                } else {
+                    text = DependencyObject.UnboxString(itemBox, "");
+                }
+                var tb = new TextBlock(text);
+                tb.Padding = new Thickness(6.0f, 2.0f, 6.0f, 2.0f);
+                tb.VerticalAlignment = VerticalAlignment.Center;
+                tb.TextTrimming = TextTrimming.CharacterEllipsis;
+                cellEl = tb;
+            }
+            if (cellEl != null) {
+                UIElement.SetGridColumn(cellEl, i);
+                rowGrid.AddChild(cellEl);
+            }
+        }
+        lvi.Content = rowGrid;
+    }
+
+    protected override UIElement CreateDefaultTemplate() {
+        var root = new Grid();
+        root.AddRowDefinition(GridUnitType.Auto, 1.0f);
+        root.AddRowDefinition(GridUnitType.Star, 1.0f);
+
+        _headerRow = new Grid();
+        UIElement.SetGridRow(_headerRow, 0);
+
+        UIElement listBody = base.CreateDefaultTemplate();
+        UIElement.SetGridRow(listBody, 1);
+
+        root.AddChild(_headerRow);
+        root.AddChild(listBody);
+        RebuildHeaderColumns();
+        return root;
+    }
+}
+
+// ============================================================================
+// 4. ComboBox (Real Popup Dropdown)
+// ============================================================================
+
+public class ComboBox : Selector {
+    private bool _isDropDownOpen = false;
+    private bool _isEditable = false;
+    private float _maxDropDownHeight = 240.0f;
+
+    private Border _headerBox;
+    private ContentPresenter _selectionDisplay;
+    private Path _arrowIcon;
+    private Popup _dropdownPopup;
+
+    public event EventHandler DropDownOpened;
+    public event EventHandler DropDownClosed;
+
+    public ComboBox() : base() {
+        Background = new SolidColorBrush("#FF1E2430");
+        BorderBrush = new SolidColorBrush("#FF3B465C");
+        BorderThickness = new Thickness(1.0f);
+        CornerRadius = new CornerRadius(6.0f);
+        Padding = new Thickness(10.0f, 6.0f, 10.0f, 6.0f);
+        MinWidth = 140.0f;
+        MinHeight = 32.0f;
+    }
+
+    public override string GetTypeName() { return "ComboBox"; }
+
+    public bool IsEditable { get { return _isEditable; } set { _isEditable = value; } }
+    public float MaxDropDownHeight {
+        get { return _maxDropDownHeight; }
+        set { _maxDropDownHeight = value > 40.0f ? value : 240.0f; }
+    }
+
+    public bool IsDropDownOpen {
+        get { return _isDropDownOpen; }
+        set {
+            if (_isDropDownOpen == value) { return; }
+            _isDropDownOpen = value;
+            if (_dropdownPopup != null) {
+                _dropdownPopup.IsOpen = _isDropDownOpen;
+            }
+            if (_isDropDownOpen) { DropDownOpened(this, EventArgs.Empty()); }
+            else { DropDownClosed(this, EventArgs.Empty()); }
+        }
+    }
+
+    private void SyncSelectedPreview() {
+        if (_selectionDisplay == null) { return; }
+        DependencyObject box = SelectedIndex >= 0 ? GetItemBoxAt(SelectedIndex) : null;
+        if (box == null) {
+            _selectionDisplay.SetContent("");
+            return;
+        }
+        if (box is UIElement) {
+            if (box is ContentControl) {
+                _selectionDisplay.SetContentBox((box as ContentControl).ContentBox);
+            } else {
+                _selectionDisplay.SetContent(box.ToDisplayString());
+            }
+            return;
+        }
+        object raw = DependencyObject.Unbox(box);
+        if (DisplayMemberPath.Length > 0 && raw != null) {
+            _selectionDisplay.SetContentBox(BindingEngine.ReadPathBox(raw, DisplayMemberPath));
+        } else if (ItemTemplate != null) {
+            _selectionDisplay.ContentTemplate = ItemTemplate;
+            _selectionDisplay.SetContentBox(box);
+        } else {
+            _selectionDisplay.SetContentBox(box);
+        }
+    }
+
+    protected override UIElement CreateContainerForItem() {
+        return new ComboBoxItem();
+    }
+
+    protected override void OnSelectionChanged(int oldIdx, int newIdx, DependencyObject oldBox, DependencyObject newBox) {
+        base.OnSelectionChanged(oldIdx, newIdx, oldBox, newBox);
+        SyncSelectedPreview();
+    }
+
+    public override void NotifyItemClicked(SelectableItem item, int index, int modifiers) {
+        base.NotifyItemClicked(item, index, modifiers);
+        IsDropDownOpen = false;
+    }
+
+    public override void RefreshItems() {
+        base.RefreshItems();
+        SyncSelectedPreview();
+    }
+
+    public override void OnKeyDown(KeyEventArgs e) {
+        base.OnKeyDown(e);
+        if (e.Key == KeyCode.Escape && _isDropDownOpen) {
+            IsDropDownOpen = false;
+            e.Handled = true;
+        } else if (e.Key == KeyCode.Down) {
+            if (!_isDropDownOpen) { IsDropDownOpen = true; }
+            else if (SelectedIndex < ItemCount() - 1) { SelectedIndex = SelectedIndex + 1; }
+            e.Handled = true;
+        } else if (e.Key == KeyCode.Up && SelectedIndex > 0) {
+            SelectedIndex = SelectedIndex - 1;
+            e.Handled = true;
+        } else if (e.Key == KeyCode.Enter || e.Key == KeyCode.Space) {
+            IsDropDownOpen = !IsDropDownOpen;
+            e.Handled = true;
+        }
+    }
+
+    protected override UIElement CreateDefaultTemplate() {
+        var root = new Grid();
+        root.AddColumnDefinition(GridUnitType.Star, 1.0f);
+        root.AddColumnDefinition(GridUnitType.Auto, 1.0f);
+
+        _headerBox = new Border();
+        _headerBox.HorizontalAlignment = HorizontalAlignment.Stretch;
+        UIElement.SetGridColumnSpan(_headerBox, 2);
+
+        _selectionDisplay = new ContentPresenter();
+        _selectionDisplay.HorizontalAlignment = HorizontalAlignment.Left;
+        _selectionDisplay.VerticalAlignment = VerticalAlignment.Center;
+        UIElement.SetGridColumn(_selectionDisplay, 0);
+
+        _arrowIcon = new Path("M 2,5 L 7,10 L 12,5");
+        _arrowIcon.Width = 14.0f;
+        _arrowIcon.Height = 14.0f;
+        _arrowIcon.Stroke = new SolidColorBrush("#FF94A3B8");
+        _arrowIcon.StrokeThickness = 1.8f;
+        _arrowIcon.Stretch = Stretch.None;
+        _arrowIcon.VerticalAlignment = VerticalAlignment.Center;
+        UIElement.SetGridColumn(_arrowIcon, 1);
+
+        _dropdownPopup = new Popup();
+        _dropdownPopup.PlacementTarget = this;
+        _dropdownPopup.StaysOpen = false;
+        _dropdownPopup.Closed += (object s, EventArgs e) => { _isDropDownOpen = false; };
+
+        var dropBorder = new Border();
+        dropBorder.Background = new SolidColorBrush("#FF1B202B");
+        dropBorder.BorderBrush = new SolidColorBrush("#FF3B465C");
+        dropBorder.BorderThickness = new Thickness(1.0f);
+        dropBorder.CornerRadius = new CornerRadius(6.0f);
+        dropBorder.Padding = new Thickness(4.0f);
+        dropBorder.MaxHeight = _maxDropDownHeight;
+        dropBorder.MinWidth = 140.0f;
+
+        var scroll = new ScrollViewer();
+        scroll.HorizontalScrollBarVisibility = ScrollBarVisibility.Disabled;
+        scroll.VerticalScrollBarVisibility = ScrollBarVisibility.Auto;
+        _itemsPresenter = new ItemsPresenter();
+        _itemsPresenter.Name = "PART_ItemsPresenter";
+        if (ItemsPanelFactory() != null) { _itemsPresenter.PanelFactory = ItemsPanelFactory(); }
+        _itemsPresenter.EnsurePanel();
+        scroll.Content = _itemsPresenter;
+        dropBorder.Child = scroll;
+        _dropdownPopup.Child = dropBorder;
+
+        root.MouseLeftButtonUp += (object s, MouseButtonEventArgs e) => {
+            if (IsEnabled) { IsDropDownOpen = !IsDropDownOpen; e.Handled = true; }
+        };
+
+        root.AddChild(_headerBox);
+        root.AddChild(_selectionDisplay);
+        root.AddChild(_arrowIcon);
+        root.AddChild(_dropdownPopup);
+        RefreshItems();
+        return root;
+    }
+}
+
+// ============================================================================
+// 5. TabItem & TabControl
+// ============================================================================
+
+public class TabItem : HeaderedContentControl {
+    private bool _isSelected = false;
+    private int _tabIndex = -1;
+    private TabControl _ownerTabControl;
+    private Border _accentUnderline;
+
+    public event RoutedEventHandler Selected;
+    public event RoutedEventHandler Unselected;
+
+    public TabItem() : base() {
+        Padding = new Thickness(14.0f, 8.0f, 14.0f, 8.0f);
+        Focusable = true;
+    }
+    public TabItem(string headerText, UIElement content = null) : this() {
+        SetHeader(headerText);
+        if (content != null) { Content = content; }
+    }
+
+    public override string GetTypeName() { return "TabItem"; }
+
+    public int TabIndex { get { return _tabIndex; } set { _tabIndex = value; } }
+    public TabControl OwnerTabControl { get { return _ownerTabControl; } set { _ownerTabControl = value; } }
+
+    public bool IsSelected {
+        get { return _isSelected; }
+        set {
+            if (_isSelected == value) { return; }
+            _isSelected = value;
+            UpdateTabVisual();
+            if (_isSelected) { Selected(this, new RoutedEventArgs("Selected", this)); }
+            else { Unselected(this, new RoutedEventArgs("Unselected", this)); }
+        }
+    }
+
+    internal void SetSelectedSilent(bool sel) {
+        if (_isSelected == sel) { return; }
+        _isSelected = sel;
+        UpdateTabVisual();
+    }
+
+    protected override void OnVisualStatePropertyChanged() {
+        UpdateTabVisual();
+    }
+
+    private void UpdateTabVisual() {
+        if (Style == null) {
+            Background = new SolidColorBrush(_isSelected ? "#FF222836" : (IsMouseOver ? "#FF1E2430" : "#00000000"));
+            Foreground = new SolidColorBrush(_isSelected ? "#FFF1F5F9" : "#FF94A3B8");
+        }
+        if (_accentUnderline != null) {
+            _accentUnderline.Visibility = _isSelected ? Visibility.Visible : Visibility.Collapsed;
+        }
+    }
+
+    public override void OnMouseLeftButtonDown(MouseButtonEventArgs e) {
+        base.OnMouseLeftButtonDown(e);
+        if (!IsEnabled) { return; }
+        if (_ownerTabControl != null) {
+            _ownerTabControl.SelectTabIndex(_tabIndex);
+            e.Handled = true;
+        }
+    }
+
+    protected override UIElement CreateDefaultTemplate() {
+        var box = new StackPanel(Orientation.Vertical, 4.0f);
+        _headerPresenter = new ContentPresenter();
+        _headerPresenter.Name = "PART_HeaderPresenter";
+        _headerPresenter.ContentTemplate = HeaderTemplate;
+        _headerPresenter.SetContentBox(HeaderBox);
+
+        _accentUnderline = new Border();
+        _accentUnderline.Height = 2.0f;
+        _accentUnderline.Background = new SolidColorBrush("#FF3B82F6");
+        _accentUnderline.CornerRadius = new CornerRadius(1.0f);
+        _accentUnderline.HorizontalAlignment = HorizontalAlignment.Stretch;
+
+        box.AddChild(_headerPresenter);
+        box.AddChild(_accentUnderline);
+        UpdateTabVisual();
+        return box;
+    }
+}
+
+public class TabControl : Selector {
+    private TabStripPlacement _tabStripPlacement = TabStripPlacement.Top;
+    private StackPanel _tabStrip;
+    private Border _contentFrame;
+    private ContentPresenter _selectedContentHost;
+
+    public TabControl() : base() {
+        Background = new SolidColorBrush("#FF1B202B");
+        BorderBrush = new SolidColorBrush("#FF364054");
+        BorderThickness = new Thickness(1.0f);
+        CornerRadius = new CornerRadius(8.0f);
+    }
+
+    public override string GetTypeName() { return "TabControl"; }
+
+    public TabStripPlacement TabStripPlacement {
+        get { return _tabStripPlacement; }
+        set { _tabStripPlacement = value; ApplyTemplate(); }
+    }
+
+    public void SelectTabIndex(int idx) {
+        SetSelectedIndexInternal(idx, true);
+    }
+
+    protected override bool IsItemItsOwnContainer(DependencyObject itemBox) {
+        return itemBox is TabItem;
+    }
+    protected override bool IsContainerRecyclable(UIElement c) {
+        return false;
+    }
+    protected override UIElement CreateContainerForItem() {
+        var ti = new TabItem();
+        return ti;
+    }
+
+    protected override void OnSelectionChanged(int oldIdx, int newIdx, DependencyObject oldBox, DependencyObject newBox) {
+        base.OnSelectionChanged(oldIdx, newIdx, oldBox, newBox);
+        SyncTabSelectionVisuals();
+    }
+
+    private void SyncTabSelectionVisuals() {
+        for (int i = 0; i < _activeContainers.Length; i += 1) {
+            if (_activeContainers[i] is TabItem) {
+                (_activeContainers[i] as TabItem).SetSelectedSilent(i == SelectedIndex);
+            }
+        }
+        if (_selectedContentHost == null) { return; }
+        if (SelectedIndex < 0 || SelectedIndex >= ItemCount()) {
+            _selectedContentHost.SetContentBox(null);
+            return;
+        }
+        DependencyObject itemBox = GetItemBoxAt(SelectedIndex);
+        if (itemBox is TabItem) {
+            TabItem ti = itemBox as TabItem;
+            _selectedContentHost.ContentTemplate = ti.ContentTemplate;
+            _selectedContentHost.SetContentBox(ti.ContentBox);
+        } else {
+            _selectedContentHost.ContentTemplate = ItemTemplate;
+            _selectedContentHost.SetContentBox(itemBox);
+        }
+    }
+
+    public override void RefreshItems() {
+        if (_tabStrip == null) { return; }
+        _tabStrip.ClearChildren();
+        _activeContainers.Clear();
+        int n = ItemCount();
+        for (int i = 0; i < n; i += 1) {
+            DependencyObject box = GetItemBoxAt(i);
+            TabItem ti = null;
+            if (box is TabItem) {
+                ti = box as TabItem;
+            } else {
+                ti = new TabItem();
+                ti.SetHeader(DependencyObject.UnboxString(box, "Tab"));
+                ti.SetContentBox(box);
+            }
+            ti.TabIndex = i;
+            ti.OwnerTabControl = this;
+            _activeContainers.Push(ti);
+            _tabStrip.AddChild(ti);
+        }
+        if (n > 0 && SelectedIndex < 0) {
+            SetSelectedIndexInternal(0, true);
+        } else {
+            SyncTabSelectionVisuals();
+        }
+    }
+
+    protected override UIElement CreateDefaultTemplate() {
+        var dock = new DockPanel();
+        _tabStrip = new StackPanel(
+            (_tabStripPlacement == TabStripPlacement.Left || _tabStripPlacement == TabStripPlacement.Right)
+                ? Orientation.Vertical
+                : Orientation.Horizontal,
+            2.0f);
+        _tabStrip.Background = new SolidColorBrush("#FF141821");
+        _tabStrip.Padding = new Thickness(6.0f, 4.0f, 6.0f, 0.0f);
+
+        Dock stripDock = Dock.Top;
+        if (_tabStripPlacement == TabStripPlacement.Bottom) { stripDock = Dock.Bottom; }
+        else if (_tabStripPlacement == TabStripPlacement.Left) { stripDock = Dock.Left; }
+        else if (_tabStripPlacement == TabStripPlacement.Right) { stripDock = Dock.Right; }
+        UIElement.SetDock(_tabStrip, stripDock);
+
+        _contentFrame = new Border();
+        _contentFrame.Padding = new Thickness(12.0f);
+        _selectedContentHost = new ContentPresenter();
+        _selectedContentHost.Name = "PART_SelectedContentHost";
+        _contentFrame.Child = _selectedContentHost;
+
+        dock.AddChild(_tabStrip);
+        dock.AddChild(_contentFrame);
+        RefreshItems();
+        return dock;
+    }
+}
