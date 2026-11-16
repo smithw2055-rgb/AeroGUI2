@@ -4,11 +4,10 @@
 #include <cmath>
 #include <cstring>
 
-#include "aero/asset/AxbFormat.hpp"
-#include "aero/asset/AxbTemplateRegistry.hpp"
+#include "aero/asset/MtsdfPathBaker.hpp"
+#include "aero/core/UIResourceStore.hpp"
 #include "aero/render/FontAtlas.hpp"
 #include "aero/render/ImageAtlas.hpp"
-#include "aero/core/UIResourceContext.hpp"
 #include <condition_variable>
 #include <functional>
 #include <thread>
@@ -41,10 +40,8 @@ public:
             bandFn(0, totalHeight);
             return;
         }
-        UIResourceContext* const callerResourceCtx = UIResourceContext::ActiveOverride();
         const int step = (totalHeight + 3) / 4;
         std::function<void(int)> taskFn = [&](int bandIdx) {
-            ScopedUIResourceContext workerCtxScope(bandIdx > 0 ? callerResourceCtx : nullptr);
             const int y0 = bandIdx * step;
             const int y1 = std::min(totalHeight, y0 + step);
             if (y0 < y1) {
@@ -2216,7 +2213,11 @@ void RasterizeSingleNode(
         }
 
         if (nd->primType == AeroPrimType::MsdfVectorPath && nd->mtsdfPathHash != 0 && !resolvedNodeMtsdf) {
-            cachedNodeMtsdf = AxbTemplateRegistry::Instance().FindMtsdfPath(nd->mtsdfPathHash);
+            cachedNodeMtsdf = tree.FindMtsdfEntry(nd->mtsdfPathHash);
+            if (!cachedNodeMtsdf) {
+                const UIResourceStore* store = tree.ResourceStore() ? tree.ResourceStore() : &UIResourceStore::Default();
+                cachedNodeMtsdf = store->FindMtsdfPath(nd->mtsdfPathHash);
+            }
             resolvedNodeMtsdf = true;
         }
         const AxbMtsdfPathEntry* mtsdfEntry = cachedNodeMtsdf;
@@ -3245,7 +3246,7 @@ void ExecuteBackdropBlurSpan(
     }
     ApplySpanPostProcessEffect(bgLayer, span);
     const AxbMtsdfPathEntry* maskEntry = (span.maskMtsdfHash != 0u)
-        ? AxbTemplateRegistry::Instance().FindMtsdfPath(span.maskMtsdfHash)
+        ? UIResourceStore::Default().FindMtsdfPath(span.maskMtsdfHash)
         : nullptr;
     int mx0 = std::clamp(SafeFloorToInt(mr.x, surfX0, surfX1), bx0, bx1);
     int my0 = std::clamp(SafeFloorToInt(mr.y, surfY0, surfY1), by0, by1);
@@ -4134,7 +4135,7 @@ bool ZeroCopyGpuStream::ComputeBackdropBlurPatchPremulRgba8(
     }
 
     const AxbMtsdfPathEntry* maskEntry = (span.maskMtsdfHash != 0u)
-        ? AxbTemplateRegistry::Instance().FindMtsdfPath(span.maskMtsdfHash)
+        ? UIResourceStore::Default().FindMtsdfPath(span.maskMtsdfHash)
         : nullptr;
     const float screenScale = std::max(
         1.0f,

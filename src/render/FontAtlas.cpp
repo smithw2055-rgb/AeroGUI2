@@ -6,9 +6,8 @@
 #include <cstring>
 #include <fstream>
 
-#include "aero/asset/AxbFormat.hpp"
-#include "aero/asset/AxbTemplateRegistry.hpp"
-#include "aero/core/UIResourceContext.hpp"
+#include "aero/core/StringUtils.hpp"
+#include "aero/core/UIResourceStore.hpp"
 
 namespace aero {
 
@@ -1646,8 +1645,24 @@ bool TrueTypeFontFace::ExtractGlyphOutline(
 // FontAtlas Implementation
 // ============================================================================
 
+namespace {
+
+void EnsureFontAtlasRegisteredWithStore() noexcept {
+    UIResourceStore::RegisterFontAtlasHooks(
+        [](std::uint16_t size) { return std::make_shared<FontAtlas>(size); },
+        [](FontAtlas& atlas) noexcept { atlas.ClearCustomFonts(); });
+}
+
+const bool gFontAtlasStoreHooksInit = []() noexcept {
+    EnsureFontAtlasRegisteredWithStore();
+    return true;
+}();
+
+} // namespace
+
 FontAtlas& FontAtlas::Instance() noexcept {
-    return UIResourceContext::Current().Fonts();
+    EnsureFontAtlasRegisteredWithStore();
+    return UIResourceStore::Default().Fonts();
 }
 
 FontAtlas::FontAtlas(std::uint16_t atlasSize)

@@ -9,14 +9,15 @@
 #include <unordered_set>
 #include <vector>
 
-#include "aero/asset/AxbFormat.hpp"
-#include "aero/core/UIElement.hpp"
+#include <unordered_map>
+
+#include "aero/asset/MtsdfPathBaker.hpp"
 #include "aero/core/UnifiedValue.hpp"
 #include "aero/render/FontAtlas.hpp"
 
 namespace aero {
 
-class DualTrackBindingEngine;
+class UIResourceStore;
 
 enum class AeroPrimType : std::uint16_t {
     SolidQuad = 0,
@@ -150,7 +151,7 @@ struct RenderNodeDescriptor {
     std::uint32_t textureId = 0u;
     std::uint32_t gradientBrushId = 0u; // Non-zero GradientBrushRegistry ID for AeroPrimType::GradientRoundedRect
     std::uint64_t mtsdfPathHash = 0;
-    const UIElement* sourceElement = nullptr;
+    const void* sourceElement = nullptr;
     CornerRadius cornerRadii{};
     Thickness borderThicknesses{};
     // P1-5: 3D perspective planar homography & soft SDF shadow/blur parameters
@@ -371,13 +372,9 @@ public:
     void SetRootDpiScale(float scale) noexcept;
     [[nodiscard]] float RootDpiScale() const noexcept { return rootDpiScale_; }
 
-    // Full build of paged 4KB render tree from a laid-out UIElement hierarchy
-    std::size_t BuildFromVisualTree(const UIElement* rootElement);
-
-    // O(dirty_nodes) zero-allocation incremental synchronization from UIElement hierarchy:
-    // Walks ONLY branches carrying (RenderDirty | SubtreeRenderDirty) and updates bound render
-    // node spans in O(1) via UIElement::RenderNodeId() without rebuilding clean pages.
-    std::size_t SyncVisualTree(const UIElement* rootElement);
+    void SetResourceStore(UIResourceStore* store) noexcept { resourceStore_ = store; }
+    [[nodiscard]] UIResourceStore* ResourceStore() const noexcept { return resourceStore_; }
+    [[nodiscard]] const AxbMtsdfPathEntry* FindMtsdfEntry(std::uint64_t pathHash) const noexcept;
 
     // Allocate a standalone fast-path render node (e.g. ECS HUD health bar or damage counter)
     std::uint32_t AllocateRenderNode(
@@ -388,7 +385,7 @@ public:
         const Color& color,
         float cornerRadius = 0.0f,
         float borderThickness = 0.0f,
-        const UIElement* owner = nullptr);
+        const void* owner = nullptr);
 
     // Allocate a filled rounded-rect node supporting asymmetric 4-component CornerRadius(tl, tr, br, bl)
     std::uint32_t AllocateRoundedRectNode(
@@ -398,7 +395,7 @@ public:
         float height,
         const Color& color,
         const CornerRadius& cornerRadii,
-        const UIElement* owner = nullptr);
+        const void* owner = nullptr);
 
     // Allocate an analytical hollow SDF border ring node supporting independent BorderBrush, 4-corner radii & 4-side thickness
     std::uint32_t AllocateBorderRingNode(
@@ -409,7 +406,7 @@ public:
         const Color& borderColor,
         const CornerRadius& cornerRadii,
         const Thickness& borderThickness,
-        const UIElement* owner = nullptr);
+        const void* owner = nullptr);
 
     // P1-3: Allocate an analytical SDF Ellipse / Circle node (fill or hollow stroke ring)
     std::uint32_t AllocateEllipseNode(
@@ -421,7 +418,7 @@ public:
         float strokeThickness = 0.0f,
         bool hollowStroke = false,
         float opacity = 1.0f,
-        const UIElement* owner = nullptr);
+        const void* owner = nullptr);
 
     // P1-3: Allocate a multi-stop Linear/Radial Gradient RoundedRect (or Ellipse) node
     std::uint32_t AllocateGradientRoundedRectNode(
@@ -434,7 +431,7 @@ public:
         bool isEllipseShape = false,
         const Color& tintModulator = Color{1.0f, 1.0f, 1.0f, 1.0f},
         float opacity = 1.0f,
-        const UIElement* owner = nullptr);
+        const void* owner = nullptr);
 
     // Allocate a multi-digit HUD numeric node backed by pre-cached glyph UVs (0 font shaping)
     std::uint32_t AllocateHudDigitsNode(
@@ -454,7 +451,7 @@ public:
         const Color& color,
         float opacity = 1.0f,
         std::uint32_t reservedGlyphCapacity = 0,
-        const UIElement* owner = nullptr,
+        const void* owner = nullptr,
         std::string_view fontFamily = {},
         float maxWidth = 1000000.0f,
         TextWrapping wrapMode = TextWrapping::NoWrap);
@@ -469,7 +466,7 @@ public:
         const Color& fillColor,
         float strokeThickness = 0.0f,
         float opacity = 1.0f,
-        const UIElement* owner = nullptr);
+        const void* owner = nullptr);
 
     // Allocate a 4-vertex textured image quad (default textureId = 0 shared UI atlas)
     std::uint32_t AllocateTexturedNode(
@@ -483,7 +480,7 @@ public:
         float v1,
         const Color& tintColor,
         float opacity = 1.0f,
-        const UIElement* owner = nullptr);
+        const void* owner = nullptr);
 
     // Allocate a 4-vertex textured image quad bound to an explicit textureId slot
     std::uint32_t AllocateTexturedNode(
@@ -497,7 +494,7 @@ public:
         float v1,
         const Color& tintColor,
         float opacity,
-        const UIElement* owner,
+        const void* owner,
         std::uint32_t textureId);
 
     // Allocate a 4-vertex analytical SDF radial arc / ring / gauge quad (0 CPU tessellation)
@@ -511,7 +508,7 @@ public:
         float innerRadiusRatio01,
         const Color& color,
         float opacity = 1.0f,
-        const UIElement* owner = nullptr);
+        const void* owner = nullptr);
 
     bool UpdateRadialArcNode(
         std::uint32_t nodeId,
@@ -556,7 +553,6 @@ public:
     bool InvalidateNodePage(std::uint32_t nodeId) noexcept;
     bool RefreshTextNode(std::uint32_t nodeId) noexcept;
     std::size_t RefreshGlyphRange(std::uint32_t rangeStart, std::uint32_t rangeEnd) noexcept;
-    bool UpdateDirtyElement(const UIElement* element) noexcept;
 
     // Track B (EcsColumnSimdTrack) direct zero-allocation batch update:
     // Reads contiguous float values (with byte stride & offset) and directly updates
@@ -568,10 +564,6 @@ public:
         std::size_t elementStrideBytes,
         std::size_t fieldByteOffset,
         float scaleFactor = 1.0f) noexcept;
-
-    std::size_t BatchUpdateFromEcsTrackB(
-        const DualTrackBindingEngine& bindingEngine,
-        std::uint32_t firstNodeId = 0) noexcept;
 
     [[nodiscard]] std::size_t PageCount() const noexcept { return pages_.size(); }
     [[nodiscard]] const std::vector<CommandPage>& Pages() const noexcept { return pages_; }
@@ -642,39 +634,17 @@ private:
         const Color& color,
         float opacity,
         const RenderTraversalState& curState,
-        const UIElement* owner,
+        const void* owner,
         std::string_view fontFamily = {},
         float maxWidth = 1000000.0f,
         TextWrapping wrapMode = TextWrapping::NoWrap,
         TextAlignment textAlign = TextAlignment::Left,
         float alignBoxWidth = 0.0f,
         const std::vector<RichGlyphStyle>* optRichStyles = nullptr);
-    bool UpdateElementInPlace(
-        const UIElement* element,
-        const RenderTraversalState& curState);
-    void CollapseSubtreeRenderNodesRecursive(
-        const UIElement* elem,
-        std::size_t& ioUpdatedNodes) noexcept;
-    friend class PagedCustomDrawingContext;
-    friend struct ControlRenderEmitter;
-
-    struct DeferredComboPopup {
-        const UIElement* combo = nullptr;
-        PagedRenderTraversalState state{};
-    };
-
-    [[nodiscard]] bool SubtreeContainsActiveComboPopup(const UIElement* elem) const noexcept;
-    void EmitDeferredComboPopups();
-    void TraverseAndEmitElement(const UIElement* elem, const RenderTraversalState& parentState);
-    bool SyncDirtySubtreeRecursive(
-        const UIElement* elem,
-        const RenderTraversalState& parentState,
-        bool forceSubtreeSync,
-        std::size_t& ioUpdatedNodes,
-        bool& outNeedsFullRebuild);
+    friend class VisualRenderAdapter;
 
     std::uint32_t treeId_ = 1u;
-    const UIElement* boundRootElement_ = nullptr;
+    UIResourceStore* resourceStore_ = nullptr;
     Rect activeClipRect_{0.0f, 0.0f, 16384.0f, 16384.0f};
     bool activeClipEnabled_ = false;
     BlendingMode activeBlendMode_ = BlendingMode::Normal;
@@ -682,7 +652,6 @@ private:
     std::vector<RenderNodeDescriptor> nodes_;
     std::vector<std::uint8_t> pageDirtyFlags_;
     std::vector<std::uint32_t> dirtyPageList_;
-    std::vector<DeferredComboPopup> pendingComboPopups_;
     struct StandaloneTextRunRecord {
         float x = 0.0f;
         float y = 0.0f;
@@ -696,7 +665,6 @@ private:
     };
 
     std::vector<BlurLayerSpan> blurLayerSpans_;
-    std::vector<const UIElement*> activeComboPopupOwners_;
     std::unordered_map<std::uint32_t, StandaloneTextRunRecord> standaloneTextRuns_;
     std::array<GlyphUvRect, 128> preCachedGlyphs_{};
     float rootDpiScale_ = 1.0f;
@@ -705,6 +673,7 @@ private:
     std::uint32_t mtsdfPopulatedRows_ = 0u;
     std::vector<std::uint8_t> mtsdfAtlasRgba8_;
     std::unordered_set<std::uint64_t> mtsdfRegisteredHashes_;
+    std::unordered_map<std::uint64_t, AxbMtsdfPathEntry> mtsdfEntries_;
 };
 
 } // namespace aero

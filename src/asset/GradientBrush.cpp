@@ -9,9 +9,8 @@
 #include <string_view>
 #include <vector>
 
-#include "aero/asset/AxbFormat.hpp"
 #include "aero/core/StringUtils.hpp"
-#include "aero/core/UIResourceContext.hpp"
+#include "aero/core/UIResourceStore.hpp"
 
 namespace aero {
 
@@ -312,7 +311,7 @@ bool TryDeserializeGradientBrushSpec(std::string_view raw, GradientBrushDesc& ou
         }
         GradientStop stop{};
         stop.offset = detail::ParseFloat32Token(st.substr(0u, colon), 0.0f);
-        stop.color = ParseXamlColorLiteral(st.substr(colon + 1u));
+        stop.color = ParseColorLiteral(st.substr(colon + 1u));
         parsed.stops.push_back(stop);
     }
 
@@ -322,7 +321,7 @@ bool TryDeserializeGradientBrushSpec(std::string_view raw, GradientBrushDesc& ou
 }
 
 GradientBrushRegistry& GradientBrushRegistry::Instance() noexcept {
-    return UIResourceContext::Current().GradientBrushes();
+    return UIResourceStore::Default().GradientBrushes();
 }
 
 std::uint32_t GradientBrushRegistry::RegisterBrush(GradientBrushDesc desc) {

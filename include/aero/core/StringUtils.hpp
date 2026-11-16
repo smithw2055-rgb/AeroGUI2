@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstddef>
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <string_view>
@@ -85,4 +86,86 @@ namespace detail {
     return TryParseFloat32(text, val) ? val : fallback;
 }
 
+[[nodiscard]] inline bool DecodeNextUtf8CodePoint(
+    std::string_view utf8Text,
+    std::size_t& ioCursor,
+    std::uint32_t& outCodePoint) noexcept {
+    if (ioCursor >= utf8Text.size()) {
+        return false;
+    }
+    const auto b0 = static_cast<std::uint8_t>(utf8Text[ioCursor]);
+    if ((b0 & 0x80u) == 0u) {
+        outCodePoint = b0;
+        ioCursor += 1u;
+        return true;
+    }
+    if ((b0 & 0xE0u) == 0xC0u && b0 >= 0xC2u && ioCursor + 1u < utf8Text.size()) {
+        const auto b1 = static_cast<std::uint8_t>(utf8Text[ioCursor + 1u]);
+        if ((b1 & 0xC0u) == 0x80u) {
+            outCodePoint = (static_cast<std::uint32_t>(b0 & 0x1Fu) << 6u) | (b1 & 0x3Fu);
+            ioCursor += 2u;
+            return true;
+        }
+    } else if ((b0 & 0xF0u) == 0xE0u && ioCursor + 2u < utf8Text.size()) {
+        const auto b1 = static_cast<std::uint8_t>(utf8Text[ioCursor + 1u]);
+        const auto b2 = static_cast<std::uint8_t>(utf8Text[ioCursor + 2u]);
+        if ((b1 & 0xC0u) == 0x80u && (b2 & 0xC0u) == 0x80u) {
+            const std::uint32_t cp =
+                (static_cast<std::uint32_t>(b0 & 0x0Fu) << 12u) |
+                (static_cast<std::uint32_t>(b1 & 0x3Fu) << 6u) |
+                (b2 & 0x3Fu);
+            if (cp >= 0x800u && (cp < 0xD800u || cp > 0xDFFFu)) {
+                outCodePoint = cp;
+                ioCursor += 3u;
+                return true;
+            }
+        }
+    } else if ((b0 & 0xF8u) == 0xF0u && b0 <= 0xF4u && ioCursor + 3u < utf8Text.size()) {
+        const auto b1 = static_cast<std::uint8_t>(utf8Text[ioCursor + 1u]);
+        const auto b2 = static_cast<std::uint8_t>(utf8Text[ioCursor + 2u]);
+        const auto b3 = static_cast<std::uint8_t>(utf8Text[ioCursor + 3u]);
+        if ((b1 & 0xC0u) == 0x80u && (b2 & 0xC0u) == 0x80u && (b3 & 0xC0u) == 0x80u) {
+            const std::uint32_t cp =
+                (static_cast<std::uint32_t>(b0 & 0x07u) << 18u) |
+                (static_cast<std::uint32_t>(b1 & 0x3Fu) << 12u) |
+                (static_cast<std::uint32_t>(b2 & 0x3Fu) << 6u) |
+                (b3 & 0x3Fu);
+            if (cp >= 0x10000u && cp <= 0x10FFFFu) {
+                outCodePoint = cp;
+                ioCursor += 4u;
+                return true;
+            }
+        }
+    }
+    outCodePoint = 0xFFFDu;
+    ioCursor += 1u;
+    return true;
+}
+
+[[nodiscard]] constexpr bool IsWideCjkCodePoint(std::uint32_t cp) noexcept {
+    return (cp >= 0x2E80u && cp <= 0x9FFFu) ||
+           (cp >= 0xAC00u && cp <= 0xD7AFu) ||
+           (cp >= 0xF900u && cp <= 0xFAFFu) ||
+           (cp >= 0xFF01u && cp <= 0xFF60u) ||
+           (cp >= 0x20000u && cp <= 0x2FA1Fu);
+}
+
+[[nodiscard]] inline std::size_t CountVisibleUtf8Glyphs(std::string_view utf8Text) noexcept {
+    std::size_t count = 0u;
+    std::size_t cursor = 0u;
+    std::uint32_t cp = 0u;
+    while (DecodeNextUtf8CodePoint(utf8Text, cursor, cp)) {
+        if (cp != ' ' && cp != '\r' && cp != '\n') {
+            ++count;
+        }
+    }
+    return count;
+}
+
 } // namespace aero::str
+
+namespace aero {
+using str::DecodeNextUtf8CodePoint;
+using str::IsWideCjkCodePoint;
+using str::CountVisibleUtf8Glyphs;
+} // namespace aero

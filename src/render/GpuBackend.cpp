@@ -5,8 +5,7 @@
 #include <cstdio>
 #include <cstring>
 
-#include "aero/asset/AxbFormat.hpp"
-#include "aero/asset/AxbTemplateRegistry.hpp"
+#include "aero/asset/GradientBrush.hpp"
 #include "aero/render/FontAtlas.hpp"
 #include "aero/render/ImageAtlas.hpp"
 

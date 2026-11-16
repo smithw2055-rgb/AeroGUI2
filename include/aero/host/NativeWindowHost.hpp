@@ -71,23 +71,23 @@ public:
         DesktopEventHost* desktopHost,
         PagedRenderTree* renderTree,
         ZeroCopyGpuStream* gpuStream = nullptr,
-        InputEventRouter* inputRouter = nullptr) noexcept;
+        VisualInputRouter* inputRouter = nullptr) noexcept;
 
     void BindWebCanvasHost(
         WebCanvasHost* webHost,
         PagedRenderTree* renderTree,
         ZeroCopyGpuStream* gpuStream = nullptr,
-        InputEventRouter* inputRouter = nullptr) noexcept;
+        VisualInputRouter* inputRouter = nullptr) noexcept;
 
     // Optional injection of custom IGpuDeviceBackend (e.g. mock GL spy backend in unit tests)
     void SetCustomGpuBackend(std::unique_ptr<IGpuDeviceBackend> customBackend) noexcept;
 
-    // Optional binding of dedicated UIResourceContext (falls back to desktopHost_/webHost_ context when unset)
-    void SetResourceContext(std::shared_ptr<UIResourceContext> context) noexcept {
-        resourceContext_ = std::move(context);
+    // Optional binding of dedicated UIResourceStore (falls back to desktopHost_/webHost_ store when unset)
+    void SetResourceStore(std::shared_ptr<UIResourceStore> store) noexcept {
+        resourceStore_ = std::move(store);
     }
-    [[nodiscard]] std::shared_ptr<UIResourceContext> GetResourceContext() const noexcept {
-        return EffectiveResourceContext();
+    [[nodiscard]] std::shared_ptr<UIResourceStore> GetResourceStore() const noexcept {
+        return EffectiveResourceStore();
     }
 
     bool Initialize(const NativeWindowConfig& config = NativeWindowConfig{});
@@ -173,7 +173,7 @@ private:
     void SyncNativeImeSpot(Rect caretRect, bool active) noexcept;
     [[nodiscard]] bool CanHostSleepIdle() const noexcept;
     void NotifyHostInputArrived() noexcept;
-    [[nodiscard]] std::shared_ptr<UIResourceContext> EffectiveResourceContext() const noexcept;
+    [[nodiscard]] std::shared_ptr<UIResourceStore> EffectiveResourceStore() const noexcept;
 
 #if defined(_WIN32)
     bool EnsureWin32ImmLoaded() noexcept;
@@ -184,9 +184,9 @@ private:
 
     DesktopEventHost* desktopHost_ = nullptr;
     WebCanvasHost* webHost_ = nullptr;
-    std::shared_ptr<UIResourceContext> resourceContext_{};
+    std::shared_ptr<UIResourceStore> resourceStore_{};
     PagedRenderTree* renderTree_ = nullptr;
-    InputEventRouter* inputRouter_ = nullptr;
+    VisualInputRouter* inputRouter_ = nullptr;
     std::unique_ptr<ZeroCopyGpuStream> ownedGpuStream_;
     ZeroCopyGpuStream* activeGpuStream_ = nullptr;
     std::unique_ptr<IGpuDeviceBackend> gpuBackend_;

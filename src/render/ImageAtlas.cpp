@@ -1,5 +1,5 @@
 #include "aero/render/ImageAtlas.hpp"
-#include "aero/core/UIResourceContext.hpp"
+#include "aero/core/UIResourceStore.hpp"
 
 #include <algorithm>
 #include <array>
@@ -2653,8 +2653,24 @@ ImageStretchPlacement ComputeImageStretchPlacement(
 // ImageAtlas Implementation (Skyline Bin Packer + Multi-Texture Slot Manager)
 // ============================================================================
 
+namespace {
+
+void EnsureImageAtlasRegisteredWithStore() noexcept {
+    UIResourceStore::RegisterImageAtlasHooks(
+        []() { return std::make_shared<ImageAtlas>(); },
+        [](ImageAtlas& atlas) noexcept { atlas.Clear(); });
+}
+
+const bool gImageAtlasStoreHooksInit = []() noexcept {
+    EnsureImageAtlasRegisteredWithStore();
+    return true;
+}();
+
+} // namespace
+
 ImageAtlas& ImageAtlas::Instance() noexcept {
-    return UIResourceContext::Current().Images();
+    EnsureImageAtlasRegisteredWithStore();
+    return UIResourceStore::Default().Images();
 }
 
 ImageAtlas::ImageAtlas() noexcept = default;

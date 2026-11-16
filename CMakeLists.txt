@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.20)
 
-project(AeroGUI2 VERSION 2.0.0 LANGUAGES C CXX)
+project(AeroGUI2 VERSION 3.0.0 LANGUAGES CXX)
 
 include(GNUInstallDirs)
 include(CMakePackageConfigHelpers)
@@ -11,7 +11,11 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
-option(AERO_BUILD_COMPILER_TOOLS "Build host XAML+RealScript compiler & desktop compiler test suites" ON)
+if(EMSCRIPTEN)
+    option(AERO_BUILD_COMPILER_TOOLS "Build host XAML+RealScript compiler & desktop compiler test suites" OFF)
+else()
+    option(AERO_BUILD_COMPILER_TOOLS "Build host XAML+RealScript compiler & desktop compiler test suites" ON)
+endif()
 option(AERO_BUILD_TESTS "Build AeroGUI conformance and slim-runtime test suites" ON)
 option(AERO_INSTALL_SDK "Generate installable AeroGUI2 SDK targets" ON)
 
@@ -28,10 +32,6 @@ else()
 endif()
 set(REALSCRIPT_BUILD_DIR "${_aero_default_realscript_build_dir}"
     CACHE PATH "Path to a RealScript build tree or installed SDK prefix containing RealScriptConfig.cmake")
-
-if(DEFINED REALSCRIPT_SOURCE_DIR AND NOT "${REALSCRIPT_SOURCE_DIR}" STREQUAL "")
-    message(WARNING "REALSCRIPT_SOURCE_DIR is deprecated and ignored; AeroGUI2 consumes prebuilt RealScript outputs via RealScript_DIR / REALSCRIPT_BUILD_DIR / CMAKE_PREFIX_PATH.")
-endif()
 
 if(MSVC AND EXISTS "${REALSCRIPT_BUILD_DIR}/Release")
     if(NOT EXISTS "${REALSCRIPT_BUILD_DIR}/RelWithDebInfo" AND NOT DEFINED CMAKE_MAP_IMPORTED_CONFIG_RELWITHDEBINFO)
@@ -54,311 +54,249 @@ if(NOT TARGET RealScript::SlimRuntime)
     )
 endif()
 
-if(DEFINED RealScript_SLIM_RUNTIME AND RealScript_SLIM_RUNTIME)
-    set(REALSCRIPT_SLIM_RUNTIME ON)
-endif()
-
-if(REALSCRIPT_SLIM_RUNTIME OR NOT TARGET RealScript::Frontend)
+if(NOT TARGET RealScript::Frontend)
     set(AERO_BUILD_COMPILER_TOOLS OFF CACHE BOOL "Compiler tools require full RealScript frontend" FORCE)
 endif()
 
+function(aero_apply_no_rtti_options target_name)
+    if(MSVC)
+        target_compile_options(${target_name} PRIVATE /utf-8 /GR-)
+    else()
+        target_compile_options(${target_name} PRIVATE -fno-rtti)
+    endif()
+endfunction()
+
+function(aero_apply_default_rtti_options target_name)
+    if(MSVC)
+        target_compile_options(${target_name} PRIVATE /utf-8)
+    endif()
+endfunction()
+
 # ============================================================================
-# 1. Modular Pure Runtime Libraries (NoesisGUI-Style Layered Targets, Wasm-Ready)
+# 1. Foundation (drawing + core + runtime + asset) [NO RTTI, SlimRuntime]
 # ============================================================================
-set(AERO_KERNEL_SOURCES
-    src/runtime/AeroObservableList.cpp
-    src/runtime/AeroExecutionDomains.cpp
+add_library(aerogui_foundation STATIC
     src/core/AeroObject.cpp
     src/core/TypeClass.cpp
-    src/core/DependencyProperty.cpp
-    src/core/UIViewContext.cpp
-    src/core/UIElement.cpp
-    src/core/UIResourceContext.cpp
-    src/asset/AxbFormat.cpp
-    src/asset/AxbTemplateRegistry.cpp
+    src/core/UIResourceStore.cpp
+    src/runtime/AeroExecutionDomains.cpp
+    src/runtime/AeroObservableList.cpp
     src/asset/GradientBrush.cpp
     src/asset/MtsdfPathBaker.cpp
-    src/asset/RiveDecoder.cpp
-    src/asset/ValueConverters.cpp
-    src/asset/XamlLiteralParser.cpp
-    src/layout/DepthBucketLayoutQueue.cpp
-    src/binding/DualTrackBindingEngine.cpp
-    src/controls/ControlContainers.cpp
-    src/controls/ControlPanelsShapes.cpp
-    src/controls/ControlButtonsRanges.cpp
-    src/controls/ControlTextMedia.cpp
-    src/controls/ControlItems.cpp
-    src/controls/AxbTemplateMounter.cpp
-    src/controls/ControlRenderEmitters.cpp
-    src/input/InputEventRouter.cpp
-    src/animation/AnimationEngine.cpp
-    src/style/StyleTriggerEngine.cpp
-    src/render/PagedRenderTree.cpp
-    src/render/FontAtlas.cpp
-    src/render/ImageAtlas.cpp
 )
-
-add_library(aerogui_kernel STATIC
-    ${AERO_KERNEL_SOURCES}
-)
-
-if(MSVC)
-    target_compile_options(aerogui_kernel PUBLIC /utf-8)
-endif()
-
-set_target_properties(aerogui_kernel PROPERTIES EXPORT_NAME Kernel)
-
-target_include_directories(aerogui_kernel
+add_library(AeroGUI::Foundation ALIAS aerogui_foundation)
+target_include_directories(aerogui_foundation
     PUBLIC
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
         $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
 )
-
-target_link_libraries(aerogui_kernel
+target_link_libraries(aerogui_foundation
     PUBLIC
         RealScript::SlimRuntime
+        $<$<BOOL:${Threads_FOUND}>:Threads::Threads>
 )
+aero_apply_no_rtti_options(aerogui_foundation)
 
-if(TARGET Threads::Threads)
-    target_link_libraries(aerogui_kernel PUBLIC Threads::Threads)
-endif()
-
-add_library(AeroGUI::Kernel ALIAS aerogui_kernel)
-
-set(AERO_RENDER_SOURCES
+# ============================================================================
+# 2. Render (atlases + PagedRenderTree + rasterizer + GPU) [NO RTTI]
+# ============================================================================
+add_library(aerogui_render STATIC
+    src/render/FontAtlas.cpp
+    src/render/ImageAtlas.cpp
+    src/render/PagedRenderTree.cpp
+    src/render/SoftwareRasterizer.cpp
     src/render/ZeroCopyGpuStream.cpp
     src/render/GpuBackend.cpp
 )
-
-add_library(aerogui_render STATIC
-    ${AERO_RENDER_SOURCES}
-)
-
-if(MSVC)
-    target_compile_options(aerogui_render PUBLIC /utf-8)
-endif()
-
-set_target_properties(aerogui_render PROPERTIES EXPORT_NAME Render)
-
-target_include_directories(aerogui_render
-    PUBLIC
-        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
-        $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
-)
-
+add_library(AeroGUI::Render ALIAS aerogui_render)
 target_link_libraries(aerogui_render
     PUBLIC
-        aerogui_kernel
+        aerogui_foundation
 )
-
-if(UNIX AND NOT APPLE AND NOT EMSCRIPTEN)
-    target_link_libraries(aerogui_render PUBLIC ${CMAKE_DL_LIBS})
+if(UNIX AND NOT EMSCRIPTEN AND CMAKE_DL_LIBS)
+    target_link_libraries(aerogui_render PRIVATE ${CMAKE_DL_LIBS})
 endif()
+aero_apply_no_rtti_options(aerogui_render)
 
-add_library(AeroGUI::Render ALIAS aerogui_render)
-
-set(AERO_APP_HOST_SOURCES
-    src/bridge/ScriptUIBridge.cpp
-    src/host/HostDrivers.cpp
-    src/host/NativeWindowHost.cpp
+# ============================================================================
+# 3. Visual Microkernel (VisualWorld + Drawing + Anim + Input + HostBindings)
+# ============================================================================
+add_library(aerogui_visual STATIC
+    src/visual/VisualTree.cpp
+    src/visual/VisualLayoutSolver.cpp
+    src/visual/DrawingCommandBuffer.cpp
+    src/visual/VisualAnimationEngine.cpp
+    src/visual/VisualInputRouter.cpp
+    src/visual/VisualRenderAdapter.cpp
+    src/visual/VisualHostBindings.cpp
 )
-
-add_library(aerogui_app_host STATIC
-    ${AERO_APP_HOST_SOURCES}
-)
-
-if(MSVC)
-    target_compile_options(aerogui_app_host PUBLIC /utf-8)
-    add_link_options(/STACK:8388608)
-endif()
-
-set_target_properties(aerogui_app_host PROPERTIES EXPORT_NAME AppHost)
-
-target_include_directories(aerogui_app_host
-    PUBLIC
-        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
-        $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
-)
-
-target_link_libraries(aerogui_app_host
+add_library(AeroGUI::Visual ALIAS aerogui_visual)
+target_link_libraries(aerogui_visual
     PUBLIC
         aerogui_render
 )
+aero_apply_no_rtti_options(aerogui_visual)
 
+# ============================================================================
+# 4. Platform Host (HostDrivers + NativeWindowHost) [NO RTTI]
+# ============================================================================
+add_library(aerogui_host STATIC
+    src/host/HostDrivers.cpp
+    src/host/NativeWindowHost.cpp
+)
+add_library(AeroGUI::Host ALIAS aerogui_host)
+target_link_libraries(aerogui_host
+    PUBLIC
+        aerogui_visual
+)
 if(WIN32)
-    target_link_libraries(aerogui_app_host PUBLIC user32 gdi32 imm32)
+    target_link_libraries(aerogui_host PRIVATE user32 gdi32)
 endif()
-
-add_library(AeroGUI::AppHost ALIAS aerogui_app_host)
+aero_apply_no_rtti_options(aerogui_host)
 
 add_library(aerogui_runtime INTERFACE)
-set_target_properties(aerogui_runtime PROPERTIES EXPORT_NAME Runtime)
-target_link_libraries(aerogui_runtime INTERFACE aerogui_app_host)
 add_library(AeroGUI::Runtime ALIAS aerogui_runtime)
-
-set(AERO_RUNTIME_SOURCES
-    ${AERO_KERNEL_SOURCES}
-    ${AERO_RENDER_SOURCES}
-    ${AERO_APP_HOST_SOURCES}
-)
+target_link_libraries(aerogui_runtime INTERFACE aerogui_host)
 
 # ============================================================================
-# 2. Host Compiler Library & CLI (Only built when full RealScript frontend is active)
+# 5. Ahead-of-Time / XAML Compiler (ZERO GUI/render/host/Win32 deps)
 # ============================================================================
-if(AERO_BUILD_COMPILER_TOOLS)
-    add_library(aerogui_compiler_lib STATIC
-        src/compiler/AeroCompiler.cpp
-        src/compiler/FrontendImporters.cpp
-        src/compiler/AeroAotCppEmitter.cpp
+if(AERO_BUILD_COMPILER_TOOLS AND TARGET RealScript::Frontend)
+    add_library(aerogui_compiler STATIC
+        src/compiler/StdlibModulePack.cpp
+        src/compiler/XmlPullLexer.cpp
+        src/compiler/MarkupExtensionParser.cpp
+        src/compiler/XamlToRsEmitter.cpp
         src/compiler/CSharpCompatLowerer.cpp
-        src/compiler/XamlApplication.cpp
+        src/compiler/AeroCompilerV3.cpp
     )
-
-    if(MSVC)
-        target_compile_options(aerogui_compiler_lib PUBLIC /utf-8)
-    endif()
-
-    set_target_properties(aerogui_compiler_lib PROPERTIES EXPORT_NAME Compiler)
-
-    target_include_directories(aerogui_compiler_lib
+    add_library(AeroGUI::Compiler ALIAS aerogui_compiler)
+    target_link_libraries(aerogui_compiler
         PUBLIC
-            $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
-            $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
-    )
-
-    target_link_libraries(aerogui_compiler_lib
-        PUBLIC
-            aerogui_runtime
+            aerogui_foundation
             RealScript::Frontend
     )
-
-    add_library(AeroGUI::Compiler ALIAS aerogui_compiler_lib)
-
-    # Composite targets (aerocore & aerogui_core) preserving 100% downstream compatibility
-    add_library(aerocore INTERFACE)
-    set_target_properties(aerocore PROPERTIES EXPORT_NAME Core)
-    target_link_libraries(aerocore
-        INTERFACE
-            aerogui_runtime
-            aerogui_compiler_lib
+    target_compile_definitions(aerogui_compiler
+        PUBLIC
+            AERO_STDLIB_DIR="${CMAKE_CURRENT_SOURCE_DIR}/stdlib"
     )
-
-    add_library(aerogui_core INTERFACE)
-    target_link_libraries(aerogui_core INTERFACE aerocore)
-    add_library(AeroGUI::Core ALIAS aerocore)
+    aero_apply_default_rtti_options(aerogui_compiler)
 
     add_executable(aero-compiler
         tools/aero_compiler/main.cpp
     )
-    set_target_properties(aero-compiler PROPERTIES EXPORT_NAME aero-compiler)
+    target_link_libraries(aero-compiler PRIVATE aerogui_compiler)
+    aero_apply_default_rtti_options(aero-compiler)
+endif()
 
-    target_link_libraries(aero-compiler
-        PRIVATE
-            aerogui_compiler_lib
-    )
+# ============================================================================
+# 6. App Host & Viewer Tool
+# ============================================================================
+add_library(aerogui_app STATIC
+    src/app/AeroAppHost.cpp
+)
+add_library(AeroGUI::App ALIAS aerogui_app)
+target_link_libraries(aerogui_app
+    PUBLIC
+        aerogui_host
+)
+if(AERO_BUILD_COMPILER_TOOLS AND TARGET aerogui_compiler)
+    target_link_libraries(aerogui_app PUBLIC aerogui_compiler)
+    target_compile_definitions(aerogui_app PUBLIC AERO_HAS_COMPILER_V3=1)
+    aero_apply_default_rtti_options(aerogui_app)
+else()
+    aero_apply_no_rtti_options(aerogui_app)
+endif()
 
+add_library(aerocore INTERFACE)
+add_library(AeroGUI::Core ALIAS aerocore)
+target_link_libraries(aerocore INTERFACE aerogui_app)
+
+if(NOT EMSCRIPTEN)
     add_executable(aero-viewer
         tools/aero_viewer/main.cpp
     )
-
-    target_link_libraries(aero-viewer
-        PRIVATE
-            aerocore
-    )
-
-    target_compile_definitions(aero-viewer
-        PRIVATE
-            AERO_SAMPLES_DIR="${CMAKE_CURRENT_SOURCE_DIR}/Samples"
-    )
-
-    if(AERO_BUILD_TESTS)
-        # Helper function to register test targets with strict source existence verification
-        function(aero_register_core_test target_name source_rel_path)
-            if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/${source_rel_path}")
-                add_executable(${target_name}
-                    "${source_rel_path}"
-                )
-                target_link_libraries(${target_name} PRIVATE aerocore)
-                target_compile_definitions(${target_name}
-                    PRIVATE
-                        AERO_SAMPLES_DIR="${CMAKE_CURRENT_SOURCE_DIR}/Samples"
-                        AERO_TEST_TEMP_DIR="${CMAKE_CURRENT_BINARY_DIR}/test_out"
-                )
-                add_test(
-                    NAME ${target_name}
-                    COMMAND ${target_name}
-                    WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
-                )
-            else()
-                message(FATAL_ERROR "Missing test source: ${CMAKE_CURRENT_SOURCE_DIR}/${source_rel_path}")
-            endif()
-        endfunction()
-
-        # Active canonical WPF/script & 23-sample regression/completeness suites
-        aero_register_core_test(wpf_controls_and_script_tests   tests/wpf_controls_and_script_tests.cpp)
-        aero_register_core_test(samples_mainwindow_tests        tests/samples_mainwindow_tests.cpp)
-        aero_register_core_test(samples_completeness_tests      tests/samples_completeness_tests.cpp)
-        aero_register_core_test(samples_golden_regression_tests tests/samples_golden_regression_tests.cpp)
-    endif()
-else()
-    # In Wasm / REALSCRIPT_SLIM_RUNTIME mode, aerocore & aerogui_core alias the pure runtime
-    add_library(aerocore INTERFACE)
-    set_target_properties(aerocore PROPERTIES EXPORT_NAME Core)
-    target_link_libraries(aerocore INTERFACE aerogui_runtime)
-
-    add_library(aerogui_core INTERFACE)
-    target_link_libraries(aerogui_core INTERFACE aerocore)
-    add_library(AeroGUI::Core ALIAS aerocore)
-endif()
-
-if(AERO_BUILD_TESTS)
-    # Pure runtime smoke test compiling all runtime TUs + test with RTTI disabled
-    # (avoids -frtti/-fno-rtti cross-TU ODR mixing and verifies 0 dynamic_cast/typeid & 0 AeroCompiler.cpp dependency)
-    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/slim_runtime_smoke_tests.cpp")
-        add_executable(aerogui_slim_runtime_tests
-            ${AERO_RUNTIME_SOURCES}
-            tests/slim_runtime_smoke_tests.cpp
-        )
-        target_include_directories(aerogui_slim_runtime_tests
-            PRIVATE
-                ${CMAKE_CURRENT_SOURCE_DIR}/include
-        )
-        target_link_libraries(aerogui_slim_runtime_tests
-            PRIVATE
-                RealScript::SlimRuntime
-        )
-        target_compile_definitions(aerogui_slim_runtime_tests
-            PRIVATE
-                AERO_SAMPLES_DIR="${CMAKE_CURRENT_SOURCE_DIR}/Samples"
-                AERO_TEST_TEMP_DIR="${CMAKE_CURRENT_BINARY_DIR}/test_out"
-        )
-        if(WIN32)
-            target_link_libraries(aerogui_slim_runtime_tests PRIVATE user32 gdi32 imm32)
-        endif()
-        if(TARGET Threads::Threads)
-            target_link_libraries(aerogui_slim_runtime_tests PRIVATE Threads::Threads)
-        endif()
-        if(UNIX AND NOT APPLE AND NOT EMSCRIPTEN)
-            target_link_libraries(aerogui_slim_runtime_tests PRIVATE ${CMAKE_DL_LIBS})
-        endif()
-        if(MSVC)
-            target_compile_options(aerogui_slim_runtime_tests PRIVATE /utf-8 /GR-)
-        else()
-            target_compile_options(aerogui_slim_runtime_tests PRIVATE -fno-rtti)
-        endif()
-        add_test(
-            NAME aerogui_slim_runtime_tests
-            COMMAND aerogui_slim_runtime_tests
-            WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
-        )
+    target_link_libraries(aero-viewer PRIVATE aerogui_app)
+    if(AERO_BUILD_COMPILER_TOOLS AND TARGET aerogui_compiler)
+        aero_apply_default_rtti_options(aero-viewer)
     else()
-        message(FATAL_ERROR "Missing test source: ${CMAKE_CURRENT_SOURCE_DIR}/tests/slim_runtime_smoke_tests.cpp")
+        aero_apply_no_rtti_options(aero-viewer)
     endif()
 endif()
 
-set(aerogui_export_targets aerogui_kernel aerogui_render aerogui_app_host aerogui_runtime aerocore)
-if(AERO_BUILD_COMPILER_TOOLS)
-    list(APPEND aerogui_export_targets aerogui_compiler_lib aero-compiler)
+# ============================================================================
+# Pre-Registered Future v3 CTest Suites
+# ============================================================================
+if(AERO_BUILD_TESTS)
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/microkernel_tests.cpp")
+        add_executable(microkernel_tests tests/microkernel_tests.cpp)
+        target_link_libraries(microkernel_tests PRIVATE aerogui_visual)
+        aero_apply_no_rtti_options(microkernel_tests)
+        add_test(NAME microkernel_tests COMMAND microkernel_tests)
+    endif()
+
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/render_host_tests.cpp")
+        add_executable(render_host_tests tests/render_host_tests.cpp)
+        target_link_libraries(render_host_tests PRIVATE aerogui_host)
+        aero_apply_no_rtti_options(render_host_tests)
+        add_test(NAME render_host_tests COMMAND render_host_tests)
+    endif()
+
+    if(AERO_BUILD_COMPILER_TOOLS AND TARGET aerogui_compiler AND
+       EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/compiler_v3_tests.cpp")
+        add_executable(compiler_v3_tests tests/compiler_v3_tests.cpp)
+        target_link_libraries(compiler_v3_tests PRIVATE aerogui_compiler)
+        target_compile_definitions(compiler_v3_tests PRIVATE
+            AERO_STDLIB_DIR="${CMAKE_CURRENT_SOURCE_DIR}/stdlib"
+            AERO_SAMPLES_DIR="${CMAKE_CURRENT_SOURCE_DIR}/Samples"
+            AERO_TEST_TEMP_DIR="${CMAKE_CURRENT_BINARY_DIR}/test_out"
+        )
+        aero_apply_default_rtti_options(compiler_v3_tests)
+        add_test(NAME compiler_v3_tests COMMAND compiler_v3_tests)
+    endif()
+
+    if(AERO_BUILD_COMPILER_TOOLS AND TARGET aerogui_app AND
+       EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/v3_controls_and_samples_tests.cpp")
+        add_executable(v3_controls_and_samples_tests tests/v3_controls_and_samples_tests.cpp)
+        target_link_libraries(v3_controls_and_samples_tests PRIVATE aerogui_app)
+        target_compile_definitions(v3_controls_and_samples_tests PRIVATE
+            AERO_STDLIB_DIR="${CMAKE_CURRENT_SOURCE_DIR}/stdlib"
+            AERO_SAMPLES_DIR="${CMAKE_CURRENT_SOURCE_DIR}/Samples"
+            AERO_TEST_TEMP_DIR="${CMAKE_CURRENT_BINARY_DIR}/test_out"
+        )
+        aero_apply_default_rtti_options(v3_controls_and_samples_tests)
+        add_test(NAME v3_controls_and_samples_tests COMMAND v3_controls_and_samples_tests)
+    endif()
+
+    if(AERO_BUILD_COMPILER_TOOLS AND TARGET aero-compiler AND
+       EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/v3_slim_no_rtti_and_aot_tests.cpp")
+        add_executable(v3_slim_no_rtti_and_aot_tests tests/v3_slim_no_rtti_and_aot_tests.cpp)
+        target_link_libraries(v3_slim_no_rtti_and_aot_tests PRIVATE aerogui_host)
+        add_dependencies(v3_slim_no_rtti_and_aot_tests aero-compiler)
+        target_compile_definitions(v3_slim_no_rtti_and_aot_tests PRIVATE
+            AERO_COMPILER_EXE="$<TARGET_FILE:aero-compiler>"
+            AERO_STDLIB_DIR="${CMAKE_CURRENT_SOURCE_DIR}/stdlib"
+            AERO_TEST_TEMP_DIR="${CMAKE_CURRENT_BINARY_DIR}/test_out"
+        )
+        aero_apply_no_rtti_options(v3_slim_no_rtti_and_aot_tests)
+        add_test(NAME v3_slim_no_rtti_and_aot_tests COMMAND v3_slim_no_rtti_and_aot_tests)
+    endif()
+endif()
+
+# ============================================================================
+# Package Config / SDK Export
+# ============================================================================
+set(_aero_export_targets
+    aerogui_foundation
+    aerogui_render
+    aerogui_visual
+    aerogui_host
+    aerogui_runtime
+    aerogui_app
+    aerocore
+)
+if(TARGET aerogui_compiler)
+    list(APPEND _aero_export_targets aerogui_compiler aero-compiler)
     set(AERO_HAS_COMPILER_TOOLS_CMAKE TRUE)
 else()
     set(AERO_HAS_COMPILER_TOOLS_CMAKE FALSE)
@@ -366,7 +304,7 @@ endif()
 
 file(TO_CMAKE_PATH "${RealScript_DIR}" REALSCRIPT_CONFIG_HINT_DIR)
 export(
-    TARGETS ${aerogui_export_targets}
+    TARGETS ${_aero_export_targets}
     NAMESPACE AeroGUI::
     FILE "${CMAKE_CURRENT_BINARY_DIR}/AeroGUI2Targets.cmake"
 )
@@ -384,7 +322,7 @@ write_basic_package_version_file(
 if(AERO_INSTALL_SDK)
     set(REALSCRIPT_CONFIG_HINT_DIR "")
     install(
-        TARGETS ${aerogui_export_targets}
+        TARGETS ${_aero_export_targets}
         EXPORT AeroGUI2Targets
         ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
         LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}

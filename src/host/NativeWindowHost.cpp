@@ -5,9 +5,9 @@
 #include <cstring>
 #include <thread>
 
-#include "aero/asset/AxbFormat.hpp"
-#include "aero/core/UIResourceContext.hpp"
-#include "aero/input/TextInputMethod.hpp"
+#include "aero/core/StringUtils.hpp"
+#include "aero/core/UIResourceStore.hpp"
+#include "aero/visual/VisualInputRouter.hpp"
 
 #if defined(__EMSCRIPTEN__)
 #include <emscripten/emscripten.h>
@@ -690,7 +690,7 @@ void NativeWindowHost::BindDesktopHost(
     DesktopEventHost* desktopHost,
     PagedRenderTree* renderTree,
     ZeroCopyGpuStream* gpuStream,
-    InputEventRouter* inputRouter) noexcept {
+    VisualInputRouter* inputRouter) noexcept {
     if (desktopHost_) {
         desktopHost_->SetWakeCallback(nullptr, nullptr);
     }
@@ -725,7 +725,7 @@ void NativeWindowHost::BindWebCanvasHost(
     WebCanvasHost* webHost,
     PagedRenderTree* renderTree,
     ZeroCopyGpuStream* gpuStream,
-    InputEventRouter* inputRouter) noexcept {
+    VisualInputRouter* inputRouter) noexcept {
     if (webHost_) {
         webHost_->SetWakeCallback(nullptr, nullptr);
     }
@@ -852,7 +852,7 @@ bool NativeWindowHost::Initialize(const NativeWindowConfig& config) {
     win32WakeEvent_ = static_cast<void*>(CreateEventW(nullptr, FALSE, FALSE, nullptr));
 #endif
 
-    ScopedUIResourceContext resourceScope(EffectiveResourceContext());
+    (void)EffectiveResourceStore();
     if (!InitializePlatformWindowAndBackend(config)) {
         Shutdown();
         return false;
@@ -1503,7 +1503,7 @@ bool NativeWindowHost::InitializePlatformWindowAndBackend(const NativeWindowConf
                             }
                             ime->OnCompositionEnd(utf8);
                             if (self->webHost_ && !utf8.empty()) {
-                                ScopedUIResourceContext resourceScope(self->EffectiveResourceContext());
+                                (void)self->EffectiveResourceStore();
                                 (void)self->webHost_->FontStream().InspectTextAndQueueMissingShards(utf8);
                             }
                             handled = true;
@@ -2112,15 +2112,15 @@ bool NativeWindowHost::WaitForEventsOrWake(std::int32_t timeoutMs) noexcept {
 #endif
 }
 
-std::shared_ptr<UIResourceContext> NativeWindowHost::EffectiveResourceContext() const noexcept {
-    if (resourceContext_) {
-        return resourceContext_;
+std::shared_ptr<UIResourceStore> NativeWindowHost::EffectiveResourceStore() const noexcept {
+    if (resourceStore_) {
+        return resourceStore_;
     }
     if (desktopHost_) {
-        return desktopHost_->GetResourceContext();
+        return desktopHost_->GetResourceStore();
     }
     if (webHost_) {
-        return webHost_->GetResourceContext();
+        return webHost_->GetResourceStore();
     }
     return nullptr;
 }
@@ -2215,7 +2215,7 @@ void NativeWindowHost::OnPlatformTextInput(std::string_view utf8Text) noexcept {
         (void)inputRouter_->QueueTextInput(utf8Text);
     }
     if (webHost_) {
-        ScopedUIResourceContext resourceScope(EffectiveResourceContext());
+        (void)EffectiveResourceStore();
         (void)webHost_->FontStream().InspectTextAndQueueMissingShards(utf8Text);
     }
     NotifyHostInputArrived();
@@ -2436,7 +2436,7 @@ GpuBackendFrameStats NativeWindowHost::TickAndPresentFrame(float dtSeconds, bool
     if (!IsInitialized() || !gpuBackend_ || !activeGpuStream_) {
         return frameStats;
     }
-    ScopedUIResourceContext resourceScope(EffectiveResourceContext());
+    (void)EffectiveResourceStore();
 
     auto markAllTreePagesDirty = [](PagedRenderTree& tree) noexcept {
         if (tree.DirtyPageCount() >= tree.PageCount()) {
@@ -2525,15 +2525,13 @@ GpuBackendFrameStats NativeWindowHost::TickAndPresentFrame(float dtSeconds, bool
 
     // Refresh IME caret screen bounds if a TextBox is currently focused and moved during layout
     if (inputRouter_) {
-        if (auto* focused = inputRouter_->FocusedElement()) {
-            if (focused->AcceptsActiveImeInput()) {
-                const Rect currentCaret = focused->GetEditableCaretScreenRect();
-                if (!(currentCaret == telemetry_.lastSyncedImeCaretRect) || !telemetry_.lastImeActive) {
-                    if (ITextInputMethodHost* ime = ActiveImeHost()) {
-                        ime->FocusTextInput(focused, currentCaret);
-                    }
-                    SyncNativeImeSpot(currentCaret, true);
+        if (inputRouter_->HasFocusedTextInput()) {
+            const Rect currentCaret = inputRouter_->FocusedTextCaretRect();
+            if (!(currentCaret == telemetry_.lastSyncedImeCaretRect) || !telemetry_.lastImeActive) {
+                if (ITextInputMethodHost* ime = ActiveImeHost()) {
+                    ime->FocusTextInput(inputRouter_->FocusedNode(), currentCaret);
                 }
+                SyncNativeImeSpot(currentCaret, true);
             }
         } else if (telemetry_.lastImeActive) {
             SyncNativeImeSpot(Rect{}, false);
@@ -2826,7 +2824,7 @@ bool NativeWindowHost::CaptureFramebufferRgba8(
             (void)wglMakeCur(static_cast<HDC>(win32Hdc_), static_cast<HGLRC>(win32Hglrc_));
         }
         if (renderTree_ && activeGpuStream_) {
-            ScopedUIResourceContext resourceScope(EffectiveResourceContext());
+            (void)EffectiveResourceStore();
             (void)gpuBackend_->PresentStream(*renderTree_, *activeGpuStream_, width_, height_, clearColor_);
         }
     }
@@ -2835,7 +2833,7 @@ bool NativeWindowHost::CaptureFramebufferRgba8(
         x11_->glxContext && x11_->glXMakeCurrent) {
         (void)x11_->glXMakeCurrent(x11_->display, x11_->window, x11_->glxContext);
         if (renderTree_ && activeGpuStream_) {
-            ScopedUIResourceContext resourceScope(EffectiveResourceContext());
+            (void)EffectiveResourceStore();
             (void)gpuBackend_->PresentStream(*renderTree_, *activeGpuStream_, width_, height_, clearColor_);
         }
     }

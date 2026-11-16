@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <string_view>
 
 namespace realscript::runtime {
 struct QuatfValue;
@@ -575,9 +576,29 @@ struct CornerRadius {
     [[nodiscard]] static CornerRadius FromFloat4(const Float4Value& v) noexcept;
 };
 
+enum class Visibility : std::uint8_t {
+    Visible = 0,
+    Hidden = 1,
+    Collapsed = 2
+};
+
 enum class Orientation : std::uint8_t {
-    Vertical = 0,
-    Horizontal = 1
+    Horizontal = 0,
+    Vertical = 1
+};
+
+enum class HorizontalAlignment : std::uint8_t {
+    Stretch = 0,
+    Left = 1,
+    Center = 2,
+    Right = 3
+};
+
+enum class VerticalAlignment : std::uint8_t {
+    Stretch = 0,
+    Top = 1,
+    Center = 2,
+    Bottom = 3
 };
 
 enum class Stretch : std::uint8_t {
@@ -588,9 +609,9 @@ enum class Stretch : std::uint8_t {
 };
 
 enum class StretchDirection : std::uint8_t {
-    Both = 0,
-    UpOnly = 1,
-    DownOnly = 2
+    UpOnly = 0,
+    DownOnly = 1,
+    Both = 2
 };
 
 enum class ExpandDirection : std::uint8_t {
@@ -599,5 +620,85 @@ enum class ExpandDirection : std::uint8_t {
     Left = 2,
     Right = 3
 };
+
+enum class Dock : std::uint8_t {
+    Left = 0,
+    Top = 1,
+    Right = 2,
+    Bottom = 3
+};
+
+enum class ClickMode : std::uint8_t {
+    Release = 0,
+    Press = 1,
+    Hover = 2
+};
+
+enum class SelectionMode : std::uint8_t {
+    Single = 0,
+    Multiple = 1,
+    Extended = 2
+};
+
+enum class TabStripPlacement : std::uint8_t {
+    Top = 0,
+    Bottom = 1,
+    Left = 2,
+    Right = 3
+};
+
+enum class ScrollBarVisibility : std::uint8_t {
+    Disabled = 0,
+    Auto = 1,
+    Hidden = 2,
+    Visible = 3
+};
+
+enum class TextWrapping : std::uint8_t {
+    NoWrap = 0,
+    Wrap = 1,
+    WrapWithOverflow = 2
+};
+
+enum class TextAlignment : std::uint8_t {
+    Left = 0,
+    Center = 1,
+    Right = 2,
+    Justify = 3
+};
+
+enum class TextTrimming : std::uint8_t {
+    None = 0,
+    CharacterEllipsis = 1,
+    WordEllipsis = 2
+};
+
+enum class GridUnitType : std::uint8_t {
+    Auto = 0,
+    Pixel = 1,
+    Star = 2
+};
+
+enum class UIEffectKind : std::uint8_t {
+    None = 0,
+    Blur = 1,
+    DropShadow = 2,
+    Pixelate = 3,
+    BackdropBlur = 4,
+    Tint = 5,
+    ChromaticAberration = 6,
+    DirectionalBlur = 7,
+    Saturation = 8
+};
+
+enum class BlendingMode : std::uint8_t {
+    Normal = 0,
+    Multiply = 1,
+    Screen = 2,
+    Additive = 3
+};
+
+[[nodiscard]] Color ParseColorLiteral(std::string_view raw) noexcept;
+[[nodiscard]] std::uint32_t ParseColorRgba32(std::string_view raw) noexcept;
 
 } // namespace aero

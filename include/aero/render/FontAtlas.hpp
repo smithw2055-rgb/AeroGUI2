@@ -10,7 +10,6 @@
 #include <unordered_map>
 #include <vector>
 
-#include "aero/core/DependencyProperty.hpp"
 #include "aero/core/UnifiedValue.hpp"
 
 namespace aero {

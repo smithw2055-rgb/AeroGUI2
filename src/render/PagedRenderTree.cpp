@@ -1,5 +1,4 @@
 #include "aero/render/PagedRenderTree.hpp"
-#include "aero/render/PagedRenderTreeInternal.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -7,31 +6,74 @@
 #include <cmath>
 #include <cstring>
 
-#include "aero/asset/AxbFormat.hpp"
-#include "aero/asset/AxbTemplateRegistry.hpp"
-#include "aero/binding/DualTrackBindingEngine.hpp"
+#include "aero/core/StringUtils.hpp"
+#include "aero/core/UIResourceStore.hpp"
 #include "aero/render/FontAtlas.hpp"
 #include "aero/render/ImageAtlas.hpp"
 
 namespace aero {
+
+struct MtsdfMappedQuad {
+    Rect quadRect{};
+    float u0 = 0.0f;
+    float v0 = 0.0f;
+    float u1 = 1.0f;
+    float v1 = 1.0f;
+};
+
+struct SurfaceFillBorderPlan {
+    Rect fillRect{};
+    CornerRadius fillRadii{};
+    Color fillColor{0.0f, 0.0f, 0.0f, 0.0f};
+    bool hasVisibleFill = false;
+
+    Rect borderRect{};
+    CornerRadius borderRadii{};
+    Thickness borderThickness{};
+    Color borderColor{0.0f, 0.0f, 0.0f, 0.0f};
+    bool reserveBorderNode = false;
+    bool hasVisibleBorder = false;
+};
+
+[[nodiscard]] std::size_t CountLayoutVisibleGlyphs(const TextLayoutResult& layout) noexcept;
+[[nodiscard]] Matrix2D MatrixFromState(
+    float m00, float m01, float m10, float m11, float tx, float ty) noexcept;
+[[nodiscard]] MtsdfMappedQuad ComputeMtsdfMappedPlacement(
+    const Rect& fitted,
+    const AxbMtsdfPathEntry& entry,
+    float strokeThickness) noexcept;
+void ApplyTextAlignmentToLayout(
+    TextLayoutResult& layout,
+    TextAlignment align,
+    float alignBoxWidth) noexcept;
+[[nodiscard]] Rect ComputeStretchedDestRect(
+    const Rect& box,
+    float naturalW,
+    float naturalH,
+    Stretch stretch) noexcept;
+[[nodiscard]] CornerRadius SanitizeCornerRadius(const CornerRadius& r) noexcept;
+[[nodiscard]] Thickness SanitizeThickness(const Thickness& t) noexcept;
+[[nodiscard]] bool HasPositiveThickness(const Thickness& t) noexcept;
+[[nodiscard]] std::uint32_t ExtractGradBrushId(const UnifiedValue& v) noexcept;
+[[nodiscard]] SurfaceFillBorderPlan BuildSurfaceFillBorderPlan(
+    const Rect& outerRect,
+    const CornerRadius& rawRadii,
+    bool hasVisibleFill,
+    const Color& fillColor,
+    bool reserveBorderNode,
+    const Color& borderColor,
+    const Thickness& rawBorderThickness) noexcept;
+void ConfigureRoundedRectDescriptor(
+    RenderNodeDescriptor& desc,
+    const CornerRadius& rawRadii,
+    const Thickness& rawBorder,
+    bool hollowBorder) noexcept;
 
 namespace {
 
 std::atomic<std::uint32_t> gNextRenderTreeId{1u};
 
 } // namespace
-
-std::string ResolveElementFontFamily(const UIElement* elem) {
-    for (const UIElement* cur = elem; cur != nullptr; cur = cur->Parent()) {
-        const UnifiedValue v = cur->GetValue(PropId_FontFamily);
-        if (const auto* sv = std::get_if<StringValue>(&v)) {
-            if (!sv->view().empty()) {
-                return sv->str();
-            }
-        }
-    }
-    return {};
-}
 
 namespace {
 
@@ -240,34 +282,7 @@ Rect ComputeStretchedDestRect(
     }
 }
 
-Color ModulateInteractiveSurfaceColor(Color base, const UIElement* elem) noexcept {
-    if (!elem) {
-        return base;
-    }
-    if (!elem->IsEffectivelyEnabled()) {
-        const float luma = 0.299f * base.r + 0.587f * base.g + 0.114f * base.b;
-        return Color{
-            0.5f * base.r + 0.5f * luma,
-            0.5f * base.g + 0.5f * luma,
-            0.5f * base.b + 0.5f * luma,
-            base.a * 0.55f};
-    }
-    if (elem->IsPressed()) {
-        return Color{
-            std::clamp(base.r * 0.78f, 0.0f, 1.0f),
-            std::clamp(base.g * 0.80f, 0.0f, 1.0f),
-            std::clamp(base.b * 0.86f, 0.0f, 1.0f),
-            base.a};
-    }
-    if (elem->IsHovered()) {
-        return Color{
-            std::clamp(base.r + 0.08f, 0.0f, 1.0f),
-            std::clamp(base.g + 0.09f, 0.0f, 1.0f),
-            std::clamp(base.b + 0.11f, 0.0f, 1.0f),
-            base.a};
-    }
-    return base;
-}
+
 
 namespace {
 
@@ -816,43 +831,7 @@ std::uint32_t ExtractGradBrushId(const UnifiedValue& v) noexcept {
     return 0u;
 }
 
-SurfaceFillBorderPlan ComputeContainerFillBorderPlan(
-    const UIElement* elem,
-    const Rect& outerRect) noexcept {
-    if (!elem) {
-        return SurfaceFillBorderPlan{};
-    }
-    // Containers (Panel/Grid/StackPanel/DockPanel/WrapPanel/Canvas/ScrollViewer/ItemsControl/
-    // UserControl/Window/Border) strictly use PropId_Background only — never PropId_Foreground,
-    // and never fall back to an opaque default backdrop when unbacked.
-    float bgOpMul = 1.0f;
-    (void)TryGetFloat(elem->GetValue(PropId_BackgroundOpacity), bgOpMul);
-    bgOpMul = std::clamp(bgOpMul, 0.0f, 1.0f);
-    float brdOpMul = 1.0f;
-    (void)TryGetFloat(elem->GetValue(PropId_BorderOpacity), brdOpMul);
-    brdOpMul = std::clamp(brdOpMul, 0.0f, 1.0f);
-    auto bgOpt = value::TryGetColor(elem->GetValue(PropId_Background));
-    if (bgOpt) bgOpt->a = std::clamp(bgOpt->a * bgOpMul, 0.0f, 1.0f);
-    const bool hasVisibleBg = bgOpt.has_value() && (bgOpt->a > 0.0f);
-    const bool hasGradientBg = (ExtractGradBrushId(elem->GetValue(PropId_BackgroundGradientId)) != 0u) && (bgOpMul > 0.0f);
-    const Color fillCol = hasVisibleBg ? *bgOpt : Color{0.0f, 0.0f, 0.0f, 0.0f};
 
-    const CornerRadius cr = value::TryGetCornerRadius(elem->GetValue(PropId_CornerRadius))
-        .value_or(CornerRadius{});
-    const Thickness bt = value::TryGetThickness(elem->GetValue(PropId_BorderThickness))
-        .value_or(Thickness{});
-    auto bbOpt = value::TryGetColor(elem->GetValue(PropId_BorderBrush));
-    if (bbOpt) bbOpt->a = std::clamp(bbOpt->a * brdOpMul, 0.0f, 1.0f);
-
-    return BuildSurfaceFillBorderPlan(
-        outerRect,
-        cr,
-        hasVisibleBg || hasGradientBg,
-        fillCol,
-        bbOpt.has_value(),
-        bbOpt.value_or(Color{0.0f, 0.0f, 0.0f, 0.0f}),
-        bt);
-}
 
 void ConfigureRoundedRectDescriptor(
     RenderNodeDescriptor& desc,
@@ -1525,9 +1504,19 @@ void PagedRenderTree::RegisterMtsdfInTreeAtlas(const AxbMtsdfPathEntry& entry) {
     }
 
     mtsdfRegisteredHashes_.insert(entry.pathHash);
+    mtsdfEntries_[entry.pathHash] = entry;
+    (resourceStore_ ? resourceStore_ : &UIResourceStore::Default())->RegisterMtsdfPath(entry);
     const std::uint32_t endLocalRow = static_cast<std::uint32_t>(dstY1 - static_cast<int>(kMtsdfBaseY));
     mtsdfPopulatedRows_ = std::max(mtsdfPopulatedRows_, std::min(kMtsdfMaxRows, endLocalRow));
     ++mtsdfAtlasRevision_;
+}
+
+const AxbMtsdfPathEntry* PagedRenderTree::FindMtsdfEntry(std::uint64_t pathHash) const noexcept {
+    if (pathHash == 0ull) {
+        return nullptr;
+    }
+    const auto it = mtsdfEntries_.find(pathHash);
+    return (it != mtsdfEntries_.end()) ? &it->second : nullptr;
 }
 
 void PagedRenderTree::InitPreCachedDigitGlyphs() noexcept {
@@ -1573,12 +1562,10 @@ void PagedRenderTree::SetRootDpiScale(float scale) noexcept {
         : 1.0f;
     if (std::fabs(clamped - rootDpiScale_) > 1e-4f) {
         rootDpiScale_ = clamped;
-        boundRootElement_ = nullptr;
     }
 }
 
 void PagedRenderTree::Clear() noexcept {
-    boundRootElement_ = nullptr;
     activeClipRect_ = Rect{0.0f, 0.0f, 16384.0f, 16384.0f};
     activeClipEnabled_ = false;
     pages_.clear();
@@ -1586,10 +1573,8 @@ void PagedRenderTree::Clear() noexcept {
     pageDirtyFlags_.clear();
     dirtyPageList_.clear();
     blurLayerSpans_.clear();
-    pendingComboPopups_.clear();
-    activeComboPopupOwners_.clear();
     standaloneTextRuns_.clear();
-    // Advance treeId_ so stale cached renderNodeId_ handles on UIElements never collide
+    mtsdfEntries_.clear();
     treeId_ = gNextRenderTreeId.fetch_add(1u, std::memory_order_relaxed);
 }
 
@@ -1753,7 +1738,7 @@ std::uint32_t PagedRenderTree::AllocateRenderNode(
     const Color& color,
     float cornerRadius,
     float borderThickness,
-    const UIElement* owner) {
+    const void* owner) {
     const std::uint32_t pageIdx = EnsurePageForAllocation(4u, activeClipRect_, activeClipEnabled_);
     CommandPage& page = pages_[pageIdx];
     const auto vOffset = static_cast<std::uint16_t>(page.header.vertexCount);
@@ -1788,7 +1773,7 @@ std::uint32_t PagedRenderTree::AllocateRoundedRectNode(
     float height,
     const Color& color,
     const CornerRadius& cornerRadii,
-    const UIElement* owner) {
+    const void* owner) {
     const std::uint32_t pageIdx = EnsurePageForAllocation(4u, activeClipRect_, activeClipEnabled_);
     CommandPage& page = pages_[pageIdx];
     const auto vOffset = static_cast<std::uint16_t>(page.header.vertexCount);
@@ -1824,7 +1809,7 @@ std::uint32_t PagedRenderTree::AllocateBorderRingNode(
     const Color& borderColor,
     const CornerRadius& cornerRadii,
     const Thickness& borderThickness,
-    const UIElement* owner) {
+    const void* owner) {
     const std::uint32_t pageIdx = EnsurePageForAllocation(4u, activeClipRect_, activeClipEnabled_);
     CommandPage& page = pages_[pageIdx];
     const auto vOffset = static_cast<std::uint16_t>(page.header.vertexCount);
@@ -1861,7 +1846,7 @@ std::uint32_t PagedRenderTree::AllocateEllipseNode(
     float strokeThickness,
     bool hollowStroke,
     float opacity,
-    const UIElement* owner) {
+    const void* owner) {
     const std::uint32_t pageIdx = EnsurePageForAllocation(4u, activeClipRect_, activeClipEnabled_);
     CommandPage& page = pages_[pageIdx];
     const auto vOffset = static_cast<std::uint16_t>(page.header.vertexCount);
@@ -1904,7 +1889,7 @@ std::uint32_t PagedRenderTree::AllocateGradientRoundedRectNode(
     bool isEllipseShape,
     const Color& tintModulator,
     float opacity,
-    const UIElement* owner) {
+    const void* owner) {
     const std::uint32_t pageIdx = EnsurePageForAllocation(4u, activeClipRect_, activeClipEnabled_);
     CommandPage& page = pages_[pageIdx];
     const auto vOffset = static_cast<std::uint16_t>(page.header.vertexCount);
@@ -1988,7 +1973,7 @@ std::uint32_t PagedRenderTree::AllocateTextRunNode(
     const Color& color,
     float opacity,
     std::uint32_t reservedGlyphCapacity,
-    const UIElement* owner,
+    const void* owner,
     std::string_view fontFamily,
     float maxWidth,
     TextWrapping wrapMode) {
@@ -2036,7 +2021,7 @@ std::uint32_t PagedRenderTree::AllocateMtsdfPathNode(
     const Color& fillColor,
     float strokeThickness,
     float opacity,
-    const UIElement* owner) {
+    const void* owner) {
     RegisterMtsdfInTreeAtlas(mtsdfEntry);
     const std::uint32_t pageIdx = EnsurePageForAllocation(4u, activeClipRect_, activeClipEnabled_);
     CommandPage& page = pages_[pageIdx];
@@ -2092,7 +2077,7 @@ std::uint32_t PagedRenderTree::AllocateTexturedNode(
     float v1,
     const Color& tintColor,
     float opacity,
-    const UIElement* owner) {
+    const void* owner) {
     return AllocateTexturedNode(x, y, width, height, u0, v0, u1, v1, tintColor, opacity, owner, 0u);
 }
 
@@ -2107,7 +2092,7 @@ std::uint32_t PagedRenderTree::AllocateTexturedNode(
     float v1,
     const Color& tintColor,
     float opacity,
-    const UIElement* owner,
+    const void* owner,
     std::uint32_t textureId) {
     const std::uint32_t pageIdx = EnsurePageForAllocation(
         4u,
@@ -2156,7 +2141,7 @@ std::uint32_t PagedRenderTree::AllocateRadialArcNode(
     float innerRadiusRatio01,
     const Color& color,
     float opacity,
-    const UIElement* owner) {
+    const void* owner) {
     const std::uint32_t pageIdx = EnsurePageForAllocation(4u, activeClipRect_, activeClipEnabled_);
     CommandPage& page = pages_[pageIdx];
     const auto vOffset = static_cast<std::uint16_t>(page.header.vertexCount);
@@ -2350,63 +2335,15 @@ bool PagedRenderTree::UpdateHudDigitsText(
 }
 
 
-std::string ExtractContainerImageBrushUri(const UIElement* elem, Stretch* outStretch) {
-    if (outStretch != nullptr) {
-        *outStretch = Stretch::Fill;
-    }
-    if (!elem) return {};
-    auto hasImageExtCI = [](std::string_view sv) noexcept -> bool {
-        const std::size_t dot = sv.rfind('.');
-        if (dot == std::string_view::npos || dot + 1u >= sv.size()) {
-            return false;
-        }
-        std::string_view ext = sv.substr(dot + 1u);
-        const std::size_t q = ext.find_first_of("?#");
-        if (q != std::string_view::npos) {
-            ext = ext.substr(0u, q);
-        }
-        auto eqCI = [](std::string_view a, std::string_view b) noexcept -> bool {
-            if (a.size() != b.size()) return false;
-            for (std::size_t i = 0u; i < a.size(); ++i) {
-                const char ca = (a[i] >= 'A' && a[i] <= 'Z')
-                    ? static_cast<char>(a[i] - 'A' + 'a')
-                    : a[i];
-                if (ca != b[i]) return false;
-            }
-            return true;
-        };
-        return eqCI(ext, "png") || eqCI(ext, "jpg") || eqCI(ext, "jpeg") ||
-               eqCI(ext, "bmp") || eqCI(ext, "tga") || eqCI(ext, "webp");
-    };
-    for (const std::uint16_t pid : {PropId_ImageSource, PropId_Background}) {
-        const UnifiedValue v = elem->GetValue(pid);
-        if (const auto* sv = std::get_if<StringValue>(&v)) {
-            const std::string_view raw = sv->view();
-            if (raw.empty()) continue;
-            if (raw.front() == '#' || raw.rfind("AERO_GRAD:", 0) == 0) {
-                continue;
-            }
-            if (raw.size() > 16u && raw.rfind("AERO_IMGBRUSH:", 0) == 0 &&
-                raw[15] == ':' && raw[14] >= '0' && raw[14] <= '3') {
-                if (outStretch != nullptr) {
-                    *outStretch = static_cast<Stretch>(raw[14] - '0');
-                }
-                return std::string(raw.substr(16u));
-            }
-            if (hasImageExtCI(raw)) {
-                return std::string(raw);
-            }
-        }
-    }
-    return {};
-}
+
 
 void ParseRichTextToPlainAndStyles(
     std::string_view rawBbCode,
     const Color& baseColor,
-    const UIElement* owner,
+    const void* owner,
     std::string& outPlainUtf8,
     std::vector<RichGlyphStyle>& outCodePointStyles) {
+    (void)owner;
     outPlainUtf8.clear();
     outCodePointStyles.clear();
 
@@ -2447,10 +2384,8 @@ void ParseRichTextToPlainAndStyles(
                     (tagContent.size() == 4u || tagContent[4] == ' ' || tagContent[4] == '=')) {
                     const std::size_t endBind = rawBbCode.find("[/bind]", closeBracket + 1u);
                     if (endBind != std::string_view::npos) {
-                        const std::string resolved = StripAndResolveRichTextBbCode(
-                            rawBbCode.substr(i, (endBind + 7u) - i),
-                            owner);
-                        appendPlainSegment(resolved);
+                        appendPlainSegment(
+                            rawBbCode.substr(closeBracket + 1u, endBind - (closeBracket + 1u)));
                         i = endBind + 7u;
                         continue;
                     }
@@ -2487,22 +2422,10 @@ void ParseRichTextToPlainAndStyles(
                         } else if (tagName == "s") {
                             next.strikethrough = true;
                         } else if (tagName == "color" && !tagArg.empty()) {
-                            next.color = ParseXamlColorLiteral(tagArg);
+                            next.color = ParseColorLiteral(tagArg);
                             next.hasCustomColor = true;
                         } else if (tagName == "style" && !tagArg.empty()) {
-                            bool matchedStyle = false;
-                            if (const AxbStyleDefinition* st = AxbTemplateRegistry::Instance().FindStyle(tagArg)) {
-                                for (const auto& setter : st->setters) {
-                                    if (setter.propId == PropId_Foreground) {
-                                        if (auto cOpt = value::TryGetColor(setter.value)) {
-                                            next.color = *cOpt;
-                                            next.hasCustomColor = true;
-                                            matchedStyle = true;
-                                        }
-                                        if (tagArg == "ColoredText") next.bold = true;
-                                    }
-                                }
-                            }
+                            const bool matchedStyle = false;
                             if (!matchedStyle && tagArg == "ColoredText") {
                                 next.color = Color{0.165f, 0.651f, 0.886f, 1.0f}; // #FF2AA6E2
                                 next.hasCustomColor = true;
@@ -2693,7 +2616,7 @@ std::uint16_t PagedRenderTree::EmitTextRunNodes(
     const Color& color,
     float opacity,
     const RenderTraversalState& curState,
-    const UIElement* owner,
+    const void* owner,
     std::string_view fontFamily,
     float maxWidth,
     TextWrapping wrapMode,
@@ -2799,12 +2722,6 @@ bool PagedRenderTree::RefreshTextNode(std::uint32_t nodeId) noexcept {
     if (nodeId >= nodes_.size()) {
         return false;
     }
-    const RenderNodeDescriptor& node = nodes_[nodeId];
-    if (node.sourceElement != nullptr) {
-        if (UpdateDirtyElement(node.sourceElement)) {
-            return true;
-        }
-    }
     if (const auto it = standaloneTextRuns_.find(nodeId); it != standaloneTextRuns_.end()) {
         const StandaloneTextRunRecord& rec = it->second;
         const TextLayoutResult layout = MeasureTextLayout(
@@ -2823,26 +2740,12 @@ std::size_t PagedRenderTree::RefreshGlyphRange(
         return 0u;
     }
     std::size_t refreshed = 0u;
-    const UIElement* lastElement = nullptr;
-
     for (std::uint32_t nid = 0u; nid < static_cast<std::uint32_t>(nodes_.size()); ++nid) {
         const RenderNodeDescriptor& nd = nodes_[nid];
         if (nd.primType != AeroPrimType::SdfTextGlyph) {
             continue;
         }
-        if (nd.sourceElement != nullptr) {
-            if (nd.sourceElement == lastElement) {
-                continue;
-            }
-            std::string elemText;
-            if (nd.sourceElement->TryGetRenderGlyphScanText(elemText) &&
-                TextContainsCodePointInRange(elemText, rangeStart, rangeEnd)) {
-                lastElement = nd.sourceElement;
-                if (UpdateDirtyElement(nd.sourceElement)) {
-                    ++refreshed;
-                }
-            }
-        } else if (const auto it = standaloneTextRuns_.find(nid); it != standaloneTextRuns_.end()) {
+        if (const auto it = standaloneTextRuns_.find(nid); it != standaloneTextRuns_.end()) {
             if (TextContainsCodePointInRange(it->second.utf8Text, rangeStart, rangeEnd)) {
                 if (RefreshTextNode(nid)) {
                     ++refreshed;
@@ -2851,278 +2754,6 @@ std::size_t PagedRenderTree::RefreshGlyphRange(
         }
     }
     return refreshed;
-}
-
-bool PagedRenderTree::UpdateDirtyElement(const UIElement* element) noexcept {
-    if (!element) {
-        return false;
-    }
-
-    try {
-        // Reconstruct ancestor state along parent chain in O(depth) with 0 heap allocations
-        const UIElement* chain[64]{};
-        std::size_t depth = 0;
-        for (const UIElement* anc = element->Parent(); anc != nullptr && depth < 64u; anc = anc->Parent()) {
-            chain[depth++] = anc;
-        }
-
-        RenderTraversalState parentState{};
-        bool ancestorHasDropShadow = false;
-        for (std::size_t idx = depth; idx > 0u; --idx) {
-            const UIElement* anc = chain[idx - 1u];
-            if (anc->GetEffectDescriptor().kind == UIEffectKind::DropShadow) {
-                ancestorHasDropShadow = true;
-            }
-            const Visibility ancVis = anc->GetVisibility();
-            if (ancVis != Visibility::Visible) {
-                parentState.inheritedOpacity = 0.0f;
-            } else {
-                parentState.inheritedOpacity *= std::clamp(anc->GetOpacity(), 0.0f, 1.0f);
-            }
-            const Rect ar = anc->FinalRect();
-            const float aw = (ar.width > 0.0f) ? ar.width : std::max(0.0f, anc->GetWidth());
-            const float ah = (ar.height > 0.0f) ? ar.height : std::max(0.0f, anc->GetHeight());
-            const Matrix2D ancLocal2D = anc->ComputeLocalEffectiveTransform2D();
-            ApplyStateMatrix(
-                parentState.m00, parentState.m01, parentState.m10, parentState.m11, parentState.tx, parentState.ty,
-                ancLocal2D);
-            if (anc->HasActiveTransform3D()) {
-                parentState.world3D = Matrix4x4::ComposePlanarHomography(
-                    parentState.world3D,
-                    anc->ComputeLocalEffectiveTransform3D());
-                parentState.hasPerspective3D = true;
-            } else if (parentState.hasPerspective3D) {
-                if (!ancLocal2D.IsIdentity()) {
-                    parentState.world3D = Matrix4x4::ComposePlanarHomography(
-                        parentState.world3D,
-                        Matrix4x4::FromMatrix2D(ancLocal2D));
-                }
-            } else {
-                parentState.world3D = Matrix4x4::FromMatrix2D(
-                    MatrixFromState(
-                        parentState.m00, parentState.m01, parentState.m10, parentState.m11, parentState.tx, parentState.ty));
-            }
-
-            const UnifiedValue clipVal = anc->GetValue(PropId_ClipToBounds);
-            if (const auto* clipBool = std::get_if<bool>(&clipVal); clipBool && *clipBool) {
-                const Matrix2D ancWorldM = MatrixFromState(
-                    parentState.m00, parentState.m01, parentState.m10, parentState.m11, parentState.tx, parentState.ty);
-                Rect rawClip = anc->GetLocalClipBounds();
-                if (ar.width <= 0.0f && ar.height <= 0.0f && (aw > 0.0f || ah > 0.0f)) {
-                    rawClip = Rect{ar.x, ar.y, aw, ah};
-                }
-                const Rect bounds = ancWorldM.TransformRectBounds(rawClip);
-                parentState.clipRect = parentState.clipActive ? IntersectRect(parentState.clipRect, bounds) : bounds;
-                parentState.clipActive = true;
-            }
-
-            const Matrix2D childContainer2D = anc->GetChildContainerTransform2D();
-            ApplyStateMatrix(
-                parentState.m00, parentState.m01, parentState.m10, parentState.m11, parentState.tx, parentState.ty,
-                childContainer2D);
-            if (parentState.hasPerspective3D) {
-                if (!childContainer2D.IsIdentity()) {
-                    parentState.world3D = Matrix4x4::ComposePlanarHomography(
-                        parentState.world3D,
-                        Matrix4x4::FromMatrix2D(childContainer2D));
-                }
-            } else {
-                parentState.world3D = Matrix4x4::FromMatrix2D(
-                    MatrixFromState(
-                        parentState.m00, parentState.m01, parentState.m10, parentState.m11, parentState.tx, parentState.ty));
-            }
-        }
-
-        RenderTraversalState curState = parentState;
-        const Visibility vis = element->GetVisibility();
-        if (vis != Visibility::Visible) {
-            curState.inheritedOpacity = 0.0f;
-        } else {
-            curState.inheritedOpacity *= std::clamp(element->GetOpacity(), 0.0f, 1.0f);
-        }
-        const Matrix2D elemLocal2D = element->ComputeLocalEffectiveTransform2D();
-        ApplyStateMatrix(
-            curState.m00, curState.m01, curState.m10, curState.m11, curState.tx, curState.ty,
-            elemLocal2D);
-        if (element->HasActiveTransform3D()) {
-            curState.world3D = Matrix4x4::ComposePlanarHomography(
-                curState.world3D,
-                element->ComputeLocalEffectiveTransform3D());
-            curState.hasPerspective3D = true;
-        } else if (curState.hasPerspective3D) {
-            if (!elemLocal2D.IsIdentity()) {
-                curState.world3D = Matrix4x4::ComposePlanarHomography(
-                    curState.world3D,
-                    Matrix4x4::FromMatrix2D(elemLocal2D));
-            }
-        } else {
-            curState.world3D = Matrix4x4::FromMatrix2D(
-                MatrixFromState(curState.m00, curState.m01, curState.m10, curState.m11, curState.tx, curState.ty));
-        }
-
-        if (!ancestorHasDropShadow && UpdateElementInPlace(element, curState)) {
-            return true;
-        }
-
-        // Element grew beyond its in-page span capacity or structurally changed -> rebuild cleanly
-        // to preserve 100% exact Painter's Algorithm Z-order with zero leaked dead nodes.
-        const UIElement* rebuildRoot = (boundRootElement_ != nullptr)
-            ? boundRootElement_
-            : ((depth > 0u) ? chain[depth - 1u] : element);
-        if (rebuildRoot != nullptr && !nodes_.empty()) {
-            (void)BuildFromVisualTree(rebuildRoot);
-            return true;
-        }
-        return false;
-    } catch (...) {
-        return false;
-    }
-}
-
-bool PagedRenderTree::UpdateElementInPlace(
-    const UIElement* element,
-    const RenderTraversalState& curState) {
-    if (!element) {
-        return false;
-    }
-
-    // O(1) direct span lookup via UIElement::RenderNodeId(), with O(N) fallback only if unbound
-    std::uint32_t firstId = UIElement::InvalidRenderNodeId;
-    std::uint16_t span = 0u;
-    if (element->RenderTreeId() == treeId_ &&
-        element->RenderNodeId() < nodes_.size() &&
-        element->RenderNodeSpan() > 0u &&
-        nodes_[element->RenderNodeId()].sourceElement == element) {
-        firstId = element->RenderNodeId();
-        span = element->RenderNodeSpan();
-    } else {
-        for (std::uint32_t i = 0; i < static_cast<std::uint32_t>(nodes_.size()); ++i) {
-            if (nodes_[i].sourceElement == element) {
-                firstId = i;
-                span = 1u;
-                while (firstId + span < nodes_.size() &&
-                       nodes_[firstId + span].sourceElement == element) {
-                    ++span;
-                }
-                element->BindRenderNodeSpan(treeId_, firstId, span);
-                break;
-            }
-        }
-    }
-
-    if (firstId == UIElement::InvalidRenderNodeId || span == 0u) {
-        return false;
-    }
-    if (element->GetEffectDescriptor().kind != UIEffectKind::None ||
-        element->HasCustomRender() ||
-        element->FindCompactEntry(PropId_BlendingMode) != nullptr) {
-        return false;
-    }
-
-    const Visibility vis = element->GetVisibility();
-    const Rect r = element->FinalRect();
-    const float boxW = (vis == Visibility::Collapsed)
-        ? 0.0f
-        : ((r.width > 0.0f) ? r.width : std::max(0.0f, element->GetWidth()));
-    const float boxH = (vis == Visibility::Collapsed)
-        ? 0.0f
-        : ((r.height > 0.0f) ? r.height : std::max(0.0f, element->GetHeight()));
-    const float effOpacity = (vis == Visibility::Visible) ? curState.inheritedOpacity : 0.0f;
-
-    auto syncQuadTransform = [&](RenderNodeDescriptor& nd) noexcept {
-        nd.m00 = curState.m00;
-        nd.m01 = curState.m01;
-        nd.m10 = curState.m10;
-        nd.m11 = curState.m11;
-        nd.baseTx = curState.tx;
-        nd.baseTy = curState.ty;
-        nd.tx = curState.tx + nd.x * (curState.m00 - 1.0f) + nd.y * curState.m01;
-        nd.ty = curState.ty + nd.x * curState.m10 + nd.y * (curState.m11 - 1.0f);
-        nd.inheritedOpacity = curState.inheritedOpacity;
-        nd.hasPerspective3D = curState.hasPerspective3D;
-        nd.worldMatrix3D = curState.world3D;
-    };
-
-    // Specialized Path update
-    if (element->HasControlTemplate()) {
-        if (span != 1u) {
-            return false;
-        }
-        RenderNodeDescriptor& anchorNode = nodes_[firstId];
-        anchorNode.x = r.x;
-        anchorNode.y = r.y;
-        anchorNode.width = 0.0f;
-        anchorNode.height = 0.0f;
-        anchorNode.opacity = 0.0f;
-        anchorNode.baseRgba = 0u;
-        ConfigureRoundedRectDescriptor(anchorNode, CornerRadius{}, Thickness{}, false);
-        syncQuadTransform(anchorNode);
-        WriteQuadVertices(anchorNode);
-        MarkPageDirty(anchorNode.pageIndex, anchorNode.vertexOffsetInPage);
-        element->ClearLayoutDirtyFlags(RenderDirty);
-        return true;
-    }
-
-    const RenderInPlaceResult hookResult = element->TryUpdateRenderElementInPlace(
-        *this, curState, r, boxW, boxH, effOpacity);
-    if (hookResult == RenderInPlaceResult::UpdatedInPlace) {
-        return true;
-    }
-    if (hookResult == RenderInPlaceResult::NeedsFullRebuild) {
-        return false;
-    }
-
-    // Generic Quad / Border / Panel update
-    if (ExtractGradBrushId(element->GetValue(PropId_BackgroundGradientId)) != 0u ||
-        !ExtractContainerImageBrushUri(element).empty() ||
-        nodes_[firstId].primType == AeroPrimType::GradientRoundedRect ||
-        nodes_[firstId].primType == AeroPrimType::TexturedQuad) {
-        return false;
-    }
-    const SurfaceFillBorderPlan plan = ComputeContainerFillBorderPlan(
-        element,
-        Rect{r.x, r.y, boxW, boxH});
-    const std::uint16_t neededSpan = plan.reserveBorderNode ? 2u : 1u;
-
-    if (span < neededSpan) {
-        return false;
-    }
-
-    {
-        RenderNodeDescriptor& fillNode = nodes_[firstId];
-        fillNode.x = plan.fillRect.x;
-        fillNode.y = plan.fillRect.y;
-        fillNode.width = plan.fillRect.width;
-        fillNode.height = plan.fillRect.height;
-        fillNode.opacity = plan.hasVisibleFill ? effOpacity : 0.0f;
-        fillNode.baseRgba = PackColorRgba8(plan.fillColor, 1.0f);
-        ConfigureRoundedRectDescriptor(fillNode, plan.fillRadii, Thickness{}, false);
-        syncQuadTransform(fillNode);
-        WriteQuadVertices(fillNode);
-        MarkPageDirty(fillNode.pageIndex, fillNode.vertexOffsetInPage);
-    }
-
-    if (span >= 2u) {
-        const bool activeBorder = plan.hasVisibleBorder && (vis == Visibility::Visible);
-        RenderNodeDescriptor& borderNode = nodes_[firstId + 1u];
-        borderNode.x = plan.borderRect.x;
-        borderNode.y = plan.borderRect.y;
-        borderNode.width = activeBorder ? plan.borderRect.width : 0.0f;
-        borderNode.height = activeBorder ? plan.borderRect.height : 0.0f;
-        borderNode.opacity = activeBorder ? effOpacity : 0.0f;
-        borderNode.baseRgba = activeBorder ? PackColorRgba8(plan.borderColor, 1.0f) : 0u;
-        ConfigureRoundedRectDescriptor(borderNode, plan.borderRadii, plan.borderThickness, true);
-        syncQuadTransform(borderNode);
-        WriteQuadVertices(borderNode);
-        MarkPageDirty(borderNode.pageIndex, borderNode.vertexOffsetInPage);
-
-        for (std::uint16_t k = 2u; k < span; ++k) {
-            ZeroOutNodeVertices(nodes_[firstId + k]);
-        }
-    }
-
-    element->ClearLayoutDirtyFlags(RenderDirty);
-    return true;
 }
 
 std::size_t PagedRenderTree::BatchUpdateWidthsFromRawColumn(
@@ -3178,29 +2809,6 @@ std::size_t PagedRenderTree::BatchUpdateWidthsFromRawColumn(
                     v[3].u = -halfW;
                 }
             } else {
-                if (node.sourceElement != nullptr) {
-                    const Matrix2D oldLocal = node.sourceElement->ComputeLocalEffectiveTransform2DForRect(
-                        Rect{node.x, node.y, oldW, node.height});
-                    const Matrix2D newLocal = node.sourceElement->ComputeLocalEffectiveTransform2DForRect(
-                        Rect{node.x, node.y, w, node.height});
-                    if (oldLocal != newLocal) {
-                        Matrix2D invOld{};
-                        if (oldLocal.TryInvert(invOld)) {
-                            const Matrix2D prevWorld = MatrixFromState(
-                                node.m00, node.m01, node.m10, node.m11, node.baseTx, node.baseTy);
-                            const Matrix2D parentM = Matrix2D::Multiply(prevWorld, invOld);
-                            const Matrix2D nextWorld = Matrix2D::Multiply(parentM, newLocal);
-                            node.m00 = nextWorld.m00;
-                            node.m01 = nextWorld.m01;
-                            node.m10 = nextWorld.m10;
-                            node.m11 = nextWorld.m11;
-                            node.baseTx = nextWorld.tx;
-                            node.baseTy = nextWorld.ty;
-                            node.tx = nextWorld.tx + node.x * (nextWorld.m00 - 1.0f) + node.y * nextWorld.m01;
-                            node.ty = nextWorld.ty + node.x * nextWorld.m10 + node.y * (nextWorld.m11 - 1.0f);
-                        }
-                    }
-                }
                 WriteQuadVertices(node);
             }
 
@@ -3219,1287 +2827,6 @@ std::size_t PagedRenderTree::BatchUpdateWidthsFromRawColumn(
 
     dirtyPageList_.resize(dirtyListCount);
     return updatedCount;
-}
-
-std::size_t PagedRenderTree::BatchUpdateFromEcsTrackB(
-    const DualTrackBindingEngine& bindingEngine,
-    std::uint32_t firstNodeId) noexcept {
-    std::size_t totalUpdated = 0;
-    std::uint32_t cursorNodeId = firstNodeId;
-    for (const auto& channel : bindingEngine.EcsChannels()) {
-        const NativeRawColumnView* view = bindingEngine.ResolveChannelView(channel);
-        const std::size_t reservedSpan = !channel.targetElements.empty()
-            ? channel.targetElements.size()
-            : (view ? view->count : 0u);
-        if (view && view->basePtr) {
-            const std::size_t stride = (channel.elementStride != 0)
-                ? channel.elementStride
-                : view->strideBytes;
-            if (stride != 0) {
-                const std::size_t count = !channel.targetElements.empty()
-                    ? std::min(channel.targetElements.size(), view->count)
-                    : view->count;
-                totalUpdated += BatchUpdateWidthsFromRawColumn(
-                    cursorNodeId,
-                    count,
-                    view->basePtr,
-                    stride,
-                    channel.fieldByteOffset,
-                    channel.scaleFactor);
-            }
-        }
-        cursorNodeId += static_cast<std::uint32_t>(reservedSpan);
-    }
-    return totalUpdated;
-}
-
-bool PagedRenderTree::SubtreeContainsActiveComboPopup(const UIElement* elem) const noexcept {
-    if (!elem || activeComboPopupOwners_.empty()) {
-        return false;
-    }
-    for (const UIElement* owner : activeComboPopupOwners_) {
-        for (const UIElement* cur = owner; cur != nullptr; cur = cur->Parent()) {
-            if (cur == elem) {
-                return true;
-            }
-        }
-    }
-    return false;
-}
-
-void PagedRenderTree::EmitDeferredComboPopups() {
-    if (pendingComboPopups_.empty()) {
-        return;
-    }
-    // Render open ComboBox dropdown menus unclipped on top of sibling controls
-    activeClipRect_ = Rect{0.0f, 0.0f, 16384.0f, 16384.0f};
-    activeClipEnabled_ = false;
-
-    for (const auto& entry : pendingComboPopups_) {
-        if (entry.combo != nullptr) {
-            entry.combo->EmitDeferredOverlayPopupPrimitives(*this, entry.state);
-        }
-    }
-    pendingComboPopups_.clear();
-}
-
-std::size_t PagedRenderTree::BuildFromVisualTree(const UIElement* rootElement) {
-    Clear();
-    if (!rootElement) {
-        return 0;
-    }
-    boundRootElement_ = rootElement;
-    RenderTraversalState rootState{};
-    if (std::fabs(rootDpiScale_ - 1.0f) > 1e-4f) {
-        rootState.m00 = rootDpiScale_;
-        rootState.m11 = rootDpiScale_;
-        rootState.world3D = Matrix4x4::FromMatrix2D(
-            Matrix2D::Scaling(rootDpiScale_, rootDpiScale_, 0.0f, 0.0f));
-    }
-    TraverseAndEmitElement(rootElement, rootState);
-    EmitDeferredComboPopups();
-    return nodes_.size();
-}
-
-void PagedRenderTree::CollapseSubtreeRenderNodesRecursive(
-    const UIElement* elem,
-    std::size_t& ioUpdatedNodes) noexcept {
-    if (!elem) {
-        return;
-    }
-    if (elem->RenderTreeId() == treeId_ &&
-        elem->RenderNodeId() < nodes_.size() &&
-        elem->RenderNodeSpan() > 0u) {
-        const std::uint32_t firstId = elem->RenderNodeId();
-        const std::uint16_t span = elem->RenderNodeSpan();
-        bool anyZeroed = false;
-        for (std::uint16_t k = 0; k < span && firstId + k < nodes_.size(); ++k) {
-            RenderNodeDescriptor& nd = nodes_[firstId + k];
-            if (nd.sourceElement == elem) {
-                nd.width = 0.0f;
-                nd.height = 0.0f;
-                nd.opacity = 0.0f;
-                ZeroOutNodeVertices(nd);
-                anyZeroed = true;
-            }
-        }
-        if (anyZeroed) {
-            ++ioUpdatedNodes;
-        }
-    }
-    elem->DetachRenderNodeSpan();
-    elem->ClearLayoutDirtyFlags(static_cast<std::uint8_t>(RenderDirty | SubtreeRenderDirty));
-    for (const UIElement* child = elem->FirstChild(); child != nullptr; child = child->NextSibling()) {
-        CollapseSubtreeRenderNodesRecursive(child, ioUpdatedNodes);
-    }
-}
-
-std::size_t PagedRenderTree::SyncVisualTree(const UIElement* rootElement) {
-    if (!rootElement) {
-        Clear();
-        return 0;
-    }
-    if (boundRootElement_ != rootElement ||
-        nodes_.empty() ||
-        (rootElement->GetVisibility() != Visibility::Collapsed && rootElement->RenderTreeId() != treeId_)) {
-        return BuildFromVisualTree(rootElement);
-    }
-
-    // Fast O(1) clean-frame short-circuit!
-    const std::uint8_t rootFlags = rootElement->GetLayoutDirtyFlags();
-    if ((rootFlags & (RenderDirty | SubtreeRenderDirty)) == 0u) {
-        return 0;
-    }
-
-    std::size_t updatedNodes = 0;
-    bool needsRebuild = false;
-    RenderTraversalState rootState{};
-    if (std::fabs(rootDpiScale_ - 1.0f) > 1e-4f) {
-        rootState.m00 = rootDpiScale_;
-        rootState.m11 = rootDpiScale_;
-        rootState.world3D = Matrix4x4::FromMatrix2D(
-            Matrix2D::Scaling(rootDpiScale_, rootDpiScale_, 0.0f, 0.0f));
-    }
-    (void)SyncDirtySubtreeRecursive(rootElement, rootState, false, updatedNodes, needsRebuild);
-    if (needsRebuild) {
-        return BuildFromVisualTree(rootElement);
-    }
-    return updatedNodes;
-}
-
-bool PagedRenderTree::SyncDirtySubtreeRecursive(
-    const UIElement* elem,
-    const RenderTraversalState& parentState,
-    bool forceSubtreeSync,
-    std::size_t& ioUpdatedNodes,
-    bool& outNeedsFullRebuild) {
-    if (!elem) {
-        return true;
-    }
-
-    const std::uint8_t flags = elem->GetLayoutDirtyFlags();
-    if (!forceSubtreeSync && (flags & (RenderDirty | SubtreeRenderDirty)) == 0u) {
-        return true;
-    }
-
-    // If a container or leaf transitioned to Collapsed, zero out its entire subtree's GPU vertices in-place (0 allocs!)
-    if (elem->GetVisibility() == Visibility::Collapsed) {
-        if (SubtreeContainsActiveComboPopup(elem)) {
-            outNeedsFullRebuild = true;
-            return false;
-        }
-        CollapseSubtreeRenderNodesRecursive(elem, ioUpdatedNodes);
-        return true;
-    }
-    if (!elem->IsOpenForHitTest()) {
-        CollapseSubtreeRenderNodesRecursive(elem, ioUpdatedNodes);
-        return true;
-    }
-
-    if (elem->HasActiveTransform3D() || parentState.hasPerspective3D ||
-        elem->GetEffectKind() != UIEffectKind::None) {
-        outNeedsFullRebuild = true;
-        return false;
-    }
-    if (!blurLayerSpans_.empty() && elem->RenderTreeId() == treeId_ && elem->RenderNodeSpan() > 0u) {
-        const std::uint32_t n0 = elem->RenderNodeId();
-        const std::uint32_t n1 = n0 + elem->RenderNodeSpan();
-        for (const auto& sp : blurLayerSpans_) {
-            if (sp.effectMode == UIEffectKind::BackdropBlur) {
-                if (n0 <= sp.firstNodeId) {
-                    outNeedsFullRebuild = true;
-                    return false;
-                }
-            } else if (n0 < sp.endNodeId && n1 > sp.firstNodeId) {
-                outNeedsFullRebuild = true;
-                return false;
-            }
-        }
-    }
-
-    // If a new child was dynamically added, a sibling was removed (parent detached), or Visibility transitioned
-    // out of Collapsed/unemitted state, trigger a clean structural rebuild once.
-    if (elem->RenderTreeId() != treeId_ ||
-        elem->RenderNodeId() >= nodes_.size() ||
-        elem->RenderNodeSpan() == 0u ||
-        nodes_[elem->RenderNodeId()].sourceElement != elem) {
-        outNeedsFullRebuild = true;
-        return false;
-    }
-
-    const Rect r = elem->FinalRect();
-    const float w = (r.width > 0.0f) ? r.width : std::max(0.0f, elem->GetWidth());
-    const float h = (r.height > 0.0f) ? r.height : std::max(0.0f, elem->GetHeight());
-
-    RenderTraversalState curState = parentState;
-    if (elem->GetVisibility() != Visibility::Visible) {
-        curState.inheritedOpacity = 0.0f;
-    } else {
-        curState.inheritedOpacity *= std::clamp(elem->GetOpacity(), 0.0f, 1.0f);
-    }
-
-    if ((elem->GetVisibility() != Visibility::Visible || curState.inheritedOpacity <= 0.0f ||
-         !elem->IsEffectivelyEnabled()) &&
-        SubtreeContainsActiveComboPopup(elem)) {
-        outNeedsFullRebuild = true;
-        return false;
-    }
-
-    ApplyStateMatrix(
-        curState.m00, curState.m01, curState.m10, curState.m11, curState.tx, curState.ty,
-        elem->ComputeLocalEffectiveTransform2D());
-
-    // Check whether this container's inherited opacity or full 2D/3D transform changed so descendants also sync
-    bool propagateToAllChildren = forceSubtreeSync;
-    if (!propagateToAllChildren && elem->FirstChild() != nullptr) {
-        const RenderNodeDescriptor& prevNode = nodes_[elem->RenderNodeId()];
-        if (std::fabs(prevNode.inheritedOpacity - curState.inheritedOpacity) > 1e-5f ||
-            std::fabs(prevNode.m00 - curState.m00) > 1e-5f ||
-            std::fabs(prevNode.m01 - curState.m01) > 1e-5f ||
-            std::fabs(prevNode.m10 - curState.m10) > 1e-5f ||
-            std::fabs(prevNode.m11 - curState.m11) > 1e-5f ||
-            std::fabs(prevNode.baseTx - curState.tx) > 1e-3f ||
-            std::fabs(prevNode.baseTy - curState.ty) > 1e-3f) {
-            propagateToAllChildren = true;
-        }
-    }
-
-    if (forceSubtreeSync || (flags & RenderDirty) != 0u) {
-        if (!UpdateElementInPlace(elem, curState)) {
-            outNeedsFullRebuild = true;
-            return false;
-        }
-        ++ioUpdatedNodes;
-        elem->ClearLayoutDirtyFlags(RenderDirty);
-    }
-
-    if (elem->RequiresFullRenderRebuildOnDirty() && (flags & RenderDirty) != 0u) {
-        outNeedsFullRebuild = true;
-        return false;
-    }
-    if (elem->SuppressesUntemplatedRenderChildren()) {
-        elem->ClearLayoutDirtyFlags(SubtreeRenderDirty);
-        return true;
-    }
-
-    RenderTraversalState childState = curState;
-    const UnifiedValue clipVal = elem->GetValue(PropId_ClipToBounds);
-    if (const auto* clipBool = std::get_if<bool>(&clipVal); clipBool && *clipBool) {
-        const Matrix2D worldM = MatrixFromState(
-            curState.m00, curState.m01, curState.m10, curState.m11, curState.tx, curState.ty);
-        Rect rawClip = elem->GetLocalClipBounds();
-        if (r.width <= 0.0f && r.height <= 0.0f && (w > 0.0f || h > 0.0f)) {
-            rawClip = Rect{r.x, r.y, w, h};
-        }
-        const Rect transformedBounds = worldM.TransformRectBounds(rawClip);
-        childState.clipRect = childState.clipActive
-            ? IntersectRect(childState.clipRect, transformedBounds)
-            : transformedBounds;
-        childState.clipActive = true;
-    }
-    ApplyStateMatrix(
-        childState.m00, childState.m01, childState.m10, childState.m11, childState.tx, childState.ty,
-        elem->GetChildContainerTransform2D());
-
-    // Verify child CommandPage scissor state matches childState when container or clip changed
-    if (elem->FirstChild() != nullptr && (forceSubtreeSync || (flags & RenderDirty) != 0u)) {
-        for (const UIElement* child = elem->FirstChild(); child != nullptr; child = child->NextSibling()) {
-            if (child->GetVisibility() != Visibility::Collapsed &&
-                child->RenderTreeId() == treeId_ &&
-                child->RenderNodeId() < nodes_.size()) {
-                const std::uint32_t cPageIdx = nodes_[child->RenderNodeId()].pageIndex;
-                if (cPageIdx < pages_.size() &&
-                    !SameClipRect(pages_[cPageIdx].header, childState.clipRect, childState.clipActive)) {
-                    outNeedsFullRebuild = true;
-                    return false;
-                }
-                break;
-            }
-        }
-    }
-
-    if (propagateToAllChildren || (flags & SubtreeRenderDirty) != 0u) {
-        for (const UIElement* child = elem->FirstChild(); child != nullptr; child = child->NextSibling()) {
-            if (!SyncDirtySubtreeRecursive(
-                    child, childState, propagateToAllChildren, ioUpdatedNodes, outNeedsFullRebuild)) {
-                return false;
-            }
-        }
-        elem->ClearLayoutDirtyFlags(SubtreeRenderDirty);
-    }
-    return true;
-}
-
-std::uint16_t ControlRenderEmitter::EmitCapsuleLine(
-    PagedRenderTree& tree,
-    float x1,
-    float y1,
-    float x2,
-    float y2,
-    float strokeW,
-    const Color& strokeCol,
-    float effOpacity,
-    bool emitEvenIfInvisible,
-    bool roundCapExtend,
-    const PagedRenderTraversalState& curState,
-    const UIElement* owner) {
-    float wx1 = x1;
-    float wy1 = y1;
-    float wx2 = x2;
-    float wy2 = y2;
-    const bool projected3D = curState.hasPerspective3D;
-    if (projected3D) {
-        const Point p1 = curState.world3D.ProjectPoint2D(Point{wx1, wy1});
-        const Point p2 = curState.world3D.ProjectPoint2D(Point{wx2, wy2});
-        wx1 = p1.x;
-        wy1 = p1.y;
-        wx2 = p2.x;
-        wy2 = p2.y;
-    }
-    const float dx = wx2 - wx1;
-    const float dy = wy2 - wy1;
-    const float segLen = std::sqrt(dx * dx + dy * dy);
-    const bool hasVis = (strokeW > 0.0f) && (strokeCol.a > 0.0f) && (effOpacity > 0.0f) &&
-                        std::isfinite(segLen) && (segLen > 1e-3f);
-    if (!hasVis && !emitEvenIfInvisible) {
-        return 0u;
-    }
-
-    const float ux = (segLen > 1e-4f) ? (dx / segLen) : 1.0f;
-    const float uy = (segLen > 1e-4f) ? (dy / segLen) : 0.0f;
-    const float capExt = (hasVis && roundCapExtend) ? (0.5f * strokeW) : 0.0f;
-    const float sx = wx1 - capExt * ux;
-    const float sy = wy1 - capExt * uy;
-    const float boxLen = segLen + 2.0f * capExt;
-    const float px0 = sx + 0.5f * strokeW * uy;
-    const float py0 = sy - 0.5f * strokeW * ux;
-
-    const std::uint32_t segId = tree.AllocateRoundedRectNode(
-        px0,
-        py0,
-        hasVis ? boxLen : 0.0f,
-        hasVis ? strokeW : 0.0f,
-        strokeCol,
-        CornerRadius{strokeW * 0.5f},
-        owner);
-    RenderNodeDescriptor& nd = tree.nodes_[segId];
-    nd.opacity = hasVis ? effOpacity : 0.0f;
-    const Matrix2D segM{
-        ux,
-        -uy,
-        uy,
-        ux,
-        px0 - (ux * px0 - uy * py0),
-        py0 - (uy * px0 + ux * py0)};
-    const Matrix2D worldM = projected3D
-        ? segM
-        : Matrix2D::Multiply(
-              MatrixFromState(curState.m00, curState.m01, curState.m10, curState.m11, curState.tx, curState.ty),
-              segM);
-    nd.m00 = worldM.m00;
-    nd.m01 = worldM.m01;
-    nd.m10 = worldM.m10;
-    nd.m11 = worldM.m11;
-    nd.baseTx = worldM.tx;
-    nd.baseTy = worldM.ty;
-    nd.tx = worldM.tx + nd.x * (worldM.m00 - 1.0f) + nd.y * worldM.m01;
-    nd.ty = worldM.ty + nd.x * worldM.m10 + nd.y * (worldM.m11 - 1.0f);
-    nd.inheritedOpacity = curState.inheritedOpacity;
-    nd.hasPerspective3D = false;
-    nd.blendMode = curState.blendMode;
-    tree.WriteQuadVertices(nd);
-    tree.MarkPageDirty(nd.pageIndex, nd.vertexOffsetInPage);
-    return 1u;
-}
-
-std::uint16_t ControlRenderEmitter::EmitTrimmedPathSubpaths(
-    PagedRenderTree& tree,
-    std::string_view pathStr,
-    const Rect& box,
-    Stretch stretch,
-    float strokeW,
-    const Color& strokeCol,
-    std::uint32_t strokeGradId,
-    float effOpacity,
-    const PagedRenderTraversalState& curState,
-    const UIElement* owner,
-    float trimStart,
-    float trimEnd) {
-    if (pathStr.empty() || trimEnd <= trimStart + 1e-5f || strokeW <= 0.0f || effOpacity <= 0.0f) {
-        return 0u;
-    }
-    if (strokeGradId == 0u && strokeCol.a <= 0.0f) {
-        return 0u;
-    }
-    const std::vector<std::vector<Point>> subpaths = ParseSvgPathToSubpaths(pathStr);
-    if (subpaths.empty()) {
-        return 0u;
-    }
-
-    float minX = 0.0f;
-    float minY = 0.0f;
-    float maxX = 0.0f;
-    float maxY = 0.0f;
-    bool hasAnyPt = false;
-    for (const auto& sp : subpaths) {
-        for (const Point& pt : sp) {
-            if (!hasAnyPt) {
-                minX = maxX = pt.x;
-                minY = maxY = pt.y;
-                hasAnyPt = true;
-            } else {
-                minX = std::min(minX, pt.x);
-                minY = std::min(minY, pt.y);
-                maxX = std::max(maxX, pt.x);
-                maxY = std::max(maxY, pt.y);
-            }
-        }
-    }
-    if (!hasAnyPt) {
-        return 0u;
-    }
-    const float natW = maxX - minX;
-    const float natH = maxY - minY;
-
-    auto mapPoint = [&](const Point& pt) noexcept -> Point {
-        if (stretch == Stretch::None || box.width <= 0.0f || box.height <= 0.0f) {
-            return Point{box.x + pt.x, box.y + pt.y};
-        }
-        if (stretch == Stretch::Fill) {
-            const float u = (natW > 1e-4f) ? ((pt.x - minX) / natW) : 0.5f;
-            const float v = (natH > 1e-4f) ? ((pt.y - minY) / natH) : 0.5f;
-            return Point{box.x + u * box.width, box.y + v * box.height};
-        }
-        float s = 1.0f;
-        if (natW > 1e-4f && natH > 1e-4f) {
-            s = (stretch == Stretch::UniformToFill)
-                ? std::max(box.width / natW, box.height / natH)
-                : std::min(box.width / natW, box.height / natH);
-        } else if (natW > 1e-4f) {
-            s = box.width / natW;
-        } else if (natH > 1e-4f) {
-            s = box.height / natH;
-        }
-        const float dw = natW * s;
-        const float dh = natH * s;
-        const float ox = box.x + (box.width - dw) * 0.5f;
-        const float oy = box.y + (box.height - dh) * 0.5f;
-        return Point{ox + (pt.x - minX) * s, oy + (pt.y - minY) * s};
-    };
-
-    const GradientBrushDesc* gradBrush = (strokeGradId != 0u)
-        ? GradientBrushRegistry::Instance().Find(strokeGradId)
-        : nullptr;
-    const float safeW = std::max(1.0f, box.width);
-    const float safeH = std::max(1.0f, box.height);
-    std::uint16_t emitted = 0u;
-
-    for (const auto& sp : subpaths) {
-        const std::vector<Point> trimmed = TrimSubpathPolyline(sp, trimStart, trimEnd);
-        if (trimmed.size() < 2u) {
-            continue;
-        }
-        for (std::size_t i = 0u; i + 1u < trimmed.size(); ++i) {
-            if (emitted >= 0xFFF0u) {
-                return emitted;
-            }
-            const Point a = mapPoint(trimmed[i]);
-            const Point b = mapPoint(trimmed[i + 1u]);
-            Color segCol = strokeCol;
-            if (gradBrush != nullptr) {
-                const float mx = 0.5f * (a.x + b.x);
-                const float my = 0.5f * (a.y + b.y);
-                const float u = std::clamp((mx - box.x) / safeW, 0.0f, 1.0f);
-                const float v = std::clamp((my - box.y) / safeH, 0.0f, 1.0f);
-                segCol = EvaluateGradientBrushAtNormalizedUv(*gradBrush, u, v, safeW, safeH);
-                segCol.a = std::clamp(segCol.a * strokeCol.a, 0.0f, 1.0f);
-            }
-            emitted = static_cast<std::uint16_t>(
-                emitted + EmitCapsuleLine(
-                    tree,
-                    a.x,
-                    a.y,
-                    b.x,
-                    b.y,
-                    strokeW,
-                    segCol,
-                    effOpacity,
-                    false,
-                    true,
-                    curState,
-                    owner));
-        }
-    }
-    return emitted;
-}
-
-void ControlRenderEmitter::EmitGenericContainerPrimitives(
-    PagedRenderTree& tree,
-    const UIElement* elem,
-    const PagedRenderTraversalState& curState,
-    Rect r,
-    float w,
-    float h,
-    float effOpacity,
-    std::uint16_t& ioEmittedCount) {
-    if (!elem) {
-        return;
-    }
-    const SurfaceFillBorderPlan plan = ComputeContainerFillBorderPlan(
-        elem,
-        Rect{r.x, r.y, w, h});
-    const std::uint32_t bgGradId = ExtractGradBrushId(elem->GetValue(PropId_BackgroundGradientId));
-    Stretch imgStretch = Stretch::Fill;
-    const std::string bgImgUri = (bgGradId == 0u)
-        ? ExtractContainerImageBrushUri(elem, &imgStretch)
-        : std::string{};
-    const ImageAtlasEntry* bgAtlas = bgImgUri.empty() ? nullptr : ImageAtlas::Instance().LoadOrGet(bgImgUri);
-    float bgGradOp = 1.0f;
-    (void)TryGetFloat(elem->GetValue(PropId_BackgroundOpacity), bgGradOp);
-    bgGradOp = std::clamp(bgGradOp, 0.0f, 1.0f);
-    if (bgGradId != 0u) {
-        const std::uint32_t fillId = tree.AllocateGradientRoundedRectNode(
-            plan.fillRect.x,
-            plan.fillRect.y,
-            plan.fillRect.width,
-            plan.fillRect.height,
-            bgGradId,
-            plan.fillRadii,
-            false,
-            Color{1.0f, 1.0f, 1.0f, 1.0f},
-            effOpacity * bgGradOp,
-            elem);
-        ApplyNodeTransform(tree, fillId, curState);
-        ++ioEmittedCount;
-    } else if (bgAtlas && bgAtlas->width > 0u && bgAtlas->height > 0u &&
-               plan.fillRect.width > 0.0f && plan.fillRect.height > 0.0f) {
-        const ImageStretchPlacement pl = ComputeImageStretchPlacement(
-            plan.fillRect,
-            static_cast<float>(bgAtlas->width),
-            static_cast<float>(bgAtlas->height),
-            imgStretch,
-            StretchDirection::Both,
-            bgAtlas->u0, bgAtlas->v0, bgAtlas->u1, bgAtlas->v1);
-        const Rect dr = pl.valid ? pl.destRect : plan.fillRect;
-        const std::uint32_t fillId = tree.AllocateTexturedNode(
-            dr.x, dr.y, dr.width, dr.height,
-            pl.valid ? pl.u0 : bgAtlas->u0,
-            pl.valid ? pl.v0 : bgAtlas->v0,
-            pl.valid ? pl.u1 : bgAtlas->u1,
-            pl.valid ? pl.v1 : bgAtlas->v1,
-            Color{1.0f, 1.0f, 1.0f, 1.0f},
-            effOpacity * bgGradOp,
-            elem,
-            bgAtlas->textureId);
-        ApplyNodeTransform(tree, fillId, curState);
-        ++ioEmittedCount;
-    } else {
-        const std::uint32_t fillId = tree.AllocateRoundedRectNode(
-            plan.fillRect.x,
-            plan.fillRect.y,
-            plan.fillRect.width,
-            plan.fillRect.height,
-            plan.fillColor,
-            plan.fillRadii,
-            elem);
-        tree.nodes_[fillId].opacity = plan.hasVisibleFill ? effOpacity : 0.0f;
-        ApplyNodeTransform(tree, fillId, curState);
-        ++ioEmittedCount;
-    }
-
-    if (plan.reserveBorderNode) {
-        const std::uint32_t borderId = tree.AllocateBorderRingNode(
-            plan.borderRect.x,
-            plan.borderRect.y,
-            plan.hasVisibleBorder ? plan.borderRect.width : 0.0f,
-            plan.hasVisibleBorder ? plan.borderRect.height : 0.0f,
-            plan.borderColor,
-            plan.borderRadii,
-            plan.borderThickness,
-            elem);
-        tree.nodes_[borderId].opacity = plan.hasVisibleBorder ? effOpacity : 0.0f;
-        ApplyNodeTransform(tree, borderId, curState);
-        ++ioEmittedCount;
-    }
-}
-
-class PagedCustomDrawingContext final : public CustomDrawingContext {
-public:
-    PagedCustomDrawingContext(
-        PagedRenderTree& tree,
-        const PagedRenderTree::RenderTraversalState& state,
-        const UIElement* owner,
-        float originX,
-        float originY,
-        float effOpacity) noexcept
-        : tree_(tree),
-          state_(state),
-          owner_(owner),
-          originX_(originX),
-          originY_(originY),
-          effOpacity_(effOpacity) {}
-
-    [[nodiscard]] std::uint16_t EmittedCount() const noexcept {
-        return emittedCount_;
-    }
-
-    void FillRect(const Rect& rect, const Color& color) override {
-        if (rect.width <= 0.0f || rect.height <= 0.0f || color.a <= 0.0f || effOpacity_ <= 0.0f ||
-            emittedCount_ >= 0xFFFEu) {
-            return;
-        }
-        const std::uint32_t nid = tree_.AllocateRoundedRectNode(
-            originX_ + rect.x,
-            originY_ + rect.y,
-            rect.width,
-            rect.height,
-            color,
-            CornerRadius{},
-            owner_);
-        tree_.nodes_[nid].opacity = effOpacity_;
-        ControlRenderEmitter::ApplyNodeTransform(tree_, nid, state_);
-        ++emittedCount_;
-    }
-
-    void DrawRect(const Rect& rect, const Color& strokeColor, float strokeWidth) override {
-        if (rect.width <= 0.0f || rect.height <= 0.0f || strokeWidth <= 0.0f ||
-            strokeColor.a <= 0.0f || effOpacity_ <= 0.0f || emittedCount_ >= 0xFFFEu) {
-            return;
-        }
-        const std::uint32_t nid = tree_.AllocateBorderRingNode(
-            originX_ + rect.x,
-            originY_ + rect.y,
-            rect.width,
-            rect.height,
-            strokeColor,
-            CornerRadius{},
-            Thickness{strokeWidth},
-            owner_);
-        tree_.nodes_[nid].opacity = effOpacity_;
-        ControlRenderEmitter::ApplyNodeTransform(tree_, nid, state_);
-        ++emittedCount_;
-    }
-
-    void FillRoundedRect(const Rect& rect, float radiusX, float radiusY, const Color& color) override {
-        if (rect.width <= 0.0f || rect.height <= 0.0f || color.a <= 0.0f || effOpacity_ <= 0.0f ||
-            emittedCount_ >= 0xFFFEu) {
-            return;
-        }
-        const float maxR = std::min(rect.width, rect.height) * 0.5f;
-        const float rEff = std::max(0.0f, std::min(0.5f * (std::max(0.0f, radiusX) + std::max(0.0f, radiusY)), maxR));
-        const std::uint32_t nid = tree_.AllocateRoundedRectNode(
-            originX_ + rect.x,
-            originY_ + rect.y,
-            rect.width,
-            rect.height,
-            color,
-            CornerRadius{rEff},
-            owner_);
-        tree_.nodes_[nid].opacity = effOpacity_;
-        ControlRenderEmitter::ApplyNodeTransform(tree_, nid, state_);
-        ++emittedCount_;
-    }
-
-    void DrawRoundedRect(
-        const Rect& rect,
-        float radiusX,
-        float radiusY,
-        const Color& strokeColor,
-        float strokeWidth) override {
-        if (rect.width <= 0.0f || rect.height <= 0.0f || strokeWidth <= 0.0f ||
-            strokeColor.a <= 0.0f || effOpacity_ <= 0.0f || emittedCount_ >= 0xFFFEu) {
-            return;
-        }
-        const float maxR = std::min(rect.width, rect.height) * 0.5f;
-        const float rEff = std::max(0.0f, std::min(0.5f * (std::max(0.0f, radiusX) + std::max(0.0f, radiusY)), maxR));
-        const std::uint32_t nid = tree_.AllocateBorderRingNode(
-            originX_ + rect.x,
-            originY_ + rect.y,
-            rect.width,
-            rect.height,
-            strokeColor,
-            CornerRadius{rEff},
-            Thickness{strokeWidth},
-            owner_);
-        tree_.nodes_[nid].opacity = effOpacity_;
-        ControlRenderEmitter::ApplyNodeTransform(tree_, nid, state_);
-        ++emittedCount_;
-    }
-
-    void FillEllipse(const Point& center, float radiusX, float radiusY, const Color& color) override {
-        if (radiusX <= 0.0f || radiusY <= 0.0f || color.a <= 0.0f || effOpacity_ <= 0.0f ||
-            emittedCount_ >= 0xFFFEu) {
-            return;
-        }
-        const std::uint32_t nid = tree_.AllocateEllipseNode(
-            originX_ + center.x - radiusX,
-            originY_ + center.y - radiusY,
-            radiusX * 2.0f,
-            radiusY * 2.0f,
-            color,
-            0.0f,
-            false,
-            effOpacity_,
-            owner_);
-        ControlRenderEmitter::ApplyNodeTransform(tree_, nid, state_);
-        ++emittedCount_;
-    }
-
-    void DrawEllipse(
-        const Point& center,
-        float radiusX,
-        float radiusY,
-        const Color& strokeColor,
-        float strokeWidth) override {
-        if (radiusX <= 0.0f || radiusY <= 0.0f || strokeWidth <= 0.0f ||
-            strokeColor.a <= 0.0f || effOpacity_ <= 0.0f || emittedCount_ >= 0xFFFEu) {
-            return;
-        }
-        const float halfStroke = 0.5f * strokeWidth;
-        const float outerRx = radiusX + halfStroke;
-        const float outerRy = radiusY + halfStroke;
-        const std::uint32_t nid = tree_.AllocateEllipseNode(
-            originX_ + center.x - outerRx,
-            originY_ + center.y - outerRy,
-            outerRx * 2.0f,
-            outerRy * 2.0f,
-            strokeColor,
-            strokeWidth,
-            true,
-            effOpacity_,
-            owner_);
-        ControlRenderEmitter::ApplyNodeTransform(tree_, nid, state_);
-        ++emittedCount_;
-    }
-
-    void DrawLine(const Point& start, const Point& end, const Color& strokeColor, float strokeWidth) override {
-        if (strokeWidth <= 0.0f || strokeColor.a <= 0.0f || effOpacity_ <= 0.0f || emittedCount_ >= 0xFFFEu) {
-            return;
-        }
-        const std::uint16_t added = ControlRenderEmitter::EmitCapsuleLine(
-            tree_,
-            originX_ + start.x,
-            originY_ + start.y,
-            originX_ + end.x,
-            originY_ + end.y,
-            strokeWidth,
-            strokeColor,
-            effOpacity_,
-            false,
-            true,
-            state_,
-            owner_);
-        emittedCount_ = static_cast<std::uint16_t>(std::min<std::uint32_t>(0xFFFFu, emittedCount_ + added));
-    }
-
-    void DrawText(
-        std::string_view text,
-        const Rect& layoutRect,
-        const Color& color,
-        float fontSize,
-        HorizontalAlignment hAlign,
-        VerticalAlignment vAlign) override {
-        if (text.empty() || color.a <= 0.0f || effOpacity_ <= 0.0f || fontSize <= 0.0f ||
-            emittedCount_ >= 0xFFFEu) {
-            return;
-        }
-        const std::string fontFamily = ResolveElementFontFamily(owner_);
-        const Size metrics = MeasureUtf8TextRun(text, fontSize, fontFamily, 1000000.0f, TextWrapping::NoWrap);
-        TextAlignment tAlign = TextAlignment::Left;
-        float alignBoxWidth = layoutRect.width;
-        float drawX = originX_ + layoutRect.x;
-        if (layoutRect.width > 0.0f) {
-            if (hAlign == HorizontalAlignment::Center) {
-                tAlign = TextAlignment::Center;
-            } else if (hAlign == HorizontalAlignment::Right) {
-                tAlign = TextAlignment::Right;
-            }
-        } else {
-            alignBoxWidth = 0.0f;
-            if (hAlign == HorizontalAlignment::Center) {
-                drawX -= metrics.width * 0.5f;
-            } else if (hAlign == HorizontalAlignment::Right) {
-                drawX -= metrics.width;
-            }
-        }
-        const float textH = (metrics.height > 0.0f) ? metrics.height : (fontSize * 1.2f);
-        float drawY = originY_ + layoutRect.y;
-        switch (vAlign) {
-            case VerticalAlignment::Center:
-                drawY += (layoutRect.height - textH) * 0.5f;
-                break;
-            case VerticalAlignment::Bottom:
-                drawY += (layoutRect.height - textH);
-                break;
-            case VerticalAlignment::Top:
-            case VerticalAlignment::Stretch:
-            default:
-                break;
-        }
-        const std::uint16_t added = tree_.EmitTextRunNodes(
-            drawX,
-            drawY,
-            fontSize,
-            text,
-            color,
-            effOpacity_,
-            state_,
-            owner_,
-            fontFamily,
-            1000000.0f,
-            TextWrapping::NoWrap,
-            tAlign,
-            alignBoxWidth);
-        const std::uint32_t sum = static_cast<std::uint32_t>(emittedCount_) + static_cast<std::uint32_t>(added);
-        emittedCount_ = static_cast<std::uint16_t>(std::min<std::uint32_t>(sum, 0xFFFFu));
-    }
-
-private:
-    PagedRenderTree& tree_;
-    const PagedRenderTree::RenderTraversalState& state_;
-    const UIElement* owner_ = nullptr;
-    float originX_ = 0.0f;
-    float originY_ = 0.0f;
-    float effOpacity_ = 1.0f;
-    std::uint16_t emittedCount_ = 0u;
-};
-
-void PagedRenderTree::TraverseAndEmitElement(
-    const UIElement* elem,
-    const RenderTraversalState& parentState) {
-    if (!elem) {
-        return;
-    }
-    if (elem->GetVisibility() == Visibility::Collapsed) {
-        std::size_t dummy = 0;
-        CollapseSubtreeRenderNodesRecursive(elem, dummy);
-        return;
-    }
-    if (!elem->IsOpenForHitTest()) {
-        std::size_t dummy = 0;
-        CollapseSubtreeRenderNodesRecursive(elem, dummy);
-        return;
-    }
-
-    const Rect r = elem->FinalRect();
-    const float w = (r.width > 0.0f) ? r.width : std::max(0.0f, elem->GetWidth());
-    const float h = (r.height > 0.0f) ? r.height : std::max(0.0f, elem->GetHeight());
-
-    // Compose inherited opacity and local 2D/3D foreshortening transform with parentState
-    RenderTraversalState curState = parentState;
-    if (elem->GetVisibility() != Visibility::Visible) {
-        curState.inheritedOpacity = 0.0f;
-    } else {
-        curState.inheritedOpacity *= std::clamp(elem->GetOpacity(), 0.0f, 1.0f);
-    }
-    const float effOpacity = curState.inheritedOpacity;
-
-    const Matrix2D local2D = elem->ComputeLocalEffectiveTransform2D();
-    ApplyStateMatrix(
-        curState.m00, curState.m01, curState.m10, curState.m11, curState.tx, curState.ty,
-        local2D);
-
-    if (elem->HasActiveTransform3D()) {
-        curState.world3D = Matrix4x4::ComposePlanarHomography(
-            curState.world3D,
-            elem->ComputeLocalEffectiveTransform3D());
-        curState.hasPerspective3D = true;
-    } else if (curState.hasPerspective3D) {
-        if (!local2D.IsIdentity()) {
-            curState.world3D = Matrix4x4::ComposePlanarHomography(
-                curState.world3D,
-                Matrix4x4::FromMatrix2D(local2D));
-        }
-    } else {
-        curState.world3D = Matrix4x4::FromMatrix2D(
-            MatrixFromState(curState.m00, curState.m01, curState.m10, curState.m11, curState.tx, curState.ty));
-    }
-
-    // Resolve BlendingMode (element override or inherited)
-    {
-        const UnifiedValue bmVal = elem->GetValue(PropId_BlendingMode);
-        if (const auto* bmi = std::get_if<std::int64_t>(&bmVal)) {
-            if (*bmi >= 0 && *bmi <= 3) {
-                curState.blendMode = static_cast<BlendingMode>(*bmi);
-            }
-        } else if (const auto* bms = std::get_if<StringValue>(&bmVal)) {
-            const UnifiedValue parsed = ParseBuiltinLiteralPropertyValue(PropId_BlendingMode, bms->view());
-            if (const auto* pi = std::get_if<std::int64_t>(&parsed); pi && *pi >= 0 && *pi <= 3) {
-                curState.blendMode = static_cast<BlendingMode>(*pi);
-            }
-        }
-    }
-
-    // Apply current clip & blend state for this element's own primitives
-    activeClipRect_ = curState.clipRect;
-    activeClipEnabled_ = curState.clipActive;
-    activeBlendMode_ = curState.blendMode;
-
-    const UIEffectDescriptor fx = elem->GetEffectDescriptor();
-    const bool wantsBlurSpan =
-        !curState.shadowOnlyPass &&
-        ((fx.kind == UIEffectKind::Blur && fx.blurRadius > 0.25f) ||
-         (fx.kind == UIEffectKind::Pixelate && fx.blurRadius >= 1.5f) ||
-         (fx.kind == UIEffectKind::Tint) ||
-         (fx.kind == UIEffectKind::ChromaticAberration && std::fabs(fx.amountX) > 0.01f) ||
-         (fx.kind == UIEffectKind::DirectionalBlur && fx.blurRadius > 0.25f) ||
-         (fx.kind == UIEffectKind::Saturation && std::fabs(fx.saturation - 1.0f) > 0.001f) ||
-         (fx.kind == UIEffectKind::BackdropBlur &&
-          (fx.blurRadius > 0.25f || std::fabs(fx.saturation - 1.0f) > 0.001f))) &&
-        effOpacity > 0.001f;
-    const std::size_t blurSpanSlot = wantsBlurSpan ? blurLayerSpans_.size() : static_cast<std::size_t>(-1);
-    if (wantsBlurSpan) {
-        const float worldScaleX = std::sqrt(curState.m00 * curState.m00 + curState.m10 * curState.m10);
-        const float worldScaleY = std::sqrt(curState.m01 * curState.m01 + curState.m11 * curState.m11);
-        const float worldScale = std::max(0.01f, 0.5f * (worldScaleX + worldScaleY));
-        BlurLayerSpan bSpan{};
-        bSpan.firstNodeId = static_cast<std::uint32_t>(nodes_.size());
-        bSpan.endNodeId = static_cast<std::uint32_t>(nodes_.size());
-        bSpan.radiusPx = fx.blurRadius * worldScale;
-        bSpan.clipRect = curState.clipRect;
-        bSpan.clipActive = curState.clipActive;
-        bSpan.effectMode = fx.kind;
-        bSpan.maskOpacity = effOpacity;
-        bSpan.amountX = fx.amountX * worldScale;
-        bSpan.angleDeg = fx.angleDeg;
-        bSpan.saturation = fx.saturation;
-        bSpan.effectColor = fx.color;
-        bSpan.effectOpacity = fx.opacity;
-        if (fx.kind == UIEffectKind::BackdropBlur) {
-            const Matrix2D worldM = MatrixFromState(
-                curState.m00, curState.m01, curState.m10, curState.m11, curState.tx, curState.ty);
-            std::string maskPathStr;
-            Stretch maskStretch = Stretch::Uniform;
-            if (elem->TryGetBackdropBlurVectorMask(maskPathStr, maskStretch)) {
-                if (const AxbMtsdfPathEntry* mtsdf = AxbTemplateRegistry::Instance().FindOrBakeMtsdfPath(maskPathStr)) {
-                    RegisterMtsdfInTreeAtlas(*mtsdf);
-                    Rect fitted = ComputeStretchedDestRect(
-                        Rect{r.x, r.y, w, h}, mtsdf->boundsW, mtsdf->boundsH, maskStretch);
-                    if (maskStretch == Stretch::None) {
-                        fitted.x += mtsdf->boundsX;
-                        fitted.y += mtsdf->boundsY;
-                    }
-                    bSpan.maskMtsdfHash = mtsdf->pathHash;
-                    bSpan.maskDestRect = curState.hasPerspective3D
-                        ? curState.world3D.TransformRectBounds(fitted)
-                        : worldM.TransformRectBounds(fitted);
-                }
-            } else {
-                bSpan.maskDestRect = curState.hasPerspective3D
-                    ? curState.world3D.TransformRectBounds(Rect{r.x, r.y, w, h})
-                    : worldM.TransformRectBounds(Rect{r.x, r.y, w, h});
-            }
-        }
-        blurLayerSpans_.push_back(bSpan);
-    }
-
-    const std::uint32_t spanStartId = static_cast<std::uint32_t>(nodes_.size());
-    std::uint16_t emittedCount = 0u;
-
-    auto applyNodeTransform = [&](std::uint32_t nid) noexcept {
-        RenderNodeDescriptor& nd = nodes_[nid];
-        nd.m00 = curState.m00;
-        nd.m01 = curState.m01;
-        nd.m10 = curState.m10;
-        nd.m11 = curState.m11;
-        nd.baseTx = curState.tx;
-        nd.baseTy = curState.ty;
-        nd.tx = curState.tx + nd.x * (curState.m00 - 1.0f) + nd.y * curState.m01;
-        nd.ty = curState.ty + nd.x * curState.m10 + nd.y * (curState.m11 - 1.0f);
-        nd.inheritedOpacity = curState.inheritedOpacity;
-        nd.hasPerspective3D = curState.hasPerspective3D;
-        nd.blendMode = curState.blendMode;
-        nd.worldMatrix3D = curState.world3D;
-        if (nd.primType != AeroPrimType::SdfTextGlyph) {
-            WriteQuadVertices(nd);
-        }
-    };
-
-    // Determine effective DropShadow (own DropShadowEffect or inherited shadow-only pass from a transparent container)
-    bool hasActiveShadow = false;
-    float worldSdx = 0.0f, worldSdy = 0.0f, worldBlurR = 1.0f;
-    Color shCol{0.0f, 0.0f, 0.0f, 0.0f};
-    bool propagateShadowToChildren = false;
-
-    if (curState.shadowOnlyPass) {
-        if (curState.hasInheritedDropShadow && effOpacity > 0.001f) {
-            worldSdx = curState.shadowWorldDx;
-            worldSdy = curState.shadowWorldDy;
-            worldBlurR = curState.shadowWorldBlurR;
-            shCol = curState.shadowColor;
-            hasActiveShadow = true;
-        }
-    } else if (fx.kind == UIEffectKind::DropShadow &&
-               fx.opacity > 0.001f &&
-               fx.color.a > 0.001f &&
-               effOpacity > 0.001f) {
-        constexpr float kDegToRad = 3.14159265358979323846f / 180.0f;
-        const float dirRad = fx.directionDeg * kDegToRad;
-        const float rawSdx = std::cos(dirRad) * fx.shadowDepth;
-        const float rawSdy = -std::sin(dirRad) * fx.shadowDepth;
-        worldSdx = curState.m00 * rawSdx + curState.m01 * rawSdy;
-        worldSdy = curState.m10 * rawSdx + curState.m11 * rawSdy;
-        const float elemScaleX = std::sqrt(curState.m00 * curState.m00 + curState.m10 * curState.m10);
-        const float elemScaleY = std::sqrt(curState.m01 * curState.m01 + curState.m11 * curState.m11);
-        const float elemAvgScale = std::max(1e-4f, 0.5f * (elemScaleX + elemScaleY));
-        worldBlurR = std::max(1.0f, fx.blurRadius) * elemAvgScale;
-        shCol = Color{
-            fx.color.r,
-            fx.color.g,
-            fx.color.b,
-            std::clamp(fx.color.a * fx.opacity, 0.0f, 1.0f)};
-        hasActiveShadow = true;
-    }
-
-    if (hasActiveShadow) {
-        const float leafScaleX = std::sqrt(curState.m00 * curState.m00 + curState.m10 * curState.m10);
-        const float leafScaleY = std::sqrt(curState.m01 * curState.m01 + curState.m11 * curState.m11);
-        const float leafAvgScale = std::max(1e-4f, 0.5f * (leafScaleX + leafScaleY));
-        const float det = curState.m00 * curState.m11 - curState.m01 * curState.m10;
-        float sdx = worldSdx;
-        float sdy = worldSdy;
-        if (std::fabs(det) > 1e-6f) {
-            const float invDet = 1.0f / det;
-            sdx = (curState.m11 * worldSdx - curState.m01 * worldSdy) * invDet;
-            sdy = (-curState.m10 * worldSdx + curState.m00 * worldSdy) * invDet;
-        }
-        const float localBlurR = std::max(0.5f, worldBlurR / leafAvgScale);
-        const UIElement* shadowOwner = curState.shadowOnlyPass ? nullptr : elem;
-
-        if (!elem->EmitRenderDropShadowPrimitives(
-                *this, curState, effOpacity, sdx, sdy, localBlurR, shCol, shadowOwner, emittedCount)) {
-            const bool hasOwnOpaqueSurface =
-                !elem->HasControlTemplate() &&
-                (elem->HasOwnOpaqueShadowSurfaceForRender() ||
-                 (ExtractGradBrushId(elem->GetValue(PropId_BackgroundGradientId)) != 0u) ||
-                 !ExtractContainerImageBrushUri(elem).empty() ||
-                 (value::TryGetColor(elem->GetValue(PropId_Background)).value_or(Color{0, 0, 0, 0}).a > 0.01f));
-            if (hasOwnOpaqueSurface && w > 0.0f && h > 0.0f) {
-                const float pad = std::ceil(localBlurR);
-                const CornerRadius cr = SanitizeCornerRadius(
-                    value::TryGetCornerRadius(elem->GetValue(PropId_CornerRadius))
-                        .value_or(CornerRadius{}));
-                const std::uint32_t shId = AllocateRoundedRectNode(
-                    r.x + sdx - pad,
-                    r.y + sdy - pad,
-                    w + 2.0f * pad,
-                    h + 2.0f * pad,
-                    shCol,
-                    cr,
-                    shadowOwner);
-                nodes_[shId].primType = AeroPrimType::SdfRoundedRect;
-                nodes_[shId].opacity = effOpacity;
-                nodes_[shId].softFeatherPx = localBlurR;
-                nodes_[shId].sdfPadPx = pad;
-                if (IsUniformCornerRadius(cr)) {
-                    const auto qPad = static_cast<std::uint16_t>(std::clamp(pad * 2.0f + 0.5f, 0.0f, 2047.0f)) & 0x07FFu;
-                    nodes_[shId].encodedPrimExtra = static_cast<std::uint16_t>(qPad << 5u);
-                }
-                applyNodeTransform(shId);
-                ++emittedCount;
-            } else {
-                // Transparent container (e.g. Viewbox/Canvas/StackPanel/templated Control): propagate shadow to child shapes!
-                propagateShadowToChildren = true;
-            }
-        }
-    }
-
-    if (curState.shadowOnlyPass) {
-        if (propagateShadowToChildren) {
-            RenderTraversalState childShadowState = curState;
-            const UnifiedValue clipVal = elem->GetValue(PropId_ClipToBounds);
-            if (const auto* clipBool = std::get_if<bool>(&clipVal); clipBool && *clipBool) {
-                const Matrix2D worldM = MatrixFromState(
-                    curState.m00, curState.m01, curState.m10, curState.m11, curState.tx, curState.ty);
-                Rect rawClip = elem->GetLocalClipBounds();
-                if (r.width <= 0.0f && r.height <= 0.0f && (w > 0.0f || h > 0.0f)) {
-                    rawClip = Rect{r.x, r.y, w, h};
-                }
-                const Rect localBounds = curState.hasPerspective3D
-                    ? curState.world3D.TransformRectBounds(rawClip)
-                    : worldM.TransformRectBounds(rawClip);
-                childShadowState.clipRect = childShadowState.clipActive
-                    ? IntersectRect(childShadowState.clipRect, localBounds)
-                    : localBounds;
-                childShadowState.clipActive = true;
-            }
-            const Matrix2D childContainerTf = elem->GetChildContainerTransform2D();
-            ApplyStateMatrix(
-                childShadowState.m00, childShadowState.m01, childShadowState.m10, childShadowState.m11,
-                childShadowState.tx, childShadowState.ty,
-                childContainerTf);
-            if (!childContainerTf.IsIdentity()) {
-                if (childShadowState.hasPerspective3D) {
-                    childShadowState.world3D = Matrix4x4::ComposePlanarHomography(
-                        childShadowState.world3D,
-                        Matrix4x4::FromMatrix2D(childContainerTf));
-                } else {
-                    childShadowState.world3D = Matrix4x4::FromMatrix2D(
-                        MatrixFromState(
-                            childShadowState.m00, childShadowState.m01,
-                            childShadowState.m10, childShadowState.m11,
-                            childShadowState.tx, childShadowState.ty));
-                }
-            }
-            if (!elem->SuppressesUntemplatedRenderChildren()) {
-                for (const UIElement* child = elem->FirstChild(); child != nullptr; child = child->NextSibling()) {
-                    bool collapseSubtree = false;
-                    const UIElement* fallbackHeaderOnly = nullptr;
-                    if (!elem->ShouldEmitRenderChild(child, collapseSubtree, fallbackHeaderOnly)) {
-                        if (fallbackHeaderOnly != nullptr) {
-                            TraverseAndEmitElement(fallbackHeaderOnly, childShadowState);
-                        }
-                        continue;
-                    }
-                    TraverseAndEmitElement(child, childShadowState);
-                }
-            }
-        }
-        activeClipRect_ = parentState.clipRect;
-        activeClipEnabled_ = parentState.clipActive;
-        activeBlendMode_ = parentState.blendMode;
-        return;
-    }
-
-    if (elem->HasCustomRender()) {
-        PagedCustomDrawingContext customDc(*this, curState, elem, r.x, r.y, effOpacity);
-        const_cast<UIElement*>(elem)->OnRender(customDc);
-        emittedCount = customDc.EmittedCount();
-        if (emittedCount == 0u) {
-            const std::uint32_t anchorId = AllocateRenderNode(
-                r.x, r.y, 0.0f, 0.0f, Color{0.0f, 0.0f, 0.0f, 0.0f}, 0.0f, 0.0f, elem);
-            nodes_[anchorId].opacity = 0.0f;
-            applyNodeTransform(anchorId);
-            ++emittedCount;
-        }
-    } else if (elem->HasControlTemplate()) {
-        const std::uint32_t anchorId = AllocateRenderNode(
-            r.x, r.y, 0.0f, 0.0f, Color{0.0f, 0.0f, 0.0f, 0.0f}, 0.0f, 0.0f, elem);
-        nodes_[anchorId].opacity = 0.0f;
-        applyNodeTransform(anchorId);
-        ++emittedCount;
-    } else if (!elem->EmitRenderVisualPrimitives(*this, curState, r, w, h, effOpacity, emittedCount)) {
-        ControlRenderEmitter::EmitGenericContainerPrimitives(
-            *this, elem, curState, r, w, h, effOpacity, emittedCount);
-    }
-
-    elem->BindRenderNodeSpan(treeId_, spanStartId, emittedCount);
-    elem->ClearLayoutDirtyFlags(static_cast<std::uint8_t>(RenderDirty | SubtreeRenderDirty));
-
-    // If this container specifies ClipToBounds=true, intersect transformed child clip rect before descending
-    RenderTraversalState childState = curState;
-    childState.hasInheritedDropShadow = false;
-    childState.shadowOnlyPass = false;
-    const UnifiedValue clipVal = elem->GetValue(PropId_ClipToBounds);
-    if (const auto* clipBool = std::get_if<bool>(&clipVal); clipBool && *clipBool) {
-        const Matrix2D worldM = MatrixFromState(
-            curState.m00, curState.m01, curState.m10, curState.m11, curState.tx, curState.ty);
-        Rect rawClip = elem->GetLocalClipBounds();
-        if (r.width <= 0.0f && r.height <= 0.0f && (w > 0.0f || h > 0.0f)) {
-            rawClip = Rect{r.x, r.y, w, h};
-        }
-        const Rect localBounds = curState.hasPerspective3D
-            ? curState.world3D.TransformRectBounds(rawClip)
-            : worldM.TransformRectBounds(rawClip);
-        childState.clipRect = childState.clipActive
-            ? IntersectRect(childState.clipRect, localBounds)
-            : localBounds;
-        childState.clipActive = true;
-    }
-    const Matrix2D childContainerTf = elem->GetChildContainerTransform2D();
-    ApplyStateMatrix(
-        childState.m00, childState.m01, childState.m10, childState.m11, childState.tx, childState.ty,
-        childContainerTf);
-    if (!childContainerTf.IsIdentity()) {
-        if (childState.hasPerspective3D) {
-            childState.world3D = Matrix4x4::ComposePlanarHomography(
-                childState.world3D,
-                Matrix4x4::FromMatrix2D(childContainerTf));
-        } else {
-            childState.world3D = Matrix4x4::FromMatrix2D(
-                MatrixFromState(
-                    childState.m00, childState.m01, childState.m10, childState.m11, childState.tx, childState.ty));
-        }
-    }
-
-    if (!elem->SuppressesUntemplatedRenderChildren()) {
-        if (propagateShadowToChildren) {
-            RenderTraversalState shadowPassState = childState;
-            shadowPassState.hasInheritedDropShadow = true;
-            shadowPassState.shadowOnlyPass = true;
-            shadowPassState.shadowWorldDx = worldSdx;
-            shadowPassState.shadowWorldDy = worldSdy;
-            shadowPassState.shadowWorldBlurR = worldBlurR;
-            shadowPassState.shadowColor = shCol;
-            for (const UIElement* child = elem->FirstChild(); child != nullptr; child = child->NextSibling()) {
-                bool collapseSubtree = false;
-                const UIElement* fallbackHeaderOnly = nullptr;
-                if (!elem->ShouldEmitRenderChild(child, collapseSubtree, fallbackHeaderOnly)) {
-                    if (fallbackHeaderOnly != nullptr) {
-                        TraverseAndEmitElement(fallbackHeaderOnly, shadowPassState);
-                    }
-                    continue;
-                }
-                TraverseAndEmitElement(child, shadowPassState);
-            }
-        }
-
-        auto readChildZ = [](const UIElement* ch) noexcept -> std::int64_t {
-            if (const auto* ze = ch->FindCompactEntry(PropId_ZIndex)) {
-                if (const auto* zi = std::get_if<std::int64_t>(&ze->effectiveValue)) return *zi;
-                float zf = 0.0f;
-                if (TryGetFloat(ze->effectiveValue, zf)) return static_cast<std::int64_t>(std::lround(zf));
-            }
-            return 0;
-        };
-        bool hasNonZeroZ = false;
-        for (const UIElement* child = elem->FirstChild(); child != nullptr; child = child->NextSibling()) {
-            if (readChildZ(child) != 0) {
-                hasNonZeroZ = true;
-                break;
-            }
-        }
-        auto emitOneChild = [&](const UIElement* child) {
-            bool collapseSubtree = false;
-            const UIElement* fallbackHeaderOnly = nullptr;
-            if (!elem->ShouldEmitRenderChild(child, collapseSubtree, fallbackHeaderOnly)) {
-                if (collapseSubtree) {
-                    std::size_t dummy = 0u;
-                    CollapseSubtreeRenderNodesRecursive(child, dummy);
-                }
-                if (fallbackHeaderOnly != nullptr) {
-                    TraverseAndEmitElement(fallbackHeaderOnly, childState);
-                }
-                return;
-            }
-            TraverseAndEmitElement(child, childState);
-        };
-        if (!hasNonZeroZ) {
-            for (const UIElement* child = elem->FirstChild(); child != nullptr; child = child->NextSibling()) {
-                emitOneChild(child);
-            }
-        } else {
-            std::vector<const UIElement*> zSorted;
-            for (const UIElement* child = elem->FirstChild(); child != nullptr; child = child->NextSibling()) {
-                zSorted.push_back(child);
-            }
-            std::stable_sort(zSorted.begin(), zSorted.end(), [&](const UIElement* a, const UIElement* b) noexcept {
-                return readChildZ(a) < readChildZ(b);
-            });
-            for (const UIElement* child : zSorted) {
-                emitOneChild(child);
-            }
-        }
-    }
-
-    if (wantsBlurSpan && blurSpanSlot < blurLayerSpans_.size()) {
-        blurLayerSpans_[blurSpanSlot].endNodeId = static_cast<std::uint32_t>(nodes_.size());
-    }
-
-    // Restore active clip & blend state after visiting children
-    activeClipRect_ = parentState.clipRect;
-    activeClipEnabled_ = parentState.clipActive;
-    activeBlendMode_ = parentState.blendMode;
 }
 
 bool PagedRenderTree::IsPageDirty(std::size_t pageIndex) const noexcept {

@@ -1,29 +1,24 @@
 #pragma once
 
-#include <algorithm>
-#include <cmath>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <string>
 #include <string_view>
 #include <unordered_map>
-#include <utility>
 #include <vector>
 
-#include "aero/animation/AnimationEngine.hpp"
-#include "aero/asset/AxbTemplateRegistry.hpp"
-#include "aero/binding/DualTrackBindingEngine.hpp"
-#include "aero/core/UIElement.hpp"
-#include "aero/core/UIResourceContext.hpp"
-#include "aero/core/UIViewContext.hpp"
-#include "aero/input/InputEventRouter.hpp"
-#include "aero/input/TextInputMethod.hpp"
-#include "aero/layout/DepthBucketLayoutQueue.hpp"
+#include "aero/core/UIResourceStore.hpp"
 #include "aero/render/FontAtlas.hpp"
 #include "aero/render/PagedRenderTree.hpp"
 #include "aero/render/ZeroCopyGpuStream.hpp"
-#include "aero/style/StyleTriggerEngine.hpp"
+#include "aero/runtime/AeroExecutionDomains.hpp"
+#include "aero/visual/DrawingCommandBuffer.hpp"
+#include "aero/visual/VisualAnimationEngine.hpp"
+#include "aero/visual/VisualInputRouter.hpp"
+#include "aero/visual/VisualRenderAdapter.hpp"
+#include "aero/visual/VisualTree.hpp"
 
 namespace aero {
 
@@ -41,7 +36,6 @@ enum UiPhaseMask : std::uint32_t {
     UiPhase_Layout = 1u << 7u,
     UiPhase_RenderRecord = 1u << 8u,
     UiPhase_All = 0x1FFu,
-    // Fast HUD refresh mask: only Track B SIMD column scan + dirty 4KB page recording (skips Style & Layout)
     UiPhase_HudFastRefresh = UiPhase_TrackBBinding | UiPhase_RenderRecord,
 };
 
@@ -71,91 +65,57 @@ public:
         ZeroCopyGpuStream& gpuStream) = 0;
     [[nodiscard]] virtual bool CanSleepIdle() const noexcept = 0;
 
-    // P2-1: Optional instance-scoped UIResourceContext binding for multi-viewport / PIE isolation
-    virtual void SetResourceContext(std::shared_ptr<UIResourceContext> context) {
-        (void)context;
+    virtual void SetResourceStore(std::shared_ptr<UIResourceStore> store) {
+        (void)store;
     }
-    [[nodiscard]] virtual std::shared_ptr<UIResourceContext> GetResourceContext() const noexcept {
+    [[nodiscard]] virtual std::shared_ptr<UIResourceStore> GetResourceStore() const noexcept {
         return nullptr;
     }
 };
 
-// Shared base class holding per-view subsystem pointers, viewport/DPI state, telemetry,
-// and the unified 9-phase UI tick pipeline across EmbeddedGameHost, DesktopEventHost, and WebCanvasHost.
 class HostDriverBase : public IHostDriver {
 public:
     HostDriverBase(
-        UIElement* rootVisual = nullptr,
-        DualTrackBindingEngine* bindingEngine = nullptr,
-        DepthBucketLayoutQueue* layoutQueue = nullptr,
+        VisualWorld* world = nullptr,
+        DrawingCommandBuffer* drawBuffer = nullptr,
+        VisualAnimationEngine* animationEngine = nullptr,
+        VisualInputRouter* inputRouter = nullptr,
         PagedRenderTree* renderTree = nullptr,
-        std::shared_ptr<UIResourceContext> resourceContext = nullptr,
+        std::shared_ptr<UIResourceStore> resourceStore = nullptr,
         Size initialViewportSize = Size{1920.0f, 1080.0f}) noexcept;
     ~HostDriverBase() override;
 
-    void SetResourceContext(std::shared_ptr<UIResourceContext> context) override;
-    [[nodiscard]] std::shared_ptr<UIResourceContext> GetResourceContext() const noexcept override {
-        return resourceContext_;
+    void SetResourceStore(std::shared_ptr<UIResourceStore> store) override;
+    [[nodiscard]] std::shared_ptr<UIResourceStore> GetResourceStore() const noexcept override {
+        return resourceStore_;
     }
 
-    void SetRootVisual(UIElement* root) noexcept;
-    [[nodiscard]] UIElement* RootVisual() const noexcept { return rootVisual_; }
+    void SetVisualWorld(VisualWorld* world) noexcept;
+    [[nodiscard]] VisualWorld* GetVisualWorld() const noexcept { return world_; }
 
-    void SetBindingEngine(DualTrackBindingEngine* engine) noexcept {
-        viewContext_.SetBindingEngine(engine);
-        viewContext_.SetDomains(engine ? &engine->Domains() : nullptr);
-    }
-    [[nodiscard]] DualTrackBindingEngine* GetBindingEngine() const noexcept {
-        return viewContext_.GetBindingEngine();
-    }
+    void SetDrawBuffer(DrawingCommandBuffer* drawBuffer) noexcept { drawBuffer_ = drawBuffer; }
+    [[nodiscard]] DrawingCommandBuffer* GetDrawBuffer() const noexcept { return drawBuffer_; }
 
-    void SetLayoutQueue(DepthBucketLayoutQueue* queue) noexcept {
-        viewContext_.SetLayoutQueue(queue);
-    }
-    [[nodiscard]] DepthBucketLayoutQueue* GetLayoutQueue() const noexcept {
-        return viewContext_.GetLayoutQueue();
-    }
+    void SetRenderTree(PagedRenderTree* tree) noexcept { renderTree_ = tree; }
+    [[nodiscard]] PagedRenderTree* GetRenderTree() const noexcept { return renderTree_; }
 
-    void SetRenderTree(PagedRenderTree* tree) noexcept {
-        viewContext_.SetRenderTree(tree);
-    }
-    [[nodiscard]] PagedRenderTree* GetRenderTree() const noexcept {
-        return viewContext_.GetRenderTree();
-    }
+    void SetInputRouter(VisualInputRouter* router) noexcept { inputRouter_ = router; }
+    [[nodiscard]] VisualInputRouter* InputRouter() const noexcept { return inputRouter_; }
 
-    void SetInputRouter(InputEventRouter* router) noexcept {
-        viewContext_.SetInputRouter(router);
-    }
-    [[nodiscard]] InputEventRouter* InputRouter() const noexcept {
-        return viewContext_.GetInputRouter();
-    }
+    void SetAnimationEngine(VisualAnimationEngine* animEngine) noexcept { animationEngine_ = animEngine; }
+    [[nodiscard]] VisualAnimationEngine* GetAnimationEngine() const noexcept { return animationEngine_; }
 
-    void SetStyleEngine(StyleTriggerEngine* styleEngine) noexcept {
-        viewContext_.SetStyleEngine(styleEngine);
-    }
-    [[nodiscard]] StyleTriggerEngine* StyleEngine() const noexcept {
-        return viewContext_.GetStyleEngine();
-    }
-
-    void SetAnimationEngine(AnimationEngine* animEngine) noexcept {
-        viewContext_.SetAnimationEngine(animEngine);
-    }
-    [[nodiscard]] AnimationEngine* GetAnimationEngine() const noexcept {
-        return viewContext_.GetAnimationEngine();
-    }
+    void SetDomains(ExecutionDomainContext* domains) noexcept { domains_ = domains; }
+    [[nodiscard]] ExecutionDomainContext* Domains() const noexcept { return domains_; }
 
     void SetViewportSize(Size viewport) noexcept;
     [[nodiscard]] Size ViewportSize() const noexcept { return viewportSize_; }
 
     void SetDpiScale(float scale) noexcept;
-    [[nodiscard]] float DpiScale() const noexcept { return viewContext_.GetDpiScale(); }
+    [[nodiscard]] float DpiScale() const noexcept { return dpiScale_; }
     [[nodiscard]] Size LogicalViewportSize() const noexcept {
-        const float scale = viewContext_.GetDpiScale();
-        return Size{viewportSize_.width / scale, viewportSize_.height / scale};
+        return Size{viewportSize_.width / dpiScale_, viewportSize_.height / dpiScale_};
     }
-
-    [[nodiscard]] UIViewContext& ViewContext() noexcept { return viewContext_; }
-    [[nodiscard]] const UIViewContext& ViewContext() const noexcept { return viewContext_; }
 
     ZeroCopySubmissionStats RecordGpuCommands(
         PagedRenderTree& renderTree,
@@ -194,7 +154,7 @@ protected:
 
     virtual void OnRootVisualChanged() noexcept {}
     virtual void OnViewportOrDpiChanged() noexcept {}
-    virtual void OnResourceContextChanged() {}
+    virtual void OnResourceStoreChanged() {}
 
     [[nodiscard]] UiPhaseRunResult RunUiPhases(
         float dt,
@@ -210,15 +170,19 @@ protected:
             wakeCallback_(wakeUserData_);
         }
     }
-    void RegisterWakeRegistryListener(HostWakeCallback callback, void* userData);
-    void UnregisterWakeRegistryListener() noexcept;
 
-    UIElement* rootVisual_ = nullptr;
-    UIViewContext viewContext_{};
-    std::shared_ptr<UIResourceContext> resourceContext_{};
-    AxbTemplateRegistry* wakeRegisteredRegistry_ = nullptr;
+    VisualWorld* world_ = nullptr;
+    DrawingCommandBuffer* drawBuffer_ = nullptr;
+    VisualAnimationEngine* animationEngine_ = nullptr;
+    VisualInputRouter* inputRouter_ = nullptr;
+    ExecutionDomainContext* domains_ = nullptr;
+    PagedRenderTree* renderTree_ = nullptr;
+    VisualRenderAdapter renderAdapter_{};
+    std::shared_ptr<UIResourceStore> resourceStore_{};
+
     HostWakeCallback wakeCallback_ = nullptr;
     void* wakeUserData_ = nullptr;
+    float dpiScale_ = 1.0f;
     Size viewportSize_{1920.0f, 1080.0f};
     Size lastLaidOutViewport_{-1.0f, -1.0f};
     HostFrameTelemetry telemetry_{};
@@ -230,11 +194,12 @@ protected:
 class EmbeddedGameHost final : public HostDriverBase {
 public:
     EmbeddedGameHost(
-        UIElement* rootVisual = nullptr,
-        DualTrackBindingEngine* bindingEngine = nullptr,
-        DepthBucketLayoutQueue* layoutQueue = nullptr,
+        VisualWorld* world = nullptr,
+        DrawingCommandBuffer* drawBuffer = nullptr,
+        VisualAnimationEngine* animationEngine = nullptr,
+        VisualInputRouter* inputRouter = nullptr,
         PagedRenderTree* renderTree = nullptr,
-        std::shared_ptr<UIResourceContext> resourceContext = nullptr) noexcept;
+        std::shared_ptr<UIResourceStore> resourceStore = nullptr) noexcept;
 
     [[nodiscard]] std::string_view HostName() const noexcept override {
         return "EmbeddedGameHost";
@@ -251,19 +216,18 @@ public:
 class DesktopEventHost final : public HostDriverBase {
 public:
     DesktopEventHost(
-        UIElement* rootVisual = nullptr,
-        DualTrackBindingEngine* bindingEngine = nullptr,
-        DepthBucketLayoutQueue* layoutQueue = nullptr,
+        VisualWorld* world = nullptr,
+        DrawingCommandBuffer* drawBuffer = nullptr,
+        VisualAnimationEngine* animationEngine = nullptr,
+        VisualInputRouter* inputRouter = nullptr,
         PagedRenderTree* renderTree = nullptr,
-        std::shared_ptr<UIResourceContext> resourceContext = nullptr) noexcept;
+        std::shared_ptr<UIResourceStore> resourceStore = nullptr) noexcept;
     ~DesktopEventHost() override;
 
     [[nodiscard]] std::string_view HostName() const noexcept override {
         return "DesktopEventHost";
     }
 
-    // Register a zero-allocation wake hook (e.g. NativeWindowHost pipe/Win32 Event signaler)
-    // so dirty notifications from any thread wake a sleeping OS event loop immediately.
     void SetWakeCallback(HostWakeCallback callback, void* userData) noexcept {
         SetWakeCallbackImpl(callback, userData);
     }
@@ -296,7 +260,6 @@ public:
         }
     }
 
-    // True when !hasActiveAnimations && !hasDirtyObjects && !hasDirtyLayout && !hasPendingInputEvents
     [[nodiscard]] bool CanSleepIdle() const noexcept override;
 
     [[nodiscard]] float CpuPollingUsagePercent() const noexcept {
@@ -321,7 +284,7 @@ protected:
         hasDirtyLayout_ = true;
         TriggerWake();
     }
-    void OnResourceContextChanged() override;
+    void OnResourceStoreChanged() override;
 
 private:
     bool hasActiveAnimations_ = false;
@@ -335,12 +298,11 @@ private:
 // ============================================================================
 using NativeImeRectSyncCallback = void (*)(Rect caretScreenRect, bool active, void* userData) noexcept;
 
-// Desktop X11 / Win32 / Headless IME adapter tracking caret screen bounds & composition text
 class DesktopImeAdapter final : public ITextInputMethodHost {
 public:
     DesktopImeAdapter() = default;
 
-    void FocusTextInput(UIElement* focusedElement, Rect caretScreenRect) override;
+    void FocusTextInput(VisualNodeId focusedNode, Rect caretScreenRect) override;
     void BlurTextInput() override;
     void OnCompositionStart() override;
     void OnCompositionUpdate(std::string_view preeditText, std::uint32_t caretOffset) override;
@@ -351,12 +313,12 @@ public:
         spotSyncUserData_ = userData;
     }
 
-    [[nodiscard]] bool IsImeActive() const noexcept { return ime_.IsImeActive(); }
+    [[nodiscard]] bool IsImeActive() const noexcept { return ime_.IsImeFocused(); }
     [[nodiscard]] bool IsComposing() const noexcept { return ime_.IsComposing(); }
-    [[nodiscard]] UIElement* FocusedElement() const noexcept { return ime_.FocusedElement(); }
+    [[nodiscard]] VisualNodeId FocusedNode() const noexcept { return ime_.FocusedNode(); }
     [[nodiscard]] Rect CaretScreenRect() const noexcept { return caretScreenRect_; }
-    [[nodiscard]] const std::string& PreeditString() const noexcept { return ime_.PreeditString(); }
-    [[nodiscard]] const std::string& CommittedString() const noexcept { return ime_.CommittedString(); }
+    [[nodiscard]] const std::string& PreeditString() const noexcept { return ime_.PreeditText(); }
+    [[nodiscard]] const std::string& CommittedString() const noexcept { return ime_.CommittedText(); }
     [[nodiscard]] std::uint32_t FocusSyncCount() const noexcept { return focusSyncCount_; }
 
 private:
@@ -380,26 +342,24 @@ class WebImeAdapter final : public ITextInputMethodHost {
 public:
     WebImeAdapter() = default;
 
-    void FocusTextInput(UIElement* focusedElement, Rect caretScreenRect) override;
+    void FocusTextInput(VisualNodeId focusedNode, Rect caretScreenRect) override;
     void BlurTextInput() override;
     void OnCompositionStart() override;
     void OnCompositionUpdate(std::string_view preeditText, std::uint32_t caretOffset) override;
     void OnCompositionEnd(std::string_view committedText) override;
 
-    [[nodiscard]] bool IsImeActive() const noexcept { return ime_.IsImeActive(); }
+    [[nodiscard]] bool IsImeActive() const noexcept { return ime_.IsImeFocused(); }
     [[nodiscard]] bool IsComposing() const noexcept { return ime_.IsComposing(); }
     [[nodiscard]] Rect OverlayDomInputRect() const noexcept { return overlayDomRect_; }
-    [[nodiscard]] const std::string& PreeditString() const noexcept { return ime_.PreeditString(); }
-    [[nodiscard]] const std::string& CommittedString() const noexcept { return ime_.CommittedString(); }
+    [[nodiscard]] const std::string& PreeditString() const noexcept { return ime_.PreeditText(); }
+    [[nodiscard]] const std::string& CommittedString() const noexcept { return ime_.CommittedText(); }
     [[nodiscard]] std::string GenerateOverlayCssStyle() const;
 
-    // Browser Clipboard Pre-Caching Bridge
     void SyncClipboardFromDomEvent(std::string_view pastedText);
     [[nodiscard]] std::string_view ReadCachedClipboard() const noexcept { return cachedClipboard_; }
     void WriteClipboardToDom(std::string_view copiedText);
 
-    // Accessible ARIA Shadow Semantic Tree Builder
-    [[nodiscard]] AriaShadowNode BuildAriaShadowTree(const UIElement* rootElement) const;
+    [[nodiscard]] AriaShadowNode BuildAriaShadowTree(const VisualWorld* world) const;
 
 private:
     ImeCompositionController ime_{};
@@ -435,8 +395,8 @@ class WebFontStreamProvider {
 public:
     WebFontStreamProvider();
 
-    void SetResourceContext(std::weak_ptr<UIResourceContext> context) noexcept {
-        resourceContext_ = std::move(context);
+    void SetResourceStore(std::weak_ptr<UIResourceStore> store) noexcept {
+        resourceStore_ = std::move(store);
     }
 
     void SetWakeCallback(HostWakeCallback callback, void* userData) noexcept {
@@ -444,25 +404,21 @@ public:
         wakeUserData_ = userData;
     }
 
-    // Decode UTF-8 codePoints and enqueue non-blocking shard fetch requests for any unloaded CJK range
     std::size_t InspectTextAndQueueMissingShards(
         std::string_view utf8Text,
         std::uint32_t targetRenderNodeId = 0);
 
-    // Export a compact binary "AGFS" glyph shard for shardId ([shardId*256 .. shardId*256+255])
     [[nodiscard]] bool ExportShardPayloadForId(
         std::uint32_t shardId,
         std::string_view fontFamily,
         std::vector<std::uint8_t>& outShardPayload) const;
 
-    // Export a compact binary "AGFS" glyph shard for an arbitrary Unicode codePoint range
     [[nodiscard]] static bool ExportRangeShardPayload(
         std::string_view fontFamily,
         std::uint32_t rangeStart,
         std::uint32_t rangeEnd,
         std::vector<std::uint8_t>& outShardPayload);
 
-    // Complete an async shard fetch, unpack binary SDF glyphs into FontAtlas, and mark affected pages dirty
     bool OnShardDataArrived(
         std::uint32_t shardId,
         const std::vector<std::uint8_t>& shardPayload,
@@ -479,7 +435,7 @@ public:
 private:
     UnicodeShardDescriptor& EnsureShardDescriptor(std::uint32_t codePoint);
 
-    std::weak_ptr<UIResourceContext> resourceContext_{};
+    std::weak_ptr<UIResourceStore> resourceStore_{};
     HostWakeCallback wakeCallback_ = nullptr;
     void* wakeUserData_ = nullptr;
     std::unordered_map<std::uint32_t, UnicodeShardDescriptor> shards_;
@@ -496,12 +452,13 @@ enum class WebRafState : std::uint8_t {
 class WebCanvasHost final : public HostDriverBase {
 public:
     WebCanvasHost(
-        UIElement* rootVisual = nullptr,
-        DualTrackBindingEngine* bindingEngine = nullptr,
-        DepthBucketLayoutQueue* layoutQueue = nullptr,
+        VisualWorld* world = nullptr,
+        DrawingCommandBuffer* drawBuffer = nullptr,
+        VisualAnimationEngine* animationEngine = nullptr,
+        VisualInputRouter* inputRouter = nullptr,
         ShaderBackend webBackend = ShaderBackend::WebGL2,
         PagedRenderTree* renderTree = nullptr,
-        std::shared_ptr<UIResourceContext> resourceContext = nullptr);
+        std::shared_ptr<UIResourceStore> resourceStore = nullptr);
     ~WebCanvasHost() override;
 
     [[nodiscard]] std::string_view HostName() const noexcept override {
@@ -512,7 +469,6 @@ public:
         SetWakeCallbackImpl(callback, userData);
     }
 
-    // Strictly non-blocking rAF state machine (ASYNCIFY is strictly forbidden)
     [[nodiscard]] static constexpr bool IsAsyncifyEnabled() noexcept { return false; }
     [[nodiscard]] WebRafState RafState() const noexcept { return rafState_; }
     [[nodiscard]] ShaderBackend WebShaderBackend() const noexcept { return webBackend_; }
@@ -550,7 +506,7 @@ protected:
     void OnViewportOrDpiChanged() noexcept override {
         RequestWakeFrame();
     }
-    void OnResourceContextChanged() override;
+    void OnResourceStoreChanged() override;
 
 private:
     ShaderBackend webBackend_ = ShaderBackend::WebGL2;
