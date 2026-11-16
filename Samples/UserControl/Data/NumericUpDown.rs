@@ -4,14 +4,14 @@ import Aero.UI;
 
 public partial class NumericUpDown : UserControl
 {
-    private int _value = 0;
+    private float _value = 0.0f;
     private int _minValue = 0;
     private int _maxValue = 255;
     private int _stepValue = 1;
 
-    public event RoutedPropertyChangedEventHandler<int> ValueChanged;
+    public event RoutedPropertyChangedEventHandler<float> ValueChanged;
 
-    public int Value
+    public float Value
     {
         get { return this._value; }
         set { this.ApplyValue(value); }
@@ -64,46 +64,51 @@ public partial class NumericUpDown : UserControl
         return "NumericUpDown";
     }
 
-    private int ClampValue(int requested)
+    private int RoundToInt(float v)
     {
-        int clamped = requested;
-        if (clamped < this._minValue) { clamped = this._minValue; }
-        if (clamped > this._maxValue) { clamped = this._maxValue; }
-        return clamped;
+        return v >= 0.0f ? (int)(v + 0.5f) : (int)(v - 0.5f);
     }
 
-    private void ApplyValue(int requested)
+    private float ClampValue(float requested)
     {
-        int next = this.ClampValue(requested);
+        int rounded = this.RoundToInt(requested);
+        if (rounded < this._minValue) { rounded = this._minValue; }
+        if (rounded > this._maxValue) { rounded = this._maxValue; }
+        return (float)rounded;
+    }
+
+    private void ApplyValue(float requested)
+    {
+        float next = this.ClampValue(requested);
         if (this._value == next)
         {
             return;
         }
-        int oldVal = this._value;
+        float oldVal = this._value;
         this._value = next;
-        this.OnValueChanged(new RoutedPropertyChangedEventArgs<int>(oldVal, next, this));
-        BindingEngine.NotifyTargetPropertyChanged(this, "Value", DependencyObject.BoxInt(this._value));
+        this.OnValueChanged(new RoutedPropertyChangedEventArgs<float>(oldVal, next, this));
+        BindingEngine.NotifyTargetPropertyChanged(this, "Value", DependencyObject.BoxFloat(this._value));
         BindingEngine.Flush();
     }
 
-    protected virtual void OnValueChanged(RoutedPropertyChangedEventArgs<int> e)
+    protected virtual void OnValueChanged(RoutedPropertyChangedEventArgs<float> e)
     {
         ValueChanged(this, e);
     }
 
     public void UpButton_Click(object sender, RoutedEventArgs e)
     {
-        this.Value = this.Value + this.StepValue;
+        this.Value = this.Value + (float)this.StepValue;
     }
 
     public void DownButton_Click(object sender, RoutedEventArgs e)
     {
-        this.Value = this.Value - this.StepValue;
+        this.Value = this.Value - (float)this.StepValue;
     }
 
     public override bool SetPropertyValue(string propName, DependencyObject value)
     {
-        if (propName == "Value") { this.Value = DependencyObject.UnboxInt(value, this._value); return true; }
+        if (propName == "Value") { this.Value = DependencyObject.UnboxFloat(value, this._value); return true; }
         if (propName == "MinValue") { this.MinValue = DependencyObject.UnboxInt(value, this._minValue); return true; }
         if (propName == "MaxValue") { this.MaxValue = DependencyObject.UnboxInt(value, this._maxValue); return true; }
         if (propName == "StepValue") { this.StepValue = DependencyObject.UnboxInt(value, this._stepValue); return true; }
@@ -112,7 +117,7 @@ public partial class NumericUpDown : UserControl
 
     public override DependencyObject GetPropertyValue(string propName)
     {
-        if (propName == "Value") { return DependencyObject.BoxInt(this._value); }
+        if (propName == "Value") { return DependencyObject.BoxInt(this.RoundToInt(this._value)); }
         if (propName == "MinValue") { return DependencyObject.BoxInt(this._minValue); }
         if (propName == "MaxValue") { return DependencyObject.BoxInt(this._maxValue); }
         if (propName == "StepValue") { return DependencyObject.BoxInt(this._stepValue); }

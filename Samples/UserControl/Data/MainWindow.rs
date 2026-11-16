@@ -156,6 +156,11 @@ public partial class MainWindow : Page
         this.SyncFromControls();
     }
 
+    private int RoundStat(float value)
+    {
+        return value >= 0.0f ? (int)(value + 0.5f) : (int)(value - 0.5f);
+    }
+
     public void SyncFromControls()
     {
         if (this.VM == null)
@@ -163,10 +168,10 @@ public partial class MainWindow : Page
             return;
         }
 
-        if (this.StatStr != null) { this.VM.Strength = this.StatStr.Value; }
-        if (this.StatAgi != null) { this.VM.Agility = this.StatAgi.Value; }
-        if (this.StatInt != null) { this.VM.Intelligence = this.StatInt.Value; }
-        if (this.StatCha != null) { this.VM.Charisma = this.StatCha.Value; }
+        if (this.StatStr != null) { this.VM.Strength = this.RoundStat(this.StatStr.Value); }
+        if (this.StatAgi != null) { this.VM.Agility = this.RoundStat(this.StatAgi.Value); }
+        if (this.StatInt != null) { this.VM.Intelligence = this.RoundStat(this.StatInt.Value); }
+        if (this.StatCha != null) { this.VM.Charisma = this.RoundStat(this.StatCha.Value); }
 
         this.VM.RecalculatePoints();
     }
@@ -178,10 +183,10 @@ public partial class MainWindow : Page
             return;
         }
 
-        if (this.StatStr != null) { this.StatStr.Value = this.VM.Strength; }
-        if (this.StatAgi != null) { this.StatAgi.Value = this.VM.Agility; }
-        if (this.StatInt != null) { this.StatInt.Value = this.VM.Intelligence; }
-        if (this.StatCha != null) { this.StatCha.Value = this.VM.Charisma; }
+        if (this.StatStr != null) { this.StatStr.Value = (float)this.VM.Strength; }
+        if (this.StatAgi != null) { this.StatAgi.Value = (float)this.VM.Agility; }
+        if (this.StatInt != null) { this.StatInt.Value = (float)this.VM.Intelligence; }
+        if (this.StatCha != null) { this.StatCha.Value = (float)this.VM.Charisma; }
     }
 
     public void SetStrength(int v)
@@ -191,7 +196,7 @@ public partial class MainWindow : Page
             return;
         }
         int actual = this.VM.SetStrength(v);
-        if (this.StatStr != null) { this.StatStr.Value = actual; }
+        if (this.StatStr != null) { this.StatStr.Value = (float)actual; }
         this.BeginStoryboard("UserControl.Anim.Str.ValueChanged");
     }
 
@@ -202,7 +207,7 @@ public partial class MainWindow : Page
             return;
         }
         int actual = this.VM.SetAgility(v);
-        if (this.StatAgi != null) { this.StatAgi.Value = actual; }
+        if (this.StatAgi != null) { this.StatAgi.Value = (float)actual; }
         this.BeginStoryboard("UserControl.Anim.Agi.ValueChanged");
     }
 
@@ -213,7 +218,7 @@ public partial class MainWindow : Page
             return;
         }
         int actual = this.VM.SetIntelligence(v);
-        if (this.StatInt != null) { this.StatInt.Value = actual; }
+        if (this.StatInt != null) { this.StatInt.Value = (float)actual; }
         this.BeginStoryboard("UserControl.Anim.Int.ValueChanged");
     }
 
@@ -224,7 +229,7 @@ public partial class MainWindow : Page
             return;
         }
         int actual = this.VM.SetCharisma(v);
-        if (this.StatCha != null) { this.StatCha.Value = actual; }
+        if (this.StatCha != null) { this.StatCha.Value = (float)actual; }
         this.BeginStoryboard("UserControl.Anim.Cha.ValueChanged");
     }
 
