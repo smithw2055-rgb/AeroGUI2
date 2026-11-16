@@ -6,6 +6,7 @@
 #include <sstream>
 
 #include "aero/core/StringUtils.hpp"
+#include "realscript/semantic/Semantic.h"
 
 namespace aero {
 namespace {
@@ -198,7 +199,14 @@ std::unordered_set<std::string> CollectDeclaredModuleNames(
 void StripAeroNativeMirBodies(std::vector<rs_mir::Module>& modules) {
     for (auto& mod : modules) {
         if (mod.name == "Aero.Native") {
-            mod.functions.clear();
+            mod.functions.erase(
+                std::remove_if(
+                    mod.functions.begin(),
+                    mod.functions.end(),
+                    [](const rs_mir::Function& fn) {
+                        return fn.returnType != rs_sem::PrimitiveType::Void;
+                    }),
+                mod.functions.end());
         }
     }
 }

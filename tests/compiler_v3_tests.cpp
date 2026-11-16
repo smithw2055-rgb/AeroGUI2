@@ -843,24 +843,29 @@ public void RunVoidProbe(handle h) {
         return;
     }
 
-    // Verify Aero.Native bytecode module has ZERO compiled function bodies AND
-    // NativeProbe preserved external call to Aero.Native::Visual_Create under -O2!
+    // Verify Aero.Native retains ONLY void wrappers (all non-void & __rs_native_* stripped),
+    // and NativeProbe preserved external call to Aero.Native::Visual_Create under -O2!
     std::string probeDisasm;
     for (const auto& bcMod : result.bytecodeModules) {
         if (bcMod.name == "Aero.Native") {
-            Require(bcMod.functions.empty(),
-                "Aero.Native MIR/bytecode functions must be stripped cleanly");
+            for (const auto& fn : bcMod.functions) {
+                Require(fn.returnType == aero::rs_sem::PrimitiveType::Void &&
+                        !ContainsText(fn.name, "__rs_native_"),
+                    "Aero.Native must strip all non-void and __rs_native_* bodies, keeping only void wrappers");
+            }
         } else if (bcMod.name == "NativeProbe") {
             probeDisasm = rs_bc::disassembleModule(bcMod);
         }
     }
     Require(ContainsText(probeDisasm, "Visual_Create") &&
             ContainsText(probeDisasm, "Color_ParseRgba") &&
-            ContainsText(probeDisasm, "Visual_SetOpacity"),
+            (ContainsText(probeDisasm, "Visual_SetOpacity") ||
+             ContainsText(probeDisasm, "__rs_native_Visual_SetOpacity")),
         "-O2 must NOT inline Aero.Native dummy bodies; Call instructions must remain");
 
     Require(ContainsText(result.aotCpp.scriptAotSource, "Visual_Create") &&
-            ContainsText(result.aotCpp.scriptAotSource, "Visual_SetOpacity"),
+            (ContainsText(result.aotCpp.scriptAotSource, "Visual_SetOpacity") ||
+             ContainsText(result.aotCpp.scriptAotSource, "__rs_native_Visual_SetOpacity")),
         "AOT C++ source must preserve external Aero.Native calls");
 
     // Execute compiled bytecode with mock native hooks to confirm live FFI dispatch
@@ -887,6 +892,79 @@ public void RunVoidProbe(handle h) {
     Require(std::holds_alternative<rs_rt::UIntValue>(execRes.value) &&
             std::get<rs_rt::UIntValue>(execRes.value).value == 0xFF1098DFu,
         "RunNativeProbe should return live native hook result 0xFF1098DFu, not inlined 0u");
+}
+
+void TestVoidNativeForwardersO0O2AndAot() {
+    const aero::AeroCompilerV3 compiler;
+    aero::SourceFile probe;
+    probe.path = "VoidForwarderProbe.rs";
+    probe.content = R"RS(
+module VoidForwarderProbe;
+import Aero.Native;
+
+public float ApplyFade(float opacity) {
+    handle node = Visual_Create(0);
+    Visual_SetOpacity(node, opacity);
+    return opacity;
+}
+)RS";
+
+    for (bool optO2 : {false, true}) {
+        aero::AeroV3CompileInput input;
+        input.includeStdlib = true;
+        input.optimizeBytecode = optO2;
+        input.emitAotCpp = true;
+        input.aotViewBuilderName = optO2 ? "BuildVoidProbeO2" : "BuildVoidProbeO0";
+        input.scriptSources.push_back(probe);
+
+        const aero::AeroV3CompileResult res = compiler.Compile(input);
+        for (const auto& d : res.diagnostics) {
+            if (!res.succeeded) {
+                std::cerr << "  void probe diag: " << d << "\n";
+            }
+        }
+        Require(res.succeeded && res.programImage != nullptr,
+            std::string("VoidForwarderProbe compile failed under ") + (optO2 ? "-O2" : "-O0"));
+        Require(!res.aotCpp.scriptAotHeader.empty() && !res.aotCpp.scriptAotSource.empty(),
+            std::string("VoidForwarderProbe AOT output empty under ") + (optO2 ? "-O2" : "-O0"));
+        if (!res.succeeded || !res.programImage) {
+            continue;
+        }
+
+        rs_rt::Interpreter interp(res.programImage);
+        bool sawCreate = false;
+        bool sawNativeSetOpacity = false;
+        float capturedOpacity = -1.0f;
+        interp.setExternalResolver(
+            [&](const rs_bc::FunctionReference& ref, rs_rt::ValueSpan args, rs_rt::RuntimeError&)
+                -> std::optional<rs_rt::Value> {
+                if (ref.name == "Aero.Native::Visual_Create") {
+                    sawCreate = true;
+                    return rs_rt::Value(rs_rt::NativeHandle{99u, 1u, 1u, 1u});
+                }
+                if (ref.name == "Aero.Native::__rs_native_Visual_SetOpacity" ||
+                    ref.name == "Aero.Native::Visual_SetOpacity") {
+                    sawNativeSetOpacity = true;
+                    if (args.size() >= 2) {
+                        (void)args[1].tryGetFloat(capturedOpacity);
+                    }
+                    return rs_rt::Value{std::int64_t{0}};
+                }
+                return std::nullopt;
+            });
+
+        const auto execRes = interp.invoke(
+            "VoidForwarderProbe::ApplyFade",
+            {rs_rt::Value(rs_rt::FloatValue{0.42f})});
+        Require(execRes.succeeded,
+            std::string("VoidForwarderProbe invoke failed under ") + (optO2 ? "-O2" : "-O0") +
+            ": " + execRes.error.message);
+        Require(sawCreate && sawNativeSetOpacity,
+            std::string("VoidForwarderProbe did not dispatch __rs_native_Visual_SetOpacity under ") +
+            (optO2 ? "-O2" : "-O0"));
+        Require(capturedOpacity > 0.41f && capturedOpacity < 0.43f,
+            "VoidForwarderProbe did not receive expected opacity argument 0.42f");
+    }
 }
 
 void TestEndToEndXamlCompileAndSessionReuse() {
@@ -1035,6 +1113,7 @@ int main() {
     TestCSharpCompatLowerer();
     TestXamlToRsEmitterFeatures();
     TestNativeBodyStrippingUnderO2AndAot();
+    TestVoidNativeForwardersO0O2AndAot();
     TestEndToEndXamlCompileAndSessionReuse();
 
     if (gFailureCount > 0) {
