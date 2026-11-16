@@ -57,6 +57,10 @@ public class TextBoxBase : Control {
         get { return _placeholderText; }
         set { _placeholderText = value == null ? "" : value; RefreshTextVisual(); }
     }
+    public string Placeholder {
+        get { return PlaceholderText; }
+        set { PlaceholderText = value; }
+    }
     public Brush CaretBrush {
         get { return _caretBrush; }
         set { _caretBrush = value; RefreshTextSelectionVisual(); }
@@ -421,16 +425,23 @@ public class TextBox : TextBoxBase {
         set { if (_textVisual != null) { _textVisual.TextAlignment = value; } }
     }
 
+    public int MaxLines { get; set; } = 0;
+    public int MinLines { get; set; } = 1;
+
     protected override void OnRawTextChanged(string newRaw) {
         BindingEngine.NotifyTargetPropertyChanged(this, "Text", DependencyObject.BoxString(newRaw));
     }
 
     public override bool SetPropertyValue(string propName, DependencyObject value) {
         if (propName == "Text") { Text = DependencyObject.UnboxString(value, ""); return true; }
+        if (propName == "MaxLines") { MaxLines = DependencyObject.UnboxInt(value, 0); return true; }
+        if (propName == "MinLines") { MinLines = DependencyObject.UnboxInt(value, 1); return true; }
         return base.SetPropertyValue(propName, value);
     }
     public override DependencyObject GetPropertyValue(string propName) {
         if (propName == "Text") { return DependencyObject.BoxString(Text); }
+        if (propName == "MaxLines") { return DependencyObject.BoxInt(MaxLines); }
+        if (propName == "MinLines") { return DependencyObject.BoxInt(MinLines); }
         return base.GetPropertyValue(propName);
     }
 }

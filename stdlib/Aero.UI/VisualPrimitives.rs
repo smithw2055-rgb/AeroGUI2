@@ -69,6 +69,39 @@ public class Inline : DependencyObject {
     public Brush Foreground { get; set; }
     public string FontWeight { get; set; } = "";
     public float FontSize { get; set; } = 0.0f;
+    internal TextBlock OwnerTextBlock;
+
+    public virtual bool SetPropertyValue(string propName, DependencyObject value) {
+        if (propName == "Text") {
+            Text = DependencyObject.UnboxString(value, "");
+            if (OwnerTextBlock != null) { OwnerTextBlock.NotifyInlineChanged(); }
+            return true;
+        }
+        if (propName == "Foreground") {
+            Foreground = UIElement.CoerceBrush(value);
+            if (OwnerTextBlock != null) { OwnerTextBlock.NotifyInlineChanged(); }
+            return true;
+        }
+        if (propName == "FontWeight") {
+            FontWeight = DependencyObject.UnboxString(value, "Normal");
+            if (OwnerTextBlock != null) { OwnerTextBlock.NotifyInlineChanged(); }
+            return true;
+        }
+        if (propName == "FontSize") {
+            FontSize = DependencyObject.UnboxFloat(value, 14.0f);
+            if (OwnerTextBlock != null) { OwnerTextBlock.NotifyInlineChanged(); }
+            return true;
+        }
+        return false;
+    }
+
+    public virtual DependencyObject GetPropertyValue(string propName) {
+        if (propName == "Text") { return DependencyObject.BoxString(Text); }
+        if (propName == "Foreground") { return Foreground; }
+        if (propName == "FontWeight") { return DependencyObject.BoxString(FontWeight); }
+        if (propName == "FontSize") { return DependencyObject.BoxFloat(FontSize); }
+        return null;
+    }
 }
 
 public class Run : Inline {
@@ -96,6 +129,10 @@ public class TextBlock : FrameworkElement {
     private int _maxLines = 0;
     private int _decorations = 0;
     private Inline[] _inlines;
+    private bool _hasExplicitFontSize = false;
+    private bool _hasExplicitFontFamily = false;
+    private bool _hasExplicitFontWeight = false;
+    private bool _hasExplicitForeground = false;
 
     public TextBlock() : base(VisualKind.Text) {
         _inlines = new Inline[0];
@@ -122,15 +159,15 @@ public class TextBlock : FrameworkElement {
     }
     public string FontFamily {
         get { return _fontFamily; }
-        set { _fontFamily = value == null ? "Segoe UI" : value; SyncTextToNative(); }
+        set { _hasExplicitFontFamily = true; _fontFamily = value == null ? "Segoe UI" : value; SyncTextToNative(); }
     }
     public float FontSize {
         get { return _fontSize; }
-        set { _fontSize = value > 0.0f ? value : 14.0f; SyncTextToNative(); }
+        set { _hasExplicitFontSize = true; _fontSize = value > 0.0f ? value : 14.0f; SyncTextToNative(); }
     }
     public string FontWeight {
         get { return _fontWeight; }
-        set { _fontWeight = value == null ? "Normal" : value; SyncTextToNative(); }
+        set { _hasExplicitFontWeight = true; _fontWeight = value == null ? "Normal" : value; SyncTextToNative(); }
     }
     public string FontStyle {
         get { return _fontStyle; }
@@ -138,7 +175,32 @@ public class TextBlock : FrameworkElement {
     }
     public Brush Foreground {
         get { return _foreground; }
-        set { _foreground = value; SyncTextToNative(); }
+        set { _hasExplicitForeground = true; _foreground = value; SyncTextToNative(); }
+    }
+
+    internal override void OnInheritedTypographyChanged() {
+        bool changed = false;
+        if (!_hasExplicitFontSize) {
+            float fs = EffectiveTextFontSizeOrZero();
+            float nextFs = fs > 0.0f ? fs : 14.0f;
+            if (_fontSize != nextFs) { _fontSize = nextFs; changed = true; }
+        }
+        if (!_hasExplicitFontFamily) {
+            string ff = EffectiveTextFontFamilyOrEmpty();
+            string nextFf = ff.Length > 0 ? ff : "Segoe UI";
+            if (_fontFamily != nextFf) { _fontFamily = nextFf; changed = true; }
+        }
+        if (!_hasExplicitFontWeight) {
+            string fw = EffectiveTextFontWeightOrEmpty();
+            string nextFw = fw.Length > 0 ? fw : "Normal";
+            if (_fontWeight != nextFw) { _fontWeight = nextFw; changed = true; }
+        }
+        if (!_hasExplicitForeground) {
+            Brush fg = EffectiveTextForeground();
+            Brush nextFg = fg != null ? fg : Brushes.DefaultForeground();
+            if (_foreground != nextFg) { _foreground = nextFg; changed = true; }
+        }
+        if (changed) { SyncTextToNative(); }
     }
     public TextWrapping TextWrapping {
         get { return _textWrapping; }
@@ -173,9 +235,11 @@ public class TextBlock : FrameworkElement {
 
     public void AddInline(Inline inline) {
         if (inline == null) { return; }
+        inline.OwnerTextBlock = this;
         _inlines.Push(inline);
         RebuildFromInlines();
     }
+    internal void NotifyInlineChanged() { RebuildFromInlines(); }
     public void AddRun(Run run) { AddInline(run); }
     public void ClearInlines() {
         _inlines.Clear();
@@ -221,6 +285,9 @@ public class TextBlock : FrameworkElement {
         Visual_SetTextMetrics(__nativeHandle, _lineHeight, _charSpacing, _maxLines, _decorations);
     }
 
+    public Brush Stroke { get; set; }
+    public float StrokeThickness { get; set; } = 0.0f;
+
     public override bool SetPropertyValue(string propName, DependencyObject value) {
         if (propName == "Text") { Text = DependencyObject.UnboxString(value, ""); return true; }
         if (propName == "FontFamily") { FontFamily = DependencyObject.UnboxString(value, "Segoe UI"); return true; }
@@ -228,6 +295,8 @@ public class TextBlock : FrameworkElement {
         if (propName == "FontWeight") { FontWeight = DependencyObject.UnboxString(value, "Normal"); return true; }
         if (propName == "FontStyle") { FontStyle = DependencyObject.UnboxString(value, "Normal"); return true; }
         if (propName == "Foreground") { Foreground = UIElement.CoerceBrush(value); return true; }
+        if (propName == "Stroke") { Stroke = UIElement.CoerceBrush(value); return true; }
+        if (propName == "StrokeThickness") { StrokeThickness = DependencyObject.UnboxFloat(value, 0.0f); return true; }
         if (propName == "LineHeight") { LineHeight = DependencyObject.UnboxFloat(value, 0.0f); return true; }
         if (propName == "TextWrapping") {
             if (value is BoxedInt) {
@@ -262,6 +331,8 @@ public class TextBlock : FrameworkElement {
         if (propName == "FontSize") { return DependencyObject.BoxFloat(_fontSize); }
         if (propName == "FontFamily") { return DependencyObject.BoxString(_fontFamily); }
         if (propName == "Foreground") { return _foreground; }
+        if (propName == "Stroke") { return Stroke; }
+        if (propName == "StrokeThickness") { return DependencyObject.BoxFloat(StrokeThickness); }
         return base.GetPropertyValue(propName);
     }
 }

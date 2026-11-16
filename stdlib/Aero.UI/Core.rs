@@ -293,6 +293,15 @@ public static class KeyModifiers {
         if (flag <= 0) { return false; }
         return ((mods / flag) % 2) != 0;
     }
+    public static int Parse(string text) {
+        if (text == null || text.Length == 0) { return 0; }
+        string s = text.ToLower().Trim();
+        int m = 0;
+        if (s.Contains("ctrl") || s.Contains("control")) { m = m + 2; }
+        if (s.Contains("shift")) { m = m + 1; }
+        if (s.Contains("alt")) { m = m + 4; }
+        return m;
+    }
 }
 
 public static class EnumConvert {
@@ -520,23 +529,24 @@ public static class EnumConvert {
         string n = name.Trim();
         if (n == "Opacity") { return VisualAnimProp.Opacity; }
         if (n == "Width") { return VisualAnimProp.Width; }
-        if (n == "Height") { return VisualAnimProp.Height; }
-        if (n == "TranslateX" || n == "RenderTransform.X") { return VisualAnimProp.TranslateX; }
-        if (n == "TranslateY" || n == "RenderTransform.Y") { return VisualAnimProp.TranslateY; }
+        if (n == "Height" || n == "MinHeight") { return VisualAnimProp.Height; }
+        if (n == "MinWidth") { return VisualAnimProp.Width; }
+        if (n == "TranslateX" || n == "RenderTransform.X" || n == "X") { return VisualAnimProp.TranslateX; }
+        if (n == "TranslateY" || n == "RenderTransform.Y" || n == "Y") { return VisualAnimProp.TranslateY; }
         if (n == "ScaleX" || n == "RenderTransform.ScaleX") { return VisualAnimProp.ScaleX; }
         if (n == "ScaleY" || n == "RenderTransform.ScaleY") { return VisualAnimProp.ScaleY; }
-        if (n == "RotateDeg" || n == "Angle" || n == "RenderTransform.Angle") { return VisualAnimProp.RotateDeg; }
+        if (n == "RotateDeg" || n == "Rotation" || n == "Angle" || n == "RenderTransform.Angle") { return VisualAnimProp.RotateDeg; }
         if (n == "SkewX" || n == "RenderTransform.AngleX") { return VisualAnimProp.SkewX; }
         if (n == "SkewY" || n == "RenderTransform.AngleY") { return VisualAnimProp.SkewY; }
-        if (n == "Rot3DX" || n == "Rotation3DX") { return VisualAnimProp.Rot3DX; }
-        if (n == "Rot3DY" || n == "Rotation3DY") { return VisualAnimProp.Rot3DY; }
-        if (n == "Rot3DZ" || n == "Rotation3DZ") { return VisualAnimProp.Rot3DZ; }
-        if (n == "Trans3DX" || n == "Translation3DX") { return VisualAnimProp.Trans3DX; }
+        if (n == "Rot3DX" || n == "Rotation3DX" || n == "RotationX") { return VisualAnimProp.Rot3DX; }
+        if (n == "Rot3DY" || n == "Rotation3DY" || n == "RotationY") { return VisualAnimProp.Rot3DY; }
+        if (n == "Rot3DZ" || n == "Rotation3DZ" || n == "RotationZ") { return VisualAnimProp.Rot3DZ; }
+        if (n == "Trans3DX" || n == "Translation3DX" || n == "TranslateZ") { return VisualAnimProp.Trans3DX; }
         if (n == "Trans3DY" || n == "Translation3DY") { return VisualAnimProp.Trans3DY; }
-        if (n == "Trans3DZ" || n == "Translation3DZ") { return VisualAnimProp.Trans3DZ; }
-        if (n == "Background" || n == "Background.Color" || n == "Fill") { return VisualAnimProp.BgColor; }
+        if (n == "Trans3DZ" || n == "Translation3DZ" || n == "GlobalOffsetZ") { return VisualAnimProp.Trans3DZ; }
+        if (n == "Background" || n == "Background.Color" || n == "Fill" || n == "Fill.Color") { return VisualAnimProp.BgColor; }
         if (n == "Foreground" || n == "Foreground.Color") { return VisualAnimProp.FgColor; }
-        if (n == "BorderBrush" || n == "BorderBrush.Color" || n == "Stroke") { return VisualAnimProp.BorderColor; }
+        if (n == "BorderBrush" || n == "BorderBrush.Color" || n == "Stroke" || n == "Stroke.Color") { return VisualAnimProp.BorderColor; }
         if (n == "CornerRadius") { return VisualAnimProp.CornerRadius; }
         if (n == "TrimStart") { return VisualAnimProp.PathTrimStart; }
         if (n == "TrimEnd") { return VisualAnimProp.PathTrimEnd; }
@@ -571,6 +581,44 @@ public static class EnumConvert {
     public static int ToInt(PointerButton v) {
         if (v == PointerButton.Right) { return 1; }
         if (v == PointerButton.Middle) { return 2; }
+        return 0;
+    }
+    public static int ToInt(ExpandDirection v) {
+        switch (v) {
+            case ExpandDirection.Up: return 1;
+            case ExpandDirection.Left: return 2;
+            case ExpandDirection.Right: return 3;
+        }
+        return 0;
+    }
+    public static int ToInt(ClickMode v) {
+        switch (v) {
+            case ClickMode.Press: return 1;
+            case ClickMode.Hover: return 2;
+        }
+        return 0;
+    }
+    public static int ToInt(SelectionMode v) {
+        switch (v) {
+            case SelectionMode.Multiple: return 1;
+            case SelectionMode.Extended: return 2;
+        }
+        return 0;
+    }
+    public static int ToInt(TabStripPlacement v) {
+        switch (v) {
+            case TabStripPlacement.Bottom: return 1;
+            case TabStripPlacement.Left: return 2;
+            case TabStripPlacement.Right: return 3;
+        }
+        return 0;
+    }
+    public static int ToInt(ScrollBarVisibility v) {
+        switch (v) {
+            case ScrollBarVisibility.Auto: return 1;
+            case ScrollBarVisibility.Hidden: return 2;
+            case ScrollBarVisibility.Visible: return 3;
+        }
         return 0;
     }
     public static PointerButton ToPointerButton(int v) {
@@ -613,6 +661,62 @@ public static class EnumConvert {
             case 60: return KeyCode.F10; case 61: return KeyCode.F11; case 62: return KeyCode.F12;
         }
         return KeyCode.None;
+    }
+    public static KeyCode ParseKeyCode(string text) {
+        if (text == null || text.Length == 0) { return KeyCode.None; }
+        string k = text.Trim().ToLower();
+        if (k == "tab") { return KeyCode.Tab; }
+        if (k == "enter" || k == "return") { return KeyCode.Enter; }
+        if (k == "space") { return KeyCode.Space; }
+        if (k == "escape" || k == "esc") { return KeyCode.Escape; }
+        if (k == "back" || k == "backspace") { return KeyCode.Backspace; }
+        if (k == "delete" || k == "del") { return KeyCode.Delete; }
+        if (k == "left") { return KeyCode.Left; }
+        if (k == "right") { return KeyCode.Right; }
+        if (k == "up") { return KeyCode.Up; }
+        if (k == "down") { return KeyCode.Down; }
+        if (k == "home") { return KeyCode.Home; }
+        if (k == "end") { return KeyCode.End; }
+        if (k == "pageup" || k == "prior") { return KeyCode.PageUp; }
+        if (k == "pagedown" || k == "next") { return KeyCode.PageDown; }
+        if (k == "a") { return KeyCode.A; } if (k == "b") { return KeyCode.B; }
+        if (k == "c") { return KeyCode.C; } if (k == "d") { return KeyCode.D; }
+        if (k == "e") { return KeyCode.E; } if (k == "f") { return KeyCode.F; }
+        if (k == "g") { return KeyCode.G; } if (k == "h") { return KeyCode.H; }
+        if (k == "i") { return KeyCode.I; } if (k == "j") { return KeyCode.J; }
+        if (k == "k") { return KeyCode.K; } if (k == "l") { return KeyCode.L; }
+        if (k == "m") { return KeyCode.M; } if (k == "n") { return KeyCode.N; }
+        if (k == "o") { return KeyCode.O; } if (k == "p") { return KeyCode.P; }
+        if (k == "q") { return KeyCode.Q; } if (k == "r") { return KeyCode.R; }
+        if (k == "s") { return KeyCode.S; } if (k == "t") { return KeyCode.T; }
+        if (k == "u") { return KeyCode.U; } if (k == "v") { return KeyCode.V; }
+        if (k == "w") { return KeyCode.W; } if (k == "x") { return KeyCode.X; }
+        if (k == "y") { return KeyCode.Y; } if (k == "z") { return KeyCode.Z; }
+        if (k == "0" || k == "d0") { return KeyCode.D0; }
+        if (k == "1" || k == "d1") { return KeyCode.D1; }
+        if (k == "2" || k == "d2") { return KeyCode.D2; }
+        if (k == "3" || k == "d3") { return KeyCode.D3; }
+        if (k == "4" || k == "d4") { return KeyCode.D4; }
+        if (k == "5" || k == "d5") { return KeyCode.D5; }
+        if (k == "6" || k == "d6") { return KeyCode.D6; }
+        if (k == "7" || k == "d7") { return KeyCode.D7; }
+        if (k == "8" || k == "d8") { return KeyCode.D8; }
+        if (k == "9" || k == "d9") { return KeyCode.D9; }
+        if (k == "f1") { return KeyCode.F1; } if (k == "f2") { return KeyCode.F2; }
+        if (k == "f3") { return KeyCode.F3; } if (k == "f4") { return KeyCode.F4; }
+        if (k == "f5") { return KeyCode.F5; } if (k == "f6") { return KeyCode.F6; }
+        if (k == "f7") { return KeyCode.F7; } if (k == "f8") { return KeyCode.F8; }
+        if (k == "f9") { return KeyCode.F9; } if (k == "f10") { return KeyCode.F10; }
+        if (k == "f11") { return KeyCode.F11; } if (k == "f12") { return KeyCode.F12; }
+        return KeyCode.None;
+    }
+    public static BlendingMode ParseBlendingMode(string text) {
+        if (text == null) { return BlendingMode.Normal; }
+        string m = text.Trim().ToLower();
+        if (m == "multiply") { return BlendingMode.Multiply; }
+        if (m == "screen") { return BlendingMode.Screen; }
+        if (m == "additive" || m == "add") { return BlendingMode.Additive; }
+        return BlendingMode.Normal;
     }
 }
 
@@ -1238,6 +1342,13 @@ public class GradientBrush : Brush {
     public void AddStop(string color, float offset) {
         AddStop(new GradientStop(color, offset));
     }
+    public void AddStopObj(object colorObj, float offset) {
+        if (colorObj is BoxedString) {
+            AddStop((colorObj as BoxedString).Value, offset);
+        } else if (colorObj is SolidColorBrush) {
+            AddStop((colorObj as SolidColorBrush).ResolveRgba(), offset);
+        }
+    }
     public void ClearStops() {
         _stops.Clear();
         _dirty = true;
@@ -1308,6 +1419,9 @@ public class RadialGradientBrush : GradientBrush {
     public RadialGradientBrush() : base() {}
     public RadialGradientBrush(float cx, float cy, float rx, float ry) : base() {
         _cx = cx; _cy = cy; _ox = cx; _oy = cy; _rx = rx; _ry = ry;
+    }
+    public RadialGradientBrush(float cx, float cy, float ox, float oy, float rx, float ry) : base() {
+        _cx = cx; _cy = cy; _ox = ox; _oy = oy; _rx = rx; _ry = ry;
     }
 
     public float CenterX { get { return _cx; } set { _cx = value; _dirty = true; } }
@@ -1397,6 +1511,9 @@ public class SkewTransform : Transform {
     public float CenterY { get; set; }
     public SkewTransform() {}
     public SkewTransform(float ax, float ay) { AngleX = ax; AngleY = ay; }
+    public SkewTransform(float ax, float ay, float cx, float cy) {
+        AngleX = ax; AngleY = ay; CenterX = cx; CenterY = cy;
+    }
     public override void Accumulate(TransformData acc) {
         acc.SkewX = acc.SkewX + AngleX;
         acc.SkewY = acc.SkewY + AngleY;
@@ -1491,6 +1608,82 @@ public class SaturationEffect : Effect {
     public SaturationEffect(float factor = 1.0f) { Kind = UIEffectKind.Saturation; Radius = factor; }
 }
 
+public class ImageBrush : Brush {
+    public string ImageSource { get; set; } = "";
+    public Stretch Stretch { get; set; } = Stretch.Uniform;
+    public string Viewbox { get; set; } = "0,0,1,1";
+    public uint TintRgba { get; set; } = 0u;
+
+    public ImageBrush() { TintRgba = ParseUtil.PackArgb(48u, 32u, 56u, 96u); }
+    public ImageBrush(string source) {
+        ImageSource = source == null ? "" : source;
+        TintRgba = ParseUtil.PackArgb(48u, 32u, 56u, 96u);
+    }
+
+    public override uint ResolveRgba() { return TintRgba; }
+}
+
+public class PlaneProjection : DependencyObject {
+    public float RotationX { get; set; } = 0.0f;
+    public float RotationY { get; set; } = 0.0f;
+    public float RotationZ { get; set; } = 0.0f;
+    public float LocalOffsetX { get; set; } = 0.0f;
+    public float LocalOffsetY { get; set; } = 0.0f;
+    public float LocalOffsetZ { get; set; } = 0.0f;
+    public float GlobalOffsetX { get; set; } = 0.0f;
+    public float GlobalOffsetY { get; set; } = 0.0f;
+    public float GlobalOffsetZ { get; set; } = 0.0f;
+    public float CenterOfRotationX { get; set; } = 0.5f;
+    public float CenterOfRotationY { get; set; } = 0.5f;
+    public float CenterOfRotationZ { get; set; } = 0.0f;
+
+    public PlaneProjection() {}
+    public PlaneProjection(float rx, float ry, float rz) {
+        RotationX = rx; RotationY = ry; RotationZ = rz;
+    }
+}
+
+public class CompositeTransform3D : DependencyObject {
+    public float RotationX { get; set; } = 0.0f;
+    public float RotationY { get; set; } = 0.0f;
+    public float RotationZ { get; set; } = 0.0f;
+    public float TranslateX { get; set; } = 0.0f;
+    public float TranslateY { get; set; } = 0.0f;
+    public float TranslateZ { get; set; } = 0.0f;
+    public float ScaleX { get; set; } = 1.0f;
+    public float ScaleY { get; set; } = 1.0f;
+    public float ScaleZ { get; set; } = 1.0f;
+    public float CenterX { get; set; } = 0.0f;
+    public float CenterY { get; set; } = 0.0f;
+    public float CenterZ { get; set; } = 0.0f;
+
+    public CompositeTransform3D() {}
+}
+
+public class KeyBinding : DependencyObject {
+    public KeyCode Key { get; set; } = KeyCode.None;
+    public int Modifiers { get; set; } = 0;
+    public ICommand Command { get; set; }
+    public string CommandPath { get; set; } = "";
+    public string CommandParameterPath { get; set; } = "";
+    private DependencyObject _paramBox;
+
+    public KeyBinding() {}
+    public KeyBinding(ICommand command, KeyCode key, int modifiers = 0) {
+        Command = command;
+        Key = key;
+        Modifiers = modifiers;
+    }
+
+    public object CommandParameter {
+        get { return DependencyObject.Unbox(_paramBox); }
+        set { _paramBox = DependencyObject.BoxObject(value); }
+    }
+    public void SetCommandParameter(string val) { _paramBox = DependencyObject.BoxString(val); }
+    public void SetCommandParameterBox(DependencyObject box) { _paramBox = box; }
+    public DependencyObject GetCommandParameterBox() { return _paramBox; }
+}
+
 // ============================================================================
 // 6. UIElement & FrameworkElement
 // ============================================================================
@@ -1565,6 +1758,19 @@ public partial class UIElement : DependencyObject {
     private Thickness _borderThickness;
     private CornerRadius _cornerRadius;
 
+    private PlaneProjection _projection3D;
+    private CompositeTransform3D _transform3D;
+    private KeyBinding[] _inputBindings;
+    private float _explicitFontSize = 0.0f;
+    private float _inheritedFontSize = 0.0f;
+    private string _explicitFontFamily = "";
+    private string _inheritedFontFamily = "";
+    private string _explicitFontWeight = "";
+    private string _inheritedFontWeight = "";
+    private Brush _explicitTextForeground;
+    private Brush _inheritedTextForeground;
+    private string _riveSource = "";
+
     private bool _loadedFired = false;
     private bool _isStyleApplying = false;
 
@@ -1605,6 +1811,7 @@ public partial class UIElement : DependencyObject {
         _renderTransformOrigin = new Point(0.5f, 0.5f);
         _dynResProps = new string[0];
         _dynResKeys = new string[0];
+        _inputBindings = new KeyBinding[0];
         CreateNativeVisual(kind);
     }
 
@@ -1676,7 +1883,7 @@ public partial class UIElement : DependencyObject {
         }
     }
 
-    public void SetDataContext(object dc) { DataContext = dc; }
+    public virtual void SetDataContext(object dc) { DataContext = dc; }
     public void ClearLocalDataContext() {
         DependencyObject oldBox = _explicitDataContext;
         _explicitDataContext = null;
@@ -1728,6 +1935,7 @@ public partial class UIElement : DependencyObject {
             ApplyStyleInternal();
         }
     }
+    public Style FocusVisualStyle { get; set; }
 
     public void SetResourceReference(string propName, string resourceKey) {
         if (propName == null || resourceKey == null) { return; }
@@ -1877,6 +2085,131 @@ public partial class UIElement : DependencyObject {
     public BlendingMode BlendMode {
         get { return _blendMode; }
         set { _blendMode = value; }
+    }
+    public PlaneProjection Projection3D {
+        get { return _projection3D; }
+        set {
+            _projection3D = value;
+            if (value != null) {
+                _rot3DX = value.RotationX;
+                _rot3DY = value.RotationY;
+                _rot3DZ = value.RotationZ;
+                _trans3DX = value.LocalOffsetX + value.GlobalOffsetX;
+                _trans3DY = value.LocalOffsetY + value.GlobalOffsetY;
+                _trans3DZ = value.LocalOffsetZ + value.GlobalOffsetZ;
+                SyncTransform3D();
+            }
+        }
+    }
+    public CompositeTransform3D Transform3D {
+        get { return _transform3D; }
+        set {
+            _transform3D = value;
+            if (value != null) {
+                _rot3DX = value.RotationX;
+                _rot3DY = value.RotationY;
+                _rot3DZ = value.RotationZ;
+                _trans3DX = value.TranslateX;
+                _trans3DY = value.TranslateY;
+                _trans3DZ = value.TranslateZ;
+                SyncTransform3D();
+            }
+        }
+    }
+
+    public void SetExplicitTextFontSize(float sz) {
+        _explicitFontSize = sz > 0.0f ? sz : 0.0f;
+        PropagateTypographyToSubtree();
+    }
+    public float EffectiveTextFontSizeOrZero() {
+        return _explicitFontSize > 0.0f ? _explicitFontSize : _inheritedFontSize;
+    }
+    public void SetExplicitTextFontFamily(string ff) {
+        _explicitFontFamily = ff == null ? "" : ff;
+        PropagateTypographyToSubtree();
+    }
+    public string EffectiveTextFontFamilyOrEmpty() {
+        return _explicitFontFamily.Length > 0 ? _explicitFontFamily : _inheritedFontFamily;
+    }
+    public void SetExplicitTextFontWeight(string fw) {
+        _explicitFontWeight = fw == null ? "" : fw;
+        PropagateTypographyToSubtree();
+    }
+    public string EffectiveTextFontWeightOrEmpty() {
+        return _explicitFontWeight.Length > 0 ? _explicitFontWeight : _inheritedFontWeight;
+    }
+    public void SetExplicitTextForeground(Brush fg) {
+        _explicitTextForeground = fg;
+        PropagateTypographyToSubtree();
+    }
+    public Brush EffectiveTextForeground() {
+        return _explicitTextForeground != null ? _explicitTextForeground : _inheritedTextForeground;
+    }
+
+    internal virtual void OnInheritedTypographyChanged() {}
+
+    internal void ReceiveInheritedTypography(float fs, string ff, string fw, Brush fg) {
+        _inheritedFontSize = fs;
+        _inheritedFontFamily = ff == null ? "" : ff;
+        _inheritedFontWeight = fw == null ? "" : fw;
+        _inheritedTextForeground = fg;
+        OnInheritedTypographyChanged();
+        float outFs = EffectiveTextFontSizeOrZero();
+        string outFf = EffectiveTextFontFamilyOrEmpty();
+        string outFw = EffectiveTextFontWeightOrEmpty();
+        Brush outFg = EffectiveTextForeground();
+        for (int i = 0; i < _children.Length; i += 1) {
+            _children[i].ReceiveInheritedTypography(outFs, outFf, outFw, outFg);
+        }
+    }
+
+    protected void PropagateTypographyToSubtree() {
+        OnInheritedTypographyChanged();
+        float outFs = EffectiveTextFontSizeOrZero();
+        string outFf = EffectiveTextFontFamilyOrEmpty();
+        string outFw = EffectiveTextFontWeightOrEmpty();
+        Brush outFg = EffectiveTextForeground();
+        for (int i = 0; i < _children.Length; i += 1) {
+            _children[i].ReceiveInheritedTypography(outFs, outFf, outFw, outFg);
+        }
+    }
+
+    public void AddInputBinding(KeyBinding kb) {
+        if (kb != null) { _inputBindings.Push(kb); }
+    }
+    public void AddKeyBinding(KeyBinding kb) { AddInputBinding(kb); }
+    public KeyBinding[] InputBindings() { return _inputBindings; }
+
+    internal bool TryHandleInputBindings(KeyEventArgs e) {
+        if (e == null || e.Handled || _inputBindings == null || _inputBindings.Length == 0) {
+            return false;
+        }
+        int evMods = e.Modifiers % 8;
+        for (int i = 0; i < _inputBindings.Length; i += 1) {
+            KeyBinding kb = _inputBindings[i];
+            if (kb.Key == e.Key && (kb.Modifiers % 8) == evMods) {
+                ICommand cmd = kb.Command;
+                if (cmd == null && kb.CommandPath.Length > 0) {
+                    object dc = DataContext;
+                    if (dc != null) {
+                        DependencyObject box = BindingEngine.ReadPathBox(dc, kb.CommandPath);
+                        cmd = DependencyObject.Unbox(box) as ICommand;
+                    }
+                }
+                if (cmd != null) {
+                    object paramObj = kb.CommandParameter;
+                    if (paramObj == null && kb.CommandParameterPath.Length > 0 && DataContext != null) {
+                        paramObj = DependencyObject.Unbox(BindingEngine.ReadPathBox(DataContext, kb.CommandParameterPath));
+                    }
+                    if (cmd.CanExecute(paramObj)) {
+                        cmd.Execute(paramObj);
+                        e.Handled = true;
+                        return true;
+                    }
+                }
+            }
+        }
+        return false;
     }
 
     public Brush Background {
@@ -2059,6 +2392,11 @@ public partial class UIElement : DependencyObject {
 
     protected void OnChildAttached(UIElement child) {
         child.ReceiveInheritedDataContext(EffectiveDataContextBox());
+        child.ReceiveInheritedTypography(
+            EffectiveTextFontSizeOrZero(),
+            EffectiveTextFontFamilyOrEmpty(),
+            EffectiveTextFontWeightOrEmpty(),
+            EffectiveTextForeground());
         child.ApplyStyleInternal();
         child.RefreshDynamicResourcesRecursive();
         child.EnsureLoadedSubtree();
@@ -2287,6 +2625,11 @@ public partial class UIElement : DependencyObject {
             Style = value as Style;
             return true;
         }
+        if (propName == "FocusVisualStyle") {
+            if (value is Style) { FocusVisualStyle = value as Style; }
+            else { FocusVisualStyle = null; }
+            return true;
+        }
         if (propName == "Grid.Row") { SetGridRow(this, DependencyObject.UnboxInt(value, 0)); return true; }
         if (propName == "Grid.Column") { SetGridColumn(this, DependencyObject.UnboxInt(value, 0)); return true; }
         if (propName == "Grid.RowSpan") { SetGridRowSpan(this, DependencyObject.UnboxInt(value, 1)); return true; }
@@ -2295,10 +2638,50 @@ public partial class UIElement : DependencyObject {
         if (propName == "Canvas.Top") { SetCanvasTop(this, DependencyObject.UnboxFloat(value, 0.0f)); return true; }
         if (propName == "Canvas.Right") { SetCanvasRight(this, DependencyObject.UnboxFloat(value, 0.0f)); return true; }
         if (propName == "Canvas.Bottom") { SetCanvasBottom(this, DependencyObject.UnboxFloat(value, 0.0f)); return true; }
+        if (propName == "Rotation3DX") { Rotation3DX = DependencyObject.UnboxFloat(value, 0.0f); return true; }
+        if (propName == "Rotation3DY") { Rotation3DY = DependencyObject.UnboxFloat(value, 0.0f); return true; }
+        if (propName == "Rotation3DZ") { Rotation3DZ = DependencyObject.UnboxFloat(value, 0.0f); return true; }
+        if (propName == "Translation3DX") { Translation3DX = DependencyObject.UnboxFloat(value, 0.0f); return true; }
+        if (propName == "Translation3DY") { Translation3DY = DependencyObject.UnboxFloat(value, 0.0f); return true; }
+        if (propName == "Translation3DZ") { Translation3DZ = DependencyObject.UnboxFloat(value, 0.0f); return true; }
+        if (propName == "CameraDistance") { CameraDistance = DependencyObject.UnboxFloat(value, 0.0f); return true; }
+        if (propName == "TextElement.FontSize" || propName == "TextBlock.FontSize") {
+            SetExplicitTextFontSize(DependencyObject.UnboxFloat(value, 14.0f));
+            return true;
+        }
+        if (propName == "TextElement.FontFamily" || propName == "TextBlock.FontFamily") {
+            SetExplicitTextFontFamily(DependencyObject.UnboxString(value, "Segoe UI"));
+            return true;
+        }
+        if (propName == "TextElement.FontWeight" || propName == "TextBlock.FontWeight") {
+            SetExplicitTextFontWeight(DependencyObject.UnboxString(value, "Normal"));
+            return true;
+        }
+        if (propName == "TextElement.Foreground" || propName == "TextBlock.Foreground") {
+            SetExplicitTextForeground(CoerceBrush(value));
+            return true;
+        }
+        if (propName == "Element.BlendingMode" || propName == "BlendMode") {
+            BlendMode = EnumConvert.ParseBlendingMode(DependencyObject.UnboxString(value, "Normal"));
+            return true;
+        }
+        if (propName == "Element.Projection3D" && value is PlaneProjection) {
+            Projection3D = value as PlaneProjection;
+            return true;
+        }
+        if (propName == "Element.Transform3D" && value is CompositeTransform3D) {
+            Transform3D = value as CompositeTransform3D;
+            return true;
+        }
+        if (propName == "RiveControl.Source") {
+            _riveSource = DependencyObject.UnboxString(value, "");
+            return true;
+        }
         return false;
     }
 
     public virtual DependencyObject GetPropertyValue(string propName) {
+        if (propName == "RiveControl.Source") { return DependencyObject.BoxString(_riveSource); }
         if (propName == "Width") { return DependencyObject.BoxFloat(_width); }
         if (propName == "Height") { return DependencyObject.BoxFloat(_height); }
         if (propName == "ActualWidth") { return DependencyObject.BoxFloat(ActualWidth); }
@@ -2307,13 +2690,44 @@ public partial class UIElement : DependencyObject {
         if (propName == "IsEnabled") { return DependencyObject.BoxBool(_isEnabled); }
         if (propName == "IsMouseOver") { return DependencyObject.BoxBool(_isMouseOver); }
         if (propName == "IsPressed") { return DependencyObject.BoxBool(_isPressed); }
-        if (propName == "IsFocused") { return DependencyObject.BoxBool(_isFocused); }
+        if (propName == "IsFocused" || propName == "IsKeyboardFocused") { return DependencyObject.BoxBool(_isFocused); }
         if (propName == "Visibility") { return DependencyObject.BoxInt(EnumConvert.ToInt(_visibility)); }
         if (propName == "Background") { return _background; }
         if (propName == "BorderBrush") { return _borderBrush; }
         if (propName == "Name") { return DependencyObject.BoxString(_name); }
         if (propName == "DataContext") { return EffectiveDataContextBox(); }
         if (propName == "Tag") { return _tag; }
+        if (propName == "Rotation3DX") { return DependencyObject.BoxFloat(_rot3DX); }
+        if (propName == "Rotation3DY") { return DependencyObject.BoxFloat(_rot3DY); }
+        if (propName == "Rotation3DZ") { return DependencyObject.BoxFloat(_rot3DZ); }
+        if (propName == "Translation3DX") { return DependencyObject.BoxFloat(_trans3DX); }
+        if (propName == "Translation3DY") { return DependencyObject.BoxFloat(_trans3DY); }
+        if (propName == "Translation3DZ") { return DependencyObject.BoxFloat(_trans3DZ); }
+        if (propName == "RenderTransform.ScaleX" || propName == "ScaleX") {
+            var td = new TransformData();
+            if (_renderTransform != null) { _renderTransform.Accumulate(td); }
+            return DependencyObject.BoxFloat(td.SX);
+        }
+        if (propName == "RenderTransform.ScaleY" || propName == "ScaleY") {
+            var td = new TransformData();
+            if (_renderTransform != null) { _renderTransform.Accumulate(td); }
+            return DependencyObject.BoxFloat(td.SY);
+        }
+        if (propName == "RenderTransform.Angle" || propName == "Rotation" || propName == "Angle") {
+            var td = new TransformData();
+            if (_renderTransform != null) { _renderTransform.Accumulate(td); }
+            return DependencyObject.BoxFloat(td.RotDeg);
+        }
+        if (propName == "RenderTransform.X" || propName == "TranslateX") {
+            var td = new TransformData();
+            if (_renderTransform != null) { _renderTransform.Accumulate(td); }
+            return DependencyObject.BoxFloat(td.TX);
+        }
+        if (propName == "RenderTransform.Y" || propName == "TranslateY") {
+            var td = new TransformData();
+            if (_renderTransform != null) { _renderTransform.Accumulate(td); }
+            return DependencyObject.BoxFloat(td.TY);
+        }
         return null;
     }
 
@@ -2323,6 +2737,13 @@ public partial class UIElement : DependencyObject {
         string s = DependencyObject.UnboxString(value, "");
         if (s.Length > 0) { return new SolidColorBrush(s); }
         return null;
+    }
+
+    public void SetPropertyBox(string propName, DependencyObject value) {
+        SetPropertyValue(propName, value);
+    }
+    public void SetPropertyObject(string propName, object value) {
+        SetPropertyValue(propName, DependencyObject.BoxObject(value));
     }
 
     public void SetProperty(string propName, string value) {
@@ -2422,8 +2843,71 @@ public class FrameworkElement : UIElement {
     public FrameworkElement() : base(VisualKind.Box) {}
     protected FrameworkElement(VisualKind kind) : base(kind) {}
     public override string GetTypeName() { return "FrameworkElement"; }
+    public void SetDataContext<T>(T vm) { DataContext = vm; }
     public virtual bool ApplyTemplate() { OnApplyTemplate(); return true; }
     public virtual void OnApplyTemplate() {}
+}
+
+public static class TextElement {
+    public static void SetFontSize(UIElement el, float size) {
+        if (el == null) { return; }
+        el.SetExplicitTextFontSize(size);
+        el.SetPropertyValue("FontSize", DependencyObject.BoxFloat(size));
+    }
+    public static float GetFontSize(UIElement el) {
+        if (el == null) { return 14.0f; }
+        float f = el.EffectiveTextFontSizeOrZero();
+        return f > 0.0f ? f : 14.0f;
+    }
+    public static void SetFontFamily(UIElement el, string family) {
+        if (el == null) { return; }
+        el.SetExplicitTextFontFamily(family);
+        el.SetPropertyValue("FontFamily", DependencyObject.BoxString(family));
+    }
+    public static string GetFontFamily(UIElement el) {
+        if (el == null) { return "Segoe UI"; }
+        string ff = el.EffectiveTextFontFamilyOrEmpty();
+        return ff.Length > 0 ? ff : "Segoe UI";
+    }
+    public static void SetFontWeight(UIElement el, string weight) {
+        if (el == null) { return; }
+        el.SetExplicitTextFontWeight(weight);
+        el.SetPropertyValue("FontWeight", DependencyObject.BoxString(weight));
+    }
+    public static string GetFontWeight(UIElement el) {
+        if (el == null) { return "Normal"; }
+        string fw = el.EffectiveTextFontWeightOrEmpty();
+        return fw.Length > 0 ? fw : "Normal";
+    }
+    public static void SetForeground(UIElement el, Brush brush) {
+        if (el == null) { return; }
+        el.SetExplicitTextForeground(brush);
+        el.SetPropertyValue("Foreground", brush);
+    }
+    public static Brush GetForeground(UIElement el) {
+        return el == null ? null : el.EffectiveTextForeground();
+    }
+}
+
+public static class Element {
+    public static void SetProjection3D(UIElement el, PlaneProjection proj) {
+        if (el != null) { el.Projection3D = proj; }
+    }
+    public static PlaneProjection GetProjection3D(UIElement el) {
+        return el == null ? null : el.Projection3D;
+    }
+    public static void SetTransform3D(UIElement el, CompositeTransform3D tr) {
+        if (el != null) { el.Transform3D = tr; }
+    }
+    public static CompositeTransform3D GetTransform3D(UIElement el) {
+        return el == null ? null : el.Transform3D;
+    }
+    public static void SetBlendingMode(UIElement el, BlendingMode mode) {
+        if (el != null) { el.BlendMode = mode; }
+    }
+    public static BlendingMode GetBlendingMode(UIElement el) {
+        return el == null ? BlendingMode.Normal : el.BlendMode;
+    }
 }
 
 // ============================================================================
@@ -2700,6 +3184,16 @@ public static class InputDispatcher {
                 else { cur.RaiseKeyUp(args); }
             }
             cur = cur.Parent;
+        }
+
+        if (isDown && !args.Handled) {
+            UIElement bcur = target;
+            while (bcur != null && !args.Handled) {
+                if (bcur.IsEnabled && bcur.TryHandleInputBindings(args)) {
+                    break;
+                }
+                bcur = bcur.Parent;
+            }
         }
 
         if (isDown && !args.Handled && kc == KeyCode.Tab) {

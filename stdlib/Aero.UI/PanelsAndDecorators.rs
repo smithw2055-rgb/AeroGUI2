@@ -108,6 +108,21 @@ public class StackPanel : Panel {
     }
 }
 
+public class VirtualizingStackPanel : StackPanel {
+    public VirtualizingStackPanel() : base() {}
+    public override string GetTypeName() { return "VirtualizingStackPanel"; }
+}
+
+public class TabPanel : StackPanel {
+    public TabPanel() : base(Orientation.Horizontal, 0.0f) {}
+    public override string GetTypeName() { return "TabPanel"; }
+}
+
+public class ToolBarPanel : StackPanel {
+    public ToolBarPanel() : base(Orientation.Horizontal, 2.0f) {}
+    public override string GetTypeName() { return "ToolBarPanel"; }
+}
+
 public class DockPanel : Panel {
     private bool _lastChildFill = true;
 
@@ -164,6 +179,11 @@ public class WrapPanel : Panel {
             EnumConvert.ToInt(_orientation),
             0);
     }
+}
+
+public class ToolBarOverflowPanel : WrapPanel {
+    public ToolBarOverflowPanel() : base() {}
+    public override string GetTypeName() { return "ToolBarOverflowPanel"; }
 }
 
 public class UniformGrid : Panel {
