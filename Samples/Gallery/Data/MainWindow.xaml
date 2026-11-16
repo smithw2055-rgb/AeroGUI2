@@ -15,8 +15,12 @@
         UseLayoutRounding="True"
         d:DesignWidth="1920" d:DesignHeight="1080">
     <Window.Resources>
-        <sys:Double x:Key="SelectorBarWidth">215</sys:Double>
-        <Storyboard x:Key="ShowContainer1">
+        <ResourceDictionary>
+            <ResourceDictionary.MergedDictionaries>
+                <ResourceDictionary Source="Resources.xaml"/>
+            </ResourceDictionary.MergedDictionaries>
+            <sys:Double x:Key="SelectorBarWidth">215</sys:Double>
+            <Storyboard x:Key="ShowContainer1">
             <BooleanAnimationUsingKeyFrames Storyboard.TargetProperty="(UIElement.IsEnabled)" Storyboard.TargetName="SelectorTree">
                 <DiscreteBooleanKeyFrame KeyTime="0:0:0" Value="False"/>
                 <DiscreteBooleanKeyFrame KeyTime="0:0:0.8" Value="True"/>
@@ -188,6 +192,7 @@
                 <DiscreteBooleanKeyFrame KeyTime="0:0:3" Value="True"/>
             </BooleanAnimationUsingKeyFrames>
         </Storyboard>
+        </ResourceDictionary>
     </Window.Resources>
     <b:Interaction.Triggers>
         <b:DataTrigger Binding="{Binding IsChecked, ElementName=SelectorExpanderButton}" Value="True">

@@ -1,0 +1,58 @@
+<Window x:Class="IntegrationGLUT.MainWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:local="clr-namespace:IntegrationGLUT"
+        Title="AeroGUI v3 - IntegrationGLUT Overlay"
+        Width="1024" Height="640"
+        Background="#FF0A111D">
+  <Grid x:Name="LayoutRoot">
+    <!-- Retains the GLUT sample concept: live 3D wireframe viewport beneath an interactive AeroGUI HUD overlay -->
+    <local:GlutViewport x:Name="Viewport3D" Focusable="True"/>
+
+    <!-- Top HUD bar -->
+    <Border HorizontalAlignment="Stretch" VerticalAlignment="Top"
+            Margin="20,16,20,0" Padding="16,12"
+            Background="#CC0F1A2B" BorderBrush="#FF29466E" BorderThickness="1" CornerRadius="8">
+      <Grid>
+        <Grid.ColumnDefinitions>
+          <ColumnDefinition Width="*"/>
+          <ColumnDefinition Width="Auto"/>
+        </Grid.ColumnDefinitions>
+        <StackPanel Grid.Column="0" Orientation="Vertical" Spacing="2">
+          <TextBlock Text="AeroGUI v3 Overlay HUD (GLUT Viewport Replacement)"
+                     FontSize="18" FontWeight="Bold" Foreground="#FFE6F1FF"/>
+          <TextBlock x:Name="TelemetryText"
+                     Text="{Binding TelemetryLabel}"
+                     FontSize="12" Foreground="#FF8FB6DF"/>
+        </StackPanel>
+        <StackPanel Grid.Column="1" Orientation="Horizontal" Spacing="8" VerticalAlignment="Center">
+          <Button x:Name="RotateLeftBtn" Content="Rotate -" Padding="12,6"
+                  Background="#FF1B3A5C" Foreground="#FFEAF4FF" BorderBrush="#FF366DA3" BorderThickness="1"/>
+          <Button x:Name="RotateRightBtn" Content="Rotate +" Padding="12,6"
+                  Background="#FF1B3A5C" Foreground="#FFEAF4FF" BorderBrush="#FF366DA3" BorderThickness="1"/>
+          <Button x:Name="ToggleOverlayBtn" Content="Toggle Card" Padding="12,6"
+                  Background="#FF1F4E78" Foreground="#FFFFFFFF" BorderBrush="#FF4D94D4" BorderThickness="1"/>
+        </StackPanel>
+      </Grid>
+    </Border>
+
+    <!-- Classic GLUT Sample centered Hello World gradient overlay card -->
+    <Border x:Name="HelloCard"
+            HorizontalAlignment="Center" VerticalAlignment="Center"
+            Padding="36,24" CornerRadius="14"
+            BorderBrush="#FF4CB5FF" BorderThickness="1.5">
+      <Border.Background>
+        <LinearGradientBrush StartPoint="0,0" EndPoint="0,1">
+          <GradientStop Color="#E6123F73" Offset="0"/>
+          <GradientStop Color="#E6081A33" Offset="1"/>
+        </LinearGradientBrush>
+      </Border.Background>
+      <StackPanel Spacing="6" HorizontalAlignment="Center">
+        <TextBlock Text="Hello World!" FontSize="44" FontWeight="Bold"
+                   Foreground="#FFFFFFFF" HorizontalAlignment="Center"/>
+        <TextBlock Text="{Binding AngleSummary}" FontSize="14"
+                   Foreground="#FF9AD2FF" HorizontalAlignment="Center"/>
+      </StackPanel>
+    </Border>
+  </Grid>
+</Window>

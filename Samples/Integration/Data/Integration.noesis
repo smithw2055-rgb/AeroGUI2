@@ -1,5 +1,0 @@
-<Project>
-  <Assembly>Integration</Assembly>
-  <DefaultDataNamespace>Integration</DefaultDataNamespace>
-  <StartupDocument>MainPage.xaml</StartupDocument>
-</Project>
