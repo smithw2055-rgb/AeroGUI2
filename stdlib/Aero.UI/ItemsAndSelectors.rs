@@ -61,10 +61,22 @@ public class ItemsPresenter : FrameworkElement {
     }
 }
 
+public class ItemsPanelTemplate : DependencyObject {
+    private Func<Panel> _factory;
+    public ItemsPanelTemplate() {}
+    public ItemsPanelTemplate(Func<Panel> factory) { _factory = factory; }
+    public Func<Panel> GetFactory() { return _factory; }
+    public Func<Panel> Factory {
+        get { return _factory; }
+        set { _factory = value; }
+    }
+}
+
 public class ItemsControl : Control {
     private DependencyObject[] _manualItems;
     private DependencyObject _itemsSourceBox;
     private DataTemplate _itemTemplate;
+    private Style _itemContainerStyle;
     private Func<Panel> _itemsPanelFactory;
     private string _displayMemberPath = "";
     private int _alternationCount = 0;
@@ -99,6 +111,10 @@ public class ItemsControl : Control {
     public DataTemplate ItemTemplate {
         get { return _itemTemplate; }
         set { _itemTemplate = value; RefreshItems(); }
+    }
+    public Style ItemContainerStyle {
+        get { return _itemContainerStyle; }
+        set { _itemContainerStyle = value; RefreshItems(); }
     }
     public Func<Panel> ItemsPanel {
         get { return _itemsPanelFactory; }
@@ -331,6 +347,9 @@ public class ItemsControl : Control {
                 container = AcquireContainer();
                 PrepareContainerForItem(container, box, i);
             }
+            if (_itemContainerStyle != null && container != null) {
+                container.Style = _itemContainerStyle;
+            }
             _activeContainers.Push(container);
             host.AddChild(container);
         }
@@ -350,6 +369,12 @@ public class ItemsControl : Control {
     public override bool SetPropertyValue(string propName, DependencyObject value) {
         if (propName == "ItemsSource") { SetItemsSourceBox(value); return true; }
         if (propName == "ItemTemplate" && value is DataTemplate) { ItemTemplate = value as DataTemplate; return true; }
+        if (propName == "ItemContainerStyle" && value is Style) { ItemContainerStyle = value as Style; return true; }
+        if (propName == "ItemsPanel" && value is ItemsPanelTemplate) {
+            ItemsPanelTemplate ipt = value as ItemsPanelTemplate;
+            ItemsPanel = ipt.GetFactory();
+            return true;
+        }
         if (propName == "DisplayMemberPath") { DisplayMemberPath = DependencyObject.UnboxString(value, ""); return true; }
         if (propName == "AlternationCount") { AlternationCount = DependencyObject.UnboxInt(value, 0); return true; }
         return base.SetPropertyValue(propName, value);
@@ -715,6 +740,53 @@ public class GridView : DependencyObject {
     public void ClearColumns() { _columns.Clear(); }
 }
 
+public class GridViewHeaderRowPresenter : FrameworkElement {
+    private DependencyObject _contextMenuBox;
+    private DependencyObject _templateSelectorBox;
+    private DependencyObject _toolTipBox;
+    private DependencyObject _columnsBox;
+    public bool AllowsColumnReorder { get; set; } = true;
+    public Style ColumnHeaderContainerStyle { get; set; }
+    public DataTemplate ColumnHeaderTemplate { get; set; }
+
+    public object ColumnHeaderContextMenu {
+        get { return DependencyObject.Unbox(_contextMenuBox); }
+        set { _contextMenuBox = DependencyObject.BoxObject(value); }
+    }
+    public object ColumnHeaderTemplateSelector {
+        get { return DependencyObject.Unbox(_templateSelectorBox); }
+        set { _templateSelectorBox = DependencyObject.BoxObject(value); }
+    }
+    public object ColumnHeaderToolTip {
+        get { return DependencyObject.Unbox(_toolTipBox); }
+        set { _toolTipBox = DependencyObject.BoxObject(value); }
+    }
+    public object Columns {
+        get { return DependencyObject.Unbox(_columnsBox); }
+        set { _columnsBox = DependencyObject.BoxObject(value); }
+    }
+
+    public GridViewHeaderRowPresenter() : base() {}
+    public override string GetTypeName() { return "GridViewHeaderRowPresenter"; }
+}
+
+public class GridViewRowPresenter : FrameworkElement {
+    private DependencyObject _contentBox;
+    private DependencyObject _columnsBox;
+
+    public object Content {
+        get { return DependencyObject.Unbox(_contentBox); }
+        set { _contentBox = DependencyObject.BoxObject(value); }
+    }
+    public object Columns {
+        get { return DependencyObject.Unbox(_columnsBox); }
+        set { _columnsBox = DependencyObject.BoxObject(value); }
+    }
+
+    public GridViewRowPresenter() : base() {}
+    public override string GetTypeName() { return "GridViewRowPresenter"; }
+}
+
 public class ListView : ListBox {
     private GridView _view;
     private Grid _headerRow;
@@ -856,6 +928,7 @@ public class ComboBox : Selector {
     public override string GetTypeName() { return "ComboBox"; }
 
     public bool IsEditable { get { return _isEditable; } set { _isEditable = value; } }
+    public string Placeholder { get; set; } = "";
     public float MaxDropDownHeight {
         get { return _maxDropDownHeight; }
         set { _maxDropDownHeight = value > 40.0f ? value : 240.0f; }

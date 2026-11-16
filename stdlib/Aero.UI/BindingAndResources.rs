@@ -39,8 +39,13 @@ public class ResourceDictionary : DependencyObject {
     public void Set(string key, bool val) { SetBox(key, DependencyObject.BoxBool(val)); }
 
     public DependencyObject GetBox(string key) {
-        if (key == null || !_map.ContainsKey(key)) { return null; }
-        return _map[key];
+        if (key == null) { return null; }
+        if (_map.ContainsKey(key)) { return _map[key]; }
+        ResourceDictionary appRes = GlobalApplicationResources();
+        if (this != appRes && appRes != null && appRes.Contains(key)) {
+            return appRes.GetBox(key);
+        }
+        return null;
     }
 
     public object Get(string key) {
@@ -75,6 +80,9 @@ public class ResourceDictionary : DependencyObject {
             SetBox(k, other.GetBox(k));
         }
     }
+    public void AddMergedDictionary(ResourceDictionary other) {
+        Merge(other);
+    }
 }
 
 // ============================================================================
@@ -85,6 +93,17 @@ public class Setter : DependencyObject {
     private DependencyObject _valueBox;
     public string Property { get; set; } = "";
     public string TargetName { get; set; } = "";
+    public string BindingPath { get; set; } = "";
+    public string BindingElementName { get; set; } = "";
+    public string BindingRelativeMode { get; set; } = "";
+    public string BindingAncestorType { get; set; } = "";
+    public IValueConverter BindingConverter { get; set; }
+    public string BindingConverterKey { get; set; } = "";
+    public string BindingConverterParam { get; set; } = "";
+    public string BindingStringFormat { get; set; } = "";
+    public int BindingMode { get; set; } = 0;
+    public bool BindingHasFallback { get; set; } = false;
+    private DependencyObject _bindingFallbackBox;
 
     public Setter() {}
     public Setter(string property, object value) {
@@ -108,6 +127,39 @@ public class Setter : DependencyObject {
         _valueBox = DependencyObject.BoxBool(value);
     }
 
+    public static Setter FromBox(string property, DependencyObject valueBox, string targetName = "") {
+        var s = new Setter();
+        s.Property = property == null ? "" : property;
+        s._valueBox = valueBox;
+        s.TargetName = targetName == null ? "" : targetName;
+        return s;
+    }
+
+    public static Setter FromBinding(
+        string property, string path,
+        IValueConverter conv = null, string converterKey = "", string converterParam = "",
+        string stringFormat = "", int mode = 0, string elementName = "",
+        string relativeMode = "", string ancestorType = "", string targetName = "") {
+        var s = new Setter();
+        s.Property = property == null ? "" : property;
+        s.BindingPath = path == null ? "" : path;
+        s.BindingConverter = conv;
+        s.BindingConverterKey = converterKey == null ? "" : converterKey;
+        s.BindingConverterParam = converterParam == null ? "" : converterParam;
+        s.BindingStringFormat = stringFormat == null ? "" : stringFormat;
+        s.BindingMode = mode;
+        s.BindingElementName = elementName == null ? "" : elementName;
+        s.BindingRelativeMode = relativeMode == null ? "" : relativeMode;
+        s.BindingAncestorType = ancestorType == null ? "" : ancestorType;
+        s.TargetName = targetName == null ? "" : targetName;
+        return s;
+    }
+
+    public void SetBindingFallback(DependencyObject fallbackBox) {
+        BindingHasFallback = true;
+        _bindingFallbackBox = fallbackBox;
+    }
+
     public object Value {
         get { return DependencyObject.Unbox(_valueBox); }
         set { _valueBox = DependencyObject.BoxObject(value); }
@@ -121,7 +173,15 @@ public class Setter : DependencyObject {
         if (rootTarget == null || Property.Length == 0) { return; }
         UIElement dest = TargetName.Length > 0 ? rootTarget.FindName(TargetName) : rootTarget;
         if (dest != null) {
-            dest.SetPropertyValue(Property, _valueBox);
+            if (BindingPath.Length > 0) {
+                BindingEngine.BindPathEx(
+                    dest, Property, null, BindingPath, BindingMode,
+                    BindingConverter, BindingConverterKey, BindingConverterParam, BindingStringFormat,
+                    BindingHasFallback, _bindingFallbackBox, false, null,
+                    BindingRelativeMode, BindingAncestorType);
+            } else {
+                dest.SetPropertyValue(Property, _valueBox);
+            }
         }
     }
 }
@@ -146,6 +206,9 @@ public class TriggerBase : DependencyObject {
     public void AddSetter(string prop, float val) { _setters.Push(new Setter(prop, val)); }
     public void AddSetter(string prop, int val) { _setters.Push(new Setter(prop, val)); }
     public void AddSetter(string prop, bool val) { _setters.Push(new Setter(prop, val)); }
+    public void AddSetterBox(string prop, DependencyObject box, string targetName = "") {
+        _setters.Push(Setter.FromBox(prop, box, targetName));
+    }
     public void AddEnterAction(Storyboard sb) { if (sb != null) { _enterActions.Push(sb); } }
     public void AddExitAction(Storyboard sb) { if (sb != null) { _exitActions.Push(sb); } }
 
@@ -199,6 +262,13 @@ public class Trigger : TriggerBase {
         Property = property == null ? "" : property;
         _valueBox = DependencyObject.BoxFloat(value);
     }
+    public static Trigger CreateBox(string property, DependencyObject valueBox, string sourceName = "") {
+        var t = new Trigger();
+        t.Property = property == null ? "" : property;
+        t._valueBox = valueBox;
+        t.SourceName = sourceName == null ? "" : sourceName;
+        return t;
+    }
 
     public object Value {
         get { return DependencyObject.Unbox(_valueBox); }
@@ -238,6 +308,8 @@ public class Trigger : TriggerBase {
 public class DataTrigger : TriggerBase {
     private DependencyObject _valueBox;
     public string BindingPath { get; set; } = "";
+    public string RelativeSourceMode { get; set; } = "";
+    public string RelativeSourceAncestorType { get; set; } = "";
     public string Binding {
         get { return BindingPath; }
         set { BindingPath = value == null ? "" : value; }
@@ -256,6 +328,22 @@ public class DataTrigger : TriggerBase {
         BindingPath = bindingPath == null ? "" : bindingPath;
         _valueBox = DependencyObject.BoxBool(value);
     }
+    public DataTrigger(string bindingPath, int value) : base() {
+        BindingPath = bindingPath == null ? "" : bindingPath;
+        _valueBox = DependencyObject.BoxInt(value);
+    }
+    public DataTrigger(string bindingPath, float value) : base() {
+        BindingPath = bindingPath == null ? "" : bindingPath;
+        _valueBox = DependencyObject.BoxFloat(value);
+    }
+    public static DataTrigger CreateBox(string bindingPath, DependencyObject valueBox, string relMode = "", string ancestorType = "") {
+        var dt = new DataTrigger();
+        dt.BindingPath = bindingPath == null ? "" : bindingPath;
+        dt._valueBox = valueBox;
+        dt.RelativeSourceMode = relMode == null ? "" : relMode;
+        dt.RelativeSourceAncestorType = ancestorType == null ? "" : ancestorType;
+        return dt;
+    }
 
     public object Value {
         get { return DependencyObject.Unbox(_valueBox); }
@@ -264,9 +352,24 @@ public class DataTrigger : TriggerBase {
 
     public override bool IsMatched(UIElement target) {
         if (target == null || BindingPath.Length == 0) { return false; }
-        object dc = target.DataContext;
-        if (dc == null) { return _valueBox == null; }
-        DependencyObject actual = BindingEngine.ReadPathBox(dc, BindingPath);
+        DependencyObject actual = null;
+        if (RelativeSourceMode == "Self") {
+            actual = target.GetPropertyValue(BindingPath);
+            if (actual == null) { actual = BindingEngine.ReadPathBox(target, BindingPath); }
+        } else if (RelativeSourceMode == "FindAncestor" || RelativeSourceMode == "AncestorType") {
+            UIElement anc = target;
+            while (anc != null && RelativeSourceAncestorType.Length > 0 && anc.GetTypeName() != RelativeSourceAncestorType) {
+                anc = anc.Parent;
+            }
+            if (anc != null) {
+                actual = anc.GetPropertyValue(BindingPath);
+                if (actual == null) { actual = BindingEngine.ReadPathBox(anc, BindingPath); }
+            }
+        } else {
+            object dc = target.DataContext;
+            if (dc == null) { return _valueBox == null; }
+            actual = BindingEngine.ReadPathBox(dc, BindingPath);
+        }
         return Trigger.BoxEquals(actual, _valueBox);
     }
 }
@@ -321,10 +424,12 @@ public class Style : DependencyObject {
 
     private Setter[] _setters;
     private TriggerBase[] _triggers;
+    private BehaviorTriggerBase[] _behaviorTriggers;
 
     public Style() {
         _setters = new Setter[0];
         _triggers = new TriggerBase[0];
+        _behaviorTriggers = new BehaviorTriggerBase[0];
         Resources = new ResourceDictionary();
     }
     public Style(string targetType) : this() {
@@ -343,10 +448,16 @@ public class Style : DependencyObject {
     public void AddSetter(string propName, float value) { _setters.Push(new Setter(propName, value)); }
     public void AddSetter(string propName, int value) { _setters.Push(new Setter(propName, value)); }
     public void AddSetter(string propName, bool value) { _setters.Push(new Setter(propName, value)); }
+    public void AddSetterBox(string propName, DependencyObject valueBox, string targetName = "") {
+        _setters.Push(Setter.FromBox(propName, valueBox, targetName));
+    }
 
     public void AddTrigger(TriggerBase trigger) { if (trigger != null) { _triggers.Push(trigger); } }
     public void AddDataTrigger(DataTrigger trigger) { AddTrigger(trigger); }
     public void AddEventTrigger(EventTrigger trigger) { AddTrigger(trigger); }
+    public void AddBehaviorTrigger(BehaviorTriggerBase trigger) {
+        if (trigger != null) { _behaviorTriggers.Push(trigger); }
+    }
 
     public void ApplySettersOnly(UIElement target) {
         if (target == null) { return; }
@@ -364,6 +475,9 @@ public class Style : DependencyObject {
         }
         for (int i = 0; i < _triggers.Length; i += 1) {
             _triggers[i].Attach(target);
+        }
+        for (int i = 0; i < _behaviorTriggers.Length; i += 1) {
+            _behaviorTriggers[i].Attach(target);
         }
         EvaluateTriggers(target);
     }
@@ -387,12 +501,17 @@ public class Style : DependencyObject {
 public class ControlTemplate : DependencyObject {
     public string TargetType { get; set; } = "";
     private Func<Control, UIElement> _factory;
+    private TriggerBase[] _triggers;
+    public ResourceDictionary Resources { get; set; }
 
-    public ControlTemplate() {}
-    public ControlTemplate(Func<Control, UIElement> factory) {
+    public ControlTemplate() {
+        _triggers = new TriggerBase[0];
+        Resources = new ResourceDictionary();
+    }
+    public ControlTemplate(Func<Control, UIElement> factory) : this() {
         _factory = factory;
     }
-    public ControlTemplate(string targetType, Func<Control, UIElement> factory) {
+    public ControlTemplate(string targetType, Func<Control, UIElement> factory) : this() {
         TargetType = targetType == null ? "" : targetType;
         _factory = factory;
     }
@@ -401,12 +520,24 @@ public class ControlTemplate : DependencyObject {
         get { return _factory; }
         set { _factory = value; }
     }
+    public void AddTrigger(TriggerBase trigger) { if (trigger != null) { _triggers.Push(trigger); } }
+    public TriggerBase[] Triggers() { return _triggers; }
 
     public UIElement Instantiate(Control owner) {
         if (_factory == null) { return null; }
         UIElement root = _factory(owner);
         if (root != null) { MarkTemplatedParentSubtree(root, owner); }
+        for (int i = 0; i < _triggers.Length; i += 1) {
+            _triggers[i].Attach(owner);
+        }
         return root;
+    }
+
+    public void EvaluateTriggers(Control owner) {
+        if (owner == null || _triggers == null) { return; }
+        for (int i = 0; i < _triggers.Length; i += 1) {
+            _triggers[i].Evaluate(owner, null);
+        }
     }
 
     private static void MarkTemplatedParentSubtree(UIElement node, UIElement owner) {
@@ -420,12 +551,17 @@ public class ControlTemplate : DependencyObject {
 public class DataTemplate : DependencyObject {
     public string DataType { get; set; } = "";
     private Func<object, UIElement> _factory;
+    private TriggerBase[] _triggers;
+    public ResourceDictionary Resources { get; set; }
 
-    public DataTemplate() {}
-    public DataTemplate(Func<object, UIElement> factory) {
+    public DataTemplate() {
+        _triggers = new TriggerBase[0];
+        Resources = new ResourceDictionary();
+    }
+    public DataTemplate(Func<object, UIElement> factory) : this() {
         _factory = factory;
     }
-    public DataTemplate(string dataType, Func<object, UIElement> factory) {
+    public DataTemplate(string dataType, Func<object, UIElement> factory) : this() {
         DataType = dataType == null ? "" : dataType;
         _factory = factory;
     }
@@ -434,6 +570,7 @@ public class DataTemplate : DependencyObject {
         get { return _factory; }
         set { _factory = value; }
     }
+    public void AddTrigger(TriggerBase trigger) { if (trigger != null) { _triggers.Push(trigger); } }
 
     public virtual UIElement Instantiate(object item) {
         if (_factory == null) { return null; }
@@ -441,7 +578,29 @@ public class DataTemplate : DependencyObject {
         if (root != null && item != null) {
             root.DataContext = item;
         }
+        if (root != null && _triggers != null && _triggers.Length > 0) {
+            AttachTriggers(root);
+        }
         return root;
+    }
+
+    private void AttachTriggers(UIElement root) {
+        for (int i = 0; i < _triggers.Length; i += 1) {
+            _triggers[i].Attach(root);
+            _triggers[i].Evaluate(root, null);
+        }
+        root.Loaded += (object s, RoutedEventArgs e) => {
+            for (int i = 0; i < _triggers.Length; i += 1) { _triggers[i].Evaluate(root, null); }
+        };
+        root.DataContextChanged += (object s, DependencyPropertyChangedEventArgs e) => {
+            for (int i = 0; i < _triggers.Length; i += 1) { _triggers[i].Evaluate(root, null); }
+        };
+        root.GotFocus += (object s, RoutedEventArgs e) => {
+            for (int i = 0; i < _triggers.Length; i += 1) { _triggers[i].Evaluate(root, null); }
+        };
+        root.LostFocus += (object s, RoutedEventArgs e) => {
+            for (int i = 0; i < _triggers.Length; i += 1) { _triggers[i].Evaluate(root, null); }
+        };
     }
 }
 
@@ -477,6 +636,9 @@ public class VisualState : DependencyObject {
     public void AddSetter(string prop, string val) { _setters.Push(new Setter(prop, val)); }
     public void AddSetter(string prop, float val) { _setters.Push(new Setter(prop, val)); }
     public void AddSetter(string prop, bool val) { _setters.Push(new Setter(prop, val)); }
+    public void AddSetterBox(string propName, DependencyObject valueBox, string targetName = "") {
+        _setters.Push(Setter.FromBox(propName, valueBox, targetName));
+    }
 
     public void Enter(UIElement target) {
         for (int i = 0; i < _setters.Length; i += 1) {
@@ -596,6 +758,9 @@ public class TimelineAnimation : DependencyObject {
     public bool IsColor { get; set; } = false;
     public string FromColor { get; set; } = "";
     public string ToColor { get; set; } = "";
+    public uint FromRgba { get; set; } = 0u;
+    public uint ToRgba { get; set; } = 0u;
+    public bool HasColorUint { get; set; } = false;
     public bool UseSpring { get; set; } = false;
     public float Stiffness { get; set; } = 320.0f;
     public float Damping { get; set; } = 28.0f;
@@ -613,8 +778,8 @@ public class TimelineAnimation : DependencyObject {
         int em = EnumConvert.ToInt(EasingMode);
 
         if (IsColor) {
-            uint fromCol = FromColor.Length > 0 ? ParseUtil.ParseColor(FromColor) : 0u;
-            uint toCol = ToColor.Length > 0 ? ParseUtil.ParseColor(ToColor) : 0u;
+            uint fromCol = HasColorUint ? FromRgba : (FromColor.Length > 0 ? ParseUtil.ParseColor(FromColor) : 0u);
+            uint toCol = HasColorUint ? ToRgba : (ToColor.Length > 0 ? ParseUtil.ParseColor(ToColor) : 0u);
             Anim_StartColor(dest.__nativeHandle, propId, fromCol, toCol, DurationSec, ek, em);
             return;
         }
@@ -698,6 +863,29 @@ public class Storyboard : DependencyObject {
     public TimelineAnimation[] Children() { return _children; }
     public void Add(TimelineAnimation anim) { if (anim != null) { _children.Push(anim); } }
 
+    private static EasingFunctionKind IntToEasingKind(int kind) {
+        switch (kind) {
+            case 1: return EasingFunctionKind.Quadratic;
+            case 2: return EasingFunctionKind.Cubic;
+            case 3: return EasingFunctionKind.Quartic;
+            case 4: return EasingFunctionKind.Quintic;
+            case 5: return EasingFunctionKind.Sine;
+            case 6: return EasingFunctionKind.Circle;
+            case 7: return EasingFunctionKind.Exponential;
+            case 8: return EasingFunctionKind.Back;
+            case 9: return EasingFunctionKind.Bounce;
+            case 10: return EasingFunctionKind.Elastic;
+            case 11: return EasingFunctionKind.Spline;
+        }
+        return EasingFunctionKind.Linear;
+    }
+
+    private static EasingMode IntToEasingMode(int mode) {
+        if (mode == 1) { return EasingMode.EaseIn; }
+        if (mode == 2) { return EasingMode.EaseInOut; }
+        return EasingMode.EaseOut;
+    }
+
     public void AddDoubleAnimation(
         string targetName, string targetProp, float from, float to, float durationSec,
         EasingFunctionKind ease = EasingFunctionKind.Cubic, EasingMode mode = EasingMode.EaseOut) {
@@ -706,6 +894,18 @@ public class Storyboard : DependencyObject {
         da.TargetProperty = targetProp == null ? "Opacity" : targetProp;
         da.EasingKind = ease;
         da.EasingMode = mode;
+        _children.Push(da);
+    }
+
+    public void AddDoubleAnimation(
+        string targetName, string targetProp, float from, float to, float durationSec,
+        int easeKind, int easeMode, float delaySec) {
+        var da = new DoubleAnimation(from, to, durationSec);
+        da.TargetName = targetName == null ? "" : targetName;
+        da.TargetProperty = targetProp == null ? "Opacity" : targetProp;
+        da.EasingKind = IntToEasingKind(easeKind);
+        da.EasingMode = IntToEasingMode(easeMode);
+        da.DelaySec = delaySec;
         _children.Push(da);
     }
 
@@ -723,6 +923,34 @@ public class Storyboard : DependencyObject {
         ca.TargetProperty = targetProp == null ? "Background" : targetProp;
         ca.EasingKind = ease;
         ca.EasingMode = mode;
+        _children.Push(ca);
+    }
+
+    public void AddColorAnimation(
+        string targetName, string targetProp, string fromColor, string toColor, float durationSec,
+        int easeKind, int easeMode, float delaySec) {
+        var ca = new ColorAnimation(fromColor, toColor, durationSec);
+        ca.TargetName = targetName == null ? "" : targetName;
+        ca.TargetProperty = targetProp == null ? "Background" : targetProp;
+        ca.EasingKind = IntToEasingKind(easeKind);
+        ca.EasingMode = IntToEasingMode(easeMode);
+        ca.DelaySec = delaySec;
+        _children.Push(ca);
+    }
+
+    public void AddColorAnimation(
+        string targetName, string targetProp, uint fromRgba, uint toRgba, float durationSec,
+        int easeKind, int easeMode, float delaySec) {
+        var ca = new ColorAnimation();
+        ca.TargetName = targetName == null ? "" : targetName;
+        ca.TargetProperty = targetProp == null ? "Background" : targetProp;
+        ca.HasColorUint = true;
+        ca.FromRgba = fromRgba;
+        ca.ToRgba = toRgba;
+        ca.DurationSec = durationSec;
+        ca.EasingKind = IntToEasingKind(easeKind);
+        ca.EasingMode = IntToEasingMode(easeMode);
+        ca.DelaySec = delaySec;
         _children.Push(ca);
     }
 
@@ -786,7 +1014,12 @@ public class Binding : DependencyObject {
     public string ConverterKey { get; set; } = "";
     public string ConverterParameter { get; set; } = "";
     public string StringFormat { get; set; } = "";
+    public string RelativeSourceMode { get; set; } = "";
+    public string RelativeSourceAncestorType { get; set; } = "";
+    public bool HasFallbackValue { get; set; } = false;
+    public bool HasTargetNullValue { get; set; } = false;
     private DependencyObject _fallbackBox;
+    private DependencyObject _targetNullBox;
 
     public Binding() {}
     public Binding(string path) { Path = path == null ? "" : path; }
@@ -795,9 +1028,25 @@ public class Binding : DependencyObject {
         get { return DependencyObject.Unbox(_sourceBox); }
         set { _sourceBox = DependencyObject.BoxObject(value); }
     }
+    public DependencyObject SourceBox {
+        get { return _sourceBox; }
+        set { _sourceBox = value; }
+    }
     public object FallbackValue {
         get { return DependencyObject.Unbox(_fallbackBox); }
-        set { _fallbackBox = DependencyObject.BoxObject(value); }
+        set { _fallbackBox = DependencyObject.BoxObject(value); HasFallbackValue = true; }
+    }
+    public DependencyObject FallbackBox {
+        get { return _fallbackBox; }
+        set { _fallbackBox = value; HasFallbackValue = true; }
+    }
+    public object TargetNullValue {
+        get { return DependencyObject.Unbox(_targetNullBox); }
+        set { _targetNullBox = DependencyObject.BoxObject(value); HasTargetNullValue = true; }
+    }
+    public DependencyObject TargetNullBox {
+        get { return _targetNullBox; }
+        set { _targetNullBox = value; HasTargetNullValue = true; }
     }
 }
 
@@ -813,6 +1062,7 @@ public class MultiBinding : DependencyObject {
 
 internal class BindingEntry : DependencyObject {
     public UIElement Target;
+    public Inline TargetInline;
     public string TargetProp = "";
     public int Mode = 0; // 0=OneWay, 1=TwoWay, 2=OneTime
     public int Kind = 0; // 0=Lambda, 1=Path, 2=Element, 3=TemplateParent, 4=Multi
@@ -824,12 +1074,19 @@ internal class BindingEntry : DependencyObject {
     public UIElement SourceElement;
     public string SourcePath = "";
     public string[] MultiPaths;
+    public Binding[] MultiBindings;
     public string ElementName = "";
+    public string RelativeSourceMode = "";
+    public string RelativeSourceAncestorType = "";
     public IValueConverter Converter;
     public IMultiValueConverter MultiConverter;
     public string ConverterKey = "";
     public string ConverterParam = "";
     public string StringFormat = "";
+    public bool HasFallback = false;
+    public DependencyObject FallbackBox;
+    public bool HasTargetNull = false;
+    public DependencyObject TargetNullBox;
 
     public string LastHash = "";
     public int LastDirtyMask = -1;
@@ -837,30 +1094,121 @@ internal class BindingEntry : DependencyObject {
 
     public DependencyObject ResolveSourceBox() {
         if (ExplicitSourceBox != null) { return ExplicitSourceBox; }
-        if (Target != null) { return Target.EffectiveDataContextBox(); }
+        UIElement host = Target != null ? Target : (TargetInline != null ? TargetInline.OwnerTextBlock : null);
+        if (RelativeSourceMode == "Self") {
+            return Target != null ? (DependencyObject)Target : (DependencyObject)TargetInline;
+        }
+        if ((RelativeSourceMode == "FindAncestor" || RelativeSourceMode == "AncestorType") && host != null) {
+            UIElement anc = host;
+            while (anc != null && RelativeSourceAncestorType.Length > 0 && anc.GetTypeName() != RelativeSourceAncestorType) {
+                anc = anc.Parent;
+            }
+            if (anc != null) { return anc; }
+        }
+        if (host != null) { return host.EffectiveDataContextBox(); }
         return null;
     }
 
     public IValueConverter ResolveConverter() {
         if (Converter != null) { return Converter; }
-        if (ConverterKey.Length > 0 && Target != null) {
-            DependencyObject box = Target.FindResourceBox(ConverterKey);
+        UIElement host = Target != null ? Target : (TargetInline != null ? TargetInline.OwnerTextBlock : null);
+        if (ConverterKey.Length > 0 && host != null) {
+            DependencyObject box = host.FindResourceBox(ConverterKey);
             if (box is IValueConverter) { return box as IValueConverter; }
         }
         return null;
     }
 
-    public string FormatValue(DependencyObject box) {
-        string raw = DependencyObject.UnboxString(box, "");
-        if (StringFormat.Length == 0) { return raw; }
-        if (StringFormat.Contains("{0}")) {
-            return StringFormat.Replace("{0}", raw);
+    private static string FormatFixedDecimal(float v, int digits) {
+        if (digits <= 0) {
+            int iv = (int)(v >= 0.0f ? (v + 0.5f) : (v - 0.5f));
+            return "" + iv;
         }
-        return StringFormat + raw;
+        float scale = digits == 1 ? 10.0f : 100.0f;
+        int mod = digits == 1 ? 10 : 100;
+        bool neg = v < 0.0f;
+        int scaled = (int)(Math.Absf(v) * scale + 0.5f);
+        int whole = scaled / mod;
+        int frac = scaled % mod;
+        string fracStr = "" + frac;
+        if (digits == 2 && frac < 10) { fracStr = "0" + fracStr; }
+        return (neg && (whole > 0 || frac > 0) ? "-" : "") + whole + "." + fracStr;
+    }
+
+    private static string FormatSpecOnly(DependencyObject box, string spec) {
+        string raw = DependencyObject.UnboxString(box, "");
+        if (spec == null || spec.Length == 0) { return raw; }
+        if (box is BoxedFloat || box is BoxedInt) {
+            float fv = DependencyObject.UnboxFloat(box, 0.0f);
+            if (spec == "G" || spec == "g") {
+                int iv = (int)(fv >= 0.0f ? (fv + 0.0001f) : (fv - 0.0001f));
+                if (Math.Absf(fv - (float)iv) < 0.0001f) { return "" + iv; }
+                return raw;
+            }
+            if (spec == "00" || spec == "D2") {
+                int iv = (int)(fv >= 0.0f ? (fv + 0.0001f) : (fv - 0.0001f));
+                if (iv >= 0 && iv < 10) { return "0" + iv; }
+                return "" + iv;
+            }
+            if (spec == "F0" || spec == "f0" || spec == "N0" || spec == "n0" || spec == "0") {
+                return FormatFixedDecimal(fv, 0);
+            }
+            if (spec == "F1" || spec == "f1" || spec == "0.0") {
+                return FormatFixedDecimal(fv, 1);
+            }
+            if (spec == "F2" || spec == "f2" || spec == "0.00") {
+                return FormatFixedDecimal(fv, 2);
+            }
+        }
+        return raw;
+    }
+
+    private static int FindSubstr(string s, string needle, int start) {
+        if (s == null || needle == null || needle.Length == 0) { return -1; }
+        int limit = s.Length - needle.Length;
+        for (int i = start < 0 ? 0 : start; i <= limit; i += 1) {
+            if (s.Substring(i, needle.Length) == needle) { return i; }
+        }
+        return -1;
+    }
+
+    public string FormatValue(DependencyObject box) {
+        string fmt = StringFormat == null ? "" : StringFormat;
+        if (fmt.Length >= 2 && fmt.Substring(0, 2) == "{}") {
+            fmt = fmt.Substring(2);
+        }
+        if (fmt.Length == 0) { return DependencyObject.UnboxString(box, ""); }
+        if (fmt == "G" || fmt == "00" || fmt == "F0" || fmt == "F1" || fmt == "F2" ||
+            fmt == "D2" || fmt == "N0" || fmt == "0.0" || fmt == "0.00") {
+            return FormatSpecOnly(box, fmt);
+        }
+        int colIdx = FindSubstr(fmt, "{0:", 0);
+        if (colIdx >= 0) {
+            int endBrace = FindSubstr(fmt, "}", colIdx);
+            if (endBrace > colIdx + 3) {
+                string spec = fmt.Substring(colIdx + 3, endBrace - (colIdx + 3));
+                string formatted = FormatSpecOnly(box, spec);
+                return fmt.Substring(0, colIdx) + formatted + fmt.Substring(endBrace + 1);
+            }
+        }
+        string raw = DependencyObject.UnboxString(box, "");
+        if (fmt.Contains("{0}")) {
+            return fmt.Replace("{0}", raw);
+        }
+        return fmt + raw;
+    }
+
+    private void ApplyTargetBox(DependencyObject valBox) {
+        if (Target != null) {
+            Target.SetPropertyValue(TargetProp, valBox);
+        } else if (TargetInline != null) {
+            TargetInline.SetPropertyValue(TargetProp, valBox);
+        }
     }
 
     public void Evaluate() {
-        if (Target == null) { return; }
+        if (Target == null && TargetInline == null) { return; }
+        UIElement host = Target != null ? Target : (TargetInline != null ? TargetInline.OwnerTextBlock : null);
         if (Mode == 2 && OneTimeDone) { return; }
 
         if (Kind == 0 && LambdaGetter != null) {
@@ -869,42 +1217,121 @@ internal class BindingEntry : DependencyObject {
             if (h != LastHash || !OneTimeDone) {
                 LastHash = h;
                 OneTimeDone = true;
-                Target.SetPropertyValue(TargetProp, val);
+                ApplyTargetBox(val);
             }
             return;
         }
 
         if (Kind == 2) {
-            if (SourceElement == null && ElementName.Length > 0) {
-                SourceElement = Target.RootElement().FindName(ElementName);
+            if (SourceElement == null && ElementName.Length > 0 && host != null) {
+                SourceElement = host.RootElement().FindName(ElementName);
             }
             if (SourceElement != null) {
                 DependencyObject ev = SourceElement.GetPropertyValue(SourcePath);
                 if (ev == null && SourceElement.DataContext != null) {
                     ev = BindingEngine.ReadPathBox(SourceElement.DataContext, SourcePath);
                 }
+                if (ev == null && HasFallback) { ev = FallbackBox; }
                 ApplyConverted(ev);
                 OneTimeDone = true;
+            } else if (HasFallback && host != null) {
+                ApplyRawBox(FallbackBox);
             }
             return;
         }
 
         if (Kind == 3 && SourceElement != null) {
             DependencyObject tv = SourceElement.GetPropertyValue(SourcePath);
-            ApplyConverted(tv);
-            OneTimeDone = true;
+            if (tv == null) {
+                tv = BindingEngine.ReadPathBox(SourceElement, SourcePath);
+            }
+            if (tv == null && HasFallback) { tv = FallbackBox; }
+            string sig = tv != null ? DependencyObject.UnboxString(tv, "") : "<null>";
+            if (sig != LastHash || !OneTimeDone) {
+                LastHash = sig;
+                OneTimeDone = true;
+                ApplyConverted(tv);
+            }
             return;
         }
 
-        DependencyObject srcBox = ResolveSourceBox();
-        object srcObj = DependencyObject.Unbox(srcBox);
-        if (srcObj == null) { return; }
+        if (Kind == 4 && MultiBindings != null) {
+            var vals = new DependencyObject[MultiBindings.Length];
+            string sig = "";
+            for (int i = 0; i < MultiBindings.Length; i += 1) {
+                Binding sub = MultiBindings[i];
+                DependencyObject sv = null;
+                if (sub.ElementName.Length > 0 && host != null) {
+                    UIElement se = host.RootElement().FindName(sub.ElementName);
+                    if (se != null) {
+                        sv = se.GetPropertyValue(sub.Path);
+                        if (sv == null && se.DataContext != null) { sv = BindingEngine.ReadPathBox(se.DataContext, sub.Path); }
+                    }
+                } else if (sub.RelativeSourceMode == "Self" && host != null) {
+                    sv = Target != null ? Target.GetPropertyValue(sub.Path) : TargetInline.GetPropertyValue(sub.Path);
+                    if (sv == null) { sv = BindingEngine.ReadPathBox(Target != null ? (object)Target : (object)TargetInline, sub.Path); }
+                } else if (sub.RelativeSourceMode == "TemplatedParent" && host != null && host.TemplatedParent != null) {
+                    sv = host.TemplatedParent.GetPropertyValue(sub.Path);
+                    if (sv == null) { sv = BindingEngine.ReadPathBox(host.TemplatedParent, sub.Path); }
+                } else {
+                    object dc = sub.Source != null ? sub.Source : DependencyObject.Unbox(ResolveSourceBox());
+                    if (dc != null) { sv = BindingEngine.ReadPathBox(dc, sub.Path); }
+                }
+                if (sv == null && sub.HasFallbackValue) { sv = sub.FallbackBox; }
+                vals[i] = sv;
+                sig = sig + "|" + DependencyObject.UnboxString(sv, "");
+            }
+            if (sig == LastHash && OneTimeDone) { return; }
+            LastHash = sig;
+            OneTimeDone = true;
+            if (MultiConverter != null) {
+                object res = MultiConverter.Convert(vals, TargetProp, DependencyObject.BoxString(ConverterParam), "");
+                ApplyRawBox(DependencyObject.BoxObject(res));
+            } else if (StringFormat.Length > 0) {
+                string txt = StringFormat;
+                if (txt.Length >= 2 && txt.Substring(0, 2) == "{}") { txt = txt.Substring(2); }
+                for (int i = 0; i < vals.Length; i += 1) {
+                    txt = txt.Replace("{" + i + "}", DependencyObject.UnboxString(vals[i], ""));
+                }
+                ApplyTargetBox(DependencyObject.BoxString(txt));
+            }
+            return;
+        }
+
+        if (Kind == 1) {
+            if (host == null && RelativeSourceMode != "Self") { return; }
+            DependencyObject srcBox = ResolveSourceBox();
+            object srcObj = DependencyObject.Unbox(srcBox);
+            if (srcObj == null) {
+                if (HasFallback) { ApplyRawBox(FallbackBox); }
+                return;
+            }
+            int dm = ParseUtil.IsNativeReady() ? Reflect_GetDirtyMask(srcObj) : -1;
+            DependencyObject valBox = BindingEngine.ReadPathBox(srcObj, SourcePath);
+            if (valBox == null && HasFallback) { valBox = FallbackBox; }
+            string sig = DependencyObject.UnboxString(valBox, "");
+            if (dm == LastDirtyMask && dm >= 0 && sig == LastHash && OneTimeDone) { return; }
+            LastDirtyMask = dm;
+            if (sig != LastHash || !OneTimeDone) {
+                LastHash = sig;
+                OneTimeDone = true;
+                ApplyConverted(valBox);
+            }
+            return;
+        }
+
+        DependencyObject mSrcBox = ResolveSourceBox();
+        object mSrcObj = DependencyObject.Unbox(mSrcBox);
+        if (mSrcObj == null) {
+            if (HasFallback) { ApplyRawBox(FallbackBox); }
+            return;
+        }
 
         if (Kind == 4 && MultiPaths != null) {
             var vals = new DependencyObject[MultiPaths.Length];
             string sig = "";
             for (int i = 0; i < MultiPaths.Length; i += 1) {
-                vals[i] = BindingEngine.ReadPathBox(srcObj, MultiPaths[i]);
+                vals[i] = BindingEngine.ReadPathBox(mSrcObj, MultiPaths[i]);
                 sig = sig + "|" + DependencyObject.UnboxString(vals[i], "");
             }
             if (sig == LastHash && OneTimeDone) { return; }
@@ -915,25 +1342,13 @@ internal class BindingEntry : DependencyObject {
                 ApplyRawBox(DependencyObject.BoxObject(res));
             } else if (StringFormat.Length > 0) {
                 string txt = StringFormat;
+                if (txt.Length >= 2 && txt.Substring(0, 2) == "{}") { txt = txt.Substring(2); }
                 for (int i = 0; i < vals.Length; i += 1) {
                     txt = txt.Replace("{" + i + "}", DependencyObject.UnboxString(vals[i], ""));
                 }
-                Target.SetPropertyValue(TargetProp, DependencyObject.BoxString(txt));
+                ApplyTargetBox(DependencyObject.BoxString(txt));
             }
             return;
-        }
-
-        if (Kind == 1) {
-            int dm = ParseUtil.IsNativeReady() ? Reflect_GetDirtyMask(srcObj) : -1;
-            DependencyObject valBox = BindingEngine.ReadPathBox(srcObj, SourcePath);
-            string sig = DependencyObject.UnboxString(valBox, "");
-            if (dm == LastDirtyMask && dm >= 0 && sig == LastHash && OneTimeDone) { return; }
-            LastDirtyMask = dm;
-            if (sig != LastHash || !OneTimeDone) {
-                LastHash = sig;
-                OneTimeDone = true;
-                ApplyConverted(valBox);
-            }
         }
     }
 
@@ -953,10 +1368,14 @@ internal class BindingEntry : DependencyObject {
     }
 
     private void ApplyRawBox(DependencyObject valBox) {
+        if (valBox == null && HasTargetNull) { valBox = TargetNullBox; }
+        else if (HasTargetNull && valBox is BoxedString && (valBox as BoxedString).Value.Length == 0) {
+            valBox = TargetNullBox;
+        }
         if (StringFormat.Length > 0) {
-            Target.SetPropertyValue(TargetProp, DependencyObject.BoxString(FormatValue(valBox)));
+            ApplyTargetBox(DependencyObject.BoxString(FormatValue(valBox)));
         } else {
-            Target.SetPropertyValue(TargetProp, valBox);
+            ApplyTargetBox(valBox);
         }
     }
 
@@ -1102,6 +1521,122 @@ public static class BindingEngine {
         e.MultiConverter = converter;
         e.ConverterParam = converterParam == null ? "" : converterParam;
         e.StringFormat = stringFormat == null ? "" : stringFormat;
+        RegisterEntry(e);
+    }
+
+    public static void BindPathEx(
+        UIElement target, string targetProp, object source, string path,
+        int mode, IValueConverter converter, string converterKey, string converterParam, string stringFormat,
+        bool hasFallback = false, DependencyObject fallbackBox = null,
+        bool hasTargetNull = false, DependencyObject targetNullBox = null,
+        string relativeMode = "", string ancestorType = "") {
+        if (target == null || targetProp == null) { return; }
+        var e = new BindingEntry();
+        e.Target = target;
+        e.TargetProp = targetProp;
+        e.Kind = 1;
+        e.Mode = mode;
+        e.ExplicitSourceBox = source != null ? DependencyObject.BoxObject(source) : null;
+        e.SourcePath = path == null ? "" : path;
+        e.Converter = converter;
+        e.ConverterKey = converterKey == null ? "" : converterKey;
+        e.ConverterParam = converterParam == null ? "" : converterParam;
+        e.StringFormat = stringFormat == null ? "" : stringFormat;
+        e.HasFallback = hasFallback;
+        e.FallbackBox = fallbackBox;
+        e.HasTargetNull = hasTargetNull;
+        e.TargetNullBox = targetNullBox;
+        e.RelativeSourceMode = relativeMode == null ? "" : relativeMode;
+        e.RelativeSourceAncestorType = ancestorType == null ? "" : ancestorType;
+        RegisterEntry(e);
+    }
+
+    public static void BindElementEx(
+        UIElement target, string targetProp, string elementName, string sourceProp,
+        int mode, IValueConverter converter, string converterKey, string converterParam, string stringFormat,
+        bool hasFallback = false, DependencyObject fallbackBox = null,
+        bool hasTargetNull = false, DependencyObject targetNullBox = null) {
+        if (target == null || targetProp == null) { return; }
+        var e = new BindingEntry();
+        e.Target = target;
+        e.TargetProp = targetProp;
+        e.Kind = 2;
+        e.Mode = mode;
+        e.ElementName = elementName == null ? "" : elementName;
+        e.SourcePath = sourceProp == null ? "" : sourceProp;
+        e.Converter = converter;
+        e.ConverterKey = converterKey == null ? "" : converterKey;
+        e.ConverterParam = converterParam == null ? "" : converterParam;
+        e.StringFormat = stringFormat == null ? "" : stringFormat;
+        e.HasFallback = hasFallback;
+        e.FallbackBox = fallbackBox;
+        e.HasTargetNull = hasTargetNull;
+        e.TargetNullBox = targetNullBox;
+        RegisterEntry(e);
+    }
+
+    public static void BindInlineEx(
+        Inline target, string targetProp, string path, string elementName,
+        int mode, IValueConverter converter, string converterKey, string converterParam, string stringFormat,
+        bool hasFallback = false, DependencyObject fallbackBox = null,
+        bool hasTargetNull = false, DependencyObject targetNullBox = null,
+        string relativeMode = "", string ancestorType = "") {
+        if (target == null || targetProp == null) { return; }
+        var e = new BindingEntry();
+        e.TargetInline = target;
+        e.TargetProp = targetProp;
+        e.Kind = (elementName != null && elementName.Length > 0) ? 2 : 1;
+        e.Mode = mode;
+        e.ElementName = elementName == null ? "" : elementName;
+        e.SourcePath = path == null ? "" : path;
+        e.Converter = converter;
+        e.ConverterKey = converterKey == null ? "" : converterKey;
+        e.ConverterParam = converterParam == null ? "" : converterParam;
+        e.StringFormat = stringFormat == null ? "" : stringFormat;
+        e.HasFallback = hasFallback;
+        e.FallbackBox = fallbackBox;
+        e.HasTargetNull = hasTargetNull;
+        e.TargetNullBox = targetNullBox;
+        e.RelativeSourceMode = relativeMode == null ? "" : relativeMode;
+        e.RelativeSourceAncestorType = ancestorType == null ? "" : ancestorType;
+        RegisterEntry(e);
+    }
+
+    public static void BindTemplateParentEx(
+        UIElement target, string targetProp, Control templatedParent, string sourceProp,
+        IValueConverter converter, string converterKey, string converterParam, string stringFormat,
+        bool hasFallback = false, DependencyObject fallbackBox = null,
+        bool hasTargetNull = false, DependencyObject targetNullBox = null) {
+        if (target == null || targetProp == null) { return; }
+        var e = new BindingEntry();
+        e.Target = target;
+        e.TargetProp = targetProp;
+        e.Kind = 3;
+        e.Mode = 0;
+        e.SourceElement = templatedParent;
+        e.SourcePath = sourceProp == null ? "" : sourceProp;
+        e.Converter = converter;
+        e.ConverterKey = converterKey == null ? "" : converterKey;
+        e.ConverterParam = converterParam == null ? "" : converterParam;
+        e.StringFormat = stringFormat == null ? "" : stringFormat;
+        e.HasFallback = hasFallback;
+        e.FallbackBox = fallbackBox;
+        e.HasTargetNull = hasTargetNull;
+        e.TargetNullBox = targetNullBox;
+        RegisterEntry(e);
+    }
+
+    public static void BindMultiBinding(UIElement target, string targetProp, MultiBinding mb) {
+        if (target == null || targetProp == null || mb == null) { return; }
+        var e = new BindingEntry();
+        e.Target = target;
+        e.TargetProp = targetProp;
+        e.Kind = 4;
+        e.Mode = 0;
+        e.MultiBindings = mb.Bindings;
+        e.MultiConverter = mb.Converter;
+        e.ConverterParam = mb.ConverterParameter == null ? "" : mb.ConverterParameter;
+        e.StringFormat = mb.StringFormat == null ? "" : mb.StringFormat;
         RegisterEntry(e);
     }
 

@@ -991,6 +991,26 @@ public class Application : DependencyObject {
         }
     }
 
+    public object FindResource(string key) {
+        if (_resources != null) {
+            object localVal = _resources.Get(key);
+            if (localVal != null) { return localVal; }
+        }
+        return ResourceDictionary.GlobalApplicationResources().Get(key);
+    }
+
+    public object TryFindResource(string key) {
+        return FindResource(key);
+    }
+
+    public DependencyObject FindResourceBox(string key) {
+        if (_resources != null) {
+            DependencyObject localBox = _resources.GetBox(key);
+            if (localBox != null) { return localBox; }
+        }
+        return ResourceDictionary.GlobalApplicationResources().GetBox(key);
+    }
+
     public void Run(Window window = null) {
         Startup(this, new StartupEventArgs(new string[0]));
         if (window != null) { MainWindow = window; }

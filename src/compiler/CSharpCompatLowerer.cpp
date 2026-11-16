@@ -584,10 +584,27 @@ struct CompatToken final {
 [[nodiscard]] bool ShouldImportWpfBridge(std::string_view ns) {
     return ns == "System.Windows" ||
            aero::str::StartsWith(ns, "System.Windows.") ||
+           ns == "System.Collections.ObjectModel" ||
            ns == "Noesis" ||
            aero::str::StartsWith(ns, "Noesis.") ||
            ns == "Aero.UI" ||
            aero::str::StartsWith(ns, "Aero.UI.");
+}
+
+[[nodiscard]] bool IsWpfOrUiCompatSymbol(std::string_view tok) {
+    return tok == "ObservableCollection" ||
+           tok == "ViewModelBase" ||
+           tok == "DelegateCommand" ||
+           tok == "RelayCommand" ||
+           tok == "ICommand" ||
+           tok == "IValueConverter" ||
+           tok == "IMultiValueConverter" ||
+           tok == "Window" ||
+           tok == "Page" ||
+           tok == "UserControl" ||
+           tok == "DependencyObject" ||
+           tok == "UIElement" ||
+           tok == "FrameworkElement";
 }
 
 } // namespace
@@ -869,6 +886,11 @@ std::string LowerCSharpCompatSyntax(
         if (tok == "readonly" && i > 0 && tokens[i - 1].text == "ref") {
             keepToken[i] = false;
             continue;
+        }
+
+        // 12. Auto-import Aero.UI when WPF/MVVM collection or UI base types appear
+        if (IsWpfOrUiCompatSymbol(tok)) {
+            sawWpfUsing = true;
         }
     }
 

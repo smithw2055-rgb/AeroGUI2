@@ -124,6 +124,10 @@ public class Control : FrameworkElement {
     private ControlTemplate _template;
     private UIElement _templateRoot;
     private bool _templateApplied = false;
+    private bool _hasExplicitFontSize = false;
+    private bool _hasExplicitFontFamily = false;
+    private bool _hasExplicitFontWeight = false;
+    private bool _hasExplicitForeground = false;
 
     public Control() : base(VisualKind.Box) {
         ThemeManager.EnsureInitialized();
@@ -134,19 +138,43 @@ public class Control : FrameworkElement {
 
     public Brush Foreground {
         get { return _foreground; }
-        set { _foreground = value; OnTypographyChanged(); }
+        set { _hasExplicitForeground = true; _foreground = value; SetExplicitTextForeground(value); OnTypographyChanged(); }
     }
     public string FontFamily {
         get { return _fontFamily; }
-        set { _fontFamily = value == null ? "Segoe UI" : value; OnTypographyChanged(); }
+        set { _hasExplicitFontFamily = true; _fontFamily = value == null ? "Segoe UI" : value; SetExplicitTextFontFamily(_fontFamily); OnTypographyChanged(); }
     }
     public float FontSize {
         get { return _fontSize; }
-        set { _fontSize = value > 0.0f ? value : 14.0f; OnTypographyChanged(); }
+        set { _hasExplicitFontSize = true; _fontSize = value > 0.0f ? value : 14.0f; SetExplicitTextFontSize(_fontSize); OnTypographyChanged(); }
     }
     public string FontWeight {
         get { return _fontWeight; }
-        set { _fontWeight = value == null ? "Normal" : value; OnTypographyChanged(); }
+        set { _hasExplicitFontWeight = true; _fontWeight = value == null ? "Normal" : value; SetExplicitTextFontWeight(_fontWeight); OnTypographyChanged(); }
+    }
+
+    internal override void OnInheritedTypographyChanged() {
+        bool changed = false;
+        if (!_hasExplicitFontSize) {
+            float fs = EffectiveTextFontSizeOrZero();
+            float nextFs = fs > 0.0f ? fs : 14.0f;
+            if (_fontSize != nextFs) { _fontSize = nextFs; changed = true; }
+        }
+        if (!_hasExplicitFontFamily) {
+            string ff = EffectiveTextFontFamilyOrEmpty();
+            string nextFf = ff.Length > 0 ? ff : "Segoe UI";
+            if (_fontFamily != nextFf) { _fontFamily = nextFf; changed = true; }
+        }
+        if (!_hasExplicitFontWeight) {
+            string fw = EffectiveTextFontWeightOrEmpty();
+            string nextFw = fw.Length > 0 ? fw : "Normal";
+            if (_fontWeight != nextFw) { _fontWeight = nextFw; changed = true; }
+        }
+        if (!_hasExplicitForeground) {
+            Brush fg = EffectiveTextForeground();
+            if (fg != null && _foreground != fg) { _foreground = fg; changed = true; }
+        }
+        if (changed) { OnTypographyChanged(); }
     }
     public string FontStyle {
         get { return _fontStyle; }
@@ -179,6 +207,11 @@ public class Control : FrameworkElement {
     }
     protected virtual void OnContentAlignmentChanged() {
         SyncTemplatePresenters();
+    }
+    protected override void OnVisualStatePropertyChanged() {
+        if (_template != null && _templateApplied) {
+            _template.EvaluateTriggers(this);
+        }
     }
 
     private void SyncTemplatePresenters() {
@@ -389,6 +422,12 @@ public class ContentPresenter : FrameworkElement {
         }
         return base.SetPropertyValue(propName, value);
     }
+}
+
+public class ScrollContentPresenter : ContentPresenter {
+    public bool CanContentScroll { get; set; } = false;
+    public ScrollContentPresenter() : base() {}
+    public override string GetTypeName() { return "ScrollContentPresenter"; }
 }
 
 // ============================================================================

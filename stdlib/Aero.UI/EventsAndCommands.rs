@@ -344,6 +344,10 @@ public class RelayCommand : DependencyObject, ICommand {
     public void SetExecuteWithParam(Action<object> execute) { _exec1 = execute; _exec0 = null; }
     public void SetCanExecute(Func<bool> canExecute) { _can0 = canExecute; _can1 = null; RaiseCanExecuteChanged(); }
     public void SetCanExecuteWithParam(Func<object, bool> canExecute) { _can1 = canExecute; _can0 = null; RaiseCanExecuteChanged(); }
+    public void SetExecuteFunc(Action execute) { SetExecute(execute); }
+    public void SetExecuteFuncWithParam(Action<object> execute) { SetExecuteWithParam(execute); }
+    public void SetCanExecuteFunc(Func<bool> canExecute) { SetCanExecute(canExecute); }
+    public void SetCanExecuteFuncWithParam(Func<object, bool> canExecute) { SetCanExecuteWithParam(canExecute); }
 
     public virtual bool CanExecute(object parameter) {
         if (_can1 != null) { return _can1(parameter); }
@@ -796,38 +800,284 @@ public class AlternationConverter : DependencyObject, IValueConverter {
     }
 }
 
-public class MathConverter : DependencyObject, IValueConverter {
+internal class MathExprParser {
+    private string _s = "";
+    private int _p = 0;
+    private float[] _args;
+
+    public MathExprParser(string expr, float[] args) {
+        _s = expr == null ? "" : expr;
+        _p = 0;
+        _args = args;
+    }
+
+    private static float FloorF(float x) {
+        int k = (int)x;
+        float kf = (float)k;
+        return (x < kf) ? (kf - 1.0f) : kf;
+    }
+
+    private static float CeilF(float x) {
+        int k = (int)x;
+        float kf = (float)k;
+        return (x > kf) ? (kf + 1.0f) : kf;
+    }
+
+    private static float ExpF(float x) {
+        float ln2 = 0.69314718f;
+        int m = (int)FloorF(x / ln2 + 0.5f);
+        float r = x - (float)m * ln2;
+        float r2 = r * r;
+        float r3 = r2 * r;
+        float r4 = r2 * r2;
+        float r5 = r4 * r;
+        float r6 = r3 * r3;
+        float poly = 1.0f + r + r2 * 0.5f + r3 * 0.16666667f + r4 * 0.04166667f + r5 * 0.00833333f + r6 * 0.00138889f;
+        if (m >= 0) {
+            int i = 0;
+            while (i < m && i < 64) { poly = poly * 2.0f; i += 1; }
+        } else {
+            int i = 0;
+            int negM = -m;
+            while (i < negM && i < 64) { poly = poly * 0.5f; i += 1; }
+        }
+        return poly;
+    }
+
+    private static float LnF(float x) {
+        if (x <= 0.0f) { return 0.0f; }
+        float ln2 = 0.69314718f;
+        int k = 0;
+        float v = x;
+        while (v > 1.5f && k < 64) { v = v * 0.5f; k += 1; }
+        while (v < 0.5f && k > -64) { v = v * 2.0f; k -= 1; }
+        float u = (v - 1.0f) / (v + 1.0f);
+        float u2 = u * u;
+        float u3 = u * u2;
+        float u5 = u3 * u2;
+        float u7 = u5 * u2;
+        float u9 = u7 * u2;
+        float s = 2.0f * (u + u3 * 0.33333334f + u5 * 0.2f + u7 * 0.14285715f + u9 * 0.11111111f);
+        return s + (float)k * ln2;
+    }
+
+    private static float PowF(float b, float e) {
+        if (e == 0.0f) { return 1.0f; }
+        if (b == 0.0f) { return e > 0.0f ? 0.0f : 1.0f; }
+        int ei = (int)e;
+        if ((float)ei == e && ei >= -32 && ei <= 32) {
+            float res = 1.0f;
+            int cnt = ei < 0 ? -ei : ei;
+            for (int i = 0; i < cnt; i += 1) { res = res * b; }
+            return ei < 0 ? (1.0f / res) : res;
+        }
+        if (b < 0.0f) { return 0.0f; }
+        return ExpF(e * LnF(b));
+    }
+
+    private void SkipWs() {
+        while (_p < _s.Length) {
+            string ch = _s.Substring(_p, 1);
+            if (ch == " " || ch == "\t" || ch == "\r" || ch == "\n") { _p += 1; }
+            else { break; }
+        }
+    }
+
+    private string Peek() {
+        SkipWs();
+        if (_p >= _s.Length) { return ""; }
+        return _s.Substring(_p, 1);
+    }
+
+    public float ParseExpr() {
+        float lhs = ParseTerm();
+        while (true) {
+            string op = Peek();
+            if (op == "+") { _p += 1; lhs = lhs + ParseTerm(); }
+            else if (op == "-") { _p += 1; lhs = lhs - ParseTerm(); }
+            else { break; }
+        }
+        return lhs;
+    }
+
+    private float ParseTerm() {
+        float lhs = ParsePower();
+        while (true) {
+            string op = Peek();
+            if (op == "*") {
+                _p += 1;
+                lhs = lhs * ParsePower();
+            } else if (op == "/") {
+                _p += 1;
+                float rhs = ParsePower();
+                lhs = (rhs != 0.0f) ? (lhs / rhs) : 0.0f;
+            } else if (op == "%") {
+                _p += 1;
+                float rhs = ParsePower();
+                if (rhs != 0.0f) {
+                    float q = FloorF(lhs / rhs);
+                    lhs = lhs - q * rhs;
+                } else {
+                    lhs = 0.0f;
+                }
+            } else {
+                break;
+            }
+        }
+        return lhs;
+    }
+
+    private float ParsePower() {
+        float lhs = ParseUnary();
+        if (Peek() == "^") {
+            _p += 1;
+            float rhs = ParsePower();
+            return PowF(lhs, rhs);
+        }
+        return lhs;
+    }
+
+    private float ParseUnary() {
+        string op = Peek();
+        if (op == "-") { _p += 1; return -ParseUnary(); }
+        if (op == "+") { _p += 1; return ParseUnary(); }
+        return ParsePrimary();
+    }
+
+    private float ParsePrimary() {
+        string ch = Peek();
+        if (ch == "(") {
+            _p += 1;
+            float val = ParseExpr();
+            if (Peek() == ")") { _p += 1; }
+            return val;
+        }
+        if (ch == "{") {
+            _p += 1;
+            int idx = 0;
+            while (_p < _s.Length) {
+                string dch = _s.Substring(_p, 1);
+                if (dch == "}") { _p += 1; break; }
+                int dv = ParseUtil.DigitValue(dch);
+                if (dv >= 0) { idx = idx * 10 + dv; }
+                _p += 1;
+            }
+            if (_args != null && idx >= 0 && idx < _args.Length) { return _args[idx]; }
+            return 0.0f;
+        }
+        if (ParseUtil.DigitValue(ch) >= 0 || ch == ".") {
+            int start = _p;
+            bool seenDot = false;
+            while (_p < _s.Length) {
+                string nc = _s.Substring(_p, 1);
+                if (ParseUtil.DigitValue(nc) >= 0) { _p += 1; }
+                else if (nc == "." && !seenDot) { seenDot = true; _p += 1; }
+                else { break; }
+            }
+            return ParseUtil.ParseFloat(_s.Substring(start, _p - start), 0.0f);
+        }
+        int idStart = _p;
+        while (_p < _s.Length) {
+            string ic = _s.Substring(_p, 1);
+            if (ic == "(" || ic == ")" || ic == "," || ic == "+" || ic == "-" ||
+                ic == "*" || ic == "/" || ic == "%" || ic == "^" || ic == " ") { break; }
+            _p += 1;
+        }
+        string ident = _s.Substring(idStart, _p - idStart).ToLower();
+        if (ident == "x" || ident == "value") {
+            return (_args != null && _args.Length > 0) ? _args[0] : 0.0f;
+        }
+        if (ident == "pi") { return 3.14159265f; }
+        if (Peek() == "(") {
+            _p += 1;
+            float a = ParseExpr();
+            float b = 0.0f;
+            float c = 0.0f;
+            int argc = 1;
+            if (Peek() == ",") { _p += 1; b = ParseExpr(); argc = 2; }
+            if (Peek() == ",") { _p += 1; c = ParseExpr(); argc = 3; }
+            if (Peek() == ")") { _p += 1; }
+            if (ident == "floor") { return FloorF(a); }
+            if (ident == "ceil") { return CeilF(a); }
+            if (ident == "round") { return a >= 0.0f ? FloorF(a + 0.5f) : -FloorF(-a + 0.5f); }
+            if (ident == "abs") { return Math.Absf(a); }
+            if (ident == "sqrt") { return a >= 0.0f ? Math.Sqrtf(a) : 0.0f; }
+            if (ident == "sin") { return Math.Sinf(a); }
+            if (ident == "cos") { return Math.Cosf(a); }
+            if (ident == "min" && argc >= 2) { return Math.Minf(a, b); }
+            if (ident == "max" && argc >= 2) { return Math.Maxf(a, b); }
+            if (ident == "pow" && argc >= 2) { return PowF(a, b); }
+            if (ident == "clamp" && argc >= 3) { return Math.Clampf(a, b, c); }
+            return a;
+        }
+        return 0.0f;
+    }
+}
+
+public class MathConverter : DependencyObject, IValueConverter, IMultiValueConverter {
+    public string Expression { get; set; } = "";
+
+    public MathConverter() {}
+    public MathConverter(string expression) {
+        Expression = expression == null ? "" : expression;
+    }
+
+    private string ResolveExprString(object parameter) {
+        string expr = Expression != null ? Expression.Trim() : "";
+        if (expr.Length == 0 && parameter is DependencyObject) {
+            expr = DependencyObject.UnboxString(parameter as DependencyObject, "").Trim();
+        }
+        if (expr.Length >= 2 && expr.Substring(0, 2) == "{}") {
+            expr = expr.Substring(2).Trim();
+        }
+        if (expr.Length > 0) {
+            string first = expr.Substring(0, 1);
+            if (first == "+" || first == "*" || first == "/" || first == "%") {
+                expr = "{0}" + expr;
+            } else if (first == "-" && expr.Length > 1 && ParseUtil.DigitValue(expr.Substring(1, 1)) >= 0) {
+                expr = "{0}" + expr;
+            }
+        }
+        return expr;
+    }
+
     public virtual object Convert(object value, string targetType, object parameter, string culture) {
         float x = (value is DependencyObject) ? DependencyObject.UnboxFloat(value as DependencyObject, 0.0f) : 0.0f;
-        string expr = (parameter is DependencyObject) ? DependencyObject.UnboxString(parameter as DependencyObject, "").Trim() : "";
+        string expr = ResolveExprString(parameter);
         if (expr.Length == 0) { return DependencyObject.BoxFloat(x); }
+        var args = new float[1];
+        args[0] = x;
+        var parser = new MathExprParser(expr, args);
+        return DependencyObject.BoxFloat(parser.ParseExpr());
+    }
 
-        string op = expr.Substring(0, 1);
-        float k = ParseUtil.ParseFloat(expr.Substring(1), 0.0f);
-        float res = x;
-        if (op == "+") { res = x + k; }
-        else if (op == "-") { res = x - k; }
-        else if (op == "*") { res = x * k; }
-        else if (op == "/") { res = k != 0.0f ? (x / k) : 0.0f; }
-        else if (op == "%") {
-            int ki = (int)k;
-            res = ki != 0 ? (float)(((int)x) % ki) : 0.0f;
+    public virtual object Convert(DependencyObject[] values, string targetType, object parameter, string culture) {
+        int n = values == null ? 0 : values.Length;
+        var args = new float[n];
+        for (int i = 0; i < n; i += 1) {
+            args[i] = values[i] != null ? DependencyObject.UnboxFloat(values[i], 0.0f) : 0.0f;
         }
-        return DependencyObject.BoxFloat(res);
+        string expr = ResolveExprString(parameter);
+        if (expr.Length == 0) { return DependencyObject.BoxFloat(n > 0 ? args[0] : 0.0f); }
+        var parser = new MathExprParser(expr, args);
+        return DependencyObject.BoxFloat(parser.ParseExpr());
     }
 
     public virtual object ConvertBack(object value, string targetType, object parameter, string culture) {
         float y = (value is DependencyObject) ? DependencyObject.UnboxFloat(value as DependencyObject, 0.0f) : 0.0f;
-        string expr = (parameter is DependencyObject) ? DependencyObject.UnboxString(parameter as DependencyObject, "").Trim() : "";
+        string expr = ResolveExprString(parameter);
         if (expr.Length == 0) { return DependencyObject.BoxFloat(y); }
-
-        string op = expr.Substring(0, 1);
-        float k = ParseUtil.ParseFloat(expr.Substring(1), 0.0f);
-        float res = y;
-        if (op == "+") { res = y - k; }
-        else if (op == "-") { res = y + k; }
-        else if (op == "*") { res = k != 0.0f ? (y / k) : 0.0f; }
-        else if (op == "/") { res = y * k; }
-        return DependencyObject.BoxFloat(res);
+        if (expr.Substring(0, 3) == "{0}") {
+            string tail = expr.Substring(3).Trim();
+            if (tail.Length > 1) {
+                string op = tail.Substring(0, 1);
+                float k = ParseUtil.ParseFloat(tail.Substring(1), 0.0f);
+                if (op == "+") { return DependencyObject.BoxFloat(y - k); }
+                if (op == "-") { return DependencyObject.BoxFloat(y + k); }
+                if (op == "*") { return DependencyObject.BoxFloat(k != 0.0f ? (y / k) : 0.0f); }
+                if (op == "/") { return DependencyObject.BoxFloat(y * k); }
+            }
+        }
+        return DependencyObject.BoxFloat(y);
     }
 }

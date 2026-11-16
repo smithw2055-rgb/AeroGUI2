@@ -588,6 +588,156 @@ public class GridSplitter : Thumb {
     }
 }
 
+public class Track : FrameworkElement {
+    private Orientation _orientation = Orientation.Horizontal;
+    private float _min = 0.0f;
+    private float _max = 100.0f;
+    private float _value = 0.0f;
+    private float _viewportSize = 0.0f;
+    private bool _isDirectionReversed = false;
+    private UIElement _decreaseRepeatButton;
+    private UIElement _increaseRepeatButton;
+    private Thumb _thumb;
+
+    public Track() : base() {}
+    public override string GetTypeName() { return "Track"; }
+
+    public Orientation Orientation {
+        get { return _orientation; }
+        set { _orientation = value; UpdateTrackVisuals(); }
+    }
+    public float Minimum {
+        get { return _min; }
+        set { _min = value; UpdateTrackVisuals(); }
+    }
+    public float Maximum {
+        get { return _max; }
+        set { _max = value; UpdateTrackVisuals(); }
+    }
+    public float Value {
+        get { return _value; }
+        set { _value = value; UpdateTrackVisuals(); }
+    }
+    public float ViewportSize {
+        get { return _viewportSize; }
+        set { _viewportSize = value; UpdateTrackVisuals(); }
+    }
+    public bool IsDirectionReversed {
+        get { return _isDirectionReversed; }
+        set { _isDirectionReversed = value; UpdateTrackVisuals(); }
+    }
+    public UIElement DecreaseRepeatButton {
+        get { return _decreaseRepeatButton; }
+        set {
+            if (_decreaseRepeatButton != null) { RemoveChild(_decreaseRepeatButton); }
+            _decreaseRepeatButton = value;
+            if (value != null) { AddChild(value); }
+            UpdateTrackVisuals();
+        }
+    }
+    public UIElement IncreaseRepeatButton {
+        get { return _increaseRepeatButton; }
+        set {
+            if (_increaseRepeatButton != null) { RemoveChild(_increaseRepeatButton); }
+            _increaseRepeatButton = value;
+            if (value != null) { AddChild(value); }
+            UpdateTrackVisuals();
+        }
+    }
+    public Thumb Thumb {
+        get { return _thumb; }
+        set {
+            if (_thumb != null) { RemoveChild(_thumb); }
+            _thumb = value;
+            if (value != null) { AddChild(value); }
+            UpdateTrackVisuals();
+        }
+    }
+
+    protected override void OnLoaded() {
+        base.OnLoaded();
+        UpdateTrackVisuals();
+    }
+
+    private void UpdateTrackVisuals() {
+        float span = _max - _min;
+        float frac = span > 0.00001f ? Math.Clampf((_value - _min) / span, 0.0f, 1.0f) : 0.0f;
+        if (_isDirectionReversed) { frac = 1.0f - frac; }
+        float w = ActualWidth > 1.0f ? ActualWidth : (ParseUtil.IsFinite(Width) ? Width : 160.0f);
+        float h = ActualHeight > 1.0f ? ActualHeight : (ParseUtil.IsFinite(Height) ? Height : 24.0f);
+        if (_thumb != null) {
+            float tw = ParseUtil.IsFinite(_thumb.Width) ? _thumb.Width : (_orientation == Orientation.Horizontal ? 16.0f : w);
+            float th = ParseUtil.IsFinite(_thumb.Height) ? _thumb.Height : (_orientation == Orientation.Horizontal ? h : 16.0f);
+            _thumb.HorizontalAlignment = HorizontalAlignment.Left;
+            _thumb.VerticalAlignment = VerticalAlignment.Top;
+            if (_orientation == Orientation.Horizontal) {
+                float lx = Math.Maxf(0.0f, w - tw) * frac;
+                _thumb.Margin = new Thickness(lx, Math.Maxf(0.0f, (h - th) * 0.5f), 0.0f, 0.0f);
+            } else {
+                float ty = Math.Maxf(0.0f, h - th) * frac;
+                _thumb.Margin = new Thickness(Math.Maxf(0.0f, (w - tw) * 0.5f), ty, 0.0f, 0.0f);
+            }
+        }
+    }
+
+    public override bool SetPropertyValue(string propName, DependencyObject value) {
+        if (propName == "Minimum") { Minimum = DependencyObject.UnboxFloat(value, 0.0f); return true; }
+        if (propName == "Maximum") { Maximum = DependencyObject.UnboxFloat(value, 100.0f); return true; }
+        if (propName == "Value") { Value = DependencyObject.UnboxFloat(value, 0.0f); return true; }
+        if (propName == "ViewportSize") { ViewportSize = DependencyObject.UnboxFloat(value, 0.0f); return true; }
+        if (propName == "IsDirectionReversed") { IsDirectionReversed = DependencyObject.UnboxBool(value, false); return true; }
+        if (propName == "Orientation") {
+            string ov = DependencyObject.UnboxString(value, "");
+            Orientation = (ov == "Vertical" || ov == "1") ? Orientation.Vertical : Orientation.Horizontal;
+            return true;
+        }
+        return base.SetPropertyValue(propName, value);
+    }
+    public override DependencyObject GetPropertyValue(string propName) {
+        if (propName == "Minimum") { return DependencyObject.BoxFloat(_min); }
+        if (propName == "Maximum") { return DependencyObject.BoxFloat(_max); }
+        if (propName == "Value") { return DependencyObject.BoxFloat(_value); }
+        if (propName == "ViewportSize") { return DependencyObject.BoxFloat(_viewportSize); }
+        if (propName == "IsDirectionReversed") { return DependencyObject.BoxBool(_isDirectionReversed); }
+        if (propName == "Orientation") { return DependencyObject.BoxInt(EnumConvert.ToInt(_orientation)); }
+        return base.GetPropertyValue(propName);
+    }
+}
+
+public class TickBar : FrameworkElement {
+    public Brush Fill { get; set; }
+    public string Placement { get; set; } = "Top";
+    public float Minimum { get; set; } = 0.0f;
+    public float Maximum { get; set; } = 10.0f;
+    public float TickFrequency { get; set; } = 1.0f;
+    public float ReservedSpace { get; set; } = 0.0f;
+    public bool IsDirectionReversed { get; set; } = false;
+
+    public TickBar() : base() {}
+    public override string GetTypeName() { return "TickBar"; }
+
+    public override bool SetPropertyValue(string propName, DependencyObject value) {
+        if (propName == "Fill") { Fill = UIElement.CoerceBrush(value); return true; }
+        if (propName == "Placement") { Placement = DependencyObject.UnboxString(value, "Top"); return true; }
+        if (propName == "Minimum") { Minimum = DependencyObject.UnboxFloat(value, 0.0f); return true; }
+        if (propName == "Maximum") { Maximum = DependencyObject.UnboxFloat(value, 10.0f); return true; }
+        if (propName == "TickFrequency") { TickFrequency = DependencyObject.UnboxFloat(value, 1.0f); return true; }
+        if (propName == "ReservedSpace") { ReservedSpace = DependencyObject.UnboxFloat(value, 0.0f); return true; }
+        if (propName == "IsDirectionReversed") { IsDirectionReversed = DependencyObject.UnboxBool(value, false); return true; }
+        return base.SetPropertyValue(propName, value);
+    }
+    public override DependencyObject GetPropertyValue(string propName) {
+        if (propName == "Fill") { return Fill; }
+        if (propName == "Placement") { return DependencyObject.BoxString(Placement); }
+        if (propName == "Minimum") { return DependencyObject.BoxFloat(Minimum); }
+        if (propName == "Maximum") { return DependencyObject.BoxFloat(Maximum); }
+        if (propName == "TickFrequency") { return DependencyObject.BoxFloat(TickFrequency); }
+        if (propName == "ReservedSpace") { return DependencyObject.BoxFloat(ReservedSpace); }
+        if (propName == "IsDirectionReversed") { return DependencyObject.BoxBool(IsDirectionReversed); }
+        return base.GetPropertyValue(propName);
+    }
+}
+
 public class RangeBase : Control {
     private float _min = 0.0f;
     private float _max = 100.0f;
