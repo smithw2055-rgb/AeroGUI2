@@ -550,8 +550,8 @@ private:
     std::string actionText_{"PRESS SPACE TO START"};
 };
 
-[[nodiscard]] inline std::shared_ptr<UIElement> CreateBreakoutGameControl() {
-    return std::make_shared<BreakoutGameControl>();
+[[nodiscard]] inline IntrusivePtr<UIElement> CreateBreakoutGameControl() {
+    return MakeIntrusive<BreakoutGameControl>();
 }
 
 inline void RegisterCustomRenderSampleTypes() {

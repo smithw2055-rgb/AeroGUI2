@@ -1,41 +1,17 @@
 #include "aero/host/HostDrivers.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <utility>
 
-#include "aero/controls/Controls.hpp"
+#include "aero/asset/AxbFormat.hpp"
+#include "aero/asset/AxbTemplateRegistry.hpp"
 #include "aero/render/FontAtlas.hpp"
 
 namespace aero {
 
 namespace {
-
-constexpr std::size_t kMaxImeCommittedHistoryBytes = 4096u;
-
-void AppendBoundedImeCommittedText(std::string& ioHistory, std::string_view committed) {
-    if (committed.empty()) {
-        return;
-    }
-    if (committed.size() >= kMaxImeCommittedHistoryBytes) {
-        std::size_t start = committed.size() - kMaxImeCommittedHistoryBytes;
-        while (start < committed.size() &&
-               (static_cast<std::uint8_t>(committed[start]) & 0xC0u) == 0x80u) {
-            ++start;
-        }
-        ioHistory.assign(committed.substr(start));
-        return;
-    }
-    if (ioHistory.size() + committed.size() > kMaxImeCommittedHistoryBytes) {
-        std::size_t drop = (ioHistory.size() + committed.size()) - kMaxImeCommittedHistoryBytes;
-        while (drop < ioHistory.size() &&
-               (static_cast<std::uint8_t>(ioHistory[drop]) & 0xC0u) == 0x80u) {
-            ++drop;
-        }
-        ioHistory.erase(0u, drop);
-    }
-    ioHistory.append(committed);
-}
 
 AriaShadowNode BuildAriaNodeRecursive(const UIElement* elem) {
     AriaShadowNode node{};
@@ -45,43 +21,14 @@ AriaShadowNode BuildAriaNodeRecursive(const UIElement* elem) {
     node.bounds = elem->FinalRect();
     node.label = elem->Name();
 
-    if (const auto* rb = elem->DynamicCast<RadioButton>()) {
-        node.role = "radio";
-        node.value = rb->IsChecked() ? "true" : "false";
-        if (node.label.empty()) node.label = rb->GetContentText();
-        node.focusable = rb->CanReceiveFocus();
-    } else if (const auto* cb = elem->DynamicCast<CheckBox>()) {
-        node.role = "checkbox";
-        node.value = cb->IsChecked() ? "true" : "false";
-        if (node.label.empty()) node.label = cb->GetContentText();
-        node.focusable = cb->CanReceiveFocus();
-    } else if (const auto* slider = elem->DynamicCast<Slider>()) {
-        node.role = "slider";
-        node.value = rs_rt::valueToString(MakeFloat(slider->GetSliderValue()));
-        node.focusable = slider->CanReceiveFocus();
-    } else if (const auto* tbox = elem->DynamicCast<TextBox>()) {
-        node.role = "textbox";
-        node.value = tbox->GetDisplayString();
-        node.focusable = tbox->CanReceiveFocus();
-    } else if (const auto* combo = elem->DynamicCast<ComboBox>()) {
-        node.role = "combobox";
-        node.value = combo->GetSelectedItemText();
-        node.focusable = combo->CanReceiveFocus();
-    } else if (const auto* btn = elem->DynamicCast<Button>()) {
-        node.role = "button";
-        node.value = btn->GetContentText();
-        node.focusable = btn->CanReceiveFocus();
-    } else if (const auto* tb = elem->DynamicCast<TextBlock>()) {
-        node.role = "text";
-        node.value = tb->GetText();
-        node.focusable = elem->CanReceiveFocus();
-    } else if (elem->IsA<Window>()) {
-        node.role = "dialog";
-        node.focusable = true;
-    } else {
-        node.role = "group";
-        node.focusable = elem->CanReceiveFocus();
+    AriaElementInfo info{};
+    elem->PopulateAriaInfo(info);
+    node.role = std::move(info.role);
+    node.value = std::move(info.value);
+    if (node.label.empty()) {
+        node.label = std::move(info.label);
     }
+    node.focusable = info.focusable;
 
     for (const UIElement* c = elem->FirstChild(); c != nullptr; c = c->NextSibling()) {
         if (c->GetVisibility() != Visibility::Collapsed) {
@@ -94,6 +41,245 @@ AriaShadowNode BuildAriaNodeRecursive(const UIElement* elem) {
 } // namespace
 
 // ============================================================================
+// 0. HostDriverBase
+// ============================================================================
+
+HostDriverBase::HostDriverBase(
+    UIElement* rootVisual,
+    DualTrackBindingEngine* bindingEngine,
+    DepthBucketLayoutQueue* layoutQueue,
+    PagedRenderTree* renderTree,
+    std::shared_ptr<UIResourceContext> resourceContext,
+    Size initialViewportSize) noexcept
+    : rootVisual_(rootVisual)
+    , resourceContext_(std::move(resourceContext))
+    , viewportSize_(initialViewportSize) {
+    viewContext_.SetBindingEngine(bindingEngine);
+    viewContext_.SetDomains(bindingEngine ? &bindingEngine->Domains() : nullptr);
+    viewContext_.SetLayoutQueue(layoutQueue);
+    viewContext_.SetRenderTree(renderTree);
+    viewContext_.SetResourceContext(resourceContext_.get());
+    if (rootVisual_ && !rootVisual_->ViewContext()) {
+        rootVisual_->SetViewContext(&viewContext_);
+    }
+}
+
+HostDriverBase::~HostDriverBase() {
+    UnregisterWakeRegistryListener();
+}
+
+void HostDriverBase::SetResourceContext(std::shared_ptr<UIResourceContext> context) {
+    if (resourceContext_ == context) {
+        return;
+    }
+    resourceContext_ = std::move(context);
+    viewContext_.SetResourceContext(resourceContext_.get());
+    OnResourceContextChanged();
+}
+
+void HostDriverBase::SetRootVisual(UIElement* root) noexcept {
+    ScopedUIResourceContext scope(resourceContext_);
+    rootVisual_ = root;
+    if (rootVisual_ && !rootVisual_->ViewContext()) {
+        rootVisual_->SetViewContext(&viewContext_);
+    }
+    lastLaidOutViewport_ = {-1.0f, -1.0f};
+    OnRootVisualChanged();
+}
+
+void HostDriverBase::SetViewportSize(Size viewport) noexcept {
+    if (viewportSize_ != viewport) {
+        viewportSize_ = viewport;
+        OnViewportOrDpiChanged();
+    }
+}
+
+void HostDriverBase::SetDpiScale(float scale) noexcept {
+    const float clamped = (std::isfinite(scale) && scale > 0.0f)
+        ? std::clamp(scale, 0.25f, 8.0f)
+        : 1.0f;
+    const bool changed = std::fabs(viewContext_.GetDpiScale() - clamped) > 1e-4f;
+    viewContext_.SetDpiScale(clamped);
+    if (changed) {
+        OnViewportOrDpiChanged();
+    }
+    if (rootVisual_ && rootVisual_->ViewContext() && rootVisual_->ViewContext() != &viewContext_) {
+        rootVisual_->ViewContext()->SetDpiScale(viewContext_.GetDpiScale());
+    }
+    if (auto* rt = GetRenderTree()) {
+        rt->SetRootDpiScale(viewContext_.GetDpiScale());
+    }
+}
+
+void HostDriverBase::RegisterWakeRegistryListener(HostWakeCallback callback, void* userData) {
+    UnregisterWakeRegistryListener();
+    wakeRegisteredRegistry_ = resourceContext_
+        ? &resourceContext_->Templates()
+        : &AxbTemplateRegistry::Instance();
+    wakeRegisteredRegistry_->RegisterHostWakeListener(this, callback, userData);
+}
+
+void HostDriverBase::UnregisterWakeRegistryListener() noexcept {
+    if (wakeRegisteredRegistry_ && AxbTemplateRegistry::IsLiveRegistry(wakeRegisteredRegistry_)) {
+        wakeRegisteredRegistry_->UnregisterHostWakeListener(this);
+    }
+    wakeRegisteredRegistry_ = nullptr;
+}
+
+HostDriverBase::UiPhaseRunResult HostDriverBase::RunUiPhases(
+    float dt,
+    std::uint32_t activePhaseMask,
+    const UiPhaseRunConfig& config) {
+    telemetry_.frameCount += 1u;
+    telemetry_.lastActivePhaseMask = activePhaseMask;
+
+    InputEventRouter* inputRouter = viewContext_.GetInputRouter();
+    DualTrackBindingEngine* bindingEngine = viewContext_.GetBindingEngine();
+    AnimationEngine* animationEngine = viewContext_.GetAnimationEngine();
+    StyleTriggerEngine* styleEngine = viewContext_.GetStyleEngine();
+    DepthBucketLayoutQueue* layoutQueue = viewContext_.GetLayoutQueue();
+    PagedRenderTree* renderTree = viewContext_.GetRenderTree();
+    const float dpiScale = viewContext_.GetDpiScale();
+
+    if (inputRouter && animationEngine && !inputRouter->GetAnimationEngine()) {
+        inputRouter->SetAnimationEngine(animationEngine);
+    }
+    if (bindingEngine && animationEngine && !bindingEngine->GetAnimationEngine()) {
+        bindingEngine->SetAnimationEngine(animationEngine);
+    }
+
+    auto markDirtyObjects = [&]() noexcept {
+        if (config.ioHasDirtyObjects) {
+            *config.ioHasDirtyObjects = true;
+        }
+    };
+    auto markDirtyLayout = [&]() noexcept {
+        if (config.ioHasDirtyLayout) {
+            *config.ioHasDirtyLayout = true;
+        }
+    };
+    const auto isDirtyObjects = [&]() noexcept -> bool {
+        return config.ioHasDirtyObjects && *config.ioHasDirtyObjects;
+    };
+    const auto isDirtyLayout = [&]() noexcept -> bool {
+        return config.ioHasDirtyLayout && *config.ioHasDirtyLayout;
+    };
+
+    UiPhaseRunResult result{};
+
+    if ((activePhaseMask & UiPhase_Input) != 0u && inputRouter && inputRouter->HasPendingEvents()) {
+        result.inputDispatched = inputRouter->FlushQueuedEvents();
+        telemetry_.inputEventsDispatched += result.inputDispatched;
+        if (result.inputDispatched > 0u) {
+            markDirtyObjects();
+            markDirtyLayout();
+        }
+    }
+
+    if (rootVisual_ && dt > 0.0f) {
+        result.liveTickUpdated = TickLiveControlsInSubtree(rootVisual_, dt);
+        if (result.liveTickUpdated > 0u) {
+            markDirtyObjects();
+            markDirtyLayout();
+        }
+    }
+
+    const bool canRunTrackA = !config.gatePhasesByDirtyFlags ||
+        isDirtyObjects() || (bindingEngine && bindingEngine->HasPendingDirtyObjects());
+    if (canRunTrackA && bindingEngine && (activePhaseMask & UiPhase_TrackABinding) != 0u) {
+        result.trackAUpdates = bindingEngine->FlushTrackA();
+        telemetry_.trackAUpdates += result.trackAUpdates;
+        if (result.trackAUpdates > 0u) {
+            markDirtyLayout();
+        }
+    }
+
+    if (config.runTrackB && bindingEngine && (activePhaseMask & UiPhase_TrackBBinding) != 0u) {
+        if (config.allowTrackBEcsFastPath && renderTree && (activePhaseMask & UiPhase_Layout) == 0u) {
+            result.trackBUpdates = renderTree->BatchUpdateFromEcsTrackB(*bindingEngine);
+        } else {
+            result.trackBUpdates = bindingEngine->FlushTrackB();
+        }
+        telemetry_.trackBUpdates += result.trackBUpdates;
+    }
+
+    if ((activePhaseMask & UiPhase_MotionStateMachine) != 0u && animationEngine) {
+        result.stateMachineTransitions = animationEngine->EvaluateStateMachines(dt);
+        telemetry_.stateMachineTransitions += result.stateMachineTransitions;
+        if (result.stateMachineTransitions > 0u) {
+            markDirtyLayout();
+        }
+    }
+
+    const bool canRunStyle = !config.gatePhasesByDirtyFlags ||
+        styleEngine != nullptr || isDirtyObjects() || isDirtyLayout();
+    if ((activePhaseMask & UiPhase_Style) != 0u && canRunStyle) {
+        telemetry_.stylePassesRun += 1u;
+        if (styleEngine) {
+            if (bindingEngine && !styleEngine->GetBindingEngine()) {
+                styleEngine->SetBindingEngine(bindingEngine);
+            }
+            result.styleChanges = styleEngine->EvaluateAndApply();
+            telemetry_.styleTriggerChanges += result.styleChanges;
+            if (result.styleChanges > 0u) {
+                markDirtyLayout();
+            }
+        }
+    }
+
+    if ((activePhaseMask & UiPhase_Animation) != 0u && animationEngine &&
+        (!config.requireActiveAnimationsForTick || animationEngine->HasActiveAnimations())) {
+        result.animationUpdates = animationEngine->Tick(dt);
+        telemetry_.animationTrackUpdates += result.animationUpdates;
+    }
+
+    const Size logicalViewport = LogicalViewportSize();
+    const bool viewportOrDpiChanged =
+        (rootVisual_ && logicalViewport != lastLaidOutViewport_);
+    const bool rootNeedsLayout = rootVisual_ &&
+        (rootVisual_->GetLayoutDirtyFlags() &
+         (MeasureDirty | ArrangeDirty | SubtreeLayoutDirty)) != 0u;
+    const bool canRunLayout = !config.gatePhasesByDirtyFlags ||
+        isDirtyLayout() || rootNeedsLayout || viewportOrDpiChanged;
+    if ((activePhaseMask & UiPhase_Layout) != 0u && canRunLayout) {
+        telemetry_.layoutPassesRun += 1u;
+        if (rootVisual_ && rootVisual_->ViewContext()) {
+            rootVisual_->ViewContext()->SetDpiScale(dpiScale);
+        }
+        if (rootVisual_ && logicalViewport != lastLaidOutViewport_) {
+            rootVisual_->InvalidateLayout();
+            lastLaidOutViewport_ = logicalViewport;
+        }
+        if (layoutQueue) {
+            if (rootVisual_) {
+                layoutQueue->EnqueueDirtySubtree(rootVisual_);
+            }
+            result.layoutUpdates = layoutQueue->FlushLayout(logicalViewport);
+        } else if (rootVisual_) {
+            rootVisual_->Measure(logicalViewport);
+            rootVisual_->Arrange(Rect{0.0f, 0.0f, logicalViewport.width, logicalViewport.height});
+        }
+    }
+
+    if (renderTree && rootVisual_ && (activePhaseMask & UiPhase_RenderRecord) != 0u &&
+        (!config.requireLayoutPhaseForRenderSync || (activePhaseMask & UiPhase_Layout) != 0u)) {
+        renderTree->SetRootDpiScale(dpiScale);
+        result.renderNodesSynced = renderTree->SyncVisualTree(rootVisual_);
+        telemetry_.renderNodesSynced += result.renderNodesSynced;
+    }
+
+    return result;
+}
+
+ZeroCopySubmissionStats HostDriverBase::RecordGpuCommands(
+    PagedRenderTree& renderTree,
+    ZeroCopyGpuStream& gpuStream) {
+    ScopedUIResourceContext resourceScope(resourceContext_);
+    telemetry_.gpuStats = gpuStream.SubmitDirtyPages(renderTree);
+    return telemetry_.gpuStats;
+}
+
+// ============================================================================
 // 1. EmbeddedGameHost
 // ============================================================================
 
@@ -102,94 +288,25 @@ EmbeddedGameHost::EmbeddedGameHost(
     DualTrackBindingEngine* bindingEngine,
     DepthBucketLayoutQueue* layoutQueue,
     PagedRenderTree* renderTree,
-    std::shared_ptr<UiResourceContext> resourceContext) noexcept
-    : rootVisual_(rootVisual)
-    , bindingEngine_(bindingEngine)
-    , layoutQueue_(layoutQueue)
-    , renderTree_(renderTree)
-    , resourceContext_(std::move(resourceContext)) {}
+    std::shared_ptr<UIResourceContext> resourceContext) noexcept
+    : HostDriverBase(
+        rootVisual,
+        bindingEngine,
+        layoutQueue,
+        renderTree,
+        std::move(resourceContext),
+        Size{1920.0f, 1080.0f}) {}
 
 void EmbeddedGameHost::TickUi(float dt, std::uint32_t activePhaseMask) {
-    ScopedUiResourceContext resourceScope(resourceContext_);
+    ScopedUIResourceContext resourceScope(resourceContext_);
 
-    telemetry_.frameCount += 1u;
-    telemetry_.lastActivePhaseMask = activePhaseMask;
-
-    if (inputRouter_ && animationEngine_ && !inputRouter_->GetAnimationEngine()) {
-        inputRouter_->SetAnimationEngine(animationEngine_);
-    }
-    if (bindingEngine_ && animationEngine_ && !bindingEngine_->GetAnimationEngine()) {
-        bindingEngine_->SetAnimationEngine(animationEngine_);
-    }
-
-    if ((activePhaseMask & UiPhase_Input) != 0u && inputRouter_) {
-        telemetry_.inputEventsDispatched += inputRouter_->FlushQueuedEvents();
-    }
-
-    if (rootVisual_ && dt > 0.0f) {
-        (void)TickLiveControlsInSubtree(rootVisual_, dt);
-    }
-
-    if ((activePhaseMask & UiPhase_TrackABinding) != 0u && bindingEngine_) {
-        telemetry_.trackAUpdates += bindingEngine_->FlushTrackA();
-    }
-
-    if ((activePhaseMask & UiPhase_TrackBBinding) != 0u && bindingEngine_) {
-        if (renderTree_ && (activePhaseMask & UiPhase_Layout) == 0u) {
-            telemetry_.trackBUpdates += renderTree_->BatchUpdateFromEcsTrackB(*bindingEngine_);
-        } else {
-            telemetry_.trackBUpdates += bindingEngine_->FlushTrackB();
-        }
-    }
-
-    if ((activePhaseMask & UiPhase_MotionStateMachine) != 0u && animationEngine_) {
-        telemetry_.stateMachineTransitions += animationEngine_->EvaluateStateMachines(dt);
-    }
-
-    if ((activePhaseMask & UiPhase_Style) != 0u) {
-        telemetry_.stylePassesRun += 1u;
-        if (styleEngine_) {
-            if (bindingEngine_ && !styleEngine_->GetBindingEngine()) {
-                styleEngine_->SetBindingEngine(bindingEngine_);
-            }
-            telemetry_.styleTriggerChanges += styleEngine_->EvaluateAndApply();
-        }
-    }
-
-    if ((activePhaseMask & UiPhase_Animation) != 0u && animationEngine_) {
-        telemetry_.animationTrackUpdates += animationEngine_->Tick(dt);
-    }
-
-    if ((activePhaseMask & UiPhase_Layout) != 0u) {
-        telemetry_.layoutPassesRun += 1u;
-        if (rootVisual_ && viewportSize_ != lastLaidOutViewport_) {
-            rootVisual_->InvalidateLayout();
-            lastLaidOutViewport_ = viewportSize_;
-        }
-        if (layoutQueue_) {
-            if (rootVisual_) {
-                layoutQueue_->EnqueueDirtySubtree(rootVisual_);
-            }
-            (void)layoutQueue_->FlushLayout(viewportSize_);
-        } else if (rootVisual_) {
-            rootVisual_->Measure(viewportSize_);
-            rootVisual_->Arrange(Rect{0.0f, 0.0f, viewportSize_.width, viewportSize_.height});
-        }
-    }
-
-    if (renderTree_ && rootVisual_ &&
-        (activePhaseMask & UiPhase_RenderRecord) != 0u &&
-        (activePhaseMask & UiPhase_Layout) != 0u) {
-        telemetry_.renderNodesSynced += renderTree_->SyncVisualTree(rootVisual_);
-    }
-}
-
-ZeroCopySubmissionStats EmbeddedGameHost::RecordGpuCommands(
-    PagedRenderTree& renderTree,
-    ZeroCopyGpuStream& gpuStream) {
-    ScopedUiResourceContext resourceScope(resourceContext_);
-    telemetry_.gpuStats = gpuStream.SubmitDirtyPages(renderTree);
-    return telemetry_.gpuStats;
+    UiPhaseRunConfig cfg{};
+    cfg.runTrackB = true;
+    cfg.allowTrackBEcsFastPath = true;
+    cfg.requireActiveAnimationsForTick = false;
+    cfg.requireLayoutPhaseForRenderSync = true;
+    cfg.gatePhasesByDirtyFlags = false;
+    (void)RunUiPhases(dt, activePhaseMask, cfg);
 }
 
 // ============================================================================
@@ -201,17 +318,15 @@ DesktopEventHost::DesktopEventHost(
     DualTrackBindingEngine* bindingEngine,
     DepthBucketLayoutQueue* layoutQueue,
     PagedRenderTree* renderTree,
-    std::shared_ptr<UiResourceContext> resourceContext) noexcept
-    : rootVisual_(rootVisual)
-    , bindingEngine_(bindingEngine)
-    , layoutQueue_(layoutQueue)
-    , renderTree_(renderTree)
-    , resourceContext_(std::move(resourceContext)) {
-    wakeRegisteredRegistry_ = resourceContext_
-        ? &resourceContext_->Templates()
-        : &AxbTemplateRegistry::Instance();
-    wakeRegisteredRegistry_->RegisterHostWakeListener(
-        this,
+    std::shared_ptr<UIResourceContext> resourceContext) noexcept
+    : HostDriverBase(
+        rootVisual,
+        bindingEngine,
+        layoutQueue,
+        renderTree,
+        std::move(resourceContext),
+        Size{1920.0f, 1080.0f}) {
+    RegisterWakeRegistryListener(
         [](void* ud) noexcept {
             static_cast<DesktopEventHost*>(ud)->NotifyDirtyLayout();
         },
@@ -219,25 +334,11 @@ DesktopEventHost::DesktopEventHost(
 }
 
 DesktopEventHost::~DesktopEventHost() {
-    if (wakeRegisteredRegistry_ && AxbTemplateRegistry::IsLiveRegistry(wakeRegisteredRegistry_)) {
-        wakeRegisteredRegistry_->UnregisterHostWakeListener(this);
-    }
-    wakeRegisteredRegistry_ = nullptr;
+    UnregisterWakeRegistryListener();
 }
 
-void DesktopEventHost::SetResourceContext(std::shared_ptr<UiResourceContext> context) {
-    if (resourceContext_ == context) {
-        return;
-    }
-    if (wakeRegisteredRegistry_ && AxbTemplateRegistry::IsLiveRegistry(wakeRegisteredRegistry_)) {
-        wakeRegisteredRegistry_->UnregisterHostWakeListener(this);
-    }
-    resourceContext_ = std::move(context);
-    wakeRegisteredRegistry_ = resourceContext_
-        ? &resourceContext_->Templates()
-        : &AxbTemplateRegistry::Instance();
-    wakeRegisteredRegistry_->RegisterHostWakeListener(
-        this,
+void DesktopEventHost::OnResourceContextChanged() {
+    RegisterWakeRegistryListener(
         [](void* ud) noexcept {
             static_cast<DesktopEventHost*>(ud)->NotifyDirtyLayout();
         },
@@ -259,16 +360,21 @@ void DesktopEventHost::SetStateFlags(
 }
 
 bool DesktopEventHost::CanSleepIdle() const noexcept {
+    auto* renderTree = GetRenderTree();
+    auto* inputRouter = InputRouter();
+    auto* bindingEngine = GetBindingEngine();
+    auto* animationEngine = GetAnimationEngine();
+
     const bool rootLayoutDirty = rootVisual_ &&
         (rootVisual_->GetLayoutDirtyFlags() &
          (MeasureDirty | ArrangeDirty | SubtreeLayoutDirty)) != 0u;
-    const bool rootRenderDirty = renderTree_ && rootVisual_ &&
+    const bool rootRenderDirty = renderTree && rootVisual_ &&
         (rootVisual_->GetLayoutDirtyFlags() &
          (RenderDirty | SubtreeRenderDirty)) != 0u;
     const bool rootVisualDirty = rootLayoutDirty || rootRenderDirty;
-    const bool routerPending = inputRouter_ && inputRouter_->HasPendingEvents();
-    const bool bindingDirty = bindingEngine_ && bindingEngine_->HasPendingDirtyObjects();
-    const bool animEngineActive = animationEngine_ && animationEngine_->HasActiveAnimations();
+    const bool routerPending = inputRouter && inputRouter->HasPendingEvents();
+    const bool bindingDirty = bindingEngine && bindingEngine->HasPendingDirtyObjects();
+    const bool animEngineActive = animationEngine && animationEngine->HasActiveAnimations();
     const bool liveControlsTick = SubtreeNeedsContinuousTick(rootVisual_);
     return !hasActiveAnimations_ &&
            !animEngineActive &&
@@ -282,116 +388,39 @@ bool DesktopEventHost::CanSleepIdle() const noexcept {
 }
 
 void DesktopEventHost::TickUi(float dt, std::uint32_t activePhaseMask) {
-    ScopedUiResourceContext resourceScope(resourceContext_);
+    ScopedUIResourceContext resourceScope(resourceContext_);
 
     if (CanSleepIdle()) {
         // 0.0% CPU / 0.0% GPU polling when idle
         return;
     }
 
-    telemetry_.frameCount += 1u;
-    telemetry_.lastActivePhaseMask = activePhaseMask;
-
-    if (inputRouter_ && animationEngine_ && !inputRouter_->GetAnimationEngine()) {
-        inputRouter_->SetAnimationEngine(animationEngine_);
-    }
-    if (bindingEngine_ && animationEngine_ && !bindingEngine_->GetAnimationEngine()) {
-        bindingEngine_->SetAnimationEngine(animationEngine_);
-    }
-
-    if ((activePhaseMask & UiPhase_Input) != 0u && inputRouter_ && inputRouter_->HasPendingEvents()) {
-        const std::size_t dispatched = inputRouter_->FlushQueuedEvents();
-        telemetry_.inputEventsDispatched += dispatched;
-        if (dispatched > 0u) {
-            hasDirtyObjects_ = true;
-            hasDirtyLayout_ = true;
-        }
-    }
-
-    if (rootVisual_ && dt > 0.0f && SubtreeNeedsContinuousTick(rootVisual_)) {
-        if (TickLiveControlsInSubtree(rootVisual_, dt) > 0u) {
-            hasDirtyObjects_ = true;
-            hasDirtyLayout_ = true;
-        }
-    }
-
-    if ((hasDirtyObjects_ || (bindingEngine_ && bindingEngine_->HasPendingDirtyObjects())) &&
-        bindingEngine_ && (activePhaseMask & UiPhase_TrackABinding) != 0u) {
-        const std::size_t updated = bindingEngine_->FlushTrackA();
-        telemetry_.trackAUpdates += updated;
-        if (updated > 0) {
-            hasDirtyLayout_ = true;
-        }
-    }
-
-    if ((activePhaseMask & UiPhase_MotionStateMachine) != 0u && animationEngine_) {
-        const std::size_t smChanged = animationEngine_->EvaluateStateMachines(dt);
-        telemetry_.stateMachineTransitions += smChanged;
-        if (smChanged > 0u) {
-            hasDirtyLayout_ = true;
-        }
-    }
-
-    if ((activePhaseMask & UiPhase_Style) != 0u && (styleEngine_ || hasDirtyObjects_ || hasDirtyLayout_)) {
-        telemetry_.stylePassesRun += 1u;
-        if (styleEngine_) {
-            if (bindingEngine_ && !styleEngine_->GetBindingEngine()) {
-                styleEngine_->SetBindingEngine(bindingEngine_);
-            }
-            const std::size_t stChanged = styleEngine_->EvaluateAndApply();
-            telemetry_.styleTriggerChanges += stChanged;
-            if (stChanged > 0u) {
-                hasDirtyLayout_ = true;
-            }
-        }
-    }
-
-    if ((activePhaseMask & UiPhase_Animation) != 0u && animationEngine_ && animationEngine_->HasActiveAnimations()) {
-        telemetry_.animationTrackUpdates += animationEngine_->Tick(dt);
-    }
-
-    const bool rootNeedsLayout = rootVisual_ &&
-        (rootVisual_->GetLayoutDirtyFlags() &
-         (MeasureDirty | ArrangeDirty | SubtreeLayoutDirty)) != 0u;
-    if ((activePhaseMask & UiPhase_Layout) != 0u && (hasDirtyLayout_ || rootNeedsLayout)) {
-        telemetry_.layoutPassesRun += 1u;
-        if (rootVisual_ && viewportSize_ != lastLaidOutViewport_) {
-            rootVisual_->InvalidateLayout();
-            lastLaidOutViewport_ = viewportSize_;
-        }
-        if (layoutQueue_) {
-            if (rootVisual_) {
-                layoutQueue_->EnqueueDirtySubtree(rootVisual_);
-            }
-            (void)layoutQueue_->FlushLayout(viewportSize_);
-        } else if (rootVisual_) {
-            rootVisual_->Measure(viewportSize_);
-            rootVisual_->Arrange(Rect{0.0f, 0.0f, viewportSize_.width, viewportSize_.height});
-        }
-    }
-
-    if (renderTree_ && rootVisual_ && (activePhaseMask & UiPhase_RenderRecord) != 0u) {
-        telemetry_.renderNodesSynced += renderTree_->SyncVisualTree(rootVisual_);
-    }
+    UiPhaseRunConfig cfg{};
+    cfg.runTrackB = false;
+    cfg.allowTrackBEcsFastPath = false;
+    cfg.requireActiveAnimationsForTick = true;
+    cfg.requireLayoutPhaseForRenderSync = false;
+    cfg.gatePhasesByDirtyFlags = true;
+    cfg.ioHasDirtyObjects = &hasDirtyObjects_;
+    cfg.ioHasDirtyLayout = &hasDirtyLayout_;
+    (void)RunUiPhases(dt, activePhaseMask, cfg);
 
     // Clear transient dirty flags after processing; if animations are off, next check can sleep idle
     hasDirtyObjects_ = false;
     hasDirtyLayout_ = false;
     hasPendingInputEvents_ = false;
-    if (animationEngine_) {
-        hasActiveAnimations_ = animationEngine_->HasActiveAnimations();
+    if (auto* animationEngine = GetAnimationEngine()) {
+        hasActiveAnimations_ = animationEngine->HasActiveAnimations();
     }
 }
 
 ZeroCopySubmissionStats DesktopEventHost::RecordGpuCommands(
     PagedRenderTree& renderTree,
     ZeroCopyGpuStream& gpuStream) {
-    ScopedUiResourceContext resourceScope(resourceContext_);
     if (renderTree.DirtyPageCount() == 0 && CanSleepIdle()) {
         return ZeroCopySubmissionStats{};
     }
-    telemetry_.gpuStats = gpuStream.SubmitDirtyPages(renderTree);
-    return telemetry_.gpuStats;
+    return HostDriverBase::RecordGpuCommands(renderTree, gpuStream);
 }
 
 // ============================================================================
@@ -399,61 +428,23 @@ ZeroCopySubmissionStats DesktopEventHost::RecordGpuCommands(
 // ============================================================================
 
 void DesktopImeAdapter::FocusTextInput(UIElement* focusedElement, Rect caretScreenRect) {
-    if (focusedElement_ != focusedElement) {
-        if (isComposing_) {
-            if (auto* prevBox = focusedElement_ ? focusedElement_->DynamicCast<TextBox>() : nullptr) {
-                prevBox->SetText(compositionBaseText_);
-                prevBox->SetCaretIndex(compositionBaseCaret_);
-            }
-        }
-        isComposing_ = false;
-        preeditText_.clear();
-        committedText_.clear();
-        caretOffset_ = 0u;
-        if (const auto* tbox = focusedElement ? focusedElement->DynamicCast<TextBox>() : nullptr) {
-            compositionBaseText_ = tbox->GetText();
-            compositionBaseCaret_ = tbox->GetCaretIndex();
-        } else {
-            compositionBaseText_.clear();
-            compositionBaseCaret_ = 0u;
-        }
-    }
-    focusedElement_ = focusedElement;
+    ime_.BeginFocus(focusedElement);
     caretScreenRect_ = caretScreenRect;
-    imeFocused_ = (focusedElement != nullptr);
     focusSyncCount_ += 1u;
     if (spotSyncCallback_) {
-        spotSyncCallback_(caretScreenRect_, imeFocused_, spotSyncUserData_);
+        spotSyncCallback_(caretScreenRect_, ime_.IsImeActive(), spotSyncUserData_);
     }
 }
 
 void DesktopImeAdapter::BlurTextInput() {
-    if (isComposing_) {
-        if (auto* tbox = focusedElement_ ? focusedElement_->DynamicCast<TextBox>() : nullptr) {
-            tbox->SetText(compositionBaseText_);
-            tbox->SetCaretIndex(compositionBaseCaret_);
-        }
-    }
-    focusedElement_ = nullptr;
-    imeFocused_ = false;
-    isComposing_ = false;
-    preeditText_.clear();
-    committedText_.clear();
-    compositionBaseText_.clear();
-    compositionBaseCaret_ = 0u;
+    ime_.EndBlur();
     if (spotSyncCallback_) {
         spotSyncCallback_(caretScreenRect_, false, spotSyncUserData_);
     }
 }
 
 void DesktopImeAdapter::OnCompositionStart() {
-    isComposing_ = true;
-    preeditText_.clear();
-    caretOffset_ = 0u;
-    if (auto* tbox = focusedElement_ ? focusedElement_->DynamicCast<TextBox>() : nullptr) {
-        compositionBaseText_ = tbox->GetText();
-        compositionBaseCaret_ = tbox->GetCaretIndex();
-        caretScreenRect_ = tbox->CaretScreenRect();
+    if (ime_.StartComposition(&caretScreenRect_)) {
         if (spotSyncCallback_) {
             spotSyncCallback_(caretScreenRect_, true, spotSyncUserData_);
         }
@@ -461,53 +452,15 @@ void DesktopImeAdapter::OnCompositionStart() {
 }
 
 void DesktopImeAdapter::OnCompositionUpdate(std::string_view preeditText, std::uint32_t caretOffset) {
-    if (auto* tbox = focusedElement_ ? focusedElement_->DynamicCast<TextBox>() : nullptr) {
-        if (!isComposing_) {
-            compositionBaseText_ = tbox->GetText();
-            compositionBaseCaret_ = tbox->GetCaretIndex();
-            caretScreenRect_ = tbox->CaretScreenRect();
-        }
-        isComposing_ = true;
-        preeditText_.assign(preeditText);
-        caretOffset_ = caretOffset;
-
-        std::size_t bytePos = 0u;
-        std::size_t cpCount = 0u;
-        std::uint32_t cp = 0u;
-        while (cpCount < compositionBaseCaret_ && DecodeNextUtf8CodePoint(compositionBaseText_, bytePos, cp)) {
-            ++cpCount;
-        }
-        const std::string preview =
-            compositionBaseText_.substr(0, bytePos) + preeditText_ + compositionBaseText_.substr(bytePos);
-        tbox->SetText(preview);
-        caretScreenRect_ = tbox->CaretScreenRect();
+    if (ime_.BuildPreviewAndApply(preeditText, caretOffset, nullptr, &caretScreenRect_)) {
         if (spotSyncCallback_) {
             spotSyncCallback_(caretScreenRect_, true, spotSyncUserData_);
         }
-        return;
     }
-
-    isComposing_ = true;
-    preeditText_.assign(preeditText);
-    caretOffset_ = caretOffset;
 }
 
 void DesktopImeAdapter::OnCompositionEnd(std::string_view committedText) {
-    const bool wasComposing = isComposing_;
-    isComposing_ = false;
-    preeditText_.clear();
-    AppendBoundedImeCommittedText(committedText_, committedText);
-    caretOffset_ = 0u;
-
-    if (auto* tbox = focusedElement_ ? focusedElement_->DynamicCast<TextBox>() : nullptr) {
-        if (wasComposing) {
-            tbox->SetText(compositionBaseText_);
-            tbox->SetCaretIndex(compositionBaseCaret_);
-        }
-        (void)tbox->InsertText(committedText);
-        compositionBaseText_ = tbox->GetText();
-        compositionBaseCaret_ = tbox->GetCaretIndex();
-        caretScreenRect_ = tbox->CaretScreenRect();
+    if (ime_.CommitComposition(committedText, &caretScreenRect_)) {
         focusSyncCount_ += 1u;
         if (spotSyncCallback_) {
             spotSyncCallback_(caretScreenRect_, true, spotSyncUserData_);
@@ -516,125 +469,54 @@ void DesktopImeAdapter::OnCompositionEnd(std::string_view committedText) {
 }
 
 void WebImeAdapter::FocusTextInput(UIElement* focusedElement, Rect caretScreenRect) {
-    if (focusedElement_ != focusedElement) {
-        if (isComposing_) {
-            if (auto* prevBox = focusedElement_ ? focusedElement_->DynamicCast<TextBox>() : nullptr) {
-                prevBox->SetText(compositionBaseText_);
-                prevBox->SetCaretIndex(compositionBaseCaret_);
-            }
-        }
-        isComposing_ = false;
-        preeditText_.clear();
-        committedText_.clear();
-        caretOffset_ = 0;
-        if (const auto* tbox = focusedElement ? focusedElement->DynamicCast<TextBox>() : nullptr) {
-            compositionBaseText_ = tbox->GetText();
-            compositionBaseCaret_ = tbox->GetCaretIndex();
-        } else {
-            compositionBaseText_.clear();
-            compositionBaseCaret_ = 0u;
-        }
-    }
-    focusedElement_ = focusedElement;
+    ime_.BeginFocus(focusedElement);
     baseCaretRect_ = caretScreenRect;
     overlayDomRect_ = caretScreenRect;
-    imeFocused_ = (focusedElement != nullptr);
 }
 
 void WebImeAdapter::BlurTextInput() {
-    if (isComposing_) {
-        if (auto* tbox = focusedElement_ ? focusedElement_->DynamicCast<TextBox>() : nullptr) {
-            tbox->SetText(compositionBaseText_);
-            tbox->SetCaretIndex(compositionBaseCaret_);
-        }
-    }
-    focusedElement_ = nullptr;
-    imeFocused_ = false;
-    isComposing_ = false;
-    preeditText_.clear();
-    committedText_.clear();
-    compositionBaseText_.clear();
-    compositionBaseCaret_ = 0u;
+    ime_.EndBlur();
 }
 
 void WebImeAdapter::OnCompositionStart() {
-    isComposing_ = true;
-    preeditText_.clear();
-    caretOffset_ = 0;
-    if (auto* tbox = focusedElement_ ? focusedElement_->DynamicCast<TextBox>() : nullptr) {
-        compositionBaseText_ = tbox->GetText();
-        compositionBaseCaret_ = tbox->GetCaretIndex();
-        baseCaretRect_ = tbox->CaretScreenRect();
+    if (ime_.StartComposition(&baseCaretRect_)) {
         overlayDomRect_ = baseCaretRect_;
     } else {
-        overlayDomRect_.x = baseCaretRect_.x + static_cast<float>(committedText_.size()) * 2.0f;
+        overlayDomRect_.x = baseCaretRect_.x +
+            static_cast<float>(ime_.CommittedString().size()) * 2.0f;
     }
 }
 
 void WebImeAdapter::OnCompositionUpdate(std::string_view preeditText, std::uint32_t caretOffset) {
-    if (auto* tbox = focusedElement_ ? focusedElement_->DynamicCast<TextBox>() : nullptr) {
-        if (!isComposing_) {
-            compositionBaseText_ = tbox->GetText();
-            compositionBaseCaret_ = tbox->GetCaretIndex();
-            baseCaretRect_ = tbox->CaretScreenRect();
-        }
-        isComposing_ = true;
-        preeditText_.assign(preeditText);
-        caretOffset_ = caretOffset;
+    if (ime_.BuildPreviewAndApply(preeditText, caretOffset, &baseCaretRect_, nullptr)) {
         overlayDomRect_.x = baseCaretRect_.x + static_cast<float>(caretOffset) * 2.0f;
-
-        std::size_t bytePos = 0u;
-        std::size_t cpCount = 0u;
-        std::uint32_t cp = 0u;
-        while (cpCount < compositionBaseCaret_ && DecodeNextUtf8CodePoint(compositionBaseText_, bytePos, cp)) {
-            ++cpCount;
-        }
-        const std::string preview =
-            compositionBaseText_.substr(0, bytePos) + preeditText_ + compositionBaseText_.substr(bytePos);
-        tbox->SetText(preview);
         return;
     }
 
-    isComposing_ = true;
-    preeditText_.assign(preeditText);
-    caretOffset_ = caretOffset;
     overlayDomRect_.x = baseCaretRect_.x +
-        static_cast<float>(committedText_.size() + caretOffset) * 2.0f;
-    if (focusedElement_) {
-        focusedElement_->SetValue(
+        static_cast<float>(ime_.CommittedString().size() + caretOffset) * 2.0f;
+    if (UIElement* focused = ime_.FocusedElement()) {
+        focused->SetValue(
             PropId_Text,
-            value::FromString(committedText_ + preeditText_),
+            value::FromString(ime_.CommittedString() + ime_.PreeditString()),
             ValueSourceRank::Local);
     }
 }
 
 void WebImeAdapter::OnCompositionEnd(std::string_view committedText) {
-    const bool wasComposing = isComposing_;
-    isComposing_ = false;
-    preeditText_.clear();
-    AppendBoundedImeCommittedText(committedText_, committedText);
-    caretOffset_ = 0;
-    if (focusedElement_) {
-        if (auto* tbox = focusedElement_->DynamicCast<TextBox>()) {
-            if (wasComposing) {
-                tbox->SetText(compositionBaseText_);
-                tbox->SetCaretIndex(compositionBaseCaret_);
-            }
-            (void)tbox->InsertText(committedText);
-            compositionBaseText_ = tbox->GetText();
-            compositionBaseCaret_ = tbox->GetCaretIndex();
-            baseCaretRect_ = tbox->CaretScreenRect();
-            overlayDomRect_ = baseCaretRect_;
-            return;
-        }
-        overlayDomRect_.x = baseCaretRect_.x + static_cast<float>(committedText_.size()) * 2.0f;
-        focusedElement_->SetValue(
+    if (ime_.CommitComposition(committedText, &baseCaretRect_)) {
+        overlayDomRect_ = baseCaretRect_;
+        return;
+    }
+
+    overlayDomRect_.x = baseCaretRect_.x +
+        static_cast<float>(ime_.CommittedString().size()) * 2.0f;
+    if (UIElement* focused = ime_.FocusedElement()) {
+        focused->SetValue(
             PropId_Text,
-            value::FromString(committedText_),
+            value::FromString(ime_.CommittedString()),
             ValueSourceRank::Local);
-        (void)focusedElement_->NotifyTwoWayPropertyMutated(PropId_Text);
-    } else {
-        overlayDomRect_.x = baseCaretRect_.x + static_cast<float>(committedText_.size()) * 2.0f;
+        (void)focused->NotifyTwoWayPropertyMutated(PropId_Text);
     }
 }
 
@@ -733,9 +615,9 @@ bool WebFontStreamProvider::ExportShardPayloadForId(
     std::uint32_t shardId,
     std::string_view fontFamily,
     std::vector<std::uint8_t>& outShardPayload) const {
-    const std::shared_ptr<UiResourceContext> boundCtx =
-        (UiResourceContext::ActiveOverride() == nullptr) ? resourceContext_.lock() : nullptr;
-    ScopedUiResourceContext resourceScope(boundCtx);
+    const std::shared_ptr<UIResourceContext> boundCtx =
+        (UIResourceContext::ActiveOverride() == nullptr) ? resourceContext_.lock() : nullptr;
+    ScopedUIResourceContext resourceScope(boundCtx);
     const std::uint32_t rangeStart = shardId << 8u;
     const std::uint32_t rangeEnd = rangeStart + 0xFFu;
     return FontAtlas::Instance().ExportGlyphShard(fontFamily, rangeStart, rangeEnd, outShardPayload);
@@ -753,9 +635,9 @@ bool WebFontStreamProvider::OnShardDataArrived(
     std::uint32_t shardId,
     const std::vector<std::uint8_t>& shardPayload,
     PagedRenderTree* renderTreeToInvalidate) {
-    const std::shared_ptr<UiResourceContext> boundCtx =
-        (UiResourceContext::ActiveOverride() == nullptr) ? resourceContext_.lock() : nullptr;
-    ScopedUiResourceContext resourceScope(boundCtx);
+    const std::shared_ptr<UIResourceContext> boundCtx =
+        (UIResourceContext::ActiveOverride() == nullptr) ? resourceContext_.lock() : nullptr;
+    ScopedUIResourceContext resourceScope(boundCtx);
 
     if (shardPayload.empty()) {
         return false;
@@ -843,12 +725,14 @@ WebCanvasHost::WebCanvasHost(
     DepthBucketLayoutQueue* layoutQueue,
     ShaderBackend webBackend,
     PagedRenderTree* renderTree,
-    std::shared_ptr<UiResourceContext> resourceContext)
-    : rootVisual_(rootVisual)
-    , bindingEngine_(bindingEngine)
-    , layoutQueue_(layoutQueue)
-    , renderTree_(renderTree)
-    , resourceContext_(std::move(resourceContext))
+    std::shared_ptr<UIResourceContext> resourceContext)
+    : HostDriverBase(
+        rootVisual,
+        bindingEngine,
+        layoutQueue,
+        renderTree,
+        std::move(resourceContext),
+        Size{1280.0f, 720.0f})
     , webBackend_(webBackend) {
     fontStream_.SetResourceContext(resourceContext_);
     fontStream_.SetWakeCallback(
@@ -856,11 +740,7 @@ WebCanvasHost::WebCanvasHost(
             static_cast<WebCanvasHost*>(ud)->RequestWakeFrame();
         },
         this);
-    wakeRegisteredRegistry_ = resourceContext_
-        ? &resourceContext_->Templates()
-        : &AxbTemplateRegistry::Instance();
-    wakeRegisteredRegistry_->RegisterHostWakeListener(
-        this,
+    RegisterWakeRegistryListener(
         [](void* ud) noexcept {
             static_cast<WebCanvasHost*>(ud)->RequestWakeFrame();
         },
@@ -869,48 +749,51 @@ WebCanvasHost::WebCanvasHost(
 
 WebCanvasHost::~WebCanvasHost() {
     fontStream_.SetWakeCallback(nullptr, nullptr);
-    if (wakeRegisteredRegistry_ && AxbTemplateRegistry::IsLiveRegistry(wakeRegisteredRegistry_)) {
-        wakeRegisteredRegistry_->UnregisterHostWakeListener(this);
-    }
-    wakeRegisteredRegistry_ = nullptr;
+    UnregisterWakeRegistryListener();
 }
 
 bool WebCanvasHost::OnFontShardLoaded(
     std::uint32_t shardId,
     const std::vector<std::uint8_t>& shardPayload) {
-    const bool loaded = fontStream_.OnShardDataArrived(shardId, shardPayload, renderTree_);
+    const bool loaded = fontStream_.OnShardDataArrived(shardId, shardPayload, GetRenderTree());
     if (loaded) {
         RequestWakeFrame();
     }
     return loaded;
 }
 
-void WebCanvasHost::SetResourceContext(std::shared_ptr<UiResourceContext> context) {
-    if (resourceContext_ == context) {
-        return;
-    }
-    if (wakeRegisteredRegistry_ && AxbTemplateRegistry::IsLiveRegistry(wakeRegisteredRegistry_)) {
-        wakeRegisteredRegistry_->UnregisterHostWakeListener(this);
-    }
-    resourceContext_ = std::move(context);
+void WebCanvasHost::OnResourceContextChanged() {
     fontStream_.SetResourceContext(resourceContext_);
-    wakeRegisteredRegistry_ = resourceContext_
-        ? &resourceContext_->Templates()
-        : &AxbTemplateRegistry::Instance();
-    wakeRegisteredRegistry_->RegisterHostWakeListener(
-        this,
+    RegisterWakeRegistryListener(
         [](void* ud) noexcept {
             static_cast<WebCanvasHost*>(ud)->RequestWakeFrame();
         },
         this);
 }
 
-void WebCanvasHost::TickUi(float dt, std::uint32_t activePhaseMask) {
-    ScopedUiResourceContext resourceScope(resourceContext_);
+bool WebCanvasHost::CanSleepIdle() const noexcept {
+    if (auto* inputRouter = InputRouter(); inputRouter && inputRouter->HasPendingEvents()) {
+        return false;
+    }
+    if (auto* bindingEngine = GetBindingEngine(); bindingEngine && bindingEngine->HasPendingDirtyObjects()) {
+        return false;
+    }
+    if (auto* animationEngine = GetAnimationEngine(); animationEngine && animationEngine->HasActiveAnimations()) {
+        return false;
+    }
+    return rafState_ == WebRafState::SuspendedIdle;
+}
 
-    if ((inputRouter_ && inputRouter_->HasPendingEvents()) ||
-        (bindingEngine_ && bindingEngine_->HasPendingDirtyObjects()) ||
-        (animationEngine_ && animationEngine_->HasActiveAnimations()) ||
+void WebCanvasHost::TickUi(float dt, std::uint32_t activePhaseMask) {
+    ScopedUIResourceContext resourceScope(resourceContext_);
+
+    auto* inputRouter = InputRouter();
+    auto* bindingEngine = GetBindingEngine();
+    auto* animationEngine = GetAnimationEngine();
+
+    if ((inputRouter && inputRouter->HasPendingEvents()) ||
+        (bindingEngine && bindingEngine->HasPendingDirtyObjects()) ||
+        (animationEngine && animationEngine->HasActiveAnimations()) ||
         SubtreeNeedsContinuousTick(rootVisual_)) {
         rafState_ = WebRafState::ActiveTicking;
     }
@@ -918,80 +801,16 @@ void WebCanvasHost::TickUi(float dt, std::uint32_t activePhaseMask) {
         return;
     }
 
-    if (inputRouter_ && animationEngine_ && !inputRouter_->GetAnimationEngine()) {
-        inputRouter_->SetAnimationEngine(animationEngine_);
-    }
-    if (bindingEngine_ && animationEngine_ && !bindingEngine_->GetAnimationEngine()) {
-        bindingEngine_->SetAnimationEngine(animationEngine_);
-    }
+    UiPhaseRunConfig cfg{};
+    cfg.runTrackB = true;
+    cfg.allowTrackBEcsFastPath = false;
+    cfg.requireActiveAnimationsForTick = true;
+    cfg.requireLayoutPhaseForRenderSync = false;
+    cfg.gatePhasesByDirtyFlags = false;
+    const UiPhaseRunResult res = RunUiPhases(dt, activePhaseMask, cfg);
 
-    telemetry_.frameCount += 1u;
-    telemetry_.lastActivePhaseMask = activePhaseMask;
-
-    std::size_t changes = 0;
-    if ((activePhaseMask & UiPhase_Input) != 0u && inputRouter_ && inputRouter_->HasPendingEvents()) {
-        const std::size_t dispatched = inputRouter_->FlushQueuedEvents();
-        telemetry_.inputEventsDispatched += dispatched;
-        changes += dispatched;
-    }
-    if (rootVisual_ && dt > 0.0f) {
-        changes += TickLiveControlsInSubtree(rootVisual_, dt);
-    }
-    if ((activePhaseMask & UiPhase_TrackABinding) != 0u && bindingEngine_) {
-        const std::size_t a = bindingEngine_->FlushTrackA();
-        telemetry_.trackAUpdates += a;
-        changes += a;
-    }
-    if ((activePhaseMask & UiPhase_TrackBBinding) != 0u && bindingEngine_) {
-        const std::size_t b = bindingEngine_->FlushTrackB();
-        telemetry_.trackBUpdates += b;
-        changes += b;
-    }
-    if ((activePhaseMask & UiPhase_MotionStateMachine) != 0u && animationEngine_) {
-        const std::size_t smChanged = animationEngine_->EvaluateStateMachines(dt);
-        telemetry_.stateMachineTransitions += smChanged;
-        changes += smChanged;
-    }
-    if ((activePhaseMask & UiPhase_Style) != 0u) {
-        telemetry_.stylePassesRun += 1u;
-        if (styleEngine_) {
-            if (bindingEngine_ && !styleEngine_->GetBindingEngine()) {
-                styleEngine_->SetBindingEngine(bindingEngine_);
-            }
-            const std::size_t stChanged = styleEngine_->EvaluateAndApply();
-            telemetry_.styleTriggerChanges += stChanged;
-            changes += stChanged;
-        }
-    }
-    if ((activePhaseMask & UiPhase_Animation) != 0u && animationEngine_ && animationEngine_->HasActiveAnimations()) {
-        const std::size_t animUpdated = animationEngine_->Tick(dt);
-        telemetry_.animationTrackUpdates += animUpdated;
-        changes += animUpdated;
-    }
-    if ((activePhaseMask & UiPhase_Layout) != 0u) {
-        telemetry_.layoutPassesRun += 1u;
-        if (rootVisual_ && viewportSize_ != lastLaidOutViewport_) {
-            rootVisual_->InvalidateLayout();
-            lastLaidOutViewport_ = viewportSize_;
-        }
-        if (layoutQueue_) {
-            if (rootVisual_) {
-                layoutQueue_->EnqueueDirtySubtree(rootVisual_);
-            }
-            changes += layoutQueue_->FlushLayout(viewportSize_);
-        } else if (rootVisual_) {
-            rootVisual_->Measure(viewportSize_);
-            rootVisual_->Arrange(Rect{0.0f, 0.0f, viewportSize_.width, viewportSize_.height});
-        }
-    }
-
-    if (renderTree_ && rootVisual_ && (activePhaseMask & UiPhase_RenderRecord) != 0u) {
-        const std::size_t synced = renderTree_->SyncVisualTree(rootVisual_);
-        telemetry_.renderNodesSynced += synced;
-        changes += synced;
-    }
-
-    const bool animStillRunning = animationEngine_ && animationEngine_->HasActiveAnimations();
+    const std::size_t changes = res.TotalChanges();
+    const bool animStillRunning = animationEngine && animationEngine->HasActiveAnimations();
     const bool liveStillRunning = SubtreeNeedsContinuousTick(rootVisual_);
     if (changes == 0 && !animStillRunning && !liveStillRunning && !imeAdapter_.IsComposing()) {
         rafState_ = WebRafState::SuspendedIdle;
@@ -1001,10 +820,8 @@ void WebCanvasHost::TickUi(float dt, std::uint32_t activePhaseMask) {
 ZeroCopySubmissionStats WebCanvasHost::RecordGpuCommands(
     PagedRenderTree& renderTree,
     ZeroCopyGpuStream& gpuStream) {
-    ScopedUiResourceContext resourceScope(resourceContext_);
     gpuStream.SetBackend(webBackend_);
-    telemetry_.gpuStats = gpuStream.SubmitDirtyPages(renderTree);
-    return telemetry_.gpuStats;
+    return HostDriverBase::RecordGpuCommands(renderTree, gpuStream);
 }
 
 } // namespace aero

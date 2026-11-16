@@ -1,13 +1,19 @@
 #include "aero/input/InputEventRouter.hpp"
-#include "aero/animation/AnimationEngine.hpp"
-#include "aero/style/StyleTriggerEngine.hpp"
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <string>
+#include <variant>
 
-#include "aero/host/HostDrivers.hpp"
+#include "aero/animation/AnimationEngine.hpp"
+#include "aero/asset/AxbFormat.hpp"
+#include "aero/asset/AxbTemplateRegistry.hpp"
+#include "aero/binding/DualTrackBindingEngine.hpp"
+#include "aero/input/TextInputMethod.hpp"
+#include "aero/style/StyleTriggerEngine.hpp"
 
 namespace aero {
 
@@ -342,12 +348,12 @@ void InputEventRouter::PruneDisconnectedTargets() noexcept {
         }
     }
     if (openComboBox_ && (!IsEffectivelyVisibleInTree(openComboBox_.Get(), rootVisual_) ||
-                          !openComboBox_->IsDropDownOpen() ||
+                          !openComboBox_->IsDropdownOverlayOpen() ||
                           !openComboBox_->IsEffectivelyEnabled())) {
-        if (openComboBox_->IsDropDownOpen()) {
-            openComboBox_->SetIsDropDownOpen(false);
+        if (openComboBox_->IsDropdownOverlayOpen()) {
+            openComboBox_->SetDropdownOverlayOpen(false);
         }
-        openComboBox_->SetHighlightedPopupIndex(-1);
+        openComboBox_->SetHighlightedDropdownOverlayItem(-1);
         openComboBox_.Reset();
     }
     if (activeToolTip_ &&
@@ -418,7 +424,7 @@ void InputEventRouter::UpdateHoveredTarget(UIElement* newHovered) noexcept {
     repeatNextFireMs_ = 0.0f;
 
     UIElement* newOwner = nullptr;
-    ToolTip* explicitTt = nullptr;
+    UIElement* explicitTt = nullptr;
     std::string autoTipText;
     for (std::size_t oi = 0u; oi < oldLen; ++oi) {
         UIElement* oc = oldChain[oi];
@@ -441,9 +447,9 @@ void InputEventRouter::UpdateHoveredTarget(UIElement* newHovered) noexcept {
         }
         for (UIElement* anc = hoveredElement_.Get(); anc != nullptr; anc = anc->Parent()) {
             for (UIElement* c = anc->FirstChild(); c != nullptr; c = c->NextSibling()) {
-                if (auto* tt = c->DynamicCast<ToolTip>()) {
+                if (c->IsToolTipOverlayElement()) {
                     newOwner = anc;
-                    explicitTt = tt;
+                    explicitTt = c;
                     break;
                 }
             }
@@ -473,36 +479,38 @@ void InputEventRouter::UpdateHoveredTarget(UIElement* newHovered) noexcept {
         activeToolTip_.Reset(explicitTt, true);
         activeToolTipOwner_.Reset(newOwner, true);
     } else if (!autoTipText.empty() && rootVisual_) {
-        auto autoTt = MakeIntrusive<ToolTip>();
-        autoTt->SetDeclaredTypeName("__AutoToolTip");
-        autoTt->SetIsHitTestVisible(false);
-        auto tb = MakeIntrusive<TextBlock>();
-        tb->SetIsHitTestVisible(false);
-        tb->SetText(autoTipText);
-        tb->SetFontSize(12.5f);
-        autoTt->SetPadding(Thickness{8.0f, 4.0f, 8.0f, 4.0f});
-        autoTt->SetValue(PropId_Background, value::FromColor(Color{0.12f, 0.14f, 0.18f, 0.96f}), ValueSourceRank::Local);
-        autoTt->SetValue(PropId_BorderBrush, value::FromColor(Color{0.35f, 0.42f, 0.55f, 1.0f}), ValueSourceRank::Local);
-        autoTt->SetValue(PropId_BorderThickness, value::FromThickness(Thickness{1.0f}), ValueSourceRank::Local);
-        autoTt->SetValue(PropId_CornerRadius, value::FromCornerRadius(CornerRadius{4.0f}), ValueSourceRank::Local);
-        autoTt->AddChild(tb.Get());
-        autoTt->SetValue(PropId_IsOpen, UnifiedValue{true}, ValueSourceRank::Local);
-        autoTt->SetHorizontalAlignment(HorizontalAlignment::Left);
-        autoTt->SetVerticalAlignment(VerticalAlignment::Top);
-        const Rect rootRect = rootVisual_->FinalRect();
-        float marginX = lastPointerPos_.x + 8.0f;
-        float marginY = lastPointerPos_.y + 16.0f;
-        if (rootRect.width > 0.0f && rootRect.height > 0.0f) {
-            const float localX = marginX - rootRect.x;
-            const float localY = marginY - rootRect.y;
-            marginX = std::clamp(localX, 0.0f, std::max(0.0f, rootRect.width - 120.0f));
-            marginY = std::clamp(localY, 0.0f, std::max(0.0f, rootRect.height - 28.0f));
+        auto autoTt = UIElement::CreateRegisteredElement("ToolTip");
+        auto tb = UIElement::CreateRegisteredElement("TextBlock");
+        if (autoTt && tb) {
+            autoTt->SetDeclaredTypeName("__AutoToolTip");
+            autoTt->SetIsHitTestVisible(false);
+            tb->SetIsHitTestVisible(false);
+            tb->SetValue(PropId_Text, value::FromString(autoTipText), ValueSourceRank::Local);
+            tb->SetValue(PropId_FontSize, value::FromFloat(12.5f), ValueSourceRank::Local);
+            autoTt->SetValue(PropId_Padding, value::FromThickness(Thickness{8.0f, 4.0f, 8.0f, 4.0f}), ValueSourceRank::Local);
+            autoTt->SetValue(PropId_Background, value::FromColor(Color{0.12f, 0.14f, 0.18f, 0.96f}), ValueSourceRank::Local);
+            autoTt->SetValue(PropId_BorderBrush, value::FromColor(Color{0.35f, 0.42f, 0.55f, 1.0f}), ValueSourceRank::Local);
+            autoTt->SetValue(PropId_BorderThickness, value::FromThickness(Thickness{1.0f}), ValueSourceRank::Local);
+            autoTt->SetValue(PropId_CornerRadius, value::FromCornerRadius(CornerRadius{4.0f}), ValueSourceRank::Local);
+            autoTt->AddChild(tb.Get());
+            autoTt->SetValue(PropId_IsOpen, UnifiedValue{true}, ValueSourceRank::Local);
+            autoTt->SetHorizontalAlignment(HorizontalAlignment::Left);
+            autoTt->SetVerticalAlignment(VerticalAlignment::Top);
+            const Rect rootRect = rootVisual_->FinalRect();
+            float marginX = lastPointerPos_.x + 8.0f;
+            float marginY = lastPointerPos_.y + 16.0f;
+            if (rootRect.width > 0.0f && rootRect.height > 0.0f) {
+                const float localX = marginX - rootRect.x;
+                const float localY = marginY - rootRect.y;
+                marginX = std::clamp(localX, 0.0f, std::max(0.0f, rootRect.width - 120.0f));
+                marginY = std::clamp(localY, 0.0f, std::max(0.0f, rootRect.height - 28.0f));
+            }
+            autoTt->SetMargin(Thickness{marginX, marginY, 0.0f, 0.0f});
+            autoTt->SetValue(PropId_ZIndex, value::FromInt(10001), ValueSourceRank::Local);
+            rootVisual_->AddChild(autoTt.Get());
+            activeToolTip_ = autoTt;
+            activeToolTipOwner_.Reset(newOwner, true);
         }
-        autoTt->SetMargin(Thickness{marginX, marginY, 0.0f, 0.0f});
-        autoTt->SetValue(PropId_ZIndex, value::FromInt(10001), ValueSourceRank::Local);
-        rootVisual_->AddChild(autoTt.Get());
-        activeToolTip_ = autoTt;
-        activeToolTipOwner_.Reset(newOwner, true);
     }
 }
 
@@ -533,10 +541,10 @@ void InputEventRouter::CancelPointerInteraction() noexcept {
 
 void InputEventRouter::CloseActiveComboBoxIfOpen() {
     if (openComboBox_) {
-        if (openComboBox_->IsDropDownOpen()) {
-            openComboBox_->SetIsDropDownOpen(false);
+        if (openComboBox_->IsDropdownOverlayOpen()) {
+            openComboBox_->SetDropdownOverlayOpen(false);
         }
-        openComboBox_->SetHighlightedPopupIndex(-1);
+        openComboBox_->SetHighlightedDropdownOverlayItem(-1);
         openComboBox_.Reset();
     }
 }
@@ -554,12 +562,9 @@ void InputEventRouter::SyncImeFocusState() {
     if (!imeHost_) {
         return;
     }
-    if (focusedElement_) {
-        if (auto* tb = focusedElement_->DynamicCast<TextBox>();
-            tb && !tb->IsReadOnly() && !tb->IsPassword()) {
-            imeHost_->FocusTextInput(tb, tb->CaretScreenRect());
-            return;
-        }
+    if (focusedElement_ && focusedElement_->AcceptsActiveImeInput()) {
+        imeHost_->FocusTextInput(focusedElement_.Get(), focusedElement_->GetEditableCaretScreenRect());
+        return;
     }
     imeHost_->BlurTextInput();
 }
@@ -661,16 +666,16 @@ bool InputEventRouter::DispatchPointerMove(Point position, std::uint8_t modifier
         const bool inside = PointInsideElementLocalBounds(capturedElement_.Get(), localPt);
         UpdateHoveredTarget(inside ? capturedElement_.Get() : nullptr);
         // Standard Button press-hold behavior: visual Pressed follows inside-bounds while Slider stays active
-        if (capturedElement_->IsA<Button>()) {
+        if (capturedElement_->TracksPressedWithinBoundsDuringCapture()) {
             capturedElement_->SetPressed(inside);
         }
         return capturedElement_->OnPointerMove(localPt, modifiers);
     }
 
     // 2. Open ComboBox popup hover tracking takes top overlay priority
-    if (openComboBox_ && openComboBox_->IsDropDownOpen()) {
-        const std::int32_t popupIdx = openComboBox_->HitTestPopupItemIndex(position);
-        openComboBox_->SetHighlightedPopupIndex(popupIdx);
+    if (openComboBox_ && openComboBox_->IsDropdownOverlayOpen()) {
+        const std::int32_t popupIdx = openComboBox_->HitTestDropdownOverlayItem(position);
+        openComboBox_->SetHighlightedDropdownOverlayItem(popupIdx);
         if (popupIdx >= 0) {
             UpdateHoveredTarget(openComboBox_.Get());
             return true;
@@ -711,12 +716,12 @@ bool InputEventRouter::DispatchPointerDown(
     }
 
     // 1. Check active open ComboBox overlay popup first (Z-topmost over sibling controls)
-    if (openComboBox_ && openComboBox_->IsDropDownOpen()) {
-        const std::int32_t hitItemIdx = openComboBox_->HitTestPopupItemIndex(position);
+    if (openComboBox_ && openComboBox_->IsDropdownOverlayOpen()) {
+        const std::int32_t hitItemIdx = openComboBox_->HitTestDropdownOverlayItem(position);
         if (hitItemIdx >= 0) {
             if (button == PointerButton::Left) {
-                (void)openComboBox_->SelectIndexInteractive(hitItemIdx);
-                openComboBox_->SetHighlightedPopupIndex(-1);
+                (void)openComboBox_->SelectDropdownOverlayItemInteractive(hitItemIdx);
+                openComboBox_->SetHighlightedDropdownOverlayItem(-1);
                 openComboBox_.Reset();
             }
             return true;
@@ -729,10 +734,10 @@ bool InputEventRouter::DispatchPointerDown(
 
     UIElement* rawHit = rootVisual_->HitTest(position);
     UIElement* target = ResolveInteractiveTarget(rawHit);
-    if (MenuItem::HasAnyOpenSubmenu()) {
+    if (UIElement::HasAnyOpenMenuSubmenu()) {
         auto closeOpenMenusOutsideHit = [&](auto& self, UIElement* node) -> void {
             if (!node) return;
-            if (node->IsA<Menu>()) {
+            if (node->IsMenuRootContainer()) {
                 bool hitInsideMenu = false;
                 for (const UIElement* w = rawHit; w != nullptr; w = w->Parent()) {
                     if (w == node) {
@@ -743,7 +748,7 @@ bool InputEventRouter::DispatchPointerDown(
                 if (!hitInsideMenu) {
                     auto closeSubRec = [](auto& closeSelf, UIElement* mi) -> void {
                         for (UIElement* ch = mi->FirstChild(); ch != nullptr; ch = ch->NextSibling()) {
-                            if (ch->IsA<MenuItem>()) {
+                            if (ch->IsMenuSubmenuItem()) {
                                 ch->SetValue(PropId_IsSubmenuOpen, UnifiedValue{false}, ValueSourceRank::Local);
                                 closeSelf(closeSelf, ch);
                             }
@@ -768,7 +773,7 @@ bool InputEventRouter::DispatchPointerDown(
                 if (const AxbControlTemplate* cmTpl = AxbTemplateRegistry::Instance().FindControlTemplate(sv->view());
                     cmTpl && cmTpl->templatePackage) {
                     CloseActiveContextMenuIfOpen();
-                    auto cmElem = MakeIntrusive<ContextMenu>();
+                    auto cmElem = UIElement::CreateRegisteredElement("ContextMenu");
                     DualTrackBindingEngine* be = walk->BoundTwoWayEngine();
                     StyleTriggerEngine* se = walk->BoundStyleEngine();
                     for (UIElement* anc = walk->Parent(); anc != nullptr && (!be || !se); anc = anc->Parent()) {
@@ -781,8 +786,10 @@ bool InputEventRouter::DispatchPointerDown(
                         const UnifiedValue dcVal = anc->GetValue(PropId_DataContext);
                         if (const auto* o = std::get_if<ObjectRef>(&dcVal); o && o->valid()) dcObj = *o;
                     }
-                    if (MountAxbTemplate(cmElem.Get(), *cmTpl->templatePackage, dom, be, dcObj,
-                                         be ? be->UiInterpreter() : nullptr, nullptr, animationEngine_)) {
+                    if (cmElem &&
+                        UIElement::MountRegisteredPackage(
+                            cmElem.Get(), *cmTpl->templatePackage, dom, be, dcObj,
+                            be ? be->UiInterpreter() : nullptr, nullptr, animationEngine_)) {
                         if (dom) {
                             cmElem->SetValue(
                                 PropId_PlacementTarget,
@@ -877,22 +884,22 @@ bool InputEventRouter::DispatchPointerDown(
     }
     const bool handled = targetHandled || bubbledDownHandled || dragStarted;
 
-    if (auto* combo = target->DynamicCast<ComboBox>()) {
-        if (combo->IsDropDownOpen()) {
-            if (openComboBox_.Get() != combo) {
+    if (target->HasDropdownOverlayBehavior()) {
+        if (target->IsDropdownOverlayOpen()) {
+            if (openComboBox_.Get() != target) {
                 CloseActiveComboBoxIfOpen();
-                openComboBox_.Reset(combo, true);
+                openComboBox_.Reset(target, true);
             }
-        } else if (openComboBox_.Get() == combo) {
+        } else if (openComboBox_.Get() == target) {
             openComboBox_.Reset();
         }
     }
 
     if (requestCapture && button == PointerButton::Left) {
         CapturePointer(target);
-        if (auto* rb = target->DynamicCast<RepeatButton>()) {
+        if (target->SupportsAutoRepeatPress()) {
             float delayMs = 400.0f;
-            if (!TryGetFloat(rb->GetValue(PropId_RepeatDelay), delayMs) || delayMs <= 0.0f) delayMs = 400.0f;
+            if (!TryGetFloat(target->GetValue(PropId_RepeatDelay), delayMs) || delayMs <= 0.0f) delayMs = 400.0f;
             repeatHoldElapsedMs_ = 0.0f;
             repeatNextFireMs_ = delayMs;
         }
@@ -991,27 +998,8 @@ bool InputEventRouter::DispatchMouseWheel(
     const bool shiftHeld = (modifiers & KeyMod_Shift) != 0u;
     UIElement* hit = rootVisual_->HitTest(position);
     for (UIElement* cur = hit; cur != nullptr; cur = cur->Parent()) {
-        if (auto* sv = cur->DynamicCast<ScrollViewer>(); sv && sv->IsEffectivelyEnabled()) {
-            const bool allowH = (sv->GetHorizontalScrollBarVisibility() != ScrollBarVisibility::Disabled);
-            const bool allowV = (sv->GetVerticalScrollBarVisibility() != ScrollBarVisibility::Disabled);
-            float effDx = allowH ? scrollDeltaX : 0.0f;
-            float effDy = allowV ? scrollDeltaY : 0.0f;
-            if (shiftHeld && scrollDeltaX == 0.0f && scrollDeltaY != 0.0f && allowH) {
-                effDx = scrollDeltaY;
-                effDy = 0.0f;
-            }
-            if (effDx == 0.0f && effDy == 0.0f) {
-                continue;
-            }
-            const float beforeX = sv->GetHorizontalOffset();
-            const float beforeY = sv->GetVerticalOffset();
-            sv->ScrollBy(effDx, effDy);
-            const float afterX = sv->GetHorizontalOffset();
-            const float afterY = sv->GetVerticalOffset();
-            if (std::fabs(afterX - beforeX) > 1e-4f || std::fabs(afterY - beforeY) > 1e-4f) {
-                return true;
-            }
-            // Boundary reached on inner ScrollViewer -> continue bubbling to outer ScrollViewer!
+        if (cur->TryHandleMouseWheelScroll(scrollDeltaX, scrollDeltaY, shiftHeld)) {
+            return true;
         }
         if (cur == rootVisual_) {
             break;
@@ -1028,7 +1016,7 @@ bool InputEventRouter::DispatchKeyDown(KeyCode key, std::uint8_t modifiers) {
     SyncFocusedFromTreeIfNeeded();
 
     if (key == KeyCode::Escape) {
-        if (openComboBox_ && openComboBox_->IsDropDownOpen()) {
+        if (openComboBox_ && openComboBox_->IsDropdownOverlayOpen()) {
             CloseActiveComboBoxIfOpen();
             return true;
         }
@@ -1124,7 +1112,7 @@ bool InputEventRouter::DispatchKeyDown(KeyCode key, std::uint8_t modifiers) {
             }
             const bool hasParamFallback = !cmdParam.empty();
             const UnifiedValue rawParamFallback = hasParamFallback ? value::FromString(cmdParam) : UnifiedValue{};
-            if (TryExecuteRoutedCommandBubble(host, cmdName, rawParamFallback, hasParamFallback)) {
+            if (UIElement::DispatchRegisteredRoutedCommandBubble(host, cmdName, rawParamFallback, hasParamFallback)) {
                 return true;
             }
         }
@@ -1146,8 +1134,8 @@ bool InputEventRouter::DispatchKeyDown(KeyCode key, std::uint8_t modifiers) {
         for (UIElement* cur = focusedElement_ ? focusedElement_.Get() : rootVisual_;
              cur != nullptr;
              cur = cur->Parent()) {
-            if (auto* tc = cur->DynamicCast<TabControl>()) {
-                if (tc->OnKeyDown(key, modifiers)) {
+            if (cur->HandlesCtrlTabNavigation()) {
+                if (cur->OnKeyDown(key, modifiers)) {
                     return true;
                 }
             }
@@ -1157,10 +1145,10 @@ bool InputEventRouter::DispatchKeyDown(KeyCode key, std::uint8_t modifiers) {
 
     if (focusedElement_ && focusedElement_->CanReceiveFocus()) {
         if (focusedElement_->OnKeyDown(key, modifiers)) {
-            if (auto* combo = focusedElement_->DynamicCast<ComboBox>()) {
-                if (combo->IsDropDownOpen()) {
-                    openComboBox_.Reset(combo, true);
-                } else if (openComboBox_.Get() == combo) {
+            if (focusedElement_->HasDropdownOverlayBehavior()) {
+                if (focusedElement_->IsDropdownOverlayOpen()) {
+                    openComboBox_.Reset(focusedElement_.Get(), true);
+                } else if (openComboBox_.Get() == focusedElement_.Get()) {
                     openComboBox_.Reset();
                 }
             }
@@ -1173,8 +1161,8 @@ bool InputEventRouter::DispatchKeyDown(KeyCode key, std::uint8_t modifiers) {
     for (UIElement* cur = focusedElement_ ? focusedElement_->Parent() : rootVisual_;
          cur != nullptr;
          cur = cur->Parent()) {
-        if (auto* sv = cur->DynamicCast<ScrollViewer>()) {
-            if (sv->OnKeyDown(key, modifiers)) {
+        if (cur->HandlesBubbledScrollKeys()) {
+            if (cur->OnKeyDown(key, modifiers)) {
                 return true;
             }
         }
@@ -1203,16 +1191,19 @@ void InputEventRouter::Tick(float dtSeconds) {
         (void)se->TickTimers(dtSeconds);
     }
     const float dtMs = dtSeconds * 1000.0f;
-    RepeatButton* activeRb = nullptr;
+    UIElement* activeRb = nullptr;
     if (capturedElement_) {
-        if (auto* rb = capturedElement_->DynamicCast<RepeatButton>(); rb && rb->IsPressed() && rb->IsEffectivelyEnabled()) {
-            activeRb = rb;
+        if (capturedElement_->SupportsAutoRepeatPress() &&
+            capturedElement_->IsPressed() &&
+            capturedElement_->IsEffectivelyEnabled()) {
+            activeRb = capturedElement_.Get();
         }
     } else if (hoveredElement_) {
-        if (auto* rb = hoveredElement_->DynamicCast<RepeatButton>(); rb && rb->IsEffectivelyEnabled()) {
-            const UnifiedValue cmVal = rb->GetValue(PropId_ClickMode);
+        if (hoveredElement_->SupportsAutoRepeatPress() &&
+            hoveredElement_->IsEffectivelyEnabled()) {
+            const UnifiedValue cmVal = hoveredElement_->GetValue(PropId_ClickMode);
             if (const auto* iv = std::get_if<std::int64_t>(&cmVal); iv && *iv == 2) {
-                activeRb = rb;
+                activeRb = hoveredElement_.Get();
             }
         }
     }
@@ -1225,7 +1216,7 @@ void InputEventRouter::Tick(float dtSeconds) {
     repeatHoldElapsedMs_ += dtMs;
     int safety = 0;
     while (repeatHoldElapsedMs_ >= repeatNextFireMs_ && safety++ < 8) {
-        (void)activeRb->ActivateFromInput();
+        (void)activeRb->ActivateAutoRepeatFromInput();
         repeatNextFireMs_ += intervalMs;
     }
 }

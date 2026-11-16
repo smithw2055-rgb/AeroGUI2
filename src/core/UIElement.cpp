@@ -7,10 +7,10 @@
 #include <unordered_set>
 
 #include "aero/animation/AnimationEngine.hpp"
+#include "aero/asset/AxbFormat.hpp"
+#include "aero/asset/AxbTemplateRegistry.hpp"
 #include "aero/binding/DualTrackBindingEngine.hpp"
-#include "aero/compiler/AxbFormat.hpp"
-#include "aero/controls/Controls.hpp"
-#include "aero/core/UiResourceContext.hpp"
+#include "aero/core/UIResourceContext.hpp"
 #include "aero/style/StyleTriggerEngine.hpp"
 #include "realscript/aot_cpp/AotRuntime.h"
 
@@ -58,13 +58,13 @@ struct LiveTraceableUIElementRegistry {
     }
 };
 
-TypeClass gUIElementTypeClass{};
-TypeClass gPanelTypeClass{};
-TypeClass gWindowTypeClass{};
-TypeClass gButtonTypeClass{};
-bool gBuiltinTypesInitialized = false;
 std::atomic<UIElementDestroyHook> gElementDestroyHook{nullptr};
 std::atomic<UIElementLocSourceHook> gElementLocSourceHook{nullptr};
+std::atomic<UIElementFactoryByTypeHook> gCreateElementByTypeHook{nullptr};
+std::atomic<UIElementControlTemplateMountHook> gMountControlTemplateHook{nullptr};
+std::atomic<UIElementPackageMountHook> gMountPackageHook{nullptr};
+std::atomic<UIElementRoutedCommandHook> gRoutedCommandHook{nullptr};
+std::atomic<std::int32_t> gOpenMenuSubmenuCount{0};
 std::atomic<UIElement::WrapperDestroyFn> gWrapperDestroyCallback{nullptr};
 std::atomic<std::uint64_t> gTotalConstructedUIElements{0};
 std::atomic<std::uint64_t> gTotalDestroyedUIElements{0};
@@ -102,79 +102,6 @@ void DetachSubtreeRenderNodes(UIElement* elem) noexcept {
     return false;
 }
 
-[[nodiscard]] constexpr bool IsLayoutAffectingSparseProperty(std::uint16_t propId) noexcept {
-    switch (propId) {
-        case PropId_BorderThickness:
-        case PropId_FontSize:
-        case PropId_Title:
-        case PropId_Text:
-        case PropId_Content:
-        case PropId_Placeholder:
-        case PropId_ItemsSource:
-        case PropId_GridRow:
-        case PropId_GridColumn:
-        case PropId_GridRowSpan:
-        case PropId_GridColumnSpan:
-        case PropId_CanvasLeft:
-        case PropId_CanvasTop:
-        case PropId_Orientation:
-        case PropId_Spacing:
-        case PropId_PathData:
-        case PropId_ImageSource:
-        case PropId_RiveSource:
-        case PropId_Stretch:
-        case PropId_MaxWidth:
-        case PropId_MaxHeight:
-        case PropId_Dock:
-        case PropId_LastChildFill:
-        case PropId_ItemWidth:
-        case PropId_ItemHeight:
-        case PropId_StretchDirection:
-        case PropId_HorizontalScrollBarVisibility:
-        case PropId_VerticalScrollBarVisibility:
-        case PropId_LayoutTransform:
-        case PropId_IsVirtualizing:
-        case PropId_IsPassword:
-        case PropId_FontFamily:
-        case PropId_TextWrapping:
-        case PropId_Template:
-        case PropId_HorizontalContentAlignment:
-        case PropId_VerticalContentAlignment:
-        case PropId_FlowDirection:
-        case PropId_RadiusX:
-        case PropId_RadiusY:
-        case PropId_ShapePoints:
-        case PropId_UniformRows:
-        case PropId_UniformColumns:
-        case PropId_FirstColumn:
-        case PropId_IsExpanded:
-        case PropId_Header:
-        case PropId_StrokeThickness:
-        case PropId_LineX1:
-        case PropId_LineY1:
-        case PropId_LineX2:
-        case PropId_LineY2:
-        case PropId_ExpandDirection:
-        case PropId_TabStripPlacement:
-        case PropId_ContentTemplate:
-        case PropId_RichText:
-        case PropId_RefResolution:
-        case PropId_CanvasRight:
-        case PropId_CanvasBottom:
-        case PropId_ContentSource:
-        case PropId_DisplayMemberPath:
-        case PropId_ItemsPanel:
-        case PropId_ItemContainerStyle:
-        case PropId_IsOpen:
-        case PropId_HeaderTemplate:
-        case PropId_TextTrimming:
-        case PropId_GridViewColumnsSpec:
-            return true;
-        default:
-            return false;
-    }
-}
-
 [[nodiscard]] constexpr std::uint16_t CompanionGradientPropId(std::uint16_t propId) noexcept {
     switch (propId) {
         case PropId_Background:
@@ -198,36 +125,6 @@ void DetachSubtreeRenderNodes(UIElement* elem) noexcept {
         return SampleGradientRampAtT(*brush, 0.5f);
     }
     return Color{1.0f, 1.0f, 1.0f, 1.0f};
-}
-
-[[nodiscard]] constexpr bool IsArrangeOnlySparseProperty(std::uint16_t propId) noexcept {
-    switch (propId) {
-        case PropId_HorizontalOffset:
-        case PropId_VerticalOffset:
-            return true;
-        default:
-            return false;
-    }
-}
-
-[[nodiscard]] constexpr bool IsParentLayoutAttachedProperty(std::uint16_t propId) noexcept {
-    switch (propId) {
-        case PropId_GridRow:
-        case PropId_GridColumn:
-        case PropId_GridRowSpan:
-        case PropId_GridColumnSpan:
-        case PropId_CanvasLeft:
-        case PropId_CanvasTop:
-        case PropId_CanvasRight:
-        case PropId_CanvasBottom:
-        case PropId_Dock:
-        case PropId_MaxWidth:
-        case PropId_MaxHeight:
-        case PropId_LayoutTransform:
-            return true;
-        default:
-            return false;
-    }
 }
 
 [[nodiscard]] Size MapAvailableSizeThroughLayoutTransform(Size slotAvail, const Matrix2D& lt) noexcept {
@@ -296,7 +193,7 @@ struct UIElement::MountedControlTemplateData {
     std::vector<IntrusivePtr<UIElement>> logicalChildren;
     std::vector<TemplateBindingLink> bindings;
     std::vector<TemplatePartEntry> namedParts;
-    std::vector<IntrusivePtr<ContentPresenter>> contentPresenters;
+    std::vector<IntrusivePtr<UIElement>> contentPresenters;
     std::vector<IntrusivePtr<UIElement>> inheritedTextNodes;
 };
 
@@ -307,37 +204,33 @@ void RegisterUIElementResourceHooks(
     gElementLocSourceHook.store(onLocSourceChanged, std::memory_order_release);
 }
 
+void RegisterUIElementTemplateHooks(
+    UIElementFactoryByTypeHook createByTypeName,
+    UIElementControlTemplateMountHook mountControlTemplate) noexcept {
+    gCreateElementByTypeHook.store(createByTypeName, std::memory_order_release);
+    gMountControlTemplateHook.store(mountControlTemplate, std::memory_order_release);
+}
+
+void RegisterUIElementInteractionHooks(
+    UIElementPackageMountHook mountPackage,
+    UIElementRoutedCommandHook executeCommand) noexcept {
+    gMountPackageHook.store(mountPackage, std::memory_order_release);
+    gRoutedCommandHook.store(executeCommand, std::memory_order_release);
+}
+
 void EnsureBuiltinTypesRegistered() noexcept {
-    if (gBuiltinTypesInitialized) {
-        return;
-    }
-    gBuiltinTypesInitialized = true;
-    auto& reg = TypeRegistry::Instance();
-    reg.RegisterType(gUIElementTypeClass, "Aero.UI.UIElement", nullptr);
-    reg.RegisterType(gPanelTypeClass, "Aero.UI.Panel", &gUIElementTypeClass);
-    reg.RegisterType(gWindowTypeClass, "Aero.UI.Window", &gPanelTypeClass);
-    reg.RegisterType(gButtonTypeClass, "Aero.UI.Button", &gUIElementTypeClass);
+    static std::once_flag sOnce;
+    std::call_once(sOnce, []() noexcept {
+        ScopedTypeBatch batch;
+        (void)AeroObject::StaticTypeClass();
+        const TypeClass* uiElementType = UIElement::StaticTypeClass();
+        auto& reg = TypeRegistry::Instance();
+        reg.RegisterAlias("FrameworkElement", uiElementType);
+        reg.RegisterAlias("Aero.UI.FrameworkElement", uiElementType);
+    });
 }
 
-const TypeClass* UIElement::StaticTypeClass() noexcept {
-    EnsureBuiltinTypesRegistered();
-    return &gUIElementTypeClass;
-}
-
-const TypeClass* Panel::StaticTypeClass() noexcept {
-    EnsureBuiltinTypesRegistered();
-    return &gPanelTypeClass;
-}
-
-const TypeClass* Window::StaticTypeClass() noexcept {
-    EnsureBuiltinTypesRegistered();
-    return &gWindowTypeClass;
-}
-
-const TypeClass* Button::StaticTypeClass() noexcept {
-    EnsureBuiltinTypesRegistered();
-    return &gButtonTypeClass;
-}
+AERO_IMPLEMENT_CLASS(UIElement, AeroObject, "Aero.UI.UIElement")
 
 std::uint64_t UIElement::TotalConstructedCount() noexcept {
     return gTotalConstructedUIElements.load(std::memory_order_relaxed);
@@ -355,18 +248,6 @@ std::uint64_t UIElement::LiveInstanceCount() noexcept {
 
 UIElement::UIElement() {
     gTotalConstructedUIElements.fetch_add(1u, std::memory_order_relaxed);
-    EnsureBuiltinTypesRegistered();
-}
-
-Panel::Panel() {
-    EnsureBuiltinTypesRegistered();
-}
-
-Window::Window() {
-    EnsureBuiltinTypesRegistered();
-}
-
-Button::Button() {
     EnsureBuiltinTypesRegistered();
 }
 
@@ -390,13 +271,19 @@ UIElement::~UIElement() {
         hasRegisteredScriptWrapper_ = false;
     }
     DetachRenderNodeSpan();
-    boundBindingEngine_ = nullptr;
-    boundStyleEngine_ = nullptr;
-    boundAnimationEngine_ = nullptr;
+    viewContext_ = nullptr;
+    if (rareData_) {
+        rareData_->boundBindingEngine = nullptr;
+        rareData_->boundStyleEngine = nullptr;
+        rareData_->boundAnimationEngine = nullptr;
+    }
     if (mountedTemplate_ && mountedTemplate_->templateRoot) {
         ClearSubtreeTemplatedParent(mountedTemplate_->templateRoot.Get(), this);
     }
     mountedTemplate_.reset();
+
+    NativeHandleRegistry* const reg = rareData_ ? rareData_->boundRegistry : nullptr;
+    ManagedHeap* const heap = rareData_ ? rareData_->boundUiHeap : nullptr;
 
     // Detach children safely
     UIElement* child = firstChild_;
@@ -406,20 +293,22 @@ UIElement::~UIElement() {
         child->parent_ = nullptr;
         child->prevSibling_ = nullptr;
         child->nextSibling_ = nullptr;
-        child->PropagateRootConnection(false, boundRegistry_, boundUiHeap_);
+        child->PropagateRootConnection(false, reg, heap);
         child->Release();
         child = next;
     }
     firstChild_ = nullptr;
     lastChild_ = nullptr;
 
-    pinnedWrapperRoot_.reset();
+    if (rareData_) {
+        rareData_->pinnedWrapperRoot.reset();
 
-    // Generational invalidation in NativeHandleRegistry on C++ destruction
-    if (boundRegistry_ && cachedNativeHandle_.valid()) {
-        (void)boundRegistry_->release(cachedNativeHandle_);
-        cachedNativeHandle_ = {};
-        boundRegistry_ = nullptr;
+        // Generational invalidation in NativeHandleRegistry on C++ destruction
+        if (rareData_->boundRegistry && rareData_->cachedNativeHandle.valid()) {
+            (void)rareData_->boundRegistry->release(rareData_->cachedNativeHandle);
+            rareData_->cachedNativeHandle = {};
+            rareData_->boundRegistry = nullptr;
+        }
     }
 }
 
@@ -427,52 +316,72 @@ void UIElement::SetAsRootVisual(
     bool isRoot,
     NativeHandleRegistry* registry,
     ManagedHeap* uiHeap) noexcept {
-    if (registry) boundRegistry_ = registry;
-    if (uiHeap) boundUiHeap_ = uiHeap;
+    if (registry) EnsureRareData().boundRegistry = registry;
+    if (uiHeap) EnsureRareData().boundUiHeap = uiHeap;
     const bool effectiveConnected = isRoot || (parent_ && parent_->isConnectedToRoot_);
-    PropagateRootConnection(effectiveConnected, boundRegistry_, boundUiHeap_);
+    PropagateRootConnection(
+        effectiveConnected,
+        rareData_ ? rareData_->boundRegistry : nullptr,
+        rareData_ ? rareData_->boundUiHeap : nullptr);
 }
 
 void UIElement::PropagateRootConnection(
     bool connected,
     NativeHandleRegistry* registry,
     ManagedHeap* uiHeap) noexcept {
-    if (registry) boundRegistry_ = registry;
-    if (uiHeap) boundUiHeap_ = uiHeap;
+    NativeHandleRegistry* effReg = registry;
+    ManagedHeap* effHeap = uiHeap;
+    if (rareData_) {
+        if (registry) {
+            rareData_->boundRegistry = registry;
+        } else {
+            effReg = rareData_->boundRegistry;
+        }
+        if (uiHeap) {
+            rareData_->boundUiHeap = uiHeap;
+        } else {
+            effHeap = rareData_->boundUiHeap;
+        }
+    }
     isConnectedToRoot_ = connected;
-    UpdateWrapperPinState(boundRegistry_, boundUiHeap_);
+    UpdateWrapperPinState(effReg, effHeap);
     for (UIElement* child = firstChild_; child != nullptr; child = child->nextSibling_) {
-        child->PropagateRootConnection(connected, boundRegistry_, boundUiHeap_);
+        child->PropagateRootConnection(connected, effReg, effHeap);
     }
 }
 
 void UIElement::UpdateWrapperPinState(
     NativeHandleRegistry* registry,
     ManagedHeap* uiHeap) noexcept {
-    if (registry) boundRegistry_ = registry;
-    if (uiHeap) boundUiHeap_ = uiHeap;
+    if (!rareData_) {
+        return;
+    }
+    if (registry) rareData_->boundRegistry = registry;
+    if (uiHeap) rareData_->boundUiHeap = uiHeap;
 
     if (!isConnectedToRoot_) {
-        pinnedWrapperRoot_.reset();
+        rareData_->pinnedWrapperRoot.reset();
         return;
     }
-    if (pinnedWrapperRoot_.valid()) {
+    if (rareData_->pinnedWrapperRoot.valid()) {
         return;
     }
-    if (!boundUiHeap_) {
+    if (!rareData_->boundUiHeap) {
         return;
     }
-    if (boundRegistry_ && cachedNativeHandle_.valid()) {
-        if (auto wrapperRef = boundRegistry_->cachedWrapper(
-                cachedNativeHandle_, boundUiHeap_->heapId())) {
-            if (boundUiHeap_->isAlive(*wrapperRef)) {
-                pinnedWrapperRoot_ = boundUiHeap_->retain(*wrapperRef);
+    if (rareData_->boundRegistry && rareData_->cachedNativeHandle.valid()) {
+        if (auto wrapperRef = rareData_->boundRegistry->cachedWrapper(
+                rareData_->cachedNativeHandle, rareData_->boundUiHeap->heapId())) {
+            if (rareData_->boundUiHeap->isAlive(*wrapperRef)) {
+                rareData_->pinnedWrapperRoot = rareData_->boundUiHeap->retain(*wrapperRef);
                 return;
             }
         }
     }
-    if (boundWrapperRef_.valid() && boundUiHeap_->isAlive(boundWrapperRef_)) {
-        pinnedWrapperRoot_ = boundUiHeap_->retain(boundWrapperRef_);
+    if (rareData_->boundWrapperRef.valid() &&
+        rareData_->boundUiHeap->isAlive(rareData_->boundWrapperRef)) {
+        rareData_->pinnedWrapperRoot =
+            rareData_->boundUiHeap->retain(rareData_->boundWrapperRef);
     }
 }
 
@@ -518,8 +427,8 @@ bool UIElement::AddChild(
     InvalidateLayout();
     child->PropagateRootConnection(
         isConnectedToRoot_,
-        registry ? registry : boundRegistry_,
-        uiHeap ? uiHeap : boundUiHeap_);
+        registry ? registry : (rareData_ ? rareData_->boundRegistry : nullptr),
+        uiHeap ? uiHeap : (rareData_ ? rareData_->boundUiHeap : nullptr));
     return true;
 }
 
@@ -569,8 +478,8 @@ bool UIElement::InsertChildAt(
     InvalidateLayout();
     child->PropagateRootConnection(
         isConnectedToRoot_,
-        registry ? registry : boundRegistry_,
-        uiHeap ? uiHeap : boundUiHeap_);
+        registry ? registry : (rareData_ ? rareData_->boundRegistry : nullptr),
+        uiHeap ? uiHeap : (rareData_ ? rareData_->boundUiHeap : nullptr));
     return true;
 }
 
@@ -639,8 +548,8 @@ bool UIElement::RemoveChild(
 
     child->PropagateRootConnection(
         false,
-        registry ? registry : boundRegistry_,
-        uiHeap ? uiHeap : boundUiHeap_);
+        registry ? registry : (rareData_ ? rareData_->boundRegistry : nullptr),
+        uiHeap ? uiHeap : (rareData_ ? rareData_->boundUiHeap : nullptr));
     child->Release();
     return true;
 }
@@ -654,21 +563,22 @@ std::size_t UIElement::ChildCount() const noexcept {
 }
 
 NativeHandle UIElement::ToNativeHandle(NativeHandleRegistry& registry) {
-    if (boundRegistry_ == &registry && cachedNativeHandle_.valid()) {
-        if (registry.resolveRawFast(cachedNativeHandle_) == this) {
-            return cachedNativeHandle_;
+    RareElementData& rare = EnsureRareData();
+    if (rare.boundRegistry == &registry && rare.cachedNativeHandle.valid()) {
+        if (registry.resolveRawFast(rare.cachedNativeHandle) == this) {
+            return rare.cachedNativeHandle;
         }
     }
-    if (boundRegistry_ && cachedNativeHandle_.valid()) {
-        (void)boundRegistry_->release(cachedNativeHandle_);
-        cachedNativeHandle_ = {};
+    if (rare.boundRegistry && rare.cachedNativeHandle.valid()) {
+        (void)rare.boundRegistry->release(rare.cachedNativeHandle);
+        rare.cachedNativeHandle = {};
     }
-    boundRegistry_ = &registry;
-    cachedNativeHandle_ = registry.createBorrowed(
+    rare.boundRegistry = &registry;
+    rare.cachedNativeHandle = registry.createBorrowed(
         GetTypeClass()->rsSymbolId,
         this,
         GetTypeClass()->typeName ? GetTypeClass()->typeName : "UIElement");
-    return cachedNativeHandle_;
+    return rare.cachedNativeHandle;
 }
 
 UIElement* UIElement::FromNativeHandle(
@@ -695,14 +605,15 @@ bool UIElement::BindScriptWrapper(
     if (!uiHeap.isAlive(wrapperRef)) {
         return false;
     }
-    boundRegistry_ = &registry;
-    boundUiHeap_ = &uiHeap;
-    boundWrapperRef_ = wrapperRef;
+    RareElementData& rare = EnsureRareData();
+    rare.boundRegistry = &registry;
+    rare.boundUiHeap = &uiHeap;
+    rare.boundWrapperRef = wrapperRef;
     const auto handle = ToNativeHandle(registry);
     if (!registry.setCachedWrapper(handle, wrapperRef, uiHeap.heapId())) {
         return false;
     }
-    pinnedWrapperRoot_.reset();
+    rare.pinnedWrapperRoot.reset();
     UpdateWrapperPinState(&registry, &uiHeap);
     return true;
 }
@@ -729,10 +640,11 @@ bool UIElement::CanReceiveFocus() const noexcept {
 }
 
 bool UIElement::NotifyTwoWayPropertyMutated(std::uint16_t propId, RuntimeError* error) {
-    if (!boundBindingEngine_) {
+    DualTrackBindingEngine* eng = BoundTwoWayEngine();
+    if (!eng) {
         return false;
     }
-    return boundBindingEngine_->PushTwoWayToSource(this, propId, error);
+    return eng->PushTwoWayToSource(this, propId, error);
 }
 
 Matrix2D UIElement::ComputeLocalToScreenMatrix2D() const noexcept {
@@ -888,18 +800,43 @@ bool UIElement::DispatchWrapperRoutedEvent(
     return gWrapperRoutedEventDispatcher(this, eventName, argVal, hasArg);
 }
 
+void UIElement::DispatchLoadedSubtree(bool skipNestedUserControls) {
+    const TypeClass* const ucType = skipNestedUserControls
+        ? TypeRegistry::Instance().FindByName("Aero.UI.UserControl")
+        : nullptr;
+    std::vector<IntrusivePtr<UIElement>> queue;
+    for (UIElement* c = firstChild_; c != nullptr; c = c->nextSibling_) {
+        queue.emplace_back(c, true);
+    }
+    for (std::size_t i = 0u; i < queue.size(); ++i) {
+        UIElement* cur = queue[i].Get();
+        if (!cur) {
+            continue;
+        }
+        if (ucType && cur->IsA(ucType)) {
+            continue;
+        }
+        if (cur->HasRegisteredScriptWrapper()) {
+            (void)cur->DispatchWrapperRoutedEvent("Loaded");
+        }
+        for (UIElement* ch = cur->firstChild_; ch != nullptr; ch = ch->nextSibling_) {
+            queue.emplace_back(ch, true);
+        }
+    }
+}
+
 void UIElement::OnHoveredChanged(bool hovered) noexcept {
-    if (!rareEvents_ && !hasRegisteredScriptWrapper_) {
+    if (!rareData_ && !hasRegisteredScriptWrapper_) {
         return;
     }
     if (hovered) {
-        if (rareEvents_ && rareEvents_->mouseEnter) {
-            (void)rareEvents_->mouseEnter(*this);
+        if (rareData_ && rareData_->events.mouseEnter) {
+            (void)rareData_->events.mouseEnter(*this);
         }
         (void)DispatchWrapperRoutedEvent("MouseEnter");
     } else {
-        if (rareEvents_ && rareEvents_->mouseLeave) {
-            (void)rareEvents_->mouseLeave(*this);
+        if (rareData_ && rareData_->events.mouseLeave) {
+            (void)rareData_->events.mouseLeave(*this);
         }
         (void)DispatchWrapperRoutedEvent("MouseLeave");
     }
@@ -907,8 +844,8 @@ void UIElement::OnHoveredChanged(bool hovered) noexcept {
 
 bool UIElement::InvokeMouseEnterBubble() {
     bool h = false;
-    if (rareEvents_ && rareEvents_->mouseEnter) {
-        h = rareEvents_->mouseEnter(*this) || h;
+    if (rareData_ && rareData_->events.mouseEnter) {
+        h = rareData_->events.mouseEnter(*this) || h;
     }
     if (hasRegisteredScriptWrapper_) {
         h = DispatchWrapperRoutedEvent("MouseEnter") || h;
@@ -918,8 +855,8 @@ bool UIElement::InvokeMouseEnterBubble() {
 
 bool UIElement::InvokeMouseLeaveBubble() {
     bool h = false;
-    if (rareEvents_ && rareEvents_->mouseLeave) {
-        h = rareEvents_->mouseLeave(*this) || h;
+    if (rareData_ && rareData_->events.mouseLeave) {
+        h = rareData_->events.mouseLeave(*this) || h;
     }
     if (hasRegisteredScriptWrapper_) {
         h = DispatchWrapperRoutedEvent("MouseLeave") || h;
@@ -929,8 +866,8 @@ bool UIElement::InvokeMouseLeaveBubble() {
 
 bool UIElement::InvokeMouseDownCallback() {
     bool h = false;
-    if (rareEvents_ && rareEvents_->mouseDown) {
-        h = rareEvents_->mouseDown(*this) || h;
+    if (rareData_ && rareData_->events.mouseDown) {
+        h = rareData_->events.mouseDown(*this) || h;
     }
     if (hasRegisteredScriptWrapper_) {
         h = DispatchWrapperRoutedEvent("MouseLeftButtonDown") || h;
@@ -940,8 +877,8 @@ bool UIElement::InvokeMouseDownCallback() {
 
 bool UIElement::InvokeMouseUpCallback() {
     bool h = false;
-    if (rareEvents_ && rareEvents_->mouseUp) {
-        h = rareEvents_->mouseUp(*this) || h;
+    if (rareData_ && rareData_->events.mouseUp) {
+        h = rareData_->events.mouseUp(*this) || h;
     }
     if (hasRegisteredScriptWrapper_) {
         h = DispatchWrapperRoutedEvent("MouseLeftButtonUp") || h;
@@ -950,11 +887,11 @@ bool UIElement::InvokeMouseUpCallback() {
 }
 
 void UIElement::OnFocusChanged(bool focused) {
-    if (rareEvents_) {
-        if (focused && rareEvents_->gotFocus) {
-            (void)rareEvents_->gotFocus(*this);
-        } else if (!focused && rareEvents_->lostFocus) {
-            (void)rareEvents_->lostFocus(*this);
+    if (rareData_) {
+        if (focused && rareData_->events.gotFocus) {
+            (void)rareData_->events.gotFocus(*this);
+        } else if (!focused && rareData_->events.lostFocus) {
+            (void)rareData_->events.lostFocus(*this);
         }
     }
     if (hasRegisteredScriptWrapper_) {
@@ -1475,7 +1412,7 @@ UIEffectDescriptor UIElement::GetEffectDescriptor() const noexcept {
         if (TryGetFloat(brEntry->effectiveValue, br)) {
             desc.blurRadius = std::max(0.0f, br);
             if (!hasExplicitKind && desc.kind == UIEffectKind::None && desc.blurRadius > 0.0f &&
-                !IsA<BoxShadow>()) {
+                !SuppressImplicitBlurEffectKind()) {
                 desc.kind = UIEffectKind::Blur;
             }
         }
@@ -1527,7 +1464,7 @@ UIElement* FindNameInTemplateSubtree(
     if (!targetName.empty() && node->Name() == targetName) {
         return node;
     }
-    if (node->IsA<UserControl>()) {
+    if (node->IsSubtreeNamescopeBoundary()) {
         return nullptr;
     }
     if (node->HasControlTemplate()) {
@@ -1564,7 +1501,7 @@ UIElement* FindNameInScope(
     if (!targetName.empty() && node->Name() == targetName) {
         return node;
     }
-    if (node != scopeRoot && node->IsA<UserControl>()) {
+    if (node != scopeRoot && node->IsSubtreeNamescopeBoundary()) {
         return nullptr;
     }
     if (node->HasControlTemplate()) {
@@ -1605,19 +1542,19 @@ UIElement* UIElement::FindNamescopeRoot(UIElement* elem) noexcept {
     }
     if (elem->TemplatedParent() != nullptr) {
         for (UIElement* cur = elem; cur != nullptr && cur != elem->TemplatedParent(); cur = cur->Parent()) {
-            if (cur->IsNamescopeBoundary() || cur->IsA<UserControl>()) {
+            if (cur->IsNamescopeBoundary() || cur->IsSubtreeNamescopeBoundary()) {
                 return cur;
             }
         }
         return elem->TemplatedParent();
     }
     UIElement* cur = elem;
-    if (cur->IsNamescopeBoundary() || cur->IsA<UserControl>()) {
+    if (cur->IsNamescopeBoundary() || cur->IsSubtreeNamescopeBoundary()) {
         return cur;
     }
     while (cur->Parent() != nullptr) {
         cur = cur->Parent();
-        if (cur->IsNamescopeBoundary() || cur->IsA<UserControl>()) {
+        if (cur->IsNamescopeBoundary() || cur->IsSubtreeNamescopeBoundary()) {
             return cur;
         }
     }
@@ -1625,10 +1562,8 @@ UIElement* UIElement::FindNamescopeRoot(UIElement* elem) noexcept {
 }
 
 UIElement* UIElement::HitTest(Point point) noexcept {
-    if (!isHitTestVisible_ || GetVisibility() != Visibility::Visible || GetOpacity() <= 0.0f) {
-        return nullptr;
-    }
-    if (const auto* pop = DynamicCast<Popup>(); pop && !pop->IsOpen()) {
+    if (!isHitTestVisible_ || GetVisibility() != Visibility::Visible || GetOpacity() <= 0.0f ||
+        !IsOpenForHitTest()) {
         return nullptr;
     }
 
@@ -1683,10 +1618,8 @@ UIElement* UIElement::HitTest(Point point) noexcept {
         }
     }
 
-    // Traverse children in reverse Z-order (highest Panel.ZIndex / lastChild_ -> firstChild_), skipping hidden Expander/TabControl slots
+    // Traverse children in reverse Z-order (highest Panel.ZIndex / lastChild_ -> firstChild_), skipping hidden composite layout slots
     if (childrenReachable) {
-        const auto* selfExpander = DynamicCast<Expander>();
-        const auto* selfTabControl = DynamicCast<TabControl>();
         auto readChildZ = [](const UIElement* ch) noexcept -> std::int64_t {
             if (const auto* ze = ch->FindCompactEntry(PropId_ZIndex)) {
                 if (const auto* zi = std::get_if<std::int64_t>(&ze->effectiveValue)) {
@@ -1708,10 +1641,7 @@ UIElement* UIElement::HitTest(Point point) noexcept {
         }
         if (!hasNonZeroZ) {
             for (UIElement* child = lastChild_; child != nullptr; child = child->prevSibling_) {
-                if (selfExpander && selfExpander->IsBodyChildHidden(child)) {
-                    continue;
-                }
-                if (selfTabControl && selfTabControl->IsChildInactiveTabPage(child)) {
+                if (IsChildHiddenByLayout(child)) {
                     continue;
                 }
                 if (UIElement* hit = child->HitTest(childPt)) {
@@ -1737,10 +1667,7 @@ UIElement* UIElement::HitTest(Point point) noexcept {
             });
             for (auto it = sorted.rbegin(); it != sorted.rend(); ++it) {
                 UIElement* child = it->elem;
-                if (selfExpander && selfExpander->IsBodyChildHidden(child)) {
-                    continue;
-                }
-                if (selfTabControl && selfTabControl->IsChildInactiveTabPage(child)) {
+                if (IsChildHiddenByLayout(child)) {
                     continue;
                 }
                 if (UIElement* hit = child->HitTest(childPt)) {
@@ -1838,14 +1765,8 @@ void UIElement::Measure(Size availableSize) noexcept {
 void UIElement::Arrange(Rect finalRect) noexcept {
     lastArrangeSlot_ = finalRect;
 
-    bool hiddenByCompositeParent = false;
-    if (parent_ != nullptr) {
-        if (const auto* pExp = parent_->DynamicCast<Expander>(); pExp && pExp->IsBodyChildHidden(this)) {
-            hiddenByCompositeParent = true;
-        } else if (const auto* pTab = parent_->DynamicCast<TabControl>(); pTab && pTab->IsChildInactiveTabPage(this)) {
-            hiddenByCompositeParent = true;
-        }
-    }
+    const bool hiddenByCompositeParent =
+        (parent_ != nullptr) && parent_->IsChildHiddenByLayout(this);
 
     if (GetVisibility() == Visibility::Collapsed || hiddenByCompositeParent) {
         const Rect collapsedRect{finalRect.x, finalRect.y, 0.0f, 0.0f};
@@ -1854,10 +1775,7 @@ void UIElement::Arrange(Rect finalRect) noexcept {
             InvalidateRender();
         }
         if (hiddenByCompositeParent) {
-            const UIElement* keepHdr = nullptr;
-            if (const auto* selfHcc = DynamicCast<HeaderedContentControl>()) {
-                keepHdr = selfHcc->GetHeaderElement();
-            }
+            const UIElement* keepHdr = GetCompositeHeaderElement();
             for (UIElement* c = firstChild_; c != nullptr; c = c->nextSibling_) {
                 if (c == keepHdr) {
                     continue;
@@ -2408,19 +2326,7 @@ bool UIElement::SetValue(
             gradPropId != 0u && std::holds_alternative<Float4Value>(value)) {
             (void)ClearValue(gradPropId, rank);
         }
-        InvalidateRender();
-        if (propId == PropId_ZIndex && parent_) {
-            parent_->DetachRenderNodeSpan();
-            parent_->InvalidateRender();
-        }
-        if (IsLayoutAffectingSparseProperty(propId)) {
-            InvalidateLayout();
-            if (IsParentLayoutAttachedProperty(propId) && parent_) {
-                parent_->InvalidateLayout();
-            }
-        } else if (IsArrangeOnlySparseProperty(propId)) {
-            InvalidateArrange();
-        }
+        NotifySparsePropertyInvalidation(propId);
         OnPropertyChanged(propId, value);
         if (propId == PropId_LocSource) {
             if (const auto* sv = std::get_if<StringValue>(&value)) {
@@ -2444,19 +2350,7 @@ bool UIElement::SetValue(
         gradPropId != 0u && std::holds_alternative<Float4Value>(value)) {
         (void)ClearValue(gradPropId, rank);
     }
-    InvalidateRender();
-    if (propId == PropId_ZIndex && parent_) {
-        parent_->DetachRenderNodeSpan();
-        parent_->InvalidateRender();
-    }
-    if (IsLayoutAffectingSparseProperty(propId)) {
-        InvalidateLayout();
-        if (IsParentLayoutAttachedProperty(propId) && parent_) {
-            parent_->InvalidateLayout();
-        }
-    } else if (IsArrangeOnlySparseProperty(propId)) {
-        InvalidateArrange();
-    }
+    NotifySparsePropertyInvalidation(propId);
     OnPropertyChanged(propId, value);
     if (propId == PropId_LocSource) {
         if (const auto* sv = std::get_if<StringValue>(&value)) {
@@ -2466,6 +2360,26 @@ bool UIElement::SetValue(
         }
     }
     return true;
+}
+
+void UIElement::NotifySparsePropertyInvalidation(std::uint16_t propId) noexcept {
+    InvalidateRender();
+    if (propId == PropId_ZIndex && parent_) {
+        parent_->DetachRenderNodeSpan();
+        parent_->InvalidateRender();
+    }
+    const PropertyMetadata meta = GetPropertyMetadata(propId);
+    if (HasPropMetaFlag(meta.flags, PropMetaFlags::AffectsMeasure)) {
+        InvalidateLayout();
+        if (HasPropMetaFlag(meta.flags, PropMetaFlags::AffectsParentMeasure) && parent_) {
+            parent_->InvalidateLayout();
+        }
+    } else if (HasPropMetaFlag(meta.flags, PropMetaFlags::AffectsArrange)) {
+        InvalidateArrange();
+        if (HasPropMetaFlag(meta.flags, PropMetaFlags::AffectsParentArrange) && parent_) {
+            parent_->InvalidateArrange();
+        }
+    }
 }
 
 void UIElement::SetStyleKey(std::string_view styleKey) {
@@ -2570,19 +2484,7 @@ bool UIElement::ForceEffectiveValue(
         gradPropId != 0u && std::holds_alternative<Float4Value>(value)) {
         (void)ForceClearSparseEntry(gradPropId);
     }
-    InvalidateRender();
-    if (propId == PropId_ZIndex && parent_) {
-        parent_->DetachRenderNodeSpan();
-        parent_->InvalidateRender();
-    }
-    if (IsLayoutAffectingSparseProperty(propId)) {
-        InvalidateLayout();
-        if (IsParentLayoutAttachedProperty(propId) && parent_) {
-            parent_->InvalidateLayout();
-        }
-    } else if (IsArrangeOnlySparseProperty(propId)) {
-        InvalidateArrange();
-    }
+    NotifySparsePropertyInvalidation(propId);
     OnPropertyChanged(propId, value);
     return true;
 }
@@ -2610,19 +2512,7 @@ bool UIElement::ForceClearSparseEntry(std::uint16_t propId) {
     } else if (const std::uint16_t gradPropId = CompanionGradientPropId(propId); gradPropId != 0u) {
         (void)ForceClearSparseEntry(gradPropId);
     }
-    InvalidateRender();
-    if (propId == PropId_ZIndex && parent_) {
-        parent_->DetachRenderNodeSpan();
-        parent_->InvalidateRender();
-    }
-    if (IsLayoutAffectingSparseProperty(propId)) {
-        InvalidateLayout();
-        if (IsParentLayoutAttachedProperty(propId) && parent_) {
-            parent_->InvalidateLayout();
-        }
-    } else if (IsArrangeOnlySparseProperty(propId)) {
-        InvalidateArrange();
-    }
+    NotifySparsePropertyInvalidation(propId);
     OnPropertyChanged(propId, std::monostate{});
     return true;
 }
@@ -2728,19 +2618,7 @@ bool UIElement::ClearValue(std::uint16_t propId, ValueSourceRank rank) {
     } else if (const std::uint16_t gradPropId = CompanionGradientPropId(propId); gradPropId != 0u) {
         (void)ClearValue(gradPropId, rank);
     }
-    InvalidateRender();
-    if (propId == PropId_ZIndex && parent_) {
-        parent_->DetachRenderNodeSpan();
-        parent_->InvalidateRender();
-    }
-    if (IsLayoutAffectingSparseProperty(propId)) {
-        InvalidateLayout();
-        if (IsParentLayoutAttachedProperty(propId) && parent_) {
-            parent_->InvalidateLayout();
-        }
-    } else if (IsArrangeOnlySparseProperty(propId)) {
-        InvalidateArrange();
-    }
+    NotifySparsePropertyInvalidation(propId);
     OnPropertyChanged(propId, std::monostate{});
     return true;
 }
@@ -2905,190 +2783,6 @@ void UIElement::MarkSubtreeValuesInPools() const noexcept {
     }
 }
 
-void Button::SetContentText(std::string_view text) {
-    SetValue(PropId_Text, value::FromString(std::string(text)), ValueSourceRank::Local);
-}
-
-std::string Button::GetContentText() const {
-    const auto v = GetValue(PropId_Text);
-    if (const auto* s = std::get_if<StringValue>(&v)) {
-        return s->str();
-    }
-    const auto contentVal = GetValue(PropId_Content);
-    if (const auto* s = std::get_if<StringValue>(&contentVal)) {
-        return s->str();
-    }
-    const auto titleVal = GetValue(PropId_Title);
-    if (const auto* s = std::get_if<StringValue>(&titleVal)) {
-        return s->str();
-    }
-    return {};
-}
-
-bool Button::PerformClick(RuntimeError* error) {
-    if (!IsEffectivelyEnabled()) {
-        return false;
-    }
-    IntrusivePtr<Button> selfGuard(this, true);
-    ++clickGeneration_;
-    NotifyBubbledClick();
-    if (clickCallback_) {
-        clickCallback_(*this);
-    }
-    (void)DispatchWrapperRoutedEvent("Click");
-    const UnifiedValue routedCmdVal = GetValue(PropId_RoutedCommandName);
-    if (const auto* rcmdSv = std::get_if<StringValue>(&routedCmdVal);
-        rcmdSv && !rcmdSv->view().empty()) {
-        const UnifiedValue cp = GetValue(PropId_CommandParameter);
-        const bool hasCp = !std::holds_alternative<std::monostate>(cp);
-        (void)TryExecuteRoutedCommandBubble(this, rcmdSv->view(), cp, hasCp);
-    }
-    if (scriptTargetObject_.valid() && scriptClickMethodId_ != 0) {
-        std::vector<UnifiedValue> args;
-        args.push_back(scriptTargetObject_);
-        const UnifiedValue cmdParam = GetValue(PropId_CommandParameter);
-        if (!std::holds_alternative<std::monostate>(cmdParam)) {
-            args.push_back(cmdParam);
-        }
-        if (scriptInterpreter_) {
-            auto res = scriptInterpreter_->invoke(scriptClickMethodId_, args);
-            // Only retry for arity mismatch if 0 bytecode instructions ran (entry signature check),
-            // never re-entering a handler that already started executing and failed internally.
-            if (!res.succeeded &&
-                res.error.code == ErrorCode::InvalidArguments &&
-                res.statistics.instructionsExecuted == 0u) {
-                if (args.size() == 1u) {
-                    args.push_back(UnifiedValue{NullObject{}});
-                    args.push_back(UnifiedValue{NullObject{}});
-                    res = scriptInterpreter_->invoke(scriptClickMethodId_, args);
-                    if (!res.succeeded &&
-                        res.error.code == ErrorCode::InvalidArguments &&
-                        res.statistics.instructionsExecuted == 0u) {
-                        args.resize(1u);
-                        args.push_back(value::FromInt(0));
-                        res = scriptInterpreter_->invoke(scriptClickMethodId_, args);
-                    }
-                } else if (args.size() > 1u) {
-                    args.resize(1u);
-                    res = scriptInterpreter_->invoke(scriptClickMethodId_, args);
-                    if (!res.succeeded &&
-                        res.error.code == ErrorCode::InvalidArguments &&
-                        res.statistics.instructionsExecuted == 0u) {
-                        args.push_back(UnifiedValue{NullObject{}});
-                        args.push_back(UnifiedValue{NullObject{}});
-                        res = scriptInterpreter_->invoke(scriptClickMethodId_, args);
-                    }
-                }
-            }
-            if (!res.succeeded) {
-                if (error) {
-                    *error = res.error;
-                }
-                return false;
-            }
-        } else if (scriptAotContext_) {
-            const auto& prog = scriptAotContext_->program();
-            for (std::uint32_t i = 0; i < prog.functionCount; ++i) {
-                const auto& fn = prog.functions[i];
-                if (fn.symbolId == scriptClickMethodId_) {
-                    if (args.size() < fn.parameterCount && fn.parameterTypes && fn.parameterTypeIds) {
-                        while (args.size() < fn.parameterCount) {
-                            const std::size_t pIdx = args.size();
-                            args.push_back(scriptAotContext_->defaultValue(
-                                fn.parameterTypes[pIdx],
-                                fn.parameterTypeIds[pIdx]));
-                        }
-                    } else if (args.size() > fn.parameterCount && fn.parameterCount >= 1u) {
-                        args.resize(fn.parameterCount);
-                    }
-                    break;
-                }
-            }
-            UnifiedValue outVal{};
-            const bool ok = scriptAotContext_->invoke(
-                scriptClickMethodId_,
-                args.data(),
-                args.size(),
-                outVal);
-            if (!ok) {
-                if (error) {
-                    *error = scriptAotContext_->error();
-                }
-                return false;
-            }
-        }
-    }
-    return true;
-}
-
-bool Button::ActivateFromInput(RuntimeError* error) {
-    if (!IsEffectivelyEnabled()) {
-        return false;
-    }
-    return PerformClick(error);
-}
-
-bool Button::OnPointerDown(
-    Point localPoint,
-    PointerButton button,
-    std::uint8_t modifiers,
-    bool& outRequestCapture) {
-    (void)localPoint;
-    (void)modifiers;
-    if (button == PointerButton::Left && IsEffectivelyEnabled()) {
-        outRequestCapture = true;
-        const UnifiedValue cmVal = GetValue(PropId_ClickMode);
-        if (const auto* iv = std::get_if<std::int64_t>(&cmVal); iv && *iv == 1) {
-            (void)ActivateFromInput();
-        }
-        return true;
-    }
-    outRequestCapture = false;
-    return false;
-}
-
-bool Button::OnPointerUp(
-    Point localPoint,
-    PointerButton button,
-    std::uint8_t modifiers,
-    bool insideBounds) {
-    (void)localPoint;
-    (void)modifiers;
-    if (button == PointerButton::Left && insideBounds && IsEffectivelyEnabled()) {
-        const UnifiedValue cmVal = GetValue(PropId_ClickMode);
-        if (const auto* iv = std::get_if<std::int64_t>(&cmVal); iv && (*iv == 1 || *iv == 2)) {
-            return true;
-        }
-        return ActivateFromInput();
-    }
-    return false;
-}
-
-bool Button::OnKeyDown(KeyCode key, std::uint8_t modifiers) {
-    (void)modifiers;
-    if (!IsEffectivelyEnabled()) {
-        return false;
-    }
-    if (key == KeyCode::Enter || key == KeyCode::Space) {
-        return ActivateFromInput();
-    }
-    return false;
-}
-
-Size Button::MeasureCore(Size availableSize) noexcept {
-    if (FirstChild()) {
-        return UIElement::MeasureCore(availableSize);
-    }
-    const Thickness p = GetPadding();
-    const auto text = GetContentText();
-    const std::size_t codePoints = rs_rt::utf8CodePointLength(text);
-    const float textW = static_cast<float>(codePoints) * 8.0f + 16.0f;
-    const float textH = 24.0f;
-    return Size{
-        textW + p.left + p.right,
-        textH + p.top + p.bottom};
-}
-
 // ============================================================================
 // P1-1: ControlTemplate Instantiation, Zero-Alloc TemplateBinding & PART_* Lookup
 // ============================================================================
@@ -3102,7 +2796,7 @@ void CollectTemplateTextBlocksRecursive(
     if (!node) {
         return;
     }
-    if (node->TemplatedParent() == expectedHost && node->IsA<TextBlock>()) {
+    if (node->TemplatedParent() == expectedHost && node->ParticipatesInTemplateTextMetrics()) {
         outNodes.emplace_back(node, true);
     }
     for (UIElement* c = node->FirstChild(); c != nullptr; c = c->NextSibling()) {
@@ -3215,7 +2909,7 @@ void UIElement::RegisterTemplateNamedPart(std::string_view partName, UIElement* 
     mountedTemplate_->namedParts.push_back(std::move(entry));
 }
 
-void UIElement::RegisterTemplateContentPresenter(ContentPresenter* presenter) {
+void UIElement::RegisterTemplateContentPresenter(UIElement* presenter) {
     if (!mountedTemplate_ || !presenter) {
         return;
     }
@@ -3412,7 +3106,7 @@ void UIElement::SyncTemplateBindingsForProperty(std::uint16_t changedPropId) noe
             if (changedPropId == PropId_Content || changedPropId == PropId_Text ||
                 changedPropId == PropId_ContentTemplate ||
                 changedPropId == PropId_Header || changedPropId == PropId_HeaderTemplate) {
-                cp->SyncContentTemplateChild();
+                cp->SyncTemplateContentHost();
             }
             if (affectsMetrics) {
                 cp->InvalidateLayout();
@@ -3434,11 +3128,7 @@ void UIElement::SyncTemplateBindingsForProperty(std::uint16_t changedPropId) noe
         }
     }
 
-    if (changedPropId == PropId_Value || changedPropId == PropId_Minimum || changedPropId == PropId_Maximum) {
-        if (auto* slider = DynamicCast<Slider>()) {
-            slider->SyncTemplateParts();
-        }
-    }
+    OnTemplatePropertiesUpdated(changedPropId);
 }
 
 void UIElement::SyncTemplateBindingsForTarget(UIElement* target, std::uint16_t targetPropId) noexcept {
@@ -3482,9 +3172,7 @@ void UIElement::RefreshAllTemplateBindings() noexcept {
             cp->InvalidateLayout();
         }
     }
-    if (auto* slider = DynamicCast<Slider>()) {
-        slider->SyncTemplateParts();
-    }
+    OnTemplatePropertiesUpdated(0xFFFFu);
 }
 
 UIElement* UIElement::GetTemplateChild(std::string_view partName) const noexcept {
@@ -3506,50 +3194,54 @@ void UIElement::ClearControlTemplate() {
     if (!mountedTemplate_) {
         return;
     }
+    NativeHandleRegistry* const reg = rareData_ ? rareData_->boundRegistry : nullptr;
+    ManagedHeap* const heap = rareData_ ? rareData_->boundUiHeap : nullptr;
     std::vector<IntrusivePtr<UIElement>> savedLogical = std::move(mountedTemplate_->logicalChildren);
     for (const auto& cp : mountedTemplate_->contentPresenters) {
         if (!cp) continue;
         for (const auto& lc : savedLogical) {
             if (lc && lc->Parent() == cp.Get()) {
-                (void)cp->RemoveChild(lc.Get(), boundRegistry_, boundUiHeap_);
+                (void)cp->RemoveChild(lc.Get(), reg, heap);
             }
         }
     }
+    StyleTriggerEngine* styleEng = BoundStyleEngine();
+    DualTrackBindingEngine* bindEng = BoundTwoWayEngine();
     IntrusivePtr<UIElement> oldTplRoot = mountedTemplate_->templateRoot;
     if (oldTplRoot) {
-        if (boundStyleEngine_) {
-            boundStyleEngine_->OnElementControlTemplateChanging(this, oldTplRoot.Get());
+        if (styleEng) {
+            styleEng->OnElementControlTemplateChanging(this, oldTplRoot.Get());
         }
         auto resolveLiveAnim = [&](AnimationEngine* cand) noexcept -> AnimationEngine* {
             return AnimationEngine::IsLiveInstance(cand) ? cand : nullptr;
         };
-        AnimationEngine* anim = resolveLiveAnim(boundAnimationEngine_);
-        if (!anim && boundStyleEngine_) {
-            anim = resolveLiveAnim(boundStyleEngine_->GetAnimationEngine());
+        AnimationEngine* anim = resolveLiveAnim(BoundAnimationEngine());
+        if (!anim && styleEng) {
+            anim = resolveLiveAnim(styleEng->GetAnimationEngine());
         }
-        if (!anim && boundBindingEngine_) {
-            anim = resolveLiveAnim(boundBindingEngine_->GetAnimationEngine());
+        if (!anim && bindEng) {
+            anim = resolveLiveAnim(bindEng->GetAnimationEngine());
         }
         if (anim) {
             (void)anim->StopSubtreeAnimations(oldTplRoot.Get(), false);
         }
-        if (boundBindingEngine_) {
-            (void)boundBindingEngine_->UnbindSubtree(oldTplRoot.Get());
+        if (bindEng) {
+            (void)bindEng->UnbindSubtree(oldTplRoot.Get());
         }
-        if (boundStyleEngine_) {
-            (void)boundStyleEngine_->UnbindSubtreeStyles(oldTplRoot.Get());
+        if (styleEng) {
+            (void)styleEng->UnbindSubtreeStyles(oldTplRoot.Get());
         }
-        (void)RemoveChild(oldTplRoot.Get(), boundRegistry_, boundUiHeap_);
+        (void)RemoveChild(oldTplRoot.Get(), reg, heap);
         ClearSubtreeTemplatedParent(oldTplRoot.Get(), this);
     }
     mountedTemplate_.reset();
     for (const auto& lc : savedLogical) {
         if (lc) {
-            (void)AddChild(lc.Get(), boundRegistry_, boundUiHeap_);
+            (void)AddChild(lc.Get(), reg, heap);
         }
     }
-    if (boundStyleEngine_) {
-        boundStyleEngine_->OnElementControlTemplateCleared(this);
+    if (styleEng) {
+        styleEng->OnElementControlTemplateCleared(this);
     }
     InvalidateLayout();
     InvalidateRender();
@@ -3560,27 +3252,35 @@ bool UIElement::ApplyControlTemplateByKey(std::string_view templateKey) {
         ClearControlTemplate();
         return false;
     }
-    ExecutionDomainContext* domains = boundBindingEngine_
-        ? &boundBindingEngine_->Domains()
-        : (boundStyleEngine_ ? boundStyleEngine_->GetDomains() : nullptr);
-    std::shared_ptr<UiResourceContext> domainCtx =
-        (domains && !UiResourceContext::HasActiveThreadOverride())
-            ? UiResourceContext::FindForDomains(domains)
+    DualTrackBindingEngine* bindingEng = BoundTwoWayEngine();
+    StyleTriggerEngine* styleEng = BoundStyleEngine();
+    AnimationEngine* selfAnim = BoundAnimationEngine();
+    ExecutionDomainContext* domains = bindingEng
+        ? &bindingEng->Domains()
+        : (styleEng ? styleEng->GetDomains()
+                    : (viewContext_ ? viewContext_->GetDomains() : nullptr));
+    std::shared_ptr<UIResourceContext> domainCtx =
+        (domains && !UIResourceContext::HasActiveThreadOverride())
+            ? UIResourceContext::FindForDomains(domains)
             : nullptr;
-    ScopedUiResourceContext ctxGuard(std::move(domainCtx));
+    UIResourceContext* fallbackViewResCtx =
+        (!domainCtx && !UIResourceContext::HasActiveThreadOverride() && viewContext_)
+            ? viewContext_->GetResourceContext()
+            : nullptr;
+    ScopedUIResourceContext ctxGuard(
+        domainCtx ? domainCtx.get() : fallbackViewResCtx);
 
     if (const AxbControlTemplate* ct = AxbTemplateRegistry::Instance().FindControlTemplate(templateKey)) {
-        DualTrackBindingEngine* bindingEng = boundBindingEngine_;
         const Interpreter* interp = bindingEng
             ? bindingEng->UiInterpreter()
-            : (boundStyleEngine_ ? boundStyleEngine_->GetUiInterpreter() : nullptr);
-        rs_aot::ExecutionContext* aotCtx = boundStyleEngine_
-            ? boundStyleEngine_->GetAotExecutionContext()
+            : (styleEng ? styleEng->GetUiInterpreter() : nullptr);
+        rs_aot::ExecutionContext* aotCtx = styleEng
+            ? styleEng->GetAotExecutionContext()
             : nullptr;
-        AnimationEngine* anim = AnimationEngine::IsLiveInstance(boundAnimationEngine_)
-            ? boundAnimationEngine_
-            : (boundStyleEngine_ && AnimationEngine::IsLiveInstance(boundStyleEngine_->GetAnimationEngine())
-                   ? boundStyleEngine_->GetAnimationEngine()
+        AnimationEngine* anim = AnimationEngine::IsLiveInstance(selfAnim)
+            ? selfAnim
+            : (styleEng && AnimationEngine::IsLiveInstance(styleEng->GetAnimationEngine())
+                   ? styleEng->GetAnimationEngine()
                    : (bindingEng && AnimationEngine::IsLiveInstance(bindingEng->GetAnimationEngine())
                           ? bindingEng->GetAnimationEngine()
                           : nullptr));
@@ -3615,28 +3315,8 @@ bool UIElement::ApplyControlTemplate(
         controlTemplate.templatePackage->instructions.empty()) {
         return false;
     }
-    // Skip unimplemented WPF presenter shells (ScrollContentPresenter / ItemsPresenter / Popup / Track)
-    // so ScrollViewer, ItemsControl/ListBox, ComboBox, and Track-based Sliders preserve live children & native rendering.
-    {
-        const auto& strs = controlTemplate.templatePackage->stringTable;
-        auto hasStr = [&](std::string_view needle) {
-            for (const auto& s : strs) {
-                if (s == needle) return true;
-            }
-            return false;
-        };
-        if (IsA<ScrollViewer>() && (hasStr("ScrollContentPresenter") || hasStr("PART_ScrollContentPresenter") || FirstChild() != nullptr)) {
-            return false;
-        }
-        if (IsA<ComboBox>() && (hasStr("Popup") || hasStr("PART_Popup") || hasStr("ItemsPresenter"))) {
-            return false;
-        }
-        if (IsA<ItemsControl>() && !IsA<ComboBox>() && (hasStr("ItemsPresenter") || hasStr("ScrollViewer"))) {
-            return false;
-        }
-        if (IsA<Slider>() && hasStr("Track") && !hasStr("PART_Indicator") && !hasStr("PART_Thumb")) {
-            return false;
-        }
+    if (ShouldSkipControlTemplatePackage(*controlTemplate.templatePackage)) {
+        return false;
     }
 
     // Prevent infinite self-template recursion when a template contains a child of the same control type
@@ -3649,15 +3329,24 @@ bool UIElement::ApplyControlTemplate(
         }
     }
 
+    DualTrackBindingEngine* boundBind = BoundTwoWayEngine();
+    StyleTriggerEngine* boundStyle = BoundStyleEngine();
+    AnimationEngine* boundAnim = BoundAnimationEngine();
     ExecutionDomainContext* effDomains = domains
         ? domains
         : (bindingEngine ? &bindingEngine->Domains()
-                         : (boundBindingEngine_ ? &boundBindingEngine_->Domains() : nullptr));
-    std::shared_ptr<UiResourceContext> domainCtx =
-        (effDomains && !UiResourceContext::HasActiveThreadOverride())
-            ? UiResourceContext::FindForDomains(effDomains)
+                         : (boundBind ? &boundBind->Domains()
+                                      : (viewContext_ ? viewContext_->GetDomains() : nullptr)));
+    std::shared_ptr<UIResourceContext> domainCtx =
+        (effDomains && !UIResourceContext::HasActiveThreadOverride())
+            ? UIResourceContext::FindForDomains(effDomains)
             : nullptr;
-    ScopedUiResourceContext ctxGuard(std::move(domainCtx));
+    UIResourceContext* fallbackViewResCtx =
+        (!domainCtx && !UIResourceContext::HasActiveThreadOverride() && viewContext_)
+            ? viewContext_->GetResourceContext()
+            : nullptr;
+    ScopedUIResourceContext ctxGuard(
+        domainCtx ? domainCtx.get() : fallbackViewResCtx);
 
     // Idempotent fast path if this exact ControlTemplate is already mounted on this host
     if (mountedTemplate_ &&
@@ -3668,8 +3357,8 @@ bool UIElement::ApplyControlTemplate(
         mountedTemplate_->definition.eventTriggers = controlTemplate.eventTriggers;
         mountedTemplate_->definition.visualStateGroups = controlTemplate.visualStateGroups;
         RefreshAllTemplateBindings();
-        if (boundStyleEngine_) {
-            boundStyleEngine_->OnElementControlTemplateApplied(this);
+        if (boundStyle) {
+            boundStyle->OnElementControlTemplateApplied(this);
         }
         return true;
     }
@@ -3681,15 +3370,20 @@ bool UIElement::ApplyControlTemplate(
         return false;
     }
     const std::string_view rootTypeName = tplPkg.GetString(firstInst.strIdx0);
-    IntrusivePtr<UIElement> tplRoot = CreateElementByTypeName(rootTypeName);
+    const auto createFn = gCreateElementByTypeHook.load(std::memory_order_acquire);
+    IntrusivePtr<UIElement> tplRoot = createFn ? createFn(rootTypeName) : IntrusivePtr<UIElement>{};
     if (!tplRoot) {
         return false;
     }
 
     applyingControlTemplate_ = true;
-    if (animationEngine && !boundAnimationEngine_) {
-        boundAnimationEngine_ = animationEngine;
+    if (animationEngine && (!rareData_ || !rareData_->boundAnimationEngine)) {
+        BindAnimationEngine(animationEngine);
+        boundAnim = animationEngine;
     }
+
+    NativeHandleRegistry* const boundReg = rareData_ ? rareData_->boundRegistry : nullptr;
+    ManagedHeap* const boundHeap = rareData_ ? rareData_->boundUiHeap : nullptr;
 
     // 1. Preserve non-template logical children (e.g. graphical <Button><Path/></Button> content)
     //    and cleanly tear down any previously mounted template subtree across all engines!
@@ -3700,42 +3394,42 @@ bool UIElement::ApplyControlTemplate(
             if (!cp) continue;
             for (const auto& lc : savedLogical) {
                 if (lc && lc->Parent() == cp.Get()) {
-                    (void)cp->RemoveChild(lc.Get(), boundRegistry_, boundUiHeap_);
+                    (void)cp->RemoveChild(lc.Get(), boundReg, boundHeap);
                 }
             }
         }
         IntrusivePtr<UIElement> oldTplRoot = mountedTemplate_->templateRoot;
         if (oldTplRoot) {
-            if (boundStyleEngine_) {
-                boundStyleEngine_->OnElementControlTemplateChanging(this, oldTplRoot.Get());
+            if (boundStyle) {
+                boundStyle->OnElementControlTemplateChanging(this, oldTplRoot.Get());
             }
             AnimationEngine* effAnim = AnimationEngine::IsLiveInstance(animationEngine)
                 ? animationEngine
-                : (AnimationEngine::IsLiveInstance(boundAnimationEngine_)
-                       ? boundAnimationEngine_
-                       : (boundStyleEngine_ && AnimationEngine::IsLiveInstance(boundStyleEngine_->GetAnimationEngine())
-                              ? boundStyleEngine_->GetAnimationEngine()
-                              : (boundBindingEngine_ && AnimationEngine::IsLiveInstance(boundBindingEngine_->GetAnimationEngine())
-                                     ? boundBindingEngine_->GetAnimationEngine()
+                : (AnimationEngine::IsLiveInstance(boundAnim)
+                       ? boundAnim
+                       : (boundStyle && AnimationEngine::IsLiveInstance(boundStyle->GetAnimationEngine())
+                              ? boundStyle->GetAnimationEngine()
+                              : (boundBind && AnimationEngine::IsLiveInstance(boundBind->GetAnimationEngine())
+                                     ? boundBind->GetAnimationEngine()
                                      : nullptr)));
             if (effAnim) {
                 (void)effAnim->StopSubtreeAnimations(oldTplRoot.Get(), false);
             }
-            DualTrackBindingEngine* effBind = bindingEngine ? bindingEngine : boundBindingEngine_;
+            DualTrackBindingEngine* effBind = bindingEngine ? bindingEngine : boundBind;
             if (effBind) {
                 (void)effBind->UnbindSubtree(oldTplRoot.Get());
             }
-            if (boundStyleEngine_) {
-                (void)boundStyleEngine_->UnbindSubtreeStyles(oldTplRoot.Get());
+            if (boundStyle) {
+                (void)boundStyle->UnbindSubtreeStyles(oldTplRoot.Get());
             }
-            (void)RemoveChild(oldTplRoot.Get(), boundRegistry_, boundUiHeap_);
+            (void)RemoveChild(oldTplRoot.Get(), boundReg, boundHeap);
             ClearSubtreeTemplatedParent(oldTplRoot.Get(), this);
         }
         mountedTemplate_.reset();
     } else {
         while (firstChild_ != nullptr) {
             IntrusivePtr<UIElement> childRef(firstChild_, true);
-            (void)RemoveChild(firstChild_, boundRegistry_, boundUiHeap_);
+            (void)RemoveChild(firstChild_, boundReg, boundHeap);
             savedLogical.push_back(std::move(childRef));
         }
     }
@@ -3747,8 +3441,8 @@ bool UIElement::ApplyControlTemplate(
     mountedTemplate_ = std::move(data);
 
     tplRoot->SetTemplatedParent(this);
-    NativeHandleRegistry* reg = effDomains ? &effDomains->nativeHandles() : boundRegistry_;
-    ManagedHeap* heap = effDomains ? &effDomains->uiHeap() : boundUiHeap_;
+    NativeHandleRegistry* reg = effDomains ? &effDomains->nativeHandles() : boundReg;
+    ManagedHeap* heap = effDomains ? &effDomains->uiHeap() : boundHeap;
     (void)AddChild(tplRoot.Get(), reg, heap);
 
     // Pre-reserve common host properties so runtime SetValue on host never reallocates sparseProps_
@@ -3767,31 +3461,29 @@ bool UIElement::ApplyControlTemplate(
     EnsureRegisteredInValuePoolSet();
 
     // 2. Mount template instructions, wiring TemplatedParent, BindTemplateParent, PART_* & ContentPresenter
-    const bool mountedOk = MountControlTemplatePackage(
+    const auto mountFn = gMountControlTemplateHook.load(std::memory_order_acquire);
+    const bool mountedOk = mountFn ? mountFn(
         this,
         tplRoot.Get(),
         tplPkg,
         effDomains,
-        bindingEngine ? bindingEngine : boundBindingEngine_,
+        bindingEngine ? bindingEngine : boundBind,
         dataContext,
         eventInterpreter,
         eventAotContext,
         AnimationEngine::IsLiveInstance(animationEngine)
             ? animationEngine
-            : (AnimationEngine::IsLiveInstance(boundAnimationEngine_) ? boundAnimationEngine_ : nullptr));
+            : (AnimationEngine::IsLiveInstance(boundAnim) ? boundAnim : nullptr)) : false;
 
     if (mountedOk && mountedTemplate_) {
         // Host logical UIElement content (and HeaderedContentControl headerElement) inside matching ContentPresenters
         if (!mountedTemplate_->logicalChildren.empty() && !mountedTemplate_->contentPresenters.empty()) {
-            UIElement* hdrLogical = nullptr;
-            if (const auto* hcc = DynamicCast<HeaderedContentControl>()) {
-                hdrLogical = hcc->GetRawHeaderElement();
-            }
-            ContentPresenter* headerCp = nullptr;
-            ContentPresenter* contentCp = nullptr;
+            UIElement* hdrLogical = GetLogicalHeaderElementForTemplate();
+            UIElement* headerCp = nullptr;
+            UIElement* contentCp = nullptr;
             for (const auto& cpRef : mountedTemplate_->contentPresenters) {
                 if (!cpRef) continue;
-                const std::string cs = cpRef->GetContentSource();
+                const std::string cs = cpRef->GetTemplateContentSource();
                 if (cs == "Header") {
                     if (!headerCp) headerCp = cpRef.Get();
                 } else if (cs.empty() || cs == "Content") {
@@ -3816,14 +3508,14 @@ bool UIElement::ApplyControlTemplate(
         RefreshAllTemplateBindings();
         for (const auto& cp : mountedTemplate_->contentPresenters) {
             if (cp) {
-                cp->SyncContentTemplateChild();
+                cp->SyncTemplateContentHost();
             }
         }
     }
 
     applyingControlTemplate_ = false;
-    if (mountedOk && boundStyleEngine_) {
-        boundStyleEngine_->OnElementControlTemplateApplied(this);
+    if (mountedOk && boundStyle) {
+        boundStyle->OnElementControlTemplateApplied(this);
     }
     InvalidateLayout();
     InvalidateRender();
@@ -3857,6 +3549,143 @@ bool SubtreeNeedsContinuousTick(const UIElement* root) noexcept {
             return true;
         }
     }
+    return false;
+}
+
+void UIElement::PopulateAriaInfo(AriaElementInfo& ioInfo) const {
+    ioInfo.role = "group";
+    ioInfo.label = Name();
+    ioInfo.focusable = CanReceiveFocus();
+}
+
+void UIElement::IncrementOpenMenuSubmenuCount() noexcept {
+    gOpenMenuSubmenuCount.fetch_add(1, std::memory_order_acq_rel);
+}
+
+void UIElement::DecrementOpenMenuSubmenuCount() noexcept {
+    std::int32_t cur = gOpenMenuSubmenuCount.load(std::memory_order_acquire);
+    while (cur > 0 &&
+           !gOpenMenuSubmenuCount.compare_exchange_weak(
+               cur, cur - 1, std::memory_order_acq_rel, std::memory_order_acquire)) {
+    }
+}
+
+bool UIElement::HasAnyOpenMenuSubmenu() noexcept {
+    return gOpenMenuSubmenuCount.load(std::memory_order_acquire) > 0;
+}
+
+IntrusivePtr<UIElement> UIElement::CreateRegisteredElement(std::string_view typeName) {
+    if (const auto factory = gCreateElementByTypeHook.load(std::memory_order_acquire)) {
+        return factory(typeName);
+    }
+    return {};
+}
+
+bool UIElement::MountRegisteredPackage(
+    UIElement* rootControl,
+    const AxbPackage& package,
+    ExecutionDomainContext* domains,
+    DualTrackBindingEngine* bindingEngine,
+    ObjectRef dataContext,
+    const Interpreter* eventInterpreter,
+    rs_aot::ExecutionContext* eventAotContext,
+    AnimationEngine* animationEngine) {
+    if (const auto hook = gMountPackageHook.load(std::memory_order_acquire)) {
+        return hook(
+            rootControl,
+            package,
+            domains,
+            bindingEngine,
+            dataContext,
+            eventInterpreter,
+            eventAotContext,
+            animationEngine);
+    }
+    return false;
+}
+
+bool UIElement::DispatchRegisteredRoutedCommandBubble(
+    UIElement* startElement,
+    std::string_view commandName,
+    const UnifiedValue& commandParameter,
+    bool hasCommandParameter) {
+    if (const auto hook = gRoutedCommandHook.load(std::memory_order_acquire)) {
+        return hook(startElement, commandName, commandParameter, hasCommandParameter);
+    }
+    return false;
+}
+
+bool UIElement::MatchesXamlAncestorTypeAlias(std::string_view wantedType) const noexcept {
+    return wantedType == "FrameworkElement" || wantedType == "UIElement";
+}
+
+bool UIElement::MatchesBindingAncestorLegacyFallback(std::string_view targetType) const noexcept {
+    return targetType == "FrameworkElement" || targetType == "Control";
+}
+
+RenderInPlaceResult UIElement::TryUpdateRenderElementInPlace(
+    PagedRenderTree& tree,
+    const PagedRenderTraversalState& curState,
+    Rect r,
+    float boxW,
+    float boxH,
+    float effOpacity) const {
+    (void)tree;
+    (void)curState;
+    (void)r;
+    (void)boxW;
+    (void)boxH;
+    (void)effOpacity;
+    return RenderInPlaceResult::UseDefaultContainer;
+}
+
+bool UIElement::ShouldEmitRenderChild(
+    const UIElement* child,
+    bool& outCollapseSubtree,
+    const UIElement*& outFallbackHeaderOnly) const noexcept {
+    (void)child;
+    outCollapseSubtree = false;
+    outFallbackHeaderOnly = nullptr;
+    return true;
+}
+
+bool UIElement::EmitRenderDropShadowPrimitives(
+    PagedRenderTree& tree,
+    const PagedRenderTraversalState& curState,
+    float effOpacity,
+    float sdx,
+    float sdy,
+    float localBlurR,
+    const Color& shCol,
+    const UIElement* shadowOwner,
+    std::uint16_t& ioEmittedCount) const {
+    (void)tree;
+    (void)curState;
+    (void)effOpacity;
+    (void)sdx;
+    (void)sdy;
+    (void)localBlurR;
+    (void)shCol;
+    (void)shadowOwner;
+    (void)ioEmittedCount;
+    return false;
+}
+
+bool UIElement::EmitRenderVisualPrimitives(
+    PagedRenderTree& tree,
+    const PagedRenderTraversalState& curState,
+    Rect r,
+    float w,
+    float h,
+    float effOpacity,
+    std::uint16_t& ioEmittedCount) const {
+    (void)tree;
+    (void)curState;
+    (void)r;
+    (void)w;
+    (void)h;
+    (void)effOpacity;
+    (void)ioEmittedCount;
     return false;
 }
 

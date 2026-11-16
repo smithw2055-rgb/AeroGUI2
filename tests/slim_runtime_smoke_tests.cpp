@@ -7,8 +7,9 @@
 #include <vector>
 
 #include "aero/animation/AnimationEngine.hpp"
+#include "aero/asset/AxbFormat.hpp"
+#include "aero/asset/AxbTemplateRegistry.hpp"
 #include "aero/binding/DualTrackBindingEngine.hpp"
-#include "aero/compiler/AxbFormat.hpp"
 #include "aero/controls/Controls.hpp"
 #include "aero/core/DependencyProperty.hpp"
 #include "aero/core/UIElement.hpp"
@@ -213,18 +214,25 @@ void TestSlimRuntimePhase5BInteractiveControlsAndRouterNoRtti() {
     auto pb = aero::CreateElementByTypeName("PasswordBox");
     auto co = aero::CreateElementByTypeName("ComboBox");
 
-    AERO_SLIM_CHECK(cb && cb->IsA<aero::CheckBox>() && cb->IsA<aero::Button>(),
+    AERO_SLIM_CHECK(cb && cb->IsA<aero::CheckBox>() && cb->IsA<aero::ToggleButton>() &&
+                        cb->IsA<aero::ButtonBase>() && !cb->IsA<aero::Button>(),
                     "CheckBox Euler-tour RTTI under -fno-rtti");
-    AERO_SLIM_CHECK(rb && rb->IsA<aero::RadioButton>() && rb->IsA<aero::Button>(),
+    AERO_SLIM_CHECK(rb && rb->IsA<aero::RadioButton>() && rb->IsA<aero::ToggleButton>() &&
+                        rb->IsA<aero::ButtonBase>() && !rb->IsA<aero::Button>(),
                     "RadioButton Euler-tour RTTI under -fno-rtti");
     AERO_SLIM_CHECK(sl && sl->IsA<aero::Slider>(),
                     "Slider Euler-tour RTTI under -fno-rtti");
-    AERO_SLIM_CHECK(tb && tb->IsA<aero::TextBox>() && tb->IsA<aero::TextBlock>(),
+    AERO_SLIM_CHECK(tb && tb->IsA<aero::TextBox>() && tb->IsA<aero::TextBoxBase>() &&
+                        !tb->IsA<aero::TextBlock>(),
                     "TextBox Euler-tour RTTI under -fno-rtti");
-    AERO_SLIM_CHECK(pb && pb->IsA<aero::PasswordBox>() && pb->IsA<aero::TextBox>(),
+    AERO_SLIM_CHECK(pb && pb->IsA<aero::PasswordBox>() && pb->IsA<aero::TextBoxBase>() &&
+                        !pb->IsA<aero::TextBox>() && !pb->IsA<aero::TextBlock>(),
                     "PasswordBox Euler-tour RTTI under -fno-rtti");
     AERO_SLIM_CHECK(co && co->IsA<aero::ComboBox>() && co->IsA<aero::ItemsControl>(),
                     "ComboBox Euler-tour RTTI under -fno-rtti");
+    AERO_SLIM_CHECK(aero::TypeRegistry::Instance().FindByName("FrameworkElement") ==
+                        aero::UIElement::StaticTypeClass(),
+                    "FrameworkElement type alias resolves to UIElement");
 
     auto root = aero::MakeIntrusive<aero::StackPanel>();
     root->SetWidth(240.0f);

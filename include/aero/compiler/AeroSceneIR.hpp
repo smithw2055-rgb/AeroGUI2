@@ -8,7 +8,7 @@
 #include <vector>
 
 #include "aero/animation/AnimationEngine.hpp"
-#include "aero/compiler/AxbFormat.hpp"
+#include "aero/asset/AxbFormat.hpp"
 #include "aero/core/DependencyProperty.hpp"
 #include "aero/core/UIElement.hpp"
 #include "aero/core/UnifiedValue.hpp"

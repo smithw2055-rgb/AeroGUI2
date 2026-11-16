@@ -5,13 +5,12 @@
 #include <cstdint>
 #include <string_view>
 
-#include "aero/controls/Controls.hpp"
 #include "aero/core/DependencyProperty.hpp"
 #include "aero/core/UIElement.hpp"
+#include "aero/input/TextInputMethod.hpp"
 
 namespace aero {
 
-class ITextInputMethodHost;
 class AnimationEngine;
 class StyleTriggerEngine;
 
@@ -114,7 +113,7 @@ public:
     [[nodiscard]] UIElement* CapturedElement() const noexcept { return capturedElement_.Get(); }
     [[nodiscard]] UIElement* HoveredElement() const noexcept { return hoveredElement_.Get(); }
     [[nodiscard]] UIElement* FocusedElement() const noexcept { return focusedElement_.Get(); }
-    [[nodiscard]] ComboBox* ActiveOpenComboBox() const noexcept { return openComboBox_.Get(); }
+    [[nodiscard]] UIElement* ActiveOpenComboBox() const noexcept { return openComboBox_.Get(); }
     [[nodiscard]] Point LastPointerPosition() const noexcept { return lastPointerPos_; }
 
     // Focus management & keyboard/gamepad navigation
@@ -146,10 +145,10 @@ private:
     IntrusivePtr<UIElement> hoveredElement_{};
     IntrusivePtr<UIElement> capturedElement_{};
     IntrusivePtr<UIElement> focusedElement_{};
-    IntrusivePtr<ComboBox> openComboBox_{};
-    IntrusivePtr<ContextMenu> openContextMenu_{};
-    IntrusivePtr<ToolTip> activeToolTip_{};
-    IntrusivePtr<ToolTip> retiredAutoToolTip_{};
+    IntrusivePtr<UIElement> openComboBox_{};
+    IntrusivePtr<UIElement> openContextMenu_{};
+    IntrusivePtr<UIElement> activeToolTip_{};
+    IntrusivePtr<UIElement> retiredAutoToolTip_{};
     IntrusivePtr<UIElement> activeToolTipOwner_{};
     bool isDraggingBehavior_ = false;
     bool dragConstrainToParent_ = false;

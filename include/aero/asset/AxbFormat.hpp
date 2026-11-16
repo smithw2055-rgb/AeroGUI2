@@ -11,6 +11,10 @@
 #include <utility>
 #include <vector>
 
+#include "aero/asset/GradientBrush.hpp"
+#include "aero/asset/MtsdfPathBaker.hpp"
+#include "aero/asset/RiveDecoder.hpp"
+#include "aero/asset/ValueConverters.hpp"
 #include "aero/core/DependencyProperty.hpp"
 #include "aero/core/RsAliases.hpp"
 #include "aero/core/UnifiedValue.hpp"
@@ -28,17 +32,6 @@ enum class BindingMode : std::uint8_t {
     OneWay = 0,
     TwoWay = 1,
     OneTime = 2,
-};
-
-enum class ValueConverterKind : std::uint8_t {
-    None = 0,
-    BooleanToVisibility = 1,
-    InverseBooleanToVisibility = 2,
-    InverseBoolean = 3,
-    NullToCollapsed = 4,
-    NullToBoolean = 5,
-    MathExpression = 6,
-    CustomScriptOrHost = 7,
 };
 
 enum class AxbOpcode : std::uint8_t {
@@ -61,99 +54,6 @@ enum AxbResourceLookupFlags : std::uint8_t {
     AxbResourceFlag_DynamicResource = 0x02u,
     AxbResourceFlag_Loc = 0x04u,
 };
-
-// ============================================================================
-// P1-3: Multi-Stop LinearGradientBrush & RadialGradientBrush Registry + 1D LUT
-// ============================================================================
-
-enum class GradientBrushKind : std::uint8_t {
-    Linear = 0,
-    Radial = 1,
-    Conic = 2,
-};
-
-enum class BrushMappingMode : std::uint8_t {
-    RelativeToBoundingBox = 0,
-    Absolute = 1,
-};
-
-enum class GradientSpreadMethod : std::uint8_t {
-    Pad = 0,
-    Reflect = 1,
-    Repeat = 2,
-};
-
-struct GradientStop {
-    float offset = 0.0f;
-    Color color{0.0f, 0.0f, 0.0f, 1.0f};
-};
-
-struct GradientBrushDesc {
-    static constexpr std::uint32_t kLutWidth = 256u;
-
-    std::uint32_t brushId = 0u;
-    GradientBrushKind kind = GradientBrushKind::Linear;
-    BrushMappingMode mappingMode = BrushMappingMode::RelativeToBoundingBox;
-    GradientSpreadMethod spreadMethod = GradientSpreadMethod::Pad;
-    float opacity = 1.0f;
-    // LinearGradientBrush endpoints (default XAML diagonal 0,0 -> 1,1)
-    Point startPoint{0.0f, 0.0f};
-    Point endPoint{1.0f, 1.0f};
-    // RadialGradientBrush ellipse center, focal origin & radii (default 0.5,0.5, rx=0.5, ry=0.5)
-    Point center{0.5f, 0.5f};
-    Point gradientOrigin{0.5f, 0.5f};
-    float radiusX = 0.5f;
-    float radiusY = 0.5f;
-    std::vector<GradientStop> stops;
-    // Pre-baked 256-texel RGBA8 1D ramp for O(1) GPU LUT row upload & CPU bilinear evaluation
-    std::array<std::uint8_t, kLutWidth * 4u> bakedRampRgba8{};
-};
-
-void BakeGradientBrushRamp(GradientBrushDesc& ioBrush) noexcept;
-[[nodiscard]] Color SampleGradientRampAtT(
-    const GradientBrushDesc& brush,
-    float rawT) noexcept;
-[[nodiscard]] Color EvaluateGradientBrushAtNormalizedUv(
-    const GradientBrushDesc& brush,
-    float normU,
-    float normV,
-    float quadWidthPx = 1.0f,
-    float quadHeightPx = 1.0f) noexcept;
-[[nodiscard]] std::string SerializeGradientBrushSpec(const GradientBrushDesc& brush);
-[[nodiscard]] bool IsGradientBrushSpec(std::string_view raw) noexcept;
-[[nodiscard]] bool TryDeserializeGradientBrushSpec(
-    std::string_view raw,
-    GradientBrushDesc& outBrush);
-
-class GradientBrushRegistry {
-public:
-    static constexpr std::uint32_t kMaxBrushId = 4095u;
-
-    static GradientBrushRegistry& Instance() noexcept;
-
-    GradientBrushRegistry() noexcept = default;
-    ~GradientBrushRegistry() = default;
-
-    GradientBrushRegistry(const GradientBrushRegistry&) = delete;
-    GradientBrushRegistry& operator=(const GradientBrushRegistry&) = delete;
-
-    std::uint32_t RegisterBrush(GradientBrushDesc desc);
-    std::uint32_t RegisterOrResolveSpec(std::string_view serializedSpec);
-    [[nodiscard]] const GradientBrushDesc* Find(std::uint32_t brushId) const noexcept;
-    [[nodiscard]] std::size_t BrushCount() const noexcept;
-    [[nodiscard]] std::uint32_t Revision() const noexcept;
-    void Clear() noexcept;
-
-private:
-    mutable std::mutex mutex_;
-    std::vector<GradientBrushDesc> brushes_;
-    std::unordered_map<std::string, std::uint32_t> specToId_;
-    std::uint32_t revision_ = 1u;
-};
-
-[[nodiscard]] std::string ConvertPointsToSvgPath(
-    std::string_view rawPoints,
-    bool closePath);
 
 // ============================================================================
 // Phase 5C & 5D: Easing Curves, Storyboards, Data/Event Triggers & Templates
@@ -542,58 +442,6 @@ struct AxbInstruction {
     UnifiedValue literalValue{};
 };
 
-// Offline / on-demand 4-channel MTSDF (Multi-channel + True Signed Distance Field)
-// atlas entry for SVG <Path Data="M..."/> & <Geometry> vector icons.
-struct AxbMtsdfPathEntry {
-    std::uint64_t pathHash = 0;
-    float boundsX = 0.0f;
-    float boundsY = 0.0f;
-    float boundsW = 32.0f;
-    float boundsH = 32.0f;
-    float u0 = 0.0f;
-    float v0 = 0.0f;
-    float u1 = 1.0f;
-    float v1 = 1.0f;
-    std::uint16_t atlasWidth = 256;
-    std::uint16_t atlasHeight = 256;
-    std::uint16_t cellWidth = 32;
-    std::uint16_t cellHeight = 32;
-    float pxRange = 4.0f;
-    // 4-channel RGBA8 MTSDF cell (R,G,B = corner-preserving directional SDF, A = true Euclidean SDF)
-    std::vector<std::uint8_t> mtsdfRgbaPixels;
-    // Cached per-row non-zero RGB bounds (transient runtime cache; not serialized into .axb4)
-    std::vector<std::int16_t> rowMinX;
-    std::vector<std::int16_t> rowMaxX;
-
-    void ComputeRowBounds() noexcept {
-        if (cellWidth == 0u || cellHeight == 0u ||
-            mtsdfRgbaPixels.size() < static_cast<std::size_t>(cellWidth) * cellHeight * 4u) {
-            rowMinX.clear();
-            rowMaxX.clear();
-            return;
-        }
-        const int cw = static_cast<int>(cellWidth);
-        const int ch = static_cast<int>(cellHeight);
-        rowMinX.resize(static_cast<std::size_t>(ch));
-        rowMaxX.resize(static_cast<std::size_t>(ch));
-        const std::uint8_t* mBase = mtsdfRgbaPixels.data();
-        for (int ry = 0; ry < ch; ++ry) {
-            const std::uint8_t* rPtr = mBase + static_cast<std::size_t>(ry) * static_cast<std::size_t>(cw) * 4u;
-            std::int16_t rMin = static_cast<std::int16_t>(cw);
-            std::int16_t rMax = -1;
-            for (int rx = 0; rx < cw; ++rx) {
-                const std::uint8_t* p = rPtr + static_cast<std::size_t>(rx) * 4u;
-                if ((p[0] | p[1] | p[2]) != 0u) {
-                    if (rx < rMin) rMin = static_cast<std::int16_t>(rx);
-                    rMax = static_cast<std::int16_t>(rx);
-                }
-            }
-            rowMinX[static_cast<std::size_t>(ry)] = rMin;
-            rowMaxX[static_cast<std::size_t>(ry)] = rMax;
-        }
-    }
-};
-
 struct AxbDataTemplate {
     std::string key;
     std::string dataTypeName;
@@ -857,38 +705,15 @@ struct AxbPackage {
         std::string* errorMessage = nullptr);
 };
 
-// Runtime-accessible property literal helpers & SVG Path -> 4-channel MTSDF baker
+// Runtime-accessible property literal helpers
 [[nodiscard]] std::uint16_t ResolveBuiltinPropertyId(std::string_view propertyName) noexcept;
 [[nodiscard]] std::uint16_t ResolveTriggerConditionPropertyId(std::string_view propertyName) noexcept;
 [[nodiscard]] std::uint16_t ResolveAnimationTargetPropertyId(std::string_view targetPropertyPath) noexcept;
 [[nodiscard]] float ParseXamlTimeSpanSeconds(std::string_view rawTimeSpan, float fallbackSeconds = 0.0f) noexcept;
 [[nodiscard]] EasingFunctionKind ParseEasingFunctionKind(std::string_view tagName) noexcept;
 [[nodiscard]] EasingMode ParseEasingMode(std::string_view rawMode) noexcept;
-[[nodiscard]] ValueConverterKind ParseValueConverterKind(std::string_view rawConverterKey) noexcept;
 [[nodiscard]] TriggerComparisonOp ParseTriggerComparisonOp(std::string_view rawOp) noexcept;
 [[nodiscard]] ControlStoryboardOption ParseControlStoryboardOption(std::string_view rawOpt) noexcept;
-[[nodiscard]] UnifiedValue ApplyBuiltinValueConverter(
-    ValueConverterKind kind,
-    const UnifiedValue& rawVal,
-    bool inverseForTwoWay = false) noexcept;
-
-// P1-4: Zero-exception 32-bit float recursive-descent MathConverter expression evaluator
-// Supports {0}..{8}, @VALUE, @PARAMETER, + - * / %, unary + - !, (), < <= > >= == != && || ? :,
-// and min/max/abs/clamp/floor/ceil/round/pow/sqrt/sin/cos/tan/lerp/sign.
-[[nodiscard]] bool EvaluateMathConverterExpression(
-    std::string_view expression,
-    const UnifiedValue* args,
-    std::size_t argCount,
-    float parameterValue,
-    float& outResult) noexcept;
-
-// P1-4: Zero-exception StringFormat engine supporting {0}..{8} placeholders & numeric specifiers
-// (0, 00, 000, F0, F1, F2, P0, G, C2, #,.##, standalone specifiers like "F1", and escaped {{ / }}).
-[[nodiscard]] std::string FormatBindingString(
-    std::string_view formatSpec,
-    const UnifiedValue* args,
-    std::size_t argCount,
-    const ExecutionDomainContext* domains = nullptr);
 
 [[nodiscard]] RoutedTriggerEvent ParseRoutedTriggerEvent(
     std::string_view rawRoutedEvent,
@@ -904,34 +729,6 @@ struct AxbPackage {
 [[nodiscard]] rs_rt::NativeHandleRegistry& FallbackVisualHandleRegistry() noexcept;
 [[nodiscard]] Matrix2D ParseXamlMatrix2DLiteral(std::string_view raw) noexcept;
 [[nodiscard]] std::string DecodeXamlXmlEntities(std::string_view raw);
-
-[[nodiscard]] std::uint64_t ComputeSvgPathHash(std::string_view pathData) noexcept;
-[[nodiscard]] Rect MeasureSvgPathBounds(std::string_view pathData);
-[[nodiscard]] std::uint16_t SelectAdaptiveMtsdfCellSize(
-    std::string_view pathData,
-    float designMaxSpanPx = 32.0f,
-    float* outRecommendedPxRange = nullptr) noexcept;
-[[nodiscard]] AxbMtsdfPathEntry BakeSvgPathToMtsdfEntry(
-    std::string_view pathData,
-    std::uint16_t cellSize = 32,
-    float pxRange = 4.0f,
-    std::uint16_t atlasSlotIndex = 0,
-    std::uint16_t atlasSize = 512);
-void PackMtsdfAtlasSkyline(
-    std::vector<AxbMtsdfPathEntry>& ioEntries,
-    std::uint16_t atlasSize = 512) noexcept;
-
-// P1-5: Real Rive v7 LEB128 binary .riv stream detection & runtime/compiler decoding to AxbPackage
-[[nodiscard]] bool IsRiveBinaryStream(
-    const std::uint8_t* rawBytes,
-    std::size_t byteLength) noexcept;
-
-[[nodiscard]] bool DecodeRiveBinaryToAxbPackage(
-    const std::uint8_t* rawBytes,
-    std::size_t byteLength,
-    AxbPackage& outPackage,
-    std::vector<std::string>* outDiagnostics = nullptr,
-    std::string_view artboardNameHint = {});
 
 struct DecomposedTransform2D {
     float translateX = 0.0f;

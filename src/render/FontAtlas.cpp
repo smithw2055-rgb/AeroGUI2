@@ -6,8 +6,9 @@
 #include <cstring>
 #include <fstream>
 
-#include "aero/compiler/AxbFormat.hpp"
-#include "aero/core/UiResourceContext.hpp"
+#include "aero/asset/AxbFormat.hpp"
+#include "aero/asset/AxbTemplateRegistry.hpp"
+#include "aero/core/UIResourceContext.hpp"
 
 namespace aero {
 
@@ -1646,7 +1647,7 @@ bool TrueTypeFontFace::ExtractGlyphOutline(
 // ============================================================================
 
 FontAtlas& FontAtlas::Instance() noexcept {
-    return UiResourceContext::Current().Fonts();
+    return UIResourceContext::Current().Fonts();
 }
 
 FontAtlas::FontAtlas(std::uint16_t atlasSize)

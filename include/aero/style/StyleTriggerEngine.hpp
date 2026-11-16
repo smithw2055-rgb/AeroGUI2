@@ -11,7 +11,7 @@
 
 #include "aero/animation/AnimationEngine.hpp"
 #include "aero/binding/DualTrackBindingEngine.hpp"
-#include "aero/compiler/AxbFormat.hpp"
+#include "aero/asset/AxbFormat.hpp"
 #include "aero/core/DependencyProperty.hpp"
 #include "aero/core/UIElement.hpp"
 
@@ -183,7 +183,6 @@ private:
     void ExecuteSingleInteractionAction(
         std::size_t instIdx,
         AxbInteractionAction& action);
-    [[nodiscard]] static bool HasFocusedDescendant(const UIElement* elem) noexcept;
     [[nodiscard]] static bool IsFastInlineAtDefault(const UIElement* elem, std::uint16_t propId) noexcept;
 
     void EnsurePropertySnapshotSlot(

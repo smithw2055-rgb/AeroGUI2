@@ -4,10 +4,11 @@
 #include <cmath>
 #include <cstring>
 
-#include "aero/controls/Controls.hpp"
+#include "aero/asset/AxbFormat.hpp"
+#include "aero/asset/AxbTemplateRegistry.hpp"
 #include "aero/render/FontAtlas.hpp"
 #include "aero/render/ImageAtlas.hpp"
-#include "aero/core/UiResourceContext.hpp"
+#include "aero/core/UIResourceContext.hpp"
 #include <condition_variable>
 #include <functional>
 #include <thread>
@@ -40,10 +41,10 @@ public:
             bandFn(0, totalHeight);
             return;
         }
-        UiResourceContext* const callerResourceCtx = UiResourceContext::ActiveOverride();
+        UIResourceContext* const callerResourceCtx = UIResourceContext::ActiveOverride();
         const int step = (totalHeight + 3) / 4;
         std::function<void(int)> taskFn = [&](int bandIdx) {
-            ScopedUiResourceContext workerCtxScope(bandIdx > 0 ? callerResourceCtx : nullptr);
+            ScopedUIResourceContext workerCtxScope(bandIdx > 0 ? callerResourceCtx : nullptr);
             const int y0 = bandIdx * step;
             const int y1 = std::min(totalHeight, y0 + step);
             if (y0 < y1) {

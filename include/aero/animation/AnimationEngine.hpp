@@ -9,7 +9,7 @@
 #include <string_view>
 #include <vector>
 
-#include "aero/compiler/AxbFormat.hpp"
+#include "aero/asset/AxbFormat.hpp"
 #include "aero/core/DependencyProperty.hpp"
 #include "aero/core/UIElement.hpp"
 

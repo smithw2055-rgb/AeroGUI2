@@ -1,5 +1,5 @@
 #include "aero/render/ImageAtlas.hpp"
-#include "aero/core/UiResourceContext.hpp"
+#include "aero/core/UIResourceContext.hpp"
 
 #include <algorithm>
 #include <array>
@@ -2654,7 +2654,7 @@ ImageStretchPlacement ComputeImageStretchPlacement(
 // ============================================================================
 
 ImageAtlas& ImageAtlas::Instance() noexcept {
-    return UiResourceContext::Current().Images();
+    return UIResourceContext::Current().Images();
 }
 
 ImageAtlas::ImageAtlas() noexcept = default;

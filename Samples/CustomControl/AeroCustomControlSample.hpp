@@ -50,9 +50,9 @@ struct CustomControlSamplePropIds {
     return ids;
 }
 
-class DateTimeControl : public Panel {
+class DateTimeControl : public Control {
 public:
-    DateTimeControl() noexcept = default;
+    DateTimeControl() = default;
 
     [[nodiscard]] bool GetUseSystemTime() const noexcept {
         const auto& ids = GetCustomControlSamplePropIds();
@@ -336,9 +336,9 @@ private:
     bool hasExplicitStrokeThickness_ = false;
 };
 
-class RadialNeedleControl : public Panel {
+class RadialNeedleControl : public Control {
 public:
-    RadialNeedleControl() noexcept {
+    RadialNeedleControl() {
         (void)SetValue(
             PropId_RenderTransformOrigin,
             Float4Value{0.5f, 0.5f, 0.0f, 0.0f},
@@ -351,12 +351,12 @@ public:
 
     Size MeasureCore(Size availableSize) noexcept override {
         SyncRotateTransformFromChildState();
-        return Panel::MeasureCore(availableSize);
+        return Control::MeasureCore(availableSize);
     }
 
     void ArrangeCore(Rect finalRect) noexcept override {
         SyncRotateTransformFromChildState();
-        Panel::ArrangeCore(finalRect);
+        Control::ArrangeCore(finalRect);
     }
 
     [[nodiscard]] float GetComputedAngle() const noexcept {
@@ -374,7 +374,7 @@ public:
     }
 
     void OnPropertyChanged(std::uint16_t propId, const UnifiedValue& newValue) override {
-        Panel::OnPropertyChanged(propId, newValue);
+        Control::OnPropertyChanged(propId, newValue);
         if (updatingAngle_) {
             return;
         }
@@ -483,16 +483,16 @@ private:
     bool updatingAngle_ = false;
 };
 
-[[nodiscard]] inline std::shared_ptr<UIElement> CreateDateTimeControl() {
-    return std::make_shared<DateTimeControl>();
+[[nodiscard]] inline IntrusivePtr<UIElement> CreateDateTimeControl() {
+    return MakeIntrusive<DateTimeControl>();
 }
 
-[[nodiscard]] inline std::shared_ptr<UIElement> CreateRadialTicksControl() {
-    return std::make_shared<RadialTicksControl>();
+[[nodiscard]] inline IntrusivePtr<UIElement> CreateRadialTicksControl() {
+    return MakeIntrusive<RadialTicksControl>();
 }
 
-[[nodiscard]] inline std::shared_ptr<UIElement> CreateRadialNeedleControl() {
-    return std::make_shared<RadialNeedleControl>();
+[[nodiscard]] inline IntrusivePtr<UIElement> CreateRadialNeedleControl() {
+    return MakeIntrusive<RadialNeedleControl>();
 }
 
 inline void RegisterCustomControlSampleTypes() {

@@ -1,7 +1,6 @@
-#include "aero/bridge/ScriptUiBridge.hpp"
+#include "aero/bridge/ScriptUIBridge.hpp"
 
 #include <algorithm>
-#include <cctype>
 #include <cmath>
 #include <cstdio>
 #include <mutex>
@@ -11,9 +10,11 @@
 #include <vector>
 
 #include "aero/animation/AnimationEngine.hpp"
-#include "aero/compiler/AxbFormat.hpp"
+#include "aero/asset/AxbFormat.hpp"
+#include "aero/asset/AxbTemplateRegistry.hpp"
 #include "aero/controls/Controls.hpp"
-#include "aero/core/UiResourceContext.hpp"
+#include "aero/core/StringUtils.hpp"
+#include "aero/core/UIResourceContext.hpp"
 #include "aero/style/StyleTriggerEngine.hpp"
 #include "realscript/aot_cpp/AotRuntime.h"
 
@@ -21,18 +22,14 @@ namespace aero {
 
 namespace {
 
-[[nodiscard]] bool EqualsAsciiIgnoreCase(std::string_view a, std::string_view b) noexcept {
-    if (a.size() != b.size()) {
-        return false;
-    }
-    for (std::size_t i = 0u; i < a.size(); ++i) {
-        if (std::tolower(static_cast<unsigned char>(a[i])) !=
-            std::tolower(static_cast<unsigned char>(b[i]))) {
-            return false;
-        }
-    }
-    return true;
+void EnsureDomainCleanupHookRegistered() noexcept {
+    DualTrackBindingEngine::RegisterDomainCleanupHook(&ClearScriptUiDomainState);
 }
+
+[[maybe_unused]] const bool gDomainCleanupHookRegistered = []() noexcept {
+    EnsureDomainCleanupHookRegistered();
+    return true;
+}();
 
 struct PendingScriptUiState {
     struct DcEntry {
@@ -313,21 +310,16 @@ struct PendingScriptUiState {
 };
 
 [[nodiscard]] std::uint16_t ResolveSdkPropertyIdByName(std::string_view propName) noexcept {
-    while (!propName.empty() && std::isspace(static_cast<unsigned char>(propName.front()))) {
-        propName.remove_prefix(1u);
-    }
-    while (!propName.empty() && std::isspace(static_cast<unsigned char>(propName.back()))) {
-        propName.remove_suffix(1u);
-    }
+    propName = str::Trim(propName);
     if (propName.empty()) {
         return 0xFFFFu;
     }
-    if (EqualsAsciiIgnoreCase(propName, "Width")) return PropId_Width;
-    if (EqualsAsciiIgnoreCase(propName, "Height")) return PropId_Height;
-    if (EqualsAsciiIgnoreCase(propName, "Value")) return PropId_Value;
-    if (EqualsAsciiIgnoreCase(propName, "Minimum") || EqualsAsciiIgnoreCase(propName, "MinValue")) return PropId_Minimum;
-    if (EqualsAsciiIgnoreCase(propName, "Maximum") || EqualsAsciiIgnoreCase(propName, "MaxValue")) return PropId_Maximum;
-    if (EqualsAsciiIgnoreCase(propName, "SmallChange") || EqualsAsciiIgnoreCase(propName, "StepValue")) return PropId_SmallChange;
+    if (str::EqualsIgnoreCase(propName, "Width")) return PropId_Width;
+    if (str::EqualsIgnoreCase(propName, "Height")) return PropId_Height;
+    if (str::EqualsIgnoreCase(propName, "Value")) return PropId_Value;
+    if (str::EqualsIgnoreCase(propName, "Minimum") || str::EqualsIgnoreCase(propName, "MinValue")) return PropId_Minimum;
+    if (str::EqualsIgnoreCase(propName, "Maximum") || str::EqualsIgnoreCase(propName, "MaxValue")) return PropId_Maximum;
+    if (str::EqualsIgnoreCase(propName, "SmallChange") || str::EqualsIgnoreCase(propName, "StepValue")) return PropId_SmallChange;
     const std::uint16_t builtin = ResolveBuiltinPropertyId(propName);
     if (builtin != 0xFFFFu && builtin != 0u) {
         return builtin;
@@ -505,21 +497,21 @@ void AttachStyleEngineAcrossSubtree(UIElement* subtreeRoot, StyleTriggerEngine* 
 }
 
 [[nodiscard]] std::optional<Color> ResolveThemeAccentColor(std::string_view accentName) noexcept {
-    if (EqualsAsciiIgnoreCase(accentName, "Red")) return MakeHexColor(0xDE2B10FFu);
-    if (EqualsAsciiIgnoreCase(accentName, "Green")) return MakeHexColor(0x2AA60CFFu);
-    if (EqualsAsciiIgnoreCase(accentName, "Blue")) return MakeHexColor(0x1098DFFFu);
-    if (EqualsAsciiIgnoreCase(accentName, "Orange") || EqualsAsciiIgnoreCase(accentName, "Amber")) {
+    if (str::EqualsIgnoreCase(accentName, "Red")) return MakeHexColor(0xDE2B10FFu);
+    if (str::EqualsIgnoreCase(accentName, "Green")) return MakeHexColor(0x2AA60CFFu);
+    if (str::EqualsIgnoreCase(accentName, "Blue")) return MakeHexColor(0x1098DFFFu);
+    if (str::EqualsIgnoreCase(accentName, "Orange") || str::EqualsIgnoreCase(accentName, "Amber")) {
         return MakeHexColor(0xDF9910FFu);
     }
-    if (EqualsAsciiIgnoreCase(accentName, "Emerald")) return MakeHexColor(0x10DE62FFu);
-    if (EqualsAsciiIgnoreCase(accentName, "Purple") ||
-        EqualsAsciiIgnoreCase(accentName, "Violet") ||
-        EqualsAsciiIgnoreCase(accentName, "Indigo")) {
+    if (str::EqualsIgnoreCase(accentName, "Emerald")) return MakeHexColor(0x10DE62FFu);
+    if (str::EqualsIgnoreCase(accentName, "Purple") ||
+        str::EqualsIgnoreCase(accentName, "Violet") ||
+        str::EqualsIgnoreCase(accentName, "Indigo")) {
         return MakeHexColor(0x894EEDFFu);
     }
-    if (EqualsAsciiIgnoreCase(accentName, "Crimson")) return MakeHexColor(0xDE1043FFu);
-    if (EqualsAsciiIgnoreCase(accentName, "Lime")) return MakeHexColor(0x99DF10FFu);
-    if (EqualsAsciiIgnoreCase(accentName, "Aqua") || EqualsAsciiIgnoreCase(accentName, "Cyan")) {
+    if (str::EqualsIgnoreCase(accentName, "Crimson")) return MakeHexColor(0xDE1043FFu);
+    if (str::EqualsIgnoreCase(accentName, "Lime")) return MakeHexColor(0x99DF10FFu);
+    if (str::EqualsIgnoreCase(accentName, "Aqua") || str::EqualsIgnoreCase(accentName, "Cyan")) {
         return MakeHexColor(0x10DDDFFFu);
     }
     return std::nullopt;
@@ -532,24 +524,8 @@ void UnregisterScriptWrapperOnElementDestroy(const UIElement* elem) noexcept {
 } // namespace
 
 void DispatchLoadedToRegisteredDescendants(UIElement* root, bool skipNestedUserControls) {
-    if (!root) return;
-    std::vector<IntrusivePtr<UIElement>> queue;
-    for (UIElement* c = root->FirstChild(); c != nullptr; c = c->NextSibling()) {
-        queue.emplace_back(c, true);
-    }
-    for (std::size_t i = 0u; i < queue.size(); ++i) {
-        UIElement* cur = queue[i].Get();
-        if (!cur) continue;
-        const bool isNestedUc = skipNestedUserControls && (cur->DynamicCast<UserControl>() != nullptr);
-        if (isNestedUc) {
-            continue;
-        }
-        if (cur->HasRegisteredScriptWrapper()) {
-            (void)cur->DispatchWrapperRoutedEvent("Loaded");
-        }
-        for (UIElement* ch = cur->FirstChild(); ch != nullptr; ch = ch->NextSibling()) {
-            queue.emplace_back(ch, true);
-        }
+    if (root) {
+        root->DispatchLoadedSubtree(skipNestedUserControls);
     }
 }
 
@@ -743,6 +719,7 @@ void SetPendingMainWindowMountTarget(
     const ExecutionDomainContext* domains,
     UIElement* rootControl,
     const AxbPackage* package) {
+    EnsureDomainCleanupHookRegistered();
     PendingScriptUiState::Instance().SetPendingMountTarget(domains, rootControl, package);
 }
 
@@ -756,6 +733,7 @@ void ClearScriptUiDomainState(const ExecutionDomainContext* domains) noexcept {
 
 void SetActiveApplicationObject(const ExecutionDomainContext* domains, ObjectRef appObj) {
     if (!domains) return;
+    EnsureDomainCleanupHookRegistered();
     std::lock_guard<std::mutex> lock(PendingScriptUiState::Instance().mutex);
     if (appObj.valid()) {
         PendingScriptUiState::Instance().appInstances[domains] = appObj;
@@ -775,15 +753,16 @@ bool MountAndWireMainWindow(
     rs_aot::ExecutionContext* aotContext,
     AnimationEngine* animationEngine,
     ObjectRef* outViewModelRef) {
+    EnsureDomainCleanupHookRegistered();
     if (!rootControl) {
         return false;
     }
 
-    std::shared_ptr<UiResourceContext> domainCtx =
-        !UiResourceContext::HasActiveThreadOverride()
-            ? UiResourceContext::FindForDomains(&domains)
+    std::shared_ptr<UIResourceContext> domainCtx =
+        !UIResourceContext::HasActiveThreadOverride()
+            ? UIResourceContext::FindForDomains(&domains)
             : nullptr;
-    ScopedUiResourceContext ctxGuard(std::move(domainCtx));
+    ScopedUIResourceContext ctxGuard(std::move(domainCtx));
 
     const ProgramImage* program = bindingEngine.Program();
     if (program) {
@@ -1023,29 +1002,33 @@ IntrusivePtr<UIElement> MountAndWireMainWindow(
     return root;
 }
 
-ScriptUiBridge::ScriptUiBridge(
+ScriptUIBridge::ScriptUIBridge(
     ExecutionDomainContext& domains,
     const ProgramImage* program,
     const Interpreter* uiInterpreter)
     : domains_(domains)
     , ownedEngine_(std::make_unique<DualTrackBindingEngine>(domains, program, uiInterpreter))
     , engine_(ownedEngine_.get())
-    , sharedEngineSlot_(std::make_shared<DualTrackBindingEngine*>(engine_)) {}
+    , sharedEngineSlot_(std::make_shared<DualTrackBindingEngine*>(engine_)) {
+    EnsureDomainCleanupHookRegistered();
+}
 
-ScriptUiBridge::ScriptUiBridge(DualTrackBindingEngine& externalEngine) noexcept
+ScriptUIBridge::ScriptUIBridge(DualTrackBindingEngine& externalEngine) noexcept
     : domains_(externalEngine.Domains())
     , ownedEngine_(nullptr)
     , engine_(&externalEngine)
-    , sharedEngineSlot_(std::make_shared<DualTrackBindingEngine*>(engine_)) {}
+    , sharedEngineSlot_(std::make_shared<DualTrackBindingEngine*>(engine_)) {
+    EnsureDomainCleanupHookRegistered();
+}
 
-ScriptUiBridge::~ScriptUiBridge() noexcept {
+ScriptUIBridge::~ScriptUIBridge() noexcept {
     PendingScriptUiState::Instance().ClearForDomain(&domains_);
     if (sharedEngineSlot_) {
         *sharedEngineSlot_ = nullptr;
     }
 }
 
-void ScriptUiBridge::SetUnderlyingEngine(DualTrackBindingEngine* externalEngine) noexcept {
+void ScriptUIBridge::SetUnderlyingEngine(DualTrackBindingEngine* externalEngine) noexcept {
     if (externalEngine != nullptr) {
         engine_ = externalEngine;
     } else {
@@ -1059,7 +1042,8 @@ void ScriptUiBridge::SetUnderlyingEngine(DualTrackBindingEngine* externalEngine)
     }
 }
 
-void ScriptUiBridge::RegisterCoreUiBindings(BindingRegistry& bindings) {
+void ScriptUIBridge::RegisterCoreUiBindings(BindingRegistry& bindings) {
+    EnsureDomainCleanupHookRegistered();
     auto* handlesPtr = &domains_.nativeHandles();
     auto* uiHeapPtr = &domains_.uiHeap();
     auto* domPtr = &domains_;
@@ -1313,7 +1297,7 @@ void ScriptUiBridge::RegisterCoreUiBindings(BindingRegistry& bindings) {
             }
             auto* elem = UIElement::FromNativeHandle(*handlesPtr, handle);
             std::string pwd;
-            if (const auto* tb = elem ? elem->DynamicCast<TextBox>() : nullptr) {
+            if (const auto* tb = elem ? elem->DynamicCast<TextBoxBase>() : nullptr) {
                 pwd = tb->GetText();
             }
             return uiHeapPtr->allocateString(pwd, &error);
@@ -1335,7 +1319,7 @@ void ScriptUiBridge::RegisterCoreUiBindings(BindingRegistry& bindings) {
                 return UnifiedValue{false};
             }
             auto* elem = UIElement::FromNativeHandle(*handlesPtr, handle);
-            auto* tb = elem ? elem->DynamicCast<TextBox>() : nullptr;
+            auto* tb = elem ? elem->DynamicCast<TextBoxBase>() : nullptr;
             if (!tb) {
                 return UnifiedValue{false};
             }
@@ -1367,11 +1351,11 @@ void ScriptUiBridge::RegisterCoreUiBindings(BindingRegistry& bindings) {
                 return UnifiedValue{false};
             }
 
-            std::shared_ptr<UiResourceContext> domainCtx =
-                !UiResourceContext::HasActiveThreadOverride()
-                    ? UiResourceContext::FindForDomains(domPtr)
+            std::shared_ptr<UIResourceContext> domainCtx =
+                !UIResourceContext::HasActiveThreadOverride()
+                    ? UIResourceContext::FindForDomains(domPtr)
                     : nullptr;
-            ScopedUiResourceContext ctxGuard(std::move(domainCtx));
+            ScopedUIResourceContext ctxGuard(std::move(domainCtx));
 
             DualTrackBindingEngine* bindEng = host->BoundTwoWayEngine();
             StyleTriggerEngine* styleEng = host->BoundStyleEngine();
@@ -1431,7 +1415,7 @@ void ScriptUiBridge::RegisterCoreUiBindings(BindingRegistry& bindings) {
                 subPkg = *cached;
                 haveSubPkg = true;
             } else if (const auto compileFn = GetRuntimeXamlCompileHook()) {
-                const auto searchDirs = UiResourceContext::Current().XamlSearchDirectoriesSnapshot();
+                const auto searchDirs = UIResourceContext::Current().XamlSearchDirectoriesSnapshot();
                 if (compileFn(uri, searchDirs, subPkg)) {
                     AxbTemplateRegistry::Instance().Register(uri, subPkg);
                     haveSubPkg = true;
@@ -1517,11 +1501,11 @@ void ScriptUiBridge::RegisterCoreUiBindings(BindingRegistry& bindings) {
                 return UnifiedValue{false};
             }
             const std::string uri = FormatBindingString({}, &args[1], 1u, domPtr);
-            std::shared_ptr<UiResourceContext> domainCtx =
-                !UiResourceContext::HasActiveThreadOverride()
-                    ? UiResourceContext::FindForDomains(domPtr)
+            std::shared_ptr<UIResourceContext> domainCtx =
+                !UIResourceContext::HasActiveThreadOverride()
+                    ? UIResourceContext::FindForDomains(domPtr)
                     : nullptr;
-            ScopedUiResourceContext ctxGuard(std::move(domainCtx));
+            ScopedUIResourceContext ctxGuard(std::move(domainCtx));
 
             DualTrackBindingEngine* liveEng = (engineSlot && *engineSlot) ? *engineSlot : nullptr;
             const ProgramImage* prog = liveEng ? liveEng->Program() : nullptr;
@@ -1531,7 +1515,7 @@ void ScriptUiBridge::RegisterCoreUiBindings(BindingRegistry& bindings) {
                 strippedUri = strippedUri.substr(slash + 1u);
             }
             if (strippedUri.size() > 5u &&
-                EqualsAsciiIgnoreCase(strippedUri.substr(strippedUri.size() - 5u), ".xaml")) {
+                str::EqualsIgnoreCase(strippedUri.substr(strippedUri.size() - 5u), ".xaml")) {
                 strippedUri.resize(strippedUri.size() - 5u);
             }
 
@@ -1577,7 +1561,7 @@ void ScriptUiBridge::RegisterCoreUiBindings(BindingRegistry& bindings) {
                 if (!pkg && !uri.empty()) {
                     if (const auto compileFn = GetRuntimeXamlCompileHook()) {
                         AxbPackage compiledPkg{};
-                        const auto searchDirs = UiResourceContext::Current().XamlSearchDirectoriesSnapshot();
+                        const auto searchDirs = UIResourceContext::Current().XamlSearchDirectoriesSnapshot();
                         if (compileFn(uri, searchDirs, compiledPkg)) {
                             AxbTemplateRegistry::Instance().Register(
                                 !compiledPkg.className.empty() ? compiledPkg.className : uri,
@@ -1643,7 +1627,7 @@ void ScriptUiBridge::RegisterCoreUiBindings(BindingRegistry& bindings) {
             if (!uri.empty()) {
                 if (const auto compileFn = GetRuntimeXamlCompileHook()) {
                     AxbPackage compiledPkg{};
-                    const auto searchDirs = UiResourceContext::Current().XamlSearchDirectoriesSnapshot();
+                    const auto searchDirs = UIResourceContext::Current().XamlSearchDirectoriesSnapshot();
                     if (compileFn(uri, searchDirs, compiledPkg)) {
                         AxbTemplateRegistry::Instance().Register(uri, compiledPkg);
                         AxbTemplateRegistry::Instance().RegisterResources(compiledPkg);
@@ -1822,11 +1806,11 @@ void ScriptUiBridge::RegisterCoreUiBindings(BindingRegistry& bindings) {
             if (uri.empty()) {
                 return UnifiedValue{false};
             }
-            std::shared_ptr<UiResourceContext> domainCtx =
-                !UiResourceContext::HasActiveThreadOverride()
-                    ? UiResourceContext::FindForDomains(domPtr)
+            std::shared_ptr<UIResourceContext> domainCtx =
+                !UIResourceContext::HasActiveThreadOverride()
+                    ? UIResourceContext::FindForDomains(domPtr)
                     : nullptr;
-            ScopedUiResourceContext ctxGuard(std::move(domainCtx));
+            ScopedUIResourceContext ctxGuard(std::move(domainCtx));
             const std::size_t applied = AxbTemplateRegistry::Instance().ApplyRegisteredDictionary(uri, scopeRoot);
             if (!scopeRoot) {
                 PendingScriptUiState::Instance().RecordDictionary(domPtr, uri);
@@ -1862,11 +1846,11 @@ void ScriptUiBridge::RegisterCoreUiBindings(BindingRegistry& bindings) {
             if (uri.empty()) {
                 return UnifiedValue{false};
             }
-            std::shared_ptr<UiResourceContext> domainCtx =
-                !UiResourceContext::HasActiveThreadOverride()
-                    ? UiResourceContext::FindForDomains(domPtr)
+            std::shared_ptr<UIResourceContext> domainCtx =
+                !UIResourceContext::HasActiveThreadOverride()
+                    ? UIResourceContext::FindForDomains(domPtr)
                     : nullptr;
-            ScopedUiResourceContext ctxGuard(std::move(domainCtx));
+            ScopedUIResourceContext ctxGuard(std::move(domainCtx));
             (void)AxbTemplateRegistry::Instance().ApplyRegisteredDictionary(uri, nullptr);
             PendingScriptUiState::Instance().RecordDictionary(domPtr, uri);
             return UnifiedValue{true};
@@ -1978,11 +1962,11 @@ void ScriptUiBridge::RegisterCoreUiBindings(BindingRegistry& bindings) {
             if (uri.empty()) {
                 return UnifiedValue{false};
             }
-            std::shared_ptr<UiResourceContext> domainCtx =
-                (domPtr && !UiResourceContext::HasActiveThreadOverride())
-                    ? UiResourceContext::FindForDomains(domPtr)
+            std::shared_ptr<UIResourceContext> domainCtx =
+                (domPtr && !UIResourceContext::HasActiveThreadOverride())
+                    ? UIResourceContext::FindForDomains(domPtr)
                     : nullptr;
-            ScopedUiResourceContext ctxGuard(std::move(domainCtx));
+            ScopedUIResourceContext ctxGuard(std::move(domainCtx));
             const std::size_t applied = AxbTemplateRegistry::Instance().ApplyRegisteredDictionary(uri, nullptr);
             return UnifiedValue{applied > 0u};
         });
@@ -2009,13 +1993,13 @@ void ScriptUiBridge::RegisterCoreUiBindings(BindingRegistry& bindings) {
                 return UnifiedValue{false};
             }
 
-            std::shared_ptr<UiResourceContext> domainCtx =
-                (domPtr && !UiResourceContext::HasActiveThreadOverride())
-                    ? UiResourceContext::FindForDomains(domPtr)
+            std::shared_ptr<UIResourceContext> domainCtx =
+                (domPtr && !UIResourceContext::HasActiveThreadOverride())
+                    ? UIResourceContext::FindForDomains(domPtr)
                     : nullptr;
-            ScopedUiResourceContext ctxGuard(std::move(domainCtx));
+            ScopedUIResourceContext ctxGuard(std::move(domainCtx));
 
-            const std::string normColor = EqualsAsciiIgnoreCase(colorName, "Dark") ? "Dark" : "Light";
+            const std::string normColor = str::EqualsIgnoreCase(colorName, "Dark") ? "Dark" : "Light";
             const std::string normAccent = accentName.empty() ? "Blue" : accentName;
             const std::string exactDict = "NoesisTheme." + normColor + normAccent + ".xaml";
             const std::string fallbackDict = "NoesisTheme." + normColor + "Blue.xaml";
@@ -2208,11 +2192,11 @@ void ScriptUiBridge::RegisterCoreUiBindings(BindingRegistry& bindings) {
                 return UnifiedValue{false};
             }
 
-            std::shared_ptr<UiResourceContext> domainCtx =
-                (domPtr && !UiResourceContext::HasActiveThreadOverride())
-                    ? UiResourceContext::FindForDomains(domPtr)
+            std::shared_ptr<UIResourceContext> domainCtx =
+                (domPtr && !UIResourceContext::HasActiveThreadOverride())
+                    ? UIResourceContext::FindForDomains(domPtr)
                     : nullptr;
-            ScopedUiResourceContext ctxGuard(std::move(domainCtx));
+            ScopedUIResourceContext ctxGuard(std::move(domainCtx));
 
             const AxbStoryboard* sb = nullptr;
             AnimationEngine* animEng = scopeRoot->BoundAnimationEngine();
@@ -2266,11 +2250,11 @@ void ScriptUiBridge::RegisterCoreUiBindings(BindingRegistry& bindings) {
                 return UnifiedValue{false};
             }
 
-            std::shared_ptr<UiResourceContext> domainCtx =
-                (domPtr && !UiResourceContext::HasActiveThreadOverride())
-                    ? UiResourceContext::FindForDomains(domPtr)
+            std::shared_ptr<UIResourceContext> domainCtx =
+                (domPtr && !UIResourceContext::HasActiveThreadOverride())
+                    ? UIResourceContext::FindForDomains(domPtr)
                     : nullptr;
-            ScopedUiResourceContext ctxGuard(std::move(domainCtx));
+            ScopedUIResourceContext ctxGuard(std::move(domainCtx));
 
             const AxbStoryboard* sb = nullptr;
             AnimationEngine* animEng = scopeRoot->BoundAnimationEngine();
@@ -2332,8 +2316,14 @@ void ScriptUiBridge::RegisterCoreUiBindings(BindingRegistry& bindings) {
                 if (const auto* sv = std::get_if<StringValue>(&v)) {
                     outStr = sv->str();
                 } else if (propId == PropId_Content || propId == PropId_Text) {
-                    if (const auto* btn = elem->DynamicCast<Button>()) {
+                    if (const auto* btn = elem->DynamicCast<ButtonBase>()) {
                         outStr = btn->GetContentText();
+                    } else if (const auto* mi = elem->DynamicCast<MenuItem>()) {
+                        outStr = mi->GetContentText();
+                    } else if (const auto* tbb = elem->DynamicCast<TextBoxBase>()) {
+                        outStr = tbb->GetText();
+                    } else if (const auto* lbl = elem->DynamicCast<Label>()) {
+                        outStr = lbl->GetText();
                     } else if (const auto* tb = elem->DynamicCast<TextBlock>()) {
                         outStr = tb->GetText();
                     }
@@ -2618,7 +2608,7 @@ void ScriptUiBridge::RegisterCoreUiBindings(BindingRegistry& bindings) {
             NativeHandle handle{};
             if (!args[0].tryGetNativeHandle(handle) || !handle.valid()) return UnifiedValue{false};
             auto* elem = UIElement::FromNativeHandle(*handlesPtr, handle);
-            if (auto* tb = elem ? elem->DynamicCast<TextBox>() : nullptr) {
+            if (auto* tb = elem ? elem->DynamicCast<TextBoxBase>() : nullptr) {
                 tb->Clear();
                 return UnifiedValue{true};
             }
@@ -2637,7 +2627,7 @@ void ScriptUiBridge::RegisterCoreUiBindings(BindingRegistry& bindings) {
             NativeHandle handle{};
             if (!args[0].tryGetNativeHandle(handle) || !handle.valid()) return UnifiedValue{false};
             auto* elem = UIElement::FromNativeHandle(*handlesPtr, handle);
-            if (auto* tb = elem ? elem->DynamicCast<TextBox>() : nullptr) {
+            if (auto* tb = elem ? elem->DynamicCast<TextBoxBase>() : nullptr) {
                 tb->SelectAll();
                 return UnifiedValue{true};
             }
@@ -2732,7 +2722,7 @@ void ScriptUiBridge::RegisterCoreUiBindings(BindingRegistry& bindings) {
             (void)args[1].tryGetInt64(start);
             (void)args[2].tryGetInt64(len);
             auto* elem = UIElement::FromNativeHandle(*handlesPtr, handle);
-            if (auto* tb = elem ? elem->DynamicCast<TextBox>() : nullptr) {
+            if (auto* tb = elem ? elem->DynamicCast<TextBoxBase>() : nullptr) {
                 tb->Select(
                     static_cast<std::size_t>(std::max<std::int64_t>(0, start)),
                     static_cast<std::size_t>(std::max<std::int64_t>(0, len)));
@@ -2757,7 +2747,7 @@ void ScriptUiBridge::RegisterCoreUiBindings(BindingRegistry& bindings) {
             if (!args[0].tryGetNativeHandle(handle) || !handle.valid()) return uiHeapPtr->allocateString("", &error);
             auto* elem = UIElement::FromNativeHandle(*handlesPtr, handle);
             std::string sel;
-            if (const auto* tb = elem ? elem->DynamicCast<TextBox>() : nullptr) {
+            if (const auto* tb = elem ? elem->DynamicCast<TextBoxBase>() : nullptr) {
                 sel = tb->GetSelectedText();
             }
             return uiHeapPtr->allocateString(sel, &error);
@@ -2774,7 +2764,7 @@ void ScriptUiBridge::RegisterCoreUiBindings(BindingRegistry& bindings) {
             NativeHandle handle{};
             if (!args[0].tryGetNativeHandle(handle) || !handle.valid()) return UnifiedValue{false};
             auto* elem = UIElement::FromNativeHandle(*handlesPtr, handle);
-            if (auto* tb = elem ? elem->DynamicCast<TextBox>() : nullptr) {
+            if (auto* tb = elem ? elem->DynamicCast<TextBoxBase>() : nullptr) {
                 tb->SetSelectedText(FormatBindingString({}, &args[1], 1u, domPtr));
                 return UnifiedValue{true};
             }
@@ -2788,7 +2778,7 @@ void ScriptUiBridge::RegisterCoreUiBindings(BindingRegistry& bindings) {
             NativeHandle handle{};
             if (!args[0].tryGetNativeHandle(handle) || !handle.valid()) return UnifiedValue{false};
             auto* elem = UIElement::FromNativeHandle(*handlesPtr, handle);
-            if (const auto* tb = elem ? elem->DynamicCast<TextBox>() : nullptr) {
+            if (const auto* tb = elem ? elem->DynamicCast<TextBoxBase>() : nullptr) {
                 return UnifiedValue{tb->Copy()};
             }
             return UnifiedValue{false};
@@ -2801,7 +2791,7 @@ void ScriptUiBridge::RegisterCoreUiBindings(BindingRegistry& bindings) {
             NativeHandle handle{};
             if (!args[0].tryGetNativeHandle(handle) || !handle.valid()) return UnifiedValue{false};
             auto* elem = UIElement::FromNativeHandle(*handlesPtr, handle);
-            if (auto* tb = elem ? elem->DynamicCast<TextBox>() : nullptr) {
+            if (auto* tb = elem ? elem->DynamicCast<TextBoxBase>() : nullptr) {
                 return UnifiedValue{tb->Cut()};
             }
             return UnifiedValue{false};
@@ -2814,7 +2804,7 @@ void ScriptUiBridge::RegisterCoreUiBindings(BindingRegistry& bindings) {
             NativeHandle handle{};
             if (!args[0].tryGetNativeHandle(handle) || !handle.valid()) return UnifiedValue{false};
             auto* elem = UIElement::FromNativeHandle(*handlesPtr, handle);
-            if (auto* tb = elem ? elem->DynamicCast<TextBox>() : nullptr) {
+            if (auto* tb = elem ? elem->DynamicCast<TextBoxBase>() : nullptr) {
                 return UnifiedValue{tb->Paste()};
             }
             return UnifiedValue{false};
@@ -2895,7 +2885,7 @@ void ScriptUiBridge::RegisterCoreUiBindings(BindingRegistry& bindings) {
         });
 }
 
-bool ScriptUiBridge::BindObservableProperty(
+bool ScriptUIBridge::BindObservableProperty(
     ObjectRef sourceObject,
     PropertySlotHandle sourceSlot,
     const IntrusivePtr<UIElement>& targetElement,
@@ -2913,7 +2903,7 @@ bool ScriptUiBridge::BindObservableProperty(
         error);
 }
 
-bool ScriptUiBridge::BindObservableProperty(
+bool ScriptUIBridge::BindObservableProperty(
     ObjectRef sourceObject,
     PropertySlotHandle sourceSlot,
     const IntrusivePtr<UIElement>& targetElement,
@@ -2975,7 +2965,7 @@ bool ScriptUiBridge::BindObservableProperty(
     return true;
 }
 
-bool ScriptUiBridge::BindPath(
+bool ScriptUIBridge::BindPath(
     ObjectRef rootObject,
     std::string_view propertyPath,
     const IntrusivePtr<UIElement>& targetElement,
@@ -2985,7 +2975,7 @@ bool ScriptUiBridge::BindPath(
     if (!engine_) {
         if (error) {
             error->code = ErrorCode::InvalidArguments;
-            error->message = "ScriptUiBridge has no underlying DualTrackBindingEngine";
+            error->message = "ScriptUIBridge has no underlying DualTrackBindingEngine";
         }
         return false;
     }
@@ -3009,7 +2999,7 @@ bool ScriptUiBridge::BindPath(
     return true;
 }
 
-bool ScriptUiBridge::PushTwoWayToSource(
+bool ScriptUIBridge::PushTwoWayToSource(
     const UIElement* targetElement,
     std::uint16_t targetPropertyId,
     RuntimeError* error) {
@@ -3019,19 +3009,19 @@ bool ScriptUiBridge::PushTwoWayToSource(
     return engine_->PushTwoWayToSource(targetElement, targetPropertyId, error);
 }
 
-std::size_t ScriptUiBridge::FlushReactiveBindings(RuntimeError* error) {
+std::size_t ScriptUIBridge::FlushReactiveBindings(RuntimeError* error) {
     if (!engine_) {
         return 0u;
     }
-    std::shared_ptr<UiResourceContext> domainCtx =
-        !UiResourceContext::HasActiveThreadOverride()
-            ? UiResourceContext::FindForDomains(&domains_)
+    std::shared_ptr<UIResourceContext> domainCtx =
+        !UIResourceContext::HasActiveThreadOverride()
+            ? UIResourceContext::FindForDomains(&domains_)
             : nullptr;
-    ScopedUiResourceContext ctxGuard(std::move(domainCtx));
+    ScopedUIResourceContext ctxGuard(std::move(domainCtx));
     return engine_->FlushTrackA(error) + engine_->FlushTrackB();
 }
 
-std::size_t ScriptUiBridge::BindingCount() const noexcept {
+std::size_t ScriptUIBridge::BindingCount() const noexcept {
     if (!engine_) {
         return 0u;
     }
@@ -3040,7 +3030,7 @@ std::size_t ScriptUiBridge::BindingCount() const noexcept {
            engine_->MultiBindings().size();
 }
 
-std::vector<ReactivePropertyBinding> ScriptUiBridge::Bindings() const {
+std::vector<ReactivePropertyBinding> ScriptUIBridge::Bindings() const {
     std::vector<ReactivePropertyBinding> out;
     if (!engine_) {
         return out;

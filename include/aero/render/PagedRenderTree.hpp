@@ -9,13 +9,14 @@
 #include <unordered_set>
 #include <vector>
 
-#include "aero/binding/DualTrackBindingEngine.hpp"
-#include "aero/compiler/AxbFormat.hpp"
+#include "aero/asset/AxbFormat.hpp"
 #include "aero/core/UIElement.hpp"
 #include "aero/core/UnifiedValue.hpp"
 #include "aero/render/FontAtlas.hpp"
 
 namespace aero {
+
+class DualTrackBindingEngine;
 
 enum class AeroPrimType : std::uint16_t {
     SolidQuad = 0,
@@ -336,13 +337,39 @@ void UnpackSdfRadialArcParams(
     float innerRadiusRatio01,
     float aaFeatherWidth = 1.0f) noexcept;
 
+struct PagedRenderTraversalState {
+    Rect clipRect{0.0f, 0.0f, 16384.0f, 16384.0f};
+    bool clipActive = false;
+    float inheritedOpacity = 1.0f;
+    float m00 = 1.0f;
+    float m01 = 0.0f;
+    float m10 = 0.0f;
+    float m11 = 1.0f;
+    float tx = 0.0f;
+    float ty = 0.0f;
+    bool hasPerspective3D = false;
+    BlendingMode blendMode = BlendingMode::Normal;
+    bool hasInheritedDropShadow = false;
+    bool shadowOnlyPass = false;
+    float shadowWorldDx = 0.0f;
+    float shadowWorldDy = 0.0f;
+    float shadowWorldBlurR = 0.0f;
+    Color shadowColor{0.0f, 0.0f, 0.0f, 0.0f};
+    Matrix4x4 world3D{};
+};
+
 class PagedRenderTree {
 public:
+    using RenderTraversalState = PagedRenderTraversalState;
+
     PagedRenderTree();
 
     void Clear() noexcept;
 
     [[nodiscard]] std::uint32_t TreeId() const noexcept { return treeId_; }
+
+    void SetRootDpiScale(float scale) noexcept;
+    [[nodiscard]] float RootDpiScale() const noexcept { return rootDpiScale_; }
 
     // Full build of paged 4KB render tree from a laid-out UIElement hierarchy
     std::size_t BuildFromVisualTree(const UIElement* rootElement);
@@ -587,27 +614,6 @@ public:
         float fontSize = 14.0f) const noexcept;
 
 private:
-    struct RenderTraversalState {
-        Rect clipRect{0.0f, 0.0f, 16384.0f, 16384.0f};
-        bool clipActive = false;
-        float inheritedOpacity = 1.0f;
-        float m00 = 1.0f;
-        float m01 = 0.0f;
-        float m10 = 0.0f;
-        float m11 = 1.0f;
-        float tx = 0.0f;
-        float ty = 0.0f;
-        bool hasPerspective3D = false;
-        BlendingMode blendMode = BlendingMode::Normal;
-        bool hasInheritedDropShadow = false;
-        bool shadowOnlyPass = false;
-        float shadowWorldDx = 0.0f;
-        float shadowWorldDy = 0.0f;
-        float shadowWorldBlurR = 0.0f;
-        Color shadowColor{0.0f, 0.0f, 0.0f, 0.0f};
-        Matrix4x4 world3D{};
-    };
-
     void InitPreCachedDigitGlyphs() noexcept;
     void RegisterMtsdfInTreeAtlas(const AxbMtsdfPathEntry& entry);
     std::uint32_t EnsurePageForAllocation(
@@ -650,10 +656,11 @@ private:
         const UIElement* elem,
         std::size_t& ioUpdatedNodes) noexcept;
     friend class PagedCustomDrawingContext;
+    friend struct ControlRenderEmitter;
 
     struct DeferredComboPopup {
-        const class ComboBox* combo = nullptr;
-        RenderTraversalState state{};
+        const UIElement* combo = nullptr;
+        PagedRenderTraversalState state{};
     };
 
     [[nodiscard]] bool SubtreeContainsActiveComboPopup(const UIElement* elem) const noexcept;
@@ -692,6 +699,7 @@ private:
     std::vector<const UIElement*> activeComboPopupOwners_;
     std::unordered_map<std::uint32_t, StandaloneTextRunRecord> standaloneTextRuns_;
     std::array<GlyphUvRect, 128> preCachedGlyphs_{};
+    float rootDpiScale_ = 1.0f;
     std::uint32_t mtsdfOwnerId_ = 0u;
     std::uint64_t mtsdfAtlasRevision_ = 0u;
     std::uint32_t mtsdfPopulatedRows_ = 0u;

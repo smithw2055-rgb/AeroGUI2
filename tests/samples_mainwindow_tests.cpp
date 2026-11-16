@@ -16,14 +16,15 @@
 
 #include "aero/animation/AnimationEngine.hpp"
 #include "aero/binding/DualTrackBindingEngine.hpp"
-#include "aero/bridge/ScriptUiBridge.hpp"
+#include "aero/bridge/ScriptUIBridge.hpp"
 #include "aero/compiler/AeroCompiler.hpp"
-#include "aero/compiler/AxbFormat.hpp"
+#include "aero/asset/AxbFormat.hpp"
+#include "aero/asset/AxbTemplateRegistry.hpp"
 #include "aero/controls/Controls.hpp"
 #include "aero/core/DependencyProperty.hpp"
 #include "aero/core/RsAliases.hpp"
 #include "aero/core/UIElement.hpp"
-#include "aero/core/UiResourceContext.hpp"
+#include "aero/core/UIResourceContext.hpp"
 #include "aero/core/UnifiedValue.hpp"
 #include "aero/layout/DepthBucketLayoutQueue.hpp"
 #include "aero/render/FontAtlas.hpp"
@@ -126,14 +127,14 @@ void RegisterDecoratorShims() {
 }
 
 struct MountedSampleHarness {
-    std::shared_ptr<UiResourceContext> resourceCtx;
-    std::unique_ptr<ScopedUiResourceContext> resourceScope;
+    std::shared_ptr<UIResourceContext> resourceCtx;
+    std::unique_ptr<ScopedUIResourceContext> resourceScope;
     ExecutionDomainContext domains;
     StyleTriggerEngine styleEngine;
     AnimationEngine animEngine;
     AeroCompileResult compileResult;
     std::shared_ptr<BindingRegistry> nativeBindings;
-    std::unique_ptr<ScriptUiBridge> scriptBridge;
+    std::unique_ptr<ScriptUIBridge> scriptBridge;
     std::unique_ptr<Interpreter> uiInterpreter;
     std::unique_ptr<DualTrackBindingEngine> bindingEngine;
     ObjectRef mainWinRef{};
@@ -176,8 +177,8 @@ struct MountedSampleHarness {
             return false;
         }
 
-        resourceCtx = std::make_shared<UiResourceContext>();
-        resourceScope = std::make_unique<ScopedUiResourceContext>(resourceCtx);
+        resourceCtx = std::make_shared<UIResourceContext>();
+        resourceScope = std::make_unique<ScopedUIResourceContext>(resourceCtx);
         RegisterDecoratorShims();
 
         const fs::path robotoFont = samplesRoot / "DataBinding" / "Data" / "Roboto-Regular.ttf";
@@ -199,7 +200,7 @@ struct MountedSampleHarness {
             }
         }
         for (const auto& sp : searchPaths) {
-            UiResourceContext::Current().AddXamlSearchDirectory(sp);
+            UIResourceContext::Current().AddXamlSearchDirectory(sp);
             ImageAtlas::Instance().AddSearchDirectory(sp);
         }
 
@@ -358,7 +359,7 @@ struct MountedSampleHarness {
 
         domains.registerProgramObservableMetadata(*compileResult.programImage);
         nativeBindings = std::make_shared<BindingRegistry>();
-        scriptBridge = std::make_unique<ScriptUiBridge>(domains);
+        scriptBridge = std::make_unique<ScriptUIBridge>(domains);
         scriptBridge->RegisterCoreUiBindings(*nativeBindings);
 
         uiInterpreter = std::make_unique<Interpreter>(compileResult.programImage, domains.uiHeapPtr());
@@ -682,8 +683,8 @@ struct MountedSampleHarness {
     }
 
     bool ClickButton(UIElement* elem) {
-        auto* btn = elem ? elem->DynamicCast<Button>() : nullptr;
-        AERO_MW_CHECK_MSG(btn != nullptr, "ClickButton expected a Button*");
+        auto* btn = elem ? elem->DynamicCast<ButtonBase>() : nullptr;
+        AERO_MW_CHECK_MSG(btn != nullptr, "ClickButton expected a ButtonBase*");
         if (!btn) {
             return false;
         }
@@ -715,13 +716,23 @@ void CollectTextsRecursive(UIElement* node, std::vector<std::string>& out, bool 
         if (!t.empty()) {
             out.push_back(t);
         }
+    } else if (auto* lbl = node->DynamicCast<Label>()) {
+        const std::string t = lbl->GetText();
+        if (!t.empty()) {
+            out.push_back(t);
+        }
     } else if (auto* cp = node->DynamicCast<ContentPresenter>()) {
         const std::string t = cp->GetEffectiveText();
         if (!t.empty()) {
             out.push_back(t);
         }
-    } else if (auto* btn = node->DynamicCast<Button>()) {
+    } else if (auto* btn = node->DynamicCast<ButtonBase>()) {
         const std::string t = btn->GetContentText();
+        if (!t.empty()) {
+            out.push_back(t);
+        }
+    } else if (auto* mi = node->DynamicCast<MenuItem>()) {
+        const std::string t = mi->GetContentText();
         if (!t.empty()) {
             out.push_back(t);
         }

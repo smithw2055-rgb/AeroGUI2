@@ -1,5 +1,5 @@
 #include <fstream>
-#include "aero/core/UiResourceContext.hpp"
+#include "aero/core/UIResourceContext.hpp"
 #include <cassert>
 #include <cmath>
 #include <cstdio>
@@ -9,10 +9,15 @@
 #include <thread>
 #include <vector>
 
-#include "aero/bridge/ScriptUiBridge.hpp"
+#include "aero/animation/AnimationEngine.hpp"
+#include "aero/asset/AxbFormat.hpp"
+#include "aero/asset/AxbTemplateRegistry.hpp"
+#include "aero/binding/DualTrackBindingEngine.hpp"
+#include "aero/bridge/ScriptUIBridge.hpp"
 #include "aero/compiler/AeroCompiler.hpp"
 #include "aero/compiler/XamlApplication.hpp"
 #include "aero/controls/Controls.hpp"
+#include "aero/input/InputEventRouter.hpp"
 #include "aero/render/PagedRenderTree.hpp"
 #include "aero/render/ZeroCopyGpuStream.hpp"
 #include "aero/style/StyleTriggerEngine.hpp"
@@ -390,7 +395,7 @@ namespace HierDemo
     aero::ExecutionDomainContext domains;
     domains.registerProgramObservableMetadata(*res.programImage);
     auto nativeBindings = std::make_shared<aero::BindingRegistry>();
-    aero::ScriptUiBridge bridge(domains);
+    aero::ScriptUIBridge bridge(domains);
     bridge.RegisterCoreUiBindings(*nativeBindings);
     aero::Interpreter interp(res.programImage, domains.uiHeapPtr());
     domains.attachInterpreter(interp, aero::DomainKind::UiPresentation);
@@ -547,7 +552,7 @@ namespace CtorDemo
     aero::ExecutionDomainContext domains;
     domains.registerProgramObservableMetadata(*res.programImage);
     auto nativeBindings = std::make_shared<aero::BindingRegistry>();
-    aero::ScriptUiBridge bridge(domains);
+    aero::ScriptUIBridge bridge(domains);
     bridge.RegisterCoreUiBindings(*nativeBindings);
     aero::Interpreter interp(res.programImage, domains.uiHeapPtr());
     domains.attachInterpreter(interp, aero::DomainKind::UiPresentation);
@@ -765,7 +770,7 @@ namespace TypedEventsDemo
     aero::ExecutionDomainContext domains;
     domains.registerProgramObservableMetadata(*res.programImage);
     auto nativeBindings = std::make_shared<aero::BindingRegistry>();
-    aero::ScriptUiBridge bridge(domains);
+    aero::ScriptUIBridge bridge(domains);
     bridge.RegisterCoreUiBindings(*nativeBindings);
     aero::Interpreter interp(res.programImage, domains.uiHeapPtr());
     domains.attachInterpreter(interp, aero::DomainKind::UiPresentation);
@@ -880,7 +885,7 @@ void TestRepeatButtonAutoRepeatMenuAutoCloseAndTreeKeyboard() {
 
     // 2. RepeatButton press-hold Delay (200ms) + Interval (50ms) via InputEventRouter::Tick
     int repeatClicks = 0;
-    holdBtn->SetClickCallback([&](aero::Button&) { ++repeatClicks; });
+    holdBtn->SetClickCallback([&](aero::ButtonBase&) { ++repeatClicks; });
     aero::InputEventRouter router(root.Get());
     const aero::Rect btnWorld = holdBtn->FinalRect();
     const aero::Point btnCenter{btnWorld.x + btnWorld.width * 0.5f, btnWorld.y + btnWorld.height * 0.5f};
@@ -914,9 +919,9 @@ void TestRepeatButtonAutoRepeatMenuAutoCloseAndTreeKeyboard() {
 void TestGalleryEnhancedXamlSamples() {
     const fs::path galleryData = fs::path(AERO_SAMPLES_DIR) / "Gallery" / "Data";
     const fs::path samplesDir = galleryData / "Samples";
-    aero::UiResourceContext::Current().ClearXamlSearchDirectories();
-    aero::UiResourceContext::Current().AddXamlSearchDirectory(galleryData.string());
-    aero::UiResourceContext::Current().AddXamlSearchDirectory(samplesDir.string());
+    aero::UIResourceContext::Current().ClearXamlSearchDirectories();
+    aero::UIResourceContext::Current().AddXamlSearchDirectory(galleryData.string());
+    aero::UIResourceContext::Current().AddXamlSearchDirectory(samplesDir.string());
 
     auto countType = [](auto& self, aero::UIElement* e, int& lvItems, int& icPop, int& tcMulti, int& tvPop) -> void {
         if (!e) return;
@@ -1430,7 +1435,7 @@ namespace VerbatimDemo
     aero::ExecutionDomainContext domains;
     domains.registerProgramObservableMetadata(*res.programImage);
     auto nativeBindings = std::make_shared<aero::BindingRegistry>();
-    aero::ScriptUiBridge bridge(domains);
+    aero::ScriptUIBridge bridge(domains);
     bridge.RegisterCoreUiBindings(*nativeBindings);
     aero::Interpreter interp(res.programImage, domains.uiHeapPtr());
     domains.attachInterpreter(interp, aero::DomainKind::UiPresentation);
@@ -1929,7 +1934,7 @@ keep_literal";
             aero::ExecutionDomainContext domains;
             domains.registerProgramObservableMetadata(*res.programImage);
             auto nativeBindings = std::make_shared<aero::BindingRegistry>();
-            aero::ScriptUiBridge bridge(domains);
+            aero::ScriptUIBridge bridge(domains);
             bridge.RegisterCoreUiBindings(*nativeBindings);
             aero::Interpreter interp(res.programImage, domains.uiHeapPtr());
             domains.attachInterpreter(interp, aero::DomainKind::UiPresentation);
@@ -2778,7 +2783,7 @@ namespace PostPatchConvTest
         auto* slnHello = (root && root->FindName("SlnHello")) ? root->FindName("SlnHello")->DynamicCast<TextBlock>() : nullptr;
         CHECK(slnHello && slnHello->GetText() == "FromSln");
 
-        const auto xamlDirs = UiResourceContext::Default().XamlSearchDirectoriesSnapshot();
+        const auto xamlDirs = UIResourceContext::Default().XamlSearchDirectoriesSnapshot();
         bool stillHasDir1 = false;
         for (const auto& d : xamlDirs) {
             if (d == dir1Str) {

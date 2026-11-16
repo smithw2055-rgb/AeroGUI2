@@ -5,7 +5,12 @@
 #include <fstream>
 #include <sstream>
 
-#include "aero/core/UiResourceContext.hpp"
+#include "aero/asset/AxbFormat.hpp"
+#include "aero/asset/AxbTemplateRegistry.hpp"
+#include "aero/binding/DualTrackBindingEngine.hpp"
+#include "aero/core/UIResourceContext.hpp"
+#include "aero/render/FontAtlas.hpp"
+#include "aero/render/ImageAtlas.hpp"
 
 namespace fs = std::filesystem;
 
@@ -367,7 +372,7 @@ bool XamlApplication::Load(const XamlApplicationOptions& options, std::string* o
     viewportH_ = options.viewportHeight;
     ImageAtlas::Instance().ClearSearchDirectories();
     RiveControl::ClearAssetSearchDirectories();
-    UiResourceContext::Current().ClearXamlSearchDirectories();
+    UIResourceContext::Current().ClearXamlSearchDirectories();
 
     std::error_code ec;
     fs::path targetPath(options.appOrWindowXamlPath);
@@ -534,17 +539,17 @@ bool XamlApplication::Load(const XamlApplicationOptions& options, std::string* o
         ImageAtlas::Instance().SetBaseDirectory(winDir.string());
         ImageAtlas::Instance().AddSearchDirectory(winDir.string());
         RiveControl::AddAssetSearchDirectory(winDir.string());
-        UiResourceContext::Current().AddXamlSearchDirectory(winDir.string());
+        UIResourceContext::Current().AddXamlSearchDirectory(winDir.string());
         if (!baseDir.empty() && baseDir != winDir) {
             ImageAtlas::Instance().AddSearchDirectory(baseDir.string());
             RiveControl::AddAssetSearchDirectory(baseDir.string());
-            UiResourceContext::Current().AddXamlSearchDirectory(baseDir.string());
+            UIResourceContext::Current().AddXamlSearchDirectory(baseDir.string());
         }
         for (const auto& extraDir : options.resourceSearchPaths) {
             if (!extraDir.empty()) {
                 ImageAtlas::Instance().AddSearchDirectory(extraDir);
                 RiveControl::AddAssetSearchDirectory(extraDir);
-                UiResourceContext::Current().AddXamlSearchDirectory(extraDir);
+                UIResourceContext::Current().AddXamlSearchDirectory(extraDir);
             }
         }
         for (const char* sub : {"Fonts", "Assets", "Assets/Fonts", "Images", "Resources"}) {
@@ -645,7 +650,7 @@ bool XamlApplication::Load(const XamlApplicationOptions& options, std::string* o
     if (compileResult_.programImage) {
         domains_.registerProgramObservableMetadata(*compileResult_.programImage);
         nativeBindings_ = std::make_shared<BindingRegistry>();
-        scriptBridge_ = std::make_unique<ScriptUiBridge>(domains_);
+        scriptBridge_ = std::make_unique<ScriptUIBridge>(domains_);
         scriptBridge_->RegisterCoreUiBindings(*nativeBindings_);
 
         interpreter_ = std::make_unique<Interpreter>(compileResult_.programImage, domains_.uiHeapPtr());

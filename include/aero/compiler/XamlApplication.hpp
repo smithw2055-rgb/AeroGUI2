@@ -7,7 +7,7 @@
 
 #include "aero/animation/AnimationEngine.hpp"
 #include "aero/binding/DualTrackBindingEngine.hpp"
-#include "aero/bridge/ScriptUiBridge.hpp"
+#include "aero/bridge/ScriptUIBridge.hpp"
 #include "aero/compiler/AeroCompiler.hpp"
 #include "aero/controls/Controls.hpp"
 #include "aero/core/UIElement.hpp"
@@ -67,7 +67,7 @@ private:
     std::shared_ptr<rs_comp::CompilerSession> compilerSession_;
     AeroCompileResult compileResult_{};
     std::shared_ptr<BindingRegistry> nativeBindings_;
-    std::unique_ptr<ScriptUiBridge> scriptBridge_;
+    std::unique_ptr<ScriptUIBridge> scriptBridge_;
     std::unique_ptr<Interpreter> interpreter_;
     std::unique_ptr<DualTrackBindingEngine> bindingEngine_;
     std::unique_ptr<AnimationEngine> animationEngine_;

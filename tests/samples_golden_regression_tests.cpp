@@ -13,10 +13,11 @@
 #include <vector>
 
 #include "aero/animation/AnimationEngine.hpp"
+#include "aero/asset/AxbFormat.hpp"
+#include "aero/asset/AxbTemplateRegistry.hpp"
 #include "aero/binding/DualTrackBindingEngine.hpp"
 #include "aero/compiler/AeroCompiler.hpp"
 #include "aero/compiler/AeroSceneIR.hpp"
-#include "aero/compiler/AxbFormat.hpp"
 #include "aero/controls/Controls.hpp"
 #include "aero/core/DependencyProperty.hpp"
 #include "aero/core/UIElement.hpp"
@@ -502,7 +503,7 @@ int main(int argc, char** argv) {
         {"HelloWorld", "HelloWorld/Data/MainPage.xaml", nullptr, 1.2f, 0x7863b040a6dc4444ULL, 50000u, 300u},
         {"Login", "Login/Data/MainPage.xaml", "Login/Data/Resources.xaml", 1.0f, 0xe52312950e1871afULL, 50000u, 600u},
         {"Buttons", "Buttons/Data/MainPage.xaml", "Buttons/Data/Resources.xaml", 1.0f, 0x1dc81e85638e4134ULL, 50000u, 600u},
-        {"QuestLog", "QuestLog/Data/MainPage.xaml", "QuestLog/Data/Resources.xaml", 1.0f, 0x57a28126d5c058efULL, 20000u, 600u},
+        {"QuestLog", "QuestLog/Data/MainPage.xaml", "QuestLog/Data/Resources.xaml", 1.0f, 0x9be414c1322db398ULL, 20000u, 600u},
         {"Inventory", "Inventory/Data/MainPage.xaml", "Inventory/Data/Resources.xaml", 3.2f, 0xdc85cde6a258c5e5ULL, 40000u, 300u},
         {"Scoreboard", "Scoreboard/Data/MainPage.xaml", nullptr, 1.0f, 0x063ca2044a4f5443ULL, 50000u, 600u},
         {"TicTacToe", "TicTacToe/Data/MainPage.xaml", "TicTacToe/Data/Resources.xaml", 1.0f, 0xdf6758fc356ab321ULL, 50000u, 1000u},
@@ -510,9 +511,9 @@ int main(int argc, char** argv) {
         {"Gallery", "Gallery/Data/MainWindow.xaml", "Gallery/Data/Resources.xaml", 1.0f, 0x97982bf0a0b5c10aULL, 50000u, 600u},
         {"Brushes", "Gallery/Data/Samples/Brushes.xaml", "Gallery/Data/Resources.xaml", 1.0f, 0x560db0a00d704ffcULL, 5000u, 600u},
         {"Gallery_Blending", "Gallery/Data/Samples/Blending.xaml", "Gallery/Data/Resources.xaml", 1.0f, 0xfefc265287ff59ecULL, 7000u, 500u},
-        {"Rive", "Rive/Data/MainPage.xaml", nullptr, 1.0f, 0xb5434a846c223365ULL, 50000u, 3000u},
-        {"Effects", "Gallery/Data/Samples/Effects.xaml", "Gallery/Data/Resources.xaml", 1.0f, 0x63c53ebcb5fc3432ULL, 8000u, 2000u},
-        {"BackgroundBlur", "BackgroundBlur/Data/MainPage.xaml", "BackgroundBlur/Data/Resources.xaml", 1.0f, 0x637465c308a7b16cULL, 40000u, 800u},
+        {"Rive", "Rive/Data/MainPage.xaml", nullptr, 1.0f, 0xd865d968ca178016ULL, 50000u, 3000u},
+        {"Effects", "Gallery/Data/Samples/Effects.xaml", "Gallery/Data/Resources.xaml", 1.0f, 0x37d8faabef45ffc7ULL, 8000u, 2000u},
+        {"BackgroundBlur", "BackgroundBlur/Data/MainPage.xaml", "BackgroundBlur/Data/Resources.xaml", 1.0f, 0x05b834a7730831a1ULL, 40000u, 800u},
         {"BrushShaders", "BrushShaders/Data/MainPage.xaml", nullptr, 1.0f, 0x6e903983482a68a8ULL, 50000u, 300u},
         {"UserControl", "UserControl/Data/MainPage.xaml", "UserControl/Data/Resources.xaml", 1.0f, 0x261e72f064aeb55cULL, 50000u, 800u},
     };

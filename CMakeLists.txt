@@ -63,65 +63,144 @@ if(REALSCRIPT_SLIM_RUNTIME OR NOT TARGET RealScript::Frontend)
 endif()
 
 # ============================================================================
-# 1. Pure Runtime Library (Zero XML Parser, Zero Compiler Frontend, Wasm-Ready)
+# 1. Modular Pure Runtime Libraries (NoesisGUI-Style Layered Targets, Wasm-Ready)
 # ============================================================================
-set(AERO_RUNTIME_SOURCES
+set(AERO_KERNEL_SOURCES
     src/runtime/AeroObservableList.cpp
     src/runtime/AeroExecutionDomains.cpp
+    src/core/AeroObject.cpp
+    src/core/TypeClass.cpp
+    src/core/DependencyProperty.cpp
+    src/core/UIViewContext.cpp
     src/core/UIElement.cpp
-    src/core/AxbFormat.cpp
-    src/core/UiResourceContext.cpp
-    src/bridge/ScriptUiBridge.cpp
+    src/core/UIResourceContext.cpp
+    src/asset/AxbFormat.cpp
+    src/asset/AxbTemplateRegistry.cpp
+    src/asset/GradientBrush.cpp
+    src/asset/MtsdfPathBaker.cpp
+    src/asset/RiveDecoder.cpp
+    src/asset/ValueConverters.cpp
+    src/asset/XamlLiteralParser.cpp
     src/layout/DepthBucketLayoutQueue.cpp
     src/binding/DualTrackBindingEngine.cpp
-    src/controls/Controls.cpp
+    src/controls/ControlContainers.cpp
+    src/controls/ControlPanelsShapes.cpp
+    src/controls/ControlButtonsRanges.cpp
+    src/controls/ControlTextMedia.cpp
+    src/controls/ControlItems.cpp
+    src/controls/AxbTemplateMounter.cpp
+    src/controls/ControlRenderEmitters.cpp
     src/input/InputEventRouter.cpp
     src/animation/AnimationEngine.cpp
     src/style/StyleTriggerEngine.cpp
     src/render/PagedRenderTree.cpp
-    src/render/ZeroCopyGpuStream.cpp
     src/render/FontAtlas.cpp
     src/render/ImageAtlas.cpp
-    src/render/GpuBackend.cpp
-    src/host/HostDrivers.cpp
-    src/host/NativeWindowHost.cpp
 )
 
-add_library(aerogui_runtime STATIC
-    ${AERO_RUNTIME_SOURCES}
+add_library(aerogui_kernel STATIC
+    ${AERO_KERNEL_SOURCES}
 )
 
 if(MSVC)
-    target_compile_options(aerogui_runtime PUBLIC /utf-8)
-    add_link_options(/STACK:8388608)
+    target_compile_options(aerogui_kernel PUBLIC /utf-8)
 endif()
 
-set_target_properties(aerogui_runtime PROPERTIES EXPORT_NAME Runtime)
+set_target_properties(aerogui_kernel PROPERTIES EXPORT_NAME Kernel)
 
-target_include_directories(aerogui_runtime
+target_include_directories(aerogui_kernel
     PUBLIC
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
         $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
 )
 
-target_link_libraries(aerogui_runtime
+target_link_libraries(aerogui_kernel
     PUBLIC
         RealScript::SlimRuntime
 )
 
 if(TARGET Threads::Threads)
-    target_link_libraries(aerogui_runtime PUBLIC Threads::Threads)
+    target_link_libraries(aerogui_kernel PUBLIC Threads::Threads)
 endif()
 
-if(WIN32)
-    target_link_libraries(aerogui_runtime PUBLIC user32 gdi32 imm32)
+add_library(AeroGUI::Kernel ALIAS aerogui_kernel)
+
+set(AERO_RENDER_SOURCES
+    src/render/ZeroCopyGpuStream.cpp
+    src/render/GpuBackend.cpp
+)
+
+add_library(aerogui_render STATIC
+    ${AERO_RENDER_SOURCES}
+)
+
+if(MSVC)
+    target_compile_options(aerogui_render PUBLIC /utf-8)
 endif()
+
+set_target_properties(aerogui_render PROPERTIES EXPORT_NAME Render)
+
+target_include_directories(aerogui_render
+    PUBLIC
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+        $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
+)
+
+target_link_libraries(aerogui_render
+    PUBLIC
+        aerogui_kernel
+)
 
 if(UNIX AND NOT APPLE AND NOT EMSCRIPTEN)
-    target_link_libraries(aerogui_runtime PUBLIC ${CMAKE_DL_LIBS})
+    target_link_libraries(aerogui_render PUBLIC ${CMAKE_DL_LIBS})
 endif()
 
+add_library(AeroGUI::Render ALIAS aerogui_render)
+
+set(AERO_APP_HOST_SOURCES
+    src/bridge/ScriptUIBridge.cpp
+    src/host/HostDrivers.cpp
+    src/host/NativeWindowHost.cpp
+)
+
+add_library(aerogui_app_host STATIC
+    ${AERO_APP_HOST_SOURCES}
+)
+
+if(MSVC)
+    target_compile_options(aerogui_app_host PUBLIC /utf-8)
+    add_link_options(/STACK:8388608)
+endif()
+
+set_target_properties(aerogui_app_host PROPERTIES EXPORT_NAME AppHost)
+
+target_include_directories(aerogui_app_host
+    PUBLIC
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+        $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
+)
+
+target_link_libraries(aerogui_app_host
+    PUBLIC
+        aerogui_render
+)
+
+if(WIN32)
+    target_link_libraries(aerogui_app_host PUBLIC user32 gdi32 imm32)
+endif()
+
+add_library(AeroGUI::AppHost ALIAS aerogui_app_host)
+
+add_library(aerogui_runtime INTERFACE)
+set_target_properties(aerogui_runtime PROPERTIES EXPORT_NAME Runtime)
+target_link_libraries(aerogui_runtime INTERFACE aerogui_app_host)
 add_library(AeroGUI::Runtime ALIAS aerogui_runtime)
+
+set(AERO_RUNTIME_SOURCES
+    ${AERO_KERNEL_SOURCES}
+    ${AERO_RENDER_SOURCES}
+    ${AERO_APP_HOST_SOURCES}
+)
 
 # ============================================================================
 # 2. Host Compiler Library & CLI (Only built when full RealScript frontend is active)
@@ -129,6 +208,8 @@ add_library(AeroGUI::Runtime ALIAS aerogui_runtime)
 if(AERO_BUILD_COMPILER_TOOLS)
     add_library(aerogui_compiler_lib STATIC
         src/compiler/AeroCompiler.cpp
+        src/compiler/FrontendImporters.cpp
+        src/compiler/AeroAotCppEmitter.cpp
         src/compiler/CSharpCompatLowerer.cpp
         src/compiler/XamlApplication.cpp
     )
@@ -275,7 +356,7 @@ if(AERO_BUILD_TESTS)
     endif()
 endif()
 
-set(aerogui_export_targets aerogui_runtime aerocore)
+set(aerogui_export_targets aerogui_kernel aerogui_render aerogui_app_host aerogui_runtime aerocore)
 if(AERO_BUILD_COMPILER_TOOLS)
     list(APPEND aerogui_export_targets aerogui_compiler_lib aero-compiler)
     set(AERO_HAS_COMPILER_TOOLS_CMAKE TRUE)

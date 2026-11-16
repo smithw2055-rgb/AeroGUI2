@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
@@ -11,19 +12,36 @@
 #include <utility>
 #include <vector>
 
+#include "aero/core/AeroObject.hpp"
 #include "aero/core/DependencyProperty.hpp"
 #include "aero/core/TypeClass.hpp"
+#include "aero/core/UIViewContext.hpp"
 #include "aero/core/UnifiedValue.hpp"
 
 namespace aero {
 
 struct AxbPackage;
 struct AxbControlTemplate;
+struct CollectionChangeRecord;
+struct PagedRenderTraversalState;
+class PagedRenderTree;
 enum class ValueConverterKind : std::uint8_t;
-class ContentPresenter;
 class DualTrackBindingEngine;
 class StyleTriggerEngine;
 class AnimationEngine;
+
+struct AriaElementInfo {
+    std::string role = "group";
+    std::string label;
+    std::string value;
+    bool focusable = false;
+};
+
+enum class RenderInPlaceResult : std::uint8_t {
+    UseDefaultContainer = 0,
+    UpdatedInPlace = 1,
+    NeedsFullRebuild = 2
+};
 
 struct UIEffectDescriptor {
     UIEffectKind kind = UIEffectKind::None;
@@ -116,81 +134,13 @@ public:
     }
 };
 
-template <typename T>
-class IntrusivePtr {
-public:
-    constexpr IntrusivePtr() noexcept = default;
-    constexpr IntrusivePtr(std::nullptr_t) noexcept : ptr_(nullptr) {}
-    explicit IntrusivePtr(T* p, bool addRef = true) noexcept : ptr_(p) {
-        if (ptr_ && addRef) {
-            ptr_->AddRef();
-        }
-    }
-    IntrusivePtr(const IntrusivePtr& other) noexcept : ptr_(other.ptr_) {
-        if (ptr_) {
-            ptr_->AddRef();
-        }
-    }
-    template <typename U, typename = std::enable_if_t<std::is_convertible_v<U*, T*>>>
-    IntrusivePtr(const IntrusivePtr<U>& other) noexcept : ptr_(other.Get()) {
-        if (ptr_) {
-            ptr_->AddRef();
-        }
-    }
-    IntrusivePtr(IntrusivePtr&& other) noexcept : ptr_(other.ptr_) {
-        other.ptr_ = nullptr;
-    }
-    ~IntrusivePtr() {
-        Reset();
-    }
-
-    IntrusivePtr& operator=(const IntrusivePtr& other) noexcept {
-        if (this != &other) {
-            Reset(other.ptr_);
-        }
-        return *this;
-    }
-    IntrusivePtr& operator=(IntrusivePtr&& other) noexcept {
-        if (this != &other) {
-            if (ptr_) {
-                ptr_->Release();
-            }
-            ptr_ = other.ptr_;
-            other.ptr_ = nullptr;
-        }
-        return *this;
-    }
-
-    void Reset(T* p = nullptr, bool addRef = true) noexcept {
-        if (p && addRef) {
-            p->AddRef();
-        }
-        if (ptr_) {
-            ptr_->Release();
-        }
-        ptr_ = p;
-    }
-
-    [[nodiscard]] T* Get() const noexcept { return ptr_; }
-    [[nodiscard]] T* operator->() const noexcept { return ptr_; }
-    [[nodiscard]] T& operator*() const noexcept { return *ptr_; }
-    explicit operator bool() const noexcept { return ptr_ != nullptr; }
-
-private:
-    T* ptr_ = nullptr;
-};
-
-template <typename T, typename... Args>
-[[nodiscard]] IntrusivePtr<T> MakeIntrusive(Args&&... args) {
-    return IntrusivePtr<T>(new T(std::forward<Args>(args)...), true);
-}
-
-class UIElement {
+class UIElement : public AeroObject {
+    AERO_DECLARE_CLASS(UIElement, AeroObject)
 public:
     static constexpr std::uint32_t InvalidRenderNodeId = 0xFFFFFFFFu;
 
     UIElement();
-    virtual ~UIElement();
+    ~UIElement() override;
 
     [[nodiscard]] static std::uint64_t TotalConstructedCount() noexcept;
     [[nodiscard]] static std::uint64_t TotalDestroyedCount() noexcept;
@@ -198,48 +148,6 @@ public:
 
     UIElement(const UIElement&) = delete;
     UIElement& operator=(const UIElement&) = delete;
-
-    // Intrusive reference counting
-    void AddRef() const noexcept {
-        refCount_.fetch_add(1u, std::memory_order_relaxed);
-    }
-    void Release() const noexcept {
-        if (refCount_.fetch_sub(1u, std::memory_order_acq_rel) == 1u) {
-            if (ownedBySharedPtr_) {
-                auto holder = std::move(sharedSelfKeepAlive_);
-                return;
-            }
-            delete this;
-        }
-    }
-    void AdoptSharedOwnership(std::shared_ptr<UIElement> selfHolder) const noexcept {
-        ownedBySharedPtr_ = (selfHolder != nullptr);
-        sharedSelfKeepAlive_ = std::move(selfHolder);
-    }
-    [[nodiscard]] std::uint32_t RefCount() const noexcept {
-        return refCount_.load(std::memory_order_relaxed);
-    }
-
-    // Static TypeClass & O(1) Euler-tour RTTI
-    static const TypeClass* StaticTypeClass() noexcept;
-    [[nodiscard]] virtual const TypeClass* GetTypeClass() const noexcept {
-        return StaticTypeClass();
-    }
-    [[nodiscard]] bool IsA(const TypeClass* target) const noexcept {
-        return GetTypeClass()->IsDerivedFrom(target);
-    }
-    template <typename T>
-    [[nodiscard]] bool IsA() const noexcept {
-        return IsA(T::StaticTypeClass());
-    }
-    template <typename T>
-    [[nodiscard]] T* DynamicCast() noexcept {
-        return IsA<T>() ? static_cast<T*>(this) : nullptr;
-    }
-    template <typename T>
-    [[nodiscard]] const T* DynamicCast() const noexcept {
-        return IsA<T>() ? static_cast<const T*>(this) : nullptr;
-    }
 
     // Pure intrusive visual tree (0 std::vector allocation for child links)
     void SetAsRootVisual(
@@ -290,20 +198,43 @@ public:
         NativeHandleRegistry& registry,
         ManagedHeap& uiHeap) noexcept;
     [[nodiscard]] bool HasPinnedScriptWrapper() const noexcept {
-        return pinnedWrapperRoot_.valid();
+        return rareData_ && rareData_->pinnedWrapperRoot.valid();
     }
     [[nodiscard]] ObjectRef BoundScriptWrapper() const noexcept {
-        return boundWrapperRef_;
+        return rareData_ ? rareData_->boundWrapperRef : ObjectRef{};
     }
 
     // Element x:Name and O(N) subtree lookup (only for dynamic debugging; compiled code uses O(1) slots)
-    [[nodiscard]] const std::string& Name() const noexcept { return name_; }
-    void SetName(std::string name) noexcept { name_ = std::move(name); }
-    [[nodiscard]] const std::string& DeclaredTypeName() const noexcept { return declaredTypeName_; }
-    void SetDeclaredTypeName(std::string typeName) noexcept { declaredTypeName_ = std::move(typeName); }
+    [[nodiscard]] const std::string& Name() const noexcept {
+        if (!rareData_) {
+            static const std::string kEmpty;
+            return kEmpty;
+        }
+        return rareData_->name;
+    }
+    void SetName(std::string name) noexcept {
+        if (name.empty() && !rareData_) {
+            return;
+        }
+        EnsureRareData().name = std::move(name);
+    }
+    [[nodiscard]] const std::string& DeclaredTypeName() const noexcept {
+        if (!rareData_) {
+            static const std::string kEmpty;
+            return kEmpty;
+        }
+        return rareData_->declaredTypeName;
+    }
+    void SetDeclaredTypeName(std::string typeName) noexcept {
+        if (typeName.empty() && !rareData_) {
+            return;
+        }
+        EnsureRareData().declaredTypeName = std::move(typeName);
+    }
     [[nodiscard]] UIElement* FindName(std::string_view targetName) noexcept;
     void SetNamescopeBoundary(bool boundary) noexcept { isNamescopeBoundary_ = boundary; }
     [[nodiscard]] bool IsNamescopeBoundary() const noexcept { return isNamescopeBoundary_; }
+    [[nodiscard]] virtual bool IsSubtreeNamescopeBoundary() const noexcept { return false; }
     [[nodiscard]] static UIElement* FindNamescopeRoot(UIElement* elem) noexcept;
 
     // Layout geometry & Measure/Arrange lifecycle
@@ -432,26 +363,22 @@ public:
     }
     [[nodiscard]] bool CanReceiveFocus() const noexcept;
 
+    // Shared per-view service container + per-element overrides
+    void SetViewContext(UIViewContext* viewContext) noexcept {
+        viewContext_ = viewContext;
+    }
+    [[nodiscard]] UIViewContext* ViewContext() const noexcept {
+        return viewContext_;
+    }
+
     // Automatic TwoWay binding write-back linkage
-    void BindTwoWayEngine(DualTrackBindingEngine* engine) noexcept {
-        boundBindingEngine_ = engine;
-    }
-    [[nodiscard]] DualTrackBindingEngine* BoundTwoWayEngine() const noexcept {
-        return boundBindingEngine_;
-    }
+    void BindTwoWayEngine(DualTrackBindingEngine* engine) noexcept;
+    [[nodiscard]] DualTrackBindingEngine* BoundTwoWayEngine() const noexcept;
     bool NotifyTwoWayPropertyMutated(std::uint16_t propId, RuntimeError* error = nullptr);
-    void BindStyleEngine(StyleTriggerEngine* engine) noexcept {
-        boundStyleEngine_ = engine;
-    }
-    [[nodiscard]] StyleTriggerEngine* BoundStyleEngine() const noexcept {
-        return boundStyleEngine_;
-    }
-    void BindAnimationEngine(AnimationEngine* engine) noexcept {
-        boundAnimationEngine_ = engine;
-    }
-    [[nodiscard]] AnimationEngine* BoundAnimationEngine() const noexcept {
-        return boundAnimationEngine_;
-    }
+    void BindStyleEngine(StyleTriggerEngine* engine) noexcept;
+    [[nodiscard]] StyleTriggerEngine* BoundStyleEngine() const noexcept;
+    void BindAnimationEngine(AnimationEngine* engine) noexcept;
+    [[nodiscard]] AnimationEngine* BoundAnimationEngine() const noexcept;
     void MarkReferencedAsElementSource() const noexcept {
         referencedAsElementSource_ = true;
     }
@@ -500,6 +427,7 @@ public:
         bool hasArg = false);
     void SetHasRegisteredScriptWrapper(bool v) noexcept { hasRegisteredScriptWrapper_ = v; }
     [[nodiscard]] bool HasRegisteredScriptWrapper() const noexcept { return hasRegisteredScriptWrapper_; }
+    void DispatchLoadedSubtree(bool skipNestedUserControls = true);
 
     void SetMouseEnterCallback(SimpleUiEventCallback cb) { EnsureRareEvents().mouseEnter = std::move(cb); }
     void SetMouseLeaveCallback(SimpleUiEventCallback cb) { EnsureRareEvents().mouseLeave = std::move(cb); }
@@ -512,10 +440,22 @@ public:
     bool InvokeMouseDownCallback();
     bool InvokeMouseUpCallback();
 
-    void SetKeyDownCallback(KeyEventCallback cb) { keyDownCallback_ = std::move(cb); }
-    void SetKeyUpCallback(KeyEventCallback cb) { keyUpCallback_ = std::move(cb); }
+    void SetKeyDownCallback(KeyEventCallback cb) {
+        if (!cb && !rareData_) {
+            return;
+        }
+        EnsureRareData().keyDownCallback = std::move(cb);
+    }
+    void SetKeyUpCallback(KeyEventCallback cb) {
+        if (!cb && !rareData_) {
+            return;
+        }
+        EnsureRareData().keyUpCallback = std::move(cb);
+    }
     bool InvokeKeyDownCallback(KeyCode key, std::uint8_t modifiers) {
-        bool handled = keyDownCallback_ ? keyDownCallback_(*this, key, modifiers) : false;
+        bool handled = (rareData_ && rareData_->keyDownCallback)
+                           ? rareData_->keyDownCallback(*this, key, modifiers)
+                           : false;
         if (hasRegisteredScriptWrapper_) {
             const std::int64_t packed = static_cast<std::int64_t>(
                 static_cast<std::uint32_t>(key) | (static_cast<std::uint32_t>(modifiers) << 16u));
@@ -524,7 +464,9 @@ public:
         return handled;
     }
     bool InvokeKeyUpCallback(KeyCode key, std::uint8_t modifiers) {
-        bool handled = keyUpCallback_ ? keyUpCallback_(*this, key, modifiers) : false;
+        bool handled = (rareData_ && rareData_->keyUpCallback)
+                           ? rareData_->keyUpCallback(*this, key, modifiers)
+                           : false;
         if (hasRegisteredScriptWrapper_) {
             const std::int64_t packed = static_cast<std::int64_t>(
                 static_cast<std::uint32_t>(key) | (static_cast<std::uint32_t>(modifiers) << 16u));
@@ -861,7 +803,7 @@ public:
         std::uint16_t targetPropId,
         ValueConverterKind converter);
     void RegisterTemplateNamedPart(std::string_view partName, UIElement* partElement);
-    void RegisterTemplateContentPresenter(ContentPresenter* presenter);
+    void RegisterTemplateContentPresenter(UIElement* presenter);
     void SyncTemplateBindingsForProperty(std::uint16_t changedPropId) noexcept;
     void SyncTemplateBindingsForTarget(UIElement* target, std::uint16_t targetPropId) noexcept;
     void RefreshAllTemplateBindings() noexcept;
@@ -946,6 +888,161 @@ public:
     virtual void TickControl(float deltaSeconds) { (void)deltaSeconds; }
     [[nodiscard]] virtual bool NeedsContinuousTick() const { return false; }
 
+    // Decoupled polymorphic hooks implemented by specialized controls without core -> controls dependencies
+    [[nodiscard]] virtual bool SuppressImplicitBlurEffectKind() const noexcept { return false; }
+    [[nodiscard]] virtual bool IsOpenForHitTest() const noexcept { return true; }
+    [[nodiscard]] virtual bool IsChildHiddenByLayout(const UIElement* /*child*/) const noexcept { return false; }
+    [[nodiscard]] virtual const UIElement* GetCompositeHeaderElement() const noexcept { return nullptr; }
+    [[nodiscard]] virtual UIElement* GetLogicalHeaderElementForTemplate() const noexcept { return nullptr; }
+    [[nodiscard]] virtual bool ParticipatesInTemplateTextMetrics() const noexcept { return false; }
+    virtual void OnTemplatePropertiesUpdated(std::uint16_t /*changedPropId*/) noexcept {}
+    [[nodiscard]] virtual bool ShouldSkipControlTemplatePackage(const AxbPackage& /*package*/) const noexcept { return false; }
+    [[nodiscard]] virtual std::string GetTemplateContentSource() const { return {}; }
+    virtual void SyncTemplateContentHost() {}
+
+    // Wave 3 decoupling hooks: Accessibility
+    virtual void PopulateAriaInfo(AriaElementInfo& ioInfo) const;
+
+    // Wave 3 decoupling hooks: IME & Editable Text
+    [[nodiscard]] virtual bool IsEditableTextInput() const noexcept { return false; }
+    [[nodiscard]] virtual bool AcceptsActiveImeInput() const noexcept { return false; }
+    [[nodiscard]] virtual std::string GetEditableText() const { return {}; }
+    virtual void SetEditableText(std::string text) { (void)text; }
+    [[nodiscard]] virtual std::size_t GetEditableCaretIndex() const noexcept { return 0u; }
+    virtual void SetEditableCaretIndex(std::size_t idx) noexcept { (void)idx; }
+    [[nodiscard]] virtual Rect GetEditableCaretScreenRect() const noexcept { return {}; }
+    virtual bool InsertEditableText(std::string_view utf8Text) {
+        (void)utf8Text;
+        return false;
+    }
+    virtual void SelectAllEditableText() {}
+
+    // Wave 3 decoupling hooks: Input Routing
+    [[nodiscard]] virtual bool IsToolTipOverlayElement() const noexcept { return false; }
+    [[nodiscard]] virtual bool TracksPressedWithinBoundsDuringCapture() const noexcept { return false; }
+    [[nodiscard]] virtual bool HasDropdownOverlayBehavior() const noexcept { return false; }
+    [[nodiscard]] virtual bool IsDropdownOverlayOpen() const noexcept { return false; }
+    virtual void SetDropdownOverlayOpen(bool open) { (void)open; }
+    [[nodiscard]] virtual std::int32_t HitTestDropdownOverlayItem(Point screenPt) const noexcept {
+        (void)screenPt;
+        return -1;
+    }
+    virtual void SetHighlightedDropdownOverlayItem(std::int32_t idx) noexcept { (void)idx; }
+    virtual bool SelectDropdownOverlayItemInteractive(std::int32_t idx) {
+        (void)idx;
+        return false;
+    }
+    [[nodiscard]] virtual bool IsMenuRootContainer() const noexcept { return false; }
+    [[nodiscard]] virtual bool IsMenuSubmenuItem() const noexcept { return false; }
+    static void IncrementOpenMenuSubmenuCount() noexcept;
+    static void DecrementOpenMenuSubmenuCount() noexcept;
+    [[nodiscard]] static bool HasAnyOpenMenuSubmenu() noexcept;
+    [[nodiscard]] virtual bool SupportsAutoRepeatPress() const noexcept { return false; }
+    virtual bool ActivateAutoRepeatFromInput() { return false; }
+    virtual bool TryHandleMouseWheelScroll(float scrollDeltaX, float scrollDeltaY, bool shiftHeld) {
+        (void)scrollDeltaX;
+        (void)scrollDeltaY;
+        (void)shiftHeld;
+        return false;
+    }
+    [[nodiscard]] virtual bool HandlesBubbledScrollKeys() const noexcept { return false; }
+    [[nodiscard]] virtual bool HandlesCtrlTabNavigation() const noexcept { return false; }
+
+    [[nodiscard]] static IntrusivePtr<UIElement> CreateRegisteredElement(std::string_view typeName);
+    [[nodiscard]] static bool MountRegisteredPackage(
+        UIElement* rootControl,
+        const AxbPackage& package,
+        ExecutionDomainContext* domains = nullptr,
+        DualTrackBindingEngine* bindingEngine = nullptr,
+        ObjectRef dataContext = {},
+        const Interpreter* eventInterpreter = nullptr,
+        rs_aot::ExecutionContext* eventAotContext = nullptr,
+        AnimationEngine* animationEngine = nullptr);
+    [[nodiscard]] static bool DispatchRegisteredRoutedCommandBubble(
+        UIElement* startElement,
+        std::string_view commandName,
+        const UnifiedValue& commandParameter = UnifiedValue{},
+        bool hasCommandParameter = false);
+
+    // Wave 3 decoupling hooks: Style & Binding
+    [[nodiscard]] virtual bool MatchesXamlAncestorTypeAlias(std::string_view wantedType) const noexcept;
+    [[nodiscard]] virtual bool MatchesBindingAncestorLegacyFallback(std::string_view targetType) const noexcept;
+    virtual void AssignContainerStyleEngine(StyleTriggerEngine* engine) noexcept { (void)engine; }
+    [[nodiscard]] virtual bool TryExecuteSelectContainerAction(UIElement* originTarget) {
+        (void)originTarget;
+        return false;
+    }
+    [[nodiscard]] virtual bool SupportsImplicitChromeStyleProperties() const noexcept { return false; }
+    virtual void PlayMediaAction() {}
+    virtual void StopMediaAction() {}
+    [[nodiscard]] virtual std::uint32_t GetMediaEndedGeneration() const noexcept { return 0u; }
+    [[nodiscard]] virtual bool TryGetRichTextDisplayString(std::string& outText) const {
+        (void)outText;
+        return false;
+    }
+    [[nodiscard]] virtual bool TryGetResolvedHeaderText(std::string& outHeader) const {
+        (void)outHeader;
+        return false;
+    }
+    [[nodiscard]] virtual bool TryApplyIncrementalCollectionChanges(
+        const CollectionChangeRecord* deltas,
+        std::size_t count) {
+        (void)deltas;
+        (void)count;
+        return false;
+    }
+
+    // Wave 3 decoupling hooks: Render
+    [[nodiscard]] virtual bool TryGetRenderGlyphScanText(std::string& outText) const {
+        (void)outText;
+        return false;
+    }
+    [[nodiscard]] virtual RenderInPlaceResult TryUpdateRenderElementInPlace(
+        PagedRenderTree& tree,
+        const PagedRenderTraversalState& curState,
+        Rect r,
+        float boxW,
+        float boxH,
+        float effOpacity) const;
+    [[nodiscard]] virtual bool RequiresFullRenderRebuildOnDirty() const noexcept { return false; }
+    [[nodiscard]] virtual bool SuppressesUntemplatedRenderChildren() const noexcept { return false; }
+    [[nodiscard]] virtual bool ShouldEmitRenderChild(
+        const UIElement* child,
+        bool& outCollapseSubtree,
+        const UIElement*& outFallbackHeaderOnly) const noexcept;
+    [[nodiscard]] virtual bool HasOwnOpaqueShadowSurfaceForRender() const noexcept { return false; }
+    [[nodiscard]] virtual bool TryGetBackdropBlurVectorMask(
+        std::string& outPathData,
+        Stretch& outStretch) const {
+        (void)outPathData;
+        (void)outStretch;
+        return false;
+    }
+    virtual bool EmitRenderDropShadowPrimitives(
+        PagedRenderTree& tree,
+        const PagedRenderTraversalState& curState,
+        float effOpacity,
+        float sdx,
+        float sdy,
+        float localBlurR,
+        const Color& shCol,
+        const UIElement* shadowOwner,
+        std::uint16_t& ioEmittedCount) const;
+    virtual bool EmitRenderVisualPrimitives(
+        PagedRenderTree& tree,
+        const PagedRenderTraversalState& curState,
+        Rect r,
+        float w,
+        float h,
+        float effOpacity,
+        std::uint16_t& ioEmittedCount) const;
+    virtual void EmitDeferredOverlayPopupPrimitives(
+        PagedRenderTree& tree,
+        const PagedRenderTraversalState& st) const {
+        (void)tree;
+        (void)st;
+    }
+
 protected:
     void CoerceSparseFloatInPlace(std::uint16_t propId, float clampedValue) noexcept;
     void EnsureRegisteredInValuePoolSet() noexcept;
@@ -954,6 +1051,7 @@ protected:
 private:
     friend class DepthBucketLayoutQueue;
 
+    void NotifySparsePropertyInvalidation(std::uint16_t propId) noexcept;
     [[nodiscard]] Matrix2D ComputeLocalToScreenMatrix2D() const noexcept;
     void PropagateEnabledStateToSubtree() noexcept;
     void PropagateRootConnection(
@@ -972,8 +1070,6 @@ private:
         }
     }
     void UpdateSubtreeDepth(std::uint16_t newDepth) noexcept;
-
-    mutable std::atomic<std::uint32_t> refCount_{0};
 
     // Intrusive visual tree pointers
     UIElement* parent_ = nullptr;
@@ -1000,32 +1096,72 @@ private:
     Size measuredCoreSize_{0.0f, 0.0f};
     Size desiredSize_{0.0f, 0.0f};
     Rect finalRect_{0.0f, 0.0f, 0.0f, 0.0f};
-    std::string name_;
-    std::string declaredTypeName_;
     std::uint32_t bubbledClickGen_ = 0u;
-    KeyEventCallback keyDownCallback_;
-    KeyEventCallback keyUpCallback_;
 
-    // Zero-hash NativeHandle slot, binding engine backlink & generation cache
-    NativeHandle cachedNativeHandle_{};
-    NativeHandleRegistry* boundRegistry_ = nullptr;
-    ManagedHeap* boundUiHeap_ = nullptr;
-    DualTrackBindingEngine* boundBindingEngine_ = nullptr;
-    StyleTriggerEngine* boundStyleEngine_ = nullptr;
-    AnimationEngine* boundAnimationEngine_ = nullptr;
-    ObjectRef boundWrapperRef_{};
-    PersistentRoot pinnedWrapperRoot_{};
+    UIViewContext* viewContext_ = nullptr;
     bool isConnectedToRoot_ = false;
     bool registeredInValuePoolSet_ = false;
     bool isNamescopeBoundary_ = false;
     bool isHitTestVisible_ = true;
     bool hasRegisteredScriptWrapper_ = false;
     mutable bool referencedAsElementSource_ = false;
-    std::unique_ptr<RareEventCallbacks> rareEvents_;
-    RareEventCallbacks& EnsureRareEvents() {
-        if (!rareEvents_) rareEvents_ = std::make_unique<RareEventCallbacks>();
-        return *rareEvents_;
+
+    struct RareElementData {
+        std::string name;
+        std::string declaredTypeName;
+        NativeHandle cachedNativeHandle{};
+        ObjectRef boundWrapperRef{};
+        PersistentRoot pinnedWrapperRoot{};
+        NativeHandleRegistry* boundRegistry = nullptr;
+        ManagedHeap* boundUiHeap = nullptr;
+        DualTrackBindingEngine* boundBindingEngine = nullptr;
+        StyleTriggerEngine* boundStyleEngine = nullptr;
+        AnimationEngine* boundAnimationEngine = nullptr;
+        KeyEventCallback keyDownCallback;
+        KeyEventCallback keyUpCallback;
+        RareEventCallbacks events;
+    };
+
+    RareElementData& EnsureRareData() const {
+        if (!rareData_) {
+            rareData_ = std::make_unique<RareElementData>();
+        }
+        return *rareData_;
     }
+
+    RareEventCallbacks& EnsureRareEvents() {
+        return EnsureRareData().events;
+    }
+
+    template <typename EngineT, EngineT* RareElementData::* RareField>
+    void BindInheritedEngineOverride(EngineT* engine) noexcept {
+        if (!engine && !rareData_) {
+            return;
+        }
+        EnsureRareData().*RareField = engine;
+    }
+
+    template <
+        typename EngineT,
+        EngineT* RareElementData::* RareField,
+        EngineT* (UIViewContext::* ViewGetter)() const noexcept>
+    [[nodiscard]] EngineT* ResolveInheritedEngine() const noexcept {
+        for (const UIElement* cur = this;
+             cur != nullptr;
+             cur = cur->parent_ ? cur->parent_ : cur->templatedParent_) {
+            if (cur->rareData_ && (cur->rareData_.get()->*RareField)) {
+                return cur->rareData_.get()->*RareField;
+            }
+            if (cur->viewContext_) {
+                if (EngineT* eng = (cur->viewContext_->*ViewGetter)()) {
+                    return eng;
+                }
+            }
+        }
+        return nullptr;
+    }
+
+    mutable std::unique_ptr<RareElementData> rareData_;
     void OnHoveredChanged(bool hovered) noexcept;
     std::uint16_t fastActiveAnimMask_ = 0u;
     std::array<std::uint8_t, kFastInlinePropertySlotCount> fastInlineRanks_{};
@@ -1043,124 +1179,42 @@ private:
     // High-frequency properties inline + 32B compact sparse vector
     FastInlineStorage fastProps_{};
     std::vector<CompactPropertyEntry> sparseProps_;
-    mutable std::shared_ptr<UIElement> sharedSelfKeepAlive_;
-    mutable bool ownedBySharedPtr_ = false;
 };
 
-class Panel : public UIElement {
-public:
-    Panel();
-    ~Panel() override = default;
+inline void UIElement::BindTwoWayEngine(DualTrackBindingEngine* engine) noexcept {
+    BindInheritedEngineOverride<DualTrackBindingEngine, &RareElementData::boundBindingEngine>(engine);
+}
 
-    static const TypeClass* StaticTypeClass() noexcept;
-    [[nodiscard]] const TypeClass* GetTypeClass() const noexcept override {
-        return StaticTypeClass();
-    }
-};
+inline DualTrackBindingEngine* UIElement::BoundTwoWayEngine() const noexcept {
+    return ResolveInheritedEngine<
+        DualTrackBindingEngine,
+        &RareElementData::boundBindingEngine,
+        &UIViewContext::GetBindingEngine>();
+}
 
-class Window : public Panel {
-public:
-    Window();
-    explicit Window(
-        std::string_view className,
-        ExecutionDomainContext* domains = nullptr,
-        DualTrackBindingEngine* bindingEngine = nullptr,
-        ObjectRef dataContext = {},
-        const Interpreter* eventInterpreter = nullptr,
-        rs_aot::ExecutionContext* eventAotContext = nullptr,
-        AnimationEngine* animationEngine = nullptr);
-    ~Window() override = default;
+inline void UIElement::BindStyleEngine(StyleTriggerEngine* engine) noexcept {
+    BindInheritedEngineOverride<StyleTriggerEngine, &RareElementData::boundStyleEngine>(engine);
+}
 
-    static const TypeClass* StaticTypeClass() noexcept;
-    [[nodiscard]] const TypeClass* GetTypeClass() const noexcept override {
-        return StaticTypeClass();
-    }
+inline StyleTriggerEngine* UIElement::BoundStyleEngine() const noexcept {
+    return ResolveInheritedEngine<
+        StyleTriggerEngine,
+        &RareElementData::boundStyleEngine,
+        &UIViewContext::GetStyleEngine>();
+}
 
-    [[nodiscard]] const std::string& WindowClassName() const noexcept {
-        return windowClassName_;
-    }
-    [[nodiscard]] bool IsTemplateMounted() const noexcept {
-        return templateMounted_;
-    }
+inline void UIElement::BindAnimationEngine(AnimationEngine* engine) noexcept {
+    BindInheritedEngineOverride<AnimationEngine, &RareElementData::boundAnimationEngine>(engine);
+}
 
-    bool MountTemplate(
-        const AxbPackage& package,
-        ExecutionDomainContext* domains = nullptr,
-        DualTrackBindingEngine* bindingEngine = nullptr,
-        ObjectRef dataContext = {},
-        const Interpreter* eventInterpreter = nullptr,
-        rs_aot::ExecutionContext* eventAotContext = nullptr,
-        AnimationEngine* animationEngine = nullptr);
+inline AnimationEngine* UIElement::BoundAnimationEngine() const noexcept {
+    return ResolveInheritedEngine<
+        AnimationEngine,
+        &RareElementData::boundAnimationEngine,
+        &UIViewContext::GetAnimationEngine>();
+}
 
-private:
-    std::string windowClassName_;
-    bool templateMounted_ = false;
-};
-
-class Button : public UIElement {
-public:
-    using ClickCallback = std::function<void(Button&)>;
-
-    Button();
-    ~Button() override = default;
-
-    static const TypeClass* StaticTypeClass() noexcept;
-    [[nodiscard]] const TypeClass* GetTypeClass() const noexcept override {
-        return StaticTypeClass();
-    }
-
-    [[nodiscard]] bool DefaultFocusable() const noexcept override { return true; }
-
-    void SetContentText(std::string_view text);
-    [[nodiscard]] std::string GetContentText() const;
-
-    void SetClickCallback(ClickCallback callback) {
-        clickCallback_ = std::move(callback);
-    }
-    void BindScriptClickHandler(
-        const Interpreter* interpreter,
-        ObjectRef targetObject,
-        SymbolId methodSymbolId) noexcept {
-        scriptInterpreter_ = interpreter;
-        scriptAotContext_ = nullptr;
-        scriptTargetObject_ = targetObject;
-        scriptClickMethodId_ = methodSymbolId;
-    }
-    void BindAotClickHandler(
-        rs_aot::ExecutionContext* aotContext,
-        ObjectRef targetObject,
-        SymbolId methodSymbolId) noexcept {
-        scriptAotContext_ = aotContext;
-        scriptInterpreter_ = nullptr;
-        scriptTargetObject_ = targetObject;
-        scriptClickMethodId_ = methodSymbolId;
-    }
-    bool PerformClick(RuntimeError* error = nullptr);
-    virtual bool ActivateFromInput(RuntimeError* error = nullptr);
-    [[nodiscard]] std::uint32_t ClickGeneration() const noexcept { return clickGeneration_; }
-
-    bool OnPointerDown(
-        Point localPoint,
-        PointerButton button,
-        std::uint8_t modifiers,
-        bool& outRequestCapture) override;
-    bool OnPointerUp(
-        Point localPoint,
-        PointerButton button,
-        std::uint8_t modifiers,
-        bool insideBounds) override;
-    bool OnKeyDown(KeyCode key, std::uint8_t modifiers) override;
-
-    Size MeasureCore(Size availableSize) noexcept override;
-
-private:
-    ClickCallback clickCallback_;
-    const Interpreter* scriptInterpreter_ = nullptr;
-    rs_aot::ExecutionContext* scriptAotContext_ = nullptr;
-    ObjectRef scriptTargetObject_{};
-    SymbolId scriptClickMethodId_ = 0;
-    std::uint32_t clickGeneration_ = 0u;
-};
+using FrameworkElement = UIElement;
 
 // Initialize built-in AeroGUI TypeClass hierarchy and Euler-tour intervals
 void EnsureBuiltinTypesRegistered() noexcept;
@@ -1171,9 +1225,47 @@ std::size_t TickLiveControlsInSubtree(UIElement* root, float dtSeconds);
 // P1-2: Zero-ABI-overhead lifecycle & Loc.Source hooks for weak DynamicResource / Loc cleanup
 using UIElementDestroyHook = void (*)(const UIElement* element) noexcept;
 using UIElementLocSourceHook = void (*)(UIElement* element, std::string_view locSourceUri);
+using UIElementFactoryByTypeHook = IntrusivePtr<UIElement> (*)(std::string_view typeName);
+using UIElementControlTemplateMountHook = bool (*)(
+    UIElement* hostControl,
+    UIElement* templateRootControl,
+    const AxbPackage& templatePackage,
+    ExecutionDomainContext* domains,
+    DualTrackBindingEngine* bindingEngine,
+    ObjectRef dataContext,
+    const Interpreter* eventInterpreter,
+    rs_aot::ExecutionContext* eventAotContext,
+    AnimationEngine* animationEngine);
 
 void RegisterUIElementResourceHooks(
     UIElementDestroyHook onDestroyed,
     UIElementLocSourceHook onLocSourceChanged) noexcept;
+
+void RegisterUIElementTemplateHooks(
+    UIElementFactoryByTypeHook createByTypeName,
+    UIElementControlTemplateMountHook mountControlTemplate) noexcept;
+
+using UIElementPackageMountHook = bool (*)(
+    UIElement* rootControl,
+    const AxbPackage& package,
+    ExecutionDomainContext* domains,
+    DualTrackBindingEngine* bindingEngine,
+    ObjectRef dataContext,
+    const Interpreter* eventInterpreter,
+    rs_aot::ExecutionContext* eventAotContext,
+    AnimationEngine* animationEngine);
+using UIElementRoutedCommandHook = bool (*)(
+    UIElement* startElement,
+    std::string_view commandName,
+    const UnifiedValue& commandParameter,
+    bool hasCommandParameter);
+
+void RegisterUIElementInteractionHooks(
+    UIElementPackageMountHook mountPackage,
+    UIElementRoutedCommandHook executeCommand) noexcept;
+
+[[nodiscard]] std::string StripAndResolveRichTextBbCode(
+    std::string_view rawBbCode,
+    const UIElement* owner);
 
 } // namespace aero

@@ -18,23 +18,25 @@
 
 ## 2. 16 个静态/动画 XAML 场景 CPU 黄金像素基准表（跨 13 个示例工程，`320x180` RGBA8）
 
+> 注：表中“FNV-1a 64-bit 黄金哈希”已与 [`tests/samples_golden_regression_tests.cpp`](../tests/samples_golden_regression_tests.cpp) 对齐（含 `BlurEffect` / `BackgroundEffectBehavior` 按 `worldScale` 缩放后更新的 `QuestLog`、`Rive`、`Effects`、`BackgroundBlur` 4 场景哈希，以及 `Brushes`、`Gallery_Blending`、`BrushShaders` 现行黄金哈希）；节点数、页数与耗时列保留原基准快照实测值。
+
 | 场景名称 | XAML 路径 | 字体数 | 渲染节点 | 4KB 页数 | 非空像素数 | 覆盖率 | 独立色彩数 | FNV-1a 64-bit 黄金哈希 | 编译 (ms) | 挂载+样式 (ms) | 布局 (ms) | 建树 (ms) | 光栅化 (ms) |
 | :--- | :--- | ---: | ---: | ---: | ---: | ---: | ---: | :--- | ---: | ---: | ---: | ---: | ---: |
 | `HelloWorld` | `HelloWorld/Data/MainPage.xaml` | 1 | 15 | 2 | 57600 | 100.0% | 648 | `0x7863b040a6dc4444` | 0.52 | 0.15 | 0.04 | 0.21 | 1.43 |
 | `Login` | `Login/Data/MainPage.xaml` | 1 | 24 | 5 | 57600 | 100.0% | 980 | `0xe52312950e1871af` | 2.51 | 2.02 | 0.05 | 0.36 | 2.46 |
 | `Buttons` | `Buttons/Data/MainPage.xaml` | 1 | 46 | 3 | 57600 | 100.0% | 1323 | `0x1dc81e85638e4134` | 1.75 | 1.43 | 0.07 | 0.22 | 3.40 |
-| `QuestLog` | `QuestLog/Data/MainPage.xaml` | 2 | 52 | 7 | 57489 | 99.8% | 8723 | `0x57a28126d5c058ef` | 3.77 | 2.07 | 0.07 | 46.86 | 11.24 |
+| `QuestLog` | `QuestLog/Data/MainPage.xaml` | 2 | 52 | 7 | 57489 | 99.8% | 8723 | `0x9be414c1322db398` | 3.77 | 2.07 | 0.07 | 46.86 | 11.24 |
 | `Inventory` | `Inventory/Data/MainPage.xaml` | 2 | 224 | 22 | 57600 | 100.0% | 8039 | `0xdc85cde6a258c5e5` | 3.88 | 3.47 | 0.25 | 94.80 | 5.73 |
 | `Scoreboard` | `Scoreboard/Data/MainPage.xaml` | 2 | 55 | 10 | 57600 | 100.0% | 1236 | `0x063ca2044a4f5443` | 4.29 | 0.40 | 0.12 | 0.54 | 6.86 |
 | `TicTacToe` | `TicTacToe/Data/MainPage.xaml` | 0 | 257 | 11 | 57600 | 100.0% | 4094 | `0xdf6758fc356ab321` | 13.42 | 6.12 | 0.22 | 5.51 | 6.87 |
 | `Localization` | `Localization/Data/MainPage.xaml` | 5 | 65 | 27 | 57600 | 100.0% | 2491 | `0xa3d3d035b759cae9` | 1.58 | 0.37 | 0.11 | 10.84 | 3.08 |
 | `Gallery` | `Gallery/Data/MainWindow.xaml` | 7 | 64 | 12 | 57600 | 100.0% | 1121 | `0x97982bf0a0b5c10a` | 17.24 | 16.18 | 4.99 | 5.22 | 1.93 |
-| `Brushes` | `Gallery/Data/Samples/Brushes.xaml` | 7 | 277 | 51 | 35456 | 61.6% | 1188 | `0xf5fbaa4f98c890f5` | 1.02 | 16.01 | 0.18 | 1.17 | 0.92 |
-| `Gallery_Blending` | `Gallery/Data/Samples/Blending.xaml` | 7 | 76 | 26 | 28920 | 50.2% | 3726 | `0xf81782644ae39d27` | 0.34 | 15.31 | 18.91 | 0.17 | 1.19 |
-| `Rive` | `Rive/Data/MainPage.xaml` | 0 | 1248 | 32 | 57600 | 100.0% | 7307 | `0xb5434a846c223365` | 0.53 | 16.51 | 0.59 | 2.40 | 49.36 |
-| `Effects` | `Gallery/Data/Samples/Effects.xaml` | 7 | 150 | 28 | 39463 | 68.5% | 5493 | `0x625000cc7552dd34` | 0.53 | 15.61 | 0.45 | 0.55 | 1.27 |
-| `BackgroundBlur` | `BackgroundBlur/Data/MainPage.xaml` | 1 | 62 | 8 | 57578 | 100.0% | 27858 | `0x637465c308a7b16c` | 1.82 | 1.48 | 0.07 | 152.47 | 12.38 |
-| `BrushShaders` | `BrushShaders/Data/MainPage.xaml` | 1 | 59 | 3 | 57600 | 100.0% | 1873 | `0x9ca3061feedf5fd5` | 1.81 | 0.35 | 0.07 | 0.47 | 4.44 |
+| `Brushes` | `Gallery/Data/Samples/Brushes.xaml` | 7 | 277 | 51 | 35456 | 61.6% | 1188 | `0x560db0a00d704ffc` | 1.02 | 16.01 | 0.18 | 1.17 | 0.92 |
+| `Gallery_Blending` | `Gallery/Data/Samples/Blending.xaml` | 7 | 76 | 26 | 28920 | 50.2% | 3726 | `0xfefc265287ff59ec` | 0.34 | 15.31 | 18.91 | 0.17 | 1.19 |
+| `Rive` | `Rive/Data/MainPage.xaml` | 0 | 1248 | 32 | 57600 | 100.0% | 7307 | `0xd865d968ca178016` | 0.53 | 16.51 | 0.59 | 2.40 | 49.36 |
+| `Effects` | `Gallery/Data/Samples/Effects.xaml` | 7 | 150 | 28 | 39463 | 68.5% | 5493 | `0x37d8faabef45ffc7` | 0.53 | 15.61 | 0.45 | 0.55 | 1.27 |
+| `BackgroundBlur` | `BackgroundBlur/Data/MainPage.xaml` | 1 | 62 | 8 | 57578 | 100.0% | 27858 | `0x05b834a7730831a1` | 1.82 | 1.48 | 0.07 | 152.47 | 12.38 |
+| `BrushShaders` | `BrushShaders/Data/MainPage.xaml` | 1 | 59 | 3 | 57600 | 100.0% | 1873 | `0x6e903983482a68a8` | 1.81 | 0.35 | 0.07 | 0.47 | 4.44 |
 | `UserControl` | `UserControl/Data/MainPage.xaml` | 1 | 74 | 8 | 57600 | 100.0% | 1559 | `0x261e72f064aeb55c` | 0.72 | 0.51 | 0.04 | 0.12 | 2.83 |
 
 ## 3. 全部 9 个官方 Rive v7 (`.riv`) 二进制资产解码统计表

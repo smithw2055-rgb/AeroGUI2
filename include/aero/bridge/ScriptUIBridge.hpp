@@ -64,23 +64,23 @@ struct ReactivePropertyBinding {
 };
 
 // ============================================================================
-// ScriptUiBridge (P2-1 Unified Compatibility Facade):
+// ScriptUIBridge (P2-1 Unified Compatibility Facade):
 // Zero-duplicate-polling lightweight facade delegating all reactive & two-way
 // property bindings directly to an owned or externally injected DualTrackBindingEngine.
 // ============================================================================
-class ScriptUiBridge {
+class ScriptUIBridge {
 public:
-    explicit ScriptUiBridge(
+    explicit ScriptUIBridge(
         ExecutionDomainContext& domains,
         const ProgramImage* program = nullptr,
         const Interpreter* uiInterpreter = nullptr);
 
-    explicit ScriptUiBridge(DualTrackBindingEngine& externalEngine) noexcept;
+    explicit ScriptUIBridge(DualTrackBindingEngine& externalEngine) noexcept;
 
-    ~ScriptUiBridge() noexcept;
+    ~ScriptUIBridge() noexcept;
 
-    ScriptUiBridge(const ScriptUiBridge&) = delete;
-    ScriptUiBridge& operator=(const ScriptUiBridge&) = delete;
+    ScriptUIBridge(const ScriptUIBridge&) = delete;
+    ScriptUIBridge& operator=(const ScriptUIBridge&) = delete;
 
     void SetUnderlyingEngine(DualTrackBindingEngine* externalEngine) noexcept;
 

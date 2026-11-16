@@ -33,6 +33,8 @@ struct NativeWindowConfig {
     bool preferHardwareGpu = true;
     bool allowHeadlessFallback = true;
     bool forceHeadless = false;
+    bool enableHighDpi = true;
+    float dpiScale = 0.0f;
     std::size_t maxPagesInRing = 256u;
     std::uint32_t defaultAtlasSize = 256u;
     float animationFrameIntervalMs = 16.0f;
@@ -80,11 +82,11 @@ public:
     // Optional injection of custom IGpuDeviceBackend (e.g. mock GL spy backend in unit tests)
     void SetCustomGpuBackend(std::unique_ptr<IGpuDeviceBackend> customBackend) noexcept;
 
-    // Optional binding of dedicated UiResourceContext (falls back to desktopHost_/webHost_ context when unset)
-    void SetResourceContext(std::shared_ptr<UiResourceContext> context) noexcept {
+    // Optional binding of dedicated UIResourceContext (falls back to desktopHost_/webHost_ context when unset)
+    void SetResourceContext(std::shared_ptr<UIResourceContext> context) noexcept {
         resourceContext_ = std::move(context);
     }
-    [[nodiscard]] std::shared_ptr<UiResourceContext> GetResourceContext() const noexcept {
+    [[nodiscard]] std::shared_ptr<UIResourceContext> GetResourceContext() const noexcept {
         return EffectiveResourceContext();
     }
 
@@ -144,6 +146,10 @@ public:
 
     [[nodiscard]] std::uint32_t Width() const noexcept { return width_; }
     [[nodiscard]] std::uint32_t Height() const noexcept { return height_; }
+    [[nodiscard]] std::uint32_t LogicalWidth() const noexcept { return logicalWidth_; }
+    [[nodiscard]] std::uint32_t LogicalHeight() const noexcept { return logicalHeight_; }
+    [[nodiscard]] float DpiScale() const noexcept { return dpiScale_; }
+    void UpdateDpiScale(float newDpiScale) noexcept;
     [[nodiscard]] Color ClearColor() const noexcept { return clearColor_; }
     void SetClearColor(Color color) noexcept { clearColor_ = color; }
 
@@ -167,7 +173,7 @@ private:
     void SyncNativeImeSpot(Rect caretRect, bool active) noexcept;
     [[nodiscard]] bool CanHostSleepIdle() const noexcept;
     void NotifyHostInputArrived() noexcept;
-    [[nodiscard]] std::shared_ptr<UiResourceContext> EffectiveResourceContext() const noexcept;
+    [[nodiscard]] std::shared_ptr<UIResourceContext> EffectiveResourceContext() const noexcept;
 
 #if defined(_WIN32)
     bool EnsureWin32ImmLoaded() noexcept;
@@ -178,7 +184,7 @@ private:
 
     DesktopEventHost* desktopHost_ = nullptr;
     WebCanvasHost* webHost_ = nullptr;
-    std::shared_ptr<UiResourceContext> resourceContext_{};
+    std::shared_ptr<UIResourceContext> resourceContext_{};
     PagedRenderTree* renderTree_ = nullptr;
     InputEventRouter* inputRouter_ = nullptr;
     std::unique_ptr<ZeroCopyGpuStream> ownedGpuStream_;
@@ -190,6 +196,9 @@ private:
     NativeWindowMode mode_ = NativeWindowMode::Uninitialized;
     std::uint32_t width_ = 1280u;
     std::uint32_t height_ = 720u;
+    std::uint32_t logicalWidth_ = 1280u;
+    std::uint32_t logicalHeight_ = 720u;
+    float dpiScale_ = 1.0f;
     Color clearColor_{0.06f, 0.08f, 0.11f, 1.0f};
     Point lastPointerPos_{0.0f, 0.0f};
     std::uint8_t activeModifiers_ = KeyMod_None;

@@ -1,30 +1,21 @@
 #include "aero/style/StyleTriggerEngine.hpp"
 
 #include <algorithm>
-#include <mutex>
 #include <cctype>
 #include <charconv>
 #include <cmath>
-#include <cstdlib>
+#include <mutex>
 
-#include "aero/controls/Controls.hpp"
-#include "aero/core/UiResourceContext.hpp"
+#include "aero/asset/AxbTemplateRegistry.hpp"
+#include "aero/binding/PropertyPathUtils.hpp"
+#include "aero/core/StringUtils.hpp"
+#include "aero/core/UIResourceContext.hpp"
 #include "realscript/bytecode/Bytecode.h"
 #include "realscript/aot_cpp/AotRuntime.h"
 
 namespace aero {
 
 namespace {
-
-[[nodiscard]] std::string_view ShortTypeNameView(std::string_view raw) noexcept {
-    if (const auto colon = raw.rfind(':'); colon != std::string_view::npos) {
-        raw = raw.substr(colon + 1u);
-    }
-    if (const auto dot = raw.rfind('.'); dot != std::string_view::npos) {
-        raw = raw.substr(dot + 1u);
-    }
-    return raw;
-}
 
 [[nodiscard]] bool MatchesXamlAncestorType(
     const UIElement* anc,
@@ -36,60 +27,11 @@ namespace {
         return true;
     }
     for (const TypeClass* tc = anc->GetTypeClass(); tc != nullptr; tc = tc->baseClass) {
-        if (tc->typeName && ShortTypeNameView(tc->typeName) == wantedType) {
+        if (tc->typeName && str::ShortTypeName(tc->typeName) == wantedType) {
             return true;
         }
     }
-    if (wantedType == "ToggleButton") {
-        return anc->IsA<CheckBox>() || anc->IsA<RadioButton>();
-    }
-    if (wantedType == "Page") {
-        return anc->IsA<UserControl>() || anc->IsA<Window>();
-    }
-    if (wantedType == "ContentControl" ||
-        wantedType == "ListBoxItem" ||
-        wantedType == "ComboBoxItem" ||
-        wantedType == "ListViewItem" ||
-        wantedType == "TreeViewItem") {
-        return anc->IsA<Border>() || anc->IsA<ContentPresenter>() || anc->IsA<UserControl>();
-    }
-    if (wantedType == "RepeatButton" || wantedType == "Hyperlink" || wantedType == "MenuItem") {
-        return anc->IsA<Button>();
-    }
-    if (wantedType == "ListView") {
-        return anc->IsA<ListBox>();
-    }
-    if (wantedType == "TreeView") {
-        return anc->IsA<ItemsControl>();
-    }
-    if (wantedType == "FrameworkElement" || wantedType == "Control") {
-        return true;
-    }
-    return false;
-}
-
-[[nodiscard]] bool EqualsAsciiIgnoreCase(std::string_view a, std::string_view b) noexcept {
-    if (a.size() != b.size()) return false;
-    for (std::size_t i = 0u; i < a.size(); ++i) {
-        if (std::tolower(static_cast<unsigned char>(a[i])) !=
-            std::tolower(static_cast<unsigned char>(b[i]))) {
-            return false;
-        }
-    }
-    return true;
-}
-
-[[nodiscard]] bool TryParseStackFloat(std::string_view s, float& outVal) noexcept {
-    while (!s.empty() && std::isspace(static_cast<unsigned char>(s.front()))) s.remove_prefix(1);
-    while (!s.empty() && std::isspace(static_cast<unsigned char>(s.back()))) s.remove_suffix(1);
-    if (s.empty() || s.size() >= 60u) return false;
-    char buf[64]{};
-    for (std::size_t i = 0u; i < s.size(); ++i) buf[i] = s[i];
-    char* end = nullptr;
-    const float v = std::strtof(buf, &end);
-    if (end != buf + s.size()) return false;
-    outVal = v;
-    return true;
+    return anc->MatchesXamlAncestorTypeAlias(wantedType);
 }
 
 [[nodiscard]] bool TryExtractIntOrEnum(const UnifiedValue& v, std::int64_t& outInt) noexcept {
@@ -106,39 +48,33 @@ namespace {
 }
 
 [[nodiscard]] bool UnifiedValuesEqual(const UnifiedValue& a, const UnifiedValue& b) noexcept {
+    if (aero::UnifiedValueEquals(a, b, 1e-4f)) {
+        return true;
+    }
     if (const auto* ab = std::get_if<bool>(&a)) {
-        if (const auto* bb = std::get_if<bool>(&b)) return *ab == *bb;
         std::int64_t bi = 0;
-        if (TryExtractIntOrEnum(b, bi)) return *ab == (bi != 0);
+        return TryExtractIntOrEnum(b, bi) && (*ab == (bi != 0));
     }
     std::int64_t ai = 0;
     if (TryExtractIntOrEnum(a, ai)) {
         std::int64_t bi = 0;
-        if (TryExtractIntOrEnum(b, bi)) return ai == bi;
-        if (const auto* bb = std::get_if<bool>(&b)) return (ai != 0) == *bb;
-    }
-    float af = 0.0f;
-    float bf = 0.0f;
-    if (TryGetFloat(a, af) && TryGetFloat(b, bf) &&
-        !std::holds_alternative<bool>(a) && !std::holds_alternative<bool>(b)) {
-        return std::fabs(af - bf) <= 1e-4f;
-    }
-    Float4Value af4{};
-    Float4Value bf4{};
-    if (a.tryGetQuatf(af4) && b.tryGetQuatf(bf4)) {
-        return af4 == bf4;
-    }
-    if (const auto* as = std::get_if<StringValue>(&a)) {
-        if (const auto* bs = std::get_if<StringValue>(&b)) {
-            return as->view() == bs->view();
+        if (TryExtractIntOrEnum(b, bi)) {
+            return ai == bi;
+        }
+        if (const auto* bb = std::get_if<bool>(&b)) {
+            return (ai != 0) == *bb;
         }
     }
-    if (const auto* ao = std::get_if<ObjectRef>(&a)) {
-        if (const auto* bo = std::get_if<ObjectRef>(&b)) {
-            return *ao == *bo;
+    if ((std::holds_alternative<std::int64_t>(a) || std::holds_alternative<std::int64_t>(b)) &&
+        !std::holds_alternative<bool>(a) && !std::holds_alternative<bool>(b) &&
+        !std::holds_alternative<EnumValue>(a) && !std::holds_alternative<EnumValue>(b)) {
+        float af = 0.0f;
+        float bf = 0.0f;
+        if (TryGetFloat(a, af) && TryGetFloat(b, bf)) {
+            return std::fabs(af - bf) <= 1e-4f;
         }
     }
-    return a.index() == b.index() && std::holds_alternative<std::monostate>(a);
+    return false;
 }
 
 [[nodiscard]] bool TriggerValuesEqual(
@@ -179,8 +115,8 @@ namespace {
     if (const auto* expStr = std::get_if<StringValue>(&expectedVal)) {
         const std::string_view sv = expStr->view();
         if (const auto* ab = std::get_if<bool>(&actualVal)) {
-            if (EqualsAsciiIgnoreCase(sv, "true") || sv == "1") return *ab;
-            if (EqualsAsciiIgnoreCase(sv, "false") || sv == "0") return !(*ab);
+            if (str::EqualsIgnoreCase(sv, "true") || sv == "1") return *ab;
+            if (str::EqualsIgnoreCase(sv, "false") || sv == "0") return !(*ab);
             return false;
         }
         std::int64_t ai = 0;
@@ -190,9 +126,9 @@ namespace {
             if (ec == std::errc{} && ptr == sv.data() + sv.size()) {
                 return ai == parsedInt;
             }
-            if (EqualsAsciiIgnoreCase(sv, "Visible")) return ai == 0;
-            if (EqualsAsciiIgnoreCase(sv, "Hidden")) return ai == 1;
-            if (EqualsAsciiIgnoreCase(sv, "Collapsed")) return ai == 2;
+            if (str::EqualsIgnoreCase(sv, "Visible")) return ai == 0;
+            if (str::EqualsIgnoreCase(sv, "Hidden")) return ai == 1;
+            if (str::EqualsIgnoreCase(sv, "Collapsed")) return ai == 2;
             EnumValue ev{};
             if (actualVal.tryGetEnum(ev) && ev.typeId != 0 && program) {
                 std::int64_t enumInt = 0;
@@ -203,7 +139,7 @@ namespace {
         }
         float af = 0.0f;
         float parsedFloat = 0.0f;
-        if (TryGetFloat(actualVal, af) && TryParseStackFloat(sv, parsedFloat)) {
+        if (TryGetFloat(actualVal, af) && str::TryParseFloat32(sv, parsedFloat)) {
             return std::fabs(af - parsedFloat) <= 1e-4f;
         }
     }
@@ -228,12 +164,12 @@ namespace {
         return true;
     }
     if (const auto* sv = std::get_if<StringValue>(&v)) {
-        return TryParseStackFloat(sv->view(), outVal);
+        return str::TryParseFloat32(sv->view(), outVal);
     }
     if (const auto* oref = std::get_if<ObjectRef>(&v)) {
         if (oref->kind == ObjectKind::String && domains) {
             if (const auto sv = domains->stringViewAcrossDomains(*oref)) {
-                return TryParseStackFloat(*sv, outVal);
+                return str::TryParseFloat32(*sv, outVal);
             }
         }
     }
@@ -324,108 +260,14 @@ namespace {
     return false;
 }
 
-[[nodiscard]] const UIElement* NextContextParent(const UIElement* cur) noexcept {
-    if (!cur) return nullptr;
-    if (cur->Parent()) return cur->Parent();
-    return cur->TemplatedParent();
-}
-
-[[nodiscard]] ObjectRef ResolveEffectiveDataContext(const UIElement* elem) noexcept {
-    for (const UIElement* cur = elem; cur != nullptr; cur = NextContextParent(cur)) {
-        const UnifiedValue dcVal = cur->GetValue(PropId_DataContext);
-        if (const auto* ref = std::get_if<ObjectRef>(&dcVal)) {
-            if (ref->valid()) {
-                return *ref;
-            }
-        }
-        if (cur->BoundScriptWrapper().valid()) {
-            return cur->BoundScriptWrapper();
-        }
-    }
-    return ObjectRef{};
-}
-
 [[nodiscard]] ObjectRef ResolveRootScriptWrapper(const UIElement* elem) noexcept {
     ObjectRef topWrapper{};
-    for (const UIElement* cur = elem; cur != nullptr; cur = NextContextParent(cur)) {
+    for (const UIElement* cur = elem; cur != nullptr; cur = binding_util::NextContextParent(cur)) {
         if (cur->BoundScriptWrapper().valid()) {
             topWrapper = cur->BoundScriptWrapper();
         }
     }
     return topWrapper;
-}
-
-void ResolveHopTargetType(
-    const ProgramImage* program,
-    SymbolId ownerTypeId,
-    AxbCompiledHop& hop) noexcept {
-    if (!program || ownerTypeId == 0 || hop.targetTypeId != 0) {
-        return;
-    }
-    std::string rawTypeName;
-    SymbolId curTypeId = ownerTypeId;
-    for (int depth = 0; depth < 16 && curTypeId != 0; ++depth) {
-        const auto* ts = program->resolveType(curTypeId);
-        if (!ts) break;
-        for (const auto& p : ts->properties) {
-            if (p.name == hop.memberName) {
-                rawTypeName = p.typeName;
-                break;
-            }
-        }
-        if (!rawTypeName.empty()) break;
-        for (const auto& f : ts->fields) {
-            if (f.name == hop.memberName) {
-                rawTypeName = f.typeName;
-                break;
-            }
-        }
-        if (!rawTypeName.empty()) break;
-        curTypeId = ts->baseTypeId;
-    }
-    if (rawTypeName.empty()) {
-        return;
-    }
-    std::string lookupName = rawTypeName;
-    if (hop.collectionIndex >= 0) {
-        const auto lt = lookupName.find('<');
-        const auto gt = lookupName.rfind('>');
-        if (lt != std::string::npos && gt != std::string::npos && gt > lt + 1u) {
-            lookupName = lookupName.substr(lt + 1u, gt - lt - 1u);
-        } else if (lookupName.size() > 2u && lookupName.compare(lookupName.size() - 2u, 2u, "[]") == 0) {
-            lookupName.erase(lookupName.size() - 2u);
-        }
-    }
-    std::string normalized;
-    normalized.reserve(lookupName.size() + 2u);
-    for (std::size_t i = 0; i < lookupName.size(); ++i) {
-        if (lookupName[i] == '.' && (i + 1u >= lookupName.size() || lookupName[i + 1u] != '.')) {
-            normalized += "::";
-        } else if (!std::isspace(static_cast<unsigned char>(lookupName[i]))) {
-            normalized.push_back(lookupName[i]);
-        }
-    }
-    std::string_view shortTarget = ShortTypeNameView(normalized);
-    const rs_sem::TypeSymbol* bestMatch = nullptr;
-    for (const auto& mod : program->modules()) {
-        for (const auto& cand : mod.types) {
-            const std::string canon = rs_sem::canonicalTypeName(cand);
-            if (canon == normalized || cand.name == normalized) {
-                bestMatch = &cand;
-                break;
-            }
-            if (!bestMatch && cand.name == shortTarget) {
-                bestMatch = &cand;
-            }
-        }
-        if (bestMatch && (rs_sem::canonicalTypeName(*bestMatch) == normalized || bestMatch->name == normalized)) {
-            break;
-        }
-    }
-    if (bestMatch) {
-        hop.targetTypeId = bestMatch->id;
-        hop.targetIsEnum = (bestMatch->kind == rs_sem::TypeKind::Enum);
-    }
 }
 
 [[nodiscard]] bool ReadSingleHopOnObject(
@@ -458,7 +300,7 @@ void ResolveHopTargetType(
                 hop.isSimCommand = resolved->isSimCommand;
             }
         }
-        ResolveHopTargetType(program, runtimeTypeId, hop);
+        binding_util::ResolveCompiledHopTargetType(program, runtimeTypeId, hop);
     }
 
     const PropertySlotHandle slot = hop.ToSlotHandle();
@@ -837,7 +679,7 @@ void StyleTriggerEngine::RegisterStyle(AxbStyleDefinition style) {
     if (style.inlineControlTemplate && style.inlineControlTemplate->templatePackage) {
         style.inlineControlTemplate->templatePackage->PinValuesInPools();
     }
-    style.targetTypeName = std::string(ShortTypeNameView(style.targetTypeName));
+    style.targetTypeName = std::string(str::ShortTypeName(style.targetTypeName));
     if (!style.key.empty()) {
         keyedStyles_[style.key] = std::move(style);
     } else if (!style.targetTypeName.empty()) {
@@ -893,7 +735,7 @@ const AxbStyleDefinition* StyleTriggerEngine::FindStyle(std::string_view key) co
 
 const AxbStyleDefinition* StyleTriggerEngine::FindImplicitStyle(
     std::string_view shortTypeName) const noexcept {
-    const std::string_view stripped = ShortTypeNameView(shortTypeName);
+    const std::string_view stripped = str::ShortTypeName(shortTypeName);
     const auto it = implicitTypeStyles_.find(std::string(stripped));
     if (it != implicitTypeStyles_.end()) {
         return &it->second;
@@ -1096,7 +938,7 @@ bool StyleTriggerEngine::AttachStyle(UIElement* element, const AxbStyleDefinitio
                     ct = style.inlineControlTemplate.get();
                 }
                 if (ct) {
-                    const ObjectRef effDc = ResolveEffectiveDataContext(element);
+                    const ObjectRef effDc = binding_util::ResolveEffectiveDataContext(element);
                     const bool prevInAttach = inAttachStyle_;
                     inAttachStyle_ = true;
                     (void)element->ApplyControlTemplate(
@@ -1131,7 +973,7 @@ bool StyleTriggerEngine::AttachStyle(UIElement* element, const AxbStyleDefinitio
                 if (!bc.elementName.empty() || !bc.relativeAncestorType.empty() || bc.relativeSelf) {
                     (void)bindingEngine_->BindElementProperty(bc, targetPtr);
                 } else {
-                    (void)bindingEngine_->BindChain(ResolveEffectiveDataContext(target), bc, targetPtr);
+                    (void)bindingEngine_->BindChain(binding_util::ResolveEffectiveDataContext(target), bc, targetPtr);
                 }
             }
             continue;
@@ -1248,21 +1090,17 @@ std::size_t StyleTriggerEngine::BindSubtreeStyles(
         if (bindingEngine_->Program()) program_ = bindingEngine_->Program();
         if (bindingEngine_->UiInterpreter()) uiInterpreter_ = bindingEngine_->UiInterpreter();
     }
-    std::shared_ptr<UiResourceContext> domainCtx =
-        (domains_ && !UiResourceContext::HasActiveThreadOverride())
-            ? UiResourceContext::FindForDomains(domains_)
+    std::shared_ptr<UIResourceContext> domainCtx =
+        (domains_ && !UIResourceContext::HasActiveThreadOverride())
+            ? UIResourceContext::FindForDomains(domains_)
             : nullptr;
-    ScopedUiResourceContext ctxGuard(std::move(domainCtx));
+    ScopedUIResourceContext ctxGuard(std::move(domainCtx));
 
     rootElement->BindStyleEngine(this);
     if (animationEngine_ && !rootElement->BoundAnimationEngine()) {
         rootElement->BindAnimationEngine(animationEngine_);
     }
-    if (auto* ic = rootElement->DynamicCast<ItemsControl>()) {
-        ic->AssignStyleEnginePointer(this);
-    } else if (auto* tc = rootElement->DynamicCast<TabControl>()) {
-        tc->AssignStyleEnginePointer(this);
-    }
+    rootElement->AssignContainerStyleEngine(this);
 
     std::size_t attachedCount = 0u;
     bool attachedHere = false;
@@ -1279,7 +1117,7 @@ std::size_t StyleTriggerEngine::BindSubtreeStyles(
         }
         if (!imp) {
             if (const char* fullTypeName = rootElement->GetTypeClass()->typeName) {
-                imp = FindImplicitStyle(ShortTypeNameView(fullTypeName));
+                imp = FindImplicitStyle(str::ShortTypeName(fullTypeName));
             }
         }
         if (imp && AttachStyle(rootElement, *imp)) {
@@ -1295,7 +1133,7 @@ std::size_t StyleTriggerEngine::BindSubtreeStyles(
             if (!ct->triggers.empty() || !ct->eventTriggers.empty() || !ct->visualStateGroups.empty()) {
                 AxbStyleDefinition synthStyle{};
                 if (const char* tn = rootElement->GetTypeClass()->typeName) {
-                    synthStyle.targetTypeName = std::string(ShortTypeNameView(tn));
+                    synthStyle.targetTypeName = std::string(str::ShortTypeName(tn));
                 }
                 if (AttachStyle(rootElement, synthStyle)) {
                     ++attachedCount;
@@ -1462,11 +1300,11 @@ void StyleTriggerEngine::OnElementControlTemplateApplied(UIElement* host) {
         if (bindingEngine_->Program()) program_ = bindingEngine_->Program();
         if (bindingEngine_->UiInterpreter()) uiInterpreter_ = bindingEngine_->UiInterpreter();
     }
-    std::shared_ptr<UiResourceContext> domainCtx =
-        (domains_ && !UiResourceContext::HasActiveThreadOverride())
-            ? UiResourceContext::FindForDomains(domains_)
+    std::shared_ptr<UIResourceContext> domainCtx =
+        (domains_ && !UIResourceContext::HasActiveThreadOverride())
+            ? UIResourceContext::FindForDomains(domains_)
             : nullptr;
-    ScopedUiResourceContext ctxGuard(std::move(domainCtx));
+    ScopedUIResourceContext ctxGuard(std::move(domainCtx));
 
     const bool prevInAttach = inAttachStyle_;
     inAttachStyle_ = true;
@@ -1485,7 +1323,7 @@ void StyleTriggerEngine::OnElementControlTemplateApplied(UIElement* host) {
             if (!ct->triggers.empty() || !ct->eventTriggers.empty() || !ct->visualStateGroups.empty()) {
                 AxbStyleDefinition synthStyle{};
                 if (const char* tn = host->GetTypeClass()->typeName) {
-                    synthStyle.targetTypeName = std::string(ShortTypeNameView(tn));
+                    synthStyle.targetTypeName = std::string(str::ShortTypeName(tn));
                 }
                 (void)AttachStyle(host, synthStyle);
             }
@@ -1499,21 +1337,6 @@ void StyleTriggerEngine::OnElementControlTemplateApplied(UIElement* host) {
     (void)EvaluateSubtree(host, true);
 }
 
-bool StyleTriggerEngine::HasFocusedDescendant(const UIElement* elem) noexcept {
-    if (!elem) {
-        return false;
-    }
-    if (elem->IsFocused()) {
-        return true;
-    }
-    for (const UIElement* c = elem->FirstChild(); c != nullptr; c = c->NextSibling()) {
-        if (HasFocusedDescendant(c)) {
-            return true;
-        }
-    }
-    return false;
-}
-
 [[nodiscard]] bool IsTimerIntervalCondition(const AxbTriggerCondition& cond) noexcept {
     if (const auto* sv = std::get_if<StringValue>(&cond.expectedValue)) {
         return sv->view() == "__TimerInterval";
@@ -1522,8 +1345,7 @@ bool StyleTriggerEngine::HasFocusedDescendant(const UIElement* elem) noexcept {
 }
 
 [[nodiscard]] bool IsEffectivelyVisibleForTrigger(const UIElement* elem) noexcept {
-    for (const UIElement* cur = elem; cur != nullptr;
-         cur = cur->Parent() ? cur->Parent() : cur->TemplatedParent()) {
+    for (const UIElement* cur = elem; cur != nullptr; cur = binding_util::NextContextParent(cur)) {
         if (cur->GetVisibility() != Visibility::Visible) {
             return false;
         }
@@ -1537,8 +1359,7 @@ bool StyleTriggerEngine::HasFocusedDescendant(const UIElement* elem) noexcept {
     if (!candidate || !ancestor) {
         return false;
     }
-    for (const UIElement* cur = candidate; cur != nullptr;
-         cur = cur->Parent() ? cur->Parent() : cur->TemplatedParent()) {
+    for (const UIElement* cur = candidate; cur != nullptr; cur = binding_util::NextContextParent(cur)) {
         if (cur == ancestor) {
             return true;
         }
@@ -1573,7 +1394,7 @@ bool StyleTriggerEngine::EvaluateSingleCondition(
             case PropId_TriggerIsFocused:
                 return UnifiedValue{target->IsFocused()};
             case PropId_TriggerIsKeyboardFocusWithin:
-                return UnifiedValue{StyleTriggerEngine::HasFocusedDescendant(target)};
+                return UnifiedValue{binding_util::HasFocusedDescendant(target)};
             case PropId_IsEnabled:
                 return UnifiedValue{target->IsEffectivelyEnabled()};
             default: {
@@ -1620,7 +1441,7 @@ bool StyleTriggerEngine::EvaluateSingleCondition(
                     case PropId_TriggerIsFocused:
                         return elem->IsFocused() == expectedBool;
                     case PropId_TriggerIsKeyboardFocusWithin:
-                        return HasFocusedDescendant(elem) == expectedBool;
+                        return binding_util::HasFocusedDescendant(elem) == expectedBool;
                     case PropId_IsEnabled:
                         return elem->IsEffectivelyEnabled() == expectedBool;
                     default:
@@ -1650,8 +1471,8 @@ bool StyleTriggerEngine::EvaluateSingleCondition(
             if (cond.sourceName == "$TemplatedParent") {
                 matchedAnc = elem->TemplatedParent();
             } else {
-                const std::string_view wantedType = ShortTypeNameView(cond.sourceName);
-                for (const UIElement* anc = elem; anc != nullptr; anc = NextContextParent(anc)) {
+                const std::string_view wantedType = str::ShortTypeName(cond.sourceName);
+                for (const UIElement* anc = elem; anc != nullptr; anc = binding_util::NextContextParent(anc)) {
                     if (MatchesXamlAncestorType(anc, wantedType)) {
                         matchedAnc = anc;
                         break;
@@ -1666,9 +1487,9 @@ bool StyleTriggerEngine::EvaluateSingleCondition(
         }
 
         case TriggerConditionSource::DataContextBinding: {
-            const ObjectRef dcObj = ResolveEffectiveDataContext(elem);
+            const ObjectRef dcObj = binding_util::ResolveEffectiveDataContext(elem);
             if (!dcObj.valid()) {
-                for (const UIElement* cur = elem; cur != nullptr; cur = NextContextParent(cur)) {
+                for (const UIElement* cur = elem; cur != nullptr; cur = binding_util::NextContextParent(cur)) {
                     const UnifiedValue rawDc = cur->GetValue(PropId_DataContext);
                     if (const auto* nh = std::get_if<NativeHandle>(&rawDc)) {
                         const UIElement* dcEl = domains_
@@ -1805,7 +1626,7 @@ bool StyleTriggerEngine::EvaluateSingleCondition(
                 false);
         } else if (cond.converter == ValueConverterKind::MathExpression) {
             float paramF = 0.0f;
-            (void)TryParseStackFloat(cond.converterParameter, paramF);
+            (void)str::TryParseFloat32(cond.converterParameter, paramF);
             float mathOut = 0.0f;
             if (EvaluateMathConverterExpression(cond.converterKey, &actualVal, 1u, paramF, mathOut)) {
                 actualVal = MakeFloat(mathOut);
@@ -1847,8 +1668,8 @@ namespace {
         } else if (bc.relativeAncestorType == "$TemplatedParent") {
             srcEl = elem->TemplatedParent();
         } else if (!bc.relativeAncestorType.empty()) {
-            const std::string_view wantedType = ShortTypeNameView(bc.relativeAncestorType);
-            for (UIElement* anc = elem; anc != nullptr; anc = const_cast<UIElement*>(NextContextParent(anc))) {
+            const std::string_view wantedType = str::ShortTypeName(bc.relativeAncestorType);
+            for (UIElement* anc = elem; anc != nullptr; anc = const_cast<UIElement*>(binding_util::NextContextParent(anc))) {
                 if (MatchesXamlAncestorType(anc, wantedType)) {
                     srcEl = anc;
                     break;
@@ -1910,7 +1731,7 @@ namespace {
             }
         }
     } else {
-        ObjectRef cur = ResolveEffectiveDataContext(elem);
+        ObjectRef cur = binding_util::ResolveEffectiveDataContext(elem);
         if (bc.hops.empty()) {
             if (cur.valid()) {
                 rawVal = cur;
@@ -1959,7 +1780,7 @@ namespace {
                 false);
         } else if (bc.converter == ValueConverterKind::MathExpression) {
             float paramF = 0.0f;
-            (void)TryParseStackFloat(bc.converterParameter, paramF);
+            (void)str::TryParseFloat32(bc.converterParameter, paramF);
             float mathOut = 0.0f;
             if (EvaluateMathConverterExpression(bc.converterKey, &rawVal, 1u, paramF, mathOut)) {
                 rawVal = MakeFloat(mathOut);
@@ -2003,8 +1824,8 @@ namespace {
                 resolved = !std::holds_alternative<std::monostate>(evalVal);
             }
         } else if (cond.sourceKind == TriggerConditionSource::AncestorProperty) {
-            const std::string_view wantedType = ShortTypeNameView(cond.sourceName);
-            for (const UIElement* anc = elem; anc != nullptr; anc = NextContextParent(anc)) {
+            const std::string_view wantedType = str::ShortTypeName(cond.sourceName);
+            for (const UIElement* anc = elem; anc != nullptr; anc = binding_util::NextContextParent(anc)) {
                 if (MatchesXamlAncestorType(anc, wantedType) && cond.propId != 0u) {
                     evalVal = anc->GetValue(cond.propId);
                     resolved = !std::holds_alternative<std::monostate>(evalVal);
@@ -2051,7 +1872,7 @@ namespace {
                     false);
             } else if (cond.converter == ValueConverterKind::MathExpression) {
                 float paramF = 0.0f;
-                (void)TryParseStackFloat(cond.converterParameter, paramF);
+                (void)str::TryParseFloat32(cond.converterParameter, paramF);
                 float mathOut = 0.0f;
                 if (EvaluateMathConverterExpression(cond.converterKey, &evalVal, 1u, paramF, mathOut)) {
                     evalVal = MakeFloat(mathOut);
@@ -2066,7 +1887,7 @@ namespace {
         }
         if (resolved) {
             if (const auto* sv = std::get_if<StringValue>(&evalVal)) {
-                if (TryParseStackFloat(sv->view(), ms)) {
+                if (str::TryParseFloat32(sv->view(), ms)) {
                     return std::max(0.0f, ms);
                 }
             }
@@ -2095,7 +1916,7 @@ namespace {
             return elem->TemplatedParent();
         }
         if (!tb.relativeAncestorType.empty()) {
-            const std::string_view wantedType = ShortTypeNameView(tb.relativeAncestorType);
+            const std::string_view wantedType = str::ShortTypeName(tb.relativeAncestorType);
             for (UIElement* anc = elem; anc != nullptr; anc = anc->Parent()) {
                 if (MatchesXamlAncestorType(anc, wantedType)) {
                     if (allowPlacementTarget && tb.rawPath == "PlacementTarget" && domains) {
@@ -2155,46 +1976,8 @@ void ExecuteSelectActionOnTarget(UIElement* target) {
         return;
     }
     for (UIElement* cur = target; cur != nullptr;
-         cur = cur->Parent() ? cur->Parent() : cur->TemplatedParent()) {
-        if (auto* tvi = cur->DynamicCast<TreeViewItem>()) {
-            if (TreeView* tv = tvi->FindAncestorTreeView()) {
-                tv->SelectContainer(tvi);
-            } else {
-                tvi->SetIsSelected(true);
-            }
-            return;
-        }
-        if (auto* ti = cur->DynamicCast<TabItem>()) {
-            for (UIElement* p = ti->Parent(); p != nullptr; p = p->Parent()) {
-                if (auto* tc = p->DynamicCast<TabControl>()) {
-                    const std::size_t count = tc->TabCount();
-                    for (std::size_t idx = 0u; idx < count; ++idx) {
-                        if (tc->GetTabElement(idx) == ti) {
-                            (void)tc->SelectTabInteractive(static_cast<std::int32_t>(idx));
-                            return;
-                        }
-                    }
-                    break;
-                }
-            }
-            ti->SetIsSelected(true);
-            return;
-        }
-        if (auto* lb = cur->DynamicCast<ListBox>()) {
-            std::size_t childOffset = 0u;
-            for (UIElement* c = lb->FirstChild(); c != nullptr; c = c->NextSibling()) {
-                if (c == lb->TemplateRoot()) {
-                    continue;
-                }
-                if (IsElementOrAncestor(target, c)) {
-                    const std::size_t logicalIdx = lb->IsVirtualizing()
-                        ? (lb->FirstRealizedItemIndex() + childOffset)
-                        : childOffset;
-                    (void)lb->SelectIndexInteractive(static_cast<std::int32_t>(logicalIdx));
-                    return;
-                }
-                ++childOffset;
-            }
+         cur = const_cast<UIElement*>(binding_util::NextContextParent(cur))) {
+        if (cur->TryExecuteSelectContainerAction(target)) {
             return;
         }
     }
@@ -2859,13 +2642,13 @@ void StyleTriggerEngine::ExecuteSingleInteractionAction(
         case InteractionActionKind::ChangeProperty: {
             // Check if TargetName refers to a sibling InteractionAction's x:Name (e.g. toggling IsEnabled on PlaySoundAction)
             if (!action.targetName.empty() &&
-                (action.propId == PropId_IsEnabled || EqualsAsciiIgnoreCase(action.propertyName, "IsEnabled"))) {
+                (action.propId == PropId_IsEnabled || str::EqualsIgnoreCase(action.propertyName, "IsEnabled"))) {
                 bool matchedActionTarget = false;
                 bool desiredEnabled = true;
                 if (const auto* b = std::get_if<bool>(&action.value)) {
                     desiredEnabled = *b;
                 } else if (const auto* sv = std::get_if<StringValue>(&action.value)) {
-                    desiredEnabled = EqualsAsciiIgnoreCase(sv->view(), "true") || sv->view() == "1";
+                    desiredEnabled = str::EqualsIgnoreCase(sv->view(), "true") || sv->view() == "1";
                 }
                 auto updateSiblingList = [&](std::vector<AxbInteractionAction>& list) {
                     for (auto& cand : list) {
@@ -2907,7 +2690,7 @@ void StyleTriggerEngine::ExecuteSingleInteractionAction(
 
             if (action.isNullValue) {
                 if ((action.propId == PropId_Content || action.propId == PropId_Text) &&
-                    (target->IsA<Border>() || target->IsA<ContentPresenter>() || target->IsA<UserControl>())) {
+                    target->SupportsImplicitChromeStyleProperties()) {
                     for (UIElement* ch = target->FirstChild(); ch != nullptr;) {
                         UIElement* next = ch->NextSibling();
                         if (ch != target->TemplateRoot()) {
@@ -2962,7 +2745,7 @@ void StyleTriggerEngine::ExecuteSingleInteractionAction(
                             args.size());
                     } else if (mb.converter == ValueConverterKind::MathExpression) {
                         float paramF = 0.0f;
-                        (void)TryParseStackFloat(mb.converterParameter, paramF);
+                        (void)str::TryParseFloat32(mb.converterParameter, paramF);
                         float mathOut = 0.0f;
                         if (EvaluateMathConverterExpression(
                                 mb.converterKey, args.data(), args.size(), paramF, mathOut)) {
@@ -3036,9 +2819,9 @@ void StyleTriggerEngine::ExecuteSingleInteractionAction(
 
         case InteractionActionKind::InvokeCommand: {
             const ObjectRef wrapperObj = ResolveRootScriptWrapper(elem);
-            const ObjectRef dcObj = ResolveEffectiveDataContext(elem);
+            const ObjectRef dcObj = binding_util::ResolveEffectiveDataContext(elem);
 
-            if (action.commandPath.rfind("__NavigateTo:", 0) == 0) {
+            if (str::StartsWith(action.commandPath, "__NavigateTo:")) {
                 const std::string destId = action.commandPath.substr(13u);
                 // 1. Invoke MainWindow.NavigateTo<DestId>() if defined
                 if (wrapperObj.valid() && domains_ && program_) {
@@ -3060,7 +2843,7 @@ void StyleTriggerEngine::ExecuteSingleInteractionAction(
                 }
                 // 2. Switch NavigationRoot's Content + ContentTemplate to the matching destination
                 UIElement* topRoot = elem;
-                while (const UIElement* nxt = NextContextParent(topRoot)) {
+                while (const UIElement* nxt = binding_util::NextContextParent(topRoot)) {
                     topRoot = const_cast<UIElement*>(nxt);
                 }
                 UIElement* navRoot = topRoot ? topRoot->FindName("NavigationRoot") : nullptr;
@@ -3283,7 +3066,7 @@ void StyleTriggerEngine::ExecuteSingleInteractionAction(
                         } else if (pt == rs_sem::PrimitiveType::Float) {
                             if (const auto* sv = std::get_if<StringValue>(&paramVal)) {
                                 float fv = 0.0f;
-                                if (TryParseStackFloat(sv->view(), fv)) {
+                                if (str::TryParseFloat32(sv->view(), fv)) {
                                     paramVal = MakeFloat(fv);
                                 }
                             } else if (const auto* iv = std::get_if<std::int64_t>(&paramVal)) {
@@ -3291,7 +3074,7 @@ void StyleTriggerEngine::ExecuteSingleInteractionAction(
                             }
                         } else if (pt == rs_sem::PrimitiveType::Bool) {
                             if (const auto* sv = std::get_if<StringValue>(&paramVal)) {
-                                paramVal = EqualsAsciiIgnoreCase(sv->view(), "true") || sv->view() == "1";
+                                paramVal = str::EqualsIgnoreCase(sv->view(), "true") || sv->view() == "1";
                             }
                         } else if (pt == rs_sem::PrimitiveType::String) {
                             if (const auto* sv = std::get_if<StringValue>(&paramVal)) {
@@ -3459,13 +3242,13 @@ void StyleTriggerEngine::ExecuteSingleInteractionAction(
             if (!target) {
                 break;
             }
-            if (auto* tb = target->DynamicCast<TextBox>()) {
-                tb->SelectAll();
+            if (target->IsEditableTextInput()) {
+                target->SelectAllEditableText();
                 break;
             }
             for (UIElement* anc = target->Parent(); anc != nullptr; anc = anc->Parent()) {
-                if (auto* tb = anc->DynamicCast<TextBox>()) {
-                    tb->SelectAll();
+                if (anc->IsEditableTextInput()) {
+                    anc->SelectAllEditableText();
                     break;
                 }
             }
@@ -3508,8 +3291,8 @@ void StyleTriggerEngine::ExecuteSingleInteractionAction(
         case InteractionActionKind::PlayMedia: {
             UIElement* target = ResolveActionTargetElement(
                 elem, action, domains_, program_, uiInterpreter_, bindingEngine_);
-            if (auto* media = target ? target->DynamicCast<MediaElement>() : nullptr) {
-                media->Play();
+            if (target) {
+                target->PlayMediaAction();
             }
             break;
         }
@@ -3517,8 +3300,8 @@ void StyleTriggerEngine::ExecuteSingleInteractionAction(
         case InteractionActionKind::StopMedia: {
             UIElement* target = ResolveActionTargetElement(
                 elem, action, domains_, program_, uiInterpreter_, bindingEngine_);
-            if (auto* media = target ? target->DynamicCast<MediaElement>() : nullptr) {
-                media->Stop();
+            if (target) {
+                target->StopMediaAction();
             }
             break;
         }
@@ -3670,10 +3453,7 @@ bool StyleTriggerEngine::EvaluateEventTriggers(std::size_t instIdx) {
             curChecked = *b;
         }
         const std::uint32_t curClickGen = src->BubbledClickGeneration();
-        std::uint32_t curMediaGen = 0u;
-        if (const auto* mediaSrc = src->DynamicCast<MediaElement>()) {
-            curMediaGen = mediaSrc->MediaEndedGeneration();
-        }
+        const std::uint32_t curMediaGen = src->GetMediaEndedGeneration();
         std::int64_t curSelectedIdx = -1;
         const UnifiedValue selVal = src->GetValue(PropId_SelectedIndex);
         if (const auto* selI = std::get_if<std::int64_t>(&selVal)) {
@@ -4186,11 +3966,11 @@ std::size_t StyleTriggerEngine::EvaluateSubtree(UIElement* subtreeRoot, bool res
         if (bindingEngine_->Program()) program_ = bindingEngine_->Program();
         if (bindingEngine_->UiInterpreter()) uiInterpreter_ = bindingEngine_->UiInterpreter();
     }
-    std::shared_ptr<UiResourceContext> domainCtx =
-        (domains_ && !UiResourceContext::HasActiveThreadOverride())
-            ? UiResourceContext::FindForDomains(domains_)
+    std::shared_ptr<UIResourceContext> domainCtx =
+        (domains_ && !UIResourceContext::HasActiveThreadOverride())
+            ? UIResourceContext::FindForDomains(domains_)
             : nullptr;
-    ScopedUiResourceContext ctxGuard(std::move(domainCtx));
+    ScopedUIResourceContext ctxGuard(std::move(domainCtx));
 
     std::size_t changedElements = 0u;
 
@@ -4331,11 +4111,11 @@ bool StyleTriggerEngine::NotifyKeyTriggerEvent(
         if (bindingEngine_->Program()) program_ = bindingEngine_->Program();
         if (bindingEngine_->UiInterpreter()) uiInterpreter_ = bindingEngine_->UiInterpreter();
     }
-    std::shared_ptr<UiResourceContext> domainCtx =
-        (domains_ && !UiResourceContext::HasActiveThreadOverride())
-            ? UiResourceContext::FindForDomains(domains_)
+    std::shared_ptr<UIResourceContext> domainCtx =
+        (domains_ && !UIResourceContext::HasActiveThreadOverride())
+            ? UIResourceContext::FindForDomains(domains_)
             : nullptr;
-    ScopedUiResourceContext ctxGuard(std::move(domainCtx));
+    ScopedUIResourceContext ctxGuard(std::move(domainCtx));
 
     bool anyFired = false;
     for (int pass = 0; pass < 2; ++pass) {
@@ -4422,11 +4202,11 @@ void StyleTriggerEngine::NotifyRoutedElementEvent(
         if (bindingEngine_->Program()) program_ = bindingEngine_->Program();
         if (bindingEngine_->UiInterpreter()) uiInterpreter_ = bindingEngine_->UiInterpreter();
     }
-    std::shared_ptr<UiResourceContext> domainCtx =
-        (domains_ && !UiResourceContext::HasActiveThreadOverride())
-            ? UiResourceContext::FindForDomains(domains_)
+    std::shared_ptr<UIResourceContext> domainCtx =
+        (domains_ && !UIResourceContext::HasActiveThreadOverride())
+            ? UIResourceContext::FindForDomains(domains_)
             : nullptr;
-    ScopedUiResourceContext ctxGuard(std::move(domainCtx));
+    ScopedUIResourceContext ctxGuard(std::move(domainCtx));
 
     const std::size_t snapCount = instances_.size();
     for (std::size_t snapIdx = 0u; snapIdx < snapCount && snapIdx < instances_.size(); ++snapIdx) {
@@ -4569,11 +4349,11 @@ std::size_t StyleTriggerEngine::TickTimers(float dtSeconds) {
         if (bindingEngine_->Program()) program_ = bindingEngine_->Program();
         if (bindingEngine_->UiInterpreter()) uiInterpreter_ = bindingEngine_->UiInterpreter();
     }
-    std::shared_ptr<UiResourceContext> domainCtx =
-        (domains_ && !UiResourceContext::HasActiveThreadOverride())
-            ? UiResourceContext::FindForDomains(domains_)
+    std::shared_ptr<UIResourceContext> domainCtx =
+        (domains_ && !UIResourceContext::HasActiveThreadOverride())
+            ? UIResourceContext::FindForDomains(domains_)
             : nullptr;
-    ScopedUiResourceContext ctxGuard(std::move(domainCtx));
+    ScopedUIResourceContext ctxGuard(std::move(domainCtx));
 
     std::size_t firedCount = 0u;
     const std::size_t snapCount = instances_.size();

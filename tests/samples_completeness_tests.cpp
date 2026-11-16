@@ -14,12 +14,13 @@
 #include "aero/animation/AnimationEngine.hpp"
 #include "aero/binding/DualTrackBindingEngine.hpp"
 #include "aero/compiler/AeroCompiler.hpp"
-#include "aero/compiler/AxbFormat.hpp"
+#include "aero/asset/AxbFormat.hpp"
+#include "aero/asset/AxbTemplateRegistry.hpp"
 #include "aero/compiler/XamlApplication.hpp"
 #include "aero/controls/Controls.hpp"
 #include "aero/core/DependencyProperty.hpp"
 #include "aero/core/UIElement.hpp"
-#include "aero/core/UiResourceContext.hpp"
+#include "aero/core/UIResourceContext.hpp"
 #include "aero/core/UnifiedValue.hpp"
 #include "aero/input/InputEventRouter.hpp"
 #include "aero/render/FontAtlas.hpp"
@@ -191,7 +192,7 @@ void ResetSharedRegistries() {
     AxbTemplateRegistry::Instance().Clear();
     GradientBrushRegistry::Instance().Clear();
     FontAtlas::Instance().ClearCustomFonts();
-    UiResourceContext::Current().ClearAll();
+    UIResourceContext::Current().ClearAll();
 }
 
 constexpr Color kTestClearColor{0.06f, 0.08f, 0.11f, 1.0f};
@@ -1609,7 +1610,7 @@ void TestInteractiveTriggersAndBehaviors(const fs::path& samplesRoot) {
                 UIElement* userNode = root->FindName("UserBox");
                 UIElement* passNode = root->FindName("PassBox");
                 auto* userBox = userNode ? userNode->DynamicCast<TextBox>() : nullptr;
-                auto* passBox = passNode ? passNode->DynamicCast<TextBox>() : nullptr;
+                auto* passBox = passNode ? passNode->DynamicCast<PasswordBox>() : nullptr;
                 AERO_CHECK(userBox != nullptr);
                 AERO_CHECK(passBox != nullptr);
                 if (userBox) {

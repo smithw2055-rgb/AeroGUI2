@@ -418,6 +418,9 @@ struct FastInlineStorage {
 static_assert(
     sizeof(FastInlineStorage) == 56,
     "FastInlineStorage layout size check");
+static_assert(
+    alignof(FastInlineStorage) == 4,
+    "FastInlineStorage alignment check");
 
 // C-03 & ABI v2.0: 32-byte 16-byte-aligned zero-hole sparse property entry.
 // Bytes 0..7 store core dependency property & primary track indices;
@@ -459,6 +462,57 @@ enum class CustomPropertyValueKind : std::uint8_t {
     Brush = 5,
     Thickness = 6,
 };
+
+enum class PropMetaFlags : std::uint16_t {
+    None = 0u,
+    AffectsMeasure = 1u << 0u,
+    AffectsArrange = 1u << 1u,
+    AffectsParentMeasure = 1u << 2u,
+    AffectsParentArrange = 1u << 3u,
+    AffectsRender = 1u << 4u,
+    Inherits = 1u << 5u,
+    BindsTwoWayByDefault = 1u << 6u,
+    ReadOnly = 1u << 7u,
+};
+
+[[nodiscard]] constexpr PropMetaFlags operator|(PropMetaFlags lhs, PropMetaFlags rhs) noexcept {
+    return static_cast<PropMetaFlags>(
+        static_cast<std::uint16_t>(lhs) | static_cast<std::uint16_t>(rhs));
+}
+
+[[nodiscard]] constexpr PropMetaFlags operator&(PropMetaFlags lhs, PropMetaFlags rhs) noexcept {
+    return static_cast<PropMetaFlags>(
+        static_cast<std::uint16_t>(lhs) & static_cast<std::uint16_t>(rhs));
+}
+
+[[nodiscard]] constexpr PropMetaFlags operator~(PropMetaFlags flags) noexcept {
+    return static_cast<PropMetaFlags>(~static_cast<std::uint16_t>(flags));
+}
+
+constexpr PropMetaFlags& operator|=(PropMetaFlags& lhs, PropMetaFlags rhs) noexcept {
+    lhs = lhs | rhs;
+    return lhs;
+}
+
+constexpr PropMetaFlags& operator&=(PropMetaFlags& lhs, PropMetaFlags rhs) noexcept {
+    lhs = lhs & rhs;
+    return lhs;
+}
+
+[[nodiscard]] constexpr bool HasPropMetaFlag(PropMetaFlags flags, PropMetaFlags flag) noexcept {
+    return (static_cast<std::uint16_t>(flags) & static_cast<std::uint16_t>(flag)) != 0u;
+}
+
+inline constexpr std::uint16_t kBuiltinPropertyMetadataCount =
+    static_cast<std::uint16_t>(PropId_EasingExponent) + 1u;
+
+struct PropertyMetadata {
+    std::uint16_t propId = 0u;
+    PropMetaFlags flags = PropMetaFlags::None;
+    CustomPropertyValueKind valueKind = CustomPropertyValueKind::String;
+};
+
+[[nodiscard]] PropertyMetadata GetPropertyMetadata(std::uint16_t propId) noexcept;
 
 struct CustomPropertyDesc {
     std::uint16_t propId = 0xFFFFu;

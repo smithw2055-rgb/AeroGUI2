@@ -16,13 +16,14 @@
 #include <vector>
 
 #include "aero/animation/AnimationEngine.hpp"
-#include "aero/bridge/ScriptUiBridge.hpp"
+#include "aero/bridge/ScriptUIBridge.hpp"
 #include "aero/binding/DualTrackBindingEngine.hpp"
 #include "aero/compiler/AeroCompiler.hpp"
-#include "aero/compiler/AxbFormat.hpp"
+#include "aero/asset/AxbFormat.hpp"
+#include "aero/asset/AxbTemplateRegistry.hpp"
 #include "aero/controls/Controls.hpp"
 #include "aero/core/UIElement.hpp"
-#include "aero/core/UiResourceContext.hpp"
+#include "aero/core/UIResourceContext.hpp"
 #include "aero/host/HostDrivers.hpp"
 #include "aero/host/NativeWindowHost.hpp"
 #include "aero/input/InputEventRouter.hpp"
@@ -129,10 +130,8 @@ fs::path DiscoverSamplesRoot() {
 }
 
 void RegisterContainerPassThroughShims() {
-    aero::AxbPackage passThrough{};
-    passThrough.rootTypeName = "UserControl";
-    aero::AxbTemplateRegistry::Instance().Register("Decorator", passThrough);
-    aero::AxbTemplateRegistry::Instance().Register("ViewboxDecorator", passThrough);
+    // Decorator and ViewboxDecorator are native core elements in AxbTemplateMounter;
+    // do not register UserControl shims that would shadow their child layout.
 }
 
 void PrintUsage(const fs::path& samplesRoot) {
@@ -144,8 +143,9 @@ void PrintUsage(const fs::path& samplesRoot) {
         << "  --sample <name|path>    Preset name (e.g. Login, Rive, TicTacToe) or .xaml/.riv path\n"
         << "  --list                  List all built-in sample presets and Gallery sub-samples\n"
         << "  --rs <file.rs>          Compile & bind RealScript ViewModel file (repeatable)\n"
-        << "  --width <px>            Initial window width (default: 1280)\n"
-        << "  --height <px>           Initial window height (default: 720)\n"
+        << "  --width <px>            Initial window width in DIPs (default: 1280)\n"
+        << "  --height <px>           Initial window height in DIPs (default: 720)\n"
+        << "  --dpi-scale <factor>    Override UI DPI scale factor (default: OS DPI in windowed, 1.0 in headless)\n"
         << "  --settle <sec>          Pre-advance animations by <sec> before showing\n"
         << "  --frames <count>        Render <count> frames and exit automatically (0 = interactive)\n"
         << "  --screenshot <out.bmp>  Capture rendered framebuffer to BMP file\n"
@@ -312,6 +312,7 @@ bool ResolveTarget(
 struct ViewerRunOptions {
     std::uint32_t width = 1280u;
     std::uint32_t height = 720u;
+    float dpiScale = 0.0f;
     bool preferHardwareGpu = true;
     bool forceHeadless = false;
     bool hasExplicitSettle = false;
@@ -330,7 +331,7 @@ int MountAndRunSingleTarget(
     aero::FontAtlas::Instance().ClearCustomFonts();
     aero::ImageAtlas::Instance().Clear();
     aero::RiveControl::ClearAssetSearchDirectories();
-    aero::UiResourceContext::Current().ClearXamlSearchDirectories();
+    aero::UIResourceContext::Current().ClearXamlSearchDirectories();
     RegisterContainerPassThroughShims();
 
     fs::path projDataDir = target.filePath.parent_path();
@@ -437,7 +438,7 @@ int MountAndRunSingleTarget(
     aero::ExecutionDomainContext domains;
     aero::AnimationEngine animEngine;
     std::shared_ptr<aero::BindingRegistry> nativeBindings;
-    std::unique_ptr<aero::ScriptUiBridge> scriptBridge;
+    std::unique_ptr<aero::ScriptUIBridge> scriptBridge;
     std::unique_ptr<aero::Interpreter> uiInterpreter;
     std::unique_ptr<aero::DualTrackBindingEngine> bindingEngine;
     aero::StyleTriggerEngine styleEngine(&animEngine, nullptr);
@@ -479,7 +480,7 @@ int MountAndRunSingleTarget(
             commonSearchPaths.push_back((themeDataDir / "Theme").string());
         }
         for (const auto& sp : commonSearchPaths) {
-            aero::UiResourceContext::Current().AddXamlSearchDirectory(sp);
+            aero::UIResourceContext::Current().AddXamlSearchDirectory(sp);
         }
 
         // Pre-load global NoesisTheme dictionary as baseline fallback styles/brushes before sample overrides,
@@ -839,7 +840,7 @@ int MountAndRunSingleTarget(
         if (mainRes.programImage) {
             domains.registerProgramObservableMetadata(*mainRes.programImage);
             nativeBindings = std::make_shared<aero::BindingRegistry>();
-            scriptBridge = std::make_unique<aero::ScriptUiBridge>(domains);
+            scriptBridge = std::make_unique<aero::ScriptUIBridge>(domains);
             scriptBridge->RegisterCoreUiBindings(*nativeBindings);
 
             uiInterpreter = std::make_unique<aero::Interpreter>(mainRes.programImage, domains.uiHeapPtr());
@@ -955,6 +956,7 @@ int MountAndRunSingleTarget(
     winCfg.title = "AeroGUI 2.0 Viewer - " + target.displayName;
     winCfg.width = opts.width;
     winCfg.height = opts.height;
+    winCfg.dpiScale = opts.dpiScale;
     winCfg.preferHardwareGpu = opts.preferHardwareGpu;
     winCfg.allowHeadlessFallback = true;
     winCfg.forceHeadless = opts.forceHeadless;
@@ -981,7 +983,9 @@ int MountAndRunSingleTarget(
         std::cout << "[aero-viewer] Scene: " << target.displayName
                   << " (" << target.filePath.string() << ")\n"
                   << "              Window Mode: " << windowHost.ModeName()
-                  << " (" << windowHost.Width() << "x" << windowHost.Height() << ")\n"
+                  << " (" << windowHost.LogicalWidth() << "x" << windowHost.LogicalHeight() << " DIP, "
+                  << windowHost.Width() << "x" << windowHost.Height() << " px @ "
+                  << static_cast<int>(std::lround(windowHost.DpiScale() * 100.0f)) << "% DPI)\n"
                   << "              Fonts Loaded: " << fontsLoaded
                   << " | Render Nodes: " << renderTree.NodeCount()
                   << " | 4KB Pages: " << renderTree.PageCount() << "\n";
@@ -1055,6 +1059,8 @@ int main(int argc, char** argv) {
             exportAllDir = argv[++i];
         } else if (arg == "--software") {
             opts.preferHardwareGpu = false;
+        } else if (arg == "--dpi-scale" && i + 1 < argc) {
+            opts.dpiScale = static_cast<float>(std::atof(argv[++i]));
         } else if (arg == "--headless") {
             opts.forceHeadless = true;
             opts.preferHardwareGpu = false;

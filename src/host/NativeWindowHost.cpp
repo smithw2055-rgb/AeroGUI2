@@ -5,6 +5,10 @@
 #include <cstring>
 #include <thread>
 
+#include "aero/asset/AxbFormat.hpp"
+#include "aero/core/UIResourceContext.hpp"
+#include "aero/input/TextInputMethod.hpp"
+
 #if defined(__EMSCRIPTEN__)
 #include <emscripten/emscripten.h>
 #include <emscripten/html5.h>
@@ -106,6 +110,121 @@ namespace {
         *outCodePointCount = cpTotal;
     }
     return out;
+}
+#endif
+
+#if defined(_WIN32)
+void EnableWin32PerMonitorDpiV2() noexcept {
+    static bool sAttempted = false;
+    if (sAttempted) {
+        return;
+    }
+    sAttempted = true;
+
+    if (HMODULE user32 = GetModuleHandleW(L"user32.dll")) {
+        using SetDpiCtxFn = BOOL (WINAPI*)(HANDLE);
+        if (auto setCtx = reinterpret_cast<SetDpiCtxFn>(
+                GetProcAddress(user32, "SetProcessDpiAwarenessContext"))) {
+            // DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 = (DPI_AWARENESS_CONTEXT)-4
+            if (setCtx(reinterpret_cast<HANDLE>(static_cast<std::intptr_t>(-4)))) {
+                return;
+            }
+        }
+    }
+    if (HMODULE shcore = LoadLibraryW(L"Shcore.dll")) {
+        using SetAwarenessFn = HRESULT (WINAPI*)(int);
+        if (auto setAwareness = reinterpret_cast<SetAwarenessFn>(
+                GetProcAddress(shcore, "SetProcessDpiAwareness"))) {
+            // PROCESS_PER_MONITOR_DPI_AWARE = 2
+            if (setAwareness(2) == S_OK) {
+                return;
+            }
+        }
+    }
+    if (HMODULE user32 = GetModuleHandleW(L"user32.dll")) {
+        using SetDpiAwareFn = BOOL (WINAPI*)();
+        if (auto setAware = reinterpret_cast<SetDpiAwareFn>(
+                GetProcAddress(user32, "SetProcessDPIAware"))) {
+            (void)setAware();
+        }
+    }
+}
+
+[[nodiscard]] float QueryWin32SystemDpiScale() noexcept {
+    if (HMODULE user32 = GetModuleHandleW(L"user32.dll")) {
+        using GetDpiSysFn = UINT (WINAPI*)();
+        if (auto getDpiSys = reinterpret_cast<GetDpiSysFn>(
+                GetProcAddress(user32, "GetDpiForSystem"))) {
+            const UINT dpi = getDpiSys();
+            if (dpi > 0u) {
+                return std::clamp(static_cast<float>(dpi) / 96.0f, 0.25f, 8.0f);
+            }
+        }
+    }
+    if (HDC dc = GetDC(nullptr)) {
+        const int dpiX = GetDeviceCaps(dc, LOGPIXELSX);
+        ReleaseDC(nullptr, dc);
+        if (dpiX > 0) {
+            return std::clamp(static_cast<float>(dpiX) / 96.0f, 0.25f, 8.0f);
+        }
+    }
+    return 1.0f;
+}
+
+[[nodiscard]] float QueryWin32WindowDpiScale(HWND hwnd) noexcept {
+    if (hwnd) {
+        if (HMODULE user32 = GetModuleHandleW(L"user32.dll")) {
+            using GetDpiWinFn = UINT (WINAPI*)(HWND);
+            if (auto getDpiWin = reinterpret_cast<GetDpiWinFn>(
+                    GetProcAddress(user32, "GetDpiForWindow"))) {
+                const UINT dpi = getDpiWin(hwnd);
+                if (dpi > 0u) {
+                    return std::clamp(static_cast<float>(dpi) / 96.0f, 0.25f, 8.0f);
+                }
+            }
+        }
+    }
+    return QueryWin32SystemDpiScale();
+}
+
+void AdjustWin32WindowRectForDpi(
+    RECT* rect,
+    DWORD style,
+    BOOL hasMenu,
+    DWORD exStyle,
+    float dpiScale) noexcept {
+    if (!rect) {
+        return;
+    }
+    if (HMODULE user32 = GetModuleHandleW(L"user32.dll")) {
+        using AdjustDpiFn = BOOL (WINAPI*)(LPRECT, DWORD, BOOL, DWORD, UINT);
+        if (auto adjustDpi = reinterpret_cast<AdjustDpiFn>(
+                GetProcAddress(user32, "AdjustWindowRectExForDpi"))) {
+            const UINT dpi = static_cast<UINT>(
+                std::max<long>(24L, std::lround(std::clamp(dpiScale, 0.25f, 8.0f) * 96.0f)));
+            if (adjustDpi(rect, style, hasMenu, exStyle, dpi)) {
+                return;
+            }
+        }
+    }
+    (void)AdjustWindowRectEx(rect, style, hasMenu, exStyle);
+}
+
+void EnableWin32DarkTitleBar(HWND hwnd) noexcept {
+    if (!hwnd) {
+        return;
+    }
+    if (HMODULE dwm = LoadLibraryW(L"dwmapi.dll")) {
+        using DwmSetAttrFn = HRESULT (WINAPI*)(HWND, DWORD, const void*, DWORD);
+        if (auto setAttr = reinterpret_cast<DwmSetAttrFn>(
+                GetProcAddress(dwm, "DwmSetWindowAttribute"))) {
+            const BOOL useDark = TRUE;
+            // DWMWA_USE_IMMERSIVE_DARK_MODE = 20 (Win10 2004+/Win11), fallback 19 (older builds)
+            if (FAILED(setAttr(hwnd, 20u, &useDark, sizeof(useDark)))) {
+                (void)setAttr(hwnd, 19u, &useDark, sizeof(useDark));
+            }
+        }
+    }
 }
 #endif
 
@@ -594,6 +713,7 @@ void NativeWindowHost::BindDesktopHost(
         if (inputRouter_ && !desktopHost_->InputRouter()) {
             desktopHost_->SetInputRouter(inputRouter_);
         }
+        desktopHost_->SetDpiScale(dpiScale_);
         desktopHost_->SetWakeCallback(&NativeWindowHost::OnHostWakeTrampoline, this);
     }
     if (inputRouter_ && !inputRouter_->ImeHost()) {
@@ -628,6 +748,7 @@ void NativeWindowHost::BindWebCanvasHost(
         if (inputRouter_ && !webHost_->InputRouter()) {
             webHost_->SetInputRouter(inputRouter_);
         }
+        webHost_->SetDpiScale(dpiScale_);
         webHost_->SetWakeCallback(&NativeWindowHost::OnHostWakeTrampoline, this);
         if (inputRouter_ && !inputRouter_->ImeHost()) {
             inputRouter_->SetImeHost(&webHost_->ImeAdapter());
@@ -666,8 +787,23 @@ bool NativeWindowHost::Initialize(const NativeWindowConfig& config) {
     ShutdownPlatformWindow();
 
     config_ = config;
-    width_ = std::max<std::uint32_t>(1u, config.width);
-    height_ = std::max<std::uint32_t>(1u, config.height);
+    logicalWidth_ = std::max<std::uint32_t>(1u, config.width);
+    logicalHeight_ = std::max<std::uint32_t>(1u, config.height);
+    dpiScale_ = 1.0f;
+    if (config.dpiScale > 0.0f && std::isfinite(config.dpiScale)) {
+        dpiScale_ = std::clamp(config.dpiScale, 0.25f, 8.0f);
+    } else if (!config.forceHeadless && !gpuBackend_ && config.enableHighDpi) {
+#if defined(_WIN32)
+        EnableWin32PerMonitorDpiV2();
+        dpiScale_ = QueryWin32SystemDpiScale();
+#endif
+    }
+    width_ = std::max<std::uint32_t>(
+        1u,
+        static_cast<std::uint32_t>(std::lround(static_cast<float>(logicalWidth_) * dpiScale_)));
+    height_ = std::max<std::uint32_t>(
+        1u,
+        static_cast<std::uint32_t>(std::lround(static_cast<float>(logicalHeight_) * dpiScale_)));
     clearColor_ = config.clearColor;
     closeRequested_.store(false, std::memory_order_release);
     wakeSignaled_.store(false, std::memory_order_release);
@@ -688,9 +824,11 @@ bool NativeWindowHost::Initialize(const NativeWindowConfig& config) {
     }
 
     if (desktopHost_) {
+        desktopHost_->SetDpiScale(dpiScale_);
         desktopHost_->SetViewportSize(Size{static_cast<float>(width_), static_cast<float>(height_)});
     }
     if (webHost_) {
+        webHost_->SetDpiScale(dpiScale_);
         webHost_->SetViewportSize(Size{static_cast<float>(width_), static_cast<float>(height_)});
     }
     if (inputRouter_ && !inputRouter_->ImeHost()) {
@@ -714,7 +852,7 @@ bool NativeWindowHost::Initialize(const NativeWindowConfig& config) {
     win32WakeEvent_ = static_cast<void*>(CreateEventW(nullptr, FALSE, FALSE, nullptr));
 #endif
 
-    ScopedUiResourceContext resourceScope(EffectiveResourceContext());
+    ScopedUIResourceContext resourceScope(EffectiveResourceContext());
     if (!InitializePlatformWindowAndBackend(config)) {
         Shutdown();
         return false;
@@ -909,10 +1047,18 @@ bool NativeWindowHost::InitializePlatformWindowAndBackend(const NativeWindowConf
     {
         detail::wasm_abi::EmRafTimestamp cssW{};
         detail::wasm_abi::EmRafTimestamp cssH{};
-        const float dpr = std::max(1.0f, static_cast<float>(emscripten_get_device_pixel_ratio()));
+        float dpr = 1.0f;
+        if (config.dpiScale > 0.0f && std::isfinite(config.dpiScale)) {
+            dpr = std::clamp(config.dpiScale, 0.25f, 8.0f);
+        } else if (config.enableHighDpi) {
+            dpr = std::clamp(static_cast<float>(emscripten_get_device_pixel_ratio()), 0.25f, 8.0f);
+        }
+        dpiScale_ = dpr;
         if (emscripten_get_element_css_size(selector, &cssW, &cssH) == EMSCRIPTEN_RESULT_SUCCESS &&
             static_cast<float>(cssW) > 1.0f &&
             static_cast<float>(cssH) > 1.0f) {
+            logicalWidth_ = std::max<std::uint32_t>(1u, static_cast<std::uint32_t>(std::lround(static_cast<float>(cssW))));
+            logicalHeight_ = std::max<std::uint32_t>(1u, static_cast<std::uint32_t>(std::lround(static_cast<float>(cssH))));
             const auto dprW = static_cast<std::uint32_t>(std::lround(static_cast<float>(cssW) * dpr));
             const auto dprH = static_cast<std::uint32_t>(std::lround(static_cast<float>(cssH) * dpr));
             if (dprW > 0u && dprH > 0u) {
@@ -921,9 +1067,11 @@ bool NativeWindowHost::InitializePlatformWindowAndBackend(const NativeWindowConf
                 gpuCfg.initialViewportWidth = width_;
                 gpuCfg.initialViewportHeight = height_;
                 if (desktopHost_) {
+                    desktopHost_->SetDpiScale(dpiScale_);
                     desktopHost_->SetViewportSize(Size{static_cast<float>(width_), static_cast<float>(height_)});
                 }
                 if (webHost_) {
+                    webHost_->SetDpiScale(dpiScale_);
                     webHost_->SetViewportSize(Size{static_cast<float>(width_), static_cast<float>(height_)});
                 }
             }
@@ -1187,6 +1335,26 @@ bool NativeWindowHost::InitializePlatformWindowAndBackend(const NativeWindowConf
                 }
                 return 0;
             }
+            case 0x02E0: { // WM_DPICHANGED
+                if (self->config_.enableHighDpi && self->config_.dpiScale <= 0.0f) {
+                    const UINT newDpiX = static_cast<UINT>(LOWORD(wParam));
+                    const float newScale = (newDpiX > 0u)
+                        ? std::clamp(static_cast<float>(newDpiX) / 96.0f, 0.25f, 8.0f)
+                        : QueryWin32WindowDpiScale(hwnd);
+                    self->UpdateDpiScale(newScale);
+                    if (const RECT* suggested = reinterpret_cast<const RECT*>(lParam)) {
+                        SetWindowPos(
+                            hwnd,
+                            nullptr,
+                            suggested->left,
+                            suggested->top,
+                            suggested->right - suggested->left,
+                            suggested->bottom - suggested->top,
+                            SWP_NOZORDER | SWP_NOACTIVATE);
+                    }
+                }
+                return 0;
+            }
             case WM_MOUSEMOVE:
                 self->OnPlatformMouseMove(
                     static_cast<float>(GET_X_LPARAM(lParam)),
@@ -1335,7 +1503,7 @@ bool NativeWindowHost::InitializePlatformWindowAndBackend(const NativeWindowConf
                             }
                             ime->OnCompositionEnd(utf8);
                             if (self->webHost_ && !utf8.empty()) {
-                                ScopedUiResourceContext resourceScope(self->EffectiveResourceContext());
+                                ScopedUIResourceContext resourceScope(self->EffectiveResourceContext());
                                 (void)self->webHost_->FontStream().InspectTextAndQueueMissingShards(utf8);
                             }
                             handled = true;
@@ -1466,7 +1634,7 @@ bool NativeWindowHost::InitializePlatformWindowAndBackend(const NativeWindowConf
     }
 
     RECT wr{0, 0, static_cast<LONG>(width_), static_cast<LONG>(height_)};
-    AdjustWindowRect(&wr, WS_OVERLAPPEDWINDOW, FALSE);
+    AdjustWin32WindowRectForDpi(&wr, WS_OVERLAPPEDWINDOW, FALSE, 0u, dpiScale_);
     const int outerW = wr.right - wr.left;
     const int outerH = wr.bottom - wr.top;
     int posX = CW_USEDEFAULT;
@@ -1493,6 +1661,49 @@ bool NativeWindowHost::InitializePlatformWindowAndBackend(const NativeWindowConf
 
     if (hwnd) {
         win32Hwnd_ = hwnd;
+        EnableWin32DarkTitleBar(hwnd);
+        if (config.enableHighDpi && config.dpiScale <= 0.0f) {
+            const float winScale = QueryWin32WindowDpiScale(hwnd);
+            if (std::abs(winScale - dpiScale_) > 1e-3f) {
+                dpiScale_ = winScale;
+                width_ = std::max<std::uint32_t>(
+                    1u,
+                    static_cast<std::uint32_t>(std::lround(static_cast<float>(logicalWidth_) * dpiScale_)));
+                height_ = std::max<std::uint32_t>(
+                    1u,
+                    static_cast<std::uint32_t>(std::lround(static_cast<float>(logicalHeight_) * dpiScale_)));
+                RECT adj{0, 0, static_cast<LONG>(width_), static_cast<LONG>(height_)};
+                AdjustWin32WindowRectForDpi(&adj, WS_OVERLAPPEDWINDOW, FALSE, 0u, dpiScale_);
+                SetWindowPos(
+                    hwnd,
+                    nullptr,
+                    0,
+                    0,
+                    adj.right - adj.left,
+                    adj.bottom - adj.top,
+                    SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+                gpuCfg.initialViewportWidth = width_;
+                gpuCfg.initialViewportHeight = height_;
+                if (desktopHost_) {
+                    desktopHost_->SetDpiScale(dpiScale_);
+                    desktopHost_->SetViewportSize(Size{static_cast<float>(width_), static_cast<float>(height_)});
+                }
+                if (webHost_) {
+                    webHost_->SetDpiScale(dpiScale_);
+                    webHost_->SetViewportSize(Size{static_cast<float>(width_), static_cast<float>(height_)});
+                }
+            }
+        }
+        RECT clientRect{};
+        if (GetClientRect(hwnd, &clientRect)) {
+            const auto cw = static_cast<std::uint32_t>(std::max<LONG>(1L, clientRect.right - clientRect.left));
+            const auto ch = static_cast<std::uint32_t>(std::max<LONG>(1L, clientRect.bottom - clientRect.top));
+            if (cw != width_ || ch != height_) {
+                OnPlatformResize(cw, ch);
+                gpuCfg.initialViewportWidth = width_;
+                gpuCfg.initialViewportHeight = height_;
+            }
+        }
         HDC hdc = GetDC(hwnd);
         win32Hdc_ = hdc;
 
@@ -1901,7 +2112,7 @@ bool NativeWindowHost::WaitForEventsOrWake(std::int32_t timeoutMs) noexcept {
 #endif
 }
 
-std::shared_ptr<UiResourceContext> NativeWindowHost::EffectiveResourceContext() const noexcept {
+std::shared_ptr<UIResourceContext> NativeWindowHost::EffectiveResourceContext() const noexcept {
     if (resourceContext_) {
         return resourceContext_;
     }
@@ -1944,7 +2155,8 @@ void NativeWindowHost::NotifyHostInputArrived() noexcept {
 }
 
 void NativeWindowHost::OnPlatformMouseMove(float x, float y, std::uint8_t modifiers) noexcept {
-    lastPointerPos_ = Point{x, y};
+    const float invDpi = 1.0f / std::max(0.25f, dpiScale_);
+    lastPointerPos_ = Point{x * invDpi, y * invDpi};
     activeModifiers_ = modifiers;
     telemetry_.osEventsTranslated += 1u;
     if (inputRouter_) {
@@ -1959,7 +2171,8 @@ void NativeWindowHost::OnPlatformMouseButton(
     PointerButton button,
     bool isDown,
     std::uint8_t modifiers) noexcept {
-    lastPointerPos_ = Point{x, y};
+    const float invDpi = 1.0f / std::max(0.25f, dpiScale_);
+    lastPointerPos_ = Point{x * invDpi, y * invDpi};
     activeModifiers_ = modifiers;
     telemetry_.osEventsTranslated += 1u;
     if (inputRouter_) {
@@ -1974,7 +2187,8 @@ void NativeWindowHost::OnPlatformMouseWheel(
     float scrollDeltaX,
     float scrollDeltaY,
     std::uint8_t modifiers) noexcept {
-    lastPointerPos_ = Point{x, y};
+    const float invDpi = 1.0f / std::max(0.25f, dpiScale_);
+    lastPointerPos_ = Point{x * invDpi, y * invDpi};
     activeModifiers_ = modifiers;
     telemetry_.osEventsTranslated += 1u;
     if (inputRouter_) {
@@ -2001,7 +2215,7 @@ void NativeWindowHost::OnPlatformTextInput(std::string_view utf8Text) noexcept {
         (void)inputRouter_->QueueTextInput(utf8Text);
     }
     if (webHost_) {
-        ScopedUiResourceContext resourceScope(EffectiveResourceContext());
+        ScopedUIResourceContext resourceScope(EffectiveResourceContext());
         (void)webHost_->FontStream().InspectTextAndQueueMissingShards(utf8Text);
     }
     NotifyHostInputArrived();
@@ -2016,13 +2230,50 @@ void NativeWindowHost::OnPlatformResize(std::uint32_t newWidth, std::uint32_t ne
     }
     width_ = newWidth;
     height_ = newHeight;
+    const float invDpi = 1.0f / std::max(0.25f, dpiScale_);
+    logicalWidth_ = std::max<std::uint32_t>(
+        1u,
+        static_cast<std::uint32_t>(std::lround(static_cast<float>(width_) * invDpi)));
+    logicalHeight_ = std::max<std::uint32_t>(
+        1u,
+        static_cast<std::uint32_t>(std::lround(static_cast<float>(height_) * invDpi)));
     needsInitialRender_ = true;
     telemetry_.osEventsTranslated += 1u;
     if (desktopHost_) {
+        desktopHost_->SetDpiScale(dpiScale_);
         desktopHost_->SetViewportSize(Size{static_cast<float>(width_), static_cast<float>(height_)});
     }
     if (webHost_) {
+        webHost_->SetDpiScale(dpiScale_);
         webHost_->SetViewportSize(Size{static_cast<float>(width_), static_cast<float>(height_)});
+    }
+    WakeEventLoop();
+}
+
+void NativeWindowHost::UpdateDpiScale(float newDpiScale) noexcept {
+    const float clamped = (std::isfinite(newDpiScale) && newDpiScale > 0.05f)
+        ? std::clamp(newDpiScale, 0.25f, 8.0f)
+        : 1.0f;
+    if (std::abs(clamped - dpiScale_) <= 1e-4f) {
+        return;
+    }
+    dpiScale_ = clamped;
+    const float invDpi = 1.0f / dpiScale_;
+    logicalWidth_ = std::max<std::uint32_t>(
+        1u,
+        static_cast<std::uint32_t>(std::lround(static_cast<float>(width_) * invDpi)));
+    logicalHeight_ = std::max<std::uint32_t>(
+        1u,
+        static_cast<std::uint32_t>(std::lround(static_cast<float>(height_) * invDpi)));
+    needsInitialRender_ = true;
+    if (desktopHost_) {
+        desktopHost_->SetDpiScale(dpiScale_);
+    }
+    if (webHost_) {
+        webHost_->SetDpiScale(dpiScale_);
+    }
+    if (renderTree_) {
+        renderTree_->SetRootDpiScale(dpiScale_);
     }
     WakeEventLoop();
 }
@@ -2052,12 +2303,16 @@ bool NativeWindowHost::EnsureWin32ImmLoaded() noexcept {
 void NativeWindowHost::SyncNativeImeSpot(Rect caretRect, bool active) noexcept {
     telemetry_.lastSyncedImeCaretRect = caretRect;
     telemetry_.lastImeActive = active;
+    const float scale = std::max(0.25f, dpiScale_);
+    const float physX = caretRect.x * scale;
+    const float physY = caretRect.y * scale;
+    const float physBottom = (caretRect.y + caretRect.height) * scale;
 
 #if defined(__linux__) && !defined(__EMSCRIPTEN__)
     if (active && x11_ && x11_->xic && x11_->XVaCreateNestedList && x11_->XSetICValues) {
         detail::x11_abi::XPoint spot{};
-        spot.x = static_cast<short>(std::clamp(caretRect.x, 0.0f, 32767.0f));
-        spot.y = static_cast<short>(std::clamp(caretRect.y + caretRect.height, 0.0f, 32767.0f));
+        spot.x = static_cast<short>(std::clamp(physX, 0.0f, 32767.0f));
+        spot.y = static_cast<short>(std::clamp(physBottom, 0.0f, 32767.0f));
         void* preeditAttr = x11_->XVaCreateNestedList(0, "spotLocation", &spot, nullptr);
         if (preeditAttr) {
             (void)x11_->XSetICValues(x11_->xic, "preeditAttributes", preeditAttr, nullptr);
@@ -2067,6 +2322,7 @@ void NativeWindowHost::SyncNativeImeSpot(Rect caretRect, bool active) noexcept {
         }
     }
 #elif defined(_WIN32)
+    (void)physBottom;
     if (active && win32Hwnd_ && EnsureWin32ImmLoaded()) {
         struct WinCompForm {
             DWORD dwStyle;
@@ -2082,8 +2338,8 @@ void NativeWindowHost::SyncNativeImeSpot(Rect caretRect, bool active) noexcept {
         if (HANDLE himc = immGet(static_cast<HWND>(win32Hwnd_))) {
             WinCompForm cf{};
             cf.dwStyle = 0x0002u; // CFS_POINT
-            cf.ptCurrentPos.x = static_cast<LONG>(caretRect.x);
-            cf.ptCurrentPos.y = static_cast<LONG>(caretRect.y);
+            cf.ptCurrentPos.x = static_cast<LONG>(std::lround(physX));
+            cf.ptCurrentPos.y = static_cast<LONG>(std::lround(physY));
             (void)immSet(himc, &cf);
             (void)immRel(static_cast<HWND>(win32Hwnd_), himc);
         }
@@ -2180,7 +2436,7 @@ GpuBackendFrameStats NativeWindowHost::TickAndPresentFrame(float dtSeconds, bool
     if (!IsInitialized() || !gpuBackend_ || !activeGpuStream_) {
         return frameStats;
     }
-    ScopedUiResourceContext resourceScope(EffectiveResourceContext());
+    ScopedUIResourceContext resourceScope(EffectiveResourceContext());
 
     auto markAllTreePagesDirty = [](PagedRenderTree& tree) noexcept {
         if (tree.DirtyPageCount() >= tree.PageCount()) {
@@ -2270,12 +2526,11 @@ GpuBackendFrameStats NativeWindowHost::TickAndPresentFrame(float dtSeconds, bool
     // Refresh IME caret screen bounds if a TextBox is currently focused and moved during layout
     if (inputRouter_) {
         if (auto* focused = inputRouter_->FocusedElement()) {
-            if (auto* tb = focused->DynamicCast<TextBox>();
-                tb && !tb->IsReadOnly() && !tb->IsPassword()) {
-                const Rect currentCaret = tb->CaretScreenRect();
+            if (focused->AcceptsActiveImeInput()) {
+                const Rect currentCaret = focused->GetEditableCaretScreenRect();
                 if (!(currentCaret == telemetry_.lastSyncedImeCaretRect) || !telemetry_.lastImeActive) {
                     if (ITextInputMethodHost* ime = ActiveImeHost()) {
-                        ime->FocusTextInput(tb, currentCaret);
+                        ime->FocusTextInput(focused, currentCaret);
                     }
                     SyncNativeImeSpot(currentCaret, true);
                 }
@@ -2571,7 +2826,7 @@ bool NativeWindowHost::CaptureFramebufferRgba8(
             (void)wglMakeCur(static_cast<HDC>(win32Hdc_), static_cast<HGLRC>(win32Hglrc_));
         }
         if (renderTree_ && activeGpuStream_) {
-            ScopedUiResourceContext resourceScope(EffectiveResourceContext());
+            ScopedUIResourceContext resourceScope(EffectiveResourceContext());
             (void)gpuBackend_->PresentStream(*renderTree_, *activeGpuStream_, width_, height_, clearColor_);
         }
     }
@@ -2580,7 +2835,7 @@ bool NativeWindowHost::CaptureFramebufferRgba8(
         x11_->glxContext && x11_->glXMakeCurrent) {
         (void)x11_->glXMakeCurrent(x11_->display, x11_->window, x11_->glxContext);
         if (renderTree_ && activeGpuStream_) {
-            ScopedUiResourceContext resourceScope(EffectiveResourceContext());
+            ScopedUIResourceContext resourceScope(EffectiveResourceContext());
             (void)gpuBackend_->PresentStream(*renderTree_, *activeGpuStream_, width_, height_, clearColor_);
         }
     }

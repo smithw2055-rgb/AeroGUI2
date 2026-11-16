@@ -1,14 +1,13 @@
 #include "aero/binding/DualTrackBindingEngine.hpp"
 #include "aero/animation/AnimationEngine.hpp"
-#include "aero/bridge/ScriptUiBridge.hpp"
-#include "aero/controls/Controls.hpp"
-#include "aero/core/UiResourceContext.hpp"
+#include "aero/binding/PropertyPathUtils.hpp"
+#include "aero/core/StringUtils.hpp"
+#include "aero/core/UIResourceContext.hpp"
 
 #include <algorithm>
-#include <cctype>
+#include <atomic>
 #include <charconv>
 #include <cmath>
-#include <cstdlib>
 #include <cstring>
 #include <mutex>
 #include "realscript/bytecode/Bytecode.h"
@@ -16,6 +15,8 @@
 namespace aero {
 
 namespace {
+
+std::atomic<DualTrackBindingEngine::DomainCleanupHook> gDomainCleanupHook{nullptr};
 
 struct LiveBindingEngineRegistry {
     std::mutex mutex;
@@ -53,14 +54,61 @@ struct LiveBindingEngineRegistry {
     }
 };
 
-[[nodiscard]] std::string_view ShortTypeNameOf(std::string_view raw) noexcept {
-    if (const auto colon = raw.rfind(':'); colon != std::string_view::npos) {
-        raw = raw.substr(colon + 1u);
+[[nodiscard]] bool MatchesAncestorTypeClassOrDeclaredName(
+    const UIElement& anc,
+    std::string_view targetType) noexcept {
+    for (const TypeClass* tc = anc.GetTypeClass(); tc != nullptr; tc = tc->baseClass) {
+        if (tc->typeName && str::ShortTypeName(tc->typeName) == targetType) {
+            return true;
+        }
     }
-    if (const auto dot = raw.rfind('.'); dot != std::string_view::npos) {
-        raw = raw.substr(dot + 1u);
+    if (!anc.DeclaredTypeName().empty()) {
+        const std::string_view declShort = str::ShortTypeName(anc.DeclaredTypeName());
+        if (declShort == targetType) {
+            return true;
+        }
+        if (targetType == "ContentControl" &&
+            (declShort == "ListBoxItem" || declShort == "ComboBoxItem" || declShort == "ListViewItem")) {
+            return true;
+        }
     }
-    return raw;
+    return false;
+}
+
+[[nodiscard]] bool MatchesAncestorLegacyFallback(
+    const UIElement& anc,
+    std::string_view targetType) noexcept {
+    return anc.MatchesBindingAncestorLegacyFallback(targetType);
+}
+
+[[nodiscard]] UIElement* FindMatchingAncestorByType(
+    UIElement* start,
+    std::string_view targetType) noexcept {
+    if (targetType.empty()) {
+        return nullptr;
+    }
+    for (UIElement* anc = start; anc != nullptr; anc = anc->Parent()) {
+        if (MatchesAncestorTypeClassOrDeclaredName(*anc, targetType)) {
+            return anc;
+        }
+    }
+    for (UIElement* anc = start; anc != nullptr; anc = anc->Parent()) {
+        if (MatchesAncestorLegacyFallback(*anc, targetType)) {
+            return anc;
+        }
+    }
+    return nullptr;
+}
+
+[[nodiscard]] bool IsRichTextTarget(const UIElement* elem) noexcept {
+    std::string dummy;
+    return elem != nullptr && elem->TryGetRichTextDisplayString(dummy);
+}
+
+[[nodiscard]] bool TryReadRichTextResolvedText(
+    const UIElement* elem,
+    std::string& outText) {
+    return elem != nullptr && elem->TryGetRichTextDisplayString(outText);
 }
 
 [[nodiscard]] UIElement* FindVisualRoot(UIElement* elem) noexcept {
@@ -83,15 +131,6 @@ struct LiveBindingEngineRegistry {
     return false;
 }
 
-[[nodiscard]] bool HasFocusedChildRecursive(const UIElement* elem) noexcept {
-    if (!elem) return false;
-    if (elem->IsFocused()) return true;
-    for (const UIElement* c = elem->FirstChild(); c != nullptr; c = c->NextSibling()) {
-        if (HasFocusedChildRecursive(c)) return true;
-    }
-    return false;
-}
-
 [[nodiscard]] UnifiedValue ReadElementPropertyOrState(const UIElement* elem, std::uint16_t propId) {
     if (!elem) {
         return UnifiedValue{};
@@ -104,7 +143,7 @@ struct LiveBindingEngineRegistry {
         case PropId_TriggerIsFocused:
             return UnifiedValue{elem->IsFocused()};
         case PropId_TriggerIsKeyboardFocusWithin:
-            return UnifiedValue{HasFocusedChildRecursive(elem)};
+            return UnifiedValue{binding_util::HasFocusedDescendant(elem)};
         case PropId_Content: {
             const UnifiedValue v = elem->GetValue(PropId_Content);
             if (!std::holds_alternative<std::monostate>(v)) {
@@ -124,17 +163,14 @@ struct LiveBindingEngineRegistry {
             if (std::holds_alternative<StringValue>(v)) {
                 return v;
             }
-            if (const auto* tvi = elem->DynamicCast<TreeViewItem>()) {
-                const std::string hdr = tvi->GetHeader();
-                if (!hdr.empty()) {
-                    return value::FromString(hdr);
-                }
+            std::string hdr;
+            if (elem->TryGetResolvedHeaderText(hdr) && !hdr.empty()) {
+                return value::FromString(hdr);
             }
             return v;
         }
         case PropId_DataContext: {
-            for (const UIElement* cur = elem; cur != nullptr;
-                 cur = cur->Parent() ? cur->Parent() : cur->TemplatedParent()) {
+            for (const UIElement* cur = elem; cur != nullptr; cur = binding_util::NextContextParent(cur)) {
                 const UnifiedValue dc = cur->GetValue(PropId_DataContext);
                 if (!std::holds_alternative<std::monostate>(dc)) {
                     return dc;
@@ -182,157 +218,6 @@ struct LiveBindingEngineRegistry {
         }
         default:
             return elem->GetValue(propId);
-    }
-}
-
-[[nodiscard]] bool BindingValuesEqual(const UnifiedValue& a, const UnifiedValue& b) noexcept {
-    if (std::holds_alternative<std::monostate>(a) || std::holds_alternative<std::monostate>(b)) {
-        return std::holds_alternative<std::monostate>(a) && std::holds_alternative<std::monostate>(b);
-    }
-    if (std::holds_alternative<NullObject>(a) || std::holds_alternative<NullObject>(b)) {
-        return std::holds_alternative<NullObject>(a) && std::holds_alternative<NullObject>(b);
-    }
-    if (std::holds_alternative<NullString>(a) || std::holds_alternative<NullString>(b)) {
-        return std::holds_alternative<NullString>(a) && std::holds_alternative<NullString>(b);
-    }
-    if (std::holds_alternative<NullArray>(a) || std::holds_alternative<NullArray>(b)) {
-        return std::holds_alternative<NullArray>(a) && std::holds_alternative<NullArray>(b);
-    }
-    if (const auto* ab = std::get_if<bool>(&a)) {
-        if (const auto* bb = std::get_if<bool>(&b)) return *ab == *bb;
-    }
-    EnumValue ae{};
-    EnumValue be{};
-    if (a.tryGetEnum(ae) && b.tryGetEnum(be)) {
-        return ae == be;
-    }
-    if (const auto* ai = std::get_if<std::int64_t>(&a)) {
-        if (const auto* bi = std::get_if<std::int64_t>(&b)) return *ai == *bi;
-    }
-    NativeHandle ah{};
-    NativeHandle bh{};
-    if (a.tryGetNativeHandle(ah) && b.tryGetNativeHandle(bh)) {
-        return ah == bh;
-    }
-    float af = 0.0f;
-    float bf = 0.0f;
-    if (TryGetFloat(a, af) && TryGetFloat(b, bf) &&
-        !std::holds_alternative<bool>(a) && !std::holds_alternative<bool>(b) &&
-        !std::holds_alternative<std::int64_t>(a) && !std::holds_alternative<std::int64_t>(b) &&
-        !std::holds_alternative<EnumValue>(a) && !std::holds_alternative<EnumValue>(b)) {
-        return std::fabs(af - bf) <= 1e-5f;
-    }
-    Float4Value af4{};
-    Float4Value bf4{};
-    if (a.tryGetQuatf(af4) && b.tryGetQuatf(bf4)) {
-        return af4 == bf4;
-    }
-    if (const auto* as = std::get_if<StringValue>(&a)) {
-        if (const auto* bs = std::get_if<StringValue>(&b)) {
-            return as->view() == bs->view();
-        }
-    }
-    if (const auto* ao = std::get_if<ObjectRef>(&a)) {
-        if (const auto* bo = std::get_if<ObjectRef>(&b)) {
-            return *ao == *bo;
-        }
-    }
-    return false;
-}
-
-[[nodiscard]] const rs_sem::TypeSymbol* FindTypeSymbolByRawName(
-    const ProgramImage* program,
-    std::string_view rawTypeName) noexcept {
-    if (!program || rawTypeName.empty()) {
-        return nullptr;
-    }
-    std::string canonical(rawTypeName);
-    for (std::size_t i = 0u; i < canonical.size(); ++i) {
-        if (canonical[i] == '.') {
-            canonical.replace(i, 1u, "::");
-            ++i;
-        }
-    }
-    const rs_sem::TypeSymbol* shortMatch = nullptr;
-    const std::string_view shortName = ShortTypeNameOf(canonical);
-    for (const auto& mod : program->modules()) {
-        for (const auto& t : mod.types) {
-            const std::string canon = rs_sem::canonicalTypeName(t);
-            if (canon == canonical || t.name == canonical) {
-                return &t;
-            }
-            if (!shortMatch && t.name == shortName) {
-                shortMatch = &t;
-            }
-        }
-    }
-    return shortMatch;
-}
-
-void ResolveDynamicHopTargetType(
-    const ProgramImage* program,
-    SymbolId runtimeTypeId,
-    AxbCompiledHop& hop) noexcept {
-    if (!program || runtimeTypeId == 0 || hop.targetTypeId != 0) {
-        return;
-    }
-    std::string memberTypeName;
-    for (SymbolId curId = runtimeTypeId; curId != 0;) {
-        const rs_sem::TypeSymbol* tSym = program->resolveType(curId);
-        if (!tSym) {
-            break;
-        }
-        for (const auto& p : tSym->properties) {
-            if (p.name == hop.memberName) {
-                memberTypeName = p.typeName;
-                break;
-            }
-        }
-        if (!memberTypeName.empty()) {
-            break;
-        }
-        for (const auto& f : tSym->fields) {
-            if (f.name == hop.memberName) {
-                memberTypeName = f.typeName;
-                break;
-            }
-        }
-        if (!memberTypeName.empty()) {
-            break;
-        }
-        curId = (tSym->baseTypeId != curId) ? tSym->baseTypeId : 0;
-    }
-    if (memberTypeName.empty()) {
-        return;
-    }
-    const rs_sem::TypeSymbol* memberType = FindTypeSymbolByRawName(program, memberTypeName);
-    if (hop.collectionIndex >= 0) {
-        std::string elemTypeName;
-        if (memberType) {
-            for (const auto& f : memberType->fields) {
-                if (f.name == "_items") {
-                    if (f.typeName.size() > 2u &&
-                        f.typeName.substr(f.typeName.size() - 2u) == "[]") {
-                        elemTypeName = f.typeName.substr(0u, f.typeName.size() - 2u);
-                    }
-                    break;
-                }
-            }
-        }
-        if (elemTypeName.empty()) {
-            if (memberTypeName.size() > 2u &&
-                memberTypeName.substr(memberTypeName.size() - 2u) == "[]") {
-                elemTypeName = memberTypeName.substr(0u, memberTypeName.size() - 2u);
-            } else if (const auto lt = memberTypeName.find('<');
-                       lt != std::string::npos && memberTypeName.back() == '>') {
-                elemTypeName = memberTypeName.substr(lt + 1u, memberTypeName.size() - lt - 2u);
-            }
-        }
-        memberType = FindTypeSymbolByRawName(program, elemTypeName);
-    }
-    if (memberType) {
-        hop.targetTypeId = memberType->id;
-        hop.targetIsEnum = (memberType->kind == rs_sem::TypeKind::Enum);
     }
 }
 
@@ -433,19 +318,6 @@ void UpsertIndexedArrayObserver(
     return changed;
 }
 
-[[nodiscard]] float ParseStackFloat32(std::string_view raw, float fallback = 0.0f) noexcept {
-    while (!raw.empty() && std::isspace(static_cast<unsigned char>(raw.front()))) raw.remove_prefix(1u);
-    while (!raw.empty() && std::isspace(static_cast<unsigned char>(raw.back()))) raw.remove_suffix(1u);
-    if (raw.empty() || raw.size() >= 60u) {
-        return fallback;
-    }
-    char buf[64]{};
-    for (std::size_t i = 0u; i < raw.size(); ++i) buf[i] = raw[i];
-    char* endPtr = nullptr;
-    const float v = std::strtof(buf, &endPtr);
-    return (endPtr != buf) ? v : fallback;
-}
-
 [[nodiscard]] bool MultiBindingMatchesDirtyObj(
     const MultiBindingInstance& mb,
     const ObjectRef& dirtyObj,
@@ -539,6 +411,10 @@ bool DualTrackBindingEngine::IsLiveInstance(const DualTrackBindingEngine* engine
     return LiveBindingEngineRegistry::Instance().Contains(engine);
 }
 
+void DualTrackBindingEngine::RegisterDomainCleanupHook(DomainCleanupHook hook) noexcept {
+    gDomainCleanupHook.store(hook, std::memory_order_release);
+}
+
 DualTrackBindingEngine::~DualTrackBindingEngine() noexcept {
     LiveBindingEngineRegistry::Instance().Unregister(this);
     bool anyOtherEngineForDomain = false;
@@ -552,7 +428,9 @@ DualTrackBindingEngine::~DualTrackBindingEngine() noexcept {
             }
         });
     if (!anyOtherEngineForDomain) {
-        ClearScriptUiDomainState(&domains_);
+        if (const DomainCleanupHook hook = gDomainCleanupHook.load(std::memory_order_acquire)) {
+            hook(&domains_);
+        }
     }
     commandCanExecuteWatchers_.clear();
     lazyConverterInstances_.clear();
@@ -812,7 +690,7 @@ void DualTrackBindingEngine::RegisterValueConverter(
     auto& entry = registeredConverters_[name];
     entry.convertFn = std::move(convertFn);
     entry.convertBackFn = std::move(convertBackFn);
-    const std::string shortName(ShortTypeNameOf(name));
+    const std::string shortName(str::ShortTypeName(name));
     if (!shortName.empty() && shortName != name) {
         registeredConverters_[shortName] = entry;
     }
@@ -826,7 +704,7 @@ void DualTrackBindingEngine::RegisterMultiValueConverter(
     }
     auto& entry = registeredConverters_[name];
     entry.multiConvertFn = std::move(convertFn);
-    const std::string shortName(ShortTypeNameOf(name));
+    const std::string shortName(str::ShortTypeName(name));
     if (!shortName.empty() && shortName != name) {
         registeredConverters_[shortName] = entry;
     }
@@ -850,7 +728,7 @@ void DualTrackBindingEngine::RegisterScriptValueConverter(
             entry.receiverRoot = std::make_shared<PersistentRoot>(heap->retain(receiverObject));
         }
     }
-    const std::string shortName(ShortTypeNameOf(name));
+    const std::string shortName(str::ShortTypeName(name));
     if (!shortName.empty() && shortName != name) {
         registeredConverters_[shortName] = entry;
     }
@@ -900,7 +778,7 @@ UnifiedValue DualTrackBindingEngine::InvokeScriptConverterSymbol(
                 return MakeFloat(fv);
             }
             if (const auto* sv = std::get_if<StringValue>(&raw)) {
-                return MakeFloat(ParseStackFloat32(sv->view(), 0.0f));
+                return MakeFloat(str::ParseFloat32Or(sv->view(), 0.0f));
             }
             return MakeFloat(0.0f);
         }
@@ -927,15 +805,13 @@ UnifiedValue DualTrackBindingEngine::InvokeScriptConverterSymbol(
                 return value::FromInt(static_cast<std::int64_t>(std::llround(fv)));
             }
             if (const auto* sv = std::get_if<StringValue>(&raw)) {
-                std::string_view ts = sv->view();
-                while (!ts.empty() && std::isspace(static_cast<unsigned char>(ts.front()))) ts.remove_prefix(1u);
-                while (!ts.empty() && std::isspace(static_cast<unsigned char>(ts.back()))) ts.remove_suffix(1u);
+                const std::string_view ts = str::Trim(sv->view());
                 std::int64_t parsedInt = 0;
                 const auto [ptr, ec] = std::from_chars(ts.data(), ts.data() + ts.size(), parsedInt);
                 if (ec == std::errc{} && ptr == ts.data() + ts.size()) {
                     return value::FromInt(parsedInt);
                 }
-                return value::FromInt(static_cast<std::int64_t>(std::llround(ParseStackFloat32(ts, 0.0f))));
+                return value::FromInt(static_cast<std::int64_t>(std::llround(str::ParseFloat32Or(ts, 0.0f))));
             }
             return value::FromInt(0);
         }
@@ -1114,7 +990,7 @@ UnifiedValue DualTrackBindingEngine::ApplySingleValueConversion(
     }
     if (kind == ValueConverterKind::MathExpression) {
         if (!inverseForTwoWay) {
-            const float paramF = ParseStackFloat32(converterParameter, 0.0f);
+            const float paramF = str::ParseFloat32Or(converterParameter, 0.0f);
             float evalOut = 0.0f;
             if (EvaluateMathConverterExpression(converterKey, &rawVal, 1u, paramF, evalOut)) {
                 return MakeFloat(evalOut);
@@ -1123,7 +999,7 @@ UnifiedValue DualTrackBindingEngine::ApplySingleValueConversion(
         return rawVal;
     }
     if (kind == ValueConverterKind::CustomScriptOrHost) {
-        if (converterKey.rfind("__aero_alt_conv__:", 0) == 0) {
+        if (str::StartsWith(converterKey, "__aero_alt_conv__:")) {
             if (!inverseForTwoWay) {
                 const std::string_view body = converterKey.substr(18u);
                 std::vector<std::string_view> parts;
@@ -1155,7 +1031,7 @@ UnifiedValue DualTrackBindingEngine::ApplySingleValueConversion(
             if (it != registeredConverters_.end()) {
                 found = &it->second;
             } else {
-                const std::string shortKey(ShortTypeNameOf(converterKey));
+                const std::string shortKey(str::ShortTypeName(converterKey));
                 const auto itShort = registeredConverters_.find(shortKey);
                 if (itShort != registeredConverters_.end()) {
                     found = &itShort->second;
@@ -1203,7 +1079,7 @@ UnifiedValue DualTrackBindingEngine::ApplyMultiValueConversion(
     const UnifiedValue* values,
     std::size_t count) const {
     if (kind == ValueConverterKind::MathExpression) {
-        const float paramF = ParseStackFloat32(converterParameter, 0.0f);
+        const float paramF = str::ParseFloat32Or(converterParameter, 0.0f);
         float evalOut = 0.0f;
         if (EvaluateMathConverterExpression(converterKey, values, count, paramF, evalOut)) {
             return MakeFloat(evalOut);
@@ -1217,7 +1093,7 @@ UnifiedValue DualTrackBindingEngine::ApplyMultiValueConversion(
             if (it != registeredConverters_.end()) {
                 found = &it->second;
             } else {
-                const std::string shortKey(ShortTypeNameOf(converterKey));
+                const std::string shortKey(str::ShortTypeName(converterKey));
                 const auto itShort = registeredConverters_.find(shortKey);
                 if (itShort != registeredConverters_.end()) {
                     found = &itShort->second;
@@ -1480,7 +1356,7 @@ bool DualTrackBindingEngine::EvaluateAndSyncChain(
                 hop.targetTypeId = 0;
                 hop.targetIsEnum = false;
             }
-            ResolveDynamicHopTargetType(program_, runtimeTypeId, hop);
+            binding_util::ResolveCompiledHopTargetType(program_, runtimeTypeId, hop);
         }
 
         const PropertySlotHandle slot = hop.ToSlotHandle();
@@ -1624,16 +1500,11 @@ bool DualTrackBindingEngine::EvaluateAndSyncChain(
                                         }
                                         binding.lastSeenMutationVersion = latestVer;
                                         const IntrusivePtr<UIElement> targetElem = binding.targetElement;
-                                        bool appliedIncrementally = false;
-                                        if (auto* ic = targetElem->DynamicCast<ItemsControl>()) {
-                                            appliedIncrementally = ic->ApplyIncrementalChanges(
+                                        const bool appliedIncrementally =
+                                            targetElem &&
+                                            targetElem->TryApplyIncrementalCollectionChanges(
                                                 localDeltas.data(),
                                                 localDeltas.size());
-                                        } else if (auto* tc = targetElem->DynamicCast<TabControl>()) {
-                                            appliedIncrementally = tc->ApplyIncrementalChanges(
-                                                localDeltas.data(),
-                                                localDeltas.size());
-                                        }
                                         if (appliedIncrementally) {
                                             recycleLocalDeltas();
                                             return true;
@@ -1768,43 +1639,7 @@ bool DualTrackBindingEngine::EvaluateAndSyncElementBinding(ElementPropertyBindin
         } else if (eb.relativeAncestorType == "$TemplatedParent") {
             eb.cachedSourceElement = target->TemplatedParent();
         } else if (!eb.relativeAncestorType.empty()) {
-            for (UIElement* anc = target; anc != nullptr; anc = anc->Parent()) {
-                bool matched = false;
-                for (const TypeClass* tc = anc->GetTypeClass(); tc != nullptr; tc = tc->baseClass) {
-                    if (tc->typeName && ShortTypeNameOf(tc->typeName) == eb.relativeAncestorType) {
-                        matched = true;
-                        break;
-                    }
-                }
-                if (!matched) {
-                    if (eb.relativeAncestorType == "ToggleButton") {
-                        matched = anc->IsA<CheckBox>() || anc->IsA<RadioButton>();
-                    } else if (eb.relativeAncestorType == "Page") {
-                        matched = anc->IsA<UserControl>() || anc->IsA<Window>();
-                    } else if (eb.relativeAncestorType == "ContentControl" ||
-                               eb.relativeAncestorType == "ListBoxItem" ||
-                               eb.relativeAncestorType == "ComboBoxItem" ||
-                               eb.relativeAncestorType == "ListViewItem" ||
-                               eb.relativeAncestorType == "TreeViewItem") {
-                        matched = anc->IsA<Border>() || anc->IsA<ContentPresenter>() || anc->IsA<UserControl>();
-                    } else if (eb.relativeAncestorType == "RepeatButton" ||
-                               eb.relativeAncestorType == "Hyperlink" ||
-                               eb.relativeAncestorType == "MenuItem") {
-                        matched = anc->IsA<Button>();
-                    } else if (eb.relativeAncestorType == "ListView") {
-                        matched = anc->IsA<ListBox>();
-                    } else if (eb.relativeAncestorType == "TreeView") {
-                        matched = anc->IsA<ItemsControl>();
-                    } else if (eb.relativeAncestorType == "FrameworkElement" ||
-                               eb.relativeAncestorType == "Control") {
-                        matched = true;
-                    }
-                }
-                if (matched) {
-                    eb.cachedSourceElement = anc;
-                    break;
-                }
-            }
+            eb.cachedSourceElement = FindMatchingAncestorByType(target, eb.relativeAncestorType);
         } else if (!eb.elementName.empty()) {
             if (UIElement* scopeRoot = UIElement::FindNamescopeRoot(target)) {
                 eb.cachedSourceElement = scopeRoot->FindName(eb.elementName);
@@ -1885,12 +1720,13 @@ bool DualTrackBindingEngine::EvaluateAndSyncElementBinding(ElementPropertyBindin
                 const UIElement* selElem = UIElement::FromNativeHandle(domains_.nativeHandles(), *nh);
                 if (!selElem) selElem = UIElement::FromNativeHandle(FallbackVisualHandleRegistry(), *nh);
                 if (selElem) {
-                    if (const auto* tvi = selElem->DynamicCast<TreeViewItem>()) {
+                    std::string hdr;
+                    if (selElem->TryGetResolvedHeaderText(hdr)) {
                         if (eb.targetPropertyId == PropId_Text ||
                             eb.targetPropertyId == PropId_Content ||
                             eb.targetPropertyId == PropId_Header ||
                             !eb.stringFormat.empty()) {
-                            val = value::FromString(tvi->GetHeader());
+                            val = value::FromString(hdr);
                         }
                     }
                 }
@@ -1977,7 +1813,7 @@ bool DualTrackBindingEngine::EvaluateAndSyncElementBinding(ElementPropertyBindin
                             hop.targetTypeId = 0;
                             hop.targetIsEnum = false;
                         }
-                        ResolveDynamicHopTargetType(program_, runtimeTypeId, hop);
+                        binding_util::ResolveCompiledHopTargetType(program_, runtimeTypeId, hop);
                     }
                     const PropertySlotHandle sh = hop.ToSlotHandle();
                     UnifiedValue hv{};
@@ -2099,7 +1935,7 @@ bool DualTrackBindingEngine::EvaluateAndSyncElementBinding(ElementPropertyBindin
         usedTargetNullValue ? std::string_view{} : std::string_view(eb.stringFormat),
         val);
 
-    if (eb.initialized && BindingValuesEqual(val, eb.lastSyncedValue)) {
+    if (eb.initialized && UnifiedValueEquals(val, eb.lastSyncedValue, 1e-5f)) {
         return false;
     }
 
@@ -2205,7 +2041,7 @@ std::uint16_t DualTrackBindingEngine::BindElementProperty(
     eb.converterSymbolId = compiledChain.converterSymbolId;
     eb.convertBackSymbolId = compiledChain.convertBackSymbolId;
     eb.elementName = compiledChain.elementName;
-    eb.relativeAncestorType = std::string(ShortTypeNameOf(compiledChain.relativeAncestorType));
+    eb.relativeAncestorType = std::string(str::ShortTypeName(compiledChain.relativeAncestorType));
     eb.relativeSelf = compiledChain.relativeSelf;
     eb.sourcePropertyId = srcPropId;
     eb.targetPropertyId = compiledChain.targetPropertyId;
@@ -2297,7 +2133,7 @@ void DualTrackBindingEngine::PopulateMultiBindingFromCompiled(
         if (isElem) {
             outInst.hasElementSource = true;
             slot.elementName = srcCh.elementName;
-            slot.relativeAncestorType = std::string(ShortTypeNameOf(srcCh.relativeAncestorType));
+            slot.relativeAncestorType = std::string(str::ShortTypeName(srcCh.relativeAncestorType));
             slot.relativeSelf = srcCh.relativeSelf;
             const std::string_view propLeaf = !srcCh.hops.empty()
                 ? std::string_view(srcCh.hops.front().memberName)
@@ -2473,7 +2309,7 @@ UnifiedValue DualTrackBindingEngine::EvaluateMultiBindingValue(
                         hop.targetTypeId = 0;
                         hop.targetIsEnum = false;
                     }
-                    ResolveDynamicHopTargetType(program_, runtimeTypeId, hop);
+                    binding_util::ResolveCompiledHopTargetType(program_, runtimeTypeId, hop);
                 }
                 const PropertySlotHandle sh = hop.ToSlotHandle();
                 UnifiedValue hv{};
@@ -2565,43 +2401,7 @@ UnifiedValue DualTrackBindingEngine::EvaluateMultiBindingValue(
                 } else if (slot.relativeAncestorType == "$TemplatedParent") {
                     slot.cachedSourceElement = target->TemplatedParent();
                 } else if (!slot.relativeAncestorType.empty()) {
-                    for (UIElement* anc = target; anc != nullptr; anc = anc->Parent()) {
-                        bool matched = false;
-                        for (const TypeClass* tc = anc->GetTypeClass(); tc != nullptr; tc = tc->baseClass) {
-                            if (tc->typeName && ShortTypeNameOf(tc->typeName) == slot.relativeAncestorType) {
-                                matched = true;
-                                break;
-                            }
-                        }
-                        if (!matched) {
-                            if (slot.relativeAncestorType == "ToggleButton") {
-                                matched = anc->IsA<CheckBox>() || anc->IsA<RadioButton>();
-                            } else if (slot.relativeAncestorType == "Page") {
-                                matched = anc->IsA<UserControl>() || anc->IsA<Window>();
-                            } else if (slot.relativeAncestorType == "ContentControl" ||
-                                       slot.relativeAncestorType == "ListBoxItem" ||
-                                       slot.relativeAncestorType == "ComboBoxItem" ||
-                                       slot.relativeAncestorType == "ListViewItem" ||
-                                       slot.relativeAncestorType == "TreeViewItem") {
-                                matched = anc->IsA<Border>() || anc->IsA<ContentPresenter>() || anc->IsA<UserControl>();
-                            } else if (slot.relativeAncestorType == "RepeatButton" ||
-                                       slot.relativeAncestorType == "Hyperlink" ||
-                                       slot.relativeAncestorType == "MenuItem") {
-                                matched = anc->IsA<Button>();
-                            } else if (slot.relativeAncestorType == "ListView") {
-                                matched = anc->IsA<ListBox>();
-                            } else if (slot.relativeAncestorType == "TreeView") {
-                                matched = anc->IsA<ItemsControl>();
-                            } else if (slot.relativeAncestorType == "FrameworkElement" ||
-                                       slot.relativeAncestorType == "Control") {
-                                matched = true;
-                            }
-                        }
-                        if (matched) {
-                            slot.cachedSourceElement = anc;
-                            break;
-                        }
-                    }
+                    slot.cachedSourceElement = FindMatchingAncestorByType(target, slot.relativeAncestorType);
                 } else if (!slot.elementName.empty()) {
                     if (UIElement* scopeRoot = UIElement::FindNamescopeRoot(target)) {
                         slot.cachedSourceElement = scopeRoot->FindName(slot.elementName);
@@ -2736,7 +2536,7 @@ bool DualTrackBindingEngine::EvaluateAndSyncMultiBinding(
         return false;
     }
     outVal = FinalizeTargetPropertyValue(mb.targetPropertyId, {}, outVal);
-    if (mb.initialized && BindingValuesEqual(outVal, mb.lastSyncedOutput)) {
+    if (mb.initialized && UnifiedValueEquals(outVal, mb.lastSyncedOutput, 1e-5f)) {
         return false;
     }
     if (outVal.isTraceable()) {
@@ -3110,16 +2910,11 @@ void DualTrackBindingEngine::RegisterRichTextDependent(
         }
     }
     ObjectRef dcRef{};
-    for (const UIElement* cur = targetElement.Get(); cur != nullptr;) {
+    for (const UIElement* cur = targetElement.Get(); cur != nullptr; cur = binding_util::NextContextParent(cur)) {
         const UnifiedValue dcVal = cur->GetValue(PropId_DataContext);
         if (const auto* oref = std::get_if<ObjectRef>(&dcVal); oref && oref->valid()) {
             dcRef = *oref;
             break;
-        }
-        if (cur->Parent() != nullptr) {
-            cur = cur->Parent();
-        } else {
-            cur = cur->TemplatedParent();
         }
     }
     if (dcRef.valid()) {
@@ -3132,8 +2927,8 @@ void DualTrackBindingEngine::RegisterRichTextDependent(
     entry.observedDcRef = dcRef;
     richTextDependents_.push_back(std::move(entry));
     const std::size_t slotIdx = richTextDependents_.size() - 1u;
-    if (const auto* tb = targetElement->DynamicCast<TextBlock>()) {
-        std::string initialText = tb->GetText();
+    std::string initialText;
+    if (TryReadRichTextResolvedText(targetElement.Get(), initialText)) {
         if (slotIdx < richTextDependents_.size() &&
             richTextDependents_[slotIdx].targetElement.Get() == targetElement.Get()) {
             richTextDependents_[slotIdx].lastResolvedText = std::move(initialText);
@@ -3244,11 +3039,11 @@ std::size_t DualTrackBindingEngine::FlushTrackA(RuntimeError* error) {
         commandCanExecuteWatchers_.empty()) {
         return 0;
     }
-    std::shared_ptr<UiResourceContext> domainCtx =
-        !UiResourceContext::HasActiveThreadOverride()
-            ? UiResourceContext::FindForDomains(&domains_)
+    std::shared_ptr<UIResourceContext> domainCtx =
+        !UIResourceContext::HasActiveThreadOverride()
+            ? UIResourceContext::FindForDomains(&domains_)
             : nullptr;
-    ScopedUiResourceContext ctxGuard(std::move(domainCtx));
+    ScopedUIResourceContext ctxGuard(std::move(domainCtx));
 
     std::size_t updatedCount = 0;
 
@@ -3491,20 +3286,17 @@ std::size_t DualTrackBindingEngine::FlushTrackA(RuntimeError* error) {
     if (!richTextDependents_.empty()) {
         const std::size_t rtSnapshotCount = richTextDependents_.size();
         for (std::size_t rIdx = 0u; rIdx < rtSnapshotCount && rIdx < richTextDependents_.size(); ++rIdx) {
-            auto* tb = richTextDependents_[rIdx].targetElement
-                ? richTextDependents_[rIdx].targetElement->DynamicCast<TextBlock>()
-                : nullptr;
-            if (!tb) {
+            UIElement* rtElem = richTextDependents_[rIdx].targetElement.Get();
+            if (!IsRichTextTarget(rtElem)) {
                 continue;
             }
             ObjectRef curDc{};
-            for (const UIElement* cur = tb; cur != nullptr;) {
+            for (const UIElement* cur = rtElem; cur != nullptr; cur = binding_util::NextContextParent(cur)) {
                 const UnifiedValue dcVal = cur->GetValue(PropId_DataContext);
                 if (const auto* oref = std::get_if<ObjectRef>(&dcVal); oref && oref->valid()) {
                     curDc = *oref;
                     break;
                 }
-                cur = (cur->Parent() != nullptr) ? cur->Parent() : cur->TemplatedParent();
             }
             if (!(curDc == richTextDependents_[rIdx].observedDcRef)) {
                 if (richTextDependents_[rIdx].observedDcRef.valid()) {
@@ -3519,12 +3311,13 @@ std::size_t DualTrackBindingEngine::FlushTrackA(RuntimeError* error) {
                     }
                 }
             }
-            std::string nextText = tb->GetText();
-            if (rIdx < richTextDependents_.size() &&
+            std::string nextText;
+            if (TryReadRichTextResolvedText(rtElem, nextText) &&
+                rIdx < richTextDependents_.size() &&
                 nextText != richTextDependents_[rIdx].lastResolvedText) {
                 richTextDependents_[rIdx].lastResolvedText = std::move(nextText);
-                tb->InvalidateMeasure();
-                tb->InvalidateRender();
+                rtElem->InvalidateMeasure();
+                rtElem->InvalidateRender();
                 ++updatedCount;
             }
         }
@@ -3583,7 +3376,7 @@ bool DualTrackBindingEngine::PushTwoWayToSource(
             UIElement* cachedSrc = eb.cachedSourceElement;
             const std::uint16_t srcProp = eb.sourcePropertyId;
             const UnifiedValue curSrcVal = ReadElementPropertyOrState(cachedSrc, srcProp);
-            if (!BindingValuesEqual(curSrcVal, uiVal) &&
+            if (!UnifiedValueEquals(curSrcVal, uiVal, 1e-5f) &&
                 cachedSrc->SetValue(srcProp, uiVal, ValueSourceRank::Local)) {
                 (void)cachedSrc->NotifyTwoWayPropertyMutated(srcProp, error);
                 anyPushed = true;
@@ -3700,7 +3493,7 @@ bool DualTrackBindingEngine::PushTwoWayToSource(
                 } else if (const auto* sv = std::get_if<StringValue>(&uiValue)) {
                     const SymbolId enumT = (curEv.typeId != 0) ? curEv.typeId : lastHop.targetTypeId;
                     if (!TryResolveEnumMemberByName(program_, enumT, sv->view(), enumInt)) {
-                        enumInt = static_cast<std::int64_t>(std::llround(ParseStackFloat32(sv->view(), 0.0f)));
+                        enumInt = static_cast<std::int64_t>(std::llround(str::ParseFloat32Or(sv->view(), 0.0f)));
                     }
                 } else {
                     float fv = 0.0f;
@@ -3714,7 +3507,7 @@ bool DualTrackBindingEngine::PushTwoWayToSource(
                 if (TryGetFloat(uiValue, fv)) {
                     uiValue = MakeFloat(fv);
                 } else if (const auto* sv = std::get_if<StringValue>(&uiValue)) {
-                    uiValue = MakeFloat(ParseStackFloat32(sv->view(), 0.0f));
+                    uiValue = MakeFloat(str::ParseFloat32Or(sv->view(), 0.0f));
                 }
             } else if (std::holds_alternative<std::int64_t>(curSlotVal) && !std::holds_alternative<std::int64_t>(uiValue)) {
                 float fv = 0.0f;
@@ -3726,7 +3519,7 @@ bool DualTrackBindingEngine::PushTwoWayToSource(
                         TryResolveEnumMemberByName(program_, lastHop.targetTypeId, sv->view(), enumInt)) {
                         uiValue = value::FromInt(enumInt);
                     } else {
-                        uiValue = value::FromInt(static_cast<std::int64_t>(std::llround(ParseStackFloat32(sv->view(), 0.0f))));
+                        uiValue = value::FromInt(static_cast<std::int64_t>(std::llround(str::ParseFloat32Or(sv->view(), 0.0f))));
                     }
                 }
             } else if (std::holds_alternative<bool>(curSlotVal) && !std::holds_alternative<bool>(uiValue)) {

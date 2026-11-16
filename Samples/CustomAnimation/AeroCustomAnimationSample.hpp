@@ -9,7 +9,7 @@
 #include <string>
 #include <string_view>
 
-#include "aero/compiler/AxbFormat.hpp"
+#include "aero/asset/AxbFormat.hpp"
 
 namespace aero::samples {
 

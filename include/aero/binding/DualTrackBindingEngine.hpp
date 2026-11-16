@@ -10,7 +10,7 @@
 #include <utility>
 #include <vector>
 
-#include "aero/compiler/AxbFormat.hpp"
+#include "aero/asset/AxbFormat.hpp"
 #include "aero/core/RsAliases.hpp"
 #include "aero/core/UIElement.hpp"
 
@@ -158,6 +158,7 @@ public:
         const UnifiedValue* values,
         std::size_t count,
         std::string_view parameter)>;
+    using DomainCleanupHook = void (*)(const ExecutionDomainContext*) noexcept;
 
     explicit DualTrackBindingEngine(
         ExecutionDomainContext& domains,
@@ -166,6 +167,7 @@ public:
     ~DualTrackBindingEngine() noexcept;
 
     [[nodiscard]] static bool IsLiveInstance(const DualTrackBindingEngine* engine) noexcept;
+    static void RegisterDomainCleanupHook(DomainCleanupHook hook) noexcept;
 
     void SetProgramImage(const ProgramImage* program);
     void SetUiInterpreter(const Interpreter* uiInterpreter) noexcept { uiInterpreter_ = uiInterpreter; }

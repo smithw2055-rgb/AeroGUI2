@@ -6,8 +6,8 @@
 #include <string_view>
 #include <vector>
 
+#include "aero/asset/AxbFormat.hpp"
 #include "aero/compiler/AeroSceneIR.hpp"
-#include "aero/compiler/AxbFormat.hpp"
 #include "aero/core/RsAliases.hpp"
 #include "realscript/compiler/Compilation.h"
 

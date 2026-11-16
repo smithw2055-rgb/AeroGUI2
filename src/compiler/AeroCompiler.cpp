@@ -1,22 +1,29 @@
-#include <thread>
 #include "aero/compiler/AeroCompiler.hpp"
+#include "AeroCompilerInternal.hpp"
 #include "aero/compiler/CSharpCompatLowerer.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <iterator>
 #include <limits>
 #include <memory>
 #include <sstream>
 #include <string>
+#include <string_view>
 #include <system_error>
+#include <thread>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
+#include <variant>
+#include <vector>
 
 #if defined(_MSC_VER)
 #define AERO_NOINLINE __declspec(noinline)
@@ -26,9 +33,13 @@
 #define AERO_NOINLINE
 #endif
 
-#include "aero/controls/Controls.hpp"
+#include "aero/asset/AxbFormat.hpp"
+#include "aero/asset/AxbTemplateRegistry.hpp"
+#include "aero/controls/AxbTemplateMounter.hpp"
+#include "aero/controls/Panels.hpp"
+#include "aero/core/StringUtils.hpp"
 #include "aero/core/TypeClass.hpp"
-#include "aero/core/UiResourceContext.hpp"
+#include "aero/core/UIResourceContext.hpp"
 #include "realscript/aot_cpp/AotCpp.h"
 #include "realscript/bytecode/Bytecode.h"
 #include "realscript/compiler/StandardMacros.h"
@@ -39,67 +50,20 @@ namespace aero {
 
 namespace {
 
-std::string_view Trim(std::string_view s) noexcept {
-    while (!s.empty() && std::isspace(static_cast<unsigned char>(s.front()))) {
-        s.remove_prefix(1);
-    }
-    while (!s.empty() && std::isspace(static_cast<unsigned char>(s.back()))) {
-        s.remove_suffix(1);
-    }
-    return s;
-}
-
-float ParseFloat32(std::string_view text, float fallback = 0.0f) noexcept {
-    text = Trim(text);
-    if (!text.empty() && (text.back() == 'f' || text.back() == 'F')) {
-        text.remove_suffix(1);
-    }
-    std::string buf(text);
-    char* end = nullptr;
-    const float val = std::strtof(buf.c_str(), &end);
-    if (end == buf.c_str()) {
-        return fallback;
-    }
-    return val;
-}
-
-bool EqualsIgnoreCase(std::string_view a, std::string_view b) noexcept {
-    if (a.size() != b.size()) return false;
-    for (std::size_t i = 0; i < a.size(); ++i) {
-        if (std::tolower(static_cast<unsigned char>(a[i])) !=
-            std::tolower(static_cast<unsigned char>(b[i]))) {
-            return false;
-        }
-    }
-    return true;
-}
-
-std::pair<GridUnitType, float> ParseGridLength(std::string_view raw) noexcept {
-    raw = Trim(raw);
+[[nodiscard]] std::pair<GridUnitType, float> ParseGridLength(std::string_view raw) noexcept {
+    raw = str::Trim(raw);
     if (raw.empty() || raw == "*") {
         return {GridUnitType::Star, 1.0f};
     }
-    if (EqualsIgnoreCase(raw, "Auto")) {
+    if (str::EqualsIgnoreCase(raw, "Auto")) {
         return {GridUnitType::Auto, 1.0f};
     }
     if (raw.back() == '*') {
-        const std::string_view numPart = Trim(raw.substr(0, raw.size() - 1));
-        const float starWeight = numPart.empty() ? 1.0f : ParseFloat32(numPart, 1.0f);
+        const std::string_view numPart = str::Trim(raw.substr(0u, raw.size() - 1u));
+        const float starWeight = numPart.empty() ? 1.0f : compiler_detail::ParseFloat32(numPart, 1.0f);
         return {GridUnitType::Star, starWeight};
     }
-    return {GridUnitType::Pixel, ParseFloat32(raw, 0.0f)};
-}
-
-std::string_view StripXmlPrefix(std::string_view name) noexcept {
-    if (const std::size_t colon = name.find(':'); colon != std::string_view::npos) {
-        return name.substr(colon + 1);
-    }
-    return name;
-}
-
-bool EndsWith(std::string_view s, std::string_view suffix) noexcept {
-    return s.size() >= suffix.size() &&
-           s.compare(s.size() - suffix.size(), suffix.size(), suffix) == 0;
+    return {GridUnitType::Pixel, compiler_detail::ParseFloat32(raw, 0.0f)};
 }
 
 bool TryParseResourceMarkupExtension(
@@ -108,39 +72,39 @@ bool TryParseResourceMarkupExtension(
     std::uint8_t& outFlags) noexcept {
     outKey = {};
     outFlags = AxbResourceFlag_StaticResource;
-    std::string_view v = Trim(rawExpr);
+    std::string_view v = str::Trim(rawExpr);
     if (v.size() <= 2u || v.front() != '{' || v.back() != '}') {
         return false;
     }
-    std::string_view inner = Trim(v.substr(1u, v.size() - 2u));
+    std::string_view inner = str::Trim(v.substr(1u, v.size() - 2u));
     if (inner.rfind("StaticResource ", 0) == 0) {
         outFlags = AxbResourceFlag_StaticResource;
-        inner = Trim(inner.substr(15u));
+        inner = str::Trim(inner.substr(15u));
     } else if (inner.rfind("DynamicResource ", 0) == 0) {
         outFlags = AxbResourceFlag_DynamicResource;
-        inner = Trim(inner.substr(16u));
+        inner = str::Trim(inner.substr(16u));
     } else if (inner.rfind("noesis:Loc ", 0) == 0) {
         outFlags = AxbResourceFlag_Loc;
-        inner = Trim(inner.substr(11u));
+        inner = str::Trim(inner.substr(11u));
     } else if (inner.rfind("Loc ", 0) == 0) {
         outFlags = AxbResourceFlag_Loc;
-        inner = Trim(inner.substr(4u));
+        inner = str::Trim(inner.substr(4u));
     } else {
         return false;
     }
 
     if (const std::size_t comma = inner.find(','); comma != std::string_view::npos) {
-        inner = Trim(inner.substr(0u, comma));
+        inner = str::Trim(inner.substr(0u, comma));
     }
     if (inner.rfind("ResourceKey=", 0) == 0) {
-        inner = Trim(inner.substr(12u));
+        inner = str::Trim(inner.substr(12u));
     } else if (inner.rfind("Key=", 0) == 0) {
-        inner = Trim(inner.substr(4u));
+        inner = str::Trim(inner.substr(4u));
     }
     if (inner.size() >= 2u &&
         ((inner.front() == '\'' && inner.back() == '\'') ||
          (inner.front() == '"' && inner.back() == '"'))) {
-        inner = Trim(inner.substr(1u, inner.size() - 2u));
+        inner = str::Trim(inner.substr(1u, inner.size() - 2u));
     }
     outKey = inner;
     return !outKey.empty();
@@ -206,7 +170,7 @@ std::string NormalizeSlashes(std::string_view raw) {
 }
 
 std::string CanonicalizeCycleKeyNoThrow(std::string_view rawPath) {
-    const std::string norm = NormalizeSlashes(Trim(rawPath));
+    const std::string norm = NormalizeSlashes(str::Trim(rawPath));
     if (norm.empty()) {
         return {};
     }
@@ -229,7 +193,7 @@ struct ParsedPackResourceUri {
 
 ParsedPackResourceUri ParsePackOrRelativeUri(std::string_view rawUri) {
     ParsedPackResourceUri out{};
-    std::string s = NormalizeSlashes(Trim(rawUri));
+    std::string s = NormalizeSlashes(str::Trim(rawUri));
     if (s.rfind("pack://application:,,,/", 0) == 0) {
         s.erase(0, 23u);
         out.hadPackOrComponentPrefix = true;
@@ -269,7 +233,7 @@ bool ResolveExternalXamlSource(
     std::string_view requestedSource,
     std::string& outResolvedPath,
     std::string& outContent) {
-    requestedSource = Trim(requestedSource);
+    requestedSource = str::Trim(requestedSource);
     if (requestedSource.empty()) {
         return false;
     }
@@ -557,7 +521,7 @@ std::string DiscoverGlobalResourcesPathForDirectory(const std::filesystem::path&
                     const std::size_t closeTag = noesisXml.find("</GlobalResources>");
                     if (openTag != std::string::npos && closeTag != std::string::npos &&
                         closeTag > openTag + 17u) {
-                        const std::string_view rel = Trim(
+                        const std::string_view rel = str::Trim(
                             std::string_view(noesisXml).substr(openTag + 17u, closeTag - (openTag + 17u)));
                         if (!rel.empty()) {
                             return std::string(rel);
@@ -579,26 +543,20 @@ std::string DiscoverGlobalResourcesPathForDirectory(const std::filesystem::path&
 }
 
 std::string ExtractTargetTypeShortName(std::string_view rawTypeExpr) {
-    std::string_view v = Trim(rawTypeExpr);
+    std::string_view v = str::Trim(rawTypeExpr);
     if (v.size() > 2u && v.front() == '{' && v.back() == '}') {
-        v = Trim(v.substr(1u, v.size() - 2u));
-        if (v.rfind("x:Type ", 0) == 0) {
-            v = Trim(v.substr(7u));
-        } else if (v.rfind("Type ", 0) == 0) {
-            v = Trim(v.substr(5u));
+        v = str::Trim(v.substr(1u, v.size() - 2u));
+        if (str::StartsWith(v, "x:Type ")) {
+            v = str::Trim(v.substr(7u));
+        } else if (str::StartsWith(v, "Type ")) {
+            v = str::Trim(v.substr(5u));
         }
-        if (v.rfind("TypeName=", 0) == 0) {
-            v = Trim(v.substr(9u));
+        if (str::StartsWith(v, "TypeName=")) {
+            v = str::Trim(v.substr(9u));
         }
     }
-    v = StripXmlPrefix(v);
-    if (const std::size_t dot = v.rfind('.'); dot != std::string_view::npos) {
-        v = v.substr(dot + 1u);
-    }
-    return std::string(v);
+    return std::string(str::ShortTypeName(v));
 }
-
-constexpr std::uint16_t kUnmappedPropId = 0xFFFFu;
 
 [[nodiscard]] bool IsInstanceSubHopPropertyPath(std::string_view path) noexcept {
     const auto dot = path.find('.');
@@ -611,9 +569,9 @@ constexpr std::uint16_t kUnmappedPropId = 0xFFFFu;
 std::uint16_t ResolveOwnerAwarePropertyId(
     std::string_view rawProp,
     std::string_view ownerType) noexcept {
-    rawProp = Trim(rawProp);
+    rawProp = str::Trim(rawProp);
     if (rawProp.size() > 2u && rawProp.front() == '(' && rawProp.back() == ')') {
-        rawProp = Trim(rawProp.substr(1u, rawProp.size() - 2u));
+        rawProp = str::Trim(rawProp.substr(1u, rawProp.size() - 2u));
     }
     if (rawProp.empty()) {
         return PropId_Tag;
@@ -622,8 +580,8 @@ std::uint16_t ResolveOwnerAwarePropertyId(
         return PropId_Tag;
     }
     if (const std::size_t dot = rawProp.rfind('.'); dot != std::string_view::npos) {
-        const std::string_view qualOwner = StripXmlPrefix(Trim(rawProp.substr(0u, dot)));
-        const std::string_view qualLeaf = Trim(rawProp.substr(dot + 1u));
+        const std::string_view qualOwner = str::StripNamespacePrefix(str::Trim(rawProp.substr(0u, dot)));
+        const std::string_view qualLeaf = str::Trim(rawProp.substr(dot + 1u));
         if (!qualOwner.empty() && !qualLeaf.empty()) {
             const std::uint16_t customId = FindCustomProperty(qualOwner, qualLeaf);
             if (customId != 0xFFFFu) {
@@ -631,7 +589,7 @@ std::uint16_t ResolveOwnerAwarePropertyId(
             }
         }
     } else if (!ownerType.empty()) {
-        const std::string_view ownerShort = StripXmlPrefix(Trim(ownerType));
+        const std::string_view ownerShort = str::StripNamespacePrefix(str::Trim(ownerType));
         if (!ownerShort.empty()) {
             const std::uint16_t customId = FindCustomProperty(ownerShort, rawProp);
             if (customId != 0xFFFFu) {
@@ -645,9 +603,9 @@ std::uint16_t ResolveOwnerAwarePropertyId(
 std::uint16_t ResolveMappedSetterPropertyId(
     std::string_view rawProp,
     std::string_view ownerType = {}) noexcept {
-    rawProp = Trim(rawProp);
+    rawProp = str::Trim(rawProp);
     if (rawProp.empty()) {
-        return kUnmappedPropId;
+        return compiler_detail::kUnmappedPropId;
     }
     if (rawProp == "Tag") {
         return PropId_Tag;
@@ -666,17 +624,17 @@ std::uint16_t ResolveMappedSetterPropertyId(
             return stripped;
         }
     }
-    return kUnmappedPropId;
+    return compiler_detail::kUnmappedPropId;
 }
 
 std::uint16_t ResolveMappedTriggerConditionId(
     std::string_view rawProp,
     std::string_view ownerType = {}) noexcept {
-    rawProp = Trim(rawProp);
+    rawProp = str::Trim(rawProp);
     if (rawProp.empty()) {
-        return kUnmappedPropId;
+        return compiler_detail::kUnmappedPropId;
     }
-    if (rawProp == "Tag" || EndsWith(rawProp, ".Tag")) {
+    if (rawProp == "Tag" || str::EndsWith(rawProp, ".Tag")) {
         return PropId_Tag;
     }
     if (!ownerType.empty()) {
@@ -686,42 +644,42 @@ std::uint16_t ResolveMappedTriggerConditionId(
         }
     }
     const std::uint16_t id = ResolveTriggerConditionPropertyId(rawProp);
-    return (id == PropId_Tag) ? kUnmappedPropId : id;
+    return (id == PropId_Tag) ? compiler_detail::kUnmappedPropId : id;
 }
 
 std::uint16_t ResolveMappedAnimationPropertyId(
     std::string_view rawPath,
     std::string_view targetOwnerType = {}) noexcept {
-    rawPath = Trim(rawPath);
+    rawPath = str::Trim(rawPath);
     if (rawPath.empty()) {
-        return kUnmappedPropId;
+        return compiler_detail::kUnmappedPropId;
     }
-    if (rawPath == "Tag" || EndsWith(rawPath, ".Tag") || EndsWith(rawPath, ".Tag)")) {
+    if (rawPath == "Tag" || str::EndsWith(rawPath, ".Tag") || str::EndsWith(rawPath, ".Tag)")) {
         return PropId_Tag;
     }
     if (!targetOwnerType.empty()) {
-        const std::string_view ownerShort = StripXmlPrefix(targetOwnerType);
+        const std::string_view ownerShort = str::StripNamespacePrefix(targetOwnerType);
         if (ownerShort == "DirectionalBlurEffect") {
-            if (rawPath == "Angle" || EndsWith(rawPath, ".Angle") || EndsWith(rawPath, ".Angle)")) {
+            if (rawPath == "Angle" || str::EndsWith(rawPath, ".Angle") || str::EndsWith(rawPath, ".Angle)")) {
                 return PropId_EffectAngle;
             }
-            if (rawPath == "Radius" || EndsWith(rawPath, ".Radius") || EndsWith(rawPath, ".Radius)")) {
+            if (rawPath == "Radius" || str::EndsWith(rawPath, ".Radius") || str::EndsWith(rawPath, ".Radius)")) {
                 return PropId_EffectBlurRadius;
             }
         } else if (ownerShort == "TintEffect") {
-            if (rawPath == "Color" || EndsWith(rawPath, ".Color") || EndsWith(rawPath, ".Color)")) {
+            if (rawPath == "Color" || str::EndsWith(rawPath, ".Color") || str::EndsWith(rawPath, ".Color)")) {
                 return PropId_EffectColor;
             }
         } else if (ownerShort == "ChromaticAberrationEffect") {
-            if (rawPath == "AmountX" || EndsWith(rawPath, ".AmountX") || EndsWith(rawPath, ".AmountX)")) {
+            if (rawPath == "AmountX" || str::EndsWith(rawPath, ".AmountX") || str::EndsWith(rawPath, ".AmountX)")) {
                 return PropId_EffectAmountX;
             }
         } else if (ownerShort == "SaturationEffect" || ownerShort == "SaturationBrush") {
-            if (rawPath == "Saturation" || EndsWith(rawPath, ".Saturation") || EndsWith(rawPath, ".Saturation)")) {
+            if (rawPath == "Saturation" || str::EndsWith(rawPath, ".Saturation") || str::EndsWith(rawPath, ".Saturation)")) {
                 return PropId_Saturation;
             }
         } else if (ownerShort == "PlasmaBrush") {
-            if (rawPath == "Time" || EndsWith(rawPath, ".Time") || EndsWith(rawPath, ".Time)")) {
+            if (rawPath == "Time" || str::EndsWith(rawPath, ".Time") || str::EndsWith(rawPath, ".Time)")) {
                 return PropId_ShaderTime;
             }
         }
@@ -731,7 +689,7 @@ std::uint16_t ResolveMappedAnimationPropertyId(
         }
     }
     const std::uint16_t id = ResolveAnimationTargetPropertyId(rawPath);
-    return (id == PropId_Tag) ? kUnmappedPropId : id;
+    return (id == PropId_Tag) ? compiler_detail::kUnmappedPropId : id;
 }
 
 bool IsAnimationTimelineTag(std::string_view shortTag) noexcept {
@@ -752,37 +710,37 @@ bool IsAnimationTimelineTag(std::string_view shortTag) noexcept {
 }
 
 bool IsAnimationKeyFrameTag(std::string_view shortTag) noexcept {
-    return EndsWith(shortTag, "DoubleKeyFrame") ||
-           EndsWith(shortTag, "SingleKeyFrame") ||
-           EndsWith(shortTag, "Int32KeyFrame") ||
-           EndsWith(shortTag, "ColorKeyFrame") ||
-           EndsWith(shortTag, "ThicknessKeyFrame") ||
-           EndsWith(shortTag, "BooleanKeyFrame") ||
-           EndsWith(shortTag, "ObjectKeyFrame") ||
-           EndsWith(shortTag, "PointKeyFrame");
+    return str::EndsWith(shortTag, "DoubleKeyFrame") ||
+           str::EndsWith(shortTag, "SingleKeyFrame") ||
+           str::EndsWith(shortTag, "Int32KeyFrame") ||
+           str::EndsWith(shortTag, "ColorKeyFrame") ||
+           str::EndsWith(shortTag, "ThicknessKeyFrame") ||
+           str::EndsWith(shortTag, "BooleanKeyFrame") ||
+           str::EndsWith(shortTag, "ObjectKeyFrame") ||
+           str::EndsWith(shortTag, "PointKeyFrame");
 }
 
 bool IsEasingFunctionTag(std::string_view shortTag) noexcept {
-    return shortTag.size() > 4u && EndsWith(shortTag, "Ease");
+    return shortTag.size() > 4u && str::EndsWith(shortTag, "Ease");
 }
 
 std::int32_t ParseRepeatCountAttr(std::string_view rawVal) noexcept {
-    rawVal = Trim(rawVal);
+    rawVal = str::Trim(rawVal);
     if (rawVal.empty()) {
         return 1;
     }
-    if (EqualsIgnoreCase(rawVal, "Forever")) {
+    if (str::EqualsIgnoreCase(rawVal, "Forever")) {
         return 0;
     }
     if (rawVal.back() == 'x' || rawVal.back() == 'X') {
         rawVal.remove_suffix(1);
     }
-    const float f = ParseFloat32(rawVal, 1.0f);
+    const float f = compiler_detail::ParseFloat32(rawVal, 1.0f);
     return (f <= 0.0f) ? 0 : std::max<std::int32_t>(1, static_cast<std::int32_t>(std::lround(f)));
 }
 
 std::string NormalizeXamlFormatOrExpr(std::string_view raw) {
-    std::string_view s = Trim(raw);
+    std::string_view s = str::Trim(raw);
     if (s.size() >= 2u && s.front() == '\'' && s.back() == '\'') {
         s = s.substr(1u, s.size() - 2u);
     }
@@ -821,17 +779,17 @@ struct ParsedTemplateBindingClause {
 std::uint16_t ResolveTemplateBindingSourcePropId(
     std::string_view rawProp,
     std::string_view ownerType = {}) noexcept {
-    rawProp = Trim(rawProp);
+    rawProp = str::Trim(rawProp);
     if (rawProp.size() > 2u && rawProp.front() == '(' && rawProp.back() == ')') {
-        rawProp = Trim(rawProp.substr(1u, rawProp.size() - 2u));
+        rawProp = str::Trim(rawProp.substr(1u, rawProp.size() - 2u));
     }
     if (rawProp.empty()) {
-        return kUnmappedPropId;
+        return compiler_detail::kUnmappedPropId;
     }
-    if (rawProp == "Content" || EndsWith(rawProp, ".Content")) {
+    if (rawProp == "Content" || str::EndsWith(rawProp, ".Content")) {
         return PropId_Content;
     }
-    if (rawProp == "Tag" || EndsWith(rawProp, ".Tag")) {
+    if (rawProp == "Tag" || str::EndsWith(rawProp, ".Tag")) {
         return PropId_Tag;
     }
     const std::uint16_t ownerAware = ResolveOwnerAwarePropertyId(rawProp, ownerType);
@@ -852,16 +810,16 @@ std::uint16_t ResolveTemplateBindingSourcePropId(
 
 ParsedTemplateBindingClause ParseTemplateBindingMarkupExpression(std::string_view rawExpr) {
     ParsedTemplateBindingClause out{};
-    std::string_view v = Trim(rawExpr);
+    std::string_view v = str::Trim(rawExpr);
     if (v.size() <= 2u || v.front() != '{' || v.back() != '}') {
         return out;
     }
-    std::string_view inner = Trim(v.substr(1u, v.size() - 2u));
+    std::string_view inner = str::Trim(v.substr(1u, v.size() - 2u));
     if (inner == "TemplateBinding") {
         return out;
     }
     if (inner.rfind("TemplateBinding ", 0) == 0 || inner.rfind("TemplateBinding	", 0) == 0) {
-        inner = Trim(inner.substr(15u));
+        inner = str::Trim(inner.substr(15u));
     } else {
         return out;
     }
@@ -876,13 +834,13 @@ ParsedTemplateBindingClause ParseTemplateBindingMarkupExpression(std::string_vie
             else if (inner[end] == ',' && braceDepth == 0) break;
             ++end;
         }
-        const std::string_view clause = Trim(inner.substr(pos, end - pos));
+        const std::string_view clause = str::Trim(inner.substr(pos, end - pos));
         if (clause.rfind("Property=", 0) == 0) {
-            out.sourcePath = Trim(clause.substr(9u));
+            out.sourcePath = str::Trim(clause.substr(9u));
         } else if (clause.rfind("Path=", 0) == 0) {
-            out.sourcePath = Trim(clause.substr(5u));
+            out.sourcePath = str::Trim(clause.substr(5u));
         } else if (clause.rfind("Converter=", 0) == 0) {
-            const std::string_view convExpr = Trim(clause.substr(10u));
+            const std::string_view convExpr = str::Trim(clause.substr(10u));
             const std::string_view convKey = ExtractMarkupResourceKey(convExpr);
             out.converter = ParseValueConverterKind(!convKey.empty() ? convKey : convExpr);
         } else if (firstClause && clause.find('=') == std::string_view::npos) {
@@ -893,7 +851,7 @@ ParsedTemplateBindingClause ParseTemplateBindingMarkupExpression(std::string_vie
         pos = end + 1u;
     }
     if (out.sourcePath.size() > 2u && out.sourcePath.front() == '(' && out.sourcePath.back() == ')') {
-        out.sourcePath = Trim(out.sourcePath.substr(1u, out.sourcePath.size() - 2u));
+        out.sourcePath = str::Trim(out.sourcePath.substr(1u, out.sourcePath.size() - 2u));
     }
     out.isValid = !out.sourcePath.empty();
     return out;
@@ -901,19 +859,19 @@ ParsedTemplateBindingClause ParseTemplateBindingMarkupExpression(std::string_vie
 
 ParsedBindingClause ParseBindingMarkupExpression(std::string_view rawExpr) {
     ParsedBindingClause out{};
-    std::string_view v = Trim(rawExpr);
+    std::string_view v = str::Trim(rawExpr);
     if (v.size() < 2u || v.front() != '{' || v.back() != '}') {
         return out;
     }
-    std::string_view inner = Trim(v.substr(1u, v.size() - 2u));
+    std::string_view inner = str::Trim(v.substr(1u, v.size() - 2u));
     if (inner == "Binding" || inner == "Bind") {
         out.isValidBinding = true;
         return out;
     }
     if (inner.rfind("Binding ", 0) == 0) {
-        inner = Trim(inner.substr(8u));
+        inner = str::Trim(inner.substr(8u));
     } else if (inner.rfind("Bind ", 0) == 0) {
-        inner = Trim(inner.substr(5u));
+        inner = str::Trim(inner.substr(5u));
     } else {
         return out;
     }
@@ -936,37 +894,37 @@ ParsedBindingClause ParseBindingMarkupExpression(std::string_view rawExpr) {
             }
             ++end;
         }
-        const std::string_view clause = Trim(inner.substr(pos, end - pos));
+        const std::string_view clause = str::Trim(inner.substr(pos, end - pos));
         if (clause.rfind("Path=", 0) == 0) {
-            out.pathPart = Trim(clause.substr(5u));
+            out.pathPart = str::Trim(clause.substr(5u));
         } else if (clause.rfind("Mode=", 0) == 0) {
             out.hasExplicitMode = true;
-            const std::string_view mStr = Trim(clause.substr(5u));
+            const std::string_view mStr = str::Trim(clause.substr(5u));
             if (mStr == "TwoWay") out.mode = BindingMode::TwoWay;
             else if (mStr == "OneTime") out.mode = BindingMode::OneTime;
         } else if (clause.rfind("FallbackValue=", 0) == 0) {
-            std::string_view fv = Trim(clause.substr(14u));
+            std::string_view fv = str::Trim(clause.substr(14u));
             if (fv.size() >= 2u && fv.front() == '\'' && fv.back() == '\'') {
                 fv = fv.substr(1u, fv.size() - 2u);
             }
             out.fallbackValue = fv;
         } else if (clause.rfind("TargetNullValue=", 0) == 0) {
-            std::string_view tnv = Trim(clause.substr(16u));
+            std::string_view tnv = str::Trim(clause.substr(16u));
             if (tnv.size() >= 2u && tnv.front() == '\'' && tnv.back() == '\'') {
                 tnv = tnv.substr(1u, tnv.size() - 2u);
             }
             out.hasTargetNullValue = true;
             out.targetNullValue = tnv;
         } else if (clause.rfind("ElementName=", 0) == 0) {
-            out.elementName = Trim(clause.substr(12u));
+            out.elementName = str::Trim(clause.substr(12u));
         } else if (clause.rfind("Source=", 0) == 0) {
-            const std::string_view srcExpr = Trim(clause.substr(7u));
+            const std::string_view srcExpr = str::Trim(clause.substr(7u));
             const std::string_view srcKey = ExtractMarkupResourceKey(srcExpr);
             if (!srcKey.empty()) {
                 out.staticResourceSourceKey = std::string(srcKey);
             }
         } else if (clause.rfind("Converter=", 0) == 0) {
-            const std::string_view convExpr = Trim(clause.substr(10u));
+            const std::string_view convExpr = str::Trim(clause.substr(10u));
             const std::string_view convKey = ExtractMarkupResourceKey(convExpr);
             const std::string_view effKey = !convKey.empty() ? convKey : convExpr;
             out.converter = ParseValueConverterKind(effKey);
@@ -976,15 +934,15 @@ ParsedBindingClause ParseBindingMarkupExpression(std::string_view rawExpr) {
         } else if (clause.rfind("StringFormat=", 0) == 0) {
             out.stringFormat = NormalizeXamlFormatOrExpr(clause.substr(13u));
         } else if (clause.rfind("RelativeSource=", 0) == 0) {
-            std::string_view rsExpr = Trim(clause.substr(15u));
+            std::string_view rsExpr = str::Trim(clause.substr(15u));
             if (rsExpr.size() > 2u && rsExpr.front() == '{' && rsExpr.back() == '}') {
-                rsExpr = Trim(rsExpr.substr(1u, rsExpr.size() - 2u));
+                rsExpr = str::Trim(rsExpr.substr(1u, rsExpr.size() - 2u));
             }
             if (rsExpr.find("TemplatedParent") != std::string_view::npos) {
                 out.relativeTemplatedParent = true;
             } else if (rsExpr.find("Self") != std::string_view::npos) {                out.relativeSelf = true;
             } else if (const auto ancPos = rsExpr.find("AncestorType="); ancPos != std::string_view::npos) {
-                std::string_view ancVal = Trim(rsExpr.substr(ancPos + 13u));
+                std::string_view ancVal = str::Trim(rsExpr.substr(ancPos + 13u));
                 int bd = 0;
                 std::size_t ae = 0u;
                 while (ae < ancVal.size()) {
@@ -1005,7 +963,7 @@ ParsedBindingClause ParseBindingMarkupExpression(std::string_view rawExpr) {
 
     // Strip parentheses around attached property paths like "(noesis:DragDrop.IsContentEmpty)"
     if (out.pathPart.size() > 2u && out.pathPart.front() == '(' && out.pathPart.back() == ')') {
-        out.pathPart = Trim(out.pathPart.substr(1u, out.pathPart.size() - 2u));
+        out.pathPart = str::Trim(out.pathPart.substr(1u, out.pathPart.size() - 2u));
         out.isAttachedPropertyPath = true;
     }
     return out;
@@ -1044,7 +1002,7 @@ bool FindMatchingClosingTag(
                xml[nameEnd] != '>' && xml[nameEnd] != '/') {
             ++nameEnd;
         }
-        const std::string_view st = StripXmlPrefix(xml.substr(nameStart, nameEnd - nameStart));
+        const std::string_view st = str::StripNamespacePrefix(xml.substr(nameStart, nameEnd - nameStart));
         // Advance to end of tag '>' respecting quotes
         std::size_t scan = nameEnd;
         bool selfClose = false;
@@ -1162,7 +1120,7 @@ struct XmlScopeEntry {
                innerXml[tEnd] != '>' && innerXml[tEnd] != '/') {
             ++tEnd;
         }
-        const std::string_view st = StripXmlPrefix(innerXml.substr(lt + 1u, tEnd - (lt + 1u)));
+        const std::string_view st = str::StripNamespacePrefix(innerXml.substr(lt + 1u, tEnd - (lt + 1u)));
         if (st.find('.') != std::string_view::npos) {
             const std::size_t gt = innerXml.find('>', tEnd);
             if (gt == std::string_view::npos) break;
@@ -1206,7 +1164,7 @@ struct XmlScopeEntry {
                         if (ap < attrSlice.size()) ++ap;
                     }
                 }
-                if (nm == wanted) return Trim(vl);
+                if (nm == wanted) return str::Trim(vl);
             }
             return {};
         };
@@ -1250,11 +1208,11 @@ struct XmlScopeEntry {
 }
 
 [[nodiscard]] std::uint8_t ParseImageBrushStretchCode(std::string_view rawStretch) noexcept {
-    const std::string_view s = Trim(rawStretch);
-    if (EqualsIgnoreCase(s, "None")) return 0u;
-    if (EqualsIgnoreCase(s, "Fill")) return 1u;
-    if (EqualsIgnoreCase(s, "Uniform")) return 2u;
-    if (EqualsIgnoreCase(s, "UniformToFill")) return 3u;
+    const std::string_view s = str::Trim(rawStretch);
+    if (str::EqualsIgnoreCase(s, "None")) return 0u;
+    if (str::EqualsIgnoreCase(s, "Fill")) return 1u;
+    if (str::EqualsIgnoreCase(s, "Uniform")) return 2u;
+    if (str::EqualsIgnoreCase(s, "UniformToFill")) return 3u;
     return 1u; // WPF/Noesis TileBrush.Stretch default is Fill
 }
 
@@ -1347,7 +1305,7 @@ struct ActiveKeyFrameScope {
 };
 
 struct ActiveSetterScope {
-    AxbPropertySetter setter{"", kUnmappedPropId, {}};
+    AxbPropertySetter setter{"", compiler_detail::kUnmappedPropId, {}};
     SetterOwnerKind owner = SetterOwnerKind::Style;
     bool hasValue = false;
     std::size_t scopeDepth = 0;
@@ -1429,1226 +1387,6 @@ bool AeroCompiler::BindPackageAgainstProgram(
     std::string_view rootDataTypeName,
     const ExecutionDomainContext* domains) {
     return package.BindAgainstProgram(program, rootDataTypeName, domains);
-}
-
-namespace {
-
-void PopulateSceneIrFromPackage(
-    const AxbPackage& pkg,
-    FrontendSourceFormat format,
-    std::string_view sourcePath,
-    AeroSceneGraphIR& outIr) {
-    outIr = AeroSceneGraphIR{};
-    outIr.sourceFormat = format;
-    outIr.sourcePath = std::string(sourcePath);
-    outIr.className = pkg.className;
-    outIr.loweredPackage = pkg;
-
-    std::vector<std::uint32_t> parentStack;
-    for (const auto& inst : pkg.instructions) {
-        if (inst.opcode == AxbOpcode::BeginElement) {
-            IrSceneNode node{};
-            node.localElementIdx = static_cast<std::uint32_t>(outIr.nodes.size());
-            node.parentElementIdx = parentStack.empty() ? 0xFFFFFFFFu : parentStack.back();
-            node.typeName = std::string(pkg.GetString(inst.strIdx0));
-            node.name = std::string(pkg.GetString(inst.strIdx1));
-            if (!parentStack.empty() && parentStack.back() < outIr.nodes.size()) {
-                outIr.nodes[parentStack.back()].childIndices.push_back(node.localElementIdx);
-            }
-            parentStack.push_back(node.localElementIdx);
-            outIr.nodes.push_back(std::move(node));
-        } else if (inst.opcode == AxbOpcode::EndElement) {
-            if (!parentStack.empty()) {
-                parentStack.pop_back();
-            }
-        } else if (inst.opcode == AxbOpcode::SetStaticProperty && !parentStack.empty()) {
-            IrSceneNode& cur = outIr.nodes[parentStack.back()];
-            cur.staticProperties.emplace_back(inst.propId, inst.literalValue);
-            if (inst.propId == PropId_Width) {
-                (void)TryGetFloat(inst.literalValue, cur.width);
-            } else if (inst.propId == PropId_Height) {
-                (void)TryGetFloat(inst.literalValue, cur.height);
-            } else if (inst.propId == PropId_AnimTranslateX || inst.propId == PropId_CanvasLeft) {
-                (void)TryGetFloat(inst.literalValue, cur.translateX);
-            } else if (inst.propId == PropId_AnimTranslateY || inst.propId == PropId_CanvasTop) {
-                (void)TryGetFloat(inst.literalValue, cur.translateY);
-            } else if (inst.propId == PropId_AnimScaleX) {
-                (void)TryGetFloat(inst.literalValue, cur.scaleX);
-            } else if (inst.propId == PropId_AnimScaleY) {
-                (void)TryGetFloat(inst.literalValue, cur.scaleY);
-            } else if (inst.propId == PropId_AnimRotateAngle) {
-                (void)TryGetFloat(inst.literalValue, cur.rotateDeg);
-            } else if (inst.propId == PropId_AnimSkewX) {
-                (void)TryGetFloat(inst.literalValue, cur.skewXDeg);
-            } else if (inst.propId == PropId_AnimSkewY) {
-                (void)TryGetFloat(inst.literalValue, cur.skewYDeg);
-            } else if (inst.propId == PropId_Opacity) {
-                (void)TryGetFloat(inst.literalValue, cur.opacity);
-            } else if (inst.propId == PropId_PathData) {
-                if (const auto* sv = std::get_if<StringValue>(&inst.literalValue)) {
-                    cur.svgPathData = std::string(sv->view());
-                }
-            }
-        }
-    }
-
-    if (!outIr.nodes.empty()) {
-        outIr.designWidth = outIr.nodes[0].width > 0.0f ? outIr.nodes[0].width : 256.0f;
-        outIr.designHeight = outIr.nodes[0].height > 0.0f ? outIr.nodes[0].height : 256.0f;
-    }
-
-    for (const auto& mp : pkg.mtsdfPaths) {
-        IrVectorShapeAsset shape{};
-        shape.pathHash = mp.pathHash;
-        shape.adaptiveCellSize = mp.cellWidth;
-        shape.pxRange = mp.pxRange;
-        outIr.vectorShapes.push_back(std::move(shape));
-    }
-
-    for (std::size_t ciIdx = 0; ciIdx < pkg.contractInputs.size(); ++ciIdx) {
-        const auto& cp = pkg.contractInputs[ciIdx];
-        IrContractPort port{};
-        port.name = std::string(pkg.GetString(cp.nameStrIdx));
-        port.direction = cp.isTrigger ? IrContractPortDirection::OutputTrigger : IrContractPortDirection::Input;
-        port.valueType = cp.isTrigger ? IrContractPortValueType::Trigger
-                                      : static_cast<IrContractPortValueType>(cp.valueKind);
-        port.assignedPropId = (cp.bridgePropId != 0xFFFFu)
-            ? cp.bridgePropId
-            : static_cast<std::uint16_t>(PropId_FirstContractInput + ciIdx);
-        port.smInputIndex = static_cast<std::uint16_t>(ciIdx);
-        port.defaultValue = cp.defaultValue;
-        (void)TryGetFloat(cp.defaultValue, port.defaultFloat);
-        outIr.contractPorts.push_back(std::move(port));
-    }
-}
-
-void EmitDecomposedSvgMatrixInstructions(const Matrix2D& m, AxbPackage& pkg) {
-    const DecomposedTransform2D d = PolarDecomposeMatrix2D(m);
-    auto pushFloatProp = [&](std::uint16_t propId, float v) {
-        AxbInstruction inst{};
-        inst.opcode = AxbOpcode::SetStaticProperty;
-        inst.propId = propId;
-        inst.literalValue = MakeFloat(v);
-        pkg.instructions.push_back(std::move(inst));
-    };
-    if (std::fabs(d.translateX) > 1e-4f) pushFloatProp(PropId_AnimTranslateX, d.translateX);
-    if (std::fabs(d.translateY) > 1e-4f) pushFloatProp(PropId_AnimTranslateY, d.translateY);
-    if (std::fabs(d.rotateDeg) > 1e-4f) pushFloatProp(PropId_AnimRotateAngle, d.rotateDeg);
-    if (std::fabs(d.scaleX - 1.0f) > 1e-4f) pushFloatProp(PropId_AnimScaleX, d.scaleX);
-    if (std::fabs(d.scaleY - 1.0f) > 1e-4f) pushFloatProp(PropId_AnimScaleY, d.scaleY);
-    if (std::fabs(d.skewXDeg) > 1e-4f) pushFloatProp(PropId_AnimSkewX, d.skewXDeg);
-    if (std::fabs(d.skewYDeg) > 1e-4f) pushFloatProp(PropId_AnimSkewY, d.skewYDeg);
-}
-
-Matrix2D ParseSvgTransformAttr(std::string_view raw) noexcept {
-    raw = Trim(raw);
-    if (raw.rfind("matrix(", 0) == 0 && raw.back() == ')') {
-        return ParseXamlMatrix2DLiteral(raw.substr(7, raw.size() - 8));
-    }
-    if (raw.rfind("translate(", 0) == 0 && raw.back() == ')') {
-        const auto inner = raw.substr(10, raw.size() - 11);
-        const std::size_t sep = inner.find_first_of(", ");
-        const float tx = ParseFloat32(sep == std::string_view::npos ? inner : inner.substr(0, sep), 0.0f);
-        const float ty = sep == std::string_view::npos ? 0.0f : ParseFloat32(Trim(inner.substr(sep + 1)), 0.0f);
-        return Matrix2D::Translation(tx, ty);
-    }
-    if (raw.rfind("scale(", 0) == 0 && raw.back() == ')') {
-        const auto inner = raw.substr(6, raw.size() - 7);
-        const std::size_t sep = inner.find_first_of(", ");
-        const float sx = ParseFloat32(sep == std::string_view::npos ? inner : inner.substr(0, sep), 1.0f);
-        const float sy = sep == std::string_view::npos ? sx : ParseFloat32(Trim(inner.substr(sep + 1)), sx);
-        return Matrix2D::Scaling(sx, sy);
-    }
-    if (raw.rfind("rotate(", 0) == 0 && raw.back() == ')') {
-        const auto inner = raw.substr(7, raw.size() - 8);
-        return Matrix2D::Rotation(ParseFloat32(inner, 0.0f));
-    }
-    return Matrix2D::Identity();
-}
-
-// Simple JSON token helpers for Lottie & Rive structured JSON/RIV descriptions
-std::string_view FindJsonFieldValue(std::string_view obj, std::string_view key) noexcept {
-    const std::string pattern = "\"" + std::string(key) + "\"";
-    int depth = 0;
-    for (std::size_t i = 0; i < obj.size(); ++i) {
-        const char c = obj[i];
-        if (c == '\"') {
-            std::size_t endQuote = i + 1;
-            while (endQuote < obj.size() && !(obj[endQuote] == '\"' && obj[endQuote - 1] != '\\')) {
-                ++endQuote;
-            }
-            if (endQuote >= obj.size()) break;
-            if (depth <= 1 && (endQuote - i + 1) == pattern.size() &&
-                obj.substr(i, pattern.size()) == pattern) {
-                std::size_t pos = endQuote + 1;
-                while (pos < obj.size() && std::isspace(static_cast<unsigned char>(obj[pos]))) {
-                    ++pos;
-                }
-                if (pos < obj.size() && obj[pos] == ':') {
-                    ++pos;
-                    while (pos < obj.size() && std::isspace(static_cast<unsigned char>(obj[pos]))) {
-                        ++pos;
-                    }
-                    if (pos >= obj.size()) return {};
-                    const char startChar = obj[pos];
-                    if (startChar == '\"') {
-                        std::size_t valEnd = pos + 1;
-                        while (valEnd < obj.size() && !(obj[valEnd] == '\"' && obj[valEnd - 1] != '\\')) {
-                            ++valEnd;
-                        }
-                        return obj.substr(pos + 1, valEnd - (pos + 1));
-                    }
-                    if (startChar == '{' || startChar == '[') {
-                        const char closeChar = (startChar == '{') ? '}' : ']';
-                        int subDepth = 0;
-                        bool subStr = false;
-                        for (std::size_t j = pos; j < obj.size(); ++j) {
-                            if (obj[j] == '\"' && (j == pos || obj[j - 1] != '\\')) {
-                                subStr = !subStr;
-                                continue;
-                            }
-                            if (subStr) continue;
-                            if (obj[j] == startChar) ++subDepth;
-                            else if (obj[j] == closeChar) {
-                                --subDepth;
-                                if (subDepth == 0) return obj.substr(pos, j - pos + 1);
-                            }
-                        }
-                        return {};
-                    }
-                    std::size_t endVal = pos;
-                    while (endVal < obj.size() && obj[endVal] != ',' && obj[endVal] != '}' &&
-                           obj[endVal] != ']' && !std::isspace(static_cast<unsigned char>(obj[endVal]))) {
-                        ++endVal;
-                    }
-                    return obj.substr(pos, endVal - pos);
-                }
-            }
-            i = endQuote;
-            continue;
-        }
-        if (c == '{' || c == '[') {
-            ++depth;
-        } else if (c == '}' || c == ']') {
-            if (depth > 0) --depth;
-        }
-    }
-    return {};
-}
-
-std::vector<std::string_view> SplitJsonTopLevelArray(std::string_view arr) {
-    std::vector<std::string_view> items;
-    arr = Trim(arr);
-    if (arr.size() < 2 || arr.front() != '[' || arr.back() != ']') return items;
-    arr = Trim(arr.substr(1, arr.size() - 2));
-    int depth = 0;
-    bool inStr = false;
-    std::size_t itemStart = 0;
-    for (std::size_t i = 0; i < arr.size(); ++i) {
-        const char c = arr[i];
-        if (c == '\"' && (i == 0 || arr[i - 1] != '\\')) inStr = !inStr;
-        if (inStr) continue;
-        if (c == '{' || c == '[') ++depth;
-        else if (c == '}' || c == ']') {
-            if (depth > 0) --depth;
-        } else if (c == ',' && depth == 0) {
-            const auto piece = Trim(arr.substr(itemStart, i - itemStart));
-            if (!piece.empty()) items.push_back(piece);
-            itemStart = i + 1;
-        }
-    }
-    const auto tail = Trim(arr.substr(itemStart));
-    if (!tail.empty()) items.push_back(tail);
-    return items;
-}
-
-float ExtractFirstFloatFromJsonToken(std::string_view tok, float fallback) noexcept {
-    tok = Trim(tok);
-    if (tok.empty()) return fallback;
-    if (tok.front() == '[') {
-        auto elems = SplitJsonTopLevelArray(tok);
-        if (!elems.empty()) return ParseFloat32(elems[0], fallback);
-        return fallback;
-    }
-    return ParseFloat32(tok, fallback);
-}
-
-bool IsSvgAssetInput(std::string_view path, std::string_view content) noexcept {
-    if (path.size() >= 4 && EqualsIgnoreCase(path.substr(path.size() - 4), ".svg")) {
-        return true;
-    }
-    const std::string_view trimmed = Trim(content);
-    return trimmed.rfind("<svg", 0) == 0;
-}
-
-bool IsLottieAssetInput(std::string_view path, std::string_view content) noexcept {
-    if ((path.size() >= 5 && EqualsIgnoreCase(path.substr(path.size() - 5), ".json")) ||
-        (path.size() >= 7 && EqualsIgnoreCase(path.substr(path.size() - 7), ".lottie"))) {
-        const std::string_view trimmed = Trim(content);
-        if (!trimmed.empty() && trimmed.front() == '{' &&
-            trimmed.find("\"layers\"") != std::string_view::npos) {
-            return true;
-        }
-    }
-    const std::string_view trimmed = Trim(content);
-    return !trimmed.empty() && trimmed.front() == '{' &&
-           trimmed.find("\"fr\"") != std::string_view::npos &&
-           trimmed.find("\"layers\"") != std::string_view::npos;
-}
-
-bool IsRiveAssetInput(std::string_view path, std::string_view content) noexcept {
-    if (path.size() >= 4 && EqualsIgnoreCase(path.substr(path.size() - 4), ".riv")) {
-        return true;
-    }
-    const std::string_view trimmed = Trim(content);
-    if (trimmed.size() >= 4 && trimmed.substr(0, 4) == "RIVE") {
-        return true;
-    }
-    return !trimmed.empty() && trimmed.front() == '{' &&
-           trimmed.find("\"artboard\"") != std::string_view::npos &&
-           trimmed.find("\"stateMachines\"") != std::string_view::npos;
-}
-
-} // namespace
-
-bool SvgTokenFrontendImporter::ImportToSceneIR(
-    std::string_view sourcePath,
-    const std::uint8_t* rawBytes,
-    std::size_t byteLength,
-    AeroSceneGraphIR& outIr,
-    std::vector<std::string>& outDiagnostics) const {
-    if (!rawBytes || byteLength == 0) {
-        outDiagnostics.push_back("AERO_SVG_EMPTY: Empty SVG input");
-        return false;
-    }
-    const std::string_view src(reinterpret_cast<const char*>(rawBytes), byteLength);
-    AxbPackage pkg{};
-    pkg.InternString("");
-    pkg.rootTypeName = "Canvas";
-
-    float viewW = 256.0f;
-    float viewH = 256.0f;
-    std::unordered_set<std::uint64_t> bakedHashes;
-    bool rootEmitted = false;
-    std::size_t openContainers = 0u;
-
-    std::size_t pos = 0;
-    while (pos < src.size()) {
-        const std::size_t lt = src.find('<', pos);
-        if (lt == std::string_view::npos) break;
-        pos = lt + 1;
-        if (pos >= src.size()) break;
-        if (src.substr(pos, 3) == "!--") {
-            const std::size_t endC = src.find("-->", pos + 3);
-            pos = (endC == std::string_view::npos) ? src.size() : (endC + 3);
-            continue;
-        }
-        if (src[pos] == '?') {
-            const std::size_t endD = src.find("?>", pos + 1);
-            pos = (endD == std::string_view::npos) ? src.size() : (endD + 2);
-            continue;
-        }
-        if (src[pos] == '/') {
-            const std::size_t gt = src.find('>', pos + 1);
-            const std::string_view closeTag = StripXmlPrefix(Trim(src.substr(pos + 1, (gt == std::string_view::npos ? src.size() : gt) - (pos + 1))));
-            if ((closeTag == "svg" || closeTag == "g") && openContainers > 0u) {
-                AxbInstruction endInst{};
-                endInst.opcode = AxbOpcode::EndElement;
-                pkg.instructions.push_back(std::move(endInst));
-                --openContainers;
-            }
-            pos = (gt == std::string_view::npos) ? src.size() : (gt + 1);
-            continue;
-        }
-
-        std::size_t tagEnd = pos;
-        while (tagEnd < src.size() && !std::isspace(static_cast<unsigned char>(src[tagEnd])) &&
-               src[tagEnd] != '>' && src[tagEnd] != '/') {
-            ++tagEnd;
-        }
-        const std::string_view shortTag = StripXmlPrefix(src.substr(pos, tagEnd - pos));
-        pos = tagEnd;
-
-        std::vector<std::pair<std::string_view, std::string_view>> attrs;
-        bool selfClosing = false;
-        while (pos < src.size()) {
-            while (pos < src.size() && std::isspace(static_cast<unsigned char>(src[pos]))) ++pos;
-            if (pos >= src.size()) break;
-            if (src[pos] == '>') { ++pos; break; }
-            if (src.substr(pos, 2) == "/>") { selfClosing = true; pos += 2; break; }
-            const std::size_t aStart = pos;
-            while (pos < src.size() && src[pos] != '=' &&
-                   !std::isspace(static_cast<unsigned char>(src[pos])) &&
-                   src[pos] != '>' && src[pos] != '/') {
-                ++pos;
-            }
-            const std::string_view aName = src.substr(aStart, pos - aStart);
-            while (pos < src.size() && std::isspace(static_cast<unsigned char>(src[pos]))) ++pos;
-            std::string_view aVal;
-            if (pos < src.size() && src[pos] == '=') {
-                ++pos;
-                while (pos < src.size() && std::isspace(static_cast<unsigned char>(src[pos]))) ++pos;
-                if (pos < src.size() && (src[pos] == '\"' || src[pos] == '\'')) {
-                    const char q = src[pos++];
-                    const std::size_t vStart = pos;
-                    while (pos < src.size() && src[pos] != q) ++pos;
-                    aVal = src.substr(vStart, pos - vStart);
-                    if (pos < src.size() && src[pos] == q) ++pos;
-                }
-            }
-            if (!aName.empty()) attrs.emplace_back(aName, aVal);
-        }
-
-        if (shortTag == "svg") {
-            std::string_view elemId;
-            for (const auto& kv : attrs) {
-                if (kv.first == "x:Class") pkg.className = std::string(Trim(kv.second));
-                else if (kv.first == "id" || kv.first == "x:Name") elemId = Trim(kv.second);
-                else if (kv.first == "width") viewW = ParseFloat32(kv.second, viewW);
-                else if (kv.first == "height") viewH = ParseFloat32(kv.second, viewH);
-                else if (kv.first == "viewBox") {
-                    std::string_view vb = Trim(kv.second);
-                    float vals[4]{0.0f, 0.0f, viewW, viewH};
-                    for (int vi = 0; vi < 4 && !vb.empty(); ++vi) {
-                        const std::size_t sep = vb.find_first_of(", ");
-                        vals[vi] = ParseFloat32(sep == std::string_view::npos ? vb : vb.substr(0, sep), vals[vi]);
-                        if (sep == std::string_view::npos) break;
-                        vb = Trim(vb.substr(sep + 1));
-                    }
-                    if (vals[2] > 0.0f) viewW = vals[2];
-                    if (vals[3] > 0.0f) viewH = vals[3];
-                }
-            }
-            AxbInstruction beginRoot{};
-            beginRoot.opcode = AxbOpcode::BeginElement;
-            beginRoot.strIdx0 = pkg.InternString("Canvas");
-            beginRoot.strIdx1 = pkg.InternString(elemId);
-            pkg.instructions.push_back(std::move(beginRoot));
-
-            AxbInstruction wInst{AxbOpcode::SetStaticProperty, PropId_Width, 0, 0, 0, 0, MakeFloat(viewW)};
-            AxbInstruction hInst{AxbOpcode::SetStaticProperty, PropId_Height, 0, 0, 0, 0, MakeFloat(viewH)};
-            pkg.instructions.push_back(std::move(wInst));
-            pkg.instructions.push_back(std::move(hInst));
-            rootEmitted = true;
-            if (selfClosing) {
-                AxbInstruction endInst{};
-                endInst.opcode = AxbOpcode::EndElement;
-                pkg.instructions.push_back(std::move(endInst));
-            } else {
-                ++openContainers;
-            }
-            continue;
-        }
-
-        if (!rootEmitted) continue;
-
-        if (shortTag == "g") {
-            std::string_view gName;
-            Matrix2D gMat = Matrix2D::Identity();
-            bool hasMat = false;
-            float gOpacity = 1.0f;
-            for (const auto& kv : attrs) {
-                if (kv.first == "id" || kv.first == "x:Name") gName = Trim(kv.second);
-                else if (kv.first == "transform") { gMat = ParseSvgTransformAttr(kv.second); hasMat = true; }
-                else if (kv.first == "opacity") gOpacity = ParseFloat32(kv.second, 1.0f);
-            }
-            AxbInstruction beginG{};
-            beginG.opcode = AxbOpcode::BeginElement;
-            beginG.strIdx0 = pkg.InternString("Canvas");
-            beginG.strIdx1 = pkg.InternString(gName);
-            pkg.instructions.push_back(std::move(beginG));
-            if (!gName.empty()) {
-                pkg.namedControls.push_back(AxbNamedControlSlot{std::string(gName), "Canvas", 0, PropertySlotHandle::InvalidIndex});
-            }
-            if (std::fabs(gOpacity - 1.0f) > 1e-4f) {
-                pkg.instructions.push_back(AxbInstruction{AxbOpcode::SetStaticProperty, PropId_Opacity, 0, 0, 0, 0, MakeFloat(gOpacity)});
-            }
-            if (hasMat) {
-                EmitDecomposedSvgMatrixInstructions(gMat, pkg);
-            }
-            if (selfClosing) {
-                pkg.instructions.push_back(AxbInstruction{AxbOpcode::EndElement});
-            } else {
-                ++openContainers;
-            }
-            continue;
-        }
-
-        if (shortTag == "path") {
-            std::string_view pName;
-            std::string_view dPath;
-            std::string_view fillStr = "#FFFFFFFF";
-            std::string_view strokeStr;
-            float strokeW = 0.0f;
-            float opacity = 1.0f;
-            float pathW = viewW;
-            float pathH = viewH;
-            Matrix2D pMat = Matrix2D::Identity();
-            bool hasMat = false;
-
-            for (const auto& kv : attrs) {
-                if (kv.first == "id" || kv.first == "x:Name") pName = Trim(kv.second);
-                else if (kv.first == "d" || kv.first == "Data") dPath = Trim(kv.second);
-                else if (kv.first == "fill" || kv.first == "Fill") fillStr = Trim(kv.second);
-                else if (kv.first == "stroke" || kv.first == "Stroke") strokeStr = Trim(kv.second);
-                else if (kv.first == "stroke-width" || kv.first == "StrokeThickness") strokeW = ParseFloat32(kv.second, 0.0f);
-                else if (kv.first == "opacity" || kv.first == "Opacity") opacity = ParseFloat32(kv.second, 1.0f);
-                else if (kv.first == "width" || kv.first == "Width") pathW = ParseFloat32(kv.second, viewW);
-                else if (kv.first == "height" || kv.first == "Height") pathH = ParseFloat32(kv.second, viewH);
-                else if (kv.first == "transform") { pMat = ParseSvgTransformAttr(kv.second); hasMat = true; }
-            }
-
-            if (!dPath.empty()) {
-                const std::uint64_t h = ComputeSvgPathHash(dPath);
-                if (h != 0 && bakedHashes.insert(h).second) {
-                    const std::uint16_t adaptiveDim = SelectAdaptiveMtsdfCellSize(dPath);
-                    const auto slotIdx = static_cast<std::uint16_t>(pkg.mtsdfPaths.size());
-                    pkg.mtsdfPaths.push_back(BakeSvgPathToMtsdfEntry(dPath, adaptiveDim, 4.0f, slotIdx, 256u));
-                }
-            }
-
-            AxbInstruction beginP{};
-            beginP.opcode = AxbOpcode::BeginElement;
-            beginP.strIdx0 = pkg.InternString("Path");
-            beginP.strIdx1 = pkg.InternString(pName);
-            pkg.instructions.push_back(std::move(beginP));
-            if (!pName.empty()) {
-                pkg.namedControls.push_back(AxbNamedControlSlot{std::string(pName), "Path", 0, PropertySlotHandle::InvalidIndex});
-            }
-            pkg.instructions.push_back(AxbInstruction{AxbOpcode::SetStaticProperty, PropId_Width, 0, 0, 0, 0, MakeFloat(pathW)});
-            pkg.instructions.push_back(AxbInstruction{AxbOpcode::SetStaticProperty, PropId_Height, 0, 0, 0, 0, MakeFloat(pathH)});
-            pkg.instructions.push_back(AxbInstruction{AxbOpcode::SetStaticProperty, PropId_HorizontalAlignment, 0, 0, 0, 0, value::FromInt(1)});
-            pkg.instructions.push_back(AxbInstruction{AxbOpcode::SetStaticProperty, PropId_VerticalAlignment, 0, 0, 0, 0, value::FromInt(1)});
-            if (!dPath.empty()) {
-                pkg.instructions.push_back(AxbInstruction{AxbOpcode::SetStaticProperty, PropId_PathData, 0, 0, 0, 0, value::FromString(std::string(dPath))});
-            }
-            if (!fillStr.empty() && !EqualsIgnoreCase(fillStr, "none")) {
-                pkg.instructions.push_back(AxbInstruction{AxbOpcode::SetStaticProperty, PropId_Background, 0, 0, 0, 0, ParseBuiltinLiteralPropertyValue(PropId_Background, fillStr)});
-            }
-            if (!strokeStr.empty() && !EqualsIgnoreCase(strokeStr, "none")) {
-                pkg.instructions.push_back(AxbInstruction{AxbOpcode::SetStaticProperty, PropId_BorderBrush, 0, 0, 0, 0, ParseBuiltinLiteralPropertyValue(PropId_BorderBrush, strokeStr)});
-            }
-            if (strokeW > 0.0f) {
-                pkg.instructions.push_back(AxbInstruction{AxbOpcode::SetStaticProperty, PropId_BorderThickness, 0, 0, 0, 0, value::FromThickness(Thickness(strokeW))});
-            }
-            if (std::fabs(opacity - 1.0f) > 1e-4f) {
-                pkg.instructions.push_back(AxbInstruction{AxbOpcode::SetStaticProperty, PropId_Opacity, 0, 0, 0, 0, MakeFloat(opacity)});
-            }
-            if (hasMat) {
-                EmitDecomposedSvgMatrixInstructions(pMat, pkg);
-            }
-            pkg.instructions.push_back(AxbInstruction{AxbOpcode::EndElement});
-        }
-    }
-
-    while (openContainers > 0u) {
-        pkg.instructions.push_back(AxbInstruction{AxbOpcode::EndElement});
-        --openContainers;
-    }
-
-    if (!pkg.mtsdfPaths.empty()) {
-        PackMtsdfAtlasSkyline(pkg.mtsdfPaths, 256u);
-    }
-
-    PopulateSceneIrFromPackage(pkg, FrontendSourceFormat::SvgVectorToken, sourcePath, outIr);
-    return !pkg.instructions.empty();
-}
-
-bool LottieFrontendImporter::ImportToSceneIR(
-    std::string_view sourcePath,
-    const std::uint8_t* rawBytes,
-    std::size_t byteLength,
-    AeroSceneGraphIR& outIr,
-    std::vector<std::string>& outDiagnostics) const {
-    if (!rawBytes || byteLength == 0) {
-        outDiagnostics.push_back("AERO_LOTTIE_EMPTY: Empty Lottie JSON input");
-        return false;
-    }
-    const std::string_view json(reinterpret_cast<const char*>(rawBytes), byteLength);
-    const float fps = ParseFloat32(FindJsonFieldValue(json, "fr"), 60.0f);
-    const float inFrame = ParseFloat32(FindJsonFieldValue(json, "ip"), 0.0f);
-    const float outFrame = ParseFloat32(FindJsonFieldValue(json, "op"), 60.0f);
-    const float compW = ParseFloat32(FindJsonFieldValue(json, "w"), 256.0f);
-    const float compH = ParseFloat32(FindJsonFieldValue(json, "h"), 256.0f);
-    const std::string_view compName = FindJsonFieldValue(json, "nm");
-    const std::string_view classAttr = FindJsonFieldValue(json, "x:Class");
-    const float durationSec = std::max(0.001f, (outFrame - inFrame) / std::max(1.0f, fps));
-
-    AxbPackage pkg{};
-    pkg.InternString("");
-    pkg.rootTypeName = "Canvas";
-    if (!classAttr.empty()) {
-        pkg.className = std::string(classAttr);
-    }
-
-    // Root Canvas (localElementIdx = 0)
-    pkg.instructions.push_back(AxbInstruction{
-        AxbOpcode::BeginElement, 0, 0, pkg.InternString("Canvas"), pkg.InternString(compName), 0, {}});
-    pkg.instructions.push_back(AxbInstruction{AxbOpcode::SetStaticProperty, PropId_Width, 0, 0, 0, 0, MakeFloat(compW)});
-    pkg.instructions.push_back(AxbInstruction{AxbOpcode::SetStaticProperty, PropId_Height, 0, 0, 0, 0, MakeFloat(compH)});
-
-    AxbMotionClipDesc mainClip{};
-    mainClip.nameStrIdx = pkg.InternString(compName.empty() ? "LottieMain" : compName);
-    mainClip.durationSec = durationSec;
-    mainClip.firstTrackIdx = 0u;
-    mainClip.trackCount = 0u;
-    mainClip.isLooping = true;
-
-    struct LayerIndMap {
-        int lottieInd = -1;
-        int parentInd = -1;
-        std::uint32_t localElemIdx = 0u;
-    };
-    std::vector<LayerIndMap> layerMappings;
-    std::unordered_set<std::uint64_t> bakedHashes;
-
-    auto parseAnimOrStaticChannel = [&](std::string_view propObj,
-                                        std::uint32_t targetElemIdx,
-                                        std::uint16_t propId,
-                                        float scaleFactor,
-                                        float defaultStaticVal,
-                                        int componentIdx) -> float {
-        if (propObj.empty()) return defaultStaticVal;
-        const std::string_view aFlag = FindJsonFieldValue(propObj, "a");
-        const std::string_view kVal = FindJsonFieldValue(propObj, "k");
-        if (aFlag != "1") {
-            if (kVal.front() == '[') {
-                const auto comps = SplitJsonTopLevelArray(kVal);
-                if (static_cast<std::size_t>(componentIdx) < comps.size()) {
-                    return ParseFloat32(comps[static_cast<std::size_t>(componentIdx)], defaultStaticVal) * scaleFactor;
-                }
-            }
-            return ExtractFirstFloatFromJsonToken(kVal, defaultStaticVal) * scaleFactor;
-        }
-
-        const auto kfObjs = SplitJsonTopLevelArray(kVal);
-        if (kfObjs.empty()) return defaultStaticVal;
-
-        AxbMotionTrackDesc track{};
-        track.localElementIdx = static_cast<std::uint16_t>(targetElemIdx);
-        track.targetPropId = propId;
-        track.channelCount = 1u;
-        track.firstKeyframeIdx = static_cast<std::uint32_t>(pkg.motionKeyframes.size());
-
-        float firstVal = defaultStaticVal;
-        float prevEndVal = defaultStaticVal;
-        bool hasPrevEnd = false;
-        for (std::size_t ki = 0; ki < kfObjs.size(); ++ki) {
-            const std::string_view kfObj = kfObjs[ki];
-            const float tFrame = ParseFloat32(FindJsonFieldValue(kfObj, "t"), inFrame);
-            const std::string_view sArr = FindJsonFieldValue(kfObj, "s");
-            const std::string_view eArr = FindJsonFieldValue(kfObj, "e");
-            float val = hasPrevEnd ? prevEndVal : defaultStaticVal;
-            if (!sArr.empty()) {
-                if (sArr.front() == '[') {
-                    const auto comps = SplitJsonTopLevelArray(sArr);
-                    if (static_cast<std::size_t>(componentIdx) < comps.size()) {
-                        val = ParseFloat32(comps[static_cast<std::size_t>(componentIdx)], val) * scaleFactor;
-                    } else if (!comps.empty()) {
-                        val = ParseFloat32(comps[0], val) * scaleFactor;
-                    }
-                } else {
-                    val = ParseFloat32(sArr, val) * scaleFactor;
-                }
-            }
-            if (!eArr.empty()) {
-                if (eArr.front() == '[') {
-                    const auto comps = SplitJsonTopLevelArray(eArr);
-                    if (static_cast<std::size_t>(componentIdx) < comps.size()) {
-                        prevEndVal = ParseFloat32(comps[static_cast<std::size_t>(componentIdx)], val) * scaleFactor;
-                        hasPrevEnd = true;
-                    } else if (!comps.empty()) {
-                        prevEndVal = ParseFloat32(comps[0], val) * scaleFactor;
-                        hasPrevEnd = true;
-                    }
-                } else {
-                    prevEndVal = ParseFloat32(eArr, val) * scaleFactor;
-                    hasPrevEnd = true;
-                }
-            }
-            if (ki == 0) firstVal = val;
-
-            AxbFlatKeyframe kf{};
-            kf.timeSec = std::max(0.0f, (tFrame - inFrame) / std::max(1.0f, fps));
-            kf.value = Float4Value{val, 0.0f, 0.0f, 0.0f};
-            const std::string_view oObj = FindJsonFieldValue(kfObj, "o");
-            const std::string_view iObj = FindJsonFieldValue(kfObj, "i");
-            if (!oObj.empty() && !iObj.empty()) {
-                kf.interp = static_cast<std::uint8_t>(CurveInterpMode::CubicBezier);
-                const float bx1 = std::clamp(ExtractFirstFloatFromJsonToken(FindJsonFieldValue(oObj, "x"), 0.25f), 0.0f, 1.0f);
-                const float by1 = std::clamp(ExtractFirstFloatFromJsonToken(FindJsonFieldValue(oObj, "y"), 0.25f), -4.0f, 4.0f);
-                const float bx2 = std::clamp(ExtractFirstFloatFromJsonToken(FindJsonFieldValue(iObj, "x"), 0.75f), 0.0f, 1.0f);
-                const float by2 = std::clamp(ExtractFirstFloatFromJsonToken(FindJsonFieldValue(iObj, "y"), 0.75f), -4.0f, 4.0f);
-                kf.easeKindOrCtrlX1 = static_cast<std::uint8_t>(std::round(bx1 * 255.0f));
-                kf.easeModeOrCtrlX2 = static_cast<std::uint8_t>(std::round(bx2 * 255.0f));
-                kf.ctrlY1Fixed8 = static_cast<std::int16_t>(std::round(by1 * 256.0f));
-                kf.ctrlY2Fixed8 = static_cast<std::int16_t>(std::round(by2 * 256.0f));
-            } else {
-                kf.interp = static_cast<std::uint8_t>(CurveInterpMode::Linear);
-            }
-            pkg.motionKeyframes.push_back(std::move(kf));
-        }
-
-        track.keyframeCount = static_cast<std::uint32_t>(pkg.motionKeyframes.size()) - track.firstKeyframeIdx;
-        if (track.keyframeCount > 0u) {
-            pkg.motionTracks.push_back(std::move(track));
-            ++mainClip.trackCount;
-        }
-        return firstVal;
-    };
-
-    const std::string_view layersArr = FindJsonFieldValue(json, "layers");
-    const auto layerObjs = SplitJsonTopLevelArray(layersArr);
-    std::uint32_t nextLocalElemIdx = 1u;
-    for (const auto& layerObj : layerObjs) {
-        const std::string_view layerName = FindJsonFieldValue(layerObj, "nm");
-        const int ind = static_cast<int>(ParseFloat32(FindJsonFieldValue(layerObj, "ind"), -1.0f));
-        const int parentInd = static_cast<int>(ParseFloat32(FindJsonFieldValue(layerObj, "parent"), -1.0f));
-        const std::string_view dPath = FindJsonFieldValue(layerObj, "d");
-        const std::string_view fillHex = FindJsonFieldValue(layerObj, "fill");
-        const float lw = ParseFloat32(FindJsonFieldValue(layerObj, "w"), compW);
-        const float lh = ParseFloat32(FindJsonFieldValue(layerObj, "h"), compH);
-
-        const std::uint32_t elemIdx = nextLocalElemIdx++;
-        layerMappings.push_back(LayerIndMap{ind, parentInd, elemIdx});
-
-        const std::string_view elemType = dPath.empty() ? "Border" : "Path";
-        pkg.instructions.push_back(AxbInstruction{
-            AxbOpcode::BeginElement, 0, 0, pkg.InternString(elemType), pkg.InternString(layerName), 0, {}});
-        if (!layerName.empty()) {
-            pkg.namedControls.push_back(AxbNamedControlSlot{
-                std::string(layerName), std::string(elemType), 0, PropertySlotHandle::InvalidIndex});
-        }
-        pkg.instructions.push_back(AxbInstruction{AxbOpcode::SetStaticProperty, PropId_Width, 0, 0, 0, 0, MakeFloat(lw)});
-        pkg.instructions.push_back(AxbInstruction{AxbOpcode::SetStaticProperty, PropId_Height, 0, 0, 0, 0, MakeFloat(lh)});
-        pkg.instructions.push_back(AxbInstruction{AxbOpcode::SetStaticProperty, PropId_HorizontalAlignment, 0, 0, 0, 0, value::FromInt(1)});
-        pkg.instructions.push_back(AxbInstruction{AxbOpcode::SetStaticProperty, PropId_VerticalAlignment, 0, 0, 0, 0, value::FromInt(1)});
-
-        if (!dPath.empty()) {
-            const std::uint64_t h = ComputeSvgPathHash(dPath);
-            if (h != 0 && bakedHashes.insert(h).second) {
-                const std::uint16_t adaptiveDim = SelectAdaptiveMtsdfCellSize(dPath);
-                const auto slotIdx = static_cast<std::uint16_t>(pkg.mtsdfPaths.size());
-                pkg.mtsdfPaths.push_back(BakeSvgPathToMtsdfEntry(dPath, adaptiveDim, 4.0f, slotIdx, 256u));
-            }
-            pkg.instructions.push_back(AxbInstruction{
-                AxbOpcode::SetStaticProperty, PropId_PathData, 0, 0, 0, 0, value::FromString(std::string(dPath))});
-            if (!fillHex.empty()) {
-                pkg.instructions.push_back(AxbInstruction{
-                    AxbOpcode::SetStaticProperty, PropId_Background, 0, 0, 0, 0, ParseBuiltinLiteralPropertyValue(PropId_Background, fillHex)});
-            }
-        } else if (!fillHex.empty()) {
-            pkg.instructions.push_back(AxbInstruction{
-                AxbOpcode::SetStaticProperty, PropId_Background, 0, 0, 0, 0, ParseBuiltinLiteralPropertyValue(PropId_Background, fillHex)});
-        }
-
-        const std::string_view ksObj = FindJsonFieldValue(layerObj, "ks");
-        if (!ksObj.empty()) {
-            const float op = parseAnimOrStaticChannel(FindJsonFieldValue(ksObj, "o"), elemIdx, PropId_Opacity, 0.01f, 1.0f, 0);
-            const float rot = parseAnimOrStaticChannel(FindJsonFieldValue(ksObj, "r"), elemIdx, PropId_AnimRotateAngle, 1.0f, 0.0f, 0);
-            const float tx = parseAnimOrStaticChannel(FindJsonFieldValue(ksObj, "p"), elemIdx, PropId_AnimTranslateX, 1.0f, 0.0f, 0);
-            const float ty = parseAnimOrStaticChannel(FindJsonFieldValue(ksObj, "p"), elemIdx, PropId_AnimTranslateY, 1.0f, 0.0f, 1);
-            const float sx = parseAnimOrStaticChannel(FindJsonFieldValue(ksObj, "s"), elemIdx, PropId_AnimScaleX, 0.01f, 1.0f, 0);
-            const float sy = parseAnimOrStaticChannel(FindJsonFieldValue(ksObj, "s"), elemIdx, PropId_AnimScaleY, 0.01f, 1.0f, 1);
-            const float skx = parseAnimOrStaticChannel(FindJsonFieldValue(ksObj, "sk"), elemIdx, PropId_AnimSkewX, 1.0f, 0.0f, 0);
-
-            if (std::fabs(op - 1.0f) > 1e-4f)
-                pkg.instructions.push_back(AxbInstruction{AxbOpcode::SetStaticProperty, PropId_Opacity, 0, 0, 0, 0, MakeFloat(op)});
-            if (std::fabs(rot) > 1e-4f)
-                pkg.instructions.push_back(AxbInstruction{AxbOpcode::SetStaticProperty, PropId_AnimRotateAngle, 0, 0, 0, 0, MakeFloat(rot)});
-            if (std::fabs(tx) > 1e-4f)
-                pkg.instructions.push_back(AxbInstruction{AxbOpcode::SetStaticProperty, PropId_AnimTranslateX, 0, 0, 0, 0, MakeFloat(tx)});
-            if (std::fabs(ty) > 1e-4f)
-                pkg.instructions.push_back(AxbInstruction{AxbOpcode::SetStaticProperty, PropId_AnimTranslateY, 0, 0, 0, 0, MakeFloat(ty)});
-            if (std::fabs(sx - 1.0f) > 1e-4f)
-                pkg.instructions.push_back(AxbInstruction{AxbOpcode::SetStaticProperty, PropId_AnimScaleX, 0, 0, 0, 0, MakeFloat(sx)});
-            if (std::fabs(sy - 1.0f) > 1e-4f)
-                pkg.instructions.push_back(AxbInstruction{AxbOpcode::SetStaticProperty, PropId_AnimScaleY, 0, 0, 0, 0, MakeFloat(sy)});
-            if (std::fabs(skx) > 1e-4f)
-                pkg.instructions.push_back(AxbInstruction{AxbOpcode::SetStaticProperty, PropId_AnimSkewX, 0, 0, 0, 0, MakeFloat(skx)});
-        }
-
-        pkg.instructions.push_back(AxbInstruction{AxbOpcode::EndElement});
-    }
-
-    // Close Root Canvas
-    pkg.instructions.push_back(AxbInstruction{AxbOpcode::EndElement});
-
-    // Resolve Lottie `parent` layer indices into non-tree AxbTransformConstraintDesc records
-    for (const auto& lm : layerMappings) {
-        if (lm.parentInd >= 0) {
-            for (const auto& targetLm : layerMappings) {
-                if (targetLm.lottieInd == lm.parentInd && targetLm.localElemIdx != lm.localElemIdx) {
-                    AxbTransformConstraintDesc tc{};
-                    tc.childLocalElementIdx = static_cast<std::uint16_t>(lm.localElemIdx);
-                    tc.parentLocalElementIdx = static_cast<std::uint16_t>(targetLm.localElemIdx);
-                    pkg.transformConstraints.push_back(tc);
-                    break;
-                }
-            }
-        }
-    }
-
-    if (!pkg.mtsdfPaths.empty()) {
-        PackMtsdfAtlasSkyline(pkg.mtsdfPaths, 256u);
-    }
-
-    // Add MOT6 clip + default "Progress" contract input + playback state machine
-    pkg.motionClips.push_back(mainClip);
-
-    AxbContractInputDesc progressIn{};
-    progressIn.nameStrIdx = pkg.InternString("Progress");
-    progressIn.valueKind = 1u; // Float
-    progressIn.isTrigger = 0u;
-    progressIn.bridgePropId = PropId_FirstContractInput;
-    progressIn.defaultValue = MakeFloat(0.0f);
-    pkg.contractInputs.push_back(progressIn);
-
-    AxbSmState playState{};
-    playState.nameStrIdx = pkg.InternString("Playing");
-    playState.kind = SmStateKind::SingleClip;
-    playState.primaryClipIdx = 0u;
-    playState.speedMultiplier = 1.0f;
-    pkg.smStates.push_back(playState);
-
-    AxbSmState scrubState{};
-    scrubState.nameStrIdx = pkg.InternString("Scrub");
-    scrubState.kind = SmStateKind::ScrubbedClip;
-    scrubState.primaryClipIdx = 0u;
-    scrubState.progressInputSlot = 0u;
-    scrubState.speedMultiplier = 1.0f;
-    pkg.smStates.push_back(scrubState);
-
-    AxbSmLayerDesc layer{};
-    layer.nameStrIdx = pkg.InternString("MainLayer");
-    layer.blendMode = SmLayerBlendMode::Override;
-    layer.layerWeight = 1.0f;
-    layer.firstStateIdx = 0u;
-    layer.stateCount = 2u;
-    layer.entryStateIdx = 0u;
-    pkg.smLayers.push_back(layer);
-
-    AxbStateMachineDesc sm{};
-    sm.nameStrIdx = pkg.InternString("LottiePlayback");
-    sm.firstLayerIdx = 0u;
-    sm.layerCount = 1u;
-    pkg.stateMachines.push_back(sm);
-
-    PopulateSceneIrFromPackage(pkg, FrontendSourceFormat::LottieJson, sourcePath, outIr);
-    return true;
-}
-
-bool RiveFrontendImporter::ImportToSceneIR(
-    std::string_view sourcePath,
-    const std::uint8_t* rawBytes,
-    std::size_t byteLength,
-    AeroSceneGraphIR& outIr,
-    std::vector<std::string>& outDiagnostics) const {
-    if (!rawBytes || byteLength == 0) {
-        outDiagnostics.push_back("AERO_RIVE_EMPTY: Empty Rive .riv input");
-        return false;
-    }
-    if (IsRiveBinaryStream(rawBytes, byteLength)) {
-        AxbPackage binPkg{};
-        if (!DecodeRiveBinaryToAxbPackage(rawBytes, byteLength, binPkg, &outDiagnostics)) {
-            return false;
-        }
-        PopulateSceneIrFromPackage(binPkg, FrontendSourceFormat::RiveBinary, sourcePath, outIr);
-        return true;
-    }
-    std::string_view content(reinterpret_cast<const char*>(rawBytes), byteLength);
-    if (content.size() >= 4 && content.substr(0, 4) == "RIVE") {
-        content = Trim(content.substr(4));
-    }
-
-    AxbPackage pkg{};
-    pkg.InternString("");
-    pkg.rootTypeName = "Canvas";
-
-    const std::string_view classAttr = FindJsonFieldValue(content, "x:Class");
-    if (!classAttr.empty()) {
-        pkg.className = std::string(classAttr);
-    }
-
-    const std::string_view abObj = FindJsonFieldValue(content, "artboard");
-    const std::string_view abSource = abObj.empty() ? content : abObj;
-    const std::string_view abName = FindJsonFieldValue(abSource, "name");
-    const float abW = ParseFloat32(FindJsonFieldValue(abSource, "width"), 320.0f);
-    const float abH = ParseFloat32(FindJsonFieldValue(abSource, "height"), 320.0f);
-
-    pkg.instructions.push_back(AxbInstruction{
-        AxbOpcode::BeginElement, 0, 0, pkg.InternString("Canvas"), pkg.InternString(abName), 0, {}});
-    pkg.instructions.push_back(AxbInstruction{AxbOpcode::SetStaticProperty, PropId_Width, 0, 0, 0, 0, MakeFloat(abW)});
-    pkg.instructions.push_back(AxbInstruction{AxbOpcode::SetStaticProperty, PropId_Height, 0, 0, 0, 0, MakeFloat(abH)});
-
-    std::unordered_map<std::string, std::uint32_t> elemIndexByName;
-    if (!abName.empty()) {
-        elemIndexByName.emplace(std::string(abName), 0u);
-    }
-    std::unordered_set<std::uint64_t> bakedHashes;
-
-    const auto nodeObjs = SplitJsonTopLevelArray(FindJsonFieldValue(abSource, "nodes"));
-    std::uint32_t nextElemIdx = 1u;
-    for (const auto& nodeObj : nodeObjs) {
-        const std::string_view nName = FindJsonFieldValue(nodeObj, "name");
-        const std::string_view nType = FindJsonFieldValue(nodeObj, "type");
-        const std::string_view dPath = FindJsonFieldValue(nodeObj, "path");
-        const std::string_view fillHex = FindJsonFieldValue(nodeObj, "fill");
-        const float nw = ParseFloat32(FindJsonFieldValue(nodeObj, "width"), abW);
-        const float nh = ParseFloat32(FindJsonFieldValue(nodeObj, "height"), abH);
-        const float nx = ParseFloat32(FindJsonFieldValue(nodeObj, "x"), 0.0f);
-        const float ny = ParseFloat32(FindJsonFieldValue(nodeObj, "y"), 0.0f);
-        const float nRot = ParseFloat32(FindJsonFieldValue(nodeObj, "rotation"), 0.0f);
-        const float nsx = ParseFloat32(FindJsonFieldValue(nodeObj, "scaleX"), 1.0f);
-        const float nsy = ParseFloat32(FindJsonFieldValue(nodeObj, "scaleY"), 1.0f);
-        const float nOp = ParseFloat32(FindJsonFieldValue(nodeObj, "opacity"), 1.0f);
-
-        const std::uint32_t curIdx = nextElemIdx++;
-        if (!nName.empty()) {
-            elemIndexByName.emplace(std::string(nName), curIdx);
-        }
-
-        const std::string_view runtimeType = (!dPath.empty() || EqualsIgnoreCase(nType, "Path")) ? "Path"
-                                           : (EqualsIgnoreCase(nType, "TextBlock") ? "TextBlock" : "Border");
-        pkg.instructions.push_back(AxbInstruction{
-            AxbOpcode::BeginElement, 0, 0, pkg.InternString(runtimeType), pkg.InternString(nName), 0, {}});
-        if (!nName.empty()) {
-            pkg.namedControls.push_back(AxbNamedControlSlot{
-                std::string(nName), std::string(runtimeType), 0, PropertySlotHandle::InvalidIndex});
-        }
-        pkg.instructions.push_back(AxbInstruction{AxbOpcode::SetStaticProperty, PropId_Width, 0, 0, 0, 0, MakeFloat(nw)});
-        pkg.instructions.push_back(AxbInstruction{AxbOpcode::SetStaticProperty, PropId_Height, 0, 0, 0, 0, MakeFloat(nh)});
-        pkg.instructions.push_back(AxbInstruction{AxbOpcode::SetStaticProperty, PropId_HorizontalAlignment, 0, 0, 0, 0, value::FromInt(1)});
-        pkg.instructions.push_back(AxbInstruction{AxbOpcode::SetStaticProperty, PropId_VerticalAlignment, 0, 0, 0, 0, value::FromInt(1)});
-        if (std::fabs(nx) > 1e-4f)
-            pkg.instructions.push_back(AxbInstruction{AxbOpcode::SetStaticProperty, PropId_AnimTranslateX, 0, 0, 0, 0, MakeFloat(nx)});
-        if (std::fabs(ny) > 1e-4f)
-            pkg.instructions.push_back(AxbInstruction{AxbOpcode::SetStaticProperty, PropId_AnimTranslateY, 0, 0, 0, 0, MakeFloat(ny)});
-        if (std::fabs(nRot) > 1e-4f)
-            pkg.instructions.push_back(AxbInstruction{AxbOpcode::SetStaticProperty, PropId_AnimRotateAngle, 0, 0, 0, 0, MakeFloat(nRot)});
-        if (std::fabs(nsx - 1.0f) > 1e-4f)
-            pkg.instructions.push_back(AxbInstruction{AxbOpcode::SetStaticProperty, PropId_AnimScaleX, 0, 0, 0, 0, MakeFloat(nsx)});
-        if (std::fabs(nsy - 1.0f) > 1e-4f)
-            pkg.instructions.push_back(AxbInstruction{AxbOpcode::SetStaticProperty, PropId_AnimScaleY, 0, 0, 0, 0, MakeFloat(nsy)});
-        if (std::fabs(nOp - 1.0f) > 1e-4f)
-            pkg.instructions.push_back(AxbInstruction{AxbOpcode::SetStaticProperty, PropId_Opacity, 0, 0, 0, 0, MakeFloat(nOp)});
-
-        if (!dPath.empty()) {
-            const std::uint64_t h = ComputeSvgPathHash(dPath);
-            if (h != 0 && bakedHashes.insert(h).second) {
-                const std::uint16_t adaptiveDim = SelectAdaptiveMtsdfCellSize(dPath);
-                const auto slotIdx = static_cast<std::uint16_t>(pkg.mtsdfPaths.size());
-                pkg.mtsdfPaths.push_back(BakeSvgPathToMtsdfEntry(dPath, adaptiveDim, 4.0f, slotIdx, 256u));
-            }
-            pkg.instructions.push_back(AxbInstruction{
-                AxbOpcode::SetStaticProperty, PropId_PathData, 0, 0, 0, 0, value::FromString(std::string(dPath))});
-            if (!fillHex.empty()) {
-                pkg.instructions.push_back(AxbInstruction{
-                    AxbOpcode::SetStaticProperty, PropId_Background, 0, 0, 0, 0, ParseBuiltinLiteralPropertyValue(PropId_Background, fillHex)});
-            }
-        } else if (!fillHex.empty()) {
-            pkg.instructions.push_back(AxbInstruction{
-                AxbOpcode::SetStaticProperty, PropId_Background, 0, 0, 0, 0, ParseBuiltinLiteralPropertyValue(PropId_Background, fillHex)});
-        }
-
-        pkg.instructions.push_back(AxbInstruction{AxbOpcode::EndElement});
-    }
-
-    // Close Artboard Canvas
-    pkg.instructions.push_back(AxbInstruction{AxbOpcode::EndElement});
-
-    if (!pkg.mtsdfPaths.empty()) {
-        PackMtsdfAtlasSkyline(pkg.mtsdfPaths, 256u);
-    }
-
-    // Parse non-tree bone/transform constraints
-    const auto constraintObjs = SplitJsonTopLevelArray(FindJsonFieldValue(abSource, "constraints"));
-    for (const auto& cObj : constraintObjs) {
-        const std::string constrainedName(FindJsonFieldValue(cObj, "constrained"));
-        const std::string targetName(FindJsonFieldValue(cObj, "target"));
-        const auto itC = elemIndexByName.find(constrainedName);
-        const auto itT = elemIndexByName.find(targetName);
-        if (itC != elemIndexByName.end() && itT != elemIndexByName.end()) {
-            AxbTransformConstraintDesc tc{};
-            tc.childLocalElementIdx = static_cast<std::uint16_t>(itC->second);
-            tc.parentLocalElementIdx = static_cast<std::uint16_t>(itT->second);
-            pkg.transformConstraints.push_back(tc);
-        }
-    }
-
-    // Parse clips
-    std::unordered_map<std::string, std::uint32_t> clipIndexByName;
-    const auto clipObjs = SplitJsonTopLevelArray(FindJsonFieldValue(content, "clips"));
-    for (const auto& clObj : clipObjs) {
-        const std::string_view clName = FindJsonFieldValue(clObj, "name");
-        AxbMotionClipDesc clip{};
-        clip.nameStrIdx = pkg.InternString(clName);
-        clip.durationSec = std::max(0.001f, ParseFloat32(FindJsonFieldValue(clObj, "duration"), 1.0f));
-        clip.isLooping = EqualsIgnoreCase(FindJsonFieldValue(clObj, "loop"), "true");
-        clip.firstTrackIdx = static_cast<std::uint32_t>(pkg.motionTracks.size());
-        clip.firstEventIdx = static_cast<std::uint32_t>(pkg.motionEvents.size());
-
-        const auto trObjs = SplitJsonTopLevelArray(FindJsonFieldValue(clObj, "tracks"));
-        for (const auto& trObj : trObjs) {
-            const std::string targetName(FindJsonFieldValue(trObj, "target"));
-            const std::string_view propName = FindJsonFieldValue(trObj, "property");
-            const auto itElem = elemIndexByName.find(targetName);
-            const std::uint32_t targetIdx = (itElem != elemIndexByName.end()) ? itElem->second : 0u;
-            const std::uint16_t propId = ResolveBuiltinPropertyId(propName);
-            if (propId == kUnmappedPropId) continue;
-
-            AxbMotionTrackDesc tr{};
-            tr.localElementIdx = static_cast<std::uint16_t>(targetIdx);
-            tr.targetPropId = propId;
-            tr.channelCount = 1u;
-            tr.firstKeyframeIdx = static_cast<std::uint32_t>(pkg.motionKeyframes.size());
-            const auto kfObjs = SplitJsonTopLevelArray(FindJsonFieldValue(trObj, "keyframes"));
-            for (const auto& kfObj : kfObjs) {
-                AxbFlatKeyframe kf{};
-                kf.timeSec = ParseFloat32(FindJsonFieldValue(kfObj, "t"), 0.0f);
-                const std::string_view vRaw = FindJsonFieldValue(kfObj, "v");
-                const UnifiedValue parsedV = ParseBuiltinLiteralPropertyValue(propId, vRaw);
-                if (! parsedV.tryGetQuatf(kf.value)) {
-                    float sf = 0.0f;
-                    (void)TryGetFloat(parsedV, sf);
-                    kf.value = Float4Value{sf, 0.0f, 0.0f, 0.0f};
-                } else {
-                    tr.channelCount = 4u;
-                }
-                const std::string_view easeStr = FindJsonFieldValue(kfObj, "easing");
-                if (EqualsIgnoreCase(easeStr, "CubicBezier")) {
-                    kf.interp = static_cast<std::uint8_t>(CurveInterpMode::CubicBezier);
-                    const float bx1 = std::clamp(ParseFloat32(FindJsonFieldValue(kfObj, "bx1"), 0.25f), 0.0f, 1.0f);
-                    const float by1 = std::clamp(ParseFloat32(FindJsonFieldValue(kfObj, "by1"), 0.1f), -4.0f, 4.0f);
-                    const float bx2 = std::clamp(ParseFloat32(FindJsonFieldValue(kfObj, "bx2"), 0.25f), 0.0f, 1.0f);
-                    const float by2 = std::clamp(ParseFloat32(FindJsonFieldValue(kfObj, "by2"), 1.0f), -4.0f, 4.0f);
-                    kf.easeKindOrCtrlX1 = static_cast<std::uint8_t>(std::round(bx1 * 255.0f));
-                    kf.easeModeOrCtrlX2 = static_cast<std::uint8_t>(std::round(bx2 * 255.0f));
-                    kf.ctrlY1Fixed8 = static_cast<std::int16_t>(std::round(by1 * 256.0f));
-                    kf.ctrlY2Fixed8 = static_cast<std::int16_t>(std::round(by2 * 256.0f));
-                } else {
-                    kf.interp = static_cast<std::uint8_t>(CurveInterpMode::Linear);
-                }
-                pkg.motionKeyframes.push_back(std::move(kf));
-            }
-            tr.keyframeCount = static_cast<std::uint32_t>(pkg.motionKeyframes.size()) - tr.firstKeyframeIdx;
-            if (tr.keyframeCount > 0u) {
-                pkg.motionTracks.push_back(std::move(tr));
-            }
-        }
-        clip.trackCount = static_cast<std::uint32_t>(pkg.motionTracks.size()) - clip.firstTrackIdx;
-
-        const auto evObjs = SplitJsonTopLevelArray(FindJsonFieldValue(clObj, "events"));
-        for (const auto& evObj : evObjs) {
-            AxbTimelineEventMarker ev{};
-            ev.timeSec = ParseFloat32(FindJsonFieldValue(evObj, "t"), 0.0f);
-            ev.eventNameStrIdx = pkg.InternString(FindJsonFieldValue(evObj, "name"));
-            pkg.motionEvents.push_back(ev);
-        }
-        clip.eventCount = static_cast<std::uint32_t>(pkg.motionEvents.size() - clip.firstEventIdx);
-
-        const auto clipIdx = static_cast<std::uint32_t>(pkg.motionClips.size());
-        if (!clName.empty()) clipIndexByName.emplace(std::string(clName), clipIdx);
-        pkg.motionClips.push_back(clip);
-    }
-
-    // Parse StateMachines
-    const auto smObjs = SplitJsonTopLevelArray(FindJsonFieldValue(content, "stateMachines"));
-    for (const auto& smObj : smObjs) {
-        AxbStateMachineDesc sm{};
-        sm.nameStrIdx = pkg.InternString(FindJsonFieldValue(smObj, "name"));
-        sm.firstLayerIdx = static_cast<std::uint32_t>(pkg.smLayers.size());
-        sm.firstListenerIdx = static_cast<std::uint32_t>(pkg.smListeners.size());
-
-        std::unordered_map<std::string, std::uint32_t> inputIdxByName;
-        const auto inObjs = SplitJsonTopLevelArray(FindJsonFieldValue(smObj, "inputs"));
-        for (const auto& inObj : inObjs) {
-            const std::string_view inName = FindJsonFieldValue(inObj, "name");
-            const std::string_view inType = FindJsonFieldValue(inObj, "type");
-            const auto slotIdx = static_cast<std::uint32_t>(pkg.contractInputs.size());
-            const auto portPropId = static_cast<std::uint16_t>(PropId_FirstContractInput + slotIdx);
-
-            AxbContractInputDesc inDesc{};
-            inDesc.nameStrIdx = pkg.InternString(inName);
-            inDesc.bridgePropId = portPropId;
-            if (EqualsIgnoreCase(inType, "Boolean") || EqualsIgnoreCase(inType, "Bool")) {
-                inDesc.valueKind = 0u;
-                inDesc.defaultValue = UnifiedValue{EqualsIgnoreCase(FindJsonFieldValue(inObj, "default"), "true")};
-            } else if (EqualsIgnoreCase(inType, "Trigger")) {
-                inDesc.valueKind = 5u;
-                inDesc.isTrigger = 1u;
-                inDesc.defaultValue = MakeFloat(0.0f);
-            } else {
-                inDesc.valueKind = 1u;
-                inDesc.defaultValue = MakeFloat(ParseFloat32(FindJsonFieldValue(inObj, "default"), 0.0f));
-            }
-            pkg.contractInputs.push_back(inDesc);
-            if (!inName.empty()) inputIdxByName.emplace(std::string(inName), slotIdx);
-        }
-
-        const auto layerObjs = SplitJsonTopLevelArray(FindJsonFieldValue(smObj, "layers"));
-        for (const auto& lyObj : layerObjs) {
-            AxbSmLayerDesc ly{};
-            ly.nameStrIdx = pkg.InternString(FindJsonFieldValue(lyObj, "name"));
-            ly.blendMode = EqualsIgnoreCase(FindJsonFieldValue(lyObj, "blendMode"), "Additive")
-                ? SmLayerBlendMode::Additive
-                : SmLayerBlendMode::Override;
-            ly.layerWeight = ParseFloat32(FindJsonFieldValue(lyObj, "weight"), 1.0f);
-            ly.firstStateIdx = static_cast<std::uint32_t>(pkg.smStates.size());
-            ly.firstTransitionIdx = static_cast<std::uint32_t>(pkg.smTransitions.size());
-
-            std::unordered_map<std::string, std::uint16_t> stateIdxByName;
-            const auto stObjs = SplitJsonTopLevelArray(FindJsonFieldValue(lyObj, "states"));
-            for (const auto& stObj : stObjs) {
-                const std::string_view stName = FindJsonFieldValue(stObj, "name");
-                const std::string_view stKind = FindJsonFieldValue(stObj, "kind");
-                const auto globalStIdx = static_cast<std::uint16_t>(pkg.smStates.size());
-                if (!stName.empty()) stateIdxByName.emplace(std::string(stName), globalStIdx);
-
-                AxbSmState st{};
-                st.nameStrIdx = pkg.InternString(stName);
-                st.speedMultiplier = ParseFloat32(FindJsonFieldValue(stObj, "speed"), 1.0f);
-
-                if (EqualsIgnoreCase(stKind, "Blend1D")) {
-                    st.kind = SmStateKind::Blend1D;
-                    const std::string paramName(FindJsonFieldValue(stObj, "input"));
-                    const auto itIn = inputIdxByName.find(paramName);
-                    st.progressInputSlot = (itIn != inputIdxByName.end()) ? static_cast<std::uint16_t>(itIn->second) : 0u;
-                    const auto bItems = SplitJsonTopLevelArray(FindJsonFieldValue(stObj, "thresholds"));
-                    if (!bItems.empty()) {
-                        st.blendRangeMin = ParseFloat32(FindJsonFieldValue(bItems.front(), "threshold"), 0.0f);
-                        const std::string cl0(FindJsonFieldValue(bItems.front(), "clip"));
-                        const auto it0 = clipIndexByName.find(cl0);
-                        st.primaryClipIdx = (it0 != clipIndexByName.end()) ? static_cast<std::uint16_t>(it0->second) : 0u;
-                        if (bItems.size() >= 2u) {
-                            st.blendRangeMax = ParseFloat32(FindJsonFieldValue(bItems.back(), "threshold"), 100.0f);
-                            const std::string cl1(FindJsonFieldValue(bItems.back(), "clip"));
-                            const auto it1 = clipIndexByName.find(cl1);
-                            st.secondaryClipIdx = (it1 != clipIndexByName.end()) ? static_cast<std::uint16_t>(it1->second) : st.primaryClipIdx;
-                        } else {
-                            st.blendRangeMax = st.blendRangeMin + 1.0f;
-                            st.secondaryClipIdx = st.primaryClipIdx;
-                        }
-                    }
-                } else if (EqualsIgnoreCase(stKind, "ScrubbedClip")) {
-                    st.kind = SmStateKind::ScrubbedClip;
-                    const std::string clName(FindJsonFieldValue(stObj, "clip"));
-                    const auto itCl = clipIndexByName.find(clName);
-                    st.primaryClipIdx = (itCl != clipIndexByName.end()) ? static_cast<std::uint16_t>(itCl->second) : 0u;
-                    const std::string paramName(FindJsonFieldValue(stObj, "input"));
-                    const auto itIn = inputIdxByName.find(paramName);
-                    st.progressInputSlot = (itIn != inputIdxByName.end()) ? static_cast<std::uint16_t>(itIn->second) : 0u;
-                } else {
-                    st.kind = SmStateKind::SingleClip;
-                    const std::string clName(FindJsonFieldValue(stObj, "clip"));
-                    const auto itCl = clipIndexByName.find(clName);
-                    st.primaryClipIdx = (itCl != clipIndexByName.end()) ? static_cast<std::uint16_t>(itCl->second) : 0u;
-                }
-                pkg.smStates.push_back(st);
-            }
-            ly.stateCount = static_cast<std::uint16_t>(pkg.smStates.size() - ly.firstStateIdx);
-            ly.entryStateIdx = static_cast<std::uint16_t>(ly.firstStateIdx);
-
-            // Parse transitions in layer
-            const auto trObjs = SplitJsonTopLevelArray(FindJsonFieldValue(lyObj, "transitions"));
-            for (const auto& trObj : trObjs) {
-                const std::string fromName(FindJsonFieldValue(trObj, "from"));
-                const std::string toName(FindJsonFieldValue(trObj, "to"));
-                const auto itTo = stateIdxByName.find(toName);
-                if (itTo == stateIdxByName.end()) continue;
-
-                AxbSmTransition tr{};
-                if (fromName == "*" || fromName.empty()) {
-                    tr.fromStateIdx = 0xFFFFu;
-                } else {
-                    const auto itFrom = stateIdxByName.find(fromName);
-                    if (itFrom == stateIdxByName.end()) continue;
-                    tr.fromStateIdx = itFrom->second;
-                }
-                tr.toStateIdx = itTo->second;
-                tr.crossfadeDurationSec = ParseFloat32(FindJsonFieldValue(trObj, "duration"), 0.15f);
-                tr.exitTimeNormalized01 = ParseFloat32(FindJsonFieldValue(trObj, "exitTime"), 0.0f);
-                tr.hasExitTime = (tr.exitTimeNormalized01 > 0.0f);
-                tr.firstConditionIdx = static_cast<std::uint32_t>(pkg.smConditions.size());
-
-                const auto condObjs = SplitJsonTopLevelArray(FindJsonFieldValue(trObj, "conditions"));
-                for (const auto& cObj : condObjs) {
-                    const std::string inName(FindJsonFieldValue(cObj, "input"));
-                    const auto itIn = inputIdxByName.find(inName);
-                    if (itIn == inputIdxByName.end()) continue;
-                    AxbSmCondition cond{};
-                    cond.inputSlotIdx = static_cast<std::uint16_t>(itIn->second);
-                    const std::string_view opStr = FindJsonFieldValue(cObj, "op");
-                    if (opStr == "==" || EqualsIgnoreCase(opStr, "Equals")) cond.op = SmCompareOp::Equal;
-                    else if (opStr == "!=" || EqualsIgnoreCase(opStr, "NotEquals")) cond.op = SmCompareOp::NotEqual;
-                    else if (opStr == ">" || EqualsIgnoreCase(opStr, "Greater")) cond.op = SmCompareOp::Greater;
-                    else if (opStr == ">=" || EqualsIgnoreCase(opStr, "GreaterOrEqual")) cond.op = SmCompareOp::GreaterOrEqual;
-                    else if (opStr == "<" || EqualsIgnoreCase(opStr, "Less")) cond.op = SmCompareOp::Less;
-                    else if (opStr == "<=" || EqualsIgnoreCase(opStr, "LessOrEqual")) cond.op = SmCompareOp::LessOrEqual;
-                    else if (EqualsIgnoreCase(opStr, "TriggerFired")) cond.op = SmCompareOp::TriggerFired;
-                    else if (EqualsIgnoreCase(opStr, "IsTrue")) cond.op = SmCompareOp::BoolTrue;
-                    else if (EqualsIgnoreCase(opStr, "IsFalse")) cond.op = SmCompareOp::BoolFalse;
-                    cond.threshold = ParseFloat32(FindJsonFieldValue(cObj, "value"), 0.0f);
-                    pkg.smConditions.push_back(cond);
-                }
-                tr.conditionCount = static_cast<std::uint16_t>(pkg.smConditions.size() - tr.firstConditionIdx);
-                pkg.smTransitions.push_back(tr);
-            }
-            ly.transitionCount = static_cast<std::uint16_t>(pkg.smTransitions.size() - ly.firstTransitionIdx);
-
-            pkg.smLayers.push_back(ly);
-        }
-        sm.layerCount = static_cast<std::uint16_t>(pkg.smLayers.size() - sm.firstLayerIdx);
-
-        const auto lstObjs = SplitJsonTopLevelArray(FindJsonFieldValue(smObj, "listeners"));
-        for (const auto& lObj : lstObjs) {
-            AxbSmPointerListener lst{};
-            const std::string targetName(FindJsonFieldValue(lObj, "target"));
-            const auto itEl = elemIndexByName.find(targetName);
-            lst.hitTargetElementIdx = (itEl != elemIndexByName.end()) ? static_cast<std::uint16_t>(itEl->second) : 0u;
-            const std::string_view evStr = FindJsonFieldValue(lObj, "event");
-            if (EqualsIgnoreCase(evStr, "PointerExit")) lst.eventKind = SmListenerEventKind::PointerExit;
-            else if (EqualsIgnoreCase(evStr, "PointerDown")) lst.eventKind = SmListenerEventKind::PointerDown;
-            else if (EqualsIgnoreCase(evStr, "PointerUp") || EqualsIgnoreCase(evStr, "Click")) lst.eventKind = SmListenerEventKind::PointerUpInside;
-            else if (EqualsIgnoreCase(evStr, "FocusGained")) lst.eventKind = SmListenerEventKind::FocusGained;
-            else if (EqualsIgnoreCase(evStr, "FocusLost")) lst.eventKind = SmListenerEventKind::FocusLost;
-            else lst.eventKind = SmListenerEventKind::PointerEnter;
-
-            const std::string inName(FindJsonFieldValue(lObj, "input"));
-            const auto itIn = inputIdxByName.find(inName);
-            lst.targetInputSlot = (itIn != inputIdxByName.end()) ? static_cast<std::uint16_t>(itIn->second) : 0u;
-            const std::string_view actStr = FindJsonFieldValue(lObj, "action");
-            if (EqualsIgnoreCase(actStr, "FireTrigger")) lst.actionKind = SmListenerActionKind::FireTrigger;
-            else if (EqualsIgnoreCase(actStr, "AddFloat") || EqualsIgnoreCase(actStr, "AddDelta")) lst.actionKind = SmListenerActionKind::AddDelta;
-            else lst.actionKind = SmListenerActionKind::SetFloatOrBool;
-            lst.actionValue = ParseFloat32(FindJsonFieldValue(lObj, "value"), 1.0f);
-            pkg.smListeners.push_back(lst);
-        }
-        sm.listenerCount = static_cast<std::uint16_t>(pkg.smListeners.size() - sm.firstListenerIdx);
-
-        pkg.stateMachines.push_back(sm);
-    }
-
-    PopulateSceneIrFromPackage(pkg, FrontendSourceFormat::RiveBinary, sourcePath, outIr);
-    return true;
-}
-
-bool XamlFrontendImporter::ImportToSceneIR(
-    std::string_view sourcePath,
-    const std::uint8_t* rawBytes,
-    std::size_t byteLength,
-    AeroSceneGraphIR& outIr,
-    std::vector<std::string>& outDiagnostics) const {
-    AeroCompiler compiler;
-    AeroCompileInput in{};
-    in.xamlPath = std::string(sourcePath);
-    if (rawBytes && byteLength > 0) {
-        in.xamlContent.assign(reinterpret_cast<const char*>(rawBytes), byteLength);
-    }
-    AeroCompileResult res = compiler.Compile(in);
-    outDiagnostics.insert(outDiagnostics.end(), res.diagnostics.begin(), res.diagnostics.end());
-    outIr = std::move(res.sceneIr);
-    return res.succeeded;
 }
 
 namespace {
@@ -2781,7 +1519,7 @@ AERO_NOINLINE bool RunFrontendImportPhaseNoInline(
 AERO_NOINLINE void CompileAndMergeExternalDictionaryNoInline(
     XamlCtx& ctx,
     std::string_view rawDictSource) {
-    rawDictSource = Trim(rawDictSource);
+    rawDictSource = str::Trim(rawDictSource);
     if (rawDictSource.empty()) {
         return;
     }
@@ -2876,7 +1614,7 @@ AERO_NOINLINE void FlushDeferredMtsdfJobsNoInline(XamlCtx& ctx) {
 }
 
 void EnsurePathBakedIntoPackageHelper(XamlCtx& ctx, std::string_view svgPathData) {
-    svgPathData = Trim(svgPathData);
+    svgPathData = str::Trim(svgPathData);
     if (svgPathData.empty()) {
         return;
     }
@@ -2914,7 +1652,7 @@ void EmitStaticLayoutTransformMatrix(AxbPackage& pkg, const Matrix2D& m) {
 }
 
 void EnsureEnclosingElementHasNameIfEmpty(AxbPackage& pkg, std::string_view xName) {
-    xName = Trim(xName);
+    xName = str::Trim(xName);
     if (xName.empty()) {
         return;
     }
@@ -2999,14 +1737,14 @@ void SplitPathIntoHopsHelper(
     std::string_view pathPart,
     std::vector<AxbCompiledHop>& outHops,
     bool keepSingleAttachedPropertyHop = false) {
-    pathPart = Trim(pathPart);
+    pathPart = str::Trim(pathPart);
     if (pathPart.empty() || pathPart == ".") {
         return;
     }
     auto pushHopSegment = [&](std::string_view rawSeg) {
-        std::string_view seg = Trim(rawSeg);
+        std::string_view seg = str::Trim(rawSeg);
         if (seg.size() >= 2u && seg.front() == '(' && seg.back() == ')') {
-            seg = Trim(seg.substr(1u, seg.size() - 2u));
+            seg = str::Trim(seg.substr(1u, seg.size() - 2u));
         }
         if (seg.empty()) {
             return;
@@ -3094,14 +1832,14 @@ AERO_NOINLINE AxbCompiledBindingChain BuildCompiledBindingChainHelper(
     ResolveConverterResourceHelper(pkg, chain.converter, chain.converterKey);
 
     if (!parsed.fallbackValue.empty()) {
-        chain.fallbackValue = (targetPropId != 0u && targetPropId != kUnmappedPropId)
+        chain.fallbackValue = (targetPropId != 0u && targetPropId != compiler_detail::kUnmappedPropId)
             ? AeroCompiler::ParseLiteralPropertyValue(targetPropId, parsed.fallbackValue)
             : value::FromString(DecodeXamlXmlEntities(parsed.fallbackValue));
     }
     if (parsed.hasTargetNullValue) {
         chain.targetNullValue = parsed.targetNullValue.empty()
             ? value::FromString("")
-            : ((targetPropId != 0u && targetPropId != kUnmappedPropId)
+            : ((targetPropId != 0u && targetPropId != compiler_detail::kUnmappedPropId)
                 ? AeroCompiler::ParseLiteralPropertyValue(targetPropId, parsed.targetNullValue)
                 : value::FromString(DecodeXamlXmlEntities(parsed.targetNullValue)));
     }
@@ -3114,7 +1852,7 @@ AERO_NOINLINE AxbCompiledBindingChain BuildCompiledBindingChainHelper(
             (hasElemSrc &&
              effPathPart.find('.') != std::string_view::npos &&
              !IsInstanceSubHopPropertyPath(effPathPart) &&
-             ResolveMappedSetterPropertyId(effPathPart, ownerType) != kUnmappedPropId);
+             ResolveMappedSetterPropertyId(effPathPart, ownerType) != compiler_detail::kUnmappedPropId);
         SplitPathIntoHopsHelper(effPathPart, chain.hops, keepAttachedSingle);
     }
     return chain;
@@ -3124,10 +1862,10 @@ bool EmitPropertyBindingIfValidHelper(
     XamlCtx& ctx,
     std::uint16_t targetPropId,
     std::string_view rawMarkupExpr) {
-    if (targetPropId == kUnmappedPropId) {
+    if (targetPropId == compiler_detail::kUnmappedPropId) {
         return false;
     }
-    const std::string_view trimmedExpr = Trim(rawMarkupExpr);
+    const std::string_view trimmedExpr = str::Trim(rawMarkupExpr);
     if (trimmedExpr.size() <= 2 || trimmedExpr.front() != '{' || trimmedExpr.back() != '}') {
         return false;
     }
@@ -3149,7 +1887,7 @@ bool EmitPropertyBindingIfValidHelper(
         }
         const std::uint16_t srcPropId =
             ResolveTemplateBindingSourcePropId(parsedBind.pathPart, t_activeTemplateTargetTypeHint);
-        if (srcPropId == kUnmappedPropId) {
+        if (srcPropId == compiler_detail::kUnmappedPropId) {
             return !parsedBind.fallbackValue.empty();
         }
         AxbInstruction tbInst{};
@@ -3189,10 +1927,10 @@ std::uint16_t FindEnclosingPropertyTargetIdHelper(const std::vector<XmlScopeEntr
     for (auto it = scopeStack.rbegin(); it != scopeStack.rend(); ++it) {
         if (it->kind == XmlScopeKind::BindingPropertyElement ||
             it->kind == XmlScopeKind::TransparentContainer) {
-            if (it->targetPropId != 0 && it->targetPropId != kUnmappedPropId) {
+            if (it->targetPropId != 0 && it->targetPropId != compiler_detail::kUnmappedPropId) {
                 return it->targetPropId;
             }
-            if (it->targetPropId == PropId_Width && EndsWith(StripXmlPrefix(it->tagName), ".Width")) {
+            if (it->targetPropId == PropId_Width && str::EndsWith(str::StripNamespacePrefix(it->tagName), ".Width")) {
                 return PropId_Width;
             }
         }
@@ -3200,7 +1938,7 @@ std::uint16_t FindEnclosingPropertyTargetIdHelper(const std::vector<XmlScopeEntr
             break;
         }
     }
-    return kUnmappedPropId;
+    return compiler_detail::kUnmappedPropId;
 }
 
 void CommitActionToActiveTriggerHelper(
@@ -3221,7 +1959,7 @@ void CommitActionToActiveTriggerHelper(
 }
 
 void EmitSingleCompiledChainHelper(AxbPackage& pkg, AxbCompiledBindingChain&& chain) {
-    if (chain.targetPropertyId == kUnmappedPropId) {
+    if (chain.targetPropertyId == compiler_detail::kUnmappedPropId) {
         return;
     }
     if (!std::holds_alternative<std::monostate>(chain.fallbackValue)) {
@@ -3256,7 +1994,7 @@ void EmitSingleCompiledChainHelper(AxbPackage& pkg, AxbCompiledBindingChain&& ch
 }
 
 void EmitCompiledMultiBindingHelper(AxbPackage& pkg, AxbCompiledMultiBinding&& mb) {
-    if (mb.targetPropertyId == kUnmappedPropId || mb.sources.empty()) {
+    if (mb.targetPropertyId == compiler_detail::kUnmappedPropId || mb.sources.empty()) {
         return;
     }
     if (!std::holds_alternative<std::monostate>(mb.fallbackValue)) {
@@ -3285,20 +2023,20 @@ UnifiedValue ParseStyleOrAnimationValueHelper(
     std::string_view rawVal,
     bool& outValid) {
     outValid = false;
-    if (propId == kUnmappedPropId) {
+    if (propId == compiler_detail::kUnmappedPropId) {
         return UnifiedValue{};
     }
-    const std::string_view trimmed = Trim(rawVal);
+    const std::string_view trimmed = str::Trim(rawVal);
     if (trimmed.size() > 2u && trimmed.front() == '{' && trimmed.back() == '}') {
-        const std::string_view innerMarkup = Trim(trimmed.substr(1u, trimmed.size() - 2u));
+        const std::string_view innerMarkup = str::Trim(trimmed.substr(1u, trimmed.size() - 2u));
         if (innerMarkup == "x:Null" || innerMarkup.rfind("x:Null ", 0) == 0) {
             outValid = true;
             return NullObject{};
         }
         if (innerMarkup.rfind("x:Static ", 0) == 0 || innerMarkup.rfind("x:Static\t", 0) == 0) {
-            std::string_view arg = Trim(innerMarkup.substr(8u));
+            std::string_view arg = str::Trim(innerMarkup.substr(8u));
             if (arg.rfind("Member=", 0) == 0) {
-                arg = Trim(arg.substr(7u));
+                arg = str::Trim(arg.substr(7u));
             }
             if (arg.size() >= 2u && ((arg.front() == '\'' && arg.back() == '\'') || (arg.front() == '"' && arg.back() == '"'))) {
                 arg = arg.substr(1u, arg.size() - 2u);
@@ -3342,7 +2080,7 @@ UnifiedValue ParseStyleOrAnimationValueHelper(
 
 void CommitSetterToOwnerHelper(XamlCtx& ctx, AxbPropertySetter&& s, SetterOwnerKind owner) {
     auto& st = ctx.st;
-    if (s.propId == kUnmappedPropId ||
+    if (s.propId == compiler_detail::kUnmappedPropId ||
         (!s.hasBinding && std::holds_alternative<std::monostate>(s.value))) {
         return;
     }
@@ -3378,14 +2116,14 @@ AERO_NOINLINE bool BuildDataTriggerConditionHelper(
     if (!parsed.isValidBinding) {
         return false;
     }
-    const std::string_view trimmedVal = Trim(valAttr);
+    const std::string_view trimmedVal = str::Trim(valAttr);
     outCond = AxbTriggerCondition{};
     outCond.converter = parsed.converter;
     outCond.converterKey = parsed.converterKey;
     outCond.converterParameter = parsed.converterParameter;
     ResolveConverterResourceHelper(ctx.pkg, outCond.converter, outCond.converterKey);
     if (trimmedVal.size() > 2u && trimmedVal.front() == '{' && trimmedVal.back() == '}') {
-        const std::string_view innerV = Trim(trimmedVal.substr(1u, trimmedVal.size() - 2u));
+        const std::string_view innerV = str::Trim(trimmedVal.substr(1u, trimmedVal.size() - 2u));
         if (innerV.rfind("x:Null", 0) == 0) {
             outCond.expectNull = true;
         } else {
@@ -3448,7 +2186,7 @@ AERO_NOINLINE bool BuildDataTriggerConditionHelper(
         std::string_view firstSeg;
         splitSubObjectHopsAfterFirstDot(parsed.pathPart, firstSeg);
         outCond.propId = ResolveMappedTriggerConditionId(firstSeg, effOwner);
-        if (outCond.propId == kUnmappedPropId) return false;
+        if (outCond.propId == compiler_detail::kUnmappedPropId) return false;
         if (!outCond.expectNull && std::holds_alternative<std::monostate>(outCond.expectedValue)) {
             if (!outCond.compiledHops.empty()) {
                 outCond.expectedValue = value::FromString(DecodeXamlXmlEntities(trimmedVal));
@@ -3467,7 +2205,7 @@ AERO_NOINLINE bool BuildDataTriggerConditionHelper(
         std::string_view firstSeg;
         splitSubObjectHopsAfterFirstDot(parsed.pathPart, firstSeg);
         outCond.propId = ResolveMappedTriggerConditionId(firstSeg, effOwner);
-        if (outCond.propId == kUnmappedPropId) return false;
+        if (outCond.propId == compiler_detail::kUnmappedPropId) return false;
         if (!outCond.expectNull && std::holds_alternative<std::monostate>(outCond.expectedValue)) {
             if (!outCond.compiledHops.empty()) {
                 outCond.expectedValue = value::FromString(DecodeXamlXmlEntities(trimmedVal));
@@ -3492,7 +2230,7 @@ AERO_NOINLINE bool BuildDataTriggerConditionHelper(
             namedOwner = it->second;
         }
         outCond.propId = ResolveMappedTriggerConditionId(firstSeg, namedOwner);
-        if (outCond.propId == kUnmappedPropId) return false;
+        if (outCond.propId == compiler_detail::kUnmappedPropId) return false;
         if (!outCond.expectNull && std::holds_alternative<std::monostate>(outCond.expectedValue)) {
             if (!outCond.compiledHops.empty() ||
                 outCond.propId == PropId_SelectedItem || outCond.propId == PropId_Text ||
@@ -3514,7 +2252,7 @@ AERO_NOINLINE bool BuildDataTriggerConditionHelper(
         std::string_view firstSeg;
         splitSubObjectHopsAfterFirstDot(parsed.pathPart, firstSeg);
         outCond.propId = ResolveMappedTriggerConditionId(firstSeg, parsed.relativeAncestorType);
-        if (outCond.propId == kUnmappedPropId) return false;
+        if (outCond.propId == compiler_detail::kUnmappedPropId) return false;
         if (!outCond.expectNull && std::holds_alternative<std::monostate>(outCond.expectedValue)) {
             if (!outCond.compiledHops.empty()) {
                 outCond.expectedValue = value::FromString(DecodeXamlXmlEntities(trimmedVal));
@@ -3682,7 +2420,7 @@ AERO_NOINLINE void EmitMouseDragElementBehaviorHelper(
 
     for (const auto& a : tag.attrs) {
         if (a.name == "ConstrainToParentBounds") {
-            const std::string_view tv = Trim(a.value);
+            const std::string_view tv = str::Trim(a.value);
             if (tv.size() > 2u && tv.front() == '{' && tv.back() == '}') {
                 std::string_view rk;
                 if (TryParseResourceMarkupExtension(tv, rk, constrainResFlags)) {
@@ -3691,7 +2429,7 @@ AERO_NOINLINE void EmitMouseDragElementBehaviorHelper(
                         if (const auto* bv = std::get_if<bool>(rv)) {
                             constrainStatic = *bv;
                         } else if (const auto* sv = std::get_if<StringValue>(rv)) {
-                            constrainStatic = EqualsIgnoreCase(Trim(sv->view()), "true");
+                            constrainStatic = str::EqualsIgnoreCase(str::Trim(sv->view()), "true");
                         }
                     }
                 } else {
@@ -3700,7 +2438,7 @@ AERO_NOINLINE void EmitMouseDragElementBehaviorHelper(
                 }
             } else {
                 const std::string dec = DecodeXamlXmlEntities(tv);
-                constrainStatic = EqualsIgnoreCase(Trim(dec), "true") || Trim(dec) == "1";
+                constrainStatic = str::EqualsIgnoreCase(str::Trim(dec), "true") || str::Trim(dec) == "1";
             }
         }
     }
@@ -3759,20 +2497,20 @@ GradientBrushDesc ParseGradientBrushHeaderHelper(const OpenTagInfo& tag) {
         } else if (a.name == "GradientOrigin") {
             d.gradientOrigin = ParseXamlPoint2D(a.value, d.gradientOrigin);
         } else if (a.name == "RadiusX") {
-            d.radiusX = std::max(1e-5f, ParseFloat32(a.value, d.radiusX));
+            d.radiusX = std::max(1e-5f, compiler_detail::ParseFloat32(a.value, d.radiusX));
         } else if (a.name == "RadiusY") {
-            d.radiusY = std::max(1e-5f, ParseFloat32(a.value, d.radiusY));
+            d.radiusY = std::max(1e-5f, compiler_detail::ParseFloat32(a.value, d.radiusY));
         } else if (a.name == "Opacity") {
-            d.opacity = std::clamp(ParseFloat32(a.value, 1.0f), 0.0f, 1.0f);
+            d.opacity = std::clamp(compiler_detail::ParseFloat32(a.value, 1.0f), 0.0f, 1.0f);
         } else if (a.name == "MappingMode") {
-            d.mappingMode = EqualsIgnoreCase(Trim(a.value), "Absolute")
+            d.mappingMode = str::EqualsIgnoreCase(str::Trim(a.value), "Absolute")
                 ? BrushMappingMode::Absolute
                 : BrushMappingMode::RelativeToBoundingBox;
         } else if (a.name == "SpreadMethod") {
-            const std::string_view sm = Trim(a.value);
-            if (EqualsIgnoreCase(sm, "Reflect")) {
+            const std::string_view sm = str::Trim(a.value);
+            if (str::EqualsIgnoreCase(sm, "Reflect")) {
                 d.spreadMethod = GradientSpreadMethod::Reflect;
-            } else if (EqualsIgnoreCase(sm, "Repeat")) {
+            } else if (str::EqualsIgnoreCase(sm, "Repeat")) {
                 d.spreadMethod = GradientSpreadMethod::Repeat;
             } else {
                 d.spreadMethod = GradientSpreadMethod::Pad;
@@ -3802,7 +2540,7 @@ bool EmitDynamicResourceOrBindingForPropHelper(
     XamlCtx& ctx,
     std::uint16_t propId,
     std::string_view rawExpr) {
-    const std::string_view tv = Trim(rawExpr);
+    const std::string_view tv = str::Trim(rawExpr);
     if (tv.size() <= 2u || tv.front() != '{') {
         return false;
     }
@@ -3855,7 +2593,7 @@ AERO_NOINLINE int TryHandleSubPackageTemplateTagNoInline(
                 if (a.name == "Header") {
                     colHeader = DecodeXamlXmlEntities(a.value);
                 } else if (a.name == "Width") {
-                    colWidth = std::string(Trim(a.value));
+                    colWidth = std::string(str::Trim(a.value));
                 } else if (a.name == "DisplayMemberBinding") {
                     const auto parsedB = ParseBindingMarkupExpression(a.value);
                     if (parsedB.isValidBinding) {
@@ -3923,7 +2661,7 @@ AERO_NOINLINE int TryHandleSubPackageTemplateTagNoInline(
                             const std::size_t absDtAfterOpen = ctx.pos + dtTagGt + 1u;
                             if (FindMatchingClosingTag(src, absDtAfterOpen, "DataTemplate", dtInnerEnd, dtAfterClose)) {
                                 const std::string_view dtInnerXml = src.substr(absDtAfterOpen, dtInnerEnd - absDtAfterOpen);
-                                if (!Trim(dtInnerXml).empty()) {
+                                if (!str::Trim(dtInnerXml).empty()) {
                                     AxbTemplateRegistry::Instance().RegisterResources(pkg);
                                     auto subIn = std::make_unique<AeroCompileInput>();
                                     subIn->xamlPath = ctx.input.xamlPath;
@@ -4064,10 +2802,10 @@ AERO_NOINLINE int TryHandleSubPackageTemplateTagNoInline(
                 const ParsedBindingClause isb = ParseBindingMarkupExpression(a.value);
                 dtItemsSourcePath = isb.isValidBinding
                     ? std::string(isb.pathPart)
-                    : std::string(Trim(a.value));
+                    : std::string(str::Trim(a.value));
             } else if (a.name == "ItemTemplate") {
                 const std::string_view rk = ExtractMarkupResourceKey(a.value);
-                dtChildItemTemplateKey = !rk.empty() ? std::string(rk) : std::string(Trim(a.value));
+                dtChildItemTemplateKey = !rk.empty() ? std::string(rk) : std::string(str::Trim(a.value));
             }
         }
         if (!selfClosing) {
@@ -4169,7 +2907,7 @@ AERO_NOINLINE void HandleGraphicsEffectsShadersAndResourcesNoInline(
         for (const auto& a : attrs) {
             if (a.name == "Offset") {
                 if (!a.value.empty() && a.value.front() != '{') {
-                    stopOffset = ParseFloat32(a.value, stopOffset);
+                    stopOffset = compiler_detail::ParseFloat32(a.value, stopOffset);
                 }
             } else if (a.name == "Color") {
                 const std::string_view resKey = ExtractMarkupResourceKey(a.value);
@@ -4188,12 +2926,12 @@ AERO_NOINLINE void HandleGraphicsEffectsShadersAndResourcesNoInline(
     }
 
     if (!setterStack.empty() && !setterStack.back().hasValue &&
-        setterStack.back().setter.propId != kUnmappedPropId) {
+        setterStack.back().setter.propId != compiler_detail::kUnmappedPropId) {
         if (shortTag == "SolidColorBrush") {
             float brushAlphaMul = 1.0f;
             for (const auto& a : attrs) {
                 if (a.name == "Opacity") {
-                    brushAlphaMul = std::clamp(ParseFloat32(a.value, 1.0f), 0.0f, 1.0f);
+                    brushAlphaMul = std::clamp(compiler_detail::ParseFloat32(a.value, 1.0f), 0.0f, 1.0f);
                 }
             }
             for (const auto& a : attrs) {
@@ -4248,8 +2986,8 @@ AERO_NOINLINE void HandleGraphicsEffectsShadersAndResourcesNoInline(
             }
             for (const auto& a : attrs) {
                 if ((a.name == "ImageSource" || a.name == "UriSource" || a.name == "Source") &&
-                    !Trim(a.value).empty()) {
-                    const std::string_view rawU = Trim(a.value);
+                    !str::Trim(a.value).empty()) {
+                    const std::string_view rawU = str::Trim(a.value);
                     if (rawU.front() == '{') {
                         const std::string_view refKey = ExtractMarkupResourceKey(rawU);
                         if (!refKey.empty()) {
@@ -4307,11 +3045,11 @@ AERO_NOINLINE void HandleGraphicsEffectsShadersAndResourcesNoInline(
 
     if (shortTag == "ResourceDictionary" ||
         shortTag == "ResourceDictionary.MergedDictionaries" ||
-        EndsWith(shortTag, ".MergedDictionaries") ||
-        EndsWith(shortTag, ".Resources")) {
+        str::EndsWith(shortTag, ".MergedDictionaries") ||
+        str::EndsWith(shortTag, ".Resources")) {
         if (shortTag == "ResourceDictionary") {
             for (const auto& a : attrs) {
-                if (a.name == "Source" && !Trim(a.value).empty()) {
+                if (a.name == "Source" && !str::Trim(a.value).empty()) {
                     CompileAndMergeExternalDictionaryNoInline(ctx, DecodeXamlXmlEntities(a.value));
                     break;
                 }
@@ -4333,7 +3071,7 @@ AERO_NOINLINE void HandleGraphicsEffectsShadersAndResourcesNoInline(
         (shortTag == "CompositeTransform3D" || shortTag == "PlaneProjection")) {
         CompositeTransform3DParams p3d{};
         for (const auto& a : attrs) {
-            const std::string_view v = Trim(a.value);
+            const std::string_view v = str::Trim(a.value);
             if (v.empty()) continue;
             if (v.front() == '{') {
                 if (a.name == "RotationX") (void)EmitPropertyBindingIfValidHelper(ctx, PropId_AnimRotation3DX, v);
@@ -4347,22 +3085,22 @@ AERO_NOINLINE void HandleGraphicsEffectsShadersAndResourcesNoInline(
                     (void)EmitPropertyBindingIfValidHelper(ctx, PropId_AnimTranslate3DZ, v);
                 continue;
             }
-            if (a.name == "RotationX") p3d.rotationX = ParseFloat32(v, 0.0f);
-            else if (a.name == "RotationY") p3d.rotationY = ParseFloat32(v, 0.0f);
-            else if (a.name == "RotationZ") p3d.rotationZ = ParseFloat32(v, 0.0f);
+            if (a.name == "RotationX") p3d.rotationX = compiler_detail::ParseFloat32(v, 0.0f);
+            else if (a.name == "RotationY") p3d.rotationY = compiler_detail::ParseFloat32(v, 0.0f);
+            else if (a.name == "RotationZ") p3d.rotationZ = compiler_detail::ParseFloat32(v, 0.0f);
             else if (a.name == "TranslateX" || a.name == "LocalOffsetX" || a.name == "GlobalOffsetX")
-                p3d.translateX = ParseFloat32(v, 0.0f);
+                p3d.translateX = compiler_detail::ParseFloat32(v, 0.0f);
             else if (a.name == "TranslateY" || a.name == "LocalOffsetY" || a.name == "GlobalOffsetY")
-                p3d.translateY = ParseFloat32(v, 0.0f);
+                p3d.translateY = compiler_detail::ParseFloat32(v, 0.0f);
             else if (a.name == "TranslateZ" || a.name == "LocalOffsetZ" || a.name == "GlobalOffsetZ")
-                p3d.translateZ = ParseFloat32(v, 0.0f);
-            else if (a.name == "ScaleX") p3d.scaleX = ParseFloat32(v, 1.0f);
-            else if (a.name == "ScaleY") p3d.scaleY = ParseFloat32(v, 1.0f);
-            else if (a.name == "ScaleZ") p3d.scaleZ = ParseFloat32(v, 1.0f);
-            else if (a.name == "CenterX") { p3d.centerX = ParseFloat32(v, 0.0f); p3d.hasExplicitCenter = true; }
-            else if (a.name == "CenterY") { p3d.centerY = ParseFloat32(v, 0.0f); p3d.hasExplicitCenter = true; }
-            else if (a.name == "CenterZ") { p3d.centerZ = ParseFloat32(v, 0.0f); }
-            else if (a.name == "CameraDistance") { p3d.cameraDistance = ParseFloat32(v, 1000.0f); }
+                p3d.translateZ = compiler_detail::ParseFloat32(v, 0.0f);
+            else if (a.name == "ScaleX") p3d.scaleX = compiler_detail::ParseFloat32(v, 1.0f);
+            else if (a.name == "ScaleY") p3d.scaleY = compiler_detail::ParseFloat32(v, 1.0f);
+            else if (a.name == "ScaleZ") p3d.scaleZ = compiler_detail::ParseFloat32(v, 1.0f);
+            else if (a.name == "CenterX") { p3d.centerX = compiler_detail::ParseFloat32(v, 0.0f); p3d.hasExplicitCenter = true; }
+            else if (a.name == "CenterY") { p3d.centerY = compiler_detail::ParseFloat32(v, 0.0f); p3d.hasExplicitCenter = true; }
+            else if (a.name == "CenterZ") { p3d.centerZ = compiler_detail::ParseFloat32(v, 0.0f); }
+            else if (a.name == "CameraDistance") { p3d.cameraDistance = compiler_detail::ParseFloat32(v, 1000.0f); }
         }
         pkg.instructions.push_back(AxbInstruction{
             AxbOpcode::SetStaticProperty,
@@ -4398,7 +3136,7 @@ AERO_NOINLINE void HandleGraphicsEffectsShadersAndResourcesNoInline(
         bool insideBgEffectBehavior = false;
         for (auto it = scopeStack.rbegin(); it != scopeStack.rend(); ++it) {
             if (it->kind == XmlScopeKind::VisualElement) break;
-            if (StripXmlPrefix(it->tagName) == "BackgroundEffectBehavior") {
+            if (str::StripNamespacePrefix(it->tagName) == "BackgroundEffectBehavior") {
                 insideBgEffectBehavior = true;
                 break;
             }
@@ -4407,11 +3145,11 @@ AERO_NOINLINE void HandleGraphicsEffectsShadersAndResourcesNoInline(
             float radius = 10.0f;
             for (const auto& a : attrs) {
                 if (a.name == "Radius") {
-                    const std::string_view v = Trim(a.value);
+                    const std::string_view v = str::Trim(a.value);
                     if (!v.empty() && v.front() == '{') {
                         (void)EmitDynamicResourceOrBindingForPropHelper(ctx, PropId_EffectBlurRadius, v);
                     } else {
-                        radius = std::max(0.0f, ParseFloat32(v, 10.0f));
+                        radius = std::max(0.0f, compiler_detail::ParseFloat32(v, 10.0f));
                     }
                 }
             }
@@ -4435,7 +3173,7 @@ AERO_NOINLINE void HandleGraphicsEffectsShadersAndResourcesNoInline(
             if (it->kind == XmlScopeKind::VisualElement) break;
             if ((it->kind == XmlScopeKind::TransparentContainer && it->targetPropId == PropId_PathData) ||
                 (it->kind == XmlScopeKind::KeyedResourceItem &&
-                 (StripXmlPrefix(it->tagName) == "PathGeometry" || StripXmlPrefix(it->tagName) == "Geometry"))) {
+                 (str::StripNamespacePrefix(it->tagName) == "PathGeometry" || str::StripNamespacePrefix(it->tagName) == "Geometry"))) {
                 geomOwner = &(*it);
                 break;
             }
@@ -4445,10 +3183,10 @@ AERO_NOINLINE void HandleGraphicsEffectsShadersAndResourcesNoInline(
                 std::string startPt = "0,0";
                 bool isClosed = false;
                 for (const auto& a : attrs) {
-                    if (a.name == "StartPoint") startPt = std::string(Trim(a.value));
+                    if (a.name == "StartPoint") startPt = std::string(str::Trim(a.value));
                     else if (a.name == "IsClosed") {
-                        const std::string_view tv = Trim(a.value);
-                        isClosed = EqualsIgnoreCase(tv, "true") || tv == "1";
+                        const std::string_view tv = str::Trim(a.value);
+                        isClosed = str::EqualsIgnoreCase(tv, "true") || tv == "1";
                     }
                 }
                 if (!geomOwner->accumulatedText.empty()) geomOwner->accumulatedText.push_back(' ');
@@ -4465,16 +3203,16 @@ AERO_NOINLINE void HandleGraphicsEffectsShadersAndResourcesNoInline(
                 return;
             } else if (shortTag == "LineSegment") {
                 for (const auto& a : attrs) {
-                    if (a.name == "Point" && !Trim(a.value).empty()) {
-                        geomOwner->accumulatedText += " L " + std::string(Trim(a.value));
+                    if (a.name == "Point" && !str::Trim(a.value).empty()) {
+                        geomOwner->accumulatedText += " L " + std::string(str::Trim(a.value));
                     }
                 }
                 if (!selfClosing) (void)PushNonVisualScopeHelper(ctx, tagName);
                 return;
             } else if (shortTag == "PolyLineSegment") {
                 for (const auto& a : attrs) {
-                    if (a.name == "Points" && !Trim(a.value).empty()) {
-                        geomOwner->accumulatedText += " L " + std::string(Trim(a.value));
+                    if (a.name == "Points" && !str::Trim(a.value).empty()) {
+                        geomOwner->accumulatedText += " L " + std::string(str::Trim(a.value));
                     }
                 }
                 if (!selfClosing) (void)PushNonVisualScopeHelper(ctx, tagName);
@@ -4482,9 +3220,9 @@ AERO_NOINLINE void HandleGraphicsEffectsShadersAndResourcesNoInline(
             } else if (shortTag == "BezierSegment") {
                 std::string p1 = "0,0", p2 = "0,0", p3 = "0,0";
                 for (const auto& a : attrs) {
-                    if (a.name == "Point1") p1 = std::string(Trim(a.value));
-                    else if (a.name == "Point2") p2 = std::string(Trim(a.value));
-                    else if (a.name == "Point3") p3 = std::string(Trim(a.value));
+                    if (a.name == "Point1") p1 = std::string(str::Trim(a.value));
+                    else if (a.name == "Point2") p2 = std::string(str::Trim(a.value));
+                    else if (a.name == "Point3") p3 = std::string(str::Trim(a.value));
                 }
                 geomOwner->accumulatedText += " C " + p1 + " " + p2 + " " + p3;
                 if (!selfClosing) (void)PushNonVisualScopeHelper(ctx, tagName);
@@ -4492,8 +3230,8 @@ AERO_NOINLINE void HandleGraphicsEffectsShadersAndResourcesNoInline(
             } else if (shortTag == "QuadraticBezierSegment") {
                 std::string p1 = "0,0", p2 = "0,0";
                 for (const auto& a : attrs) {
-                    if (a.name == "Point1") p1 = std::string(Trim(a.value));
-                    else if (a.name == "Point2") p2 = std::string(Trim(a.value));
+                    if (a.name == "Point1") p1 = std::string(str::Trim(a.value));
+                    else if (a.name == "Point2") p2 = std::string(str::Trim(a.value));
                 }
                 geomOwner->accumulatedText += " Q " + p1 + " " + p2;
                 if (!selfClosing) (void)PushNonVisualScopeHelper(ctx, tagName);
@@ -4502,11 +3240,11 @@ AERO_NOINLINE void HandleGraphicsEffectsShadersAndResourcesNoInline(
                 std::string pt = "0,0", sz = "1,1", rot = "0";
                 int largeArc = 0, sweep = 0;
                 for (const auto& a : attrs) {
-                    if (a.name == "Point") pt = std::string(Trim(a.value));
-                    else if (a.name == "Size") sz = std::string(Trim(a.value));
-                    else if (a.name == "RotationAngle") rot = std::string(Trim(a.value));
-                    else if (a.name == "IsLargeArc") largeArc = EqualsIgnoreCase(Trim(a.value), "true") ? 1 : 0;
-                    else if (a.name == "SweepDirection") sweep = EqualsIgnoreCase(Trim(a.value), "Clockwise") ? 1 : 0;
+                    if (a.name == "Point") pt = std::string(str::Trim(a.value));
+                    else if (a.name == "Size") sz = std::string(str::Trim(a.value));
+                    else if (a.name == "RotationAngle") rot = std::string(str::Trim(a.value));
+                    else if (a.name == "IsLargeArc") largeArc = str::EqualsIgnoreCase(str::Trim(a.value), "true") ? 1 : 0;
+                    else if (a.name == "SweepDirection") sweep = str::EqualsIgnoreCase(str::Trim(a.value), "Clockwise") ? 1 : 0;
                 }
                 geomOwner->accumulatedText += " A " + sz + " " + rot + " " +
                     std::to_string(largeArc) + " " + std::to_string(sweep) + " " + pt;
@@ -4527,11 +3265,11 @@ AERO_NOINLINE void HandleGraphicsEffectsShadersAndResourcesNoInline(
         std::string_view satDynamicExpr;
         for (const auto& a : attrs) {
             if (a.name == "Saturation") {
-                const std::string_view v = Trim(a.value);
+                const std::string_view v = str::Trim(a.value);
                 if (!v.empty() && v.front() == '{') {
                     satDynamicExpr = v;
                 } else {
-                    satVal = std::clamp(ParseFloat32(v, 1.0f), 0.0f, 4.0f);
+                    satVal = std::clamp(compiler_detail::ParseFloat32(v, 1.0f), 0.0f, 4.0f);
                 }
             }
         }
@@ -4630,12 +3368,12 @@ AERO_NOINLINE void HandleGraphicsEffectsShadersAndResourcesNoInline(
                 bool hasStaticColor = false;
                 Color plasmaCol{1.0f, 1.0f, 1.0f, 1.0f};
                 for (const auto& a : attrs) {
-                    const std::string_view v = Trim(a.value);
+                    const std::string_view v = str::Trim(a.value);
                     if (a.name == "Time") {
                         if (!v.empty() && v.front() == '{') {
                             timeDynamicExpr = v;
                         } else {
-                            shaderTime = ParseFloat32(v, 0.0f);
+                            shaderTime = compiler_detail::ParseFloat32(v, 0.0f);
                         }
                     } else if (a.name == "Color") {
                         if (!v.empty() && v.front() == '{') {
@@ -4677,9 +3415,9 @@ AERO_NOINLINE void HandleGraphicsEffectsShadersAndResourcesNoInline(
             std::string_view sizeDyn;
             for (const auto& a : attrs) {
                 if (a.name == "Size") {
-                    const std::string_view v = Trim(a.value);
+                    const std::string_view v = str::Trim(a.value);
                     if (!v.empty() && v.front() == '{') sizeDyn = v;
-                    else pxSize = std::max(1.0f, ParseFloat32(v, 6.0f));
+                    else pxSize = std::max(1.0f, compiler_detail::ParseFloat32(v, 6.0f));
                 }
             }
             pkg.instructions.push_back(AxbInstruction{
@@ -4693,9 +3431,9 @@ AERO_NOINLINE void HandleGraphicsEffectsShadersAndResourcesNoInline(
             std::string_view radDyn;
             for (const auto& a : attrs) {
                 if (a.name == "Radius") {
-                    const std::string_view v = Trim(a.value);
+                    const std::string_view v = str::Trim(a.value);
                     if (!v.empty() && v.front() == '{') radDyn = v;
-                    else radius = std::max(0.0f, ParseFloat32(v, 5.0f));
+                    else radius = std::max(0.0f, compiler_detail::ParseFloat32(v, 5.0f));
                 }
             }
             pkg.instructions.push_back(AxbInstruction{
@@ -4712,7 +3450,7 @@ AERO_NOINLINE void HandleGraphicsEffectsShadersAndResourcesNoInline(
             Color shadowCol{0.0f, 0.0f, 0.0f, 1.0f};
             std::string_view brDyn, sdDyn, opDyn, colDyn;
             for (const auto& a : attrs) {
-                const std::string_view v = Trim(a.value);
+                const std::string_view v = str::Trim(a.value);
                 if (v.empty()) continue;
                 if (v.front() == '{') {
                     if (a.name == "BlurRadius") brDyn = v;
@@ -4721,10 +3459,10 @@ AERO_NOINLINE void HandleGraphicsEffectsShadersAndResourcesNoInline(
                     else if (a.name == "Color") colDyn = v;
                     continue;
                 }
-                if (a.name == "BlurRadius") blurRadius = std::max(0.0f, ParseFloat32(v, 5.0f));
-                else if (a.name == "ShadowDepth") shadowDepth = std::max(0.0f, ParseFloat32(v, 5.0f));
-                else if (a.name == "Direction") directionDeg = ParseFloat32(v, 315.0f);
-                else if (a.name == "Opacity") opacity = std::clamp(ParseFloat32(v, 1.0f), 0.0f, 1.0f);
+                if (a.name == "BlurRadius") blurRadius = std::max(0.0f, compiler_detail::ParseFloat32(v, 5.0f));
+                else if (a.name == "ShadowDepth") shadowDepth = std::max(0.0f, compiler_detail::ParseFloat32(v, 5.0f));
+                else if (a.name == "Direction") directionDeg = compiler_detail::ParseFloat32(v, 315.0f);
+                else if (a.name == "Opacity") opacity = std::clamp(compiler_detail::ParseFloat32(v, 1.0f), 0.0f, 1.0f);
                 else if (a.name == "Color") shadowCol = ParseXamlColorLiteral(v);
             }
             pkg.instructions.push_back(AxbInstruction{
@@ -4744,7 +3482,7 @@ AERO_NOINLINE void HandleGraphicsEffectsShadersAndResourcesNoInline(
             float opacity = 1.0f;
             std::string_view colDyn, opDyn;
             for (const auto& a : attrs) {
-                const std::string_view v = Trim(a.value);
+                const std::string_view v = str::Trim(a.value);
                 if (v.empty()) continue;
                 if (v.front() == '{') {
                     if (a.name == "Color") colDyn = v;
@@ -4752,7 +3490,7 @@ AERO_NOINLINE void HandleGraphicsEffectsShadersAndResourcesNoInline(
                     continue;
                 }
                 if (a.name == "Color") tintCol = ParseXamlColorLiteral(v);
-                else if (a.name == "Opacity") opacity = std::clamp(ParseFloat32(v, 1.0f), 0.0f, 1.0f);
+                else if (a.name == "Opacity") opacity = std::clamp(compiler_detail::ParseFloat32(v, 1.0f), 0.0f, 1.0f);
             }
             pkg.instructions.push_back(AxbInstruction{
                 AxbOpcode::SetStaticProperty, PropId_EffectKind, 0, 0, 0, 0, value::FromInt(5)});
@@ -4769,15 +3507,15 @@ AERO_NOINLINE void HandleGraphicsEffectsShadersAndResourcesNoInline(
             float opacity = 1.0f;
             std::string_view axDyn, opDyn;
             for (const auto& a : attrs) {
-                const std::string_view v = Trim(a.value);
+                const std::string_view v = str::Trim(a.value);
                 if (v.empty()) continue;
                 if (v.front() == '{') {
                     if (a.name == "AmountX" || a.name == "Amount") axDyn = v;
                     else if (a.name == "Opacity") opDyn = v;
                     continue;
                 }
-                if (a.name == "AmountX" || a.name == "Amount") amountX = ParseFloat32(v, 0.0f);
-                else if (a.name == "Opacity") opacity = std::clamp(ParseFloat32(v, 1.0f), 0.0f, 1.0f);
+                if (a.name == "AmountX" || a.name == "Amount") amountX = compiler_detail::ParseFloat32(v, 0.0f);
+                else if (a.name == "Opacity") opacity = std::clamp(compiler_detail::ParseFloat32(v, 1.0f), 0.0f, 1.0f);
             }
             pkg.instructions.push_back(AxbInstruction{
                 AxbOpcode::SetStaticProperty, PropId_EffectKind, 0, 0, 0, 0, value::FromInt(6)});
@@ -4794,7 +3532,7 @@ AERO_NOINLINE void HandleGraphicsEffectsShadersAndResourcesNoInline(
             float opacity = 1.0f;
             std::string_view radDyn, angDyn, opDyn;
             for (const auto& a : attrs) {
-                const std::string_view v = Trim(a.value);
+                const std::string_view v = str::Trim(a.value);
                 if (v.empty()) continue;
                 if (v.front() == '{') {
                     if (a.name == "Radius") radDyn = v;
@@ -4802,9 +3540,9 @@ AERO_NOINLINE void HandleGraphicsEffectsShadersAndResourcesNoInline(
                     else if (a.name == "Opacity") opDyn = v;
                     continue;
                 }
-                if (a.name == "Radius") radius = std::max(0.0f, ParseFloat32(v, 0.0f));
-                else if (a.name == "Angle") angle = ParseFloat32(v, 0.0f);
-                else if (a.name == "Opacity") opacity = std::clamp(ParseFloat32(v, 1.0f), 0.0f, 1.0f);
+                if (a.name == "Radius") radius = std::max(0.0f, compiler_detail::ParseFloat32(v, 0.0f));
+                else if (a.name == "Angle") angle = compiler_detail::ParseFloat32(v, 0.0f);
+                else if (a.name == "Opacity") opacity = std::clamp(compiler_detail::ParseFloat32(v, 1.0f), 0.0f, 1.0f);
             }
             pkg.instructions.push_back(AxbInstruction{
                 AxbOpcode::SetStaticProperty, PropId_EffectKind, 0, 0, 0, 0, value::FromInt(7)});
@@ -4823,15 +3561,15 @@ AERO_NOINLINE void HandleGraphicsEffectsShadersAndResourcesNoInline(
             float opacity = 1.0f;
             std::string_view satDyn, opDyn;
             for (const auto& a : attrs) {
-                const std::string_view v = Trim(a.value);
+                const std::string_view v = str::Trim(a.value);
                 if (v.empty()) continue;
                 if (v.front() == '{') {
                     if (a.name == "Saturation") satDyn = v;
                     else if (a.name == "Opacity") opDyn = v;
                     continue;
                 }
-                if (a.name == "Saturation") saturation = std::clamp(ParseFloat32(v, 1.0f), 0.0f, 4.0f);
-                else if (a.name == "Opacity") opacity = std::clamp(ParseFloat32(v, 1.0f), 0.0f, 1.0f);
+                if (a.name == "Saturation") saturation = std::clamp(compiler_detail::ParseFloat32(v, 1.0f), 0.0f, 4.0f);
+                else if (a.name == "Opacity") opacity = std::clamp(compiler_detail::ParseFloat32(v, 1.0f), 0.0f, 1.0f);
             }
             pkg.instructions.push_back(AxbInstruction{
                 AxbOpcode::SetStaticProperty, PropId_EffectKind, 0, 0, 0, 0, value::FromInt(8)});
@@ -4856,7 +3594,7 @@ AERO_NOINLINE void HandleGraphicsEffectsShadersAndResourcesNoInline(
                 float radius = 5.0f;
                 for (const auto& a : attrs) {
                     if (a.name == "Radius" && (a.value.empty() || a.value.front() != '{')) {
-                        radius = std::max(0.0f, ParseFloat32(a.value, 5.0f));
+                        radius = std::max(0.0f, compiler_detail::ParseFloat32(a.value, 5.0f));
                     }
                 }
                 UpsertPackageResource(pkg, xKey, MakeFloat4InlineFast(radius, -1.0f, 0.0f, 1.0f));
@@ -4864,10 +3602,10 @@ AERO_NOINLINE void HandleGraphicsEffectsShadersAndResourcesNoInline(
                 float blurR = 5.0f, depth = 5.0f, dir = 315.0f, op = 1.0f;
                 for (const auto& a : attrs) {
                     if (!a.value.empty() && a.value.front() == '{') continue;
-                    if (a.name == "BlurRadius") blurR = std::max(0.0f, ParseFloat32(a.value, 5.0f));
-                    else if (a.name == "ShadowDepth") depth = std::max(0.0f, ParseFloat32(a.value, 5.0f));
-                    else if (a.name == "Direction") dir = ParseFloat32(a.value, 315.0f);
-                    else if (a.name == "Opacity") op = std::clamp(ParseFloat32(a.value, 1.0f), 0.0f, 1.0f);
+                    if (a.name == "BlurRadius") blurR = std::max(0.0f, compiler_detail::ParseFloat32(a.value, 5.0f));
+                    else if (a.name == "ShadowDepth") depth = std::max(0.0f, compiler_detail::ParseFloat32(a.value, 5.0f));
+                    else if (a.name == "Direction") dir = compiler_detail::ParseFloat32(a.value, 315.0f);
+                    else if (a.name == "Opacity") op = std::clamp(compiler_detail::ParseFloat32(a.value, 1.0f), 0.0f, 1.0f);
                 }
                 UpsertPackageResource(pkg, xKey, MakeFloat4InlineFast(blurR, depth, dir, op));
             } else if (shortTag == "TintEffect") {
@@ -4882,7 +3620,7 @@ AERO_NOINLINE void HandleGraphicsEffectsShadersAndResourcesNoInline(
                 float ax = 0.0f;
                 for (const auto& a : attrs) {
                     if ((a.name == "AmountX" || a.name == "Amount") && (a.value.empty() || a.value.front() != '{')) {
-                        ax = ParseFloat32(a.value, 0.0f);
+                        ax = compiler_detail::ParseFloat32(a.value, 0.0f);
                     }
                 }
                 UpsertPackageResource(pkg, xKey, MakeFloat(ax));
@@ -4890,16 +3628,16 @@ AERO_NOINLINE void HandleGraphicsEffectsShadersAndResourcesNoInline(
                 float rad = 0.0f, ang = 0.0f, op = 1.0f;
                 for (const auto& a : attrs) {
                     if (!a.value.empty() && a.value.front() == '{') continue;
-                    if (a.name == "Radius") rad = std::max(0.0f, ParseFloat32(a.value, 0.0f));
-                    else if (a.name == "Angle") ang = ParseFloat32(a.value, 0.0f);
-                    else if (a.name == "Opacity") op = std::clamp(ParseFloat32(a.value, 1.0f), 0.0f, 1.0f);
+                    if (a.name == "Radius") rad = std::max(0.0f, compiler_detail::ParseFloat32(a.value, 0.0f));
+                    else if (a.name == "Angle") ang = compiler_detail::ParseFloat32(a.value, 0.0f);
+                    else if (a.name == "Opacity") op = std::clamp(compiler_detail::ParseFloat32(a.value, 1.0f), 0.0f, 1.0f);
                 }
                 UpsertPackageResource(pkg, xKey, MakeFloat4InlineFast(rad, -1.0f, ang, op));
             } else if (shortTag == "SaturationEffect") {
                 float sat = 1.0f;
                 for (const auto& a : attrs) {
                     if (a.name == "Saturation" && (a.value.empty() || a.value.front() != '{')) {
-                        sat = std::clamp(ParseFloat32(a.value, 1.0f), 0.0f, 4.0f);
+                        sat = std::clamp(compiler_detail::ParseFloat32(a.value, 1.0f), 0.0f, 4.0f);
                     }
                 }
                 UpsertPackageResource(pkg, xKey, MakeFloat(sat));
@@ -4910,9 +3648,9 @@ AERO_NOINLINE void HandleGraphicsEffectsShadersAndResourcesNoInline(
                 std::string_view colorAttr;
                 for (const auto& a : attrs) {
                     if (a.name == "Color") {
-                        colorAttr = Trim(a.value);
+                        colorAttr = str::Trim(a.value);
                     } else if (a.name == "Opacity") {
-                        brushOpacity = std::clamp(ParseFloat32(a.value, 1.0f), 0.0f, 1.0f);
+                        brushOpacity = std::clamp(compiler_detail::ParseFloat32(a.value, 1.0f), 0.0f, 1.0f);
                         hasOpacity = true;
                     }
                 }
@@ -4986,10 +3724,10 @@ AERO_NOINLINE void HandleGraphicsEffectsShadersAndResourcesNoInline(
                 bool hasChannelAttr = false;
                 std::uint8_t ca = 255u, cr = 0u, cg = 0u, cb = 0u;
                 for (const auto& a : attrs) {
-                    if (a.name == "A") { ca = static_cast<std::uint8_t>(std::clamp(ParseFloat32(a.value, 255.0f), 0.0f, 255.0f)); hasChannelAttr = true; }
-                    else if (a.name == "R") { cr = static_cast<std::uint8_t>(std::clamp(ParseFloat32(a.value, 0.0f), 0.0f, 255.0f)); hasChannelAttr = true; }
-                    else if (a.name == "G") { cg = static_cast<std::uint8_t>(std::clamp(ParseFloat32(a.value, 0.0f), 0.0f, 255.0f)); hasChannelAttr = true; }
-                    else if (a.name == "B") { cb = static_cast<std::uint8_t>(std::clamp(ParseFloat32(a.value, 0.0f), 0.0f, 255.0f)); hasChannelAttr = true; }
+                    if (a.name == "A") { ca = static_cast<std::uint8_t>(std::clamp(compiler_detail::ParseFloat32(a.value, 255.0f), 0.0f, 255.0f)); hasChannelAttr = true; }
+                    else if (a.name == "R") { cr = static_cast<std::uint8_t>(std::clamp(compiler_detail::ParseFloat32(a.value, 0.0f), 0.0f, 255.0f)); hasChannelAttr = true; }
+                    else if (a.name == "G") { cg = static_cast<std::uint8_t>(std::clamp(compiler_detail::ParseFloat32(a.value, 0.0f), 0.0f, 255.0f)); hasChannelAttr = true; }
+                    else if (a.name == "B") { cb = static_cast<std::uint8_t>(std::clamp(compiler_detail::ParseFloat32(a.value, 0.0f), 0.0f, 255.0f)); hasChannelAttr = true; }
                 }
                 if (hasChannelAttr) {
                     UpsertPackageResource(
@@ -5020,8 +3758,8 @@ AERO_NOINLINE void HandleGraphicsEffectsShadersAndResourcesNoInline(
                 bool assignedUri = false;
                 for (const auto& a : attrs) {
                     if ((a.name == "ImageSource" || a.name == "UriSource" || a.name == "Source") &&
-                        !Trim(a.value).empty()) {
-                        const std::string_view rawU = Trim(a.value);
+                        !str::Trim(a.value).empty()) {
+                        const std::string_view rawU = str::Trim(a.value);
                         if (rawU.front() == '{') {
                             const std::string_view refKey = ExtractMarkupResourceKey(rawU);
                             if (!refKey.empty()) {
@@ -5240,8 +3978,8 @@ AERO_NOINLINE void HandleGraphicsEffectsShadersAndResourcesNoInline(
             }
             for (const auto& a : attrs) {
                 if ((a.name == "UriSource" || a.name == "ImageSource" || a.name == "Source") &&
-                    !Trim(a.value).empty()) {
-                    const std::string_view rawU = Trim(a.value);
+                    !str::Trim(a.value).empty()) {
+                    const std::string_view rawU = str::Trim(a.value);
                     if (rawU.front() == '{') {
                         const std::string_view refKey = ExtractMarkupResourceKey(rawU);
                         if (!refKey.empty()) {
@@ -5290,12 +4028,12 @@ AERO_NOINLINE void HandleGraphicsEffectsShadersAndResourcesNoInline(
                 blockedByTemplateOrRes = true;
                 break;
             }
-            const std::string_view st = StripXmlPrefix(it->tagName);
+            const std::string_view st = str::StripNamespacePrefix(it->tagName);
             if (st == "Style" || st == "ControlTemplate" || st == "DataTemplate") {
                 blockedByTemplateOrRes = true;
                 break;
             }
-            if (EndsWith(st, ".ItemsPanel")) {
+            if (str::EndsWith(st, ".ItemsPanel")) {
                 insideItemsPanel = true;
             }
         }
@@ -5313,7 +4051,7 @@ AERO_NOINLINE void HandleGraphicsEffectsShadersAndResourcesNoInline(
             float brushAlphaMul = 1.0f;
             for (const auto& a : attrs) {
                 if (a.name == "Opacity") {
-                    brushAlphaMul = std::clamp(ParseFloat32(a.value, 1.0f), 0.0f, 1.0f);
+                    brushAlphaMul = std::clamp(compiler_detail::ParseFloat32(a.value, 1.0f), 0.0f, 1.0f);
                 }
             }
             for (const auto& a : attrs) {
@@ -5407,7 +4145,7 @@ AERO_NOINLINE void HandleGraphicsEffectsShadersAndResourcesNoInline(
             bool hadDirectUri = false;
             for (const auto& a : attrs) {
                 if ((a.name == "UriSource" || a.name == "ImageSource" || a.name == "Source") &&
-                    !Trim(a.value).empty()) {
+                    !str::Trim(a.value).empty()) {
                     hadDirectUri = true;
                     break;
                 }
@@ -5430,8 +4168,8 @@ AERO_NOINLINE void HandleGraphicsEffectsShadersAndResourcesNoInline(
                     : parentScope.targetPropId);
             for (const auto& a : attrs) {
                 if ((a.name == "UriSource" || a.name == "ImageSource" || a.name == "Source") &&
-                    !Trim(a.value).empty()) {
-                    const std::string_view rawUri = Trim(a.value);
+                    !str::Trim(a.value).empty()) {
+                    const std::string_view rawUri = str::Trim(a.value);
                     std::string_view resK{};
                     std::uint8_t resF = 0u;
                     if (TryParseResourceMarkupExtension(rawUri, resK, resF)) {
@@ -5504,17 +4242,17 @@ AERO_NOINLINE void HandleTransformChildNoInline(
     const auto& attrs = tag.attrs;
 
     auto resolveTransformResource = [&](std::string_view rawExpr, std::string_view attrName) -> const UnifiedValue* {
-        const std::string_view v = Trim(rawExpr);
+        const std::string_view v = str::Trim(rawExpr);
         if (v.size() <= 2u || v.front() != '{' || v.back() != '}') {
             return nullptr;
         }
-        const std::string_view inner = Trim(v.substr(1u, v.size() - 2u));
+        const std::string_view inner = str::Trim(v.substr(1u, v.size() - 2u));
         if (inner.rfind("StaticResource ", 0) == 0 || inner.rfind("DynamicResource ", 0) == 0) {
             std::string_view keyPart = (inner.rfind("StaticResource ", 0) == 0)
-                ? Trim(inner.substr(15u))
-                : Trim(inner.substr(16u));
+                ? str::Trim(inner.substr(15u))
+                : str::Trim(inner.substr(16u));
             if (keyPart.rfind("ResourceKey=", 0) == 0) {
-                keyPart = Trim(keyPart.substr(12u));
+                keyPart = str::Trim(keyPart.substr(12u));
             }
             if (const UnifiedValue* rv = FindLocalOrGlobalResourceHelper(ctx.pkg, keyPart)) {
                 return rv;
@@ -5538,14 +4276,14 @@ AERO_NOINLINE void HandleTransformChildNoInline(
     };
 
     auto evalFloatAttr = [&](const ParsedXmlAttr& a, float fallback, bool& outResolved) -> float {
-        const std::string_view v = Trim(a.value);
+        const std::string_view v = str::Trim(a.value);
         if (v.empty()) {
             outResolved = false;
             return fallback;
         }
         if (v.front() != '{') {
             outResolved = true;
-            return ParseFloat32(v, fallback);
+            return compiler_detail::ParseFloat32(v, fallback);
         }
         if (const UnifiedValue* rv = resolveTransformResource(v, a.name)) {
             float fv = fallback;
@@ -5555,7 +4293,7 @@ AERO_NOINLINE void HandleTransformChildNoInline(
             }
             if (const auto* sv = std::get_if<StringValue>(rv)) {
                 outResolved = true;
-                return ParseFloat32(sv->view(), fallback);
+                return compiler_detail::ParseFloat32(sv->view(), fallback);
             }
         }
         outResolved = false;
@@ -5669,7 +4407,7 @@ AERO_NOINLINE void HandleTransformChildNoInline(
         bool anyElemAttr = false;
         for (const auto& a : attrs) {
             if (a.name == "Matrix") {
-                const std::string_view mv = Trim(a.value);
+                const std::string_view mv = str::Trim(a.value);
                 if (!mv.empty() && mv.front() != '{') {
                     step = ParseXamlMatrix2DLiteral(mv);
                     parsedMatrixStr = true;
@@ -5737,7 +4475,7 @@ AERO_NOINLINE int TryHandleStyleControlTemplateKeyBindingsNoInline(
                     const std::string_view bKey = ExtractMarkupResourceKey(a.value);
                     styleStack.back().def.basedOnKey = !bKey.empty()
                         ? std::string(bKey)
-                        : std::string(Trim(a.value));
+                        : std::string(str::Trim(a.value));
                 }
             }
             if (!selfClosing) {
@@ -5755,7 +4493,7 @@ AERO_NOINLINE int TryHandleStyleControlTemplateKeyBindingsNoInline(
                 const std::string_view bKey = ExtractMarkupResourceKey(a.value);
                 styleDefPtr->basedOnKey = !bKey.empty()
                     ? std::string(bKey)
-                    : std::string(Trim(a.value));
+                    : std::string(str::Trim(a.value));
             }
         }
         if (selfClosing) {
@@ -5912,11 +4650,11 @@ AERO_NOINLINE int TryHandleStyleControlTemplateKeyBindingsNoInline(
                     if (!ct.targetTypeName.empty()) {
                         for (auto& inst : ct.templatePackage->instructions) {
                             if (inst.opcode == AxbOpcode::BindTemplateParent &&
-                                (inst.strIdx0 == kUnmappedPropId || inst.strIdx0 == PropId_Tag)) {
+                                (inst.strIdx0 == compiler_detail::kUnmappedPropId || inst.strIdx0 == PropId_Tag)) {
                                 const std::uint16_t customId = FindCustomProperty(
                                     ct.targetTypeName,
                                     ct.templatePackage->GetString(inst.strIdx1));
-                                if (customId != kUnmappedPropId) {
+                                if (customId != compiler_detail::kUnmappedPropId) {
                                     inst.strIdx0 = static_cast<std::uint32_t>(customId);
                                 }
                             }
@@ -5988,10 +4726,10 @@ AERO_NOINLINE int TryHandleStyleControlTemplateKeyBindingsNoInline(
     if (shortTag == "KeyBinding") {
         std::string kbKey, kbMods, kbCmd, kbParam;
         for (const auto& a : attrs) {
-            if (a.name == "Key") kbKey = std::string(Trim(a.value));
-            else if (a.name == "Modifiers") kbMods = std::string(Trim(a.value));
+            if (a.name == "Key") kbKey = std::string(str::Trim(a.value));
+            else if (a.name == "Modifiers") kbMods = std::string(str::Trim(a.value));
             else if (a.name == "Gesture") {
-                const std::string_view g = Trim(a.value);
+                const std::string_view g = str::Trim(a.value);
                 if (const auto plus = g.rfind('+'); plus != std::string_view::npos) {
                     kbMods = std::string(g.substr(0u, plus));
                     kbKey = std::string(g.substr(plus + 1u));
@@ -6030,9 +4768,9 @@ AERO_NOINLINE int TryHandleStyleControlTemplateKeyBindingsNoInline(
                 const auto pb = ParseBindingMarkupExpression(a.value);
                 cbCmd = pb.isValidBinding ? std::string(pb.pathPart) : DecodeXamlXmlEntities(a.value);
             } else if (a.name == "Executed") {
-                cbExec = std::string(Trim(a.value));
+                cbExec = std::string(str::Trim(a.value));
             } else if (a.name == "CanExecute") {
-                cbCanExec = std::string(Trim(a.value));
+                cbCanExec = std::string(str::Trim(a.value));
             }
         }
         if (!cbCmd.empty() && (!cbExec.empty() || !cbCanExec.empty())) {
@@ -6084,7 +4822,7 @@ AERO_NOINLINE int TryHandleTriggerAndConditionTagNoInline(
                     const std::string_view sbKey = ExtractMarkupResourceKey(a.value);
                     et.sourceName = !sbKey.empty()
                         ? std::string(sbKey)
-                        : std::string(Trim(a.value));
+                        : std::string(str::Trim(a.value));
                     rec = !et.sourceName.empty();
                 }
             }
@@ -6102,7 +4840,7 @@ AERO_NOINLINE int TryHandleTriggerAndConditionTagNoInline(
                             }
                         }
                         const std::uint16_t pid = ResolveMappedSetterPropertyId(pb.pathPart, pctOwner);
-                        if (pid != kUnmappedPropId) {
+                        if (pid != compiler_detail::kUnmappedPropId) {
                             et.sourceName = std::string(pb.elementName) + "|" + std::to_string(pid);
                             rec = true;
                         }
@@ -6119,12 +4857,12 @@ AERO_NOINLINE int TryHandleTriggerAndConditionTagNoInline(
                 } else if (a.name == "Modifiers") {
                     rawMods = a.value;
                 } else if (a.name == "ActiveOnFocus") {
-                    const std::string_view tv = Trim(a.value);
-                    et.activeOnFocus = EqualsIgnoreCase(tv, "true") || tv == "1";
+                    const std::string_view tv = str::Trim(a.value);
+                    et.activeOnFocus = str::EqualsIgnoreCase(tv, "true") || tv == "1";
                 } else if (a.name == "FiredOn") {
-                    et.firedOnKeyUp = EqualsIgnoreCase(Trim(a.value), "KeyUp");
+                    et.firedOnKeyUp = str::EqualsIgnoreCase(str::Trim(a.value), "KeyUp");
                 } else if (a.name == "SourceName") {
-                    et.sourceName = std::string(Trim(a.value));
+                    et.sourceName = std::string(str::Trim(a.value));
                 }
             }
             et.keyCode = ParseXamlKeyCode(rawKey);
@@ -6144,12 +4882,12 @@ AERO_NOINLINE int TryHandleTriggerAndConditionTagNoInline(
                         et.triggerSourceEvent = srcEv;
                     }
                 } else if (a.name == "TotalTicks") {
-                    const std::string ttStr(Trim(a.value));
+                    const std::string ttStr(str::Trim(a.value));
                     et.totalTicks = static_cast<std::int32_t>(std::strtoll(ttStr.c_str(), nullptr, 10));
                 } else if (a.name == "SourceName") {
-                    et.sourceName = std::string(Trim(a.value));
+                    et.sourceName = std::string(str::Trim(a.value));
                 } else if (a.name == "MillisecondsPerTick") {
-                    const std::string_view trimMs = Trim(a.value);
+                    const std::string_view trimMs = str::Trim(a.value);
                     AxbTriggerCondition timerCond{};
                     if (BuildDataTriggerConditionHelper(ctx, trimMs, "0", true, timerCond, trigOwnerType)) {
                         timerCond.expectedValue = value::FromString("__TimerInterval");
@@ -6161,12 +4899,12 @@ AERO_NOINLINE int TryHandleTriggerAndConditionTagNoInline(
                                 float fv = 1000.0f;
                                 if (TryGetFloat(*rv, fv)) {
                                     et.timerIntervalMs = static_cast<std::uint32_t>(
-                                        std::max<long>(1L, std::lround(static_cast<double>(fv))));
+                                        std::max<long>(1L, std::lround(fv)));
                                 }
                             }
                         }
                     } else {
-                        const float msVal = std::max(1.0f, ParseFloat32(trimMs, 1000.0f));
+                        const float msVal = std::max(1.0f, compiler_detail::ParseFloat32(trimMs, 1000.0f));
                         et.timerIntervalMs = static_cast<std::uint32_t>(std::lround(msVal));
                     }
                 }
@@ -6180,7 +4918,7 @@ AERO_NOINLINE int TryHandleTriggerAndConditionTagNoInline(
                 if (a.name == "RoutedEvent" || a.name == "EventName") {
                     et.eventKind = ParseRoutedTriggerEvent(a.value, rec);
                 } else if (a.name == "SourceName") {
-                    et.sourceName = std::string(Trim(a.value));
+                    et.sourceName = std::string(str::Trim(a.value));
                 }
             }
         }
@@ -6215,11 +4953,11 @@ AERO_NOINLINE int TryHandleTriggerAndConditionTagNoInline(
                 }
             }
             const std::uint16_t condPropId = ResolveMappedTriggerConditionId(propAttr, trigOwnerType);
-            const std::string_view trimTrigVal = Trim(valAttr);
+            const std::string_view trimTrigVal = str::Trim(valAttr);
             const bool isNullTrigVal =
                 trimTrigVal.size() > 2u && trimTrigVal.front() == '{' && trimTrigVal.back() == '}' &&
-                Trim(trimTrigVal.substr(1u, trimTrigVal.size() - 2u)).rfind("x:Null", 0) == 0;
-            if (condPropId == kUnmappedPropId || !hasValAttr) {
+                str::Trim(trimTrigVal.substr(1u, trimTrigVal.size() - 2u)).rfind("x:Null", 0) == 0;
+            if (condPropId == compiler_detail::kUnmappedPropId || !hasValAttr) {
                 unsupportedCond = true;
             } else if (isNullTrigVal) {
                 AxbTriggerCondition c{};
@@ -6305,11 +5043,11 @@ AERO_NOINLINE int TryHandleTriggerAndConditionTagNoInline(
                 }
             } else {
                 const std::uint16_t condPropId = ResolveMappedTriggerConditionId(propAttr, trigOwnerType);
-                const std::string_view trimCondVal = Trim(valAttr);
+                const std::string_view trimCondVal = str::Trim(valAttr);
                 const bool isNullCondVal =
                     trimCondVal.size() > 2u && trimCondVal.front() == '{' && trimCondVal.back() == '}' &&
-                    Trim(trimCondVal.substr(1u, trimCondVal.size() - 2u)).rfind("x:Null", 0) == 0;
-                if (condPropId == kUnmappedPropId || !hasValAttr) {
+                    str::Trim(trimCondVal.substr(1u, trimCondVal.size() - 2u)).rfind("x:Null", 0) == 0;
+                if (condPropId == compiler_detail::kUnmappedPropId || !hasValAttr) {
                     triggerStack.back().hasUnsupportedCondition = true;
                 } else if (isNullCondVal) {
                     AxbTriggerCondition c{};
@@ -6390,11 +5128,11 @@ AERO_NOINLINE int TryHandleInteractionActionTagNoInline(
     const auto& attrs = tag.attrs;
 
     if (!actionStack.empty() && shortTag.find('.') != std::string_view::npos &&
-        (EndsWith(shortTag, ".TargetObject") ||
-         EndsWith(shortTag, ".Value") ||
-         EndsWith(shortTag, ".Uri") ||
-         EndsWith(shortTag, ".Path") ||
-         EndsWith(shortTag, ".CommandParameter"))) {
+        (str::EndsWith(shortTag, ".TargetObject") ||
+         str::EndsWith(shortTag, ".Value") ||
+         str::EndsWith(shortTag, ".Uri") ||
+         str::EndsWith(shortTag, ".Path") ||
+         str::EndsWith(shortTag, ".CommandParameter"))) {
         if (!selfClosing) {
             (void)PushNonVisualScopeHelper(ctx, tagName);
         }
@@ -6433,7 +5171,7 @@ AERO_NOINLINE int TryHandleInteractionActionTagNoInline(
     act.actionName = std::string(xName);
     for (const auto& a : attrs) {
         if (a.name == "IsEnabled") {
-            act.isEnabled = !EqualsIgnoreCase(Trim(a.value), "false") && Trim(a.value) != "0";
+            act.isEnabled = !str::EqualsIgnoreCase(str::Trim(a.value), "false") && str::Trim(a.value) != "0";
         }
     }
 
@@ -6453,9 +5191,9 @@ AERO_NOINLINE int TryHandleInteractionActionTagNoInline(
         bool hasValAttr = false;
         for (const auto& a : attrs) {
             if (a.name == "TargetName") {
-                act.targetName = std::string(Trim(a.value));
+                act.targetName = std::string(str::Trim(a.value));
             } else if (a.name == "PropertyName") {
-                act.propertyName = std::string(Trim(a.value));
+                act.propertyName = std::string(str::Trim(a.value));
                 rawPropName = a.value;
             } else if (a.name == "Value") {
                 rawVal = a.value;
@@ -6478,10 +5216,10 @@ AERO_NOINLINE int TryHandleInteractionActionTagNoInline(
             applyTargetObjectAttr(rawTargetObj, ownerHint);
         }
         if (hasValAttr) {
-            const std::string_view trimRaw = Trim(rawVal);
+            const std::string_view trimRaw = str::Trim(rawVal);
             const std::string_view innerNull =
                 (trimRaw.size() > 2u && trimRaw.front() == '{' && trimRaw.back() == '}')
-                    ? Trim(trimRaw.substr(1u, trimRaw.size() - 2u))
+                    ? str::Trim(trimRaw.substr(1u, trimRaw.size() - 2u))
                     : std::string_view{};
             const ParsedBindingClause valBind = ParseBindingMarkupExpression(trimRaw);
             if (!innerNull.empty() && innerNull.rfind("x:Null", 0) == 0) {
@@ -6490,15 +5228,15 @@ AERO_NOINLINE int TryHandleInteractionActionTagNoInline(
                 act.hasValueBinding = true;
                 act.valueBinding = std::make_shared<AxbCompiledBindingChain>(
                     BuildCompiledBindingChainHelper(pkg, valBind, act.propId, false, ownerHint));
-            } else if (act.propId != kUnmappedPropId) {
+            } else if (act.propId != compiler_detail::kUnmappedPropId) {
                 bool ok = false;
                 act.value = ParseStyleOrAnimationValueHelper(ctx, act.propId, rawVal, ok);
                 if (!ok) {
                     act.value = value::FromString(DecodeXamlXmlEntities(rawVal));
                 }
-            } else if (EqualsIgnoreCase(act.propertyName, "IsEnabled")) {
+            } else if (str::EqualsIgnoreCase(act.propertyName, "IsEnabled")) {
                 act.propId = PropId_IsEnabled;
-                act.value = !EqualsIgnoreCase(Trim(rawVal), "false") && Trim(rawVal) != "0";
+                act.value = !str::EqualsIgnoreCase(str::Trim(rawVal), "false") && str::Trim(rawVal) != "0";
             } else {
                 act.value = value::FromString(DecodeXamlXmlEntities(rawVal));
             }
@@ -6510,7 +5248,7 @@ AERO_NOINLINE int TryHandleInteractionActionTagNoInline(
                 const std::string_view sbKey = ExtractMarkupResourceKey(a.value);
                 act.storyboardKey = !sbKey.empty()
                     ? std::string(sbKey)
-                    : std::string(Trim(a.value));
+                    : std::string(str::Trim(a.value));
                 if (!act.storyboardKey.empty()) {
                     if (const AxbStoryboard* foundSb = FindLocalOrGlobalStoryboardHelper(pkg, act.storyboardKey)) {
                         act.inlineStoryboard = *foundSb;
@@ -6527,11 +5265,11 @@ AERO_NOINLINE int TryHandleInteractionActionTagNoInline(
                 const ParsedBindingClause cmdParsed = ParseBindingMarkupExpression(a.value);
                 const std::string_view cmdPath = cmdParsed.isValidBinding
                     ? cmdParsed.pathPart
-                    : Trim(a.value);
+                    : str::Trim(a.value);
                 act.commandPath = std::string(cmdPath);
                 SplitPathIntoHopsHelper(cmdPath, act.commandHops);
             } else if (a.name == "CommandParameter") {
-                const std::string_view cpTrim = Trim(a.value);
+                const std::string_view cpTrim = str::Trim(a.value);
                 const ParsedBindingClause cpBind = ParseBindingMarkupExpression(cpTrim);
                 if (cpBind.isValidBinding) {
                     act.hasCommandParameterBinding = true;
@@ -6556,7 +5294,7 @@ AERO_NOINLINE int TryHandleInteractionActionTagNoInline(
         act.kind = InteractionActionKind::RemoveElement;
         for (const auto& a : attrs) {
             if (a.name == "TargetName") {
-                act.targetName = std::string(Trim(a.value));
+                act.targetName = std::string(str::Trim(a.value));
             } else if (a.name == "TargetObject") {
                 applyTargetObjectAttr(a.value, styleOwnerHint);
             }
@@ -6565,7 +5303,7 @@ AERO_NOINLINE int TryHandleInteractionActionTagNoInline(
         act.kind = InteractionActionKind::InvokeCommand;
         for (const auto& a : attrs) {
             if (a.name == "DestinationId") {
-                act.commandPath = "__NavigateTo:" + std::string(Trim(a.value));
+                act.commandPath = "__NavigateTo:" + std::string(str::Trim(a.value));
             }
         }
     } else if (shortTag == "NavigateBackAction") {
@@ -6575,9 +5313,9 @@ AERO_NOINLINE int TryHandleInteractionActionTagNoInline(
         act.kind = InteractionActionKind::PlaySound;
         for (const auto& a : attrs) {
             if (a.name == "Source") {
-                act.soundSource = DecodeXamlXmlEntities(Trim(a.value));
+                act.soundSource = DecodeXamlXmlEntities(str::Trim(a.value));
             } else if (a.name == "Volume") {
-                act.volume = ParseFloat32(a.value, 1.0f);
+                act.volume = compiler_detail::ParseFloat32(a.value, 1.0f);
             }
         }
     } else if (shortTag == "GoToStateAction") {
@@ -6585,12 +5323,12 @@ AERO_NOINLINE int TryHandleInteractionActionTagNoInline(
         act.volume = 1.0f;
         for (const auto& a : attrs) {
             if (a.name == "StateName") {
-                act.storyboardKey = DecodeXamlXmlEntities(Trim(a.value));
+                act.storyboardKey = DecodeXamlXmlEntities(str::Trim(a.value));
             } else if (a.name == "UseTransitions") {
-                const std::string_view ut = Trim(a.value);
-                act.volume = (!EqualsIgnoreCase(ut, "false") && ut != "0") ? 1.0f : 0.0f;
+                const std::string_view ut = str::Trim(a.value);
+                act.volume = (!str::EqualsIgnoreCase(ut, "false") && ut != "0") ? 1.0f : 0.0f;
             } else if (a.name == "TargetName") {
-                act.targetName = std::string(Trim(a.value));
+                act.targetName = std::string(str::Trim(a.value));
             } else if (a.name == "TargetObject") {
                 applyTargetObjectAttr(a.value, styleOwnerHint);
             }
@@ -6599,7 +5337,7 @@ AERO_NOINLINE int TryHandleInteractionActionTagNoInline(
         act.kind = InteractionActionKind::LaunchUri;
         for (const auto& a : attrs) {
             if (a.name == "Path" || a.name == "Uri" || a.name == "Source") {
-                const std::string_view trimU = Trim(a.value);
+                const std::string_view trimU = str::Trim(a.value);
                 const ParsedBindingClause ub = ParseBindingMarkupExpression(trimU);
                 if (ub.isValidBinding) {
                     act.hasValueBinding = true;
@@ -6621,7 +5359,7 @@ AERO_NOINLINE int TryHandleInteractionActionTagNoInline(
 
         for (const auto& a : attrs) {
             if (a.name == "TargetName") {
-                act.targetName = std::string(Trim(a.value));
+                act.targetName = std::string(str::Trim(a.value));
             } else if (a.name == "TargetObject") {
                 applyTargetObjectAttr(a.value, styleOwnerHint);
             }
@@ -6657,7 +5395,7 @@ AERO_NOINLINE int TryHandleBindingAndMultiBindingTagNoInline(
 
     if (!actionStack.empty() &&
         actionStack.back().action.kind == InteractionActionKind::ChangeProperty &&
-        actionStack.back().action.propId != kUnmappedPropId &&
+        actionStack.back().action.propId != compiler_detail::kUnmappedPropId &&
         (shortTag == "SolidColorBrush" || shortTag == "GradientStop")) {
         for (const auto& a : attrs) {
             if (a.name == "Color" && (a.value.empty() || a.value.front() != '{')) {
@@ -6677,7 +5415,7 @@ AERO_NOINLINE int TryHandleBindingAndMultiBindingTagNoInline(
         if (isNested) {
             mb.targetPropertyId = 0u;
         } else if (insideAction) {
-            mb.targetPropertyId = (actionStack.back().action.propId != kUnmappedPropId)
+            mb.targetPropertyId = (actionStack.back().action.propId != compiler_detail::kUnmappedPropId)
                 ? actionStack.back().action.propId
                 : 0u;
             mbsPtr->attachToActionValue = true;
@@ -6686,20 +5424,20 @@ AERO_NOINLINE int TryHandleBindingAndMultiBindingTagNoInline(
         }
         for (const auto& a : attrs) {
             if (a.name == "Mode") {
-                const std::string_view mStr = Trim(a.value);
+                const std::string_view mStr = str::Trim(a.value);
                 if (mStr == "TwoWay") mb.mode = BindingMode::TwoWay;
                 else if (mStr == "OneTime") mb.mode = BindingMode::OneTime;
             } else if (a.name == "StringFormat") {
                 mb.stringFormat = NormalizeXamlFormatOrExpr(a.value);
             } else if (a.name == "Converter") {
                 const std::string_view convKey = ExtractMarkupResourceKey(a.value);
-                const std::string_view effKey = !convKey.empty() ? convKey : Trim(a.value);
+                const std::string_view effKey = !convKey.empty() ? convKey : str::Trim(a.value);
                 mb.converter = ParseValueConverterKind(effKey);
                 mb.converterKey = std::string(effKey);
             } else if (a.name == "ConverterParameter") {
                 mb.converterParameter = NormalizeXamlFormatOrExpr(a.value);
-            } else if (a.name == "FallbackValue" && mb.targetPropertyId != 0u && mb.targetPropertyId != kUnmappedPropId) {
-                mb.fallbackValue = AeroCompiler::ParseLiteralPropertyValue(mb.targetPropertyId, Trim(a.value));
+            } else if (a.name == "FallbackValue" && mb.targetPropertyId != 0u && mb.targetPropertyId != compiler_detail::kUnmappedPropId) {
+                mb.fallbackValue = AeroCompiler::ParseLiteralPropertyValue(mb.targetPropertyId, str::Trim(a.value));
             }
         }
         if (!selfClosing) {
@@ -6716,9 +5454,9 @@ AERO_NOINLINE int TryHandleBindingAndMultiBindingTagNoInline(
             (bindingElemStack.empty() || multiBindingStack.back().scopeDepth > bindingElemStack.back().scopeDepth);
         const bool insideAction = !insideMulti && !actionStack.empty() &&
             (styleStack.empty() || actionStack.back().scopeDepth > styleStack.back().scopeDepth);
-        const std::string_view parentShort = StripXmlPrefix(parentScope.tagName);
-        const bool actTargetObj = insideAction && EndsWith(parentShort, ".TargetObject");
-        const bool actCmdParam = insideAction && EndsWith(parentShort, ".CommandParameter");
+        const std::string_view parentShort = str::StripNamespacePrefix(parentScope.tagName);
+        const bool actTargetObj = insideAction && str::EndsWith(parentShort, ".TargetObject");
+        const bool actCmdParam = insideAction && str::EndsWith(parentShort, ".CommandParameter");
         const bool actVal = insideAction && !actTargetObj && !actCmdParam;
 
         auto besPtr = std::make_unique<ActiveBindingElemScope>();
@@ -6739,24 +5477,24 @@ AERO_NOINLINE int TryHandleBindingAndMultiBindingTagNoInline(
         std::string_view tnRaw{};
         for (const auto& a : attrs) {
             if (a.name == "Path") {
-                std::string_view pp = Trim(a.value);
+                std::string_view pp = str::Trim(a.value);
                 bool isAttachedParen = false;
                 if (pp.size() > 2u && pp.front() == '(' && pp.back() == ')') {
-                    pp = Trim(pp.substr(1u, pp.size() - 2u));
+                    pp = str::Trim(pp.substr(1u, pp.size() - 2u));
                     isAttachedParen = true;
                 }
                 ch.rawPath = std::string(pp);
                 SplitPathIntoHopsHelper(pp, ch.hops, isAttachedParen);
             } else if (a.name == "Mode") {
-                const std::string_view mStr = Trim(a.value);
+                const std::string_view mStr = str::Trim(a.value);
                 if (mStr == "TwoWay") ch.mode = BindingMode::TwoWay;
                 else if (mStr == "OneTime") ch.mode = BindingMode::OneTime;
             } else if (a.name == "ElementName") {
-                ch.elementName = std::string(Trim(a.value));
+                ch.elementName = std::string(str::Trim(a.value));
             } else if (a.name == "RelativeSource") {
-                std::string_view rsExpr = Trim(a.value);
+                std::string_view rsExpr = str::Trim(a.value);
                 if (rsExpr.size() > 2u && rsExpr.front() == '{' && rsExpr.back() == '}') {
-                    rsExpr = Trim(rsExpr.substr(1u, rsExpr.size() - 2u));
+                    rsExpr = str::Trim(rsExpr.substr(1u, rsExpr.size() - 2u));
                 }
                 if (rsExpr.find("TemplatedParent") != std::string_view::npos) {
                     ch.relativeAncestorType = "$TemplatedParent";
@@ -6764,7 +5502,7 @@ AERO_NOINLINE int TryHandleBindingAndMultiBindingTagNoInline(
                 } else if (rsExpr.find("Self") != std::string_view::npos) {
                     ch.relativeSelf = true;
                 } else if (const auto ancPos = rsExpr.find("AncestorType="); ancPos != std::string_view::npos) {
-                    std::string_view ancVal = Trim(rsExpr.substr(ancPos + 13u));
+                    std::string_view ancVal = str::Trim(rsExpr.substr(ancPos + 13u));
                     int bd = 0;
                     std::size_t ae = 0u;
                     while (ae < ancVal.size()) {
@@ -6777,7 +5515,7 @@ AERO_NOINLINE int TryHandleBindingAndMultiBindingTagNoInline(
                 }
             } else if (a.name == "Converter") {
                 const std::string_view convKey = ExtractMarkupResourceKey(a.value);
-                const std::string_view effKey = !convKey.empty() ? convKey : Trim(a.value);
+                const std::string_view effKey = !convKey.empty() ? convKey : str::Trim(a.value);
                 ch.converter = ParseValueConverterKind(effKey);
                 ch.converterKey = std::string(effKey);
             } else if (a.name == "ConverterParameter") {
@@ -6785,15 +5523,15 @@ AERO_NOINLINE int TryHandleBindingAndMultiBindingTagNoInline(
             } else if (a.name == "StringFormat") {
                 ch.stringFormat = NormalizeXamlFormatOrExpr(a.value);
             } else if (a.name == "FallbackValue") {
-                fbRaw = Trim(a.value);
+                fbRaw = str::Trim(a.value);
             } else if (a.name == "TargetNullValue") {
                 hasTnRaw = true;
-                tnRaw = Trim(a.value);
+                tnRaw = str::Trim(a.value);
             }
         }
         (void)ownerHint;
         if (!fbRaw.empty()) {
-            if (ch.targetPropertyId != 0u && ch.targetPropertyId != kUnmappedPropId) {
+            if (ch.targetPropertyId != 0u && ch.targetPropertyId != compiler_detail::kUnmappedPropId) {
                 ch.fallbackValue = AeroCompiler::ParseLiteralPropertyValue(ch.targetPropertyId, fbRaw);
             } else {
                 ch.fallbackValue = value::FromString(DecodeXamlXmlEntities(fbRaw));
@@ -6802,7 +5540,7 @@ AERO_NOINLINE int TryHandleBindingAndMultiBindingTagNoInline(
         if (hasTnRaw) {
             if (tnRaw.empty()) {
                 ch.targetNullValue = value::FromString("");
-            } else if (ch.targetPropertyId != 0u && ch.targetPropertyId != kUnmappedPropId) {
+            } else if (ch.targetPropertyId != 0u && ch.targetPropertyId != compiler_detail::kUnmappedPropId) {
                 ch.targetNullValue = AeroCompiler::ParseLiteralPropertyValue(ch.targetPropertyId, tnRaw);
             } else {
                 ch.targetNullValue = value::FromString(DecodeXamlXmlEntities(tnRaw));
@@ -6889,11 +5627,11 @@ AERO_NOINLINE int TryHandleVsmStoryboardAndSetterTagNoInline(
     const bool selfClosing = tag.selfClosing;
     const auto& attrs = tag.attrs;
 
-    if ((EndsWith(shortTag, ".EnterActions") || EndsWith(shortTag, ".ExitActions")) &&
+    if ((str::EndsWith(shortTag, ".EnterActions") || str::EndsWith(shortTag, ".ExitActions")) &&
         !triggerStack.empty()) {
         if (!selfClosing) {
             const std::size_t depth = PushNonVisualScopeHelper(ctx, tagName);
-            if (EndsWith(shortTag, ".EnterActions")) {
+            if (str::EndsWith(shortTag, ".EnterActions")) {
                 triggerStack.back().enterActionsDepth = depth;
             } else {
                 triggerStack.back().exitActionsDepth = depth;
@@ -6950,8 +5688,8 @@ AERO_NOINLINE int TryHandleVsmStoryboardAndSetterTagNoInline(
         std::string_view fromState;
         std::string_view toState;
         for (const auto& a : attrs) {
-            if (a.name == "From") fromState = Trim(a.value);
-            else if (a.name == "To") toState = Trim(a.value);
+            if (a.name == "From") fromState = str::Trim(a.value);
+            else if (a.name == "To") toState = str::Trim(a.value);
             else if (a.name == "GeneratedDuration") {
                 const float dur = ParseXamlTimeSpanSeconds(a.value, 0.0f);
                 if ((fromState.empty() && toState.empty()) ||
@@ -6999,9 +5737,9 @@ AERO_NOINLINE int TryHandleVsmStoryboardAndSetterTagNoInline(
         sbsPtr->sb.key = std::string(xKey);
         for (const auto& a : attrs) {
             if (a.name == "Storyboard.TargetName" || a.name == "TargetName") {
-                sbsPtr->defaultTargetName = std::string(Trim(a.value));
+                sbsPtr->defaultTargetName = std::string(str::Trim(a.value));
             } else if (a.name == "Storyboard.TargetProperty" || a.name == "TargetProperty") {
-                sbsPtr->defaultTargetProperty = std::string(Trim(a.value));
+                sbsPtr->defaultTargetProperty = std::string(str::Trim(a.value));
             }
         }
 
@@ -7021,7 +5759,7 @@ AERO_NOINLINE int TryHandleVsmStoryboardAndSetterTagNoInline(
     if (shortTag == "StaticResource" && !storyboardStack.empty()) {
         for (const auto& a : attrs) {
             if (a.name == "ResourceKey") {
-                const std::string_view refKey = Trim(a.value);
+                const std::string_view refKey = str::Trim(a.value);
                 if (const AxbStoryboard* refSb = FindLocalOrGlobalStoryboardHelper(pkg, refKey)) {
                     for (const auto& refTl : refSb->timelines) {
                         storyboardStack.back().sb.timelines.push_back(refTl);
@@ -7055,9 +5793,9 @@ AERO_NOINLINE int TryHandleVsmStoryboardAndSetterTagNoInline(
 
         for (const auto& a : attrs) {
             if (a.name == "Storyboard.TargetName" || a.name == "TargetName") {
-                tl.targetName = std::string(Trim(a.value));
+                tl.targetName = std::string(str::Trim(a.value));
             } else if (a.name == "Storyboard.TargetProperty" || a.name == "TargetProperty") {
-                rawTargetProp = std::string(Trim(a.value));
+                rawTargetProp = std::string(str::Trim(a.value));
             } else if (a.name == "BeginTime") {
                 tl.beginTimeSeconds = ParseXamlTimeSpanSeconds(a.value, 0.0f);
             } else if (a.name == "Duration") {
@@ -7072,19 +5810,19 @@ AERO_NOINLINE int TryHandleVsmStoryboardAndSetterTagNoInline(
                 rawBy = a.value;
                 hasByAttr = true;
             } else if (a.name == "AutoReverse") {
-                tl.autoReverse = EqualsIgnoreCase(Trim(a.value), "true") || Trim(a.value) == "1";
+                tl.autoReverse = str::EqualsIgnoreCase(str::Trim(a.value), "true") || str::Trim(a.value) == "1";
             } else if (a.name == "RepeatBehavior") {
                 tl.repeatCount = ParseRepeatCountAttr(a.value);
             } else if (a.name == "FillBehavior") {
-                tl.fillBehavior = EqualsIgnoreCase(Trim(a.value), "Stop")
+                tl.fillBehavior = str::EqualsIgnoreCase(str::Trim(a.value), "Stop")
                     ? FillBehavior::Stop
                     : FillBehavior::HoldEnd;
             } else if (a.name == "SpeedRatio") {
-                tl.speedRatio = std::max(0.01f, ParseFloat32(a.value, 1.0f));
+                tl.speedRatio = std::max(0.01f, compiler_detail::ParseFloat32(a.value, 1.0f));
             } else if (a.name == "AccelerationRatio") {
-                tl.accelerationRatio = std::clamp(ParseFloat32(a.value, 0.0f), 0.0f, 1.0f);
+                tl.accelerationRatio = std::clamp(compiler_detail::ParseFloat32(a.value, 0.0f), 0.0f, 1.0f);
             } else if (a.name == "DecelerationRatio") {
-                tl.decelerationRatio = std::clamp(ParseFloat32(a.value, 0.0f), 0.0f, 1.0f);
+                tl.decelerationRatio = std::clamp(compiler_detail::ParseFloat32(a.value, 0.0f), 0.0f, 1.0f);
             } else if (customSpec != nullptr && customSpec->parseAttr != nullptr) {
                 customSpec->parseAttr(a.name, a.value, tl.customAnim);
             }
@@ -7103,7 +5841,7 @@ AERO_NOINLINE int TryHandleVsmStoryboardAndSetterTagNoInline(
                 : t_activeTemplateTargetTypeHint;
         }
         tl.targetPropertyId = ResolveMappedAnimationPropertyId(rawTargetProp, targetOwnerType);
-        if (tl.targetPropertyId != kUnmappedPropId) {
+        if (tl.targetPropertyId != compiler_detail::kUnmappedPropId) {
             if (hasFromAttr) {
                 bool ok = false;
                 tl.fromValue = ParseStyleOrAnimationValueHelper(ctx, tl.targetPropertyId, rawFrom, ok);
@@ -7123,7 +5861,7 @@ AERO_NOINLINE int TryHandleVsmStoryboardAndSetterTagNoInline(
         }
 
         if (selfClosing) {
-            if (tl.targetPropertyId != kUnmappedPropId) {
+            if (tl.targetPropertyId != compiler_detail::kUnmappedPropId) {
                 storyboardStack.back().sb.timelines.push_back(std::move(tl));
             }
         } else {
@@ -7139,8 +5877,8 @@ AERO_NOINLINE int TryHandleVsmStoryboardAndSetterTagNoInline(
         auto& kf = kfsPtr->kf;
         kf.isDiscrete =
             (shortTag.rfind("Discrete", 0) == 0) ||
-            EndsWith(shortTag, "BooleanKeyFrame") ||
-            EndsWith(shortTag, "ObjectKeyFrame");
+            str::EndsWith(shortTag, "BooleanKeyFrame") ||
+            str::EndsWith(shortTag, "ObjectKeyFrame");
         if (shortTag.rfind("Spline", 0) == 0) {
             kf.easingKind = EasingFunctionKind::Cubic;
             kf.easingMode = EasingMode::EaseInOut;
@@ -7164,8 +5902,8 @@ AERO_NOINLINE int TryHandleVsmStoryboardAndSetterTagNoInline(
                     kf.splineX2 = std::clamp(sx2, 0.0f, 1.0f);
                     kf.splineY2 = sy2;
                 }
-            } else if (a.name == "Value" && targetPropId != kUnmappedPropId) {
-                const std::string_view trimVal = Trim(a.value);
+            } else if (a.name == "Value" && targetPropId != compiler_detail::kUnmappedPropId) {
+                const std::string_view trimVal = str::Trim(a.value);
                 const ParsedBindingClause bm = ParseBindingMarkupExpression(trimVal);
                 if (bm.isValidBinding && !bm.elementName.empty() && !bm.pathPart.empty() && bm.pathPart != ".") {
                     kf.bindingElementName = std::string(bm.elementName);
@@ -7175,7 +5913,7 @@ AERO_NOINLINE int TryHandleVsmStoryboardAndSetterTagNoInline(
                         bindOwner = it->second;
                     }
                     const std::uint16_t bp = ResolveMappedSetterPropertyId(bm.pathPart, bindOwner);
-                    kf.bindingPropId = (bp != kUnmappedPropId) ? bp : 0u;
+                    kf.bindingPropId = (bp != compiler_detail::kUnmappedPropId) ? bp : 0u;
                 } else {
                     bool ok = false;
                     UnifiedValue parsed = ParseStyleOrAnimationValueHelper(ctx, targetPropId, a.value, ok);
@@ -7206,7 +5944,7 @@ AERO_NOINLINE int TryHandleVsmStoryboardAndSetterTagNoInline(
             ek = EasingFunctionKind::Quadratic;
             for (const auto& a : attrs) {
                 if (a.name == "Power") {
-                    const int p = static_cast<int>(std::lround(ParseFloat32(a.value, 2.0f)));
+                    const int p = static_cast<int>(std::lround(compiler_detail::ParseFloat32(a.value, 2.0f)));
                     if (p <= 1) ek = EasingFunctionKind::Linear;
                     else if (p == 2) ek = EasingFunctionKind::Quadratic;
                     else if (p == 3) ek = EasingFunctionKind::Cubic;
@@ -7217,7 +5955,7 @@ AERO_NOINLINE int TryHandleVsmStoryboardAndSetterTagNoInline(
         } else if (shortTag == "ExponentialEase") {
             for (const auto& a : attrs) {
                 if (a.name == "Exponent") {
-                    easeExponent = ParseFloat32(a.value, 2.0f);
+                    easeExponent = compiler_detail::ParseFloat32(a.value, 2.0f);
                     hasEaseExponent = true;
                 }
             }
@@ -7259,7 +5997,7 @@ AERO_NOINLINE int TryHandleVsmStoryboardAndSetterTagNoInline(
 
         auto ssPtr = std::make_unique<ActiveSetterScope>();
         auto& setter = ssPtr->setter;
-        setter.propId = kUnmappedPropId;
+        setter.propId = compiler_detail::kUnmappedPropId;
         std::string_view rawPropAttr;
         std::string_view rawVal;
         bool hasValAttr = false;
@@ -7267,7 +6005,7 @@ AERO_NOINLINE int TryHandleVsmStoryboardAndSetterTagNoInline(
             if (a.name == "Property") {
                 rawPropAttr = a.value;
             } else if (a.name == "TargetName") {
-                setter.targetName = std::string(Trim(a.value));
+                setter.targetName = std::string(str::Trim(a.value));
             } else if (a.name == "Value") {
                 rawVal = a.value;
                 hasValAttr = true;
@@ -7284,9 +6022,9 @@ AERO_NOINLINE int TryHandleVsmStoryboardAndSetterTagNoInline(
             }
         }
         if (!rawPropAttr.empty()) {
-            const std::string_view pTrim = Trim(rawPropAttr);
+            const std::string_view pTrim = str::Trim(rawPropAttr);
             if (pTrim == "Color" && !styleStack.empty() &&
-                StripXmlPrefix(styleStack.back().def.targetTypeName) == "BoxShadow") {
+                str::StripNamespacePrefix(styleStack.back().def.targetTypeName) == "BoxShadow") {
                 setter.propId = PropId_EffectColor;
             } else {
                 setter.propId = ResolveMappedSetterPropertyId(rawPropAttr, setterOwnerHint);
@@ -7294,7 +6032,7 @@ AERO_NOINLINE int TryHandleVsmStoryboardAndSetterTagNoInline(
         }
 
         bool hasValidVal = false;
-        if (setter.propId != kUnmappedPropId && hasValAttr) {
+        if (setter.propId != compiler_detail::kUnmappedPropId && hasValAttr) {
             const ParsedBindingClause setterBind = ParseBindingMarkupExpression(rawVal);
             if (setterBind.isValidBinding && owner == SetterOwnerKind::Style) {
                 setter.hasBinding = true;
@@ -7302,10 +6040,10 @@ AERO_NOINLINE int TryHandleVsmStoryboardAndSetterTagNoInline(
                     BuildCompiledBindingChainHelper(pkg, setterBind, setter.propId, false, setterOwnerHint));
                 hasValidVal = true;
             } else {
-                const std::string_view trimSetVal = Trim(rawVal);
+                const std::string_view trimSetVal = str::Trim(rawVal);
                 if (setter.propId == PropId_IsChecked &&
                     trimSetVal.size() > 2u && trimSetVal.front() == '{' && trimSetVal.back() == '}' &&
-                    Trim(trimSetVal.substr(1u, trimSetVal.size() - 2u)).rfind("x:Null", 0) == 0) {
+                    str::Trim(trimSetVal.substr(1u, trimSetVal.size() - 2u)).rfind("x:Null", 0) == 0) {
                     setter.value = UnifiedValue{NullObject{}};
                     hasValidVal = true;
                 } else {
@@ -7348,7 +6086,7 @@ AERO_NOINLINE int HandleTopLevelAndInlinePropertyElementsNoInline(
         ctx.seenRoot = true;
         pkg.rootTypeName = "ResourceDictionary";
         for (const auto& a : attrs) {
-            if (a.name == "Source" && !Trim(a.value).empty()) {
+            if (a.name == "Source" && !str::Trim(a.value).empty()) {
                 CompileAndMergeExternalDictionaryNoInline(ctx, DecodeXamlXmlEntities(a.value));
                 break;
             }
@@ -7387,9 +6125,9 @@ AERO_NOINLINE int HandleTopLevelAndInlinePropertyElementsNoInline(
             ActiveStyleScope ctTrigStyle{};
             ctTrigStyle.def.key = state.ctRootTriggersStyleKey;
             ctTrigStyle.def.targetTypeName = !t_activeTemplateTargetTypeHint.empty()
-                ? std::string(StripXmlPrefix(t_activeTemplateTargetTypeHint))
+                ? std::string(str::StripNamespacePrefix(t_activeTemplateTargetTypeHint))
                 : (!pkg.rootTypeName.empty()
-                    ? std::string(StripXmlPrefix(pkg.rootTypeName))
+                    ? std::string(str::StripNamespacePrefix(pkg.rootTypeName))
                     : std::string("UIElement"));
             ctTrigStyle.controlTemplateTriggersDepth = depth;
             ctTrigStyle.scopeDepth = depth;
@@ -7414,7 +6152,7 @@ AERO_NOINLINE int HandleTopLevelAndInlinePropertyElementsNoInline(
             ActiveStyleScope dtTrigStyle{};
             dtTrigStyle.def.key = state.dtRootTriggersStyleKey;
             dtTrigStyle.def.targetTypeName = !pkg.rootTypeName.empty()
-                ? std::string(StripXmlPrefix(pkg.rootTypeName))
+                ? std::string(str::StripNamespacePrefix(pkg.rootTypeName))
                 : std::string("UIElement");
             dtTrigStyle.controlTemplateTriggersDepth = depth;
             dtTrigStyle.scopeDepth = depth;
@@ -7425,8 +6163,8 @@ AERO_NOINLINE int HandleTopLevelAndInlinePropertyElementsNoInline(
 
     // Element-level <VisualStateManager.VisualStateGroups>, <Element.Style>, or <Element.Triggers>!
     if ((shortTag == "VisualStateManager.VisualStateGroups" ||
-         EndsWith(shortTag, ".Style") ||
-         EndsWith(shortTag, ".Triggers")) &&
+         str::EndsWith(shortTag, ".Style") ||
+         str::EndsWith(shortTag, ".Triggers")) &&
         !scopeStack.empty()) {
         if (!selfClosing) {
             XmlScopeEntry& ownerElemScope = scopeStack.back();
@@ -7444,7 +6182,7 @@ AERO_NOINLINE int HandleTopLevelAndInlinePropertyElementsNoInline(
                 pkg.instructions.push_back(std::move(styleRefInst));
             }
             const std::string synthKey = ownerElemScope.inlineStyleKey;
-            const std::string ownerType = std::string(StripXmlPrefix(ownerElemScope.tagName));
+            const std::string ownerType = std::string(str::StripNamespacePrefix(ownerElemScope.tagName));
             const std::string ownerBasedOnKey = ownerElemScope.resourceKey;
             const std::size_t depth = PushNonVisualScopeHelper(ctx, tagName);
             ActiveStyleScope synthStyle{};
@@ -7452,7 +6190,7 @@ AERO_NOINLINE int HandleTopLevelAndInlinePropertyElementsNoInline(
             synthStyle.def.targetTypeName = ownerType;
             synthStyle.def.basedOnKey = ownerBasedOnKey;
             synthStyle.scopeDepth = depth;
-            synthStyle.isInlinePropertyElement = EndsWith(shortTag, ".Style");
+            synthStyle.isInlinePropertyElement = str::EndsWith(shortTag, ".Style");
             if (shortTag == "Interaction.Triggers") {
                 synthStyle.interactionTriggersDepth = depth;
             }
@@ -7462,18 +6200,18 @@ AERO_NOINLINE int HandleTopLevelAndInlinePropertyElementsNoInline(
     }
 
     // Inline <*.ItemTemplate>, <*.ContentTemplate>, or <*.HeaderTemplate>
-    if ((EndsWith(shortTag, ".ItemTemplate") ||
-         EndsWith(shortTag, ".ContentTemplate") ||
-         EndsWith(shortTag, ".HeaderTemplate")) &&
+    if ((str::EndsWith(shortTag, ".ItemTemplate") ||
+         str::EndsWith(shortTag, ".ContentTemplate") ||
+         str::EndsWith(shortTag, ".HeaderTemplate")) &&
         !scopeStack.empty()) {
         if (!selfClosing) {
             XmlScopeEntry itScope{};
             itScope.kind = XmlScopeKind::NonVisualSkip;
             itScope.tagName = std::string(tagName);
             itScope.isItemTemplateContainer = true;
-            itScope.targetPropId = EndsWith(shortTag, ".ContentTemplate")
+            itScope.targetPropId = str::EndsWith(shortTag, ".ContentTemplate")
                 ? static_cast<std::uint16_t>(PropId_ContentTemplate)
-                : (EndsWith(shortTag, ".HeaderTemplate")
+                : (str::EndsWith(shortTag, ".HeaderTemplate")
                        ? static_cast<std::uint16_t>(PropId_HeaderTemplate)
                        : static_cast<std::uint16_t>(PropId_ItemTemplate));
             scopeStack.push_back(std::move(itScope));
@@ -7483,7 +6221,7 @@ AERO_NOINLINE int HandleTopLevelAndInlinePropertyElementsNoInline(
     }
 
     // Inline <ItemsControl.ItemsPanel><ItemsPanelTemplate>...</ItemsPanelTemplate></ItemsControl.ItemsPanel>
-    if (EndsWith(shortTag, ".ItemsPanel") && !scopeStack.empty()) {
+    if (str::EndsWith(shortTag, ".ItemsPanel") && !scopeStack.empty()) {
         if (!selfClosing) {
             XmlScopeEntry ipScope{};
             ipScope.kind = XmlScopeKind::NonVisualSkip;
@@ -7496,7 +6234,7 @@ AERO_NOINLINE int HandleTopLevelAndInlinePropertyElementsNoInline(
     }
 
     // Inline <ListView.View><GridView>...</GridView></ListView.View>
-    if (EndsWith(shortTag, ".View") && !scopeStack.empty()) {
+    if (str::EndsWith(shortTag, ".View") && !scopeStack.empty()) {
         if (!selfClosing) {
             XmlScopeEntry vwScope{};
             vwScope.kind = XmlScopeKind::NonVisualSkip;
@@ -7509,7 +6247,7 @@ AERO_NOINLINE int HandleTopLevelAndInlinePropertyElementsNoInline(
     }
 
     // Inline <Element.ContextMenu><ContextMenu>...</ContextMenu></Element.ContextMenu>
-    if (EndsWith(shortTag, ".ContextMenu") && !scopeStack.empty()) {
+    if (str::EndsWith(shortTag, ".ContextMenu") && !scopeStack.empty()) {
         if (!selfClosing) {
             XmlScopeEntry cmScope{};
             cmScope.kind = XmlScopeKind::NonVisualSkip;
@@ -7522,7 +6260,7 @@ AERO_NOINLINE int HandleTopLevelAndInlinePropertyElementsNoInline(
     }
 
     // Inline <Control.Template><ControlTemplate>...</ControlTemplate></Control.Template>
-    if (EndsWith(shortTag, ".Template") && !scopeStack.empty()) {
+    if (str::EndsWith(shortTag, ".Template") && !scopeStack.empty()) {
         if (!selfClosing) {
             XmlScopeEntry ctScope{};
             ctScope.kind = XmlScopeKind::NonVisualSkip;
@@ -7536,22 +6274,22 @@ AERO_NOINLINE int HandleTopLevelAndInlinePropertyElementsNoInline(
 
     // Property-element tags (<Type.Property>)
     if (shortTag == "Grid.RowDefinitions" || shortTag == "Grid.ColumnDefinitions" ||
-        EndsWith(shortTag, ".Header") ||
-        EndsWith(shortTag, ".Content") ||
-        EndsWith(shortTag, ".ToolTip") ||
-        EndsWith(shortTag, ".Icon") ||
-        EndsWith(shortTag, ".Data")) {
+        str::EndsWith(shortTag, ".Header") ||
+        str::EndsWith(shortTag, ".Content") ||
+        str::EndsWith(shortTag, ".ToolTip") ||
+        str::EndsWith(shortTag, ".Icon") ||
+        str::EndsWith(shortTag, ".Data")) {
         if (!selfClosing) {
             XmlScopeEntry trans{};
             trans.kind = XmlScopeKind::TransparentContainer;
             trans.tagName = std::string(tagName);
-            if (EndsWith(shortTag, ".Header")) {
+            if (str::EndsWith(shortTag, ".Header")) {
                 trans.targetPropId = PropId_Header;
-            } else if (EndsWith(shortTag, ".Content")) {
+            } else if (str::EndsWith(shortTag, ".Content")) {
                 trans.targetPropId = PropId_Text;
-            } else if (EndsWith(shortTag, ".ToolTip")) {
+            } else if (str::EndsWith(shortTag, ".ToolTip")) {
                 trans.targetPropId = PropId_ToolTipText;
-            } else if (EndsWith(shortTag, ".Data")) {
+            } else if (str::EndsWith(shortTag, ".Data")) {
                 trans.targetPropId = PropId_PathData;
             } else {
                 trans.targetPropId = 0;
@@ -7622,15 +6360,15 @@ AERO_NOINLINE int HandleTopLevelAndInlinePropertyElementsNoInline(
                 rawRunTextAttr = a.value;
                 runText = DecodeXamlXmlEntities(a.value);
             } else if (a.name == "FontWeight") {
-                const std::string_view fw = Trim(a.value);
-                if (EqualsIgnoreCase(fw, "Bold") || EqualsIgnoreCase(fw, "SemiBold") ||
-                    EqualsIgnoreCase(fw, "DemiBold") || EqualsIgnoreCase(fw, "ExtraBold") ||
-                    EqualsIgnoreCase(fw, "Black") || EqualsIgnoreCase(fw, "Heavy")) {
+                const std::string_view fw = str::Trim(a.value);
+                if (str::EqualsIgnoreCase(fw, "Bold") || str::EqualsIgnoreCase(fw, "SemiBold") ||
+                    str::EqualsIgnoreCase(fw, "DemiBold") || str::EqualsIgnoreCase(fw, "ExtraBold") ||
+                    str::EqualsIgnoreCase(fw, "Black") || str::EqualsIgnoreCase(fw, "Heavy")) {
                     attrBold = true;
                 }
             } else if (a.name == "FontStyle") {
-                const std::string_view fs = Trim(a.value);
-                if (EqualsIgnoreCase(fs, "Italic") || EqualsIgnoreCase(fs, "Oblique")) {
+                const std::string_view fs = str::Trim(a.value);
+                if (str::EqualsIgnoreCase(fs, "Italic") || str::EqualsIgnoreCase(fs, "Oblique")) {
                     attrItalic = true;
                 }
             }
@@ -7736,11 +6474,11 @@ AERO_NOINLINE int HandleTopLevelAndInlinePropertyElementsNoInline(
 
     if (shortTag == "ResourceDictionary" ||
         shortTag == "ResourceDictionary.MergedDictionaries" ||
-        EndsWith(shortTag, ".MergedDictionaries") ||
-        EndsWith(shortTag, ".Resources")) {
+        str::EndsWith(shortTag, ".MergedDictionaries") ||
+        str::EndsWith(shortTag, ".Resources")) {
         if (shortTag == "ResourceDictionary") {
             for (const auto& a : attrs) {
-                if (a.name == "Source" && !Trim(a.value).empty()) {
+                if (a.name == "Source" && !str::Trim(a.value).empty()) {
                     CompileAndMergeExternalDictionaryNoInline(ctx, DecodeXamlXmlEntities(a.value));
                     break;
                 }
@@ -7756,7 +6494,7 @@ AERO_NOINLINE int HandleTopLevelAndInlinePropertyElementsNoInline(
         return 1;
     }
 
-    if (EndsWith(shortTag, ".Transform3D") || EndsWith(shortTag, ".Projection")) {
+    if (str::EndsWith(shortTag, ".Transform3D") || str::EndsWith(shortTag, ".Projection")) {
         if (!selfClosing) {
             XmlScopeEntry tf3Scope{};
             tf3Scope.kind = XmlScopeKind::Transform3DPropertyElement;
@@ -7767,7 +6505,7 @@ AERO_NOINLINE int HandleTopLevelAndInlinePropertyElementsNoInline(
         return 1;
     }
 
-    if (EndsWith(shortTag, ".Effect")) {
+    if (str::EndsWith(shortTag, ".Effect")) {
         if (!selfClosing) {
             XmlScopeEntry fxScope{};
             fxScope.kind = XmlScopeKind::EffectPropertyElement;
@@ -7778,12 +6516,12 @@ AERO_NOINLINE int HandleTopLevelAndInlinePropertyElementsNoInline(
         return 1;
     }
 
-    if (EndsWith(shortTag, ".RenderTransform") || EndsWith(shortTag, ".LayoutTransform")) {
+    if (str::EndsWith(shortTag, ".RenderTransform") || str::EndsWith(shortTag, ".LayoutTransform")) {
         if (!selfClosing) {
             XmlScopeEntry tfScope{};
             tfScope.kind = XmlScopeKind::TransformPropertyElement;
             tfScope.tagName = std::string(tagName);
-            tfScope.targetPropId = EndsWith(shortTag, ".LayoutTransform")
+            tfScope.targetPropId = str::EndsWith(shortTag, ".LayoutTransform")
                 ? PropId_LayoutTransform
                 : PropId_RenderTransform;
             tfScope.accumulatedTransform = Matrix2D::Identity();
@@ -7793,22 +6531,22 @@ AERO_NOINLINE int HandleTopLevelAndInlinePropertyElementsNoInline(
         return 1;
     }
 
-    if (EndsWith(shortTag, ".Background") ||
-        EndsWith(shortTag, ".Fill") ||
-        EndsWith(shortTag, ".Foreground") ||
-        EndsWith(shortTag, ".BorderBrush") ||
-        EndsWith(shortTag, ".Stroke") ||
-        EndsWith(shortTag, ".Source")) {
+    if (str::EndsWith(shortTag, ".Background") ||
+        str::EndsWith(shortTag, ".Fill") ||
+        str::EndsWith(shortTag, ".Foreground") ||
+        str::EndsWith(shortTag, ".BorderBrush") ||
+        str::EndsWith(shortTag, ".Stroke") ||
+        str::EndsWith(shortTag, ".Source")) {
         if (!selfClosing) {
             XmlScopeEntry brushScope{};
             brushScope.kind = XmlScopeKind::BrushPropertyElement;
             brushScope.tagName = std::string(tagName);
-            if (EndsWith(shortTag, ".Foreground")) {
+            if (str::EndsWith(shortTag, ".Foreground")) {
                 brushScope.targetPropId = PropId_Foreground;
-            } else if (EndsWith(shortTag, ".BorderBrush") ||
-                       EndsWith(shortTag, ".Stroke")) {
+            } else if (str::EndsWith(shortTag, ".BorderBrush") ||
+                       str::EndsWith(shortTag, ".Stroke")) {
                 brushScope.targetPropId = PropId_BorderBrush;
-            } else if (EndsWith(shortTag, ".Source")) {
+            } else if (str::EndsWith(shortTag, ".Source")) {
                 brushScope.targetPropId = PropId_ImageSource;
             } else {
                 brushScope.targetPropId = PropId_Background;
@@ -7827,7 +6565,7 @@ AERO_NOINLINE int HandleTopLevelAndInlinePropertyElementsNoInline(
             }
             const std::uint16_t mappedProp = ResolveMappedSetterPropertyId(shortTag, ownerHint);
             XmlScopeEntry propScope{};
-            propScope.kind = (mappedProp != kUnmappedPropId)
+            propScope.kind = (mappedProp != compiler_detail::kUnmappedPropId)
                 ? XmlScopeKind::BindingPropertyElement
                 : XmlScopeKind::NonVisualSkip;
             propScope.tagName = std::string(tagName);
@@ -7871,7 +6609,7 @@ AERO_NOINLINE void HandleVisualElementTagNoInline(
         if (shortTag == "Application") {
             for (const auto& a : attrs) {
                 if (a.name == "StartupUri") {
-                    pkg.startupUri = DecodeXamlXmlEntities(Trim(a.value));
+                    pkg.startupUri = DecodeXamlXmlEntities(str::Trim(a.value));
                 }
             }
         }
@@ -7880,15 +6618,15 @@ AERO_NOINLINE void HandleVisualElementTagNoInline(
                 const std::filesystem::path xDir =
                     std::filesystem::path(NormalizeSlashes(ctx.effectiveXamlPath)).parent_path();
                 if (!xDir.empty()) {
-                    UiResourceContext::Current().AddXamlSearchDirectory(xDir.string());
+                    UIResourceContext::Current().AddXamlSearchDirectory(xDir.string());
                 }
             }
             if (!ctx.input.resourceSearchRoot.empty()) {
-                UiResourceContext::Current().AddXamlSearchDirectory(ctx.input.resourceSearchRoot);
+                UIResourceContext::Current().AddXamlSearchDirectory(ctx.input.resourceSearchRoot);
             }
             for (const auto& sp : ctx.input.resourceSearchPaths) {
                 if (!sp.empty()) {
-                    UiResourceContext::Current().AddXamlSearchDirectory(sp);
+                    UIResourceContext::Current().AddXamlSearchDirectory(sp);
                 }
             }
         }
@@ -7917,7 +6655,7 @@ AERO_NOINLINE void HandleVisualElementTagNoInline(
 
     const bool isDirectHeaderChild = !scopeStack.empty() &&
         scopeStack.back().kind == XmlScopeKind::TransparentContainer &&
-        EndsWith(StripXmlPrefix(scopeStack.back().tagName), ".Header");
+        str::EndsWith(str::StripNamespacePrefix(scopeStack.back().tagName), ".Header");
 
     const bool isInlinePrimitiveVisualItem =
         (shortTag == "Double" || shortTag == "Single" || shortTag == "Int32" ||
@@ -7962,7 +6700,7 @@ AERO_NOINLINE void HandleVisualElementTagNoInline(
                 AxbEventBindingRecord ev{};
                 ev.controlName = std::string(xName);
                 ev.eventName = std::move(canonicalEvent);
-                ev.handlerMethodName = std::string(Trim(attr.value));
+                ev.handlerMethodName = std::string(str::Trim(attr.value));
                 pkg.eventBindings.push_back(std::move(ev));
 
                 AxbInstruction evInst{};
@@ -7973,17 +6711,17 @@ AERO_NOINLINE void HandleVisualElementTagNoInline(
             }
         }
 
-        const std::string_view trimmedVal = Trim(attr.value);
+        const std::string_view trimmedVal = str::Trim(attr.value);
 
         if (attr.name == "Command" && trimmedVal.size() > 2 &&
             trimmedVal.front() == '{' && trimmedVal.back() == '}') {
-            std::string_view cmdInner = Trim(trimmedVal.substr(1, trimmedVal.size() - 2));
-            if (cmdInner.rfind("Binding ", 0) == 0) cmdInner = Trim(cmdInner.substr(8));
-            else if (cmdInner.rfind("Bind ", 0) == 0) cmdInner = Trim(cmdInner.substr(5));
+            std::string_view cmdInner = str::Trim(trimmedVal.substr(1, trimmedVal.size() - 2));
+            if (cmdInner.rfind("Binding ", 0) == 0) cmdInner = str::Trim(cmdInner.substr(8));
+            else if (cmdInner.rfind("Bind ", 0) == 0) cmdInner = str::Trim(cmdInner.substr(5));
             if (const std::size_t comma = cmdInner.find(','); comma != std::string_view::npos) {
-                cmdInner = Trim(cmdInner.substr(0, comma));
+                cmdInner = str::Trim(cmdInner.substr(0, comma));
             }
-            if (cmdInner.rfind("Path=", 0) == 0) cmdInner = Trim(cmdInner.substr(5));
+            if (cmdInner.rfind("Path=", 0) == 0) cmdInner = str::Trim(cmdInner.substr(5));
             if (!cmdInner.empty()) {
                 const auto evIdx = static_cast<std::uint32_t>(pkg.eventBindings.size());
                 AxbEventBindingRecord ev{};
@@ -8016,21 +6754,16 @@ AERO_NOINLINE void HandleVisualElementTagNoInline(
                     : ResolveOwnerAwarePropertyId(attr.name, tagName));
 
         if (trimmedVal.size() > 2 && trimmedVal.front() == '{' && trimmedVal.back() == '}') {
-            std::string_view inner = Trim(trimmedVal.substr(1, trimmedVal.size() - 2));
+            std::string_view inner = str::Trim(trimmedVal.substr(1, trimmedVal.size() - 2));
             if (inner.rfind("EcsBind ", 0) == 0) {
-                inner = Trim(inner.substr(8));
+                inner = str::Trim(inner.substr(8));
                 const std::size_t dot = inner.rfind('.');
                 const std::string_view compName =
                     (dot != std::string_view::npos) ? inner.substr(0, dot) : inner;
                 const std::string_view fieldName =
                     (dot != std::string_view::npos) ? inner.substr(dot + 1) : std::string_view{};
 
-                std::string canonicalComp(compName);
-                if (canonicalComp.find("::") == std::string::npos) {
-                    if (const std::size_t lastDot = canonicalComp.rfind('.'); lastDot != std::string::npos) {
-                        canonicalComp.replace(lastDot, 1, "::");
-                    }
-                }
+                const std::string canonicalComp = compiler_detail::CanonicalizeEcsComponentName(compName);
                 AxbInstruction ecsInst{};
                 ecsInst.opcode = AxbOpcode::BindEcsColumn;
                 ecsInst.propId = propId;
@@ -8086,7 +6819,7 @@ AERO_NOINLINE void HandleVisualElementTagNoInline(
                 if (tb.isValid) {
                     const std::uint16_t srcPropId =
                         ResolveTemplateBindingSourcePropId(tb.sourcePath, t_activeTemplateTargetTypeHint);
-                    if (srcPropId != kUnmappedPropId) {
+                    if (srcPropId != compiler_detail::kUnmappedPropId) {
                         AxbInstruction tbInst{};
                         tbInst.opcode = AxbOpcode::BindTemplateParent;
                         tbInst.propId = propId;
@@ -8100,15 +6833,15 @@ AERO_NOINLINE void HandleVisualElementTagNoInline(
             }
 
             if (inner.rfind("x:Static", 0) == 0) {
-                std::string_view memberExpr = Trim(inner.substr(8u));
+                std::string_view memberExpr = str::Trim(inner.substr(8u));
                 if (memberExpr.rfind("Member=", 0) == 0) {
-                    memberExpr = Trim(memberExpr.substr(7u));
+                    memberExpr = str::Trim(memberExpr.substr(7u));
                 }
                 if (!memberExpr.empty() && (memberExpr.front() == '\'' || memberExpr.front() == '"') &&
                     memberExpr.back() == memberExpr.front() && memberExpr.size() >= 2u) {
                     memberExpr = memberExpr.substr(1u, memberExpr.size() - 2u);
                 }
-                const std::string_view bareMem = StripXmlPrefix(memberExpr);
+                const std::string_view bareMem = str::StripNamespacePrefix(memberExpr);
                 std::string resolvedStaticStr;
                 bool hasStaticResolved = false;
                 bool isExplicitEmptyString = false;
@@ -8187,7 +6920,7 @@ AERO_NOINLINE void HandleVisualElementTagNoInline(
                 }
                 const std::uint16_t srcPropId =
                     ResolveTemplateBindingSourcePropId(parsedBind.pathPart, t_activeTemplateTargetTypeHint);
-                if (srcPropId != kUnmappedPropId) {
+                if (srcPropId != compiler_detail::kUnmappedPropId) {
                     AxbInstruction tbInst{};
                     tbInst.opcode = AxbOpcode::BindTemplateParent;
                     tbInst.propId = propId;
@@ -8302,7 +7035,7 @@ AERO_NOINLINE bool FinalizeXamlPhaseNoInline(
             if (st.key == state.dtRootTriggersStyleKey) {
                 if ((st.targetTypeName.empty() || st.targetTypeName == "UIElement") &&
                     !pkg.rootTypeName.empty()) {
-                    st.targetTypeName = std::string(StripXmlPrefix(pkg.rootTypeName));
+                    st.targetTypeName = std::string(str::StripNamespacePrefix(pkg.rootTypeName));
                 }
                 bool updatedExistingStyleInst = false;
                 for (std::size_t idx = 1u; idx < pkg.instructions.size(); ++idx) {
@@ -8360,7 +7093,7 @@ AERO_NOINLINE bool FinalizeXamlPhaseNoInline(
     }
 
     if (!isSvgInput && !isLottieInput && !isRiveInput) {
-        PopulateSceneIrFromPackage(pkg, FrontendSourceFormat::Xaml, ctx.effectiveXamlPath, ctx.result.sceneIr);
+        compiler_detail::PopulateSceneIrFromPackage(pkg, FrontendSourceFormat::Xaml, ctx.effectiveXamlPath, ctx.result.sceneIr);
     }
     return true;
 }
@@ -8369,7 +7102,7 @@ AERO_NOINLINE void HandleInnerTextNoInline(XamlCtx& ctx, std::size_t lt) {
     auto& pkg = ctx.pkg;
     auto& state = ctx.st;
     auto& scopeStack = state.scopeStack;
-    const std::string_view rawInner = Trim(ctx.src.substr(ctx.pos, lt - ctx.pos));
+    const std::string_view rawInner = str::Trim(ctx.src.substr(ctx.pos, lt - ctx.pos));
     if (rawInner.empty()) {
         return;
     }
@@ -8400,7 +7133,7 @@ AERO_NOINLINE void HandleInnerTextNoInline(XamlCtx& ctx, std::size_t lt) {
         if (!top.accumulatedText.empty()) top.accumulatedText.push_back(' ');
         top.accumulatedText += DecodeXamlXmlEntities(rawInner);
     } else if (top.kind == XmlScopeKind::VisualElement && state.nonVisualDepth == 0) {
-        const std::string_view st = StripXmlPrefix(top.tagName);
+        const std::string_view st = str::StripNamespacePrefix(top.tagName);
         if (st == "ItemsControl" || st == "ListBox" || st == "ListView" || st == "ComboBox") {
             const std::string decItemText = DecodeXamlXmlEntities(rawInner);
             if (!decItemText.empty()) {
@@ -8467,7 +7200,7 @@ AERO_NOINLINE void HandleClosingTagNoInline(XamlCtx& ctx) {
     if (!state.timelineStack.empty() && state.timelineStack.back().scopeDepth == closingDepth) {
         auto finishedTl = std::make_unique<ActiveTimelineScope>(std::move(state.timelineStack.back()));
         state.timelineStack.pop_back();
-        if (!state.storyboardStack.empty() && finishedTl->tl.targetPropertyId != kUnmappedPropId) {
+        if (!state.storyboardStack.empty() && finishedTl->tl.targetPropertyId != compiler_detail::kUnmappedPropId) {
             std::sort(
                 finishedTl->tl.keyFrames.begin(),
                 finishedTl->tl.keyFrames.end(),
@@ -8770,7 +7503,7 @@ AERO_NOINLINE void HandleClosingTagNoInline(XamlCtx& ctx) {
         }
     } else if (closed->kind == XmlScopeKind::KeyedResourceItem &&
                !closed->resourceKey.empty()) {
-        const std::string_view st = StripXmlPrefix(closed->tagName);
+        const std::string_view st = str::StripNamespacePrefix(closed->tagName);
         if (!closed->brushAssigned) {
             if ((st == "Color" || st == "SolidColorBrush") && !closed->accumulatedText.empty()) {
                 UpsertPackageResource(
@@ -8781,7 +7514,7 @@ AERO_NOINLINE void HandleClosingTagNoInline(XamlCtx& ctx) {
                 UpsertPackageResource(
                     pkg,
                     closed->resourceKey,
-                    MakeFloat(ParseFloat32(closed->accumulatedText, 0.0f)));
+                    MakeFloat(compiler_detail::ParseFloat32(closed->accumulatedText, 0.0f)));
             } else if ((st == "Int32" || st == "Int64" || st == "Int16") &&
                        !closed->accumulatedText.empty()) {
                 const long long iv = std::strtoll(closed->accumulatedText.c_str(), nullptr, 10);
@@ -8790,11 +7523,11 @@ AERO_NOINLINE void HandleClosingTagNoInline(XamlCtx& ctx) {
                     closed->resourceKey,
                     value::FromInt(static_cast<std::int64_t>(iv)));
             } else if (st == "Boolean" && !closed->accumulatedText.empty()) {
-                const std::string_view bt = Trim(closed->accumulatedText);
+                const std::string_view bt = str::Trim(closed->accumulatedText);
                 UpsertPackageResource(
                     pkg,
                     closed->resourceKey,
-                    UnifiedValue{EqualsIgnoreCase(bt, "true") || bt == "1"});
+                    UnifiedValue{str::EqualsIgnoreCase(bt, "true") || bt == "1"});
             } else if (st == "Thickness" && !closed->accumulatedText.empty()) {
                 UpsertPackageResource(
                     pkg,
@@ -8839,7 +7572,7 @@ AERO_NOINLINE void HandleClosingTagNoInline(XamlCtx& ctx) {
             if (it->kind == XmlScopeKind::VisualElement) break;
             if ((it->kind == XmlScopeKind::TransparentContainer && it->targetPropId == PropId_PathData) ||
                 (it->kind == XmlScopeKind::KeyedResourceItem &&
-                 (StripXmlPrefix(it->tagName) == "PathGeometry" || StripXmlPrefix(it->tagName) == "Geometry"))) {
+                 (str::StripNamespacePrefix(it->tagName) == "PathGeometry" || str::StripNamespacePrefix(it->tagName) == "Geometry"))) {
                 it->accumulatedText += " Z";
                 break;
             }
@@ -8851,7 +7584,7 @@ AERO_NOINLINE void HandleClosingTagNoInline(XamlCtx& ctx) {
         gvInst.literalValue = value::FromString(std::move(closed->gridViewColumnsSpec));
         pkg.instructions.push_back(std::move(gvInst));
     } else if (closed->kind == XmlScopeKind::RunInline && !closed->accumulatedText.empty()) {
-        const std::string_view closedSt = StripXmlPrefix(closed->tagName);
+        const std::string_view closedSt = str::StripNamespacePrefix(closed->tagName);
         std::string richChunk = closed->accumulatedRichText.empty()
             ? closed->accumulatedText
             : closed->accumulatedRichText;
@@ -8916,7 +7649,7 @@ AERO_NOINLINE void HandleClosingTagNoInline(XamlCtx& ctx) {
             pkg.instructions.push_back(std::move(textInst));
             if (closed->hasInlineRichFormatting &&
                 !closed->accumulatedRichText.empty() &&
-                StripXmlPrefix(closed->tagName) == "TextBlock") {
+                str::StripNamespacePrefix(closed->tagName) == "TextBlock") {
                 AxbInstruction richInst{};
                 richInst.opcode = AxbOpcode::SetStaticProperty;
                 richInst.propId = PropId_RichText;
@@ -8954,9 +7687,9 @@ AERO_NOINLINE bool RunXamlPhaseNoInline(
     AxbPackage& pkg = result.axbPackage;
     const std::string_view src = loadedContentStorage;
 
-    const bool isSvgInput = IsSvgAssetInput(effectiveXamlPath, src);
-    const bool isLottieInput = !isSvgInput && IsLottieAssetInput(effectiveXamlPath, src);
-    const bool isRiveInput = !isSvgInput && !isLottieInput && IsRiveAssetInput(effectiveXamlPath, src);
+    const bool isSvgInput = compiler_detail::IsSvgAssetInput(effectiveXamlPath, src);
+    const bool isLottieInput = !isSvgInput && compiler_detail::IsLottieAssetInput(effectiveXamlPath, src);
+    const bool isRiveInput = !isSvgInput && !isLottieInput && compiler_detail::IsRiveAssetInput(effectiveXamlPath, src);
     if (isSvgInput || isLottieInput || isRiveInput) {
         if (!RunFrontendImportPhaseNoInline(
                 effectiveXamlPath, src, isSvgInput, isLottieInput, isRiveInput, result)) {
@@ -9030,7 +7763,7 @@ AERO_NOINLINE bool RunXamlPhaseNoInline(
         }
         auto& openTag = state->openTag;
         openTag.tagName = src.substr(pos, tagEnd - pos);
-        openTag.shortTag = StripXmlPrefix(openTag.tagName);
+        openTag.shortTag = str::StripNamespacePrefix(openTag.tagName);
         openTag.xName = {};
         openTag.xKey = {};
         openTag.selfClosing = false;
@@ -9827,7 +8560,7 @@ AERO_NOINLINE bool RunScriptSynthesisAndCompilationPhase(
                 }
                 const auto openBrace = cleanSrc.find('{', after);
                 if (openBrace == std::string_view::npos) break;
-                const std::string_view headerSlice = Trim(cleanSrc.substr(after, openBrace - after));
+                const std::string_view headerSlice = str::Trim(cleanSrc.substr(after, openBrace - after));
                 if (!headerSlice.empty() && headerSlice.front() == ':') {
                     return true;
                 }
@@ -9836,7 +8569,7 @@ AERO_NOINLINE bool RunScriptSynthesisAndCompilationPhase(
             return false;
         };
         auto mapXamlTagToSdkType = [](std::string_view rawTag) -> std::string {
-            const std::string_view st = StripXmlPrefix(rawTag);
+            const std::string_view st = str::StripNamespacePrefix(rawTag);
             if (st == "Window") return "Window";
             if (st == "UserControl") return "UserControl";
             if (st == "Page") return "Page";
@@ -10935,9 +9668,9 @@ AERO_NOINLINE bool RunScriptSynthesisAndCompilationPhase(
         }
 
         if (input.optimizeBytecode) {
-            realscript::optimization::Optimizer optimizer;
-            realscript::optimization::Options optOpts{};
-            optOpts.level = realscript::optimization::Level::Aggressive;
+            rs_opt::Optimizer optimizer;
+            rs_opt::Options optOpts{};
+            optOpts.level = rs_opt::Level::Aggressive;
             rs_diag::DiagnosticBag optDiag;
             auto optRes = optimizer.optimize(std::move(build.modules), optDiag, optOpts);
             for (const auto& d : optDiag.items()) {
@@ -10950,6 +9683,43 @@ AERO_NOINLINE bool RunScriptSynthesisAndCompilationPhase(
             build.modules = std::move(optRes.modules);
         }
 
+        auto stripSynthesizedSdkOrStubFunctions = [](const std::string& modName, auto& functions) {
+            if (modName == "Aero.UI") {
+                functions.erase(
+                    std::remove_if(
+                        functions.begin(),
+                        functions.end(),
+                        [](const auto& fn) {
+                            const auto sep = fn.name.find("::");
+                            const std::string_view local = (sep != std::string::npos)
+                                ? std::string_view(fn.name).substr(sep + 2u)
+                                : std::string_view(fn.name);
+                            // Keep class methods and generated factory helpers, strip free native SDK stubs
+                            if (str::StartsWith(local, "__AeroCreateInstance_") ||
+                                local == "CreateMainWindow" ||
+                                local == "CreateViewModel") {
+                                return false;
+                            }
+                            return local.find('.') == std::string_view::npos;
+                        }),
+                    functions.end());
+            } else {
+                functions.erase(
+                    std::remove_if(
+                        functions.begin(),
+                        functions.end(),
+                        [](const auto& fn) {
+                            return fn.name.find("__Aero_SetDataContext") != std::string::npos ||
+                                   fn.name.find("Aero_SetDataContext__") != std::string::npos ||
+                                   fn.name.find("GUI_SetDataContext__") != std::string::npos ||
+                                   fn.name.find("Aero_LoadComponent__") != std::string::npos ||
+                                   fn.name.find("GUI_LoadComponent__") != std::string::npos ||
+                                   fn.name.find("Aero_LoadResources__") != std::string::npos;
+                        }),
+                    functions.end());
+            }
+        };
+
         rs_bc::Lowerer lowerer;
         for (const auto& mir : build.modules) {
             auto bc = lowerer.lower(mir);
@@ -10961,40 +9731,7 @@ AERO_NOINLINE bool RunScriptSynthesisAndCompilationPhase(
                 result.succeeded = false;
                 return false;
             }
-            if (bc.name == "Aero.UI") {
-                bc.functions.erase(
-                    std::remove_if(
-                        bc.functions.begin(),
-                        bc.functions.end(),
-                        [](const auto& fn) {
-                            const auto sep = fn.name.find("::");
-                            const std::string_view local = (sep != std::string::npos)
-                                ? std::string_view(fn.name).substr(sep + 2u)
-                                : std::string_view(fn.name);
-                            // Keep class methods and generated factory helpers, strip free native SDK stubs
-                            if (local.rfind("__AeroCreateInstance_", 0) == 0 ||
-                                local == "CreateMainWindow" ||
-                                local == "CreateViewModel") {
-                                return false;
-                            }
-                            return local.find('.') == std::string_view::npos;
-                        }),
-                    bc.functions.end());
-            } else {
-                bc.functions.erase(
-                    std::remove_if(
-                        bc.functions.begin(),
-                        bc.functions.end(),
-                        [](const auto& fn) {
-                            return fn.name.find("__Aero_SetDataContext") != std::string::npos ||
-                                   fn.name.find("Aero_SetDataContext__") != std::string::npos ||
-                                   fn.name.find("GUI_SetDataContext__") != std::string::npos ||
-                                   fn.name.find("Aero_LoadComponent__") != std::string::npos ||
-                                   fn.name.find("GUI_LoadComponent__") != std::string::npos ||
-                                   fn.name.find("Aero_LoadResources__") != std::string::npos;
-                        }),
-                    bc.functions.end());
-            }
+            stripSynthesizedSdkOrStubFunctions(bc.name, bc.functions);
             for (auto& fref : bc.functionReferences) {
                 const auto sep = fref.name.find("::");
                 const std::string_view local = (sep != std::string::npos)
@@ -11047,39 +9784,7 @@ AERO_NOINLINE bool RunScriptSynthesisAndCompilationPhase(
             genOpts.emitLineDirectives = false;
             auto aotModules = build.modules;
             for (auto& m : aotModules) {
-                if (m.name == "Aero.UI") {
-                    m.functions.erase(
-                        std::remove_if(
-                            m.functions.begin(),
-                            m.functions.end(),
-                            [](const auto& fn) {
-                                const auto sep = fn.name.find("::");
-                                const std::string_view local = (sep != std::string::npos)
-                                    ? std::string_view(fn.name).substr(sep + 2u)
-                                    : std::string_view(fn.name);
-                                if (local.rfind("__AeroCreateInstance_", 0) == 0 ||
-                                    local == "CreateMainWindow" ||
-                                    local == "CreateViewModel") {
-                                    return false;
-                                }
-                                return local.find('.') == std::string_view::npos;
-                            }),
-                        m.functions.end());
-                } else {
-                    m.functions.erase(
-                        std::remove_if(
-                            m.functions.begin(),
-                            m.functions.end(),
-                            [](const auto& fn) {
-                                return fn.name.find("__Aero_SetDataContext") != std::string::npos ||
-                                       fn.name.find("Aero_SetDataContext__") != std::string::npos ||
-                                       fn.name.find("GUI_SetDataContext__") != std::string::npos ||
-                                       fn.name.find("Aero_LoadComponent__") != std::string::npos ||
-                                       fn.name.find("GUI_LoadComponent__") != std::string::npos ||
-                                       fn.name.find("Aero_LoadResources__") != std::string::npos;
-                            }),
-                        m.functions.end());
-                }
+                stripSynthesizedSdkOrStubFunctions(m.name, m.functions);
             }
             const auto generatedScriptAot = aotGen.generate(aotModules, aotDiag, genOpts);
             for (const auto& d : aotDiag.items()) {
@@ -11210,924 +9915,6 @@ AERO_NOINLINE void CompileInternalBody(
 }
 
 } // namespace
-
-namespace {
-
-std::string FormatFloatLiteral(float v) {
-    if (std::isinf(v)) {
-        return (v < 0.0f) ? "-std::numeric_limits<float>::infinity()" : "std::numeric_limits<float>::infinity()";
-    }
-    if (std::isnan(v)) {
-        return "-1.0f";
-    }
-    char buf[64]{};
-    std::snprintf(buf, sizeof(buf), "%.6ff", v);
-    return std::string(buf);
-}
-
-std::string EscapeAotCppString(std::string_view sv) {
-    std::string out;
-    out.reserve(sv.size() + 8u);
-    for (std::size_t i = 0u; i < sv.size(); ++i) {
-        const unsigned char c = static_cast<unsigned char>(sv[i]);
-        switch (c) {
-            case '\"': out += "\\\""; break;
-            case '\\': out += "\\\\"; break;
-            case '\n': out += "\\n"; break;
-            case '\r': out += "\\r"; break;
-            case '\t': out += "\\t"; break;
-            case '?':
-                if (i + 1u < sv.size() && sv[i + 1u] == '?') {
-                    out += "\\?";
-                } else {
-                    out.push_back('?');
-                }
-                break;
-            default:
-                if (c < 0x20u || c >= 0x7Fu) {
-                    // Use fixed 3-digit octal escape so following [0-9a-fA-F] chars are never eaten as hex!
-                    char oct[5];
-                    oct[0] = '\\';
-                    oct[1] = static_cast<char>('0' + ((c >> 6u) & 0x07u));
-                    oct[2] = static_cast<char>('0' + ((c >> 3u) & 0x07u));
-                    oct[3] = static_cast<char>('0' + (c & 0x07u));
-                    oct[4] = '\0';
-                    out.append(oct, 4u);
-                } else {
-                    out.push_back(static_cast<char>(c));
-                }
-                break;
-        }
-    }
-    return out;
-}
-
-std::string EmitUnifiedValueLiteralCpp(const UnifiedValue& val) {
-    if (const auto* b = std::get_if<bool>(&val)) {
-        return *b ? "aero::UnifiedValue{true}" : "aero::UnifiedValue{false}";
-    }
-    if (const auto* i = std::get_if<std::int64_t>(&val)) {
-        return "aero::value::FromInt(" + std::to_string(*i) + "LL)";
-    }
-    if (const auto* f = std::get_if<FloatValue>(&val)) {
-        return "aero::MakeFloat(" + FormatFloatLiteral(f->value) + ")";
-    }
-    Float4Value f4{};
-    if (val.tryGetQuatf(f4)) {
-        return "aero::MakeFloat4InlineFast(" +
-               FormatFloatLiteral(f4.x) + ", " +
-               FormatFloatLiteral(f4.y) + ", " +
-               FormatFloatLiteral(f4.z) + ", " +
-               FormatFloatLiteral(f4.w) + ")";
-    }
-    if (const auto* s = std::get_if<StringValue>(&val)) {
-        return "aero::value::FromString(\"" + EscapeAotCppString(s->str()) + "\")";
-    }
-    return "aero::UnifiedValue{}";
-}
-
-void AppendStoryboardPopulateCpp(
-    std::string& src,
-    const AxbStoryboard& sb,
-    const std::string& sbVar,
-    const std::string& indent) {
-    if (!sb.key.empty()) {
-        src += indent + sbVar + ".key = \"" + EscapeAotCppString(sb.key) + "\";\n";
-    }
-    for (const auto& tl : sb.timelines) {
-        src += indent + "{\n";
-        src += indent + "    aero::AxbAnimationTimeline tl{};\n";
-        if (!tl.targetName.empty()) {
-            src += indent + "    tl.targetName = \"" + EscapeAotCppString(tl.targetName) + "\";\n";
-        }
-        src += indent + "    tl.targetPropertyId = " + std::to_string(tl.targetPropertyId) + "u;\n";
-        src += indent + "    tl.beginTimeSeconds = " + FormatFloatLiteral(tl.beginTimeSeconds) + ";\n";
-        src += indent + "    tl.durationSeconds = " + FormatFloatLiteral(tl.durationSeconds) + ";\n";
-        src += indent + "    tl.hasFrom = " + std::string(tl.hasFrom ? "true" : "false") + ";\n";
-        if (tl.hasFrom) {
-            src += indent + "    tl.fromValue = " + EmitUnifiedValueLiteralCpp(tl.fromValue) + ";\n";
-        }
-        src += indent + "    tl.hasTo = " + std::string(tl.hasTo ? "true" : "false") + ";\n";
-        src += indent + "    tl.isBy = " + std::string(tl.isBy ? "true" : "false") + ";\n";
-        if (tl.hasTo) {
-            src += indent + "    tl.toValue = " + EmitUnifiedValueLiteralCpp(tl.toValue) + ";\n";
-        }
-        src += indent + "    tl.easingKind = static_cast<aero::EasingFunctionKind>(" +
-               std::to_string(static_cast<unsigned>(tl.easingKind)) + "u);\n";
-        src += indent + "    tl.easingMode = static_cast<aero::EasingMode>(" +
-               std::to_string(static_cast<unsigned>(tl.easingMode)) + "u);\n";
-        src += indent + "    tl.fillBehavior = static_cast<aero::FillBehavior>(" +
-               std::to_string(static_cast<unsigned>(tl.fillBehavior)) + "u);\n";
-        src += indent + "    tl.autoReverse = " + std::string(tl.autoReverse ? "true" : "false") + ";\n";
-        src += indent + "    tl.repeatCount = " + std::to_string(tl.repeatCount) + ";\n";
-        for (const auto& kf : tl.keyFrames) {
-            src += indent + "    {\n";
-            src += indent + "        aero::AxbKeyFrame kf{};\n";
-            src += indent + "        kf.timeSeconds = " + FormatFloatLiteral(kf.timeSeconds) + ";\n";
-            src += indent + "        kf.value = " + EmitUnifiedValueLiteralCpp(kf.value) + ";\n";
-            src += indent + "        kf.easingKind = static_cast<aero::EasingFunctionKind>(" +
-                   std::to_string(static_cast<unsigned>(kf.easingKind)) + "u);\n";
-            src += indent + "        kf.easingMode = static_cast<aero::EasingMode>(" +
-                   std::to_string(static_cast<unsigned>(kf.easingMode)) + "u);\n";
-            src += indent + "        kf.isDiscrete = " + std::string(kf.isDiscrete ? "true" : "false") + ";\n";
-            src += indent + "        tl.keyFrames.push_back(std::move(kf));\n";
-            src += indent + "    }\n";
-        }
-        src += indent + "    " + sbVar + ".timelines.push_back(std::move(tl));\n";
-        src += indent + "}\n";
-    }
-}
-
-void AppendSetterListPopulateCpp(
-    std::string& src,
-    const std::vector<AxbPropertySetter>& setters,
-    const std::string& targetVecExpr,
-    const std::string& indent) {
-    for (const auto& s : setters) {
-        src += indent + "{\n";
-        src += indent + "    aero::AxbPropertySetter ps{};\n";
-        if (!s.targetName.empty()) {
-            src += indent + "    ps.targetName = \"" + EscapeAotCppString(s.targetName) + "\";\n";
-        }
-        src += indent + "    ps.propId = " + std::to_string(s.propId) + "u;\n";
-        src += indent + "    ps.value = " + EmitUnifiedValueLiteralCpp(s.value) + ";\n";
-        src += indent + "    " + targetVecExpr + ".push_back(std::move(ps));\n";
-        src += indent + "}\n";
-    }
-}
-
-} // namespace
-
-AeroViewAotCppOutput AeroCompiler::GenerateAotCppFromPackage(
-    const AxbPackage& package,
-    std::string_view cppNamespace,
-    std::string_view builderFunctionName) {
-    AeroViewAotCppOutput out{};
-    out.cppNamespace = cppNamespace.empty()
-        ? "aero::aot_generated"
-        : std::string(cppNamespace);
-
-    if (!builderFunctionName.empty()) {
-        out.builderFunctionName = std::string(builderFunctionName);
-    } else if (!package.className.empty()) {
-        out.builderFunctionName = "BuildView_" + rs_aot::sanitizeCppIdentifier(package.className);
-    } else {
-        out.builderFunctionName = "BuildAeroView";
-    }
-
-    // 1. Emit C++17 Header (.hpp)
-    std::string hdr;
-    hdr += "#pragma once\n\n";
-    hdr += "// Auto-generated by aero-compiler --aot-cpp (Zero-XML C++17 Visual Tree & Binding Builder)\n";
-    hdr += "#include <cstdint>\n";
-    hdr += "#include <limits>\n";
-    hdr += "#include \"aero/controls/Controls.hpp\"\n";
-    hdr += "#include \"aero/binding/DualTrackBindingEngine.hpp\"\n\n";
-    hdr += "namespace " + out.cppNamespace + " {\n\n";
-    hdr += "bool " + out.builderFunctionName + "(\n";
-    hdr += "    aero::UIElement* rootControl,\n";
-    hdr += "    aero::ExecutionDomainContext* domains = nullptr,\n";
-    hdr += "    aero::DualTrackBindingEngine* bindingEngine = nullptr,\n";
-    hdr += "    aero::ObjectRef dataContext = {},\n";
-    hdr += "    const aero::Interpreter* eventInterpreter = nullptr,\n";
-    hdr += "    aero::rs_aot::ExecutionContext* eventAotContext = nullptr);\n\n";
-    hdr += "} // namespace " + out.cppNamespace + "\n";
-    out.header = std::move(hdr);
-
-    // 2. Emit C++17 Source (.cpp) - unrolled batch creation, static properties, MTSDF, Styles/Storyboards & bindings
-    bool hasNestedMultiInBindingChains = false;
-    for (const auto& ch : package.bindingChains) {
-        if (ch.nestedMultiBinding != nullptr) {
-            hasNestedMultiInBindingChains = true;
-            break;
-        }
-    }
-    bool hasP1StylePayload = false;
-    for (const auto& st : package.styles) {
-        if (!st.controlTemplateKey.empty() || st.inlineControlTemplate != nullptr) {
-            hasP1StylePayload = true;
-            break;
-        }
-        for (const auto& tr : st.triggers) {
-            if (!tr.enterActions.empty() || !tr.exitActions.empty()) {
-                hasP1StylePayload = true;
-                break;
-            }
-            for (const auto& c : tr.conditions) {
-                if (!c.converterKey.empty() || c.converterSymbolId != 0) {
-                    hasP1StylePayload = true;
-                    break;
-                }
-            }
-            if (hasP1StylePayload) break;
-        }
-        if (hasP1StylePayload) break;
-        for (const auto& et : st.eventTriggers) {
-            if (!et.actions.empty() || !et.conditions.empty()) {
-                hasP1StylePayload = true;
-                break;
-            }
-        }
-        if (hasP1StylePayload) break;
-    }
-    const bool needSharedPkg =
-        !package.multiBindings.empty() ||
-        package.HasMotionSection() ||
-        !package.dataTemplates.empty() ||
-        !package.controlTemplates.empty() ||
-        hasNestedMultiInBindingChains ||
-        hasP1StylePayload;
-
-    std::vector<std::uint8_t> sharedPkgBytes;
-    if (needSharedPkg) {
-        sharedPkgBytes = package.Serialize();
-    }
-    const bool emitSharedPkg = needSharedPkg && !sharedPkgBytes.empty();
-
-    std::string src;
-    src += "// Auto-generated by aero-compiler --aot-cpp (Zero-XML C++17 Visual Tree & Binding Builder)\n";
-    src += "#include <limits>\n";
-    src += "#include <mutex>\n";
-    src += "#include \"aero/animation/AnimationEngine.hpp\"\n";
-    src += "#include \"aero/controls/Controls.hpp\"\n";
-    src += "#include \"aero/binding/DualTrackBindingEngine.hpp\"\n";
-    src += "#include \"realscript/runtime/Runtime.h\"\n\n";
-    src += "namespace " + out.cppNamespace + " {\n\n";
-    src += "bool " + out.builderFunctionName + "(\n";
-    src += "    aero::UIElement* rootControl,\n";
-    src += "    aero::ExecutionDomainContext* domains,\n";
-    src += "    aero::DualTrackBindingEngine* bindingEngine,\n";
-    src += "    aero::ObjectRef dataContext,\n";
-    src += "    const aero::Interpreter* eventInterpreter,\n";
-    src += "    aero::rs_aot::ExecutionContext* eventAotContext) {\n";
-    src += "    if (!rootControl) {\n";
-    src += "        return false;\n";
-    src += "    }\n";
-    src += "    aero::EnsureControlTypesRegistered();\n";
-
-    if (emitSharedPkg) {
-        src += "    static std::mutex sAotSharedPkgMutex;\n";
-        src += "    static const aero::ProgramImage* sAotBoundProgram = nullptr;\n";
-        src += "    static aero::AxbPackage* const sAotSharedPkgPtr = []() {\n";
-        src += "        auto* p = new aero::AxbPackage();\n";
-        src += "        static constexpr std::uint8_t kAotSharedPkgBytes[] = {";
-        for (std::size_t b = 0; b < sharedPkgBytes.size(); ++b) {
-            if (b > 0) src += ",";
-            src += std::to_string(static_cast<unsigned>(sharedPkgBytes[b])) + "u";
-        }
-        src += "};\n";
-        src += "        (void)aero::AxbPackage::Deserialize(kAotSharedPkgBytes, sizeof(kAotSharedPkgBytes), *p);\n";
-        src += "        p->PinValuesInPools();\n";
-        src += "        aero::rs_rt::registerExternalValuePoolRootMarker(\n";
-        src += "            p,\n";
-        src += "            [p]() noexcept {\n";
-        src += "                std::lock_guard<std::mutex> lock(sAotSharedPkgMutex);\n";
-        src += "                p->MarkValuesInPools();\n";
-        src += "            });\n";
-        src += "        return p;\n";
-        src += "    }();\n";
-        src += "    aero::AxbPackage& sAotSharedPkg = *sAotSharedPkgPtr;\n";
-        src += "    bool sAotReboundSharedPkg = false;\n";
-        src += "    {\n";
-        src += "        std::lock_guard<std::mutex> lock(sAotSharedPkgMutex);\n";
-        src += "        const aero::ProgramImage* liveProg = bindingEngine ? bindingEngine->Program() : nullptr;\n";
-        src += "        if (liveProg && liveProg != sAotBoundProgram) {\n";
-        src += "            (void)sAotSharedPkg.BindAgainstProgram(*liveProg, {}, domains);\n";
-        src += "            sAotSharedPkg.PinValuesInPools();\n";
-        src += "            sAotBoundProgram = liveProg;\n";
-        src += "            sAotReboundSharedPkg = true;\n";
-        src += "        }\n";
-        src += "    }\n";
-        src += "    (void)sAotReboundSharedPkg;\n";
-    }
-
-    // Emit pre-baked MTSDF vector path entries so pure C++17 AOT views have 0 runtime SVG parsing
-    for (std::size_t mpIdx = 0; mpIdx < package.mtsdfPaths.size(); ++mpIdx) {
-        const auto& mp = package.mtsdfPaths[mpIdx];
-        if (mp.pathHash == 0 || mp.mtsdfRgbaPixels.empty()) {
-            continue;
-        }
-        src += "    if (!aero::AxbTemplateRegistry::Instance().FindMtsdfPath(" +
-               std::to_string(mp.pathHash) + "ULL)) {\n";
-        const std::string arrName = "kMtsdfPixels_" + std::to_string(mpIdx);
-        src += "        static constexpr std::uint8_t " + arrName + "[] = {";
-        for (std::size_t b = 0; b < mp.mtsdfRgbaPixels.size(); ++b) {
-            if (b > 0) src += ",";
-            src += std::to_string(static_cast<unsigned>(mp.mtsdfRgbaPixels[b])) + "u";
-        }
-        src += "};\n";
-        src += "        aero::AxbMtsdfPathEntry entry{};\n";
-        src += "        entry.pathHash = " + std::to_string(mp.pathHash) + "ULL;\n";
-        src += "        entry.boundsX = " + FormatFloatLiteral(mp.boundsX) + ";\n";
-        src += "        entry.boundsY = " + FormatFloatLiteral(mp.boundsY) + ";\n";
-        src += "        entry.boundsW = " + FormatFloatLiteral(mp.boundsW) + ";\n";
-        src += "        entry.boundsH = " + FormatFloatLiteral(mp.boundsH) + ";\n";
-        src += "        entry.u0 = " + FormatFloatLiteral(mp.u0) + ";\n";
-        src += "        entry.v0 = " + FormatFloatLiteral(mp.v0) + ";\n";
-        src += "        entry.u1 = " + FormatFloatLiteral(mp.u1) + ";\n";
-        src += "        entry.v1 = " + FormatFloatLiteral(mp.v1) + ";\n";
-        src += "        entry.atlasWidth = " + std::to_string(mp.atlasWidth) + "u;\n";
-        src += "        entry.atlasHeight = " + std::to_string(mp.atlasHeight) + "u;\n";
-        src += "        entry.cellWidth = " + std::to_string(mp.cellWidth) + "u;\n";
-        src += "        entry.cellHeight = " + std::to_string(mp.cellHeight) + "u;\n";
-        src += "        entry.pxRange = " + FormatFloatLiteral(mp.pxRange) + ";\n";
-        src += "        entry.mtsdfRgbaPixels.assign(" + arrName + ", " + arrName + " + sizeof(" + arrName + "));\n";
-        src += "        aero::AxbTemplateRegistry::Instance().RegisterMtsdfPath(std::move(entry));\n";
-        src += "    }\n";
-    }
-
-    // Emit keyed scalar/color/string resources into AxbTemplateRegistry for zero-XML AOT runtime
-    for (const auto& resPair : package.resources) {
-        if (resPair.first.empty()) {
-            continue;
-        }
-        src += "    if (!aero::AxbTemplateRegistry::Instance().FindResource(\"" +
-               EscapeAotCppString(resPair.first) + "\")) {\n";
-        src += "        aero::AxbTemplateRegistry::Instance().RegisterResource(\"" +
-               EscapeAotCppString(resPair.first) + "\", " +
-               EmitUnifiedValueLiteralCpp(resPair.second) + ");\n";
-        src += "    }\n";
-    }
-
-    // Emit pre-compiled Storyboards & Styles into AxbTemplateRegistry for zero-XML AOT runtime
-    for (const auto& sb : package.storyboards) {
-        if (sb.key.empty()) {
-            continue;
-        }
-        src += "    if (!aero::AxbTemplateRegistry::Instance().FindStoryboard(\"" +
-               EscapeAotCppString(sb.key) + "\")) {\n";
-        src += "        aero::AxbStoryboard sbDef{};\n";
-        AppendStoryboardPopulateCpp(src, sb, "sbDef", "        ");
-        src += "        aero::AxbTemplateRegistry::Instance().RegisterStoryboard(std::move(sbDef));\n";
-        src += "    }\n";
-    }
-
-    for (std::size_t stIdx = 0; stIdx < package.styles.size(); ++stIdx) {
-        const auto& st = package.styles[stIdx];
-        if (!st.key.empty()) {
-            src += "    if (" + std::string(emitSharedPkg ? "sAotReboundSharedPkg || " : "") +
-                   "!aero::AxbTemplateRegistry::Instance().FindStyle(\"" +
-                   EscapeAotCppString(st.key) + "\")) {\n";
-        } else {
-            src += "    {\n";
-        }
-        src += "        aero::AxbStyleDefinition stDef{};\n";
-        if (!st.key.empty()) {
-            src += "        stDef.key = \"" + EscapeAotCppString(st.key) + "\";\n";
-        }
-        if (!st.targetTypeName.empty()) {
-            src += "        stDef.targetTypeName = \"" + EscapeAotCppString(st.targetTypeName) + "\";\n";
-        }
-        if (!st.basedOnKey.empty()) {
-            src += "        stDef.basedOnKey = \"" + EscapeAotCppString(st.basedOnKey) + "\";\n";
-        }
-        if (!st.controlTemplateKey.empty()) {
-            src += "        stDef.controlTemplateKey = \"" + EscapeAotCppString(st.controlTemplateKey) + "\";\n";
-        }
-        AppendSetterListPopulateCpp(src, st.setters, "stDef.setters", "        ");
-        for (const auto& trig : st.triggers) {
-            src += "        {\n";
-            src += "            aero::AxbStyleTrigger trigDef{};\n";
-            src += "            trigDef.overrideLocalValues = " +
-                   std::string(trig.overrideLocalValues ? "true" : "false") + ";\n";
-            for (const auto& cond : trig.conditions) {
-                src += "            {\n";
-                src += "                aero::AxbTriggerCondition tc{};\n";
-                src += "                tc.propId = " + std::to_string(cond.propId) + "u;\n";
-                src += "                tc.expectedValue = " + EmitUnifiedValueLiteralCpp(cond.expectedValue) + ";\n";
-                src += "                tc.sourceKind = static_cast<aero::TriggerConditionSource>(" +
-                       std::to_string(static_cast<unsigned>(cond.sourceKind)) + "u);\n";
-                src += "                tc.converter = static_cast<aero::ValueConverterKind>(" +
-                       std::to_string(static_cast<unsigned>(cond.converter)) + "u);\n";
-                if (!cond.converterKey.empty()) {
-                    src += "                tc.converterKey = \"" + EscapeAotCppString(cond.converterKey) + "\";\n";
-                }
-                if (!cond.converterParameter.empty()) {
-                    src += "                tc.converterParameter = \"" + EscapeAotCppString(cond.converterParameter) + "\";\n";
-                }
-                src += "                tc.converterSymbolId = " + std::to_string(cond.converterSymbolId) + "ULL;\n";
-                src += "                tc.expectNull = " + std::string(cond.expectNull ? "true" : "false") + ";\n";
-                if (!cond.sourceName.empty()) {
-                    src += "                tc.sourceName = \"" + EscapeAotCppString(cond.sourceName) + "\";\n";
-                }
-                if (!cond.bindingPath.empty()) {
-                    src += "                tc.bindingPath = \"" + EscapeAotCppString(cond.bindingPath) + "\";\n";
-                }
-                for (const auto& chop : cond.compiledHops) {
-                    src += "                {\n";
-                    src += "                    aero::AxbCompiledHop ch{};\n";
-                    src += "                    ch.memberName = \"" + EscapeAotCppString(chop.memberName) + "\";\n";
-                    src += "                    ch.declaringTypeId = " + std::to_string(chop.declaringTypeId) + "ULL;\n";
-                    src += "                    ch.fieldIndex = " + std::to_string(chop.fieldIndex) + "u;\n";
-                    src += "                    ch.observableBitIndex = " + std::to_string(static_cast<unsigned>(chop.observableBitIndex)) + "u;\n";
-                    src += "                    ch.getterSymbolId = " + std::to_string(chop.getterSymbolId) + "ULL;\n";
-                    src += "                    ch.setterSymbolId = " + std::to_string(chop.setterSymbolId) + "ULL;\n";
-                    src += "                    ch.isAutoProperty = " + std::string(chop.isAutoProperty ? "true" : "false") + ";\n";
-                    src += "                    ch.isObservable = " + std::string(chop.isObservable ? "true" : "false") + ";\n";
-                    src += "                    ch.isReadOnly = " + std::string(chop.isReadOnly ? "true" : "false") + ";\n";
-                    src += "                    ch.isSimState = " + std::string(chop.isSimState ? "true" : "false") + ";\n";
-                    src += "                    ch.isSimCommand = " + std::string(chop.isSimCommand ? "true" : "false") + ";\n";
-                    src += "                    tc.compiledHops.push_back(std::move(ch));\n";
-                    src += "                }\n";
-                }
-                src += "                trigDef.conditions.push_back(std::move(tc));\n";
-                src += "            }\n";
-            }
-            AppendSetterListPopulateCpp(src, trig.setters, "trigDef.setters", "            ");
-            for (const auto& esb : trig.enterStoryboards) {
-                src += "            {\n";
-                src += "                aero::AxbStoryboard esbDef{};\n";
-                AppendStoryboardPopulateCpp(src, esb, "esbDef", "                ");
-                src += "                trigDef.enterStoryboards.push_back(std::move(esbDef));\n";
-                src += "            }\n";
-            }
-            for (const auto& xsb : trig.exitStoryboards) {
-                src += "            {\n";
-                src += "                aero::AxbStoryboard xsbDef{};\n";
-                AppendStoryboardPopulateCpp(src, xsb, "xsbDef", "                ");
-                src += "                trigDef.exitStoryboards.push_back(std::move(xsbDef));\n";
-                src += "            }\n";
-            }
-            src += "            stDef.triggers.push_back(std::move(trigDef));\n";
-            src += "        }\n";
-        }
-        for (const auto& vsg : st.visualStateGroups) {
-            src += "        {\n";
-            src += "            aero::AxbVisualStateGroup vsgDef{};\n";
-            src += "            vsgDef.name = \"" + EscapeAotCppString(vsg.name) + "\";\n";
-            src += "            vsgDef.defaultTransitionDuration = " +
-                   FormatFloatLiteral(vsg.defaultTransitionDuration) + ";\n";
-            src += "            vsgDef.defaultEasingKind = static_cast<aero::EasingFunctionKind>(" +
-                   std::to_string(static_cast<unsigned>(vsg.defaultEasingKind)) + "u);\n";
-            src += "            vsgDef.defaultEasingMode = static_cast<aero::EasingMode>(" +
-                   std::to_string(static_cast<unsigned>(vsg.defaultEasingMode)) + "u);\n";
-            for (const auto& vs : vsg.states) {
-                src += "            {\n";
-                src += "                aero::AxbVisualState vsDef{};\n";
-                src += "                vsDef.name = \"" + EscapeAotCppString(vs.name) + "\";\n";
-                AppendSetterListPopulateCpp(src, vs.setters, "vsDef.setters", "                ");
-                AppendStoryboardPopulateCpp(src, vs.storyboard, "vsDef.storyboard", "                ");
-                src += "                vsgDef.states.push_back(std::move(vsDef));\n";
-                src += "            }\n";
-            }
-            src += "            stDef.visualStateGroups.push_back(std::move(vsgDef));\n";
-            src += "        }\n";
-        }
-        for (const auto& et : st.eventTriggers) {
-            src += "        {\n";
-            src += "            aero::AxbEventTrigger etDef{};\n";
-            src += "            etDef.eventKind = static_cast<aero::RoutedTriggerEvent>(" +
-                   std::to_string(static_cast<unsigned>(et.eventKind)) + "u);\n";
-            if (!et.sourceName.empty()) {
-                src += "            etDef.sourceName = \"" + EscapeAotCppString(et.sourceName) + "\";\n";
-            }
-            for (const auto& etSb : et.storyboards) {
-                src += "            {\n";
-                src += "                aero::AxbStoryboard etSbDef{};\n";
-                AppendStoryboardPopulateCpp(src, etSb, "etSbDef", "                ");
-                src += "                etDef.storyboards.push_back(std::move(etSbDef));\n";
-                src += "            }\n";
-            }
-            src += "            stDef.eventTriggers.push_back(std::move(etDef));\n";
-            src += "        }\n";
-        }
-        if (emitSharedPkg && hasP1StylePayload) {
-            src += "        if (" + std::to_string(stIdx) + "u < sAotSharedPkg.styles.size()) {\n";
-            src += "            aero::AxbTemplateRegistry::Instance().RegisterStyle(sAotSharedPkg.styles[" +
-                   std::to_string(stIdx) + "u]);\n";
-            src += "        } else {\n";
-            src += "            aero::AxbTemplateRegistry::Instance().RegisterStyle(std::move(stDef));\n";
-            src += "        }\n";
-        } else if (emitSharedPkg) {
-            src += "        if (sAotReboundSharedPkg && " + std::to_string(stIdx) + "u < sAotSharedPkg.styles.size()) {\n";
-            src += "            aero::AxbTemplateRegistry::Instance().RegisterStyle(sAotSharedPkg.styles[" +
-                   std::to_string(stIdx) + "u]);\n";
-            src += "        } else {\n";
-            src += "            aero::AxbTemplateRegistry::Instance().RegisterStyle(std::move(stDef));\n";
-            src += "        }\n";
-        } else {
-            src += "        aero::AxbTemplateRegistry::Instance().RegisterStyle(std::move(stDef));\n";
-        }
-        src += "    }\n";
-    }
-
-    if (emitSharedPkg) {
-        for (std::size_t dtIdx = 0; dtIdx < package.dataTemplates.size(); ++dtIdx) {
-            const auto& dt = package.dataTemplates[dtIdx];
-            if (!dt.templatePackage) {
-                continue;
-            }
-            if (!dt.key.empty()) {
-                src += "    if (sAotReboundSharedPkg || !aero::AxbTemplateRegistry::Instance().FindDataTemplate(\"" +
-                       EscapeAotCppString(dt.key) + "\")) {\n";
-            } else {
-                src += "    {\n";
-            }
-            src += "        if (" + std::to_string(dtIdx) + "u < sAotSharedPkg.dataTemplates.size() && "
-                   "sAotSharedPkg.dataTemplates[" + std::to_string(dtIdx) + "u].templatePackage) {\n";
-            src += "            aero::AxbTemplateRegistry::Instance().RegisterDataTemplate(sAotSharedPkg.dataTemplates[" +
-                   std::to_string(dtIdx) + "u]);\n";
-            src += "        }\n";
-            src += "    }\n";
-        }
-
-        for (std::size_t ctIdx = 0; ctIdx < package.controlTemplates.size(); ++ctIdx) {
-            const auto& ct = package.controlTemplates[ctIdx];
-            if (!ct.templatePackage) {
-                continue;
-            }
-            if (!ct.key.empty()) {
-                src += "    if (sAotReboundSharedPkg || !aero::AxbTemplateRegistry::Instance().FindControlTemplate(\"" +
-                       EscapeAotCppString(ct.key) + "\")) {\n";
-            } else {
-                src += "    {\n";
-            }
-            src += "        if (" + std::to_string(ctIdx) + "u < sAotSharedPkg.controlTemplates.size() && "
-                   "sAotSharedPkg.controlTemplates[" + std::to_string(ctIdx) + "u].templatePackage) {\n";
-            src += "            aero::AxbTemplateRegistry::Instance().RegisterControlTemplate(sAotSharedPkg.controlTemplates[" +
-                   std::to_string(ctIdx) + "u]);\n";
-            src += "        }\n";
-            src += "    }\n";
-        }
-    }
-
-    src += "    aero::NativeHandleRegistry* registry = domains ? &domains->nativeHandles() : nullptr;\n";
-    src += "    aero::ManagedHeap* uiHeap = domains ? &domains->uiHeap() : nullptr;\n";
-    const std::string_view unusedNote = ""; (void)unusedNote;
-    src += "    const aero::ObjectRef effectiveContext = dataContext.valid() ? dataContext : rootControl->BoundScriptWrapper();\n";
-    src += "    const aero::ObjectRef wrapperObj = rootControl->BoundScriptWrapper().valid() ? rootControl->BoundScriptWrapper() : effectiveContext;\n\n";
-    src += "    (void)registry; (void)uiHeap; (void)effectiveContext; (void)wrapperObj;\n";
-    src += "    (void)bindingEngine; (void)eventInterpreter; (void)eventAotContext;\n\n";
-
-    std::vector<std::string> elemVarStack;
-    std::size_t nextElemId = 0;
-    bool rootVisited = false;
-    src += "    std::vector<aero::UIElement*> localElements;\n";
-    src += "    localElements.reserve(" + std::to_string(package.instructions.size() / 2u + 1u) + "u);\n";
-
-    for (const auto& inst : package.instructions) {
-        switch (inst.opcode) {
-            case AxbOpcode::BeginElement: {
-                const std::string_view typeName = package.GetString(inst.strIdx0);
-                const std::string_view elemName = package.GetString(inst.strIdx1);
-                const std::string varName = "elem_" + std::to_string(nextElemId++);
-
-                if (!rootVisited) {
-                    rootVisited = true;
-                    src += "    aero::UIElement* " + varName + " = rootControl; (void)" + varName + ";\n";
-                    if (package.rootHandleFieldIndex != PropertySlotHandle::InvalidIndex) {
-                        const std::string ownerTypeCond = (package.fieldsOwnerTypeId != 0)
-                            ? (" && uiHeap->objectTypeIdFast(wrapperObj) == " + std::to_string(package.fieldsOwnerTypeId) + "ULL")
-                            : std::string{};
-                        src += "    if (domains && registry && uiHeap && wrapperObj.valid() && uiHeap->isAlive(wrapperObj)" + ownerTypeCond + ") {\n";
-                        src += "        const auto rootH = rootControl->ToNativeHandle(*registry);\n";
-                        src += "        (void)domains->writeObjectField(aero::DomainKind::Ui, wrapperObj, " +
-                               std::to_string(package.rootHandleFieldIndex) + "u, rootH, nullptr);\n";
-                        src += "    }\n";
-                    }
-                } else {
-                    const std::string parentVar = elemVarStack.empty() ? "rootControl" : elemVarStack.back();
-                    const std::string escapedType = EscapeAotCppString(std::string(typeName));
-                    const std::string_view shortChild = StripXmlPrefix(typeName);
-                    if (AxbTemplateRegistry::Instance().Find(typeName) != nullptr &&
-                        shortChild != "UserControl" && shortChild != "Page") {
-                        src += "    aero::IntrusivePtr<aero::UIElement> " + varName +
-                               "_ptr = aero::MakeIntrusive<aero::UserControl>(\"" + escapedType +
-                               "\", domains, bindingEngine, effectiveContext, eventInterpreter, eventAotContext);\n";
-                    } else {
-                        src += "    auto " + varName + "_ptr = aero::CreateElementByTypeName(\"" +
-                               escapedType + "\");\n";
-                    }
-                    src += "    aero::UIElement* " + varName + " = " + varName + "_ptr.Get();\n";
-                    src += "    if (" + parentVar + " && " + varName + ") {\n";
-                    src += "        " + parentVar + "->AddChild(" + varName + ", registry, uiHeap);\n";
-                    if ((inst.flags & 0x01u) != 0u) {
-                        src += "        if (auto* hcc = " + parentVar + "->DynamicCast<aero::HeaderedContentControl>()) {\n";
-                        src += "            hcc->SetHeaderElement(" + varName + ");\n";
-                        src += "        }\n";
-                    }
-                    src += "    }\n";
-                }
-                src += "    localElements.push_back(" + varName + ");\n";
-                src += "    if (" + varName + " && bindingEngine) {\n";
-                src += "        " + varName + "->BindTwoWayEngine(bindingEngine);\n";
-                src += "    }\n";
-
-                if (const auto probe = CreateElementByTypeName(typeName)) {
-                    if (probe->IsA<ItemsControl>()) {
-                        src += "    if (auto* ic = " + varName + " ? " + varName + "->DynamicCast<aero::ItemsControl>() : nullptr) {\n";
-                        src += "        ic->SetDomains(domains);\n";
-                        src += "        ic->SetBindingEngine(bindingEngine);\n";
-                        src += "        if (bindingEngine) {\n";
-                        src += "            ic->SetAnimationEngine(bindingEngine->GetAnimationEngine());\n";
-                        src += "        }\n";
-                        src += "    }\n";
-                    } else if (probe->IsA<TabControl>()) {
-                        src += "    if (auto* tc = " + varName + " ? " + varName + "->DynamicCast<aero::TabControl>() : nullptr) {\n";
-                        src += "        tc->SetDomains(domains);\n";
-                        src += "        tc->SetBindingEngine(bindingEngine);\n";
-                        src += "        if (bindingEngine) {\n";
-                        src += "            tc->SetAnimationEngine(bindingEngine->GetAnimationEngine());\n";
-                        src += "        }\n";
-                        src += "    }\n";
-                    }
-                    if (probe->IsA<RiveControl>()) {
-                        src += "    if (auto* rc = " + varName + " ? " + varName + "->DynamicCast<aero::RiveControl>() : nullptr) {\n";
-                        src += "        if (bindingEngine) {\n";
-                        src += "            rc->SetAnimationEngine(bindingEngine->GetAnimationEngine());\n";
-                        src += "        }\n";
-                        src += "    }\n";
-                    }
-                }
-
-                if (!elemName.empty()) {
-                    src += "    if (" + varName + ") {\n";
-                    src += "        " + varName + "->SetName(\"" + EscapeAotCppString(std::string(elemName)) + "\");\n";
-                    for (const auto& namedSlot : package.namedControls) {
-                        if (namedSlot.name == elemName &&
-                            namedSlot.fieldIndexInClass != PropertySlotHandle::InvalidIndex) {
-                            const std::string ownerTypeCond = (package.fieldsOwnerTypeId != 0)
-                                ? (" && uiHeap->objectTypeIdFast(wrapperObj) == " + std::to_string(package.fieldsOwnerTypeId) + "ULL")
-                                : std::string{};
-                            src += "        if (domains && registry && uiHeap && wrapperObj.valid() && uiHeap->isAlive(wrapperObj)" + ownerTypeCond + ") {\n";
-                            src += "            const auto h = " + varName + "->ToNativeHandle(*registry);\n";
-                            src += "            (void)domains->writeObjectField(aero::DomainKind::Ui, wrapperObj, " +
-                                   std::to_string(namedSlot.fieldIndexInClass) + "u, h, nullptr);\n";
-                            src += "        }\n";
-                            break;
-                        }
-                    }
-                    src += "    }\n";
-                }
-
-                elemVarStack.push_back(varName);
-                break;
-            }
-
-            case AxbOpcode::EndElement: {
-                if (!elemVarStack.empty()) {
-                    elemVarStack.pop_back();
-                }
-                break;
-            }
-
-            case AxbOpcode::SetStaticProperty: {
-                if (!elemVarStack.empty()) {
-                    const std::string& curVar = elemVarStack.back();
-                    src += "    if (" + curVar + ") {\n";
-                    src += "        " + curVar + "->SetValue(" + std::to_string(inst.propId) + "u, " +
-                           EmitUnifiedValueLiteralCpp(inst.literalValue) + ", aero::ValueSourceRank::Local);\n";
-                    src += "    }\n";
-                }
-                break;
-            }
-
-            case AxbOpcode::BindProperty: {
-                if (!elemVarStack.empty() && inst.strIdx0 < package.bindingChains.size()) {
-                    const std::string& curVar = elemVarStack.back();
-                    const auto& chain = package.bindingChains[inst.strIdx0];
-                    const bool isElemBind = !chain.elementName.empty() ||
-                                            !chain.relativeAncestorType.empty() ||
-                                            chain.relativeSelf;
-                    src += "    if (" + curVar + " && bindingEngine" +
-                           std::string(isElemBind ? "" : " && effectiveContext.valid()") + ") {\n";
-                    if (chain.mode == BindingMode::TwoWay) {
-                        src += "        " + curVar + "->BindTwoWayEngine(bindingEngine);\n";
-                    }
-                    if (emitSharedPkg && chain.nestedMultiBinding != nullptr) {
-                        src += "        if (" + std::to_string(inst.strIdx0) + "u < sAotSharedPkg.bindingChains.size()) {\n";
-                        if (isElemBind) {
-                            src += "            (void)bindingEngine->BindElementProperty(sAotSharedPkg.bindingChains[" +
-                                   std::to_string(inst.strIdx0) + "u], aero::IntrusivePtr<aero::UIElement>(" + curVar + ", true));\n";
-                        } else {
-                            src += "            (void)bindingEngine->BindChain(effectiveContext, sAotSharedPkg.bindingChains[" +
-                                   std::to_string(inst.strIdx0) + "u], aero::IntrusivePtr<aero::UIElement>(" + curVar + ", true));\n";
-                        }
-                        src += "        }\n";
-                    } else {
-                        src += "        aero::AxbCompiledBindingChain chain{};\n";
-                        src += "        chain.rawPath = \"" + EscapeAotCppString(chain.rawPath) + "\";\n";
-                        src += "        chain.targetPropertyId = " + std::to_string(chain.targetPropertyId) + "u;\n";
-                        src += "        chain.mode = static_cast<aero::BindingMode>(" +
-                               std::to_string(static_cast<unsigned>(chain.mode)) + "u);\n";
-                        src += "        chain.converter = static_cast<aero::ValueConverterKind>(" +
-                               std::to_string(static_cast<unsigned>(chain.converter)) + "u);\n";
-                        if (!chain.converterKey.empty()) {
-                            src += "        chain.converterKey = \"" + EscapeAotCppString(chain.converterKey) + "\";\n";
-                        }
-                        if (!chain.converterParameter.empty()) {
-                            src += "        chain.converterParameter = \"" + EscapeAotCppString(chain.converterParameter) + "\";\n";
-                        }
-                        if (!chain.stringFormat.empty()) {
-                            src += "        chain.stringFormat = \"" + EscapeAotCppString(chain.stringFormat) + "\";\n";
-                        }
-                        src += "        chain.converterSymbolId = " + std::to_string(chain.converterSymbolId) + "ULL;\n";
-                        src += "        chain.convertBackSymbolId = " + std::to_string(chain.convertBackSymbolId) + "ULL;\n";
-                        if (!chain.elementName.empty()) {
-                            src += "        chain.elementName = \"" + EscapeAotCppString(chain.elementName) + "\";\n";
-                        }
-                        if (!chain.relativeAncestorType.empty()) {
-                            src += "        chain.relativeAncestorType = \"" + EscapeAotCppString(chain.relativeAncestorType) + "\";\n";
-                        }
-                        src += "        chain.relativeSelf = " + std::string(chain.relativeSelf ? "true" : "false") + ";\n";
-                        if (!std::holds_alternative<std::monostate>(chain.fallbackValue)) {
-                            src += "        chain.fallbackValue = " + EmitUnifiedValueLiteralCpp(chain.fallbackValue) + ";\n";
-                        }
-                        if (!std::holds_alternative<std::monostate>(chain.targetNullValue)) {
-                            src += "        chain.targetNullValue = " + EmitUnifiedValueLiteralCpp(chain.targetNullValue) + ";\n";
-                        }
-                        for (const auto& hop : chain.hops) {
-                            src += "        {\n";
-                            src += "            aero::AxbCompiledHop hop{};\n";
-                            src += "            hop.memberName = \"" + EscapeAotCppString(hop.memberName) + "\";\n";
-                            src += "            hop.declaringTypeId = " + std::to_string(hop.declaringTypeId) + "ULL;\n";
-                            src += "            hop.fieldIndex = " + std::to_string(hop.fieldIndex) + "u;\n";
-                            src += "            hop.observableBitIndex = " + std::to_string(static_cast<unsigned>(hop.observableBitIndex)) + "u;\n";
-                            src += "            hop.getterSymbolId = " + std::to_string(hop.getterSymbolId) + "ULL;\n";
-                            src += "            hop.setterSymbolId = " + std::to_string(hop.setterSymbolId) + "ULL;\n";
-                            src += "            hop.isAutoProperty = " + std::string(hop.isAutoProperty ? "true" : "false") + ";\n";
-                            src += "            hop.isObservable = " + std::string(hop.isObservable ? "true" : "false") + ";\n";
-                            src += "            hop.isReadOnly = " + std::string(hop.isReadOnly ? "true" : "false") + ";\n";
-                            src += "            hop.isSimState = " + std::string(hop.isSimState ? "true" : "false") + ";\n";
-                            src += "            hop.isSimCommand = " + std::string(hop.isSimCommand ? "true" : "false") + ";\n";
-                            src += "            chain.hops.push_back(std::move(hop));\n";
-                            src += "        }\n";
-                        }
-                        if (isElemBind) {
-                            src += "        (void)bindingEngine->BindElementProperty(chain, aero::IntrusivePtr<aero::UIElement>(" + curVar + ", true));\n";
-                        } else {
-                            src += "        (void)bindingEngine->BindChain(effectiveContext, chain, aero::IntrusivePtr<aero::UIElement>(" + curVar + ", true));\n";
-                        }
-                    }
-                    src += "    }\n";
-                }
-                break;
-            }
-
-            case AxbOpcode::BindMultiProperty: {
-                if (!elemVarStack.empty() && emitSharedPkg && inst.strIdx0 < package.multiBindings.size()) {
-                    const std::string& curVar = elemVarStack.back();
-                    const auto& mb = package.multiBindings[inst.strIdx0];
-                    src += "    if (" + curVar + " && bindingEngine) {\n";
-                    if (mb.mode == BindingMode::TwoWay) {
-                        src += "        " + curVar + "->BindTwoWayEngine(bindingEngine);\n";
-                    }
-                    src += "        if (" + std::to_string(inst.strIdx0) + "u < sAotSharedPkg.multiBindings.size()) {\n";
-                    src += "            (void)bindingEngine->BindMultiChain(effectiveContext, sAotSharedPkg.multiBindings[" +
-                           std::to_string(inst.strIdx0) + "u], aero::IntrusivePtr<aero::UIElement>(" + curVar + ", true));\n";
-                    src += "        }\n";
-                    src += "    }\n";
-                }
-                break;
-            }
-
-            case AxbOpcode::BindEcsColumn: {
-                if (!elemVarStack.empty()) {
-                    const std::string& curVar = elemVarStack.back();
-                    const std::string_view compName = package.GetString(inst.strIdx0);
-                    const std::string_view fieldName = package.GetString(inst.strIdx1);
-                    std::string canonicalComp(compName);
-                    if (canonicalComp.find("::") == std::string::npos) {
-                        if (const std::size_t lastDot = canonicalComp.rfind('.'); lastDot != std::string::npos) {
-                            canonicalComp.replace(lastDot, 1, "::");
-                        }
-                    }
-                    const SymbolId compId = (inst.symbolId != 0)
-                        ? inst.symbolId
-                        : rs_sem::stableTypeId(canonicalComp);
-                    src += "    if (" + curVar + " && bindingEngine) {\n";
-                    src += "        (void)bindingEngine->BindEcsColumn(" + std::to_string(compId) + "ULL, \"" +
-                           EscapeAotCppString(std::string(fieldName)) + "\", 0u, aero::IntrusivePtr<aero::UIElement>(" +
-                           curVar + ", true), " + std::to_string(inst.propId) + "u);\n";
-                    src += "    }\n";
-                }
-                break;
-            }
-
-            case AxbOpcode::BindEvent: {
-                if (!elemVarStack.empty()) {
-                    const std::string& curVar = elemVarStack.back();
-                    SymbolId handlerSym = inst.symbolId;
-                    if (handlerSym == 0 && inst.strIdx0 < package.eventBindings.size()) {
-                        handlerSym = package.eventBindings[inst.strIdx0].handlerSymbolId;
-                    }
-                    src += "    if (" + curVar + " && wrapperObj.valid() && " +
-                           std::to_string(handlerSym) + "ULL != 0ULL) {\n";
-                    src += "        if (auto* btn = " + curVar + "->DynamicCast<aero::Button>()) {\n";
-                    src += "            if (eventInterpreter) {\n";
-                    src += "                btn->BindScriptClickHandler(eventInterpreter, wrapperObj, " +
-                           std::to_string(handlerSym) + "ULL);\n";
-                    src += "            } else if (eventAotContext) {\n";
-                    src += "                btn->BindAotClickHandler(eventAotContext, wrapperObj, " +
-                           std::to_string(handlerSym) + "ULL);\n";
-                    src += "            }\n";
-                    src += "        }\n";
-                    src += "    }\n";
-                }
-                break;
-            }
-
-            case AxbOpcode::AddRowDefinition: {
-                if (!elemVarStack.empty()) {
-                    const std::string& curVar = elemVarStack.back();
-                    const float val = value::TryGetFloat(inst.literalValue).value_or(1.0f);
-                    src += "    if (" + curVar + ") {\n";
-                    src += "        if (auto* grid = " + curVar + "->DynamicCast<aero::Grid>()) {\n";
-                    src += "            grid->AddRowDefinition(static_cast<aero::GridUnitType>(" +
-                           std::to_string(static_cast<unsigned>(inst.flags)) + "u), " +
-                           FormatFloatLiteral(val) + ");\n";
-                    src += "        }\n";
-                    src += "    }\n";
-                }
-                break;
-            }
-
-            case AxbOpcode::AddColumnDefinition: {
-                if (!elemVarStack.empty()) {
-                    const std::string& curVar = elemVarStack.back();
-                    const float val = value::TryGetFloat(inst.literalValue).value_or(1.0f);
-                    src += "    if (" + curVar + ") {\n";
-                    src += "        if (auto* grid = " + curVar + "->DynamicCast<aero::Grid>()) {\n";
-                    src += "            grid->AddColumnDefinition(static_cast<aero::GridUnitType>(" +
-                           std::to_string(static_cast<unsigned>(inst.flags)) + "u), " +
-                           FormatFloatLiteral(val) + ");\n";
-                    src += "        }\n";
-                    src += "    }\n";
-                }
-                break;
-            }
-
-            case AxbOpcode::SetResourceProperty: {
-                if (!elemVarStack.empty()) {
-                    const std::string& curVar = elemVarStack.back();
-                    const std::string escapedKey = EscapeAotCppString(std::string(package.GetString(inst.strIdx0)));
-                    const bool isDynamicOrLoc =
-                        (inst.flags & (AxbResourceFlag_DynamicResource | AxbResourceFlag_Loc)) != 0u;
-                    src += "    if (" + curVar + ") {\n";
-                    if (isDynamicOrLoc) {
-                        src += "        if (const auto* dv = aero::AxbTemplateRegistry::Instance().FindDynamicResource(\"" +
-                               escapedKey + "\")) {\n";
-                        src += "            aero::AxbTemplateRegistry::ApplyResolvedResourceToElement(" +
-                               curVar + ", " + std::to_string(inst.propId) + "u, *dv);\n";
-                        src += "        } else if (const auto* rv = aero::AxbTemplateRegistry::Instance().FindResource(\"" +
-                               escapedKey + "\")) {\n";
-                        src += "            aero::AxbTemplateRegistry::ApplyResolvedResourceToElement(" +
-                               curVar + ", " + std::to_string(inst.propId) + "u, *rv);\n";
-                    } else {
-                        src += "        if (const auto* rv = aero::AxbTemplateRegistry::Instance().FindResource(\"" +
-                               escapedKey + "\")) {\n";
-                        src += "            aero::AxbTemplateRegistry::ApplyResolvedResourceToElement(" +
-                               curVar + ", " + std::to_string(inst.propId) + "u, *rv);\n";
-                    }
-                    if (!std::holds_alternative<std::monostate>(inst.literalValue)) {
-                        src += "        } else {\n";
-                        src += "            aero::AxbTemplateRegistry::ApplyResolvedResourceToElement(" +
-                               curVar + ", " + std::to_string(inst.propId) + "u, " +
-                               EmitUnifiedValueLiteralCpp(inst.literalValue) + ");\n";
-                    }
-                    src += "        }\n";
-                    if (isDynamicOrLoc) {
-                        src += "        aero::AxbTemplateRegistry::Instance().SubscribeDynamicResource(" +
-                               curVar + ", rootControl, " + std::to_string(inst.propId) + "u, \"" +
-                               escapedKey + "\", " + std::to_string(static_cast<unsigned>(inst.flags)) + "u);\n";
-                    }
-                    src += "    }\n";
-                }
-                break;
-            }
-
-            case AxbOpcode::BindTemplateParent: {
-                if (!elemVarStack.empty()) {
-                    const std::string& curVar = elemVarStack.back();
-                    src += "    if (" + curVar + " && rootControl->TemplatedParent()) {\n";
-                    src += "        rootControl->TemplatedParent()->AddTemplateBinding(" +
-                           curVar + ", static_cast<std::uint16_t>(" + std::to_string(inst.strIdx0) +
-                           "u), " + std::to_string(inst.propId) +
-                           "u, static_cast<aero::ValueConverterKind>(" +
-                           std::to_string(static_cast<unsigned>(inst.flags)) + "u));\n";
-                    src += "    }\n";
-                }
-                break;
-            }
-        }
-    }
-
-    if (emitSharedPkg && package.HasMotionSection()) {
-        src += "    if (bindingEngine && bindingEngine->GetAnimationEngine()) {\n";
-        src += "        (void)bindingEngine->GetAnimationEngine()->InstantiatePackageMotion(\n";
-        src += "            rootControl,\n";
-        src += "            localElements.data(),\n";
-        src += "            localElements.size(),\n";
-        src += "            sAotSharedPkg);\n";
-        src += "    }\n";
-    }
-
-    src += "    return " + std::string(rootVisited ? "true" : "false") + ";\n";
-    src += "}\n\n";
-    src += "} // namespace " + out.cppNamespace + "\n";
-    out.source = std::move(src);
-    return out;
-}
 
 namespace {
 
@@ -12266,12 +10053,12 @@ bool AttachDesktopStencilJit(
             bool& outSucceeded,
             rs_rt::Value& outResult,
             rs_rt::RuntimeError& outError) -> bool {
-            realscript::jit::StencilModule* mod =
+            rs::jit::StencilModule* mod =
                 (domain == DomainKind::SimDeterministic) ? simModule : uiModule;
             if (!mod || !mod->valid()) {
                 return false;
             }
-            if (mod->functionTier(functionId) == realscript::jit::StencilTier::InterpreterFallback) {
+            if (mod->functionTier(functionId) == rs::jit::StencilTier::InterpreterFallback) {
                 return false;
             }
 
