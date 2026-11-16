@@ -1,177 +1,110 @@
-# AeroGUI 2.0 + RealScript `Samples.zip` 全量基准与黄金像素回归报告
+# AeroGUI 3.0 (`v3-microkernel`) 全量示例与编译器优化基准报告
 
-## 1. 全局回归总览与覆盖范围说明
+> 测试环境：Windows x64 Release (`/GR-` zero-RTTI, 32-bit `float` UI 坐标域) · `AeroCompilerV3` (`treeShakeStdlib = true`, 磁盘 stdlib 缓存启用) · `SoftwareRasterizer` CPU 无头光栅化 (`320x180` RGBA8, 64-bit FNV-1a 像素哈希)
 
-| 指标维度 | 扫描总数 | 通过数量 | 成功率 | 总耗时 (ms) | 平均耗时 (ms) |
-| :--- | ---: | ---: | ---: | ---: | ---: |
-| 官方示例工程目录扫描 (`Samples/*`) | 22 | 22 | 100.0% | - | - |
-| `.xaml` 编译 + `.axb4` 往返校验（覆盖全部有 `.xaml` 的工程） | 118 | 118 | 100.0% | 1153.29 | 9.77 |
-| `.riv` Rive v7 LEB128 二进制解码 | 9 | 9 | 100.0% | 107.46 | 11.94 |
-| 静态/入场动画 XAML 场景 CPU 黄金像素光栅化 (`13` 个工程 / `16` 个场景, `1280x720 -> 320x180`) | 16 | 16 | 100.0% | 617.22 | 38.58 |
+## 1. 总览与优化成果汇总
 
-### 测试覆盖边界说明（Honest Scope Notes）
+| 验证维度 | 覆盖数量 | 通过数量 | 通过率 | 关键实测指标 |
+| :--- | ---: | ---: | ---: | :--- |
+| 全量迁移工程 (`23` 经典示例 + `5` 个 V3 原生示例) | 28 | 28 | 100.0% | 零错误编译、挂载、布局与非均匀多色无头渲染 |
+| `Gallery/Data/Samples/*.xaml` 独立子页面 | 6 | 6 | 100.0% | `Brushes`, `Blending`, `Effects`, `Button`, `Slider`, `Canvas` 全部通过 (`>= 36` 独立色) |
+| 交互式 MVVM / 命令 / 输入 / 主题切换回归 | 10 | 10 | 100.0% | 全部状态变更与前后帧像素差异均验证通过 |
+| 零 RTTI C++17 AOT 编译与纯 AOT 无头执行 | 1 | 1 | 100.0% | `aero-compiler --O2 --aot-cpp` + `cl.exe /std:c++17 /GR-` + `rs_aot::ExecutionContext` 全通过 |
 
-- **编译与 `.axb4` 二进制往返校验（21 个官方示例工程目录，116 个 `.xaml` + 9 个 `.riv`）**：全部 21 个官方示例目录均纳入扫描，其中所有 116 个 `.xaml` 资产 100% 通过 `AeroCompiler::Compile` 与 `.axb4` 序列化/反序列化字节级一致性校验，9 个 `.riv` 资产 100% 通过 `RiveImporter::ImportBytesToAxb`。
-- **CPU 黄金像素光栅化覆盖（13 个工程共 16 个静态/动画 XAML 场景）**：覆盖 `BackgroundBlur`、`BrushShaders`、`Buttons`、`Gallery`（含 `Gallery` 主窗体、`Brushes`、`Gallery_Blending`、`Effects` 共 4 个场景）、`HelloWorld`、`Inventory`、`Localization`、`Login`、`QuestLog`、`Rive`、`Scoreboard`、`TicTacToe`、`UserControl`。
-- **仅做 `.xaml -> .axb4` 编译往返、未纳入纯 CPU 黄金像素光栅化的 8 个示例工程**：`CustomAnimation`、`CustomControl`、`CustomRender`、`DataBinding`、`Integration`、`IntegrationGLUT`、`Menu3D`、`VideoEffect`。这些工程依赖外部宿主 C++ 自定义控件/自定义渲染器/自定义动画类、GLUT/引擎宿主集成循环、C++ Code-Behind 动态 ViewModel 数据源或外部视频流与自定义 Shader 特效。
-- **静态 `DataContext` 挂载范围**：CPU 黄金光栅化在推进指定 `settleAnimSeconds` 入场动画后以空/静态 `DataContext`（`ObjectRef{}`）执行确定性软件光栅化，用于锁定 XAML 布局、样式字典、矢量图元、Rive 画板与混合模式的像素回归，不等同于运行示例原始 C++ ViewModel 业务逻辑或原生 GPU 自定义 Shader。
+### 1.1 `AeroCompilerV3` 编译期优化与 AOT 实测对比
 
-## 2. 16 个静态/动画 XAML 场景 CPU 黄金像素基准表（跨 13 个示例工程，`320x180` RGBA8）
+#### MIR 可达性剪枝（Tree-Shaking）与字节码包体积缩减
 
-> 注：表中“FNV-1a 64-bit 黄金哈希”已与 [`tests/samples_golden_regression_tests.cpp`](../tests/samples_golden_regression_tests.cpp) 对齐（含 `BlurEffect` / `BackgroundEffectBehavior` 按 `worldScale` 缩放后更新的 `QuestLog`、`Rive`、`Effects`、`BackgroundBlur` 4 场景哈希，以及 `Brushes`、`Gallery_Blending`、`BrushShaders` 现行黄金哈希）；节点数、页数与耗时列保留原基准快照实测值。
+| 基准场景 | 未剪枝 `.rsb` | 剪枝后 `.rsb` | 体积降幅 | 保留 / 剪枝 MIR 类型 | 保留 / 剪枝 MIR 函数 | 实测来源 |
+| :--- | ---: | ---: | ---: | ---: | ---: | :--- |
+| `TreeShake Probe`（最小 XAML 工程） | `18,984,064 B` (`18,539.13 KB`) | `4,260,441 B` (`4,160.59 KB`) | `-77.6%` (降至 `22.4%`) | `175` kept / `274` pruned (`449` total) | `1,303` kept / `1,989` pruned (`3,292` total) | `compiler_v3_tests` `[TreeShake]` |
+| `Samples/Buttons`（完整标准示例工程） | `18,865.41 KB` | `6,460.58 KB` | `-65.8%` (降至 `34.2%`) | `279` kept / `175` pruned (`454` total) | `1,897` kept / `1,423` pruned (`3,320` total) | `v3_legacy_samples_tests` `[OPT]` |
 
-| 场景名称 | XAML 路径 | 字体数 | 渲染节点 | 4KB 页数 | 非空像素数 | 覆盖率 | 独立色彩数 | FNV-1a 64-bit 黄金哈希 | 编译 (ms) | 挂载+样式 (ms) | 布局 (ms) | 建树 (ms) | 光栅化 (ms) |
-| :--- | :--- | ---: | ---: | ---: | ---: | ---: | ---: | :--- | ---: | ---: | ---: | ---: | ---: |
-| `HelloWorld` | `HelloWorld/Data/MainPage.xaml` | 1 | 15 | 2 | 57600 | 100.0% | 648 | `0x7863b040a6dc4444` | 0.52 | 0.15 | 0.04 | 0.21 | 1.43 |
-| `Login` | `Login/Data/MainPage.xaml` | 1 | 24 | 5 | 57600 | 100.0% | 980 | `0xe52312950e1871af` | 2.51 | 2.02 | 0.05 | 0.36 | 2.46 |
-| `Buttons` | `Buttons/Data/MainPage.xaml` | 1 | 46 | 3 | 57600 | 100.0% | 1323 | `0x1dc81e85638e4134` | 1.75 | 1.43 | 0.07 | 0.22 | 3.40 |
-| `QuestLog` | `QuestLog/Data/MainPage.xaml` | 2 | 52 | 7 | 57489 | 99.8% | 8723 | `0x9be414c1322db398` | 3.77 | 2.07 | 0.07 | 46.86 | 11.24 |
-| `Inventory` | `Inventory/Data/MainPage.xaml` | 2 | 224 | 22 | 57600 | 100.0% | 8039 | `0xdc85cde6a258c5e5` | 3.88 | 3.47 | 0.25 | 94.80 | 5.73 |
-| `Scoreboard` | `Scoreboard/Data/MainPage.xaml` | 2 | 55 | 10 | 57600 | 100.0% | 1236 | `0x063ca2044a4f5443` | 4.29 | 0.40 | 0.12 | 0.54 | 6.86 |
-| `TicTacToe` | `TicTacToe/Data/MainPage.xaml` | 0 | 257 | 11 | 57600 | 100.0% | 4094 | `0xdf6758fc356ab321` | 13.42 | 6.12 | 0.22 | 5.51 | 6.87 |
-| `Localization` | `Localization/Data/MainPage.xaml` | 5 | 65 | 27 | 57600 | 100.0% | 2491 | `0xa3d3d035b759cae9` | 1.58 | 0.37 | 0.11 | 10.84 | 3.08 |
-| `Gallery` | `Gallery/Data/MainWindow.xaml` | 7 | 64 | 12 | 57600 | 100.0% | 1121 | `0x97982bf0a0b5c10a` | 17.24 | 16.18 | 4.99 | 5.22 | 1.93 |
-| `Brushes` | `Gallery/Data/Samples/Brushes.xaml` | 7 | 277 | 51 | 35456 | 61.6% | 1188 | `0x560db0a00d704ffc` | 1.02 | 16.01 | 0.18 | 1.17 | 0.92 |
-| `Gallery_Blending` | `Gallery/Data/Samples/Blending.xaml` | 7 | 76 | 26 | 28920 | 50.2% | 3726 | `0xfefc265287ff59ec` | 0.34 | 15.31 | 18.91 | 0.17 | 1.19 |
-| `Rive` | `Rive/Data/MainPage.xaml` | 0 | 1248 | 32 | 57600 | 100.0% | 7307 | `0xd865d968ca178016` | 0.53 | 16.51 | 0.59 | 2.40 | 49.36 |
-| `Effects` | `Gallery/Data/Samples/Effects.xaml` | 7 | 150 | 28 | 39463 | 68.5% | 5493 | `0x37d8faabef45ffc7` | 0.53 | 15.61 | 0.45 | 0.55 | 1.27 |
-| `BackgroundBlur` | `BackgroundBlur/Data/MainPage.xaml` | 1 | 62 | 8 | 57578 | 100.0% | 27858 | `0x05b834a7730831a1` | 1.82 | 1.48 | 0.07 | 152.47 | 12.38 |
-| `BrushShaders` | `BrushShaders/Data/MainPage.xaml` | 1 | 59 | 3 | 57600 | 100.0% | 1873 | `0x6e903983482a68a8` | 1.81 | 0.35 | 0.07 | 0.47 | 4.44 |
-| `UserControl` | `UserControl/Data/MainPage.xaml` | 1 | 74 | 8 | 57600 | 100.0% | 1559 | `0x261e72f064aeb55c` | 0.72 | 0.51 | 0.04 | 0.12 | 2.83 |
+#### 进程内 / 持久化 Stdlib 缓存冷热编译耗时对比
 
-## 3. 全部 9 个官方 Rive v7 (`.riv`) 二进制资产解码统计表
+| 基准场景 | 冷编译 (`cold_ms`) | 热缓存编译 (`warm`) | 加速比 | 耗时降幅 | 实测来源 |
+| :--- | ---: | ---: | ---: | ---: | :--- |
+| `compiler_v3_tests` (`CompilerSession=nullptr`, `usedStdlibCache=1`) | `16,985 ms` | `6,138 ms` | **2.77x** | `-63.9%` | `compiler_v3_tests` `[StdlibCache]` |
+| `Samples/Buttons` (`allowDiskCache=false` -> `true`) | `19,850.55 ms` | `6,517.95 ms` | **3.05x** | `-67.2%` | `v3_legacy_samples_tests` `[OPT]` |
 
-| `.riv` 相对路径 | 原始大小 (B) | `.axb4` 大小 (B) | 画板尺寸 | IR 节点数 | MTSDF 路径数 | `MOT6` 动画片段 | 状态机数 | 解码+往返耗时 (ms) | 状态 |
-| :--- | ---: | ---: | :--- | ---: | ---: | ---: | ---: | ---: | :--- |
-| `Rive/Data/background.riv` | 126154 | 587500 | 1920x1080 | 697 | 126 | 42 | 1 | 35.88 | PASS |
-| `Rive/Data/leaves-bl.riv` | 126129 | 671557 | 1920x1080 | 50 | 10 | 1 | 1 | 25.51 | PASS |
-| `Rive/Data/leaves-br.riv` | 126129 | 671557 | 1920x1080 | 50 | 10 | 1 | 1 | 4.28 | PASS |
-| `Rive/Data/leaves-tl.riv` | 126129 | 671607 | 1920x1080 | 50 | 10 | 1 | 1 | 4.25 | PASS |
-| `Rive/Data/leaves-tr.riv` | 126129 | 671557 | 1920x1080 | 50 | 10 | 1 | 1 | 5.45 | PASS |
-| `Rive/Data/logo.riv` | 9105 | 67684 | 420x180 | 52 | 17 | 1 | 1 | 7.44 | PASS |
-| `Rive/Data/rewards.riv` | 8560 | 427288 | 500x200 | 72 | 10 | 6 | 1 | 19.59 | PASS |
-| `Rive/Data/settings.riv` | 12916 | 62098 | 500x200 | 87 | 12 | 6 | 1 | 2.61 | PASS |
-| `Rive/Data/start.riv` | 8918 | 74474 | 500x200 | 79 | 18 | 6 | 1 | 2.45 | PASS |
+#### C++17 AOT 代码生成与 `/GR-` 原生编译（`v3_slim_no_rtti_and_aot_tests`）
 
-## 4. 全部 116 个官方 `.xaml` 编译与 `.axb4` 往返明细表
+| 阶段 / 指标 | 实测耗时 (ms) | 产出大小 (Bytes) | 备注 |
+| :--- | ---: | ---: | :--- |
+| `aero-compiler --O2 --aot-cpp` (`AotProbeUi`) | `13,116 ms` | `33,383,137 B` (`.cpp`, 含默认开启的 MIR Tree-Shaking) | 同组字节码包：`4` 个模块，`4,443,147 B` |
+| `cl.exe /nologo /bigobj /c /std:c++17 /GR- /EHsc` | `88,814 ms` | `82,680,029 B` (`.obj`) | 严格关闭 MSVC C++ RTTI (`_CPPRTTI` 未定义) |
+| 运行时执行 (`TestLiveAotExecutionAndHeadlessRenderWithoutInterpreter`) | - | 零字节码虚拟机 (`Interpreter = nullptr`) | 验证 `CanSleepIdle()`、指针点击命中、动画播放与像素更新 |
 
-| # | `.xaml` 相对路径 | 指令条数 | 样式数 | `.axb4` 字节数 | 编译耗时 (ms) | 往返校验耗时 (ms) | 结果 |
-| ---: | :--- | ---: | ---: | ---: | ---: | ---: | :--- |
-| 1 | `BackgroundBlur/Data/MainPage.xaml` | 243 | 6 | 458547 | 20.52 | 1.05 | PASS |
-| 2 | `BackgroundBlur/Data/Resources.xaml` | 2 | 4 | 438437 | 1.25 | 0.79 | PASS |
-| 3 | `BrushShaders/Data/MainPage.xaml` | 71 | 3 | 755763 | 15.07 | 2.28 | PASS |
-| 4 | `Buttons/Data/MainPage.xaml` | 75 | 2 | 781675 | 7.07 | 2.13 | PASS |
-| 5 | `Buttons/Data/Resources.xaml` | 2 | 1 | 769936 | 1.61 | 1.54 | PASS |
-| 6 | `CustomAnimation/Data/MainPage.xaml` | 368 | 6 | 113261 | 1.80 | 0.16 | PASS |
-| 7 | `CustomControl/Data/MainPage.xaml` | 63 | 2 | 270581 | 3.26 | 0.42 | PASS |
-| 8 | `CustomRender/Data/MainWindow.xaml` | 62 | 0 | 2202 | 0.17 | 0.02 | PASS |
-| 9 | `DataBinding/Data/MainPage.xaml` | 34 | 2 | 8753 | 0.55 | 0.09 | PASS |
-| 10 | `Gallery/Data/MainWindow.xaml` | 392 | 100 | 785204 | 26.52 | 4.03 | PASS |
-| 11 | `Gallery/Data/Resources.xaml` | 2 | 92 | 743649 | 13.78 | 1.75 | PASS |
-| 12 | `Gallery/Data/Samples/Animation.xaml` | 511 | 11 | 285749 | 4.77 | 0.23 | PASS |
-| 13 | `Gallery/Data/Samples/Blending.xaml` | 180 | 0 | 5946 | 0.29 | 0.05 | PASS |
-| 14 | `Gallery/Data/Samples/Brushes.xaml` | 561 | 1 | 502169 | 29.71 | 0.39 | PASS |
-| 15 | `Gallery/Data/Samples/Button.xaml` | 260 | 4 | 1318358 | 35.07 | 2.77 | PASS |
-| 16 | `Gallery/Data/Samples/Canvas.xaml` | 220 | 0 | 7601 | 0.34 | 0.06 | PASS |
-| 17 | `Gallery/Data/Samples/CheckBox.xaml` | 178 | 7 | 11817 | 0.43 | 0.10 | PASS |
-| 18 | `Gallery/Data/Samples/ComboBox.xaml` | 148 | 0 | 5923 | 0.24 | 0.05 | PASS |
-| 19 | `Gallery/Data/Samples/ContextMenu.xaml` | 135 | 1 | 7794 | 0.30 | 0.08 | PASS |
-| 20 | `Gallery/Data/Samples/DockPanel.xaml` | 157 | 0 | 5769 | 0.21 | 0.04 | PASS |
-| 21 | `Gallery/Data/Samples/Effects.xaml` | 279 | 0 | 110050 | 7.89 | 0.11 | PASS |
-| 22 | `Gallery/Data/Samples/Expander.xaml` | 192 | 0 | 204077 | 10.99 | 0.10 | PASS |
-| 23 | `Gallery/Data/Samples/Grid.xaml` | 270 | 0 | 9659 | 0.36 | 0.09 | PASS |
-| 24 | `Gallery/Data/Samples/GroupBox.xaml` | 143 | 0 | 203066 | 0.28 | 0.08 | PASS |
-| 25 | `Gallery/Data/Samples/Hyperlink.xaml` | 90 | 2 | 4183 | 0.23 | 0.04 | PASS |
-| 26 | `Gallery/Data/Samples/Image.xaml` | 144 | 0 | 5258 | 0.21 | 0.05 | PASS |
-| 27 | `Gallery/Data/Samples/ItemsControl.xaml` | 125 | 0 | 7410 | 0.32 | 0.05 | PASS |
-| 28 | `Gallery/Data/Samples/ListBox.xaml` | 189 | 0 | 9071 | 0.33 | 0.08 | PASS |
-| 29 | `Gallery/Data/Samples/ListView.xaml` | 54 | 3 | 5141 | 0.30 | 0.05 | PASS |
-| 30 | `Gallery/Data/Samples/Menu.xaml` | 289 | 0 | 8689 | 0.30 | 0.07 | PASS |
-| 31 | `Gallery/Data/Samples/PasswordBox.xaml` | 98 | 0 | 4084 | 0.19 | 0.03 | PASS |
-| 32 | `Gallery/Data/Samples/ProgressBar.xaml` | 207 | 3 | 11363 | 0.44 | 0.10 | PASS |
-| 33 | `Gallery/Data/Samples/RadioButton.xaml` | 177 | 8 | 8776 | 0.29 | 0.07 | PASS |
-| 34 | `Gallery/Data/Samples/RepeatButton.xaml` | 209 | 1 | 35212 | 0.48 | 0.11 | PASS |
-| 35 | `Gallery/Data/Samples/ScrollViewer.xaml` | 175 | 0 | 7707 | 0.33 | 0.06 | PASS |
-| 36 | `Gallery/Data/Samples/Slider.xaml` | 315 | 0 | 11765 | 0.35 | 0.10 | PASS |
-| 37 | `Gallery/Data/Samples/StackPanel.xaml` | 85 | 0 | 3091 | 0.15 | 0.02 | PASS |
-| 38 | `Gallery/Data/Samples/StatusBar.xaml` | 72 | 0 | 2682 | 0.15 | 0.02 | PASS |
-| 39 | `Gallery/Data/Samples/TabControl.xaml` | 149 | 0 | 7382 | 0.26 | 0.06 | PASS |
-| 40 | `Gallery/Data/Samples/TextBlock.xaml` | 204 | 0 | 8332 | 0.27 | 0.06 | PASS |
-| 41 | `Gallery/Data/Samples/TextBox.xaml` | 108 | 0 | 5162 | 0.19 | 0.04 | PASS |
-| 42 | `Gallery/Data/Samples/ToggleButton.xaml` | 159 | 4 | 13100 | 0.61 | 0.11 | PASS |
-| 43 | `Gallery/Data/Samples/ToolBar.xaml` | 216 | 0 | 11195 | 0.35 | 0.06 | PASS |
-| 44 | `Gallery/Data/Samples/ToolTip.xaml` | 97 | 1 | 3892 | 0.19 | 0.04 | PASS |
-| 45 | `Gallery/Data/Samples/TreeView.xaml` | 211 | 2 | 9706 | 0.39 | 0.09 | PASS |
-| 46 | `Gallery/Data/Samples/UniformGrid.xaml` | 192 | 0 | 6527 | 0.24 | 0.06 | PASS |
-| 47 | `Gallery/Data/Samples/WrapPanel.xaml` | 188 | 0 | 6606 | 0.22 | 0.06 | PASS |
-| 48 | `HelloWorld/Data/MainPage.xaml` | 95 | 1 | 155635 | 0.79 | 0.11 | PASS |
-| 49 | `Integration/Data/MainPage.xaml` | 440 | 0 | 12440 | 0.42 | 0.11 | PASS |
-| 50 | `Inventory/Data/MainPage.xaml` | 708 | 13 | 379014 | 34.29 | 0.97 | PASS |
-| 51 | `Inventory/Data/Resources.xaml` | 2 | 10 | 60206 | 1.54 | 0.28 | PASS |
-| 52 | `Localization/Data/Language-ar.xaml` | 2 | 0 | 1440 | 0.11 | 0.01 | PASS |
-| 53 | `Localization/Data/Language-en.xaml` | 2 | 0 | 1035 | 0.06 | 0.01 | PASS |
-| 54 | `Localization/Data/Language-fr.xaml` | 2 | 0 | 1094 | 0.05 | 0.01 | PASS |
-| 55 | `Localization/Data/Language-jp.xaml` | 2 | 0 | 1144 | 0.05 | 0.01 | PASS |
-| 56 | `Localization/Data/MainPage.xaml` | 186 | 10 | 228769 | 1.54 | 0.29 | PASS |
-| 57 | `Localization/Data/Resources.xaml` | 2 | 9 | 213318 | 0.97 | 0.16 | PASS |
-| 58 | `Login/Data/MainPage.xaml` | 150 | 9 | 793324 | 2.71 | 1.21 | PASS |
-| 59 | `Login/Data/Resources.xaml` | 2 | 4 | 775967 | 1.62 | 1.36 | PASS |
-| 60 | `Menu3D/Data/MainPage.xaml` | 27 | 6 | 1920054 | 312.19 | 5.69 | PASS |
-| 61 | `Menu3D/Data/PagePreviews/PreviewMain.xaml` | 24 | 0 | 928 | 0.17 | 0.01 | PASS |
-| 62 | `Menu3D/Data/PagePreviews/PreviewSettings.xaml` | 24 | 0 | 940 | 0.08 | 0.01 | PASS |
-| 63 | `Menu3D/Data/PagePreviews/PreviewStart.xaml` | 24 | 0 | 931 | 0.07 | 0.01 | PASS |
-| 64 | `Menu3D/Data/Resources.xaml` | 2 | 6 | 1918861 | 6.70 | 5.27 | PASS |
-| 65 | `QuestLog/Data/MainPage.xaml` | 298 | 9 | 1572309 | 43.34 | 3.70 | PASS |
-| 66 | `QuestLog/Data/Resources.xaml` | 2 | 6 | 829128 | 1.63 | 0.54 | PASS |
-| 67 | `Rive/Data/MainPage.xaml` | 100 | 3 | 9650 | 0.55 | 0.12 | PASS |
-| 68 | `Scoreboard/Data/MainPage.xaml` | 347 | 11 | 1276197 | 82.03 | 3.62 | PASS |
-| 69 | `Theme/Data/App.xaml` | 2 | 81 | 497362 | 11.50 | 1.43 | PASS |
-| 70 | `Theme/Data/MainWindow.xaml` | 303 | 0 | 8299 | 0.35 | 0.07 | PASS |
-| 71 | `Theme/Data/Theme/NoesisTheme.Brushes.DarkAqua.xaml` | 2 | 0 | 3261 | 0.21 | 0.02 | PASS |
-| 72 | `Theme/Data/Theme/NoesisTheme.Brushes.DarkBlue.xaml` | 2 | 0 | 3261 | 0.20 | 0.02 | PASS |
-| 73 | `Theme/Data/Theme/NoesisTheme.Brushes.DarkCrimson.xaml` | 2 | 0 | 3261 | 0.18 | 0.02 | PASS |
-| 74 | `Theme/Data/Theme/NoesisTheme.Brushes.DarkEmerald.xaml` | 2 | 0 | 3261 | 0.18 | 0.02 | PASS |
-| 75 | `Theme/Data/Theme/NoesisTheme.Brushes.DarkGreen.xaml` | 2 | 0 | 3261 | 0.17 | 0.02 | PASS |
-| 76 | `Theme/Data/Theme/NoesisTheme.Brushes.DarkLime.xaml` | 2 | 0 | 3261 | 0.18 | 0.02 | PASS |
-| 77 | `Theme/Data/Theme/NoesisTheme.Brushes.DarkOrange.xaml` | 2 | 0 | 3261 | 0.17 | 0.02 | PASS |
-| 78 | `Theme/Data/Theme/NoesisTheme.Brushes.DarkPurple.xaml` | 2 | 0 | 3261 | 0.17 | 0.02 | PASS |
-| 79 | `Theme/Data/Theme/NoesisTheme.Brushes.DarkRed.xaml` | 2 | 0 | 3261 | 0.17 | 0.02 | PASS |
-| 80 | `Theme/Data/Theme/NoesisTheme.Brushes.LightAqua.xaml` | 2 | 0 | 3262 | 0.17 | 0.02 | PASS |
-| 81 | `Theme/Data/Theme/NoesisTheme.Brushes.LightBlue.xaml` | 2 | 0 | 3262 | 0.18 | 0.02 | PASS |
-| 82 | `Theme/Data/Theme/NoesisTheme.Brushes.LightCrimson.xaml` | 2 | 0 | 3262 | 0.17 | 0.02 | PASS |
-| 83 | `Theme/Data/Theme/NoesisTheme.Brushes.LightEmerald.xaml` | 2 | 0 | 3262 | 0.17 | 0.02 | PASS |
-| 84 | `Theme/Data/Theme/NoesisTheme.Brushes.LightGreen.xaml` | 2 | 0 | 3262 | 0.17 | 0.02 | PASS |
-| 85 | `Theme/Data/Theme/NoesisTheme.Brushes.LightLime.xaml` | 2 | 0 | 3262 | 0.17 | 0.02 | PASS |
-| 86 | `Theme/Data/Theme/NoesisTheme.Brushes.LightOrange.xaml` | 2 | 0 | 3262 | 0.18 | 0.02 | PASS |
-| 87 | `Theme/Data/Theme/NoesisTheme.Brushes.LightPurple.xaml` | 2 | 0 | 3262 | 0.17 | 0.02 | PASS |
-| 88 | `Theme/Data/Theme/NoesisTheme.Brushes.LightRed.xaml` | 2 | 0 | 3262 | 0.24 | 0.02 | PASS |
-| 89 | `Theme/Data/Theme/NoesisTheme.Colors.Dark.xaml` | 2 | 0 | 518 | 0.07 | 0.00 | PASS |
-| 90 | `Theme/Data/Theme/NoesisTheme.Colors.Light.xaml` | 2 | 0 | 518 | 0.05 | 0.00 | PASS |
-| 91 | `Theme/Data/Theme/NoesisTheme.DarkAqua.xaml` | 2 | 81 | 494540 | 9.87 | 1.38 | PASS |
-| 92 | `Theme/Data/Theme/NoesisTheme.DarkBlue.xaml` | 2 | 81 | 494540 | 9.93 | 1.32 | PASS |
-| 93 | `Theme/Data/Theme/NoesisTheme.DarkCrimson.xaml` | 2 | 81 | 494543 | 9.70 | 1.30 | PASS |
-| 94 | `Theme/Data/Theme/NoesisTheme.DarkEmerald.xaml` | 2 | 81 | 494543 | 9.87 | 1.32 | PASS |
-| 95 | `Theme/Data/Theme/NoesisTheme.DarkGreen.xaml` | 2 | 81 | 494541 | 10.03 | 1.37 | PASS |
-| 96 | `Theme/Data/Theme/NoesisTheme.DarkLime.xaml` | 2 | 81 | 494540 | 9.83 | 1.32 | PASS |
-| 97 | `Theme/Data/Theme/NoesisTheme.DarkOrange.xaml` | 2 | 81 | 494542 | 9.78 | 1.30 | PASS |
-| 98 | `Theme/Data/Theme/NoesisTheme.DarkPurple.xaml` | 2 | 81 | 494542 | 9.65 | 1.34 | PASS |
-| 99 | `Theme/Data/Theme/NoesisTheme.DarkRed.xaml` | 2 | 81 | 494539 | 9.99 | 1.31 | PASS |
-| 100 | `Theme/Data/Theme/NoesisTheme.Fonts.xaml` | 2 | 0 | 255 | 0.13 | 0.00 | PASS |
-| 101 | `Theme/Data/Theme/NoesisTheme.LightAqua.xaml` | 2 | 81 | 494542 | 9.75 | 1.31 | PASS |
-| 102 | `Theme/Data/Theme/NoesisTheme.LightBlue.xaml` | 2 | 81 | 494542 | 9.84 | 1.32 | PASS |
-| 103 | `Theme/Data/Theme/NoesisTheme.LightCrimson.xaml` | 2 | 81 | 494545 | 9.44 | 1.34 | PASS |
-| 104 | `Theme/Data/Theme/NoesisTheme.LightEmerald.xaml` | 2 | 81 | 494545 | 9.91 | 1.28 | PASS |
-| 105 | `Theme/Data/Theme/NoesisTheme.LightGreen.xaml` | 2 | 81 | 494543 | 9.83 | 1.33 | PASS |
-| 106 | `Theme/Data/Theme/NoesisTheme.LightLime.xaml` | 2 | 81 | 494542 | 9.81 | 1.30 | PASS |
-| 107 | `Theme/Data/Theme/NoesisTheme.LightOrange.xaml` | 2 | 81 | 494544 | 9.87 | 1.26 | PASS |
-| 108 | `Theme/Data/Theme/NoesisTheme.LightPurple.xaml` | 2 | 81 | 494544 | 10.74 | 1.34 | PASS |
-| 109 | `Theme/Data/Theme/NoesisTheme.LightRed.xaml` | 2 | 81 | 494541 | 9.89 | 1.34 | PASS |
-| 110 | `Theme/Data/Theme/NoesisTheme.Styles.xaml` | 2 | 84 | 484409 | 8.05 | 1.22 | PASS |
-| 111 | `TicTacToe/Data/MainPage.xaml` | 1285 | 8 | 4408918 | 176.08 | 19.11 | PASS |
-| 112 | `TicTacToe/Data/Resources.xaml` | 2 | 1 | 1398662 | 2.80 | 1.28 | PASS |
-| 113 | `UserControl/Data/MainPage.xaml` | 182 | 10 | 13853 | 0.83 | 0.15 | PASS |
-| 114 | `UserControl/Data/NumericUpDown.xaml` | 47 | 5 | 12925 | 0.43 | 0.06 | PASS |
-| 115 | `UserControl/Data/Resources.xaml` | 2 | 5 | 2516 | 0.18 | 0.03 | PASS |
-| 116 | `VideoEffect/Data/MainPage.xaml` | 62 | 1 | 140829 | 0.44 | 0.07 | PASS |
-| 117 | `WpfQuickStart/Data/App.xaml` | 2 | 0 | 332 | 0.09 | 0.00 | PASS |
-| 118 | `WpfQuickStart/Data/MainWindow.xaml` | 149 | 0 | 5891 | 0.25 | 0.05 | PASS |
+> 诚实边界说明：`v3_slim_no_rtti_and_aot_tests` 仅针对开启 `--O2` 与默认 `treeShakeStdlib=true` 的 C++17 AOT 链路采集了直接计时；未在同一二进制中另行测量未剪枝 (`treeShakeStdlib=false`) 的 C++17 AOT 对比耗时，因此本报告仅列出实测值，不做未实测的倍速推算。
+
+## 2. 全量 28 个应用端到端无头基准表（23 经典示例 + 5 个 V3 示例）
+
+- **汇总统计（28 个应用）**：
+  - 剪枝后 `.rsb` 合计：`210,507.12 KB`（均值 `7,518.11 KB`，最小 `4,424.11 KB` @ `CustomRender`，最大 `14,512.47 KB` @ `Gallery`）
+  - 热编译耗时合计：`273,814.55 ms`（均值 `9,779.09 ms`，最小 `5,935.29 ms` @ `V3/04_VectorAndCanvas`，最大 `18,571.06 ms` @ `Theme`）
+  - `VisualWorld` 活跃节点总计：`7,142`（均值 `255.1`，峰值 `3,727` @ `Inventory`）；`PagedRenderTree` 渲染节点总计：`1,754`（均值 `62.6`，峰值 `177` @ `Scoreboard` / `TicTacToe`）；4KB 渲染页总计：`342`（均值 `12.2`）
+  - 布局求解耗时合计：`1.25 ms`（均值 `0.04 ms`，峰值 `0.42 ms` @ `Inventory`）；`320x180` CPU 光栅化合计：`306.72 ms`（均值 `10.95 ms`，最快 `1.54 ms` @ `HelloWorld` / `Rive`，最慢 `102.75 ms` @ `Inventory`）
+
+| # | 示例名称 | 入口 XAML / RS 路径 | 剪枝 `.rsb` (KB) | MIR 类型 (保留/总计) | MIR 函数 (保留/总计) | 热编译 (ms) | `VisualWorld` 节点 | `PagedRenderTree` 节点 | 4KB 页数 | 布局 (ms) | `320x180` 光栅化 (ms) | 独立色数 | 非空像素率 | 64-bit FNV-1a RGBA 哈希 |
+| ---: | :--- | :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | :--- |
+| 1 | `BackgroundBlur` | `BackgroundBlur/Data/MainPage.xaml` | 7439.97 | 296/457 | 1991/3319 | 6540.94 | 65 | 36 | 4 | 0.03 | 4.92 | 1423 | 100.00% | `0xDB652185CB26DCFB` |
+| 2 | `BrushShaders` | `BrushShaders/Data/MainPage.xaml` | 6407.34 | 276/453 | 1862/3310 | 5949.84 | 57 | 44 | 3 | 0.02 | 6.38 | 2051 | 100.00% | `0x16F37500759D09A9` |
+| 3 | `Buttons` | `Buttons/Data/MainPage.xaml` | 6460.58 | 279/454 | 1897/3320 | 6326.48 | 47 | 28 | 2 | 0.01 | 4.42 | 1594 | 100.00% | `0x147569F3C276F009` |
+| 4 | `CustomAnimation` | `CustomAnimation/Data/MainPage.xaml` | 7262.93 | 283/452 | 1954/3317 | 6294.28 | 76 | 50 | 17 | 0.02 | 4.68 | 1860 | 100.00% | `0x63D37D2F23B56ADC` |
+| 5 | `CustomControl` | `CustomControl/Data/MainPage.xaml` | 5595.11 | 198/452 | 1582/3304 | 6261.46 | 47 | 99 | 8 | 0.02 | 2.05 | 502 | 100.00% | `0x0D680C1C8D014558` |
+| 6 | `CustomRender` | `CustomRender/Data/MainWindow.xaml` | 4424.11 | 179/450 | 1361/3317 | 6165.89 | 11 | 98 | 5 | 0.01 | 2.95 | 349 | 100.00% | `0x4F0AE337116AB098` |
+| 7 | `DataBinding` | `DataBinding/Data/MainPage.xaml` | 7230.33 | 297/459 | 2054/3357 | 14847.49 | 461 | 33 | 3 | 0.03 | 24.78 | 5493 | 100.00% | `0xFA0900E55346FD5E` |
+| 8 | `Gallery` | `Gallery/Data/MainWindow.xaml` | 14512.47 | 412/546 | 2402/3501 | 17691.40 | 203 | 45 | 12 | 0.03 | 22.90 | 526 | 100.00% | `0x7B4D0AD7915BED3B` |
+| 9 | `HelloWorld` | `HelloWorld/Data/MainPage.xaml` | 6116.56 | 270/450 | 1821/3304 | 6269.17 | 16 | 11 | 1 | 0.01 | 1.54 | 191 | 100.00% | `0x916986083A386852` |
+| 10 | `Integration` | `Integration/Data/MainPage.xaml` | 7076.82 | 227/450 | 1755/3353 | 6195.73 | 330 | 124 | 26 | 0.05 | 4.77 | 2399 | 100.00% | `0x02861E776D15FD05` |
+| 11 | `IntegrationGLUT` | `IntegrationGLUT/MainWindow.xaml` | 4789.69 | 199/454 | 1441/3325 | 6695.86 | 23 | 64 | 9 | 0.01 | 7.81 | 731 | 100.00% | `0x585E12BC27525914` |
+| 12 | `Inventory` | `Inventory/Data/MainPage.xaml` | 9906.04 | 325/468 | 2254/3394 | 15543.25 | 3727 | 133 | 9 | 0.42 | 102.75 | 200 | 100.00% | `0x2541FD5612E3FF26` |
+| 13 | `Localization` | `Localization/Data/MainPage.xaml` | 7932.64 | 305/464 | 2157/3360 | 15762.35 | 65 | 41 | 13 | 0.02 | 5.59 | 2455 | 100.00% | `0x06A63EA606B3B18A` |
+| 14 | `Login` | `Login/Data/MainPage.xaml` | 7625.37 | 300/455 | 2076/3317 | 6630.31 | 60 | 34 | 5 | 0.04 | 4.55 | 959 | 100.00% | `0x767380BB41E7A9BA` |
+| 15 | `Menu3D` | `Menu3D/Data/MainPage.xaml` | 10196.14 | 327/471 | 2247/3382 | 7002.97 | 116 | 25 | 5 | 0.02 | 1.97 | 1009 | 17.65% | `0xFE3470D2AED77B1C` |
+| 16 | `QuestLog` | `QuestLog/Data/MainPage.xaml` | 8353.19 | 310/463 | 2100/3364 | 15811.62 | 76 | 36 | 8 | 0.03 | 7.89 | 6018 | 100.00% | `0x9930F8292F3E19D4` |
+| 17 | `Rive` | `Rive/Data/MainPage.xaml` | 6508.23 | 292/458 | 1926/3323 | 6906.75 | 39 | 10 | 2 | 0.10 | 1.54 | 102 | 100.00% | `0x6F5E23442DAC208C` |
+| 18 | `Scoreboard` | `Scoreboard/Data/MainPage.xaml` | 8443.12 | 318/471 | 2150/3396 | 16905.87 | 298 | 177 | 61 | 0.10 | 17.62 | 3413 | 100.00% | `0xA40D851F99C2AEC0` |
+| 19 | `Theme` | `Theme/Data/MainWindow.xaml` | 12658.61 | 348/528 | 2171/3424 | 18571.06 | 265 | 127 | 26 | 0.07 | 22.09 | 289 | 100.00% | `0x88759A5D0A7A9411` |
+| 20 | `TicTacToe` | `TicTacToe/Data/MainPage.xaml` | 9627.59 | 302/455 | 2107/3344 | 6975.17 | 377 | 177 | 6 | 0.06 | 9.65 | 3382 | 100.00% | `0xCB380205335574F5` |
+| 21 | `UserControl` | `UserControl/Data/MainPage.xaml` | 7908.78 | 285/454 | 2036/3357 | 8601.10 | 84 | 46 | 6 | 0.02 | 6.88 | 1606 | 100.00% | `0x4BF06904908B48A6` |
+| 22 | `VideoEffect` | `VideoEffect/Data/MainPage.xaml` | 6408.74 | 290/456 | 1928/3343 | 6365.13 | 14 | 12 | 2 | 0.01 | 8.94 | 7360 | 100.00% | `0x55DDFD327EFC9D70` |
+| 23 | `WpfQuickStart` | `WpfQuickStart/Data/MainWindow.xaml` | 9280.70 | 271/464 | 1952/3386 | 18464.52 | 250 | 75 | 31 | 0.04 | 4.61 | 192 | 100.00% | `0x4FD2EFF40FE03D22` |
+| 24 | `V3/01_CodeFirstCounter` | `V3/01_CodeFirstCounter/Program.rs` | 4737.99 | 207/456 | 1418/3308 | 6082.26 | 30 | 28 | 8 | 0.01 | 5.97 | 199 | 100.00% | `0xF3B3776237AB91FE` |
+| 25 | `V3/02_CompiledXamlMvvm` | `V3/02_CompiledXamlMvvm/MainWindow.xaml` | 6424.09 | 238/459 | 1730/3347 | 15867.88 | 84 | 42 | 14 | 0.02 | 5.23 | 175 | 100.00% | `0xFBC8B211A5D2BCDE` |
+| 26 | `V3/03_ControlGallery` | `V3/03_ControlGallery/MainWindow.xaml` | 7319.88 | 246/451 | 1813/3310 | 6804.19 | 248 | 62 | 30 | 0.03 | 5.35 | 202 | 100.00% | `0x7D4B4F0846DBEE13` |
+| 27 | `V3/04_VectorAndCanvas` | `V3/04_VectorAndCanvas/MainWindow.xaml` | 5160.17 | 204/453 | 1586/3305 | 5935.29 | 30 | 60 | 13 | 0.01 | 6.03 | 591 | 100.00% | `0x787505EFC68D652C` |
+| 28 | `V3/05_DualDomainSimHud` | `V3/05_DualDomainSimHud/MainWindow.xaml` | 4699.93 | 188/453 | 1379/3305 | 6346.29 | 43 | 37 | 13 | 0.01 | 2.86 | 229 | 100.00% | `0x3229EB2068E53F0D` |
+
+## 3. `Gallery` 独立子页面无头编译渲染验证 (`Samples/Gallery/Data/Samples/*.xaml`)
+
+通过共享 `Gallery` 资源与字体搜索路径 (`DiscoverSampleProject`)，独立编译、步进 5 帧并光栅化 `320x180` RGBA8：
+
+| # | 子页面路径 | `VisualWorld` 节点 | `PagedRenderTree` 节点 | 独立色数 | 状态 |
+| ---: | :--- | ---: | ---: | ---: | :--- |
+| 1 | `Gallery/Data/Samples/Brushes.xaml` | 282 | 71 | 36 | PASS |
+| 2 | `Gallery/Data/Samples/Blending.xaml` | 42 | 19 | 425 | PASS |
+| 3 | `Gallery/Data/Samples/Effects.xaml` | 118 | 40 | 194 | PASS |
+| 4 | `Gallery/Data/Samples/Button.xaml` | 96 | 62 | 1681 | PASS |
+| 5 | `Gallery/Data/Samples/Slider.xaml` | 98 | 50 | 185 | PASS |
+| 6 | `Gallery/Data/Samples/Canvas.xaml` | 80 | 42 | 230 | PASS |
+
+## 4. 交互式 MVVM、命令绑定与控件状态验证 (`v3_legacy_samples_tests`)
+
+1. **`Buttons` (`800x600`)**：点击 `StartButton` 与 `SettingsButton`，验证 `StartCount` / `SettingsCount` 递增、`State` 由 `Menu -> Started -> Settings` 切换及渲染像素变化 (`CountChangedPixels > 0`)。
+2. **`Login` (`800x600`)**：向 `UserBox` / `PassBox` 注入文本并触发 `LoginBtn`（及回退验证 `LoginWithPassword`），校验 `LoginSuccessful == true` 与界面像素刷新 (`CountChangedPixels > 0`)。
+3. **`TicTacToe` (`800x600`)**：等待入场动画后点击 `Cell0`，校验 `Cell0 != 0` 与落子前后像素变化 (`CountChangedPixels > 0`)。
+4. **`Inventory` (`800x600`)**：校验 `ObservableList` 物品列表绑定、装备 (`EquipFromInventory`) / 卸下 (`UnequipSlot`) 状态更新与渲染像素刷新 (`CountChangedPixels > 0`)。
+5. **`QuestLog` (`800x600`)**：校验 `SelectedIndex`、`SelectedQuest.Title` 与 `SelectedQuest.Completed` 绑定、`SelectQuestByIndex(2)` 切换、任务完成态翻转 (`ToggleSelectedQuestCompleted`) 及 `CountChangedPixels > 0`。
+6. **`Localization` (`800x600`)**：校验 `Languages` (4 语言)、`SelectLanguageByIndex(1)` 切换至 `Français` (`Language-fr.xaml`) 并触发页面重绘 (`CountChangedPixels > 0`)，以及切换 `Language-ar.xaml` (阿拉伯语 RTL)。
+7. **`UserControl` (`800x600`)**：校验 `NumericUpDown` 自定义控件与 `SetStrength(25)` 预算上限夹紧 (`10 -> 16`, `PointsAvailable 6 -> 0`)、`ResetStats()` 复位、`IncrementStrength()` 递增 (`10 -> 11`) 与像素刷新。
+8. **`WpfQuickStart` (`800x600`)**：点击 `AddTaskButton` 触发 `AddTaskCommand`，验证 `TaskCount` / `TaskRows` / `ActiveTasks` 由 `3` 增至 `4` 且界面像素更新 (`CountChangedPixels > 0`)。
+9. **`CustomControl` (`800x600`)**：调用 `AdvanceAllClocks(3665)` 推进指针与读数，校验时钟视觉变化 (`CountChangedPixels > 0`)。
+10. **`Theme` (`800x600`)**：调用 `ToggleTheme()` 翻转 `IsDarkTheme` 并校验明暗主题像素重绘 (`CountChangedPixels > 0`)，随后调用 `NextAccent()` 切换 `CurrentAccent` 强调色。
+
+## 5. 测试范围与诚实边界说明 (Honest Scope Notes)
+
+- **运行模式**：表 2、表 3 均在无头模式（`NativeWindowConfig::forceHeadless = true`, `SoftwareRasterizer`）下采集，避免 GPU 驱动差异对 64-bit FNV-1a 像素回归造成影响；编译期热计时在启用持久化 `aero_stdlib_cache`、单次独立调用 `AeroCompilerV3::Compile` 的 Release 进程下测得。
+- **外部宿主与媒体能力边界**：`IntegrationGLUT` 的宿主 GLUT 主循环与 `VideoEffect` 外部实时视频解码流在无头测试中以宿主初始化与静态/占位帧路径运行；`Menu3D` 为居中透视 3D 菜单布局，清屏背景外有效前景覆盖率为 `17.65%` (`1009` 独立色)。
+- **资源与包路径解析**：`DiscoverSampleProject` 注册各示例 `<sampleDir>`、`Data/`、`Images/`、`Fonts/`、`Theme/` 以及祖先级 `Samples/Theme/Data/Theme`，使得 `Gallery/Data/Resources.xaml` 引用的 `/Noesis.GUI.Extensions;component/Theme/NoesisTheme.DarkBlue.xaml` 等主题与字体资源可直接解析并参与渲染。
+- **编译器与 ABI 约束**：全部二进制目标及 C++17 AOT 探针均在 MSVC `/GR-`（严格无 RTTI）与 32-bit `float` UI 呈现域约束下编译通过，且不修改 `CMakeLists.txt` 或外部 `C:/Projects/RealScript`。

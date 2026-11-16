@@ -988,6 +988,7 @@ public static class ParseUtil {
 public class DependencyObject {
     public virtual object UnboxObject() { return this; }
     public virtual string ToDisplayString() { return ""; }
+    public virtual bool BoxValueEquals(DependencyObject other) { return this == other; }
 
     public static DependencyObject BoxObject(object value) {
         if (value == null) { return null; }
@@ -1044,6 +1045,15 @@ public class TypedBox<T> : DependencyObject {
     public T Value;
     public TypedBox(T v) { Value = v; }
     public override string ToDisplayString() { return "" + Value; }
+    public override bool BoxValueEquals(DependencyObject other) {
+        DependencyObject self = this;
+        if (self == other) { return true; }
+        var o = other as TypedBox<T>;
+        if (o == null) { return false; }
+        var probe = new T[1];
+        probe[0] = Value;
+        return probe.Contains(o.Value);
+    }
     public override object UnboxObject() {
         if (ParseUtil.IsNativeReady()) {
             var r = Reflect_GetPropObject(this, "Value");
@@ -1325,7 +1335,7 @@ public class GradientBrush : Brush {
     protected int _cachedGradId = -1;
     protected bool _dirty = true;
     public int SpreadMethod { get; set; } = 0;
-    public int MappingMode { get; set; } = 1;
+    public int MappingMode { get; set; } = 0;
 
     public GradientBrush() { _stops = new GradientStop[0]; }
 
@@ -1770,6 +1780,13 @@ public partial class UIElement : DependencyObject {
     private Brush _explicitTextForeground;
     private Brush _inheritedTextForeground;
     private string _riveSource = "";
+    private ResourceDictionary _locResources;
+    private string _locSource = "";
+    private string _flowDirection = "LeftToRight";
+    private Style _appliedStyle;
+    internal bool _isDisposedTree = false;
+    private string[] _dynPropKeys;
+    private DependencyObject[] _dynPropVals;
 
     private bool _loadedFired = false;
     private bool _isStyleApplying = false;
@@ -1803,6 +1820,33 @@ public partial class UIElement : DependencyObject {
     }
 
     private void InitElement(VisualKind kind) {
+        if (_name == null) { _name = ""; }
+        if (_uid == null) { _uid = ""; }
+        _width = ParseUtil.NaN();
+        _height = ParseUtil.NaN();
+        _maxWidth = ParseUtil.PositiveInfinity();
+        _maxHeight = ParseUtil.PositiveInfinity();
+        _hAlign = HorizontalAlignment.Stretch;
+        _vAlign = VerticalAlignment.Stretch;
+        _visibility = Visibility.Visible;
+        _opacity = 1.0f;
+        _isEnabled = true;
+        _isHitTestVisible = true;
+        _gridRowSpan = 1;
+        _gridColSpan = 1;
+        _dock = Dock.Left;
+        _canvasLeft = ParseUtil.NaN();
+        _canvasTop = ParseUtil.NaN();
+        _canvasRight = ParseUtil.NaN();
+        _canvasBottom = ParseUtil.NaN();
+        _blendMode = BlendingMode.Normal;
+        if (_explicitFontFamily == null) { _explicitFontFamily = ""; }
+        if (_inheritedFontFamily == null) { _inheritedFontFamily = ""; }
+        if (_explicitFontWeight == null) { _explicitFontWeight = ""; }
+        if (_inheritedFontWeight == null) { _inheritedFontWeight = ""; }
+        if (_riveSource == null) { _riveSource = ""; }
+        if (_locSource == null) { _locSource = ""; }
+        if (_flowDirection == null || _flowDirection.Length == 0) { _flowDirection = "LeftToRight"; }
         _children = new UIElement[0];
         _margin = new Thickness(0.0f);
         _padding = new Thickness(0.0f);
@@ -1890,16 +1934,39 @@ public partial class UIElement : DependencyObject {
         PropagateDataContextToSubtree(oldBox);
     }
 
-    internal void ReceiveInheritedDataContext(DependencyObject parentDc) {
-        if (_explicitDataContext != null) { return; }
-        DependencyObject oldBox = _inheritedDataContext;
-        _inheritedDataContext = parentDc;
-        if (oldBox != parentDc) {
-            RaiseDataContextChanged(DependencyObject.Unbox(oldBox), DependencyObject.Unbox(parentDc));
-            for (int i = 0; i < _children.Length; i += 1) {
-                _children[i].ReceiveInheritedDataContext(EffectiveDataContextBox());
+    private static void PropagateDataContextQueue(UIElement startNode, DependencyObject dcBox, bool includeStart) {
+        if (startNode == null) { return; }
+        var els = new UIElement[0];
+        var dcs = new DependencyObject[0];
+        if (includeStart) {
+            els.Push(startNode);
+            dcs.Push(dcBox);
+        } else {
+            for (int i = 0; i < startNode._children.Length; i += 1) {
+                els.Push(startNode._children[i]);
+                dcs.Push(dcBox);
             }
         }
+        int idx = 0;
+        while (idx < els.Length) {
+            UIElement cur = els[idx];
+            DependencyObject parentDc = dcs[idx];
+            idx += 1;
+            if (cur == null || cur._explicitDataContext != null) { continue; }
+            DependencyObject oldBox = cur._inheritedDataContext;
+            if (oldBox == parentDc) { continue; }
+            cur._inheritedDataContext = parentDc;
+            cur.RaiseDataContextChanged(DependencyObject.Unbox(oldBox), DependencyObject.Unbox(parentDc));
+            DependencyObject eff = cur.EffectiveDataContextBox();
+            for (int i = 0; i < cur._children.Length; i += 1) {
+                els.Push(cur._children[i]);
+                dcs.Push(eff);
+            }
+        }
+    }
+
+    internal void ReceiveInheritedDataContext(DependencyObject parentDc) {
+        PropagateDataContextQueue(this, parentDc, true);
     }
 
     internal DependencyObject EffectiveDataContextBox() {
@@ -1909,9 +1976,7 @@ public partial class UIElement : DependencyObject {
     private void PropagateDataContextToSubtree(DependencyObject oldBox) {
         DependencyObject eff = EffectiveDataContextBox();
         RaiseDataContextChanged(DependencyObject.Unbox(oldBox), DependencyObject.Unbox(eff));
-        for (int i = 0; i < _children.Length; i += 1) {
-            _children[i].ReceiveInheritedDataContext(eff);
-        }
+        PropagateDataContextQueue(this, eff, false);
     }
 
     private void RaiseDataContextChanged(object oldVal, object newVal) {
@@ -1924,7 +1989,11 @@ public partial class UIElement : DependencyObject {
             if (_resources == null) { _resources = new ResourceDictionary(); }
             return _resources;
         }
-        set { _resources = value; RefreshDynamicResourcesRecursive(); }
+        set {
+            _resources = value;
+            ApplyStyleSubtree();
+            RefreshDynamicResourcesRecursive();
+        }
     }
 
     public Style Style {
@@ -1932,6 +2001,7 @@ public partial class UIElement : DependencyObject {
         set {
             if (_style == value) { return; }
             _style = value;
+            _appliedStyle = null;
             ApplyStyleInternal();
         }
     }
@@ -1959,11 +2029,19 @@ public partial class UIElement : DependencyObject {
     }
 
     public void RefreshDynamicResourcesRecursive() {
-        for (int i = 0; i < _dynResProps.Length; i += 1) {
-            ApplyDynamicResourceAt(i);
-        }
-        for (int i = 0; i < _children.Length; i += 1) {
-            _children[i].RefreshDynamicResourcesRecursive();
+        var q = new UIElement[0];
+        q.Push(this);
+        int idx = 0;
+        while (idx < q.Length) {
+            UIElement cur = q[idx];
+            idx += 1;
+            if (cur == null) { continue; }
+            for (int i = 0; i < cur._dynResProps.Length; i += 1) {
+                cur.ApplyDynamicResourceAt(i);
+            }
+            for (int i = 0; i < cur._children.Length; i += 1) {
+                q.Push(cur._children[i]);
+            }
         }
     }
 
@@ -1972,14 +2050,38 @@ public partial class UIElement : DependencyObject {
         _isStyleApplying = true;
         Style active = _style;
         if (active == null) {
-            DependencyObject themeRes = FindResourceBox(GetTypeName());
-            if (themeRes is Style) { active = themeRes as Style; }
+            string tn = GetTypeName();
+            if (ResourceDictionary.MayHaveStyleKey(tn)) {
+                DependencyObject themeRes = FindResourceBox(tn);
+                if (themeRes is Style) { active = themeRes as Style; }
+            }
         }
         if (active != null) {
-            active.ApplyTo(this);
-            OnStyleApplied(active);
+            if (active == _appliedStyle) {
+                active.EvaluateTriggers(this);
+            } else {
+                _appliedStyle = active;
+                active.ApplyTo(this);
+                OnStyleApplied(active);
+            }
         }
         _isStyleApplying = false;
+    }
+
+    public void ApplyStyleSubtree() {
+        var q = new UIElement[0];
+        q.Push(this);
+        int idx = 0;
+        while (idx < q.Length) {
+            UIElement cur = q[idx];
+            idx += 1;
+            if (cur == null) { continue; }
+            int preCount = cur._children.Length;
+            for (int i = 0; i < preCount; i += 1) {
+                q.Push(cur._children[i]);
+            }
+            cur.ApplyStyleInternal();
+        }
     }
 
     // ---- Layout & Geometry Properties ----
@@ -2129,14 +2231,16 @@ public partial class UIElement : DependencyObject {
         PropagateTypographyToSubtree();
     }
     public string EffectiveTextFontFamilyOrEmpty() {
-        return _explicitFontFamily.Length > 0 ? _explicitFontFamily : _inheritedFontFamily;
+        if (_explicitFontFamily != null && _explicitFontFamily.Length > 0) { return _explicitFontFamily; }
+        return _inheritedFontFamily == null ? "" : _inheritedFontFamily;
     }
     public void SetExplicitTextFontWeight(string fw) {
         _explicitFontWeight = fw == null ? "" : fw;
         PropagateTypographyToSubtree();
     }
     public string EffectiveTextFontWeightOrEmpty() {
-        return _explicitFontWeight.Length > 0 ? _explicitFontWeight : _inheritedFontWeight;
+        if (_explicitFontWeight != null && _explicitFontWeight.Length > 0) { return _explicitFontWeight; }
+        return _inheritedFontWeight == null ? "" : _inheritedFontWeight;
     }
     public void SetExplicitTextForeground(Brush fg) {
         _explicitTextForeground = fg;
@@ -2148,30 +2252,78 @@ public partial class UIElement : DependencyObject {
 
     internal virtual void OnInheritedTypographyChanged() {}
 
-    internal void ReceiveInheritedTypography(float fs, string ff, string fw, Brush fg) {
-        _inheritedFontSize = fs;
-        _inheritedFontFamily = ff == null ? "" : ff;
-        _inheritedFontWeight = fw == null ? "" : fw;
-        _inheritedTextForeground = fg;
-        OnInheritedTypographyChanged();
-        float outFs = EffectiveTextFontSizeOrZero();
-        string outFf = EffectiveTextFontFamilyOrEmpty();
-        string outFw = EffectiveTextFontWeightOrEmpty();
-        Brush outFg = EffectiveTextForeground();
-        for (int i = 0; i < _children.Length; i += 1) {
-            _children[i].ReceiveInheritedTypography(outFs, outFf, outFw, outFg);
+    private static void PropagateTypographyQueue(
+        UIElement startNode, float startFs, string startFf, string startFw, Brush startFg, bool includeStart) {
+        if (startNode == null) { return; }
+        var els = new UIElement[0];
+        var fss = new float[0];
+        var ffs = new string[0];
+        var fws = new string[0];
+        var fgs = new Brush[0];
+        if (includeStart) {
+            els.Push(startNode);
+            fss.Push(startFs);
+            ffs.Push(startFf == null ? "" : startFf);
+            fws.Push(startFw == null ? "" : startFw);
+            fgs.Push(startFg);
+        } else {
+            for (int i = 0; i < startNode._children.Length; i += 1) {
+                els.Push(startNode._children[i]);
+                fss.Push(startFs);
+                ffs.Push(startFf == null ? "" : startFf);
+                fws.Push(startFw == null ? "" : startFw);
+                fgs.Push(startFg);
+            }
         }
+        int idx = 0;
+        while (idx < els.Length) {
+            UIElement cur = els[idx];
+            float cFs = fss[idx];
+            string cFf = ffs[idx];
+            string cFw = fws[idx];
+            Brush cFg = fgs[idx];
+            idx += 1;
+            if (cur == null) { continue; }
+            if (cur._inheritedFontSize == cFs &&
+                cur._inheritedFontFamily == cFf &&
+                cur._inheritedFontWeight == cFw &&
+                cur._inheritedTextForeground == cFg) {
+                continue;
+            }
+            cur._inheritedFontSize = cFs;
+            cur._inheritedFontFamily = cFf;
+            cur._inheritedFontWeight = cFw;
+            cur._inheritedTextForeground = cFg;
+            cur.OnInheritedTypographyChanged();
+            if (cur._children.Length == 0) { continue; }
+            float outFs = cur.EffectiveTextFontSizeOrZero();
+            string outFf = cur.EffectiveTextFontFamilyOrEmpty();
+            string outFw = cur.EffectiveTextFontWeightOrEmpty();
+            Brush outFg = cur.EffectiveTextForeground();
+            for (int i = 0; i < cur._children.Length; i += 1) {
+                els.Push(cur._children[i]);
+                fss.Push(outFs);
+                ffs.Push(outFf);
+                fws.Push(outFw);
+                fgs.Push(outFg);
+            }
+        }
+    }
+
+    internal void ReceiveInheritedTypography(float fs, string ff, string fw, Brush fg) {
+        PropagateTypographyQueue(this, fs, ff, fw, fg, true);
     }
 
     protected void PropagateTypographyToSubtree() {
         OnInheritedTypographyChanged();
-        float outFs = EffectiveTextFontSizeOrZero();
-        string outFf = EffectiveTextFontFamilyOrEmpty();
-        string outFw = EffectiveTextFontWeightOrEmpty();
-        Brush outFg = EffectiveTextForeground();
-        for (int i = 0; i < _children.Length; i += 1) {
-            _children[i].ReceiveInheritedTypography(outFs, outFf, outFw, outFg);
-        }
+        if (_children.Length == 0) { return; }
+        PropagateTypographyQueue(
+            this,
+            EffectiveTextFontSizeOrZero(),
+            EffectiveTextFontFamilyOrEmpty(),
+            EffectiveTextFontWeightOrEmpty(),
+            EffectiveTextForeground(),
+            false);
     }
 
     public void AddInputBinding(KeyBinding kb) {
@@ -2368,7 +2520,7 @@ public partial class UIElement : DependencyObject {
     public UIElement[] Children() { return _children; }
 
     public virtual void AddChild(UIElement child) {
-        if (child == null) { return; }
+        if (child == null || child == this || child.IsAncestorOf(this)) { return; }
         if (child._parent != null) { child._parent.RemoveChild(child); }
         child._parent = this;
         _children.Push(child);
@@ -2379,7 +2531,7 @@ public partial class UIElement : DependencyObject {
     }
 
     public virtual void InsertChild(int index, UIElement child) {
-        if (child == null) { return; }
+        if (child == null || child == this || child.IsAncestorOf(this)) { return; }
         if (child._parent != null) { child._parent.RemoveChild(child); }
         int idx = index < 0 ? 0 : (index > _children.Length ? _children.Length : index);
         child._parent = this;
@@ -2391,15 +2543,23 @@ public partial class UIElement : DependencyObject {
     }
 
     protected void OnChildAttached(UIElement child) {
+        if (_parent == null && !_loadedFired && _resources == null && _locResources == null &&
+            _explicitDataContext == null && _inheritedDataContext == null &&
+            _explicitFontSize <= 0.0f && _explicitFontFamily.Length == 0 &&
+            _explicitFontWeight.Length == 0 && _explicitTextForeground == null) {
+            return;
+        }
         child.ReceiveInheritedDataContext(EffectiveDataContextBox());
         child.ReceiveInheritedTypography(
             EffectiveTextFontSizeOrZero(),
             EffectiveTextFontFamilyOrEmpty(),
             EffectiveTextFontWeightOrEmpty(),
             EffectiveTextForeground());
-        child.ApplyStyleInternal();
+        child.ApplyStyleSubtree();
         child.RefreshDynamicResourcesRecursive();
-        child.EnsureLoadedSubtree();
+        if (_loadedFired) {
+            child.EnsureLoadedSubtree();
+        }
     }
 
     public virtual void RemoveChild(UIElement child) {
@@ -2428,34 +2588,81 @@ public partial class UIElement : DependencyObject {
         }
     }
 
-    public void EnsureLoadedSubtree() {
+    private void EnsureLoadedSelf() {
         if (!_loadedFired) {
             _loadedFired = true;
             ApplyStyleInternal();
             OnLoaded();
             Loaded(this, new RoutedEventArgs("Loaded", this));
         }
-        for (int i = 0; i < _children.Length; i += 1) {
-            _children[i].EnsureLoadedSubtree();
-        }
     }
 
-    protected void NotifyUnloadedSubtree() {
+    private void NotifyUnloadedSelf() {
         if (_loadedFired) {
             _loadedFired = false;
             Unloaded(this, new RoutedEventArgs("Unloaded", this));
         }
-        for (int i = 0; i < _children.Length; i += 1) {
-            _children[i].NotifyUnloadedSubtree();
+    }
+
+    public void EnsureLoadedSubtree() {
+        var q = new UIElement[0];
+        q.Push(this);
+        int idx = 0;
+        while (idx < q.Length) {
+            UIElement cur = q[idx];
+            idx += 1;
+            if (cur == null) { continue; }
+            int preCount = cur._children.Length;
+            for (int i = 0; i < preCount; i += 1) {
+                q.Push(cur._children[i]);
+            }
+            cur.EnsureLoadedSelf();
+        }
+    }
+
+    protected void NotifyUnloadedSubtree() {
+        var q = new UIElement[0];
+        q.Push(this);
+        int idx = 0;
+        while (idx < q.Length) {
+            UIElement cur = q[idx];
+            idx += 1;
+            if (cur == null) { continue; }
+            cur.NotifyUnloadedSelf();
+            for (int i = 0; i < cur._children.Length; i += 1) {
+                q.Push(cur._children[i]);
+            }
+        }
+    }
+
+    internal void MarkDisposedSubtree() {
+        var q = new UIElement[0];
+        q.Push(this);
+        int idx = 0;
+        while (idx < q.Length) {
+            UIElement cur = q[idx];
+            idx += 1;
+            if (cur == null || cur._isDisposedTree) { continue; }
+            cur._isDisposedTree = true;
+            for (int i = 0; i < cur._children.Length; i += 1) {
+                q.Push(cur._children[i]);
+            }
         }
     }
 
     public UIElement FindName(string name) {
         if (name == null || name.Length == 0) { return null; }
-        if (_name == name) { return this; }
-        for (int i = 0; i < _children.Length; i += 1) {
-            UIElement found = _children[i].FindName(name);
-            if (found != null) { return found; }
+        var stack = new UIElement[0];
+        stack.Push(this);
+        while (stack.Length > 0) {
+            int last = stack.Length - 1;
+            UIElement cur = stack[last];
+            stack.RemoveAt(last);
+            if (cur == null) { continue; }
+            if (cur._name == name) { return cur; }
+            for (int i = cur._children.Length - 1; i >= 0; i -= 1) {
+                stack.Push(cur._children[i]);
+            }
         }
         return null;
     }
@@ -2475,10 +2682,18 @@ public partial class UIElement : DependencyObject {
         return false;
     }
 
-    public DependencyObject FindResourceBox(string key) {
+    protected DependencyObject TryFindLocalResourceBox(string key) {
+        if (key == null || key.Length == 0 || _resources == null || !_resources.Contains(key)) { return null; }
+        return _resources.GetBox(key);
+    }
+
+    public virtual DependencyObject FindResourceBox(string key) {
         if (key == null || key.Length == 0) { return null; }
         UIElement cur = this;
         while (cur != null) {
+            if (cur._locResources != null && cur._locResources.Contains(key)) {
+                return cur._locResources.GetBox(key);
+            }
             if (cur._resources != null && cur._resources.Contains(key)) {
                 return cur._resources.GetBox(key);
             }
@@ -2677,7 +2892,71 @@ public partial class UIElement : DependencyObject {
             _riveSource = DependencyObject.UnboxString(value, "");
             return true;
         }
+        if (propName == "Loc.Source" || propName == "noesis:Loc.Source") {
+            ApplyLocSource(DependencyObject.UnboxString(value, ""));
+            return true;
+        }
+        if (propName == "FlowDirection") {
+            string fd = DependencyObject.UnboxString(value, "LeftToRight").Trim();
+            if (fd.Length > 0 && fd != _flowDirection) {
+                _flowDirection = fd;
+                UpdateLayout();
+            }
+            return true;
+        }
+        string cleanCustom = NormalizeCustomPropKey(propName);
+        if (IsCustomAttachedPropKey(cleanCustom)) {
+            SetDynamicProp(cleanCustom, value);
+            return true;
+        }
         return false;
+    }
+
+    private static string NormalizeCustomPropKey(string propName) {
+        if (propName == null) { return ""; }
+        string s = propName.Trim();
+        if (s.Length > 2 && s.Substring(0, 1) == "(" && s.Substring(s.Length - 1, 1) == ")") {
+            s = s.Substring(1, s.Length - 2).Trim();
+        }
+        return s;
+    }
+
+    private static bool IsCustomAttachedPropKey(string cleanKey) {
+        return cleanKey.Length >= 7 && cleanKey.Substring(0, 7) == "Custom.";
+    }
+
+    private void SetDynamicProp(string cleanKey, DependencyObject value) {
+        if (_dynPropKeys == null) {
+            _dynPropKeys = new string[0];
+            _dynPropVals = new DependencyObject[0];
+        }
+        for (int i = 0; i < _dynPropKeys.Length; i += 1) {
+            if (_dynPropKeys[i] == cleanKey) {
+                _dynPropVals[i] = value;
+                return;
+            }
+        }
+        _dynPropKeys.Push(cleanKey);
+        _dynPropVals.Push(value);
+    }
+
+    private DependencyObject GetDynamicProp(string cleanKey) {
+        if (_dynPropKeys == null) { return null; }
+        for (int i = 0; i < _dynPropKeys.Length; i += 1) {
+            if (_dynPropKeys[i] == cleanKey) { return _dynPropVals[i]; }
+        }
+        return null;
+    }
+
+    public void ApplyLocSource(string sourceName) {
+        string nextSrc = sourceName == null ? "" : sourceName.Trim();
+        ResourceDictionary dict = ResourceDictionary.GetLocSource(nextSrc);
+        if (dict == null) { return; }
+        _locSource = nextSrc;
+        _locResources = dict;
+        RefreshDynamicResourcesRecursive();
+        BindingEngine.Flush();
+        UpdateLayout();
     }
 
     public virtual DependencyObject GetPropertyValue(string propName) {
@@ -2728,6 +3007,10 @@ public partial class UIElement : DependencyObject {
             if (_renderTransform != null) { _renderTransform.Accumulate(td); }
             return DependencyObject.BoxFloat(td.TY);
         }
+        if (propName == "FlowDirection") { return DependencyObject.BoxString(_flowDirection); }
+        if (propName == "Loc.Source" || propName == "noesis:Loc.Source") { return DependencyObject.BoxString(_locSource); }
+        DependencyObject customBox = GetDynamicProp(NormalizeCustomPropKey(propName));
+        if (customBox != null) { return customBox; }
         return null;
     }
 

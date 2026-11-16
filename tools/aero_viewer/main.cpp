@@ -29,6 +29,8 @@ void PrintUsage() {
         "  --out <screenshot.ppm>  Write rendered RGBA8 frame as binary PPM (P6)\n"
         "  --O2                    Enable aggressive MIR optimization\n"
         "  --stdlib <dir>          Path to stdlib root directory\n"
+        "  --cache-dir <dir>       Disk stdlib cache directory\n"
+        "  --no-cache              Disable stdlib disk cache\n"
         "  -h, --help              Show this help\n");
 }
 
@@ -93,11 +95,27 @@ void PrintUsage() {
     return anyNonZero && anyDiff;
 }
 
-[[nodiscard]] bool EndsWithIgnoreCase(std::string_view text, std::string_view suffix) noexcept {
-    if (text.size() < suffix.size()) {
-        return false;
+[[nodiscard]] std::string ResolveDefaultCacheDir(const char* argv0) {
+    if (const char* envCache = std::getenv("AERO_CACHE_DIR"); envCache && envCache[0] != '\0') {
+        return std::filesystem::path(envCache).lexically_normal().generic_string();
     }
-    return aero::str::EqualsIgnoreCase(text.substr(text.size() - suffix.size()), suffix);
+    if (argv0 && argv0[0] != '\0') {
+        const std::filesystem::path exeDir = std::filesystem::path(argv0).parent_path();
+        if (!exeDir.empty()) {
+            return (exeDir / "aero_stdlib_cache").lexically_normal().generic_string();
+        }
+    }
+    return {};
+}
+
+void AppendUniqueDir(std::vector<std::string>& list, const std::filesystem::path& dir) {
+    if (dir.empty()) {
+        return;
+    }
+    const std::string norm = dir.lexically_normal().generic_string();
+    if (std::find(list.begin(), list.end(), norm) == list.end()) {
+        list.push_back(norm);
+    }
 }
 
 [[nodiscard]] std::string ResolveDefaultStdlibDir(const char* argv0) {
@@ -146,6 +164,8 @@ int main(int argc, char** argv) {
     std::string outPpmPath;
     bool optimizeO2 = false;
     std::string stdlibDir;
+    std::string cacheDir;
+    bool allowCache = true;
 
     for (int i = 1; i < argc; ++i) {
         const std::string_view arg(argv[i]);
@@ -202,6 +222,12 @@ int main(int argc, char** argv) {
             const char* v = needNext(arg);
             if (!v) return 2;
             stdlibDir = v;
+        } else if (arg == "--cache-dir") {
+            const char* v = needNext(arg);
+            if (!v) return 2;
+            cacheDir = v;
+        } else if (arg == "--no-cache") {
+            allowCache = false;
         } else {
             std::cerr << "Unknown option: " << arg << "\n";
             PrintUsage();
@@ -218,105 +244,91 @@ int main(int argc, char** argv) {
     std::cerr << "aero-viewer was built without AERO_HAS_COMPILER_V3 compiler support.\n";
     return 1;
 #else
-    if (!sampleDir.empty()) {
-        const std::filesystem::path dirPath(sampleDir);
-        std::error_code ec;
-        if (!std::filesystem::exists(dirPath, ec) || !std::filesystem::is_directory(dirPath, ec)) {
-            std::cerr << "Sample directory not found: " << sampleDir << "\n";
-            return 1;
-        }
-        std::vector<std::filesystem::path> xamls;
-        std::vector<std::filesystem::path> scripts;
-        for (const auto& entry : std::filesystem::recursive_directory_iterator(dirPath, ec)) {
-            if (!entry.is_regular_file()) {
-                continue;
-            }
-            const std::filesystem::path p = entry.path();
-            const std::string ext = p.extension().string();
-            const std::string name = p.filename().string();
-            if (aero::str::EqualsIgnoreCase(ext, ".xaml")) {
-                xamls.push_back(p);
-            } else if ((aero::str::EqualsIgnoreCase(ext, ".rs") || aero::str::EqualsIgnoreCase(ext, ".cs")) &&
-                       !EndsWithIgnoreCase(name, ".g.rs")) {
-                scripts.push_back(p);
-            }
-        }
-        std::sort(xamls.begin(), xamls.end());
-        std::sort(scripts.begin(), scripts.end());
+    aero::AeroV3CompileInput compileInput;
+    aero::AeroAppHostConfig hostCfg;
 
-        if (xamlPath.empty() && !xamls.empty()) {
-            // Prefer MainWindow.xaml or first XAML with x:Class
-            for (const auto& xp : xamls) {
-                if (aero::str::EqualsIgnoreCase(xp.filename().string(), "MainWindow.xaml")) {
-                    xamlPath = xp.lexically_normal().generic_string();
-                    break;
-                }
-            }
-            if (xamlPath.empty()) {
-                for (const auto& xp : xamls) {
-                    std::string text;
-                    if (ReadFileText(xp, text) && text.find("x:Class") != std::string::npos) {
-                        xamlPath = xp.lexically_normal().generic_string();
-                        break;
-                    }
-                }
-            }
-            if (xamlPath.empty()) {
-                xamlPath = xamls.front().lexically_normal().generic_string();
-            }
-        }
-        for (const auto& sp : scripts) {
-            const std::string norm = sp.lexically_normal().generic_string();
-            if (std::find(scriptPaths.begin(), scriptPaths.end(), norm) == scriptPaths.end()) {
-                scriptPaths.push_back(norm);
-            }
+    if (!sampleDir.empty()) {
+        if (!aero::DiscoverSampleProject(std::filesystem::path(sampleDir), compileInput, hostCfg)) {
+            std::cerr << "Failed to discover sample project: " << sampleDir << "\n";
+            return 1;
         }
     }
 
-    aero::AeroV3CompileInput compileInput;
     compileInput.includeStdlib = true;
     compileInput.optimizeBytecode = optimizeO2;
+    compileInput.allowDiskCache = allowCache;
+    if (allowCache) {
+        compileInput.cacheDir = !cacheDir.empty() ? cacheDir : ResolveDefaultCacheDir(argc > 0 ? argv[0] : nullptr);
+    }
     if (!stdlibDir.empty()) {
         compileInput.stdlibRootDir = stdlibDir;
-    } else {
+    } else if (compileInput.stdlibRootDir.empty()) {
         compileInput.stdlibRootDir = ResolveDefaultStdlibDir(argc > 0 ? argv[0] : nullptr);
     }
 
-    if (!sampleDir.empty()) {
-        compileInput.resourceSearchRoot = std::filesystem::path(sampleDir).lexically_normal().generic_string();
-    }
     if (!xamlPath.empty()) {
-        const std::filesystem::path xp(xamlPath);
-        compileInput.xamlPath = xp.lexically_normal().generic_string();
-        if (compileInput.resourceSearchRoot.empty() && xp.has_parent_path()) {
-            compileInput.resourceSearchRoot = xp.parent_path().lexically_normal().generic_string();
-        }
+        const std::filesystem::path xp = std::filesystem::path(xamlPath).lexically_normal();
+        compileInput.xamlPath = xp.generic_string();
         if (!ReadFileText(xp, compileInput.xamlContent)) {
             std::cerr << "Failed to read XAML file: " << xamlPath << "\n";
             return 1;
         }
+        compileInput.additionalXamlSources.erase(
+            std::remove_if(
+                compileInput.additionalXamlSources.begin(),
+                compileInput.additionalXamlSources.end(),
+                [&](const aero::SourceFile& sf) {
+                    return aero::str::EqualsIgnoreCase(
+                        std::filesystem::path(sf.path).lexically_normal().generic_string(),
+                        compileInput.xamlPath);
+                }),
+            compileInput.additionalXamlSources.end());
+
+        if (xp.has_parent_path()) {
+            const std::filesystem::path xpDir = xp.parent_path();
+            if (compileInput.resourceSearchRoot.empty()) {
+                compileInput.resourceSearchRoot = xpDir.generic_string();
+            }
+            AppendUniqueDir(compileInput.resourceSearchPaths, xpDir);
+            AppendUniqueDir(hostCfg.assetSearchDirs, xpDir);
+        }
     }
+
     for (const auto& sp : scriptPaths) {
+        const std::filesystem::path spPath = std::filesystem::path(sp).lexically_normal();
+        const std::string norm = spPath.generic_string();
+        const bool alreadyAdded = std::any_of(
+            compileInput.scriptSources.begin(),
+            compileInput.scriptSources.end(),
+            [&](const aero::SourceFile& sf) {
+                return aero::str::EqualsIgnoreCase(
+                    std::filesystem::path(sf.path).lexically_normal().generic_string(),
+                    norm);
+            });
+        if (alreadyAdded) {
+            continue;
+        }
         std::string text;
-        if (!ReadFileText(sp, text)) {
+        if (!ReadFileText(spPath, text)) {
             std::cerr << "Failed to read script file: " << sp << "\n";
             return 1;
         }
         aero::SourceFile sf;
-        sf.path = std::filesystem::path(sp).lexically_normal().generic_string();
+        sf.path = norm;
         sf.content = std::move(text);
         compileInput.scriptSources.push_back(std::move(sf));
     }
 
-    aero::AeroAppHostConfig hostCfg;
     hostCfg.viewportWidth = width;
     hostCfg.viewportHeight = height;
     hostCfg.headless = headless;
     hostCfg.optimizeBytecode = optimizeO2;
-    hostCfg.entryClassName = entryName;
-    hostCfg.entryFunctionName = entryName;
+    if (!entryName.empty()) {
+        hostCfg.entryClassName = entryName;
+        hostCfg.entryFunctionName = entryName;
+    }
     if (!compileInput.resourceSearchRoot.empty()) {
-        hostCfg.assetSearchDirs.push_back(compileInput.resourceSearchRoot);
+        AppendUniqueDir(hostCfg.assetSearchDirs, std::filesystem::path(compileInput.resourceSearchRoot));
     }
 
     aero::AeroAppHost host(hostCfg);

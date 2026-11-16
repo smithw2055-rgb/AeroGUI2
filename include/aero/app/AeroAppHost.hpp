@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <filesystem>
 #include <functional>
 #include <memory>
 #include <string>
@@ -40,6 +41,15 @@ struct AeroAppHostConfig {
     std::vector<std::string> assetSearchDirs;
     Color clearColor{0.059f, 0.090f, 0.165f, 1.0f};
 };
+
+#ifdef AERO_HAS_COMPILER_V3
+/// Discovers a sample directory's entry XAML, bundled auxiliary XAMLs, script sources,
+/// and resource/asset search paths into compile and host configurations.
+[[nodiscard]] bool DiscoverSampleProject(
+    const std::filesystem::path& sampleDir,
+    AeroV3CompileInput& outCompileInput,
+    AeroAppHostConfig& outHostConfig);
+#endif
 
 class AeroAppHost final {
 public:
@@ -179,9 +189,16 @@ private:
         SymbolId bindingFlush = 0u;
         SymbolId windowShow = 0u;
         SymbolId applyTemplate = 0u;
+        SymbolId controlApplyTemplate = 0u;
         SymbolId ensureLoadedSubtree = 0u;
+        SymbolId popupSetOverlayHost = 0u;
     };
 
+    void RegisterAssetDirectoryInternal(std::string_view dir);
+    [[nodiscard]] bool LoadProgramImageInternal(
+        std::shared_ptr<const ProgramImage> image,
+        std::string_view entryClassOrFn,
+        std::string_view preferredEntryClass);
     void ResetLoadedProgramState() noexcept;
     void WireKernelBridges();
     void ResolveDispatchSymbols();
@@ -235,6 +252,7 @@ private:
 #endif
 
     CachedDispatchSymbols symbols_{};
+    std::string preferredEntryClass_;
     ObjectRef rootObject_{};
     PersistentRoot rootObjectPin_{};
     ObjectRef simObject_{};

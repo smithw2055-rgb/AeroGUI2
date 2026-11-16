@@ -288,8 +288,38 @@ public class TextBlock : FrameworkElement {
     public Brush Stroke { get; set; }
     public float StrokeThickness { get; set; } = 0.0f;
 
+    private static string StripRichTextTags(string raw) {
+        if (raw == null || raw.Length == 0) { return ""; }
+        string outText = "";
+        int i = 0;
+        while (i < raw.Length) {
+            string ch = raw.Substring(i, 1);
+            if (ch == "[") {
+                int closeIdx = -1;
+                int j = i + 1;
+                while (j < raw.Length) {
+                    string cj = raw.Substring(j, 1);
+                    if (cj == "]") { closeIdx = j; break; }
+                    if (cj == "[") { break; }
+                    j += 1;
+                }
+                if (closeIdx > i) {
+                    i = closeIdx + 1;
+                    continue;
+                }
+            }
+            outText = outText + ch;
+            i += 1;
+        }
+        return outText;
+    }
+
     public override bool SetPropertyValue(string propName, DependencyObject value) {
         if (propName == "Text") { Text = DependencyObject.UnboxString(value, ""); return true; }
+        if (propName == "RichText.Text" || propName == "noesis:RichText.Text") {
+            Text = StripRichTextTags(DependencyObject.UnboxString(value, ""));
+            return true;
+        }
         if (propName == "FontFamily") { FontFamily = DependencyObject.UnboxString(value, "Segoe UI"); return true; }
         if (propName == "FontSize") { FontSize = DependencyObject.UnboxFloat(value, 14.0f); return true; }
         if (propName == "FontWeight") { FontWeight = DependencyObject.UnboxString(value, "Normal"); return true; }

@@ -583,9 +583,7 @@ std::size_t VisualRenderAdapter::EmitBoxVisual(
         if (hasBgGrad || HasAlpha(node.box.bgRgba)) {
             const auto beginNid = static_cast<std::uint32_t>(tree.nodes_.size());
             if (hasBgGrad) {
-                const Color tint = HasAlpha(node.box.bgRgba)
-                    ? UnpackRgba32(node.box.bgRgba, effOpacity)
-                    : Color{1.0f, 1.0f, 1.0f, effOpacity};
+                const Color tint{1.0f, 1.0f, 1.0f, effOpacity};
                 (void)tree.AllocateGradientRoundedRectNode(
                     rect.x,
                     rect.y,
@@ -880,9 +878,7 @@ std::size_t VisualRenderAdapter::EmitVectorVisual(
                 if (hasFill) {
                     const auto beginNid = static_cast<std::uint32_t>(tree.nodes_.size());
                     if (vec.fillGradId > 0) {
-                        const Color tint = HasAlpha(vec.fillRgba)
-                            ? UnpackRgba32(vec.fillRgba, effOpacity)
-                            : Color{1.0f, 1.0f, 1.0f, effOpacity};
+                        const Color tint{1.0f, 1.0f, 1.0f, effOpacity};
                         (void)tree.AllocateGradientRoundedRectNode(
                             rect.x,
                             rect.y,
@@ -1071,9 +1067,7 @@ std::size_t VisualRenderAdapter::EmitCanvasDrawVisual(
                     if (cmd.gradientId > 0 || HasAlpha(cmd.colorRgba)) {
                         const auto bN = static_cast<std::uint32_t>(tree.nodes_.size());
                         if (cmd.gradientId > 0) {
-                            const Color tint = HasAlpha(cmd.colorRgba)
-                                ? UnpackRgba32(cmd.colorRgba, curOpacity)
-                                : Color{1.0f, 1.0f, 1.0f, curOpacity};
+                            const Color tint{1.0f, 1.0f, 1.0f, curOpacity};
                             (void)tree.AllocateGradientRoundedRectNode(
                                 rect.x + cmd.rect.x, rect.y + cmd.rect.y, cmd.rect.width, cmd.rect.height,
                                 static_cast<std::uint32_t>(cmd.gradientId), CornerRadius{}, false, tint, 1.0f, &node);
@@ -1105,9 +1099,7 @@ std::size_t VisualRenderAdapter::EmitCanvasDrawVisual(
                     if (cmd.gradientId > 0 || HasAlpha(cmd.colorRgba)) {
                         const auto bN = static_cast<std::uint32_t>(tree.nodes_.size());
                         if (cmd.gradientId > 0) {
-                            const Color tint = HasAlpha(cmd.colorRgba)
-                                ? UnpackRgba32(cmd.colorRgba, curOpacity)
-                                : Color{1.0f, 1.0f, 1.0f, curOpacity};
+                            const Color tint{1.0f, 1.0f, 1.0f, curOpacity};
                             (void)tree.AllocateGradientRoundedRectNode(
                                 rect.x + cmd.rect.x, rect.y + cmd.rect.y, cmd.rect.width, cmd.rect.height,
                                 static_cast<std::uint32_t>(cmd.gradientId), CornerRadius{radius}, false, tint, 1.0f, &node);
@@ -1143,9 +1135,7 @@ std::size_t VisualRenderAdapter::EmitCanvasDrawVisual(
                         const float bh = cmd.rect.height * 2.0f;
                         const auto bN = static_cast<std::uint32_t>(tree.nodes_.size());
                         if (cmd.gradientId > 0) {
-                            const Color tint = HasAlpha(cmd.colorRgba)
-                                ? UnpackRgba32(cmd.colorRgba, curOpacity)
-                                : Color{1.0f, 1.0f, 1.0f, curOpacity};
+                            const Color tint{1.0f, 1.0f, 1.0f, curOpacity};
                             (void)tree.AllocateGradientRoundedRectNode(
                                 bx, by, bw, bh, static_cast<std::uint32_t>(cmd.gradientId),
                                 CornerRadius{}, true, tint, 1.0f, &node);

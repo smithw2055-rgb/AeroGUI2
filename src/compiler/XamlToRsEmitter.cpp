@@ -822,6 +822,7 @@ private:
     std::vector<std::string> diagnostics_;
     int nextId_ = 0;
     bool inPartialClass_ = false;
+    bool emittedLocSources_ = false;
     std::string currentTplParentVar_;
 
     void MaybeImportClrNamespace(std::string_view ns) {
@@ -1311,7 +1312,8 @@ private:
             Indent(out, indent);
             out << dictVar << ".SetBox(" << EscapeRsString(key) << ", DependencyObject.BoxBool("
                 << (bv ? "true" : "false") << "));\n";
-        } else if (child.localName == "String" || child.localName == "FontFamily") {
+        } else if (child.localName == "String" || child.localName == "FontFamily" ||
+                   child.localName == "FlowDirection") {
             Indent(out, indent);
             out << dictVar << ".SetBox(" << EscapeRsString(key) << ", DependencyObject.BoxString("
                 << EscapeRsString(aero::str::Trim(child.textContent)) << "));\n";
@@ -1876,8 +1878,8 @@ private:
             return;
         }
         // StyleInteraction.Triggers -> Style.AddBehaviorTrigger(...)
-        if (pAttr->rawName == "noesis:StyleInteraction.Triggers" ||
-            aero::str::EndsWith(pAttr->rawName, "StyleInteraction.Triggers")) {
+        if (pAttr->value == "noesis:StyleInteraction.Triggers" ||
+            aero::str::EndsWith(pAttr->value, "StyleInteraction.Triggers")) {
             if (const auto* valEl = setterNode.FindPropertyElement("Setter", "Value")) {
                 for (const auto& c : valEl->children) {
                     if (c->localName == "StyleTriggerCollection") {
@@ -2102,8 +2104,12 @@ private:
         const std::string tpParam = FreshVar("__tp");
 
         Indent(out, indent);
-        out << "var " << tplVar << " = new ControlTemplate(" << EscapeRsString(targetType)
-            << ", (Control " << tpParam << ") =>\n";
+        out << "var " << tplVar << " = new ControlTemplate();\n";
+        Indent(out, indent);
+        out << tplVar << ".TargetType = " << EscapeRsString(targetType) << ";\n";
+        EmitResourcesPropertyElement(tplNode, "ControlTemplate", tplVar, opts_.xamlPath, out, indent);
+        Indent(out, indent);
+        out << tplVar << ".Factory = (Control " << tpParam << ") =>\n";
         Indent(out, indent);
         out << "{\n";
 
@@ -2117,7 +2123,7 @@ private:
         std::string returnedRoot;
         for (const auto& child : tplNode.children) {
             if (ShouldIgnoreXmlElement(*child) ||
-                child->localName == "ControlTemplate.Triggers") {
+                child->localName.find('.') != std::string::npos) {
                 continue;
             }
             returnedRoot = EmitConstructedElement(*child, "", safeDictVar, opts_.xamlPath, out, indent + 1);
@@ -2135,7 +2141,7 @@ private:
         currentTplParentVar_ = prevTp;
 
         Indent(out, indent);
-        out << "});\n";
+        out << "};\n";
 
         if (const XamlNode* trigProp = tplNode.FindPropertyElement("ControlTemplate", "Triggers")) {
             EmitTriggerCollectionInto(*trigProp, tplVar, dictVar, out, indent);
@@ -2192,7 +2198,14 @@ private:
         const std::string dcParam = FreshVar("__dc");
 
         Indent(out, indent);
-        out << "var " << dtVar << " = new DataTemplate((object " << dcParam << ") =>\n";
+        out << "var " << dtVar << " = new DataTemplate();\n";
+        if (!itemDataType.empty()) {
+            Indent(out, indent);
+            out << dtVar << ".DataType = " << EscapeRsString(itemDataType) << ";\n";
+        }
+        EmitResourcesPropertyElement(dtNode, "DataTemplate", dtVar, opts_.xamlPath, out, indent);
+        Indent(out, indent);
+        out << dtVar << ".Factory = (object " << dcParam << ") =>\n";
         Indent(out, indent);
         out << "{\n";
 
@@ -2203,7 +2216,8 @@ private:
 
         std::string returnedRoot;
         for (const auto& child : dtNode.children) {
-            if (ShouldIgnoreXmlElement(*child)) {
+            if (ShouldIgnoreXmlElement(*child) ||
+                child->localName.find('.') != std::string::npos) {
                 continue;
             }
             returnedRoot = EmitConstructedElement(
@@ -2223,7 +2237,7 @@ private:
         inPartialClass_ = prevPartial;
 
         Indent(out, indent);
-        out << "});\n";
+        out << "};\n";
 
         if (const XamlNode* trigProp = dtNode.FindPropertyElement("DataTemplate", "Triggers")) {
             EmitTriggerCollectionInto(*trigProp, dtVar, dictVar, out, indent);
@@ -2734,10 +2748,16 @@ private:
                 propName = "Stroke";
             } else if (aero::str::EndsWith(propName, "Text.StrokeThickness")) {
                 propName = "StrokeThickness";
+            } else if (propName == "noesis:RichText.Text" || propName == "RichText.Text") {
+                propName = "RichText.Text";
             }
         }
         if (aero::str::EndsWith(propName, "Text.Placeholder")) {
             propName = "Placeholder";
+        }
+        if (propName == "noesis:Loc.Source" || propName == "Loc.Source") {
+            propName = "Loc.Source";
+            EmitSiblingLanguageDictionaries(out, indent);
         }
         std::string ownedRawVal;
         if (LooksLikeMarkupExtension(rawVal)) {
@@ -2816,13 +2836,24 @@ private:
                     rawVal = ownedRawVal;
                 }
             } else if (ext.kind == MarkupExtensionKind::NoesisLoc) {
+                std::string key;
                 if (const auto* k = ext.FindPositional(0)) {
-                    ownedRawVal = k->literal;
-                    rawVal = ownedRawVal;
+                    key = k->literal;
                 } else if (const auto* rk = ext.FindNamed("ResourceKey")) {
-                    ownedRawVal = rk->literal;
-                    rawVal = ownedRawVal;
+                    key = rk->literal;
                 }
+                if (!key.empty()) {
+                    if (targetType == "Run") {
+                        Indent(out, indent);
+                        out << targetVar << ".SetPropertyBox(" << EscapeRsString(propName)
+                            << ", DependencyObject.BoxObject(" << LookupResourceExpr(key, dictVar) << "));\n";
+                    } else {
+                        Indent(out, indent);
+                        out << targetVar << ".SetResourceReference(" << EscapeRsString(propName)
+                            << ", " << EscapeRsString(key) << ");\n";
+                    }
+                }
+                return;
             }
         }
 
@@ -2965,13 +2996,88 @@ private:
             return;
         }
 
-        // Generic scalar metadata props (`Tag`, `ToolTip`, `Placeholder`, `CommandParameter`, etc.)
+        // Generic scalar metadata props (`Tag`, `ToolTip`, `Placeholder`, `CommandParameter`, `Custom.*`, etc.)
+        if (aero::str::StartsWith(propName, "Custom.")) {
+            Indent(out, indent);
+            if (aero::str::EndsWith(propName, "_Int32") || aero::str::EndsWith(propName, "_Int")) {
+                const long iv = std::strtol(std::string(rawVal).c_str(), nullptr, 10);
+                out << targetVar << ".SetPropertyBox(" << EscapeRsString(propName)
+                    << ", DependencyObject.BoxInt(" << iv << "));\n";
+            } else {
+                out << targetVar << ".SetPropertyBox(" << EscapeRsString(propName)
+                    << ", DependencyObject.BoxString(" << EscapeRsString(rawVal) << "));\n";
+            }
+            return;
+        }
         if (propName == "Tag" || propName == "ToolTip" || propName == "Title" ||
             propName == "InputGestureText" || propName == "CommandParameter" ||
-            propName == "Placeholder" || propName == "FontWeight" || propName == "DisplayMemberPath") {
+            propName == "Placeholder" || propName == "FontWeight" || propName == "DisplayMemberPath" ||
+            propName == "Loc.Source") {
             Indent(out, indent);
             out << targetVar << ".SetPropertyBox(" << EscapeRsString(propName) << ", "
                 << BoxSetterValueExpr(propName, FormatGenericScalarLiteral(rawVal)) << ");\n";
+        }
+    }
+
+    void EmitSiblingLanguageDictionaries(std::ostringstream& out, int indent) {
+        if (emittedLocSources_) {
+            return;
+        }
+        emittedLocSources_ = true;
+
+        std::vector<std::filesystem::path> dirs;
+        if (!opts_.xamlPath.empty()) {
+            const auto p = std::filesystem::path(opts_.xamlPath).parent_path();
+            if (!p.empty()) dirs.push_back(p);
+        }
+        if (!opts_.resourceSearchRoot.empty()) {
+            dirs.emplace_back(opts_.resourceSearchRoot);
+        }
+        for (const auto& sp : opts_.resourceSearchPaths) {
+            if (!sp.empty()) dirs.emplace_back(sp);
+        }
+
+        std::vector<std::filesystem::path> langFiles;
+        std::unordered_set<std::string> seenNames;
+        std::error_code ec;
+        for (const auto& dir : dirs) {
+            if (!std::filesystem::is_directory(dir, ec)) {
+                continue;
+            }
+            for (const auto& entry : std::filesystem::directory_iterator(dir, ec)) {
+                if (!entry.is_regular_file(ec)) {
+                    continue;
+                }
+                const std::string fname = entry.path().filename().string();
+                std::string lower = fname;
+                for (char& ch : lower) {
+                    if (ch >= 'A' && ch <= 'Z') ch = static_cast<char>(ch - 'A' + 'a');
+                }
+                if (aero::str::StartsWith(lower, "language-") && aero::str::EndsWith(lower, ".xaml")) {
+                    if (seenNames.insert(lower).second) {
+                        langFiles.push_back(entry.path());
+                    }
+                }
+            }
+        }
+        std::sort(langFiles.begin(), langFiles.end());
+
+        for (const auto& lp : langFiles) {
+            const std::string content = ReadFileTextUtf8(lp);
+            if (content.empty()) {
+                continue;
+            }
+            std::unique_ptr<XamlNode> langRoot;
+            if (!BuildXamlDom(content, langRoot, diagnostics_) || !langRoot) {
+                continue;
+            }
+            const std::string dv = FreshVar("locDict");
+            Indent(out, indent);
+            out << "var " << dv << " = new ResourceDictionary();\n";
+            EmitResourceDictionaryEntries(*langRoot, lp.generic_string(), dv, out, indent);
+            Indent(out, indent);
+            out << "ResourceDictionary.RegisterLocSource(" << EscapeRsString(lp.filename().string())
+                << ", " << dv << ");\n";
         }
     }
 
@@ -3007,7 +3113,18 @@ private:
             ? BoxSetterValueExpr(propName, FormatTypedValueLiteral(propName, spec.targetNullValue, {}))
             : std::string("null");
 
-        const int modeInt = MapBindingMode(spec.mode);
+        int modeInt = MapBindingMode(spec.mode);
+        if (spec.mode.empty()) {
+            if ((targetType == "TextBox" && propName == "Text") ||
+                (targetType == "Slider" && propName == "Value") ||
+                ((targetType == "CheckBox" || targetType == "ToggleButton" || targetType == "RadioButton") &&
+                 propName == "IsChecked") ||
+                ((targetType == "ComboBox" || targetType == "ListBox" || targetType == "Selector" ||
+                  targetType == "ListView" || targetType == "TabControl") &&
+                 (propName == "SelectedItem" || propName == "SelectedIndex" || propName == "SelectedValue"))) {
+                modeInt = 1; // TwoWay default for interactive input/selection properties
+            }
+        }
         if (targetType == "Run") {
             Indent(out, indent);
             out << "BindingEngine.BindInlineEx(" << targetVar << ", "
@@ -3718,8 +3835,32 @@ private:
                 }
             }
             if (const auto* cp = act.FindAttribute("CommandParameter")) {
-                Indent(out, indent);
-                out << av << ".SetCommandParameter(" << EscapeRsString(cp->value) << ");\n";
+                if (LooksLikeMarkupExtension(cp->value)) {
+                    const auto ext = ParseMarkupExtension(cp->value);
+                    ParsedBindingSpec spec;
+                    if (TryExtractBindingSpec(ext, spec) && !spec.path.empty()) {
+                        Indent(out, indent);
+                        out << av << ".CommandParameterPath = " << EscapeRsString(spec.path) << ";\n";
+                        if (!spec.relativeSourceMode.empty()) {
+                            Indent(out, indent);
+                            out << av << ".CommandParameterRelativeMode = "
+                                << EscapeRsString(spec.relativeSourceMode) << ";\n";
+                        }
+                        if (!spec.ancestorType.empty()) {
+                            Indent(out, indent);
+                            out << av << ".CommandParameterAncestorType = "
+                                << EscapeRsString(spec.ancestorType) << ";\n";
+                        }
+                        if (!spec.elementName.empty()) {
+                            Indent(out, indent);
+                            out << av << ".CommandParameterElementName = "
+                                << EscapeRsString(spec.elementName) << ";\n";
+                        }
+                    }
+                } else {
+                    Indent(out, indent);
+                    out << av << ".SetCommandParameter(" << EscapeRsString(cp->value) << ");\n";
+                }
             }
         } else if (act.localName == "ChangePropertyAction") {
             Indent(out, indent);

@@ -1,17 +1,22 @@
 #include "aero/app/AeroAppHost.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <sstream>
 #include <unordered_set>
 
 #include <realscript/aot_cpp/AotRuntime.h>
 #include <realscript/semantic/Semantic.h>
 
+#include "aero/core/StringUtils.hpp"
+#include "aero/render/FontAtlas.hpp"
+#include "aero/render/ImageAtlas.hpp"
 #include "aero/visual/VisualHostBindings.hpp"
 
 namespace aero {
@@ -323,11 +328,6 @@ namespace {
     std::unordered_set<SymbolId> visited;
     const rs_sem::TypeSymbol* cur = image.resolveType(typeId);
     while (cur && visited.insert(cur->id).second) {
-        for (const auto& m : cur->methods) {
-            if (m.name == methodName && m.parameters.size() == nonSelfArgCount) {
-                return m.id;
-            }
-        }
         const std::string qualColon =
             (cur->moduleName.empty() ? std::string{} : (cur->moduleName + ".")) +
             cur->name + "::" + std::string(methodName);
@@ -343,6 +343,11 @@ namespace {
                 if (fn.name == shortDot || EndsWithSymbol(fn.name, shortDot)) {
                     return fn.symbolId;
                 }
+            }
+        }
+        for (const auto& m : cur->methods) {
+            if (m.name == methodName && m.parameters.size() == nonSelfArgCount) {
+                return m.id;
             }
         }
         if (cur->baseTypeId == 0u || cur->baseTypeId == cur->id) {
@@ -517,7 +522,329 @@ namespace {
     return false;
 }
 
+#ifdef AERO_HAS_COMPILER_V3
+[[nodiscard]] bool ReadFileUtf8Text(const std::filesystem::path& path, std::string& outText) {
+    std::ifstream in(path, std::ios::binary);
+    if (!in.is_open()) {
+        return false;
+    }
+    std::ostringstream ss;
+    ss << in.rdbuf();
+    outText = ss.str();
+    if (outText.size() >= 3u &&
+        static_cast<unsigned char>(outText[0]) == 0xEFu &&
+        static_cast<unsigned char>(outText[1]) == 0xBBu &&
+        static_cast<unsigned char>(outText[2]) == 0xBFu) {
+        outText.erase(0u, 3u);
+    }
+    return true;
+}
+
+[[nodiscard]] std::string ToLowerAscii(std::string_view s) {
+    std::string out(s);
+    for (char& c : out) {
+        if (c >= 'A' && c <= 'Z') {
+            c = static_cast<char>(c - 'A' + 'a');
+        }
+    }
+    return out;
+}
+
+[[nodiscard]] bool EndsWithIgnoreCase(std::string_view text, std::string_view suffix) noexcept {
+    if (text.size() < suffix.size()) {
+        return false;
+    }
+    return str::EqualsIgnoreCase(text.substr(text.size() - suffix.size()), suffix);
+}
+
+[[nodiscard]] bool StartsWithIgnoreCase(std::string_view text, std::string_view prefix) noexcept {
+    if (text.size() < prefix.size()) {
+        return false;
+    }
+    return str::EqualsIgnoreCase(text.substr(0u, prefix.size()), prefix);
+}
+
+[[nodiscard]] bool HasPathSegment(std::string_view lowerRel, std::string_view segment) noexcept {
+    if (lowerRel.rfind(segment, 0u) == 0u) {
+        return true;
+    }
+    std::string needle = "/";
+    needle.append(segment);
+    return lowerRel.find(needle) != std::string_view::npos;
+}
+
+[[nodiscard]] bool HasViewRootTag(std::string_view xamlText) noexcept {
+    std::size_t pos = 0u;
+    while (pos < xamlText.size()) {
+        const std::size_t lt = xamlText.find('<', pos);
+        if (lt == std::string_view::npos || lt + 1u >= xamlText.size()) {
+            return false;
+        }
+        const char next = xamlText[lt + 1u];
+        if (next == '?' || next == '!') {
+            if (xamlText.compare(lt, 4u, "<!--") == 0) {
+                const std::size_t endComment = xamlText.find("-->", lt + 4u);
+                pos = (endComment == std::string_view::npos) ? xamlText.size() : (endComment + 3u);
+            } else {
+                const std::size_t gt = xamlText.find('>', lt + 2u);
+                pos = (gt == std::string_view::npos) ? xamlText.size() : (gt + 1u);
+            }
+            continue;
+        }
+        std::size_t endTag = lt + 1u;
+        while (endTag < xamlText.size() &&
+               xamlText[endTag] != ' ' && xamlText[endTag] != '\t' &&
+               xamlText[endTag] != '\r' && xamlText[endTag] != '\n' &&
+               xamlText[endTag] != '>' && xamlText[endTag] != '/') {
+            ++endTag;
+        }
+        std::string_view rootTag = xamlText.substr(lt + 1u, endTag - (lt + 1u));
+        if (const std::size_t colon = rootTag.find(':'); colon != std::string_view::npos) {
+            rootTag = rootTag.substr(colon + 1u);
+        }
+        return rootTag == "Window" || rootTag == "Page" || rootTag == "UserControl";
+    }
+    return false;
+}
+#endif
+
 } // namespace
+
+#ifdef AERO_HAS_COMPILER_V3
+bool DiscoverSampleProject(
+    const std::filesystem::path& sampleDir,
+    AeroV3CompileInput& outCompileInput,
+    AeroAppHostConfig& outHostConfig) {
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    if (!fs::exists(sampleDir, ec) || !fs::is_directory(sampleDir, ec)) {
+        return false;
+    }
+
+    const fs::path sampleRoot = sampleDir.lexically_normal();
+
+    struct DiscoveredXaml {
+        fs::path absPath;
+        std::string normPath;
+        std::string lowerRel;
+        std::string filename;
+        bool isResources = false;
+        bool isApp = false;
+        bool isLanguage = false;
+        bool isDataSamples = false;
+        bool isDataTheme = false;
+        bool isDataPagePreviews = false;
+        bool isDataControls = false;
+        bool eligibleEntry = false;
+        std::string content;
+    };
+
+    std::vector<DiscoveredXaml> xamls;
+    std::vector<fs::path> scripts;
+
+    for (const auto& entry : fs::recursive_directory_iterator(sampleRoot, ec)) {
+        if (!entry.is_regular_file(ec)) {
+            continue;
+        }
+        const fs::path p = entry.path().lexically_normal();
+        const std::string ext = p.extension().string();
+        const std::string fname = p.filename().string();
+        if (str::EqualsIgnoreCase(ext, ".xaml") || str::EqualsIgnoreCase(ext, ".axaml")) {
+            DiscoveredXaml item;
+            item.absPath = p;
+            item.normPath = p.generic_string();
+            const fs::path rel = p.lexically_relative(sampleRoot);
+            item.lowerRel = ToLowerAscii(rel.generic_string());
+            item.filename = fname;
+            item.isResources = str::EqualsIgnoreCase(fname, "Resources.xaml");
+            item.isApp = str::EqualsIgnoreCase(fname, "App.xaml");
+            item.isLanguage = StartsWithIgnoreCase(fname, "Language-");
+            item.isDataSamples = HasPathSegment(item.lowerRel, "data/samples/") ||
+                                 HasPathSegment(item.lowerRel, "samples/");
+            item.isDataTheme = HasPathSegment(item.lowerRel, "data/theme/") ||
+                               HasPathSegment(item.lowerRel, "theme/");
+            item.isDataPagePreviews = HasPathSegment(item.lowerRel, "data/pagepreviews/") ||
+                                      HasPathSegment(item.lowerRel, "pagepreviews/");
+            item.isDataControls = HasPathSegment(item.lowerRel, "data/controls/") ||
+                                  HasPathSegment(item.lowerRel, "controls/");
+            item.eligibleEntry = !(item.isResources || item.isApp || item.isLanguage ||
+                                   item.isDataSamples || item.isDataTheme ||
+                                   item.isDataPagePreviews || item.isDataControls);
+            xamls.push_back(std::move(item));
+        } else if ((str::EqualsIgnoreCase(ext, ".rs") || str::EqualsIgnoreCase(ext, ".cs")) &&
+                   !EndsWithIgnoreCase(fname, ".g.rs")) {
+            scripts.push_back(p);
+        }
+    }
+
+    std::sort(xamls.begin(), xamls.end(),
+        [](const DiscoveredXaml& a, const DiscoveredXaml& b) {
+            return a.normPath < b.normPath;
+        });
+    std::sort(scripts.begin(), scripts.end(),
+        [](const fs::path& a, const fs::path& b) {
+            return a.generic_string() < b.generic_string();
+        });
+
+    std::size_t entryIndex = xamls.size();
+    for (auto& item : xamls) {
+        if (item.eligibleEntry) {
+            (void)ReadFileUtf8Text(item.absPath, item.content);
+        }
+    }
+
+    // 1. Prefer MainWindow.xaml
+    for (std::size_t i = 0u; i < xamls.size(); ++i) {
+        if (xamls[i].eligibleEntry && str::EqualsIgnoreCase(xamls[i].filename, "MainWindow.xaml")) {
+            entryIndex = i;
+            break;
+        }
+    }
+    // 2. Fallback MainPage.xaml
+    if (entryIndex == xamls.size()) {
+        for (std::size_t i = 0u; i < xamls.size(); ++i) {
+            if (xamls[i].eligibleEntry && str::EqualsIgnoreCase(xamls[i].filename, "MainPage.xaml")) {
+                entryIndex = i;
+                break;
+            }
+        }
+    }
+    // 3. Fallback first primary XAML with x:Class
+    if (entryIndex == xamls.size()) {
+        for (std::size_t i = 0u; i < xamls.size(); ++i) {
+            if (xamls[i].eligibleEntry &&
+                xamls[i].content.find("x:Class") != std::string::npos) {
+                entryIndex = i;
+                break;
+            }
+        }
+    }
+    // 4. Fallback first primary XAML with Window/Page/UserControl root
+    if (entryIndex == xamls.size()) {
+        for (std::size_t i = 0u; i < xamls.size(); ++i) {
+            if (xamls[i].eligibleEntry && HasViewRootTag(xamls[i].content)) {
+                entryIndex = i;
+                break;
+            }
+        }
+    }
+    // 5. Final fallback: first eligible XAML
+    if (entryIndex == xamls.size()) {
+        for (std::size_t i = 0u; i < xamls.size(); ++i) {
+            if (xamls[i].eligibleEntry) {
+                entryIndex = i;
+                break;
+            }
+        }
+    }
+
+    if (entryIndex < xamls.size()) {
+        outCompileInput.xamlPath = xamls[entryIndex].normPath;
+        outCompileInput.xamlContent = xamls[entryIndex].content;
+        if (outCompileInput.resourceSearchRoot.empty() && xamls[entryIndex].absPath.has_parent_path()) {
+            outCompileInput.resourceSearchRoot =
+                xamls[entryIndex].absPath.parent_path().lexically_normal().generic_string();
+        }
+    } else if (outCompileInput.resourceSearchRoot.empty()) {
+        outCompileInput.resourceSearchRoot = sampleRoot.generic_string();
+    }
+
+    std::unordered_set<std::string> seenAdditionalXamls;
+    for (const auto& existing : outCompileInput.additionalXamlSources) {
+        seenAdditionalXamls.insert(existing.path);
+    }
+    for (std::size_t i = 0u; i < xamls.size(); ++i) {
+        if (i == entryIndex) {
+            continue;
+        }
+        const auto& item = xamls[i];
+        if (item.isDataSamples || item.isDataTheme || item.isDataPagePreviews ||
+            item.isResources || item.isLanguage) {
+            continue;
+        }
+        if (!seenAdditionalXamls.insert(item.normPath).second) {
+            continue;
+        }
+        std::string text = item.content;
+        if (text.empty() && !ReadFileUtf8Text(item.absPath, text)) {
+            continue;
+        }
+        if (!text.empty()) {
+            outCompileInput.additionalXamlSources.push_back(SourceFile{item.normPath, std::move(text)});
+        }
+    }
+
+    std::unordered_set<std::string> seenScripts;
+    for (const auto& existing : outCompileInput.scriptSources) {
+        seenScripts.insert(existing.path);
+    }
+    for (const auto& sp : scripts) {
+        const std::string norm = sp.generic_string();
+        if (!seenScripts.insert(norm).second) {
+            continue;
+        }
+        std::string text;
+        if (ReadFileUtf8Text(sp, text)) {
+            outCompileInput.scriptSources.push_back(SourceFile{norm, std::move(text)});
+        }
+    }
+
+    std::unordered_set<std::string> seenResourcePaths;
+    for (const auto& p : outCompileInput.resourceSearchPaths) {
+        seenResourcePaths.insert(p);
+    }
+    std::unordered_set<std::string> seenAssetDirs;
+    for (const auto& p : outHostConfig.assetSearchDirs) {
+        seenAssetDirs.insert(p);
+    }
+    auto registerDirIfExists = [&](const fs::path& dir) {
+        std::error_code dirEc;
+        if (!fs::is_directory(dir, dirEc)) {
+            return;
+        }
+        const std::string norm = dir.lexically_normal().generic_string();
+        if (seenResourcePaths.insert(norm).second) {
+            outCompileInput.resourceSearchPaths.push_back(norm);
+        }
+        if (seenAssetDirs.insert(norm).second) {
+            outHostConfig.assetSearchDirs.push_back(norm);
+        }
+    };
+
+    const fs::path dataDir = sampleRoot / "Data";
+    const fs::path baseDirs[] = {sampleRoot, dataDir};
+    const char* kSubDirs[] = {
+        "",
+        "Images",
+        "Images/Items",
+        "Fonts",
+        "Samples",
+        "Samples/Images",
+        "Samples/Fonts",
+        "Theme",
+        "Theme/Fonts",
+    };
+    for (const fs::path& base : baseDirs) {
+        for (const char* sub : kSubDirs) {
+            registerDirIfExists(sub[0] == '\0' ? base : (base / sub));
+        }
+    }
+
+    // Walk ancestors so packaged /Noesis.GUI.Extensions;component/Theme/*.xaml resolves
+    fs::path probe = sampleRoot;
+    for (int up = 0; up < 5 && !probe.empty(); ++up) {
+        registerDirIfExists(probe / "Theme" / "Data");
+        registerDirIfExists(probe / "Theme" / "Data" / "Theme");
+        registerDirIfExists(probe / "Theme" / "Data" / "Theme" / "Fonts");
+        registerDirIfExists(probe / "Samples" / "Theme" / "Data");
+        registerDirIfExists(probe / "Samples" / "Theme" / "Data" / "Theme");
+        registerDirIfExists(probe / "Samples" / "Theme" / "Data" / "Theme" / "Fonts");
+        probe = probe.parent_path();
+    }
+
+    return !outCompileInput.xamlContent.empty() || !outCompileInput.scriptSources.empty();
+}
+#endif
 
 AeroAppHost::AeroAppHost(const AeroAppHostConfig& config)
     : config_(config)
@@ -533,9 +860,58 @@ AeroAppHost::AeroAppHost(const AeroAppHostConfig& config)
     , windowHost_()
     , bindings_(std::make_shared<BindingRegistry>()) {
     for (const auto& dir : config_.assetSearchDirs) {
-        if (!dir.empty()) {
-            resourceStore_->AddAssetSearchDirectory(dir);
+        RegisterAssetDirectoryInternal(dir);
+    }
+}
+
+void AeroAppHost::RegisterAssetDirectoryInternal(std::string_view dir) {
+    if (dir.empty()) {
+        return;
+    }
+    const std::string dirStr(dir);
+    const auto existing = resourceStore_->AssetSearchDirectoriesSnapshot();
+    const bool alreadyAdded = std::find(existing.begin(), existing.end(), dirStr) != existing.end();
+    resourceStore_->AddAssetSearchDirectory(dirStr);
+    resourceStore_->Images().AddSearchDirectory(dirStr);
+    if (alreadyAdded) {
+        return;
+    }
+
+    std::error_code ec;
+    const std::filesystem::path dirPath(dirStr);
+    if (!std::filesystem::is_directory(dirPath, ec)) {
+        return;
+    }
+    std::vector<std::filesystem::path> ttfFiles;
+    for (const auto& entry : std::filesystem::directory_iterator(dirPath, ec)) {
+        if (!entry.is_regular_file(ec)) {
+            continue;
         }
+        if (str::EqualsIgnoreCase(entry.path().extension().string(), ".ttf")) {
+            ttfFiles.push_back(entry.path());
+        }
+    }
+    if (ttfFiles.empty()) {
+        return;
+    }
+    // Load Regular variants last so base family aliases resolve to Regular weight.
+    auto isRegular = [](const std::filesystem::path& p) {
+        const std::string name = p.stem().string();
+        return name.find("Regular") != std::string::npos ||
+               name.find("regular") != std::string::npos;
+    };
+    std::sort(ttfFiles.begin(), ttfFiles.end(),
+        [&](const std::filesystem::path& a, const std::filesystem::path& b) {
+            const bool aReg = isRegular(a);
+            const bool bReg = isRegular(b);
+            if (aReg != bReg) {
+                return !aReg;
+            }
+            return a.generic_string() < b.generic_string();
+        });
+    FontAtlas& fonts = resourceStore_->Fonts();
+    for (const auto& ttf : ttfFiles) {
+        (void)fonts.LoadTrueTypeFontFromFile(ttf.generic_string());
     }
 }
 
@@ -628,6 +1004,7 @@ void AeroAppHost::ResetLoadedProgramState() noexcept {
     }
     programImage_.reset();
     aotDescriptor_ = nullptr;
+    preferredEntryClass_.clear();
     bindings_ = std::make_shared<BindingRegistry>();
 }
 
@@ -646,7 +1023,9 @@ void AeroAppHost::ResolveDispatchSymbols() {
         symbols_.bindingFlush = find("BindingEngine::Flush");
         symbols_.windowShow = find("Window::Show");
         symbols_.applyTemplate = find("FrameworkElement::ApplyTemplate");
+        symbols_.controlApplyTemplate = find("Control::ApplyTemplate");
         symbols_.ensureLoadedSubtree = find("UIElement::EnsureLoadedSubtree");
+        symbols_.popupSetOverlayHost = find("PopupService::SetOverlayHost");
     } else if (aotDescriptor_) {
         const auto find = [&](std::string_view suffix) -> SymbolId {
             return FindAotFunctionSymbol(*aotDescriptor_, suffix);
@@ -660,13 +1039,22 @@ void AeroAppHost::ResolveDispatchSymbols() {
         symbols_.bindingFlush = find("BindingEngine::Flush");
         symbols_.windowShow = find("Window::Show");
         symbols_.applyTemplate = find("FrameworkElement::ApplyTemplate");
+        symbols_.controlApplyTemplate = find("Control::ApplyTemplate");
         symbols_.ensureLoadedSubtree = find("UIElement::EnsureLoadedSubtree");
+        symbols_.popupSetOverlayHost = find("PopupService::SetOverlayHost");
     }
 }
 
 bool AeroAppHost::LoadProgramImage(
     std::shared_ptr<const ProgramImage> image,
     std::string_view entryClassOrFn) {
+    return LoadProgramImageInternal(std::move(image), entryClassOrFn, {});
+}
+
+bool AeroAppHost::LoadProgramImageInternal(
+    std::shared_ptr<const ProgramImage> image,
+    std::string_view entryClassOrFn,
+    std::string_view preferredEntryClass) {
     const bool trace = std::getenv("AERO_TRACE") != nullptr;
     auto logTrace = [&](const char* msg) {
         if (trace) {
@@ -686,6 +1074,7 @@ bool AeroAppHost::LoadProgramImage(
     ResetLoadedProgramState();
 
     programImage_ = std::move(image);
+    preferredEntryClass_ = std::string(preferredEntryClass);
     domains_.registerProgramObservableMetadata(*programImage_);
 
     interpreter_ = std::make_unique<Interpreter>(programImage_, domains_.uiHeapPtr());
@@ -724,7 +1113,62 @@ bool AeroAppHost::LoadProgramImage(
     logTrace("LoadProgramImage: mounted entry, stepping initial frame");
 
     StepFrame(0.0f, true);
-    logTrace("LoadProgramImage: done");
+    if (trace) {
+        const VisualNode* rn = world_.GetNode(world_.Root());
+        const Rect r = rn ? rn->layout.layoutRect : Rect{};
+        std::fprintf(
+            stderr,
+            "[AERO_TRACE] LoadProgramImage: done liveNodes=%zu renderNodes=%zu rootRect=(%.1f,%.1f %.1fx%.1f)\n",
+            world_.LiveNodeCount(),
+            renderTree_.NodeCount(),
+            r.x,
+            r.y,
+            r.width,
+            r.height);
+        auto dumpNode = [&](auto& self, VisualNodeId id, int depth) -> void {
+            const VisualNode* n = world_.GetNode(id);
+            if (!n || !n->alive) {
+                return;
+            }
+            std::string name;
+            if (n->hasScriptOwner && n->scriptOwner.valid()) {
+                UnifiedValue nv{};
+                if (ReadMemberFromHeap(
+                        domains_, programImage_.get(), interpreter_.get(), aotDescriptor_, aotContext_.get(),
+                        n->scriptOwner, "Name", nv)) {
+                    (void)ReadScriptStringValue(domains_, nv, name);
+                }
+            }
+            std::fprintf(
+                stderr,
+                "[AERO_TRACE] %*snode idx=%u kind=%u mode=%u vis=%u op=%.2f rect=(%.1f,%.1f %.1fx%.1f) des=(%.1fx%.1f) bg=%08X grad=%d vfill=%08X vlen=%zu render=(%u+%u) name='%s'\n",
+                depth * 2,
+                "",
+                id.index,
+                static_cast<unsigned>(n->kind),
+                static_cast<unsigned>(n->layout.layoutMode),
+                static_cast<unsigned>(n->layout.visibility),
+                n->layout.opacity,
+                n->layout.layoutRect.x,
+                n->layout.layoutRect.y,
+                n->layout.layoutRect.width,
+                n->layout.layoutRect.height,
+                n->layout.desiredSize.width,
+                n->layout.desiredSize.height,
+                n->box.bgRgba,
+                n->box.bgGradId,
+                n->vector.fillRgba,
+                n->vector.pathOrParams.size(),
+                n->layout.renderNodeId,
+                n->layout.renderNodeCount,
+                name.c_str());
+            for (const auto& ch : n->children) {
+                self(self, ch, depth + 1);
+            }
+        };
+        dumpNode(dumpNode, world_.Root(), 0);
+        std::fflush(stderr);
+    }
     return true;
 }
 
@@ -735,6 +1179,12 @@ bool AeroAppHost::CompileAndLoad(
     AeroV3CompileInput effective = input;
     if (config_.optimizeBytecode && !effective.optimizeBytecode) {
         effective.optimizeBytecode = true;
+    }
+    if (!effective.resourceSearchRoot.empty()) {
+        RegisterAssetDirectoryInternal(effective.resourceSearchRoot);
+    }
+    for (const auto& dir : effective.resourceSearchPaths) {
+        RegisterAssetDirectoryInternal(dir);
     }
     const AeroCompilerV3 compiler;
     auto compiled = std::make_unique<AeroV3CompileResult>(compiler.Compile(effective));
@@ -757,12 +1207,10 @@ bool AeroAppHost::CompileAndLoad(
     if (entryHint.empty() && !config_.entryClassName.empty()) {
         entryHint = config_.entryClassName;
     }
-    if (!LoadProgramImage(lastCompileResult_->programImage, entryHint)) {
-        if (entryHint.empty() && !lastCompileResult_->rootClassName.empty()) {
-            if (LoadProgramImage(lastCompileResult_->programImage, lastCompileResult_->rootClassName)) {
-                return true;
-            }
-        }
+    if (!LoadProgramImageInternal(
+            lastCompileResult_->programImage,
+            entryHint,
+            lastCompileResult_->rootClassName)) {
         if (outError) {
             *outError = lastError_;
         }
@@ -849,9 +1297,10 @@ bool AeroAppHost::InvokeSymbol(
                 static_cast<unsigned long long>(fnId), args.size());
             std::fflush(stderr);
         }
-        rs_rt::Limits limits{};
-        limits.instructionBudget = 32'000'000u;
-        const auto exec = targetInterp->invoke(fnId, args, limits);
+        rs_rt::ExecutionOptions execOpts{};
+        execOpts.limits.instructionBudget = 32'000'000u;
+        execOpts.limits.gcWorkBudget = 0u;
+        const auto exec = targetInterp->invoke(fnId, args, execOpts);
         if (std::getenv("AERO_TRACE") != nullptr) {
             std::fprintf(stderr, "[AERO_TRACE] InvokeSymbol: returned ok=%d err=%s\n",
                 exec.succeeded ? 1 : 0, exec.error.message.c_str());
@@ -1060,6 +1509,90 @@ bool AeroAppHost::InstantiateAndMountEntry(std::string_view entryHint) {
         return false;
     };
 
+    auto initializeAppResourcesIfPresent = [&]() {
+        if (!programImage_) {
+            return;
+        }
+        for (const auto& mod : programImage_->modules()) {
+            if (IsStdlibModuleName(mod.name)) {
+                continue;
+            }
+            for (const auto& ts : mod.types) {
+                if (ts.kind != rs_sem::TypeKind::Class || ts.abstractType || ts.staticType ||
+                    IsStdlibModuleName(ts.moduleName)) {
+                    continue;
+                }
+                if (!ts.moduleName.empty() && ts.moduleName != mod.name) {
+                    continue;
+                }
+                if (!IsBytecodeTypeDerivedFrom(*programImage_, &ts, "Application")) {
+                    continue;
+                }
+                const std::string qName = ts.moduleName.empty()
+                    ? ts.name
+                    : (ts.moduleName + "." + ts.name);
+                if ((!entryHint.empty() && NameMatchesTypeSpec(ts.moduleName, ts.name, entryHint)) ||
+                    (!preferredEntryClass_.empty() && NameMatchesTypeSpec(ts.moduleName, ts.name, preferredEntryClass_))) {
+                    continue;
+                }
+                const rs_sem::TypeSymbol* resolved = programImage_->resolveType(ts.id);
+                const rs_sem::TypeSymbol& fullTs = resolved ? *resolved : ts;
+                std::vector<UnifiedValue> fields;
+                std::vector<std::size_t> refFields;
+                fields.reserve(fullTs.fields.size());
+                for (std::size_t fi = 0u; fi < fullTs.fields.size(); ++fi) {
+                    const auto& f = fullTs.fields[fi];
+                    SymbolId fTypeId = 0u;
+                    if (!f.typeName.empty()) {
+                        for (const auto& m : programImage_->modules()) {
+                            for (const auto& t : m.types) {
+                                if (NameMatchesTypeSpec(t.moduleName, t.name, f.typeName)) {
+                                    fTypeId = t.id;
+                                    break;
+                                }
+                            }
+                            if (fTypeId != 0u) {
+                                break;
+                            }
+                        }
+                    }
+                    fields.push_back(DefaultFieldValue(f.type, fTypeId));
+                    if (f.type == rs_sem::PrimitiveType::String ||
+                        f.type == rs_sem::PrimitiveType::Object ||
+                        f.type == rs_sem::PrimitiveType::Array ||
+                        (f.type == rs_sem::PrimitiveType::Struct &&
+                         !rs_rt::makeDefaultInlineStructValue(fTypeId).has_value())) {
+                        refFields.push_back(fi);
+                    }
+                }
+                RuntimeError allocErr{};
+                const auto alloc = domains_.uiHeap().allocateObject(
+                    fullTs.id, std::move(fields), std::move(refFields), &allocErr);
+                if (!alloc) {
+                    continue;
+                }
+                PersistentRoot pin = domains_.uiHeap().retain(*alloc);
+                SymbolId ctorId = 0u;
+                for (const auto& c : fullTs.constructors) {
+                    if (!c.staticMethod && c.parameters.empty()) {
+                        ctorId = c.id;
+                        break;
+                    }
+                }
+                if (ctorId == 0u) {
+                    ctorId = FindBytecodeFunctionSymbol(*programImage_, qName + "::.ctor");
+                }
+                if (ctorId != 0u) {
+                    (void)InvokeSymbol(ctorId, {UnifiedValue{*alloc}}, nullptr, DomainKind::UiPresentation);
+                }
+                const SymbolId initSym = FindBytecodeClassMethod(*programImage_, fullTs.id, "InitializeComponent", 0u);
+                if (initSym != 0u) {
+                    (void)InvokeSymbol(initSym, {UnifiedValue{*alloc}}, nullptr, DomainKind::UiPresentation);
+                }
+            }
+        }
+    };
+
     ObjectRef entryObj{};
 
     // 1. If entryHint directly identifies a callable function, invoke it first.
@@ -1071,6 +1604,8 @@ bool AeroAppHost::InstantiateAndMountEntry(std::string_view entryHint) {
             return MountScriptRootObject(entryObj);
         }
     }
+
+    initializeAppResourcesIfPresent();
 
     // 2. If entryHint identifies a class (or module.class), try <Class>::Build or construct <Class>.
     if (!entryHint.empty() && programImage_) {
@@ -1116,8 +1651,8 @@ bool AeroAppHost::InstantiateAndMountEntry(std::string_view entryHint) {
         }
     }
 
-    // 3. Auto-discover standard entry factories: CreateMainWindow, Main, CreateRoot, Build
-    const char* kStandardFactories[] = {"::CreateMainWindow", "::Main", "::CreateRoot", "::Build"};
+    // 3. Auto-discover standard entry factories: CreateMainWindow, Main, CreateRoot
+    const char* kStandardFactories[] = {"::CreateMainWindow", "::Main", "::CreateRoot"};
     for (const char* suffix : kStandardFactories) {
         const SymbolId fnId = programImage_
             ? FindBytecodeFunctionSymbol(*programImage_, suffix, true)
@@ -1127,8 +1662,13 @@ bool AeroAppHost::InstantiateAndMountEntry(std::string_view entryHint) {
         }
     }
 
-    // 4. Auto-discover first concrete Window/UserControl/Page subclass outside Aero.*/RealScript.* stdlib
-    if (programImage_) {
+    // 4. Preferred root class discovered during compilation (e.g. main XAML entry <Stem>View or x:Class)
+    if (!preferredEntryClass_.empty() && programImage_) {
+        const SymbolId buildFn = FindBytecodeFunctionSymbol(
+            *programImage_, preferredEntryClass_ + "::Build");
+        if (tryInvokeCandidateFn(buildFn, entryObj)) {
+            return MountScriptRootObject(entryObj);
+        }
         for (const auto& mod : programImage_->modules()) {
             if (IsStdlibModuleName(mod.name)) {
                 continue;
@@ -1138,30 +1678,50 @@ bool AeroAppHost::InstantiateAndMountEntry(std::string_view entryHint) {
                     IsStdlibModuleName(ts.moduleName)) {
                     continue;
                 }
-                if (!ts.moduleName.empty() && ts.moduleName != mod.name) {
-                    continue;
-                }
-                if (IsBytecodeTypeDerivedFrom(*programImage_, &ts, "Window") ||
-                    IsBytecodeTypeDerivedFrom(*programImage_, &ts, "UserControl") ||
-                    IsBytecodeTypeDerivedFrom(*programImage_, &ts, "Page")) {
+                if (NameMatchesTypeSpec(ts.moduleName, ts.name, preferredEntryClass_)) {
                     return instantiateBytecodeType(ts);
                 }
             }
         }
+    }
+
+    // 5. Auto-discover first concrete Window -> Page -> UserControl -> UIElement -> Application subclass
+    if (programImage_) {
+        const char* kBasePriority[] = {"Window", "Page", "UserControl", "UIElement", "Application"};
+        for (const char* baseName : kBasePriority) {
+            for (const auto& mod : programImage_->modules()) {
+                if (IsStdlibModuleName(mod.name)) {
+                    continue;
+                }
+                for (const auto& ts : mod.types) {
+                    if (ts.kind != rs_sem::TypeKind::Class || ts.abstractType || ts.staticType ||
+                        IsStdlibModuleName(ts.moduleName)) {
+                        continue;
+                    }
+                    if (!ts.moduleName.empty() && ts.moduleName != mod.name) {
+                        continue;
+                    }
+                    if (IsBytecodeTypeDerivedFrom(*programImage_, &ts, baseName)) {
+                        return instantiateBytecodeType(ts);
+                    }
+                }
+            }
+        }
     } else if (aotDescriptor_ && aotDescriptor_->types) {
-        for (std::uint32_t ti = 0u; ti < aotDescriptor_->typeCount; ++ti) {
-            const auto& td = aotDescriptor_->types[ti];
-            if (td.kind != rs_sem::TypeKind::Class || td.interfaceType || td.delegateType || !td.name) {
-                continue;
-            }
-            const std::string_view modName = td.moduleName ? std::string_view(td.moduleName) : std::string_view{};
-            if (IsStdlibModuleName(modName)) {
-                continue;
-            }
-            if (IsAotTypeDerivedFrom(*aotDescriptor_, &td, "Window") ||
-                IsAotTypeDerivedFrom(*aotDescriptor_, &td, "UserControl") ||
-                IsAotTypeDerivedFrom(*aotDescriptor_, &td, "Page")) {
-                return instantiateAotType(td);
+        const char* kBasePriority[] = {"Window", "Page", "UserControl", "UIElement", "Application"};
+        for (const char* baseName : kBasePriority) {
+            for (std::uint32_t ti = 0u; ti < aotDescriptor_->typeCount; ++ti) {
+                const auto& td = aotDescriptor_->types[ti];
+                if (td.kind != rs_sem::TypeKind::Class || td.interfaceType || td.delegateType || !td.name) {
+                    continue;
+                }
+                const std::string_view modName = td.moduleName ? std::string_view(td.moduleName) : std::string_view{};
+                if (IsStdlibModuleName(modName)) {
+                    continue;
+                }
+                if (IsAotTypeDerivedFrom(*aotDescriptor_, &td, baseName)) {
+                    return instantiateAotType(td);
+                }
             }
         }
     }
@@ -1180,6 +1740,57 @@ bool AeroAppHost::MountScriptRootObject(ObjectRef candidate) {
     if (!candidate.valid()) {
         lastError_ = "MountScriptRootObject: invalid ObjectRef";
         return false;
+    }
+
+    const SymbolId candTypeId = domains_.uiHeap().objectTypeIdFast(candidate);
+    const bool isApplication = candTypeId != 0u &&
+        ((programImage_ && [&]() {
+              const rs_sem::TypeSymbol* rt = programImage_->resolveType(candTypeId);
+              return rt && IsBytecodeTypeDerivedFrom(*programImage_, rt, "Application");
+          }()) ||
+         (aotDescriptor_ && [&]() {
+              const rs_aot::TypeDescriptor* rt = FindAotTypeById(*aotDescriptor_, candTypeId);
+              return rt && IsAotTypeDerivedFrom(*aotDescriptor_, rt, "Application");
+          }()));
+
+    if (isApplication) {
+        const SymbolId initSym = programImage_
+            ? FindBytecodeClassMethod(*programImage_, candTypeId, "InitializeComponent", 0u)
+            : (aotDescriptor_ ? FindAotClassMethod(*aotDescriptor_, candTypeId, "InitializeComponent", 1u) : 0u);
+        if (initSym != 0u) {
+            (void)InvokeSymbol(initSym, {UnifiedValue{candidate}}, nullptr, DomainKind::UiPresentation);
+        }
+        UnifiedValue checkWinVal{};
+        const bool hasMainWin = ReadMemberFromHeap(
+                domains_,
+                programImage_.get(),
+                interpreter_.get(),
+                aotDescriptor_,
+                aotContext_.get(),
+                candidate,
+                "MainWindow",
+                checkWinVal) &&
+            std::holds_alternative<ObjectRef>(checkWinVal) &&
+            std::get<ObjectRef>(checkWinVal).valid();
+        if (!hasMainWin) {
+            SymbolId runSym = programImage_
+                ? FindBytecodeClassMethod(*programImage_, candTypeId, "Run", 1u)
+                : (aotDescriptor_ ? FindAotClassMethod(*aotDescriptor_, candTypeId, "Run", 2u) : 0u);
+            if (runSym != 0u) {
+                (void)InvokeSymbol(
+                    runSym,
+                    {UnifiedValue{candidate}, UnifiedValue{rs_rt::NullObject{}}},
+                    nullptr,
+                    DomainKind::UiPresentation);
+            } else {
+                runSym = programImage_
+                    ? FindBytecodeClassMethod(*programImage_, candTypeId, "Run", 0u)
+                    : (aotDescriptor_ ? FindAotClassMethod(*aotDescriptor_, candTypeId, "Run", 1u) : 0u);
+                if (runSym != 0u) {
+                    (void)InvokeSymbol(runSym, {UnifiedValue{candidate}}, nullptr, DomainKind::UiPresentation);
+                }
+            }
+        }
     }
 
     ObjectRef uiRoot = candidate;
@@ -1213,7 +1824,7 @@ bool AeroAppHost::MountScriptRootObject(ObjectRef candidate) {
     rootObject_ = uiRoot;
     rootObjectPin_ = domains_.uiHeap().retain(rootObject_);
 
-    // Show Window (or ApplyTemplate + EnsureLoadedSubtree for UserControl/Page/UIElement)
+    // Show Window (or PopupService + ApplyTemplate + EnsureLoadedSubtree for UserControl/Page/UIElement)
     const SymbolId typeId = domains_.uiHeap().objectTypeIdFast(rootObject_);
     bool invokedShow = false;
     if (typeId != 0u) {
@@ -1235,24 +1846,40 @@ bool AeroAppHost::MountScriptRootObject(ObjectRef candidate) {
                 }
             }
         }
-        logTrace("MountScriptRootObject: invoking Show");
         if (showSym != 0u) {
+            logTrace("MountScriptRootObject: invoking Show");
             invokedShow = InvokeSymbol(showSym, {UnifiedValue{rootObject_}}, nullptr, DomainKind::UiPresentation);
         }
         if (!invokedShow) {
-            logTrace("MountScriptRootObject: invoking ApplyTemplate/EnsureLoadedSubtree");
+            logTrace("MountScriptRootObject: invoking SetOverlayHost/ApplyTemplate/EnsureLoadedSubtree");
+            if (symbols_.popupSetOverlayHost != 0u) {
+                (void)InvokeSymbol(
+                    symbols_.popupSetOverlayHost, {UnifiedValue{rootObject_}}, nullptr, DomainKind::UiPresentation);
+            }
             SymbolId tplSym = 0u;
             SymbolId loadSym = 0u;
             if (programImage_) {
                 tplSym = FindBytecodeClassMethod(*programImage_, typeId, "ApplyTemplate", 0u);
-                if (tplSym == 0u) tplSym = symbols_.applyTemplate;
+                if (tplSym == 0u) {
+                    tplSym = symbols_.controlApplyTemplate != 0u
+                        ? symbols_.controlApplyTemplate
+                        : symbols_.applyTemplate;
+                }
                 loadSym = FindBytecodeClassMethod(*programImage_, typeId, "EnsureLoadedSubtree", 0u);
-                if (loadSym == 0u) loadSym = symbols_.ensureLoadedSubtree;
+                if (loadSym == 0u) {
+                    loadSym = symbols_.ensureLoadedSubtree;
+                }
             } else if (aotDescriptor_) {
                 tplSym = FindAotClassMethod(*aotDescriptor_, typeId, "ApplyTemplate", 1u);
-                if (tplSym == 0u) tplSym = symbols_.applyTemplate;
+                if (tplSym == 0u) {
+                    tplSym = symbols_.controlApplyTemplate != 0u
+                        ? symbols_.controlApplyTemplate
+                        : symbols_.applyTemplate;
+                }
                 loadSym = FindAotClassMethod(*aotDescriptor_, typeId, "EnsureLoadedSubtree", 1u);
-                if (loadSym == 0u) loadSym = symbols_.ensureLoadedSubtree;
+                if (loadSym == 0u) {
+                    loadSym = symbols_.ensureLoadedSubtree;
+                }
             }
             if (tplSym != 0u) {
                 (void)InvokeSymbol(tplSym, {UnifiedValue{rootObject_}}, nullptr, DomainKind::UiPresentation);
@@ -1680,6 +2307,11 @@ void AeroAppHost::StepFrame(float dtSeconds, bool forceRenderSync) {
         logTrace("TickAndPresentFrame");
         (void)windowHost_.TickAndPresentFrame(0.0f, forceRenderSync || needSync);
     }
+    if (domains_.uiHeap().collectionRequested() ||
+        domains_.uiHeap().phase() != rs_rt::GcPhase::Idle) {
+        (void)domains_.uiHeap().collectIncrementalWithBudget(
+            rs_rt::RootSet{}, std::chrono::milliseconds(1));
+    }
     logTrace("done");
 }
 
@@ -1704,16 +2336,56 @@ bool AeroAppHost::RenderHeadlessRgba(
 
     std::uint32_t capW = 0u;
     std::uint32_t capH = 0u;
-    if (windowHost_.IsInitialized() &&
+    const bool usedCapture =
+        windowHost_.IsInitialized() &&
         windowHost_.Width() == width &&
         windowHost_.Height() == height &&
         windowHost_.CaptureFramebufferRgba8(outRgba, capW, capH) &&
         capW == width && capH == height &&
-        outRgba.size() == static_cast<std::size_t>(width) * static_cast<std::size_t>(height) * 4u) {
-        return true;
-    }
+        outRgba.size() == static_cast<std::size_t>(width) * static_cast<std::size_t>(height) * 4u;
 
-    ZeroCopyGpuStream::RasterizeTreeToRgba8(renderTree_, width, height, outRgba, config_.clearColor);
+    if (!usedCapture) {
+        ZeroCopyGpuStream::RasterizeTreeToRgba8(renderTree_, width, height, outRgba, config_.clearColor);
+    }
+    if (std::getenv("AERO_TRACE") != nullptr && outRgba.size() >= static_cast<std::size_t>(width) * height * 4u) {
+        const auto pxAt = [&](std::uint32_t x, std::uint32_t y) {
+            const std::size_t o = (static_cast<std::size_t>(y) * width + x) * 4u;
+            return std::array<std::uint8_t, 4>{outRgba[o], outRgba[o + 1u], outRgba[o + 2u], outRgba[o + 3u]};
+        };
+        const auto p0 = pxAt(0u, 0u);
+        const auto pm = pxAt(width / 2u, height / 2u);
+        const auto pb = pxAt(0u, height - 1u);
+        const auto* g1 = resourceStore_ ? resourceStore_->GradientBrushes().Find(1u) : nullptr;
+        std::fprintf(
+            stderr,
+            "[AERO_TRACE] RenderHeadlessRgba(%ux%u, usedCap=%d): nodes=%zu treeStore==hostStore=%d gradCount=%zu g1=(kind=%d mm=%d s=(%.2f,%.2f)->(%.2f,%.2f) stops=%zu) px(0,0)=#%02X%02X%02X%02X px(mid)=#%02X%02X%02X%02X px(bot)=#%02X%02X%02X%02X\n",
+            width,
+            height,
+            static_cast<int>(usedCapture),
+            renderTree_.NodeCount(),
+            static_cast<int>(renderTree_.ResourceStore() == resourceStore_.get()),
+            resourceStore_ ? resourceStore_->GradientBrushes().BrushCount() : 0u,
+            g1 ? static_cast<int>(g1->kind) : -1,
+            g1 ? static_cast<int>(g1->mappingMode) : -1,
+            g1 ? g1->startPoint.x : -1.0f,
+            g1 ? g1->startPoint.y : -1.0f,
+            g1 ? g1->endPoint.x : -1.0f,
+            g1 ? g1->endPoint.y : -1.0f,
+            g1 ? g1->stops.size() : 0u,
+            p0[0], p0[1], p0[2], p0[3],
+            pm[0], pm[1], pm[2], pm[3],
+            pb[0], pb[1], pb[2], pb[3]);
+        if (programImage_) {
+            const SymbolId b1 = FindBytecodeFunctionSymbol(*programImage_, "Shape.BuildVectorGeometrySpec");
+            const SymbolId b2 = FindBytecodeFunctionSymbol(*programImage_, "Path.BuildVectorGeometrySpec");
+            std::fprintf(
+                stderr,
+                "[AERO_TRACE] Shape.BuildVectorGeometrySpec=%llu Path.BuildVectorGeometrySpec=%llu\n",
+                static_cast<unsigned long long>(b1),
+                static_cast<unsigned long long>(b2));
+        }
+        std::fflush(stderr);
+    }
     return outRgba.size() == static_cast<std::size_t>(width) * static_cast<std::size_t>(height) * 4u;
 }
 
