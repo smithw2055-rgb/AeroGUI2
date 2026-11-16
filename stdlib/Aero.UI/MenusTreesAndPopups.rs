@@ -924,11 +924,6 @@ public class Window : ContentControl {
 
     public override string GetTypeName() { return "Window"; }
 
-    public void InitializeComponent() {
-        ApplyTemplate();
-        EnsureLoadedSubtree();
-    }
-
     public void Show() {
         _isActive = true;
         PopupService.SetOverlayHost(this);
