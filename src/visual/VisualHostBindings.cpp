@@ -73,7 +73,9 @@ namespace {
 [[nodiscard]] rs_rt::ObjectRef ArgObject(rs_rt::ValueSpan args, std::size_t idx) noexcept {
     if (idx >= args.size()) return rs_rt::ObjectRef{};
     if (const auto* ov = std::get_if<rs_rt::ObjectRef>(&args[idx])) {
-        return *ov;
+        if (ov->valid() && ov->kind == rs_rt::ObjectKind::Record) {
+            return *ov;
+        }
     }
     return rs_rt::ObjectRef{};
 }
@@ -465,7 +467,7 @@ struct ReflectHostEnv {
             return false;
         }
         const auto* nextObj = std::get_if<rs_rt::ObjectRef>(&hopVal);
-        if (!nextObj || !nextObj->valid()) {
+        if (!nextObj || !nextObj->valid() || nextObj->kind != rs_rt::ObjectKind::Record) {
             return false;
         }
         cur = *nextObj;
@@ -781,7 +783,9 @@ bool RegisterVisualHostBindings(
     });
     ok &= bindFn("Visual_GetOwner", [&world](const rs_bc::FunctionReference&, rs_rt::ValueSpan args, rs_rt::RuntimeError&) -> std::optional<rs_rt::Value> {
         const rs_rt::ObjectRef obj = world.GetOwner(ArgNode(args, 0, world));
-        return obj.valid() ? rs_rt::Value{obj} : rs_rt::Value{rs_rt::NullObject{}};
+        return (obj.valid() && obj.kind == rs_rt::ObjectKind::Record)
+            ? rs_rt::Value{obj}
+            : rs_rt::Value{rs_rt::NullObject{}};
     });
 
     // Geometry & Layout
@@ -1272,7 +1276,8 @@ bool RegisterVisualHostBindings(
         }
         rs_rt::Value val{};
         if (ReadDotPathValue(reflectEnv, target, propPath, val)) {
-            if (const auto* ov = std::get_if<rs_rt::ObjectRef>(&val)) {
+            if (const auto* ov = std::get_if<rs_rt::ObjectRef>(&val);
+                ov && ov->valid() && ov->kind == rs_rt::ObjectKind::Record) {
                 return rs_rt::Value{*ov};
             }
         }
@@ -1342,7 +1347,8 @@ bool RegisterVisualHostBindings(
         // Case 1: Path resolves to a command object exposing CanExecute / Execute (ICommand / RelayCommand).
         rs_rt::Value propVal{};
         if (ReadSingleMember(reflectEnv, recvObj, leafName, propVal)) {
-            if (const auto* cmdRef = std::get_if<rs_rt::ObjectRef>(&propVal); cmdRef && cmdRef->valid()) {
+            if (const auto* cmdRef = std::get_if<rs_rt::ObjectRef>(&propVal);
+                cmdRef && cmdRef->valid() && cmdRef->kind == rs_rt::ObjectKind::Record) {
                 rs_rt::Value canExecRes{};
                 bool hasCanExec = false;
                 const bool canExecOk = TryInvokeObjectMethod(

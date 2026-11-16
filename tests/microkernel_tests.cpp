@@ -1080,6 +1080,19 @@ void TestHostBindingsAndReflection() {
         MakeStrVal("Profile.Title")});
     CHECK(gotUpdated.has_value() && std::get<aero::rs_rt::StringValue>(*gotUpdated).str() == "Updated");
 
+    // Reflect_GetPropObject on string fields must return NullObject rather than leaking ObjectKind::String
+    const auto strAsObj = invokeBound("Reflect_GetPropObject", {
+        aero::rs_rt::Value{*rootObjOpt},
+        MakeStrVal("Profile.Title")});
+    CHECK(strAsObj.has_value() && std::holds_alternative<aero::rs_rt::NullObject>(*strAsObj));
+
+    const auto recordAsObj = invokeBound("Reflect_GetPropObject", {
+        aero::rs_rt::Value{*rootObjOpt},
+        MakeStrVal("Profile")});
+    CHECK(recordAsObj.has_value() &&
+          std::holds_alternative<aero::rs_rt::ObjectRef>(*recordAsObj) &&
+          std::get<aero::rs_rt::ObjectRef>(*recordAsObj).kind == aero::rs_rt::ObjectKind::Record);
+
     (void)invokeBound("Reflect_SetPropInt", {
         aero::rs_rt::Value{*rootObjOpt},
         MakeStrVal("Profile.Score"),

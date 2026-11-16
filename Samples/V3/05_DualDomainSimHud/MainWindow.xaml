@@ -1,0 +1,98 @@
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        x:Class="Samples.V3.DualDomainSimHud.MainWindow"
+        Title="AeroGUI v3 — Dual-Domain Sim HUD"
+        Width="860"
+        Height="560"
+        Background="#FF090D16">
+    <Grid Margin="20">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="*" />
+        </Grid.RowDefinitions>
+
+        <!-- HUD Top Strip -->
+        <Border Grid.Row="0" Background="#FF111827" BorderBrush="#FF1F2937" BorderThickness="1"
+                CornerRadius="12" Padding="16" Margin="0,0,0,16">
+            <StackPanel Orientation="Horizontal" Spacing="12" VerticalAlignment="Center">
+                <StackPanel Width="400" Spacing="4">
+                    <TextBlock Text="DUAL-DOMAIN FLIGHT &amp; TELEMETRY HUD" FontSize="18" Foreground="#FFF8FAFC" />
+                    <TextBlock x:Name="HudStatusText"
+                               Text="Domain A: SimDeterministic | Domain B: UiPresentation | Track-B Zero-Alloc ECS"
+                               FontSize="12" Foreground="#FF38BDF8" />
+                </StackPanel>
+                <Button x:Name="BoostBtn" Content="Afterburner" Padding="12,8"
+                        Background="#FFF59E0B" Foreground="#FF0F172A" CornerRadius="8" />
+                <Button x:Name="ShieldBtn" Content="Toggle Shields" Padding="12,8"
+                        Background="#FF2563EB" Foreground="#FFFFFFFF" CornerRadius="8" />
+                <Button x:Name="ResetSimBtn" Content="Reset Sim" Padding="12,8"
+                        Background="#FF334155" Foreground="#FFFFFFFF" CornerRadius="8" />
+            </StackPanel>
+        </Border>
+
+        <!-- Main HUD Telemetry Panels -->
+        <Grid Grid.Row="1">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="460" />
+                <ColumnDefinition Width="*" />
+            </Grid.ColumnDefinitions>
+
+            <!-- Left Column: Track-B ECS-Bound Gauges -->
+            <Border Grid.Column="0" Background="#FF0F172A" BorderBrush="#FF1E293B" BorderThickness="1"
+                    CornerRadius="12" Padding="18" Margin="0,0,16,0">
+                <StackPanel Spacing="18">
+                    <TextBlock Text="Track-B Native ECS Float Columns" FontSize="15" Foreground="#FFE2E8F0" />
+
+                    <StackPanel Spacing="6">
+                        <TextBlock Text="Hull Integrity (Track-B Width)" FontSize="12" Foreground="#FF94A3B8" />
+                        <Border Width="380" Height="24" Background="#FF1E293B" CornerRadius="6" Padding="2">
+                            <Border x:Name="HealthFill" Width="320" Height="20"
+                                    HorizontalAlignment="Left" Background="#FF22C55E" CornerRadius="4" />
+                        </Border>
+                    </StackPanel>
+
+                    <StackPanel Spacing="6">
+                        <TextBlock Text="Reactor Energy (Track-B Width)" FontSize="12" Foreground="#FF94A3B8" />
+                        <Border Width="380" Height="24" Background="#FF1E293B" CornerRadius="6" Padding="2">
+                            <Border x:Name="EnergyFill" Width="260" Height="20"
+                                    HorizontalAlignment="Left" Background="#FF38BDF8" CornerRadius="4" />
+                        </Border>
+                    </StackPanel>
+
+                    <StackPanel Spacing="6">
+                        <TextBlock Text="Thruster Output" FontSize="12" Foreground="#FF94A3B8" />
+                        <Border Width="380" Height="24" Background="#FF1E293B" CornerRadius="6" Padding="2">
+                            <Border x:Name="ThrustFill" Width="180" Height="20"
+                                    HorizontalAlignment="Left" Background="#FFF59E0B" CornerRadius="4" />
+                        </Border>
+                    </StackPanel>
+
+                    <Border x:Name="HudReadoutCard" Background="#FF1E293B" CornerRadius="8" Padding="12">
+                        <StackPanel Spacing="4">
+                            <TextBlock x:Name="ShieldStatusText" Text="SHIELDS: ONLINE" FontSize="14" Foreground="#FF38BDF8" />
+                            <TextBlock x:Name="TelemetrySummaryText" Text="Health 85% | Energy 68% | Mach 1.40"
+                                       FontSize="12" Foreground="#FFCBD5E1" />
+                        </StackPanel>
+                    </Border>
+                </StackPanel>
+            </Border>
+
+            <!-- Right Column: Attitude Reticle + Track-B RotateDeg Needle -->
+            <Border x:Name="HudCoreCard" Grid.Column="1" Background="#FF0F172A" BorderBrush="#FF38BDF8"
+                    BorderThickness="1" CornerRadius="12" Padding="18">
+                <StackPanel Spacing="14" HorizontalAlignment="Center" VerticalAlignment="Center">
+                    <TextBlock Text="Attitude &amp; Heading Indicator" FontSize="15" Foreground="#FFE2E8F0"
+                               HorizontalAlignment="Center" />
+                    <Border Width="220" Height="220" CornerRadius="110" Background="#FF020617"
+                            BorderBrush="#FF1D4ED8" BorderThickness="3" HorizontalAlignment="Center">
+                        <Border x:Name="SpeedNeedle" Width="12" Height="110"
+                                Background="#FFF59E0B" CornerRadius="6"
+                                HorizontalAlignment="Center" VerticalAlignment="Center" />
+                    </Border>
+                    <TextBlock x:Name="DomainStatsText" Text="Sim commands queued cleanly across domains"
+                               FontSize="12" Foreground="#FF94A3B8" HorizontalAlignment="Center" />
+                </StackPanel>
+            </Border>
+        </Grid>
+    </Grid>
+</Window>
