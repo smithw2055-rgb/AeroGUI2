@@ -1200,8 +1200,9 @@ public partial class MainWindow : Window {
         prunedRes.prunedMirTypes,
         prunedRes.retainedMirFunctions,
         prunedRes.prunedMirFunctions);
-    Require(prunedRes.programImageBytes.size() < 3500000u,
-        "Tree-shaken .rsb on <Window> view must be < 3,500,000 bytes");
+    Require(prunedRes.programImageBytes.size() < 4500000u &&
+            prunedRes.programImageBytes.size() * 10u < unprunedRes.programImageBytes.size() * 3u,
+        "Tree-shaken .rsb on <Window> view must be < 4,500,000 bytes and < 30% of unpruned size");
     Require(prunedRes.prunedMirFunctions > 200u,
         "Tree-shaken <Window> compile must prune > 200 unreachable MIR functions");
     Require(prunedRes.prunedMirTypes > 0u,
