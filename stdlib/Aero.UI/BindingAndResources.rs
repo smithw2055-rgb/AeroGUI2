@@ -8,9 +8,57 @@ import RealScript.Math;
 
 public class ResourceDictionary : DependencyObject {
     private static ResourceDictionary _appResources;
+    private static Dictionary<string, ResourceDictionary> _locSources;
+    private static Dictionary<string, int> _registeredStyleKeys;
 
     private Dictionary<string, DependencyObject> _map;
     private string[] _keys;
+
+    private static string NormalizeLocKey(string src) {
+        if (src == null) { return ""; }
+        string s = src.Trim();
+        while (s.Length > 0) {
+            if (s.Length >= 2 && s.Substring(0, 2) == "./") { s = s.Substring(2); }
+            else if (s.Substring(0, 1) == "/") { s = s.Substring(1); }
+            else { break; }
+        }
+        return s;
+    }
+
+    private static string LocBaseName(string k) {
+        int slash = -1;
+        for (int i = k.Length - 1; i >= 0; i -= 1) {
+            if (k.Substring(i, 1) == "/") { slash = i; break; }
+        }
+        if (slash >= 0 && slash + 1 < k.Length) {
+            return k.Substring(slash + 1);
+        }
+        return "";
+    }
+
+    public static void RegisterLocSource(string sourceName, ResourceDictionary dict) {
+        if (sourceName == null || dict == null) { return; }
+        if (_locSources == null) { _locSources = new Dictionary<string, ResourceDictionary>(); }
+        string k = NormalizeLocKey(sourceName);
+        if (k.Length == 0) { return; }
+        _locSources[k] = dict;
+        string baseName = LocBaseName(k);
+        if (baseName.Length > 0) {
+            _locSources[baseName] = dict;
+        }
+    }
+
+    public static ResourceDictionary GetLocSource(string sourceName) {
+        if (_locSources == null || sourceName == null) { return null; }
+        string k = NormalizeLocKey(sourceName);
+        if (k.Length == 0) { return null; }
+        if (_locSources.ContainsKey(k)) { return _locSources[k]; }
+        string baseName = LocBaseName(k);
+        if (baseName.Length > 0 && _locSources.ContainsKey(baseName)) {
+            return _locSources[baseName];
+        }
+        return null;
+    }
 
     public ResourceDictionary() {
         _map = new Dictionary<string, DependencyObject>();
@@ -24,12 +72,23 @@ public class ResourceDictionary : DependencyObject {
         return _appResources;
     }
 
+    public static bool MayHaveStyleKey(string key) {
+        if (key == null || key.Length == 0 || _registeredStyleKeys == null) { return false; }
+        return _registeredStyleKeys.ContainsKey(key);
+    }
+
     public void SetBox(string key, DependencyObject box) {
         if (key == null || key.Length == 0) { return; }
         if (!_map.ContainsKey(key)) {
             _keys.Push(key);
         }
         _map[key] = box;
+        if (box is Style || DependencyObject.Unbox(box) is Style) {
+            if (_registeredStyleKeys == null) {
+                _registeredStyleKeys = new Dictionary<string, int>();
+            }
+            _registeredStyleKeys[key] = 1;
+        }
     }
 
     public void Set(string key, object val) { SetBox(key, DependencyObject.BoxObject(val)); }
@@ -459,41 +518,62 @@ public class Style : DependencyObject {
         if (trigger != null) { _behaviorTriggers.Push(trigger); }
     }
 
+    private static Style[] CollectChain(Style leaf) {
+        var chain = new Style[0];
+        Style cur = leaf;
+        while (cur != null && chain.Length < 32) {
+            chain.Push(cur);
+            cur = cur.BasedOn;
+        }
+        return chain;
+    }
+
     public void ApplySettersOnly(UIElement target) {
         if (target == null) { return; }
-        if (BasedOn != null) { BasedOn.ApplySettersOnly(target); }
-        for (int i = 0; i < _setters.Length; i += 1) {
-            _setters[i].ApplyTo(target);
+        Style[] chain = Style.CollectChain(this);
+        for (int c = chain.Length - 1; c >= 0; c -= 1) {
+            Setter[] ss = chain[c]._setters;
+            for (int i = 0; i < ss.Length; i += 1) {
+                ss[i].ApplyTo(target);
+            }
         }
     }
 
     public void ApplyTo(UIElement target) {
         if (target == null) { return; }
-        if (BasedOn != null) { BasedOn.ApplyTo(target); }
-        for (int i = 0; i < _setters.Length; i += 1) {
-            _setters[i].ApplyTo(target);
-        }
-        for (int i = 0; i < _triggers.Length; i += 1) {
-            _triggers[i].Attach(target);
-        }
-        for (int i = 0; i < _behaviorTriggers.Length; i += 1) {
-            _behaviorTriggers[i].Attach(target);
+        Style[] chain = Style.CollectChain(this);
+        for (int c = chain.Length - 1; c >= 0; c -= 1) {
+            Style st = chain[c];
+            for (int i = 0; i < st._setters.Length; i += 1) {
+                st._setters[i].ApplyTo(target);
+            }
+            for (int i = 0; i < st._triggers.Length; i += 1) {
+                st._triggers[i].Attach(target);
+            }
+            for (int i = 0; i < st._behaviorTriggers.Length; i += 1) {
+                st._behaviorTriggers[i].Attach(target);
+            }
         }
         EvaluateTriggers(target);
     }
 
     public void EvaluateTriggers(UIElement target) {
         if (target == null) { return; }
-        bool anyReverted = false;
-        for (int i = 0; i < _triggers.Length; i += 1) {
-            if (!_triggers[i].IsMatched(target)) { anyReverted = true; break; }
-        }
-        if (anyReverted) {
-            ApplySettersOnly(target);
-        }
-        if (BasedOn != null) { BasedOn.EvaluateTriggers(target); }
-        for (int i = 0; i < _triggers.Length; i += 1) {
-            _triggers[i].Evaluate(target, this);
+        Style[] chain = Style.CollectChain(this);
+        for (int c = chain.Length - 1; c >= 0; c -= 1) {
+            Style st = chain[c];
+            bool anyReverted = false;
+            for (int i = 0; i < st._triggers.Length; i += 1) {
+                if (!st._triggers[i].IsMatched(target)) { anyReverted = true; break; }
+            }
+            if (anyReverted) {
+                for (int i = 0; i < st._setters.Length; i += 1) {
+                    st._setters[i].ApplyTo(target);
+                }
+            }
+            for (int i = 0; i < st._triggers.Length; i += 1) {
+                st._triggers[i].Evaluate(target, st);
+            }
         }
     }
 }
@@ -526,7 +606,12 @@ public class ControlTemplate : DependencyObject {
     public UIElement Instantiate(Control owner) {
         if (_factory == null) { return null; }
         UIElement root = _factory(owner);
-        if (root != null) { MarkTemplatedParentSubtree(root, owner); }
+        if (root != null) {
+            if (Resources != null && Resources.Keys().Length > 0) {
+                root.Resources.Merge(Resources);
+            }
+            MarkTemplatedParentSubtree(root, owner);
+        }
         for (int i = 0; i < _triggers.Length; i += 1) {
             _triggers[i].Attach(owner);
         }
@@ -540,10 +625,20 @@ public class ControlTemplate : DependencyObject {
         }
     }
 
-    private static void MarkTemplatedParentSubtree(UIElement node, UIElement owner) {
-        node.TemplatedParent = owner;
-        for (int i = 0; i < node.ChildCount(); i += 1) {
-            MarkTemplatedParentSubtree(node.ChildAt(i), owner);
+    private static void MarkTemplatedParentSubtree(UIElement rootNode, UIElement owner) {
+        if (rootNode == null || owner == null) { return; }
+        var q = new UIElement[0];
+        q.Push(rootNode);
+        int idx = 0;
+        while (idx < q.Length) {
+            UIElement node = q[idx];
+            idx += 1;
+            if (node == null) { continue; }
+            if (node.TemplatedParent == null) { node.TemplatedParent = owner; }
+            if (node is ContentPresenter || node.TemplatedParent != owner) { continue; }
+            for (int i = 0; i < node.ChildCount(); i += 1) {
+                q.Push(node.ChildAt(i));
+            }
         }
     }
 }
@@ -575,6 +670,9 @@ public class DataTemplate : DependencyObject {
     public virtual UIElement Instantiate(object item) {
         if (_factory == null) { return null; }
         UIElement root = _factory(item);
+        if (root != null && Resources != null && Resources.Keys().Length > 0) {
+            root.Resources.Merge(Resources);
+        }
         if (root != null && item != null) {
             root.DataContext = item;
         }
@@ -1091,6 +1189,31 @@ internal class BindingEntry : DependencyObject {
     public string LastHash = "";
     public int LastDirtyMask = -1;
     public bool OneTimeDone = false;
+    private UIElement _lastFindNameRoot;
+    private UIElement[] _multiElementSources;
+    private UIElement[] _multiFindRoots;
+
+    internal static UIElement FindElementScoped(UIElement host, string elementName) {
+        if (host == null || elementName == null || elementName.Length == 0) { return null; }
+        if (host.TemplatedParent != null) {
+            UIElement t = host;
+            while (t.Parent != null && t.Parent.TemplatedParent == host.TemplatedParent) {
+                t = t.Parent;
+            }
+            UIElement localHit = t.FindName(elementName);
+            if (localHit != null) { return localHit; }
+        }
+        UIElement cur = host;
+        while (cur.Parent != null) {
+            cur = cur.Parent;
+            if (cur is ContentPresenter || cur is UserControl) {
+                UIElement scopeHit = cur.FindName(elementName);
+                if (scopeHit != null) { return scopeHit; }
+                break;
+            }
+        }
+        return null;
+    }
 
     public DependencyObject ResolveSourceBox() {
         if (ExplicitSourceBox != null) { return ExplicitSourceBox; }
@@ -1224,17 +1347,38 @@ internal class BindingEntry : DependencyObject {
 
         if (Kind == 2) {
             if (SourceElement == null && ElementName.Length > 0 && host != null) {
-                SourceElement = host.RootElement().FindName(ElementName);
+                SourceElement = BindingEntry.FindElementScoped(host, ElementName);
+                if (SourceElement == null) {
+                    UIElement curRoot = host.RootElement();
+                    if (curRoot != null && curRoot != _lastFindNameRoot) {
+                        _lastFindNameRoot = curRoot;
+                        SourceElement = curRoot.FindName(ElementName);
+                    }
+                }
             }
             if (SourceElement != null) {
-                DependencyObject ev = SourceElement.GetPropertyValue(SourcePath);
-                if (ev == null && SourceElement.DataContext != null) {
-                    ev = BindingEngine.ReadPathBox(SourceElement.DataContext, SourcePath);
+                DependencyObject ev = null;
+                if (SourcePath == null || SourcePath.Length == 0 || SourcePath == ".") {
+                    ev = DependencyObject.BoxObject(SourceElement);
+                } else {
+                    ev = SourceElement.GetPropertyValue(SourcePath);
+                    if (ev == null) {
+                        ev = BindingEngine.ReadPathBox(SourceElement, SourcePath);
+                    }
+                    if (ev == null && SourceElement.DataContext != null) {
+                        ev = BindingEngine.ReadPathBox(SourceElement.DataContext, SourcePath);
+                    }
                 }
                 if (ev == null && HasFallback) { ev = FallbackBox; }
-                ApplyConverted(ev);
+                bool isDirectUi = ev != null && (ev.UnboxObject() is UIElement);
+                string sig = isDirectUi ? "<ui>" : (ev != null ? DependencyObject.UnboxString(ev, "") : "<null>");
+                if (!OneTimeDone || (!isDirectUi && sig != LastHash)) {
+                    LastHash = sig;
+                    OneTimeDone = true;
+                    ApplyConverted(ev);
+                }
+            } else if (HasFallback && host != null && !OneTimeDone) {
                 OneTimeDone = true;
-            } else if (HasFallback && host != null) {
                 ApplyRawBox(FallbackBox);
             }
             return;
@@ -1256,15 +1400,34 @@ internal class BindingEntry : DependencyObject {
         }
 
         if (Kind == 4 && MultiBindings != null) {
-            var vals = new DependencyObject[MultiBindings.Length];
+            int mbLen = MultiBindings.Length;
+            if (_multiElementSources == null || _multiElementSources.Length < mbLen) {
+                _multiElementSources = new UIElement[mbLen];
+                _multiFindRoots = new UIElement[mbLen];
+            }
+            var vals = new DependencyObject[mbLen];
             string sig = "";
-            for (int i = 0; i < MultiBindings.Length; i += 1) {
+            for (int i = 0; i < mbLen; i += 1) {
                 Binding sub = MultiBindings[i];
                 DependencyObject sv = null;
                 if (sub.ElementName.Length > 0 && host != null) {
-                    UIElement se = host.RootElement().FindName(sub.ElementName);
+                    UIElement se = _multiElementSources[i];
+                    if (se == null) {
+                        se = BindingEntry.FindElementScoped(host, sub.ElementName);
+                        if (se == null) {
+                            UIElement curRoot = host.RootElement();
+                            if (curRoot != null && curRoot != _multiFindRoots[i]) {
+                                _multiFindRoots[i] = curRoot;
+                                se = curRoot.FindName(sub.ElementName);
+                            }
+                        }
+                        if (se != null) {
+                            _multiElementSources[i] = se;
+                        }
+                    }
                     if (se != null) {
                         sv = se.GetPropertyValue(sub.Path);
+                        if (sv == null) { sv = BindingEngine.ReadPathBox(se, sub.Path); }
                         if (sv == null && se.DataContext != null) { sv = BindingEngine.ReadPathBox(se.DataContext, sub.Path); }
                     }
                 } else if (sub.RelativeSourceMode == "Self" && host != null) {
@@ -1661,6 +1824,16 @@ public static class BindingEngine {
 
     public static void Flush() {
         if (_entries == null) { return; }
+        int write = 0;
+        for (int i = 0; i < _entries.Length; i += 1) {
+            BindingEntry e = _entries[i];
+            if (e.Target != null && e.Target._isDisposedTree) { continue; }
+            if (write != i) { _entries[write] = e; }
+            write += 1;
+        }
+        while (_entries.Length > write) {
+            _entries.RemoveAt(_entries.Length - 1);
+        }
         for (int i = 0; i < _entries.Length; i += 1) {
             _entries[i].Evaluate();
         }
@@ -1672,6 +1845,13 @@ public static class BindingEngine {
         if (path == null || path.Length == 0 || path == ".") {
             if (root is DependencyObject) { return root as DependencyObject; }
             return DependencyObject.BoxObject(root);
+        }
+        if (root is UIElement) {
+            DependencyObject direct = (root as UIElement).GetPropertyValue(path);
+            if (direct != null) { return direct; }
+            if (path.Length > 2 && path.Substring(0, 1) == "(" && path.Substring(path.Length - 1, 1) == ")") {
+                return null;
+            }
         }
         string[] segs = path.Split(".");
         object cur = root;

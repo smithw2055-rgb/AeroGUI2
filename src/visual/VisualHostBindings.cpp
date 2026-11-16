@@ -70,6 +70,22 @@ namespace {
     return {};
 }
 
+[[nodiscard]] std::string ArgString(
+    const ExecutionDomainContext& domains,
+    rs_rt::ValueSpan args,
+    std::size_t idx) {
+    if (idx >= args.size()) return {};
+    if (const auto* sv = std::get_if<rs_rt::StringValue>(&args[idx])) {
+        return sv->str();
+    }
+    if (const auto* ov = std::get_if<rs_rt::ObjectRef>(&args[idx]); ov && ov->valid()) {
+        if (const auto view = domains.stringViewAcrossDomains(*ov)) {
+            return std::string(*view);
+        }
+    }
+    return {};
+}
+
 [[nodiscard]] rs_rt::ObjectRef ArgObject(rs_rt::ValueSpan args, std::size_t idx) noexcept {
     if (idx >= args.size()) return rs_rt::ObjectRef{};
     if (const auto* ov = std::get_if<rs_rt::ObjectRef>(&args[idx])) {
@@ -909,18 +925,18 @@ bool RegisterVisualHostBindings(
             static_cast<std::int32_t>(ArgInt(args, 2, -1)));
         return rs_rt::Value{std::int64_t{0}};
     });
-    ok &= bindFn("Visual_RegisterLinearGradient", [&world](const rs_bc::FunctionReference&, rs_rt::ValueSpan args, rs_rt::RuntimeError&) -> std::optional<rs_rt::Value> {
+    ok &= bindFn("Visual_RegisterLinearGradient", [&world, &domains](const rs_bc::FunctionReference&, rs_rt::ValueSpan args, rs_rt::RuntimeError&) -> std::optional<rs_rt::Value> {
         GradientBrushDesc desc{};
         desc.kind = GradientBrushKind::Linear;
         desc.startPoint = Point{ArgFloat(args, 0, 0.0f), ArgFloat(args, 1, 0.0f)};
         desc.endPoint = Point{ArgFloat(args, 2, 1.0f), ArgFloat(args, 3, 1.0f)};
         desc.spreadMethod = static_cast<GradientSpreadMethod>(ArgInt(args, 4, 0));
         desc.mappingMode = static_cast<BrushMappingMode>(ArgInt(args, 5, 0));
-        ParseStopsSpec(ArgString(args, 6), desc);
+        ParseStopsSpec(ArgString(domains, args, 6), desc);
         const std::uint32_t id = world.ResourceStore()->GradientBrushes().RegisterBrush(std::move(desc));
         return rs_rt::Value{static_cast<std::int64_t>(id)};
     });
-    ok &= bindFn("Visual_RegisterRadialGradient", [&world](const rs_bc::FunctionReference&, rs_rt::ValueSpan args, rs_rt::RuntimeError&) -> std::optional<rs_rt::Value> {
+    ok &= bindFn("Visual_RegisterRadialGradient", [&world, &domains](const rs_bc::FunctionReference&, rs_rt::ValueSpan args, rs_rt::RuntimeError&) -> std::optional<rs_rt::Value> {
         GradientBrushDesc desc{};
         desc.kind = GradientBrushKind::Radial;
         desc.center = Point{ArgFloat(args, 0, 0.5f), ArgFloat(args, 1, 0.5f)};
@@ -929,7 +945,7 @@ bool RegisterVisualHostBindings(
         desc.radiusY = ArgFloat(args, 5, 0.5f);
         desc.spreadMethod = static_cast<GradientSpreadMethod>(ArgInt(args, 6, 0));
         desc.mappingMode = static_cast<BrushMappingMode>(ArgInt(args, 7, 0));
-        ParseStopsSpec(ArgString(args, 8), desc);
+        ParseStopsSpec(ArgString(domains, args, 8), desc);
         const std::uint32_t id = world.ResourceStore()->GradientBrushes().RegisterBrush(std::move(desc));
         return rs_rt::Value{static_cast<std::int64_t>(id)};
     });
@@ -972,11 +988,11 @@ bool RegisterVisualHostBindings(
     });
 
     // Text / Image / Vector
-    ok &= bindFn("Visual_SetText", [&world](const rs_bc::FunctionReference&, rs_rt::ValueSpan args, rs_rt::RuntimeError&) -> std::optional<rs_rt::Value> {
+    ok &= bindFn("Visual_SetText", [&world, &domains](const rs_bc::FunctionReference&, rs_rt::ValueSpan args, rs_rt::RuntimeError&) -> std::optional<rs_rt::Value> {
         (void)world.SetText(
             ArgNode(args, 0, world),
-            ArgString(args, 1),
-            ArgString(args, 2),
+            ArgString(domains, args, 1),
+            ArgString(domains, args, 2),
             ArgFloat(args, 3, 14.0f),
             ArgUInt(args, 4, 0xFF000000u),
             static_cast<TextWrapping>(ArgInt(args, 5, 0)),
@@ -1004,10 +1020,10 @@ bool RegisterVisualHostBindings(
             ArgUInt(args, 6));
         return rs_rt::Value{std::int64_t{0}};
     });
-    ok &= bindFn("Visual_MeasureText", [&world](const rs_bc::FunctionReference&, rs_rt::ValueSpan args, rs_rt::RuntimeError&) -> std::optional<rs_rt::Value> {
+    ok &= bindFn("Visual_MeasureText", [&world, &domains](const rs_bc::FunctionReference&, rs_rt::ValueSpan args, rs_rt::RuntimeError&) -> std::optional<rs_rt::Value> {
         const Size measured = world.MeasureText(
-            ArgString(args, 0),
-            ArgString(args, 1),
+            ArgString(domains, args, 0),
+            ArgString(domains, args, 1),
             ArgFloat(args, 2, 14.0f),
             ArgFloat(args, 3, 1000000.0f),
             static_cast<TextWrapping>(ArgInt(args, 4, 0)));
@@ -1017,20 +1033,20 @@ bool RegisterVisualHostBindings(
         const std::int32_t cp = world.HitTestTextCodePoint(ArgNode(args, 0, world), ArgFloat(args, 1), ArgFloat(args, 2));
         return rs_rt::Value{static_cast<std::int64_t>(cp)};
     });
-    ok &= bindFn("Visual_SetImage", [&world](const rs_bc::FunctionReference&, rs_rt::ValueSpan args, rs_rt::RuntimeError&) -> std::optional<rs_rt::Value> {
+    ok &= bindFn("Visual_SetImage", [&world, &domains](const rs_bc::FunctionReference&, rs_rt::ValueSpan args, rs_rt::RuntimeError&) -> std::optional<rs_rt::Value> {
         (void)world.SetImage(
             ArgNode(args, 0, world),
-            ArgString(args, 1),
+            ArgString(domains, args, 1),
             static_cast<Stretch>(ArgInt(args, 2, 2)),
             static_cast<StretchDirection>(ArgInt(args, 3, 2)),
             ArgUInt(args, 4, 0xFFFFFFFFu));
         return rs_rt::Value{std::int64_t{0}};
     });
-    ok &= bindFn("Visual_SetVectorShape", [&world](const rs_bc::FunctionReference&, rs_rt::ValueSpan args, rs_rt::RuntimeError&) -> std::optional<rs_rt::Value> {
+    ok &= bindFn("Visual_SetVectorShape", [&world, &domains](const rs_bc::FunctionReference&, rs_rt::ValueSpan args, rs_rt::RuntimeError&) -> std::optional<rs_rt::Value> {
         (void)world.SetVectorShape(
             ArgNode(args, 0, world),
             static_cast<VectorShapeKind>(ArgInt(args, 1, 0)),
-            ArgString(args, 2),
+            ArgString(domains, args, 2),
             ArgUInt(args, 3),
             static_cast<std::int32_t>(ArgInt(args, 4, -1)),
             ArgUInt(args, 5),
@@ -1081,19 +1097,19 @@ bool RegisterVisualHostBindings(
         drawBuffer.DrawLine(ArgNode(args, 0, world), ArgFloat(args, 1), ArgFloat(args, 2), ArgFloat(args, 3), ArgFloat(args, 4), ArgUInt(args, 5), ArgFloat(args, 6, 1.0f));
         return rs_rt::Value{std::int64_t{0}};
     });
-    ok &= bindFn("Draw_Path", [&world, &drawBuffer](const rs_bc::FunctionReference&, rs_rt::ValueSpan args, rs_rt::RuntimeError&) -> std::optional<rs_rt::Value> {
-        drawBuffer.DrawPath(ArgNode(args, 0, world), ArgString(args, 1), ArgFloat(args, 2), ArgFloat(args, 3), ArgFloat(args, 4), ArgFloat(args, 5), ArgUInt(args, 6), ArgUInt(args, 7), ArgFloat(args, 8, 1.0f));
+    ok &= bindFn("Draw_Path", [&world, &drawBuffer, &domains](const rs_bc::FunctionReference&, rs_rt::ValueSpan args, rs_rt::RuntimeError&) -> std::optional<rs_rt::Value> {
+        drawBuffer.DrawPath(ArgNode(args, 0, world), ArgString(domains, args, 1), ArgFloat(args, 2), ArgFloat(args, 3), ArgFloat(args, 4), ArgFloat(args, 5), ArgUInt(args, 6), ArgUInt(args, 7), ArgFloat(args, 8, 1.0f));
         return rs_rt::Value{std::int64_t{0}};
     });
-    ok &= bindFn("Draw_Text", [&world, &drawBuffer](const rs_bc::FunctionReference&, rs_rt::ValueSpan args, rs_rt::RuntimeError&) -> std::optional<rs_rt::Value> {
+    ok &= bindFn("Draw_Text", [&world, &drawBuffer, &domains](const rs_bc::FunctionReference&, rs_rt::ValueSpan args, rs_rt::RuntimeError&) -> std::optional<rs_rt::Value> {
         drawBuffer.DrawText(
             ArgNode(args, 0, world),
-            ArgString(args, 1),
+            ArgString(domains, args, 1),
             ArgFloat(args, 2),
             ArgFloat(args, 3),
             ArgFloat(args, 4),
             ArgFloat(args, 5),
-            ArgString(args, 6),
+            ArgString(domains, args, 6),
             ArgFloat(args, 7, 14.0f),
             ArgUInt(args, 8, 0xFF000000u),
             static_cast<HorizontalAlignment>(ArgInt(args, 9, 0)),
@@ -1178,8 +1194,8 @@ bool RegisterVisualHostBindings(
     ok &= bindFn("Host_GetClipboardText", [&inputRouter](const rs_bc::FunctionReference&, rs_rt::ValueSpan, rs_rt::RuntimeError&) -> std::optional<rs_rt::Value> {
         return rs_rt::Value{rs_rt::StringValue{inputRouter.GetClipboardText()}};
     });
-    ok &= bindFn("Host_SetClipboardText", [&inputRouter](const rs_bc::FunctionReference&, rs_rt::ValueSpan args, rs_rt::RuntimeError&) -> std::optional<rs_rt::Value> {
-        inputRouter.SetClipboardText(ArgString(args, 0));
+    ok &= bindFn("Host_SetClipboardText", [&inputRouter, &domains](const rs_bc::FunctionReference&, rs_rt::ValueSpan args, rs_rt::RuntimeError&) -> std::optional<rs_rt::Value> {
+        inputRouter.SetClipboardText(ArgString(domains, args, 0));
         return rs_rt::Value{std::int64_t{0}};
     });
     ok &= bindFn("Host_RequestWake", [platformHooks](const rs_bc::FunctionReference&, rs_rt::ValueSpan, rs_rt::RuntimeError&) -> std::optional<rs_rt::Value> {

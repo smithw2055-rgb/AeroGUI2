@@ -619,9 +619,16 @@ bool ExecutionDomainContext::DomainPolicy::interceptCall(
 // ExecutionDomainContext
 // ============================================================================
 
+[[nodiscard]] std::shared_ptr<ManagedHeap> MakeDefaultDomainHeap() {
+    realscript::runtime::HeapConfig cfg{};
+    cfg.initialCollectionThresholdBytes = 8u * 1024u * 1024u;
+    cfg.maximumHeapBytes = 256u * 1024u * 1024u;
+    return std::make_shared<ManagedHeap>(cfg);
+}
+
 ExecutionDomainContext::ExecutionDomainContext()
-    : simHeap_(std::make_shared<ManagedHeap>()),
-      uiHeap_(std::make_shared<ManagedHeap>()),
+    : simHeap_(MakeDefaultDomainHeap()),
+      uiHeap_(MakeDefaultDomainHeap()),
       simHeapId_(simHeap_->heapId()),
       uiHeapId_(uiHeap_->heapId()),
       nativeHandles_(std::make_shared<NativeHandleRegistry>()),
@@ -637,8 +644,8 @@ ExecutionDomainContext::ExecutionDomainContext(
     std::shared_ptr<ManagedHeap> simHeap,
     std::shared_ptr<ManagedHeap> uiHeap,
     std::shared_ptr<NativeHandleRegistry> nativeHandles)
-    : simHeap_(simHeap ? std::move(simHeap) : std::make_shared<ManagedHeap>()),
-      uiHeap_(uiHeap ? std::move(uiHeap) : std::make_shared<ManagedHeap>()),
+    : simHeap_(simHeap ? std::move(simHeap) : MakeDefaultDomainHeap()),
+      uiHeap_(uiHeap ? std::move(uiHeap) : MakeDefaultDomainHeap()),
       simHeapId_(simHeap_->heapId()),
       uiHeapId_(uiHeap_->heapId()),
       nativeHandles_(nativeHandles ? std::move(nativeHandles) : std::make_shared<NativeHandleRegistry>()),

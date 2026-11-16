@@ -1665,6 +1665,12 @@ FontAtlas& FontAtlas::Instance() noexcept {
     return UIResourceStore::Default().Fonts();
 }
 
+namespace {
+
+std::atomic<std::uint64_t> gNextFontAtlasInstanceId{1u};
+
+} // namespace
+
 FontAtlas::FontAtlas(std::uint16_t atlasSize)
     : atlasWidth_(std::max<std::uint16_t>(atlasSize, 512u))
     , atlasHeight_(std::max<std::uint16_t>(atlasSize, 512u))
@@ -1674,7 +1680,8 @@ FontAtlas::FontAtlas(std::uint16_t atlasSize)
           static_cast<std::uint32_t>(std::max<std::uint16_t>(atlasSize, 512u) / 2u) - 4u,
           2u,
           2u)
-    , sdfPixels_(static_cast<std::size_t>(atlasWidth_) * atlasHeight_, 0u) {
+    , sdfPixels_(static_cast<std::size_t>(atlasWidth_) * atlasHeight_, 0u)
+    , instanceId_(gNextFontAtlasInstanceId.fetch_add(1u, std::memory_order_relaxed)) {
     InitBuiltInFallbackAscii();
 }
 
@@ -2880,7 +2887,7 @@ void FontAtlas::CopyGlyphRegionRgba8(
 
 float FontAtlas::SampleSdfBilinear(float u, float v) const noexcept {
     struct TlsFontView {
-        const FontAtlas* owner = nullptr;
+        std::uint64_t instanceId = 0u;
         std::uint64_t rev = 0u;
         std::uint16_t w = 0u;
         std::uint16_t h = 0u;
@@ -2888,12 +2895,12 @@ float FontAtlas::SampleSdfBilinear(float u, float v) const noexcept {
     };
     thread_local TlsFontView tlsView{};
     const std::uint64_t curRev = revision_.load(std::memory_order_acquire);
-    if (tlsView.owner != this || tlsView.rev != curRev) {
+    if (tlsView.instanceId != instanceId_ || tlsView.rev != curRev) {
         std::lock_guard<std::mutex> lock(mutex_);
         if (sdfPixels_.empty() || atlasWidth_ == 0u || atlasHeight_ == 0u) {
             return 0.0f;
         }
-        tlsView.owner = this;
+        tlsView.instanceId = instanceId_;
         tlsView.rev = curRev;
         tlsView.w = atlasWidth_;
         tlsView.h = atlasHeight_;

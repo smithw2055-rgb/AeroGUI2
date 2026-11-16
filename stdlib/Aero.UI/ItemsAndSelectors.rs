@@ -88,12 +88,14 @@ public class ItemsControl : Control {
 
     protected ItemsPresenter _itemsPresenter;
     protected UIElement[] _activeContainers;
+    protected DependencyObject[] _activeBoxes;
     protected UIElement[] _recycledPool;
     private Action _collectionChangedHook;
 
     public ItemsControl() : base() {
         _manualItems = new DependencyObject[0];
         _activeContainers = new UIElement[0];
+        _activeBoxes = new DependencyObject[0];
         _recycledPool = new UIElement[0];
     }
 
@@ -110,24 +112,25 @@ public class ItemsControl : Control {
 
     public DataTemplate ItemTemplate {
         get { return _itemTemplate; }
-        set { _itemTemplate = value; RefreshItems(); }
+        set { _itemTemplate = value; RecycleActiveContainers(); RefreshItems(); }
     }
     public Style ItemContainerStyle {
         get { return _itemContainerStyle; }
-        set { _itemContainerStyle = value; RefreshItems(); }
+        set { _itemContainerStyle = value; RecycleActiveContainers(); RefreshItems(); }
     }
     public Func<Panel> ItemsPanel {
         get { return _itemsPanelFactory; }
         set {
             _itemsPanelFactory = value;
             if (_itemsPresenter != null) { _itemsPresenter.PanelFactory = value; }
+            RecycleActiveContainers();
             RefreshItems();
         }
     }
     public Func<Panel> ItemsPanelFactory() { return _itemsPanelFactory; }
     public string DisplayMemberPath {
         get { return _displayMemberPath; }
-        set { _displayMemberPath = value == null ? "" : value; RefreshItems(); }
+        set { _displayMemberPath = value == null ? "" : value; RecycleActiveContainers(); RefreshItems(); }
     }
     public int AlternationCount {
         get { return _alternationCount; }
@@ -260,12 +263,10 @@ public class ItemsControl : Control {
         }
         if (container is ContentControl) {
             ContentControl cc = container as ContentControl;
-            cc.ContentTemplate = _itemTemplate;
-            cc.SetContentBox(displayBox);
+            cc.SetContentAndTemplate(displayBox, _itemTemplate);
         } else if (container is ContentPresenter) {
             ContentPresenter cp = container as ContentPresenter;
-            cp.ContentTemplate = _itemTemplate;
-            cp.SetContentBox(displayBox);
+            cp.SetContentAndTemplate(displayBox, _itemTemplate);
         }
         if (_alternationCount > 0) {
             container.Tag = DependencyObject.BoxInt(index % _alternationCount);
@@ -275,8 +276,26 @@ public class ItemsControl : Control {
     protected virtual void ClearContainerForItem(UIElement container) {
         if (container == null) { return; }
         container.ClearLocalDataContext();
-        if (container is ContentControl) { (container as ContentControl).SetContentBox(null); }
-        else if (container is ContentPresenter) { (container as ContentPresenter).SetContentBox(null); }
+        if (container is ContentControl) { (container as ContentControl).SetContentAndTemplate(null, null); }
+        else if (container is ContentPresenter) { (container as ContentPresenter).SetContentAndTemplate(null, null); }
+    }
+
+    private static bool SameItemBox(DependencyObject a, DependencyObject b) {
+        if (a == b) { return true; }
+        if (a == null || b == null) { return false; }
+        if (a is BoxedString && b is BoxedString) {
+            return (a as BoxedString).Value == (b as BoxedString).Value;
+        }
+        if (a is BoxedInt && b is BoxedInt) {
+            return (a as BoxedInt).Value == (b as BoxedInt).Value;
+        }
+        if (a is BoxedFloat && b is BoxedFloat) {
+            return (a as BoxedFloat).Value == (b as BoxedFloat).Value;
+        }
+        if (a is BoxedBool && b is BoxedBool) {
+            return (a as BoxedBool).Value == (b as BoxedBool).Value;
+        }
+        return a.BoxValueEquals(b);
     }
 
     private void RecycleActiveContainers() {
@@ -289,6 +308,7 @@ public class ItemsControl : Control {
             _recycledPool.Push(c);
         }
         _activeContainers.Clear();
+        _activeBoxes.Clear();
     }
 
     protected virtual bool IsContainerRecyclable(UIElement c) {
@@ -334,28 +354,127 @@ public class ItemsControl : Control {
     protected void BuildContainerRange(int firstIdx, int lastIdx) {
         if (_itemsPresenter == null) { return; }
         Panel host = _itemsPresenter.EnsurePanel();
-        RecycleActiveContainers();
-        if (lastIdx < firstIdx) { return; }
-
-        for (int i = firstIdx; i <= lastIdx; i += 1) {
-            DependencyObject box = GetItemBoxAt(i);
-            UIElement container = null;
-            if (IsItemItsOwnContainer(box)) {
-                container = box as UIElement;
-                PrepareOwnContainer(container, i);
-            } else {
-                container = AcquireContainer();
-                PrepareContainerForItem(container, box, i);
-            }
-            if (_itemContainerStyle != null && container != null) {
-                container.Style = _itemContainerStyle;
-            }
-            _activeContainers.Push(container);
-            host.AddChild(container);
+        if (lastIdx < firstIdx) {
+            RecycleActiveContainers();
+            return;
         }
+
+        int desiredCount = lastIdx - firstIdx + 1;
+        UIElement[] prevContainers = _activeContainers;
+        DependencyObject[] prevBoxes = _activeBoxes;
+        int prevCount = prevContainers.Length;
+        var prevUsed = new bool[prevCount];
+        var nextContainers = new UIElement[desiredCount];
+        var nextBoxes = new DependencyObject[desiredCount];
+
+        for (int j = 0; j < desiredCount; j += 1) {
+            int itemIdx = firstIdx + j;
+            DependencyObject box = GetItemBoxAt(itemIdx);
+            nextBoxes[j] = box;
+            if (IsItemItsOwnContainer(box)) {
+                UIElement own = box as UIElement;
+                PrepareOwnContainer(own, itemIdx);
+                nextContainers[j] = own;
+                for (int k = 0; k < prevCount; k += 1) {
+                    if (!prevUsed[k] && prevContainers[k] == own) {
+                        prevUsed[k] = true;
+                        break;
+                    }
+                }
+                continue;
+            }
+            int hit = -1;
+            for (int k = 0; k < prevCount; k += 1) {
+                if (prevUsed[k]) { continue; }
+                if (k < prevBoxes.Length && ItemsControl.SameItemBox(prevBoxes[k], box) && IsContainerRecyclable(prevContainers[k])) {
+                    hit = k;
+                    break;
+                }
+            }
+            if (hit >= 0) {
+                prevUsed[hit] = true;
+                UIElement reused = prevContainers[hit];
+                if (_alternationCount > 0 && reused != null) {
+                    reused.Tag = DependencyObject.BoxInt(itemIdx % _alternationCount);
+                }
+                nextContainers[j] = reused;
+            } else {
+                UIElement c = AcquireContainer();
+                PrepareContainerForItem(c, box, itemIdx);
+                if (_itemContainerStyle != null && c != null) {
+                    c.Style = _itemContainerStyle;
+                }
+                nextContainers[j] = c;
+            }
+        }
+
+        UIElement hostEl = host;
+        for (int k = 0; k < prevCount; k += 1) {
+            if (prevUsed[k]) { continue; }
+            UIElement dead = prevContainers[k];
+            if (dead == null) { continue; }
+            if (hostEl != null && dead.Parent == hostEl) {
+                host.RemoveChild(dead);
+            }
+            DependencyObject oldBox = k < prevBoxes.Length ? prevBoxes[k] : null;
+            if (!IsItemItsOwnContainer(oldBox) && IsContainerRecyclable(dead)) {
+                ClearContainerForItem(dead);
+                _recycledPool.Push(dead);
+            }
+        }
+
+        if (host != null) {
+            for (int j = 0; j < desiredCount; j += 1) {
+                UIElement c = nextContainers[j];
+                if (c == null) { continue; }
+                if (j < host.ChildCount() && host.ChildAt(j) == c) {
+                    continue;
+                }
+                if (j >= host.ChildCount() && c.Parent != hostEl) {
+                    host.AddChild(c);
+                } else {
+                    host.InsertChild(j, c);
+                }
+            }
+        }
+
+        _activeContainers = nextContainers;
+        _activeBoxes = nextBoxes;
     }
 
     protected virtual void PrepareOwnContainer(UIElement container, int index) {}
+
+    private static ItemsPresenter FindFirstItemsPresenter(UIElement rootNode, UIElement owner) {
+        if (rootNode == null) { return null; }
+        var q = new UIElement[0];
+        q.Push(rootNode);
+        int idx = 0;
+        while (idx < q.Length) {
+            UIElement node = q[idx];
+            idx += 1;
+            if (node == null) { continue; }
+            if (node.TemplatedParent != null && node.TemplatedParent != owner) { continue; }
+            if (node is ItemsPresenter) { return node as ItemsPresenter; }
+            for (int i = 0; i < node.ChildCount(); i += 1) {
+                q.Push(node.ChildAt(i));
+            }
+        }
+        return null;
+    }
+
+    public override void OnApplyTemplate() {
+        UIElement found = GetTemplateChild("PART_ItemsPresenter");
+        if (found is ItemsPresenter) {
+            _itemsPresenter = found as ItemsPresenter;
+        } else {
+            _itemsPresenter = FindFirstItemsPresenter(TemplateRoot(), this);
+        }
+        if (_itemsPresenter != null) {
+            if (_itemsPanelFactory != null) { _itemsPresenter.PanelFactory = _itemsPanelFactory; }
+            _itemsPresenter.EnsurePanel();
+            RefreshItems();
+        }
+    }
 
     protected override UIElement CreateDefaultTemplate() {
         _itemsPresenter = new ItemsPresenter();
@@ -975,6 +1094,16 @@ public class ComboBox : Selector {
 
     protected override UIElement CreateContainerForItem() {
         return new ComboBoxItem();
+    }
+
+    public override void OnApplyTemplate() {
+        base.OnApplyTemplate();
+        if (_selectionDisplay == null) {
+            UIElement site = GetTemplateChild("ContentSite");
+            if (!(site is ContentPresenter)) { site = GetTemplateChild("PART_SelectionBox"); }
+            if (site is ContentPresenter) { _selectionDisplay = site as ContentPresenter; }
+        }
+        SyncSelectedPreview();
     }
 
     protected override void OnSelectionChanged(int oldIdx, int newIdx, DependencyObject oldBox, DependencyObject newBox) {

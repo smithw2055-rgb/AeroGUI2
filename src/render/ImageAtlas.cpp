@@ -2673,7 +2673,14 @@ ImageAtlas& ImageAtlas::Instance() noexcept {
     return UIResourceStore::Default().Images();
 }
 
-ImageAtlas::ImageAtlas() noexcept = default;
+namespace {
+
+std::atomic<std::uint64_t> gNextImageAtlasInstanceId{1u};
+
+} // namespace
+
+ImageAtlas::ImageAtlas() noexcept
+    : instanceId_(gNextImageAtlasInstanceId.fetch_add(1u, std::memory_order_relaxed)) {}
 
 void ImageAtlas::ConfigureAtlas(
     std::uint32_t sharedAtlasSize,
@@ -3143,7 +3150,7 @@ bool ImageAtlas::CopyTextureSlotIfModified(
 
 Color ImageAtlas::SampleBilinearRgba(std::uint32_t textureId, float u, float v) const noexcept {
     struct TlsTexSampleSlot {
-        const ImageAtlas* owner = nullptr;
+        std::uint64_t instanceId = 0u;
         std::uint64_t rev = 0u;
         std::uint32_t texId = 0xFFFFFFFFu;
         std::uint32_t width = 0u;
@@ -3153,7 +3160,7 @@ Color ImageAtlas::SampleBilinearRgba(std::uint32_t textureId, float u, float v) 
     thread_local std::array<TlsTexSampleSlot, 16> tlsTex{};
     const std::uint64_t curRev = revision_.load(std::memory_order_acquire);
     auto& ts = tlsTex[textureId & 15u];
-    if (ts.owner != this || ts.rev != curRev || ts.texId != textureId) {
+    if (ts.instanceId != instanceId_ || ts.rev != curRev || ts.texId != textureId) {
         std::lock_guard<std::mutex> lock(mutex_);
         const auto it = textureSlots_.find(textureId);
         if (it == textureSlots_.end()) {
@@ -3164,7 +3171,7 @@ Color ImageAtlas::SampleBilinearRgba(std::uint32_t textureId, float u, float v) 
             sBuf.rgbaPixels.size() < static_cast<std::size_t>(sBuf.width) * sBuf.height * 4u) {
             return Color{0.0f, 0.0f, 0.0f, 0.0f};
         }
-        ts.owner = this;
+        ts.instanceId = instanceId_;
         ts.rev = curRev;
         ts.texId = textureId;
         ts.width = sBuf.width;

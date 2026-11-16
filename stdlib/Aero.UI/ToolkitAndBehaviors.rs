@@ -414,6 +414,10 @@ public class TriggerAction : DependencyObject {
 public class InvokeCommandAction : TriggerAction {
     public ICommand Command { get; set; }
     public string CommandPath { get; set; } = "";
+    public string CommandParameterPath { get; set; } = "";
+    public string CommandParameterRelativeMode { get; set; } = "";
+    public string CommandParameterAncestorType { get; set; } = "";
+    public string CommandParameterElementName { get; set; } = "";
     private DependencyObject _paramBox;
     public bool PassEventArgsToCommand { get; set; } = false;
 
@@ -430,6 +434,32 @@ public class InvokeCommandAction : TriggerAction {
     public void SetCommandParameter(string v) { _paramBox = DependencyObject.BoxString(v); }
     public void SetCommandParameterBox(DependencyObject box) { _paramBox = box; }
 
+    private DependencyObject ResolveDynamicParameter(UIElement associatedObject) {
+        if (CommandParameterPath.Length == 0 || associatedObject == null) { return null; }
+        if (CommandParameterRelativeMode == "Self") {
+            return BindingEngine.ReadPathBox(associatedObject, CommandParameterPath);
+        }
+        if (CommandParameterAncestorType.Length > 0) {
+            UIElement cur = associatedObject;
+            while (cur != null && cur.GetTypeName() != CommandParameterAncestorType) {
+                cur = cur.Parent;
+            }
+            if (cur != null) {
+                return BindingEngine.ReadPathBox(cur, CommandParameterPath);
+            }
+        }
+        if (CommandParameterElementName.Length > 0) {
+            UIElement named = associatedObject.RootElement().FindName(CommandParameterElementName);
+            if (named != null) {
+                return BindingEngine.ReadPathBox(named, CommandParameterPath);
+            }
+        }
+        if (associatedObject.DataContext != null) {
+            return BindingEngine.ReadPathBox(associatedObject.DataContext, CommandParameterPath);
+        }
+        return null;
+    }
+
     public override void Invoke(UIElement associatedObject, DependencyObject parameter) {
         if (!IsEnabled) { return; }
         ICommand cmd = Command;
@@ -438,7 +468,11 @@ public class InvokeCommandAction : TriggerAction {
             cmd = DependencyObject.Unbox(cb) as ICommand;
         }
         if (cmd == null) { return; }
-        DependencyObject arg = (_paramBox == null && PassEventArgsToCommand) ? parameter : _paramBox;
+        DependencyObject resolved = _paramBox;
+        if (resolved == null && CommandParameterPath.Length > 0) {
+            resolved = ResolveDynamicParameter(associatedObject);
+        }
+        DependencyObject arg = (resolved == null && PassEventArgsToCommand) ? parameter : resolved;
         CommandTriggerHelper.ExecuteBox(cmd, arg);
     }
 }

@@ -235,6 +235,7 @@ private:
         std::string_view localBaseDir) const;
 
     mutable std::mutex mutex_;
+    std::uint64_t instanceId_ = 0u;
     std::atomic<std::uint64_t> revision_{1u};
     std::uint32_t sharedAtlasSize_ = kDefaultSharedAtlasSize;
     std::uint32_t maxPackableWidth_ = kDefaultMaxPackableExtent;

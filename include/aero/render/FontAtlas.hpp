@@ -380,6 +380,7 @@ private:
     std::uint16_t glyphRegionHeight_ = kDefaultAtlasSize / 2u; // Top half v in [0.0..0.5)
     SkylinePacker skyline_;
     std::vector<std::uint8_t> sdfPixels_;
+    std::uint64_t instanceId_ = 0u;
     std::atomic<std::uint64_t> revision_{1u};
 
     std::uint32_t nextFontId_ = 1u;
