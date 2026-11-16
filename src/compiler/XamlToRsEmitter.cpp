@@ -522,7 +522,8 @@ struct XamlNode final {
 
 [[nodiscard]] bool IsContentControlType(std::string_view typeName) {
     static const std::unordered_set<std::string_view> kCC = {
-        "ContentControl", "HeaderedContentControl", "ButtonBase", "Button",
+        "ContentControl", "HeaderedContentControl", "Window", "Page",
+        "UserControl", "ScrollViewer", "ButtonBase", "Button",
         "RepeatButton", "ToggleButton", "CheckBox", "RadioButton", "GroupBox",
         "Expander", "TabItem", "MenuItem", "ListBoxItem", "ComboBoxItem",
         "ListViewItem", "StatusBarItem", "ToolTip", "Label"
@@ -2119,7 +2120,7 @@ private:
 
         std::string srcExpr = !explicitSourceVar.empty()
             ? std::string(explicitSourceVar)
-            : std::string(targetVar);
+            : std::string("null");
         if (spec.hasRelativeSource) {
             if (spec.relativeSourceMode == "Self") {
                 srcExpr = std::string(targetVar);

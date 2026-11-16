@@ -367,6 +367,12 @@ public class UserControl : ContentControl {
     public UserControl() { }
 }
 
+public class ScrollViewer : ContentControl {
+    public ScrollBarVisibility HorizontalScrollBarVisibility = ScrollBarVisibility.Auto;
+    public ScrollBarVisibility VerticalScrollBarVisibility = ScrollBarVisibility.Auto;
+    public ScrollViewer() { }
+}
+
 public class Application : DependencyObject {
     public ResourceDictionary Resources = new ResourceDictionary();
     public Application() { }
@@ -775,6 +781,10 @@ void TestXamlToRsEmitterFeatures() {
         "Missing Storyboard DoubleAnimation");
     Require(ContainsText(res.generatedRsCode, "AddColorAnimation(\"HeroRect\", \"Fill.Color\""),
         "Missing Storyboard ColorAnimation");
+    Require(ContainsText(res.generatedRsCode, "this.SetContent("),
+        "Window root child must attach via SetContent for ContentPresenter template");
+    Require(ContainsText(res.generatedRsCode, ", \"Text\", null, \"Headline\", 0, \"\", \"\", \"Hi {0}\");"),
+        "Plain DataContext binding must pass null source so BindingEngine resolves EffectiveDataContext");
 }
 
 void TestNativeBodyStrippingUnderO2AndAot() {
@@ -1070,6 +1080,9 @@ namespace QuickApp
     }
     Require(res1.succeeded, "End-to-end XAML + lowered C# compilation failed");
     Require(res1.programImage != nullptr, "End-to-end compilation must produce linked ProgramImage");
+    if (!res1.succeeded || !res1.programImage) {
+        return;
+    }
     Require(res1.programImage->findFunction("QuickApp.MainWindow::InitializeComponent").has_value() ||
             ContainsText(res1.generatedPartialRsCode, "InitializeComponent"),
         "Compiled program must include QuickApp::MainWindow::InitializeComponent");
@@ -1077,10 +1090,6 @@ namespace QuickApp
         "End-to-end AOT C++ header missing BuildQuickAppWindowProgram");
     Require(session.parsedUnitCacheSize() > 0,
         "CompilerSession parsedUnitCache should be populated after first compile");
-
-    if (!res1.succeeded) {
-        return;
-    }
 
     // Second compile sharing the same CompilerSession -> reuses cached parsed units cleanly
     const auto res2 = compiler.Compile(input);
