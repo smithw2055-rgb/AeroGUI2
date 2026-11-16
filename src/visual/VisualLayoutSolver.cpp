@@ -676,6 +676,14 @@ void ComputeUniformGridDims(
         }
 
         case LayoutMode::Dock: {
+            const bool lastChildFill = (parent.layout.layoutInt0 != 0);
+            VisualNodeId lastVisible{};
+            for (VisualNodeId cid : childrenCopy) {
+                const VisualNode* child = world.GetNode(cid);
+                if (child && child->layout.visibility != Visibility::Collapsed) {
+                    lastVisible = cid;
+                }
+            }
             float usedW = 0.0f;
             float usedH = 0.0f;
             float maxTotalW = 0.0f;
@@ -687,7 +695,21 @@ void ComputeUniformGridDims(
                 if (!child || child->layout.visibility == Visibility::Collapsed) {
                     continue;
                 }
-                const Size d = MeasureNode(world, cid, Size{remW, remH});
+                const bool isFill = lastChildFill && (cid == lastVisible);
+                Size childAvail{remW, remH};
+                if (!isFill) {
+                    if (child->layout.dock == Dock::Top || child->layout.dock == Dock::Bottom) {
+                        childAvail.height = kInf;
+                    } else {
+                        childAvail.width = kInf;
+                    }
+                }
+                const Size d = MeasureNode(world, cid, childAvail);
+                if (isFill) {
+                    maxTotalW = std::max(maxTotalW, usedW + d.width);
+                    maxTotalH = std::max(maxTotalH, usedH + d.height);
+                    continue;
+                }
                 switch (child->layout.dock) {
                     case Dock::Left:
                     case Dock::Right:

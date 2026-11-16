@@ -164,6 +164,7 @@ public class Control : FrameworkElement {
     public ControlTemplate Template {
         get { return _template; }
         set {
+            if (_template == value && _templateApplied) { return; }
             _template = value;
             _templateApplied = false;
             ApplyTemplate();

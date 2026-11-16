@@ -951,18 +951,22 @@ public class TypedBox<T> : DependencyObject {
 
 public class BoxedString : TypedBox<string> {
     public BoxedString(string v) : base(v) {}
+    public override object UnboxObject() { return this; }
 }
 
 public class BoxedFloat : TypedBox<float> {
     public BoxedFloat(float v) : base(v) {}
+    public override object UnboxObject() { return this; }
 }
 
 public class BoxedInt : TypedBox<int> {
     public BoxedInt(int v) : base(v) {}
+    public override object UnboxObject() { return this; }
 }
 
 public class BoxedBool : TypedBox<bool> {
     public BoxedBool(bool v) : base(v) {}
+    public override object UnboxObject() { return this; }
 }
 
 public class CollectionBox : DependencyObject {
@@ -2526,6 +2530,15 @@ public static class InputDispatcher {
         return chain;
     }
 
+    private static void ApplyHoverChainRecursive(
+        UIElement cur, UIElement prev, float x, float y, int mods) {
+        if (cur == null) { return; }
+        ApplyHoverChainRecursive(cur.Parent, prev, x, y, mods);
+        if (prev == null || !cur.IsAncestorOf(prev)) {
+            cur.SetMouseOverState(true, x, y, mods);
+        }
+    }
+
     private static void UpdateHoverChain(UIElement newTarget, float x, float y, int mods) {
         if (_hovered == newTarget) { return; }
         UIElement prev = _hovered;
@@ -2540,12 +2553,7 @@ public static class InputDispatcher {
             }
         }
         if (newTarget != null) {
-            UIElement[] chain = AncestorChain(newTarget);
-            for (int i = chain.Length - 1; i >= 0; i -= 1) {
-                if (prev == null || !chain[i].IsAncestorOf(prev)) {
-                    chain[i].SetMouseOverState(true, x, y, mods);
-                }
-            }
+            ApplyHoverChainRecursive(newTarget, prev, x, y, mods);
         }
     }
 
@@ -2560,7 +2568,7 @@ public static class InputDispatcher {
         }
 
         if (kind == 8) {
-            UpdateHoverChain(target, x, y, modifiers);
+            UpdateHoverChain(rawTarget != null ? rawTarget : target, x, y, modifiers);
             return true;
         }
         if (kind == 16) {
@@ -2571,7 +2579,10 @@ public static class InputDispatcher {
         }
 
         if (kind == 1 || kind == 0) {
-            UpdateHoverChain(rawTarget != null ? rawTarget : target, x, y, modifiers);
+            UIElement hoverLeaf = rawTarget != null ? rawTarget : target;
+            if (_hovered == null || (hoverLeaf != _hovered && !hoverLeaf.IsAncestorOf(_hovered))) {
+                UpdateHoverChain(hoverLeaf, x, y, modifiers);
+            }
             var moveArgs = new MouseEventArgs("MouseMove", target, x, y, modifiers);
             UIElement cur = target;
             while (cur != null && !moveArgs.Handled) {
