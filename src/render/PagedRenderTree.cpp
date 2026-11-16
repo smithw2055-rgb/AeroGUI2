@@ -21,23 +21,7 @@ struct MtsdfMappedQuad {
     float v1 = 1.0f;
 };
 
-struct SurfaceFillBorderPlan {
-    Rect fillRect{};
-    CornerRadius fillRadii{};
-    Color fillColor{0.0f, 0.0f, 0.0f, 0.0f};
-    bool hasVisibleFill = false;
-
-    Rect borderRect{};
-    CornerRadius borderRadii{};
-    Thickness borderThickness{};
-    Color borderColor{0.0f, 0.0f, 0.0f, 0.0f};
-    bool reserveBorderNode = false;
-    bool hasVisibleBorder = false;
-};
-
 [[nodiscard]] std::size_t CountLayoutVisibleGlyphs(const TextLayoutResult& layout) noexcept;
-[[nodiscard]] Matrix2D MatrixFromState(
-    float m00, float m01, float m10, float m11, float tx, float ty) noexcept;
 [[nodiscard]] MtsdfMappedQuad ComputeMtsdfMappedPlacement(
     const Rect& fitted,
     const AxbMtsdfPathEntry& entry,
@@ -46,23 +30,9 @@ void ApplyTextAlignmentToLayout(
     TextLayoutResult& layout,
     TextAlignment align,
     float alignBoxWidth) noexcept;
-[[nodiscard]] Rect ComputeStretchedDestRect(
-    const Rect& box,
-    float naturalW,
-    float naturalH,
-    Stretch stretch) noexcept;
 [[nodiscard]] CornerRadius SanitizeCornerRadius(const CornerRadius& r) noexcept;
 [[nodiscard]] Thickness SanitizeThickness(const Thickness& t) noexcept;
 [[nodiscard]] bool HasPositiveThickness(const Thickness& t) noexcept;
-[[nodiscard]] std::uint32_t ExtractGradBrushId(const UnifiedValue& v) noexcept;
-[[nodiscard]] SurfaceFillBorderPlan BuildSurfaceFillBorderPlan(
-    const Rect& outerRect,
-    const CornerRadius& rawRadii,
-    bool hasVisibleFill,
-    const Color& fillColor,
-    bool reserveBorderNode,
-    const Color& borderColor,
-    const Thickness& rawBorderThickness) noexcept;
 void ConfigureRoundedRectDescriptor(
     RenderNodeDescriptor& desc,
     const CornerRadius& rawRadii,
@@ -145,31 +115,6 @@ namespace {
 
 } // namespace
 
-Matrix2D MatrixFromState(
-    float m00, float m01, float m10, float m11, float tx, float ty) noexcept {
-    return Matrix2D{m00, m01, m10, m11, tx, ty};
-}
-
-namespace {
-
-void ApplyStateMatrix(
-    float& ioM00, float& ioM01, float& ioM10, float& ioM11, float& ioTx, float& ioTy,
-    const Matrix2D& localTransform) noexcept {
-    if (localTransform.IsIdentity()) {
-        return;
-    }
-    const Matrix2D parentM = MatrixFromState(ioM00, ioM01, ioM10, ioM11, ioTx, ioTy);
-    const Matrix2D composed = Matrix2D::Multiply(parentM, localTransform);
-    ioM00 = composed.m00;
-    ioM01 = composed.m01;
-    ioM10 = composed.m10;
-    ioM11 = composed.m11;
-    ioTx = composed.tx;
-    ioTy = composed.ty;
-}
-
-} // namespace
-
 // Map the geometry sub-region [cellBoxX0..cellBoxX1] x [cellBoxY0..cellBoxY1] inside the uniform-scaled
 // MTSDF cell onto screen `fitted`, preserving exact non-square aspect ratio and outer AA/stroke padding.
 MtsdfMappedQuad ComputeMtsdfMappedPlacement(
@@ -245,453 +190,7 @@ void ApplyTextAlignmentToLayout(
     }
 }
 
-Rect ComputeStretchedDestRect(
-    const Rect& box,
-    float naturalW,
-    float naturalH,
-    Stretch stretch) noexcept {
-    if (box.width <= 0.0f || box.height <= 0.0f || naturalW <= 0.0f || naturalH <= 0.0f) {
-        return box;
-    }
-    switch (stretch) {
-        case Stretch::None:
-            return Rect{box.x, box.y, naturalW, naturalH};
-        case Stretch::Fill:
-            return box;
-        case Stretch::UniformToFill: {
-            const float s = std::max(box.width / naturalW, box.height / naturalH);
-            const float dw = naturalW * s;
-            const float dh = naturalH * s;
-            return Rect{
-                box.x + (box.width - dw) * 0.5f,
-                box.y + (box.height - dh) * 0.5f,
-                dw,
-                dh};
-        }
-        case Stretch::Uniform:
-        default: {
-            const float s = std::min(box.width / naturalW, box.height / naturalH);
-            const float dw = naturalW * s;
-            const float dh = naturalH * s;
-            return Rect{
-                box.x + (box.width - dw) * 0.5f,
-                box.y + (box.height - dh) * 0.5f,
-                dw,
-                dh};
-        }
-    }
-}
-
-
-
 namespace {
-
-[[nodiscard]] bool ParseSvgFloat(std::string_view s, std::size_t& pos, float& outVal) noexcept {
-    while (pos < s.size() && (s[pos] == ' ' || s[pos] == '\t' || s[pos] == '\r' || s[pos] == '\n' || s[pos] == ',')) {
-        ++pos;
-    }
-    if (pos >= s.size()) {
-        return false;
-    }
-    const std::size_t start = pos;
-    if (s[pos] == '+' || s[pos] == '-') {
-        ++pos;
-    }
-    bool anyDigit = false;
-    while (pos < s.size() && s[pos] >= '0' && s[pos] <= '9') {
-        anyDigit = true;
-        ++pos;
-    }
-    if (pos < s.size() && s[pos] == '.') {
-        ++pos;
-        while (pos < s.size() && s[pos] >= '0' && s[pos] <= '9') {
-            anyDigit = true;
-            ++pos;
-        }
-    }
-    if (!anyDigit) {
-        pos = start;
-        return false;
-    }
-    if (pos < s.size() && (s[pos] == 'e' || s[pos] == 'E')) {
-        const std::size_t expSave = pos++;
-        if (pos < s.size() && (s[pos] == '+' || s[pos] == '-')) {
-            ++pos;
-        }
-        bool expDigits = false;
-        while (pos < s.size() && s[pos] >= '0' && s[pos] <= '9') {
-            expDigits = true;
-            ++pos;
-        }
-        if (!expDigits) {
-            pos = expSave;
-        }
-    }
-    float parsed = 0.0f;
-    const auto res = std::from_chars(s.data() + start, s.data() + pos, parsed);
-    if (res.ec != std::errc{} || !std::isfinite(parsed)) {
-        pos = start;
-        return false;
-    }
-    outVal = parsed;
-    return true;
-}
-
-[[nodiscard]] bool ParseSvgFlag(std::string_view s, std::size_t& pos, int& outFlag) noexcept {
-    while (pos < s.size() && (s[pos] == ' ' || s[pos] == '\t' || s[pos] == '\r' || s[pos] == '\n' || s[pos] == ',')) {
-        ++pos;
-    }
-    if (pos >= s.size() || (s[pos] != '0' && s[pos] != '1')) {
-        return false;
-    }
-    outFlag = (s[pos] == '1') ? 1 : 0;
-    ++pos;
-    return true;
-}
-
-void AppendSvgArcPoints(
-    float x1,
-    float y1,
-    float rxIn,
-    float ryIn,
-    float angleDeg,
-    int largeArcFlag,
-    int sweepFlag,
-    float x2,
-    float y2,
-    std::vector<Point>& outPts) {
-    if (std::hypot(x2 - x1, y2 - y1) <= 1e-5f) {
-        return;
-    }
-    float rx = std::fabs(rxIn);
-    float ry = std::fabs(ryIn);
-    if (rx <= 1e-5f || ry <= 1e-5f) {
-        outPts.push_back(Point{x2, y2});
-        return;
-    }
-
-    constexpr float kPi = 3.14159265358979323846f;
-    const float phi = angleDeg * (kPi / 180.0f);
-    const float cosPhi = std::cos(phi);
-    const float sinPhi = std::sin(phi);
-    const float dx2 = (x1 - x2) * 0.5f;
-    const float dy2 = (y1 - y2) * 0.5f;
-    const float x1p = cosPhi * dx2 + sinPhi * dy2;
-    const float y1p = -sinPhi * dx2 + cosPhi * dy2;
-
-    const float lambda = (x1p * x1p) / (rx * rx) + (y1p * y1p) / (ry * ry);
-    if (lambda > 1.0f) {
-        const float s = std::sqrt(lambda);
-        rx *= s;
-        ry *= s;
-    }
-
-    const float rx2 = rx * rx;
-    const float ry2 = ry * ry;
-    const float x1p2 = x1p * x1p;
-    const float y1p2 = y1p * y1p;
-    const float num = std::max(0.0f, rx2 * ry2 - rx2 * y1p2 - ry2 * x1p2);
-    const float den = std::max(1e-8f, rx2 * y1p2 + ry2 * x1p2);
-    const float sign = (largeArcFlag == sweepFlag) ? -1.0f : 1.0f;
-    const float coef = sign * std::sqrt(num / den);
-    const float cxp = coef * ((rx * y1p) / ry);
-    const float cyp = coef * (-(ry * x1p) / rx);
-
-    const float cx = cosPhi * cxp - sinPhi * cyp + (x1 + x2) * 0.5f;
-    const float cy = sinPhi * cxp + cosPhi * cyp + (y1 + y2) * 0.5f;
-
-    auto vecAngle = [](float ux, float uy, float vx, float vy) noexcept -> float {
-        const float dot = ux * vx + uy * vy;
-        const float len = std::max(1e-8f, std::hypot(ux, uy) * std::hypot(vx, vy));
-        const float c = std::clamp(dot / len, -1.0f, 1.0f);
-        const float cross = ux * vy - uy * vx;
-        return (cross < 0.0f) ? -std::acos(c) : std::acos(c);
-    };
-
-    const float vx0 = (x1p - cxp) / rx;
-    const float vy0 = (y1p - cyp) / ry;
-    const float vx1 = (-x1p - cxp) / rx;
-    const float vy1 = (-y1p - cyp) / ry;
-    const float theta1 = vecAngle(1.0f, 0.0f, vx0, vy0);
-    float dTheta = vecAngle(vx0, vy0, vx1, vy1);
-    if (sweepFlag == 0 && dTheta > 0.0f) {
-        dTheta -= 2.0f * kPi;
-    } else if (sweepFlag != 0 && dTheta < 0.0f) {
-        dTheta += 2.0f * kPi;
-    }
-
-    const int steps = std::clamp(static_cast<int>(std::ceil(std::fabs(dTheta) / (kPi / 16.0f))), 4, 64);
-    for (int s = 1; s <= steps; ++s) {
-        const float t = static_cast<float>(s) / static_cast<float>(steps);
-        const float ang = theta1 + dTheta * t;
-        const float lx = rx * std::cos(ang);
-        const float ly = ry * std::sin(ang);
-        outPts.push_back(Point{
-            cosPhi * lx - sinPhi * ly + cx,
-            sinPhi * lx + cosPhi * ly + cy});
-    }
-}
-
-[[nodiscard]] std::vector<std::vector<Point>> ParseSvgPathToSubpaths(std::string_view pathStr) {
-    std::vector<std::vector<Point>> subpaths;
-    std::vector<Point> cur;
-    std::size_t pos = 0u;
-    float curX = 0.0f;
-    float curY = 0.0f;
-    float startX = 0.0f;
-    float startY = 0.0f;
-    float lastCtrlX = 0.0f;
-    float lastCtrlY = 0.0f;
-    char cmd = 0;
-    char prevCmd = 0;
-
-    auto flushCur = [&]() {
-        if (cur.size() >= 2u) {
-            subpaths.push_back(std::move(cur));
-        }
-        cur.clear();
-    };
-    auto skipWs = [&]() {
-        while (pos < pathStr.size() &&
-               (pathStr[pos] == ' ' || pathStr[pos] == '\t' || pathStr[pos] == '\r' ||
-                pathStr[pos] == '\n' || pathStr[pos] == ',')) {
-            ++pos;
-        }
-    };
-    auto appendCubic = [&](float x1, float y1, float x2, float y2, float x3, float y3) {
-        constexpr int kSteps = 16;
-        const float x0 = curX;
-        const float y0 = curY;
-        for (int i = 1; i <= kSteps; ++i) {
-            const float t = static_cast<float>(i) / static_cast<float>(kSteps);
-            const float u = 1.0f - t;
-            const float b0 = u * u * u;
-            const float b1 = 3.0f * u * u * t;
-            const float b2 = 3.0f * u * t * t;
-            const float b3 = t * t * t;
-            cur.push_back(Point{
-                b0 * x0 + b1 * x1 + b2 * x2 + b3 * x3,
-                b0 * y0 + b1 * y1 + b2 * y2 + b3 * y3});
-        }
-    };
-    auto appendQuad = [&](float x1, float y1, float x2, float y2) {
-        constexpr int kSteps = 12;
-        const float x0 = curX;
-        const float y0 = curY;
-        for (int i = 1; i <= kSteps; ++i) {
-            const float t = static_cast<float>(i) / static_cast<float>(kSteps);
-            const float u = 1.0f - t;
-            cur.push_back(Point{
-                u * u * x0 + 2.0f * u * t * x1 + t * t * x2,
-                u * u * y0 + 2.0f * u * t * y1 + t * t * y2});
-        }
-    };
-
-    while (pos < pathStr.size()) {
-        skipWs();
-        if (pos >= pathStr.size()) {
-            break;
-        }
-        const char ch = pathStr[pos];
-        if ((ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z')) {
-            cmd = ch;
-            ++pos;
-        } else if (cmd == 0) {
-            ++pos;
-            continue;
-        }
-
-        const bool rel = (cmd >= 'a' && cmd <= 'z');
-        const char upper = rel ? static_cast<char>(cmd - ('a' - 'A')) : cmd;
-
-        if (upper == 'Z') {
-            if (!cur.empty() && std::hypot(startX - curX, startY - curY) > 1e-4f) {
-                cur.push_back(Point{startX, startY});
-            }
-            curX = startX;
-            curY = startY;
-            lastCtrlX = curX;
-            lastCtrlY = curY;
-            prevCmd = upper;
-            flushCur();
-            cmd = 0;
-            continue;
-        }
-
-        if (upper == 'F') {
-            // Optional WPF fill rule prefix (F0/F1)
-            float ruleVal = 0.0f;
-            (void)ParseSvgFloat(pathStr, pos, ruleVal);
-            cmd = 0;
-            continue;
-        }
-
-        if (upper == 'M') {
-            float nx = 0.0f, ny = 0.0f;
-            if (!ParseSvgFloat(pathStr, pos, nx) || !ParseSvgFloat(pathStr, pos, ny)) {
-                break;
-            }
-            if (rel) {
-                nx += curX;
-                ny += curY;
-            }
-            flushCur();
-            curX = nx;
-            curY = ny;
-            startX = nx;
-            startY = ny;
-            lastCtrlX = nx;
-            lastCtrlY = ny;
-            cur.push_back(Point{nx, ny});
-            prevCmd = 'M';
-            cmd = rel ? 'l' : 'L';
-        } else if (upper == 'L') {
-            float nx = 0.0f, ny = 0.0f;
-            if (!ParseSvgFloat(pathStr, pos, nx) || !ParseSvgFloat(pathStr, pos, ny)) {
-                cmd = 0;
-                continue;
-            }
-            if (rel) {
-                nx += curX;
-                ny += curY;
-            }
-            if (cur.empty()) cur.push_back(Point{curX, curY});
-            cur.push_back(Point{nx, ny});
-            curX = nx;
-            curY = ny;
-            lastCtrlX = curX;
-            lastCtrlY = curY;
-            prevCmd = 'L';
-        } else if (upper == 'H') {
-            float nx = 0.0f;
-            if (!ParseSvgFloat(pathStr, pos, nx)) {
-                cmd = 0;
-                continue;
-            }
-            if (rel) nx += curX;
-            if (cur.empty()) cur.push_back(Point{curX, curY});
-            cur.push_back(Point{nx, curY});
-            curX = nx;
-            lastCtrlX = curX;
-            lastCtrlY = curY;
-            prevCmd = 'H';
-        } else if (upper == 'V') {
-            float ny = 0.0f;
-            if (!ParseSvgFloat(pathStr, pos, ny)) {
-                cmd = 0;
-                continue;
-            }
-            if (rel) ny += curY;
-            if (cur.empty()) cur.push_back(Point{curX, curY});
-            cur.push_back(Point{curX, ny});
-            curY = ny;
-            lastCtrlX = curX;
-            lastCtrlY = curY;
-            prevCmd = 'V';
-        } else if (upper == 'C') {
-            float x1 = 0.0f, y1 = 0.0f, x2 = 0.0f, y2 = 0.0f, x3 = 0.0f, y3 = 0.0f;
-            if (!ParseSvgFloat(pathStr, pos, x1) || !ParseSvgFloat(pathStr, pos, y1) ||
-                !ParseSvgFloat(pathStr, pos, x2) || !ParseSvgFloat(pathStr, pos, y2) ||
-                !ParseSvgFloat(pathStr, pos, x3) || !ParseSvgFloat(pathStr, pos, y3)) {
-                cmd = 0;
-                continue;
-            }
-            if (rel) {
-                x1 += curX; y1 += curY;
-                x2 += curX; y2 += curY;
-                x3 += curX; y3 += curY;
-            }
-            if (cur.empty()) cur.push_back(Point{curX, curY});
-            appendCubic(x1, y1, x2, y2, x3, y3);
-            lastCtrlX = x2;
-            lastCtrlY = y2;
-            curX = x3;
-            curY = y3;
-            prevCmd = 'C';
-        } else if (upper == 'S') {
-            float x2 = 0.0f, y2 = 0.0f, x3 = 0.0f, y3 = 0.0f;
-            if (!ParseSvgFloat(pathStr, pos, x2) || !ParseSvgFloat(pathStr, pos, y2) ||
-                !ParseSvgFloat(pathStr, pos, x3) || !ParseSvgFloat(pathStr, pos, y3)) {
-                cmd = 0;
-                continue;
-            }
-            if (rel) {
-                x2 += curX; y2 += curY;
-                x3 += curX; y3 += curY;
-            }
-            const float x1 = (prevCmd == 'C' || prevCmd == 'S') ? (2.0f * curX - lastCtrlX) : curX;
-            const float y1 = (prevCmd == 'C' || prevCmd == 'S') ? (2.0f * curY - lastCtrlY) : curY;
-            if (cur.empty()) cur.push_back(Point{curX, curY});
-            appendCubic(x1, y1, x2, y2, x3, y3);
-            lastCtrlX = x2;
-            lastCtrlY = y2;
-            curX = x3;
-            curY = y3;
-            prevCmd = 'S';
-        } else if (upper == 'Q') {
-            float x1 = 0.0f, y1 = 0.0f, x2 = 0.0f, y2 = 0.0f;
-            if (!ParseSvgFloat(pathStr, pos, x1) || !ParseSvgFloat(pathStr, pos, y1) ||
-                !ParseSvgFloat(pathStr, pos, x2) || !ParseSvgFloat(pathStr, pos, y2)) {
-                cmd = 0;
-                continue;
-            }
-            if (rel) {
-                x1 += curX; y1 += curY;
-                x2 += curX; y2 += curY;
-            }
-            if (cur.empty()) cur.push_back(Point{curX, curY});
-            appendQuad(x1, y1, x2, y2);
-            lastCtrlX = x1;
-            lastCtrlY = y1;
-            curX = x2;
-            curY = y2;
-            prevCmd = 'Q';
-        } else if (upper == 'T') {
-            float x2 = 0.0f, y2 = 0.0f;
-            if (!ParseSvgFloat(pathStr, pos, x2) || !ParseSvgFloat(pathStr, pos, y2)) {
-                cmd = 0;
-                continue;
-            }
-            if (rel) {
-                x2 += curX; y2 += curY;
-            }
-            const float x1 = (prevCmd == 'Q' || prevCmd == 'T') ? (2.0f * curX - lastCtrlX) : curX;
-            const float y1 = (prevCmd == 'Q' || prevCmd == 'T') ? (2.0f * curY - lastCtrlY) : curY;
-            if (cur.empty()) cur.push_back(Point{curX, curY});
-            appendQuad(x1, y1, x2, y2);
-            lastCtrlX = x1;
-            lastCtrlY = y1;
-            curX = x2;
-            curY = y2;
-            prevCmd = 'T';
-        } else if (upper == 'A') {
-            float rx = 0.0f, ry = 0.0f, rot = 0.0f, x2 = 0.0f, y2 = 0.0f;
-            int largeArc = 0, sweep = 0;
-            if (!ParseSvgFloat(pathStr, pos, rx) || !ParseSvgFloat(pathStr, pos, ry) ||
-                !ParseSvgFloat(pathStr, pos, rot) || !ParseSvgFlag(pathStr, pos, largeArc) ||
-                !ParseSvgFlag(pathStr, pos, sweep) || !ParseSvgFloat(pathStr, pos, x2) ||
-                !ParseSvgFloat(pathStr, pos, y2)) {
-                cmd = 0;
-                continue;
-            }
-            if (rel) {
-                x2 += curX;
-                y2 += curY;
-            }
-            if (cur.empty()) cur.push_back(Point{curX, curY});
-            AppendSvgArcPoints(curX, curY, rx, ry, rot, largeArc, sweep, x2, y2, cur);
-            curX = x2;
-            curY = y2;
-            lastCtrlX = curX;
-            lastCtrlY = curY;
-            prevCmd = 'A';
-        } else {
-            cmd = 0;
-        }
-    }
-    flushCur();
-    return subpaths;
-}
 
 [[nodiscard]] std::vector<Point> TrimSubpathPolyline(
     const std::vector<Point>& pts,
@@ -771,67 +270,6 @@ Thickness SanitizeThickness(const Thickness& t) noexcept {
 bool HasPositiveThickness(const Thickness& t) noexcept {
     return t.left > 0.0f || t.top > 0.0f || t.right > 0.0f || t.bottom > 0.0f;
 }
-
-SurfaceFillBorderPlan BuildSurfaceFillBorderPlan(
-    const Rect& outerRect,
-    const CornerRadius& rawRadii,
-    bool hasVisibleFill,
-    const Color& fillColor,
-    bool reserveBorderNode,
-    const Color& borderColor,
-    const Thickness& rawBorderThickness) noexcept {
-    SurfaceFillBorderPlan plan{};
-    const CornerRadius cr = SanitizeCornerRadius(rawRadii);
-    const Thickness bt = SanitizeThickness(rawBorderThickness);
-    const bool hasVisBorder = reserveBorderNode && (borderColor.a > 0.0f) && HasPositiveThickness(bt);
-
-    plan.hasVisibleFill = hasVisibleFill;
-    plan.fillColor = hasVisibleFill ? fillColor : Color{0.0f, 0.0f, 0.0f, 0.0f};
-    plan.reserveBorderNode = reserveBorderNode;
-    plan.hasVisibleBorder = hasVisBorder;
-    plan.borderColor = borderColor;
-    plan.borderRect = outerRect;
-    plan.borderRadii = cr;
-    plan.borderThickness = bt;
-
-    if (hasVisibleFill && hasVisBorder) {
-        auto computeSideInset = [&](float sideBt) noexcept -> float {
-            if (sideBt <= 0.0f) {
-                return 0.0f;
-            }
-            return (borderColor.a >= 0.999f && sideBt >= 1.0f) ? (0.5f * sideBt) : sideBt;
-        };
-        const float inL = computeSideInset(bt.left);
-        const float inT = computeSideInset(bt.top);
-        const float inR = computeSideInset(bt.right);
-        const float inB = computeSideInset(bt.bottom);
-        plan.fillRect = Rect{
-            outerRect.x + inL,
-            outerRect.y + inT,
-            std::max(0.0f, outerRect.width - (inL + inR)),
-            std::max(0.0f, outerRect.height - (inT + inB))};
-        plan.fillRadii = CornerRadius{
-            std::max(0.0f, cr.topLeft - std::max(inL, inT)),
-            std::max(0.0f, cr.topRight - std::max(inR, inT)),
-            std::max(0.0f, cr.bottomRight - std::max(inR, inB)),
-            std::max(0.0f, cr.bottomLeft - std::max(inL, inB))};
-    } else {
-        plan.fillRect = outerRect;
-        plan.fillRadii = cr;
-    }
-    return plan;
-}
-
-std::uint32_t ExtractGradBrushId(const UnifiedValue& v) noexcept {
-    if (const auto* i = std::get_if<std::int64_t>(&v)) {
-        if (*i > 0) {
-            return static_cast<std::uint32_t>(*i);
-        }
-    }
-    return 0u;
-}
-
-
 
 void ConfigureRoundedRectDescriptor(
     RenderNodeDescriptor& desc,
@@ -1520,7 +958,9 @@ const AxbMtsdfPathEntry* PagedRenderTree::FindMtsdfEntry(std::uint64_t pathHash)
 }
 
 void PagedRenderTree::InitPreCachedDigitGlyphs() noexcept {
-    const FontAtlas& atlas = FontAtlas::Instance();
+    const FontAtlas& atlas = (resourceStore_ && resourceStore_->TryFonts())
+        ? *resourceStore_->TryFonts()
+        : FontAtlas::Instance();
     for (std::uint32_t cp = 0u; cp < 128u; ++cp) {
         if (cp >= 0x20u && cp <= 0x7Eu) {
             const FontAtlasGlyph& fg = atlas.GetBuiltInAsciiGlyph(cp);
@@ -1537,6 +977,20 @@ void PagedRenderTree::InitPreCachedDigitGlyphs() noexcept {
     }
 }
 
+TextLayoutResult PagedRenderTree::MeasureTextWithStore(
+    std::string_view utf8Text,
+    std::string_view fontFamily,
+    float fontSize,
+    float maxWidth,
+    TextWrapping wrapMode) const {
+    if (resourceStore_ != nullptr) {
+        if (FontAtlas* storeFonts = resourceStore_->TryFonts(); storeFonts != nullptr) {
+            return storeFonts->MeasureLayout(utf8Text, fontFamily, fontSize, maxWidth, wrapMode);
+        }
+    }
+    return MeasureTextLayout(utf8Text, fontFamily, fontSize, maxWidth, wrapMode);
+}
+
 GlyphUvRect PagedRenderTree::LookupCodePointGlyph(std::uint32_t codePoint) const noexcept {
     return LookupFontGlyph({}, codePoint, 14.0f);
 }
@@ -1545,7 +999,10 @@ GlyphUvRect PagedRenderTree::LookupFontGlyph(
     std::string_view fontFamily,
     std::uint32_t codePoint,
     float fontSize) const noexcept {
-    const FontAtlasGlyph fg = FontAtlas::Instance().EnsureGlyph(fontFamily, codePoint);
+    FontAtlas& atlas = (resourceStore_ && resourceStore_->TryFonts())
+        ? *resourceStore_->TryFonts()
+        : FontAtlas::Instance();
+    const FontAtlasGlyph fg = atlas.EnsureGlyph(fontFamily, codePoint);
     GlyphUvRect rect{};
     rect.u0 = fg.u0;
     rect.v0 = fg.v0;
@@ -1766,6 +1223,7 @@ std::uint32_t PagedRenderTree::AllocateRenderNode(
     return nodeId;
 }
 
+
 std::uint32_t PagedRenderTree::AllocateRoundedRectNode(
     float x,
     float y,
@@ -1800,6 +1258,7 @@ std::uint32_t PagedRenderTree::AllocateRoundedRectNode(
     MarkPageDirty(pageIdx, vOffset);
     return nodeId;
 }
+
 
 std::uint32_t PagedRenderTree::AllocateBorderRingNode(
     float x,
@@ -1836,6 +1295,7 @@ std::uint32_t PagedRenderTree::AllocateBorderRingNode(
     MarkPageDirty(pageIdx, vOffset);
     return nodeId;
 }
+
 
 std::uint32_t PagedRenderTree::AllocateEllipseNode(
     float x,
@@ -1878,6 +1338,7 @@ std::uint32_t PagedRenderTree::AllocateEllipseNode(
     MarkPageDirty(pageIdx, vOffset);
     return nodeId;
 }
+
 
 std::uint32_t PagedRenderTree::AllocateGradientRoundedRectNode(
     float x,
@@ -1927,6 +1388,7 @@ std::uint32_t PagedRenderTree::AllocateGradientRoundedRectNode(
     MarkPageDirty(pageIdx, vOffset);
     return nodeId;
 }
+
 
 std::uint32_t PagedRenderTree::AllocateHudDigitsNode(
     float x,
@@ -2066,6 +1528,123 @@ std::uint32_t PagedRenderTree::AllocateMtsdfPathNode(
     return nodeId;
 }
 
+std::uint16_t PagedRenderTree::AllocateSvgPathStrokeNodes(
+    std::string_view pathStr,
+    const Rect& box,
+    Stretch stretch,
+    float strokeWidth,
+    const Color& strokeColor,
+    std::uint32_t strokeGradId,
+    float opacity,
+    const void* owner,
+    float trimStart01,
+    float trimEnd01) {
+    if (pathStr.empty() || strokeWidth <= 0.0f || opacity <= 0.0f ||
+        (strokeGradId == 0u && strokeColor.a <= 0.0f) ||
+        box.width <= 0.0f || box.height <= 0.0f) {
+        return 0u;
+    }
+
+    const std::vector<std::vector<Point>> subpaths = ParseSvgPathToSubpaths(pathStr);
+    if (subpaths.empty()) {
+        return 0u;
+    }
+
+    float minX = 1e30f;
+    float minY = 1e30f;
+    float maxX = -1e30f;
+    float maxY = -1e30f;
+    for (const auto& sp : subpaths) {
+        for (const Point& pt : sp) {
+            minX = std::min(minX, pt.x);
+            minY = std::min(minY, pt.y);
+            maxX = std::max(maxX, pt.x);
+            maxY = std::max(maxY, pt.y);
+        }
+    }
+    if (maxX < minX || maxY < minY) {
+        return 0u;
+    }
+
+    const float natW = std::max(1e-3f, maxX - minX);
+    const float natH = std::max(1e-3f, maxY - minY);
+    float scaleX = 1.0f;
+    float scaleY = 1.0f;
+    if (stretch == Stretch::Fill) {
+        scaleX = box.width / natW;
+        scaleY = box.height / natH;
+    } else if (stretch == Stretch::Uniform) {
+        const float s = std::min(box.width / natW, box.height / natH);
+        scaleX = s;
+        scaleY = s;
+    } else if (stretch == Stretch::UniformToFill) {
+        const float s = std::max(box.width / natW, box.height / natH);
+        scaleX = s;
+        scaleY = s;
+    }
+    const float dstW = natW * scaleX;
+    const float dstH = natH * scaleY;
+    const float ox = (stretch == Stretch::None)
+        ? (box.x - minX)
+        : (box.x + (box.width - dstW) * 0.5f - minX * scaleX);
+    const float oy = (stretch == Stretch::None)
+        ? (box.y - minY)
+        : (box.y + (box.height - dstH) * 0.5f - minY * scaleY);
+
+    std::uint16_t emitted = 0u;
+    for (const auto& sp : subpaths) {
+        std::vector<Point> transformed;
+        transformed.reserve(sp.size());
+        for (const Point& pt : sp) {
+            transformed.push_back(Point{ox + pt.x * scaleX, oy + pt.y * scaleY});
+        }
+        const std::vector<Point> segPts = (trimStart01 > 0.0f || trimEnd01 < 1.0f)
+            ? TrimSubpathPolyline(transformed, trimStart01, trimEnd01)
+            : transformed;
+        if (segPts.size() < 2u) {
+            continue;
+        }
+        for (std::size_t i = 0u; i + 1u < segPts.size(); ++i) {
+            const float dx = segPts[i + 1u].x - segPts[i].x;
+            const float dy = segPts[i + 1u].y - segPts[i].y;
+            const float len = std::hypot(dx, dy);
+            if (len <= 1e-4f) {
+                continue;
+            }
+            const float midX = 0.5f * (segPts[i].x + segPts[i + 1u].x);
+            const float midY = 0.5f * (segPts[i].y + segPts[i + 1u].y);
+            const float cosA = dx / len;
+            const float sinA = dy / len;
+            const float rx = midX - (0.5f * len) * cosA + (0.5f * strokeWidth) * sinA;
+            const float ry = midY - (0.5f * len) * sinA - (0.5f * strokeWidth) * cosA;
+            const std::uint32_t nodeId = (strokeGradId > 0u)
+                ? AllocateGradientRoundedRectNode(
+                      0.0f,
+                      0.0f,
+                      len,
+                      strokeWidth,
+                      strokeGradId,
+                      CornerRadius{strokeWidth * 0.5f},
+                      false,
+                      strokeColor,
+                      opacity,
+                      owner)
+                : AllocateRenderNode(
+                      0.0f,
+                      0.0f,
+                      len,
+                      strokeWidth,
+                      Color{strokeColor.r, strokeColor.g, strokeColor.b, strokeColor.a * opacity},
+                      strokeWidth * 0.5f,
+                      0.0f,
+                      owner);
+            (void)UpdateNodeTransform2D(nodeId, cosA, sinA, -sinA, cosA, rx, ry);
+            ++emitted;
+        }
+    }
+    return emitted;
+}
+
 std::uint32_t PagedRenderTree::AllocateTexturedNode(
     float x,
     float y,
@@ -2131,6 +1710,7 @@ std::uint32_t PagedRenderTree::AllocateTexturedNode(
     return nodeId;
 }
 
+
 std::uint32_t PagedRenderTree::AllocateRadialArcNode(
     float x,
     float y,
@@ -2169,6 +1749,7 @@ std::uint32_t PagedRenderTree::AllocateRadialArcNode(
     MarkPageDirty(pageIdx, vOffset);
     return nodeId;
 }
+
 
 bool PagedRenderTree::UpdateRadialArcNode(
     std::uint32_t nodeId,
@@ -2334,118 +1915,6 @@ bool PagedRenderTree::UpdateHudDigitsText(
     return true;
 }
 
-
-
-
-void ParseRichTextToPlainAndStyles(
-    std::string_view rawBbCode,
-    const Color& baseColor,
-    const void* owner,
-    std::string& outPlainUtf8,
-    std::vector<RichGlyphStyle>& outCodePointStyles) {
-    (void)owner;
-    outPlainUtf8.clear();
-    outCodePointStyles.clear();
-
-    struct StyleFrame {
-        Color color;
-        bool hasCustomColor = false;
-        bool bold = false;
-        bool italic = false;
-        bool underline = false;
-        bool strikethrough = false;
-    };
-    std::vector<StyleFrame> stack;
-    stack.push_back(StyleFrame{baseColor, false, false, false, false, false});
-
-    auto appendPlainSegment = [&](std::string_view seg) {
-        const StyleFrame& cur = stack.back();
-        outPlainUtf8.append(seg);
-        std::size_t k = 0u;
-        std::uint32_t dummyCp = 0u;
-        while (DecodeNextUtf8CodePoint(seg, k, dummyCp)) {
-            outCodePointStyles.push_back(RichGlyphStyle{
-                cur.color, cur.hasCustomColor, cur.bold, cur.italic, cur.underline, cur.strikethrough});
-        }
-    };
-
-    std::size_t i = 0u;
-    while (i < rawBbCode.size()) {
-        if (rawBbCode[i] == '[') {
-            const std::size_t closeBracket = rawBbCode.find(']', i + 1u);
-            if (closeBracket != std::string_view::npos) {
-                const std::string_view tagContent = rawBbCode.substr(i + 1u, closeBracket - i - 1u);
-                if (tagContent == "br" || tagContent == "br/") {
-                    appendPlainSegment("\n");
-                    i = closeBracket + 1u;
-                    continue;
-                }
-                if (tagContent.rfind("bind", 0) == 0 &&
-                    (tagContent.size() == 4u || tagContent[4] == ' ' || tagContent[4] == '=')) {
-                    const std::size_t endBind = rawBbCode.find("[/bind]", closeBracket + 1u);
-                    if (endBind != std::string_view::npos) {
-                        appendPlainSegment(
-                            rawBbCode.substr(closeBracket + 1u, endBind - (closeBracket + 1u)));
-                        i = endBind + 7u;
-                        continue;
-                    }
-                }
-                if (tagContent.rfind("img", 0) == 0) {
-                    const std::size_t endImg = rawBbCode.find("[/img]", closeBracket + 1u);
-                    if (endImg != std::string_view::npos) {
-                        i = endImg + 6u;
-                        continue;
-                    }
-                }
-                const bool isClosing = !tagContent.empty() && tagContent.front() == '/';
-                const std::string_view bare = isClosing ? tagContent.substr(1u) : tagContent;
-                const std::size_t eqPos = bare.find('=');
-                const std::string_view tagName = (eqPos != std::string_view::npos) ? bare.substr(0u, eqPos) : bare;
-                std::string_view tagArg = (eqPos != std::string_view::npos) ? bare.substr(eqPos + 1u) : std::string_view{};
-                if (tagArg.size() >= 2u &&
-                    ((tagArg.front() == '\'' && tagArg.back() == '\'') ||
-                     (tagArg.front() == '"' && tagArg.back() == '"'))) {
-                    tagArg = tagArg.substr(1u, tagArg.size() - 2u);
-                }
-                if (tagName == "b" || tagName == "i" || tagName == "u" || tagName == "s" ||
-                    tagName == "style" || tagName == "color" || tagName == "size" || tagName == "url") {
-                    if (isClosing) {
-                        if (stack.size() > 1u) stack.pop_back();
-                    } else {
-                        StyleFrame next = stack.back();
-                        if (tagName == "b") {
-                            next.bold = true;
-                        } else if (tagName == "i") {
-                            next.italic = true;
-                        } else if (tagName == "u") {
-                            next.underline = true;
-                        } else if (tagName == "s") {
-                            next.strikethrough = true;
-                        } else if (tagName == "color" && !tagArg.empty()) {
-                            next.color = ParseColorLiteral(tagArg);
-                            next.hasCustomColor = true;
-                        } else if (tagName == "style" && !tagArg.empty()) {
-                            const bool matchedStyle = false;
-                            if (!matchedStyle && tagArg == "ColoredText") {
-                                next.color = Color{0.165f, 0.651f, 0.886f, 1.0f}; // #FF2AA6E2
-                                next.hasCustomColor = true;
-                                next.bold = true;
-                            }
-                        }
-                        stack.push_back(next);
-                    }
-                    i = closeBracket + 1u;
-                    continue;
-                }
-            }
-        }
-        std::size_t nextBracket = rawBbCode.find('[', i + 1u);
-        if (nextBracket == std::string_view::npos) nextBracket = rawBbCode.size();
-        appendPlainSegment(rawBbCode.substr(i, nextBracket - i));
-        i = nextBracket;
-    }
-}
-
 bool PagedRenderTree::WriteLayoutGlyphSlice(
     std::uint32_t nodeId,
     float x,
@@ -2583,7 +2052,7 @@ bool PagedRenderTree::UpdateTextRunNode(
         return false;
     }
 
-    const TextLayoutResult layout = MeasureTextLayout(utf8Text, fontFamily, fontSize, maxWidth, wrapMode);
+    const TextLayoutResult layout = MeasureTextWithStore(utf8Text, fontFamily, fontSize, maxWidth, wrapMode);
     const std::size_t maxSlots = node.vertexCount / 4u;
     const std::size_t neededGlyphs = CountLayoutVisibleGlyphs(layout);
     if (neededGlyphs > maxSlots) {
@@ -2624,7 +2093,7 @@ std::uint16_t PagedRenderTree::EmitTextRunNodes(
     float alignBoxWidth,
     const std::vector<RichGlyphStyle>* optRichStyles) {
     const std::uint32_t maxQuadsPerPage = static_cast<std::uint32_t>(kVerticesPerCommandPage / 4u);
-    TextLayoutResult layout = MeasureTextLayout(utf8Text, fontFamily, fontSize, maxWidth, wrapMode);
+    TextLayoutResult layout = MeasureTextWithStore(utf8Text, fontFamily, fontSize, maxWidth, wrapMode);
     ApplyTextAlignmentToLayout(layout, textAlign, alignBoxWidth);
     const std::size_t visibleGlyphs = CountLayoutVisibleGlyphs(layout);
     const std::size_t totalDesiredSlots = std::max<std::size_t>(visibleGlyphs + 8u, 16u);
@@ -2724,7 +2193,7 @@ bool PagedRenderTree::RefreshTextNode(std::uint32_t nodeId) noexcept {
     }
     if (const auto it = standaloneTextRuns_.find(nodeId); it != standaloneTextRuns_.end()) {
         const StandaloneTextRunRecord& rec = it->second;
-        const TextLayoutResult layout = MeasureTextLayout(
+        const TextLayoutResult layout = MeasureTextWithStore(
             rec.utf8Text, rec.fontFamily, rec.fontSize, rec.maxWidth, rec.wrapMode);
         std::size_t glyphCursor = 0u;
         return WriteLayoutGlyphSlice(

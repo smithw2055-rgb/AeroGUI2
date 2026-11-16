@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -136,6 +137,11 @@ public:
     void OnPlatformTextInput(std::string_view utf8Text) noexcept;
     void OnPlatformResize(std::uint32_t newWidth, std::uint32_t newHeight) noexcept;
 
+    [[nodiscard]] static KeyCode TranslateWin32VirtualKey(std::uint32_t vk) noexcept;
+    [[nodiscard]] std::string GetClipboardText() const;
+    void SetClipboardText(std::string_view text);
+    void InstallPlatformHooks(UIHostPlatformHooks& hooks) noexcept;
+
     // Framebuffer readback & PPM/BMP screenshot export
     bool CaptureFramebufferRgba8(
         std::vector<std::uint8_t>& outRgba8,
@@ -171,6 +177,7 @@ private:
     void DrainWakeSignal() noexcept;
     bool WaitForEventsOrWake(std::int32_t timeoutMs) noexcept;
     void SyncNativeImeSpot(Rect caretRect, bool active) noexcept;
+    void WireInputRouterHooks() noexcept;
     [[nodiscard]] bool CanHostSleepIdle() const noexcept;
     void NotifyHostInputArrived() noexcept;
     [[nodiscard]] std::shared_ptr<UIResourceStore> EffectiveResourceStore() const noexcept;
@@ -238,6 +245,9 @@ private:
 
     std::string diagnostics_;
     NativeWindowTelemetry telemetry_{};
+    mutable std::mutex clipboardMutex_;
+    std::string clipboardFallbackBuffer_;
+    UIHostPlatformHooks ownedPlatformHooks_{};
 };
 
 } // namespace aero

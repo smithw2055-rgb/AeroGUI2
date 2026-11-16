@@ -36,21 +36,23 @@ bool TryReadSvgFloat(std::string_view s, std::size_t& pos, float& outVal) noexce
     }
     bool seenDot = false;
     bool seenDigit = false;
+    bool seenExp = false;
     while (pos < s.size()) {
         const char c = s[pos];
         if (std::isdigit(static_cast<unsigned char>(c))) {
             seenDigit = true;
             ++pos;
-        } else if (c == '.' && !seenDot) {
+        } else if (c == '.' && !seenDot && !seenExp) {
             seenDot = true;
             ++pos;
-        } else if ((c == 'e' || c == 'E') && seenDigit) {
+        } else if (!seenExp && (c == 'e' || c == 'E') && seenDigit) {
             std::size_t expPos = pos + 1u;
             if (expPos < s.size() && (s[expPos] == '+' || s[expPos] == '-')) {
                 ++expPos;
             }
             if (expPos < s.size() && std::isdigit(static_cast<unsigned char>(s[expPos]))) {
-                pos = expPos;
+                seenExp = true;
+                pos = expPos + 1u;
             } else {
                 break;
             }
@@ -114,27 +116,11 @@ namespace {
 // SVG Path Mini-Language Parser & 4-Channel MTSDF Baker
 // ============================================================================
 
-struct SvgVec2 {
-    float x = 0.0f;
-    float y = 0.0f;
-};
-
 struct ColoredSegment {
-    SvgVec2 p0{};
-    SvgVec2 p1{};
+    Point p0{};
+    Point p1{};
     std::uint8_t channelMask = 0x07u; // Bit 0 = R, Bit 1 = G, Bit 2 = B
     bool inClosedContour = true;
-};
-
-struct SvgContour {
-    std::vector<SvgVec2> points;
-    bool closed = false;
-};
-
-struct ParsedSvgGeometry {
-    bool nonZeroFill = false; // Default XAML F0 = EvenOdd, F1 = NonZero
-    std::vector<SvgContour> contours;
-    Rect bounds{0.0f, 0.0f, 0.0f, 0.0f};
 };
 
 // SVG 1.1 / XAML StreamGeometry arc flag grammar: single '0' or '1' digit (may omit trailing separator, e.g. "a4,4 0 014,-4")
@@ -148,16 +134,58 @@ bool TryReadSvgArcFlag(std::string_view s, std::size_t& pos, bool& outFlag) noex
     return true;
 }
 
+void AppendCubicBezierPoints(
+    std::vector<Point>& contour,
+    Point p0,
+    Point c1,
+    Point c2,
+    Point p3,
+    int steps) {
+    const int safeSteps = std::max(1, steps);
+    for (int i = 1; i <= safeSteps; ++i) {
+        const float t = static_cast<float>(i) / static_cast<float>(safeSteps);
+        const float u = 1.0f - t;
+        const float b0 = u * u * u;
+        const float b1 = 3.0f * u * u * t;
+        const float b2 = 3.0f * u * t * t;
+        const float b3 = t * t * t;
+        contour.push_back(Point{
+            b0 * p0.x + b1 * c1.x + b2 * c2.x + b3 * p3.x,
+            b0 * p0.y + b1 * c1.y + b2 * c2.y + b3 * p3.y});
+    }
+}
+
+void AppendQuadBezierPoints(
+    std::vector<Point>& contour,
+    Point p0,
+    Point c1,
+    Point p2,
+    int steps) {
+    const int safeSteps = std::max(1, steps);
+    for (int i = 1; i <= safeSteps; ++i) {
+        const float t = static_cast<float>(i) / static_cast<float>(safeSteps);
+        const float u = 1.0f - t;
+        contour.push_back(Point{
+            u * u * p0.x + 2.0f * u * t * c1.x + t * t * p2.x,
+            u * u * p0.y + 2.0f * u * t * c1.y + t * t * p2.y});
+    }
+}
+
+} // namespace
+
 // W3C SVG 1.1 Appendix F.6.5 & F.6.6 endpoint-to-center elliptical arc tessellation
-void AppendSvgEllipticalArc(
-    std::vector<SvgVec2>& contour,
-    SvgVec2 p0,
+void AppendSvgArcPoints(
+    Point p0,
     float rxRaw,
     float ryRaw,
     float xAxisRotDeg,
     bool largeArc,
     bool sweep,
-    SvgVec2 p1) {
+    Point p1,
+    std::vector<Point>& contour,
+    float stepAngleRad,
+    int minSteps,
+    int maxSteps) {
     const float dx2 = (p0.x - p1.x) * 0.5f;
     const float dy2 = (p0.y - p1.y) * 0.5f;
     if (dx2 * dx2 + dy2 * dy2 <= 1e-10f) {
@@ -224,7 +252,13 @@ void AppendSvgEllipticalArc(
         deltaTheta += 2.0f * kPi;
     }
 
-    const int steps = std::clamp(static_cast<int>(std::ceil(std::fabs(deltaTheta) / (kPi / 10.0f))), 2, 48);
+    const float safeStepRad = std::max(1e-3f, stepAngleRad);
+    const int safeMin = std::max(1, minSteps);
+    const int safeMax = std::max(safeMin, maxSteps);
+    const int steps = std::clamp(
+        static_cast<int>(std::ceil(std::fabs(deltaTheta) / safeStepRad)),
+        safeMin,
+        safeMax);
     for (int i = 1; i <= steps; ++i) {
         if (i == steps) {
             contour.push_back(p1);
@@ -232,45 +266,38 @@ void AppendSvgEllipticalArc(
             const float th = theta1 + deltaTheta * (static_cast<float>(i) / static_cast<float>(steps));
             const float ex = rx * std::cos(th);
             const float ey = ry * std::sin(th);
-            contour.push_back(SvgVec2{
+            contour.push_back(Point{
                 cosPhi * ex - sinPhi * ey + cx,
                 sinPhi * ex + cosPhi * ey + cy});
         }
     }
 }
 
-ParsedSvgGeometry ParseSvgPathGeometry(std::string_view pathData) {
+ParsedSvgGeometry ParseSvgPathGeometry(
+    std::string_view pathData,
+    const SvgPathTessellationOptions& options) {
     ParsedSvgGeometry geom{};
     std::size_t pos = 0;
     detail::SkipSvgDelimiters(pathData, pos);
 
-    // Optional XAML FillRule prefix: "F0" (EvenOdd) or "F1" (NonZero)
-    if (pos < pathData.size() && (pathData[pos] == 'F' || pathData[pos] == 'f')) {
-        ++pos;
-        float ruleVal = 0.0f;
-        if (detail::TryReadSvgFloat(pathData, pos, ruleVal)) {
-            geom.nonZeroFill = (static_cast<int>(ruleVal) != 0);
-        }
-    }
-
-    std::vector<SvgVec2> currentContour;
+    std::vector<Point> currentContour;
     bool currentClosed = false;
-    SvgVec2 cur{0.0f, 0.0f};
-    SvgVec2 startPt{0.0f, 0.0f};
-    SvgVec2 prevCtrl{0.0f, 0.0f};
+    Point cur{0.0f, 0.0f};
+    Point startPt{0.0f, 0.0f};
+    Point prevCtrl{0.0f, 0.0f};
     char cmd = 0;
     char prevCmd = 0;
 
     auto flushContour = [&]() {
         if (currentContour.size() >= 2u) {
             if (!currentClosed && currentContour.size() >= 4u) {
-                const SvgVec2 first = currentContour.front();
-                const SvgVec2 last = currentContour.back();
+                const Point first = currentContour.front();
+                const Point last = currentContour.back();
                 if (std::fabs(first.x - last.x) <= 1e-4f && std::fabs(first.y - last.y) <= 1e-4f) {
                     currentClosed = true;
                 }
             }
-            geom.contours.push_back(SvgContour{std::move(currentContour), currentClosed});
+            geom.contours.push_back(SvgPathContour{std::move(currentContour), currentClosed});
         }
         currentContour.clear();
         currentClosed = false;
@@ -289,6 +316,15 @@ ParsedSvgGeometry ParseSvgPathGeometry(std::string_view pathData) {
         }
 
         switch (cmd) {
+            case 'F':
+            case 'f': {
+                float ruleVal = 0.0f;
+                if (detail::TryReadSvgFloat(pathData, pos, ruleVal)) {
+                    geom.nonZeroFill = (static_cast<int>(ruleVal) != 0);
+                }
+                cmd = 0;
+                break;
+            }
             case 'M':
             case 'm': {
                 float x = 0.0f;
@@ -298,11 +334,13 @@ ParsedSvgGeometry ParseSvgPathGeometry(std::string_view pathData) {
                     break;
                 }
                 flushContour();
-                cur = (cmd == 'm') ? SvgVec2{cur.x + x, cur.y + y} : SvgVec2{x, y};
+                cur = (cmd == 'm') ? Point{cur.x + x, cur.y + y} : Point{x, y};
                 startPt = cur;
+                prevCtrl = cur;
                 currentContour.push_back(cur);
+                prevCmd = 'M';
                 cmd = (cmd == 'm') ? 'l' : 'L';
-                break;
+                continue;
             }
             case 'L':
             case 'l': {
@@ -312,9 +350,10 @@ ParsedSvgGeometry ParseSvgPathGeometry(std::string_view pathData) {
                     cmd = 0;
                     break;
                 }
-                cur = (cmd == 'l') ? SvgVec2{cur.x + x, cur.y + y} : SvgVec2{x, y};
+                cur = (cmd == 'l') ? Point{cur.x + x, cur.y + y} : Point{x, y};
                 if (currentContour.empty()) currentContour.push_back(startPt);
                 currentContour.push_back(cur);
+                prevCtrl = cur;
                 break;
             }
             case 'H':
@@ -327,6 +366,7 @@ ParsedSvgGeometry ParseSvgPathGeometry(std::string_view pathData) {
                 cur.x = (cmd == 'h') ? (cur.x + x) : x;
                 if (currentContour.empty()) currentContour.push_back(startPt);
                 currentContour.push_back(cur);
+                prevCtrl = cur;
                 break;
             }
             case 'V':
@@ -339,6 +379,7 @@ ParsedSvgGeometry ParseSvgPathGeometry(std::string_view pathData) {
                 cur.y = (cmd == 'v') ? (cur.y + y) : y;
                 if (currentContour.empty()) currentContour.push_back(startPt);
                 currentContour.push_back(cur);
+                prevCtrl = cur;
                 break;
             }
             case 'C':
@@ -350,20 +391,12 @@ ParsedSvgGeometry ParseSvgPathGeometry(std::string_view pathData) {
                     cmd = 0;
                     break;
                 }
-                const SvgVec2 p0 = cur;
-                const SvgVec2 c1 = (cmd == 'c') ? SvgVec2{cur.x + x1, cur.y + y1} : SvgVec2{x1, y1};
-                const SvgVec2 c2 = (cmd == 'c') ? SvgVec2{cur.x + x2, cur.y + y2} : SvgVec2{x2, y2};
-                const SvgVec2 p3 = (cmd == 'c') ? SvgVec2{cur.x + x, cur.y + y} : SvgVec2{x, y};
+                const Point p0 = cur;
+                const Point c1 = (cmd == 'c') ? Point{cur.x + x1, cur.y + y1} : Point{x1, y1};
+                const Point c2 = (cmd == 'c') ? Point{cur.x + x2, cur.y + y2} : Point{x2, y2};
+                const Point p3 = (cmd == 'c') ? Point{cur.x + x, cur.y + y} : Point{x, y};
                 if (currentContour.empty()) currentContour.push_back(p0);
-                constexpr int kSteps = 8;
-                for (int i = 1; i <= kSteps; ++i) {
-                    const float t = static_cast<float>(i) / static_cast<float>(kSteps);
-                    const float u = 1.0f - t;
-                    const SvgVec2 pt{
-                        u * u * u * p0.x + 3.0f * u * u * t * c1.x + 3.0f * u * t * t * c2.x + t * t * t * p3.x,
-                        u * u * u * p0.y + 3.0f * u * u * t * c1.y + 3.0f * u * t * t * c2.y + t * t * t * p3.y};
-                    currentContour.push_back(pt);
-                }
+                AppendCubicBezierPoints(currentContour, p0, c1, c2, p3, options.cubicSteps);
                 prevCtrl = c2;
                 cur = p3;
                 break;
@@ -376,21 +409,14 @@ ParsedSvgGeometry ParseSvgPathGeometry(std::string_view pathData) {
                     cmd = 0;
                     break;
                 }
-                const SvgVec2 p0 = cur;
-                const SvgVec2 c1 = (prevCmd == 'C' || prevCmd == 'c' || prevCmd == 'S' || prevCmd == 's')
-                    ? SvgVec2{2.0f * cur.x - prevCtrl.x, 2.0f * cur.y - prevCtrl.y}
+                const Point p0 = cur;
+                const Point c1 = (prevCmd == 'C' || prevCmd == 'c' || prevCmd == 'S' || prevCmd == 's')
+                    ? Point{2.0f * cur.x - prevCtrl.x, 2.0f * cur.y - prevCtrl.y}
                     : cur;
-                const SvgVec2 c2 = (cmd == 's') ? SvgVec2{cur.x + x2, cur.y + y2} : SvgVec2{x2, y2};
-                const SvgVec2 p3 = (cmd == 's') ? SvgVec2{cur.x + x, cur.y + y} : SvgVec2{x, y};
+                const Point c2 = (cmd == 's') ? Point{cur.x + x2, cur.y + y2} : Point{x2, y2};
+                const Point p3 = (cmd == 's') ? Point{cur.x + x, cur.y + y} : Point{x, y};
                 if (currentContour.empty()) currentContour.push_back(p0);
-                constexpr int kSteps = 8;
-                for (int i = 1; i <= kSteps; ++i) {
-                    const float t = static_cast<float>(i) / static_cast<float>(kSteps);
-                    const float u = 1.0f - t;
-                    currentContour.push_back(SvgVec2{
-                        u * u * u * p0.x + 3.0f * u * u * t * c1.x + 3.0f * u * t * t * c2.x + t * t * t * p3.x,
-                        u * u * u * p0.y + 3.0f * u * u * t * c1.y + 3.0f * u * t * t * c2.y + t * t * t * p3.y});
-                }
+                AppendCubicBezierPoints(currentContour, p0, c1, c2, p3, options.cubicSteps);
                 prevCtrl = c2;
                 cur = p3;
                 break;
@@ -403,18 +429,11 @@ ParsedSvgGeometry ParseSvgPathGeometry(std::string_view pathData) {
                     cmd = 0;
                     break;
                 }
-                const SvgVec2 p0 = cur;
-                const SvgVec2 c1 = (cmd == 'q') ? SvgVec2{cur.x + x1, cur.y + y1} : SvgVec2{x1, y1};
-                const SvgVec2 p2 = (cmd == 'q') ? SvgVec2{cur.x + x, cur.y + y} : SvgVec2{x, y};
+                const Point p0 = cur;
+                const Point c1 = (cmd == 'q') ? Point{cur.x + x1, cur.y + y1} : Point{x1, y1};
+                const Point p2 = (cmd == 'q') ? Point{cur.x + x, cur.y + y} : Point{x, y};
                 if (currentContour.empty()) currentContour.push_back(p0);
-                constexpr int kSteps = 6;
-                for (int i = 1; i <= kSteps; ++i) {
-                    const float t = static_cast<float>(i) / static_cast<float>(kSteps);
-                    const float u = 1.0f - t;
-                    currentContour.push_back(SvgVec2{
-                        u * u * p0.x + 2.0f * u * t * c1.x + t * t * p2.x,
-                        u * u * p0.y + 2.0f * u * t * c1.y + t * t * p2.y});
-                }
+                AppendQuadBezierPoints(currentContour, p0, c1, p2, options.quadSteps);
                 prevCtrl = c1;
                 cur = p2;
                 break;
@@ -426,20 +445,13 @@ ParsedSvgGeometry ParseSvgPathGeometry(std::string_view pathData) {
                     cmd = 0;
                     break;
                 }
-                const SvgVec2 p0 = cur;
-                const SvgVec2 c1 = (prevCmd == 'Q' || prevCmd == 'q' || prevCmd == 'T' || prevCmd == 't')
-                    ? SvgVec2{2.0f * cur.x - prevCtrl.x, 2.0f * cur.y - prevCtrl.y}
+                const Point p0 = cur;
+                const Point c1 = (prevCmd == 'Q' || prevCmd == 'q' || prevCmd == 'T' || prevCmd == 't')
+                    ? Point{2.0f * cur.x - prevCtrl.x, 2.0f * cur.y - prevCtrl.y}
                     : cur;
-                const SvgVec2 p2 = (cmd == 't') ? SvgVec2{cur.x + x, cur.y + y} : SvgVec2{x, y};
+                const Point p2 = (cmd == 't') ? Point{cur.x + x, cur.y + y} : Point{x, y};
                 if (currentContour.empty()) currentContour.push_back(p0);
-                constexpr int kSteps = 6;
-                for (int i = 1; i <= kSteps; ++i) {
-                    const float t = static_cast<float>(i) / static_cast<float>(kSteps);
-                    const float u = 1.0f - t;
-                    currentContour.push_back(SvgVec2{
-                        u * u * p0.x + 2.0f * u * t * c1.x + t * t * p2.x,
-                        u * u * p0.y + 2.0f * u * t * c1.y + t * t * p2.y});
-                }
+                AppendQuadBezierPoints(currentContour, p0, c1, p2, options.quadSteps);
                 prevCtrl = c1;
                 cur = p2;
                 break;
@@ -459,17 +471,29 @@ ParsedSvgGeometry ParseSvgPathGeometry(std::string_view pathData) {
                     cmd = 0;
                     break;
                 }
-                const SvgVec2 p0 = cur;
-                const SvgVec2 p1 = (cmd == 'a') ? SvgVec2{cur.x + ex, cur.y + ey} : SvgVec2{ex, ey};
+                const Point p0 = cur;
+                const Point p1 = (cmd == 'a') ? Point{cur.x + ex, cur.y + ey} : Point{ex, ey};
                 if (currentContour.empty()) currentContour.push_back(p0);
-                AppendSvgEllipticalArc(currentContour, p0, rx, ry, rot, largeArc, sweep, p1);
+                AppendSvgArcPoints(
+                    p0,
+                    rx,
+                    ry,
+                    rot,
+                    largeArc,
+                    sweep,
+                    p1,
+                    currentContour,
+                    options.arcStepAngleRad,
+                    options.arcMinSteps,
+                    options.arcMaxSteps);
                 cur = p1;
+                prevCtrl = cur;
                 break;
             }
             case 'Z':
             case 'z': {
                 if (!currentContour.empty()) {
-                    const SvgVec2 last = currentContour.back();
+                    const Point last = currentContour.back();
                     if (std::fabs(last.x - startPt.x) > 1e-4f || std::fabs(last.y - startPt.y) > 1e-4f) {
                         currentContour.push_back(startPt);
                     }
@@ -477,6 +501,7 @@ ParsedSvgGeometry ParseSvgPathGeometry(std::string_view pathData) {
                     flushContour();
                 }
                 cur = startPt;
+                prevCtrl = cur;
                 cmd = 0;
                 break;
             }
@@ -515,6 +540,21 @@ ParsedSvgGeometry ParseSvgPathGeometry(std::string_view pathData) {
     }
     return geom;
 }
+
+std::vector<std::vector<Point>> ParseSvgPathToSubpaths(std::string_view pathData) {
+    constexpr float kPi = 3.14159265358979323846f;
+    const ParsedSvgGeometry geom = ParseSvgPathGeometry(
+        pathData,
+        SvgPathTessellationOptions{16, 12, kPi / 16.0f, 4, 64});
+    std::vector<std::vector<Point>> subpaths;
+    subpaths.reserve(geom.contours.size());
+    for (const auto& contour : geom.contours) {
+        subpaths.push_back(contour.points);
+    }
+    return subpaths;
+}
+
+namespace {
 
 std::vector<ColoredSegment> BuildCornerColoredSegments(const ParsedSvgGeometry& geom) {
     std::vector<ColoredSegment> allSegments;
@@ -615,8 +655,8 @@ bool IsPointInsideSvgGeometry(const ParsedSvgGeometry& geom, float px, float py)
             continue;
         }
         for (std::size_t i = 0; i + 1u < contour.points.size(); ++i) {
-            const SvgVec2 a = contour.points[i];
-            const SvgVec2 b = contour.points[i + 1u];
+            const Point a = contour.points[i];
+            const Point b = contour.points[i + 1u];
             if ((a.y <= py && b.y > py) || (b.y <= py && a.y > py)) {
                 const float vt = (py - a.y) / (b.y - a.y);
                 const float xIntersect = a.x + vt * (b.x - a.x);
@@ -1000,8 +1040,8 @@ AxbMtsdfPathEntry BakeSvgPathToMtsdfEntry(
 
     // Collect closed-contour SVG edges once for fast per-row straddling-edge filtering
     struct ClosedSvgEdge {
-        SvgVec2 a{};
-        SvgVec2 b{};
+        Point a{};
+        Point b{};
     };
     std::vector<ClosedSvgEdge> closedEdges;
     if (anyClosedContour) {
@@ -1009,8 +1049,8 @@ AxbMtsdfPathEntry BakeSvgPathToMtsdfEntry(
         for (const auto& contour : geom.contours) {
             if (!contour.closed) continue;
             for (std::size_t i = 0u; i + 1u < contour.points.size(); ++i) {
-                const SvgVec2 a = contour.points[i];
-                const SvgVec2 b = contour.points[i + 1u];
+                const Point a = contour.points[i];
+                const Point b = contour.points[i + 1u];
                 if (a.y != b.y) {
                     closedEdges.push_back(ClosedSvgEdge{a, b});
                 }

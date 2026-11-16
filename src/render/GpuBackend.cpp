@@ -6,8 +6,11 @@
 #include <cstring>
 
 #include "aero/asset/GradientBrush.hpp"
+#include "aero/core/UIResourceStore.hpp"
 #include "aero/render/FontAtlas.hpp"
 #include "aero/render/ImageAtlas.hpp"
+
+#include "RenderInternal.hpp"
 
 #if defined(__EMSCRIPTEN__)
 #include <GLES3/gl3.h>
@@ -65,7 +68,117 @@ constexpr AeroGLenum kGlVertexShader = 0x8B31u;
 constexpr AeroGLenum kGlCompileStatus = 0x8B81u;
 constexpr AeroGLenum kGlLinkStatus = 0x8B82u;
 constexpr AeroGLenum kGlInfoLogLength = 0x8B84u;
+constexpr AeroGLenum kGlFramebuffer = 0x8D40u;
+constexpr AeroGLenum kGlColorAttachment0 = 0x8CE0u;
+constexpr AeroGLenum kGlFramebufferComplete = 0x8CD5u;
 constexpr AeroGLbitfield kGlColorBufferBit = 0x00004000u;
+
+constexpr std::string_view kEffectVertexShaderBodyGlsl = R"(layout(location = 0) in vec2 a_Position;
+layout(location = 1) in vec2 a_TexCoord;
+layout(location = 2) in uint a_PackedRgba;
+layout(location = 3) in uint a_PrimFlags;
+
+uniform vec2 u_ViewportSize;
+
+out vec2 v_Uv;
+out vec4 v_Color;
+
+void main() {
+    vec2 ndc = (a_Position / max(u_ViewportSize, vec2(1.0))) * 2.0 - 1.0;
+    ndc.y = -ndc.y;
+    gl_Position = vec4(ndc, 0.0, 1.0);
+    v_Uv = a_TexCoord;
+    v_Color = vec4(
+        float((a_PackedRgba >>  0u) & 0xFFu) / 255.0,
+        float((a_PackedRgba >>  8u) & 0xFFu) / 255.0,
+        float((a_PackedRgba >> 16u) & 0xFFu) / 255.0,
+        float((a_PackedRgba >> 24u) & 0xFFu) / 255.0
+    );
+}
+)";
+
+constexpr std::string_view kEffectPixelShaderBodyGlsl = R"(in vec2 v_Uv;
+in vec4 v_Color;
+
+uniform sampler2D u_SrcTex;
+uniform vec2 u_TexelSize;
+uniform int u_EffectMode;
+uniform vec2 u_EffectParams;
+uniform vec2 u_EffectUvMin;
+uniform vec2 u_EffectUvMax;
+
+out vec4 o_FragColor;
+
+vec4 sampleClamped(vec2 uv) {
+    return texture(u_SrcTex, clamp(uv, u_EffectUvMin, u_EffectUvMax));
+}
+
+void main() {
+    if (u_EffectMode == 1) {
+        float radius = clamp(u_EffectParams.x, 0.5, 128.0);
+        float sigma = max(0.35, radius * 0.5);
+        float stepPx = max(1.0, radius / 6.0);
+        vec4 acc = vec4(0.0);
+        float wSum = 0.0;
+        for (int k = -6; k <= 6; ++k) {
+            float d = float(k) * stepPx;
+            if (abs(d) > radius + 0.5) {
+                continue;
+            }
+            float w = exp(-0.5 * (d * d) / (sigma * sigma));
+            acc += sampleClamped(v_Uv + u_TexelSize * d) * w;
+            wSum += w;
+        }
+        vec4 res = (wSum > 0.0) ? (acc / wSum) : sampleClamped(v_Uv);
+        o_FragColor = res * v_Color.a;
+        return;
+    }
+    if (u_EffectMode == 2) {
+        float radius = clamp(u_EffectParams.x, 0.5, 128.0);
+        float stepPx = radius / 6.0;
+        vec4 acc = vec4(0.0);
+        for (int k = -6; k <= 6; ++k) {
+            acc += sampleClamped(v_Uv + u_TexelSize * (float(k) * stepPx));
+        }
+        o_FragColor = (acc / 13.0) * v_Color.a;
+        return;
+    }
+    if (u_EffectMode == 3) {
+        float blockPx = max(1.5, u_EffectParams.x);
+        vec2 cellUv = max(u_TexelSize * blockPx, vec2(1e-6));
+        vec2 snapped = floor((v_Uv - u_EffectUvMin) / cellUv) * cellUv + 0.5 * cellUv + u_EffectUvMin;
+        o_FragColor = sampleClamped(min(snapped, u_EffectUvMax)) * v_Color.a;
+        return;
+    }
+    vec4 c = sampleClamped(v_Uv);
+    if (u_EffectMode == 4) {
+        float strength = clamp(u_EffectParams.x, 0.0, 1.0);
+        c.rgb = clamp(c.rgb * mix(vec3(1.0), v_Color.rgb, strength), vec3(0.0), vec3(c.a));
+    } else if (u_EffectMode == 5) {
+        float shift = clamp(u_EffectParams.x, -64.0, 64.0);
+        vec4 sR = sampleClamped(v_Uv - u_TexelSize * shift);
+        vec4 sB = sampleClamped(v_Uv + u_TexelSize * shift);
+        float outA = max(c.a, max(sR.a, sB.a));
+        c = vec4(min(sR.r, outA), min(c.g, outA), min(sB.b, outA), outA);
+    } else if (u_EffectMode == 6) {
+        float sat = max(0.0, u_EffectParams.x);
+        if (c.a > 1e-4) {
+            vec3 straight = c.rgb / c.a;
+            float lum = dot(straight, vec3(0.2126, 0.7152, 0.0722));
+            vec3 satRgb = clamp(mix(vec3(lum), straight, sat), 0.0, 1.0);
+            c.rgb = satRgb * c.a;
+        }
+    }
+    o_FragColor = c * v_Color.a;
+}
+)";
+
+[[nodiscard]] std::string BuildEffectShaderSource(ShaderBackend backend, std::string_view body) {
+    if (backend == ShaderBackend::WebGL2) {
+        return std::string("#version 300 es\nprecision highp float;\nprecision highp int;\n") + std::string(body);
+    }
+    return std::string("#version 330 core\n") + std::string(body);
+}
 
 constexpr std::size_t kPageVertexBytes = kVerticesPerCommandPage * sizeof(AeroVertex);
 constexpr std::size_t kQuadsPerPage = kVerticesPerCommandPage / 4u;
@@ -212,7 +325,29 @@ void BakeProceduralGlyphHalf(
     }
 }
 
+[[nodiscard]] const GradientBrushRegistry& ResolveGradientRegistry(
+    const PagedRenderTree* optTree) noexcept {
+    if (optTree != nullptr) {
+        if (const UIResourceStore* store = optTree->ResourceStore();
+            store != nullptr && store->GradientBrushes().BrushCount() > 0u) {
+            return store->GradientBrushes();
+        }
+    }
+    return GradientBrushRegistry::Instance();
+}
+
+[[nodiscard]] const FontAtlas& ResolveFontAtlas(const PagedRenderTree* optTree) noexcept {
+    if (optTree != nullptr) {
+        if (const UIResourceStore* store = optTree->ResourceStore();
+            store != nullptr && store->TryFonts() != nullptr) {
+            return *store->TryFonts();
+        }
+    }
+    return FontAtlas::Instance();
+}
+
 void BakeGradientRowsIntoBuffer(
+    const GradientBrushRegistry& registry,
     std::uint32_t atlasSize,
     std::uint32_t bufferStartRow,
     std::uint32_t bufferRowCount,
@@ -252,7 +387,8 @@ void BakeGradientRowsIntoBuffer(
     };
 
     std::uint32_t lowestRow = bottomRow;
-    const std::size_t brushCount = GradientBrushRegistry::Instance().BrushCount();
+    const std::size_t brushCount = registry.BrushCount();
+    GradientBrushDesc brushDesc{};
     for (std::size_t idx = 0; idx < brushCount; ++idx) {
         if (atlasSize < 4u + static_cast<std::uint32_t>(idx * 2u)) {
             break;
@@ -265,8 +401,7 @@ void BakeGradientRowsIntoBuffer(
         lowestRow = std::min(lowestRow, metaRow);
 
         const auto brushId = static_cast<std::uint32_t>(idx + 1u);
-        const GradientBrushDesc* brush = GradientBrushRegistry::Instance().Find(brushId);
-        if (!brush) {
+        if (!registry.TryGetBrush(brushId, brushDesc)) {
             continue;
         }
 
@@ -276,12 +411,12 @@ void BakeGradientRowsIntoBuffer(
             if (rampWidth == GradientBrushDesc::kLutWidth) {
                 std::memcpy(
                     bufferRgba8 + localRampRow * atlasSize * 4u,
-                    brush->bakedRampRgba8.data(),
+                    brushDesc.bakedRampRgba8.data(),
                     GradientBrushDesc::kLutWidth * 4u);
             } else if (rampWidth > 1u) {
                 for (std::uint32_t x = 0; x < rampWidth; ++x) {
                     const float t = static_cast<float>(x) / static_cast<float>(rampWidth - 1u);
-                    const Color c = SampleGradientRampAtT(*brush, t);
+                    const Color c = SampleGradientRampAtT(brushDesc, t);
                     const std::uint32_t packed = PackColorRgba8(c, 1.0f);
                     const std::size_t off = (localRampRow * atlasSize + x) * 4u;
                     bufferRgba8[off + 0u] = static_cast<std::uint8_t>(packed & 0xFFu);
@@ -294,25 +429,25 @@ void BakeGradientRowsIntoBuffer(
 
         if (metaRow >= bufferStartRow && (metaRow - bufferStartRow) < bufferRowCount) {
             const std::size_t m0Off = static_cast<std::size_t>(metaRow - bufferStartRow) * atlasSize * 4u;
-            bufferRgba8[m0Off + 0u] = static_cast<std::uint8_t>(brush->kind);
-            bufferRgba8[m0Off + 1u] = static_cast<std::uint8_t>(brush->mappingMode);
-            bufferRgba8[m0Off + 2u] = static_cast<std::uint8_t>(brush->spreadMethod);
+            bufferRgba8[m0Off + 0u] = static_cast<std::uint8_t>(brushDesc.kind);
+            bufferRgba8[m0Off + 1u] = static_cast<std::uint8_t>(brushDesc.mappingMode);
+            bufferRgba8[m0Off + 2u] = static_cast<std::uint8_t>(brushDesc.spreadMethod);
             bufferRgba8[m0Off + 3u] = static_cast<std::uint8_t>(
-                std::clamp(brush->opacity, 0.0f, 1.0f) * 255.0f + 0.5f);
+                std::clamp(brushDesc.opacity, 0.0f, 1.0f) * 255.0f + 0.5f);
 
-            if (brush->kind == GradientBrushKind::Linear) {
-                writeFloatTexel(1u, metaRow, brush->startPoint.x);
-                writeFloatTexel(2u, metaRow, brush->startPoint.y);
-                writeFloatTexel(3u, metaRow, brush->endPoint.x);
-                writeFloatTexel(4u, metaRow, brush->endPoint.y);
+            if (brushDesc.kind == GradientBrushKind::Linear) {
+                writeFloatTexel(1u, metaRow, brushDesc.startPoint.x);
+                writeFloatTexel(2u, metaRow, brushDesc.startPoint.y);
+                writeFloatTexel(3u, metaRow, brushDesc.endPoint.x);
+                writeFloatTexel(4u, metaRow, brushDesc.endPoint.y);
             } else {
-                writeFloatTexel(1u, metaRow, brush->center.x);
-                writeFloatTexel(2u, metaRow, brush->center.y);
-                writeFloatTexel(3u, metaRow, brush->gradientOrigin.x);
-                writeFloatTexel(4u, metaRow, brush->gradientOrigin.y);
+                writeFloatTexel(1u, metaRow, brushDesc.center.x);
+                writeFloatTexel(2u, metaRow, brushDesc.center.y);
+                writeFloatTexel(3u, metaRow, brushDesc.gradientOrigin.x);
+                writeFloatTexel(4u, metaRow, brushDesc.gradientOrigin.y);
             }
-            writeFloatTexel(5u, metaRow, brush->radiusX);
-            writeFloatTexel(6u, metaRow, brush->radiusY);
+            writeFloatTexel(5u, metaRow, brushDesc.radiusX);
+            writeFloatTexel(6u, metaRow, brushDesc.radiusY);
         }
     }
 
@@ -331,7 +466,7 @@ void BuildUnifiedUiAtlas1024(
     std::vector<std::uint8_t> fontRegion;
     std::uint32_t fontW = 0u;
     std::uint32_t fontRows = 0u;
-    FontAtlas::Instance().CopyGlyphRegionRgba8(512u, fontRegion, fontW, fontRows);
+    ResolveFontAtlas(&referenceTree).CopyGlyphRegionRgba8(512u, fontRegion, fontW, fontRows);
     if (fontW == kUnifiedUiAtlasSize && fontRows > 0u) {
         const std::size_t copyBytes =
             static_cast<std::size_t>(kUnifiedUiAtlasSize) * std::min<std::uint32_t>(512u, fontRows) * 4u;
@@ -356,6 +491,7 @@ void BuildUnifiedUiAtlas1024(
     // 3. Bottom band [y: minAllowedRow..1022]: GradientBrushRegistry 1D LUT & float32 metadata rows + (1023,1023) white texel
     const std::uint32_t minAllowedRow = 512u + mtsdfRows;
     BakeGradientRowsIntoBuffer(
+        ResolveGradientRegistry(&referenceTree),
         kUnifiedUiAtlasSize,
         0u,
         kUnifiedUiAtlasSize,
@@ -368,6 +504,235 @@ template <typename FnPtr>
 void AssignRawProc(FnPtr& outTyped, void* rawSym) noexcept {
     static_assert(sizeof(FnPtr) == sizeof(void*), "Function pointer must match pointer width");
     std::memcpy(&outTyped, &rawSym, sizeof(void*));
+}
+
+struct DynamicGlLibrarySession {
+    void* glHandle = nullptr;
+    void* eglHandle = nullptr;
+    void* glesHandle = nullptr;
+    bool loadedGl = false;
+    bool loadedEgl = false;
+    bool resolverReady = false;
+    bool activeContext = false;
+    std::string primaryLibName;
+
+#if defined(_WIN32)
+    PROC(WINAPI* wglGetProc)(LPCSTR) = nullptr;
+    HGLRC(WINAPI* wglGetCur)() = nullptr;
+#elif defined(__linux__) && !defined(__EMSCRIPTEN__)
+    using GlxGetProcFn = void (*(*)(const std::uint8_t*))();
+    using EglGetProcFn = void (*(*)(const char*))();
+    using GetCurCtxFn = void* (*)();
+    GlxGetProcFn glxGetProc = nullptr;
+    EglGetProcFn eglGetProc = nullptr;
+    GetCurCtxFn glxGetCur = nullptr;
+    GetCurCtxFn eglGetCur = nullptr;
+#endif
+
+    bool Open(bool includeFallbackEglAndGles, std::string& outError) noexcept {
+        outError.clear();
+#if defined(__EMSCRIPTEN__)
+        (void)includeFallbackEglAndGles;
+        loadedGl = true;
+        resolverReady = true;
+        primaryLibName = "Emscripten-WebGL2";
+        activeContext = (glGetString(GL_VERSION) != nullptr);
+        return true;
+#elif defined(_WIN32)
+        (void)includeFallbackEglAndGles;
+        HMODULE glMod = LoadLibraryA("opengl32.dll");
+        if (!glMod) {
+            outError = "Win32 opengl32.dll unavailable.";
+            return false;
+        }
+        glHandle = static_cast<void*>(glMod);
+        loadedGl = true;
+        primaryLibName = "opengl32.dll";
+        wglGetProc = reinterpret_cast<PROC(WINAPI*)(LPCSTR)>(GetProcAddress(glMod, "wglGetProcAddress"));
+        wglGetCur = reinterpret_cast<HGLRC(WINAPI*)()>(GetProcAddress(glMod, "wglGetCurrentContext"));
+        resolverReady = (wglGetProc != nullptr);
+        activeContext = (wglGetCur != nullptr && wglGetCur() != nullptr);
+        return true;
+#elif defined(__linux__)
+        glHandle = dlopen("libGL.so.1", RTLD_LAZY | RTLD_LOCAL);
+        if (glHandle) {
+            loadedGl = true;
+            primaryLibName = "libGL.so.1";
+        } else {
+            glHandle = dlopen("libGL.so", RTLD_LAZY | RTLD_LOCAL);
+            if (glHandle) {
+                loadedGl = true;
+                primaryLibName = "libGL.so";
+            }
+        }
+        eglHandle = dlopen("libEGL.so.1", RTLD_LAZY | RTLD_LOCAL);
+        if (!eglHandle && includeFallbackEglAndGles) {
+            eglHandle = dlopen("libEGL.so", RTLD_LAZY | RTLD_LOCAL);
+        }
+        if (eglHandle) {
+            loadedEgl = true;
+            if (primaryLibName.empty()) {
+                primaryLibName = "libEGL.so.1";
+            }
+        }
+        if (includeFallbackEglAndGles) {
+            glesHandle = dlopen("libGLESv2.so.2", RTLD_LAZY | RTLD_LOCAL);
+        }
+        if (!glHandle && !eglHandle && !glesHandle) {
+            outError = includeFallbackEglAndGles
+                ? "dlopen failed for libGL.so.1, libEGL.so.1, and libGLESv2.so.2."
+                : "Neither libGL.so.1 nor libEGL.so.1 found via dlopen.";
+            return false;
+        }
+        if (glHandle) {
+            AssignRawProc(glxGetProc, dlsym(glHandle, "glXGetProcAddressARB"));
+            if (!glxGetProc) {
+                AssignRawProc(glxGetProc, dlsym(glHandle, "glXGetProcAddress"));
+            }
+            AssignRawProc(glxGetCur, dlsym(glHandle, "glXGetCurrentContext"));
+        }
+        if (eglHandle) {
+            AssignRawProc(eglGetProc, dlsym(eglHandle, "eglGetProcAddress"));
+            AssignRawProc(eglGetCur, dlsym(eglHandle, "eglGetCurrentContext"));
+        }
+        resolverReady = (glxGetProc != nullptr) || (eglGetProc != nullptr);
+        activeContext = (glxGetCur && glxGetCur() != nullptr) || (eglGetCur && eglGetCur() != nullptr);
+        return true;
+#else
+        (void)includeFallbackEglAndGles;
+        outError = "OpenGL dynamic probe unsupported on target OS.";
+        return false;
+#endif
+    }
+
+    [[nodiscard]] void* ResolveSymbol(const char* name, bool useExtGetProcAddress) const noexcept {
+#if defined(_WIN32)
+        void* p = nullptr;
+        if (useExtGetProcAddress && wglGetProc) {
+            PROC extP = wglGetProc(name);
+            const auto rawVal = reinterpret_cast<std::uintptr_t>(extP);
+            if (rawVal > 3u && rawVal != static_cast<std::uintptr_t>(-1)) {
+                p = reinterpret_cast<void*>(extP);
+            }
+        }
+        if (!p && glHandle) {
+            p = reinterpret_cast<void*>(GetProcAddress(static_cast<HMODULE>(glHandle), name));
+        }
+        return p;
+#elif defined(__linux__) && !defined(__EMSCRIPTEN__)
+        (void)useExtGetProcAddress;
+        void* sym = nullptr;
+        if (glHandle) {
+            sym = dlsym(glHandle, name);
+        }
+        if (!sym && glesHandle) {
+            sym = dlsym(glesHandle, name);
+        }
+        if (!sym && glxGetProc) {
+            auto fn = glxGetProc(reinterpret_cast<const std::uint8_t*>(name));
+            AssignRawProc(sym, reinterpret_cast<void*>(fn));
+        }
+        if (!sym && eglGetProc) {
+            auto fn = eglGetProc(name);
+            AssignRawProc(sym, reinterpret_cast<void*>(fn));
+        }
+        return sym;
+#else
+        (void)name;
+        (void)useExtGetProcAddress;
+        return nullptr;
+#endif
+    }
+
+    void Close() noexcept {
+#if defined(_WIN32)
+        if (glHandle) {
+            FreeLibrary(static_cast<HMODULE>(glHandle));
+            glHandle = nullptr;
+        }
+#elif defined(__linux__) && !defined(__EMSCRIPTEN__)
+        if (glesHandle) {
+            dlclose(glesHandle);
+            glesHandle = nullptr;
+        }
+        if (eglHandle) {
+            dlclose(eglHandle);
+            eglHandle = nullptr;
+        }
+        if (glHandle) {
+            dlclose(glHandle);
+            glHandle = nullptr;
+        }
+#endif
+    }
+
+    void TransferHandlesTo(void*& outGl, void*& outEgl, void*& outGles) noexcept {
+        outGl = glHandle;
+        outEgl = eglHandle;
+        outGles = glesHandle;
+        glHandle = nullptr;
+        eglHandle = nullptr;
+        glesHandle = nullptr;
+    }
+};
+
+void PopulateGlFunctionTableFromSession(
+    const DynamicGlLibrarySession& session,
+    GlFunctionTable& table) noexcept {
+    auto bind = [&](auto& outFn, const char* name) noexcept {
+        AssignRawProc(outFn, session.ResolveSymbol(name, true));
+    };
+    bind(table.Viewport, "glViewport");
+    bind(table.Scissor, "glScissor");
+    bind(table.Enable, "glEnable");
+    bind(table.Disable, "glDisable");
+    bind(table.BlendFuncSeparate, "glBlendFuncSeparate");
+    bind(table.ClearColor, "glClearColor");
+    bind(table.Clear, "glClear");
+    bind(table.GenBuffers, "glGenBuffers");
+    bind(table.DeleteBuffers, "glDeleteBuffers");
+    bind(table.BindBuffer, "glBindBuffer");
+    bind(table.BufferData, "glBufferData");
+    bind(table.BufferSubData, "glBufferSubData");
+    bind(table.GenVertexArrays, "glGenVertexArrays");
+    bind(table.DeleteVertexArrays, "glDeleteVertexArrays");
+    bind(table.BindVertexArray, "glBindVertexArray");
+    bind(table.EnableVertexAttribArray, "glEnableVertexAttribArray");
+    bind(table.VertexAttribPointer, "glVertexAttribPointer");
+    bind(table.VertexAttribIPointer, "glVertexAttribIPointer");
+    bind(table.CreateShader, "glCreateShader");
+    bind(table.DeleteShader, "glDeleteShader");
+    bind(table.ShaderSource, "glShaderSource");
+    bind(table.CompileShader, "glCompileShader");
+    bind(table.GetShaderiv, "glGetShaderiv");
+    bind(table.GetShaderInfoLog, "glGetShaderInfoLog");
+    bind(table.CreateProgram, "glCreateProgram");
+    bind(table.DeleteProgram, "glDeleteProgram");
+    bind(table.AttachShader, "glAttachShader");
+    bind(table.LinkProgram, "glLinkProgram");
+    bind(table.GetProgramiv, "glGetProgramiv");
+    bind(table.GetProgramInfoLog, "glGetProgramInfoLog");
+    bind(table.UseProgram, "glUseProgram");
+    bind(table.GetUniformLocation, "glGetUniformLocation");
+    bind(table.Uniform1i, "glUniform1i");
+    bind(table.Uniform2f, "glUniform2f");
+    bind(table.GenTextures, "glGenTextures");
+    bind(table.DeleteTextures, "glDeleteTextures");
+    bind(table.ActiveTexture, "glActiveTexture");
+    bind(table.BindTexture, "glBindTexture");
+    bind(table.TexImage2D, "glTexImage2D");
+    bind(table.TexSubImage2D, "glTexSubImage2D");
+    bind(table.TexParameteri, "glTexParameteri");
+    bind(table.PixelStorei, "glPixelStorei");
+    bind(table.DrawElements, "glDrawElements");
+    bind(table.ReadPixels, "glReadPixels");
+    bind(table.GetError, "glGetError");
+    bind(table.GetString, "glGetString");
+    bind(table.GenFramebuffers, "glGenFramebuffers");
+    bind(table.DeleteFramebuffers, "glDeleteFramebuffers");
+    bind(table.BindFramebuffer, "glBindFramebuffer");
+    bind(table.FramebufferTexture2D, "glFramebufferTexture2D");
+    bind(table.CheckFramebufferStatus, "glCheckFramebufferStatus");
 }
 
 } // namespace
@@ -416,6 +781,14 @@ bool GlFunctionTable::IsComplete() const noexcept {
            TexParameteri != nullptr &&
            PixelStorei != nullptr &&
            DrawElements != nullptr;
+}
+
+bool GlFunctionTable::HasFramebufferSupport() const noexcept {
+    return GenFramebuffers != nullptr &&
+           DeleteFramebuffers != nullptr &&
+           BindFramebuffer != nullptr &&
+           FramebufferTexture2D != nullptr &&
+           CheckFramebufferStatus != nullptr;
 }
 
 void BuildStaticQuadIndexBuffer(
@@ -475,6 +848,7 @@ void BuildDefaultUiAtlasRgba8(
     outRgba8.assign(static_cast<std::size_t>(safeSize) * safeSize * 4u, 0u);
     BakeProceduralGlyphHalf(referenceTree, safeSize, outRgba8);
     BakeGradientRowsIntoBuffer(
+        ResolveGradientRegistry(&referenceTree),
         safeSize,
         0u,
         safeSize,
@@ -485,94 +859,41 @@ void BuildDefaultUiAtlasRgba8(
 
 GlDynamicProbeResult ProbeOpenGlDynamicLibrary() noexcept {
     GlDynamicProbeResult res{};
+    DynamicGlLibrarySession session;
+    std::string openErr;
+    if (!session.Open(false, openErr)) {
+        res.diagnostics = std::move(openErr);
+        return res;
+    }
+
+    res.libGlLoaded = session.loadedGl;
+    res.libEglLoaded = session.loadedEgl;
+    res.procAddressResolverReady = session.resolverReady;
+    res.hasCurrentContext = session.activeContext;
+    res.loadedLibraryName = session.primaryLibName;
+
 #if defined(__EMSCRIPTEN__)
-    res.libGlLoaded = true;
-    res.procAddressResolverReady = true;
     res.coreEntryPointsFound = true;
     res.resolvedSymbolCount = 43u;
-    res.loadedLibraryName = "Emscripten-WebGL2";
-    const auto* ver = reinterpret_cast<const char*>(glGetString(GL_VERSION));
-    if (ver) {
-        res.hasCurrentContext = true;
+    if (const auto* ver = reinterpret_cast<const char*>(glGetString(GL_VERSION))) {
         res.glVersionString = ver;
     }
     res.diagnostics = "Emscripten WebGL2 static-import symbols ready.";
 #elif defined(_WIN32)
-    HMODULE glMod = LoadLibraryA("opengl32.dll");
-    if (glMod) {
-        res.libGlLoaded = true;
-        res.loadedLibraryName = "opengl32.dll";
-        auto wglGetProc = reinterpret_cast<PROC (WINAPI*)(LPCSTR)>(
-            GetProcAddress(glMod, "wglGetProcAddress"));
-        auto wglGetCur = reinterpret_cast<HGLRC (WINAPI*)()>(
-            GetProcAddress(glMod, "wglGetCurrentContext"));
-        res.procAddressResolverReady = (wglGetProc != nullptr);
-        res.hasCurrentContext = (wglGetCur != nullptr && wglGetCur() != nullptr);
-        const char* kCoreNames[] = {
-            "glViewport", "glScissor", "glEnable", "glDisable",
-            "glClearColor", "glClear", "glDrawElements", "glGetString"
-        };
-        for (const char* sym : kCoreNames) {
-            if (GetProcAddress(glMod, sym) != nullptr) {
-                ++res.resolvedSymbolCount;
-            }
+    const char* kCoreNames[] = {
+        "glViewport", "glScissor", "glEnable", "glDisable",
+        "glClearColor", "glClear", "glDrawElements", "glGetString"
+    };
+    for (const char* sym : kCoreNames) {
+        if (session.ResolveSymbol(sym, false) != nullptr) {
+            ++res.resolvedSymbolCount;
         }
-        res.coreEntryPointsFound = (res.resolvedSymbolCount >= 8u);
-        FreeLibrary(glMod);
-        res.diagnostics = res.hasCurrentContext
-            ? "Win32 opengl32.dll loaded with active WGL context."
-            : "Win32 opengl32.dll loaded (no active WGL context on calling thread).";
-    } else {
-        res.diagnostics = "Win32 opengl32.dll unavailable.";
     }
+    res.coreEntryPointsFound = (res.resolvedSymbolCount >= 8u);
+    res.diagnostics = res.hasCurrentContext
+        ? "Win32 opengl32.dll loaded with active WGL context."
+        : "Win32 opengl32.dll loaded (no active WGL context on calling thread).";
 #elif defined(__linux__)
-    void* glHandle = dlopen("libGL.so.1", RTLD_LAZY | RTLD_LOCAL);
-    if (glHandle) {
-        res.libGlLoaded = true;
-        res.loadedLibraryName = "libGL.so.1";
-    } else {
-        glHandle = dlopen("libGL.so", RTLD_LAZY | RTLD_LOCAL);
-        if (glHandle) {
-            res.libGlLoaded = true;
-            res.loadedLibraryName = "libGL.so";
-        }
-    }
-
-    void* eglHandle = dlopen("libEGL.so.1", RTLD_LAZY | RTLD_LOCAL);
-    if (eglHandle) {
-        res.libEglLoaded = true;
-        if (res.loadedLibraryName.empty()) {
-            res.loadedLibraryName = "libEGL.so.1";
-        }
-    }
-
-    using GlxGetProcFn = void (*(*)(const std::uint8_t*))();
-    using EglGetProcFn = void (*(*)(const char*))();
-    using GlxGetCurrentContextFn = void* (*)();
-    using EglGetCurrentContextFn = void* (*)();
-
-    GlxGetProcFn glxGetProc = nullptr;
-    GlxGetCurrentContextFn glxGetCur = nullptr;
-    if (glHandle) {
-        AssignRawProc(glxGetProc, dlsym(glHandle, "glXGetProcAddressARB"));
-        if (!glxGetProc) {
-            AssignRawProc(glxGetProc, dlsym(glHandle, "glXGetProcAddress"));
-        }
-        AssignRawProc(glxGetCur, dlsym(glHandle, "glXGetCurrentContext"));
-    }
-
-    EglGetProcFn eglGetProc = nullptr;
-    EglGetCurrentContextFn eglGetCur = nullptr;
-    if (eglHandle) {
-        AssignRawProc(eglGetProc, dlsym(eglHandle, "eglGetProcAddress"));
-        AssignRawProc(eglGetCur, dlsym(eglHandle, "eglGetCurrentContext"));
-    }
-
-    res.procAddressResolverReady = (glxGetProc != nullptr) || (eglGetProc != nullptr);
-    if ((glxGetCur && glxGetCur() != nullptr) || (eglGetCur && eglGetCur() != nullptr)) {
-        res.hasCurrentContext = true;
-    }
-
     const char* kProbeSymbols[] = {
         "glViewport", "glScissor", "glEnable", "glDisable",
         "glBlendFuncSeparate", "glClearColor", "glClear",
@@ -582,27 +903,14 @@ GlDynamicProbeResult ProbeOpenGlDynamicLibrary() noexcept {
         "glGenTextures", "glBindTexture", "glTexImage2D", "glTexSubImage2D", "glDrawElements"
     };
     for (const char* name : kProbeSymbols) {
-        void* sym = nullptr;
-        if (glHandle) {
-            sym = dlsym(glHandle, name);
-        }
-        if (!sym && glxGetProc) {
-            auto fn = glxGetProc(reinterpret_cast<const std::uint8_t*>(name));
-            AssignRawProc(sym, reinterpret_cast<void*>(fn));
-        }
-        if (!sym && eglGetProc) {
-            auto fn = eglGetProc(name);
-            AssignRawProc(sym, reinterpret_cast<void*>(fn));
-        }
-        if (sym) {
+        if (session.ResolveSymbol(name, false) != nullptr) {
             ++res.resolvedSymbolCount;
         }
     }
     res.coreEntryPointsFound = (res.resolvedSymbolCount >= 20u);
-
-    if (res.hasCurrentContext && glHandle) {
+    if (res.hasCurrentContext) {
         const std::uint8_t* (AERO_GL_APIENTRY *glGetStr)(AeroGLenum) = nullptr;
-        AssignRawProc(glGetStr, dlsym(glHandle, "glGetString"));
+        AssignRawProc(glGetStr, session.ResolveSymbol("glGetString", false));
         if (glGetStr) {
             if (const auto* v = glGetStr(kGlVersion)) {
                 res.glVersionString = reinterpret_cast<const char*>(v);
@@ -612,24 +920,11 @@ GlDynamicProbeResult ProbeOpenGlDynamicLibrary() noexcept {
             }
         }
     }
-
-    if (eglHandle) {
-        dlclose(eglHandle);
-    }
-    if (glHandle) {
-        dlclose(glHandle);
-    }
-
-    if (res.libGlLoaded || res.libEglLoaded) {
-        res.diagnostics = "Linux dlopen probe succeeded (" + res.loadedLibraryName +
-            ", resolved " + std::to_string(res.resolvedSymbolCount) + "/25 probe symbols, activeContext=" +
-            (res.hasCurrentContext ? "true" : "false") + ").";
-    } else {
-        res.diagnostics = "Neither libGL.so.1 nor libEGL.so.1 found via dlopen.";
-    }
-#else
-    res.diagnostics = "OpenGL dynamic probe unsupported on target OS.";
+    res.diagnostics = "Linux dlopen probe succeeded (" + res.loadedLibraryName +
+        ", resolved " + std::to_string(res.resolvedSymbolCount) + "/25 probe symbols, activeContext=" +
+        (res.hasCurrentContext ? "true" : "false") + ").";
 #endif
+    session.Close();
     return res;
 }
 
@@ -857,207 +1152,41 @@ bool OpenGlDeviceBackend::LoadDynamicGlEntryPoints() {
     gl_.ReadPixels = &glReadPixels;
     gl_.GetError = &glGetError;
     gl_.GetString = &glGetString;
+    gl_.GenFramebuffers = &glGenFramebuffers;
+    gl_.DeleteFramebuffers = &glDeleteFramebuffers;
+    gl_.BindFramebuffer = &glBindFramebuffer;
+    gl_.FramebufferTexture2D = &glFramebufferTexture2D;
+    gl_.CheckFramebufferStatus = &glCheckFramebufferStatus;
     return gl_.IsComplete();
-
-#elif defined(_WIN32)
-    HMODULE glMod = LoadLibraryA("opengl32.dll");
-    if (!glMod) {
-        diagnostics_ = "LoadLibraryA(opengl32.dll) failed.";
+#elif defined(_WIN32) || defined(__linux__)
+    DynamicGlLibrarySession session;
+    std::string openErr;
+    if (!session.Open(true, openErr)) {
+        diagnostics_ = std::move(openErr);
         return false;
     }
-    dynGlLibHandle_ = static_cast<void*>(glMod);
-
-    auto wglGetCur = reinterpret_cast<HGLRC (WINAPI*)()>(
-        GetProcAddress(glMod, "wglGetCurrentContext"));
-    if (!wglGetCur || wglGetCur() == nullptr) {
+    session.TransferHandlesTo(dynGlLibHandle_, dynEglLibHandle_, dynGlesLibHandle_);
+    if (!session.activeContext) {
+#if defined(_WIN32)
         diagnostics_ = "No active WGL context on current thread when initializing OpenGlDeviceBackend.";
-        return false;
-    }
-
-    auto wglGetProc = reinterpret_cast<PROC (WINAPI*)(LPCSTR)>(
-        GetProcAddress(glMod, "wglGetProcAddress"));
-
-    auto resolveWinGl = [&](auto& outFn, const char* name) noexcept {
-        void* p = nullptr;
-        if (wglGetProc) {
-            PROC extP = wglGetProc(name);
-            const auto rawVal = reinterpret_cast<std::uintptr_t>(extP);
-            if (rawVal > 3u && rawVal != static_cast<std::uintptr_t>(-1)) {
-                p = reinterpret_cast<void*>(extP);
-            }
-        }
-        if (!p) {
-            p = reinterpret_cast<void*>(GetProcAddress(glMod, name));
-        }
-        AssignRawProc(outFn, p);
-    };
-
-    resolveWinGl(gl_.Viewport, "glViewport");
-    resolveWinGl(gl_.Scissor, "glScissor");
-    resolveWinGl(gl_.Enable, "glEnable");
-    resolveWinGl(gl_.Disable, "glDisable");
-    resolveWinGl(gl_.BlendFuncSeparate, "glBlendFuncSeparate");
-    resolveWinGl(gl_.ClearColor, "glClearColor");
-    resolveWinGl(gl_.Clear, "glClear");
-    resolveWinGl(gl_.GenBuffers, "glGenBuffers");
-    resolveWinGl(gl_.DeleteBuffers, "glDeleteBuffers");
-    resolveWinGl(gl_.BindBuffer, "glBindBuffer");
-    resolveWinGl(gl_.BufferData, "glBufferData");
-    resolveWinGl(gl_.BufferSubData, "glBufferSubData");
-    resolveWinGl(gl_.GenVertexArrays, "glGenVertexArrays");
-    resolveWinGl(gl_.DeleteVertexArrays, "glDeleteVertexArrays");
-    resolveWinGl(gl_.BindVertexArray, "glBindVertexArray");
-    resolveWinGl(gl_.EnableVertexAttribArray, "glEnableVertexAttribArray");
-    resolveWinGl(gl_.VertexAttribPointer, "glVertexAttribPointer");
-    resolveWinGl(gl_.VertexAttribIPointer, "glVertexAttribIPointer");
-    resolveWinGl(gl_.CreateShader, "glCreateShader");
-    resolveWinGl(gl_.DeleteShader, "glDeleteShader");
-    resolveWinGl(gl_.ShaderSource, "glShaderSource");
-    resolveWinGl(gl_.CompileShader, "glCompileShader");
-    resolveWinGl(gl_.GetShaderiv, "glGetShaderiv");
-    resolveWinGl(gl_.GetShaderInfoLog, "glGetShaderInfoLog");
-    resolveWinGl(gl_.CreateProgram, "glCreateProgram");
-    resolveWinGl(gl_.DeleteProgram, "glDeleteProgram");
-    resolveWinGl(gl_.AttachShader, "glAttachShader");
-    resolveWinGl(gl_.LinkProgram, "glLinkProgram");
-    resolveWinGl(gl_.GetProgramiv, "glGetProgramiv");
-    resolveWinGl(gl_.GetProgramInfoLog, "glGetProgramInfoLog");
-    resolveWinGl(gl_.UseProgram, "glUseProgram");
-    resolveWinGl(gl_.GetUniformLocation, "glGetUniformLocation");
-    resolveWinGl(gl_.Uniform1i, "glUniform1i");
-    resolveWinGl(gl_.Uniform2f, "glUniform2f");
-    resolveWinGl(gl_.GenTextures, "glGenTextures");
-    resolveWinGl(gl_.DeleteTextures, "glDeleteTextures");
-    resolveWinGl(gl_.ActiveTexture, "glActiveTexture");
-    resolveWinGl(gl_.BindTexture, "glBindTexture");
-    resolveWinGl(gl_.TexImage2D, "glTexImage2D");
-    resolveWinGl(gl_.TexSubImage2D, "glTexSubImage2D");
-    resolveWinGl(gl_.TexParameteri, "glTexParameteri");
-    resolveWinGl(gl_.PixelStorei, "glPixelStorei");
-    resolveWinGl(gl_.DrawElements, "glDrawElements");
-    resolveWinGl(gl_.ReadPixels, "glReadPixels");
-    resolveWinGl(gl_.GetError, "glGetError");
-    resolveWinGl(gl_.GetString, "glGetString");
-
-    if (!gl_.IsComplete()) {
-        diagnostics_ = "Failed to resolve all required OpenGL 3.3 Core entry points via WGL.";
-        return false;
-    }
-    return true;
-
-#elif defined(__linux__)
-    dynGlLibHandle_ = dlopen("libGL.so.1", RTLD_LAZY | RTLD_LOCAL);
-    if (!dynGlLibHandle_) {
-        dynGlLibHandle_ = dlopen("libGL.so", RTLD_LAZY | RTLD_LOCAL);
-    }
-    dynEglLibHandle_ = dlopen("libEGL.so.1", RTLD_LAZY | RTLD_LOCAL);
-    if (!dynEglLibHandle_) {
-        dynEglLibHandle_ = dlopen("libEGL.so", RTLD_LAZY | RTLD_LOCAL);
-    }
-    dynGlesLibHandle_ = dlopen("libGLESv2.so.2", RTLD_LAZY | RTLD_LOCAL);
-
-    if (!dynGlLibHandle_ && !dynEglLibHandle_ && !dynGlesLibHandle_) {
-        diagnostics_ = "dlopen failed for libGL.so.1, libEGL.so.1, and libGLESv2.so.2.";
-        return false;
-    }
-
-    using GlxGetProcFn = void (*(*)(const std::uint8_t*))();
-    using EglGetProcFn = void (*(*)(const char*))();
-    using GetCurCtxFn = void* (*)();
-
-    GlxGetProcFn glxGetProc = nullptr;
-    GetCurCtxFn glxGetCur = nullptr;
-    if (dynGlLibHandle_) {
-        AssignRawProc(glxGetProc, dlsym(dynGlLibHandle_, "glXGetProcAddressARB"));
-        if (!glxGetProc) {
-            AssignRawProc(glxGetProc, dlsym(dynGlLibHandle_, "glXGetProcAddress"));
-        }
-        AssignRawProc(glxGetCur, dlsym(dynGlLibHandle_, "glXGetCurrentContext"));
-    }
-
-    EglGetProcFn eglGetProc = nullptr;
-    GetCurCtxFn eglGetCur = nullptr;
-    if (dynEglLibHandle_) {
-        AssignRawProc(eglGetProc, dlsym(dynEglLibHandle_, "eglGetProcAddress"));
-        AssignRawProc(eglGetCur, dlsym(dynEglLibHandle_, "eglGetCurrentContext"));
-    }
-
-    const bool hasCtx =
-        (glxGetCur && glxGetCur() != nullptr) ||
-        (eglGetCur && eglGetCur() != nullptr);
-    if (!hasCtx) {
+#else
         diagnostics_ = "OpenGL dynamic libraries loaded, but no active GLX/EGL context is bound on this thread.";
+#endif
         return false;
     }
 
-    auto resolvePosixGl = [&](auto& outFn, const char* name) noexcept {
-        void* sym = nullptr;
-        if (dynGlLibHandle_) {
-            sym = dlsym(dynGlLibHandle_, name);
-        }
-        if (!sym && dynGlesLibHandle_) {
-            sym = dlsym(dynGlesLibHandle_, name);
-        }
-        if (!sym && glxGetProc) {
-            auto fn = glxGetProc(reinterpret_cast<const std::uint8_t*>(name));
-            AssignRawProc(sym, reinterpret_cast<void*>(fn));
-        }
-        if (!sym && eglGetProc) {
-            auto fn = eglGetProc(name);
-            AssignRawProc(sym, reinterpret_cast<void*>(fn));
-        }
-        AssignRawProc(outFn, sym);
-    };
-
-    resolvePosixGl(gl_.Viewport, "glViewport");
-    resolvePosixGl(gl_.Scissor, "glScissor");
-    resolvePosixGl(gl_.Enable, "glEnable");
-    resolvePosixGl(gl_.Disable, "glDisable");
-    resolvePosixGl(gl_.BlendFuncSeparate, "glBlendFuncSeparate");
-    resolvePosixGl(gl_.ClearColor, "glClearColor");
-    resolvePosixGl(gl_.Clear, "glClear");
-    resolvePosixGl(gl_.GenBuffers, "glGenBuffers");
-    resolvePosixGl(gl_.DeleteBuffers, "glDeleteBuffers");
-    resolvePosixGl(gl_.BindBuffer, "glBindBuffer");
-    resolvePosixGl(gl_.BufferData, "glBufferData");
-    resolvePosixGl(gl_.BufferSubData, "glBufferSubData");
-    resolvePosixGl(gl_.GenVertexArrays, "glGenVertexArrays");
-    resolvePosixGl(gl_.DeleteVertexArrays, "glDeleteVertexArrays");
-    resolvePosixGl(gl_.BindVertexArray, "glBindVertexArray");
-    resolvePosixGl(gl_.EnableVertexAttribArray, "glEnableVertexAttribArray");
-    resolvePosixGl(gl_.VertexAttribPointer, "glVertexAttribPointer");
-    resolvePosixGl(gl_.VertexAttribIPointer, "glVertexAttribIPointer");
-    resolvePosixGl(gl_.CreateShader, "glCreateShader");
-    resolvePosixGl(gl_.DeleteShader, "glDeleteShader");
-    resolvePosixGl(gl_.ShaderSource, "glShaderSource");
-    resolvePosixGl(gl_.CompileShader, "glCompileShader");
-    resolvePosixGl(gl_.GetShaderiv, "glGetShaderiv");
-    resolvePosixGl(gl_.GetShaderInfoLog, "glGetShaderInfoLog");
-    resolvePosixGl(gl_.CreateProgram, "glCreateProgram");
-    resolvePosixGl(gl_.DeleteProgram, "glDeleteProgram");
-    resolvePosixGl(gl_.AttachShader, "glAttachShader");
-    resolvePosixGl(gl_.LinkProgram, "glLinkProgram");
-    resolvePosixGl(gl_.GetProgramiv, "glGetProgramiv");
-    resolvePosixGl(gl_.GetProgramInfoLog, "glGetProgramInfoLog");
-    resolvePosixGl(gl_.UseProgram, "glUseProgram");
-    resolvePosixGl(gl_.GetUniformLocation, "glGetUniformLocation");
-    resolvePosixGl(gl_.Uniform1i, "glUniform1i");
-    resolvePosixGl(gl_.Uniform2f, "glUniform2f");
-    resolvePosixGl(gl_.GenTextures, "glGenTextures");
-    resolvePosixGl(gl_.DeleteTextures, "glDeleteTextures");
-    resolvePosixGl(gl_.ActiveTexture, "glActiveTexture");
-    resolvePosixGl(gl_.BindTexture, "glBindTexture");
-    resolvePosixGl(gl_.TexImage2D, "glTexImage2D");
-    resolvePosixGl(gl_.TexSubImage2D, "glTexSubImage2D");
-    resolvePosixGl(gl_.TexParameteri, "glTexParameteri");
-    resolvePosixGl(gl_.PixelStorei, "glPixelStorei");
-    resolvePosixGl(gl_.DrawElements, "glDrawElements");
-    resolvePosixGl(gl_.ReadPixels, "glReadPixels");
-    resolvePosixGl(gl_.GetError, "glGetError");
-    resolvePosixGl(gl_.GetString, "glGetString");
-
+    DynamicGlLibrarySession lookupSession{};
+    lookupSession.glHandle = dynGlLibHandle_;
+    lookupSession.eglHandle = dynEglLibHandle_;
+    lookupSession.glesHandle = dynGlesLibHandle_;
+    lookupSession.wglGetProc = session.wglGetProc;
+#if defined(__linux__) && !defined(__EMSCRIPTEN__)
+    lookupSession.glxGetProc = session.glxGetProc;
+    lookupSession.eglGetProc = session.eglGetProc;
+#endif
+    PopulateGlFunctionTableFromSession(lookupSession, gl_);
     if (!gl_.IsComplete()) {
-        diagnostics_ = "Failed to resolve complete GL 3.3 / GLES3 symbol table via dlopen.";
+        diagnostics_ = "Failed to resolve complete OpenGL 3.3 / GLES3 symbol table.";
         return false;
     }
     return true;
@@ -1150,7 +1279,46 @@ bool OpenGlDeviceBackend::Initialize(const GpuBackendConfig& config) {
     return true;
 }
 
+void OpenGlDeviceBackend::DestroyEffectGpuResources() noexcept {
+    if (gl_.DeleteFramebuffers) {
+        for (AeroGLuint& fboId : effectFboIds_) {
+            if (fboId != 0u) {
+                gl_.DeleteFramebuffers(1, &fboId);
+                fboId = 0u;
+            }
+        }
+    } else {
+        effectFboIds_[0] = 0u;
+        effectFboIds_[1] = 0u;
+    }
+    if (gl_.DeleteTextures) {
+        for (AeroGLuint& texId : effectFboTexIds_) {
+            if (texId != 0u) {
+                gl_.DeleteTextures(1, &texId);
+                texId = 0u;
+            }
+        }
+    } else {
+        effectFboTexIds_[0] = 0u;
+        effectFboTexIds_[1] = 0u;
+    }
+    if (gl_.DeleteProgram && effectProgramId_ != 0u) {
+        gl_.DeleteProgram(effectProgramId_);
+    }
+    effectProgramId_ = 0u;
+    effectFboW_ = 0u;
+    effectFboH_ = 0u;
+    uEffectViewportSizeLoc_ = -1;
+    uEffectSrcTexLoc_ = -1;
+    uEffectTexelSizeLoc_ = -1;
+    uEffectModeLoc_ = -1;
+    uEffectParamsLoc_ = -1;
+    uEffectUvMinLoc_ = -1;
+    uEffectUvMaxLoc_ = -1;
+}
+
 void OpenGlDeviceBackend::Shutdown() noexcept {
+    DestroyEffectGpuResources();
     if (gl_.IsComplete()) {
         for (const GlImageSlotState& slot : imageSlotTextures_) {
             if (slot.texId != 0u) {
@@ -1189,6 +1357,7 @@ void OpenGlDeviceBackend::Shutdown() noexcept {
     effectQuadVboId_ = 0u;
     effectScratchTexW_ = 0u;
     effectScratchTexH_ = 0u;
+    effectGpuPipelineFailed_ = false;
     quadEboId_ = 0u;
     ringVboId_ = 0u;
     vaoId_ = 0u;
@@ -1242,9 +1411,12 @@ void OpenGlDeviceBackend::Shutdown() noexcept {
     }
 }
 
-bool OpenGlDeviceBackend::CompileAndLinkUberShader(
+bool OpenGlDeviceBackend::CompileShaderProgramInternal(
     std::string_view vertexShaderSrc,
-    std::string_view pixelShaderSrc) {
+    std::string_view pixelShaderSrc,
+    const char* shaderLabelPrefix,
+    AeroGLuint& outProgramId) {
+    outProgramId = 0u;
     if (!gl_.IsComplete()) {
         diagnostics_ = "Cannot compile shader: GL function table is incomplete.";
         return false;
@@ -1254,10 +1426,10 @@ bool OpenGlDeviceBackend::CompileAndLinkUberShader(
         return false;
     }
 
-    auto compileStage = [&](AeroGLenum stageType, std::string_view src, const char* stageLabel, AeroGLuint& outShader) -> bool {
+    auto compileStage = [&](AeroGLenum stageType, std::string_view src, const char* stageSuffix, AeroGLuint& outShader) -> bool {
         const AeroGLuint sh = gl_.CreateShader(stageType);
         if (sh == 0u) {
-            diagnostics_ = std::string("glCreateShader failed for ") + stageLabel;
+            diagnostics_ = std::string("glCreateShader failed for ") + shaderLabelPrefix + stageSuffix;
             return false;
         }
         const AeroGLchar* srcPtr = src.data();
@@ -1274,7 +1446,7 @@ bool OpenGlDeviceBackend::CompileAndLinkUberShader(
             AeroGLsizei written = 0;
             gl_.GetShaderInfoLog(sh, static_cast<AeroGLsizei>(infoLog.size()), &written, infoLog.data());
             infoLog.resize(static_cast<std::size_t>(std::max<AeroGLsizei>(0, written)));
-            diagnostics_ = std::string(stageLabel) + " compile error: " + infoLog;
+            diagnostics_ = std::string(shaderLabelPrefix) + stageSuffix + " compile error: " + infoLog;
             gl_.DeleteShader(sh);
             return false;
         }
@@ -1283,12 +1455,12 @@ bool OpenGlDeviceBackend::CompileAndLinkUberShader(
     };
 
     AeroGLuint vs = 0u;
-    if (!compileStage(kGlVertexShader, vertexShaderSrc, "UberVertexShader", vs)) {
+    if (!compileStage(kGlVertexShader, vertexShaderSrc, "VertexShader", vs)) {
         return false;
     }
 
     AeroGLuint fs = 0u;
-    if (!compileStage(kGlFragmentShader, pixelShaderSrc, "UberPixelShader", fs)) {
+    if (!compileStage(kGlFragmentShader, pixelShaderSrc, "PixelShader", fs)) {
         gl_.DeleteShader(vs);
         return false;
     }
@@ -1316,8 +1488,20 @@ bool OpenGlDeviceBackend::CompileAndLinkUberShader(
         AeroGLsizei written = 0;
         gl_.GetProgramInfoLog(prog, static_cast<AeroGLsizei>(infoLog.size()), &written, infoLog.data());
         infoLog.resize(static_cast<std::size_t>(std::max<AeroGLsizei>(0, written)));
-        diagnostics_ = "UberShader program link error: " + infoLog;
+        diagnostics_ = std::string(shaderLabelPrefix) + " program link error: " + infoLog;
         gl_.DeleteProgram(prog);
+        return false;
+    }
+
+    outProgramId = prog;
+    return true;
+}
+
+bool OpenGlDeviceBackend::CompileAndLinkUberShader(
+    std::string_view vertexShaderSrc,
+    std::string_view pixelShaderSrc) {
+    AeroGLuint prog = 0u;
+    if (!CompileShaderProgramInternal(vertexShaderSrc, pixelShaderSrc, "Uber", prog)) {
         return false;
     }
 
@@ -1337,6 +1521,98 @@ bool OpenGlDeviceBackend::CompileAndLinkUberShader(
         gl_.Uniform1i(uImageSamplerLoc_, 1);
     }
     diagnostics_ = "UberShader compiled and linked cleanly.";
+    return true;
+}
+
+bool OpenGlDeviceBackend::EnsureEffectGpuResources(
+    std::uint32_t viewportWidth,
+    std::uint32_t viewportHeight) {
+    if (!initialized_ || !gl_.IsComplete() || !gl_.HasFramebufferSupport() ||
+        effectGpuPipelineFailed_ || viewportWidth == 0u || viewportHeight == 0u) {
+        return false;
+    }
+
+    if (effectProgramId_ == 0u) {
+        const std::string vsSrc = BuildEffectShaderSource(shaderBackend_, kEffectVertexShaderBodyGlsl);
+        const std::string psSrc = BuildEffectShaderSource(shaderBackend_, kEffectPixelShaderBodyGlsl);
+        AeroGLuint prog = 0u;
+        if (!CompileShaderProgramInternal(vsSrc, psSrc, "EffectFbo", prog)) {
+            effectGpuPipelineFailed_ = true;
+            return false;
+        }
+        effectProgramId_ = prog;
+        uEffectViewportSizeLoc_ = gl_.GetUniformLocation(effectProgramId_, "u_ViewportSize");
+        uEffectSrcTexLoc_ = gl_.GetUniformLocation(effectProgramId_, "u_SrcTex");
+        uEffectTexelSizeLoc_ = gl_.GetUniformLocation(effectProgramId_, "u_TexelSize");
+        uEffectModeLoc_ = gl_.GetUniformLocation(effectProgramId_, "u_EffectMode");
+        uEffectParamsLoc_ = gl_.GetUniformLocation(effectProgramId_, "u_EffectParams");
+        uEffectUvMinLoc_ = gl_.GetUniformLocation(effectProgramId_, "u_EffectUvMin");
+        uEffectUvMaxLoc_ = gl_.GetUniformLocation(effectProgramId_, "u_EffectUvMax");
+    }
+
+    if (effectQuadVboId_ == 0u) {
+        gl_.GenBuffers(1, &effectQuadVboId_);
+        if (effectQuadVboId_ == 0u) {
+            return false;
+        }
+        gl_.BindBuffer(kGlArrayBuffer, effectQuadVboId_);
+        gl_.BufferData(
+            kGlArrayBuffer,
+            static_cast<AeroGLsizeiptr>(4u * sizeof(AeroVertex)),
+            nullptr,
+            kGlDynamicDraw);
+    }
+
+    if (effectFboIds_[0] == 0u || effectFboIds_[1] == 0u) {
+        gl_.GenFramebuffers(2, effectFboIds_);
+        gl_.GenTextures(2, effectFboTexIds_);
+        if (effectFboIds_[0] == 0u || effectFboIds_[1] == 0u ||
+            effectFboTexIds_[0] == 0u || effectFboTexIds_[1] == 0u) {
+            DestroyEffectGpuResources();
+            return false;
+        }
+        effectFboW_ = 0u;
+        effectFboH_ = 0u;
+    }
+
+    if (effectFboW_ != viewportWidth || effectFboH_ != viewportHeight) {
+        gl_.ActiveTexture(kGlTexture0);
+        for (int i = 0; i < 2; ++i) {
+            gl_.BindTexture(kGlTexture2D, effectFboTexIds_[i]);
+            gl_.TexParameteri(kGlTexture2D, kGlTextureMinFilter, static_cast<AeroGLint>(kGlLinear));
+            gl_.TexParameteri(kGlTexture2D, kGlTextureMagFilter, static_cast<AeroGLint>(kGlLinear));
+            gl_.TexParameteri(kGlTexture2D, kGlTextureWrapS, static_cast<AeroGLint>(kGlClampToEdge));
+            gl_.TexParameteri(kGlTexture2D, kGlTextureWrapT, static_cast<AeroGLint>(kGlClampToEdge));
+            gl_.TexImage2D(
+                kGlTexture2D,
+                0,
+                static_cast<AeroGLint>(kGlRgba8),
+                static_cast<AeroGLsizei>(viewportWidth),
+                static_cast<AeroGLsizei>(viewportHeight),
+                0,
+                kGlRgba,
+                kGlUnsignedByte,
+                nullptr);
+            gl_.BindFramebuffer(kGlFramebuffer, effectFboIds_[i]);
+            gl_.FramebufferTexture2D(
+                kGlFramebuffer,
+                kGlColorAttachment0,
+                kGlTexture2D,
+                effectFboTexIds_[i],
+                0);
+            if (gl_.CheckFramebufferStatus(kGlFramebuffer) != kGlFramebufferComplete) {
+                gl_.BindFramebuffer(kGlFramebuffer, 0u);
+                DestroyEffectGpuResources();
+                effectGpuPipelineFailed_ = true;
+                return false;
+            }
+        }
+        gl_.BindFramebuffer(kGlFramebuffer, 0u);
+        gl_.BindTexture(kGlTexture2D, atlasTextureId_);
+        effectFboW_ = viewportWidth;
+        effectFboH_ = viewportHeight;
+    }
+
     return true;
 }
 
@@ -1514,12 +1790,15 @@ void OpenGlDeviceBackend::SyncUnifiedUiAtlas(const PagedRenderTree& tree) {
         return;
     }
 
+    const FontAtlas& fontAtlas = ResolveFontAtlas(&tree);
+    const GradientBrushRegistry& gradReg = ResolveGradientRegistry(&tree);
+
     if (!syncedUiAtlasReady_ ||
         atlasTextureId_ == 0u ||
         atlasWidth_ != kUnifiedUiAtlasSize ||
         atlasHeight_ != kUnifiedUiAtlasSize) {
-        const std::uint64_t fontRev = FontAtlas::Instance().Revision();
-        const std::uint32_t gradRev = GradientBrushRegistry::Instance().Revision();
+        const std::uint64_t fontRev = fontAtlas.Revision();
+        const std::uint32_t gradRev = gradReg.Revision();
         std::uint32_t lowestGradRow = kUnifiedUiAtlasSize - 1u;
         BuildUnifiedUiAtlas1024(tree, uiAtlasScratchRgba8_, &lowestGradRow);
         if (UploadAtlasTexture(kUnifiedUiAtlasSize, kUnifiedUiAtlasSize, uiAtlasScratchRgba8_.data())) {
@@ -1535,12 +1814,12 @@ void OpenGlDeviceBackend::SyncUnifiedUiAtlas(const PagedRenderTree& tree) {
     }
 
     // 1. Incremental FontAtlas SDF glyph band sync [y: 0..511]
-    const std::uint64_t curFontRev = FontAtlas::Instance().Revision();
+    const std::uint64_t curFontRev = fontAtlas.Revision();
     if (curFontRev != syncedFontRevision_) {
         std::uint32_t fontW = 0u;
         std::uint32_t fontRows = 0u;
         std::uint64_t snapRev = curFontRev;
-        FontAtlas::Instance().CopyGlyphRegionRgba8(512u, uiAtlasScratchRgba8_, fontW, fontRows, &snapRev);
+        fontAtlas.CopyGlyphRegionRgba8(512u, uiAtlasScratchRgba8_, fontW, fontRows, &snapRev);
         if (fontW == kUnifiedUiAtlasSize && fontRows > 0u) {
             (void)UpdateAtlasSubRegion(
                 0u,
@@ -1585,10 +1864,10 @@ void OpenGlDeviceBackend::SyncUnifiedUiAtlas(const PagedRenderTree& tree) {
     }
 
     // 3. Incremental GradientBrushRegistry LUT & float32 metadata band sync [y: minAllowedRow..1023]
-    const std::uint32_t curGradRev = GradientBrushRegistry::Instance().Revision();
+    const std::uint32_t curGradRev = gradReg.Revision();
     if (curGradRev != syncedGradientRevision_) {
         const std::uint32_t minAllowedRow = 512u + syncedMtsdfRows_;
-        const std::size_t brushCount = GradientBrushRegistry::Instance().BrushCount();
+        const std::size_t brushCount = gradReg.BrushCount();
         std::uint32_t estMinRow = kUnifiedUiAtlasSize - 1u;
         if (brushCount > 0u) {
             const std::uint32_t maxFitBrushes =
@@ -1606,6 +1885,7 @@ void OpenGlDeviceBackend::SyncUnifiedUiAtlas(const PagedRenderTree& tree) {
         uiAtlasScratchRgba8_.assign(static_cast<std::size_t>(subRows) * kUnifiedUiAtlasSize * 4u, 0u);
         std::uint32_t newLowestRow = kUnifiedUiAtlasSize - 1u;
         BakeGradientRowsIntoBuffer(
+            gradReg,
             kUnifiedUiAtlasSize,
             subStartY,
             subRows,
@@ -1648,13 +1928,18 @@ AeroGLuint OpenGlDeviceBackend::EnsureFallbackWhiteTexture() {
     return fallbackWhiteTexId_;
 }
 
-AeroGLuint OpenGlDeviceBackend::ResolveBatchImageTexture(std::uint32_t textureId) {
+AeroGLuint OpenGlDeviceBackend::ResolveBatchImageTexture(
+    std::uint32_t textureId,
+    const UIResourceStore* optStore) {
     const AeroGLuint fallbackTex = EnsureFallbackWhiteTexture();
     if (!gl_.IsComplete() || textureId > 16384u) {
         return fallbackTex != 0u ? fallbackTex : atlasTextureId_;
     }
 
-    const std::uint64_t globalRev = ImageAtlas::Instance().Revision();
+    const ImageAtlas& imageAtlas = (optStore != nullptr && optStore->TryImages() != nullptr)
+        ? *optStore->TryImages()
+        : ImageAtlas::Instance();
+    const std::uint64_t globalRev = imageAtlas.Revision();
     if (textureId < imageSlotTextures_.size()) {
         const GlImageSlotState& cached = imageSlotTextures_[textureId];
         if (cached.texId != 0u && cached.lastGlobalRevision == globalRev) {
@@ -1662,7 +1947,7 @@ AeroGLuint OpenGlDeviceBackend::ResolveBatchImageTexture(std::uint32_t textureId
         }
     }
 
-    if (!ImageAtlas::Instance().HasTextureSlot(textureId)) {
+    if (!imageAtlas.HasTextureSlot(textureId)) {
         return fallbackTex != 0u ? fallbackTex : atlasTextureId_;
     }
 
@@ -1673,7 +1958,7 @@ AeroGLuint OpenGlDeviceBackend::ResolveBatchImageTexture(std::uint32_t textureId
     std::uint32_t slotW = 0u;
     std::uint32_t slotH = 0u;
     bool wasUpdated = false;
-    if (!ImageAtlas::Instance().CopyTextureSlotIfModified(
+    if (!imageAtlas.CopyTextureSlotIfModified(
             textureId,
             slot.slotRevision,
             slotW,
@@ -1690,7 +1975,7 @@ AeroGLuint OpenGlDeviceBackend::ResolveBatchImageTexture(std::uint32_t textureId
     if (needsAlloc && !wasUpdated) {
         // Re-fetch full pixel buffer if GL texture handle was recreated after Shutdown/Initialize
         slot.slotRevision = 0u;
-        if (!ImageAtlas::Instance().CopyTextureSlotIfModified(
+        if (!imageAtlas.CopyTextureSlotIfModified(
                 textureId,
                 slot.slotRevision,
                 slotW,
@@ -1891,7 +2176,7 @@ GpuBackendFrameStats OpenGlDeviceBackend::ExecuteSubmission(
     }
 
     std::uint32_t boundBatchTextureId = 0u;
-    AeroGLuint boundUnit1Tex = ResolveBatchImageTexture(0u);
+    AeroGLuint boundUnit1Tex = ResolveBatchImageTexture(0u, tree.ResourceStore());
     gl_.ActiveTexture(kGlTexture1);
     gl_.BindTexture(kGlTexture2D, boundUnit1Tex);
     if (uImageSamplerLoc_ >= 0) {
@@ -1939,7 +2224,7 @@ GpuBackendFrameStats OpenGlDeviceBackend::ExecuteSubmission(
             setGlBlendMode(batch.blendMode);
 
             if (batch.textureId != boundBatchTextureId) {
-                const AeroGLuint nextTex = ResolveBatchImageTexture(batch.textureId);
+                const AeroGLuint nextTex = ResolveBatchImageTexture(batch.textureId, tree.ResourceStore());
                 if (nextTex != boundUnit1Tex) {
                     gl_.ActiveTexture(kGlTexture1);
                     gl_.BindTexture(kGlTexture2D, nextTex);
@@ -2000,7 +2285,7 @@ GpuBackendFrameStats OpenGlDeviceBackend::ExecuteSubmission(
 
             const std::uint32_t texId = hdr.reserved[0];
             if (texId != boundBatchTextureId) {
-                const AeroGLuint nextTex = ResolveBatchImageTexture(texId);
+                const AeroGLuint nextTex = ResolveBatchImageTexture(texId, tree.ResourceStore());
                 if (nextTex != boundUnit1Tex) {
                     gl_.ActiveTexture(kGlTexture1);
                     gl_.BindTexture(kGlTexture2D, nextTex);
@@ -2080,6 +2365,17 @@ GpuBackendFrameStats OpenGlDeviceBackend::ExecuteSubmission(
             if (hasPending) {
                 flushPageQuadSubBatch(pendingPage, pendingQuadStart, pendingQuadCount);
             }
+        };
+
+        auto bindEffectQuadVboAttribs = [&]() noexcept {
+            gl_.BindVertexArray(vaoId_);
+            gl_.BindBuffer(kGlArrayBuffer, effectQuadVboId_);
+            constexpr auto kStride = static_cast<AeroGLsizei>(sizeof(AeroVertex));
+            gl_.VertexAttribPointer(0u, 2, kGlFloat, 0u, kStride, reinterpret_cast<const void*>(std::uintptr_t{0}));
+            gl_.VertexAttribPointer(1u, 2, kGlFloat, 0u, kStride, reinterpret_cast<const void*>(std::uintptr_t{8}));
+            gl_.VertexAttribIPointer(2u, 1, kGlUnsignedInt, kStride, reinterpret_cast<const void*>(std::uintptr_t{16}));
+            gl_.VertexAttribIPointer(3u, 1, kGlUnsignedInt, kStride, reinterpret_cast<const void*>(std::uintptr_t{20}));
+            gl_.BindBuffer(kGlElementArrayBuffer, quadEboId_);
         };
 
         auto drawPremulEffectPatch = [&](int patchX, int patchY, int patchW, int patchH, const std::uint8_t* premulRgba8) {
@@ -2162,21 +2458,12 @@ GpuBackendFrameStats OpenGlDeviceBackend::ExecuteSubmission(
                 {x0, y1, 0.0f, 1.0f, 0xFFFFFFFFu, prim, AeroVertexFlag_PremultipliedAlpha},
             };
 
-            gl_.BindVertexArray(vaoId_);
-            gl_.BindBuffer(kGlArrayBuffer, effectQuadVboId_);
+            bindEffectQuadVboAttribs();
             gl_.BufferSubData(
                 kGlArrayBuffer,
                 0,
                 static_cast<AeroGLsizeiptr>(sizeof(quadVerts)),
                 quadVerts);
-
-            constexpr auto kStride = static_cast<AeroGLsizei>(sizeof(AeroVertex));
-            gl_.VertexAttribPointer(0u, 2, kGlFloat, 0u, kStride, reinterpret_cast<const void*>(std::uintptr_t{0}));
-            gl_.VertexAttribPointer(1u, 2, kGlFloat, 0u, kStride, reinterpret_cast<const void*>(std::uintptr_t{8}));
-            gl_.VertexAttribIPointer(2u, 1, kGlUnsignedInt, kStride, reinterpret_cast<const void*>(std::uintptr_t{16}));
-            gl_.VertexAttribIPointer(3u, 1, kGlUnsignedInt, kStride, reinterpret_cast<const void*>(std::uintptr_t{20}));
-
-            gl_.BindBuffer(kGlElementArrayBuffer, quadEboId_);
             gl_.DrawElements(kGlTriangles, 6, kGlUnsignedInt, nullptr);
 
             BindAeroVertexLayout();
@@ -2188,29 +2475,246 @@ GpuBackendFrameStats OpenGlDeviceBackend::ExecuteSubmission(
             stats.trianglesSubmitted += 2u;
         };
 
-        auto spanHasActiveEffect = [](const BlurLayerSpan& span) noexcept -> bool {
-            switch (span.effectMode) {
-                case UIEffectKind::Blur:
-                case UIEffectKind::DirectionalBlur:
-                    return std::isfinite(span.radiusPx) && span.radiusPx > 0.25f;
-                case UIEffectKind::Pixelate:
-                    return std::isfinite(span.radiusPx) && span.radiusPx >= 1.5f;
-                case UIEffectKind::Tint:
-                    return true;
-                case UIEffectKind::ChromaticAberration:
-                    return std::isfinite(span.amountX) && std::fabs(span.amountX) > 0.01f;
-                case UIEffectKind::Saturation:
-                    return std::isfinite(span.saturation) && std::fabs(span.saturation - 1.0f) > 0.001f;
-                case UIEffectKind::BackdropBlur:
-                    return (std::isfinite(span.radiusPx) && span.radiusPx > 0.25f) ||
-                           (std::isfinite(span.saturation) && std::fabs(span.saturation - 1.0f) > 0.001f);
-                default:
-                    return false;
+        const auto& blurSpans = tree.BlurLayerSpans();
+        const int vpW = static_cast<int>(std::min<std::uint32_t>(viewportWidth, 0x3FFFFFFFu));
+        const int vpH = static_cast<int>(std::min<std::uint32_t>(viewportHeight, 0x3FFFFFFFu));
+
+        auto executeBlurSpanViaFbo = [&](const BlurLayerSpan& span, std::size_t nextBlurCursor) -> bool {
+            if (!gl_.HasFramebufferSupport() || effectGpuPipelineFailed_) {
+                return false;
             }
+            for (std::size_t k = nextBlurCursor; k < blurSpans.size(); ++k) {
+                if (blurSpans[k].firstNodeId >= span.endNodeId) {
+                    break;
+                }
+                if (aero::render::detail::SpanNeedsEffectPass(blurSpans[k])) {
+                    return false;
+                }
+            }
+            float uMinX = 0.0f, uMinY = 0.0f, uMaxX = 0.0f, uMaxY = 0.0f;
+            if (!aero::render::detail::ComputeNodeRangeScreenBounds(
+                    tree, span.firstNodeId, span.endNodeId, uMinX, uMinY, uMaxX, uMaxY)) {
+                return true;
+            }
+            const int padPx = aero::render::detail::ComputeSpanPaddingPx(span);
+            const int bx0 = std::clamp(
+                aero::render::detail::SafeFloorToInt(uMinX, -padPx, vpW + padPx) - padPx, 0, vpW);
+            const int by0 = std::clamp(
+                aero::render::detail::SafeFloorToInt(uMinY, -padPx, vpH + padPx) - padPx, 0, vpH);
+            const int bx1 = std::clamp(
+                aero::render::detail::SafeCeilToInt(uMaxX, -padPx, vpW + padPx) + padPx, 0, vpW);
+            const int by1 = std::clamp(
+                aero::render::detail::SafeCeilToInt(uMaxY, -padPx, vpH + padPx) + padPx, 0, vpH);
+            if (bx1 <= bx0 || by1 <= by0) {
+                return true;
+            }
+            if (!EnsureEffectGpuResources(viewportWidth, viewportHeight) || !EnsureQuadIndexCapacity(1u)) {
+                return false;
+            }
+
+            // 1. Render child span subtree directly into offscreen FBO #0 using main UberShader
+            const int bw = bx1 - bx0;
+            const int bh = by1 - by0;
+            gl_.BindFramebuffer(kGlFramebuffer, effectFboIds_[0]);
+            gl_.Enable(kGlScissorTest);
+            scissorCurrentlyEnabled = true;
+            gl_.Scissor(
+                static_cast<AeroGLint>(bx0),
+                static_cast<AeroGLint>(vpH - by1),
+                static_cast<AeroGLsizei>(bw),
+                static_cast<AeroGLsizei>(bh));
+            gl_.ClearColor(0.0f, 0.0f, 0.0f, 0.0f);
+            gl_.Clear(kGlColorBufferBit);
+            gl_.Disable(kGlScissorTest);
+            scissorCurrentlyEnabled = false;
+            setGlBlendMode(BlendingMode::Normal);
+            flushNodeRange(span.firstNodeId, span.endNodeId);
+
+            // 2. Post-process via FBO effect shader and composite back to default FBO (0)
+            const float fVpW = static_cast<float>(vpW);
+            const float fVpH = static_cast<float>(vpH);
+            const float u0 = static_cast<float>(bx0) / fVpW;
+            const float u1 = static_cast<float>(bx1) / fVpW;
+            const float vTop = 1.0f - static_cast<float>(by0) / fVpH;
+            const float vBot = 1.0f - static_cast<float>(by1) / fVpH;
+            const float uvMinX = (static_cast<float>(bx0) + 0.5f) / fVpW;
+            const float uvMaxX = std::max(uvMinX, (static_cast<float>(bx1) - 0.5f) / fVpW);
+            const float uvMinY = 1.0f - (static_cast<float>(by1) - 0.5f) / fVpH;
+            const float uvMaxY = std::max(uvMinY, 1.0f - (static_cast<float>(by0) + 0.5f) / fVpH);
+
+            gl_.UseProgram(effectProgramId_);
+            if (uEffectViewportSizeLoc_ >= 0) {
+                gl_.Uniform2f(uEffectViewportSizeLoc_, fVpW, fVpH);
+            }
+            if (uEffectSrcTexLoc_ >= 0) {
+                gl_.Uniform1i(uEffectSrcTexLoc_, 0);
+            }
+            if (uEffectUvMinLoc_ >= 0) {
+                gl_.Uniform2f(uEffectUvMinLoc_, uvMinX, uvMinY);
+            }
+            if (uEffectUvMaxLoc_ >= 0) {
+                gl_.Uniform2f(uEffectUvMaxLoc_, uvMaxX, uvMaxY);
+            }
+
+            auto issueEffectPass = [&](
+                AeroGLuint targetFbo,
+                AeroGLint mode,
+                AeroGLuint srcTexId,
+                float texelX,
+                float texelY,
+                float paramX,
+                float paramY,
+                std::uint32_t packedColor,
+                bool enableBlend,
+                bool applyClipScissor) {
+                gl_.BindFramebuffer(kGlFramebuffer, targetFbo);
+                if (enableBlend) {
+                    gl_.Enable(kGlBlend);
+                    gl_.BlendFuncSeparate(kGlOne, kGlOneMinusSrcAlpha, kGlOne, kGlOneMinusSrcAlpha);
+                    activeGlBlend = BlendingMode::Normal;
+                } else {
+                    gl_.Disable(kGlBlend);
+                }
+                if (applyClipScissor && span.clipActive) {
+                    if (!scissorCurrentlyEnabled) {
+                        gl_.Enable(kGlScissorTest);
+                        scissorCurrentlyEnabled = true;
+                    }
+                    const GlScissorBox sc = ComputeGlScissorBox(span.clipRect, viewportWidth, viewportHeight);
+                    gl_.Scissor(sc.x, sc.y, sc.width, sc.height);
+                } else if (scissorCurrentlyEnabled) {
+                    gl_.Disable(kGlScissorTest);
+                    scissorCurrentlyEnabled = false;
+                }
+
+                gl_.ActiveTexture(kGlTexture0);
+                gl_.BindTexture(kGlTexture2D, srcTexId);
+                if (uEffectModeLoc_ >= 0) {
+                    gl_.Uniform1i(uEffectModeLoc_, mode);
+                }
+                if (uEffectTexelSizeLoc_ >= 0) {
+                    gl_.Uniform2f(uEffectTexelSizeLoc_, texelX, texelY);
+                }
+                if (uEffectParamsLoc_ >= 0) {
+                    gl_.Uniform2f(uEffectParamsLoc_, paramX, paramY);
+                }
+
+                const float fx0 = static_cast<float>(bx0);
+                const float fy0 = static_cast<float>(by0);
+                const float fx1 = static_cast<float>(bx1);
+                const float fy1 = static_cast<float>(by1);
+                const auto prim = static_cast<std::uint16_t>(AeroPrimType::TexturedQuad);
+                const AeroVertex quadVerts[4]{
+                    {fx0, fy0, u0, vTop, packedColor, prim, AeroVertexFlag_PremultipliedAlpha},
+                    {fx1, fy0, u1, vTop, packedColor, prim, AeroVertexFlag_PremultipliedAlpha},
+                    {fx1, fy1, u1, vBot, packedColor, prim, AeroVertexFlag_PremultipliedAlpha},
+                    {fx0, fy1, u0, vBot, packedColor, prim, AeroVertexFlag_PremultipliedAlpha},
+                };
+                bindEffectQuadVboAttribs();
+                gl_.BufferSubData(kGlArrayBuffer, 0, static_cast<AeroGLsizeiptr>(sizeof(quadVerts)), quadVerts);
+                gl_.DrawElements(kGlTriangles, 6, kGlUnsignedInt, nullptr);
+
+                stats.clipBatchesProcessed += 1u;
+                stats.drawCallsIssued += 1u;
+                stats.quadsSubmitted += 1u;
+                stats.indicesSubmitted += 6u;
+                stats.trianglesSubmitted += 2u;
+            };
+
+            const float effSpanOpacity = std::clamp(
+                std::isfinite(span.effectOpacity) ? span.effectOpacity : 1.0f, 0.0f, 1.0f);
+            const std::uint32_t opacityColor = PackColorRgba8(Color{1.0f, 1.0f, 1.0f, 1.0f}, effSpanOpacity);
+            constexpr float kDegToRad = 3.14159265358979323846f / 180.0f;
+            const float angRad = (std::isfinite(span.angleDeg) ? span.angleDeg : 0.0f) * kDegToRad;
+            const float invW = 1.0f / fVpW;
+            const float invH = 1.0f / fVpH;
+
+            switch (span.effectMode) {
+                case UIEffectKind::Blur: {
+                    gl_.BindFramebuffer(kGlFramebuffer, effectFboIds_[1]);
+                    gl_.Enable(kGlScissorTest);
+                    scissorCurrentlyEnabled = true;
+                    gl_.Scissor(
+                        static_cast<AeroGLint>(bx0),
+                        static_cast<AeroGLint>(vpH - by1),
+                        static_cast<AeroGLsizei>(bw),
+                        static_cast<AeroGLsizei>(bh));
+                    gl_.ClearColor(0.0f, 0.0f, 0.0f, 0.0f);
+                    gl_.Clear(kGlColorBufferBit);
+                    gl_.Disable(kGlScissorTest);
+                    scissorCurrentlyEnabled = false;
+                    issueEffectPass(effectFboIds_[1], 1, effectFboTexIds_[0], invW, 0.0f, span.radiusPx, 1.0f, 0xFFFFFFFFu, false, false);
+                    issueEffectPass(0u, 1, effectFboTexIds_[1], 0.0f, invH, span.radiusPx, 1.0f, opacityColor, true, true);
+                    break;
+                }
+                case UIEffectKind::DirectionalBlur:
+                    issueEffectPass(
+                        0u,
+                        2,
+                        effectFboTexIds_[0],
+                        std::cos(angRad) * invW,
+                        std::sin(angRad) * invH,
+                        span.radiusPx,
+                        1.0f,
+                        opacityColor,
+                        true,
+                        true);
+                    break;
+                case UIEffectKind::Pixelate:
+                    issueEffectPass(0u, 3, effectFboTexIds_[0], invW, invH, span.radiusPx, 1.0f, opacityColor, true, true);
+                    break;
+                case UIEffectKind::Tint: {
+                    const float tintStrength = std::clamp(
+                        (std::isfinite(span.effectColor.a) ? span.effectColor.a : 1.0f) * effSpanOpacity,
+                        0.0f,
+                        1.0f);
+                    const std::uint32_t tintPacked = PackColorRgba8(
+                        Color{span.effectColor.r, span.effectColor.g, span.effectColor.b, 1.0f},
+                        1.0f);
+                    issueEffectPass(0u, 4, effectFboTexIds_[0], invW, invH, tintStrength, 1.0f, tintPacked, true, true);
+                    break;
+                }
+                case UIEffectKind::ChromaticAberration:
+                    issueEffectPass(
+                        0u,
+                        5,
+                        effectFboTexIds_[0],
+                        std::cos(angRad) * invW,
+                        std::sin(angRad) * invH,
+                        span.amountX,
+                        1.0f,
+                        opacityColor,
+                        true,
+                        true);
+                    break;
+                case UIEffectKind::Saturation:
+                    issueEffectPass(0u, 6, effectFboTexIds_[0], invW, invH, span.saturation, 1.0f, opacityColor, true, true);
+                    break;
+                default:
+                    issueEffectPass(0u, 0, effectFboTexIds_[0], invW, invH, 1.0f, 1.0f, opacityColor, true, true);
+                    break;
+            }
+
+            // 3. Restore primary UberShader + atlas binding + 24B vertex layout on default framebuffer (0)
+            gl_.BindFramebuffer(kGlFramebuffer, 0u);
+            gl_.Enable(kGlBlend);
+            gl_.BlendFuncSeparate(kGlOne, kGlOneMinusSrcAlpha, kGlOne, kGlOneMinusSrcAlpha);
+            activeGlBlend = BlendingMode::Normal;
+            if (scissorCurrentlyEnabled) {
+                gl_.Disable(kGlScissorTest);
+                scissorCurrentlyEnabled = false;
+            }
+            gl_.UseProgram(programId_);
+            gl_.ActiveTexture(kGlTexture0);
+            gl_.BindTexture(kGlTexture2D, atlasTextureId_);
+            boundBatchTextureId = 0xFFFFFFFFu;
+            boundUnit1Tex = 0u;
+            BindAeroVertexLayout();
+            return true;
         };
 
         auto executeBackdropBlurOnGpu = [&](const BlurLayerSpan& span) {
-            if (!gl_.ReadPixels || !spanHasActiveEffect(span)) {
+            if (!gl_.ReadPixels || !aero::render::detail::SpanNeedsEffectPass(span)) {
                 return;
             }
             const Rect mr = span.maskDestRect;
@@ -2219,11 +2723,7 @@ GpuBackendFrameStats OpenGlDeviceBackend::ExecuteSubmission(
                 mr.width <= 1.0f || mr.height <= 1.0f) {
                 return;
             }
-            const int vpW = static_cast<int>(std::min<std::uint32_t>(viewportWidth, 0x3FFFFFFFu));
-            const int vpH = static_cast<int>(std::min<std::uint32_t>(viewportHeight, 0x3FFFFFFFu));
-            const int boxR = (std::isfinite(span.radiusPx) && span.radiusPx > 0.25f)
-                ? std::max(1, static_cast<int>(std::lround(std::clamp(span.radiusPx, 0.5f, 128.0f) * 0.5f)))
-                : 0;
+            const int boxR = aero::render::detail::ComputeSpanBoxRadius(span);
             const int padPx = (boxR > 0) ? (boxR * 3 + 2) : 0;
             const int bx0 = std::clamp(static_cast<int>(std::floor(mr.x)) - padPx, 0, vpW);
             const int by0 = std::clamp(static_cast<int>(std::floor(mr.y)) - padPx, 0, vpH);
@@ -2276,12 +2776,12 @@ GpuBackendFrameStats OpenGlDeviceBackend::ExecuteSubmission(
                     patchY,
                     patchW,
                     patchH,
-                    effectPatchScratch_)) {
+                    effectPatchScratch_,
+                    tree.ResourceStore())) {
                 drawPremulEffectPatch(patchX, patchY, patchW, patchH, effectPatchScratch_.data());
             }
         };
 
-        const auto& blurSpans = tree.BlurLayerSpans();
         const auto totalNodes = static_cast<std::uint32_t>(tree.NodeCount());
         std::size_t blurCursor = 0u;
         std::uint32_t regularSegStart = 0u;
@@ -2299,7 +2799,7 @@ GpuBackendFrameStats OpenGlDeviceBackend::ExecuteSubmission(
                 (blurSpans[blurCursor].endNodeId > nid ||
                  blurSpans[blurCursor].effectMode == UIEffectKind::BackdropBlur) &&
                 blurSpans[blurCursor].endNodeId <= totalNodes &&
-                spanHasActiveEffect(blurSpans[blurCursor])) {
+                aero::render::detail::SpanNeedsEffectPass(blurSpans[blurCursor])) {
                 const BlurLayerSpan span = blurSpans[blurCursor];
                 ++blurCursor;
 
@@ -2311,19 +2811,21 @@ GpuBackendFrameStats OpenGlDeviceBackend::ExecuteSubmission(
                     continue;
                 }
 
-                int patchX = 0, patchY = 0, patchW = 0, patchH = 0;
-                if (ZeroCopyGpuStream::RasterizeBlurSpanPatchPremulRgba8(
-                        tree,
-                        span,
-                        blurCursor,
-                        viewportWidth,
-                        viewportHeight,
-                        patchX,
-                        patchY,
-                        patchW,
-                        patchH,
-                        effectPatchScratch_)) {
-                    drawPremulEffectPatch(patchX, patchY, patchW, patchH, effectPatchScratch_.data());
+                if (!executeBlurSpanViaFbo(span, blurCursor)) {
+                    int patchX = 0, patchY = 0, patchW = 0, patchH = 0;
+                    if (ZeroCopyGpuStream::RasterizeBlurSpanPatchPremulRgba8(
+                            tree,
+                            span,
+                            blurCursor,
+                            viewportWidth,
+                            viewportHeight,
+                            patchX,
+                            patchY,
+                            patchW,
+                            patchH,
+                            effectPatchScratch_)) {
+                        drawPremulEffectPatch(patchX, patchY, patchW, patchH, effectPatchScratch_.data());
+                    }
                 }
                 while (blurCursor < blurSpans.size() &&
                        blurSpans[blurCursor].firstNodeId < span.endNodeId) {
