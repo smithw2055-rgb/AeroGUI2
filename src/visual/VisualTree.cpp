@@ -7,6 +7,7 @@
 #include "aero/asset/GradientBrush.hpp"
 #include "aero/core/UIResourceStore.hpp"
 #include "aero/render/FontAtlas.hpp"
+#include "aero/visual/VisualAnimationEngine.hpp"
 
 namespace aero {
 
@@ -180,18 +181,27 @@ const VisualNode* VisualWorld::GetNode(VisualNodeId id) const noexcept {
 
 void VisualWorld::SetRoot(VisualNodeId id) noexcept {
     rootId_ = IsAlive(id) ? id : VisualNodeId{};
+    if (rootId_.IsValid()) {
+        RefreshSubtreeDepths(rootId_, 0u);
+    }
     anyDirty_ = true;
 }
 
 bool VisualWorld::AddChild(VisualNodeId parentId, VisualNodeId childId) {
     VisualNode* parent = GetNode(parentId);
     VisualNode* child = GetNode(childId);
-    if (!parent || !child || parentId == childId) {
+    if (!parent || !child || parentId == childId || WouldCreateCycle(parentId, childId)) {
         return false;
     }
     DetachFromParent(*child);
     child->parent = parentId;
     parent->children.push_back(childId);
+    const std::uint8_t childDepth = (parent->layout.treeDepth < 63u)
+        ? static_cast<std::uint8_t>(parent->layout.treeDepth + 1u)
+        : 63u;
+    RefreshSubtreeDepths(childId, childDepth);
+    child->layout.hasValidMeasure = false;
+    child->layout.hasValidArrange = false;
     MarkAncestorsDirty(parentId, VisualDirty_All);
     return true;
 }
@@ -199,7 +209,7 @@ bool VisualWorld::AddChild(VisualNodeId parentId, VisualNodeId childId) {
 bool VisualWorld::InsertChild(VisualNodeId parentId, std::int32_t index, VisualNodeId childId) {
     VisualNode* parent = GetNode(parentId);
     VisualNode* child = GetNode(childId);
-    if (!parent || !child || parentId == childId) {
+    if (!parent || !child || parentId == childId || WouldCreateCycle(parentId, childId)) {
         return false;
     }
     DetachFromParent(*child);
@@ -208,6 +218,12 @@ bool VisualWorld::InsertChild(VisualNodeId parentId, std::int32_t index, VisualN
         ? 0u
         : std::min(static_cast<std::size_t>(index), parent->children.size());
     parent->children.insert(parent->children.begin() + static_cast<std::ptrdiff_t>(clampedIndex), childId);
+    const std::uint8_t childDepth = (parent->layout.treeDepth < 63u)
+        ? static_cast<std::uint8_t>(parent->layout.treeDepth + 1u)
+        : 63u;
+    RefreshSubtreeDepths(childId, childDepth);
+    child->layout.hasValidMeasure = false;
+    child->layout.hasValidArrange = false;
     MarkAncestorsDirty(parentId, VisualDirty_All);
     return true;
 }
@@ -452,7 +468,37 @@ float VisualWorld::GetLayoutRectScalar(VisualNodeId id, VisualLayoutRectQuery wh
     return 0.0f;
 }
 
+bool VisualWorld::TryScreenToLocal(VisualNodeId id, Point viewportPoint, Point& outLocal) const noexcept {
+    const VisualNode* node = GetNode(id);
+    if (!node) {
+        outLocal = Point{};
+        return false;
+    }
+    Point worldPt = viewportPoint;
+    if (node->layout.hasPerspective3D) {
+        if (!node->layout.worldMatrix3D.InverseProjectScreenToLocalPlane(viewportPoint, worldPt)) {
+            outLocal = Point{};
+            return false;
+        }
+    } else if (!node->layout.worldTransform.IsIdentity()) {
+        Matrix2D invM{};
+        if (!node->layout.worldTransform.TryInvert(invM)) {
+            outLocal = Point{};
+            return false;
+        }
+        worldPt = invM.TransformPoint(viewportPoint);
+    }
+    outLocal = Point{
+        worldPt.x - node->layout.layoutRect.x,
+        worldPt.y - node->layout.layoutRect.y};
+    return std::isfinite(outLocal.x) && std::isfinite(outLocal.y);
+}
+
 Point VisualWorld::ScreenToLocal(VisualNodeId id, Point viewportPoint) const noexcept {
+    Point local{};
+    if (TryScreenToLocal(id, viewportPoint, local)) {
+        return local;
+    }
     const VisualNode* node = GetNode(id);
     if (!node) {
         return Point{};
@@ -515,7 +561,7 @@ bool VisualWorld::SetTransform2D(
     node->transform2D.skewY = skewY;
     node->transform2D.originX = originX;
     node->transform2D.originY = originY;
-    MarkDirty(id, VisualDirty_Transform);
+    MarkDirty(id, static_cast<VisualDirtyFlags>(VisualDirty_Transform | VisualDirty_Visual));
     return true;
 }
 
@@ -539,7 +585,7 @@ bool VisualWorld::SetTransform3D(
     node->transform3D.camDist = camDist;
     node->transform3D.enabled = (rx != 0.0f || ry != 0.0f || rz != 0.0f ||
                                  tx != 0.0f || ty != 0.0f || tz != 0.0f || camDist > 0.0f);
-    MarkDirty(id, VisualDirty_Transform);
+    MarkDirty(id, static_cast<VisualDirtyFlags>(VisualDirty_Transform | VisualDirty_Visual));
     return true;
 }
 
@@ -630,9 +676,9 @@ Size VisualWorld::MeasureText(
     if (text.empty()) {
         return Size{0.0f, 0.0f};
     }
-    const UIResourceStore* store = ResourceStore();
-    if (store && store->TryFonts() != nullptr) {
-        const TextLayoutResult res = MeasureTextLayout(text, fontFamily, fontSize, maxWidth, wrap);
+    UIResourceStore* store = const_cast<VisualWorld*>(this)->ResourceStore();
+    if (store) {
+        const TextLayoutResult res = store->Fonts().MeasureLayout(text, fontFamily, fontSize, maxWidth, wrap);
         return Size{res.totalWidth, res.totalHeight};
     }
     const float safeFont = (fontSize > 1.0f) ? fontSize : 14.0f;
@@ -644,10 +690,56 @@ std::int32_t VisualWorld::HitTestTextCodePoint(VisualNodeId id, float localX, fl
     if (!node || node->text.text.empty()) {
         return 0;
     }
-    (void)localY;
-    const float charW = std::max(1.0f, node->text.fontSize * 0.6f);
-    const std::int32_t approx = static_cast<std::int32_t>(std::max(0.0f, localX) / charW + 0.5f);
-    return std::min<std::int32_t>(approx, static_cast<std::int32_t>(node->text.text.size()));
+    UIResourceStore* store = const_cast<VisualWorld*>(this)->ResourceStore();
+    if (!store) {
+        return 0;
+    }
+    const float maxW = (node->text.wrap == TextWrapping::NoWrap)
+        ? 1000000.0f
+        : std::max(1.0f, node->layout.layoutRect.width);
+    const TextLayoutResult layout = store->Fonts().MeasureLayout(
+        node->text.text,
+        node->text.fontFamily,
+        node->text.fontSize,
+        maxW,
+        node->text.wrap);
+    if (layout.lines.empty() || layout.glyphs.empty()) {
+        return 0;
+    }
+
+    const TextLineMetrics* chosenLine = &layout.lines.back();
+    if (localY <= layout.lines.front().topY + layout.lines.front().lineHeight) {
+        chosenLine = &layout.lines.front();
+    } else {
+        for (const TextLineMetrics& line : layout.lines) {
+            if (localY <= line.topY + line.lineHeight) {
+                chosenLine = &line;
+                break;
+            }
+        }
+    }
+
+    float alignDx = 0.0f;
+    const float boxW = std::max(0.0f, node->layout.layoutRect.width);
+    if (node->text.align == TextAlignment::Center) {
+        alignDx = std::max(0.0f, (boxW - chosenLine->width) * 0.5f);
+    } else if (node->text.align == TextAlignment::Right) {
+        alignDx = std::max(0.0f, boxW - chosenLine->width);
+    }
+
+    const std::size_t lineBegin = std::min(chosenLine->firstGlyphIndex, layout.glyphs.size());
+    const std::size_t lineEnd = std::min(lineBegin + chosenLine->glyphCount, layout.glyphs.size());
+    for (std::size_t i = lineBegin; i < lineEnd; ++i) {
+        const PositionedGlyph& g = layout.glyphs[i];
+        const float midX = g.penX + alignDx + g.advanceX * 0.5f;
+        if (localX < midX) {
+            return static_cast<std::int32_t>(g.sourceCodePointIndex);
+        }
+    }
+    if (lineEnd > lineBegin) {
+        return static_cast<std::int32_t>(layout.glyphs[lineEnd - 1u].sourceCodePointIndex + 1u);
+    }
+    return 0;
 }
 
 bool VisualWorld::SetImage(
@@ -702,14 +794,31 @@ bool VisualWorld::InvalidateDraw(VisualNodeId id) noexcept {
     return true;
 }
 
+void VisualWorld::SetCustomLayoutCallbacks(CustomMeasureCallback onMeasure, CustomArrangeCallback onArrange) {
+    customMeasureCallback_ = std::move(onMeasure);
+    customArrangeCallback_ = std::move(onArrange);
+    if (rootId_.IsValid()) {
+        MarkDirty(rootId_, VisualDirty_Layout);
+    }
+}
+
 bool VisualWorld::BindEcsColumn(
     VisualNodeId nodeId,
     std::uint32_t targetProp,
     const float* columnData,
     std::size_t rowIndex,
     std::size_t columnCount) {
-    if (!IsAlive(nodeId) || !columnData) {
+    if (!IsAlive(nodeId) || !columnData || rowIndex >= columnCount) {
         return false;
+    }
+    for (auto& existing : ecsBindings_) {
+        if (existing.targetNode == nodeId && existing.targetProp == targetProp) {
+            existing.columnData = columnData;
+            existing.rowIndex = rowIndex;
+            existing.columnCount = columnCount;
+            existing.hasApplied = false;
+            return true;
+        }
     }
     VisualEcsColumnBinding binding{};
     binding.targetNode = nodeId;
@@ -736,13 +845,79 @@ std::size_t VisualWorld::FlushTrackB() {
             continue;
         }
         const float v = binding.columnData[binding.rowIndex];
-        if (binding.hasApplied && v == binding.lastAppliedValue) {
+        if (!std::isfinite(v) || (binding.hasApplied && v == binding.lastAppliedValue)) {
             continue;
         }
         binding.lastAppliedValue = v;
         binding.hasApplied = true;
-        node->customScalars[binding.targetProp % 4u] = v;
-        MarkDirty(binding.targetNode, VisualDirty_Visual);
+        switch (static_cast<VisualAnimProp>(binding.targetProp)) {
+            case VisualAnimProp::Opacity:
+                node->layout.opacity = std::clamp(v, 0.0f, 1.0f);
+                MarkDirty(binding.targetNode, VisualDirty_Visual);
+                break;
+            case VisualAnimProp::Width:
+                node->layout.width = std::max(0.0f, v);
+                MarkAncestorsDirty(
+                    binding.targetNode,
+                    static_cast<VisualDirtyFlags>(VisualDirty_Layout | VisualDirty_Visual));
+                break;
+            case VisualAnimProp::Height:
+                node->layout.height = std::max(0.0f, v);
+                MarkAncestorsDirty(
+                    binding.targetNode,
+                    static_cast<VisualDirtyFlags>(VisualDirty_Layout | VisualDirty_Visual));
+                break;
+            case VisualAnimProp::TranslateX:
+                node->transform2D.tx = v;
+                MarkDirty(
+                    binding.targetNode,
+                    static_cast<VisualDirtyFlags>(VisualDirty_Transform | VisualDirty_Visual));
+                break;
+            case VisualAnimProp::TranslateY:
+                node->transform2D.ty = v;
+                MarkDirty(
+                    binding.targetNode,
+                    static_cast<VisualDirtyFlags>(VisualDirty_Transform | VisualDirty_Visual));
+                break;
+            case VisualAnimProp::ScaleX:
+                node->transform2D.sx = v;
+                MarkDirty(
+                    binding.targetNode,
+                    static_cast<VisualDirtyFlags>(VisualDirty_Transform | VisualDirty_Visual));
+                break;
+            case VisualAnimProp::ScaleY:
+                node->transform2D.sy = v;
+                MarkDirty(
+                    binding.targetNode,
+                    static_cast<VisualDirtyFlags>(VisualDirty_Transform | VisualDirty_Visual));
+                break;
+            case VisualAnimProp::RotateDeg:
+                node->transform2D.rotDeg = v;
+                MarkDirty(
+                    binding.targetNode,
+                    static_cast<VisualDirtyFlags>(VisualDirty_Transform | VisualDirty_Visual));
+                break;
+            case VisualAnimProp::CornerRadius:
+                node->box.cornerRadius = CornerRadius{std::max(0.0f, v)};
+                MarkDirty(binding.targetNode, VisualDirty_Visual);
+                break;
+            case VisualAnimProp::PathTrimStart:
+                node->vector.trimStart = std::clamp(v, 0.0f, 1.0f);
+                MarkDirty(binding.targetNode, VisualDirty_Visual);
+                break;
+            case VisualAnimProp::PathTrimEnd:
+                node->vector.trimEnd = std::clamp(v, 0.0f, 1.0f);
+                MarkDirty(binding.targetNode, VisualDirty_Visual);
+                break;
+            case VisualAnimProp::EffectRadius:
+                node->effect.radius = std::max(0.0f, v);
+                MarkDirty(binding.targetNode, VisualDirty_Visual);
+                break;
+            default:
+                node->customScalars[binding.targetProp % 4u] = v;
+                MarkDirty(binding.targetNode, VisualDirty_Visual);
+                break;
+        }
         ++updated;
     }
     return updated;
@@ -781,6 +956,19 @@ void VisualWorld::Clear() noexcept {
     nodes_.clear();
     freeIndices_.clear();
     ecsBindings_.clear();
+    for (auto& bucket : measureDepthBuckets_) {
+        bucket.clear();
+    }
+    for (auto& bucket : arrangeDepthBuckets_) {
+        bucket.clear();
+    }
+    for (auto& bucket : transformDepthBuckets_) {
+        bucket.clear();
+    }
+    lastViewportSize_ = Size{
+        std::numeric_limits<float>::quiet_NaN(),
+        std::numeric_limits<float>::quiet_NaN()};
+    lastLaidOutRoot_ = VisualNodeId{};
     rootId_ = VisualNodeId{};
     liveCount_ = 0u;
     anyDirty_ = false;
@@ -844,6 +1032,36 @@ void VisualWorld::RefreshOwnerPin(VisualNode& node) noexcept {
     }
     if (managedHeap_->isAlive(node.scriptOwner)) {
         node.pinnedOwnerRoot = managedHeap_->retain(node.scriptOwner);
+    }
+}
+
+bool VisualWorld::WouldCreateCycle(VisualNodeId parentId, VisualNodeId childId) const noexcept {
+    VisualNodeId cur = parentId;
+    std::size_t hops = 0u;
+    const std::size_t maxHops = liveCount_ + 1u;
+    while (cur.IsValid() && hops < maxHops) {
+        if (cur == childId) {
+            return true;
+        }
+        const VisualNode* n = GetNode(cur);
+        if (!n) {
+            break;
+        }
+        cur = n->parent;
+        ++hops;
+    }
+    return false;
+}
+
+void VisualWorld::RefreshSubtreeDepths(VisualNodeId id, std::uint8_t depth) noexcept {
+    VisualNode* node = GetNode(id);
+    if (!node) {
+        return;
+    }
+    node->layout.treeDepth = depth;
+    const std::uint8_t nextDepth = (depth < 63u) ? static_cast<std::uint8_t>(depth + 1u) : 63u;
+    for (VisualNodeId childId : node->children) {
+        RefreshSubtreeDepths(childId, nextDepth);
     }
 }
 

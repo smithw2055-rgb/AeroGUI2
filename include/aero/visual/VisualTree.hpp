@@ -3,6 +3,7 @@
 #include <array>
 #include <cstdint>
 #include <deque>
+#include <functional>
 #include <limits>
 #include <string>
 #include <string_view>
@@ -230,6 +231,23 @@ struct VisualLayoutData {
     Rect layoutRect{};
     Size scrollExtent{};
     Matrix2D worldTransform{};
+    Matrix4x4 worldMatrix3D{};
+    bool hasPerspective3D = false;
+    bool hasValidMeasure = false;
+    bool hasValidArrange = false;
+    Size lastMeasureConstraint{
+        std::numeric_limits<float>::quiet_NaN(),
+        std::numeric_limits<float>::quiet_NaN()};
+    Rect lastArrangeSlot{
+        0.0f,
+        0.0f,
+        std::numeric_limits<float>::quiet_NaN(),
+        std::numeric_limits<float>::quiet_NaN()};
+    float viewboxScaleX = 1.0f;
+    float viewboxScaleY = 1.0f;
+    float viewboxOriginX = 0.0f;
+    float viewboxOriginY = 0.0f;
+    std::uint8_t treeDepth = 0u;
     std::uint32_t renderNodeId = 0u;
     std::uint32_t renderNodeCount = 0u;
 };
@@ -341,6 +359,7 @@ public:
     bool SetScrollOffsets(VisualNodeId id, float ox, float oy) noexcept;
 
     [[nodiscard]] float GetLayoutRectScalar(VisualNodeId id, VisualLayoutRectQuery which) const noexcept;
+    [[nodiscard]] bool TryScreenToLocal(VisualNodeId id, Point viewportPoint, Point& outLocal) const noexcept;
     [[nodiscard]] Point ScreenToLocal(VisualNodeId id, Point viewportPoint) const noexcept;
 
     // Appearance, Transforms & Effects
@@ -438,7 +457,14 @@ public:
     bool InvalidateDraw(VisualNodeId id) noexcept;
 
     // Layout & ECS Track B
+    using CustomMeasureCallback = std::function<Size(VisualWorld&, VisualNodeId, Size)>;
+    using CustomArrangeCallback = std::function<void(VisualWorld&, VisualNodeId, Rect)>;
+
+    void SetCustomLayoutCallbacks(CustomMeasureCallback onMeasure, CustomArrangeCallback onArrange);
+    [[nodiscard]] const CustomMeasureCallback& CustomMeasureHook() const noexcept { return customMeasureCallback_; }
+    [[nodiscard]] const CustomArrangeCallback& CustomArrangeHook() const noexcept { return customArrangeCallback_; }
     void UpdateLayout(float viewportWidth, float viewportHeight);
+    [[nodiscard]] Size LastLayoutViewport() const noexcept { return lastViewportSize_; }
     bool BindEcsColumn(
         VisualNodeId nodeId,
         std::uint32_t targetProp,
@@ -465,6 +491,8 @@ private:
     void MarkAncestorsDirty(VisualNodeId id, VisualDirtyFlags flags) noexcept;
     void DetachFromParent(VisualNode& child) noexcept;
     void RefreshOwnerPin(VisualNode& node) noexcept;
+    [[nodiscard]] bool WouldCreateCycle(VisualNodeId parentId, VisualNodeId childId) const noexcept;
+    void RefreshSubtreeDepths(VisualNodeId id, std::uint8_t depth) noexcept;
 
     SymbolId visualNodeTypeId_ = 0u;
     NativeHandleRegistry ownedFallbackRegistry_;
@@ -478,6 +506,16 @@ private:
     std::size_t liveCount_ = 0u;
     bool anyDirty_ = false;
     std::vector<VisualEcsColumnBinding> ecsBindings_;
+
+    Size lastViewportSize_{
+        std::numeric_limits<float>::quiet_NaN(),
+        std::numeric_limits<float>::quiet_NaN()};
+    VisualNodeId lastLaidOutRoot_{};
+    std::array<std::vector<VisualNodeId>, 64> measureDepthBuckets_{};
+    std::array<std::vector<VisualNodeId>, 64> arrangeDepthBuckets_{};
+    std::array<std::vector<VisualNodeId>, 64> transformDepthBuckets_{};
+    CustomMeasureCallback customMeasureCallback_{};
+    CustomArrangeCallback customArrangeCallback_{};
 };
 
 } // namespace aero

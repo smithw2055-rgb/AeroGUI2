@@ -1,59 +1,1532 @@
 #include "aero/visual/VisualTree.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
+#include <limits>
+#include <vector>
+
+#include "aero/asset/MtsdfPathBaker.hpp"
+#include "aero/core/UIResourceStore.hpp"
+#include "aero/render/ImageAtlas.hpp"
 
 namespace aero {
 
 namespace {
 
-[[nodiscard]] float ResolveSizeOrFallback(float explicitSize, float available, float fallback) noexcept {
-    if (std::isfinite(explicitSize) && explicitSize >= 0.0f) {
-        return explicitSize;
+constexpr float kInf = std::numeric_limits<float>::infinity();
+constexpr float kLayoutEps = 1e-4f;
+
+[[nodiscard]] bool SameFloatOrBothNaN(float a, float b) noexcept {
+    if (std::isnan(a) && std::isnan(b)) {
+        return true;
     }
-    if (std::isfinite(available) && available >= 0.0f) {
-        return available;
+    if (std::isinf(a) && std::isinf(b)) {
+        return (a > 0.0f) == (b > 0.0f);
     }
-    return fallback;
+    if (!std::isfinite(a) || !std::isfinite(b)) {
+        return false;
+    }
+    return std::fabs(a - b) <= kLayoutEps;
 }
 
-void LayoutNodeRecursive(
-    VisualWorld& world,
-    VisualNodeId id,
-    Rect availableRect) noexcept {
-    VisualNode* node = world.GetNode(id);
-    if (!node || node->layout.visibility == Visibility::Collapsed) {
+[[nodiscard]] bool SameSizeConstraint(const Size& a, const Size& b) noexcept {
+    return SameFloatOrBothNaN(a.width, b.width) && SameFloatOrBothNaN(a.height, b.height);
+}
+
+[[nodiscard]] bool SameRectExact(const Rect& a, const Rect& b) noexcept {
+    return SameFloatOrBothNaN(a.x, b.x) &&
+           SameFloatOrBothNaN(a.y, b.y) &&
+           SameFloatOrBothNaN(a.width, b.width) &&
+           SameFloatOrBothNaN(a.height, b.height);
+}
+
+void ComputeAxisConstraint(
+    float explicitDim,
+    float minDim,
+    float maxDim,
+    float padTotal,
+    float marginTotal,
+    float availOuter,
+    bool allowInfinity,
+    float& outMinContent,
+    float& outMaxContent,
+    float& outInnerAvail) noexcept {
+    const float safeMin = std::max(0.0f, std::isfinite(minDim) ? minDim : 0.0f);
+    const float rawMax = (std::isnan(maxDim) || maxDim < 0.0f) ? kInf : maxDim;
+    const float safeMax = std::max(safeMin, rawMax);
+
+    outMinContent = safeMin;
+    outMaxContent = safeMax;
+
+    if (std::isfinite(explicitDim) && explicitDim >= 0.0f) {
+        const float clampedExplicit = std::clamp(explicitDim, safeMin, safeMax);
+        outMinContent = clampedExplicit;
+        outMaxContent = clampedExplicit;
+        outInnerAvail = std::max(0.0f, clampedExplicit - padTotal);
         return;
     }
 
-    const float marginH = node->layout.margin.left + node->layout.margin.right;
-    const float marginV = node->layout.margin.top + node->layout.margin.bottom;
+    if (std::isfinite(availOuter)) {
+        const float availBox = std::max(0.0f, availOuter - marginTotal);
+        const float boundedBox = std::clamp(availBox, safeMin, safeMax);
+        outInnerAvail = std::max(0.0f, boundedBox - padTotal);
+        return;
+    }
 
-    const float targetW = std::clamp(
-        ResolveSizeOrFallback(node->layout.width, availableRect.width - marginH, 0.0f),
+    if (allowInfinity) {
+        outInnerAvail = std::isfinite(safeMax) ? std::max(0.0f, safeMax - padTotal) : kInf;
+    } else {
+        outInnerAvail = std::max(0.0f, safeMin - padTotal);
+    }
+}
+
+void ComputeViewboxScale(
+    float availW,
+    float availH,
+    float contentW,
+    float contentH,
+    Stretch stretch,
+    StretchDirection dir,
+    float& outSx,
+    float& outSy) noexcept {
+    if (contentW <= 1e-5f || contentH <= 1e-5f) {
+        outSx = 1.0f;
+        outSy = 1.0f;
+        return;
+    }
+
+    const bool infW = !std::isfinite(availW);
+    const bool infH = !std::isfinite(availH);
+    if (infW && infH) {
+        outSx = 1.0f;
+        outSy = 1.0f;
+        return;
+    }
+
+    float sx = infW ? 1.0f : (std::max(0.0f, availW) / contentW);
+    float sy = infH ? 1.0f : (std::max(0.0f, availH) / contentH);
+    if (infW) {
+        sx = sy;
+    } else if (infH) {
+        sy = sx;
+    }
+
+    switch (stretch) {
+        case Stretch::None:
+            sx = 1.0f;
+            sy = 1.0f;
+            break;
+        case Stretch::Fill:
+            break;
+        case Stretch::Uniform: {
+            const float u = std::min(sx, sy);
+            sx = u;
+            sy = u;
+            break;
+        }
+        case Stretch::UniformToFill: {
+            const float u = std::max(sx, sy);
+            sx = u;
+            sy = u;
+            break;
+        }
+    }
+
+    if (stretch != Stretch::None) {
+        if (dir == StretchDirection::UpOnly) {
+            sx = std::max(1.0f, sx);
+            sy = std::max(1.0f, sy);
+        } else if (dir == StretchDirection::DownOnly) {
+            sx = std::min(1.0f, sx);
+            sy = std::min(1.0f, sy);
+        }
+    }
+
+    outSx = std::isfinite(sx) ? std::max(0.0f, sx) : 1.0f;
+    outSy = std::isfinite(sy) ? std::max(0.0f, sy) : 1.0f;
+}
+
+[[nodiscard]] float ResolveStretchedExtent(
+    float naturalW,
+    float naturalH,
+    float availW,
+    float availH,
+    Stretch stretch,
+    StretchDirection dir,
+    Size& outSize) noexcept {
+    if (naturalW <= 0.0f || naturalH <= 0.0f) {
+        outSize = Size{0.0f, 0.0f};
+        return 0.0f;
+    }
+    float sx = 1.0f;
+    float sy = 1.0f;
+    ComputeViewboxScale(availW, availH, naturalW, naturalH, stretch, dir, sx, sy);
+    outSize = Size{naturalW * sx, naturalH * sy};
+    return sx;
+}
+
+[[nodiscard]] Size MeasureIntrinsicContent(
+    VisualWorld& world,
+    const VisualNode& node,
+    float innerAvailW,
+    float innerAvailH) {
+    switch (node.kind) {
+        case VisualKind::Text: {
+            if (node.text.text.empty()) {
+                return Size{0.0f, std::max(1.0f, node.text.fontSize) * 1.25f};
+            }
+            const float maxW = (node.text.wrap == TextWrapping::NoWrap || !std::isfinite(innerAvailW))
+                ? 1000000.0f
+                : std::max(1.0f, innerAvailW);
+            return world.MeasureText(
+                node.text.text,
+                node.text.fontFamily,
+                node.text.fontSize,
+                maxW,
+                node.text.wrap);
+        }
+        case VisualKind::Image: {
+            if (node.image.uri.empty()) {
+                return Size{0.0f, 0.0f};
+            }
+            UIResourceStore* store = world.ResourceStore();
+            if (!store) {
+                return Size{0.0f, 0.0f};
+            }
+            const ImageAtlasEntry* entry = store->Images().LoadOrGet(node.image.uri);
+            if (!entry || entry->width == 0u || entry->height == 0u) {
+                return Size{0.0f, 0.0f};
+            }
+            Size out{};
+            (void)ResolveStretchedExtent(
+                static_cast<float>(entry->width),
+                static_cast<float>(entry->height),
+                innerAvailW,
+                innerAvailH,
+                node.image.stretch,
+                node.image.stretchDir,
+                out);
+            return out;
+        }
+        case VisualKind::Vector: {
+            if (node.vector.shapeKind == VectorShapeKind::SvgPath && !node.vector.pathOrParams.empty()) {
+                const Rect bounds = MeasureSvgPathBounds(node.vector.pathOrParams);
+                if (bounds.width > 0.0f && bounds.height > 0.0f) {
+                    Size out{};
+                    (void)ResolveStretchedExtent(
+                        bounds.width,
+                        bounds.height,
+                        innerAvailW,
+                        innerAvailH,
+                        node.vector.stretch,
+                        StretchDirection::Both,
+                        out);
+                    return out;
+                }
+            }
+            return Size{0.0f, 0.0f};
+        }
+        case VisualKind::Box:
+        case VisualKind::CanvasDraw:
+        default:
+            return Size{0.0f, 0.0f};
+    }
+}
+
+Size MeasureNode(VisualWorld& world, VisualNodeId id, Size availSize);
+void ArrangeNode(
+    VisualWorld& world,
+    VisualNodeId id,
+    Rect finalSlot,
+    bool parentWasViewbox,
+    float viewboxSx,
+    float viewboxSy,
+    float viewboxOx,
+    float viewboxOy);
+
+struct GridTrackSolved {
+    GridUnitType unit = GridUnitType::Star;
+    float value = 1.0f;
+    float size = 0.0f;
+    float offset = 0.0f;
+};
+
+void BuildGridTrackDefs(
+    const std::vector<VisualGridLength>& defs,
+    std::vector<GridTrackSolved>& outTracks) {
+    outTracks.clear();
+    if (defs.empty()) {
+        outTracks.push_back(GridTrackSolved{GridUnitType::Star, 1.0f, 0.0f, 0.0f});
+        return;
+    }
+    outTracks.reserve(defs.size());
+    for (const VisualGridLength& d : defs) {
+        outTracks.push_back(GridTrackSolved{
+            d.unit,
+            (std::isfinite(d.value) && d.value >= 0.0f) ? d.value : 0.0f,
+            0.0f,
+            0.0f});
+    }
+}
+
+void FinalizeGridTrackOffsets(std::vector<GridTrackSolved>& tracks, float origin) noexcept {
+    float cur = origin;
+    for (GridTrackSolved& t : tracks) {
+        t.offset = cur;
+        cur += t.size;
+    }
+}
+
+[[nodiscard]] float SumTrackSpan(
+    const std::vector<GridTrackSolved>& tracks,
+    std::size_t start,
+    std::size_t span) noexcept {
+    const std::size_t end = std::min(tracks.size(), start + span);
+    float sum = 0.0f;
+    for (std::size_t i = start; i < end; ++i) {
+        sum += tracks[i].size;
+    }
+    return sum;
+}
+
+[[nodiscard]] bool SpanHasStar(
+    const std::vector<GridTrackSolved>& tracks,
+    std::size_t start,
+    std::size_t span) noexcept {
+    const std::size_t end = std::min(tracks.size(), start + span);
+    for (std::size_t i = start; i < end; ++i) {
+        if (tracks[i].unit == GridUnitType::Star) {
+            return true;
+        }
+    }
+    return false;
+}
+
+[[nodiscard]] float SpanAvailExtent(
+    const std::vector<GridTrackSolved>& tracks,
+    std::size_t start,
+    std::size_t span) noexcept {
+    const std::size_t end = std::min(tracks.size(), start + span);
+    float sum = 0.0f;
+    for (std::size_t i = start; i < end; ++i) {
+        if (tracks[i].unit == GridUnitType::Auto || !std::isfinite(tracks[i].size)) {
+            return kInf;
+        }
+        sum += tracks[i].size;
+    }
+    return sum;
+}
+
+void DistributeGridSpanDemand(
+    std::vector<GridTrackSolved>& tracks,
+    std::size_t start,
+    std::size_t span,
+    GridUnitType targetUnit,
+    float neededSize) noexcept {
+    const std::size_t end = std::min(tracks.size(), start + span);
+    float existing = 0.0f;
+    std::size_t matchCount = 0u;
+    float weightSum = 0.0f;
+    for (std::size_t i = start; i < end; ++i) {
+        existing += tracks[i].size;
+        if (tracks[i].unit == targetUnit) {
+            ++matchCount;
+            weightSum += std::max(0.0f, tracks[i].value);
+        }
+    }
+    const float deficit = neededSize - existing;
+    if (deficit <= 0.0f || matchCount == 0u) {
+        return;
+    }
+    for (std::size_t i = start; i < end; ++i) {
+        if (tracks[i].unit != targetUnit) {
+            continue;
+        }
+        const float share = (targetUnit == GridUnitType::Star && weightSum > 0.0f)
+            ? (deficit * (tracks[i].value / weightSum))
+            : (deficit / static_cast<float>(matchCount));
+        tracks[i].size += share;
+    }
+}
+
+void ResolveStarTracks(
+    std::vector<GridTrackSolved>& tracks,
+    float totalAvail) noexcept {
+    float fixedSum = 0.0f;
+    float totalStarWeight = 0.0f;
+    for (const GridTrackSolved& t : tracks) {
+        if (t.unit == GridUnitType::Star) {
+            totalStarWeight += std::max(0.0f, t.value);
+        } else {
+            fixedSum += t.size;
+        }
+    }
+    if (totalStarWeight <= 0.0f) {
+        return;
+    }
+    if (std::isfinite(totalAvail)) {
+        const float remaining = std::max(0.0f, totalAvail - fixedSum);
+        const float unitSize = remaining / totalStarWeight;
+        for (GridTrackSolved& t : tracks) {
+            if (t.unit == GridUnitType::Star) {
+                t.size = std::max(0.0f, t.value) * unitSize;
+            }
+        }
+    }
+}
+
+void ResolveStarTracksFromInfinite(
+    std::vector<GridTrackSolved>& tracks,
+    std::size_t start,
+    std::size_t span,
+    float childDesired) noexcept {
+    const std::size_t end = std::min(tracks.size(), start + span);
+    float nonStar = 0.0f;
+    float starWeights = 0.0f;
+    for (std::size_t i = start; i < end; ++i) {
+        if (tracks[i].unit == GridUnitType::Star) {
+            starWeights += std::max(0.0f, tracks[i].value);
+        } else {
+            nonStar += tracks[i].size;
+        }
+    }
+    if (starWeights <= 0.0f) {
+        return;
+    }
+    const float neededStar = std::max(0.0f, childDesired - nonStar);
+    const float minUnit = neededStar / starWeights;
+    for (GridTrackSolved& t : tracks) {
+        if (t.unit == GridUnitType::Star) {
+            t.size = std::max(t.size, std::max(0.0f, t.value) * minUnit);
+        }
+    }
+}
+
+[[nodiscard]] Size MeasureGridPanel(
+    VisualWorld& world,
+    const VisualNode& parent,
+    float availW,
+    float availH) {
+    std::vector<GridTrackSolved> rows;
+    std::vector<GridTrackSolved> cols;
+    BuildGridTrackDefs(parent.layout.rowDefs, rows);
+    BuildGridTrackDefs(parent.layout.colDefs, cols);
+
+    for (GridTrackSolved& r : rows) {
+        if (r.unit == GridUnitType::Pixel) {
+            r.size = r.value;
+        }
+    }
+    for (GridTrackSolved& c : cols) {
+        if (c.unit == GridUnitType::Pixel) {
+            c.size = c.value;
+        }
+    }
+
+    const std::size_t rCount = rows.size();
+    const std::size_t cCount = cols.size();
+    struct GridChildCell {
+        VisualNodeId id{};
+        std::size_t r0 = 0u;
+        std::size_t c0 = 0u;
+        std::size_t rSpan = 1u;
+        std::size_t cSpan = 1u;
+        bool hasStarRow = false;
+        bool hasStarCol = false;
+    };
+    std::vector<GridChildCell> items;
+    items.reserve(parent.children.size());
+
+    for (VisualNodeId cid : parent.children) {
+        const VisualNode* child = world.GetNode(cid);
+        if (!child || child->layout.visibility == Visibility::Collapsed) {
+            continue;
+        }
+        GridChildCell cell{};
+        cell.id = cid;
+        cell.r0 = static_cast<std::size_t>(std::clamp<std::int32_t>(child->layout.gridRow, 0, static_cast<std::int32_t>(rCount - 1u)));
+        cell.c0 = static_cast<std::size_t>(std::clamp<std::int32_t>(child->layout.gridCol, 0, static_cast<std::int32_t>(cCount - 1u)));
+        cell.rSpan = static_cast<std::size_t>(std::clamp<std::int32_t>(child->layout.gridRowSpan, 1, static_cast<std::int32_t>(rCount - cell.r0)));
+        cell.cSpan = static_cast<std::size_t>(std::clamp<std::int32_t>(child->layout.gridColSpan, 1, static_cast<std::int32_t>(cCount - cell.c0)));
+        cell.hasStarRow = SpanHasStar(rows, cell.r0, cell.rSpan);
+        cell.hasStarCol = SpanHasStar(cols, cell.c0, cell.cSpan);
+        items.push_back(cell);
+    }
+
+    // Group 1: Pixel/Auto cells (no Star in row or col), plus multi-span Auto expansion
+    for (const GridChildCell& item : items) {
+        if (item.hasStarRow || item.hasStarCol) {
+            continue;
+        }
+        const float cw = SpanAvailExtent(cols, item.c0, item.cSpan);
+        const float ch = SpanAvailExtent(rows, item.r0, item.rSpan);
+        const Size d = MeasureNode(world, item.id, Size{cw, ch});
+        if (item.cSpan == 1u) {
+            if (cols[item.c0].unit == GridUnitType::Auto) {
+                cols[item.c0].size = std::max(cols[item.c0].size, d.width);
+            }
+        }
+        if (item.rSpan == 1u) {
+            if (rows[item.r0].unit == GridUnitType::Auto) {
+                rows[item.r0].size = std::max(rows[item.r0].size, d.height);
+            }
+        }
+    }
+    for (const GridChildCell& item : items) {
+        if (item.hasStarRow || item.hasStarCol) {
+            continue;
+        }
+        const VisualNode* child = world.GetNode(item.id);
+        if (!child) continue;
+        if (item.cSpan > 1u) {
+            DistributeGridSpanDemand(cols, item.c0, item.cSpan, GridUnitType::Auto, child->layout.desiredSize.width);
+        }
+        if (item.rSpan > 1u) {
+            DistributeGridSpanDemand(rows, item.r0, item.rSpan, GridUnitType::Auto, child->layout.desiredSize.height);
+        }
+    }
+
+    // Group 2: Auto/Star cross cells: measure Star-width+Auto-height or Auto-width+Star-height first if finite
+    ResolveStarTracks(cols, availW);
+    ResolveStarTracks(rows, availH);
+
+    for (const GridChildCell& item : items) {
+        if (!item.hasStarRow && !item.hasStarCol) {
+            continue;
+        }
+        const float cw = (!std::isfinite(availW) && item.hasStarCol) ? kInf : SumTrackSpan(cols, item.c0, item.cSpan);
+        const float ch = (!std::isfinite(availH) && item.hasStarRow) ? kInf : SumTrackSpan(rows, item.r0, item.rSpan);
+        const Size d = MeasureNode(world, item.id, Size{cw, ch});
+        if (!item.hasStarCol) {
+            DistributeGridSpanDemand(cols, item.c0, item.cSpan, GridUnitType::Auto, d.width);
+        } else if (!std::isfinite(availW)) {
+            ResolveStarTracksFromInfinite(cols, item.c0, item.cSpan, d.width);
+        }
+        if (!item.hasStarRow) {
+            DistributeGridSpanDemand(rows, item.r0, item.rSpan, GridUnitType::Auto, d.height);
+        } else if (!std::isfinite(availH)) {
+            ResolveStarTracksFromInfinite(rows, item.r0, item.rSpan, d.height);
+        }
+    }
+
+    // Re-resolve Star after Auto growth, and re-measure Star cells with exact final track sizes
+    if (std::isfinite(availW)) {
+        ResolveStarTracks(cols, availW);
+    }
+    if (std::isfinite(availH)) {
+        ResolveStarTracks(rows, availH);
+    }
+    for (const GridChildCell& item : items) {
+        if (!item.hasStarRow && !item.hasStarCol) {
+            continue;
+        }
+        const float cw = SumTrackSpan(cols, item.c0, item.cSpan);
+        const float ch = SumTrackSpan(rows, item.r0, item.rSpan);
+        (void)MeasureNode(world, item.id, Size{cw, ch});
+    }
+
+    float totalW = 0.0f;
+    for (const GridTrackSolved& c : cols) {
+        totalW += c.size;
+    }
+    float totalH = 0.0f;
+    for (const GridTrackSolved& r : rows) {
+        totalH += r.size;
+    }
+    return Size{totalW, totalH};
+}
+
+void ArrangeGridPanel(
+    VisualWorld& world,
+    const VisualNode& parent,
+    const Rect& innerRect) {
+    std::vector<GridTrackSolved> rows;
+    std::vector<GridTrackSolved> cols;
+    BuildGridTrackDefs(parent.layout.rowDefs, rows);
+    BuildGridTrackDefs(parent.layout.colDefs, cols);
+
+    for (GridTrackSolved& r : rows) {
+        if (r.unit == GridUnitType::Pixel) {
+            r.size = r.value;
+        }
+    }
+    for (GridTrackSolved& c : cols) {
+        if (c.unit == GridUnitType::Pixel) {
+            c.size = c.value;
+        }
+    }
+
+    const std::size_t rCount = rows.size();
+    const std::size_t cCount = cols.size();
+    for (VisualNodeId cid : parent.children) {
+        const VisualNode* child = world.GetNode(cid);
+        if (!child || child->layout.visibility == Visibility::Collapsed) {
+            continue;
+        }
+        const auto r0 = static_cast<std::size_t>(std::clamp<std::int32_t>(child->layout.gridRow, 0, static_cast<std::int32_t>(rCount - 1u)));
+        const auto c0 = static_cast<std::size_t>(std::clamp<std::int32_t>(child->layout.gridCol, 0, static_cast<std::int32_t>(cCount - 1u)));
+        const auto rSpan = static_cast<std::size_t>(std::clamp<std::int32_t>(child->layout.gridRowSpan, 1, static_cast<std::int32_t>(rCount - r0)));
+        const auto cSpan = static_cast<std::size_t>(std::clamp<std::int32_t>(child->layout.gridColSpan, 1, static_cast<std::int32_t>(cCount - c0)));
+
+        if (!SpanHasStar(cols, c0, cSpan)) {
+            DistributeGridSpanDemand(cols, c0, cSpan, GridUnitType::Auto, child->layout.desiredSize.width);
+        }
+        if (!SpanHasStar(rows, r0, rSpan)) {
+            DistributeGridSpanDemand(rows, r0, rSpan, GridUnitType::Auto, child->layout.desiredSize.height);
+        }
+    }
+
+    ResolveStarTracks(cols, innerRect.width);
+    ResolveStarTracks(rows, innerRect.height);
+    FinalizeGridTrackOffsets(cols, innerRect.x);
+    FinalizeGridTrackOffsets(rows, innerRect.y);
+
+    const auto childrenCopy = parent.children;
+    for (VisualNodeId cid : childrenCopy) {
+        const VisualNode* child = world.GetNode(cid);
+        if (!child) {
+            continue;
+        }
+        if (child->layout.visibility == Visibility::Collapsed) {
+            ArrangeNode(world, cid, Rect{innerRect.x, innerRect.y, 0.0f, 0.0f}, false, 1.0f, 1.0f, 0.0f, 0.0f);
+            continue;
+        }
+        const auto r0 = static_cast<std::size_t>(std::clamp<std::int32_t>(child->layout.gridRow, 0, static_cast<std::int32_t>(rCount - 1u)));
+        const auto c0 = static_cast<std::size_t>(std::clamp<std::int32_t>(child->layout.gridCol, 0, static_cast<std::int32_t>(cCount - 1u)));
+        const auto rSpan = static_cast<std::size_t>(std::clamp<std::int32_t>(child->layout.gridRowSpan, 1, static_cast<std::int32_t>(rCount - r0)));
+        const auto cSpan = static_cast<std::size_t>(std::clamp<std::int32_t>(child->layout.gridColSpan, 1, static_cast<std::int32_t>(cCount - c0)));
+
+        const Rect cellSlot{
+            cols[c0].offset,
+            rows[r0].offset,
+            SumTrackSpan(cols, c0, cSpan),
+            SumTrackSpan(rows, r0, rSpan)};
+        ArrangeNode(world, cid, cellSlot, false, 1.0f, 1.0f, 0.0f, 0.0f);
+    }
+}
+
+void ComputeUniformGridDims(
+    const VisualNode& parent,
+    std::size_t visibleCount,
+    int& outRows,
+    int& outCols,
+    int& outFirstCol) noexcept {
+    int rows = std::max(0, parent.layout.layoutInt0);
+    int cols = std::max(0, parent.layout.layoutInt1);
+    int firstCol = (std::isfinite(parent.layout.layoutParam0) && parent.layout.layoutParam0 > 0.0f)
+        ? static_cast<int>(parent.layout.layoutParam0)
+        : 0;
+    if (cols > 0) {
+        firstCol = std::clamp(firstCol, 0, cols - 1);
+    }
+    const int n = static_cast<int>(visibleCount);
+    if (rows == 0 && cols == 0) {
+        const int total = std::max(1, n + firstCol);
+        cols = std::max(1, static_cast<int>(std::ceil(std::sqrt(static_cast<double>(total)))));
+        rows = std::max(1, (total + cols - 1) / cols);
+    } else if (rows == 0) {
+        cols = std::max(1, cols);
+        const int total = std::max(1, n + firstCol);
+        rows = std::max(1, (total + cols - 1) / cols);
+    } else if (cols == 0) {
+        rows = std::max(1, rows);
+        const int total = std::max(1, n + firstCol);
+        cols = std::max(1, (total + rows - 1) / rows);
+        if (firstCol >= cols) {
+            firstCol = cols - 1;
+        }
+    }
+    outRows = std::max(1, rows);
+    outCols = std::max(1, cols);
+    outFirstCol = firstCol;
+}
+
+[[nodiscard]] Size MeasurePanelChildren(
+    VisualWorld& world,
+    VisualNode& parent,
+    float availW,
+    float availH) {
+    const auto childrenCopy = parent.children;
+
+    switch (parent.layout.layoutMode) {
+        case LayoutMode::Stack: {
+            const bool isHoriz = (static_cast<Orientation>(parent.layout.layoutInt0) == Orientation::Horizontal);
+            const float spacing = std::isfinite(parent.layout.layoutParam0)
+                ? std::max(0.0f, parent.layout.layoutParam0)
+                : 0.0f;
+            float primarySum = 0.0f;
+            float maxCross = 0.0f;
+            std::size_t visCount = 0u;
+            for (VisualNodeId cid : childrenCopy) {
+                const VisualNode* child = world.GetNode(cid);
+                if (!child || child->layout.visibility == Visibility::Collapsed) {
+                    continue;
+                }
+                const Size cAvail = isHoriz ? Size{kInf, availH} : Size{availW, kInf};
+                const Size d = MeasureNode(world, cid, cAvail);
+                if (visCount > 0u) {
+                    primarySum += spacing;
+                }
+                primarySum += isHoriz ? d.width : d.height;
+                maxCross = std::max(maxCross, isHoriz ? d.height : d.width);
+                ++visCount;
+            }
+            return isHoriz ? Size{primarySum, maxCross} : Size{maxCross, primarySum};
+        }
+
+        case LayoutMode::Dock: {
+            float usedW = 0.0f;
+            float usedH = 0.0f;
+            float maxTotalW = 0.0f;
+            float maxTotalH = 0.0f;
+            float remW = availW;
+            float remH = availH;
+            for (VisualNodeId cid : childrenCopy) {
+                const VisualNode* child = world.GetNode(cid);
+                if (!child || child->layout.visibility == Visibility::Collapsed) {
+                    continue;
+                }
+                const Size d = MeasureNode(world, cid, Size{remW, remH});
+                switch (child->layout.dock) {
+                    case Dock::Left:
+                    case Dock::Right:
+                        maxTotalH = std::max(maxTotalH, usedH + d.height);
+                        usedW += d.width;
+                        if (std::isfinite(remW)) {
+                            remW = std::max(0.0f, remW - d.width);
+                        }
+                        break;
+                    case Dock::Top:
+                    case Dock::Bottom:
+                        maxTotalW = std::max(maxTotalW, usedW + d.width);
+                        usedH += d.height;
+                        if (std::isfinite(remH)) {
+                            remH = std::max(0.0f, remH - d.height);
+                        }
+                        break;
+                }
+            }
+            return Size{std::max(maxTotalW, usedW), std::max(maxTotalH, usedH)};
+        }
+
+        case LayoutMode::Wrap: {
+            const bool isHoriz = (static_cast<Orientation>(parent.layout.layoutInt0) == Orientation::Horizontal);
+            const bool hasItemW = std::isfinite(parent.layout.layoutParam0) && parent.layout.layoutParam0 > 0.0f;
+            const bool hasItemH = std::isfinite(parent.layout.layoutParam1) && parent.layout.layoutParam1 > 0.0f;
+            const float itemW = hasItemW ? parent.layout.layoutParam0 : availW;
+            const float itemH = hasItemH ? parent.layout.layoutParam1 : availH;
+            const float spacing = (parent.layout.layoutInt1 > 0)
+                ? (static_cast<float>(parent.layout.layoutInt1) * 0.001f)
+                : 0.0f;
+            const float maxPrimary = isHoriz ? availW : availH;
+
+            float curPrimary = 0.0f;
+            float curSecondary = 0.0f;
+            float totalSecondary = 0.0f;
+            float maxLinePrimary = 0.0f;
+            bool firstLine = true;
+            std::size_t itemsInLine = 0u;
+
+            for (VisualNodeId cid : childrenCopy) {
+                const VisualNode* child = world.GetNode(cid);
+                if (!child || child->layout.visibility == Visibility::Collapsed) {
+                    continue;
+                }
+                const Size measured = MeasureNode(world, cid, Size{itemW, itemH});
+                const float cw = hasItemW ? itemW : measured.width;
+                const float ch = hasItemH ? itemH : measured.height;
+                const float cPrimary = isHoriz ? cw : ch;
+                const float cSecondary = isHoriz ? ch : cw;
+
+                const float addPrimary = (itemsInLine > 0u) ? (spacing + cPrimary) : cPrimary;
+                if (itemsInLine > 0u && std::isfinite(maxPrimary) &&
+                    curPrimary + addPrimary > maxPrimary + kLayoutEps) {
+                    maxLinePrimary = std::max(maxLinePrimary, curPrimary);
+                    if (!firstLine) {
+                        totalSecondary += spacing;
+                    }
+                    totalSecondary += curSecondary;
+                    firstLine = false;
+                    curPrimary = cPrimary;
+                    curSecondary = cSecondary;
+                    itemsInLine = 1u;
+                } else {
+                    curPrimary += addPrimary;
+                    curSecondary = std::max(curSecondary, cSecondary);
+                    ++itemsInLine;
+                }
+            }
+            if (itemsInLine > 0u) {
+                maxLinePrimary = std::max(maxLinePrimary, curPrimary);
+                if (!firstLine) {
+                    totalSecondary += spacing;
+                }
+                totalSecondary += curSecondary;
+            }
+            return isHoriz ? Size{maxLinePrimary, totalSecondary} : Size{totalSecondary, maxLinePrimary};
+        }
+
+        case LayoutMode::Grid:
+            return MeasureGridPanel(world, parent, availW, availH);
+
+        case LayoutMode::UniformGrid: {
+            std::size_t visCount = 0u;
+            for (VisualNodeId cid : childrenCopy) {
+                const VisualNode* child = world.GetNode(cid);
+                if (child && child->layout.visibility != Visibility::Collapsed) {
+                    ++visCount;
+                }
+            }
+            int rows = 1, cols = 1, firstCol = 0;
+            ComputeUniformGridDims(parent, visCount, rows, cols, firstCol);
+            const Size cellAvail{
+                std::isfinite(availW) ? (availW / static_cast<float>(cols)) : kInf,
+                std::isfinite(availH) ? (availH / static_cast<float>(rows)) : kInf};
+            float maxCellW = 0.0f;
+            float maxCellH = 0.0f;
+            for (VisualNodeId cid : childrenCopy) {
+                const VisualNode* child = world.GetNode(cid);
+                if (!child || child->layout.visibility == Visibility::Collapsed) {
+                    continue;
+                }
+                const Size d = MeasureNode(world, cid, cellAvail);
+                maxCellW = std::max(maxCellW, d.width);
+                maxCellH = std::max(maxCellH, d.height);
+            }
+            return Size{maxCellW * static_cast<float>(cols), maxCellH * static_cast<float>(rows)};
+        }
+
+        case LayoutMode::Canvas: {
+            for (VisualNodeId cid : childrenCopy) {
+                const VisualNode* child = world.GetNode(cid);
+                if (!child || child->layout.visibility == Visibility::Collapsed) {
+                    continue;
+                }
+                (void)MeasureNode(world, cid, Size{kInf, kInf});
+            }
+            return Size{0.0f, 0.0f};
+        }
+
+        case LayoutMode::ScrollViewport: {
+            const Size childAvail{
+                (parent.layout.layoutInt0 == 1) ? availW : kInf,
+                (parent.layout.layoutInt0 == 2) ? availH : kInf};
+            float extW = 0.0f;
+            float extH = 0.0f;
+            for (VisualNodeId cid : childrenCopy) {
+                const VisualNode* child = world.GetNode(cid);
+                if (!child || child->layout.visibility == Visibility::Collapsed) {
+                    continue;
+                }
+                const Size d = MeasureNode(world, cid, childAvail);
+                extW = std::max(extW, d.width);
+                extH = std::max(extH, d.height);
+            }
+            parent.layout.scrollExtent = Size{extW, extH};
+            return Size{
+                std::isfinite(availW) ? std::min(availW, extW) : extW,
+                std::isfinite(availH) ? std::min(availH, extH) : extH};
+        }
+
+        case LayoutMode::Viewbox: {
+            const float refW = parent.layout.layoutParam0;
+            const float refH = parent.layout.layoutParam1;
+            const auto stretch = static_cast<Stretch>(std::clamp(parent.layout.layoutInt0, 0, 3));
+            const auto stretchDir = static_cast<StretchDirection>(std::clamp(parent.layout.layoutInt1, 0, 2));
+            const bool hasRef = std::isfinite(refW) && refW > 0.0f && std::isfinite(refH) && refH > 0.0f;
+
+            float contentW = hasRef ? refW : 0.0f;
+            float contentH = hasRef ? refH : 0.0f;
+            const Size childAvail = hasRef ? Size{refW, refH} : Size{kInf, kInf};
+            for (VisualNodeId cid : childrenCopy) {
+                const VisualNode* child = world.GetNode(cid);
+                if (!child || child->layout.visibility == Visibility::Collapsed) {
+                    continue;
+                }
+                const Size d = MeasureNode(world, cid, childAvail);
+                if (!hasRef) {
+                    contentW = std::max(contentW, d.width);
+                    contentH = std::max(contentH, d.height);
+                }
+            }
+            float sx = 1.0f;
+            float sy = 1.0f;
+            ComputeViewboxScale(availW, availH, contentW, contentH, stretch, stretchDir, sx, sy);
+            return Size{contentW * sx, contentH * sy};
+        }
+
+        case LayoutMode::CustomCallback: {
+            // Note: CustomMeasureCallback is checked at MeasureNode level; fallback here handles child measurement.
+            float maxW = 0.0f;
+            float maxH = 0.0f;
+            for (VisualNodeId cid : childrenCopy) {
+                const VisualNode* child = world.GetNode(cid);
+                if (!child || child->layout.visibility == Visibility::Collapsed) {
+                    continue;
+                }
+                const Size d = MeasureNode(world, cid, Size{availW, availH});
+                maxW = std::max(maxW, d.width);
+                maxH = std::max(maxH, d.height);
+            }
+            return Size{maxW, maxH};
+        }
+
+        case LayoutMode::Manual:
+        default: {
+            float maxW = 0.0f;
+            float maxH = 0.0f;
+            for (VisualNodeId cid : childrenCopy) {
+                const VisualNode* child = world.GetNode(cid);
+                if (!child || child->layout.visibility == Visibility::Collapsed) {
+                    continue;
+                }
+                const Size d = MeasureNode(world, cid, Size{availW, availH});
+                maxW = std::max(maxW, d.width);
+                maxH = std::max(maxH, d.height);
+            }
+            return Size{maxW, maxH};
+        }
+    }
+}
+
+void ArrangePanelChildren(
+    VisualWorld& world,
+    VisualNode& parent,
+    const Rect& innerRect) {
+    const auto childrenCopy = parent.children;
+
+    switch (parent.layout.layoutMode) {
+        case LayoutMode::Stack: {
+            const bool isHoriz = (static_cast<Orientation>(parent.layout.layoutInt0) == Orientation::Horizontal);
+            const float spacing = std::isfinite(parent.layout.layoutParam0)
+                ? std::max(0.0f, parent.layout.layoutParam0)
+                : 0.0f;
+            float cursor = isHoriz ? innerRect.x : innerRect.y;
+            bool first = true;
+            for (VisualNodeId cid : childrenCopy) {
+                const VisualNode* child = world.GetNode(cid);
+                if (!child) continue;
+                if (child->layout.visibility == Visibility::Collapsed) {
+                    ArrangeNode(world, cid, Rect{innerRect.x, innerRect.y, 0.0f, 0.0f}, false, 1.0f, 1.0f, 0.0f, 0.0f);
+                    continue;
+                }
+                if (!first) {
+                    cursor += spacing;
+                }
+                first = false;
+                const Size d = child->layout.desiredSize;
+                if (isHoriz) {
+                    ArrangeNode(world, cid, Rect{cursor, innerRect.y, d.width, innerRect.height}, false, 1.0f, 1.0f, 0.0f, 0.0f);
+                    cursor += d.width;
+                } else {
+                    ArrangeNode(world, cid, Rect{innerRect.x, cursor, innerRect.width, d.height}, false, 1.0f, 1.0f, 0.0f, 0.0f);
+                    cursor += d.height;
+                }
+            }
+            break;
+        }
+
+        case LayoutMode::Dock: {
+            const bool lastChildFill = (parent.layout.layoutInt0 != 0);
+            VisualNodeId lastVisible{};
+            for (VisualNodeId cid : childrenCopy) {
+                const VisualNode* child = world.GetNode(cid);
+                if (child && child->layout.visibility != Visibility::Collapsed) {
+                    lastVisible = cid;
+                }
+            }
+            Rect rem = innerRect;
+            for (VisualNodeId cid : childrenCopy) {
+                const VisualNode* child = world.GetNode(cid);
+                if (!child) continue;
+                if (child->layout.visibility == Visibility::Collapsed) {
+                    ArrangeNode(world, cid, Rect{rem.x, rem.y, 0.0f, 0.0f}, false, 1.0f, 1.0f, 0.0f, 0.0f);
+                    continue;
+                }
+                if (lastChildFill && cid == lastVisible) {
+                    ArrangeNode(world, cid, rem, false, 1.0f, 1.0f, 0.0f, 0.0f);
+                    continue;
+                }
+                const Size d = child->layout.desiredSize;
+                Rect slot = rem;
+                switch (child->layout.dock) {
+                    case Dock::Left: {
+                        const float w = std::min(rem.width, d.width);
+                        slot = Rect{rem.x, rem.y, w, rem.height};
+                        rem.x += w;
+                        rem.width = std::max(0.0f, rem.width - w);
+                        break;
+                    }
+                    case Dock::Right: {
+                        const float w = std::min(rem.width, d.width);
+                        slot = Rect{rem.x + rem.width - w, rem.y, w, rem.height};
+                        rem.width = std::max(0.0f, rem.width - w);
+                        break;
+                    }
+                    case Dock::Top: {
+                        const float h = std::min(rem.height, d.height);
+                        slot = Rect{rem.x, rem.y, rem.width, h};
+                        rem.y += h;
+                        rem.height = std::max(0.0f, rem.height - h);
+                        break;
+                    }
+                    case Dock::Bottom: {
+                        const float h = std::min(rem.height, d.height);
+                        slot = Rect{rem.x, rem.y + rem.height - h, rem.width, h};
+                        rem.height = std::max(0.0f, rem.height - h);
+                        break;
+                    }
+                }
+                ArrangeNode(world, cid, slot, false, 1.0f, 1.0f, 0.0f, 0.0f);
+            }
+            break;
+        }
+
+        case LayoutMode::Wrap: {
+            const bool isHoriz = (static_cast<Orientation>(parent.layout.layoutInt0) == Orientation::Horizontal);
+            const bool hasItemW = std::isfinite(parent.layout.layoutParam0) && parent.layout.layoutParam0 > 0.0f;
+            const bool hasItemH = std::isfinite(parent.layout.layoutParam1) && parent.layout.layoutParam1 > 0.0f;
+            const float spacing = (parent.layout.layoutInt1 > 0)
+                ? (static_cast<float>(parent.layout.layoutInt1) * 0.001f)
+                : 0.0f;
+            const float maxPrimary = isHoriz ? innerRect.width : innerRect.height;
+
+            struct WrapItem {
+                VisualNodeId id{};
+                float w = 0.0f;
+                float h = 0.0f;
+            };
+            std::vector<WrapItem> line;
+            line.reserve(childrenCopy.size());
+
+            float linePrimary = 0.0f;
+            float lineSecondary = 0.0f;
+            float secCursor = isHoriz ? innerRect.y : innerRect.x;
+
+            auto flushLine = [&]() {
+                if (line.empty()) {
+                    return;
+                }
+                float primCursor = isHoriz ? innerRect.x : innerRect.y;
+                for (std::size_t i = 0u; i < line.size(); ++i) {
+                    if (i > 0u) {
+                        primCursor += spacing;
+                    }
+                    const WrapItem& it = line[i];
+                    const Rect slot = isHoriz
+                        ? Rect{primCursor, secCursor, it.w, lineSecondary}
+                        : Rect{secCursor, primCursor, lineSecondary, it.h};
+                    ArrangeNode(world, it.id, slot, false, 1.0f, 1.0f, 0.0f, 0.0f);
+                    primCursor += isHoriz ? it.w : it.h;
+                }
+                secCursor += lineSecondary + spacing;
+                line.clear();
+                linePrimary = 0.0f;
+                lineSecondary = 0.0f;
+            };
+
+            for (VisualNodeId cid : childrenCopy) {
+                const VisualNode* child = world.GetNode(cid);
+                if (!child) continue;
+                if (child->layout.visibility == Visibility::Collapsed) {
+                    ArrangeNode(world, cid, Rect{innerRect.x, innerRect.y, 0.0f, 0.0f}, false, 1.0f, 1.0f, 0.0f, 0.0f);
+                    continue;
+                }
+                const float cw = hasItemW ? parent.layout.layoutParam0 : child->layout.desiredSize.width;
+                const float ch = hasItemH ? parent.layout.layoutParam1 : child->layout.desiredSize.height;
+                const float cPrimary = isHoriz ? cw : ch;
+                const float cSecondary = isHoriz ? ch : cw;
+                const float addPrimary = line.empty() ? cPrimary : (spacing + cPrimary);
+
+                if (!line.empty() && linePrimary + addPrimary > maxPrimary + kLayoutEps) {
+                    flushLine();
+                }
+                linePrimary += line.empty() ? cPrimary : (spacing + cPrimary);
+                lineSecondary = std::max(lineSecondary, cSecondary);
+                line.push_back(WrapItem{cid, cw, ch});
+            }
+            flushLine();
+            break;
+        }
+
+        case LayoutMode::Grid:
+            ArrangeGridPanel(world, parent, innerRect);
+            break;
+
+        case LayoutMode::UniformGrid: {
+            std::size_t visCount = 0u;
+            for (VisualNodeId cid : childrenCopy) {
+                const VisualNode* child = world.GetNode(cid);
+                if (child && child->layout.visibility != Visibility::Collapsed) {
+                    ++visCount;
+                }
+            }
+            int rows = 1, cols = 1, firstCol = 0;
+            ComputeUniformGridDims(parent, visCount, rows, cols, firstCol);
+            const float cellW = innerRect.width / static_cast<float>(cols);
+            const float cellH = innerRect.height / static_cast<float>(rows);
+            int slotIndex = firstCol;
+            for (VisualNodeId cid : childrenCopy) {
+                const VisualNode* child = world.GetNode(cid);
+                if (!child) continue;
+                if (child->layout.visibility == Visibility::Collapsed) {
+                    ArrangeNode(world, cid, Rect{innerRect.x, innerRect.y, 0.0f, 0.0f}, false, 1.0f, 1.0f, 0.0f, 0.0f);
+                    continue;
+                }
+                const int r = slotIndex / cols;
+                const int c = slotIndex % cols;
+                const Rect cellSlot{
+                    innerRect.x + static_cast<float>(c) * cellW,
+                    innerRect.y + static_cast<float>(r) * cellH,
+                    cellW,
+                    cellH};
+                ArrangeNode(world, cid, cellSlot, false, 1.0f, 1.0f, 0.0f, 0.0f);
+                ++slotIndex;
+            }
+            break;
+        }
+
+        case LayoutMode::Canvas: {
+            for (VisualNodeId cid : childrenCopy) {
+                const VisualNode* child = world.GetNode(cid);
+                if (!child) continue;
+                if (child->layout.visibility == Visibility::Collapsed) {
+                    ArrangeNode(world, cid, Rect{innerRect.x, innerRect.y, 0.0f, 0.0f}, false, 1.0f, 1.0f, 0.0f, 0.0f);
+                    continue;
+                }
+                const Size d = child->layout.desiredSize;
+                float x = innerRect.x;
+                if (!std::isnan(child->layout.canvasLeft)) {
+                    x = innerRect.x + child->layout.canvasLeft;
+                } else if (!std::isnan(child->layout.canvasRight)) {
+                    x = innerRect.x + innerRect.width - child->layout.canvasRight - d.width;
+                }
+                float y = innerRect.y;
+                if (!std::isnan(child->layout.canvasTop)) {
+                    y = innerRect.y + child->layout.canvasTop;
+                } else if (!std::isnan(child->layout.canvasBottom)) {
+                    y = innerRect.y + innerRect.height - child->layout.canvasBottom - d.height;
+                }
+                ArrangeNode(world, cid, Rect{x, y, d.width, d.height}, false, 1.0f, 1.0f, 0.0f, 0.0f);
+            }
+            break;
+        }
+
+        case LayoutMode::ScrollViewport: {
+            float extW = 0.0f;
+            float extH = 0.0f;
+            for (VisualNodeId cid : childrenCopy) {
+                const VisualNode* child = world.GetNode(cid);
+                if (child && child->layout.visibility != Visibility::Collapsed) {
+                    extW = std::max(extW, child->layout.desiredSize.width);
+                    extH = std::max(extH, child->layout.desiredSize.height);
+                }
+            }
+            parent.layout.scrollExtent = Size{extW, extH};
+            const float ox = std::isfinite(parent.layout.scrollOffsetX) ? parent.layout.scrollOffsetX : 0.0f;
+            const float oy = std::isfinite(parent.layout.scrollOffsetY) ? parent.layout.scrollOffsetY : 0.0f;
+            for (VisualNodeId cid : childrenCopy) {
+                const VisualNode* child = world.GetNode(cid);
+                if (!child) continue;
+                if (child->layout.visibility == Visibility::Collapsed) {
+                    ArrangeNode(world, cid, Rect{innerRect.x, innerRect.y, 0.0f, 0.0f}, false, 1.0f, 1.0f, 0.0f, 0.0f);
+                    continue;
+                }
+                const float cw = std::max(innerRect.width, child->layout.desiredSize.width);
+                const float ch = std::max(innerRect.height, child->layout.desiredSize.height);
+                ArrangeNode(
+                    world,
+                    cid,
+                    Rect{innerRect.x - ox, innerRect.y - oy, cw, ch},
+                    false,
+                    1.0f,
+                    1.0f,
+                    0.0f,
+                    0.0f);
+            }
+            break;
+        }
+
+        case LayoutMode::Viewbox: {
+            const float refW = parent.layout.layoutParam0;
+            const float refH = parent.layout.layoutParam1;
+            const auto stretch = static_cast<Stretch>(std::clamp(parent.layout.layoutInt0, 0, 3));
+            const auto stretchDir = static_cast<StretchDirection>(std::clamp(parent.layout.layoutInt1, 0, 2));
+            const bool hasRef = std::isfinite(refW) && refW > 0.0f && std::isfinite(refH) && refH > 0.0f;
+
+            float contentW = hasRef ? refW : 0.0f;
+            float contentH = hasRef ? refH : 0.0f;
+            if (!hasRef) {
+                for (VisualNodeId cid : childrenCopy) {
+                    const VisualNode* child = world.GetNode(cid);
+                    if (child && child->layout.visibility != Visibility::Collapsed) {
+                        contentW = std::max(contentW, child->layout.desiredSize.width);
+                        contentH = std::max(contentH, child->layout.desiredSize.height);
+                    }
+                }
+            }
+            float sx = 1.0f;
+            float sy = 1.0f;
+            ComputeViewboxScale(innerRect.width, innerRect.height, contentW, contentH, stretch, stretchDir, sx, sy);
+            const float destX = innerRect.x + (innerRect.width - contentW * sx) * 0.5f;
+            const float destY = innerRect.y + (innerRect.height - contentH * sy) * 0.5f;
+
+            for (VisualNodeId cid : childrenCopy) {
+                const VisualNode* child = world.GetNode(cid);
+                if (!child) continue;
+                if (child->layout.visibility == Visibility::Collapsed) {
+                    ArrangeNode(world, cid, Rect{innerRect.x, innerRect.y, 0.0f, 0.0f}, true, 1.0f, 1.0f, 0.0f, 0.0f);
+                    continue;
+                }
+                ArrangeNode(
+                    world,
+                    cid,
+                    Rect{destX, destY, contentW, contentH},
+                    true,
+                    sx,
+                    sy,
+                    destX,
+                    destY);
+            }
+            break;
+        }
+
+        case LayoutMode::CustomCallback:
+        case LayoutMode::Manual:
+        default: {
+            for (VisualNodeId cid : childrenCopy) {
+                ArrangeNode(world, cid, innerRect, false, 1.0f, 1.0f, 0.0f, 0.0f);
+            }
+            break;
+        }
+    }
+}
+
+Size MeasureNode(VisualWorld& world, VisualNodeId id, Size availSize) {
+    VisualNode* node = world.GetNode(id);
+    if (!node) {
+        return Size{0.0f, 0.0f};
+    }
+
+    if (node->layout.visibility == Visibility::Collapsed) {
+        node->layout.desiredSize = Size{0.0f, 0.0f};
+        node->layout.lastMeasureConstraint = availSize;
+        node->layout.hasValidMeasure = true;
+        return Size{0.0f, 0.0f};
+    }
+
+    if (node->layout.hasValidMeasure &&
+        SameSizeConstraint(node->layout.lastMeasureConstraint, availSize)) {
+        return node->layout.desiredSize;
+    }
+
+    if (const auto& customMeasure = world.CustomMeasureHook();
+        customMeasure &&
+        (node->layout.layoutMode == LayoutMode::CustomCallback ||
+         (node->callbackMask & VisualCallback_CustomMeasure) != 0u)) {
+        const Size customDesired = customMeasure(world, id, availSize);
+        node->layout.desiredSize = customDesired;
+        node->layout.lastMeasureConstraint = availSize;
+        node->layout.hasValidMeasure = true;
+        node->layout.hasValidArrange = false;
+        return customDesired;
+    }
+
+    const float marginH = std::max(0.0f, node->layout.margin.left) + std::max(0.0f, node->layout.margin.right);
+    const float marginV = std::max(0.0f, node->layout.margin.top) + std::max(0.0f, node->layout.margin.bottom);
+    const float padH = std::max(0.0f, node->layout.padding.left) + std::max(0.0f, node->layout.padding.right);
+    const float padV = std::max(0.0f, node->layout.padding.top) + std::max(0.0f, node->layout.padding.bottom);
+
+    float minW = 0.0f, maxW = kInf, innerAvailW = kInf;
+    float minH = 0.0f, maxH = kInf, innerAvailH = kInf;
+    ComputeAxisConstraint(
+        node->layout.width,
         node->layout.minWidth,
-        node->layout.maxWidth);
-    const float targetH = std::clamp(
-        ResolveSizeOrFallback(node->layout.height, availableRect.height - marginV, 0.0f),
+        node->layout.maxWidth,
+        padH,
+        marginH,
+        availSize.width,
+        true,
+        minW,
+        maxW,
+        innerAvailW);
+    ComputeAxisConstraint(
+        node->layout.height,
         node->layout.minHeight,
-        node->layout.maxHeight);
+        node->layout.maxHeight,
+        padV,
+        marginV,
+        availSize.height,
+        true,
+        minH,
+        maxH,
+        innerAvailH);
 
-    node->layout.desiredSize = Size{targetW + marginH, targetH + marginV};
-    node->layout.layoutRect = Rect{
-        availableRect.x + node->layout.margin.left,
-        availableRect.y + node->layout.margin.top,
-        targetW,
-        targetH};
+    Size contentDesired = MeasureIntrinsicContent(world, *node, innerAvailW, innerAvailH);
+    if (!node->children.empty()) {
+        const Size panelDesired = MeasurePanelChildren(world, *node, innerAvailW, innerAvailH);
+        contentDesired.width = std::max(contentDesired.width, panelDesired.width);
+        contentDesired.height = std::max(contentDesired.height, panelDesired.height);
+    }
 
+    const float desiredBoxW = std::clamp(contentDesired.width + padH, minW, maxW);
+    const float desiredBoxH = std::clamp(contentDesired.height + padV, minH, maxH);
+
+    node->layout.desiredSize = Size{
+        std::isfinite(desiredBoxW) ? (desiredBoxW + marginH) : marginH,
+        std::isfinite(desiredBoxH) ? (desiredBoxH + marginV) : marginV};
+    node->layout.lastMeasureConstraint = availSize;
+    node->layout.hasValidMeasure = true;
+    node->layout.hasValidArrange = false;
+    return node->layout.desiredSize;
+}
+
+void ArrangeNode(
+    VisualWorld& world,
+    VisualNodeId id,
+    Rect finalSlot,
+    bool parentWasViewbox,
+    float viewboxSx,
+    float viewboxSy,
+    float viewboxOx,
+    float viewboxOy) {
+    VisualNode* node = world.GetNode(id);
+    if (!node) {
+        return;
+    }
+
+    if (node->layout.visibility == Visibility::Collapsed) {
+        const Rect collapsedRect{finalSlot.x, finalSlot.y, 0.0f, 0.0f};
+        const bool rectChanged = !SameRectExact(node->layout.layoutRect, collapsedRect);
+        node->layout.layoutRect = collapsedRect;
+        node->layout.lastArrangeSlot = finalSlot;
+        node->layout.hasValidArrange = true;
+        if (rectChanged) {
+            node->dirtyFlags = static_cast<std::uint8_t>(node->dirtyFlags | VisualDirty_Transform | VisualDirty_Visual);
+        }
+        return;
+    }
+
+    const float nextVbSx = parentWasViewbox ? viewboxSx : 1.0f;
+    const float nextVbSy = parentWasViewbox ? viewboxSy : 1.0f;
+    const float nextVbOx = parentWasViewbox ? viewboxOx : 0.0f;
+    const float nextVbOy = parentWasViewbox ? viewboxOy : 0.0f;
+    const bool vbChanged =
+        !SameFloatOrBothNaN(node->layout.viewboxScaleX, nextVbSx) ||
+        !SameFloatOrBothNaN(node->layout.viewboxScaleY, nextVbSy) ||
+        !SameFloatOrBothNaN(node->layout.viewboxOriginX, nextVbOx) ||
+        !SameFloatOrBothNaN(node->layout.viewboxOriginY, nextVbOy);
+    node->layout.viewboxScaleX = nextVbSx;
+    node->layout.viewboxScaleY = nextVbSy;
+    node->layout.viewboxOriginX = nextVbOx;
+    node->layout.viewboxOriginY = nextVbOy;
+
+    if (!vbChanged &&
+        node->layout.hasValidArrange &&
+        SameRectExact(node->layout.lastArrangeSlot, finalSlot)) {
+        return;
+    }
+
+    if (const auto& customArrange = world.CustomArrangeHook();
+        customArrange &&
+        (node->layout.layoutMode == LayoutMode::CustomCallback ||
+         (node->callbackMask & VisualCallback_CustomArrange) != 0u)) {
+        const bool rectChanged = !SameRectExact(node->layout.layoutRect, finalSlot) || vbChanged;
+        node->layout.layoutRect = finalSlot;
+        node->layout.lastArrangeSlot = finalSlot;
+        node->layout.hasValidArrange = true;
+        if (rectChanged) {
+            node->dirtyFlags = static_cast<std::uint8_t>(node->dirtyFlags | VisualDirty_Transform | VisualDirty_Visual);
+        }
+        customArrange(world, id, finalSlot);
+        return;
+    }
+
+    const float mL = std::max(0.0f, node->layout.margin.left);
+    const float mT = std::max(0.0f, node->layout.margin.top);
+    const float mR = std::max(0.0f, node->layout.margin.right);
+    const float mB = std::max(0.0f, node->layout.margin.bottom);
+    const float marginH = mL + mR;
+    const float marginV = mT + mB;
+
+    const float availBoxW = std::max(0.0f, finalSlot.width - marginH);
+    const float availBoxH = std::max(0.0f, finalSlot.height - marginV);
+
+    const float minW = std::max(0.0f, std::isfinite(node->layout.minWidth) ? node->layout.minWidth : 0.0f);
+    const float maxW = std::max(minW, (std::isnan(node->layout.maxWidth) || node->layout.maxWidth < 0.0f) ? kInf : node->layout.maxWidth);
+    const float minH = std::max(0.0f, std::isfinite(node->layout.minHeight) ? node->layout.minHeight : 0.0f);
+    const float maxH = std::max(minH, (std::isnan(node->layout.maxHeight) || node->layout.maxHeight < 0.0f) ? kInf : node->layout.maxHeight);
+
+    const float desiredContentW = std::max(0.0f, node->layout.desiredSize.width - marginH);
+    const float desiredContentH = std::max(0.0f, node->layout.desiredSize.height - marginV);
+
+    float targetW = 0.0f;
+    if (std::isfinite(node->layout.width) && node->layout.width >= 0.0f) {
+        targetW = std::clamp(node->layout.width, minW, maxW);
+    } else if (node->layout.hAlign == HorizontalAlignment::Stretch) {
+        targetW = std::clamp(availBoxW, minW, maxW);
+    } else {
+        targetW = std::clamp(desiredContentW, minW, maxW);
+    }
+
+    float targetH = 0.0f;
+    if (std::isfinite(node->layout.height) && node->layout.height >= 0.0f) {
+        targetH = std::clamp(node->layout.height, minH, maxH);
+    } else if (node->layout.vAlign == VerticalAlignment::Stretch) {
+        targetH = std::clamp(availBoxH, minH, maxH);
+    } else {
+        targetH = std::clamp(desiredContentH, minH, maxH);
+    }
+
+    float posX = finalSlot.x + mL;
+    switch (node->layout.hAlign) {
+        case HorizontalAlignment::Left:
+            posX = finalSlot.x + mL;
+            break;
+        case HorizontalAlignment::Center:
+        case HorizontalAlignment::Stretch:
+            posX = finalSlot.x + mL + (availBoxW - targetW) * 0.5f;
+            break;
+        case HorizontalAlignment::Right:
+            posX = finalSlot.x + mL + (availBoxW - targetW);
+            break;
+    }
+
+    float posY = finalSlot.y + mT;
+    switch (node->layout.vAlign) {
+        case VerticalAlignment::Top:
+            posY = finalSlot.y + mT;
+            break;
+        case VerticalAlignment::Center:
+        case VerticalAlignment::Stretch:
+            posY = finalSlot.y + mT + (availBoxH - targetH) * 0.5f;
+            break;
+        case VerticalAlignment::Bottom:
+            posY = finalSlot.y + mT + (availBoxH - targetH);
+            break;
+    }
+
+    const Rect newLayoutRect{posX, posY, targetW, targetH};
+    const bool rectChanged = !SameRectExact(node->layout.layoutRect, newLayoutRect) || vbChanged;
+    node->layout.layoutRect = newLayoutRect;
+    node->layout.lastArrangeSlot = finalSlot;
+    node->layout.hasValidArrange = true;
+    if (rectChanged) {
+        node->dirtyFlags = static_cast<std::uint8_t>(node->dirtyFlags | VisualDirty_Transform | VisualDirty_Visual);
+    }
+
+    const float pL = std::max(0.0f, node->layout.padding.left);
+    const float pT = std::max(0.0f, node->layout.padding.top);
+    const float pR = std::max(0.0f, node->layout.padding.right);
+    const float pB = std::max(0.0f, node->layout.padding.bottom);
     const Rect innerRect{
-        node->layout.layoutRect.x + node->layout.padding.left,
-        node->layout.layoutRect.y + node->layout.padding.top,
-        std::max(0.0f, targetW - (node->layout.padding.left + node->layout.padding.right)),
-        std::max(0.0f, targetH - (node->layout.padding.top + node->layout.padding.bottom))};
+        posX + pL,
+        posY + pT,
+        std::max(0.0f, targetW - (pL + pR)),
+        std::max(0.0f, targetH - (pT + pB))};
 
-    const auto childrenCopy = node->children;
-    for (VisualNodeId childId : childrenCopy) {
-        LayoutNodeRecursive(world, childId, innerRect);
+    if (!node->children.empty()) {
+        ArrangePanelChildren(world, *node, innerRect);
+    }
+}
+
+[[nodiscard]] Matrix2D ComputeNodeLocalMatrix2D(const VisualNode& node) noexcept {
+    const Rect& rect = node.layout.layoutRect;
+    const VisualTransform2D& t = node.transform2D;
+    const bool hasViewboxScale =
+        std::fabs(node.layout.viewboxScaleX - 1.0f) > 1e-6f ||
+        std::fabs(node.layout.viewboxScaleY - 1.0f) > 1e-6f;
+    Matrix2D viewboxM = Matrix2D::Identity();
+    if (hasViewboxScale) {
+        viewboxM = Matrix2D::Scaling(node.layout.viewboxScaleX, node.layout.viewboxScaleY)
+                       .AroundPivot(node.layout.viewboxOriginX, node.layout.viewboxOriginY);
+    }
+
+    const bool hasT2 =
+        t.tx != 0.0f || t.ty != 0.0f ||
+        std::fabs(t.sx - 1.0f) > 1e-6f || std::fabs(t.sy - 1.0f) > 1e-6f ||
+        std::fabs(t.rotDeg) > 1e-6f ||
+        std::fabs(t.skewX) > 1e-6f || std::fabs(t.skewY) > 1e-6f;
+    if (!hasT2) {
+        return viewboxM;
+    }
+
+    Matrix2D localM = Matrix2D::Identity();
+    if (std::fabs(t.sx - 1.0f) > 1e-6f || std::fabs(t.sy - 1.0f) > 1e-6f) {
+        localM = Matrix2D::Multiply(Matrix2D::Scaling(t.sx, t.sy), localM);
+    }
+    if (std::fabs(t.skewX) > 1e-6f || std::fabs(t.skewY) > 1e-6f) {
+        localM = Matrix2D::Multiply(Matrix2D::Skew(t.skewX, t.skewY), localM);
+    }
+    if (std::fabs(t.rotDeg) > 1e-6f) {
+        localM = Matrix2D::Multiply(Matrix2D::Rotation(t.rotDeg), localM);
+    }
+    const float pivotX = rect.x + rect.width * t.originX;
+    const float pivotY = rect.y + rect.height * t.originY;
+    localM = localM.AroundPivot(pivotX, pivotY);
+    localM.tx += t.tx;
+    localM.ty += t.ty;
+    return hasViewboxScale ? Matrix2D::Multiply(viewboxM, localM) : localM;
+}
+
+void UpdateWorldTransformsRecursive(
+    VisualWorld& world,
+    VisualNodeId id,
+    const Matrix2D& parentWorld2D,
+    const Matrix4x4& parentWorld3D,
+    bool parentHas3D) noexcept {
+    VisualNode* node = world.GetNode(id);
+    if (!node) {
+        return;
+    }
+
+    const Matrix2D local2D = ComputeNodeLocalMatrix2D(*node);
+    const Matrix2D world2D = local2D.IsIdentity()
+        ? parentWorld2D
+        : Matrix2D::Multiply(parentWorld2D, local2D);
+    node->layout.worldTransform = world2D;
+
+    const VisualTransform3D& t3 = node->transform3D;
+    const bool hasLocal3D = t3.enabled && (
+        std::fabs(t3.rx) > 1e-6f || std::fabs(t3.ry) > 1e-6f || std::fabs(t3.rz) > 1e-6f ||
+        std::fabs(t3.tx) > 1e-6f || std::fabs(t3.ty) > 1e-6f || std::fabs(t3.tz) > 1e-6f ||
+        t3.camDist > 0.0f);
+
+    Matrix4x4 nextWorld3D{};
+    const bool nextHas3D = parentHas3D || hasLocal3D;
+    node->layout.hasPerspective3D = nextHas3D;
+
+    if (nextHas3D) {
+        Matrix4x4 base3D = parentHas3D ? parentWorld3D : Matrix4x4::FromMatrix2D(parentWorld2D);
+        if (!local2D.IsIdentity()) {
+            base3D = Matrix4x4::Multiply(base3D, Matrix4x4::FromMatrix2D(local2D));
+        }
+        if (hasLocal3D) {
+            CompositeTransform3DParams params{};
+            params.rotationX = t3.rx;
+            params.rotationY = t3.ry;
+            params.rotationZ = t3.rz;
+            params.translateX = t3.tx;
+            params.translateY = t3.ty;
+            params.translateZ = t3.tz;
+            params.cameraDistance = t3.camDist;
+            const float pivotX = node->layout.layoutRect.x + node->layout.layoutRect.width * node->transform2D.originX;
+            const float pivotY = node->layout.layoutRect.y + node->layout.layoutRect.height * node->transform2D.originY;
+            const Matrix4x4 local3D = Matrix4x4::FromCompositeTransform3D(params, pivotX, pivotY, 0.0f, pivotX, pivotY);
+            nextWorld3D = Matrix4x4::Multiply(base3D, local3D);
+        } else {
+            nextWorld3D = base3D;
+        }
+        node->layout.worldMatrix3D = nextWorld3D;
+    } else {
+        node->layout.worldMatrix3D = Matrix4x4{};
+    }
+
+    node->dirtyFlags = static_cast<std::uint8_t>(node->dirtyFlags & ~VisualDirty_Transform);
+
+    for (VisualNodeId cid : node->children) {
+        UpdateWorldTransformsRecursive(world, cid, world2D, nextWorld3D, nextHas3D);
     }
 }
 
@@ -63,9 +1536,193 @@ void VisualWorld::UpdateLayout(float viewportWidth, float viewportHeight) {
     if (!rootId_.IsValid()) {
         return;
     }
-    const float safeW = std::max(0.0f, viewportWidth);
-    const float safeH = std::max(0.0f, viewportHeight);
-    LayoutNodeRecursive(*this, rootId_, Rect{0.0f, 0.0f, safeW, safeH});
+    VisualNode* rootNode = GetNode(rootId_);
+    if (!rootNode) {
+        return;
+    }
+
+    const float safeW = std::max(0.0f, std::isfinite(viewportWidth) ? viewportWidth : 0.0f);
+    const float safeH = std::max(0.0f, std::isfinite(viewportHeight) ? viewportHeight : 0.0f);
+    const Size viewportAvail{safeW, safeH};
+    const Rect viewportSlot{0.0f, 0.0f, safeW, safeH};
+
+    const bool viewportChanged =
+        !SameFloatOrBothNaN(lastViewportSize_.width, safeW) ||
+        !SameFloatOrBothNaN(lastViewportSize_.height, safeH);
+    const bool rootChanged = (lastLaidOutRoot_ != rootId_);
+    if (viewportChanged || rootChanged || !rootNode->layout.hasValidMeasure || !rootNode->layout.hasValidArrange) {
+        RefreshSubtreeDepths(rootId_, 0u);
+        rootNode->layout.hasValidMeasure = false;
+        rootNode->layout.hasValidArrange = false;
+        rootNode->dirtyFlags = static_cast<std::uint8_t>(rootNode->dirtyFlags | VisualDirty_Layout);
+        lastViewportSize_ = viewportAvail;
+        lastLaidOutRoot_ = rootId_;
+    }
+
+    for (auto& bucket : measureDepthBuckets_) {
+        bucket.clear();
+    }
+    for (auto& bucket : arrangeDepthBuckets_) {
+        bucket.clear();
+    }
+    for (auto& bucket : transformDepthBuckets_) {
+        bucket.clear();
+    }
+
+    const std::size_t slots = ArenaSlotCount();
+    for (std::size_t s = 0u; s < slots; ++s) {
+        VisualNode* n = NodeAtSlot(s);
+        if (!n) {
+            continue;
+        }
+        const std::uint8_t depth = std::min<std::uint8_t>(n->layout.treeDepth, 63u);
+        if ((n->dirtyFlags & (VisualDirty_Layout | VisualDirty_Structure)) != 0u) {
+            if ((n->dirtyFlags & VisualDirty_Structure) != 0u) {
+                RefreshSubtreeDepths(n->id, depth);
+            }
+            if (!n->layout.hasValidMeasure || std::isnan(n->layout.lastMeasureConstraint.width)) {
+                // Never measured before: bubble invalidation to nearest ancestor that has a valid constraint (or root)
+                VisualNode* cur = n;
+                while (cur) {
+                    cur->layout.hasValidMeasure = false;
+                    cur->layout.hasValidArrange = false;
+                    cur->dirtyFlags = static_cast<std::uint8_t>(cur->dirtyFlags | VisualDirty_Layout);
+                    if (!cur->parent.IsValid() || !std::isnan(cur->layout.lastMeasureConstraint.width)) {
+                        const std::uint8_t cd = std::min<std::uint8_t>(cur->layout.treeDepth, 63u);
+                        measureDepthBuckets_[cd].push_back(cur->id);
+                        arrangeDepthBuckets_[cd].push_back(cur->id);
+                        break;
+                    }
+                    cur = GetNode(cur->parent);
+                }
+            } else {
+                n->layout.hasValidMeasure = false;
+                n->layout.hasValidArrange = false;
+                measureDepthBuckets_[depth].push_back(n->id);
+                arrangeDepthBuckets_[depth].push_back(n->id);
+            }
+        }
+        if ((n->dirtyFlags & VisualDirty_Transform) != 0u) {
+            transformDepthBuckets_[depth].push_back(n->id);
+        }
+    }
+
+    // Phase 1: 64-level depth-bucket bottom-up Measure (depth 63 -> 0)
+    // Only re-measures dirty nodes with cached constraints and bubbles upward only when desiredSize actually changes.
+    for (std::size_t pass = 0u; pass < 4u; ++pass) {
+        bool anyMeasuredInPass = false;
+        for (int d = 63; d >= 0; --d) {
+            auto& bucket = measureDepthBuckets_[static_cast<std::size_t>(d)];
+            if (bucket.empty()) {
+                continue;
+            }
+            for (std::size_t i = 0u; i < bucket.size(); ++i) {
+                const VisualNodeId nid = bucket[i];
+                VisualNode* node = GetNode(nid);
+                if (!node || node->layout.hasValidMeasure) {
+                    continue;
+                }
+                const Size constraint = (nid == rootId_)
+                    ? viewportAvail
+                    : node->layout.lastMeasureConstraint;
+                if (std::isnan(constraint.width)) {
+                    continue;
+                }
+                const Size prevDesired = node->layout.desiredSize;
+                const Size newDesired = MeasureNode(*this, nid, constraint);
+                anyMeasuredInPass = true;
+
+                arrangeDepthBuckets_[static_cast<std::size_t>(d)].push_back(nid);
+                if (nid != rootId_ && node->parent.IsValid() &&
+                    (!SameFloatOrBothNaN(prevDesired.width, newDesired.width) ||
+                     !SameFloatOrBothNaN(prevDesired.height, newDesired.height))) {
+                    if (VisualNode* p = GetNode(node->parent)) {
+                        p->layout.hasValidMeasure = false;
+                        p->layout.hasValidArrange = false;
+                        p->dirtyFlags = static_cast<std::uint8_t>(p->dirtyFlags | VisualDirty_Layout);
+                        const std::uint8_t pd = std::min<std::uint8_t>(p->layout.treeDepth, 63u);
+                        measureDepthBuckets_[pd].push_back(p->id);
+                        arrangeDepthBuckets_[pd].push_back(p->id);
+                    }
+                }
+            }
+            bucket.clear();
+        }
+        if (!anyMeasuredInPass) {
+            break;
+        }
+    }
+
+    // Phase 2: 64-level depth-bucket top-down Arrange (depth 0 -> 63)
+    for (int d = 0; d < 64; ++d) {
+        auto& bucket = arrangeDepthBuckets_[static_cast<std::size_t>(d)];
+        for (const VisualNodeId nid : bucket) {
+            VisualNode* node = GetNode(nid);
+            if (!node || node->layout.hasValidArrange) {
+                continue;
+            }
+            const Rect slot = (nid == rootId_) ? viewportSlot : node->layout.lastArrangeSlot;
+            if (std::isnan(slot.width)) {
+                continue;
+            }
+            const VisualNode* parentNode =
+                (nid != rootId_ && node->parent.IsValid()) ? GetNode(node->parent) : nullptr;
+            const bool parentIsVb =
+                parentNode && parentNode->layout.layoutMode == LayoutMode::Viewbox;
+            ArrangeNode(
+                *this,
+                nid,
+                slot,
+                parentIsVb,
+                parentIsVb ? node->layout.viewboxScaleX : 1.0f,
+                parentIsVb ? node->layout.viewboxScaleY : 1.0f,
+                parentIsVb ? node->layout.viewboxOriginX : 0.0f,
+                parentIsVb ? node->layout.viewboxOriginY : 0.0f);
+            if ((node->dirtyFlags & VisualDirty_Transform) != 0u) {
+                const std::uint8_t td = std::min<std::uint8_t>(node->layout.treeDepth, 63u);
+                transformDepthBuckets_[td].push_back(nid);
+            }
+        }
+        bucket.clear();
+    }
+
+    // Phase 3: Incremental top-down 2D + 3D world transform propagation (depth 0 -> 63)
+    for (int d = 0; d < 64; ++d) {
+        auto& bucket = transformDepthBuckets_[static_cast<std::size_t>(d)];
+        for (const VisualNodeId nid : bucket) {
+            VisualNode* node = GetNode(nid);
+            if (!node || (node->dirtyFlags & VisualDirty_Transform) == 0u) {
+                continue;
+            }
+            Matrix2D pWorld2D = Matrix2D::Identity();
+            Matrix4x4 pWorld3D{};
+            bool pHas3D = false;
+            if (nid != rootId_ && node->parent.IsValid()) {
+                if (const VisualNode* p = GetNode(node->parent)) {
+                    pWorld2D = p->layout.worldTransform;
+                    pWorld3D = p->layout.worldMatrix3D;
+                    pHas3D = p->layout.hasPerspective3D;
+                }
+            }
+            UpdateWorldTransformsRecursive(*this, nid, pWorld2D, pWorld3D, pHas3D);
+        }
+        bucket.clear();
+    }
+
+    // Clear geometry dirty bits; leave VisualDirty_Visual intact for VisualRenderAdapter::SyncPagedRenderTree.
+    bool stillVisualDirty = false;
+    for (std::size_t s = 0u; s < slots; ++s) {
+        VisualNode* n = NodeAtSlot(s);
+        if (!n) {
+            continue;
+        }
+        n->dirtyFlags = static_cast<std::uint8_t>(
+            n->dirtyFlags & ~(VisualDirty_Layout | VisualDirty_Structure | VisualDirty_Transform));
+        if (n->dirtyFlags != VisualDirty_Clean || n->drawDirty) {
+            stillVisualDirty = true;
+        }
+    }
+    anyDirty_ = stillVisualDirty;
 }
 
 } // namespace aero
