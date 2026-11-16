@@ -1,5 +1,0 @@
-<Class Name="ButtonsViewModel">
-  <Property Name="StartCommand" Type="Command"/>
-  <Property Name="SettingsCommand" Type="Command"/>
-  <Property Name="ExitCommand" Type="Command"/>
-</Class>

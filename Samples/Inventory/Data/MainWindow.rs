@@ -21,7 +21,7 @@ public enum ItemCategory
 }
 
 [Observable]
-public class Item
+public class Item : ViewModelBase
 {
     public string Name { get; set; } = "";
     public string Description { get; set; } = "";
@@ -75,7 +75,7 @@ public class Item
 }
 
 [Observable]
-public class Player
+public class Player : ViewModelBase
 {
     public string Name { get; set; } = "";
     public int Life { get; set; } = 0;
@@ -109,7 +109,7 @@ public class Player
 }
 
 [Observable]
-public class ViewModel
+public class ViewModel : ViewModelBase
 {
     public Platform Platform { get; set; } = Platform.PC;
     public Player Player { get; set; } = null;
@@ -403,17 +403,17 @@ public class ViewModel
 }
 
 [Observable]
-public partial class MainWindow
+public partial class MainWindow : Page
 {
     public ViewModel ViewModel { get; set; } = null;
 
     public MainWindow()
     {
-        Application_SetResources("Resources.xaml");
         this.InitializeComponent();
 
         this.ViewModel = new ViewModel();
-        this.SetDataContext<ViewModel>(this.ViewModel);
+        this.DataContext = this.ViewModel;
+        BindingEngine.Flush();
     }
 
     public void OnInitialized()

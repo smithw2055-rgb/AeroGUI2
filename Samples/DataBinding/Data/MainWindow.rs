@@ -3,7 +3,7 @@ module DataBinding;
 import Aero.UI;
 
 [Observable]
-public class SolarSystemObject
+public class SolarSystemObject : ViewModelBase
 {
     public string Name { get; set; } = "";
     public float Orbit { get; set; } = 0.0f;
@@ -26,7 +26,7 @@ public class SolarSystemObject
 }
 
 [Observable]
-public class SolarSystem
+public class SolarSystem : ViewModelBase
 {
     public ObservableList<SolarSystemObject> SolarSystemObjects { get; set; }
     public SolarSystemObject SelectedObject { get; set; }
@@ -190,17 +190,17 @@ public class ViewModel : SolarSystem
 }
 
 [Observable]
-public partial class MainWindow
+public partial class MainWindow : Page
 {
-    public SolarSystem DataContext { get; set; } = null;
-    public SolarSystem ViewModel { get { return this.DataContext; } }
+    public SolarSystem ViewModel { get; set; } = null;
 
     public MainWindow()
     {
         this.InitializeComponent();
 
-        this.DataContext = new SolarSystem();
-        this.SetDataContext<SolarSystem>(this.DataContext);
+        this.ViewModel = new SolarSystem();
+        this.DataContext = this.ViewModel;
+        BindingEngine.Flush();
     }
 
     public void OnInitialized()
@@ -209,32 +209,32 @@ public partial class MainWindow
 
     public void SelectByIndex(int index)
     {
-        this.DataContext.SelectByIndex(index);
+        this.ViewModel.SelectByIndex(index);
     }
 
     public void SelectByName(string name)
     {
-        this.DataContext.SelectByName(name);
+        this.ViewModel.SelectByName(name);
     }
 
     public void SelectObject(SolarSystemObject target)
     {
-        this.DataContext.SelectObject(target);
+        this.ViewModel.SelectObject(target);
     }
 
     public void SelectNext()
     {
-        this.DataContext.SelectNext();
+        this.ViewModel.SelectNext();
     }
 
     public void SelectPrevious()
     {
-        this.DataContext.SelectPrevious();
+        this.ViewModel.SelectPrevious();
     }
 
     public void ClearSelection()
     {
-        this.DataContext.ClearSelection();
+        this.ViewModel.ClearSelection();
     }
 }
 

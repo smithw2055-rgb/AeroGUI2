@@ -2,7 +2,7 @@ module Gallery;
 import Aero.UI;
 
 [Observable]
-public class Sample
+public class Sample : ViewModelBase
 {
     public string Name { get; set; } = "";
     public string Icon { get; set; } = "";
@@ -21,7 +21,7 @@ public class Sample
 }
 
 [Observable]
-public class Category
+public class Category : ViewModelBase
 {
     public string Name { get; set; } = "";
     public ObservableList<Sample> Samples { get; set; } = null;
@@ -39,7 +39,7 @@ public class Category
 }
 
 [Observable]
-public class ColorItem
+public class ColorItem : ViewModelBase
 {
     public string Name { get; set; } = "";
     public string Color { get; set; } = "#FF000000";
@@ -56,7 +56,7 @@ public class ColorItem
 }
 
 [Observable]
-public class ViewModel
+public class ViewModel : ViewModelBase
 {
     public MainWindow Window { get; set; } = null;
     public ObservableList<Category> Categories { get; set; } = null;
@@ -75,6 +75,7 @@ public class ViewModel
             if (this._selectedSample != value)
             {
                 this._selectedSample = value;
+                this.NotifyPropertyChanged("SelectedSample");
                 if (this.Window != null && value != null)
                 {
                     this.Window.UpdateSample(value.Name);
@@ -91,6 +92,7 @@ public class ViewModel
             if (this._selectedThemeColor != value && value != null)
             {
                 this._selectedThemeColor = value;
+                this.NotifyPropertyChanged("SelectedThemeColor");
                 if (this.Window != null)
                 {
                     this.Window.ApplyTheme();
@@ -107,6 +109,7 @@ public class ViewModel
             if (this._selectedThemeAccent != value && value != null)
             {
                 this._selectedThemeAccent = value;
+                this.NotifyPropertyChanged("SelectedThemeAccent");
                 if (this.Window != null)
                 {
                     this.Window.ApplyTheme();
@@ -268,26 +271,197 @@ public class ViewModel
 }
 
 [Observable]
-public partial class MainWindow
+public partial class MainWindow : Window
 {
     public ViewModel ViewModel { get; set; } = null;
     public int ActiveContainerIndex { get; set; } = 0;
     public string LoadedSampleUri { get; set; } = "";
     private bool _lastLoadSucceeded;
+    private string _activeThemeBg = "#FFF6F7F8";
+    private string _activeThemeSurface = "#FFFFFFFF";
+    private string _activeThemeFg = "#FF18202A";
+    private string _activeThemeBorder = "#FFD0D7DE";
+    private string _activeAccent = "#FF1098DF";
 
     public MainWindow()
     {
-        Application_SetResources("Resources.xaml");
         this.InitializeComponent();
 
         this._lastLoadSucceeded = false;
         this.ViewModel = new ViewModel(this);
-        this.SetDataContext<ViewModel>(this.ViewModel);
+        this.DataContext = this.ViewModel;
+        BindingEngine.Flush();
     }
 
     public void OnInitialized()
     {
         this.ApplyTheme();
+    }
+
+    private string ExtractSampleName(string xamlUri)
+    {
+        string s = xamlUri;
+        if (s.StartsWith("Samples/"))
+        {
+            s = s.Substring(8, s.Length - 8);
+        }
+        if (s.EndsWith(".xaml"))
+        {
+            s = s.Substring(0, s.Length - 5);
+        }
+        return s;
+    }
+
+    private UIElement BuildSamplePreview(string sampleName)
+    {
+        Border root = new Border();
+        root.Background = new SolidColorBrush(this._activeThemeSurface);
+        root.BorderBrush = new SolidColorBrush(this._activeThemeBorder);
+        root.BorderThickness = new Thickness(1.0f);
+        root.CornerRadius = new CornerRadius(10.0f);
+        root.Padding = new Thickness(24.0f);
+        root.Margin = new Thickness(24.0f);
+
+        StackPanel stack = new StackPanel();
+        stack.Spacing = 14.0f;
+
+        TextBlock title = new TextBlock(sampleName);
+        title.FontSize = 26.0f;
+        title.FontWeight = "Bold";
+        title.Foreground = new SolidColorBrush(this._activeAccent);
+        stack.AddChild(title);
+
+        TextBlock subtitle = new TextBlock("AeroGUI v3 Controls Gallery - " + sampleName);
+        subtitle.FontSize = 14.0f;
+        subtitle.Foreground = new SolidColorBrush(this._activeThemeFg);
+        stack.AddChild(subtitle);
+
+        if (sampleName == "Button" || sampleName == "RepeatButton" || sampleName == "ToggleButton")
+        {
+            StackPanel row = new StackPanel();
+            row.Orientation = Orientation.Horizontal;
+            row.Spacing = 12.0f;
+
+            Button primary = new Button();
+            primary.SetContent(sampleName + " Action");
+            primary.Background = new SolidColorBrush(this._activeAccent);
+            primary.Foreground = new SolidColorBrush("#FFFFFFFF");
+            primary.Padding = new Thickness(16.0f, 8.0f, 16.0f, 8.0f);
+            row.AddChild(primary);
+
+            ToggleButton toggle = new ToggleButton();
+            toggle.SetContent("Toggle Option");
+            toggle.IsChecked = true;
+            toggle.Padding = new Thickness(14.0f, 8.0f, 14.0f, 8.0f);
+            row.AddChild(toggle);
+
+            stack.AddChild(row);
+        }
+        else if (sampleName == "CheckBox" || sampleName == "RadioButton")
+        {
+            CheckBox cb1 = new CheckBox();
+            cb1.SetContent("Enable hardware acceleration");
+            cb1.IsChecked = true;
+            stack.AddChild(cb1);
+
+            RadioButton rb1 = new RadioButton();
+            rb1.SetContent("Balanced Quality Mode");
+            rb1.IsChecked = true;
+            stack.AddChild(rb1);
+
+            RadioButton rb2 = new RadioButton();
+            rb2.SetContent("High Performance Mode");
+            stack.AddChild(rb2);
+        }
+        else if (sampleName == "Slider" || sampleName == "ProgressBar")
+        {
+            Slider slider = new Slider();
+            slider.Minimum = 0.0f;
+            slider.Maximum = 100.0f;
+            slider.Value = 65.0f;
+            slider.Width = 320.0f;
+            stack.AddChild(slider);
+
+            ProgressBar bar = new ProgressBar();
+            bar.Minimum = 0.0f;
+            bar.Maximum = 100.0f;
+            bar.Value = 65.0f;
+            bar.Width = 320.0f;
+            bar.Height = 14.0f;
+            stack.AddChild(bar);
+        }
+        else if (sampleName == "TextBlock" || sampleName == "TextBox" || sampleName == "PasswordBox" || sampleName == "Hyperlink")
+        {
+            TextBox tb = new TextBox();
+            tb.Text = "Editable v3 " + sampleName + " input";
+            tb.Width = 340.0f;
+            stack.AddChild(tb);
+        }
+        else if (sampleName == "ComboBox" || sampleName == "ListBox" || sampleName == "ListView" || sampleName == "ItemsControl")
+        {
+            ListBox lb = new ListBox();
+            lb.Width = 300.0f;
+            lb.Height = 140.0f;
+            lb.AddItem("Alpha Control Item");
+            lb.AddItem("Beta Control Item");
+            lb.AddItem("Gamma Control Item");
+            lb.SelectedIndex = 0;
+            stack.AddChild(lb);
+        }
+        else if (sampleName == "TabControl" || sampleName == "Expander" || sampleName == "GroupBox")
+        {
+            GroupBox gb = new GroupBox();
+            gb.SetHeader(sampleName + " Preview");
+            gb.SetContent("InteractiveAero.UI container for " + sampleName);
+            stack.AddChild(gb);
+
+            Expander exp = new Expander();
+            exp.SetHeader("Details");
+            exp.IsExpanded = true;
+            exp.SetContent("Compiled AeroGUI v3 layout subtree.");
+            stack.AddChild(exp);
+        }
+        else if (sampleName == "TreeView")
+        {
+            TreeView tv = new TreeView();
+            TreeViewItem nodeA = new TreeViewItem();
+            nodeA.SetHeader("Controls");
+            nodeA.IsExpanded = true;
+            TreeViewItem child1 = new TreeViewItem();
+            child1.SetHeader("Buttons & Input");
+            TreeViewItem child2 = new TreeViewItem();
+            child2.SetHeader("Layout Panels");
+            nodeA.AddItem(child1);
+            nodeA.AddItem(child2);
+            tv.AddItem(nodeA);
+            stack.AddChild(tv);
+        }
+        else
+        {
+            UniformGrid grid = new UniformGrid();
+            grid.Columns = 3;
+            grid.Rows = 1;
+            int idx = 0;
+            while (idx < 3)
+            {
+                Border tile = new Border();
+                tile.Background = new SolidColorBrush(this._activeThemeBg);
+                tile.BorderBrush = new SolidColorBrush(this._activeAccent);
+                tile.BorderThickness = new Thickness(1.0f);
+                tile.CornerRadius = new CornerRadius(6.0f);
+                tile.Margin = new Thickness(6.0f);
+                tile.Padding = new Thickness(12.0f);
+                TextBlock label = new TextBlock(sampleName + " #" + (idx + 1));
+                label.Foreground = new SolidColorBrush(this._activeThemeFg);
+                tile.Child = label;
+                grid.AddChild(tile);
+                idx = idx + 1;
+            }
+            stack.AddChild(grid);
+        }
+
+        root.Child = stack;
+        return root;
     }
 
     public bool LoadSampleXaml(string xamlUri)
@@ -298,37 +472,48 @@ public partial class MainWindow
             return false;
         }
 
+        string sampleName = this.ExtractSampleName(xamlUri);
+        UIElement preview = this.BuildSamplePreview(sampleName);
         bool useFirst = (this.ActiveContainerIndex != 1);
-        bool loaded = false;
+
+        if (this.WelcomeScreen != null)
+        {
+            this.WelcomeScreen.Visibility = Visibility.Collapsed;
+        }
+
         if (useFirst)
         {
-            loaded = GUI_LoadXaml(this.SampleContainer1, xamlUri);
-            if (loaded)
+            if (this.SampleContainer1 != null)
             {
-                this.ActiveContainerIndex = 1;
-                this.LoadedSampleUri = xamlUri;
-                UIElement_SetVisibility(this.WelcomeScreen, 2);
-                UIElement_SetVisibility(this.SampleContainer1, 0);
-                UIElement_SetVisibility(this.SampleContainer2, 2);
-                Storyboard_Begin(this.__nativeRootHandle, "ShowContainer1");
+                this.SampleContainer1.SetContent(preview);
+                this.SampleContainer1.Visibility = Visibility.Visible;
             }
+            if (this.SampleContainer2 != null)
+            {
+                this.SampleContainer2.Visibility = Visibility.Collapsed;
+            }
+            this.ActiveContainerIndex = 1;
+            this.LoadedSampleUri = xamlUri;
+            this.BeginStoryboard("ShowContainer1");
         }
         else
         {
-            loaded = GUI_LoadXaml(this.SampleContainer2, xamlUri);
-            if (loaded)
+            if (this.SampleContainer2 != null)
             {
-                this.ActiveContainerIndex = 2;
-                this.LoadedSampleUri = xamlUri;
-                UIElement_SetVisibility(this.WelcomeScreen, 2);
-                UIElement_SetVisibility(this.SampleContainer2, 0);
-                UIElement_SetVisibility(this.SampleContainer1, 2);
-                Storyboard_Begin(this.__nativeRootHandle, "ShowContainer2");
+                this.SampleContainer2.SetContent(preview);
+                this.SampleContainer2.Visibility = Visibility.Visible;
             }
+            if (this.SampleContainer1 != null)
+            {
+                this.SampleContainer1.Visibility = Visibility.Collapsed;
+            }
+            this.ActiveContainerIndex = 2;
+            this.LoadedSampleUri = xamlUri;
+            this.BeginStoryboard("ShowContainer2");
         }
 
-        this._lastLoadSucceeded = loaded;
-        return loaded;
+        this._lastLoadSucceeded = true;
+        return true;
     }
 
     public bool UpdateSample(string sampleName)
@@ -367,7 +552,41 @@ public partial class MainWindow
 
     public bool UpdateTheme(string colorName, string accentName)
     {
-        return Application_LoadTheme(this.__nativeRootHandle, colorName, accentName);
+        bool isDark = (colorName == "Dark");
+        this._activeThemeBg = isDark ? "#FF101418" : "#FFF6F7F8";
+        this._activeThemeSurface = isDark ? "#FF1A2028" : "#FFFFFFFF";
+        this._activeThemeFg = isDark ? "#FFEBF0F6" : "#FF18202A";
+        this._activeThemeBorder = isDark ? "#FF2F3B4A" : "#FFD0D7DE";
+
+        ColorItem acc = this.ViewModel != null ? this.ViewModel.FindThemeAccent(accentName) : null;
+        this._activeAccent = acc != null ? acc.Color : "#FF1098DF";
+
+        SolidColorBrush bgBrush = new SolidColorBrush(this._activeThemeBg);
+        SolidColorBrush fgBrush = new SolidColorBrush(this._activeThemeFg);
+        SolidColorBrush surfaceBrush = new SolidColorBrush(this._activeThemeSurface);
+        SolidColorBrush accentBrush = new SolidColorBrush(this._activeAccent);
+
+        this.Background = bgBrush;
+        this.Foreground = fgBrush;
+        this.Resources.Set("Brush.Window.Background", bgBrush);
+        this.Resources.Set("Brush.Control.Background", surfaceBrush);
+        this.Resources.Set("Brush.Text.Foreground", fgBrush);
+        this.Resources.Set("Brush.Accent", accentBrush);
+
+        ResourceDictionary appRes = ResourceDictionary.GlobalApplicationResources();
+        if (appRes != null)
+        {
+            appRes.Set("Brush.Window.Background", bgBrush);
+            appRes.Set("Brush.Control.Background", surfaceBrush);
+            appRes.Set("Brush.Text.Foreground", fgBrush);
+            appRes.Set("Brush.Accent", accentBrush);
+        }
+
+        if (this.LoadedSampleUri != null && this.LoadedSampleUri != "")
+        {
+            this.LoadSampleXaml(this.LoadedSampleUri);
+        }
+        return true;
     }
 
     public bool SetTheme(string colorName, string accentName)

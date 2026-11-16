@@ -3,7 +3,7 @@ module Buttons;
 import Aero.UI;
 
 [Observable]
-public class ViewModel
+public class ViewModel : ViewModelBase
 {
     private DelegateCommand _startCommand;
     private DelegateCommand _settingsCommand;
@@ -22,12 +22,9 @@ public class ViewModel
 
     public ViewModel()
     {
-        this._startCommand = new DelegateCommand();
-        this._settingsCommand = new DelegateCommand();
-        this._exitCommand = new DelegateCommand();
-        this._startCommand.SetExecuteFunc(this.Start);
-        this._settingsCommand.SetExecuteFunc(this.Settings);
-        this._exitCommand.SetExecuteFunc(this.Exit);
+        this._startCommand = new DelegateCommand(() => { this.Start(); });
+        this._settingsCommand = new DelegateCommand(() => { this.Settings(); });
+        this._exitCommand = new DelegateCommand(() => { this.Exit(); });
 
         this.Reset();
     }
@@ -65,19 +62,17 @@ public class ViewModel
     }
 }
 
-[Observable]
-public partial class MainWindow
+public partial class MainWindow : Page
 {
-    public ViewModel DataContext { get; set; } = null;
-    public ViewModel ViewModel { get { return this.DataContext; } }
+    public ViewModel ViewModel { get; set; } = null;
 
     public MainWindow()
     {
-        Application_SetResources("Resources.xaml");
         this.InitializeComponent();
 
-        this.DataContext = new ViewModel();
-        this.SetDataContext<ViewModel>(this.DataContext);
+        this.ViewModel = new ViewModel();
+        this.DataContext = this.ViewModel;
+        BindingEngine.Flush();
     }
 
     public void OnInitialized()
@@ -86,7 +81,7 @@ public partial class MainWindow
 
     public void PlayIntro()
     {
-        Storyboard_Begin(this.__nativeRootHandle, "Intro");
+        this.BeginStoryboard("Intro");
     }
 }
 

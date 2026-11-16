@@ -1,5 +1,0 @@
-<Project>
-  <Assembly>DataBinding</Assembly>
-  <DefaultDataNamespace>DataBinding</DefaultDataNamespace>
-  <StartupDocument>MainPage.xaml</StartupDocument>
-</Project>
