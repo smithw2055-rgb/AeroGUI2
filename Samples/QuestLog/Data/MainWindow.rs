@@ -1,4 +1,5 @@
 module QuestLog;
+
 import Aero.UI;
 
 public enum QuestDifficulty
@@ -9,44 +10,103 @@ public enum QuestDifficulty
 }
 
 [Observable]
-public class Quest
+public class Quest : ObservableObject
 {
-    public string Title { get; set; }
-    public string Image { get; set; }
-    public QuestDifficulty Difficulty { get; set; }
-    public string Description { get; set; }
-    public bool Completed { get; set; }
+    private string _title = "";
+    private string _image = "";
+    private QuestDifficulty _difficulty = QuestDifficulty.Easy;
+    private string _description = "";
+    private bool _completed = false;
+
+    public string Title
+    {
+        get { return this._title; }
+        set { this.SetProperty(ref this._title, value, "Title"); }
+    }
+
+    public string Image
+    {
+        get { return this._image; }
+        set { this.SetProperty(ref this._image, value, "Image"); }
+    }
+
+    public QuestDifficulty Difficulty
+    {
+        get { return this._difficulty; }
+        set
+        {
+            if (this._difficulty != value)
+            {
+                this._difficulty = value;
+                this.NotifyPropertyChanged("Difficulty");
+            }
+        }
+    }
+
+    public string Description
+    {
+        get { return this._description; }
+        set { this.SetProperty(ref this._description, value, "Description"); }
+    }
+
+    public bool Completed
+    {
+        get { return this._completed; }
+        set { this.SetProperty(ref this._completed, value, "Completed"); }
+    }
 
     public Quest()
     {
-        this.Title = "";
-        this.Image = "";
-        this.Difficulty = QuestDifficulty.Easy;
-        this.Description = "";
-        this.Completed = false;
     }
 
     public Quest(string title, string image, QuestDifficulty difficulty, string description, bool completed)
     {
-        this.Title = title;
-        this.Image = image;
-        this.Difficulty = difficulty;
-        this.Description = description;
-        this.Completed = completed;
+        this._title = title == null ? "" : title;
+        this._image = image == null ? "" : image;
+        this._difficulty = difficulty;
+        this._description = description == null ? "" : description;
+        this._completed = completed;
     }
 }
 
 [Observable]
-public class ViewModel
+public class ViewModel : ViewModelBase
 {
-    public ObservableList<Quest> Quests { get; set; }
-    public Quest SelectedQuest { get; set; }
-    public int SelectedIndex { get; set; }
-    public bool IsClosed { get; set; }
+    private Quest _selectedQuest = null;
+    private int _selectedIndex = 0;
+    private bool _isClosed = false;
+    private ObservableList<Quest> _quests;
+
+    public ObservableList<Quest> Quests { get { return this._quests; } }
+
+    public Quest SelectedQuest
+    {
+        get { return this._selectedQuest; }
+        set
+        {
+            if (this._selectedQuest != value)
+            {
+                this._selectedQuest = value;
+                this.NotifyPropertyChanged("SelectedQuest");
+            }
+        }
+    }
+
+    public int SelectedIndex
+    {
+        get { return this._selectedIndex; }
+        set { this.SetProperty(ref this._selectedIndex, value, "SelectedIndex"); }
+    }
+
+    public bool IsClosed
+    {
+        get { return this._isClosed; }
+        set { this.SetProperty(ref this._isClosed, value, "IsClosed"); }
+    }
 
     public ViewModel()
     {
-        this.Quests = new ObservableList<Quest>(12);
+        this._quests = new ObservableList<Quest>();
 
         string image0 = "Images/Image0.png";
         string image1 = "Images/Image1.png";
@@ -125,9 +185,9 @@ public class ViewModel
             "“I think he said he hid it in a tall tree east of the River Falls in the Autumn Valley. Beware of the Necromancer!”",
             false));
 
-        this.SelectedIndex = 0;
-        this.SelectedQuest = this.Quests.Get(0);
-        this.IsClosed = false;
+        this._selectedIndex = 0;
+        this._selectedQuest = this.Quests.Get(0);
+        this._isClosed = false;
     }
 
     public int QuestCount()
@@ -223,18 +283,19 @@ public class ViewModel
     }
 }
 
-[Observable]
-public partial class MainWindow
+public partial class MainWindow : Page
 {
-    public ViewModel ViewModel { get; set; }
+    private ViewModel _vm;
+
+    public ViewModel VM { get { return this._vm; } }
+    public ViewModel ViewModel { get { return this._vm; } }
 
     public MainWindow()
     {
-        Application_SetResources("Resources.xaml");
+        this._vm = new ViewModel();
+        this.DataContext = this._vm;
         this.InitializeComponent();
-
-        this.ViewModel = new ViewModel();
-        this.SetDataContext<ViewModel>(this.ViewModel);
+        BindingEngine.Flush();
     }
 
     public void OnInitialized()
@@ -243,51 +304,51 @@ public partial class MainWindow
 
     public void SelectQuest(Quest quest)
     {
-        this.ViewModel.SelectQuest(quest);
+        if (this.VM != null) { this.VM.SelectQuest(quest); }
     }
 
     public void SelectQuestByIndex(int index)
     {
-        this.ViewModel.SelectQuestByIndex(index);
+        if (this.VM != null) { this.VM.SelectQuestByIndex(index); }
     }
 
     public void NextQuest()
     {
-        this.ViewModel.NextQuest();
+        if (this.VM != null) { this.VM.NextQuest(); }
     }
 
     public void PreviousQuest()
     {
-        this.ViewModel.PreviousQuest();
+        if (this.VM != null) { this.VM.PreviousQuest(); }
     }
 
     public void ToggleCompleted()
     {
-        this.ViewModel.ToggleSelectedQuestCompleted();
+        if (this.VM != null) { this.VM.ToggleSelectedQuestCompleted(); }
     }
 
     public void ToggleSelectedQuestCompleted()
     {
-        this.ViewModel.ToggleSelectedQuestCompleted();
+        if (this.VM != null) { this.VM.ToggleSelectedQuestCompleted(); }
     }
 
     public void SetQuestCompleted(int index, bool completed)
     {
-        this.ViewModel.SetQuestCompleted(index, completed);
+        if (this.VM != null) { this.VM.SetQuestCompleted(index, completed); }
     }
 
     public void CloseQuestLog()
     {
-        this.ViewModel.Close();
+        if (this.VM != null) { this.VM.Close(); }
     }
 
     public void OpenQuestLog()
     {
-        this.ViewModel.Open();
+        if (this.VM != null) { this.VM.Open(); }
     }
 }
 
-public MainWindow CreateMainWindow()
+public static MainWindow CreateMainWindow()
 {
     return new MainWindow();
 }

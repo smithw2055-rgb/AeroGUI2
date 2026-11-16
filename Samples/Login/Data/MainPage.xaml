@@ -15,7 +15,11 @@
   Title="NoesisGUI - Login">
 
   <Page.Resources>
-    <Storyboard x:Key="Intro">
+    <ResourceDictionary>
+      <ResourceDictionary.MergedDictionaries>
+        <ResourceDictionary Source="Resources.xaml"/>
+      </ResourceDictionary.MergedDictionaries>
+      <Storyboard x:Key="Intro">
       <DoubleAnimationUsingKeyFrames Storyboard.TargetProperty="(UIElement.RenderTransform).(TransformGroup.Children)[0].(ScaleTransform.ScaleX)" Storyboard.TargetName="Dialog">
         <EasingDoubleKeyFrame KeyTime="0" Value="0"/>
         <EasingDoubleKeyFrame KeyTime="0:0:0.3" Value="0"/>
@@ -103,6 +107,7 @@
         <LinearColorKeyFrame KeyTime="0:0:0.01" Value="#00FFFFFF"/>
       </ColorAnimationUsingKeyFrames>
     </Storyboard>
+    </ResourceDictionary>
   </Page.Resources>
 
   <b:Interaction.Triggers>

@@ -18,6 +18,9 @@
   noesis:Loc.Source="{Binding SelectedLanguage.Source}">
   <Page.Resources>
     <ResourceDictionary>
+      <ResourceDictionary.MergedDictionaries>
+        <ResourceDictionary Source="Resources.xaml"/>
+      </ResourceDictionary.MergedDictionaries>
       <Storyboard x:Key="Intro">
         <DoubleAnimationUsingKeyFrames Storyboard.TargetProperty="(UIElement.Opacity)" Storyboard.TargetName="Dialog">
           <EasingDoubleKeyFrame KeyTime="0" Value="0"/>

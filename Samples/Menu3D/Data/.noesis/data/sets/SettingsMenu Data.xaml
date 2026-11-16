@@ -1,5 +1,0 @@
-<vdctx:SettingsMenu xmlns:vdctx="clr-namespace:Menu3D">
-  <vdctx:SettingsMenu.Description>
-    <vdctx:MenuDescription Description="SETTINGS" AcceptText="ACCEPT" CancelText="BACK"/>
-  </vdctx:SettingsMenu.Description>
-</vdctx:SettingsMenu>

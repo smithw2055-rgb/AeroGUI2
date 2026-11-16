@@ -11,6 +11,9 @@
 
   <Page.Resources>
     <ResourceDictionary>
+      <ResourceDictionary.MergedDictionaries>
+        <ResourceDictionary Source="Resources.xaml"/>
+      </ResourceDictionary.MergedDictionaries>
       <!--Score changed animation-->
       <Storyboard x:Key="ScorePlayer1ChangedAnim">
         <ColorAnimationUsingKeyFrames Storyboard.TargetProperty="(TextElement.Foreground).(SolidColorBrush.Color)" Storyboard.TargetName="ScorePlayer1">

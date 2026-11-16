@@ -13,6 +13,9 @@
     d:DesignWidth="1280" d:DesignHeight="720" Background="{x:Null}" d:DataContext="QuestLogViewModel">
     <Page.Resources>
         <ResourceDictionary>
+            <ResourceDictionary.MergedDictionaries>
+                <ResourceDictionary Source="Resources.xaml"/>
+            </ResourceDictionary.MergedDictionaries>
             <Storyboard x:Key="Intro">
                 <DoubleAnimationUsingKeyFrames Storyboard.TargetProperty="(UIElement.RenderTransform).(TransformGroup.Children)[0].(ScaleTransform.ScaleX)" Storyboard.TargetName="Dialog">
                     <EasingDoubleKeyFrame KeyTime="0" Value="0"/>

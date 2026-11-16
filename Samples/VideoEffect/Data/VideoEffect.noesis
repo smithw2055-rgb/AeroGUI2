@@ -1,5 +1,0 @@
-<Project>
-  <Assembly>VideoEffect</Assembly>
-  <DefaultDataNamespace>VideoEffect</DefaultDataNamespace>
-  <StartupDocument>MainPage.xaml</StartupDocument>
-</Project>
