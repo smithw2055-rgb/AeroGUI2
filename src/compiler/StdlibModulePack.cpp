@@ -184,6 +184,39 @@ std::vector<SourceFile> LoadStdlibModulePack(std::string_view stdlibRootDir) {
     return sources;
 }
 
+std::uint64_t ComputeStdlibPackHash(
+    const std::vector<SourceFile>& sources,
+    bool enableReactiveMacros) noexcept {
+    constexpr std::uint64_t kFnvOffset = 14695981039346656037ull;
+    constexpr std::uint64_t kFnvPrime = 1099511628211ull;
+
+    auto mixBytes = [&](const void* data, std::size_t size, std::uint64_t& state) noexcept {
+        const auto* ptr = static_cast<const unsigned char*>(data);
+        for (std::size_t i = 0u; i < size; ++i) {
+            state ^= static_cast<std::uint64_t>(ptr[i]);
+            state *= kFnvPrime;
+        }
+    };
+    auto mixSize = [&](std::size_t value, std::uint64_t& state) noexcept {
+        const std::uint64_t v = static_cast<std::uint64_t>(value);
+        mixBytes(&v, sizeof(v), state);
+    };
+    auto mixString = [&](std::string_view s, std::uint64_t& state) noexcept {
+        mixSize(s.size(), state);
+        mixBytes(s.data(), s.size(), state);
+    };
+
+    std::uint64_t hash = kFnvOffset;
+    const std::uint8_t macroFlag = enableReactiveMacros ? 1u : 0u;
+    mixBytes(&macroFlag, sizeof(macroFlag), hash);
+    mixSize(sources.size(), hash);
+    for (const auto& sf : sources) {
+        mixString(sf.path, hash);
+        mixString(sf.content, hash);
+    }
+    return hash;
+}
+
 std::unordered_set<std::string> CollectDeclaredModuleNames(
     const std::vector<SourceFile>& sources) {
     std::unordered_set<std::string> modules;

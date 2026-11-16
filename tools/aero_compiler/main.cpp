@@ -1,4 +1,6 @@
+#include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -6,6 +8,16 @@
 #include <string>
 #include <string_view>
 #include <vector>
+
+#if defined(_WIN32)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#endif
 
 #include "aero/compiler/AeroCompilerV3.hpp"
 #include "aero/core/StringUtils.hpp"
@@ -36,11 +48,57 @@ namespace {
     return out.good();
 }
 
+[[nodiscard]] std::string ReadEnvString(const char* name) {
+    if (!name || name[0] == '\0') {
+        return {};
+    }
+#ifdef _MSC_VER
+    char* buf = nullptr;
+    std::size_t len = 0u;
+    std::string out;
+    if (_dupenv_s(&buf, &len, name) == 0 && buf != nullptr) {
+        if (buf[0] != '\0') {
+            out = buf;
+        }
+        std::free(buf);
+    }
+    return out;
+#else
+    if (const char* val = std::getenv(name); val != nullptr && val[0] != '\0') {
+        return std::string(val);
+    }
+    return {};
+#endif
+}
+
+[[nodiscard]] std::filesystem::path ResolveExecutableDir(const char* argv0) {
+#if defined(_WIN32)
+    wchar_t modulePath[MAX_PATH * 4]{};
+    const DWORD len = GetModuleFileNameW(nullptr, modulePath, static_cast<DWORD>(std::size(modulePath)));
+    if (len > 0u && len < std::size(modulePath)) {
+        return std::filesystem::path(modulePath).parent_path();
+    }
+#endif
+    if (argv0 && argv0[0] != '\0') {
+        std::error_code ec;
+        const auto absPath = std::filesystem::absolute(std::filesystem::path(argv0), ec);
+        if (!ec && absPath.has_parent_path()) {
+            return absPath.parent_path();
+        }
+        const std::filesystem::path fallback(argv0);
+        if (fallback.has_parent_path()) {
+            return fallback.parent_path();
+        }
+    }
+    std::error_code ec;
+    return std::filesystem::current_path(ec);
+}
+
 void PrintUsage() {
     std::printf(
         "aero-compiler v3.0 - AeroGUI XAML & RealScript AOT/Bytecode Compiler\n"
         "Usage: aero-compiler [options]\n"
-        "  --xaml <file.xaml>        Input XAML file\n"
+        "  --xaml <file.xaml>        Input XAML file (repeatable; first or MainWindow is primary)\n"
         "  --rs <file.rs|file.cs>    Input RealScript / C#-compat script file (repeatable)\n"
         "  --out-rs <file.g.rs>      Write generated partial .g.rs code to file\n"
         "  --out-dir <dir>           Output directory for bytecode bundle & generated files\n"
@@ -49,6 +107,8 @@ void PrintUsage() {
         "  --O2                      Enable aggressive MIR optimization\n"
         "  --no-stdlib               Do not auto-load Aero.Native / Aero.UI stdlib pack\n"
         "  --stdlib <dir>            Path to stdlib root directory\n"
+        "  --cache-dir <dir>         Directory for persistent stdlib module cache\n"
+        "  --no-cache                Disable persistent disk cache (overrides AERO_CACHE_DIR)\n"
         "  -h, --help                Show this help\n");
 }
 
@@ -67,11 +127,13 @@ void PrintUsage() {
 
 int main(int argc, char** argv) {
     aero::AeroV3CompileInput input;
+    std::vector<std::string> xamlFilePaths;
     std::vector<std::string> scriptPaths;
-    std::string xamlFilePath;
     std::string outRsPath;
     std::string outDirPath;
     std::string aotCppPath;
+    std::string explicitCacheDir;
+    bool noCache = false;
 
     for (int i = 1; i < argc; ++i) {
         const std::string_view arg(argv[i]);
@@ -90,7 +152,7 @@ int main(int argc, char** argv) {
         if (arg == "--xaml") {
             const char* v = needNext(arg);
             if (!v) return 2;
-            xamlFilePath = v;
+            xamlFilePaths.emplace_back(v);
         } else if (arg == "--rs") {
             const char* v = needNext(arg);
             if (!v) return 2;
@@ -120,6 +182,12 @@ int main(int argc, char** argv) {
             input.stdlibRootDir = v;
         } else if (arg == "--no-stdlib") {
             input.includeStdlib = false;
+        } else if (arg == "--cache-dir") {
+            const char* v = needNext(arg);
+            if (!v) return 2;
+            explicitCacheDir = v;
+        } else if (arg == "--no-cache") {
+            noCache = true;
         } else {
             std::cerr << "Unknown option: " << arg << "\n";
             PrintUsage();
@@ -127,20 +195,54 @@ int main(int argc, char** argv) {
         }
     }
 
-    if (xamlFilePath.empty() && scriptPaths.empty()) {
+    if (xamlFilePaths.empty() && scriptPaths.empty()) {
         PrintUsage();
         return 0;
     }
 
-    if (!xamlFilePath.empty()) {
-        const std::filesystem::path xp(xamlFilePath);
-        input.xamlPath = xp.lexically_normal().generic_string();
-        if (input.resourceSearchRoot.empty() && xp.has_parent_path()) {
-            input.resourceSearchRoot = xp.parent_path().lexically_normal().generic_string();
+    if (noCache) {
+        input.allowDiskCache = false;
+        input.cacheDir.clear();
+    } else if (!explicitCacheDir.empty()) {
+        input.cacheDir = explicitCacheDir;
+    } else {
+        const std::string envCache = ReadEnvString("AERO_CACHE_DIR");
+        if (!envCache.empty()) {
+            input.cacheDir = envCache;
+        } else {
+            const std::filesystem::path exeDir = ResolveExecutableDir(argc > 0 ? argv[0] : nullptr);
+            if (!exeDir.empty()) {
+                input.cacheDir = (exeDir / "aero_stdlib_cache").lexically_normal().generic_string();
+            }
         }
-        if (!ReadFileText(xp, input.xamlContent)) {
-            std::cerr << "Failed to read XAML file: " << xamlFilePath << "\n";
-            return 1;
+    }
+
+    if (!xamlFilePaths.empty()) {
+        std::size_t primaryIdx = 0u;
+        for (std::size_t i = 0u; i < xamlFilePaths.size(); ++i) {
+            const std::string fname = std::filesystem::path(xamlFilePaths[i]).filename().string();
+            if (aero::str::EqualsIgnoreCase(fname, "MainWindow.xaml")) {
+                primaryIdx = i;
+                break;
+            }
+        }
+        for (std::size_t i = 0u; i < xamlFilePaths.size(); ++i) {
+            const std::filesystem::path xp(xamlFilePaths[i]);
+            std::string content;
+            if (!ReadFileText(xp, content)) {
+                std::cerr << "Failed to read XAML file: " << xamlFilePaths[i] << "\n";
+                return 1;
+            }
+            const std::string normPath = xp.lexically_normal().generic_string();
+            if (i == primaryIdx) {
+                input.xamlPath = normPath;
+                if (input.resourceSearchRoot.empty() && xp.has_parent_path()) {
+                    input.resourceSearchRoot = xp.parent_path().lexically_normal().generic_string();
+                }
+                input.xamlContent = std::move(content);
+            } else {
+                input.additionalXamlSources.push_back(aero::SourceFile{normPath, std::move(content)});
+            }
         }
     }
 

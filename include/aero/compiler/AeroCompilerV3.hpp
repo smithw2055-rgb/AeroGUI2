@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -31,9 +32,13 @@ using ExternalXamlResolverFn = std::function<bool(
 struct AeroV3CompileInput {
     std::string xamlPath = "MainView.xaml";
     std::string xamlContent;
+    std::vector<SourceFile> additionalXamlSources;
     std::vector<SourceFile> scriptSources;
     std::string stdlibRootDir;
     bool includeStdlib = true;
+    bool treeShakeStdlib = true;
+    std::string cacheDir;
+    bool allowDiskCache = true;
     bool emitAotCpp = false;
     std::string aotCppNamespace = "aero::aot_generated";
     std::string aotViewBuilderName;
@@ -64,6 +69,11 @@ struct AeroV3CompileResult {
     std::vector<std::uint8_t> programImageBytes;
     std::shared_ptr<const ProgramImage> programImage;
     AeroV3AotCppOutput aotCpp;
+    bool usedStdlibCache = false;
+    std::size_t retainedMirTypes = 0u;
+    std::size_t prunedMirTypes = 0u;
+    std::size_t retainedMirFunctions = 0u;
+    std::size_t prunedMirFunctions = 0u;
     std::vector<std::string> diagnostics;
 };
 

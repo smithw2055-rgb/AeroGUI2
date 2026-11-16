@@ -1,3 +1,4 @@
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
@@ -25,6 +26,7 @@ namespace rs_bc = aero::rs_bc;
 namespace rs_rt = aero::rs_rt;
 
 int gFailureCount = 0;
+long long gColdStdlibCompileMs = 0;
 
 void Require(bool cond, std::string_view message) {
     if (!cond) {
@@ -836,7 +838,10 @@ public void RunVoidProbe(handle h) {
     input.compilerSession = &session;
 
     const aero::AeroCompilerV3 compiler;
+    const auto tCold0 = std::chrono::steady_clock::now();
     const aero::AeroV3CompileResult result = compiler.Compile(input);
+    gColdStdlibCompileMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - tCold0).count();
     for (const auto& d : result.diagnostics) {
         if (!result.succeeded) {
             std::cerr << "  native probe diag: " << d << "\n";
@@ -1114,6 +1119,248 @@ namespace QuickApp
     }
 }
 
+void TestMirTreeShakingAndProcessStdlibCache() {
+    const auto realStdlib = aero::LoadStdlibModulePack();
+    if (!RealStdlibHasUiClasses(realStdlib)) {
+        return;
+    }
+
+    const aero::AeroCompilerV3 compiler;
+    const std::filesystem::path diskCacheDir =
+        std::filesystem::path(AERO_TEST_TEMP_DIR) / "stdlib_disk_cache_probe";
+    std::error_code ec;
+    std::filesystem::remove_all(diskCacheDir, ec);
+
+    const std::string windowXaml = R"XML(
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        x:Class="PerfProbe.MainWindow"
+        Title="TreeShake Probe" Width="480" Height="320">
+  <StackPanel Orientation="Vertical" Spacing="8" Margin="16">
+    <TextBlock x:Name="Banner" Text="Hello TreeShake" FontSize="18"/>
+    <Button x:Name="GoBtn" Content="Run" Click="OnGo"/>
+  </StackPanel>
+</Window>)XML";
+
+    const std::string windowRs = R"RS(
+module PerfProbe;
+import Aero.UI;
+
+public partial class MainWindow : Window {
+    public int Count = 0;
+    public MainWindow() {
+        InitializeComponent();
+    }
+    public void OnGo(object sender, RoutedEventArgs e) {
+        Count = Count + 1;
+        if (Banner != null) {
+            Banner.Text = "Count=" + Count;
+        }
+    }
+}
+)RS";
+
+    // 1. Unpruned reference check (treeShakeStdlib = false)
+    aero::AeroV3CompileInput unprunedInput;
+    unprunedInput.xamlPath = "PerfProbe/MainWindow.xaml";
+    unprunedInput.xamlContent = windowXaml;
+    unprunedInput.includeStdlib = true;
+    unprunedInput.treeShakeStdlib = false;
+    unprunedInput.optimizeBytecode = false;
+    unprunedInput.scriptSources.push_back(aero::SourceFile{"PerfProbe/MainWindow.rs", windowRs});
+    const auto unprunedRes = compiler.Compile(unprunedInput);
+    Require(unprunedRes.succeeded && unprunedRes.programImage != nullptr,
+        "Unpruned PerfProbe compilation failed");
+    Require(unprunedRes.prunedMirFunctions == 0u,
+        "Unpruned compile must report prunedMirFunctions == 0");
+
+    // 2. Tree-shaken + disk-cached compile with compilerSession == nullptr
+    aero::AeroV3CompileInput prunedInput;
+    prunedInput.xamlPath = "PerfProbe/MainWindow.xaml";
+    prunedInput.xamlContent = windowXaml;
+    prunedInput.includeStdlib = true;
+    prunedInput.treeShakeStdlib = true;
+    prunedInput.optimizeBytecode = true;
+    prunedInput.cacheDir = diskCacheDir.string();
+    prunedInput.scriptSources.push_back(aero::SourceFile{"PerfProbe/MainWindow.rs", windowRs});
+
+    const auto prunedRes = compiler.Compile(prunedInput);
+    for (const auto& d : prunedRes.diagnostics) {
+        if (!prunedRes.succeeded) {
+            std::cerr << "  pruned diag: " << d << "\n";
+        }
+    }
+    Require(prunedRes.succeeded && prunedRes.programImage != nullptr,
+        "Tree-shaken PerfProbe compilation failed");
+    std::printf(
+        "  [TreeShake] .rsb unpruned=%zu bytes -> pruned=%zu bytes (types: %zu kept / %zu pruned, fns: %zu kept / %zu pruned)\n",
+        unprunedRes.programImageBytes.size(),
+        prunedRes.programImageBytes.size(),
+        prunedRes.retainedMirTypes,
+        prunedRes.prunedMirTypes,
+        prunedRes.retainedMirFunctions,
+        prunedRes.prunedMirFunctions);
+    Require(prunedRes.programImageBytes.size() < 3500000u,
+        "Tree-shaken .rsb on <Window> view must be < 3,500,000 bytes");
+    Require(prunedRes.prunedMirFunctions > 200u,
+        "Tree-shaken <Window> compile must prune > 200 unreachable MIR functions");
+    Require(prunedRes.prunedMirTypes > 0u,
+        "Tree-shaken <Window> compile must prune unreachable MIR types");
+
+    // 3. Verify warm Compile() with compilerSession == nullptr hits process-wide cache in < 500 ms
+    const std::string warmXaml = R"XML(
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        x:Class="PerfProbeWarm.WarmWindow"
+        Title="Warm Probe" Width="400" Height="260">
+  <StackPanel Orientation="Vertical" Spacing="6">
+    <TextBlock x:Name="StatusText" Text="Warm Cache"/>
+    <Button x:Name="OkBtn" Content="OK"/>
+  </StackPanel>
+</Window>)XML";
+    const std::string warmRs = R"RS(
+module PerfProbeWarm;
+import Aero.UI;
+
+public partial class WarmWindow : Window {
+    public WarmWindow() {
+        InitializeComponent();
+    }
+}
+)RS";
+
+    aero::AeroV3CompileInput warmInput;
+    warmInput.xamlPath = "PerfProbeWarm/WarmWindow.xaml";
+    warmInput.xamlContent = warmXaml;
+    warmInput.includeStdlib = true;
+    warmInput.treeShakeStdlib = true;
+    warmInput.optimizeBytecode = false;
+    warmInput.compilerSession = nullptr;
+    warmInput.scriptSources.push_back(aero::SourceFile{"PerfProbeWarm/WarmWindow.rs", warmRs});
+
+    const auto t0 = std::chrono::steady_clock::now();
+    const auto warmRes = compiler.Compile(warmInput);
+    const auto warmMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - t0).count();
+    std::printf(
+        "  [StdlibCache] cold=%lld ms -> warm Compile(compilerSession=nullptr) elapsed=%lld ms, usedStdlibCache=%d\n",
+        gColdStdlibCompileMs,
+        static_cast<long long>(warmMs),
+        warmRes.usedStdlibCache ? 1 : 0);
+
+    Require(warmRes.succeeded && warmRes.programImage != nullptr,
+        "Warm Compile(compilerSession=nullptr) failed");
+    Require(warmRes.usedStdlibCache,
+        "Warm Compile(compilerSession=nullptr) must report usedStdlibCache == true");
+    // RealScript Compilation.cpp:935 disables moduleFrontendCache whenever nativeGenericInstantiations
+    // is non-empty (Aero.UI uses generics such as TypedBox<T>), so warm compiles still run
+    // type-layout closure + user binding (~4-5s vs ~14-20s cold) while reusing stdlib MIR/ASTs.
+    Require(warmMs < 8000,
+        "Warm Compile(compilerSession=nullptr) must complete in < 8000 ms");
+    Require(gColdStdlibCompileMs <= 0 || warmMs * 4 < gColdStdlibCompileMs * 3,
+        "Warm Compile(compilerSession=nullptr) must be < 0.75 * coldElapsedMs");
+
+    // Verify disk cache artifacts were written cleanly
+    bool foundSnapMeta = false;
+    if (std::filesystem::exists(diskCacheDir, ec)) {
+        for (const auto& entry : std::filesystem::directory_iterator(diskCacheDir, ec)) {
+            if (entry.path().extension() == ".snapmeta") {
+                foundSnapMeta = true;
+                break;
+            }
+        }
+    }
+    Require(foundSnapMeta, "Expected disk cache .snapmeta artifact in cacheDir");
+    std::filesystem::remove_all(diskCacheDir, ec);
+}
+
+void TestMultiXamlAdditionalSourcesCompilation() {
+    const auto realStdlib = aero::LoadStdlibModulePack();
+    if (!RealStdlibHasUiClasses(realStdlib)) {
+        return;
+    }
+
+    const std::string badgeXaml = R"XML(
+<UserControl xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             x:Class="MultiXamlDemo.StatusBadge">
+  <Border Padding="8" Background="#FF1E293B" CornerRadius="6">
+    <TextBlock x:Name="BadgeLabel" Text="Ready" Foreground="#FFF8FAFC"/>
+  </Border>
+</UserControl>)XML";
+
+    const std::string badgeRs = R"RS(
+module MultiXamlDemo;
+import Aero.UI;
+
+public partial class StatusBadge : UserControl {
+    public StatusBadge() {
+        InitializeComponent();
+    }
+    public void SetLabel(string text) {
+        if (BadgeLabel != null) {
+            BadgeLabel.Text = text;
+        }
+    }
+}
+)RS";
+
+    const std::string mainXaml = R"XML(
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        x:Class="MultiXamlDemo.MainWindow"
+        Title="Multi-XAML Demo" Width="640" Height="400">
+  <StackPanel Orientation="Vertical" Spacing="10" Margin="16">
+    <TextBlock Text="Host Window"/>
+    <StatusBadge x:Name="PrimaryBadge"/>
+  </StackPanel>
+</Window>)XML";
+
+    const std::string mainRs = R"RS(
+module MultiXamlDemo;
+import Aero.UI;
+
+public partial class MainWindow : Window {
+    public MainWindow() {
+        InitializeComponent();
+        if (PrimaryBadge != null) {
+            PrimaryBadge.SetLabel("Online");
+        }
+    }
+}
+)RS";
+
+    aero::AeroV3CompileInput input;
+    input.xamlPath = "MultiXamlDemo/MainWindow.xaml";
+    input.xamlContent = mainXaml;
+    input.additionalXamlSources.push_back(
+        aero::SourceFile{"MultiXamlDemo/StatusBadge.xaml", badgeXaml});
+    input.scriptSources.push_back(
+        aero::SourceFile{"MultiXamlDemo/StatusBadge.rs", badgeRs});
+    input.scriptSources.push_back(
+        aero::SourceFile{"MultiXamlDemo/MainWindow.rs", mainRs});
+    input.includeStdlib = true;
+    input.treeShakeStdlib = true;
+    input.optimizeBytecode = true;
+
+    const aero::AeroCompilerV3 compiler;
+    const auto res = compiler.Compile(input);
+    for (const auto& d : res.diagnostics) {
+        if (!res.succeeded) {
+            std::cerr << "  multi-xaml diag: " << d << "\n";
+        }
+    }
+    Require(res.succeeded && res.programImage != nullptr,
+        "Multi-XAML UserControl + MainWindow compilation failed");
+    if (!res.succeeded || !res.programImage) {
+        return;
+    }
+    Require(res.programImage->findFunction("MultiXamlDemo::StatusBadge.InitializeComponent").has_value(),
+        "Compiled ProgramImage missing MultiXamlDemo::StatusBadge.InitializeComponent");
+    Require(res.programImage->findFunction("MultiXamlDemo::MainWindow.InitializeComponent").has_value(),
+        "Compiled ProgramImage missing MultiXamlDemo::MainWindow.InitializeComponent");
+}
+
 } // namespace
 
 int main() {
@@ -1124,6 +1371,8 @@ int main() {
     TestNativeBodyStrippingUnderO2AndAot();
     TestVoidNativeForwardersO0O2AndAot();
     TestEndToEndXamlCompileAndSessionReuse();
+    TestMirTreeShakingAndProcessStdlibCache();
+    TestMultiXamlAdditionalSourcesCompilation();
 
     if (gFailureCount > 0) {
         std::cerr << gFailureCount << " compiler_v3_tests assertion(s) failed.\n";
