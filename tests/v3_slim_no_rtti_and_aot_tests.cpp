@@ -18,6 +18,7 @@
 #include <realscript/aot_cpp/AotRuntime.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
@@ -209,13 +210,18 @@ public partial class MainWindow : Window {
         << " --aot-cpp \"" << aotStem.string() << "\""
         << " --out-dir \"" << outDir.string() << "\"";
 
+    const auto compT0 = std::chrono::steady_clock::now();
     const int compRc = RunCommandDirect(cmd.str());
+    const auto compMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - compT0).count();
     Require(compRc == 0, "AERO_COMPILER_EXE --O2 --aot-cpp failed with exit code " + std::to_string(compRc));
 
     const fs::path aotHeader = outDir / "AotProbeUi.h";
     const fs::path aotSource = outDir / "AotProbeUi.cpp";
     Require(fs::exists(aotHeader) && fs::file_size(aotHeader) > 0u, "Emitted AOT header missing or empty");
     Require(fs::exists(aotSource) && fs::file_size(aotSource) > 0u, "Emitted AOT source missing or empty");
+    std::cout << "  [AOT] aero-compiler --O2 --aot-cpp elapsed=" << compMs << " ms, cpp="
+              << (fs::exists(aotSource) ? fs::file_size(aotSource) : 0u) << " bytes\n";
 
     const std::string headerText = ReadTextFile(aotHeader);
     const std::string sourceText = ReadTextFile(aotSource);
@@ -259,7 +265,12 @@ public partial class MainWindow : Window {
                 << " /Fo\"" << objOut.string() << "\""
                 << " \"" << aotSource.string() << "\"\r\n";
             Require(WriteTextFile(compileBat, bat.str()), "Failed to write compile_aot.bat");
+            const auto clT0 = std::chrono::steady_clock::now();
             const int clRc = RunCommandDirect("cmd.exe /c \"\"" + compileBat.string() + "\"\"");
+            const auto clMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - clT0).count();
+            std::cout << "  [AOT] cl.exe /std:c++17 /GR- elapsed=" << clMs << " ms, obj="
+                      << (fs::exists(objOut) ? fs::file_size(objOut) : 0u) << " bytes\n";
             Require(clRc == 0 && fs::exists(objOut) && fs::file_size(objOut) > 0u,
                 "Emitted C++17 AOT source failed MSVC /std:c++17 /GR- compilation");
         }

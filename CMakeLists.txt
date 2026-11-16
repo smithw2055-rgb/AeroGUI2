@@ -168,6 +168,7 @@ if(AERO_BUILD_COMPILER_TOOLS AND TARGET RealScript::Frontend)
         src/compiler/MarkupExtensionParser.cpp
         src/compiler/XamlToRsEmitter.cpp
         src/compiler/CSharpCompatLowerer.cpp
+        src/compiler/MirReachabilityPruner.cpp
         src/compiler/AeroCompilerV3.cpp
     )
     add_library(AeroGUI::Compiler ALIAS aerogui_compiler)
@@ -280,6 +281,19 @@ if(AERO_BUILD_TESTS)
         )
         aero_apply_no_rtti_options(v3_slim_no_rtti_and_aot_tests)
         add_test(NAME v3_slim_no_rtti_and_aot_tests COMMAND v3_slim_no_rtti_and_aot_tests)
+    endif()
+
+    if(AERO_BUILD_COMPILER_TOOLS AND TARGET aerogui_app AND
+       EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/v3_legacy_samples_tests.cpp")
+        add_executable(v3_legacy_samples_tests tests/v3_legacy_samples_tests.cpp)
+        target_link_libraries(v3_legacy_samples_tests PRIVATE aerogui_app)
+        target_compile_definitions(v3_legacy_samples_tests PRIVATE
+            AERO_STDLIB_DIR="${CMAKE_CURRENT_SOURCE_DIR}/stdlib"
+            AERO_SAMPLES_DIR="${CMAKE_CURRENT_SOURCE_DIR}/Samples"
+            AERO_TEST_TEMP_DIR="${CMAKE_CURRENT_BINARY_DIR}/test_out"
+        )
+        aero_apply_default_rtti_options(v3_legacy_samples_tests)
+        add_test(NAME v3_legacy_samples_tests COMMAND v3_legacy_samples_tests)
     endif()
 endif()
 
