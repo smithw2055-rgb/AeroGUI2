@@ -3,6 +3,9 @@
 #include <algorithm>
 #include <cmath>
 
+#include "aero/asset/GradientBrush.hpp"
+#include "aero/core/UIResourceStore.hpp"
+
 namespace aero {
 
 namespace {
@@ -52,7 +55,123 @@ namespace {
     return t;
 }
 
+struct GradientStopTarget {
+    bool isStopColor = false;
+    bool isStopOffset = false;
+    bool isStroke = false;
+    std::size_t stopIndex = 0u;
+};
+
+[[nodiscard]] GradientStopTarget ParseGradientStopTarget(VisualAnimProp prop) noexcept {
+    const auto v = static_cast<std::uint8_t>(prop);
+    if (v >= static_cast<std::uint8_t>(VisualAnimProp::FillStop0Color) &&
+        v <= static_cast<std::uint8_t>(VisualAnimProp::FillStop3Color)) {
+        return {true, false, false, v - static_cast<std::uint8_t>(VisualAnimProp::FillStop0Color)};
+    }
+    if (v >= static_cast<std::uint8_t>(VisualAnimProp::FillStop0Offset) &&
+        v <= static_cast<std::uint8_t>(VisualAnimProp::FillStop3Offset)) {
+        return {false, true, false, v - static_cast<std::uint8_t>(VisualAnimProp::FillStop0Offset)};
+    }
+    if (v >= static_cast<std::uint8_t>(VisualAnimProp::StrokeStop0Color) &&
+        v <= static_cast<std::uint8_t>(VisualAnimProp::StrokeStop3Color)) {
+        return {true, false, true, v - static_cast<std::uint8_t>(VisualAnimProp::StrokeStop0Color)};
+    }
+    if (v >= static_cast<std::uint8_t>(VisualAnimProp::StrokeStop0Offset) &&
+        v <= static_cast<std::uint8_t>(VisualAnimProp::StrokeStop3Offset)) {
+        return {false, true, true, v - static_cast<std::uint8_t>(VisualAnimProp::StrokeStop0Offset)};
+    }
+    return {};
+}
+
+[[nodiscard]] Color UnpackRgba(std::uint32_t rgba) noexcept {
+    constexpr float kInv255 = 1.0f / 255.0f;
+    return Color{
+        static_cast<float>(rgba & 0xFFu) * kInv255,
+        static_cast<float>((rgba >> 8u) & 0xFFu) * kInv255,
+        static_cast<float>((rgba >> 16u) & 0xFFu) * kInv255,
+        static_cast<float>((rgba >> 24u) & 0xFFu) * kInv255};
+}
+
+[[nodiscard]] std::uint32_t PackColor(const Color& c) noexcept {
+    const auto r = static_cast<std::uint32_t>(std::clamp(c.r * 255.0f + 0.5f, 0.0f, 255.0f)) & 0xFFu;
+    const auto g = static_cast<std::uint32_t>(std::clamp(c.g * 255.0f + 0.5f, 0.0f, 255.0f)) & 0xFFu;
+    const auto b = static_cast<std::uint32_t>(std::clamp(c.b * 255.0f + 0.5f, 0.0f, 255.0f)) & 0xFFu;
+    const auto a = static_cast<std::uint32_t>(std::clamp(c.a * 255.0f + 0.5f, 0.0f, 255.0f)) & 0xFFu;
+    return r | (g << 8u) | (b << 16u) | (a << 24u);
+}
+
+struct MutableGradSlot {
+    std::int32_t* gradId = nullptr;
+    bool* ownsMutable = nullptr;
+};
+
+[[nodiscard]] MutableGradSlot ResolveGradSlot(VisualNode* node, bool isStroke) noexcept {
+    if (!node) return {};
+    if (node->kind == VisualKind::Vector) {
+        return isStroke
+            ? MutableGradSlot{&node->vector.strokeGradId, &node->vector.ownsMutableStrokeGrad}
+            : MutableGradSlot{&node->vector.fillGradId, &node->vector.ownsMutableFillGrad};
+    }
+    return isStroke
+        ? MutableGradSlot{&node->box.borderGradId, &node->box.ownsMutableBorderGrad}
+        : MutableGradSlot{&node->box.bgGradId, &node->box.ownsMutableBgGrad};
+}
+
+[[nodiscard]] std::int32_t ReadGradId(const VisualNode* node, bool isStroke) noexcept {
+    if (!node) return -1;
+    if (node->kind == VisualKind::Vector) {
+        return isStroke ? node->vector.strokeGradId : node->vector.fillGradId;
+    }
+    return isStroke ? node->box.borderGradId : node->box.bgGradId;
+}
+
+[[nodiscard]] GradientBrushRegistry* ResolveGradRegistryForBrush(
+    VisualWorld& world,
+    std::uint32_t brushId) noexcept {
+    if (UIResourceStore* store = world.ResourceStore();
+        store != nullptr && store->GradientBrushes().Find(brushId) != nullptr) {
+        return &store->GradientBrushes();
+    }
+    if (GradientBrushRegistry::Instance().Find(brushId) != nullptr) {
+        return &GradientBrushRegistry::Instance();
+    }
+    return nullptr;
+}
+
+[[nodiscard]] bool TryReadGradientBrush(
+    const VisualWorld& world,
+    std::int32_t gradId,
+    GradientBrushDesc& outDesc) noexcept {
+    if (gradId <= 0) return false;
+    const auto brushId = static_cast<std::uint32_t>(gradId);
+    const UIResourceStore* store = world.ResourceStore();
+    return (store != nullptr && store->GradientBrushes().TryGetBrush(brushId, outDesc)) ||
+           GradientBrushRegistry::Instance().TryGetBrush(brushId, outDesc);
+}
+
+[[nodiscard]] GradientBrushRegistry* EnsureMutableNodeGradient(
+    VisualWorld& world,
+    VisualNode* node,
+    bool isStroke,
+    std::uint32_t& outBrushId) noexcept {
+    outBrushId = 0u;
+    const MutableGradSlot slot = ResolveGradSlot(node, isStroke);
+    if (!slot.gradId || *slot.gradId <= 0) return nullptr;
+    GradientBrushRegistry* reg = ResolveGradRegistryForBrush(world, static_cast<std::uint32_t>(*slot.gradId));
+    if (!reg) return nullptr;
+    if (slot.ownsMutable && !*slot.ownsMutable) {
+        const std::uint32_t cloned = reg->CloneMutableBrush(static_cast<std::uint32_t>(*slot.gradId));
+        if (cloned == 0u) return nullptr;
+        *slot.gradId = static_cast<std::int32_t>(cloned);
+        *slot.ownsMutable = true;
+    }
+    outBrushId = static_cast<std::uint32_t>(*slot.gradId);
+    return reg;
+}
+
 [[nodiscard]] bool IsColorProp(VisualAnimProp prop) noexcept {
+    const auto target = ParseGradientStopTarget(prop);
+    if (target.isStopColor) return true;
     return prop == VisualAnimProp::BgColor ||
            prop == VisualAnimProp::FgColor ||
            prop == VisualAnimProp::BorderColor ||
@@ -160,7 +279,23 @@ void ApplyScalarProp(VisualWorld& world, VisualNodeId id, VisualAnimProp prop, f
         node->effect.opacity = std::clamp(value, 0.0f, 1.0f);
         break;
     case VisualAnimProp::BrushOpacity:
-        node->box.bgOpacity = std::clamp(value, 0.0f, 1.0f);
+        if (node->kind == VisualKind::Vector) {
+            node->vector.fillOpacity = std::clamp(value, 0.0f, 1.0f);
+        } else {
+            node->box.bgOpacity = std::clamp(value, 0.0f, 1.0f);
+        }
+        break;
+    case VisualAnimProp::FillBrushOpacity:
+        if (node->kind == VisualKind::Vector) {
+            node->vector.fillOpacity = std::clamp(value, 0.0f, 1.0f);
+        } else {
+            node->box.bgOpacity = std::clamp(value, 0.0f, 1.0f);
+        }
+        break;
+    case VisualAnimProp::StrokeBrushOpacity:
+        if (node->kind == VisualKind::Vector) {
+            node->vector.strokeOpacity = std::clamp(value, 0.0f, 1.0f);
+        }
         break;
     case VisualAnimProp::CustomScalar0:
         node->customScalars[0] = value;
@@ -174,8 +309,27 @@ void ApplyScalarProp(VisualWorld& world, VisualNodeId id, VisualAnimProp prop, f
     case VisualAnimProp::CustomScalar3:
         node->customScalars[3] = value;
         break;
-    default:
+    case VisualAnimProp::OpacityMaskStop0Offset:
+    case VisualAnimProp::OpacityMaskStop1Offset:
+    case VisualAnimProp::OpacityMaskStop2Offset:
+    case VisualAnimProp::OpacityMaskStop3Offset: {
+        const std::size_t stopIdx = static_cast<std::size_t>(
+            static_cast<std::uint8_t>(prop) - static_cast<std::uint8_t>(VisualAnimProp::OpacityMaskStop0Offset));
+        if (stopIdx < node->opacityMask.stopOffsets.size()) {
+            node->opacityMask.stopOffsets[stopIdx] = std::clamp(value, 0.0f, 1.0f);
+        }
         break;
+    }
+    default: {
+        const auto target = ParseGradientStopTarget(prop);
+        if (target.isStopOffset) {
+            std::uint32_t brushId = 0u;
+            if (GradientBrushRegistry* reg = EnsureMutableNodeGradient(world, node, target.isStroke, brushId)) {
+                (void)reg->UpdateBrushStopOffset(brushId, target.stopIndex, value);
+            }
+        }
+        break;
+    }
     }
     world.MarkDirty(id, DirtyFlagsForScalarProp(prop));
 }
@@ -183,6 +337,14 @@ void ApplyScalarProp(VisualWorld& world, VisualNodeId id, VisualAnimProp prop, f
 void ApplyColorProp(VisualWorld& world, VisualNodeId id, VisualAnimProp prop, std::uint32_t rgba) noexcept {
     VisualNode* node = world.GetNode(id);
     if (!node) return;
+    if (const auto target = ParseGradientStopTarget(prop); target.isStopColor) {
+        std::uint32_t brushId = 0u;
+        if (GradientBrushRegistry* reg = EnsureMutableNodeGradient(world, node, target.isStroke, brushId)) {
+            (void)reg->UpdateBrushStopColor(brushId, target.stopIndex, UnpackRgba(rgba));
+            world.MarkDirty(id, VisualDirty_Visual);
+        }
+        return;
+    }
     switch (prop) {
     case VisualAnimProp::BgColor:
     case VisualAnimProp::FillColor:
@@ -395,7 +557,9 @@ std::int32_t VisualAnimationEngine::StartColor(
     float durationSec,
     EasingFunctionKind easeKind,
     EasingMode easeMode,
-    float delaySec) {
+    float delaySec,
+    bool autoReverse,
+    std::int32_t repeatCount) {
     if (!node.IsValid()) return 0;
     const float clampedDelay = std::max(0.0f, delaySec);
     if (clampedDelay <= 0.0f) {
@@ -420,6 +584,8 @@ std::int32_t VisualAnimationEngine::StartColor(
     track.delaySec = clampedDelay;
     track.easeKind = easeKind;
     track.easeMode = easeMode;
+    track.autoReverse = autoReverse;
+    track.repeatCount = repeatCount;
     tracks_.push_back(std::move(track));
     if (wakeHostCallback_) {
         wakeHostCallback_();
@@ -455,12 +621,43 @@ float VisualAnimationEngine::ReadCurrentScalarProp(
     case VisualAnimProp::PathTrimEnd: return node->vector.trimEnd;
     case VisualAnimProp::EffectRadius: return node->effect.radius;
     case VisualAnimProp::EffectOpacity: return node->effect.opacity;
-    case VisualAnimProp::BrushOpacity: return node->box.bgOpacity;
+    case VisualAnimProp::BrushOpacity:
+        return (node->kind == VisualKind::Vector) ? node->vector.fillOpacity : node->box.bgOpacity;
+    case VisualAnimProp::FillBrushOpacity:
+        return (node->kind == VisualKind::Vector) ? node->vector.fillOpacity : node->box.bgOpacity;
+    case VisualAnimProp::StrokeBrushOpacity:
+        return (node->kind == VisualKind::Vector) ? node->vector.strokeOpacity : 1.0f;
     case VisualAnimProp::CustomScalar0: return node->customScalars[0];
     case VisualAnimProp::CustomScalar1: return node->customScalars[1];
     case VisualAnimProp::CustomScalar2: return node->customScalars[2];
     case VisualAnimProp::CustomScalar3: return node->customScalars[3];
-    default: return 0.0f;
+    case VisualAnimProp::OpacityMaskStop0Offset:
+    case VisualAnimProp::OpacityMaskStop1Offset:
+    case VisualAnimProp::OpacityMaskStop2Offset:
+    case VisualAnimProp::OpacityMaskStop3Offset: {
+        const std::size_t stopIdx = static_cast<std::size_t>(
+            static_cast<std::uint8_t>(prop) - static_cast<std::uint8_t>(VisualAnimProp::OpacityMaskStop0Offset));
+        if (stopIdx < node->opacityMask.stopOffsets.size() &&
+            std::isfinite(node->opacityMask.stopOffsets[stopIdx])) {
+            return node->opacityMask.stopOffsets[stopIdx];
+        }
+        GradientBrushDesc desc{};
+        if (TryReadGradientBrush(world, node->opacityMask.gradId, desc) && stopIdx < desc.stops.size()) {
+            return desc.stops[stopIdx].offset;
+        }
+        return 0.0f;
+    }
+    default: {
+        const auto target = ParseGradientStopTarget(prop);
+        if (target.isStopOffset) {
+            GradientBrushDesc desc{};
+            if (TryReadGradientBrush(world, ReadGradId(node, target.isStroke), desc) &&
+                target.stopIndex < desc.stops.size()) {
+                return desc.stops[target.stopIndex].offset;
+            }
+        }
+        return 0.0f;
+    }
     }
 }
 
@@ -470,6 +667,14 @@ std::uint32_t VisualAnimationEngine::ReadCurrentColorProp(
     VisualAnimProp prop) noexcept {
     const VisualNode* node = world.GetNode(id);
     if (!node) return 0u;
+    if (const auto target = ParseGradientStopTarget(prop); target.isStopColor) {
+        GradientBrushDesc desc{};
+        if (TryReadGradientBrush(world, ReadGradId(node, target.isStroke), desc) &&
+            target.stopIndex < desc.stops.size()) {
+            return PackColor(desc.stops[target.stopIndex].color);
+        }
+        return 0u;
+    }
     switch (prop) {
     case VisualAnimProp::BgColor:
     case VisualAnimProp::FillColor:
@@ -682,6 +887,18 @@ bool VisualAnimationEngine::Tick(float dtSeconds, VisualWorld& world) {
         }
     }
     return anyUpdated;
+}
+
+bool VisualAnimationEngine::HasTrack(std::int32_t trackId) const noexcept {
+    if (trackId <= 0) {
+        return false;
+    }
+    for (const VisualAnimTrack& tr : tracks_) {
+        if (tr.trackId == trackId) {
+            return true;
+        }
+    }
+    return false;
 }
 
 bool VisualAnimationEngine::HasActiveAnimations() const noexcept {

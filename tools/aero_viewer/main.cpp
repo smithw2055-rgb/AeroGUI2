@@ -27,10 +27,13 @@ void PrintUsage() {
         "  --width <W>             Viewport width (default: 1280)\n"
         "  --height <H>            Viewport height (default: 800)\n"
         "  --out <screenshot.ppm>  Write rendered RGBA8 frame as binary PPM (P6)\n"
-        "  --O2                    Enable aggressive MIR optimization\n"
+        "  --O2                    Enable optional MIR optimization (default: off / pure interpreter)\n"
+        "  --no-tree-shake         Disable stdlib AST/MIR reachability pruning\n"
+        "  --software              Use low-memory Win32 GDI software presenter instead of OpenGL\n"
+        "  --gpu                   Prefer hardware OpenGL presenter (default)\n"
         "  --stdlib <dir>          Path to stdlib root directory\n"
-        "  --cache-dir <dir>       Disk stdlib cache directory\n"
-        "  --no-cache              Disable stdlib disk cache\n"
+        "  --cache-dir <dir>       Enable and use disk stdlib cache directory\n"
+        "  --no-cache              Disable stdlib cache (default)\n"
         "  -h, --help              Show this help\n");
 }
 
@@ -95,19 +98,6 @@ void PrintUsage() {
     return anyNonZero && anyDiff;
 }
 
-[[nodiscard]] std::string ResolveDefaultCacheDir(const char* argv0) {
-    if (const char* envCache = std::getenv("AERO_CACHE_DIR"); envCache && envCache[0] != '\0') {
-        return std::filesystem::path(envCache).lexically_normal().generic_string();
-    }
-    if (argv0 && argv0[0] != '\0') {
-        const std::filesystem::path exeDir = std::filesystem::path(argv0).parent_path();
-        if (!exeDir.empty()) {
-            return (exeDir / "aero_stdlib_cache").lexically_normal().generic_string();
-        }
-    }
-    return {};
-}
-
 void AppendUniqueDir(std::vector<std::string>& list, const std::filesystem::path& dir) {
     if (dir.empty()) {
         return;
@@ -163,9 +153,12 @@ int main(int argc, char** argv) {
     std::uint32_t height = 800u;
     std::string outPpmPath;
     bool optimizeO2 = false;
+    bool disableTreeShake = false;
+    bool preferSoftware = false;
+    bool softwareFlagSet = false;
     std::string stdlibDir;
     std::string cacheDir;
-    bool allowCache = true;
+    bool allowCache = false;
 
     for (int i = 1; i < argc; ++i) {
         const std::string_view arg(argv[i]);
@@ -218,6 +211,14 @@ int main(int argc, char** argv) {
             outPpmPath = v;
         } else if (arg == "--O2" || arg == "-O2") {
             optimizeO2 = true;
+        } else if (arg == "--no-tree-shake") {
+            disableTreeShake = true;
+        } else if (arg == "--software") {
+            preferSoftware = true;
+            softwareFlagSet = true;
+        } else if (arg == "--gpu") {
+            preferSoftware = false;
+            softwareFlagSet = true;
         } else if (arg == "--stdlib") {
             const char* v = needNext(arg);
             if (!v) return 2;
@@ -226,8 +227,10 @@ int main(int argc, char** argv) {
             const char* v = needNext(arg);
             if (!v) return 2;
             cacheDir = v;
+            allowCache = true;
         } else if (arg == "--no-cache") {
             allowCache = false;
+            cacheDir.clear();
         } else {
             std::cerr << "Unknown option: " << arg << "\n";
             PrintUsage();
@@ -255,10 +258,16 @@ int main(int argc, char** argv) {
     }
 
     compileInput.includeStdlib = true;
+    compileInput.treeShakeStdlib = !disableTreeShake;
     compileInput.optimizeBytecode = optimizeO2;
+    compileInput.emitAotCpp = false;
     compileInput.allowDiskCache = allowCache;
-    if (allowCache) {
-        compileInput.cacheDir = !cacheDir.empty() ? cacheDir : ResolveDefaultCacheDir(argc > 0 ? argv[0] : nullptr);
+    compileInput.allowStdlibCache = false;
+    compileInput.compilerSession = nullptr;
+    if (allowCache && !cacheDir.empty()) {
+        compileInput.cacheDir = cacheDir;
+    } else {
+        compileInput.cacheDir.clear();
     }
     if (!stdlibDir.empty()) {
         compileInput.stdlibRootDir = stdlibDir;
@@ -322,6 +331,9 @@ int main(int argc, char** argv) {
     hostCfg.viewportWidth = width;
     hostCfg.viewportHeight = height;
     hostCfg.headless = headless;
+    if (softwareFlagSet) {
+        hostCfg.preferSoftwareRasterizer = preferSoftware;
+    }
     hostCfg.optimizeBytecode = optimizeO2;
     if (!entryName.empty()) {
         hostCfg.entryClassName = entryName;

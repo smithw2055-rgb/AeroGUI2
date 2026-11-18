@@ -82,12 +82,14 @@ uniform vec2 u_ViewportSize;
 
 out vec2 v_Uv;
 out vec4 v_Color;
+out vec2 v_PhysPos;
 
 void main() {
     vec2 ndc = (a_Position / max(u_ViewportSize, vec2(1.0))) * 2.0 - 1.0;
     ndc.y = -ndc.y;
     gl_Position = vec4(ndc, 0.0, 1.0);
     v_Uv = a_TexCoord;
+    v_PhysPos = a_Position;
     v_Color = vec4(
         float((a_PackedRgba >>  0u) & 0xFFu) / 255.0,
         float((a_PackedRgba >>  8u) & 0xFFu) / 255.0,
@@ -99,6 +101,7 @@ void main() {
 
 constexpr std::string_view kEffectPixelShaderBodyGlsl = R"(in vec2 v_Uv;
 in vec4 v_Color;
+in vec2 v_PhysPos;
 
 uniform sampler2D u_SrcTex;
 uniform vec2 u_TexelSize;
@@ -106,6 +109,13 @@ uniform int u_EffectMode;
 uniform vec2 u_EffectParams;
 uniform vec2 u_EffectUvMin;
 uniform vec2 u_EffectUvMax;
+uniform vec4 u_MaskMatRow0;
+uniform vec4 u_MaskMatRow1;
+uniform vec4 u_MaskSizeGrad;
+uniform vec4 u_MaskGradPts;
+uniform vec4 u_MaskStopOffsets;
+uniform vec4 u_MaskStopAlphas;
+uniform int u_MaskStopCount;
 
 out vec4 o_FragColor;
 
@@ -167,6 +177,54 @@ void main() {
             float lum = dot(straight, vec3(0.2126, 0.7152, 0.0722));
             vec3 satRgb = clamp(mix(vec3(lum), straight, sat), 0.0, 1.0);
             c.rgb = satRgb * c.a;
+        }
+    } else if (u_EffectMode == 7) {
+        if (u_MaskStopCount <= 0) {
+            c *= clamp(u_EffectParams.x, 0.0, 1.0);
+        } else {
+            vec2 localPt = vec2(
+                dot(u_MaskMatRow0.xyz, vec3(v_PhysPos, 1.0)),
+                dot(u_MaskMatRow1.xyz, vec3(v_PhysPos, 1.0)));
+            float normU = (localPt.x - u_MaskMatRow0.w) / max(1e-4, u_MaskSizeGrad.x);
+            float normV = (localPt.y - u_MaskMatRow1.w) / max(1e-4, u_MaskSizeGrad.y);
+            vec2 samplePos = (u_MaskSizeGrad.z > 0.5)
+                ? vec2(normU * u_MaskSizeGrad.x, normV * u_MaskSizeGrad.y)
+                : vec2(normU, normV);
+            vec2 d = u_MaskGradPts.zw - u_MaskGradPts.xy;
+            float lenSq = dot(d, d);
+            float rawT = (lenSq > 1e-8) ? dot(samplePos - u_MaskGradPts.xy, d) / lenSq : 0.0;
+            float t01 = clamp(rawT, 0.0, 1.0);
+            if (u_MaskSizeGrad.w > 1.5) {
+                t01 = clamp(rawT - floor(rawT), 0.0, 1.0);
+            } else if (u_MaskSizeGrad.w > 0.5) {
+                float m = mod(abs(rawT), 2.0);
+                t01 = clamp((m > 1.0) ? (2.0 - m) : m, 0.0, 1.0);
+            }
+            float maskA = u_MaskStopAlphas.x;
+            int sc = min(u_MaskStopCount, 4);
+            float lastOff = u_MaskStopOffsets.x;
+            float lastA = u_MaskStopAlphas.x;
+            if (sc >= 2) { lastOff = u_MaskStopOffsets.y; lastA = u_MaskStopAlphas.y; }
+            if (sc >= 3) { lastOff = u_MaskStopOffsets.z; lastA = u_MaskStopAlphas.z; }
+            if (sc >= 4) { lastOff = u_MaskStopOffsets.w; lastA = u_MaskStopAlphas.w; }
+            if (t01 <= u_MaskStopOffsets.x || sc == 1) {
+                maskA = u_MaskStopAlphas.x;
+            } else if (t01 >= lastOff) {
+                maskA = lastA;
+            } else if (sc >= 2 && t01 <= u_MaskStopOffsets.y) {
+                float sp = u_MaskStopOffsets.y - u_MaskStopOffsets.x;
+                float f = (sp > 1e-6) ? clamp((t01 - u_MaskStopOffsets.x) / sp, 0.0, 1.0) : 0.0;
+                maskA = mix(u_MaskStopAlphas.x, u_MaskStopAlphas.y, f);
+            } else if (sc >= 3 && t01 <= u_MaskStopOffsets.z) {
+                float sp = u_MaskStopOffsets.z - u_MaskStopOffsets.y;
+                float f = (sp > 1e-6) ? clamp((t01 - u_MaskStopOffsets.y) / sp, 0.0, 1.0) : 0.0;
+                maskA = mix(u_MaskStopAlphas.y, u_MaskStopAlphas.z, f);
+            } else if (sc >= 4) {
+                float sp = u_MaskStopOffsets.w - u_MaskStopOffsets.z;
+                float f = (sp > 1e-6) ? clamp((t01 - u_MaskStopOffsets.z) / sp, 0.0, 1.0) : 0.0;
+                maskA = mix(u_MaskStopAlphas.z, u_MaskStopAlphas.w, f);
+            }
+            c *= clamp(maskA * u_EffectParams.x, 0.0, 1.0);
         }
     }
     o_FragColor = c * v_Color.a;
@@ -716,6 +774,7 @@ void PopulateGlFunctionTableFromSession(
     bind(table.GetUniformLocation, "glGetUniformLocation");
     bind(table.Uniform1i, "glUniform1i");
     bind(table.Uniform2f, "glUniform2f");
+    bind(table.Uniform4f, "glUniform4f");
     bind(table.GenTextures, "glGenTextures");
     bind(table.DeleteTextures, "glDeleteTextures");
     bind(table.ActiveTexture, "glActiveTexture");
@@ -1552,6 +1611,13 @@ bool OpenGlDeviceBackend::EnsureEffectGpuResources(
         uEffectParamsLoc_ = gl_.GetUniformLocation(effectProgramId_, "u_EffectParams");
         uEffectUvMinLoc_ = gl_.GetUniformLocation(effectProgramId_, "u_EffectUvMin");
         uEffectUvMaxLoc_ = gl_.GetUniformLocation(effectProgramId_, "u_EffectUvMax");
+        uEffectMaskMatRow0Loc_ = gl_.GetUniformLocation(effectProgramId_, "u_MaskMatRow0");
+        uEffectMaskMatRow1Loc_ = gl_.GetUniformLocation(effectProgramId_, "u_MaskMatRow1");
+        uEffectMaskSizeGradLoc_ = gl_.GetUniformLocation(effectProgramId_, "u_MaskSizeGrad");
+        uEffectMaskGradPtsLoc_ = gl_.GetUniformLocation(effectProgramId_, "u_MaskGradPts");
+        uEffectMaskStopOffsetsLoc_ = gl_.GetUniformLocation(effectProgramId_, "u_MaskStopOffsets");
+        uEffectMaskStopAlphasLoc_ = gl_.GetUniformLocation(effectProgramId_, "u_MaskStopAlphas");
+        uEffectMaskStopCountLoc_ = gl_.GetUniformLocation(effectProgramId_, "u_MaskStopCount");
     }
 
     if (effectQuadVboId_ == 0u) {
@@ -1708,12 +1774,11 @@ bool OpenGlDeviceBackend::AllocateRingVertexBuffer(std::size_t maxPagesInRing) {
     if (vaoId_ != 0u) {
         gl_.BindVertexArray(vaoId_);
     }
-    std::vector<std::uint8_t> zeroInit(ringBufferBytes_, 0u);
     gl_.BindBuffer(kGlArrayBuffer, ringVboId_);
     gl_.BufferData(
         kGlArrayBuffer,
         static_cast<AeroGLsizeiptr>(ringBufferBytes_),
-        zeroInit.data(),
+        nullptr,
         kGlDynamicDraw);
 
     if (vaoId_ != 0u && quadEboId_ != 0u) {
@@ -1797,6 +1862,12 @@ void OpenGlDeviceBackend::SyncUnifiedUiAtlas(const PagedRenderTree& tree) {
     const FontAtlas& fontAtlas = ResolveFontAtlas(&tree);
     const GradientBrushRegistry& gradReg = ResolveGradientRegistry(&tree);
 
+    auto trimAtlasScratch = [&]() {
+        if (uiAtlasScratchRgba8_.capacity() > 65536u) {
+            std::vector<std::uint8_t>().swap(uiAtlasScratchRgba8_);
+        }
+    };
+
     if (!syncedUiAtlasReady_ ||
         atlasTextureId_ == 0u ||
         atlasWidth_ != kUnifiedUiAtlasSize ||
@@ -1814,6 +1885,7 @@ void OpenGlDeviceBackend::SyncUnifiedUiAtlas(const PagedRenderTree& tree) {
             syncedGradientRevision_ = gradRev;
             syncedMinGradRow_ = lowestGradRow;
         }
+        trimAtlasScratch();
         return;
     }
 
@@ -1833,6 +1905,7 @@ void OpenGlDeviceBackend::SyncUnifiedUiAtlas(const PagedRenderTree& tree) {
                 uiAtlasScratchRgba8_.data());
         }
         syncedFontRevision_ = snapRev;
+        trimAtlasScratch();
     }
 
     // 2. Incremental MTSDF vector path band sync [y: 512..959]
@@ -1860,6 +1933,7 @@ void OpenGlDeviceBackend::SyncUnifiedUiAtlas(const PagedRenderTree& tree) {
                     kUnifiedUiAtlasSize,
                     dirtyRows,
                     uiAtlasScratchRgba8_.data());
+                trimAtlasScratch();
             }
         }
         syncedMtsdfOwnerId_ = curMtsdfOwner;
@@ -1899,6 +1973,7 @@ void OpenGlDeviceBackend::SyncUnifiedUiAtlas(const PagedRenderTree& tree) {
         (void)UpdateAtlasSubRegion(0u, subStartY, kUnifiedUiAtlasSize, subRows, uiAtlasScratchRgba8_.data());
         syncedMinGradRow_ = newLowestRow;
         syncedGradientRevision_ = curGradRev;
+        trimAtlasScratch();
     }
 }
 
@@ -2497,6 +2572,34 @@ GpuBackendFrameStats OpenGlDeviceBackend::ExecuteSubmission(
             if (!gl_.HasFramebufferSupport() || effectGpuPipelineFailed_) {
                 return false;
             }
+            const bool isPureOpacityMask = (span.effectMode == UIEffectKind::OpacityMask);
+            if (span.hasOpacityMask && (!isPureOpacityMask || !gl_.Uniform4f)) {
+                return false;
+            }
+            GradientBrushDesc maskGrad{};
+            std::vector<GradientStop> sortedMaskStops;
+            if (isPureOpacityMask && span.opacityMaskGradId > 0u) {
+                const bool found =
+                    (tree.ResourceStore() != nullptr &&
+                     tree.ResourceStore()->GradientBrushes().TryGetBrush(span.opacityMaskGradId, maskGrad)) ||
+                    GradientBrushRegistry::Instance().TryGetBrush(span.opacityMaskGradId, maskGrad);
+                if (!found || maskGrad.kind != GradientBrushKind::Linear || maskGrad.stops.empty() ||
+                    maskGrad.stops.size() > 4u) {
+                    return false;
+                }
+                sortedMaskStops = maskGrad.stops;
+                for (std::size_t i = 0u; i < sortedMaskStops.size() && i < span.opacityMaskStopOffsets.size(); ++i) {
+                    if (std::isfinite(span.opacityMaskStopOffsets[i])) {
+                        sortedMaskStops[i].offset = std::clamp(span.opacityMaskStopOffsets[i], 0.0f, 1.0f);
+                    }
+                }
+                std::stable_sort(
+                    sortedMaskStops.begin(),
+                    sortedMaskStops.end(),
+                    [](const GradientStop& a, const GradientStop& b) noexcept {
+                        return a.offset < b.offset;
+                    });
+            }
             for (std::size_t k = nextBlurCursor; k < blurSpans.size(); ++k) {
                 if (blurSpans[k].firstNodeId >= span.endNodeId) {
                     break;
@@ -2706,6 +2809,71 @@ GpuBackendFrameStats OpenGlDeviceBackend::ExecuteSubmission(
                 case UIEffectKind::Saturation:
                     issueEffectPass(0u, 6, effectFboTexIds_[0], invW, invH, span.saturation, 1.0f, opacityColor, true, true);
                     break;
+                case UIEffectKind::OpacityMask: {
+                    const float maskOp = std::clamp(span.opacityMaskOpacity, 0.0f, 1.0f);
+                    if (span.opacityMaskGradId == 0u) {
+                        const float solidA =
+                            (static_cast<float>((span.opacityMaskSolidRgba >> 24u) & 0xFFu) / 255.0f) * maskOp;
+                        if (uEffectMaskStopCountLoc_ >= 0) {
+                            gl_.Uniform1i(uEffectMaskStopCountLoc_, 0);
+                        }
+                        issueEffectPass(0u, 7, effectFboTexIds_[0], invW, invH, solidA, 1.0f, 0xFFFFFFFFu, true, true);
+                    } else {
+                        const float invDpi = 1.0f / std::max(0.25f, dpiScale);
+                        const Matrix2D& invW2 = span.opacityMaskInvWorld2D;
+                        if (uEffectMaskMatRow0Loc_ >= 0 && gl_.Uniform4f) {
+                            gl_.Uniform4f(
+                                uEffectMaskMatRow0Loc_,
+                                invW2.m00 * invDpi,
+                                invW2.m01 * invDpi,
+                                invW2.tx,
+                                span.opacityMaskLocalRect.x);
+                        }
+                        if (uEffectMaskMatRow1Loc_ >= 0 && gl_.Uniform4f) {
+                            gl_.Uniform4f(
+                                uEffectMaskMatRow1Loc_,
+                                invW2.m10 * invDpi,
+                                invW2.m11 * invDpi,
+                                invW2.ty,
+                                span.opacityMaskLocalRect.y);
+                        }
+                        if (uEffectMaskSizeGradLoc_ >= 0 && gl_.Uniform4f) {
+                            gl_.Uniform4f(
+                                uEffectMaskSizeGradLoc_,
+                                std::max(1e-4f, span.opacityMaskLocalRect.width),
+                                std::max(1e-4f, span.opacityMaskLocalRect.height),
+                                (maskGrad.mappingMode == BrushMappingMode::Absolute) ? 1.0f : 0.0f,
+                                static_cast<float>(static_cast<int>(maskGrad.spreadMethod)));
+                        }
+                        if (uEffectMaskGradPtsLoc_ >= 0 && gl_.Uniform4f) {
+                            gl_.Uniform4f(
+                                uEffectMaskGradPtsLoc_,
+                                maskGrad.startPoint.x,
+                                maskGrad.startPoint.y,
+                                maskGrad.endPoint.x,
+                                maskGrad.endPoint.y);
+                        }
+                        float offs[4]{0.0f, 1.0f, 1.0f, 1.0f};
+                        float alphas[4]{1.0f, 1.0f, 1.0f, 1.0f};
+                        const int sc = static_cast<int>(std::min<std::size_t>(4u, sortedMaskStops.size()));
+                        for (int si = 0; si < sc; ++si) {
+                            offs[si] = sortedMaskStops[static_cast<std::size_t>(si)].offset;
+                            alphas[si] = std::clamp(sortedMaskStops[static_cast<std::size_t>(si)].color.a, 0.0f, 1.0f);
+                        }
+                        if (uEffectMaskStopOffsetsLoc_ >= 0 && gl_.Uniform4f) {
+                            gl_.Uniform4f(uEffectMaskStopOffsetsLoc_, offs[0], offs[1], offs[2], offs[3]);
+                        }
+                        if (uEffectMaskStopAlphasLoc_ >= 0 && gl_.Uniform4f) {
+                            gl_.Uniform4f(uEffectMaskStopAlphasLoc_, alphas[0], alphas[1], alphas[2], alphas[3]);
+                        }
+                        if (uEffectMaskStopCountLoc_ >= 0) {
+                            gl_.Uniform1i(uEffectMaskStopCountLoc_, sc);
+                        }
+                        const float totalMaskOp = std::clamp(maskGrad.opacity, 0.0f, 1.0f) * maskOp;
+                        issueEffectPass(0u, 7, effectFboTexIds_[0], invW, invH, totalMaskOp, 1.0f, 0xFFFFFFFFu, true, true);
+                    }
+                    break;
+                }
                 default:
                     issueEffectPass(0u, 0, effectFboTexIds_[0], invW, invH, 1.0f, 1.0f, opacityColor, true, true);
                     break;

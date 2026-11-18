@@ -552,8 +552,16 @@ bool VisualWorld::SetBoxStyle(
 bool VisualWorld::SetBoxGradients(VisualNodeId id, std::int32_t bgGradId, std::int32_t borderGradId) noexcept {
     VisualNode* node = GetNode(id);
     if (!node) return false;
-    node->box.bgGradId = bgGradId;
-    node->box.borderGradId = borderGradId;
+    if (!node->box.ownsMutableBgGrad || node->box.baseBgGradId != bgGradId) {
+        node->box.bgGradId = bgGradId;
+        node->box.baseBgGradId = bgGradId;
+        node->box.ownsMutableBgGrad = false;
+    }
+    if (!node->box.ownsMutableBorderGrad || node->box.baseBorderGradId != borderGradId) {
+        node->box.borderGradId = borderGradId;
+        node->box.baseBorderGradId = borderGradId;
+        node->box.ownsMutableBorderGrad = false;
+    }
     MarkDirty(id, VisualDirty_Visual);
     return true;
 }
@@ -632,6 +640,26 @@ bool VisualWorld::SetEffect(
     node->effect.dirDeg = dirDeg;
     node->effect.colorRgba = colorRgba;
     node->effect.opacity = opacity;
+    MarkDirty(id, VisualDirty_Visual);
+    return true;
+}
+
+bool VisualWorld::SetOpacityMask(
+    VisualNodeId id,
+    bool enabled,
+    std::int32_t gradId,
+    std::uint32_t solidRgba,
+    float opacity) noexcept {
+    VisualNode* node = GetNode(id);
+    if (!node) return false;
+    const bool gradChanged = (node->opacityMask.gradId != gradId) || !enabled;
+    node->opacityMask.enabled = enabled;
+    node->opacityMask.gradId = gradId;
+    node->opacityMask.solidRgba = solidRgba;
+    node->opacityMask.opacity = std::clamp(opacity, 0.0f, 1.0f);
+    if (gradChanged) {
+        node->opacityMask.stopOffsets.fill(std::numeric_limits<float>::quiet_NaN());
+    }
     MarkDirty(id, VisualDirty_Visual);
     return true;
 }
@@ -802,14 +830,31 @@ bool VisualWorld::SetVectorShape(
     node->vector.shapeKind = shapeKind;
     node->vector.pathOrParams.assign(pathOrParams);
     node->vector.fillRgba = fillRgba;
-    node->vector.fillGradId = fillGradId;
+    if (!node->vector.ownsMutableFillGrad || node->vector.baseFillGradId != fillGradId) {
+        node->vector.fillGradId = fillGradId;
+        node->vector.baseFillGradId = fillGradId;
+        node->vector.ownsMutableFillGrad = false;
+    }
     node->vector.strokeRgba = strokeRgba;
-    node->vector.strokeGradId = strokeGradId;
+    if (!node->vector.ownsMutableStrokeGrad || node->vector.baseStrokeGradId != strokeGradId) {
+        node->vector.strokeGradId = strokeGradId;
+        node->vector.baseStrokeGradId = strokeGradId;
+        node->vector.ownsMutableStrokeGrad = false;
+    }
     node->vector.strokeWidth = strokeWidth;
     node->vector.stretch = stretch;
     node->vector.trimStart = trimStart;
     node->vector.trimEnd = trimEnd;
     MarkAncestorsDirty(id, VisualDirty_All);
+    return true;
+}
+
+bool VisualWorld::SetVectorBrushOpacity(VisualNodeId id, float fillOpacity, float strokeOpacity) noexcept {
+    VisualNode* node = GetNode(id);
+    if (!node) return false;
+    node->vector.fillOpacity = std::clamp(fillOpacity, 0.0f, 1.0f);
+    node->vector.strokeOpacity = std::clamp(strokeOpacity, 0.0f, 1.0f);
+    MarkDirty(id, VisualDirty_Visual);
     return true;
 }
 

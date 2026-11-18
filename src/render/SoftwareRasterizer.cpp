@@ -482,7 +482,184 @@ void ApplySaturationPremulLayer(PremulOffscreenLayer& layer, float saturationVal
     }
 }
 
-void ApplySpanPostProcessEffect(PremulOffscreenLayer& layer, const BlurLayerSpan& span) {
+[[nodiscard]] bool TryResolveGradientBrush(
+    const PagedRenderTree& tree,
+    std::uint32_t brushId,
+    GradientBrushDesc& outBrush) noexcept;
+
+[[nodiscard]] float EvaluateOpacityMaskStopsAlpha(
+    const std::vector<GradientStop>& sortedStops,
+    float clampedT01) noexcept {
+    if (sortedStops.empty()) {
+        return 1.0f;
+    }
+    if (sortedStops.size() == 1u || clampedT01 <= sortedStops.front().offset) {
+        return std::clamp(sortedStops.front().color.a, 0.0f, 1.0f);
+    }
+    if (clampedT01 >= sortedStops.back().offset) {
+        return std::clamp(sortedStops.back().color.a, 0.0f, 1.0f);
+    }
+    for (std::size_t i = 0u; i + 1u < sortedStops.size(); ++i) {
+        const GradientStop& s0 = sortedStops[i];
+        const GradientStop& s1 = sortedStops[i + 1u];
+        if (clampedT01 >= s0.offset && clampedT01 <= s1.offset) {
+            const float span = s1.offset - s0.offset;
+            const float f = (span > 1e-6f) ? std::clamp((clampedT01 - s0.offset) / span, 0.0f, 1.0f) : 0.0f;
+            return std::clamp(s0.color.a + (s1.color.a - s0.color.a) * f, 0.0f, 1.0f);
+        }
+    }
+    return std::clamp(sortedStops.back().color.a, 0.0f, 1.0f);
+}
+
+void ApplyOpacityMaskToPremulLayer(
+    const UIResourceStore* optResourceStore,
+    float rootDpiScale,
+    PremulOffscreenLayer& layer,
+    const BlurLayerSpan& span) {
+    if (!span.hasOpacityMask && span.effectMode != UIEffectKind::OpacityMask) {
+        return;
+    }
+    const float maskOp = std::clamp(span.opacityMaskOpacity, 0.0f, 1.0f);
+    if (span.opacityMaskGradId == 0u) {
+        const float solidA = (static_cast<float>((span.opacityMaskSolidRgba >> 24u) & 0xFFu) / 255.0f) * maskOp;
+        if (solidA >= 0.999f) {
+            return;
+        }
+        const std::size_t pxCount = static_cast<std::size_t>(layer.width) * static_cast<std::size_t>(layer.height);
+        float* p = layer.premulRgba.data();
+        for (std::size_t i = 0u; i < pxCount; ++i) {
+            float* px = p + i * 4u;
+            px[0] *= solidA;
+            px[1] *= solidA;
+            px[2] *= solidA;
+            px[3] *= solidA;
+        }
+        return;
+    }
+
+    GradientBrushDesc desc{};
+    const bool foundGrad =
+        (span.opacityMaskGradId != 0u) &&
+        ((optResourceStore != nullptr &&
+          optResourceStore->GradientBrushes().TryGetBrush(span.opacityMaskGradId, desc)) ||
+         GradientBrushRegistry::Instance().TryGetBrush(span.opacityMaskGradId, desc));
+    if (!foundGrad || desc.stops.empty()) {
+        return;
+    }
+    for (std::size_t i = 0u; i < desc.stops.size() && i < span.opacityMaskStopOffsets.size(); ++i) {
+        if (std::isfinite(span.opacityMaskStopOffsets[i])) {
+            desc.stops[i].offset = std::clamp(span.opacityMaskStopOffsets[i], 0.0f, 1.0f);
+        }
+    }
+    std::stable_sort(
+        desc.stops.begin(),
+        desc.stops.end(),
+        [](const GradientStop& a, const GradientStop& b) noexcept {
+            return a.offset < b.offset;
+        });
+
+    const float totalOp = std::clamp(desc.opacity, 0.0f, 1.0f) * maskOp;
+    const float invDpi = 1.0f / std::max(0.25f, rootDpiScale);
+    const float effW = std::max(1e-4f, span.opacityMaskLocalRect.width);
+    const float effH = std::max(1e-4f, span.opacityMaskLocalRect.height);
+    const int w = layer.width;
+    const int h = layer.height;
+
+    auto evalT = [&](float sampleX, float sampleY) noexcept -> float {
+        float t = 0.0f;
+        if (desc.kind == GradientBrushKind::Linear) {
+            const float dx = desc.endPoint.x - desc.startPoint.x;
+            const float dy = desc.endPoint.y - desc.startPoint.y;
+            const float lenSq = dx * dx + dy * dy;
+            if (lenSq > 1e-8f) {
+                t = ((sampleX - desc.startPoint.x) * dx + (sampleY - desc.startPoint.y) * dy) / lenSq;
+            }
+        } else if (desc.kind == GradientBrushKind::Conic) {
+            constexpr float kTwoPi = 6.2831853071795864769f;
+            float angle = std::atan2(sampleY - desc.center.y, sampleX - desc.center.x);
+            if (angle < 0.0f) {
+                angle += kTwoPi;
+            }
+            t = angle / kTwoPi;
+        } else {
+            const float rx = std::max(1e-4f, std::fabs(desc.radiusX));
+            const float ry = std::max(1e-4f, std::fabs(desc.radiusY));
+            const float qx = (sampleX - desc.center.x) / rx;
+            const float qy = (sampleY - desc.center.y) / ry;
+            float fx = (desc.gradientOrigin.x - desc.center.x) / rx;
+            float fy = (desc.gradientOrigin.y - desc.center.y) / ry;
+            const float fLenSq = fx * fx + fy * fy;
+            if (fLenSq < 1e-6f) {
+                t = std::sqrt(qx * qx + qy * qy);
+            } else {
+                if (fLenSq > 0.9801f) {
+                    const float invFLen = 0.99f / std::sqrt(fLenSq);
+                    fx *= invFLen;
+                    fy *= invFLen;
+                }
+                const float dx = qx - fx;
+                const float dy = qy - fy;
+                const float d2 = dx * dx + dy * dy;
+                if (d2 <= 1e-10f) {
+                    t = 0.0f;
+                } else {
+                    const float a = 1.0f - (fx * fx + fy * fy);
+                    const float b = fx * dx + fy * dy;
+                    const float denom = b + std::sqrt(std::max(0.0f, b * b + a * d2));
+                    t = (denom > 1e-8f) ? (d2 / denom) : 1.0f;
+                }
+            }
+        }
+        switch (desc.spreadMethod) {
+            case GradientSpreadMethod::Repeat:
+                return std::clamp(t - std::floor(t), 0.0f, 1.0f);
+            case GradientSpreadMethod::Reflect: {
+                const float m = std::fmod(std::fabs(t), 2.0f);
+                return std::clamp((m > 1.0f) ? (2.0f - m) : m, 0.0f, 1.0f);
+            }
+            case GradientSpreadMethod::Pad:
+            default:
+                return std::clamp(t, 0.0f, 1.0f);
+        }
+    };
+
+    auto maskBandFn = [&](int y0, int y1) {
+        for (int ly = y0; ly < y1; ++ly) {
+            const float py = (static_cast<float>(layer.originY + ly) + 0.5f) * invDpi;
+            float* row = layer.premulRgba.data() +
+                static_cast<std::size_t>(ly) * static_cast<std::size_t>(w) * 4u;
+            for (int lx = 0; lx < w; ++lx) {
+                float* px = row + static_cast<std::size_t>(lx) * 4u;
+                if (px[3] <= 0.0005f) {
+                    continue;
+                }
+                const float ptX = (static_cast<float>(layer.originX + lx) + 0.5f) * invDpi;
+                const Point localPt = span.opacityMaskInvWorld2D.TransformPoint(Point{ptX, py});
+                const float normU = (localPt.x - span.opacityMaskLocalRect.x) / effW;
+                const float normV = (localPt.y - span.opacityMaskLocalRect.y) / effH;
+                const float sX = (desc.mappingMode == BrushMappingMode::Absolute) ? (normU * effW) : normU;
+                const float sY = (desc.mappingMode == BrushMappingMode::Absolute) ? (normV * effH) : normV;
+                const float t01 = evalT(sX, sY);
+                const float ma = std::clamp(EvaluateOpacityMaskStopsAlpha(desc.stops, t01) * totalOp, 0.0f, 1.0f);
+                px[0] *= ma;
+                px[1] *= ma;
+                px[2] *= ma;
+                px[3] *= ma;
+            }
+        }
+    };
+    if (!gInScanlineBand && static_cast<std::size_t>(w) * static_cast<std::size_t>(h) >= 16384u) {
+        ScanlineWorkerPool::Instance().ParallelBands4(h, maskBandFn);
+    } else {
+        maskBandFn(0, h);
+    }
+}
+
+void ApplySpanPostProcessEffect(
+    const UIResourceStore* optResourceStore,
+    float rootDpiScale,
+    PremulOffscreenLayer& layer,
+    const BlurLayerSpan& span) {
     if (layer.width <= 0 || layer.height <= 0) {
         return;
     }
@@ -660,6 +837,9 @@ void ApplySpanPostProcessEffect(PremulOffscreenLayer& layer, const BlurLayerSpan
         }
         default:
             break;
+    }
+    if (span.hasOpacityMask || span.effectMode == UIEffectKind::OpacityMask) {
+        ApplyOpacityMaskToPremulLayer(optResourceStore, rootDpiScale, layer, span);
     }
 }
 
@@ -1799,7 +1979,7 @@ void ExecuteBackdropBlurSpan(
     } else {
         copyBackdropRowsFn(0, bgLayer.height);
     }
-    ApplySpanPostProcessEffect(bgLayer, span);
+    ApplySpanPostProcessEffect(tree.ResourceStore(), tree.RootDpiScale(), bgLayer, span);
     const AxbMtsdfPathEntry* maskEntry = nullptr;
     if (span.maskMtsdfHash != 0u) {
         maskEntry = tree.FindMtsdfEntry(span.maskMtsdfHash);
@@ -1985,7 +2165,7 @@ void RasterizeNodeSpanRecursive(
                     gRasterBandY0 = savedBandY0;
                     gRasterBandY1 = savedBandY1;
 
-                    ApplySpanPostProcessEffect(subLayer, span);
+                    ApplySpanPostProcessEffect(tree.ResourceStore(), tree.RootDpiScale(), subLayer, span);
 
                     int compX0 = bx0;
                     int compY0 = by0;
@@ -2333,7 +2513,7 @@ bool ZeroCopyGpuStream::RasterizeBlurSpanPatchPremulRgba8(
         nullptr,
         &subLayer);
 
-    ApplySpanPostProcessEffect(subLayer, span);
+    ApplySpanPostProcessEffect(tree.ResourceStore(), tree.RootDpiScale(), subLayer, span);
 
     int compX0 = bx0;
     int compY0 = by0;
@@ -2455,7 +2635,7 @@ bool ZeroCopyGpuStream::ComputeBackdropBlurPatchPremulRgba8(
             dp[3] = static_cast<float>(sp[3]) / 255.0f;
         }
     }
-    ApplySpanPostProcessEffect(bgLayer, span);
+    ApplySpanPostProcessEffect(optResourceStore, 1.0f, bgLayer, span);
 
     int mx0 = std::clamp(SafeFloorToInt(mr.x, 0, vpW), readX, readX + readW);
     int my0 = std::clamp(SafeFloorToInt(mr.y, 0, vpH), readY, readY + readH);

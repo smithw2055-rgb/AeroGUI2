@@ -45,6 +45,14 @@ public class ButtonBase : ContentControl {
 
     public override string GetTypeName() { return "ButtonBase"; }
 
+    public override bool SubscribeBehaviorRoutedEvent(string ev, BehaviorEventSink sink) {
+        if (ev == "Click") {
+            Click += (object s, RoutedEventArgs e) => { if (sink != null) { sink.OnBehaviorEvent(s, e); } };
+            return true;
+        }
+        return base.SubscribeBehaviorRoutedEvent(ev, sink);
+    }
+
     public ClickMode ClickMode {
         get { return _clickMode; }
         set { _clickMode = value; }
@@ -307,6 +315,18 @@ public class ToggleButton : ButtonBase {
     }
 
     public override string GetTypeName() { return "ToggleButton"; }
+
+    public override bool SubscribeBehaviorRoutedEvent(string ev, BehaviorEventSink sink) {
+        if (ev == "Checked") {
+            Checked += (object s, RoutedEventArgs e) => { if (sink != null) { sink.OnBehaviorEvent(s, e); } };
+            return true;
+        }
+        if (ev == "Unchecked") {
+            Unchecked += (object s, RoutedEventArgs e) => { if (sink != null) { sink.OnBehaviorEvent(s, e); } };
+            return true;
+        }
+        return base.SubscribeBehaviorRoutedEvent(ev, sink);
+    }
 
     public bool IsChecked {
         get { return _isChecked; }
@@ -1441,16 +1461,32 @@ public class ScrollViewer : ContentControl {
         }
     }
 
+    private float MaxEffectiveVerticalOffset() {
+        float vh = ViewportHeight;
+        if (vh <= 0.0f) { return -1.0f; }
+        if (_vVis == ScrollBarVisibility.Disabled) { return 0.0f; }
+        if (_vVis == ScrollBarVisibility.Auto && ComputedVerticalScrollBarVisibility != Visibility.Visible) { return 0.0f; }
+        return Math.Maxf(0.0f, ExtentHeight - vh);
+    }
+
+    private float MaxEffectiveHorizontalOffset() {
+        float vw = ViewportWidth;
+        if (vw <= 0.0f) { return -1.0f; }
+        if (_hVis == ScrollBarVisibility.Disabled) { return 0.0f; }
+        if (_hVis == ScrollBarVisibility.Auto && ComputedHorizontalScrollBarVisibility != Visibility.Visible) { return 0.0f; }
+        return Math.Maxf(0.0f, ExtentWidth - vw);
+    }
+
     public void ScrollToVerticalOffset(float offset) {
-        float maxY = Math.Maxf(0.0f, ExtentHeight - ViewportHeight);
-        float next = Math.Clampf(offset, 0.0f, maxY > 0.0f ? maxY : Math.Maxf(0.0f, offset));
+        float maxY = MaxEffectiveVerticalOffset();
+        float next = maxY >= 0.0f ? Math.Clampf(offset, 0.0f, maxY) : Math.Maxf(0.0f, offset);
         _offsetY = next;
         ApplyScrollOffsets();
     }
 
     public void ScrollToHorizontalOffset(float offset) {
-        float maxX = Math.Maxf(0.0f, ExtentWidth - ViewportWidth);
-        float next = Math.Clampf(offset, 0.0f, maxX > 0.0f ? maxX : Math.Maxf(0.0f, offset));
+        float maxX = MaxEffectiveHorizontalOffset();
+        float next = maxX >= 0.0f ? Math.Clampf(offset, 0.0f, maxX) : Math.Maxf(0.0f, offset);
         _offsetX = next;
         ApplyScrollOffsets();
     }
@@ -1463,27 +1499,48 @@ public class ScrollViewer : ContentControl {
             Visual_SetScrollOffsets(_viewport.__nativeHandle, _offsetX, _offsetY);
         }
         SyncScrollBarRanges();
+        BindingEngine.NotifyTargetPropertyChanged(this, "VerticalOffset", DependencyObject.BoxFloat(_offsetY));
+        BindingEngine.NotifyTargetPropertyChanged(this, "HorizontalOffset", DependencyObject.BoxFloat(_offsetX));
         ScrollChanged(this, new ScrollEventArgs(_offsetY, this));
     }
 
     private void SyncScrollBarRanges() {
         if (_syncingBars) { return; }
         _syncingBars = true;
+        bool offsetClamped = false;
+        float maxY = MaxEffectiveVerticalOffset();
+        if (maxY >= 0.0f && (_offsetY > maxY || _offsetY < 0.0f)) {
+            _offsetY = Math.Clampf(_offsetY, 0.0f, maxY);
+            offsetClamped = true;
+        }
+        float maxX = MaxEffectiveHorizontalOffset();
+        if (maxX >= 0.0f && (_offsetX > maxX || _offsetX < 0.0f)) {
+            _offsetX = Math.Clampf(_offsetX, 0.0f, maxX);
+            offsetClamped = true;
+        }
+        if (offsetClamped) {
+            if (_viewport != null && ParseUtil.IsValidHandle(_viewport.__nativeHandle)) {
+                Visual_SetScrollOffsets(_viewport.__nativeHandle, _offsetX, _offsetY);
+            }
+            BindingEngine.NotifyTargetPropertyChanged(this, "VerticalOffset", DependencyObject.BoxFloat(_offsetY));
+            BindingEngine.NotifyTargetPropertyChanged(this, "HorizontalOffset", DependencyObject.BoxFloat(_offsetX));
+        }
         if (_vBar != null) {
-            float maxY = Math.Maxf(0.0f, ExtentHeight - ViewportHeight);
-            _vBar.Maximum = maxY;
+            _vBar.Maximum = maxY >= 0.0f ? maxY : Math.Maxf(0.0f, ExtentHeight - ViewportHeight);
             float vh = ViewportHeight;
             _vBar.ViewportSize = vh > 0.0f ? vh : 16.0f;
             _vBar.Value = _offsetY;
         }
         if (_hBar != null) {
-            float maxX = Math.Maxf(0.0f, ExtentWidth - ViewportWidth);
-            _hBar.Maximum = maxX;
+            _hBar.Maximum = maxX >= 0.0f ? maxX : Math.Maxf(0.0f, ExtentWidth - ViewportWidth);
             _hBar.ViewportSize = Math.Maxf(16.0f, ViewportWidth);
             _hBar.Value = _offsetX;
         }
         SyncScrollBarVisibility();
         _syncingBars = false;
+        if (offsetClamped) {
+            ScrollChanged(this, new ScrollEventArgs(_offsetY, this));
+        }
     }
 
     private void SyncScrollBarVisibility() {
@@ -1498,11 +1555,15 @@ public class ScrollViewer : ContentControl {
     public override void OnMouseWheel(MouseWheelEventArgs e) {
         base.OnMouseWheel(e);
         if (e.Handled) { return; }
-        if (_vVis != ScrollBarVisibility.Disabled && e.DeltaY != 0.0f) {
-            ScrollToVerticalOffset(_offsetY - e.DeltaY * 42.0f);
+        float dy = Math.Absf(e.DeltaY) >= 20.0f ? (e.DeltaY / 120.0f) : e.DeltaY;
+        float dx = Math.Absf(e.DeltaX) >= 20.0f ? (e.DeltaX / 120.0f) : e.DeltaX;
+        float maxY = MaxEffectiveVerticalOffset();
+        float maxX = MaxEffectiveHorizontalOffset();
+        if (_vVis != ScrollBarVisibility.Disabled && dy != 0.0f && maxY > 0.0f) {
+            ScrollToVerticalOffset(_offsetY - dy * 48.0f);
             e.Handled = true;
-        } else if (_hVis != ScrollBarVisibility.Disabled && e.DeltaX != 0.0f) {
-            ScrollToHorizontalOffset(_offsetX - e.DeltaX * 42.0f);
+        } else if (_hVis != ScrollBarVisibility.Disabled && dx != 0.0f && maxX > 0.0f) {
+            ScrollToHorizontalOffset(_offsetX - dx * 48.0f);
             e.Handled = true;
         }
     }

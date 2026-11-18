@@ -9,6 +9,8 @@ import RealScript.Math;
 public class ResourceDictionary : DependencyObject {
     private static ResourceDictionary _appResources;
     private static Dictionary<string, ResourceDictionary> _locSources;
+    private static string[] _locSourceKeys;
+    private static ResourceDictionary[] _locSourceDicts;
     private static Dictionary<string, int> _registeredStyleKeys;
     private static ResourceDictionary[] _ambientStack;
 
@@ -74,26 +76,51 @@ public class ResourceDictionary : DependencyObject {
         return "";
     }
 
+    private static void RecordLocPair(string key, ResourceDictionary dict) {
+        if (key == null || key.Length == 0 || dict == null) { return; }
+        if (_locSourceKeys == null) {
+            _locSourceKeys = new string[0];
+            _locSourceDicts = new ResourceDictionary[0];
+        }
+        for (int i = 0; i < _locSourceKeys.Length; i += 1) {
+            if (_locSourceKeys[i] == key) {
+                _locSourceDicts[i] = dict;
+                return;
+            }
+        }
+        _locSourceKeys.Push(key);
+        _locSourceDicts.Push(dict);
+    }
+
     public static void RegisterLocSource(string sourceName, ResourceDictionary dict) {
         if (sourceName == null || dict == null) { return; }
         if (_locSources == null) { _locSources = new Dictionary<string, ResourceDictionary>(); }
         string k = NormalizeLocKey(sourceName);
         if (k.Length == 0) { return; }
         _locSources[k] = dict;
+        RecordLocPair(k, dict);
         string baseName = LocBaseName(k);
         if (baseName.Length > 0) {
             _locSources[baseName] = dict;
+            RecordLocPair(baseName, dict);
         }
     }
 
     public static ResourceDictionary GetLocSource(string sourceName) {
-        if (_locSources == null || sourceName == null) { return null; }
+        if (sourceName == null) { return null; }
         string k = NormalizeLocKey(sourceName);
         if (k.Length == 0) { return null; }
-        if (_locSources.ContainsKey(k)) { return _locSources[k]; }
+        if (_locSources != null && _locSources.ContainsKey(k)) { return _locSources[k]; }
         string baseName = LocBaseName(k);
-        if (baseName.Length > 0 && _locSources.ContainsKey(baseName)) {
+        if (_locSources != null && baseName.Length > 0 && _locSources.ContainsKey(baseName)) {
             return _locSources[baseName];
+        }
+        if (_locSourceKeys != null) {
+            for (int i = 0; i < _locSourceKeys.Length; i += 1) {
+                if (_locSourceKeys[i] == k || (baseName.Length > 0 && _locSourceKeys[i] == baseName)) {
+                    return _locSourceDicts[i];
+                }
+            }
         }
         return null;
     }
@@ -1479,8 +1506,21 @@ public class TimelineAnimation : DependencyObject {
     public float Stiffness { get; set; } = 320.0f;
     public float Damping { get; set; } = 28.0f;
     public DoubleKeyFrame[] KeyFrames { get; set; }
+    private int[] _activeTrackIds;
 
-    public TimelineAnimation() { KeyFrames = new DoubleKeyFrame[0]; }
+    public TimelineAnimation() {
+        KeyFrames = new DoubleKeyFrame[0];
+        _activeTrackIds = new int[0];
+    }
+
+    private void StopTrackedOnly() {
+        if (_activeTrackIds != null && _activeTrackIds.Length > 0) {
+            for (int i = 0; i < _activeTrackIds.Length; i += 1) {
+                Anim_StopTrack(_activeTrackIds[i]);
+            }
+            _activeTrackIds = new int[0];
+        }
+    }
 
     private static UIElement ResolveAnimTarget(UIElement rootScope, string targetName) {
         if (rootScope == null) { return null; }
@@ -1501,51 +1541,103 @@ public class TimelineAnimation : DependencyObject {
     }
 
     public void StartOn(UIElement rootScope) {
-        if (rootScope == null) { return; }
+        StartOnTracked(rootScope, 1.0f, false);
+    }
+
+    internal int[] StartOnTracked(UIElement rootScope, float speedRatio, bool forceRepeatForever) {
+        var started = new int[0];
+        StopTrackedOnly();
+        if (rootScope == null) { return started; }
         UIElement dest = ResolveAnimTarget(rootScope, TargetName);
-        if (dest == null || !ParseUtil.IsValidHandle(dest.__nativeHandle)) { return; }
+        if (dest == null || !ParseUtil.IsValidHandle(dest.__nativeHandle)) { return started; }
         int propId = EnumConvert.ParseAnimPropOrInvalid(TargetProperty);
-        if (propId < 0) { return; }
+        if (propId < 0) { return started; }
         int ek = EnumConvert.ToInt(EasingKind);
         int em = EnumConvert.ToInt(EasingMode);
+        float invSpeed = speedRatio > 0.001f ? (1.0f / speedRatio) : 1.0f;
+        float effDur = DurationSec * invSpeed;
+        float effDelay = DelaySec * invSpeed;
+        int effRepeat = forceRepeatForever ? -1 : RepeatCount;
 
         if (IsColor) {
             uint toCol = HasColorUint ? ToRgba : (ToColor.Length > 0 ? ParseUtil.ParseColor(ToColor) : 0u);
+            int tid = 0;
             if (HasColorUint || HasFrom || FromColor.Length > 0) {
                 uint fromCol = HasColorUint ? FromRgba : ParseUtil.ParseColor(FromColor);
-                Anim_StartColorDelayed(dest.__nativeHandle, propId, fromCol, toCol, DurationSec, ek, em, DelaySec);
+                tid = Anim_StartColorDelayed(dest.__nativeHandle, propId, fromCol, toCol, effDur, ek, em, effDelay);
             } else {
-                Anim_StartColorTo(dest.__nativeHandle, propId, toCol, DurationSec, ek, em, DelaySec);
+                tid = Anim_StartColorTo(dest.__nativeHandle, propId, toCol, effDur, ek, em, effDelay);
             }
-            return;
+            if (tid > 0) { started.Push(tid); }
+            _activeTrackIds = started;
+            return started;
         }
         if (UseSpring) {
-            Anim_SpringFloat(dest.__nativeHandle, propId, ToFloat, Stiffness, Damping);
-            return;
+            int tid = Anim_SpringFloat(dest.__nativeHandle, propId, ToFloat, Stiffness, Damping);
+            if (tid > 0) { started.Push(tid); }
+            _activeTrackIds = started;
+            return started;
         }
         if (KeyFrames != null && KeyFrames.Length > 0) {
+            bool firstAtZero = KeyFrames[0].KeyTimeSec <= 0.0001f;
             float prevVal = FromFloat;
             float prevTime = 0.0f;
-            for (int i = 0; i < KeyFrames.Length; i += 1) {
+            int startIdx = 0;
+            if (firstAtZero) {
+                prevVal = KeyFrames[0].Value;
+                prevTime = 0.0f;
+                startIdx = 1;
+                if (KeyFrames.Length == 1) {
+                    int tid0 = Anim_StartFloat(
+                        dest.__nativeHandle, propId, prevVal, prevVal, 0.001f,
+                        EnumConvert.ToInt(KeyFrames[0].EasingKind), EnumConvert.ToInt(KeyFrames[0].EasingMode),
+                        effDelay, AutoReverse, effRepeat);
+                    if (tid0 > 0) { started.Push(tid0); }
+                    _activeTrackIds = started;
+                    return started;
+                }
+            }
+            for (int i = startIdx; i < KeyFrames.Length; i += 1) {
                 DoubleKeyFrame kf = KeyFrames[i];
-                float segDur = Math.Maxf(0.01f, kf.KeyTimeSec - prevTime);
-                Anim_StartFloat(
-                    dest.__nativeHandle, propId, prevVal, kf.Value, segDur,
-                    EnumConvert.ToInt(kf.EasingKind), EnumConvert.ToInt(kf.EasingMode),
-                    DelaySec + prevTime, false, 1);
+                float segDur = Math.Maxf(0.001f, (kf.KeyTimeSec - prevTime) * invSpeed);
+                float segDelay = effDelay + prevTime * invSpeed;
+                bool segAutoRev = (startIdx == 1 && KeyFrames.Length == 2) ? AutoReverse : false;
+                int segRepeat = (startIdx == 1 && KeyFrames.Length == 2) ? effRepeat : 1;
+                int tid = 0;
+                if (i == 0 && !HasFrom) {
+                    tid = Anim_StartFloatTo(
+                        dest.__nativeHandle, propId, kf.Value, segDur,
+                        EnumConvert.ToInt(kf.EasingKind), EnumConvert.ToInt(kf.EasingMode),
+                        segDelay, segAutoRev, segRepeat);
+                } else {
+                    tid = Anim_StartFloat(
+                        dest.__nativeHandle, propId, prevVal, kf.Value, segDur,
+                        EnumConvert.ToInt(kf.EasingKind), EnumConvert.ToInt(kf.EasingMode),
+                        segDelay, segAutoRev, segRepeat);
+                }
+                if (tid > 0) { started.Push(tid); }
                 prevVal = kf.Value;
                 prevTime = kf.KeyTimeSec;
             }
-            return;
+            _activeTrackIds = started;
+            return started;
         }
+        int tidMain = 0;
         if (!HasFrom) {
-            Anim_StartFloatTo(dest.__nativeHandle, propId, ToFloat, DurationSec, ek, em, DelaySec, AutoReverse, RepeatCount);
-            return;
+            tidMain = Anim_StartFloatTo(dest.__nativeHandle, propId, ToFloat, effDur, ek, em, effDelay, AutoReverse, effRepeat);
+        } else {
+            tidMain = Anim_StartFloat(dest.__nativeHandle, propId, FromFloat, ToFloat, effDur, ek, em, effDelay, AutoReverse, effRepeat);
         }
-        Anim_StartFloat(dest.__nativeHandle, propId, FromFloat, ToFloat, DurationSec, ek, em, DelaySec, AutoReverse, RepeatCount);
+        if (tidMain > 0) { started.Push(tidMain); }
+        _activeTrackIds = started;
+        return started;
     }
 
     public void StopOn(UIElement rootScope) {
+        if (_activeTrackIds != null && _activeTrackIds.Length > 0) {
+            StopTrackedOnly();
+            return;
+        }
         if (rootScope == null) { return; }
         UIElement dest = ResolveAnimTarget(rootScope, TargetName);
         if (dest != null && ParseUtil.IsValidHandle(dest.__nativeHandle)) {
@@ -1588,11 +1680,18 @@ public class DoubleAnimationUsingKeyFrames : TimelineAnimation {
 public class Storyboard : DependencyObject {
     public string TargetName { get; set; } = "";
     public UIElement Target { get; set; }
+    public float SpeedRatio { get; set; } = 1.0f;
+    public bool RepeatForever { get; set; } = false;
     private TimelineAnimation[] _children;
+    private int[] _runningTrackIds;
+    private bool _awaitingCompletion = false;
+    private static Storyboard[] _activeStoryboards;
+    private static bool _completionHookInstalled = false;
     public event EventHandler Completed;
 
     public Storyboard() {
         _children = new TimelineAnimation[0];
+        _runningTrackIds = new int[0];
     }
 
     public TimelineAnimation[] Children() { return _children; }
@@ -1712,20 +1811,98 @@ public class Storyboard : DependencyObject {
         _children.Push(sa);
     }
 
+    private static void EnsureCompletionHook() {
+        if (!_completionHookInstalled) {
+            _completionHookInstalled = true;
+            _activeStoryboards = new Storyboard[0];
+            BindingEngine.AddPreFlushHook(() => { Storyboard.TickAllActive(); });
+        }
+    }
+
+    private static void RegisterActiveStoryboard(Storyboard sb) {
+        if (sb == null) { return; }
+        if (_activeStoryboards == null) { _activeStoryboards = new Storyboard[0]; }
+        for (int i = 0; i < _activeStoryboards.Length; i += 1) {
+            if (_activeStoryboards[i] == sb) { return; }
+        }
+        _activeStoryboards.Push(sb);
+    }
+
+    public static void TickAllActive() {
+        if (_activeStoryboards == null || _activeStoryboards.Length == 0) { return; }
+        var remaining = new Storyboard[0];
+        var finished = new Storyboard[0];
+        for (int i = 0; i < _activeStoryboards.Length; i += 1) {
+            Storyboard sb = _activeStoryboards[i];
+            if (sb == null || !sb._awaitingCompletion) { continue; }
+            bool anyActive = false;
+            if (sb._runningTrackIds != null) {
+                for (int j = 0; j < sb._runningTrackIds.Length; j += 1) {
+                    if (Anim_IsTrackActive(sb._runningTrackIds[j])) {
+                        anyActive = true;
+                        break;
+                    }
+                }
+            }
+            if (anyActive) {
+                remaining.Push(sb);
+            } else {
+                sb._awaitingCompletion = false;
+                sb._runningTrackIds = new int[0];
+                finished.Push(sb);
+            }
+        }
+        _activeStoryboards = remaining;
+        for (int k = 0; k < finished.Length; k += 1) {
+            finished[k].RaiseCompleted();
+        }
+    }
+
+    private void RaiseCompleted() {
+        Completed(this, EventArgs.Empty());
+    }
+
+    private void StopRunningTracksOnly() {
+        if (_runningTrackIds != null && _runningTrackIds.Length > 0) {
+            for (int i = 0; i < _runningTrackIds.Length; i += 1) {
+                Anim_StopTrack(_runningTrackIds[i]);
+            }
+            _runningTrackIds = new int[0];
+        }
+    }
+
     public void Begin(UIElement scope = null) {
         UIElement root = scope != null ? scope : Target;
         if (root == null) { return; }
+        _awaitingCompletion = false;
+        StopRunningTracksOnly();
+        var allTracks = new int[0];
+        bool hasInfinite = RepeatForever;
         for (int i = 0; i < _children.Length; i += 1) {
             TimelineAnimation anim = _children[i];
             if (anim.TargetName.Length == 0 && TargetName.Length > 0) {
                 anim.TargetName = TargetName;
             }
-            anim.StartOn(root);
+            if (anim.RepeatCount < 0) { hasInfinite = true; }
+            int[] tids = anim.StartOnTracked(root, SpeedRatio, RepeatForever);
+            for (int j = 0; j < tids.Length; j += 1) {
+                allTracks.Push(tids[j]);
+            }
         }
-        Completed(this, EventArgs.Empty());
+        _runningTrackIds = allTracks;
+        if (hasInfinite) { return; }
+        if (_runningTrackIds.Length == 0) {
+            Completed(this, EventArgs.Empty());
+            return;
+        }
+        EnsureCompletionHook();
+        _awaitingCompletion = true;
+        RegisterActiveStoryboard(this);
     }
 
     public void Stop(UIElement scope = null) {
+        _awaitingCompletion = false;
+        StopRunningTracksOnly();
         UIElement root = scope != null ? scope : Target;
         if (root == null) { return; }
         for (int i = 0; i < _children.Length; i += 1) {
@@ -1840,6 +2017,7 @@ internal class BindingEntry : DependencyObject {
     public bool OneTimeDone = false;
     private UIElement _lastFindNameRoot;
     private DependencyObject _lastTemplateValBox;
+    private DependencyObject _lastPathValBox;
     private UIElement[] _multiElementSources;
     private UIElement[] _multiFindRoots;
 
@@ -1856,7 +2034,7 @@ internal class BindingEntry : DependencyObject {
         UIElement cur = host;
         while (cur.Parent != null) {
             cur = cur.Parent;
-            if (cur is ContentPresenter || cur is UserControl) {
+            if (cur.IsNamescopeBoundary()) {
                 UIElement scopeHit = cur.FindName(elementName);
                 if (scopeHit != null) { return scopeHit; }
                 break;
@@ -2263,9 +2441,11 @@ internal class BindingEntry : DependencyObject {
             DependencyObject valBox = BindingEngine.ReadPathBox(srcObj, SourcePath);
             if (valBox == null && HasFallback) { valBox = FallbackBox; }
             string sig = DependencyObject.UnboxString(valBox, "");
-            if (dm == LastDirtyMask && dm >= 0 && sig == LastHash && OneTimeDone) { return; }
+            bool boxDiff = (valBox != _lastPathValBox) && !ItemsControl.SameItemBox(valBox, _lastPathValBox);
+            if (!boxDiff && dm == LastDirtyMask && dm >= 0 && sig == LastHash && OneTimeDone) { return; }
             LastDirtyMask = dm;
-            if (sig != LastHash || !OneTimeDone) {
+            if (boxDiff || sig != LastHash || !OneTimeDone) {
+                _lastPathValBox = valBox;
                 LastHash = sig;
                 OneTimeDone = true;
                 ApplyConverted(valBox);

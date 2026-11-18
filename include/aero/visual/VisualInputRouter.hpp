@@ -91,6 +91,7 @@ struct UIHostPlatformHooks {
     std::function<void(std::string_view)> setClipboardText;
     std::function<void()> requestWake;
     std::function<void()> closeWindow;
+    std::function<void(std::string_view, float)> playSound;
 };
 
 class ITextInputMethodHost {

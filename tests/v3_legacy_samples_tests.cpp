@@ -204,6 +204,18 @@ struct ImageMetrics {
     return v.tryGetBool(outVal);
 }
 
+[[nodiscard]] bool ReadFloatMember(
+    const aero::AeroAppHost& host,
+    aero::ObjectRef obj,
+    std::string_view path,
+    float& outVal) {
+    aero::UnifiedValue v{};
+    if (!host.ReadScriptMember(obj, path, v)) {
+        return false;
+    }
+    return v.tryGetFloat(outVal);
+}
+
 [[nodiscard]] bool ReadStringMember(
     const aero::AeroAppHost& host,
     aero::ObjectRef obj,
@@ -303,12 +315,12 @@ struct ImageMetrics {
             outCompileInput.scriptSources.push_back(aero::SourceFile{p.string(), ReadFileText(p)});
         }
         outCompileInput.includeStdlib = true;
-        outCompileInput.treeShakeStdlib = true;
+        outCompileInput.treeShakeStdlib = false;
     }
 
     outCompileInput.stdlibRootDir = AERO_STDLIB_DIR;
     outCompileInput.includeStdlib = true;
-    outCompileInput.treeShakeStdlib = true;
+    outCompileInput.treeShakeStdlib = false;
     outCompileInput.optimizeBytecode = false;
     outCompileInput.emitAotCpp = false;
     outCompileInput.allowDiskCache = true;
@@ -448,7 +460,7 @@ void TestDiscoverSampleProjectAndCache(aero::rs_comp::CompilerSession& session) 
         pageCi.xamlContent = ReadFileText(brushesPath);
         pageCi.stdlibRootDir = AERO_STDLIB_DIR;
         pageCi.includeStdlib = true;
-        pageCi.treeShakeStdlib = true;
+        pageCi.treeShakeStdlib = false;
         pageCi.allowDiskCache = true;
         pageCi.compilerSession = &session;
         pageCi.resourceSearchRoot = (samplesRoot / "Gallery" / "Data" / "Samples").string();
@@ -750,7 +762,7 @@ void TestGalleryStandaloneSubPages(std::uint32_t clearRgba) {
         Require(!ci.xamlContent.empty(), std::string("Missing Gallery sub-page: ") + fileName);
         ci.stdlibRootDir = AERO_STDLIB_DIR;
         ci.includeStdlib = true;
-        ci.treeShakeStdlib = true;
+        ci.treeShakeStdlib = false;
         ci.allowDiskCache = true;
         ci.compilerSession = nullptr;
         ci.resourceSearchRoot = (samplesRoot / "Gallery" / "Data" / "Samples").string();
@@ -1045,6 +1057,9 @@ void TestInteractiveQuestLog(aero::rs_comp::CompilerSession& session) {
     for (int f = 0; f < 45; ++f) {
         host.StepFrame(1.0f / 60.0f, f == 44);
     }
+    Require(host.PlayedSoundCount() == 0u,
+        "QuestLog initial startup should not play sound while SelectionSoundAction starts disabled (got " +
+        std::to_string(host.PlayedSoundCount()) + ")");
 
     aero::ObjectRef vmRef{};
     Require(ReadObjectMember(host, host.RootScriptObject(), "VM", vmRef),
@@ -1299,6 +1314,57 @@ void TestInteractiveQuestLog(aero::rs_comp::CompilerSession& session) {
         "Interrupted ListBoxItem[1] should settle back to Unselected state");
     Require(grid2 && grid2->transform2D.tx > 7.9f && outer2 && outer2->vector.fillRgba == 0xFF77ABBDu,
         "Hovered ListBoxItem[2] should settle cleanly to Selected state");
+
+    // 5. Sound effects: SelectionChanged invokes PlaySoundAction once SelectionSoundAction is enabled by Loaded
+    Require(host.PlayedSoundCount() >= 2u,
+        "QuestLog hover/selection changes should trigger WaterDropSmall.mp3 via PlaySoundAction (got " +
+        std::to_string(host.PlayedSoundCount()) + ")");
+    if (!host.PlayedSounds().empty()) {
+        const auto& lastSound = host.PlayedSounds().back();
+        Require(lastSound.uri.find("WaterDropSmall.mp3") != std::string::npos,
+            "QuestLog played sound URI mismatch: " + lastSound.uri);
+        Require(std::fabs(lastSound.volume - 0.2f) < 0.01f,
+            "QuestLog SelectionSoundAction Volume should be 0.2 (got " + std::to_string(lastSound.volume) + ")");
+        Require(!lastSound.resolvedPath.empty() && fs::exists(lastSound.resolvedPath),
+            "QuestLog WaterDropSmall.mp3 resolved path missing: " + lastSound.resolvedPath);
+#if defined(_WIN32)
+        std::uint32_t decSr = 0u;
+        std::uint16_t decCh = 0u;
+        std::vector<std::int16_t> decPcm;
+        Require(aero::NativeWindowHost::DecodeSoundFileToPcm16(lastSound.resolvedPath, decSr, decCh, decPcm) &&
+                decSr > 0u && decCh >= 1u && decPcm.size() > 100u,
+            "Win32 Media Foundation failed to decode WaterDropSmall.mp3 to PCM16");
+        bool hasNonZero = false;
+        for (std::int16_t s : decPcm) {
+            if (s != 0) { hasNonZero = true; break; }
+        }
+        Require(hasNonZero, "Decoded WaterDropSmall.mp3 PCM16 buffer is completely silent");
+#endif
+    }
+
+    // 6. Mouse wheel direction on Quests list: wheel down (-1 notch) scrolls down (+offset), wheel up (+1 notch) scrolls back up
+    const aero::VisualNodeId qSvId = FindDescendantByTypeName(host, questsId, "ScrollViewer");
+    Require(qSvId.IsValid(), "QuestLog Quests ScrollViewer missing");
+    const aero::VisualNode* qSvNode = host.World().GetNode(qSvId);
+    Require(qSvNode && qSvNode->scriptOwner.valid(), "QuestLog Quests ScrollViewer scriptOwner missing");
+    float qOff0 = -1.0f;
+    Require(ReadFloatMember(host, qSvNode->scriptOwner, "VerticalOffset", qOff0) && std::fabs(qOff0) < 0.1f,
+        "QuestLog initial VerticalOffset should be 0");
+    const aero::Rect qVp = NodeViewportBounds(*host.World().GetNode(questsId));
+    const float qCx = qVp.x + qVp.width * 0.5f;
+    const float qCy = qVp.y + qVp.height * 0.5f;
+    host.InjectPointerMove(qCx, qCy);
+    host.InjectMouseWheel(qCx, qCy, 0.0f, -1.0f);
+    host.StepFrame(1.0f / 60.0f, true);
+    float qOffDown = 0.0f;
+    Require(ReadFloatMember(host, qSvNode->scriptOwner, "VerticalOffset", qOffDown) &&
+            qOffDown > 20.0f && qOffDown < 80.0f,
+        "QuestLog wheel down (-1 notch) should scroll DOWN (+~48px), got " + std::to_string(qOffDown));
+    host.InjectMouseWheel(qCx, qCy, 0.0f, 1.0f);
+    host.StepFrame(1.0f / 60.0f, true);
+    float qOffUp = -1.0f;
+    Require(ReadFloatMember(host, qSvNode->scriptOwner, "VerticalOffset", qOffUp) && std::fabs(qOffUp) < 1.0f,
+        "QuestLog wheel up (+1 notch) should scroll UP back to ~0, got " + std::to_string(qOffUp));
 }
 
 void TestInteractiveLocalization(aero::rs_comp::CompilerSession& session) {
@@ -1635,8 +1701,8 @@ void TestInteractiveScoreboard(aero::rs_comp::CompilerSession&) {
     aero::AeroAppHost host(hc);
     std::string err;
     Require(host.CompileAndLoad(ci, &err), "Scoreboard load failed: " + err);
-    for (int f = 0; f < 10; ++f) {
-        host.StepFrame(1.0f / 60.0f, f == 9);
+    for (int f = 0; f < 25; ++f) {
+        host.StepFrame(1.0f / 60.0f, f == 24);
     }
 
     // 1. Scrollbar thumb position (starts at top, moves down on drag) and hover brightness (#FF3E4146 -> #FF5D6064)
@@ -1709,9 +1775,21 @@ void TestInteractiveScoreboard(aero::rs_comp::CompilerSession&) {
             ", IsMouseOver=" + std::to_string(thOver) + ", IsDragging=" + std::to_string(thDrag) + ")");
     }
     float psx = 0.0f, psy = 0.0f;
-    Require(RequireNodeCenter(host, "PlayersScroll", psx, psy), "Scoreboard PlayersScroll missing");
+    aero::VisualNodeId psId{};
+    Require(RequireNodeCenter(host, "PlayersScroll", psx, psy, &psId), "Scoreboard PlayersScroll missing");
+    const aero::VisualNode* psScrollNode = host.World().GetNode(psId);
+    Require(psScrollNode && psScrollNode->scriptOwner.valid(), "Scoreboard PlayersScroll scriptOwner missing");
     host.InjectMouseWheel(psx, psy, 0.0f, 5.0f);
     host.StepFrame(1.0f / 60.0f, true);
+    float psOffTop = -1.0f;
+    Require(ReadFloatMember(host, psScrollNode->scriptOwner, "VerticalOffset", psOffTop) && std::fabs(psOffTop) < 0.5f,
+        "Scoreboard wheel up (+5 notches) should return PlayersScroll to top (got " + std::to_string(psOffTop) + ")");
+    // Scroll down with wheel (-3 notches) while in Overall before switching to Alliance (shrink clamp check)
+    host.InjectMouseWheel(psx, psy, 0.0f, -3.0f);
+    host.StepFrame(1.0f / 60.0f, true);
+    float psOffScrolled = 0.0f;
+    Require(ReadFloatMember(host, psScrollNode->scriptOwner, "VerticalOffset", psOffScrolled) && psOffScrolled > 20.0f,
+        "Scoreboard wheel down (-3 notches) in Overall should scroll down (got " + std::to_string(psOffScrolled) + ")");
 
     // 2. VisibleTeam ComboBox hover, click -> PART_Popup opens inside viewport -> click Alliance filters list
     float cbCx = 0.0f, cbCy = 0.0f;
@@ -1776,13 +1854,55 @@ void TestInteractiveScoreboard(aero::rs_comp::CompilerSession&) {
         std::to_string(cbItems.size()));
 
     if (cbItems.size() == 3u) {
+        const aero::VisualNodeId rootId = host.FindVisualByOwnerName("Root");
+        const aero::VisualNodeId listMaskNodeId = host.FindVisualByOwnerName("ListMask");
+        Require(rootId.IsValid() && listMaskNodeId.IsValid(), "Scoreboard Root / ListMask missing");
+
         const aero::Rect allianceVp = NodeViewportBounds(*host.World().GetNode(cbItems[1]));
         const float ax = allianceVp.x + allianceVp.width * 0.5f;
         const float ay = allianceVp.y + allianceVp.height * 0.5f;
         host.InjectClick(ax, ay);
-        for (int f = 0; f < 5; ++f) {
-            host.StepFrame(1.0f / 60.0f, true);
+        host.StepFrame(1.0f / 60.0f, true);
+
+        const aero::VisualNode* rootMid = host.World().GetNode(rootId);
+        const aero::VisualNode* lmMid = host.World().GetNode(listMaskNodeId);
+        Require(rootMid && !rootMid->layout.isEnabled,
+            "Scoreboard Root.IsEnabled should become false during VisibleTeamChanged animation");
+        Require(lmMid && lmMid->opacityMask.enabled,
+            "Scoreboard ListMask.opacityMask.enabled should be true during VisibleTeamChanged");
+        std::vector<std::uint8_t> teamAnimF1;
+        Require(host.RenderHeadlessRgba(1280u, 800u, teamAnimF1), "Scoreboard team switch frame 1 render failed");
+
+        for (int f = 0; f < 8; ++f) {
+            host.StepFrame(1.0f / 60.0f, f == 7);
         }
+        std::vector<std::uint8_t> teamAnimF9;
+        Require(host.RenderHeadlessRgba(1280u, 800u, teamAnimF9), "Scoreboard team switch frame 9 render failed");
+        Require(CountChangedPixels(teamAnimF1, teamAnimF9) > 150u,
+            "Scoreboard ListMask OpacityMask should reveal rows progressively over VisibleTeamChanged (diff=" +
+            std::to_string(CountChangedPixels(teamAnimF1, teamAnimF9)) + ")");
+
+        for (int f = 0; f < 16; ++f) {
+            host.StepFrame(1.0f / 60.0f, f == 15);
+        }
+        rootMid = host.World().GetNode(rootId);
+        Require(rootMid && rootMid->layout.isEnabled,
+            "Scoreboard Root.IsEnabled should re-enable after VisibleTeamChanged Storyboard.Completed");
+
+        float psOffAlliance = -1.0f;
+        Require(ReadFloatMember(host, psScrollNode->scriptOwner, "VerticalOffset", psOffAlliance) &&
+                std::fabs(psOffAlliance) < 0.5f,
+            "Scoreboard switching from scrolled Overall to short Alliance must clamp VerticalOffset to 0 (got " +
+            std::to_string(psOffAlliance) + ")");
+
+        // In Alliance (5 rows, no scrollbar), wheel down must NOT scroll into empty space
+        host.InjectMouseWheel(psx, psy, 0.0f, -3.0f);
+        host.StepFrame(1.0f / 60.0f, true);
+        float psOffNoBarWheel = -1.0f;
+        Require(ReadFloatMember(host, psScrollNode->scriptOwner, "VerticalOffset", psOffNoBarWheel) &&
+                std::fabs(psOffNoBarWheel) < 0.5f,
+            "Scoreboard Alliance with no scrollbar must ignore wheel down (got " +
+            std::to_string(psOffNoBarWheel) + ")");
 
         popupNode = host.World().GetNode(popupId);
         Require(popupNode && popupNode->layout.visibility == aero::Visibility::Collapsed,
@@ -1804,7 +1924,7 @@ void TestInteractiveScoreboard(aero::rs_comp::CompilerSession&) {
             "Selecting Alliance should show 5 Alliance rows and collapse 5 Horde rows (visible=" +
             std::to_string(visibleRows) + ", collapsed=" + std::to_string(collapsedRows) + ")");
 
-        // Switch back to Overall
+        // Switch back to Overall and wait full VisibleTeamChanged duration so Root.IsEnabled restores
         host.InjectPointerButton(cbCx, cbCy, aero::PointerButton::Left, true);
         host.InjectPointerButton(cbCx, cbCy, aero::PointerButton::Left, false);
         for (int f = 0; f < 3; ++f) {
@@ -1812,8 +1932,8 @@ void TestInteractiveScoreboard(aero::rs_comp::CompilerSession&) {
         }
         const aero::Rect overallVp = NodeViewportBounds(*host.World().GetNode(cbItems[0]));
         host.InjectClick(overallVp.x + overallVp.width * 0.5f, overallVp.y + overallVp.height * 0.5f);
-        for (int f = 0; f < 5; ++f) {
-            host.StepFrame(1.0f / 60.0f, true);
+        for (int f = 0; f < 25; ++f) {
+            host.StepFrame(1.0f / 60.0f, f == 24);
         }
         visibleRows = 0;
         for (aero::VisualNodeId rid : rows) {
@@ -1977,12 +2097,14 @@ int main(int argc, char** argv) {
     if (want("bench")) { TestAll23LegacyAnd5V3Samples(clearRgba); }
     if (want("subpages")) { TestGalleryStandaloneSubPages(clearRgba); }
 
-    if (want("tictactoe")) { TestInteractiveTicTacToe(sharedSession); }
-    if (want("inventory")) { TestInteractiveInventory(sharedSession); }
-    if (want("questlog")) { TestInteractiveQuestLog(sharedSession); }
-    if (want("localization")) { TestInteractiveLocalization(sharedSession); }
-    if (want("wpf")) { TestInteractiveWpfQuickStart(sharedSession); }
-    if (want("scoreboard")) { TestInteractiveScoreboard(sharedSession); }
+    if (!filter.empty()) {
+        if (filter == "tictactoe") { TestInteractiveTicTacToe(sharedSession); }
+        if (filter == "inventory") { TestInteractiveInventory(sharedSession); }
+        if (filter == "questlog") { TestInteractiveQuestLog(sharedSession); }
+        if (filter == "localization") { TestInteractiveLocalization(sharedSession); }
+        if (filter == "wpf") { TestInteractiveWpfQuickStart(sharedSession); }
+        if (filter == "scoreboard") { TestInteractiveScoreboard(sharedSession); }
+    }
 
     if (want("interactive")) {
         TestInteractiveButtons(sharedSession);

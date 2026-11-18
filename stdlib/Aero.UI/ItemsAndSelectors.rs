@@ -672,6 +672,14 @@ public class Selector : ItemsControl {
 
     public override string GetTypeName() { return "Selector"; }
 
+    public override bool SubscribeBehaviorRoutedEvent(string ev, BehaviorEventSink sink) {
+        if (ev == "SelectionChanged") {
+            SelectionChanged += (object s, SelectionChangedEventArgs e) => { if (sink != null) { sink.OnBehaviorEvent(s, e); } };
+            return true;
+        }
+        return base.SubscribeBehaviorRoutedEvent(ev, sink);
+    }
+
     public SelectionMode SelectionMode {
         get { return _selectionMode; }
         set { _selectionMode = value; }

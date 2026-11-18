@@ -143,6 +143,10 @@ public class Control : FrameworkElement {
 
     public override string GetTypeName() { return "Control"; }
 
+    public virtual DataTemplate GetNamedContentTemplate(string source) { return null; }
+    public virtual DependencyObject GetNamedContentBox(string source) { return null; }
+    public virtual bool HasNamedContentSlot(string source) { return false; }
+
     public Brush Foreground {
         get { return _foreground; }
         set { _hasExplicitForeground = true; _foreground = value; SetExplicitTextForeground(value); OnTypographyChanged(); }
@@ -442,6 +446,8 @@ public class ContentPresenter : FrameworkElement {
     }
 
     public override string GetTypeName() { return "ContentPresenter"; }
+    public override bool IsNamescopeBoundary() { return true; }
+    protected virtual bool IsScrollPresenter() { return false; }
 
     protected override bool IsSelfHitTestSolid() {
         return Background != null;
@@ -530,7 +536,7 @@ public class ContentPresenter : FrameworkElement {
         _fontFamily = owner.FontFamily;
         _fontSize = owner.FontSize;
         _fontWeight = owner.FontWeight;
-        if (!(this is ScrollContentPresenter)) {
+        if (!IsScrollPresenter()) {
             if (!_hasExplicitHAlign) { HorizontalAlignment = owner.HorizontalContentAlignment; _hasExplicitHAlign = false; }
             if (!_hasExplicitVAlign) { VerticalAlignment = owner.VerticalContentAlignment; _hasExplicitVAlign = false; }
         }
@@ -544,38 +550,19 @@ public class ContentPresenter : FrameworkElement {
         if (ContentSource == "SelectionBoxItem") {
             return;
         }
-        if (ContentSource == "Header" && owner is HeaderedContentControl) {
-            HeaderedContentControl hcc = owner as HeaderedContentControl;
-            bool needHdrRebuild = false;
-            if (_contentTemplate == null && hcc.HeaderTemplate != null) {
-                _contentTemplate = hcc.HeaderTemplate;
-                needHdrRebuild = true;
-            }
-            if (_contentBox == null && hcc.HeaderBox != null) {
-                UIElement self = this;
-                UIElement hbEl = (hcc.HeaderBox is UIElement) ? (hcc.HeaderBox as UIElement) : null;
-                if (hbEl == null || (hbEl != self && !hbEl.IsAncestorOf(self))) {
-                    _contentBox = hcc.HeaderBox;
-                    needHdrRebuild = true;
-                }
-            }
-            if (needHdrRebuild) {
-                RebuildContentVisual();
-            }
-            return;
-        }
-        if (owner is ContentControl) {
-            ContentControl cc = owner as ContentControl;
+        if (owner.HasNamedContentSlot(ContentSource)) {
             bool needRebuild = false;
-            if (_contentTemplate == null && cc.ContentTemplate != null) {
-                _contentTemplate = cc.ContentTemplate;
+            DataTemplate namedTpl = owner.GetNamedContentTemplate(ContentSource);
+            DependencyObject namedBox = owner.GetNamedContentBox(ContentSource);
+            if (_contentTemplate == null && namedTpl != null) {
+                _contentTemplate = namedTpl;
                 needRebuild = true;
             }
-            if (_contentBox == null && cc.ContentBox != null) {
+            if (_contentBox == null && namedBox != null) {
                 UIElement self = this;
-                UIElement cbEl = (cc.ContentBox is UIElement) ? (cc.ContentBox as UIElement) : null;
-                if (cbEl == null || (cbEl != self && !cbEl.IsAncestorOf(self))) {
-                    _contentBox = cc.ContentBox;
+                UIElement boxEl = (namedBox is UIElement) ? (namedBox as UIElement) : null;
+                if (boxEl == null || (boxEl != self && !boxEl.IsAncestorOf(self))) {
+                    _contentBox = namedBox;
                     needRebuild = true;
                 }
             }
@@ -692,6 +679,7 @@ public class ScrollContentPresenter : ContentPresenter {
     }
 
     public override string GetTypeName() { return "ScrollContentPresenter"; }
+    protected override bool IsScrollPresenter() { return true; }
 
     public override bool SetPropertyValue(string propName, DependencyObject value) {
         if (propName == "CanContentScroll") { CanContentScroll = DependencyObject.UnboxBool(value, false); return true; }
@@ -715,6 +703,18 @@ public class ContentControl : Control {
 
     public ContentControl() : base() {}
     public override string GetTypeName() { return "ContentControl"; }
+
+    public override DataTemplate GetNamedContentTemplate(string source) {
+        if (source != "Header" && source != "SelectionBoxItem") { return _contentTemplate; }
+        return null;
+    }
+    public override DependencyObject GetNamedContentBox(string source) {
+        if (source != "Header" && source != "SelectionBoxItem") { return _contentBox; }
+        return null;
+    }
+    public override bool HasNamedContentSlot(string source) {
+        return source != "Header" && source != "SelectionBoxItem";
+    }
 
     public object Content {
         get { return DependencyObject.Unbox(_contentBox); }
@@ -837,6 +837,19 @@ public class HeaderedContentControl : ContentControl {
     public HeaderedContentControl() : base() {}
     public override string GetTypeName() { return "HeaderedContentControl"; }
 
+    public override DataTemplate GetNamedContentTemplate(string source) {
+        if (source == "Header") { return _headerTemplate; }
+        return base.GetNamedContentTemplate(source);
+    }
+    public override DependencyObject GetNamedContentBox(string source) {
+        if (source == "Header") { return _headerBox; }
+        return base.GetNamedContentBox(source);
+    }
+    public override bool HasNamedContentSlot(string source) {
+        if (source == "Header") { return true; }
+        return base.HasNamedContentSlot(source);
+    }
+
     public object Header {
         get { return DependencyObject.Unbox(_headerBox); }
         set { SetHeaderBox(DependencyObject.BoxObject(value)); }
@@ -956,6 +969,18 @@ public class Expander : HeaderedContentControl {
     }
 
     public override string GetTypeName() { return "Expander"; }
+
+    public override bool SubscribeBehaviorRoutedEvent(string ev, BehaviorEventSink sink) {
+        if (ev == "Expanded") {
+            Expanded += (object s, RoutedEventArgs e) => { if (sink != null) { sink.OnBehaviorEvent(s, e); } };
+            return true;
+        }
+        if (ev == "Collapsed") {
+            Collapsed += (object s, RoutedEventArgs e) => { if (sink != null) { sink.OnBehaviorEvent(s, e); } };
+            return true;
+        }
+        return base.SubscribeBehaviorRoutedEvent(ev, sink);
+    }
 
     public bool IsExpanded {
         get { return _isExpanded; }

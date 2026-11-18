@@ -41,6 +41,14 @@ public class TextBoxBase : Control {
 
     public override string GetTypeName() { return "TextBoxBase"; }
 
+    public override bool SubscribeBehaviorRoutedEvent(string ev, BehaviorEventSink sink) {
+        if (ev == "TextChanged") {
+            TextChanged += (object s, TextChangedEventArgs e) => { if (sink != null) { sink.OnBehaviorEvent(s, e); } };
+            return true;
+        }
+        return base.SubscribeBehaviorRoutedEvent(ev, sink);
+    }
+
     public bool IsReadOnly {
         get { return _isReadOnly; }
         set { _isReadOnly = value; RefreshTextVisual(); SyncImeState(); }

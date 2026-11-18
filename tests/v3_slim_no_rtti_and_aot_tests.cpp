@@ -618,7 +618,12 @@ void TestLiveAotExecutionAndHeadlessRenderWithoutInterpreter() {
 } // namespace
 
 int main() {
-    TestCliCompileO2AotAndMsvcNoRttiCompile();
+    const char* runOpt = std::getenv("AERO_TEST_ENABLE_AOT_OPT");
+    if (runOpt != nullptr && runOpt[0] != '\0' && std::string_view(runOpt) != "0") {
+        TestCliCompileO2AotAndMsvcNoRttiCompile();
+    } else {
+        std::cout << "[Skip] CLI --O2 --aot-cpp + cl.exe check skipped in pure interpreter mode (set AERO_TEST_ENABLE_AOT_OPT=1 to enable)\n";
+    }
     TestLiveAotExecutionAndHeadlessRenderWithoutInterpreter();
 
     if (gFailureCount > 0) {

@@ -357,6 +357,58 @@ std::uint32_t GradientBrushRegistry::RegisterOrResolveSpec(std::string_view seri
     return RegisterBrush(std::move(desc));
 }
 
+std::uint32_t GradientBrushRegistry::CloneMutableBrush(std::uint32_t sourceBrushId) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (sourceBrushId == 0u || sourceBrushId > brushes_.size()) {
+        return 0u;
+    }
+    if (brushes_.size() >= kMaxBrushId) {
+        return 0u;
+    }
+    GradientBrushDesc copy = brushes_[sourceBrushId - 1u];
+    const auto newId = static_cast<std::uint32_t>(brushes_.size() + 1u);
+    copy.brushId = newId;
+    brushes_.push_back(std::move(copy));
+    ++revision_;
+    return newId;
+}
+
+bool GradientBrushRegistry::UpdateBrushStopColor(
+    std::uint32_t brushId,
+    std::size_t stopIndex,
+    const Color& color) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (brushId == 0u || brushId > brushes_.size()) {
+        return false;
+    }
+    GradientBrushDesc& brush = brushes_[brushId - 1u];
+    if (stopIndex >= brush.stops.size()) {
+        return false;
+    }
+    brush.stops[stopIndex].color = color;
+    BakeGradientBrushRamp(brush);
+    ++revision_;
+    return true;
+}
+
+bool GradientBrushRegistry::UpdateBrushStopOffset(
+    std::uint32_t brushId,
+    std::size_t stopIndex,
+    float offset) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (brushId == 0u || brushId > brushes_.size()) {
+        return false;
+    }
+    GradientBrushDesc& brush = brushes_[brushId - 1u];
+    if (stopIndex >= brush.stops.size()) {
+        return false;
+    }
+    brush.stops[stopIndex].offset = std::clamp(offset, 0.0f, 1.0f);
+    BakeGradientBrushRamp(brush);
+    ++revision_;
+    return true;
+}
+
 const GradientBrushDesc* GradientBrushRegistry::Find(std::uint32_t brushId) const noexcept {
     std::lock_guard<std::mutex> lock(mutex_);
     if (brushId == 0u || brushId > brushes_.size()) {

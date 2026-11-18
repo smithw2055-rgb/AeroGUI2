@@ -91,6 +91,9 @@ public:
 
     std::uint32_t RegisterBrush(GradientBrushDesc desc);
     std::uint32_t RegisterOrResolveSpec(std::string_view serializedSpec);
+    std::uint32_t CloneMutableBrush(std::uint32_t sourceBrushId);
+    bool UpdateBrushStopColor(std::uint32_t brushId, std::size_t stopIndex, const Color& color);
+    bool UpdateBrushStopOffset(std::uint32_t brushId, std::size_t stopIndex, float offset);
     [[nodiscard]] const GradientBrushDesc* Find(std::uint32_t brushId) const noexcept;
     [[nodiscard]] bool TryGetBrush(std::uint32_t brushId, GradientBrushDesc& outBrush) const noexcept;
     [[nodiscard]] std::size_t BrushCount() const noexcept;

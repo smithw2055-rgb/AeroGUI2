@@ -27,6 +27,17 @@
 #include "realscript/optimization/Optimizer.h"
 #include "realscript/runtime/Runtime.h"
 
+#if defined(_WIN32)
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <malloc.h>
+#include <windows.h>
+#endif
+
 namespace aero {
 namespace {
 
@@ -458,10 +469,19 @@ void PersistStdlibDiskCache(
 void PopulateStdlibDerivedCache(ProcessStdlibCacheEntry& entry) {
     rs_bc::Lowerer lowerer;
     for (const auto& [modName, cm] : entry.snapshot.modules) {
-        if (modName == "Aero.Native" || modName == "Aero.UI") {
-            continue;
+        std::vector<rs_mir::Module> tmpMods{cm.module};
+        StripAeroNativeMirBodies(tmpMods);
+        rs_mir::Module& mirMod = tmpMods.front();
+        mirMod.sourceFiles.clear();
+        for (auto& fn : mirMod.functions) {
+            fn.debugInfo.sourceName.clear();
+            fn.debugInfo.sourceFileId = 0u;
+            fn.debugInfo.declaration = {};
+            fn.debugInfo.body = {};
+            fn.debugInfo.sequencePoints.clear();
+            fn.debugInfo.locals.clear();
         }
-        rs_bc::Module bcMod = lowerer.lower(cm.module);
+        rs_bc::Module bcMod = lowerer.lower(mirMod);
         rs_diag::DiagnosticBag bcDiag;
         if (rs_bc::verifyModule(bcMod, bcDiag) && !bcDiag.hasErrors()) {
             entry.preloweredNonPrunableBc.emplace(modName, std::move(bcMod));
@@ -489,7 +509,8 @@ void PopulateStdlibDerivedCache(ProcessStdlibCacheEntry& entry) {
     std::shared_ptr<rs_comp::CompilerSession>& outSession,
     rs_comp::BuildSnapshot& outSnapshot,
     std::shared_ptr<const ProcessStdlibCacheEntry>& outEntry,
-    bool& outCacheHit) {
+    bool& outCacheHit,
+    bool allowDiskSnapshotLoad = true) {
     outCacheHit = false;
     outEntry.reset();
     const StdlibCacheKey key{resolvedRootKey, stdlibHash, enableReactiveMacros};
@@ -546,7 +567,8 @@ void PopulateStdlibDerivedCache(ProcessStdlibCacheEntry& entry) {
 
     // Try cross-process disk cache before running a cold stdlib compilation.
     rs_comp::BuildSnapshot loadedSnap;
-    if (TryLoadStdlibSnapshotFromDisk(
+    if (allowDiskSnapshotLoad &&
+        TryLoadStdlibSnapshotFromDisk(
             effectiveCacheDir, stdlibSources, stdlibHash, enableReactiveMacros, loadedSnap)) {
         auto freshEntry = std::make_shared<ProcessStdlibCacheEntry>();
         freshEntry->session = std::make_shared<rs_comp::CompilerSession>();
@@ -586,19 +608,16 @@ void PopulateStdlibDerivedCache(ProcessStdlibCacheEntry& entry) {
             effectiveCacheDir, stdlibSources, stdlibHash, enableReactiveMacros, warmupRes.snapshot);
     }
 
-    // Never share a non-owning caller session pointer inside the process-wide cache.
-    auto procEntry = std::make_shared<ProcessStdlibCacheEntry>();
-    procEntry->session = (callerSession == nullptr)
-        ? warmSession
-        : std::make_shared<rs_comp::CompilerSession>();
-    procEntry->snapshot = warmupRes.snapshot;
-    PopulateStdlibDerivedCache(*procEntry);
-    {
-        std::lock_guard<std::mutex> lock(procCache.lookupMutex);
-        procCache.entries[key] = procEntry;
-    }
-
+    // Only store in process-wide cache when compiled with a dedicated owned session.
     if (callerSession == nullptr) {
+        auto procEntry = std::make_shared<ProcessStdlibCacheEntry>();
+        procEntry->session = std::move(warmSession);
+        procEntry->snapshot = warmupRes.snapshot;
+        PopulateStdlibDerivedCache(*procEntry);
+        {
+            std::lock_guard<std::mutex> lock(procCache.lookupMutex);
+            procCache.entries[key] = procEntry;
+        }
         outSession = procEntry->session;
         outEntry = procEntry;
     }
@@ -1119,6 +1138,7 @@ constexpr std::uint32_t kProgramCacheVersion = 4u;
     std::uint64_t expectedH1,
     std::uint64_t expectedH2,
     bool skipRawBytecodeOutput,
+    bool retainBytecodeModules,
     AeroV3CompileResult& ioResult) {
     std::vector<std::uint8_t> bytes;
     if (!ReadBinaryFile(cacheFilePath, bytes) || bytes.size() < 88u) {
@@ -1231,11 +1251,20 @@ constexpr std::uint32_t kProgramCacheVersion = 4u;
     if (!DecodeProgramBundle(bytes.data() + pos, arbcLen, modules)) {
         return false;
     }
+    const std::size_t arbcOffset = pos;
+    if (skipRawBytecodeOutput) {
+        std::vector<std::uint8_t>().swap(bytes);
+    }
 
     rs_rt::RuntimeError linkErr;
-    auto linked = ProgramImage::link(modules, linkErr);
+    auto linked = retainBytecodeModules
+        ? ProgramImage::link(modules, linkErr, /*verifyModules=*/false)
+        : ProgramImage::link(std::move(modules), linkErr, /*verifyModules=*/false);
     if (!linked.has_value()) {
         return false;
+    }
+    if (!retainBytecodeModules) {
+        linked->compactForRuntime();
     }
 
     ioResult.retainedMirTypes = static_cast<std::size_t>(retainedTypes);
@@ -1246,11 +1275,13 @@ constexpr std::uint32_t kProgramCacheVersion = 4u;
     ioResult.generatedPartialRsPath = std::move(genRsPath);
     if (!skipRawBytecodeOutput) {
         ioResult.generatedPartialRsCode = std::move(genRsCode);
-        ioResult.programImageBytes.assign(bytes.data() + pos, bytes.data() + pos + arbcLen);
+        ioResult.programImageBytes.assign(bytes.data() + arbcOffset, bytes.data() + arbcOffset + arbcLen);
     }
     ioResult.diagnostics.insert(
         ioResult.diagnostics.end(), storedDiags.begin(), storedDiags.end());
-    ioResult.bytecodeModules = std::move(modules);
+    if (retainBytecodeModules) {
+        ioResult.bytecodeModules = std::move(modules);
+    }
     ioResult.programImage = std::make_shared<const ProgramImage>(std::move(*linked));
     ioResult.succeeded = true;
     return true;
@@ -1315,6 +1346,13 @@ void PersistProgramBundleToDisk(
     const std::uint64_t checksum = FastChecksum64(buf.data(), buf.size());
     pushU64(checksum);
     WriteBinaryFileAtomic(cacheFilePath, buf);
+}
+
+void CompactProcessHeapAfterCompile() noexcept {
+#if defined(_WIN32)
+    (void)_heapmin();
+    (void)HeapCompact(GetProcessHeap(), 0u);
+#endif
 }
 
 } // namespace
@@ -1386,6 +1424,7 @@ AeroV3CompileResult AeroCompilerV3::Compile(const AeroV3CompileInput& input) con
                 progH1,
                 progH2,
                 input.skipRawBytecodeOutput,
+                input.retainBytecodeModules,
                 result)) {
             result.usedStdlibCache = input.includeStdlib;
             return result;
@@ -1597,7 +1636,7 @@ AeroV3CompileResult AeroCompilerV3::Compile(const AeroV3CompileInput& input) con
                 stdlibCacheCandidate = input.includeStdlib;
             }
         }
-        if (!usePreviousSnapshot && input.includeStdlib) {
+        if (!usePreviousSnapshot && input.includeStdlib && input.allowStdlibCache) {
             std::shared_ptr<rs_comp::CompilerSession> unusedSession;
             std::shared_ptr<const ProcessStdlibCacheEntry> unusedEntry;
             if (ResolveStdlibCacheForCompile(
@@ -1614,7 +1653,7 @@ AeroV3CompileResult AeroCompilerV3::Compile(const AeroV3CompileInput& input) con
                 usePreviousSnapshot = true;
             }
         }
-    } else if (input.includeStdlib) {
+    } else if (input.includeStdlib && input.allowStdlibCache) {
         std::error_code snapEc;
         const bool snapMetaExists = effectiveCacheDir.empty() ||
             std::filesystem::exists(
@@ -1623,63 +1662,108 @@ AeroV3CompileResult AeroCompilerV3::Compile(const AeroV3CompileInput& input) con
             !HasProcessStdlibCacheEntry(resolvedStdlibRootKey, stdlibHash, input.enableReactiveMacros) &&
             usesStdlibGenerics &&
             snapMetaExists;
-        if (!skipIneffectiveDiskStdlibLoad) {
-            std::shared_ptr<rs_comp::CompilerSession> procSession;
-            if (ResolveStdlibCacheForCompile(
-                    resolvedStdlibRootKey,
-                    stdlibSources,
-                    stdlibHash,
-                    input.enableReactiveMacros,
-                    effectiveCacheDir,
-                    nullptr,
-                    procSession,
-                    previousSnapshot,
-                    procEntry,
-                    stdlibCacheCandidate)) {
-                compOpts.session = std::move(procSession);
-                usePreviousSnapshot = true;
-            }
+        std::shared_ptr<rs_comp::CompilerSession> procSession;
+        if (ResolveStdlibCacheForCompile(
+                resolvedStdlibRootKey,
+                stdlibSources,
+                stdlibHash,
+                input.enableReactiveMacros,
+                effectiveCacheDir,
+                nullptr,
+                procSession,
+                previousSnapshot,
+                procEntry,
+                stdlibCacheCandidate,
+                !skipIneffectiveDiskStdlibLoad)) {
+            compOpts.session = std::move(procSession);
+            usePreviousSnapshot = true;
         }
     }
 
-    const rs_comp::Compilation compilation(std::move(allSources), std::move(compOpts));
-    rs_comp::BuildResult buildRes = compilation.build(
-        usePreviousSnapshot ? &previousSnapshot : nullptr);
-    AppendDiagnostics(buildRes.diagnostics, result.diagnostics);
-
-    if (buildRes.diagnostics.hasErrors()) {
-        return result;
+    if (input.compilerSession == nullptr && !usePreviousSnapshot && !input.allowStdlibCache) {
+        compOpts.populateSnapshot = false;
+        compOpts.collectSymbolOccurrences = false;
+        compOpts.emitDebugInfo = input.emitAotCpp;
+    }
+    if (input.includeStdlib &&
+        input.treeShakeStdlib &&
+        !usePreviousSnapshot &&
+        input.compilerSession == nullptr) {
+        compOpts.pruneUnreachableModules = {"Aero.UI", "RealScript.Math"};
+        compOpts.reachabilityRootSymbols = {
+            "InputDispatcher",
+            "BindingEngine",
+            "DependencyObject",
+            "UIElement",
+            "FrameworkElement",
+            "BoxedString",
+            "BoxedFloat",
+            "BoxedInt",
+            "BoxedBool",
+            "CollectionBox",
+            "NativeObjectBox",
+            "INotifyPropertyChanged",
+        };
     }
 
+    xamlRes = XamlEmitResult{};
+    std::vector<XamlEmitResult>().swap(additionalXamlResults);
+    std::vector<SourceFile>().swap(loweredScripts);
+    if (!input.allowStdlibCache && input.compilerSession == nullptr) {
+        std::vector<SourceFile>().swap(stdlibSources);
+    }
+
+    std::vector<rs_mir::Module> mirModules;
     bool stdlibReused = false;
-    for (const auto& bi : buildRes.buildInfo) {
-        if (bi.name == "Aero.Native" || bi.name == "Aero.UI") {
-            if (bi.reused) {
+    std::size_t prunedFrontendTypes = 0u;
+    std::size_t prunedFrontendFunctions = 0u;
+    std::unordered_set<std::string> reusedModuleNames;
+    {
+        const rs_comp::Compilation compilation(std::move(allSources), std::move(compOpts));
+        std::vector<SourceFile>().swap(allSources);
+        rs_comp::BuildResult buildRes = compilation.build(
+            usePreviousSnapshot ? &previousSnapshot : nullptr);
+        AppendDiagnostics(buildRes.diagnostics, result.diagnostics);
+
+        if (buildRes.diagnostics.hasErrors()) {
+            return result;
+        }
+
+        for (const auto& bi : buildRes.buildInfo) {
+            if ((bi.name == "Aero.Native" || bi.name == "Aero.UI") && bi.reused) {
                 stdlibReused = true;
             }
+            if (bi.reused) {
+                reusedModuleNames.insert(bi.name);
+            }
         }
+        prunedFrontendTypes = buildRes.prunedFrontendTypes;
+        prunedFrontendFunctions = buildRes.prunedFrontendFunctions;
+
+        // Only update per-caller SessionSnapshotCache; NEVER overwrite the shared
+        // process-wide stdlib snapshot with user compilation units.
+        if (input.compilerSession != nullptr) {
+            auto& cache = GetSessionSnapshotCache();
+            std::lock_guard<std::mutex> lock(cache.mutex);
+            cache.snapshots[input.compilerSession] = buildRes.snapshot;
+        }
+
+        mirModules = std::move(buildRes.modules);
     }
+    std::vector<SourceFile>().swap(stdlibSources);
+    previousSnapshot = {};
     result.usedStdlibCache = stdlibCacheCandidate && stdlibReused;
 
-    // Only update per-caller SessionSnapshotCache; NEVER overwrite the shared
-    // process-wide stdlib snapshot with user compilation units.
-    if (input.compilerSession != nullptr) {
-        auto& cache = GetSessionSnapshotCache();
-        std::lock_guard<std::mutex> lock(cache.mutex);
-        cache.snapshots[input.compilerSession] = buildRes.snapshot;
-    }
-
     // CRITICAL: Strip Aero.Native dummy bodies BEFORE tree-shaker, optimizer, lowerer, and AOT emitter!
-    std::vector<rs_mir::Module> mirModules = std::move(buildRes.modules);
     StripAeroNativeMirBodies(mirModules);
 
     if (input.includeStdlib && input.treeShakeStdlib) {
         MirPruneStats pruneStats;
         (void)PruneUnreachableStdlibMir(mirModules, &pruneStats);
         result.retainedMirTypes = pruneStats.retainedTypes;
-        result.prunedMirTypes = pruneStats.prunedTypes;
+        result.prunedMirTypes = prunedFrontendTypes + pruneStats.prunedTypes;
         result.retainedMirFunctions = pruneStats.retainedFunctions;
-        result.prunedMirFunctions = pruneStats.prunedFunctions;
+        result.prunedMirFunctions = prunedFrontendFunctions + pruneStats.prunedFunctions;
     } else {
         std::unordered_set<SymbolId> uniqueTypeIds;
         std::size_t totalFns = 0u;
@@ -1735,13 +1819,22 @@ AeroV3CompileResult AeroCompilerV3::Compile(const AeroV3CompileInput& input) con
     // Lower MIR -> Bytecode modules and verify
     rs_bc::Lowerer lowerer;
     result.bytecodeModules.reserve(mirModules.size());
-    for (const auto& mirMod : mirModules) {
-        if (!input.optimizeBytecode && procEntry) {
+    for (auto& mirMod : mirModules) {
+        const bool canReuseStdlibBc =
+            !input.optimizeBytecode &&
+            !input.emitAotCpp &&
+            procEntry &&
+            reusedModuleNames.count(mirMod.name) > 0u &&
+            (!input.treeShakeStdlib || mirMod.name != "Aero.UI");
+        if (canReuseStdlibBc) {
             if (const auto preIt = procEntry->preloweredNonPrunableBc.find(mirMod.name);
                 preIt != procEntry->preloweredNonPrunableBc.end() &&
                 preIt->second.functions.size() == mirMod.functions.size() &&
                 preIt->second.types.size() == mirMod.types.size()) {
                 result.bytecodeModules.push_back(preIt->second);
+                if (!input.emitAotCpp) {
+                    mirMod = rs_mir::Module{};
+                }
                 continue;
             }
         }
@@ -1752,16 +1845,55 @@ AeroV3CompileResult AeroCompilerV3::Compile(const AeroV3CompileInput& input) con
             return result;
         }
         result.bytecodeModules.push_back(std::move(bcMod));
+        if (!input.emitAotCpp) {
+            mirMod = rs_mir::Module{};
+        }
+    }
+    procEntry.reset();
+    std::unordered_set<std::string>().swap(reusedModuleNames);
+    if (!input.emitAotCpp) {
+        std::vector<rs_mir::Module>().swap(mirModules);
     }
 
-    std::vector<std::uint8_t> encodedProgramBytes = EncodeProgramBundle(result.bytecodeModules);
-    if (!input.skipRawBytecodeOutput) {
-        result.programImageBytes = encodedProgramBytes;
+    const bool useCompactHeapLink = !input.retainBytecodeModules && !input.emitAotCpp;
+    const bool needEncodedBundle =
+        useCompactHeapLink || !input.skipRawBytecodeOutput || !progCacheFilePath.empty();
+    std::vector<std::uint8_t> encodedProgramBytes;
+    if (needEncodedBundle) {
+        encodedProgramBytes = EncodeProgramBundle(result.bytecodeModules);
+        if (!input.skipRawBytecodeOutput) {
+            result.programImageBytes = encodedProgramBytes;
+        }
     }
 
-    // Link ProgramImage
+    // Link ProgramImage (modules above already passed rs_bc::verifyModule or cached verification)
     rs_rt::RuntimeError linkErr;
-    auto linked = ProgramImage::link(result.bytecodeModules, linkErr);
+    std::optional<ProgramImage> linked;
+    if (useCompactHeapLink) {
+        std::vector<rs_bc::Module>().swap(result.bytecodeModules);
+        CompactProcessHeapAfterCompile();
+        std::vector<rs_bc::Module> compactModules;
+        if (!DecodeProgramBundle(
+                encodedProgramBytes.data(), encodedProgramBytes.size(), compactModules)) {
+            result.diagnostics.push_back("DecodeProgramBundle failed during runtime heap compaction");
+            return result;
+        }
+        if (progCacheFilePath.empty()) {
+            std::vector<std::uint8_t>().swap(encodedProgramBytes);
+        }
+        linked = ProgramImage::link(std::move(compactModules), linkErr, /*verifyModules=*/false);
+        std::vector<rs_bc::Module>().swap(compactModules);
+        if (linked.has_value()) {
+            linked->compactForRuntime();
+        }
+    } else {
+        linked = input.retainBytecodeModules
+            ? ProgramImage::link(result.bytecodeModules, linkErr, /*verifyModules=*/false)
+            : ProgramImage::link(std::move(result.bytecodeModules), linkErr, /*verifyModules=*/false);
+        if (!input.retainBytecodeModules) {
+            std::vector<rs_bc::Module>().swap(result.bytecodeModules);
+        }
+    }
     if (!linked.has_value()) {
         result.diagnostics.push_back(
             std::string("ProgramImage link error ") + rs_rt::errorCodeName(linkErr.code) +

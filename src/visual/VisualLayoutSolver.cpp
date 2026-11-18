@@ -1209,8 +1209,18 @@ void ArrangePanelChildren(
                 }
             }
             parent.layout.scrollExtent = Size{extW, extH};
-            const float ox = std::isfinite(parent.layout.scrollOffsetX) ? parent.layout.scrollOffsetX : 0.0f;
-            const float oy = std::isfinite(parent.layout.scrollOffsetY) ? parent.layout.scrollOffsetY : 0.0f;
+            const float maxOx = std::max(0.0f, extW - innerRect.width);
+            const float maxOy = std::max(0.0f, extH - innerRect.height);
+            const float ox = std::clamp(
+                std::isfinite(parent.layout.scrollOffsetX) ? parent.layout.scrollOffsetX : 0.0f,
+                0.0f,
+                maxOx);
+            const float oy = std::clamp(
+                std::isfinite(parent.layout.scrollOffsetY) ? parent.layout.scrollOffsetY : 0.0f,
+                0.0f,
+                maxOy);
+            parent.layout.scrollOffsetX = ox;
+            parent.layout.scrollOffsetY = oy;
             for (VisualNodeId cid : childrenCopy) {
                 const VisualNode* child = world.GetNode(cid);
                 if (!child) continue;

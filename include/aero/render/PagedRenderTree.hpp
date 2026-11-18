@@ -175,6 +175,17 @@ struct BlurLayerSpan {
     float saturation = 1.0f;
     Color effectColor{1.0f, 1.0f, 1.0f, 1.0f};
     float effectOpacity = 1.0f;
+    bool hasOpacityMask = false;
+    std::uint32_t opacityMaskGradId = 0u;
+    std::uint32_t opacityMaskSolidRgba = 0xFFFFFFFFu;
+    float opacityMaskOpacity = 1.0f;
+    Rect opacityMaskLocalRect{};
+    Matrix2D opacityMaskInvWorld2D{};
+    std::array<float, 4> opacityMaskStopOffsets{
+        std::numeric_limits<float>::quiet_NaN(),
+        std::numeric_limits<float>::quiet_NaN(),
+        std::numeric_limits<float>::quiet_NaN(),
+        std::numeric_limits<float>::quiet_NaN()};
 };
 
 struct RichGlyphStyle {

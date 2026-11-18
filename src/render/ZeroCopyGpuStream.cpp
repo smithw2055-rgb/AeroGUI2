@@ -803,8 +803,7 @@ ZeroCopyGpuStream::ZeroCopyGpuStream(ShaderBackend backend, std::size_t maxPages
     : maxPagesInRing_(std::max<std::size_t>(16u, maxPagesInRing)) {
     const std::size_t pageVertexBytes = kVerticesPerCommandPage * sizeof(AeroVertex);
     ringCapacityBytes_ = maxPagesInRing_ * pageVertexBytes;
-    ownedRingStorage_.resize(ringCapacityBytes_, 0u);
-    mappedRingBase_ = ownedRingStorage_.data();
+    mappedRingBase_ = nullptr;
     prevUploadedBytes_.assign(maxPagesInRing_, pageVertexBytes);
     subDataSpans_.reserve(maxPagesInRing_);
     clipDrawBatches_.reserve(16u);
@@ -857,11 +856,13 @@ ZeroCopySubmissionStats ZeroCopyGpuStream::SubmitDirtyPages(PagedRenderTree& tre
         const auto* pagesPtr = tree.Pages().data();
         const std::size_t totalTreePages = tree.PageCount();
 
-        // Auto-grow internal ring buffer when tree.PageCount() exceeds maxPagesInRing_ so pageIndex % maxPagesInRing_ never aliases
+        // Auto-grow / lazily initialize internal ring buffer when needed so pageIndex % maxPagesInRing_ never aliases
         bool fullRingReupload = false;
         const bool usingOwnedRing =
-            !ownedRingStorage_.empty() && (mappedRingBase_ == ownedRingStorage_.data());
-        if (totalTreePages > maxPagesInRing_ && usingOwnedRing) {
+            (mappedRingBase_ == nullptr) ||
+            (!ownedRingStorage_.empty() && mappedRingBase_ == ownedRingStorage_.data());
+        if (usingOwnedRing && totalTreePages > 0u &&
+            (ownedRingStorage_.empty() || totalTreePages > maxPagesInRing_)) {
             std::size_t newCap = std::max<std::size_t>(16u, maxPagesInRing_);
             while (newCap < totalTreePages) {
                 newCap *= 2u;

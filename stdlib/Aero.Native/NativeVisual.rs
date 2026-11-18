@@ -71,6 +71,8 @@ int __rs_native_Visual_SetTransform3D(handle node, float rx, float ry, float rz,
 public void Visual_SetTransform3D(handle node, float rx, float ry, float rz, float tx, float ty, float tz, float camDist) { __rs_native_Visual_SetTransform3D(node, rx, ry, rz, tx, ty, tz, camDist); return; }
 int __rs_native_Visual_SetEffect(handle node, int kind, float radius, float depth, float dirDeg, uint colorRgba, float opacity) { return 0; }
 public void Visual_SetEffect(handle node, int kind, float radius, float depth, float dirDeg, uint colorRgba, float opacity) { __rs_native_Visual_SetEffect(node, kind, radius, depth, dirDeg, colorRgba, opacity); return; }
+int __rs_native_Visual_SetOpacityMask(handle node, bool enabled, int gradId, uint solidRgba, float opacity) { return 0; }
+public void Visual_SetOpacityMask(handle node, bool enabled, int gradId, uint solidRgba, float opacity) { __rs_native_Visual_SetOpacityMask(node, enabled, gradId, solidRgba, opacity); return; }
 
 // Text, Image & Vector
 int __rs_native_Visual_SetText(handle node, string text, string fontFamily, float fontSize, uint fgRgba, int wrap, int align, int trim) { return 0; }
@@ -85,6 +87,8 @@ int __rs_native_Visual_SetImage(handle node, string uri, int stretch, int stretc
 public void Visual_SetImage(handle node, string uri, int stretch, int stretchDir, uint tintRgba) { __rs_native_Visual_SetImage(node, uri, stretch, stretchDir, tintRgba); return; }
 int __rs_native_Visual_SetVectorShape(handle node, int shapeKind, string pathOrParams, uint fillRgba, int fillGradId, uint strokeRgba, int strokeGradId, float strokeWidth, int stretch, float trimStart, float trimEnd) { return 0; }
 public void Visual_SetVectorShape(handle node, int shapeKind, string pathOrParams, uint fillRgba, int fillGradId, uint strokeRgba, int strokeGradId, float strokeWidth, int stretch, float trimStart, float trimEnd) { __rs_native_Visual_SetVectorShape(node, shapeKind, pathOrParams, fillRgba, fillGradId, strokeRgba, strokeGradId, strokeWidth, stretch, trimStart, trimEnd); return; }
+int __rs_native_Visual_SetVectorBrushOpacity(handle node, float fillOpacity, float strokeOpacity) { return 0; }
+public void Visual_SetVectorBrushOpacity(handle node, float fillOpacity, float strokeOpacity) { __rs_native_Visual_SetVectorBrushOpacity(node, fillOpacity, strokeOpacity); return; }
 
 // Retained DrawingContext
 int __rs_native_Draw_Begin(handle node) { return 0; }
@@ -125,12 +129,17 @@ public int Anim_StartFloat(handle node, int prop, float fromVal, float toVal, fl
 public int Anim_StartFloatTo(handle node, int prop, float toVal, float durationSec, int easeKind, int easeMode, float delaySec, bool autoReverse, int repeatCount) { return 0; }
 public int Anim_StartColor(handle node, int prop, uint fromRgba, uint toRgba, float durationSec, int easeKind, int easeMode) { return 0; }
 public int Anim_StartColorDelayed(handle node, int prop, uint fromRgba, uint toRgba, float durationSec, int easeKind, int easeMode, float delaySec) { return 0; }
+public int Anim_StartColorEx(handle node, int prop, uint fromRgba, uint toRgba, float durationSec, int easeKind, int easeMode, float delaySec, bool autoReverse, int repeatCount) { return 0; }
 public int Anim_StartColorTo(handle node, int prop, uint toRgba, float durationSec, int easeKind, int easeMode, float delaySec) { return 0; }
+public int Anim_StartColorToEx(handle node, int prop, uint toRgba, float durationSec, int easeKind, int easeMode, float delaySec, bool autoReverse, int repeatCount) { return 0; }
 public float Anim_ReadCurrentFloat(handle node, int prop) { return 0.0f; }
 public uint Anim_ReadCurrentColor(handle node, int prop) { return 0u; }
 public int Anim_SpringFloat(handle node, int prop, float targetVal, float stiffness, float damping) { return 0; }
 int __rs_native_Anim_StopAll(handle node) { return 0; }
 public void Anim_StopAll(handle node) { __rs_native_Anim_StopAll(node); return; }
+int __rs_native_Anim_StopTrack(int trackId) { return 0; }
+public void Anim_StopTrack(int trackId) { __rs_native_Anim_StopTrack(trackId); return; }
+public bool Anim_IsTrackActive(int trackId) { return false; }
 int __rs_native_Host_SetPointerCapture(handle node) { return 0; }
 public void Host_SetPointerCapture(handle node) { __rs_native_Host_SetPointerCapture(node); return; }
 int __rs_native_Host_ReleasePointerCapture(handle node) { return 0; }
@@ -144,6 +153,9 @@ int __rs_native_Host_RequestWake() { return 0; }
 public void Host_RequestWake() { __rs_native_Host_RequestWake(); return; }
 int __rs_native_Host_CloseWindow() { return 0; }
 public void Host_CloseWindow() { __rs_native_Host_CloseWindow(); return; }
+int __rs_native_Host_PlaySound(string uri, float volume) { return 0; }
+public void Host_PlaySound(string uri, float volume) { __rs_native_Host_PlaySound(uri, volume); return; }
+public int Host_GetLocalTimePart(int part) { return 0; }
 
 public string Reflect_GetPropString(object target, string propPath) { return ""; }
 public float Reflect_GetPropFloat(object target, string propPath) { return 0.0f; }

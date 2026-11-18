@@ -395,6 +395,7 @@ public class RadialNeedle : CustomDrawElement {
 // ============================================================================
 
 public class TriggerAction : DependencyObject {
+    public string ActionName { get; set; } = "";
     public string TargetName { get; set; } = "";
     public UIElement TargetObject { get; set; }
     public bool IsEnabled { get; set; } = true;
@@ -406,6 +407,12 @@ public class TriggerAction : DependencyObject {
             if (found != null) { return found; }
         }
         return associatedObject;
+    }
+
+    public virtual bool SetActionProperty(string propName, DependencyObject value) {
+        if (propName == "IsEnabled") { IsEnabled = DependencyObject.UnboxBool(value, true); return true; }
+        if (propName == "TargetName") { TargetName = DependencyObject.UnboxString(value, ""); return true; }
+        return false;
     }
 
     public virtual void Invoke(UIElement associatedObject, DependencyObject parameter) {}
@@ -512,6 +519,22 @@ public class ChangePropertyAction : TriggerAction {
 
     public override void Invoke(UIElement associatedObject, DependencyObject parameter) {
         if (!IsEnabled || PropertyName.Length == 0) { return; }
+        if (TargetObject == null && TargetName.Length > 0) {
+            UIElement namedEl = associatedObject != null ? associatedObject.FindName(TargetName) : null;
+            if (namedEl == null && associatedObject != null) {
+                namedEl = associatedObject.RootElement().FindName(TargetName);
+            }
+            if (namedEl != null) {
+                namedEl.SetPropertyValue(PropertyName, _valueBox);
+                return;
+            }
+            TriggerAction namedAct = Interaction.FindNamedAction(associatedObject, TargetName);
+            if (namedAct != null) {
+                namedAct.SetActionProperty(PropertyName, _valueBox);
+                return;
+            }
+            return;
+        }
         UIElement dest = ResolveTarget(associatedObject);
         if (dest != null) {
             dest.SetPropertyValue(PropertyName, _valueBox);
@@ -573,7 +596,17 @@ public class SelectAction : TriggerAction {
 public class PlaySoundAction : TriggerAction {
     public string Source { get; set; } = "";
     public float Volume { get; set; } = 1.0f;
-    public override void Invoke(UIElement associatedObject, DependencyObject parameter) {}
+
+    public override bool SetActionProperty(string propName, DependencyObject value) {
+        if (propName == "Source") { Source = DependencyObject.UnboxString(value, ""); return true; }
+        if (propName == "Volume") { Volume = DependencyObject.UnboxFloat(value, 1.0f); return true; }
+        return base.SetActionProperty(propName, value);
+    }
+
+    public override void Invoke(UIElement associatedObject, DependencyObject parameter) {
+        if (!IsEnabled || Source == null || Source.Length == 0) { return; }
+        Host_PlaySound(Source, Math.Clampf(Volume, 0.0f, 1.0f));
+    }
 }
 
 public class NavigateToAction : TriggerAction {
@@ -768,6 +801,14 @@ public class MediaElement : FrameworkElement {
 
     public override string GetTypeName() { return "MediaElement"; }
 
+    public override bool SubscribeBehaviorRoutedEvent(string ev, BehaviorEventSink sink) {
+        if (ev == "MediaEnded") {
+            MediaEnded += (object s, RoutedEventArgs e) => { if (sink != null) { sink.OnBehaviorEvent(s, e); } };
+            return true;
+        }
+        return base.SubscribeBehaviorRoutedEvent(ev, sink);
+    }
+
     protected override int GetCallbackMask() {
         return VisualCallbacks.StandardInput() + VisualCallbacks.Draw();
     }
@@ -953,10 +994,25 @@ public class BehaviorTriggerBase : DependencyObject {
     }
 }
 
+internal class BehaviorBoundEventSink : BehaviorEventSink {
+    private BehaviorEventTrigger _trigger;
+    private UIElement _owner;
+    public BehaviorBoundEventSink(BehaviorEventTrigger trigger, UIElement owner) {
+        _trigger = trigger;
+        _owner = owner;
+    }
+    public override void OnBehaviorEvent(object sender, RoutedEventArgs e) {
+        if (_trigger != null) { _trigger.DispatchEvent(_owner, e); }
+    }
+}
+
 public class BehaviorEventTrigger : BehaviorTriggerBase {
     public string EventName { get; set; } = "Loaded";
     public string SourceName { get; set; } = "";
     private UIElement[] _wiredOwners;
+    private static BehaviorEventTrigger[] _pendingTriggers;
+    private static UIElement[] _pendingOwners;
+    private static bool _pendingHookInstalled = false;
 
     public BehaviorEventTrigger() : base() {
         _wiredOwners = new UIElement[0];
@@ -964,6 +1020,10 @@ public class BehaviorEventTrigger : BehaviorTriggerBase {
     public BehaviorEventTrigger(string eventName) : base() {
         EventName = eventName == null ? "Loaded" : eventName;
         _wiredOwners = new UIElement[0];
+    }
+
+    internal void DispatchEvent(UIElement owner, RoutedEventArgs e) {
+        Fire(owner, e);
     }
 
     private UIElement ResolveSourceElement(UIElement associatedObject) {
@@ -1016,42 +1076,48 @@ public class BehaviorEventTrigger : BehaviorTriggerBase {
             src.GotFocus += (object s, RoutedEventArgs e) => { Fire(associatedObject, e); };
         } else if (ev == "LostFocus") {
             src.LostFocus += (object s, RoutedEventArgs e) => { Fire(associatedObject, e); };
-        } else if (ev == "Click" && src is ButtonBase) {
-            var bb = src as ButtonBase;
-            bb.Click += (object s, RoutedEventArgs e) => { Fire(associatedObject, e); };
-        } else if (ev == "Click") {
+        } else if (src.SubscribeBehaviorRoutedEvent(ev, new BehaviorBoundEventSink(this, associatedObject))) {
+            return;
+        } else if (ev == "Click" || ev == "Checked" || ev == "Unchecked" || ev == "Expanded") {
             src.Loaded += (object s, RoutedEventArgs e) => { WireDescendantRoutedEvent(src, ev, associatedObject); };
-        } else if (ev == "Checked" && src is ToggleButton) {
-            var tb = src as ToggleButton;
-            tb.Checked += (object s, RoutedEventArgs e) => { Fire(associatedObject, e); };
-        } else if (ev == "Checked") {
-            src.Loaded += (object s, RoutedEventArgs e) => { WireDescendantRoutedEvent(src, ev, associatedObject); };
-        } else if (ev == "Unchecked" && src is ToggleButton) {
-            var tb = src as ToggleButton;
-            tb.Unchecked += (object s, RoutedEventArgs e) => { Fire(associatedObject, e); };
-        } else if (ev == "Unchecked") {
-            src.Loaded += (object s, RoutedEventArgs e) => { WireDescendantRoutedEvent(src, ev, associatedObject); };
-        } else if (ev == "TextChanged" && src is TextBoxBase) {
-            var txb = src as TextBoxBase;
-            txb.TextChanged += (object s, TextChangedEventArgs e) => { Fire(associatedObject, e); };
-        } else if (ev == "SelectionChanged" && src is Selector) {
-            var sel = src as Selector;
-            sel.SelectionChanged += (object s, SelectionChangedEventArgs e) => { Fire(associatedObject, e); };
-        } else if (ev == "Expanded" && src is Expander) {
-            var ex = src as Expander;
-            ex.Expanded += (object s, RoutedEventArgs e) => { Fire(associatedObject, e); };
-        } else if (ev == "Expanded" && src is TreeViewItem) {
-            var tvi = src as TreeViewItem;
-            tvi.Expanded += (object s, RoutedEventArgs e) => { Fire(associatedObject, e); };
-        } else if (ev == "Expanded") {
-            src.Loaded += (object s, RoutedEventArgs e) => { WireDescendantRoutedEvent(src, ev, associatedObject); };
-        } else if (ev == "Collapsed" && src is Expander) {
-            var ex = src as Expander;
-            ex.Collapsed += (object s, RoutedEventArgs e) => { Fire(associatedObject, e); };
-        } else if (ev == "MediaEnded" && src is MediaElement) {
-            var me = src as MediaElement;
-            me.MediaEnded += (object s, RoutedEventArgs e) => { Fire(associatedObject, e); };
         }
+    }
+
+    private static void EnqueuePendingAttach(BehaviorEventTrigger trig, UIElement owner) {
+        if (trig == null || owner == null) { return; }
+        if (!_pendingHookInstalled) {
+            _pendingHookInstalled = true;
+            _pendingTriggers = new BehaviorEventTrigger[0];
+            _pendingOwners = new UIElement[0];
+            BindingEngine.AddPreFlushHook(() => { BehaviorEventTrigger.RetryPendingAttaches(); });
+        }
+        if (_pendingTriggers == null) { _pendingTriggers = new BehaviorEventTrigger[0]; }
+        if (_pendingOwners == null) { _pendingOwners = new UIElement[0]; }
+        for (int i = 0; i < _pendingTriggers.Length; i += 1) {
+            if (_pendingTriggers[i] == trig && _pendingOwners[i] == owner) { return; }
+        }
+        _pendingTriggers.Push(trig);
+        _pendingOwners.Push(owner);
+    }
+
+    public static void RetryPendingAttaches() {
+        if (_pendingTriggers == null || _pendingTriggers.Length == 0) { return; }
+        var remT = new BehaviorEventTrigger[0];
+        var remO = new UIElement[0];
+        for (int i = 0; i < _pendingTriggers.Length; i += 1) {
+            BehaviorEventTrigger trig = _pendingTriggers[i];
+            UIElement owner = _pendingOwners[i];
+            if (trig == null || owner == null || owner._isDisposedTree || trig.IsWiredOwner(owner)) { continue; }
+            UIElement src = trig.ResolveSourceElement(owner);
+            if (src != null) {
+                trig.WireSourceEvents(src, owner);
+            } else {
+                remT.Push(trig);
+                remO.Push(owner);
+            }
+        }
+        _pendingTriggers = remT;
+        _pendingOwners = remO;
     }
 
     public override void Attach(UIElement associatedObject) {
@@ -1064,29 +1130,21 @@ public class BehaviorEventTrigger : BehaviorTriggerBase {
         associatedObject.Loaded += (object s, RoutedEventArgs e) => {
             if (!IsWiredOwner(associatedObject)) {
                 UIElement lateSrc = ResolveSourceElement(associatedObject);
-                WireSourceEvents(lateSrc != null ? lateSrc : associatedObject, associatedObject);
+                if (lateSrc != null) {
+                    WireSourceEvents(lateSrc, associatedObject);
+                } else if (SourceName.Length == 0) {
+                    WireSourceEvents(associatedObject, associatedObject);
+                }
             }
         };
+        if (SourceName.Length > 0) {
+            EnqueuePendingAttach(this, associatedObject);
+        }
     }
 
     private void WireDescendantRoutedEvent(UIElement node, string ev, UIElement associatedObject) {
         if (node == null) { return; }
-        if (ev == "Click" && node is ButtonBase) {
-            ButtonBase bb = node as ButtonBase;
-            bb.Click += (object s, RoutedEventArgs e) => { Fire(associatedObject, e); };
-        } else if (ev == "Checked" && node is ToggleButton) {
-            ToggleButton tb = node as ToggleButton;
-            tb.Checked += (object s, RoutedEventArgs e) => { Fire(associatedObject, e); };
-        } else if (ev == "Unchecked" && node is ToggleButton) {
-            ToggleButton tb = node as ToggleButton;
-            tb.Unchecked += (object s, RoutedEventArgs e) => { Fire(associatedObject, e); };
-        } else if (ev == "Expanded" && node is Expander) {
-            Expander ex = node as Expander;
-            ex.Expanded += (object s, RoutedEventArgs e) => { Fire(associatedObject, e); };
-        } else if (ev == "Expanded" && node is TreeViewItem) {
-            TreeViewItem tvi = node as TreeViewItem;
-            tvi.Expanded += (object s, RoutedEventArgs e) => { Fire(associatedObject, e); };
-        }
+        node.SubscribeBehaviorRoutedEvent(ev, new BehaviorBoundEventSink(this, associatedObject));
         int n = node.ChildCount();
         for (int i = 0; i < n; i += 1) {
             WireDescendantRoutedEvent(node.ChildAt(i), ev, associatedObject);
@@ -1387,5 +1445,25 @@ public static class Interaction {
             if (_owners[i] == target) { res.Push(_triggers[i]); }
         }
         return res;
+    }
+
+    public static TriggerAction FindNamedAction(UIElement scope, string name) {
+        if (_triggers == null || name == null || name.Length == 0) { return null; }
+        UIElement scopeRoot = scope != null ? scope.RootElement() : null;
+        TriggerAction fallback = null;
+        for (int i = 0; i < _triggers.Length; i += 1) {
+            BehaviorTriggerBase trig = _triggers[i];
+            if (trig == null) { continue; }
+            bool sameRoot = (scopeRoot == null) || (_owners[i] != null && _owners[i].RootElement() == scopeRoot);
+            TriggerAction[] acts = trig.Actions();
+            for (int j = 0; j < acts.Length; j += 1) {
+                TriggerAction act = acts[j];
+                if (act != null && act.ActionName == name) {
+                    if (sameRoot) { return act; }
+                    if (fallback == null) { fallback = act; }
+                }
+            }
+        }
+        return fallback;
     }
 }

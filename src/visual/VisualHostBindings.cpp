@@ -1,7 +1,9 @@
 #include "aero/visual/VisualHostBindings.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdlib>
+#include <ctime>
 #include <string>
 #include <unordered_set>
 #include <vector>
@@ -982,6 +984,15 @@ bool RegisterVisualHostBindings(
             ArgFloat(args, 6, 1.0f));
         return rs_rt::Value{std::int64_t{0}};
     });
+    ok &= bindFn("Visual_SetOpacityMask", [&world](const rs_bc::FunctionReference&, rs_rt::ValueSpan args, rs_rt::RuntimeError&) -> std::optional<rs_rt::Value> {
+        (void)world.SetOpacityMask(
+            ArgNode(args, 0, world),
+            ArgBool(args, 1, false),
+            static_cast<std::int32_t>(ArgInt(args, 2, -1)),
+            ArgUInt(args, 3, 0xFFFFFFFFu),
+            ArgFloat(args, 4, 1.0f));
+        return rs_rt::Value{std::int64_t{0}};
+    });
 
     // Text / Image / Vector
     ok &= bindFn("Visual_SetText", [&world, &domains](const rs_bc::FunctionReference&, rs_rt::ValueSpan args, rs_rt::RuntimeError&) -> std::optional<rs_rt::Value> {
@@ -1051,6 +1062,13 @@ bool RegisterVisualHostBindings(
             static_cast<Stretch>(ArgInt(args, 8, 2)),
             ArgFloat(args, 9, 0.0f),
             ArgFloat(args, 10, 1.0f));
+        return rs_rt::Value{std::int64_t{0}};
+    });
+    ok &= bindFn("Visual_SetVectorBrushOpacity", [&world](const rs_bc::FunctionReference&, rs_rt::ValueSpan args, rs_rt::RuntimeError&) -> std::optional<rs_rt::Value> {
+        (void)world.SetVectorBrushOpacity(
+            ArgNode(args, 0, world),
+            ArgFloat(args, 1, 1.0f),
+            ArgFloat(args, 2, 1.0f));
         return rs_rt::Value{std::int64_t{0}};
     });
 
@@ -1173,42 +1191,49 @@ bool RegisterVisualHostBindings(
             static_cast<std::int32_t>(ArgInt(args, 8, 1)));
         return rs_rt::Value{static_cast<std::int64_t>(tid)};
     });
-    auto startColorHandler = [&world, &animEngine](const rs_bc::FunctionReference&, rs_rt::ValueSpan args, rs_rt::RuntimeError&) -> std::optional<rs_rt::Value> {
+    auto startColorCommon = [&world, &animEngine](rs_rt::ValueSpan args, bool hasAutoRepeat, bool readCurrentFrom) -> std::int64_t {
         const VisualNodeId nodeId = ArgNode(args, 0, world);
         const auto prop = static_cast<VisualAnimProp>(ArgInt(args, 1, 16));
-        const std::uint32_t fromRgba = ArgUInt(args, 2);
-        const std::uint32_t toRgba = ArgUInt(args, 3);
-        const float durationSec = ArgFloat(args, 4, 0.25f);
-        const float delaySec = ArgFloat(args, 7, 0.0f);
+        const std::uint32_t fromRgba = readCurrentFrom
+            ? VisualAnimationEngine::ReadCurrentColorProp(world, nodeId, prop)
+            : ArgUInt(args, 2);
+        const std::size_t off = readCurrentFrom ? 2u : 3u;
+        const std::uint32_t toRgba = ArgUInt(args, off);
+        const float durationSec = ArgFloat(args, off + 1u, 0.25f);
+        const auto easeKind = static_cast<EasingFunctionKind>(ArgInt(args, off + 2u, 2));
+        const auto easeMode = static_cast<EasingMode>(ArgInt(args, off + 3u, 0));
+        const float delaySec = ArgFloat(args, off + 4u, 0.0f);
+        const bool autoReverse = hasAutoRepeat ? ArgBool(args, off + 5u, false) : false;
+        const std::int32_t repeatCount = hasAutoRepeat ? static_cast<std::int32_t>(ArgInt(args, off + 6u, 1)) : 1;
         const std::int32_t tid = animEngine.StartColor(
             nodeId,
             prop,
             fromRgba,
             toRgba,
             durationSec,
-            static_cast<EasingFunctionKind>(ArgInt(args, 5, 2)),
-            static_cast<EasingMode>(ArgInt(args, 6, 0)),
-            delaySec);
-        if (tid > 0 && delaySec <= 0.0f && durationSec > 1e-5f) {
+            easeKind,
+            easeMode,
+            delaySec,
+            autoReverse,
+            repeatCount);
+        if (!readCurrentFrom && tid > 0 && delaySec <= 0.0f && durationSec > 1e-5f) {
             VisualAnimationEngine::ApplyColorPropImmediate(world, nodeId, prop, fromRgba);
         }
-        return rs_rt::Value{static_cast<std::int64_t>(tid)};
+        return static_cast<std::int64_t>(tid);
+    };
+    auto startColorHandler = [startColorCommon](const rs_bc::FunctionReference&, rs_rt::ValueSpan args, rs_rt::RuntimeError&) -> std::optional<rs_rt::Value> {
+        return rs_rt::Value{startColorCommon(args, false, false)};
     };
     ok &= bindFn("Anim_StartColor", startColorHandler);
     ok &= bindFn("Anim_StartColorDelayed", startColorHandler);
-    ok &= bindFn("Anim_StartColorTo", [&world, &animEngine](const rs_bc::FunctionReference&, rs_rt::ValueSpan args, rs_rt::RuntimeError&) -> std::optional<rs_rt::Value> {
-        const VisualNodeId nodeId = ArgNode(args, 0, world);
-        const auto prop = static_cast<VisualAnimProp>(ArgInt(args, 1, 16));
-        const std::int32_t tid = animEngine.StartColor(
-            nodeId,
-            prop,
-            VisualAnimationEngine::ReadCurrentColorProp(world, nodeId, prop),
-            ArgUInt(args, 2),
-            ArgFloat(args, 3, 0.25f),
-            static_cast<EasingFunctionKind>(ArgInt(args, 4, 2)),
-            static_cast<EasingMode>(ArgInt(args, 5, 0)),
-            ArgFloat(args, 6, 0.0f));
-        return rs_rt::Value{static_cast<std::int64_t>(tid)};
+    ok &= bindFn("Anim_StartColorEx", [startColorCommon](const rs_bc::FunctionReference&, rs_rt::ValueSpan args, rs_rt::RuntimeError&) -> std::optional<rs_rt::Value> {
+        return rs_rt::Value{startColorCommon(args, true, false)};
+    });
+    ok &= bindFn("Anim_StartColorTo", [startColorCommon](const rs_bc::FunctionReference&, rs_rt::ValueSpan args, rs_rt::RuntimeError&) -> std::optional<rs_rt::Value> {
+        return rs_rt::Value{startColorCommon(args, false, true)};
+    });
+    ok &= bindFn("Anim_StartColorToEx", [startColorCommon](const rs_bc::FunctionReference&, rs_rt::ValueSpan args, rs_rt::RuntimeError&) -> std::optional<rs_rt::Value> {
+        return rs_rt::Value{startColorCommon(args, true, true)};
     });
     ok &= bindFn("Anim_ReadCurrentFloat", [&world](const rs_bc::FunctionReference&, rs_rt::ValueSpan args, rs_rt::RuntimeError&) -> std::optional<rs_rt::Value> {
         const VisualNodeId nodeId = ArgNode(args, 0, world);
@@ -1235,6 +1260,13 @@ bool RegisterVisualHostBindings(
     ok &= bindFn("Anim_StopAll", [&world, &animEngine](const rs_bc::FunctionReference&, rs_rt::ValueSpan args, rs_rt::RuntimeError&) -> std::optional<rs_rt::Value> {
         animEngine.StopAll(ArgNode(args, 0, world));
         return rs_rt::Value{std::int64_t{0}};
+    });
+    ok &= bindFn("Anim_StopTrack", [&animEngine](const rs_bc::FunctionReference&, rs_rt::ValueSpan args, rs_rt::RuntimeError&) -> std::optional<rs_rt::Value> {
+        animEngine.StopTrack(static_cast<std::int32_t>(ArgInt(args, 0, 0)));
+        return rs_rt::Value{std::int64_t{0}};
+    });
+    ok &= bindFn("Anim_IsTrackActive", [&animEngine](const rs_bc::FunctionReference&, rs_rt::ValueSpan args, rs_rt::RuntimeError&) -> std::optional<rs_rt::Value> {
+        return rs_rt::Value{animEngine.HasTrack(static_cast<std::int32_t>(ArgInt(args, 0, 0)))};
     });
     ok &= bindFn("Host_SetPointerCapture", [&world, &inputRouter](const rs_bc::FunctionReference&, rs_rt::ValueSpan args, rs_rt::RuntimeError&) -> std::optional<rs_rt::Value> {
         inputRouter.SetPointerCapture(ArgNode(args, 0, world));
@@ -1266,6 +1298,39 @@ bool RegisterVisualHostBindings(
             platformHooks->closeWindow();
         }
         return rs_rt::Value{std::int64_t{0}};
+    });
+    ok &= bindFn("Host_PlaySound", [platformHooks, &domains](const rs_bc::FunctionReference&, rs_rt::ValueSpan args, rs_rt::RuntimeError&) -> std::optional<rs_rt::Value> {
+        if (platformHooks && platformHooks->playSound) {
+            platformHooks->playSound(ArgString(domains, args, 0), ArgFloat(args, 1, 1.0f));
+        }
+        return rs_rt::Value{std::int64_t{0}};
+    });
+    ok &= bindFn("Host_GetLocalTimePart", [](const rs_bc::FunctionReference&, rs_rt::ValueSpan args, rs_rt::RuntimeError&) -> std::optional<rs_rt::Value> {
+        const int part = static_cast<int>(ArgInt(args, 0, 0));
+        const auto now = std::chrono::system_clock::now();
+        const std::time_t tt = std::chrono::system_clock::to_time_t(now);
+        std::tm localTm{};
+#if defined(_WIN32)
+        localtime_s(&localTm, &tt);
+#else
+        localtime_r(&tt, &localTm);
+#endif
+        std::int64_t out = 0;
+        switch (part) {
+        case 0: out = static_cast<std::int64_t>(localTm.tm_year + 1900); break;
+        case 1: out = static_cast<std::int64_t>(localTm.tm_mon + 1); break;
+        case 2: out = static_cast<std::int64_t>(localTm.tm_mday); break;
+        case 3: out = static_cast<std::int64_t>(localTm.tm_hour); break;
+        case 4: out = static_cast<std::int64_t>(localTm.tm_min); break;
+        case 5: out = static_cast<std::int64_t>(localTm.tm_sec); break;
+        case 6: {
+            const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count();
+            out = static_cast<std::int64_t>((ms % 1000 + 1000) % 1000);
+            break;
+        }
+        default: out = 0; break;
+        }
+        return rs_rt::Value{out};
     });
 
     // Reflection & color utilities

@@ -795,6 +795,14 @@ public class TreeViewItem : HeaderedItemsControl {
 
     public override string GetTypeName() { return "TreeViewItem"; }
 
+    public override bool SubscribeBehaviorRoutedEvent(string ev, BehaviorEventSink sink) {
+        if (ev == "Expanded") {
+            Expanded += (object s, RoutedEventArgs e) => { if (sink != null) { sink.OnBehaviorEvent(s, e); } };
+            return true;
+        }
+        return base.SubscribeBehaviorRoutedEvent(ev, sink);
+    }
+
     public TreeView OwnerTree {
         get { return _ownerTree; }
         set {
@@ -1044,6 +1052,7 @@ public class UserControl : ContentControl {
         VerticalContentAlignment = VerticalAlignment.Stretch;
     }
     public override string GetTypeName() { return "UserControl"; }
+    public override bool IsNamescopeBoundary() { return true; }
 }
 
 public class Page : ContentControl {

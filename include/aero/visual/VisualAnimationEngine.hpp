@@ -40,6 +40,28 @@ enum class VisualAnimProp : std::uint8_t {
     BrushOpacity = 28,
     FillColor = 29,
     StrokeColor = 30,
+    OpacityMaskStop0Offset = 31,
+    OpacityMaskStop1Offset = 32,
+    OpacityMaskStop2Offset = 33,
+    OpacityMaskStop3Offset = 34,
+    FillBrushOpacity = 35,
+    StrokeBrushOpacity = 36,
+    FillStop0Color = 37,
+    FillStop1Color = 38,
+    FillStop2Color = 39,
+    FillStop3Color = 40,
+    FillStop0Offset = 41,
+    FillStop1Offset = 42,
+    FillStop2Offset = 43,
+    FillStop3Offset = 44,
+    StrokeStop0Color = 45,
+    StrokeStop1Color = 46,
+    StrokeStop2Color = 47,
+    StrokeStop3Color = 48,
+    StrokeStop0Offset = 49,
+    StrokeStop1Offset = 50,
+    StrokeStop2Offset = 51,
+    StrokeStop3Offset = 52,
 };
 
 enum class EasingFunctionKind : std::uint8_t {
@@ -149,7 +171,9 @@ public:
         float durationSec,
         EasingFunctionKind easeKind = EasingFunctionKind::Cubic,
         EasingMode easeMode = EasingMode::EaseOut,
-        float delaySec = 0.0f);
+        float delaySec = 0.0f,
+        bool autoReverse = false,
+        std::int32_t repeatCount = 1);
 
     [[nodiscard]] static float ReadCurrentScalarProp(
         const VisualWorld& world,
@@ -191,6 +215,7 @@ public:
     void Clear() noexcept;
 
     bool Tick(float dtSeconds, VisualWorld& world);
+    [[nodiscard]] bool HasTrack(std::int32_t trackId) const noexcept;
     [[nodiscard]] bool HasActiveAnimations() const noexcept;
     [[nodiscard]] std::size_t ActiveTrackCount() const noexcept;
 

@@ -36,7 +36,7 @@ struct NativeWindowConfig {
     bool forceHeadless = false;
     bool enableHighDpi = false;
     float dpiScale = 0.0f;
-    std::size_t maxPagesInRing = 256u;
+    std::size_t maxPagesInRing = 32u;
     std::uint32_t defaultAtlasSize = 256u;
     float animationFrameIntervalMs = 16.0f;
 };
@@ -141,6 +141,12 @@ public:
     [[nodiscard]] std::string GetClipboardText() const;
     void SetClipboardText(std::string_view text);
     void InstallPlatformHooks(UIHostPlatformHooks& hooks) noexcept;
+    void PlaySoundFile(std::string_view filePath, float volume = 1.0f) noexcept;
+    [[nodiscard]] static bool DecodeSoundFileToPcm16(
+        std::string_view filePath,
+        std::uint32_t& outSampleRate,
+        std::uint16_t& outChannels,
+        std::vector<std::int16_t>& outSamples);
 
     // Framebuffer readback & PPM/BMP screenshot export
     bool CaptureFramebufferRgba8(
@@ -237,6 +243,8 @@ private:
     std::uint16_t pendingHighSurrogate_ = 0u;
     std::uint8_t win32PressedMouseMask_ = 0u;
     bool win32WindowShown_ = false;
+    struct Win32AudioState;
+    std::unique_ptr<Win32AudioState> win32Audio_;
 #elif defined(__EMSCRIPTEN__)
     std::string emCanvasSelector_;
     int webglContextHandle_ = 0;

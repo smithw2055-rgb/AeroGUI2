@@ -424,6 +424,14 @@ struct XamlNode final {
         s.find("TranslateZ") != std::string_view::npos || s.find("Translation3DZ") != std::string_view::npos) {
         return "Trans3DZ";
     }
+    if (s.find("OpacityMask") != std::string_view::npos &&
+        s.find("GradientStops") != std::string_view::npos &&
+        s.find("Offset") != std::string_view::npos) {
+        if (s.find("[0]") != std::string_view::npos) return "OpacityMask.Stop0.Offset";
+        if (s.find("[1]") != std::string_view::npos) return "OpacityMask.Stop1.Offset";
+        if (s.find("[2]") != std::string_view::npos) return "OpacityMask.Stop2.Offset";
+        if (s.find("[3]") != std::string_view::npos) return "OpacityMask.Stop3.Offset";
+    }
     if (s.find("OpacityMask") != std::string_view::npos ||
         s.find("GradientStops") != std::string_view::npos ||
         s.find("GradientStop.") != std::string_view::npos) {
@@ -623,7 +631,7 @@ struct XamlNode final {
 [[nodiscard]] bool IsBrushProperty(std::string_view prop) {
     return prop == "Background" || prop == "Foreground" || prop == "BorderBrush" ||
            prop == "Fill" || prop == "Stroke" || prop == "CaretBrush" ||
-           prop == "SelectionBrush" || prop == "Brush";
+           prop == "SelectionBrush" || prop == "Brush" || prop == "OpacityMask";
 }
 
 [[nodiscard]] bool IsEventAttribute(std::string_view prop) {
@@ -655,7 +663,7 @@ struct XamlNode final {
         "IsReadOnly", "LastChildFill", "SelectedIndex", "SelectionMode",
         "Placeholder", "IsCheckable", "TabStripPlacement",
         "HorizontalScrollBarVisibility", "VerticalScrollBarVisibility",
-        "RenderTransform", "Effect", "Style", "ShowGridLines", "Rows", "Columns",
+        "RenderTransform", "Effect", "OpacityMask", "Style", "ShowGridLines", "Rows", "Columns",
         "TickLength", "TickWidth", "MinAngle", "MaxAngle", "Brush",
         "Volume", "IsMuted", "LoadedBehavior", "Password", "PasswordChar",
         "Year", "Month", "Day", "Hour", "Minute", "Second", "Format", "UseSystemTime",
@@ -2884,6 +2892,19 @@ private:
         const std::string sbVar = FreshVar("sb");
         Indent(out, indent);
         out << "var " << sbVar << " = new Storyboard();\n";
+        if (const auto* srAttr = sbNode.FindAttribute("SpeedRatio")) {
+            float sr = 1.0f;
+            if (aero::str::TryParseFloat32(srAttr->value, sr) && sr > 0.0f) {
+                Indent(out, indent);
+                out << sbVar << ".SpeedRatio = " << FormatFloatLiteral(sr) << ";\n";
+            }
+        }
+        if (const auto* rbAttr = sbNode.FindAttribute("RepeatBehavior")) {
+            if (aero::str::EqualsIgnoreCase(aero::str::Trim(rbAttr->value), "Forever")) {
+                Indent(out, indent);
+                out << sbVar << ".RepeatForever = true;\n";
+            }
+        }
 
         for (const auto& child : sbNode.children) {
             std::string targetName;
@@ -4020,7 +4041,7 @@ private:
                 ? propKey.substr(dotPos + 1)
                 : propKey;
             if (shortProp == "Resources" || shortProp == "RowDefinitions" ||
-                shortProp == "ColumnDefinitions" || shortProp == "OpacityMask" ||
+                shortProp == "ColumnDefinitions" ||
                 propKey == "Navigation.Destinations") {
                 continue;
             }
@@ -4581,6 +4602,15 @@ private:
                     Indent(out, indent);
                     out << av << ".Source = " << EscapeRsString(src->value) << ";\n";
                 }
+                if (act.localName == "PlaySoundAction") {
+                    if (const auto* vol = act.FindAttribute("Volume")) {
+                        float v = 1.0f;
+                        if (aero::str::TryParseFloat32(vol->value, v)) {
+                            Indent(out, indent);
+                            out << av << ".Volume = " << FormatFloatLiteral(v) << ";\n";
+                        }
+                    }
+                }
             }
         } else if (act.localName == "BeginStoryboard") {
             for (const auto& sbNode : act.children) {
@@ -4595,6 +4625,16 @@ private:
             return {};
         }
 
+        const std::string actionName = act.GetName();
+        if (!actionName.empty()) {
+            Indent(out, indent);
+            out << av << ".ActionName = " << EscapeRsString(actionName) << ";\n";
+        }
+        if (const auto* enabledAttr = act.FindAttribute("IsEnabled")) {
+            const bool isEn = aero::str::EqualsIgnoreCase(aero::str::Trim(enabledAttr->value), "True");
+            Indent(out, indent);
+            out << av << ".IsEnabled = " << (isEn ? "true" : "false") << ";\n";
+        }
         if (!targetName.empty()) {
             Indent(out, indent);
             out << av << ".TargetName = " << EscapeRsString(targetName) << ";\n";

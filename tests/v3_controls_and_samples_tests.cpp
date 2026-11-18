@@ -37,14 +37,15 @@ void Require(bool cond, std::string_view msg) {
 
 [[nodiscard]] aero::AeroV3CompileInput BuildSampleCompileInput(
     std::string_view sampleSubdir,
-    aero::rs_comp::CompilerSession& sharedSession) {
+    aero::rs_comp::CompilerSession&) {
     namespace fs = std::filesystem;
     aero::AeroV3CompileInput input;
     input.stdlibRootDir = AERO_STDLIB_DIR;
     input.includeStdlib = true;
+    input.treeShakeStdlib = false;
     input.optimizeBytecode = false;
     input.emitAotCpp = false;
-    input.compilerSession = &sharedSession;
+    input.compilerSession = nullptr;
 
     const fs::path sampleDir = fs::path(AERO_SAMPLES_DIR) / "V3" / std::string(sampleSubdir);
     std::vector<fs::path> entries;

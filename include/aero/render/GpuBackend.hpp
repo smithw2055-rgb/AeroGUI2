@@ -27,8 +27,8 @@ enum class GpuBackendKind : std::uint8_t {
 
 struct GpuBackendConfig {
     ShaderBackend shaderBackend = ShaderBackend::DesktopGL33;
-    std::size_t maxPagesInRing = 256u;
-    std::size_t initialQuadCapacity = 256u * (kVerticesPerCommandPage / 4u);
+    std::size_t maxPagesInRing = 32u;
+    std::size_t initialQuadCapacity = 32u * (kVerticesPerCommandPage / 4u);
     std::uint32_t defaultAtlasSize = 256u;
     std::uint32_t initialViewportWidth = 1280u;
     std::uint32_t initialViewportHeight = 720u;
@@ -169,6 +169,12 @@ struct GlFunctionTable {
     AeroGLint (AERO_GL_APIENTRY *GetUniformLocation)(AeroGLuint program, const AeroGLchar* name) = nullptr;
     void (AERO_GL_APIENTRY *Uniform1i)(AeroGLint location, AeroGLint v0) = nullptr;
     void (AERO_GL_APIENTRY *Uniform2f)(AeroGLint location, AeroGLfloat v0, AeroGLfloat v1) = nullptr;
+    void (AERO_GL_APIENTRY *Uniform4f)(
+        AeroGLint location,
+        AeroGLfloat v0,
+        AeroGLfloat v1,
+        AeroGLfloat v2,
+        AeroGLfloat v3) = nullptr;
 
     void (AERO_GL_APIENTRY *GenTextures)(AeroGLsizei n, AeroGLuint* textures) = nullptr;
     void (AERO_GL_APIENTRY *DeleteTextures)(AeroGLsizei n, const AeroGLuint* textures) = nullptr;
@@ -471,6 +477,13 @@ private:
     AeroGLint uEffectParamsLoc_ = -1;
     AeroGLint uEffectUvMinLoc_ = -1;
     AeroGLint uEffectUvMaxLoc_ = -1;
+    AeroGLint uEffectMaskMatRow0Loc_ = -1;
+    AeroGLint uEffectMaskMatRow1Loc_ = -1;
+    AeroGLint uEffectMaskSizeGradLoc_ = -1;
+    AeroGLint uEffectMaskGradPtsLoc_ = -1;
+    AeroGLint uEffectMaskStopOffsetsLoc_ = -1;
+    AeroGLint uEffectMaskStopAlphasLoc_ = -1;
+    AeroGLint uEffectMaskStopCountLoc_ = -1;
 
     AeroGLint uViewportSizeLoc_ = -1;
     AeroGLint uQuadHalfExtentLoc_ = -1;

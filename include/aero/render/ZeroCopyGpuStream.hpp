@@ -52,7 +52,7 @@ class ZeroCopyGpuStream {
 public:
     explicit ZeroCopyGpuStream(
         ShaderBackend backend = ShaderBackend::DesktopGL33,
-        std::size_t maxPagesInRing = 256);
+        std::size_t maxPagesInRing = 32);
 
     [[nodiscard]] ShaderBackend Backend() const noexcept { return backend_; }
     void SetBackend(ShaderBackend backend) noexcept;
@@ -131,7 +131,7 @@ private:
     ShaderBackend backend_ = ShaderBackend::DesktopGL33;
     RingUploadMechanism uploadMechanism_ = RingUploadMechanism::PersistentCoherentMap;
     std::uint64_t frameCounter_ = 0;
-    std::size_t maxPagesInRing_ = 256;
+    std::size_t maxPagesInRing_ = 32;
     std::size_t ringCapacityBytes_ = 0;
     std::vector<std::uint8_t> ownedRingStorage_;
     std::vector<std::size_t> prevUploadedBytes_;

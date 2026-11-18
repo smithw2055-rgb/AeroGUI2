@@ -154,7 +154,7 @@ target_link_libraries(aerogui_host
         aerogui_visual
 )
 if(WIN32)
-    target_link_libraries(aerogui_host PRIVATE user32 gdi32)
+    target_link_libraries(aerogui_host PRIVATE user32 gdi32 winmm mfplat mfreadwrite mfuuid ole32)
 endif()
 aero_apply_no_rtti_options(aerogui_host)
 

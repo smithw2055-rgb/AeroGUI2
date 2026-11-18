@@ -42,6 +42,12 @@ struct AeroAppHostConfig {
     Color clearColor{0.059f, 0.090f, 0.165f, 1.0f};
 };
 
+struct PlayedSoundRecord {
+    std::string uri;
+    std::string resolvedPath;
+    float volume = 1.0f;
+};
+
 #ifdef AERO_HAS_COMPILER_V3
 /// Discovers a sample directory's entry XAML, bundled auxiliary XAMLs, script sources,
 /// and resource/asset search paths into compile and host configurations.
@@ -135,6 +141,9 @@ public:
     // Diagnostics & Subsystem Accessors
     [[nodiscard]] const AeroAppHostConfig& Config() const noexcept { return config_; }
     [[nodiscard]] const std::string& LastError() const noexcept { return lastError_; }
+    [[nodiscard]] std::size_t PlayedSoundCount() const noexcept { return playedSounds_.size(); }
+    [[nodiscard]] const std::vector<PlayedSoundRecord>& PlayedSounds() const noexcept { return playedSounds_; }
+    void ClearPlayedSounds() noexcept { playedSounds_.clear(); }
     [[nodiscard]] bool IsAotMode() const noexcept { return aotDescriptor_ != nullptr && aotContext_ != nullptr; }
     [[nodiscard]] bool IsBytecodeMode() const noexcept { return programImage_ != nullptr && interpreter_ != nullptr; }
 
@@ -195,6 +204,7 @@ private:
     };
 
     void RegisterAssetDirectoryInternal(std::string_view dir);
+    [[nodiscard]] std::string ResolveSoundAssetPath(std::string_view uri) const;
     [[nodiscard]] bool LoadProgramImageInternal(
         std::shared_ptr<const ProgramImage> image,
         std::string_view entryClassOrFn,
@@ -259,6 +269,7 @@ private:
     PersistentRoot simObjectPin_{};
     SimTickCallback simTickCallback_{};
     std::unordered_map<std::uint64_t, std::pair<float, float>> lastCanvasDrawSizes_;
+    std::vector<PlayedSoundRecord> playedSounds_;
     std::string lastError_;
     bool initialized_ = false;
 };

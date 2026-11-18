@@ -39,6 +39,7 @@ struct AeroV3CompileInput {
     bool treeShakeStdlib = true;
     std::string cacheDir;
     bool allowDiskCache = true;
+    bool allowStdlibCache = true;
     bool emitAotCpp = false;
     std::string aotCppNamespace = "aero::aot_generated";
     std::string aotViewBuilderName;
@@ -49,6 +50,7 @@ struct AeroV3CompileInput {
 
     bool optimizeBytecode = false;
     bool skipRawBytecodeOutput = false;
+    bool retainBytecodeModules = true;
     rs_comp::CompilerSession* compilerSession = nullptr;
     bool enableReactiveMacros = true;
 };

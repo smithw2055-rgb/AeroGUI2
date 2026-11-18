@@ -1457,6 +1457,58 @@ std::size_t VisualRenderAdapter::EmitCanvasDrawVisual(
         return count;
     }
 
+[[nodiscard]] bool NodeNeedsOpacityMaskSpan(
+    const VisualNode& node,
+    const UIResourceStore* store) noexcept {
+    if (!node.opacityMask.enabled || node.layout.layoutRect.width <= 0.0f || node.layout.layoutRect.height <= 0.0f) {
+        return false;
+    }
+    const float maskOp = std::clamp(node.opacityMask.opacity, 0.0f, 1.0f);
+    if (node.opacityMask.gradId <= 0) {
+        const float solidA = static_cast<float>((node.opacityMask.solidRgba >> 24u) & 0xFFu) / 255.0f;
+        return (solidA * maskOp) < 0.999f;
+    }
+    GradientBrushDesc desc{};
+    const auto brushId = static_cast<std::uint32_t>(node.opacityMask.gradId);
+    const bool found = (store != nullptr && store->GradientBrushes().TryGetBrush(brushId, desc)) ||
+                       GradientBrushRegistry::Instance().TryGetBrush(brushId, desc);
+    if (!found || desc.stops.empty()) {
+        return maskOp < 0.999f;
+    }
+    for (std::size_t i = 0u; i < desc.stops.size() && i < node.opacityMask.stopOffsets.size(); ++i) {
+        if (std::isfinite(node.opacityMask.stopOffsets[i])) {
+            desc.stops[i].offset = std::clamp(node.opacityMask.stopOffsets[i], 0.0f, 1.0f);
+        }
+    }
+    std::stable_sort(
+        desc.stops.begin(),
+        desc.stops.end(),
+        [](const GradientStop& a, const GradientStop& b) noexcept {
+            return a.offset < b.offset;
+        });
+    const float brushOp = std::clamp(desc.opacity, 0.0f, 1.0f) * maskOp;
+    if (brushOp < 0.999f) {
+        return true;
+    }
+    bool allOpaque = true;
+    for (const auto& s : desc.stops) {
+        if (s.color.a < 0.999f) {
+            allOpaque = false;
+            break;
+        }
+    }
+    if (allOpaque) {
+        return false;
+    }
+    // At rest, a Pad mask whose first stop is opaque white at offset 1.0 covers t in [0, 1] at 100% alpha.
+    if (desc.spreadMethod == GradientSpreadMethod::Pad &&
+        desc.stops.front().offset >= 0.999f &&
+        desc.stops.front().color.a >= 0.999f) {
+        return false;
+    }
+    return true;
+}
+
 std::size_t VisualRenderAdapter::EmitNodeRecursive(
         VisualWorld* mutableWorld,
         const VisualWorld& world,
@@ -1581,28 +1633,48 @@ std::size_t VisualRenderAdapter::EmitNodeRecursive(
             isVisible &&
             node->effect.kind != UIEffectKind::None &&
             node->effect.kind != UIEffectKind::DropShadow;
+        const UIResourceStore* effStore = outTree.ResourceStore() ? outTree.ResourceStore() : world.ResourceStore();
+        const bool hasOpacityMask = isVisible && NodeNeedsOpacityMaskSpan(*node, effStore);
         std::size_t blurSpanIndex = std::numeric_limits<std::size_t>::max();
         const std::uint32_t spanStartNid = static_cast<std::uint32_t>(outTree.nodes_.size());
-        if (hasPostProcessEffect) {
+        if (hasPostProcessEffect || hasOpacityMask) {
             BlurLayerSpan span{};
             span.firstNodeId = spanStartNid;
             span.endNodeId = spanStartNid;
-            span.effectMode = node->effect.kind;
-            span.radiusPx = std::max(0.0f, node->effect.radius);
-            span.angleDeg = node->effect.dirDeg;
-            span.amountX = (node->effect.depth != 0.0f) ? node->effect.depth : node->effect.radius;
-            span.saturation = (node->effect.kind == UIEffectKind::Saturation)
-                ? ((node->effect.depth != 0.0f || node->effect.radius == 0.0f)
-                       ? node->effect.depth
-                       : node->effect.radius)
-                : ((node->effect.depth != 0.0f) ? node->effect.depth : 1.0f);
-            span.effectColor = UnpackRgba32(node->effect.colorRgba, 1.0f);
-            span.effectOpacity = std::clamp(node->effect.opacity, 0.0f, 1.0f);
+            span.effectMode = hasPostProcessEffect ? node->effect.kind : UIEffectKind::OpacityMask;
+            if (hasPostProcessEffect) {
+                span.radiusPx = std::max(0.0f, node->effect.radius);
+                span.angleDeg = node->effect.dirDeg;
+                span.amountX = (node->effect.depth != 0.0f) ? node->effect.depth : node->effect.radius;
+                span.saturation = (node->effect.kind == UIEffectKind::Saturation)
+                    ? ((node->effect.depth != 0.0f || node->effect.radius == 0.0f)
+                           ? node->effect.depth
+                           : node->effect.radius)
+                    : ((node->effect.depth != 0.0f) ? node->effect.depth : 1.0f);
+                span.effectColor = UnpackRgba32(node->effect.colorRgba, 1.0f);
+                span.effectOpacity = std::clamp(node->effect.opacity, 0.0f, 1.0f);
+            }
+            if (hasOpacityMask) {
+                span.hasOpacityMask = true;
+                span.opacityMaskGradId = (node->opacityMask.gradId > 0)
+                    ? static_cast<std::uint32_t>(node->opacityMask.gradId)
+                    : 0u;
+                span.opacityMaskSolidRgba = node->opacityMask.solidRgba;
+                span.opacityMaskOpacity = std::clamp(node->opacityMask.opacity, 0.0f, 1.0f);
+                span.opacityMaskLocalRect = rect;
+                span.opacityMaskStopOffsets = node->opacityMask.stopOffsets;
+                Matrix2D invW{};
+                if (!world2D.TryInvert(invW)) {
+                    invW = Matrix2D::Identity();
+                }
+                span.opacityMaskInvWorld2D = invW;
+            }
             const Rect worldBounds = TransformRectViewportBounds(rect, world2D, world3D, has3D);
             span.clipRect = outTree.activeClipEnabled_
                 ? IntersectRects(outTree.activeClipRect_, worldBounds)
                 : worldBounds;
-            span.clipActive = (node->effect.kind == UIEffectKind::BackdropBlur) || outTree.activeClipEnabled_;
+            span.clipActive = (hasPostProcessEffect && node->effect.kind == UIEffectKind::BackdropBlur) ||
+                              outTree.activeClipEnabled_;
             blurSpanIndex = outTree.blurLayerSpans_.size();
             outTree.blurLayerSpans_.push_back(span);
         }

@@ -37,6 +37,9 @@ namespace aero::render::detail {
 }
 
 [[nodiscard]] inline bool SpanNeedsEffectPass(const BlurLayerSpan& span) noexcept {
+    if (span.hasOpacityMask || span.effectMode == UIEffectKind::OpacityMask) {
+        return true;
+    }
     switch (span.effectMode) {
         case UIEffectKind::Blur:
         case UIEffectKind::DirectionalBlur:

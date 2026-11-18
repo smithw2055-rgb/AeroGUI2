@@ -20,6 +20,17 @@
 #include "aero/render/ImageAtlas.hpp"
 #include "aero/visual/VisualHostBindings.hpp"
 
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#include <malloc.h>
+#endif
+
 namespace aero {
 
 namespace {
@@ -819,6 +830,7 @@ bool DiscoverSampleProject(
         "Images",
         "Images/Items",
         "Fonts",
+        "Sounds",
         "Samples",
         "Samples/Images",
         "Samples/Fonts",
@@ -927,6 +939,15 @@ void AeroAppHost::WireKernelBridges() {
         windowHost_.WakeEventLoop();
     });
 
+    platformHooks_.playSound = [this](std::string_view uri, float volume) {
+        const float clampedVol = std::clamp(volume, 0.0f, 1.0f);
+        const std::string resolved = ResolveSoundAssetPath(uri);
+        playedSounds_.push_back(PlayedSoundRecord{std::string(uri), resolved, clampedVol});
+        if (!config_.headless && !resolved.empty()) {
+            windowHost_.PlaySoundFile(resolved, clampedVol);
+        }
+    };
+
     inputRouter_.SetScriptEventDispatcher(
         [this](VisualNodeId nodeId, VisualCallbackFlags flag, const NativeInputEvent& ev) -> bool {
             return HandleScriptInputEvent(nodeId, flag, ev);
@@ -989,6 +1010,63 @@ bool AeroAppHost::InitializeRuntime() {
     return true;
 }
 
+std::string AeroAppHost::ResolveSoundAssetPath(std::string_view uri) const {
+    if (uri.empty()) {
+        return {};
+    }
+    std::string clean(uri);
+    const std::size_t compPos = clean.find(";component/");
+    if (compPos != std::string::npos) {
+        clean.erase(0u, compPos + 11u);
+    } else {
+        const std::size_t compBackPos = clean.find(";component\\");
+        if (compBackPos != std::string::npos) {
+            clean.erase(0u, compBackPos + 11u);
+        }
+    }
+    std::replace(clean.begin(), clean.end(), '\\', '/');
+    while (!clean.empty() && clean.front() == '/') {
+        clean.erase(clean.begin());
+    }
+    if (clean.empty()) {
+        return {};
+    }
+
+    std::error_code ec;
+    const std::filesystem::path directRaw{std::string(uri)};
+    if (directRaw.is_absolute() && std::filesystem::is_regular_file(directRaw, ec)) {
+        return directRaw.lexically_normal().string();
+    }
+    const std::filesystem::path relPath(clean);
+    if (std::filesystem::is_regular_file(relPath, ec)) {
+        return relPath.lexically_normal().string();
+    }
+
+    const auto searchDirs = resourceStore_
+        ? resourceStore_->AssetSearchDirectoriesSnapshot()
+        : std::vector<std::string>{};
+    std::vector<std::filesystem::path> candidateSuffixes;
+    candidateSuffixes.push_back(relPath);
+    if (clean.size() > 5u && aero::str::EqualsIgnoreCase(std::string_view(clean).substr(0u, 5u), "Data/")) {
+        candidateSuffixes.emplace_back(clean.substr(5u));
+    }
+    const std::filesystem::path fileName = relPath.filename();
+    if (!fileName.empty() && fileName != relPath) {
+        candidateSuffixes.push_back(fileName);
+    }
+
+    for (const std::string& dir : searchDirs) {
+        const std::filesystem::path baseDir(dir);
+        for (const std::filesystem::path& suffix : candidateSuffixes) {
+            const std::filesystem::path candidate = baseDir / suffix;
+            if (std::filesystem::is_regular_file(candidate, ec)) {
+                return candidate.lexically_normal().string();
+            }
+        }
+    }
+    return {};
+}
+
 void AeroAppHost::ResetLoadedProgramState() noexcept {
     simObjectPin_.reset();
     simObject_ = ObjectRef{};
@@ -996,6 +1074,7 @@ void AeroAppHost::ResetLoadedProgramState() noexcept {
     rootObject_ = ObjectRef{};
     symbols_ = CachedDispatchSymbols{};
     lastCanvasDrawSizes_.clear();
+    playedSounds_.clear();
 
     animEngine_.Clear();
     drawBuffer_.ClearAll();
@@ -1094,6 +1173,7 @@ bool AeroAppHost::LoadProgramImageInternal(
     preferredEntryClass_ = std::string(preferredEntryClass);
     domains_.registerProgramObservableMetadata(*programImage_);
 
+    domains_.clearDesktopJitInvoker();
     interpreter_ = std::make_unique<Interpreter>(programImage_, domains_.uiHeapPtr());
     simInterpreter_ = std::make_unique<Interpreter>(programImage_, domains_.simHeapPtr());
     domains_.attachInterpreter(*interpreter_, DomainKind::UiPresentation);
@@ -1195,6 +1275,8 @@ bool AeroAppHost::CompileAndLoad(
     std::string* outError) {
     AeroV3CompileInput effective = input;
     effective.skipRawBytecodeOutput = true;
+    effective.retainBytecodeModules = false;
+    effective.emitAotCpp = false;
     if (config_.optimizeBytecode && !effective.optimizeBytecode) {
         effective.optimizeBytecode = true;
     }
@@ -1205,32 +1287,12 @@ bool AeroAppHost::CompileAndLoad(
         RegisterAssetDirectoryInternal(dir);
     }
     std::unique_ptr<AeroV3CompileResult> compiled;
-    bool didInitHere = false;
-    if (!initialized_) {
-        auto compileFut = std::async(std::launch::async, [effective]() {
-            const AeroCompilerV3 compiler;
-            return std::make_unique<AeroV3CompileResult>(compiler.Compile(effective));
-        });
-        const bool initOk = InitializeRuntime();
-        didInitHere = initOk;
-        compiled = compileFut.get();
-        if (!initOk) {
-            lastCompileResult_ = std::move(compiled);
-            if (outError) {
-                *outError = lastError_;
-            }
-            return false;
-        }
-    } else {
+    {
         const AeroCompilerV3 compiler;
         compiled = std::make_unique<AeroV3CompileResult>(compiler.Compile(effective));
     }
-    lastCompileResult_ = std::move(compiled);
-
-    if (!lastCompileResult_->succeeded || !lastCompileResult_->programImage) {
-        if (didInitHere) {
-            Shutdown();
-        }
+    if (!compiled->succeeded || !compiled->programImage) {
+        lastCompileResult_ = std::move(compiled);
         std::string msg = "AeroCompilerV3 compilation failed";
         for (const auto& d : lastCompileResult_->diagnostics) {
             msg.append("\n  ");
@@ -1242,6 +1304,20 @@ bool AeroAppHost::CompileAndLoad(
         }
         return false;
     }
+
+    bool didInitHere = false;
+    if (!initialized_) {
+        const bool initOk = InitializeRuntime();
+        didInitHere = initOk;
+        if (!initOk) {
+            lastCompileResult_ = std::move(compiled);
+            if (outError) {
+                *outError = lastError_;
+            }
+            return false;
+        }
+    }
+    lastCompileResult_ = std::move(compiled);
 
     std::string entryHint = config_.entryFunctionName;
     if (entryHint.empty() && !config_.entryClassName.empty()) {
@@ -1256,6 +1332,12 @@ bool AeroAppHost::CompileAndLoad(
         }
         return false;
     }
+#ifdef _WIN32
+#ifdef _MSC_VER
+    (void)_heapmin();
+#endif
+    (void)HeapCompact(GetProcessHeap(), 0u);
+#endif
     return true;
 }
 
@@ -2309,7 +2391,13 @@ void AeroAppHost::StepFrame(float dtSeconds, bool forceRenderSync) {
         if (animEngine_.Tick(dt, world_)) {
             desktopHost_.NotifyDirtyLayout();
         }
-        desktopHost_.SetActiveAnimations(animEngine_.HasActiveAnimations());
+        const bool stillActive = animEngine_.HasActiveAnimations();
+        desktopHost_.SetActiveAnimations(stillActive);
+        if (!stillActive) {
+            FlushBindings();
+            desktopHost_.NotifyDirtyObjects();
+            desktopHost_.NotifyDirtyLayout();
+        }
     } else {
         desktopHost_.SetActiveAnimations(false);
     }

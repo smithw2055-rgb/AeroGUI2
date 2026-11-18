@@ -119,6 +119,7 @@ public enum UIEffectKind {
     ChromaticAberration = 6,
     DirectionalBlur = 7,
     Saturation = 8,
+    OpacityMask = 9,
 }
 
 public enum BlendingMode {
@@ -203,6 +204,10 @@ public enum VisualAnimProp {
     BrushOpacity = 28,
     FillColor = 29,
     StrokeColor = 30,
+    OpacityMaskStop0Offset = 31,
+    OpacityMaskStop1Offset = 32,
+    OpacityMaskStop2Offset = 33,
+    OpacityMaskStop3Offset = 34,
 }
 
 public enum EasingFunctionKind {
@@ -451,6 +456,7 @@ public static class EnumConvert {
             case UIEffectKind.ChromaticAberration: return 6;
             case UIEffectKind.DirectionalBlur: return 7;
             case UIEffectKind.Saturation: return 8;
+            case UIEffectKind.OpacityMask: return 9;
         }
         return 0;
     }
@@ -538,6 +544,10 @@ public static class EnumConvert {
             case VisualAnimProp.BrushOpacity: return 28;
             case VisualAnimProp.FillColor: return 29;
             case VisualAnimProp.StrokeColor: return 30;
+            case VisualAnimProp.OpacityMaskStop0Offset: return 31;
+            case VisualAnimProp.OpacityMaskStop1Offset: return 32;
+            case VisualAnimProp.OpacityMaskStop2Offset: return 33;
+            case VisualAnimProp.OpacityMaskStop3Offset: return 34;
         }
         return 0;
     }
@@ -545,6 +555,10 @@ public static class EnumConvert {
         if (name == null) { return -1; }
         string n = name.Trim();
         if (n.Length == 0) { return -1; }
+        if (n == "OpacityMask.Stop0.Offset" || (n.Contains("OpacityMask") && (n.Contains("[0]") || n.Contains("Stop0")))) { return 31; }
+        if (n == "OpacityMask.Stop1.Offset" || (n.Contains("OpacityMask") && (n.Contains("[1]") || n.Contains("Stop1")))) { return 32; }
+        if (n == "OpacityMask.Stop2.Offset" || (n.Contains("OpacityMask") && (n.Contains("[2]") || n.Contains("Stop2")))) { return 33; }
+        if (n == "OpacityMask.Stop3.Offset" || (n.Contains("OpacityMask") && (n.Contains("[3]") || n.Contains("Stop3")))) { return 34; }
         if (n.Contains("OpacityMask") || n.Contains("GradientStop")) { return -1; }
         if (n == "Opacity") { return 0; }
         if (n == "Width" || n == "MinWidth") { return 1; }
@@ -604,6 +618,10 @@ public static class EnumConvert {
             case 28: return VisualAnimProp.BrushOpacity;
             case 29: return VisualAnimProp.FillColor;
             case 30: return VisualAnimProp.StrokeColor;
+            case 31: return VisualAnimProp.OpacityMaskStop0Offset;
+            case 32: return VisualAnimProp.OpacityMaskStop1Offset;
+            case 33: return VisualAnimProp.OpacityMaskStop2Offset;
+            case 34: return VisualAnimProp.OpacityMaskStop3Offset;
         }
         return VisualAnimProp.Opacity;
     }
@@ -1805,6 +1823,10 @@ public class KeyBinding : DependencyObject {
 
 public delegate void PopupDismissHook(UIElement clickedTarget, bool isEscape);
 
+public class BehaviorEventSink : DependencyObject {
+    public virtual void OnBehaviorEvent(object sender, RoutedEventArgs e) {}
+}
+
 [Observable]
 public partial class UIElement : DependencyObject {
     public handle __nativeHandle;
@@ -1869,6 +1891,7 @@ public partial class UIElement : DependencyObject {
     private float _trans3DZ = 0.0f;
     private float _camDist = 0.0f;
     private Effect _effect;
+    private Brush _opacityMask;
     private BlendingMode _blendMode = BlendingMode.Normal;
 
     private Brush _background;
@@ -2308,6 +2331,10 @@ public partial class UIElement : DependencyObject {
         get { return _effect; }
         set { _effect = value; SyncEffect(); }
     }
+    public Brush OpacityMask {
+        get { return _opacityMask; }
+        set { _opacityMask = value; SyncOpacityMask(); }
+    }
     public BlendingMode BlendMode {
         get { return _blendMode; }
         set { _blendMode = value; }
@@ -2591,6 +2618,17 @@ public partial class UIElement : DependencyObject {
             _effect.Direction,
             _effect.ColorRgba,
             _effect.Opacity);
+    }
+    public void SyncOpacityMask() {
+        if (!_hasNative) { return; }
+        if (_opacityMask == null) {
+            Visual_SetOpacityMask(__nativeHandle, false, -1, 4294967295u, 1.0f);
+            return;
+        }
+        int gradId = _opacityMask.ResolveGradIdUnscaled();
+        uint solidRgba = _opacityMask.ResolveRgbaUnscaled();
+        float op = Math.Clampf(_opacityMask.Opacity, 0.0f, 1.0f);
+        Visual_SetOpacityMask(__nativeHandle, true, gradId, solidRgba, op);
     }
 
     protected virtual void OnBoxAppearanceChanged() {
@@ -3192,6 +3230,10 @@ public partial class UIElement : DependencyObject {
             if (value is Effect) { Effect = value as Effect; return true; }
             return false;
         }
+        if (propName == "OpacityMask") {
+            OpacityMask = CoerceBrush(value);
+            return true;
+        }
         if (propName == "ToolTip") {
             ToolTipBox = value;
             return true;
@@ -3360,6 +3402,7 @@ public partial class UIElement : DependencyObject {
             return DependencyObject.BoxString(_background != null ? ParseUtil.FormatArgbHex(_background.ResolveRgba()) : "#00000000");
         }
         if (propName == "BorderBrush") { return _borderBrush; }
+        if (propName == "OpacityMask") { return _opacityMask; }
         if (propName == "BorderBrush.Color") {
             return DependencyObject.BoxString(_borderBrush != null ? ParseUtil.FormatArgbHex(_borderBrush.ResolveRgba()) : "#00000000");
         }
@@ -3509,6 +3552,9 @@ public partial class UIElement : DependencyObject {
     internal void RaiseKeyDown(KeyEventArgs e) { OnKeyDown(e); KeyDown(this, e); }
     internal void RaiseKeyUp(KeyEventArgs e) { OnKeyUp(e); KeyUp(this, e); }
     internal void RaiseTextInput(TextCompositionEventArgs e) { OnTextInput(e); TextInput(this, e); }
+
+    public virtual bool SubscribeBehaviorRoutedEvent(string ev, BehaviorEventSink sink) { return false; }
+    public virtual bool IsNamescopeBoundary() { return false; }
 }
 
 public class FrameworkElement : UIElement {

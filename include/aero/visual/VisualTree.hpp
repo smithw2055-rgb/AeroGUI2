@@ -113,8 +113,12 @@ struct VisualBoxStyle {
     std::uint32_t bgRgba = 0u;
     std::uint32_t borderRgba = 0u;
     std::int32_t bgGradId = -1;
+    std::int32_t baseBgGradId = -1;
     std::int32_t borderGradId = -1;
+    std::int32_t baseBorderGradId = -1;
     float bgOpacity = 1.0f;
+    bool ownsMutableBgGrad = false;
+    bool ownsMutableBorderGrad = false;
     Thickness borderThickness{};
     CornerRadius cornerRadius{};
 };
@@ -152,6 +156,18 @@ struct VisualEffectStyle {
     float opacity = 1.0f;
 };
 
+struct VisualOpacityMask {
+    bool enabled = false;
+    std::int32_t gradId = -1;
+    std::uint32_t solidRgba = 0xFFFFFFFFu;
+    float opacity = 1.0f;
+    std::array<float, 4> stopOffsets{
+        std::numeric_limits<float>::quiet_NaN(),
+        std::numeric_limits<float>::quiet_NaN(),
+        std::numeric_limits<float>::quiet_NaN(),
+        std::numeric_limits<float>::quiet_NaN()};
+};
+
 struct VisualTextData {
     std::string text;
     std::string fontFamily;
@@ -184,8 +200,14 @@ struct VisualVectorData {
     std::string pathOrParams;
     std::uint32_t fillRgba = 0u;
     std::int32_t fillGradId = -1;
+    std::int32_t baseFillGradId = -1;
     std::uint32_t strokeRgba = 0u;
     std::int32_t strokeGradId = -1;
+    std::int32_t baseStrokeGradId = -1;
+    float fillOpacity = 1.0f;
+    float strokeOpacity = 1.0f;
+    bool ownsMutableFillGrad = false;
+    bool ownsMutableStrokeGrad = false;
     float strokeWidth = 1.0f;
     Stretch stretch = Stretch::Uniform;
     float trimStart = 0.0f;
@@ -278,6 +300,7 @@ struct VisualNode {
     VisualTransform2D transform2D{};
     VisualTransform3D transform3D{};
     VisualEffectStyle effect{};
+    VisualOpacityMask opacityMask{};
     VisualTextData text{};
     VisualImageData image{};
     VisualVectorData vector{};
@@ -410,6 +433,12 @@ public:
         float dirDeg,
         std::uint32_t colorRgba,
         float opacity) noexcept;
+    bool SetOpacityMask(
+        VisualNodeId id,
+        bool enabled,
+        std::int32_t gradId,
+        std::uint32_t solidRgba,
+        float opacity) noexcept;
 
     // Text, Image, Vector & Retained Canvas Invalidation
     bool SetText(
@@ -460,6 +489,7 @@ public:
         Stretch stretch,
         float trimStart,
         float trimEnd);
+    bool SetVectorBrushOpacity(VisualNodeId id, float fillOpacity, float strokeOpacity) noexcept;
     bool InvalidateDraw(VisualNodeId id) noexcept;
 
     // Layout & ECS Track B

@@ -688,7 +688,8 @@ enum class UIEffectKind : std::uint8_t {
     Tint = 5,
     ChromaticAberration = 6,
     DirectionalBlur = 7,
-    Saturation = 8
+    Saturation = 8,
+    OpacityMask = 9
 };
 
 enum class BlendingMode : std::uint8_t {

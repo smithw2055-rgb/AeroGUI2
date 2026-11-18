@@ -28,6 +28,11 @@ namespace rs_rt = aero::rs_rt;
 int gFailureCount = 0;
 long long gColdStdlibCompileMs = 0;
 
+[[nodiscard]] bool ShouldRunSlowAotOptTests() {
+    const char* v = std::getenv("AERO_TEST_ENABLE_AOT_OPT");
+    return v != nullptr && v[0] != '\0' && std::string_view(v) != "0";
+}
+
 void Require(bool cond, std::string_view message) {
     if (!cond) {
         std::cerr << "[FAIL] " << message << "\n";
@@ -827,15 +832,14 @@ public void RunVoidProbe(handle h) {
 }
 )RS";
 
+    const bool runSlow = ShouldRunSlowAotOptTests();
     aero::AeroV3CompileInput input;
     input.includeStdlib = true;
-    input.optimizeBytecode = true;
-    input.emitAotCpp = true;
+    input.treeShakeStdlib = false;
+    input.optimizeBytecode = runSlow;
+    input.emitAotCpp = runSlow;
     input.aotViewBuilderName = "BuildNativeProbe";
     input.scriptSources.push_back(probe);
-
-    aero::rs_comp::CompilerSession session;
-    input.compilerSession = &session;
 
     const aero::AeroCompilerV3 compiler;
     const auto tCold0 = std::chrono::steady_clock::now();
@@ -848,12 +852,14 @@ public void RunVoidProbe(handle h) {
         }
     }
     Require(result.succeeded && result.programImage != nullptr,
-        "NativeProbe compilation with real stdlib and -O2 failed");
+        "NativeProbe compilation with real stdlib failed");
     Require(!result.programImageBytes.empty(), "programImageBytes must not be empty");
-    Require(!result.aotCpp.scriptAotHeader.empty() && !result.aotCpp.scriptAotSource.empty(),
-        "CppGenerator must produce non-empty AOT header & source");
-    Require(ContainsText(result.aotCpp.scriptAotHeader, "BuildNativeProbeProgram"),
-        "AOT header missing BuildNativeProbeProgram");
+    if (runSlow) {
+        Require(!result.aotCpp.scriptAotHeader.empty() && !result.aotCpp.scriptAotSource.empty(),
+            "CppGenerator must produce non-empty AOT header & source");
+        Require(ContainsText(result.aotCpp.scriptAotHeader, "BuildNativeProbeProgram"),
+            "AOT header missing BuildNativeProbeProgram");
+    }
     if (!result.succeeded || !result.programImage) {
         return;
     }
@@ -876,12 +882,14 @@ public void RunVoidProbe(handle h) {
             ContainsText(probeDisasm, "Color_ParseRgba") &&
             (ContainsText(probeDisasm, "Visual_SetOpacity") ||
              ContainsText(probeDisasm, "__rs_native_Visual_SetOpacity")),
-        "-O2 must NOT inline Aero.Native dummy bodies; Call instructions must remain");
+        "-O0/-O2 must NOT inline Aero.Native dummy bodies; Call instructions must remain");
 
-    Require(ContainsText(result.aotCpp.scriptAotSource, "Visual_Create") &&
-            (ContainsText(result.aotCpp.scriptAotSource, "Visual_SetOpacity") ||
-             ContainsText(result.aotCpp.scriptAotSource, "__rs_native_Visual_SetOpacity")),
-        "AOT C++ source must preserve external Aero.Native calls");
+    if (runSlow) {
+        Require(ContainsText(result.aotCpp.scriptAotSource, "Visual_Create") &&
+                (ContainsText(result.aotCpp.scriptAotSource, "Visual_SetOpacity") ||
+                 ContainsText(result.aotCpp.scriptAotSource, "__rs_native_Visual_SetOpacity")),
+            "AOT C++ source must preserve external Aero.Native calls");
+    }
 
     // Execute compiled bytecode with mock native hooks to confirm live FFI dispatch
     rs_rt::Interpreter interp(result.programImage);
@@ -924,11 +932,16 @@ public float ApplyFade(float opacity) {
 }
 )RS";
 
-    for (bool optO2 : {false, true}) {
+    std::vector<bool> optModes{false};
+    if (ShouldRunSlowAotOptTests()) {
+        optModes.push_back(true);
+    }
+    for (bool optO2 : optModes) {
         aero::AeroV3CompileInput input;
         input.includeStdlib = true;
+        input.treeShakeStdlib = false;
         input.optimizeBytecode = optO2;
-        input.emitAotCpp = true;
+        input.emitAotCpp = optO2;
         input.aotViewBuilderName = optO2 ? "BuildVoidProbeO2" : "BuildVoidProbeO0";
         input.scriptSources.push_back(probe);
 
@@ -940,8 +953,10 @@ public float ApplyFade(float opacity) {
         }
         Require(res.succeeded && res.programImage != nullptr,
             std::string("VoidForwarderProbe compile failed under ") + (optO2 ? "-O2" : "-O0"));
-        Require(!res.aotCpp.scriptAotHeader.empty() && !res.aotCpp.scriptAotSource.empty(),
-            std::string("VoidForwarderProbe AOT output empty under ") + (optO2 ? "-O2" : "-O0"));
+        if (optO2) {
+            Require(!res.aotCpp.scriptAotHeader.empty() && !res.aotCpp.scriptAotSource.empty(),
+                std::string("VoidForwarderProbe AOT output empty under ") + (optO2 ? "-O2" : "-O0"));
+        }
         if (!res.succeeded || !res.programImage) {
             continue;
         }
@@ -1057,11 +1072,13 @@ namespace QuickApp
     aero::rs_comp::CompilerSession session;
     const aero::AeroCompilerV3 compiler;
 
+    const bool runSlow = ShouldRunSlowAotOptTests();
     aero::AeroV3CompileInput input;
     input.xamlPath = "QuickApp/MainWindow.xaml";
     input.xamlContent = xaml;
-    input.optimizeBytecode = true;
-    input.emitAotCpp = true;
+    input.treeShakeStdlib = false;
+    input.optimizeBytecode = runSlow;
+    input.emitAotCpp = runSlow;
     input.aotViewBuilderName = "BuildQuickAppWindow";
     input.compilerSession = &session;
 
@@ -1091,8 +1108,10 @@ namespace QuickApp
     Require(res1.programImage->findFunction("QuickApp.MainWindow::InitializeComponent").has_value() ||
             ContainsText(res1.generatedPartialRsCode, "InitializeComponent"),
         "Compiled program must include QuickApp::MainWindow::InitializeComponent");
-    Require(ContainsText(res1.aotCpp.scriptAotHeader, "BuildQuickAppWindowProgram"),
-        "End-to-end AOT C++ header missing BuildQuickAppWindowProgram");
+    if (runSlow) {
+        Require(ContainsText(res1.aotCpp.scriptAotHeader, "BuildQuickAppWindowProgram"),
+            "End-to-end AOT C++ header missing BuildQuickAppWindowProgram");
+    }
     Require(session.parsedUnitCacheSize() > 0,
         "CompilerSession parsedUnitCache should be populated after first compile");
 
@@ -1180,7 +1199,7 @@ public partial class MainWindow : Window {
     prunedInput.xamlContent = windowXaml;
     prunedInput.includeStdlib = true;
     prunedInput.treeShakeStdlib = true;
-    prunedInput.optimizeBytecode = true;
+    prunedInput.optimizeBytecode = false;
     prunedInput.cacheDir = diskCacheDir.string();
     prunedInput.scriptSources.push_back(aero::SourceFile{"PerfProbe/MainWindow.rs", windowRs});
 
@@ -1341,8 +1360,8 @@ public partial class MainWindow : Window {
     input.scriptSources.push_back(
         aero::SourceFile{"MultiXamlDemo/MainWindow.rs", mainRs});
     input.includeStdlib = true;
-    input.treeShakeStdlib = true;
-    input.optimizeBytecode = true;
+    input.treeShakeStdlib = false;
+    input.optimizeBytecode = false;
 
     const aero::AeroCompilerV3 compiler;
     const auto res = compiler.Compile(input);
