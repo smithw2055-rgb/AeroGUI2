@@ -27,6 +27,11 @@
 #include "aero/compiler/AeroCompilerV3.hpp"
 #endif
 
+namespace realscript::aot {
+struct TypeDescriptor;
+struct FunctionDescriptor;
+} // namespace realscript::aot
+
 namespace aero {
 
 struct AeroAppHostConfig {
@@ -250,10 +255,13 @@ private:
     std::shared_ptr<BindingRegistry> bindings_;
 
     std::shared_ptr<const ProgramImage> programImage_;
+    std::shared_ptr<void> uiStencilModule_;
     std::unique_ptr<Interpreter> interpreter_;
     std::unique_ptr<Interpreter> simInterpreter_;
 
     const rs_aot::ProgramDescriptor* aotDescriptor_ = nullptr;
+    std::unordered_map<SymbolId, const rs_aot::TypeDescriptor*> aotPrebuiltTypes_;
+    std::unordered_map<SymbolId, const rs_aot::FunctionDescriptor*> aotPrebuiltFunctions_;
     std::unique_ptr<rs_aot::ExecutionContext> aotContext_;
     std::unique_ptr<rs_aot::ExecutionContext> simAotContext_;
 
@@ -271,6 +279,7 @@ private:
     std::unordered_map<std::uint64_t, std::pair<float, float>> lastCanvasDrawSizes_;
     std::vector<PlayedSoundRecord> playedSounds_;
     std::string lastError_;
+    bool scriptWakeRequested_ = false;
     bool initialized_ = false;
 };
 

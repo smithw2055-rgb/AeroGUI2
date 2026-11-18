@@ -373,6 +373,7 @@ public class ItemsControl : Control {
             return;
         }
 
+        BindingEngine.BeginBatch();
         int desiredCount = lastIdx - firstIdx + 1;
         UIElement[] prevContainers = _activeContainers;
         DependencyObject[] prevBoxes = _activeBoxes;
@@ -414,10 +415,10 @@ public class ItemsControl : Control {
                 nextContainers[j] = reused;
             } else {
                 UIElement c = AcquireContainer();
-                PrepareContainerForItem(c, box, itemIdx);
                 if (_itemContainerStyle != null && c != null) {
                     c.Style = _itemContainerStyle;
                 }
+                PrepareContainerForItem(c, box, itemIdx);
                 nextContainers[j] = c;
             }
         }
@@ -454,6 +455,7 @@ public class ItemsControl : Control {
 
         _activeContainers = nextContainers;
         _activeBoxes = nextBoxes;
+        BindingEngine.EndBatch();
         OnContainersRebuilt();
     }
 

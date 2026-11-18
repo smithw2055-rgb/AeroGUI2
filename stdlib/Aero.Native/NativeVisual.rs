@@ -85,6 +85,8 @@ public float Visual_MeasureText(string text, string fontFamily, float fontSize, 
 public int Visual_HitTestTextCp(handle node, float localX, float localY) { return 0; }
 int __rs_native_Visual_SetImage(handle node, string uri, int stretch, int stretchDir, uint tintRgba) { return 0; }
 public void Visual_SetImage(handle node, string uri, int stretch, int stretchDir, uint tintRgba) { __rs_native_Visual_SetImage(node, uri, stretch, stretchDir, tintRgba); return; }
+int __rs_native_Visual_SetImageViewbox(handle node, float vx, float vy, float vw, float vh) { return 0; }
+public void Visual_SetImageViewbox(handle node, float vx, float vy, float vw, float vh) { __rs_native_Visual_SetImageViewbox(node, vx, vy, vw, vh); return; }
 int __rs_native_Visual_SetVectorShape(handle node, int shapeKind, string pathOrParams, uint fillRgba, int fillGradId, uint strokeRgba, int strokeGradId, float strokeWidth, int stretch, float trimStart, float trimEnd) { return 0; }
 public void Visual_SetVectorShape(handle node, int shapeKind, string pathOrParams, uint fillRgba, int fillGradId, uint strokeRgba, int strokeGradId, float strokeWidth, int stretch, float trimStart, float trimEnd) { __rs_native_Visual_SetVectorShape(node, shapeKind, pathOrParams, fillRgba, fillGradId, strokeRgba, strokeGradId, strokeWidth, stretch, trimStart, trimEnd); return; }
 int __rs_native_Visual_SetVectorBrushOpacity(handle node, float fillOpacity, float strokeOpacity) { return 0; }
@@ -160,6 +162,7 @@ public int Host_GetLocalTimePart(int part) { return 0; }
 public string Reflect_GetPropString(object target, string propPath) { return ""; }
 public float Reflect_GetPropFloat(object target, string propPath) { return 0.0f; }
 public int Reflect_GetPropInt(object target, string propPath) { return 0; }
+public int Reflect_ResolveEnumOrdinal(object target, string propPath, string memberName) { return -2147483647; }
 public bool Reflect_GetPropBool(object target, string propPath) { return false; }
 public object Reflect_GetPropObject(object target, string propPath) { return null; }
 public int Reflect_GetPropTypeKind(object target, string propPath) { return 0; }

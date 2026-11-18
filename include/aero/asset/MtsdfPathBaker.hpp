@@ -133,6 +133,17 @@ bool RasterizeSvgPathFillAlphaMask(
     std::uint32_t padPx,
     std::vector<std::uint8_t>& outRgba8);
 
+/// Rasterize an SVG path's centered stroke outline into an exact Euclidean-distance
+/// anti-aliased RGBA8 alpha mask surrounded by `padPx` padding inside `[0..texW] x [0..texH]`.
+bool RasterizeSvgPathStrokeAlphaMask(
+    std::string_view pathData,
+    const Rect& pathBounds,
+    std::uint32_t innerWidth,
+    std::uint32_t innerHeight,
+    float strokeWidthPx,
+    std::uint32_t padPx,
+    std::vector<std::uint8_t>& outRgba8);
+
 namespace detail {
 
 void SkipSvgDelimiters(std::string_view s, std::size_t& pos) noexcept;

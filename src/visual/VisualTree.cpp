@@ -727,13 +727,15 @@ Size VisualWorld::MeasureText(
     std::string_view fontFamily,
     float fontSize,
     float maxWidth,
-    TextWrapping wrap) const {
+    TextWrapping wrap,
+    float charSpacing) const {
     if (text.empty()) {
         return Size{0.0f, 0.0f};
     }
     UIResourceStore* store = const_cast<VisualWorld*>(this)->ResourceStore();
     if (store) {
-        const TextLayoutResult res = store->Fonts().MeasureLayout(text, fontFamily, fontSize, maxWidth, wrap);
+        const TextLayoutResult res = store->Fonts().MeasureLayout(
+            text, fontFamily, fontSize, maxWidth, wrap, charSpacing);
         return Size{res.totalWidth, res.totalHeight};
     }
     const float safeFont = (fontSize > 1.0f) ? fontSize : 14.0f;
@@ -757,7 +759,8 @@ std::int32_t VisualWorld::HitTestTextCodePoint(VisualNodeId id, float localX, fl
         node->text.fontFamily,
         node->text.fontSize,
         maxW,
-        node->text.wrap);
+        node->text.wrap,
+        node->text.charSpacing);
     if (layout.lines.empty() || layout.glyphs.empty()) {
         return 0;
     }
@@ -810,6 +813,22 @@ bool VisualWorld::SetImage(
     node->image.stretchDir = stretchDir;
     node->image.tintRgba = tintRgba;
     MarkAncestorsDirty(id, VisualDirty_All);
+    return true;
+}
+
+bool VisualWorld::SetImageViewbox(
+    VisualNodeId id,
+    float vx,
+    float vy,
+    float vw,
+    float vh) noexcept {
+    VisualNode* node = GetNode(id);
+    if (!node) return false;
+    node->image.viewboxX = std::isfinite(vx) ? vx : 0.0f;
+    node->image.viewboxY = std::isfinite(vy) ? vy : 0.0f;
+    node->image.viewboxW = std::isfinite(vw) ? vw : 1.0f;
+    node->image.viewboxH = std::isfinite(vh) ? vh : 1.0f;
+    MarkDirty(id, VisualDirty_Visual);
     return true;
 }
 

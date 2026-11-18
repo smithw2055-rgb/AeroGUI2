@@ -4,7 +4,9 @@
 #include <chrono>
 #include <cstdlib>
 #include <ctime>
+#include <mutex>
 #include <string>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -275,6 +277,135 @@ struct ReflectHostEnv {
     return val;
 }
 
+struct AotMemberSlot {
+    bool hasReadField = false;
+    std::uint32_t readFieldIndex = 0u;
+    rs_sem::SymbolId getterSym = 0u;
+    bool hasWriteField = false;
+    std::uint32_t writeFieldIndex = 0u;
+    rs_sem::SymbolId setterSym = 0u;
+};
+
+struct AotNamedMemberEntry {
+    std::string memberName;
+    AotMemberSlot slot;
+};
+
+struct AotProgramReflectionCache {
+    std::uint32_t typeCount = 0u;
+    std::uint32_t functionCount = 0u;
+    std::unordered_map<rs_sem::SymbolId, std::vector<AotNamedMemberEntry>> byType;
+};
+
+[[nodiscard]] AotMemberSlot ResolveAotMemberSlot(
+    const rs_aot::ProgramDescriptor& prog,
+    rs_sem::SymbolId typeId,
+    std::string_view memberName) {
+    static std::mutex sCacheMutex;
+    static std::unordered_map<const rs_aot::ProgramDescriptor*, AotProgramReflectionCache> sCaches;
+
+    {
+        std::lock_guard<std::mutex> lock(sCacheMutex);
+        const auto progIt = sCaches.find(&prog);
+        if (progIt != sCaches.end() &&
+            progIt->second.typeCount == prog.typeCount &&
+            progIt->second.functionCount == prog.functionCount) {
+            const auto tIt = progIt->second.byType.find(typeId);
+            if (tIt != progIt->second.byType.end()) {
+                for (const auto& entry : tIt->second) {
+                    if (entry.memberName == memberName) {
+                        return entry.slot;
+                    }
+                }
+            }
+        }
+    }
+
+    AotMemberSlot resolved{};
+    const std::string backingName = std::string("$") + std::string(memberName);
+    const std::string getterName = std::string("get_") + std::string(memberName);
+    const std::string setterName = std::string("set_") + std::string(memberName);
+    std::unordered_set<rs_sem::SymbolId> visited;
+    const rs_aot::TypeDescriptor* cur = FindAotType(prog, typeId);
+    while (cur && visited.insert(cur->id).second) {
+        if (cur->fields) {
+            for (std::uint32_t fi = 0u; fi < cur->fieldCount; ++fi) {
+                const auto& fd = cur->fields[fi];
+                if (fd.staticField || !fd.name) continue;
+                const std::string_view fname(fd.name);
+                if (fname == memberName || fname == backingName) {
+                    if (!resolved.hasReadField) {
+                        resolved.hasReadField = true;
+                        resolved.readFieldIndex = fd.index;
+                    }
+                    if (!fd.constField && !resolved.hasWriteField) {
+                        resolved.hasWriteField = true;
+                        resolved.writeFieldIndex = fd.index;
+                    }
+                }
+            }
+        }
+        if ((!resolved.hasReadField && resolved.getterSym == 0u) ||
+            (!resolved.hasWriteField && resolved.setterSym == 0u)) {
+            if (prog.functions && prog.functionCount > 0u) {
+                const std::string fullType = AotTypeQualifiedName(*cur);
+                const std::string_view shortType = cur->name ? std::string_view(cur->name) : std::string_view{};
+                for (std::uint32_t fnIdx = 0u; fnIdx < prog.functionCount; ++fnIdx) {
+                    const auto& fn = prog.functions[fnIdx];
+                    if (!fn.name) continue;
+                    if (fn.parameterCount == 1u && resolved.getterSym == 0u) {
+                        if (FunctionNameMatchesMember(fn.name, fullType, shortType, getterName) ||
+                            FunctionNameMatchesMember(fn.name, fullType, shortType, memberName)) {
+                            resolved.getterSym = fn.symbolId;
+                        }
+                    } else if (fn.parameterCount == 2u && resolved.setterSym == 0u) {
+                        if (FunctionNameMatchesMember(fn.name, fullType, shortType, setterName)) {
+                            resolved.setterSym = fn.symbolId;
+                        }
+                    }
+                    if (resolved.getterSym != 0u && resolved.setterSym != 0u) {
+                        break;
+                    }
+                }
+            }
+        }
+        if (resolved.hasReadField && resolved.hasWriteField) {
+            break;
+        }
+        if (cur->baseTypeId == 0u || cur->baseTypeId == cur->id) {
+            break;
+        }
+        cur = FindAotType(prog, cur->baseTypeId);
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(sCacheMutex);
+        if (sCaches.size() > 16u && sCaches.find(&prog) == sCaches.end()) {
+            sCaches.clear();
+        }
+        auto& progCache = sCaches[&prog];
+        if (progCache.typeCount != prog.typeCount ||
+            progCache.functionCount != prog.functionCount) {
+            progCache.byType.clear();
+            progCache.typeCount = prog.typeCount;
+            progCache.functionCount = prog.functionCount;
+        }
+        auto& entries = progCache.byType[typeId];
+        bool updated = false;
+        for (auto& existing : entries) {
+            if (existing.memberName == memberName) {
+                existing.slot = resolved;
+                updated = true;
+                break;
+            }
+        }
+        if (!updated) {
+            entries.push_back(AotNamedMemberEntry{std::string(memberName), resolved});
+        }
+    }
+    return resolved;
+}
+
 [[nodiscard]] bool ReadSingleMember(
     const ReflectHostEnv& env,
     rs_rt::ObjectRef obj,
@@ -328,44 +459,18 @@ struct ReflectHostEnv {
     }
 
     if (env.aotContext) {
-        const rs_aot::ProgramDescriptor& prog = env.aotContext->program();
-        const std::string backingName = std::string("$") + std::string(memberName);
-        const std::string getterName = std::string("get_") + std::string(memberName);
-        std::unordered_set<rs_sem::SymbolId> visited;
-        const rs_aot::TypeDescriptor* cur = FindAotType(prog, typeId);
-        while (cur && visited.insert(cur->id).second) {
-            if (cur->fields) {
-                for (std::uint32_t fi = 0u; fi < cur->fieldCount; ++fi) {
-                    const auto& fd = cur->fields[fi];
-                    if (fd.staticField || !fd.name) continue;
-                    const std::string_view fname(fd.name);
-                    if (fname == memberName || fname == backingName) {
-                        if (const rs_rt::Value* fp = heap->fieldGetFast(obj, fd.index)) {
-                            outValue = *fp;
-                            return true;
-                        }
-                    }
-                }
+        const AotMemberSlot slot = ResolveAotMemberSlot(env.aotContext->program(), typeId, memberName);
+        if (slot.hasReadField) {
+            if (const rs_rt::Value* fp = heap->fieldGetFast(obj, slot.readFieldIndex)) {
+                outValue = *fp;
+                return true;
             }
-            if (prog.functions && prog.functionCount > 0u) {
-                const std::string fullType = AotTypeQualifiedName(*cur);
-                const std::string_view shortType = cur->name ? std::string_view(cur->name) : std::string_view{};
-                for (std::uint32_t fnIdx = 0u; fnIdx < prog.functionCount; ++fnIdx) {
-                    const auto& fn = prog.functions[fnIdx];
-                    if (!fn.name || fn.parameterCount != 1u) continue;
-                    if (FunctionNameMatchesMember(fn.name, fullType, shortType, getterName) ||
-                        FunctionNameMatchesMember(fn.name, fullType, shortType, memberName)) {
-                        const rs_rt::Value selfArg{obj};
-                        if (env.aotContext->invoke(fn.symbolId, &selfArg, 1u, outValue)) {
-                            return true;
-                        }
-                    }
-                }
+        }
+        if (slot.getterSym != 0u) {
+            const rs_rt::Value selfArg{obj};
+            if (env.aotContext->invoke(slot.getterSym, &selfArg, 1u, outValue)) {
+                return true;
             }
-            if (cur->baseTypeId == 0u || cur->baseTypeId == cur->id) {
-                break;
-            }
-            cur = FindAotType(prog, cur->baseTypeId);
         }
     }
 
@@ -438,44 +543,19 @@ struct ReflectHostEnv {
             (env.domains->isSimObject(obj) || env.domains->isTypeSimState(typeId))) {
             return false;
         }
-        const rs_aot::ProgramDescriptor& prog = env.aotContext->program();
-        const std::string backingName = std::string("$") + std::string(memberName);
-        const std::string setterName = std::string("set_") + std::string(memberName);
-        std::unordered_set<rs_sem::SymbolId> visited;
-        const rs_aot::TypeDescriptor* cur = FindAotType(prog, typeId);
-        while (cur && visited.insert(cur->id).second) {
-            if (cur->fields) {
-                for (std::uint32_t fi = 0u; fi < cur->fieldCount; ++fi) {
-                    const auto& fd = cur->fields[fi];
-                    if (fd.staticField || fd.constField || !fd.name) continue;
-                    const std::string_view fname(fd.name);
-                    if (fname == memberName || fname == backingName) {
-                        rs_rt::Value writeVal = InternIfStringValueForHeap(*heap, value);
-                        rs_rt::RuntimeError err{};
-                        return heap->fieldSet(obj, fd.index, std::move(writeVal), &err);
-                    }
-                }
+        const AotMemberSlot slot = ResolveAotMemberSlot(env.aotContext->program(), typeId, memberName);
+        if (slot.hasWriteField) {
+            rs_rt::Value writeVal = InternIfStringValueForHeap(*heap, value);
+            rs_rt::RuntimeError err{};
+            return heap->fieldSet(obj, slot.writeFieldIndex, std::move(writeVal), &err);
+        }
+        if (slot.setterSym != 0u) {
+            rs_rt::Value writeVal = InternIfStringValueForHeap(*heap, value);
+            const rs_rt::Value callArgs[2]{rs_rt::Value{obj}, std::move(writeVal)};
+            rs_rt::Value unused{};
+            if (env.aotContext->invoke(slot.setterSym, callArgs, 2u, unused)) {
+                return true;
             }
-            if (prog.functions && prog.functionCount > 0u) {
-                const std::string fullType = AotTypeQualifiedName(*cur);
-                const std::string_view shortType = cur->name ? std::string_view(cur->name) : std::string_view{};
-                for (std::uint32_t fnIdx = 0u; fnIdx < prog.functionCount; ++fnIdx) {
-                    const auto& fn = prog.functions[fnIdx];
-                    if (!fn.name || fn.parameterCount != 2u) continue;
-                    if (FunctionNameMatchesMember(fn.name, fullType, shortType, setterName)) {
-                        rs_rt::Value writeVal = InternIfStringValueForHeap(*heap, value);
-                        const rs_rt::Value callArgs[2]{rs_rt::Value{obj}, std::move(writeVal)};
-                        rs_rt::Value unused{};
-                        if (env.aotContext->invoke(fn.symbolId, callArgs, 2u, unused)) {
-                            return true;
-                        }
-                    }
-                }
-            }
-            if (cur->baseTypeId == 0u || cur->baseTypeId == cur->id) {
-                break;
-            }
-            cur = FindAotType(prog, cur->baseTypeId);
         }
     }
 
@@ -1049,6 +1129,15 @@ bool RegisterVisualHostBindings(
             ArgUInt(args, 4, 0xFFFFFFFFu));
         return rs_rt::Value{std::int64_t{0}};
     });
+    ok &= bindFn("Visual_SetImageViewbox", [&world](const rs_bc::FunctionReference&, rs_rt::ValueSpan args, rs_rt::RuntimeError&) -> std::optional<rs_rt::Value> {
+        (void)world.SetImageViewbox(
+            ArgNode(args, 0, world),
+            ArgFloat(args, 1, 0.0f),
+            ArgFloat(args, 2, 0.0f),
+            ArgFloat(args, 3, 1.0f),
+            ArgFloat(args, 4, 1.0f));
+        return rs_rt::Value{std::int64_t{0}};
+    });
     ok &= bindFn("Visual_SetVectorShape", [&world, &domains](const rs_bc::FunctionReference&, rs_rt::ValueSpan args, rs_rt::RuntimeError&) -> std::optional<rs_rt::Value> {
         (void)world.SetVectorShape(
             ArgNode(args, 0, world),
@@ -1391,6 +1480,44 @@ bool RegisterVisualHostBindings(
         }
         return rs_rt::Value{static_cast<std::int64_t>(0)};
     });
+    ok &= bindFn("Reflect_ResolveEnumOrdinal", [reflectEnv](const rs_bc::FunctionReference&, rs_rt::ValueSpan args, rs_rt::RuntimeError&) -> std::optional<rs_rt::Value> {
+        constexpr std::int64_t kNotFound = std::int64_t{-2147483647};
+        const rs_rt::ObjectRef target = ArgObject(args, 0);
+        std::string propPath;
+        if (!TryExtractStringValue(reflectEnv, args.size() > 1u ? args[1] : rs_rt::Value{}, propPath)) {
+            propPath = ArgString(args, 1);
+        }
+        std::string memberName;
+        if (!TryExtractStringValue(reflectEnv, args.size() > 2u ? args[2] : rs_rt::Value{}, memberName)) {
+            memberName = ArgString(args, 2);
+        }
+        rs_rt::Value val{};
+        rs_rt::EnumValue ev{};
+        if (memberName.empty() || !ReadDotPathValue(reflectEnv, target, propPath, val) || !val.tryGetEnum(ev) || ev.typeId == 0u) {
+            return rs_rt::Value{kNotFound};
+        }
+        if (reflectEnv.programImage) {
+            if (const rs_sem::TypeSymbol* ts = reflectEnv.programImage->resolveType(ev.typeId)) {
+                for (const auto& em : ts->enumMembers) {
+                    if (em.name == memberName) {
+                        return rs_rt::Value{em.value};
+                    }
+                }
+            }
+        }
+        if (reflectEnv.aotContext) {
+            if (const rs_aot::TypeDescriptor* td = FindAotType(reflectEnv.aotContext->program(), ev.typeId)) {
+                if (td->enumMembers) {
+                    for (std::uint32_t i = 0u; i < td->enumMemberCount; ++i) {
+                        if (td->enumMembers[i].name && memberName == td->enumMembers[i].name) {
+                            return rs_rt::Value{td->enumMembers[i].value};
+                        }
+                    }
+                }
+            }
+        }
+        return rs_rt::Value{kNotFound};
+    });
     ok &= bindFn("Reflect_GetPropBool", [reflectEnv](const rs_bc::FunctionReference&, rs_rt::ValueSpan args, rs_rt::RuntimeError&) -> std::optional<rs_rt::Value> {
         const rs_rt::ObjectRef target = ArgObject(args, 0);
         std::string propPath;
@@ -1557,10 +1684,19 @@ bool RegisterVisualHostBindings(
     ok &= bindFn("Reflect_GetDirtyMask", [reflectEnv](const rs_bc::FunctionReference&, rs_rt::ValueSpan args, rs_rt::RuntimeError&) -> std::optional<rs_rt::Value> {
         const rs_rt::ObjectRef target = ArgObject(args, 0);
         if (rs_rt::ManagedHeap* heap = ResolveTargetHeap(reflectEnv, target)) {
+            rs_sem::SymbolId typeId = heap->objectTypeIdFast(target);
+            if (typeId == 0u) {
+                if (const auto tidOpt = heap->objectTypeId(target)) {
+                    typeId = *tidOpt;
+                }
+            }
+            if (typeId == 0u || !reflectEnv.domains || !reflectEnv.domains->isTypeObservable(typeId)) {
+                return rs_rt::Value{static_cast<std::int64_t>(-1)};
+            }
             const std::uint64_t mask = heap->peekDirtyMask(target);
             return rs_rt::Value{static_cast<std::int64_t>(mask)};
         }
-        return rs_rt::Value{static_cast<std::int64_t>(0)};
+        return rs_rt::Value{static_cast<std::int64_t>(-1)};
     });
     ok &= bindFn("Color_ParseRgba", [reflectEnv](const rs_bc::FunctionReference&, rs_rt::ValueSpan args, rs_rt::RuntimeError&) -> std::optional<rs_rt::Value> {
         std::string rawColor;

@@ -194,6 +194,7 @@ public class Popup : FrameworkElement {
                 AmbientResources = Parent.AmbientResources;
             }
             if (Parent != null) {
+                Parent.RegisterDetachedLogicalChild(this);
                 Parent.RemoveChild(this);
             }
             overlay.AddChild(this);
@@ -342,7 +343,9 @@ public static class ToolTipService {
     private static Popup _activeTipPopup;
 
     public static void ShowFor(UIElement target) {
-        if (target == null || target.ToolTipBox == null) { return; }
+        if (target == null || !target.HasToolTip) { return; }
+        DependencyObject tipBox = target.ToolTipBox;
+        if (tipBox == null) { return; }
         Hide();
         _activeTipPopup = new Popup();
         _activeTipPopup.PlacementTarget = target;
@@ -351,11 +354,11 @@ public static class ToolTipService {
         _activeTipPopup.IsHitTestVisible = false;
 
         ToolTip tip = null;
-        if (target.ToolTipBox is ToolTip) {
-            tip = target.ToolTipBox as ToolTip;
+        if (tipBox is ToolTip) {
+            tip = tipBox as ToolTip;
         } else {
             tip = new ToolTip();
-            tip.SetContentBox(target.ToolTipBox);
+            tip.SetContentBox(tipBox);
         }
         _activeTipPopup.Child = tip;
         _activeTipPopup.IsOpen = true;
@@ -392,7 +395,7 @@ public partial class UIElement {
         if (_toolTipHooked) { return; }
         _toolTipHooked = true;
         MouseEnter += (object s, MouseEventArgs e) => {
-            if (ToolTipBox != null) { ToolTipService.ShowFor(this); }
+            if (HasToolTip) { ToolTipService.ShowFor(this); }
         };
         MouseLeave += (object s, MouseEventArgs e) => {
             ToolTipService.Hide();
@@ -1053,6 +1056,10 @@ public class UserControl : ContentControl {
     }
     public override string GetTypeName() { return "UserControl"; }
     public override bool IsNamescopeBoundary() { return true; }
+    protected override void OnBoxAppearanceChanged() {
+        base.OnBoxAppearanceChanged();
+        UpdateInheritedForegroundForBackground(Background);
+    }
 }
 
 public class Page : ContentControl {
@@ -1063,6 +1070,10 @@ public class Page : ContentControl {
         VerticalContentAlignment = VerticalAlignment.Stretch;
     }
     public override string GetTypeName() { return "Page"; }
+    protected override void OnBoxAppearanceChanged() {
+        base.OnBoxAppearanceChanged();
+        UpdateInheritedForegroundForBackground(Background);
+    }
 }
 
 public class Window : ContentControl {
@@ -1086,6 +1097,10 @@ public class Window : ContentControl {
     }
 
     public override string GetTypeName() { return "Window"; }
+    protected override void OnBoxAppearanceChanged() {
+        base.OnBoxAppearanceChanged();
+        UpdateInheritedForegroundForBackground(Background);
+    }
 
     public void Show() {
         _isActive = true;

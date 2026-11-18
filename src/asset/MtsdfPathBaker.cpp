@@ -1498,4 +1498,147 @@ bool RasterizeSvgPathFillAlphaMask(
     return true;
 }
 
+bool RasterizeSvgPathStrokeAlphaMask(
+    std::string_view pathData,
+    const Rect& pathBounds,
+    std::uint32_t innerWidth,
+    std::uint32_t innerHeight,
+    float strokeWidthPx,
+    std::uint32_t padPx,
+    std::vector<std::uint8_t>& outRgba8) {
+    if (strokeWidthPx <= 0.0f) {
+        return false;
+    }
+    constexpr float kPi = 3.14159265358979323846f;
+    const ParsedSvgGeometry geom = ParseSvgPathGeometry(
+        pathData,
+        SvgPathTessellationOptions{24, 16, kPi / 24.0f, 6, 64});
+    if (geom.contours.empty()) {
+        return false;
+    }
+
+    const std::uint32_t innerW = std::clamp<std::uint32_t>(innerWidth, 1u, 2048u);
+    const std::uint32_t innerH = std::clamp<std::uint32_t>(innerHeight, 1u, 2048u);
+    const std::uint32_t pad = std::clamp<std::uint32_t>(padPx, 1u, 64u);
+    const std::uint32_t texW = innerW + 2u * pad;
+    const std::uint32_t texH = innerH + 2u * pad;
+    const std::size_t totalPixels = static_cast<std::size_t>(texW) * static_cast<std::size_t>(texH);
+
+    outRgba8.resize(totalPixels * 4u);
+    for (std::size_t p = 0u; p < totalPixels; ++p) {
+        const std::size_t o = p * 4u;
+        outRgba8[o + 0u] = 255u;
+        outRgba8[o + 1u] = 255u;
+        outRgba8[o + 2u] = 255u;
+        outRgba8[o + 3u] = 0u;
+    }
+
+    const float bw = (pathBounds.width > 1e-5f) ? pathBounds.width : geom.bounds.width;
+    const float bh = (pathBounds.height > 1e-5f) ? pathBounds.height : geom.bounds.height;
+    const float originX = (pathBounds.width > 1e-5f) ? pathBounds.x : geom.bounds.x;
+    const float originY = (pathBounds.height > 1e-5f) ? pathBounds.y : geom.bounds.y;
+    const float fInnerW = static_cast<float>(innerW);
+    const float fInnerH = static_cast<float>(innerH);
+    const float fPad = static_cast<float>(pad);
+    const float scaleX = (bw > 1e-5f) ? (fInnerW / bw) : 0.0f;
+    const float scaleY = (bh > 1e-5f) ? (fInnerH / bh) : 0.0f;
+
+    const float effHalfStroke = (strokeWidthPx >= 1.0f) ? (0.5f * strokeWidthPx) : 0.5f;
+    const float maxRadius = effHalfStroke + 1.0f;
+    const float maxRadiusSq = maxRadius * maxRadius;
+    std::vector<float> minDistSq(totalPixels, maxRadiusSq);
+
+    auto accumulateSegment = [&](Point a, Point b) noexcept {
+        const float abx = b.x - a.x;
+        const float aby = b.y - a.y;
+        const float lenSq = abx * abx + aby * aby;
+        const int xMin = std::clamp(
+            static_cast<int>(std::floor(std::min(a.x, b.x) - maxRadius)),
+            1,
+            static_cast<int>(texW) - 2);
+        const int xMax = std::clamp(
+            static_cast<int>(std::ceil(std::max(a.x, b.x) + maxRadius)),
+            1,
+            static_cast<int>(texW) - 2);
+        const int yMin = std::clamp(
+            static_cast<int>(std::floor(std::min(a.y, b.y) - maxRadius)),
+            1,
+            static_cast<int>(texH) - 2);
+        const int yMax = std::clamp(
+            static_cast<int>(std::ceil(std::max(a.y, b.y) + maxRadius)),
+            1,
+            static_cast<int>(texH) - 2);
+        for (int py = yMin; py <= yMax; ++py) {
+            const float cy = static_cast<float>(py) + 0.5f;
+            const std::size_t rowOff = static_cast<std::size_t>(py) * static_cast<std::size_t>(texW);
+            for (int px = xMin; px <= xMax; ++px) {
+                const float cx = static_cast<float>(px) + 0.5f;
+                const float apx = cx - a.x;
+                const float apy = cy - a.y;
+                const float t = (lenSq > 1e-10f)
+                    ? std::clamp((apx * abx + apy * aby) / lenSq, 0.0f, 1.0f)
+                    : 0.0f;
+                const float dx = cx - (a.x + t * abx);
+                const float dy = cy - (a.y + t * aby);
+                const float d2 = dx * dx + dy * dy;
+                float& dst = minDistSq[rowOff + static_cast<std::size_t>(px)];
+                if (d2 < dst) {
+                    dst = d2;
+                }
+            }
+        }
+    };
+
+    std::vector<Point> pts;
+    bool hasAnySegment = false;
+    for (const auto& contour : geom.contours) {
+        if (contour.points.size() < 2u) {
+            continue;
+        }
+        pts.clear();
+        pts.reserve(contour.points.size());
+        for (const Point& rawPt : contour.points) {
+            const float mx = (bw > 1e-5f)
+                ? ((rawPt.x - originX) * scaleX + fPad)
+                : (0.5f * fInnerW + fPad);
+            const float my = (bh > 1e-5f)
+                ? ((rawPt.y - originY) * scaleY + fPad)
+                : (0.5f * fInnerH + fPad);
+            pts.push_back(Point{mx, my});
+        }
+        for (std::size_t i = 0u; i + 1u < pts.size(); ++i) {
+            accumulateSegment(pts[i], pts[i + 1u]);
+            hasAnySegment = true;
+        }
+        if (contour.closed && pts.size() >= 2u) {
+            const float cdx = pts.back().x - pts.front().x;
+            const float cdy = pts.back().y - pts.front().y;
+            if (std::fabs(cdx) > 1e-4f || std::fabs(cdy) > 1e-4f) {
+                accumulateSegment(pts.back(), pts.front());
+                hasAnySegment = true;
+            }
+        }
+    }
+
+    if (!hasAnySegment) {
+        return true;
+    }
+
+    const float thinScale = (strokeWidthPx < 1.0f) ? std::max(0.0f, strokeWidthPx) : 1.0f;
+    for (std::size_t p = 0u; p < totalPixels; ++p) {
+        const float d2 = minDistSq[p];
+        if (d2 < maxRadiusSq) {
+            const float minDist = std::sqrt(d2);
+            const float cov = (strokeWidthPx >= 1.0f)
+                ? std::clamp(0.5f * strokeWidthPx + 0.5f - minDist, 0.0f, 1.0f)
+                : (std::clamp(1.0f - minDist, 0.0f, 1.0f) * thinScale);
+            if (cov > 0.0f) {
+                outRgba8[p * 4u + 3u] = static_cast<std::uint8_t>(std::lround(cov * 255.0f));
+            }
+        }
+    }
+
+    return true;
+}
+
 } // namespace aero

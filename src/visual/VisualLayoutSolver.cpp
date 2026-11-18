@@ -189,7 +189,8 @@ void ComputeViewboxScale(
                 node.text.fontFamily,
                 node.text.fontSize,
                 maxW,
-                node.text.wrap);
+                node.text.wrap,
+                node.text.charSpacing);
         }
         case VisualKind::Image: {
             if (node.image.uri.empty()) {
@@ -918,8 +919,31 @@ void ComputeUniformGridDims(
             const float refW = parent.layout.layoutParam0;
             const float refH = parent.layout.layoutParam1;
             const auto stretch = static_cast<Stretch>(std::clamp(parent.layout.layoutInt0, 0, 3));
-            const auto stretchDir = static_cast<StretchDirection>(std::clamp(parent.layout.layoutInt1, 0, 2));
+            const bool expandViewport = (parent.layout.layoutInt1 & 0x100) != 0;
+            const auto stretchDir = static_cast<StretchDirection>(std::clamp(parent.layout.layoutInt1 & 0xFF, 0, 2));
             const bool hasRef = std::isfinite(refW) && refW > 0.0f && std::isfinite(refH) && refH > 0.0f;
+
+            if (expandViewport && hasRef) {
+                float sx = 1.0f;
+                float sy = 1.0f;
+                ComputeViewboxScale(availW, availH, refW, refH, stretch, stretchDir, sx, sy);
+                const float childAvailW = (std::isfinite(availW) && sx > 1e-5f) ? (availW / sx) : refW;
+                const float childAvailH = (std::isfinite(availH) && sy > 1e-5f) ? (availH / sy) : refH;
+                float contentW = 0.0f;
+                float contentH = 0.0f;
+                for (VisualNodeId cid : childrenCopy) {
+                    const VisualNode* child = world.GetNode(cid);
+                    if (!child || child->layout.visibility == Visibility::Collapsed) {
+                        continue;
+                    }
+                    const Size d = MeasureNode(world, cid, Size{childAvailW, childAvailH});
+                    contentW = std::max(contentW, d.width);
+                    contentH = std::max(contentH, d.height);
+                }
+                return Size{
+                    std::isfinite(availW) ? availW : (contentW * sx),
+                    std::isfinite(availH) ? availH : (contentH * sy)};
+            }
 
             float contentW = hasRef ? refW : 0.0f;
             float contentH = hasRef ? refH : 0.0f;
@@ -1247,8 +1271,35 @@ void ArrangePanelChildren(
             const float refW = parent.layout.layoutParam0;
             const float refH = parent.layout.layoutParam1;
             const auto stretch = static_cast<Stretch>(std::clamp(parent.layout.layoutInt0, 0, 3));
-            const auto stretchDir = static_cast<StretchDirection>(std::clamp(parent.layout.layoutInt1, 0, 2));
+            const bool expandViewport = (parent.layout.layoutInt1 & 0x100) != 0;
+            const auto stretchDir = static_cast<StretchDirection>(std::clamp(parent.layout.layoutInt1 & 0xFF, 0, 2));
             const bool hasRef = std::isfinite(refW) && refW > 0.0f && std::isfinite(refH) && refH > 0.0f;
+
+            if (expandViewport && hasRef) {
+                float sx = 1.0f;
+                float sy = 1.0f;
+                ComputeViewboxScale(innerRect.width, innerRect.height, refW, refH, stretch, stretchDir, sx, sy);
+                const float arrangeW = (sx > 1e-5f) ? (innerRect.width / sx) : refW;
+                const float arrangeH = (sy > 1e-5f) ? (innerRect.height / sy) : refH;
+                for (VisualNodeId cid : childrenCopy) {
+                    const VisualNode* child = world.GetNode(cid);
+                    if (!child) continue;
+                    if (child->layout.visibility == Visibility::Collapsed) {
+                        ArrangeNode(world, cid, Rect{innerRect.x, innerRect.y, 0.0f, 0.0f}, true, 1.0f, 1.0f, 0.0f, 0.0f);
+                        continue;
+                    }
+                    ArrangeNode(
+                        world,
+                        cid,
+                        Rect{innerRect.x, innerRect.y, arrangeW, arrangeH},
+                        true,
+                        sx,
+                        sy,
+                        innerRect.x,
+                        innerRect.y);
+                }
+                break;
+            }
 
             float contentW = hasRef ? refW : 0.0f;
             float contentH = hasRef ? refH : 0.0f;
@@ -1328,8 +1379,12 @@ Size MeasureNode(VisualWorld& world, VisualNodeId id, Size availSize) {
         return customDesired;
     }
 
-    const float marginH = std::max(0.0f, node->layout.margin.left) + std::max(0.0f, node->layout.margin.right);
-    const float marginV = std::max(0.0f, node->layout.margin.top) + std::max(0.0f, node->layout.margin.bottom);
+    const float marginH =
+        (std::isfinite(node->layout.margin.left) ? node->layout.margin.left : 0.0f) +
+        (std::isfinite(node->layout.margin.right) ? node->layout.margin.right : 0.0f);
+    const float marginV =
+        (std::isfinite(node->layout.margin.top) ? node->layout.margin.top : 0.0f) +
+        (std::isfinite(node->layout.margin.bottom) ? node->layout.margin.bottom : 0.0f);
     const float padH = std::max(0.0f, node->layout.padding.left) + std::max(0.0f, node->layout.padding.right);
     const float padV = std::max(0.0f, node->layout.padding.top) + std::max(0.0f, node->layout.padding.bottom);
 
@@ -1369,8 +1424,8 @@ Size MeasureNode(VisualWorld& world, VisualNodeId id, Size availSize) {
     const float desiredBoxH = std::clamp(contentDesired.height + padV, minH, maxH);
 
     node->layout.desiredSize = Size{
-        std::isfinite(desiredBoxW) ? (desiredBoxW + marginH) : marginH,
-        std::isfinite(desiredBoxH) ? (desiredBoxH + marginV) : marginV};
+        std::max(0.0f, std::isfinite(desiredBoxW) ? (desiredBoxW + marginH) : marginH),
+        std::max(0.0f, std::isfinite(desiredBoxH) ? (desiredBoxH + marginV) : marginV)};
     node->layout.lastMeasureConstraint = availSize;
     node->layout.hasValidMeasure = true;
     node->layout.hasValidArrange = false;
@@ -1438,10 +1493,10 @@ void ArrangeNode(
         return;
     }
 
-    const float mL = std::max(0.0f, node->layout.margin.left);
-    const float mT = std::max(0.0f, node->layout.margin.top);
-    const float mR = std::max(0.0f, node->layout.margin.right);
-    const float mB = std::max(0.0f, node->layout.margin.bottom);
+    const float mL = std::isfinite(node->layout.margin.left) ? node->layout.margin.left : 0.0f;
+    const float mT = std::isfinite(node->layout.margin.top) ? node->layout.margin.top : 0.0f;
+    const float mR = std::isfinite(node->layout.margin.right) ? node->layout.margin.right : 0.0f;
+    const float mB = std::isfinite(node->layout.margin.bottom) ? node->layout.margin.bottom : 0.0f;
     const float marginH = mL + mR;
     const float marginV = mT + mB;
 

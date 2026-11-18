@@ -13,6 +13,9 @@
 #include <unordered_set>
 
 #include <realscript/aot_cpp/AotRuntime.h>
+#ifdef AERO_HAS_STENCIL_JIT
+#include <realscript/jit/StencilJit.h>
+#endif
 #include <realscript/semantic/Semantic.h>
 
 #include "aero/core/StringUtils.hpp"
@@ -34,6 +37,11 @@
 namespace aero {
 
 namespace {
+
+[[nodiscard]] bool IsAeroTraceEnabled() noexcept {
+    static const bool enabled = (std::getenv("AERO_TRACE") != nullptr);
+    return enabled;
+}
 
 [[nodiscard]] bool WritePpmP6(
     std::string_view filePath,
@@ -900,7 +908,8 @@ void AeroAppHost::RegisterAssetDirectoryInternal(std::string_view dir) {
         if (!entry.is_regular_file(ec)) {
             continue;
         }
-        if (str::EqualsIgnoreCase(entry.path().extension().string(), ".ttf")) {
+        const std::string ext = entry.path().extension().string();
+        if (str::EqualsIgnoreCase(ext, ".ttf") || str::EqualsIgnoreCase(ext, ".otf")) {
             ttfFiles.push_back(entry.path());
         }
     }
@@ -938,6 +947,12 @@ void AeroAppHost::WireKernelBridges() {
         desktopHost_.TriggerWake();
         windowHost_.WakeEventLoop();
     });
+
+    platformHooks_.requestWake = [this]() {
+        scriptWakeRequested_ = true;
+        desktopHost_.TriggerWake();
+        windowHost_.WakeEventLoop();
+    };
 
     platformHooks_.playSound = [this](std::string_view uri, float volume) {
         const float clampedVol = std::clamp(volume, 0.0f, 1.0f);
@@ -1082,6 +1097,9 @@ void AeroAppHost::ResetLoadedProgramState() noexcept {
     world_.Clear();
     desktopHost_.SetStateFlags(false, false, false, false);
 
+    domains_.clearDesktopJitInvoker();
+    uiStencilModule_.reset();
+
     if (simInterpreter_) {
         domains_.detachInterpreter(*simInterpreter_);
         simInterpreter_.reset();
@@ -1100,6 +1118,8 @@ void AeroAppHost::ResetLoadedProgramState() noexcept {
     }
     programImage_.reset();
     aotDescriptor_ = nullptr;
+    aotPrebuiltTypes_.clear();
+    aotPrebuiltFunctions_.clear();
     preferredEntryClass_.clear();
     bindings_ = std::make_shared<BindingRegistry>();
 }
@@ -1151,7 +1171,7 @@ bool AeroAppHost::LoadProgramImageInternal(
     std::shared_ptr<const ProgramImage> image,
     std::string_view entryClassOrFn,
     std::string_view preferredEntryClass) {
-    const bool trace = std::getenv("AERO_TRACE") != nullptr;
+    const bool trace = IsAeroTraceEnabled();
     auto logTrace = [&](const char* msg) {
         if (trace) {
             std::fprintf(stderr, "[AERO_TRACE] %s\n", msg);
@@ -1196,6 +1216,53 @@ bool AeroAppHost::LoadProgramImageInternal(
 
     interpreter_->setBindingRegistry(bindings_);
     simInterpreter_->setBindingRegistry(bindings_);
+
+#ifdef AERO_HAS_STENCIL_JIT
+    if (realscript::jit::StencilJit::nativeAvailable()) {
+        const realscript::jit::StencilJit jitCompiler;
+        realscript::jit::StencilJitOptions jitOpts{};
+        jitOpts.enableNativeCodegen = true;
+        jitOpts.enableThreadedFallback = false;
+        jitOpts.hotnessThreshold = 0;
+        auto compileRes = jitCompiler.compile(programImage_, jitOpts);
+        if (compileRes.succeeded() && compileRes.nativeFunctionCount > 0) {
+            auto stencilMod = compileRes.module;
+            stencilMod->setHeap(domains_.uiHeapPtr());
+            stencilMod->setBindingRegistry(bindings_);
+            uiStencilModule_ = stencilMod;
+            domains_.setDesktopJitInvoker(
+                [stencilMod, policy = domains_.executionPolicy(DomainKind::UiPresentation)](
+                    DomainKind domain,
+                    SymbolId functionId,
+                    const UnifiedValue* arguments,
+                    std::size_t argumentCount,
+                    bool& outSucceeded,
+                    UnifiedValue& outResult,
+                    rs_rt::RuntimeError& outError) -> bool {
+                    if (domain != DomainKind::UiPresentation) {
+                        return false;
+                    }
+                    if (stencilMod->functionTier(functionId) !=
+                        realscript::jit::StencilTier::NativeMachineCode) {
+                        return false;
+                    }
+                    std::vector<UnifiedValue> argVec;
+                    if (arguments != nullptr && argumentCount > 0u) {
+                        argVec.assign(arguments, arguments + argumentCount);
+                    }
+                    rs_rt::ExecutionOptions execOpts{};
+                    execOpts.limits.instructionBudget = 32'000'000u;
+                    execOpts.limits.gcWorkBudget = 0u;
+                    execOpts.executionPolicy = policy;
+                    const auto exec = stencilMod->invoke(functionId, argVec, std::move(execOpts));
+                    outSucceeded = exec.succeeded;
+                    outResult = exec.value;
+                    outError = exec.error;
+                    return true;
+                });
+        }
+    }
+#endif
 
     ResolveDispatchSymbols();
     logTrace("LoadProgramImage: bindings & symbols ready");
@@ -1362,10 +1429,31 @@ bool AeroAppHost::LoadAotProgram(
     aotDescriptor_ = descriptor;
     domains_.registerAotProgramAttributes(*aotDescriptor_);
 
+    aotPrebuiltTypes_.clear();
+    if (aotDescriptor_->types && aotDescriptor_->typeCount > 0u) {
+        aotPrebuiltTypes_.reserve(aotDescriptor_->typeCount);
+        for (std::uint32_t i = 0u; i < aotDescriptor_->typeCount; ++i) {
+            aotPrebuiltTypes_.emplace(aotDescriptor_->types[i].id, &aotDescriptor_->types[i]);
+        }
+    }
+    aotPrebuiltFunctions_.clear();
+    if (aotDescriptor_->functions && aotDescriptor_->functionCount > 0u) {
+        aotPrebuiltFunctions_.reserve(aotDescriptor_->functionCount);
+        for (std::uint32_t i = 0u; i < aotDescriptor_->functionCount; ++i) {
+            aotPrebuiltFunctions_.emplace(aotDescriptor_->functions[i].symbolId, &aotDescriptor_->functions[i]);
+        }
+    }
+
+    rs_rt::ExecutionOptions aotOpts{};
+    aotOpts.limits.instructionBudget = 32'000'000u;
+    aotOpts.limits.gcWorkBudget = 0u;
+
     aotContext_ = std::make_unique<rs_aot::ExecutionContext>(
-        *aotDescriptor_, domains_.uiHeapPtr(), bindings_);
+        *aotDescriptor_, domains_.uiHeapPtr(), bindings_, aotOpts,
+        &aotPrebuiltTypes_, &aotPrebuiltFunctions_);
     simAotContext_ = std::make_unique<rs_aot::ExecutionContext>(
-        *aotDescriptor_, domains_.simHeapPtr(), bindings_);
+        *aotDescriptor_, domains_.simHeapPtr(), bindings_, aotOpts,
+        &aotPrebuiltTypes_, &aotPrebuiltFunctions_);
     domains_.attachAotContext(*aotContext_, DomainKind::UiPresentation);
     domains_.attachAotContext(*simAotContext_, DomainKind::SimDeterministic);
 
@@ -1414,7 +1502,7 @@ bool AeroAppHost::InvokeSymbol(
         if (!targetInterp) {
             return false;
         }
-        if (std::getenv("AERO_TRACE") != nullptr) {
+        if (IsAeroTraceEnabled()) {
             std::fprintf(stderr, "[AERO_TRACE] InvokeSymbol: bytecode sym=%llu args=%zu\n",
                 static_cast<unsigned long long>(fnId), args.size());
             std::fflush(stderr);
@@ -1422,8 +1510,8 @@ bool AeroAppHost::InvokeSymbol(
         rs_rt::ExecutionOptions execOpts{};
         execOpts.limits.instructionBudget = 32'000'000u;
         execOpts.limits.gcWorkBudget = 0u;
-        const auto exec = targetInterp->invoke(fnId, args, execOpts);
-        if (std::getenv("AERO_TRACE") != nullptr) {
+        const auto exec = domains_.invokeMethod(domain, targetInterp, fnId, args, execOpts);
+        if (IsAeroTraceEnabled()) {
             std::fprintf(stderr, "[AERO_TRACE] InvokeSymbol: returned ok=%d err=%s\n",
                 exec.succeeded ? 1 : 0, exec.error.message.c_str());
             for (const auto& st : exec.error.stackTrace) {
@@ -1460,7 +1548,7 @@ bool AeroAppHost::InvokeSymbol(
 }
 
 bool AeroAppHost::InstantiateAndMountEntry(std::string_view entryHint) {
-    const bool trace = std::getenv("AERO_TRACE") != nullptr;
+    const bool trace = IsAeroTraceEnabled();
     if (trace) {
         std::fprintf(stderr, "[AERO_TRACE] InstantiateAndMountEntry(entryHint='%.*s')\n",
             static_cast<int>(entryHint.size()), entryHint.data());
@@ -1934,7 +2022,7 @@ bool AeroAppHost::MountScriptRootObject(ObjectRef candidate) {
         }
     }
 
-    const bool trace = std::getenv("AERO_TRACE") != nullptr;
+    const bool trace = IsAeroTraceEnabled();
     auto logTrace = [&](const char* msg) {
         if (trace) {
             std::fprintf(stderr, "[AERO_TRACE] %s\n", msg);
@@ -2111,7 +2199,7 @@ bool AeroAppHost::HandleScriptInputEvent(
             }
             bool handled = false;
             const bool gotBool = res.tryGetBool(handled);
-            if (std::getenv("AERO_TRACE") != nullptr) {
+            if (IsAeroTraceEnabled()) {
                 std::fprintf(stderr, "[AERO_TRACE] DispatchPointer node=%u flag=%u pos=(%.1f,%.1f) owner=%d handled=%d (gotBool=%d)\n",
                     nodeId.index, static_cast<unsigned>(flag), ev.x, ev.y,
                     node->hasScriptOwner ? 1 : 0, handled ? 1 : 0, gotBool ? 1 : 0);
@@ -2135,7 +2223,7 @@ bool AeroAppHost::HandleScriptInputEvent(
             }
             bool handled = false;
             const bool gotBool = res.tryGetBool(handled);
-            if (std::getenv("AERO_TRACE") != nullptr) {
+            if (IsAeroTraceEnabled()) {
                 std::fprintf(stderr, "[AERO_TRACE] DispatchPointer node=%u flag=%u pos=(%.1f,%.1f) owner=%d handled=%d (gotBool=%d)\n",
                     nodeId.index, static_cast<unsigned>(flag), ev.x, ev.y,
                     node->hasScriptOwner ? 1 : 0, handled ? 1 : 0, gotBool ? 1 : 0);
@@ -2157,7 +2245,7 @@ bool AeroAppHost::HandleScriptInputEvent(
             }
             bool handled = false;
             const bool gotBool = res.tryGetBool(handled);
-            if (std::getenv("AERO_TRACE") != nullptr) {
+            if (IsAeroTraceEnabled()) {
                 std::fprintf(stderr, "[AERO_TRACE] DispatchPointer node=%u flag=%u pos=(%.1f,%.1f) owner=%d handled=%d (gotBool=%d)\n",
                     nodeId.index, static_cast<unsigned>(flag), ev.x, ev.y,
                     node->hasScriptOwner ? 1 : 0, handled ? 1 : 0, gotBool ? 1 : 0);
@@ -2311,7 +2399,7 @@ void AeroAppHost::StepFrame(float dtSeconds, bool forceRenderSync) {
     if (!initialized_) {
         return;
     }
-    const bool trace = std::getenv("AERO_TRACE") != nullptr;
+    const bool trace = IsAeroTraceEnabled();
     auto logTrace = [&](const char* msg) {
         if (trace) {
             std::fprintf(stderr, "[AERO_TRACE] StepFrame: %s\n", msg);
@@ -2686,7 +2774,10 @@ std::uint64_t AeroAppHost::RunWindowedLoop(std::uint64_t maxFrames) {
         if (maxFrames > 0u && frames >= maxFrames) {
             break;
         }
-        const bool idleAllowed = desktopHost_.CanSleepIdle() && !static_cast<bool>(simTickCallback_);
+        const bool wakeBeforePump = scriptWakeRequested_;
+        scriptWakeRequested_ = false;
+        const bool idleAllowed =
+            desktopHost_.CanSleepIdle() && !static_cast<bool>(simTickCallback_) && !wakeBeforePump;
         const std::int32_t waitMs = idleAllowed
             ? (maxFrames > 0u ? 0 : -1)
             : 16;
@@ -2721,6 +2812,8 @@ std::uint64_t AeroAppHost::RunWindowedLoop(std::uint64_t maxFrames) {
             followUpDirty = true;
         }
         if (followUpDirty ||
+            wakeBeforePump ||
+            scriptWakeRequested_ ||
             (windowHost_.Telemetry().osEventsTranslated != prevOsEvents) ||
             world_.HasAnyDirty() ||
             animEngine_.HasActiveAnimations()) {

@@ -187,12 +187,20 @@ void main() {
                 dot(u_MaskMatRow1.xyz, vec3(v_PhysPos, 1.0)));
             float normU = (localPt.x - u_MaskMatRow0.w) / max(1e-4, u_MaskSizeGrad.x);
             float normV = (localPt.y - u_MaskMatRow1.w) / max(1e-4, u_MaskSizeGrad.y);
-            vec2 samplePos = (u_MaskSizeGrad.z > 0.5)
+            bool isRadialMask = (u_MaskSizeGrad.z >= 1.5);
+            float absMapping = isRadialMask ? (u_MaskSizeGrad.z - 2.0) : u_MaskSizeGrad.z;
+            vec2 samplePos = (absMapping > 0.5)
                 ? vec2(normU * u_MaskSizeGrad.x, normV * u_MaskSizeGrad.y)
                 : vec2(normU, normV);
-            vec2 d = u_MaskGradPts.zw - u_MaskGradPts.xy;
-            float lenSq = dot(d, d);
-            float rawT = (lenSq > 1e-8) ? dot(samplePos - u_MaskGradPts.xy, d) / lenSq : 0.0;
+            float rawT = 0.0;
+            if (isRadialMask) {
+                vec2 rel = (samplePos - u_MaskGradPts.xy) / max(u_MaskGradPts.zw, vec2(1e-5));
+                rawT = length(rel);
+            } else {
+                vec2 d = u_MaskGradPts.zw - u_MaskGradPts.xy;
+                float lenSq = dot(d, d);
+                rawT = (lenSq > 1e-8) ? dot(samplePos - u_MaskGradPts.xy, d) / lenSq : 0.0;
+            }
             float t01 = clamp(rawT, 0.0, 1.0);
             if (u_MaskSizeGrad.w > 1.5) {
                 t01 = clamp(rawT - floor(rawT), 0.0, 1.0);
@@ -1242,7 +1250,9 @@ bool OpenGlDeviceBackend::LoadDynamicGlEntryPoints() {
     lookupSession.glHandle = dynGlLibHandle_;
     lookupSession.eglHandle = dynEglLibHandle_;
     lookupSession.glesHandle = dynGlesLibHandle_;
+#if defined(_WIN32)
     lookupSession.wglGetProc = session.wglGetProc;
+#endif
 #if defined(__linux__) && !defined(__EMSCRIPTEN__)
     lookupSession.glxGetProc = session.glxGetProc;
     lookupSession.eglGetProc = session.eglGetProc;
@@ -2583,7 +2593,10 @@ GpuBackendFrameStats OpenGlDeviceBackend::ExecuteSubmission(
                     (tree.ResourceStore() != nullptr &&
                      tree.ResourceStore()->GradientBrushes().TryGetBrush(span.opacityMaskGradId, maskGrad)) ||
                     GradientBrushRegistry::Instance().TryGetBrush(span.opacityMaskGradId, maskGrad);
-                if (!found || maskGrad.kind != GradientBrushKind::Linear || maskGrad.stops.empty() ||
+                const bool supportedKind =
+                    (maskGrad.kind == GradientBrushKind::Linear ||
+                     maskGrad.kind == GradientBrushKind::Radial);
+                if (!found || !supportedKind || maskGrad.stops.empty() ||
                     maskGrad.stops.size() > 4u) {
                     return false;
                 }
@@ -2838,20 +2851,32 @@ GpuBackendFrameStats OpenGlDeviceBackend::ExecuteSubmission(
                                 span.opacityMaskLocalRect.y);
                         }
                         if (uEffectMaskSizeGradLoc_ >= 0 && gl_.Uniform4f) {
+                            const float modeVal =
+                                ((maskGrad.mappingMode == BrushMappingMode::Absolute) ? 1.0f : 0.0f) +
+                                ((maskGrad.kind == GradientBrushKind::Radial) ? 2.0f : 0.0f);
                             gl_.Uniform4f(
                                 uEffectMaskSizeGradLoc_,
                                 std::max(1e-4f, span.opacityMaskLocalRect.width),
                                 std::max(1e-4f, span.opacityMaskLocalRect.height),
-                                (maskGrad.mappingMode == BrushMappingMode::Absolute) ? 1.0f : 0.0f,
+                                modeVal,
                                 static_cast<float>(static_cast<int>(maskGrad.spreadMethod)));
                         }
                         if (uEffectMaskGradPtsLoc_ >= 0 && gl_.Uniform4f) {
-                            gl_.Uniform4f(
-                                uEffectMaskGradPtsLoc_,
-                                maskGrad.startPoint.x,
-                                maskGrad.startPoint.y,
-                                maskGrad.endPoint.x,
-                                maskGrad.endPoint.y);
+                            if (maskGrad.kind == GradientBrushKind::Radial) {
+                                gl_.Uniform4f(
+                                    uEffectMaskGradPtsLoc_,
+                                    maskGrad.center.x,
+                                    maskGrad.center.y,
+                                    std::max(1e-5f, std::fabs(maskGrad.radiusX)),
+                                    std::max(1e-5f, std::fabs(maskGrad.radiusY)));
+                            } else {
+                                gl_.Uniform4f(
+                                    uEffectMaskGradPtsLoc_,
+                                    maskGrad.startPoint.x,
+                                    maskGrad.startPoint.y,
+                                    maskGrad.endPoint.x,
+                                    maskGrad.endPoint.y);
+                            }
                         }
                         float offs[4]{0.0f, 1.0f, 1.0f, 1.0f};
                         float alphas[4]{1.0f, 1.0f, 1.0f, 1.0f};

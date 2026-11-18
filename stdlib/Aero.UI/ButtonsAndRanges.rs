@@ -172,7 +172,6 @@ public class Button : ButtonBase {
 
     public Button() : base() {
         Background = new SolidColorBrush("#FF242B38");
-        Foreground = new SolidColorBrush("#FFF1F5F9");
         BorderBrush = new SolidColorBrush("#FF3B465C");
         BorderThickness = new Thickness(1.0f);
         CornerRadius = new CornerRadius(6.0f);

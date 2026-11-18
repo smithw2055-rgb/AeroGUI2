@@ -472,6 +472,10 @@ public class Image : FrameworkElement {
 public class Shape : FrameworkElement {
     private Brush _fill;
     private Brush _stroke;
+    private float _fillOpacity = 1.0f;
+    private float _strokeOpacity = 1.0f;
+    private bool _ownsClonedFill = false;
+    private bool _ownsClonedStroke = false;
     private float _strokeThickness = 1.0f;
     private Stretch _stretch = Stretch.Fill;
     private float _trimStart = 0.0f;
@@ -482,11 +486,23 @@ public class Shape : FrameworkElement {
 
     public Brush Fill {
         get { return _fill; }
-        set { _fill = value; SyncVectorShape(); }
+        set {
+            _fill = value;
+            _ownsClonedFill = false;
+            _fillOpacity = value != null ? Math.Clampf(value.Opacity, 0.0f, 1.0f) : 1.0f;
+            SyncVectorShape();
+            SyncVectorBrushOpacity();
+        }
     }
     public Brush Stroke {
         get { return _stroke; }
-        set { _stroke = value; SyncVectorShape(); }
+        set {
+            _stroke = value;
+            _ownsClonedStroke = false;
+            _strokeOpacity = value != null ? Math.Clampf(value.Opacity, 0.0f, 1.0f) : 1.0f;
+            SyncVectorShape();
+            SyncVectorBrushOpacity();
+        }
     }
     public float StrokeThickness {
         get { return _strokeThickness; }
@@ -508,12 +524,17 @@ public class Shape : FrameworkElement {
     protected virtual VectorShapeKind GetVectorKind() { return VectorShapeKind.SvgPath; }
     protected virtual string BuildVectorGeometrySpec() { return ""; }
 
+    public void SyncVectorBrushOpacity() {
+        if (!ParseUtil.IsValidHandle(__nativeHandle)) { return; }
+        Visual_SetVectorBrushOpacity(__nativeHandle, _fillOpacity, _strokeOpacity);
+    }
+
     public void SyncVectorShape() {
         if (!ParseUtil.IsValidHandle(__nativeHandle)) { return; }
-        uint fillCol = _fill != null ? _fill.ResolveRgba() : 0u;
-        int fillGrad = _fill != null ? _fill.ResolveGradId() : -1;
-        uint strokeCol = _stroke != null ? _stroke.ResolveRgba() : 0u;
-        int strokeGrad = _stroke != null ? _stroke.ResolveGradId() : -1;
+        uint fillCol = _fill != null ? _fill.ResolveRgbaUnscaled() : 0u;
+        int fillGrad = _fill != null ? _fill.ResolveGradIdUnscaled() : -1;
+        uint strokeCol = _stroke != null ? _stroke.ResolveRgbaUnscaled() : 0u;
+        int strokeGrad = _stroke != null ? _stroke.ResolveGradIdUnscaled() : -1;
         Visual_SetVectorShape(
             __nativeHandle,
             EnumConvert.ToInt(GetVectorKind()),
@@ -526,8 +547,62 @@ public class Shape : FrameworkElement {
     }
 
     public override bool SetPropertyValue(string propName, DependencyObject value) {
-        if (propName == "Fill" || propName == "Fill.Color") { Fill = UIElement.CoerceBrush(value); return true; }
-        if (propName == "Stroke" || propName == "Stroke.Color") { Stroke = UIElement.CoerceBrush(value); return true; }
+        if (propName == "Fill") { Fill = UIElement.CoerceBrush(value); return true; }
+        if (propName == "Stroke") { Stroke = UIElement.CoerceBrush(value); return true; }
+        if (propName == "Fill.Opacity") {
+            _fillOpacity = Math.Clampf(DependencyObject.UnboxFloat(value, 1.0f), 0.0f, 1.0f);
+            SyncVectorBrushOpacity();
+            return true;
+        }
+        if (propName == "Stroke.Opacity") {
+            _strokeOpacity = Math.Clampf(DependencyObject.UnboxFloat(value, 1.0f), 0.0f, 1.0f);
+            SyncVectorBrushOpacity();
+            return true;
+        }
+        if (propName == "Fill.Color") {
+            Brush b = UIElement.CoerceBrush(value);
+            if (b != null) { b.Opacity = _fillOpacity; }
+            _fill = b;
+            _ownsClonedFill = false;
+            SyncVectorShape();
+            return true;
+        }
+        if (propName == "Stroke.Color") {
+            Brush b = UIElement.CoerceBrush(value);
+            if (b != null) { b.Opacity = _strokeOpacity; }
+            _stroke = b;
+            _ownsClonedStroke = false;
+            SyncVectorShape();
+            return true;
+        }
+        if (propName.Length > 5 && propName.Substring(0, 5) == "Fill.") {
+            string suffix = propName.Substring(5);
+            if (_fill is GradientBrush && GradientBrush.ParseStopSlotIndex(suffix) >= 0) {
+                GradientBrush gb = _fill as GradientBrush;
+                if (!_ownsClonedFill) {
+                    gb = gb.CloneBrush();
+                    _fill = gb;
+                    _ownsClonedFill = true;
+                }
+                gb.TryApplyStopProperty(suffix, value);
+                SyncVectorShape();
+                return true;
+            }
+        }
+        if (propName.Length > 7 && propName.Substring(0, 7) == "Stroke.") {
+            string suffix = propName.Substring(7);
+            if (_stroke is GradientBrush && GradientBrush.ParseStopSlotIndex(suffix) >= 0) {
+                GradientBrush gb = _stroke as GradientBrush;
+                if (!_ownsClonedStroke) {
+                    gb = gb.CloneBrush();
+                    _stroke = gb;
+                    _ownsClonedStroke = true;
+                }
+                gb.TryApplyStopProperty(suffix, value);
+                SyncVectorShape();
+                return true;
+            }
+        }
         if (propName == "StrokeThickness") { StrokeThickness = DependencyObject.UnboxFloat(value, 1.0f); return true; }
         if (propName == "Stretch") {
             if (value is BoxedInt) { Stretch = EnumConvert.ToStretch((value as BoxedInt).Value); return true; }
@@ -545,12 +620,22 @@ public class Shape : FrameworkElement {
 
     public override DependencyObject GetPropertyValue(string propName) {
         if (propName == "Fill") { return _fill; }
+        if (propName == "Fill.Opacity") { return DependencyObject.BoxFloat(_fillOpacity); }
         if (propName == "Fill.Color") {
-            return DependencyObject.BoxString(_fill != null ? ParseUtil.FormatArgbHex(_fill.ResolveRgba()) : "#00000000");
+            return DependencyObject.BoxString(_fill != null ? ParseUtil.FormatArgbHex(_fill.ResolveRgbaUnscaled()) : "#00000000");
         }
         if (propName == "Stroke") { return _stroke; }
+        if (propName == "Stroke.Opacity") { return DependencyObject.BoxFloat(_strokeOpacity); }
         if (propName == "Stroke.Color") {
-            return DependencyObject.BoxString(_stroke != null ? ParseUtil.FormatArgbHex(_stroke.ResolveRgba()) : "#00000000");
+            return DependencyObject.BoxString(_stroke != null ? ParseUtil.FormatArgbHex(_stroke.ResolveRgbaUnscaled()) : "#00000000");
+        }
+        if (propName.Length > 5 && propName.Substring(0, 5) == "Fill." && _fill is GradientBrush) {
+            DependencyObject stopBox = (_fill as GradientBrush).TryReadStopProperty(propName.Substring(5));
+            if (stopBox != null) { return stopBox; }
+        }
+        if (propName.Length > 7 && propName.Substring(0, 7) == "Stroke." && _stroke is GradientBrush) {
+            DependencyObject stopBox = (_stroke as GradientBrush).TryReadStopProperty(propName.Substring(7));
+            if (stopBox != null) { return stopBox; }
         }
         if (propName == "StrokeThickness") { return DependencyObject.BoxFloat(_strokeThickness); }
         if (propName == "Stretch") { return DependencyObject.BoxInt(EnumConvert.ToInt(_stretch)); }
@@ -574,20 +659,22 @@ public class Rectangle : Shape {
         set { _radiusY = value >= 0.0f ? value : 0.0f; SyncVectorShape(); }
     }
 
+    protected override VectorShapeKind GetVectorKind() { return VectorShapeKind.Rectangle; }
+
     protected override string BuildVectorGeometrySpec() {
-        if (_radiusX <= 0.001f && _radiusY <= 0.001f) {
-            return "M 0,0 H 100 V 100 H 0 Z";
-        }
-        float rx = Math.Clampf(_radiusX, 0.0f, 50.0f);
-        float ry = Math.Clampf(_radiusY > 0.0f ? _radiusY : _radiusX, 0.0f, 50.0f);
-        return "M " + rx + ",0 H " + (100.0f - rx)
-             + " Q 100,0 100," + ry
-             + " V " + (100.0f - ry)
-             + " Q 100,100 " + (100.0f - rx) + ",100"
-             + " H " + rx
-             + " Q 0,100 0," + (100.0f - ry)
-             + " V " + ry
-             + " Q 0,0 " + rx + ",0 Z";
+        return "" + _radiusX + "," + _radiusY;
+    }
+
+    public override bool SetPropertyValue(string propName, DependencyObject value) {
+        if (propName == "RadiusX") { RadiusX = DependencyObject.UnboxFloat(value, 0.0f); return true; }
+        if (propName == "RadiusY") { RadiusY = DependencyObject.UnboxFloat(value, 0.0f); return true; }
+        return base.SetPropertyValue(propName, value);
+    }
+
+    public override DependencyObject GetPropertyValue(string propName) {
+        if (propName == "RadiusX") { return DependencyObject.BoxFloat(_radiusX); }
+        if (propName == "RadiusY") { return DependencyObject.BoxFloat(_radiusY); }
+        return base.GetPropertyValue(propName);
     }
 }
 

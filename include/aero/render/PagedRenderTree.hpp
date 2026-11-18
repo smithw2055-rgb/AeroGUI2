@@ -635,7 +635,8 @@ private:
         std::string_view fontFamily,
         float fontSize,
         float maxWidth,
-        TextWrapping wrapMode) const;
+        TextWrapping wrapMode,
+        float charSpacing = 0.0f) const;
     void RegisterMtsdfInTreeAtlas(const AxbMtsdfPathEntry& entry);
     std::uint32_t EnsurePageForAllocation(
         std::uint32_t neededVertices,
@@ -669,7 +670,8 @@ private:
         TextWrapping wrapMode = TextWrapping::NoWrap,
         TextAlignment textAlign = TextAlignment::Left,
         float alignBoxWidth = 0.0f,
-        const std::vector<RichGlyphStyle>* optRichStyles = nullptr);
+        const std::vector<RichGlyphStyle>* optRichStyles = nullptr,
+        float charSpacing = 0.0f);
     friend class VisualRenderAdapter;
 
     std::uint32_t treeId_ = 1u;

@@ -73,6 +73,14 @@ public partial class MainWindow : Page
         this.ViewModel = new ViewModel();
         this.DataContext = this.ViewModel;
         BindingEngine.Flush();
+        this.Loaded += (object s, RoutedEventArgs e) =>
+        {
+            UIElement startBtn = this.FindName("StartButton");
+            if (startBtn != null)
+            {
+                startBtn.Focus();
+            }
+        };
     }
 
     public void OnInitialized()

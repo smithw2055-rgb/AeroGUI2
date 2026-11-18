@@ -188,7 +188,8 @@ void main() {
             float softShadowPad   = float((payload27 >> 16u) & 0x7FFu) * 0.5;
             vec2 boxHalf = (softShadowPad > 0.0) ? max(vec2(0.5), halfSize - vec2(softShadowPad)) : halfSize;
             float dist = sdRoundedBox(v_UvOrLocalPos, boxHalf, cornerRadius);
-            float aa = max(max(fwidth(dist) * 0.75, softShadowPad * 0.8), 1e-4);
+            float softBlur = (softShadowPad > 1.05) ? (softShadowPad * 0.8) : 0.0;
+            float aa = max(max(fwidth(dist) * 0.75, softBlur), 1e-4);
             float outerCoverage = smoothstep(aa, -aa, dist);
             float outA = v_Color.a * outerCoverage;
             if (borderThickness > 0.0) {
@@ -362,8 +363,12 @@ void main() {
                 : 0.0;
             cov = clamp(outerCov - innerCov, 0.0, 1.0);
         }
-        float outA = v_Color.a * cov;
-        o_FragColor = vec4(v_Color.rgb * outA, outA);
+        uint brushId = (v_Flags >> 17u) & 0x0FFFu;
+        vec2 quadSize = max(halfSize * 2.0, vec2(1e-4));
+        vec2 normUv = v_UvOrLocalPos / quadSize + vec2(0.5);
+        vec4 gradSample = (brushId > 0u) ? sampleAtlasGradientBrush(brushId, normUv, quadSize) : vec4(1.0);
+        float outA = gradSample.a * v_Color.a * cov;
+        o_FragColor = vec4(gradSample.rgb * v_Color.rgb * outA, outA);
         return;
     }
 
@@ -750,8 +755,15 @@ fn fs_main(in : VertexOut) -> @location(0) vec4<f32> {
             }
             cov = clamp(outerCov - innerCov, 0.0, 1.0);
         }
-        let outA = in.color.a * cov;
-        return vec4<f32>(in.color.rgb * outA, outA);
+        let brushId = (in.flags >> 17u) & 0x0FFFu;
+        var gradSample = vec4<f32>(1.0, 1.0, 1.0, 1.0);
+        if (brushId > 0u) {
+            let quadSize = max(halfSize * 2.0, vec2<f32>(1e-4, 1e-4));
+            let normUv = in.uvOrLocal / quadSize + vec2<f32>(0.5, 0.5);
+            gradSample = sampleAtlasGradientBrush(brushId, normUv, quadSize);
+        }
+        let outA = gradSample.a * in.color.a * cov;
+        return vec4<f32>(gradSample.rgb * in.color.rgb * outA, outA);
     }
     if (in.primType == 8u) {
         let halfSize = max(abs(u_Globals.quadHalfExtent), in.quadHalfSize);

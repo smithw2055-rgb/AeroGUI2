@@ -127,7 +127,17 @@ public class ResourceDictionary : DependencyObject {
 
     public ResourceDictionary() {
         _map = new Dictionary<string, DependencyObject>();
+        _keyIndex = new Dictionary<string, int>();
         _keys = new string[0];
+        _vals = new DependencyObject[0];
+    }
+
+    private Dictionary<string, int> _keyIndex;
+    private DependencyObject[] _vals;
+
+    private int FindFallbackKeyIndex(string key) {
+        if (key == null || _keyIndex == null) { return -1; }
+        return _keyIndex.GetOrDefault(key, -1);
     }
 
     public static ResourceDictionary GlobalApplicationResources() {
@@ -144,8 +154,13 @@ public class ResourceDictionary : DependencyObject {
 
     public void SetBox(string key, DependencyObject box) {
         if (key == null || key.Length == 0) { return; }
-        if (!_map.ContainsKey(key)) {
+        int fbIdx = _keyIndex.GetOrDefault(key, -1);
+        if (fbIdx < 0) {
+            _keyIndex[key] = _keys.Length;
             _keys.Push(key);
+            _vals.Push(box);
+        } else {
+            _vals[fbIdx] = box;
         }
         _map[key] = box;
         if (box is Style || DependencyObject.Unbox(box) is Style) {
@@ -165,6 +180,8 @@ public class ResourceDictionary : DependencyObject {
     public DependencyObject GetBox(string key) {
         if (key == null) { return null; }
         if (_map.ContainsKey(key)) { return _map[key]; }
+        int fbIdx = _keyIndex.GetOrDefault(key, -1);
+        if (fbIdx >= 0 && fbIdx < _vals.Length) { return _vals[fbIdx]; }
         ResourceDictionary appRes = GlobalApplicationResources();
         if (this != appRes && appRes != null && appRes.Contains(key)) {
             return appRes.GetBox(key);
@@ -178,20 +195,30 @@ public class ResourceDictionary : DependencyObject {
 
     public bool Contains(string key) {
         if (key == null) { return false; }
-        return _map.ContainsKey(key);
+        if (_map.ContainsKey(key)) { return true; }
+        return _keyIndex.ContainsKey(key);
     }
 
     public bool Remove(string key) {
-        if (key == null || !_map.ContainsKey(key)) { return false; }
+        if (key == null || !Contains(key)) { return false; }
         _map.Remove(key);
-        int idx = _keys.IndexOf(key);
-        if (idx >= 0) { _keys.RemoveAt(idx); }
+        int idx = _keyIndex.GetOrDefault(key, -1);
+        _keyIndex.Remove(key);
+        if (idx >= 0) {
+            _keys.RemoveAt(idx);
+            _vals.RemoveAt(idx);
+            for (int i = idx; i < _keys.Length; i += 1) {
+                _keyIndex[_keys[i]] = i;
+            }
+        }
         return true;
     }
 
     public void Clear() {
         _map.Clear();
+        _keyIndex.Clear();
         _keys.Clear();
+        _vals.Clear();
     }
 
     public string[] Keys() { return _keys; }
@@ -320,6 +347,8 @@ public class TriggerBase : DependencyObject {
     private Setter[] _setters;
     private Storyboard[] _enterActions;
     private Storyboard[] _exitActions;
+    private string[] _enterActionKeys;
+    private string[] _exitActionKeys;
     private UIElement[] _activeTargets;
     private UIElement[] _savedOwners;
     private UIElement[] _savedDests;
@@ -334,6 +363,8 @@ public class TriggerBase : DependencyObject {
         _setters = new Setter[0];
         _enterActions = new Storyboard[0];
         _exitActions = new Storyboard[0];
+        _enterActionKeys = new string[0];
+        _exitActionKeys = new string[0];
         _activeTargets = new UIElement[0];
         _savedOwners = new UIElement[0];
         _savedDests = new UIElement[0];
@@ -397,6 +428,8 @@ public class TriggerBase : DependencyObject {
     }
     public void AddEnterAction(Storyboard sb) { if (sb != null) { _enterActions.Push(sb); } }
     public void AddExitAction(Storyboard sb) { if (sb != null) { _exitActions.Push(sb); } }
+    public void AddEnterActionKey(string key) { if (key != null && key.Length > 0) { _enterActionKeys.Push(key); } }
+    public void AddExitActionKey(string key) { if (key != null && key.Length > 0) { _exitActionKeys.Push(key); } }
 
     public virtual void Attach(UIElement target) {}
 
@@ -442,6 +475,11 @@ public class TriggerBase : DependencyObject {
             for (int i = 0; i < _exitActions.Length; i += 1) {
                 _exitActions[i].Begin(target);
             }
+            if (_exitActionKeys != null) {
+                for (int i = 0; i < _exitActionKeys.Length; i += 1) {
+                    target.BeginStoryboard(_exitActionKeys[i]);
+                }
+            }
         }
     }
 
@@ -473,8 +511,18 @@ public class TriggerBase : DependencyObject {
             s.ApplyTo(target);
         }
         if (!wasActive) {
-            for (int i = 0; i < _enterActions.Length; i += 1) {
-                _enterActions[i].Begin(target);
+            RunEnterActions(target);
+        }
+    }
+
+    protected void RunEnterActions(UIElement target) {
+        if (target == null) { return; }
+        for (int i = 0; i < _enterActions.Length; i += 1) {
+            _enterActions[i].Begin(target);
+        }
+        if (_enterActionKeys != null) {
+            for (int i = 0; i < _enterActionKeys.Length; i += 1) {
+                target.BeginStoryboard(_enterActionKeys[i]);
             }
         }
     }
@@ -546,6 +594,8 @@ public class Trigger : TriggerBase {
     public void SetValue(int v) { _valueBox = DependencyObject.BoxInt(v); }
     public void SetValue(float v) { _valueBox = DependencyObject.BoxFloat(v); }
 
+    public override void Attach(UIElement target) {}
+
     public override bool IsMatched(UIElement target) {
         if (target == null || Property.Length == 0) { return false; }
         UIElement src = SourceName.Length > 0 ? target.FindName(SourceName) : target;
@@ -574,6 +624,9 @@ public class Trigger : TriggerBase {
 
 public class DataTrigger : TriggerBase {
     private DependencyObject _valueBox;
+    private static DataTrigger[] _reactiveTriggers;
+    private static UIElement[] _reactiveTargets;
+    private static bool _reactiveHookInstalled = false;
     public string BindingPath { get; set; } = "";
     public string RelativeSourceMode { get; set; } = "";
     public string RelativeSourceAncestorType { get; set; } = "";
@@ -615,6 +668,54 @@ public class DataTrigger : TriggerBase {
     public object Value {
         get { return DependencyObject.Unbox(_valueBox); }
         set { _valueBox = DependencyObject.BoxObject(value); }
+    }
+
+    public override void Attach(UIElement target) {
+        if (target == null) { return; }
+        if (RelativeSourceMode.Length == 0 || RelativeSourceMode == "DataContext") {
+            RegisterReactive(this, target);
+        }
+    }
+
+    private static void RegisterReactive(DataTrigger dt, UIElement target) {
+        if (dt == null || target == null) { return; }
+        if (_reactiveTriggers == null) {
+            _reactiveTriggers = new DataTrigger[0];
+            _reactiveTargets = new UIElement[0];
+        }
+        if (!_reactiveHookInstalled) {
+            _reactiveHookInstalled = true;
+            BindingEngine.AddPreFlushHook(() => { DataTrigger.FlushReactive(); });
+        }
+        for (int i = 0; i < _reactiveTriggers.Length; i += 1) {
+            if (_reactiveTriggers[i] == dt && _reactiveTargets[i] == target) { return; }
+        }
+        _reactiveTriggers.Push(dt);
+        _reactiveTargets.Push(target);
+    }
+
+    public static void FlushReactive() {
+        if (_reactiveTriggers == null || _reactiveTargets == null) { return; }
+        int write = 0;
+        for (int i = 0; i < _reactiveTriggers.Length; i += 1) {
+            UIElement t = _reactiveTargets[i];
+            if (t == null || t._isDisposedTree) { continue; }
+            if (write != i) {
+                _reactiveTriggers[write] = _reactiveTriggers[i];
+                _reactiveTargets[write] = t;
+            }
+            write += 1;
+        }
+        while (_reactiveTriggers.Length > write) {
+            _reactiveTriggers.RemoveAt(_reactiveTriggers.Length - 1);
+            _reactiveTargets.RemoveAt(_reactiveTargets.Length - 1);
+        }
+        for (int i = 0; i < _reactiveTriggers.Length; i += 1) {
+            _reactiveTriggers[i].DeactivateIfUnmatched(_reactiveTargets[i], null);
+        }
+        for (int i = 0; i < _reactiveTriggers.Length; i += 1) {
+            _reactiveTriggers[i].ApplyIfMatched(_reactiveTargets[i], null);
+        }
     }
 
     public override bool IsMatched(UIElement target) {
@@ -716,6 +817,8 @@ public class MultiDataTrigger : TriggerBase {
         _conditions.Push(new TriggerCondition(bindingPath, valueBox, elementName, relMode, ancestorType));
     }
 
+    public TriggerCondition[] Conditions() { return _conditions; }
+
     private bool HasHooked(UIElement target, UIElement src) {
         for (int i = 0; i < _hookedTargets.Length; i += 1) {
             if (_hookedTargets[i] == target && _hookedSources[i] == src) { return true; }
@@ -792,8 +895,12 @@ public class EventTrigger : TriggerBase {
         }
     }
 
+    public void AddAction(Storyboard sb) { AddEnterAction(sb); }
+    public void AddActionKey(string key) { AddEnterActionKey(key); }
+
     public void RunActions(UIElement target) {
         if (_storyboard != null) { _storyboard.Begin(target); }
+        RunEnterActions(target);
     }
 }
 
@@ -1050,13 +1157,63 @@ public class DataTemplate : DependencyObject {
         return root;
     }
 
+    public static void HookTemplateAncestors(TriggerBase[] list, UIElement root, UIElement[] hookedAncestors) {
+        if (list == null || root == null || hookedAncestors == null) { return; }
+        for (int i = 0; i < list.Length; i += 1) {
+            if (list[i] is DataTrigger) {
+                DataTrigger dt = list[i] as DataTrigger;
+                if (dt.RelativeSourceAncestorType.Length > 0) {
+                    UIElement anc = root;
+                    while (anc != null && anc.GetTypeName() != dt.RelativeSourceAncestorType) {
+                        anc = anc.Parent;
+                    }
+                    if (anc != null) {
+                        bool already = false;
+                        for (int h = 0; h < hookedAncestors.Length; h += 1) {
+                            if (hookedAncestors[h] == anc) { already = true; break; }
+                        }
+                        if (!already) {
+                            hookedAncestors.Push(anc);
+                            anc.AddStateInvalidatedHook(() => { TriggerBase.EvaluateGroup(list, root, null); });
+                        }
+                    }
+                }
+            } else if (list[i] is MultiDataTrigger) {
+                MultiDataTrigger mdt = list[i] as MultiDataTrigger;
+                TriggerCondition[] conds = mdt.Conditions();
+                for (int ci = 0; ci < conds.Length; ci += 1) {
+                    TriggerCondition cond = conds[ci];
+                    if (cond.RelativeSourceAncestorType.Length > 0) {
+                        UIElement anc = root;
+                        while (anc != null && anc.GetTypeName() != cond.RelativeSourceAncestorType) {
+                            anc = anc.Parent;
+                        }
+                        if (anc != null) {
+                            bool already = false;
+                            for (int h = 0; h < hookedAncestors.Length; h += 1) {
+                                if (hookedAncestors[h] == anc) { already = true; break; }
+                            }
+                            if (!already) {
+                                hookedAncestors.Push(anc);
+                                anc.AddStateInvalidatedHook(() => { TriggerBase.EvaluateGroup(list, root, null); });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     private void AttachTriggers(UIElement root) {
         TriggerBase[] list = _triggers;
         for (int i = 0; i < list.Length; i += 1) {
             list[i].Attach(root);
         }
+        var hookedAncestors = new UIElement[0];
+        DataTemplate.HookTemplateAncestors(list, root, hookedAncestors);
         TriggerBase.EvaluateGroup(list, root, null);
         root.Loaded += (object s, RoutedEventArgs e) => {
+            DataTemplate.HookTemplateAncestors(list, root, hookedAncestors);
             TriggerBase.EvaluateGroup(list, root, null);
         };
         root.DataContextChanged += (object s, DependencyPropertyChangedEventArgs e) => {
@@ -1089,6 +1246,7 @@ public class VisualState : DependencyObject {
     public string Name { get; set; } = "";
     public string StoryboardKey { get; set; } = "";
     private Storyboard _storyboard;
+    private bool _storyboardSettersExtracted = false;
     private Setter[] _setters;
     private UIElement[] _savedTargets;
     private string[] _savedProps;
@@ -1118,14 +1276,42 @@ public class VisualState : DependencyObject {
 
     public Setter[] Setters() { return _setters; }
 
-    internal void StartStoryboardOnly(UIElement target) {
-        if (target == null) { return; }
-        if (_storyboard == null && StoryboardKey.Length > 0) {
+    internal void EnsureResolvedStoryboard(UIElement target) {
+        if (_storyboard == null && StoryboardKey.Length > 0 && target != null) {
             DependencyObject box = target.FindResourceBox(StoryboardKey);
+            if (box == null && target.TemplatedParent != null) {
+                box = target.TemplatedParent.FindResourceBox(StoryboardKey);
+            }
             if (box is Storyboard) { _storyboard = box as Storyboard; }
         }
+        if (_storyboard != null && StoryboardKey.Length > 0 && !_storyboardSettersExtracted) {
+            _storyboardSettersExtracted = true;
+            TimelineAnimation[] tls = _storyboard.Children();
+            if (tls != null) {
+                for (int i = 0; i < tls.Length; i += 1) {
+                    TimelineAnimation tl = tls[i];
+                    if (tl == null || tl.HasAnimatedDuration() || tl.TargetProperty.Length == 0) { continue; }
+                    if (tl.IsColor) {
+                        string hex = tl.ToColor.Length > 0
+                            ? tl.ToColor
+                            : ParseUtil.FormatArgbHex(tl.HasColorUint ? tl.ToRgba : 0u);
+                        AddSetterBox(tl.TargetProperty, DependencyObject.BoxString(hex), tl.TargetName);
+                    } else {
+                        float val = (tl.KeyFrames != null && tl.KeyFrames.Length > 0)
+                            ? tl.KeyFrames[tl.KeyFrames.Length - 1].Value
+                            : tl.ToFloat;
+                        AddSetterBox(tl.TargetProperty, DependencyObject.BoxFloat(val), tl.TargetName);
+                    }
+                }
+            }
+        }
+    }
+
+    internal void StartStoryboardOnly(UIElement target) {
+        if (target == null) { return; }
+        EnsureResolvedStoryboard(target);
         if (_storyboard != null) {
-            _storyboard.Begin(target);
+            _storyboard.BeginAnimatedOnly(target);
         }
     }
 
@@ -1242,13 +1428,17 @@ public class VisualStateGroup : DependencyObject {
     }
 
     private static bool IsColorAnimPropId(int propId) {
-        return propId == 16 || propId == 17 || propId == 18 || propId == 29 || propId == 30;
+        return propId == 16 || propId == 17 || propId == 18 || propId == 29 || propId == 30 ||
+               (propId >= 37 && propId <= 40) || (propId >= 45 && propId <= 48);
     }
 
     public bool GoTo(VisualState next, UIElement scope, bool useTransitions = true) {
         if (next == null) { return false; }
         if (_currentState == next && CurrentStateName == next.Name) { return true; }
 
+        if (scope != null) {
+            next.EnsureResolvedStoryboard(scope);
+        }
         Setter[] nextSetters = next.Setters();
         if (scope != null && nextSetters != null) {
             for (int i = 0; i < nextSetters.Length; i += 1) {
@@ -1540,6 +1730,11 @@ public class TimelineAnimation : DependencyObject {
         return null;
     }
 
+    internal bool HasAnimatedDuration() {
+        return DurationSec > 0.001f || AutoReverse || RepeatCount != 1 || UseSpring ||
+               (KeyFrames != null && KeyFrames.Length > 1);
+    }
+
     public void StartOn(UIElement rootScope) {
         StartOnTracked(rootScope, 1.0f, false);
     }
@@ -1564,9 +1759,9 @@ public class TimelineAnimation : DependencyObject {
             int tid = 0;
             if (HasColorUint || HasFrom || FromColor.Length > 0) {
                 uint fromCol = HasColorUint ? FromRgba : ParseUtil.ParseColor(FromColor);
-                tid = Anim_StartColorDelayed(dest.__nativeHandle, propId, fromCol, toCol, effDur, ek, em, effDelay);
+                tid = Anim_StartColorEx(dest.__nativeHandle, propId, fromCol, toCol, effDur, ek, em, effDelay, AutoReverse, effRepeat);
             } else {
-                tid = Anim_StartColorTo(dest.__nativeHandle, propId, toCol, effDur, ek, em, effDelay);
+                tid = Anim_StartColorToEx(dest.__nativeHandle, propId, toCol, effDur, ek, em, effDelay, AutoReverse, effRepeat);
             }
             if (tid > 0) { started.Push(tid); }
             _activeTrackIds = started;
@@ -1684,6 +1879,7 @@ public class Storyboard : DependencyObject {
     public bool RepeatForever { get; set; } = false;
     private TimelineAnimation[] _children;
     private int[] _runningTrackIds;
+    private UIElement _lastScope;
     private bool _awaitingCompletion = false;
     private static Storyboard[] _activeStoryboards;
     private static bool _completionHookInstalled = false;
@@ -1755,6 +1951,34 @@ public class Storyboard : DependencyObject {
         _children.Push(da);
     }
 
+    public void AddDoubleAnimationEx(
+        string targetName, string targetProp, float from, float to, float durationSec,
+        int easeKind, int easeMode, float delaySec, bool autoReverse, int repeatCount) {
+        var da = new DoubleAnimation(from, to, durationSec);
+        da.TargetName = targetName == null ? "" : targetName;
+        da.TargetProperty = targetProp == null ? "Opacity" : targetProp;
+        da.EasingKind = IntToEasingKind(easeKind);
+        da.EasingMode = IntToEasingMode(easeMode);
+        da.DelaySec = delaySec;
+        da.AutoReverse = autoReverse;
+        da.RepeatCount = repeatCount;
+        _children.Push(da);
+    }
+
+    public void AddDoubleToAnimationEx(
+        string targetName, string targetProp, float to, float durationSec,
+        int easeKind, int easeMode, float delaySec, bool autoReverse, int repeatCount) {
+        var da = new DoubleAnimation(to, durationSec);
+        da.TargetName = targetName == null ? "" : targetName;
+        da.TargetProperty = targetProp == null ? "Opacity" : targetProp;
+        da.EasingKind = IntToEasingKind(easeKind);
+        da.EasingMode = IntToEasingMode(easeMode);
+        da.DelaySec = delaySec;
+        da.AutoReverse = autoReverse;
+        da.RepeatCount = repeatCount;
+        _children.Push(da);
+    }
+
     public void AddDoubleAnimation(
         string targetProp, float from, float to, float durationSec,
         EasingFunctionKind ease = EasingFunctionKind.Cubic, EasingMode mode = EasingMode.EaseOut) {
@@ -1781,6 +2005,25 @@ public class Storyboard : DependencyObject {
         ca.EasingKind = IntToEasingKind(easeKind);
         ca.EasingMode = IntToEasingMode(easeMode);
         ca.DelaySec = delaySec;
+        _children.Push(ca);
+    }
+
+    public void AddColorAnimationEx(
+        string targetName, string targetProp, string fromColor, string toColor, float durationSec,
+        int easeKind, int easeMode, float delaySec, bool hasFrom, bool autoReverse, int repeatCount) {
+        var ca = new ColorAnimation();
+        ca.IsColor = true;
+        ca.HasFrom = hasFrom;
+        ca.FromColor = hasFrom && fromColor != null ? fromColor : "";
+        ca.ToColor = toColor == null ? "" : toColor;
+        ca.DurationSec = durationSec;
+        ca.TargetName = targetName == null ? "" : targetName;
+        ca.TargetProperty = targetProp == null ? "Background" : targetProp;
+        ca.EasingKind = IntToEasingKind(easeKind);
+        ca.EasingMode = IntToEasingMode(easeMode);
+        ca.DelaySec = delaySec;
+        ca.AutoReverse = autoReverse;
+        ca.RepeatCount = repeatCount;
         _children.Push(ca);
     }
 
@@ -1871,15 +2114,19 @@ public class Storyboard : DependencyObject {
         }
     }
 
-    public void Begin(UIElement scope = null) {
+    private void BeginCore(UIElement scope, bool animatedOnly) {
         UIElement root = scope != null ? scope : Target;
         if (root == null) { return; }
         _awaitingCompletion = false;
-        StopRunningTracksOnly();
+        if (_lastScope == null || _lastScope == root) {
+            StopRunningTracksOnly();
+        }
+        _lastScope = root;
         var allTracks = new int[0];
         bool hasInfinite = RepeatForever;
         for (int i = 0; i < _children.Length; i += 1) {
             TimelineAnimation anim = _children[i];
+            if (animatedOnly && !anim.HasAnimatedDuration()) { continue; }
             if (anim.TargetName.Length == 0 && TargetName.Length > 0) {
                 anim.TargetName = TargetName;
             }
@@ -1898,6 +2145,14 @@ public class Storyboard : DependencyObject {
         EnsureCompletionHook();
         _awaitingCompletion = true;
         RegisterActiveStoryboard(this);
+    }
+
+    public void Begin(UIElement scope = null) {
+        BeginCore(scope, false);
+    }
+
+    internal void BeginAnimatedOnly(UIElement scope = null) {
+        BeginCore(scope, true);
     }
 
     public void Stop(UIElement scope = null) {
@@ -1989,14 +2244,17 @@ internal class BindingEntry : DependencyObject {
     public Inline TargetInline;
     public string TargetProp = "";
     public int Mode = 0; // 0=OneWay, 1=TwoWay, 2=OneTime
-    public int Kind = 0; // 0=Lambda, 1=Path, 2=Element, 3=TemplateParent, 4=Multi
+    public int Kind = 0; // 0=Lambda, 1=Path, 2=Element, 3=TemplateParent, 4=Multi, 5=Compiled
 
     public Func<DependencyObject> LambdaGetter;
     public Action<DependencyObject> LambdaSetter;
+    public Action<UIElement, object> CompiledUpdater;
 
     public DependencyObject ExplicitSourceBox;
     public UIElement SourceElement;
     public string SourcePath = "";
+    public string[] PathSegments;
+    public bool IsSingleHopPath = false;
     public string[] MultiPaths;
     public Binding[] MultiBindings;
     public string ElementName = "";
@@ -2018,8 +2276,19 @@ internal class BindingEntry : DependencyObject {
     private UIElement _lastFindNameRoot;
     private DependencyObject _lastTemplateValBox;
     private DependencyObject _lastPathValBox;
+    private DependencyObject _lastSrcBox;
     private UIElement[] _multiElementSources;
     private UIElement[] _multiFindRoots;
+
+    internal void InitPathSegments() {
+        if (SourcePath != null && SourcePath.Length > 0 && SourcePath != ".") {
+            PathSegments = SourcePath.Split(".");
+            IsSingleHopPath = (PathSegments.Length == 1);
+        } else {
+            PathSegments = null;
+            IsSingleHopPath = true;
+        }
+    }
 
     internal static UIElement FindElementScoped(UIElement host, string elementName) {
         if (host == null || elementName == null || elementName.Length == 0) { return null; }
@@ -2429,6 +2698,23 @@ internal class BindingEntry : DependencyObject {
             return;
         }
 
+        if (Kind == 5 && CompiledUpdater != null) {
+            if (Target == null) { return; }
+            DependencyObject srcBox = ResolveSourceBox();
+            object srcObj = DependencyObject.Unbox(srcBox);
+            if (srcObj == null) { return; }
+            int dm = ParseUtil.IsNativeReady() ? Reflect_GetDirtyMask(srcObj) : -1;
+            bool sameSrc = ItemsControl.SameItemBox(srcBox, _lastSrcBox);
+            if (OneTimeDone && sameSrc && !(srcObj is UIElement) && dm >= 0 && dm == LastDirtyMask) {
+                return;
+            }
+            _lastSrcBox = srcBox;
+            LastDirtyMask = dm;
+            OneTimeDone = true;
+            CompiledUpdater(Target, srcObj);
+            return;
+        }
+
         if (Kind == 1) {
             if (host == null && RelativeSourceMode != "Self") { return; }
             DependencyObject srcBox = ResolveSourceBox();
@@ -2438,13 +2724,25 @@ internal class BindingEntry : DependencyObject {
                 return;
             }
             int dm = ParseUtil.IsNativeReady() ? Reflect_GetDirtyMask(srcObj) : -1;
-            DependencyObject valBox = BindingEngine.ReadPathBox(srcObj, SourcePath);
+            bool sameSrc = ItemsControl.SameItemBox(srcBox, _lastSrcBox);
+            if (OneTimeDone && sameSrc && !(srcObj is UIElement) && IsSingleHopPath && dm >= 0 && dm == LastDirtyMask) {
+                return;
+            }
+            DependencyObject valBox = BindingEngine.ReadSegmentsBox(srcObj, SourcePath, PathSegments);
             if (valBox == null && HasFallback) { valBox = FallbackBox; }
-            string sig = DependencyObject.UnboxString(valBox, "");
             bool boxDiff = (valBox != _lastPathValBox) && !ItemsControl.SameItemBox(valBox, _lastPathValBox);
-            if (!boxDiff && dm == LastDirtyMask && dm >= 0 && sig == LastHash && OneTimeDone) { return; }
+            if (!boxDiff && OneTimeDone && sameSrc &&
+                (valBox == _lastPathValBox || valBox is BoxedInt || valBox is BoxedFloat || valBox is BoxedBool || valBox is BoxedString)) {
+                LastDirtyMask = dm;
+                return;
+            }
+            string sig = DependencyObject.UnboxString(valBox, "");
+            if (!boxDiff && dm == LastDirtyMask && dm >= 0 && sig == LastHash && OneTimeDone && sameSrc) {
+                return;
+            }
+            _lastSrcBox = srcBox;
             LastDirtyMask = dm;
-            if (boxDiff || sig != LastHash || !OneTimeDone) {
+            if (boxDiff || sig != LastHash || !OneTimeDone || !sameSrc) {
                 _lastPathValBox = valBox;
                 LastHash = sig;
                 OneTimeDone = true;
@@ -2554,6 +2852,27 @@ internal class ElementBindingList : DependencyObject {
 public static class BindingEngine {
     private static BindingEntry[] _entries;
     private static Action[] _preFlushHooks;
+    private static int _batchDepth = 0;
+    private static BindingEntry[] _batchPending;
+
+    public static void BeginBatch() {
+        _batchDepth += 1;
+        if (_batchPending == null) { _batchPending = new BindingEntry[0]; }
+    }
+
+    public static void EndBatch() {
+        if (_batchDepth <= 0) { return; }
+        _batchDepth -= 1;
+        if (_batchDepth > 0 || _batchPending == null || _batchPending.Length == 0) { return; }
+        BindingEntry[] pending = _batchPending;
+        _batchPending = new BindingEntry[0];
+        for (int i = 0; i < pending.Length; i += 1) {
+            BindingEntry e = pending[i];
+            if (e != null && (e.Target == null || !e.Target._isDisposedTree)) {
+                e.Evaluate();
+            }
+        }
+    }
 
     public static void SetPreFlushHook(Action hook) {
         _preFlushHooks = new Action[0];
@@ -2583,7 +2902,25 @@ public static class BindingEngine {
             }
             list.Items.Push(entry);
         }
+        if (_batchDepth > 0) {
+            if (_batchPending == null) { _batchPending = new BindingEntry[0]; }
+            _batchPending.Push(entry);
+            return;
+        }
         entry.Evaluate();
+    }
+
+    public static void BindCompiledAction(
+        UIElement target, string targetProp, object source, int mode, Action<UIElement, object> updater) {
+        if (target == null || targetProp == null || updater == null) { return; }
+        var e = new BindingEntry();
+        e.Target = target;
+        e.TargetProp = targetProp;
+        e.Kind = 5;
+        e.Mode = mode;
+        e.ExplicitSourceBox = source != null ? DependencyObject.BoxObject(source) : null;
+        e.CompiledUpdater = updater;
+        RegisterEntry(e);
     }
 
     public static void BindLambdaOneWay(UIElement target, string targetProp, Func<DependencyObject> getter) {
@@ -2639,6 +2976,7 @@ public static class BindingEngine {
         e.Mode = mode;
         e.ExplicitSourceBox = source != null ? DependencyObject.BoxObject(source) : null;
         e.SourcePath = path == null ? "" : path;
+        e.InitPathSegments();
         e.ConverterKey = converterKey == null ? "" : converterKey;
         e.ConverterParam = converterParam == null ? "" : converterParam;
         e.StringFormat = stringFormat == null ? "" : stringFormat;
@@ -2655,6 +2993,7 @@ public static class BindingEngine {
         e.Mode = mode;
         e.ElementName = elementName == null ? "" : elementName;
         e.SourcePath = sourceProp == null ? "" : sourceProp;
+        e.InitPathSegments();
         RegisterEntry(e);
     }
 
@@ -2668,6 +3007,7 @@ public static class BindingEngine {
         e.Mode = mode;
         e.SourceElement = templatedParent;
         e.SourcePath = sourceProp == null ? "" : sourceProp;
+        e.InitPathSegments();
         RegisterEntry(e);
     }
 
@@ -2702,6 +3042,7 @@ public static class BindingEngine {
         e.Mode = mode;
         e.ExplicitSourceBox = source != null ? DependencyObject.BoxObject(source) : null;
         e.SourcePath = path == null ? "" : path;
+        e.InitPathSegments();
         e.Converter = converter;
         e.ConverterKey = converterKey == null ? "" : converterKey;
         e.ConverterParam = converterParam == null ? "" : converterParam;
@@ -2728,6 +3069,7 @@ public static class BindingEngine {
         e.Mode = mode;
         e.ElementName = elementName == null ? "" : elementName;
         e.SourcePath = sourceProp == null ? "" : sourceProp;
+        e.InitPathSegments();
         e.Converter = converter;
         e.ConverterKey = converterKey == null ? "" : converterKey;
         e.ConverterParam = converterParam == null ? "" : converterParam;
@@ -2753,6 +3095,7 @@ public static class BindingEngine {
         e.Mode = mode;
         e.ElementName = elementName == null ? "" : elementName;
         e.SourcePath = path == null ? "" : path;
+        e.InitPathSegments();
         e.Converter = converter;
         e.ConverterKey = converterKey == null ? "" : converterKey;
         e.ConverterParam = converterParam == null ? "" : converterParam;
@@ -2779,6 +3122,7 @@ public static class BindingEngine {
         e.Mode = mode;
         e.SourceElement = templatedParent;
         e.SourcePath = sourceProp == null ? "" : sourceProp;
+        e.InitPathSegments();
         e.Converter = converter;
         e.ConverterKey = converterKey == null ? "" : converterKey;
         e.ConverterParam = converterParam == null ? "" : converterParam;
@@ -2875,7 +3219,7 @@ public static class BindingEngine {
     }
 
     // ---- Reflection Path Traversals ----
-    public static DependencyObject ReadPathBox(object root, string path) {
+    internal static DependencyObject ReadSegmentsBox(object root, string path, string[] segs) {
         if (root == null) { return null; }
         if (path == null || path.Length == 0 || path == ".") {
             if (root is DependencyObject) { return root as DependencyObject; }
@@ -2888,10 +3232,10 @@ public static class BindingEngine {
                 return null;
             }
         }
-        string[] segs = path.Split(".");
+        string[] parts = segs != null ? segs : path.Split(".");
         object cur = root;
-        for (int i = 0; i < segs.Length - 1; i += 1) {
-            string seg = segs[i];
+        for (int i = 0; i < parts.Length - 1; i += 1) {
+            string seg = parts[i];
             if (cur is UIElement) {
                 DependencyObject sub = (cur as UIElement).GetPropertyValue(seg);
                 cur = sub != null ? sub.UnboxObject() : Reflect_GetPropObject(cur, seg);
@@ -2900,7 +3244,7 @@ public static class BindingEngine {
             }
             if (cur == null) { return null; }
         }
-        string leaf = segs[segs.Length - 1];
+        string leaf = parts[parts.Length - 1];
         if (cur is UIElement) {
             DependencyObject local = (cur as UIElement).GetPropertyValue(leaf);
             if (local != null) { return local; }
@@ -2919,6 +3263,10 @@ public static class BindingEngine {
             return objVal != null ? DependencyObject.BoxObject(objVal) : null;
         }
         return null;
+    }
+
+    public static DependencyObject ReadPathBox(object root, string path) {
+        return ReadSegmentsBox(root, path, null);
     }
 
     public static void WritePathBox(object root, string path, DependencyObject valBox) {

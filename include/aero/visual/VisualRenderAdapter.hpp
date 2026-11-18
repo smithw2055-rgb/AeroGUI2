@@ -28,6 +28,11 @@ public:
         UIResourceStore* resourceStore = nullptr) const;
 
 private:
+    static void AttachNodeGradientBrush(
+        PagedRenderTree& tree,
+        std::uint32_t nid,
+        std::int32_t gradId) noexcept;
+
     static void ApplyNodeTransform(
         PagedRenderTree& tree,
         std::uint32_t beginNid,
@@ -56,6 +61,7 @@ private:
         std::uint32_t fillRgba,
         std::int32_t fillGradId,
         std::uint32_t strokeRgba,
+        std::int32_t strokeGradId,
         float strokeWidth,
         Stretch stretch,
         float trimStart,
@@ -65,7 +71,9 @@ private:
         const Matrix2D& world2D,
         const Matrix4x4& world3D,
         bool has3D,
-        BlendingMode blend);
+        BlendingMode blend,
+        float fillOpacity = 1.0f,
+        float strokeOpacity = 1.0f);
 
     static std::size_t EmitBoxVisual(
         PagedRenderTree& tree,
@@ -119,13 +127,39 @@ private:
         bool has3D,
         BlendingMode blend);
 
+    static std::size_t EmitDropShadowLeafSilhouette(
+        PagedRenderTree& outTree,
+        const VisualNode& node,
+        const Rect& rect,
+        float effOpacity,
+        const Matrix2D& world2D,
+        const Matrix4x4& world3D,
+        bool has3D,
+        BlendingMode blend,
+        const VisualEffectStyle& dropShadow,
+        float dx,
+        float dy,
+        float blurR,
+        bool wrapWithBlurSpan);
+
+    static std::size_t EmitDropShadowSubtreeRecursive(
+        const VisualWorld& world,
+        VisualNodeId id,
+        float parentOpacity,
+        PagedRenderTree& outTree,
+        const VisualEffectStyle& dropShadow,
+        float dx,
+        float dy,
+        float blurR);
+
     static std::size_t EmitNodeRecursive(
         VisualWorld* mutableWorld,
         const VisualWorld& world,
         const DrawingCommandBuffer* drawBuffer,
         VisualNodeId id,
         float parentOpacity,
-        PagedRenderTree& outTree);
+        PagedRenderTree& outTree,
+        const VisualEffectStyle* inheritedDropShadow = nullptr);
 };
 
 } // namespace aero

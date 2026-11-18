@@ -66,19 +66,19 @@ struct GradientStopTarget {
     const auto v = static_cast<std::uint8_t>(prop);
     if (v >= static_cast<std::uint8_t>(VisualAnimProp::FillStop0Color) &&
         v <= static_cast<std::uint8_t>(VisualAnimProp::FillStop3Color)) {
-        return {true, false, false, v - static_cast<std::uint8_t>(VisualAnimProp::FillStop0Color)};
+        return {true, false, false, static_cast<std::size_t>(v - static_cast<std::uint8_t>(VisualAnimProp::FillStop0Color))};
     }
     if (v >= static_cast<std::uint8_t>(VisualAnimProp::FillStop0Offset) &&
         v <= static_cast<std::uint8_t>(VisualAnimProp::FillStop3Offset)) {
-        return {false, true, false, v - static_cast<std::uint8_t>(VisualAnimProp::FillStop0Offset)};
+        return {false, true, false, static_cast<std::size_t>(v - static_cast<std::uint8_t>(VisualAnimProp::FillStop0Offset))};
     }
     if (v >= static_cast<std::uint8_t>(VisualAnimProp::StrokeStop0Color) &&
         v <= static_cast<std::uint8_t>(VisualAnimProp::StrokeStop3Color)) {
-        return {true, false, true, v - static_cast<std::uint8_t>(VisualAnimProp::StrokeStop0Color)};
+        return {true, false, true, static_cast<std::size_t>(v - static_cast<std::uint8_t>(VisualAnimProp::StrokeStop0Color))};
     }
     if (v >= static_cast<std::uint8_t>(VisualAnimProp::StrokeStop0Offset) &&
         v <= static_cast<std::uint8_t>(VisualAnimProp::StrokeStop3Offset)) {
-        return {false, true, true, v - static_cast<std::uint8_t>(VisualAnimProp::StrokeStop0Offset)};
+        return {false, true, true, static_cast<std::size_t>(v - static_cast<std::uint8_t>(VisualAnimProp::StrokeStop0Offset))};
     }
     return {};
 }

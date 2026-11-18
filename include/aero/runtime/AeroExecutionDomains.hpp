@@ -409,7 +409,9 @@ private:
     UiTaskId nextUiTaskId_ = 1;
     std::vector<std::unique_ptr<UiAsyncTaskFrame>> uiTasks_;
     std::unordered_set<std::uint32_t> cancelledControlSlots_;
-    DesktopJitInvokerFn desktopJitInvoker_{};
+    std::shared_ptr<const DesktopJitInvokerFn> desktopJitInvoker_{};
+    std::atomic<bool> hasDesktopJitInvoker_{false};
+    mutable std::atomic<bool> hasSimCommands_{false};
     mutable std::atomic<std::uint64_t> desktopJitInvokeHits_{0u};
     mutable std::atomic<std::uint64_t> desktopJitFallbackHits_{0u};
 };

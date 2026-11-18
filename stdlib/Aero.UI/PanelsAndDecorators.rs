@@ -25,7 +25,7 @@ public class Viewbox : Decorator {
         set { _stretchDir = value; SyncViewboxMode(); }
     }
 
-    private void SyncViewboxMode() {
+    protected virtual void SyncViewboxMode() {
         if (ParseUtil.IsValidHandle(__nativeHandle)) {
             Visual_SetLayoutMode(
                 __nativeHandle,
@@ -40,13 +40,54 @@ public class Viewbox : Decorator {
 public class LayoutScaler : Viewbox {
     public float DesignWidth { get; set; } = 1920.0f;
     public float DesignHeight { get; set; } = 1080.0f;
+    private Size _referenceResolution;
 
     public LayoutScaler() : base() {
+        _referenceResolution = new Size(0.0f, 0.0f);
         Stretch = Stretch.Uniform;
         StretchDirection = StretchDirection.Both;
+        SyncViewboxMode();
     }
 
     public override string GetTypeName() { return "LayoutScaler"; }
+
+    public Size ReferenceResolution {
+        get { return _referenceResolution; }
+        set {
+            _referenceResolution = value == null ? new Size(0.0f, 0.0f) : value;
+            SyncViewboxMode();
+        }
+    }
+
+    protected override void SyncViewboxMode() {
+        if (ParseUtil.IsValidHandle(__nativeHandle)) {
+            float rw = _referenceResolution != null ? _referenceResolution.Width : 0.0f;
+            float rh = _referenceResolution != null ? _referenceResolution.Height : 0.0f;
+            Visual_SetLayoutMode(
+                __nativeHandle,
+                EnumConvert.ToInt(LayoutMode.Viewbox),
+                rw, rh,
+                EnumConvert.ToInt(Stretch),
+                EnumConvert.ToInt(StretchDirection) + 256);
+        }
+    }
+
+    public override bool SetPropertyValue(string propName, DependencyObject value) {
+        if (propName == "ReferenceResolution") {
+            if (value is Size) {
+                ReferenceResolution = value as Size;
+            } else {
+                ReferenceResolution = Size.Parse(DependencyObject.UnboxString(value, "0,0"));
+            }
+            return true;
+        }
+        return base.SetPropertyValue(propName, value);
+    }
+
+    public override DependencyObject GetPropertyValue(string propName) {
+        if (propName == "ReferenceResolution") { return _referenceResolution; }
+        return base.GetPropertyValue(propName);
+    }
 }
 
 // ============================================================================

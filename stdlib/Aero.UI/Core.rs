@@ -155,6 +155,7 @@ public enum VectorShapeKind {
     Ellipse = 1,
     Line = 2,
     RadialArc = 3,
+    Rectangle = 4,
 }
 
 public enum VisualLayoutRectQuery {
@@ -208,6 +209,24 @@ public enum VisualAnimProp {
     OpacityMaskStop1Offset = 32,
     OpacityMaskStop2Offset = 33,
     OpacityMaskStop3Offset = 34,
+    FillBrushOpacity = 35,
+    StrokeBrushOpacity = 36,
+    FillStop0Color = 37,
+    FillStop1Color = 38,
+    FillStop2Color = 39,
+    FillStop3Color = 40,
+    FillStop0Offset = 41,
+    FillStop1Offset = 42,
+    FillStop2Offset = 43,
+    FillStop3Offset = 44,
+    StrokeStop0Color = 45,
+    StrokeStop1Color = 46,
+    StrokeStop2Color = 47,
+    StrokeStop3Color = 48,
+    StrokeStop0Offset = 49,
+    StrokeStop1Offset = 50,
+    StrokeStop2Offset = 51,
+    StrokeStop3Offset = 52,
 }
 
 public enum EasingFunctionKind {
@@ -491,6 +510,7 @@ public static class EnumConvert {
             case VectorShapeKind.Ellipse: return 1;
             case VectorShapeKind.Line: return 2;
             case VectorShapeKind.RadialArc: return 3;
+            case VectorShapeKind.Rectangle: return 4;
         }
         return 0;
     }
@@ -548,17 +568,56 @@ public static class EnumConvert {
             case VisualAnimProp.OpacityMaskStop1Offset: return 32;
             case VisualAnimProp.OpacityMaskStop2Offset: return 33;
             case VisualAnimProp.OpacityMaskStop3Offset: return 34;
+            case VisualAnimProp.FillBrushOpacity: return 35;
+            case VisualAnimProp.StrokeBrushOpacity: return 36;
+            case VisualAnimProp.FillStop0Color: return 37;
+            case VisualAnimProp.FillStop1Color: return 38;
+            case VisualAnimProp.FillStop2Color: return 39;
+            case VisualAnimProp.FillStop3Color: return 40;
+            case VisualAnimProp.FillStop0Offset: return 41;
+            case VisualAnimProp.FillStop1Offset: return 42;
+            case VisualAnimProp.FillStop2Offset: return 43;
+            case VisualAnimProp.FillStop3Offset: return 44;
+            case VisualAnimProp.StrokeStop0Color: return 45;
+            case VisualAnimProp.StrokeStop1Color: return 46;
+            case VisualAnimProp.StrokeStop2Color: return 47;
+            case VisualAnimProp.StrokeStop3Color: return 48;
+            case VisualAnimProp.StrokeStop0Offset: return 49;
+            case VisualAnimProp.StrokeStop1Offset: return 50;
+            case VisualAnimProp.StrokeStop2Offset: return 51;
+            case VisualAnimProp.StrokeStop3Offset: return 52;
         }
         return 0;
+    }
+    private static int ParseGradientStopPropId(string n) {
+        if (n == "OpacityMask.Stop0.Offset" || (n.Contains("OpacityMask") && (n.Contains("[0]") || n.Contains("Stop0")))) { return 31; }
+        if (n == "OpacityMask.Stop1.Offset" || (n.Contains("OpacityMask") && (n.Contains("[1]") || n.Contains("Stop1")))) { return 32; }
+        if (n == "OpacityMask.Stop2.Offset" || (n.Contains("OpacityMask") && (n.Contains("[2]") || n.Contains("Stop2")))) { return 33; }
+        if (n == "OpacityMask.Stop3.Offset" || (n.Contains("OpacityMask") && (n.Contains("[3]") || n.Contains("Stop3")))) { return 34; }
+        if (n == "Fill.Stop0Color") { return 37; }
+        if (n == "Fill.Stop1Color") { return 38; }
+        if (n == "Fill.Stop2Color") { return 39; }
+        if (n == "Fill.Stop3Color") { return 40; }
+        if (n == "Fill.Stop0Offset") { return 41; }
+        if (n == "Fill.Stop1Offset") { return 42; }
+        if (n == "Fill.Stop2Offset") { return 43; }
+        if (n == "Fill.Stop3Offset") { return 44; }
+        if (n == "Stroke.Stop0Color") { return 45; }
+        if (n == "Stroke.Stop1Color") { return 46; }
+        if (n == "Stroke.Stop2Color") { return 47; }
+        if (n == "Stroke.Stop3Color") { return 48; }
+        if (n == "Stroke.Stop0Offset") { return 49; }
+        if (n == "Stroke.Stop1Offset") { return 50; }
+        if (n == "Stroke.Stop2Offset") { return 51; }
+        if (n == "Stroke.Stop3Offset") { return 52; }
+        return -1;
     }
     public static int ParseAnimPropOrInvalid(string name) {
         if (name == null) { return -1; }
         string n = name.Trim();
         if (n.Length == 0) { return -1; }
-        if (n == "OpacityMask.Stop0.Offset" || (n.Contains("OpacityMask") && (n.Contains("[0]") || n.Contains("Stop0")))) { return 31; }
-        if (n == "OpacityMask.Stop1.Offset" || (n.Contains("OpacityMask") && (n.Contains("[1]") || n.Contains("Stop1")))) { return 32; }
-        if (n == "OpacityMask.Stop2.Offset" || (n.Contains("OpacityMask") && (n.Contains("[2]") || n.Contains("Stop2")))) { return 33; }
-        if (n == "OpacityMask.Stop3.Offset" || (n.Contains("OpacityMask") && (n.Contains("[3]") || n.Contains("Stop3")))) { return 34; }
+        int gradProp = ParseGradientStopPropId(n);
+        if (gradProp >= 0) { return gradProp; }
         if (n.Contains("OpacityMask") || n.Contains("GradientStop")) { return -1; }
         if (n == "Opacity") { return 0; }
         if (n == "Width" || n == "MinWidth") { return 1; }
@@ -587,6 +646,8 @@ public static class EnumConvert {
         if (n == "BrushOpacity" || n == "Brush.Opacity") { return 28; }
         if (n == "Fill" || n == "Fill.Color") { return 29; }
         if (n == "Stroke" || n == "Stroke.Color") { return 30; }
+        if (n == "Fill.Opacity") { return 35; }
+        if (n == "Stroke.Opacity") { return 36; }
         return -1;
     }
     public static VisualAnimProp AnimPropFromInt(int id) {
@@ -622,6 +683,24 @@ public static class EnumConvert {
             case 32: return VisualAnimProp.OpacityMaskStop1Offset;
             case 33: return VisualAnimProp.OpacityMaskStop2Offset;
             case 34: return VisualAnimProp.OpacityMaskStop3Offset;
+            case 35: return VisualAnimProp.FillBrushOpacity;
+            case 36: return VisualAnimProp.StrokeBrushOpacity;
+            case 37: return VisualAnimProp.FillStop0Color;
+            case 38: return VisualAnimProp.FillStop1Color;
+            case 39: return VisualAnimProp.FillStop2Color;
+            case 40: return VisualAnimProp.FillStop3Color;
+            case 41: return VisualAnimProp.FillStop0Offset;
+            case 42: return VisualAnimProp.FillStop1Offset;
+            case 43: return VisualAnimProp.FillStop2Offset;
+            case 44: return VisualAnimProp.FillStop3Offset;
+            case 45: return VisualAnimProp.StrokeStop0Color;
+            case 46: return VisualAnimProp.StrokeStop1Color;
+            case 47: return VisualAnimProp.StrokeStop2Color;
+            case 48: return VisualAnimProp.StrokeStop3Color;
+            case 49: return VisualAnimProp.StrokeStop0Offset;
+            case 50: return VisualAnimProp.StrokeStop1Offset;
+            case 51: return VisualAnimProp.StrokeStop2Offset;
+            case 52: return VisualAnimProp.StrokeStop3Offset;
         }
         return VisualAnimProp.Opacity;
     }
@@ -1307,6 +1386,14 @@ public class Size : DependencyObject {
     public Size() {}
     public Size(float w, float h) { Width = w; Height = h; }
     public override string ToDisplayString() { return "" + Width + "," + Height; }
+    public static Size Parse(string text) {
+        if (text == null) { return new Size(0.0f, 0.0f); }
+        string[] parts = text.Trim().Split(",");
+        if (parts.Length >= 2) {
+            return new Size(ParseUtil.ParseFloat(parts[0], 0.0f), ParseUtil.ParseFloat(parts[1], 0.0f));
+        }
+        return new Size(0.0f, 0.0f);
+    }
 }
 
 public class Rect : DependencyObject {
@@ -1424,8 +1511,17 @@ public class GradientBrush : Brush {
     protected bool _dirty = true;
     protected int _cachedUnscaledGradId = -1;
     protected bool _unscaledDirty = true;
-    public int SpreadMethod { get; set; } = 0;
-    public int MappingMode { get; set; } = 0;
+    private int _spreadMethod = 0;
+    private int _mappingMode = 0;
+
+    public int SpreadMethod {
+        get { return _spreadMethod; }
+        set { if (_spreadMethod != value) { _spreadMethod = value; _dirty = true; _unscaledDirty = true; } }
+    }
+    public int MappingMode {
+        get { return _mappingMode; }
+        set { if (_mappingMode != value) { _mappingMode = value; _dirty = true; _unscaledDirty = true; } }
+    }
 
     public GradientBrush() { _stops = new GradientStop[0]; }
 
@@ -1454,6 +1550,76 @@ public class GradientBrush : Brush {
         _stops.Clear();
         _dirty = true;
         _unscaledDirty = true;
+    }
+
+    public int StopCount() { return _stops.Length; }
+
+    public string GetStopColor(int idx) {
+        if (idx < 0 || idx >= _stops.Length) { return "#00000000"; }
+        return _stops[idx].Color;
+    }
+
+    public float GetStopOffset(int idx) {
+        if (idx < 0 || idx >= _stops.Length) { return 0.0f; }
+        return _stops[idx].Offset;
+    }
+
+    public bool SetStopColor(int idx, string hex) {
+        if (idx < 0 || idx >= _stops.Length) { return false; }
+        _stops[idx].Color = hex == null ? "#00000000" : hex;
+        _dirty = true;
+        _unscaledDirty = true;
+        return true;
+    }
+
+    public bool SetStopOffset(int idx, float off) {
+        if (idx < 0 || idx >= _stops.Length) { return false; }
+        _stops[idx].Offset = Math.Clampf(off, 0.0f, 1.0f);
+        _dirty = true;
+        _unscaledDirty = true;
+        return true;
+    }
+
+    protected void CopyGradientStopsAndPropsTo(GradientBrush dst) {
+        if (dst == null) { return; }
+        dst.Opacity = Opacity;
+        dst.SpreadMethod = SpreadMethod;
+        dst.MappingMode = MappingMode;
+        for (int i = 0; i < _stops.Length; i += 1) {
+            dst.AddStop(_stops[i].ColorRgba, _stops[i].Offset);
+        }
+    }
+
+    public virtual GradientBrush CloneBrush() {
+        var copy = new GradientBrush();
+        CopyGradientStopsAndPropsTo(copy);
+        return copy;
+    }
+
+    internal static int ParseStopSlotIndex(string suffix) {
+        if (suffix == "Stop0Color" || suffix == "Stop0Offset") { return 0; }
+        if (suffix == "Stop1Color" || suffix == "Stop1Offset") { return 1; }
+        if (suffix == "Stop2Color" || suffix == "Stop2Offset") { return 2; }
+        if (suffix == "Stop3Color" || suffix == "Stop3Offset") { return 3; }
+        return -1;
+    }
+
+    internal bool TryApplyStopProperty(string suffix, DependencyObject value) {
+        int idx = ParseStopSlotIndex(suffix);
+        if (idx < 0) { return false; }
+        if (suffix.Contains("Color")) {
+            return SetStopColor(idx, DependencyObject.UnboxString(value, "#00000000"));
+        }
+        return SetStopOffset(idx, DependencyObject.UnboxFloat(value, 0.0f));
+    }
+
+    internal DependencyObject TryReadStopProperty(string suffix) {
+        int idx = ParseStopSlotIndex(suffix);
+        if (idx < 0) { return null; }
+        if (suffix.Contains("Color")) {
+            return DependencyObject.BoxString(GetStopColor(idx));
+        }
+        return DependencyObject.BoxFloat(GetStopOffset(idx));
     }
 
     protected string BuildStopsSpec() {
@@ -1530,6 +1696,12 @@ public class LinearGradientBrush : GradientBrush {
         }
         return _cachedUnscaledGradId;
     }
+
+    public override GradientBrush CloneBrush() {
+        var copy = new LinearGradientBrush(_x0, _y0, _x1, _y1);
+        CopyGradientStopsAndPropsTo(copy);
+        return copy;
+    }
 }
 
 public class RadialGradientBrush : GradientBrush {
@@ -1579,6 +1751,12 @@ public class RadialGradientBrush : GradientBrush {
             _unscaledDirty = false;
         }
         return _cachedUnscaledGradId;
+    }
+
+    public override GradientBrush CloneBrush() {
+        var copy = new RadialGradientBrush(_cx, _cy, _ox, _oy, _rx, _ry);
+        CopyGradientStopsAndPropsTo(copy);
+        return copy;
     }
 }
 
@@ -1836,11 +2014,13 @@ public partial class UIElement : DependencyObject {
     private string _uid = "";
     private DependencyObject _tag;
     private DependencyObject _toolTip;
+    private Func<object, UIElement> _toolTipFactory;
     private DependencyObject _explicitDataContext;
     private DependencyObject _inheritedDataContext;
     private UIElement _templatedParent;
     private UIElement _parent;
     private UIElement[] _children;
+    private UIElement[] _detachedLogicalChildren;
     internal DependencyObject _vsgBox;
     internal DependencyObject _ownBindingsBox;
 
@@ -1896,6 +2076,7 @@ public partial class UIElement : DependencyObject {
 
     private Brush _background;
     private float _bgOpacity = 1.0f;
+    private bool _ownsClonedBgGrad = false;
     private Brush _borderBrush;
     private Thickness _borderThickness;
     private CornerRadius _cornerRadius;
@@ -1984,6 +2165,7 @@ public partial class UIElement : DependencyObject {
         if (_locSource == null) { _locSource = ""; }
         if (_flowDirection == null || _flowDirection.Length == 0) { _flowDirection = "LeftToRight"; }
         _children = new UIElement[0];
+        _detachedLogicalChildren = new UIElement[0];
         _margin = new Thickness(0.0f);
         _padding = new Thickness(0.0f);
         _borderThickness = new Thickness(0.0f);
@@ -2026,15 +2208,51 @@ public partial class UIElement : DependencyObject {
         get { return DependencyObject.Unbox(_tag); }
         set { _tag = DependencyObject.BoxObject(value); }
     }
+    public bool HasToolTip {
+        get { return _toolTip != null || _toolTipFactory != null; }
+    }
+    public void SetLazyToolTip(Func<object, UIElement> factory) {
+        _toolTipFactory = factory;
+        _toolTip = null;
+        if (factory != null) { EnableToolTipHover(); }
+    }
+    private void EnsureToolTipMaterialized() {
+        if (_toolTip != null || _toolTipFactory == null) { return; }
+        var fn = _toolTipFactory;
+        _toolTipFactory = null;
+        var pushed = new ResourceDictionary[0];
+        var chain = new UIElement[0];
+        UIElement cur = this;
+        while (cur != null) {
+            chain.Push(cur);
+            cur = cur._parent;
+        }
+        for (int i = chain.Length - 1; i >= 0; i -= 1) {
+            UIElement node = chain[i];
+            if (node._ambientResources != null) {
+                ResourceDictionary.PushAmbient(node._ambientResources);
+                pushed.Push(node._ambientResources);
+            }
+            if (node._resources != null) {
+                ResourceDictionary.PushAmbient(node._resources);
+                pushed.Push(node._resources);
+            }
+        }
+        UIElement built = fn(DataContext);
+        for (int i = pushed.Length - 1; i >= 0; i -= 1) {
+            ResourceDictionary.PopAmbient(pushed[i]);
+        }
+        _toolTip = built;
+    }
     public object ToolTip {
-        get { return DependencyObject.Unbox(_toolTip); }
-        set { _toolTip = DependencyObject.BoxObject(value); }
+        get { EnsureToolTipMaterialized(); return DependencyObject.Unbox(_toolTip); }
+        set { _toolTipFactory = null; _toolTip = DependencyObject.BoxObject(value); }
     }
     public DependencyObject ToolTipBox {
-        get { return _toolTip; }
-        set { _toolTip = value; }
+        get { EnsureToolTipMaterialized(); return _toolTip; }
+        set { _toolTipFactory = null; _toolTip = value; }
     }
-    public void SetToolTip(string text) { _toolTip = DependencyObject.BoxString(text); }
+    public void SetToolTip(string text) { _toolTipFactory = null; _toolTip = DependencyObject.BoxString(text); }
 
     public UIElement Parent { get { return _parent; } }
     public UIElement TemplatedParent {
@@ -2519,6 +2737,7 @@ public partial class UIElement : DependencyObject {
         get { return _background; }
         set {
             _background = value;
+            _ownsClonedBgGrad = false;
             _bgOpacity = value != null ? Math.Clampf(value.Opacity, 0.0f, 1.0f) : 1.0f;
             OnBoxAppearanceChanged();
         }
@@ -2651,10 +2870,25 @@ public partial class UIElement : DependencyObject {
                 EnumConvert.ToInt(ib.Stretch),
                 EnumConvert.ToInt(StretchDirection.Both),
                 tint);
+            float vx = 0.0f;
+            float vy = 0.0f;
+            float vw = 1.0f;
+            float vh = 1.0f;
+            if (ib.Viewbox != null && ib.Viewbox.Length > 0) {
+                string[] parts = ib.Viewbox.Trim().Split(",");
+                if (parts.Length >= 4) {
+                    vx = ParseUtil.ParseFloat(parts[0], 0.0f);
+                    vy = ParseUtil.ParseFloat(parts[1], 0.0f);
+                    vw = ParseUtil.ParseFloat(parts[2], 1.0f);
+                    vh = ParseUtil.ParseFloat(parts[3], 1.0f);
+                }
+            }
+            Visual_SetImageViewbox(__nativeHandle, vx, vy, vw, vh);
             _hadBgImage = true;
         } else {
             if (_hadBgImage) {
                 Visual_SetImage(__nativeHandle, "", 0, 2, 4294967295u);
+                Visual_SetImageViewbox(__nativeHandle, 0.0f, 0.0f, 1.0f, 1.0f);
                 _hadBgImage = false;
             }
             if (_background != null) {
@@ -2853,6 +3087,24 @@ public partial class UIElement : DependencyObject {
         }
     }
 
+    internal void RegisterDetachedLogicalChild(UIElement child) {
+        if (child == null) { return; }
+        if (_detachedLogicalChildren == null) { _detachedLogicalChildren = new UIElement[0]; }
+        for (int i = 0; i < _detachedLogicalChildren.Length; i += 1) {
+            if (_detachedLogicalChildren[i] == child) { return; }
+        }
+        _detachedLogicalChildren.Push(child);
+    }
+
+    internal void UnregisterDetachedLogicalChild(UIElement child) {
+        if (child == null || _detachedLogicalChildren == null) { return; }
+        for (int i = _detachedLogicalChildren.Length - 1; i >= 0; i -= 1) {
+            if (_detachedLogicalChildren[i] == child) {
+                _detachedLogicalChildren.RemoveAt(i);
+            }
+        }
+    }
+
     internal void MarkDisposedSubtree() {
         var q = new UIElement[0];
         q.Push(this);
@@ -2864,6 +3116,11 @@ public partial class UIElement : DependencyObject {
             cur._isDisposedTree = true;
             for (int i = 0; i < cur._children.Length; i += 1) {
                 q.Push(cur._children[i]);
+            }
+            if (cur._detachedLogicalChildren != null) {
+                for (int i = 0; i < cur._detachedLogicalChildren.Length; i += 1) {
+                    q.Push(cur._detachedLogicalChildren[i]);
+                }
             }
         }
     }
@@ -2878,6 +3135,11 @@ public partial class UIElement : DependencyObject {
             stack.RemoveAt(last);
             if (cur == null) { continue; }
             if (cur._name == name) { return cur; }
+            if (cur._detachedLogicalChildren != null) {
+                for (int i = cur._detachedLogicalChildren.Length - 1; i >= 0; i -= 1) {
+                    stack.Push(cur._detachedLogicalChildren[i]);
+                }
+            }
             for (int i = cur._children.Length - 1; i >= 0; i -= 1) {
                 stack.Push(cur._children[i]);
             }
@@ -3206,6 +3468,29 @@ public partial class UIElement : DependencyObject {
             Background = CoerceBrush(value);
             return true;
         }
+        if (propName == "Background.ImageSource") {
+            if (_background is ImageBrush) {
+                ImageBrush ib = _background as ImageBrush;
+                ib.ImageSource = DependencyObject.UnboxString(value, "");
+                OnBoxAppearanceChanged();
+                return true;
+            }
+            return false;
+        }
+        if (propName.Length > 5 && propName.Substring(0, 5) == "Fill.") {
+            string suffix = propName.Substring(5);
+            if (_background is GradientBrush && GradientBrush.ParseStopSlotIndex(suffix) >= 0) {
+                GradientBrush gb = _background as GradientBrush;
+                if (!_ownsClonedBgGrad) {
+                    gb = gb.CloneBrush();
+                    _background = gb;
+                    _ownsClonedBgGrad = true;
+                }
+                gb.TryApplyStopProperty(suffix, value);
+                OnBoxAppearanceChanged();
+                return true;
+            }
+        }
         if (propName == "BorderBrush" || propName == "BorderBrush.Color") {
             BorderBrush = CoerceBrush(value);
             return true;
@@ -3400,6 +3685,16 @@ public partial class UIElement : DependencyObject {
         if (propName == "Background") { return _background; }
         if (propName == "Background.Color") {
             return DependencyObject.BoxString(_background != null ? ParseUtil.FormatArgbHex(_background.ResolveRgba()) : "#00000000");
+        }
+        if (propName == "Background.ImageSource" && _background is ImageBrush) {
+            return DependencyObject.BoxString((_background as ImageBrush).ImageSource);
+        }
+        if (propName.Length > 5 && propName.Substring(0, 5) == "Fill.") {
+            string suffix = propName.Substring(5);
+            if (_background is GradientBrush) {
+                DependencyObject stopBox = (_background as GradientBrush).TryReadStopProperty(suffix);
+                if (stopBox != null) { return stopBox; }
+            }
         }
         if (propName == "BorderBrush") { return _borderBrush; }
         if (propName == "OpacityMask") { return _opacityMask; }

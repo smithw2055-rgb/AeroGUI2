@@ -98,11 +98,31 @@ public:
         std::uint32_t padPx,
         RasterizedPathMaskEntry& outEntry);
 
+    [[nodiscard]] bool GetOrRasterizePathStrokeMask(
+        std::uint64_t pathHash,
+        std::string_view pathData,
+        const Rect& rawBounds,
+        std::uint32_t innerW,
+        std::uint32_t innerH,
+        float strokeWidthPx,
+        std::uint32_t padPx,
+        RasterizedPathMaskEntry& outEntry);
+
     void ClearAll() noexcept;
 
 private:
     void EnsureFontsInitialized() const;
     void EnsureImagesInitialized() const;
+    [[nodiscard]] bool StoreOrLookupPathMaskLocked(
+        std::uint64_t key,
+        std::uint32_t texW,
+        std::uint32_t texH,
+        float u0,
+        float v0,
+        float u1,
+        float v1,
+        std::vector<std::uint8_t>&& rgba8,
+        RasterizedPathMaskEntry& outEntry);
 
     std::uint16_t fontAtlasSize_ = kDefaultFontAtlasSize;
     mutable std::shared_ptr<FontAtlas> fonts_;

@@ -117,7 +117,17 @@ private:
         std::int16_t valueFUnits = 0;
     };
 
+    struct CffIndexTable {
+        struct Slice {
+            std::uint32_t offset = 0u;
+            std::uint32_t length = 0u;
+        };
+        std::vector<Slice> items;
+        std::uint32_t endOffset = 0u;
+    };
+
     bool ParseTables(std::string* outError);
+    bool ParseCffTable(std::uint32_t offset, std::uint32_t length, std::string* outError);
     bool ParseNameTable(std::uint32_t offset, std::uint32_t length);
     bool ParseCmapTable(std::uint32_t offset, std::uint32_t length);
     void ParseKernTable(std::uint32_t offset, std::uint32_t length);
@@ -131,10 +141,14 @@ private:
         std::uint32_t& ioTotalVisitedComponents,
         std::vector<TtfContourSegment>& outSegments,
         std::vector<TtfPoint>* outRawPoints) const;
+    bool ExtractCffGlyphOutline(
+        std::uint32_t glyphIndex,
+        std::vector<TtfContourSegment>& outSegments) const;
 
     std::vector<std::uint8_t> data_;
     std::uint64_t contentHash_ = 0u;
     bool valid_ = false;
+    bool isCff_ = false;
     std::string familyName_;
     std::string fullName_;
 
@@ -152,6 +166,9 @@ private:
     std::uint32_t locaLength_ = 0u;
     std::uint32_t glyfOffset_ = 0u;
     std::uint32_t glyfLength_ = 0u;
+    CffIndexTable cffCharStrings_;
+    CffIndexTable cffLocalSubrs_;
+    CffIndexTable cffGlobalSubrs_;
 
     bool hasFormat12_ = false;
     bool hasFormat4_ = false;
@@ -307,7 +324,8 @@ public:
         std::string_view fontFamily,
         float fontSize,
         float maxWidth = 1000000.0f,
-        TextWrapping wrapMode = TextWrapping::NoWrap);
+        TextWrapping wrapMode = TextWrapping::NoWrap,
+        float charSpacing = 0.0f);
 
     // Bilinear normalized [0..1] SDF sample at UV coordinates (u, v) in [0..1]^2
     [[nodiscard]] float SampleSdfBilinear(float u, float v) const noexcept;
@@ -400,6 +418,7 @@ private:
     std::string_view fontFamily,
     float fontSize,
     float maxWidth = 1000000.0f,
-    TextWrapping wrapMode = TextWrapping::NoWrap);
+    TextWrapping wrapMode = TextWrapping::NoWrap,
+    float charSpacing = 0.0f);
 
 } // namespace aero

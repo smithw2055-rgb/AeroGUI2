@@ -1007,6 +1007,9 @@ void ExecutionDomainContext::ensureProgramMetadataComputedLocked(
     if (pushToHeaps) {
         registeredImages_.insert(imageKey);
     }
+    if (!simCommandFunctions_.empty()) {
+        hasSimCommands_.store(true, std::memory_order_release);
+    }
 }
 
 void ExecutionDomainContext::registerProgramObservableMetadata(const ProgramImage& program) {
@@ -1220,6 +1223,9 @@ void ExecutionDomainContext::registerAotProgramAttributes(
                 simCommandFunctions_[fn.symbolId] = isInstance;
             }
         }
+    }
+    if (!simCommandFunctions_.empty()) {
+        hasSimCommands_.store(true, std::memory_order_release);
     }
 }
 
@@ -2161,18 +2167,25 @@ std::size_t ExecutionDomainContext::stepUiIdleGc(double maxMilliseconds) {
 }
 
 void ExecutionDomainContext::setDesktopJitInvoker(DesktopJitInvokerFn invoker) {
-    std::lock_guard<std::mutex> lock(mutex_);
-    desktopJitInvoker_ = std::move(invoker);
+    if (invoker) {
+        auto holder = std::make_shared<const DesktopJitInvokerFn>(std::move(invoker));
+        std::atomic_store_explicit(&desktopJitInvoker_, std::move(holder), std::memory_order_release);
+        hasDesktopJitInvoker_.store(true, std::memory_order_release);
+    } else {
+        clearDesktopJitInvoker();
+    }
 }
 
 void ExecutionDomainContext::clearDesktopJitInvoker() noexcept {
-    std::lock_guard<std::mutex> lock(mutex_);
-    desktopJitInvoker_ = nullptr;
+    hasDesktopJitInvoker_.store(false, std::memory_order_release);
+    std::atomic_store_explicit(
+        &desktopJitInvoker_,
+        std::shared_ptr<const DesktopJitInvokerFn>{},
+        std::memory_order_release);
 }
 
 bool ExecutionDomainContext::hasDesktopJitInvoker() const noexcept {
-    std::lock_guard<std::mutex> lock(mutex_);
-    return static_cast<bool>(desktopJitInvoker_);
+    return hasDesktopJitInvoker_.load(std::memory_order_acquire);
 }
 
 bool ExecutionDomainContext::tryInvokeDesktopJit(
@@ -2181,26 +2194,25 @@ bool ExecutionDomainContext::tryInvokeDesktopJit(
     const Value* arguments,
     std::size_t argumentCount,
     ExecutionResult& outResult) const {
-    if (functionId == 0) {
+    if (functionId == 0 || !hasDesktopJitInvoker_.load(std::memory_order_acquire)) {
         return false;
     }
-    DesktopJitInvokerFn invoker;
-    bool simCmdBlockedOnUi = false;
-    {
+    const auto invokerHolder = std::atomic_load_explicit(&desktopJitInvoker_, std::memory_order_acquire);
+    if (!invokerHolder || !(*invokerHolder)) {
+        return false;
+    }
+    if (domain == DomainKind::UiPresentation &&
+        hasSimCommands_.load(std::memory_order_acquire)) {
         std::lock_guard<std::mutex> lock(mutex_);
-        invoker = desktopJitInvoker_;
-        if (invoker && domain == DomainKind::UiPresentation) {
-            simCmdBlockedOnUi = (simCommandFunctions_.find(functionId) != simCommandFunctions_.end());
+        if (simCommandFunctions_.find(functionId) != simCommandFunctions_.end()) {
+            return false;
         }
-    }
-    if (!invoker || simCmdBlockedOnUi) {
-        return false;
     }
 
     bool outSucceeded = false;
     Value outVal{};
     RuntimeError outErr{};
-    if (invoker(domain, functionId, arguments, argumentCount, outSucceeded, outVal, outErr)) {
+    if ((*invokerHolder)(domain, functionId, arguments, argumentCount, outSucceeded, outVal, outErr)) {
         desktopJitInvokeHits_.fetch_add(1u, std::memory_order_relaxed);
         outResult = ExecutionResult{};
         outResult.succeeded = outSucceeded;

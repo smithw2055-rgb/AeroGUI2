@@ -355,12 +355,67 @@ struct XamlNode final {
     return 0.3f;
 }
 
+[[nodiscard]] std::string NormalizeGradientStopPath(std::string_view s) {
+    int stopIdx = -1;
+    if (s.find("[0]") != std::string_view::npos) stopIdx = 0;
+    else if (s.find("[1]") != std::string_view::npos) stopIdx = 1;
+    else if (s.find("[2]") != std::string_view::npos) stopIdx = 2;
+    else if (s.find("[3]") != std::string_view::npos) stopIdx = 3;
+    if (stopIdx < 0) {
+        return "Unsupported.GradientStop";
+    }
+    const std::string idxStr = std::to_string(stopIdx);
+    if (s.find("OpacityMask") != std::string_view::npos) {
+        if (s.find("Offset") != std::string_view::npos) {
+            return "OpacityMask.Stop" + idxStr + ".Offset";
+        }
+        return "Unsupported.GradientStop";
+    }
+    const bool isStroke =
+        s.find("Shape.Stroke") != std::string_view::npos ||
+        s.find("Stroke.") != std::string_view::npos ||
+        s.find("BorderBrush") != std::string_view::npos;
+    const std::string prefix = isStroke ? "Stroke.Stop" : "Fill.Stop";
+    if (s.find("Color") != std::string_view::npos) {
+        return prefix + idxStr + "Color";
+    }
+    if (s.find("Offset") != std::string_view::npos) {
+        return prefix + idxStr + "Offset";
+    }
+    return "Unsupported.GradientStop";
+}
+
+[[nodiscard]] bool ParseTimelineAutoReverse(const XamlNode& node) {
+    if (const auto* ar = node.FindAttribute("AutoReverse")) {
+        return aero::str::EqualsIgnoreCase(aero::str::Trim(ar->value), "True");
+    }
+    return false;
+}
+
+[[nodiscard]] int ParseTimelineRepeatCount(const XamlNode& node) {
+    const auto* rb = node.FindAttribute("RepeatBehavior");
+    if (!rb) return 1;
+    const std::string_view raw = aero::str::Trim(rb->value);
+    if (raw.empty()) return 1;
+    if (aero::str::EqualsIgnoreCase(raw, "Forever")) return -1;
+    std::string_view numStr = raw;
+    if (!numStr.empty() && (numStr.back() == 'x' || numStr.back() == 'X')) {
+        numStr.remove_suffix(1);
+    }
+    float count = 1.0f;
+    if (aero::str::TryParseFloat32(numStr, count)) {
+        return std::max(1, static_cast<int>(std::lround(count)));
+    }
+    return 1;
+}
+
 [[nodiscard]] std::string NormalizeTargetPropertyPath(std::string_view raw) {
     std::string_view s = aero::str::Trim(raw);
     if (s.empty()) { return "Opacity"; }
     if (s == "Opacity" || s == "Width" || s == "Height" || s == "MinWidth" ||
         s == "MinHeight" || s == "Fill.Color" || s == "Stroke.Color" ||
-        s == "Background.Color" || s == "Foreground.Color") {
+        s == "Background.Color" || s == "Foreground.Color" ||
+        s == "Fill.Opacity" || s == "Stroke.Opacity") {
         return std::string(s);
     }
     if (s.find("SolidColorBrush.Color") != std::string_view::npos) {
@@ -377,6 +432,16 @@ struct XamlNode final {
         return "EffectOpacity";
     }
     if (s.find("Brush.Opacity") != std::string_view::npos || s == "BrushOpacity") {
+        if (s.find("Shape.Stroke") != std::string_view::npos ||
+            s.find("(Stroke)") != std::string_view::npos ||
+            s.find("Stroke.") != std::string_view::npos) {
+            return "Stroke.Opacity";
+        }
+        if (s.find("Shape.Fill") != std::string_view::npos ||
+            s.find("(Fill)") != std::string_view::npos ||
+            s.find("Fill.") != std::string_view::npos) {
+            return "Fill.Opacity";
+        }
         return "BrushOpacity";
     }
     if (s.find("BlurEffect.Radius") != std::string_view::npos || s == "Radius" || s == "BlurRadius") {
@@ -424,18 +489,10 @@ struct XamlNode final {
         s.find("TranslateZ") != std::string_view::npos || s.find("Translation3DZ") != std::string_view::npos) {
         return "Trans3DZ";
     }
-    if (s.find("OpacityMask") != std::string_view::npos &&
-        s.find("GradientStops") != std::string_view::npos &&
-        s.find("Offset") != std::string_view::npos) {
-        if (s.find("[0]") != std::string_view::npos) return "OpacityMask.Stop0.Offset";
-        if (s.find("[1]") != std::string_view::npos) return "OpacityMask.Stop1.Offset";
-        if (s.find("[2]") != std::string_view::npos) return "OpacityMask.Stop2.Offset";
-        if (s.find("[3]") != std::string_view::npos) return "OpacityMask.Stop3.Offset";
-    }
-    if (s.find("OpacityMask") != std::string_view::npos ||
-        s.find("GradientStops") != std::string_view::npos ||
-        s.find("GradientStop.") != std::string_view::npos) {
-        return "Unsupported.GradientStop";
+    if (s.find("GradientStops") != std::string_view::npos ||
+        s.find("GradientStop.") != std::string_view::npos ||
+        s.find("OpacityMask") != std::string_view::npos) {
+        return NormalizeGradientStopPath(s);
     }
     // Strip wrapping parentheses such as `(FrameworkElement.Width)` or `(UIElement.Opacity)`
     if (s.front() == '(' && s.back() == ')' && s.size() > 2) {
@@ -775,6 +832,42 @@ struct XamlNode final {
            localName == "DataTemplate" ||
            localName == "HierarchicalDataTemplate" ||
            localName == "ItemsPanelTemplate";
+}
+
+[[nodiscard]] bool CanEmitLazyToolTipNode(const XamlNode& node, bool isRoot) noexcept {
+    if (!node.GetName().empty()) {
+        return false;
+    }
+    if (IsPrunableExternalResourceTag(node.localName)) {
+        return false;
+    }
+    if (isRoot &&
+        (node.localName == "SolidColorBrush" ||
+         node.localName == "LinearGradientBrush" ||
+         node.localName == "RadialGradientBrush" ||
+         node.localName == "ImageBrush" ||
+         node.localName == "String")) {
+        return false;
+    }
+    for (const auto& attr : node.attributes) {
+        if (IsEventAttribute(attr.localName)) {
+            return false;
+        }
+        if (attr.value.find("ElementName") != std::string::npos ||
+            attr.value.find("TemplatedParent") != std::string::npos ||
+            attr.value.find("TemplateBinding") != std::string::npos ||
+            attr.value.find("FindAncestor") != std::string::npos ||
+            attr.value.find("AncestorType") != std::string::npos ||
+            attr.value.find("x:Reference") != std::string::npos) {
+            return false;
+        }
+    }
+    for (const auto& child : node.children) {
+        if (child && !CanEmitLazyToolTipNode(*child, false)) {
+            return false;
+        }
+    }
+    return true;
 }
 
 void ExpandControlHierarchy(std::unordered_set<std::string>& usedTypes) {
@@ -1954,6 +2047,43 @@ private:
         }
     }
 
+    void EmitGradientBrushCommonProps(
+        const XamlNode& brushNode,
+        std::string_view bVar,
+        std::ostringstream& out,
+        int indent) {
+        if (const auto* opAttr = brushNode.FindAttribute("Opacity")) {
+            float op = 1.0f;
+            if (aero::str::TryParseFloat32(opAttr->value, op)) {
+                Indent(out, indent);
+                out << bVar << ".Opacity = " << FormatFloatLiteral(op) << ";\n";
+            }
+        }
+        if (const auto* mmAttr = brushNode.FindAttribute("MappingMode")) {
+            const std::string_view mm = aero::str::Trim(mmAttr->value);
+            if (aero::str::EqualsIgnoreCase(mm, "Absolute")) {
+                Indent(out, indent);
+                out << bVar << ".MappingMode = 1;\n";
+            } else if (aero::str::EqualsIgnoreCase(mm, "RelativeToBoundingBox")) {
+                Indent(out, indent);
+                out << bVar << ".MappingMode = 0;\n";
+            }
+        }
+        if (const auto* smAttr = brushNode.FindAttribute("SpreadMethod")) {
+            const std::string_view sm = aero::str::Trim(smAttr->value);
+            if (aero::str::EqualsIgnoreCase(sm, "Reflect")) {
+                Indent(out, indent);
+                out << bVar << ".SpreadMethod = 1;\n";
+            } else if (aero::str::EqualsIgnoreCase(sm, "Repeat")) {
+                Indent(out, indent);
+                out << bVar << ".SpreadMethod = 2;\n";
+            } else if (aero::str::EqualsIgnoreCase(sm, "Pad")) {
+                Indent(out, indent);
+                out << bVar << ".SpreadMethod = 0;\n";
+            }
+        }
+    }
+
     [[nodiscard]] std::string EmitBrushObject(
         const XamlNode& brushNode,
         std::string_view /*targetProp*/,
@@ -2027,6 +2157,13 @@ private:
             }
             Indent(out, indent);
             out << "var " << bVar << " = new ImageBrush(" << EscapeRsString(src) << ");\n";
+            if (const auto* vbAttr = brushNode.FindAttribute("Viewbox")) {
+                const std::string_view vb = aero::str::Trim(vbAttr->value);
+                if (!vb.empty()) {
+                    Indent(out, indent);
+                    out << bVar << ".Viewbox = " << EscapeRsString(vb) << ";\n";
+                }
+            }
             if (const auto* stAttr = brushNode.FindAttribute("Stretch")) {
                 const std::string_view st = aero::str::Trim(stAttr->value);
                 if (!st.empty()) {
@@ -2065,13 +2202,7 @@ private:
             out << "var " << bVar << " = new LinearGradientBrush("
                 << FormatFloatLiteral(x0) << ", " << FormatFloatLiteral(y0) << ", "
                 << FormatFloatLiteral(x1) << ", " << FormatFloatLiteral(y1) << ");\n";
-            if (const auto* opAttr = brushNode.FindAttribute("Opacity")) {
-                float op = 1.0f;
-                if (aero::str::TryParseFloat32(opAttr->value, op)) {
-                    Indent(out, indent);
-                    out << bVar << ".Opacity = " << FormatFloatLiteral(op) << ";\n";
-                }
-            }
+            EmitGradientBrushCommonProps(brushNode, bVar, out, indent);
             EmitGradientStops(brushNode, bVar, dictVar, out, indent);
             return bVar;
         }
@@ -2107,13 +2238,7 @@ private:
                 << FormatFloatLiteral(cx) << ", " << FormatFloatLiteral(cy) << ", "
                 << FormatFloatLiteral(ox) << ", " << FormatFloatLiteral(oy) << ", "
                 << FormatFloatLiteral(rx) << ", " << FormatFloatLiteral(ry) << ");\n";
-            if (const auto* opAttr = brushNode.FindAttribute("Opacity")) {
-                float op = 1.0f;
-                if (aero::str::TryParseFloat32(opAttr->value, op)) {
-                    Indent(out, indent);
-                    out << bVar << ".Opacity = " << FormatFloatLiteral(op) << ";\n";
-                }
-            }
+            EmitGradientBrushCommonProps(brushNode, bVar, out, indent);
             EmitGradientStops(brushNode, bVar, dictVar, out, indent);
             return bVar;
         }
@@ -2614,6 +2739,42 @@ private:
         }
     }
 
+    void EmitTriggerEnterExitActions(
+        const XamlNode& trigNode,
+        std::string_view trigTypeName,
+        std::string_view trigVar,
+        std::ostringstream& out,
+        int indent) {
+        auto emitActionList = [&](std::string_view propName, std::string_view methodPrefix) {
+            const XamlNode* propEl = trigNode.FindPropertyElement(trigTypeName, propName);
+            if (!propEl) {
+                return;
+            }
+            for (const auto& act : propEl->children) {
+                if (!act || act->localName != "BeginStoryboard") {
+                    continue;
+                }
+                if (const auto* sbAttr = act->FindAttribute("Storyboard");
+                    sbAttr != nullptr && LooksLikeMarkupExtension(sbAttr->value)) {
+                    const std::string rk = ResolveResourceKeyFromExtension(ParseMarkupExtension(sbAttr->value));
+                    if (!rk.empty()) {
+                        Indent(out, indent);
+                        out << trigVar << "." << methodPrefix << "ActionKey(" << EscapeRsString(rk) << ");\n";
+                    }
+                }
+                for (const auto& sbNode : act->children) {
+                    if (sbNode && sbNode->localName == "Storyboard") {
+                        const std::string sb = EmitStoryboard(*sbNode, out, indent);
+                        Indent(out, indent);
+                        out << trigVar << "." << methodPrefix << "Action(" << sb << ");\n";
+                    }
+                }
+            }
+        };
+        emitActionList("EnterActions", "AddEnter");
+        emitActionList("ExitActions", "AddExit");
+    }
+
     void EmitTriggerCollectionInto(
         const XamlNode& trigProp,
         std::string_view ownerObjVar,
@@ -2638,6 +2799,7 @@ private:
                         EmitSetterInto(*s, tVar, dictVar, out, indent);
                     }
                 }
+                EmitTriggerEnterExitActions(*trig, "Trigger", tVar, out, indent);
                 Indent(out, indent);
                 out << ownerObjVar << ".AddTrigger(" << tVar << ");\n";
             } else if (trig->localName == "DataTrigger") {
@@ -2660,6 +2822,7 @@ private:
                         EmitSetterInto(*s, tVar, dictVar, out, indent);
                     }
                 }
+                EmitTriggerEnterExitActions(*trig, "DataTrigger", tVar, out, indent);
                 Indent(out, indent);
                 out << ownerObjVar << ".AddTrigger(" << tVar << ");\n";
             } else if (trig->localName == "MultiDataTrigger") {
@@ -2690,6 +2853,7 @@ private:
                         EmitSetterInto(*s, tVar, dictVar, out, indent);
                     }
                 }
+                EmitTriggerEnterExitActions(*trig, "MultiDataTrigger", tVar, out, indent);
                 Indent(out, indent);
                 out << ownerObjVar << ".AddTrigger(" << tVar << ");\n";
             } else if (trig->localName == "EventTrigger") {
@@ -2704,6 +2868,14 @@ private:
                 out << "var " << tVar << " = new EventTrigger(" << EscapeRsString(evName) << ");\n";
                 for (const auto& act : trig->children) {
                     if (act->localName == "BeginStoryboard") {
+                        if (const auto* sbAttr = act->FindAttribute("Storyboard");
+                            sbAttr != nullptr && LooksLikeMarkupExtension(sbAttr->value)) {
+                            const std::string rk = ResolveResourceKeyFromExtension(ParseMarkupExtension(sbAttr->value));
+                            if (!rk.empty()) {
+                                Indent(out, indent);
+                                out << tVar << ".AddActionKey(" << EscapeRsString(rk) << ");\n";
+                            }
+                        }
                         for (const auto& sbNode : act->children) {
                             if (sbNode->localName == "Storyboard") {
                                 const std::string sb = EmitStoryboard(*sbNode, out, indent);
@@ -2924,6 +3096,9 @@ private:
             if (const auto* bt = child->FindAttribute("BeginTime")) {
                 beginSec = ParseDurationSeconds(bt->value);
             }
+            const bool autoRev = ParseTimelineAutoReverse(*child);
+            const int repeatCount = ParseTimelineRepeatCount(*child);
+            const bool hasLoopParams = autoRev || (repeatCount != 1);
 
             int easeKind = 0;
             int easeMode = 0;
@@ -2967,14 +3142,37 @@ private:
                 }
                 Indent(out, indent);
                 if (hasFrom) {
-                    out << sbVar << ".AddDoubleAnimation("
+                    if (hasLoopParams) {
+                        out << sbVar << ".AddDoubleAnimationEx("
+                            << EscapeRsString(targetName) << ", "
+                            << EscapeRsString(targetProp) << ", "
+                            << FormatFloatLiteral(fromVal) << ", "
+                            << FormatFloatLiteral(toVal) << ", "
+                            << FormatFloatLiteral(durSec) << ", "
+                            << easeKind << ", " << easeMode << ", "
+                            << FormatFloatLiteral(beginSec) << ", "
+                            << (autoRev ? "true" : "false") << ", "
+                            << repeatCount << ");\n";
+                    } else {
+                        out << sbVar << ".AddDoubleAnimation("
+                            << EscapeRsString(targetName) << ", "
+                            << EscapeRsString(targetProp) << ", "
+                            << FormatFloatLiteral(fromVal) << ", "
+                            << FormatFloatLiteral(toVal) << ", "
+                            << FormatFloatLiteral(durSec) << ", "
+                            << easeKind << ", " << easeMode << ", "
+                            << FormatFloatLiteral(beginSec) << ");\n";
+                    }
+                } else if (hasLoopParams) {
+                    out << sbVar << ".AddDoubleToAnimationEx("
                         << EscapeRsString(targetName) << ", "
                         << EscapeRsString(targetProp) << ", "
-                        << FormatFloatLiteral(fromVal) << ", "
                         << FormatFloatLiteral(toVal) << ", "
                         << FormatFloatLiteral(durSec) << ", "
                         << easeKind << ", " << easeMode << ", "
-                        << FormatFloatLiteral(beginSec) << ");\n";
+                        << FormatFloatLiteral(beginSec) << ", "
+                        << (autoRev ? "true" : "false") << ", "
+                        << repeatCount << ");\n";
                 } else {
                     out << sbVar << ".AddDoubleToAnimation("
                         << EscapeRsString(targetName) << ", "
@@ -2987,8 +3185,10 @@ private:
             } else if (child->localName == "ColorAnimation") {
                 std::string fromHex = "#FFFFFFFF";
                 std::string toHex = "#FFFFFFFF";
+                bool hasFrom = false;
                 if (const auto* f = child->FindAttribute("From")) {
                     fromHex = ResolveColorHexOrString(f->value);
+                    hasFrom = true;
                 }
                 if (const auto* t = child->FindAttribute("To")) {
                     toHex = ResolveColorHexOrString(t->value);
@@ -2998,14 +3198,28 @@ private:
                     durSec = ParseDurationSeconds(d->value);
                 }
                 Indent(out, indent);
-                out << sbVar << ".AddColorAnimation("
-                    << EscapeRsString(targetName) << ", "
-                    << EscapeRsString(targetProp) << ", "
-                    << EscapeRsString(fromHex) << ", "
-                    << EscapeRsString(toHex) << ", "
-                    << FormatFloatLiteral(durSec) << ", "
-                    << easeKind << ", " << easeMode << ", "
-                    << FormatFloatLiteral(beginSec) << ");\n";
+                if (hasLoopParams) {
+                    out << sbVar << ".AddColorAnimationEx("
+                        << EscapeRsString(targetName) << ", "
+                        << EscapeRsString(targetProp) << ", "
+                        << EscapeRsString(fromHex) << ", "
+                        << EscapeRsString(toHex) << ", "
+                        << FormatFloatLiteral(durSec) << ", "
+                        << easeKind << ", " << easeMode << ", "
+                        << FormatFloatLiteral(beginSec) << ", "
+                        << (hasFrom ? "true" : "false") << ", "
+                        << (autoRev ? "true" : "false") << ", "
+                        << repeatCount << ");\n";
+                } else {
+                    out << sbVar << ".AddColorAnimation("
+                        << EscapeRsString(targetName) << ", "
+                        << EscapeRsString(targetProp) << ", "
+                        << EscapeRsString(fromHex) << ", "
+                        << EscapeRsString(toHex) << ", "
+                        << FormatFloatLiteral(durSec) << ", "
+                        << easeKind << ", " << easeMode << ", "
+                        << FormatFloatLiteral(beginSec) << ");\n";
+                }
             } else if (child->localName == "PointAnimation") {
                 float fx = 0.0f, fy = 0.0f, tx = 0.0f, ty = 0.0f;
                 std::vector<float> pts;
@@ -3062,16 +3276,30 @@ private:
                         }
                     }
                     const float segDur = std::max(0.001f, kt - prevTime);
+                    const bool segLoop = hasLoopParams && child->children.size() <= 2;
                     if (havePrev && kt > prevTime) {
                         Indent(out, indent);
-                        out << sbVar << ".AddDoubleAnimation("
-                            << EscapeRsString(targetName) << ", "
-                            << EscapeRsString(targetProp) << ", "
-                            << FormatFloatLiteral(prevVal) << ", "
-                            << FormatFloatLiteral(val) << ", "
-                            << FormatFloatLiteral(segDur) << ", "
-                            << kfEase << ", " << kfMode << ", "
-                            << FormatFloatLiteral(beginSec + prevTime) << ");\n";
+                        if (segLoop) {
+                            out << sbVar << ".AddDoubleAnimationEx("
+                                << EscapeRsString(targetName) << ", "
+                                << EscapeRsString(targetProp) << ", "
+                                << FormatFloatLiteral(prevVal) << ", "
+                                << FormatFloatLiteral(val) << ", "
+                                << FormatFloatLiteral(segDur) << ", "
+                                << kfEase << ", " << kfMode << ", "
+                                << FormatFloatLiteral(beginSec + prevTime) << ", "
+                                << (autoRev ? "true" : "false") << ", "
+                                << repeatCount << ");\n";
+                        } else {
+                            out << sbVar << ".AddDoubleAnimation("
+                                << EscapeRsString(targetName) << ", "
+                                << EscapeRsString(targetProp) << ", "
+                                << FormatFloatLiteral(prevVal) << ", "
+                                << FormatFloatLiteral(val) << ", "
+                                << FormatFloatLiteral(segDur) << ", "
+                                << kfEase << ", " << kfMode << ", "
+                                << FormatFloatLiteral(beginSec + prevTime) << ");\n";
+                        }
                     } else if (!havePrev && kt > 0.0001f) {
                         Indent(out, indent);
                         out << sbVar << ".AddDoubleToAnimation("
@@ -3088,7 +3316,7 @@ private:
                             << EscapeRsString(targetProp) << ", "
                             << FormatFloatLiteral(val) << ", "
                             << FormatFloatLiteral(val) << ", "
-                            << FormatFloatLiteral(segDur) << ", "
+                            << FormatFloatLiteral(kt > 0.0001f ? kt : 0.0f) << ", "
                             << kfEase << ", " << kfMode << ", "
                             << FormatFloatLiteral(beginSec + prevTime) << ");\n";
                     }
@@ -3109,17 +3337,54 @@ private:
                     if (const auto* va = kf->FindAttribute("Value")) {
                         hex = ResolveColorHexOrString(va->value);
                     }
+                    int kfEase = 0;
+                    int kfMode = 0;
+                    const XamlNode* kfEaseProp = kf->FindPropertyElement(kf->localName, "EasingFunction");
+                    if (kfEaseProp != nullptr && !kfEaseProp->children.empty()) {
+                        kfEase = MapEasingKind(kfEaseProp->children.front()->localName);
+                        if (const auto* em = kfEaseProp->children.front()->FindAttribute("EasingMode")) {
+                            kfMode = MapEasingMode(em->value);
+                        }
+                    }
                     const float segDur = std::max(0.001f, kt - prevTime);
+                    const bool segLoop = hasLoopParams && child->children.size() <= 2;
                     if ((havePrev && kt > prevTime) || (!havePrev && child->children.size() == 1)) {
                         const std::string& startHex = havePrev ? prevHex : hex;
+                        const float emitDur = havePrev ? segDur : (kt > 0.0001f ? kt : 0.0f);
                         Indent(out, indent);
-                        out << sbVar << ".AddColorAnimation("
+                        if (segLoop) {
+                            out << sbVar << ".AddColorAnimationEx("
+                                << EscapeRsString(targetName) << ", "
+                                << EscapeRsString(targetProp) << ", "
+                                << EscapeRsString(startHex) << ", "
+                                << EscapeRsString(hex) << ", "
+                                << FormatFloatLiteral(emitDur) << ", "
+                                << kfEase << ", " << kfMode << ", "
+                                << FormatFloatLiteral(beginSec + prevTime) << ", true, "
+                                << (autoRev ? "true" : "false") << ", "
+                                << repeatCount << ");\n";
+                        } else {
+                            out << sbVar << ".AddColorAnimation("
+                                << EscapeRsString(targetName) << ", "
+                                << EscapeRsString(targetProp) << ", "
+                                << EscapeRsString(startHex) << ", "
+                                << EscapeRsString(hex) << ", "
+                                << FormatFloatLiteral(emitDur) << ", "
+                                << kfEase << ", " << kfMode << ", "
+                                << FormatFloatLiteral(beginSec + prevTime) << ");\n";
+                        }
+                    } else if (!havePrev && kt > 0.0001f) {
+                        Indent(out, indent);
+                        out << sbVar << ".AddColorAnimationEx("
                             << EscapeRsString(targetName) << ", "
                             << EscapeRsString(targetProp) << ", "
-                            << EscapeRsString(startHex) << ", "
                             << EscapeRsString(hex) << ", "
-                            << FormatFloatLiteral(segDur) << ", 0, 0, "
-                            << FormatFloatLiteral(beginSec + prevTime) << ");\n";
+                            << EscapeRsString(hex) << ", "
+                            << FormatFloatLiteral(kt) << ", "
+                            << kfEase << ", " << kfMode << ", "
+                            << FormatFloatLiteral(beginSec) << ", false, "
+                            << (autoRev ? "true" : "false") << ", "
+                            << repeatCount << ");\n";
                     }
                     prevTime = kt;
                     prevHex = hex;
@@ -3661,6 +3926,16 @@ private:
             return;
         }
 
+        if (targetType == "LayoutScaler" && propName == "ReferenceResolution") {
+            std::vector<float> vals;
+            if (TryParseFloatList(rawVal, vals) && vals.size() >= 2) {
+                Indent(out, indent);
+                out << targetVar << ".ReferenceResolution = new Size("
+                    << FormatFloatLiteral(vals[0]) << ", " << FormatFloatLiteral(vals[1]) << ");\n";
+                return;
+            }
+        }
+
         if (IsDirectUIProperty(propName) && propName != "Title") {
             Indent(out, indent);
             out << targetVar << "." << propName << " = "
@@ -3907,6 +4182,47 @@ private:
 
         if (!xDataType.empty() && !explicitSourceVar.empty() &&
             !cleanPath.empty() && cleanPath.find('.') == std::string::npos &&
+            spec.converterKey.empty() && spec.stringFormat.empty() && inlineConvExpr.empty() &&
+            !needExtended && !targetType.empty() && (modeInt == 0 || modeInt == 2)) {
+            if (modeInt == 2) {
+                const std::string typedVar = FreshVar("__vm");
+                Indent(out, indent);
+                out << "if (" << explicitSourceVar << " is " << xDataType << " " << typedVar << ") { ";
+                if (propName == "Content") {
+                    out << targetVar << ".SetContent(" << typedVar << "." << cleanPath << ");";
+                } else if (IsDirectUIProperty(propName)) {
+                    out << targetVar << "." << propName << " = " << typedVar << "." << cleanPath << ";";
+                } else {
+                    out << targetVar << ".SetPropertyBox(" << EscapeRsString(propName)
+                        << ", DependencyObject.BoxObject(" << typedVar << "." << cleanPath << "));";
+                }
+                out << " }\n";
+                return;
+            }
+            const std::string tArg = FreshVar("__tgt");
+            const std::string sArg = FreshVar("__src");
+            const std::string tEl = FreshVar("__tel");
+            const std::string vmVar = FreshVar("__vm");
+            Indent(out, indent);
+            out << "BindingEngine.BindCompiledAction(" << bindTarget << ", "
+                << EscapeRsString(propName) << ", " << srcExpr << ", 0, "
+                << "(UIElement " << tArg << ", object " << sArg << ") => { "
+                << "if (" << tArg << " is " << targetType << " " << tEl << " && "
+                << sArg << " is " << xDataType << " " << vmVar << ") { ";
+            if (propName == "Content") {
+                out << tEl << ".SetContent(" << vmVar << "." << cleanPath << ");";
+            } else if (IsDirectUIProperty(propName)) {
+                out << tEl << "." << propName << " = " << vmVar << "." << cleanPath << ";";
+            } else {
+                out << tEl << ".SetPropertyBox(" << EscapeRsString(propName)
+                    << ", DependencyObject.BoxObject(" << vmVar << "." << cleanPath << "));";
+            }
+            out << " } });\n";
+            return;
+        }
+
+        if (!xDataType.empty() && !explicitSourceVar.empty() &&
+            !cleanPath.empty() && cleanPath.find('.') == std::string::npos &&
             spec.converterKey.empty() && spec.stringFormat.empty() && inlineConvExpr.empty()) {
             const std::string typedVar = FreshVar("__vm");
             Indent(out, indent);
@@ -4116,6 +4432,17 @@ private:
                                 xDataType, out, indent, explicitBindSourceVar);
                         }
                     }
+                } else if (brushChild.localName == "ImageBrush") {
+                    if (const auto* srcAttr = brushChild.FindAttribute("ImageSource");
+                        srcAttr != nullptr && LooksLikeMarkupExtension(srcAttr->value)) {
+                        const auto ext = ParseMarkupExtension(srcAttr->value);
+                        ParsedBindingSpec bSpec;
+                        if (TryExtractBindingSpec(ext, bSpec)) {
+                            EmitBindingSpec(
+                                targetVar, resolvedTypeName, shortProp + ".ImageSource", bSpec,
+                                xDataType, out, indent, explicitBindSourceVar);
+                        }
+                    }
                 }
                 continue;
             }
@@ -4162,6 +4489,28 @@ private:
                     explicitBindSourceVar);
                 Indent(out, indent);
                 out << targetVar << "." << shortProp << " = " << sub << ";\n";
+                continue;
+            }
+            if (shortProp == "ToolTip" && !propNode->children.empty() &&
+                currentTplParentVar_.empty() &&
+                CanEmitLazyToolTipNode(*propNode->children.front(), true)) {
+                const std::string dcParam = FreshVar("__tipDc");
+                Indent(out, indent);
+                out << targetVar << ".SetLazyToolTip((object " << dcParam << ") =>\n";
+                Indent(out, indent);
+                out << "{\n";
+                const bool prevPartial = inPartialClass_;
+                inPartialClass_ = false;
+                const std::string sub = EmitConstructedElement(
+                    *propNode->children.front(), xDataType, {}, currentXamlPath, out, indent + 1,
+                    dcParam);
+                inPartialClass_ = prevPartial;
+                Indent(out, indent + 1);
+                out << sub << ".DataContext = " << dcParam << ";\n";
+                Indent(out, indent + 1);
+                out << "return " << sub << ";\n";
+                Indent(out, indent);
+                out << "});\n";
                 continue;
             }
             if ((shortProp == "Content" || shortProp == "Header" || shortProp == "Icon" ||
@@ -4613,13 +4962,28 @@ private:
                 }
             }
         } else if (act.localName == "BeginStoryboard") {
+            std::string sbKey;
+            std::string sbVar;
+            if (const auto* sbAttr = act.FindAttribute("Storyboard");
+                sbAttr != nullptr && LooksLikeMarkupExtension(sbAttr->value)) {
+                sbKey = ResolveResourceKeyFromExtension(ParseMarkupExtension(sbAttr->value));
+            }
             for (const auto& sbNode : act.children) {
                 if (sbNode->localName == "Storyboard") {
-                    const std::string sbVar = EmitStoryboard(*sbNode, out, indent);
-                    Indent(out, indent);
-                    out << "var " << av << " = new ControlStoryboardAction(" << sbVar << ");\n";
+                    sbVar = EmitStoryboard(*sbNode, out, indent);
                     break;
                 }
+            }
+            if (!sbVar.empty()) {
+                Indent(out, indent);
+                out << "var " << av << " = new ControlStoryboardAction(" << sbVar << ");\n";
+            } else if (!sbKey.empty()) {
+                Indent(out, indent);
+                out << "var " << av << " = new ControlStoryboardAction();\n";
+                Indent(out, indent);
+                out << av << ".StoryboardKey = " << EscapeRsString(sbKey) << ";\n";
+            } else {
+                return {};
             }
         } else {
             return {};
@@ -4863,6 +5227,34 @@ private:
         }
     }
 
+    [[nodiscard]] bool StoryboardHasAnimatedTimeline(const XamlNode& sbNode) {
+        if (ParseTimelineAutoReverse(sbNode) || ParseTimelineRepeatCount(sbNode) != 1) {
+            return true;
+        }
+        for (const auto& tl : sbNode.children) {
+            if (!tl) continue;
+            if (ParseTimelineAutoReverse(*tl) || ParseTimelineRepeatCount(*tl) != 1) {
+                return true;
+            }
+            if (tl->children.size() > 1u) {
+                return true;
+            }
+            if (const auto* d = tl->FindAttribute("Duration")) {
+                if (ParseDurationSeconds(d->value) > 0.001f) {
+                    return true;
+                }
+            }
+            if (!tl->children.empty()) {
+                if (const auto* kt = tl->children.back()->FindAttribute("KeyTime")) {
+                    if (ParseDurationSeconds(kt->value) > 0.001f) {
+                        return true;
+                    }
+                }
+            }
+        }
+        return false;
+    }
+
     void EmitVisualStateStoryboardSetters(
         const XamlNode& sbNode,
         std::string_view vsVar,
@@ -4884,13 +5276,18 @@ private:
             }
             if (targetProp.empty() || targetProp == "Unsupported.GradientStop") continue;
 
+            const bool useInitialAnchor =
+                ParseTimelineAutoReverse(*tl) || (ParseTimelineRepeatCount(*tl) != 1);
+
             if (tl->localName == "DoubleAnimation" ||
                 tl->localName == "BounceAnimation" ||
                 tl->localName == "ElasticAnimation" ||
                 tl->localName == "BackAnimation") {
-                if (const auto* t = tl->FindAttribute("To")) {
+                const auto* valAttr = useInitialAnchor ? tl->FindAttribute("From") : tl->FindAttribute("To");
+                if (!valAttr) valAttr = tl->FindAttribute("To");
+                if (valAttr) {
                     float toVal = 0.0f;
-                    if (aero::str::TryParseFloat32(t->value, toVal)) {
+                    if (aero::str::TryParseFloat32(valAttr->value, toVal)) {
                         Indent(out, indent);
                         out << vsVar << ".AddSetterBox(" << EscapeRsString(targetProp)
                             << ", DependencyObject.BoxFloat(" << FormatFloatLiteral(toVal) << "), "
@@ -4898,8 +5295,8 @@ private:
                     }
                 }
             } else if (tl->localName == "DoubleAnimationUsingKeyFrames" && !tl->children.empty()) {
-                const auto& lastKf = *tl->children.back();
-                if (const auto* va = lastKf.FindAttribute("Value")) {
+                const auto& anchorKf = useInitialAnchor ? *tl->children.front() : *tl->children.back();
+                if (const auto* va = anchorKf.FindAttribute("Value")) {
                     float val = 0.0f;
                     if (aero::str::TryParseFloat32(va->value, val)) {
                         Indent(out, indent);
@@ -4909,16 +5306,18 @@ private:
                     }
                 }
             } else if (tl->localName == "ColorAnimation") {
-                if (const auto* t = tl->FindAttribute("To")) {
-                    const std::string hex = ResolveColorHexOrString(t->value);
+                const auto* colAttr = useInitialAnchor ? tl->FindAttribute("From") : tl->FindAttribute("To");
+                if (!colAttr) colAttr = tl->FindAttribute("To");
+                if (colAttr) {
+                    const std::string hex = ResolveColorHexOrString(colAttr->value);
                     Indent(out, indent);
                     out << vsVar << ".AddSetterBox(" << EscapeRsString(targetProp)
                         << ", DependencyObject.BoxString(" << EscapeRsString(hex) << "), "
                         << EscapeRsString(targetName) << ");\n";
                 }
             } else if (tl->localName == "ColorAnimationUsingKeyFrames" && !tl->children.empty()) {
-                const auto& lastKf = *tl->children.back();
-                if (const auto* va = lastKf.FindAttribute("Value")) {
+                const auto& anchorKf = useInitialAnchor ? *tl->children.front() : *tl->children.back();
+                if (const auto* va = anchorKf.FindAttribute("Value")) {
                     const std::string hex = ResolveColorHexOrString(va->value);
                     Indent(out, indent);
                     out << vsVar << ".AddSetterBox(" << EscapeRsString(targetProp)
@@ -4983,16 +5382,24 @@ private:
                         }
                     }
                 }
+                auto emitInlineSb = [&](const XamlNode& sbNode) {
+                    EmitVisualStateStoryboardSetters(sbNode, vsVar, dictVar, out, indent);
+                    if (StoryboardHasAnimatedTimeline(sbNode)) {
+                        const std::string sbVar = EmitStoryboard(sbNode, out, indent);
+                        Indent(out, indent);
+                        out << vsVar << ".Storyboard = " << sbVar << ";\n";
+                    }
+                };
                 if (const auto* sbProp = stNode->FindPropertyElement("VisualState", "Storyboard")) {
                     for (const auto& c : sbProp->children) {
                         if (c && c->localName == "Storyboard") {
-                            EmitVisualStateStoryboardSetters(*c, vsVar, dictVar, out, indent);
+                            emitInlineSb(*c);
                         }
                     }
                 }
                 for (const auto& c : stNode->children) {
                     if (c && c->localName == "Storyboard") {
-                        EmitVisualStateStoryboardSetters(*c, vsVar, dictVar, out, indent);
+                        emitInlineSb(*c);
                     }
                 }
 

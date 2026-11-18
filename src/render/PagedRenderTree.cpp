@@ -965,13 +965,14 @@ TextLayoutResult PagedRenderTree::MeasureTextWithStore(
     std::string_view fontFamily,
     float fontSize,
     float maxWidth,
-    TextWrapping wrapMode) const {
+    TextWrapping wrapMode,
+    float charSpacing) const {
     if (resourceStore_ != nullptr) {
         if (FontAtlas* storeFonts = resourceStore_->TryFonts(); storeFonts != nullptr) {
-            return storeFonts->MeasureLayout(utf8Text, fontFamily, fontSize, maxWidth, wrapMode);
+            return storeFonts->MeasureLayout(utf8Text, fontFamily, fontSize, maxWidth, wrapMode, charSpacing);
         }
     }
-    return MeasureTextLayout(utf8Text, fontFamily, fontSize, maxWidth, wrapMode);
+    return MeasureTextLayout(utf8Text, fontFamily, fontSize, maxWidth, wrapMode, charSpacing);
 }
 
 GlyphUvRect PagedRenderTree::LookupCodePointGlyph(std::uint32_t codePoint) const noexcept {
@@ -2075,9 +2076,10 @@ std::uint16_t PagedRenderTree::EmitTextRunNodes(
     TextWrapping wrapMode,
     TextAlignment textAlign,
     float alignBoxWidth,
-    const std::vector<RichGlyphStyle>* optRichStyles) {
+    const std::vector<RichGlyphStyle>* optRichStyles,
+    float charSpacing) {
     const std::uint32_t maxQuadsPerPage = static_cast<std::uint32_t>(kVerticesPerCommandPage / 4u);
-    TextLayoutResult layout = MeasureTextWithStore(utf8Text, fontFamily, fontSize, maxWidth, wrapMode);
+    TextLayoutResult layout = MeasureTextWithStore(utf8Text, fontFamily, fontSize, maxWidth, wrapMode, charSpacing);
     ApplyTextAlignmentToLayout(layout, textAlign, alignBoxWidth);
     const std::size_t visibleGlyphs = CountLayoutVisibleGlyphs(layout);
     const std::size_t totalDesiredSlots = std::max<std::size_t>(visibleGlyphs + 8u, 16u);

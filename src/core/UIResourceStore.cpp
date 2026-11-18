@@ -320,6 +320,67 @@ void UIResourceStore::ClearMtsdfPaths() noexcept {
     pathMaskEntries_.clear();
 }
 
+bool UIResourceStore::StoreOrLookupPathMaskLocked(
+    std::uint64_t key,
+    std::uint32_t texW,
+    std::uint32_t texH,
+    float u0,
+    float v0,
+    float u1,
+    float v1,
+    std::vector<std::uint8_t>&& rgba8,
+    RasterizedPathMaskEntry& outEntry) {
+    const ImageAtlasRegisterSlotFn slotFn = gImageRegisterSlot.load(std::memory_order_acquire);
+    if (!slotFn) {
+        return false;
+    }
+    ImageAtlas& atlas = Images();
+
+    std::uint32_t reuseSlotId = 0u;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (const auto it = pathMaskEntries_.find(key); it != pathMaskEntries_.end()) {
+            it->second.lastUsedTick = ++pathMaskAccessSeq_;
+            outEntry = it->second;
+            return true;
+        }
+        if (pathMaskEntries_.size() >= 256u) {
+            auto lru = pathMaskEntries_.begin();
+            for (auto it = pathMaskEntries_.begin(); it != pathMaskEntries_.end(); ++it) {
+                if (it->second.lastUsedTick < lru->second.lastUsedTick) {
+                    lru = it;
+                }
+            }
+            if (lru != pathMaskEntries_.end()) {
+                reuseSlotId = lru->second.textureId;
+                pathMaskEntries_.erase(lru);
+            }
+        }
+    }
+
+    const std::uint32_t texId = slotFn(atlas, reuseSlotId, texW, texH, std::move(rgba8));
+    if (texId == 0u) {
+        return false;
+    }
+
+    RasterizedPathMaskEntry entry{};
+    entry.textureId = texId;
+    entry.texWidth = texW;
+    entry.texHeight = texH;
+    entry.u0 = u0;
+    entry.v0 = v0;
+    entry.u1 = u1;
+    entry.v1 = v1;
+
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        entry.lastUsedTick = ++pathMaskAccessSeq_;
+        pathMaskEntries_.emplace(key, entry);
+    }
+    outEntry = entry;
+    return true;
+}
+
 bool UIResourceStore::GetOrRasterizePathMask(
     std::uint64_t pathHash,
     std::string_view pathData,
@@ -358,13 +419,37 @@ bool UIResourceStore::GetOrRasterizePathMask(
 
     const std::uint32_t texW = clampedW + 2u * clampedPad;
     const std::uint32_t texH = clampedH + 2u * clampedPad;
-    const ImageAtlasRegisterSlotFn slotFn = gImageRegisterSlot.load(std::memory_order_acquire);
-    if (!slotFn) {
+    const float u0 = static_cast<float>(clampedPad) / static_cast<float>(texW);
+    const float v0 = static_cast<float>(clampedPad) / static_cast<float>(texH);
+    const float u1 = static_cast<float>(clampedPad + clampedW) / static_cast<float>(texW);
+    const float v1 = static_cast<float>(clampedPad + clampedH) / static_cast<float>(texH);
+    return StoreOrLookupPathMaskLocked(key, texW, texH, u0, v0, u1, v1, std::move(rgba8), outEntry);
+}
+
+bool UIResourceStore::GetOrRasterizePathStrokeMask(
+    std::uint64_t pathHash,
+    std::string_view pathData,
+    const Rect& rawBounds,
+    std::uint32_t innerW,
+    std::uint32_t innerH,
+    float strokeWidthPx,
+    std::uint32_t padPx,
+    RasterizedPathMaskEntry& outEntry) {
+    if (pathData.empty() || strokeWidthPx <= 0.0f) {
         return false;
     }
-    ImageAtlas& atlas = Images();
+    const std::uint64_t safeHash = (pathHash != 0ull) ? pathHash : ComputeSvgPathHash(pathData);
+    const std::uint32_t clampedW = std::clamp<std::uint32_t>(innerW, 1u, 2048u);
+    const std::uint32_t clampedH = std::clamp<std::uint32_t>(innerH, 1u, 2048u);
+    const std::uint32_t clampedPad = std::clamp<std::uint32_t>(padPx, 1u, 64u);
+    const auto quantizedStroke = static_cast<std::uint64_t>(std::max<long>(1L, std::lround(strokeWidthPx * 16.0f)));
 
-    std::uint32_t reuseSlotId = 0u;
+    std::uint64_t key = safeHash ^ 0xD1B54A32D192ED03ULL;
+    key ^= (static_cast<std::uint64_t>(clampedW) << 32u) | static_cast<std::uint64_t>(clampedH);
+    key *= 1099511628211ULL;
+    key ^= (quantizedStroke << 8u) | static_cast<std::uint64_t>(clampedPad);
+    key *= 1099511628211ULL;
+
     {
         std::lock_guard<std::mutex> lock(mutex_);
         if (const auto it = pathMaskEntries_.find(key); it != pathMaskEntries_.end()) {
@@ -372,41 +457,17 @@ bool UIResourceStore::GetOrRasterizePathMask(
             outEntry = it->second;
             return true;
         }
-        if (pathMaskEntries_.size() >= 256u) {
-            auto lru = pathMaskEntries_.begin();
-            for (auto it = pathMaskEntries_.begin(); it != pathMaskEntries_.end(); ++it) {
-                if (it->second.lastUsedTick < lru->second.lastUsedTick) {
-                    lru = it;
-                }
-            }
-            if (lru != pathMaskEntries_.end()) {
-                reuseSlotId = lru->second.textureId;
-                pathMaskEntries_.erase(lru);
-            }
-        }
     }
 
-    const std::uint32_t texId = slotFn(atlas, reuseSlotId, texW, texH, std::move(rgba8));
-    if (texId == 0u) {
+    std::vector<std::uint8_t> rgba8;
+    if (!RasterizeSvgPathStrokeAlphaMask(
+            pathData, rawBounds, clampedW, clampedH, strokeWidthPx, clampedPad, rgba8)) {
         return false;
     }
 
-    RasterizedPathMaskEntry entry{};
-    entry.textureId = texId;
-    entry.texWidth = texW;
-    entry.texHeight = texH;
-    entry.u0 = static_cast<float>(clampedPad) / static_cast<float>(texW);
-    entry.v0 = static_cast<float>(clampedPad) / static_cast<float>(texH);
-    entry.u1 = static_cast<float>(clampedPad + clampedW) / static_cast<float>(texW);
-    entry.v1 = static_cast<float>(clampedPad + clampedH) / static_cast<float>(texH);
-
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        entry.lastUsedTick = ++pathMaskAccessSeq_;
-        pathMaskEntries_.emplace(key, entry);
-    }
-    outEntry = entry;
-    return true;
+    const std::uint32_t texW = clampedW + 2u * clampedPad;
+    const std::uint32_t texH = clampedH + 2u * clampedPad;
+    return StoreOrLookupPathMaskLocked(key, texW, texH, 0.0f, 0.0f, 1.0f, 1.0f, std::move(rgba8), outEntry);
 }
 
 void UIResourceStore::ClearAll() noexcept {

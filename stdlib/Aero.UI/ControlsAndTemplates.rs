@@ -259,6 +259,31 @@ public class Control : FrameworkElement {
         base.SyncPadding();
     }
 
+    protected bool HasExplicitForeground() { return _hasExplicitForeground; }
+
+    protected void SetInheritedDefaultForeground(Brush fg) {
+        if (_hasExplicitForeground || fg == null) { return; }
+        _foreground = fg;
+        SetExplicitTextForeground(fg);
+        OnTypographyChanged();
+    }
+
+    protected void UpdateInheritedForegroundForBackground(Brush bg) {
+        if (_hasExplicitForeground || bg == null) { return; }
+        uint rgba = bg.ResolveRgba();
+        uint a = (rgba / 16777216u) % 256u;
+        if (a <= 128u) { return; }
+        uint r = rgba % 256u;
+        uint g = (rgba / 256u) % 256u;
+        uint b = (rgba / 65536u) % 256u;
+        uint lum = (r * 299u + g * 587u + b * 114u) / 1000u;
+        if (lum > 150u) {
+            SetInheritedDefaultForeground(Brushes.Black());
+        } else {
+            SetInheritedDefaultForeground(Brushes.DefaultForeground());
+        }
+    }
+
     protected virtual void OnTypographyChanged() {
         SyncTemplatePresenters();
     }
@@ -279,6 +304,7 @@ public class Control : FrameworkElement {
     }
 
     private void PropagateTypography(UIElement rootNode) {
+        PropagateTypographyToSubtree();
         if (rootNode == null) { return; }
         UIElement self = this;
         var q = new UIElement[0];
@@ -291,13 +317,6 @@ public class Control : FrameworkElement {
             if (node is ContentPresenter) {
                 (node as ContentPresenter).SyncFromTemplatedParent(this);
                 continue;
-            }
-            if (node is TextBlock) {
-                TextBlock tb = node as TextBlock;
-                if (_hasExplicitForeground) { tb.Foreground = _foreground; }
-                if (_hasExplicitFontSize) { tb.FontSize = _fontSize; }
-                if (_hasExplicitFontFamily) { tb.FontFamily = _fontFamily; }
-                if (_hasExplicitFontWeight) { tb.FontWeight = _fontWeight; }
             }
             for (int i = 0; i < node.ChildCount(); i += 1) {
                 UIElement ch = node.ChildAt(i);
@@ -739,6 +758,7 @@ public class ContentControl : Control {
             _presenter.SetContentBox(_contentBox);
         }
         OnContentChanged(DependencyObject.Unbox(oldBox), DependencyObject.Unbox(_contentBox));
+        UpdateTriggersAndStates();
     }
 
     public DataTemplate ContentTemplate {
@@ -757,6 +777,7 @@ public class ContentControl : Control {
             _presenter.SetContentAndTemplate(_contentBox, _contentTemplate);
         }
         OnContentChanged(DependencyObject.Unbox(oldBox), DependencyObject.Unbox(_contentBox));
+        UpdateTriggersAndStates();
     }
 
     protected virtual void OnContentChanged(object oldContent, object newContent) {}

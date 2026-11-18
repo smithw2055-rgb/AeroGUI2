@@ -1,6 +1,8 @@
 #include "aero/app/AeroAppHost.hpp"
+#include "aero/asset/GradientBrush.hpp"
 #include "aero/compiler/AeroCompilerV3.hpp"
 #include "aero/core/RsAliases.hpp"
+#include "aero/core/UIResourceStore.hpp"
 #include "aero/render/ZeroCopyGpuStream.hpp"
 
 #include <algorithm>
@@ -801,6 +803,30 @@ void TestGalleryStandaloneSubPages(std::uint32_t clearRgba) {
     }
 }
 
+[[nodiscard]] aero::VisualNodeId FindDescendantByOwnerName(
+    aero::AeroAppHost& host,
+    aero::VisualNodeId rootId,
+    std::string_view ownerName) {
+    const aero::VisualWorld& world = host.World();
+    std::vector<aero::VisualNodeId> q{rootId};
+    for (std::size_t i = 0u; i < q.size(); ++i) {
+        const aero::VisualNode* n = world.GetNode(q[i]);
+        if (!n) { continue; }
+        std::string name;
+        if (q[i] != rootId &&
+            n->hasScriptOwner &&
+            n->scriptOwner.valid() &&
+            ReadStringMember(host, n->scriptOwner, "Name", name) &&
+            name == ownerName) {
+            return q[i];
+        }
+        for (aero::VisualNodeId cid : n->children) {
+            q.push_back(cid);
+        }
+    }
+    return aero::VisualNodeId{};
+}
+
 void TestInteractiveButtons(aero::rs_comp::CompilerSession& session) {
     std::cout << "[Interactive] Buttons...\n";
     aero::AeroV3CompileInput ci;
@@ -830,12 +856,76 @@ void TestInteractiveButtons(aero::rs_comp::CompilerSession& session) {
     Require(ReadIntMember(host, vmRef, "SettingsCount", settings0) && settings0 == 0, "Buttons SettingsCount should start at 0");
     Require(ReadStringMember(host, vmRef, "State", state0) && state0 == "Menu", "Buttons initial State should be Menu");
 
+    const aero::VisualNodeId startBtnId = host.FindVisualByOwnerName("StartButton");
+    const aero::VisualNodeId settingsBtnId = host.FindVisualByOwnerName("SettingsButton");
+    Require(startBtnId.IsValid() && settingsBtnId.IsValid(), "Buttons StartButton/SettingsButton visual nodes missing");
+    const aero::VisualNode* startBtnNode = host.World().GetNode(startBtnId);
+    const aero::VisualNode* settingsBtnNode = host.World().GetNode(settingsBtnId);
+    bool startFocused0 = false;
+    bool settingsFocused0 = true;
+    Require(startBtnNode && ReadBoolMember(host, startBtnNode->scriptOwner, "IsFocused", startFocused0) && startFocused0,
+        "Buttons StartButton should start focused");
+    Require(settingsBtnNode && ReadBoolMember(host, settingsBtnNode->scriptOwner, "IsFocused", settingsFocused0) && !settingsFocused0,
+        "Buttons SettingsButton should start unfocused");
+
+    const aero::VisualNodeId startHostId = FindDescendantByOwnerName(host, startBtnId, "ContentHost");
+    const aero::VisualNodeId settingsHostId = FindDescendantByOwnerName(host, settingsBtnId, "ContentHost");
+    const aero::VisualNodeId startFocusOuterId = FindDescendantByOwnerName(host, startBtnId, "FocusedOuter");
+    const aero::VisualNodeId startFocusHiId = FindDescendantByOwnerName(host, startBtnId, "FocusedOuterHi");
+    const aero::VisualNodeId settingsFocusOuterId = FindDescendantByOwnerName(host, settingsBtnId, "FocusedOuter");
+    Require(startHostId.IsValid() && settingsHostId.IsValid() &&
+            startFocusOuterId.IsValid() && startFocusHiId.IsValid() && settingsFocusOuterId.IsValid(),
+        "Buttons template ContentHost/FocusedOuter parts missing");
+    const aero::VisualNode* startHost = host.World().GetNode(startHostId);
+    const aero::VisualNode* settingsHost = host.World().GetNode(settingsHostId);
+    const aero::VisualNode* startFocusOuter = host.World().GetNode(startFocusOuterId);
+    const aero::VisualNode* startFocusHi = host.World().GetNode(startFocusHiId);
+    const aero::VisualNode* settingsFocusOuter = host.World().GetNode(settingsFocusOuterId);
+    Require(startHost && startHost->text.fgRgba == 0xFFFFFFFFu,
+        "Buttons focused StartButton ContentHost should be White (0xFFFFFFFF)");
+    Require(settingsHost && settingsHost->text.fgRgba == 0xFFB58E48u,
+        "Buttons unfocused SettingsButton ContentHost should be #FF488EB5 (0xFFB58E48), got " +
+        std::to_string(settingsHost ? settingsHost->text.fgRgba : 0u));
+    Require(startFocusOuter && startFocusOuter->vector.strokeOpacity > 0.9f &&
+            startFocusHi && startFocusHi->vector.strokeOpacity > 0.9f,
+        "Buttons focused StartButton FocusedOuter & FocusedOuterHi should have visible strokeOpacity");
+    Require(settingsFocusOuter && settingsFocusOuter->vector.strokeOpacity < 0.1f,
+        "Buttons unfocused SettingsButton FocusedOuter should remain hidden");
+
     float sx = 0.0f, sy = 0.0f;
     float stx = 0.0f, sty = 0.0f;
     Require(RequireNodeCenter(host, "StartButton", sx, sy), "Buttons StartButton missing");
     Require(RequireNodeCenter(host, "SettingsButton", stx, sty), "Buttons SettingsButton missing");
 
+    // Hover SettingsButton -> MouseEnter triggers SetFocusAction -> GotFocus plays AudioSlide.mp3
+    const std::size_t soundsBeforeHover = host.PlayedSoundCount();
+    host.InjectPointerMove(stx, sty);
+    for (int f = 0; f < 18; ++f) {
+        host.StepFrame(1.0f / 60.0f, f == 17);
+    }
+    bool startFocusedHover = true;
+    bool settingsFocusedHover = false;
+    Require(ReadBoolMember(host, startBtnNode->scriptOwner, "IsFocused", startFocusedHover) && !startFocusedHover &&
+            ReadBoolMember(host, settingsBtnNode->scriptOwner, "IsFocused", settingsFocusedHover) && settingsFocusedHover,
+        "Buttons hover on SettingsButton should transfer focus from StartButton");
+    startHost = host.World().GetNode(startHostId);
+    settingsHost = host.World().GetNode(settingsHostId);
+    startFocusOuter = host.World().GetNode(startFocusOuterId);
+    settingsFocusOuter = host.World().GetNode(settingsFocusOuterId);
+    Require(settingsHost && settingsHost->text.fgRgba == 0xFFFFFFFFu,
+        "Buttons newly focused SettingsButton ContentHost should turn White");
+    Require(startHost && startHost->text.fgRgba == 0xFFB58E48u,
+        "Buttons unfocused StartButton ContentHost should transition back to #FF488EB5");
+    Require(settingsFocusOuter && settingsFocusOuter->vector.strokeOpacity > 0.9f &&
+            startFocusOuter && startFocusOuter->vector.strokeOpacity < 0.1f,
+        "Buttons focus glow strokeOpacity should transfer to SettingsButton");
+    Require(host.PlayedSoundCount() > soundsBeforeHover,
+        "Buttons hovering SettingsButton should trigger AudioSlide.mp3 via GotFocus");
+
     host.InjectPointerMove(sx, sy);
+    for (int f = 0; f < 18; ++f) {
+        host.StepFrame(1.0f / 60.0f, f == 17);
+    }
     host.InjectClick(sx, sy);
     host.StepFrame(1.0f / 60.0f, true);
 
@@ -850,6 +940,7 @@ void TestInteractiveButtons(aero::rs_comp::CompilerSession& session) {
     Require(host.RenderHeadlessRgba(800u, 600u, frame1), "Buttons post-click render failed");
     Require(CountChangedPixels(frame0, frame1) > 0u, "Buttons render pixels should update after Start click");
 
+    host.InjectPointerMove(stx, sty);
     host.InjectClick(stx, sty);
     host.StepFrame(1.0f / 60.0f, true);
     std::int64_t settings1 = 0;
@@ -1365,6 +1456,48 @@ void TestInteractiveQuestLog(aero::rs_comp::CompilerSession& session) {
     float qOffUp = -1.0f;
     Require(ReadFloatMember(host, qSvNode->scriptOwner, "VerticalOffset", qOffUp) && std::fabs(qOffUp) < 1.0f,
         "QuestLog wheel up (+1 notch) should scroll UP back to ~0, got " + std::to_string(qOffUp));
+
+    // 7. ScrollBar Thumb hover highlight (OverState: #FF696140 <-> #FFDCCD8F)
+    bdMidNode = host.World().GetNode(bdMidId);
+    thumbNode = host.World().GetNode(thumbId);
+    const aero::Rect thumbHoverVp = NodeViewportBounds(*thumbNode);
+    const aero::GradientBrushRegistry& qGrads = host.World().ResourceStore()->GradientBrushes();
+    aero::GradientBrushDesc thumbRestGrad{};
+    Require(bdMidNode && bdMidNode->vector.fillGradId > 0 &&
+            qGrads.TryGetBrush(static_cast<std::uint32_t>(bdMidNode->vector.fillGradId), thumbRestGrad) &&
+            !thumbRestGrad.stops.empty() && thumbRestGrad.stops[0].color.r < 0.55f,
+        "QuestLog Thumb BdMiddle should rest at muted gold (#FF696140)");
+
+    std::vector<std::uint8_t> preThumbHover;
+    Require(host.RenderHeadlessRgba(800u, 600u, preThumbHover), "QuestLog pre-thumb-hover render failed");
+
+    host.InjectPointerMove(
+        thumbHoverVp.x + thumbHoverVp.width * 0.5f,
+        thumbHoverVp.y + thumbHoverVp.height * 0.5f);
+    for (int f = 0; f < 16; ++f) {
+        host.StepFrame(1.0f / 60.0f, f == 15);
+    }
+    bdMidNode = host.World().GetNode(bdMidId);
+    aero::GradientBrushDesc thumbOverGrad{};
+    Require(bdMidNode && bdMidNode->vector.fillGradId > 0 &&
+            qGrads.TryGetBrush(static_cast<std::uint32_t>(bdMidNode->vector.fillGradId), thumbOverGrad) &&
+            !thumbOverGrad.stops.empty() && thumbOverGrad.stops[0].color.r > 0.75f,
+        "QuestLog Thumb hover should animate BdMiddle stop 0 to highlighted gold (#FFDCCD8F)");
+    std::vector<std::uint8_t> postThumbHover;
+    Require(host.RenderHeadlessRgba(800u, 600u, postThumbHover), "QuestLog post-thumb-hover render failed");
+    Require(CountChangedPixels(preThumbHover, postThumbHover) > 0u,
+        "QuestLog Thumb hover highlight should change rendered pixels");
+
+    host.InjectPointerMove(5.0f, 5.0f);
+    for (int f = 0; f < 22; ++f) {
+        host.StepFrame(1.0f / 60.0f, f == 21);
+    }
+    bdMidNode = host.World().GetNode(bdMidId);
+    aero::GradientBrushDesc thumbLeaveGrad{};
+    Require(bdMidNode && bdMidNode->vector.fillGradId > 0 &&
+            qGrads.TryGetBrush(static_cast<std::uint32_t>(bdMidNode->vector.fillGradId), thumbLeaveGrad) &&
+            !thumbLeaveGrad.stops.empty() && thumbLeaveGrad.stops[0].color.r < 0.55f,
+        "QuestLog Thumb MouseLeave should restore BdMiddle stop 0 back to #FF696140");
 }
 
 void TestInteractiveLocalization(aero::rs_comp::CompilerSession& session) {
@@ -1556,6 +1689,56 @@ void TestInteractiveCustomControlAndTheme(aero::rs_comp::CompilerSession& sessio
         }
         std::vector<std::uint8_t> frame0;
         Require(host.RenderHeadlessRgba(800u, 600u, frame0), "CustomControl initial render failed");
+
+        // Verify dark/black foreground inheritance on Page Background="White", FontSize="40" on Digital clock,
+        // and 400x400 analog RadialTicks/RadialNeedle layout
+        bool foundAnalogLabel = false;
+        bool foundDigitalHour40 = false;
+        bool foundRadialTicks400 = false;
+        bool foundRadialNeedle400 = false;
+        bool foundRotatedContainerBg = false;
+        const aero::VisualWorld& cWorld = host.World();
+        for (std::size_t s = 0u; s < cWorld.ArenaSlotCount(); ++s) {
+            const aero::VisualNode* n = cWorld.NodeAtSlot(s);
+            if (!n) { continue; }
+            if (n->kind == aero::VisualKind::Text) {
+                if (n->text.text.find("Analog Clock Template") != std::string::npos) {
+                    foundAnalogLabel = true;
+                    Require(n->text.fgRgba == 0xFF000000u,
+                        "CustomControl label should render in black on White background");
+                }
+                if (n->text.fontSize >= 38.0f && n->text.text == ":") {
+                    foundDigitalHour40 = true;
+                    Require(n->text.fgRgba == 0xFF000000u,
+                        "CustomControl Digital clock ':' should render in black at FontSize=40");
+                }
+            }
+            std::string tn;
+            if (TryReadNodeTypeName(host, n, tn)) {
+                if (tn == "RadialTicks" && n->layout.layoutRect.width >= 399.0f && n->layout.layoutRect.height >= 399.0f) {
+                    foundRadialTicks400 = true;
+                }
+                if (tn == "RadialNeedle" && n->layout.layoutRect.width >= 399.0f && n->layout.layoutRect.height >= 399.0f) {
+                    foundRadialNeedle400 = true;
+                }
+            }
+            if (n->kind == aero::VisualKind::Box &&
+                n->effect.kind == aero::UIEffectKind::DropShadow &&
+                n->box.bgRgba == 0u && n->box.bgGradId <= 0) {
+                // Ensure transparent DropShadow containers do not emit opaque/shadow boxes in render tree
+                for (std::uint32_t k = 0u; k < n->layout.renderNodeCount; ++k) {
+                    const aero::RenderNodeDescriptor* rd = host.RenderTree().GetNode(n->layout.renderNodeId + k);
+                    if (rd && rd->sourceElement == n) {
+                        foundRotatedContainerBg = true;
+                    }
+                }
+            }
+        }
+        Require(foundAnalogLabel, "CustomControl 'Analog Clock Template:' TextBlock missing");
+        Require(foundDigitalHour40, "CustomControl Digital clock TextElement.FontSize=40 not preserved");
+        Require(foundRadialTicks400, "CustomControl RadialTicks should stretch to 400x400");
+        Require(foundRadialNeedle400, "CustomControl RadialNeedle should stretch to 400x400");
+        Require(!foundRotatedContainerBg, "Transparent DropShadow container should not emit a box primitive");
 
         Require(host.InvokeScriptMethod(host.RootScriptObject(), "AdvanceAllClocks",
                     {aero::UnifiedValue{std::int64_t{3665}}}),
@@ -2085,9 +2268,18 @@ void TestInteractiveScoreboard(aero::rs_comp::CompilerSession&) {
 
 int main(int argc, char** argv) {
     std::cout << std::unitbuf;
-    const std::string_view filter = (argc > 1 && argv[1]) ? std::string_view(argv[1]) : std::string_view{};
+    std::vector<std::string_view> filters;
+    for (int i = 1; i < argc; ++i) {
+        if (argv[i] && argv[i][0] != '\0') {
+            filters.emplace_back(argv[i]);
+        }
+    }
     const auto want = [&](std::string_view section) {
-        return filter.empty() || filter == section;
+        if (filters.empty()) { return true; }
+        for (std::string_view f : filters) {
+            if (f == section) { return true; }
+        }
+        return false;
     };
 
     aero::rs_comp::CompilerSession sharedSession;
@@ -2097,13 +2289,15 @@ int main(int argc, char** argv) {
     if (want("bench")) { TestAll23LegacyAnd5V3Samples(clearRgba); }
     if (want("subpages")) { TestGalleryStandaloneSubPages(clearRgba); }
 
-    if (!filter.empty()) {
-        if (filter == "tictactoe") { TestInteractiveTicTacToe(sharedSession); }
-        if (filter == "inventory") { TestInteractiveInventory(sharedSession); }
-        if (filter == "questlog") { TestInteractiveQuestLog(sharedSession); }
-        if (filter == "localization") { TestInteractiveLocalization(sharedSession); }
-        if (filter == "wpf") { TestInteractiveWpfQuickStart(sharedSession); }
-        if (filter == "scoreboard") { TestInteractiveScoreboard(sharedSession); }
+    if (!filters.empty()) {
+        if (want("buttons")) { TestInteractiveButtons(sharedSession); }
+        if (want("customcontrol")) { TestInteractiveCustomControlAndTheme(sharedSession); }
+        if (want("tictactoe")) { TestInteractiveTicTacToe(sharedSession); }
+        if (want("inventory")) { TestInteractiveInventory(sharedSession); }
+        if (want("questlog")) { TestInteractiveQuestLog(sharedSession); }
+        if (want("localization")) { TestInteractiveLocalization(sharedSession); }
+        if (want("wpf")) { TestInteractiveWpfQuickStart(sharedSession); }
+        if (want("scoreboard")) { TestInteractiveScoreboard(sharedSession); }
     }
 
     if (want("interactive")) {

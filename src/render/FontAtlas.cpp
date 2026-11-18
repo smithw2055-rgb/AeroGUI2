@@ -694,9 +694,11 @@ bool TrueTypeFontFace::ParseTables(std::string* outError) {
         return false;
     }
 
-    // Standard TrueType sfnt versions: 0x00010000 or 'true' (0x74727565)
-    if (sfntVersion != 0x00010000u && sfntVersion != MakeTag('t', 'r', 'u', 'e')) {
-        if (outError) *outError = "Unsupported sfnt version (requires TrueType glyf outlines)";
+    // Standard TrueType / OpenType sfnt versions: 0x00010000, 'true', or 'OTTO' (CFF)
+    if (sfntVersion != 0x00010000u &&
+        sfntVersion != MakeTag('t', 'r', 'u', 'e') &&
+        sfntVersion != MakeTag('O', 'T', 'T', 'O')) {
+        if (outError) *outError = "Unsupported sfnt version (requires TrueType glyf or OpenType CFF outlines)";
         return false;
     }
     if (numTables == 0u || !r.InBounds(12u, static_cast<std::size_t>(numTables) * 16u)) {
@@ -709,7 +711,7 @@ bool TrueTypeFontFace::ParseTables(std::string* outError) {
         std::uint32_t length = 0u;
         bool present = false;
     };
-    TableSpan head{}, hhea{}, maxp{}, cmap{}, hmtx{}, loca{}, glyf{}, name{}, kern{};
+    TableSpan head{}, hhea{}, maxp{}, cmap{}, hmtx{}, loca{}, glyf{}, cff{}, name{}, kern{};
 
     for (std::uint16_t i = 0u; i < numTables; ++i) {
         const std::size_t recOff = 12u + static_cast<std::size_t>(i) * 16u;
@@ -731,21 +733,26 @@ bool TrueTypeFontFace::ParseTables(std::string* outError) {
         else if (tag == MakeTag('h', 'm', 't', 'x')) hmtx = span;
         else if (tag == MakeTag('l', 'o', 'c', 'a')) loca = span;
         else if (tag == MakeTag('g', 'l', 'y', 'f')) glyf = span;
+        else if (tag == MakeTag('C', 'F', 'F', ' ')) cff = span;
         else if (tag == MakeTag('n', 'a', 'm', 'e')) name = span;
         else if (tag == MakeTag('k', 'e', 'r', 'n')) kern = span;
     }
 
+    const bool hasGlyf = loca.present && glyf.present;
+    const bool hasCff = cff.present;
     if (!head.present || !hhea.present || !maxp.present ||
-        !cmap.present || !hmtx.present || !loca.present || !glyf.present) {
-        if (outError) *outError = "Missing mandatory TrueType table (head/hhea/maxp/cmap/hmtx/loca/glyf)";
+        !cmap.present || !hmtx.present || (!hasGlyf && !hasCff)) {
+        if (outError) *outError = "Missing mandatory font table (head/hhea/maxp/cmap/hmtx/glyf|CFF )";
         return false;
     }
+
+    isCff_ = hasCff && !hasGlyf;
 
     if (head.length < 54u ||
         !r.ReadU16BE(head.offset + 18u, unitsPerEm_) ||
         !r.ReadI16BE(head.offset + 50u, indexToLocFormat_) ||
         unitsPerEm_ < 16u ||
-        (indexToLocFormat_ != 0 && indexToLocFormat_ != 1)) {
+        (!isCff_ && indexToLocFormat_ != 0 && indexToLocFormat_ != 1)) {
         if (outError) *outError = "Invalid TrueType head table";
         return false;
     }
@@ -784,12 +791,18 @@ bool TrueTypeFontFace::ParseTables(std::string* outError) {
         return false;
     }
 
-    const std::size_t requiredLocaBytes = (indexToLocFormat_ == 0)
-        ? (static_cast<std::size_t>(numGlyphs_) + 1u) * 2u
-        : (static_cast<std::size_t>(numGlyphs_) + 1u) * 4u;
-    if (locaLength_ < requiredLocaBytes) {
-        if (outError) *outError = "Truncated TrueType loca table";
-        return false;
+    if (isCff_) {
+        if (!ParseCffTable(cff.offset, cff.length, outError)) {
+            return false;
+        }
+    } else {
+        const std::size_t requiredLocaBytes = (indexToLocFormat_ == 0)
+            ? (static_cast<std::size_t>(numGlyphs_) + 1u) * 2u
+            : (static_cast<std::size_t>(numGlyphs_) + 1u) * 4u;
+        if (locaLength_ < requiredLocaBytes) {
+            if (outError) *outError = "Truncated TrueType loca table";
+            return false;
+        }
     }
 
     if (!ParseCmapTable(cmap.offset, cmap.length)) {
@@ -1582,6 +1595,574 @@ bool TrueTypeFontFace::ExtractGlyphRecursive(
     return true;
 }
 
+namespace {
+
+[[nodiscard]] bool ReadCffIndex(
+    const TtfReader& r,
+    std::size_t indexOffset,
+    std::size_t tableEnd,
+    std::uint32_t& outEndOffset,
+    std::vector<std::pair<std::uint32_t, std::uint32_t>>& outItems) {
+    outItems.clear();
+    if (indexOffset + 2u > tableEnd) {
+        return false;
+    }
+    std::uint16_t count = 0u;
+    if (!r.ReadU16BE(indexOffset, count)) {
+        return false;
+    }
+    if (count == 0u) {
+        outEndOffset = static_cast<std::uint32_t>(indexOffset + 2u);
+        return true;
+    }
+    if (indexOffset + 3u > tableEnd) {
+        return false;
+    }
+    std::uint8_t offSize = 0u;
+    if (!r.ReadU8(indexOffset + 2u, offSize) || offSize < 1u || offSize > 4u) {
+        return false;
+    }
+    const std::size_t offTableStart = indexOffset + 3u;
+    const std::size_t offTableBytes = static_cast<std::size_t>(count + 1u) * static_cast<std::size_t>(offSize);
+    if (offTableStart + offTableBytes > tableEnd) {
+        return false;
+    }
+    const std::size_t dataBase = offTableStart + offTableBytes - 1u;
+    auto readOff = [&](std::size_t idx, std::uint32_t& outOff) noexcept -> bool {
+        const std::size_t p = offTableStart + idx * static_cast<std::size_t>(offSize);
+        std::uint32_t val = 0u;
+        for (std::uint8_t k = 0u; k < offSize; ++k) {
+            std::uint8_t b = 0u;
+            if (!r.ReadU8(p + k, b)) return false;
+            val = (val << 8u) | static_cast<std::uint32_t>(b);
+        }
+        outOff = val;
+        return true;
+    };
+    std::uint32_t prevOff = 0u;
+    if (!readOff(0u, prevOff) || prevOff == 0u) {
+        return false;
+    }
+    outItems.reserve(count);
+    for (std::uint16_t i = 0u; i < count; ++i) {
+        std::uint32_t nextOff = 0u;
+        if (!readOff(static_cast<std::size_t>(i) + 1u, nextOff) || nextOff < prevOff) {
+            return false;
+        }
+        const std::size_t absStart = dataBase + static_cast<std::size_t>(prevOff);
+        const std::size_t len = static_cast<std::size_t>(nextOff - prevOff);
+        if (absStart + len > tableEnd) {
+            return false;
+        }
+        outItems.push_back({static_cast<std::uint32_t>(absStart), static_cast<std::uint32_t>(len)});
+        prevOff = nextOff;
+    }
+    outEndOffset = static_cast<std::uint32_t>(dataBase + static_cast<std::size_t>(prevOff));
+    return true;
+}
+
+} // namespace
+
+bool TrueTypeFontFace::ParseCffTable(std::uint32_t offset, std::uint32_t length, std::string* outError) {
+    cffCharStrings_.items.clear();
+    cffLocalSubrs_.items.clear();
+    cffGlobalSubrs_.items.clear();
+
+    TtfReader r{data_.data(), data_.size()};
+    const std::size_t tableStart = offset;
+    const std::size_t tableEnd = tableStart + length;
+    if (length < 4u || !r.InBounds(tableStart, length)) {
+        if (outError) *outError = "Invalid CFF table bounds";
+        return false;
+    }
+    std::uint8_t major = 0u, minor = 0u, hdrSize = 0u;
+    if (!r.ReadU8(tableStart, major) || !r.ReadU8(tableStart + 1u, minor) ||
+        !r.ReadU8(tableStart + 2u, hdrSize) || major != 1u || hdrSize < 4u ||
+        static_cast<std::size_t>(hdrSize) >= length) {
+        if (outError) *outError = "Unsupported CFF version/header";
+        return false;
+    }
+
+    auto toIndexTable = [&](std::size_t idxPos, CffIndexTable& outIdx) -> bool {
+        std::vector<std::pair<std::uint32_t, std::uint32_t>> raw;
+        if (!ReadCffIndex(r, idxPos, tableEnd, outIdx.endOffset, raw)) {
+            return false;
+        }
+        outIdx.items.reserve(raw.size());
+        for (const auto& kv : raw) {
+            outIdx.items.push_back(CffIndexTable::Slice{kv.first, kv.second});
+        }
+        return true;
+    };
+
+    CffIndexTable nameIdx{}, topDictIdx{}, strIdx{};
+    if (!toIndexTable(tableStart + hdrSize, nameIdx) ||
+        !toIndexTable(nameIdx.endOffset, topDictIdx) ||
+        topDictIdx.items.empty() ||
+        !toIndexTable(topDictIdx.endOffset, strIdx) ||
+        !toIndexTable(strIdx.endOffset, cffGlobalSubrs_)) {
+        if (outError) *outError = "Truncated CFF top headers";
+        return false;
+    }
+
+    auto parseDict = [&](std::uint32_t dOff, std::uint32_t dLen,
+                         std::int32_t& outCharStringsRel,
+                         std::int32_t& outPrivSize,
+                         std::int32_t& outPrivRel,
+                         std::int32_t& outSubrsRel) {
+        std::size_t p = dOff;
+        const std::size_t endP = static_cast<std::size_t>(dOff) + dLen;
+        std::vector<std::int32_t> stk;
+        while (p < endP) {
+            std::uint8_t b0 = 0u;
+            if (!r.ReadU8(p++, b0)) break;
+            if (b0 <= 21u) {
+                std::uint16_t op = b0;
+                if (b0 == 12u) {
+                    std::uint8_t b1 = 0u;
+                    if (!r.ReadU8(p++, b1)) break;
+                    op = static_cast<std::uint16_t>(0x0C00u | b1);
+                }
+                if (op == 17u && !stk.empty()) {
+                    outCharStringsRel = stk.back();
+                } else if (op == 18u && stk.size() >= 2u) {
+                    outPrivSize = stk[stk.size() - 2u];
+                    outPrivRel = stk.back();
+                } else if (op == 19u && !stk.empty()) {
+                    outSubrsRel = stk.back();
+                }
+                stk.clear();
+            } else if (b0 == 28u) {
+                std::int16_t v = 0;
+                if (!r.ReadI16BE(p, v)) break;
+                p += 2u;
+                stk.push_back(static_cast<std::int32_t>(v));
+            } else if (b0 == 29u) {
+                std::uint32_t u = 0u;
+                if (!r.ReadU32BE(p, u)) break;
+                p += 4u;
+                stk.push_back(static_cast<std::int32_t>(u));
+            } else if (b0 == 30u) {
+                while (p < endP) {
+                    std::uint8_t nb = 0u;
+                    if (!r.ReadU8(p++, nb)) break;
+                    if ((nb & 0x0Fu) == 0x0Fu || ((nb >> 4u) & 0x0Fu) == 0x0Fu) break;
+                }
+                stk.push_back(0);
+            } else if (b0 >= 32u && b0 <= 246u) {
+                stk.push_back(static_cast<std::int32_t>(b0) - 139);
+            } else if (b0 >= 247u && b0 <= 250u) {
+                std::uint8_t b1 = 0u;
+                if (!r.ReadU8(p++, b1)) break;
+                stk.push_back((static_cast<std::int32_t>(b0) - 247) * 256 + static_cast<std::int32_t>(b1) + 108);
+            } else if (b0 >= 251u && b0 <= 254u) {
+                std::uint8_t b1 = 0u;
+                if (!r.ReadU8(p++, b1)) break;
+                stk.push_back(-(static_cast<std::int32_t>(b0) - 251) * 256 - static_cast<std::int32_t>(b1) - 108);
+            }
+        }
+    };
+
+    std::int32_t charStringsRel = -1, privSize = 0, privRel = -1, unusedSubr = -1;
+    parseDict(topDictIdx.items[0].offset, topDictIdx.items[0].length,
+              charStringsRel, privSize, privRel, unusedSubr);
+    if (charStringsRel <= 0 || tableStart + static_cast<std::size_t>(charStringsRel) >= tableEnd) {
+        if (outError) *outError = "CFF missing CharStrings INDEX";
+        return false;
+    }
+    if (!toIndexTable(tableStart + static_cast<std::size_t>(charStringsRel), cffCharStrings_) ||
+        cffCharStrings_.items.empty()) {
+        if (outError) *outError = "Invalid CFF CharStrings INDEX";
+        return false;
+    }
+
+    if (privRel > 0 && privSize > 0 &&
+        tableStart + static_cast<std::size_t>(privRel) + static_cast<std::size_t>(privSize) <= tableEnd) {
+        std::int32_t u1 = -1, u2 = 0, u3 = -1, subrsRel = -1;
+        parseDict(
+            static_cast<std::uint32_t>(tableStart + static_cast<std::size_t>(privRel)),
+            static_cast<std::uint32_t>(privSize),
+            u1, u2, u3, subrsRel);
+        if (subrsRel > 0) {
+            const std::size_t subrsPos = tableStart + static_cast<std::size_t>(privRel) + static_cast<std::size_t>(subrsRel);
+            if (subrsPos < tableEnd) {
+                (void)toIndexTable(subrsPos, cffLocalSubrs_);
+            }
+        }
+    }
+    return true;
+}
+
+bool TrueTypeFontFace::ExtractCffGlyphOutline(
+    std::uint32_t glyphIndex,
+    std::vector<TtfContourSegment>& outSegments) const {
+    if (glyphIndex >= cffCharStrings_.items.size()) {
+        return false;
+    }
+
+    TtfReader r{data_.data(), data_.size()};
+    std::vector<float> stack;
+    stack.reserve(64u);
+
+    float curX = 0.0f, curY = 0.0f;
+    float startX = 0.0f, startY = 0.0f;
+    bool hasOpenContour = false;
+    bool widthChecked = false;
+    std::uint32_t numHints = 0u;
+
+    auto closeContour = [&]() {
+        if (hasOpenContour) {
+            if (std::fabs(curX - startX) > 1e-4f || std::fabs(curY - startY) > 1e-4f) {
+                outSegments.push_back(TtfContourSegment{
+                    curX, curY,
+                    0.5f * (curX + startX), 0.5f * (curY + startY),
+                    startX, startY,
+                    false});
+            }
+            hasOpenContour = false;
+        }
+    };
+
+    auto moveTo = [&](float nx, float ny) {
+        closeContour();
+        curX = nx;
+        curY = ny;
+        startX = nx;
+        startY = ny;
+        hasOpenContour = true;
+    };
+
+    auto lineTo = [&](float nx, float ny) {
+        if (!hasOpenContour) {
+            startX = curX;
+            startY = curY;
+            hasOpenContour = true;
+        }
+        outSegments.push_back(TtfContourSegment{
+            curX, curY,
+            0.5f * (curX + nx), 0.5f * (curY + ny),
+            nx, ny,
+            false});
+        curX = nx;
+        curY = ny;
+    };
+
+    auto emitCubicSegment = [&](float p0x, float p0y, float c1x, float c1y,
+                                float c2x, float c2y, float p3x, float p3y) {
+        auto emitSub = [&](float ax, float ay, float bx, float by,
+                           float cx, float cy, float dx, float dy) {
+            const float qx = 0.75f * (bx + cx) - 0.25f * (ax + dx);
+            const float qy = 0.75f * (by + cy) - 0.25f * (ay + dy);
+            outSegments.push_back(TtfContourSegment{ax, ay, qx, qy, dx, dy, true});
+        };
+        auto splitHalf = [](float a0, float a1, float a2, float a3,
+                            float& l1, float& l2, float& mid, float& r1, float& r2) {
+            const float m01 = 0.5f * (a0 + a1);
+            const float m12 = 0.5f * (a1 + a2);
+            const float m23 = 0.5f * (a2 + a3);
+            l1 = m01;
+            l2 = 0.5f * (m01 + m12);
+            r2 = m23;
+            r1 = 0.5f * (m12 + m23);
+            mid = 0.5f * (l2 + r1);
+        };
+        float xL1, xL2, xM, xR1, xR2, yL1, yL2, yM, yR1, yR2;
+        splitHalf(p0x, c1x, c2x, p3x, xL1, xL2, xM, xR1, xR2);
+        splitHalf(p0y, c1y, c2y, p3y, yL1, yL2, yM, yR1, yR2);
+
+        float q1L1, q1L2, q1M, q1R1, q1R2, y1L1, y1L2, y1M, y1R1, y1R2;
+        splitHalf(p0x, xL1, xL2, xM, q1L1, q1L2, q1M, q1R1, q1R2);
+        splitHalf(p0y, yL1, yL2, yM, y1L1, y1L2, y1M, y1R1, y1R2);
+        emitSub(p0x, p0y, q1L1, y1L1, q1L2, y1L2, q1M, y1M);
+        emitSub(q1M, y1M, q1R1, y1R1, q1R2, y1R2, xM, yM);
+
+        float q2L1, q2L2, q2M, q2R1, q2R2, y2L1, y2L2, y2M, y2R1, y2R2;
+        splitHalf(xM, xR1, xR2, p3x, q2L1, q2L2, q2M, q2R1, q2R2);
+        splitHalf(yM, yR1, yR2, p3y, y2L1, y2L2, y2M, y2R1, y2R2);
+        emitSub(xM, yM, q2L1, y2L1, q2L2, y2L2, q2M, y2M);
+        emitSub(q2M, y2M, q2R1, y2R1, q2R2, y2R2, p3x, p3y);
+    };
+
+    auto curveTo = [&](float dx1, float dy1, float dx2, float dy2, float dx3, float dy3) {
+        if (!hasOpenContour) {
+            startX = curX;
+            startY = curY;
+            hasOpenContour = true;
+        }
+        const float c1x = curX + dx1;
+        const float c1y = curY + dy1;
+        const float c2x = c1x + dx2;
+        const float c2y = c1y + dy2;
+        const float p3x = c2x + dx3;
+        const float p3y = c2y + dy3;
+        emitCubicSegment(curX, curY, c1x, c1y, c2x, c2y, p3x, p3y);
+        curX = p3x;
+        curY = p3y;
+    };
+
+    auto subrBias = [](std::size_t n) noexcept -> std::int32_t {
+        if (n < 1240u) return 107;
+        if (n < 33900u) return 1131;
+        return 32768;
+    };
+
+    auto consumeOptionalWidth = [&](bool hasExtraWidth) {
+        if (!widthChecked) {
+            widthChecked = true;
+            if (hasExtraWidth && !stack.empty()) {
+                stack.erase(stack.begin());
+            }
+        }
+    };
+
+    bool ended = false;
+    auto runCharstring = [&](auto& self, const CffIndexTable::Slice& slice, std::uint32_t depth) -> bool {
+        if (depth > 16u) {
+            return false;
+        }
+        std::size_t p = slice.offset;
+        const std::size_t endP = static_cast<std::size_t>(slice.offset) + slice.length;
+        while (p < endP && !ended) {
+            std::uint8_t b0 = 0u;
+            if (!r.ReadU8(p++, b0)) return false;
+            if (b0 >= 32u && b0 <= 246u) {
+                stack.push_back(static_cast<float>(static_cast<std::int32_t>(b0) - 139));
+                continue;
+            }
+            if (b0 >= 247u && b0 <= 250u) {
+                std::uint8_t b1 = 0u;
+                if (!r.ReadU8(p++, b1)) return false;
+                stack.push_back(static_cast<float>((static_cast<std::int32_t>(b0) - 247) * 256 + static_cast<std::int32_t>(b1) + 108));
+                continue;
+            }
+            if (b0 >= 251u && b0 <= 254u) {
+                std::uint8_t b1 = 0u;
+                if (!r.ReadU8(p++, b1)) return false;
+                stack.push_back(static_cast<float>(-(static_cast<std::int32_t>(b0) - 251) * 256 - static_cast<std::int32_t>(b1) - 108));
+                continue;
+            }
+            if (b0 == 28u) {
+                std::int16_t v = 0;
+                if (!r.ReadI16BE(p, v)) return false;
+                p += 2u;
+                stack.push_back(static_cast<float>(v));
+                continue;
+            }
+            if (b0 == 255u) {
+                std::uint32_t u = 0u;
+                if (!r.ReadU32BE(p, u)) return false;
+                p += 4u;
+                const auto s = static_cast<std::int32_t>(u);
+                stack.push_back(static_cast<float>(s) / 65536.0f);
+                continue;
+            }
+
+            switch (b0) {
+                case 1u:  // hstem
+                case 3u:  // vstem
+                case 18u: // hstemhm
+                case 23u: // vstemhm
+                    consumeOptionalWidth((stack.size() % 2u) == 1u);
+                    numHints += static_cast<std::uint32_t>(stack.size() / 2u);
+                    stack.clear();
+                    break;
+                case 19u: // hintmask
+                case 20u: // cntrmask
+                    consumeOptionalWidth((stack.size() % 2u) == 1u);
+                    if (!stack.empty()) {
+                        numHints += static_cast<std::uint32_t>(stack.size() / 2u);
+                        stack.clear();
+                    }
+                    p += static_cast<std::size_t>((numHints + 7u) / 8u);
+                    if (p > endP) return false;
+                    break;
+                case 10u: { // callsubr
+                    if (stack.empty()) return false;
+                    const std::int32_t idx = static_cast<std::int32_t>(std::lround(stack.back())) +
+                                             subrBias(cffLocalSubrs_.items.size());
+                    stack.pop_back();
+                    if (idx < 0 || static_cast<std::size_t>(idx) >= cffLocalSubrs_.items.size()) return false;
+                    if (!self(self, cffLocalSubrs_.items[static_cast<std::size_t>(idx)], depth + 1u)) return false;
+                    break;
+                }
+                case 29u: { // callgsubr
+                    if (stack.empty()) return false;
+                    const std::int32_t idx = static_cast<std::int32_t>(std::lround(stack.back())) +
+                                             subrBias(cffGlobalSubrs_.items.size());
+                    stack.pop_back();
+                    if (idx < 0 || static_cast<std::size_t>(idx) >= cffGlobalSubrs_.items.size()) return false;
+                    if (!self(self, cffGlobalSubrs_.items[static_cast<std::size_t>(idx)], depth + 1u)) return false;
+                    break;
+                }
+                case 11u: // return
+                    return true;
+                case 14u: // endchar
+                    consumeOptionalWidth((stack.size() % 2u) == 1u);
+                    stack.clear();
+                    closeContour();
+                    ended = true;
+                    return true;
+                case 21u: // rmoveto
+                    consumeOptionalWidth(stack.size() > 2u);
+                    if (stack.size() >= 2u) {
+                        moveTo(curX + stack[0], curY + stack[1]);
+                    }
+                    stack.clear();
+                    break;
+                case 22u: // hmoveto
+                    consumeOptionalWidth(stack.size() > 1u);
+                    if (!stack.empty()) {
+                        moveTo(curX + stack[0], curY);
+                    }
+                    stack.clear();
+                    break;
+                case 4u: // vmoveto
+                    consumeOptionalWidth(stack.size() > 1u);
+                    if (!stack.empty()) {
+                        moveTo(curX, curY + stack[0]);
+                    }
+                    stack.clear();
+                    break;
+                case 5u: // rlineto
+                    for (std::size_t i = 0u; i + 1u < stack.size(); i += 2u) {
+                        lineTo(curX + stack[i], curY + stack[i + 1u]);
+                    }
+                    stack.clear();
+                    break;
+                case 6u: { // hlineto
+                    bool horiz = true;
+                    for (std::size_t i = 0u; i < stack.size(); ++i) {
+                        if (horiz) lineTo(curX + stack[i], curY);
+                        else lineTo(curX, curY + stack[i]);
+                        horiz = !horiz;
+                    }
+                    stack.clear();
+                    break;
+                }
+                case 7u: { // vlineto
+                    bool vert = true;
+                    for (std::size_t i = 0u; i < stack.size(); ++i) {
+                        if (vert) lineTo(curX, curY + stack[i]);
+                        else lineTo(curX + stack[i], curY);
+                        vert = !vert;
+                    }
+                    stack.clear();
+                    break;
+                }
+                case 8u: // rrcurveto
+                    for (std::size_t i = 0u; i + 5u < stack.size(); i += 6u) {
+                        curveTo(stack[i], stack[i + 1u], stack[i + 2u], stack[i + 3u], stack[i + 4u], stack[i + 5u]);
+                    }
+                    stack.clear();
+                    break;
+                case 24u: { // rcurveline
+                    std::size_t i = 0u;
+                    while (i + 7u < stack.size()) {
+                        curveTo(stack[i], stack[i + 1u], stack[i + 2u], stack[i + 3u], stack[i + 4u], stack[i + 5u]);
+                        i += 6u;
+                    }
+                    if (i + 1u < stack.size()) {
+                        lineTo(curX + stack[i], curY + stack[i + 1u]);
+                    }
+                    stack.clear();
+                    break;
+                }
+                case 25u: { // rlinecurve
+                    std::size_t i = 0u;
+                    while (i + 7u < stack.size()) {
+                        lineTo(curX + stack[i], curY + stack[i + 1u]);
+                        i += 2u;
+                    }
+                    if (i + 5u < stack.size()) {
+                        curveTo(stack[i], stack[i + 1u], stack[i + 2u], stack[i + 3u], stack[i + 4u], stack[i + 5u]);
+                    }
+                    stack.clear();
+                    break;
+                }
+                case 26u: { // vvcurveto
+                    std::size_t i = 0u;
+                    float dx1 = 0.0f;
+                    if ((stack.size() % 4u) == 1u) {
+                        dx1 = stack[i++];
+                    }
+                    while (i + 3u < stack.size()) {
+                        curveTo(dx1, stack[i], stack[i + 1u], stack[i + 2u], 0.0f, stack[i + 3u]);
+                        dx1 = 0.0f;
+                        i += 4u;
+                    }
+                    stack.clear();
+                    break;
+                }
+                case 27u: { // hhcurveto
+                    std::size_t i = 0u;
+                    float dy1 = 0.0f;
+                    if ((stack.size() % 4u) == 1u) {
+                        dy1 = stack[i++];
+                    }
+                    while (i + 3u < stack.size()) {
+                        curveTo(stack[i], dy1, stack[i + 1u], stack[i + 2u], stack[i + 3u], 0.0f);
+                        dy1 = 0.0f;
+                        i += 4u;
+                    }
+                    stack.clear();
+                    break;
+                }
+                case 30u:   // vhcurveto
+                case 31u: { // hvcurveto
+                    bool verticalStart = (b0 == 30u);
+                    std::size_t i = 0u;
+                    const std::size_t n = stack.size();
+                    while (i + 3u < n) {
+                        const bool isLast = (i + 4u == n) || (i + 5u == n);
+                        const float dLast = (isLast && i + 5u == n) ? stack[i + 4u] : 0.0f;
+                        if (verticalStart) {
+                            curveTo(0.0f, stack[i], stack[i + 1u], stack[i + 2u], dLast, stack[i + 3u]);
+                        } else {
+                            curveTo(stack[i], 0.0f, stack[i + 1u], stack[i + 2u], stack[i + 3u], dLast);
+                        }
+                        i += (isLast && i + 5u == n) ? 5u : 4u;
+                        verticalStart = !verticalStart;
+                    }
+                    stack.clear();
+                    break;
+                }
+                case 12u: {
+                    std::uint8_t b1 = 0u;
+                    if (!r.ReadU8(p++, b1)) return false;
+                    if (b1 == 34u && stack.size() >= 7u) { // hflex
+                        curveTo(stack[0], 0.0f, stack[1], stack[2], stack[3], 0.0f);
+                        curveTo(stack[4], 0.0f, stack[5], -stack[2], stack[6], 0.0f);
+                    } else if (b1 == 35u && stack.size() >= 13u) { // flex
+                        curveTo(stack[0], stack[1], stack[2], stack[3], stack[4], stack[5]);
+                        curveTo(stack[6], stack[7], stack[8], stack[9], stack[10], stack[11]);
+                    } else if (b1 == 36u && stack.size() >= 9u) { // hflex1
+                        const float dy1 = stack[1], dy2 = stack[3], dy5 = stack[7];
+                        curveTo(stack[0], dy1, stack[2], dy2, stack[4], 0.0f);
+                        curveTo(stack[5], 0.0f, stack[6], dy5, stack[8], -(dy1 + dy2 + dy5));
+                    } else if (b1 == 37u && stack.size() >= 11u) { // flex1
+                        const float dxSum = stack[0] + stack[2] + stack[4] + stack[6] + stack[8];
+                        const float dySum = stack[1] + stack[3] + stack[5] + stack[7] + stack[9];
+                        const bool dxDom = std::fabs(dxSum) > std::fabs(dySum);
+                        curveTo(stack[0], stack[1], stack[2], stack[3], stack[4], stack[5]);
+                        curveTo(stack[6], stack[7], stack[8], stack[9],
+                                dxDom ? stack[10] : -dxSum, dxDom ? -dySum : stack[10]);
+                    }
+                    stack.clear();
+                    break;
+                }
+                default:
+                    stack.clear();
+                    break;
+            }
+        }
+        return true;
+    };
+
+    const bool ok = runCharstring(runCharstring, cffCharStrings_.items[glyphIndex], 0u);
+    closeContour();
+    return ok;
+}
+
 bool TrueTypeFontFace::ExtractGlyphOutline(
     std::uint32_t glyphIndex,
     TtfGlyphOutline& outOutline) const {
@@ -1594,7 +2175,10 @@ bool TrueTypeFontFace::ExtractGlyphOutline(
     GetGlyphHorizontalMetrics(glyphIndex, outOutline.advanceWidth, outOutline.leftSideBearing);
 
     std::uint32_t totalVisitedComponents = 0u;
-    if (!ExtractGlyphRecursive(glyphIndex, 0u, totalVisitedComponents, outOutline.segments, nullptr)) {
+    const bool extracted = isCff_
+        ? ExtractCffGlyphOutline(glyphIndex, outOutline.segments)
+        : ExtractGlyphRecursive(glyphIndex, 0u, totalVisitedComponents, outOutline.segments, nullptr);
+    if (!extracted) {
         return false;
     }
 
@@ -2622,7 +3206,8 @@ TextLayoutResult FontAtlas::MeasureLayout(
     std::string_view fontFamily,
     float fontSize,
     float maxWidth,
-    TextWrapping wrapMode) {
+    TextWrapping wrapMode,
+    float charSpacing) {
     TextLayoutResult result{};
     const float safeFont = std::max(1.0f, fontSize);
 
@@ -2754,11 +3339,17 @@ TextLayoutResult FontAtlas::MeasureLayout(
 
         const bool isSpace = (tg.cp == ' ' || tg.cp == '\t');
         float kernPx = 0.0f;
-        if (face && prevGlyphIdOnLine != 0xFFFFFFFFu) {
-            kernPx = face->GetKerningFUnits(prevGlyphIdOnLine, tg.meta.glyphIndex) * upemInvScale;
+        float trackingPx = 0.0f;
+        if (prevGlyphIdOnLine != 0xFFFFFFFFu) {
+            if (face) {
+                kernPx = face->GetKerningFUnits(prevGlyphIdOnLine, tg.meta.glyphIndex) * upemInvScale;
+            }
+            if (std::isfinite(charSpacing) && charSpacing != 0.0f) {
+                trackingPx = charSpacing * 0.001f * safeFont;
+            }
         }
         const float advPx = tg.meta.advanceEm * safeFont;
-        const float nextPenX = curPenX + kernPx + advPx;
+        const float nextPenX = curPenX + kernPx + trackingPx + advPx;
 
         // CJK characters can also break BEFORE the ideograph itself
         if (wrapEnabled && IsWideCjkCodePoint(tg.cp) && result.glyphs.size() > lineStartGlyphIdx) {
@@ -2789,10 +3380,11 @@ TextLayoutResult FontAtlas::MeasureLayout(
                 // Emergency character-level break for unbroken words exceeding maxWidth
                 finishLine(result.glyphs.size());
                 kernPx = 0.0f;
+                trackingPx = 0.0f;
             }
         }
 
-        const float penStart = curPenX + kernPx;
+        const float penStart = curPenX + kernPx + trackingPx;
         const float baselineY = curTopY + result.ascent;
         PositionedGlyph pg{};
         pg.codePoint = tg.cp;
@@ -2952,8 +3544,10 @@ TextLayoutResult MeasureTextLayout(
     std::string_view fontFamily,
     float fontSize,
     float maxWidth,
-    TextWrapping wrapMode) {
-    return FontAtlas::Instance().MeasureLayout(utf8Text, fontFamily, fontSize, maxWidth, wrapMode);
+    TextWrapping wrapMode,
+    float charSpacing) {
+    return FontAtlas::Instance().MeasureLayout(
+        utf8Text, fontFamily, fontSize, maxWidth, wrapMode, charSpacing);
 }
 
 } // namespace aero

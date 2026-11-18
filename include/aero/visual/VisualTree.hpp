@@ -42,6 +42,7 @@ enum class VectorShapeKind : std::uint8_t {
     Ellipse = 1,
     Line = 2,
     RadialArc = 3,
+    Rectangle = 4,
 };
 
 enum VisualCallbackFlags : std::uint32_t {
@@ -193,6 +194,10 @@ struct VisualImageData {
     Stretch stretch = Stretch::Uniform;
     StretchDirection stretchDir = StretchDirection::Both;
     std::uint32_t tintRgba = 0xFFFFFFFFu;
+    float viewboxX = 0.0f;
+    float viewboxY = 0.0f;
+    float viewboxW = 1.0f;
+    float viewboxH = 1.0f;
 };
 
 struct VisualVectorData {
@@ -469,7 +474,8 @@ public:
         std::string_view fontFamily,
         float fontSize,
         float maxWidth,
-        TextWrapping wrap) const;
+        TextWrapping wrap,
+        float charSpacing = 0.0f) const;
     [[nodiscard]] std::int32_t HitTestTextCodePoint(VisualNodeId id, float localX, float localY) const noexcept;
     bool SetImage(
         VisualNodeId id,
@@ -477,6 +483,12 @@ public:
         Stretch stretch,
         StretchDirection stretchDir,
         std::uint32_t tintRgba);
+    bool SetImageViewbox(
+        VisualNodeId id,
+        float vx,
+        float vy,
+        float vw,
+        float vh) noexcept;
     bool SetVectorShape(
         VisualNodeId id,
         VectorShapeKind shapeKind,

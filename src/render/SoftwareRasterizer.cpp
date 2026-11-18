@@ -1048,7 +1048,10 @@ void RasterizeSingleNode(
         const float perpQuadH = std::fabs(det) / std::max(localQuadW, 1e-4f);
         const bool uniformSdfCr = IsUniformCornerRadius(sdfRadii);
 
-        const std::uint32_t pathGradId = (prim == AeroPrimType::MsdfVectorPath || prim == AeroPrimType::TexturedQuad)
+        const std::uint32_t pathGradId =
+            (prim == AeroPrimType::MsdfVectorPath ||
+             prim == AeroPrimType::TexturedQuad ||
+             prim == AeroPrimType::SdfEllipse)
             ? ((nd->gradientBrushId != 0u)
                    ? nd->gradientBrushId
                    : static_cast<std::uint32_t>((v0.primType >> 4u) & 0x0FFFu))
@@ -1127,8 +1130,9 @@ void RasterizeSingleNode(
             const float maxBdr = std::max(
                 std::max(sdfBorder.left, sdfBorder.right),
                 std::max(sdfBorder.top, sdfBorder.bottom));
-            sdfSafeInteriorHalfW = quadHalfW - maxRad - maxBdr - quadAaFeather - 0.5f;
-            sdfSafeInteriorHalfH = quadHalfH - maxRad - maxBdr - quadAaFeather - 0.5f;
+            const float pad = std::max(0.0f, nd->sdfPadPx);
+            sdfSafeInteriorHalfW = quadHalfW - pad - maxRad - maxBdr - quadAaFeather - 0.5f;
+            sdfSafeInteriorHalfH = quadHalfH - pad - maxRad - maxBdr - quadAaFeather - 0.5f;
         }
 
         const int bandClampedPyStart = quadBandPyStart;
@@ -1428,11 +1432,11 @@ void RasterizeSingleNode(
                     const float localX = (su - 0.5f) * (2.0f * halfW);
                     const float localY = (sv - 0.5f) * (2.0f * halfH);
                     const float aaFeather = quadAaFeather;
+                    const float pad = std::max(0.0f, nd->sdfPadPx);
+                    const float boxHalfW = std::max(0.5f, halfW - pad);
+                    const float boxHalfH = std::max(0.5f, halfH - pad);
 
                     if (nd->softFeatherPx > 0.0f) {
-                        const float pad = std::max(0.0f, nd->sdfPadPx);
-                        const float boxHalfW = std::max(0.5f, halfW - pad);
-                        const float boxHalfH = std::max(0.5f, halfH - pad);
                         const float softFeather = std::max(aaFeather, nd->softFeatherPx * 1.6f);
                         if (uniformSdfCr) {
                             coverage = EvaluateSdfRoundedRectCoverage(
@@ -1459,8 +1463,8 @@ void RasterizeSingleNode(
                         coverage = EvaluateSdfRoundedBorderCoverage(
                             localX,
                             localY,
-                            halfW,
-                            halfH,
+                            boxHalfW,
+                            boxHalfH,
                             sdfRadii,
                             sdfBorder,
                             aaFeather);
@@ -1470,13 +1474,13 @@ void RasterizeSingleNode(
                         const float outerCov = EvaluateSdfRoundedRectCoverage(
                             localX,
                             localY,
-                            halfW,
-                            halfH,
+                            boxHalfW,
+                            boxHalfH,
                             rad,
                             aaFeather);
                         if (border > 0.0f) {
-                            const float innerHalfW = std::max(0.0f, halfW - border);
-                            const float innerHalfH = std::max(0.0f, halfH - border);
+                            const float innerHalfW = std::max(0.0f, boxHalfW - border);
+                            const float innerHalfH = std::max(0.0f, boxHalfH - border);
                             const float innerRad = std::max(0.0f, rad - border);
                             const float innerCov = (innerHalfW > 0.0f && innerHalfH > 0.0f)
                                 ? EvaluateSdfRoundedRectCoverage(localX, localY, innerHalfW, innerHalfH, innerRad, aaFeather)
@@ -1501,8 +1505,8 @@ void RasterizeSingleNode(
                         coverage = EvaluateSdfRoundedRectCoverage(
                             localX,
                             localY,
-                            halfW,
-                            halfH,
+                            boxHalfW,
+                            boxHalfH,
                             sdfRadii,
                             aaFeather);
                     }
@@ -1768,6 +1772,18 @@ void RasterizeSingleNode(
                         strokePx,
                         hollowStroke,
                         aaFeather);
+                    if (hoistedPathGradBrush != nullptr && coverage > 0.0f) {
+                        const Color gc = EvaluateGradientBrushSafe(
+                            *hoistedPathGradBrush,
+                            std::clamp(su, 0.0f, 1.0f),
+                            std::clamp(sv, 0.0f, 1.0f),
+                            std::max(1.0f, 2.0f * halfW),
+                            std::max(1.0f, 2.0f * halfH));
+                        shadeR = static_cast<std::uint8_t>(std::clamp((static_cast<float>(shadeR) / 255.0f) * gc.r * 255.0f + 0.5f, 0.0f, 255.0f));
+                        shadeG = static_cast<std::uint8_t>(std::clamp((static_cast<float>(shadeG) / 255.0f) * gc.g * 255.0f + 0.5f, 0.0f, 255.0f));
+                        shadeB = static_cast<std::uint8_t>(std::clamp((static_cast<float>(shadeB) / 255.0f) * gc.b * 255.0f + 0.5f, 0.0f, 255.0f));
+                        coverage *= std::clamp(gc.a, 0.0f, 1.0f);
+                    }
                 } else if (prim == AeroPrimType::GradientRoundedRect) {
                     const float gradRadius = hoistedGradRadius;
                     const bool isEllipse = hoistedGradIsEllipse;

@@ -16,26 +16,102 @@ public class DateTimeControl : Control {
     private string _format = "yyyy-MM-dd HH:mm:ss";
     private bool _showDate = true;
     private bool _showTime = true;
+    private bool _useSystemTime = false;
+    private int _lastSysSec = -1;
+    private int _lastSysMsBucket = -1;
+    private static DateTimeControl[] _liveClocks;
+    private static bool _sysHookInstalled = false;
     private TextBlock _display;
 
     public event EventHandler DateTimeChanged;
 
     public DateTimeControl() : base() {
-        Foreground = new SolidColorBrush("#FFF1F5F9");
-        FontSize = 14.0f;
     }
 
     public override string GetTypeName() { return "DateTimeControl"; }
 
-    public int Year { get { return _year; } set { _year = value; SyncDisplay(); } }
-    public int Month { get { return _month; } set { _month = ClampRange(value, 1, 12); SyncDisplay(); } }
-    public int Day { get { return _day; } set { _day = ClampRange(value, 1, DaysInMonth(_year, _month)); SyncDisplay(); } }
-    public int Hour { get { return _hour; } set { _hour = ClampRange(value, 0, 23); SyncDisplay(); } }
-    public int Minute { get { return _minute; } set { _minute = ClampRange(value, 0, 59); SyncDisplay(); } }
-    public int Second { get { return _second; } set { _second = ClampRange(value, 0, 59); SyncDisplay(); } }
+    protected virtual void OnTimeChanged() {}
+    protected virtual void OnLiveSystemTimeSample(int yr, int mo, int dy, int hr, int mn, int sc) {
+        SetDateTime(yr, mo, dy, hr, mn, sc);
+    }
+    protected virtual void OnLiveSystemTimeSampleMs(int yr, int mo, int dy, int hr, int mn, int sc, int ms) {
+        OnLiveSystemTimeSample(yr, mo, dy, hr, mn, sc);
+    }
+
+    private static void RegisterLiveClock(DateTimeControl clock) {
+        if (clock == null) { return; }
+        if (_liveClocks == null) { _liveClocks = new DateTimeControl[0]; }
+        for (int i = 0; i < _liveClocks.Length; i += 1) {
+            if (_liveClocks[i] == clock) { return; }
+        }
+        _liveClocks.Push(clock);
+        if (!_sysHookInstalled) {
+            _sysHookInstalled = true;
+            BindingEngine.AddPreFlushHook(() => { DateTimeControl.TickLiveClocks(); });
+        }
+    }
+
+    public static void TickLiveClocks() {
+        if (_liveClocks == null || _liveClocks.Length == 0) { return; }
+        var alive = new DateTimeControl[0];
+        for (int i = 0; i < _liveClocks.Length; i += 1) {
+            DateTimeControl dt = _liveClocks[i];
+            if (dt == null || dt._isDisposedTree) { continue; }
+            alive.Push(dt);
+            if (dt._useSystemTime) {
+                dt.SyncFromSystemTime();
+            }
+        }
+        _liveClocks = alive;
+    }
+
+    public void SyncFromSystemTime() {
+        if (!_useSystemTime || _isDisposedTree) { return; }
+        Host_RequestWake();
+        int yr = Host_GetLocalTimePart(0);
+        int mo = Host_GetLocalTimePart(1);
+        int dy = Host_GetLocalTimePart(2);
+        int hr = Host_GetLocalTimePart(3);
+        int mn = Host_GetLocalTimePart(4);
+        int sc = Host_GetLocalTimePart(5);
+        int ms = Host_GetLocalTimePart(6);
+        int msBucket = ms / 16;
+        if (yr <= 0) { return; }
+        if (msBucket == _lastSysMsBucket && sc == _lastSysSec &&
+            dy == _day && mo == _month && yr == _year &&
+            hr == _hour && mn == _minute) {
+            return;
+        }
+        _lastSysSec = sc;
+        _lastSysMsBucket = msBucket;
+        OnLiveSystemTimeSampleMs(yr, mo, dy, hr, mn, sc, ms);
+    }
+
+    protected override void OnLoaded() {
+        base.OnLoaded();
+        if (_useSystemTime) {
+            SyncFromSystemTime();
+        }
+    }
+
+    public int Year { get { return _year; } set { _year = value; SyncDisplay(); OnTimeChanged(); } }
+    public int Month { get { return _month; } set { _month = ClampRange(value, 1, 12); SyncDisplay(); OnTimeChanged(); } }
+    public int Day { get { return _day; } set { _day = ClampRange(value, 1, DaysInMonth(_year, _month)); SyncDisplay(); OnTimeChanged(); } }
+    public int Hour { get { return _hour; } set { _hour = ClampRange(value, 0, 23); SyncDisplay(); OnTimeChanged(); } }
+    public int Minute { get { return _minute; } set { _minute = ClampRange(value, 0, 59); SyncDisplay(); OnTimeChanged(); } }
+    public int Second { get { return _second; } set { _second = ClampRange(value, 0, 59); SyncDisplay(); OnTimeChanged(); } }
     public bool ShowDate { get { return _showDate; } set { _showDate = value; SyncDisplay(); } }
     public bool ShowTime { get { return _showTime; } set { _showTime = value; SyncDisplay(); } }
-    public bool UseSystemTime { get; set; } = false;
+    public bool UseSystemTime {
+        get { return _useSystemTime; }
+        set {
+            _useSystemTime = value;
+            if (value) {
+                RegisterLiveClock(this);
+                SyncFromSystemTime();
+            }
+        }
+    }
     public string Format {
         get { return _format; }
         set { _format = value == null ? "yyyy-MM-dd HH:mm:ss" : value; SyncDisplay(); }
@@ -77,6 +153,7 @@ public class DateTimeControl : Control {
         _minute = ClampRange(minute, 0, 59);
         _second = ClampRange(second, 0, 59);
         SyncDisplay();
+        OnTimeChanged();
         DateTimeChanged(this, EventArgs.Empty());
     }
 
@@ -94,6 +171,7 @@ public class DateTimeControl : Control {
         _minute = (total % 3600) / 60;
         _second = total % 60;
         SyncDisplay();
+        OnTimeChanged();
         DateTimeChanged(this, EventArgs.Empty());
     }
 
@@ -209,8 +287,6 @@ public class RadialTicks : CustomDrawElement {
     public RadialTicks() : base() {
         _strokeBrush = new SolidColorBrush("#FF64748B");
         _majorStrokeBrush = new SolidColorBrush("#FFF1F5F9");
-        Width = 180.0f;
-        Height = 180.0f;
     }
 
     public override string GetTypeName() { return "RadialTicks"; }
@@ -316,11 +392,10 @@ public class RadialNeedle : CustomDrawElement {
     private float _tailLength = 14.0f;
     private float _pivotRadius = 6.0f;
     private Brush _fill;
+    private bool _childHostConfigured = false;
 
     public RadialNeedle() : base() {
         _fill = new SolidColorBrush("#FFEF4444");
-        Width = 180.0f;
-        Height = 180.0f;
     }
 
     public override string GetTypeName() { return "RadialNeedle"; }
@@ -357,8 +432,29 @@ public class RadialNeedle : CustomDrawElement {
         InvalidateDraw();
     }
 
+    private void ConfigureNeedleChild(UIElement child) {
+        if (child == null) { return; }
+        if (!_childHostConfigured && ParseUtil.IsValidHandle(__nativeHandle)) {
+            _childHostConfigured = true;
+            UpdateCallbackMask(VisualCallbacks.StandardInput());
+            Visual_SetLayoutMode(__nativeHandle, EnumConvert.ToInt(LayoutMode.Grid), 0.0f, 0.0f, 0, 0);
+            Visual_GridClearDefs(__nativeHandle);
+            Visual_GridAddRowDef(__nativeHandle, EnumConvert.ToInt(GridUnitType.Star), 1.0f);
+            Visual_GridAddRowDef(__nativeHandle, EnumConvert.ToInt(GridUnitType.Star), 1.0f);
+        }
+        UIElement.SetGridRow(child, 0);
+        child.VerticalAlignment = VerticalAlignment.Bottom;
+    }
+
     public override void AddChild(UIElement child) {
         base.AddChild(child);
+        ConfigureNeedleChild(child);
+        SyncRotationOrDraw();
+    }
+
+    public override void InsertChild(int index, UIElement child) {
+        base.InsertChild(index, child);
+        ConfigureNeedleChild(child);
         SyncRotationOrDraw();
     }
 
@@ -959,8 +1055,9 @@ public class ComparisonCondition : DependencyObject {
         }
         if (Operator == "Equal" || Operator == "==") { return Trigger.BoxEquals(left, _rightBox); }
         if (Operator == "NotEqual" || Operator == "!=") { return !Trigger.BoxEquals(left, _rightBox); }
-        float lf = DependencyObject.UnboxFloat(left, 0.0f);
-        float rf = DependencyObject.UnboxFloat(_rightBox, 0.0f);
+        float lf = DependencyObject.UnboxFloat(left, ParseUtil.NaN());
+        float rf = DependencyObject.UnboxFloat(_rightBox, ParseUtil.NaN());
+        if (ParseUtil.IsNaN(lf) || ParseUtil.IsNaN(rf)) { return false; }
         if (Operator == "LessThan" || Operator == "<") { return lf < rf; }
         if (Operator == "GreaterThan" || Operator == ">") { return lf > rf; }
         if (Operator == "LessThanOrEqual" || Operator == "<=") { return lf <= rf; }
@@ -1163,6 +1260,9 @@ public class BehaviorDataTrigger : BehaviorTriggerBase {
     private UIElement[] _matchedTargets;
     private UIElement[] _hookedTargets;
     private UIElement[] _hookedSources;
+    private static BehaviorDataTrigger[] _reactiveBTriggers;
+    private static UIElement[] _reactiveBTargets;
+    private static bool _reactiveBHookInstalled = false;
 
     public BehaviorDataTrigger() : base() {
         _initTargets = new UIElement[0];
@@ -1231,6 +1331,12 @@ public class BehaviorDataTrigger : BehaviorTriggerBase {
             src = ResolveElementSource(associatedObject);
         } else if (RelativeSourceMode == "Self") {
             src = associatedObject;
+        } else if (RelativeSourceMode == "FindAncestor" || RelativeSourceMode == "AncestorType") {
+            UIElement anc = associatedObject;
+            while (anc != null && RelativeSourceAncestorType.Length > 0 && anc.GetTypeName() != RelativeSourceAncestorType) {
+                anc = anc.Parent;
+            }
+            src = anc;
         }
         if (src == null || HasHookedSource(associatedObject, src)) { return; }
         _hookedTargets.Push(associatedObject);
@@ -1238,16 +1344,61 @@ public class BehaviorDataTrigger : BehaviorTriggerBase {
         src.AddStateInvalidatedHook(() => { CheckAndFire(associatedObject, false); });
     }
 
+    private static void RegisterReactive(BehaviorDataTrigger dt, UIElement target) {
+        if (dt == null || target == null) { return; }
+        if (_reactiveBTriggers == null) {
+            _reactiveBTriggers = new BehaviorDataTrigger[0];
+            _reactiveBTargets = new UIElement[0];
+        }
+        if (!_reactiveBHookInstalled) {
+            _reactiveBHookInstalled = true;
+            BindingEngine.AddPreFlushHook(() => { BehaviorDataTrigger.FlushReactive(); });
+        }
+        for (int i = 0; i < _reactiveBTriggers.Length; i += 1) {
+            if (_reactiveBTriggers[i] == dt && _reactiveBTargets[i] == target) { return; }
+        }
+        _reactiveBTriggers.Push(dt);
+        _reactiveBTargets.Push(target);
+    }
+
+    public static void FlushReactive() {
+        if (_reactiveBTriggers == null || _reactiveBTargets == null) { return; }
+        int write = 0;
+        for (int i = 0; i < _reactiveBTriggers.Length; i += 1) {
+            UIElement t = _reactiveBTargets[i];
+            if (t == null || t._isDisposedTree) { continue; }
+            if (write != i) {
+                _reactiveBTriggers[write] = _reactiveBTriggers[i];
+                _reactiveBTargets[write] = t;
+            }
+            write += 1;
+        }
+        while (_reactiveBTriggers.Length > write) {
+            _reactiveBTriggers.RemoveAt(_reactiveBTriggers.Length - 1);
+            _reactiveBTargets.RemoveAt(_reactiveBTargets.Length - 1);
+        }
+        for (int i = 0; i < _reactiveBTriggers.Length; i += 1) {
+            _reactiveBTriggers[i].CheckAndFire(_reactiveBTargets[i], false);
+        }
+    }
+
     private void CheckAndFire(UIElement associatedObject, bool isInitialAttach) {
         if (associatedObject == null || BindingPath.Length == 0) { return; }
         DependencyObject actual = null;
+        object reflectObj = null;
         if (ElementName.Length > 0) {
             UIElement se = ResolveElementSource(associatedObject);
             if (se == null) { return; }
+            reflectObj = se;
             actual = se.GetPropertyValue(BindingPath);
             if (actual == null) { actual = BindingEngine.ReadPathBox(se, BindingPath); }
-            if (actual == null && se.DataContext != null) { actual = BindingEngine.ReadPathBox(se.DataContext, BindingPath); }
+            if (actual == null && se.DataContext != null) {
+                if (!ParseUtil.IsNativeReady() && !(se.DataContext is UIElement)) { return; }
+                reflectObj = se.DataContext;
+                actual = BindingEngine.ReadPathBox(se.DataContext, BindingPath);
+            }
         } else if (RelativeSourceMode == "Self") {
+            reflectObj = associatedObject;
             actual = associatedObject.GetPropertyValue(BindingPath);
             if (actual == null) { actual = BindingEngine.ReadPathBox(associatedObject, BindingPath); }
         } else if (RelativeSourceMode == "FindAncestor" || RelativeSourceMode == "AncestorType") {
@@ -1255,15 +1406,53 @@ public class BehaviorDataTrigger : BehaviorTriggerBase {
             while (anc != null && RelativeSourceAncestorType.Length > 0 && anc.GetTypeName() != RelativeSourceAncestorType) {
                 anc = anc.Parent;
             }
-            if (anc != null) {
-                actual = anc.GetPropertyValue(BindingPath);
-                if (actual == null) { actual = BindingEngine.ReadPathBox(anc, BindingPath); }
-            }
+            if (anc == null) { return; }
+            reflectObj = anc;
+            actual = anc.GetPropertyValue(BindingPath);
+            if (actual == null) { actual = BindingEngine.ReadPathBox(anc, BindingPath); }
         } else if (associatedObject.DataContext != null) {
+            if (!ParseUtil.IsNativeReady() && !(associatedObject.DataContext is UIElement)) { return; }
+            reflectObj = associatedObject.DataContext;
             actual = BindingEngine.ReadPathBox(associatedObject.DataContext, BindingPath);
+        } else if (_valueBox != null) {
+            if (HasInitTarget(associatedObject)) {
+                SetMatchedFor(associatedObject, false);
+            }
+            return;
         }
-        bool eq = Trigger.BoxEquals(actual, _valueBox);
-        bool matched = (Comparison == "NotEqual") ? !eq : eq;
+        bool matched = false;
+        if (Comparison == "Equal" || Comparison == "==") {
+            matched = Trigger.BoxEquals(actual, _valueBox);
+        } else if (Comparison == "NotEqual" || Comparison == "!=") {
+            matched = !Trigger.BoxEquals(actual, _valueBox);
+        } else {
+            string expectedStr = DependencyObject.UnboxString(_valueBox, "");
+            int ord = (reflectObj != null && expectedStr.Length > 0 && ParseUtil.IsNativeReady())
+                ? Reflect_ResolveEnumOrdinal(reflectObj, BindingPath, expectedStr)
+                : -2147483647;
+            if (ord != -2147483647) {
+                int actOrd = Reflect_GetPropInt(reflectObj, BindingPath);
+                if (Comparison == "GreaterThanOrEqual" || Comparison == ">=") { matched = actOrd >= ord; }
+                else if (Comparison == "GreaterThan" || Comparison == ">") { matched = actOrd > ord; }
+                else if (Comparison == "LessThanOrEqual" || Comparison == "<=") { matched = actOrd <= ord; }
+                else if (Comparison == "LessThan" || Comparison == "<") { matched = actOrd < ord; }
+                else { matched = Trigger.BoxEquals(actual, _valueBox); }
+            } else {
+                float lf = DependencyObject.UnboxFloat(actual, ParseUtil.NaN());
+                float rf = DependencyObject.UnboxFloat(_valueBox, ParseUtil.NaN());
+                if (!ParseUtil.IsNaN(lf) && !ParseUtil.IsNaN(rf)) {
+                    if (Comparison == "GreaterThanOrEqual" || Comparison == ">=") { matched = lf >= rf; }
+                    else if (Comparison == "GreaterThan" || Comparison == ">") { matched = lf > rf; }
+                    else if (Comparison == "LessThanOrEqual" || Comparison == "<=") { matched = lf <= rf; }
+                    else if (Comparison == "LessThan" || Comparison == "<") { matched = lf < rf; }
+                } else if (Comparison != "GreaterThanOrEqual" && Comparison != ">=" &&
+                           Comparison != "GreaterThan" && Comparison != ">" &&
+                           Comparison != "LessThanOrEqual" && Comparison != "<=" &&
+                           Comparison != "LessThan" && Comparison != "<") {
+                    matched = Trigger.BoxEquals(actual, _valueBox);
+                }
+            }
+        }
         if (!HasInitTarget(associatedObject)) {
             _initTargets.Push(associatedObject);
             if (isInitialAttach && BindingPath == "IsMouseOver" && matched && !DependencyObject.UnboxBool(_valueBox, true)) {
@@ -1288,6 +1477,10 @@ public class BehaviorDataTrigger : BehaviorTriggerBase {
     public override void Attach(UIElement associatedObject) {
         if (associatedObject == null) { return; }
         TryHookSource(associatedObject);
+        if (ElementName.Length == 0 && RelativeSourceMode != "Self" &&
+            RelativeSourceMode != "FindAncestor" && RelativeSourceMode != "AncestorType") {
+            RegisterReactive(this, associatedObject);
+        }
         CheckAndFire(associatedObject, true);
         associatedObject.Loaded += (object s, RoutedEventArgs e) => {
             TryHookSource(associatedObject);
