@@ -2659,6 +2659,15 @@ void EnsureImageAtlasRegisteredWithStore() noexcept {
     UIResourceStore::RegisterImageAtlasHooks(
         []() { return std::make_shared<ImageAtlas>(); },
         [](ImageAtlas& atlas) noexcept { atlas.Clear(); });
+    UIResourceStore::RegisterImageAtlasSlotHook(
+        [](ImageAtlas& atlas,
+           std::uint32_t reuseSlotId,
+           std::uint32_t w,
+           std::uint32_t h,
+           std::vector<std::uint8_t>&& rgbaPixels) {
+            return atlas.RegisterOrUpdateRgbaTextureSlot(
+                reuseSlotId, w, h, std::move(rgbaPixels));
+        });
 }
 
 const bool gImageAtlasStoreHooksInit = []() noexcept {
@@ -2921,6 +2930,30 @@ const ImageAtlasEntry* ImageAtlas::RegisterDecodedImage(
         return &it->second;
     }
     return InsertDecodedLocked(normKey, std::move(image), forceStandalone);
+}
+
+std::uint32_t ImageAtlas::RegisterOrUpdateRgbaTextureSlot(
+    std::uint32_t reuseSlotId,
+    std::uint32_t width,
+    std::uint32_t height,
+    std::vector<std::uint8_t>&& rgbaPixels) {
+    if (width == 0u || height == 0u ||
+        rgbaPixels.size() != static_cast<std::size_t>(width) * static_cast<std::size_t>(height) * 4u) {
+        return 0u;
+    }
+    std::lock_guard<std::mutex> lock(mutex_);
+    const std::uint32_t texId = (reuseSlotId > 0u && textureSlots_.find(reuseSlotId) != textureSlots_.end())
+        ? reuseSlotId
+        : nextStandaloneTextureId_++;
+    const std::uint64_t nextRev = revision_.fetch_add(1u, std::memory_order_acq_rel) + 1u;
+    TextureSlotBuffer& slot = textureSlots_[texId];
+    slot.textureId = texId;
+    slot.width = width;
+    slot.height = height;
+    slot.dirtyRevision = static_cast<std::uint32_t>(nextRev != 0u ? nextRev : 1u);
+    slot.isAtlas = false;
+    slot.rgbaPixels = std::move(rgbaPixels);
+    return texId;
 }
 
 std::string ImageAtlas::ResolveExistingFileLocked(

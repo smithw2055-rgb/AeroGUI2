@@ -2130,10 +2130,6 @@ bool FontAtlas::LoadTrueTypeFontFromMemory(
         defaultFamilyKey_ = primaryKey;
     }
 
-    // Warm-bake printable ASCII glyphs (0x20..0x7E) so common UI text has zero first-frame miss
-    for (std::uint32_t cp = 0x20u; cp <= 0x7Eu; ++cp) {
-        (void)EnsureGlyphLocked(&fonts_[entryIndex], cp);
-    }
     return true;
 }
 

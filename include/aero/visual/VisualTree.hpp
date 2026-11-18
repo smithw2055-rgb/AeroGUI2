@@ -79,6 +79,10 @@ enum class VisualLayoutRectQuery : std::int32_t {
     DesiredHeight = 5,
     ScrollExtentWidth = 6,
     ScrollExtentHeight = 7,
+    ViewportX = 8,
+    ViewportY = 9,
+    ViewportWidth = 10,
+    ViewportHeight = 11,
 };
 
 struct VisualNodeId {
@@ -110,6 +114,7 @@ struct VisualBoxStyle {
     std::uint32_t borderRgba = 0u;
     std::int32_t bgGradId = -1;
     std::int32_t borderGradId = -1;
+    float bgOpacity = 1.0f;
     Thickness borderThickness{};
     CornerRadius cornerRadius{};
 };
@@ -376,6 +381,7 @@ public:
         float crBR,
         float crBL) noexcept;
     bool SetBoxGradients(VisualNodeId id, std::int32_t bgGradId, std::int32_t borderGradId) noexcept;
+    bool SetBoxBrushOpacity(VisualNodeId id, float bgOpacity) noexcept;
     bool SetTransform2D(
         VisualNodeId id,
         float tx,

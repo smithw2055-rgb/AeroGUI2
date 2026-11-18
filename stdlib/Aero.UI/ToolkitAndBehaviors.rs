@@ -956,16 +956,39 @@ public class BehaviorTriggerBase : DependencyObject {
 public class BehaviorEventTrigger : BehaviorTriggerBase {
     public string EventName { get; set; } = "Loaded";
     public string SourceName { get; set; } = "";
+    private UIElement[] _wiredOwners;
 
-    public BehaviorEventTrigger() : base() {}
+    public BehaviorEventTrigger() : base() {
+        _wiredOwners = new UIElement[0];
+    }
     public BehaviorEventTrigger(string eventName) : base() {
         EventName = eventName == null ? "Loaded" : eventName;
+        _wiredOwners = new UIElement[0];
     }
 
-    public override void Attach(UIElement associatedObject) {
-        if (associatedObject == null) { return; }
-        UIElement src = SourceName.Length > 0 ? associatedObject.RootElement().FindName(SourceName) : associatedObject;
-        if (src == null) { src = associatedObject; }
+    private UIElement ResolveSourceElement(UIElement associatedObject) {
+        if (associatedObject == null) { return null; }
+        if (SourceName.Length == 0) { return associatedObject; }
+        UIElement se = BindingEntry.FindElementScoped(associatedObject, SourceName);
+        if (se == null) { se = associatedObject.FindName(SourceName); }
+        if (se == null) {
+            UIElement root = associatedObject.RootElement();
+            if (root != null) { se = root.FindName(SourceName); }
+        }
+        return se;
+    }
+
+    private bool IsWiredOwner(UIElement owner) {
+        if (owner == null || _wiredOwners == null) { return false; }
+        for (int i = 0; i < _wiredOwners.Length; i += 1) {
+            if (_wiredOwners[i] == owner) { return true; }
+        }
+        return false;
+    }
+
+    private void WireSourceEvents(UIElement src, UIElement associatedObject) {
+        if (src == null || associatedObject == null || IsWiredOwner(associatedObject)) { return; }
+        _wiredOwners.Push(associatedObject);
         string ev = EventName;
         if (ev == "Loaded") {
             src.Loaded += (object s, RoutedEventArgs e) => { Fire(associatedObject, e); };
@@ -1031,6 +1054,21 @@ public class BehaviorEventTrigger : BehaviorTriggerBase {
         }
     }
 
+    public override void Attach(UIElement associatedObject) {
+        if (associatedObject == null) { return; }
+        UIElement src = ResolveSourceElement(associatedObject);
+        if (src != null) {
+            WireSourceEvents(src, associatedObject);
+            return;
+        }
+        associatedObject.Loaded += (object s, RoutedEventArgs e) => {
+            if (!IsWiredOwner(associatedObject)) {
+                UIElement lateSrc = ResolveSourceElement(associatedObject);
+                WireSourceEvents(lateSrc != null ? lateSrc : associatedObject, associatedObject);
+            }
+        };
+    }
+
     private void WireDescendantRoutedEvent(UIElement node, string ev, UIElement associatedObject) {
         if (node == null) { return; }
         if (ev == "Click" && node is ButtonBase) {
@@ -1058,14 +1096,23 @@ public class BehaviorEventTrigger : BehaviorTriggerBase {
 
 public class BehaviorDataTrigger : BehaviorTriggerBase {
     public string BindingPath { get; set; } = "";
+    public string ElementName { get; set; } = "";
     public string RelativeSourceMode { get; set; } = "";
     public string RelativeSourceAncestorType { get; set; } = "";
     public string Comparison { get; set; } = "Equal";
     private DependencyObject _valueBox;
-    private bool _wasMatched = false;
+    private UIElement[] _initTargets;
+    private UIElement[] _matchedTargets;
+    private UIElement[] _hookedTargets;
+    private UIElement[] _hookedSources;
 
-    public BehaviorDataTrigger() : base() {}
-    public BehaviorDataTrigger(string bindingPath, object value) : base() {
+    public BehaviorDataTrigger() : base() {
+        _initTargets = new UIElement[0];
+        _matchedTargets = new UIElement[0];
+        _hookedTargets = new UIElement[0];
+        _hookedSources = new UIElement[0];
+    }
+    public BehaviorDataTrigger(string bindingPath, object value) : this() {
         BindingPath = bindingPath == null ? "" : bindingPath;
         _valueBox = DependencyObject.BoxObject(value);
     }
@@ -1076,10 +1123,73 @@ public class BehaviorDataTrigger : BehaviorTriggerBase {
         set { _valueBox = DependencyObject.BoxObject(value); }
     }
 
-    private void CheckAndFire(UIElement associatedObject) {
+    private UIElement ResolveElementSource(UIElement associatedObject) {
+        if (associatedObject == null || ElementName.Length == 0) { return null; }
+        if (associatedObject.Name == ElementName) { return associatedObject; }
+        UIElement se = BindingEntry.FindElementScoped(associatedObject, ElementName);
+        if (se == null) { se = associatedObject.FindName(ElementName); }
+        if (se == null) {
+            UIElement root = associatedObject.RootElement();
+            if (root != null) { se = root.FindName(ElementName); }
+        }
+        return se;
+    }
+
+    private bool HasInitTarget(UIElement target) {
+        for (int i = 0; i < _initTargets.Length; i += 1) {
+            if (_initTargets[i] == target) { return true; }
+        }
+        return false;
+    }
+
+    private bool IsMatchedFor(UIElement target) {
+        for (int i = 0; i < _matchedTargets.Length; i += 1) {
+            if (_matchedTargets[i] == target) { return true; }
+        }
+        return false;
+    }
+
+    private void SetMatchedFor(UIElement target, bool active) {
+        for (int i = _matchedTargets.Length - 1; i >= 0; i -= 1) {
+            if (_matchedTargets[i] == target) {
+                if (!active) { _matchedTargets.RemoveAt(i); }
+                return;
+            }
+        }
+        if (active) { _matchedTargets.Push(target); }
+    }
+
+    private bool HasHookedSource(UIElement target, UIElement src) {
+        for (int i = 0; i < _hookedTargets.Length; i += 1) {
+            if (_hookedTargets[i] == target && _hookedSources[i] == src) { return true; }
+        }
+        return false;
+    }
+
+    private void TryHookSource(UIElement associatedObject) {
+        if (associatedObject == null) { return; }
+        UIElement src = null;
+        if (ElementName.Length > 0) {
+            src = ResolveElementSource(associatedObject);
+        } else if (RelativeSourceMode == "Self") {
+            src = associatedObject;
+        }
+        if (src == null || HasHookedSource(associatedObject, src)) { return; }
+        _hookedTargets.Push(associatedObject);
+        _hookedSources.Push(src);
+        src.AddStateInvalidatedHook(() => { CheckAndFire(associatedObject, false); });
+    }
+
+    private void CheckAndFire(UIElement associatedObject, bool isInitialAttach) {
         if (associatedObject == null || BindingPath.Length == 0) { return; }
         DependencyObject actual = null;
-        if (RelativeSourceMode == "Self") {
+        if (ElementName.Length > 0) {
+            UIElement se = ResolveElementSource(associatedObject);
+            if (se == null) { return; }
+            actual = se.GetPropertyValue(BindingPath);
+            if (actual == null) { actual = BindingEngine.ReadPathBox(se, BindingPath); }
+            if (actual == null && se.DataContext != null) { actual = BindingEngine.ReadPathBox(se.DataContext, BindingPath); }
+        } else if (RelativeSourceMode == "Self") {
             actual = associatedObject.GetPropertyValue(BindingPath);
             if (actual == null) { actual = BindingEngine.ReadPathBox(associatedObject, BindingPath); }
         } else if (RelativeSourceMode == "FindAncestor" || RelativeSourceMode == "AncestorType") {
@@ -1096,20 +1206,38 @@ public class BehaviorDataTrigger : BehaviorTriggerBase {
         }
         bool eq = Trigger.BoxEquals(actual, _valueBox);
         bool matched = (Comparison == "NotEqual") ? !eq : eq;
-        if (matched && !_wasMatched) {
-            _wasMatched = true;
+        if (!HasInitTarget(associatedObject)) {
+            _initTargets.Push(associatedObject);
+            if (isInitialAttach && BindingPath == "IsMouseOver" && matched && !DependencyObject.UnboxBool(_valueBox, true)) {
+                SetMatchedFor(associatedObject, true);
+                return;
+            }
+            if (matched) {
+                SetMatchedFor(associatedObject, true);
+                Fire(associatedObject, null);
+            }
+            return;
+        }
+        bool was = IsMatchedFor(associatedObject);
+        if (matched && !was) {
+            SetMatchedFor(associatedObject, true);
             Fire(associatedObject, null);
-        } else if (!matched) {
-            _wasMatched = false;
+        } else if (!matched && was) {
+            SetMatchedFor(associatedObject, false);
         }
     }
 
     public override void Attach(UIElement associatedObject) {
         if (associatedObject == null) { return; }
-        associatedObject.Loaded += (object s, RoutedEventArgs e) => { CheckAndFire(associatedObject); };
-        associatedObject.GotFocus += (object s, RoutedEventArgs e) => { CheckAndFire(associatedObject); };
-        associatedObject.LostFocus += (object s, RoutedEventArgs e) => { CheckAndFire(associatedObject); };
-        associatedObject.DataContextChanged += (object s, DependencyPropertyChangedEventArgs e) => { CheckAndFire(associatedObject); };
+        TryHookSource(associatedObject);
+        CheckAndFire(associatedObject, true);
+        associatedObject.Loaded += (object s, RoutedEventArgs e) => {
+            TryHookSource(associatedObject);
+            CheckAndFire(associatedObject, true);
+        };
+        associatedObject.GotFocus += (object s, RoutedEventArgs e) => { CheckAndFire(associatedObject, false); };
+        associatedObject.LostFocus += (object s, RoutedEventArgs e) => { CheckAndFire(associatedObject, false); };
+        associatedObject.DataContextChanged += (object s, DependencyPropertyChangedEventArgs e) => { CheckAndFire(associatedObject, false); };
     }
 }
 

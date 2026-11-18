@@ -153,12 +153,53 @@ struct ReflectHostEnv {
     return nullptr;
 }
 
+[[nodiscard]] const rs_aot::TypeDescriptor* FindAotType(
+    const rs_aot::ProgramDescriptor& prog,
+    rs_sem::SymbolId typeId) noexcept {
+    if (!prog.types || prog.typeCount == 0u || typeId == 0u) {
+        return nullptr;
+    }
+    for (std::uint32_t i = 0u; i < prog.typeCount; ++i) {
+        if (prog.types[i].id == typeId) {
+            return &prog.types[i];
+        }
+    }
+    return nullptr;
+}
+
 [[nodiscard]] bool TryExtractStringValue(
     const ReflectHostEnv& env,
     const rs_rt::Value& val,
     std::string& outStr) {
     if (const auto* sv = std::get_if<rs_rt::StringValue>(&val)) {
         outStr = sv->str();
+        return true;
+    }
+    rs_rt::EnumValue ev{};
+    if (val.tryGetEnum(ev)) {
+        if (env.programImage && ev.typeId != 0u) {
+            if (const rs_sem::TypeSymbol* ts = env.programImage->resolveType(ev.typeId)) {
+                for (const auto& em : ts->enumMembers) {
+                    if (em.value == ev.value) {
+                        outStr = em.name;
+                        return true;
+                    }
+                }
+            }
+        }
+        if (env.aotContext && ev.typeId != 0u) {
+            if (const rs_aot::TypeDescriptor* td = FindAotType(env.aotContext->program(), ev.typeId)) {
+                if (td->enumMembers) {
+                    for (std::uint32_t i = 0u; i < td->enumMemberCount; ++i) {
+                        if (td->enumMembers[i].value == ev.value && td->enumMembers[i].name) {
+                            outStr = td->enumMembers[i].name;
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+        outStr = std::to_string(ev.value);
         return true;
     }
     rs_rt::ObjectRef ref{};
@@ -193,20 +234,6 @@ struct ReflectHostEnv {
         full.append(td.name);
     }
     return full;
-}
-
-[[nodiscard]] const rs_aot::TypeDescriptor* FindAotType(
-    const rs_aot::ProgramDescriptor& prog,
-    rs_sem::SymbolId typeId) noexcept {
-    if (!prog.types || prog.typeCount == 0u || typeId == 0u) {
-        return nullptr;
-    }
-    for (std::uint32_t i = 0u; i < prog.typeCount; ++i) {
-        if (prog.types[i].id == typeId) {
-            return &prog.types[i];
-        }
-    }
-    return nullptr;
 }
 
 [[nodiscard]] bool FunctionNameMatchesMember(
@@ -669,43 +696,6 @@ struct ReflectHostEnv {
     return false;
 }
 
-[[nodiscard]] float ReadCurrentScalarProp(
-    const VisualWorld& world,
-    VisualNodeId id,
-    VisualAnimProp prop) noexcept {
-    const VisualNode* node = world.GetNode(id);
-    if (!node) {
-        return 0.0f;
-    }
-    switch (prop) {
-        case VisualAnimProp::Opacity: return node->layout.opacity;
-        case VisualAnimProp::Width: return std::isfinite(node->layout.width) ? node->layout.width : node->layout.layoutRect.width;
-        case VisualAnimProp::Height: return std::isfinite(node->layout.height) ? node->layout.height : node->layout.layoutRect.height;
-        case VisualAnimProp::TranslateX: return node->transform2D.tx;
-        case VisualAnimProp::TranslateY: return node->transform2D.ty;
-        case VisualAnimProp::ScaleX: return node->transform2D.sx;
-        case VisualAnimProp::ScaleY: return node->transform2D.sy;
-        case VisualAnimProp::RotateDeg: return node->transform2D.rotDeg;
-        case VisualAnimProp::SkewX: return node->transform2D.skewX;
-        case VisualAnimProp::SkewY: return node->transform2D.skewY;
-        case VisualAnimProp::Rot3DX: return node->transform3D.rx;
-        case VisualAnimProp::Rot3DY: return node->transform3D.ry;
-        case VisualAnimProp::Rot3DZ: return node->transform3D.rz;
-        case VisualAnimProp::Trans3DX: return node->transform3D.tx;
-        case VisualAnimProp::Trans3DY: return node->transform3D.ty;
-        case VisualAnimProp::Trans3DZ: return node->transform3D.tz;
-        case VisualAnimProp::CornerRadius: return node->box.cornerRadius.topLeft;
-        case VisualAnimProp::PathTrimStart: return node->vector.trimStart;
-        case VisualAnimProp::PathTrimEnd: return node->vector.trimEnd;
-        case VisualAnimProp::EffectRadius: return node->effect.radius;
-        case VisualAnimProp::CustomScalar0: return node->customScalars[0];
-        case VisualAnimProp::CustomScalar1: return node->customScalars[1];
-        case VisualAnimProp::CustomScalar2: return node->customScalars[2];
-        case VisualAnimProp::CustomScalar3: return node->customScalars[3];
-        default: return 0.0f;
-    }
-}
-
 } // namespace
 
 bool RegisterVisualHostBindings(
@@ -925,6 +915,12 @@ bool RegisterVisualHostBindings(
             static_cast<std::int32_t>(ArgInt(args, 2, -1)));
         return rs_rt::Value{std::int64_t{0}};
     });
+    ok &= bindFn("Visual_SetBoxBrushOpacity", [&world](const rs_bc::FunctionReference&, rs_rt::ValueSpan args, rs_rt::RuntimeError&) -> std::optional<rs_rt::Value> {
+        (void)world.SetBoxBrushOpacity(
+            ArgNode(args, 0, world),
+            ArgFloat(args, 1, 1.0f));
+        return rs_rt::Value{std::int64_t{0}};
+    });
     ok &= bindFn("Visual_RegisterLinearGradient", [&world, &domains](const rs_bc::FunctionReference&, rs_rt::ValueSpan args, rs_rt::RuntimeError&) -> std::optional<rs_rt::Value> {
         GradientBrushDesc desc{};
         desc.kind = GradientBrushKind::Linear;
@@ -1139,29 +1135,90 @@ bool RegisterVisualHostBindings(
 
     // Animation / Host / Reflection
     ok &= bindFn("Anim_StartFloat", [&world, &animEngine](const rs_bc::FunctionReference&, rs_rt::ValueSpan args, rs_rt::RuntimeError&) -> std::optional<rs_rt::Value> {
+        const VisualNodeId nodeId = ArgNode(args, 0, world);
+        const auto prop = static_cast<VisualAnimProp>(ArgInt(args, 1, 0));
+        const float fromVal = ArgFloat(args, 2);
+        const float toVal = ArgFloat(args, 3);
+        const float durationSec = ArgFloat(args, 4, 0.25f);
+        const float delaySec = ArgFloat(args, 7, 0.0f);
         const std::int32_t tid = animEngine.StartFloat(
-            ArgNode(args, 0, world),
-            static_cast<VisualAnimProp>(ArgInt(args, 1, 0)),
-            ArgFloat(args, 2),
-            ArgFloat(args, 3),
-            ArgFloat(args, 4, 0.25f),
+            nodeId,
+            prop,
+            fromVal,
+            toVal,
+            durationSec,
             static_cast<EasingFunctionKind>(ArgInt(args, 5, 2)),
             static_cast<EasingMode>(ArgInt(args, 6, 0)),
-            ArgFloat(args, 7, 0.0f),
+            delaySec,
             ArgBool(args, 8, false),
             static_cast<std::int32_t>(ArgInt(args, 9, 1)));
+        if (tid > 0 && delaySec <= 0.0f && durationSec > 1e-5f) {
+            VisualAnimationEngine::ApplyScalarPropImmediate(world, nodeId, prop, fromVal);
+        }
         return rs_rt::Value{static_cast<std::int64_t>(tid)};
     });
-    ok &= bindFn("Anim_StartColor", [&world, &animEngine](const rs_bc::FunctionReference&, rs_rt::ValueSpan args, rs_rt::RuntimeError&) -> std::optional<rs_rt::Value> {
-        const std::int32_t tid = animEngine.StartColor(
-            ArgNode(args, 0, world),
-            static_cast<VisualAnimProp>(ArgInt(args, 1, 16)),
-            ArgUInt(args, 2),
-            ArgUInt(args, 3),
-            ArgFloat(args, 4, 0.25f),
-            static_cast<EasingFunctionKind>(ArgInt(args, 5, 2)),
-            static_cast<EasingMode>(ArgInt(args, 6, 0)));
+    ok &= bindFn("Anim_StartFloatTo", [&world, &animEngine](const rs_bc::FunctionReference&, rs_rt::ValueSpan args, rs_rt::RuntimeError&) -> std::optional<rs_rt::Value> {
+        const VisualNodeId nodeId = ArgNode(args, 0, world);
+        const auto prop = static_cast<VisualAnimProp>(ArgInt(args, 1, 0));
+        const std::int32_t tid = animEngine.StartFloat(
+            nodeId,
+            prop,
+            VisualAnimationEngine::ReadCurrentScalarProp(world, nodeId, prop),
+            ArgFloat(args, 2),
+            ArgFloat(args, 3, 0.25f),
+            static_cast<EasingFunctionKind>(ArgInt(args, 4, 2)),
+            static_cast<EasingMode>(ArgInt(args, 5, 0)),
+            ArgFloat(args, 6, 0.0f),
+            ArgBool(args, 7, false),
+            static_cast<std::int32_t>(ArgInt(args, 8, 1)));
         return rs_rt::Value{static_cast<std::int64_t>(tid)};
+    });
+    auto startColorHandler = [&world, &animEngine](const rs_bc::FunctionReference&, rs_rt::ValueSpan args, rs_rt::RuntimeError&) -> std::optional<rs_rt::Value> {
+        const VisualNodeId nodeId = ArgNode(args, 0, world);
+        const auto prop = static_cast<VisualAnimProp>(ArgInt(args, 1, 16));
+        const std::uint32_t fromRgba = ArgUInt(args, 2);
+        const std::uint32_t toRgba = ArgUInt(args, 3);
+        const float durationSec = ArgFloat(args, 4, 0.25f);
+        const float delaySec = ArgFloat(args, 7, 0.0f);
+        const std::int32_t tid = animEngine.StartColor(
+            nodeId,
+            prop,
+            fromRgba,
+            toRgba,
+            durationSec,
+            static_cast<EasingFunctionKind>(ArgInt(args, 5, 2)),
+            static_cast<EasingMode>(ArgInt(args, 6, 0)),
+            delaySec);
+        if (tid > 0 && delaySec <= 0.0f && durationSec > 1e-5f) {
+            VisualAnimationEngine::ApplyColorPropImmediate(world, nodeId, prop, fromRgba);
+        }
+        return rs_rt::Value{static_cast<std::int64_t>(tid)};
+    };
+    ok &= bindFn("Anim_StartColor", startColorHandler);
+    ok &= bindFn("Anim_StartColorDelayed", startColorHandler);
+    ok &= bindFn("Anim_StartColorTo", [&world, &animEngine](const rs_bc::FunctionReference&, rs_rt::ValueSpan args, rs_rt::RuntimeError&) -> std::optional<rs_rt::Value> {
+        const VisualNodeId nodeId = ArgNode(args, 0, world);
+        const auto prop = static_cast<VisualAnimProp>(ArgInt(args, 1, 16));
+        const std::int32_t tid = animEngine.StartColor(
+            nodeId,
+            prop,
+            VisualAnimationEngine::ReadCurrentColorProp(world, nodeId, prop),
+            ArgUInt(args, 2),
+            ArgFloat(args, 3, 0.25f),
+            static_cast<EasingFunctionKind>(ArgInt(args, 4, 2)),
+            static_cast<EasingMode>(ArgInt(args, 5, 0)),
+            ArgFloat(args, 6, 0.0f));
+        return rs_rt::Value{static_cast<std::int64_t>(tid)};
+    });
+    ok &= bindFn("Anim_ReadCurrentFloat", [&world](const rs_bc::FunctionReference&, rs_rt::ValueSpan args, rs_rt::RuntimeError&) -> std::optional<rs_rt::Value> {
+        const VisualNodeId nodeId = ArgNode(args, 0, world);
+        const auto prop = static_cast<VisualAnimProp>(ArgInt(args, 1, 0));
+        return MakeFloat(VisualAnimationEngine::ReadCurrentScalarProp(world, nodeId, prop));
+    });
+    ok &= bindFn("Anim_ReadCurrentColor", [&world](const rs_bc::FunctionReference&, rs_rt::ValueSpan args, rs_rt::RuntimeError&) -> std::optional<rs_rt::Value> {
+        const VisualNodeId nodeId = ArgNode(args, 0, world);
+        const auto prop = static_cast<VisualAnimProp>(ArgInt(args, 1, 16));
+        return MakeUInt(VisualAnimationEngine::ReadCurrentColorProp(world, nodeId, prop));
     });
     ok &= bindFn("Anim_SpringFloat", [&world, &animEngine](const rs_bc::FunctionReference&, rs_rt::ValueSpan args, rs_rt::RuntimeError&) -> std::optional<rs_rt::Value> {
         const VisualNodeId nodeId = ArgNode(args, 0, world);
@@ -1169,7 +1226,7 @@ bool RegisterVisualHostBindings(
         const std::int32_t tid = animEngine.SpringFloat(
             nodeId,
             prop,
-            ReadCurrentScalarProp(world, nodeId, prop),
+            VisualAnimationEngine::ReadCurrentScalarProp(world, nodeId, prop),
             ArgFloat(args, 2),
             ArgFloat(args, 3, 320.0f),
             ArgFloat(args, 4, 28.0f));
@@ -1298,6 +1355,48 @@ bool RegisterVisualHostBindings(
             }
         }
         return rs_rt::Value{rs_rt::NullObject{}};
+    });
+    ok &= bindFn("Reflect_GetPropTypeKind", [reflectEnv](const rs_bc::FunctionReference&, rs_rt::ValueSpan args, rs_rt::RuntimeError&) -> std::optional<rs_rt::Value> {
+        const rs_rt::ObjectRef target = ArgObject(args, 0);
+        std::string propPath;
+        if (!TryExtractStringValue(reflectEnv, args.size() > 1u ? args[1] : rs_rt::Value{}, propPath)) {
+            propPath = ArgString(args, 1);
+        }
+        rs_rt::Value val{};
+        if (!ReadDotPathValue(reflectEnv, target, propPath, val)) {
+            return rs_rt::Value{std::int64_t{0}};
+        }
+        switch (val.rawTag()) {
+            case rs_rt::ValueTag::Bool:
+                return rs_rt::Value{std::int64_t{1}};
+            case rs_rt::ValueTag::Byte:
+            case rs_rt::ValueTag::SByte:
+            case rs_rt::ValueTag::Short:
+            case rs_rt::ValueTag::UShort:
+            case rs_rt::ValueTag::Int64:
+            case rs_rt::ValueTag::UInt:
+            case rs_rt::ValueTag::Long:
+            case rs_rt::ValueTag::ULong:
+                return rs_rt::Value{std::int64_t{2}};
+            case rs_rt::ValueTag::Float:
+            case rs_rt::ValueTag::Double:
+                return rs_rt::Value{std::int64_t{3}};
+            case rs_rt::ValueTag::String:
+            case rs_rt::ValueTag::EnumInline:
+            case rs_rt::ValueTag::EnumArena:
+                return rs_rt::Value{std::int64_t{4}};
+            case rs_rt::ValueTag::ObjectRef: {
+                if (const auto* ov = std::get_if<rs_rt::ObjectRef>(&val); ov && ov->valid()) {
+                    if (ov->kind == rs_rt::ObjectKind::String) {
+                        return rs_rt::Value{std::int64_t{4}};
+                    }
+                    return rs_rt::Value{std::int64_t{5}};
+                }
+                return rs_rt::Value{std::int64_t{0}};
+            }
+            default:
+                return rs_rt::Value{std::int64_t{0}};
+        }
     });
     ok &= bindFn("Reflect_SetPropString", [reflectEnv](const rs_bc::FunctionReference&, rs_rt::ValueSpan args, rs_rt::RuntimeError&) -> std::optional<rs_rt::Value> {
         const rs_rt::ObjectRef target = ArgObject(args, 0);

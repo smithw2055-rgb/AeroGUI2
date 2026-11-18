@@ -72,6 +72,10 @@ function(aero_apply_default_rtti_options target_name)
     endif()
 endfunction()
 
+if(MSVC)
+    add_link_options(/STACK:8388608)
+endif()
+
 # ============================================================================
 # 1. Foundation (drawing + core + runtime + asset) [NO RTTI, SlimRuntime]
 # ============================================================================

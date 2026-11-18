@@ -9,8 +9,14 @@ import RealScript.Math;
 public class Decorator : FrameworkElement {
     private UIElement _child;
 
-    public Decorator() : base(VisualKind.Box) {}
+    public Decorator() : base(VisualKind.Box) {
+        SyncInteractiveFlags();
+    }
     public override string GetTypeName() { return "Decorator"; }
+
+    protected override bool IsSelfHitTestSolid() {
+        return Background != null;
+    }
 
     public UIElement Child {
         get { return _child; }
@@ -26,6 +32,29 @@ public class Decorator : FrameworkElement {
 public class Border : Decorator {
     public Border() : base() {}
     public override string GetTypeName() { return "Border"; }
+
+    protected override bool IsSelfHitTestSolid() {
+        if (Background != null) { return true; }
+        Thickness bt = BorderThickness;
+        return BorderBrush != null && (bt.Left > 0.0f || bt.Top > 0.0f || bt.Right > 0.0f || bt.Bottom > 0.0f);
+    }
+
+    protected override void SyncPadding() {
+        if (!ParseUtil.IsValidHandle(__nativeHandle)) { return; }
+        Thickness p = Padding;
+        Thickness b = BorderThickness;
+        Visual_SetPadding(
+            __nativeHandle,
+            p.Left + b.Left,
+            p.Top + b.Top,
+            p.Right + b.Right,
+            p.Bottom + b.Bottom);
+    }
+
+    protected override void OnBoxAppearanceChanged() {
+        base.OnBoxAppearanceChanged();
+        SyncPadding();
+    }
 }
 
 public class BoxShadow : Decorator {
@@ -324,7 +353,7 @@ public class TextBlock : FrameworkElement {
         if (propName == "FontSize") { FontSize = DependencyObject.UnboxFloat(value, 14.0f); return true; }
         if (propName == "FontWeight") { FontWeight = DependencyObject.UnboxString(value, "Normal"); return true; }
         if (propName == "FontStyle") { FontStyle = DependencyObject.UnboxString(value, "Normal"); return true; }
-        if (propName == "Foreground") { Foreground = UIElement.CoerceBrush(value); return true; }
+        if (propName == "Foreground" || propName == "Foreground.Color") { Foreground = UIElement.CoerceBrush(value); return true; }
         if (propName == "Stroke") { Stroke = UIElement.CoerceBrush(value); return true; }
         if (propName == "StrokeThickness") { StrokeThickness = DependencyObject.UnboxFloat(value, 0.0f); return true; }
         if (propName == "LineHeight") { LineHeight = DependencyObject.UnboxFloat(value, 0.0f); return true; }
@@ -361,6 +390,9 @@ public class TextBlock : FrameworkElement {
         if (propName == "FontSize") { return DependencyObject.BoxFloat(_fontSize); }
         if (propName == "FontFamily") { return DependencyObject.BoxString(_fontFamily); }
         if (propName == "Foreground") { return _foreground; }
+        if (propName == "Foreground.Color") {
+            return DependencyObject.BoxString(_foreground != null ? ParseUtil.FormatArgbHex(_foreground.ResolveRgba()) : "#FFEAECEF");
+        }
         if (propName == "Stroke") { return Stroke; }
         if (propName == "StrokeThickness") { return DependencyObject.BoxFloat(StrokeThickness); }
         return base.GetPropertyValue(propName);
@@ -494,12 +526,35 @@ public class Shape : FrameworkElement {
     }
 
     public override bool SetPropertyValue(string propName, DependencyObject value) {
-        if (propName == "Fill") { Fill = UIElement.CoerceBrush(value); return true; }
-        if (propName == "Stroke") { Stroke = UIElement.CoerceBrush(value); return true; }
+        if (propName == "Fill" || propName == "Fill.Color") { Fill = UIElement.CoerceBrush(value); return true; }
+        if (propName == "Stroke" || propName == "Stroke.Color") { Stroke = UIElement.CoerceBrush(value); return true; }
         if (propName == "StrokeThickness") { StrokeThickness = DependencyObject.UnboxFloat(value, 1.0f); return true; }
+        if (propName == "Stretch") {
+            if (value is BoxedInt) { Stretch = EnumConvert.ToStretch((value as BoxedInt).Value); return true; }
+            string st = DependencyObject.UnboxString(value, "Fill").Trim();
+            if (st == "None" || st == "0") { Stretch = Stretch.None; return true; }
+            if (st == "Uniform" || st == "2") { Stretch = Stretch.Uniform; return true; }
+            if (st == "UniformToFill" || st == "3") { Stretch = Stretch.UniformToFill; return true; }
+            Stretch = Stretch.Fill;
+            return true;
+        }
         if (propName == "TrimStart") { TrimStart = DependencyObject.UnboxFloat(value, 0.0f); return true; }
         if (propName == "TrimEnd") { TrimEnd = DependencyObject.UnboxFloat(value, 1.0f); return true; }
         return base.SetPropertyValue(propName, value);
+    }
+
+    public override DependencyObject GetPropertyValue(string propName) {
+        if (propName == "Fill") { return _fill; }
+        if (propName == "Fill.Color") {
+            return DependencyObject.BoxString(_fill != null ? ParseUtil.FormatArgbHex(_fill.ResolveRgba()) : "#00000000");
+        }
+        if (propName == "Stroke") { return _stroke; }
+        if (propName == "Stroke.Color") {
+            return DependencyObject.BoxString(_stroke != null ? ParseUtil.FormatArgbHex(_stroke.ResolveRgba()) : "#00000000");
+        }
+        if (propName == "StrokeThickness") { return DependencyObject.BoxFloat(_strokeThickness); }
+        if (propName == "Stretch") { return DependencyObject.BoxInt(EnumConvert.ToInt(_stretch)); }
+        return base.GetPropertyValue(propName);
     }
 }
 
@@ -570,9 +625,13 @@ public class Line : Shape {
 public class Path : Shape {
     private string _data = "";
 
-    public Path() : base() { SyncVectorShape(); }
+    public Path() : base() {
+        Stretch = Stretch.None;
+        SyncVectorShape();
+    }
     public Path(string svgPath) : base() {
         _data = svgPath == null ? "" : svgPath;
+        Stretch = Stretch.None;
         SyncVectorShape();
     }
 
@@ -582,6 +641,31 @@ public class Path : Shape {
         set { _data = value == null ? "" : value; SyncVectorShape(); }
     }
     protected override string BuildVectorGeometrySpec() { return _data; }
+
+    public override bool SetPropertyValue(string propName, DependencyObject value) {
+        if (propName == "Data") {
+            if (value is Geometry) {
+                Data = (value as Geometry).Data;
+                return true;
+            }
+            if (value != null) {
+                object raw = value.UnboxObject();
+                if (raw is Geometry) {
+                    Data = (raw as Geometry).Data;
+                    return true;
+                }
+            }
+            Data = DependencyObject.UnboxString(value, "");
+            return true;
+        }
+        return base.SetPropertyValue(propName, value);
+    }
+
+    public override DependencyObject GetPropertyValue(string propName) {
+        if (propName == "Data") { return DependencyObject.BoxString(_data); }
+        return base.GetPropertyValue(propName);
+    }
+    public override string ToDisplayString() { return "path:" + _data; }
 }
 
 public class Geometry : Path {

@@ -121,6 +121,7 @@ struct ColoredSegment {
     Point p1{};
     std::uint8_t channelMask = 0x07u; // Bit 0 = R, Bit 1 = G, Bit 2 = B
     bool inClosedContour = true;
+    bool smoothAtStart = false;
 };
 
 // SVG 1.1 / XAML StreamGeometry arc flag grammar: single '0' or '1' digit (may omit trailing separator, e.g. "a4,4 0 014,-4")
@@ -281,6 +282,7 @@ ParsedSvgGeometry ParseSvgPathGeometry(
     detail::SkipSvgDelimiters(pathData, pos);
 
     std::vector<Point> currentContour;
+    std::vector<std::uint8_t> currentSmooth;
     bool currentClosed = false;
     Point cur{0.0f, 0.0f};
     Point startPt{0.0f, 0.0f};
@@ -297,10 +299,23 @@ ParsedSvgGeometry ParseSvgPathGeometry(
                     currentClosed = true;
                 }
             }
-            geom.contours.push_back(SvgPathContour{std::move(currentContour), currentClosed});
+            currentSmooth.resize(currentContour.size(), 0u);
+            geom.contours.push_back(SvgPathContour{
+                std::move(currentContour),
+                std::move(currentSmooth),
+                currentClosed});
         }
         currentContour.clear();
+        currentSmooth.clear();
         currentClosed = false;
+    };
+    auto markSmoothAppend = [&](std::size_t firstNewIdx) {
+        currentSmooth.resize(currentContour.size(), 0u);
+        if (currentContour.size() > firstNewIdx + 1u) {
+            for (std::size_t idx = firstNewIdx; idx + 1u < currentContour.size(); ++idx) {
+                currentSmooth[idx] = 1u;
+            }
+        }
     };
 
     while (pos < pathData.size()) {
@@ -396,7 +411,10 @@ ParsedSvgGeometry ParseSvgPathGeometry(
                 const Point c2 = (cmd == 'c') ? Point{cur.x + x2, cur.y + y2} : Point{x2, y2};
                 const Point p3 = (cmd == 'c') ? Point{cur.x + x, cur.y + y} : Point{x, y};
                 if (currentContour.empty()) currentContour.push_back(p0);
+                currentSmooth.resize(currentContour.size(), 0u);
+                const std::size_t curveStartIdx = currentContour.size();
                 AppendCubicBezierPoints(currentContour, p0, c1, c2, p3, options.cubicSteps);
+                markSmoothAppend(curveStartIdx);
                 prevCtrl = c2;
                 cur = p3;
                 break;
@@ -416,7 +434,10 @@ ParsedSvgGeometry ParseSvgPathGeometry(
                 const Point c2 = (cmd == 's') ? Point{cur.x + x2, cur.y + y2} : Point{x2, y2};
                 const Point p3 = (cmd == 's') ? Point{cur.x + x, cur.y + y} : Point{x, y};
                 if (currentContour.empty()) currentContour.push_back(p0);
+                currentSmooth.resize(currentContour.size(), 0u);
+                const std::size_t curveStartIdx = currentContour.size();
                 AppendCubicBezierPoints(currentContour, p0, c1, c2, p3, options.cubicSteps);
+                markSmoothAppend(curveStartIdx);
                 prevCtrl = c2;
                 cur = p3;
                 break;
@@ -433,7 +454,10 @@ ParsedSvgGeometry ParseSvgPathGeometry(
                 const Point c1 = (cmd == 'q') ? Point{cur.x + x1, cur.y + y1} : Point{x1, y1};
                 const Point p2 = (cmd == 'q') ? Point{cur.x + x, cur.y + y} : Point{x, y};
                 if (currentContour.empty()) currentContour.push_back(p0);
+                currentSmooth.resize(currentContour.size(), 0u);
+                const std::size_t curveStartIdx = currentContour.size();
                 AppendQuadBezierPoints(currentContour, p0, c1, p2, options.quadSteps);
+                markSmoothAppend(curveStartIdx);
                 prevCtrl = c1;
                 cur = p2;
                 break;
@@ -451,7 +475,10 @@ ParsedSvgGeometry ParseSvgPathGeometry(
                     : cur;
                 const Point p2 = (cmd == 't') ? Point{cur.x + x, cur.y + y} : Point{x, y};
                 if (currentContour.empty()) currentContour.push_back(p0);
+                currentSmooth.resize(currentContour.size(), 0u);
+                const std::size_t curveStartIdx = currentContour.size();
                 AppendQuadBezierPoints(currentContour, p0, c1, p2, options.quadSteps);
+                markSmoothAppend(curveStartIdx);
                 prevCtrl = c1;
                 cur = p2;
                 break;
@@ -474,6 +501,8 @@ ParsedSvgGeometry ParseSvgPathGeometry(
                 const Point p0 = cur;
                 const Point p1 = (cmd == 'a') ? Point{cur.x + ex, cur.y + ey} : Point{ex, ey};
                 if (currentContour.empty()) currentContour.push_back(p0);
+                currentSmooth.resize(currentContour.size(), 0u);
+                const std::size_t curveStartIdx = currentContour.size();
                 AppendSvgArcPoints(
                     p0,
                     rx,
@@ -486,6 +515,7 @@ ParsedSvgGeometry ParseSvgPathGeometry(
                     options.arcStepAngleRad,
                     options.arcMinSteps,
                     options.arcMaxSteps);
+                markSmoothAppend(curveStartIdx);
                 cur = p1;
                 prevCtrl = cur;
                 break;
@@ -570,11 +600,14 @@ std::vector<ColoredSegment> BuildCornerColoredSegments(const ParsedSvgGeometry& 
             const float dx = contour.points[i + 1u].x - contour.points[i].x;
             const float dy = contour.points[i + 1u].y - contour.points[i].y;
             if (dx * dx + dy * dy > 1e-8f) {
+                const bool smoothStart =
+                    (i < contour.isSmoothVertex.size()) && (contour.isSmoothVertex[i] != 0u);
                 segs.push_back(ColoredSegment{
                     contour.points[i],
                     contour.points[i + 1u],
                     0x07u,
-                    contour.closed});
+                    contour.closed,
+                    smoothStart});
             }
         }
         if (segs.empty()) {
@@ -597,7 +630,7 @@ std::vector<ColoredSegment> BuildCornerColoredSegments(const ParsedSvgGeometry& 
                 if (lenU > 1e-6f && lenV > 1e-6f) {
                     const float dotNorm = (ux * vx + uy * vy) / (lenU * lenV);
                     const float crossNorm = std::fabs(ux * vy - uy * vx) / (lenU * lenV);
-                    if (dotNorm <= 0.985f || crossNorm >= 0.14f) {
+                    if (!curr.smoothAtStart && (dotNorm <= 0.985f || crossNorm >= 0.14f)) {
                         cornerIndices.push_back(i);
                     }
                 }
@@ -1252,6 +1285,217 @@ AxbMtsdfPathEntry BakeSvgPathToMtsdfEntry(
 
     entry.ComputeRowBounds();
     return entry;
+}
+
+bool RasterizeSvgPathFillAlphaMask(
+    std::string_view pathData,
+    const Rect& pathBounds,
+    std::uint32_t innerWidth,
+    std::uint32_t innerHeight,
+    std::uint32_t padPx,
+    std::vector<std::uint8_t>& outRgba8) {
+    constexpr float kPi = 3.14159265358979323846f;
+    const ParsedSvgGeometry geom = ParseSvgPathGeometry(
+        pathData,
+        SvgPathTessellationOptions{24, 16, kPi / 24.0f, 6, 64});
+    if (geom.contours.empty()) {
+        return false;
+    }
+
+    const std::uint32_t innerW = std::clamp<std::uint32_t>(innerWidth, 1u, 2048u);
+    const std::uint32_t innerH = std::clamp<std::uint32_t>(innerHeight, 1u, 2048u);
+    const std::uint32_t pad = std::min<std::uint32_t>(padPx, 64u);
+    const std::uint32_t texW = innerW + 2u * pad;
+    const std::uint32_t texH = innerH + 2u * pad;
+    const std::size_t totalPixels = static_cast<std::size_t>(texW) * static_cast<std::size_t>(texH);
+    outRgba8.resize(totalPixels * 4u);
+    for (std::size_t p = 0u; p < totalPixels; ++p) {
+        const std::size_t o = p * 4u;
+        outRgba8[o + 0u] = 255u;
+        outRgba8[o + 1u] = 255u;
+        outRgba8[o + 2u] = 255u;
+        outRgba8[o + 3u] = 0u;
+    }
+
+    const float originX = (pathBounds.width > 1e-5f) ? pathBounds.x : geom.bounds.x;
+    const float originY = (pathBounds.height > 1e-5f) ? pathBounds.y : geom.bounds.y;
+    const float bw = (pathBounds.width > 1e-5f) ? pathBounds.width : std::max(1e-5f, geom.bounds.width);
+    const float bh = (pathBounds.height > 1e-5f) ? pathBounds.height : std::max(1e-5f, geom.bounds.height);
+    const float scaleX = static_cast<float>(innerW) / bw;
+    const float scaleY = static_cast<float>(innerH) / bh;
+    const float fInnerW = static_cast<float>(innerW);
+    const float fInnerH = static_cast<float>(innerH);
+
+    struct RasterEdge {
+        float xTop = 0.0f;
+        float yTop = 0.0f;
+        float yBot = 0.0f;
+        float invSlope = 0.0f;
+        int dir = 1;
+    };
+
+    std::vector<RasterEdge> edges;
+    std::vector<std::vector<std::uint32_t>> rowBuckets(innerH);
+
+    auto pushEdge = [&](Point a, Point b) {
+        const float dy = b.y - a.y;
+        if (std::fabs(dy) <= 1e-6f) {
+            return;
+        }
+        RasterEdge e{};
+        if (dy > 0.0f) {
+            e.xTop = a.x;
+            e.yTop = a.y;
+            e.yBot = b.y;
+            e.invSlope = (b.x - a.x) / dy;
+            e.dir = 1;
+        } else {
+            e.xTop = b.x;
+            e.yTop = b.y;
+            e.yBot = a.y;
+            e.invSlope = (a.x - b.x) / (-dy);
+            e.dir = -1;
+        }
+        if (e.yBot <= 0.0f || e.yTop >= fInnerH) {
+            return;
+        }
+        const int iyStart = std::clamp(
+            static_cast<int>(std::floor(e.yTop)),
+            0,
+            static_cast<int>(innerH) - 1);
+        const auto edgeIdx = static_cast<std::uint32_t>(edges.size());
+        edges.push_back(e);
+        rowBuckets[static_cast<std::size_t>(iyStart)].push_back(edgeIdx);
+    };
+
+    std::vector<Point> pts;
+    for (const auto& contour : geom.contours) {
+        if (contour.points.size() < 2u) {
+            continue;
+        }
+        pts.clear();
+        pts.reserve(contour.points.size());
+        for (const Point& rawPt : contour.points) {
+            pts.push_back(Point{
+                (rawPt.x - originX) * scaleX,
+                (rawPt.y - originY) * scaleY});
+        }
+        for (std::size_t i = 0u; i + 1u < pts.size(); ++i) {
+            pushEdge(pts[i], pts[i + 1u]);
+        }
+        const float closeDx = pts.back().x - pts.front().x;
+        const float closeDy = pts.back().y - pts.front().y;
+        if (std::fabs(closeDx) > 1e-4f || std::fabs(closeDy) > 1e-4f) {
+            pushEdge(pts.back(), pts.front());
+        }
+    }
+
+    if (edges.empty()) {
+        return true;
+    }
+
+    struct Crossing {
+        float x = 0.0f;
+        int dir = 1;
+    };
+
+    std::vector<std::uint32_t> active;
+    active.reserve(64u);
+    std::vector<Crossing> crossings;
+    crossings.reserve(64u);
+    std::vector<float> rowCov(innerW, 0.0f);
+
+    constexpr int kSubSamples = 8;
+    constexpr float kInvSubSamples = 1.0f / static_cast<float>(kSubSamples);
+
+    auto accumulateInterval = [&](float xa, float xb) noexcept {
+        xa = std::clamp(xa, 0.0f, fInnerW);
+        xb = std::clamp(xb, 0.0f, fInnerW);
+        if (xb <= xa + 1e-6f) {
+            return;
+        }
+        const int ix0 = std::clamp(static_cast<int>(std::floor(xa)), 0, static_cast<int>(innerW) - 1);
+        const int ix1 = std::min(static_cast<int>(std::floor(xb)), static_cast<int>(innerW) - 1);
+        if (ix0 == ix1) {
+            rowCov[static_cast<std::size_t>(ix0)] +=
+                std::min(xb, static_cast<float>(ix0 + 1)) - std::max(xa, static_cast<float>(ix0));
+        } else {
+            rowCov[static_cast<std::size_t>(ix0)] += static_cast<float>(ix0 + 1) - xa;
+            for (int ix = ix0 + 1; ix < ix1; ++ix) {
+                rowCov[static_cast<std::size_t>(ix)] += 1.0f;
+            }
+            rowCov[static_cast<std::size_t>(ix1)] +=
+                std::min(xb, static_cast<float>(ix1 + 1)) - static_cast<float>(ix1);
+        }
+    };
+
+    for (std::uint32_t iy = 0u; iy < innerH; ++iy) {
+        const float rowY0 = static_cast<float>(iy);
+        for (const std::uint32_t eIdx : rowBuckets[iy]) {
+            active.push_back(eIdx);
+        }
+        std::size_t writePos = 0u;
+        for (std::size_t k = 0u; k < active.size(); ++k) {
+            const std::uint32_t eIdx = active[k];
+            if (edges[eIdx].yBot > rowY0) {
+                active[writePos++] = eIdx;
+            }
+        }
+        active.resize(writePos);
+        if (active.empty()) {
+            continue;
+        }
+
+        std::fill(rowCov.begin(), rowCov.end(), 0.0f);
+        for (int s = 0; s < kSubSamples; ++s) {
+            const float ys = rowY0 + (static_cast<float>(s) + 0.5f) * kInvSubSamples;
+            crossings.clear();
+            for (const std::uint32_t eIdx : active) {
+                const RasterEdge& e = edges[eIdx];
+                if (e.yTop <= ys && ys < e.yBot) {
+                    const float xCross = e.xTop + (ys - e.yTop) * e.invSlope;
+                    crossings.push_back(Crossing{xCross, e.dir});
+                }
+            }
+            if (crossings.size() < 2u) {
+                continue;
+            }
+            std::sort(
+                crossings.begin(),
+                crossings.end(),
+                [](const Crossing& a, const Crossing& b) noexcept { return a.x < b.x; });
+
+            if (!geom.nonZeroFill) {
+                for (std::size_t i = 0u; i + 1u < crossings.size(); i += 2u) {
+                    accumulateInterval(crossings[i].x, crossings[i + 1u].x);
+                }
+            } else {
+                int winding = 0;
+                float spanStart = 0.0f;
+                for (const Crossing& c : crossings) {
+                    const int prevW = winding;
+                    winding += c.dir;
+                    if (prevW == 0 && winding != 0) {
+                        spanStart = c.x;
+                    } else if (prevW != 0 && winding == 0) {
+                        accumulateInterval(spanStart, c.x);
+                    }
+                }
+            }
+        }
+
+        const std::size_t dstRow = static_cast<std::size_t>(iy + pad) * static_cast<std::size_t>(texW);
+        for (std::uint32_t ix = 0u; ix < innerW; ++ix) {
+            const float cov = std::clamp(rowCov[ix] * kInvSubSamples, 0.0f, 1.0f);
+            if (cov > 0.0f) {
+                const auto a8 = static_cast<std::uint8_t>(std::lround(cov * 255.0f));
+                const std::size_t o = (dstRow + static_cast<std::size_t>(ix + pad)) * 4u;
+                outRgba8[o + 3u] = a8;
+            }
+        }
+    }
+
+    return true;
 }
 
 } // namespace aero

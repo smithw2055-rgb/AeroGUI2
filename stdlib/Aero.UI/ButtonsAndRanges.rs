@@ -132,9 +132,28 @@ public class ButtonBase : ContentControl {
         }
     }
 
+    protected override void UpdateCommonVisualStates(bool useTransitions) {
+        if (!IsEnabled) { VisualStateManager.GoToState(this, "Disabled", useTransitions); }
+        else if (IsPressed) { VisualStateManager.GoToState(this, "Pressed", useTransitions); }
+        else if (IsMouseOver) { VisualStateManager.GoToState(this, "MouseOver", useTransitions); }
+        else { VisualStateManager.GoToState(this, "Normal", useTransitions); }
+    }
+
     public override bool SetPropertyValue(string propName, DependencyObject value) {
         if (propName == "Command" && value is ICommand) { Command = value as ICommand; return true; }
         if (propName == "CommandParameter") { CommandParameterBox = value; return true; }
+        if (propName == "ClickMode") {
+            if (value is BoxedInt) {
+                int cm = (value as BoxedInt).Value;
+                ClickMode = cm == 1 ? ClickMode.Press : (cm == 2 ? ClickMode.Hover : ClickMode.Release);
+                return true;
+            }
+            string s = DependencyObject.UnboxString(value, "Release");
+            if (s == "Press") { ClickMode = ClickMode.Press; return true; }
+            if (s == "Hover") { ClickMode = ClickMode.Hover; return true; }
+            ClickMode = ClickMode.Release;
+            return true;
+        }
         return base.SetPropertyValue(propName, value);
     }
 }
@@ -158,7 +177,8 @@ public class Button : ButtonBase {
     public override string GetTypeName() { return "Button"; }
 
     protected override void OnVisualStatePropertyChanged() {
-        if (Style != null) { return; }
+        base.OnVisualStatePropertyChanged();
+        if (Style != null || Template != null) { return; }
         if (!IsEnabled) {
             Opacity = 0.45f;
         } else {
@@ -187,6 +207,7 @@ public class Button : ButtonBase {
 public class RepeatButton : Button {
     public int Delay { get; set; } = 500;
     public int Interval { get; set; } = 100;
+    private string _routedCommandName = "";
 
     public RepeatButton() : base() {
         ClickMode = ClickMode.Press;
@@ -195,6 +216,43 @@ public class RepeatButton : Button {
 
     public void TickRepeat() {
         if (IsEnabled && IsPressed) { OnClick(); }
+    }
+
+    private ScrollBar FindAncestorScrollBar() {
+        UIElement cur = TemplatedParent != null ? TemplatedParent : Parent;
+        while (cur != null) {
+            if (cur is ScrollBar) { return cur as ScrollBar; }
+            cur = cur.TemplatedParent != null ? cur.TemplatedParent : cur.Parent;
+        }
+        return null;
+    }
+
+    protected override void OnClick() {
+        base.OnClick();
+        if (_routedCommandName.Length == 0) { return; }
+        ScrollBar sb = FindAncestorScrollBar();
+        if (sb == null) { return; }
+        float small = sb.SmallChange > 0.0f ? sb.SmallChange : 16.0f;
+        float large = sb.ViewportSize > 0.0f ? sb.ViewportSize : (sb.LargeChange > 0.0f ? sb.LargeChange : 80.0f);
+        if (_routedCommandName == "ScrollBar.LineUpCommand" || _routedCommandName == "ScrollBar.LineLeftCommand") {
+            sb.Value = sb.Value - small;
+        } else if (_routedCommandName == "ScrollBar.LineDownCommand" || _routedCommandName == "ScrollBar.LineRightCommand") {
+            sb.Value = sb.Value + small;
+        } else if (_routedCommandName == "ScrollBar.PageUpCommand" || _routedCommandName == "ScrollBar.PageLeftCommand") {
+            sb.Value = sb.Value - large;
+        } else if (_routedCommandName == "ScrollBar.PageDownCommand" || _routedCommandName == "ScrollBar.PageRightCommand") {
+            sb.Value = sb.Value + large;
+        }
+    }
+
+    public override bool SetPropertyValue(string propName, DependencyObject value) {
+        if (propName == "Delay") { Delay = DependencyObject.UnboxInt(value, 500); return true; }
+        if (propName == "Interval") { Interval = DependencyObject.UnboxInt(value, 100); return true; }
+        if (propName == "Command" && !(value is ICommand)) {
+            _routedCommandName = DependencyObject.UnboxString(value, "");
+            return true;
+        }
+        return base.SetPropertyValue(propName, value);
     }
 }
 
@@ -271,11 +329,13 @@ public class ToggleButton : ButtonBase {
                 Indeterminate(this, new RoutedEventArgs("Indeterminate", this));
             }
             UpdateVisualCheckedState();
+            UpdateTriggersAndStates();
         }
     }
 
     protected virtual void OnCheckedChanged() {
         UpdateVisualCheckedState();
+        UpdateTriggersAndStates();
         if (_isChecked) {
             Checked(this, new RoutedEventArgs("Checked", this));
         } else {
@@ -283,8 +343,17 @@ public class ToggleButton : ButtonBase {
         }
     }
 
+    protected override void UpdateVisualStates(bool useTransitions) {
+        base.UpdateVisualStates(useTransitions);
+        if (_isIndeterminate) {
+            VisualStateManager.GoToState(this, "Indeterminate", useTransitions);
+        } else {
+            VisualStateManager.GoToState(this, _isChecked ? "Checked" : "Unchecked", useTransitions);
+        }
+    }
+
     protected virtual void UpdateVisualCheckedState() {
-        if (Style == null) {
+        if (Style == null && Template == null) {
             Background = new SolidColorBrush(_isChecked ? "#FF3B82F6" : "#FF242B38");
             BorderBrush = new SolidColorBrush(_isChecked ? "#FF60A5FA" : "#FF3B465C");
         }
@@ -312,6 +381,7 @@ public class ToggleButton : ButtonBase {
     }
     public override DependencyObject GetPropertyValue(string propName) {
         if (propName == "IsChecked") { return DependencyObject.BoxBool(_isChecked); }
+        if (propName == "IsThreeState") { return DependencyObject.BoxBool(IsThreeState); }
         return base.GetPropertyValue(propName);
     }
 }
@@ -517,15 +587,26 @@ public class Thumb : Control {
     public override string GetTypeName() { return "Thumb"; }
     public bool IsDragging { get { return _isDragging; } }
 
+    private Point ToTrackPoint(float screenX, float screenY) {
+        if (Parent != null && ParseUtil.IsValidHandle(Parent.__nativeHandle)) {
+            return new Point(
+                Visual_ScreenToLocal(Parent.__nativeHandle, screenX, screenY, 0),
+                Visual_ScreenToLocal(Parent.__nativeHandle, screenX, screenY, 1));
+        }
+        return new Point(screenX, screenY);
+    }
+
     public override void OnMouseLeftButtonDown(MouseButtonEventArgs e) {
         base.OnMouseLeftButtonDown(e);
         if (!IsEnabled) { return; }
+        Point pt = ToTrackPoint(e.X, e.Y);
         _isDragging = true;
-        _startX = e.X;
-        _startY = e.Y;
-        _prevX = e.X;
-        _prevY = e.Y;
+        _startX = pt.X;
+        _startY = pt.Y;
+        _prevX = pt.X;
+        _prevY = pt.Y;
         CaptureMouse();
+        UpdateTriggersAndStates();
         e.Handled = true;
         DragStarted(this, new DragStartedEventArgs(0.0f, 0.0f, this));
     }
@@ -533,10 +614,11 @@ public class Thumb : Control {
     public override void OnMouseMove(MouseEventArgs e) {
         base.OnMouseMove(e);
         if (!_isDragging) { return; }
-        float dx = e.X - _prevX;
-        float dy = e.Y - _prevY;
-        _prevX = e.X;
-        _prevY = e.Y;
+        Point pt = ToTrackPoint(e.X, e.Y);
+        float dx = pt.X - _prevX;
+        float dy = pt.Y - _prevY;
+        _prevX = pt.X;
+        _prevY = pt.Y;
         if (dx != 0.0f || dy != 0.0f) {
             DragDelta(this, new DragDeltaEventArgs(dx, dy, this));
         }
@@ -545,10 +627,24 @@ public class Thumb : Control {
     public override void OnMouseLeftButtonUp(MouseButtonEventArgs e) {
         base.OnMouseLeftButtonUp(e);
         if (!_isDragging) { return; }
+        Point pt = ToTrackPoint(e.X, e.Y);
         _isDragging = false;
         ReleaseMouseCapture();
+        UpdateTriggersAndStates();
         e.Handled = true;
-        DragCompleted(this, new DragCompletedEventArgs(e.X - _startX, e.Y - _startY, false, this));
+        DragCompleted(this, new DragCompletedEventArgs(pt.X - _startX, pt.Y - _startY, false, this));
+    }
+
+    protected override void UpdateVisualStates(bool useTransitions) {
+        if (!IsEnabled) { VisualStateManager.GoToState(this, "Disabled", useTransitions); }
+        else if (IsPressed || _isDragging) { VisualStateManager.GoToState(this, "Pressed", useTransitions); }
+        else if (IsMouseOver) { VisualStateManager.GoToState(this, "MouseOver", useTransitions); }
+        else { VisualStateManager.GoToState(this, "Normal", useTransitions); }
+    }
+
+    public override DependencyObject GetPropertyValue(string propName) {
+        if (propName == "IsDragging") { return DependencyObject.BoxBool(_isDragging); }
+        return base.GetPropertyValue(propName);
     }
 }
 
@@ -599,7 +695,12 @@ public class Track : FrameworkElement {
     private UIElement _increaseRepeatButton;
     private Thumb _thumb;
 
-    public Track() : base() {}
+    public Track() : base() {
+        if (ParseUtil.IsValidHandle(__nativeHandle)) {
+            Visual_SetLayoutMode(__nativeHandle, EnumConvert.ToInt(LayoutMode.Grid), 0.0f, 0.0f, 0, 0);
+        }
+        UpdateTrackVisuals();
+    }
     public override string GetTypeName() { return "Track"; }
 
     public Orientation Orientation {
@@ -631,7 +732,11 @@ public class Track : FrameworkElement {
         set {
             if (_decreaseRepeatButton != null) { RemoveChild(_decreaseRepeatButton); }
             _decreaseRepeatButton = value;
-            if (value != null) { AddChild(value); }
+            if (value != null) {
+                value.HorizontalAlignment = HorizontalAlignment.Stretch;
+                value.VerticalAlignment = VerticalAlignment.Stretch;
+                AddChild(value);
+            }
             UpdateTrackVisuals();
         }
     }
@@ -640,7 +745,11 @@ public class Track : FrameworkElement {
         set {
             if (_increaseRepeatButton != null) { RemoveChild(_increaseRepeatButton); }
             _increaseRepeatButton = value;
-            if (value != null) { AddChild(value); }
+            if (value != null) {
+                value.HorizontalAlignment = HorizontalAlignment.Stretch;
+                value.VerticalAlignment = VerticalAlignment.Stretch;
+                AddChild(value);
+            }
             UpdateTrackVisuals();
         }
     }
@@ -649,7 +758,11 @@ public class Track : FrameworkElement {
         set {
             if (_thumb != null) { RemoveChild(_thumb); }
             _thumb = value;
-            if (value != null) { AddChild(value); }
+            if (value != null) {
+                value.HorizontalAlignment = HorizontalAlignment.Stretch;
+                value.VerticalAlignment = VerticalAlignment.Stretch;
+                AddChild(value);
+            }
             UpdateTrackVisuals();
         }
     }
@@ -660,22 +773,53 @@ public class Track : FrameworkElement {
     }
 
     private void UpdateTrackVisuals() {
-        float span = _max - _min;
+        if (!ParseUtil.IsValidHandle(__nativeHandle)) { return; }
+        float span = Math.Maxf(0.0f, _max - _min);
         float frac = span > 0.00001f ? Math.Clampf((_value - _min) / span, 0.0f, 1.0f) : 0.0f;
-        if (_isDirectionReversed) { frac = 1.0f - frac; }
-        float w = ActualWidth > 1.0f ? ActualWidth : (ParseUtil.IsFinite(Width) ? Width : 160.0f);
-        float h = ActualHeight > 1.0f ? ActualHeight : (ParseUtil.IsFinite(Height) ? Height : 24.0f);
-        if (_thumb != null) {
-            float tw = ParseUtil.IsFinite(_thumb.Width) ? _thumb.Width : (_orientation == Orientation.Horizontal ? 16.0f : w);
-            float th = ParseUtil.IsFinite(_thumb.Height) ? _thumb.Height : (_orientation == Orientation.Horizontal ? h : 16.0f);
-            _thumb.HorizontalAlignment = HorizontalAlignment.Left;
-            _thumb.VerticalAlignment = VerticalAlignment.Top;
-            if (_orientation == Orientation.Horizontal) {
-                float lx = Math.Maxf(0.0f, w - tw) * frac;
-                _thumb.Margin = new Thickness(lx, Math.Maxf(0.0f, (h - th) * 0.5f), 0.0f, 0.0f);
-            } else {
-                float ty = Math.Maxf(0.0f, h - th) * frac;
-                _thumb.Margin = new Thickness(Math.Maxf(0.0f, (w - tw) * 0.5f), ty, 0.0f, 0.0f);
+        float beforeFrac = (_orientation == Orientation.Vertical)
+            ? (_isDirectionReversed ? frac : (1.0f - frac))
+            : (_isDirectionReversed ? (1.0f - frac) : frac);
+        float thumbRatio = (_viewportSize > 0.0f)
+            ? ((span > 0.00001f) ? Math.Clampf(_viewportSize / (span + _viewportSize), 0.08f, 1.0f) : 1.0f)
+            : 0.25f;
+        float freeRatio = Math.Maxf(0.0f, 1.0f - thumbRatio);
+        float w0 = freeRatio * beforeFrac;
+        float w1 = thumbRatio;
+        float w2 = freeRatio * (1.0f - beforeFrac);
+
+        Visual_GridClearDefs(__nativeHandle);
+        int starUnit = EnumConvert.ToInt(GridUnitType.Star);
+        if (_orientation == Orientation.Vertical) {
+            Visual_GridAddRowDef(__nativeHandle, starUnit, w0);
+            Visual_GridAddRowDef(__nativeHandle, starUnit, w1);
+            Visual_GridAddRowDef(__nativeHandle, starUnit, w2);
+            if (_decreaseRepeatButton != null) {
+                UIElement.SetGridRow(_decreaseRepeatButton, 0);
+                UIElement.SetGridColumn(_decreaseRepeatButton, 0);
+            }
+            if (_thumb != null) {
+                UIElement.SetGridRow(_thumb, 1);
+                UIElement.SetGridColumn(_thumb, 0);
+            }
+            if (_increaseRepeatButton != null) {
+                UIElement.SetGridRow(_increaseRepeatButton, 2);
+                UIElement.SetGridColumn(_increaseRepeatButton, 0);
+            }
+        } else {
+            Visual_GridAddColDef(__nativeHandle, starUnit, w0);
+            Visual_GridAddColDef(__nativeHandle, starUnit, w1);
+            Visual_GridAddColDef(__nativeHandle, starUnit, w2);
+            if (_decreaseRepeatButton != null) {
+                UIElement.SetGridRow(_decreaseRepeatButton, 0);
+                UIElement.SetGridColumn(_decreaseRepeatButton, 0);
+            }
+            if (_thumb != null) {
+                UIElement.SetGridRow(_thumb, 0);
+                UIElement.SetGridColumn(_thumb, 1);
+            }
+            if (_increaseRepeatButton != null) {
+                UIElement.SetGridRow(_increaseRepeatButton, 0);
+                UIElement.SetGridColumn(_increaseRepeatButton, 2);
             }
         }
     }
@@ -943,6 +1087,28 @@ public class Slider : RangeBase {
         OnRangeUpdated();
         return root;
     }
+
+    public override bool SetPropertyValue(string propName, DependencyObject value) {
+        if (propName == "IsDirectionReversed") { IsDirectionReversed = DependencyObject.UnboxBool(value, false); return true; }
+        if (propName == "TickFrequency") { TickFrequency = DependencyObject.UnboxFloat(value, 0.0f); return true; }
+        if (propName == "Orientation") {
+            if (value is BoxedInt) {
+                Orientation = (value as BoxedInt).Value == 1 ? Orientation.Vertical : Orientation.Horizontal;
+                return true;
+            }
+            string ov = DependencyObject.UnboxString(value, "Horizontal");
+            Orientation = ov == "Vertical" ? Orientation.Vertical : Orientation.Horizontal;
+            return true;
+        }
+        return base.SetPropertyValue(propName, value);
+    }
+
+    public override DependencyObject GetPropertyValue(string propName) {
+        if (propName == "IsDirectionReversed") { return DependencyObject.BoxBool(IsDirectionReversed); }
+        if (propName == "TickFrequency") { return DependencyObject.BoxFloat(_tickFrequency); }
+        if (propName == "Orientation") { return DependencyObject.BoxInt(EnumConvert.ToInt(_orientation)); }
+        return base.GetPropertyValue(propName);
+    }
 }
 
 public class ProgressBar : RangeBase {
@@ -1008,8 +1174,11 @@ public class ProgressBar : RangeBase {
 public class ScrollBar : RangeBase {
     private Orientation _orientation = Orientation.Vertical;
     private float _viewportSize = 100.0f;
+    private bool _isDirectionReversed = false;
+    private bool _hasExplicitDirRev = false;
     private Border _trackBg;
     private Thumb _thumb;
+    private Track _partTrack;
 
     public event ScrollEventHandler Scroll;
 
@@ -1026,10 +1195,28 @@ public class ScrollBar : RangeBase {
     }
     public float ViewportSize {
         get { return _viewportSize; }
-        set { _viewportSize = value > 0.0f ? value : 1.0f; OnRangeUpdated(); }
+        set { _viewportSize = value >= 0.0f ? value : 0.0f; OnRangeUpdated(); }
+    }
+    public bool IsDirectionReversed {
+        get { return _partTrack != null ? _partTrack.IsDirectionReversed : _isDirectionReversed; }
+        set {
+            _hasExplicitDirRev = true;
+            _isDirectionReversed = value;
+            if (_partTrack != null) { _partTrack.IsDirectionReversed = value; }
+            OnRangeUpdated();
+        }
     }
 
     protected override void OnRangeUpdated() {
+        if (_partTrack != null) {
+            _partTrack.Orientation = _orientation;
+            _partTrack.Minimum = Minimum;
+            _partTrack.Maximum = Maximum;
+            _partTrack.ViewportSize = _viewportSize;
+            if (_hasExplicitDirRev) { _partTrack.IsDirectionReversed = _isDirectionReversed; }
+            _partTrack.Value = Value;
+            return;
+        }
         if (_thumb == null) { return; }
         float span = Maximum - Minimum;
         float total = span + _viewportSize;
@@ -1060,7 +1247,40 @@ public class ScrollBar : RangeBase {
         Scroll(this, new ScrollEventArgs(newVal, this));
     }
 
+    public override void OnApplyTemplate() {
+        base.OnApplyTemplate();
+        if (Template != null) {
+            _thumb = null;
+            _trackBg = null;
+            _partTrack = GetTemplateChild("PART_Track") as Track;
+            if (_partTrack != null && _hasExplicitDirRev) {
+                _partTrack.IsDirectionReversed = _isDirectionReversed;
+            }
+            if (_partTrack != null && _partTrack.Thumb != null) {
+                _partTrack.Thumb.DragDelta += (object s, DragDeltaEventArgs e) => {
+                    float span = Maximum - Minimum;
+                    if (span <= 0.001f) { return; }
+                    if (_orientation == Orientation.Vertical) {
+                        float trackH = Math.Maxf(24.0f, _partTrack.ActualHeight);
+                        float thumbH = Math.Maxf(8.0f, _partTrack.Thumb.ActualHeight);
+                        float travel = Math.Maxf(1.0f, trackH - thumbH);
+                        float deltaY = _partTrack.IsDirectionReversed ? e.VerticalChange : -e.VerticalChange;
+                        Value = Value + (deltaY / travel) * span;
+                    } else {
+                        float trackW = Math.Maxf(24.0f, _partTrack.ActualWidth);
+                        float thumbW = Math.Maxf(8.0f, _partTrack.Thumb.ActualWidth);
+                        float travel = Math.Maxf(1.0f, trackW - thumbW);
+                        float deltaX = _partTrack.IsDirectionReversed ? -e.HorizontalChange : e.HorizontalChange;
+                        Value = Value + (deltaX / travel) * span;
+                    }
+                };
+            }
+            OnRangeUpdated();
+        }
+    }
+
     protected override UIElement CreateDefaultTemplate() {
+        _partTrack = null;
         var host = new Canvas();
         host.Width = _orientation == Orientation.Vertical ? 10.0f : ParseUtil.NaN();
         host.Height = _orientation == Orientation.Horizontal ? 10.0f : ParseUtil.NaN();
@@ -1093,18 +1313,47 @@ public class ScrollBar : RangeBase {
         OnRangeUpdated();
         return host;
     }
+
+    public override bool SetPropertyValue(string propName, DependencyObject value) {
+        if (propName == "ViewportSize") { ViewportSize = DependencyObject.UnboxFloat(value, 0.0f); return true; }
+        if (propName == "IsDirectionReversed") { IsDirectionReversed = DependencyObject.UnboxBool(value, false); return true; }
+        if (propName == "Orientation") {
+            if (value is BoxedInt) {
+                Orientation = (value as BoxedInt).Value == 1 ? Orientation.Vertical : Orientation.Horizontal;
+                return true;
+            }
+            string ov = DependencyObject.UnboxString(value, "Vertical");
+            Orientation = ov == "Horizontal" ? Orientation.Horizontal : Orientation.Vertical;
+            return true;
+        }
+        return base.SetPropertyValue(propName, value);
+    }
+
+    public override DependencyObject GetPropertyValue(string propName) {
+        if (propName == "ViewportSize") { return DependencyObject.BoxFloat(_viewportSize); }
+        if (propName == "IsDirectionReversed") { return DependencyObject.BoxBool(IsDirectionReversed); }
+        if (propName == "Orientation") { return DependencyObject.BoxInt(EnumConvert.ToInt(_orientation)); }
+        return base.GetPropertyValue(propName);
+    }
 }
 
 public class ScrollViewer : ContentControl {
+    private static ScrollViewer[] _instances;
+
     private float _offsetX = 0.0f;
     private float _offsetY = 0.0f;
     private ScrollBarVisibility _hVis = ScrollBarVisibility.Disabled;
     private ScrollBarVisibility _vVis = ScrollBarVisibility.Auto;
+    private bool _canContentScroll = false;
 
-    private Border _viewport;
+    private UIElement _viewport;
     private ScrollBar _vBar;
     private ScrollBar _hBar;
     private bool _syncingBars = false;
+    private float _lastSyncExtW = -1.0f;
+    private float _lastSyncExtH = -1.0f;
+    private float _lastSyncVpW = -1.0f;
+    private float _lastSyncVpH = -1.0f;
 
     public event ScrollEventHandler ScrollChanged;
 
@@ -1112,10 +1361,49 @@ public class ScrollViewer : ContentControl {
         ClipToBounds = true;
         HorizontalContentAlignment = HorizontalAlignment.Stretch;
         VerticalContentAlignment = VerticalAlignment.Top;
+        RegisterInstance(this);
+    }
+
+    private static void RegisterInstance(ScrollViewer sv) {
+        if (_instances == null) {
+            _instances = new ScrollViewer[0];
+            BindingEngine.AddPreFlushHook(() => { ScrollViewer.SyncAllMetrics(); });
+        }
+        for (int i = 0; i < _instances.Length; i += 1) {
+            if (_instances[i] == sv) { return; }
+        }
+        _instances.Push(sv);
+    }
+
+    public static void SyncAllMetrics() {
+        if (_instances == null) { return; }
+        for (int i = _instances.Length - 1; i >= 0; i -= 1) {
+            ScrollViewer sv = _instances[i];
+            if (sv == null || sv._isDisposedTree) {
+                _instances.RemoveAt(i);
+                continue;
+            }
+            float ew = sv.ExtentWidth;
+            float eh = sv.ExtentHeight;
+            float vw = sv.ViewportWidth;
+            float vh = sv.ViewportHeight;
+            if (ew != sv._lastSyncExtW || eh != sv._lastSyncExtH ||
+                vw != sv._lastSyncVpW || vh != sv._lastSyncVpH) {
+                sv._lastSyncExtW = ew;
+                sv._lastSyncExtH = eh;
+                sv._lastSyncVpW = vw;
+                sv._lastSyncVpH = vh;
+                sv.SyncScrollBarRanges();
+            }
+        }
     }
 
     public override string GetTypeName() { return "ScrollViewer"; }
 
+    public bool CanContentScroll {
+        get { return _canContentScroll; }
+        set { _canContentScroll = value; }
+    }
     public float HorizontalOffset {
         get { return _offsetX; }
         set { ScrollToHorizontalOffset(value); }
@@ -1135,8 +1423,23 @@ public class ScrollViewer : ContentControl {
 
     public float ExtentWidth { get { return _viewport != null ? _viewport.ScrollExtentWidth : ScrollExtentWidth; } }
     public float ExtentHeight { get { return _viewport != null ? _viewport.ScrollExtentHeight : ScrollExtentHeight; } }
-    public float ViewportWidth { get { return _viewport != null ? _viewport.ActualWidth : ActualWidth; } }
-    public float ViewportHeight { get { return _viewport != null ? _viewport.ActualHeight : ActualHeight; } }
+    protected override float GetLogicalViewportWidth() { return _viewport != null ? _viewport.ActualWidth : ActualWidth; }
+    protected override float GetLogicalViewportHeight() { return _viewport != null ? _viewport.ActualHeight : ActualHeight; }
+    public float ScrollableWidth { get { return Math.Maxf(0.0f, ExtentWidth - ViewportWidth); } }
+    public float ScrollableHeight { get { return Math.Maxf(0.0f, ExtentHeight - ViewportHeight); } }
+
+    public Visibility ComputedVerticalScrollBarVisibility {
+        get {
+            bool showV = _vVis == ScrollBarVisibility.Visible || (_vVis == ScrollBarVisibility.Auto && ExtentHeight > ViewportHeight + 1.0f);
+            return showV ? Visibility.Visible : Visibility.Collapsed;
+        }
+    }
+    public Visibility ComputedHorizontalScrollBarVisibility {
+        get {
+            bool showH = _hVis == ScrollBarVisibility.Visible || (_hVis == ScrollBarVisibility.Auto && ExtentWidth > ViewportWidth + 1.0f);
+            return showH ? Visibility.Visible : Visibility.Collapsed;
+        }
+    }
 
     public void ScrollToVerticalOffset(float offset) {
         float maxY = Math.Maxf(0.0f, ExtentHeight - ViewportHeight);
@@ -1169,7 +1472,8 @@ public class ScrollViewer : ContentControl {
         if (_vBar != null) {
             float maxY = Math.Maxf(0.0f, ExtentHeight - ViewportHeight);
             _vBar.Maximum = maxY;
-            _vBar.ViewportSize = Math.Maxf(16.0f, ViewportHeight);
+            float vh = ViewportHeight;
+            _vBar.ViewportSize = vh > 0.0f ? vh : 16.0f;
             _vBar.Value = _offsetY;
         }
         if (_hBar != null) {
@@ -1184,12 +1488,10 @@ public class ScrollViewer : ContentControl {
 
     private void SyncScrollBarVisibility() {
         if (_vBar != null) {
-            bool showV = _vVis == ScrollBarVisibility.Visible || (_vVis == ScrollBarVisibility.Auto && ExtentHeight > ViewportHeight + 1.0f);
-            _vBar.Visibility = showV ? Visibility.Visible : Visibility.Collapsed;
+            _vBar.Visibility = ComputedVerticalScrollBarVisibility;
         }
         if (_hBar != null) {
-            bool showH = _hVis == ScrollBarVisibility.Visible || (_hVis == ScrollBarVisibility.Auto && ExtentWidth > ViewportWidth + 1.0f);
-            _hBar.Visibility = showH ? Visibility.Visible : Visibility.Collapsed;
+            _hBar.Visibility = ComputedHorizontalScrollBarVisibility;
         }
     }
 
@@ -1205,6 +1507,60 @@ public class ScrollViewer : ContentControl {
         }
     }
 
+    private static ScrollContentPresenter FindDescendantScrollContentPresenter(UIElement rootNode) {
+        if (rootNode == null) { return null; }
+        var q = new UIElement[0];
+        q.Push(rootNode);
+        int idx = 0;
+        while (idx < q.Length) {
+            UIElement node = q[idx];
+            idx += 1;
+            if (node == null) { continue; }
+            if (node != rootNode && node is ScrollViewer) { continue; }
+            if (node is ScrollContentPresenter) { return node as ScrollContentPresenter; }
+            for (int i = 0; i < node.ChildCount(); i += 1) {
+                q.Push(node.ChildAt(i));
+            }
+        }
+        return null;
+    }
+
+    public override void OnApplyTemplate() {
+        if (Template != null) {
+            _presenter = null;
+            _viewport = null;
+            _vBar = null;
+            _hBar = null;
+            UIElement scpEl = GetTemplateChild("PART_ScrollContentPresenter");
+            ScrollContentPresenter scp = (scpEl is ScrollContentPresenter)
+                ? (scpEl as ScrollContentPresenter)
+                : FindDescendantScrollContentPresenter(TemplateRoot());
+            if (scp != null) {
+                _presenter = scp;
+                _viewport = scp;
+                scp.ContentTemplate = ContentTemplate;
+                scp.SetContentBox(ContentBox);
+            }
+            UIElement vb = GetTemplateChild("PART_VerticalScrollBar");
+            if (vb is ScrollBar) {
+                _vBar = vb as ScrollBar;
+                _vBar.Scroll += (object s, ScrollEventArgs e) => {
+                    if (!_syncingBars) { ScrollToVerticalOffset(e.NewValue); }
+                };
+            }
+            UIElement hb = GetTemplateChild("PART_HorizontalScrollBar");
+            if (hb is ScrollBar) {
+                _hBar = hb as ScrollBar;
+                _hBar.Scroll += (object s, ScrollEventArgs e) => {
+                    if (!_syncingBars) { ScrollToHorizontalOffset(e.NewValue); }
+                };
+            }
+            ApplyScrollOffsets();
+            return;
+        }
+        base.OnApplyTemplate();
+    }
+
     protected override UIElement CreateDefaultTemplate() {
         var grid = new Grid();
         grid.AddColumnDefinition(GridUnitType.Star, 1.0f);
@@ -1212,16 +1568,17 @@ public class ScrollViewer : ContentControl {
         grid.AddRowDefinition(GridUnitType.Star, 1.0f);
         grid.AddRowDefinition(GridUnitType.Auto, 1.0f);
 
-        _viewport = new Border();
-        _viewport.ClipToBounds = true;
-        if (ParseUtil.IsValidHandle(_viewport.__nativeHandle)) {
-            Visual_SetLayoutMode(_viewport.__nativeHandle, EnumConvert.ToInt(LayoutMode.ScrollViewport), 0.0f, 0.0f, 0, 0);
+        var defaultBorder = new Border();
+        defaultBorder.ClipToBounds = true;
+        if (ParseUtil.IsValidHandle(defaultBorder.__nativeHandle)) {
+            Visual_SetLayoutMode(defaultBorder.__nativeHandle, EnumConvert.ToInt(LayoutMode.ScrollViewport), 0.0f, 0.0f, 1, 0);
         }
         _presenter = new ContentPresenter();
         _presenter.Name = "PART_ContentPresenter";
         _presenter.ContentTemplate = ContentTemplate;
         _presenter.SetContentBox(ContentBox);
-        _viewport.Child = _presenter;
+        defaultBorder.Child = _presenter;
+        _viewport = defaultBorder;
 
         _vBar = new ScrollBar();
         _vBar.Orientation = Orientation.Vertical;
@@ -1244,5 +1601,67 @@ public class ScrollViewer : ContentControl {
         grid.AddChild(_hBar);
         SyncScrollBarVisibility();
         return grid;
+    }
+
+    private static ScrollBarVisibility ParseScrollVis(DependencyObject value, ScrollBarVisibility fallback) {
+        if (value is BoxedInt) {
+            int v = (value as BoxedInt).Value;
+            if (v == 0) { return ScrollBarVisibility.Disabled; }
+            if (v == 1) { return ScrollBarVisibility.Auto; }
+            if (v == 2) { return ScrollBarVisibility.Hidden; }
+            if (v == 3) { return ScrollBarVisibility.Visible; }
+            return fallback;
+        }
+        string s = DependencyObject.UnboxString(value, "");
+        if (s == "Disabled") { return ScrollBarVisibility.Disabled; }
+        if (s == "Auto") { return ScrollBarVisibility.Auto; }
+        if (s == "Hidden") { return ScrollBarVisibility.Hidden; }
+        if (s == "Visible") { return ScrollBarVisibility.Visible; }
+        return fallback;
+    }
+
+    public override bool SetPropertyValue(string propName, DependencyObject value) {
+        if (propName == "VerticalOffset") { VerticalOffset = DependencyObject.UnboxFloat(value, 0.0f); return true; }
+        if (propName == "HorizontalOffset") { HorizontalOffset = DependencyObject.UnboxFloat(value, 0.0f); return true; }
+        if (propName == "VerticalScrollBarVisibility" || propName == "ScrollViewer.VerticalScrollBarVisibility") {
+            VerticalScrollBarVisibility = ParseScrollVis(value, _vVis);
+            return true;
+        }
+        if (propName == "HorizontalScrollBarVisibility" || propName == "ScrollViewer.HorizontalScrollBarVisibility") {
+            HorizontalScrollBarVisibility = ParseScrollVis(value, _hVis);
+            return true;
+        }
+        if (propName == "CanContentScroll" || propName == "ScrollViewer.CanContentScroll") {
+            CanContentScroll = DependencyObject.UnboxBool(value, false);
+            return true;
+        }
+        return base.SetPropertyValue(propName, value);
+    }
+
+    public override DependencyObject GetPropertyValue(string propName) {
+        if (propName == "VerticalOffset") { return DependencyObject.BoxFloat(_offsetY); }
+        if (propName == "HorizontalOffset") { return DependencyObject.BoxFloat(_offsetX); }
+        if (propName == "ViewportHeight") { return DependencyObject.BoxFloat(ViewportHeight); }
+        if (propName == "ViewportWidth") { return DependencyObject.BoxFloat(ViewportWidth); }
+        if (propName == "ExtentHeight") { return DependencyObject.BoxFloat(ExtentHeight); }
+        if (propName == "ExtentWidth") { return DependencyObject.BoxFloat(ExtentWidth); }
+        if (propName == "ScrollableHeight") { return DependencyObject.BoxFloat(ScrollableHeight); }
+        if (propName == "ScrollableWidth") { return DependencyObject.BoxFloat(ScrollableWidth); }
+        if (propName == "ComputedVerticalScrollBarVisibility") {
+            return DependencyObject.BoxInt(EnumConvert.ToInt(ComputedVerticalScrollBarVisibility));
+        }
+        if (propName == "ComputedHorizontalScrollBarVisibility") {
+            return DependencyObject.BoxInt(EnumConvert.ToInt(ComputedHorizontalScrollBarVisibility));
+        }
+        if (propName == "VerticalScrollBarVisibility" || propName == "ScrollViewer.VerticalScrollBarVisibility") {
+            return DependencyObject.BoxInt(EnumConvert.ToInt(_vVis));
+        }
+        if (propName == "HorizontalScrollBarVisibility" || propName == "ScrollViewer.HorizontalScrollBarVisibility") {
+            return DependencyObject.BoxInt(EnumConvert.ToInt(_hVis));
+        }
+        if (propName == "CanContentScroll" || propName == "ScrollViewer.CanContentScroll") {
+            return DependencyObject.BoxBool(_canContentScroll);
+        }
+        return base.GetPropertyValue(propName);
     }
 }

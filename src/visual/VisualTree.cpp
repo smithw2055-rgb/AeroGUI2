@@ -464,6 +464,25 @@ float VisualWorld::GetLayoutRectScalar(VisualNodeId id, VisualLayoutRectQuery wh
     case VisualLayoutRectQuery::DesiredHeight: return node->layout.desiredSize.height;
     case VisualLayoutRectQuery::ScrollExtentWidth: return node->layout.scrollExtent.width;
     case VisualLayoutRectQuery::ScrollExtentHeight: return node->layout.scrollExtent.height;
+    case VisualLayoutRectQuery::ViewportX:
+    case VisualLayoutRectQuery::ViewportY:
+    case VisualLayoutRectQuery::ViewportWidth:
+    case VisualLayoutRectQuery::ViewportHeight: {
+        Rect bounds = node->layout.layoutRect;
+        if (node->layout.hasPerspective3D) {
+            bounds = node->layout.worldMatrix3D.TransformRectBounds(bounds);
+        } else if (!node->layout.worldTransform.IsIdentity()) {
+            bounds = node->layout.worldTransform.TransformRectBounds(bounds);
+        }
+        switch (which) {
+        case VisualLayoutRectQuery::ViewportX: return bounds.x;
+        case VisualLayoutRectQuery::ViewportY: return bounds.y;
+        case VisualLayoutRectQuery::ViewportWidth: return bounds.width;
+        case VisualLayoutRectQuery::ViewportHeight: return bounds.height;
+        default: break;
+        }
+        return 0.0f;
+    }
     }
     return 0.0f;
 }
@@ -535,6 +554,14 @@ bool VisualWorld::SetBoxGradients(VisualNodeId id, std::int32_t bgGradId, std::i
     if (!node) return false;
     node->box.bgGradId = bgGradId;
     node->box.borderGradId = borderGradId;
+    MarkDirty(id, VisualDirty_Visual);
+    return true;
+}
+
+bool VisualWorld::SetBoxBrushOpacity(VisualNodeId id, float bgOpacity) noexcept {
+    VisualNode* node = GetNode(id);
+    if (!node) return false;
+    node->box.bgOpacity = std::clamp(bgOpacity, 0.0f, 1.0f);
     MarkDirty(id, VisualDirty_Visual);
     return true;
 }
@@ -911,6 +938,14 @@ std::size_t VisualWorld::FlushTrackB() {
                 break;
             case VisualAnimProp::EffectRadius:
                 node->effect.radius = std::max(0.0f, v);
+                MarkDirty(binding.targetNode, VisualDirty_Visual);
+                break;
+            case VisualAnimProp::EffectOpacity:
+                node->effect.opacity = std::clamp(v, 0.0f, 1.0f);
+                MarkDirty(binding.targetNode, VisualDirty_Visual);
+                break;
+            case VisualAnimProp::BrushOpacity:
+                node->box.bgOpacity = std::clamp(v, 0.0f, 1.0f);
                 MarkDirty(binding.targetNode, VisualDirty_Visual);
                 break;
             default:

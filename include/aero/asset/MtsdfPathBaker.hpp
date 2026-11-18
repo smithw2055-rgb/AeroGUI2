@@ -64,6 +64,7 @@ struct AxbMtsdfPathEntry {
 
 struct SvgPathContour {
     std::vector<Point> points;
+    std::vector<std::uint8_t> isSmoothVertex;
     bool closed = false;
 };
 
@@ -121,6 +122,16 @@ void AppendSvgArcPoints(
 void PackMtsdfAtlasSkyline(
     std::vector<AxbMtsdfPathEntry>& ioEntries,
     std::uint16_t atlasSize = 512) noexcept;
+
+/// Rasterize an SVG path's fill geometry into an 8x supersampled analytical horizontal-coverage
+/// RGBA8 mask (white RGB with anti-aliased alpha channel) surrounded by a `padPx` transparent border.
+bool RasterizeSvgPathFillAlphaMask(
+    std::string_view pathData,
+    const Rect& pathBounds,
+    std::uint32_t innerWidth,
+    std::uint32_t innerHeight,
+    std::uint32_t padPx,
+    std::vector<std::uint8_t>& outRgba8);
 
 namespace detail {
 

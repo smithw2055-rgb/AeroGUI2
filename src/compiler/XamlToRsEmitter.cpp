@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cstdio>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <set>
@@ -369,8 +370,14 @@ struct XamlNode final {
         if (s.find("BorderBrush") != std::string_view::npos) return "BorderBrush.Color";
         return "Background.Color";
     }
-    if (s.find("Brush.Opacity") != std::string_view::npos) {
-        return "Opacity";
+    if (s.find("DropShadowEffect.Opacity") != std::string_view::npos ||
+        s.find("Effect.Opacity") != std::string_view::npos ||
+        s.find("Effect).(DropShadowEffect.Opacity") != std::string_view::npos ||
+        s == "EffectOpacity") {
+        return "EffectOpacity";
+    }
+    if (s.find("Brush.Opacity") != std::string_view::npos || s == "BrushOpacity") {
+        return "BrushOpacity";
     }
     if (s.find("BlurEffect.Radius") != std::string_view::npos || s == "Radius" || s == "BlurRadius") {
         return "EffectRadius";
@@ -416,6 +423,11 @@ struct XamlNode final {
     if (s.find("GlobalOffsetZ") != std::string_view::npos || s.find("LocalOffsetZ") != std::string_view::npos ||
         s.find("TranslateZ") != std::string_view::npos || s.find("Translation3DZ") != std::string_view::npos) {
         return "Trans3DZ";
+    }
+    if (s.find("OpacityMask") != std::string_view::npos ||
+        s.find("GradientStops") != std::string_view::npos ||
+        s.find("GradientStop.") != std::string_view::npos) {
+        return "Unsupported.GradientStop";
     }
     // Strip wrapping parentheses such as `(FrameworkElement.Width)` or `(UIElement.Opacity)`
     if (s.front() == '(' && s.back() == ')' && s.size() > 2) {
@@ -578,7 +590,8 @@ struct XamlNode final {
         "X1", "Y1", "X2", "Y2", "CenterX", "CenterY", "Radius", "BlurRadius",
         "ShadowDepth", "Direction", "Angle", "AngleX", "AngleY", "ScaleX", "ScaleY",
         "TickLength", "TickWidth", "MinAngle", "MaxAngle", "Volume",
-        "LineHeight", "CharacterSpacing"
+        "LineHeight", "CharacterSpacing",
+        "ViewportSize", "MaxDropDownHeight", "HorizontalOffset", "VerticalOffset"
     };
     return kFloatProps.count(prop) > 0;
 }
@@ -596,7 +609,9 @@ struct XamlNode final {
         "IsEnabled", "IsHitTestVisible", "Focusable", "ClipToBounds", "IsChecked",
         "IsThreeState", "IsExpanded", "IsSelected", "IsReadOnly", "LastChildFill",
         "IsOpen", "IsCheckable", "IsDefault", "IsCancel", "ShowGridLines",
-        "StaysOpen", "IsEditable", "IsMuted", "ShowDate", "ShowTime", "UseSystemTime"
+        "StaysOpen", "IsEditable", "IsMuted", "ShowDate", "ShowTime", "UseSystemTime",
+        "IsDirectionReversed", "IsTabStop", "IsMouseOver", "IsPressed", "IsDragging",
+        "IsFocused", "IsKeyboardFocused", "HasItems", "IsDropDownOpen", "CanContentScroll"
     };
     return kBoolProps.count(prop) > 0;
 }
@@ -644,7 +659,8 @@ struct XamlNode final {
         "TickLength", "TickWidth", "MinAngle", "MaxAngle", "Brush",
         "Volume", "IsMuted", "LoadedBehavior", "Password", "PasswordChar",
         "Year", "Month", "Day", "Hour", "Minute", "Second", "Format", "UseSystemTime",
-        "LineHeight", "CharacterSpacing", "MaxLines"
+        "LineHeight", "CharacterSpacing", "MaxLines",
+        "IsDirectionReversed", "IsTabStop", "ViewportSize", "MaxDropDownHeight"
     };
     return kProps.count(prop) > 0;
 }
@@ -669,18 +685,57 @@ struct XamlNode final {
     return kIC.count(typeName) > 0;
 }
 
-[[nodiscard]] std::string ReadFileTextUtf8(const std::filesystem::path& path) {
-    std::ifstream in(path, std::ios::binary);
+[[nodiscard]] std::uint64_t FastHashBytes64(const void* data, std::size_t size) noexcept {
+    std::uint64_t h = 0x9E3779B97F4A7C15ULL ^ static_cast<std::uint64_t>(size);
+    const auto* ptr = static_cast<const unsigned char*>(data);
+    std::size_t i = 0u;
+    while (i + 8u <= size) {
+        std::uint64_t word = 0u;
+        std::memcpy(&word, ptr + i, sizeof(word));
+        h ^= word;
+        h *= 0xBF58476D1CE4E5B9ULL;
+        h ^= (h >> 30u);
+        i += 8u;
+    }
+    if (i < size) {
+        std::uint64_t tail = 0u;
+        std::memcpy(&tail, ptr + i, size - i);
+        h ^= tail;
+        h *= 0x94D049BB133111EBULL;
+        h ^= (h >> 31u);
+    }
+    return h;
+}
+
+[[nodiscard]] std::string ReadFileTextUtf8(
+    const std::filesystem::path& path,
+    std::uint64_t* outRawHash = nullptr) {
+    std::ifstream in(path, std::ios::binary | std::ios::ate);
     if (!in.is_open()) {
+        if (outRawHash) {
+            *outRawHash = 0u;
+        }
         return {};
     }
-    std::ostringstream ss;
-    ss << in.rdbuf();
-    std::string text = ss.str();
+    const std::streampos sz = in.tellg();
+    std::string text;
+    if (sz > 0) {
+        text.resize(static_cast<std::size_t>(sz));
+        in.seekg(0, std::ios::beg);
+        if (!in.read(text.data(), sz)) {
+            if (outRawHash) {
+                *outRawHash = 0u;
+            }
+            return {};
+        }
+    }
+    if (outRawHash) {
+        *outRawHash = FastHashBytes64(text.data(), text.size());
+    }
     if (text.size() >= 3 &&
-        static_cast<unsigned char>(text[0]) == 0xEF &&
-        static_cast<unsigned char>(text[1]) == 0xBB &&
-        static_cast<unsigned char>(text[2]) == 0xBF) {
+        static_cast<unsigned char>(text[0]) == 0xEFu &&
+        static_cast<unsigned char>(text[1]) == 0xBBu &&
+        static_cast<unsigned char>(text[2]) == 0xBFu) {
         text.erase(0, 3);
     }
     return text;
@@ -704,6 +759,299 @@ struct XamlNode final {
            aero::str::StartsWith(ns, "Microsoft") ||
            aero::str::StartsWith(ns, "Windows") ||
            aero::str::StartsWith(ns, "Noesis");
+}
+
+[[nodiscard]] bool IsPrunableExternalResourceTag(std::string_view localName) noexcept {
+    return localName == "Style" ||
+           localName == "ControlTemplate" ||
+           localName == "DataTemplate" ||
+           localName == "HierarchicalDataTemplate" ||
+           localName == "ItemsPanelTemplate";
+}
+
+void ExpandControlHierarchy(std::unordered_set<std::string>& usedTypes) {
+    auto add = [&](std::string_view name) -> bool {
+        return usedTypes.emplace(name).second;
+    };
+    bool changed = true;
+    while (changed) {
+        changed = false;
+        const auto has = [&](std::string_view n) -> bool {
+            return usedTypes.count(std::string(n)) > 0u;
+        };
+        if (has("Button") || has("RepeatButton") || has("ToggleButton") ||
+            has("CheckBox") || has("RadioButton")) {
+            changed |= add("ButtonBase");
+        }
+        if (has("Window") || has("Page") || has("UserControl") || has("ButtonBase") ||
+            has("Label") || has("ToolTip") || has("ScrollViewer") || has("Frame") ||
+            has("ListBoxItem") || has("ListViewItem") || has("ComboBoxItem") ||
+            has("TabItem") || has("StatusBarItem") || has("GridViewColumnHeader")) {
+            changed |= add("ContentControl");
+        }
+        if (has("GroupBox") || has("Expander")) {
+            changed |= add("HeaderedContentControl");
+            changed |= add("ContentControl");
+        }
+        if (has("TreeViewItem") || has("MenuItem") || has("ToolBar")) {
+            changed |= add("HeaderedItemsControl");
+            changed |= add("ItemsControl");
+        }
+        if (has("ListBox") || has("ListView") || has("ComboBox") || has("TabControl")) {
+            changed |= add("Selector");
+            changed |= add("ItemsControl");
+        }
+        if (has("TreeView") || has("Menu") || has("ContextMenu") || has("StatusBar")) {
+            changed |= add("ItemsControl");
+        }
+        if (has("Slider") || has("ProgressBar") || has("ScrollBar")) {
+            changed |= add("RangeBase");
+            changed |= add("Control");
+        }
+        if (has("TextBox") || has("RichTextBox") || has("PasswordBox")) {
+            changed |= add("TextBoxBase");
+            changed |= add("Control");
+        }
+        if (has("ContentControl") || has("ItemsControl") || has("Thumb") || has("Separator")) {
+            changed |= add("Control");
+            changed |= add("FrameworkElement");
+            changed |= add("UIElement");
+        }
+        if (has("Expander")) {
+            changed |= add("ToggleButton");
+        }
+        if (has("ListBox")) {
+            changed |= add("ListBoxItem");
+            changed |= add("ScrollViewer");
+        }
+        if (has("ListView")) {
+            changed |= add("ListBoxItem");
+            changed |= add("ListViewItem");
+            changed |= add("ScrollViewer");
+            changed |= add("GridViewColumnHeader");
+            changed |= add("Thumb");
+        }
+        if (has("ComboBox")) {
+            changed |= add("ComboBoxItem");
+            changed |= add("ToggleButton");
+            changed |= add("Popup");
+            changed |= add("ScrollViewer");
+            changed |= add("TextBox");
+        }
+        if (has("TreeView")) {
+            changed |= add("TreeViewItem");
+            changed |= add("ScrollViewer");
+            changed |= add("ToggleButton");
+        }
+        if (has("TabControl")) {
+            changed |= add("TabItem");
+        }
+        if (has("Menu") || has("ContextMenu")) {
+            changed |= add("MenuItem");
+            changed |= add("Separator");
+            changed |= add("Popup");
+        }
+        if (has("ToolBar")) {
+            changed |= add("ToggleButton");
+            changed |= add("Button");
+            changed |= add("Separator");
+            changed |= add("Thumb");
+        }
+        if (has("StatusBar")) {
+            changed |= add("StatusBarItem");
+            changed |= add("Separator");
+        }
+        if (has("ScrollViewer") || has("TextBox") || has("PasswordBox")) {
+            changed |= add("ScrollViewer");
+            changed |= add("ScrollBar");
+            changed |= add("Thumb");
+            changed |= add("RepeatButton");
+        }
+        if (has("Slider") || has("ScrollBar")) {
+            changed |= add("Thumb");
+            changed |= add("RepeatButton");
+        }
+    }
+}
+
+void ExtractKeysFromExtension(
+    const MarkupExtensionNode& ext,
+    std::unordered_set<std::string>& usedTypes,
+    std::unordered_set<std::string>& liveKeys) {
+    if (ext.kind == MarkupExtensionKind::StaticResource ||
+        ext.kind == MarkupExtensionKind::DynamicResource) {
+        const std::string rk = ResolveResourceKeyFromExtension(ext);
+        if (!rk.empty()) {
+            liveKeys.insert(rk);
+            const auto* p0 = ext.FindPositional(0);
+            const auto* rka = ext.FindNamed("ResourceKey");
+            const MarkupArgValue* av = p0 ? p0 : rka;
+            if (av && av->isExtension && av->extension &&
+                av->extension->kind == MarkupExtensionKind::XType) {
+                usedTypes.insert(rk);
+            }
+        }
+    } else if (ext.kind == MarkupExtensionKind::XType) {
+        if (const auto* p0 = ext.FindPositional(0)) {
+            const std::string t = StripTargetTypeName(p0->literal);
+            if (!t.empty()) {
+                usedTypes.insert(t);
+                liveKeys.insert(t);
+            }
+        } else if (const auto* tn = ext.FindNamed("TypeName")) {
+            const std::string t = StripTargetTypeName(tn->literal);
+            if (!t.empty()) {
+                usedTypes.insert(t);
+                liveKeys.insert(t);
+            }
+        }
+    }
+    for (const auto& arg : ext.arguments) {
+        if (arg.value.isExtension && arg.value.extension) {
+            ExtractKeysFromExtension(*arg.value.extension, usedTypes, liveKeys);
+        } else if (!arg.value.literal.empty() && LooksLikeMarkupExtension(arg.value.literal)) {
+            const auto sub = ParseMarkupExtension(arg.value.literal);
+            if (sub.IsOk()) {
+                ExtractKeysFromExtension(sub, usedTypes, liveKeys);
+            }
+        }
+    }
+}
+
+void ScanXamlSubtreeForSeeds(
+    const XamlNode& node,
+    std::unordered_set<std::string>& usedTypes,
+    std::unordered_set<std::string>& liveKeys,
+    bool skipDefinitionOwnKey,
+    bool skipExternalSourceDicts) {
+    if (skipExternalSourceDicts && node.localName == "ResourceDictionary" &&
+        node.FindAttribute("Source") != nullptr) {
+        return;
+    }
+
+    if (!node.localName.empty() && node.localName.find('.') == std::string::npos) {
+        usedTypes.insert(node.localName);
+        if (node.localName == "TransitionContentPresenter") {
+            usedTypes.insert("ContentPresenter");
+        } else if (node.localName == "RichText") {
+            usedTypes.insert("TextBlock");
+        }
+    }
+
+    for (const auto& attr : node.attributes) {
+        if (attr.isXmlns || IsDesignOrMarkupCompatPrefix(attr.prefix, attr.namespaceUri)) {
+            continue;
+        }
+        if (skipDefinitionOwnKey && attr.prefix == "x" && attr.localName == "Key") {
+            continue;
+        }
+        if (attr.localName == "TargetType" || attr.localName == "DataType" ||
+            attr.localName == "AncestorType") {
+            const std::string t = StripTargetTypeName(attr.value);
+            if (!t.empty()) {
+                usedTypes.insert(t);
+                liveKeys.insert(t);
+            }
+            continue;
+        }
+        if (LooksLikeMarkupExtension(attr.value)) {
+            const auto ext = ParseMarkupExtension(attr.value);
+            if (ext.IsOk()) {
+                ExtractKeysFromExtension(ext, usedTypes, liveKeys);
+            }
+            continue;
+        }
+        if (attr.localName == "BasedOn" || attr.localName == "Style" ||
+            attr.localName == "Template" || attr.localName == "ItemContainerStyle" ||
+            attr.localName == "ItemTemplate" || attr.localName == "ContentTemplate" ||
+            attr.localName == "ItemsPanel" || attr.localName == "Storyboard") {
+            const std::string val = StripTargetTypeName(attr.value);
+            if (!val.empty()) {
+                liveKeys.insert(val);
+            }
+        }
+    }
+
+    for (const auto& ch : node.children) {
+        if (ch && !ShouldIgnoreXmlElement(*ch)) {
+            ScanXamlSubtreeForSeeds(*ch, usedTypes, liveKeys, false, skipExternalSourceDicts);
+        }
+    }
+    for (const auto& [k, prop] : node.propertyElements) {
+        (void)k;
+        if (prop) {
+            ScanXamlSubtreeForSeeds(*prop, usedTypes, liveKeys, false, skipExternalSourceDicts);
+        }
+    }
+}
+
+void ScanHintTextForSeeds(
+    std::string_view text,
+    std::unordered_set<std::string>& usedTypes,
+    std::unordered_set<std::string>& liveKeys) {
+    const std::size_t n = text.size();
+    std::size_t i = 0u;
+    while (i < n) {
+        const unsigned char ch = static_cast<unsigned char>(text[i]);
+        if (std::isalpha(ch) || ch == '_') {
+            const std::size_t start = i++;
+            while (i < n) {
+                const unsigned char c = static_cast<unsigned char>(text[i]);
+                if (std::isalnum(c) || c == '_') {
+                    ++i;
+                } else {
+                    break;
+                }
+            }
+            const std::string tok(text.substr(start, i - start));
+            usedTypes.insert(tok);
+            liveKeys.insert(tok);
+            continue;
+        }
+        if (ch == '"') {
+            std::string lit;
+            ++i;
+            while (i < n && text[i] != '"') {
+                if (text[i] == '\\' && i + 1u < n) {
+                    ++i;
+                }
+                lit.push_back(text[i++]);
+            }
+            if (i < n && text[i] == '"') {
+                ++i;
+            }
+            if (!lit.empty()) {
+                liveKeys.insert(lit);
+                if (LooksLikeMarkupExtension(lit)) {
+                    const auto ext = ParseMarkupExtension(lit);
+                    if (ext.IsOk()) {
+                        ExtractKeysFromExtension(ext, usedTypes, liveKeys);
+                    }
+                }
+            }
+            continue;
+        }
+        if (ch == '{') {
+            int depth = 1;
+            std::size_t j = i + 1u;
+            const std::size_t limit = std::min(n, i + 256u);
+            while (j < limit && depth > 0 && text[j] != '\n' && text[j] != '\r') {
+                if (text[j] == '{') ++depth;
+                else if (text[j] == '}') --depth;
+                ++j;
+            }
+            if (depth == 0) {
+                const std::string_view snippet = text.substr(i, j - i);
+                if (LooksLikeMarkupExtension(snippet)) {
+                    const auto ext = ParseMarkupExtension(snippet);
+                    if (ext.IsOk()) {
+                        ExtractKeysFromExtension(ext, usedTypes, liveKeys);
+                    }
+                }
+            }
+        }
+        ++i;
+    }
 }
 
 class XamlEmitter final {
@@ -774,6 +1122,10 @@ public:
             MaybeImportPrefixedType(xdt->value);
         }
 
+        if (opts_.pruneUnreferencedExternalStyles && root->localName != "ResourceDictionary") {
+            PrecomputeLiveExternalStyleNodes(*root, opts_.xamlPath);
+        }
+
         // Emit body into bodyStream_ first so x:Name fields & imports are collected
         std::ostringstream body;
         if (root->localName == "ResourceDictionary") {
@@ -802,11 +1154,18 @@ public:
         res.moduleName = moduleName_;
         res.rootClassName = rootClassName_;
         res.generatedRsCode = out.str();
+        res.externalDependencies = std::move(externalDependencies_);
         res.diagnostics = diagnostics_;
         return res;
     }
 
 private:
+    struct ParsedExternalDoc final {
+        std::string resolvedPath;
+        std::uint64_t hash = 0u;
+        std::unique_ptr<XamlNode> root;
+    };
+
     const XamlEmitOptions& opts_;
     std::string moduleName_;
     std::string shortClassName_;
@@ -819,11 +1178,284 @@ private:
     std::unordered_map<std::string, std::string> knownGeometries_;
     std::unordered_map<std::string, float> knownDoubles_;
     std::unordered_set<std::string> visitedExternalXamls_;
+    std::unordered_map<std::string, ParsedExternalDoc> externalDocCache_;
+    std::unordered_map<std::string, std::string> externalPathLookup_;
+    std::vector<ExternalXamlDep> externalDependencies_;
+    std::unordered_set<std::string> recordedExternalDeps_;
+    std::vector<const XamlNode*> externalPrunableList_;
+    std::unordered_set<const XamlNode*> externalPrunableCandidates_;
+    std::unordered_set<const XamlNode*> liveExternalNodes_;
+    std::vector<const XamlNode*> externalNonPrunableNodes_;
+    bool hasLiveExternalFilter_ = false;
+    int externalDictDepth_ = 0;
     std::vector<std::string> diagnostics_;
     int nextId_ = 0;
     bool inPartialClass_ = false;
     bool emittedLocSources_ = false;
     std::string currentTplParentVar_;
+
+    void RecordExternalDependency(std::string_view normPath, std::uint64_t contentHash) {
+        if (normPath.empty()) {
+            return;
+        }
+        const std::string key(normPath);
+        if (recordedExternalDeps_.insert(key).second) {
+            externalDependencies_.push_back(ExternalXamlDep{key, contentHash});
+        }
+    }
+
+    [[nodiscard]] const ParsedExternalDoc* ResolveAndLoadExternalDoc(
+        std::string_view requestedSource,
+        std::string_view currentXamlPath,
+        bool reportErrors) {
+        const std::string cleanRel = NormalizePackSourcePath(requestedSource);
+        if (cleanRel.empty()) {
+            return nullptr;
+        }
+
+        const std::string pairKey = std::string(currentXamlPath) + "|" + cleanRel;
+        if (const auto lookupIt = externalPathLookup_.find(pairKey); lookupIt != externalPathLookup_.end()) {
+            if (const auto docIt = externalDocCache_.find(lookupIt->second); docIt != externalDocCache_.end()) {
+                return &docIt->second;
+            }
+        }
+
+        std::string resolvedPath;
+        std::string xamlContent;
+        std::uint64_t rawHash = 0u;
+        bool loaded = false;
+
+        if (opts_.externalXamlResolver) {
+            loaded = opts_.externalXamlResolver(cleanRel, currentXamlPath, resolvedPath, xamlContent);
+            if (loaded) {
+                rawHash = FastHashBytes64(xamlContent.data(), xamlContent.size());
+            }
+        }
+        if (!loaded) {
+            std::vector<std::filesystem::path> candidates;
+            const std::filesystem::path curDir = std::filesystem::path(currentXamlPath).parent_path();
+            if (!curDir.empty()) {
+                candidates.push_back(curDir / cleanRel);
+            }
+            if (!opts_.resourceSearchRoot.empty()) {
+                candidates.push_back(std::filesystem::path(opts_.resourceSearchRoot) / cleanRel);
+            }
+            for (const auto& sp : opts_.resourceSearchPaths) {
+                candidates.push_back(std::filesystem::path(sp) / cleanRel);
+            }
+            candidates.push_back(std::filesystem::path(cleanRel));
+            // Fallback for packaged NoesisTheme references (`Theme/NoesisTheme.*.xaml`)
+            if (aero::str::StartsWith(cleanRel, "Theme/")) {
+                std::filesystem::path probe = curDir;
+                for (int up = 0; up < 4 && !probe.empty(); ++up) {
+                    candidates.push_back(probe / "Theme" / "Data" / cleanRel);
+                    candidates.push_back(probe / "Samples" / "Theme" / "Data" / cleanRel);
+                    probe = probe.parent_path();
+                }
+                candidates.push_back(std::filesystem::path("Samples/Theme/Data") / cleanRel);
+            }
+
+            std::error_code ec;
+            for (const auto& cand : candidates) {
+                if (std::filesystem::is_regular_file(cand, ec)) {
+                    resolvedPath = cand.lexically_normal().generic_string();
+                    if (const auto existingIt = externalDocCache_.find(resolvedPath);
+                        existingIt != externalDocCache_.end()) {
+                        externalPathLookup_[pairKey] = resolvedPath;
+                        return &existingIt->second;
+                    }
+                    xamlContent = ReadFileTextUtf8(cand, &rawHash);
+                    loaded = !xamlContent.empty();
+                    if (loaded) {
+                        break;
+                    }
+                }
+            }
+        }
+
+        if (!loaded) {
+            if (reportErrors) {
+                diagnostics_.push_back(
+                    "Could not resolve MergedDictionary Source '" + std::string(requestedSource) +
+                    "' referenced from '" + std::string(currentXamlPath) + "'");
+            }
+            return nullptr;
+        }
+        if (resolvedPath.empty()) {
+            resolvedPath = cleanRel;
+        }
+        externalPathLookup_[pairKey] = resolvedPath;
+        if (const auto existingIt = externalDocCache_.find(resolvedPath);
+            existingIt != externalDocCache_.end()) {
+            return &existingIt->second;
+        }
+
+        std::vector<std::string> tempDiag;
+        std::unique_ptr<XamlNode> mergedRoot;
+        if (!BuildXamlDom(xamlContent, mergedRoot, reportErrors ? diagnostics_ : tempDiag) || !mergedRoot) {
+            return nullptr;
+        }
+        RecordExternalDependency(resolvedPath, rawHash);
+        ParsedExternalDoc doc;
+        doc.resolvedPath = resolvedPath;
+        doc.hash = rawHash;
+        doc.root = std::move(mergedRoot);
+        const auto [insertedIt, unused] = externalDocCache_.emplace(resolvedPath, std::move(doc));
+        (void)unused;
+        return &insertedIt->second;
+    }
+
+    void CollectExternalDictNodes(
+        const XamlNode& dictNode,
+        std::string_view currentXamlPath) {
+        if (const auto* rootSrc = dictNode.FindAttribute("Source")) {
+            CollectExternalDictInclude(rootSrc->value, currentXamlPath);
+        }
+        if (const auto* mergedEl = dictNode.FindPropertyElement("ResourceDictionary", "MergedDictionaries")) {
+            for (const auto& child : mergedEl->children) {
+                if (!child || ShouldIgnoreXmlElement(*child)) continue;
+                if (child->localName == "ResourceDictionary") {
+                    if (const auto* srcAttr = child->FindAttribute("Source")) {
+                        CollectExternalDictInclude(srcAttr->value, currentXamlPath);
+                    } else {
+                        CollectExternalDictNodes(*child, currentXamlPath);
+                    }
+                }
+            }
+        }
+        for (const auto& child : dictNode.children) {
+            if (!child || ShouldIgnoreXmlElement(*child)) continue;
+            if (child->localName == "ResourceDictionary") {
+                if (const auto* srcAttr = child->FindAttribute("Source")) {
+                    CollectExternalDictInclude(srcAttr->value, currentXamlPath);
+                } else {
+                    CollectExternalDictNodes(*child, currentXamlPath);
+                }
+                continue;
+            }
+            if (externalDictDepth_ > 0) {
+                if (IsPrunableExternalResourceTag(child->localName)) {
+                    if (externalPrunableCandidates_.insert(child.get()).second) {
+                        externalPrunableList_.push_back(child.get());
+                    }
+                } else {
+                    externalNonPrunableNodes_.push_back(child.get());
+                }
+            }
+        }
+    }
+
+    void CollectExternalDictInclude(
+        std::string_view requestedSource,
+        std::string_view currentXamlPath) {
+        const ParsedExternalDoc* doc = ResolveAndLoadExternalDoc(requestedSource, currentXamlPath, false);
+        if (!doc || !doc->root) {
+            return;
+        }
+        if (!visitedExternalXamls_.insert(doc->resolvedPath).second) {
+            return;
+        }
+        ++externalDictDepth_;
+        CollectExternalDictNodes(*doc->root, doc->resolvedPath);
+        --externalDictDepth_;
+        visitedExternalXamls_.erase(doc->resolvedPath);
+    }
+
+    void WalkTreeForExternalDictRefs(const XamlNode& node, std::string_view currentXamlPath) {
+        if (node.localName == "ResourceDictionary") {
+            if (const auto* src = node.FindAttribute("Source")) {
+                CollectExternalDictInclude(src->value, currentXamlPath);
+            }
+        }
+        for (const auto& ch : node.children) {
+            if (ch && !ShouldIgnoreXmlElement(*ch)) {
+                WalkTreeForExternalDictRefs(*ch, currentXamlPath);
+            }
+        }
+        for (const auto& [k, prop] : node.propertyElements) {
+            (void)k;
+            if (prop) {
+                WalkTreeForExternalDictRefs(*prop, currentXamlPath);
+            }
+        }
+    }
+
+    void PrecomputeLiveExternalStyleNodes(
+        const XamlNode& primaryRoot,
+        std::string_view currentXamlPath) {
+        externalPrunableList_.clear();
+        externalPrunableCandidates_.clear();
+        liveExternalNodes_.clear();
+        externalNonPrunableNodes_.clear();
+        hasLiveExternalFilter_ = false;
+
+        WalkTreeForExternalDictRefs(primaryRoot, currentXamlPath);
+        if (externalPrunableList_.empty()) {
+            return;
+        }
+
+        hasLiveExternalFilter_ = true;
+        std::unordered_set<std::string> usedTypes;
+        std::unordered_set<std::string> liveKeys;
+
+        ScanXamlSubtreeForSeeds(primaryRoot, usedTypes, liveKeys, false, true);
+        for (const XamlNode* nonPrune : externalNonPrunableNodes_) {
+            if (nonPrune) {
+                ScanXamlSubtreeForSeeds(*nonPrune, usedTypes, liveKeys, false, false);
+            }
+        }
+        for (const std::string& hint : opts_.usageHintTexts) {
+            ScanHintTextForSeeds(hint, usedTypes, liveKeys);
+        }
+        ExpandControlHierarchy(usedTypes);
+
+        bool changed = true;
+        while (changed) {
+            changed = false;
+            for (const XamlNode* cand : externalPrunableList_) {
+                if (!cand || liveExternalNodes_.count(cand) > 0u) {
+                    continue;
+                }
+                const std::string rawKey = cand->GetKey();
+                bool isLive = false;
+                if (!rawKey.empty()) {
+                    std::string effKey = rawKey;
+                    if (LooksLikeMarkupExtension(effKey)) {
+                        effKey = StripTargetTypeName(effKey);
+                    }
+                    if (liveKeys.count(rawKey) > 0u || liveKeys.count(effKey) > 0u) {
+                        isLive = true;
+                    } else if (cand->localName == "Style") {
+                        if (const auto* tt = cand->FindAttribute("TargetType")) {
+                            const std::string ttName = StripTargetTypeName(tt->value);
+                            if (!ttName.empty() && effKey == ttName && usedTypes.count(ttName) > 0u) {
+                                isLive = true;
+                            }
+                        }
+                    }
+                } else {
+                    if (cand->localName == "Style") {
+                        if (const auto* tt = cand->FindAttribute("TargetType")) {
+                            const std::string ttName = StripTargetTypeName(tt->value);
+                            if (ttName.empty() || usedTypes.count(ttName) > 0u) {
+                                isLive = true;
+                            }
+                        } else {
+                            isLive = true;
+                        }
+                    } else {
+                        isLive = true;
+                    }
+                }
+                if (isLive) {
+                    liveExternalNodes_.insert(cand);
+                    ScanXamlSubtreeForSeeds(*cand, usedTypes, liveKeys, true, false);
+                    ExpandControlHierarchy(usedTypes);
+                    changed = true;
+                }
+            }
+        }
+    }
 
     void MaybeImportClrNamespace(std::string_view ns) {
         if (ns.empty() || ns == moduleName_ || IsIgnoredExternalClrNamespace(ns)) {
@@ -920,75 +1552,20 @@ private:
         std::string_view targetDictVar,
         std::ostringstream& out,
         int indent) {
-        const std::string cleanRel = NormalizePackSourcePath(requestedSource);
-        if (cleanRel.empty()) {
+        const ParsedExternalDoc* doc = ResolveAndLoadExternalDoc(
+            requestedSource, currentXamlPath, true);
+        if (!doc || !doc->root) {
             return {};
         }
-
-        std::string resolvedPath;
-        std::string xamlContent;
-        bool loaded = false;
-
-        if (opts_.externalXamlResolver) {
-            loaded = opts_.externalXamlResolver(cleanRel, currentXamlPath, resolvedPath, xamlContent);
-        }
-        if (!loaded) {
-            std::vector<std::filesystem::path> candidates;
-            const std::filesystem::path curDir = std::filesystem::path(currentXamlPath).parent_path();
-            if (!curDir.empty()) {
-                candidates.push_back(curDir / cleanRel);
-            }
-            if (!opts_.resourceSearchRoot.empty()) {
-                candidates.push_back(std::filesystem::path(opts_.resourceSearchRoot) / cleanRel);
-            }
-            for (const auto& sp : opts_.resourceSearchPaths) {
-                candidates.push_back(std::filesystem::path(sp) / cleanRel);
-            }
-            candidates.push_back(std::filesystem::path(cleanRel));
-            // Fallback for packaged NoesisTheme references (`Theme/NoesisTheme.*.xaml`)
-            if (aero::str::StartsWith(cleanRel, "Theme/")) {
-                std::filesystem::path probe = curDir;
-                for (int up = 0; up < 4 && !probe.empty(); ++up) {
-                    candidates.push_back(probe / "Theme" / "Data" / cleanRel);
-                    candidates.push_back(probe / "Samples" / "Theme" / "Data" / cleanRel);
-                    probe = probe.parent_path();
-                }
-                candidates.push_back(std::filesystem::path("Samples/Theme/Data") / cleanRel);
-            }
-
-            std::error_code ec;
-            for (const auto& cand : candidates) {
-                if (std::filesystem::is_regular_file(cand, ec)) {
-                    resolvedPath = cand.lexically_normal().generic_string();
-                    xamlContent = ReadFileTextUtf8(cand);
-                    loaded = !xamlContent.empty();
-                    if (loaded) {
-                        break;
-                    }
-                }
-            }
-        }
-
-        if (!loaded) {
-            diagnostics_.push_back(
-                "Could not resolve MergedDictionary Source '" + std::string(requestedSource) +
-                "' referenced from '" + std::string(currentXamlPath) + "'");
+        if (!visitedExternalXamls_.insert(doc->resolvedPath).second) {
+            diagnostics_.push_back("Circular ResourceDictionary Source detected: " + doc->resolvedPath);
             return {};
         }
-        if (resolvedPath.empty()) {
-            resolvedPath = cleanRel;
-        }
-        if (!visitedExternalXamls_.insert(resolvedPath).second) {
-            diagnostics_.push_back("Circular ResourceDictionary Source detected: " + resolvedPath);
-            return {};
-        }
-
-        std::unique_ptr<XamlNode> mergedRoot;
-        if (BuildXamlDom(xamlContent, mergedRoot, diagnostics_)) {
-            EmitResourceDictionaryEntries(*mergedRoot, resolvedPath, targetDictVar, out, indent);
-        }
-        visitedExternalXamls_.erase(resolvedPath);
-        return resolvedPath;
+        ++externalDictDepth_;
+        EmitResourceDictionaryEntries(*doc->root, doc->resolvedPath, targetDictVar, out, indent);
+        --externalDictDepth_;
+        visitedExternalXamls_.erase(doc->resolvedPath);
+        return doc->resolvedPath;
     }
 
     void EmitResourceDictionaryEntries(
@@ -1246,6 +1823,12 @@ private:
         std::string_view dictVar,
         std::ostringstream& out,
         int indent) {
+        if (hasLiveExternalFilter_ &&
+            externalDictDepth_ > 0 &&
+            externalPrunableCandidates_.count(&child) > 0u &&
+            liveExternalNodes_.count(&child) == 0u) {
+            return;
+        }
         std::string key = child.GetKey();
         if (child.localName == "Style" && key.empty()) {
             if (const auto* tt = child.FindAttribute("TargetType")) {
@@ -1436,6 +2019,13 @@ private:
             }
             Indent(out, indent);
             out << "var " << bVar << " = new ImageBrush(" << EscapeRsString(src) << ");\n";
+            if (const auto* stAttr = brushNode.FindAttribute("Stretch")) {
+                const std::string_view st = aero::str::Trim(stAttr->value);
+                if (!st.empty()) {
+                    Indent(out, indent);
+                    out << bVar << ".Stretch = Stretch." << st << ";\n";
+                }
+            }
             if (const auto* opAttr = brushNode.FindAttribute("Opacity")) {
                 float op = 1.0f;
                 if (aero::str::TryParseFloat32(opAttr->value, op)) {
@@ -2064,6 +2654,36 @@ private:
                 }
                 Indent(out, indent);
                 out << ownerObjVar << ".AddTrigger(" << tVar << ");\n";
+            } else if (trig->localName == "MultiDataTrigger") {
+                const std::string tVar = FreshVar("mdtrig");
+                Indent(out, indent);
+                out << "var " << tVar << " = new MultiDataTrigger();\n";
+                if (const auto* condProp = trig->FindPropertyElement("MultiDataTrigger", "Conditions")) {
+                    for (const auto& cond : condProp->children) {
+                        if (cond->localName != "Condition") continue;
+                        ParsedBindingSpec bSpec;
+                        if (const auto* b = cond->FindAttribute("Binding")) {
+                            const auto ext = ParseMarkupExtension(b->value);
+                            (void)TryExtractBindingSpec(ext, bSpec);
+                        }
+                        std::string val;
+                        if (const auto* v = cond->FindAttribute("Value")) val = v->value;
+                        Indent(out, indent);
+                        out << tVar << ".AddCondition("
+                            << EscapeRsString(NormalizeBindingPath(bSpec.path)) << ", "
+                            << BoxSetterValueExpr(bSpec.path, FormatGenericScalarLiteral(val)) << ", "
+                            << EscapeRsString(bSpec.elementName) << ", "
+                            << EscapeRsString(bSpec.relativeSourceMode) << ", "
+                            << EscapeRsString(bSpec.ancestorType) << ");\n";
+                    }
+                }
+                for (const auto& s : trig->children) {
+                    if (s->localName == "Setter") {
+                        EmitSetterInto(*s, tVar, dictVar, out, indent);
+                    }
+                }
+                Indent(out, indent);
+                out << ownerObjVar << ".AddTrigger(" << tVar << ");\n";
             } else if (trig->localName == "EventTrigger") {
                 std::string evName = "Loaded";
                 if (const auto* re = trig->FindAttribute("RoutedEvent")) {
@@ -2107,6 +2727,10 @@ private:
         out << "var " << tplVar << " = new ControlTemplate();\n";
         Indent(out, indent);
         out << tplVar << ".TargetType = " << EscapeRsString(targetType) << ";\n";
+        if (!dictVar.empty()) {
+            Indent(out, indent);
+            out << tplVar << ".AmbientResources = " << dictVar << ";\n";
+        }
         EmitResourcesPropertyElement(tplNode, "ControlTemplate", tplVar, opts_.xamlPath, out, indent);
         Indent(out, indent);
         out << tplVar << ".Factory = (Control " << tpParam << ") =>\n";
@@ -2179,6 +2803,10 @@ private:
         inPartialClass_ = prevPartial;
         Indent(out, indent);
         out << "});\n";
+        if (!dictVar.empty()) {
+            Indent(out, indent);
+            out << iptVar << ".AmbientResources = " << dictVar << ";\n";
+        }
         return iptVar;
     }
 
@@ -2202,6 +2830,10 @@ private:
         if (!itemDataType.empty()) {
             Indent(out, indent);
             out << dtVar << ".DataType = " << EscapeRsString(itemDataType) << ";\n";
+        }
+        if (!dictVar.empty()) {
+            Indent(out, indent);
+            out << dtVar << ".AmbientResources = " << dictVar << ";\n";
         }
         EmitResourcesPropertyElement(dtNode, "DataTemplate", dtVar, opts_.xamlPath, out, indent);
         Indent(out, indent);
@@ -2297,8 +2929,9 @@ private:
                 child->localName == "ShakeAnimation") {
                 float fromVal = 0.0f;
                 float toVal = 1.0f;
+                bool hasFrom = false;
                 if (const auto* f = child->FindAttribute("From")) {
-                    (void)aero::str::TryParseFloat32(f->value, fromVal);
+                    hasFrom = aero::str::TryParseFloat32(f->value, fromVal);
                 }
                 if (const auto* t = child->FindAttribute("To")) {
                     (void)aero::str::TryParseFloat32(t->value, toVal);
@@ -2312,14 +2945,24 @@ private:
                     durSec = ParseDurationSeconds(d->value);
                 }
                 Indent(out, indent);
-                out << sbVar << ".AddDoubleAnimation("
-                    << EscapeRsString(targetName) << ", "
-                    << EscapeRsString(targetProp) << ", "
-                    << FormatFloatLiteral(fromVal) << ", "
-                    << FormatFloatLiteral(toVal) << ", "
-                    << FormatFloatLiteral(durSec) << ", "
-                    << easeKind << ", " << easeMode << ", "
-                    << FormatFloatLiteral(beginSec) << ");\n";
+                if (hasFrom) {
+                    out << sbVar << ".AddDoubleAnimation("
+                        << EscapeRsString(targetName) << ", "
+                        << EscapeRsString(targetProp) << ", "
+                        << FormatFloatLiteral(fromVal) << ", "
+                        << FormatFloatLiteral(toVal) << ", "
+                        << FormatFloatLiteral(durSec) << ", "
+                        << easeKind << ", " << easeMode << ", "
+                        << FormatFloatLiteral(beginSec) << ");\n";
+                } else {
+                    out << sbVar << ".AddDoubleToAnimation("
+                        << EscapeRsString(targetName) << ", "
+                        << EscapeRsString(targetProp) << ", "
+                        << FormatFloatLiteral(toVal) << ", "
+                        << FormatFloatLiteral(durSec) << ", "
+                        << easeKind << ", " << easeMode << ", "
+                        << FormatFloatLiteral(beginSec) << ");\n";
+                }
             } else if (child->localName == "ColorAnimation") {
                 std::string fromHex = "#FFFFFFFF";
                 std::string toHex = "#FFFFFFFF";
@@ -2398,12 +3041,31 @@ private:
                         }
                     }
                     const float segDur = std::max(0.001f, kt - prevTime);
-                    if ((havePrev && kt > prevTime) || (!havePrev && child->children.size() == 1 && kt > 0.0f)) {
+                    if (havePrev && kt > prevTime) {
                         Indent(out, indent);
                         out << sbVar << ".AddDoubleAnimation("
                             << EscapeRsString(targetName) << ", "
                             << EscapeRsString(targetProp) << ", "
                             << FormatFloatLiteral(prevVal) << ", "
+                            << FormatFloatLiteral(val) << ", "
+                            << FormatFloatLiteral(segDur) << ", "
+                            << kfEase << ", " << kfMode << ", "
+                            << FormatFloatLiteral(beginSec + prevTime) << ");\n";
+                    } else if (!havePrev && kt > 0.0001f) {
+                        Indent(out, indent);
+                        out << sbVar << ".AddDoubleToAnimation("
+                            << EscapeRsString(targetName) << ", "
+                            << EscapeRsString(targetProp) << ", "
+                            << FormatFloatLiteral(val) << ", "
+                            << FormatFloatLiteral(kt) << ", "
+                            << kfEase << ", " << kfMode << ", "
+                            << FormatFloatLiteral(beginSec) << ");\n";
+                    } else if (!havePrev && child->children.size() == 1) {
+                        Indent(out, indent);
+                        out << sbVar << ".AddDoubleAnimation("
+                            << EscapeRsString(targetName) << ", "
+                            << EscapeRsString(targetProp) << ", "
+                            << FormatFloatLiteral(val) << ", "
                             << FormatFloatLiteral(val) << ", "
                             << FormatFloatLiteral(segDur) << ", "
                             << kfEase << ", " << kfMode << ", "
@@ -2427,12 +3089,13 @@ private:
                         hex = ResolveColorHexOrString(va->value);
                     }
                     const float segDur = std::max(0.001f, kt - prevTime);
-                    if ((havePrev && kt > prevTime) || (!havePrev && child->children.size() == 1 && kt > 0.0f)) {
+                    if ((havePrev && kt > prevTime) || (!havePrev && child->children.size() == 1)) {
+                        const std::string& startHex = havePrev ? prevHex : hex;
                         Indent(out, indent);
                         out << sbVar << ".AddColorAnimation("
                             << EscapeRsString(targetName) << ", "
                             << EscapeRsString(targetProp) << ", "
-                            << EscapeRsString(prevHex) << ", "
+                            << EscapeRsString(startHex) << ", "
                             << EscapeRsString(hex) << ", "
                             << FormatFloatLiteral(segDur) << ", 0, 0, "
                             << FormatFloatLiteral(beginSec + prevTime) << ");\n";
@@ -2458,7 +3121,7 @@ private:
         if (!dictVar.empty()) {
             return std::string(dictVar) + ".Get(" + EscapeRsString(key) + ")";
         }
-        return "ResourceDictionary.GlobalApplicationResources().Get(" + EscapeRsString(key) + ")";
+        return "ResourceDictionary.FindAmbientOrGlobal(" + EscapeRsString(key) + ")";
     }
 
     [[nodiscard]] std::string FormatGenericScalarLiteral(std::string_view val) const {
@@ -2511,6 +3174,13 @@ private:
             }
             if (ext.kind == MarkupExtensionKind::XStatic) {
                 if (const auto* p0 = ext.FindPositional(0)) {
+                    if (const char* enumType = LookupEnumType(propName)) {
+                        const std::size_t dot = p0->literal.rfind('.');
+                        const std::string member = (dot != std::string::npos)
+                            ? p0->literal.substr(dot + 1)
+                            : p0->literal;
+                        return std::string(enumType) + "." + std::string(aero::str::Trim(member));
+                    }
                     return EscapeRsString(p0->literal);
                 }
             }
@@ -3010,9 +3680,12 @@ private:
             return;
         }
         if (propName == "Tag" || propName == "ToolTip" || propName == "Title" ||
-            propName == "InputGestureText" || propName == "CommandParameter" ||
+            propName == "InputGestureText" || propName == "CommandParameter" || propName == "Command" ||
             propName == "Placeholder" || propName == "FontWeight" || propName == "DisplayMemberPath" ||
-            propName == "Loc.Source") {
+            propName == "Loc.Source" || propName == "ContentSource" || propName == "Placement" ||
+            propName == "HorizontalOffset" || propName == "VerticalOffset" ||
+            propName == "IsOpen" || propName == "StaysOpen" ||
+            propName == "Delay" || propName == "Interval" || propName == "CanContentScroll") {
             Indent(out, indent);
             out << targetVar << ".SetPropertyBox(" << EscapeRsString(propName) << ", "
                 << BoxSetterValueExpr(propName, FormatGenericScalarLiteral(rawVal)) << ");\n";
@@ -3063,10 +3736,12 @@ private:
         std::sort(langFiles.begin(), langFiles.end());
 
         for (const auto& lp : langFiles) {
-            const std::string content = ReadFileTextUtf8(lp);
+            std::uint64_t rawHash = 0u;
+            const std::string content = ReadFileTextUtf8(lp, &rawHash);
             if (content.empty()) {
                 continue;
             }
+            RecordExternalDependency(lp.lexically_normal().generic_string(), rawHash);
             std::unique_ptr<XamlNode> langRoot;
             if (!BuildXamlDom(content, langRoot, diagnostics_) || !langRoot) {
                 continue;
@@ -3150,7 +3825,11 @@ private:
                 if (!needExtended && spec.converterKey.empty() && spec.stringFormat.empty() && spec.converterParam.empty()) {
                     out << "BindingEngine.BindTemplateParent(" << targetVar << ", "
                         << EscapeRsString(propName) << ", " << currentTplParentVar_ << ", "
-                        << EscapeRsString(cleanPath) << ");\n";
+                        << EscapeRsString(cleanPath);
+                    if (modeInt != 0) {
+                        out << ", " << modeInt;
+                    }
+                    out << ");\n";
                 } else {
                     out << "BindingEngine.BindTemplateParentEx(" << targetVar << ", "
                         << EscapeRsString(propName) << ", " << currentTplParentVar_ << ", "
@@ -3160,7 +3839,11 @@ private:
                         << EscapeRsString(spec.converterParam) << ", "
                         << EscapeRsString(spec.stringFormat) << ", "
                         << fbHas << ", " << fbBox << ", "
-                        << tnHas << ", " << tnBox << ");\n";
+                        << tnHas << ", " << tnBox;
+                    if (modeInt != 0) {
+                        out << ", " << modeInt;
+                    }
+                    out << ");\n";
                 }
             }
             return;
@@ -3343,6 +4026,10 @@ private:
             }
             if (shortProp == "InputBindings") {
                 EmitInputBindings(*propNode, targetVar, out, indent);
+                continue;
+            }
+            if (propKey == "VisualStateManager.VisualStateGroups" || shortProp == "VisualStateGroups") {
+                EmitVisualStateGroups(*propNode, targetVar, dictVar, out, indent);
                 continue;
             }
             if (propKey == "Interaction.Triggers") {
@@ -3954,6 +4641,10 @@ private:
             out << "var " << tv << " = new BehaviorDataTrigger();\n";
             Indent(out, indent);
             out << tv << ".BindingPath = " << EscapeRsString(spec.path) << ";\n";
+            if (!spec.elementName.empty()) {
+                Indent(out, indent);
+                out << tv << ".ElementName = " << EscapeRsString(spec.elementName) << ";\n";
+            }
             if (!spec.relativeSourceMode.empty()) {
                 Indent(out, indent);
                 out << tv << ".RelativeSourceMode = " << EscapeRsString(spec.relativeSourceMode) << ";\n";
@@ -4130,6 +4821,205 @@ private:
             Indent(out, indent);
             out << "Interaction.AddTrigger(" << targetVar << ", " << etVar << ");\n";
         }
+    }
+
+    void EmitVisualStateStoryboardSetters(
+        const XamlNode& sbNode,
+        std::string_view vsVar,
+        std::string_view dictVar,
+        std::ostringstream& out,
+        int indent) {
+        for (const auto& tl : sbNode.children) {
+            std::string targetName;
+            std::string targetProp;
+            if (const auto* tn = tl->FindAttribute("Storyboard.TargetName")) {
+                targetName = tn->value;
+            } else if (const auto* tn2 = tl->FindAttribute("TargetName")) {
+                targetName = tn2->value;
+            }
+            if (const auto* tp = tl->FindAttribute("Storyboard.TargetProperty")) {
+                targetProp = NormalizeTargetPropertyPath(tp->value);
+            } else if (const auto* tp2 = tl->FindAttribute("TargetProperty")) {
+                targetProp = NormalizeTargetPropertyPath(tp2->value);
+            }
+            if (targetProp.empty() || targetProp == "Unsupported.GradientStop") continue;
+
+            if (tl->localName == "DoubleAnimation" ||
+                tl->localName == "BounceAnimation" ||
+                tl->localName == "ElasticAnimation" ||
+                tl->localName == "BackAnimation") {
+                if (const auto* t = tl->FindAttribute("To")) {
+                    float toVal = 0.0f;
+                    if (aero::str::TryParseFloat32(t->value, toVal)) {
+                        Indent(out, indent);
+                        out << vsVar << ".AddSetterBox(" << EscapeRsString(targetProp)
+                            << ", DependencyObject.BoxFloat(" << FormatFloatLiteral(toVal) << "), "
+                            << EscapeRsString(targetName) << ");\n";
+                    }
+                }
+            } else if (tl->localName == "DoubleAnimationUsingKeyFrames" && !tl->children.empty()) {
+                const auto& lastKf = *tl->children.back();
+                if (const auto* va = lastKf.FindAttribute("Value")) {
+                    float val = 0.0f;
+                    if (aero::str::TryParseFloat32(va->value, val)) {
+                        Indent(out, indent);
+                        out << vsVar << ".AddSetterBox(" << EscapeRsString(targetProp)
+                            << ", DependencyObject.BoxFloat(" << FormatFloatLiteral(val) << "), "
+                            << EscapeRsString(targetName) << ");\n";
+                    }
+                }
+            } else if (tl->localName == "ColorAnimation") {
+                if (const auto* t = tl->FindAttribute("To")) {
+                    const std::string hex = ResolveColorHexOrString(t->value);
+                    Indent(out, indent);
+                    out << vsVar << ".AddSetterBox(" << EscapeRsString(targetProp)
+                        << ", DependencyObject.BoxString(" << EscapeRsString(hex) << "), "
+                        << EscapeRsString(targetName) << ");\n";
+                }
+            } else if (tl->localName == "ColorAnimationUsingKeyFrames" && !tl->children.empty()) {
+                const auto& lastKf = *tl->children.back();
+                if (const auto* va = lastKf.FindAttribute("Value")) {
+                    const std::string hex = ResolveColorHexOrString(va->value);
+                    Indent(out, indent);
+                    out << vsVar << ".AddSetterBox(" << EscapeRsString(targetProp)
+                        << ", DependencyObject.BoxString(" << EscapeRsString(hex) << "), "
+                        << EscapeRsString(targetName) << ");\n";
+                }
+            } else if (tl->localName == "BooleanAnimationUsingKeyFrames" && !tl->children.empty()) {
+                const auto& lastKf = *tl->children.back();
+                if (const auto* va = lastKf.FindAttribute("Value")) {
+                    const bool bv = aero::str::EqualsIgnoreCase(aero::str::Trim(va->value), "True");
+                    Indent(out, indent);
+                    out << vsVar << ".AddSetterBox(" << EscapeRsString(targetProp)
+                        << ", DependencyObject.BoxBool(" << (bv ? "true" : "false") << "), "
+                        << EscapeRsString(targetName) << ");\n";
+                }
+            } else if (tl->localName == "ObjectAnimationUsingKeyFrames" && !tl->children.empty()) {
+                const auto& lastKf = *tl->children.back();
+                if (const auto* va = lastKf.FindAttribute("Value")) {
+                    const std::string valExpr = FormatTypedValueLiteral(targetProp, va->value, dictVar);
+                    Indent(out, indent);
+                    out << vsVar << ".AddSetterBox(" << EscapeRsString(targetProp)
+                        << ", " << BoxSetterValueExpr(targetProp, valExpr) << ", "
+                        << EscapeRsString(targetName) << ");\n";
+                }
+            }
+        }
+    }
+
+    void EmitVisualStateGroups(
+        const XamlNode& vsgPropNode,
+        std::string_view targetVar,
+        std::string_view dictVar,
+        std::ostringstream& out,
+        int indent) {
+        const std::string arrVar = FreshVar("vsgList");
+        Indent(out, indent);
+        out << "var " << arrVar << " = new VisualStateGroup[0];\n";
+
+        for (const auto& grpNode : vsgPropNode.children) {
+            if (!grpNode || grpNode->localName != "VisualStateGroup") continue;
+            const std::string gVar = FreshVar("vsg");
+            Indent(out, indent);
+            out << "var " << gVar << " = new VisualStateGroup(" << EscapeRsString(grpNode->GetName()) << ");\n";
+
+            const XamlNode* statesProp = grpNode->FindPropertyElement("VisualStateGroup", "States");
+            const auto& stateChildren = (statesProp != nullptr) ? statesProp->children : grpNode->children;
+            for (const auto& stNode : stateChildren) {
+                if (!stNode || stNode->localName != "VisualState") continue;
+                const std::string stName = stNode->GetName();
+                if (stName.empty()) continue;
+                const std::string vsVar = FreshVar("vs");
+                Indent(out, indent);
+                out << "var " << vsVar << " = new VisualState(" << EscapeRsString(stName) << ");\n";
+
+                if (const auto* sbAttr = stNode->FindAttribute("Storyboard")) {
+                    if (LooksLikeMarkupExtension(sbAttr->value)) {
+                        const auto ext = ParseMarkupExtension(sbAttr->value);
+                        const std::string rk = ResolveResourceKeyFromExtension(ext);
+                        if (!rk.empty()) {
+                            Indent(out, indent);
+                            out << vsVar << ".StoryboardKey = " << EscapeRsString(rk) << ";\n";
+                        }
+                    }
+                }
+                if (const auto* sbProp = stNode->FindPropertyElement("VisualState", "Storyboard")) {
+                    for (const auto& c : sbProp->children) {
+                        if (c && c->localName == "Storyboard") {
+                            EmitVisualStateStoryboardSetters(*c, vsVar, dictVar, out, indent);
+                        }
+                    }
+                }
+                for (const auto& c : stNode->children) {
+                    if (c && c->localName == "Storyboard") {
+                        EmitVisualStateStoryboardSetters(*c, vsVar, dictVar, out, indent);
+                    }
+                }
+
+                Indent(out, indent);
+                out << gVar << ".AddState(" << vsVar << ");\n";
+            }
+
+            const XamlNode* trProp = grpNode->FindPropertyElement("VisualStateGroup", "Transitions");
+            const auto emitTransitionNode = [&](const XamlNode& trNode) {
+                const std::string vtVar = FreshVar("vt");
+                Indent(out, indent);
+                out << "var " << vtVar << " = new VisualTransition();\n";
+                if (const auto* fAttr = trNode.FindAttribute("From")) {
+                    Indent(out, indent);
+                    out << vtVar << ".From = " << EscapeRsString(fAttr->value) << ";\n";
+                }
+                if (const auto* tAttr = trNode.FindAttribute("To")) {
+                    Indent(out, indent);
+                    out << vtVar << ".To = " << EscapeRsString(tAttr->value) << ";\n";
+                }
+                if (const auto* dAttr = trNode.FindAttribute("GeneratedDuration")) {
+                    const float durSec = ParseDurationSeconds(dAttr->value);
+                    Indent(out, indent);
+                    out << vtVar << ".GeneratedDurationSec = " << FormatFloatLiteral(durSec) << ";\n";
+                }
+                int easeKind = 0;
+                int easeMode = 0;
+                bool hasEase = false;
+                if (const auto* eAttr = trNode.FindAttribute("GeneratedEasingFunction")) {
+                    easeKind = MapEasingKind(eAttr->value);
+                    hasEase = true;
+                }
+                const XamlNode* eProp = trNode.FindPropertyElement("VisualTransition", "GeneratedEasingFunction");
+                if (eProp != nullptr && !eProp->children.empty() && eProp->children.front() != nullptr) {
+                    const auto& eNode = *eProp->children.front();
+                    easeKind = MapEasingKind(eNode.localName);
+                    if (const auto* em = eNode.FindAttribute("EasingMode")) {
+                        easeMode = MapEasingMode(em->value);
+                    }
+                    hasEase = true;
+                }
+                if (hasEase) {
+                    Indent(out, indent);
+                    out << vtVar << ".SetEasing(" << easeKind << ", " << easeMode << ");\n";
+                }
+                Indent(out, indent);
+                out << gVar << ".AddTransition(" << vtVar << ");\n";
+            };
+            if (trProp != nullptr) {
+                for (const auto& trNode : trProp->children) {
+                    if (trNode && trNode->localName == "VisualTransition") {
+                        emitTransitionNode(*trNode);
+                    }
+                }
+            }
+            for (const auto& trNode : grpNode->children) {
+                if (trNode && trNode->localName == "VisualTransition") {
+                    emitTransitionNode(*trNode);
+                }
+            }
+
+            Indent(out, indent);
+            out << arrVar << ".Push(" << gVar << ");\n";
+        }
+
+        Indent(out, indent);
+        out << "VisualStateManager.SetVisualStateGroups(" << targetVar << ", " << arrVar << ");\n";
     }
 };
 

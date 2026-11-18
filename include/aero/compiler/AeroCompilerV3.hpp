@@ -48,6 +48,7 @@ struct AeroV3CompileInput {
     std::vector<std::string> resourceSearchPaths;
 
     bool optimizeBytecode = false;
+    bool skipRawBytecodeOutput = false;
     rs_comp::CompilerSession* compilerSession = nullptr;
     bool enableReactiveMacros = true;
 };

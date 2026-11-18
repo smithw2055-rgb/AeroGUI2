@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstdint>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -8,12 +9,19 @@
 
 namespace aero {
 
+struct ExternalXamlDep final {
+    std::string resolvedPath;
+    std::uint64_t contentHash = 0u;
+};
+
 struct XamlEmitOptions final {
     std::string xamlPath = "MainView.xaml";
     std::string defaultModuleName;
     ExternalXamlResolverFn externalXamlResolver{};
     std::string resourceSearchRoot;
     std::vector<std::string> resourceSearchPaths;
+    bool pruneUnreferencedExternalStyles = false;
+    std::vector<std::string> usageHintTexts;
 };
 
 struct XamlEmitResult final {
@@ -23,6 +31,7 @@ struct XamlEmitResult final {
     std::string moduleName;
     std::string rootClassName;
     std::string dataType;
+    std::vector<ExternalXamlDep> externalDependencies;
     std::vector<std::string> diagnostics;
 };
 

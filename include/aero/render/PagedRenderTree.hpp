@@ -689,6 +689,9 @@ private:
     std::uint32_t mtsdfOwnerId_ = 0u;
     std::uint64_t mtsdfAtlasRevision_ = 0u;
     std::uint32_t mtsdfPopulatedRows_ = 0u;
+    std::uint32_t mtsdfShelfX_ = 0u;
+    std::uint32_t mtsdfShelfY_ = 512u;
+    std::uint32_t mtsdfShelfRowH_ = 0u;
     std::vector<std::uint8_t> mtsdfAtlasRgba8_;
     std::unordered_set<std::uint64_t> mtsdfRegisteredHashes_;
     std::unordered_map<std::uint64_t, AxbMtsdfPathEntry> mtsdfEntries_;

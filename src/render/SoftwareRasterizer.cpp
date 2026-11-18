@@ -868,7 +868,7 @@ void RasterizeSingleNode(
         const float perpQuadH = std::fabs(det) / std::max(localQuadW, 1e-4f);
         const bool uniformSdfCr = IsUniformCornerRadius(sdfRadii);
 
-        const std::uint32_t pathGradId = (prim == AeroPrimType::MsdfVectorPath)
+        const std::uint32_t pathGradId = (prim == AeroPrimType::MsdfVectorPath || prim == AeroPrimType::TexturedQuad)
             ? ((nd->gradientBrushId != 0u)
                    ? nd->gradientBrushId
                    : static_cast<std::uint32_t>((v0.primType >> 4u) & 0x0FFFu))
@@ -1526,6 +1526,18 @@ void RasterizeSingleNode(
                         vertA = bilerpVertByte(24u);
                     }
 
+                    if (hoistedPathGradBrush != nullptr && texel.a > 0.002f) {
+                        const Color gc = EvaluateGradientBrushSafe(
+                            *hoistedPathGradBrush,
+                            std::clamp(su, 0.0f, 1.0f),
+                            std::clamp(sv, 0.0f, 1.0f),
+                            std::max(1.0f, perpQuadW),
+                            std::max(1.0f, perpQuadH));
+                        vertR *= gc.r;
+                        vertG *= gc.g;
+                        vertB *= gc.b;
+                        vertA *= std::clamp(gc.a, 0.0f, 1.0f);
+                    }
                     const float finalAlpha = std::clamp(texel.a * vertA, 0.0f, 1.0f);
                     if (finalAlpha > 0.002f) {
                         const bool isPremul = (v0.flags & AeroVertexFlag_PremultipliedAlpha) != 0u;

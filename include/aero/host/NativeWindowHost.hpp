@@ -34,7 +34,7 @@ struct NativeWindowConfig {
     bool preferHardwareGpu = true;
     bool allowHeadlessFallback = true;
     bool forceHeadless = false;
-    bool enableHighDpi = true;
+    bool enableHighDpi = false;
     float dpiScale = 0.0f;
     std::size_t maxPagesInRing = 256u;
     std::uint32_t defaultAtlasSize = 256u;
@@ -236,6 +236,7 @@ private:
     void* win32WakeEvent_ = nullptr;
     std::uint16_t pendingHighSurrogate_ = 0u;
     std::uint8_t win32PressedMouseMask_ = 0u;
+    bool win32WindowShown_ = false;
 #elif defined(__EMSCRIPTEN__)
     std::string emCanvasSelector_;
     int webglContextHandle_ = 0;

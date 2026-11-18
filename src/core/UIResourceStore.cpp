@@ -15,6 +15,7 @@ std::atomic<UIResourceStore::FontAtlasFactoryFn> gFontFactory{nullptr};
 std::atomic<UIResourceStore::FontAtlasClearFn> gFontClear{nullptr};
 std::atomic<UIResourceStore::ImageAtlasFactoryFn> gImageFactory{nullptr};
 std::atomic<UIResourceStore::ImageAtlasClearFn> gImageClear{nullptr};
+std::atomic<UIResourceStore::ImageAtlasRegisterSlotFn> gImageRegisterSlot{nullptr};
 
 [[nodiscard]] int HexNibble(char c) noexcept {
     if (c >= '0' && c <= '9') return c - '0';
@@ -212,6 +213,11 @@ void UIResourceStore::RegisterImageAtlasHooks(
     gImageClear.store(clearFn, std::memory_order_release);
 }
 
+void UIResourceStore::RegisterImageAtlasSlotHook(
+    ImageAtlasRegisterSlotFn registerSlotFn) noexcept {
+    gImageRegisterSlot.store(registerSlotFn, std::memory_order_release);
+}
+
 void UIResourceStore::EnsureFontsInitialized() const {
     if (fonts_ != nullptr) {
         return;
@@ -311,6 +317,96 @@ const AxbMtsdfPathEntry* UIResourceStore::FindMtsdfPath(std::uint64_t pathHash) 
 void UIResourceStore::ClearMtsdfPaths() noexcept {
     std::lock_guard<std::mutex> lock(mutex_);
     mtsdfEntries_.clear();
+    pathMaskEntries_.clear();
+}
+
+bool UIResourceStore::GetOrRasterizePathMask(
+    std::uint64_t pathHash,
+    std::string_view pathData,
+    const Rect& rawBounds,
+    std::uint32_t innerW,
+    std::uint32_t innerH,
+    std::uint32_t padPx,
+    RasterizedPathMaskEntry& outEntry) {
+    if (pathData.empty()) {
+        return false;
+    }
+    const std::uint64_t safeHash = (pathHash != 0ull) ? pathHash : ComputeSvgPathHash(pathData);
+    const std::uint32_t clampedW = std::clamp<std::uint32_t>(innerW, 1u, 2048u);
+    const std::uint32_t clampedH = std::clamp<std::uint32_t>(innerH, 1u, 2048u);
+    const std::uint32_t clampedPad = std::min<std::uint32_t>(padPx, 64u);
+
+    std::uint64_t key = safeHash ^ 0x9E3779B97F4A7C15ULL;
+    key ^= (static_cast<std::uint64_t>(clampedW) << 32u) | static_cast<std::uint64_t>(clampedH);
+    key *= 1099511628211ULL;
+    key ^= static_cast<std::uint64_t>(clampedPad);
+    key *= 1099511628211ULL;
+
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (const auto it = pathMaskEntries_.find(key); it != pathMaskEntries_.end()) {
+            it->second.lastUsedTick = ++pathMaskAccessSeq_;
+            outEntry = it->second;
+            return true;
+        }
+    }
+
+    std::vector<std::uint8_t> rgba8;
+    if (!RasterizeSvgPathFillAlphaMask(pathData, rawBounds, clampedW, clampedH, clampedPad, rgba8)) {
+        return false;
+    }
+
+    const std::uint32_t texW = clampedW + 2u * clampedPad;
+    const std::uint32_t texH = clampedH + 2u * clampedPad;
+    const ImageAtlasRegisterSlotFn slotFn = gImageRegisterSlot.load(std::memory_order_acquire);
+    if (!slotFn) {
+        return false;
+    }
+    ImageAtlas& atlas = Images();
+
+    std::uint32_t reuseSlotId = 0u;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (const auto it = pathMaskEntries_.find(key); it != pathMaskEntries_.end()) {
+            it->second.lastUsedTick = ++pathMaskAccessSeq_;
+            outEntry = it->second;
+            return true;
+        }
+        if (pathMaskEntries_.size() >= 256u) {
+            auto lru = pathMaskEntries_.begin();
+            for (auto it = pathMaskEntries_.begin(); it != pathMaskEntries_.end(); ++it) {
+                if (it->second.lastUsedTick < lru->second.lastUsedTick) {
+                    lru = it;
+                }
+            }
+            if (lru != pathMaskEntries_.end()) {
+                reuseSlotId = lru->second.textureId;
+                pathMaskEntries_.erase(lru);
+            }
+        }
+    }
+
+    const std::uint32_t texId = slotFn(atlas, reuseSlotId, texW, texH, std::move(rgba8));
+    if (texId == 0u) {
+        return false;
+    }
+
+    RasterizedPathMaskEntry entry{};
+    entry.textureId = texId;
+    entry.texWidth = texW;
+    entry.texHeight = texH;
+    entry.u0 = static_cast<float>(clampedPad) / static_cast<float>(texW);
+    entry.v0 = static_cast<float>(clampedPad) / static_cast<float>(texH);
+    entry.u1 = static_cast<float>(clampedPad + clampedW) / static_cast<float>(texW);
+    entry.v1 = static_cast<float>(clampedPad + clampedH) / static_cast<float>(texH);
+
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        entry.lastUsedTick = ++pathMaskAccessSeq_;
+        pathMaskEntries_.emplace(key, entry);
+    }
+    outEntry = entry;
+    return true;
 }
 
 void UIResourceStore::ClearAll() noexcept {
@@ -328,6 +424,8 @@ void UIResourceStore::ClearAll() noexcept {
     std::lock_guard<std::mutex> lock(mutex_);
     assetSearchDirs_.clear();
     mtsdfEntries_.clear();
+    pathMaskEntries_.clear();
+    pathMaskAccessSeq_ = 0u;
 }
 
 } // namespace aero

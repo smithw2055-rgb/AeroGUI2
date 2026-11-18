@@ -280,12 +280,17 @@ void main() {
         return;
     }
 
-    // 3: TexturedQuad (<Image> sprites & standalone textures on u_ImageAtlas)
+    // 3: TexturedQuad (<Image> sprites & standalone textures/SVG masks on u_ImageAtlas)
     if (v_PrimType == 3u) {
         vec4 texel = texture(u_ImageAtlas, v_UvOrLocalPos);
+        uint pathBrushId = (v_Flags >> 17u) & 0x0FFFu;
+        vec2 approxQuadPx = vec2(1.0) / max(fwidth(v_QuadNormUv), vec2(1e-4));
+        vec4 gradCol = (pathBrushId > 0u) ? sampleAtlasGradientBrush(pathBrushId, v_QuadNormUv, approxQuadPx) : vec4(1.0);
         bool isPremul = (v_Flags & 4u) != 0u;
-        float outA = texel.a * v_Color.a;
-        vec3 rgb = isPremul ? (texel.rgb * v_Color.rgb) : (texel.rgb * v_Color.rgb * outA);
+        float outA = texel.a * v_Color.a * gradCol.a;
+        vec3 rgb = isPremul
+            ? (texel.rgb * v_Color.rgb * gradCol.rgb * gradCol.a)
+            : (texel.rgb * v_Color.rgb * gradCol.rgb * outA);
         o_FragColor = vec4(rgb, outA);
         return;
     }
@@ -667,9 +672,18 @@ fn fs_main(in : VertexOut) -> @location(0) vec4<f32> {
     }
     if (in.primType == 3u) {
         let texel = textureSample(u_ImageTex, u_ImageSampler, in.uvOrLocal);
+        let pathBrushId = (in.flags >> 17u) & 0x0FFFu;
+        var gradCol = vec4<f32>(1.0, 1.0, 1.0, 1.0);
+        if (pathBrushId > 0u) {
+            let approxQuadPx = vec2<f32>(1.0, 1.0) / max(fwidth(in.quadNormUv), vec2<f32>(1e-4, 1e-4));
+            gradCol = sampleAtlasGradientBrush(pathBrushId, in.quadNormUv, approxQuadPx);
+        }
         let isPremul = (in.flags & 4u) != 0u;
-        let outA = texel.a * in.color.a;
-        let rgb = select(texel.rgb * in.color.rgb * outA, texel.rgb * in.color.rgb, isPremul);
+        let outA = texel.a * in.color.a * gradCol.a;
+        let rgb = select(
+            texel.rgb * in.color.rgb * gradCol.rgb * outA,
+            texel.rgb * in.color.rgb * gradCol.rgb * gradCol.a,
+            isPremul);
         return vec4<f32>(rgb, outA);
     }
     if (in.primType == 4u) {

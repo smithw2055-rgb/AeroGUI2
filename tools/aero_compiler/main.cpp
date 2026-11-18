@@ -258,8 +258,7 @@ int main(int argc, char** argv) {
         input.scriptSources.push_back(std::move(sf));
     }
 
-    aero::rs_comp::CompilerSession session;
-    input.compilerSession = &session;
+    input.compilerSession = nullptr;
 
     const aero::AeroCompilerV3 compiler;
     const aero::AeroV3CompileResult result = compiler.Compile(input);

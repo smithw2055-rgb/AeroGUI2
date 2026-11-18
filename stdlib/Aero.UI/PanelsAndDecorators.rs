@@ -56,8 +56,14 @@ public class LayoutScaler : Viewbox {
 public class Panel : FrameworkElement {
     public bool IsItemsHost { get; set; } = false;
 
-    public Panel() : base(VisualKind.Box) {}
+    public Panel() : base(VisualKind.Box) {
+        SyncInteractiveFlags();
+    }
     public override string GetTypeName() { return "Panel"; }
+
+    protected override bool IsSelfHitTestSolid() {
+        return Background != null;
+    }
 
     public void Add(UIElement child) { AddChild(child); }
 

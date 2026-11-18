@@ -1022,6 +1022,16 @@ void TestInteractiveInventory(aero::rs_comp::CompilerSession& session) {
     Require(CountChangedPixels(frame0, frame1) > 0u, "Inventory UI should update visually after equip");
 }
 
+[[nodiscard]] bool TryReadNodeTypeName(
+    aero::AeroAppHost& host,
+    const aero::VisualNode* n,
+    std::string& outTypeName);
+[[nodiscard]] aero::VisualNodeId FindDescendantByTypeName(
+    aero::AeroAppHost& host,
+    aero::VisualNodeId rootId,
+    std::string_view typeName);
+[[nodiscard]] aero::Rect NodeViewportBounds(const aero::VisualNode& node) noexcept;
+
 void TestInteractiveQuestLog(aero::rs_comp::CompilerSession& session) {
     std::cout << "[Interactive] QuestLog...\n";
     aero::AeroV3CompileInput ci;
@@ -1083,6 +1093,212 @@ void TestInteractiveQuestLog(aero::rs_comp::CompilerSession& session) {
     std::vector<std::uint8_t> frame1;
     Require(host.RenderHeadlessRgba(800u, 600u, frame1), "QuestLog post-selection render failed");
     Require(CountChangedPixels(frame0, frame1) > 0u, "QuestLog visuals should change after quest switch");
+
+    // 2. Verify left ScrollBar Thumb/BdMiddle realized geometry and golden pixels
+    const aero::VisualNodeId vBarId = host.FindVisualByOwnerName("PART_VerticalScrollBar");
+    const aero::VisualNodeId trackId = host.FindVisualByOwnerName("PART_Track");
+    const aero::VisualNodeId thumbId = trackId.IsValid()
+        ? FindDescendantByTypeName(host, trackId, "Thumb")
+        : aero::VisualNodeId{};
+    const aero::VisualNodeId bdMidId = host.FindVisualByOwnerName("BdMiddle");
+    Require(vBarId.IsValid() && trackId.IsValid() && thumbId.IsValid() && bdMidId.IsValid(),
+        "QuestLog PART_VerticalScrollBar / PART_Track / Thumb / BdMiddle missing");
+    const aero::VisualNode* vBarNode = host.World().GetNode(vBarId);
+    const aero::VisualNode* thumbNode = host.World().GetNode(thumbId);
+    const aero::VisualNode* bdMidNode = host.World().GetNode(bdMidId);
+    Require(vBarNode && vBarNode->layout.visibility == aero::Visibility::Visible,
+        "QuestLog PART_VerticalScrollBar should be visible");
+    Require(thumbNode && thumbNode->layout.visibility == aero::Visibility::Visible &&
+            thumbNode->layout.layoutRect.height > 40.0f,
+        "QuestLog Thumb should be visible with height > 40 (got " +
+        std::to_string(thumbNode ? thumbNode->layout.layoutRect.height : 0.0f) + ")");
+    Require(bdMidNode && bdMidNode->layout.layoutRect.height > 20.0f,
+        "QuestLog BdMiddle should have height > 20 (got " +
+        std::to_string(bdMidNode ? bdMidNode->layout.layoutRect.height : 0.0f) + ")");
+
+    auto countPixelsInRect = [](
+        const std::vector<std::uint8_t>& rgba,
+        std::uint32_t imgW,
+        std::uint32_t imgH,
+        const aero::Rect& box,
+        auto&& pred) -> int {
+        const int x0 = std::max(0, static_cast<int>(std::floor(box.x)));
+        const int y0 = std::max(0, static_cast<int>(std::floor(box.y)));
+        const int x1 = std::min(static_cast<int>(imgW), static_cast<int>(std::ceil(box.x + box.width)));
+        const int y1 = std::min(static_cast<int>(imgH), static_cast<int>(std::ceil(box.y + box.height)));
+        int count = 0;
+        for (int py = y0; py < y1; ++py) {
+            for (int px = x0; px < x1; ++px) {
+                const std::size_t o = (static_cast<std::size_t>(py) * imgW + static_cast<std::size_t>(px)) * 4u;
+                if (pred(rgba[o], rgba[o + 1u], rgba[o + 2u], rgba[o + 3u])) {
+                    ++count;
+                }
+            }
+        }
+        return count;
+    };
+
+    const aero::Rect thumbVp = NodeViewportBounds(*thumbNode);
+    const int thumbGoldPx = countPixelsInRect(frame0, 800u, 600u, thumbVp,
+        [](std::uint8_t r, std::uint8_t g, std::uint8_t b, std::uint8_t a) {
+            return a > 200u && r > 90u && r > g && g > b;
+        });
+    Require(thumbGoldPx >= 20,
+        "QuestLog ScrollBar Thumb should render visible golden pixels (got " + std::to_string(thumbGoldPx) + ")");
+
+    // 3. Verify PanelHeaderDetails bottom chevron ornament & InnerFrame double-contour corner/edge strokes
+    const aero::VisualNodeId hdrDetailsId = host.FindVisualByOwnerName("PanelHeaderDetails");
+    const aero::VisualNodeId innerFrameId = host.FindVisualByOwnerName("InnerFrame");
+    Require(hdrDetailsId.IsValid() && innerFrameId.IsValid(),
+        "QuestLog PanelHeaderDetails / InnerFrame missing");
+    const aero::VisualNode* hdrNode = host.World().GetNode(hdrDetailsId);
+    const aero::VisualNode* innerFrameNode = host.World().GetNode(innerFrameId);
+    Require(hdrNode && innerFrameNode, "QuestLog PanelHeaderDetails / InnerFrame null");
+    const aero::Rect hdrVp = NodeViewportBounds(*hdrNode);
+    const aero::Rect chevronBox{
+        hdrVp.x + hdrVp.width * 0.5f - 14.0f,
+        hdrVp.y + hdrVp.height - 14.0f,
+        28.0f,
+        16.0f};
+    const int chevronPx = countPixelsInRect(frame0, 800u, 600u, chevronBox,
+        [](std::uint8_t r, std::uint8_t g, std::uint8_t b, std::uint8_t a) {
+            return a > 200u && r >= 100u && static_cast<int>(r) > static_cast<int>(b) + 20;
+        });
+    Require(chevronPx >= 8,
+        "QuestLog header bottom-center chevron ornament missing (px=" + std::to_string(chevronPx) + ")");
+
+    const aero::Rect innerVp = NodeViewportBounds(*innerFrameNode);
+    const aero::Rect cornerBox{innerVp.x, innerVp.y, 26.0f, 26.0f};
+    const aero::Rect topEdgeBox{innerVp.x + 28.0f, innerVp.y, std::max(10.0f, innerVp.width - 56.0f), 8.0f};
+    const int cornerStrokePx = countPixelsInRect(frame0, 800u, 600u, cornerBox,
+        [](std::uint8_t r, std::uint8_t g, std::uint8_t b, std::uint8_t a) {
+            return a > 200u && r > 60u && r > b;
+        });
+    const int topEdgeStrokePx = countPixelsInRect(frame0, 800u, 600u, topEdgeBox,
+        [](std::uint8_t r, std::uint8_t g, std::uint8_t b, std::uint8_t a) {
+            return a > 200u && r > 60u && r > b;
+        });
+    Require(cornerStrokePx >= 25 && topEdgeStrokePx >= 50,
+        "QuestLog InnerFrame corner/edge strokes incomplete (corner=" +
+        std::to_string(cornerStrokePx) + ", topEdge=" + std::to_string(topEdgeStrokePx) + ")");
+
+    // 4. Hover card switch + QuestSelected animation + VisualTransition smooth select/unselect & interruption
+    Require(host.InvokeScriptMethod(host.RootScriptObject(), "SelectQuestByIndex",
+                {aero::UnifiedValue{std::int64_t{0}}}),
+        "QuestLog SelectQuestByIndex(0) failed");
+    for (int f = 0; f < 30; ++f) {
+        host.StepFrame(1.0f / 60.0f, f == 29);
+    }
+
+    auto findNamedDescendant = [&](aero::VisualNodeId rootId, std::string_view name) -> aero::VisualNodeId {
+        std::vector<aero::VisualNodeId> q{rootId};
+        for (std::size_t qi = 0u; qi < q.size(); ++qi) {
+            const aero::VisualNode* n = host.World().GetNode(q[qi]);
+            if (!n) { continue; }
+            if (q[qi] != rootId && n->hasScriptOwner && n->scriptOwner.valid()) {
+                std::string ownerName;
+                if (ReadStringMember(host, n->scriptOwner, "Name", ownerName) && ownerName == name) {
+                    return q[qi];
+                }
+            }
+            for (aero::VisualNodeId cid : n->children) {
+                q.push_back(cid);
+            }
+        }
+        return aero::VisualNodeId{};
+    };
+
+    const aero::VisualNodeId questsId = host.FindVisualByOwnerName("Quests");
+    const aero::VisualNodeId selBorderId = host.FindVisualByOwnerName("SelectedQuestBorder");
+    Require(questsId.IsValid() && selBorderId.IsValid(), "QuestLog Quests / SelectedQuestBorder missing");
+
+    std::vector<aero::VisualNodeId> listItems;
+    {
+        std::vector<aero::VisualNodeId> q{questsId};
+        for (std::size_t qi = 0u; qi < q.size(); ++qi) {
+            const aero::VisualNode* n = host.World().GetNode(q[qi]);
+            if (!n) { continue; }
+            std::string tn;
+            if (q[qi] != questsId && TryReadNodeTypeName(host, n, tn) && tn == "ListBoxItem") {
+                listItems.push_back(q[qi]);
+                continue;
+            }
+            for (aero::VisualNodeId cid : n->children) {
+                q.push_back(cid);
+            }
+        }
+    }
+    Require(listItems.size() >= 8u,
+        "QuestLog Quests should realize ListBoxItem containers (got " + std::to_string(listItems.size()) + ")");
+
+    const aero::VisualNodeId grid0Id = findNamedDescendant(listItems[0], "QuestItemGrid");
+    const aero::VisualNodeId grid1Id = findNamedDescendant(listItems[1], "QuestItemGrid");
+    const aero::VisualNodeId grid2Id = findNamedDescendant(listItems[2], "QuestItemGrid");
+    const aero::VisualNodeId outer0Id = findNamedDescendant(listItems[0], "OuterBorder");
+    const aero::VisualNodeId outer1Id = findNamedDescendant(listItems[1], "OuterBorder");
+    const aero::VisualNodeId outer2Id = findNamedDescendant(listItems[2], "OuterBorder");
+    Require(grid0Id.IsValid() && grid1Id.IsValid() && grid2Id.IsValid() &&
+            outer0Id.IsValid() && outer1Id.IsValid() && outer2Id.IsValid(),
+        "QuestLog ListBoxItem template QuestItemGrid / OuterBorder parts missing");
+
+    const aero::Rect item1Vp = NodeViewportBounds(*host.World().GetNode(listItems[1]));
+    host.InjectPointerMove(item1Vp.x + item1Vp.width * 0.5f, item1Vp.y + item1Vp.height * 0.5f);
+    host.StepFrame(1.0f / 60.0f, true);
+
+    const aero::VisualNode* questsNode = host.World().GetNode(questsId);
+    std::int64_t hoverIdx1 = -1;
+    std::string hoverTitle1;
+    Require(questsNode && ReadIntMember(host, questsNode->scriptOwner, "SelectedIndex", hoverIdx1) && hoverIdx1 == 1,
+        "Hovering ListBoxItem[1] should select index 1 (got " + std::to_string(hoverIdx1) + ")");
+    Require(ReadStringMember(host, vmRef, "SelectedQuest.Title", hoverTitle1) && hoverTitle1 == "Calming the Wake",
+        "Hovering ListBoxItem[1] should switch right card to Calming the Wake (got '" + hoverTitle1 + "')");
+
+    const aero::VisualNode* selBorder = host.World().GetNode(selBorderId);
+    const aero::VisualNode* grid0 = host.World().GetNode(grid0Id);
+    const aero::VisualNode* grid1 = host.World().GetNode(grid1Id);
+    Require(selBorder && (selBorder->layout.opacity < 0.95f || selBorder->transform2D.tx < -1.0f),
+        "Hover selection should trigger QuestSelected animation on SelectedQuestBorder");
+    Require(grid1 && grid1->transform2D.tx > 0.05f && grid1->transform2D.tx < 7.95f,
+        "Hovering ListBoxItem[1] should animate QuestItemGrid.X smoothly via VisualTransition (got " +
+        std::to_string(grid1 ? grid1->transform2D.tx : -1.0f) + ")");
+    Require(grid0 && grid0->transform2D.tx > 0.05f && grid0->transform2D.tx < 7.95f,
+        "Leaving ListBoxItem[0] should cancel selection smoothly via VisualTransition (got " +
+        std::to_string(grid0 ? grid0->transform2D.tx : -1.0f) + ")");
+
+    // Interrupt mid-transition by moving pointer onto ListBoxItem[2]
+    for (int f = 0; f < 2; ++f) {
+        host.StepFrame(1.0f / 60.0f, false);
+    }
+    const aero::Rect item2Vp = NodeViewportBounds(*host.World().GetNode(listItems[2]));
+    host.InjectPointerMove(item2Vp.x + item2Vp.width * 0.5f, item2Vp.y + item2Vp.height * 0.5f);
+    host.StepFrame(1.0f / 60.0f, true);
+
+    questsNode = host.World().GetNode(questsId);
+    std::int64_t hoverIdx2 = -1;
+    std::string hoverTitle2;
+    Require(questsNode && ReadIntMember(host, questsNode->scriptOwner, "SelectedIndex", hoverIdx2) && hoverIdx2 == 2,
+        "Mid-transition hover onto ListBoxItem[2] should select index 2 (got " + std::to_string(hoverIdx2) + ")");
+    Require(ReadStringMember(host, vmRef, "SelectedQuest.Title", hoverTitle2) && hoverTitle2 == "Tomen's Curiosity",
+        "Mid-transition hover onto ListBoxItem[2] should update card title to Tomen's Curiosity");
+
+    for (int f = 0; f < 35; ++f) {
+        host.StepFrame(1.0f / 60.0f, f == 34);
+    }
+    selBorder = host.World().GetNode(selBorderId);
+    grid0 = host.World().GetNode(grid0Id);
+    grid1 = host.World().GetNode(grid1Id);
+    const aero::VisualNode* grid2 = host.World().GetNode(grid2Id);
+    const aero::VisualNode* outer0 = host.World().GetNode(outer0Id);
+    const aero::VisualNode* outer1 = host.World().GetNode(outer1Id);
+    const aero::VisualNode* outer2 = host.World().GetNode(outer2Id);
+    Require(selBorder && selBorder->layout.opacity > 0.99f && std::abs(selBorder->transform2D.tx) < 0.1f,
+        "SelectedQuestBorder should settle cleanly after QuestSelected animation");
+    Require(grid0 && grid0->transform2D.tx < 0.1f && outer0 && outer0->vector.fillRgba == 0xFF53646Bu,
+        "Previously selected ListBoxItem[0] should settle back to Unselected state");
+    Require(grid1 && grid1->transform2D.tx < 0.1f && outer1 && outer1->vector.fillRgba == 0xFF53646Bu,
+        "Interrupted ListBoxItem[1] should settle back to Unselected state");
+    Require(grid2 && grid2->transform2D.tx > 7.9f && outer2 && outer2->vector.fillRgba == 0xFF77ABBDu,
+        "Hovered ListBoxItem[2] should settle cleanly to Selected state");
 }
 
 void TestInteractiveLocalization(aero::rs_comp::CompilerSession& session) {
@@ -1335,6 +1551,416 @@ void TestInteractiveCustomControlAndTheme(aero::rs_comp::CompilerSession& sessio
     }
 }
 
+void CollectVisualNodesByOwnerName(
+    const aero::AeroAppHost& host,
+    std::string_view ownerName,
+    std::vector<aero::VisualNodeId>& outIds) {
+    outIds.clear();
+    const aero::VisualWorld& world = host.World();
+    const std::size_t slots = world.ArenaSlotCount();
+    for (std::size_t s = 0u; s < slots; ++s) {
+        const aero::VisualNode* n = world.NodeAtSlot(s);
+        if (!n || !n->hasScriptOwner || !n->scriptOwner.valid()) {
+            continue;
+        }
+        std::string name;
+        if (ReadStringMember(host, n->scriptOwner, "Name", name) && name == ownerName) {
+            outIds.push_back(n->id);
+        }
+    }
+}
+
+[[nodiscard]] bool TryReadNodeTypeName(
+    aero::AeroAppHost& host,
+    const aero::VisualNode* n,
+    std::string& outTypeName) {
+    if (!n || !n->hasScriptOwner || !n->scriptOwner.valid()) {
+        return false;
+    }
+    aero::UnifiedValue res{};
+    if (!host.InvokeScriptMethod(n->scriptOwner, "GetTypeName", {}, &res)) {
+        return false;
+    }
+    if (const auto* sv = std::get_if<aero::rs_rt::StringValue>(&res)) {
+        outTypeName = sv->str();
+        return true;
+    }
+    if (const auto* ref = std::get_if<aero::rs_rt::ObjectRef>(&res);
+        ref && ref->valid() && ref->kind == aero::rs_rt::ObjectKind::String) {
+        if (const auto opt = host.Domains().stringViewAcrossDomains(*ref)) {
+            outTypeName.assign(opt->data(), opt->size());
+            return true;
+        }
+    }
+    return false;
+}
+
+[[nodiscard]] aero::VisualNodeId FindDescendantByTypeName(
+    aero::AeroAppHost& host,
+    aero::VisualNodeId rootId,
+    std::string_view typeName) {
+    const aero::VisualWorld& world = host.World();
+    std::vector<aero::VisualNodeId> q{rootId};
+    for (std::size_t i = 0u; i < q.size(); ++i) {
+        const aero::VisualNode* n = world.GetNode(q[i]);
+        if (!n) { continue; }
+        std::string tn;
+        if (q[i] != rootId && TryReadNodeTypeName(host, n, tn) && tn == typeName) {
+            return q[i];
+        }
+        for (aero::VisualNodeId cid : n->children) {
+            q.push_back(cid);
+        }
+    }
+    return aero::VisualNodeId{};
+}
+
+[[nodiscard]] aero::Rect NodeViewportBounds(const aero::VisualNode& node) noexcept {
+    aero::Rect r = node.layout.layoutRect;
+    if (node.layout.hasPerspective3D) {
+        return node.layout.worldMatrix3D.TransformRectBounds(r);
+    }
+    if (!node.layout.worldTransform.IsIdentity()) {
+        return node.layout.worldTransform.TransformRectBounds(r);
+    }
+    return r;
+}
+
+void TestInteractiveScoreboard(aero::rs_comp::CompilerSession&) {
+    std::cout << "[Interactive] Scoreboard...\n";
+    aero::AeroV3CompileInput ci;
+    aero::AeroAppHostConfig hc;
+    Require(BuildDiscoveredSample(fs::path(AERO_SAMPLES_DIR) / "Scoreboard", nullptr, ci, hc, 1280u, 800u),
+        "Scoreboard discover failed");
+    aero::AeroAppHost host(hc);
+    std::string err;
+    Require(host.CompileAndLoad(ci, &err), "Scoreboard load failed: " + err);
+    for (int f = 0; f < 10; ++f) {
+        host.StepFrame(1.0f / 60.0f, f == 9);
+    }
+
+    // 1. Scrollbar thumb position (starts at top, moves down on drag) and hover brightness (#FF3E4146 -> #FF5D6064)
+    aero::VisualNodeId trackId = host.FindVisualByOwnerName("PART_Track");
+    aero::VisualNodeId thumbId = host.FindVisualByOwnerName("Thumb");
+    Require(trackId.IsValid() && thumbId.IsValid(), "Scoreboard PART_Track / Thumb missing");
+    const aero::VisualNode* trackNode = host.World().GetNode(trackId);
+    const aero::VisualNode* thumbNode = host.World().GetNode(thumbId);
+    Require(trackNode && thumbNode, "Scoreboard track/thumb nodes null");
+    Require(thumbNode->layout.visibility == aero::Visibility::Visible, "Scoreboard Thumb should be visible");
+
+    const aero::Rect trackVp = NodeViewportBounds(*trackNode);
+    const aero::Rect thumbVp0 = NodeViewportBounds(*thumbNode);
+    Require(std::abs(thumbVp0.y - trackVp.y) < 4.0f,
+        "Scoreboard vertical Thumb should start at top of PART_Track (trackY=" +
+        std::to_string(trackVp.y) + ", thumbY=" + std::to_string(thumbVp0.y) + ")");
+
+    const aero::VisualNodeId thumbBorderId = FindDescendantByTypeName(host, thumbId, "Border");
+    Require(thumbBorderId.IsValid(), "Scoreboard Thumb template Border missing");
+    const aero::VisualNode* thumbBorderNode = host.World().GetNode(thumbBorderId);
+    Require(thumbBorderNode && thumbBorderNode->box.bgRgba == 0xFF46413Eu,
+        "Scoreboard Thumb initial color should be #FF3E4146 (0xFF46413E), got 0x" +
+        std::to_string(thumbBorderNode ? thumbBorderNode->box.bgRgba : 0u));
+
+    const float thumbCx = thumbVp0.x + thumbVp0.width * 0.5f;
+    const float thumbCy = thumbVp0.y + thumbVp0.height * 0.5f;
+    host.InjectPointerMove(thumbCx, thumbCy);
+    host.StepFrame(1.0f / 60.0f, true);
+    thumbBorderNode = host.World().GetNode(thumbBorderId);
+    Require(thumbBorderNode && thumbBorderNode->box.bgRgba == 0xFF64605Du,
+        "Scoreboard Thumb hover color should be #FF5D6064 (0xFF64605D), got 0x" +
+        std::to_string(thumbBorderNode ? thumbBorderNode->box.bgRgba : 0u));
+
+    // Drag thumb downward and verify normal -> hover -> pressed/dragging -> hover -> normal states
+    host.InjectPointerButton(thumbCx, thumbCy, aero::PointerButton::Left, true);
+    host.StepFrame(1.0f / 60.0f, true);
+    thumbBorderNode = host.World().GetNode(thumbBorderId);
+    Require(thumbBorderNode && thumbBorderNode->box.bgRgba == 0xFF756F6Au,
+        "Scoreboard Thumb dragging color should be #FF6A6F75 (0xFF756F6A)");
+
+    host.InjectPointerMove(thumbCx, thumbCy + 30.0f);
+    host.StepFrame(1.0f / 60.0f, true);
+    host.InjectPointerButton(thumbCx, thumbCy + 30.0f, aero::PointerButton::Left, false);
+    host.StepFrame(1.0f / 60.0f, true);
+    thumbBorderNode = host.World().GetNode(thumbBorderId);
+    Require(thumbBorderNode && thumbBorderNode->box.bgRgba == 0xFF64605Du,
+        "Scoreboard Thumb should return to hover color #FF5D6064 (0xFF64605D) after drag release while hovered");
+
+    thumbNode = host.World().GetNode(thumbId);
+    const aero::Rect thumbVpAfterDrag = thumbNode ? NodeViewportBounds(*thumbNode) : aero::Rect{};
+    Require(thumbVpAfterDrag.y > thumbVp0.y + 4.0f,
+        "Scoreboard dragging Thumb down should move Thumb downward (before=" +
+        std::to_string(thumbVp0.y) + ", after=" + std::to_string(thumbVpAfterDrag.y) + ")");
+
+    // Reset hover & scroll back to top
+    host.InjectPointerMove(5.0f, 5.0f);
+    host.StepFrame(1.0f / 60.0f, true);
+    thumbBorderNode = host.World().GetNode(thumbBorderId);
+    {
+        bool thOver = false, thDrag = false;
+        (void)ReadBoolMember(host, thumbNode->scriptOwner, "IsMouseOver", thOver);
+        (void)ReadBoolMember(host, thumbNode->scriptOwner, "IsDragging", thDrag);
+        Require(thumbBorderNode && thumbBorderNode->box.bgRgba == 0xFF46413Eu,
+            "Scoreboard Thumb color should revert to #FF3E4146 when mouse leaves (got 0x" +
+            ([&]() {
+                std::ostringstream hx;
+                hx << std::hex << std::uppercase << (thumbBorderNode ? thumbBorderNode->box.bgRgba : 0u);
+                return hx.str();
+            })() +
+            ", IsMouseOver=" + std::to_string(thOver) + ", IsDragging=" + std::to_string(thDrag) + ")");
+    }
+    float psx = 0.0f, psy = 0.0f;
+    Require(RequireNodeCenter(host, "PlayersScroll", psx, psy), "Scoreboard PlayersScroll missing");
+    host.InjectMouseWheel(psx, psy, 0.0f, 5.0f);
+    host.StepFrame(1.0f / 60.0f, true);
+
+    // 2. VisibleTeam ComboBox hover, click -> PART_Popup opens inside viewport -> click Alliance filters list
+    float cbCx = 0.0f, cbCy = 0.0f;
+    aero::VisualNodeId comboId{};
+    Require(RequireNodeCenter(host, "VisibleTeam", cbCx, cbCy, &comboId), "Scoreboard VisibleTeam missing");
+    aero::VisualNodeId dropBtnId = host.FindVisualByOwnerName("DropDownButton");
+    Require(dropBtnId.IsValid(), "Scoreboard DropDownButton missing");
+    aero::VisualNodeId dropBorderId = FindDescendantByTypeName(host, dropBtnId, "Border");
+    Require(dropBorderId.IsValid(), "Scoreboard DropDownButton Border missing");
+    const aero::VisualNode* dropBorderNode = host.World().GetNode(dropBorderId);
+    Require(dropBorderNode && dropBorderNode->box.bgRgba == 0xFF46413Eu,
+        "Scoreboard ComboBox initial DropDownButton color should be #FF3E4146");
+
+    host.InjectPointerMove(cbCx, cbCy);
+    host.StepFrame(1.0f / 60.0f, true);
+    dropBorderNode = host.World().GetNode(dropBorderId);
+    Require(dropBorderNode && dropBorderNode->box.bgRgba == 0xFF64605Du,
+        "Scoreboard ComboBox DropDownButton should highlight on hover (#FF5D6064)");
+
+    // Click ComboBox to open PART_Popup
+    host.InjectPointerButton(cbCx, cbCy, aero::PointerButton::Left, true);
+    host.InjectPointerButton(cbCx, cbCy, aero::PointerButton::Left, false);
+    for (int f = 0; f < 3; ++f) {
+        host.StepFrame(1.0f / 60.0f, true);
+    }
+
+    aero::VisualNodeId popupId = host.FindVisualByOwnerName("PART_Popup");
+    aero::VisualNodeId popupBorderId = host.FindVisualByOwnerName("DropDownBorder");
+    Require(popupId.IsValid() && popupBorderId.IsValid(), "Scoreboard PART_Popup / DropDownBorder missing");
+    const aero::VisualNode* popupNode = host.World().GetNode(popupId);
+    const aero::VisualNode* popupBorderNode = host.World().GetNode(popupBorderId);
+    Require(popupNode && popupNode->layout.visibility == aero::Visibility::Visible,
+        "Scoreboard PART_Popup should be visible after clicking VisibleTeam");
+    Require(popupBorderNode && popupBorderNode->layout.visibility == aero::Visibility::Visible,
+        "Scoreboard DropDownBorder should be visible");
+
+    const aero::Rect popVp = NodeViewportBounds(*popupBorderNode);
+    Require(popVp.width > 80.0f && popVp.height > 40.0f &&
+            popVp.x >= 0.0f && popVp.y >= 0.0f &&
+            popVp.x + popVp.width <= 1280.5f && popVp.y + popVp.height <= 800.5f,
+        "Scoreboard PART_Popup should fit inside 1280x800 viewport (got " +
+        std::to_string(popVp.x) + "," + std::to_string(popVp.y) + " " +
+        std::to_string(popVp.width) + "x" + std::to_string(popVp.height) + ")");
+
+    // Locate ComboBoxItem nodes (Overall=0, Alliance=1, Horde=2)
+    std::vector<aero::VisualNodeId> cbItems;
+    {
+        std::vector<aero::VisualNodeId> q{popupId};
+        for (std::size_t i = 0u; i < q.size(); ++i) {
+            const aero::VisualNode* n = host.World().GetNode(q[i]);
+            if (!n) { continue; }
+            std::string tn;
+            if (TryReadNodeTypeName(host, n, tn) && tn == "ComboBoxItem") {
+                cbItems.push_back(q[i]);
+            }
+            for (aero::VisualNodeId cid : n->children) {
+                q.push_back(cid);
+            }
+        }
+    }
+    Require(cbItems.size() == 3u, "Scoreboard VisibleTeam should realize 3 ComboBoxItem entries, got " +
+        std::to_string(cbItems.size()));
+
+    if (cbItems.size() == 3u) {
+        const aero::Rect allianceVp = NodeViewportBounds(*host.World().GetNode(cbItems[1]));
+        const float ax = allianceVp.x + allianceVp.width * 0.5f;
+        const float ay = allianceVp.y + allianceVp.height * 0.5f;
+        host.InjectClick(ax, ay);
+        for (int f = 0; f < 5; ++f) {
+            host.StepFrame(1.0f / 60.0f, true);
+        }
+
+        popupNode = host.World().GetNode(popupId);
+        Require(popupNode && popupNode->layout.visibility == aero::Visibility::Collapsed,
+            "Scoreboard PART_Popup should close after selecting ComboBoxItem");
+        dropBorderNode = host.World().GetNode(dropBorderId);
+        Require(dropBorderNode && dropBorderNode->box.bgRgba == 0xFF46413Eu,
+            "Scoreboard DropDownButton should revert to normal color #FF3E4146 (0xFF46413E) when popup closes off-hover");
+
+        std::vector<aero::VisualNodeId> rows;
+        CollectVisualNodesByOwnerName(host, "PlayerRow", rows);
+        int visibleRows = 0, collapsedRows = 0;
+        for (aero::VisualNodeId rid : rows) {
+            const aero::VisualNode* rn = host.World().GetNode(rid);
+            if (!rn) { continue; }
+            if (rn->layout.visibility == aero::Visibility::Visible) { ++visibleRows; }
+            else if (rn->layout.visibility == aero::Visibility::Collapsed) { ++collapsedRows; }
+        }
+        Require(visibleRows == 5 && collapsedRows == 5,
+            "Selecting Alliance should show 5 Alliance rows and collapse 5 Horde rows (visible=" +
+            std::to_string(visibleRows) + ", collapsed=" + std::to_string(collapsedRows) + ")");
+
+        // Switch back to Overall
+        host.InjectPointerButton(cbCx, cbCy, aero::PointerButton::Left, true);
+        host.InjectPointerButton(cbCx, cbCy, aero::PointerButton::Left, false);
+        for (int f = 0; f < 3; ++f) {
+            host.StepFrame(1.0f / 60.0f, true);
+        }
+        const aero::Rect overallVp = NodeViewportBounds(*host.World().GetNode(cbItems[0]));
+        host.InjectClick(overallVp.x + overallVp.width * 0.5f, overallVp.y + overallVp.height * 0.5f);
+        for (int f = 0; f < 5; ++f) {
+            host.StepFrame(1.0f / 60.0f, true);
+        }
+        visibleRows = 0;
+        for (aero::VisualNodeId rid : rows) {
+            const aero::VisualNode* rn = host.World().GetNode(rid);
+            if (rn && rn->layout.visibility == aero::Visibility::Visible) { ++visibleRows; }
+        }
+        Require(visibleRows == 10, "Selecting Overall should restore all 10 PlayerRows");
+    }
+
+    // 3. PlayerRow hover animations (OverOn / OverOff)
+    host.InjectPointerMove(5.0f, 5.0f);
+    host.StepFrame(1.0f / 60.0f, true);
+
+    std::vector<aero::VisualNodeId> rows, overs, icons, statsList;
+    CollectVisualNodesByOwnerName(host, "PlayerRow", rows);
+    CollectVisualNodesByOwnerName(host, "Over", overs);
+    CollectVisualNodesByOwnerName(host, "ClassIcon", icons);
+    CollectVisualNodesByOwnerName(host, "PlayerStats", statsList);
+    Require(rows.size() == 10u && overs.size() == 10u && icons.size() == 10u && statsList.size() == 10u,
+        "Scoreboard should have 10 PlayerRow/Over/ClassIcon/PlayerStats nodes");
+
+    const aero::VisualNode* over0 = host.World().GetNode(overs[0]);
+    const aero::VisualNode* icon0 = host.World().GetNode(icons[0]);
+    const aero::VisualNode* stats0 = host.World().GetNode(statsList[0]);
+    Require(over0 && icon0 && stats0, "PlayerRow[0] child nodes null");
+    Require(over0->box.bgOpacity < 0.05f && icon0->layout.opacity == 1.0f && icon0->effect.opacity == 0.0f,
+        "PlayerRow[0] rest state should keep Over bgOpacity=0, ClassIcon opacity=1, glow effect opacity=0");
+
+    const aero::Rect row0Vp = NodeViewportBounds(*host.World().GetNode(rows[0]));
+    host.InjectPointerMove(row0Vp.x + row0Vp.width * 0.5f, row0Vp.y + row0Vp.height * 0.5f);
+    host.StepFrame(0.06f, true);
+
+    over0 = host.World().GetNode(overs[0]);
+    icon0 = host.World().GetNode(icons[0]);
+    stats0 = host.World().GetNode(statsList[0]);
+    Require(over0->box.bgOpacity > 0.4f,
+        "PlayerRow[0] hover OverOn should animate Over.bgOpacity -> 0.5 (got " +
+        std::to_string(over0->box.bgOpacity) + ")");
+    Require(icon0->transform2D.sx > 1.05f && icon0->transform2D.sy > 1.05f,
+        "PlayerRow[0] hover OverOn should scale ClassIcon -> 1.1 (got sx=" +
+        std::to_string(icon0->transform2D.sx) + ")");
+    Require(icon0->effect.opacity > 0.3f && icon0->layout.opacity == 1.0f,
+        "PlayerRow[0] hover OverOn should animate ClassIcon glow EffectOpacity -> 0.4 without hiding ClassIcon (eff=" +
+        std::to_string(icon0->effect.opacity) + ", op=" + std::to_string(icon0->layout.opacity) + ")");
+    Require(stats0->transform2D.tx > 1.5f,
+        "PlayerRow[0] hover OverOn should nudge PlayerStats.X -> 2 (got " +
+        std::to_string(stats0->transform2D.tx) + ")");
+
+    // Move away -> OverOff
+    host.InjectPointerMove(5.0f, 5.0f);
+    host.StepFrame(0.12f, true);
+
+    over0 = host.World().GetNode(overs[0]);
+    icon0 = host.World().GetNode(icons[0]);
+    stats0 = host.World().GetNode(statsList[0]);
+    Require(over0->box.bgOpacity < 0.05f,
+        "PlayerRow[0] leave OverOff should animate Over.bgOpacity -> 0 (got " +
+        std::to_string(over0->box.bgOpacity) + ")");
+    Require(icon0->transform2D.sx < 1.02f && icon0->effect.opacity < 0.05f && icon0->layout.opacity == 1.0f,
+        "PlayerRow[0] leave OverOff should restore ClassIcon scale/glow without hiding it");
+    Require(stats0->transform2D.tx < 0.2f,
+        "PlayerRow[0] leave OverOff should restore PlayerStats.X -> 0");
+
+    // 4. Multi-resolution resize + team switch regression check (ListMask.Opacity & visible player list pixels)
+    const aero::VisualNodeId listMaskId = host.FindVisualByOwnerName("ListMask");
+    const aero::VisualNodeId playersScrollId = host.FindVisualByOwnerName("PlayersScroll");
+    Require(listMaskId.IsValid() && playersScrollId.IsValid(), "Scoreboard ListMask / PlayersScroll missing");
+
+    auto countBrightListPixels = [&](const std::vector<std::uint8_t>& rgba,
+                                     std::uint32_t w,
+                                     std::uint32_t h,
+                                     const aero::Rect& vp) -> int {
+        const int x0 = std::max(0, static_cast<int>(std::floor(vp.x)));
+        const int y0 = std::max(0, static_cast<int>(std::floor(vp.y)));
+        const int x1 = std::min(static_cast<int>(w), static_cast<int>(std::ceil(vp.x + vp.width)));
+        const int y1 = std::min(static_cast<int>(h), static_cast<int>(std::ceil(vp.y + vp.height)));
+        int bright = 0;
+        for (int py = y0; py < y1; ++py) {
+            for (int px = x0; px < x1; ++px) {
+                const std::size_t o = (static_cast<std::size_t>(py) * w + static_cast<std::size_t>(px)) * 4u;
+                const std::uint8_t mx = std::max(rgba[o], std::max(rgba[o + 1u], rgba[o + 2u]));
+                if (rgba[o + 3u] > 200u && mx > 150u) {
+                    ++bright;
+                }
+            }
+        }
+        return bright;
+    };
+
+    const std::array<std::pair<std::uint32_t, std::uint32_t>, 5> kResizeSteps{{
+        {800u, 480u},
+        {640u, 400u},
+        {1920u, 1200u},
+        {960u, 540u},
+        {1280u, 800u},
+    }};
+    for (const auto& [rw, rh] : kResizeSteps) {
+        host.InjectResize(rw, rh);
+        host.StepFrame(1.0f / 60.0f, true);
+        std::vector<std::uint8_t> resizedRgba;
+        Require(host.RenderHeadlessRgba(rw, rh, resizedRgba),
+            "Scoreboard RenderHeadlessRgba failed after resize to " + std::to_string(rw) + "x" + std::to_string(rh));
+
+        const aero::VisualNode* lmNode = host.World().GetNode(listMaskId);
+        const aero::VisualNode* psNode = host.World().GetNode(playersScrollId);
+        Require(lmNode && lmNode->layout.opacity > 0.99f,
+            "Scoreboard ListMask.Opacity should remain 1.0 after resize (got " +
+            std::to_string(lmNode ? lmNode->layout.opacity : -1.0f) + ")");
+        const aero::Rect psVp = psNode ? NodeViewportBounds(*psNode) : aero::Rect{};
+        Require(psVp.width > 100.0f && psVp.height > 60.0f,
+            "Scoreboard PlayersScroll viewport bounds collapsed after resize " +
+            std::to_string(rw) + "x" + std::to_string(rh));
+        const int brightPx = countBrightListPixels(resizedRgba, rw, rh, psVp);
+        Require(brightPx >= 50,
+            "Scoreboard player list content disappeared after resize " +
+            std::to_string(rw) + "x" + std::to_string(rh) + " (brightPx=" + std::to_string(brightPx) + ")");
+    }
+
+    // Shrink to 640x400 and switch VisibleTeam to verify VisibleTeamChanged does not fade out ListMask
+    host.InjectResize(640u, 400u);
+    host.StepFrame(1.0f / 60.0f, true);
+    if (RequireNodeCenter(host, "VisibleTeam", cbCx, cbCy)) {
+        host.InjectPointerButton(cbCx, cbCy, aero::PointerButton::Left, true);
+        host.InjectPointerButton(cbCx, cbCy, aero::PointerButton::Left, false);
+        for (int f = 0; f < 3; ++f) {
+            host.StepFrame(1.0f / 60.0f, true);
+        }
+        if (cbItems.size() == 3u) {
+            const aero::Rect allianceVp = NodeViewportBounds(*host.World().GetNode(cbItems[1]));
+            host.InjectClick(allianceVp.x + allianceVp.width * 0.5f, allianceVp.y + allianceVp.height * 0.5f);
+            for (int f = 0; f < 30; ++f) {
+                host.StepFrame(1.0f / 60.0f, f == 29);
+            }
+            std::vector<std::uint8_t> smallTeamRgba;
+            Require(host.RenderHeadlessRgba(640u, 400u, smallTeamRgba), "Scoreboard 640x400 team render failed");
+            const aero::VisualNode* lmNode = host.World().GetNode(listMaskId);
+            const aero::VisualNode* psNode = host.World().GetNode(playersScrollId);
+            Require(lmNode && lmNode->layout.opacity > 0.99f,
+                "Scoreboard ListMask.Opacity clobbered during VisibleTeamChanged (got " +
+                std::to_string(lmNode ? lmNode->layout.opacity : -1.0f) + ")");
+            const int brightPx = psNode ? countBrightListPixels(smallTeamRgba, 640u, 400u, NodeViewportBounds(*psNode)) : 0;
+            Require(brightPx >= 50,
+                "Scoreboard player rows missing at 640x400 after team switch (brightPx=" + std::to_string(brightPx) + ")");
+        }
+    }
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -1356,6 +1982,7 @@ int main(int argc, char** argv) {
     if (want("questlog")) { TestInteractiveQuestLog(sharedSession); }
     if (want("localization")) { TestInteractiveLocalization(sharedSession); }
     if (want("wpf")) { TestInteractiveWpfQuickStart(sharedSession); }
+    if (want("scoreboard")) { TestInteractiveScoreboard(sharedSession); }
 
     if (want("interactive")) {
         TestInteractiveButtons(sharedSession);
@@ -1367,6 +1994,7 @@ int main(int argc, char** argv) {
         TestInteractiveUserControl(sharedSession);
         TestInteractiveWpfQuickStart(sharedSession);
         TestInteractiveCustomControlAndTheme(sharedSession);
+        TestInteractiveScoreboard(sharedSession);
     }
 
     if (gFailureCount != 0) {

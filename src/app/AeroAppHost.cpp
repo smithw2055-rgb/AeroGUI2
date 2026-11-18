@@ -8,6 +8,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <future>
 #include <sstream>
 #include <unordered_set>
 
@@ -968,6 +969,22 @@ bool AeroAppHost::InitializeRuntime() {
         return false;
     }
 
+    if (!config_.headless && windowHost_.Mode() != NativeWindowMode::HeadlessSoftware) {
+        config_.viewportWidth = std::max<std::uint32_t>(1u, windowHost_.LogicalWidth());
+        config_.viewportHeight = std::max<std::uint32_t>(1u, windowHost_.LogicalHeight());
+        desktopHost_.SetDpiScale(windowHost_.DpiScale());
+        desktopHost_.SetViewportSize(Size{
+            static_cast<float>(windowHost_.Width()),
+            static_cast<float>(windowHost_.Height())});
+        renderTree_.SetRootDpiScale(windowHost_.DpiScale());
+    } else {
+        desktopHost_.SetDpiScale(1.0f);
+        desktopHost_.SetViewportSize(Size{
+            static_cast<float>(std::max<std::uint32_t>(1u, config_.viewportWidth)),
+            static_cast<float>(std::max<std::uint32_t>(1u, config_.viewportHeight))});
+        renderTree_.SetRootDpiScale(1.0f);
+    }
+
     initialized_ = true;
     return true;
 }
@@ -1177,6 +1194,7 @@ bool AeroAppHost::CompileAndLoad(
     const AeroV3CompileInput& input,
     std::string* outError) {
     AeroV3CompileInput effective = input;
+    effective.skipRawBytecodeOutput = true;
     if (config_.optimizeBytecode && !effective.optimizeBytecode) {
         effective.optimizeBytecode = true;
     }
@@ -1186,11 +1204,33 @@ bool AeroAppHost::CompileAndLoad(
     for (const auto& dir : effective.resourceSearchPaths) {
         RegisterAssetDirectoryInternal(dir);
     }
-    const AeroCompilerV3 compiler;
-    auto compiled = std::make_unique<AeroV3CompileResult>(compiler.Compile(effective));
+    std::unique_ptr<AeroV3CompileResult> compiled;
+    bool didInitHere = false;
+    if (!initialized_) {
+        auto compileFut = std::async(std::launch::async, [effective]() {
+            const AeroCompilerV3 compiler;
+            return std::make_unique<AeroV3CompileResult>(compiler.Compile(effective));
+        });
+        const bool initOk = InitializeRuntime();
+        didInitHere = initOk;
+        compiled = compileFut.get();
+        if (!initOk) {
+            lastCompileResult_ = std::move(compiled);
+            if (outError) {
+                *outError = lastError_;
+            }
+            return false;
+        }
+    } else {
+        const AeroCompilerV3 compiler;
+        compiled = std::make_unique<AeroV3CompileResult>(compiler.Compile(effective));
+    }
     lastCompileResult_ = std::move(compiled);
 
     if (!lastCompileResult_->succeeded || !lastCompileResult_->programImage) {
+        if (didInitHere) {
+            Shutdown();
+        }
         std::string msg = "AeroCompilerV3 compilation failed";
         for (const auto& d : lastCompileResult_->diagnostics) {
             msg.append("\n  ");
@@ -1948,8 +1988,6 @@ bool AeroAppHost::MountScriptRootObject(ObjectRef candidate) {
         }
     }
 
-    logTrace("MountScriptRootObject: flushing bindings");
-    FlushBindings();
     logTrace("MountScriptRootObject: done");
     desktopHost_.NotifyDirtyLayout();
     return true;
@@ -2277,13 +2315,26 @@ void AeroAppHost::StepFrame(float dtSeconds, bool forceRenderSync) {
     }
 
     // 7. Depth-bucket layout pass (measure/arrange/3D world transforms)
-    const float vpW = static_cast<float>(std::max<std::uint32_t>(1u, config_.viewportWidth));
-    const float vpH = static_cast<float>(std::max<std::uint32_t>(1u, config_.viewportHeight));
+    const bool hasLiveWindow = !config_.headless && windowHost_.IsInitialized() &&
+        windowHost_.Mode() != NativeWindowMode::HeadlessSoftware &&
+        windowHost_.Width() > 0u && windowHost_.Height() > 0u;
+    float vpW = static_cast<float>(std::max<std::uint32_t>(1u, config_.viewportWidth));
+    float vpH = static_cast<float>(std::max<std::uint32_t>(1u, config_.viewportHeight));
+    if (hasLiveWindow) {
+        const float dpi = std::max(0.25f, windowHost_.DpiScale());
+        vpW = static_cast<float>(windowHost_.Width()) / dpi;
+        vpH = static_cast<float>(windowHost_.Height()) / dpi;
+    }
     const Size targetViewport{vpW, vpH};
     const bool viewportChanged = (world_.LastLayoutViewport() != targetViewport);
-    if (forceRenderSync || viewportChanged || world_.HasAnyDirty()) {
+    const bool hadDirtyBeforeLayout = world_.HasAnyDirty();
+    if (forceRenderSync || viewportChanged || hadDirtyBeforeLayout) {
         logTrace("UpdateLayout");
         world_.UpdateLayout(vpW, vpH);
+        FlushBindings();
+        if (world_.FlushTrackB() > 0u || world_.HasAnyDirty()) {
+            world_.UpdateLayout(vpW, vpH);
+        }
     }
 
     // 8. Retained CanvasDraw (CustomDrawElement) invalidation pass
@@ -2291,19 +2342,34 @@ void AeroAppHost::StepFrame(float dtSeconds, bool forceRenderSync) {
     const bool drawUpdated = DispatchPendingCanvasDraws();
 
     // 9. PagedRenderTree sync + GPU/Software frame presentation
-    const bool needSync = forceRenderSync || drawUpdated || world_.HasAnyDirty() ||
+    const bool needSync = forceRenderSync || drawUpdated || viewportChanged || hadDirtyBeforeLayout ||
+                          world_.HasAnyDirty() ||
                           (renderTree_.NodeCount() == 0u && world_.Root().IsValid());
+    const bool willTickWindowHost = windowHost_.IsInitialized() &&
+        (needSync || forceRenderSync || !desktopHost_.CanSleepIdle());
     if (needSync) {
-        logTrace("TickUi RenderRecord");
-        desktopHost_.SetViewportSize(targetViewport);
+        if (hasLiveWindow) {
+            const float dpi = std::max(0.25f, windowHost_.DpiScale());
+            desktopHost_.SetDpiScale(dpi);
+            desktopHost_.SetViewportSize(Size{
+                static_cast<float>(windowHost_.Width()),
+                static_cast<float>(windowHost_.Height())});
+            renderTree_.SetRootDpiScale(dpi);
+        } else {
+            desktopHost_.SetDpiScale(1.0f);
+            desktopHost_.SetViewportSize(targetViewport);
+            renderTree_.SetRootDpiScale(1.0f);
+        }
         desktopHost_.NotifyDirtyLayout();
-        desktopHost_.TickUi(0.0f, UiPhase_RenderRecord);
+        if (!willTickWindowHost) {
+            logTrace("TickUi RenderRecord");
+            desktopHost_.TickUi(0.0f, UiPhase_RenderRecord);
+        }
     } else {
         desktopHost_.SetStateFlags(animEngine_.HasActiveAnimations(), false, false, false);
     }
 
-    if (windowHost_.IsInitialized() &&
-        (needSync || forceRenderSync || !desktopHost_.CanSleepIdle())) {
+    if (willTickWindowHost) {
         logTrace("TickAndPresentFrame");
         (void)windowHost_.TickAndPresentFrame(0.0f, forceRenderSync || needSync);
     }
@@ -2332,7 +2398,11 @@ bool AeroAppHost::RenderHeadlessRgba(
     if (config_.viewportWidth != width || config_.viewportHeight != height) {
         InjectResize(width, height);
     }
-    StepFrame(0.0f, true);
+    const bool mustForce = (renderTree_.NodeCount() == 0u) ||
+        (windowHost_.IsInitialized() && windowHost_.Telemetry().framesRendered == 0u) ||
+        (windowHost_.IsInitialized() &&
+         (windowHost_.Width() != width || windowHost_.Height() != height));
+    StepFrame(0.0f, mustForce);
 
     std::uint32_t capW = 0u;
     std::uint32_t capH = 0u;
@@ -2393,9 +2463,42 @@ bool AeroAppHost::SaveScreenshotPpm(
     std::string_view filePath,
     std::uint32_t width,
     std::uint32_t height) {
+    const bool hasLiveWindow = !config_.headless && windowHost_.IsInitialized() &&
+        windowHost_.Mode() != NativeWindowMode::HeadlessSoftware &&
+        windowHost_.Width() > 0u && windowHost_.Height() > 0u;
+    std::vector<std::uint8_t> rgba;
+    if (width == 0u && height == 0u && hasLiveWindow) {
+        std::uint32_t capW = 0u;
+        std::uint32_t capH = 0u;
+        if (windowHost_.CaptureFramebufferRgba8(rgba, capW, capH) &&
+            capW > 0u && capH > 0u &&
+            rgba.size() == static_cast<std::size_t>(capW) * static_cast<std::size_t>(capH) * 4u) {
+            return WritePpmP6(filePath, capW, capH, rgba.data());
+        }
+        if (RenderHeadlessRgba(windowHost_.Width(), windowHost_.Height(), rgba)) {
+            return WritePpmP6(filePath, windowHost_.Width(), windowHost_.Height(), rgba.data());
+        }
+        return false;
+    }
     const std::uint32_t targetW = width > 0u ? width : std::max<std::uint32_t>(1u, config_.viewportWidth);
     const std::uint32_t targetH = height > 0u ? height : std::max<std::uint32_t>(1u, config_.viewportHeight);
-    std::vector<std::uint8_t> rgba;
+    const Size targetSize{static_cast<float>(targetW), static_cast<float>(targetH)};
+    if (hasLiveWindow &&
+        world_.Root().IsValid() &&
+        (windowHost_.Width() != targetW || windowHost_.Height() != targetH)) {
+        const Size prevLayoutVp = world_.LastLayoutViewport();
+        if (prevLayoutVp != targetSize) {
+            world_.UpdateLayout(targetSize.width, targetSize.height);
+        }
+        PagedRenderTree tempTree;
+        VisualRenderAdapter adapter;
+        (void)adapter.BuildPagedRenderTree(world_, &drawBuffer_, tempTree, resourceStore_.get());
+        ZeroCopyGpuStream::RasterizeTreeToRgba8(tempTree, targetW, targetH, rgba, config_.clearColor);
+        if (prevLayoutVp.width > 0.0f && prevLayoutVp.height > 0.0f && prevLayoutVp != targetSize) {
+            world_.UpdateLayout(prevLayoutVp.width, prevLayoutVp.height);
+        }
+        return WritePpmP6(filePath, targetW, targetH, rgba.data());
+    }
     if (!RenderHeadlessRgba(targetW, targetH, rgba)) {
         return false;
     }
@@ -2481,7 +2584,14 @@ std::uint64_t AeroAppHost::RunWindowedLoop(std::uint64_t maxFrames) {
     if (!initialized_ && !InitializeRuntime()) {
         return 0u;
     }
-    StepFrame(0.0f, true);
+    const Size expectedVp{
+        static_cast<float>(std::max<std::uint32_t>(1u, config_.viewportWidth)),
+        static_cast<float>(std::max<std::uint32_t>(1u, config_.viewportHeight))};
+    if (!world_.Root().IsValid() || renderTree_.NodeCount() == 0u ||
+        world_.HasAnyDirty() || world_.LastLayoutViewport() != expectedVp ||
+        windowHost_.Telemetry().framesRendered == 0u) {
+        StepFrame(0.0f, true);
+    }
 
     std::uint64_t frames = 0u;
     while (!windowHost_.ShouldClose()) {
@@ -2492,6 +2602,7 @@ std::uint64_t AeroAppHost::RunWindowedLoop(std::uint64_t maxFrames) {
         const std::int32_t waitMs = idleAllowed
             ? (maxFrames > 0u ? 0 : -1)
             : 16;
+        const std::uint64_t prevOsEvents = windowHost_.Telemetry().osEventsTranslated;
         if (!windowHost_.PumpEventsAndRender(0.016f, waitMs)) {
             break;
         }
@@ -2521,7 +2632,12 @@ std::uint64_t AeroAppHost::RunWindowedLoop(std::uint64_t maxFrames) {
         if (world_.FlushTrackB() > 0u) {
             followUpDirty = true;
         }
-        FlushBindings();
+        if (followUpDirty ||
+            (windowHost_.Telemetry().osEventsTranslated != prevOsEvents) ||
+            world_.HasAnyDirty() ||
+            animEngine_.HasActiveAnimations()) {
+            FlushBindings();
+        }
         if (world_.HasAnyDirty()) {
             followUpDirty = true;
         }

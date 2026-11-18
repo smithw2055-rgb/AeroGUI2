@@ -16,6 +16,17 @@ namespace aero {
 class FontAtlas;
 class ImageAtlas;
 
+struct RasterizedPathMaskEntry {
+    std::uint32_t textureId = 0u;
+    std::uint32_t texWidth = 0u;
+    std::uint32_t texHeight = 0u;
+    float u0 = 0.0f;
+    float v0 = 0.0f;
+    float u1 = 1.0f;
+    float v1 = 1.0f;
+    std::uint64_t lastUsedTick = 0u;
+};
+
 /// Explicit per-view resource store owning FontAtlas, ImageAtlas,
 /// GradientBrushRegistry, MTSDF path cache, and asset search directories.
 /// Zero thread_local global state: pass explicit UIResourceStore& / pointers
@@ -26,6 +37,12 @@ public:
     using FontAtlasClearFn = void (*)(FontAtlas& atlas) noexcept;
     using ImageAtlasFactoryFn = std::shared_ptr<ImageAtlas> (*)();
     using ImageAtlasClearFn = void (*)(ImageAtlas& atlas) noexcept;
+    using ImageAtlasRegisterSlotFn = std::uint32_t (*)(
+        ImageAtlas& atlas,
+        std::uint32_t reuseSlotId,
+        std::uint32_t width,
+        std::uint32_t height,
+        std::vector<std::uint8_t>&& rgbaPixels);
 
     static constexpr std::uint16_t kDefaultFontAtlasSize = 1024u;
 
@@ -46,6 +63,8 @@ public:
     static void RegisterImageAtlasHooks(
         ImageAtlasFactoryFn factoryFn,
         ImageAtlasClearFn clearFn) noexcept;
+    static void RegisterImageAtlasSlotHook(
+        ImageAtlasRegisterSlotFn registerSlotFn) noexcept;
 
     [[nodiscard]] FontAtlas& Fonts();
     [[nodiscard]] const FontAtlas& Fonts() const;
@@ -70,6 +89,15 @@ public:
     [[nodiscard]] const AxbMtsdfPathEntry* FindMtsdfPath(std::uint64_t pathHash) const noexcept;
     void ClearMtsdfPaths() noexcept;
 
+    [[nodiscard]] bool GetOrRasterizePathMask(
+        std::uint64_t pathHash,
+        std::string_view pathData,
+        const Rect& rawBounds,
+        std::uint32_t innerW,
+        std::uint32_t innerH,
+        std::uint32_t padPx,
+        RasterizedPathMaskEntry& outEntry);
+
     void ClearAll() noexcept;
 
 private:
@@ -84,6 +112,8 @@ private:
     mutable std::mutex mutex_;
     std::vector<std::string> assetSearchDirs_;
     std::unordered_map<std::uint64_t, AxbMtsdfPathEntry> mtsdfEntries_;
+    std::unordered_map<std::uint64_t, RasterizedPathMaskEntry> pathMaskEntries_;
+    std::uint64_t pathMaskAccessSeq_ = 0u;
 };
 
 } // namespace aero

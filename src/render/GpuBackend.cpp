@@ -810,6 +810,10 @@ void BuildStaticQuadIndexBuffer(
     }
 }
 
+[[nodiscard]] Rect ScaleRectByDpi(const Rect& r, float dpiScale) noexcept {
+    return Rect{r.x * dpiScale, r.y * dpiScale, r.width * dpiScale, r.height * dpiScale};
+}
+
 GlScissorBox ComputeGlScissorBox(
     const Rect& clipRectTopLeft,
     std::uint32_t viewportWidth,
@@ -2147,6 +2151,13 @@ GpuBackendFrameStats OpenGlDeviceBackend::ExecuteSubmission(
     // 3. Synchronize Unit 0 (1024x1024 Glyph/MTSDF/Gradient UI Atlas) & Unit 1 (ImageAtlas sprites/standalone slots)
     SyncUnifiedUiAtlas(tree);
 
+    const float dpiScale = std::clamp(
+        (std::isfinite(tree.RootDpiScale()) && tree.RootDpiScale() > 0.0f) ? tree.RootDpiScale() : 1.0f,
+        0.25f,
+        8.0f);
+    const float logicalVpW = std::max(1.0f, static_cast<float>(viewportWidth) / dpiScale);
+    const float logicalVpH = std::max(1.0f, static_cast<float>(viewportHeight) / dpiScale);
+
     gl_.Viewport(0, 0, static_cast<AeroGLsizei>(viewportWidth), static_cast<AeroGLsizei>(viewportHeight));
     gl_.Disable(kGlDepthTest);
     gl_.Disable(kGlCullFace);
@@ -2159,10 +2170,7 @@ GpuBackendFrameStats OpenGlDeviceBackend::ExecuteSubmission(
 
     gl_.UseProgram(programId_);
     if (uViewportSizeLoc_ >= 0) {
-        gl_.Uniform2f(
-            uViewportSizeLoc_,
-            static_cast<float>(viewportWidth),
-            static_cast<float>(viewportHeight));
+        gl_.Uniform2f(uViewportSizeLoc_, logicalVpW, logicalVpH);
     }
     if (uQuadHalfExtentLoc_ >= 0) {
         gl_.Uniform2f(uQuadHalfExtentLoc_, 0.0f, 0.0f);
@@ -2239,7 +2247,7 @@ GpuBackendFrameStats OpenGlDeviceBackend::ExecuteSubmission(
                     scissorCurrentlyEnabled = true;
                 }
                 const GlScissorBox sc = ComputeGlScissorBox(
-                    batch.scissorRect,
+                    ScaleRectByDpi(batch.scissorRect, dpiScale),
                     viewportWidth,
                     viewportHeight);
                 gl_.Scissor(sc.x, sc.y, sc.width, sc.height);
@@ -2301,7 +2309,7 @@ GpuBackendFrameStats OpenGlDeviceBackend::ExecuteSubmission(
                     scissorCurrentlyEnabled = true;
                 }
                 const GlScissorBox sc = ComputeGlScissorBox(
-                    Rect{hdr.clipX, hdr.clipY, hdr.clipW, hdr.clipH},
+                    ScaleRectByDpi(Rect{hdr.clipX, hdr.clipY, hdr.clipW, hdr.clipH}, dpiScale),
                     viewportWidth,
                     viewportHeight);
                 gl_.Scissor(sc.x, sc.y, sc.width, sc.height);
@@ -2378,7 +2386,12 @@ GpuBackendFrameStats OpenGlDeviceBackend::ExecuteSubmission(
             gl_.BindBuffer(kGlElementArrayBuffer, quadEboId_);
         };
 
-        auto drawPremulEffectPatch = [&](int patchX, int patchY, int patchW, int patchH, const std::uint8_t* premulRgba8) {
+        auto drawPremulEffectPatch = [&](int patchX,
+                                         int patchY,
+                                         int patchW,
+                                         int patchH,
+                                         const std::uint8_t* premulRgba8,
+                                         bool coordsArePhysical) {
             if (patchW <= 0 || patchH <= 0 || !premulRgba8 || !EnsureQuadIndexCapacity(1u)) {
                 return;
             }
@@ -2446,10 +2459,11 @@ GpuBackendFrameStats OpenGlDeviceBackend::ExecuteSubmission(
                 scissorCurrentlyEnabled = false;
             }
 
-            const float x0 = static_cast<float>(patchX);
-            const float y0 = static_cast<float>(patchY);
-            const float x1 = static_cast<float>(patchX + patchW);
-            const float y1 = static_cast<float>(patchY + patchH);
+            const float coordScale = coordsArePhysical ? (1.0f / dpiScale) : 1.0f;
+            const float x0 = static_cast<float>(patchX) * coordScale;
+            const float y0 = static_cast<float>(patchY) * coordScale;
+            const float x1 = static_cast<float>(patchX + patchW) * coordScale;
+            const float y1 = static_cast<float>(patchY + patchH) * coordScale;
             const auto prim = static_cast<std::uint16_t>(AeroPrimType::TexturedQuad);
             const AeroVertex quadVerts[4]{
                 {x0, y0, 0.0f, 0.0f, 0xFFFFFFFFu, prim, AeroVertexFlag_PremultipliedAlpha},
@@ -2496,15 +2510,16 @@ GpuBackendFrameStats OpenGlDeviceBackend::ExecuteSubmission(
                     tree, span.firstNodeId, span.endNodeId, uMinX, uMinY, uMaxX, uMaxY)) {
                 return true;
             }
-            const int padPx = aero::render::detail::ComputeSpanPaddingPx(span);
+            const int logicalPadPx = aero::render::detail::ComputeSpanPaddingPx(span);
+            const int padPx = static_cast<int>(std::ceil(static_cast<float>(logicalPadPx) * dpiScale));
             const int bx0 = std::clamp(
-                aero::render::detail::SafeFloorToInt(uMinX, -padPx, vpW + padPx) - padPx, 0, vpW);
+                aero::render::detail::SafeFloorToInt(uMinX * dpiScale, -padPx, vpW + padPx) - padPx, 0, vpW);
             const int by0 = std::clamp(
-                aero::render::detail::SafeFloorToInt(uMinY, -padPx, vpH + padPx) - padPx, 0, vpH);
+                aero::render::detail::SafeFloorToInt(uMinY * dpiScale, -padPx, vpH + padPx) - padPx, 0, vpH);
             const int bx1 = std::clamp(
-                aero::render::detail::SafeCeilToInt(uMaxX, -padPx, vpW + padPx) + padPx, 0, vpW);
+                aero::render::detail::SafeCeilToInt(uMaxX * dpiScale, -padPx, vpW + padPx) + padPx, 0, vpW);
             const int by1 = std::clamp(
-                aero::render::detail::SafeCeilToInt(uMaxY, -padPx, vpH + padPx) + padPx, 0, vpH);
+                aero::render::detail::SafeCeilToInt(uMaxY * dpiScale, -padPx, vpH + padPx) + padPx, 0, vpH);
             if (bx1 <= bx0 || by1 <= by0) {
                 return true;
             }
@@ -2580,7 +2595,8 @@ GpuBackendFrameStats OpenGlDeviceBackend::ExecuteSubmission(
                         gl_.Enable(kGlScissorTest);
                         scissorCurrentlyEnabled = true;
                     }
-                    const GlScissorBox sc = ComputeGlScissorBox(span.clipRect, viewportWidth, viewportHeight);
+                    const GlScissorBox sc = ComputeGlScissorBox(
+                        ScaleRectByDpi(span.clipRect, dpiScale), viewportWidth, viewportHeight);
                     gl_.Scissor(sc.x, sc.y, sc.width, sc.height);
                 } else if (scissorCurrentlyEnabled) {
                     gl_.Disable(kGlScissorTest);
@@ -2643,8 +2659,8 @@ GpuBackendFrameStats OpenGlDeviceBackend::ExecuteSubmission(
                     gl_.Clear(kGlColorBufferBit);
                     gl_.Disable(kGlScissorTest);
                     scissorCurrentlyEnabled = false;
-                    issueEffectPass(effectFboIds_[1], 1, effectFboTexIds_[0], invW, 0.0f, span.radiusPx, 1.0f, 0xFFFFFFFFu, false, false);
-                    issueEffectPass(0u, 1, effectFboTexIds_[1], 0.0f, invH, span.radiusPx, 1.0f, opacityColor, true, true);
+                    issueEffectPass(effectFboIds_[1], 1, effectFboTexIds_[0], invW, 0.0f, span.radiusPx * dpiScale, 1.0f, 0xFFFFFFFFu, false, false);
+                    issueEffectPass(0u, 1, effectFboTexIds_[1], 0.0f, invH, span.radiusPx * dpiScale, 1.0f, opacityColor, true, true);
                     break;
                 }
                 case UIEffectKind::DirectionalBlur:
@@ -2654,14 +2670,14 @@ GpuBackendFrameStats OpenGlDeviceBackend::ExecuteSubmission(
                         effectFboTexIds_[0],
                         std::cos(angRad) * invW,
                         std::sin(angRad) * invH,
-                        span.radiusPx,
+                        span.radiusPx * dpiScale,
                         1.0f,
                         opacityColor,
                         true,
                         true);
                     break;
                 case UIEffectKind::Pixelate:
-                    issueEffectPass(0u, 3, effectFboTexIds_[0], invW, invH, span.radiusPx, 1.0f, opacityColor, true, true);
+                    issueEffectPass(0u, 3, effectFboTexIds_[0], invW, invH, span.radiusPx * dpiScale, 1.0f, opacityColor, true, true);
                     break;
                 case UIEffectKind::Tint: {
                     const float tintStrength = std::clamp(
@@ -2717,13 +2733,17 @@ GpuBackendFrameStats OpenGlDeviceBackend::ExecuteSubmission(
             if (!gl_.ReadPixels || !aero::render::detail::SpanNeedsEffectPass(span)) {
                 return;
             }
-            const Rect mr = span.maskDestRect;
+            BlurLayerSpan physSpan = span;
+            physSpan.maskDestRect = ScaleRectByDpi(span.maskDestRect, dpiScale);
+            physSpan.clipRect = ScaleRectByDpi(span.clipRect, dpiScale);
+            physSpan.radiusPx = span.radiusPx * dpiScale;
+            const Rect mr = physSpan.maskDestRect;
             if (!std::isfinite(mr.x) || !std::isfinite(mr.y) ||
                 !std::isfinite(mr.width) || !std::isfinite(mr.height) ||
                 mr.width <= 1.0f || mr.height <= 1.0f) {
                 return;
             }
-            const int boxR = aero::render::detail::ComputeSpanBoxRadius(span);
+            const int boxR = aero::render::detail::ComputeSpanBoxRadius(physSpan);
             const int padPx = (boxR > 0) ? (boxR * 3 + 2) : 0;
             const int bx0 = std::clamp(static_cast<int>(std::floor(mr.x)) - padPx, 0, vpW);
             const int by0 = std::clamp(static_cast<int>(std::floor(mr.y)) - padPx, 0, vpH);
@@ -2764,7 +2784,7 @@ GpuBackendFrameStats OpenGlDeviceBackend::ExecuteSubmission(
 
             int patchX = 0, patchY = 0, patchW = 0, patchH = 0;
             if (ZeroCopyGpuStream::ComputeBackdropBlurPatchPremulRgba8(
-                    span,
+                    physSpan,
                     viewportWidth,
                     viewportHeight,
                     bx0,
@@ -2778,7 +2798,7 @@ GpuBackendFrameStats OpenGlDeviceBackend::ExecuteSubmission(
                     patchH,
                     effectPatchScratch_,
                     tree.ResourceStore())) {
-                drawPremulEffectPatch(patchX, patchY, patchW, patchH, effectPatchScratch_.data());
+                drawPremulEffectPatch(patchX, patchY, patchW, patchH, effectPatchScratch_.data(), true);
             }
         };
 
@@ -2812,19 +2832,21 @@ GpuBackendFrameStats OpenGlDeviceBackend::ExecuteSubmission(
                 }
 
                 if (!executeBlurSpanViaFbo(span, blurCursor)) {
+                    const auto logVpW = static_cast<std::uint32_t>(std::max(1.0f, std::round(logicalVpW)));
+                    const auto logVpH = static_cast<std::uint32_t>(std::max(1.0f, std::round(logicalVpH)));
                     int patchX = 0, patchY = 0, patchW = 0, patchH = 0;
                     if (ZeroCopyGpuStream::RasterizeBlurSpanPatchPremulRgba8(
                             tree,
                             span,
                             blurCursor,
-                            viewportWidth,
-                            viewportHeight,
+                            logVpW,
+                            logVpH,
                             patchX,
                             patchY,
                             patchW,
                             patchH,
                             effectPatchScratch_)) {
-                        drawPremulEffectPatch(patchX, patchY, patchW, patchH, effectPatchScratch_.data());
+                        drawPremulEffectPatch(patchX, patchY, patchW, patchH, effectPatchScratch_.data(), false);
                     }
                 }
                 while (blurCursor < blurSpans.size() &&

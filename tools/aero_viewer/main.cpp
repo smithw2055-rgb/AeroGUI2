@@ -332,10 +332,6 @@ int main(int argc, char** argv) {
     }
 
     aero::AeroAppHost host(hostCfg);
-    if (!host.InitializeRuntime()) {
-        std::cerr << "Host runtime init failed: " << host.LastError() << "\n";
-        return 1;
-    }
 
     std::string compileErr;
     if (!host.CompileAndLoad(compileInput, &compileErr)) {
@@ -346,7 +342,7 @@ int main(int argc, char** argv) {
     if (headless) {
         const std::uint64_t stepCount = framesSet ? std::max<std::uint64_t>(1u, frames) : 1u;
         for (std::uint64_t f = 0u; f < stepCount; ++f) {
-            host.StepFrame(1.0f / 60.0f, (f + 1u) == stepCount);
+            host.StepFrame(1.0f / 60.0f, false);
         }
 
         std::vector<std::uint8_t> rgba;
@@ -373,7 +369,7 @@ int main(int argc, char** argv) {
 
     const std::uint64_t rendered = host.RunWindowedLoop(framesSet ? frames : 0u);
     if (!outPpmPath.empty()) {
-        if (!host.SaveScreenshotPpm(outPpmPath, width, height)) {
+        if (!host.SaveScreenshotPpm(outPpmPath, 0u, 0u)) {
             std::cerr << "Failed to write PPM screenshot: " << outPpmPath << "\n";
             return 1;
         }

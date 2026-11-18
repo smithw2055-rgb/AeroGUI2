@@ -35,7 +35,7 @@ public class ItemsPresenter : FrameworkElement {
             _itemsPanel = fn();
         }
         if (_itemsPanel == null) {
-            var sp = new StackPanel(Orientation.Vertical, 2.0f);
+            var sp = new StackPanel(Orientation.Vertical, 0.0f);
             sp.HorizontalAlignment = HorizontalAlignment.Stretch;
             _itemsPanel = sp;
         }
@@ -63,9 +63,23 @@ public class ItemsPresenter : FrameworkElement {
 
 public class ItemsPanelTemplate : DependencyObject {
     private Func<Panel> _factory;
+    public ResourceDictionary AmbientResources { get; set; }
     public ItemsPanelTemplate() {}
     public ItemsPanelTemplate(Func<Panel> factory) { _factory = factory; }
-    public Func<Panel> GetFactory() { return _factory; }
+    public Panel CreatePanelScoped() {
+        if (_factory == null) { return null; }
+        ResourceDictionary.PushAmbient(AmbientResources);
+        var fn = _factory;
+        Panel p = fn();
+        if (p != null && AmbientResources != null && p.AmbientResources == null) { p.AmbientResources = AmbientResources; }
+        ResourceDictionary.PopAmbient(AmbientResources);
+        return p;
+    }
+    public Func<Panel> GetFactory() {
+        if (_factory == null || AmbientResources == null) { return _factory; }
+        ItemsPanelTemplate self = this;
+        return () => { return self.CreatePanelScoped(); };
+    }
     public Func<Panel> Factory {
         get { return _factory; }
         set { _factory = value; }
@@ -181,7 +195,7 @@ public class ItemsControl : Control {
     public int IndexOfItemBox(DependencyObject box) {
         int n = ItemCount();
         for (int i = 0; i < n; i += 1) {
-            if (GetItemBoxAt(i) == box) { return i; }
+            if (ItemsControl.SameItemBox(GetItemBoxAt(i), box)) { return i; }
         }
         return -1;
     }
@@ -280,7 +294,7 @@ public class ItemsControl : Control {
         else if (container is ContentPresenter) { (container as ContentPresenter).SetContentAndTemplate(null, null); }
     }
 
-    private static bool SameItemBox(DependencyObject a, DependencyObject b) {
+    internal static bool SameItemBox(DependencyObject a, DependencyObject b) {
         if (a == b) { return true; }
         if (a == null || b == null) { return false; }
         if (a is BoxedString && b is BoxedString) {
@@ -440,8 +454,10 @@ public class ItemsControl : Control {
 
         _activeContainers = nextContainers;
         _activeBoxes = nextBoxes;
+        OnContainersRebuilt();
     }
 
+    protected virtual void OnContainersRebuilt() {}
     protected virtual void PrepareOwnContainer(UIElement container, int index) {}
 
     private static ItemsPresenter FindFirstItemsPresenter(UIElement rootNode, UIElement owner) {
@@ -453,8 +469,15 @@ public class ItemsControl : Control {
             UIElement node = q[idx];
             idx += 1;
             if (node == null) { continue; }
-            if (node.TemplatedParent != null && node.TemplatedParent != owner) { continue; }
+            if (node != rootNode && node is ItemsControl) { continue; }
             if (node is ItemsPresenter) { return node as ItemsPresenter; }
+            if (node != rootNode && node is Control) {
+                Control subCtrl = node as Control;
+                subCtrl.ApplyStyleInternal();
+                if (subCtrl.TemplateRoot() == null) {
+                    subCtrl.ApplyTemplate();
+                }
+            }
             for (int i = 0; i < node.ChildCount(); i += 1) {
                 q.Push(node.ChildAt(i));
             }
@@ -498,6 +521,11 @@ public class ItemsControl : Control {
         if (propName == "AlternationCount") { AlternationCount = DependencyObject.UnboxInt(value, 0); return true; }
         return base.SetPropertyValue(propName, value);
     }
+
+    public override DependencyObject GetPropertyValue(string propName) {
+        if (propName == "HasItems") { return DependencyObject.BoxBool(ItemCount() > 0); }
+        return base.GetPropertyValue(propName);
+    }
 }
 
 // ============================================================================
@@ -535,7 +563,12 @@ public class SelectableItem : ContentControl {
         get { return _isSelected; }
         set {
             if (_isSelected == value) { return; }
+            if (_ownerSelector != null) {
+                _ownerSelector.NotifyContainerSelected(this, value);
+                return;
+            }
             _isSelected = value;
+            UpdateTriggersAndStates();
             UpdateSelectionVisual();
             if (_isSelected) { Selected(this, new RoutedEventArgs("Selected", this)); }
             else { Unselected(this, new RoutedEventArgs("Unselected", this)); }
@@ -545,15 +578,33 @@ public class SelectableItem : ContentControl {
     internal void SetSelectedSilent(bool sel) {
         if (_isSelected == sel) { return; }
         _isSelected = sel;
+        UpdateTriggersAndStates();
         UpdateSelectionVisual();
+        if (_isSelected) { Selected(this, new RoutedEventArgs("Selected", this)); }
+        else { Unselected(this, new RoutedEventArgs("Unselected", this)); }
+    }
+
+    protected override void UpdateVisualStates(bool useTransitions) {
+        base.UpdateVisualStates(useTransitions);
+        if (_isSelected) {
+            bool focused = IsFocused || (_ownerSelector != null && _ownerSelector.IsFocused);
+            if (!focused && VisualStateManager.HasState(this, "SelectedUnfocused")) {
+                VisualStateManager.GoToState(this, "SelectedUnfocused", useTransitions);
+            } else {
+                VisualStateManager.GoToState(this, "Selected", useTransitions);
+            }
+        } else {
+            VisualStateManager.GoToState(this, "Unselected", useTransitions);
+        }
     }
 
     protected override void OnVisualStatePropertyChanged() {
+        base.OnVisualStatePropertyChanged();
         UpdateSelectionVisual();
     }
 
     protected virtual void UpdateSelectionVisual() {
-        if (Style != null) { return; }
+        if (Style != null || Template != null) { return; }
         if (_isSelected) {
             Background = new SolidColorBrush(ParseUtil.PackArgb(255u, 37u, 99u, 235u));
             Foreground = Brushes.White();
@@ -577,6 +628,15 @@ public class SelectableItem : ContentControl {
             e.Handled = true;
         }
     }
+
+    public override bool SetPropertyValue(string propName, DependencyObject value) {
+        if (propName == "IsSelected") { IsSelected = DependencyObject.UnboxBool(value, false); return true; }
+        return base.SetPropertyValue(propName, value);
+    }
+    public override DependencyObject GetPropertyValue(string propName) {
+        if (propName == "IsSelected") { return DependencyObject.BoxBool(_isSelected); }
+        return base.GetPropertyValue(propName);
+    }
 }
 
 public class ListBoxItem : SelectableItem {
@@ -596,6 +656,7 @@ public class ListViewItem : SelectableItem {
 
 public class Selector : ItemsControl {
     private int _selectedIndex = -1;
+    private int _pendingSelectedIndex = -1;
     private DependencyObject _selectedItemBox;
     private SelectionMode _selectionMode = SelectionMode.Single;
     private int[] _selectedIndices;
@@ -652,14 +713,59 @@ public class Selector : ItemsControl {
 
     protected virtual void OnSelectionChanged(int oldIdx, int newIdx, DependencyObject oldBox, DependencyObject newBox) {
         SyncContainerSelectionStates();
+        NotifyStateInvalidatedHooks();
         SelectionChanged(this, new SelectionChangedEventArgs(this, newIdx, oldBox, newBox));
         BindingEngine.NotifyTargetPropertyChanged(this, "SelectedIndex", DependencyObject.BoxInt(newIdx));
         BindingEngine.NotifyTargetPropertyChanged(this, "SelectedItem", newBox);
     }
 
+    internal void NotifyContainerSelected(SelectableItem item, bool selected) {
+        if (item == null) { return; }
+        int idx = item.ItemIndex;
+        if (idx < 0 || idx >= ItemCount()) {
+            idx = IndexOfContainer(item);
+        }
+        if (idx < 0 || idx >= ItemCount()) {
+            item.SetSelectedSilent(selected);
+            return;
+        }
+        if (selected) {
+            SetSelectedIndexInternal(idx, _selectionMode == SelectionMode.Single);
+            if (_selectionMode != SelectionMode.Single && _selectedIndices.IndexOf(idx) < 0) {
+                _selectedIndices.Push(idx);
+                SyncContainerSelectionStates();
+            }
+        } else {
+            if (_selectionMode == SelectionMode.Single) {
+                if (_selectedIndex == idx) {
+                    SetSelectedIndexInternal(-1, true);
+                } else {
+                    item.SetSelectedSilent(false);
+                }
+            } else {
+                int pos = _selectedIndices.IndexOf(idx);
+                if (pos >= 0) {
+                    _selectedIndices.RemoveAt(pos);
+                }
+                if (_selectedIndex == idx) {
+                    int nextIdx = _selectedIndices.Length > 0 ? _selectedIndices[_selectedIndices.Length - 1] : -1;
+                    SetSelectedIndexInternal(nextIdx, false);
+                } else {
+                    SyncContainerSelectionStates();
+                    item.SetSelectedSilent(false);
+                }
+            }
+        }
+    }
+
     protected void SetSelectedIndexInternal(int newIdx, bool replaceMultiSet) {
         int count = ItemCount();
+        if (count == 0 && newIdx >= 0) {
+            _pendingSelectedIndex = newIdx;
+            return;
+        }
         int clamped = (newIdx >= 0 && newIdx < count) ? newIdx : -1;
+        if (clamped >= 0) { _pendingSelectedIndex = -1; }
         int oldIdx = _selectedIndex;
         DependencyObject oldBox = _selectedItemBox;
         DependencyObject newBox = clamped >= 0 ? GetItemBoxAt(clamped) : null;
@@ -668,11 +774,31 @@ public class Selector : ItemsControl {
             _selectedIndices.Clear();
             if (clamped >= 0) { _selectedIndices.Push(clamped); }
         }
-        if (oldIdx == clamped && oldBox == newBox && !replaceMultiSet) { return; }
+        if (oldIdx == clamped && ItemsControl.SameItemBox(oldBox, newBox)) { return; }
         _selectedIndex = clamped;
         _selectedItemBox = newBox;
         if (clamped >= 0) { _anchorIndex = clamped; }
         OnSelectionChanged(oldIdx, clamped, oldBox, newBox);
+    }
+
+    protected void TryApplyPendingSelection() {
+        int total = ItemCount();
+        if (total <= 0) { return; }
+        if (_selectedIndex < 0) {
+            if (_pendingSelectedIndex >= 0 && _pendingSelectedIndex < total) {
+                int pend = _pendingSelectedIndex;
+                _pendingSelectedIndex = -1;
+                SetSelectedIndexInternal(pend, true);
+                return;
+            }
+            if (_selectedItemBox != null) {
+                int idx = IndexOfItemBox(_selectedItemBox);
+                if (idx >= 0) {
+                    SetSelectedIndexInternal(idx, true);
+                    return;
+                }
+            }
+        }
     }
 
     public virtual void NotifyItemClicked(SelectableItem item, int index, int modifiers) {
@@ -748,8 +874,14 @@ public class Selector : ItemsControl {
         }
     }
 
+    protected override void OnContainersRebuilt() {
+        TryApplyPendingSelection();
+        SyncContainerSelectionStates();
+    }
+
     protected override void OnItemsCollectionChanged() {
         base.OnItemsCollectionChanged();
+        TryApplyPendingSelection();
         if (_selectedIndex >= ItemCount()) {
             SetSelectedIndexInternal(-1, true);
         } else {
@@ -1030,6 +1162,7 @@ public class ComboBox : Selector {
     private ContentPresenter _selectionDisplay;
     private Path _arrowIcon;
     private Popup _dropdownPopup;
+    private ToggleButton _dropDownToggle;
 
     public event EventHandler DropDownOpened;
     public event EventHandler DropDownClosed;
@@ -1058,9 +1191,14 @@ public class ComboBox : Selector {
         set {
             if (_isDropDownOpen == value) { return; }
             _isDropDownOpen = value;
+            if (_dropDownToggle != null && _dropDownToggle.IsChecked != _isDropDownOpen) {
+                _dropDownToggle.IsChecked = _isDropDownOpen;
+            }
             if (_dropdownPopup != null) {
                 _dropdownPopup.IsOpen = _isDropDownOpen;
             }
+            BindingEngine.NotifyTargetPropertyChanged(this, "IsDropDownOpen", DependencyObject.BoxBool(_isDropDownOpen));
+            UpdateTriggersAndStates();
             if (_isDropDownOpen) { DropDownOpened(this, EventArgs.Empty()); }
             else { DropDownClosed(this, EventArgs.Empty()); }
         }
@@ -1096,12 +1234,78 @@ public class ComboBox : Selector {
         return new ComboBoxItem();
     }
 
+    private static ContentPresenter FindSelectionBoxPresenter(UIElement rootNode) {
+        if (rootNode == null) { return null; }
+        var q = new UIElement[0];
+        q.Push(rootNode);
+        int idx = 0;
+        while (idx < q.Length) {
+            UIElement node = q[idx];
+            idx += 1;
+            if (node == null) { continue; }
+            if (node is ContentPresenter) {
+                ContentPresenter cp = node as ContentPresenter;
+                if (cp.ContentSource == "SelectionBoxItem") { return cp; }
+            }
+            for (int i = 0; i < node.ChildCount(); i += 1) {
+                q.Push(node.ChildAt(i));
+            }
+        }
+        return null;
+    }
+
+    private static ToggleButton FindDescendantToggleButton(UIElement rootNode) {
+        if (rootNode == null) { return null; }
+        var q = new UIElement[0];
+        q.Push(rootNode);
+        int idx = 0;
+        while (idx < q.Length) {
+            UIElement node = q[idx];
+            idx += 1;
+            if (node == null) { continue; }
+            if (node is ToggleButton) { return node as ToggleButton; }
+            if (node is Popup) { continue; }
+            for (int i = 0; i < node.ChildCount(); i += 1) {
+                q.Push(node.ChildAt(i));
+            }
+        }
+        return null;
+    }
+
+    private void NotifyPopupClosedInternal() {
+        _isDropDownOpen = false;
+        if (_dropDownToggle != null && _dropDownToggle.IsChecked) {
+            _dropDownToggle.IsChecked = false;
+        }
+        BindingEngine.NotifyTargetPropertyChanged(this, "IsDropDownOpen", DependencyObject.BoxBool(false));
+        UpdateTriggersAndStates();
+        DropDownClosed(this, EventArgs.Empty());
+    }
+
     public override void OnApplyTemplate() {
         base.OnApplyTemplate();
-        if (_selectionDisplay == null) {
+        if (Template != null) {
+            _selectionDisplay = null;
+            _dropdownPopup = null;
+            _dropDownToggle = null;
             UIElement site = GetTemplateChild("ContentSite");
             if (!(site is ContentPresenter)) { site = GetTemplateChild("PART_SelectionBox"); }
             if (site is ContentPresenter) { _selectionDisplay = site as ContentPresenter; }
+            else { _selectionDisplay = FindSelectionBoxPresenter(TemplateRoot()); }
+            UIElement tog = GetTemplateChild("DropDownButton");
+            if (!(tog is ToggleButton)) { tog = GetTemplateChild("PART_ToggleButton"); }
+            if (tog is ToggleButton) { _dropDownToggle = tog as ToggleButton; }
+            else { _dropDownToggle = FindDescendantToggleButton(TemplateRoot()); }
+            if (_dropDownToggle != null && _dropDownToggle.IsChecked != _isDropDownOpen) {
+                _dropDownToggle.IsChecked = _isDropDownOpen;
+            }
+            UIElement pop = GetTemplateChild("PART_Popup");
+            if (pop is Popup) {
+                _dropdownPopup = pop as Popup;
+                _dropdownPopup.PlacementTarget = this;
+                _dropdownPopup.IsOpen = _isDropDownOpen;
+                _dropdownPopup.Closed += (object s, EventArgs e) => { NotifyPopupClosedInternal(); };
+            }
         }
         SyncSelectedPreview();
     }
@@ -1119,6 +1323,23 @@ public class ComboBox : Selector {
     public override void RefreshItems() {
         base.RefreshItems();
         SyncSelectedPreview();
+        UpdateTriggersAndStates();
+    }
+
+    public override bool SetPropertyValue(string propName, DependencyObject value) {
+        if (propName == "IsDropDownOpen") { IsDropDownOpen = DependencyObject.UnboxBool(value, false); return true; }
+        if (propName == "MaxDropDownHeight") { MaxDropDownHeight = DependencyObject.UnboxFloat(value, 240.0f); return true; }
+        return base.SetPropertyValue(propName, value);
+    }
+
+    public override DependencyObject GetPropertyValue(string propName) {
+        if (propName == "IsDropDownOpen") { return DependencyObject.BoxBool(_isDropDownOpen); }
+        if (propName == "MaxDropDownHeight") { return DependencyObject.BoxFloat(_maxDropDownHeight); }
+        if (propName == "HasItems") { return DependencyObject.BoxBool(ItemCount() > 0); }
+        if (propName == "SelectionBoxItem") {
+            return SelectedIndex >= 0 ? GetItemBoxAt(SelectedIndex) : null;
+        }
+        return base.GetPropertyValue(propName);
     }
 
     public override void OnKeyDown(KeyEventArgs e) {
@@ -1145,6 +1366,7 @@ public class ComboBox : Selector {
         root.AddColumnDefinition(GridUnitType.Auto, 1.0f);
 
         _headerBox = new Border();
+        _headerBox.Background = Brushes.Transparent();
         _headerBox.HorizontalAlignment = HorizontalAlignment.Stretch;
         UIElement.SetGridColumnSpan(_headerBox, 2);
 

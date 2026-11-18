@@ -7,6 +7,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <future>
 #include <iomanip>
 #include <mutex>
 #include <sstream>
@@ -126,6 +127,28 @@ struct ProcessStdlibCache final {
     for (std::size_t i = 0u; i < size; ++i) {
         h ^= static_cast<std::uint64_t>(bytes[i]);
         h *= 1099511628211ull;
+    }
+    return h;
+}
+
+[[nodiscard]] std::uint64_t FastChecksum64(const void* data, std::size_t size) noexcept {
+    std::uint64_t h = 0x9E3779B97F4A7C15ULL ^ static_cast<std::uint64_t>(size);
+    const auto* p = static_cast<const std::uint8_t*>(data);
+    std::size_t i = 0u;
+    while (i + 8u <= size) {
+        std::uint64_t word = 0u;
+        std::memcpy(&word, p + i, 8u);
+        h ^= word;
+        h *= 0xBF58476D1CE4E5B9ULL;
+        h ^= (h >> 30u);
+        i += 8u;
+    }
+    if (i < size) {
+        std::uint64_t tail = 0u;
+        std::memcpy(&tail, p + i, size - i);
+        h ^= tail;
+        h *= 0x94D049BB133111EBULL;
+        h ^= (h >> 31u);
     }
     return h;
 }
@@ -446,6 +469,16 @@ void PopulateStdlibDerivedCache(ProcessStdlibCacheEntry& entry) {
     }
 }
 
+[[nodiscard]] bool HasProcessStdlibCacheEntry(
+    const std::string& resolvedRootKey,
+    std::uint64_t stdlibHash,
+    bool enableReactiveMacros) {
+    const StdlibCacheKey key{resolvedRootKey, stdlibHash, enableReactiveMacros};
+    auto& procCache = GetProcessStdlibCache();
+    std::lock_guard<std::mutex> lock(procCache.lookupMutex);
+    return procCache.entries.find(key) != procCache.entries.end();
+}
+
 [[nodiscard]] bool ResolveStdlibCacheForCompile(
     const std::string& resolvedRootKey,
     const std::vector<SourceFile>& stdlibSources,
@@ -632,28 +665,756 @@ void AppendUint32Le(std::vector<std::uint8_t>& out, std::uint32_t v) {
     return bytes;
 }
 
+[[nodiscard]] bool DecodeProgramBundle(
+    const std::uint8_t* data,
+    std::size_t size,
+    std::vector<rs_bc::Module>& outModules) {
+    outModules.clear();
+    if (!data || size < 8u || std::memcmp(data, "ARBC", 4u) != 0) {
+        return false;
+    }
+    std::size_t pos = 4u;
+    auto readU32 = [&](std::uint32_t& out) -> bool {
+        if (pos + 4u > size) return false;
+        out = static_cast<std::uint32_t>(data[pos]) |
+              (static_cast<std::uint32_t>(data[pos + 1u]) << 8u) |
+              (static_cast<std::uint32_t>(data[pos + 2u]) << 16u) |
+              (static_cast<std::uint32_t>(data[pos + 3u]) << 24u);
+        pos += 4u;
+        return true;
+    };
+
+    std::uint32_t modCount = 0u;
+    if (!readU32(modCount) || modCount > 1024u) {
+        return false;
+    }
+
+    struct ModuleSlice final {
+        std::size_t offset = 0u;
+        std::size_t length = 0u;
+    };
+    std::vector<ModuleSlice> slices;
+    slices.reserve(modCount);
+    for (std::uint32_t i = 0u; i < modCount; ++i) {
+        std::uint32_t modSize = 0u;
+        if (!readU32(modSize) || pos + modSize > size) {
+            return false;
+        }
+        slices.push_back(ModuleSlice{pos, modSize});
+        pos += modSize;
+    }
+    if (pos != size) {
+        return false;
+    }
+
+    outModules.resize(modCount);
+    if (modCount >= 2u && size >= 131072u) {
+        std::vector<std::future<bool>> futures;
+        futures.reserve(modCount);
+        for (std::uint32_t i = 0u; i < modCount; ++i) {
+            const ModuleSlice sl = slices[i];
+            futures.push_back(std::async(std::launch::async, [&, i, sl]() -> bool {
+                std::vector<std::uint8_t> modBytes(data + sl.offset, data + sl.offset + sl.length);
+                rs_diag::DiagnosticBag diag;
+                return rs_bc::decodeModule(modBytes, outModules[i], diag) && !diag.hasErrors();
+            }));
+        }
+        bool allOk = true;
+        for (auto& fut : futures) {
+            if (!fut.get()) {
+                allOk = false;
+            }
+        }
+        if (!allOk) {
+            outModules.clear();
+            return false;
+        }
+        return true;
+    }
+
+    for (std::uint32_t i = 0u; i < modCount; ++i) {
+        const ModuleSlice sl = slices[i];
+        std::vector<std::uint8_t> modBytes(data + sl.offset, data + sl.offset + sl.length);
+        rs_diag::DiagnosticBag diag;
+        if (!rs_bc::decodeModule(modBytes, outModules[i], diag) || diag.hasErrors()) {
+            outModules.clear();
+            return false;
+        }
+    }
+    return true;
+}
+
+[[nodiscard]] bool TextInstantiatesStdlibGenerics(std::string_view text) noexcept {
+    static constexpr std::string_view kNeedles[] = {
+        "ObservableList<",
+        "ObservableCollection<",
+        "RelayCommand<",
+        "DelegateCommand<",
+        "TypedBox<",
+        "RoutedPropertyChangedEventArgs<",
+    };
+    for (std::string_view needle : kNeedles) {
+        if (text.find(needle) != std::string_view::npos) {
+            return true;
+        }
+    }
+    return false;
+}
+
+[[nodiscard]] bool UserSourcesInstantiateStdlibGenerics(
+    const XamlEmitResult& primaryXaml,
+    const std::vector<XamlEmitResult>& additionalXamls,
+    const std::vector<SourceFile>& loweredScripts) noexcept {
+    if (TextInstantiatesStdlibGenerics(primaryXaml.generatedRsCode)) {
+        return true;
+    }
+    for (const auto& addRes : additionalXamls) {
+        if (TextInstantiatesStdlibGenerics(addRes.generatedRsCode)) {
+            return true;
+        }
+    }
+    for (const auto& sf : loweredScripts) {
+        if (TextInstantiatesStdlibGenerics(sf.content)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+struct DualHash128 final {
+    std::uint64_t h1 = 14695981039346656037ull;
+    std::uint64_t h2 = 0x9e3779b97f4a7c15ull;
+
+    void mixBytes(const void* data, std::size_t size) noexcept {
+        const auto* bytes = static_cast<const unsigned char*>(data);
+        std::size_t i = 0u;
+        while (i + 8u <= size) {
+            std::uint64_t word = 0u;
+            std::memcpy(&word, bytes + i, 8u);
+            h1 ^= word;
+            h1 *= 1099511628211ull;
+            h1 ^= (h1 >> 32u);
+            h2 ^= word + 0x9e3779b97f4a7c15ull + (h2 << 6u) + (h2 >> 2u);
+            h2 *= 11400714819323198485ull;
+            h2 ^= (h2 >> 30u);
+            i += 8u;
+        }
+        for (; i < size; ++i) {
+            const std::uint64_t b = bytes[i];
+            h1 ^= b;
+            h1 *= 1099511628211ull;
+            h2 ^= b + 0x9e3779b97f4a7c15ull + (h2 << 6u) + (h2 >> 2u);
+            h2 *= 11400714819323198485ull;
+        }
+    }
+
+    void mixU32(std::uint32_t v) noexcept { mixBytes(&v, sizeof(v)); }
+    void mixU64(std::uint64_t v) noexcept { mixBytes(&v, sizeof(v)); }
+    void mixString(std::string_view s) noexcept {
+        mixU64(static_cast<std::uint64_t>(s.size()));
+        if (!s.empty()) {
+            mixBytes(s.data(), s.size());
+        }
+    }
+};
+
+struct FastStdlibStatCache final {
+    struct Entry final {
+        std::string resolvedRootKey;
+        std::uint64_t statFingerprint = 0u;
+        bool enableReactiveMacros = true;
+        std::uint64_t stdlibHash = 0u;
+    };
+    std::mutex mutex;
+    std::vector<Entry> entries;
+};
+
+[[nodiscard]] FastStdlibStatCache& GetFastStdlibStatCache() {
+    static FastStdlibStatCache cache;
+    return cache;
+}
+
+[[nodiscard]] std::uint64_t ComputeStdlibStatFingerprint(
+    const std::filesystem::path& resolvedRoot,
+    std::string_view resolvedRootKey,
+    bool enableReactiveMacros) {
+    DualHash128 hasher;
+    hasher.mixU32(1u);
+    hasher.mixU32(enableReactiveMacros ? 1u : 0u);
+    hasher.mixString(resolvedRootKey);
+
+    const char* subdirs[2] = {"Aero.Native", "Aero.UI"};
+    for (const char* sub : subdirs) {
+        const std::filesystem::path dir = resolvedRoot / sub;
+        std::error_code ec;
+        if (!std::filesystem::is_directory(dir, ec)) {
+            continue;
+        }
+        struct StatEntry final {
+            std::string name;
+            std::uint64_t size = 0u;
+            std::int64_t mtime = 0;
+        };
+        std::vector<StatEntry> entries;
+        for (const auto& entry : std::filesystem::directory_iterator(dir, ec)) {
+            if (ec || !entry.is_regular_file(ec)) {
+                continue;
+            }
+            if (entry.path().extension() != ".rs") {
+                continue;
+            }
+            std::error_code ecSz;
+            std::error_code ecMt;
+            const auto sz = entry.file_size(ecSz);
+            const auto mt = entry.last_write_time(ecMt);
+            entries.push_back(StatEntry{
+                entry.path().filename().generic_string(),
+                ecSz ? 0u : static_cast<std::uint64_t>(sz),
+                ecMt ? 0 : static_cast<std::int64_t>(mt.time_since_epoch().count()),
+            });
+        }
+        std::sort(entries.begin(), entries.end(),
+            [](const StatEntry& a, const StatEntry& b) { return a.name < b.name; });
+        hasher.mixString(sub);
+        hasher.mixU64(static_cast<std::uint64_t>(entries.size()));
+        for (const auto& e : entries) {
+            hasher.mixString(e.name);
+            hasher.mixU64(e.size);
+            hasher.mixU64(static_cast<std::uint64_t>(e.mtime));
+        }
+    }
+    return hasher.h1 ^ (hasher.h2 * 0x9e3779b97f4a7c15ull);
+}
+
+[[nodiscard]] bool TryGetFastStdlibHash(
+    std::string_view resolvedRootKey,
+    std::uint64_t statFingerprint,
+    bool enableReactiveMacros,
+    const std::filesystem::path& cacheDir,
+    std::uint64_t& outStdlibHash) {
+    auto& statCache = GetFastStdlibStatCache();
+    {
+        std::lock_guard<std::mutex> lock(statCache.mutex);
+        for (const auto& e : statCache.entries) {
+            if (e.statFingerprint == statFingerprint &&
+                e.enableReactiveMacros == enableReactiveMacros &&
+                e.resolvedRootKey == resolvedRootKey) {
+                outStdlibHash = e.stdlibHash;
+                return true;
+            }
+        }
+    }
+
+    if (cacheDir.empty()) {
+        return false;
+    }
+
+    std::vector<std::uint8_t> bytes;
+    if (!ReadBinaryFile(cacheDir / "stdlib_stat_v1.bin", bytes) || bytes.size() < 20u) {
+        return false;
+    }
+    const std::size_t payloadSize = bytes.size() - 8u;
+    std::uint64_t storedChecksum = 0u;
+    for (int s = 0; s < 64; s += 8) {
+        storedChecksum |= static_cast<std::uint64_t>(bytes[payloadSize + static_cast<std::size_t>(s / 8)]) << s;
+    }
+    if (storedChecksum != FastChecksum64(bytes.data(), payloadSize)) {
+        return false;
+    }
+    if (std::memcmp(bytes.data(), "ASTS", 4u) != 0) {
+        return false;
+    }
+    std::size_t pos = 4u;
+    auto readU32 = [&](std::uint32_t& out) -> bool {
+        if (pos + 4u > payloadSize) return false;
+        out = 0u;
+        for (int s = 0; s < 32; s += 8) {
+            out |= static_cast<std::uint32_t>(bytes[pos++]) << s;
+        }
+        return true;
+    };
+    auto readU64 = [&](std::uint64_t& out) -> bool {
+        if (pos + 8u > payloadSize) return false;
+        out = 0u;
+        for (int s = 0; s < 64; s += 8) {
+            out |= static_cast<std::uint64_t>(bytes[pos++]) << s;
+        }
+        return true;
+    };
+
+    std::uint32_t ver = 0u;
+    std::uint32_t count = 0u;
+    if (!readU32(ver) || ver != 1u || !readU32(count) || count > 64u) {
+        return false;
+    }
+
+    std::vector<FastStdlibStatCache::Entry> loaded;
+    loaded.reserve(count);
+    for (std::uint32_t i = 0u; i < count; ++i) {
+        std::uint32_t len = 0u;
+        if (!readU32(len) || pos + len > payloadSize) {
+            return false;
+        }
+        FastStdlibStatCache::Entry e;
+        e.resolvedRootKey.assign(reinterpret_cast<const char*>(bytes.data() + pos), len);
+        pos += len;
+        if (!readU64(e.statFingerprint) || pos >= payloadSize) {
+            return false;
+        }
+        e.enableReactiveMacros = (bytes[pos++] != 0u);
+        if (!readU64(e.stdlibHash)) {
+            return false;
+        }
+        loaded.push_back(std::move(e));
+    }
+    if (pos != payloadSize) {
+        return false;
+    }
+
+    bool found = false;
+    {
+        std::lock_guard<std::mutex> lock(statCache.mutex);
+        for (const auto& le : loaded) {
+            if (le.statFingerprint == statFingerprint &&
+                le.enableReactiveMacros == enableReactiveMacros &&
+                le.resolvedRootKey == resolvedRootKey) {
+                outStdlibHash = le.stdlibHash;
+                found = true;
+            }
+            bool exists = false;
+            for (const auto& cur : statCache.entries) {
+                if (cur.statFingerprint == le.statFingerprint &&
+                    cur.enableReactiveMacros == le.enableReactiveMacros &&
+                    cur.resolvedRootKey == le.resolvedRootKey) {
+                    exists = true;
+                    break;
+                }
+            }
+            if (!exists && statCache.entries.size() < 16u) {
+                statCache.entries.push_back(le);
+            }
+        }
+    }
+    return found;
+}
+
+void RecordFastStdlibHash(
+    std::string_view resolvedRootKey,
+    std::uint64_t statFingerprint,
+    bool enableReactiveMacros,
+    const std::filesystem::path& cacheDir,
+    std::uint64_t stdlibHash) {
+    auto& statCache = GetFastStdlibStatCache();
+    std::vector<FastStdlibStatCache::Entry> snapshot;
+    {
+        std::lock_guard<std::mutex> lock(statCache.mutex);
+        bool updated = false;
+        for (auto& e : statCache.entries) {
+            if (e.enableReactiveMacros == enableReactiveMacros &&
+                e.resolvedRootKey == resolvedRootKey) {
+                e.statFingerprint = statFingerprint;
+                e.stdlibHash = stdlibHash;
+                updated = true;
+                break;
+            }
+        }
+        if (!updated) {
+            if (statCache.entries.size() >= 16u) {
+                statCache.entries.erase(statCache.entries.begin());
+            }
+            statCache.entries.push_back(FastStdlibStatCache::Entry{
+                std::string(resolvedRootKey),
+                statFingerprint,
+                enableReactiveMacros,
+                stdlibHash,
+            });
+        }
+        snapshot = statCache.entries;
+    }
+
+    if (cacheDir.empty()) {
+        return;
+    }
+
+    std::vector<std::uint8_t> buf;
+    buf.reserve(512u);
+    auto pushU32 = [&](std::uint32_t v) { AppendUint32Le(buf, v); };
+    auto pushU64 = [&](std::uint64_t v) {
+        for (int s = 0; s < 64; s += 8) {
+            buf.push_back(static_cast<std::uint8_t>((v >> s) & 0xFFu));
+        }
+    };
+    const auto pushBytes = [&](const void* p, std::size_t n) {
+        const auto* c = static_cast<const std::uint8_t*>(p);
+        buf.insert(buf.end(), c, c + n);
+    };
+
+    pushBytes("ASTS", 4u);
+    pushU32(1u);
+    pushU32(static_cast<std::uint32_t>(snapshot.size()));
+    for (const auto& e : snapshot) {
+        pushU32(static_cast<std::uint32_t>(e.resolvedRootKey.size()));
+        if (!e.resolvedRootKey.empty()) {
+            pushBytes(e.resolvedRootKey.data(), e.resolvedRootKey.size());
+        }
+        pushU64(e.statFingerprint);
+        buf.push_back(e.enableReactiveMacros ? 1u : 0u);
+        pushU64(e.stdlibHash);
+    }
+    const std::uint64_t checksum = FastChecksum64(buf.data(), buf.size());
+    pushU64(checksum);
+    WriteBinaryFileAtomic(cacheDir / "stdlib_stat_v1.bin", buf);
+}
+
+constexpr std::uint32_t kProgramCacheVersion = 4u;
+
+[[nodiscard]] std::pair<std::uint64_t, std::uint64_t> ComputeRawInputBundleKey(
+    const AeroV3CompileInput& input,
+    std::uint64_t stdlibHash) noexcept {
+    DualHash128 hasher;
+    hasher.mixU32(kProgramCacheVersion);
+    hasher.mixU32(realscript::kVersionMajor);
+    hasher.mixU32(realscript::kVersionMinor);
+    hasher.mixU32(realscript::kVersionPatch);
+    hasher.mixU32(realscript::kSdkCompatibilityVersion);
+    const std::uint32_t flags =
+        (input.includeStdlib ? 1u : 0u) |
+        (input.treeShakeStdlib ? 2u : 0u) |
+        (input.optimizeBytecode ? 4u : 0u) |
+        (input.enableReactiveMacros ? 8u : 0u);
+    hasher.mixU32(flags);
+    hasher.mixU64(stdlibHash);
+
+    hasher.mixString(input.xamlPath);
+    hasher.mixString(input.xamlContent);
+    hasher.mixString(input.resourceSearchRoot);
+    hasher.mixU64(static_cast<std::uint64_t>(input.resourceSearchPaths.size()));
+    for (const auto& p : input.resourceSearchPaths) {
+        hasher.mixString(p);
+    }
+
+    hasher.mixU64(static_cast<std::uint64_t>(input.additionalXamlSources.size()));
+    for (const auto& sf : input.additionalXamlSources) {
+        hasher.mixString(sf.path);
+        hasher.mixString(sf.content);
+    }
+
+    hasher.mixU64(static_cast<std::uint64_t>(input.scriptSources.size()));
+    for (const auto& sf : input.scriptSources) {
+        hasher.mixString(sf.path);
+        hasher.mixString(sf.content);
+    }
+    return {hasher.h1, hasher.h2};
+}
+
+[[nodiscard]] std::filesystem::path MakeProgramCacheFilePath(
+    const std::filesystem::path& cacheDir,
+    std::uint64_t h1,
+    std::uint64_t h2) {
+    return cacheDir / "programs" / ("prog_" + Hex64(h1) + "_" + Hex64(h2) + ".arbc");
+}
+
+[[nodiscard]] bool TryLoadProgramBundleFromDisk(
+    const std::filesystem::path& cacheFilePath,
+    std::uint64_t expectedH1,
+    std::uint64_t expectedH2,
+    bool skipRawBytecodeOutput,
+    AeroV3CompileResult& ioResult) {
+    std::vector<std::uint8_t> bytes;
+    if (!ReadBinaryFile(cacheFilePath, bytes) || bytes.size() < 88u) {
+        return false;
+    }
+    const std::size_t payloadSize = bytes.size() - 8u;
+    std::size_t pos = 0u;
+    auto readU32 = [&](std::uint32_t& out) -> bool {
+        if (pos + 4u > payloadSize) return false;
+        out = 0u;
+        for (int s = 0; s < 32; s += 8) {
+            out |= static_cast<std::uint32_t>(bytes[pos++]) << s;
+        }
+        return true;
+    };
+    auto readU64 = [&](std::uint64_t& out) -> bool {
+        if (pos + 8u > payloadSize) return false;
+        out = 0u;
+        for (int s = 0; s < 64; s += 8) {
+            out |= static_cast<std::uint64_t>(bytes[pos++]) << s;
+        }
+        return true;
+    };
+    auto readString = [&](std::string& out, bool assignValue = true) -> bool {
+        std::uint32_t len = 0u;
+        if (!readU32(len) || pos + len > payloadSize) {
+            return false;
+        }
+        if (assignValue) {
+            out.assign(reinterpret_cast<const char*>(bytes.data() + pos), len);
+        }
+        pos += len;
+        return true;
+    };
+
+    std::uint64_t storedChecksum = 0u;
+    for (int s = 0; s < 64; s += 8) {
+        storedChecksum |= static_cast<std::uint64_t>(bytes[payloadSize + static_cast<std::size_t>(s / 8)]) << s;
+    }
+    if (storedChecksum != FastChecksum64(bytes.data(), payloadSize)) {
+        return false;
+    }
+
+    if (std::memcmp(bytes.data(), "APRG", 4u) != 0) {
+        return false;
+    }
+    pos = 4u;
+
+    std::uint32_t ver = 0u;
+    std::uint64_t h1 = 0u;
+    std::uint64_t h2 = 0u;
+    if (!readU32(ver) || ver != kProgramCacheVersion ||
+        !readU64(h1) || h1 != expectedH1 ||
+        !readU64(h2) || h2 != expectedH2) {
+        return false;
+    }
+
+    std::uint64_t retainedTypes = 0u, prunedTypes = 0u, retainedFns = 0u, prunedFns = 0u;
+    if (!readU64(retainedTypes) || !readU64(prunedTypes) ||
+        !readU64(retainedFns) || !readU64(prunedFns)) {
+        return false;
+    }
+
+    std::string rootClassName;
+    std::string genRsPath;
+    std::string genRsCode;
+    if (!readString(rootClassName) ||
+        !readString(genRsPath) ||
+        !readString(genRsCode, !skipRawBytecodeOutput)) {
+        return false;
+    }
+
+    std::uint32_t extDepCount = 0u;
+    if (!readU32(extDepCount) || extDepCount > 4096u) {
+        return false;
+    }
+    std::vector<std::uint8_t> depBuf;
+    for (std::uint32_t i = 0u; i < extDepCount; ++i) {
+        std::string depPath;
+        std::uint64_t depHash = 0u;
+        if (!readString(depPath) || !readU64(depHash) || depPath.empty()) {
+            return false;
+        }
+        if (!ReadBinaryFile(std::filesystem::path(depPath), depBuf) ||
+            FastChecksum64(depBuf.data(), depBuf.size()) != depHash) {
+            return false;
+        }
+    }
+
+    std::uint32_t diagCount = 0u;
+    if (!readU32(diagCount) || diagCount > 4096u) {
+        return false;
+    }
+    std::vector<std::string> storedDiags;
+    storedDiags.reserve(diagCount);
+    for (std::uint32_t i = 0u; i < diagCount; ++i) {
+        std::string d;
+        if (!readString(d)) {
+            return false;
+        }
+        storedDiags.push_back(std::move(d));
+    }
+
+    std::uint32_t arbcLen = 0u;
+    if (!readU32(arbcLen) || pos + arbcLen != payloadSize) {
+        return false;
+    }
+
+    std::vector<rs_bc::Module> modules;
+    if (!DecodeProgramBundle(bytes.data() + pos, arbcLen, modules)) {
+        return false;
+    }
+
+    rs_rt::RuntimeError linkErr;
+    auto linked = ProgramImage::link(modules, linkErr);
+    if (!linked.has_value()) {
+        return false;
+    }
+
+    ioResult.retainedMirTypes = static_cast<std::size_t>(retainedTypes);
+    ioResult.prunedMirTypes = static_cast<std::size_t>(prunedTypes);
+    ioResult.retainedMirFunctions = static_cast<std::size_t>(retainedFns);
+    ioResult.prunedMirFunctions = static_cast<std::size_t>(prunedFns);
+    ioResult.rootClassName = std::move(rootClassName);
+    ioResult.generatedPartialRsPath = std::move(genRsPath);
+    if (!skipRawBytecodeOutput) {
+        ioResult.generatedPartialRsCode = std::move(genRsCode);
+        ioResult.programImageBytes.assign(bytes.data() + pos, bytes.data() + pos + arbcLen);
+    }
+    ioResult.diagnostics.insert(
+        ioResult.diagnostics.end(), storedDiags.begin(), storedDiags.end());
+    ioResult.bytecodeModules = std::move(modules);
+    ioResult.programImage = std::make_shared<const ProgramImage>(std::move(*linked));
+    ioResult.succeeded = true;
+    return true;
+}
+
+void PersistProgramBundleToDisk(
+    const std::filesystem::path& cacheFilePath,
+    std::uint64_t h1,
+    std::uint64_t h2,
+    const AeroV3CompileResult& result,
+    const std::vector<std::uint8_t>& encodedArbcBytes,
+    const std::vector<ExternalXamlDep>& externalDeps) {
+    if (cacheFilePath.empty() || !result.succeeded || encodedArbcBytes.empty()) {
+        return;
+    }
+    std::vector<std::uint8_t> buf;
+    buf.reserve(encodedArbcBytes.size() + result.generatedPartialRsCode.size() + 512u);
+    auto pushBytes = [&](const void* p, std::size_t n) {
+        const auto* c = static_cast<const std::uint8_t*>(p);
+        buf.insert(buf.end(), c, c + n);
+    };
+    auto pushU32 = [&](std::uint32_t v) { AppendUint32Le(buf, v); };
+    auto pushU64 = [&](std::uint64_t v) {
+        for (int s = 0; s < 64; s += 8) {
+            buf.push_back(static_cast<std::uint8_t>((v >> s) & 0xFFu));
+        }
+    };
+    auto pushString = [&](std::string_view s) {
+        pushU32(static_cast<std::uint32_t>(s.size()));
+        if (!s.empty()) {
+            pushBytes(s.data(), s.size());
+        }
+    };
+
+    pushBytes("APRG", 4u);
+    pushU32(kProgramCacheVersion);
+    pushU64(h1);
+    pushU64(h2);
+    pushU64(static_cast<std::uint64_t>(result.retainedMirTypes));
+    pushU64(static_cast<std::uint64_t>(result.prunedMirTypes));
+    pushU64(static_cast<std::uint64_t>(result.retainedMirFunctions));
+    pushU64(static_cast<std::uint64_t>(result.prunedMirFunctions));
+
+    pushString(result.rootClassName);
+    pushString(result.generatedPartialRsPath);
+    pushString(result.generatedPartialRsCode);
+
+    pushU32(static_cast<std::uint32_t>(externalDeps.size()));
+    for (const auto& dep : externalDeps) {
+        pushString(dep.resolvedPath);
+        pushU64(dep.contentHash);
+    }
+
+    pushU32(static_cast<std::uint32_t>(result.diagnostics.size()));
+    for (const auto& d : result.diagnostics) {
+        pushString(d);
+    }
+
+    pushU32(static_cast<std::uint32_t>(encodedArbcBytes.size()));
+    pushBytes(encodedArbcBytes.data(), encodedArbcBytes.size());
+
+    const std::uint64_t checksum = FastChecksum64(buf.data(), buf.size());
+    pushU64(checksum);
+    WriteBinaryFileAtomic(cacheFilePath, buf);
+}
+
 } // namespace
 
 AeroV3CompileResult AeroCompilerV3::Compile(const AeroV3CompileInput& input) const {
     AeroV3CompileResult result;
 
+    const std::filesystem::path effectiveCacheDir = ResolveEffectiveCacheDir(input);
+    const bool sessionAllowsEarlyHit =
+        (input.compilerSession == nullptr) ||
+        (input.compilerSession->parsedUnitCacheSize() > 0u);
+    const bool canUseRawProgramCache =
+        !effectiveCacheDir.empty() &&
+        !input.emitAotCpp &&
+        sessionAllowsEarlyHit &&
+        !input.externalXamlResolver;
+
     std::vector<SourceFile> stdlibSources;
     std::string resolvedStdlibRootKey;
+    std::filesystem::path resolvedStdlibRoot;
+    std::uint64_t stdlibStatFp = 0u;
     std::uint64_t stdlibHash = 0u;
     if (input.includeStdlib) {
-        const std::filesystem::path resolvedRoot = ResolveStdlibRootDirectory(input.stdlibRootDir);
+        resolvedStdlibRoot = ResolveStdlibRootDirectory(input.stdlibRootDir);
+        if (resolvedStdlibRoot.empty()) {
+            result.diagnostics.emplace_back(
+                "StdlibModulePack: failed to locate stdlib Aero.Native / Aero.UI sources");
+            return result;
+        }
+        std::error_code ec;
+        const auto canon = std::filesystem::weakly_canonical(resolvedStdlibRoot, ec);
+        resolvedStdlibRootKey = (!ec && !canon.empty())
+            ? canon.lexically_normal().generic_string()
+            : resolvedStdlibRoot.lexically_normal().generic_string();
+        stdlibStatFp = ComputeStdlibStatFingerprint(
+            resolvedStdlibRoot, resolvedStdlibRootKey, input.enableReactiveMacros);
+        if (!TryGetFastStdlibHash(
+                resolvedStdlibRootKey,
+                stdlibStatFp,
+                input.enableReactiveMacros,
+                effectiveCacheDir,
+                stdlibHash)) {
+            stdlibSources = LoadStdlibModulePack(input.stdlibRootDir);
+            if (stdlibSources.empty()) {
+                result.diagnostics.emplace_back(
+                    "StdlibModulePack: failed to locate stdlib Aero.Native / Aero.UI sources");
+                return result;
+            }
+            stdlibHash = ComputeStdlibPackHash(stdlibSources, input.enableReactiveMacros);
+            RecordFastStdlibHash(
+                resolvedStdlibRootKey,
+                stdlibStatFp,
+                input.enableReactiveMacros,
+                effectiveCacheDir,
+                stdlibHash);
+        }
+    }
+
+    std::uint64_t progH1 = 0u;
+    std::uint64_t progH2 = 0u;
+    std::filesystem::path progCacheFilePath;
+    if (canUseRawProgramCache) {
+        const auto [h1, h2] = ComputeRawInputBundleKey(input, stdlibHash);
+        progH1 = h1;
+        progH2 = h2;
+        progCacheFilePath = MakeProgramCacheFilePath(effectiveCacheDir, progH1, progH2);
+        if (TryLoadProgramBundleFromDisk(
+                progCacheFilePath,
+                progH1,
+                progH2,
+                input.skipRawBytecodeOutput,
+                result)) {
+            result.usedStdlibCache = input.includeStdlib;
+            return result;
+        }
+    }
+
+    if (input.includeStdlib && stdlibSources.empty()) {
         stdlibSources = LoadStdlibModulePack(input.stdlibRootDir);
         if (stdlibSources.empty()) {
             result.diagnostics.emplace_back(
                 "StdlibModulePack: failed to locate stdlib Aero.Native / Aero.UI sources");
             return result;
         }
-        std::error_code ec;
-        const auto canon = std::filesystem::weakly_canonical(resolvedRoot, ec);
-        resolvedStdlibRootKey = (!ec && !canon.empty())
-            ? canon.lexically_normal().generic_string()
-            : resolvedRoot.lexically_normal().generic_string();
-        stdlibHash = ComputeStdlibPackHash(stdlibSources, input.enableReactiveMacros);
+        const std::uint64_t exactHash = ComputeStdlibPackHash(stdlibSources, input.enableReactiveMacros);
+        if (exactHash != stdlibHash) {
+            stdlibHash = exactHash;
+            RecordFastStdlibHash(
+                resolvedStdlibRootKey,
+                stdlibStatFp,
+                input.enableReactiveMacros,
+                effectiveCacheDir,
+                stdlibHash);
+            if (canUseRawProgramCache) {
+                const auto [h1, h2] = ComputeRawInputBundleKey(input, stdlibHash);
+                progH1 = h1;
+                progH2 = h2;
+                progCacheFilePath = MakeProgramCacheFilePath(effectiveCacheDir, progH1, progH2);
+            }
+        }
     }
 
     // Emit primary XAML -> .g.rs
@@ -664,9 +1425,24 @@ AeroV3CompileResult AeroCompilerV3::Compile(const AeroV3CompileInput& input) con
         emitOpts.externalXamlResolver = input.externalXamlResolver;
         emitOpts.resourceSearchRoot = input.resourceSearchRoot;
         emitOpts.resourceSearchPaths = input.resourceSearchPaths;
+        emitOpts.pruneUnreferencedExternalStyles = true;
+        emitOpts.usageHintTexts.reserve(
+            input.additionalXamlSources.size() + input.scriptSources.size());
+        for (const auto& addSf : input.additionalXamlSources) {
+            if (!addSf.content.empty()) {
+                emitOpts.usageHintTexts.push_back(addSf.content);
+            }
+        }
+        for (const auto& sf : input.scriptSources) {
+            if (!sf.content.empty()) {
+                emitOpts.usageHintTexts.push_back(sf.content);
+            }
+        }
         xamlRes = EmitXamlToRealScript(input.xamlContent, emitOpts);
         result.generatedPartialRsPath = xamlRes.generatedFilePath;
-        result.generatedPartialRsCode = xamlRes.generatedRsCode;
+        if (!input.skipRawBytecodeOutput) {
+            result.generatedPartialRsCode = xamlRes.generatedRsCode;
+        }
         result.rootClassName = xamlRes.rootClassName;
         result.diagnostics.insert(
             result.diagnostics.end(),
@@ -692,6 +1468,24 @@ AeroV3CompileResult AeroCompilerV3::Compile(const AeroV3CompileInput& input) con
         addOpts.externalXamlResolver = input.externalXamlResolver;
         addOpts.resourceSearchRoot = input.resourceSearchRoot;
         addOpts.resourceSearchPaths = input.resourceSearchPaths;
+        addOpts.pruneUnreferencedExternalStyles = true;
+        addOpts.usageHintTexts.reserve(
+            (input.xamlContent.empty() ? 0u : 1u) +
+            input.additionalXamlSources.size() +
+            input.scriptSources.size());
+        if (!input.xamlContent.empty()) {
+            addOpts.usageHintTexts.push_back(input.xamlContent);
+        }
+        for (std::size_t other = 0u; other < input.additionalXamlSources.size(); ++other) {
+            if (other != idx && !input.additionalXamlSources[other].content.empty()) {
+                addOpts.usageHintTexts.push_back(input.additionalXamlSources[other].content);
+            }
+        }
+        for (const auto& sf : input.scriptSources) {
+            if (!sf.content.empty()) {
+                addOpts.usageHintTexts.push_back(sf.content);
+            }
+        }
         XamlEmitResult addRes = EmitXamlToRealScript(addSf.content, addOpts);
         result.diagnostics.insert(
             result.diagnostics.end(),
@@ -701,6 +1495,22 @@ AeroV3CompileResult AeroCompilerV3::Compile(const AeroV3CompileInput& input) con
             return result;
         }
         additionalXamlResults.push_back(std::move(addRes));
+    }
+
+    std::vector<ExternalXamlDep> mergedExternalDeps;
+    {
+        std::unordered_set<std::string> seenDeps;
+        auto appendDeps = [&](const std::vector<ExternalXamlDep>& deps) {
+            for (const auto& dep : deps) {
+                if (!dep.resolvedPath.empty() && seenDeps.insert(dep.resolvedPath).second) {
+                    mergedExternalDeps.push_back(dep);
+                }
+            }
+        };
+        appendDeps(xamlRes.externalDependencies);
+        for (const auto& addRes : additionalXamlResults) {
+            appendDeps(addRes.externalDependencies);
+        }
     }
 
     // Assemble declared modules before C# compatibility lowering
@@ -716,9 +1526,21 @@ AeroV3CompileResult AeroCompilerV3::Compile(const AeroV3CompileInput& input) con
         }
     }
 
+    std::vector<SourceFile> loweredScripts;
+    loweredScripts.reserve(input.scriptSources.size());
+    for (const auto& sf : input.scriptSources) {
+        SourceFile lowered;
+        lowered.path = sf.path;
+        lowered.content = LowerCSharpCompatSyntax(sf.content, &availableModules);
+        loweredScripts.push_back(std::move(lowered));
+    }
+
+    const bool usesStdlibGenerics =
+        UserSourcesInstantiateStdlibGenerics(xamlRes, additionalXamlResults, loweredScripts);
+
     std::vector<SourceFile> allSources;
     allSources.reserve(
-        stdlibSources.size() + additionalXamlResults.size() + input.scriptSources.size() + 1u);
+        stdlibSources.size() + additionalXamlResults.size() + loweredScripts.size() + 1u);
     std::unordered_set<std::string> seenPaths;
 
     auto pushUniqueSource = [&](SourceFile sf) {
@@ -741,10 +1563,7 @@ AeroV3CompileResult AeroCompilerV3::Compile(const AeroV3CompileInput& input) con
             pushUniqueSource(SourceFile{addRes.generatedFilePath, addRes.generatedRsCode});
         }
     }
-    for (const auto& sf : input.scriptSources) {
-        SourceFile lowered;
-        lowered.path = sf.path;
-        lowered.content = LowerCSharpCompatSyntax(sf.content, &availableModules);
+    for (auto& lowered : loweredScripts) {
         pushUniqueSource(std::move(lowered));
     }
 
@@ -764,7 +1583,6 @@ AeroV3CompileResult AeroCompilerV3::Compile(const AeroV3CompileInput& input) con
     bool usePreviousSnapshot = false;
     bool stdlibCacheCandidate = false;
     std::shared_ptr<const ProcessStdlibCacheEntry> procEntry;
-    const std::filesystem::path effectiveCacheDir = ResolveEffectiveCacheDir(input);
 
     if (input.compilerSession != nullptr) {
         compOpts.session = std::shared_ptr<rs_comp::CompilerSession>(
@@ -797,20 +1615,30 @@ AeroV3CompileResult AeroCompilerV3::Compile(const AeroV3CompileInput& input) con
             }
         }
     } else if (input.includeStdlib) {
-        std::shared_ptr<rs_comp::CompilerSession> procSession;
-        if (ResolveStdlibCacheForCompile(
-                resolvedStdlibRootKey,
-                stdlibSources,
-                stdlibHash,
-                input.enableReactiveMacros,
-                effectiveCacheDir,
-                nullptr,
-                procSession,
-                previousSnapshot,
-                procEntry,
-                stdlibCacheCandidate)) {
-            compOpts.session = std::move(procSession);
-            usePreviousSnapshot = true;
+        std::error_code snapEc;
+        const bool snapMetaExists = effectiveCacheDir.empty() ||
+            std::filesystem::exists(
+                effectiveCacheDir / ("aero_stdlib_" + Hex64(stdlibHash) + ".snapmeta"), snapEc);
+        const bool skipIneffectiveDiskStdlibLoad =
+            !HasProcessStdlibCacheEntry(resolvedStdlibRootKey, stdlibHash, input.enableReactiveMacros) &&
+            usesStdlibGenerics &&
+            snapMetaExists;
+        if (!skipIneffectiveDiskStdlibLoad) {
+            std::shared_ptr<rs_comp::CompilerSession> procSession;
+            if (ResolveStdlibCacheForCompile(
+                    resolvedStdlibRootKey,
+                    stdlibSources,
+                    stdlibHash,
+                    input.enableReactiveMacros,
+                    effectiveCacheDir,
+                    nullptr,
+                    procSession,
+                    previousSnapshot,
+                    procEntry,
+                    stdlibCacheCandidate)) {
+                compOpts.session = std::move(procSession);
+                usePreviousSnapshot = true;
+            }
         }
     }
 
@@ -873,7 +1701,7 @@ AeroV3CompileResult AeroCompilerV3::Compile(const AeroV3CompileInput& input) con
         rs_opt::Options optOpts;
         optOpts.level = rs_opt::Level::Aggressive;
         optOpts.maximumIterations = 4;
-        optOpts.preserveDebugInfo = true;
+        optOpts.preserveDebugInfo = input.emitAotCpp;
         optOpts.enableInlining = true;
         optOpts.enableLicm = true;
         optOpts.enableStructFieldForwarding = true;
@@ -886,6 +1714,21 @@ AeroV3CompileResult AeroCompilerV3::Compile(const AeroV3CompileInput& input) con
         AppendDiagnostics(optDiag, result.diagnostics);
         if (optDiag.hasErrors()) {
             return result;
+        }
+    }
+
+    // Strip debug metadata before lowering to shrink runtime bytecode when AOT C++ isn't requested.
+    if (!input.emitAotCpp) {
+        for (auto& mirMod : mirModules) {
+            mirMod.sourceFiles.clear();
+            for (auto& fn : mirMod.functions) {
+                fn.debugInfo.sourceName.clear();
+                fn.debugInfo.sourceFileId = 0u;
+                fn.debugInfo.declaration = {};
+                fn.debugInfo.body = {};
+                fn.debugInfo.sequencePoints.clear();
+                fn.debugInfo.locals.clear();
+            }
         }
     }
 
@@ -911,7 +1754,10 @@ AeroV3CompileResult AeroCompilerV3::Compile(const AeroV3CompileInput& input) con
         result.bytecodeModules.push_back(std::move(bcMod));
     }
 
-    result.programImageBytes = EncodeProgramBundle(result.bytecodeModules);
+    std::vector<std::uint8_t> encodedProgramBytes = EncodeProgramBundle(result.bytecodeModules);
+    if (!input.skipRawBytecodeOutput) {
+        result.programImageBytes = encodedProgramBytes;
+    }
 
     // Link ProgramImage
     rs_rt::RuntimeError linkErr;
@@ -958,6 +1804,10 @@ AeroV3CompileResult AeroCompilerV3::Compile(const AeroV3CompileInput& input) con
     }
 
     result.succeeded = true;
+    if (!progCacheFilePath.empty()) {
+        PersistProgramBundleToDisk(
+            progCacheFilePath, progH1, progH2, result, encodedProgramBytes, mergedExternalDeps);
+    }
     return result;
 }
 

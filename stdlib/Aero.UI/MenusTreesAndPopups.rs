@@ -10,6 +10,8 @@ public static class PopupService {
     private static Popup[] _openPopups;
     private static bool _hooked = false;
     private static UIElement _overlayHost;
+    private static UIElement _overlayRootOwner;
+    private static Canvas _overlayCanvas;
 
     public static void SetOverlayHost(UIElement host) {
         _overlayHost = host;
@@ -23,12 +25,48 @@ public static class PopupService {
         return _overlayHost;
     }
 
+    public static Canvas ResolveOverlayCanvas(UIElement anchor) {
+        UIElement root = ResolveOverlayHost(anchor);
+        if (root == null) { return null; }
+        if (_overlayCanvas == null || _overlayCanvas._isDisposedTree) {
+            _overlayCanvas = new Canvas();
+            _overlayCanvas.Name = "__AeroPopupOverlay";
+            _overlayCanvas.ZIndex = 10000;
+            _overlayCanvas.HorizontalAlignment = HorizontalAlignment.Stretch;
+            _overlayCanvas.VerticalAlignment = VerticalAlignment.Stretch;
+            _overlayRootOwner = null;
+        }
+        if (_overlayCanvas.Parent != root || _overlayRootOwner != root) {
+            if (_overlayCanvas.Parent != null) {
+                _overlayCanvas.Parent.RemoveChild(_overlayCanvas);
+            }
+            root.AddChild(_overlayCanvas);
+            _overlayRootOwner = root;
+        }
+        return _overlayCanvas;
+    }
+
     private static void EnsureHooked() {
         if (_hooked) { return; }
         _hooked = true;
         InputDispatcher.RegisterPopupDismissHook((UIElement target, bool isEscape) => {
             DismissNonPersistent(target, isEscape);
         });
+        BindingEngine.AddPreFlushHook(() => {
+            RefreshOpenPositions();
+        });
+    }
+
+    public static void RefreshOpenPositions() {
+        if (_openPopups == null || _openPopups.Length == 0) { return; }
+        for (int i = _openPopups.Length - 1; i >= 0; i -= 1) {
+            Popup p = _openPopups[i];
+            if (p == null || p._isDisposedTree || !p.IsOpen) {
+                _openPopups.RemoveAt(i);
+                continue;
+            }
+            p.UpdatePosition();
+        }
     }
 
     public static void RegisterOpen(Popup p) {
@@ -74,11 +112,14 @@ public class Popup : FrameworkElement {
     private UIElement _child;
     private bool _isOpen = false;
     private UIElement _placementTarget;
+    private UIElement _logicalParent;
     private bool _staysOpen = false;
     private float _horizOffset = 0.0f;
     private float _vertOffset = 0.0f;
     private string _placement = "Bottom";
     private UIElement _attachedRoot;
+    private float _appliedScaleX = 1.0f;
+    private float _appliedScaleY = 1.0f;
 
     public event EventHandler Opened;
     public event EventHandler Closed;
@@ -86,13 +127,20 @@ public class Popup : FrameworkElement {
     public Popup() : base(VisualKind.Box) {
         ZIndex = 10000;
         Visibility = Visibility.Collapsed;
+        HorizontalAlignment = HorizontalAlignment.Left;
+        VerticalAlignment = VerticalAlignment.Top;
         IsHitTestVisible = true;
+        SyncInteractiveFlags();
     }
 
     public override string GetTypeName() { return "Popup"; }
 
+    protected override bool IsSelfHitTestSolid() {
+        return Background != null;
+    }
+
     public UIElement Child {
-        get { return _child; }
+        get { return _child != null ? _child : (ChildCount() > 0 ? ChildAt(0) : null); }
         set {
             if (_child == value) { return; }
             ClearChildren();
@@ -104,6 +152,9 @@ public class Popup : FrameworkElement {
     public UIElement PlacementTarget {
         get { return _placementTarget; }
         set { _placementTarget = value; UpdatePosition(); }
+    }
+    public UIElement LogicalParent {
+        get { return _logicalParent; }
     }
     public bool StaysOpen { get { return _staysOpen; } set { _staysOpen = value; } }
     public float HorizontalOffset { get { return _horizOffset; } set { _horizOffset = value; UpdatePosition(); } }
@@ -117,8 +168,8 @@ public class Popup : FrameworkElement {
             _isOpen = value;
             if (_isOpen) {
                 AttachToOverlayIfNeeded();
-                UpdatePosition();
                 Visibility = Visibility.Visible;
+                UpdatePosition();
                 PopupService.RegisterOpen(this);
                 Opened(this, EventArgs.Empty());
             } else {
@@ -131,13 +182,32 @@ public class Popup : FrameworkElement {
     }
 
     private void AttachToOverlayIfNeeded() {
-        if (Parent != null) { return; }
+        UIElement anchor = _placementTarget != null
+            ? _placementTarget
+            : (TemplatedParent != null ? TemplatedParent : (_logicalParent != null ? _logicalParent : Parent));
+        if (anchor != null) { _logicalParent = anchor; }
+        UIElement overlay = PopupService.ResolveOverlayCanvas(anchor);
         UIElement self = this;
-        UIElement host = PopupService.ResolveOverlayHost(_placementTarget);
-        if (host != null && host != self) {
-            _attachedRoot = host;
-            host.AddChild(this);
+        if (overlay == null || overlay == self) { return; }
+        if (Parent != overlay) {
+            if (AmbientResources == null && Parent != null && Parent.AmbientResources != null) {
+                AmbientResources = Parent.AmbientResources;
+            }
+            if (Parent != null) {
+                Parent.RemoveChild(this);
+            }
+            overlay.AddChild(this);
+            _attachedRoot = overlay;
         }
+        if (_logicalParent != null) {
+            ReceiveInheritedDataContext(_logicalParent.EffectiveDataContextBox());
+            ReceiveInheritedTypography(
+                _logicalParent.EffectiveTextFontSizeOrZero(),
+                _logicalParent.EffectiveTextFontFamilyOrEmpty(),
+                _logicalParent.EffectiveTextFontWeightOrEmpty(),
+                _logicalParent.EffectiveTextForeground());
+        }
+        BindingEngine.FlushSubtree(this);
     }
 
     private void DetachOverlay() {
@@ -148,22 +218,106 @@ public class Popup : FrameworkElement {
     }
 
     public void UpdatePosition() {
-        if (_placementTarget != null) {
-            float x = _placementTarget.LayoutX + _horizOffset;
-            float y = _placementTarget.LayoutY + _vertOffset;
-            if (_placement == "Bottom") {
-                y = y + _placementTarget.ActualHeight;
-            } else if (_placement == "Right") {
-                x = x + _placementTarget.ActualWidth;
-            } else if (_placement == "Top") {
-                y = y - Math.Maxf(24.0f, ActualHeight);
+        if (!_isOpen) { return; }
+        UIElement anchor = _placementTarget != null ? _placementTarget : _logicalParent;
+        if (anchor != null) {
+            float vx = anchor.ViewportX;
+            float vy = anchor.ViewportY;
+            float vw = anchor.ScreenBoundsWidth;
+            float vh = anchor.ScreenBoundsHeight;
+            if (vw <= 0.0f && vh <= 0.0f) {
+                vx = anchor.LayoutX;
+                vy = anchor.LayoutY;
+                vw = anchor.ActualWidth;
+                vh = anchor.ActualHeight;
             }
-            UIElement.SetCanvasLeft(this, x);
-            UIElement.SetCanvasTop(this, y);
+            float scaleX = (anchor.ActualWidth > 0.5f && vw > 0.5f) ? (vw / anchor.ActualWidth) : 1.0f;
+            float scaleY = (anchor.ActualHeight > 0.5f && vh > 0.5f) ? (vh / anchor.ActualHeight) : 1.0f;
+            if (Math.Absf(scaleX - _appliedScaleX) > 0.005f || Math.Absf(scaleY - _appliedScaleY) > 0.005f) {
+                _appliedScaleX = scaleX;
+                _appliedScaleY = scaleY;
+                RenderTransformOrigin = new Point(0.0f, 0.0f);
+                if (Math.Absf(scaleX - 1.0f) > 0.005f || Math.Absf(scaleY - 1.0f) > 0.005f) {
+                    RenderTransform = new ScaleTransform(scaleX, scaleY, 0.0f, 0.0f);
+                } else {
+                    RenderTransform = null;
+                }
+            }
+
+            float rawW = DesiredWidth > 1.0f ? DesiredWidth : (ActualWidth > 1.0f ? ActualWidth : anchor.ActualWidth);
+            float rawH = DesiredHeight > 1.0f ? DesiredHeight : (ActualHeight > 1.0f ? ActualHeight : 96.0f);
+            float popW = rawW * scaleX;
+            float popH = rawH * scaleY;
+
+            float x = vx + _horizOffset * scaleX;
+            float y = vy + _vertOffset * scaleY;
+            if (_placement == "Bottom") {
+                y = vy + vh + _vertOffset * scaleY;
+            } else if (_placement == "Right") {
+                x = vx + vw + _horizOffset * scaleX;
+            } else if (_placement == "Top") {
+                y = vy - popH - _vertOffset * scaleY;
+            }
+
+            UIElement root = PopupService.ResolveOverlayHost(anchor);
+            float rootW = root != null ? root.ActualWidth : 0.0f;
+            float rootH = root != null ? root.ActualHeight : 0.0f;
+            if (_placement == "Bottom" && rootH > 0.0f && popH > 0.0f && (y + popH > rootH)) {
+                float aboveY = vy - popH - _vertOffset * scaleY;
+                if (aboveY >= 0.0f) {
+                    y = aboveY;
+                } else {
+                    y = Math.Maxf(0.0f, rootH - popH);
+                }
+            } else if (_placement == "Top" && y < 0.0f && rootH > 0.0f) {
+                float belowY = vy + vh + _vertOffset * scaleY;
+                if (belowY + popH <= rootH) {
+                    y = belowY;
+                }
+            }
+            if (rootW > 0.0f && popW > 0.0f && x + popW > rootW) {
+                x = Math.Maxf(0.0f, rootW - popW);
+            }
+            if (x < 0.0f) { x = 0.0f; }
+
+            float curLeft = UIElement.GetCanvasLeft(this);
+            float curTop = UIElement.GetCanvasTop(this);
+            if (ParseUtil.IsNaN(curLeft) || Math.Absf(curLeft - x) > 0.1f) {
+                UIElement.SetCanvasLeft(this, x);
+            }
+            if (ParseUtil.IsNaN(curTop) || Math.Absf(curTop - y) > 0.1f) {
+                UIElement.SetCanvasTop(this, y);
+            }
         } else {
-            UIElement.SetCanvasLeft(this, _horizOffset);
-            UIElement.SetCanvasTop(this, _vertOffset);
+            float curLeft = UIElement.GetCanvasLeft(this);
+            float curTop = UIElement.GetCanvasTop(this);
+            if (ParseUtil.IsNaN(curLeft) || Math.Absf(curLeft - _horizOffset) > 0.1f) {
+                UIElement.SetCanvasLeft(this, _horizOffset);
+            }
+            if (ParseUtil.IsNaN(curTop) || Math.Absf(curTop - _vertOffset) > 0.1f) {
+                UIElement.SetCanvasTop(this, _vertOffset);
+            }
         }
+    }
+
+    public override bool SetPropertyValue(string propName, DependencyObject value) {
+        if (propName == "IsOpen") { IsOpen = DependencyObject.UnboxBool(value, false); return true; }
+        if (propName == "StaysOpen") { StaysOpen = DependencyObject.UnboxBool(value, false); return true; }
+        if (propName == "Placement") { Placement = DependencyObject.UnboxString(value, "Bottom"); return true; }
+        if (propName == "HorizontalOffset") { HorizontalOffset = DependencyObject.UnboxFloat(value, 0.0f); return true; }
+        if (propName == "VerticalOffset") { VerticalOffset = DependencyObject.UnboxFloat(value, 0.0f); return true; }
+        if (propName == "Child" && value is UIElement) { Child = value as UIElement; return true; }
+        return base.SetPropertyValue(propName, value);
+    }
+
+    public override DependencyObject GetPropertyValue(string propName) {
+        if (propName == "IsOpen") { return DependencyObject.BoxBool(_isOpen); }
+        if (propName == "StaysOpen") { return DependencyObject.BoxBool(_staysOpen); }
+        if (propName == "Placement") { return DependencyObject.BoxString(_placement); }
+        if (propName == "HorizontalOffset") { return DependencyObject.BoxFloat(_horizOffset); }
+        if (propName == "VerticalOffset") { return DependencyObject.BoxFloat(_vertOffset); }
+        if (propName == "Child") { return Child; }
+        return base.GetPropertyValue(propName);
     }
 }
 

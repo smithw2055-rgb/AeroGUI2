@@ -183,6 +183,13 @@ public:
         DecodedImage image,
         bool forceStandalone = false);
 
+    // Allocate or update a dedicated standalone RGBA8 texture slot for procedural/vector masks.
+    std::uint32_t RegisterOrUpdateRgbaTextureSlot(
+        std::uint32_t reuseSlotId,
+        std::uint32_t width,
+        std::uint32_t height,
+        std::vector<std::uint8_t>&& rgbaPixels);
+
     // Resolve URI (memory provider -> direct path -> localBaseDir -> baseDir -> searchDirs), decode & cache
     const ImageAtlasEntry* LoadOrGet(
         std::string_view uri,

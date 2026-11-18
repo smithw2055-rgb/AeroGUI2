@@ -59,6 +59,11 @@ struct MockGlSpyState {
         drawCalls = 0;
         texImage2dCalls = 0;
         texSubImage2dCalls = 0;
+        lastGlViewportW = 0;
+        lastGlViewportH = 0;
+        lastUniformViewportW = 0.0f;
+        lastUniformViewportH = 0.0f;
+        scissorHistory.clear();
         fboBindHistory.clear();
         programBindHistory.clear();
     }
@@ -74,14 +79,30 @@ struct MockGlSpyState {
     int drawCalls = 0;
     int texImage2dCalls = 0;
     int texSubImage2dCalls = 0;
+    aero::AeroGLsizei lastGlViewportW = 0;
+    aero::AeroGLsizei lastGlViewportH = 0;
+    aero::AeroGLfloat lastUniformViewportW = 0.0f;
+    aero::AeroGLfloat lastUniformViewportH = 0.0f;
+    struct ScissorRecord {
+        aero::AeroGLint x = 0;
+        aero::AeroGLint y = 0;
+        aero::AeroGLsizei w = 0;
+        aero::AeroGLsizei h = 0;
+    };
+    std::vector<ScissorRecord> scissorHistory;
     std::vector<aero::AeroGLuint> fboBindHistory;
     std::vector<aero::AeroGLuint> programBindHistory;
 };
 
 MockGlSpyState gMockGl;
 
-void AERO_GL_APIENTRY MockViewport(aero::AeroGLint, aero::AeroGLint, aero::AeroGLsizei, aero::AeroGLsizei) {}
-void AERO_GL_APIENTRY MockScissor(aero::AeroGLint, aero::AeroGLint, aero::AeroGLsizei, aero::AeroGLsizei) {}
+void AERO_GL_APIENTRY MockViewport(aero::AeroGLint, aero::AeroGLint, aero::AeroGLsizei w, aero::AeroGLsizei h) {
+    gMockGl.lastGlViewportW = w;
+    gMockGl.lastGlViewportH = h;
+}
+void AERO_GL_APIENTRY MockScissor(aero::AeroGLint x, aero::AeroGLint y, aero::AeroGLsizei w, aero::AeroGLsizei h) {
+    gMockGl.scissorHistory.push_back(MockGlSpyState::ScissorRecord{x, y, w, h});
+}
 void AERO_GL_APIENTRY MockEnable(aero::AeroGLenum) {}
 void AERO_GL_APIENTRY MockDisable(aero::AeroGLenum) {}
 void AERO_GL_APIENTRY MockBlendFuncSeparate(aero::AeroGLenum, aero::AeroGLenum, aero::AeroGLenum, aero::AeroGLenum) {}
@@ -131,10 +152,18 @@ void AERO_GL_APIENTRY MockUseProgram(aero::AeroGLuint prog) {
     gMockGl.programBindHistory.push_back(prog);
 }
 aero::AeroGLint AERO_GL_APIENTRY MockGetUniformLocation(aero::AeroGLuint, const aero::AeroGLchar* name) {
-    return (name != nullptr) ? 1 : -1;
+    if (!name) {
+        return -1;
+    }
+    return (std::string_view(name) == "u_ViewportSize") ? 2 : 1;
 }
 void AERO_GL_APIENTRY MockUniform1i(aero::AeroGLint, aero::AeroGLint) {}
-void AERO_GL_APIENTRY MockUniform2f(aero::AeroGLint, aero::AeroGLfloat, aero::AeroGLfloat) {}
+void AERO_GL_APIENTRY MockUniform2f(aero::AeroGLint loc, aero::AeroGLfloat x, aero::AeroGLfloat y) {
+    if (loc == 2) {
+        gMockGl.lastUniformViewportW = x;
+        gMockGl.lastUniformViewportH = y;
+    }
+}
 
 void AERO_GL_APIENTRY MockGenTextures(aero::AeroGLsizei n, aero::AeroGLuint* out) {
     for (aero::AeroGLsizei i = 0; i < n; ++i) out[i] = gMockGl.nextId++;
@@ -760,6 +789,93 @@ bool TestNativeWindowHostKeysClipboardAndDrivers() {
     return true;
 }
 
+bool TestHighDpiMockGlViewportAndScissor() {
+    auto store = std::make_shared<aero::UIResourceStore>();
+    aero::VisualWorld world(nullptr, store.get());
+    const aero::VisualNodeId root = world.CreateNode(aero::VisualKind::Box);
+    world.SetRoot(root);
+    world.SetSize(root, 1280.0f, 800.0f);
+
+    const aero::VisualNodeId clipBox = world.CreateNode(aero::VisualKind::Box);
+    world.AddChild(root, clipBox);
+    world.SetAlignment(clipBox, aero::HorizontalAlignment::Left, aero::VerticalAlignment::Top);
+    world.SetMargin(clipBox, 100.0f, 50.0f, 0.0f, 0.0f);
+    world.SetSize(clipBox, 300.0f, 200.0f);
+    world.SetClipToBounds(clipBox, true);
+    world.SetBoxStyle(
+        clipBox,
+        aero::ParseColorRgba32("#FF3366CC"),
+        0u,
+        0.0f, 0.0f, 0.0f, 0.0f,
+        0.0f, 0.0f, 0.0f, 0.0f);
+    world.UpdateLayout(1280.0f, 800.0f);
+
+    aero::DrawingCommandBuffer drawBuf;
+    aero::VisualRenderAdapter adapter;
+    aero::PagedRenderTree tree;
+    tree.SetResourceStore(store.get());
+    AERO_CHECK(adapter.SyncPagedRenderTree(world, &drawBuf, tree, store.get()) >= 1u);
+    tree.SetRootDpiScale(2.0f);
+
+    aero::ZeroCopyGpuStream stream(aero::ShaderBackend::DesktopGL33, 16u);
+    (void)stream.SubmitDirtyPages(tree);
+
+    gMockGl.Reset();
+    const aero::GlFunctionTable gl = MakeMinimalMockGlTable();
+    aero::OpenGlDeviceBackend backend(gl);
+    aero::GpuBackendConfig cfg{};
+    cfg.initialViewportWidth = 2560u;
+    cfg.initialViewportHeight = 1600u;
+    AERO_CHECK(backend.Initialize(cfg));
+
+    const aero::GpuBackendFrameStats frame = backend.PresentStream(
+        tree,
+        stream,
+        2560u,
+        1600u,
+        aero::Color{0.0f, 0.0f, 0.0f, 1.0f});
+    AERO_CHECK(frame.succeeded);
+    AERO_CHECK(gMockGl.lastGlViewportW == 2560 && gMockGl.lastGlViewportH == 1600);
+    AERO_CHECK(std::fabs(gMockGl.lastUniformViewportW - 1280.0f) < 1e-3f);
+    AERO_CHECK(std::fabs(gMockGl.lastUniformViewportH - 800.0f) < 1e-3f);
+    AERO_CHECK(!gMockGl.scissorHistory.empty());
+    const auto sc = gMockGl.scissorHistory.front();
+    // Logical (x=100, y=50, w=300, h=200) @ 2.0x -> physical (x=200, bottomY=1600-(50+200)*2=1100, w=600, h=400)
+    AERO_CHECK(sc.x == 200 && sc.y == 1100 && sc.w == 600 && sc.h == 400);
+    backend.Shutdown();
+    return true;
+}
+
+bool TestWindowExactClientSizeNoDpiScaling() {
+    aero::NativeWindowConfig defCfg{};
+    AERO_CHECK(!defCfg.enableHighDpi);
+
+    defCfg.width = 1280u;
+    defCfg.height = 800u;
+    defCfg.forceHeadless = true;
+
+    aero::NativeWindowHost host1;
+    AERO_CHECK(host1.Initialize(defCfg));
+    AERO_CHECK(host1.Width() == 1280u);
+    AERO_CHECK(host1.Height() == 800u);
+    AERO_CHECK(host1.LogicalWidth() == 1280u);
+    AERO_CHECK(host1.LogicalHeight() == 800u);
+    AERO_CHECK(std::fabs(host1.DpiScale() - 1.0f) < 1e-4f);
+    host1.Shutdown();
+
+    aero::NativeWindowConfig explicitScaleCfg = defCfg;
+    explicitScaleCfg.dpiScale = 2.0f;
+    aero::NativeWindowHost host2;
+    AERO_CHECK(host2.Initialize(explicitScaleCfg));
+    AERO_CHECK(host2.Width() == 1280u);
+    AERO_CHECK(host2.Height() == 800u);
+    AERO_CHECK(host2.LogicalWidth() == 640u);
+    AERO_CHECK(host2.LogicalHeight() == 400u);
+    AERO_CHECK(std::fabs(host2.DpiScale() - 2.0f) < 1e-4f);
+    host2.Shutdown();
+    return true;
+}
+
 } // namespace
 
 int main() {
@@ -774,6 +890,8 @@ int main() {
         {"ShadersStoreIsolationAndSoftwareRasterizer", &TestShadersStoreIsolationAndSoftwareRasterizer},
         {"MockGlBackendFboAndFallback", &TestMockGlBackendFboAndFallback},
         {"NativeWindowHostKeysClipboardAndDrivers", &TestNativeWindowHostKeysClipboardAndDrivers},
+        {"HighDpiMockGlViewportAndScissor", &TestHighDpiMockGlViewportAndScissor},
+        {"WindowExactClientSizeNoDpiScaling", &TestWindowExactClientSizeNoDpiScaling},
     };
 
     int passed = 0;

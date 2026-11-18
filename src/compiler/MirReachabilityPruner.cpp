@@ -21,6 +21,10 @@ constexpr std::uint32_t kInvalidSlot = std::numeric_limits<std::uint32_t>::max()
     return moduleName == "Aero.UI" || moduleName == "Aero.Native";
 }
 
+[[nodiscard]] bool IsPrunableFunctionOnlyModule(std::string_view moduleName) noexcept {
+    return moduleName == "RealScript.Math";
+}
+
 [[nodiscard]] bool StartsWith(std::string_view text, std::string_view prefix) noexcept {
     return text.size() >= prefix.size() && text.substr(0u, prefix.size()) == prefix;
 }
@@ -202,7 +206,9 @@ bool PruneUnreachableStdlibMir(
     const bool hasPrunableStdlib = std::any_of(
         mirModules.begin(),
         mirModules.end(),
-        [](const rs_mir::Module& mod) { return IsPrunableStdlibModule(mod.name); });
+        [](const rs_mir::Module& mod) {
+            return IsPrunableStdlibModule(mod.name) || IsPrunableFunctionOnlyModule(mod.name);
+        });
     if (!hasPrunableStdlib) {
         stats.retainedTypes = stats.totalTypesBefore;
         stats.retainedFunctions = stats.totalFunctionsBefore;
@@ -222,7 +228,7 @@ bool PruneUnreachableStdlibMir(
     backups.reserve(mirModules.size());
     for (std::size_t i = 0u; i < mirModules.size(); ++i) {
         const auto& mod = mirModules[i];
-        if (IsPrunableStdlibModule(mod.name)) {
+        if (IsPrunableStdlibModule(mod.name) || IsPrunableFunctionOnlyModule(mod.name)) {
             backups.push_back(ModuleMutationBackup{i, true, mod, {}});
         } else {
             const bool hasImportedStdlibTypes = std::any_of(
@@ -450,7 +456,7 @@ bool PruneUnreachableStdlibMir(
 
     // 3. Seed roots: all non-stdlib modules + host-dispatched Aero.UI runtime roots.
     for (const auto& mod : mirModules) {
-        if (IsPrunableStdlibModule(mod.name)) {
+        if (IsPrunableStdlibModule(mod.name) || IsPrunableFunctionOnlyModule(mod.name)) {
             continue;
         }
         for (const auto& fn : mod.functions) {
@@ -696,7 +702,7 @@ bool PruneUnreachableStdlibMir(
                 t.properties.end());
         }
 
-        if (!IsPrunableStdlibModule(mod.name)) {
+        if (!IsPrunableStdlibModule(mod.name) && !IsPrunableFunctionOnlyModule(mod.name)) {
             // Shrink non-stdlib modules' imported Aero.UI / Aero.Native TypeSymbol copies
             // down to ONLY the structural closure required by this module's own code/types.
             std::unordered_map<SymbolId, const rs_sem::TypeSymbol*> modTypeById;
@@ -883,6 +889,10 @@ bool PruneUnreachableStdlibMir(
                            retainedFnIds.count(entry.callerSymbolId) == 0u;
                 }),
             meta.inlinedDependencies.end());
+
+        if (IsPrunableFunctionOnlyModule(mod.name)) {
+            continue;
+        }
 
         meta.attributes.erase(
             std::remove_if(

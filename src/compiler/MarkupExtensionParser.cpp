@@ -113,7 +113,29 @@ private:
             if (Peek(1) == '}') {
                 pos_ += 2;
                 std::string raw;
-                while (!AtEnd() && Peek() != ',' && Peek() != '}') {
+                int braceDepth = 0;
+                int parenDepth = 0;
+                int bracketDepth = 0;
+                while (!AtEnd()) {
+                    const char ch = Peek();
+                    if (ch == '{') {
+                        ++braceDepth;
+                    } else if (ch == '}') {
+                        if (braceDepth == 0 && parenDepth == 0 && bracketDepth == 0) {
+                            break;
+                        }
+                        if (braceDepth > 0) --braceDepth;
+                    } else if (ch == '(') {
+                        ++parenDepth;
+                    } else if (ch == ')' && parenDepth > 0) {
+                        --parenDepth;
+                    } else if (ch == '[') {
+                        ++bracketDepth;
+                    } else if (ch == ']' && bracketDepth > 0) {
+                        --bracketDepth;
+                    } else if (ch == ',' && braceDepth == 0 && parenDepth == 0 && bracketDepth == 0) {
+                        break;
+                    }
                     raw.push_back(Advance());
                 }
                 val.literal = std::string(aero::str::Trim(raw));
@@ -131,13 +153,16 @@ private:
         std::string raw;
         int parenDepth = 0;
         int bracketDepth = 0;
+        int braceDepth = 0;
         while (!AtEnd()) {
             const char ch = Peek();
-            if (ch == '(') ++parenDepth;
+            if (ch == '{') ++braceDepth;
+            else if (ch == '}' && braceDepth > 0) --braceDepth;
+            else if (ch == '(') ++parenDepth;
             else if (ch == ')' && parenDepth > 0) --parenDepth;
             else if (ch == '[') ++bracketDepth;
             else if (ch == ']' && bracketDepth > 0) --bracketDepth;
-            else if (parenDepth == 0 && bracketDepth == 0 && (ch == ',' || ch == '}')) {
+            else if (braceDepth == 0 && parenDepth == 0 && bracketDepth == 0 && (ch == ',' || ch == '}')) {
                 break;
             }
             raw.push_back(Advance());

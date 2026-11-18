@@ -61,6 +61,8 @@ int __rs_native_Visual_SetBoxStyle(handle node, uint bgRgba, uint borderRgba, fl
 public void Visual_SetBoxStyle(handle node, uint bgRgba, uint borderRgba, float btL, float btT, float btR, float btB, float crTL, float crTR, float crBR, float crBL) { __rs_native_Visual_SetBoxStyle(node, bgRgba, borderRgba, btL, btT, btR, btB, crTL, crTR, crBR, crBL); return; }
 int __rs_native_Visual_SetBoxGradients(handle node, int bgGradId, int borderGradId) { return 0; }
 public void Visual_SetBoxGradients(handle node, int bgGradId, int borderGradId) { __rs_native_Visual_SetBoxGradients(node, bgGradId, borderGradId); return; }
+int __rs_native_Visual_SetBoxBrushOpacity(handle node, float bgOpacity) { return 0; }
+public void Visual_SetBoxBrushOpacity(handle node, float bgOpacity) { __rs_native_Visual_SetBoxBrushOpacity(node, bgOpacity); return; }
 public int Visual_RegisterLinearGradient(float x0, float y0, float x1, float y1, int spread, int mapping, string stopsSpec) { return 0; }
 public int Visual_RegisterRadialGradient(float cx, float cy, float ox, float oy, float rx, float ry, int spread, int mapping, string stopsSpec) { return 0; }
 int __rs_native_Visual_SetTransform2D(handle node, float tx, float ty, float sx, float sy, float rotDeg, float skewX, float skewY, float ox, float oy) { return 0; }
@@ -120,7 +122,12 @@ public void Visual_InvalidateDraw(handle node) { __rs_native_Visual_InvalidateDr
 
 // Animation, Host & Reflection
 public int Anim_StartFloat(handle node, int prop, float fromVal, float toVal, float durationSec, int easeKind, int easeMode, float delaySec, bool autoReverse, int repeatCount) { return 0; }
+public int Anim_StartFloatTo(handle node, int prop, float toVal, float durationSec, int easeKind, int easeMode, float delaySec, bool autoReverse, int repeatCount) { return 0; }
 public int Anim_StartColor(handle node, int prop, uint fromRgba, uint toRgba, float durationSec, int easeKind, int easeMode) { return 0; }
+public int Anim_StartColorDelayed(handle node, int prop, uint fromRgba, uint toRgba, float durationSec, int easeKind, int easeMode, float delaySec) { return 0; }
+public int Anim_StartColorTo(handle node, int prop, uint toRgba, float durationSec, int easeKind, int easeMode, float delaySec) { return 0; }
+public float Anim_ReadCurrentFloat(handle node, int prop) { return 0.0f; }
+public uint Anim_ReadCurrentColor(handle node, int prop) { return 0u; }
 public int Anim_SpringFloat(handle node, int prop, float targetVal, float stiffness, float damping) { return 0; }
 int __rs_native_Anim_StopAll(handle node) { return 0; }
 public void Anim_StopAll(handle node) { __rs_native_Anim_StopAll(node); return; }
@@ -143,6 +150,7 @@ public float Reflect_GetPropFloat(object target, string propPath) { return 0.0f;
 public int Reflect_GetPropInt(object target, string propPath) { return 0; }
 public bool Reflect_GetPropBool(object target, string propPath) { return false; }
 public object Reflect_GetPropObject(object target, string propPath) { return null; }
+public int Reflect_GetPropTypeKind(object target, string propPath) { return 0; }
 public bool Reflect_SetPropString(object target, string propPath, string val) { return false; }
 public bool Reflect_SetPropFloat(object target, string propPath, float val) { return false; }
 public bool Reflect_SetPropInt(object target, string propPath, int val) { return false; }

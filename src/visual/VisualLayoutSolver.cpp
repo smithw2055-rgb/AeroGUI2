@@ -106,11 +106,6 @@ void ComputeViewboxScale(
 
     float sx = infW ? 1.0f : (std::max(0.0f, availW) / contentW);
     float sy = infH ? 1.0f : (std::max(0.0f, availH) / contentH);
-    if (infW) {
-        sx = sy;
-    } else if (infH) {
-        sy = sx;
-    }
 
     switch (stretch) {
         case Stretch::None:
@@ -120,12 +115,22 @@ void ComputeViewboxScale(
         case Stretch::Fill:
             break;
         case Stretch::Uniform: {
+            if (infW) {
+                sx = sy;
+            } else if (infH) {
+                sy = sx;
+            }
             const float u = std::min(sx, sy);
             sx = u;
             sy = u;
             break;
         }
         case Stretch::UniformToFill: {
+            if (infW) {
+                sx = sy;
+            } else if (infH) {
+                sy = sx;
+            }
             const float u = std::max(sx, sy);
             sx = u;
             sy = u;
@@ -212,6 +217,14 @@ void ComputeViewboxScale(
         case VisualKind::Vector: {
             if (node.vector.shapeKind == VectorShapeKind::SvgPath && !node.vector.pathOrParams.empty()) {
                 const Rect bounds = MeasureSvgPathBounds(node.vector.pathOrParams);
+                if (node.vector.stretch == Stretch::None) {
+                    if (bounds.width > 0.0f || bounds.height > 0.0f) {
+                        return Size{
+                            std::max(0.0f, bounds.x + bounds.width),
+                            std::max(0.0f, bounds.y + bounds.height)};
+                    }
+                    return Size{0.0f, 0.0f};
+                }
                 if (bounds.width > 0.0f && bounds.height > 0.0f) {
                     Size out{};
                     (void)ResolveStretchedExtent(
@@ -487,16 +500,21 @@ void ResolveStarTracksFromInfinite(
         }
     }
 
-    // Group 2: Auto/Star cross cells: measure Star-width+Auto-height or Auto-width+Star-height first if finite
+    // Group 2a: Auto/Star cross cells (one axis has Star, the other has Pixel/Auto).
+    // Measure the non-Star axis with SpanAvailExtent (kInf for Auto) so Auto tracks expand before Star-Star cells.
     ResolveStarTracks(cols, availW);
     ResolveStarTracks(rows, availH);
 
     for (const GridChildCell& item : items) {
-        if (!item.hasStarRow && !item.hasStarCol) {
+        if (item.hasStarRow == item.hasStarCol) {
             continue;
         }
-        const float cw = (!std::isfinite(availW) && item.hasStarCol) ? kInf : SumTrackSpan(cols, item.c0, item.cSpan);
-        const float ch = (!std::isfinite(availH) && item.hasStarRow) ? kInf : SumTrackSpan(rows, item.r0, item.rSpan);
+        const float cw = !item.hasStarCol
+            ? SpanAvailExtent(cols, item.c0, item.cSpan)
+            : (std::isfinite(availW) ? SumTrackSpan(cols, item.c0, item.cSpan) : kInf);
+        const float ch = !item.hasStarRow
+            ? SpanAvailExtent(rows, item.r0, item.rSpan)
+            : (std::isfinite(availH) ? SumTrackSpan(rows, item.r0, item.rSpan) : kInf);
         const Size d = MeasureNode(world, item.id, Size{cw, ch});
         if (!item.hasStarCol) {
             DistributeGridSpanDemand(cols, item.c0, item.cSpan, GridUnitType::Auto, d.width);
@@ -510,7 +528,7 @@ void ResolveStarTracksFromInfinite(
         }
     }
 
-    // Re-resolve Star after Auto growth, and re-measure Star cells with exact final track sizes
+    // Re-resolve Star after Auto growth, and measure all Star-participating cells with final track constraints
     if (std::isfinite(availW)) {
         ResolveStarTracks(cols, availW);
     }
@@ -521,17 +539,62 @@ void ResolveStarTracksFromInfinite(
         if (!item.hasStarRow && !item.hasStarCol) {
             continue;
         }
-        const float cw = SumTrackSpan(cols, item.c0, item.cSpan);
-        const float ch = SumTrackSpan(rows, item.r0, item.rSpan);
-        (void)MeasureNode(world, item.id, Size{cw, ch});
+        const float cw = (!std::isfinite(availW) && item.hasStarCol) ? kInf : SumTrackSpan(cols, item.c0, item.cSpan);
+        const float ch = (!std::isfinite(availH) && item.hasStarRow) ? kInf : SumTrackSpan(rows, item.r0, item.rSpan);
+        const Size d = MeasureNode(world, item.id, Size{cw, ch});
+        if (!std::isfinite(availW) && item.hasStarCol) {
+            ResolveStarTracksFromInfinite(cols, item.c0, item.cSpan, d.width);
+        }
+        if (!std::isfinite(availH) && item.hasStarRow) {
+            ResolveStarTracksFromInfinite(rows, item.r0, item.rSpan, d.height);
+        }
+    }
+
+    std::vector<GridTrackSolved> desiredCols = cols;
+    std::vector<GridTrackSolved> desiredRows = rows;
+    for (GridTrackSolved& c : desiredCols) {
+        if (c.unit == GridUnitType::Star) {
+            c.size = 0.0f;
+        }
+    }
+    for (GridTrackSolved& r : desiredRows) {
+        if (r.unit == GridUnitType::Star) {
+            r.size = 0.0f;
+        }
+    }
+    for (const GridChildCell& item : items) {
+        const VisualNode* child = world.GetNode(item.id);
+        if (!child) {
+            continue;
+        }
+        if (item.hasStarCol) {
+            ResolveStarTracksFromInfinite(desiredCols, item.c0, item.cSpan, child->layout.desiredSize.width);
+        }
+        if (item.hasStarRow) {
+            ResolveStarTracksFromInfinite(desiredRows, item.r0, item.rSpan, child->layout.desiredSize.height);
+        }
+    }
+    if (std::isfinite(availW)) {
+        for (std::size_t i = 0u; i < desiredCols.size(); ++i) {
+            if (desiredCols[i].unit == GridUnitType::Star) {
+                desiredCols[i].size = std::min(desiredCols[i].size, cols[i].size);
+            }
+        }
+    }
+    if (std::isfinite(availH)) {
+        for (std::size_t i = 0u; i < desiredRows.size(); ++i) {
+            if (desiredRows[i].unit == GridUnitType::Star) {
+                desiredRows[i].size = std::min(desiredRows[i].size, rows[i].size);
+            }
+        }
     }
 
     float totalW = 0.0f;
-    for (const GridTrackSolved& c : cols) {
+    for (const GridTrackSolved& c : desiredCols) {
         totalW += c.size;
     }
     float totalH = 0.0f;
-    for (const GridTrackSolved& r : rows) {
+    for (const GridTrackSolved& r : desiredRows) {
         totalH += r.size;
     }
     return Size{totalW, totalH};
@@ -1503,11 +1566,20 @@ void UpdateWorldTransformsRecursive(
         return;
     }
 
+    const Matrix2D prevWorld2D = node->layout.worldTransform;
     const Matrix2D local2D = ComputeNodeLocalMatrix2D(*node);
     const Matrix2D world2D = local2D.IsIdentity()
         ? parentWorld2D
         : Matrix2D::Multiply(parentWorld2D, local2D);
     node->layout.worldTransform = world2D;
+
+    bool transformChanged =
+        std::fabs(prevWorld2D.m00 - world2D.m00) > 1e-5f ||
+        std::fabs(prevWorld2D.m01 - world2D.m01) > 1e-5f ||
+        std::fabs(prevWorld2D.m10 - world2D.m10) > 1e-5f ||
+        std::fabs(prevWorld2D.m11 - world2D.m11) > 1e-5f ||
+        std::fabs(prevWorld2D.tx - world2D.tx) > 1e-5f ||
+        std::fabs(prevWorld2D.ty - world2D.ty) > 1e-5f;
 
     const VisualTransform3D& t3 = node->transform3D;
     const bool hasLocal3D = t3.enabled && (
@@ -1516,8 +1588,12 @@ void UpdateWorldTransformsRecursive(
         t3.camDist > 0.0f);
 
     Matrix4x4 nextWorld3D{};
+    const bool prevHas3D = node->layout.hasPerspective3D;
     const bool nextHas3D = parentHas3D || hasLocal3D;
     node->layout.hasPerspective3D = nextHas3D;
+    if (prevHas3D != nextHas3D) {
+        transformChanged = true;
+    }
 
     if (nextHas3D) {
         Matrix4x4 base3D = parentHas3D ? parentWorld3D : Matrix4x4::FromMatrix2D(parentWorld2D);
@@ -1540,11 +1616,20 @@ void UpdateWorldTransformsRecursive(
         } else {
             nextWorld3D = base3D;
         }
+        for (int mi = 0; mi < 16; ++mi) {
+            if (std::fabs(node->layout.worldMatrix3D.m[mi] - nextWorld3D.m[mi]) > 1e-5f) {
+                transformChanged = true;
+                break;
+            }
+        }
         node->layout.worldMatrix3D = nextWorld3D;
     } else {
         node->layout.worldMatrix3D = Matrix4x4{};
     }
 
+    if (transformChanged) {
+        node->dirtyFlags = static_cast<std::uint8_t>(node->dirtyFlags | VisualDirty_Visual);
+    }
     node->dirtyFlags = static_cast<std::uint8_t>(node->dirtyFlags & ~VisualDirty_Transform);
 
     for (VisualNodeId cid : node->children) {

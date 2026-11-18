@@ -981,23 +981,28 @@ bool NativeWindowHost::Initialize(const NativeWindowConfig& config) {
     ShutdownPlatformWindow();
 
     config_ = config;
-    logicalWidth_ = std::max<std::uint32_t>(1u, config.width);
-    logicalHeight_ = std::max<std::uint32_t>(1u, config.height);
+    width_ = std::max<std::uint32_t>(1u, config.width);
+    height_ = std::max<std::uint32_t>(1u, config.height);
     dpiScale_ = 1.0f;
+#if defined(_WIN32)
+    if (!config.forceHeadless && !gpuBackend_) {
+        EnableWin32PerMonitorDpiV2();
+    }
+#endif
     if (config.dpiScale > 0.0f && std::isfinite(config.dpiScale)) {
         dpiScale_ = std::clamp(config.dpiScale, 0.25f, 8.0f);
     } else if (!config.forceHeadless && !gpuBackend_ && config.enableHighDpi) {
 #if defined(_WIN32)
-        EnableWin32PerMonitorDpiV2();
         dpiScale_ = QueryWin32SystemDpiScale();
 #endif
     }
-    width_ = std::max<std::uint32_t>(
+    const float invDpi = 1.0f / std::max(0.25f, dpiScale_);
+    logicalWidth_ = std::max<std::uint32_t>(
         1u,
-        static_cast<std::uint32_t>(std::lround(static_cast<float>(logicalWidth_) * dpiScale_)));
-    height_ = std::max<std::uint32_t>(
+        static_cast<std::uint32_t>(std::lround(static_cast<float>(width_) * invDpi)));
+    logicalHeight_ = std::max<std::uint32_t>(
         1u,
-        static_cast<std::uint32_t>(std::lround(static_cast<float>(logicalHeight_) * dpiScale_)));
+        static_cast<std::uint32_t>(std::lround(static_cast<float>(height_) * invDpi)));
     clearColor_ = config.clearColor;
     closeRequested_.store(false, std::memory_order_release);
     wakeSignaled_.store(false, std::memory_order_release);
@@ -1135,7 +1140,6 @@ void NativeWindowHost::ShutdownPlatformWindow() noexcept {
         win32Hglrc_ = nullptr;
     }
     if (win32OpenglModule_) {
-        FreeLibrary(static_cast<HMODULE>(win32OpenglModule_));
         win32OpenglModule_ = nullptr;
     }
     if (win32ImmModule_) {
@@ -1149,6 +1153,7 @@ void NativeWindowHost::ShutdownPlatformWindow() noexcept {
     win32ImmProbed_ = false;
     pendingHighSurrogate_ = 0u;
     win32PressedMouseMask_ = 0u;
+    win32WindowShown_ = false;
     if (win32Hdc_ && win32Hwnd_) {
         ReleaseDC(static_cast<HWND>(win32Hwnd_), static_cast<HDC>(win32Hdc_));
         win32Hdc_ = nullptr;
@@ -1515,12 +1520,12 @@ bool NativeWindowHost::InitializePlatformWindowAndBackend(const NativeWindowConf
                 return 0;
             }
             case 0x02E0: { // WM_DPICHANGED
+                const UINT newDpiX = static_cast<UINT>(LOWORD(wParam));
+                const float borderScale = (newDpiX > 0u)
+                    ? std::clamp(static_cast<float>(newDpiX) / 96.0f, 0.25f, 8.0f)
+                    : QueryWin32WindowDpiScale(hwnd);
                 if (self->config_.enableHighDpi && self->config_.dpiScale <= 0.0f) {
-                    const UINT newDpiX = static_cast<UINT>(LOWORD(wParam));
-                    const float newScale = (newDpiX > 0u)
-                        ? std::clamp(static_cast<float>(newDpiX) / 96.0f, 0.25f, 8.0f)
-                        : QueryWin32WindowDpiScale(hwnd);
-                    self->UpdateDpiScale(newScale);
+                    self->UpdateDpiScale(borderScale);
                     if (const RECT* suggested = reinterpret_cast<const RECT*>(lParam)) {
                         SetWindowPos(
                             hwnd,
@@ -1531,6 +1536,19 @@ bool NativeWindowHost::InitializePlatformWindowAndBackend(const NativeWindowConf
                             suggested->bottom - suggested->top,
                             SWP_NOZORDER | SWP_NOACTIVATE);
                     }
+                } else {
+                    RECT wr{0, 0, static_cast<LONG>(self->width_), static_cast<LONG>(self->height_)};
+                    const DWORD style = static_cast<DWORD>(GetWindowLongPtrW(hwnd, GWL_STYLE));
+                    const DWORD exStyle = static_cast<DWORD>(GetWindowLongPtrW(hwnd, GWL_EXSTYLE));
+                    AdjustWin32WindowRectForDpi(&wr, style, FALSE, exStyle, borderScale);
+                    SetWindowPos(
+                        hwnd,
+                        nullptr,
+                        0,
+                        0,
+                        std::max(1, static_cast<int>(wr.right - wr.left)),
+                        std::max(1, static_cast<int>(wr.bottom - wr.top)),
+                        SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
                 }
                 return 0;
             }
@@ -1816,18 +1834,47 @@ bool NativeWindowHost::InitializePlatformWindowAndBackend(const NativeWindowConf
         }
     }
 
-    RECT wr{0, 0, static_cast<LONG>(width_), static_cast<LONG>(height_)};
-    AdjustWin32WindowRectForDpi(&wr, WS_OVERLAPPEDWINDOW, FALSE, 0u, dpiScale_);
-    const int outerW = wr.right - wr.left;
-    const int outerH = wr.bottom - wr.top;
+    auto computeClampedWindowBounds = [&](std::uint32_t clientW,
+                                          std::uint32_t clientH,
+                                          float scale,
+                                          int& outW,
+                                          int& outH,
+                                          int& outX,
+                                          int& outY) {
+        RECT wr{0, 0, static_cast<LONG>(clientW), static_cast<LONG>(clientH)};
+        AdjustWin32WindowRectForDpi(&wr, WS_OVERLAPPEDWINDOW, FALSE, 0u, scale);
+        outW = std::max(1, static_cast<int>(wr.right - wr.left));
+        outH = std::max(1, static_cast<int>(wr.bottom - wr.top));
+        outX = CW_USEDEFAULT;
+        outY = CW_USEDEFAULT;
+
+        RECT workArea{};
+        if (SystemParametersInfoW(SPI_GETWORKAREA, 0, &workArea, 0) &&
+            workArea.right > workArea.left && workArea.bottom > workArea.top) {
+            const int workW = static_cast<int>(workArea.right - workArea.left);
+            const int workH = static_cast<int>(workArea.bottom - workArea.top);
+            outW = std::min(outW, workW);
+            outH = std::min(outH, workH);
+            outX = static_cast<int>(workArea.left) + std::max(0, (workW - outW) / 2);
+            outY = static_cast<int>(workArea.top) + std::max(0, (workH - outH) / 2);
+        } else {
+            const int screenW = GetSystemMetrics(SM_CXSCREEN);
+            const int screenH = GetSystemMetrics(SM_CYSCREEN);
+            if (screenW > 0 && screenH > 0) {
+                outW = std::min(outW, screenW);
+                outH = std::min(outH, screenH);
+                outX = std::max(0, (screenW - outW) / 2);
+                outY = std::max(0, (screenH - outH) / 2);
+            }
+        }
+    };
+
+    int outerW = 0;
+    int outerH = 0;
     int posX = CW_USEDEFAULT;
     int posY = CW_USEDEFAULT;
-    const int screenW = GetSystemMetrics(SM_CXSCREEN);
-    const int screenH = GetSystemMetrics(SM_CYSCREEN);
-    if (screenW > 0 && screenH > 0) {
-        posX = std::max(0, (screenW - outerW) / 2);
-        posY = std::max(0, (screenH - outerH) / 2);
-    }
+    const float initialBorderDpi = QueryWin32SystemDpiScale();
+    computeClampedWindowBounds(width_, height_, initialBorderDpi, outerW, outerH, posX, posY);
     HWND hwnd = CreateWindowExW(
         0,
         kWndClassName,
@@ -1844,38 +1891,34 @@ bool NativeWindowHost::InitializePlatformWindowAndBackend(const NativeWindowConf
 
     if (hwnd) {
         win32Hwnd_ = hwnd;
+        win32WindowShown_ = false;
         EnableWin32DarkTitleBar(hwnd);
-        if (config.enableHighDpi && config.dpiScale <= 0.0f) {
-            const float winScale = QueryWin32WindowDpiScale(hwnd);
-            if (std::abs(winScale - dpiScale_) > 1e-3f) {
-                dpiScale_ = winScale;
-                width_ = std::max<std::uint32_t>(
-                    1u,
-                    static_cast<std::uint32_t>(std::lround(static_cast<float>(logicalWidth_) * dpiScale_)));
-                height_ = std::max<std::uint32_t>(
-                    1u,
-                    static_cast<std::uint32_t>(std::lround(static_cast<float>(logicalHeight_) * dpiScale_)));
-                RECT adj{0, 0, static_cast<LONG>(width_), static_cast<LONG>(height_)};
-                AdjustWin32WindowRectForDpi(&adj, WS_OVERLAPPEDWINDOW, FALSE, 0u, dpiScale_);
-                SetWindowPos(
-                    hwnd,
-                    nullptr,
-                    0,
-                    0,
-                    adj.right - adj.left,
-                    adj.bottom - adj.top,
-                    SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
-                gpuCfg.initialViewportWidth = width_;
-                gpuCfg.initialViewportHeight = height_;
-                if (desktopHost_) {
-                    desktopHost_->SetDpiScale(dpiScale_);
-                    desktopHost_->SetViewportSize(Size{static_cast<float>(width_), static_cast<float>(height_)});
-                }
-                if (webHost_) {
-                    webHost_->SetDpiScale(dpiScale_);
-                    webHost_->SetViewportSize(Size{static_cast<float>(width_), static_cast<float>(height_)});
-                }
-            }
+        const float winBorderDpi = QueryWin32WindowDpiScale(hwnd);
+        if (config.enableHighDpi && config.dpiScale <= 0.0f &&
+            std::abs(winBorderDpi - dpiScale_) > 1e-3f) {
+            dpiScale_ = winBorderDpi;
+            const float invDpi = 1.0f / std::max(0.25f, dpiScale_);
+            logicalWidth_ = std::max<std::uint32_t>(
+                1u,
+                static_cast<std::uint32_t>(std::lround(static_cast<float>(width_) * invDpi)));
+            logicalHeight_ = std::max<std::uint32_t>(
+                1u,
+                static_cast<std::uint32_t>(std::lround(static_cast<float>(height_) * invDpi)));
+        }
+        if (std::abs(winBorderDpi - initialBorderDpi) > 1e-3f) {
+            int adjW = 0;
+            int adjH = 0;
+            int adjX = 0;
+            int adjY = 0;
+            computeClampedWindowBounds(width_, height_, winBorderDpi, adjW, adjH, adjX, adjY);
+            SetWindowPos(
+                hwnd,
+                nullptr,
+                adjX,
+                adjY,
+                adjW,
+                adjH,
+                (adjX == CW_USEDEFAULT ? SWP_NOMOVE : 0u) | SWP_NOZORDER | SWP_NOACTIVATE);
         }
         RECT clientRect{};
         if (GetClientRect(hwnd, &clientRect)) {
@@ -1886,6 +1929,17 @@ bool NativeWindowHost::InitializePlatformWindowAndBackend(const NativeWindowConf
                 gpuCfg.initialViewportWidth = width_;
                 gpuCfg.initialViewportHeight = height_;
             }
+        }
+        if (desktopHost_) {
+            desktopHost_->SetDpiScale(dpiScale_);
+            desktopHost_->SetViewportSize(Size{static_cast<float>(width_), static_cast<float>(height_)});
+        }
+        if (webHost_) {
+            webHost_->SetDpiScale(dpiScale_);
+            webHost_->SetViewportSize(Size{static_cast<float>(width_), static_cast<float>(height_)});
+        }
+        if (renderTree_) {
+            renderTree_->SetRootDpiScale(dpiScale_);
         }
         HDC hdc = GetDC(hwnd);
         win32Hdc_ = hdc;
@@ -1899,7 +1953,8 @@ bool NativeWindowHost::InitializePlatformWindowAndBackend(const NativeWindowConf
             pfd.cColorBits = 32;
             const int pf = ChoosePixelFormat(hdc, &pfd);
             if (pf != 0 && SetPixelFormat(hdc, pf, &pfd)) {
-                HMODULE glMod = LoadLibraryA("opengl32.dll");
+                static HMODULE sGlMod = LoadLibraryA("opengl32.dll");
+                HMODULE glMod = sGlMod;
                 if (glMod) {
                     win32OpenglModule_ = static_cast<void*>(glMod);
                     auto wglCreateCtx = reinterpret_cast<HGLRC (WINAPI*)(HDC)>(
@@ -1938,8 +1993,6 @@ bool NativeWindowHost::InitializePlatformWindowAndBackend(const NativeWindowConf
                             gpuBackend_ = std::move(glBackend);
                             mode_ = NativeWindowMode::Win32WglOpenGL;
                             diagnostics_ = "Win32 HWND + WGL OpenGL 3.3 Core context initialized.";
-                            ShowWindow(hwnd, SW_SHOW);
-                            UpdateWindow(hwnd);
                             return true;
                         }
                         wglMakeCur(nullptr, nullptr);
@@ -1961,7 +2014,6 @@ bool NativeWindowHost::InitializePlatformWindowAndBackend(const NativeWindowConf
             gpuBackend_ = std::move(sw);
             mode_ = NativeWindowMode::Win32GdiSoftware;
             diagnostics_ = "Win32 HWND initialized with GDI SoftwareSurfaceBackend presenter.";
-            ShowWindow(hwnd, SW_SHOW);
             return true;
         }
         if (win32Hdc_) {
@@ -2451,9 +2503,12 @@ void NativeWindowHost::UpdateDpiScale(float newDpiScale) noexcept {
     needsInitialRender_ = true;
     if (desktopHost_) {
         desktopHost_->SetDpiScale(dpiScale_);
+        desktopHost_->SetViewportSize(Size{static_cast<float>(width_), static_cast<float>(height_)});
+        desktopHost_->NotifyDirtyLayout();
     }
     if (webHost_) {
         webHost_->SetDpiScale(dpiScale_);
+        webHost_->SetViewportSize(Size{static_cast<float>(width_), static_cast<float>(height_)});
     }
     if (renderTree_) {
         renderTree_->SetRootDpiScale(dpiScale_);
@@ -2601,9 +2656,10 @@ void NativeWindowHost::SwapOrBlitPlatformSurface() noexcept {
             bmi.bmiHeader.biPlanes = 1;
             bmi.bmiHeader.biBitCount = 32;
             bmi.bmiHeader.biCompression = BI_RGB;
+            SetStretchBltMode(static_cast<HDC>(win32Hdc_), COLORONCOLOR);
             StretchDIBits(
                 static_cast<HDC>(win32Hdc_),
-                0, 0, static_cast<int>(rw), static_cast<int>(rh),
+                0, 0, static_cast<int>(width_), static_cast<int>(height_),
                 0, 0, static_cast<int>(rw), static_cast<int>(rh),
                 bgra.data(),
                 &bmi,
@@ -2635,6 +2691,19 @@ GpuBackendFrameStats NativeWindowHost::TickAndPresentFrame(float dtSeconds, bool
         }
     };
 
+    const bool swScaledBlit = (mode_ == NativeWindowMode::Win32GdiSoftware);
+    const std::uint32_t presentW = swScaledBlit ? std::max<std::uint32_t>(1u, logicalWidth_) : width_;
+    const std::uint32_t presentH = swScaledBlit ? std::max<std::uint32_t>(1u, logicalHeight_) : height_;
+
+    auto ensureNativeWindowShown = [&]() noexcept {
+#if defined(_WIN32)
+        if (win32Hwnd_ && !win32WindowShown_) {
+            win32WindowShown_ = true;
+            ShowWindow(static_cast<HWND>(win32Hwnd_), SW_SHOW);
+        }
+#endif
+    };
+
     if (desktopHost_) {
         if (forcePresent && desktopHost_->CanSleepIdle()) {
             desktopHost_->NotifyDirtyLayout();
@@ -2646,11 +2715,12 @@ GpuBackendFrameStats NativeWindowHost::TickAndPresentFrame(float dtSeconds, bool
             }
             const ZeroCopySubmissionStats subStats = desktopHost_->RecordGpuCommands(*renderTree_, *activeGpuStream_);
             if (forcePresent || needsInitialRender_ || subStats.dirtyPagesUploaded > 0u || subStats.drawCallCount > 0u) {
+                ensureNativeWindowShown();
                 frameStats = gpuBackend_->PresentStream(
                     *renderTree_,
                     *activeGpuStream_,
-                    width_,
-                    height_,
+                    presentW,
+                    presentH,
                     clearColor_);
                 SwapOrBlitPlatformSurface();
                 needsInitialRender_ = false;
@@ -2676,11 +2746,12 @@ GpuBackendFrameStats NativeWindowHost::TickAndPresentFrame(float dtSeconds, bool
                     const ZeroCopySubmissionStats subStats =
                         webHost_->RecordGpuCommands(*renderTree_, *activeGpuStream_);
                     if (forcePresent || needsInitialRender_ || subStats.dirtyPagesUploaded > 0u || subStats.drawCallCount > 0u) {
+                        ensureNativeWindowShown();
                         frameStats = gpuBackend_->PresentStream(
                             *renderTree_,
                             *activeGpuStream_,
-                            width_,
-                            height_,
+                            presentW,
+                            presentH,
                             clearColor_);
                         SwapOrBlitPlatformSurface();
                         needsInitialRender_ = false;
@@ -2694,11 +2765,12 @@ GpuBackendFrameStats NativeWindowHost::TickAndPresentFrame(float dtSeconds, bool
         if (inputRouter_ && inputRouter_->HasPendingEvents()) {
             (void)inputRouter_->FlushQueuedEvents();
         }
+        ensureNativeWindowShown();
         frameStats = gpuBackend_->SubmitAndPresent(
             *renderTree_,
             *activeGpuStream_,
-            width_,
-            height_,
+            presentW,
+            presentH,
             clearColor_);
         SwapOrBlitPlatformSurface();
         needsInitialRender_ = false;

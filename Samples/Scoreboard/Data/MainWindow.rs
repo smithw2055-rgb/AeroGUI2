@@ -182,12 +182,6 @@ public class Game : ViewModelBase
         this._players.Add(new Player(Class.Mage, 60, 201175, 4915, 63, "Nunc mauris accumsan", 225, Team.Horde));
         this._players.Add(new Player(Class.Fighter, 30, 271735, 6715, 20, "Phasellus nullam", 195, Team.Alliance));
         this._players.Add(new Player(Class.Cleric, 18, 87537, 95717, 54, "Consequat bibendum", 180, Team.Horde));
-        this._players.Add(new Player(Class.Fighter, 88, 534123, 1241, 66, "Kaelen Ironfist", 175, Team.Alliance));
-        this._players.Add(new Player(Class.Mage, 42, 652132, 2341, 22, "Gromdar Frostwolf", 160, Team.Horde));
-        this._players.Add(new Player(Class.Rogue, 75, 742131, 8562, 45, "Elara Nightshade", 155, Team.Alliance));
-        this._players.Add(new Player(Class.Hunter, 91, 943211, 1124, 88, "Sylas Arrowhawk", 145, Team.Horde));
-        this._players.Add(new Player(Class.Cleric, 55, 123456, 456123, 12, "Aveline Dawnblessed", 130, Team.Alliance));
-        this._players.Add(new Player(Class.Fighter, 67, 432198, 3214, 59, "Durok Bloodrage", 115, Team.Horde));
 
         this.RecalculateScores();
     }

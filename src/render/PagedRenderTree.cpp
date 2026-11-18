@@ -871,80 +871,63 @@ void PagedRenderTree::RegisterMtsdfInTreeAtlas(const AxbMtsdfPathEntry& entry) {
         entry.mtsdfRgbaPixels.size() < static_cast<std::size_t>(entry.cellWidth) * entry.cellHeight * 4u) {
         return;
     }
-    if (mtsdfRegisteredHashes_.find(entry.pathHash) != mtsdfRegisteredHashes_.end()) {
+    if (mtsdfEntries_.find(entry.pathHash) != mtsdfEntries_.end()) {
         return;
     }
 
     constexpr std::uint32_t kAtlasWidth = 1024u;
     constexpr std::uint32_t kMtsdfBaseY = 512u;
     constexpr std::uint32_t kMtsdfMaxRows = 448u; // y in [512 .. 959], leaving [960 .. 1023] for gradients
+    constexpr std::uint32_t kGutter = 1u;
     const std::size_t totalBytes = static_cast<std::size_t>(kAtlasWidth) * kMtsdfMaxRows * 4u;
     if (mtsdfAtlasRgba8_.size() != totalBytes) {
         mtsdfAtlasRgba8_.assign(totalBytes, 0u);
     }
 
-    const int rawOriginX = static_cast<int>(std::lround(entry.u0 * static_cast<float>(kAtlasWidth) - 0.5f));
-    const int rawOriginY = static_cast<int>(std::lround(entry.v0 * static_cast<float>(kAtlasWidth) - 0.5f));
-    const int rawEndX = static_cast<int>(std::lround(entry.u1 * static_cast<float>(kAtlasWidth) + 0.5f));
-    const int rawEndY = static_cast<int>(std::lround(entry.v1 * static_cast<float>(kAtlasWidth) + 0.5f));
-
-    const int dstX0 = std::clamp(rawOriginX, 0, static_cast<int>(kAtlasWidth));
-    const int dstY0 = std::clamp(rawOriginY, static_cast<int>(kMtsdfBaseY), static_cast<int>(kMtsdfBaseY + kMtsdfMaxRows));
-    const int dstX1 = std::clamp(std::max(dstX0, rawEndX), 0, static_cast<int>(kAtlasWidth));
-    const int dstY1 = std::clamp(std::max(dstY0, rawEndY), static_cast<int>(kMtsdfBaseY), static_cast<int>(kMtsdfBaseY + kMtsdfMaxRows));
-
-    const int dstW = dstX1 - dstX0;
-    const int dstH = dstY1 - dstY0;
-    if (dstW <= 0 || dstH <= 0) {
+    const std::uint32_t cw = entry.cellWidth;
+    const std::uint32_t ch = entry.cellHeight;
+    if (cw > kAtlasWidth || ch > kMtsdfMaxRows) {
         return;
     }
 
-    if (dstW == static_cast<int>(entry.cellWidth) && dstH == static_cast<int>(entry.cellHeight)) {
-        for (int cy = 0; cy < dstH; ++cy) {
-            const std::size_t localRow = static_cast<std::size_t>(dstY0 - static_cast<int>(kMtsdfBaseY) + cy);
-            std::uint8_t* dstRow = mtsdfAtlasRgba8_.data() +
-                (localRow * kAtlasWidth + static_cast<std::size_t>(dstX0)) * 4u;
-            const std::uint8_t* srcRow = entry.mtsdfRgbaPixels.data() +
-                static_cast<std::size_t>(cy) * entry.cellWidth * 4u;
-            std::memcpy(dstRow, srcRow, static_cast<std::size_t>(dstW) * 4u);
-        }
-    } else {
-        for (int cy = 0; cy < dstH; ++cy) {
-            const float v = (static_cast<float>(cy) + 0.5f) / static_cast<float>(dstH) *
-                static_cast<float>(entry.cellHeight) - 0.5f;
-            const int sy0 = std::clamp(static_cast<int>(std::floor(v)), 0, static_cast<int>(entry.cellHeight) - 1);
-            const int sy1 = std::min(sy0 + 1, static_cast<int>(entry.cellHeight) - 1);
-            const float fy = std::clamp(v - std::floor(v), 0.0f, 1.0f);
-            const std::size_t localRow = static_cast<std::size_t>(dstY0 - static_cast<int>(kMtsdfBaseY) + cy);
-            for (int cx = 0; cx < dstW; ++cx) {
-                const float u = (static_cast<float>(cx) + 0.5f) / static_cast<float>(dstW) *
-                    static_cast<float>(entry.cellWidth) - 0.5f;
-                const int sx0 = std::clamp(static_cast<int>(std::floor(u)), 0, static_cast<int>(entry.cellWidth) - 1);
-                const int sx1 = std::min(sx0 + 1, static_cast<int>(entry.cellWidth) - 1);
-                const float fx = std::clamp(u - std::floor(u), 0.0f, 1.0f);
-                std::uint8_t* dstPx = mtsdfAtlasRgba8_.data() +
-                    (localRow * kAtlasWidth + static_cast<std::size_t>(dstX0 + cx)) * 4u;
-                for (std::size_t ch = 0; ch < 4u; ++ch) {
-                    const float c00 = static_cast<float>(
-                        entry.mtsdfRgbaPixels[(static_cast<std::size_t>(sy0) * entry.cellWidth + sx0) * 4u + ch]);
-                    const float c10 = static_cast<float>(
-                        entry.mtsdfRgbaPixels[(static_cast<std::size_t>(sy0) * entry.cellWidth + sx1) * 4u + ch]);
-                    const float c01 = static_cast<float>(
-                        entry.mtsdfRgbaPixels[(static_cast<std::size_t>(sy1) * entry.cellWidth + sx0) * 4u + ch]);
-                    const float c11 = static_cast<float>(
-                        entry.mtsdfRgbaPixels[(static_cast<std::size_t>(sy1) * entry.cellWidth + sx1) * 4u + ch]);
-                    const float top = c00 + (c10 - c00) * fx;
-                    const float bot = c01 + (c11 - c01) * fx;
-                    dstPx[ch] = static_cast<std::uint8_t>(std::clamp(top + (bot - top) * fy + 0.5f, 0.0f, 255.0f));
-                }
-            }
-        }
+    if (mtsdfShelfX_ + cw > kAtlasWidth) {
+        mtsdfShelfX_ = 0u;
+        mtsdfShelfY_ += mtsdfShelfRowH_ + kGutter;
+        mtsdfShelfRowH_ = 0u;
+    }
+    if (mtsdfShelfY_ + ch > kMtsdfBaseY + kMtsdfMaxRows) {
+        mtsdfShelfX_ = 0u;
+        mtsdfShelfY_ = kMtsdfBaseY;
+        mtsdfShelfRowH_ = 0u;
     }
 
+    const std::uint32_t dstX = mtsdfShelfX_;
+    const std::uint32_t dstY = mtsdfShelfY_;
+    for (std::uint32_t cy = 0u; cy < ch; ++cy) {
+        const std::size_t localRow = static_cast<std::size_t>((dstY - kMtsdfBaseY) + cy);
+        std::uint8_t* dstRow = mtsdfAtlasRgba8_.data() +
+            (localRow * kAtlasWidth + static_cast<std::size_t>(dstX)) * 4u;
+        const std::uint8_t* srcRow = entry.mtsdfRgbaPixels.data() +
+            static_cast<std::size_t>(cy) * cw * 4u;
+        std::memcpy(dstRow, srcRow, static_cast<std::size_t>(cw) * 4u);
+    }
+
+    mtsdfShelfX_ += cw + kGutter;
+    mtsdfShelfRowH_ = std::max(mtsdfShelfRowH_, ch);
+
+    AxbMtsdfPathEntry packed = entry;
+    packed.atlasWidth = static_cast<std::uint16_t>(kAtlasWidth);
+    packed.atlasHeight = static_cast<std::uint16_t>(kAtlasWidth);
+    constexpr float kInvAtlas = 1.0f / static_cast<float>(kAtlasWidth);
+    packed.u0 = (static_cast<float>(dstX) + 0.5f) * kInvAtlas;
+    packed.v0 = (static_cast<float>(dstY) + 0.5f) * kInvAtlas;
+    packed.u1 = (static_cast<float>(dstX + cw) - 0.5f) * kInvAtlas;
+    packed.v1 = (static_cast<float>(dstY + ch) - 0.5f) * kInvAtlas;
+
     mtsdfRegisteredHashes_.insert(entry.pathHash);
-    mtsdfEntries_[entry.pathHash] = entry;
+    mtsdfEntries_[entry.pathHash] = packed;
     (resourceStore_ ? resourceStore_ : &UIResourceStore::Default())->RegisterMtsdfPath(entry);
-    const std::uint32_t endLocalRow = static_cast<std::uint32_t>(dstY1 - static_cast<int>(kMtsdfBaseY));
+    const std::uint32_t endLocalRow = (dstY - kMtsdfBaseY) + ch;
     mtsdfPopulatedRows_ = std::max(mtsdfPopulatedRows_, std::min(kMtsdfMaxRows, endLocalRow));
     ++mtsdfAtlasRevision_;
 }
@@ -1031,7 +1014,6 @@ void PagedRenderTree::Clear() noexcept {
     dirtyPageList_.clear();
     blurLayerSpans_.clear();
     standaloneTextRuns_.clear();
-    mtsdfEntries_.clear();
     treeId_ = gNextRenderTreeId.fetch_add(1u, std::memory_order_relaxed);
 }
 
@@ -1485,6 +1467,8 @@ std::uint32_t PagedRenderTree::AllocateMtsdfPathNode(
     float opacity,
     const void* owner) {
     RegisterMtsdfInTreeAtlas(mtsdfEntry);
+    const AxbMtsdfPathEntry* packedEntry = (mtsdfEntry.pathHash != 0u) ? FindMtsdfEntry(mtsdfEntry.pathHash) : nullptr;
+    const AxbMtsdfPathEntry& activeEntry = packedEntry ? *packedEntry : mtsdfEntry;
     const std::uint32_t pageIdx = EnsurePageForAllocation(4u, activeClipRect_, activeClipEnabled_);
     CommandPage& page = pages_[pageIdx];
     const auto vOffset = static_cast<std::uint16_t>(page.header.vertexCount);
@@ -1493,7 +1477,7 @@ std::uint32_t PagedRenderTree::AllocateMtsdfPathNode(
 
     const MtsdfMappedQuad mapped = ComputeMtsdfMappedPlacement(
         Rect{x, y, width, height},
-        mtsdfEntry,
+        activeEntry,
         strokeThickness);
 
     const auto nodeId = static_cast<std::uint32_t>(nodes_.size());
@@ -1504,8 +1488,8 @@ std::uint32_t PagedRenderTree::AllocateMtsdfPathNode(
     desc.vertexCount = 4u;
     desc.primType = AeroPrimType::MsdfVectorPath;
     desc.encodedSdfParams = PackMtsdfParams(
-        mtsdfEntry.pxRange,
-        mtsdfEntry.atlasWidth,
+        activeEntry.pxRange,
+        activeEntry.atlasWidth,
         strokeThickness,
         false);
     desc.x = mapped.quadRect.x;
@@ -1519,7 +1503,7 @@ std::uint32_t PagedRenderTree::AllocateMtsdfPathNode(
     desc.uv1X = mapped.u1;
     desc.uv1Y = mapped.v1;
     desc.baseRgba = PackColorRgba8(fillColor, 1.0f);
-    desc.mtsdfPathHash = mtsdfEntry.pathHash;
+    desc.mtsdfPathHash = activeEntry.pathHash;
     desc.sourceElement = owner;
 
     nodes_.push_back(desc);

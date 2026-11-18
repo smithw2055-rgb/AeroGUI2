@@ -55,7 +55,9 @@ namespace {
 [[nodiscard]] bool IsColorProp(VisualAnimProp prop) noexcept {
     return prop == VisualAnimProp::BgColor ||
            prop == VisualAnimProp::FgColor ||
-           prop == VisualAnimProp::BorderColor;
+           prop == VisualAnimProp::BorderColor ||
+           prop == VisualAnimProp::FillColor ||
+           prop == VisualAnimProp::StrokeColor;
 }
 
 [[nodiscard]] VisualDirtyFlags DirtyFlagsForScalarProp(VisualAnimProp prop) noexcept {
@@ -154,6 +156,12 @@ void ApplyScalarProp(VisualWorld& world, VisualNodeId id, VisualAnimProp prop, f
     case VisualAnimProp::EffectRadius:
         node->effect.radius = value;
         break;
+    case VisualAnimProp::EffectOpacity:
+        node->effect.opacity = std::clamp(value, 0.0f, 1.0f);
+        break;
+    case VisualAnimProp::BrushOpacity:
+        node->box.bgOpacity = std::clamp(value, 0.0f, 1.0f);
+        break;
     case VisualAnimProp::CustomScalar0:
         node->customScalars[0] = value;
         break;
@@ -177,13 +185,23 @@ void ApplyColorProp(VisualWorld& world, VisualNodeId id, VisualAnimProp prop, st
     if (!node) return;
     switch (prop) {
     case VisualAnimProp::BgColor:
-        node->box.bgRgba = rgba;
+    case VisualAnimProp::FillColor:
+        if (node->kind == VisualKind::Vector) {
+            node->vector.fillRgba = rgba;
+        } else {
+            node->box.bgRgba = rgba;
+        }
         break;
     case VisualAnimProp::FgColor:
         node->text.fgRgba = rgba;
         break;
     case VisualAnimProp::BorderColor:
-        node->box.borderRgba = rgba;
+    case VisualAnimProp::StrokeColor:
+        if (node->kind == VisualKind::Vector) {
+            node->vector.strokeRgba = rgba;
+        } else {
+            node->box.borderRgba = rgba;
+        }
         break;
     default:
         return;
@@ -259,6 +277,7 @@ void EvaluateKeyFramesAtTime(VisualAnimTrack& track, VisualWorld& world, float l
     const bool colorProp = IsColorProp(track.prop);
     auto applyKf = [&](const VisualKeyFrame& kf) {
         if (colorProp) {
+            track.currentRgba = kf.colorRgba;
             ApplyColorProp(world, track.targetNode, track.prop, kf.colorRgba);
         } else {
             track.currentVal = kf.scalarValue;
@@ -287,7 +306,9 @@ void EvaluateKeyFramesAtTime(VisualAnimTrack& track, VisualWorld& world, float l
             const float u = std::clamp((localTimeSec - kf0.timeSec) / span, 0.0f, 1.0f);
             const float eased = EvaluateEasing(kf1.easingKind, kf1.easingMode, u);
             if (colorProp) {
-                ApplyColorProp(world, track.targetNode, track.prop, LerpRgba(kf0.colorRgba, kf1.colorRgba, eased));
+                const std::uint32_t col = LerpRgba(kf0.colorRgba, kf1.colorRgba, eased);
+                track.currentRgba = col;
+                ApplyColorProp(world, track.targetNode, track.prop, col);
             } else {
                 const float val = kf0.scalarValue + (kf1.scalarValue - kf0.scalarValue) * eased;
                 track.currentVal = val;
@@ -334,6 +355,17 @@ std::int32_t VisualAnimationEngine::StartFloat(
     bool autoReverse,
     std::int32_t repeatCount) {
     if (!node.IsValid()) return 0;
+    const float clampedDelay = std::max(0.0f, delaySec);
+    if (clampedDelay <= 0.0f) {
+        tracks_.erase(
+            std::remove_if(
+                tracks_.begin(),
+                tracks_.end(),
+                [node, prop](const VisualAnimTrack& existing) noexcept {
+                    return existing.targetNode == node && existing.prop == prop;
+                }),
+            tracks_.end());
+    }
     VisualAnimTrack track{};
     track.trackId = nextTrackId_++;
     track.targetNode = node;
@@ -343,7 +375,7 @@ std::int32_t VisualAnimationEngine::StartFloat(
     track.toVal = toVal;
     track.currentVal = fromVal;
     track.durationSec = std::max(0.0f, durationSec);
-    track.delaySec = std::max(0.0f, delaySec);
+    track.delaySec = clampedDelay;
     track.easeKind = easeKind;
     track.easeMode = easeMode;
     track.autoReverse = autoReverse;
@@ -362,8 +394,20 @@ std::int32_t VisualAnimationEngine::StartColor(
     std::uint32_t toRgba,
     float durationSec,
     EasingFunctionKind easeKind,
-    EasingMode easeMode) {
+    EasingMode easeMode,
+    float delaySec) {
     if (!node.IsValid()) return 0;
+    const float clampedDelay = std::max(0.0f, delaySec);
+    if (clampedDelay <= 0.0f) {
+        tracks_.erase(
+            std::remove_if(
+                tracks_.begin(),
+                tracks_.end(),
+                [node, prop](const VisualAnimTrack& existing) noexcept {
+                    return existing.targetNode == node && existing.prop == prop;
+                }),
+            tracks_.end());
+    }
     VisualAnimTrack track{};
     track.trackId = nextTrackId_++;
     track.targetNode = node;
@@ -371,7 +415,9 @@ std::int32_t VisualAnimationEngine::StartColor(
     track.kind = VisualAnimTrackKind::ColorTween;
     track.fromRgba = fromRgba;
     track.toRgba = toRgba;
+    track.currentRgba = fromRgba;
     track.durationSec = std::max(0.0f, durationSec);
+    track.delaySec = clampedDelay;
     track.easeKind = easeKind;
     track.easeMode = easeMode;
     tracks_.push_back(std::move(track));
@@ -379,6 +425,79 @@ std::int32_t VisualAnimationEngine::StartColor(
         wakeHostCallback_();
     }
     return tracks_.back().trackId;
+}
+
+float VisualAnimationEngine::ReadCurrentScalarProp(
+    const VisualWorld& world,
+    VisualNodeId id,
+    VisualAnimProp prop) noexcept {
+    const VisualNode* node = world.GetNode(id);
+    if (!node) return 0.0f;
+    switch (prop) {
+    case VisualAnimProp::Opacity: return node->layout.opacity;
+    case VisualAnimProp::Width: return std::isfinite(node->layout.width) ? node->layout.width : node->layout.layoutRect.width;
+    case VisualAnimProp::Height: return std::isfinite(node->layout.height) ? node->layout.height : node->layout.layoutRect.height;
+    case VisualAnimProp::TranslateX: return node->transform2D.tx;
+    case VisualAnimProp::TranslateY: return node->transform2D.ty;
+    case VisualAnimProp::ScaleX: return node->transform2D.sx;
+    case VisualAnimProp::ScaleY: return node->transform2D.sy;
+    case VisualAnimProp::RotateDeg: return node->transform2D.rotDeg;
+    case VisualAnimProp::SkewX: return node->transform2D.skewX;
+    case VisualAnimProp::SkewY: return node->transform2D.skewY;
+    case VisualAnimProp::Rot3DX: return node->transform3D.rx;
+    case VisualAnimProp::Rot3DY: return node->transform3D.ry;
+    case VisualAnimProp::Rot3DZ: return node->transform3D.rz;
+    case VisualAnimProp::Trans3DX: return node->transform3D.tx;
+    case VisualAnimProp::Trans3DY: return node->transform3D.ty;
+    case VisualAnimProp::Trans3DZ: return node->transform3D.tz;
+    case VisualAnimProp::CornerRadius: return node->box.cornerRadius.topLeft;
+    case VisualAnimProp::PathTrimStart: return node->vector.trimStart;
+    case VisualAnimProp::PathTrimEnd: return node->vector.trimEnd;
+    case VisualAnimProp::EffectRadius: return node->effect.radius;
+    case VisualAnimProp::EffectOpacity: return node->effect.opacity;
+    case VisualAnimProp::BrushOpacity: return node->box.bgOpacity;
+    case VisualAnimProp::CustomScalar0: return node->customScalars[0];
+    case VisualAnimProp::CustomScalar1: return node->customScalars[1];
+    case VisualAnimProp::CustomScalar2: return node->customScalars[2];
+    case VisualAnimProp::CustomScalar3: return node->customScalars[3];
+    default: return 0.0f;
+    }
+}
+
+std::uint32_t VisualAnimationEngine::ReadCurrentColorProp(
+    const VisualWorld& world,
+    VisualNodeId id,
+    VisualAnimProp prop) noexcept {
+    const VisualNode* node = world.GetNode(id);
+    if (!node) return 0u;
+    switch (prop) {
+    case VisualAnimProp::BgColor:
+    case VisualAnimProp::FillColor:
+        return (node->kind == VisualKind::Vector) ? node->vector.fillRgba : node->box.bgRgba;
+    case VisualAnimProp::FgColor:
+        return node->text.fgRgba;
+    case VisualAnimProp::BorderColor:
+    case VisualAnimProp::StrokeColor:
+        return (node->kind == VisualKind::Vector) ? node->vector.strokeRgba : node->box.borderRgba;
+    default:
+        return 0u;
+    }
+}
+
+void VisualAnimationEngine::ApplyScalarPropImmediate(
+    VisualWorld& world,
+    VisualNodeId node,
+    VisualAnimProp prop,
+    float value) noexcept {
+    ApplyScalarProp(world, node, prop, value);
+}
+
+void VisualAnimationEngine::ApplyColorPropImmediate(
+    VisualWorld& world,
+    VisualNodeId node,
+    VisualAnimProp prop,
+    std::uint32_t rgba) noexcept {
+    ApplyColorProp(world, node, prop, rgba);
 }
 
 std::int32_t VisualAnimationEngine::SpringFloat(
@@ -464,10 +583,10 @@ bool VisualAnimationEngine::Tick(float dtSeconds, VisualWorld& world) {
         return false;
     }
     bool anyUpdated = false;
-    for (std::size_t i = tracks_.size(); i > 0u; --i) {
-        VisualAnimTrack& track = tracks_[i - 1u];
+    for (std::size_t i = 0u; i < tracks_.size(); ) {
+        VisualAnimTrack& track = tracks_[i];
         if (!world.IsAlive(track.targetNode)) {
-            tracks_.erase(tracks_.begin() + static_cast<std::ptrdiff_t>(i - 1u));
+            tracks_.erase(tracks_.begin() + static_cast<std::ptrdiff_t>(i));
             continue;
         }
         anyUpdated = true;
@@ -477,6 +596,7 @@ bool VisualAnimationEngine::Tick(float dtSeconds, VisualWorld& world) {
             track.delaySec -= step;
             activeDt -= step;
             if (track.delaySec > 0.0f) {
+                ++i;
                 continue;
             }
         }
@@ -547,18 +667,19 @@ bool VisualAnimationEngine::Tick(float dtSeconds, VisualWorld& world) {
                 ApplyScalarProp(world, track.targetNode, track.prop, val);
             } else if (track.kind == VisualAnimTrackKind::ColorTween) {
                 const float eased = EvaluateEasing(track.easeKind, track.easeMode, normT);
-                ApplyColorProp(world, track.targetNode, track.prop, LerpRgba(track.fromRgba, track.toRgba, eased));
+                const std::uint32_t col = LerpRgba(track.fromRgba, track.toRgba, eased);
+                track.currentRgba = col;
+                ApplyColorProp(world, track.targetNode, track.prop, col);
             } else if (track.kind == VisualAnimTrackKind::KeyFrames) {
                 EvaluateKeyFramesAtTime(track, world, localTimeSec);
             }
         }
 
         if (finished) {
-            tracks_.erase(tracks_.begin() + static_cast<std::ptrdiff_t>(i - 1u));
+            tracks_.erase(tracks_.begin() + static_cast<std::ptrdiff_t>(i));
+        } else {
+            ++i;
         }
-    }
-    if (anyUpdated && wakeHostCallback_) {
-        wakeHostCallback_();
     }
     return anyUpdated;
 }

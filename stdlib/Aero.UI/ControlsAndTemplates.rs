@@ -128,6 +128,7 @@ public class Control : FrameworkElement {
     private bool _hasExplicitFontFamily = false;
     private bool _hasExplicitFontWeight = false;
     private bool _hasExplicitForeground = false;
+    private bool _isTabStop = true;
 
     public Control() : base(VisualKind.Box) {
         if (_fontFamily == null || _fontFamily.Length == 0) { _fontFamily = "Segoe UI"; }
@@ -199,14 +200,60 @@ public class Control : FrameworkElement {
         get { return _template; }
         set {
             if (_template == value && _templateApplied) { return; }
+            if (_template != null && _templateApplied) {
+                _template.ResetTriggers(this);
+            }
             _template = value;
             _templateApplied = false;
             ApplyTemplate();
         }
     }
+    public bool IsTabStop {
+        get { return _isTabStop; }
+        set {
+            if (_isTabStop == value) { return; }
+            _isTabStop = value;
+            UpdateTriggersAndStates();
+        }
+    }
     public UIElement TemplateRoot() { return _templateRoot; }
 
     protected virtual UIElement CreateDefaultTemplate() { return null; }
+    protected virtual void UpdateCommonVisualStates(bool useTransitions) {
+        if (!IsEnabled) {
+            VisualStateManager.GoToState(this, "Disabled", useTransitions);
+        } else if (IsMouseOver) {
+            VisualStateManager.GoToState(this, "MouseOver", useTransitions);
+        } else {
+            VisualStateManager.GoToState(this, "Normal", useTransitions);
+        }
+    }
+
+    protected virtual void UpdateVisualStates(bool useTransitions) {
+        if (_templateRoot == null && _vsgBox == null) { return; }
+        UpdateCommonVisualStates(useTransitions);
+        VisualStateManager.GoToState(this, IsFocused ? "Focused" : "Unfocused", useTransitions);
+    }
+
+    protected override void SyncBoxStyleToNative() {
+        if (!ParseUtil.IsValidHandle(__nativeHandle)) { return; }
+        if (_template != null) {
+            Visual_SetBoxStyle(__nativeHandle, 0u, 0u, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f);
+            Visual_SetBoxGradients(__nativeHandle, -1, -1);
+            Visual_SetBoxBrushOpacity(__nativeHandle, 1.0f);
+            return;
+        }
+        base.SyncBoxStyleToNative();
+    }
+
+    protected override void SyncPadding() {
+        if (!ParseUtil.IsValidHandle(__nativeHandle)) { return; }
+        if (_template != null) {
+            Visual_SetPadding(__nativeHandle, 0.0f, 0.0f, 0.0f, 0.0f);
+            return;
+        }
+        base.SyncPadding();
+    }
 
     protected virtual void OnTypographyChanged() {
         SyncTemplatePresenters();
@@ -218,6 +265,7 @@ public class Control : FrameworkElement {
         if (_template != null && _templateApplied) {
             _template.EvaluateTriggers(this);
         }
+        UpdateVisualStates(true);
     }
 
     private void SyncTemplatePresenters() {
@@ -265,6 +313,9 @@ public class Control : FrameworkElement {
     }
 
     public override bool ApplyTemplate() {
+        if (_template != null && _templateApplied) {
+            _template.ResetTriggers(this);
+        }
         UIElement self = this;
         UIElement nextRoot = null;
         if (_template != null) {
@@ -277,6 +328,8 @@ public class Control : FrameworkElement {
         }
         _templateRoot = nextRoot;
         _templateApplied = true;
+        SyncBoxStyleToNative();
+        SyncPadding();
         if (_templateRoot != null) {
             MarkTemplateOwner(_templateRoot, this);
             AddChild(_templateRoot);
@@ -286,6 +339,7 @@ public class Control : FrameworkElement {
             }
         }
         OnApplyTemplate();
+        UpdateVisualStates(false);
         return _templateRoot != null;
     }
 
@@ -314,11 +368,12 @@ public class Control : FrameworkElement {
     }
 
     public override bool SetPropertyValue(string propName, DependencyObject value) {
-        if (propName == "Foreground") { Foreground = UIElement.CoerceBrush(value); return true; }
+        if (propName == "Foreground" || propName == "Foreground.Color") { Foreground = UIElement.CoerceBrush(value); return true; }
         if (propName == "FontFamily") { FontFamily = DependencyObject.UnboxString(value, "Segoe UI"); return true; }
         if (propName == "FontSize") { FontSize = DependencyObject.UnboxFloat(value, 14.0f); return true; }
         if (propName == "FontWeight") { FontWeight = DependencyObject.UnboxString(value, "Normal"); return true; }
         if (propName == "FontStyle") { FontStyle = DependencyObject.UnboxString(value, "Normal"); return true; }
+        if (propName == "IsTabStop") { IsTabStop = DependencyObject.UnboxBool(value, true); return true; }
         if (propName == "Template" && value is ControlTemplate) {
             Template = value as ControlTemplate;
             return true;
@@ -342,20 +397,30 @@ public class Control : FrameworkElement {
         return base.SetPropertyValue(propName, value);
     }
 
-    public override DependencyObject FindResourceBox(string key) {
-        if (key == null || key.Length == 0) { return null; }
-        DependencyObject local = TryFindLocalResourceBox(key);
-        if (local != null) { return local; }
-        if (_template != null && _template.Resources != null && _template.Resources.Contains(key)) {
-            return _template.Resources.GetBox(key);
+    protected override DependencyObject TryFindTemplateScopedResourceBox(string key) {
+        if (_template != null) {
+            if (_template.Resources != null && _template.Resources.Contains(key)) {
+                return _template.Resources.GetBox(key);
+            }
+            if (_template.AmbientResources != null && _template.AmbientResources.Contains(key)) {
+                return _template.AmbientResources.GetBox(key);
+            }
         }
-        return base.FindResourceBox(key);
+        return null;
     }
 
     public override DependencyObject GetPropertyValue(string propName) {
         if (propName == "Foreground") { return _foreground; }
+        if (propName == "Foreground.Color") {
+            return DependencyObject.BoxString(_foreground != null ? ParseUtil.FormatArgbHex(_foreground.ResolveRgba()) : "#FFF1F5F9");
+        }
         if (propName == "FontSize") { return DependencyObject.BoxFloat(_fontSize); }
         if (propName == "FontFamily") { return DependencyObject.BoxString(_fontFamily); }
+        if (propName == "FontWeight") { return DependencyObject.BoxString(_fontWeight); }
+        if (propName == "HorizontalContentAlignment") { return DependencyObject.BoxInt(EnumConvert.ToInt(_hContentAlign)); }
+        if (propName == "VerticalContentAlignment") { return DependencyObject.BoxInt(EnumConvert.ToInt(_vContentAlign)); }
+        if (propName == "IsTabStop") { return DependencyObject.BoxBool(_isTabStop); }
+        if (propName == "Template") { return _template; }
         return base.GetPropertyValue(propName);
     }
 }
@@ -373,9 +438,14 @@ public class ContentPresenter : FrameworkElement {
 
     public ContentPresenter() : base(VisualKind.Box) {
         _foreground = Brushes.DefaultForeground();
+        SyncInteractiveFlags();
     }
 
     public override string GetTypeName() { return "ContentPresenter"; }
+
+    protected override bool IsSelfHitTestSolid() {
+        return Background != null;
+    }
 
     public Brush Foreground {
         get { return _foreground; }
@@ -439,6 +509,19 @@ public class ContentPresenter : FrameworkElement {
         RebuildContentVisual();
     }
 
+    private void SyncTextViewAlignment() {
+        if (_textView == null) { return; }
+        _textView.HorizontalAlignment = HorizontalAlignment.Stretch;
+        _textView.VerticalAlignment = VerticalAlignment.Center;
+        if (HorizontalAlignment == HorizontalAlignment.Center) {
+            _textView.TextAlignment = TextAlignment.Center;
+        } else if (HorizontalAlignment == HorizontalAlignment.Right) {
+            _textView.TextAlignment = TextAlignment.Right;
+        } else {
+            _textView.TextAlignment = TextAlignment.Left;
+        }
+    }
+
     public void SyncFromTemplatedParent(Control owner) {
         if (owner == null) { return; }
         UIElement ownerEl = owner;
@@ -447,13 +530,19 @@ public class ContentPresenter : FrameworkElement {
         _fontFamily = owner.FontFamily;
         _fontSize = owner.FontSize;
         _fontWeight = owner.FontWeight;
-        HorizontalAlignment = owner.HorizontalContentAlignment;
-        VerticalAlignment = owner.VerticalContentAlignment;
+        if (!(this is ScrollContentPresenter)) {
+            if (!_hasExplicitHAlign) { HorizontalAlignment = owner.HorizontalContentAlignment; _hasExplicitHAlign = false; }
+            if (!_hasExplicitVAlign) { VerticalAlignment = owner.VerticalContentAlignment; _hasExplicitVAlign = false; }
+        }
         if (_textView != null) {
             _textView.Foreground = _foreground;
             _textView.FontFamily = _fontFamily;
             _textView.FontSize = _fontSize;
             _textView.FontWeight = _fontWeight;
+            SyncTextViewAlignment();
+        }
+        if (ContentSource == "SelectionBoxItem") {
+            return;
         }
         if (ContentSource == "Header" && owner is HeaderedContentControl) {
             HeaderedContentControl hcc = owner as HeaderedContentControl;
@@ -542,12 +631,12 @@ public class ContentPresenter : FrameworkElement {
             _textView.FontFamily = _fontFamily;
             _textView.FontSize = _fontSize;
             _textView.FontWeight = _fontWeight;
-            _textView.HorizontalAlignment = HorizontalAlignment.Center;
-            _textView.VerticalAlignment = VerticalAlignment.Center;
+            SyncTextViewAlignment();
             AddChild(_textView);
         } else {
             _textView.Visibility = Visibility.Visible;
             _textView.Text = text;
+            SyncTextViewAlignment();
         }
     }
 
@@ -588,9 +677,31 @@ public class ContentPresenter : FrameworkElement {
 }
 
 public class ScrollContentPresenter : ContentPresenter {
-    public bool CanContentScroll { get; set; } = false;
-    public ScrollContentPresenter() : base() {}
+    private bool _canContentScroll = false;
+
+    public bool CanContentScroll {
+        get { return _canContentScroll; }
+        set { _canContentScroll = value; }
+    }
+
+    public ScrollContentPresenter() : base() {
+        ClipToBounds = true;
+        if (ParseUtil.IsValidHandle(__nativeHandle)) {
+            Visual_SetLayoutMode(__nativeHandle, EnumConvert.ToInt(LayoutMode.ScrollViewport), 0.0f, 0.0f, 1, 0);
+        }
+    }
+
     public override string GetTypeName() { return "ScrollContentPresenter"; }
+
+    public override bool SetPropertyValue(string propName, DependencyObject value) {
+        if (propName == "CanContentScroll") { CanContentScroll = DependencyObject.UnboxBool(value, false); return true; }
+        return base.SetPropertyValue(propName, value);
+    }
+
+    public override DependencyObject GetPropertyValue(string propName) {
+        if (propName == "CanContentScroll") { return DependencyObject.BoxBool(_canContentScroll); }
+        return base.GetPropertyValue(propName);
+    }
 }
 
 // ============================================================================
@@ -936,10 +1047,27 @@ public class Expander : HeaderedContentControl {
 
     public override bool SetPropertyValue(string propName, DependencyObject value) {
         if (propName == "IsExpanded") { IsExpanded = DependencyObject.UnboxBool(value, false); return true; }
+        if (propName == "ExpandDirection") {
+            if (value is BoxedInt) {
+                int ev = (value as BoxedInt).Value;
+                if (ev == 1) { ExpandDirection = ExpandDirection.Up; }
+                else if (ev == 2) { ExpandDirection = ExpandDirection.Left; }
+                else if (ev == 3) { ExpandDirection = ExpandDirection.Right; }
+                else { ExpandDirection = ExpandDirection.Down; }
+                return true;
+            }
+            string ed = DependencyObject.UnboxString(value, "Down");
+            if (ed == "Up") { ExpandDirection = ExpandDirection.Up; }
+            else if (ed == "Left") { ExpandDirection = ExpandDirection.Left; }
+            else if (ed == "Right") { ExpandDirection = ExpandDirection.Right; }
+            else { ExpandDirection = ExpandDirection.Down; }
+            return true;
+        }
         return base.SetPropertyValue(propName, value);
     }
     public override DependencyObject GetPropertyValue(string propName) {
         if (propName == "IsExpanded") { return DependencyObject.BoxBool(_isExpanded); }
+        if (propName == "ExpandDirection") { return DependencyObject.BoxInt(EnumConvert.ToInt(_expandDirection)); }
         return base.GetPropertyValue(propName);
     }
 }

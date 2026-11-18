@@ -283,6 +283,7 @@ protected:
     }
     void OnViewportOrDpiChanged() noexcept override {
         hasDirtyLayout_ = true;
+        renderSyncDirty_ = true;
         TriggerWake();
     }
     void OnResourceStoreChanged() override;

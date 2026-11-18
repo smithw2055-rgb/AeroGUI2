@@ -36,6 +36,10 @@ enum class VisualAnimProp : std::uint8_t {
     CustomScalar1 = 24,
     CustomScalar2 = 25,
     CustomScalar3 = 26,
+    EffectOpacity = 27,
+    BrushOpacity = 28,
+    FillColor = 29,
+    StrokeColor = 30,
 };
 
 enum class EasingFunctionKind : std::uint8_t {
@@ -97,6 +101,7 @@ struct VisualAnimTrack {
 
     std::uint32_t fromRgba = 0u;
     std::uint32_t toRgba = 0u;
+    std::uint32_t currentRgba = 0u;
 
     float durationSec = 0.0f;
     float delaySec = 0.0f;
@@ -143,7 +148,27 @@ public:
         std::uint32_t toRgba,
         float durationSec,
         EasingFunctionKind easeKind = EasingFunctionKind::Cubic,
-        EasingMode easeMode = EasingMode::EaseOut);
+        EasingMode easeMode = EasingMode::EaseOut,
+        float delaySec = 0.0f);
+
+    [[nodiscard]] static float ReadCurrentScalarProp(
+        const VisualWorld& world,
+        VisualNodeId node,
+        VisualAnimProp prop) noexcept;
+    [[nodiscard]] static std::uint32_t ReadCurrentColorProp(
+        const VisualWorld& world,
+        VisualNodeId node,
+        VisualAnimProp prop) noexcept;
+    static void ApplyScalarPropImmediate(
+        VisualWorld& world,
+        VisualNodeId node,
+        VisualAnimProp prop,
+        float value) noexcept;
+    static void ApplyColorPropImmediate(
+        VisualWorld& world,
+        VisualNodeId node,
+        VisualAnimProp prop,
+        std::uint32_t rgba) noexcept;
 
     std::int32_t SpringFloat(
         VisualNodeId node,
