@@ -30,6 +30,8 @@ struct XamlNode final {
     std::string textContent;
     int line = 1;
     int column = 1;
+    bool precededByXmlSpace = false;
+    bool pendingInlineWs = false;
 
     [[nodiscard]] const XmlAttribute* FindAttribute(std::string_view name) const noexcept {
         for (const auto& attr : attributes) {
@@ -123,7 +125,41 @@ struct XamlNode final {
             if (!openStack.empty()) {
                 XamlNode* cur = openStack.back();
                 const std::string_view trimmed = aero::str::Trim(tok.text);
-                if (!trimmed.empty() || cur->localName == "Run" || cur->localName == "TextBlock") {
+                if (cur->localName == "TextBlock") {
+                    const bool hasLeadWs = !tok.text.empty() && aero::str::Trim(tok.text.substr(0, 1)).empty();
+                    const bool hasTrailWs = !tok.text.empty() && aero::str::Trim(tok.text.substr(tok.text.size() - 1)).empty();
+                    if (tok.kind == XmlTokenKind::CData) {
+                        cur->textContent += tok.text;
+                        auto txtNode = std::make_unique<XamlNode>();
+                        txtNode->rawName = "#text";
+                        txtNode->localName = "#text";
+                        txtNode->textContent = tok.text;
+                        cur->children.push_back(std::move(txtNode));
+                        cur->pendingInlineWs = false;
+                    } else if (trimmed.empty()) {
+                        if (!tok.text.empty()) {
+                            cur->pendingInlineWs = true;
+                        }
+                    } else {
+                        std::string chunk;
+                        if ((hasLeadWs || cur->pendingInlineWs) && !cur->children.empty() &&
+                            cur->children.back()->localName != "LineBreak") {
+                            chunk.push_back(' ');
+                        }
+                        chunk.append(trimmed);
+                        if (!cur->textContent.empty()) {
+                            cur->textContent.push_back(' ');
+                        }
+                        cur->textContent.append(trimmed);
+
+                        auto txtNode = std::make_unique<XamlNode>();
+                        txtNode->rawName = "#text";
+                        txtNode->localName = "#text";
+                        txtNode->textContent = std::move(chunk);
+                        cur->children.push_back(std::move(txtNode));
+                        cur->pendingInlineWs = hasTrailWs;
+                    }
+                } else if (!trimmed.empty() || cur->localName == "Run") {
                     if (tok.kind == XmlTokenKind::CData) {
                         cur->textContent += tok.text;
                     } else if (!trimmed.empty()) {
@@ -162,6 +198,8 @@ struct XamlNode final {
                         // Lookup checks both Owner.Prop and Prop directly via raw key
                     }
                 } else {
+                    rawPtr->precededByXmlSpace = parent->pendingInlineWs;
+                    parent->pendingInlineWs = false;
                     parent->children.push_back(std::move(node));
                 }
             }
@@ -610,6 +648,25 @@ struct XamlNode final {
         s.find("TranslateZ") != std::string_view::npos || s.find("Translation3DZ") != std::string_view::npos) {
         return "Trans3DZ";
     }
+    if (s.find("PlasmaBrush.") != std::string_view::npos) {
+        const std::string prefix = (s.find("Background") != std::string_view::npos) ? "Background." : "Fill.";
+        if (s.find("PlasmaBrush.Time") != std::string_view::npos) return prefix + "PlasmaTime";
+        if (s.find("PlasmaBrush.Seed") != std::string_view::npos) return prefix + "PlasmaSeed";
+        if (s.find("PlasmaBrush.Color") != std::string_view::npos) return prefix + "PlasmaColor";
+        if (s.find("PlasmaBrush.ScaleX") != std::string_view::npos) return prefix + "PlasmaScaleX";
+        if (s.find("PlasmaBrush.ScaleY") != std::string_view::npos) return prefix + "PlasmaScaleY";
+    }
+    if (s.find("PathFigure.Segments") != std::string_view::npos && s.find(".Point") != std::string_view::npos) {
+        int figIdx = 0;
+        if (const std::size_t fp = s.find("Figures)["); fp != std::string_view::npos) {
+            figIdx = std::max(0, static_cast<int>(std::strtol(std::string(s.substr(fp + 9u)).c_str(), nullptr, 10)));
+        }
+        int segIdx = 0;
+        if (const std::size_t sp = s.find("Segments)["); sp != std::string_view::npos) {
+            segIdx = std::max(0, static_cast<int>(std::strtol(std::string(s.substr(sp + 10u)).c_str(), nullptr, 10)));
+        }
+        return "Data.Fig" + std::to_string(figIdx) + ".Seg" + std::to_string(segIdx) + ".Point";
+    }
     if (s.find("GradientStops") != std::string_view::npos ||
         s.find("GradientStop.") != std::string_view::npos ||
         s.find("OpacityMask") != std::string_view::npos) {
@@ -849,7 +906,7 @@ struct XamlNode final {
         "Year", "Month", "Day", "Hour", "Minute", "Second", "Format", "UseSystemTime",
         "LineHeight", "CharacterSpacing", "MaxLines",
         "IsDirectionReversed", "IsTabStop", "ViewportSize", "MaxDropDownHeight",
-        "FontStyle", "IsItemsHost"
+        "FontStyle", "IsItemsHost", "FlowDirection"
     };
     return kProps.count(prop) > 0;
 }
@@ -960,7 +1017,7 @@ struct XamlNode final {
         "Visibility", "Opacity", "IsEnabled", "IsHitTestVisible", "Focusable",
         "ClipToBounds", "ZIndex", "RenderTransform", "LayoutTransform", "RenderTransformOrigin",
         "Effect", "OpacityMask", "Style", "Background", "BorderBrush",
-        "BorderThickness", "CornerRadius"
+        "BorderThickness", "CornerRadius", "FlowDirection"
     };
     return kBaseProps.count(prop) > 0;
 }
@@ -2706,15 +2763,45 @@ private:
         };
 
         if (shName == "PlasmaBrush") {
-            out << "var " << bVar << " = new LinearGradientBrush(0.0f, 0.0f, 1.0f, 1.0f);\n";
+            float sx = 64.0f, sy = 64.0f, tm = 0.0f, seed = 100.0f, vw = 300.0f, vh = 90.0f;
+            std::string col = "#FF01BCFF";
+            if (const auto* a = shaderNode.FindAttribute("ScaleX")) (void)aero::str::TryParseFloat32(a->value, sx);
+            if (const auto* a = shaderNode.FindAttribute("ScaleY")) (void)aero::str::TryParseFloat32(a->value, sy);
+            if (const auto* a = shaderNode.FindAttribute("Time")) (void)aero::str::TryParseFloat32(a->value, tm);
+            if (const auto* a = shaderNode.FindAttribute("Seed"); a && !LooksLikeMarkupExtension(a->value)) {
+                (void)aero::str::TryParseFloat32(a->value, seed);
+            }
+            if (const auto* a = shaderNode.FindAttribute("Color"); a && !LooksLikeMarkupExtension(a->value)) {
+                col = ResolveColorHexOrString(a->value);
+            }
+            if (const auto* vpAttr = brushNode.FindAttribute("Viewport")) {
+                std::vector<float> vpts;
+                if (TryParseFloatList(vpAttr->value, vpts) && vpts.size() >= 4u) {
+                    vw = vpts[2];
+                    vh = vpts[3];
+                }
+            }
+            out << "var " << bVar << " = new ImageBrush(\"shader://plasma\");\n";
+            if (const auto* stAttr = brushNode.FindAttribute("Stretch")) {
+                const std::string_view st = aero::str::Trim(stAttr->value);
+                if (!st.empty()) {
+                    Indent(out, indent);
+                    out << bVar << ".Stretch = Stretch." << st << ";\n";
+                }
+            }
+            if (const auto* tmAttr = brushNode.FindAttribute("TileMode")) {
+                const std::string_view tmVal = aero::str::Trim(tmAttr->value);
+                if (!tmVal.empty()) {
+                    Indent(out, indent);
+                    out << bVar << ".TileMode = " << EscapeRsString(tmVal) << ";\n";
+                }
+            }
             Indent(out, indent);
-            out << bVar << ".AddStop(\"#FF38BDF8\", 0.0f);\n";
-            Indent(out, indent);
-            out << bVar << ".AddStop(\"#FF8B5CF6\", 0.35f);\n";
-            Indent(out, indent);
-            out << bVar << ".AddStop(\"#FFEC4899\", 0.7f);\n";
-            Indent(out, indent);
-            out << bVar << ".AddStop(\"#FFF97316\", 1.0f);\n";
+            out << bVar << ".EnablePlasmaShader("
+                << FormatFloatLiteral(sx) << ", " << FormatFloatLiteral(sy) << ", "
+                << FormatFloatLiteral(tm) << ", " << FormatFloatLiteral(seed) << ", "
+                << EscapeRsString(col) << ", "
+                << FormatFloatLiteral(vw) << ", " << FormatFloatLiteral(vh) << ");\n";
             emitOpacity();
             return bVar;
         }
@@ -2805,6 +2892,8 @@ private:
                 } else {
                     color = ResolveColorHexOrString(colAttr->value);
                 }
+            } else if (!aero::str::Trim(brushNode.textContent).empty()) {
+                color = ResolveColorHexOrString(aero::str::Trim(brushNode.textContent));
             }
             // Check shader child tint override (Brush.Shader -> SaturationBrush / ConicGradientBrush / PlasmaBrush)
             if (const auto* shProp = FindBrushShaderElement(brushNode)) {
@@ -2863,6 +2952,13 @@ private:
                 if (!st.empty()) {
                     Indent(out, indent);
                     out << bVar << ".Stretch = Stretch." << st << ";\n";
+                }
+            }
+            if (const auto* tmAttr = brushNode.FindAttribute("TileMode")) {
+                const std::string_view tmVal = aero::str::Trim(tmAttr->value);
+                if (!tmVal.empty()) {
+                    Indent(out, indent);
+                    out << bVar << ".TileMode = " << EscapeRsString(tmVal) << ";\n";
                 }
             }
             if (const auto* opAttr = brushNode.FindAttribute("Opacity")) {
@@ -3462,6 +3558,16 @@ private:
                     if (!key.empty()) {
                         valExpr = LookupResourceExpr(key, dictVar);
                     }
+                } else if (ext.kind == MarkupExtensionKind::DynamicResource) {
+                    const std::string key = ResolveResourceKeyFromExtension(ext);
+                    if (!key.empty()) {
+                        Indent(out, indent);
+                        out << targetObjVar << ".AddSetter(Setter.FromDynamicResource("
+                            << EscapeRsString(propName) << ", "
+                            << EscapeRsString(key) << ", "
+                            << EscapeRsString(targetName) << "));\n";
+                        return;
+                    }
                 }
             }
             if (valExpr.empty()) {
@@ -3591,6 +3697,35 @@ private:
                 EmitTriggerEnterExitActions(*trig, "DataTrigger", tVar, dictVar, out, indent);
                 Indent(out, indent);
                 out << ownerObjVar << ".AddTrigger(" << tVar << ");\n";
+            } else if (trig->localName == "MultiTrigger") {
+                const std::string tVar = FreshVar("mtrig");
+                Indent(out, indent);
+                out << "var " << tVar << " = new MultiDataTrigger();\n";
+                if (const auto* condProp = trig->FindPropertyElement("MultiTrigger", "Conditions")) {
+                    for (const auto& cond : condProp->children) {
+                        if (cond->localName != "Condition") continue;
+                        std::string prop;
+                        std::string val;
+                        std::string srcName;
+                        if (const auto* p = cond->FindAttribute("Property")) prop = NormalizeSetterPropertyName(p->value);
+                        if (const auto* v = cond->FindAttribute("Value")) val = v->value;
+                        if (const auto* sn = cond->FindAttribute("SourceName")) srcName = sn->value;
+                        const std::string_view condTargetType = srcName.empty() ? styleTargetType : std::string_view{};
+                        Indent(out, indent);
+                        out << tVar << ".AddCondition("
+                            << EscapeRsString(prop) << ", "
+                            << BoxSetterValueExpr(prop, FormatTypedValueLiteral(prop, val, dictVar, condTargetType), condTargetType) << ", "
+                            << EscapeRsString(srcName) << ", \"Self\", \"\");\n";
+                    }
+                }
+                for (const auto& s : trig->children) {
+                    if (s->localName == "Setter") {
+                        EmitSetterInto(*s, tVar, dictVar, out, indent, styleTargetType);
+                    }
+                }
+                EmitTriggerEnterExitActions(*trig, "MultiTrigger", tVar, dictVar, out, indent);
+                Indent(out, indent);
+                out << ownerObjVar << ".AddTrigger(" << tVar << ");\n";
             } else if (trig->localName == "MultiDataTrigger") {
                 const std::string tVar = FreshVar("mdtrig");
                 Indent(out, indent);
@@ -3633,6 +3768,10 @@ private:
                 const std::string tVar = FreshVar("etrig");
                 Indent(out, indent);
                 out << "var " << tVar << " = new EventTrigger(" << EscapeRsString(evName) << ");\n";
+                if (const auto* sn = trig->FindAttribute("SourceName")) {
+                    Indent(out, indent);
+                    out << tVar << ".SourceName = " << EscapeRsString(sn->value) << ";\n";
+                }
                 for (const auto& act : trig->children) {
                     if (act->localName == "BeginStoryboard") {
                         if (const auto* sbAttr = act->FindAttribute("Storyboard");
@@ -4321,7 +4460,7 @@ private:
                         << FormatFloatLiteral(beginSec) << ");\n";
                 }
             } else if (child->localName == "PointAnimation") {
-                if (IsComplexGeometryPointPath(rawTargetProp)) {
+                if (IsComplexGeometryPointPath(rawTargetProp) && !aero::str::StartsWith(targetProp, "Data.Fig")) {
                     AddWarning(
                         "PointAnimation target property '" + rawTargetProp +
                         "' on complex Geometry/Path sub-property is not supported on visual animation tracks.");
@@ -4360,7 +4499,7 @@ private:
                     << FormatFloatLiteral(durSec) << ", " << easeKind << ", " << easeMode
                     << ", " << FormatFloatLiteral(beginSec) << ");\n";
             } else if (child->localName == "PointAnimationUsingKeyFrames") {
-                if (IsComplexGeometryPointPath(rawTargetProp)) {
+                if (IsComplexGeometryPointPath(rawTargetProp) && !aero::str::StartsWith(targetProp, "Data.Fig")) {
                     AddWarning(
                         "PointAnimationUsingKeyFrames target property '" + rawTargetProp +
                         "' on complex Geometry/Path sub-property is not supported on visual animation tracks.");
@@ -5873,6 +6012,27 @@ private:
                                 xDataType, out, indent, explicitBindSourceVar);
                         }
                     }
+                    if (const auto* shProp = FindBrushShaderElement(brushChild);
+                        shProp != nullptr && !shProp->children.empty() &&
+                        shProp->children.front()->localName == "PlasmaBrush") {
+                        const XamlNode& pb = *shProp->children.front();
+                        auto emitPbBind = [&](std::string_view xmlAttr, std::string_view propSuffix) {
+                            if (const auto* pa = pb.FindAttribute(xmlAttr);
+                                pa != nullptr && LooksLikeMarkupExtension(pa->value)) {
+                                const auto ext = ParseMarkupExtension(pa->value);
+                                ParsedBindingSpec bSpec;
+                                if (TryExtractBindingSpec(ext, bSpec)) {
+                                    EmitBindingSpec(
+                                        targetVar, resolvedTypeName,
+                                        std::string(shortProp) + "." + std::string(propSuffix),
+                                        bSpec, xDataType, out, indent, explicitBindSourceVar);
+                                }
+                            }
+                        };
+                        emitPbBind("Seed", "PlasmaSeed");
+                        emitPbBind("Color", "PlasmaColor");
+                        emitPbBind("Time", "PlasmaTime");
+                    }
                 }
                 continue;
             }
@@ -5998,19 +6158,55 @@ private:
 
         // Text / Runs vs Child elements
         if (resolvedTypeName == "TextBlock") {
+            auto isInlineTag = [](std::string_view ln) noexcept {
+                return ln == "Run" || ln == "Hyperlink" || ln == "Bold" ||
+                       ln == "Italic" || ln == "Underline" || ln == "Span" || ln == "LineBreak";
+            };
             bool hasRunChildren = false;
             for (const auto& ch : node.children) {
-                if (ch->localName == "Run") {
+                if (isInlineTag(ch->localName)) {
                     hasRunChildren = true;
                     break;
                 }
             }
             if (hasRunChildren) {
                 for (const auto& ch : node.children) {
-                    if (ch->localName != "Run") continue;
+                    if (ch->localName == "#text") {
+                        if (!ch->textContent.empty()) {
+                            const std::string tVar = FreshVar("run");
+                            Indent(out, indent);
+                            out << "var " << tVar << " = new Run(" << EscapeRsString(ch->textContent) << ");\n";
+                            Indent(out, indent);
+                            out << targetVar << ".AddRun(" << tVar << ");\n";
+                        }
+                        continue;
+                    }
+                    if (!isInlineTag(ch->localName)) continue;
+                    if (ch->localName == "LineBreak") {
+                        Indent(out, indent);
+                        out << targetVar << ".AddInline(new LineBreak());\n";
+                        continue;
+                    }
                     const std::string rVar = EmitRunElement(*ch, xDataType, dictVar, out, indent);
+                    if (ch->localName == "Hyperlink" && ch->FindAttribute("Foreground") == nullptr) {
+                        Indent(out, indent);
+                        out << rVar << ".Foreground = new SolidColorBrush(\"#FF1098DF\");\n";
+                    } else if (ch->localName == "Bold") {
+                        Indent(out, indent);
+                        out << rVar << ".FontWeight = \"Bold\";\n";
+                    } else if (ch->localName == "Italic") {
+                        Indent(out, indent);
+                        out << rVar << ".FontStyle = \"Italic\";\n";
+                    } else if (ch->localName == "Underline") {
+                        Indent(out, indent);
+                        out << rVar << ".Decorations = 1;\n";
+                    }
                     Indent(out, indent);
-                    out << targetVar << ".AddRun(" << rVar << ");\n";
+                    if (ch->precededByXmlSpace) {
+                        out << targetVar << ".AddRunSpaced(" << rVar << ");\n";
+                    } else {
+                        out << targetVar << ".AddRun(" << rVar << ");\n";
+                    }
                 }
             } else if (!node.textContent.empty() && node.FindAttribute("Text") == nullptr) {
                 Indent(out, indent);
@@ -6171,28 +6367,42 @@ private:
         const std::string rv = FreshVar("rin");
         Indent(out, indent);
         out << "var " << rv << " = new RiveInput();\n";
+        const std::string rName = node.GetName();
+        if (!rName.empty()) {
+            Indent(out, indent);
+            out << rv << ".Name = " << EscapeRsString(rName) << ";\n";
+            
+        }
         if (const auto* n = node.FindAttribute("InputName")) {
             Indent(out, indent);
             out << rv << ".InputName = " << EscapeRsString(n->value) << ";\n";
         }
+        Indent(out, indent);
+        out << riveVar << ".AddInput(" << rv << ");\n";
         if (const auto* v = node.FindAttribute("InputValue")) {
-            const std::string_view tv = aero::str::Trim(v->value);
-            if (aero::str::EqualsIgnoreCase(tv, "True") || aero::str::EqualsIgnoreCase(tv, "False")) {
-                Indent(out, indent);
-                out << rv << ".SetInputValueBool(" << (aero::str::EqualsIgnoreCase(tv, "True") ? "true" : "false") << ");\n";
+            if (LooksLikeMarkupExtension(v->value)) {
+                const auto ext = ParseMarkupExtension(v->value);
+                ParsedBindingSpec bSpec;
+                if (TryExtractBindingSpec(ext, bSpec)) {
+                    EmitBindingSpec(rv, "RiveInput", "InputValue", bSpec, {}, out, indent, {});
+                }
             } else {
-                float fv = 0.0f;
-                if (aero::str::TryParseFloat32(tv, fv)) {
+                const std::string_view tv = aero::str::Trim(v->value);
+                if (aero::str::EqualsIgnoreCase(tv, "True") || aero::str::EqualsIgnoreCase(tv, "False")) {
                     Indent(out, indent);
-                    out << rv << ".SetInputValueFloat(" << FormatFloatLiteral(fv) << ");\n";
+                    out << rv << ".SetInputValueBool(" << (aero::str::EqualsIgnoreCase(tv, "True") ? "true" : "false") << ");\n";
                 } else {
-                    Indent(out, indent);
-                    out << rv << ".SetInputValueString(" << EscapeRsString(v->value) << ");\n";
+                    float fv = 0.0f;
+                    if (aero::str::TryParseFloat32(tv, fv)) {
+                        Indent(out, indent);
+                        out << rv << ".SetInputValueFloat(" << FormatFloatLiteral(fv) << ");\n";
+                    } else {
+                        Indent(out, indent);
+                        out << rv << ".SetInputValueString(" << EscapeRsString(v->value) << ");\n";
+                    }
                 }
             }
         }
-        Indent(out, indent);
-        out << riveVar << ".AddInput(" << rv << ");\n";
     }
 
     void EmitInputBindings(
@@ -6541,7 +6751,7 @@ private:
         std::ostringstream& out,
         int indent) {
         const std::string tv = FreshVar("btrig");
-        if (trig.localName == "EventTrigger") {
+        if (trig.localName == "EventTrigger" || trig.localName == "TimerTrigger") {
             std::string evName = "Loaded";
             if (const auto* en = trig.FindAttribute("EventName")) evName = en->value;
             else if (const auto* re = trig.FindAttribute("RoutedEvent")) {
@@ -6963,6 +7173,21 @@ private:
                 out << vsVar << ".AddSetterBox(" << EscapeRsString(targetProp)
                     << ", " << boxed << ", "
                     << EscapeRsString(targetName) << ");\n";
+            } else if (tl->localName == "PointAnimationUsingKeyFrames" && !tl->children.empty()) {
+                const auto& anchorKf = useInitialAnchor ? *tl->children.front() : *tl->children.back();
+                if (const auto* va = anchorKf.FindAttribute("Value")) {
+                    std::vector<float> pts;
+                    if (TryParseFloatList(va->value, pts) && pts.size() >= 2u) {
+                        Indent(out, indent);
+                        out << vsVar << ".AddSetterBox(" << EscapeRsString(targetProp + ".X")
+                            << ", DependencyObject.BoxFloat(" << FormatFloatLiteral(pts[0]) << "), "
+                            << EscapeRsString(targetName) << ");\n";
+                        Indent(out, indent);
+                        out << vsVar << ".AddSetterBox(" << EscapeRsString(targetProp + ".Y")
+                            << ", DependencyObject.BoxFloat(" << FormatFloatLiteral(pts[1]) << "), "
+                            << EscapeRsString(targetName) << ");\n";
+                    }
+                }
             }
         }
     }

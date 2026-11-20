@@ -693,6 +693,282 @@ void TestSample05DualDomainSimHud(aero::rs_comp::CompilerSession& session) {
         "05 Track-B HUD mutation did not alter rendered framebuffer pixels");
 }
 
+void TestRegressionsFixed(aero::rs_comp::CompilerSession& session) {
+    std::cout << "[Test] RegressionsFixed (ManagedAnim / SVG / TextBlock / XamlReader / Lifecycle)...\n";
+
+    const std::string aotXaml = R"XML(
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:noesis="clr-namespace:NoesisGUIExtensions;assembly=Noesis.GUI.Extensions"
+        x:Class="RegTestDemo.MainWindow"
+        Title="Regression Tests" Width="800" Height="600">
+  <Window.Resources>
+    <Style x:Key="AnimatedBtnStyle" TargetType="Button">
+      <Setter Property="Background" Value="#FFFF0000"/>
+      <Setter Property="Template">
+        <Setter.Value>
+          <ControlTemplate TargetType="Button">
+            <Border x:Name="InnerBorder" Background="{TemplateBinding Background}" Width="120" Height="40"/>
+          </ControlTemplate>
+        </Setter.Value>
+      </Setter>
+    </Style>
+  </Window.Resources>
+  <StackPanel Orientation="Vertical" Spacing="8" Margin="16">
+    <TextBlock x:Name="TbNoSpace"><Run Text="Alpha"/><Run Text="Beta"/></TextBlock>
+    <TextBlock x:Name="TbSpaced"><Run Text="Alpha"/> <Run Text="Beta"/></TextBlock>
+    <TextBlock x:Name="TbMixed">Hello <Bold>World</Bold>!</TextBlock>
+    <TextBlock x:Name="TbCjk"><Run Text="中"/><Run Text="文"/> <Run Text="字"/></TextBlock>
+
+    <Path x:Name="PlasmaPath" Width="120" Height="60"
+          Data="M 0,0 C 10,20 30,40 50,60 L .5.25 M 5,5 L 15,25">
+      <Path.Fill>
+        <ImageBrush Stretch="Fill" TileMode="Tile" Viewport="0,0,120,60">
+          <noesis:Brush.Shader>
+            <noesis:PlasmaBrush ScaleX="48" ScaleY="48" Seed="77" Color="#FF00FF88" Time="0.1"/>
+          </noesis:Brush.Shader>
+        </ImageBrush>
+      </Path.Fill>
+    </Path>
+
+    <Button x:Name="TplBtn" Style="{StaticResource AnimatedBtnStyle}"/>
+
+    <Border x:Name="RuntimeHost"/>
+    <StackPanel x:Name="DisposeHost">
+      <TextBlock x:Name="DisposedTb" Text="{Binding Label}"/>
+    </StackPanel>
+  </StackPanel>
+</Window>)XML";
+
+    const std::string aotRs = R"RS(
+module RegTestDemo;
+import Aero.UI;
+
+public class RegVm {
+    public string Label { get; set; } = "Initial";
+}
+
+public partial class MainWindow : Window {
+    public RegVm Vm;
+    public TextBlock RtNoSpace;
+    public TextBlock RtSpaced;
+    public TextBlock RtMixed;
+    public Path RtPlasma;
+    public RiveControl RtRive;
+    public Border RtTrigBorder;
+    public TextBlock RtDisposedTb;
+
+    public MainWindow() {
+        InitializeComponent();
+        Vm = new RegVm();
+        DataContext = Vm;
+
+        var infSb = new Storyboard();
+        infSb.RepeatForever = true;
+        var pa = new DoubleAnimation(0.1f, 5.0f, 1.0f);
+        Storyboard.SetTargetName(pa, "PlasmaPath");
+        Storyboard.SetTargetProperty(pa, "Fill.PlasmaTime");
+        infSb.Add(pa);
+
+        var pathSb = new Storyboard();
+        var da1 = new DoubleAnimation(50.0f, 90.0f, 0.4f);
+        Storyboard.SetTargetName(da1, "PlasmaPath");
+        Storyboard.SetTargetProperty(da1, "Data.Fig0.Seg0.Point.X");
+        pathSb.Add(da1);
+        var da2 = new DoubleAnimation(25.0f, 75.0f, 0.4f);
+        Storyboard.SetTargetName(da2, "PlasmaPath");
+        Storyboard.SetTargetProperty(da2, "Data.Fig1.Seg0.Point.Y");
+        pathSb.Add(da2);
+        var ca = new ColorAnimation("#FFFF0000", "#FF0000FF", 0.4f);
+        Storyboard.SetTargetName(ca, "TplBtn");
+        Storyboard.SetTargetProperty(ca, "Background");
+        pathSb.Add(ca);
+
+        Loaded += (object s, RoutedEventArgs e) => {
+            infSb.Begin(this);
+            pathSb.Begin(this);
+        };
+
+        string rtXml = "<StackPanel xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation' " +
+            "xmlns:x='http://schemas.microsoft.com/winfx/2006/xaml' " +
+            "xmlns:noesis='clr-namespace:NoesisGUIExtensions;assembly=Noesis.GUI.Extensions'>" +
+            "<TextBlock x:Name='RtNoSpace'><Run Text='Alpha'/><Run Text='Beta'/></TextBlock>" +
+            "<TextBlock x:Name='RtSpaced'><Run Text='Alpha'/> <Run Text='Beta'/></TextBlock>" +
+            "<TextBlock x:Name='RtMixed'>Hello <Bold>World</Bold>!</TextBlock>" +
+            "<Path x:Name='RtPlasma' Width='80' Height='40' Data='M 0,0 L 80,40'>" +
+            "<Path.Fill><ImageBrush TileMode='Tile' Viewport='0,0,80,40'><noesis:Brush.Shader><noesis:PlasmaBrush Seed='42' Color='#FFFF2200'/></noesis:Brush.Shader></ImageBrush></Path.Fill>" +
+            "</Path>" +
+            "<noesis:RiveControl x:Name='RtRive' Source='rive://logo.riv'><noesis:RiveInput InputName='Progress' InputValue='42'/></noesis:RiveControl>" +
+            "<Border x:Name='RtTrigBorder' Opacity='1.0' Tag='collapse'>" +
+            "<Border.Style><Style TargetType='Border'><Style.Triggers>" +
+            "<Trigger Property='FrameworkElement.Tag' Value='collapse'><Setter Property='UIElement.Opacity' Value='0.25'/></Trigger>" +
+            "</Style.Triggers></Style></Border.Style>" +
+            "</Border></StackPanel>";
+        UIElement parsed = XamlReader.Parse(rtXml);
+        if (parsed != null) {
+            RuntimeHost.AddChild(parsed);
+            RtNoSpace = parsed.FindName("RtNoSpace") as TextBlock;
+            RtSpaced = parsed.FindName("RtSpaced") as TextBlock;
+            RtMixed = parsed.FindName("RtMixed") as TextBlock;
+            RtPlasma = parsed.FindName("RtPlasma") as Path;
+            RtRive = parsed.FindName("RtRive") as RiveControl;
+            RtTrigBorder = parsed.FindName("RtTrigBorder") as Border;
+        }
+        RtDisposedTb = DisposedTb;
+    }
+
+    public string RunDisposeCheck() {
+        BindingEngine.Flush();
+        string before = RtDisposedTb != null ? RtDisposedTb.Text : "";
+        DisposeHost.DisposeSubtree();
+        Vm.Label = "AfterDispose";
+        BindingEngine.Flush();
+        string after = RtDisposedTb != null ? RtDisposedTb.Text : "";
+        return before + "|" + after;
+    }
+
+    public string GetRtNoSpaceText() { return RtNoSpace != null ? RtNoSpace.Text : ""; }
+    public string GetRtSpacedText() { return RtSpaced != null ? RtSpaced.Text : ""; }
+    public string GetRtMixedText() { return RtMixed != null ? RtMixed.Text : ""; }
+    public string GetRtPlasmaUri() {
+        return (RtPlasma != null && RtPlasma.Fill is ImageBrush) ? (RtPlasma.Fill as ImageBrush).ImageSource : "";
+    }
+    public string GetRtPlasmaTile() {
+        return (RtPlasma != null && RtPlasma.Fill is ImageBrush) ? (RtPlasma.Fill as ImageBrush).TileMode : "";
+    }
+    public int GetRtRiveInputCount() { return RtRive != null ? RtRive.Inputs().Length : -1; }
+    public string GetRtRiveInputName() {
+        return (RtRive != null && RtRive.Inputs().Length > 0) ? RtRive.Inputs()[0].InputName : "";
+    }
+    public float GetRtTrigOpacity() { return RtTrigBorder != null ? RtTrigBorder.Opacity : -1.0f; }
+    public string GetDisposedTbText() { return RtDisposedTb != null ? RtDisposedTb.Text : ""; }
+}
+)RS";
+
+    aero::AeroV3CompileInput input;
+    input.stdlibRootDir = AERO_STDLIB_DIR;
+    input.includeStdlib = true;
+    input.treeShakeStdlib = false;
+    input.optimizeBytecode = false;
+    input.emitAotCpp = false;
+    input.xamlPath = "RegTestDemo/MainWindow.xaml";
+    input.xamlContent = aotXaml;
+    input.scriptSources.push_back(aero::SourceFile{"RegTestDemo/MainWindow.rs", aotRs});
+
+    aero::AeroAppHostConfig cfg;
+    cfg.viewportWidth = 800u;
+    cfg.viewportHeight = 600u;
+    cfg.headless = true;
+    cfg.preferSoftwareRasterizer = true;
+
+    aero::AeroAppHost host(cfg);
+    std::string err;
+    Require(host.CompileAndLoad(input, &err), "RegTestDemo CompileAndLoad failed: " + err);
+    if (!host.RootVisualNode().IsValid()) {
+        return;
+    }
+
+    host.StepFrame(0.016f, true);
+
+    auto getNodeText = [&](std::string_view name) -> std::string {
+        const aero::VisualNodeId nid = host.FindVisualByOwnerName(name);
+        const aero::VisualNode* nd = host.World().GetNode(nid);
+        return nd ? nd->Text().text : std::string{};
+    };
+    Require(getNodeText("TbNoSpace") == "AlphaBeta", "AOT TextBlock adjacent Runs unexpected: " + getNodeText("TbNoSpace"));
+    Require(getNodeText("TbSpaced") == "Alpha Beta", "AOT TextBlock spaced Runs unexpected: " + getNodeText("TbSpaced"));
+    Require(getNodeText("TbMixed") == "Hello World!", "AOT TextBlock mixed text/Bold unexpected: " + getNodeText("TbMixed"));
+    Require(getNodeText("TbCjk") == "\xE4\xB8\xAD\xE6\x96\x87\xE5\xAD\x97",
+        "AOT TextBlock CJK unexpected: " + getNodeText("TbCjk"));
+
+    // Check XamlReader.Parse results via UI root object
+    const aero::ObjectRef uiObj = host.RootScriptObject();
+    Require(uiObj.valid(), "RegTestDemo RootScriptObject invalid");
+    auto callStr = [&](std::string_view fn) -> std::string {
+        aero::UnifiedValue rv{};
+        if (host.InvokeScriptMethod(uiObj, fn, {}, &rv, aero::DomainKind::UiPresentation)) {
+            if (const auto* sv = std::get_if<aero::rs_rt::StringValue>(&rv)) {
+                return sv->str();
+            }
+            if (const auto* ref = std::get_if<aero::rs_rt::ObjectRef>(&rv);
+                ref && ref->valid() && ref->kind == aero::rs_rt::ObjectKind::String) {
+                if (const auto opt = host.Domains().stringViewAcrossDomains(*ref)) {
+                    return std::string(opt->data(), opt->size());
+                }
+            }
+        }
+        return {};
+    };
+    auto callInt = [&](std::string_view fn) -> std::int64_t {
+        aero::UnifiedValue rv{};
+        std::int64_t out = -1;
+        if (host.InvokeScriptMethod(uiObj, fn, {}, &rv, aero::DomainKind::UiPresentation)) {
+            (void)rv.tryGetInt64(out);
+        }
+        return out;
+    };
+    auto callFloat = [&](std::string_view fn) -> float {
+        aero::UnifiedValue rv{};
+        float out = -1.0f;
+        if (host.InvokeScriptMethod(uiObj, fn, {}, &rv, aero::DomainKind::UiPresentation)) {
+            if (rv.tryGetFloat(out)) { return out; }
+            double dv = 0.0;
+            if (rv.tryGetDouble(dv)) { return static_cast<float>(dv); }
+        }
+        return out;
+    };
+
+    Require(callStr("GetRtNoSpaceText") == "AlphaBeta", "Runtime XamlReader NoSpace failed");
+    Require(callStr("GetRtSpacedText") == "Alpha Beta", "Runtime XamlReader Spaced failed");
+    Require(callStr("GetRtMixedText") == "Hello World!", "Runtime XamlReader Mixed failed");
+    Require(callStr("GetRtPlasmaUri").rfind("shader://plasma?", 0) == 0, "Runtime XamlReader PlasmaBrush failed");
+    Require(callStr("GetRtPlasmaTile") == "Tile", "Runtime XamlReader TileMode failed");
+    Require(callInt("GetRtRiveInputCount") == 1 && callStr("GetRtRiveInputName") == "Progress",
+        "Runtime XamlReader RiveControl/RiveInput failed");
+    Require(std::fabs(callFloat("GetRtTrigOpacity") - 0.25f) < 0.02f,
+        "Runtime XamlReader NormalizeSetterProp Trigger failed");
+    const std::string disposedTxt = callStr("RunDisposeCheck");
+    Require(disposedTxt == "Initial|Initial",
+        "DisposeSubtree() + BindingEngine.Flush() should ignore updates after disposal, got='" + disposedTxt + "'");
+
+    // Step 0.20s across frames to verify managed infinite Storyboard (PlasmaTime), SVG Path Data anim, and TplBtn ColorAnimation
+    const aero::VisualNodeId plasmaPathId = host.FindVisualByOwnerName("PlasmaPath");
+    aero::VisualNodeId innerBorderId = host.FindVisualByOwnerName("InnerBorder");
+    if (!innerBorderId.IsValid()) {
+        const aero::VisualNodeId btnId = host.FindVisualByOwnerName("TplBtn");
+        if (const aero::VisualNode* btnNode = host.World().GetNode(btnId); btnNode && !btnNode->children.empty()) {
+            innerBorderId = btnNode->children[0];
+        }
+    }
+    const aero::VisualNode* pNode0 = host.World().GetNode(plasmaPathId);
+    const std::string uri0 = pNode0 ? pNode0->Image().uri : std::string{};
+    const std::string data0 = pNode0 ? pNode0->Vector().pathOrParams : std::string{};
+    const std::size_t activeBefore = host.AnimEngine().ActiveTrackCount();
+    Require(pNode0 && pNode0->Image().tileWrap, "AOT Path ImageBrush TileMode=Tile should set tileWrap");
+
+    for (int f = 0; f < 10; ++f) {
+        host.StepFrame(0.020f, true);
+    }
+    const aero::VisualNode* pNodeMid = host.World().GetNode(plasmaPathId);
+    const aero::VisualNode* bNodeMid = host.World().GetNode(innerBorderId);
+    const std::string uriMid = pNodeMid ? pNodeMid->Image().uri : std::string{};
+    const std::string dataMid = pNodeMid ? pNodeMid->Vector().pathOrParams : std::string{};
+    Require(uriMid != uri0,
+        "Infinite Storyboard Fill.PlasmaTime did not tick: tracksBefore=" + std::to_string(activeBefore) +
+        " after=" + std::to_string(host.AnimEngine().ActiveTrackCount()) + " uri0=" + uri0 + " uriMid=" + uriMid);
+    Require(dataMid != data0 && dataMid.find(".5.25") != std::string::npos,
+        "Command-aware SVG Path animation failed: data0=" + data0 + " dataMid=" + dataMid);
+    if (bNodeMid) {
+        const std::uint32_t midCol = bNodeMid->box.bgRgba;
+        const std::uint32_t midR = midCol & 0xFFu;
+        const std::uint32_t midB = (midCol >> 16u) & 0xFFu;
+        Require(midR > 15u && midR < 240u && midB > 15u && midB < 240u,
+            "Templated Control Background ColorAnimation unexpected bgRgba=0x" + std::to_string(midCol));
+    } else {
+        Require(false, "InnerBorder from ControlTemplate not found");
+    }
+}
+
 } // namespace
 
 int main() {
@@ -702,6 +978,7 @@ int main() {
     TestSample03ControlGallery(sharedSession);
     TestSample04VectorAndCanvas(sharedSession);
     TestSample05DualDomainSimHud(sharedSession);
+    TestRegressionsFixed(sharedSession);
 
     if (gFailureCount > 0) {
         std::cerr << gFailureCount << " v3_controls_and_samples_tests assertion(s) failed.\n";

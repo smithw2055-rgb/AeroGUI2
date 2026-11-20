@@ -107,6 +107,7 @@ aero_apply_no_rtti_options(aerogui_foundation)
 add_library(aerogui_render STATIC
     src/render/FontAtlas.cpp
     src/render/ImageAtlas.cpp
+    src/render/RiveRenderer.cpp
     src/render/PagedRenderTree.cpp
     src/render/SoftwareRasterizer.cpp
     src/render/ZeroCopyGpuStream.cpp
@@ -248,6 +249,9 @@ if(AERO_BUILD_TESTS)
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/render_host_tests.cpp")
         add_executable(render_host_tests tests/render_host_tests.cpp)
         target_link_libraries(render_host_tests PRIVATE aerogui_host)
+        target_compile_definitions(render_host_tests PRIVATE
+            AERO_SAMPLES_DIR="${CMAKE_CURRENT_SOURCE_DIR}/Samples"
+        )
         aero_apply_no_rtti_options(render_host_tests)
         add_test(NAME render_host_tests COMMAND render_host_tests)
     endif()

@@ -1,4 +1,5 @@
 #include "aero/render/ImageAtlas.hpp"
+#include "aero/render/RiveRenderer.hpp"
 #include "aero/core/UIResourceStore.hpp"
 
 #include <algorithm>
@@ -3042,9 +3043,257 @@ const ImageAtlasEntry* ImageAtlas::FindLoaded(
     return nullptr;
 }
 
+
+namespace {
+
+float HashGrad2D(int ix, int iy, float dx, float dy, int seedOff) noexcept {
+    std::uint32_t h = static_cast<std::uint32_t>(ix * 374761393 + iy * 668265263 + seedOff * 1442695041);
+    h = (h ^ (h >> 13u)) * 1274126177u;
+    h ^= (h >> 16u);
+    const float ang = static_cast<float>(h & 0xFFFFu) * (6.283185307f / 65536.0f);
+    return std::cos(ang) * dx + std::sin(ang) * dy;
+}
+
+float Perlin2D(float x, float y, int seedOff) noexcept {
+    const int x0 = static_cast<int>(std::floor(x));
+    const int y0 = static_cast<int>(std::floor(y));
+    const float fx = x - static_cast<float>(x0);
+    const float fy = y - static_cast<float>(y0);
+    const float ux = fx * fx * fx * (fx * (fx * 6.0f - 15.0f) + 10.0f);
+    const float uy = fy * fy * fy * (fy * (fy * 6.0f - 15.0f) + 10.0f);
+    const float n00 = HashGrad2D(x0, y0, fx, fy, seedOff);
+    const float n10 = HashGrad2D(x0 + 1, y0, fx - 1.0f, fy, seedOff);
+    const float n01 = HashGrad2D(x0, y0 + 1, fx, fy - 1.0f, seedOff);
+    const float n11 = HashGrad2D(x0 + 1, y0 + 1, fx - 1.0f, fy - 1.0f, seedOff);
+    const float nx0 = n00 + (n10 - n00) * ux;
+    const float nx1 = n01 + (n11 - n01) * ux;
+    return nx0 + (nx1 - nx0) * uy;
+}
+
+struct PlasmaShaderParams {
+    float sx = 64.0f;
+    float sy = 64.0f;
+    float seed = 100.0f;
+    float timeSec = 0.0f;
+    float vw = 300.0f;
+    float vh = 90.0f;
+    std::string colorHex = "#FF01BCFF";
+};
+
+bool ParsePlasmaShaderUri(std::string_view uri, PlasmaShaderParams& outParams, std::string& outSlotKey) {
+    if (uri.size() < 16u || uri.substr(0u, 16u) != "shader://plasma?") return false;
+    outParams = PlasmaShaderParams{};
+    std::string_view q = uri.substr(16u);
+    while (!q.empty()) {
+        const std::size_t amp = q.find('&');
+        const std::string_view kv = (amp != std::string_view::npos) ? q.substr(0u, amp) : q;
+        if (const std::size_t eq = kv.find('='); eq != std::string_view::npos) {
+            const std::string_view k = kv.substr(0u, eq);
+            const std::string v(kv.substr(eq + 1u));
+            if (k == "sx") outParams.sx = std::max(4.0f, std::strtof(v.c_str(), nullptr));
+            else if (k == "sy") outParams.sy = std::max(4.0f, std::strtof(v.c_str(), nullptr));
+            else if (k == "seed") outParams.seed = std::strtof(v.c_str(), nullptr);
+            else if (k == "time") outParams.timeSec = std::strtof(v.c_str(), nullptr);
+            else if (k == "vw") outParams.vw = std::clamp(std::strtof(v.c_str(), nullptr), 32.0f, 512.0f);
+            else if (k == "vh") outParams.vh = std::clamp(std::strtof(v.c_str(), nullptr), 16.0f, 512.0f);
+            else if (k == "color") outParams.colorHex = v;
+        }
+        if (amp == std::string_view::npos) break;
+        q.remove_prefix(amp + 1u);
+    }
+
+    const std::uint32_t w = static_cast<std::uint32_t>(std::lround(outParams.vw));
+    const std::uint32_t h = static_cast<std::uint32_t>(std::lround(outParams.vh));
+    const int seedInt = static_cast<int>(std::lround(outParams.seed));
+    const long sxQ = std::lround(outParams.sx * 100.0f);
+    const long syQ = std::lround(outParams.sy * 100.0f);
+    outSlotKey = "shader://plasma_slot?seed=" + std::to_string(seedInt) +
+                 "&sx=" + std::to_string(sxQ) + "&sy=" + std::to_string(syQ) +
+                 "&color=" + outParams.colorHex +
+                 "&w=" + std::to_string(w) + "&h=" + std::to_string(h);
+    return true;
+}
+
+bool SynthesizePlasmaShaderImageFromParams(const PlasmaShaderParams& params, DecodedImage& outImg) {
+    float baseR = 0.004f, baseG = 0.737f, baseB = 1.0f, baseA = 1.0f;
+    std::string_view hex = params.colorHex;
+    if (!hex.empty() && hex.front() == '#') hex.remove_prefix(1u);
+    if (hex.size() == 8u || hex.size() == 6u) {
+        const unsigned long val = std::strtoul(std::string(hex).c_str(), nullptr, 16);
+        if (hex.size() == 8u) {
+            baseA = static_cast<float>((val >> 24u) & 0xFFu) / 255.0f;
+            baseR = static_cast<float>((val >> 16u) & 0xFFu) / 255.0f;
+            baseG = static_cast<float>((val >> 8u) & 0xFFu) / 255.0f;
+            baseB = static_cast<float>(val & 0xFFu) / 255.0f;
+        } else {
+            baseR = static_cast<float>((val >> 16u) & 0xFFu) / 255.0f;
+            baseG = static_cast<float>((val >> 8u) & 0xFFu) / 255.0f;
+            baseB = static_cast<float>(val & 0xFFu) / 255.0f;
+        }
+    }
+
+    const std::uint32_t w = static_cast<std::uint32_t>(std::lround(params.vw));
+    const std::uint32_t h = static_cast<std::uint32_t>(std::lround(params.vh));
+    outImg.width = w;
+    outImg.height = h;
+    outImg.format = ImageFormat::RawRgba8;
+    outImg.rgbaPixels.resize(static_cast<std::size_t>(w) * static_cast<std::size_t>(h) * 4u);
+
+    const int seedInt = static_cast<int>(std::lround(params.seed));
+    const float t = params.timeSec * 0.5f;
+    const float invSx = 1.0f / params.sx;
+    const float invSy = 1.0f / params.sy;
+    for (std::uint32_t py = 0u; py < h; ++py) {
+        const float ny = (static_cast<float>(py) + 0.5f) * invSy;
+        for (std::uint32_t px = 0u; px < w; ++px) {
+            const float nx = (static_cast<float>(px) + 0.5f) * invSx;
+            const float wx = Perlin2D(nx * 0.55f + t * 0.25f, ny * 0.55f - t * 0.15f, seedInt + 17);
+            const float wy = Perlin2D(nx * 0.55f - t * 0.2f, ny * 0.55f + t * 0.22f, seedInt + 53);
+            const float nDetail = 0.45f * Perlin2D((nx + wx * 1.3f) * 0.95f, (ny + wy * 1.3f) * 0.95f, seedInt + 97);
+            const float phase = ny * 1.35f + 0.55f * std::sin(nx * 1.45f + wx * 3.4f + t * 0.35f) + (wy + nDetail) * 1.65f;
+            const float ribbon = 1.0f - std::min(1.0f, std::fabs(std::sin(phase * 3.14159265f)) * 2.15f);
+            const float pocket = std::max(0.0f, 1.0f - std::hypot(wx * 2.1f, wy * 2.1f));
+            const float v = std::clamp(std::max(ribbon, pocket * 0.92f), 0.0f, 1.0f);
+            const float glow = v * v * (2.2f - 0.6f * v);
+            const float core = std::max(0.0f, (v - 0.52f) / 0.48f);
+            const float whiteCore = core * core * 0.95f;
+
+            const float outR = std::clamp(baseR * glow + whiteCore, 0.0f, 1.0f);
+            const float outG = std::clamp(baseG * glow + whiteCore, 0.0f, 1.0f);
+            const float outB = std::clamp(baseB * glow + whiteCore * (0.45f + 0.55f * baseB), 0.0f, 1.0f);
+            std::uint8_t* dst = outImg.rgbaPixels.data() + (static_cast<std::size_t>(py) * w + px) * 4u;
+            dst[0] = static_cast<std::uint8_t>(outR * 255.0f + 0.5f);
+            dst[1] = static_cast<std::uint8_t>(outG * 255.0f + 0.5f);
+            dst[2] = static_cast<std::uint8_t>(outB * 255.0f + 0.5f);
+            dst[3] = static_cast<std::uint8_t>(std::clamp(baseA, 0.0f, 1.0f) * 255.0f + 0.5f);
+        }
+    }
+    return true;
+}
+
+} // namespace
+
 const ImageAtlasEntry* ImageAtlas::LoadOrGet(
     std::string_view uri,
     std::string_view localBaseDir) {
+    if (uri.size() >= 16u && uri.substr(0u, 16u) == "shader://plasma?") {
+        constexpr std::size_t kMaxPlasmaSlotCache = 64u;
+        PlasmaShaderParams params{};
+        std::string slotKey;
+        if (!ParsePlasmaShaderUri(uri, params, slotKey)) {
+            return nullptr;
+        }
+        std::uint32_t reuseSlotId = 0u;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (const auto it = plasmaSlots_.find(slotKey); it != plasmaSlots_.end()) {
+                it->second.lastUsedTick = ++dynamicSlotTick_;
+                if (it->second.currentExactUri == uri &&
+                    textureSlots_.find(it->second.entry.textureId) != textureSlots_.end()) {
+                    return &it->second.entry;
+                }
+                reuseSlotId = it->second.entry.textureId;
+            }
+        }
+        DecodedImage plasmaImg{};
+        if (!SynthesizePlasmaShaderImageFromParams(params, plasmaImg)) {
+            return nullptr;
+        }
+        if (reuseSlotId == 0u) {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (plasmaSlots_.size() >= kMaxPlasmaSlotCache) {
+                auto lruIt = plasmaSlots_.begin();
+                for (auto it = plasmaSlots_.begin(); it != plasmaSlots_.end(); ++it) {
+                    if (it->second.lastUsedTick < lruIt->second.lastUsedTick) {
+                        lruIt = it;
+                    }
+                }
+                reuseSlotId = lruIt->second.entry.textureId;
+                plasmaSlots_.erase(lruIt);
+            }
+        }
+        const std::uint32_t finalTexId = RegisterOrUpdateRgbaTextureSlot(
+            reuseSlotId, plasmaImg.width, plasmaImg.height, std::move(plasmaImg.rgbaPixels));
+        if (finalTexId == 0u) {
+            return nullptr;
+        }
+        std::lock_guard<std::mutex> lock(mutex_);
+        DynamicSlotCacheEntry& cached = plasmaSlots_[slotKey];
+        cached.slotKey = std::move(slotKey);
+        cached.currentExactUri = std::string(uri);
+        cached.lastUsedTick = ++dynamicSlotTick_;
+        cached.entry.uriKey = cached.currentExactUri;
+        cached.entry.textureId = finalTexId;
+        cached.entry.width = plasmaImg.width;
+        cached.entry.height = plasmaImg.height;
+        cached.entry.atlasX = 0u;
+        cached.entry.atlasY = 0u;
+        cached.entry.atlasWidth = plasmaImg.width;
+        cached.entry.atlasHeight = plasmaImg.height;
+        cached.entry.u0 = 0.0f;
+        cached.entry.v0 = 0.0f;
+        cached.entry.u1 = 1.0f;
+        cached.entry.v1 = 1.0f;
+        cached.entry.isStandalone = true;
+        return &cached.entry;
+    }
+    if (IsRiveAssetUri(uri)) {
+        constexpr std::size_t kMaxRiveSlotCache = 32u;
+        const std::string riveKey = "rive_cache://" + std::string(localBaseDir) + "|" + std::string(uri);
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (const auto it = riveSlots_.find(riveKey); it != riveSlots_.end()) {
+                if (textureSlots_.find(it->second.entry.textureId) != textureSlots_.end()) {
+                    it->second.lastUsedTick = ++dynamicSlotTick_;
+                    return &it->second.entry;
+                }
+            }
+        }
+        DecodedImage riveImg{};
+        if (!RenderRiveUriToImage(uri, *this, localBaseDir, riveImg) || !riveImg.Valid()) {
+            return nullptr;
+        }
+        std::uint32_t reuseSlotId = 0u;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (const auto it = riveSlots_.find(riveKey); it != riveSlots_.end()) {
+                reuseSlotId = it->second.entry.textureId;
+            } else if (riveSlots_.size() >= kMaxRiveSlotCache) {
+                auto lruIt = riveSlots_.begin();
+                for (auto it = riveSlots_.begin(); it != riveSlots_.end(); ++it) {
+                    if (it->second.lastUsedTick < lruIt->second.lastUsedTick) {
+                        lruIt = it;
+                    }
+                }
+                reuseSlotId = lruIt->second.entry.textureId;
+                riveSlots_.erase(lruIt);
+            }
+        }
+        const std::uint32_t finalTexId = RegisterOrUpdateRgbaTextureSlot(
+            reuseSlotId, riveImg.width, riveImg.height, std::move(riveImg.rgbaPixels));
+        if (finalTexId == 0u) {
+            return nullptr;
+        }
+        std::lock_guard<std::mutex> lock(mutex_);
+        DynamicSlotCacheEntry& cached = riveSlots_[riveKey];
+        cached.slotKey = riveKey;
+        cached.currentExactUri = std::string(uri);
+        cached.lastUsedTick = ++dynamicSlotTick_;
+        cached.entry.uriKey = riveKey;
+        cached.entry.textureId = finalTexId;
+        cached.entry.width = riveImg.width;
+        cached.entry.height = riveImg.height;
+        cached.entry.atlasX = 0u;
+        cached.entry.atlasY = 0u;
+        cached.entry.atlasWidth = riveImg.width;
+        cached.entry.atlasHeight = riveImg.height;
+        cached.entry.u0 = 0.0f;
+        cached.entry.v0 = 0.0f;
+        cached.entry.u1 = 1.0f;
+        cached.entry.v1 = 1.0f;
+        cached.entry.isStandalone = true;
+        return &cached.entry;
+    }
     const std::string clean = NormalizeImageUriPath(uri);
     if (clean.empty()) {
         return nullptr;
@@ -3159,6 +3408,12 @@ const TextureSlotBuffer* ImageAtlas::GetTextureSlot(std::uint32_t textureId) con
     std::lock_guard<std::mutex> lock(mutex_);
     const auto it = textureSlots_.find(textureId);
     return (it != textureSlots_.end()) ? &it->second : nullptr;
+}
+
+std::uint64_t ImageAtlas::GetTextureSlotRevision(std::uint32_t textureId) const noexcept {
+    std::lock_guard<std::mutex> lock(mutex_);
+    const auto it = textureSlots_.find(textureId);
+    return (it != textureSlots_.end()) ? static_cast<std::uint64_t>(it->second.dirtyRevision) : 0u;
 }
 
 bool ImageAtlas::TryGetTextureSlotSnapshot(
@@ -3350,9 +3605,200 @@ void ImageAtlas::Clear() noexcept {
     skyline_.ClearToEmpty();
     memoryEncodedAssets_.clear();
     entries_.clear();
+    plasmaSlots_.clear();
+    riveSlots_.clear();
+    dynamicSlotTick_ = 0u;
     textureSlots_.clear();
     nextStandaloneTextureId_ = 1u;
     revision_.fetch_add(1u, std::memory_order_release);
+}
+
+bool CompositeMaskedPathImage(
+    UIResourceStore& store,
+    ImageAtlas& atlas,
+    std::uint64_t pathHash,
+    std::string_view pathData,
+    const Rect& rawBounds,
+    const Rect& elemRect,
+    const Rect& maskFittedRect,
+    std::uint32_t innerW,
+    std::uint32_t innerH,
+    std::uint32_t padPx,
+    std::string_view fillImageUri,
+    Stretch fillStretch,
+    std::uint32_t fillTintRgba,
+    bool tileWrap,
+    RasterizedPathMaskEntry& outEntry) {
+    if (pathData.empty() || fillImageUri.empty()) {
+        return false;
+    }
+    const ImageAtlasEntry* imgEntry = atlas.LoadOrGet(fillImageUri);
+    if (!imgEntry || imgEntry->width == 0u || imgEntry->height == 0u) {
+        return false;
+    }
+
+    std::uint32_t slotW = 0u;
+    std::uint32_t slotH = 0u;
+    std::shared_ptr<const std::vector<std::uint8_t>> slotPixels;
+    if (!atlas.TryGetTextureSlotSnapshot(imgEntry->textureId, slotW, slotH, slotPixels) ||
+        slotW == 0u || slotH == 0u || !slotPixels) {
+        return false;
+    }
+
+    const std::uint64_t safeHash = (pathHash != 0ull) ? pathHash : ComputeSvgPathHash(pathData);
+    const std::uint32_t clampedW = std::clamp<std::uint32_t>(innerW, 1u, 2048u);
+    const std::uint32_t clampedH = std::clamp<std::uint32_t>(innerH, 1u, 2048u);
+    const std::uint32_t clampedPad = std::min<std::uint32_t>(padPx, 64u);
+    const std::uint64_t texRev = atlas.GetTextureSlotRevision(imgEntry->textureId);
+
+    std::uint64_t key = safeHash ^ 0xA341316C98765431ULL;
+    auto mixU64 = [&](std::uint64_t v) noexcept {
+        key ^= v;
+        key *= 1099511628211ULL;
+    };
+    auto mixFloat = [&](float v) noexcept {
+        const float clean = (v == 0.0f) ? 0.0f : v;
+        std::uint32_t bits = 0u;
+        std::memcpy(&bits, &clean, sizeof(bits));
+        mixU64(static_cast<std::uint64_t>(bits));
+    };
+
+    mixU64((static_cast<std::uint64_t>(clampedW) << 32u) | static_cast<std::uint64_t>(clampedH));
+    mixU64(static_cast<std::uint64_t>(clampedPad));
+    for (unsigned char ch : fillImageUri) {
+        mixU64(static_cast<std::uint64_t>(ch));
+    }
+    mixU64((static_cast<std::uint64_t>(imgEntry->textureId) << 32u) ^ texRev);
+    mixU64((static_cast<std::uint64_t>(imgEntry->width) << 32u) | static_cast<std::uint64_t>(imgEntry->height));
+    mixU64((static_cast<std::uint64_t>(fillStretch) << 33u) ^
+           (static_cast<std::uint64_t>(fillTintRgba) << 1u) ^
+           (tileWrap ? 1ull : 0ull));
+    mixFloat(rawBounds.x);
+    mixFloat(rawBounds.y);
+    mixFloat(rawBounds.width);
+    mixFloat(rawBounds.height);
+    mixFloat(elemRect.x);
+    mixFloat(elemRect.y);
+    mixFloat(elemRect.width);
+    mixFloat(elemRect.height);
+    mixFloat(maskFittedRect.x);
+    mixFloat(maskFittedRect.y);
+    mixFloat(maskFittedRect.width);
+    mixFloat(maskFittedRect.height);
+
+    if (store.LookupCachedPathMask(key, outEntry)) {
+        return true;
+    }
+
+    std::vector<std::uint8_t> maskRgba;
+    if (!RasterizeSvgPathFillAlphaMask(pathData, rawBounds, clampedW, clampedH, clampedPad, maskRgba)) {
+        return false;
+    }
+
+    const std::uint32_t texW = clampedW + 2u * clampedPad;
+    const std::uint32_t texH = clampedH + 2u * clampedPad;
+    const std::size_t expectedBytes = static_cast<std::size_t>(texW) * static_cast<std::size_t>(texH) * 4u;
+    if (maskRgba.size() < expectedBytes) {
+        return false;
+    }
+
+    const ImageStretchPlacement place = ComputeImageStretchPlacement(
+        elemRect,
+        static_cast<float>(imgEntry->width),
+        static_cast<float>(imgEntry->height),
+        fillStretch,
+        StretchDirection::Both,
+        imgEntry->u0,
+        imgEntry->v0,
+        imgEntry->u1,
+        imgEntry->v1);
+
+    constexpr float kInv255 = 1.0f / 255.0f;
+    // Colors are packed in 0xAABBGGRR format (R = low byte, B = bits 16..23)
+    const std::uint32_t effTint = (fillTintRgba != 0u) ? fillTintRgba : 0xFFFFFFFFu;
+    const float tr = static_cast<float>(effTint & 0xFFu) * kInv255;
+    const float tg = static_cast<float>((effTint >> 8u) & 0xFFu) * kInv255;
+    const float tb = static_cast<float>((effTint >> 16u) & 0xFFu) * kInv255;
+    const float ta = static_cast<float>((effTint >> 24u) & 0xFFu) * kInv255;
+
+    const std::uint8_t* const srcPx = slotPixels->data();
+    const int maxX = static_cast<int>(slotW) - 1;
+    const int maxY = static_cast<int>(slotH) - 1;
+    const float maxXf = static_cast<float>(maxX);
+    const float maxYf = static_cast<float>(maxY);
+    const bool validDrawBox = place.valid && (place.destRect.width > 1e-6f && place.destRect.height > 1e-6f);
+
+    for (std::uint32_t py = 0u; py < texH; ++py) {
+        const float ny = ((static_cast<float>(py) - static_cast<float>(clampedPad)) + 0.5f) /
+                         static_cast<float>(clampedH);
+        const float wy = maskFittedRect.y + ny * maskFittedRect.height;
+        const float rawRy = validDrawBox ? ((wy - place.destRect.y) / place.destRect.height) : 0.0f;
+        for (std::uint32_t px = 0u; px < texW; ++px) {
+            std::uint8_t* dst = maskRgba.data() + (static_cast<std::size_t>(py) * texW + px) * 4u;
+            const std::uint8_t maskAlpha = dst[3];
+            if (maskAlpha == 0u || !validDrawBox) {
+                dst[0] = 0u;
+                dst[1] = 0u;
+                dst[2] = 0u;
+                dst[3] = 0u;
+                continue;
+            }
+            const float nx = ((static_cast<float>(px) - static_cast<float>(clampedPad)) + 0.5f) /
+                             static_cast<float>(clampedW);
+            const float wx = maskFittedRect.x + nx * maskFittedRect.width;
+            float rx = (wx - place.destRect.x) / place.destRect.width;
+            float ry = rawRy;
+            if (tileWrap) {
+                rx = rx - std::floor(rx);
+                ry = ry - std::floor(ry);
+            } else if (rx < 0.0f || rx > 1.0f || ry < 0.0f || ry > 1.0f) {
+                dst[0] = 0u;
+                dst[1] = 0u;
+                dst[2] = 0u;
+                dst[3] = 0u;
+                continue;
+            }
+
+            const float u = std::clamp(place.u0 + rx * (place.u1 - place.u0), 0.0f, 1.0f);
+            const float v = std::clamp(place.v0 + ry * (place.v1 - place.v0), 0.0f, 1.0f);
+            const float texX = std::clamp(u * static_cast<float>(slotW) - 0.5f, 0.0f, maxXf);
+            const float texY = std::clamp(v * static_cast<float>(slotH) - 0.5f, 0.0f, maxYf);
+            const int x0 = std::clamp(static_cast<int>(std::floor(texX)), 0, maxX);
+            const int y0 = std::clamp(static_cast<int>(std::floor(texY)), 0, maxY);
+            const int x1 = std::min(x0 + 1, maxX);
+            const int y1 = std::min(y0 + 1, maxY);
+            const float fx = std::clamp(texX - std::floor(texX), 0.0f, 1.0f);
+            const float fy = std::clamp(texY - std::floor(texY), 0.0f, 1.0f);
+
+            const std::uint8_t* p00 = srcPx + (static_cast<std::size_t>(y0) * slotW + x0) * 4u;
+            const std::uint8_t* p10 = srcPx + (static_cast<std::size_t>(y0) * slotW + x1) * 4u;
+            const std::uint8_t* p01 = srcPx + (static_cast<std::size_t>(y1) * slotW + x0) * 4u;
+            const std::uint8_t* p11 = srcPx + (static_cast<std::size_t>(y1) * slotW + x1) * 4u;
+
+            auto sampleCh = [&](std::size_t ch) noexcept -> float {
+                const float top = static_cast<float>(p00[ch]) +
+                                  (static_cast<float>(p10[ch]) - static_cast<float>(p00[ch])) * fx;
+                const float bot = static_cast<float>(p01[ch]) +
+                                  (static_cast<float>(p11[ch]) - static_cast<float>(p01[ch])) * fx;
+                return top + (bot - top) * fy;
+            };
+
+            const float sr = sampleCh(0u) * tr;
+            const float sg = sampleCh(1u) * tg;
+            const float sb = sampleCh(2u) * tb;
+            const float sa = sampleCh(3u) * ta * (static_cast<float>(maskAlpha) * kInv255);
+            dst[0] = static_cast<std::uint8_t>(std::clamp(sr, 0.0f, 255.0f) + 0.5f);
+            dst[1] = static_cast<std::uint8_t>(std::clamp(sg, 0.0f, 255.0f) + 0.5f);
+            dst[2] = static_cast<std::uint8_t>(std::clamp(sb, 0.0f, 255.0f) + 0.5f);
+            dst[3] = static_cast<std::uint8_t>(std::clamp(sa, 0.0f, 255.0f) + 0.5f);
+        }
+    }
+
+    const float u0 = static_cast<float>(clampedPad) / static_cast<float>(texW);
+    const float v0 = static_cast<float>(clampedPad) / static_cast<float>(texH);
+    const float u1 = static_cast<float>(clampedPad + clampedW) / static_cast<float>(texW);
+    const float v1 = static_cast<float>(clampedPad + clampedH) / static_cast<float>(texH);
+    return store.StoreCachedPathMask(key, texW, texH, u0, v0, u1, v1, std::move(maskRgba), outEntry);
 }
 
 } // namespace aero

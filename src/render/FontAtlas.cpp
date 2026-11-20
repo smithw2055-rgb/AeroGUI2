@@ -740,6 +740,7 @@ bool TrueTypeFontFace::ParseTables(std::string* outError) {
         else if (tag == MakeTag('n', 'a', 'm', 'e')) name = span;
         else if (tag == MakeTag('k', 'e', 'r', 'n')) kern = span;
         else if (tag == MakeTag('O', 'S', '/', '2')) os2 = span;
+        else if (tag == MakeTag('G', 'S', 'U', 'B')) ParseGsubTable(off, len);
     }
 
     const bool hasGlyf = loca.present && glyf.present;
@@ -1111,6 +1112,169 @@ void TrueTypeFontFace::ParseKernTable(std::uint32_t offset, std::uint32_t length
             return a.packedPair < b.packedPair;
         });
     }
+}
+
+
+void TrueTypeFontFace::ParseGsubTable(std::uint32_t offset, std::uint32_t length) {
+    gsubFeatures_.clear();
+    hasArabicGsub_ = false;
+    if (length < 10u || offset > data_.size() || length > data_.size() - offset) return;
+    const std::uint8_t* g = data_.data() + offset;
+    auto ru16 = [&](std::uint32_t p) noexcept -> std::uint16_t {
+        if (p + 2u > length) return 0u;
+        return static_cast<std::uint16_t>((static_cast<std::uint16_t>(g[p]) << 8u) | g[p + 1u]);
+    };
+    auto ri16 = [&](std::uint32_t p) noexcept -> std::int16_t {
+        return static_cast<std::int16_t>(ru16(p));
+    };
+    auto ru32 = [&](std::uint32_t p) noexcept -> std::uint32_t {
+        if (p + 4u > length) return 0u;
+        return (static_cast<std::uint32_t>(g[p]) << 24u) |
+               (static_cast<std::uint32_t>(g[p + 1u]) << 16u) |
+               (static_cast<std::uint32_t>(g[p + 2u]) << 8u) |
+               static_cast<std::uint32_t>(g[p + 3u]);
+    };
+    auto readCoverage = [&](std::uint32_t covOff, std::vector<std::uint16_t>& outGlyphs) {
+        outGlyphs.clear();
+        if (covOff + 4u > length) return;
+        const std::uint16_t fmt = ru16(covOff);
+        if (fmt == 1u) {
+            const std::uint16_t cnt = ru16(covOff + 2u);
+            if (covOff + 4u + 2u * cnt > length) return;
+            outGlyphs.reserve(cnt);
+            for (std::uint16_t i = 0u; i < cnt; ++i) outGlyphs.push_back(ru16(covOff + 4u + 2u * i));
+        } else if (fmt == 2u) {
+            const std::uint16_t rcnt = ru16(covOff + 2u);
+            if (covOff + 4u + 6u * rcnt > length) return;
+            for (std::uint16_t i = 0u; i < rcnt; ++i) {
+                const std::uint16_t s = ru16(covOff + 4u + 6u * i);
+                const std::uint16_t e = ru16(covOff + 6u + 6u * i);
+                for (std::uint32_t gid = s; gid <= e && outGlyphs.size() < 8192u; ++gid) {
+                    outGlyphs.push_back(static_cast<std::uint16_t>(gid));
+                }
+            }
+        }
+    };
+
+    const std::uint16_t featListOff = ru16(6u);
+    const std::uint16_t lookupListOff = ru16(8u);
+    if (featListOff < 10u || lookupListOff < 10u || featListOff + 2u > length || lookupListOff + 2u > length) return;
+
+    const std::uint16_t lookupCount = ru16(lookupListOff);
+    const std::uint16_t featCount = ru16(featListOff);
+    if (featListOff + 2u + 6u * featCount > length) return;
+
+    auto findOrAddFeat = [&](std::uint32_t tag) -> GsubFeatureRules& {
+        for (auto& fr : gsubFeatures_) {
+            if (fr.tag == tag) return fr;
+        }
+        gsubFeatures_.push_back(GsubFeatureRules{tag, {}, {}});
+        return gsubFeatures_.back();
+    };
+
+    std::vector<std::uint16_t> cov;
+    for (std::uint16_t fi = 0u; fi < featCount; ++fi) {
+        const std::uint32_t ftag = ru32(featListOff + 2u + 6u * fi);
+        const bool wanted =
+            ftag == 0x69736F6Cu || // 'isol'
+            ftag == 0x696E6974u || // 'init'
+            ftag == 0x6D656469u || // 'medi'
+            ftag == 0x66696E61u || // 'fina'
+            ftag == 0x6C696761u || // 'liga'
+            ftag == 0x726C6967u;   // 'rlig'
+        if (!wanted) continue;
+        const std::uint32_t fOff = featListOff + ru16(featListOff + 6u + 6u * fi);
+        if (fOff + 4u > length) continue;
+        const std::uint16_t lIdxCount = ru16(fOff + 2u);
+        if (fOff + 4u + 2u * lIdxCount > length) continue;
+        GsubFeatureRules& rules = findOrAddFeat(ftag);
+
+        for (std::uint16_t li = 0u; li < lIdxCount; ++li) {
+            const std::uint16_t lookupIdx = ru16(fOff + 4u + 2u * li);
+            if (lookupIdx >= lookupCount || lookupListOff + 4u + 2u * lookupIdx > length) continue;
+            const std::uint32_t lOff = lookupListOff + ru16(lookupListOff + 2u + 2u * lookupIdx);
+            if (lOff + 6u > length) continue;
+            const std::uint16_t lType = ru16(lOff);
+            const std::uint16_t subCount = ru16(lOff + 4u);
+            if (lOff + 6u + 2u * subCount > length) continue;
+            for (std::uint16_t si = 0u; si < subCount; ++si) {
+                std::uint16_t effType = lType;
+                std::uint32_t sOff = lOff + ru16(lOff + 6u + 2u * si);
+                if (effType == 7u) { // Extension Substitution
+                    if (sOff + 8u > length || ru16(sOff) != 1u) continue;
+                    effType = ru16(sOff + 2u);
+                    const std::uint32_t extDelta = ru32(sOff + 4u);
+                    if (extDelta > length - sOff) continue;
+                    sOff += extDelta;
+                }
+                if (sOff + 6u > length) continue;
+                const std::uint16_t substFmt = ru16(sOff);
+                if (effType == 1u) { // SingleSubst
+                    readCoverage(sOff + ru16(sOff + 2u), cov);
+                    if (substFmt == 1u) {
+                        const std::int16_t delta = ri16(sOff + 4u);
+                        for (std::uint16_t fg : cov) {
+                            rules.singles.push_back({fg, static_cast<std::uint16_t>((fg + delta) & 0xFFFF)});
+                        }
+                    } else if (substFmt == 2u) {
+                        const std::uint16_t gCnt = ru16(sOff + 4u);
+                        if (sOff + 6u + 2u * gCnt <= length) {
+                            const std::size_t n = std::min<std::size_t>(cov.size(), gCnt);
+                            for (std::size_t k = 0u; k < n; ++k) {
+                                rules.singles.push_back({cov[k], ru16(sOff + 6u + 2u * static_cast<std::uint32_t>(k))});
+                            }
+                        }
+                    }
+                } else if (effType == 4u && substFmt == 1u) { // LigatureSubst
+                    readCoverage(sOff + ru16(sOff + 2u), cov);
+                    const std::uint16_t setCnt = ru16(sOff + 4u);
+                    if (sOff + 6u + 2u * setCnt <= length) {
+                        const std::size_t n = std::min<std::size_t>(cov.size(), setCnt);
+                        for (std::size_t k = 0u; k < n; ++k) {
+                            const std::uint32_t lsOff = sOff + ru16(sOff + 6u + 2u * static_cast<std::uint32_t>(k));
+                            if (lsOff + 2u > length) continue;
+                            const std::uint16_t ligCnt = ru16(lsOff);
+                            if (lsOff + 2u + 2u * ligCnt > length) continue;
+                            for (std::uint16_t m = 0u; m < ligCnt; ++m) {
+                                const std::uint32_t lgOff = lsOff + ru16(lsOff + 2u + 2u * m);
+                                if (lgOff + 4u > length) continue;
+                                const std::uint16_t ligGlyph = ru16(lgOff);
+                                const std::uint16_t compCnt = ru16(lgOff + 2u);
+                                if (compCnt == 1u) {
+                                    rules.singles.push_back({cov[k], ligGlyph});
+                                } else if (compCnt == 2u && lgOff + 6u <= length) {
+                                    rules.ligs.push_back({cov[k], ru16(lgOff + 4u), ligGlyph});
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if (!rules.singles.empty() || !rules.ligs.empty()) {
+            hasArabicGsub_ = true;
+        }
+    }
+}
+
+std::uint32_t TrueTypeFontFace::ApplyArabicGsubFeature(std::uint32_t tag4, std::uint32_t glyphId) const noexcept {
+    for (const auto& fr : gsubFeatures_) {
+        if (fr.tag != tag4) continue;
+        for (const auto& r : fr.singles) {
+            if (r.fromGlyph == glyphId) return r.toGlyph;
+        }
+    }
+    return glyphId;
+}
+
+std::uint32_t TrueTypeFontFace::ApplyArabicGsubLigature(std::uint32_t firstGlyphId, std::uint32_t secondGlyphId) const noexcept {
+    for (const auto& fr : gsubFeatures_) {
+        if (fr.tag != 0x6C696761u && fr.tag != 0x726C6967u) continue;
+        for (const auto& r : fr.ligs) {
+            if (r.firstGlyph == firstGlyphId && r.secondGlyph == secondGlyphId) return r.ligGlyph;
+        }
+    }
+    return 0u;
 }
 
 std::uint32_t TrueTypeFontFace::FindGlyphIndex(std::uint32_t codePoint) const noexcept {
@@ -3040,6 +3204,83 @@ FontAtlasGlyph FontAtlas::EnsureGlyphFromChainLocked(
     return EnsureGlyphLocked(chain.front(), codePoint);
 }
 
+FontAtlasGlyph FontAtlas::EnsureGlyphByIndexLocked(
+    const RegisteredFontEntry& fontEntry,
+    std::uint32_t gid,
+    std::uint32_t sourceCodePoint) {
+    if (!fontEntry.face || !fontEntry.face->IsValid() || gid == 0u) {
+        return EnsureGlyphLocked(&fontEntry, sourceCodePoint);
+    }
+    const std::uint64_t cacheKey =
+        (static_cast<std::uint64_t>(fontEntry.fontId) << 32u) | 0x80000000ULL | static_cast<std::uint64_t>(gid);
+    if (const auto it = glyphCache_.find(cacheKey); it != glyphCache_.end()) {
+        return it->second;
+    }
+    const std::uint64_t faceHash = fontEntry.face->ContentHash();
+    const std::uint64_t procGlyphKey = (faceHash != 0u)
+        ? ((faceHash ^ (static_cast<std::uint64_t>(gid) * 0x9E3779B97F4A7C15ULL)) ^ 0xA5A55A5AULL)
+        : 0u;
+    FontAtlasGlyph meta{};
+    std::vector<std::uint8_t> cellPixels;
+    bool bakedOk = false;
+    if (procGlyphKey != 0u) {
+        auto& pgc = ProcessBakedGlyphCache::Instance();
+        std::lock_guard<std::mutex> g(pgc.mtx);
+        const auto hit = pgc.entries.find(procGlyphKey);
+        if (hit != pgc.entries.end()) {
+            meta = hit->second.meta;
+            meta.codePoint = sourceCodePoint;
+            cellPixels = hit->second.pixels;
+            bakedOk = true;
+        }
+    }
+    if (!bakedOk) {
+        TtfGlyphOutline outline{};
+        if (fontEntry.face->ExtractGlyphOutline(gid, outline)) {
+            meta = FontAtlasGlyph{};
+            meta.codePoint = sourceCodePoint;
+            BakeOutlineToSdfCell(
+                outline,
+                fontEntry.face->UnitsPerEm(),
+                kDefaultBakeEmPixels,
+                kDefaultSdfPxRange,
+                meta,
+                cellPixels);
+            bakedOk = true;
+            if (procGlyphKey != 0u) {
+                auto& pgc = ProcessBakedGlyphCache::Instance();
+                std::lock_guard<std::mutex> g(pgc.mtx);
+                if (pgc.entries.size() >= 8192u) pgc.entries.clear();
+                pgc.entries.emplace(procGlyphKey, ProcessBakedGlyphEntry{meta, cellPixels});
+            }
+        }
+    }
+    if (!bakedOk) {
+        return EnsureGlyphLocked(&fontEntry, sourceCodePoint);
+    }
+    const float invW = 1.0f / static_cast<float>(atlasWidth_);
+    const float invH = 1.0f / static_cast<float>(atlasHeight_);
+    if (!meta.isWhitespace && meta.cellWidth > 0u && meta.cellHeight > 0u) {
+        std::uint16_t ax = 0u, ay = 0u;
+        if (AllocateSkylineRectLocked(meta.cellWidth, meta.cellHeight, ax, ay)) {
+            BlitCellR8Locked(ax, ay, meta.cellWidth, meta.cellHeight, cellPixels.data());
+            meta.atlasX = ax;
+            meta.atlasY = ay;
+            meta.u0 = (static_cast<float>(ax) + 0.5f) * invW;
+            meta.v0 = (static_cast<float>(ay) + 0.5f) * invH;
+            meta.u1 = (static_cast<float>(ax + meta.cellWidth) - 0.5f) * invW;
+            meta.v1 = (static_cast<float>(ay + meta.cellHeight) - 0.5f) * invH;
+        }
+    } else {
+        meta.u0 = 2.5f * invW;
+        meta.v0 = 2.5f * invH;
+        meta.u1 = 6.5f * invW;
+        meta.v1 = 6.5f * invH;
+    }
+    glyphCache_[cacheKey] = meta;
+    return meta;
+}
+
 FontAtlasGlyph FontAtlas::EnsureGlyphLocked(
     const RegisteredFontEntry* fontEntry,
     std::uint32_t codePoint) {
@@ -3454,7 +3695,8 @@ TextLayoutResult FontAtlas::MeasureLayout(
     float charSpacing,
     int fontWeight,
     bool fontItalic,
-    float explicitLineHeight) {
+    float explicitLineHeight,
+    bool baseRtl) {
     RichTextRunInput singleRun{};
     singleRun.text = utf8Text;
     singleRun.fontFamily = fontFamily;
@@ -3474,8 +3716,289 @@ TextLayoutResult FontAtlas::MeasureLayout(
         maxWidth,
         wrapMode,
         charSpacing,
-        explicitLineHeight);
+        explicitLineHeight,
+        baseRtl);
 }
+
+namespace {
+
+enum class ArabicJoinType : std::uint8_t {
+    NonJoining = 0,
+    RightJoining = 1,
+    DualJoining = 2,
+    JoinCausing = 3,
+    Transparent = 4,
+};
+
+ArabicJoinType ClassifyArabicJoining(std::uint32_t cp) noexcept {
+    if ((cp >= 0x064Bu && cp <= 0x065Fu) || cp == 0x0670u || (cp >= 0x06D6u && cp <= 0x06EDu)) {
+        return ArabicJoinType::Transparent;
+    }
+    if (cp == 0x0640u || cp == 0x200Du) return ArabicJoinType::JoinCausing;
+    switch (cp) {
+        case 0x0622u: case 0x0623u: case 0x0624u: case 0x0625u: case 0x0627u:
+        case 0x0629u: case 0x062Fu: case 0x0630u: case 0x0631u: case 0x0632u:
+        case 0x0648u: case 0x0671u:
+            return ArabicJoinType::RightJoining;
+        default:
+            break;
+    }
+    if ((cp >= 0x0626u && cp <= 0x063Au) || (cp >= 0x0641u && cp <= 0x064Au) ||
+        cp == 0x067Eu || cp == 0x0686u || cp == 0x0698u || cp == 0x06A9u ||
+        cp == 0x06AFu || cp == 0x06CCu) {
+        if (cp == 0x0621u) return ArabicJoinType::NonJoining;
+        // Note: U+0649 (Alef Maksura) is DualJoining in Unicode/GSUB or RightJoining when final; in Arabic it only occurs final unless Kashmiri, but check:
+        if (cp == 0x0649u) return ArabicJoinType::RightJoining;
+        return ArabicJoinType::DualJoining;
+    }
+    return ArabicJoinType::NonJoining;
+}
+
+bool JoinsToLeft(ArabicJoinType jt) noexcept {
+    return jt == ArabicJoinType::DualJoining || jt == ArabicJoinType::JoinCausing;
+}
+bool JoinsToRight(ArabicJoinType jt) noexcept {
+    return jt == ArabicJoinType::RightJoining || jt == ArabicJoinType::DualJoining || jt == ArabicJoinType::JoinCausing;
+}
+
+std::uint32_t FallbackArabicPresentationFormB(std::uint32_t cp, int form /*0=isol,1=init,2=medi,3=fina*/) noexcept {
+    struct Row { std::uint32_t base, isol, fina, init, medi; };
+    static constexpr Row kRows[] = {
+        {0x0621, 0xFE80, 0xFE80, 0xFE80, 0xFE80},
+        {0x0622, 0xFE81, 0xFE82, 0xFE81, 0xFE82},
+        {0x0623, 0xFE83, 0xFE84, 0xFE83, 0xFE84},
+        {0x0624, 0xFE85, 0xFE86, 0xFE85, 0xFE86},
+        {0x0625, 0xFE87, 0xFE88, 0xFE87, 0xFE88},
+        {0x0626, 0xFE89, 0xFE8A, 0xFE8B, 0xFE8C},
+        {0x0627, 0xFE8D, 0xFE8E, 0xFE8D, 0xFE8E},
+        {0x0628, 0xFE8F, 0xFE90, 0xFE91, 0xFE92},
+        {0x0629, 0xFE93, 0xFE94, 0xFE93, 0xFE94},
+        {0x062A, 0xFE95, 0xFE96, 0xFE97, 0xFE98},
+        {0x062B, 0xFE99, 0xFE9A, 0xFE9B, 0xFE9C},
+        {0x062C, 0xFE9D, 0xFE9E, 0xFE9F, 0xFEA0},
+        {0x062D, 0xFEA1, 0xFEA2, 0xFEA3, 0xFEA4},
+        {0x062E, 0xFEA5, 0xFEA6, 0xFEA7, 0xFEA8},
+        {0x062F, 0xFEA9, 0xFEAA, 0xFEA9, 0xFEAA},
+        {0x0630, 0xFEAB, 0xFEAC, 0xFEAB, 0xFEAC},
+        {0x0631, 0xFEAD, 0xFEAE, 0xFEAD, 0xFEAE},
+        {0x0632, 0xFEAF, 0xFEB0, 0xFEAF, 0xFEB0},
+        {0x0633, 0xFEB1, 0xFEB2, 0xFEB3, 0xFEB4},
+        {0x0634, 0xFEB5, 0xFEB6, 0xFEB7, 0xFEB8},
+        {0x0635, 0xFEB9, 0xFEBA, 0xFEBB, 0xFEBC},
+        {0x0636, 0xFEBD, 0xFEBE, 0xFEBF, 0xFEC0},
+        {0x0637, 0xFEC1, 0xFEC2, 0xFEC3, 0xFEC4},
+        {0x0638, 0xFEC5, 0xFEC6, 0xFEC7, 0xFEC8},
+        {0x0639, 0xFEC9, 0xFECA, 0xFECB, 0xFECC},
+        {0x063A, 0xFECD, 0xFECE, 0xFECF, 0xFED0},
+        {0x0641, 0xFED1, 0xFED2, 0xFED3, 0xFED4},
+        {0x0642, 0xFED5, 0xFED6, 0xFED7, 0xFED8},
+        {0x0643, 0xFED9, 0xFEDA, 0xFEDB, 0xFEDC},
+        {0x0644, 0xFEDD, 0xFEDE, 0xFEDF, 0xFEE0},
+        {0x0645, 0xFEE1, 0xFEE2, 0xFEE3, 0xFEE4},
+        {0x0646, 0xFEE5, 0xFEE6, 0xFEE7, 0xFEE8},
+        {0x0647, 0xFEE9, 0xFEEA, 0xFEEB, 0xFEEC},
+        {0x0648, 0xFEED, 0xFEEE, 0xFEED, 0xFEEE},
+        {0x0649, 0xFEEF, 0xFEF0, 0xFEEF, 0xFEF0},
+        {0x064A, 0xFEF1, 0xFEF2, 0xFEF3, 0xFEF4},
+    };
+    for (const auto& r : kRows) {
+        if (r.base == cp) {
+            if (form == 1) return r.init;
+            if (form == 2) return r.medi;
+            if (form == 3) return r.fina;
+            return r.isol;
+        }
+    }
+    return cp;
+}
+
+enum class BidiClass : std::uint8_t {
+    L = 0, R = 1, AL = 2, EN = 3, AN = 4, ES = 5, ET = 6, CS = 7, NSM = 8, WS = 9, ON = 10
+};
+
+BidiClass ClassifyBidi(std::uint32_t cp) noexcept {
+    if ((cp >= 0x0600u && cp <= 0x06FFu) || (cp >= 0x0750u && cp <= 0x077Fu) ||
+        (cp >= 0x08A0u && cp <= 0x08FFu) || (cp >= 0xFB50u && cp <= 0xFDFFu) ||
+        (cp >= 0xFE70u && cp <= 0xFEFFu)) {
+        if (cp >= 0x0660u && cp <= 0x0669u) return BidiClass::AN;
+        if ((cp >= 0x064Bu && cp <= 0x065Fu) || cp == 0x0670u) return BidiClass::NSM;
+        if (cp == 0x060Cu) return BidiClass::CS;
+        return BidiClass::AL;
+    }
+    if (cp >= 0x0590u && cp <= 0x05FFu) return BidiClass::R;
+    if (cp >= '0' && cp <= '9') return BidiClass::EN;
+    if (cp == '+' || cp == '-') return BidiClass::ES;
+    if (cp == '%' || cp == '#' || cp == '$') return BidiClass::ET;
+    if (cp == ',' || cp == '.' || cp == ':' || cp == '/') return BidiClass::CS;
+    if (cp == ' ' || cp == '\t') return BidiClass::WS;
+    if ((cp >= 'A' && cp <= 'Z') || (cp >= 'a' && cp <= 'z') ||
+        (cp >= 0x00C0u && cp <= 0x02AFu) || (cp >= 0x3040u && cp <= 0x9FFFu)) {
+        return BidiClass::L;
+    }
+    return BidiClass::ON;
+}
+
+std::uint32_t MirrorBracketCodePoint(std::uint32_t cp) noexcept {
+    switch (cp) {
+        case '(': return ')';
+        case ')': return '(';
+        case '[': return ']';
+        case ']': return '[';
+        case '{': return '}';
+        case '}': return '{';
+        case '<': return '>';
+        case '>': return '<';
+        default: return cp;
+    }
+}
+
+void ComputeUax9LineVisualOrder(
+    const std::vector<std::uint32_t>& lineCps,
+    bool paragraphRtl,
+    std::vector<std::size_t>& outOrder,
+    std::vector<std::uint8_t>& outLevels) {
+    const std::size_t n = lineCps.size();
+    outOrder.resize(n);
+    for (std::size_t i = 0u; i < n; ++i) outOrder[i] = i;
+    const std::uint8_t baseLevel = paragraphRtl ? 1u : 0u;
+    outLevels.assign(n, baseLevel);
+    if (n == 0u) return;
+
+    std::vector<BidiClass> cls(n);
+    std::vector<bool> isNsm(n, false);
+    bool hasRtlOrNum = paragraphRtl;
+    for (std::size_t i = 0u; i < n; ++i) {
+        cls[i] = ClassifyBidi(lineCps[i]);
+        isNsm[i] = (cls[i] == BidiClass::NSM);
+        if (cls[i] == BidiClass::R || cls[i] == BidiClass::AL) hasRtlOrNum = true;
+    }
+    if (!hasRtlOrNum) return;
+
+    const BidiClass sos = paragraphRtl ? BidiClass::R : BidiClass::L;
+    const BidiClass eos = sos;
+
+    // W1: NSM -> preceding class
+    BidiClass prev = sos;
+    for (std::size_t i = 0u; i < n; ++i) {
+        if (cls[i] == BidiClass::NSM) cls[i] = prev;
+        else prev = cls[i];
+    }
+    // W2: EN -> AN if last strong was AL
+    BidiClass lastStrong = sos;
+    for (std::size_t i = 0u; i < n; ++i) {
+        if (cls[i] == BidiClass::L || cls[i] == BidiClass::R || cls[i] == BidiClass::AL) lastStrong = cls[i];
+        else if (cls[i] == BidiClass::EN && lastStrong == BidiClass::AL) cls[i] = BidiClass::AN;
+    }
+    // W3: AL -> R
+    for (std::size_t i = 0u; i < n; ++i) {
+        if (cls[i] == BidiClass::AL) cls[i] = BidiClass::R;
+    }
+    // W4: ES/CS between numbers
+    for (std::size_t i = 1u; i + 1u < n; ++i) {
+        if (cls[i] == BidiClass::ES && cls[i - 1u] == BidiClass::EN && cls[i + 1u] == BidiClass::EN) {
+            cls[i] = BidiClass::EN;
+        } else if (cls[i] == BidiClass::CS) {
+            if (cls[i - 1u] == BidiClass::EN && cls[i + 1u] == BidiClass::EN) cls[i] = BidiClass::EN;
+            else if (cls[i - 1u] == BidiClass::AN && cls[i + 1u] == BidiClass::AN) cls[i] = BidiClass::AN;
+        }
+    }
+    // W5: ET adjacent to EN -> EN
+    for (std::size_t i = 0u; i < n; ++i) {
+        if (cls[i] != BidiClass::ET) continue;
+        std::size_t j = i;
+        while (j + 1u < n && cls[j + 1u] == BidiClass::ET) ++j;
+        const bool adjEn = (i > 0u && cls[i - 1u] == BidiClass::EN) || (j + 1u < n && cls[j + 1u] == BidiClass::EN);
+        if (adjEn) {
+            for (std::size_t k = i; k <= j; ++k) cls[k] = BidiClass::EN;
+        }
+        i = j;
+    }
+    // W6: remaining ES, ET, CS -> ON
+    for (std::size_t i = 0u; i < n; ++i) {
+        if (cls[i] == BidiClass::ES || cls[i] == BidiClass::ET || cls[i] == BidiClass::CS) cls[i] = BidiClass::ON;
+    }
+    // W7: EN -> L if last strong was L
+    lastStrong = sos;
+    for (std::size_t i = 0u; i < n; ++i) {
+        if (cls[i] == BidiClass::L || cls[i] == BidiClass::R) lastStrong = cls[i];
+        else if (cls[i] == BidiClass::EN && lastStrong == BidiClass::L) cls[i] = BidiClass::L;
+    }
+    // N1 & N2: resolve neutral/whitespace sequences
+    auto strongForNeutral = [](BidiClass c) noexcept -> BidiClass {
+        if (c == BidiClass::EN || c == BidiClass::AN) return BidiClass::R;
+        return c;
+    };
+    for (std::size_t i = 0u; i < n; ++i) {
+        if (cls[i] != BidiClass::ON && cls[i] != BidiClass::WS) continue;
+        std::size_t j = i;
+        while (j + 1u < n && (cls[j + 1u] == BidiClass::ON || cls[j + 1u] == BidiClass::WS)) ++j;
+        const BidiClass leftDir = (i > 0u) ? strongForNeutral(cls[i - 1u]) : sos;
+        const BidiClass rightDir = (j + 1u < n) ? strongForNeutral(cls[j + 1u]) : eos;
+        const BidiClass resolved = (leftDir == rightDir) ? leftDir : (paragraphRtl ? BidiClass::R : BidiClass::L);
+        for (std::size_t k = i; k <= j; ++k) cls[k] = resolved;
+        i = j;
+    }
+    // I1 / I2: implicit levels
+    for (std::size_t i = 0u; i < n; ++i) {
+        if ((baseLevel & 1u) == 0u) {
+            if (cls[i] == BidiClass::R) outLevels[i] = baseLevel + 1u;
+            else if (cls[i] == BidiClass::EN || cls[i] == BidiClass::AN) outLevels[i] = baseLevel + 2u;
+        } else {
+            if (cls[i] == BidiClass::L || cls[i] == BidiClass::EN || cls[i] == BidiClass::AN) {
+                outLevels[i] = baseLevel + 1u;
+            }
+        }
+    }
+    // L1: trailing whitespace on line resets to paragraph embedding level
+    for (std::size_t k = n; k > 0u; --k) {
+        const std::uint32_t cp = lineCps[k - 1u];
+        if (cp == ' ' || cp == '\t') outLevels[k - 1u] = baseLevel;
+        else break;
+    }
+    // Preserve base-before-NSM cluster ordering inside odd-level runs so L2 reversal leaves
+    // combining marks logically after (to the right of / attached to) their base character.
+    for (std::size_t i = 0u; i < n; ) {
+        if ((outLevels[outOrder[i]] & 1u) != 0u && !isNsm[outOrder[i]]) {
+            std::size_t j = i;
+            while (j + 1u < n && isNsm[outOrder[j + 1u]] &&
+                   outLevels[outOrder[j + 1u]] == outLevels[outOrder[i]]) {
+                ++j;
+            }
+            if (j > i) {
+                std::reverse(outOrder.begin() + static_cast<std::ptrdiff_t>(i),
+                             outOrder.begin() + static_cast<std::ptrdiff_t>(j + 1u));
+            }
+            i = j + 1u;
+        } else {
+            ++i;
+        }
+    }
+    // L2: reverse contiguous sequences from maxLevel down to minOddLevel
+    std::uint8_t maxLev = 0u;
+    std::uint8_t minOdd = 255u;
+    for (std::uint8_t lv : outLevels) {
+        maxLev = std::max(maxLev, lv);
+        if ((lv & 1u) != 0u) minOdd = std::min(minOdd, lv);
+    }
+    if (minOdd <= maxLev) {
+        for (int lv = static_cast<int>(maxLev); lv >= static_cast<int>(minOdd); --lv) {
+            std::size_t i = 0u;
+            while (i < n) {
+                if (outLevels[outOrder[i]] < static_cast<std::uint8_t>(lv)) {
+                    ++i;
+                    continue;
+                }
+                std::size_t j = i;
+                while (j + 1u < n && outLevels[outOrder[j + 1u]] >= static_cast<std::uint8_t>(lv)) ++j;
+                std::reverse(outOrder.begin() + static_cast<std::ptrdiff_t>(i),
+                             outOrder.begin() + static_cast<std::ptrdiff_t>(j + 1u));
+                i = j + 1u;
+            }
+        }
+    }
+}
+
+} // namespace
 
 TextLayoutResult FontAtlas::MeasureRichLayout(
     const std::vector<RichTextRunInput>& runs,
@@ -3486,8 +4009,10 @@ TextLayoutResult FontAtlas::MeasureRichLayout(
     float maxWidth,
     TextWrapping wrapMode,
     float charSpacing,
-    float explicitLineHeight) {
+    float explicitLineHeight,
+    bool baseRtl) {
     TextLayoutResult result{};
+    result.baseRtl = baseRtl;
     const float baseFont = std::max(1.0f, defaultFontSize);
     const int baseWeight = (defaultFontWeight > 0) ? defaultFontWeight : 400;
     const float validExplicitLineH =
@@ -3535,6 +4060,7 @@ TextLayoutResult FontAtlas::MeasureRichLayout(
         std::uint32_t cp = 0u;
         std::uint32_t sourceCodePointIndex = 0u;
         FontAtlasGlyph meta{};
+        FontAtlasGlyph mirroredMeta{};
         const TrueTypeFontFace* kernFace = nullptr;
         std::uint32_t fontId = 0u;
         float fontSize = 14.0f;
@@ -3545,6 +4071,7 @@ TextLayoutResult FontAtlas::MeasureRichLayout(
         std::uint32_t customRgba = 0u;
         bool hasCustomRgba = false;
         bool hasCustomFont = false;
+        bool hasMirroredMeta = false;
         bool syntheticBold = false;
         bool syntheticItalic = false;
         bool underline = false;
@@ -3629,6 +4156,11 @@ TextLayoutResult FontAtlas::MeasureRichLayout(
             tg.cp = cp;
             tg.sourceCodePointIndex = curCpIdx;
             tg.meta = EnsureGlyphFromChainLocked(runChain, cp, &chosen);
+            const std::uint32_t mcp = MirrorBracketCodePoint(cp);
+            if (mcp != cp) {
+                tg.mirroredMeta = EnsureGlyphFromChainLocked(runChain, mcp, nullptr);
+                tg.hasMirroredMeta = tg.mirroredMeta.valid;
+            }
             tg.fontSize = runFontSize;
             tg.ascent = runAscent;
             tg.descent = runDescent;
@@ -3654,6 +4186,125 @@ TextLayoutResult FontAtlas::MeasureRichLayout(
             decoded.push_back(tg);
         }
     }
+
+    // Arabic contextual joining + GSUB / Presentation Forms-B shaping across decoded tokens
+    bool anyArabic = false;
+    for (const TokenGlyph& tg : decoded) {
+        if (!tg.explicitNewline && tg.cp >= 0x0600u && tg.cp <= 0x06FFu) {
+            anyArabic = true;
+            break;
+        }
+    }
+    if (anyArabic) {
+        const std::size_t dn = decoded.size();
+        std::vector<ArabicJoinType> jtypes(dn, ArabicJoinType::NonJoining);
+        for (std::size_t i = 0u; i < dn; ++i) {
+            if (!decoded[i].explicitNewline) jtypes[i] = ClassifyArabicJoining(decoded[i].cp);
+        }
+        auto prevJoinType = [&](std::size_t idx) noexcept -> ArabicJoinType {
+            for (std::size_t k = idx; k > 0u; --k) {
+                if (decoded[k - 1u].explicitNewline) return ArabicJoinType::NonJoining;
+                if (jtypes[k - 1u] != ArabicJoinType::Transparent) return jtypes[k - 1u];
+            }
+            return ArabicJoinType::NonJoining;
+        };
+        auto nextJoinType = [&](std::size_t idx) noexcept -> ArabicJoinType {
+            for (std::size_t k = idx + 1u; k < dn; ++k) {
+                if (decoded[k].explicitNewline) return ArabicJoinType::NonJoining;
+                if (jtypes[k] != ArabicJoinType::Transparent) return jtypes[k];
+            }
+            return ArabicJoinType::NonJoining;
+        };
+        auto findFontById = [&](std::uint32_t fid) -> const RegisteredFontEntry* {
+            for (const auto& f : fonts_) {
+                if (f.fontId == fid) return &f;
+            }
+            return nullptr;
+        };
+
+        std::vector<std::uint32_t> shapedGids(dn, 0u);
+        for (std::size_t i = 0u; i < dn; ++i) {
+            TokenGlyph& tg = decoded[i];
+            if (tg.explicitNewline || tg.cp < 0x0600u || tg.cp > 0x06FFu) continue;
+            const ArabicJoinType curJ = jtypes[i];
+            if (curJ == ArabicJoinType::NonJoining || curJ == ArabicJoinType::Transparent || curJ == ArabicJoinType::JoinCausing) {
+                shapedGids[i] = tg.meta.glyphIndex;
+                continue;
+            }
+            const bool joinPrev = JoinsToLeft(prevJoinType(i)) && JoinsToRight(curJ);
+            const bool joinNext = JoinsToLeft(curJ) && JoinsToRight(nextJoinType(i));
+            int form = 0; // 0=isol, 1=init, 2=medi, 3=fina
+            if (joinPrev && joinNext) form = 2;
+            else if (joinPrev) form = 3;
+            else if (joinNext) form = 1;
+
+            const RegisteredFontEntry* fe = findFontById(tg.fontId);
+            if (fe && fe->face && fe->face->HasArabicGsub()) {
+                static constexpr std::uint32_t kFeatTags[4] = {
+                    0x69736F6Cu, // isol
+                    0x696E6974u, // init
+                    0x6D656469u, // medi
+                    0x66696E61u  // fina
+                };
+                const std::uint32_t baseGid = fe->face->FindGlyphIndex(tg.cp);
+                const std::uint32_t subGid = fe->face->ApplyArabicGsubFeature(kFeatTags[form], baseGid);
+                shapedGids[i] = subGid;
+                if (subGid != baseGid && subGid != 0u) {
+                    tg.meta = EnsureGlyphByIndexLocked(*fe, subGid, tg.cp);
+                }
+            } else if (fe && fe->face) {
+                const std::uint32_t presCp = FallbackArabicPresentationFormB(tg.cp, form);
+                if (presCp != tg.cp && fe->face->FindGlyphIndex(presCp) != 0u) {
+                    tg.meta = EnsureGlyphLocked(fe, presCp);
+                    shapedGids[i] = tg.meta.glyphIndex;
+                }
+            }
+        }
+
+        // Apply Lam-Alef & GSUB 2-glyph ligatures ('liga' / 'rlig')
+        std::vector<TokenGlyph> compacted;
+        compacted.reserve(dn);
+        for (std::size_t i = 0u; i < dn; ++i) {
+            if (i + 1u < dn && !decoded[i].explicitNewline && !decoded[i + 1u].explicitNewline &&
+                decoded[i].fontId == decoded[i + 1u].fontId && decoded[i].fontId != 0u) {
+                const RegisteredFontEntry* fe = findFontById(decoded[i].fontId);
+                if (fe && fe->face && fe->face->HasArabicGsub() && shapedGids[i] != 0u && shapedGids[i + 1u] != 0u) {
+                    const std::uint32_t ligGid = fe->face->ApplyArabicGsubLigature(shapedGids[i], shapedGids[i + 1u]);
+                    if (ligGid != 0u) {
+                        TokenGlyph ligTg = decoded[i];
+                        ligTg.meta = EnsureGlyphByIndexLocked(*fe, ligGid, decoded[i].cp);
+                        compacted.push_back(ligTg);
+                        ++i;
+                        continue;
+                    }
+                }
+                if (decoded[i].cp == 0x0644u &&
+                    (decoded[i + 1u].cp == 0x0622u || decoded[i + 1u].cp == 0x0623u ||
+                     decoded[i + 1u].cp == 0x0625u || decoded[i + 1u].cp == 0x0627u) &&
+                    fe && fe->face) {
+                    const bool joinPrev = JoinsToLeft(prevJoinType(i));
+                    std::uint32_t lamAlefCp = 0u;
+                    switch (decoded[i + 1u].cp) {
+                        case 0x0622u: lamAlefCp = joinPrev ? 0xFEF6u : 0xFEF5u; break;
+                        case 0x0623u: lamAlefCp = joinPrev ? 0xFEF8u : 0xFEF7u; break;
+                        case 0x0625u: lamAlefCp = joinPrev ? 0xFEFAu : 0xFEF9u; break;
+                        case 0x0627u: lamAlefCp = joinPrev ? 0xFEFCu : 0xFEFBu; break;
+                        default: break;
+                    }
+                    if (lamAlefCp != 0u && fe->face->FindGlyphIndex(lamAlefCp) != 0u) {
+                        TokenGlyph ligTg = decoded[i];
+                        ligTg.meta = EnsureGlyphLocked(fe, lamAlefCp);
+                        compacted.push_back(ligTg);
+                        ++i;
+                        continue;
+                    }
+                }
+            }
+            compacted.push_back(decoded[i]);
+        }
+        decoded = std::move(compacted);
+    }
+
     lock.unlock();
 
     if (decoded.empty()) {
@@ -3699,6 +4350,80 @@ TextLayoutResult FontAtlas::MeasureRichLayout(
             : natLineH;
         const float extraLeading = std::max(0.0f, effectiveLineH - natLineH);
         const float lineBaselineY = curTopY + lineAscent + extraLeading * 0.5f;
+
+        if ((baseRtl || anyArabic) && endGlyphIdx > lineStartGlyphIdx) {
+            // Trim trailing wrap spaces before BiDi visual reordering so right edge stays flush
+            std::size_t visEnd = endGlyphIdx;
+            if (wrapEnabled) {
+                while (visEnd > lineStartGlyphIdx && result.glyphs[visEnd - 1u].isWhitespace) {
+                    --visEnd;
+                }
+            }
+            const std::size_t visCnt = visEnd - lineStartGlyphIdx;
+            if (visCnt > 0u) {
+                std::vector<std::uint32_t> lineCps(visCnt);
+                for (std::size_t m = 0u; m < visCnt; ++m) {
+                    lineCps[m] = decoded[lineTokenIndices[lineStartGlyphIdx + m]].cp;
+                }
+                std::vector<std::size_t> visOrder;
+                std::vector<std::uint8_t> visLevels;
+                ComputeUax9LineVisualOrder(lineCps, baseRtl, visOrder, visLevels);
+
+                std::vector<PositionedGlyph> origG(
+                    result.glyphs.begin() + static_cast<std::ptrdiff_t>(lineStartGlyphIdx),
+                    result.glyphs.begin() + static_cast<std::ptrdiff_t>(visEnd));
+                std::vector<std::size_t> origTok(
+                    lineTokenIndices.begin() + static_cast<std::ptrdiff_t>(lineStartGlyphIdx),
+                    lineTokenIndices.begin() + static_cast<std::ptrdiff_t>(visEnd));
+
+                float rePenX = 0.0f;
+                for (std::size_t m = 0u; m < visCnt; ++m) {
+                    const std::size_t srcOff = visOrder[m];
+                    PositionedGlyph pg = origG[srcOff];
+                    const std::size_t tokIdx = origTok[srcOff];
+                    const TokenGlyph& ltg = decoded[tokIdx];
+                    FontAtlasGlyph gmeta = ltg.meta;
+                    if ((visLevels[srcOff] & 1u) != 0u) {
+                        const std::uint32_t mcp = MirrorBracketCodePoint(ltg.cp);
+                        if (mcp != ltg.cp) {
+                            pg.codePoint = mcp;
+                            if (ltg.hasMirroredMeta) {
+                                gmeta = ltg.mirroredMeta;
+                                pg.glyphIndex = gmeta.glyphIndex;
+                                pg.u0 = gmeta.u0; pg.v0 = gmeta.v0;
+                                pg.u1 = gmeta.u1; pg.v1 = gmeta.v1;
+                                pg.cellWidth = gmeta.cellWidth;
+                                pg.cellHeight = gmeta.cellHeight;
+                                pg.pxRange = gmeta.pxRange;
+                                pg.advanceX = gmeta.advanceEm * ltg.fontSize;
+                            }
+                        }
+                    }
+                    float trackPx = 0.0f;
+                    if (m > 0u && std::isfinite(charSpacing) && charSpacing != 0.0f &&
+                        ClassifyBidi(ltg.cp) != BidiClass::NSM) {
+                        trackPx = charSpacing * 0.001f * ltg.fontSize;
+                    }
+                    const float pStart = rePenX + trackPx;
+                    pg.penX = pStart;
+                    if (ltg.hasCustomFont) {
+                        pg.x0 = pStart + gmeta.bearingXEm * ltg.fontSize;
+                        pg.x1 = pg.x0 + gmeta.quadWidthEm * ltg.fontSize;
+                    } else {
+                        pg.x0 = pStart;
+                        pg.x1 = pStart + pg.advanceX;
+                    }
+                    result.glyphs[lineStartGlyphIdx + m] = pg;
+                    lineTokenIndices[lineStartGlyphIdx + m] = tokIdx;
+                    rePenX = pStart + pg.advanceX;
+                }
+                for (std::size_t k = visEnd; k < endGlyphIdx; ++k) {
+                    result.glyphs[k].penX = rePenX;
+                    result.glyphs[k].x0 = rePenX;
+                    result.glyphs[k].x1 = rePenX;
+                }
+            }
+        }
 
         float trimmedW = 0.0f;
         for (std::size_t k = lineStartGlyphIdx; k < endGlyphIdx; ++k) {

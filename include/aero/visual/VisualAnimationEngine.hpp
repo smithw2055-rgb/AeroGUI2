@@ -63,6 +63,7 @@ enum class VisualAnimProp : std::uint8_t {
     StrokeStop2Offset = 51,
     StrokeStop3Offset = 52,
     FgBrushOpacity = 53,
+    ManagedCustom = 54,
 };
 
 enum class EasingFunctionKind : std::uint8_t {
@@ -217,6 +218,9 @@ public:
 
     bool Tick(float dtSeconds, VisualWorld& world);
     [[nodiscard]] bool HasTrack(std::int32_t trackId) const noexcept;
+    [[nodiscard]] bool IsTrackStarted(std::int32_t trackId) const noexcept;
+    [[nodiscard]] float ReadTrackFloat(std::int32_t trackId, float fallback = 0.0f) const noexcept;
+    [[nodiscard]] std::uint32_t ReadTrackColor(std::int32_t trackId, std::uint32_t fallback = 0u) const noexcept;
     [[nodiscard]] bool HasActiveAnimations() const noexcept;
     [[nodiscard]] std::size_t ActiveTrackCount() const noexcept;
 

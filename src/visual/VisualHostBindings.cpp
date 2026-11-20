@@ -899,10 +899,24 @@ bool RegisterVisualHostBindings(
         return rs_rt::Value{std::int64_t{0}};
     });
     ok &= bindFn("Visual_SetAlignment", [&world](const rs_bc::FunctionReference&, rs_rt::ValueSpan args, rs_rt::RuntimeError&) -> std::optional<rs_rt::Value> {
+        const VisualNodeId nid = ArgNode(args, 0, world);
+        const std::int64_t rawH = ArgInt(args, 1, 0);
+        const std::int64_t rawV = ArgInt(args, 2, 0);
         (void)world.SetAlignment(
-            ArgNode(args, 0, world),
-            static_cast<HorizontalAlignment>(ArgInt(args, 1, 0)),
-            static_cast<VerticalAlignment>(ArgInt(args, 2, 0)));
+            nid,
+            static_cast<HorizontalAlignment>(rawH & 0xFF),
+            static_cast<VerticalAlignment>(rawV & 0xFF));
+        if (VisualNode* node = world.GetNode(nid)) {
+            const bool hasFd = (rawH & 0x100) != 0;
+            const bool isRtl = (rawH & 0x200) != 0;
+            if (node->layout.hasExplicitFlowDirection != hasFd || node->layout.explicitRtl != isRtl) {
+                node->layout.hasExplicitFlowDirection = hasFd;
+                node->layout.explicitRtl = isRtl;
+                node->layout.hasValidMeasure = false;
+                node->layout.hasValidArrange = false;
+                world.MarkDirty(nid, VisualDirty_All);
+            }
+        }
         return rs_rt::Value{std::int64_t{0}};
     });
     ok &= bindFn("Visual_SetVisibility", [&world](const rs_bc::FunctionReference&, rs_rt::ValueSpan args, rs_rt::RuntimeError&) -> std::optional<rs_rt::Value> {
@@ -1189,6 +1203,10 @@ bool RegisterVisualHostBindings(
             ArgFloat(args, 4, 1.0f));
         return rs_rt::Value{std::int64_t{0}};
     });
+    ok &= bindFn("Visual_SetImageTile", [&world](const rs_bc::FunctionReference&, rs_rt::ValueSpan args, rs_rt::RuntimeError&) -> std::optional<rs_rt::Value> {
+        (void)world.SetImageTileMode(ArgNode(args, 0, world), ArgBool(args, 1, false));
+        return rs_rt::Value{std::int64_t{0}};
+    });
     ok &= bindFn("Visual_SetVectorShape", [&world, &domains](const rs_bc::FunctionReference&, rs_rt::ValueSpan args, rs_rt::RuntimeError&) -> std::optional<rs_rt::Value> {
         (void)world.SetVectorShape(
             ArgNode(args, 0, world),
@@ -1356,7 +1374,8 @@ bool RegisterVisualHostBindings(
             delaySec,
             autoReverse,
             repeatCount);
-        if (!readCurrentFrom && tid > 0 && delaySec <= 0.0f && durationSec > 1e-5f) {
+        if (!readCurrentFrom && tid > 0 && delaySec <= 0.0f && durationSec > 1e-5f &&
+            prop != VisualAnimProp::ManagedCustom) {
             VisualAnimationEngine::ApplyColorPropImmediate(world, nodeId, prop, fromRgba);
         }
         return static_cast<std::int64_t>(tid);
@@ -1407,6 +1426,19 @@ bool RegisterVisualHostBindings(
     });
     ok &= bindFn("Anim_IsTrackActive", [&animEngine](const rs_bc::FunctionReference&, rs_rt::ValueSpan args, rs_rt::RuntimeError&) -> std::optional<rs_rt::Value> {
         return rs_rt::Value{animEngine.HasTrack(static_cast<std::int32_t>(ArgInt(args, 0, 0)))};
+    });
+    ok &= bindFn("Anim_IsTrackStarted", [&animEngine](const rs_bc::FunctionReference&, rs_rt::ValueSpan args, rs_rt::RuntimeError&) -> std::optional<rs_rt::Value> {
+        return rs_rt::Value{animEngine.IsTrackStarted(static_cast<std::int32_t>(ArgInt(args, 0, 0)))};
+    });
+    ok &= bindFn("Anim_ReadTrackFloat", [&animEngine](const rs_bc::FunctionReference&, rs_rt::ValueSpan args, rs_rt::RuntimeError&) -> std::optional<rs_rt::Value> {
+        return MakeRtFloat(animEngine.ReadTrackFloat(
+            static_cast<std::int32_t>(ArgInt(args, 0, 0)),
+            ArgFloat(args, 1, 0.0f)));
+    });
+    ok &= bindFn("Anim_ReadTrackColor", [&animEngine](const rs_bc::FunctionReference&, rs_rt::ValueSpan args, rs_rt::RuntimeError&) -> std::optional<rs_rt::Value> {
+        return MakeUInt(animEngine.ReadTrackColor(
+            static_cast<std::int32_t>(ArgInt(args, 0, 0)),
+            ArgUInt(args, 1, 0u)));
     });
     ok &= bindFn("Host_SetPointerCapture", [&world, &inputRouter](const rs_bc::FunctionReference&, rs_rt::ValueSpan args, rs_rt::RuntimeError&) -> std::optional<rs_rt::Value> {
         inputRouter.SetPointerCapture(ArgNode(args, 0, world));

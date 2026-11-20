@@ -99,6 +99,8 @@ int __rs_native_Visual_SetImage(handle node, string uri, int stretch, int stretc
 public void Visual_SetImage(handle node, string uri, int stretch, int stretchDir, uint tintRgba) { __rs_native_Visual_SetImage(node, uri, stretch, stretchDir, tintRgba); return; }
 int __rs_native_Visual_SetImageViewbox(handle node, float vx, float vy, float vw, float vh) { return 0; }
 public void Visual_SetImageViewbox(handle node, float vx, float vy, float vw, float vh) { __rs_native_Visual_SetImageViewbox(node, vx, vy, vw, vh); return; }
+int __rs_native_Visual_SetImageTile(handle node, bool tileWrap) { return 0; }
+public void Visual_SetImageTile(handle node, bool tileWrap) { __rs_native_Visual_SetImageTile(node, tileWrap); return; }
 int __rs_native_Visual_SetVectorShape(handle node, int shapeKind, string pathOrParams, uint fillRgba, int fillGradId, uint strokeRgba, int strokeGradId, float strokeWidth, int stretch, float trimStart, float trimEnd) { return 0; }
 public void Visual_SetVectorShape(handle node, int shapeKind, string pathOrParams, uint fillRgba, int fillGradId, uint strokeRgba, int strokeGradId, float strokeWidth, int stretch, float trimStart, float trimEnd) { __rs_native_Visual_SetVectorShape(node, shapeKind, pathOrParams, fillRgba, fillGradId, strokeRgba, strokeGradId, strokeWidth, stretch, trimStart, trimEnd); return; }
 int __rs_native_Visual_SetVectorBrushOpacity(handle node, float fillOpacity, float strokeOpacity) { return 0; }
@@ -154,6 +156,9 @@ public void Anim_StopAll(handle node) { __rs_native_Anim_StopAll(node); return; 
 int __rs_native_Anim_StopTrack(int trackId) { return 0; }
 public void Anim_StopTrack(int trackId) { __rs_native_Anim_StopTrack(trackId); return; }
 public bool Anim_IsTrackActive(int trackId) { return false; }
+public bool Anim_IsTrackStarted(int trackId) { return false; }
+public float Anim_ReadTrackFloat(int trackId, float fallback) { return fallback; }
+public uint Anim_ReadTrackColor(int trackId, uint fallback) { return fallback; }
 int __rs_native_Host_SetPointerCapture(handle node) { return 0; }
 public void Host_SetPointerCapture(handle node) { __rs_native_Host_SetPointerCapture(node); return; }
 int __rs_native_Host_ReleasePointerCapture(handle node) { return 0; }

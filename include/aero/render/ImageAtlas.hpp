@@ -15,6 +15,9 @@
 
 namespace aero {
 
+class UIResourceStore;
+struct RasterizedPathMaskEntry;
+
 enum class ImageFormat : std::uint8_t {
     Unknown = 0,
     Png = 1,
@@ -209,6 +212,7 @@ public:
     [[nodiscard]] std::uint64_t Revision() const noexcept { return revision_.load(std::memory_order_acquire); }
     [[nodiscard]] bool HasTextureSlot(std::uint32_t textureId) const noexcept;
     [[nodiscard]] const TextureSlotBuffer* GetTextureSlot(std::uint32_t textureId) const noexcept;
+    [[nodiscard]] std::uint64_t GetTextureSlotRevision(std::uint32_t textureId) const noexcept;
     [[nodiscard]] bool TryGetTextureSlotSnapshot(
         std::uint32_t textureId,
         std::uint32_t& outWidth,
@@ -260,9 +264,39 @@ private:
     std::vector<std::string> searchDirectories_;
     SkylinePacker skyline_;
 
+    struct DynamicSlotCacheEntry {
+        std::string slotKey;
+        std::string currentExactUri;
+        ImageAtlasEntry entry{};
+        std::uint64_t lastUsedTick = 0u;
+    };
+
     std::unordered_map<std::string, std::vector<std::uint8_t>> memoryEncodedAssets_;
     std::unordered_map<std::string, ImageAtlasEntry> entries_;
+    std::unordered_map<std::string, DynamicSlotCacheEntry> plasmaSlots_;
+    std::unordered_map<std::string, DynamicSlotCacheEntry> riveSlots_;
+    std::uint64_t dynamicSlotTick_ = 0u;
     std::unordered_map<std::uint32_t, TextureSlotBuffer> textureSlots_;
 };
+
+/// Composite an image fill (stretched into `elemRect`, optionally tiled) through an
+/// analytical supersampled SVG fill alpha mask fitted to `maskFittedRect`, caching
+/// the resulting standalone RGBA8 slot inside `store`.
+[[nodiscard]] bool CompositeMaskedPathImage(
+    UIResourceStore& store,
+    ImageAtlas& atlas,
+    std::uint64_t pathHash,
+    std::string_view pathData,
+    const Rect& rawBounds,
+    const Rect& elemRect,
+    const Rect& maskFittedRect,
+    std::uint32_t innerW,
+    std::uint32_t innerH,
+    std::uint32_t padPx,
+    std::string_view fillImageUri,
+    Stretch fillStretch,
+    std::uint32_t fillTintRgba,
+    bool tileWrap,
+    RasterizedPathMaskEntry& outEntry);
 
 } // namespace aero

@@ -377,6 +377,8 @@ void ApplyScalarProp(VisualWorld& world, VisualNodeId id, VisualAnimProp prop, f
         }
         break;
     }
+    case VisualAnimProp::ManagedCustom:
+        break;
     default: {
         const auto target = ParseGradientStopTarget(prop);
         if (target.isStopOffset) {
@@ -421,6 +423,8 @@ void ApplyColorProp(VisualWorld& world, VisualNodeId id, VisualAnimProp prop, st
         } else {
             node->box.borderRgba = rgba;
         }
+        break;
+    case VisualAnimProp::ManagedCustom:
         break;
     default:
         return;
@@ -575,7 +579,7 @@ std::int32_t VisualAnimationEngine::StartFloat(
     std::int32_t repeatCount) {
     if (!node.IsValid()) return 0;
     const float clampedDelay = std::max(0.0f, delaySec);
-    if (clampedDelay <= 0.0f) {
+    if (clampedDelay <= 0.0f && prop != VisualAnimProp::ManagedCustom) {
         tracks_.erase(
             std::remove_if(
                 tracks_.begin(),
@@ -619,7 +623,7 @@ std::int32_t VisualAnimationEngine::StartColor(
     std::int32_t repeatCount) {
     if (!node.IsValid()) return 0;
     const float clampedDelay = std::max(0.0f, delaySec);
-    if (clampedDelay <= 0.0f) {
+    if (clampedDelay <= 0.0f && prop != VisualAnimProp::ManagedCustom) {
         tracks_.erase(
             std::remove_if(
                 tracks_.begin(),
@@ -968,6 +972,42 @@ bool VisualAnimationEngine::HasTrack(std::int32_t trackId) const noexcept {
         }
     }
     return false;
+}
+
+bool VisualAnimationEngine::IsTrackStarted(std::int32_t trackId) const noexcept {
+    if (trackId <= 0) {
+        return false;
+    }
+    for (const VisualAnimTrack& tr : tracks_) {
+        if (tr.trackId == trackId) {
+            return tr.delaySec <= 0.0f;
+        }
+    }
+    return false;
+}
+
+float VisualAnimationEngine::ReadTrackFloat(std::int32_t trackId, float fallback) const noexcept {
+    if (trackId <= 0) {
+        return fallback;
+    }
+    for (const VisualAnimTrack& tr : tracks_) {
+        if (tr.trackId == trackId) {
+            return tr.currentVal;
+        }
+    }
+    return fallback;
+}
+
+std::uint32_t VisualAnimationEngine::ReadTrackColor(std::int32_t trackId, std::uint32_t fallback) const noexcept {
+    if (trackId <= 0) {
+        return fallback;
+    }
+    for (const VisualAnimTrack& tr : tracks_) {
+        if (tr.trackId == trackId) {
+            return tr.currentRgba;
+        }
+    }
+    return fallback;
 }
 
 bool VisualAnimationEngine::HasActiveAnimations() const noexcept {

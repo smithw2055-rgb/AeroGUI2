@@ -170,14 +170,34 @@ MtsdfMappedQuad ComputeMtsdfMappedPlacement(
 
 void ApplyTextAlignmentToLayout(
     TextLayoutResult& layout,
-    TextAlignment align,
+    TextAlignment rawAlign,
     float alignBoxWidth) noexcept {
-    if (align == TextAlignment::Left || alignBoxWidth <= 0.0f || layout.lines.empty()) {
+    if (alignBoxWidth <= 0.0f || layout.lines.empty()) {
         return;
     }
+    TextAlignment align = rawAlign;
+    if (layout.baseRtl) {
+        if (align == TextAlignment::Left) align = TextAlignment::Right;
+        else if (align == TextAlignment::Right) align = TextAlignment::Left;
+    }
+    if (align == TextAlignment::Left) {
+        return;
+    }
+    auto shiftLineRight = [&](const TextLineMetrics& lm) noexcept {
+        if (!layout.baseRtl) return;
+        const float dx = alignBoxWidth - lm.width;
+        const std::size_t first = lm.firstGlyphIndex;
+        const std::size_t end = std::min(first + lm.glyphCount, layout.glyphs.size());
+        for (std::size_t k = first; k < end; ++k) {
+            layout.glyphs[k].penX += dx;
+            layout.glyphs[k].x0 += dx;
+            layout.glyphs[k].x1 += dx;
+        }
+    };
     if (align == TextAlignment::Justify) {
         for (const TextLineMetrics& lm : layout.lines) {
             if (lm.endedByNewline || lm.glyphCount <= 1u) {
+                shiftLineRight(lm);
                 continue;
             }
             const std::size_t first = lm.firstGlyphIndex;
@@ -190,6 +210,7 @@ void ApplyTextAlignmentToLayout(
                 }
             }
             if (lastNonWs == end || lastNonWs <= first) {
+                shiftLineRight(lm);
                 continue;
             }
             std::size_t gapCount = 0u;
@@ -209,6 +230,7 @@ void ApplyTextAlignmentToLayout(
             }
             const float extra = alignBoxWidth - lineRightEdge;
             if (gapCount == 0u || extra <= 0.5f || extra > alignBoxWidth * 0.65f) {
+                shiftLineRight(lm);
                 continue;
             }
             const float perGap = extra / static_cast<float>(gapCount);

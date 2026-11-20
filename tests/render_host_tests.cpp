@@ -4,6 +4,8 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <memory>
 #include <string>
 #include <string_view>
@@ -20,6 +22,7 @@
 #include "aero/render/FontAtlas.hpp"
 #include "aero/render/GpuBackend.hpp"
 #include "aero/render/ImageAtlas.hpp"
+#include "aero/render/RiveRenderer.hpp"
 #include "aero/render/PagedRenderTree.hpp"
 #include "aero/render/SkylinePacker.hpp"
 #include "aero/render/ZeroCopyGpuStream.hpp"
@@ -879,6 +882,321 @@ bool TestWindowExactClientSizeNoDpiScaling() {
     return true;
 }
 
+bool TestRiveRendererAndBackdropBlur() {
+    AERO_CHECK(aero::IsRiveAssetUri("background.riv"));
+    AERO_CHECK(aero::IsRiveAssetUri("rive://start.riv?Hover=0"));
+    AERO_CHECK(!aero::IsRiveAssetUri("texture.png"));
+#ifdef AERO_SAMPLES_DIR
+    aero::ImageAtlas riveAtlas;
+    aero::DecodedImage riveImg{};
+    const std::string riveSampleDir = std::string(AERO_SAMPLES_DIR) + "/Rive/Data";
+    const bool okRive = aero::RenderRiveUriToImage("rive://background.riv?States=0", riveAtlas, riveSampleDir, riveImg);
+    AERO_CHECK(okRive);
+    AERO_CHECK(riveImg.width >= 640u && riveImg.height >= 360u);
+    const std::size_t midTop = (10u * riveImg.width + riveImg.width / 2u) * 4u;
+    AERO_CHECK(riveImg.rgbaPixels[midTop + 3u] > 200u);
+#endif
+    return true;
+}
+
+bool TestPlasmaSlotReuseLoopAndLru() {
+    aero::ImageAtlas atlas;
+    const std::string baseParams = "sx=64&sy=64&seed=10&color=%23FF01BCFF&vw=64&vh=64";
+    const aero::ImageAtlasEntry* e0 = atlas.LoadOrGet("shader://plasma?" + baseParams + "&time=0.0");
+    AERO_CHECK(e0 != nullptr && e0->textureId > 0u);
+    const std::uint32_t slotId = e0->textureId;
+
+    std::uint32_t w0 = 0u, h0 = 0u;
+    std::shared_ptr<const std::vector<std::uint8_t>> snap0;
+    AERO_CHECK(atlas.TryGetTextureSlotSnapshot(slotId, w0, h0, snap0) && snap0 != nullptr);
+    const std::vector<std::uint8_t> frame0Copy = *snap0;
+
+    // Frame 1: time changes -> updates same slot in-place with different pixels
+    const aero::ImageAtlasEntry* e1 = atlas.LoadOrGet("shader://plasma?" + baseParams + "&time=1.0");
+    AERO_CHECK(e1 != nullptr && e1->textureId == slotId);
+    std::uint32_t w1 = 0u, h1 = 0u;
+    std::shared_ptr<const std::vector<std::uint8_t>> snap1;
+    AERO_CHECK(atlas.TryGetTextureSlotSnapshot(slotId, w1, h1, snap1) && snap1 != nullptr);
+    AERO_CHECK(*snap1 != frame0Copy);
+
+    // Loop back to time=0.0 -> must NOT return stale cached entry from time=1.0 slot!
+    const aero::ImageAtlasEntry* eLoop = atlas.LoadOrGet("shader://plasma?" + baseParams + "&time=0.0");
+    AERO_CHECK(eLoop != nullptr && eLoop->textureId == slotId);
+    std::uint32_t w2 = 0u, h2 = 0u;
+    std::shared_ptr<const std::vector<std::uint8_t>> snapLoop;
+    AERO_CHECK(atlas.TryGetTextureSlotSnapshot(slotId, w2, h2, snapLoop) && snapLoop != nullptr);
+    AERO_CHECK(*snapLoop == frame0Copy);
+
+    // Distinct ScaleX -> distinct slot ID (must not collide)
+    const aero::ImageAtlasEntry* eScale = atlas.LoadOrGet(
+        "shader://plasma?sx=128&sy=64&seed=10&color=%23FF01BCFF&vw=64&vh=64&time=0.0");
+    AERO_CHECK(eScale != nullptr && eScale->textureId > 0u && eScale->textureId != slotId);
+
+    // Bounding: loading 80 distinct seeds stays within 64-slot plasma LRU cap
+    for (int s = 100; s < 180; ++s) {
+        const aero::ImageAtlasEntry* es = atlas.LoadOrGet(
+            "shader://plasma?sx=64&sy=64&seed=" + std::to_string(s) + "&color=%23FF01BCFF&vw=32&vh=32&time=0.0");
+        AERO_CHECK(es != nullptr && es->textureId > 0u);
+    }
+    AERO_CHECK(atlas.StandaloneTextureCount() <= 64u);
+    return true;
+}
+
+bool TestCompositeMaskedPathImageTintAndTile() {
+    aero::UIResourceStore store;
+    aero::DecodedImage solidImg{};
+    solidImg.width = 16u;
+    solidImg.height = 16u;
+    solidImg.format = aero::ImageFormat::RawRgba8;
+    solidImg.rgbaPixels.assign(16u * 16u * 4u, 255u);
+    AERO_CHECK(store.Images().RegisterDecodedImage("solid://white16", solidImg, false) != nullptr);
+
+    const aero::Rect r64{0.0f, 0.0f, 64.0f, 64.0f};
+    const std::string sqPath = "M 0,0 L 64,0 L 64,64 L 0,64 Z";
+
+    // Tint uses 0xAABBGGRR: 0xFF0000FF = pure Red, 0xFFFF0000 = pure Blue
+    aero::RasterizedPathMaskEntry redEntry{};
+    AERO_CHECK(aero::CompositeMaskedPathImage(
+        store, store.Images(), 0u, sqPath, r64, r64, r64, 64u, 64u, 1u,
+        "solid://white16", aero::Stretch::Fill, 0xFF0000FFu, false, redEntry));
+    const aero::Color cRed = store.Images().SampleBilinearRgba(redEntry.textureId, 0.5f, 0.5f);
+    AERO_CHECK(cRed.r > 0.9f && cRed.g < 0.05f && cRed.b < 0.05f && cRed.a > 0.9f);
+
+    aero::RasterizedPathMaskEntry blueEntry{};
+    AERO_CHECK(aero::CompositeMaskedPathImage(
+        store, store.Images(), 0u, sqPath, r64, r64, r64, 64u, 64u, 1u,
+        "solid://white16", aero::Stretch::Fill, 0xFFFF0000u, false, blueEntry));
+    const aero::Color cBlue = store.Images().SampleBilinearRgba(blueEntry.textureId, 0.5f, 0.5f);
+    AERO_CHECK(cBlue.b > 0.9f && cBlue.r < 0.05f && cBlue.g < 0.05f && cBlue.a > 0.9f);
+
+    // TileMode wrap vs clip with Stretch::None on 16x16 centered inside 64x64
+    aero::RasterizedPathMaskEntry untiledEntry{};
+    aero::RasterizedPathMaskEntry tiledEntry{};
+    AERO_CHECK(aero::CompositeMaskedPathImage(
+        store, store.Images(), 0u, sqPath, r64, r64, r64, 64u, 64u, 1u,
+        "solid://white16", aero::Stretch::None, 0xFFFFFFFFu, false, untiledEntry));
+    AERO_CHECK(aero::CompositeMaskedPathImage(
+        store, store.Images(), 0u, sqPath, r64, r64, r64, 64u, 64u, 1u,
+        "solid://white16", aero::Stretch::None, 0xFFFFFFFFu, true, tiledEntry));
+    const aero::Color cOutsideUntiled = store.Images().SampleBilinearRgba(untiledEntry.textureId, 0.10f, 0.5f);
+    const aero::Color cOutsideTiled = store.Images().SampleBilinearRgba(tiledEntry.textureId, 0.10f, 0.5f);
+    AERO_CHECK(cOutsideUntiled.a < 0.05f);
+    AERO_CHECK(cOutsideTiled.a > 0.9f);
+    return true;
+}
+
+bool TestArabicRtlAndBidiFixes() {
+    aero::FontAtlas fa;
+    const aero::TextLayoutResult rtlLatin = fa.MeasureLayout(
+        "Hello", "", 16.0f, 1000.0f, aero::TextWrapping::NoWrap, 0.0f, 400, false, 0.0f, true);
+    AERO_CHECK(rtlLatin.baseRtl);
+
+#ifdef AERO_SAMPLES_DIR
+    const std::string locDir = std::string(AERO_SAMPLES_DIR) + "/Localization/Data";
+    AERO_CHECK(fa.LoadTrueTypeFontFromFile(locDir + "/A_Nefel_Sereke.ttf", "ArabicTest", false));
+    AERO_CHECK(fa.LoadTrueTypeFontFromFile(locDir + "/PTSans-Regular.ttf", "PtReg", false));
+    AERO_CHECK(fa.LoadTrueTypeFontFromFile(locDir + "/PTSans-Bold.ttf", "PtBold", false));
+
+    // Lam (U+0644) + Alef (U+0627) compaction
+    const auto* arabicFace = fa.FindFontFace("ArabicTest");
+    if (arabicFace && (arabicFace->HasArabicGsub() || arabicFace->FindGlyphIndex(0xFEFBu) != 0u)) {
+        const aero::TextLayoutResult lamAlef = fa.MeasureRichLayout(
+            {{"\xD9\x84\xD8\xA7", "ArabicTest", 24.0f, 400, 0, 0, false, 0}},
+            "ArabicTest", 24.0f, 400, false, 1000.0f, aero::TextWrapping::NoWrap, 0.0f, 0.0f, true);
+        AERO_CHECK(lamAlef.glyphs.size() == 1u);
+    }
+
+    // NSM combining mark stays after base glyph in visual RTL order and ignores charSpacing
+    // U+0628 (Beh, idx=0) + U+064E (Fatha NSM, idx=1) + U+062A (Teh, idx=2)
+    const aero::TextLayoutResult nsmRes = fa.MeasureRichLayout(
+        {{"\xD8\xA8\xD9\x8E\xD8\xAA", "ArabicTest", 24.0f, 400, 0, 0, false, 0}},
+        "ArabicTest", 24.0f, 400, false, 1000.0f, aero::TextWrapping::NoWrap, 200.0f, 0.0f, true);
+    AERO_CHECK(nsmRes.glyphs.size() == 3u);
+    if (nsmRes.glyphs.size() == 3u) {
+        AERO_CHECK(nsmRes.glyphs[0].sourceCodePointIndex == 2u);
+        AERO_CHECK(nsmRes.glyphs[1].sourceCodePointIndex == 0u);
+        AERO_CHECK(nsmRes.glyphs[2].sourceCodePointIndex == 1u);
+        AERO_CHECK(std::fabs(nsmRes.glyphs[2].penX - (nsmRes.glyphs[1].penX + nsmRes.glyphs[1].advanceX)) < 1e-3f);
+    }
+
+    // Per-run bracket mirroring uses run's Bold font glyph rather than defaultChain Regular glyph
+    const auto* regFace = fa.FindFontFace("PtReg");
+    const auto* boldFace = fa.FindFontFace("PtBold");
+    AERO_CHECK(regFace != nullptr && boldFace != nullptr);
+    if (regFace && boldFace) {
+        const aero::TextLayoutResult mirrorRes = fa.MeasureRichLayout(
+            {{"(", "PtBold", 24.0f, 700, 0, 0, false, 0}},
+            "PtReg", 24.0f, 400, false, 1000.0f, aero::TextWrapping::NoWrap, 0.0f, 0.0f, true);
+        AERO_CHECK(mirrorRes.glyphs.size() == 1u);
+        if (mirrorRes.glyphs.size() == 1u) {
+            AERO_CHECK(mirrorRes.glyphs[0].codePoint == ')');
+            AERO_CHECK(mirrorRes.glyphs[0].glyphIndex == boldFace->FindGlyphIndex(')'));
+        }
+    }
+
+    // GSUB LookupType 7 (Extension Substitution wrapping SingleSubst)
+    std::ifstream ptIn(locDir + "/PTSans-Regular.ttf", std::ios::binary | std::ios::ate);
+    AERO_CHECK(ptIn.is_open());
+    if (ptIn.is_open()) {
+        const auto sz = ptIn.tellg();
+        std::vector<std::uint8_t> ttf(static_cast<std::size_t>(sz));
+        ptIn.seekg(0, std::ios::beg);
+        ptIn.read(reinterpret_cast<char*>(ttf.data()), sz);
+        while ((ttf.size() & 3u) != 0u) ttf.push_back(0u);
+        if (ttf.size() > 12u) {
+            const std::uint16_t numTables = static_cast<std::uint16_t>((ttf[4] << 8u) | ttf[5]);
+            std::uint32_t gsubRecOff = 0u;
+            for (std::uint16_t ti = 0u; ti < numTables; ++ti) {
+                const std::uint32_t rec = 12u + 16u * ti;
+                if (rec + 16u <= ttf.size() && std::memcmp(ttf.data() + rec, "GSUB", 4u) == 0) {
+                    gsubRecOff = rec;
+                    break;
+                }
+            }
+            if (gsubRecOff > 0u && regFace) {
+                const auto gA = static_cast<std::uint16_t>(regFace->FindGlyphIndex('A'));
+                const auto gB = static_cast<std::uint16_t>(regFace->FindGlyphIndex('B'));
+                const auto delta = static_cast<std::uint16_t>(gB - gA);
+                const auto newOff = static_cast<std::uint32_t>(ttf.size());
+                const std::uint8_t gsubType7[60] = {
+                    // Header: v1.0, scriptOff=10, featOff=14, lookupListOff=28
+                    0x00,0x01, 0x00,0x00, 0x00,0x0A, 0x00,0x0E, 0x00,0x1C,
+                    // ScriptList (4 bytes @ 10): count=0
+                    0x00,0x00, 0x00,0x00,
+                    // FeatureList @ 14 (14 bytes): count=1, 'init' -> off=8 (@22)
+                    0x00,0x01, 'i','n','i','t', 0x00,0x08,
+                    0x00,0x00, 0x00,0x01, 0x00,0x00,
+                    // LookupList @ 28 (4 bytes): count=1, off=4 (@32)
+                    0x00,0x01, 0x00,0x04,
+                    // Lookup @ 32 (8 bytes): type=7, flag=0, subCount=1, off=8 (@40)
+                    0x00,0x07, 0x00,0x00, 0x00,0x01, 0x00,0x08,
+                    // ExtensionSubst1 @ 40 (8 bytes): fmt=1, extType=1, extOff=8 (@48)
+                    0x00,0x01, 0x00,0x01, 0x00,0x00,0x00,0x08,
+                    // SingleSubst1 @ 48 (6 bytes): fmt=1, covOff=6 (@54), delta
+                    0x00,0x01, 0x00,0x06,
+                    static_cast<std::uint8_t>((delta >> 8u) & 0xFFu),
+                    static_cast<std::uint8_t>(delta & 0xFFu),
+                    // Coverage1 @ 54 (6 bytes): fmt=1, count=1, gA
+                    0x00,0x01, 0x00,0x01,
+                    static_cast<std::uint8_t>((gA >> 8u) & 0xFFu),
+                    static_cast<std::uint8_t>(gA & 0xFFu),
+                };
+                ttf.insert(ttf.end(), gsubType7, gsubType7 + sizeof(gsubType7));
+                auto wu32 = [&](std::uint32_t off, std::uint32_t v) {
+                    ttf[off + 0u] = static_cast<std::uint8_t>((v >> 24u) & 0xFFu);
+                    ttf[off + 1u] = static_cast<std::uint8_t>((v >> 16u) & 0xFFu);
+                    ttf[off + 2u] = static_cast<std::uint8_t>((v >> 8u) & 0xFFu);
+                    ttf[off + 3u] = static_cast<std::uint8_t>(v & 0xFFu);
+                };
+                wu32(gsubRecOff + 8u, newOff);
+                wu32(gsubRecOff + 12u, static_cast<std::uint32_t>(sizeof(gsubType7)));
+
+                aero::TrueTypeFontFace customFace;
+                AERO_CHECK(customFace.LoadFromMemory(ttf.data(), ttf.size()));
+                AERO_CHECK(customFace.HasArabicGsub());
+                AERO_CHECK(customFace.ApplyArabicGsubFeature(0x696E6974u /* 'init' */, gA) == gB);
+            }
+        }
+    }
+#endif
+    return true;
+}
+
+bool TestRiveOverflowGuardAndPartialTrim() {
+    namespace fs = std::filesystem;
+    const fs::path tmpDir = fs::temp_directory_path() / "aerogui_rive_regtest";
+    std::error_code ec;
+    fs::create_directories(tmpDir, ec);
+
+    auto pushVarUint = [](std::vector<std::uint8_t>& out, std::uint64_t v) {
+        do {
+            std::uint8_t b = static_cast<std::uint8_t>(v & 0x7Fu);
+            v >>= 7u;
+            if (v != 0u) b |= 0x80u;
+            out.push_back(b);
+        } while (v != 0u);
+    };
+    auto pushF32 = [](std::vector<std::uint8_t>& out, float f) {
+        std::uint8_t buf[4]{};
+        std::memcpy(buf, &f, 4u);
+        out.insert(out.end(), buf, buf + 4u);
+    };
+    auto pushU32 = [](std::vector<std::uint8_t>& out, std::uint32_t u) {
+        std::uint8_t buf[4]{};
+        std::memcpy(buf, &u, 4u);
+        out.insert(out.end(), buf, buf + 4u);
+    };
+
+    // 1. Varuint string overflow attack must cleanly reject
+    {
+        std::vector<std::uint8_t> evil = {'R', 'I', 'V', 'E'};
+        pushVarUint(evil, 7u);
+        pushVarUint(evil, 0u);
+        pushVarUint(evil, 0u);
+        pushVarUint(evil, 0u); // TOC end
+        pushVarUint(evil, 4u); // object type
+        pushVarUint(evil, 4u); // propKey 4 = string
+        pushVarUint(evil, 0xFFFFFFFFFFFFFFF0ULL);
+        evil.resize(evil.size() + 32u, 0x41u);
+
+        const fs::path badPath = tmpDir / "overflow.riv";
+        {
+            std::ofstream ofs(badPath, std::ios::binary | std::ios::trunc);
+            ofs.write(reinterpret_cast<const char*>(evil.data()), static_cast<std::streamsize>(evil.size()));
+        }
+        aero::ImageAtlas atlas;
+        aero::DecodedImage badOut{};
+        AERO_CHECK(!aero::RenderRiveUriToImage(badPath.string(), atlas, "", badOut));
+    }
+
+    // 2. Partial TrimPath on Rectangle Stroke (end=0.0 vs 0.5 vs 1.0)
+    auto buildTrimmedStrokeRiv = [&](float trimStart, float trimEnd, const fs::path& outPath) {
+        std::vector<std::uint8_t> b = {'R', 'I', 'V', 'E'};
+        pushVarUint(b, 7u); // major
+        pushVarUint(b, 0u); // minor
+        pushVarUint(b, 0u); // fileId
+        pushVarUint(b, 0u); // empty TOC -> uses CorePropBackingTypes
+        // Obj 0: Artboard (1): width=64, height=64
+        pushVarUint(b, 1u); pushVarUint(b, 7u); pushF32(b, 64.0f); pushVarUint(b, 8u); pushF32(b, 64.0f); pushVarUint(b, 0u);
+        // Obj 1: Shape (3): parent=0, x=32, y=32
+        pushVarUint(b, 3u); pushVarUint(b, 5u); pushVarUint(b, 0u); pushVarUint(b, 13u); pushF32(b, 32.0f); pushVarUint(b, 14u); pushF32(b, 32.0f); pushVarUint(b, 0u);
+        // Obj 2: Rectangle (7): parent=1, w=40, h=40
+        pushVarUint(b, 7u); pushVarUint(b, 5u); pushVarUint(b, 1u); pushVarUint(b, 20u); pushF32(b, 40.0f); pushVarUint(b, 21u); pushF32(b, 40.0f); pushVarUint(b, 0u);
+        // Obj 3: Stroke (24): parent=1, thickness=4
+        pushVarUint(b, 24u); pushVarUint(b, 5u); pushVarUint(b, 1u); pushVarUint(b, 47u); pushF32(b, 4.0f); pushVarUint(b, 0u);
+        // Obj 4: SolidColor (18): parent=3, color=0xFFFFFFFF
+        pushVarUint(b, 18u); pushVarUint(b, 5u); pushVarUint(b, 3u); pushVarUint(b, 37u); pushU32(b, 0xFFFFFFFFu); pushVarUint(b, 0u);
+        // Obj 5: TrimPath (47): parent=3, start, end
+        pushVarUint(b, 47u); pushVarUint(b, 5u); pushVarUint(b, 3u); pushVarUint(b, 114u); pushF32(b, trimStart); pushVarUint(b, 115u); pushF32(b, trimEnd); pushVarUint(b, 0u);
+
+        std::ofstream ofs(outPath, std::ios::binary | std::ios::trunc);
+        ofs.write(reinterpret_cast<const char*>(b.data()), static_cast<std::streamsize>(b.size()));
+    };
+    auto countOpaquePixels = [](const aero::DecodedImage& img) -> std::size_t {
+        std::size_t cnt = 0u;
+        for (std::size_t i = 3u; i < img.rgbaPixels.size(); i += 4u) {
+            if (img.rgbaPixels[i] > 128u) ++cnt;
+        }
+        return cnt;
+    };
+
+    const fs::path fullPath = tmpDir / "trim_full.riv";
+    const fs::path halfPath = tmpDir / "trim_half.riv";
+    buildTrimmedStrokeRiv(0.0f, 1.0f, fullPath);
+    buildTrimmedStrokeRiv(0.0f, 0.5f, halfPath);
+
+    aero::ImageAtlas atlas;
+    aero::DecodedImage fullImg{}, halfImg{};
+    AERO_CHECK(aero::RenderRiveUriToImage(fullPath.string(), atlas, "", fullImg));
+    AERO_CHECK(aero::RenderRiveUriToImage(halfPath.string(), atlas, "", halfImg));
+    const std::size_t fullPx = countOpaquePixels(fullImg);
+    const std::size_t halfPx = countOpaquePixels(halfImg);
+    AERO_CHECK(fullPx > 100u && halfPx > 20u && halfPx < fullPx * 3u / 4u);
+
+    fs::remove_all(tmpDir, ec);
+    return true;
+}
+
 } // namespace
 
 int main() {
@@ -895,6 +1213,11 @@ int main() {
         {"NativeWindowHostKeysClipboardAndDrivers", &TestNativeWindowHostKeysClipboardAndDrivers},
         {"HighDpiMockGlViewportAndScissor", &TestHighDpiMockGlViewportAndScissor},
         {"WindowExactClientSizeNoDpiScaling", &TestWindowExactClientSizeNoDpiScaling},
+        {"RiveRendererAndBackdropBlur", &TestRiveRendererAndBackdropBlur},
+        {"PlasmaSlotReuseLoopAndLru", &TestPlasmaSlotReuseLoopAndLru},
+        {"CompositeMaskedPathImageTintAndTile", &TestCompositeMaskedPathImageTintAndTile},
+        {"ArabicRtlAndBidiFixes", &TestArabicRtlAndBidiFixes},
+        {"RiveOverflowGuardAndPartialTrim", &TestRiveOverflowGuardAndPartialTrim},
     };
 
     int passed = 0;

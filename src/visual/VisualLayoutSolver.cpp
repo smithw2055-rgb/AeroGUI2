@@ -308,6 +308,24 @@ void ComputeViewboxScale(
     }
 }
 
+
+bool ResolveNodeEffectiveRtl(const VisualWorld& world, const VisualNode& node) noexcept {
+    if (node.layout.hasExplicitFlowDirection) {
+        return node.layout.explicitRtl;
+    }
+    VisualNodeId pid = node.parent;
+    int guard = 0;
+    while (pid.IsValid() && guard++ < 256) {
+        const VisualNode* p = world.GetNode(pid);
+        if (!p) break;
+        if (p->layout.hasExplicitFlowDirection) {
+            return p->layout.explicitRtl;
+        }
+        pid = p->parent;
+    }
+    return false;
+}
+
 Size MeasureNode(VisualWorld& world, VisualNodeId id, Size availSize);
 void ArrangeNode(
     VisualWorld& world,
@@ -490,11 +508,15 @@ void ResolveStarTracksFromInfinite(
     for (GridTrackSolved& r : rows) {
         if (r.unit == GridUnitType::Pixel) {
             r.size = r.value;
+        } else if (!std::isfinite(availH) && r.unit == GridUnitType::Star) {
+            r.unit = GridUnitType::Auto;
         }
     }
     for (GridTrackSolved& c : cols) {
         if (c.unit == GridUnitType::Pixel) {
             c.size = c.value;
+        } else if (!std::isfinite(availW) && c.unit == GridUnitType::Star) {
+            c.unit = GridUnitType::Auto;
         }
     }
 
@@ -669,15 +691,23 @@ void ArrangeGridPanel(
     std::vector<GridTrackSolved> cols;
     BuildGridTrackDefs(parent.RowDefs(), rows);
     BuildGridTrackDefs(parent.ColDefs(), cols);
+    const std::vector<GridTrackSolved> origRows = rows;
+    const std::vector<GridTrackSolved> origCols = cols;
+    const bool sizeToContentW = parent.layout.lastMeasureInnerInfW;
+    const bool sizeToContentH = parent.layout.lastMeasureInnerInfH;
 
     for (GridTrackSolved& r : rows) {
         if (r.unit == GridUnitType::Pixel) {
             r.size = r.value;
+        } else if (sizeToContentH && r.unit == GridUnitType::Star) {
+            r.unit = GridUnitType::Auto;
         }
     }
     for (GridTrackSolved& c : cols) {
         if (c.unit == GridUnitType::Pixel) {
             c.size = c.value;
+        } else if (sizeToContentW && c.unit == GridUnitType::Star) {
+            c.unit = GridUnitType::Auto;
         }
     }
 
@@ -693,16 +723,65 @@ void ArrangeGridPanel(
         const auto rSpan = static_cast<std::size_t>(std::clamp<std::int32_t>(child->layout.gridRowSpan, 1, static_cast<std::int32_t>(rCount - r0)));
         const auto cSpan = static_cast<std::size_t>(std::clamp<std::int32_t>(child->layout.gridColSpan, 1, static_cast<std::int32_t>(cCount - c0)));
 
-        if (!SpanHasStar(cols, c0, cSpan)) {
+        if (!SpanHasStar(cols, c0, cSpan) && cSpan == 1u && cols[c0].unit == GridUnitType::Auto) {
+            cols[c0].size = std::max(cols[c0].size, child->layout.desiredSize.width);
+        }
+        if (!SpanHasStar(rows, r0, rSpan) && rSpan == 1u && rows[r0].unit == GridUnitType::Auto) {
+            rows[r0].size = std::max(rows[r0].size, child->layout.desiredSize.height);
+        }
+    }
+    for (VisualNodeId cid : parent.children) {
+        const VisualNode* child = world.GetNode(cid);
+        if (!child || child->layout.visibility == Visibility::Collapsed) {
+            continue;
+        }
+        const auto r0 = static_cast<std::size_t>(std::clamp<std::int32_t>(child->layout.gridRow, 0, static_cast<std::int32_t>(rCount - 1u)));
+        const auto c0 = static_cast<std::size_t>(std::clamp<std::int32_t>(child->layout.gridCol, 0, static_cast<std::int32_t>(cCount - 1u)));
+        const auto rSpan = static_cast<std::size_t>(std::clamp<std::int32_t>(child->layout.gridRowSpan, 1, static_cast<std::int32_t>(rCount - r0)));
+        const auto cSpan = static_cast<std::size_t>(std::clamp<std::int32_t>(child->layout.gridColSpan, 1, static_cast<std::int32_t>(cCount - c0)));
+
+        if (!SpanHasStar(cols, c0, cSpan) && cSpan > 1u) {
             DistributeGridSpanDemand(cols, c0, cSpan, GridUnitType::Auto, child->layout.desiredSize.width);
         }
-        if (!SpanHasStar(rows, r0, rSpan)) {
+        if (!SpanHasStar(rows, r0, rSpan) && rSpan > 1u) {
             DistributeGridSpanDemand(rows, r0, rSpan, GridUnitType::Auto, child->layout.desiredSize.height);
         }
     }
 
-    ResolveStarTracks(cols, innerRect.width);
-    ResolveStarTracks(rows, innerRect.height);
+    if (sizeToContentW) {
+        float usedW = 0.0f, starW = 0.0f;
+        for (std::size_t i = 0u; i < cCount; ++i) {
+            usedW += cols[i].size;
+            if (origCols[i].unit == GridUnitType::Star) starW += std::max(0.0f, origCols[i].value);
+        }
+        const float extraW = innerRect.width - usedW;
+        if (extraW > 0.0f && starW > 0.0f) {
+            for (std::size_t i = 0u; i < cCount; ++i) {
+                if (origCols[i].unit == GridUnitType::Star) {
+                    cols[i].size += extraW * (std::max(0.0f, origCols[i].value) / starW);
+                }
+            }
+        }
+    } else {
+        ResolveStarTracks(cols, innerRect.width);
+    }
+    if (sizeToContentH) {
+        float usedH = 0.0f, starH = 0.0f;
+        for (std::size_t i = 0u; i < rCount; ++i) {
+            usedH += rows[i].size;
+            if (origRows[i].unit == GridUnitType::Star) starH += std::max(0.0f, origRows[i].value);
+        }
+        const float extraH = innerRect.height - usedH;
+        if (extraH > 0.0f && starH > 0.0f) {
+            for (std::size_t i = 0u; i < rCount; ++i) {
+                if (origRows[i].unit == GridUnitType::Star) {
+                    rows[i].size += extraH * (std::max(0.0f, origRows[i].value) / starH);
+                }
+            }
+        }
+    } else {
+        ResolveStarTracks(rows, innerRect.height);
+    }
     FinalizeGridTrackOffsets(cols, innerRect.x);
     FinalizeGridTrackOffsets(rows, innerRect.y);
 
@@ -721,10 +800,15 @@ void ArrangeGridPanel(
         const auto rSpan = static_cast<std::size_t>(std::clamp<std::int32_t>(child->layout.gridRowSpan, 1, static_cast<std::int32_t>(rCount - r0)));
         const auto cSpan = static_cast<std::size_t>(std::clamp<std::int32_t>(child->layout.gridColSpan, 1, static_cast<std::int32_t>(cCount - c0)));
 
+        const float spanW = SumTrackSpan(cols, c0, cSpan);
+        const float rawColX = cols[c0].offset;
+        const float cellX = parent.layout.effectiveRtl
+            ? (innerRect.x + innerRect.width - (rawColX - innerRect.x) - spanW)
+            : rawColX;
         const Rect cellSlot{
-            cols[c0].offset,
+            cellX,
             rows[r0].offset,
-            SumTrackSpan(cols, c0, cSpan),
+            spanW,
             SumTrackSpan(rows, r0, rSpan)};
         ArrangeNode(world, cid, cellSlot, false, 1.0f, 1.0f, 0.0f, 0.0f);
     }
@@ -1086,7 +1170,10 @@ void ArrangePanelChildren(
                 first = false;
                 const Size d = child->layout.desiredSize;
                 if (isHoriz) {
-                    ArrangeNode(world, cid, Rect{cursor, innerRect.y, d.width, innerRect.height}, false, 1.0f, 1.0f, 0.0f, 0.0f);
+                    const float sx = parent.layout.effectiveRtl
+                        ? (innerRect.x + innerRect.width - (cursor - innerRect.x) - d.width)
+                        : cursor;
+                    ArrangeNode(world, cid, Rect{sx, innerRect.y, d.width, innerRect.height}, false, 1.0f, 1.0f, 0.0f, 0.0f);
                     cursor += d.width;
                 } else {
                     ArrangeNode(world, cid, Rect{innerRect.x, cursor, innerRect.width, d.height}, false, 1.0f, 1.0f, 0.0f, 0.0f);
@@ -1414,10 +1501,18 @@ Size MeasureNode(VisualWorld& world, VisualNodeId id, Size availSize) {
     if (!node) {
         return Size{0.0f, 0.0f};
     }
+    const bool nextRtl = ResolveNodeEffectiveRtl(world, *node);
+    if (node->layout.effectiveRtl != nextRtl) {
+        node->layout.effectiveRtl = nextRtl;
+        node->layout.hasValidMeasure = false;
+        node->layout.hasValidArrange = false;
+    }
 
     if (node->layout.visibility == Visibility::Collapsed) {
         node->layout.desiredSize = Size{0.0f, 0.0f};
         node->layout.lastMeasureConstraint = availSize;
+        node->layout.lastMeasureInnerInfW = !std::isfinite(availSize.width);
+        node->layout.lastMeasureInnerInfH = !std::isfinite(availSize.height);
         node->layout.hasValidMeasure = true;
         return Size{0.0f, 0.0f};
     }
@@ -1434,6 +1529,8 @@ Size MeasureNode(VisualWorld& world, VisualNodeId id, Size availSize) {
         const Size customDesired = customMeasure(world, id, availSize);
         node->layout.desiredSize = customDesired;
         node->layout.lastMeasureConstraint = availSize;
+        node->layout.lastMeasureInnerInfW = !std::isfinite(availSize.width);
+        node->layout.lastMeasureInnerInfH = !std::isfinite(availSize.height);
         node->layout.hasValidMeasure = true;
         node->layout.hasValidArrange = false;
         return customDesired;
@@ -1498,6 +1595,9 @@ Size MeasureNode(VisualWorld& world, VisualNodeId id, Size availSize) {
         minH,
         maxH,
         innerAvailH);
+
+    node->layout.lastMeasureInnerInfW = !std::isfinite(innerAvailW);
+    node->layout.lastMeasureInnerInfH = !std::isfinite(innerAvailH);
 
     Size contentDesired = MeasureIntrinsicContent(world, *node, innerAvailW, innerAvailH);
     if (!node->children.empty()) {
@@ -1569,7 +1669,9 @@ void ArrangeNode(
     node->layout.viewboxOriginX = nextVbOx;
     node->layout.viewboxOriginY = nextVbOy;
 
+    const bool curResolvedRtl = ResolveNodeEffectiveRtl(world, *node);
     if (!vbChanged &&
+        node->layout.effectiveRtl == curResolvedRtl &&
         node->layout.hasValidArrange &&
         SameRectExact(node->layout.lastArrangeSlot, finalSlot)) {
         return;
@@ -1591,10 +1693,18 @@ void ArrangeNode(
         return;
     }
 
-    const float mL = std::isfinite(node->layout.margin.left) ? node->layout.margin.left : 0.0f;
+    const bool nextNodeRtl = ResolveNodeEffectiveRtl(world, *node);
+    const bool rtlChanged = (node->layout.effectiveRtl != nextNodeRtl);
+    node->layout.effectiveRtl = nextNodeRtl;
+    const VisualNode* parentPtr = node->parent.IsValid() ? world.GetNode(node->parent) : nullptr;
+    const bool mirrorInParent = parentPtr ? parentPtr->layout.effectiveRtl : nextNodeRtl;
+    const float rawML = std::isfinite(node->layout.margin.left) ? node->layout.margin.left : 0.0f;
     const float mT = std::isfinite(node->layout.margin.top) ? node->layout.margin.top : 0.0f;
-    const float mR = std::isfinite(node->layout.margin.right) ? node->layout.margin.right : 0.0f;
+    const float rawMR = std::isfinite(node->layout.margin.right) ? node->layout.margin.right : 0.0f;
     const float mB = std::isfinite(node->layout.margin.bottom) ? node->layout.margin.bottom : 0.0f;
+    const float mL = mirrorInParent ? rawMR : rawML;
+    const float mR = mirrorInParent ? rawML : rawMR;
+    (void)rtlChanged;
     const float marginH = mL + mR;
     const float marginV = mT + mB;
 
@@ -1655,7 +1765,11 @@ void ArrangeNode(
         : targetH;
 
     float posX = finalSlot.x + mL;
-    switch (node->layout.hAlign) {
+    const HorizontalAlignment effHAlign = mirrorInParent
+        ? ((node->layout.hAlign == HorizontalAlignment::Left) ? HorizontalAlignment::Right
+           : ((node->layout.hAlign == HorizontalAlignment::Right) ? HorizontalAlignment::Left : node->layout.hAlign))
+        : node->layout.hAlign;
+    switch (effHAlign) {
         case HorizontalAlignment::Left:
             posX = finalSlot.x + mL;
             break;

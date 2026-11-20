@@ -908,7 +908,8 @@ TextLayoutResult VisualWorld::LayoutTextNode(const VisualNode& node, float maxWi
             maxWidth,
             txt.wrap,
             txt.charSpacing,
-            txt.lineHeight);
+            txt.lineHeight,
+            node.layout.effectiveRtl);
     }
     return store->Fonts().MeasureLayout(
         txt.text,
@@ -919,7 +920,8 @@ TextLayoutResult VisualWorld::LayoutTextNode(const VisualNode& node, float maxWi
         txt.charSpacing,
         txt.fontWeight,
         txt.fontItalic,
-        txt.lineHeight);
+        txt.lineHeight,
+        node.layout.effectiveRtl);
 }
 
 Size VisualWorld::MeasureTextNode(const VisualNode& node, float maxWidth) const {
@@ -1055,6 +1057,18 @@ bool VisualWorld::SetImageViewbox(
     img.viewboxY = std::isfinite(vy) ? vy : 0.0f;
     img.viewboxW = std::isfinite(vw) ? vw : 1.0f;
     img.viewboxH = std::isfinite(vh) ? vh : 1.0f;
+    MarkDirty(id, VisualDirty_Visual);
+    return true;
+}
+
+bool VisualWorld::SetImageTileMode(VisualNodeId id, bool tileWrap) noexcept {
+    VisualNode* node = GetNode(id);
+    if (!node) return false;
+    auto& img = node->EnsureExtras().image;
+    if (img.tileWrap == tileWrap) {
+        return true;
+    }
+    img.tileWrap = tileWrap;
     MarkDirty(id, VisualDirty_Visual);
     return true;
 }

@@ -167,6 +167,7 @@ struct BlurLayerSpan {
     std::uint32_t firstNodeId = 0u;
     std::uint32_t endNodeId = 0u;
     float radiusPx = 0.0f;
+    float worldScale = 1.0f;
     Rect clipRect{0.0f, 0.0f, 16384.0f, 16384.0f};
     bool clipActive = false;
     UIEffectKind effectMode = UIEffectKind::Blur;

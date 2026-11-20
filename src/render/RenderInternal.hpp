@@ -61,8 +61,10 @@ namespace aero::render::detail {
 }
 
 [[nodiscard]] inline int ComputeSpanBoxRadius(const BlurLayerSpan& span) noexcept {
-    if (std::isfinite(span.radiusPx) && span.radiusPx > 0.25f) {
-        return std::max(1, static_cast<int>(std::lround(std::clamp(span.radiusPx, 0.5f, 128.0f) * 0.5f)));
+    const float ws = (std::isfinite(span.worldScale) && span.worldScale > 0.0f) ? span.worldScale : 1.0f;
+    const float effRadius = span.radiusPx * ws;
+    if (std::isfinite(effRadius) && effRadius > 0.25f) {
+        return std::max(1, static_cast<int>(std::lround(std::clamp(effRadius, 0.5f, 160.0f) * 0.5f)));
     }
     return 0;
 }

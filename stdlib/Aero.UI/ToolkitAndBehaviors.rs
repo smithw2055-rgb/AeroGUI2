@@ -1150,96 +1150,69 @@ public class NavigateBackAction : TriggerAction {
     }
 }
 
-public class RiveInput : DependencyObject {
-    public string InputName { get; set; } = "";
+public class RiveInput : FrameworkElement {
+    private string _inputName = "";
     private DependencyObject _inputValueBox;
+    internal RiveControl _ownerRive;
 
-    public RiveInput() {}
-    public RiveInput(string name, object val) {
-        InputName = name == null ? "" : name;
+    public RiveInput() : base(VisualKind.Box) {
+        Visibility = Visibility.Collapsed;
+        IsHitTestVisible = false;
+    }
+    public RiveInput(string name, object val) : this() {
+        _inputName = name == null ? "" : name;
         _inputValueBox = DependencyObject.BoxObject(val);
     }
-    public RiveInput(string name, bool val) {
-        InputName = name == null ? "" : name;
+    public RiveInput(string name, bool val) : this() {
+        _inputName = name == null ? "" : name;
         _inputValueBox = DependencyObject.BoxBool(val);
     }
-    public RiveInput(string name, float val) {
-        InputName = name == null ? "" : name;
+    public RiveInput(string name, float val) : this() {
+        _inputName = name == null ? "" : name;
         _inputValueBox = DependencyObject.BoxFloat(val);
     }
-    public RiveInput(string name, int val) {
-        InputName = name == null ? "" : name;
+    public RiveInput(string name, int val) : this() {
+        _inputName = name == null ? "" : name;
         _inputValueBox = DependencyObject.BoxInt(val);
     }
-    public RiveInput(string name, string val) {
-        InputName = name == null ? "" : name;
+    public RiveInput(string name, string val) : this() {
+        _inputName = name == null ? "" : name;
         _inputValueBox = DependencyObject.BoxString(val);
+    }
+
+    public override string GetTypeName() { return "RiveInput"; }
+
+    public string InputName {
+        get { return _inputName; }
+        set { _inputName = value == null ? "" : value; NotifyOwnerRive(); }
     }
 
     public object InputValue {
         get { return DependencyObject.Unbox(_inputValueBox); }
-        set { _inputValueBox = DependencyObject.BoxObject(value); }
+        set { _inputValueBox = DependencyObject.BoxObject(value); NotifyOwnerRive(); }
     }
     public DependencyObject InputValueBox {
         get { return _inputValueBox; }
-        set { _inputValueBox = value; }
+        set { _inputValueBox = value; NotifyOwnerRive(); }
     }
-    public void SetInputValueString(string v) { _inputValueBox = DependencyObject.BoxString(v); }
-    public void SetInputValueFloat(float v) { _inputValueBox = DependencyObject.BoxFloat(v); }
-    public void SetInputValueBool(bool v) { _inputValueBox = DependencyObject.BoxBool(v); }
-}
+    public void SetInputValueString(string v) { _inputValueBox = DependencyObject.BoxString(v); NotifyOwnerRive(); }
+    public void SetInputValueFloat(float v) { _inputValueBox = DependencyObject.BoxFloat(v); NotifyOwnerRive(); }
+    public void SetInputValueBool(bool v) { _inputValueBox = DependencyObject.BoxBool(v); NotifyOwnerRive(); }
 
-internal class RiveArtboardCanvas : CustomDrawElement {
-    public RiveControl Owner;
-
-    public RiveArtboardCanvas(RiveControl owner) : base() {
-        Owner = owner;
-        HorizontalAlignment = HorizontalAlignment.Stretch;
-        VerticalAlignment = VerticalAlignment.Stretch;
+    private void NotifyOwnerRive() {
+        if (_ownerRive != null) { _ownerRive.SyncRiveVisual(); }
     }
 
-    public override void OnRender(DrawingContext dc) {
-        float w = ActualWidth > 0.0f ? ActualWidth : (ParseUtil.IsFinite(Width) ? Width : 240.0f);
-        float h = ActualHeight > 0.0f ? ActualHeight : (ParseUtil.IsFinite(Height) ? Height : 160.0f);
-        bool hovered = Owner != null && Owner.IsMouseOver;
-        bool pressed = Owner != null && Owner.IsPressed;
-        string src = Owner != null ? Owner.Source : "";
-        string tagStr = Owner != null ? DependencyObject.UnboxString(Owner.GetPropertyValue("Tag"), "") : "";
+    public override bool SetPropertyValue(string propName, DependencyObject value) {
+        if (propName == "InputName") { InputName = DependencyObject.UnboxString(value, ""); return true; }
+        if (propName == "InputValue") { InputValueBox = value; return true; }
+        return base.SetPropertyValue(propName, value);
+    }
 
-        uint hash = 2166136261u;
-        string key = src + "|" + tagStr;
-        for (int i = 0; i < key.Length; i += 1) {
-            hash = (hash * 16777619u + (uint)(i + 1) * 31u + (uint)(key.Substring(i, 1) == "a" ? 7u : 13u)) % 65521u;
-        }
-        uint rBase = 48u + (hash % 110u);
-        uint gBase = 72u + ((hash / 11u) % 110u);
-        uint bBase = 136u + ((hash / 97u) % 105u);
-        if (hovered) {
-            rBase = rBase + 28u < 245u ? rBase + 28u : 245u;
-            gBase = gBase + 28u < 245u ? gBase + 28u : 245u;
-        }
-        if (pressed) {
-            bBase = bBase + 36u < 255u ? bBase + 36u : 255u;
-        }
-        uint bgCol = ParseUtil.PackArgb(255u, rBase / 3u, gBase / 3u, bBase / 2u);
-        uint cardGlow = ParseUtil.PackArgb(hovered ? 210u : 140u, rBase, gBase, bBase);
-        uint accent = ParseUtil.PackArgb(255u, 96u + (rBase % 140u), 180u, 255u);
-
-        dc.FillRoundedRect(2.0f, 2.0f, Math.Maxf(12.0f, w - 4.0f), Math.Maxf(12.0f, h - 4.0f), 14.0f, 14.0f, bgCol, -1);
-        dc.StrokeRoundedRect(2.0f, 2.0f, Math.Maxf(12.0f, w - 4.0f), Math.Maxf(12.0f, h - 4.0f), 14.0f, 14.0f, cardGlow, hovered ? 2.5f : 1.5f);
-
-        float cx = w * 0.5f;
-        float cy = h * 0.46f;
-        float radius = Math.Minf(w, h) * (pressed ? 0.24f : (hovered ? 0.28f : 0.25f));
-        dc.FillEllipse(cx, cy, radius * 1.15f, radius * 1.15f, ParseUtil.PackArgb(48u, 255u, 255u, 255u), -1);
-        dc.FillEllipse(cx, cy, radius * 0.72f, radius * 0.72f, cardGlow, -1);
-        dc.StrokeEllipse(cx, cy, radius, radius, accent, 2.0f);
-        dc.DrawLine(cx - radius * 0.45f, cy, cx + radius * 0.45f, cy, accent, 2.0f);
-        dc.DrawLine(cx, cy - radius * 0.45f, cx, cy + radius * 0.45f, ParseUtil.PackArgb(220u, 255u, 255u, 255u), 2.0f);
-
-        string label = tagStr.Length > 0 ? tagStr : (src.Length > 0 ? src : "Rive");
-        dc.DrawText(label, 12.0f, Math.Maxf(8.0f, h - 32.0f), Math.Maxf(24.0f, w - 24.0f), 22.0f, "Segoe UI", 12.0f,
-            ParseUtil.PackArgb(230u, 241u, 245u, 249u), HorizontalAlignment.Center, VerticalAlignment.Center);
+    public override DependencyObject GetPropertyValue(string propName) {
+        if (propName == "InputName") { return DependencyObject.BoxString(_inputName); }
+        if (propName == "InputValue") { return _inputValueBox; }
+        return base.GetPropertyValue(propName);
     }
 }
 
@@ -1247,7 +1220,7 @@ public class RiveControl : Control {
     private string _source = "";
     private Stretch _stretch = Stretch.Uniform;
     private RiveInput[] _inputs;
-    private RiveArtboardCanvas _canvas;
+    private Image _imageView;
 
     public RiveControl() : base() {
         _inputs = new RiveInput[0];
@@ -1258,42 +1231,60 @@ public class RiveControl : Control {
 
     public string Source {
         get { return _source; }
-        set { _source = value == null ? "" : value; RedrawCanvas(); }
+        set { _source = value == null ? "" : value; SyncRiveVisual(); }
     }
     public Stretch Stretch {
         get { return _stretch; }
-        set { _stretch = value; RedrawCanvas(); }
+        set { _stretch = value; SyncRiveVisual(); }
     }
 
     public RiveInput[] Inputs() { return _inputs; }
     public void AddInput(RiveInput input) {
         if (input != null) {
+            input._ownerRive = this;
             _inputs.Push(input);
-            RedrawCanvas();
+            AddChild(input);
+            SyncRiveVisual();
         }
     }
 
     public static void SetSource(UIElement el, string src) {
         if (el is RiveControl) { (el as RiveControl).Source = src; }
+        else if (el != null) { el.SetPropertyValue("RiveControl.Source", DependencyObject.BoxString(src)); }
     }
     public static string GetSource(UIElement el) {
         if (el is RiveControl) { return (el as RiveControl).Source; }
+        if (el != null) { return DependencyObject.UnboxString(el.GetPropertyValue("RiveControl.Source"), ""); }
         return "";
     }
 
-    private void RedrawCanvas() {
-        if (_canvas != null) { _canvas.InvalidateDraw(); }
+    internal void SyncRiveVisual() {
+        if (_imageView == null) { return; }
+        _imageView.Stretch = _stretch;
+        if (_source == null || _source.Length == 0) {
+            _imageView.Source = "";
+            return;
+        }
+        string q = "";
+        for (int i = 0; i < _inputs.Length; i += 1) {
+            RiveInput ri = _inputs[i];
+            if (ri != null && ri.InputName.Length > 0 && ri.InputValueBox != null) {
+                string vStr = DependencyObject.UnboxString(ri.InputValueBox, "0").Trim();
+                if (vStr.Length > 0) {
+                    q = q + (q.Length == 0 ? "?" : "&") + ri.InputName + "=" + vStr;
+                }
+            }
+        }
+        _imageView.Source = "rive://" + _source + q;
     }
 
     protected override UIElement CreateDefaultTemplate() {
-        _canvas = new RiveArtboardCanvas(this);
-        return _canvas;
+        _imageView = new Image();
+        _imageView.HorizontalAlignment = HorizontalAlignment.Stretch;
+        _imageView.VerticalAlignment = VerticalAlignment.Stretch;
+        SyncRiveVisual();
+        return _imageView;
     }
-
-    public override void OnMouseEnter(MouseEventArgs e) { RedrawCanvas(); }
-    public override void OnMouseLeave(MouseEventArgs e) { RedrawCanvas(); }
-    public override void OnMouseLeftButtonDown(MouseButtonEventArgs e) { RedrawCanvas(); }
-    public override void OnMouseLeftButtonUp(MouseButtonEventArgs e) { RedrawCanvas(); }
 
     public override bool SetPropertyValue(string propName, DependencyObject value) {
         if (propName == "Source" || propName == "RiveControl.Source") { Source = DependencyObject.UnboxString(value, ""); return true; }

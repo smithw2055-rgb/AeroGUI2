@@ -1268,7 +1268,7 @@ bool AeroAppHost::LoadProgramImageInternal(
                         argVec.assign(arguments, arguments + argumentCount);
                     }
                     rs_rt::ExecutionOptions execOpts{};
-                    execOpts.limits.instructionBudget = 32'000'000u;
+                    execOpts.limits.instructionBudget = 128'000'000u;
                     execOpts.limits.gcWorkBudget = 0u;
                     execOpts.executionPolicy = policy;
                     const auto exec = stencilMod->invoke(functionId, argVec, std::move(execOpts));
@@ -1462,7 +1462,7 @@ bool AeroAppHost::LoadAotProgram(
     }
 
     rs_rt::ExecutionOptions aotOpts{};
-    aotOpts.limits.instructionBudget = 32'000'000u;
+    aotOpts.limits.instructionBudget = 128'000'000u;
     aotOpts.limits.gcWorkBudget = 0u;
 
     aotContext_ = std::make_unique<rs_aot::ExecutionContext>(
@@ -1525,7 +1525,7 @@ bool AeroAppHost::InvokeSymbol(
             std::fflush(stderr);
         }
         rs_rt::ExecutionOptions execOpts{};
-        execOpts.limits.instructionBudget = 32'000'000u;
+        execOpts.limits.instructionBudget = 128'000'000u;
         execOpts.limits.gcWorkBudget = 0u;
         const auto exec = domains_.invokeMethod(domain, targetInterp, fnId, args, execOpts);
         if (IsAeroTraceEnabled()) {
@@ -1690,7 +1690,7 @@ bool AeroAppHost::InstantiateAndMountEntry(std::string_view entryHint) {
         }
         if (ctorId != 0u) {
             rs_rt::Limits ctorLimits{};
-            ctorLimits.instructionBudget = 32'000'000u;
+            ctorLimits.instructionBudget = 128'000'000u;
             const auto exec = interpreter_->invoke(ctorId, {UnifiedValue{*alloc}}, ctorLimits);
             if (!exec.succeeded) {
                 std::string stackSummary;

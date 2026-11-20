@@ -63,6 +63,14 @@ public partial class MainWindow : Page
     protected override void OnLoaded()
     {
         base.OnLoaded();
+        if (this.Buttons != null && this.Buttons.ChildCount() > 0)
+        {
+            UIElement b0 = this.Buttons.ChildAt(0);
+            if (b0 != null)
+            {
+                b0.Focus();
+            }
+        }
         this.BeginStoryboard("AnimNoise");
     }
 

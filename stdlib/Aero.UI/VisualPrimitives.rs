@@ -78,7 +78,7 @@ public class BoxShadow : Decorator {
 
     private void UpdateShadowOffset() {
         float ox = _offsetX;
-        float oy = _offsetY;
+        float oy = -_offsetY;
         float depth = Math.Sqrtf(ox * ox + oy * oy);
         _shadow.ShadowDepth = depth;
         if (depth > 0.0001f) {
@@ -385,6 +385,35 @@ public class TextBlock : FrameworkElement {
         _inlines.Clear();
         _text = "";
         SyncTextToNative();
+    }
+    private static bool IsPrintableOrSpaceAscii(string ch) {
+        if (ch == null || ch.Length != 1) { return false; }
+        string table = " !\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~\t\n\r";
+        return table.Contains(ch);
+    }
+
+    public void AddRunSpaced(Run r) {
+        if (r == null) { return; }
+        if (_inlines != null && _inlines.Length > 0 && r.Text != null && r.Text.Length > 0) {
+            Inline prev = _inlines[_inlines.Length - 1];
+            if (!(prev is LineBreak) && prev.Text != null && prev.Text.Length > 0) {
+                string lastCh = prev.Text.Substring(prev.Text.Length - 1, 1);
+                string firstCh = r.Text.Substring(0, 1);
+                bool prevEndsSpace = (lastCh == " " || lastCh == "\t" || lastCh == "\n" || lastCh == "\r" || lastCh == "(" || lastCh == "[");
+                bool nextStartsPunct = (firstCh == " " || firstCh == "\t" || firstCh == "\n" || firstCh == "\r" ||
+                                        firstCh == "," || firstCh == "." || firstCh == ";" ||
+                                        firstCh == ":" || firstCh == "!" || firstCh == "?" ||
+                                        firstCh == ")" || firstCh == "]");
+                if (!prevEndsSpace && !nextStartsPunct) {
+                    bool prevAscii = IsPrintableOrSpaceAscii(lastCh);
+                    bool nextAscii = IsPrintableOrSpaceAscii(firstCh);
+                    if (prevAscii || nextAscii) {
+                        AddInline(new Run(" "));
+                    }
+                }
+            }
+        }
+        AddRun(r);
     }
 
     private void RebuildFromInlines() {
@@ -724,6 +753,7 @@ public class Shape : FrameworkElement {
                 EnumConvert.ToInt(StretchDirection.Both),
                 ParseUtil.PackArgb(255u, 255u, 255u, 255u));
             UIElement.ApplyImageBrushViewbox(__nativeHandle, ib.Viewbox);
+            Visual_SetImageTile(__nativeHandle, ib.TileMode == "Tile");
             _hadFillImage = true;
         } else {
             if (_hadFillImage) {
@@ -754,6 +784,23 @@ public class Shape : FrameworkElement {
         if (propName == "Stroke") { Stroke = UIElement.CoerceBrush(value); return true; }
         if (propName == "Fill.ImageSource" && _fill is ImageBrush) {
             (_fill as ImageBrush).ImageSource = DependencyObject.UnboxString(value, "");
+            SyncVectorShape();
+            return true;
+        }
+        if ((propName == "Fill.PlasmaSeed" || propName == "Fill.PlasmaColor" ||
+             propName == "Fill.PlasmaTime" || propName == "Fill.PlasmaScaleX" ||
+             propName == "Fill.PlasmaScaleY") && _fill is ImageBrush) {
+            ImageBrush ib = _fill as ImageBrush;
+            if (!_ownsClonedFill) {
+                ib = ib.CloneImageBrush();
+                _fill = ib;
+                _ownsClonedFill = true;
+            }
+            if (propName == "Fill.PlasmaSeed") { ib.PlasmaSeed = DependencyObject.UnboxFloat(value, 100.0f); }
+            else if (propName == "Fill.PlasmaColor") { ib.PlasmaColor = DependencyObject.UnboxString(value, "#FF01BCFF"); }
+            else if (propName == "Fill.PlasmaTime") { ib.PlasmaTime = DependencyObject.UnboxFloat(value, 0.0f); }
+            else if (propName == "Fill.PlasmaScaleX") { ib.PlasmaScaleX = DependencyObject.UnboxFloat(value, 64.0f); }
+            else if (propName == "Fill.PlasmaScaleY") { ib.PlasmaScaleY = DependencyObject.UnboxFloat(value, 64.0f); }
             SyncVectorShape();
             return true;
         }
@@ -830,6 +877,21 @@ public class Shape : FrameworkElement {
         if (propName == "Fill") { return _fill; }
         if (propName == "Fill.ImageSource" && _fill is ImageBrush) {
             return DependencyObject.BoxString((_fill as ImageBrush).ImageSource);
+        }
+        if (propName == "Fill.PlasmaSeed" && _fill is ImageBrush) {
+            return DependencyObject.BoxFloat((_fill as ImageBrush).PlasmaSeed);
+        }
+        if (propName == "Fill.PlasmaColor" && _fill is ImageBrush) {
+            return DependencyObject.BoxString((_fill as ImageBrush).PlasmaColor);
+        }
+        if (propName == "Fill.PlasmaTime" && _fill is ImageBrush) {
+            return DependencyObject.BoxFloat((_fill as ImageBrush).PlasmaTime);
+        }
+        if (propName == "Fill.PlasmaScaleX" && _fill is ImageBrush) {
+            return DependencyObject.BoxFloat((_fill as ImageBrush).PlasmaScaleX);
+        }
+        if (propName == "Fill.PlasmaScaleY" && _fill is ImageBrush) {
+            return DependencyObject.BoxFloat((_fill as ImageBrush).PlasmaScaleY);
         }
         if (propName == "Fill.Opacity") { return DependencyObject.BoxFloat(_fillOpacity); }
         if (propName == "Fill.Color") {
@@ -940,6 +1002,228 @@ public class Path : Shape {
     }
     protected override string BuildVectorGeometrySpec() { return _data; }
 
+    private static bool IsSvgSep(string ch) {
+        return ch == " " || ch == "\t" || ch == "\n" || ch == "\r" || ch == ",";
+    }
+
+    private static bool IsSvgDigit(string ch) {
+        return "0123456789".Contains(ch);
+    }
+
+    private static int TryParseUnsignedDigits(string s, int startPos, int[] outPair) {
+        int i = startPos;
+        int acc = 0;
+        int count = 0;
+        while (i < s.Length) {
+            string ch = s.Substring(i, 1);
+            if (!IsSvgDigit(ch)) { break; }
+            acc = acc * 10 + ParseUtil.ParseInt(ch, 0);
+            count += 1;
+            i += 1;
+        }
+        if (count == 0) { return -1; }
+        outPair[0] = acc;
+        outPair[1] = i;
+        return 0;
+    }
+
+    private static bool TryParsePathPropertySpec(string propName, int[] outSpec) {
+        if (propName == null || propName.Length < 14) { return false; }
+        if (propName.Substring(0, 8) != "Data.Fig") { return false; }
+        var pair = new int[2];
+        if (TryParseUnsignedDigits(propName, 8, pair) < 0) { return false; }
+        int figIdx = pair[0];
+        int pos = pair[1];
+        if (pos + 11 <= propName.Length && propName.Substring(pos, 11) == ".StartPoint") {
+            string axis = propName.Substring(pos + 11);
+            if (axis == ".X") { outSpec[0] = figIdx; outSpec[1] = -1; outSpec[2] = 0; return true; }
+            if (axis == ".Y") { outSpec[0] = figIdx; outSpec[1] = -1; outSpec[2] = 1; return true; }
+            return false;
+        }
+        if (pos + 4 > propName.Length || propName.Substring(pos, 4) != ".Seg") { return false; }
+        if (TryParseUnsignedDigits(propName, pos + 4, pair) < 0) { return false; }
+        int segIdx = pair[0];
+        pos = pair[1];
+        string tail = propName.Substring(pos);
+        int slot = -1;
+        if (tail == ".Point.X") { slot = 2; }
+        else if (tail == ".Point.Y") { slot = 3; }
+        else if (tail == ".Point1.X") { slot = 4; }
+        else if (tail == ".Point1.Y") { slot = 5; }
+        else if (tail == ".Point2.X") { slot = 6; }
+        else if (tail == ".Point2.Y") { slot = 7; }
+        else if (tail == ".Point3.X") { slot = 8; }
+        else if (tail == ".Point3.Y") { slot = 9; }
+        if (slot < 0) { return false; }
+        outSpec[0] = figIdx;
+        outSpec[1] = segIdx;
+        outSpec[2] = slot;
+        return true;
+    }
+
+    private static int ScanNextSvgNumber(string svg, int pos, int[] numSpan) {
+        int n = svg.Length;
+        while (pos < n && IsSvgSep(svg.Substring(pos, 1))) { pos += 1; }
+        if (pos >= n) { return -1; }
+        int start = pos;
+        string c0 = svg.Substring(pos, 1);
+        if (c0 == "+" || c0 == "-") { pos += 1; }
+        bool hasDigit = false;
+        bool seenDot = false;
+        while (pos < n) {
+            string ch = svg.Substring(pos, 1);
+            if (IsSvgDigit(ch)) {
+                hasDigit = true;
+                pos += 1;
+            } else if (ch == "." && !seenDot) {
+                seenDot = true;
+                pos += 1;
+            } else {
+                break;
+            }
+        }
+        if (!hasDigit) { return -1; }
+        if (pos < n) {
+            string ep = svg.Substring(pos, 1);
+            if (ep == "e" || ep == "E") {
+                int savePos = pos;
+                pos += 1;
+                if (pos < n) {
+                    string sg = svg.Substring(pos, 1);
+                    if (sg == "+" || sg == "-") { pos += 1; }
+                }
+                bool expDigits = false;
+                while (pos < n && IsSvgDigit(svg.Substring(pos, 1))) {
+                    expDigits = true;
+                    pos += 1;
+                }
+                if (!expDigits) { pos = savePos; }
+            }
+        }
+        numSpan[0] = start;
+        numSpan[1] = pos;
+        return pos;
+    }
+
+    private static bool FindPathTargetNumberSpan(string svg, int wantFig, int wantSeg, int slotKind, int[] outSpan) {
+        if (svg == null || svg.Length == 0 || wantFig < 0) { return false; }
+        int n = svg.Length;
+        int pos = 0;
+        int curFig = -1;
+        int curSeg = -1;
+        string curCmd = "";
+        bool expectMoveAsLine = false;
+        var numSpan = new int[2];
+        var starts = new int[7];
+        var ends = new int[7];
+
+        while (pos < n) {
+            while (pos < n && IsSvgSep(svg.Substring(pos, 1))) { pos += 1; }
+            if (pos >= n) { break; }
+            string ch = svg.Substring(pos, 1);
+            if (ch == "F" || ch == "f") {
+                pos += 1;
+                int nextF = ScanNextSvgNumber(svg, pos, numSpan);
+                if (nextF > pos) { pos = nextF; }
+                continue;
+            }
+            if ("MmLlHhVvCcSsQqTtAaZz".Contains(ch)) {
+                curCmd = ch;
+                expectMoveAsLine = false;
+                pos += 1;
+                if (curCmd == "Z" || curCmd == "z") { continue; }
+            }
+            if (curCmd.Length == 0) { break; }
+            string effCmd = curCmd;
+            if (expectMoveAsLine) {
+                if (curCmd == "M") { effCmd = "L"; }
+                else if (curCmd == "m") { effCmd = "l"; }
+            }
+            int need = 0;
+            if (effCmd == "M" || effCmd == "m" || effCmd == "L" || effCmd == "l" || effCmd == "T" || effCmd == "t") { need = 2; }
+            else if (effCmd == "H" || effCmd == "h" || effCmd == "V" || effCmd == "v") { need = 1; }
+            else if (effCmd == "S" || effCmd == "s" || effCmd == "Q" || effCmd == "q") { need = 4; }
+            else if (effCmd == "C" || effCmd == "c") { need = 6; }
+            else if (effCmd == "A" || effCmd == "a") { need = 7; }
+            else { break; }
+
+            bool okNums = true;
+            for (int k = 0; k < need; k += 1) {
+                int nextPos = ScanNextSvgNumber(svg, pos, numSpan);
+                if (nextPos < 0) { okNums = false; break; }
+                starts[k] = numSpan[0];
+                ends[k] = numSpan[1];
+                pos = nextPos;
+            }
+            if (!okNums) { break; }
+
+            if (effCmd == "M" || effCmd == "m") {
+                curFig += 1;
+                curSeg = -1;
+                expectMoveAsLine = true;
+                if (curFig == wantFig && wantSeg == -1 && (slotKind == 0 || slotKind == 1)) {
+                    outSpan[0] = starts[slotKind];
+                    outSpan[1] = ends[slotKind];
+                    return true;
+                }
+            } else {
+                curSeg += 1;
+                if (curFig == wantFig && curSeg == wantSeg) {
+                    int pick = -1;
+                    if (slotKind == 2) {
+                        if (effCmd == "H" || effCmd == "h") { pick = 0; }
+                        else if (effCmd == "V" || effCmd == "v") { pick = -1; }
+                        else { pick = need - 2; }
+                    } else if (slotKind == 3) {
+                        if (effCmd == "V" || effCmd == "v") { pick = 0; }
+                        else if (effCmd == "H" || effCmd == "h") { pick = -1; }
+                        else { pick = need - 1; }
+                    } else if (slotKind == 4 || slotKind == 5) {
+                        if (effCmd == "C" || effCmd == "c" || effCmd == "Q" || effCmd == "q") { pick = slotKind - 4; }
+                    } else if (slotKind == 6 || slotKind == 7) {
+                        if (effCmd == "C" || effCmd == "c") { pick = 2 + (slotKind - 6); }
+                        else if (effCmd == "S" || effCmd == "s") { pick = slotKind - 6; }
+                        else if (effCmd == "Q" || effCmd == "q") { pick = 2 + (slotKind - 6); }
+                    } else if (slotKind == 8 || slotKind == 9) {
+                        if (effCmd == "C" || effCmd == "c") { pick = 4 + (slotKind - 8); }
+                        else if (effCmd == "S" || effCmd == "s") { pick = 2 + (slotKind - 8); }
+                    }
+                    if (pick >= 0 && pick < need) {
+                        outSpan[0] = starts[pick];
+                        outSpan[1] = ends[pick];
+                        return true;
+                    }
+                    return false;
+                }
+            }
+        }
+        return false;
+    }
+
+    private static float ReadPathTargetNumber(string svg, int[] spec) {
+        var span = new int[2];
+        if (!FindPathTargetNumberSpan(svg, spec[0], spec[1], spec[2], span)) { return 0.0f; }
+        return ParseUtil.ParseFloat(svg.Substring(span[0], span[1] - span[0]), 0.0f);
+    }
+
+    private static string WritePathTargetNumber(string svg, int[] spec, float newVal) {
+        var span = new int[2];
+        if (!FindPathTargetNumberSpan(svg, spec[0], spec[1], spec[2], span)) { return svg; }
+        int start = span[0];
+        int end = span[1];
+        string prefixSep = "";
+        if (start > 0 && newVal >= 0.0f) {
+            string prevCh = svg.Substring(start - 1, 1);
+            if (IsSvgDigit(prevCh) || prevCh == ".") { prefixSep = " "; }
+        }
+        string suffixSep = "";
+        if (end < svg.Length) {
+            string nextCh = svg.Substring(end, 1);
+            if (IsSvgDigit(nextCh) || nextCh == ".") { suffixSep = " "; }
+        }
+        return svg.Substring(0, start) + prefixSep + ("" + newVal) + suffixSep + svg.Substring(end);
+    }
+
     public override bool SetPropertyValue(string propName, DependencyObject value) {
         if (propName == "Data") {
             if (value is Geometry) {
@@ -956,11 +1240,20 @@ public class Path : Shape {
             Data = DependencyObject.UnboxString(value, "");
             return true;
         }
+        var spec = new int[3];
+        if (TryParsePathPropertySpec(propName, spec)) {
+            Data = WritePathTargetNumber(_data, spec, DependencyObject.UnboxFloat(value, 0.0f));
+            return true;
+        }
         return base.SetPropertyValue(propName, value);
     }
 
     public override DependencyObject GetPropertyValue(string propName) {
         if (propName == "Data") { return DependencyObject.BoxString(_data); }
+        var spec = new int[3];
+        if (TryParsePathPropertySpec(propName, spec)) {
+            return DependencyObject.BoxFloat(ReadPathTargetNumber(_data, spec));
+        }
         return base.GetPropertyValue(propName);
     }
     public override string ToDisplayString() { return "path:" + _data; }

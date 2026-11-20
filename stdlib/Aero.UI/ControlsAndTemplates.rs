@@ -148,7 +148,13 @@ public class Control : FrameworkElement {
     public virtual bool HasNamedContentSlot(string source) { return false; }
 
     public Brush Foreground {
-        get { return _foreground; }
+        get {
+            if (!_hasExplicitForeground) {
+                Brush eff = EffectiveTextForeground();
+                if (eff != null) { return eff; }
+            }
+            return _foreground;
+        }
         set { _hasExplicitForeground = true; _foreground = value; SetExplicitTextForeground(value); OnTypographyChanged(); }
     }
     public string FontFamily {
@@ -340,12 +346,34 @@ public class Control : FrameworkElement {
         return FindName(name);
     }
 
+    private static void DetachUserContentFromTemplate(UIElement root, UIElement owner) {
+        if (root == null) { return; }
+        var q = new UIElement[0];
+        q.Push(root);
+        int qi = 0;
+        while (qi < q.Length) {
+            UIElement cur = q[qi];
+            qi += 1;
+            if (cur == null) { continue; }
+            for (int i = cur.ChildCount() - 1; i >= 0; i -= 1) {
+                UIElement ch = cur.ChildAt(i);
+                if (ch == null) { continue; }
+                if (ch.TemplatedParent == owner) {
+                    q.Push(ch);
+                } else if (cur is ContentPresenter) {
+                    cur.RemoveChild(ch);
+                }
+            }
+        }
+    }
+
     public override bool ApplyTemplate() {
         if (_template != null && _templateApplied) {
             _template.ResetTriggers(this);
         }
         UIElement self = this;
         if (_templateRoot != null) {
+            DetachUserContentFromTemplate(_templateRoot, self);
             if (_templateRoot.Parent == self) {
                 RemoveChild(_templateRoot);
             }
@@ -367,6 +395,12 @@ public class Control : FrameworkElement {
             MarkTemplateOwner(_templateRoot, this);
             AddChild(_templateRoot);
             SyncTemplatePresenters();
+            if (_template == null) {
+                BindingEngine.FlushSubtree(_templateRoot);
+            }
+        }
+        if (_templateRoot != null && _template != null) {
+            _template.AttachTriggers(this);
         }
         OnApplyTemplate();
         if (_templateRoot != null && _template != null) {
@@ -431,21 +465,24 @@ public class Control : FrameworkElement {
     }
 
     protected override DependencyObject TryFindTemplateScopedResourceBox(string key) {
-        if (_template != null) {
-            if (_template.Resources != null && _template.Resources.Contains(key)) {
-                return _template.Resources.GetBox(key);
-            }
-            if (_template.AmbientResources != null && _template.AmbientResources.Contains(key)) {
-                return _template.AmbientResources.GetBox(key);
-            }
+        if (_template != null && _template.Resources != null) {
+            return _template.Resources.TryGetLocalBox(key);
+        }
+        return null;
+    }
+
+    protected override DependencyObject TryFindTemplateAmbientResourceBox(string key) {
+        if (_template != null && _template.AmbientResources != null) {
+            return _template.AmbientResources.TryGetLocalBox(key);
         }
         return null;
     }
 
     public override DependencyObject GetPropertyValue(string propName) {
-        if (propName == "Foreground") { return _foreground; }
+        if (propName == "Foreground") { return Foreground; }
         if (propName == "Foreground.Color") {
-            return DependencyObject.BoxString(_foreground != null ? ParseUtil.FormatArgbHex(_foreground.ResolveRgba()) : "#FFF1F5F9");
+            Brush fg = Foreground;
+            return DependencyObject.BoxString(fg != null ? ParseUtil.FormatArgbHex(fg.ResolveRgba()) : "#FFF1F5F9");
         }
         if (propName == "FontSize") { return DependencyObject.BoxFloat(_fontSize); }
         if (propName == "FontFamily") { return DependencyObject.BoxString(_fontFamily); }
@@ -465,6 +502,9 @@ public class ContentPresenter : FrameworkElement {
     private TextBlock _textView;
     private Brush _foreground;
     private bool _hasExplicitForeground = false;
+    private bool _hasExplicitFontFamily = false;
+    private bool _hasExplicitFontSize = false;
+    private bool _hasExplicitFontWeight = false;
     private string _fontFamily = "Segoe UI";
     private float _fontSize = 14.0f;
     private string _fontWeight = "Normal";
@@ -490,6 +530,7 @@ public class ContentPresenter : FrameworkElement {
     public string FontFamily {
         get { return _fontFamily; }
         set {
+            _hasExplicitFontFamily = true;
             _fontFamily = value == null ? "Segoe UI" : value;
             if (_textView != null) { _textView.FontFamily = _fontFamily; }
         }
@@ -497,6 +538,7 @@ public class ContentPresenter : FrameworkElement {
     public float FontSize {
         get { return _fontSize; }
         set {
+            _hasExplicitFontSize = true;
             _fontSize = value > 0.0f ? value : 14.0f;
             if (_textView != null) { _textView.FontSize = _fontSize; }
         }
@@ -504,6 +546,7 @@ public class ContentPresenter : FrameworkElement {
     public string FontWeight {
         get { return _fontWeight; }
         set {
+            _hasExplicitFontWeight = true;
             _fontWeight = value == null ? "Normal" : value;
             if (_textView != null) { _textView.FontWeight = _fontWeight; }
         }
@@ -558,6 +601,8 @@ public class ContentPresenter : FrameworkElement {
         }
     }
 
+    internal bool _syncOwnerContentAlignment = false;
+
     public void SyncFromTemplatedParent(Control owner) {
         if (owner == null) { return; }
         UIElement ownerEl = owner;
@@ -565,10 +610,16 @@ public class ContentPresenter : FrameworkElement {
         if (!_hasExplicitForeground) {
             _foreground = owner.Foreground;
         }
-        _fontFamily = owner.FontFamily;
-        _fontSize = owner.FontSize;
-        _fontWeight = owner.FontWeight;
-        if (!IsScrollPresenter()) {
+        if (!_hasExplicitFontFamily) {
+            _fontFamily = owner.FontFamily;
+        }
+        if (!_hasExplicitFontSize) {
+            _fontSize = owner.FontSize;
+        }
+        if (!_hasExplicitFontWeight) {
+            _fontWeight = owner.FontWeight;
+        }
+        if (_syncOwnerContentAlignment && !IsScrollPresenter()) {
             if (!_hasExplicitHAlign) { HorizontalAlignment = owner.HorizontalContentAlignment; _hasExplicitHAlign = false; }
             if (!_hasExplicitVAlign) { VerticalAlignment = owner.VerticalContentAlignment; _hasExplicitVAlign = false; }
         }
@@ -634,9 +685,13 @@ public class ContentPresenter : FrameworkElement {
         if (_contentBox is UIElement) {
             _textView = null;
             UIElement el = _contentBox as UIElement;
-            if (ChildCount() == 1 && ChildAt(0) == el) { return; }
+            if (ChildCount() == 1 && ChildAt(0) == el) {
+                BindingEngine.FlushSubtree(el);
+                return;
+            }
             ClearChildren();
             AddChild(el);
+            BindingEngine.FlushSubtree(el);
             return;
         }
         if (_contentTemplate != null) {
@@ -810,6 +865,7 @@ public class ContentControl : Control {
 
     protected override UIElement CreateDefaultTemplate() {
         _presenter = new ContentPresenter();
+        _presenter._syncOwnerContentAlignment = true;
         _presenter.Name = "PART_ContentPresenter";
         _presenter.SetContentAndTemplate(_contentBox, _contentTemplate);
         return _presenter;

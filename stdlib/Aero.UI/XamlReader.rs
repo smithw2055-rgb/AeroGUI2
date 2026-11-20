@@ -495,6 +495,35 @@ internal static class XamlDomParser {
         }
     }
 
+    private static void AppendParentTextSegment(XamlXmlNode parent, string rawSeg) {
+        if (parent == null || rawSeg == null || rawSeg.Length == 0) { return; }
+        string decoded = XamlStr.DecodeXmlText(rawSeg);
+        string tr = decoded.Trim();
+        if (parent.LocalName == "TextBlock") {
+            if (tr.Length == 0) {
+                parent.Children.Push(new XamlXmlNode("#ws", "#ws"));
+            } else {
+                bool hasLead = decoded.Substring(0, 1).Trim().Length == 0;
+                bool hasTrail = decoded.Substring(decoded.Length - 1, 1).Trim().Length == 0;
+                bool prevIsLineBreak = parent.Children.Length > 0 && parent.Children[parent.Children.Length - 1].LocalName == "LineBreak";
+                if (hasLead && parent.Children.Length > 0 && !prevIsLineBreak) {
+                    parent.Children.Push(new XamlXmlNode("#ws", "#ws"));
+                }
+                var txtNode = new XamlXmlNode("#text", "#text");
+                txtNode.Text = tr;
+                parent.Children.Push(txtNode);
+                parent.Text = parent.Text + decoded;
+                if (hasTrail) {
+                    parent.Children.Push(new XamlXmlNode("#ws", "#ws"));
+                }
+            }
+            return;
+        }
+        if (tr.Length > 0) {
+            parent.Text = parent.Text + decoded;
+        }
+    }
+
     public static XamlXmlNode ParseDocument(string xmlText) {
         if (xmlText == null) { return null; }
         string src = xmlText.Trim();
@@ -521,11 +550,7 @@ internal static class XamlDomParser {
                 }
                 int endCom = XamlStr.FindFrom(cur, "-->", 3);
                 if (endCom >= 0 && endCom + 3 < cur.Length && stack.Length > 0) {
-                    string trailing = XamlStr.TrimPreserveNewline(cur.Substring(endCom + 3));
-                    if (trailing.Length > 0) {
-                        XamlXmlNode parent = stack[stack.Length - 1];
-                        parent.Text = parent.Text + trailing;
-                    }
+                    AppendParentTextSegment(stack[stack.Length - 1], cur.Substring(endCom + 3));
                 }
                 continue;
             }
@@ -541,8 +566,7 @@ internal static class XamlDomParser {
                     XamlXmlNode parent = stack[stack.Length - 1];
                     parent.Text = parent.Text + cur.Substring(8, endCd - 8);
                     if (endCd + 3 < cur.Length) {
-                        string tr = XamlStr.TrimPreserveNewline(cur.Substring(endCd + 3));
-                        if (tr.Length > 0) { parent.Text = parent.Text + tr; }
+                        AppendParentTextSegment(parent, cur.Substring(endCd + 3));
                     }
                 }
                 continue;
@@ -566,12 +590,8 @@ internal static class XamlDomParser {
                         break;
                     }
                 }
-                if (stack.Length > 0) {
-                    string tr = XamlStr.TrimPreserveNewline(after);
-                    if (tr.Length > 0) {
-                        XamlXmlNode curParent = stack[stack.Length - 1];
-                        curParent.Text = curParent.Text + tr;
-                    }
+                if (stack.Length > 0 && after.Length > 0) {
+                    AppendParentTextSegment(stack[stack.Length - 1], after);
                 }
                 continue;
             }
@@ -599,17 +619,12 @@ internal static class XamlDomParser {
             }
 
             if (!selfClosing) {
-                string innerText = XamlStr.TrimPreserveNewline(after);
-                if (innerText.Length > 0) {
-                    node.Text = node.Text + innerText;
+                if (after.Length > 0) {
+                    AppendParentTextSegment(node, after);
                 }
                 stack.Push(node);
-            } else if (stack.Length > 0) {
-                string tr = XamlStr.TrimPreserveNewline(after);
-                if (tr.Length > 0) {
-                    XamlXmlNode curParent = stack[stack.Length - 1];
-                    curParent.Text = curParent.Text + tr;
-                }
+            } else if (stack.Length > 0 && after.Length > 0) {
+                AppendParentTextSegment(stack[stack.Length - 1], after);
             }
         }
         return root;
@@ -630,12 +645,12 @@ public static class XamlReader {
     }
 
     public static ResourceDictionary LoadResourceDictionary(string uri) {
-        if (uri == null || uri.Trim().Length == 0) { return new ResourceDictionary(); }
+        if (uri == null || uri.Trim().Length == 0) { return null; }
         string normUri = uri.Trim();
         string text = Host_ReadTextAsset(normUri);
-        if (text == null || text.Trim().Length == 0) { return new ResourceDictionary(); }
+        if (text == null || text.Trim().Length == 0) { return null; }
         XamlXmlNode root = XamlDomParser.ParseDocument(text);
-        if (root == null) { return new ResourceDictionary(); }
+        if (root == null) { return null; }
         var ctx = new XamlBuildContext(null, normUri);
         return BuildResourceDictionaryNode(root, ctx);
     }
@@ -650,7 +665,9 @@ public static class XamlReader {
             ResourceDictionary.GlobalApplicationResources().Merge(rd);
             return null;
         }
+        ResourceDictionary.PushAmbient(fallbackResources);
         DependencyObject obj = BuildObjectNode(root, ctx, null);
+        ResourceDictionary.PopAmbient(fallbackResources);
         UIElement el = obj as UIElement;
         if (el == null) { return null; }
         if (fallbackResources != null && el.AmbientResources == null) {
@@ -1249,6 +1266,8 @@ public static class XamlReader {
         if (localName == "Polygon") { return new Polygon(); }
         if (localName == "Polyline") { return new Polyline(); }
         if (localName == "CustomDrawElement") { return new CustomDrawElement(); }
+        if (localName == "RiveControl") { return new RiveControl(); }
+        if (localName == "RiveInput") { return new RiveInput(); }
         return null;
     }
 
@@ -1378,22 +1397,41 @@ public static class XamlReader {
         }
 
         var textBlockInlines = new Inline[0];
+        var textBlockSpaced = new bool[0];
         bool isTb = el is TextBlock;
-        if (isTb && node.Text.Length > 0 && node.Children.Length > 0) {
-            textBlockInlines.Push(new Run(node.Text));
-        }
+        bool hasRealInlineTag = false;
+        bool pendingInlineWs = false;
 
         for (int i = 0; i < node.Children.Length; i += 1) {
             XamlXmlNode ch = node.Children[i];
             if (XamlStr.EndsWith(ch.LocalName, ".Resources")) { continue; }
+            if (isTb && ch.LocalName == "#ws") {
+                pendingInlineWs = true;
+                continue;
+            }
+            if (isTb && ch.LocalName == "#text") {
+                if (ch.Text.Length > 0) {
+                    textBlockInlines.Push(new Run(ch.Text));
+                    textBlockSpaced.Push(pendingInlineWs);
+                }
+                pendingInlineWs = false;
+                continue;
+            }
             if (ch.RawName.Contains(".")) {
                 ApplyPropertyElement(el, ch, ctx);
                 continue;
             }
             if (isTb && (ch.LocalName == "Run" || ch.LocalName == "LineBreak" ||
                 ch.LocalName == "Bold" || ch.LocalName == "Italic" ||
-                ch.LocalName == "Underline" || ch.LocalName == "Span")) {
+                ch.LocalName == "Underline" || ch.LocalName == "Span" ||
+                ch.LocalName == "Hyperlink")) {
+                hasRealInlineTag = true;
+                int beforeLen = textBlockInlines.Length;
                 AppendInlineNode(ch, textBlockInlines, el as TextBlock, ctx);
+                for (int k = beforeLen; k < textBlockInlines.Length; k += 1) {
+                    textBlockSpaced.Push(k == beforeLen ? pendingInlineWs : false);
+                }
+                pendingInlineWs = false;
                 continue;
             }
             DependencyObject childObj = BuildObjectNode(ch, ctx, el);
@@ -1402,9 +1440,18 @@ public static class XamlReader {
 
         if (isTb) {
             TextBlock tb = el as TextBlock;
-            if (textBlockInlines.Length > 0) {
+            if (hasRealInlineTag && textBlockInlines.Length > 0) {
                 for (int i = 0; i < textBlockInlines.Length; i += 1) {
-                    tb.AddInline(textBlockInlines[i]);
+                    Inline inl = textBlockInlines[i];
+                    if (inl is Run) {
+                        if (i < textBlockSpaced.Length && textBlockSpaced[i]) {
+                            tb.AddRunSpaced(inl as Run);
+                        } else {
+                            tb.AddRun(inl as Run);
+                        }
+                    } else {
+                        tb.AddInline(inl);
+                    }
                 }
             } else if (node.Text.Length > 0 && tb.Text.Length == 0 && node.GetAttr("Text") == null && node.GetAttr("noesis:RichText.Text") == null) {
                 tb.Text = node.Text.Trim();
@@ -1427,6 +1474,10 @@ public static class XamlReader {
 
     private static void AttachChildObject(UIElement parent, DependencyObject childObj) {
         if (parent == null || childObj == null) { return; }
+        if (parent is RiveControl && childObj is RiveInput) {
+            (parent as RiveControl).AddInput(childObj as RiveInput);
+            return;
+        }
         UIElement childEl = childObj as UIElement;
         if (parent is ItemsControl) {
             (parent as ItemsControl).AddItemBox(childObj);
@@ -1464,6 +1515,11 @@ public static class XamlReader {
         if (tag == "Bold") { run.FontWeight = "Bold"; }
         else if (tag == "Italic") { run.FontStyle = "Italic"; }
         else if (tag == "Underline") { run.Decorations = 1; }
+        else if (tag == "Hyperlink") {
+            DependencyObject hlBox = ResolveMarkupValue("{DynamicResource Brush.Hyperlink.Normal}", ctx, ownerTb);
+            Brush hlBrush = UIElement.CoerceBrush(hlBox);
+            run.Foreground = hlBrush != null ? hlBrush : new SolidColorBrush("#FF1098DF");
+        }
 
         for (int i = 0; i < node.Attrs.Length; i += 1) {
             XamlXmlAttr a = node.Attrs[i];
@@ -1495,6 +1551,14 @@ public static class XamlReader {
         }
         for (int i = 0; i < node.Children.Length; i += 1) {
             AppendInlineNode(node.Children[i], list, ownerTb, ctx);
+        }
+    }
+
+    private static void BindPlasmaAttrIfExt(UIElement el, string targetProp, string attrVal, XamlBuildContext ctx) {
+        if (el == null || attrVal == null || !XamlStr.LooksLikeMarkupExtension(attrVal)) { return; }
+        string kind = XamlStr.ExtractExtType(attrVal);
+        if (kind == "Binding" || kind == "TemplateBinding") {
+            BindElementFromSpec(el, targetProp, ParseBindingSpec(attrVal, ctx), ctx);
         }
     }
 
@@ -1642,6 +1706,13 @@ public static class XamlReader {
             }
             return;
         }
+        if (propName == "Inputs" && el is RiveControl) {
+            for (int i = 0; i < propNode.Children.Length; i += 1) {
+                DependencyObject ch = BuildObjectNode(propNode.Children[i], ctx, el);
+                if (ch is RiveInput) { (el as RiveControl).AddInput(ch as RiveInput); }
+            }
+            return;
+        }
         if (propNode.Children.Length == 1) {
             XamlXmlNode childXml = propNode.Children[0];
             DependencyObject valBox = BuildObjectNode(childXml, ctx, el);
@@ -1652,6 +1723,26 @@ public static class XamlReader {
                     string cKind = XamlStr.ExtractExtType(colAttr);
                     if (cKind == "Binding" || cKind == "TemplateBinding") {
                         BindElementFromSpec(el, propName + ".Color", ParseBindingSpec(colAttr, ctx), ctx);
+                    }
+                }
+            } else if (childXml.LocalName == "ImageBrush" && (propName == "Fill" || propName == "Background")) {
+                string srcAttr = childXml.GetAttr("ImageSource");
+                if (srcAttr != null && XamlStr.LooksLikeMarkupExtension(srcAttr)) {
+                    string sKind = XamlStr.ExtractExtType(srcAttr);
+                    if (sKind == "Binding" || sKind == "TemplateBinding") {
+                        BindElementFromSpec(el, propName + ".ImageSource", ParseBindingSpec(srcAttr, ctx), ctx);
+                    }
+                }
+                for (int si = 0; si < childXml.Children.Length; si += 1) {
+                    XamlXmlNode shProp = childXml.Children[si];
+                    if (XamlStr.EndsWith(shProp.LocalName, ".Shader") && shProp.Children.Length > 0 &&
+                        shProp.Children[0].LocalName == "PlasmaBrush") {
+                        XamlXmlNode sh = shProp.Children[0];
+                        BindPlasmaAttrIfExt(el, propName + ".PlasmaSeed", sh.GetAttr("Seed"), ctx);
+                        BindPlasmaAttrIfExt(el, propName + ".PlasmaColor", sh.GetAttr("Color"), ctx);
+                        BindPlasmaAttrIfExt(el, propName + ".PlasmaTime", sh.GetAttr("Time"), ctx);
+                        BindPlasmaAttrIfExt(el, propName + ".PlasmaScaleX", sh.GetAttr("ScaleX"), ctx);
+                        BindPlasmaAttrIfExt(el, propName + ".PlasmaScaleY", sh.GetAttr("ScaleY"), ctx);
                     }
                 }
             }
@@ -1753,6 +1844,8 @@ public static class XamlReader {
             } else {
                 col = colAttr.Trim();
             }
+        } else if (node.Text != null && node.Text.Trim().Length > 0) {
+            col = node.Text.Trim();
         } else {
             col = "#FF000000";
         }
@@ -1841,11 +1934,50 @@ public static class XamlReader {
                 if (XamlStr.EndsWith(ch.LocalName, ".Shader") && ch.Children.Length > 0) {
                     string shaderKind = ch.Children[0].LocalName;
                     if (shaderKind == "PlasmaBrush") {
-                        var lg = new LinearGradientBrush(0.0f, 0.0f, 1.0f, 1.0f);
-                        lg.AddStop("#FFFF2E93", 0.0f);
-                        lg.AddStop("#FF7C3AED", 0.5f);
-                        lg.AddStop("#FF06B6D4", 1.0f);
-                        return lg;
+                        XamlXmlNode sh = ch.Children[0];
+                        float sx = ParseUtil.ParseFloat(sh.GetAttr("ScaleX"), 64.0f);
+                        float sy = ParseUtil.ParseFloat(sh.GetAttr("ScaleY"), 64.0f);
+                        float tm = ParseUtil.ParseFloat(sh.GetAttr("Time"), 0.0f);
+                        string seedAttr = sh.GetAttr("Seed");
+                        float seed = (seedAttr != null && !XamlStr.LooksLikeMarkupExtension(seedAttr))
+                            ? ParseUtil.ParseFloat(seedAttr, 100.0f) : 100.0f;
+                        string colAttr = sh.GetAttr("Color");
+                        string col = "#FF01BCFF";
+                        if (colAttr != null && colAttr.Length > 0 && !XamlStr.LooksLikeMarkupExtension(colAttr)) {
+                            col = ParseUtil.FormatArgbHex(ParseUtil.ParseColor(colAttr));
+                        }
+                        float vw = 300.0f;
+                        float vh = 90.0f;
+                        string vpAttr = node.GetAttr("Viewport");
+                        if (vpAttr != null && vpAttr.Trim().Length > 0) {
+                            string[] parts = vpAttr.Trim().Replace(",", " ").Split(" ");
+                            var nums = new float[0];
+                            for (int p = 0; p < parts.Length; p += 1) {
+                                string pt = parts[p].Trim();
+                                if (pt.Length > 0) { nums.Push(ParseUtil.ParseFloat(pt, 0.0f)); }
+                            }
+                            if (nums.Length >= 4) {
+                                vw = nums[2];
+                                vh = nums[3];
+                            }
+                        }
+                        var pib = new ImageBrush("shader://plasma");
+                        string pst = node.GetAttr("Stretch");
+                        if (pst != null) {
+                            string sl = pst.Trim();
+                            if (sl == "None") { pib.Stretch = Stretch.None; }
+                            else if (sl == "Fill") { pib.Stretch = Stretch.Fill; }
+                            else if (sl == "UniformToFill") { pib.Stretch = Stretch.UniformToFill; }
+                            else { pib.Stretch = Stretch.Uniform; }
+                        }
+                        string ptm = node.GetAttr("TileMode");
+                        if (ptm != null && ptm.Trim().Length > 0) { pib.TileMode = ptm.Trim(); }
+                        string pvb = node.GetAttr("Viewbox");
+                        if (pvb != null) { pib.Viewbox = pvb; }
+                        string pop = node.GetAttr("Opacity");
+                        if (pop != null) { pib.Opacity = ParseUtil.ParseFloat(pop, 1.0f); }
+                        pib.EnablePlasmaShader(sx, sy, tm, seed, col, vw, vh);
+                        return pib;
                     }
                     if (shaderKind == "ConicGradientBrush") {
                         var lg = new LinearGradientBrush(0.0f, 0.5f, 1.0f, 0.5f);
@@ -1871,6 +2003,8 @@ public static class XamlReader {
             else if (sl == "UniformToFill") { ib.Stretch = Stretch.UniformToFill; }
             else { ib.Stretch = Stretch.Uniform; }
         }
+        string tmMode = node.GetAttr("TileMode");
+        if (tmMode != null && tmMode.Trim().Length > 0) { ib.TileMode = tmMode.Trim(); }
         string vb = node.GetAttr("Viewbox");
         if (vb != null) { ib.Viewbox = vb; }
         string op = node.GetAttr("Opacity");
@@ -1973,8 +2107,29 @@ public static class XamlReader {
     }
 
     // ---- Styles, Setters, Triggers, Templates ----
+    private static string NormalizeSetterProp(string rawProp) {
+        string p = XamlStr.StripOuterParens(rawProp);
+        int dot = XamlStr.FindFrom(p, ".", 0);
+        if (dot > 0 && dot + 1 < p.Length) {
+            string owner = p.Substring(0, dot);
+            if (owner != "Grid" && owner != "Canvas" && owner != "DockPanel" &&
+                owner != "ScrollViewer" && owner != "ToolTipService" &&
+                owner != "RenderOptions" && owner != "TextOptions" &&
+                owner != "VirtualizingStackPanel" && owner != "RiveControl" &&
+                owner != "Storyboard" && owner != "Loc" &&
+                owner != "Background" && owner != "Foreground" && owner != "BorderBrush" &&
+                owner != "Fill" && owner != "Stroke" &&
+                owner != "RenderTransform" && owner != "LayoutTransform" &&
+                owner != "Effect" && owner != "Data" && owner != "OpacityMask" &&
+                !owner.Contains(":")) {
+                return p.Substring(dot + 1);
+            }
+        }
+        return p;
+    }
+
     private static Setter BuildSetterNode(XamlXmlNode node, XamlBuildContext ctx) {
-        string prop = XamlStr.StripOuterParens(node.GetAttr("Property"));
+        string prop = NormalizeSetterProp(node.GetAttr("Property"));
         if (prop.Length == 0) { return null; }
         string targetName = node.GetAttr("TargetName");
         if (targetName == null) { targetName = ""; }
@@ -2024,7 +2179,7 @@ public static class XamlReader {
         TriggerBase trig = null;
 
         if (tag == "Trigger") {
-            string prop = XamlStr.StripOuterParens(node.GetAttr("Property"));
+            string prop = NormalizeSetterProp(node.GetAttr("Property"));
             string val = node.GetAttr("Value");
             string srcName = node.GetAttr("SourceName");
             DependencyObject valBox = val != null
@@ -2062,7 +2217,7 @@ public static class XamlReader {
                                 ? (XamlStr.LooksLikeMarkupExtension(cv) ? ResolveMarkupValue(cv, ctx, null) : DependencyObject.BoxString(cv))
                                 : DependencyObject.BoxBool(true);
                             if (isPropertyMulti) {
-                                string cp = XamlStr.StripOuterParens(cond.GetAttr("Property"));
+                                string cp = NormalizeSetterProp(cond.GetAttr("Property"));
                                 string sn = cond.GetAttr("SourceName");
                                 mdt.AddCondition(cp, cvBox, sn == null ? "" : sn, "Self", "");
                             } else {

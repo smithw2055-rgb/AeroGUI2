@@ -228,6 +228,7 @@ public enum VisualAnimProp {
     StrokeStop2Offset = 51,
     StrokeStop3Offset = 52,
     FgBrushOpacity = 53,
+    ManagedCustom = 54,
 }
 
 public enum EasingFunctionKind {
@@ -587,6 +588,8 @@ public static class EnumConvert {
             case VisualAnimProp.StrokeStop1Offset: return 50;
             case VisualAnimProp.StrokeStop2Offset: return 51;
             case VisualAnimProp.StrokeStop3Offset: return 52;
+            case VisualAnimProp.FgBrushOpacity: return 53;
+            case VisualAnimProp.ManagedCustom: return 54;
         }
         return 0;
     }
@@ -707,6 +710,7 @@ public static class EnumConvert {
             case 51: return VisualAnimProp.StrokeStop2Offset;
             case 52: return VisualAnimProp.StrokeStop3Offset;
             case 53: return VisualAnimProp.FgBrushOpacity;
+            case 54: return VisualAnimProp.ManagedCustom;
         }
         return VisualAnimProp.Opacity;
     }
@@ -2044,13 +2048,78 @@ public class SaturationEffect : Effect {
 public class ImageBrush : Brush {
     public string ImageSource { get; set; } = "";
     public Stretch Stretch { get; set; } = Stretch.Uniform;
+    public string TileMode { get; set; } = "None";
     public string Viewbox { get; set; } = "0,0,1,1";
     public uint TintRgba { get; set; } = 0u;
+    public bool IsPlasmaShader { get; set; } = false;
+    private float _plasmaScaleX = 64.0f;
+    private float _plasmaScaleY = 64.0f;
+    private float _plasmaTime = 0.0f;
+    private float _plasmaSeed = 100.0f;
+    private string _plasmaColor = "#FF01BCFF";
+    private float _plasmaVw = 300.0f;
+    private float _plasmaVh = 90.0f;
 
     public ImageBrush() { TintRgba = ParseUtil.PackArgb(48u, 32u, 56u, 96u); }
     public ImageBrush(string source) {
         ImageSource = source == null ? "" : source;
         TintRgba = ParseUtil.PackArgb(48u, 32u, 56u, 96u);
+    }
+
+    public void EnablePlasmaShader(float sx, float sy, float timeSec, float seed, string colorHex, float vw, float vh) {
+        IsPlasmaShader = true;
+        _plasmaScaleX = sx;
+        _plasmaScaleY = sy;
+        _plasmaTime = timeSec;
+        _plasmaSeed = seed;
+        _plasmaColor = (colorHex == null || colorHex.Length == 0) ? "#FF01BCFF" : colorHex;
+        _plasmaVw = vw > 1.0f ? vw : 300.0f;
+        _plasmaVh = vh > 1.0f ? vh : 90.0f;
+        RebuildPlasmaUri();
+    }
+
+    public float PlasmaScaleX { get { return _plasmaScaleX; } set { _plasmaScaleX = value; RebuildPlasmaUri(); } }
+    public float PlasmaScaleY { get { return _plasmaScaleY; } set { _plasmaScaleY = value; RebuildPlasmaUri(); } }
+    public float PlasmaTime {
+        get { return _plasmaTime; }
+        set {
+            if (Math.Absf(value - _plasmaTime) >= 0.004f) {
+                _plasmaTime = value;
+                RebuildPlasmaUri();
+            }
+        }
+    }
+    public float PlasmaSeed { get { return _plasmaSeed; } set { _plasmaSeed = value; RebuildPlasmaUri(); } }
+    public string PlasmaColor {
+        get { return _plasmaColor; }
+        set {
+            string next = (value == null || value.Length == 0) ? "#FF01BCFF" : value;
+            if (_plasmaColor != next) { _plasmaColor = next; RebuildPlasmaUri(); }
+        }
+    }
+
+    private void RebuildPlasmaUri() {
+        if (!IsPlasmaShader) { return; }
+        ImageSource = "shader://plasma?sx=" + _plasmaScaleX +
+                      "&sy=" + _plasmaScaleY +
+                      "&seed=" + _plasmaSeed +
+                      "&time=" + _plasmaTime +
+                      "&color=" + _plasmaColor +
+                      "&vw=" + _plasmaVw +
+                      "&vh=" + _plasmaVh;
+    }
+
+    public ImageBrush CloneImageBrush() {
+        var c = new ImageBrush(ImageSource);
+        c.Stretch = Stretch;
+        c.TileMode = TileMode;
+        c.Viewbox = Viewbox;
+        c.TintRgba = TintRgba;
+        c.Opacity = Opacity;
+        if (IsPlasmaShader) {
+            c.EnablePlasmaShader(_plasmaScaleX, _plasmaScaleY, _plasmaTime, _plasmaSeed, _plasmaColor, _plasmaVw, _plasmaVh);
+        }
+        return c;
     }
 
     public override uint ResolveRgba() { return TintRgba; }
@@ -2203,6 +2272,7 @@ public partial class UIElement : DependencyObject {
     private Brush _background;
     private float _bgOpacity = 1.0f;
     private bool _ownsClonedBgGrad = false;
+    private bool _ownsClonedBgBrush = false;
     private Brush _borderBrush;
     private Thickness _borderThickness;
     private CornerRadius _cornerRadius;
@@ -2222,6 +2292,7 @@ public partial class UIElement : DependencyObject {
     private ResourceDictionary _locResources;
     private string _locSource = "";
     private string _flowDirection = "LeftToRight";
+    private bool _hasExplicitFlowDirection = false;
     private Style _appliedStyle;
     internal bool _isDisposedTree = false;
     private string[] _dynPropKeys;
@@ -2523,6 +2594,24 @@ public partial class UIElement : DependencyObject {
         _dynResProps.Push(propName);
         _dynResKeys.Push(resourceKey);
         ApplyDynamicResourceAt(_dynResProps.Length - 1);
+    }
+
+    public string GetResourceReferenceKey(string propName) {
+        if (propName == null || _dynResProps == null) { return ""; }
+        for (int i = 0; i < _dynResProps.Length; i += 1) {
+            if (_dynResProps[i] == propName) { return _dynResKeys[i]; }
+        }
+        return "";
+    }
+
+    public void ClearResourceReference(string propName) {
+        if (propName == null || _dynResProps == null) { return; }
+        for (int i = _dynResProps.Length - 1; i >= 0; i -= 1) {
+            if (_dynResProps[i] == propName) {
+                _dynResProps.RemoveAt(i);
+                _dynResKeys.RemoveAt(i);
+            }
+        }
     }
 
     private void ApplyDynamicResourceAt(int idx) {
@@ -3024,6 +3113,7 @@ public partial class UIElement : DependencyObject {
         set {
             _background = value;
             _ownsClonedBgGrad = false;
+            _ownsClonedBgBrush = false;
             _bgOpacity = value != null ? Math.Clampf(value.Opacity, 0.0f, 1.0f) : 1.0f;
             OnBoxAppearanceChanged();
             NotifyBoundPropertyChanged("Background", _background);
@@ -3072,9 +3162,38 @@ public partial class UIElement : DependencyObject {
     protected virtual void SyncPadding() {
         if (_hasNative) { Visual_SetPadding(__nativeHandle, _padding.Left, _padding.Top, _padding.Right, _padding.Bottom); }
     }
+    public string EffectiveFlowDirection() {
+        UIElement cur = this;
+        int guard = 0;
+        while (cur != null && guard < 256) {
+            guard += 1;
+            if (cur._hasExplicitFlowDirection) { return cur._flowDirection; }
+            cur = cur.Parent;
+        }
+        return _flowDirection;
+    }
+
+    public string FlowDirection {
+        get { return EffectiveFlowDirection(); }
+        set {
+            string fd = (value == null || value.Trim().Length == 0) ? "LeftToRight" : value.Trim();
+            _hasExplicitFlowDirection = true;
+            if (_flowDirection != fd) {
+                _flowDirection = fd;
+            }
+            SyncAlignment();
+            UpdateLayout();
+        }
+    }
+
     protected void SyncAlignment() {
         if (_hasNative) {
-            Visual_SetAlignment(__nativeHandle, EnumConvert.ToInt(_hAlign), EnumConvert.ToInt(_vAlign));
+            int hEnc = EnumConvert.ToInt(_hAlign);
+            if (_hasExplicitFlowDirection) {
+                hEnc = hEnc + 256;
+                if (_flowDirection == "RightToLeft") { hEnc = hEnc + 512; }
+            }
+            Visual_SetAlignment(__nativeHandle, hEnc, EnumConvert.ToInt(_vAlign));
         }
     }
     protected void SyncInteractiveFlags() {
@@ -3184,6 +3303,7 @@ public partial class UIElement : DependencyObject {
     internal static void ClearImageBrushFromNative(handle h) {
         Visual_SetImage(h, "", 0, 2, 4294967295u);
         Visual_SetImageViewbox(h, 0.0f, 0.0f, 1.0f, 1.0f);
+        Visual_SetImageTile(h, false);
     }
 
     protected virtual void SyncBoxStyleToNative() {
@@ -3202,6 +3322,7 @@ public partial class UIElement : DependencyObject {
                 EnumConvert.ToInt(StretchDirection.Both),
                 tint);
             ApplyImageBrushViewbox(__nativeHandle, ib.Viewbox);
+            Visual_SetImageTile(__nativeHandle, ib.TileMode == "Tile");
             _hadBgImage = true;
         } else {
             if (_hadBgImage) {
@@ -3451,6 +3572,7 @@ public partial class UIElement : DependencyObject {
             if (cur == null || cur._isDisposedTree) { continue; }
             cur._isDisposedTree = true;
             cur._ownBindingsBox = null;
+            cur._stateInvalidatedHooks = null;
             if (cur._children != null) {
                 for (int i = 0; i < cur._children.Length; i += 1) {
                     q.Push(cur._children[i]);
@@ -3543,49 +3665,58 @@ public partial class UIElement : DependencyObject {
     }
 
     protected DependencyObject TryFindLocalResourceBox(string key) {
-        if (key == null || key.Length == 0 || _resources == null || !_resources.Contains(key)) { return null; }
-        return _resources.GetBox(key);
+        return _resources != null ? _resources.TryGetLocalBox(key) : null;
     }
 
     protected virtual DependencyObject TryFindTemplateScopedResourceBox(string key) { return null; }
+    protected virtual DependencyObject TryFindTemplateAmbientResourceBox(string key) { return null; }
 
     public virtual DependencyObject FindResourceBox(string key) {
         if (key == null || key.Length == 0) { return null; }
+        DependencyObject firstAmb = null;
         UIElement cur = this;
         while (cur != null) {
-            if (cur._locResources != null && cur._locResources.Contains(key)) {
-                return cur._locResources.GetBox(key);
+            if (cur._locResources != null) {
+                DependencyObject locB = cur._locResources.TryGetLocalBox(key);
+                if (locB != null) { return locB; }
             }
-            if (cur._resources != null && cur._resources.Contains(key)) {
-                return cur._resources.GetBox(key);
+            if (cur._resources != null) {
+                DependencyObject resB = cur._resources.TryGetLocalBox(key);
+                if (resB != null) { return resB; }
             }
             DependencyObject tplScoped = cur.TryFindTemplateScopedResourceBox(key);
-            if (tplScoped != null) {
-                return tplScoped;
-            }
-            if (cur._ambientResources != null && cur._ambientResources.Contains(key)) {
-                return cur._ambientResources.GetBox(key);
+            if (tplScoped != null) { return tplScoped; }
+            if (firstAmb == null) {
+                firstAmb = cur.TryFindTemplateAmbientResourceBox(key);
+                if (firstAmb == null && cur._ambientResources != null) {
+                    firstAmb = cur._ambientResources.TryGetLocalBox(key);
+                }
             }
             cur = cur._parent;
         }
         UIElement tp = _templatedParent;
         while (tp != null) {
+            if (tp._locResources != null) {
+                DependencyObject tpLoc = tp._locResources.TryGetLocalBox(key);
+                if (tpLoc != null) { return tpLoc; }
+            }
             DependencyObject tpLocal = tp.TryFindLocalResourceBox(key);
             if (tpLocal != null) { return tpLocal; }
             DependencyObject tpScoped = tp.TryFindTemplateScopedResourceBox(key);
             if (tpScoped != null) { return tpScoped; }
-            if (tp._ambientResources != null && tp._ambientResources.Contains(key)) {
-                return tp._ambientResources.GetBox(key);
+            if (firstAmb == null) {
+                firstAmb = tp.TryFindTemplateAmbientResourceBox(key);
+                if (firstAmb == null && tp._ambientResources != null) {
+                    firstAmb = tp._ambientResources.TryGetLocalBox(key);
+                }
             }
             tp = tp._parent != null ? tp._parent : tp._templatedParent;
         }
+        if (firstAmb != null) { return firstAmb; }
         DependencyObject ambient = ResourceDictionary.FindAmbientBox(key);
         if (ambient != null) { return ambient; }
         ResourceDictionary appRes = ResourceDictionary.GlobalApplicationResources();
-        if (appRes != null && appRes.Contains(key)) {
-            return appRes.GetBox(key);
-        }
-        return null;
+        return appRes != null ? appRes.TryGetLocalBox(key) : null;
     }
 
     public object FindResource(string key) {
@@ -3925,11 +4056,33 @@ public partial class UIElement : DependencyObject {
         if (propName == "Background.ImageSource") {
             if (_background is ImageBrush) {
                 ImageBrush ib = _background as ImageBrush;
+                if (!_ownsClonedBgBrush) {
+                    ib = ib.CloneImageBrush();
+                    _background = ib;
+                    _ownsClonedBgBrush = true;
+                }
                 ib.ImageSource = DependencyObject.UnboxString(value, "");
                 OnBoxAppearanceChanged();
                 return true;
             }
             return false;
+        }
+        if ((propName == "Background.PlasmaSeed" || propName == "Background.PlasmaColor" ||
+             propName == "Background.PlasmaTime" || propName == "Background.PlasmaScaleX" ||
+             propName == "Background.PlasmaScaleY") && _background is ImageBrush) {
+            ImageBrush ib = _background as ImageBrush;
+            if (!_ownsClonedBgBrush) {
+                ib = ib.CloneImageBrush();
+                _background = ib;
+                _ownsClonedBgBrush = true;
+            }
+            if (propName == "Background.PlasmaSeed") { ib.PlasmaSeed = DependencyObject.UnboxFloat(value, 100.0f); }
+            else if (propName == "Background.PlasmaColor") { ib.PlasmaColor = DependencyObject.UnboxString(value, "#FF01BCFF"); }
+            else if (propName == "Background.PlasmaTime") { ib.PlasmaTime = DependencyObject.UnboxFloat(value, 0.0f); }
+            else if (propName == "Background.PlasmaScaleX") { ib.PlasmaScaleX = DependencyObject.UnboxFloat(value, 64.0f); }
+            else if (propName == "Background.PlasmaScaleY") { ib.PlasmaScaleY = DependencyObject.UnboxFloat(value, 64.0f); }
+            OnBoxAppearanceChanged();
+            return true;
         }
         if (propName.Length > 5 && propName.Substring(0, 5) == "Fill.") {
             string suffix = propName.Substring(5);
@@ -4013,6 +4166,7 @@ public partial class UIElement : DependencyObject {
             if (!same) {
                 _tag = value;
                 NotifyBoundPropertyChanged("Tag", _tag);
+                UpdateTriggersAndStates();
             }
             return true;
         }
@@ -4078,9 +4232,8 @@ public partial class UIElement : DependencyObject {
         }
         if (propName == "FlowDirection") {
             string fd = DependencyObject.UnboxString(value, "LeftToRight").Trim();
-            if (fd.Length > 0 && fd != _flowDirection) {
-                _flowDirection = fd;
-                UpdateLayout();
+            if (fd.Length > 0) {
+                FlowDirection = fd;
             }
             return true;
         }
@@ -4174,6 +4327,21 @@ public partial class UIElement : DependencyObject {
         }
         if (propName == "Background.ImageSource" && _background is ImageBrush) {
             return DependencyObject.BoxString((_background as ImageBrush).ImageSource);
+        }
+        if (propName == "Background.PlasmaSeed" && _background is ImageBrush) {
+            return DependencyObject.BoxFloat((_background as ImageBrush).PlasmaSeed);
+        }
+        if (propName == "Background.PlasmaColor" && _background is ImageBrush) {
+            return DependencyObject.BoxString((_background as ImageBrush).PlasmaColor);
+        }
+        if (propName == "Background.PlasmaTime" && _background is ImageBrush) {
+            return DependencyObject.BoxFloat((_background as ImageBrush).PlasmaTime);
+        }
+        if (propName == "Background.PlasmaScaleX" && _background is ImageBrush) {
+            return DependencyObject.BoxFloat((_background as ImageBrush).PlasmaScaleX);
+        }
+        if (propName == "Background.PlasmaScaleY" && _background is ImageBrush) {
+            return DependencyObject.BoxFloat((_background as ImageBrush).PlasmaScaleY);
         }
         if (propName.Length > 5 && propName.Substring(0, 5) == "Fill.") {
             string suffix = propName.Substring(5);
@@ -4288,6 +4456,10 @@ public partial class UIElement : DependencyObject {
     internal void SetPressedState(bool pressed) {
         if (_isPressed == pressed) { return; }
         _isPressed = pressed;
+        UpdateTriggersAndStates();
+    }
+
+    internal void RefreshTriggersAndStates() {
         UpdateTriggersAndStates();
     }
 

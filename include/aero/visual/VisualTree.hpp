@@ -234,6 +234,7 @@ struct VisualImageData {
     float viewboxY = 0.0f;
     float viewboxW = 1.0f;
     float viewboxH = 1.0f;
+    bool tileWrap = false;
 };
 
 struct VisualVectorData {
@@ -273,6 +274,9 @@ struct VisualLayoutData {
     bool isEnabled = true;
     bool isHitTestVisible = true;
     bool isFocusable = false;
+    bool hasExplicitFlowDirection = false;
+    bool explicitRtl = false;
+    bool effectiveRtl = false;
 
     LayoutMode layoutMode = LayoutMode::Manual;
     float layoutParam0 = 0.0f;
@@ -303,6 +307,8 @@ struct VisualLayoutData {
     bool hasPerspective3D = false;
     bool hasValidMeasure = false;
     bool hasValidArrange = false;
+    bool lastMeasureInnerInfW = false;
+    bool lastMeasureInnerInfH = false;
     Size lastMeasureConstraint{
         std::numeric_limits<float>::quiet_NaN(),
         std::numeric_limits<float>::quiet_NaN()};
@@ -602,6 +608,7 @@ public:
         float vy,
         float vw,
         float vh) noexcept;
+    bool SetImageTileMode(VisualNodeId id, bool tileWrap) noexcept;
     bool SetVectorShape(
         VisualNodeId id,
         VectorShapeKind shapeKind,

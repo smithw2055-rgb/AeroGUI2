@@ -2118,21 +2118,40 @@ void ExecuteBackdropBlurSpan(
         my0 = std::max(my0, gRasterBandY0);
         my1 = std::min(my1, gRasterBandY1);
     }
-    const float screenScale = std::max(1.0f, 0.5f * (mr.width / std::max(1.0f, maskEntry ? maskEntry->boundsW : mr.width) +
-                                                     mr.height / std::max(1.0f, maskEntry ? maskEntry->boundsH : mr.height)));
+    float cellW = 1.0f, cellH = 1.0f, cellBoxX0 = 0.0f, cellBoxY0 = 0.0f, scaledW = 1.0f, scaledH = 1.0f;
+    float cellRenderedW = mr.width, cellRenderedH = mr.height;
+    if (maskEntry && maskEntry->cellWidth > 0u && maskEntry->cellHeight > 0u) {
+        cellW = static_cast<float>(maskEntry->cellWidth);
+        cellH = static_cast<float>(maskEntry->cellHeight);
+        const float safeRange = std::max(maskEntry->pxRange, 1.0f);
+        const float padTexels = std::ceil(safeRange) + 1.0f;
+        const float usableW = std::max(2.0f, cellW - 2.0f * padTexels);
+        const float usableH = std::max(2.0f, cellH - 2.0f * padTexels);
+        const float uniformScale = std::min(
+            usableW / std::max(1e-3f, maskEntry->boundsW),
+            usableH / std::max(1e-3f, maskEntry->boundsH));
+        scaledW = std::max(1e-3f, maskEntry->boundsW * uniformScale);
+        scaledH = std::max(1e-3f, maskEntry->boundsH * uniformScale);
+        cellBoxX0 = (cellW - scaledW) * 0.5f;
+        cellBoxY0 = (cellH - scaledH) * 0.5f;
+        cellRenderedW = mr.width * (cellW / scaledW);
+        cellRenderedH = mr.height * (cellH / scaledH);
+    }
     if (my1 > my0 && mx1 > mx0) {
         const int maskRows = my1 - my0;
         auto compositeBackdropFn = [&](int relY0, int relY1) {
             for (int ry = relY0; ry < relY1; ++ry) {
                 const int py = my0 + ry;
-                const float normY = ((static_cast<float>(py) + 0.5f) - mr.y) / std::max(1.0f, mr.height);
+                const float relY = ((static_cast<float>(py) + 0.5f) - mr.y) / std::max(1.0f, mr.height);
+                const float normY = (cellBoxY0 + relY * scaledH) / cellH;
                 const float* blurRow = bgLayer.premulRgba.data() +
                     static_cast<std::size_t>(py - by0) * static_cast<std::size_t>(bgLayer.width) * 4u;
                 for (int px = mx0; px < mx1; ++px) {
-                    const float normX = ((static_cast<float>(px) + 0.5f) - mr.x) / std::max(1.0f, mr.width);
+                    const float relX = ((static_cast<float>(px) + 0.5f) - mr.x) / std::max(1.0f, mr.width);
+                    const float normX = (cellBoxX0 + relX * scaledW) / cellW;
                     float cov = 1.0f;
                     if (maskEntry) {
-                        cov = EvaluateMtsdfCoverage(*maskEntry, normX, normY, screenScale, 0.0f, false);
+                        cov = EvaluateMtsdfCoverage(*maskEntry, normX, normY, cellRenderedW, cellRenderedH, false);
                     }
                     const float effMask = std::clamp(cov * span.maskOpacity, 0.0f, 1.0f);
                     if (effMask <= 0.002f) continue;
@@ -2770,18 +2789,40 @@ bool ZeroCopyGpuStream::ComputeBackdropBlurPatchPremulRgba8(
     const int pw = mx1 - mx0;
     const int ph = my1 - my0;
     outPremulRgba8.assign(static_cast<std::size_t>(pw) * static_cast<std::size_t>(ph) * 4u, 0u);
+    float cellW = 1.0f, cellH = 1.0f, cellBoxX0 = 0.0f, cellBoxY0 = 0.0f, scaledW = 1.0f, scaledH = 1.0f;
+    float cellRenderedW = mr.width, cellRenderedH = mr.height;
+    if (maskEntry && maskEntry->cellWidth > 0u && maskEntry->cellHeight > 0u) {
+        cellW = static_cast<float>(maskEntry->cellWidth);
+        cellH = static_cast<float>(maskEntry->cellHeight);
+        const float safeRange = std::max(maskEntry->pxRange, 1.0f);
+        const float padTexels = std::ceil(safeRange) + 1.0f;
+        const float usableW = std::max(2.0f, cellW - 2.0f * padTexels);
+        const float usableH = std::max(2.0f, cellH - 2.0f * padTexels);
+        const float uniformScale = std::min(
+            usableW / std::max(1e-3f, maskEntry->boundsW),
+            usableH / std::max(1e-3f, maskEntry->boundsH));
+        scaledW = std::max(1e-3f, maskEntry->boundsW * uniformScale);
+        scaledH = std::max(1e-3f, maskEntry->boundsH * uniformScale);
+        cellBoxX0 = (cellW - scaledW) * 0.5f;
+        cellBoxY0 = (cellH - scaledH) * 0.5f;
+        cellRenderedW = mr.width * (cellW / scaledW);
+        cellRenderedH = mr.height * (cellH / scaledH);
+    }
+    (void)screenScale;
     bool anyVisible = false;
     for (int py = my0; py < my1; ++py) {
-        const float normY = ((static_cast<float>(py) + 0.5f) - mr.y) / std::max(1.0f, mr.height);
+        const float relY = ((static_cast<float>(py) + 0.5f) - mr.y) / std::max(1.0f, mr.height);
+        const float normY = (cellBoxY0 + relY * scaledH) / cellH;
         const float* blurRow = bgLayer.premulRgba.data() +
             static_cast<std::size_t>(py - readY) * static_cast<std::size_t>(readW) * 4u;
         std::uint8_t* dstRow = outPremulRgba8.data() +
             static_cast<std::size_t>(py - my0) * static_cast<std::size_t>(pw) * 4u;
         for (int px = mx0; px < mx1; ++px) {
-            const float normX = ((static_cast<float>(px) + 0.5f) - mr.x) / std::max(1.0f, mr.width);
+            const float relX = ((static_cast<float>(px) + 0.5f) - mr.x) / std::max(1.0f, mr.width);
+            const float normX = (cellBoxX0 + relX * scaledW) / cellW;
             float cov = 1.0f;
             if (maskEntry) {
-                cov = EvaluateMtsdfCoverage(*maskEntry, normX, normY, screenScale, 0.0f, false);
+                cov = EvaluateMtsdfCoverage(*maskEntry, normX, normY, cellRenderedW, cellRenderedH, false);
             }
             const float effMask = std::clamp(cov * span.maskOpacity, 0.0f, 1.0f);
             if (effMask <= 0.002f) {

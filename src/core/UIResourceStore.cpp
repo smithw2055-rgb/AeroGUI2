@@ -381,6 +381,31 @@ bool UIResourceStore::StoreOrLookupPathMaskLocked(
     return true;
 }
 
+bool UIResourceStore::LookupCachedPathMask(
+    std::uint64_t key,
+    RasterizedPathMaskEntry& outEntry) noexcept {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (const auto it = pathMaskEntries_.find(key); it != pathMaskEntries_.end()) {
+        it->second.lastUsedTick = ++pathMaskAccessSeq_;
+        outEntry = it->second;
+        return true;
+    }
+    return false;
+}
+
+bool UIResourceStore::StoreCachedPathMask(
+    std::uint64_t key,
+    std::uint32_t texW,
+    std::uint32_t texH,
+    float u0,
+    float v0,
+    float u1,
+    float v1,
+    std::vector<std::uint8_t>&& rgba8,
+    RasterizedPathMaskEntry& outEntry) {
+    return StoreOrLookupPathMaskLocked(key, texW, texH, u0, v0, u1, v1, std::move(rgba8), outEntry);
+}
+
 bool UIResourceStore::GetOrRasterizePathMask(
     std::uint64_t pathHash,
     std::string_view pathData,

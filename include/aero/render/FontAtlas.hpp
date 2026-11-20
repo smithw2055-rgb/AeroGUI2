@@ -99,6 +99,10 @@ public:
     // Extracts quadratic Bezier + line segments for simple or recursive compound glyphs
     bool ExtractGlyphOutline(std::uint32_t glyphIndex, TtfGlyphOutline& outOutline) const;
 
+    [[nodiscard]] bool HasArabicGsub() const noexcept { return hasArabicGsub_; }
+    [[nodiscard]] std::uint32_t ApplyArabicGsubFeature(std::uint32_t tag4, std::uint32_t glyphId) const noexcept;
+    [[nodiscard]] std::uint32_t ApplyArabicGsubLigature(std::uint32_t firstGlyphId, std::uint32_t secondGlyphId) const noexcept;
+
 private:
     struct CmapFormat4Segment {
         std::uint16_t startCode = 0;
@@ -133,6 +137,24 @@ private:
     bool ParseNameTable(std::uint32_t offset, std::uint32_t length);
     bool ParseCmapTable(std::uint32_t offset, std::uint32_t length);
     void ParseKernTable(std::uint32_t offset, std::uint32_t length);
+    void ParseGsubTable(std::uint32_t offset, std::uint32_t length);
+
+    struct GsubSingleRule {
+        std::uint16_t fromGlyph = 0;
+        std::uint16_t toGlyph = 0;
+    };
+    struct GsubLigRule {
+        std::uint16_t firstGlyph = 0;
+        std::uint16_t secondGlyph = 0;
+        std::uint16_t ligGlyph = 0;
+    };
+    struct GsubFeatureRules {
+        std::uint32_t tag = 0;
+        std::vector<GsubSingleRule> singles;
+        std::vector<GsubLigRule> ligs;
+    };
+    std::vector<GsubFeatureRules> gsubFeatures_;
+    bool hasArabicGsub_ = false;
     [[nodiscard]] bool GetGlyphDataSpan(
         std::uint32_t glyphIndex,
         std::uint32_t& outOffset,
@@ -260,6 +282,7 @@ struct TextLayoutResult {
     float lineGap = 0.0f;
     float lineHeight = 0.0f;
     bool usedTrueTypeMetrics = false;
+    bool baseRtl = false;
     std::vector<TextLineMetrics> lines;
     std::vector<PositionedGlyph> glyphs;
 };
@@ -351,7 +374,8 @@ public:
         float charSpacing = 0.0f,
         int fontWeight = 400,
         bool fontItalic = false,
-        float explicitLineHeight = 0.0f);
+        float explicitLineHeight = 0.0f,
+        bool baseRtl = false);
 
     [[nodiscard]] TextLayoutResult MeasureRichLayout(
         const std::vector<RichTextRunInput>& runs,
@@ -362,7 +386,8 @@ public:
         float maxWidth = 1000000.0f,
         TextWrapping wrapMode = TextWrapping::NoWrap,
         float charSpacing = 0.0f,
-        float explicitLineHeight = 0.0f);
+        float explicitLineHeight = 0.0f,
+        bool baseRtl = false);
 
     // Bilinear normalized [0..1] SDF sample at UV coordinates (u, v) in [0..1]^2
     [[nodiscard]] float SampleSdfBilinear(float u, float v) const noexcept;
@@ -442,6 +467,10 @@ private:
         const std::vector<const RegisteredFontEntry*>& chain,
         std::uint32_t codePoint,
         const RegisteredFontEntry** outChosenEntry = nullptr);
+    FontAtlasGlyph EnsureGlyphByIndexLocked(
+        const RegisteredFontEntry& entry,
+        std::uint32_t glyphIndex,
+        std::uint32_t sourceCodePoint);
     [[nodiscard]] FontAtlasGlyph EnsureGlyphLocked(
         const RegisteredFontEntry* fontEntry,
         std::uint32_t codePoint);

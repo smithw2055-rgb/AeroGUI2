@@ -89,6 +89,21 @@ public:
     [[nodiscard]] const AxbMtsdfPathEntry* FindMtsdfPath(std::uint64_t pathHash) const noexcept;
     void ClearMtsdfPaths() noexcept;
 
+    [[nodiscard]] bool LookupCachedPathMask(
+        std::uint64_t key,
+        RasterizedPathMaskEntry& outEntry) noexcept;
+
+    [[nodiscard]] bool StoreCachedPathMask(
+        std::uint64_t key,
+        std::uint32_t texW,
+        std::uint32_t texH,
+        float u0,
+        float v0,
+        float u1,
+        float v1,
+        std::vector<std::uint8_t>&& rgba8,
+        RasterizedPathMaskEntry& outEntry);
+
     [[nodiscard]] bool GetOrRasterizePathMask(
         std::uint64_t pathHash,
         std::string_view pathData,

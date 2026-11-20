@@ -1503,6 +1503,76 @@ void TestPerspective3DPageVertexClipW() {
     }
 }
 
+void TestGridStarInsideExplicitWidthAndInfParent() {
+    auto store = std::make_shared<aero::UIResourceStore>();
+    aero::VisualWorld w(nullptr, store.get());
+    const aero::VisualNodeId root = w.CreateNode(aero::VisualKind::Box);
+    w.SetRoot(root);
+    w.SetLayoutMode(root, aero::LayoutMode::Stack, 0.0f, 0.0f, 1 /* Vertical */, 0);
+    w.SetSize(root, 800.0f, 600.0f);
+
+    const aero::VisualNodeId grid = w.CreateNode(aero::VisualKind::Box);
+    w.AddChild(root, grid);
+    w.SetLayoutMode(grid, aero::LayoutMode::Grid, 0.0f, 0.0f, 0, 0);
+    w.SetSize(grid, 300.0f, 120.0f);
+    w.SetAlignment(grid, aero::HorizontalAlignment::Left, aero::VerticalAlignment::Top);
+    w.GridClearDefs(grid);
+    w.GridAddRowDef(grid, aero::GridUnitType::Star, 1.0f);
+    w.GridAddColDef(grid, aero::GridUnitType::Star, 1.0f);
+    w.GridAddColDef(grid, aero::GridUnitType::Star, 2.0f);
+
+    const aero::VisualNodeId c0 = w.CreateNode(aero::VisualKind::Box);
+    w.AddChild(grid, c0);
+    w.SetGridCell(c0, 0, 0, 1, 1);
+
+    const aero::VisualNodeId c1 = w.CreateNode(aero::VisualKind::Box);
+    w.AddChild(grid, c1);
+    w.SetGridCell(c1, 0, 1, 1, 1);
+
+    w.UpdateLayout(800.0f, 600.0f);
+
+    const aero::VisualNode* n0 = w.GetNode(c0);
+    const aero::VisualNode* n1 = w.GetNode(c1);
+    CHECK(n0 != nullptr && n1 != nullptr);
+    if (n0 && n1) {
+        CHECK_NEAR(n0->layout.layoutRect.width, 100.0f, 0.5f);
+        CHECK_NEAR(n1->layout.layoutRect.width, 200.0f, 0.5f);
+        CHECK_NEAR(n1->layout.layoutRect.x, 100.0f, 0.5f);
+    }
+}
+
+void TestAnimationEngineManagedCustomAndDelayStart() {
+    aero::VisualWorld w;
+    const aero::VisualNodeId root = w.CreateNode(aero::VisualKind::Box);
+    w.SetRoot(root);
+
+    aero::VisualAnimationEngine engine;
+    const std::int32_t t1 = engine.StartFloat(
+        root, aero::VisualAnimProp::ManagedCustom, 0.0f, 10.0f, 0.2f,
+        aero::EasingFunctionKind::Linear, aero::EasingMode::EaseOut, 0.0f, false, 1);
+    const std::int32_t t2 = engine.StartColor(
+        root, aero::VisualAnimProp::ManagedCustom, 0xFF0000FFu, 0xFFFF0000u, 0.2f,
+        aero::EasingFunctionKind::Linear, aero::EasingMode::EaseOut, 0.1f, false, 1);
+    CHECK(t1 > 0 && t2 > 0 && t1 != t2);
+    CHECK(engine.HasTrack(t1) && engine.HasTrack(t2));
+    CHECK(engine.IsTrackStarted(t1));
+    CHECK(!engine.IsTrackStarted(t2));
+
+    (void)engine.Tick(0.05f, w);
+    CHECK(engine.HasTrack(t1) && engine.HasTrack(t2));
+    CHECK(!engine.IsTrackStarted(t2));
+    CHECK_NEAR(engine.ReadTrackFloat(t1, -1.0f), 2.5f, 0.1f);
+
+    (void)engine.Tick(0.10f, w);
+    CHECK(engine.HasTrack(t2));
+    CHECK(engine.IsTrackStarted(t2));
+    const std::uint32_t col = engine.ReadTrackColor(t2, 0u);
+    const std::uint32_t r = col & 0xFFu;
+    const std::uint32_t b = (col >> 16u) & 0xFFu;
+    CHECK(r > 40u && r < 220u);
+    CHECK(b > 40u && b < 220u);
+}
+
 } // namespace
 
 int main() {
@@ -1520,6 +1590,8 @@ int main() {
     TestImageAtlasConcurrentSamplingSafety();
     TestDeepHierarchyOver70Levels();
     TestPerspective3DPageVertexClipW();
+    TestGridStarInsideExplicitWidthAndInfParent();
+    TestAnimationEngineManagedCustomAndDelayStart();
 
     if (gFailureCount != 0) {
         std::fprintf(stderr, "microkernel_tests FAILED (%d checks failed)\n", gFailureCount);

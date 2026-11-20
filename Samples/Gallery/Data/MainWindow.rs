@@ -282,6 +282,7 @@ public partial class MainWindow : Window
     private string _activeThemeFg = "#FF18202A";
     private string _activeThemeBorder = "#FFD0D7DE";
     private string _activeAccent = "#FF1098DF";
+    private ResourceDictionary _sampleThemeResources = null;
 
     public MainWindow()
     {
@@ -290,12 +291,55 @@ public partial class MainWindow : Window
         this._lastLoadSucceeded = false;
         this.ViewModel = new ViewModel(this);
         this.DataContext = this.ViewModel;
+        this.DockSidebarWide();
+        this.ApplyTheme();
         BindingEngine.Flush();
+    }
+
+    private void DockSidebarWide()
+    {
+        if (this.SelectorExpanderButton != null)
+        {
+            this.SelectorExpanderButton.Visibility = Visibility.Collapsed;
+            this.SelectorExpanderButton.IsChecked = true;
+        }
+        if (this.SelectorExpanderButtonShadow != null)
+        {
+            this.SelectorExpanderButtonShadow.Visibility = Visibility.Collapsed;
+        }
+        if (this.SampleOffset != null)
+        {
+            this.SampleOffset.Width = 215.0f;
+        }
+        if (this.SampleOverlay != null)
+        {
+            this.SampleOverlay.Visibility = Visibility.Collapsed;
+        }
+        this.BeginStoryboard("ExpandSelectorInstant");
     }
 
     public void OnInitialized()
     {
         this.ApplyTheme();
+    }
+
+    public void SetUiScale(float scale)
+    {
+        if (this.LayoutRoot != null && scale > 0.1f)
+        {
+            this.LayoutRoot.LayoutTransform = new ScaleTransform(scale, scale);
+        }
+    }
+
+    public bool SetUiScalePercent(int pct)
+    {
+        if (this.LayoutRoot != null && pct > 10)
+        {
+            float s = (1.0f * pct) / 100.0f;
+            this.LayoutRoot.LayoutTransform = new ScaleTransform(s, s);
+            return true;
+        }
+        return false;
     }
 
     private string ExtractSampleName(string xamlUri)
@@ -337,7 +381,8 @@ public partial class MainWindow : Window
             return false;
         }
 
-        UIElement preview = XamlReader.LoadUri(xamlUri, this.Resources);
+        ResourceDictionary sampleRes = this._sampleThemeResources != null ? this._sampleThemeResources : this.Resources;
+        UIElement preview = XamlReader.LoadUri(xamlUri, sampleRes);
         bool loadedReal = (preview != null);
         if (preview == null)
         {
@@ -360,6 +405,7 @@ public partial class MainWindow : Window
             activeContainer.Visibility = Visibility.Visible;
             preview.ApplyTemplateSubtree();
             preview.RefreshDynamicResourcesRecursive();
+            BindingEngine.FlushSubtree(preview);
             BindingEngine.FlushSubtree(activeContainer);
             preview.EnsureLoadedSubtree();
         }
@@ -424,87 +470,67 @@ public partial class MainWindow : Window
         ResourceDictionary themeDict = XamlReader.LoadResourceDictionary("Theme/NoesisTheme." + safeColor + safeAccent + ".xaml");
         if (themeDict == null)
         {
+            themeDict = XamlReader.LoadResourceDictionary("NoesisTheme." + safeColor + safeAccent + ".xaml");
+        }
+        if (themeDict == null)
+        {
             themeDict = XamlReader.LoadResourceDictionary("Theme/NoesisTheme.Brushes." + safeColor + safeAccent + ".xaml");
         }
         if (themeDict == null)
         {
+            themeDict = XamlReader.LoadResourceDictionary("NoesisTheme.Brushes." + safeColor + safeAccent + ".xaml");
+        }
+        if (themeDict == null)
+        {
             themeDict = XamlReader.LoadResourceDictionary("Theme/NoesisTheme." + safeColor + "Blue.xaml");
+        }
+        if (themeDict == null)
+        {
+            themeDict = XamlReader.LoadResourceDictionary("NoesisTheme." + safeColor + "Blue.xaml");
         }
 
         if (this.Resources == null)
         {
             this.Resources = new ResourceDictionary();
         }
-        ResourceDictionary appRes = ResourceDictionary.GlobalApplicationResources();
 
-        if (themeDict != null)
-        {
-            this.Resources.Merge(themeDict);
-            if (appRes != null)
-            {
-                appRes.Merge(themeDict);
-            }
-        }
-
-        this._activeThemeBg = isDark ? "#FF20282F" : "#FFFAFAFA";
-        this._activeThemeSurface = isDark ? "#FF28323B" : "#FFFFFFFF";
+        this._activeThemeBg = isDark ? "#FF20282F" : "#FFF6F7F8";
+        this._activeThemeSurface = isDark ? "#FF2E3944" : "#FFFFFFFF";
         this._activeThemeFg = isDark ? "#FFFFFFFF" : "#FF20282F";
         this._activeThemeBorder = isDark ? "#FF3C4752" : "#FFD0D7DE";
-
         ColorItem acc = this.ViewModel != null ? this.ViewModel.FindThemeAccent(safeAccent) : null;
         this._activeAccent = acc != null ? acc.Color : "#FF1098DF";
 
-        Brush bgBrush = this.Resources.Get("Brush.Window.Background") as Brush;
-        if (bgBrush == null) { bgBrush = new SolidColorBrush(this._activeThemeBg); }
-
-        Brush fgBrush = this.Resources.Get("Brush.Foreground.Normal") as Brush;
-        if (fgBrush == null) { fgBrush = new SolidColorBrush(this._activeThemeFg); }
-
-        Brush surfaceBrush = this.Resources.Get("Brush.Background.Normal") as Brush;
-        if (surfaceBrush == null) { surfaceBrush = new SolidColorBrush(this._activeThemeSurface); }
-
-        Brush accentBrush = this.Resources.Get("Brush.Accent") as Brush;
-        if (accentBrush == null) { accentBrush = this.Resources.Get("Brush.Hyperlink.Normal") as Brush; }
-        if (accentBrush == null) { accentBrush = new SolidColorBrush(this._activeAccent); }
-
-        SolidColorBrush bgSolid = bgBrush as SolidColorBrush;
-        if (bgSolid != null && bgSolid.Color != "") { this._activeThemeBg = bgSolid.Color; }
-        SolidColorBrush fgSolid = fgBrush as SolidColorBrush;
-        if (fgSolid != null && fgSolid.Color != "") { this._activeThemeFg = fgSolid.Color; }
-        SolidColorBrush surfSolid = surfaceBrush as SolidColorBrush;
-        if (surfSolid != null && surfSolid.Color != "") { this._activeThemeSurface = surfSolid.Color; }
-        SolidColorBrush accSolid = accentBrush as SolidColorBrush;
-        if (accSolid != null && accSolid.Color != "") { this._activeAccent = accSolid.Color; }
-
-        Brush descBrush = new SolidColorBrush(isDark ? "#FFC8D0D8" : "#FF4E5863");
-        SolidColorBrush oldTitle = this.Resources.Get("TitleBrush") as SolidColorBrush;
-        if (oldTitle != null) { oldTitle.Color = this._activeThemeFg; }
-        SolidColorBrush oldDesc = this.Resources.Get("DescBrush") as SolidColorBrush;
-        if (oldDesc != null) { oldDesc.Color = isDark ? "#FFC8D0D8" : "#FF4E5863"; }
-
-        this.Background = bgBrush;
-        this.Foreground = fgBrush;
-
-        this.Resources.Set("Brush.Window.Background", bgBrush);
-        this.Resources.Set("Brush.Foreground.Normal", fgBrush);
-        this.Resources.Set("Brush.Control.Background", surfaceBrush);
-        this.Resources.Set("Brush.Text.Foreground", fgBrush);
-        this.Resources.Set("Brush.Accent", accentBrush);
-        this.Resources.Set("TitleBrush", fgBrush);
-        this.Resources.Set("DescBrush", descBrush);
-
-        if (appRes != null)
+        ResourceDictionary scoped = new ResourceDictionary();
+        scoped.Merge(this.Resources);
+        if (themeDict != null)
         {
-            appRes.Set("Brush.Window.Background", bgBrush);
-            appRes.Set("Brush.Foreground.Normal", fgBrush);
-            appRes.Set("Brush.Control.Background", surfaceBrush);
-            appRes.Set("Brush.Text.Foreground", fgBrush);
-            appRes.Set("Brush.Accent", accentBrush);
-            appRes.Set("TitleBrush", fgBrush);
-            appRes.Set("DescBrush", descBrush);
+            scoped.Merge(themeDict);
+        }
+        else
+        {
+            scoped.Set("Brush.Window.Background", new SolidColorBrush(this._activeThemeBg));
+            scoped.Set("Brush.Background.Normal", new SolidColorBrush(this._activeThemeSurface));
+            scoped.Set("Brush.Foreground.Normal", new SolidColorBrush(this._activeThemeFg));
+            scoped.Set("Brush.Border.Normal", new SolidColorBrush(this._activeThemeBorder));
+            scoped.Set("Brush.Hyperlink.Normal", new SolidColorBrush(this._activeAccent));
+        }
+        // Keep sample page header TitleBrush & DescBrush readable over MainWindowBackground blue gradient
+        Brush mainTitle = this.Resources.Get("TitleBrush") as Brush;
+        Brush mainDesc = this.Resources.Get("DescBrush") as Brush;
+        if (mainTitle != null) { scoped.Set("TitleBrush", mainTitle); }
+        if (mainDesc != null) { scoped.Set("DescBrush", mainDesc); }
+
+        this._sampleThemeResources = scoped;
+        if (this.SampleContainer1 != null)
+        {
+            this.SampleContainer1.Resources = scoped;
+        }
+        if (this.SampleContainer2 != null)
+        {
+            this.SampleContainer2.Resources = scoped;
         }
 
-        this.RefreshDynamicResourcesRecursive();
         if (this.LoadedSampleUri != null && this.LoadedSampleUri != "")
         {
             this.LoadSampleXaml(this.LoadedSampleUri);

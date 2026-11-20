@@ -2263,6 +2263,10 @@ ExecutionResult ExecutionDomainContext::invokeMethod(
     }
 
     if (interpreter) {
+        if (options.limits.instructionBudget == 1'000'000u) {
+            options.limits.instructionBudget = 128'000'000u;
+            options.limits.gcWorkBudget = 0u;
+        }
         std::vector<Value> argVec;
         if (arguments && argumentCount > 0u) {
             argVec.assign(arguments, arguments + argumentCount);
