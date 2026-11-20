@@ -1,10 +1,13 @@
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <limits>
 #include <memory>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <realscript/aot_cpp/AotRuntime.h>
@@ -591,7 +594,7 @@ void TestHitTestTransformsAndInputRouter() {
     CHECK(!router.HitTest(aero::Point{60.0f, 70.0f}).IsValid()); // outside vertical rotated strip
 
     // 3D planar hit test at projected off-center corner point inside card3d
-    const aero::Point p3dScreen = w.GetNode(card3d)->layout.worldMatrix3D.ProjectPoint2D(aero::Point{250.0f, 90.0f});
+    const aero::Point p3dScreen = w.GetNode(card3d)->WorldMatrix3D().ProjectPoint2D(aero::Point{250.0f, 90.0f});
     CHECK(router.HitTest(p3dScreen) == card3d);
 
     // zIndex ordering beats declaration order
@@ -1192,6 +1195,314 @@ void TestHostBindingsAndReflection() {
     gAotState = nullptr;
 }
 
+void TestBlendModePageHeaderAndBlurSpanAdditive() {
+    static_assert(sizeof(aero::AeroVertex) == 24, "AeroVertex must remain exactly 24 bytes");
+    static_assert(sizeof(aero::CommandPage) == 4096, "CommandPage must remain exactly 4096 bytes");
+    static_assert(aero::kVerticesPerCommandPage == 168u, "CommandPage must remain 168 vertices");
+
+    aero::UIResourceStore store;
+    aero::VisualWorld w(nullptr, &store);
+    aero::DrawingCommandBuffer drawBuf;
+
+    auto root = w.CreateNode(aero::VisualKind::Box);
+    auto bg = w.CreateNode(aero::VisualKind::Box);
+    auto addBox = w.CreateNode(aero::VisualKind::Box);
+    auto blurAdd = w.CreateNode(aero::VisualKind::Box);
+    auto blurChild = w.CreateNode(aero::VisualKind::Box);
+
+    w.SetRoot(root);
+    w.SetLayoutMode(root, aero::LayoutMode::Canvas, 0.0f, 0.0f, 0, 0);
+    w.SetSize(root, 240.0f, 160.0f);
+
+    // Background RGB=(64, 32, 16) in 0xAABBGGRR
+    w.AddChild(root, bg);
+    w.SetCanvasOffsets(bg, 0.0f, 0.0f, std::numeric_limits<float>::quiet_NaN(), std::numeric_limits<float>::quiet_NaN());
+    w.SetSize(bg, 240.0f, 160.0f);
+    w.SetBoxStyle(bg, 0xFF102040u, 0u, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f);
+
+    // Direct Additive box RGB=(48, 80, 32)
+    w.AddChild(root, addBox);
+    w.SetCanvasOffsets(addBox, 16.0f, 16.0f, std::numeric_limits<float>::quiet_NaN(), std::numeric_limits<float>::quiet_NaN());
+    w.SetSize(addBox, 64.0f, 64.0f);
+    w.SetBoxStyle(addBox, 0xFF205030u, 0u, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f);
+    w.GetNode(addBox)->transform2D.blendMode = aero::BlendingMode::Additive;
+    w.MarkDirty(addBox, aero::VisualDirty_Visual);
+
+    // Offscreen Blur + Additive composite layer RGB=(48, 80, 32)
+    w.AddChild(root, blurAdd);
+    w.SetCanvasOffsets(blurAdd, 110.0f, 16.0f, std::numeric_limits<float>::quiet_NaN(), std::numeric_limits<float>::quiet_NaN());
+    w.SetSize(blurAdd, 80.0f, 80.0f);
+    w.SetLayoutMode(blurAdd, aero::LayoutMode::Canvas, 0.0f, 0.0f, 0, 0);
+    w.SetEffect(blurAdd, aero::UIEffectKind::Blur, 4.0f, 0.0f, 0.0f, 0xFFFFFFFFu, 1.0f);
+    w.GetNode(blurAdd)->transform2D.blendMode = aero::BlendingMode::Additive;
+    w.MarkDirty(blurAdd, aero::VisualDirty_Visual);
+
+    w.AddChild(blurAdd, blurChild);
+    w.SetCanvasOffsets(blurChild, 10.0f, 10.0f, std::numeric_limits<float>::quiet_NaN(), std::numeric_limits<float>::quiet_NaN());
+    w.SetSize(blurChild, 60.0f, 60.0f);
+    w.SetBoxStyle(blurChild, 0xFF205030u, 0u, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f);
+
+    w.UpdateLayout(240.0f, 160.0f);
+
+    aero::PagedRenderTree renderTree;
+    aero::VisualRenderAdapter adapter;
+    const std::size_t emitted = adapter.SyncPagedRenderTree(w, &drawBuf, renderTree, &store);
+    CHECK(emitted >= 3u);
+
+    const aero::VisualNode* addPtr = w.GetNode(addBox);
+    bool foundAddNodeHeader = false;
+    for (std::uint32_t i = 0u; i < renderTree.NodeCount(); ++i) {
+        const aero::RenderNodeDescriptor* rd = renderTree.GetNode(i);
+        if (rd && rd->sourceElement == addPtr) {
+            CHECK(rd->blendMode == aero::BlendingMode::Additive);
+            const auto& page = renderTree.GetPage(rd->pageIndex);
+            CHECK(page.header.BlendMode() == static_cast<std::uint32_t>(aero::BlendingMode::Additive));
+            foundAddNodeHeader = true;
+        }
+    }
+    CHECK(foundAddNodeHeader);
+
+    bool foundAdditiveBlurSpan = false;
+    for (const auto& span : renderTree.BlurLayerSpans()) {
+        if (span.effectMode == aero::UIEffectKind::Blur &&
+            span.blendMode == aero::BlendingMode::Additive) {
+            foundAdditiveBlurSpan = true;
+        }
+    }
+    CHECK(foundAdditiveBlurSpan);
+
+    std::vector<std::uint8_t> rgba;
+    aero::ZeroCopyGpuStream::RasterizeTreeToRgba8(renderTree, 240u, 160u, rgba);
+    CHECK(rgba.size() == 240u * 160u * 4u);
+
+    auto pxAt = [&](std::uint32_t x, std::uint32_t y) {
+        const std::size_t idx = (static_cast<std::size_t>(y) * 240u + x) * 4u;
+        return std::array<std::uint8_t, 4>{rgba[idx], rgba[idx + 1u], rgba[idx + 2u], rgba[idx + 3u]};
+    };
+    const auto pAdd = pxAt(48u, 48u);
+    CHECK(pAdd[0] > 90u && pAdd[1] > 90u);
+    const auto pBlurAdd = pxAt(150u, 56u);
+    CHECK(pBlurAdd[0] > 85u && pBlurAdd[1] > 85u);
+}
+
+void TestImageAtlasConcurrentSamplingSafety() {
+    aero::ImageAtlas atlas;
+    std::vector<std::uint8_t> initPixels(64u * 64u * 4u, 0u);
+    for (std::size_t i = 0u; i < initPixels.size(); i += 4u) {
+        initPixels[i + 0u] = 200u;
+        initPixels[i + 1u] = 100u;
+        initPixels[i + 2u] = 50u;
+        initPixels[i + 3u] = 255u;
+    }
+    const std::uint32_t slotId = atlas.RegisterOrUpdateRgbaTextureSlot(0u, 64u, 64u, std::move(initPixels));
+    CHECK(slotId > 0u);
+
+    std::atomic<bool> stop{false};
+    std::atomic<bool> failed{false};
+
+    std::vector<std::thread> readers;
+    for (int t = 0; t < 4; ++t) {
+        readers.emplace_back([&, t]() {
+            for (int iter = 0; iter < 4000; ++iter) {
+                const float u = static_cast<float>((iter + t * 17) % 100) / 99.0f;
+                const float v = static_cast<float>((iter * 3 + t * 29) % 100) / 99.0f;
+                const aero::Color c = atlas.SampleBilinearRgba(slotId, u, v);
+                if (!std::isfinite(c.r) || !std::isfinite(c.g) || !std::isfinite(c.b) || !std::isfinite(c.a) ||
+                    c.r < 0.0f || c.r > 1.0f || c.a < 0.0f || c.a > 1.0f) {
+                    failed.store(true, std::memory_order_relaxed);
+                }
+            }
+        });
+    }
+
+    std::thread writer([&]() {
+        for (int w = 0; w < 120; ++w) {
+            const std::uint32_t dim = (w % 2 == 0) ? 32u : 96u;
+            std::vector<std::uint8_t> px(static_cast<std::size_t>(dim) * dim * 4u, 255u);
+            for (std::size_t i = 0u; i < px.size(); i += 4u) {
+                px[i + 0u] = static_cast<std::uint8_t>(50 + (w % 150));
+                px[i + 1u] = 160u;
+                px[i + 2u] = 220u;
+                px[i + 3u] = 255u;
+            }
+            const std::uint32_t updated = atlas.RegisterOrUpdateRgbaTextureSlot(slotId, dim, dim, std::move(px));
+            if (updated == 0u) {
+                failed.store(true, std::memory_order_relaxed);
+            }
+        }
+        stop.store(true, std::memory_order_release);
+    });
+
+    writer.join();
+    for (auto& th : readers) {
+        th.join();
+    }
+    CHECK(!failed.load());
+    CHECK(stop.load());
+
+    // Also test Clear() race safety with concurrent readers on a fresh slot
+    atlas.Clear();
+    std::vector<std::uint8_t> px2(32u * 32u * 4u, 128u);
+    const std::uint32_t slot2 = atlas.RegisterOrUpdateRgbaTextureSlot(0u, 32u, 32u, std::move(px2));
+    CHECK(slot2 > 0u);
+    std::thread clearReader([&]() {
+        for (int i = 0; i < 1000; ++i) {
+            const aero::Color c = atlas.SampleBilinearRgba(slot2, 0.5f, 0.5f);
+            if (!std::isfinite(c.r) || !std::isfinite(c.a)) {
+                failed.store(true, std::memory_order_relaxed);
+            }
+        }
+    });
+    atlas.Clear();
+    clearReader.join();
+    CHECK(!failed.load());
+}
+
+void TestDeepHierarchyOver70Levels() {
+    aero::UIResourceStore store;
+    aero::VisualWorld w(nullptr, &store);
+
+    constexpr int kDepthCount = 85;
+    std::vector<aero::VisualNodeId> chain;
+    chain.reserve(kDepthCount);
+
+    for (int d = 0; d < kDepthCount; ++d) {
+        auto node = w.CreateNode(aero::VisualKind::Box);
+        CHECK(node.IsValid());
+        w.SetLayoutMode(node, aero::LayoutMode::Stack, 0.0f, 0.0f, 1, 0);
+        if (d == 0) {
+            w.SetRoot(node);
+        } else {
+            CHECK(w.AddChild(chain.back(), node));
+            w.SetMargin(node, 1.0f, 1.0f, 0.0f, 0.0f);
+        }
+        chain.push_back(node);
+    }
+
+    const aero::VisualNodeId leaf = chain.back();
+    w.SetSize(leaf, 40.0f, 20.0f);
+    w.SetAlignment(leaf, aero::HorizontalAlignment::Left, aero::VerticalAlignment::Top);
+    w.UpdateLayout(800.0f, 600.0f);
+
+    const aero::VisualNode* leafNode = w.GetNode(leaf);
+    CHECK(leafNode != nullptr);
+    CHECK(leafNode->layout.treeDepth == static_cast<std::uint16_t>(kDepthCount - 1));
+    CHECK_NEAR(leafNode->layout.layoutRect.x, static_cast<float>(kDepthCount - 1), 0.1f);
+    CHECK_NEAR(leafNode->layout.layoutRect.y, static_cast<float>(kDepthCount - 1), 0.1f);
+    CHECK_NEAR(leafNode->layout.layoutRect.width, 40.0f, 0.1f);
+    CHECK_NEAR(leafNode->layout.layoutRect.height, 20.0f, 0.1f);
+
+    // Incremental update at depth 84 must also propagate cleanly
+    w.SetSize(leaf, 72.0f, 36.0f);
+    w.UpdateLayout(800.0f, 600.0f);
+    leafNode = w.GetNode(leaf);
+    CHECK_NEAR(leafNode->layout.layoutRect.width, 72.0f, 0.1f);
+    CHECK_NEAR(leafNode->layout.layoutRect.height, 36.0f, 0.1f);
+}
+
+void TestPerspective3DPageVertexClipW() {
+    static_assert(sizeof(aero::AeroVertex) == 24, "AeroVertex must stay 24 bytes");
+    static_assert(sizeof(aero::CommandPage) == 4096, "CommandPage must stay 4096 bytes");
+
+    aero::UIResourceStore store;
+    aero::VisualWorld w(nullptr, &store);
+    aero::DrawingCommandBuffer drawBuf;
+
+    auto root = w.CreateNode(aero::VisualKind::Box);
+    auto flatBox = w.CreateNode(aero::VisualKind::Box);
+    auto card3d = w.CreateNode(aero::VisualKind::Box);
+    auto text3d = w.CreateNode(aero::VisualKind::Text);
+
+    w.SetRoot(root);
+    w.SetLayoutMode(root, aero::LayoutMode::Canvas, 0.0f, 0.0f, 0, 0);
+    w.SetSize(root, 600.0f, 400.0f);
+
+    w.AddChild(root, flatBox);
+    w.SetCanvasOffsets(flatBox, 20.0f, 20.0f, std::numeric_limits<float>::quiet_NaN(), std::numeric_limits<float>::quiet_NaN());
+    w.SetSize(flatBox, 100.0f, 60.0f);
+    w.SetBoxStyle(flatBox, 0xFF335577u, 0u, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f);
+
+    w.AddChild(root, card3d);
+    w.SetCanvasOffsets(card3d, 200.0f, 80.0f, std::numeric_limits<float>::quiet_NaN(), std::numeric_limits<float>::quiet_NaN());
+    w.SetSize(card3d, 160.0f, 100.0f);
+    w.SetBoxStyle(card3d, 0xFF44AAFFu, 0u, 0.0f, 0.0f, 0.0f, 0.0f, 4.0f, 4.0f, 4.0f, 4.0f);
+    w.SetTransform3D(card3d, 0.0f, 45.0f, 0.0f, 0.0f, 0.0f, 0.0f, 400.0f);
+
+    w.AddChild(root, text3d);
+    w.SetCanvasOffsets(text3d, 200.0f, 220.0f, std::numeric_limits<float>::quiet_NaN(), std::numeric_limits<float>::quiet_NaN());
+    w.SetSize(text3d, 140.0f, 36.0f);
+    w.SetText(text3d, "3D", "", 18.0f, 0xFFFFFFFFu, aero::TextWrapping::NoWrap, aero::TextAlignment::Left, aero::TextTrimming::None);
+    w.SetTransform3D(text3d, 0.0f, 35.0f, 0.0f, 0.0f, 0.0f, 0.0f, 500.0f);
+
+    w.UpdateLayout(600.0f, 400.0f);
+
+    aero::PagedRenderTree renderTree;
+    aero::VisualRenderAdapter adapter;
+    const std::size_t emitted = adapter.SyncPagedRenderTree(w, &drawBuf, renderTree, &store);
+    CHECK(emitted >= 3u);
+
+    const aero::VisualNode* flatPtr = w.GetNode(flatBox);
+    const aero::VisualNode* cardPtr = w.GetNode(card3d);
+    const aero::VisualNode* textPtr = w.GetNode(text3d);
+
+    bool checkedFlat = false;
+    bool checkedCard3d = false;
+    bool checkedText3d = false;
+
+    for (std::uint32_t i = 0u; i < renderTree.NodeCount(); ++i) {
+        const aero::RenderNodeDescriptor* rd = renderTree.GetNode(i);
+        if (!rd) { continue; }
+        const float* clipW = renderTree.PageVertexClipW(rd->pageIndex);
+        CHECK(clipW != nullptr);
+        if (!clipW) { continue; }
+
+        if (rd->sourceElement == flatPtr && rd->vertexCount == 4u) {
+            for (std::uint16_t v = 0u; v < 4u; ++v) {
+                CHECK_NEAR(clipW[rd->vertexOffsetInPage + v], 1.0f, 1e-4f);
+            }
+            checkedFlat = true;
+        }
+        if (rd->sourceElement == cardPtr && rd->vertexCount == 4u) {
+            CHECK(rd->hasPerspective3D);
+            const float w0 = clipW[rd->vertexOffsetInPage + 0u];
+            const float w1 = clipW[rd->vertexOffsetInPage + 1u];
+            const float w2 = clipW[rd->vertexOffsetInPage + 2u];
+            const float w3 = clipW[rd->vertexOffsetInPage + 3u];
+            CHECK(w0 >= 1e-3f && w1 >= 1e-3f && w2 >= 1e-3f && w3 >= 1e-3f);
+            CHECK(std::fabs(w0 - w1) > 0.05f);
+            CHECK_NEAR(w0, w3, 1e-3f);
+            CHECK_NEAR(w1, w2, 1e-3f);
+            checkedCard3d = true;
+        }
+        if (rd->sourceElement == textPtr && rd->vertexCount >= 8u) {
+            CHECK(rd->hasPerspective3D);
+            const float wFirst = clipW[rd->vertexOffsetInPage + 0u];
+            const float wLast = clipW[rd->vertexOffsetInPage + rd->vertexCount - 1u];
+            CHECK(wFirst >= 1e-3f && wLast >= 1e-3f);
+            CHECK(std::fabs(wFirst - wLast) > 1e-3f);
+            checkedText3d = true;
+        }
+    }
+    CHECK(checkedFlat && checkedCard3d && checkedText3d);
+
+    aero::ZeroCopyGpuStream stream(aero::ShaderBackend::DesktopGL33, 16u);
+    const aero::ZeroCopySubmissionStats stats = stream.SubmitDirtyPages(renderTree);
+    CHECK(stats.dirtyPagesUploaded >= 1u);
+    CHECK(!stream.LastBufferSubDataSpans().empty());
+    const auto& span0 = stream.LastBufferSubDataSpans().front();
+    const std::size_t activeVerts = renderTree.GetPage(span0.pageIndex).header.vertexCount;
+    CHECK(span0.sourcePageClipWPtr != nullptr);
+    CHECK(span0.clipWByteSize >= activeVerts * sizeof(float));
+    const float* mappedW = stream.MappedPageClipW(span0.pageIndex);
+    CHECK(mappedW != nullptr);
+    if (mappedW) {
+        const float* srcW = renderTree.PageVertexClipW(span0.pageIndex);
+        for (std::size_t v = 0u; v < activeVerts; ++v) {
+            CHECK_NEAR(mappedW[v], srcW[v], 1e-5f);
+        }
+    }
+}
+
 } // namespace
 
 int main() {
@@ -1205,6 +1516,10 @@ int main() {
     TestVisualRenderAdapterAndRasterizer();
     TestTrackBEcsBindingZeroAlloc();
     TestHostBindingsAndReflection();
+    TestBlendModePageHeaderAndBlurSpanAdditive();
+    TestImageAtlasConcurrentSamplingSafety();
+    TestDeepHierarchyOver70Levels();
+    TestPerspective3DPageVertexClipW();
 
     if (gFailureCount != 0) {
         std::fprintf(stderr, "microkernel_tests FAILED (%d checks failed)\n", gFailureCount);

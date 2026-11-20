@@ -852,7 +852,11 @@ bool DiscoverSampleProject(
     }
 
     // Walk ancestors so packaged /Noesis.GUI.Extensions;component/Theme/*.xaml resolves
-    fs::path probe = sampleRoot;
+    std::error_code probeEc;
+    fs::path probe = sampleRoot.is_absolute() ? sampleRoot : fs::absolute(sampleRoot, probeEc);
+    if (probeEc || probe.empty()) {
+        probe = sampleRoot;
+    }
     for (int up = 0; up < 5 && !probe.empty(); ++up) {
         registerDirIfExists(probe / "Theme" / "Data");
         registerDirIfExists(probe / "Theme" / "Data" / "Theme");
@@ -860,7 +864,11 @@ bool DiscoverSampleProject(
         registerDirIfExists(probe / "Samples" / "Theme" / "Data");
         registerDirIfExists(probe / "Samples" / "Theme" / "Data" / "Theme");
         registerDirIfExists(probe / "Samples" / "Theme" / "Data" / "Theme" / "Fonts");
-        probe = probe.parent_path();
+        const fs::path parent = probe.parent_path();
+        if (parent == probe) {
+            break;
+        }
+        probe = parent;
     }
 
     return !outCompileInput.xamlContent.empty() || !outCompileInput.scriptSources.empty();
@@ -934,6 +942,13 @@ void AeroAppHost::RegisterAssetDirectoryInternal(std::string_view dir) {
     FontAtlas& fonts = resourceStore_->Fonts();
     for (const auto& ttf : ttfFiles) {
         (void)fonts.LoadTrueTypeFontFromFile(ttf.generic_string());
+    }
+    if (fonts.DefaultFontFamily().empty()) {
+        if (fonts.HasFontFamily("PT Root UI")) {
+            fonts.SetDefaultFontFamily("PT Root UI");
+        } else if (fonts.HasFontFamily("Roboto")) {
+            fonts.SetDefaultFontFamily("Roboto");
+        }
     }
 }
 
@@ -1140,6 +1155,7 @@ void AeroAppHost::ResolveDispatchSymbols() {
         symbols_.windowShow = find("Window::Show");
         symbols_.applyTemplate = find("FrameworkElement::ApplyTemplate");
         symbols_.controlApplyTemplate = find("Control::ApplyTemplate");
+        symbols_.applyTemplateSubtree = find("UIElement::ApplyTemplateSubtree");
         symbols_.ensureLoadedSubtree = find("UIElement::EnsureLoadedSubtree");
         symbols_.popupSetOverlayHost = find("PopupService::SetOverlayHost");
     } else if (aotDescriptor_) {
@@ -1156,6 +1172,7 @@ void AeroAppHost::ResolveDispatchSymbols() {
         symbols_.windowShow = find("Window::Show");
         symbols_.applyTemplate = find("FrameworkElement::ApplyTemplate");
         symbols_.controlApplyTemplate = find("Control::ApplyTemplate");
+        symbols_.applyTemplateSubtree = find("UIElement::ApplyTemplateSubtree");
         symbols_.ensureLoadedSubtree = find("UIElement::EnsureLoadedSubtree");
         symbols_.popupSetOverlayHost = find("PopupService::SetOverlayHost");
     }
@@ -1321,8 +1338,8 @@ bool AeroAppHost::LoadProgramImageInternal(
                 n->layout.desiredSize.height,
                 n->box.bgRgba,
                 n->box.bgGradId,
-                n->vector.fillRgba,
-                n->vector.pathOrParams.size(),
+                n->Vector().fillRgba,
+                n->Vector().pathOrParams.size(),
                 n->layout.renderNodeId,
                 n->layout.renderNodeCount,
                 name.c_str());
@@ -2034,70 +2051,68 @@ bool AeroAppHost::MountScriptRootObject(ObjectRef candidate) {
     rootObject_ = uiRoot;
     rootObjectPin_ = domains_.uiHeap().retain(rootObject_);
 
-    // Show Window (or PopupService + ApplyTemplate + EnsureLoadedSubtree for UserControl/Page/UIElement)
+    // Prepare template & overlay host before mounting root; defer Window.Show() / EnsureLoadedSubtree
+    // until after SetRoot() + layout convergence so Loaded animations observe real ActualWidth/ActualHeight.
     const SymbolId typeId = domains_.uiHeap().objectTypeIdFast(rootObject_);
-    bool invokedShow = false;
+    SymbolId deferredShowSym = 0u;
+    SymbolId deferredLoadSym = 0u;
     if (typeId != 0u) {
-        SymbolId showSym = 0u;
         if (programImage_) {
-            showSym = FindBytecodeClassMethod(*programImage_, typeId, "Show", 0u);
-            if (showSym == 0u && symbols_.windowShow != 0u) {
+            deferredShowSym = FindBytecodeClassMethod(*programImage_, typeId, "Show", 0u);
+            if (deferredShowSym == 0u && symbols_.windowShow != 0u) {
                 const rs_sem::TypeSymbol* rt = programImage_->resolveType(typeId);
                 if (rt && IsBytecodeTypeDerivedFrom(*programImage_, rt, "Window")) {
-                    showSym = symbols_.windowShow;
+                    deferredShowSym = symbols_.windowShow;
                 }
             }
         } else if (aotDescriptor_) {
-            showSym = FindAotClassMethod(*aotDescriptor_, typeId, "Show", 1u);
-            if (showSym == 0u && symbols_.windowShow != 0u) {
+            deferredShowSym = FindAotClassMethod(*aotDescriptor_, typeId, "Show", 1u);
+            if (deferredShowSym == 0u && symbols_.windowShow != 0u) {
                 const rs_aot::TypeDescriptor* rt = FindAotTypeById(*aotDescriptor_, typeId);
                 if (rt && IsAotTypeDerivedFrom(*aotDescriptor_, rt, "Window")) {
-                    showSym = symbols_.windowShow;
+                    deferredShowSym = symbols_.windowShow;
                 }
             }
         }
-        if (showSym != 0u) {
-            logTrace("MountScriptRootObject: invoking Show");
-            invokedShow = InvokeSymbol(showSym, {UnifiedValue{rootObject_}}, nullptr, DomainKind::UiPresentation);
+
+        logTrace("MountScriptRootObject: invoking SetOverlayHost/ApplyTemplateSubtree");
+        if (symbols_.popupSetOverlayHost != 0u) {
+            (void)InvokeSymbol(
+                symbols_.popupSetOverlayHost, {UnifiedValue{rootObject_}}, nullptr, DomainKind::UiPresentation);
         }
-        if (!invokedShow) {
-            logTrace("MountScriptRootObject: invoking SetOverlayHost/ApplyTemplate/EnsureLoadedSubtree");
-            if (symbols_.popupSetOverlayHost != 0u) {
-                (void)InvokeSymbol(
-                    symbols_.popupSetOverlayHost, {UnifiedValue{rootObject_}}, nullptr, DomainKind::UiPresentation);
+        SymbolId tplSym = 0u;
+        SymbolId loadSym = 0u;
+        if (programImage_) {
+            tplSym = symbols_.applyTemplateSubtree != 0u
+                ? symbols_.applyTemplateSubtree
+                : FindBytecodeClassMethod(*programImage_, typeId, "ApplyTemplate", 0u);
+            if (tplSym == 0u) {
+                tplSym = symbols_.controlApplyTemplate != 0u
+                    ? symbols_.controlApplyTemplate
+                    : symbols_.applyTemplate;
             }
-            SymbolId tplSym = 0u;
-            SymbolId loadSym = 0u;
-            if (programImage_) {
-                tplSym = FindBytecodeClassMethod(*programImage_, typeId, "ApplyTemplate", 0u);
-                if (tplSym == 0u) {
-                    tplSym = symbols_.controlApplyTemplate != 0u
-                        ? symbols_.controlApplyTemplate
-                        : symbols_.applyTemplate;
-                }
-                loadSym = FindBytecodeClassMethod(*programImage_, typeId, "EnsureLoadedSubtree", 0u);
-                if (loadSym == 0u) {
-                    loadSym = symbols_.ensureLoadedSubtree;
-                }
-            } else if (aotDescriptor_) {
-                tplSym = FindAotClassMethod(*aotDescriptor_, typeId, "ApplyTemplate", 1u);
-                if (tplSym == 0u) {
-                    tplSym = symbols_.controlApplyTemplate != 0u
-                        ? symbols_.controlApplyTemplate
-                        : symbols_.applyTemplate;
-                }
-                loadSym = FindAotClassMethod(*aotDescriptor_, typeId, "EnsureLoadedSubtree", 1u);
-                if (loadSym == 0u) {
-                    loadSym = symbols_.ensureLoadedSubtree;
-                }
+            loadSym = FindBytecodeClassMethod(*programImage_, typeId, "EnsureLoadedSubtree", 0u);
+            if (loadSym == 0u) {
+                loadSym = symbols_.ensureLoadedSubtree;
             }
-            if (tplSym != 0u) {
-                (void)InvokeSymbol(tplSym, {UnifiedValue{rootObject_}}, nullptr, DomainKind::UiPresentation);
+        } else if (aotDescriptor_) {
+            tplSym = symbols_.applyTemplateSubtree != 0u
+                ? symbols_.applyTemplateSubtree
+                : FindAotClassMethod(*aotDescriptor_, typeId, "ApplyTemplate", 1u);
+            if (tplSym == 0u) {
+                tplSym = symbols_.controlApplyTemplate != 0u
+                    ? symbols_.controlApplyTemplate
+                    : symbols_.applyTemplate;
             }
-            if (loadSym != 0u) {
-                (void)InvokeSymbol(loadSym, {UnifiedValue{rootObject_}}, nullptr, DomainKind::UiPresentation);
+            loadSym = FindAotClassMethod(*aotDescriptor_, typeId, "EnsureLoadedSubtree", 1u);
+            if (loadSym == 0u) {
+                loadSym = symbols_.ensureLoadedSubtree;
             }
         }
+        if (tplSym != 0u) {
+            (void)InvokeSymbol(tplSym, {UnifiedValue{rootObject_}}, nullptr, DomainKind::UiPresentation);
+        }
+        deferredLoadSym = loadSym;
     }
 
     logTrace("MountScriptRootObject: reading __nativeHandle");
@@ -2132,6 +2147,43 @@ bool AeroAppHost::MountScriptRootObject(ObjectRef candidate) {
     }
 
     world_.SetRoot(rootNode);
+
+    if (world_.Root().IsValid()) {
+        const bool hasLiveWin = !config_.headless && windowHost_.IsInitialized() &&
+            windowHost_.Mode() != NativeWindowMode::HeadlessSoftware &&
+            windowHost_.Width() > 0u && windowHost_.Height() > 0u;
+        float initW = static_cast<float>(std::max<std::uint32_t>(1u, config_.viewportWidth));
+        float initH = static_cast<float>(std::max<std::uint32_t>(1u, config_.viewportHeight));
+        if (hasLiveWin) {
+            const float dpi = std::max(0.25f, windowHost_.DpiScale());
+            initW = static_cast<float>(windowHost_.Width()) / dpi;
+            initH = static_cast<float>(windowHost_.Height()) / dpi;
+        }
+        for (int pass = 0; pass < 3; ++pass) {
+            world_.UpdateLayout(initW, initH);
+            FlushBindings();
+            if (world_.FlushTrackB() == 0u && !world_.HasAnyDirty()) {
+                break;
+            }
+        }
+        world_.UpdateLayout(initW, initH);
+        FlushBindings();
+
+        bool invokedShow = false;
+        if (deferredShowSym != 0u) {
+            logTrace("MountScriptRootObject: invoking deferred Show");
+            invokedShow = InvokeSymbol(
+                deferredShowSym, {UnifiedValue{rootObject_}}, nullptr, DomainKind::UiPresentation);
+        }
+        if (!invokedShow && deferredLoadSym != 0u) {
+            (void)InvokeSymbol(deferredLoadSym, {UnifiedValue{rootObject_}}, nullptr, DomainKind::UiPresentation);
+        }
+        world_.UpdateLayout(initW, initH);
+        FlushBindings();
+    } else if (deferredShowSym != 0u) {
+        logTrace("MountScriptRootObject: invoking Show without visual root");
+        (void)InvokeSymbol(deferredShowSym, {UnifiedValue{rootObject_}}, nullptr, DomainKind::UiPresentation);
+    }
 
     // Optional Dual-Domain SimDeterministic factory discovery (CreateSimState / CreateSim)
     if (!simObject_.valid()) {
@@ -2510,6 +2562,10 @@ void AeroAppHost::StepFrame(float dtSeconds, bool forceRenderSync) {
         FlushBindings();
         if (world_.FlushTrackB() > 0u || world_.HasAnyDirty()) {
             world_.UpdateLayout(vpW, vpH);
+            FlushBindings();
+            if (world_.HasAnyDirty()) {
+                world_.UpdateLayout(vpW, vpH);
+            }
         }
     }
 
@@ -2663,7 +2719,7 @@ bool AeroAppHost::SaveScreenshotPpm(
         world_.Root().IsValid() &&
         (windowHost_.Width() != targetW || windowHost_.Height() != targetH)) {
         const Size prevLayoutVp = world_.LastLayoutViewport();
-        if (prevLayoutVp != targetSize) {
+        if (prevLayoutVp != targetSize || world_.HasAnyDirty()) {
             world_.UpdateLayout(targetSize.width, targetSize.height);
         }
         PagedRenderTree tempTree;
@@ -2791,7 +2847,19 @@ std::uint64_t AeroAppHost::RunWindowedLoop(std::uint64_t maxFrames) {
         config_.viewportWidth = w;
         config_.viewportHeight = h;
 
-        bool followUpDirty = false;
+        const bool hasLiveWin = !config_.headless && windowHost_.IsInitialized() &&
+            windowHost_.Mode() != NativeWindowMode::HeadlessSoftware &&
+            windowHost_.Width() > 0u && windowHost_.Height() > 0u;
+        float liveVpW = static_cast<float>(w);
+        float liveVpH = static_cast<float>(h);
+        if (hasLiveWin) {
+            const float dpi = std::max(0.25f, windowHost_.DpiScale());
+            liveVpW = static_cast<float>(windowHost_.Width()) / dpi;
+            liveVpH = static_cast<float>(windowHost_.Height()) / dpi;
+        }
+        const bool viewportChanged = (world_.LastLayoutViewport() != Size{liveVpW, liveVpH});
+
+        bool followUpDirty = viewportChanged;
         if (simTickCallback_) {
             domains_.setActiveDomain(DomainKind::SimDeterministic);
             simTickCallback_(0.016f, *this);
@@ -2811,19 +2879,20 @@ std::uint64_t AeroAppHost::RunWindowedLoop(std::uint64_t maxFrames) {
         if (world_.FlushTrackB() > 0u) {
             followUpDirty = true;
         }
-        if (followUpDirty ||
-            wakeBeforePump ||
-            scriptWakeRequested_ ||
-            (windowHost_.Telemetry().osEventsTranslated != prevOsEvents) ||
-            world_.HasAnyDirty() ||
-            animEngine_.HasActiveAnimations()) {
+        if (!viewportChanged &&
+            (followUpDirty ||
+             wakeBeforePump ||
+             scriptWakeRequested_ ||
+             (windowHost_.Telemetry().osEventsTranslated != prevOsEvents) ||
+             world_.HasAnyDirty() ||
+             animEngine_.HasActiveAnimations())) {
             FlushBindings();
         }
         if (world_.HasAnyDirty()) {
             followUpDirty = true;
         }
         if (followUpDirty) {
-            StepFrame(0.0f, false);
+            StepFrame(0.0f, viewportChanged);
         } else if (DispatchPendingCanvasDraws()) {
             StepFrame(0.0f, true);
         }
@@ -2966,14 +3035,12 @@ VisualNodeId AeroAppHost::FindVisualByOwnerName(std::string_view elementName) co
     if (elementName.empty()) {
         return VisualNodeId{};
     }
-    const std::size_t slots = world_.ArenaSlotCount();
-    for (std::size_t s = 0u; s < slots; ++s) {
-        const VisualNode* node = world_.NodeAtSlot(s);
+    auto matchesName = [&](const VisualNode* node) -> bool {
         if (!node || !node->hasScriptOwner || !node->scriptOwner.valid()) {
-            continue;
+            return false;
         }
         UnifiedValue nameVal{};
-        if (ReadMemberFromHeap(
+        if (!ReadMemberFromHeap(
                 domains_,
                 programImage_.get(),
                 interpreter_.get(),
@@ -2982,10 +3049,53 @@ VisualNodeId AeroAppHost::FindVisualByOwnerName(std::string_view elementName) co
                 node->scriptOwner,
                 "Name",
                 nameVal)) {
-            std::string nameStr;
-            if (ReadScriptStringValue(domains_, nameVal, nameStr) && nameStr == elementName) {
+            return false;
+        }
+        std::string nameStr;
+        return ReadScriptStringValue(domains_, nameVal, nameStr) && nameStr == elementName;
+    };
+
+    // Walk the live visual tree first so detached/disposed template ghosts never shadow active nodes.
+    const VisualNodeId rootId = world_.Root();
+    if (rootId.IsValid()) {
+        std::vector<VisualNodeId> queue;
+        queue.push_back(rootId);
+        for (std::size_t qi = 0u; qi < queue.size(); ++qi) {
+            const VisualNode* node = world_.GetNode(queue[qi]);
+            if (!node) {
+                continue;
+            }
+            if (matchesName(node)) {
                 return node->id;
             }
+            for (const VisualNodeId childId : node->children) {
+                queue.push_back(childId);
+            }
+        }
+    }
+
+    const std::size_t slots = world_.ArenaSlotCount();
+    for (std::size_t s = 0u; s < slots; ++s) {
+        const VisualNode* node = world_.NodeAtSlot(s);
+        if (!node || !node->hasScriptOwner || !node->scriptOwner.valid()) {
+            continue;
+        }
+        UnifiedValue disposedVal{};
+        bool isDisposed = false;
+        if (ReadMemberFromHeap(
+                domains_,
+                programImage_.get(),
+                interpreter_.get(),
+                aotDescriptor_,
+                aotContext_.get(),
+                node->scriptOwner,
+                "_isDisposedTree",
+                disposedVal) &&
+            disposedVal.tryGetBool(isDisposed) && isDisposed) {
+            continue;
+        }
+        if (matchesName(node)) {
+            return node->id;
         }
     }
     return VisualNodeId{};

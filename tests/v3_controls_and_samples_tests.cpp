@@ -140,7 +140,7 @@ void Require(bool cond, std::string_view msg) {
     }
     const aero::Point localCenter{r.x + r.width * 0.5f, r.y + r.height * 0.5f};
     const aero::Point vpCenter = node->layout.hasPerspective3D
-        ? node->layout.worldMatrix3D.ProjectPoint2D(localCenter)
+        ? node->WorldMatrix3D().ProjectPoint2D(localCenter)
         : node->layout.worldTransform.TransformPoint(localCenter);
     outCx = vpCenter.x;
     outCy = vpCenter.y;

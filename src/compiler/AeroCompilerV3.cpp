@@ -733,9 +733,8 @@ void AppendUint32Le(std::vector<std::uint8_t>& out, std::uint32_t v) {
         for (std::uint32_t i = 0u; i < modCount; ++i) {
             const ModuleSlice sl = slices[i];
             futures.push_back(std::async(std::launch::async, [&, i, sl]() -> bool {
-                std::vector<std::uint8_t> modBytes(data + sl.offset, data + sl.offset + sl.length);
                 rs_diag::DiagnosticBag diag;
-                return rs_bc::decodeModule(modBytes, outModules[i], diag) && !diag.hasErrors();
+                return rs_bc::decodeModule(data + sl.offset, sl.length, outModules[i], diag) && !diag.hasErrors();
             }));
         }
         bool allOk = true;
@@ -753,9 +752,8 @@ void AppendUint32Le(std::vector<std::uint8_t>& out, std::uint32_t v) {
 
     for (std::uint32_t i = 0u; i < modCount; ++i) {
         const ModuleSlice sl = slices[i];
-        std::vector<std::uint8_t> modBytes(data + sl.offset, data + sl.offset + sl.length);
         rs_diag::DiagnosticBag diag;
-        if (!rs_bc::decodeModule(modBytes, outModules[i], diag) || diag.hasErrors()) {
+        if (!rs_bc::decodeModule(data + sl.offset, sl.length, outModules[i], diag) || diag.hasErrors()) {
             outModules.clear();
             return false;
         }
@@ -763,19 +761,104 @@ void AppendUint32Le(std::vector<std::uint8_t>& out, std::uint32_t v) {
     return true;
 }
 
+[[nodiscard]] bool IsGenericScanIdentChar(char ch) noexcept {
+    const unsigned char uch = static_cast<unsigned char>(ch);
+    return (uch >= 'A' && uch <= 'Z') ||
+           (uch >= 'a' && uch <= 'z') ||
+           (uch >= '0' && uch <= '9') ||
+           uch == '_';
+}
+
 [[nodiscard]] bool TextInstantiatesStdlibGenerics(std::string_view text) noexcept {
-    static constexpr std::string_view kNeedles[] = {
-        "ObservableList<",
-        "ObservableCollection<",
-        "RelayCommand<",
-        "DelegateCommand<",
-        "TypedBox<",
-        "RoutedPropertyChangedEventArgs<",
+    static constexpr std::string_view kStems[] = {
+        "ObservableList",
+        "ObservableCollection",
+        "RelayCommand",
+        "DelegateCommand",
+        "TypedBox",
+        "RoutedPropertyChangedEventArgs",
     };
-    for (std::string_view needle : kNeedles) {
-        if (text.find(needle) != std::string_view::npos) {
-            return true;
+
+    const std::size_t n = text.size();
+    for (std::size_t i = 0; i < n;) {
+        const char ch = text[i];
+
+        // Skip single-line comments `// ...`
+        if (ch == '/' && i + 1 < n && text[i + 1] == '/') {
+            i += 2;
+            while (i < n && text[i] != '\n') {
+                ++i;
+            }
+            continue;
         }
+
+        // Skip block comments `/* ... */`
+        if (ch == '/' && i + 1 < n && text[i + 1] == '*') {
+            i += 2;
+            while (i + 1 < n && !(text[i] == '*' && text[i + 1] == '/')) {
+                ++i;
+            }
+            i = (i + 1 < n) ? (i + 2) : n;
+            continue;
+        }
+
+        // Skip verbatim string literals `@"..."` (`""` escapes a quote)
+        if (ch == '@' && i + 1 < n && text[i + 1] == '"') {
+            i += 2;
+            while (i < n) {
+                if (text[i] == '"') {
+                    if (i + 1 < n && text[i + 1] == '"') {
+                        i += 2;
+                        continue;
+                    }
+                    ++i;
+                    break;
+                }
+                ++i;
+            }
+            continue;
+        }
+
+        // Skip regular string and char literals (`"..."`, `'...'`) with backslash escapes
+        if (ch == '"' || ch == '\'') {
+            const char quote = ch;
+            ++i;
+            while (i < n) {
+                if (text[i] == '\\' && i + 1 < n) {
+                    i += 2;
+                    continue;
+                }
+                if (text[i] == quote) {
+                    ++i;
+                    break;
+                }
+                ++i;
+            }
+            continue;
+        }
+
+        if (IsGenericScanIdentChar(ch) && (i == 0 || !IsGenericScanIdentChar(text[i - 1]))) {
+            for (std::string_view stem : kStems) {
+                if (i + stem.size() < n && text.substr(i, stem.size()) == stem) {
+                    std::size_t j = i + stem.size();
+                    while (j < n && (text[j] == ' ' || text[j] == '\t' ||
+                                     text[j] == '\r' || text[j] == '\n')) {
+                        ++j;
+                    }
+                    if (j < n && text[j] == '<' && (j + 1 >= n || text[j + 1] != '=')) {
+                        return true;
+                    }
+                }
+            }
+            // Skip past the remainder of this identifier so we don't re-check suffixes.
+            ++i;
+            while (i < n && IsGenericScanIdentChar(text[i])) {
+                ++i;
+            }
+            continue;
+        }
+
+        ++i;
     }
     return false;
 }
@@ -1085,7 +1168,7 @@ void RecordFastStdlibHash(
     WriteBinaryFileAtomic(cacheDir / "stdlib_stat_v1.bin", buf);
 }
 
-constexpr std::uint32_t kProgramCacheVersion = 4u;
+constexpr std::uint32_t kProgramCacheVersion = 5u;
 
 [[nodiscard]] std::pair<std::uint64_t, std::uint64_t> ComputeRawInputBundleKey(
     const AeroV3CompileInput& input,

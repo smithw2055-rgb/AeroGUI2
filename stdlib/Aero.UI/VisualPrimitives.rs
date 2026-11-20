@@ -59,14 +59,47 @@ public class Border : Decorator {
 
 public class BoxShadow : Decorator {
     private DropShadowEffect _shadow;
+    private float _offsetX = 0.0f;
+    private float _offsetY = 0.0f;
 
     public BoxShadow() : base() {
         _shadow = new DropShadowEffect();
+        _shadow.ShadowDepth = 0.0f;
+        _shadow.Opacity = 1.0f;
+        _shadow.ColorRgba = ParseUtil.PackArgb(128u, 0u, 0u, 0u);
         Effect = _shadow;
+        if (ParseUtil.IsValidHandle(__nativeHandle)) {
+            Visual_SetBoxShadow(__nativeHandle, true);
+        }
+        SyncEffect();
     }
 
     public override string GetTypeName() { return "BoxShadow"; }
 
+    private void UpdateShadowOffset() {
+        float ox = _offsetX;
+        float oy = _offsetY;
+        float depth = Math.Sqrtf(ox * ox + oy * oy);
+        _shadow.ShadowDepth = depth;
+        if (depth > 0.0001f) {
+            float ax = Math.Absf(ox);
+            float ay = Math.Absf(oy);
+            float z = ax > ay ? (ay / ax) : (ax / ay);
+            float baseDeg = z * (45.0f - (z - 1.0f) * (14.0f + 3.83f * z));
+            if (ax < ay) { baseDeg = 90.0f - baseDeg; }
+            float deg = baseDeg;
+            if (ox < 0.0f && oy >= 0.0f) { deg = 180.0f - baseDeg; }
+            else if (ox < 0.0f && oy < 0.0f) { deg = 180.0f + baseDeg; }
+            else if (ox >= 0.0f && oy < 0.0f) { deg = 360.0f - baseDeg; }
+            _shadow.Direction = deg;
+        }
+        SyncEffect();
+    }
+
+    public string Color {
+        get { return _shadow.Color; }
+        set { _shadow.Color = value; SyncEffect(); }
+    }
     public string ShadowColor {
         get { return _shadow.Color; }
         set { _shadow.Color = value; SyncEffect(); }
@@ -87,6 +120,29 @@ public class BoxShadow : Decorator {
         get { return _shadow.Opacity; }
         set { _shadow.Opacity = value; SyncEffect(); }
     }
+    public float OffsetX {
+        get { return _offsetX; }
+        set { _offsetX = value; UpdateShadowOffset(); }
+    }
+    public float OffsetY {
+        get { return _offsetY; }
+        set { _offsetY = value; UpdateShadowOffset(); }
+    }
+    public float Spread { get; set; } = 0.0f;
+    public bool Inside { get; set; } = false;
+
+    public override bool SetPropertyValue(string propName, DependencyObject value) {
+        if (propName == "Color" || propName == "ShadowColor") { Color = DependencyObject.UnboxString(value, "#7F000000"); return true; }
+        if (propName == "BlurRadius") { BlurRadius = DependencyObject.UnboxFloat(value, 10.0f); return true; }
+        if (propName == "OffsetX") { OffsetX = DependencyObject.UnboxFloat(value, 0.0f); return true; }
+        if (propName == "OffsetY") { OffsetY = DependencyObject.UnboxFloat(value, 0.0f); return true; }
+        if (propName == "Spread") { Spread = DependencyObject.UnboxFloat(value, 0.0f); return true; }
+        if (propName == "Inside") { Inside = DependencyObject.UnboxBool(value, false); return true; }
+        if (propName == "ShadowDepth") { ShadowDepth = DependencyObject.UnboxFloat(value, 0.0f); return true; }
+        if (propName == "Direction") { Direction = DependencyObject.UnboxFloat(value, 315.0f); return true; }
+        if (propName == "ShadowOpacity") { ShadowOpacity = DependencyObject.UnboxFloat(value, 1.0f); return true; }
+        return base.SetPropertyValue(propName, value);
+    }
 }
 
 // ============================================================================
@@ -96,9 +152,13 @@ public class BoxShadow : Decorator {
 public class Inline : DependencyObject {
     public string Text { get; set; } = "";
     public Brush Foreground { get; set; }
+    public string FontFamily { get; set; } = "";
     public string FontWeight { get; set; } = "";
+    public string FontStyle { get; set; } = "";
     public float FontSize { get; set; } = 0.0f;
+    public int Decorations { get; set; } = 0;
     internal TextBlock OwnerTextBlock;
+    internal DependencyObject _ownBindingsBox;
 
     public virtual bool SetPropertyValue(string propName, DependencyObject value) {
         if (propName == "Text") {
@@ -111,13 +171,28 @@ public class Inline : DependencyObject {
             if (OwnerTextBlock != null) { OwnerTextBlock.NotifyInlineChanged(); }
             return true;
         }
+        if (propName == "FontFamily") {
+            FontFamily = DependencyObject.UnboxString(value, "");
+            if (OwnerTextBlock != null) { OwnerTextBlock.NotifyInlineChanged(); }
+            return true;
+        }
         if (propName == "FontWeight") {
             FontWeight = DependencyObject.UnboxString(value, "Normal");
             if (OwnerTextBlock != null) { OwnerTextBlock.NotifyInlineChanged(); }
             return true;
         }
+        if (propName == "FontStyle") {
+            FontStyle = DependencyObject.UnboxString(value, "Normal");
+            if (OwnerTextBlock != null) { OwnerTextBlock.NotifyInlineChanged(); }
+            return true;
+        }
         if (propName == "FontSize") {
             FontSize = DependencyObject.UnboxFloat(value, 14.0f);
+            if (OwnerTextBlock != null) { OwnerTextBlock.NotifyInlineChanged(); }
+            return true;
+        }
+        if (propName == "TextDecorations") {
+            Decorations = DependencyObject.UnboxInt(value, 0);
             if (OwnerTextBlock != null) { OwnerTextBlock.NotifyInlineChanged(); }
             return true;
         }
@@ -127,9 +202,28 @@ public class Inline : DependencyObject {
     public virtual DependencyObject GetPropertyValue(string propName) {
         if (propName == "Text") { return DependencyObject.BoxString(Text); }
         if (propName == "Foreground") { return Foreground; }
+        if (propName == "FontFamily") { return DependencyObject.BoxString(FontFamily); }
         if (propName == "FontWeight") { return DependencyObject.BoxString(FontWeight); }
+        if (propName == "FontStyle") { return DependencyObject.BoxString(FontStyle); }
         if (propName == "FontSize") { return DependencyObject.BoxFloat(FontSize); }
+        if (propName == "TextDecorations") { return DependencyObject.BoxInt(Decorations); }
         return null;
+    }
+
+    internal Inline CloneStyleState() {
+        var c = new Inline();
+        c.CopyStyleFrom(this);
+        return c;
+    }
+
+    internal void CopyStyleFrom(Inline other) {
+        if (other == null) { return; }
+        FontWeight = other.FontWeight;
+        FontStyle = other.FontStyle;
+        FontSize = other.FontSize;
+        FontFamily = other.FontFamily;
+        Foreground = other.Foreground;
+        Decorations = other.Decorations;
     }
 }
 
@@ -162,6 +256,9 @@ public class TextBlock : FrameworkElement {
     private bool _hasExplicitFontFamily = false;
     private bool _hasExplicitFontWeight = false;
     private bool _hasExplicitForeground = false;
+    internal string _rawRichText = "";
+    internal bool _richNeedsResolve = false;
+    internal static Action<TextBlock, string> _richTextHandler;
 
     public TextBlock() : base(VisualKind.Text) {
         _inlines = new Inline[0];
@@ -181,6 +278,17 @@ public class TextBlock : FrameworkElement {
         get { return _text; }
         set {
             string v = value == null ? "" : value;
+            _rawRichText = "";
+            _richNeedsResolve = false;
+            if (_inlines != null && _inlines.Length > 0) {
+                for (int k = 0; k < _inlines.Length; k += 1) {
+                    if (_inlines[k] != null) { _inlines[k].OwnerTextBlock = null; }
+                }
+                _inlines.Clear();
+                _text = v;
+                SyncTextToNative();
+                return;
+            }
             if (_text == v) { return; }
             _text = v;
             SyncTextToNative();
@@ -271,6 +379,9 @@ public class TextBlock : FrameworkElement {
     internal void NotifyInlineChanged() { RebuildFromInlines(); }
     public void AddRun(Run run) { AddInline(run); }
     public void ClearInlines() {
+        for (int i = 0; i < _inlines.Length; i += 1) {
+            if (_inlines[i] != null) { _inlines[i].OwnerTextBlock = null; }
+        }
         _inlines.Clear();
         _text = "";
         SyncTextToNative();
@@ -280,9 +391,6 @@ public class TextBlock : FrameworkElement {
         string combined = "";
         for (int i = 0; i < _inlines.Length; i += 1) {
             combined = combined + _inlines[i].Text;
-            if (_inlines[i].Foreground != null && i == 0) {
-                _foreground = _inlines[i].Foreground;
-            }
         }
         _text = combined;
         SyncTextToNative();
@@ -295,9 +403,39 @@ public class TextBlock : FrameworkElement {
         return new Size(w, h);
     }
 
+    private static int ParseFontWeightOrZero(string w) {
+        if (w == null || w.Length == 0) { return 0; }
+        string s = w.Trim();
+        if (s.Length == 0) { return 0; }
+        if (s == "Bold" || s == "bold") { return 700; }
+        if (s == "SemiBold" || s == "semibold" || s == "DemiBold" || s == "demibold") { return 600; }
+        if (s == "Normal" || s == "normal" || s == "Regular" || s == "regular") { return 400; }
+        if (s == "Medium" || s == "medium") { return 500; }
+        if (s == "ExtraBold" || s == "extrabold" || s == "UltraBold" || s == "ultrabold") { return 800; }
+        if (s == "Black" || s == "black" || s == "Heavy" || s == "heavy") { return 900; }
+        if (s == "Light" || s == "light") { return 300; }
+        if (s == "ExtraLight" || s == "extralight" || s == "UltraLight" || s == "ultralight") { return 200; }
+        if (s == "Thin" || s == "thin") { return 100; }
+        int numeric = ParseUtil.ParseInt(s, 0);
+        return numeric > 0 ? numeric : 400;
+    }
+
+    private static int ParseFontWeight(string w) {
+        int v = ParseFontWeightOrZero(w);
+        return v > 0 ? v : 400;
+    }
+
+    private static bool IsItalicStyle(string s) {
+        if (s == null || s.Length == 0) { return false; }
+        string t = s.Trim();
+        return t == "Italic" || t == "italic" || t == "Oblique" || t == "oblique";
+    }
+
     protected void SyncTextToNative() {
         if (!ParseUtil.IsValidHandle(__nativeHandle)) { return; }
-        uint fg = _foreground != null ? _foreground.ResolveRgba() : ParseUtil.PackArgb(255u, 234u, 236u, 239u);
+        uint fg = _foreground != null ? _foreground.ResolveRgbaUnscaled() : ParseUtil.PackArgb(255u, 234u, 236u, 239u);
+        int fgGradId = _foreground != null ? _foreground.ResolveGradIdUnscaled() : -1;
+        float fgOp = _foreground != null ? Math.Clampf(_foreground.Opacity, 0.0f, 1.0f) : 1.0f;
         Visual_SetText(
             __nativeHandle,
             _text,
@@ -307,6 +445,32 @@ public class TextBlock : FrameworkElement {
             EnumConvert.ToInt(_textWrapping),
             EnumConvert.ToInt(_textAlignment),
             EnumConvert.ToInt(_textTrimming));
+        Visual_SetTextStyle(
+            __nativeHandle,
+            ParseFontWeight(_fontWeight),
+            IsItalicStyle(_fontStyle),
+            fgGradId);
+        Visual_SetTextBrushOpacity(__nativeHandle, fgOp);
+        Visual_ClearTextSpans(__nativeHandle);
+        if (_inlines != null && _inlines.Length > 0) {
+            for (int i = 0; i < _inlines.Length; i += 1) {
+                Inline inl = _inlines[i];
+                if (inl == null) { continue; }
+                bool hasFg = inl.Foreground != null;
+                uint spanFg = hasFg ? inl.Foreground.ResolveRgba() : 0u;
+                int spanItalic = inl.FontStyle.Length == 0 ? -1 : (IsItalicStyle(inl.FontStyle) ? 1 : 0);
+                Visual_AddTextSpan(
+                    __nativeHandle,
+                    inl.Text,
+                    inl.FontFamily,
+                    inl.FontSize,
+                    ParseFontWeightOrZero(inl.FontWeight),
+                    spanItalic,
+                    spanFg,
+                    hasFg,
+                    inl.Decorations);
+            }
+        }
     }
 
     protected void SyncTextMetricsToNative() {
@@ -317,36 +481,47 @@ public class TextBlock : FrameworkElement {
     public Brush Stroke { get; set; }
     public float StrokeThickness { get; set; } = 0.0f;
 
-    private static string StripRichTextTags(string raw) {
-        if (raw == null || raw.Length == 0) { return ""; }
-        string outText = "";
-        int i = 0;
-        while (i < raw.Length) {
-            string ch = raw.Substring(i, 1);
-            if (ch == "[") {
-                int closeIdx = -1;
-                int j = i + 1;
-                while (j < raw.Length) {
-                    string cj = raw.Substring(j, 1);
-                    if (cj == "]") { closeIdx = j; break; }
-                    if (cj == "[") { break; }
-                    j += 1;
-                }
-                if (closeIdx > i) {
-                    i = closeIdx + 1;
-                    continue;
-                }
-            }
-            outText = outText + ch;
-            i += 1;
+    internal void ClearRichInlines() {
+        for (int k = 0; k < _inlines.Length; k += 1) {
+            if (_inlines[k] != null) { _inlines[k].OwnerTextBlock = null; }
         }
-        return outText;
+        _inlines.Clear();
+    }
+
+    internal void PushRichInline(Inline inl) {
+        if (inl == null) { return; }
+        inl.OwnerTextBlock = this;
+        _inlines.Push(inl);
+    }
+
+    internal void FinishRichText(bool emptyClear) {
+        if (emptyClear) {
+            _text = "";
+            SyncTextToNative();
+        } else {
+            RebuildFromInlines();
+        }
+    }
+
+    protected override void OnLoaded() {
+        base.OnLoaded();
+        if (_rawRichText.Length > 0 && _richNeedsResolve && _richTextHandler != null) {
+            _richTextHandler(this, _rawRichText);
+        }
+        if (_inlines != null && _inlines.Length > 0) {
+            BindingEngine.FlushInlinesFor(this);
+        }
     }
 
     public override bool SetPropertyValue(string propName, DependencyObject value) {
         if (propName == "Text") { Text = DependencyObject.UnboxString(value, ""); return true; }
         if (propName == "RichText.Text" || propName == "noesis:RichText.Text") {
-            Text = StripRichTextTags(DependencyObject.UnboxString(value, ""));
+            string raw = DependencyObject.UnboxString(value, "");
+            if (_richTextHandler != null) {
+                _richTextHandler(this, raw);
+            } else {
+                Text = raw;
+            }
             return true;
         }
         if (propName == "FontFamily") { FontFamily = DependencyObject.UnboxString(value, "Segoe UI"); return true; }
@@ -476,13 +651,20 @@ public class Shape : FrameworkElement {
     private float _strokeOpacity = 1.0f;
     private bool _ownsClonedFill = false;
     private bool _ownsClonedStroke = false;
+    private bool _hadFillImage = false;
     private float _strokeThickness = 1.0f;
     private Stretch _stretch = Stretch.Fill;
     private float _trimStart = 0.0f;
     private float _trimEnd = 1.0f;
 
-    protected Shape() : base(VisualKind.Vector) {}
+    protected Shape() : base(VisualKind.Vector) {
+        SyncInteractiveFlags();
+    }
     public override string GetTypeName() { return "Shape"; }
+
+    protected override bool IsSelfHitTestSolid() {
+        return _fill != null || (_stroke != null && _strokeThickness > 0.0f);
+    }
 
     public Brush Fill {
         get { return _fill; }
@@ -531,8 +713,28 @@ public class Shape : FrameworkElement {
 
     public void SyncVectorShape() {
         if (!ParseUtil.IsValidHandle(__nativeHandle)) { return; }
-        uint fillCol = _fill != null ? _fill.ResolveRgbaUnscaled() : 0u;
-        int fillGrad = _fill != null ? _fill.ResolveGradIdUnscaled() : -1;
+        uint fillCol = 0u;
+        int fillGrad = -1;
+        if (_fill is ImageBrush) {
+            ImageBrush ib = _fill as ImageBrush;
+            Visual_SetImage(
+                __nativeHandle,
+                ib.ImageSource,
+                EnumConvert.ToInt(ib.Stretch),
+                EnumConvert.ToInt(StretchDirection.Both),
+                ParseUtil.PackArgb(255u, 255u, 255u, 255u));
+            UIElement.ApplyImageBrushViewbox(__nativeHandle, ib.Viewbox);
+            _hadFillImage = true;
+        } else {
+            if (_hadFillImage) {
+                UIElement.ClearImageBrushFromNative(__nativeHandle);
+                _hadFillImage = false;
+            }
+            if (_fill != null) {
+                fillCol = _fill.ResolveRgbaUnscaled();
+                fillGrad = _fill.ResolveGradIdUnscaled();
+            }
+        }
         uint strokeCol = _stroke != null ? _stroke.ResolveRgbaUnscaled() : 0u;
         int strokeGrad = _stroke != null ? _stroke.ResolveGradIdUnscaled() : -1;
         Visual_SetVectorShape(
@@ -544,11 +746,17 @@ public class Shape : FrameworkElement {
             _strokeThickness,
             EnumConvert.ToInt(_stretch),
             _trimStart, _trimEnd);
+        SyncInteractiveFlags();
     }
 
     public override bool SetPropertyValue(string propName, DependencyObject value) {
         if (propName == "Fill") { Fill = UIElement.CoerceBrush(value); return true; }
         if (propName == "Stroke") { Stroke = UIElement.CoerceBrush(value); return true; }
+        if (propName == "Fill.ImageSource" && _fill is ImageBrush) {
+            (_fill as ImageBrush).ImageSource = DependencyObject.UnboxString(value, "");
+            SyncVectorShape();
+            return true;
+        }
         if (propName == "Fill.Opacity") {
             _fillOpacity = Math.Clampf(DependencyObject.UnboxFloat(value, 1.0f), 0.0f, 1.0f);
             SyncVectorBrushOpacity();
@@ -620,6 +828,9 @@ public class Shape : FrameworkElement {
 
     public override DependencyObject GetPropertyValue(string propName) {
         if (propName == "Fill") { return _fill; }
+        if (propName == "Fill.ImageSource" && _fill is ImageBrush) {
+            return DependencyObject.BoxString((_fill as ImageBrush).ImageSource);
+        }
         if (propName == "Fill.Opacity") { return DependencyObject.BoxFloat(_fillOpacity); }
         if (propName == "Fill.Color") {
             return DependencyObject.BoxString(_fill != null ? ParseUtil.FormatArgbHex(_fill.ResolveRgbaUnscaled()) : "#00000000");

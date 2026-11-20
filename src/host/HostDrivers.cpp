@@ -24,7 +24,7 @@ AriaShadowNode BuildAriaNodeRecursive(const VisualWorld* world, VisualNodeId id)
     node.focusable = vnode->layout.isFocusable;
     if (vnode->kind == VisualKind::Text) {
         node.role = "text";
-        node.value = vnode->text.text;
+        node.value = vnode->Text().text;
     } else {
         node.role = "region";
     }

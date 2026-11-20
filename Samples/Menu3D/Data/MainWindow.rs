@@ -364,19 +364,28 @@ public partial class MainWindow : Page
     {
     }
 
+    private void NavigateMenu(string menuId)
+    {
+        if (this.VM != null) { this.VM.SetActiveMenu(menuId); }
+        UIElement navTarget = this.FindName("NavigationRoot");
+        if (navTarget == null) { navTarget = this; }
+        Navigation.NavigateTo(navTarget, menuId);
+        BindingEngine.Flush();
+    }
+
     public void NavigateToMain()
     {
-        if (this.VM != null) { this.VM.SetActiveMenu("Main"); }
+        this.NavigateMenu("Main");
     }
 
     public void NavigateToStart()
     {
-        if (this.VM != null) { this.VM.SetActiveMenu("Start"); }
+        this.NavigateMenu("Start");
     }
 
     public void NavigateToSettings()
     {
-        if (this.VM != null) { this.VM.SetActiveMenu("Settings"); }
+        this.NavigateMenu("Settings");
     }
 
     public void SetPlatform(Platform platform)

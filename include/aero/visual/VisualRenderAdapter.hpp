@@ -93,7 +93,8 @@ private:
         const Matrix2D& world2D,
         const Matrix4x4& world3D,
         bool has3D,
-        BlendingMode blend);
+        BlendingMode blend,
+        bool forceSolidShadowColor = false);
 
     static std::size_t EmitImageVisual(
         PagedRenderTree& tree,

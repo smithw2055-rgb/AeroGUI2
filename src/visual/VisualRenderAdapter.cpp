@@ -356,6 +356,25 @@ struct ParsedSvgSubpaths {
     return out;
 }
 
+class ScopedBlendMode final {
+public:
+    ScopedBlendMode(BlendingMode& slot, BlendingMode next) noexcept
+        : slot_(slot), prev_(slot) {
+        slot_ = next;
+    }
+
+    ~ScopedBlendMode() noexcept {
+        slot_ = prev_;
+    }
+
+    ScopedBlendMode(const ScopedBlendMode&) = delete;
+    ScopedBlendMode& operator=(const ScopedBlendMode&) = delete;
+
+private:
+    BlendingMode& slot_;
+    BlendingMode prev_;
+};
+
 } // namespace
 
 void VisualRenderAdapter::ApplyNodeTransform(
@@ -420,6 +439,7 @@ std::size_t VisualRenderAdapter::EmitLineSegment(
         const Matrix4x4& world3D,
         bool has3D,
         BlendingMode blend) {
+        const ScopedBlendMode blendGuard(tree.activeBlendMode_, blend);
         if (color.a <= 0.0f || thickness <= 0.0f) {
             return 0u;
         }
@@ -484,6 +504,7 @@ std::size_t VisualRenderAdapter::EmitSvgPathPrimitive(
         BlendingMode blend,
         float fillOpacity,
         float strokeOpacity) {
+        const ScopedBlendMode blendGuard(tree.activeBlendMode_, blend);
         if (pathData.empty() || destBox.width <= 0.0f || destBox.height <= 0.0f) {
             return 0u;
         }
@@ -657,6 +678,7 @@ std::size_t VisualRenderAdapter::EmitBoxVisual(
         const Matrix4x4& world3D,
         bool has3D,
         BlendingMode blend) {
+        const ScopedBlendMode blendGuard(tree.activeBlendMode_, blend);
         std::size_t count = 0u;
         const bool hasBorderThickness = HasPositiveThickness(node.box.borderThickness);
         Color borderColor = UnpackRgba32(node.box.borderRgba, effOpacity);
@@ -736,7 +758,8 @@ std::size_t VisualRenderAdapter::EmitBoxVisual(
             count += (endNid - beginNid);
         }
 
-        if (!node.image.uri.empty() && HasAlpha(node.image.tintRgba) &&
+        const VisualImageData& boxImg = node.Image();
+        if (!boxImg.uri.empty() && HasAlpha(boxImg.tintRgba) &&
             bgRect.width > 0.0f && bgRect.height > 0.0f) {
             count += EmitImageVisual(tree, node, bgRect, effOpacity, world2D, world3D, has3D, blend);
         }
@@ -767,7 +790,10 @@ std::size_t VisualRenderAdapter::EmitTextVisual(
         const Matrix2D& world2D,
         const Matrix4x4& world3D,
         bool has3D,
-        BlendingMode blend) {
+        BlendingMode blend,
+        bool forceSolidShadowColor) {
+        const ScopedBlendMode blendGuard(tree.activeBlendMode_, blend);
+        const VisualTextData& txt = node.Text();
         const float padL = std::max(0.0f, node.layout.padding.left);
         const float padT = std::max(0.0f, node.layout.padding.top);
         const float padR = std::max(0.0f, node.layout.padding.right);
@@ -779,33 +805,64 @@ std::size_t VisualRenderAdapter::EmitTextVisual(
             std::max(0.0f, rect.height - padT - padB)};
 
         UIResourceStore* store = tree.ResourceStore() ? tree.ResourceStore() : &UIResourceStore::Default();
-        const float maxW = (node.text.wrap == TextWrapping::NoWrap)
+        const float maxW = (txt.wrap == TextWrapping::NoWrap)
             ? 1000000.0f
             : std::max(1.0f, textRect.width);
-        const TextLayoutResult measured = store->Fonts().MeasureLayout(
-            node.text.text,
-            node.text.fontFamily,
-            node.text.fontSize,
-            maxW,
-            node.text.wrap,
-            node.text.charSpacing);
+        TextLayoutResult measured{};
+        if (!txt.richSpans.empty()) {
+            std::vector<RichTextRunInput> runs;
+            runs.reserve(txt.richSpans.size());
+            for (const VisualTextSpan& sp : txt.richSpans) {
+                RichTextRunInput r{};
+                r.text = sp.text;
+                r.fontFamily = sp.fontFamily;
+                r.fontSize = sp.fontSize;
+                r.fontWeight = sp.fontWeight;
+                r.fontItalic = sp.fontItalic;
+                r.fgRgba = sp.fgRgba;
+                r.hasFg = sp.hasFg;
+                r.decorations = sp.decorations;
+                runs.push_back(r);
+            }
+            measured = store->Fonts().MeasureRichLayout(
+                runs,
+                txt.fontFamily,
+                txt.fontSize,
+                txt.fontWeight,
+                txt.fontItalic,
+                maxW,
+                txt.wrap,
+                txt.charSpacing,
+                txt.lineHeight);
+        } else {
+            measured = store->Fonts().MeasureLayout(
+                txt.text,
+                txt.fontFamily,
+                txt.fontSize,
+                maxW,
+                txt.wrap,
+                txt.charSpacing,
+                txt.fontWeight,
+                txt.fontItalic,
+                txt.lineHeight);
+        }
 
         std::size_t count = 0u;
         auto lineAlignDx = [&](const TextLineMetrics& line) noexcept -> float {
-            if (node.text.align == TextAlignment::Center) {
+            if (txt.align == TextAlignment::Center) {
                 return std::max(0.0f, (textRect.width - line.width) * 0.5f);
             }
-            if (node.text.align == TextAlignment::Right) {
+            if (txt.align == TextAlignment::Right) {
                 return std::max(0.0f, textRect.width - line.width);
             }
             return 0.0f;
         };
 
         // Optional text selection highlight behind glyphs
-        if (node.text.selLenCp > 0 && HasAlpha(node.text.selRgba) && !measured.lines.empty()) {
-            const std::uint32_t selBegin = static_cast<std::uint32_t>(std::max<std::int32_t>(0, node.text.selStartCp));
-            const std::uint32_t selEnd = selBegin + static_cast<std::uint32_t>(node.text.selLenCp);
-            const Color selCol = UnpackRgba32(node.text.selRgba, effOpacity);
+        if (txt.selLenCp > 0 && HasAlpha(txt.selRgba) && !measured.lines.empty()) {
+            const std::uint32_t selBegin = static_cast<std::uint32_t>(std::max<std::int32_t>(0, txt.selStartCp));
+            const std::uint32_t selEnd = selBegin + static_cast<std::uint32_t>(txt.selLenCp);
+            const Color selCol = UnpackRgba32(txt.selRgba, effOpacity);
 
             for (const TextLineMetrics& line : measured.lines) {
                 const float alignDx = lineAlignDx(line);
@@ -837,7 +894,7 @@ std::size_t VisualRenderAdapter::EmitTextVisual(
         }
 
         // Main SDF text run
-        if (!node.text.text.empty()) {
+        if (!txt.text.empty() || !txt.richSpans.empty()) {
             PagedRenderTraversalState state{};
             state.clipRect = tree.activeClipRect_;
             state.clipActive = tree.activeClipEnabled_;
@@ -852,31 +909,106 @@ std::size_t VisualRenderAdapter::EmitTextVisual(
             state.blendMode = blend;
             state.world3D = world3D;
 
-            const Color fg = UnpackRgba32(node.text.fgRgba, effOpacity);
-            count += tree.EmitTextRunNodes(
+            const GradientBrushDesc* fgGrad = nullptr;
+            if (!forceSolidShadowColor && txt.fgGradId > 0) {
+                fgGrad = store->GradientBrushes().Find(static_cast<std::uint32_t>(txt.fgGradId));
+                if (!fgGrad) {
+                    fgGrad = GradientBrushRegistry::Instance().Find(static_cast<std::uint32_t>(txt.fgGradId));
+                }
+            }
+
+            const float textOpacity = effOpacity * std::clamp(txt.fgOpacity, 0.0f, 1.0f);
+            const Color fg = UnpackRgba32(txt.fgRgba, textOpacity);
+            count += tree.EmitPreparedTextLayoutNodes(
                 textRect.x,
                 textRect.y,
-                node.text.fontSize,
-                node.text.text,
+                txt.fontSize,
+                measured,
                 fg,
-                effOpacity,
+                textOpacity,
                 state,
                 &node,
-                node.text.fontFamily,
-                maxW,
-                node.text.wrap,
-                node.text.align,
+                txt.align,
                 textRect.width,
                 nullptr,
-                node.text.charSpacing);
+                fgGrad,
+                textRect.height,
+                forceSolidShadowColor);
+
+            bool hasDecorations = (txt.decorations != 0);
+            if (!hasDecorations) {
+                for (const PositionedGlyph& pg : measured.glyphs) {
+                    if (pg.underline || pg.strikethrough) {
+                        hasDecorations = true;
+                        break;
+                    }
+                }
+            }
+            if (hasDecorations && !measured.lines.empty()) {
+                TextLayoutResult decoLayout = measured;
+                ApplyTextAlignmentToLayout(decoLayout, txt.align, textRect.width);
+                const float strokeH = std::max(1.0f, txt.fontSize * 0.07f);
+                const bool nodeU = (txt.decorations & 1) != 0;
+                const bool nodeS = (txt.decorations & 2) != 0;
+                for (const TextLineMetrics& lm : decoLayout.lines) {
+                    const std::size_t gEnd = std::min(lm.firstGlyphIndex + lm.glyphCount, decoLayout.glyphs.size());
+                    auto emitDecoRun = [&](bool isStrike) {
+                        std::size_t k = lm.firstGlyphIndex;
+                        while (k < gEnd) {
+                            const PositionedGlyph& g0 = decoLayout.glyphs[k];
+                            const bool active = isStrike ? (nodeS || g0.strikethrough) : (nodeU || g0.underline);
+                            if (!active) {
+                                ++k;
+                                continue;
+                            }
+                            const std::uint32_t runRgba = (!forceSolidShadowColor && g0.hasCustomRgba) ? g0.customRgba : txt.fgRgba;
+                            const bool runHasCustom = !forceSolidShadowColor && g0.hasCustomRgba;
+                            float xStart = g0.penX;
+                            float xEnd = g0.penX + g0.advanceX;
+                            std::size_t m = k + 1u;
+                            while (m < gEnd) {
+                                const PositionedGlyph& gm = decoLayout.glyphs[m];
+                                const bool mAct = isStrike ? (nodeS || gm.strikethrough) : (nodeU || gm.underline);
+                                const bool mCustom = !forceSolidShadowColor && gm.hasCustomRgba;
+                                const std::uint32_t mRgba = mCustom ? gm.customRgba : txt.fgRgba;
+                                if (!mAct || mCustom != runHasCustom || mRgba != runRgba) {
+                                    break;
+                                }
+                                xEnd = gm.penX + gm.advanceX;
+                                ++m;
+                            }
+                            if (xEnd > xStart + 0.5f) {
+                                const float barY = textRect.y + (isStrike
+                                    ? (lm.baselineY - std::max(2.0f, lm.ascent * 0.32f))
+                                    : (lm.baselineY + std::max(1.0f, lm.descent * 0.35f)));
+                                const auto beginNid = static_cast<std::uint32_t>(tree.nodes_.size());
+                                (void)tree.AllocateRoundedRectNode(
+                                    textRect.x + xStart,
+                                    barY,
+                                    xEnd - xStart,
+                                    strokeH,
+                                    UnpackRgba32(runRgba, textOpacity),
+                                    CornerRadius{},
+                                    &node);
+                                const auto endNid = static_cast<std::uint32_t>(tree.nodes_.size());
+                                ApplyNodeTransform(tree, beginNid, endNid, world2D, world3D, has3D, blend);
+                                count += (endNid - beginNid);
+                            }
+                            k = m;
+                        }
+                    };
+                    emitDecoRun(false);
+                    emitDecoRun(true);
+                }
+            }
         }
 
         // Optional caret cursor overlay
-        if (node.text.showCaret && node.text.caretCp >= 0 && HasAlpha(node.text.caretRgba)) {
-            const auto targetCp = static_cast<std::uint32_t>(node.text.caretCp);
+        if (txt.showCaret && txt.caretCp >= 0 && HasAlpha(txt.caretRgba)) {
+            const auto targetCp = static_cast<std::uint32_t>(txt.caretCp);
             float caretX = textRect.x;
             float caretY = textRect.y;
-            float caretH = std::max(1.0f, (measured.lineHeight > 0.0f) ? measured.lineHeight : node.text.fontSize * 1.25f);
+            float caretH = std::max(1.0f, (measured.lineHeight > 0.0f) ? measured.lineHeight : txt.fontSize * 1.25f);
             if (!measured.lines.empty()) {
                 caretX = textRect.x + lineAlignDx(measured.lines.front());
                 caretY = textRect.y + measured.lines.front().topY;
@@ -911,7 +1043,7 @@ std::size_t VisualRenderAdapter::EmitTextVisual(
                 caretY,
                 1.5f,
                 caretH,
-                UnpackRgba32(node.text.caretRgba, effOpacity),
+                UnpackRgba32(txt.caretRgba, effOpacity),
                 CornerRadius{},
                 &node);
             const auto endNid = static_cast<std::uint32_t>(tree.nodes_.size());
@@ -930,53 +1062,106 @@ std::size_t VisualRenderAdapter::EmitImageVisual(
     const Matrix4x4& world3D,
     bool has3D,
     BlendingMode blend) {
-    if (node.image.uri.empty() || !HasAlpha(node.image.tintRgba)) {
+    const ScopedBlendMode blendGuard(tree.activeBlendMode_, blend);
+    const VisualImageData& img = node.Image();
+    if (img.uri.empty() || !HasAlpha(img.tintRgba)) {
         return 0u;
     }
     UIResourceStore* store = tree.ResourceStore() ? tree.ResourceStore() : &UIResourceStore::Default();
-    const ImageAtlasEntry* entry = store->Images().LoadOrGet(node.image.uri);
-    if (!entry || entry->width == 0u || entry->height == 0u) {
+    const ImageAtlasEntry* entry = store->Images().LoadOrGet(img.uri);
+    if (!entry || entry->width == 0u || entry->height == 0u ||
+        rect.width <= 0.0f || rect.height <= 0.0f) {
         return 0u;
     }
-    const float vx = std::clamp(node.image.viewboxX, 0.0f, 0.9999f);
-    const float vy = std::clamp(node.image.viewboxY, 0.0f, 0.9999f);
-    const float vw = std::clamp(node.image.viewboxW, 1e-4f, 1.0f - vx);
-    const float vh = std::clamp(node.image.viewboxH, 1e-4f, 1.0f - vy);
-    const float cropU0 = entry->u0 + vx * (entry->u1 - entry->u0);
-    const float cropU1 = entry->u0 + (vx + vw) * (entry->u1 - entry->u0);
-    const float cropV0 = entry->v0 + vy * (entry->v1 - entry->v0);
-    const float cropV1 = entry->v0 + (vy + vh) * (entry->v1 - entry->v0);
-    const ImageStretchPlacement place = ComputeImageStretchPlacement(
-        rect,
-        static_cast<float>(entry->width) * vw,
-        static_cast<float>(entry->height) * vh,
-        node.image.stretch,
-        node.image.stretchDir,
-        cropU0,
-        cropV0,
-        cropU1,
-        cropV1);
-        if (!place.valid || place.destRect.width <= 0.0f || place.destRect.height <= 0.0f) {
-            return 0u;
-        }
-        const auto beginNid = static_cast<std::uint32_t>(tree.nodes_.size());
-        (void)tree.AllocateTexturedNode(
-            place.destRect.x,
-            place.destRect.y,
-            place.destRect.width,
-            place.destRect.height,
-            place.u0,
-            place.v0,
-            place.u1,
-            place.v1,
-            UnpackRgba32(node.image.tintRgba, effOpacity),
-            1.0f,
-            &node,
-            entry->textureId);
-        const auto endNid = static_cast<std::uint32_t>(tree.nodes_.size());
-        ApplyNodeTransform(tree, beginNid, endNid, world2D, world3D, has3D, blend);
-        return endNid - beginNid;
+    const float imgW = static_cast<float>(entry->width);
+    const float imgH = static_cast<float>(entry->height);
+    const float vx = std::clamp(img.viewboxX, 0.0f, 0.9999f);
+    const float vy = std::clamp(img.viewboxY, 0.0f, 0.9999f);
+    const float vw = std::clamp(img.viewboxW, 1e-4f, 1.0f - vx);
+    const float vh = std::clamp(img.viewboxH, 1e-4f, 1.0f - vy);
+    const float vbW = imgW * vw;
+    const float vbH = imgH * vh;
+    if (vbW <= 0.0f || vbH <= 0.0f) {
+        return 0u;
     }
+
+    float sx = 1.0f;
+    float sy = 1.0f;
+    switch (img.stretch) {
+        case Stretch::None:
+            sx = 1.0f;
+            sy = 1.0f;
+            break;
+        case Stretch::Fill:
+            sx = rect.width / vbW;
+            sy = rect.height / vbH;
+            break;
+        case Stretch::Uniform: {
+            const float s = std::min(rect.width / vbW, rect.height / vbH);
+            sx = s;
+            sy = s;
+            break;
+        }
+        case Stretch::UniformToFill: {
+            const float s = std::max(rect.width / vbW, rect.height / vbH);
+            sx = s;
+            sy = s;
+            break;
+        }
+    }
+    if (img.stretch != Stretch::None) {
+        if (img.stretchDir == StretchDirection::UpOnly) {
+            sx = std::max(1.0f, sx);
+            sy = std::max(1.0f, sy);
+        } else if (img.stretchDir == StretchDirection::DownOnly) {
+            sx = std::min(1.0f, sx);
+            sy = std::min(1.0f, sy);
+        }
+    }
+
+    // Map the Viewbox rectangle into rect, then intersect the full unclipped source image with rect
+    const float placedVbW = vbW * sx;
+    const float placedVbH = vbH * sy;
+    const float placedVbX = rect.x + (rect.width - placedVbW) * 0.5f;
+    const float placedVbY = rect.y + (rect.height - placedVbH) * 0.5f;
+    const float imgX0 = placedVbX - (vx * imgW) * sx;
+    const float imgY0 = placedVbY - (vy * imgH) * sy;
+    const float fullImgW = std::max(1e-4f, imgW * sx);
+    const float fullImgH = std::max(1e-4f, imgH * sy);
+
+    const float ix0 = std::max(rect.x, imgX0);
+    const float iy0 = std::max(rect.y, imgY0);
+    const float ix1 = std::min(rect.x + rect.width, imgX0 + fullImgW);
+    const float iy1 = std::min(rect.y + rect.height, imgY0 + fullImgH);
+    if (ix1 <= ix0 || iy1 <= iy0) {
+        return 0u;
+    }
+
+    const float srcU0 = std::clamp((ix0 - imgX0) / fullImgW, 0.0f, 1.0f);
+    const float srcU1 = std::clamp((ix1 - imgX0) / fullImgW, 0.0f, 1.0f);
+    const float srcV0 = std::clamp((iy0 - imgY0) / fullImgH, 0.0f, 1.0f);
+    const float srcV1 = std::clamp((iy1 - imgY0) / fullImgH, 0.0f, 1.0f);
+    const float spanU = entry->u1 - entry->u0;
+    const float spanV = entry->v1 - entry->v0;
+
+    const auto beginNid = static_cast<std::uint32_t>(tree.nodes_.size());
+    (void)tree.AllocateTexturedNode(
+        ix0,
+        iy0,
+        ix1 - ix0,
+        iy1 - iy0,
+        entry->u0 + srcU0 * spanU,
+        entry->v0 + srcV0 * spanV,
+        entry->u0 + srcU1 * spanU,
+        entry->v0 + srcV1 * spanV,
+        UnpackRgba32(img.tintRgba, effOpacity),
+        1.0f,
+        &node,
+        entry->textureId);
+    const auto endNid = static_cast<std::uint32_t>(tree.nodes_.size());
+    ApplyNodeTransform(tree, beginNid, endNid, world2D, world3D, has3D, blend);
+    return endNid - beginNid;
+}
 
 std::size_t VisualRenderAdapter::EmitVectorVisual(
         PagedRenderTree& tree,
@@ -987,17 +1172,25 @@ std::size_t VisualRenderAdapter::EmitVectorVisual(
         const Matrix4x4& world3D,
         bool has3D,
         BlendingMode blend) {
+        const ScopedBlendMode blendGuard(tree.activeBlendMode_, blend);
         std::size_t count = 0u;
-        const VisualVectorData& vec = node.vector;
+        const VisualVectorData& vec = node.Vector();
+        const VisualImageData& fillImg = node.Image();
 
         switch (vec.shapeKind) {
-            case VectorShapeKind::SvgPath:
+            case VectorShapeKind::SvgPath: {
+                const float effFillOp = std::clamp(effOpacity * vec.fillOpacity, 0.0f, 1.0f);
+                const bool hasImageFill = !fillImg.uri.empty() && effFillOp > 0.001f &&
+                                          rect.width > 0.0f && rect.height > 0.0f;
+                if (hasImageFill) {
+                    count += EmitImageVisual(tree, node, rect, effFillOp, world2D, world3D, has3D, blend);
+                }
                 count += EmitSvgPathPrimitive(
                     tree,
                     rect,
                     vec.pathOrParams,
-                    vec.fillRgba,
-                    vec.fillGradId,
+                    hasImageFill ? 0u : vec.fillRgba,
+                    hasImageFill ? -1 : vec.fillGradId,
                     vec.strokeRgba,
                     vec.strokeGradId,
                     vec.strokeWidth,
@@ -1013,12 +1206,17 @@ std::size_t VisualRenderAdapter::EmitVectorVisual(
                     vec.fillOpacity,
                     vec.strokeOpacity);
                 break;
+            }
 
             case VectorShapeKind::Ellipse: {
                 const float effFillOp = std::clamp(effOpacity * vec.fillOpacity, 0.0f, 1.0f);
                 const float effStrokeOp = std::clamp(effOpacity * vec.strokeOpacity, 0.0f, 1.0f);
+                const bool hasImageFill = !fillImg.uri.empty() && effFillOp > 0.001f &&
+                                          rect.width > 0.0f && rect.height > 0.0f;
                 const bool hasFill = (HasAlpha(vec.fillRgba) || vec.fillGradId > 0) && effFillOp > 0.001f;
-                if (hasFill) {
+                if (hasImageFill) {
+                    count += EmitImageVisual(tree, node, rect, effFillOp, world2D, world3D, has3D, blend);
+                } else if (hasFill) {
                     const auto beginNid = static_cast<std::uint32_t>(tree.nodes_.size());
                     if (vec.fillGradId > 0) {
                         const Color tint{1.0f, 1.0f, 1.0f, effFillOp};
@@ -1088,8 +1286,12 @@ std::size_t VisualRenderAdapter::EmitVectorVisual(
                     }
                 }
                 const CornerRadius cr{std::max(rx, ry)};
+                const bool hasImageFill = !fillImg.uri.empty() && effFillOp > 0.001f &&
+                                          rect.width > 0.0f && rect.height > 0.0f;
                 const bool hasFill = (HasAlpha(vec.fillRgba) || vec.fillGradId > 0) && effFillOp > 0.001f;
-                if (hasFill && rect.width > 0.0f && rect.height > 0.0f) {
+                if (hasImageFill) {
+                    count += EmitImageVisual(tree, node, rect, effFillOp, world2D, world3D, has3D, blend);
+                } else if (hasFill && rect.width > 0.0f && rect.height > 0.0f) {
                     const auto beginNid = static_cast<std::uint32_t>(tree.nodes_.size());
                     if (vec.fillGradId > 0) {
                         const Color tint{1.0f, 1.0f, 1.0f, effFillOp};
@@ -1236,6 +1438,7 @@ std::size_t VisualRenderAdapter::EmitCanvasDrawVisual(
         const Matrix4x4& world3D,
         bool has3D,
         BlendingMode blend) {
+        const ScopedBlendMode blendGuard(tree.activeBlendMode_, blend);
         if (!drawBuffer) {
             return 0u;
         }
@@ -1605,24 +1808,25 @@ std::size_t VisualRenderAdapter::EmitCanvasDrawVisual(
 [[nodiscard]] bool NodeNeedsOpacityMaskSpan(
     const VisualNode& node,
     const UIResourceStore* store) noexcept {
-    if (!node.opacityMask.enabled || node.layout.layoutRect.width <= 0.0f || node.layout.layoutRect.height <= 0.0f) {
+    const VisualOpacityMask& om = node.OpacityMask();
+    if (!om.enabled || node.layout.layoutRect.width <= 0.0f || node.layout.layoutRect.height <= 0.0f) {
         return false;
     }
-    const float maskOp = std::clamp(node.opacityMask.opacity, 0.0f, 1.0f);
-    if (node.opacityMask.gradId <= 0) {
-        const float solidA = static_cast<float>((node.opacityMask.solidRgba >> 24u) & 0xFFu) / 255.0f;
+    const float maskOp = std::clamp(om.opacity, 0.0f, 1.0f);
+    if (om.gradId <= 0) {
+        const float solidA = static_cast<float>((om.solidRgba >> 24u) & 0xFFu) / 255.0f;
         return (solidA * maskOp) < 0.999f;
     }
     GradientBrushDesc desc{};
-    const auto brushId = static_cast<std::uint32_t>(node.opacityMask.gradId);
+    const auto brushId = static_cast<std::uint32_t>(om.gradId);
     const bool found = (store != nullptr && store->GradientBrushes().TryGetBrush(brushId, desc)) ||
                        GradientBrushRegistry::Instance().TryGetBrush(brushId, desc);
     if (!found || desc.stops.empty()) {
         return maskOp < 0.999f;
     }
-    for (std::size_t i = 0u; i < desc.stops.size() && i < node.opacityMask.stopOffsets.size(); ++i) {
-        if (std::isfinite(node.opacityMask.stopOffsets[i])) {
-            desc.stops[i].offset = std::clamp(node.opacityMask.stopOffsets[i], 0.0f, 1.0f);
+    for (std::size_t i = 0u; i < desc.stops.size() && i < om.stopOffsets.size(); ++i) {
+        if (std::isfinite(om.stopOffsets[i])) {
+            desc.stops[i].offset = std::clamp(om.stopOffsets[i], 0.0f, 1.0f);
         }
     }
     std::stable_sort(
@@ -1672,14 +1876,18 @@ std::size_t VisualRenderAdapter::EmitNodeRecursive(
         const float effOpacity = std::clamp(parentOpacity * node->layout.opacity, 0.0f, 1.0f);
         const Rect& rect = node->layout.layoutRect;
         const Matrix2D& world2D = node->layout.worldTransform;
-        const Matrix4x4& world3D = node->layout.worldMatrix3D;
+        const Matrix4x4& world3D = node->WorldMatrix3D();
         const bool has3D = node->layout.hasPerspective3D;
         const BlendingMode blend = node->transform2D.blendMode;
+        const ScopedBlendMode blendGuard(outTree.activeBlendMode_, blend);
+        const VisualImageData& imgData = node->Image();
+        const VisualEffectStyle& effStyle = node->Effect();
+        const VisualOpacityMask& maskStyle = node->OpacityMask();
 
         const bool isVisible = (node->layout.visibility == Visibility::Visible);
         const bool hasOwnBoxVisual =
             (node->box.bgOpacity > 0.001f && (HasAlpha(node->box.bgRgba) || node->box.bgGradId > 0)) ||
-            (!node->image.uri.empty() && HasAlpha(node->image.tintRgba)) ||
+            (!imgData.uri.empty() && HasAlpha(imgData.tintRgba)) ||
             (HasPositiveThickness(node->box.borderThickness) &&
              (HasAlpha(node->box.borderRgba) || node->box.borderGradId > 0));
         const bool drawsSelf =
@@ -1687,17 +1895,18 @@ std::size_t VisualRenderAdapter::EmitNodeRecursive(
              node->kind == VisualKind::Text ||
              node->kind == VisualKind::Image ||
              node->kind == VisualKind::CanvasDraw ||
-             hasOwnBoxVisual);
+             hasOwnBoxVisual ||
+             node->box.isBoxShadow);
 
         const VisualEffectStyle* ownDropShadow =
-            (node->effect.kind == UIEffectKind::DropShadow) ? &node->effect : nullptr;
+            (effStyle.kind == UIEffectKind::DropShadow) ? &effStyle : nullptr;
         const VisualEffectStyle* activeDropShadow =
             drawsSelf
-                ? (ownDropShadow ? ownDropShadow : (node->effect.kind == UIEffectKind::None ? inheritedDropShadow : nullptr))
+                ? (ownDropShadow ? ownDropShadow : (effStyle.kind == UIEffectKind::None ? inheritedDropShadow : nullptr))
                 : nullptr;
         const VisualEffectStyle* childInheritedShadow =
             !drawsSelf
-                ? (ownDropShadow ? ownDropShadow : (node->effect.kind == UIEffectKind::None ? inheritedDropShadow : nullptr))
+                ? (ownDropShadow ? ownDropShadow : (effStyle.kind == UIEffectKind::None ? inheritedDropShadow : nullptr))
                 : nullptr;
 
         // Emit DropShadow behind this element (outside element clip) before node content.
@@ -1730,8 +1939,8 @@ std::size_t VisualRenderAdapter::EmitNodeRecursive(
         // Open post-process BlurLayerSpan BEFORE child emission to guarantee pre-order span ordering.
         const bool hasPostProcessEffect =
             isVisible &&
-            node->effect.kind != UIEffectKind::None &&
-            node->effect.kind != UIEffectKind::DropShadow;
+            effStyle.kind != UIEffectKind::None &&
+            effStyle.kind != UIEffectKind::DropShadow;
         const UIResourceStore* effStore = outTree.ResourceStore() ? outTree.ResourceStore() : world.ResourceStore();
         const bool hasOpacityMask = isVisible && NodeNeedsOpacityMaskSpan(*node, effStore);
         std::size_t blurSpanIndex = std::numeric_limits<std::size_t>::max();
@@ -1740,28 +1949,28 @@ std::size_t VisualRenderAdapter::EmitNodeRecursive(
             BlurLayerSpan span{};
             span.firstNodeId = spanStartNid;
             span.endNodeId = spanStartNid;
-            span.effectMode = hasPostProcessEffect ? node->effect.kind : UIEffectKind::OpacityMask;
+            span.effectMode = hasPostProcessEffect ? effStyle.kind : UIEffectKind::OpacityMask;
             if (hasPostProcessEffect) {
-                span.radiusPx = std::max(0.0f, node->effect.radius);
-                span.angleDeg = node->effect.dirDeg;
-                span.amountX = (node->effect.depth != 0.0f) ? node->effect.depth : node->effect.radius;
-                span.saturation = (node->effect.kind == UIEffectKind::Saturation)
-                    ? ((node->effect.depth != 0.0f || node->effect.radius == 0.0f)
-                           ? node->effect.depth
-                           : node->effect.radius)
-                    : ((node->effect.depth != 0.0f) ? node->effect.depth : 1.0f);
-                span.effectColor = UnpackRgba32(node->effect.colorRgba, 1.0f);
-                span.effectOpacity = std::clamp(node->effect.opacity, 0.0f, 1.0f);
+                span.radiusPx = std::max(0.0f, effStyle.radius);
+                span.angleDeg = effStyle.dirDeg;
+                span.amountX = (effStyle.depth != 0.0f) ? effStyle.depth : effStyle.radius;
+                span.saturation = (effStyle.kind == UIEffectKind::Saturation)
+                    ? ((effStyle.depth != 0.0f || effStyle.radius == 0.0f)
+                           ? effStyle.depth
+                           : effStyle.radius)
+                    : ((effStyle.depth != 0.0f) ? effStyle.depth : 1.0f);
+                span.effectColor = UnpackRgba32(effStyle.colorRgba, 1.0f);
+                span.effectOpacity = std::clamp(effStyle.opacity, 0.0f, 1.0f);
             }
             if (hasOpacityMask) {
                 span.hasOpacityMask = true;
-                span.opacityMaskGradId = (node->opacityMask.gradId > 0)
-                    ? static_cast<std::uint32_t>(node->opacityMask.gradId)
+                span.opacityMaskGradId = (maskStyle.gradId > 0)
+                    ? static_cast<std::uint32_t>(maskStyle.gradId)
                     : 0u;
-                span.opacityMaskSolidRgba = node->opacityMask.solidRgba;
-                span.opacityMaskOpacity = std::clamp(node->opacityMask.opacity, 0.0f, 1.0f);
+                span.opacityMaskSolidRgba = maskStyle.solidRgba;
+                span.opacityMaskOpacity = std::clamp(maskStyle.opacity, 0.0f, 1.0f);
                 span.opacityMaskLocalRect = rect;
-                span.opacityMaskStopOffsets = node->opacityMask.stopOffsets;
+                span.opacityMaskStopOffsets = maskStyle.stopOffsets;
                 Matrix2D invW{};
                 if (!world2D.TryInvert(invW)) {
                     invW = Matrix2D::Identity();
@@ -1772,8 +1981,45 @@ std::size_t VisualRenderAdapter::EmitNodeRecursive(
             span.clipRect = outTree.activeClipEnabled_
                 ? IntersectRects(outTree.activeClipRect_, worldBounds)
                 : worldBounds;
-            span.clipActive = (hasPostProcessEffect && node->effect.kind == UIEffectKind::BackdropBlur) ||
+            span.clipActive = (hasPostProcessEffect && effStyle.kind == UIEffectKind::BackdropBlur) ||
                               outTree.activeClipEnabled_;
+            span.blendMode = (span.effectMode == UIEffectKind::BackdropBlur)
+                ? BlendingMode::Normal
+                : blend;
+            if (span.effectMode == UIEffectKind::BackdropBlur) {
+                span.maskDestRect = span.clipRect;
+                span.maskOpacity = std::clamp(effOpacity * effStyle.opacity, 0.0f, 1.0f);
+                if (node->kind == VisualKind::Vector) {
+                    const VisualVectorData& vec = node->Vector();
+                    if (vec.shapeKind == VectorShapeKind::SvgPath && !vec.pathOrParams.empty()) {
+                        const std::uint64_t pathHash = ComputeSvgPathHash(vec.pathOrParams);
+                        UIResourceStore* mutStore = outTree.ResourceStore() ? outTree.ResourceStore() : &UIResourceStore::Default();
+                        const AxbMtsdfPathEntry* storeEntry = mutStore->FindMtsdfPath(pathHash);
+                        if (!storeEntry) {
+                            const AxbMtsdfPathEntry* existing = outTree.FindMtsdfEntry(pathHash);
+                            if (!existing && effStore) {
+                                existing = effStore->FindMtsdfPath(pathHash);
+                            }
+                            if (existing && !existing->mtsdfRgbaPixels.empty() &&
+                                existing->cellWidth > 0u && existing->cellHeight > 0u) {
+                                mutStore->RegisterMtsdfPath(*existing);
+                            } else {
+                                float pxRange = 4.0f;
+                                const float maxSpan = std::max(span.maskDestRect.width, span.maskDestRect.height);
+                                const std::uint16_t cellSize = SelectAdaptiveMtsdfCellSize(
+                                    vec.pathOrParams,
+                                    maxSpan > 1.0f ? maxSpan : 32.0f,
+                                    &pxRange);
+                                const AxbMtsdfPathEntry baked = BakeSvgPathToMtsdfEntry(vec.pathOrParams, cellSize, pxRange);
+                                if (!baked.mtsdfRgbaPixels.empty() && baked.cellWidth > 0u && baked.cellHeight > 0u) {
+                                    mutStore->RegisterMtsdfPath(baked);
+                                }
+                            }
+                        }
+                        span.maskMtsdfHash = pathHash;
+                    }
+                }
+            }
             blurSpanIndex = outTree.blurLayerSpans_.size();
             outTree.blurLayerSpans_.push_back(span);
         }
@@ -1857,6 +2103,7 @@ std::size_t VisualRenderAdapter::EmitNodeRecursive(
                         shadowSpan.effectMode = UIEffectKind::Blur;
                         shadowSpan.radiusPx = blurR;
                         shadowSpan.effectOpacity = 1.0f;
+                        shadowSpan.blendMode = blend;
                         shadowSpan.clipRect = outTree.activeClipRect_;
                         shadowSpan.clipActive = outTree.activeClipEnabled_;
                         shadowSpanIndex = outTree.blurLayerSpans_.size();
@@ -1934,6 +2181,7 @@ std::size_t VisualRenderAdapter::EmitDropShadowLeafSilhouette(
     float dy,
     float blurR,
     bool wrapWithBlurSpan) {
+    const ScopedBlendMode blendGuard(outTree.activeBlendMode_, blend);
     if (rect.width <= 0.0f || rect.height <= 0.0f ||
         !HasAlpha(dropShadow.colorRgba) || dropShadow.opacity <= 0.0f) {
         return 0u;
@@ -1943,9 +2191,10 @@ std::size_t VisualRenderAdapter::EmitDropShadowLeafSilhouette(
     if (shadowCol.a <= 0.0f) {
         return 0u;
     }
+    const VisualImageData& imgData = node.Image();
     const bool hasOwnBoxVisual =
         (node.box.bgOpacity > 0.001f && (HasAlpha(node.box.bgRgba) || node.box.bgGradId > 0)) ||
-        (!node.image.uri.empty() && HasAlpha(node.image.tintRgba)) ||
+        (!imgData.uri.empty() && HasAlpha(imgData.tintRgba)) ||
         (HasPositiveThickness(node.box.borderThickness) &&
          (HasAlpha(node.box.borderRgba) || node.box.borderGradId > 0));
 
@@ -1967,6 +2216,7 @@ std::size_t VisualRenderAdapter::EmitDropShadowLeafSilhouette(
             shadowSpan.effectMode = UIEffectKind::Blur;
             shadowSpan.radiusPx = blurR;
             shadowSpan.effectOpacity = 1.0f;
+            shadowSpan.blendMode = blend;
             const Rect shadowWorld = TransformRectViewportBounds(shiftedRect, shifted2D, world3D, has3D);
             shadowSpan.clipRect = outTree.activeClipEnabled_
                 ? IntersectRects(outTree.activeClipRect_, shadowWorld)
@@ -1977,25 +2227,34 @@ std::size_t VisualRenderAdapter::EmitDropShadowLeafSilhouette(
         }
         std::size_t emitted = 0u;
         if (node.kind == VisualKind::Vector) {
+            const VisualVectorData& srcVec = node.Vector();
             VisualNode shadowVecNode{};
             shadowVecNode.id = node.id;
             shadowVecNode.kind = node.kind;
-            shadowVecNode.vector = node.vector;
+            auto& sv = shadowVecNode.EnsureExtras().vector;
+            sv = srcVec;
+            const bool hasSrcImg =
+                !imgData.uri.empty() && HasAlpha(imgData.tintRgba) && srcVec.fillOpacity > 0.001f;
+            if (hasSrcImg) {
+                auto& si = shadowVecNode.EnsureExtras().image;
+                si = imgData;
+                si.tintRgba = dropShadow.colorRgba;
+            }
             const bool hasSrcFill =
-                (HasAlpha(node.vector.fillRgba) || node.vector.fillGradId > 0) &&
-                node.vector.fillOpacity > 0.001f;
+                (HasAlpha(srcVec.fillRgba) || srcVec.fillGradId > 0) &&
+                srcVec.fillOpacity > 0.001f;
             const bool hasSrcStroke =
-                (HasAlpha(node.vector.strokeRgba) || node.vector.strokeGradId > 0) &&
-                node.vector.strokeWidth > 0.0f &&
-                node.vector.strokeOpacity > 0.001f;
+                (HasAlpha(srcVec.strokeRgba) || srcVec.strokeGradId > 0) &&
+                srcVec.strokeWidth > 0.0f &&
+                srcVec.strokeOpacity > 0.001f;
             if (hasSrcFill) {
-                shadowVecNode.vector.fillRgba = dropShadow.colorRgba;
-                shadowVecNode.vector.fillGradId = -1;
-                shadowVecNode.vector.strokeRgba = hasSrcStroke ? dropShadow.colorRgba : 0u;
-                shadowVecNode.vector.strokeGradId = -1;
+                sv.fillRgba = dropShadow.colorRgba;
+                sv.fillGradId = -1;
+                sv.strokeRgba = hasSrcStroke ? dropShadow.colorRgba : 0u;
+                sv.strokeGradId = -1;
             } else if (hasSrcStroke) {
-                shadowVecNode.vector.strokeRgba = dropShadow.colorRgba;
-                shadowVecNode.vector.strokeGradId = -1;
+                sv.strokeRgba = dropShadow.colorRgba;
+                sv.strokeGradId = -1;
             }
             emitted = EmitVectorVisual(
                 outTree, shadowVecNode, shiftedRect, effShadowOpacity, shifted2D, world3D, has3D, blend);
@@ -2004,12 +2263,14 @@ std::size_t VisualRenderAdapter::EmitDropShadowLeafSilhouette(
             shadowTextNode.id = node.id;
             shadowTextNode.kind = node.kind;
             shadowTextNode.layout.padding = node.layout.padding;
-            shadowTextNode.text = node.text;
-            shadowTextNode.text.fgRgba = dropShadow.colorRgba;
-            shadowTextNode.text.selLenCp = 0;
-            shadowTextNode.text.showCaret = false;
+            auto& st = shadowTextNode.EnsureExtras().text;
+            st = node.Text();
+            st.fgRgba = dropShadow.colorRgba;
+            st.fgGradId = -1;
+            st.selLenCp = 0;
+            st.showCaret = false;
             emitted = EmitTextVisual(
-                outTree, shadowTextNode, shiftedRect, effShadowOpacity, shifted2D, world3D, has3D, blend);
+                outTree, shadowTextNode, shiftedRect, effShadowOpacity, shifted2D, world3D, has3D, blend, true);
         }
         const auto eN = static_cast<std::uint32_t>(outTree.nodes_.size());
         for (std::uint32_t k = bN; k < eN; ++k) {
@@ -2025,14 +2286,16 @@ std::size_t VisualRenderAdapter::EmitDropShadowLeafSilhouette(
         return emitted;
     }
 
-    if (!hasOwnBoxVisual && node.kind != VisualKind::Image && node.kind != VisualKind::CanvasDraw) {
+    if (!hasOwnBoxVisual && !node.box.isBoxShadow && node.kind != VisualKind::Image && node.kind != VisualKind::CanvasDraw) {
         return 0u;
     }
     const bool hollowBorderOnly =
-        node.image.uri.empty() &&
+        !node.box.isBoxShadow &&
+        imgData.uri.empty() &&
         !HasAlpha(node.box.bgRgba) &&
         node.box.bgGradId <= 0 &&
         HasPositiveThickness(node.box.borderThickness);
+    std::size_t boxShadowSpanIdx = std::numeric_limits<std::size_t>::max();
     const auto bN = static_cast<std::uint32_t>(outTree.nodes_.size());
     if (hollowBorderOnly) {
         (void)outTree.AllocateBorderRingNode(
@@ -2043,6 +2306,27 @@ std::size_t VisualRenderAdapter::EmitDropShadowLeafSilhouette(
             shadowCol,
             node.box.cornerRadius,
             node.box.borderThickness,
+            &node);
+    } else if (node.box.isBoxShadow && wrapWithBlurSpan && blurR > 0.5f) {
+        BlurLayerSpan shadowSpan{};
+        shadowSpan.firstNodeId = bN;
+        shadowSpan.endNodeId = bN;
+        shadowSpan.effectMode = UIEffectKind::Blur;
+        shadowSpan.radiusPx = blurR;
+        shadowSpan.effectOpacity = 1.0f;
+        shadowSpan.blendMode = blend;
+        shadowSpan.clipRect = outTree.activeClipRect_;
+        shadowSpan.clipActive = outTree.activeClipEnabled_;
+        boxShadowSpanIdx = outTree.blurLayerSpans_.size();
+        outTree.blurLayerSpans_.push_back(shadowSpan);
+
+        (void)outTree.AllocateRoundedRectNode(
+            rect.x + (has3D ? dx : 0.0f),
+            rect.y + (has3D ? dy : 0.0f),
+            rect.width,
+            rect.height,
+            shadowCol,
+            node.box.cornerRadius,
             &node);
     } else {
         const float boxBlur = wrapWithBlurSpan ? blurR : 0.0f;
@@ -2066,6 +2350,13 @@ std::size_t VisualRenderAdapter::EmitDropShadowLeafSilhouette(
     }
     const auto eN = static_cast<std::uint32_t>(outTree.nodes_.size());
     ApplyNodeTransform(outTree, bN, eN, shifted2D, world3D, has3D, blend);
+    if (boxShadowSpanIdx < outTree.blurLayerSpans_.size()) {
+        outTree.blurLayerSpans_[boxShadowSpanIdx].endNodeId = eN;
+        if (eN <= bN) {
+            outTree.blurLayerSpans_.erase(
+                outTree.blurLayerSpans_.begin() + static_cast<std::ptrdiff_t>(boxShadowSpanIdx));
+        }
+    }
     return (eN - bN);
 }
 
@@ -2088,9 +2379,10 @@ std::size_t VisualRenderAdapter::EmitDropShadowSubtreeRecursive(
     }
     const Rect& rect = node->layout.layoutRect;
     const Matrix2D& world2D = node->layout.worldTransform;
-    const Matrix4x4& world3D = node->layout.worldMatrix3D;
+    const Matrix4x4& world3D = node->WorldMatrix3D();
     const bool has3D = node->layout.hasPerspective3D;
     const BlendingMode blend = node->transform2D.blendMode;
+    const ScopedBlendMode blendGuard(outTree.activeBlendMode_, blend);
 
     const bool prevClipEnabled = outTree.activeClipEnabled_;
     const Rect prevClipRect = outTree.activeClipRect_;
@@ -2177,6 +2469,7 @@ std::size_t VisualRenderAdapter::BuildPagedRenderTree(
     if (!world.Root().IsValid()) {
         return 0u;
     }
+    outTree.ReserveCapacity(world.LiveNodeCount() * 2u);
     return EmitNodeRecursive(nullptr, world, drawBuffer, world.Root(), 1.0f, outTree);
 }
 
@@ -2185,14 +2478,97 @@ std::size_t VisualRenderAdapter::SyncPagedRenderTree(
     const DrawingCommandBuffer* drawBuffer,
     PagedRenderTree& outTree,
     UIResourceStore* resourceStore) const {
+    UIResourceStore* store = resourceStore ? resourceStore : world.ResourceStore();
+    outTree.SetResourceStore(store);
+
+    // Fast Path 1: nothing dirty and render tree already matches this world & structure version
+    if (!world.HasAnyDirty() &&
+        !world.IsStructureDirty() &&
+        drawBuffer == nullptr &&
+        outTree.MatchesSyncedWorldState(world.WorldInstanceId(), world.StructureVersion())) {
+        return outTree.NodeCount();
+    }
+
+    // Fast Path 2: visual-only leaf solid-box updates in place
+    const auto& dirtyList = world.DirtyNodes();
+    if (!world.IsStructureDirty() &&
+        drawBuffer == nullptr &&
+        !dirtyList.empty() &&
+        outTree.MatchesSyncedWorldState(world.WorldInstanceId(), world.StructureVersion())) {
+        bool allPatched = true;
+        for (VisualNodeId id : dirtyList) {
+            const VisualNode* node = world.GetNode(id);
+            if (!node || !node->alive || !node->children.empty() ||
+                node->kind != VisualKind::Box ||
+                node->layout.visibility != Visibility::Visible ||
+                node->layout.renderNodeCount != 1u ||
+                node->layout.hasPerspective3D ||
+                node->box.isBoxShadow ||
+                node->box.bgGradId > 0 ||
+                HasPositiveThickness(node->box.borderThickness) ||
+                !node->Image().uri.empty() ||
+                node->Effect().kind != UIEffectKind::None ||
+                node->OpacityMask().enabled ||
+                node->layout.layoutRect.width <= 0.0f ||
+                node->layout.layoutRect.height <= 0.0f) {
+                allPatched = false;
+                break;
+            }
+            float effOpacity = std::clamp(node->layout.opacity, 0.0f, 1.0f);
+            VisualNodeId curParent = node->parent;
+            int depth = 0;
+            while (curParent.IsValid() && depth < 128) {
+                const VisualNode* p = world.GetNode(curParent);
+                if (!p ||
+                    p->layout.visibility != Visibility::Visible ||
+                    p->layout.hasPerspective3D ||
+                    p->Effect().kind != UIEffectKind::None ||
+                    p->OpacityMask().enabled) {
+                    allPatched = false;
+                    break;
+                }
+                effOpacity *= std::clamp(p->layout.opacity, 0.0f, 1.0f);
+                curParent = p->parent;
+                ++depth;
+            }
+            if (!allPatched || curParent.IsValid()) {
+                allPatched = false;
+                break;
+            }
+            const float effFillOp = std::clamp(effOpacity * node->box.bgOpacity, 0.0f, 1.0f);
+            if (!HasAlpha(node->box.bgRgba) || effFillOp <= 0.001f) {
+                allPatched = false;
+                break;
+            }
+            if (!outTree.UpdateSolidBoxNodeInPlace(
+                    node->layout.renderNodeId,
+                    node->layout.layoutRect,
+                    UnpackRgba32(node->box.bgRgba, effFillOp),
+                    node->box.cornerRadius,
+                    node->layout.worldTransform,
+                    node->transform2D.blendMode)) {
+                allPatched = false;
+                break;
+            }
+        }
+        if (allPatched) {
+            world.ClearDirtyFlags();
+            return outTree.NodeCount();
+        }
+    }
+
+    // Full rebuild fallback
     outTree.Clear();
-    outTree.SetResourceStore(resourceStore ? resourceStore : world.ResourceStore());
+    outTree.SetResourceStore(store);
     if (!world.Root().IsValid()) {
+        outTree.SetSyncedWorldState(world.WorldInstanceId(), world.StructureVersion());
         world.ClearDirtyFlags();
         return 0u;
     }
+    outTree.ReserveCapacity(world.LiveNodeCount() * 2u);
     const std::size_t count =
         EmitNodeRecursive(&world, world, drawBuffer, world.Root(), 1.0f, outTree);
+    outTree.SetSyncedWorldState(world.WorldInstanceId(), world.StructureVersion());
     world.ClearDirtyFlags();
     return count;
 }

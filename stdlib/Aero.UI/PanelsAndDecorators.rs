@@ -43,7 +43,7 @@ public class LayoutScaler : Viewbox {
     private Size _referenceResolution;
 
     public LayoutScaler() : base() {
-        _referenceResolution = new Size(0.0f, 0.0f);
+        _referenceResolution = new Size(1920.0f, 1080.0f);
         Stretch = Stretch.Uniform;
         StretchDirection = StretchDirection.Both;
         SyncViewboxMode();

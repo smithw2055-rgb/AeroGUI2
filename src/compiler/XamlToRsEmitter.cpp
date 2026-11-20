@@ -286,6 +286,111 @@ struct XamlNode final {
     return "new CornerRadius(" + FormatFloatLiteral(vals[0]) + ")";
 }
 
+[[nodiscard]] std::string ConvertPathGeometryToSvgData(const XamlNode& pgNode) {
+    if (const auto* figsAttr = pgNode.FindAttribute("Figures")) {
+        const std::string_view v = aero::str::Trim(figsAttr->value);
+        if (!v.empty()) {
+            return std::string(v);
+        }
+    }
+    std::vector<const XamlNode*> figures;
+    for (const auto& ch : pgNode.children) {
+        if (ch->localName == "PathFigure") {
+            figures.push_back(ch.get());
+        } else if (ch->localName == "PathGeometry.Figures") {
+            for (const auto& fc : ch->children) {
+                if (fc->localName == "PathFigure") {
+                    figures.push_back(fc.get());
+                }
+            }
+        }
+    }
+    if (figures.empty()) {
+        return std::string(aero::str::Trim(pgNode.textContent));
+    }
+
+    auto appendSegment = [](std::ostringstream& d, const XamlNode& seg) {
+        if (seg.localName == "LineSegment") {
+            if (const auto* p = seg.FindAttribute("Point")) {
+                d << " L " << aero::str::Trim(p->value);
+            }
+        } else if (seg.localName == "PolyLineSegment") {
+            if (const auto* pts = seg.FindAttribute("Points")) {
+                d << " L " << aero::str::Trim(pts->value);
+            }
+        } else if (seg.localName == "BezierSegment") {
+            const auto* p1 = seg.FindAttribute("Point1");
+            const auto* p2 = seg.FindAttribute("Point2");
+            const auto* p3 = seg.FindAttribute("Point3");
+            if (p1 && p2 && p3) {
+                d << " C " << aero::str::Trim(p1->value) << " "
+                  << aero::str::Trim(p2->value) << " " << aero::str::Trim(p3->value);
+            }
+        } else if (seg.localName == "PolyBezierSegment") {
+            if (const auto* pts = seg.FindAttribute("Points")) {
+                d << " C " << aero::str::Trim(pts->value);
+            }
+        } else if (seg.localName == "QuadraticBezierSegment") {
+            const auto* p1 = seg.FindAttribute("Point1");
+            const auto* p2 = seg.FindAttribute("Point2");
+            if (p1 && p2) {
+                d << " Q " << aero::str::Trim(p1->value) << " " << aero::str::Trim(p2->value);
+            }
+        } else if (seg.localName == "PolyQuadraticBezierSegment") {
+            if (const auto* pts = seg.FindAttribute("Points")) {
+                d << " Q " << aero::str::Trim(pts->value);
+            }
+        } else if (seg.localName == "ArcSegment") {
+            const auto* sz = seg.FindAttribute("Size");
+            const auto* pt = seg.FindAttribute("Point");
+            if (pt) {
+                std::vector<float> szVals;
+                float rx = 0.0f;
+                float ry = 0.0f;
+                if (sz && TryParseFloatList(sz->value, szVals) && szVals.size() >= 2) {
+                    rx = szVals[0];
+                    ry = szVals[1];
+                }
+                float rot = 0.0f;
+                if (const auto* ra = seg.FindAttribute("RotationAngle")) {
+                    (void)aero::str::TryParseFloat32(ra->value, rot);
+                }
+                const auto* la = seg.FindAttribute("IsLargeArc");
+                const int largeArc =
+                    (la && aero::str::EqualsIgnoreCase(aero::str::Trim(la->value), "True")) ? 1 : 0;
+                // WPF/Noesis SweepDirection defaults to Counterclockwise (SVG sweep = 0)
+                const auto* sd = seg.FindAttribute("SweepDirection");
+                const int sweep =
+                    (sd && aero::str::EqualsIgnoreCase(aero::str::Trim(sd->value), "Clockwise")) ? 1 : 0;
+                d << " A " << rx << "," << ry << " " << rot << " "
+                  << largeArc << "," << sweep << " " << aero::str::Trim(pt->value);
+            }
+        }
+    };
+
+    std::ostringstream d;
+    for (std::size_t fi = 0; fi < figures.size(); ++fi) {
+        const XamlNode& fig = *figures[fi];
+        if (fi > 0) d << " ";
+        const auto* sp = fig.FindAttribute("StartPoint");
+        d << "M " << (sp ? std::string(aero::str::Trim(sp->value)) : std::string("0,0"));
+        for (const auto& ch : fig.children) {
+            if (ch->localName == "PathFigure.Segments") {
+                for (const auto& seg : ch->children) {
+                    appendSegment(d, *seg);
+                }
+            } else if (ch->localName.find('.') == std::string::npos) {
+                appendSegment(d, *ch);
+            }
+        }
+        if (const auto* ic = fig.FindAttribute("IsClosed");
+            ic && aero::str::EqualsIgnoreCase(aero::str::Trim(ic->value), "True")) {
+            d << " Z";
+        }
+    }
+    return d.str();
+}
+
 [[nodiscard]] std::pair<std::string, std::string> ParseGridLength(std::string_view raw) {
     const std::string_view trimmed = aero::str::Trim(raw);
     if (trimmed.empty() || aero::str::EqualsIgnoreCase(trimmed, "Auto")) {
@@ -415,7 +520,7 @@ struct XamlNode final {
     if (s == "Opacity" || s == "Width" || s == "Height" || s == "MinWidth" ||
         s == "MinHeight" || s == "Fill.Color" || s == "Stroke.Color" ||
         s == "Background.Color" || s == "Foreground.Color" ||
-        s == "Fill.Opacity" || s == "Stroke.Opacity") {
+        s == "Foreground.Opacity" || s == "Fill.Opacity" || s == "Stroke.Opacity") {
         return std::string(s);
     }
     if (s.find("SolidColorBrush.Color") != std::string_view::npos) {
@@ -432,6 +537,9 @@ struct XamlNode final {
         return "EffectOpacity";
     }
     if (s.find("Brush.Opacity") != std::string_view::npos || s == "BrushOpacity") {
+        if (s.find("Foreground") != std::string_view::npos) {
+            return "Foreground.Opacity";
+        }
         if (s.find("Shape.Stroke") != std::string_view::npos ||
             s.find("(Stroke)") != std::string_view::npos ||
             s.find("Stroke.") != std::string_view::npos) {
@@ -446,6 +554,19 @@ struct XamlNode final {
     }
     if (s.find("BlurEffect.Radius") != std::string_view::npos || s == "Radius" || s == "BlurRadius") {
         return "EffectRadius";
+    }
+    if (s.find("LayoutTransform") != std::string_view::npos) {
+        if (s.find("ScaleX") != std::string_view::npos) return "LayoutTransform.ScaleX";
+        if (s.find("ScaleY") != std::string_view::npos) return "LayoutTransform.ScaleY";
+        if (s.find("AngleX") != std::string_view::npos || s.find("SkewX") != std::string_view::npos) {
+            return "LayoutTransform.SkewX";
+        }
+        if (s.find("AngleY") != std::string_view::npos || s.find("SkewY") != std::string_view::npos) {
+            return "LayoutTransform.SkewY";
+        }
+        if (s.find("Angle") != std::string_view::npos || s.find("Rotation") != std::string_view::npos) {
+            return "LayoutTransform.Angle";
+        }
     }
     if (s.find("ScaleTransform.ScaleX") != std::string_view::npos || s.find("ScaleX") != std::string_view::npos) {
         return "ScaleX";
@@ -656,7 +777,8 @@ struct XamlNode final {
         "ShadowDepth", "Direction", "Angle", "AngleX", "AngleY", "ScaleX", "ScaleY",
         "TickLength", "TickWidth", "MinAngle", "MaxAngle", "Volume",
         "LineHeight", "CharacterSpacing",
-        "ViewportSize", "MaxDropDownHeight", "HorizontalOffset", "VerticalOffset"
+        "ViewportSize", "MaxDropDownHeight", "HorizontalOffset", "VerticalOffset",
+        "OffsetX", "OffsetY", "Spread"
     };
     return kFloatProps.count(prop) > 0;
 }
@@ -676,7 +798,8 @@ struct XamlNode final {
         "IsOpen", "IsCheckable", "IsDefault", "IsCancel", "ShowGridLines",
         "StaysOpen", "IsEditable", "IsMuted", "ShowDate", "ShowTime", "UseSystemTime",
         "IsDirectionReversed", "IsTabStop", "IsMouseOver", "IsPressed", "IsDragging",
-        "IsFocused", "IsKeyboardFocused", "HasItems", "IsDropDownOpen", "CanContentScroll"
+        "IsFocused", "IsKeyboardFocused", "HasItems", "IsDropDownOpen", "CanContentScroll",
+        "Inside", "IsItemsHost"
     };
     return kBoolProps.count(prop) > 0;
 }
@@ -720,12 +843,13 @@ struct XamlNode final {
         "IsReadOnly", "LastChildFill", "SelectedIndex", "SelectionMode",
         "Placeholder", "IsCheckable", "TabStripPlacement",
         "HorizontalScrollBarVisibility", "VerticalScrollBarVisibility",
-        "RenderTransform", "Effect", "OpacityMask", "Style", "ShowGridLines", "Rows", "Columns",
+        "RenderTransform", "LayoutTransform", "RenderTransformOrigin", "Effect", "OpacityMask", "Style", "ShowGridLines", "Rows", "Columns",
         "TickLength", "TickWidth", "MinAngle", "MaxAngle", "Brush",
         "Volume", "IsMuted", "LoadedBehavior", "Password", "PasswordChar",
         "Year", "Month", "Day", "Hour", "Minute", "Second", "Format", "UseSystemTime",
         "LineHeight", "CharacterSpacing", "MaxLines",
-        "IsDirectionReversed", "IsTabStop", "ViewportSize", "MaxDropDownHeight"
+        "IsDirectionReversed", "IsTabStop", "ViewportSize", "MaxDropDownHeight",
+        "FontStyle", "IsItemsHost"
     };
     return kProps.count(prop) > 0;
 }
@@ -748,6 +872,405 @@ struct XamlNode final {
         "ToolBar", "StatusBar", "TreeView", "TreeViewItem"
     };
     return kIC.count(typeName) > 0;
+}
+
+[[nodiscard]] bool IsPanelType(std::string_view typeName) {
+    static const std::unordered_set<std::string_view> kPanels = {
+        "Panel", "Grid", "StackPanel", "VirtualizingStackPanel", "TabPanel",
+        "ToolBarPanel", "DockPanel", "WrapPanel", "ToolBarOverflowPanel",
+        "UniformGrid", "Canvas"
+    };
+    return kPanels.count(typeName) > 0;
+}
+
+[[nodiscard]] bool IsShapeType(std::string_view typeName) {
+    static const std::unordered_set<std::string_view> kShapes = {
+        "Shape", "Rectangle", "Ellipse", "Line", "Path", "Polygon", "Polyline"
+    };
+    return kShapes.count(typeName) > 0;
+}
+
+[[nodiscard]] bool IsRangeBaseType(std::string_view typeName) {
+    return typeName == "RangeBase" || typeName == "Slider" ||
+           typeName == "ProgressBar" || typeName == "ScrollBar";
+}
+
+[[nodiscard]] bool IsToggleButtonType(std::string_view typeName) {
+    return typeName == "ToggleButton" || typeName == "CheckBox" || typeName == "RadioButton";
+}
+
+[[nodiscard]] bool IsSelectableItemType(std::string_view typeName) {
+    return typeName == "SelectableItem" || typeName == "ListBoxItem" ||
+           typeName == "ComboBoxItem" || typeName == "ListViewItem" ||
+           typeName == "TabItem" || typeName == "TreeViewItem";
+}
+
+[[nodiscard]] bool IsSelectorType(std::string_view typeName) {
+    return typeName == "Selector" || typeName == "ListBox" ||
+           typeName == "ListView" || typeName == "ComboBox" || typeName == "TabControl";
+}
+
+[[nodiscard]] bool IsControlType(std::string_view typeName) {
+    static const std::unordered_set<std::string_view> kControls = {
+        "Control", "ContentControl", "HeaderedContentControl", "GroupBox", "Expander",
+        "Label", "ToolTip", "Separator", "UserControl", "Page", "Window", "ScrollViewer",
+        "ButtonBase", "Button", "RepeatButton", "Hyperlink", "ToggleButton", "CheckBox",
+        "RadioButton", "Thumb", "GridSplitter", "RangeBase", "Slider", "ProgressBar",
+        "ScrollBar", "TextBoxBase", "TextBox", "PasswordBox", "ItemsControl",
+        "HeaderedItemsControl", "SelectableItem", "ListBoxItem", "ComboBoxItem",
+        "ListViewItem", "Selector", "ListBox", "ListView", "ComboBox", "TabControl",
+        "TabItem", "MenuBase", "Menu", "ContextMenu", "MenuItem", "ToolBar",
+        "StatusBar", "StatusBarItem", "TreeView", "TreeViewItem",
+        "DateTimeControl", "RiveControl"
+    };
+    return kControls.count(typeName) > 0;
+}
+
+[[nodiscard]] bool IsNonUIElementType(std::string_view typeName) {
+    static const std::unordered_set<std::string_view> kNonUi = {
+        "Inline", "Run", "LineBreak", "GridViewColumn", "GridView",
+        "RowDefinition", "ColumnDefinition", "Transform", "TranslateTransform",
+        "ScaleTransform", "RotateTransform", "SkewTransform", "TransformGroup",
+        "Brush", "SolidColorBrush", "LinearGradientBrush", "RadialGradientBrush",
+        "ImageBrush", "GradientStop", "Effect", "UIEffect", "BlurEffect",
+        "DropShadowEffect", "BackdropBlurEffect", "TintEffect", "PixelateEffect",
+        "ChromaticAberrationEffect", "DirectionalBlurEffect"
+    };
+    return kNonUi.count(typeName) > 0;
+}
+
+[[nodiscard]] bool IsKnownUIElementType(std::string_view typeName) {
+    if (IsControlType(typeName) || IsPanelType(typeName) || IsShapeType(typeName)) {
+        return true;
+    }
+    static const std::unordered_set<std::string_view> kOtherUi = {
+        "UIElement", "FrameworkElement", "Decorator", "Border", "BoxShadow",
+        "Viewbox", "LayoutScaler", "TextBlock", "Image", "ContentPresenter",
+        "ScrollContentPresenter", "Track", "TickBar", "Popup", "CustomDrawElement",
+        "RadialTicks", "RadialNeedle", "MediaElement", "GridViewHeaderRowPresenter",
+        "GridViewRowPresenter"
+    };
+    return kOtherUi.count(typeName) > 0;
+}
+
+[[nodiscard]] bool IsCommonUIElementDirectProperty(std::string_view prop) {
+    static const std::unordered_set<std::string_view> kBaseProps = {
+        "Width", "Height", "MinWidth", "MaxWidth", "MinHeight", "MaxHeight",
+        "Margin", "Padding", "HorizontalAlignment", "VerticalAlignment",
+        "Visibility", "Opacity", "IsEnabled", "IsHitTestVisible", "Focusable",
+        "ClipToBounds", "ZIndex", "RenderTransform", "LayoutTransform", "RenderTransformOrigin",
+        "Effect", "OpacityMask", "Style", "Background", "BorderBrush",
+        "BorderThickness", "CornerRadius"
+    };
+    return kBaseProps.count(prop) > 0;
+}
+
+[[nodiscard]] bool IsDirectUIPropertyFor(std::string_view targetType, std::string_view prop) {
+    if (!IsDirectUIProperty(prop)) {
+        return false;
+    }
+    if (IsNonUIElementType(targetType)) {
+        if (targetType == "Inline" || targetType == "Run" || targetType == "LineBreak") {
+            return prop == "Text" || prop == "Foreground" || prop == "FontFamily" ||
+                   prop == "FontSize" || prop == "FontWeight" || prop == "FontStyle";
+        }
+        if (targetType == "GridViewColumn") {
+            return prop == "Width";
+        }
+        return false;
+    }
+    if (IsCommonUIElementDirectProperty(prop)) {
+        return true;
+    }
+    if (targetType.empty() || !IsKnownUIElementType(targetType)) {
+        return false;
+    }
+
+    if (prop == "Foreground" || prop == "FontFamily" || prop == "FontSize" || prop == "FontWeight") {
+        return IsControlType(targetType) || targetType == "TextBlock" ||
+               targetType == "ContentPresenter" || targetType == "ScrollContentPresenter";
+    }
+    if (prop == "FontStyle") {
+        return IsControlType(targetType) || targetType == "TextBlock";
+    }
+    if (prop == "HorizontalContentAlignment" || prop == "VerticalContentAlignment" ||
+        prop == "IsTabStop") {
+        return IsControlType(targetType);
+    }
+    if (prop == "IsItemsHost") return IsPanelType(targetType);
+    if (prop == "ShowGridLines") return targetType == "Grid";
+    if (prop == "Orientation") {
+        return targetType == "StackPanel" || targetType == "VirtualizingStackPanel" ||
+               targetType == "TabPanel" || targetType == "ToolBarPanel" ||
+               targetType == "WrapPanel" || targetType == "ToolBarOverflowPanel" ||
+               targetType == "ToolBar" || targetType == "Slider" ||
+               targetType == "ScrollBar" || targetType == "ProgressBar" ||
+               targetType == "Track";
+    }
+    if (prop == "Spacing") {
+        return targetType == "StackPanel" || targetType == "VirtualizingStackPanel" ||
+               targetType == "TabPanel" || targetType == "ToolBarPanel" ||
+               targetType == "WrapPanel" || targetType == "ToolBarOverflowPanel" ||
+               targetType == "UniformGrid";
+    }
+    if (prop == "LastChildFill") return targetType == "DockPanel";
+    if (prop == "Rows" || prop == "Columns") return targetType == "UniformGrid";
+    if (prop == "Stretch") {
+        return targetType == "Viewbox" || targetType == "LayoutScaler" ||
+               targetType == "Image" || IsShapeType(targetType) ||
+               targetType == "RiveControl" || targetType == "MediaElement";
+    }
+    if (prop == "StretchDirection") {
+        return targetType == "Viewbox" || targetType == "LayoutScaler" || targetType == "Image";
+    }
+    if (prop == "Text" || prop == "TextWrapping" || prop == "TextAlignment" || prop == "MaxLines") {
+        return targetType == "TextBlock" || targetType == "TextBox";
+    }
+    if (prop == "TextTrimming" || prop == "LineHeight" || prop == "CharacterSpacing") {
+        return targetType == "TextBlock";
+    }
+    if (prop == "IsReadOnly") {
+        return targetType == "TextBoxBase" || targetType == "TextBox" || targetType == "PasswordBox";
+    }
+    if (prop == "Placeholder") {
+        return targetType == "TextBoxBase" || targetType == "TextBox" ||
+               targetType == "PasswordBox" || targetType == "ComboBox";
+    }
+    if (prop == "Password" || prop == "PasswordChar") return targetType == "PasswordBox";
+    if (prop == "Source") {
+        return targetType == "Image" || targetType == "RiveControl" || targetType == "MediaElement";
+    }
+    if (prop == "Data") return targetType == "Path";
+    if (prop == "Fill") {
+        return IsShapeType(targetType) || targetType == "TickBar" || targetType == "RadialNeedle";
+    }
+    if (prop == "Stroke") {
+        return IsShapeType(targetType) || targetType == "TextBlock" || targetType == "RadialTicks";
+    }
+    if (prop == "StrokeThickness") {
+        return IsShapeType(targetType) || targetType == "TextBlock";
+    }
+    if (prop == "RadiusX" || prop == "RadiusY") return targetType == "Rectangle";
+    if (prop == "X1" || prop == "Y1" || prop == "X2" || prop == "Y2") return targetType == "Line";
+    if (prop == "Minimum" || prop == "Maximum") {
+        return IsRangeBaseType(targetType) || targetType == "Track" || targetType == "TickBar" ||
+               targetType == "RadialTicks" || targetType == "RadialNeedle";
+    }
+    if (prop == "Value") {
+        return IsRangeBaseType(targetType) || targetType == "Track" || targetType == "RadialNeedle";
+    }
+    if (prop == "SmallChange" || prop == "LargeChange") return IsRangeBaseType(targetType);
+    if (prop == "IsDirectionReversed") {
+        return targetType == "Slider" || targetType == "ScrollBar" ||
+               targetType == "Track" || targetType == "TickBar";
+    }
+    if (prop == "ViewportSize") return targetType == "ScrollBar" || targetType == "Track";
+    if (prop == "IsChecked") return IsToggleButtonType(targetType) || targetType == "MenuItem";
+    if (prop == "IsThreeState") return IsToggleButtonType(targetType);
+    if (prop == "IsExpanded") return targetType == "Expander" || targetType == "TreeViewItem";
+    if (prop == "ExpandDirection") return targetType == "Expander";
+    if (prop == "IsSelected") return IsSelectableItemType(targetType);
+    if (prop == "SelectedIndex" || prop == "SelectionMode") return IsSelectorType(targetType);
+    if (prop == "TabStripPlacement") return targetType == "TabControl";
+    if (prop == "HorizontalScrollBarVisibility" || prop == "VerticalScrollBarVisibility") {
+        return targetType == "ScrollViewer";
+    }
+    if (prop == "IsCheckable") return targetType == "MenuItem";
+    if (prop == "MaxDropDownHeight") return targetType == "ComboBox";
+    if (prop == "Volume" || prop == "IsMuted" || prop == "LoadedBehavior") {
+        return targetType == "MediaElement";
+    }
+    if (prop == "TickLength" || prop == "TickWidth" || prop == "MinAngle" || prop == "MaxAngle") {
+        return targetType == "RadialTicks" || targetType == "RadialNeedle";
+    }
+    if (prop == "Brush") return targetType == "RadialTicks";
+    if (prop == "Year" || prop == "Month" || prop == "Day" ||
+        prop == "Hour" || prop == "Minute" || prop == "Second" ||
+        prop == "Format" || prop == "UseSystemTime") {
+        return targetType == "DateTimeControl";
+    }
+    return false;
+}
+
+[[nodiscard]] bool IsFloatPropertyFor(
+    std::string_view targetType,
+    std::string_view prop,
+    std::string_view rawVal = {}) {
+    if (!IsFloatProperty(prop)) {
+        return false;
+    }
+    if (!targetType.empty() && (IsKnownUIElementType(targetType) || IsNonUIElementType(targetType))) {
+        if (IsNonUIElementType(targetType)) {
+            if (targetType == "Inline" || targetType == "Run" || targetType == "LineBreak") {
+                return prop == "FontSize";
+            }
+            if (targetType == "GridViewColumn") return prop == "Width";
+            if (targetType == "RowDefinition") return prop == "MinHeight" || prop == "MaxHeight";
+            if (targetType == "ColumnDefinition") return prop == "MinWidth" || prop == "MaxWidth";
+            if (targetType == "TranslateTransform") return false;
+            if (targetType == "ScaleTransform") {
+                return prop == "ScaleX" || prop == "ScaleY" || prop == "CenterX" || prop == "CenterY";
+            }
+            if (targetType == "RotateTransform") {
+                return prop == "Angle" || prop == "CenterX" || prop == "CenterY";
+            }
+            if (targetType == "SkewTransform") {
+                return prop == "AngleX" || prop == "AngleY" || prop == "CenterX" || prop == "CenterY";
+            }
+            if (targetType == "Effect" || targetType == "BlurEffect" ||
+                targetType == "DropShadowEffect" || targetType == "BackdropBlurEffect" ||
+                targetType == "TintEffect" || targetType == "PixelateEffect" ||
+                targetType == "ChromaticAberrationEffect" || targetType == "DirectionalBlurEffect") {
+                return prop == "Radius" || prop == "Direction" || prop == "Opacity" ||
+                       prop == "BlurRadius" || prop == "ShadowDepth";
+            }
+            if (targetType == "RadialGradientBrush") {
+                return prop == "CenterX" || prop == "CenterY" || prop == "RadiusX" ||
+                       prop == "RadiusY" || prop == "Opacity";
+            }
+            return prop == "Opacity";
+        }
+        if (prop == "Width" || prop == "Height" || prop == "MinWidth" ||
+            prop == "MaxWidth" || prop == "MinHeight" || prop == "MaxHeight" || prop == "Opacity") {
+            return true;
+        }
+        if (prop == "FontSize") {
+            return IsControlType(targetType) || targetType == "TextBlock" ||
+                   targetType == "ContentPresenter" || targetType == "ScrollContentPresenter";
+        }
+        if (prop == "Spacing") {
+            return targetType == "StackPanel" || targetType == "VirtualizingStackPanel" ||
+                   targetType == "TabPanel" || targetType == "ToolBarPanel" ||
+                   targetType == "WrapPanel" || targetType == "ToolBarOverflowPanel" ||
+                   targetType == "UniformGrid" || targetType == "RadialTicks";
+        }
+        if (prop == "Minimum" || prop == "Maximum") {
+            return IsRangeBaseType(targetType) || targetType == "Track" || targetType == "TickBar" ||
+                   targetType == "RadialTicks" || targetType == "RadialNeedle";
+        }
+        if (prop == "Value") {
+            return IsRangeBaseType(targetType) || targetType == "Track" || targetType == "RadialNeedle";
+        }
+        if (prop == "SmallChange" || prop == "LargeChange") return IsRangeBaseType(targetType);
+        if (prop == "StrokeThickness") return IsShapeType(targetType) || targetType == "TextBlock";
+        if (prop == "RadiusX" || prop == "RadiusY") return targetType == "Rectangle";
+        if (prop == "X1" || prop == "Y1" || prop == "X2" || prop == "Y2") return targetType == "Line";
+        if (prop == "TickLength" || prop == "TickWidth" || prop == "MinAngle" || prop == "MaxAngle") {
+            return targetType == "RadialTicks" || targetType == "RadialNeedle";
+        }
+        if (prop == "Volume") return targetType == "MediaElement";
+        if (prop == "LineHeight" || prop == "CharacterSpacing") return targetType == "TextBlock";
+        if (prop == "ViewportSize") return targetType == "ScrollBar" || targetType == "Track";
+        if (prop == "MaxDropDownHeight") return targetType == "ComboBox";
+        if (prop == "HorizontalOffset" || prop == "VerticalOffset") {
+            return targetType == "Popup" || targetType == "ScrollViewer";
+        }
+        if (prop == "BlurRadius" || prop == "ShadowDepth" || prop == "Direction" ||
+            prop == "OffsetX" || prop == "OffsetY" || prop == "Spread") {
+            return targetType == "BoxShadow";
+        }
+        return false;
+    }
+
+    // Unknown/untyped context (e.g. untyped Setter/ChangePropertyAction): avoid coercing ambiguous string values
+    if (prop == "Value" || prop == "Direction" || prop == "Radius" ||
+        prop == "Angle" || prop == "Volume" || prop == "Spacing") {
+        if (!rawVal.empty()) {
+            float parsed = 0.0f;
+            return aero::str::TryParseFloat32(rawVal, parsed);
+        }
+        return false;
+    }
+    return true;
+}
+
+[[nodiscard]] bool IsIntPropertyFor(
+    std::string_view targetType,
+    std::string_view prop,
+    std::string_view rawVal = {}) {
+    if (!IsIntProperty(prop)) {
+        return false;
+    }
+    if (!targetType.empty() && (IsKnownUIElementType(targetType) || IsNonUIElementType(targetType))) {
+        if (prop == "ZIndex") return !IsNonUIElementType(targetType);
+        if (prop == "Rows" || prop == "Columns") return targetType == "UniformGrid";
+        if (prop == "MaxLines") return targetType == "TextBlock" || targetType == "TextBox";
+        if (prop == "MaxLength") {
+            return targetType == "TextBoxBase" || targetType == "TextBox" || targetType == "PasswordBox";
+        }
+        if (prop == "TabIndex") return targetType == "TabItem";
+        if (prop == "SelectedIndex") return IsSelectorType(targetType);
+        if (prop == "Year" || prop == "Month" || prop == "Day" ||
+            prop == "Hour" || prop == "Minute" || prop == "Second") {
+            return targetType == "DateTimeControl";
+        }
+        return false;
+    }
+    if ((prop == "Rows" || prop == "Columns") && !rawVal.empty()) {
+        const std::string_view s = aero::str::Trim(rawVal);
+        if (s.empty()) return false;
+        std::size_t idx = (s.front() == '-') ? 1u : 0u;
+        if (idx >= s.size()) return false;
+        for (; idx < s.size(); ++idx) {
+            if (!std::isdigit(static_cast<unsigned char>(s[idx]))) return false;
+        }
+    }
+    return true;
+}
+
+[[nodiscard]] bool IsBoolPropertyFor(
+    std::string_view targetType,
+    std::string_view prop,
+    std::string_view rawVal = {}) {
+    if (!IsBoolProperty(prop)) {
+        return false;
+    }
+    if (!targetType.empty() && (IsKnownUIElementType(targetType) || IsNonUIElementType(targetType))) {
+        if (IsNonUIElementType(targetType)) return false;
+        if (prop == "IsEnabled" || prop == "IsHitTestVisible" || prop == "Focusable" ||
+            prop == "ClipToBounds" || prop == "IsMouseOver" || prop == "IsPressed" ||
+            prop == "IsFocused" || prop == "IsKeyboardFocused") {
+            return true;
+        }
+        if (prop == "IsChecked") return IsToggleButtonType(targetType) || targetType == "MenuItem";
+        if (prop == "IsThreeState") return IsToggleButtonType(targetType);
+        if (prop == "IsExpanded") return targetType == "Expander" || targetType == "TreeViewItem";
+        if (prop == "IsSelected") return IsSelectableItemType(targetType);
+        if (prop == "IsReadOnly") {
+            return targetType == "TextBoxBase" || targetType == "TextBox" || targetType == "PasswordBox";
+        }
+        if (prop == "LastChildFill") return targetType == "DockPanel";
+        if (prop == "IsOpen") return targetType == "Popup" || targetType == "ContextMenu";
+        if (prop == "StaysOpen") return targetType == "Popup";
+        if (prop == "IsCheckable") return targetType == "MenuItem";
+        if (prop == "IsDefault" || prop == "IsCancel") {
+            return targetType == "Button" || targetType == "RepeatButton";
+        }
+        if (prop == "ShowGridLines") return targetType == "Grid";
+        if (prop == "IsEditable" || prop == "IsDropDownOpen") return targetType == "ComboBox";
+        if (prop == "IsMuted") return targetType == "MediaElement";
+        if (prop == "ShowDate" || prop == "ShowTime" || prop == "UseSystemTime") {
+            return targetType == "DateTimeControl";
+        }
+        if (prop == "IsDirectionReversed") {
+            return targetType == "Slider" || targetType == "ScrollBar" ||
+                   targetType == "Track" || targetType == "TickBar";
+        }
+        if (prop == "IsTabStop") return IsControlType(targetType);
+        if (prop == "IsDragging") return targetType == "Thumb" || targetType == "GridSplitter";
+        if (prop == "HasItems") return IsItemsControlType(targetType);
+        if (prop == "CanContentScroll") {
+            return targetType == "ScrollViewer" || targetType == "ScrollContentPresenter";
+        }
+        if (prop == "Inside") return targetType == "BoxShadow";
+        if (prop == "IsItemsHost") return IsPanelType(targetType);
+        return false;
+    }
+    if (!rawVal.empty()) {
+        const std::string_view s = aero::str::Trim(rawVal);
+        return aero::str::EqualsIgnoreCase(s, "True") || aero::str::EqualsIgnoreCase(s, "False");
+    }
+    return true;
 }
 
 [[nodiscard]] std::uint64_t FastHashBytes64(const void* data, std::size_t size) noexcept {
@@ -1062,6 +1585,14 @@ void ScanXamlSubtreeForSeeds(
             }
             continue;
         }
+        if (node.localName == "StaticResource" &&
+            (attr.localName == "ResourceKey" || attr.localName == "Key")) {
+            const std::string val = StripTargetTypeName(attr.value);
+            if (!val.empty()) {
+                liveKeys.insert(val);
+            }
+            continue;
+        }
         if (attr.localName == "BasedOn" || attr.localName == "Style" ||
             attr.localName == "Template" || attr.localName == "ItemContainerStyle" ||
             attr.localName == "ItemTemplate" || attr.localName == "ContentTemplate" ||
@@ -1160,11 +1691,14 @@ public:
     explicit XamlEmitter(const XamlEmitOptions& opts) : opts_(opts) {}
 
     [[nodiscard]] XamlEmitResult Run(std::string_view xamlContent) {
+        hasErrors_ = false;
         XamlEmitResult res;
         res.generatedFilePath = MakeGeneratedRsPath(opts_.xamlPath);
 
         std::unique_ptr<XamlNode> root;
         if (!BuildXamlDom(xamlContent, root, diagnostics_)) {
+            hasErrors_ = true;
+            res.succeeded = false;
             res.diagnostics = diagnostics_;
             return res;
         }
@@ -1251,7 +1785,7 @@ public:
         out << "\n";
         out << body.str();
 
-        res.succeeded = diagnostics_.empty();
+        res.succeeded = !hasErrors_;
         res.moduleName = moduleName_;
         res.rootClassName = rootClassName_;
         res.generatedRsCode = out.str();
@@ -1278,6 +1812,7 @@ private:
     std::unordered_map<std::string, std::string> knownColors_;
     std::unordered_map<std::string, std::string> knownGeometries_;
     std::unordered_map<std::string, float> knownDoubles_;
+    std::unordered_map<std::string, const XamlNode*> knownStoryboards_;
     std::unordered_set<std::string> visitedExternalXamls_;
     std::unordered_map<std::string, ParsedExternalDoc> externalDocCache_;
     std::unordered_map<std::string, std::string> externalPathLookup_;
@@ -1290,10 +1825,26 @@ private:
     bool hasLiveExternalFilter_ = false;
     int externalDictDepth_ = 0;
     std::vector<std::string> diagnostics_;
+    bool hasErrors_ = false;
+    std::unordered_set<std::string> emittedWarnings_;
     int nextId_ = 0;
     bool inPartialClass_ = false;
     bool emittedLocSources_ = false;
     std::string currentTplParentVar_;
+
+    void AddError(std::string msg) {
+        hasErrors_ = true;
+        diagnostics_.push_back(std::move(msg));
+    }
+
+    void AddWarning(std::string_view msg) {
+        std::string formatted = aero::str::StartsWith(msg, "[Warning]")
+            ? std::string(msg)
+            : ("[Warning] " + std::string(msg));
+        if (emittedWarnings_.insert(formatted).second) {
+            diagnostics_.push_back(std::move(formatted));
+        }
+    }
 
     void RecordExternalDependency(std::string_view normPath, std::uint64_t contentHash) {
         if (normPath.empty()) {
@@ -1376,7 +1927,7 @@ private:
 
         if (!loaded) {
             if (reportErrors) {
-                diagnostics_.push_back(
+                AddError(
                     "Could not resolve MergedDictionary Source '" + std::string(requestedSource) +
                     "' referenced from '" + std::string(currentXamlPath) + "'");
             }
@@ -1394,6 +1945,9 @@ private:
         std::vector<std::string> tempDiag;
         std::unique_ptr<XamlNode> mergedRoot;
         if (!BuildXamlDom(xamlContent, mergedRoot, reportErrors ? diagnostics_ : tempDiag) || !mergedRoot) {
+            if (reportErrors) {
+                hasErrors_ = true;
+            }
             return nullptr;
         }
         RecordExternalDependency(resolvedPath, rawHash);
@@ -1404,6 +1958,28 @@ private:
         const auto [insertedIt, unused] = externalDocCache_.emplace(resolvedPath, std::move(doc));
         (void)unused;
         return &insertedIt->second;
+    }
+
+    [[nodiscard]] static bool IsThemeResourceDictPath(std::string_view path) noexcept {
+        if (path.empty()) {
+            return false;
+        }
+        return path.find("NoesisTheme") != std::string_view::npos ||
+               path.find("/Theme/") != std::string_view::npos ||
+               path.find("\\Theme\\") != std::string_view::npos ||
+               path.find("/Themes/") != std::string_view::npos ||
+               path.find("\\Themes\\") != std::string_view::npos;
+    }
+
+    [[nodiscard]] static bool HasDynamicXamlLoadingHint(
+        const std::vector<std::string>& hints) noexcept {
+        for (const std::string& hint : hints) {
+            if (hint.find("XamlReader.Load") != std::string::npos ||
+                hint.find("XamlReader.Parse") != std::string::npos) {
+                return true;
+            }
+        }
+        return false;
     }
 
     void CollectExternalDictNodes(
@@ -1435,7 +2011,8 @@ private:
                 continue;
             }
             if (externalDictDepth_ > 0) {
-                if (IsPrunableExternalResourceTag(child->localName)) {
+                if (IsThemeResourceDictPath(currentXamlPath) &&
+                    IsPrunableExternalResourceTag(child->localName)) {
                     if (externalPrunableCandidates_.insert(child.get()).second) {
                         externalPrunableList_.push_back(child.get());
                     }
@@ -1489,6 +2066,10 @@ private:
         liveExternalNodes_.clear();
         externalNonPrunableNodes_.clear();
         hasLiveExternalFilter_ = false;
+
+        if (HasDynamicXamlLoadingHint(opts_.usageHintTexts)) {
+            return;
+        }
 
         WalkTreeForExternalDictRefs(primaryRoot, currentXamlPath);
         if (externalPrunableList_.empty()) {
@@ -1659,7 +2240,7 @@ private:
             return {};
         }
         if (!visitedExternalXamls_.insert(doc->resolvedPath).second) {
-            diagnostics_.push_back("Circular ResourceDictionary Source detected: " + doc->resolvedPath);
+            AddError("Circular ResourceDictionary Source detected: " + doc->resolvedPath);
             return {};
         }
         ++externalDictDepth_;
@@ -1935,6 +2516,12 @@ private:
             if (const auto* tt = child.FindAttribute("TargetType")) {
                 key = StripTargetTypeName(tt->value);
             }
+        } else if ((child.localName == "DataTemplate" || child.localName == "HierarchicalDataTemplate") && key.empty()) {
+            if (const auto* dt = child.FindAttribute("DataType")) {
+                key = StripTargetTypeName(dt->value);
+            } else if (const auto* xdt = child.FindXAttribute("DataType")) {
+                key = StripTargetTypeName(xdt->value);
+            }
         }
         if (key.empty()) {
             return;
@@ -1969,7 +2556,8 @@ private:
             Indent(out, indent);
             out << dictVar << ".SetBox(" << EscapeRsString(key) << ", " << v << ");\n";
         } else if (child.localName == "Storyboard") {
-            const std::string v = EmitStoryboard(child, out, indent);
+            knownStoryboards_[key] = &child;
+            const std::string v = EmitStoryboard(child, out, indent, dictVar);
             Indent(out, indent);
             out << dictVar << ".SetBox(" << EscapeRsString(key) << ", " << v << ");\n";
         } else if (child.localName == "Thickness") {
@@ -2007,10 +2595,17 @@ private:
             Indent(out, indent);
             out << dictVar << ".SetBox(" << EscapeRsString(key) << ", DependencyObject.BoxString("
                 << EscapeRsString(uri) << "));\n";
+        } else if (child.localName == "ImageSource") {
+            const std::string uri = std::string(aero::str::Trim(child.textContent));
+            Indent(out, indent);
+            out << dictVar << ".SetBox(" << EscapeRsString(key) << ", DependencyObject.BoxString("
+                << EscapeRsString(uri) << "));\n";
         } else if (child.localName == "StreamGeometry" ||
                    child.localName == "PathGeometry" ||
                    child.localName == "Geometry") {
-            const std::string geom = std::string(aero::str::Trim(child.textContent));
+            const std::string geom = (child.localName == "PathGeometry")
+                ? ConvertPathGeometryToSvgData(child)
+                : std::string(aero::str::Trim(child.textContent));
             knownGeometries_[key] = geom;
             Indent(out, indent);
             out << dictVar << ".SetBox(" << EscapeRsString(key) << ", DependencyObject.BoxString("
@@ -2084,6 +2679,108 @@ private:
         }
     }
 
+    [[nodiscard]] const XamlNode* FindBrushShaderElement(const XamlNode& brushNode) const {
+        if (const auto* shProp = brushNode.FindPropertyElement(brushNode.localName, "Shader")) {
+            return shProp;
+        }
+        return brushNode.FindPropertyElement("Brush", "Shader");
+    }
+
+    [[nodiscard]] std::string EmitShaderFallbackBrush(
+        const XamlNode& brushNode,
+        const XamlNode& shaderNode,
+        std::ostringstream& out,
+        int indent) {
+        const std::string& shName = shaderNode.localName;
+        const std::string bVar = FreshVar("shgrad");
+        Indent(out, indent);
+
+        auto emitOpacity = [&]() {
+            if (const auto* opAttr = brushNode.FindAttribute("Opacity")) {
+                float op = 1.0f;
+                if (aero::str::TryParseFloat32(opAttr->value, op)) {
+                    Indent(out, indent);
+                    out << bVar << ".Opacity = " << FormatFloatLiteral(op) << ";\n";
+                }
+            }
+        };
+
+        if (shName == "PlasmaBrush") {
+            out << "var " << bVar << " = new LinearGradientBrush(0.0f, 0.0f, 1.0f, 1.0f);\n";
+            Indent(out, indent);
+            out << bVar << ".AddStop(\"#FF38BDF8\", 0.0f);\n";
+            Indent(out, indent);
+            out << bVar << ".AddStop(\"#FF8B5CF6\", 0.35f);\n";
+            Indent(out, indent);
+            out << bVar << ".AddStop(\"#FFEC4899\", 0.7f);\n";
+            Indent(out, indent);
+            out << bVar << ".AddStop(\"#FFF97316\", 1.0f);\n";
+            emitOpacity();
+            return bVar;
+        }
+
+        if (shName == "ConicGradientBrush") {
+            out << "var " << bVar << " = new LinearGradientBrush(0.0f, 0.5f, 1.0f, 0.5f);\n";
+            std::vector<std::pair<std::string, float>> stops;
+            const XamlNode* stopContainer = shaderNode.FindPropertyElement("ConicGradientBrush", "GradientStops");
+            const auto& stopNodes = (stopContainer != nullptr) ? stopContainer->children : shaderNode.children;
+            for (const auto& st : stopNodes) {
+                if (!st || st->localName != "GradientStop") continue;
+                std::string cHex = "#FFFFFFFF";
+                if (const auto* cAttr = st->FindAttribute("Color")) {
+                    cHex = ResolveColorHexOrString(cAttr->value);
+                }
+                float off = 0.0f;
+                if (const auto* oAttr = st->FindAttribute("Offset")) {
+                    (void)aero::str::TryParseFloat32(oAttr->value, off);
+                }
+                stops.emplace_back(std::move(cHex), off);
+            }
+            if (stops.size() >= 2u) {
+                for (const auto& [cHex, off] : stops) {
+                    Indent(out, indent);
+                    out << bVar << ".AddStop(" << EscapeRsString(cHex) << ", "
+                        << FormatFloatLiteral(off) << ");\n";
+                }
+            } else {
+                Indent(out, indent);
+                out << bVar << ".AddStop(\"#FF06B6D4\", 0.0f);\n";
+                Indent(out, indent);
+                out << bVar << ".AddStop(\"#FF3B82F6\", 0.25f);\n";
+                Indent(out, indent);
+                out << bVar << ".AddStop(\"#FFA855F7\", 0.5f);\n";
+                Indent(out, indent);
+                out << bVar << ".AddStop(\"#FFEC4899\", 0.75f);\n";
+                Indent(out, indent);
+                out << bVar << ".AddStop(\"#FFF59E0B\", 1.0f);\n";
+            }
+            emitOpacity();
+            return bVar;
+        }
+
+        if (shName == "SaturationBrush") {
+            out << "var " << bVar << " = new LinearGradientBrush(0.0f, 1.0f, 1.0f, 0.0f);\n";
+            Indent(out, indent);
+            out << bVar << ".AddStop(\"#FF10B981\", 0.0f);\n";
+            Indent(out, indent);
+            out << bVar << ".AddStop(\"#FFEAB308\", 0.5f);\n";
+            Indent(out, indent);
+            out << bVar << ".AddStop(\"#FFEF4444\", 1.0f);\n";
+            emitOpacity();
+            return bVar;
+        }
+
+        out << "var " << bVar << " = new LinearGradientBrush(0.0f, 0.0f, 1.0f, 1.0f);\n";
+        Indent(out, indent);
+        out << bVar << ".AddStop(\"#FF64748B\", 0.0f);\n";
+        Indent(out, indent);
+        out << bVar << ".AddStop(\"#FF94A3B8\", 0.5f);\n";
+        Indent(out, indent);
+        out << bVar << ".AddStop(\"#FFCBD5E1\", 1.0f);\n";
+        emitOpacity();
+        return bVar;
+    }
+
     [[nodiscard]] std::string EmitBrushObject(
         const XamlNode& brushNode,
         std::string_view /*targetProp*/,
@@ -2110,20 +2807,11 @@ private:
                 }
             }
             // Check shader child tint override (Brush.Shader -> SaturationBrush / ConicGradientBrush / PlasmaBrush)
-            if (const auto* shProp = brushNode.FindPropertyElement("SolidColorBrush", "Shader")) {
+            if (const auto* shProp = FindBrushShaderElement(brushNode)) {
                 if (!shProp->children.empty() && dynamicColorKey.empty()) {
                     const std::string& shName = shProp->children.front()->localName;
                     if (shName == "PlasmaBrush" || shName == "ConicGradientBrush" || shName == "SaturationBrush") {
-                        const std::string bVar = FreshVar("shgrad");
-                        Indent(out, indent);
-                        out << "var " << bVar << " = new LinearGradientBrush(0.0f, 0.0f, 1.0f, 1.0f);\n";
-                        Indent(out, indent);
-                        out << bVar << ".AddStop(\"#FF38BDF8\", 0.0f);\n";
-                        Indent(out, indent);
-                        out << bVar << ".AddStop(\"#FF8B5CF6\", 0.5f);\n";
-                        Indent(out, indent);
-                        out << bVar << ".AddStop(\"#FFEC4899\", 1.0f);\n";
-                        return bVar;
+                        return EmitShaderFallbackBrush(brushNode, *shProp->children.front(), out, indent);
                     }
                 }
             }
@@ -2150,11 +2838,17 @@ private:
         }
 
         if (brushNode.localName == "ImageBrush") {
-            const std::string bVar = FreshVar("ibrush");
             std::string src;
             if (const auto* sa = brushNode.FindAttribute("ImageSource")) {
                 if (!LooksLikeMarkupExtension(sa->value)) src = sa->value;
             }
+            if (src.empty()) {
+                if (const auto* shProp = FindBrushShaderElement(brushNode);
+                    shProp != nullptr && !shProp->children.empty()) {
+                    return EmitShaderFallbackBrush(brushNode, *shProp->children.front(), out, indent);
+                }
+            }
+            const std::string bVar = FreshVar("ibrush");
             Indent(out, indent);
             out << "var " << bVar << " = new ImageBrush(" << EscapeRsString(src) << ");\n";
             if (const auto* vbAttr = brushNode.FindAttribute("Viewbox")) {
@@ -2291,13 +2985,44 @@ private:
     [[nodiscard]] std::string EmitTransformObject(
         const XamlNode& node,
         std::ostringstream& out,
-        int indent) {
+        int indent,
+        std::string_view hostUiVar = {},
+        std::string_view xDataType = {},
+        std::string_view dictVar = {},
+        std::string_view transformPropPrefix = "RenderTransform") {
         auto getF = [&](std::string_view name, float def) -> float {
             if (const auto* a = node.FindAttribute(name)) {
                 float v = def;
                 if (aero::str::TryParseFloat32(a->value, v)) return v;
             }
             return def;
+        };
+        auto emitTransformPropBindings = [&](std::initializer_list<const char*> props) {
+            if (hostUiVar.empty()) {
+                return;
+            }
+            for (const char* prop : props) {
+                const std::string targetProp = std::string(transformPropPrefix) + "." + prop;
+                if (const auto* a = node.FindAttribute(prop);
+                    a != nullptr && LooksLikeMarkupExtension(a->value)) {
+                    EmitPropertyAttributeOrBinding(
+                        hostUiVar, "UIElement", targetProp, a->value, xDataType, dictVar, out, indent);
+                }
+                if (const XamlNode* propEl = node.FindPropertyElement(node.localName, prop);
+                    propEl != nullptr && !propEl->children.empty()) {
+                    const auto& firstChild = *propEl->children.front();
+                    if (firstChild.localName == "Binding") {
+                        ParsedBindingSpec spec;
+                        std::string convVar;
+                        TryParseBindingNode(firstChild, spec, convVar, dictVar, out, indent);
+                        EmitBindingSpec(
+                            hostUiVar, "UIElement", targetProp, spec, xDataType, out, indent, {}, convVar);
+                    } else if (firstChild.localName == "MultiBinding") {
+                        EmitMultiBindingNode(
+                            hostUiVar, "UIElement", targetProp, firstChild, dictVar, out, indent);
+                    }
+                }
+            }
         };
 
         if (node.localName == "TranslateTransform") {
@@ -2306,6 +3031,7 @@ private:
             out << "var " << v << " = new TranslateTransform("
                 << FormatFloatLiteral(getF("X", 0.0f)) << ", "
                 << FormatFloatLiteral(getF("Y", 0.0f)) << ");\n";
+            emitTransformPropBindings({"X", "Y"});
             return v;
         }
         if (node.localName == "ScaleTransform") {
@@ -2316,6 +3042,7 @@ private:
                 << FormatFloatLiteral(getF("ScaleY", 1.0f)) << ", "
                 << FormatFloatLiteral(getF("CenterX", 0.0f)) << ", "
                 << FormatFloatLiteral(getF("CenterY", 0.0f)) << ");\n";
+            emitTransformPropBindings({"ScaleX", "ScaleY"});
             return v;
         }
         if (node.localName == "RotateTransform") {
@@ -2325,6 +3052,7 @@ private:
                 << FormatFloatLiteral(getF("Angle", 0.0f)) << ", "
                 << FormatFloatLiteral(getF("CenterX", 0.0f)) << ", "
                 << FormatFloatLiteral(getF("CenterY", 0.0f)) << ");\n";
+            emitTransformPropBindings({"Angle"});
             return v;
         }
         if (node.localName == "SkewTransform") {
@@ -2335,6 +3063,7 @@ private:
                 << FormatFloatLiteral(getF("AngleY", 0.0f)) << ", "
                 << FormatFloatLiteral(getF("CenterX", 0.0f)) << ", "
                 << FormatFloatLiteral(getF("CenterY", 0.0f)) << ");\n";
+            emitTransformPropBindings({"AngleX", "AngleY"});
             return v;
         }
         if (node.localName == "TransformGroup") {
@@ -2344,7 +3073,8 @@ private:
             const XamlNode* childProp = node.FindPropertyElement("TransformGroup", "Children");
             const auto& items = (childProp != nullptr) ? childProp->children : node.children;
             for (const auto& item : items) {
-                const std::string sub = EmitTransformObject(*item, out, indent);
+                const std::string sub = EmitTransformObject(
+                    *item, out, indent, hostUiVar, xDataType, dictVar, transformPropPrefix);
                 if (!sub.empty()) {
                     Indent(out, indent);
                     out << tg << ".Add(" << sub << ");\n";
@@ -2492,12 +3222,12 @@ private:
 
         for (const auto& child : styleNode.children) {
             if (child->localName == "Setter") {
-                EmitSetterInto(*child, styVar, dictVar, out, indent);
+                EmitSetterInto(*child, styVar, dictVar, out, indent, targetType);
             }
         }
 
         if (const XamlNode* trigProp = styleNode.FindPropertyElement("Style", "Triggers")) {
-            EmitTriggerCollectionInto(*trigProp, styVar, dictVar, out, indent);
+            EmitTriggerCollectionInto(*trigProp, styVar, dictVar, out, indent, targetType);
         }
         return styVar;
     }
@@ -2526,7 +3256,8 @@ private:
                propKey == "TextBlock.FontSize" || propKey == "TextBlock.FontFamily" ||
                propKey == "TextBlock.FontWeight" || propKey == "TextBlock.Foreground" ||
                propKey == "Element.Projection3D" || propKey == "Element.Transform3D" ||
-               propKey == "Element.BlendingMode" || propKey == "RiveControl.Source";
+               propKey == "Element.BlendingMode" || propKey == "RiveControl.Source" ||
+               aero::str::StartsWith(propKey, "Custom.");
     }
 
     [[nodiscard]] static std::string NormalizeBindingPath(std::string_view rawPath) {
@@ -2545,7 +3276,8 @@ private:
 
     [[nodiscard]] std::string BoxSetterValueExpr(
         std::string_view propName,
-        std::string_view typedExpr) const {
+        std::string_view typedExpr,
+        std::string_view targetType = {}) const {
         if (typedExpr == "null") {
             return "null";
         }
@@ -2564,17 +3296,21 @@ private:
         if (LookupEnumType(propName) != nullptr) {
             return "DependencyObject.BoxInt(EnumConvert.ToInt(" + std::string(typedExpr) + "))";
         }
-        if (IsBoolProperty(propName) || typedExpr == "true" || typedExpr == "false") {
+        if (typedExpr == "true" || typedExpr == "false") {
             return "DependencyObject.BoxBool(" + std::string(typedExpr) + ")";
         }
-        if (IsIntProperty(propName)) {
+        const bool looksNumeric = !typedExpr.empty() &&
+            (std::isdigit(static_cast<unsigned char>(typedExpr.front())) || typedExpr.front() == '-');
+        if (looksNumeric && IsIntPropertyFor(targetType, propName)) {
+            if (typedExpr.back() == 'f' || typedExpr.find('.') != std::string_view::npos) {
+                return "DependencyObject.BoxInt((int)(" + std::string(typedExpr) + "))";
+            }
             return "DependencyObject.BoxInt(" + std::string(typedExpr) + ")";
         }
-        if (IsFloatProperty(propName)) {
+        if (looksNumeric && IsFloatPropertyFor(targetType, propName)) {
             return "DependencyObject.BoxFloat(" + std::string(typedExpr) + ")";
         }
-        if (typedExpr.size() >= 2 && typedExpr.back() == 'f' &&
-            (std::isdigit(static_cast<unsigned char>(typedExpr.front())) || typedExpr.front() == '-')) {
+        if (typedExpr.size() >= 2 && typedExpr.back() == 'f' && looksNumeric) {
             return "DependencyObject.BoxFloat(" + std::string(typedExpr) + ")";
         }
         bool allDigits = !typedExpr.empty();
@@ -2595,7 +3331,8 @@ private:
         std::string_view targetObjVar,
         std::string_view dictVar,
         std::ostringstream& out,
-        int indent) {
+        int indent,
+        std::string_view styleTargetType = {}) {
         const auto* pAttr = setterNode.FindAttribute("Property");
         if (pAttr == nullptr) {
             return;
@@ -2625,14 +3362,20 @@ private:
             return;
         }
 
-        const std::string propName = NormalizeSetterPropertyName(pAttr->value);
+        std::string propName = NormalizeSetterPropertyName(pAttr->value);
         if (propName.empty()) {
             return;
+        }
+        if (propName == "noesis:RichText.Text" || propName == "RichText.Text") {
+            propName = "RichText.Text";
+            Indent(out, indent);
+            out << "RichText.Register();\n";
         }
         std::string targetName;
         if (const auto* tnAttr = setterNode.FindAttribute("TargetName")) {
             targetName = tnAttr->value;
         }
+        const std::string_view effTargetType = targetName.empty() ? styleTargetType : std::string_view{};
 
         if (const auto* valEl = setterNode.FindPropertyElement("Setter", "Value")) {
             for (const auto& c : valEl->children) {
@@ -2680,9 +3423,17 @@ private:
                     valExpr = EmitBrushObject(*c, propName, dictVar, out, indent);
                     break;
                 }
+                if (c->localName == "TranslateTransform" ||
+                    c->localName == "ScaleTransform" ||
+                    c->localName == "RotateTransform" ||
+                    c->localName == "SkewTransform" ||
+                    c->localName == "TransformGroup") {
+                    valExpr = EmitTransformObject(*c, out, indent, {}, {}, dictVar);
+                    break;
+                }
             }
             if (valExpr.empty() && !valEl->textContent.empty()) {
-                valExpr = FormatTypedValueLiteral(propName, valEl->textContent, dictVar);
+                valExpr = FormatTypedValueLiteral(propName, valEl->textContent, dictVar, effTargetType);
             }
         } else if (const auto* valAttr = setterNode.FindAttribute("Value")) {
             if (LooksLikeMarkupExtension(valAttr->value)) {
@@ -2714,7 +3465,7 @@ private:
                 }
             }
             if (valExpr.empty()) {
-                valExpr = FormatTypedValueLiteral(propName, valAttr->value, dictVar);
+                valExpr = FormatTypedValueLiteral(propName, valAttr->value, dictVar, effTargetType);
             }
         }
 
@@ -2727,12 +3478,13 @@ private:
             propName == "Template" || propName == "ItemTemplate" ||
             propName == "ContentTemplate" || propName == "Style" ||
             propName == "ItemContainerStyle" || propName == "ItemsPanel" ||
+            propName == "RenderTransform" ||
             aero::str::StartsWith(valExpr, "this.FindResource(") ||
             valExpr.find(".FindResource(") != std::string::npos ||
             valExpr.find(".Get(") != std::string::npos ||
             valExpr.find(".GetBox(") != std::string::npos) {
             out << targetObjVar << ".AddSetterBox(" << EscapeRsString(propName) << ", "
-                << BoxSetterValueExpr(propName, valExpr) << ", "
+                << BoxSetterValueExpr(propName, valExpr, effTargetType) << ", "
                 << EscapeRsString(targetName) << ");\n";
         } else {
             out << targetObjVar << ".AddSetter(" << EscapeRsString(propName) << ", " << valExpr << ");\n";
@@ -2743,6 +3495,7 @@ private:
         const XamlNode& trigNode,
         std::string_view trigTypeName,
         std::string_view trigVar,
+        std::string_view dictVar,
         std::ostringstream& out,
         int indent) {
         auto emitActionList = [&](std::string_view propName, std::string_view methodPrefix) {
@@ -2764,7 +3517,7 @@ private:
                 }
                 for (const auto& sbNode : act->children) {
                     if (sbNode && sbNode->localName == "Storyboard") {
-                        const std::string sb = EmitStoryboard(*sbNode, out, indent);
+                        const std::string sb = EmitStoryboard(*sbNode, out, indent, dictVar);
                         Indent(out, indent);
                         out << trigVar << "." << methodPrefix << "Action(" << sb << ");\n";
                     }
@@ -2775,12 +3528,23 @@ private:
         emitActionList("ExitActions", "AddExit");
     }
 
+    [[nodiscard]] std::string FormatTriggerValueBoxExpr(
+        std::string_view propOrPath,
+        std::string_view rawVal,
+        std::string_view dictVar) const {
+        if (LooksLikeMarkupExtension(rawVal) || LookupEnumType(propOrPath) != nullptr) {
+            return BoxSetterValueExpr(propOrPath, FormatTypedValueLiteral(propOrPath, rawVal, dictVar));
+        }
+        return BoxSetterValueExpr(propOrPath, FormatGenericScalarLiteral(rawVal));
+    }
+
     void EmitTriggerCollectionInto(
         const XamlNode& trigProp,
         std::string_view ownerObjVar,
         std::string_view dictVar,
         std::ostringstream& out,
-        int indent) {
+        int indent,
+        std::string_view styleTargetType = {}) {
         for (const auto& trig : trigProp.children) {
             if (trig->localName == "Trigger") {
                 std::string prop;
@@ -2789,17 +3553,18 @@ private:
                 if (const auto* p = trig->FindAttribute("Property")) prop = NormalizeSetterPropertyName(p->value);
                 if (const auto* v = trig->FindAttribute("Value")) val = v->value;
                 if (const auto* sn = trig->FindAttribute("SourceName")) sourceName = sn->value;
+                const std::string_view trigTargetType = sourceName.empty() ? styleTargetType : std::string_view{};
                 const std::string tVar = FreshVar("trig");
                 Indent(out, indent);
                 out << "var " << tVar << " = Trigger.CreateBox(" << EscapeRsString(prop) << ", "
-                    << BoxSetterValueExpr(prop, FormatTypedValueLiteral(prop, val, dictVar)) << ", "
+                    << BoxSetterValueExpr(prop, FormatTypedValueLiteral(prop, val, dictVar, trigTargetType), trigTargetType) << ", "
                     << EscapeRsString(sourceName) << ");\n";
                 for (const auto& s : trig->children) {
                     if (s->localName == "Setter") {
-                        EmitSetterInto(*s, tVar, dictVar, out, indent);
+                        EmitSetterInto(*s, tVar, dictVar, out, indent, styleTargetType);
                     }
                 }
-                EmitTriggerEnterExitActions(*trig, "Trigger", tVar, out, indent);
+                EmitTriggerEnterExitActions(*trig, "Trigger", tVar, dictVar, out, indent);
                 Indent(out, indent);
                 out << ownerObjVar << ".AddTrigger(" << tVar << ");\n";
             } else if (trig->localName == "DataTrigger") {
@@ -2810,19 +3575,20 @@ private:
                 }
                 std::string val;
                 if (const auto* v = trig->FindAttribute("Value")) val = v->value;
+                const std::string cleanPath = NormalizeBindingPath(bSpec.path);
                 const std::string tVar = FreshVar("dtrig");
                 Indent(out, indent);
                 out << "var " << tVar << " = DataTrigger.CreateBox("
-                    << EscapeRsString(NormalizeBindingPath(bSpec.path)) << ", "
-                    << BoxSetterValueExpr(bSpec.path, FormatGenericScalarLiteral(val)) << ", "
+                    << EscapeRsString(cleanPath) << ", "
+                    << FormatTriggerValueBoxExpr(cleanPath, val, dictVar) << ", "
                     << EscapeRsString(bSpec.relativeSourceMode) << ", "
                     << EscapeRsString(bSpec.ancestorType) << ");\n";
                 for (const auto& s : trig->children) {
                     if (s->localName == "Setter") {
-                        EmitSetterInto(*s, tVar, dictVar, out, indent);
+                        EmitSetterInto(*s, tVar, dictVar, out, indent, styleTargetType);
                     }
                 }
-                EmitTriggerEnterExitActions(*trig, "DataTrigger", tVar, out, indent);
+                EmitTriggerEnterExitActions(*trig, "DataTrigger", tVar, dictVar, out, indent);
                 Indent(out, indent);
                 out << ownerObjVar << ".AddTrigger(" << tVar << ");\n";
             } else if (trig->localName == "MultiDataTrigger") {
@@ -2839,10 +3605,11 @@ private:
                         }
                         std::string val;
                         if (const auto* v = cond->FindAttribute("Value")) val = v->value;
+                        const std::string cleanPath = NormalizeBindingPath(bSpec.path);
                         Indent(out, indent);
                         out << tVar << ".AddCondition("
-                            << EscapeRsString(NormalizeBindingPath(bSpec.path)) << ", "
-                            << BoxSetterValueExpr(bSpec.path, FormatGenericScalarLiteral(val)) << ", "
+                            << EscapeRsString(cleanPath) << ", "
+                            << FormatTriggerValueBoxExpr(cleanPath, val, dictVar) << ", "
                             << EscapeRsString(bSpec.elementName) << ", "
                             << EscapeRsString(bSpec.relativeSourceMode) << ", "
                             << EscapeRsString(bSpec.ancestorType) << ");\n";
@@ -2850,10 +3617,10 @@ private:
                 }
                 for (const auto& s : trig->children) {
                     if (s->localName == "Setter") {
-                        EmitSetterInto(*s, tVar, dictVar, out, indent);
+                        EmitSetterInto(*s, tVar, dictVar, out, indent, styleTargetType);
                     }
                 }
-                EmitTriggerEnterExitActions(*trig, "MultiDataTrigger", tVar, out, indent);
+                EmitTriggerEnterExitActions(*trig, "MultiDataTrigger", tVar, dictVar, out, indent);
                 Indent(out, indent);
                 out << ownerObjVar << ".AddTrigger(" << tVar << ");\n";
             } else if (trig->localName == "EventTrigger") {
@@ -2878,7 +3645,7 @@ private:
                         }
                         for (const auto& sbNode : act->children) {
                             if (sbNode->localName == "Storyboard") {
-                                const std::string sb = EmitStoryboard(*sbNode, out, indent);
+                                const std::string sb = EmitStoryboard(*sbNode, out, indent, dictVar);
                                 Indent(out, indent);
                                 out << tVar << ".AddAction(" << sb << ");\n";
                             }
@@ -2896,6 +3663,7 @@ private:
         std::string_view dictVar,
         std::ostringstream& out,
         int indent) {
+        const auto prevStoryboards = knownStoryboards_;
         std::string targetType = "Control";
         if (const auto* tt = tplNode.FindAttribute("TargetType")) {
             targetType = StripTargetTypeName(tt->value);
@@ -2921,8 +3689,7 @@ private:
         currentTplParentVar_ = tpParam;
         const bool prevPartial = inPartialClass_;
         inPartialClass_ = false;
-        const std::string_view safeDictVar =
-            aero::str::StartsWith(dictVar, "this.") ? dictVar : std::string_view{};
+        const std::string_view safeDictVar{};
 
         std::string returnedRoot;
         for (const auto& child : tplNode.children) {
@@ -2950,6 +3717,7 @@ private:
         if (const XamlNode* trigProp = tplNode.FindPropertyElement("ControlTemplate", "Triggers")) {
             EmitTriggerCollectionInto(*trigProp, tplVar, dictVar, out, indent);
         }
+        knownStoryboards_ = prevStoryboards;
         return tplVar;
     }
 
@@ -2965,8 +3733,7 @@ private:
         out << "{\n";
         const bool prevPartial = inPartialClass_;
         inPartialClass_ = false;
-        const std::string_view safeDictVar =
-            aero::str::StartsWith(dictVar, "this.") ? dictVar : std::string_view{};
+        const std::string_view safeDictVar{};
         std::string panelVar;
         for (const auto& child : iptNode.children) {
             if (ShouldIgnoreXmlElement(*child)) continue;
@@ -2995,6 +3762,7 @@ private:
         std::string_view dictVar,
         std::ostringstream& out,
         int indent) {
+        const auto prevStoryboards = knownStoryboards_;
         std::string itemDataType;
         if (const auto* dt = dtNode.FindAttribute("DataType")) {
             itemDataType = StripTargetTypeName(dt->value);
@@ -3002,84 +3770,414 @@ private:
             itemDataType = StripTargetTypeName(xdt->value);
         }
 
+        const bool isHierarchical = (dtNode.localName == "HierarchicalDataTemplate");
+        std::string itemsSourcePath;
+        std::string itemTemplateKey;
+        if (isHierarchical) {
+            if (const auto* isAttr = dtNode.FindAttribute("ItemsSource")) {
+                if (LooksLikeMarkupExtension(isAttr->value)) {
+                    const auto ext = ParseMarkupExtension(isAttr->value);
+                    ParsedBindingSpec bSpec;
+                    if (TryExtractBindingSpec(ext, bSpec)) {
+                        itemsSourcePath = NormalizeBindingPath(bSpec.path);
+                    }
+                } else {
+                    itemsSourcePath = std::string(aero::str::Trim(isAttr->value));
+                }
+            }
+            if (const auto* itAttr = dtNode.FindAttribute("ItemTemplate")) {
+                if (LooksLikeMarkupExtension(itAttr->value)) {
+                    const auto ext = ParseMarkupExtension(itAttr->value);
+                    if (ext.kind == MarkupExtensionKind::StaticResource ||
+                        ext.kind == MarkupExtensionKind::DynamicResource) {
+                        itemTemplateKey = ResolveResourceKeyFromExtension(ext);
+                    }
+                }
+            }
+        }
+
         const std::string dtVar = FreshVar("dtpl");
         const std::string dcParam = FreshVar("__dc");
 
-        Indent(out, indent);
-        out << "var " << dtVar << " = new DataTemplate();\n";
-        if (!itemDataType.empty()) {
-            Indent(out, indent);
-            out << dtVar << ".DataType = " << EscapeRsString(itemDataType) << ";\n";
-        }
-        if (!dictVar.empty()) {
-            Indent(out, indent);
-            out << dtVar << ".AmbientResources = " << dictVar << ";\n";
-        }
-        EmitResourcesPropertyElement(dtNode, "DataTemplate", dtVar, opts_.xamlPath, out, indent);
-        Indent(out, indent);
-        out << dtVar << ".Factory = (object " << dcParam << ") =>\n";
-        Indent(out, indent);
-        out << "{\n";
-
-        const bool prevPartial = inPartialClass_;
-        inPartialClass_ = false;
-        const std::string_view safeDictVar =
-            aero::str::StartsWith(dictVar, "this.") ? dictVar : std::string_view{};
-
-        std::string returnedRoot;
-        for (const auto& child : dtNode.children) {
-            if (ShouldIgnoreXmlElement(*child) ||
-                child->localName.find('.') != std::string::npos) {
-                continue;
+        auto emitMetaAndResources = [&]() {
+            if (!itemDataType.empty()) {
+                Indent(out, indent);
+                out << dtVar << ".DataType = " << EscapeRsString(itemDataType) << ";\n";
             }
-            returnedRoot = EmitConstructedElement(
-                *child, itemDataType, safeDictVar, opts_.xamlPath, out, indent + 1, dcParam);
-            break;
-        }
-        if (returnedRoot.empty()) {
-            returnedRoot = FreshVar("empty");
+            if (!dictVar.empty()) {
+                Indent(out, indent);
+                out << dtVar << ".AmbientResources = " << dictVar << ";\n";
+            }
+            EmitResourcesPropertyElement(dtNode, dtNode.localName, dtVar, opts_.xamlPath, out, indent);
+        };
+
+        auto emitFactoryLambdaBody = [&]() {
+            Indent(out, indent);
+            out << "{\n";
+
+            const bool prevPartial = inPartialClass_;
+            inPartialClass_ = false;
+            const std::string_view safeDictVar{};
+
+            std::string returnedRoot;
+            for (const auto& child : dtNode.children) {
+                if (ShouldIgnoreXmlElement(*child) ||
+                    child->localName.find('.') != std::string::npos) {
+                    continue;
+                }
+                returnedRoot = EmitConstructedElement(
+                    *child, itemDataType, safeDictVar, opts_.xamlPath, out, indent + 1, dcParam);
+                break;
+            }
+            if (returnedRoot.empty()) {
+                returnedRoot = FreshVar("empty");
+                Indent(out, indent + 1);
+                out << "var " << returnedRoot << " = new Border();\n";
+            }
             Indent(out, indent + 1);
-            out << "var " << returnedRoot << " = new Border();\n";
+            out << returnedRoot << ".DataContext = " << dcParam << ";\n";
+            Indent(out, indent + 1);
+            out << "return " << returnedRoot << ";\n";
+
+            inPartialClass_ = prevPartial;
+        };
+
+        if (isHierarchical) {
+            Indent(out, indent);
+            out << "var " << dtVar << " = new HierarchicalDataTemplate((object " << dcParam << ") =>\n";
+            emitFactoryLambdaBody();
+            Indent(out, indent);
+            out << "}, " << EscapeRsString(itemsSourcePath) << ");\n";
+            emitMetaAndResources();
+            if (!itemTemplateKey.empty()) {
+                Indent(out, indent);
+                out << dtVar << ".ItemTemplateKey = " << EscapeRsString(itemTemplateKey) << ";\n";
+                Indent(out, indent);
+                out << dtVar << ".ItemTemplate = " << LookupResourceExpr(itemTemplateKey, dictVar)
+                    << " as DataTemplate;\n";
+            } else if (const XamlNode* itemTplEl = dtNode.FindPropertyElement("HierarchicalDataTemplate", "ItemTemplate")) {
+                for (const auto& ch : itemTplEl->children) {
+                    if (ch && (ch->localName == "DataTemplate" || ch->localName == "HierarchicalDataTemplate")) {
+                        const std::string subDt = EmitDataTemplate(*ch, dictVar, out, indent);
+                        Indent(out, indent);
+                        out << dtVar << ".ItemTemplate = " << subDt << ";\n";
+                        break;
+                    }
+                }
+            }
+        } else {
+            Indent(out, indent);
+            out << "var " << dtVar << " = new DataTemplate();\n";
+            emitMetaAndResources();
+            Indent(out, indent);
+            out << dtVar << ".Factory = (object " << dcParam << ") =>\n";
+            emitFactoryLambdaBody();
+            Indent(out, indent);
+            out << "};\n";
         }
-        Indent(out, indent + 1);
-        out << returnedRoot << ".DataContext = " << dcParam << ";\n";
-        Indent(out, indent + 1);
-        out << "return " << returnedRoot << ";\n";
 
-        inPartialClass_ = prevPartial;
-
-        Indent(out, indent);
-        out << "};\n";
-
-        if (const XamlNode* trigProp = dtNode.FindPropertyElement("DataTemplate", "Triggers")) {
+        const XamlNode* trigProp = dtNode.FindPropertyElement(dtNode.localName, "Triggers");
+        if (trigProp == nullptr && isHierarchical) {
+            trigProp = dtNode.FindPropertyElement("DataTemplate", "Triggers");
+        }
+        if (trigProp != nullptr) {
             EmitTriggerCollectionInto(*trigProp, dtVar, dictVar, out, indent);
         }
+        knownStoryboards_ = prevStoryboards;
         return dtVar;
     }
 
-    [[nodiscard]] std::string EmitStoryboard(
-        const XamlNode& sbNode,
+    [[nodiscard]] static bool IsComplexGeometryPointPath(std::string_view rawProp) {
+        return rawProp.find("PathGeometry") != std::string_view::npos ||
+               rawProp.find("PathFigure") != std::string_view::npos ||
+               rawProp.find("LineSegment") != std::string_view::npos ||
+               rawProp.find("BezierSegment") != std::string_view::npos ||
+               rawProp.find("QuadraticBezierSegment") != std::string_view::npos ||
+               rawProp.find("ArcSegment") != std::string_view::npos ||
+               rawProp.find("PolyLineSegment") != std::string_view::npos ||
+               rawProp.find("PathSegment") != std::string_view::npos ||
+               rawProp.find(".Figures") != std::string_view::npos ||
+               rawProp.find(".Segments") != std::string_view::npos ||
+               rawProp.find("Path.Data") != std::string_view::npos;
+    }
+
+    [[nodiscard]] std::string FormatDiscreteKeyFrameBoxExpr(
+        const XamlNode& kf,
+        std::string_view targetProp,
+        std::string_view dictVar,
+        bool isBooleanTimeline,
         std::ostringstream& out,
         int indent) {
-        const std::string sbVar = FreshVar("sb");
-        Indent(out, indent);
-        out << "var " << sbVar << " = new Storyboard();\n";
-        if (const auto* srAttr = sbNode.FindAttribute("SpeedRatio")) {
-            float sr = 1.0f;
-            if (aero::str::TryParseFloat32(srAttr->value, sr) && sr > 0.0f) {
-                Indent(out, indent);
-                out << sbVar << ".SpeedRatio = " << FormatFloatLiteral(sr) << ";\n";
+        std::string rawVal;
+        bool hasVal = false;
+        std::string typedChildKind;
+
+        if (const auto* va = kf.FindAttribute("Value")) {
+            rawVal = va->value;
+            hasVal = true;
+        } else {
+            const XamlNode* valEl = kf.FindPropertyElement(kf.localName, "Value");
+            if (valEl == nullptr) {
+                valEl = kf.FindPropertyElement("DiscreteObjectKeyFrame", "Value");
             }
-        }
-        if (const auto* rbAttr = sbNode.FindAttribute("RepeatBehavior")) {
-            if (aero::str::EqualsIgnoreCase(aero::str::Trim(rbAttr->value), "Forever")) {
-                Indent(out, indent);
-                out << sbVar << ".RepeatForever = true;\n";
+            if (valEl != nullptr) {
+                for (const auto& ch : valEl->children) {
+                    if (!ch || ShouldIgnoreXmlElement(*ch)) continue;
+                    if (ch->localName == "SolidColorBrush" ||
+                        ch->localName == "LinearGradientBrush" ||
+                        ch->localName == "RadialGradientBrush" ||
+                        ch->localName == "ImageBrush") {
+                        const std::string bVar = EmitBrushObject(*ch, targetProp, dictVar, out, indent);
+                        return "DependencyObject.BoxObject(" + bVar + ")";
+                    }
+                    typedChildKind = ch->localName;
+                    rawVal = ch->textContent;
+                    hasVal = true;
+                    break;
+                }
+                if (!hasVal && !valEl->textContent.empty()) {
+                    rawVal = valEl->textContent;
+                    hasVal = true;
+                }
             }
         }
 
+        if (!hasVal) {
+            return "null";
+        }
+
+        if (LooksLikeMarkupExtension(rawVal)) {
+            const auto ext = ParseMarkupExtension(rawVal);
+            if (!ext.IsOk()) {
+                AddError("Invalid markup extension '" + rawVal + "': " + ext.errorMessage);
+                return "null";
+            }
+            if (ext.kind == MarkupExtensionKind::XNull) {
+                return "null";
+            }
+            if (ext.kind == MarkupExtensionKind::StaticResource ||
+                ext.kind == MarkupExtensionKind::DynamicResource) {
+                const std::string key = ResolveResourceKeyFromExtension(ext);
+                if (!key.empty()) {
+                    return "DependencyObject.BoxObject(" + LookupResourceExpr(key, dictVar) + ")";
+                }
+                return "null";
+            }
+            if (ext.kind == MarkupExtensionKind::XStatic) {
+                if (const auto* p0 = ext.FindPositional(0)) {
+                    const std::string_view lit = aero::str::Trim(p0->literal);
+                    if (const char* enumType = LookupEnumType(targetProp)) {
+                        const std::size_t dot = lit.rfind('.');
+                        const std::string_view member = (dot != std::string_view::npos) ? lit.substr(dot + 1) : lit;
+                        return "DependencyObject.BoxInt(EnumConvert.ToInt(" + std::string(enumType) + "." +
+                               std::string(aero::str::Trim(member)) + "))";
+                    }
+                    const std::size_t dot = lit.rfind('.');
+                    if (dot != std::string_view::npos) {
+                        const std::string_view enumName = lit.substr(0, dot);
+                        const std::string_view member = aero::str::Trim(lit.substr(dot + 1));
+                        if (enumName == "Visibility" || enumName == "HorizontalAlignment" ||
+                            enumName == "VerticalAlignment" || enumName == "Orientation" ||
+                            enumName == "Stretch" || enumName == "Dock") {
+                            return "DependencyObject.BoxInt(EnumConvert.ToInt(" +
+                                   std::string(enumName) + "." + std::string(member) + "))";
+                        }
+                    }
+                    return "DependencyObject.BoxString(" + EscapeRsString(lit) + ")";
+                }
+            }
+            if (ext.kind == MarkupExtensionKind::XType) {
+                return "DependencyObject.BoxString(" + EscapeRsString(StripTargetTypeName(rawVal)) + ")";
+            }
+            if (ext.kind == MarkupExtensionKind::EscapedLiteral) {
+                return "DependencyObject.BoxString(" + EscapeRsString(ext.literalValue) + ")";
+            }
+        }
+
+        const std::string_view trimmed = aero::str::Trim(rawVal);
+        if (isBooleanTimeline || typedChildKind == "Boolean") {
+            const bool bv = aero::str::EqualsIgnoreCase(trimmed, "True");
+            return std::string("DependencyObject.BoxBool(") + (bv ? "true" : "false") + ")";
+        }
+        if (typedChildKind == "Int32" || typedChildKind == "Int64") {
+            const long iv = std::strtol(std::string(trimmed).c_str(), nullptr, 10);
+            return "DependencyObject.BoxInt(" + std::to_string(iv) + ")";
+        }
+        if (typedChildKind == "Double" || typedChildKind == "Single") {
+            float fv = 0.0f;
+            (void)aero::str::TryParseFloat32(trimmed, fv);
+            return "DependencyObject.BoxFloat(" + FormatFloatLiteral(fv) + ")";
+        }
+        if (LookupEnumType(targetProp) != nullptr) {
+            return BoxSetterValueExpr(
+                targetProp, FormatTypedValueLiteral(targetProp, trimmed, dictVar));
+        }
+        if (targetProp != "Text" && targetProp != "Title" && targetProp != "Placeholder" &&
+            typedChildKind != "String") {
+            if (aero::str::EqualsIgnoreCase(trimmed, "True")) {
+                return "DependencyObject.BoxBool(true)";
+            }
+            if (aero::str::EqualsIgnoreCase(trimmed, "False")) {
+                return "DependencyObject.BoxBool(false)";
+            }
+            if (!trimmed.empty() && trimmed.find('.') == std::string_view::npos) {
+                bool allDigits = true;
+                for (std::size_t i = (trimmed.front() == '-' && trimmed.size() > 1) ? 1 : 0;
+                     i < trimmed.size(); ++i) {
+                    if (!std::isdigit(static_cast<unsigned char>(trimmed[i]))) {
+                        allDigits = false;
+                        break;
+                    }
+                }
+                if (allDigits) {
+                    if (IsFloatPropertyFor({}, targetProp, trimmed)) {
+                        float fv = 0.0f;
+                        (void)aero::str::TryParseFloat32(trimmed, fv);
+                        return "DependencyObject.BoxFloat(" + FormatFloatLiteral(fv) + ")";
+                    }
+                    const long iv = std::strtol(std::string(trimmed).c_str(), nullptr, 10);
+                    return "DependencyObject.BoxInt(" + std::to_string(iv) + ")";
+                }
+            }
+            float fv = 0.0f;
+            if (aero::str::TryParseFloat32(trimmed, fv)) {
+                return "DependencyObject.BoxFloat(" + FormatFloatLiteral(fv) + ")";
+            }
+        }
+        return BoxSetterValueExpr(targetProp, FormatTypedValueLiteral(targetProp, rawVal, dictVar));
+    }
+
+    void EmitScalarKeyFrameSegment(
+        std::string_view sbVar,
+        std::string_view targetName,
+        std::string_view targetProp,
+        float prevTime,
+        float prevVal,
+        float kt,
+        float val,
+        bool havePrev,
+        std::size_t keyFrameCount,
+        int kfEase,
+        int kfMode,
+        float beginSec,
+        bool hasLoopParams,
+        bool autoRev,
+        int repeatCount,
+        std::ostringstream& out,
+        int indent) {
+        const float segDur = std::max(0.001f, kt - prevTime);
+        const bool segLoop = hasLoopParams && keyFrameCount <= 2;
+        if (havePrev && kt > prevTime) {
+            Indent(out, indent);
+            if (segLoop) {
+                out << sbVar << ".AddDoubleAnimationEx("
+                    << EscapeRsString(targetName) << ", "
+                    << EscapeRsString(targetProp) << ", "
+                    << FormatFloatLiteral(prevVal) << ", "
+                    << FormatFloatLiteral(val) << ", "
+                    << FormatFloatLiteral(segDur) << ", "
+                    << kfEase << ", " << kfMode << ", "
+                    << FormatFloatLiteral(beginSec + prevTime) << ", "
+                    << (autoRev ? "true" : "false") << ", "
+                    << repeatCount << ");\n";
+            } else {
+                out << sbVar << ".AddDoubleAnimation("
+                    << EscapeRsString(targetName) << ", "
+                    << EscapeRsString(targetProp) << ", "
+                    << FormatFloatLiteral(prevVal) << ", "
+                    << FormatFloatLiteral(val) << ", "
+                    << FormatFloatLiteral(segDur) << ", "
+                    << kfEase << ", " << kfMode << ", "
+                    << FormatFloatLiteral(beginSec + prevTime) << ");\n";
+            }
+        } else if (!havePrev && kt > 0.0001f) {
+            Indent(out, indent);
+            if (hasLoopParams) {
+                out << sbVar << ".AddDoubleToAnimationEx("
+                    << EscapeRsString(targetName) << ", "
+                    << EscapeRsString(targetProp) << ", "
+                    << FormatFloatLiteral(val) << ", "
+                    << FormatFloatLiteral(kt) << ", "
+                    << kfEase << ", " << kfMode << ", "
+                    << FormatFloatLiteral(beginSec) << ", "
+                    << (autoRev ? "true" : "false") << ", "
+                    << repeatCount << ");\n";
+            } else {
+                out << sbVar << ".AddDoubleToAnimation("
+                    << EscapeRsString(targetName) << ", "
+                    << EscapeRsString(targetProp) << ", "
+                    << FormatFloatLiteral(val) << ", "
+                    << FormatFloatLiteral(kt) << ", "
+                    << kfEase << ", " << kfMode << ", "
+                    << FormatFloatLiteral(beginSec) << ");\n";
+            }
+        } else if (!havePrev && keyFrameCount == 1) {
+            Indent(out, indent);
+            out << sbVar << ".AddDoubleAnimation("
+                << EscapeRsString(targetName) << ", "
+                << EscapeRsString(targetProp) << ", "
+                << FormatFloatLiteral(val) << ", "
+                << FormatFloatLiteral(val) << ", "
+                << FormatFloatLiteral(kt > 0.0001f ? kt : 0.0f) << ", "
+                << kfEase << ", " << kfMode << ", "
+                << FormatFloatLiteral(beginSec + prevTime) << ");\n";
+        }
+    }
+
+    [[nodiscard]] static std::string ExtractStaticResourceElementKey(const XamlNode& node) {
+        if (const auto* rk = node.FindAttribute("ResourceKey")) {
+            return std::string(aero::str::Trim(rk->value));
+        }
+        if (const auto* k = node.FindAttribute("Key")) {
+            return std::string(aero::str::Trim(k->value));
+        }
+        if (const auto* xk = node.FindXAttribute("Key")) {
+            return std::string(aero::str::Trim(xk->value));
+        }
+        return {};
+    }
+
+    void EmitStoryboardTimelines(
+        const XamlNode& sbNode,
+        std::string_view sbVar,
+        std::string_view dictVar,
+        std::ostringstream& out,
+        int indent,
+        std::unordered_set<std::string>& visitedSbKeys) {
         for (const auto& child : sbNode.children) {
+            if (!child || ShouldIgnoreXmlElement(*child)) {
+                continue;
+            }
+            if (child->localName == "StaticResource") {
+                const std::string refKey = ExtractStaticResourceElementKey(*child);
+                if (!refKey.empty()) {
+                    if (const auto sbIt = knownStoryboards_.find(refKey);
+                        sbIt != knownStoryboards_.end() && sbIt->second != nullptr) {
+                        if (visitedSbKeys.insert(refKey).second) {
+                            EmitStoryboardTimelines(*sbIt->second, sbVar, dictVar, out, indent, visitedSbKeys);
+                            visitedSbKeys.erase(refKey);
+                        }
+                    } else {
+                        const std::string refVar = FreshVar("sbRef");
+                        const std::string childSbVar = FreshVar("sbInc");
+                        Indent(out, indent);
+                        if (!dictVar.empty() && dictVar != "this.Resources") {
+                            out << "var " << refVar << " = " << dictVar << ".Get(" << EscapeRsString(refKey) << ");\n";
+                            Indent(out, indent);
+                            out << "if (" << refVar << " == null) { " << refVar << " = "
+                                << LookupResourceExpr(refKey, dictVar) << "; }\n";
+                        } else {
+                            out << "var " << refVar << " = " << LookupResourceExpr(refKey, dictVar) << ";\n";
+                        }
+                        Indent(out, indent);
+                        out << "if (" << refVar << " is Storyboard " << childSbVar << ") { "
+                            << sbVar << ".MergeFrom(" << childSbVar << "); }\n";
+                    }
+                }
+                continue;
+            }
             std::string targetName;
+            std::string rawTargetProp;
             std::string targetProp;
             if (const auto* tn = child->FindAttribute("Storyboard.TargetName")) {
                 targetName = tn->value;
@@ -3087,8 +4185,10 @@ private:
                 targetName = tn2->value;
             }
             if (const auto* tp = child->FindAttribute("Storyboard.TargetProperty")) {
+                rawTargetProp = tp->value;
                 targetProp = NormalizeTargetPropertyPath(tp->value);
             } else if (const auto* tp2 = child->FindAttribute("TargetProperty")) {
+                rawTargetProp = tp2->value;
                 targetProp = NormalizeTargetPropertyPath(tp2->value);
             }
 
@@ -3221,6 +4321,12 @@ private:
                         << FormatFloatLiteral(beginSec) << ");\n";
                 }
             } else if (child->localName == "PointAnimation") {
+                if (IsComplexGeometryPointPath(rawTargetProp)) {
+                    AddWarning(
+                        "PointAnimation target property '" + rawTargetProp +
+                        "' on complex Geometry/Path sub-property is not supported on visual animation tracks.");
+                    continue;
+                }
                 float fx = 0.0f, fy = 0.0f, tx = 0.0f, ty = 0.0f;
                 std::vector<float> pts;
                 if (const auto* f = child->FindAttribute("From")) {
@@ -3253,11 +4359,95 @@ private:
                     << FormatFloatLiteral(fy) << ", " << FormatFloatLiteral(ty) << ", "
                     << FormatFloatLiteral(durSec) << ", " << easeKind << ", " << easeMode
                     << ", " << FormatFloatLiteral(beginSec) << ");\n";
+            } else if (child->localName == "PointAnimationUsingKeyFrames") {
+                if (IsComplexGeometryPointPath(rawTargetProp)) {
+                    AddWarning(
+                        "PointAnimationUsingKeyFrames target property '" + rawTargetProp +
+                        "' on complex Geometry/Path sub-property is not supported on visual animation tracks.");
+                    continue;
+                }
+                float prevTime = 0.0f;
+                float prevX = 0.0f;
+                float prevY = 0.0f;
+                bool havePrev = false;
+                for (const auto& kf : child->children) {
+                    if (!kf || ShouldIgnoreXmlElement(*kf)) continue;
+                    float kt = prevTime;
+                    if (const auto* ka = kf->FindAttribute("KeyTime")) {
+                        kt = ParseDurationSeconds(ka->value);
+                    }
+                    float px = prevX;
+                    float py = prevY;
+                    if (const auto* va = kf->FindAttribute("Value")) {
+                        std::vector<float> pts;
+                        if (TryParseFloatList(va->value, pts) && pts.size() >= 2) {
+                            px = pts[0];
+                            py = pts[1];
+                        }
+                    }
+                    int kfEase = 0;
+                    int kfMode = 0;
+                    const XamlNode* kfEaseProp = kf->FindPropertyElement(kf->localName, "EasingFunction");
+                    if (kfEaseProp != nullptr && !kfEaseProp->children.empty()) {
+                        kfEase = MapEasingKind(kfEaseProp->children.front()->localName);
+                        if (const auto* em = kfEaseProp->children.front()->FindAttribute("EasingMode")) {
+                            kfMode = MapEasingMode(em->value);
+                        }
+                    }
+                    if (kf->localName == "DiscretePointKeyFrame") {
+                        Indent(out, indent);
+                        out << sbVar << ".AddDoubleAnimation("
+                            << EscapeRsString(targetName) << ", "
+                            << EscapeRsString(targetProp + ".X") << ", "
+                            << FormatFloatLiteral(px) << ", " << FormatFloatLiteral(px) << ", "
+                            << "0.0f, 0, 0, " << FormatFloatLiteral(beginSec + kt) << ");\n";
+                        Indent(out, indent);
+                        out << sbVar << ".AddDoubleAnimation("
+                            << EscapeRsString(targetName) << ", "
+                            << EscapeRsString(targetProp + ".Y") << ", "
+                            << FormatFloatLiteral(py) << ", " << FormatFloatLiteral(py) << ", "
+                            << "0.0f, 0, 0, " << FormatFloatLiteral(beginSec + kt) << ");\n";
+                    } else {
+                        EmitScalarKeyFrameSegment(
+                            sbVar, targetName, targetProp + ".X", prevTime, prevX, kt, px,
+                            havePrev, child->children.size(), kfEase, kfMode, beginSec,
+                            hasLoopParams, autoRev, repeatCount, out, indent);
+                        EmitScalarKeyFrameSegment(
+                            sbVar, targetName, targetProp + ".Y", prevTime, prevY, kt, py,
+                            havePrev, child->children.size(), kfEase, kfMode, beginSec,
+                            hasLoopParams, autoRev, repeatCount, out, indent);
+                    }
+                    prevTime = kt;
+                    prevX = px;
+                    prevY = py;
+                    havePrev = true;
+                }
+            } else if (child->localName == "ObjectAnimationUsingKeyFrames" ||
+                       child->localName == "BooleanAnimationUsingKeyFrames") {
+                const bool isBoolTl = (child->localName == "BooleanAnimationUsingKeyFrames");
+                float prevTime = 0.0f;
+                for (const auto& kf : child->children) {
+                    if (!kf || ShouldIgnoreXmlElement(*kf)) continue;
+                    float kt = prevTime;
+                    if (const auto* ka = kf->FindAttribute("KeyTime")) {
+                        kt = ParseDurationSeconds(ka->value);
+                    }
+                    const std::string boxedExpr = FormatDiscreteKeyFrameBoxExpr(
+                        *kf, targetProp, dictVar, isBoolTl, out, indent);
+                    Indent(out, indent);
+                    out << sbVar << ".AddDiscreteKeyFrame("
+                        << EscapeRsString(targetName) << ", "
+                        << EscapeRsString(targetProp) << ", "
+                        << FormatFloatLiteral(beginSec + kt) << ", "
+                        << boxedExpr << ");\n";
+                    prevTime = kt;
+                }
             } else if (child->localName == "DoubleAnimationUsingKeyFrames") {
                 float prevTime = 0.0f;
                 float prevVal = 0.0f;
                 bool havePrev = false;
                 for (const auto& kf : child->children) {
+                    if (!kf || ShouldIgnoreXmlElement(*kf)) continue;
                     float kt = prevTime;
                     if (const auto* ka = kf->FindAttribute("KeyTime")) {
                         kt = ParseDurationSeconds(ka->value);
@@ -3275,51 +4465,10 @@ private:
                             kfMode = MapEasingMode(em->value);
                         }
                     }
-                    const float segDur = std::max(0.001f, kt - prevTime);
-                    const bool segLoop = hasLoopParams && child->children.size() <= 2;
-                    if (havePrev && kt > prevTime) {
-                        Indent(out, indent);
-                        if (segLoop) {
-                            out << sbVar << ".AddDoubleAnimationEx("
-                                << EscapeRsString(targetName) << ", "
-                                << EscapeRsString(targetProp) << ", "
-                                << FormatFloatLiteral(prevVal) << ", "
-                                << FormatFloatLiteral(val) << ", "
-                                << FormatFloatLiteral(segDur) << ", "
-                                << kfEase << ", " << kfMode << ", "
-                                << FormatFloatLiteral(beginSec + prevTime) << ", "
-                                << (autoRev ? "true" : "false") << ", "
-                                << repeatCount << ");\n";
-                        } else {
-                            out << sbVar << ".AddDoubleAnimation("
-                                << EscapeRsString(targetName) << ", "
-                                << EscapeRsString(targetProp) << ", "
-                                << FormatFloatLiteral(prevVal) << ", "
-                                << FormatFloatLiteral(val) << ", "
-                                << FormatFloatLiteral(segDur) << ", "
-                                << kfEase << ", " << kfMode << ", "
-                                << FormatFloatLiteral(beginSec + prevTime) << ");\n";
-                        }
-                    } else if (!havePrev && kt > 0.0001f) {
-                        Indent(out, indent);
-                        out << sbVar << ".AddDoubleToAnimation("
-                            << EscapeRsString(targetName) << ", "
-                            << EscapeRsString(targetProp) << ", "
-                            << FormatFloatLiteral(val) << ", "
-                            << FormatFloatLiteral(kt) << ", "
-                            << kfEase << ", " << kfMode << ", "
-                            << FormatFloatLiteral(beginSec) << ");\n";
-                    } else if (!havePrev && child->children.size() == 1) {
-                        Indent(out, indent);
-                        out << sbVar << ".AddDoubleAnimation("
-                            << EscapeRsString(targetName) << ", "
-                            << EscapeRsString(targetProp) << ", "
-                            << FormatFloatLiteral(val) << ", "
-                            << FormatFloatLiteral(val) << ", "
-                            << FormatFloatLiteral(kt > 0.0001f ? kt : 0.0f) << ", "
-                            << kfEase << ", " << kfMode << ", "
-                            << FormatFloatLiteral(beginSec + prevTime) << ");\n";
-                    }
+                    EmitScalarKeyFrameSegment(
+                        sbVar, targetName, targetProp, prevTime, prevVal, kt, val,
+                        havePrev, child->children.size(), kfEase, kfMode, beginSec,
+                        hasLoopParams, autoRev, repeatCount, out, indent);
                     prevTime = kt;
                     prevVal = val;
                     havePrev = true;
@@ -3392,6 +4541,36 @@ private:
                 }
             }
         }
+    }
+
+    [[nodiscard]] std::string EmitStoryboard(
+        const XamlNode& sbNode,
+        std::ostringstream& out,
+        int indent,
+        std::string_view dictVar = {}) {
+        const std::string sbVar = FreshVar("sb");
+        Indent(out, indent);
+        out << "var " << sbVar << " = new Storyboard();\n";
+        if (const auto* srAttr = sbNode.FindAttribute("SpeedRatio")) {
+            float sr = 1.0f;
+            if (aero::str::TryParseFloat32(srAttr->value, sr) && sr > 0.0f) {
+                Indent(out, indent);
+                out << sbVar << ".SpeedRatio = " << FormatFloatLiteral(sr) << ";\n";
+            }
+        }
+        if (const auto* rbAttr = sbNode.FindAttribute("RepeatBehavior")) {
+            if (aero::str::EqualsIgnoreCase(aero::str::Trim(rbAttr->value), "Forever")) {
+                Indent(out, indent);
+                out << sbVar << ".RepeatForever = true;\n";
+            }
+        }
+
+        std::unordered_set<std::string> visitedSbKeys;
+        const std::string ownKey = sbNode.GetKey();
+        if (!ownKey.empty()) {
+            visitedSbKeys.insert(ownKey);
+        }
+        EmitStoryboardTimelines(sbNode, sbVar, dictVar, out, indent, visitedSbKeys);
         return sbVar;
     }
 
@@ -3424,7 +4603,8 @@ private:
     [[nodiscard]] std::string FormatTypedValueLiteral(
         std::string_view propName,
         std::string_view rawVal,
-        std::string_view dictVar) const {
+        std::string_view dictVar,
+        std::string_view targetType = {}) const {
         if (LooksLikeMarkupExtension(rawVal)) {
             const auto ext = ParseMarkupExtension(rawVal);
             if (ext.kind == MarkupExtensionKind::XNull) {
@@ -3487,14 +4667,14 @@ private:
         if (const char* enumType = LookupEnumType(propName)) {
             return std::string(enumType) + "." + std::string(aero::str::Trim(rawVal));
         }
-        if (IsBoolProperty(propName)) {
+        if (IsBoolPropertyFor(targetType, propName, rawVal)) {
             return aero::str::EqualsIgnoreCase(aero::str::Trim(rawVal), "True") ? "true" : "false";
         }
-        if (IsIntProperty(propName)) {
+        if (IsIntPropertyFor(targetType, propName, rawVal)) {
             const long v = std::strtol(std::string(rawVal).c_str(), nullptr, 10);
             return std::to_string(v);
         }
-        if (IsFloatProperty(propName)) {
+        if (IsFloatPropertyFor(targetType, propName, rawVal)) {
             float f = 0.0f;
             if (aero::str::TryParseFloat32(rawVal, f)) {
                 return FormatFloatLiteral(f);
@@ -3506,6 +4686,13 @@ private:
         }
         if (propName == "CornerRadius") {
             return FormatCornerRadiusExpr(rawVal);
+        }
+        if (propName == "RenderTransformOrigin") {
+            std::vector<float> pts;
+            if (TryParseFloatList(rawVal, pts) && pts.size() >= 2) {
+                return "new Point(" + FormatFloatLiteral(pts[0]) + ", " + FormatFloatLiteral(pts[1]) + ")";
+            }
+            return "new Point(0.5f, 0.5f)";
         }
         if (IsBrushProperty(propName)) {
             return "new SolidColorBrush(" + EscapeRsString(ResolveColorHexOrString(rawVal)) + ")";
@@ -3556,6 +4743,10 @@ private:
         int indent) {
         if (const auto* p = bindNode.FindAttribute("Path")) outSpec.path = p->value;
         if (const auto* en = bindNode.FindAttribute("ElementName")) outSpec.elementName = en->value;
+        if (const auto* src = bindNode.FindAttribute("Source")) {
+            outSpec.hasSourceLiteral = true;
+            outSpec.sourceLiteral = src->value;
+        }
         if (const auto* md = bindNode.FindAttribute("Mode")) outSpec.mode = md->value;
         if (const auto* sf = bindNode.FindAttribute("StringFormat")) {
             outSpec.stringFormat = sf->value;
@@ -3614,11 +4805,93 @@ private:
         }
     }
 
-    void EmitMultiBindingNode(
-        std::string_view targetVar,
-        std::string_view targetType,
+    [[nodiscard]] std::string EmitBindingObjectFromSpec(
+        const ParsedBindingSpec& subSpec,
         std::string_view propName,
+        std::string_view dictVar,
+        std::ostringstream& out,
+        int indent,
+        std::string_view subConv = {},
+        std::string_view sourceResKey = {}) {
+        const std::string bVar = FreshVar("subb");
+        Indent(out, indent);
+        out << "var " << bVar << " = new Binding(" << EscapeRsString(NormalizeBindingPath(subSpec.path)) << ");\n";
+        if (!subSpec.elementName.empty()) {
+            Indent(out, indent);
+            out << bVar << ".ElementName = " << EscapeRsString(subSpec.elementName) << ";\n";
+        }
+        if (!subSpec.mode.empty()) {
+            const int modeInt = MapBindingMode(subSpec.mode);
+            const char* modeEnum = "BindingMode.OneWay";
+            if (modeInt == 1) modeEnum = "BindingMode.TwoWay";
+            else if (modeInt == 2) modeEnum = "BindingMode.OneTime";
+            else if (modeInt == 3) modeEnum = "BindingMode.OneWayToSource";
+            Indent(out, indent);
+            out << bVar << ".Mode = " << modeEnum << ";\n";
+        }
+        if (!subSpec.relativeSourceMode.empty()) {
+            Indent(out, indent);
+            out << bVar << ".RelativeSourceMode = " << EscapeRsString(subSpec.relativeSourceMode) << ";\n";
+        }
+        if (!subSpec.ancestorType.empty()) {
+            Indent(out, indent);
+            out << bVar << ".RelativeSourceAncestorType = " << EscapeRsString(subSpec.ancestorType) << ";\n";
+        }
+        if (!sourceResKey.empty()) {
+            Indent(out, indent);
+            out << bVar << ".SourceBox = DependencyObject.BoxObject(" << LookupResourceExpr(sourceResKey, dictVar) << ");\n";
+        } else if (subSpec.hasSourceLiteral) {
+            Indent(out, indent);
+            out << bVar << ".SourceBox = DependencyObject.BoxString(" << EscapeRsString(subSpec.sourceLiteral) << ");\n";
+        }
+        if (!subConv.empty()) {
+            Indent(out, indent);
+            out << bVar << ".Converter = " << subConv << ";\n";
+        } else if (!subSpec.converterKey.empty()) {
+            Indent(out, indent);
+            out << bVar << ".ConverterKey = " << EscapeRsString(subSpec.converterKey) << ";\n";
+            Indent(out, indent);
+            out << "var __c_" << bVar << " = " << LookupResourceExpr(subSpec.converterKey, dictVar) << ";\n";
+            Indent(out, indent);
+            out << "if (__c_" << bVar << " is IValueConverter) { "
+                << bVar << ".Converter = (__c_" << bVar << " as IValueConverter); }\n";
+        }
+        if (!subSpec.converterParam.empty()) {
+            Indent(out, indent);
+            out << bVar << ".ConverterParameter = " << EscapeRsString(subSpec.converterParam) << ";\n";
+        }
+        if (!subSpec.stringFormat.empty()) {
+            Indent(out, indent);
+            out << bVar << ".StringFormat = " << EscapeRsString(subSpec.stringFormat) << ";\n";
+        }
+        if (subSpec.hasFallbackValue) {
+            Indent(out, indent);
+            out << bVar << ".FallbackBox = "
+                << BoxSetterValueExpr(propName, FormatTypedValueLiteral(propName, subSpec.fallbackValue, dictVar)) << ";\n";
+        }
+        if (subSpec.hasTargetNullValue) {
+            Indent(out, indent);
+            out << bVar << ".TargetNullBox = "
+                << BoxSetterValueExpr(propName, FormatTypedValueLiteral(propName, subSpec.targetNullValue, dictVar)) << ";\n";
+        }
+        return bVar;
+    }
+
+    [[nodiscard]] std::string EmitDynamicBindingObject(
+        const XamlNode& bindNode,
+        std::string_view propName,
+        std::string_view dictVar,
+        std::ostringstream& out,
+        int indent) {
+        ParsedBindingSpec subSpec;
+        std::string subConv;
+        TryParseBindingNode(bindNode, subSpec, subConv, dictVar, out, indent);
+        return EmitBindingObjectFromSpec(subSpec, propName, dictVar, out, indent, subConv);
+    }
+
+    [[nodiscard]] std::string EmitMultiBindingObject(
         const XamlNode& mbNode,
+        std::string_view propName,
         std::string_view dictVar,
         std::ostringstream& out,
         int indent) {
@@ -3657,31 +4930,22 @@ private:
         }
         for (const auto& ch : mbNode.children) {
             if (ch->localName != "Binding") continue;
-            ParsedBindingSpec subSpec;
-            std::string subConv;
-            TryParseBindingNode(*ch, subSpec, subConv, dictVar, out, indent);
-            const std::string bVar = FreshVar("subb");
-            Indent(out, indent);
-            out << "var " << bVar << " = new Binding(" << EscapeRsString(subSpec.path) << ");\n";
-            if (!subSpec.elementName.empty()) {
-                Indent(out, indent);
-                out << bVar << ".ElementName = " << EscapeRsString(subSpec.elementName) << ";\n";
-            }
-            if (!subSpec.relativeSourceMode.empty()) {
-                Indent(out, indent);
-                out << bVar << ".RelativeSourceMode = " << EscapeRsString(subSpec.relativeSourceMode) << ";\n";
-            }
-            if (!subConv.empty()) {
-                Indent(out, indent);
-                out << bVar << ".Converter = " << subConv << ";\n";
-            }
-            if (subSpec.hasFallbackValue) {
-                Indent(out, indent);
-                out << bVar << ".FallbackBox = " << BoxSetterValueExpr(propName, FormatTypedValueLiteral(propName, subSpec.fallbackValue, dictVar)) << ";\n";
-            }
+            const std::string bVar = EmitDynamicBindingObject(*ch, propName, dictVar, out, indent);
             Indent(out, indent);
             out << mbVar << ".AddBinding(" << bVar << ");\n";
         }
+        return mbVar;
+    }
+
+    void EmitMultiBindingNode(
+        std::string_view targetVar,
+        std::string_view targetType,
+        std::string_view propName,
+        const XamlNode& mbNode,
+        std::string_view dictVar,
+        std::ostringstream& out,
+        int indent) {
+        const std::string mbVar = EmitMultiBindingObject(mbNode, propName, dictVar, out, indent);
         const std::string bindTarget = (targetType == "Run")
             ? ("(UIElement)" + std::string(targetVar))
             : std::string(targetVar);
@@ -3706,6 +4970,8 @@ private:
                 propName = "StrokeThickness";
             } else if (propName == "noesis:RichText.Text" || propName == "RichText.Text") {
                 propName = "RichText.Text";
+                Indent(out, indent);
+                out << "RichText.Register();\n";
             }
         }
         if (aero::str::EndsWith(propName, "Text.Placeholder")) {
@@ -3715,11 +4981,29 @@ private:
             propName = "Loc.Source";
             EmitSiblingLanguageDictionaries(out, indent);
         }
+        if (propName == "noesis:TransitionContentPresenter.Enter" ||
+            propName == "TransitionContentPresenter.Enter" ||
+            propName == "noesis:TransitionContentPresenter.Exit" ||
+            propName == "TransitionContentPresenter.Exit") {
+            const bool isEnter = aero::str::EndsWith(propName, ".Enter");
+            std::string key;
+            if (LooksLikeMarkupExtension(rawVal)) {
+                key = ResolveResourceKeyFromExtension(ParseMarkupExtension(rawVal));
+            } else {
+                key = std::string(aero::str::Trim(rawVal));
+            }
+            if (!key.empty()) {
+                Indent(out, indent);
+                out << "TransitionContentPresenter." << (isEnter ? "SetEnterKey" : "SetExitKey")
+                    << "(" << targetVar << ", " << EscapeRsString(key) << ");\n";
+            }
+            return;
+        }
         std::string ownedRawVal;
         if (LooksLikeMarkupExtension(rawVal)) {
             const auto ext = ParseMarkupExtension(rawVal);
             if (!ext.IsOk()) {
-                diagnostics_.push_back("Invalid markup extension '" + std::string(rawVal) + "': " + ext.errorMessage);
+                AddError("Invalid markup extension '" + std::string(rawVal) + "': " + ext.errorMessage);
                 return;
             }
             if (ext.kind == MarkupExtensionKind::EscapedLiteral) {
@@ -3766,12 +5050,24 @@ private:
                     } else if (propName == "ItemTemplate") {
                         Indent(out, indent);
                         out << targetVar << ".ItemTemplate = (DataTemplate)" << lookup << ";\n";
+                    } else if (propName == "ContentTemplate") {
+                        Indent(out, indent);
+                        out << targetVar << ".ContentTemplate = (DataTemplate)" << lookup << ";\n";
+                    } else if (propName == "HeaderTemplate") {
+                        Indent(out, indent);
+                        out << targetVar << ".HeaderTemplate = (DataTemplate)" << lookup << ";\n";
                     } else if (propName == "ItemsPanel") {
                         Indent(out, indent);
                         out << targetVar << ".ItemsPanel = ((ItemsPanelTemplate)" << lookup << ").GetFactory();\n";
                     } else if (propName == "Storyboard") {
                         // Handled at action level
-                    } else if (IsDirectUIProperty(propName)) {
+                    } else if (IsDirectUIPropertyFor(targetType, propName) ||
+                               propName == "Tag" || propName == "ToolTip" ||
+                               propName == "Placeholder" || aero::str::StartsWith(propName, "Custom.")) {
+                        Indent(out, indent);
+                        out << targetVar << ".SetPropertyBox(" << EscapeRsString(propName)
+                            << ", DependencyObject.BoxObject(" << lookup << "));\n";
+                    } else if (IsDirectUIProperty(propName) && !IsNonUIElementType(targetType)) {
                         Indent(out, indent);
                         out << targetVar << ".SetPropertyBox(" << EscapeRsString(propName)
                             << ", DependencyObject.BoxObject(" << lookup << "));\n";
@@ -3936,10 +5232,23 @@ private:
             }
         }
 
-        if (IsDirectUIProperty(propName) && propName != "Title") {
+        if (targetType == "BoxShadow" &&
+            (propName == "BlurRadius" || propName == "OffsetX" || propName == "OffsetY" ||
+             propName == "Spread" || propName == "Inside" || propName == "Color")) {
+            Indent(out, indent);
+            if (propName == "Color") {
+                out << targetVar << ".Color = " << EscapeRsString(ResolveColorHexOrString(rawVal)) << ";\n";
+            } else {
+                out << targetVar << "." << propName << " = "
+                    << FormatTypedValueLiteral(propName, rawVal, dictVar, targetType) << ";\n";
+            }
+            return;
+        }
+
+        if (IsDirectUIPropertyFor(targetType, propName) && propName != "Title") {
             Indent(out, indent);
             out << targetVar << "." << propName << " = "
-                << FormatTypedValueLiteral(propName, rawVal, dictVar) << ";\n";
+                << FormatTypedValueLiteral(propName, rawVal, dictVar, targetType) << ";\n";
             return;
         }
 
@@ -3949,6 +5258,10 @@ private:
             const std::string method = (propName == "RowDefinitions")
                 ? "AddRowDefinition"
                 : "AddColumnDefinition";
+            if (LooksLikeMarkupExtension(rawVal)) {
+                EmitSingleGridTrackDef(targetVar, method, rawVal, dictVar, out, indent);
+                return;
+            }
             std::size_t start = 0;
             while (start <= rawVal.size()) {
                 std::size_t comma = rawVal.find(',', start);
@@ -3978,13 +5291,15 @@ private:
         if (propName == "Tag" || propName == "ToolTip" || propName == "Title" ||
             propName == "InputGestureText" || propName == "CommandParameter" || propName == "Command" ||
             propName == "Placeholder" || propName == "FontWeight" || propName == "DisplayMemberPath" ||
-            propName == "Loc.Source" || propName == "ContentSource" || propName == "Placement" ||
-            propName == "HorizontalOffset" || propName == "VerticalOffset" ||
+            propName == "RichText.Text" || propName == "Loc.Source" || propName == "ContentSource" ||
+            propName == "Placement" || propName == "HorizontalOffset" || propName == "VerticalOffset" ||
             propName == "IsOpen" || propName == "StaysOpen" ||
-            propName == "Delay" || propName == "Interval" || propName == "CanContentScroll") {
+            propName == "Delay" || propName == "Interval" || propName == "CanContentScroll" ||
+            (IsDirectUIProperty(propName) && !IsNonUIElementType(targetType) && propName != "Title")) {
             Indent(out, indent);
             out << targetVar << ".SetPropertyBox(" << EscapeRsString(propName) << ", "
-                << BoxSetterValueExpr(propName, FormatGenericScalarLiteral(rawVal)) << ");\n";
+                << BoxSetterValueExpr(propName, FormatTypedValueLiteral(propName, rawVal, dictVar, targetType), targetType)
+                << ");\n";
         }
     }
 
@@ -4040,6 +5355,7 @@ private:
             RecordExternalDependency(lp.lexically_normal().generic_string(), rawHash);
             std::unique_ptr<XamlNode> langRoot;
             if (!BuildXamlDom(content, langRoot, diagnostics_) || !langRoot) {
+                hasErrors_ = true;
                 continue;
             }
             const std::string dv = FreshVar("locDict");
@@ -4062,10 +5378,10 @@ private:
         int indent,
         std::string_view explicitSourceVar,
         std::string_view inlineConvExpr = {}) {
-        if (spec.hasFallbackValue && IsDirectUIProperty(propName)) {
+        if (spec.hasFallbackValue && IsDirectUIPropertyFor(targetType, propName)) {
             Indent(out, indent);
             out << targetVar << "." << propName << " = "
-                << FormatTypedValueLiteral(propName, spec.fallbackValue, {}) << ";\n";
+                << FormatTypedValueLiteral(propName, spec.fallbackValue, {}, targetType) << ";\n";
         }
 
         const std::string cleanPath = NormalizeBindingPath(spec.path);
@@ -4077,11 +5393,11 @@ private:
         const std::string convArg = inlineConvExpr.empty() ? std::string("null") : std::string(inlineConvExpr);
         const std::string fbHas = spec.hasFallbackValue ? "true" : "false";
         const std::string fbBox = spec.hasFallbackValue
-            ? BoxSetterValueExpr(propName, FormatTypedValueLiteral(propName, spec.fallbackValue, {}))
+            ? BoxSetterValueExpr(propName, FormatTypedValueLiteral(propName, spec.fallbackValue, {}, targetType), targetType)
             : std::string("null");
         const std::string tnHas = spec.hasTargetNullValue ? "true" : "false";
         const std::string tnBox = spec.hasTargetNullValue
-            ? BoxSetterValueExpr(propName, FormatTypedValueLiteral(propName, spec.targetNullValue, {}))
+            ? BoxSetterValueExpr(propName, FormatTypedValueLiteral(propName, spec.targetNullValue, {}, targetType), targetType)
             : std::string("null");
 
         int modeInt = MapBindingMode(spec.mode);
@@ -4190,7 +5506,7 @@ private:
                 out << "if (" << explicitSourceVar << " is " << xDataType << " " << typedVar << ") { ";
                 if (propName == "Content") {
                     out << targetVar << ".SetContent(" << typedVar << "." << cleanPath << ");";
-                } else if (IsDirectUIProperty(propName)) {
+                } else if (IsDirectUIPropertyFor(targetType, propName)) {
                     out << targetVar << "." << propName << " = " << typedVar << "." << cleanPath << ";";
                 } else {
                     out << targetVar << ".SetPropertyBox(" << EscapeRsString(propName)
@@ -4211,7 +5527,7 @@ private:
                 << sArg << " is " << xDataType << " " << vmVar << ") { ";
             if (propName == "Content") {
                 out << tEl << ".SetContent(" << vmVar << "." << cleanPath << ");";
-            } else if (IsDirectUIProperty(propName)) {
+            } else if (IsDirectUIPropertyFor(targetType, propName)) {
                 out << tEl << "." << propName << " = " << vmVar << "." << cleanPath << ";";
             } else {
                 out << tEl << ".SetPropertyBox(" << EscapeRsString(propName)
@@ -4229,7 +5545,7 @@ private:
             out << "if (" << explicitSourceVar << " is " << xDataType << " " << typedVar << ") { ";
             if (propName == "Content") {
                 out << targetVar << ".SetContent(" << typedVar << "." << cleanPath << ");";
-            } else if (IsDirectUIProperty(propName)) {
+            } else if (IsDirectUIPropertyFor(targetType, propName)) {
                 out << targetVar << "." << propName << " = " << typedVar << "." << cleanPath << ";";
             } else {
                 out << targetVar << ".SetPropertyBox(" << EscapeRsString(propName)
@@ -4263,6 +5579,83 @@ private:
                 << EscapeRsString(spec.relativeSourceMode) << ", "
                 << EscapeRsString(spec.ancestorType) << ");\n";
         }
+    }
+
+    void EmitSingleGridTrackDef(
+        std::string_view targetVar,
+        std::string_view method,
+        std::string_view rawLen,
+        std::string_view dictVar,
+        std::ostringstream& out,
+        int indent) {
+        if (LooksLikeMarkupExtension(rawLen)) {
+            const auto ext = ParseMarkupExtension(rawLen);
+            if (!ext.IsOk()) {
+                AddError("Invalid markup extension '" + std::string(rawLen) + "': " + ext.errorMessage);
+                Indent(out, indent);
+                out << targetVar << "." << method << "(GridUnitType.Auto, 1.0f);\n";
+                return;
+            }
+            std::string resKey;
+            std::string subPath;
+            bool isStaticSrc = false;
+            if (ext.kind == MarkupExtensionKind::StaticResource ||
+                ext.kind == MarkupExtensionKind::DynamicResource) {
+                resKey = ResolveResourceKeyFromExtension(ext);
+                isStaticSrc = (ext.kind == MarkupExtensionKind::StaticResource);
+            } else if (ext.kind == MarkupExtensionKind::Binding) {
+                if (const auto* srcArg = ext.FindNamed("Source");
+                    srcArg != nullptr && srcArg->isExtension && srcArg->extension &&
+                    (srcArg->extension->kind == MarkupExtensionKind::StaticResource ||
+                     srcArg->extension->kind == MarkupExtensionKind::DynamicResource)) {
+                    resKey = ResolveResourceKeyFromExtension(*srcArg->extension);
+                    isStaticSrc = (srcArg->extension->kind == MarkupExtensionKind::StaticResource);
+                }
+                ParsedBindingSpec spec;
+                if (TryExtractBindingSpec(ext, spec)) {
+                    subPath = NormalizeBindingPath(spec.path);
+                }
+            }
+            if (!resKey.empty()) {
+                if (isStaticSrc && subPath.empty()) {
+                    if (const auto it = knownDoubles_.find(resKey); it != knownDoubles_.end()) {
+                        Indent(out, indent);
+                        out << targetVar << "." << method << "(GridUnitType.Pixel, "
+                            << FormatFloatLiteral(it->second) << ");\n";
+                        return;
+                    }
+                }
+                const std::string srcVar = FreshVar("glSrc");
+                const std::string glVar = FreshVar("glVal");
+                Indent(out, indent);
+                out << "var " << srcVar << " = " << LookupResourceExpr(resKey, dictVar) << ";\n";
+                if (!subPath.empty()) {
+                    Indent(out, indent);
+                    out << srcVar << " = BindingEngine.ReadPathBox(" << srcVar << ", "
+                        << EscapeRsString(subPath) << ");\n";
+                }
+                Indent(out, indent);
+                out << "var " << glVar << " = GridLength.Auto();\n";
+                Indent(out, indent);
+                out << "if (" << srcVar << " is GridLength) { " << glVar << " = (" << srcVar << " as GridLength); }\n";
+                Indent(out, indent);
+                out << "else if (" << srcVar << " is string) { " << glVar
+                    << " = GridLength.Parse(" << srcVar << " as string); }\n";
+                Indent(out, indent);
+                out << "else if (" << srcVar << " is BoxedString) { " << glVar
+                    << " = GridLength.Parse((" << srcVar << " as BoxedString).Value); }\n";
+                Indent(out, indent);
+                out << "else if (" << srcVar << " is DependencyObject) { " << glVar
+                    << " = GridLength.FromPixel(DependencyObject.UnboxFloat(" << srcVar
+                    << " as DependencyObject, 0.0f)); }\n";
+                Indent(out, indent);
+                out << targetVar << "." << method << "(" << glVar << ".GridUnitType, " << glVar << ".Value);\n";
+                return;
+            }
+        }
+        const auto [unit, val] = ParseGridLength(rawLen);
+        Indent(out, indent);
+        out << targetVar << "." << method << "(" << unit << ", " << val << ");\n";
     }
 
     [[nodiscard]] std::string EmitConstructedElement(
@@ -4334,9 +5727,7 @@ private:
                 if (rd->localName != "RowDefinition") continue;
                 std::string rawH = "*";
                 if (const auto* h = rd->FindAttribute("Height")) rawH = h->value;
-                const auto [unit, val] = ParseGridLength(rawH);
-                Indent(out, indent);
-                out << targetVar << ".AddRowDefinition(" << unit << ", " << val << ");\n";
+                EmitSingleGridTrackDef(targetVar, "AddRowDefinition", rawH, dictVar, out, indent);
             }
         }
         if (const auto* cDefs = node.FindPropertyElement(xmlLocalName, "ColumnDefinitions")) {
@@ -4344,9 +5735,7 @@ private:
                 if (cd->localName != "ColumnDefinition") continue;
                 std::string rawW = "*";
                 if (const auto* w = cd->FindAttribute("Width")) rawW = w->value;
-                const auto [unit, val] = ParseGridLength(rawW);
-                Indent(out, indent);
-                out << targetVar << ".AddColumnDefinition(" << unit << ", " << val << ");\n";
+                EmitSingleGridTrackDef(targetVar, "AddColumnDefinition", rawW, dictVar, out, indent);
             }
         }
 
@@ -4357,8 +5746,49 @@ private:
                 ? propKey.substr(dotPos + 1)
                 : propKey;
             if (shortProp == "Resources" || shortProp == "RowDefinitions" ||
-                shortProp == "ColumnDefinitions" ||
-                propKey == "Navigation.Destinations") {
+                shortProp == "ColumnDefinitions") {
+                continue;
+            }
+            if (propKey == "Navigation.Destinations") {
+                for (const auto& destNode : propNode->children) {
+                    if (destNode->localName != "NavDestination") continue;
+                    const std::string ndVar = FreshVar("navd");
+                    Indent(out, indent);
+                    out << "var " << ndVar << " = new NavDestination();\n";
+                    if (const auto* idAttr = destNode->FindAttribute("Id")) {
+                        Indent(out, indent);
+                        out << ndVar << ".Id = " << EscapeRsString(idAttr->value) << ";\n";
+                    }
+                    if (const auto* cAttr = destNode->FindAttribute("Content")) {
+                        if (LooksLikeMarkupExtension(cAttr->value)) {
+                            const auto ext = ParseMarkupExtension(cAttr->value);
+                            ParsedBindingSpec bSpec;
+                            if (TryExtractBindingSpec(ext, bSpec)) {
+                                Indent(out, indent);
+                                out << ndVar << ".BindingPath = " << EscapeRsString(bSpec.path) << ";\n";
+                            }
+                        } else {
+                            Indent(out, indent);
+                            out << ndVar << ".ContentBox = DependencyObject.BoxString("
+                                << EscapeRsString(cAttr->value) << ");\n";
+                        }
+                    }
+                    if (const auto* ctAttr = destNode->FindAttribute("ContentTemplate")) {
+                        if (LooksLikeMarkupExtension(ctAttr->value)) {
+                            const auto ext = ParseMarkupExtension(ctAttr->value);
+                            const std::string rk = ResolveResourceKeyFromExtension(ext);
+                            if (!rk.empty()) {
+                                Indent(out, indent);
+                                out << "var __nt_" << ndVar << " = " << LookupResourceExpr(rk, dictVar) << ";\n";
+                                Indent(out, indent);
+                                out << "if (__nt_" << ndVar << " is DataTemplate) { "
+                                    << ndVar << ".ContentTemplate = (__nt_" << ndVar << " as DataTemplate); }\n";
+                            }
+                        }
+                    }
+                    Indent(out, indent);
+                    out << "Navigation.RegisterDestination(" << targetVar << ", " << ndVar << ");\n";
+                }
                 continue;
             }
             if (shortProp == "InputBindings") {
@@ -4447,10 +5877,20 @@ private:
                 continue;
             }
             if (shortProp == "RenderTransform" && !propNode->children.empty()) {
-                const std::string trVar = EmitTransformObject(*propNode->children.front(), out, indent);
+                const std::string trVar = EmitTransformObject(
+                    *propNode->children.front(), out, indent, targetVar, xDataType, dictVar, "RenderTransform");
                 if (!trVar.empty()) {
                     Indent(out, indent);
                     out << targetVar << ".RenderTransform = " << trVar << ";\n";
+                }
+                continue;
+            }
+            if (shortProp == "LayoutTransform" && !propNode->children.empty()) {
+                const std::string trVar = EmitTransformObject(
+                    *propNode->children.front(), out, indent, targetVar, xDataType, dictVar, "LayoutTransform");
+                if (!trVar.empty()) {
+                    Indent(out, indent);
+                    out << targetVar << ".LayoutTransform = " << trVar << ";\n";
                 }
                 continue;
             }
@@ -4473,6 +5913,13 @@ private:
                 const std::string dtVar = EmitDataTemplate(*propNode->children.front(), dictVar, out, indent);
                 Indent(out, indent);
                 out << targetVar << ".ItemTemplate = " << dtVar << ";\n";
+                continue;
+            }
+            if ((shortProp == "ContentTemplate" || shortProp == "HeaderTemplate") &&
+                !propNode->children.empty()) {
+                const std::string dtVar = EmitDataTemplate(*propNode->children.front(), dictVar, out, indent);
+                Indent(out, indent);
+                out << targetVar << "." << shortProp << " = " << dtVar << ";\n";
                 continue;
             }
             if (shortProp == "ItemsPanel" && !propNode->children.empty() &&
@@ -4531,6 +5978,17 @@ private:
             if (shortProp == "View" && !propNode->children.empty() &&
                 propNode->children.front()->localName == "GridView") {
                 EmitGridView(*propNode->children.front(), targetVar, xDataType, out, indent);
+                continue;
+            }
+            if (shortProp == "Data" && !propNode->children.empty()) {
+                const auto& geomNode = *propNode->children.front();
+                const std::string svgData = (geomNode.localName == "PathGeometry")
+                    ? ConvertPathGeometryToSvgData(geomNode)
+                    : std::string(aero::str::Trim(geomNode.textContent));
+                if (!svgData.empty()) {
+                    Indent(out, indent);
+                    out << targetVar << ".Data = " << EscapeRsString(svgData) << ";\n";
+                }
                 continue;
             }
             if (shortProp == "Triggers") {
@@ -4929,10 +6387,61 @@ private:
                 out << av << ".PropertyName = " << EscapeRsString(propName) << ";\n";
             }
             if (const auto* val = act.FindAttribute("Value")) {
-                Indent(out, indent);
-                out << av << ".SetValueBox("
-                    << BoxSetterValueExpr(propName, FormatTypedValueLiteral(propName, val->value, dictVar))
-                    << ");\n";
+                bool handledMarkup = false;
+                if (LooksLikeMarkupExtension(val->value)) {
+                    const auto ext = ParseMarkupExtension(val->value);
+                    if (!ext.IsOk()) {
+                        AddError("Invalid markup extension '" + val->value + "': " + ext.errorMessage);
+                        handledMarkup = true;
+                    } else if (ext.kind == MarkupExtensionKind::Binding) {
+                        ParsedBindingSpec spec;
+                        if (TryExtractBindingSpec(ext, spec)) {
+                            std::string srcResKey;
+                            if (const auto* srcArg = ext.FindNamed("Source");
+                                srcArg != nullptr && srcArg->isExtension && srcArg->extension &&
+                                (srcArg->extension->kind == MarkupExtensionKind::StaticResource ||
+                                 srcArg->extension->kind == MarkupExtensionKind::DynamicResource)) {
+                                srcResKey = ResolveResourceKeyFromExtension(*srcArg->extension);
+                            }
+                            const std::string bv = EmitBindingObjectFromSpec(
+                                spec, propName, dictVar, out, indent, {}, srcResKey);
+                            Indent(out, indent);
+                            out << av << ".ValueBinding = " << bv << ";\n";
+                            handledMarkup = true;
+                        }
+                    } else if (ext.kind == MarkupExtensionKind::StaticResource ||
+                               ext.kind == MarkupExtensionKind::DynamicResource) {
+                        const std::string key = ResolveResourceKeyFromExtension(ext);
+                        if (!key.empty()) {
+                            Indent(out, indent);
+                            out << av << ".SetValueBox(DependencyObject.BoxObject("
+                                << LookupResourceExpr(key, dictVar) << "));\n";
+                            handledMarkup = true;
+                        }
+                    }
+                }
+                if (!handledMarkup) {
+                    Indent(out, indent);
+                    out << av << ".SetValueBox("
+                        << BoxSetterValueExpr(propName, FormatTypedValueLiteral(propName, val->value, dictVar))
+                        << ");\n";
+                }
+            }
+            if (const XamlNode* valProp = act.FindPropertyElement("ChangePropertyAction", "Value")) {
+                for (const auto& ch : valProp->children) {
+                    if (ch->localName == "Binding") {
+                        const std::string bv = EmitDynamicBindingObject(*ch, propName, dictVar, out, indent);
+                        Indent(out, indent);
+                        out << av << ".ValueBinding = " << bv << ";\n";
+                        break;
+                    }
+                    if (ch->localName == "MultiBinding") {
+                        const std::string mbv = EmitMultiBindingObject(*ch, propName, dictVar, out, indent);
+                        Indent(out, indent);
+                        out << av << ".ValueMultiBinding = " << mbv << ";\n";
+                        break;
+                    }
+                }
             }
         } else if (act.localName == "SetFocusAction" ||
                    act.localName == "SelectAction" ||
@@ -4950,6 +6459,12 @@ private:
                 if (const auto* src = act.FindAttribute("Source")) {
                     Indent(out, indent);
                     out << av << ".Source = " << EscapeRsString(src->value) << ";\n";
+                }
+                if (act.localName == "NavigateToAction") {
+                    if (const auto* did = act.FindAttribute("DestinationId")) {
+                        Indent(out, indent);
+                        out << av << ".DestinationId = " << EscapeRsString(did->value) << ";\n";
+                    }
                 }
                 if (act.localName == "PlaySoundAction") {
                     if (const auto* vol = act.FindAttribute("Volume")) {
@@ -4970,7 +6485,7 @@ private:
             }
             for (const auto& sbNode : act.children) {
                 if (sbNode->localName == "Storyboard") {
-                    sbVar = EmitStoryboard(*sbNode, out, indent);
+                    sbVar = EmitStoryboard(*sbNode, out, indent, dictVar);
                     break;
                 }
             }
@@ -5002,6 +6517,19 @@ private:
         if (!targetName.empty()) {
             Indent(out, indent);
             out << av << ".TargetName = " << EscapeRsString(targetName) << ";\n";
+        }
+        if (const auto* to = act.FindAttribute("TargetObject");
+            to != nullptr && LooksLikeMarkupExtension(to->value)) {
+            const auto ext = ParseMarkupExtension(to->value);
+            ParsedBindingSpec toSpec;
+            if (TryExtractBindingSpec(ext, toSpec)) {
+                Indent(out, indent);
+                out << av << ".SetTargetObjectBinding("
+                    << EscapeRsString(toSpec.path) << ", "
+                    << EscapeRsString(toSpec.relativeSourceMode) << ", "
+                    << EscapeRsString(toSpec.ancestorType) << ", "
+                    << EscapeRsString(toSpec.elementName) << ");\n";
+            }
         }
         return av;
     }
@@ -5061,9 +6589,25 @@ private:
                 Indent(out, indent);
                 out << tv << ".Comparison = " << EscapeRsString(comp->value) << ";\n";
             }
-            if (const auto* val = trig.FindAttribute("Value")) {
-                Indent(out, indent);
-                out << tv << ".SetValueBox(" << BoxSetterValueExpr(spec.path, FormatGenericScalarLiteral(val->value)) << ");\n";
+            bool emittedDynamicValue = false;
+            if (const XamlNode* valProp = trig.FindPropertyElement("DataTrigger", "Value")) {
+                for (const auto& ch : valProp->children) {
+                    if (ch->localName == "Binding") {
+                        const std::string bv = EmitDynamicBindingObject(*ch, spec.path, dictVar, out, indent);
+                        Indent(out, indent);
+                        out << tv << ".ValueBinding = " << bv << ";\n";
+                        emittedDynamicValue = true;
+                        break;
+                    }
+                }
+            }
+            if (!emittedDynamicValue) {
+                if (const auto* val = trig.FindAttribute("Value")) {
+                    Indent(out, indent);
+                    out << tv << ".SetValueBox("
+                        << FormatTriggerValueBoxExpr(NormalizeBindingPath(spec.path), val->value, dictVar)
+                        << ");\n";
+                }
             }
         } else if (trig.localName == "StoryboardCompletedTrigger") {
             Indent(out, indent);
@@ -5091,20 +6635,43 @@ private:
                     for (const auto& ceNode : bNode->children) {
                         for (const auto& ccNode : ceNode->children) {
                             if (ccNode->localName == "ComparisonCondition") {
-                                std::string lhs, op = "Equal", rhs;
+                                std::string lhs, elName, op = "Equal", rhs;
                                 if (const auto* la = ccNode->FindAttribute("LeftOperand")) {
-                                    const auto ext = ParseMarkupExtension(la->value);
-                                    ParsedBindingSpec sp;
-                                    if (TryExtractBindingSpec(ext, sp)) lhs = sp.path;
-                                    else lhs = la->value;
+                                    if (LooksLikeMarkupExtension(la->value)) {
+                                        const auto ext = ParseMarkupExtension(la->value);
+                                        ParsedBindingSpec sp;
+                                        if (TryExtractBindingSpec(ext, sp)) {
+                                            lhs = NormalizeBindingPath(sp.path);
+                                            elName = sp.elementName;
+                                        } else {
+                                            lhs = la->value;
+                                        }
+                                    } else {
+                                        lhs = la->value;
+                                    }
                                 }
                                 if (const auto* oa = ccNode->FindAttribute("Operator")) op = oa->value;
                                 if (const auto* ra = ccNode->FindAttribute("RightOperand")) rhs = ra->value;
-                                Indent(out, indent);
-                                out << tv << ".AddCondition(new ComparisonCondition("
-                                    << EscapeRsString(lhs) << ", "
-                                    << EscapeRsString(op) << ", "
-                                    << BoxSetterValueExpr(lhs, FormatGenericScalarLiteral(rhs)) << "));\n";
+                                const std::string rightExpr =
+                                    FormatTriggerValueBoxExpr(lhs, rhs, dictVar);
+                                if (elName.empty()) {
+                                    Indent(out, indent);
+                                    out << tv << ".AddCondition(new ComparisonCondition("
+                                        << EscapeRsString(lhs) << ", "
+                                        << EscapeRsString(op) << ", "
+                                        << rightExpr << "));\n";
+                                } else {
+                                    const std::string ccVar = FreshVar("cc");
+                                    Indent(out, indent);
+                                    out << "var " << ccVar << " = new ComparisonCondition("
+                                        << EscapeRsString(lhs) << ", "
+                                        << EscapeRsString(op) << ", "
+                                        << rightExpr << ");\n";
+                                    Indent(out, indent);
+                                    out << ccVar << ".ElementName = " << EscapeRsString(elName) << ";\n";
+                                    Indent(out, indent);
+                                    out << tv << ".AddCondition(" << ccVar << ");\n";
+                                }
                             }
                         }
                     }
@@ -5208,7 +6775,7 @@ private:
                 if (act->localName == "BeginStoryboard") {
                     for (const auto& sbNode : act->children) {
                         if (sbNode->localName == "Storyboard") {
-                            const std::string sbVar = EmitStoryboard(*sbNode, out, indent);
+                            const std::string sbVar = EmitStoryboard(*sbNode, out, indent, dictVar);
                             Indent(out, indent);
                             out << etVar << ".AddAction(new ControlStoryboardAction(" << sbVar << ", \"Play\"));\n";
                         }
@@ -5227,12 +6794,27 @@ private:
         }
     }
 
-    [[nodiscard]] bool StoryboardHasAnimatedTimeline(const XamlNode& sbNode) {
+    [[nodiscard]] bool StoryboardHasAnimatedTimelineImpl(
+        const XamlNode& sbNode,
+        std::unordered_set<std::string>& visitedSbKeys) const {
         if (ParseTimelineAutoReverse(sbNode) || ParseTimelineRepeatCount(sbNode) != 1) {
             return true;
         }
         for (const auto& tl : sbNode.children) {
-            if (!tl) continue;
+            if (!tl || ShouldIgnoreXmlElement(*tl)) continue;
+            if (tl->localName == "StaticResource") {
+                const std::string refKey = ExtractStaticResourceElementKey(*tl);
+                if (!refKey.empty()) {
+                    if (const auto sbIt = knownStoryboards_.find(refKey);
+                        sbIt != knownStoryboards_.end() && sbIt->second != nullptr &&
+                        visitedSbKeys.insert(refKey).second) {
+                        const bool subAnim = StoryboardHasAnimatedTimelineImpl(*sbIt->second, visitedSbKeys);
+                        visitedSbKeys.erase(refKey);
+                        if (subAnim) return true;
+                    }
+                }
+                continue;
+            }
             if (ParseTimelineAutoReverse(*tl) || ParseTimelineRepeatCount(*tl) != 1) {
                 return true;
             }
@@ -5241,6 +6823,11 @@ private:
             }
             if (const auto* d = tl->FindAttribute("Duration")) {
                 if (ParseDurationSeconds(d->value) > 0.001f) {
+                    return true;
+                }
+            }
+            if (const auto* bt = tl->FindAttribute("BeginTime")) {
+                if (ParseDurationSeconds(bt->value) > 0.001f) {
                     return true;
                 }
             }
@@ -5255,13 +6842,51 @@ private:
         return false;
     }
 
+    [[nodiscard]] bool StoryboardHasAnimatedTimeline(const XamlNode& sbNode) const {
+        std::unordered_set<std::string> visitedSbKeys;
+        const std::string ownKey = sbNode.GetKey();
+        if (!ownKey.empty()) {
+            visitedSbKeys.insert(ownKey);
+        }
+        return StoryboardHasAnimatedTimelineImpl(sbNode, visitedSbKeys);
+    }
+
     void EmitVisualStateStoryboardSetters(
         const XamlNode& sbNode,
         std::string_view vsVar,
         std::string_view dictVar,
         std::ostringstream& out,
         int indent) {
+        std::unordered_set<std::string> visitedSbKeys;
+        const std::string ownKey = sbNode.GetKey();
+        if (!ownKey.empty()) {
+            visitedSbKeys.insert(ownKey);
+        }
+        EmitVisualStateStoryboardSettersImpl(sbNode, vsVar, dictVar, out, indent, visitedSbKeys);
+    }
+
+    void EmitVisualStateStoryboardSettersImpl(
+        const XamlNode& sbNode,
+        std::string_view vsVar,
+        std::string_view dictVar,
+        std::ostringstream& out,
+        int indent,
+        std::unordered_set<std::string>& visitedSbKeys) {
         for (const auto& tl : sbNode.children) {
+            if (!tl || ShouldIgnoreXmlElement(*tl)) continue;
+            if (tl->localName == "StaticResource") {
+                const std::string refKey = ExtractStaticResourceElementKey(*tl);
+                if (!refKey.empty()) {
+                    if (const auto sbIt = knownStoryboards_.find(refKey);
+                        sbIt != knownStoryboards_.end() && sbIt->second != nullptr &&
+                        visitedSbKeys.insert(refKey).second) {
+                        EmitVisualStateStoryboardSettersImpl(
+                            *sbIt->second, vsVar, dictVar, out, indent, visitedSbKeys);
+                        visitedSbKeys.erase(refKey);
+                    }
+                }
+                continue;
+            }
             std::string targetName;
             std::string targetProp;
             if (const auto* tn = tl->FindAttribute("Storyboard.TargetName")) {
@@ -5326,22 +6951,18 @@ private:
                 }
             } else if (tl->localName == "BooleanAnimationUsingKeyFrames" && !tl->children.empty()) {
                 const auto& lastKf = *tl->children.back();
-                if (const auto* va = lastKf.FindAttribute("Value")) {
-                    const bool bv = aero::str::EqualsIgnoreCase(aero::str::Trim(va->value), "True");
-                    Indent(out, indent);
-                    out << vsVar << ".AddSetterBox(" << EscapeRsString(targetProp)
-                        << ", DependencyObject.BoxBool(" << (bv ? "true" : "false") << "), "
-                        << EscapeRsString(targetName) << ");\n";
-                }
+                const std::string boxed = FormatDiscreteKeyFrameBoxExpr(lastKf, targetProp, dictVar, true, out, indent);
+                Indent(out, indent);
+                out << vsVar << ".AddSetterBox(" << EscapeRsString(targetProp)
+                    << ", " << boxed << ", "
+                    << EscapeRsString(targetName) << ");\n";
             } else if (tl->localName == "ObjectAnimationUsingKeyFrames" && !tl->children.empty()) {
                 const auto& lastKf = *tl->children.back();
-                if (const auto* va = lastKf.FindAttribute("Value")) {
-                    const std::string valExpr = FormatTypedValueLiteral(targetProp, va->value, dictVar);
-                    Indent(out, indent);
-                    out << vsVar << ".AddSetterBox(" << EscapeRsString(targetProp)
-                        << ", " << BoxSetterValueExpr(targetProp, valExpr) << ", "
-                        << EscapeRsString(targetName) << ");\n";
-                }
+                const std::string boxed = FormatDiscreteKeyFrameBoxExpr(lastKf, targetProp, dictVar, false, out, indent);
+                Indent(out, indent);
+                out << vsVar << ".AddSetterBox(" << EscapeRsString(targetProp)
+                    << ", " << boxed << ", "
+                    << EscapeRsString(targetName) << ");\n";
             }
         }
     }
@@ -5385,7 +7006,7 @@ private:
                 auto emitInlineSb = [&](const XamlNode& sbNode) {
                     EmitVisualStateStoryboardSetters(sbNode, vsVar, dictVar, out, indent);
                     if (StoryboardHasAnimatedTimeline(sbNode)) {
-                        const std::string sbVar = EmitStoryboard(sbNode, out, indent);
+                        const std::string sbVar = EmitStoryboard(sbNode, out, indent, dictVar);
                         Indent(out, indent);
                         out << vsVar << ".Storyboard = " << sbVar << ";\n";
                     }

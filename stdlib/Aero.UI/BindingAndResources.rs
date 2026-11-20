@@ -244,6 +244,7 @@ public class Setter : DependencyObject {
     private DependencyObject _valueBox;
     public string Property { get; set; } = "";
     public string TargetName { get; set; } = "";
+    public string DynamicResourceKey { get; set; } = "";
     public string BindingPath { get; set; } = "";
     public string BindingElementName { get; set; } = "";
     public string BindingRelativeMode { get; set; } = "";
@@ -330,7 +331,9 @@ public class Setter : DependencyObject {
     public void ApplyTo(UIElement rootTarget) {
         UIElement dest = ResolveTarget(rootTarget);
         if (dest != null) {
-            if (BindingPath.Length > 0) {
+            if (DynamicResourceKey.Length > 0) {
+                dest.SetResourceReference(Property, DynamicResourceKey);
+            } else if (BindingPath.Length > 0) {
                 BindingEngine.BindPathEx(
                     dest, Property, null, BindingPath, BindingMode,
                     BindingConverter, BindingConverterKey, BindingConverterParam, BindingStringFormat,
@@ -358,6 +361,15 @@ public class TriggerBase : DependencyObject {
     private static string[] _baseProps;
     private static DependencyObject[] _baseBoxes;
     private static int[] _baseRefs;
+    private static TriggerBase[] _triggersWithTargets;
+    private static bool _disposeHookInstalled = false;
+
+    internal static void EnsureDisposeHook() {
+        if (!_disposeHookInstalled) {
+            _disposeHookInstalled = true;
+            UIElement.RegisterDisposeHook(() => { TriggerBase.CleanupDisposed(); });
+        }
+    }
 
     public TriggerBase() {
         _setters = new Setter[0];
@@ -371,7 +383,56 @@ public class TriggerBase : DependencyObject {
         _savedProps = new string[0];
     }
 
+    private static void RegisterTriggerWithTargets(TriggerBase trig) {
+        if (trig == null) { return; }
+        EnsureDisposeHook();
+        if (_triggersWithTargets == null) { _triggersWithTargets = new TriggerBase[0]; }
+        for (int i = 0; i < _triggersWithTargets.Length; i += 1) {
+            if (_triggersWithTargets[i] == trig) { return; }
+        }
+        _triggersWithTargets.Push(trig);
+    }
+
+    public static void CleanupDisposed() {
+        if (_baseDests != null) {
+            for (int i = _baseDests.Length - 1; i >= 0; i -= 1) {
+                if (_baseDests[i] == null || _baseDests[i]._isDisposedTree) {
+                    _baseDests.RemoveAt(i);
+                    _baseProps.RemoveAt(i);
+                    _baseBoxes.RemoveAt(i);
+                    _baseRefs.RemoveAt(i);
+                }
+            }
+        }
+        if (_triggersWithTargets != null) {
+            for (int i = _triggersWithTargets.Length - 1; i >= 0; i -= 1) {
+                TriggerBase tr = _triggersWithTargets[i];
+                if (tr == null) {
+                    _triggersWithTargets.RemoveAt(i);
+                    continue;
+                }
+                for (int j = tr._activeTargets.Length - 1; j >= 0; j -= 1) {
+                    if (tr._activeTargets[j] == null || tr._activeTargets[j]._isDisposedTree) {
+                        tr._activeTargets.RemoveAt(j);
+                    }
+                }
+                for (int j = tr._savedOwners.Length - 1; j >= 0; j -= 1) {
+                    if (tr._savedOwners[j] == null || tr._savedOwners[j]._isDisposedTree ||
+                        tr._savedDests[j] == null || tr._savedDests[j]._isDisposedTree) {
+                        tr._savedOwners.RemoveAt(j);
+                        tr._savedDests.RemoveAt(j);
+                        tr._savedProps.RemoveAt(j);
+                    }
+                }
+                if (tr._activeTargets.Length == 0 && tr._savedOwners.Length == 0) {
+                    _triggersWithTargets.RemoveAt(i);
+                }
+            }
+        }
+    }
+
     private static void EnsureBaseTables() {
+        EnsureDisposeHook();
         if (_baseDests == null) {
             _baseDests = new UIElement[0];
             _baseProps = new string[0];
@@ -451,23 +512,24 @@ public class TriggerBase : DependencyObject {
                 return;
             }
         }
-        if (active) { _activeTargets.Push(target); }
+        if (active) {
+            _activeTargets.Push(target);
+            RegisterTriggerWithTargets(this);
+        }
     }
 
     internal void DeactivateTarget(UIElement target, Style owningStyle, bool runExitActions) {
         if (target == null || !WasActiveFor(target)) { return; }
         SetActiveFor(target, false);
-        if (owningStyle == null) {
-            for (int i = _savedOwners.Length - 1; i >= 0; i -= 1) {
-                if (_savedOwners[i] == target) {
-                    UIElement dest = _savedDests[i];
-                    string prop = _savedProps[i];
-                    _savedOwners.RemoveAt(i);
-                    _savedDests.RemoveAt(i);
-                    _savedProps.RemoveAt(i);
-                    if (dest != null && prop.Length > 0) {
-                        ReleaseBaseValue(dest, prop);
-                    }
+        for (int i = _savedOwners.Length - 1; i >= 0; i -= 1) {
+            if (_savedOwners[i] == target) {
+                UIElement dest = _savedDests[i];
+                string prop = _savedProps[i];
+                _savedOwners.RemoveAt(i);
+                _savedDests.RemoveAt(i);
+                _savedProps.RemoveAt(i);
+                if (dest != null && prop.Length > 0) {
+                    ReleaseBaseValue(dest, prop);
                 }
             }
         }
@@ -492,7 +554,7 @@ public class TriggerBase : DependencyObject {
     internal void ApplyIfMatched(UIElement target, Style owningStyle) {
         if (target == null || !IsMatched(target)) { return; }
         bool wasActive = WasActiveFor(target);
-        bool savePrev = (owningStyle == null) && !wasActive;
+        bool savePrev = !wasActive;
         if (!wasActive) {
             SetActiveFor(target, true);
         }
@@ -601,7 +663,122 @@ public class Trigger : TriggerBase {
         UIElement src = SourceName.Length > 0 ? target.FindName(SourceName) : target;
         if (src == null) { return false; }
         DependencyObject actual = src.GetPropertyValue(Property);
-        return BoxEquals(actual, _valueBox);
+        return BoxEqualsForProperty(Property, actual, _valueBox);
+    }
+
+    public static int ResolveKnownEnumOrdinal(string propName, string rawVal) {
+        if (propName == null || rawVal == null) { return -1; }
+        string pn = propName.Trim();
+        if (pn.Length > 2 && pn.Substring(0, 1) == "(" && pn.Substring(pn.Length - 1, 1) == ")") {
+            pn = pn.Substring(1, pn.Length - 2).Trim();
+        }
+        int dot = pn.LastIndexOf(".");
+        if (dot >= 0 && dot + 1 < pn.Length) { pn = pn.Substring(dot + 1); }
+
+        string val = rawVal.Trim();
+        int vdot = val.LastIndexOf(".");
+        if (vdot >= 0 && vdot + 1 < val.Length) { val = val.Substring(vdot + 1).Trim(); }
+        if (val.Length == 0) { return -1; }
+
+        if (pn == "Visibility") {
+            if (val == "Visible") { return 0; }
+            if (val == "Hidden") { return 1; }
+            if (val == "Collapsed") { return 2; }
+            return -1;
+        }
+        if (pn == "Orientation") {
+            if (val == "Horizontal") { return 0; }
+            if (val == "Vertical") { return 1; }
+            return -1;
+        }
+        if (pn == "HorizontalAlignment" || pn == "HorizontalContentAlignment") {
+            if (val == "Stretch") { return 0; }
+            if (val == "Left") { return 1; }
+            if (val == "Center") { return 2; }
+            if (val == "Right") { return 3; }
+            return -1;
+        }
+        if (pn == "VerticalAlignment" || pn == "VerticalContentAlignment") {
+            if (val == "Stretch") { return 0; }
+            if (val == "Top") { return 1; }
+            if (val == "Center") { return 2; }
+            if (val == "Bottom") { return 3; }
+            return -1;
+        }
+        if (pn == "ExpandDirection") {
+            if (val == "Down") { return 0; }
+            if (val == "Up") { return 1; }
+            if (val == "Left") { return 2; }
+            if (val == "Right") { return 3; }
+            return -1;
+        }
+        if (pn == "Stretch") {
+            if (val == "None") { return 0; }
+            if (val == "Fill") { return 1; }
+            if (val == "Uniform") { return 2; }
+            if (val == "UniformToFill") { return 3; }
+            return -1;
+        }
+        if (pn == "StretchDirection") {
+            if (val == "UpOnly") { return 0; }
+            if (val == "DownOnly") { return 1; }
+            if (val == "Both") { return 2; }
+            return -1;
+        }
+        if (pn == "Dock") {
+            if (val == "Left") { return 0; }
+            if (val == "Top") { return 1; }
+            if (val == "Right") { return 2; }
+            if (val == "Bottom") { return 3; }
+            return -1;
+        }
+        if (pn == "TextWrapping") {
+            if (val == "NoWrap") { return 0; }
+            if (val == "Wrap") { return 1; }
+            if (val == "WrapWithOverflow") { return 2; }
+            return -1;
+        }
+        if (pn == "TextAlignment") {
+            if (val == "Left") { return 0; }
+            if (val == "Center") { return 1; }
+            if (val == "Right") { return 2; }
+            if (val == "Justify") { return 3; }
+            return -1;
+        }
+        if (pn == "TextTrimming") {
+            if (val == "None") { return 0; }
+            if (val == "CharacterEllipsis") { return 1; }
+            if (val == "WordEllipsis") { return 2; }
+            return -1;
+        }
+        if (pn == "SelectionMode") {
+            if (val == "Single") { return 0; }
+            if (val == "Multiple") { return 1; }
+            if (val == "Extended") { return 2; }
+            return -1;
+        }
+        if (pn == "ScrollBarVisibility" || pn == "HorizontalScrollBarVisibility" || pn == "VerticalScrollBarVisibility" ||
+            pn == "ComputedHorizontalScrollBarVisibility" || pn == "ComputedVerticalScrollBarVisibility") {
+            if (val == "Disabled") { return 0; }
+            if (val == "Auto") { return 1; }
+            if (val == "Hidden") { return 2; }
+            if (val == "Visible") { return 3; }
+            return -1;
+        }
+        return -1;
+    }
+
+    public static bool BoxEqualsForProperty(string propName, DependencyObject a, DependencyObject b) {
+        if (BoxEquals(a, b)) { return true; }
+        if (a == null || b == null || propName == null || propName.Length == 0) { return false; }
+        int oa = -1;
+        if (a is BoxedInt) { oa = (a as BoxedInt).Value; }
+        else if (a is BoxedString) { oa = ResolveKnownEnumOrdinal(propName, (a as BoxedString).Value); }
+        if (oa < 0) { return false; }
+        int ob = -1;
+        if (b is BoxedInt) { ob = (b as BoxedInt).Value; }
+        else if (b is BoxedString) { ob = ResolveKnownEnumOrdinal(propName, (b as BoxedString).Value); }
+        return ob >= 0 && oa == ob;
     }
 
     public static bool BoxEquals(DependencyObject a, DependencyObject b) {
@@ -628,6 +805,7 @@ public class DataTrigger : TriggerBase {
     private static UIElement[] _reactiveTargets;
     private static bool _reactiveHookInstalled = false;
     public string BindingPath { get; set; } = "";
+    public string ElementName { get; set; } = "";
     public string RelativeSourceMode { get; set; } = "";
     public string RelativeSourceAncestorType { get; set; } = "";
     public string Binding {
@@ -686,12 +864,23 @@ public class DataTrigger : TriggerBase {
         if (!_reactiveHookInstalled) {
             _reactiveHookInstalled = true;
             BindingEngine.AddPreFlushHook(() => { DataTrigger.FlushReactive(); });
+            UIElement.RegisterDisposeHook(() => { DataTrigger.CleanupDisposedReactive(); });
         }
         for (int i = 0; i < _reactiveTriggers.Length; i += 1) {
             if (_reactiveTriggers[i] == dt && _reactiveTargets[i] == target) { return; }
         }
         _reactiveTriggers.Push(dt);
         _reactiveTargets.Push(target);
+    }
+
+    internal static void CleanupDisposedReactive() {
+        if (_reactiveTriggers == null || _reactiveTargets == null) { return; }
+        for (int i = _reactiveTargets.Length - 1; i >= 0; i -= 1) {
+            if (_reactiveTargets[i] == null || _reactiveTargets[i]._isDisposedTree) {
+                _reactiveTriggers.RemoveAt(i);
+                _reactiveTargets.RemoveAt(i);
+            }
+        }
     }
 
     public static void FlushReactive() {
@@ -721,12 +910,20 @@ public class DataTrigger : TriggerBase {
     public override bool IsMatched(UIElement target) {
         if (target == null || BindingPath.Length == 0) { return false; }
         DependencyObject actual = null;
-        if (RelativeSourceMode == "Self") {
+        if (ElementName.Length > 0) {
+            UIElement se = BindingEntry.FindElementScoped(target, ElementName);
+            if (se == null) { se = target.FindName(ElementName); }
+            if (se == null && target.RootElement() != null) { se = target.RootElement().FindName(ElementName); }
+            if (se != null) {
+                actual = se.GetPropertyValue(BindingPath);
+                if (actual == null) { actual = BindingEngine.ReadPathBox(se, BindingPath); }
+            }
+        } else if (RelativeSourceMode == "Self") {
             actual = target.GetPropertyValue(BindingPath);
             if (actual == null) { actual = BindingEngine.ReadPathBox(target, BindingPath); }
         } else if (RelativeSourceMode == "FindAncestor" || RelativeSourceMode == "AncestorType") {
             UIElement anc = target;
-            while (anc != null && RelativeSourceAncestorType.Length > 0 && anc.GetTypeName() != RelativeSourceAncestorType) {
+            while (anc != null && RelativeSourceAncestorType.Length > 0 && !BindingEntry.MatchesAncestorType(anc, RelativeSourceAncestorType)) {
                 anc = anc.Parent;
             }
             if (anc != null) {
@@ -738,7 +935,7 @@ public class DataTrigger : TriggerBase {
             if (dc == null) { return _valueBox == null; }
             actual = BindingEngine.ReadPathBox(dc, BindingPath);
         }
-        return Trigger.BoxEquals(actual, _valueBox);
+        return Trigger.BoxEqualsForProperty(BindingPath, actual, _valueBox);
     }
 }
 
@@ -784,7 +981,7 @@ public class TriggerCondition : DependencyObject {
             if (actual == null) { actual = BindingEngine.ReadPathBox(target, BindingPath); }
         } else if (RelativeSourceMode == "FindAncestor" || RelativeSourceMode == "AncestorType") {
             UIElement anc = target;
-            while (anc != null && RelativeSourceAncestorType.Length > 0 && anc.GetTypeName() != RelativeSourceAncestorType) {
+            while (anc != null && RelativeSourceAncestorType.Length > 0 && !BindingEntry.MatchesAncestorType(anc, RelativeSourceAncestorType)) {
                 anc = anc.Parent;
             }
             if (anc != null) {
@@ -796,7 +993,7 @@ public class TriggerCondition : DependencyObject {
             if (dc == null) { return ValueBox == null; }
             actual = BindingEngine.ReadPathBox(dc, BindingPath);
         }
-        return Trigger.BoxEquals(actual, ValueBox);
+        return Trigger.BoxEqualsForProperty(BindingPath, actual, ValueBox);
     }
 }
 
@@ -857,6 +1054,18 @@ public class MultiDataTrigger : TriggerBase {
     }
 }
 
+internal class EventTriggerSink : BehaviorEventSink {
+    private EventTrigger _trig;
+    private UIElement _owner;
+    public EventTriggerSink(EventTrigger trig, UIElement owner) {
+        _trig = trig;
+        _owner = owner;
+    }
+    public override void OnBehaviorEvent(object sender, RoutedEventArgs e) {
+        if (_trig != null && _owner != null) { _trig.RunActions(_owner); }
+    }
+}
+
 public class EventTrigger : TriggerBase {
     private Storyboard _storyboard;
     public string RoutedEvent { get; set; } = "";
@@ -892,6 +1101,15 @@ public class EventTrigger : TriggerBase {
             src.MouseLeftButtonDown += (object s, MouseButtonEventArgs e) => { RunActions(target); };
         } else if (ev == "MouseLeftButtonUp" || ev == "UIElement.MouseLeftButtonUp") {
             src.MouseLeftButtonUp += (object s, MouseButtonEventArgs e) => { RunActions(target); };
+        } else {
+            string shortEv = ev;
+            if (ev == "Button.Click" || ev == "ButtonBase.Click") { shortEv = "Click"; }
+            else if (ev == "ToggleButton.Checked") { shortEv = "Checked"; }
+            else if (ev == "ToggleButton.Unchecked") { shortEv = "Unchecked"; }
+            else if (ev == "ToggleButton.Indeterminate") { shortEv = "Indeterminate"; }
+            else if (ev == "TreeView.SelectedItemChanged") { shortEv = "SelectedItemChanged"; }
+            else if (ev == "Selector.SelectionChanged") { shortEv = "SelectionChanged"; }
+            src.SubscribeBehaviorRoutedEvent(shortEv, new EventTriggerSink(this, target));
         }
     }
 
@@ -1164,7 +1382,7 @@ public class DataTemplate : DependencyObject {
                 DataTrigger dt = list[i] as DataTrigger;
                 if (dt.RelativeSourceAncestorType.Length > 0) {
                     UIElement anc = root;
-                    while (anc != null && anc.GetTypeName() != dt.RelativeSourceAncestorType) {
+                    while (anc != null && !BindingEntry.MatchesAncestorType(anc, dt.RelativeSourceAncestorType)) {
                         anc = anc.Parent;
                     }
                     if (anc != null) {
@@ -1185,7 +1403,7 @@ public class DataTemplate : DependencyObject {
                     TriggerCondition cond = conds[ci];
                     if (cond.RelativeSourceAncestorType.Length > 0) {
                         UIElement anc = root;
-                        while (anc != null && anc.GetTypeName() != cond.RelativeSourceAncestorType) {
+                        while (anc != null && !BindingEntry.MatchesAncestorType(anc, cond.RelativeSourceAncestorType)) {
                             anc = anc.Parent;
                         }
                         if (anc != null) {
@@ -1231,6 +1449,7 @@ public class DataTemplate : DependencyObject {
 public class HierarchicalDataTemplate : DataTemplate {
     public string ItemsSourcePath { get; set; } = "";
     public DataTemplate ItemTemplate { get; set; }
+    public string ItemTemplateKey { get; set; } = "";
 
     public HierarchicalDataTemplate() : base() {}
     public HierarchicalDataTemplate(Func<object, UIElement> factory, string itemsSourcePath = "") : base(factory) {
@@ -1712,7 +1931,7 @@ public class TimelineAnimation : DependencyObject {
         }
     }
 
-    private static UIElement ResolveAnimTarget(UIElement rootScope, string targetName) {
+    internal static UIElement ResolveAnimTarget(UIElement rootScope, string targetName) {
         if (rootScope == null) { return null; }
         if (targetName == null || targetName.Length == 0) { return rootScope; }
         UIElement found = rootScope.FindName(targetName);
@@ -1747,6 +1966,9 @@ public class TimelineAnimation : DependencyObject {
         if (dest == null || !ParseUtil.IsValidHandle(dest.__nativeHandle)) { return started; }
         int propId = EnumConvert.ParseAnimPropOrInvalid(TargetProperty);
         if (propId < 0) { return started; }
+        if (propId >= 24 && propId <= 26) {
+            dest.EnsureLayoutTransformEnabledForAnim();
+        }
         int ek = EnumConvert.ToInt(EasingKind);
         int em = EnumConvert.ToInt(EasingMode);
         float invSpeed = speedRatio > 0.001f ? (1.0f / speedRatio) : 1.0f;
@@ -1783,6 +2005,9 @@ public class TimelineAnimation : DependencyObject {
                 prevTime = 0.0f;
                 startIdx = 1;
                 if (KeyFrames.Length == 1) {
+                    if (effDelay <= 0.0005f) {
+                        dest.SetPropertyValue(TargetProperty, DependencyObject.BoxFloat(prevVal));
+                    }
                     int tid0 = Anim_StartFloat(
                         dest.__nativeHandle, propId, prevVal, prevVal, 0.001f,
                         EnumConvert.ToInt(KeyFrames[0].EasingKind), EnumConvert.ToInt(KeyFrames[0].EasingMode),
@@ -1816,6 +2041,9 @@ public class TimelineAnimation : DependencyObject {
             }
             _activeTrackIds = started;
             return started;
+        }
+        if (effDur <= 0.0005f && effDelay <= 0.0005f) {
+            dest.SetPropertyValue(TargetProperty, DependencyObject.BoxFloat(ToFloat));
         }
         int tidMain = 0;
         if (!HasFrom) {
@@ -1872,15 +2100,45 @@ public class DoubleAnimationUsingKeyFrames : TimelineAnimation {
     }
 }
 
+internal class DiscreteKeyFrameEntry {
+    public string TargetName = "";
+    public string TargetProp = "";
+    public float KeyTimeSec = 0.0f;
+    public DependencyObject ValueBox;
+    public DiscreteKeyFrameEntry(string name, string prop, float keyTime, DependencyObject box) {
+        TargetName = name == null ? "" : name;
+        TargetProp = prop == null ? "" : prop;
+        KeyTimeSec = keyTime;
+        ValueBox = box;
+    }
+}
+
+internal class PendingDiscreteApply {
+    public UIElement Dest;
+    public string TargetProp = "";
+    public DependencyObject ValueBox;
+    public int TrackId = 0;
+    public bool Applied = false;
+    public PendingDiscreteApply(UIElement dest, string prop, DependencyObject box, int tid) {
+        Dest = dest;
+        TargetProp = prop;
+        ValueBox = box;
+        TrackId = tid;
+    }
+}
+
 public class Storyboard : DependencyObject {
     public string TargetName { get; set; } = "";
     public UIElement Target { get; set; }
     public float SpeedRatio { get; set; } = 1.0f;
     public bool RepeatForever { get; set; } = false;
     private TimelineAnimation[] _children;
+    private DiscreteKeyFrameEntry[] _discreteKeyFrames;
+    private PendingDiscreteApply[] _pendingDiscrete;
     private int[] _runningTrackIds;
     private UIElement _lastScope;
     private bool _awaitingCompletion = false;
+    private Action _oneShotCompletion;
     private static Storyboard[] _activeStoryboards;
     private static bool _completionHookInstalled = false;
     public event EventHandler Completed;
@@ -1892,6 +2150,31 @@ public class Storyboard : DependencyObject {
 
     public TimelineAnimation[] Children() { return _children; }
     public void Add(TimelineAnimation anim) { if (anim != null) { _children.Push(anim); } }
+
+    public void AddDiscreteKeyFrame(string targetName, string targetProp, float keyTimeSec, DependencyObject valueBox) {
+        if (targetProp == null || targetProp.Length == 0) { return; }
+        if (_discreteKeyFrames == null) { _discreteKeyFrames = new DiscreteKeyFrameEntry[0]; }
+        _discreteKeyFrames.Push(new DiscreteKeyFrameEntry(targetName, targetProp, keyTimeSec, valueBox));
+    }
+
+    public void MergeFrom(Storyboard other) {
+        if (other == null || other == this) { return; }
+        TimelineAnimation[] kids = other.Children();
+        if (kids != null) {
+            for (int i = 0; i < kids.Length; i += 1) {
+                if (kids[i] != null) { _children.Push(kids[i]); }
+            }
+        }
+        if (other._discreteKeyFrames != null) {
+            if (_discreteKeyFrames == null) { _discreteKeyFrames = new DiscreteKeyFrameEntry[0]; }
+            for (int i = 0; i < other._discreteKeyFrames.Length; i += 1) {
+                DiscreteKeyFrameEntry dk = other._discreteKeyFrames[i];
+                if (dk != null) {
+                    _discreteKeyFrames.Push(new DiscreteKeyFrameEntry(dk.TargetName, dk.TargetProp, dk.KeyTimeSec, dk.ValueBox));
+                }
+            }
+        }
+    }
 
     internal static EasingFunctionKind IntToEasingKind(int kind) {
         switch (kind) {
@@ -2059,6 +2342,7 @@ public class Storyboard : DependencyObject {
             _completionHookInstalled = true;
             _activeStoryboards = new Storyboard[0];
             BindingEngine.AddPreFlushHook(() => { Storyboard.TickAllActive(); });
+            UIElement.RegisterDisposeHook(() => { Storyboard.CleanupDisposed(); });
         }
     }
 
@@ -2071,6 +2355,21 @@ public class Storyboard : DependencyObject {
         _activeStoryboards.Push(sb);
     }
 
+    internal static void CleanupDisposed() {
+        if (_activeStoryboards == null || _activeStoryboards.Length == 0) { return; }
+        for (int i = _activeStoryboards.Length - 1; i >= 0; i -= 1) {
+            Storyboard sb = _activeStoryboards[i];
+            if (sb == null || (sb._lastScope != null && sb._lastScope._isDisposedTree) ||
+                (sb.Target != null && sb.Target._isDisposedTree)) {
+                if (sb != null) {
+                    sb._awaitingCompletion = false;
+                    sb.StopRunningTracksOnly();
+                }
+                _activeStoryboards.RemoveAt(i);
+            }
+        }
+    }
+
     public static void TickAllActive() {
         if (_activeStoryboards == null || _activeStoryboards.Length == 0) { return; }
         var remaining = new Storyboard[0];
@@ -2078,6 +2377,22 @@ public class Storyboard : DependencyObject {
         for (int i = 0; i < _activeStoryboards.Length; i += 1) {
             Storyboard sb = _activeStoryboards[i];
             if (sb == null || !sb._awaitingCompletion) { continue; }
+            if (sb._lastScope != null && sb._lastScope._isDisposedTree) {
+                sb._awaitingCompletion = false;
+                sb.StopRunningTracksOnly();
+                continue;
+            }
+            if (sb._pendingDiscrete != null) {
+                for (int d = 0; d < sb._pendingDiscrete.Length; d += 1) {
+                    PendingDiscreteApply pd = sb._pendingDiscrete[d];
+                    if (pd != null && !pd.Applied && !Anim_IsTrackActive(pd.TrackId)) {
+                        pd.Applied = true;
+                        if (pd.Dest != null && !pd.Dest._isDisposedTree) {
+                            pd.Dest.SetPropertyValue(pd.TargetProp, pd.ValueBox);
+                        }
+                    }
+                }
+            }
             bool anyActive = false;
             if (sb._runningTrackIds != null) {
                 for (int j = 0; j < sb._runningTrackIds.Length; j += 1) {
@@ -2092,6 +2407,7 @@ public class Storyboard : DependencyObject {
             } else {
                 sb._awaitingCompletion = false;
                 sb._runningTrackIds = new int[0];
+                sb._pendingDiscrete = null;
                 finished.Push(sb);
             }
         }
@@ -2102,10 +2418,14 @@ public class Storyboard : DependencyObject {
     }
 
     private void RaiseCompleted() {
+        var cb = _oneShotCompletion;
+        _oneShotCompletion = null;
         Completed(this, EventArgs.Empty());
+        if (cb != null) { cb(); }
     }
 
     private void StopRunningTracksOnly() {
+        _pendingDiscrete = null;
         if (_runningTrackIds != null && _runningTrackIds.Length > 0) {
             for (int i = 0; i < _runningTrackIds.Length; i += 1) {
                 Anim_StopTrack(_runningTrackIds[i]);
@@ -2136,10 +2456,32 @@ public class Storyboard : DependencyObject {
                 allTracks.Push(tids[j]);
             }
         }
+        if (_discreteKeyFrames != null && _discreteKeyFrames.Length > 0) {
+            float invSpeed = SpeedRatio > 0.001f ? (1.0f / SpeedRatio) : 1.0f;
+            for (int i = 0; i < _discreteKeyFrames.Length; i += 1) {
+                DiscreteKeyFrameEntry dk = _discreteKeyFrames[i];
+                if (dk == null || dk.TargetProp.Length == 0) { continue; }
+                string tName = dk.TargetName.Length > 0 ? dk.TargetName : TargetName;
+                UIElement dest = TimelineAnimation.ResolveAnimTarget(root, tName);
+                if (dest == null || dest._isDisposedTree) { continue; }
+                if (dk.KeyTimeSec <= 0.0005f) {
+                    dest.SetPropertyValue(dk.TargetProp, dk.ValueBox);
+                } else if (ParseUtil.IsValidHandle(dest.__nativeHandle)) {
+                    int tid = Anim_StartFloat(
+                        dest.__nativeHandle, 23, 0.0f, 1.0f, 0.001f,
+                        0, 0, dk.KeyTimeSec * invSpeed, false, 1);
+                    if (tid > 0) {
+                        allTracks.Push(tid);
+                        if (_pendingDiscrete == null) { _pendingDiscrete = new PendingDiscreteApply[0]; }
+                        _pendingDiscrete.Push(new PendingDiscreteApply(dest, dk.TargetProp, dk.ValueBox, tid));
+                    }
+                }
+            }
+        }
         _runningTrackIds = allTracks;
         if (hasInfinite) { return; }
         if (_runningTrackIds.Length == 0) {
-            Completed(this, EventArgs.Empty());
+            RaiseCompleted();
             return;
         }
         EnsureCompletionHook();
@@ -2148,14 +2490,22 @@ public class Storyboard : DependencyObject {
     }
 
     public void Begin(UIElement scope = null) {
+        _oneShotCompletion = null;
+        BeginCore(scope, false);
+    }
+
+    internal void BeginWithCompletion(UIElement scope, Action onDone) {
+        _oneShotCompletion = onDone;
         BeginCore(scope, false);
     }
 
     internal void BeginAnimatedOnly(UIElement scope = null) {
+        _oneShotCompletion = null;
         BeginCore(scope, true);
     }
 
     public void Stop(UIElement scope = null) {
+        _oneShotCompletion = null;
         _awaitingCompletion = false;
         StopRunningTracksOnly();
         UIElement root = scope != null ? scope : Target;
@@ -2242,6 +2592,9 @@ public class MultiBinding : DependencyObject {
 internal class BindingEntry : DependencyObject {
     public UIElement Target;
     public Inline TargetInline;
+    public Effect TargetEffect;
+    public UIElement ContextHost;
+    internal bool _isApplying = false;
     public string TargetProp = "";
     public int Mode = 0; // 0=OneWay, 1=TwoWay, 2=OneTime
     public int Kind = 0; // 0=Lambda, 1=Path, 2=Element, 3=TemplateParent, 4=Multi, 5=Compiled
@@ -2312,9 +2665,75 @@ internal class BindingEntry : DependencyObject {
         return null;
     }
 
+    private static bool IsToggleButtonType(string tn) {
+        return tn == "ToggleButton" || tn == "CheckBox" || tn == "RadioButton";
+    }
+    private static bool IsButtonBaseType(string tn) {
+        return tn == "ButtonBase" || tn == "Button" || tn == "RepeatButton" || IsToggleButtonType(tn);
+    }
+    private static bool IsListBoxType(string tn) {
+        return tn == "ListBox" || tn == "ListView";
+    }
+    private static bool IsSelectorType(string tn) {
+        return tn == "Selector" || tn == "ComboBox" || tn == "TabControl" || IsListBoxType(tn);
+    }
+    private static bool IsItemsControlType(string tn) {
+        return tn == "ItemsControl" || tn == "TreeView" || tn == "TreeViewItem" ||
+               tn == "Menu" || tn == "MenuItem" || tn == "ContextMenu" || tn == "MenuBase" ||
+               tn == "StatusBar" || tn == "ToolBar" || IsSelectorType(tn);
+    }
+    private static bool IsHeaderedContentControlType(string tn) {
+        return tn == "HeaderedContentControl" || tn == "GroupBox" || tn == "Expander";
+    }
+    private static bool IsContentControlType(string tn) {
+        return tn == "ContentControl" || tn == "Label" || tn == "UserControl" ||
+               tn == "Page" || tn == "Window" || tn == "ListBoxItem" || tn == "ComboBoxItem" ||
+               tn == "ListViewItem" || tn == "TabItem" || tn == "SelectableItem" ||
+               tn == "ScrollViewer" || tn == "StatusBarItem" ||
+               IsHeaderedContentControlType(tn) || IsButtonBaseType(tn);
+    }
+    private static bool IsRangeBaseType(string tn) {
+        return tn == "RangeBase" || tn == "Slider" || tn == "ProgressBar" || tn == "ScrollBar";
+    }
+    private static bool IsTextBoxBaseType(string tn) {
+        return tn == "TextBoxBase" || tn == "TextBox";
+    }
+
+    internal static bool MatchesAncestorType(UIElement anc, string typeName) {
+        if (anc == null || typeName == null || typeName.Length == 0) { return false; }
+        string tn = anc.GetTypeName();
+        if (tn == typeName) { return true; }
+        if (typeName == "UIElement" || typeName == "FrameworkElement") { return true; }
+        if (typeName == "Control") {
+            return tn == "Control" || tn == "PasswordBox" || IsContentControlType(tn) ||
+                   IsItemsControlType(tn) || IsRangeBaseType(tn) || IsTextBoxBaseType(tn);
+        }
+        if (typeName == "ContentControl") { return IsContentControlType(tn); }
+        if (typeName == "HeaderedContentControl") { return IsHeaderedContentControlType(tn); }
+        if (typeName == "ItemsControl") { return IsItemsControlType(tn); }
+        if (typeName == "Selector") { return IsSelectorType(tn); }
+        if (typeName == "ListBox") { return IsListBoxType(tn); }
+        if (typeName == "ButtonBase") { return IsButtonBaseType(tn); }
+        if (typeName == "ToggleButton") { return IsToggleButtonType(tn); }
+        if (typeName == "RangeBase") { return IsRangeBaseType(tn); }
+        if (typeName == "Panel") {
+            return tn == "Panel" || tn == "StackPanel" || tn == "VirtualizingStackPanel" ||
+                   tn == "TabPanel" || tn == "ToolBarPanel" || tn == "DockPanel" ||
+                   tn == "WrapPanel" || tn == "ToolBarOverflowPanel" || tn == "UniformGrid" ||
+                   tn == "Canvas" || tn == "Grid";
+        }
+        if (typeName == "Shape") {
+            return tn == "Shape" || tn == "Rectangle" || tn == "Ellipse" ||
+                   tn == "Line" || tn == "Path" || tn == "Polygon" || tn == "Polyline";
+        }
+        if (typeName == "TextBoxBase") { return IsTextBoxBaseType(tn); }
+        if (typeName == "Decorator") { return tn == "Decorator" || tn == "Border" || tn == "Viewbox"; }
+        return false;
+    }
+
     public DependencyObject ResolveSourceBox() {
         if (ExplicitSourceBox != null) { return ExplicitSourceBox; }
-        UIElement host = Target != null ? Target : (TargetInline != null ? TargetInline.OwnerTextBlock : null);
+        UIElement host = Target != null ? Target : (ContextHost != null ? ContextHost : (TargetInline != null ? TargetInline.OwnerTextBlock : null));
         if (RelativeSourceMode == "Self") {
             return Target != null ? (DependencyObject)Target : (DependencyObject)TargetInline;
         }
@@ -2323,7 +2742,7 @@ internal class BindingEntry : DependencyObject {
         }
         if ((RelativeSourceMode == "FindAncestor" || RelativeSourceMode == "AncestorType") && host != null) {
             UIElement anc = host;
-            while (anc != null && RelativeSourceAncestorType.Length > 0 && anc.GetTypeName() != RelativeSourceAncestorType) {
+            while (anc != null && RelativeSourceAncestorType.Length > 0 && !MatchesAncestorType(anc, RelativeSourceAncestorType)) {
                 anc = anc.Parent;
             }
             if (anc != null) { return anc; }
@@ -2514,6 +2933,23 @@ internal class BindingEntry : DependencyObject {
             if (spec == "F2" || spec == "f2" || spec == "0.00") {
                 return FormatFixedDecimal(fv, 2);
             }
+            if (spec == "P0" || spec == "p0") {
+                return FormatFixedDecimal(fv * 100.0f, 0) + "%";
+            }
+            if (spec == "P1" || spec == "p1") {
+                return FormatFixedDecimal(fv * 100.0f, 1) + "%";
+            }
+            if (spec == "P" || spec == "p" || spec == "P2" || spec == "p2") {
+                return FormatFixedDecimal(fv * 100.0f, 2) + "%";
+            }
+            if (spec == "P3" || spec == "p3") {
+                return FormatFixedDecimal(fv * 100.0f, 3) + "%";
+            }
+            if (spec.Length >= 2 && spec.Substring(spec.Length - 1, 1) == "%") {
+                string inner = spec.Substring(0, spec.Length - 1);
+                string pctNum = FormatCustomNumericSpec(DependencyObject.BoxFloat(fv * 100.0f), inner);
+                if (pctNum != null) { return pctNum + "%"; }
+            }
             string customNum = FormatCustomNumericSpec(box, spec);
             if (customNum != null) { return customNum; }
         }
@@ -2535,9 +2971,17 @@ internal class BindingEntry : DependencyObject {
             fmt = fmt.Substring(2);
         }
         if (fmt.Length == 0) { return DependencyObject.UnboxString(box, ""); }
-        if (fmt == "G" || fmt == "00" || fmt == "F0" || fmt == "F1" || fmt == "F2" ||
-            fmt == "D2" || fmt == "N0" || fmt == "0.0" || fmt == "0.00") {
+        if (fmt == "G" || fmt == "g" || fmt == "00" || fmt == "F0" || fmt == "f0" ||
+            fmt == "F1" || fmt == "f1" || fmt == "F2" || fmt == "f2" ||
+            fmt == "D2" || fmt == "N0" || fmt == "n0" || fmt == "0" || fmt == "0.0" || fmt == "0.00" ||
+            fmt == "P" || fmt == "p" || fmt == "P0" || fmt == "p0" ||
+            fmt == "P1" || fmt == "p1" || fmt == "P2" || fmt == "p2" || fmt == "P3" || fmt == "p3") {
             return FormatSpecOnly(box, fmt);
+        }
+        if (FindSubstr(fmt, "{", 0) < 0) {
+            string direct = FormatSpecOnly(box, fmt);
+            string rawCheck = DependencyObject.UnboxString(box, "");
+            if (direct != rawCheck) { return direct; }
         }
         int colIdx = FindSubstr(fmt, "{0:", 0);
         if (colIdx >= 0) {
@@ -2556,16 +3000,22 @@ internal class BindingEntry : DependencyObject {
     }
 
     private void ApplyTargetBox(DependencyObject valBox) {
+        BindingEngine.MarkFlushDirty();
+        bool prev = _isApplying;
+        _isApplying = true;
         if (Target != null) {
             Target.SetPropertyValue(TargetProp, valBox);
         } else if (TargetInline != null) {
             TargetInline.SetPropertyValue(TargetProp, valBox);
+        } else if (TargetEffect != null) {
+            TargetEffect.SetPropertyValue(TargetProp, valBox);
         }
+        _isApplying = prev;
     }
 
     public void Evaluate() {
-        if (Target == null && TargetInline == null) { return; }
-        UIElement host = Target != null ? Target : (TargetInline != null ? TargetInline.OwnerTextBlock : null);
+        if (Target == null && TargetInline == null && TargetEffect == null) { return; }
+        UIElement host = Target != null ? Target : (ContextHost != null ? ContextHost : (TargetInline != null ? TargetInline.OwnerTextBlock : null));
         if (Mode == 2 && OneTimeDone) { return; }
 
         if (Kind == 0 && LambdaGetter != null) {
@@ -2673,6 +3123,8 @@ internal class BindingEntry : DependencyObject {
                 } else if (sub.RelativeSourceMode == "TemplatedParent" && host != null && host.TemplatedParent != null) {
                     sv = host.TemplatedParent.GetPropertyValue(sub.Path);
                     if (sv == null) { sv = BindingEngine.ReadPathBox(host.TemplatedParent, sub.Path); }
+                } else if (sub.SourceBox != null && (sub.Path == null || sub.Path.Length == 0 || sub.Path == ".")) {
+                    sv = sub.SourceBox;
                 } else {
                     object dc = sub.Source != null ? sub.Source : DependencyObject.Unbox(ResolveSourceBox());
                     if (dc != null) { sv = BindingEngine.ReadPathBox(dc, sub.Path); }
@@ -2705,13 +3157,14 @@ internal class BindingEntry : DependencyObject {
             if (srcObj == null) { return; }
             int dm = ParseUtil.IsNativeReady() ? Reflect_GetDirtyMask(srcObj) : -1;
             bool sameSrc = ItemsControl.SameItemBox(srcBox, _lastSrcBox);
-            if (OneTimeDone && sameSrc && !(srcObj is UIElement) && dm >= 0 && dm == LastDirtyMask) {
+            if (OneTimeDone && sameSrc && !(srcObj is UIElement) && dm == 0 && LastDirtyMask == 0) {
                 return;
             }
             _lastSrcBox = srcBox;
             LastDirtyMask = dm;
             OneTimeDone = true;
             CompiledUpdater(Target, srcObj);
+            BindingEngine.MarkFlushDirty();
             return;
         }
 
@@ -2725,7 +3178,7 @@ internal class BindingEntry : DependencyObject {
             }
             int dm = ParseUtil.IsNativeReady() ? Reflect_GetDirtyMask(srcObj) : -1;
             bool sameSrc = ItemsControl.SameItemBox(srcBox, _lastSrcBox);
-            if (OneTimeDone && sameSrc && !(srcObj is UIElement) && IsSingleHopPath && dm >= 0 && dm == LastDirtyMask) {
+            if (OneTimeDone && sameSrc && !(srcObj is UIElement) && IsSingleHopPath && dm == 0 && LastDirtyMask == 0) {
                 return;
             }
             DependencyObject valBox = BindingEngine.ReadSegmentsBox(srcObj, SourcePath, PathSegments);
@@ -2737,7 +3190,7 @@ internal class BindingEntry : DependencyObject {
                 return;
             }
             string sig = DependencyObject.UnboxString(valBox, "");
-            if (!boxDiff && dm == LastDirtyMask && dm >= 0 && sig == LastHash && OneTimeDone && sameSrc) {
+            if (!boxDiff && sig == LastHash && OneTimeDone && sameSrc) {
                 return;
             }
             _lastSrcBox = srcBox;
@@ -2854,6 +3307,11 @@ public static class BindingEngine {
     private static Action[] _preFlushHooks;
     private static int _batchDepth = 0;
     private static BindingEntry[] _batchPending;
+    private static bool _flushPassDirty = false;
+
+    internal static void MarkFlushDirty() {
+        _flushPassDirty = true;
+    }
 
     public static void BeginBatch() {
         _batchDepth += 1;
@@ -2885,8 +3343,14 @@ public static class BindingEngine {
         _preFlushHooks.Push(hook);
     }
 
+    private static bool _disposeHookInstalled = false;
+
     private static void EnsureInit() {
         if (_entries == null) { _entries = new BindingEntry[0]; }
+        if (!_disposeHookInstalled) {
+            _disposeHookInstalled = true;
+            UIElement.RegisterDisposeHook(() => { BindingEngine.CleanupDisposed(); });
+        }
     }
 
     private static void RegisterEntry(BindingEntry entry) {
@@ -2901,6 +3365,15 @@ public static class BindingEngine {
                 entry.Target._ownBindingsBox = list;
             }
             list.Items.Push(entry);
+        } else if (entry != null && entry.TargetInline != null) {
+            ElementBindingList list = null;
+            if (entry.TargetInline._ownBindingsBox is ElementBindingList) {
+                list = entry.TargetInline._ownBindingsBox as ElementBindingList;
+            } else {
+                list = new ElementBindingList();
+                entry.TargetInline._ownBindingsBox = list;
+            }
+            list.Items.Push(entry);
         }
         if (_batchDepth > 0) {
             if (_batchPending == null) { _batchPending = new BindingEntry[0]; }
@@ -2908,6 +3381,27 @@ public static class BindingEngine {
             return;
         }
         entry.Evaluate();
+    }
+
+    public static void ClearBindings(UIElement target, string propertyName) {
+        if (target == null || propertyName == null || propertyName.Length == 0) { return; }
+        if (target._ownBindingsBox is ElementBindingList) {
+            ElementBindingList list = target._ownBindingsBox as ElementBindingList;
+            for (int i = list.Items.Length - 1; i >= 0; i -= 1) {
+                BindingEntry e = list.Items[i];
+                if (e == null || (e.Target == target && e.TargetProp == propertyName)) {
+                    list.Items.RemoveAt(i);
+                }
+            }
+        }
+        if (_entries != null) {
+            for (int i = _entries.Length - 1; i >= 0; i -= 1) {
+                BindingEntry e = _entries[i];
+                if (e == null || (e.Target == target && e.TargetProp == propertyName)) {
+                    _entries.RemoveAt(i);
+                }
+            }
+        }
     }
 
     public static void BindCompiledAction(
@@ -3148,13 +3642,67 @@ public static class BindingEngine {
         RegisterEntry(e);
     }
 
+    public static void BindEffect(Effect targetEffect, UIElement contextHost, string targetProp, Binding b) {
+        if (targetEffect == null || targetProp == null || b == null) { return; }
+        var e = new BindingEntry();
+        e.TargetEffect = targetEffect;
+        e.ContextHost = contextHost;
+        e.TargetProp = targetProp;
+        e.Mode = b.Mode == BindingMode.TwoWay ? 1 : (b.Mode == BindingMode.OneTime ? 2 : (b.Mode == BindingMode.OneWayToSource ? 3 : 0));
+        if (b.ElementName != null && b.ElementName.Length > 0) {
+            e.Kind = 2;
+            e.ElementName = b.ElementName;
+        } else {
+            e.Kind = 1;
+            e.ExplicitSourceBox = b.SourceBox;
+            e.RelativeSourceMode = b.RelativeSourceMode == null ? "" : b.RelativeSourceMode;
+            e.RelativeSourceAncestorType = b.RelativeSourceAncestorType == null ? "" : b.RelativeSourceAncestorType;
+        }
+        e.SourcePath = b.Path == null ? "" : b.Path;
+        e.InitPathSegments();
+        e.Converter = b.Converter;
+        e.ConverterKey = b.ConverterKey == null ? "" : b.ConverterKey;
+        e.ConverterParam = b.ConverterParameter == null ? "" : b.ConverterParameter;
+        e.StringFormat = b.StringFormat == null ? "" : b.StringFormat;
+        e.HasFallback = b.HasFallbackValue;
+        e.FallbackBox = b.FallbackBox;
+        e.HasTargetNull = b.HasTargetNullValue;
+        e.TargetNullBox = b.TargetNullBox;
+        RegisterEntry(e);
+    }
+
     public static void NotifyTargetPropertyChanged(UIElement target, string targetProp, DependencyObject newBox) {
         if (target == null || !(target._ownBindingsBox is ElementBindingList)) { return; }
         BindingEntry[] own = (target._ownBindingsBox as ElementBindingList).Items;
         for (int i = 0; i < own.Length; i += 1) {
             BindingEntry e = own[i];
-            if (e.TargetProp == targetProp && e.Mode == 1) {
+            if (e.TargetProp == targetProp && e.Mode == 1 && !e._isApplying) {
                 e.PushTwoWay(newBox);
+            }
+        }
+    }
+
+    public static void CleanupDisposed() {
+        if (_entries == null) { return; }
+        for (int i = _entries.Length - 1; i >= 0; i -= 1) {
+            BindingEntry e = _entries[i];
+            if (e == null) {
+                _entries.RemoveAt(i);
+                continue;
+            }
+            bool dead = false;
+            if (e.Target != null && e.Target._isDisposedTree) { dead = true; }
+            else if (e.ContextHost != null && e.ContextHost._isDisposedTree) { dead = true; }
+            else if (e.Target == null && e.TargetEffect == null && e.TargetInline != null &&
+                (e.TargetInline.OwnerTextBlock == null || e.TargetInline.OwnerTextBlock._isDisposedTree)) {
+                dead = true;
+            }
+            if (dead) {
+                _entries.RemoveAt(i);
+                continue;
+            }
+            if (e.SourceElement != null && e.SourceElement._isDisposedTree) {
+                e.SourceElement = null;
             }
         }
     }
@@ -3166,6 +3714,21 @@ public static class BindingEngine {
         for (int i = _entries.Length - 1; i >= 0; i -= 1) {
             if (_entries[i].Target == target) {
                 _entries.RemoveAt(i);
+            }
+        }
+    }
+
+    public static void FlushInlinesFor(TextBlock tb) {
+        if (tb == null || tb._isDisposedTree) { return; }
+        Inline[] inlines = tb.Inlines();
+        if (inlines == null) { return; }
+        for (int i = 0; i < inlines.Length; i += 1) {
+            Inline inl = inlines[i];
+            if (inl != null && inl._ownBindingsBox is ElementBindingList) {
+                BindingEntry[] own = (inl._ownBindingsBox as ElementBindingList).Items;
+                for (int k = 0; k < own.Length; k += 1) {
+                    own[k].Evaluate();
+                }
             }
         }
     }
@@ -3184,6 +3747,9 @@ public static class BindingEngine {
                 for (int k = 0; k < own.Length; k += 1) {
                     own[k].Evaluate();
                 }
+            }
+            if (node is TextBlock) {
+                FlushInlinesFor(node as TextBlock);
             }
             int cc = node.ChildCount();
             for (int c = 0; c < cc; c += 1) {
@@ -3207,14 +3773,23 @@ public static class BindingEngine {
         for (int i = 0; i < _entries.Length; i += 1) {
             BindingEntry e = _entries[i];
             if (e.Target != null && e.Target._isDisposedTree) { continue; }
+            if (e.ContextHost != null && e.ContextHost._isDisposedTree) { continue; }
+            if (e.Target == null && e.TargetEffect == null && e.TargetInline != null &&
+                (e.TargetInline.OwnerTextBlock == null || e.TargetInline.OwnerTextBlock._isDisposedTree)) {
+                continue;
+            }
             if (write != i) { _entries[write] = e; }
             write += 1;
         }
         while (_entries.Length > write) {
             _entries.RemoveAt(_entries.Length - 1);
         }
-        for (int i = 0; i < _entries.Length; i += 1) {
-            _entries[i].Evaluate();
+        for (int pass = 0; pass < 3; pass += 1) {
+            _flushPassDirty = false;
+            for (int i = 0; i < _entries.Length; i += 1) {
+                _entries[i].Evaluate();
+            }
+            if (!_flushPassDirty) { break; }
         }
     }
 

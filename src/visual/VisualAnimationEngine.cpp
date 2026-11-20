@@ -10,6 +10,60 @@ namespace aero {
 
 namespace {
 
+[[nodiscard]] const VisualNode* FindFirstDescendantTextNode(
+    const VisualWorld& world,
+    VisualNodeId id,
+    int depth) noexcept {
+    if (depth > 8) return nullptr;
+    const VisualNode* node = world.GetNode(id);
+    if (!node) return nullptr;
+    if (node->kind == VisualKind::Text) return node;
+    for (VisualNodeId ch : node->children) {
+        if (const VisualNode* hit = FindFirstDescendantTextNode(world, ch, depth + 1)) {
+            return hit;
+        }
+    }
+    return nullptr;
+}
+
+void ApplyTextFgOpacityRecursive(
+    VisualWorld& world,
+    VisualNodeId id,
+    float opacity,
+    int depth) noexcept {
+    if (depth > 8) return;
+    VisualNode* node = world.GetNode(id);
+    if (!node) return;
+    if (node->kind == VisualKind::Text) {
+        node->EnsureExtras().text.fgOpacity = opacity;
+        world.MarkDirty(id, VisualDirty_Visual);
+        return;
+    }
+    const std::vector<VisualNodeId> kids = node->children;
+    for (VisualNodeId ch : kids) {
+        ApplyTextFgOpacityRecursive(world, ch, opacity, depth + 1);
+    }
+}
+
+void ApplyTextFgColorRecursive(
+    VisualWorld& world,
+    VisualNodeId id,
+    std::uint32_t rgba,
+    int depth) noexcept {
+    if (depth > 8) return;
+    VisualNode* node = world.GetNode(id);
+    if (!node) return;
+    if (node->kind == VisualKind::Text) {
+        node->EnsureExtras().text.fgRgba = rgba;
+        world.MarkDirty(id, VisualDirty_Visual);
+        return;
+    }
+    const std::vector<VisualNodeId> kids = node->children;
+    for (VisualNodeId ch : kids) {
+        ApplyTextFgColorRecursive(world, ch, rgba, depth + 1);
+    }
+}
+
 [[nodiscard]] float EaseOutBounceCore(float u) noexcept {
     constexpr float n1 = 7.5625f;
     constexpr float d1 = 2.75f;
@@ -109,8 +163,8 @@ struct MutableGradSlot {
     if (!node) return {};
     if (node->kind == VisualKind::Vector) {
         return isStroke
-            ? MutableGradSlot{&node->vector.strokeGradId, &node->vector.ownsMutableStrokeGrad}
-            : MutableGradSlot{&node->vector.fillGradId, &node->vector.ownsMutableFillGrad};
+            ? MutableGradSlot{&node->EnsureExtras().vector.strokeGradId, &node->EnsureExtras().vector.ownsMutableStrokeGrad}
+            : MutableGradSlot{&node->EnsureExtras().vector.fillGradId, &node->EnsureExtras().vector.ownsMutableFillGrad};
     }
     return isStroke
         ? MutableGradSlot{&node->box.borderGradId, &node->box.ownsMutableBorderGrad}
@@ -120,7 +174,7 @@ struct MutableGradSlot {
 [[nodiscard]] std::int32_t ReadGradId(const VisualNode* node, bool isStroke) noexcept {
     if (!node) return -1;
     if (node->kind == VisualKind::Vector) {
-        return isStroke ? node->vector.strokeGradId : node->vector.fillGradId;
+        return isStroke ? node->Vector().strokeGradId : node->Vector().fillGradId;
     }
     return isStroke ? node->box.borderGradId : node->box.bgGradId;
 }
@@ -240,63 +294,66 @@ void ApplyScalarProp(VisualWorld& world, VisualNodeId id, VisualAnimProp prop, f
         node->transform2D.skewY = value;
         break;
     case VisualAnimProp::Rot3DX:
-        node->transform3D.rx = value;
-        node->transform3D.enabled = true;
+        node->EnsureExtras().transform3D.rx = value;
+        node->EnsureExtras().transform3D.enabled = true;
         break;
     case VisualAnimProp::Rot3DY:
-        node->transform3D.ry = value;
-        node->transform3D.enabled = true;
+        node->EnsureExtras().transform3D.ry = value;
+        node->EnsureExtras().transform3D.enabled = true;
         break;
     case VisualAnimProp::Rot3DZ:
-        node->transform3D.rz = value;
-        node->transform3D.enabled = true;
+        node->EnsureExtras().transform3D.rz = value;
+        node->EnsureExtras().transform3D.enabled = true;
         break;
     case VisualAnimProp::Trans3DX:
-        node->transform3D.tx = value;
-        node->transform3D.enabled = true;
+        node->EnsureExtras().transform3D.tx = value;
+        node->EnsureExtras().transform3D.enabled = true;
         break;
     case VisualAnimProp::Trans3DY:
-        node->transform3D.ty = value;
-        node->transform3D.enabled = true;
+        node->EnsureExtras().transform3D.ty = value;
+        node->EnsureExtras().transform3D.enabled = true;
         break;
     case VisualAnimProp::Trans3DZ:
-        node->transform3D.tz = value;
-        node->transform3D.enabled = true;
+        node->EnsureExtras().transform3D.tz = value;
+        node->EnsureExtras().transform3D.enabled = true;
         break;
     case VisualAnimProp::CornerRadius:
         node->box.cornerRadius = CornerRadius{value};
         break;
     case VisualAnimProp::PathTrimStart:
-        node->vector.trimStart = value;
+        node->EnsureExtras().vector.trimStart = value;
         break;
     case VisualAnimProp::PathTrimEnd:
-        node->vector.trimEnd = value;
+        node->EnsureExtras().vector.trimEnd = value;
         break;
     case VisualAnimProp::EffectRadius:
-        node->effect.radius = value;
+        node->EnsureExtras().effect.radius = value;
         break;
     case VisualAnimProp::EffectOpacity:
-        node->effect.opacity = std::clamp(value, 0.0f, 1.0f);
+        node->EnsureExtras().effect.opacity = std::clamp(value, 0.0f, 1.0f);
         break;
     case VisualAnimProp::BrushOpacity:
         if (node->kind == VisualKind::Vector) {
-            node->vector.fillOpacity = std::clamp(value, 0.0f, 1.0f);
+            node->EnsureExtras().vector.fillOpacity = std::clamp(value, 0.0f, 1.0f);
         } else {
             node->box.bgOpacity = std::clamp(value, 0.0f, 1.0f);
         }
         break;
     case VisualAnimProp::FillBrushOpacity:
         if (node->kind == VisualKind::Vector) {
-            node->vector.fillOpacity = std::clamp(value, 0.0f, 1.0f);
+            node->EnsureExtras().vector.fillOpacity = std::clamp(value, 0.0f, 1.0f);
         } else {
             node->box.bgOpacity = std::clamp(value, 0.0f, 1.0f);
         }
         break;
     case VisualAnimProp::StrokeBrushOpacity:
         if (node->kind == VisualKind::Vector) {
-            node->vector.strokeOpacity = std::clamp(value, 0.0f, 1.0f);
+            node->EnsureExtras().vector.strokeOpacity = std::clamp(value, 0.0f, 1.0f);
         }
         break;
+    case VisualAnimProp::FgBrushOpacity:
+        ApplyTextFgOpacityRecursive(world, id, std::clamp(value, 0.0f, 1.0f), 0);
+        return;
     case VisualAnimProp::CustomScalar0:
         node->customScalars[0] = value;
         break;
@@ -315,8 +372,8 @@ void ApplyScalarProp(VisualWorld& world, VisualNodeId id, VisualAnimProp prop, f
     case VisualAnimProp::OpacityMaskStop3Offset: {
         const std::size_t stopIdx = static_cast<std::size_t>(
             static_cast<std::uint8_t>(prop) - static_cast<std::uint8_t>(VisualAnimProp::OpacityMaskStop0Offset));
-        if (stopIdx < node->opacityMask.stopOffsets.size()) {
-            node->opacityMask.stopOffsets[stopIdx] = std::clamp(value, 0.0f, 1.0f);
+        if (stopIdx < node->EnsureExtras().opacityMask.stopOffsets.size()) {
+            node->EnsureExtras().opacityMask.stopOffsets[stopIdx] = std::clamp(value, 0.0f, 1.0f);
         }
         break;
     }
@@ -349,18 +406,18 @@ void ApplyColorProp(VisualWorld& world, VisualNodeId id, VisualAnimProp prop, st
     case VisualAnimProp::BgColor:
     case VisualAnimProp::FillColor:
         if (node->kind == VisualKind::Vector) {
-            node->vector.fillRgba = rgba;
+            node->EnsureExtras().vector.fillRgba = rgba;
         } else {
             node->box.bgRgba = rgba;
         }
         break;
     case VisualAnimProp::FgColor:
-        node->text.fgRgba = rgba;
-        break;
+        ApplyTextFgColorRecursive(world, id, rgba, 0);
+        return;
     case VisualAnimProp::BorderColor:
     case VisualAnimProp::StrokeColor:
         if (node->kind == VisualKind::Vector) {
-            node->vector.strokeRgba = rgba;
+            node->EnsureExtras().vector.strokeRgba = rgba;
         } else {
             node->box.borderRgba = rgba;
         }
@@ -610,23 +667,30 @@ float VisualAnimationEngine::ReadCurrentScalarProp(
     case VisualAnimProp::RotateDeg: return node->transform2D.rotDeg;
     case VisualAnimProp::SkewX: return node->transform2D.skewX;
     case VisualAnimProp::SkewY: return node->transform2D.skewY;
-    case VisualAnimProp::Rot3DX: return node->transform3D.rx;
-    case VisualAnimProp::Rot3DY: return node->transform3D.ry;
-    case VisualAnimProp::Rot3DZ: return node->transform3D.rz;
-    case VisualAnimProp::Trans3DX: return node->transform3D.tx;
-    case VisualAnimProp::Trans3DY: return node->transform3D.ty;
-    case VisualAnimProp::Trans3DZ: return node->transform3D.tz;
+    case VisualAnimProp::Rot3DX: return node->Transform3D().rx;
+    case VisualAnimProp::Rot3DY: return node->Transform3D().ry;
+    case VisualAnimProp::Rot3DZ: return node->Transform3D().rz;
+    case VisualAnimProp::Trans3DX: return node->Transform3D().tx;
+    case VisualAnimProp::Trans3DY: return node->Transform3D().ty;
+    case VisualAnimProp::Trans3DZ: return node->Transform3D().tz;
     case VisualAnimProp::CornerRadius: return node->box.cornerRadius.topLeft;
-    case VisualAnimProp::PathTrimStart: return node->vector.trimStart;
-    case VisualAnimProp::PathTrimEnd: return node->vector.trimEnd;
-    case VisualAnimProp::EffectRadius: return node->effect.radius;
-    case VisualAnimProp::EffectOpacity: return node->effect.opacity;
+    case VisualAnimProp::PathTrimStart: return node->Vector().trimStart;
+    case VisualAnimProp::PathTrimEnd: return node->Vector().trimEnd;
+    case VisualAnimProp::EffectRadius: return node->Effect().radius;
+    case VisualAnimProp::EffectOpacity: return node->Effect().opacity;
     case VisualAnimProp::BrushOpacity:
-        return (node->kind == VisualKind::Vector) ? node->vector.fillOpacity : node->box.bgOpacity;
+        return (node->kind == VisualKind::Vector) ? node->Vector().fillOpacity : node->box.bgOpacity;
     case VisualAnimProp::FillBrushOpacity:
-        return (node->kind == VisualKind::Vector) ? node->vector.fillOpacity : node->box.bgOpacity;
+        return (node->kind == VisualKind::Vector) ? node->Vector().fillOpacity : node->box.bgOpacity;
     case VisualAnimProp::StrokeBrushOpacity:
-        return (node->kind == VisualKind::Vector) ? node->vector.strokeOpacity : 1.0f;
+        return (node->kind == VisualKind::Vector) ? node->Vector().strokeOpacity : 1.0f;
+    case VisualAnimProp::FgBrushOpacity: {
+        if (node->kind == VisualKind::Text) return node->Text().fgOpacity;
+        if (const VisualNode* txt = FindFirstDescendantTextNode(world, id, 0)) {
+            return txt->Text().fgOpacity;
+        }
+        return node->Text().fgOpacity;
+    }
     case VisualAnimProp::CustomScalar0: return node->customScalars[0];
     case VisualAnimProp::CustomScalar1: return node->customScalars[1];
     case VisualAnimProp::CustomScalar2: return node->customScalars[2];
@@ -637,12 +701,12 @@ float VisualAnimationEngine::ReadCurrentScalarProp(
     case VisualAnimProp::OpacityMaskStop3Offset: {
         const std::size_t stopIdx = static_cast<std::size_t>(
             static_cast<std::uint8_t>(prop) - static_cast<std::uint8_t>(VisualAnimProp::OpacityMaskStop0Offset));
-        if (stopIdx < node->opacityMask.stopOffsets.size() &&
-            std::isfinite(node->opacityMask.stopOffsets[stopIdx])) {
-            return node->opacityMask.stopOffsets[stopIdx];
+        if (stopIdx < node->OpacityMask().stopOffsets.size() &&
+            std::isfinite(node->OpacityMask().stopOffsets[stopIdx])) {
+            return node->OpacityMask().stopOffsets[stopIdx];
         }
         GradientBrushDesc desc{};
-        if (TryReadGradientBrush(world, node->opacityMask.gradId, desc) && stopIdx < desc.stops.size()) {
+        if (TryReadGradientBrush(world, node->OpacityMask().gradId, desc) && stopIdx < desc.stops.size()) {
             return desc.stops[stopIdx].offset;
         }
         return 0.0f;
@@ -678,12 +742,17 @@ std::uint32_t VisualAnimationEngine::ReadCurrentColorProp(
     switch (prop) {
     case VisualAnimProp::BgColor:
     case VisualAnimProp::FillColor:
-        return (node->kind == VisualKind::Vector) ? node->vector.fillRgba : node->box.bgRgba;
-    case VisualAnimProp::FgColor:
-        return node->text.fgRgba;
+        return (node->kind == VisualKind::Vector) ? node->Vector().fillRgba : node->box.bgRgba;
+    case VisualAnimProp::FgColor: {
+        if (node->kind == VisualKind::Text) return node->Text().fgRgba;
+        if (const VisualNode* txt = FindFirstDescendantTextNode(world, id, 0)) {
+            return txt->Text().fgRgba;
+        }
+        return node->Text().fgRgba;
+    }
     case VisualAnimProp::BorderColor:
     case VisualAnimProp::StrokeColor:
-        return (node->kind == VisualKind::Vector) ? node->vector.strokeRgba : node->box.borderRgba;
+        return (node->kind == VisualKind::Vector) ? node->Vector().strokeRgba : node->box.borderRgba;
     default:
         return 0u;
     }

@@ -81,6 +81,67 @@ void ComputeAxisConstraint(
     }
 }
 
+[[nodiscard]] Matrix2D ComputeLayoutTransformLinearMatrix(const VisualLayoutTransform2D& lt) noexcept {
+    Matrix2D m = Matrix2D::Identity();
+    if (std::fabs(lt.sx - 1.0f) > 1e-6f || std::fabs(lt.sy - 1.0f) > 1e-6f) {
+        m = Matrix2D::Multiply(Matrix2D::Scaling(lt.sx, lt.sy), m);
+    }
+    if (std::fabs(lt.skewX) > 1e-6f || std::fabs(lt.skewY) > 1e-6f) {
+        m = Matrix2D::Multiply(Matrix2D::Skew(lt.skewX, lt.skewY), m);
+    }
+    if (std::fabs(lt.rotDeg) > 1e-6f) {
+        m = Matrix2D::Multiply(Matrix2D::Rotation(lt.rotDeg), m);
+    }
+    return m;
+}
+
+void InverseBoxConstraintUnderLayoutTransform(
+    const Matrix2D& m,
+    float outerBoxW,
+    float outerBoxH,
+    float singularFallbackW,
+    float singularFallbackH,
+    float& outLocalW,
+    float& outLocalH) noexcept {
+    const float a = std::fabs(m.m00);
+    const float b = std::fabs(m.m01);
+    const float c = std::fabs(m.m10);
+    const float d = std::fabs(m.m11);
+    const bool finiteW = std::isfinite(outerBoxW);
+    const bool finiteH = std::isfinite(outerBoxH);
+
+    if (a <= 1e-5f && c <= 1e-5f) {
+        outLocalW = singularFallbackW;
+    } else {
+        const float wFromW = (a > 1e-5f && finiteW) ? (std::max(0.0f, outerBoxW) / a) : kInf;
+        const float wFromH = (c > 1e-5f && finiteH) ? (std::max(0.0f, outerBoxH) / c) : kInf;
+        outLocalW = std::min(wFromW, wFromH);
+    }
+
+    if (b <= 1e-5f && d <= 1e-5f) {
+        outLocalH = singularFallbackH;
+    } else {
+        const float hFromW = (b > 1e-5f && finiteW) ? (std::max(0.0f, outerBoxW) / b) : kInf;
+        const float hFromH = (d > 1e-5f && finiteH) ? (std::max(0.0f, outerBoxH) / d) : kInf;
+        outLocalH = std::min(hFromW, hFromH);
+    }
+
+    if (std::isfinite(outLocalW) && std::isfinite(outLocalH) &&
+        ((a > 1e-5f && b > 1e-5f && finiteW) || (c > 1e-5f && d > 1e-5f && finiteH))) {
+        const float needW = a * outLocalW + b * outLocalH;
+        const float needH = c * outLocalW + d * outLocalH;
+        float ratio = 1.0f;
+        if (finiteW && needW > 1e-5f) {
+            ratio = std::min(ratio, std::max(0.0f, outerBoxW) / needW);
+        }
+        if (finiteH && needH > 1e-5f) {
+            ratio = std::min(ratio, std::max(0.0f, outerBoxH) / needH);
+        }
+        outLocalW *= ratio;
+        outLocalH *= ratio;
+    }
+}
+
 void ComputeViewboxScale(
     float availW,
     float availH,
@@ -113,6 +174,11 @@ void ComputeViewboxScale(
             sy = 1.0f;
             break;
         case Stretch::Fill:
+            if (infW && !infH) {
+                sx = sy;
+            } else if (infH && !infW) {
+                sy = sx;
+            }
             break;
         case Stretch::Uniform: {
             if (infW) {
@@ -178,29 +244,23 @@ void ComputeViewboxScale(
     float innerAvailH) {
     switch (node.kind) {
         case VisualKind::Text: {
-            if (node.text.text.empty()) {
-                return Size{0.0f, std::max(1.0f, node.text.fontSize) * 1.25f};
+            if (node.Text().text.empty() && node.Text().richSpans.empty()) {
+                return Size{0.0f, std::max(1.0f, node.Text().fontSize) * 1.25f};
             }
-            const float maxW = (node.text.wrap == TextWrapping::NoWrap || !std::isfinite(innerAvailW))
+            const float maxW = (node.Text().wrap == TextWrapping::NoWrap || !std::isfinite(innerAvailW))
                 ? 1000000.0f
                 : std::max(1.0f, innerAvailW);
-            return world.MeasureText(
-                node.text.text,
-                node.text.fontFamily,
-                node.text.fontSize,
-                maxW,
-                node.text.wrap,
-                node.text.charSpacing);
+            return world.MeasureTextNode(node, maxW);
         }
         case VisualKind::Image: {
-            if (node.image.uri.empty()) {
+            if (node.Image().uri.empty()) {
                 return Size{0.0f, 0.0f};
             }
             UIResourceStore* store = world.ResourceStore();
             if (!store) {
                 return Size{0.0f, 0.0f};
             }
-            const ImageAtlasEntry* entry = store->Images().LoadOrGet(node.image.uri);
+            const ImageAtlasEntry* entry = store->Images().LoadOrGet(node.Image().uri);
             if (!entry || entry->width == 0u || entry->height == 0u) {
                 return Size{0.0f, 0.0f};
             }
@@ -210,15 +270,15 @@ void ComputeViewboxScale(
                 static_cast<float>(entry->height),
                 innerAvailW,
                 innerAvailH,
-                node.image.stretch,
-                node.image.stretchDir,
+                node.Image().stretch,
+                node.Image().stretchDir,
                 out);
             return out;
         }
         case VisualKind::Vector: {
-            if (node.vector.shapeKind == VectorShapeKind::SvgPath && !node.vector.pathOrParams.empty()) {
-                const Rect bounds = MeasureSvgPathBounds(node.vector.pathOrParams);
-                if (node.vector.stretch == Stretch::None) {
+            if (node.Vector().shapeKind == VectorShapeKind::SvgPath && !node.Vector().pathOrParams.empty()) {
+                const Rect bounds = MeasureSvgPathBounds(node.Vector().pathOrParams);
+                if (node.Vector().stretch == Stretch::None) {
                     if (bounds.width > 0.0f || bounds.height > 0.0f) {
                         return Size{
                             std::max(0.0f, bounds.x + bounds.width),
@@ -233,7 +293,7 @@ void ComputeViewboxScale(
                         bounds.height,
                         innerAvailW,
                         innerAvailH,
-                        node.vector.stretch,
+                        node.Vector().stretch,
                         StretchDirection::Both,
                         out);
                     return out;
@@ -424,8 +484,8 @@ void ResolveStarTracksFromInfinite(
     float availH) {
     std::vector<GridTrackSolved> rows;
     std::vector<GridTrackSolved> cols;
-    BuildGridTrackDefs(parent.layout.rowDefs, rows);
-    BuildGridTrackDefs(parent.layout.colDefs, cols);
+    BuildGridTrackDefs(parent.RowDefs(), rows);
+    BuildGridTrackDefs(parent.ColDefs(), cols);
 
     for (GridTrackSolved& r : rows) {
         if (r.unit == GridUnitType::Pixel) {
@@ -607,8 +667,8 @@ void ArrangeGridPanel(
     const Rect& innerRect) {
     std::vector<GridTrackSolved> rows;
     std::vector<GridTrackSolved> cols;
-    BuildGridTrackDefs(parent.layout.rowDefs, rows);
-    BuildGridTrackDefs(parent.layout.colDefs, cols);
+    BuildGridTrackDefs(parent.RowDefs(), rows);
+    BuildGridTrackDefs(parent.ColDefs(), cols);
 
     for (GridTrackSolved& r : rows) {
         if (r.unit == GridUnitType::Pixel) {
@@ -1388,6 +1448,32 @@ Size MeasureNode(VisualWorld& world, VisualNodeId id, Size availSize) {
     const float padH = std::max(0.0f, node->layout.padding.left) + std::max(0.0f, node->layout.padding.right);
     const float padV = std::max(0.0f, node->layout.padding.top) + std::max(0.0f, node->layout.padding.bottom);
 
+    const bool hasLayoutTx = !node->layout.layoutTransform2D.IsIdentity();
+    float localAvailOuterW = availSize.width;
+    float localAvailOuterH = availSize.height;
+    Matrix2D layoutTxLin = Matrix2D::Identity();
+    if (hasLayoutTx) {
+        layoutTxLin = ComputeLayoutTransformLinearMatrix(node->layout.layoutTransform2D);
+        const float outerBoxAvailW = std::isfinite(availSize.width)
+            ? std::max(0.0f, availSize.width - marginH)
+            : kInf;
+        const float outerBoxAvailH = std::isfinite(availSize.height)
+            ? std::max(0.0f, availSize.height - marginV)
+            : kInf;
+        float invLocalW = kInf;
+        float invLocalH = kInf;
+        InverseBoxConstraintUnderLayoutTransform(
+            layoutTxLin,
+            outerBoxAvailW,
+            outerBoxAvailH,
+            outerBoxAvailW,
+            outerBoxAvailH,
+            invLocalW,
+            invLocalH);
+        localAvailOuterW = std::isfinite(invLocalW) ? (invLocalW + marginH) : kInf;
+        localAvailOuterH = std::isfinite(invLocalH) ? (invLocalH + marginV) : kInf;
+    }
+
     float minW = 0.0f, maxW = kInf, innerAvailW = kInf;
     float minH = 0.0f, maxH = kInf, innerAvailH = kInf;
     ComputeAxisConstraint(
@@ -1396,7 +1482,7 @@ Size MeasureNode(VisualWorld& world, VisualNodeId id, Size availSize) {
         node->layout.maxWidth,
         padH,
         marginH,
-        availSize.width,
+        localAvailOuterW,
         true,
         minW,
         maxW,
@@ -1407,7 +1493,7 @@ Size MeasureNode(VisualWorld& world, VisualNodeId id, Size availSize) {
         node->layout.maxHeight,
         padV,
         marginV,
-        availSize.height,
+        localAvailOuterH,
         true,
         minH,
         maxH,
@@ -1422,10 +1508,20 @@ Size MeasureNode(VisualWorld& world, VisualNodeId id, Size availSize) {
 
     const float desiredBoxW = std::clamp(contentDesired.width + padH, minW, maxW);
     const float desiredBoxH = std::clamp(contentDesired.height + padV, minH, maxH);
+    node->layout.untransformedDesiredBox = Size{
+        std::isfinite(desiredBoxW) ? desiredBoxW : 0.0f,
+        std::isfinite(desiredBoxH) ? desiredBoxH : 0.0f};
+
+    float finalBoxW = desiredBoxW;
+    float finalBoxH = desiredBoxH;
+    if (hasLayoutTx && std::isfinite(desiredBoxW) && std::isfinite(desiredBoxH)) {
+        finalBoxW = std::fabs(layoutTxLin.m00) * desiredBoxW + std::fabs(layoutTxLin.m01) * desiredBoxH;
+        finalBoxH = std::fabs(layoutTxLin.m10) * desiredBoxW + std::fabs(layoutTxLin.m11) * desiredBoxH;
+    }
 
     node->layout.desiredSize = Size{
-        std::max(0.0f, std::isfinite(desiredBoxW) ? (desiredBoxW + marginH) : marginH),
-        std::max(0.0f, std::isfinite(desiredBoxH) ? (desiredBoxH + marginV) : marginV)};
+        std::max(0.0f, std::isfinite(finalBoxW) ? (finalBoxW + marginH) : marginH),
+        std::max(0.0f, std::isfinite(finalBoxH) ? (finalBoxH + marginV) : marginV)};
     node->layout.lastMeasureConstraint = availSize;
     node->layout.hasValidMeasure = true;
     node->layout.hasValidArrange = false;
@@ -1454,6 +1550,7 @@ void ArrangeNode(
         node->layout.hasValidArrange = true;
         if (rectChanged) {
             node->dirtyFlags = static_cast<std::uint8_t>(node->dirtyFlags | VisualDirty_Transform | VisualDirty_Visual);
+            world.MarkStructureDirty();
         }
         return;
     }
@@ -1488,6 +1585,7 @@ void ArrangeNode(
         node->layout.hasValidArrange = true;
         if (rectChanged) {
             node->dirtyFlags = static_cast<std::uint8_t>(node->dirtyFlags | VisualDirty_Transform | VisualDirty_Visual);
+            world.MarkStructureDirty();
         }
         customArrange(world, id, finalSlot);
         return;
@@ -1508,14 +1606,34 @@ void ArrangeNode(
     const float minH = std::max(0.0f, std::isfinite(node->layout.minHeight) ? node->layout.minHeight : 0.0f);
     const float maxH = std::max(minH, (std::isnan(node->layout.maxHeight) || node->layout.maxHeight < 0.0f) ? kInf : node->layout.maxHeight);
 
-    const float desiredContentW = std::max(0.0f, node->layout.desiredSize.width - marginH);
-    const float desiredContentH = std::max(0.0f, node->layout.desiredSize.height - marginV);
+    const bool hasLayoutTx = !node->layout.layoutTransform2D.IsIdentity();
+    const float desiredContentW = hasLayoutTx
+        ? std::max(0.0f, node->layout.untransformedDesiredBox.width)
+        : std::max(0.0f, node->layout.desiredSize.width - marginH);
+    const float desiredContentH = hasLayoutTx
+        ? std::max(0.0f, node->layout.untransformedDesiredBox.height)
+        : std::max(0.0f, node->layout.desiredSize.height - marginV);
+
+    Matrix2D layoutTxLin = Matrix2D::Identity();
+    float stretchBoxW = availBoxW;
+    float stretchBoxH = availBoxH;
+    if (hasLayoutTx) {
+        layoutTxLin = ComputeLayoutTransformLinearMatrix(node->layout.layoutTransform2D);
+        InverseBoxConstraintUnderLayoutTransform(
+            layoutTxLin,
+            availBoxW,
+            availBoxH,
+            desiredContentW,
+            desiredContentH,
+            stretchBoxW,
+            stretchBoxH);
+    }
 
     float targetW = 0.0f;
     if (std::isfinite(node->layout.width) && node->layout.width >= 0.0f) {
         targetW = std::clamp(node->layout.width, minW, maxW);
     } else if (node->layout.hAlign == HorizontalAlignment::Stretch) {
-        targetW = std::clamp(availBoxW, minW, maxW);
+        targetW = std::clamp(stretchBoxW, minW, maxW);
     } else {
         targetW = std::clamp(desiredContentW, minW, maxW);
     }
@@ -1524,10 +1642,17 @@ void ArrangeNode(
     if (std::isfinite(node->layout.height) && node->layout.height >= 0.0f) {
         targetH = std::clamp(node->layout.height, minH, maxH);
     } else if (node->layout.vAlign == VerticalAlignment::Stretch) {
-        targetH = std::clamp(availBoxH, minH, maxH);
+        targetH = std::clamp(stretchBoxH, minH, maxH);
     } else {
         targetH = std::clamp(desiredContentH, minH, maxH);
     }
+
+    const float arrangedBoxW = hasLayoutTx
+        ? (std::fabs(layoutTxLin.m00) * targetW + std::fabs(layoutTxLin.m01) * targetH)
+        : targetW;
+    const float arrangedBoxH = hasLayoutTx
+        ? (std::fabs(layoutTxLin.m10) * targetW + std::fabs(layoutTxLin.m11) * targetH)
+        : targetH;
 
     float posX = finalSlot.x + mL;
     switch (node->layout.hAlign) {
@@ -1536,10 +1661,10 @@ void ArrangeNode(
             break;
         case HorizontalAlignment::Center:
         case HorizontalAlignment::Stretch:
-            posX = finalSlot.x + mL + (availBoxW - targetW) * 0.5f;
+            posX = finalSlot.x + mL + (availBoxW - arrangedBoxW) * 0.5f;
             break;
         case HorizontalAlignment::Right:
-            posX = finalSlot.x + mL + (availBoxW - targetW);
+            posX = finalSlot.x + mL + (availBoxW - arrangedBoxW);
             break;
     }
 
@@ -1550,10 +1675,10 @@ void ArrangeNode(
             break;
         case VerticalAlignment::Center:
         case VerticalAlignment::Stretch:
-            posY = finalSlot.y + mT + (availBoxH - targetH) * 0.5f;
+            posY = finalSlot.y + mT + (availBoxH - arrangedBoxH) * 0.5f;
             break;
         case VerticalAlignment::Bottom:
-            posY = finalSlot.y + mT + (availBoxH - targetH);
+            posY = finalSlot.y + mT + (availBoxH - arrangedBoxH);
             break;
     }
 
@@ -1564,6 +1689,7 @@ void ArrangeNode(
     node->layout.hasValidArrange = true;
     if (rectChanged) {
         node->dirtyFlags = static_cast<std::uint8_t>(node->dirtyFlags | VisualDirty_Transform | VisualDirty_Visual);
+        world.MarkStructureDirty();
     }
 
     const float pL = std::max(0.0f, node->layout.padding.left);
@@ -1593,13 +1719,31 @@ void ArrangeNode(
                        .AroundPivot(node.layout.viewboxOriginX, node.layout.viewboxOriginY);
     }
 
+    const bool hasLayoutTx = !node.layout.layoutTransform2D.IsIdentity();
+    Matrix2D layoutTxM = Matrix2D::Identity();
+    float boxW = rect.width;
+    float boxH = rect.height;
+    if (hasLayoutTx) {
+        const Matrix2D lLin = ComputeLayoutTransformLinearMatrix(node.layout.layoutTransform2D);
+        const float minRelX = std::min(0.0f, lLin.m00 * rect.width) + std::min(0.0f, lLin.m01 * rect.height);
+        const float minRelY = std::min(0.0f, lLin.m10 * rect.width) + std::min(0.0f, lLin.m11 * rect.height);
+        boxW = std::fabs(lLin.m00) * rect.width + std::fabs(lLin.m01) * rect.height;
+        boxH = std::fabs(lLin.m10) * rect.width + std::fabs(lLin.m11) * rect.height;
+        layoutTxM = lLin;
+        layoutTxM.tx = rect.x - minRelX - (lLin.m00 * rect.x + lLin.m01 * rect.y);
+        layoutTxM.ty = rect.y - minRelY - (lLin.m10 * rect.x + lLin.m11 * rect.y);
+    }
+
     const bool hasT2 =
         t.tx != 0.0f || t.ty != 0.0f ||
         std::fabs(t.sx - 1.0f) > 1e-6f || std::fabs(t.sy - 1.0f) > 1e-6f ||
         std::fabs(t.rotDeg) > 1e-6f ||
         std::fabs(t.skewX) > 1e-6f || std::fabs(t.skewY) > 1e-6f;
     if (!hasT2) {
-        return viewboxM;
+        if (!hasLayoutTx) {
+            return viewboxM;
+        }
+        return hasViewboxScale ? Matrix2D::Multiply(viewboxM, layoutTxM) : layoutTxM;
     }
 
     Matrix2D localM = Matrix2D::Identity();
@@ -1612,11 +1756,14 @@ void ArrangeNode(
     if (std::fabs(t.rotDeg) > 1e-6f) {
         localM = Matrix2D::Multiply(Matrix2D::Rotation(t.rotDeg), localM);
     }
-    const float pivotX = rect.x + rect.width * t.originX;
-    const float pivotY = rect.y + rect.height * t.originY;
+    const float pivotX = rect.x + boxW * t.originX;
+    const float pivotY = rect.y + boxH * t.originY;
     localM = localM.AroundPivot(pivotX, pivotY);
     localM.tx += t.tx;
     localM.ty += t.ty;
+    if (hasLayoutTx) {
+        localM = Matrix2D::Multiply(localM, layoutTxM);
+    }
     return hasViewboxScale ? Matrix2D::Multiply(viewboxM, localM) : localM;
 }
 
@@ -1646,7 +1793,7 @@ void UpdateWorldTransformsRecursive(
         std::fabs(prevWorld2D.tx - world2D.tx) > 1e-5f ||
         std::fabs(prevWorld2D.ty - world2D.ty) > 1e-5f;
 
-    const VisualTransform3D& t3 = node->transform3D;
+    const VisualTransform3D& t3 = node->Transform3D();
     const bool hasLocal3D = t3.enabled && (
         std::fabs(t3.rx) > 1e-6f || std::fabs(t3.ry) > 1e-6f || std::fabs(t3.rz) > 1e-6f ||
         std::fabs(t3.tx) > 1e-6f || std::fabs(t3.ty) > 1e-6f || std::fabs(t3.tz) > 1e-6f ||
@@ -1682,18 +1829,19 @@ void UpdateWorldTransformsRecursive(
             nextWorld3D = base3D;
         }
         for (int mi = 0; mi < 16; ++mi) {
-            if (std::fabs(node->layout.worldMatrix3D.m[mi] - nextWorld3D.m[mi]) > 1e-5f) {
+            if (std::fabs(node->WorldMatrix3D().m[mi] - nextWorld3D.m[mi]) > 1e-5f) {
                 transformChanged = true;
                 break;
             }
         }
-        node->layout.worldMatrix3D = nextWorld3D;
+        node->EnsureExtras().worldMatrix3D = nextWorld3D;
     } else {
-        node->layout.worldMatrix3D = Matrix4x4{};
+        if (node->extras) node->extras->worldMatrix3D = Matrix4x4{};
     }
 
     if (transformChanged) {
         node->dirtyFlags = static_cast<std::uint8_t>(node->dirtyFlags | VisualDirty_Visual);
+        world.MarkStructureDirty();
     }
     node->dirtyFlags = static_cast<std::uint8_t>(node->dirtyFlags & ~VisualDirty_Transform);
 
@@ -1727,6 +1875,7 @@ void VisualWorld::UpdateLayout(float viewportWidth, float viewportHeight) {
         rootNode->layout.hasValidMeasure = false;
         rootNode->layout.hasValidArrange = false;
         rootNode->dirtyFlags = static_cast<std::uint8_t>(rootNode->dirtyFlags | VisualDirty_Layout);
+        MarkStructureDirty();
         lastViewportSize_ = viewportAvail;
         lastLaidOutRoot_ = rootId_;
     }
@@ -1741,13 +1890,48 @@ void VisualWorld::UpdateLayout(float viewportWidth, float viewportHeight) {
         bucket.clear();
     }
 
+    auto ensureMeasureArrangeBuckets = [&](std::size_t depth) {
+        const std::size_t needed = depth + 1u;
+        if (measureDepthBuckets_.size() < needed) {
+            measureDepthBuckets_.resize(needed);
+        }
+        if (arrangeDepthBuckets_.size() < needed) {
+            arrangeDepthBuckets_.resize(needed);
+        }
+    };
+    auto ensureTransformBuckets = [&](std::size_t depth) {
+        const std::size_t needed = depth + 1u;
+        if (transformDepthBuckets_.size() < needed) {
+            transformDepthBuckets_.resize(needed);
+        }
+    };
+
     const std::size_t slots = ArenaSlotCount();
     for (std::size_t s = 0u; s < slots; ++s) {
         VisualNode* n = NodeAtSlot(s);
         if (!n) {
             continue;
         }
-        const std::uint8_t depth = std::min<std::uint8_t>(n->layout.treeDepth, 63u);
+        const bool customChangedLayoutTx =
+            n->layout.hasLayoutTransform
+                ? (std::fabs(n->customScalars[1] - n->layout.layoutTransform2D.sx) > 1e-6f ||
+                   std::fabs(n->customScalars[2] - n->layout.layoutTransform2D.sy) > 1e-6f ||
+                   std::fabs(n->customScalars[3] - n->layout.layoutTransform2D.rotDeg) > 1e-6f)
+                : (std::fabs(n->customScalars[1] - 1.0f) > 1e-6f ||
+                   std::fabs(n->customScalars[2] - 1.0f) > 1e-6f ||
+                   std::fabs(n->customScalars[3]) > 1e-6f);
+        if (customChangedLayoutTx) {
+            n->layout.layoutTransform2D.sx = std::isfinite(n->customScalars[1]) ? n->customScalars[1] : 1.0f;
+            n->layout.layoutTransform2D.sy = std::isfinite(n->customScalars[2]) ? n->customScalars[2] : 1.0f;
+            n->layout.layoutTransform2D.rotDeg = std::isfinite(n->customScalars[3]) ? n->customScalars[3] : 0.0f;
+            n->layout.hasLayoutTransform = true;
+            n->layout.hasValidMeasure = false;
+            n->layout.hasValidArrange = false;
+            n->dirtyFlags = static_cast<std::uint8_t>(
+                n->dirtyFlags | VisualDirty_Layout | VisualDirty_Transform | VisualDirty_Visual);
+            MarkStructureDirty();
+        }
+        const std::uint16_t depth = n->layout.treeDepth;
         if ((n->dirtyFlags & (VisualDirty_Layout | VisualDirty_Structure)) != 0u) {
             if ((n->dirtyFlags & VisualDirty_Structure) != 0u) {
                 RefreshSubtreeDepths(n->id, depth);
@@ -1760,7 +1944,8 @@ void VisualWorld::UpdateLayout(float viewportWidth, float viewportHeight) {
                     cur->layout.hasValidArrange = false;
                     cur->dirtyFlags = static_cast<std::uint8_t>(cur->dirtyFlags | VisualDirty_Layout);
                     if (!cur->parent.IsValid() || !std::isnan(cur->layout.lastMeasureConstraint.width)) {
-                        const std::uint8_t cd = std::min<std::uint8_t>(cur->layout.treeDepth, 63u);
+                        const std::uint16_t cd = cur->layout.treeDepth;
+                        ensureMeasureArrangeBuckets(cd);
                         measureDepthBuckets_[cd].push_back(cur->id);
                         arrangeDepthBuckets_[cd].push_back(cur->id);
                         break;
@@ -1770,26 +1955,28 @@ void VisualWorld::UpdateLayout(float viewportWidth, float viewportHeight) {
             } else {
                 n->layout.hasValidMeasure = false;
                 n->layout.hasValidArrange = false;
+                ensureMeasureArrangeBuckets(depth);
                 measureDepthBuckets_[depth].push_back(n->id);
                 arrangeDepthBuckets_[depth].push_back(n->id);
             }
         }
         if ((n->dirtyFlags & VisualDirty_Transform) != 0u) {
+            ensureTransformBuckets(depth);
             transformDepthBuckets_[depth].push_back(n->id);
         }
     }
 
-    // Phase 1: 64-level depth-bucket bottom-up Measure (depth 63 -> 0)
+    // Phase 1: Dynamic depth-bucket bottom-up Measure (maxDepth -> 0)
     // Only re-measures dirty nodes with cached constraints and bubbles upward only when desiredSize actually changes.
     for (std::size_t pass = 0u; pass < 4u; ++pass) {
         bool anyMeasuredInPass = false;
-        for (int d = 63; d >= 0; --d) {
-            auto& bucket = measureDepthBuckets_[static_cast<std::size_t>(d)];
-            if (bucket.empty()) {
+        for (std::ptrdiff_t d = static_cast<std::ptrdiff_t>(measureDepthBuckets_.size()) - 1; d >= 0; --d) {
+            const std::size_t ud = static_cast<std::size_t>(d);
+            if (measureDepthBuckets_[ud].empty()) {
                 continue;
             }
-            for (std::size_t i = 0u; i < bucket.size(); ++i) {
-                const VisualNodeId nid = bucket[i];
+            for (std::size_t i = 0u; i < measureDepthBuckets_[ud].size(); ++i) {
+                const VisualNodeId nid = measureDepthBuckets_[ud][i];
                 VisualNode* node = GetNode(nid);
                 if (!node || node->layout.hasValidMeasure) {
                     continue;
@@ -1804,7 +1991,8 @@ void VisualWorld::UpdateLayout(float viewportWidth, float viewportHeight) {
                 const Size newDesired = MeasureNode(*this, nid, constraint);
                 anyMeasuredInPass = true;
 
-                arrangeDepthBuckets_[static_cast<std::size_t>(d)].push_back(nid);
+                ensureMeasureArrangeBuckets(ud);
+                arrangeDepthBuckets_[ud].push_back(nid);
                 if (nid != rootId_ && node->parent.IsValid() &&
                     (!SameFloatOrBothNaN(prevDesired.width, newDesired.width) ||
                      !SameFloatOrBothNaN(prevDesired.height, newDesired.height))) {
@@ -1812,22 +2000,23 @@ void VisualWorld::UpdateLayout(float viewportWidth, float viewportHeight) {
                         p->layout.hasValidMeasure = false;
                         p->layout.hasValidArrange = false;
                         p->dirtyFlags = static_cast<std::uint8_t>(p->dirtyFlags | VisualDirty_Layout);
-                        const std::uint8_t pd = std::min<std::uint8_t>(p->layout.treeDepth, 63u);
+                        const std::uint16_t pd = p->layout.treeDepth;
+                        ensureMeasureArrangeBuckets(pd);
                         measureDepthBuckets_[pd].push_back(p->id);
                         arrangeDepthBuckets_[pd].push_back(p->id);
                     }
                 }
             }
-            bucket.clear();
+            measureDepthBuckets_[ud].clear();
         }
         if (!anyMeasuredInPass) {
             break;
         }
     }
 
-    // Phase 2: 64-level depth-bucket top-down Arrange (depth 0 -> 63)
-    for (int d = 0; d < 64; ++d) {
-        auto& bucket = arrangeDepthBuckets_[static_cast<std::size_t>(d)];
+    // Phase 2: Dynamic depth-bucket top-down Arrange (0 -> maxDepth)
+    for (std::size_t d = 0u; d < arrangeDepthBuckets_.size(); ++d) {
+        auto& bucket = arrangeDepthBuckets_[d];
         for (const VisualNodeId nid : bucket) {
             VisualNode* node = GetNode(nid);
             if (!node || node->layout.hasValidArrange) {
@@ -1851,16 +2040,17 @@ void VisualWorld::UpdateLayout(float viewportWidth, float viewportHeight) {
                 parentIsVb ? node->layout.viewboxOriginX : 0.0f,
                 parentIsVb ? node->layout.viewboxOriginY : 0.0f);
             if ((node->dirtyFlags & VisualDirty_Transform) != 0u) {
-                const std::uint8_t td = std::min<std::uint8_t>(node->layout.treeDepth, 63u);
+                const std::uint16_t td = node->layout.treeDepth;
+                ensureTransformBuckets(td);
                 transformDepthBuckets_[td].push_back(nid);
             }
         }
         bucket.clear();
     }
 
-    // Phase 3: Incremental top-down 2D + 3D world transform propagation (depth 0 -> 63)
-    for (int d = 0; d < 64; ++d) {
-        auto& bucket = transformDepthBuckets_[static_cast<std::size_t>(d)];
+    // Phase 3: Incremental top-down 2D + 3D world transform propagation (0 -> maxDepth)
+    for (std::size_t d = 0u; d < transformDepthBuckets_.size(); ++d) {
+        auto& bucket = transformDepthBuckets_[d];
         for (const VisualNodeId nid : bucket) {
             VisualNode* node = GetNode(nid);
             if (!node || (node->dirtyFlags & VisualDirty_Transform) == 0u) {
@@ -1872,7 +2062,7 @@ void VisualWorld::UpdateLayout(float viewportWidth, float viewportHeight) {
             if (nid != rootId_ && node->parent.IsValid()) {
                 if (const VisualNode* p = GetNode(node->parent)) {
                     pWorld2D = p->layout.worldTransform;
-                    pWorld3D = p->layout.worldMatrix3D;
+                    pWorld3D = p->WorldMatrix3D();
                     pHas3D = p->layout.hasPerspective3D;
                 }
             }
@@ -1894,7 +2084,7 @@ void VisualWorld::UpdateLayout(float viewportWidth, float viewportHeight) {
             stillVisualDirty = true;
         }
     }
-    anyDirty_ = stillVisualDirty;
+    anyDirty_ = stillVisualDirty || structureDirty_;
 }
 
 } // namespace aero

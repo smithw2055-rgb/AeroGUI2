@@ -6,6 +6,7 @@
 #include <condition_variable>
 #include <cstring>
 #include <functional>
+#include <memory>
 #include <mutex>
 #include <thread>
 
@@ -246,7 +247,8 @@ void BlendPremulOver(
     float premulR,
     float premulG,
     float premulB,
-    float srcAlpha01) noexcept {
+    float srcAlpha01,
+    BlendingMode blendMode = BlendingMode::Normal) noexcept {
     const float a = std::clamp(srcAlpha01, 0.0f, 1.0f);
     if (a <= 0.001f) {
         return;
@@ -259,27 +261,101 @@ void BlendPremulOver(
     float* dst = layer.premulRgba.data() +
         (static_cast<std::size_t>(ly) * static_cast<std::size_t>(layer.width) + static_cast<std::size_t>(lx)) * 4u;
     const float invA = 1.0f - a;
-    dst[0] = premulR + dst[0] * invA;
-    dst[1] = premulG + dst[1] * invA;
-    dst[2] = premulB + dst[2] * invA;
+    const float pr = std::clamp(premulR, 0.0f, 1.0f);
+    const float pg = std::clamp(premulG, 0.0f, 1.0f);
+    const float pb = std::clamp(premulB, 0.0f, 1.0f);
+    switch (blendMode) {
+        case BlendingMode::Additive:
+            dst[0] = std::clamp(pr + dst[0], 0.0f, 1.0f);
+            dst[1] = std::clamp(pg + dst[1], 0.0f, 1.0f);
+            dst[2] = std::clamp(pb + dst[2], 0.0f, 1.0f);
+            break;
+        case BlendingMode::Multiply:
+            dst[0] = std::clamp(pr * dst[0] + dst[0] * invA, 0.0f, 1.0f);
+            dst[1] = std::clamp(pg * dst[1] + dst[1] * invA, 0.0f, 1.0f);
+            dst[2] = std::clamp(pb * dst[2] + dst[2] * invA, 0.0f, 1.0f);
+            break;
+        case BlendingMode::Screen:
+            dst[0] = std::clamp(pr + dst[0] * (1.0f - pr), 0.0f, 1.0f);
+            dst[1] = std::clamp(pg + dst[1] * (1.0f - pg), 0.0f, 1.0f);
+            dst[2] = std::clamp(pb + dst[2] * (1.0f - pb), 0.0f, 1.0f);
+            break;
+        case BlendingMode::Normal:
+        default:
+            dst[0] = pr + dst[0] * invA;
+            dst[1] = pg + dst[1] * invA;
+            dst[2] = pb + dst[2] * invA;
+            break;
+    }
     dst[3] = a + dst[3] * invA;
 }
 
+void BlendPremulOverRgba8(
+    std::uint8_t* dstRgba,
+    float premulR,
+    float premulG,
+    float premulB,
+    float srcAlpha01,
+    BlendingMode blendMode = BlendingMode::Normal) noexcept {
+    const float a = std::clamp(srcAlpha01, 0.0f, 1.0f);
+    if (a <= 0.001f) {
+        return;
+    }
+    const float invA = 1.0f - a;
+    const float pr = std::clamp(premulR, 0.0f, 1.0f);
+    const float pg = std::clamp(premulG, 0.0f, 1.0f);
+    const float pb = std::clamp(premulB, 0.0f, 1.0f);
+    const float dr = static_cast<float>(dstRgba[0]) * (1.0f / 255.0f);
+    const float dg = static_cast<float>(dstRgba[1]) * (1.0f / 255.0f);
+    const float db = static_cast<float>(dstRgba[2]) * (1.0f / 255.0f);
+    const float da = static_cast<float>(dstRgba[3]) * (1.0f / 255.0f);
+    float outR = pr + dr * invA;
+    float outG = pg + dg * invA;
+    float outB = pb + db * invA;
+    switch (blendMode) {
+        case BlendingMode::Additive:
+            outR = pr + dr;
+            outG = pg + dg;
+            outB = pb + db;
+            break;
+        case BlendingMode::Multiply:
+            outR = pr * dr + dr * invA;
+            outG = pg * dg + dg * invA;
+            outB = pb * db + db * invA;
+            break;
+        case BlendingMode::Screen:
+            outR = pr + dr * (1.0f - pr);
+            outG = pg + dg * (1.0f - pg);
+            outB = pb + db * (1.0f - pb);
+            break;
+        case BlendingMode::Normal:
+        default:
+            break;
+    }
+    const float outA = a + da * invA;
+    dstRgba[0] = static_cast<std::uint8_t>(std::clamp(outR * 255.0f + 0.5f, 0.0f, 255.0f));
+    dstRgba[1] = static_cast<std::uint8_t>(std::clamp(outG * 255.0f + 0.5f, 0.0f, 255.0f));
+    dstRgba[2] = static_cast<std::uint8_t>(std::clamp(outB * 255.0f + 0.5f, 0.0f, 255.0f));
+    dstRgba[3] = static_cast<std::uint8_t>(std::clamp(outA * 255.0f + 0.5f, 0.0f, 255.0f));
+}
+
 [[nodiscard]] Color SampleTextureSlotBilinear(
-    const TextureSlotBuffer& slot,
+    std::uint32_t width,
+    std::uint32_t height,
+    const std::vector<std::uint8_t>& rgbaPixels,
     float u,
     float v) noexcept {
-    if (slot.width == 0u || slot.height == 0u ||
-        slot.rgbaPixels.size() < static_cast<std::size_t>(slot.width) * slot.height * 4u) {
+    if (width == 0u || height == 0u ||
+        rgbaPixels.size() < static_cast<std::size_t>(width) * height * 4u) {
         return Color{0.0f, 0.0f, 0.0f, 0.0f};
     }
     const float clampedU = std::clamp(u, 0.0f, 1.0f);
     const float clampedV = std::clamp(v, 0.0f, 1.0f);
-    const float texX = clampedU * static_cast<float>(slot.width) - 0.5f;
-    const float texY = clampedV * static_cast<float>(slot.height) - 0.5f;
+    const float texX = clampedU * static_cast<float>(width) - 0.5f;
+    const float texY = clampedV * static_cast<float>(height) - 0.5f;
 
-    const int maxX = static_cast<int>(slot.width) - 1;
-    const int maxY = static_cast<int>(slot.height) - 1;
+    const int maxX = static_cast<int>(width) - 1;
+    const int maxY = static_cast<int>(height) - 1;
     const float flX = std::floor(texX);
     const float flY = std::floor(texY);
     const int x0 = std::clamp(static_cast<int>(flX), 0, maxX);
@@ -289,11 +365,11 @@ void BlendPremulOver(
     const float fx = std::clamp(texX - flX, 0.0f, 1.0f);
     const float fy = std::clamp(texY - flY, 0.0f, 1.0f);
 
-    const std::size_t stride = static_cast<std::size_t>(slot.width) * 4u;
-    const std::uint8_t* p00 = slot.rgbaPixels.data() + static_cast<std::size_t>(y0) * stride + static_cast<std::size_t>(x0) * 4u;
-    const std::uint8_t* p10 = slot.rgbaPixels.data() + static_cast<std::size_t>(y0) * stride + static_cast<std::size_t>(x1) * 4u;
-    const std::uint8_t* p01 = slot.rgbaPixels.data() + static_cast<std::size_t>(y1) * stride + static_cast<std::size_t>(x0) * 4u;
-    const std::uint8_t* p11 = slot.rgbaPixels.data() + static_cast<std::size_t>(y1) * stride + static_cast<std::size_t>(x1) * 4u;
+    const std::size_t stride = static_cast<std::size_t>(width) * 4u;
+    const std::uint8_t* p00 = rgbaPixels.data() + static_cast<std::size_t>(y0) * stride + static_cast<std::size_t>(x0) * 4u;
+    const std::uint8_t* p10 = rgbaPixels.data() + static_cast<std::size_t>(y0) * stride + static_cast<std::size_t>(x1) * 4u;
+    const std::uint8_t* p01 = rgbaPixels.data() + static_cast<std::size_t>(y1) * stride + static_cast<std::size_t>(x0) * 4u;
+    const std::uint8_t* p11 = rgbaPixels.data() + static_cast<std::size_t>(y1) * stride + static_cast<std::size_t>(x1) * 4u;
 
     constexpr float kInv255 = 1.0f / 255.0f;
     auto bilerpCh = [&](std::size_t ch) noexcept -> float {
@@ -907,7 +983,9 @@ void RasterizeSingleNode(
         : ImageAtlas::Instance();
     const std::uint32_t boundTextureId = page.header.reserved[0];
     bool resolvedNodeTex = false;
-    const TextureSlotBuffer* cachedNodeTexSlot = nullptr;
+    std::uint32_t cachedNodeTexW = 0u;
+    std::uint32_t cachedNodeTexH = 0u;
+    std::shared_ptr<const std::vector<std::uint8_t>> cachedNodeTexPixels;
     bool resolvedNodeMtsdf = false;
     const AxbMtsdfPathEntry* cachedNodeMtsdf = nullptr;
 
@@ -958,11 +1036,12 @@ void RasterizeSingleNode(
         const float baseAlpha = static_cast<float>(a8) / 255.0f;
         const AeroPrimType prim = DecodeVertexPrimType(v0.primType);
         if (prim == AeroPrimType::TexturedQuad && !resolvedNodeTex) {
-            cachedNodeTexSlot = imageAtlasRef.GetTextureSlot(boundTextureId);
+            (void)imageAtlasRef.TryGetTextureSlotSnapshot(
+                boundTextureId, cachedNodeTexW, cachedNodeTexH, cachedNodeTexPixels);
             resolvedNodeTex = true;
         }
-        const TextureSlotBuffer* boundTexSlot = cachedNodeTexSlot;
-        const bool hasBoundTexture = (boundTexSlot != nullptr);
+        const bool hasBoundTexture =
+            (cachedNodeTexPixels != nullptr && cachedNodeTexW > 0u && cachedNodeTexH > 0u);
 
         float e1x = v1.x - v0.x;
         float e1y = v1.y - v0.y;
@@ -1425,6 +1504,7 @@ void RasterizeSingleNode(
                 std::uint8_t shadeR = r8;
                 std::uint8_t shadeG = g8;
                 std::uint8_t shadeB = b8;
+                float pixelBaseAlpha = baseAlpha;
                 float coverage = 1.0f;
                 if (prim == AeroPrimType::SdfRoundedRect) {
                     const float halfW = quadHalfW;
@@ -1677,6 +1757,21 @@ void RasterizeSingleNode(
                         vSpan,
                         perpQuadW,
                         perpQuadH);
+                    if (!uniformVertexColor && coverage > 0.002f) {
+                        auto bilerpVertByte = [&](std::uint32_t shift) noexcept -> float {
+                            const float c0 = static_cast<float>((v0.rgba >> shift) & 0xFFu);
+                            const float c1 = static_cast<float>((v1.rgba >> shift) & 0xFFu);
+                            const float c2 = static_cast<float>((v2.rgba >> shift) & 0xFFu);
+                            const float c3 = static_cast<float>((v3.rgba >> shift) & 0xFFu);
+                            const float top = c0 + su * (c1 - c0);
+                            const float bot = c3 + su * (c2 - c3);
+                            return top + sv * (bot - top);
+                        };
+                        shadeR = static_cast<std::uint8_t>(std::clamp(bilerpVertByte(0u) + 0.5f, 0.0f, 255.0f));
+                        shadeG = static_cast<std::uint8_t>(std::clamp(bilerpVertByte(8u) + 0.5f, 0.0f, 255.0f));
+                        shadeB = static_cast<std::uint8_t>(std::clamp(bilerpVertByte(16u) + 0.5f, 0.0f, 255.0f));
+                        pixelBaseAlpha = std::clamp(bilerpVertByte(24u) * (1.0f / 255.0f), 0.0f, 1.0f);
+                    }
                 } else if (prim == AeroPrimType::TexturedQuad) {
                     const float topU = v0.u + su * (v1.u - v0.u);
                     const float botU = v3.u + su * (v2.u - v3.u);
@@ -1687,7 +1782,7 @@ void RasterizeSingleNode(
                     const float vInterp = topV + sv * (botV - topV);
 
                     const Color texel = hasBoundTexture
-                        ? SampleTextureSlotBilinear(*boundTexSlot, uInterp, vInterp)
+                        ? SampleTextureSlotBilinear(cachedNodeTexW, cachedNodeTexH, *cachedNodeTexPixels, uInterp, vInterp)
                         : Color{1.0f, 1.0f, 1.0f, 1.0f};
 
                     float vertR = static_cast<float>(r8) * (1.0f / 255.0f);
@@ -1881,7 +1976,7 @@ void RasterizeSingleNode(
                          prim == AeroPrimType::SdfTextGlyph ||
                          prim == AeroPrimType::DynamicMesh) &&
                         ((v0.flags & AeroVertexFlag_PremultipliedAlpha) != 0u);
-                    const float effAlpha = std::clamp(baseAlpha * coverage, 0.0f, 1.0f);
+                    const float effAlpha = std::clamp(pixelBaseAlpha * coverage, 0.0f, 1.0f);
                     if (optPremulLayer) {
                         const float inv255 = 1.0f / 255.0f;
                         const float rgbScale = isPremulPrim ? (inv255 * coverage) : (inv255 * effAlpha);
@@ -1916,7 +2011,7 @@ void RasterizeSingleNode(
                     } else {
                         std::uint8_t* dst = outRgba8 +
                             (static_cast<std::size_t>(py) * viewportWidth + static_cast<std::size_t>(px)) * 4u;
-                        if (a8 == 255u && coverage >= 1.0f && nd->blendMode == BlendingMode::Normal) {
+                        if (a8 == 255u && uniformVertexColor && coverage >= 1.0f && nd->blendMode == BlendingMode::Normal) {
                             dst[0] = shadeR;
                             dst[1] = shadeG;
                             dst[2] = shadeB;
@@ -2234,19 +2329,11 @@ void RasterizeNodeSpanRecursive(
                                 continue;
                             }
                             if (optPremulLayer) {
-                                BlendPremulOver(*optPremulLayer, px, py, sp[0], sp[1], sp[2], pa);
+                                BlendPremulOver(*optPremulLayer, px, py, sp[0], sp[1], sp[2], pa, span.blendMode);
                             } else {
                                 std::uint8_t* dst = outRgba8 +
                                     (static_cast<std::size_t>(py) * viewportWidth + static_cast<std::size_t>(px)) * 4u;
-                                const float invA = 1.0f - pa;
-                                dst[0] = static_cast<std::uint8_t>(
-                                    std::clamp(sp[0] * 255.0f + static_cast<float>(dst[0]) * invA + 0.5f, 0.0f, 255.0f));
-                                dst[1] = static_cast<std::uint8_t>(
-                                    std::clamp(sp[1] * 255.0f + static_cast<float>(dst[1]) * invA + 0.5f, 0.0f, 255.0f));
-                                dst[2] = static_cast<std::uint8_t>(
-                                    std::clamp(sp[2] * 255.0f + static_cast<float>(dst[2]) * invA + 0.5f, 0.0f, 255.0f));
-                                dst[3] = static_cast<std::uint8_t>(
-                                    std::clamp(pa * 255.0f + static_cast<float>(dst[3]) * invA + 0.5f, 0.0f, 255.0f));
+                                BlendPremulOverRgba8(dst, sp[0], sp[1], sp[2], pa, span.blendMode);
                             }
                         }
                     }

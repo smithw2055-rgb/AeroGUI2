@@ -256,7 +256,7 @@ namespace {
     const Rect& r = node.layout.layoutRect;
     const Point untransformed{r.x + r.width * 0.5f, r.y + r.height * 0.5f};
     if (node.layout.hasPerspective3D) {
-        return node.layout.worldMatrix3D.ProjectPoint2D(untransformed);
+        return node.WorldMatrix3D().ProjectPoint2D(untransformed);
     }
     return node.layout.worldTransform.TransformPoint(untransformed);
 }

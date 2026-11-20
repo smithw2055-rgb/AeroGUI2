@@ -41,6 +41,8 @@ public class ButtonBase : ContentControl {
 
     public ButtonBase() : base() {
         Focusable = true;
+        HorizontalContentAlignment = HorizontalAlignment.Left;
+        VerticalContentAlignment = VerticalAlignment.Center;
     }
 
     public override string GetTypeName() { return "ButtonBase"; }
@@ -171,6 +173,7 @@ public class Button : ButtonBase {
     public bool IsCancel { get; set; }
 
     public Button() : base() {
+        HorizontalContentAlignment = HorizontalAlignment.Center;
         Background = new SolidColorBrush("#FF242B38");
         BorderBrush = new SolidColorBrush("#FF3B465C");
         BorderThickness = new Thickness(1.0f);
@@ -280,7 +283,10 @@ public class Hyperlink : ButtonBase {
     public override string GetTypeName() { return "Hyperlink"; }
 
     protected override void OnVisualStatePropertyChanged() {
-        Foreground = new SolidColorBrush(IsMouseOver ? "#FF93C5FD" : "#FF60A5FA");
+        base.OnVisualStatePropertyChanged();
+        if (Style == null && Template == null) {
+            Foreground = new SolidColorBrush(IsMouseOver ? "#FF93C5FD" : "#FF60A5FA");
+        }
     }
 
     protected override UIElement CreateDefaultTemplate() {
@@ -322,6 +328,10 @@ public class ToggleButton : ButtonBase {
         }
         if (ev == "Unchecked") {
             Unchecked += (object s, RoutedEventArgs e) => { if (sink != null) { sink.OnBehaviorEvent(s, e); } };
+            return true;
+        }
+        if (ev == "Indeterminate") {
+            Indeterminate += (object s, RoutedEventArgs e) => { if (sink != null) { sink.OnBehaviorEvent(s, e); } };
             return true;
         }
         return base.SubscribeBehaviorRoutedEvent(ev, sink);
@@ -412,7 +422,7 @@ public class CheckBox : ToggleButton {
     public CheckBox() : base() {
         Background = Brushes.Transparent();
         BorderThickness = new Thickness(0.0f);
-        Padding = new Thickness(2.0f);
+        Padding = new Thickness(0.0f);
         HorizontalContentAlignment = HorizontalAlignment.Left;
     }
     public CheckBox(string label, bool initialChecked = false) : this() {
@@ -425,15 +435,18 @@ public class CheckBox : ToggleButton {
     protected override void UpdateVisualCheckedState() {
         if (_box != null) {
             bool active = IsChecked || IsIndeterminate;
-            _box.Background = new SolidColorBrush(active ? "#FF3B82F6" : "#FF1C222D");
-            _box.BorderBrush = new SolidColorBrush(active ? "#FF60A5FA" : (IsMouseOver ? "#FF64748B" : "#FF475569"));
+            string bg = active
+                ? (IsMouseOver ? "#FF1C92E0" : "#FF1382CE")
+                : (IsMouseOver ? "#FF5D6369" : "#FF4E5358");
+            _box.Background = new SolidColorBrush(bg);
+            _box.BorderBrush = Brushes.Transparent();
         }
         if (_checkMark != null) {
             if (IsIndeterminate) {
-                _checkMark.Data = "M 4,9 H 14";
+                _checkMark.Data = "M 3.5,8.5 H 13.5";
                 _checkMark.Visibility = Visibility.Visible;
             } else if (IsChecked) {
-                _checkMark.Data = "M 3.5,9.5 L 7,13 L 14.5,5";
+                _checkMark.Data = "M 3.2,8.8 L 6.8,12.5 L 13.8,4.8";
                 _checkMark.Visibility = Visibility.Visible;
             } else {
                 _checkMark.Visibility = Visibility.Collapsed;
@@ -447,17 +460,17 @@ public class CheckBox : ToggleButton {
 
         _box = new Border();
         _box.Name = "PART_CheckBox";
-        _box.Width = 18.0f;
-        _box.Height = 18.0f;
-        _box.CornerRadius = new CornerRadius(4.0f);
-        _box.BorderThickness = new Thickness(1.5f);
+        _box.Width = 17.0f;
+        _box.Height = 17.0f;
+        _box.CornerRadius = new CornerRadius(2.0f);
+        _box.BorderThickness = new Thickness(0.0f);
         _box.VerticalAlignment = VerticalAlignment.Center;
 
-        _checkMark = new Path("M 3.5,9.5 L 7,13 L 14.5,5");
-        _checkMark.Width = 18.0f;
-        _checkMark.Height = 18.0f;
-        _checkMark.Stroke = Brushes.White();
-        _checkMark.StrokeThickness = 2.0f;
+        _checkMark = new Path("M 3.2,8.8 L 6.8,12.5 L 13.8,4.8");
+        _checkMark.Width = 17.0f;
+        _checkMark.Height = 17.0f;
+        _checkMark.Stroke = new SolidColorBrush("#FF181C20");
+        _checkMark.StrokeThickness = 2.1f;
         _checkMark.Stretch = Stretch.None;
         _box.Child = _checkMark;
 
@@ -484,7 +497,7 @@ public class RadioButton : ToggleButton {
     public RadioButton() : base() {
         Background = Brushes.Transparent();
         BorderThickness = new Thickness(0.0f);
-        Padding = new Thickness(2.0f);
+        Padding = new Thickness(0.0f);
         HorizontalContentAlignment = HorizontalAlignment.Left;
         RegisterInstance(this);
     }
@@ -537,8 +550,11 @@ public class RadioButton : ToggleButton {
 
     protected override void UpdateVisualCheckedState() {
         if (_ring != null) {
-            _ring.BorderBrush = new SolidColorBrush(IsChecked ? "#FF3B82F6" : (IsMouseOver ? "#FF64748B" : "#FF475569"));
-            _ring.Background = new SolidColorBrush("#FF1C222D");
+            _ring.BorderBrush = Brushes.Transparent();
+            string bg = IsChecked
+                ? (IsMouseOver ? "#FF1C92E0" : "#FF1382CE")
+                : (IsMouseOver ? "#FF5D6369" : "#FF4E5358");
+            _ring.Background = new SolidColorBrush(bg);
         }
         if (_dot != null) {
             _dot.Visibility = IsChecked ? Visibility.Visible : Visibility.Collapsed;
@@ -551,16 +567,16 @@ public class RadioButton : ToggleButton {
 
         _ring = new Border();
         _ring.Name = "PART_RadioRing";
-        _ring.Width = 18.0f;
-        _ring.Height = 18.0f;
-        _ring.CornerRadius = new CornerRadius(9.0f);
-        _ring.BorderThickness = new Thickness(1.5f);
+        _ring.Width = 17.0f;
+        _ring.Height = 17.0f;
+        _ring.CornerRadius = new CornerRadius(8.5f);
+        _ring.BorderThickness = new Thickness(0.0f);
         _ring.VerticalAlignment = VerticalAlignment.Center;
 
         _dot = new Ellipse();
-        _dot.Width = 8.0f;
-        _dot.Height = 8.0f;
-        _dot.Fill = new SolidColorBrush("#FF3B82F6");
+        _dot.Width = 7.0f;
+        _dot.Height = 7.0f;
+        _dot.Fill = new SolidColorBrush("#FF181C20");
         _dot.HorizontalAlignment = HorizontalAlignment.Center;
         _dot.VerticalAlignment = VerticalAlignment.Center;
         _ring.Child = _dot;
@@ -599,12 +615,18 @@ public class Thumb : Control {
     public event DragCompletedEventHandler DragCompleted;
 
     public Thumb() : base() {
-        Background = new SolidColorBrush("#FF475569");
-        CornerRadius = new CornerRadius(4.0f);
     }
 
     public override string GetTypeName() { return "Thumb"; }
     public bool IsDragging { get { return _isDragging; } }
+
+    protected override UIElement CreateDefaultTemplate() {
+        var b = new Border();
+        CornerRadius cr = CornerRadius;
+        b.Background = Background != null ? Background : new SolidColorBrush("#FF475569");
+        b.CornerRadius = cr.TopLeft > 0.0f ? cr : new CornerRadius(4.0f);
+        return b;
+    }
 
     private Point ToTrackPoint(float screenX, float screenY) {
         if (Parent != null && ParseUtil.IsValidHandle(Parent.__nativeHandle)) {
@@ -778,8 +800,8 @@ public class Track : FrameworkElement {
             if (_thumb != null) { RemoveChild(_thumb); }
             _thumb = value;
             if (value != null) {
-                value.HorizontalAlignment = HorizontalAlignment.Stretch;
-                value.VerticalAlignment = VerticalAlignment.Stretch;
+                if (ParseUtil.IsNaN(value.Width)) { value.HorizontalAlignment = HorizontalAlignment.Stretch; }
+                if (ParseUtil.IsNaN(value.Height)) { value.VerticalAlignment = VerticalAlignment.Stretch; }
                 AddChild(value);
             }
             UpdateTrackVisuals();
@@ -798,20 +820,68 @@ public class Track : FrameworkElement {
         float beforeFrac = (_orientation == Orientation.Vertical)
             ? (_isDirectionReversed ? frac : (1.0f - frac))
             : (_isDirectionReversed ? (1.0f - frac) : frac);
-        float thumbRatio = (_viewportSize > 0.0f)
-            ? ((span > 0.00001f) ? Math.Clampf(_viewportSize / (span + _viewportSize), 0.08f, 1.0f) : 1.0f)
-            : 0.25f;
-        float freeRatio = Math.Maxf(0.0f, 1.0f - thumbRatio);
-        float w0 = freeRatio * beforeFrac;
-        float w1 = thumbRatio;
-        float w2 = freeRatio * (1.0f - beforeFrac);
 
         Visual_GridClearDefs(__nativeHandle);
         int starUnit = EnumConvert.ToInt(GridUnitType.Star);
+        int autoUnit = EnumConvert.ToInt(GridUnitType.Auto);
+        int pxUnit = EnumConvert.ToInt(GridUnitType.Pixel);
+
+        if (_viewportSize <= 0.0f || ParseUtil.IsNaN(_viewportSize)) {
+            float w0 = beforeFrac;
+            float w2 = 1.0f - beforeFrac;
+            if (_decreaseRepeatButton != null) {
+                _decreaseRepeatButton.Visibility = w0 > 0.0001f ? Visibility.Visible : Visibility.Collapsed;
+            }
+            if (_increaseRepeatButton != null) {
+                _increaseRepeatButton.Visibility = w2 > 0.0001f ? Visibility.Visible : Visibility.Collapsed;
+            }
+            if (_orientation == Orientation.Vertical) {
+                Visual_GridAddRowDef(__nativeHandle, w0 > 0.0001f ? starUnit : pxUnit, w0 > 0.0001f ? w0 : 0.0f);
+                Visual_GridAddRowDef(__nativeHandle, autoUnit, 1.0f);
+                Visual_GridAddRowDef(__nativeHandle, w2 > 0.0001f ? starUnit : pxUnit, w2 > 0.0001f ? w2 : 0.0f);
+                if (_decreaseRepeatButton != null) {
+                    UIElement.SetGridRow(_decreaseRepeatButton, 0);
+                    UIElement.SetGridColumn(_decreaseRepeatButton, 0);
+                }
+                if (_thumb != null) {
+                    UIElement.SetGridRow(_thumb, 1);
+                    UIElement.SetGridColumn(_thumb, 0);
+                }
+                if (_increaseRepeatButton != null) {
+                    UIElement.SetGridRow(_increaseRepeatButton, 2);
+                    UIElement.SetGridColumn(_increaseRepeatButton, 0);
+                }
+            } else {
+                Visual_GridAddColDef(__nativeHandle, w0 > 0.0001f ? starUnit : pxUnit, w0 > 0.0001f ? w0 : 0.0f);
+                Visual_GridAddColDef(__nativeHandle, autoUnit, 1.0f);
+                Visual_GridAddColDef(__nativeHandle, w2 > 0.0001f ? starUnit : pxUnit, w2 > 0.0001f ? w2 : 0.0f);
+                if (_decreaseRepeatButton != null) {
+                    UIElement.SetGridRow(_decreaseRepeatButton, 0);
+                    UIElement.SetGridColumn(_decreaseRepeatButton, 0);
+                }
+                if (_thumb != null) {
+                    UIElement.SetGridRow(_thumb, 0);
+                    UIElement.SetGridColumn(_thumb, 1);
+                }
+                if (_increaseRepeatButton != null) {
+                    UIElement.SetGridRow(_increaseRepeatButton, 0);
+                    UIElement.SetGridColumn(_increaseRepeatButton, 2);
+                }
+            }
+            return;
+        }
+
+        if (_decreaseRepeatButton != null) { _decreaseRepeatButton.Visibility = Visibility.Visible; }
+        if (_increaseRepeatButton != null) { _increaseRepeatButton.Visibility = Visibility.Visible; }
+        float thumbRatio = (span > 0.00001f) ? Math.Clampf(_viewportSize / (span + _viewportSize), 0.08f, 1.0f) : 1.0f;
+        float freeRatio = Math.Maxf(0.0f, 1.0f - thumbRatio);
+        float sv0 = freeRatio * beforeFrac;
+        float sv1 = thumbRatio;
+        float sv2 = freeRatio * (1.0f - beforeFrac);
         if (_orientation == Orientation.Vertical) {
-            Visual_GridAddRowDef(__nativeHandle, starUnit, w0);
-            Visual_GridAddRowDef(__nativeHandle, starUnit, w1);
-            Visual_GridAddRowDef(__nativeHandle, starUnit, w2);
+            Visual_GridAddRowDef(__nativeHandle, starUnit, sv0);
+            Visual_GridAddRowDef(__nativeHandle, starUnit, sv1);
+            Visual_GridAddRowDef(__nativeHandle, starUnit, sv2);
             if (_decreaseRepeatButton != null) {
                 UIElement.SetGridRow(_decreaseRepeatButton, 0);
                 UIElement.SetGridColumn(_decreaseRepeatButton, 0);
@@ -825,9 +895,9 @@ public class Track : FrameworkElement {
                 UIElement.SetGridColumn(_increaseRepeatButton, 0);
             }
         } else {
-            Visual_GridAddColDef(__nativeHandle, starUnit, w0);
-            Visual_GridAddColDef(__nativeHandle, starUnit, w1);
-            Visual_GridAddColDef(__nativeHandle, starUnit, w2);
+            Visual_GridAddColDef(__nativeHandle, starUnit, sv0);
+            Visual_GridAddColDef(__nativeHandle, starUnit, sv1);
+            Visual_GridAddColDef(__nativeHandle, starUnit, sv2);
             if (_decreaseRepeatButton != null) {
                 UIElement.SetGridRow(_decreaseRepeatButton, 0);
                 UIElement.SetGridColumn(_decreaseRepeatButton, 0);
@@ -905,6 +975,7 @@ public class RangeBase : Control {
     private float _min = 0.0f;
     private float _max = 100.0f;
     private float _value = 0.0f;
+    private float _desiredValue = 0.0f;
     public float SmallChange { get; set; } = 1.0f;
     public float LargeChange { get; set; } = 10.0f;
 
@@ -913,33 +984,43 @@ public class RangeBase : Control {
     public RangeBase() : base() {}
     public override string GetTypeName() { return "RangeBase"; }
 
+    private void ApplyClampedValue() {
+        float clamped = Math.Clampf(_desiredValue, _min, _max);
+        if (_value == clamped) { return; }
+        float old = _value;
+        _value = clamped;
+        OnValueChanged(old, clamped);
+        ValueChanged(this, new RoutedPropertyChangedEventArgs<float>(old, clamped, this));
+        BindingEngine.NotifyTargetPropertyChanged(this, "Value", DependencyObject.BoxFloat(clamped));
+        NotifyStateInvalidatedHooks();
+    }
+
     public float Minimum {
         get { return _min; }
         set {
             _min = value;
             if (_max < _min) { _max = _min; }
-            Value = _value;
+            ApplyClampedValue();
             OnRangeUpdated();
+            NotifyStateInvalidatedHooks();
+            BindingEngine.MarkFlushDirty();
         }
     }
     public float Maximum {
         get { return _max; }
         set {
             _max = value < _min ? _min : value;
-            Value = _value;
+            ApplyClampedValue();
             OnRangeUpdated();
+            NotifyStateInvalidatedHooks();
+            BindingEngine.MarkFlushDirty();
         }
     }
     public float Value {
         get { return _value; }
         set {
-            float clamped = Math.Clampf(value, _min, _max);
-            if (_value == clamped) { return; }
-            float old = _value;
-            _value = clamped;
-            OnValueChanged(old, clamped);
-            ValueChanged(this, new RoutedPropertyChangedEventArgs<float>(old, clamped, this));
-            BindingEngine.NotifyTargetPropertyChanged(this, "Value", DependencyObject.BoxFloat(clamped));
+            _desiredValue = value;
+            ApplyClampedValue();
         }
     }
 
@@ -969,25 +1050,57 @@ public class RangeBase : Control {
 }
 
 public class Slider : RangeBase {
+    private static Slider[] _defaultSliders;
+
     private Orientation _orientation = Orientation.Horizontal;
     private float _tickFrequency = 0.0f;
     public bool IsSnapToTickEnabled { get; set; } = false;
     public bool IsDirectionReversed { get; set; } = false;
 
+    private Grid _trackGrid;
     private Border _trackBg;
     private Border _fillBar;
     private Border _thumb;
+    private Track _partTrack;
     private bool _scrubbing = false;
+    private float _lastSyncW = -1.0f;
+    private float _lastSyncH = -1.0f;
 
     public Slider() : base() {
         Focusable = true;
-        Height = 26.0f;
-        MinWidth = 100.0f;
+        RegisterDefaultSlider(this);
     }
     public Slider(float min, float max, float val) : this() {
         Minimum = min;
         Maximum = max;
         Value = val;
+    }
+
+    private static void RegisterDefaultSlider(Slider s) {
+        if (_defaultSliders == null) {
+            _defaultSliders = new Slider[0];
+            BindingEngine.AddPreFlushHook(() => { Slider.SyncAllDefaultLayouts(); });
+        }
+        if (!_defaultSliders.Contains(s)) { _defaultSliders.Push(s); }
+    }
+
+    public static void SyncAllDefaultLayouts() {
+        if (_defaultSliders == null) { return; }
+        for (int i = _defaultSliders.Length - 1; i >= 0; i -= 1) {
+            Slider s = _defaultSliders[i];
+            if (s == null || s._isDisposedTree) {
+                _defaultSliders.RemoveAt(i);
+                continue;
+            }
+            if (s._thumb == null) { continue; }
+            float aw = s.ActualWidth;
+            float ah = s.ActualHeight;
+            if (Math.Absf(aw - s._lastSyncW) > 0.25f || Math.Absf(ah - s._lastSyncH) > 0.25f) {
+                s._lastSyncW = aw;
+                s._lastSyncH = ah;
+                s.OnRangeUpdated();
+            }
+        }
     }
 
     public override string GetTypeName() { return "Slider"; }
@@ -1001,25 +1114,116 @@ public class Slider : RangeBase {
         set { _tickFrequency = value >= 0.0f ? value : 0.0f; }
     }
 
+    private static Track FindFirstTrack(UIElement rootNode) {
+        if (rootNode == null) { return null; }
+        var q = new UIElement[0];
+        q.Push(rootNode);
+        int idx = 0;
+        while (idx < q.Length) {
+            UIElement node = q[idx];
+            idx += 1;
+            if (node == null) { continue; }
+            if (node is Track) { return node as Track; }
+            for (int i = 0; i < node.ChildCount(); i += 1) {
+                q.Push(node.ChildAt(i));
+            }
+        }
+        return null;
+    }
+
+    private void SyncPartTrack() {
+        if (_partTrack == null) { return; }
+        _partTrack.Orientation = _orientation;
+        _partTrack.IsDirectionReversed = IsDirectionReversed;
+        _partTrack.Minimum = Minimum;
+        _partTrack.Maximum = Maximum;
+        _partTrack.Value = Value;
+    }
+
+    public override void OnApplyTemplate() {
+        base.OnApplyTemplate();
+        _partTrack = null;
+        if (Template != null) {
+            _trackBg = null;
+            _fillBar = null;
+            _thumb = null;
+            UIElement pt = GetTemplateChild("PART_Track");
+            if (pt is Track) { _partTrack = pt as Track; }
+            else { _partTrack = FindFirstTrack(TemplateRoot()); }
+            if (_partTrack != null) {
+                SyncPartTrack();
+                if (_partTrack.Thumb != null) {
+                    _partTrack.Thumb.DragDelta += (object s, DragDeltaEventArgs e) => {
+                        float w = Math.Maxf(1.0f, ActualWidth);
+                        float h = Math.Maxf(1.0f, ActualHeight);
+                        float span = Maximum - Minimum;
+                        if (span <= 0.00001f) { return; }
+                        float deltaFrac = _orientation == Orientation.Horizontal
+                            ? (e.HorizontalChange / w)
+                            : (-e.VerticalChange / h);
+                        if (IsDirectionReversed) { deltaFrac = -deltaFrac; }
+                        Value = Value + deltaFrac * span;
+                    };
+                }
+                if (_partTrack.DecreaseRepeatButton != null) {
+                    _partTrack.DecreaseRepeatButton.MouseLeftButtonDown += (object s, MouseButtonEventArgs e) => {
+                        UpdateFromPointer(e.X, e.Y);
+                    };
+                }
+                if (_partTrack.IncreaseRepeatButton != null) {
+                    _partTrack.IncreaseRepeatButton.MouseLeftButtonDown += (object s, MouseButtonEventArgs e) => {
+                        UpdateFromPointer(e.X, e.Y);
+                    };
+                }
+            }
+        }
+    }
+
     protected override void OnRangeUpdated() {
+        SyncPartTrack();
         if (_trackBg == null || _fillBar == null || _thumb == null) { return; }
         float frac = NormalizedFraction();
         if (IsDirectionReversed) { frac = 1.0f - frac; }
-        float w = ActualWidth > 18.0f ? ActualWidth : (ParseUtil.IsFinite(Width) ? Width : 180.0f);
-        float h = ActualHeight > 18.0f ? ActualHeight : (ParseUtil.IsFinite(Height) ? Height : 26.0f);
+        float w = ActualWidth > 15.0f ? ActualWidth : (ParseUtil.IsFinite(Width) ? Width : 140.0f);
+        float h = ActualHeight > 15.0f ? ActualHeight : (ParseUtil.IsFinite(Height) ? Height : 22.0f);
         if (_orientation == Orientation.Horizontal) {
-            float usable = Math.Maxf(1.0f, w - 18.0f);
+            if (_trackGrid != null) {
+                _trackGrid.Height = 22.0f;
+                _trackGrid.Width = ParseUtil.NaN();
+            }
+            _trackBg.Height = 2.0f;
+            _trackBg.Width = ParseUtil.NaN();
+            _trackBg.HorizontalAlignment = HorizontalAlignment.Stretch;
+            _trackBg.VerticalAlignment = VerticalAlignment.Center;
+            float usable = Math.Maxf(1.0f, w - 15.0f);
             float thumbX = usable * frac;
-            _fillBar.Width = thumbX + 9.0f;
-            UIElement.SetCanvasLeft(_thumb, thumbX);
-            UIElement.SetCanvasTop(_thumb, Math.Maxf(0.0f, (h - 18.0f) * 0.5f));
+            _fillBar.Height = 2.0f;
+            _fillBar.Width = thumbX + 7.5f;
+            _fillBar.HorizontalAlignment = HorizontalAlignment.Left;
+            _fillBar.VerticalAlignment = VerticalAlignment.Center;
+            _fillBar.Margin = new Thickness(0.0f);
+            _thumb.HorizontalAlignment = HorizontalAlignment.Left;
+            _thumb.VerticalAlignment = VerticalAlignment.Center;
+            _thumb.Margin = new Thickness(thumbX, 0.0f, 0.0f, 0.0f);
         } else {
-            float usable = Math.Maxf(1.0f, h - 18.0f);
+            if (_trackGrid != null) {
+                _trackGrid.Width = 22.0f;
+                _trackGrid.Height = ParseUtil.NaN();
+            }
+            _trackBg.Width = 2.0f;
+            _trackBg.Height = ParseUtil.NaN();
+            _trackBg.HorizontalAlignment = HorizontalAlignment.Center;
+            _trackBg.VerticalAlignment = VerticalAlignment.Stretch;
+            float usable = Math.Maxf(1.0f, h - 15.0f);
             float thumbY = usable * (1.0f - frac);
-            _fillBar.Height = Math.Maxf(4.0f, h - thumbY - 9.0f);
-            UIElement.SetCanvasTop(_fillBar, thumbY + 9.0f);
-            UIElement.SetCanvasLeft(_thumb, Math.Maxf(0.0f, (w - 18.0f) * 0.5f));
-            UIElement.SetCanvasTop(_thumb, thumbY);
+            _fillBar.Width = 2.0f;
+            _fillBar.Height = Math.Maxf(2.0f, h - thumbY - 7.5f);
+            _fillBar.HorizontalAlignment = HorizontalAlignment.Center;
+            _fillBar.VerticalAlignment = VerticalAlignment.Bottom;
+            _fillBar.Margin = new Thickness(0.0f);
+            _thumb.HorizontalAlignment = HorizontalAlignment.Center;
+            _thumb.VerticalAlignment = VerticalAlignment.Top;
+            _thumb.Margin = new Thickness(0.0f, thumbY, 0.0f, 0.0f);
         }
     }
 
@@ -1027,11 +1231,27 @@ public class Slider : RangeBase {
         if (!ParseUtil.IsValidHandle(__nativeHandle)) { return; }
         float lx = Visual_ScreenToLocal(__nativeHandle, screenX, screenY, 0);
         float ly = Visual_ScreenToLocal(__nativeHandle, screenX, screenY, 1);
-        float w = Math.Maxf(24.0f, ActualWidth);
-        float h = Math.Maxf(24.0f, ActualHeight);
-        float frac = _orientation == Orientation.Horizontal
-            ? Math.Clampf((lx - 9.0f) / Math.Maxf(1.0f, w - 18.0f), 0.0f, 1.0f)
-            : 1.0f - Math.Clampf((ly - 9.0f) / Math.Maxf(1.0f, h - 18.0f), 0.0f, 1.0f);
+        float frac = 0.0f;
+        if (_partTrack != null) {
+            handle thandle = ParseUtil.IsValidHandle(_partTrack.__nativeHandle) ? _partTrack.__nativeHandle : __nativeHandle;
+            float tx = Visual_ScreenToLocal(thandle, screenX, screenY, 0);
+            float ty = Visual_ScreenToLocal(thandle, screenX, screenY, 1);
+            float tw = Math.Maxf(1.0f, _partTrack.ActualWidth > 0.0f ? _partTrack.ActualWidth : ActualWidth);
+            float th = Math.Maxf(1.0f, _partTrack.ActualHeight > 0.0f ? _partTrack.ActualHeight : ActualHeight);
+            float thumbW = (_partTrack.Thumb != null && _partTrack.Thumb.ActualWidth > 0.0f) ? _partTrack.Thumb.ActualWidth : 0.0f;
+            float thumbH = (_partTrack.Thumb != null && _partTrack.Thumb.ActualHeight > 0.0f) ? _partTrack.Thumb.ActualHeight : 0.0f;
+            float usableW = Math.Maxf(1.0f, tw - thumbW);
+            float usableH = Math.Maxf(1.0f, th - thumbH);
+            frac = _orientation == Orientation.Horizontal
+                ? Math.Clampf((tx - thumbW * 0.5f) / usableW, 0.0f, 1.0f)
+                : 1.0f - Math.Clampf((ty - thumbH * 0.5f) / usableH, 0.0f, 1.0f);
+        } else {
+            float w = Math.Maxf(24.0f, ActualWidth);
+            float h = Math.Maxf(24.0f, ActualHeight);
+            frac = _orientation == Orientation.Horizontal
+                ? Math.Clampf((lx - 7.5f) / Math.Maxf(1.0f, w - 15.0f), 0.0f, 1.0f)
+                : 1.0f - Math.Clampf((ly - 7.5f) / Math.Maxf(1.0f, h - 15.0f), 0.0f, 1.0f);
+        }
         if (IsDirectionReversed) { frac = 1.0f - frac; }
         float raw = Minimum + frac * (Maximum - Minimum);
         if (IsSnapToTickEnabled && _tickFrequency > 0.0001f) {
@@ -1042,10 +1262,18 @@ public class Slider : RangeBase {
         Value = raw;
     }
 
+    protected override void OnVisualStatePropertyChanged() {
+        base.OnVisualStatePropertyChanged();
+        if (Template == null && _thumb != null) {
+            _thumb.Background = new SolidColorBrush((IsMouseOver || _scrubbing) ? "#FF2597E5" : "#FF1382CE");
+        }
+    }
+
     public override void OnMouseLeftButtonDown(MouseButtonEventArgs e) {
         base.OnMouseLeftButtonDown(e);
         if (!IsEnabled) { return; }
         _scrubbing = true;
+        if (Template == null && _thumb != null) { _thumb.Background = new SolidColorBrush("#FF2597E5"); }
         CaptureMouse();
         UpdateFromPointer(e.X, e.Y);
         e.Handled = true;
@@ -1060,6 +1288,9 @@ public class Slider : RangeBase {
         base.OnMouseLeftButtonUp(e);
         if (_scrubbing) {
             _scrubbing = false;
+            if (Template == null && _thumb != null) {
+                _thumb.Background = new SolidColorBrush(IsMouseOver ? "#FF2597E5" : "#FF1382CE");
+            }
             ReleaseMouseCapture();
             e.Handled = true;
         }
@@ -1075,36 +1306,40 @@ public class Slider : RangeBase {
     }
 
     protected override UIElement CreateDefaultTemplate() {
-        var root = new Canvas();
+        _trackGrid = new Grid();
+        _trackGrid.Height = 22.0f;
+        _trackGrid.MinWidth = 80.0f;
+        _trackGrid.Background = Brushes.Transparent();
+        _trackGrid.VerticalAlignment = VerticalAlignment.Center;
+
         _trackBg = new Border();
-        _trackBg.Height = 6.0f;
-        _trackBg.Background = new SolidColorBrush("#FF1E2633");
-        _trackBg.CornerRadius = new CornerRadius(3.0f);
+        _trackBg.Height = 2.0f;
+        _trackBg.Background = new SolidColorBrush("#FF5D656B");
+        _trackBg.CornerRadius = new CornerRadius(1.0f);
         _trackBg.HorizontalAlignment = HorizontalAlignment.Stretch;
-        UIElement.SetCanvasLeft(_trackBg, 0.0f);
-        UIElement.SetCanvasRight(_trackBg, 0.0f);
-        UIElement.SetCanvasTop(_trackBg, 10.0f);
+        _trackBg.VerticalAlignment = VerticalAlignment.Center;
 
         _fillBar = new Border();
-        _fillBar.Height = 6.0f;
-        _fillBar.Background = new SolidColorBrush("#FF3B82F6");
-        _fillBar.CornerRadius = new CornerRadius(3.0f);
-        UIElement.SetCanvasLeft(_fillBar, 0.0f);
-        UIElement.SetCanvasTop(_fillBar, 10.0f);
+        _fillBar.Height = 2.0f;
+        _fillBar.Background = new SolidColorBrush("#FF1382CE");
+        _fillBar.CornerRadius = new CornerRadius(1.0f);
+        _fillBar.HorizontalAlignment = HorizontalAlignment.Left;
+        _fillBar.VerticalAlignment = VerticalAlignment.Center;
 
         _thumb = new Border();
-        _thumb.Width = 18.0f;
-        _thumb.Height = 18.0f;
-        _thumb.CornerRadius = new CornerRadius(9.0f);
-        _thumb.Background = Brushes.White();
-        _thumb.BorderBrush = new SolidColorBrush("#FF3B82F6");
-        _thumb.BorderThickness = new Thickness(2.0f);
+        _thumb.Width = 15.0f;
+        _thumb.Height = 15.0f;
+        _thumb.CornerRadius = new CornerRadius(7.5f);
+        _thumb.BorderThickness = new Thickness(0.0f);
+        _thumb.Background = new SolidColorBrush("#FF1382CE");
+        _thumb.HorizontalAlignment = HorizontalAlignment.Left;
+        _thumb.VerticalAlignment = VerticalAlignment.Center;
 
-        root.AddChild(_trackBg);
-        root.AddChild(_fillBar);
-        root.AddChild(_thumb);
+        _trackGrid.AddChild(_trackBg);
+        _trackGrid.AddChild(_fillBar);
+        _trackGrid.AddChild(_thumb);
         OnRangeUpdated();
-        return root;
+        return _trackGrid;
     }
 
     public override bool SetPropertyValue(string propName, DependencyObject value) {
@@ -1196,14 +1431,47 @@ public class ScrollBar : RangeBase {
     private bool _isDirectionReversed = false;
     private bool _hasExplicitDirRev = false;
     private Border _trackBg;
+    private Border _decBtn;
+    private Border _incBtn;
     private Thumb _thumb;
     private Track _partTrack;
+    private bool _hoverExpanded = false;
+    private float _lastSyncW = -1.0f;
+    private float _lastSyncH = -1.0f;
+    private static ScrollBar[] _defaultBars;
 
     public event ScrollEventHandler Scroll;
 
     public ScrollBar() : base() {
         SmallChange = 24.0f;
         LargeChange = 120.0f;
+    }
+
+    private static void RegisterDefaultBar(ScrollBar sb) {
+        if (_defaultBars == null) {
+            _defaultBars = new ScrollBar[0];
+            BindingEngine.AddPreFlushHook(() => { ScrollBar.SyncAllDefaultLayouts(); });
+        }
+        if (!_defaultBars.Contains(sb)) { _defaultBars.Push(sb); }
+    }
+
+    public static void SyncAllDefaultLayouts() {
+        if (_defaultBars == null) { return; }
+        for (int i = _defaultBars.Length - 1; i >= 0; i -= 1) {
+            ScrollBar sb = _defaultBars[i];
+            if (sb == null || sb._isDisposedTree) {
+                _defaultBars.RemoveAt(i);
+                continue;
+            }
+            if (sb._thumb == null || sb.Template != null) { continue; }
+            float aw = sb.ActualWidth;
+            float ah = sb.ActualHeight;
+            if (Math.Absf(aw - sb._lastSyncW) > 0.25f || Math.Absf(ah - sb._lastSyncH) > 0.25f) {
+                sb._lastSyncW = aw;
+                sb._lastSyncH = ah;
+                sb.OnRangeUpdated();
+            }
+        }
     }
 
     public override string GetTypeName() { return "ScrollBar"; }
@@ -1240,24 +1508,55 @@ public class ScrollBar : RangeBase {
         float span = Maximum - Minimum;
         float total = span + _viewportSize;
         float fracPos = NormalizedFraction();
+        float inset = _hoverExpanded ? 16.0f : 4.0f;
         if (_orientation == Orientation.Vertical) {
             float trackH = Math.Maxf(24.0f, ActualHeight > 0.0f ? ActualHeight : 200.0f);
+            if (_trackBg != null) {
+                _trackBg.Width = 15.0f;
+                _trackBg.Height = trackH;
+                UIElement.SetCanvasLeft(_trackBg, 0.0f);
+                UIElement.SetCanvasTop(_trackBg, 0.0f);
+            }
+            if (_decBtn != null) {
+                UIElement.SetCanvasLeft(_decBtn, 0.0f);
+                UIElement.SetCanvasTop(_decBtn, 0.0f);
+            }
+            if (_incBtn != null) {
+                UIElement.SetCanvasLeft(_incBtn, 0.0f);
+                UIElement.SetCanvasTop(_incBtn, Math.Maxf(0.0f, trackH - 15.0f));
+            }
+            float usable = Math.Maxf(24.0f, trackH - inset * 2.0f);
             float ratio = total > 0.0f ? Math.Clampf(_viewportSize / total, 0.12f, 1.0f) : 1.0f;
-            float thumbH = Math.Maxf(24.0f, trackH * ratio);
-            float travel = Math.Maxf(0.0f, trackH - thumbH);
-            _thumb.Width = 8.0f;
+            float thumbH = Math.Minf(usable, Math.Maxf(24.0f, usable * ratio));
+            float travel = Math.Maxf(0.0f, usable - thumbH);
+            _thumb.Width = _hoverExpanded ? 6.5f : 3.5f;
             _thumb.Height = thumbH;
-            UIElement.SetCanvasLeft(_thumb, 1.0f);
-            UIElement.SetCanvasTop(_thumb, travel * fracPos);
+            UIElement.SetCanvasLeft(_thumb, _hoverExpanded ? 4.25f : 9.5f);
+            UIElement.SetCanvasTop(_thumb, inset + travel * fracPos);
         } else {
             float trackW = Math.Maxf(24.0f, ActualWidth > 0.0f ? ActualWidth : 200.0f);
+            if (_trackBg != null) {
+                _trackBg.Width = trackW;
+                _trackBg.Height = 15.0f;
+                UIElement.SetCanvasLeft(_trackBg, 0.0f);
+                UIElement.SetCanvasTop(_trackBg, 0.0f);
+            }
+            if (_decBtn != null) {
+                UIElement.SetCanvasLeft(_decBtn, 0.0f);
+                UIElement.SetCanvasTop(_decBtn, 0.0f);
+            }
+            if (_incBtn != null) {
+                UIElement.SetCanvasLeft(_incBtn, Math.Maxf(0.0f, trackW - 15.0f));
+                UIElement.SetCanvasTop(_incBtn, 0.0f);
+            }
+            float usable = Math.Maxf(24.0f, trackW - inset * 2.0f);
             float ratio = total > 0.0f ? Math.Clampf(_viewportSize / total, 0.12f, 1.0f) : 1.0f;
-            float thumbW = Math.Maxf(24.0f, trackW * ratio);
-            float travel = Math.Maxf(0.0f, trackW - thumbW);
+            float thumbW = Math.Minf(usable, Math.Maxf(24.0f, usable * ratio));
+            float travel = Math.Maxf(0.0f, usable - thumbW);
             _thumb.Width = thumbW;
-            _thumb.Height = 8.0f;
-            UIElement.SetCanvasLeft(_thumb, travel * fracPos);
-            UIElement.SetCanvasTop(_thumb, 1.0f);
+            _thumb.Height = _hoverExpanded ? 6.5f : 3.5f;
+            UIElement.SetCanvasLeft(_thumb, inset + travel * fracPos);
+            UIElement.SetCanvasTop(_thumb, _hoverExpanded ? 4.25f : 9.5f);
         }
     }
 
@@ -1271,6 +1570,8 @@ public class ScrollBar : RangeBase {
         if (Template != null) {
             _thumb = null;
             _trackBg = null;
+            _decBtn = null;
+            _incBtn = null;
             _partTrack = GetTemplateChild("PART_Track") as Track;
             if (_partTrack != null && _hasExplicitDirRev) {
                 _partTrack.IsDirectionReversed = _isDirectionReversed;
@@ -1298,37 +1599,119 @@ public class ScrollBar : RangeBase {
         }
     }
 
+    private void ApplyThumbBrush(string hex, float radius) {
+        if (_thumb == null) { return; }
+        var br = new SolidColorBrush(hex);
+        var cr = new CornerRadius(radius);
+        _thumb.Background = br;
+        _thumb.CornerRadius = cr;
+        if (_thumb.TemplateRoot() is Border tb) {
+            tb.Background = br;
+            tb.CornerRadius = cr;
+        }
+    }
+
+    private static void AnimateBarPartOpacity(UIElement el, float toAlpha) {
+        if (el == null) { return; }
+        if (ParseUtil.IsValidHandle(el.__nativeHandle)) {
+            Anim_StartFloatTo(el.__nativeHandle, 0, toAlpha, 0.14f, 0, 0, 0.0f, false, 1);
+        } else {
+            el.Opacity = toAlpha;
+        }
+    }
+
+    private void UpdateDefaultHoverState() {
+        if (Template != null || _thumb == null) { return; }
+        bool expanded = IsMouseOver || _thumb.IsDragging;
+        if (expanded != _hoverExpanded) {
+            _hoverExpanded = expanded;
+            float targetOp = expanded ? 1.0f : 0.0f;
+            AnimateBarPartOpacity(_trackBg, targetOp);
+            AnimateBarPartOpacity(_decBtn, targetOp);
+            AnimateBarPartOpacity(_incBtn, targetOp);
+            OnRangeUpdated();
+        }
+        ApplyThumbBrush(expanded ? "#FF9BA1A8" : "#FF7A8086", expanded ? 3.25f : 1.75f);
+    }
+
+    protected override void OnVisualStatePropertyChanged() {
+        base.OnVisualStatePropertyChanged();
+        UpdateDefaultHoverState();
+    }
+
     protected override UIElement CreateDefaultTemplate() {
         _partTrack = null;
+        _hoverExpanded = false;
         var host = new Canvas();
-        host.Width = _orientation == Orientation.Vertical ? 10.0f : ParseUtil.NaN();
-        host.Height = _orientation == Orientation.Horizontal ? 10.0f : ParseUtil.NaN();
+        host.Background = Brushes.Transparent();
+        host.Width = _orientation == Orientation.Vertical ? 15.0f : ParseUtil.NaN();
+        host.Height = _orientation == Orientation.Horizontal ? 15.0f : ParseUtil.NaN();
 
         _trackBg = new Border();
-        _trackBg.Background = new SolidColorBrush("#331E2633");
-        _trackBg.CornerRadius = new CornerRadius(4.0f);
-        _trackBg.HorizontalAlignment = HorizontalAlignment.Stretch;
-        _trackBg.VerticalAlignment = VerticalAlignment.Stretch;
+        _trackBg.Background = new SolidColorBrush("#EB282D32");
+        _trackBg.CornerRadius = new CornerRadius(0.0f);
+        _trackBg.Opacity = 0.0f;
+
+        _decBtn = new Border();
+        _decBtn.Width = 15.0f;
+        _decBtn.Height = 15.0f;
+        _decBtn.Background = Brushes.Transparent();
+        _decBtn.Opacity = 0.0f;
+        var decGlyph = new Path(_orientation == Orientation.Vertical ? "M 4,9 L 7.5,5.5 L 11,9" : "M 9,4 L 5.5,7.5 L 9,11");
+        decGlyph.Width = 15.0f;
+        decGlyph.Height = 15.0f;
+        decGlyph.Stroke = new SolidColorBrush("#FFB8BEC4");
+        decGlyph.StrokeThickness = 1.4f;
+        decGlyph.Stretch = Stretch.None;
+        _decBtn.Child = decGlyph;
+        _decBtn.MouseLeftButtonDown += (object s, MouseButtonEventArgs e) => {
+            if (IsEnabled) { Value = Value - SmallChange; e.Handled = true; }
+        };
+        _decBtn.MouseLeftButtonUp += (object s, MouseButtonEventArgs e) => { e.Handled = true; };
+
+        _incBtn = new Border();
+        _incBtn.Width = 15.0f;
+        _incBtn.Height = 15.0f;
+        _incBtn.Background = Brushes.Transparent();
+        _incBtn.Opacity = 0.0f;
+        var incGlyph = new Path(_orientation == Orientation.Vertical ? "M 4,6 L 7.5,9.5 L 11,6" : "M 6,4 L 9.5,7.5 L 6,11");
+        incGlyph.Width = 15.0f;
+        incGlyph.Height = 15.0f;
+        incGlyph.Stroke = new SolidColorBrush("#FFB8BEC4");
+        incGlyph.StrokeThickness = 1.4f;
+        incGlyph.Stretch = Stretch.None;
+        _incBtn.Child = incGlyph;
+        _incBtn.MouseLeftButtonDown += (object s, MouseButtonEventArgs e) => {
+            if (IsEnabled) { Value = Value + SmallChange; e.Handled = true; }
+        };
+        _incBtn.MouseLeftButtonUp += (object s, MouseButtonEventArgs e) => { e.Handled = true; };
 
         _thumb = new Thumb();
-        _thumb.Background = new SolidColorBrush("#FF475569");
-        _thumb.CornerRadius = new CornerRadius(4.0f);
+        _thumb.Background = new SolidColorBrush("#FF7A8086");
+        _thumb.CornerRadius = new CornerRadius(1.75f);
+        _thumb.DragStarted += (object s, DragStartedEventArgs e) => { UpdateDefaultHoverState(); };
+        _thumb.DragCompleted += (object s, DragCompletedEventArgs e) => { UpdateDefaultHoverState(); };
         _thumb.DragDelta += (object s, DragDeltaEventArgs e) => {
             float span = Maximum - Minimum;
             if (span <= 0.001f) { return; }
+            float inset = _hoverExpanded ? 16.0f : 4.0f;
             if (_orientation == Orientation.Vertical) {
-                float trackH = Math.Maxf(24.0f, ActualHeight);
-                float travel = Math.Maxf(1.0f, trackH - _thumb.Height);
+                float usable = Math.Maxf(24.0f, ActualHeight - inset * 2.0f);
+                float travel = Math.Maxf(1.0f, usable - _thumb.Height);
                 Value = Value + (e.VerticalChange / travel) * span;
             } else {
-                float trackW = Math.Maxf(24.0f, ActualWidth);
-                float travel = Math.Maxf(1.0f, trackW - _thumb.Width);
+                float usable = Math.Maxf(24.0f, ActualWidth - inset * 2.0f);
+                float travel = Math.Maxf(1.0f, usable - _thumb.Width);
                 Value = Value + (e.HorizontalChange / travel) * span;
             }
         };
 
         host.AddChild(_trackBg);
+        host.AddChild(_decBtn);
+        host.AddChild(_incBtn);
         host.AddChild(_thumb);
+        RegisterDefaultBar(this);
+        UpdateDefaultHoverState();
         OnRangeUpdated();
         return host;
     }
@@ -1624,9 +2007,7 @@ public class ScrollViewer : ContentControl {
     protected override UIElement CreateDefaultTemplate() {
         var grid = new Grid();
         grid.AddColumnDefinition(GridUnitType.Star, 1.0f);
-        grid.AddColumnDefinition(GridUnitType.Auto, 1.0f);
         grid.AddRowDefinition(GridUnitType.Star, 1.0f);
-        grid.AddRowDefinition(GridUnitType.Auto, 1.0f);
 
         var defaultBorder = new Border();
         defaultBorder.ClipToBounds = true;
@@ -1642,16 +2023,22 @@ public class ScrollViewer : ContentControl {
 
         _vBar = new ScrollBar();
         _vBar.Orientation = Orientation.Vertical;
-        _vBar.Width = 10.0f;
-        UIElement.SetGridColumn(_vBar, 1);
+        _vBar.Width = 15.0f;
+        _vBar.HorizontalAlignment = HorizontalAlignment.Right;
+        _vBar.VerticalAlignment = VerticalAlignment.Stretch;
+        _vBar.ZIndex = 10;
+        UIElement.SetGridColumn(_vBar, 0);
         _vBar.Scroll += (object s, ScrollEventArgs e) => {
             if (!_syncingBars) { ScrollToVerticalOffset(e.NewValue); }
         };
 
         _hBar = new ScrollBar();
         _hBar.Orientation = Orientation.Horizontal;
-        _hBar.Height = 10.0f;
-        UIElement.SetGridRow(_hBar, 1);
+        _hBar.Height = 15.0f;
+        _hBar.VerticalAlignment = VerticalAlignment.Bottom;
+        _hBar.HorizontalAlignment = HorizontalAlignment.Stretch;
+        _hBar.ZIndex = 10;
+        UIElement.SetGridRow(_hBar, 0);
         _hBar.Scroll += (object s, ScrollEventArgs e) => {
             if (!_syncingBars) { ScrollToHorizontalOffset(e.NewValue); }
         };

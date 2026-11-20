@@ -1,14 +1,17 @@
 #pragma once
 
 #include <array>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <mutex>
 #include <string>
 #include <string_view>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
+#include "aero/asset/GradientBrush.hpp"
 #include "aero/asset/MtsdfPathBaker.hpp"
 #include "aero/core/UnifiedValue.hpp"
 #include "aero/render/FontAtlas.hpp"
@@ -175,6 +178,7 @@ struct BlurLayerSpan {
     float saturation = 1.0f;
     Color effectColor{1.0f, 1.0f, 1.0f, 1.0f};
     float effectOpacity = 1.0f;
+    BlendingMode blendMode = BlendingMode::Normal;
     bool hasOpacityMask = false;
     std::uint32_t opacityMaskGradId = 0u;
     std::uint32_t opacityMaskSolidRgba = 0xFFFFFFFFu;
@@ -199,6 +203,11 @@ struct RichGlyphStyle {
 
 // Pack RGBA [0..1] floats into ABGR/RGBA 32-bit uint
 [[nodiscard]] std::uint32_t PackColorRgba8(const Color& color, float opacityMultiplier = 1.0f) noexcept;
+
+void ApplyTextAlignmentToLayout(
+    TextLayoutResult& layout,
+    TextAlignment align,
+    float alignBoxWidth) noexcept;
 
 // Pack cornerRadius and borderThickness (in 0.5px steps, 0..127.5px) into 16-bit flags (uniform fast path)
 [[nodiscard]] std::uint16_t PackSdfRoundedRectParams(float cornerRadius, float borderThickness) noexcept;
@@ -375,13 +384,19 @@ public:
     PagedRenderTree();
 
     void Clear() noexcept;
+    void ReserveCapacity(std::size_t expectedNodes);
 
     [[nodiscard]] std::uint32_t TreeId() const noexcept { return treeId_; }
 
     void SetRootDpiScale(float scale) noexcept;
     [[nodiscard]] float RootDpiScale() const noexcept { return rootDpiScale_; }
 
-    void SetResourceStore(UIResourceStore* store) noexcept { resourceStore_ = store; }
+    void SetResourceStore(UIResourceStore* store) noexcept {
+        if (resourceStore_ != store) {
+            resourceStore_ = store;
+            preCachedGlyphsReady_.store(false, std::memory_order_release);
+        }
+    }
     [[nodiscard]] UIResourceStore* ResourceStore() const noexcept { return resourceStore_; }
     [[nodiscard]] const AxbMtsdfPathEntry* FindMtsdfEntry(std::uint64_t pathHash) const noexcept;
 
@@ -552,6 +567,24 @@ public:
     // Partial node updates: re-records ONLY the owning 4KB CommandPage and marks that page dirty
     bool UpdateNodeWidth(std::uint32_t nodeId, float newWidth) noexcept;
     bool UpdateNodeOpacity(std::uint32_t nodeId, float newOpacity) noexcept;
+    bool UpdateSolidBoxNodeInPlace(
+        std::uint32_t nodeId,
+        const Rect& rect,
+        const Color& fillColor,
+        const CornerRadius& cornerRadii,
+        const Matrix2D& world2D,
+        BlendingMode blend) noexcept;
+    void SetSyncedWorldState(std::uint64_t worldId, std::uint64_t structureVersion) noexcept {
+        syncedWorldId_ = worldId;
+        syncedStructureVersion_ = structureVersion;
+    }
+    [[nodiscard]] bool MatchesSyncedWorldState(
+        std::uint64_t worldId,
+        std::uint64_t structureVersion) const noexcept {
+        return worldId != 0u &&
+               syncedWorldId_ == worldId &&
+               syncedStructureVersion_ == structureVersion;
+    }
     bool UpdateNodeTransform2D(
         std::uint32_t nodeId,
         float m00,
@@ -560,7 +593,7 @@ public:
         float m11,
         float tx,
         float ty) noexcept;
-    bool UpdateHudDigitsText(std::uint32_t nodeId, std::string_view asciiDigits) noexcept;
+    bool UpdateHudDigitsText(std::uint32_t nodeId, std::string_view asciiDigits);
     bool UpdateTextRunNode(
         std::uint32_t nodeId,
         float x,
@@ -592,6 +625,9 @@ public:
     [[nodiscard]] const CommandPage& GetPage(std::size_t pageIndex) const noexcept {
         return pages_[pageIndex];
     }
+    [[nodiscard]] const float* PageVertexClipW(std::size_t pageIndex) const noexcept {
+        return (pageIndex < pageClipW_.size()) ? pageClipW_[pageIndex].data() : nullptr;
+    }
 
     [[nodiscard]] std::size_t NodeCount() const noexcept { return nodes_.size(); }
     [[nodiscard]] const RenderNodeDescriptor* GetNode(std::uint32_t nodeId) const noexcept {
@@ -618,7 +654,8 @@ public:
     }
     void ClearDirtyPages() noexcept;
 
-    [[nodiscard]] const GlyphUvRect& LookupPreCachedGlyph(char asciiChar) const noexcept {
+    [[nodiscard]] const GlyphUvRect& LookupPreCachedGlyph(char asciiChar) const {
+        EnsurePreCachedDigitGlyphs();
         const auto idx = static_cast<std::uint8_t>(asciiChar) & 0x7Fu;
         return preCachedGlyphs_[idx];
     }
@@ -629,7 +666,8 @@ public:
         float fontSize = 14.0f) const noexcept;
 
 private:
-    void InitPreCachedDigitGlyphs() noexcept;
+    void InitPreCachedDigitGlyphs() const;
+    void EnsurePreCachedDigitGlyphs() const;
     [[nodiscard]] TextLayoutResult MeasureTextWithStore(
         std::string_view utf8Text,
         std::string_view fontFamily,
@@ -655,7 +693,26 @@ private:
         std::size_t& ioGlyphCursor,
         const Color& color,
         float opacity,
-        const std::vector<RichGlyphStyle>* optRichStyles = nullptr) noexcept;
+        const std::vector<RichGlyphStyle>* optRichStyles = nullptr,
+        const GradientBrushDesc* optFgGrad = nullptr,
+        float gradBoxWidth = 0.0f,
+        float gradBoxHeight = 0.0f,
+        bool ignoreCustomGlyphColors = false) noexcept;
+    std::uint16_t EmitPreparedTextLayoutNodes(
+        float x,
+        float y,
+        float fontSize,
+        TextLayoutResult layout,
+        const Color& color,
+        float opacity,
+        const RenderTraversalState& curState,
+        const void* owner,
+        TextAlignment textAlign = TextAlignment::Left,
+        float alignBoxWidth = 0.0f,
+        const std::vector<RichGlyphStyle>* optRichStyles = nullptr,
+        const GradientBrushDesc* optFgGrad = nullptr,
+        float gradBoxHeight = 0.0f,
+        bool ignoreCustomGlyphColors = false);
     std::uint16_t EmitTextRunNodes(
         float x,
         float y,
@@ -680,6 +737,7 @@ private:
     bool activeClipEnabled_ = false;
     BlendingMode activeBlendMode_ = BlendingMode::Normal;
     std::vector<CommandPage> pages_;
+    std::vector<std::array<float, kVerticesPerCommandPage>> pageClipW_;
     std::vector<RenderNodeDescriptor> nodes_;
     std::vector<std::uint8_t> pageDirtyFlags_;
     std::vector<std::uint32_t> dirtyPageList_;
@@ -697,9 +755,13 @@ private:
 
     std::vector<BlurLayerSpan> blurLayerSpans_;
     std::unordered_map<std::uint32_t, StandaloneTextRunRecord> standaloneTextRuns_;
-    std::array<GlyphUvRect, 128> preCachedGlyphs_{};
+    mutable std::atomic<bool> preCachedGlyphsReady_{false};
+    mutable std::mutex preCachedGlyphsMutex_;
+    mutable std::array<GlyphUvRect, 128> preCachedGlyphs_{};
     float rootDpiScale_ = 1.0f;
     std::uint32_t mtsdfOwnerId_ = 0u;
+    std::uint64_t syncedWorldId_ = 0u;
+    std::uint64_t syncedStructureVersion_ = 0u;
     std::uint64_t mtsdfAtlasRevision_ = 0u;
     std::uint32_t mtsdfPopulatedRows_ = 0u;
     std::uint32_t mtsdfShelfX_ = 0u;

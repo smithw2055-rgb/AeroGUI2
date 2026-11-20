@@ -101,6 +101,7 @@ public class ItemsControl : Control {
     private int _virtLastIndex = -1;
 
     protected ItemsPresenter _itemsPresenter;
+    protected Panel _directItemsHost;
     protected UIElement[] _activeContainers;
     protected DependencyObject[] _activeBoxes;
     protected UIElement[] _recycledPool;
@@ -309,11 +310,17 @@ public class ItemsControl : Control {
         if (a is BoxedBool && b is BoxedBool) {
             return (a as BoxedBool).Value == (b as BoxedBool).Value;
         }
-        return a.BoxValueEquals(b);
+        if (a.BoxValueEquals(b)) { return true; }
+        object ua = DependencyObject.Unbox(a);
+        object ub = DependencyObject.Unbox(b);
+        if (ua != null && ub != null && ua == ub) {
+            return true;
+        }
+        return false;
     }
 
     private void RecycleActiveContainers() {
-        Panel host = _itemsPresenter != null ? _itemsPresenter.EnsurePanel() : null;
+        Panel host = EnsureItemsHostPanel();
         if (host != null) { host.ClearChildren(); }
         for (int i = 0; i < _activeContainers.Length; i += 1) {
             UIElement c = _activeContainers[i];
@@ -330,7 +337,7 @@ public class ItemsControl : Control {
     }
 
     public void UpdateVirtualizedViewport(float scrollY, float viewportHeight) {
-        if (!_virtualizing || _itemsPresenter == null) {
+        if (!_virtualizing || EnsureItemsHostPanel() == null) {
             RefreshItems();
             return;
         }
@@ -356,8 +363,9 @@ public class ItemsControl : Control {
     }
 
     public virtual void RefreshItems() {
-        if (_itemsPresenter == null) { return; }
         int total = ItemCount();
+        BindingEngine.NotifyTargetPropertyChanged(this, "Items.Count", DependencyObject.BoxInt(total));
+        if (EnsureItemsHostPanel() == null) { return; }
         if (_virtualizing && total > 32) {
             UpdateVirtualizedViewport(0.0f, ActualHeight > 0.0f ? ActualHeight : 400.0f);
             return;
@@ -366,8 +374,8 @@ public class ItemsControl : Control {
     }
 
     protected void BuildContainerRange(int firstIdx, int lastIdx) {
-        if (_itemsPresenter == null) { return; }
-        Panel host = _itemsPresenter.EnsurePanel();
+        Panel host = EnsureItemsHostPanel();
+        if (host == null) { return; }
         if (lastIdx < firstIdx) {
             RecycleActiveContainers();
             return;
@@ -473,6 +481,11 @@ public class ItemsControl : Control {
             if (node == null) { continue; }
             if (node != rootNode && node is ItemsControl) { continue; }
             if (node is ItemsPresenter) { return node as ItemsPresenter; }
+            if (node is Popup) {
+                UIElement popChild = (node as Popup).Child;
+                if (popChild != null) { q.Push(popChild); }
+                continue;
+            }
             if (node != rootNode && node is Control) {
                 Control subCtrl = node as Control;
                 subCtrl.ApplyStyleInternal();
@@ -487,7 +500,47 @@ public class ItemsControl : Control {
         return null;
     }
 
+    protected static Panel FindItemsHostPanel(UIElement rootNode, UIElement owner) {
+        if (rootNode == null) { return null; }
+        var q = new UIElement[0];
+        q.Push(rootNode);
+        int idx = 0;
+        while (idx < q.Length) {
+            UIElement node = q[idx];
+            idx += 1;
+            if (node == null) { continue; }
+            if (node != rootNode && node is ItemsControl) { continue; }
+            if (node is Panel) {
+                Panel p = node as Panel;
+                if (p.IsItemsHost) { return p; }
+            }
+            if (node is Popup) {
+                UIElement popChild = (node as Popup).Child;
+                if (popChild != null) { q.Push(popChild); }
+                continue;
+            }
+            if (node != rootNode && node is Control) {
+                Control subCtrl = node as Control;
+                subCtrl.ApplyStyleInternal();
+                if (subCtrl.TemplateRoot() == null) {
+                    subCtrl.ApplyTemplate();
+                }
+            }
+            for (int i = 0; i < node.ChildCount(); i += 1) {
+                q.Push(node.ChildAt(i));
+            }
+        }
+        return null;
+    }
+
+    protected Panel EnsureItemsHostPanel() {
+        if (_itemsPresenter != null) { return _itemsPresenter.EnsurePanel(); }
+        return _directItemsHost;
+    }
+
     public override void OnApplyTemplate() {
+        _itemsPresenter = null;
+        _directItemsHost = null;
         UIElement found = GetTemplateChild("PART_ItemsPresenter");
         if (found is ItemsPresenter) {
             _itemsPresenter = found as ItemsPresenter;
@@ -498,6 +551,11 @@ public class ItemsControl : Control {
             if (_itemsPanelFactory != null) { _itemsPresenter.PanelFactory = _itemsPanelFactory; }
             _itemsPresenter.EnsurePanel();
             RefreshItems();
+        } else {
+            _directItemsHost = FindItemsHostPanel(TemplateRoot(), this);
+            if (_directItemsHost != null) {
+                RefreshItems();
+            }
         }
     }
 
@@ -526,6 +584,7 @@ public class ItemsControl : Control {
 
     public override DependencyObject GetPropertyValue(string propName) {
         if (propName == "HasItems") { return DependencyObject.BoxBool(ItemCount() > 0); }
+        if (propName == "Items.Count") { return DependencyObject.BoxInt(ItemCount()); }
         return base.GetPropertyValue(propName);
     }
 }
@@ -546,6 +605,7 @@ public class SelectableItem : ContentControl {
         Focusable = true;
         HorizontalAlignment = HorizontalAlignment.Stretch;
         HorizontalContentAlignment = HorizontalAlignment.Left;
+        VerticalContentAlignment = VerticalAlignment.Center;
         Padding = new Thickness(10.0f, 6.0f, 10.0f, 6.0f);
         CornerRadius = new CornerRadius(4.0f);
     }
@@ -647,7 +707,23 @@ public class ListBoxItem : SelectableItem {
 }
 
 public class ComboBoxItem : SelectableItem {
-    public ComboBoxItem() : base() {}
+    public ComboBoxItem() : base() {
+        CornerRadius = new CornerRadius(0.0f);
+        Padding = new Thickness(10.0f, 8.0f, 10.0f, 8.0f);
+    }
+    protected override void UpdateSelectionVisual() {
+        if (Style != null || Template != null) { return; }
+        if (IsSelected) {
+            Background = new SolidColorBrush("#FF0C74B3");
+            Foreground = new SolidColorBrush("#FFFFFFFF");
+        } else if (IsMouseOver) {
+            Background = new SolidColorBrush("#FF3A4046");
+            Foreground = new SolidColorBrush("#FFE8ECF0");
+        } else {
+            Background = Brushes.Transparent();
+            Foreground = new SolidColorBrush("#FFD0D4D8");
+        }
+    }
     public override string GetTypeName() { return "ComboBoxItem"; }
 }
 
@@ -659,7 +735,7 @@ public class ListViewItem : SelectableItem {
 public class Selector : ItemsControl {
     private int _selectedIndex = -1;
     private int _pendingSelectedIndex = -1;
-    private DependencyObject _selectedItemBox;
+    protected DependencyObject _selectedItemBox;
     private SelectionMode _selectionMode = SelectionMode.Single;
     private int[] _selectedIndices;
     private int _anchorIndex = -1;
@@ -692,18 +768,27 @@ public class Selector : ItemsControl {
         set { SetSelectedIndexInternal(value, true); }
     }
 
+    protected void SetSelectedItemBoxInternal(DependencyObject box) {
+        int idx = IndexOfItemBox(box);
+        if (idx >= 0) {
+            SetSelectedIndexInternal(idx, true);
+            return;
+        }
+        int oldIdx = _selectedIndex;
+        DependencyObject oldBox = _selectedItemBox;
+        _selectedIndices.Clear();
+        _selectedIndex = -1;
+        _selectedItemBox = box;
+        if (oldIdx != -1 || !ItemsControl.SameItemBox(oldBox, box)) {
+            OnSelectionChanged(oldIdx, -1, oldBox, box);
+        } else {
+            SyncContainerSelectionStates();
+        }
+    }
+
     public object SelectedItem {
         get { return DependencyObject.Unbox(_selectedItemBox); }
-        set {
-            DependencyObject box = DependencyObject.BoxObject(value);
-            int idx = IndexOfItemBox(box);
-            if (idx >= 0) { SetSelectedIndexInternal(idx, true); }
-            else {
-                _selectedItemBox = box;
-                _selectedIndex = -1;
-                SyncContainerSelectionStates();
-            }
-        }
+        set { SetSelectedItemBoxInternal(DependencyObject.BoxObject(value)); }
     }
 
     public object SelectedValue {
@@ -727,6 +812,7 @@ public class Selector : ItemsControl {
         SelectionChanged(this, new SelectionChangedEventArgs(this, newIdx, oldBox, newBox));
         BindingEngine.NotifyTargetPropertyChanged(this, "SelectedIndex", DependencyObject.BoxInt(newIdx));
         BindingEngine.NotifyTargetPropertyChanged(this, "SelectedItem", newBox);
+        BindingEngine.NotifyTargetPropertyChanged(this, "SelectedItem.Content", GetPropertyValue("SelectedItem.Content"));
     }
 
     internal void NotifyContainerSelected(SelectableItem item, bool selected) {
@@ -770,11 +856,16 @@ public class Selector : ItemsControl {
 
     protected void SetSelectedIndexInternal(int newIdx, bool replaceMultiSet) {
         int count = ItemCount();
-        if (count == 0 && newIdx >= 0) {
+        if (newIdx < 0) {
+            _pendingSelectedIndex = -1;
+        } else if (count == 0) {
             _pendingSelectedIndex = newIdx;
             return;
         }
-        int clamped = (newIdx >= 0 && newIdx < count) ? newIdx : -1;
+        int clamped = -1;
+        if (newIdx >= 0 && count > 0) {
+            clamped = newIdx < count ? newIdx : (count - 1);
+        }
         if (clamped >= 0) { _pendingSelectedIndex = -1; }
         int oldIdx = _selectedIndex;
         DependencyObject oldBox = _selectedItemBox;
@@ -794,19 +885,21 @@ public class Selector : ItemsControl {
     protected void TryApplyPendingSelection() {
         int total = ItemCount();
         if (total <= 0) { return; }
-        if (_selectedIndex < 0) {
-            if (_pendingSelectedIndex >= 0 && _pendingSelectedIndex < total) {
-                int pend = _pendingSelectedIndex;
-                _pendingSelectedIndex = -1;
-                SetSelectedIndexInternal(pend, true);
-                return;
+        if (_pendingSelectedIndex >= 0) {
+            int pend = _pendingSelectedIndex;
+            _pendingSelectedIndex = -1;
+            int targetIdx = pend < total ? pend : (total - 1);
+            SetSelectedIndexInternal(targetIdx, true);
+            if (pend >= total) {
+                _pendingSelectedIndex = pend;
             }
-            if (_selectedItemBox != null) {
-                int idx = IndexOfItemBox(_selectedItemBox);
-                if (idx >= 0) {
-                    SetSelectedIndexInternal(idx, true);
-                    return;
-                }
+            return;
+        }
+        if (_selectedIndex < 0 && _selectedItemBox != null) {
+            int idx = IndexOfItemBox(_selectedItemBox);
+            if (idx >= 0) {
+                SetSelectedIndexInternal(idx, true);
+                return;
             }
         }
     }
@@ -899,11 +992,15 @@ public class Selector : ItemsControl {
         }
     }
 
+    public override void RefreshItems() {
+        base.RefreshItems();
+        TryApplyPendingSelection();
+    }
+
     public override bool SetPropertyValue(string propName, DependencyObject value) {
         if (propName == "SelectedIndex") { SelectedIndex = DependencyObject.UnboxInt(value, -1); return true; }
         if (propName == "SelectedItem") {
-            int idx = IndexOfItemBox(value);
-            if (idx >= 0) { SetSelectedIndexInternal(idx, true); }
+            SetSelectedItemBoxInternal(value);
             return true;
         }
         if (propName == "SelectedValuePath") { SelectedValuePath = DependencyObject.UnboxString(value, ""); return true; }
@@ -912,6 +1009,13 @@ public class Selector : ItemsControl {
     public override DependencyObject GetPropertyValue(string propName) {
         if (propName == "SelectedIndex") { return DependencyObject.BoxInt(_selectedIndex); }
         if (propName == "SelectedItem") { return _selectedItemBox; }
+        if (propName == "SelectedItem.Content") {
+            object item = DependencyObject.Unbox(_selectedItemBox);
+            if (item is ContentControl) {
+                return (item as ContentControl).ContentBox;
+            }
+            return _selectedItemBox;
+        }
         return base.GetPropertyValue(propName);
     }
 }
@@ -1131,6 +1235,7 @@ public class ListView : ListBox {
                 tb.Padding = new Thickness(6.0f, 2.0f, 6.0f, 2.0f);
                 tb.VerticalAlignment = VerticalAlignment.Center;
                 tb.TextTrimming = TextTrimming.CharacterEllipsis;
+                tb.ClipToBounds = true;
                 cellEl = tb;
             }
             if (cellEl != null) {
@@ -1173,18 +1278,16 @@ public class ComboBox : Selector {
     private Path _arrowIcon;
     private Popup _dropdownPopup;
     private ToggleButton _dropDownToggle;
+    private Border _dropBorder;
+    private ScrollViewer _dropScroll;
+    private bool _pendingScrollToSelected = false;
+    private static ComboBox[] _scrollPendingCombos;
+    private static bool _scrollHookReg = false;
 
     public event EventHandler DropDownOpened;
     public event EventHandler DropDownClosed;
 
     public ComboBox() : base() {
-        Background = new SolidColorBrush("#FF1E2430");
-        BorderBrush = new SolidColorBrush("#FF3B465C");
-        BorderThickness = new Thickness(1.0f);
-        CornerRadius = new CornerRadius(6.0f);
-        Padding = new Thickness(10.0f, 6.0f, 10.0f, 6.0f);
-        MinWidth = 140.0f;
-        MinHeight = 32.0f;
     }
 
     public override string GetTypeName() { return "ComboBox"; }
@@ -1201,12 +1304,21 @@ public class ComboBox : Selector {
         set {
             if (_isDropDownOpen == value) { return; }
             _isDropDownOpen = value;
+            if (_isDropDownOpen) {
+                SyncDropDownDimensions();
+            }
             if (_dropDownToggle != null && _dropDownToggle.IsChecked != _isDropDownOpen) {
                 _dropDownToggle.IsChecked = _isDropDownOpen;
             }
             if (_dropdownPopup != null) {
                 _dropdownPopup.IsOpen = _isDropDownOpen;
             }
+            if (_isDropDownOpen) {
+                QueueScrollSelectedIntoView();
+            } else {
+                _pendingScrollToSelected = false;
+            }
+            UpdateHeaderVisual();
             BindingEngine.NotifyTargetPropertyChanged(this, "IsDropDownOpen", DependencyObject.BoxBool(_isDropDownOpen));
             UpdateTriggersAndStates();
             if (_isDropDownOpen) { DropDownOpened(this, EventArgs.Empty()); }
@@ -1216,7 +1328,7 @@ public class ComboBox : Selector {
 
     private void SyncSelectedPreview() {
         if (_selectionDisplay == null) { return; }
-        DependencyObject box = SelectedIndex >= 0 ? GetItemBoxAt(SelectedIndex) : null;
+        DependencyObject box = SelectedIndex >= 0 ? GetItemBoxAt(SelectedIndex) : _selectedItemBox;
         if (box == null) {
             _selectionDisplay.SetContent("");
             return;
@@ -1339,7 +1451,9 @@ public class ComboBox : Selector {
     public override bool SetPropertyValue(string propName, DependencyObject value) {
         if (propName == "IsDropDownOpen") { IsDropDownOpen = DependencyObject.UnboxBool(value, false); return true; }
         if (propName == "MaxDropDownHeight") { MaxDropDownHeight = DependencyObject.UnboxFloat(value, 240.0f); return true; }
-        return base.SetPropertyValue(propName, value);
+        bool handled = base.SetPropertyValue(propName, value);
+        if (handled && propName == "ItemTemplate") { SyncSelectedPreview(); }
+        return handled;
     }
 
     public override DependencyObject GetPropertyValue(string propName) {
@@ -1347,7 +1461,7 @@ public class ComboBox : Selector {
         if (propName == "MaxDropDownHeight") { return DependencyObject.BoxFloat(_maxDropDownHeight); }
         if (propName == "HasItems") { return DependencyObject.BoxBool(ItemCount() > 0); }
         if (propName == "SelectionBoxItem") {
-            return SelectedIndex >= 0 ? GetItemBoxAt(SelectedIndex) : null;
+            return SelectedIndex >= 0 ? GetItemBoxAt(SelectedIndex) : _selectedItemBox;
         }
         return base.GetPropertyValue(propName);
     }
@@ -1370,54 +1484,157 @@ public class ComboBox : Selector {
         }
     }
 
+    private void SyncDropDownDimensions() {
+        if (_dropBorder == null) { return; }
+        float w = ActualWidth > 0.0f ? ActualWidth : (_headerBox != null && _headerBox.ActualWidth > 0.0f ? _headerBox.ActualWidth : 120.0f);
+        _dropBorder.Width = Math.Maxf(w, 120.0f);
+        _dropBorder.MaxHeight = _maxDropDownHeight;
+    }
+
+    private void UpdateHeaderVisual() {
+        if (_headerBox == null) { return; }
+        if (!IsEnabled) {
+            _headerBox.Background = new SolidColorBrush("#FF22262A");
+            _headerBox.BorderBrush = new SolidColorBrush("#FF464B50");
+        } else if (_isDropDownOpen || IsMouseOver) {
+            _headerBox.Background = new SolidColorBrush("#FF33383D");
+            _headerBox.BorderBrush = new SolidColorBrush("#FFA4AAB0");
+        } else {
+            _headerBox.Background = new SolidColorBrush("#FF2B3034");
+            _headerBox.BorderBrush = new SolidColorBrush("#FF6B7278");
+        }
+    }
+
+    private void QueueScrollSelectedIntoView() {
+        if (_dropScroll == null || SelectedIndex < 0) { return; }
+        _pendingScrollToSelected = true;
+        if (!TryScrollSelectedIntoView()) {
+            float estRow = 34.0f;
+            float estOff = Math.Maxf(0.0f, SelectedIndex * estRow - (_maxDropDownHeight - estRow) * 0.5f);
+            _dropScroll.ScrollToVerticalOffset(estOff);
+            EnsureScrollPendingHook();
+            _scrollPendingCombos.Push(this);
+        }
+    }
+
+    private bool TryScrollSelectedIntoView() {
+        if (_dropScroll == null || SelectedIndex < 0 || SelectedIndex >= ContainerCount()) {
+            _pendingScrollToSelected = false;
+            return true;
+        }
+        float vh = _dropScroll.ViewportHeight;
+        UIElement c = ContainerAt(SelectedIndex);
+        if (vh <= 0.0f || c == null || c.ActualHeight <= 0.0f) { return false; }
+        float top = c.LayoutY;
+        float h = c.ActualHeight;
+        float cur = _dropScroll.VerticalOffset;
+        if (top < cur || top + h > cur + vh) {
+            _dropScroll.ScrollToVerticalOffset(Math.Maxf(0.0f, top - (vh - h) * 0.5f));
+        }
+        _pendingScrollToSelected = false;
+        return true;
+    }
+
+    private static void EnsureScrollPendingHook() {
+        if (_scrollPendingCombos == null) { _scrollPendingCombos = new ComboBox[0]; }
+        if (_scrollHookReg) { return; }
+        _scrollHookReg = true;
+        BindingEngine.AddPreFlushHook(() => { ComboBox.FlushPendingScrolls(); });
+    }
+
+    public static void FlushPendingScrolls() {
+        if (_scrollPendingCombos == null || _scrollPendingCombos.Length == 0) { return; }
+        var remaining = new ComboBox[0];
+        for (int i = 0; i < _scrollPendingCombos.Length; i += 1) {
+            ComboBox cb = _scrollPendingCombos[i];
+            if (cb == null || !cb._pendingScrollToSelected || !cb._isDropDownOpen) { continue; }
+            if (!cb.TryScrollSelectedIntoView()) {
+                remaining.Push(cb);
+            }
+        }
+        _scrollPendingCombos = remaining;
+    }
+
+    protected override void SyncPadding() {
+        if (Template != null) {
+            base.SyncPadding();
+            return;
+        }
+        if (ParseUtil.IsValidHandle(__nativeHandle)) {
+            Visual_SetPadding(__nativeHandle, 0.0f, 0.0f, 0.0f, 0.0f);
+        }
+        if (_selectionDisplay != null) {
+            Thickness pad = Padding;
+            float l = pad.Left > 0.0f ? pad.Left : 8.0f;
+            float t = pad.Top > 0.0f ? pad.Top : 5.0f;
+            float r = pad.Right > 0.0f ? pad.Right : 6.0f;
+            float b = pad.Bottom > 0.0f ? pad.Bottom : 5.0f;
+            _selectionDisplay.Margin = new Thickness(l, t, r, b);
+        }
+    }
+
+    protected override void OnVisualStatePropertyChanged() {
+        base.OnVisualStatePropertyChanged();
+        UpdateHeaderVisual();
+    }
+
     protected override UIElement CreateDefaultTemplate() {
         var root = new Grid();
         root.AddColumnDefinition(GridUnitType.Star, 1.0f);
         root.AddColumnDefinition(GridUnitType.Auto, 1.0f);
 
         _headerBox = new Border();
-        _headerBox.Background = Brushes.Transparent();
+        _headerBox.Background = new SolidColorBrush("#FF2B3034");
+        _headerBox.BorderBrush = new SolidColorBrush("#FF6B7278");
+        _headerBox.BorderThickness = new Thickness(1.0f);
+        _headerBox.CornerRadius = new CornerRadius(1.5f);
+        _headerBox.MinWidth = 100.0f;
+        _headerBox.MinHeight = 28.0f;
         _headerBox.HorizontalAlignment = HorizontalAlignment.Stretch;
         UIElement.SetGridColumnSpan(_headerBox, 2);
 
         _selectionDisplay = new ContentPresenter();
         _selectionDisplay.HorizontalAlignment = HorizontalAlignment.Left;
         _selectionDisplay.VerticalAlignment = VerticalAlignment.Center;
+        _selectionDisplay.Margin = new Thickness(8.0f, 5.0f, 6.0f, 5.0f);
         UIElement.SetGridColumn(_selectionDisplay, 0);
 
-        _arrowIcon = new Path("M 2,5 L 7,10 L 12,5");
-        _arrowIcon.Width = 14.0f;
-        _arrowIcon.Height = 14.0f;
-        _arrowIcon.Stroke = new SolidColorBrush("#FF94A3B8");
-        _arrowIcon.StrokeThickness = 1.8f;
+        _arrowIcon = new Path("M 1,3 L 6,8 L 11,3");
+        _arrowIcon.Width = 12.0f;
+        _arrowIcon.Height = 10.0f;
+        _arrowIcon.Margin = new Thickness(0.0f, 5.0f, 8.0f, 5.0f);
+        _arrowIcon.Stroke = new SolidColorBrush("#FFD0D4D8");
+        _arrowIcon.StrokeThickness = 1.25f;
         _arrowIcon.Stretch = Stretch.None;
         _arrowIcon.VerticalAlignment = VerticalAlignment.Center;
         UIElement.SetGridColumn(_arrowIcon, 1);
 
         _dropdownPopup = new Popup();
+        _dropdownPopup.Name = "PART_Popup";
         _dropdownPopup.PlacementTarget = this;
         _dropdownPopup.StaysOpen = false;
-        _dropdownPopup.Closed += (object s, EventArgs e) => { _isDropDownOpen = false; };
+        _dropdownPopup.VerticalOffset = 0.0f;
+        _dropdownPopup.Closed += (object s, EventArgs e) => { NotifyPopupClosedInternal(); };
 
-        var dropBorder = new Border();
-        dropBorder.Background = new SolidColorBrush("#FF1B202B");
-        dropBorder.BorderBrush = new SolidColorBrush("#FF3B465C");
-        dropBorder.BorderThickness = new Thickness(1.0f);
-        dropBorder.CornerRadius = new CornerRadius(6.0f);
-        dropBorder.Padding = new Thickness(4.0f);
-        dropBorder.MaxHeight = _maxDropDownHeight;
-        dropBorder.MinWidth = 140.0f;
+        _dropBorder = new Border();
+        _dropBorder.Background = new SolidColorBrush("#FF252A2E");
+        _dropBorder.BorderBrush = new SolidColorBrush("#FF4B5258");
+        _dropBorder.BorderThickness = new Thickness(1.0f);
+        _dropBorder.CornerRadius = new CornerRadius(0.0f);
+        _dropBorder.Padding = new Thickness(0.0f);
+        _dropBorder.MaxHeight = _maxDropDownHeight;
+        _dropBorder.MinWidth = 100.0f;
 
-        var scroll = new ScrollViewer();
-        scroll.HorizontalScrollBarVisibility = ScrollBarVisibility.Disabled;
-        scroll.VerticalScrollBarVisibility = ScrollBarVisibility.Auto;
+        _dropScroll = new ScrollViewer();
+        _dropScroll.HorizontalScrollBarVisibility = ScrollBarVisibility.Disabled;
+        _dropScroll.VerticalScrollBarVisibility = ScrollBarVisibility.Auto;
         _itemsPresenter = new ItemsPresenter();
         _itemsPresenter.Name = "PART_ItemsPresenter";
         if (ItemsPanelFactory() != null) { _itemsPresenter.PanelFactory = ItemsPanelFactory(); }
         _itemsPresenter.EnsurePanel();
-        scroll.Content = _itemsPresenter;
-        dropBorder.Child = scroll;
-        _dropdownPopup.Child = dropBorder;
+        _dropScroll.Content = _itemsPresenter;
+        _dropBorder.Child = _dropScroll;
+        _dropdownPopup.Child = _dropBorder;
 
         root.MouseLeftButtonUp += (object s, MouseButtonEventArgs e) => {
             if (IsEnabled) { IsDropDownOpen = !IsDropDownOpen; e.Handled = true; }
@@ -1427,6 +1644,7 @@ public class ComboBox : Selector {
         root.AddChild(_selectionDisplay);
         root.AddChild(_arrowIcon);
         root.AddChild(_dropdownPopup);
+        UpdateHeaderVisual();
         RefreshItems();
         return root;
     }
@@ -1446,7 +1664,7 @@ public class TabItem : HeaderedContentControl {
     public event RoutedEventHandler Unselected;
 
     public TabItem() : base() {
-        Padding = new Thickness(14.0f, 8.0f, 14.0f, 8.0f);
+        Padding = new Thickness(12.0f, 5.0f, 12.0f, 5.0f);
         Focusable = true;
     }
     public TabItem(string headerText, UIElement content = null) : this() {
@@ -1465,6 +1683,8 @@ public class TabItem : HeaderedContentControl {
             if (_isSelected == value) { return; }
             _isSelected = value;
             UpdateTabVisual();
+            UpdateTriggersAndStates();
+            NotifyBoundPropertyChanged("IsSelected", DependencyObject.BoxBool(_isSelected));
             if (_isSelected) { Selected(this, new RoutedEventArgs("Selected", this)); }
             else { Unselected(this, new RoutedEventArgs("Unselected", this)); }
         }
@@ -1474,16 +1694,39 @@ public class TabItem : HeaderedContentControl {
         if (_isSelected == sel) { return; }
         _isSelected = sel;
         UpdateTabVisual();
+        UpdateTriggersAndStates();
+        NotifyBoundPropertyChanged("IsSelected", DependencyObject.BoxBool(_isSelected));
+    }
+
+    public override bool SetPropertyValue(string propName, DependencyObject value) {
+        if (propName == "IsSelected") { IsSelected = DependencyObject.UnboxBool(value, false); return true; }
+        return base.SetPropertyValue(propName, value);
+    }
+    public override DependencyObject GetPropertyValue(string propName) {
+        if (propName == "IsSelected") { return DependencyObject.BoxBool(_isSelected); }
+        return base.GetPropertyValue(propName);
     }
 
     protected override void OnVisualStatePropertyChanged() {
+        base.OnVisualStatePropertyChanged();
         UpdateTabVisual();
+    }
+
+    protected override void SyncPadding() {
+        if (Template == null && _headerPresenter != null) {
+            _headerPresenter.Margin = Padding;
+            if (ParseUtil.IsValidHandle(__nativeHandle)) {
+                Visual_SetPadding(__nativeHandle, 0.0f, 0.0f, 0.0f, 0.0f);
+            }
+            return;
+        }
+        base.SyncPadding();
     }
 
     private void UpdateTabVisual() {
         if (Style == null) {
-            Background = new SolidColorBrush(_isSelected ? "#FF222836" : (IsMouseOver ? "#FF1E2430" : "#00000000"));
-            Foreground = new SolidColorBrush(_isSelected ? "#FFF1F5F9" : "#FF94A3B8");
+            Background = new SolidColorBrush(_isSelected ? "#FF282D32" : (IsMouseOver ? "#FF23272B" : "#00000000"));
+            Foreground = new SolidColorBrush(_isSelected ? "#FFF1F5F9" : "#FFD0D6DC");
         }
         if (_accentUnderline != null) {
             _accentUnderline.Visibility = _isSelected ? Visibility.Visible : Visibility.Collapsed;
@@ -1499,21 +1742,50 @@ public class TabItem : HeaderedContentControl {
         }
     }
 
+    public override void OnApplyTemplate() {
+        if (Template == null) { return; }
+        _presenter = null;
+        _headerPresenter = null;
+        UIElement hFound = GetTemplateChild("PART_HeaderPresenter");
+        if (!(hFound is ContentPresenter)) { hFound = GetTemplateChild("HeaderHost"); }
+        if (!(hFound is ContentPresenter)) {
+            UIElement ch = GetTemplateChild("ContentHost");
+            if (ch is ContentPresenter && (ch as ContentPresenter).ContentSource == "Header") {
+                hFound = ch;
+            }
+        }
+        if (hFound is ContentPresenter) {
+            _headerPresenter = hFound as ContentPresenter;
+        } else {
+            _headerPresenter = ContentControl.FindFirstTemplatedPresenter(TemplateRoot(), this, true);
+        }
+        if (_headerPresenter != null) {
+            _headerPresenter.ContentTemplate = HeaderTemplate;
+            _headerPresenter.SetContentBox(HeaderBox);
+        }
+        UpdateTabVisual();
+    }
+
     protected override UIElement CreateDefaultTemplate() {
-        var box = new StackPanel(Orientation.Vertical, 4.0f);
-        _headerPresenter = new ContentPresenter();
-        _headerPresenter.Name = "PART_HeaderPresenter";
-        _headerPresenter.ContentTemplate = HeaderTemplate;
-        _headerPresenter.SetContentBox(HeaderBox);
+        var box = new StackPanel(Orientation.Vertical, 0.0f);
 
         _accentUnderline = new Border();
         _accentUnderline.Height = 2.0f;
-        _accentUnderline.Background = new SolidColorBrush("#FF3B82F6");
-        _accentUnderline.CornerRadius = new CornerRadius(1.0f);
+        _accentUnderline.Background = new SolidColorBrush("#FF2D7EC4");
         _accentUnderline.HorizontalAlignment = HorizontalAlignment.Stretch;
 
-        box.AddChild(_headerPresenter);
+        _headerPresenter = new ContentPresenter();
+        _headerPresenter.Name = "PART_HeaderPresenter";
+        _headerPresenter.ContentSource = "Header";
+        _headerPresenter.HorizontalAlignment = HorizontalAlignment.Center;
+        _headerPresenter.VerticalAlignment = VerticalAlignment.Center;
+        _headerPresenter.Margin = Padding;
+        _headerPresenter.ContentTemplate = HeaderTemplate;
+        _headerPresenter.SetContentBox(HeaderBox);
+
         box.AddChild(_accentUnderline);
+        box.AddChild(_headerPresenter);
+        SyncPadding();
         UpdateTabVisual();
         return box;
     }
@@ -1521,15 +1793,13 @@ public class TabItem : HeaderedContentControl {
 
 public class TabControl : Selector {
     private TabStripPlacement _tabStripPlacement = TabStripPlacement.Top;
-    private StackPanel _tabStrip;
+    private Panel _tabStrip;
     private Border _contentFrame;
     private ContentPresenter _selectedContentHost;
 
     public TabControl() : base() {
-        Background = new SolidColorBrush("#FF1B202B");
-        BorderBrush = new SolidColorBrush("#FF364054");
-        BorderThickness = new Thickness(1.0f);
-        CornerRadius = new CornerRadius(8.0f);
+        Background = Brushes.Transparent();
+        Padding = new Thickness(10.0f);
     }
 
     public override string GetTypeName() { return "TabControl"; }
@@ -1537,6 +1807,19 @@ public class TabControl : Selector {
     public TabStripPlacement TabStripPlacement {
         get { return _tabStripPlacement; }
         set { _tabStripPlacement = value; ApplyTemplate(); }
+    }
+
+    public object SelectedContent {
+        get { return _selectedContentHost != null ? DependencyObject.Unbox(_selectedContentHost.ContentBox) : null; }
+    }
+
+    protected override void SyncPadding() {
+        if (_contentFrame != null) {
+            _contentFrame.Padding = Padding;
+        }
+        if (ParseUtil.IsValidHandle(__nativeHandle)) {
+            Visual_SetPadding(__nativeHandle, 0.0f, 0.0f, 0.0f, 0.0f);
+        }
     }
 
     public void SelectTabIndex(int idx) {
@@ -1557,6 +1840,7 @@ public class TabControl : Selector {
     protected override void OnSelectionChanged(int oldIdx, int newIdx, DependencyObject oldBox, DependencyObject newBox) {
         base.OnSelectionChanged(oldIdx, newIdx, oldBox, newBox);
         SyncTabSelectionVisuals();
+        BindingEngine.NotifyTargetPropertyChanged(this, "SelectedContent", _selectedContentHost != null ? _selectedContentHost.ContentBox : null);
     }
 
     private void SyncTabSelectionVisuals() {
@@ -1608,15 +1892,31 @@ public class TabControl : Selector {
         }
     }
 
+    public override void OnApplyTemplate() {
+        if (Template == null) {
+            base.OnApplyTemplate();
+            return;
+        }
+        _tabStrip = null;
+        _contentFrame = null;
+        _selectedContentHost = null;
+        UIElement hp = GetTemplateChild("HeaderPanel");
+        if (hp is Panel) { _tabStrip = hp as Panel; }
+        else { _tabStrip = ItemsControl.FindItemsHostPanel(TemplateRoot(), this); }
+        UIElement ch = GetTemplateChild("PART_SelectedContentHost");
+        if (ch is ContentPresenter) { _selectedContentHost = ch as ContentPresenter; }
+        RefreshItems();
+    }
+
     protected override UIElement CreateDefaultTemplate() {
         var dock = new DockPanel();
         _tabStrip = new StackPanel(
             (_tabStripPlacement == TabStripPlacement.Left || _tabStripPlacement == TabStripPlacement.Right)
                 ? Orientation.Vertical
                 : Orientation.Horizontal,
-            2.0f);
-        _tabStrip.Background = new SolidColorBrush("#FF141821");
-        _tabStrip.Padding = new Thickness(6.0f, 4.0f, 6.0f, 0.0f);
+            0.0f);
+        _tabStrip.Background = Brushes.Transparent();
+        _tabStrip.Padding = new Thickness(0.0f);
 
         Dock stripDock = Dock.Top;
         if (_tabStripPlacement == TabStripPlacement.Bottom) { stripDock = Dock.Bottom; }
@@ -1625,14 +1925,23 @@ public class TabControl : Selector {
         UIElement.SetDock(_tabStrip, stripDock);
 
         _contentFrame = new Border();
-        _contentFrame.Padding = new Thickness(12.0f);
+        _contentFrame.Background = new SolidColorBrush("#FF272C31");
+        _contentFrame.Padding = Padding;
         _selectedContentHost = new ContentPresenter();
         _selectedContentHost.Name = "PART_SelectedContentHost";
         _contentFrame.Child = _selectedContentHost;
 
         dock.AddChild(_tabStrip);
         dock.AddChild(_contentFrame);
+        SyncPadding();
         RefreshItems();
         return dock;
+    }
+
+    public override DependencyObject GetPropertyValue(string propName) {
+        if (propName == "SelectedContent") {
+            return _selectedContentHost != null ? _selectedContentHost.ContentBox : null;
+        }
+        return base.GetPropertyValue(propName);
     }
 }

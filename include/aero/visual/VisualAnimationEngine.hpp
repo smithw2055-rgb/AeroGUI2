@@ -62,6 +62,7 @@ enum class VisualAnimProp : std::uint8_t {
     StrokeStop1Offset = 50,
     StrokeStop2Offset = 51,
     StrokeStop3Offset = 52,
+    FgBrushOpacity = 53,
 };
 
 enum class EasingFunctionKind : std::uint8_t {

@@ -59,6 +59,8 @@ struct ParsedBindingSpec final {
     std::string stringFormat;
     std::string fallbackValue;
     bool hasFallbackValue = false;
+    std::string sourceLiteral;
+    bool hasSourceLiteral = false;
     std::string targetNullValue;
     bool hasTargetNullValue = false;
     bool isTemplateBinding = false;

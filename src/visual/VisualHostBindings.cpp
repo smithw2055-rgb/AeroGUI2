@@ -13,9 +13,14 @@
 #include <realscript/aot_cpp/AotRuntime.h>
 #include <realscript/semantic/Semantic.h>
 
+#include <filesystem>
+#include <fstream>
+#include <iterator>
+
 #include "aero/asset/GradientBrush.hpp"
 #include "aero/core/StringUtils.hpp"
 #include "aero/core/UIResourceStore.hpp"
+#include "aero/render/ImageAtlas.hpp"
 #include "aero/visual/VisualAnimationEngine.hpp"
 
 namespace aero {
@@ -100,7 +105,7 @@ namespace {
     return rs_rt::ObjectRef{};
 }
 
-[[nodiscard]] rs_rt::Value MakeFloat(float v) noexcept {
+[[nodiscard]] rs_rt::Value MakeRtFloat(float v) noexcept {
     return rs_rt::Value{rs_rt::FloatValue{v}};
 }
 
@@ -967,11 +972,11 @@ bool RegisterVisualHostBindings(
         const float val = world.GetLayoutRectScalar(
             ArgNode(args, 0, world),
             static_cast<VisualLayoutRectQuery>(ArgInt(args, 1, 0)));
-        return MakeFloat(val);
+        return MakeRtFloat(val);
     });
     ok &= bindFn("Visual_ScreenToLocal", [&world](const rs_bc::FunctionReference&, rs_rt::ValueSpan args, rs_rt::RuntimeError&) -> std::optional<rs_rt::Value> {
         const Point local = world.ScreenToLocal(ArgNode(args, 0, world), Point{ArgFloat(args, 1), ArgFloat(args, 2)});
-        return MakeFloat((ArgInt(args, 3, 0) == 0) ? local.x : local.y);
+        return MakeRtFloat((ArgInt(args, 3, 0) == 0) ? local.x : local.y);
     });
 
     // Appearance / Transforms / Effects
@@ -1001,6 +1006,12 @@ bool RegisterVisualHostBindings(
         (void)world.SetBoxBrushOpacity(
             ArgNode(args, 0, world),
             ArgFloat(args, 1, 1.0f));
+        return rs_rt::Value{std::int64_t{0}};
+    });
+    ok &= bindFn("Visual_SetBoxShadow", [&world](const rs_bc::FunctionReference&, rs_rt::ValueSpan args, rs_rt::RuntimeError&) -> std::optional<rs_rt::Value> {
+        (void)world.SetBoxShadow(
+            ArgNode(args, 0, world),
+            ArgBool(args, 1, false));
         return rs_rt::Value{std::int64_t{0}};
     });
     ok &= bindFn("Visual_RegisterLinearGradient", [&world, &domains](const rs_bc::FunctionReference&, rs_rt::ValueSpan args, rs_rt::RuntimeError&) -> std::optional<rs_rt::Value> {
@@ -1039,6 +1050,15 @@ bool RegisterVisualHostBindings(
             ArgFloat(args, 7),
             ArgFloat(args, 8, 0.5f),
             ArgFloat(args, 9, 0.5f));
+        return rs_rt::Value{std::int64_t{0}};
+    });
+    ok &= bindFn("Visual_SetLayoutTransform", [&world](const rs_bc::FunctionReference&, rs_rt::ValueSpan args, rs_rt::RuntimeError&) -> std::optional<rs_rt::Value> {
+        (void)world.SetLayoutTransform(
+            ArgNode(args, 0, world),
+            ArgFloat(args, 1, 1.0f),
+            ArgFloat(args, 2, 1.0f),
+            ArgFloat(args, 3, 0.0f),
+            ArgBool(args, 4, false));
         return rs_rt::Value{std::int64_t{0}};
     });
     ok &= bindFn("Visual_SetTransform3D", [&world](const rs_bc::FunctionReference&, rs_rt::ValueSpan args, rs_rt::RuntimeError&) -> std::optional<rs_rt::Value> {
@@ -1096,6 +1116,37 @@ bool RegisterVisualHostBindings(
             static_cast<std::int32_t>(ArgInt(args, 4, 0)));
         return rs_rt::Value{std::int64_t{0}};
     });
+    ok &= bindFn("Visual_SetTextStyle", [&world](const rs_bc::FunctionReference&, rs_rt::ValueSpan args, rs_rt::RuntimeError&) -> std::optional<rs_rt::Value> {
+        (void)world.SetTextStyle(
+            ArgNode(args, 0, world),
+            static_cast<int>(ArgInt(args, 1, 400)),
+            ArgBool(args, 2, false),
+            static_cast<std::int32_t>(ArgInt(args, 3, -1)));
+        return rs_rt::Value{std::int64_t{0}};
+    });
+    ok &= bindFn("Visual_SetTextBrushOpacity", [&world](const rs_bc::FunctionReference&, rs_rt::ValueSpan args, rs_rt::RuntimeError&) -> std::optional<rs_rt::Value> {
+        (void)world.SetTextBrushOpacity(
+            ArgNode(args, 0, world),
+            ArgFloat(args, 1, 1.0f));
+        return rs_rt::Value{std::int64_t{0}};
+    });
+    ok &= bindFn("Visual_ClearTextSpans", [&world](const rs_bc::FunctionReference&, rs_rt::ValueSpan args, rs_rt::RuntimeError&) -> std::optional<rs_rt::Value> {
+        (void)world.ClearTextSpans(ArgNode(args, 0, world));
+        return rs_rt::Value{std::int64_t{0}};
+    });
+    ok &= bindFn("Visual_AddTextSpan", [&world, &domains](const rs_bc::FunctionReference&, rs_rt::ValueSpan args, rs_rt::RuntimeError&) -> std::optional<rs_rt::Value> {
+        (void)world.AddTextSpan(
+            ArgNode(args, 0, world),
+            ArgString(domains, args, 1),
+            ArgString(domains, args, 2),
+            ArgFloat(args, 3, 0.0f),
+            static_cast<int>(ArgInt(args, 4, 0)),
+            static_cast<std::int8_t>(ArgInt(args, 5, -1)),
+            ArgUInt(args, 6, 0u),
+            ArgBool(args, 7, false),
+            static_cast<std::int32_t>(ArgInt(args, 8, 0)));
+        return rs_rt::Value{std::int64_t{0}};
+    });
     ok &= bindFn("Visual_SetTextSelection", [&world](const rs_bc::FunctionReference&, rs_rt::ValueSpan args, rs_rt::RuntimeError&) -> std::optional<rs_rt::Value> {
         (void)world.SetTextSelection(
             ArgNode(args, 0, world),
@@ -1114,7 +1165,7 @@ bool RegisterVisualHostBindings(
             ArgFloat(args, 2, 14.0f),
             ArgFloat(args, 3, 1000000.0f),
             static_cast<TextWrapping>(ArgInt(args, 4, 0)));
-        return MakeFloat((ArgInt(args, 5, 0) == 0) ? measured.width : measured.height);
+        return MakeRtFloat((ArgInt(args, 5, 0) == 0) ? measured.width : measured.height);
     });
     ok &= bindFn("Visual_HitTestTextCp", [&world](const rs_bc::FunctionReference&, rs_rt::ValueSpan args, rs_rt::RuntimeError&) -> std::optional<rs_rt::Value> {
         const std::int32_t cp = world.HitTestTextCodePoint(ArgNode(args, 0, world), ArgFloat(args, 1), ArgFloat(args, 2));
@@ -1327,7 +1378,7 @@ bool RegisterVisualHostBindings(
     ok &= bindFn("Anim_ReadCurrentFloat", [&world](const rs_bc::FunctionReference&, rs_rt::ValueSpan args, rs_rt::RuntimeError&) -> std::optional<rs_rt::Value> {
         const VisualNodeId nodeId = ArgNode(args, 0, world);
         const auto prop = static_cast<VisualAnimProp>(ArgInt(args, 1, 0));
-        return MakeFloat(VisualAnimationEngine::ReadCurrentScalarProp(world, nodeId, prop));
+        return MakeRtFloat(VisualAnimationEngine::ReadCurrentScalarProp(world, nodeId, prop));
     });
     ok &= bindFn("Anim_ReadCurrentColor", [&world](const rs_bc::FunctionReference&, rs_rt::ValueSpan args, rs_rt::RuntimeError&) -> std::optional<rs_rt::Value> {
         const VisualNodeId nodeId = ArgNode(args, 0, world);
@@ -1447,16 +1498,16 @@ bool RegisterVisualHostBindings(
         rs_rt::Value val{};
         if (ReadDotPathValue(reflectEnv, target, propPath, val)) {
             float fv = 0.0f;
-            if (val.tryGetFloat(fv)) return MakeFloat(fv);
+            if (val.tryGetFloat(fv)) return MakeRtFloat(fv);
             double dv = 0.0;
-            if (val.tryGetDouble(dv)) return MakeFloat(static_cast<float>(dv));
+            if (val.tryGetDouble(dv)) return MakeRtFloat(static_cast<float>(dv));
             std::int64_t iv = 0;
-            if (val.tryGetInt64(iv)) return MakeFloat(static_cast<float>(iv));
+            if (val.tryGetInt64(iv)) return MakeRtFloat(static_cast<float>(iv));
             if (const auto* uv = std::get_if<rs_rt::UIntValue>(&val)) {
-                return MakeFloat(static_cast<float>(uv->value));
+                return MakeRtFloat(static_cast<float>(uv->value));
             }
         }
-        return MakeFloat(0.0f);
+        return MakeRtFloat(0.0f);
     });
     ok &= bindFn("Reflect_GetPropInt", [reflectEnv](const rs_bc::FunctionReference&, rs_rt::ValueSpan args, rs_rt::RuntimeError&) -> std::optional<rs_rt::Value> {
         const rs_rt::ObjectRef target = ArgObject(args, 0);
@@ -1608,7 +1659,7 @@ bool RegisterVisualHostBindings(
         if (!TryExtractStringValue(reflectEnv, args.size() > 1u ? args[1] : rs_rt::Value{}, propPath)) {
             propPath = ArgString(args, 1);
         }
-        return rs_rt::Value{WriteDotPathValue(reflectEnv, target, propPath, MakeFloat(ArgFloat(args, 2)))};
+        return rs_rt::Value{WriteDotPathValue(reflectEnv, target, propPath, MakeRtFloat(ArgFloat(args, 2)))};
     });
     ok &= bindFn("Reflect_SetPropInt", [reflectEnv](const rs_bc::FunctionReference&, rs_rt::ValueSpan args, rs_rt::RuntimeError&) -> std::optional<rs_rt::Value> {
         const rs_rt::ObjectRef target = ArgObject(args, 0);
@@ -1704,6 +1755,162 @@ bool RegisterVisualHostBindings(
             rawColor = ArgString(args, 0);
         }
         return MakeUInt(ParseColorRgba32(rawColor));
+    });
+
+    ok &= bindFn("Host_ReadTextAsset", [&world, &domains, reflectEnv](const rs_bc::FunctionReference&, rs_rt::ValueSpan args, rs_rt::RuntimeError&) -> std::optional<rs_rt::Value> {
+        namespace fs = std::filesystem;
+        std::string rawUri;
+        if (!TryExtractStringValue(reflectEnv, args.size() > 0u ? args[0] : rs_rt::Value{}, rawUri)) {
+            rawUri = ArgString(domains, args, 0);
+        }
+
+        auto isSpace = [](unsigned char ch) {
+            return ch == ' ' || ch == '\t' || ch == '\r' || ch == '\n';
+        };
+        while (!rawUri.empty() && isSpace(static_cast<unsigned char>(rawUri.front()))) {
+            rawUri.erase(0u, 1u);
+        }
+        while (!rawUri.empty() && isSpace(static_cast<unsigned char>(rawUri.back()))) {
+            rawUri.pop_back();
+        }
+        if (rawUri.empty()) {
+            return rs_rt::Value{rs_rt::StringValue{std::string{}}};
+        }
+
+        std::replace(rawUri.begin(), rawUri.end(), '\\', '/');
+        std::string lowerUri = rawUri;
+        for (char& ch : lowerUri) {
+            if (ch >= 'A' && ch <= 'Z') {
+                ch = static_cast<char>(ch - 'A' + 'a');
+            }
+        }
+
+        std::string directPath = rawUri;
+        std::string relPath = rawUri;
+        const std::size_t compPos = lowerUri.find(";component/");
+        if (compPos != std::string::npos) {
+            relPath = rawUri.substr(compPos + 11u);
+        } else if (lowerUri.rfind("pack://", 0u) == 0u) {
+            const std::size_t tripleCommaPos = lowerUri.find(",,,/", 7u);
+            if (tripleCommaPos != std::string::npos) {
+                relPath = rawUri.substr(tripleCommaPos + 4u);
+            } else {
+                const std::size_t slashPos = rawUri.find('/', 7u);
+                relPath = slashPos != std::string::npos ? rawUri.substr(slashPos + 1u) : rawUri.substr(7u);
+            }
+        } else if (lowerUri.rfind("file:///", 0u) == 0u) {
+            directPath = rawUri.substr(8u);
+            relPath = directPath;
+        } else if (lowerUri.rfind("file://", 0u) == 0u) {
+            directPath = rawUri.substr(7u);
+            relPath = directPath;
+        }
+
+        while (!relPath.empty()) {
+            if (relPath[0] == '/') {
+                relPath.erase(0u, 1u);
+            } else if (relPath.size() >= 2u && relPath[0] == '.' && relPath[1] == '/') {
+                relPath.erase(0u, 2u);
+            } else {
+                break;
+            }
+        }
+
+        std::string text;
+        auto tryReadFile = [&text](const fs::path& candidate) -> bool {
+            if (candidate.empty()) {
+                return false;
+            }
+            std::error_code ec;
+            if (!fs::is_regular_file(candidate, ec) || ec) {
+                return false;
+            }
+            std::ifstream ifs(candidate, std::ios::binary);
+            if (!ifs.is_open()) {
+                return false;
+            }
+            std::string loaded((std::istreambuf_iterator<char>(ifs)), std::istreambuf_iterator<char>());
+            if (ifs.bad()) {
+                return false;
+            }
+            if (loaded.size() >= 3u &&
+                static_cast<unsigned char>(loaded[0]) == 0xEFu &&
+                static_cast<unsigned char>(loaded[1]) == 0xBBu &&
+                static_cast<unsigned char>(loaded[2]) == 0xBFu) {
+                loaded.erase(0u, 3u);
+            }
+            text = std::move(loaded);
+            return true;
+        };
+
+        if (tryReadFile(fs::path(directPath)) || (!relPath.empty() && tryReadFile(fs::path(relPath)))) {
+            return rs_rt::Value{rs_rt::StringValue{std::move(text)}};
+        }
+        if (relPath.empty()) {
+            return rs_rt::Value{rs_rt::StringValue{std::string{}}};
+        }
+
+        const fs::path relFs(relPath);
+        auto probeWithSampleLayouts = [&](const fs::path& base) -> bool {
+            return tryReadFile(base / relFs) ||
+                   tryReadFile(base / "Samples" / "Gallery" / "Data" / relFs) ||
+                   tryReadFile(base / "Samples" / "Gallery" / "Data" / "Samples" / relFs) ||
+                   tryReadFile(base / "Samples" / "Theme" / "Data" / relFs) ||
+                   tryReadFile(base / "Samples" / "Theme" / "Data" / "Theme" / relFs);
+        };
+        auto probeAncestors = [&](const fs::path& startDir) -> bool {
+            if (startDir.empty()) {
+                return false;
+            }
+            std::error_code ec;
+            fs::path probe = startDir.is_absolute() ? startDir : fs::absolute(startDir, ec);
+            if (ec || probe.empty()) {
+                probe = startDir;
+            }
+            for (int up = 0; up < 6 && !probe.empty(); ++up) {
+                if (probeWithSampleLayouts(probe)) {
+                    return true;
+                }
+                const fs::path parent = probe.parent_path();
+                if (parent == probe) {
+                    break;
+                }
+                probe = parent;
+            }
+            return false;
+        };
+
+        if (const UIResourceStore* store = world.ResourceStore()) {
+            for (const std::string& searchDir : store->AssetSearchDirectoriesSnapshot()) {
+                if (searchDir.empty()) {
+                    continue;
+                }
+                const fs::path dirPath(searchDir);
+                if (tryReadFile(dirPath / relFs)) {
+                    return rs_rt::Value{rs_rt::StringValue{std::move(text)}};
+                }
+                const fs::path parentDir = dirPath.parent_path();
+                if (!parentDir.empty() && tryReadFile(parentDir / relFs)) {
+                    return rs_rt::Value{rs_rt::StringValue{std::move(text)}};
+                }
+            }
+            if (const ImageAtlas* storeAtlas = store->TryImages()) {
+                if (probeAncestors(fs::path(storeAtlas->GetBaseDirectory()))) {
+                    return rs_rt::Value{rs_rt::StringValue{std::move(text)}};
+                }
+            }
+        }
+
+        if (probeAncestors(fs::path(ImageAtlas::Instance().GetBaseDirectory()))) {
+            return rs_rt::Value{rs_rt::StringValue{std::move(text)}};
+        }
+
+        std::error_code cwdEc;
+        if (probeAncestors(fs::current_path(cwdEc))) {
+            return rs_rt::Value{rs_rt::StringValue{std::move(text)}};
+        }
+
+        return rs_rt::Value{rs_rt::StringValue{std::string{}}};
     });
 
     return ok;

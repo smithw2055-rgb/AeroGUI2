@@ -10,6 +10,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
@@ -88,6 +89,22 @@ struct ImageMetrics {
         return PackRgba(px[0], px[1], px[2], px[3]);
     }
     return 0x0F172AFFu;
+}
+
+void MaybeDumpScreenshot(
+    aero::AeroAppHost& host,
+    std::string_view fileName,
+    std::uint32_t width,
+    std::uint32_t height) {
+    const char* dir = std::getenv("AERO_DUMP_SCREENSHOT_DIR");
+    if (!dir || dir[0] == '\0') {
+        return;
+    }
+    std::error_code ec;
+    fs::create_directories(fs::path(dir), ec);
+    const fs::path outPath = fs::path(dir) / fileName;
+    Require(host.SaveScreenshotPpm(outPath.string(), width, height),
+        "Failed to dump screenshot: " + outPath.string());
 }
 
 [[nodiscard]] ImageMetrics ComputeExactImageMetrics(
@@ -175,7 +192,7 @@ struct ImageMetrics {
     }
     const aero::Point localCenter{r.x + r.width * 0.5f, r.y + r.height * 0.5f};
     const aero::Point vpCenter = node->layout.hasPerspective3D
-        ? node->layout.worldMatrix3D.ProjectPoint2D(localCenter)
+        ? node->WorldMatrix3D().ProjectPoint2D(localCenter)
         : node->layout.worldTransform.TransformPoint(localCenter);
     outCx = vpCenter.x;
     outCy = vpCenter.y;
@@ -379,7 +396,15 @@ void TestDiscoverSampleProjectAndCache(aero::rs_comp::CompilerSession& session) 
 
         aero::AeroAppHost host(hc);
         std::string err;
-        Require(host.CompileAndLoad(ci, &err), "Buttons CompileAndLoad failed: " + err);
+        const bool loaded = host.CompileAndLoad(ci, &err);
+        if (!loaded && err.empty()) {
+            const auto* cr = host.LastCompileResult();
+            err = "(empty outError; host.LastError='" + host.LastError() + "', hasCompileRes=" +
+                std::to_string(cr ? 1 : 0) + ", crSucceeded=" +
+                std::to_string(cr && cr->succeeded ? 1 : 0) + ", crDiags=" +
+                std::to_string(cr ? cr->diagnostics.size() : 0u) + ")";
+        }
+        Require(loaded, "Buttons CompileAndLoad failed: " + err);
         Require(host.LastCompileResult() && host.LastCompileResult()->rootClassName == "Buttons.MainWindow",
             "Buttons rootClassName should be Buttons.MainWindow");
         host.StepFrame(1.0f / 60.0f, true);
@@ -509,7 +534,14 @@ void TestDiscoverSampleProjectAndCache(aero::rs_comp::CompilerSession& session) 
     const aero::AeroV3CompileResult coldRes = compiler.Compile(baseCi);
     const auto tCold1 = std::chrono::steady_clock::now();
     const double coldMs = std::chrono::duration<double, std::milli>(tCold1 - tCold0).count();
-    Require(coldRes.succeeded && !HasErrorDiagnostic(coldRes.diagnostics), "Cold cache compile failed");
+    std::string coldDiag;
+    for (const auto& d : coldRes.diagnostics) {
+        if (!coldDiag.empty()) { coldDiag += " | "; }
+        coldDiag += d;
+    }
+    Require(coldRes.succeeded && !HasErrorDiagnostic(coldRes.diagnostics),
+        "Cold cache compile failed (succeeded=" + std::to_string(coldRes.succeeded ? 1 : 0) +
+        ", diags=" + coldDiag + ")");
 
     // Warm disk-cache compile (fresh CompilerSession, cacheDir populated)
     const auto tWarmDisk0 = std::chrono::steady_clock::now();
@@ -881,15 +913,15 @@ void TestInteractiveButtons(aero::rs_comp::CompilerSession& session) {
     const aero::VisualNode* startFocusOuter = host.World().GetNode(startFocusOuterId);
     const aero::VisualNode* startFocusHi = host.World().GetNode(startFocusHiId);
     const aero::VisualNode* settingsFocusOuter = host.World().GetNode(settingsFocusOuterId);
-    Require(startHost && startHost->text.fgRgba == 0xFFFFFFFFu,
+    Require(startHost && startHost->Text().fgRgba == 0xFFFFFFFFu,
         "Buttons focused StartButton ContentHost should be White (0xFFFFFFFF)");
-    Require(settingsHost && settingsHost->text.fgRgba == 0xFFB58E48u,
+    Require(settingsHost && settingsHost->Text().fgRgba == 0xFFB58E48u,
         "Buttons unfocused SettingsButton ContentHost should be #FF488EB5 (0xFFB58E48), got " +
-        std::to_string(settingsHost ? settingsHost->text.fgRgba : 0u));
-    Require(startFocusOuter && startFocusOuter->vector.strokeOpacity > 0.9f &&
-            startFocusHi && startFocusHi->vector.strokeOpacity > 0.9f,
+        std::to_string(settingsHost ? settingsHost->Text().fgRgba : 0u));
+    Require(startFocusOuter && startFocusOuter->Vector().strokeOpacity > 0.9f &&
+            startFocusHi && startFocusHi->Vector().strokeOpacity > 0.9f,
         "Buttons focused StartButton FocusedOuter & FocusedOuterHi should have visible strokeOpacity");
-    Require(settingsFocusOuter && settingsFocusOuter->vector.strokeOpacity < 0.1f,
+    Require(settingsFocusOuter && settingsFocusOuter->Vector().strokeOpacity < 0.1f,
         "Buttons unfocused SettingsButton FocusedOuter should remain hidden");
 
     float sx = 0.0f, sy = 0.0f;
@@ -912,12 +944,12 @@ void TestInteractiveButtons(aero::rs_comp::CompilerSession& session) {
     settingsHost = host.World().GetNode(settingsHostId);
     startFocusOuter = host.World().GetNode(startFocusOuterId);
     settingsFocusOuter = host.World().GetNode(settingsFocusOuterId);
-    Require(settingsHost && settingsHost->text.fgRgba == 0xFFFFFFFFu,
+    Require(settingsHost && settingsHost->Text().fgRgba == 0xFFFFFFFFu,
         "Buttons newly focused SettingsButton ContentHost should turn White");
-    Require(startHost && startHost->text.fgRgba == 0xFFB58E48u,
+    Require(startHost && startHost->Text().fgRgba == 0xFFB58E48u,
         "Buttons unfocused StartButton ContentHost should transition back to #FF488EB5");
-    Require(settingsFocusOuter && settingsFocusOuter->vector.strokeOpacity > 0.9f &&
-            startFocusOuter && startFocusOuter->vector.strokeOpacity < 0.1f,
+    Require(settingsFocusOuter && settingsFocusOuter->Vector().strokeOpacity > 0.9f &&
+            startFocusOuter && startFocusOuter->Vector().strokeOpacity < 0.1f,
         "Buttons focus glow strokeOpacity should transfer to SettingsButton");
     Require(host.PlayedSoundCount() > soundsBeforeHover,
         "Buttons hovering SettingsButton should trigger AudioSlide.mp3 via GotFocus");
@@ -1004,18 +1036,10 @@ void TestInteractiveLogin(aero::rs_comp::CompilerSession& session) {
     (void)ReadIntMember(host, vmRef, "LoginAttempts", attempts1);
     (void)ReadStringMember(host, vmRef, "Message", msg1);
 
-    if (!ok1) {
-        // Check if code-behind password login works while reporting exact click state if needed
-        aero::UnifiedValue loginRes{};
-        Require(host.InvokeScriptMethod(host.RootScriptObject(), "LoginWithPassword",
-                    {aero::UnifiedValue{aero::rs_rt::StringValue{std::string_view("12345")}}}, &loginRes),
-            "LoginWithPassword invocation failed");
-        host.StepFrame(1.0f / 60.0f, true);
-        Require(ReadBoolMember(host, vmRef, "LoginSuccessful", ok1) && ok1,
-            "LoginSuccessful should be true with valid credentials (msg='" + msg1 + "')");
-    } else {
-        Require(attempts1 >= 1, "LoginAttempts should increment on LoginBtn click");
-    }
+    Require(ok1 && attempts1 >= 1,
+        "LoginBtn click should authenticate with real UI input (ok1=" +
+        std::string(ok1 ? "true" : "false") + ", attempts=" +
+        std::to_string(attempts1) + ", msg='" + msg1 + "')");
 
     std::vector<std::uint8_t> frame1;
     Require(host.RenderHeadlessRgba(800u, 600u, frame1), "Login post-login render failed");
@@ -1074,8 +1098,8 @@ void TestInteractiveInventory(aero::rs_comp::CompilerSession& session) {
     std::string err;
     Require(host.CompileAndLoad(ci, &err), "Inventory load failed: " + err);
 
-    for (int f = 0; f < 25; ++f) {
-        host.StepFrame(1.0f / 60.0f, f == 24);
+    for (int f = 0; f < 190; ++f) {
+        host.StepFrame(1.0f / 60.0f, f == 189);
     }
 
     aero::ObjectRef vmRef{};
@@ -1399,11 +1423,11 @@ void TestInteractiveQuestLog(aero::rs_comp::CompilerSession& session) {
     const aero::VisualNode* outer2 = host.World().GetNode(outer2Id);
     Require(selBorder && selBorder->layout.opacity > 0.99f && std::abs(selBorder->transform2D.tx) < 0.1f,
         "SelectedQuestBorder should settle cleanly after QuestSelected animation");
-    Require(grid0 && grid0->transform2D.tx < 0.1f && outer0 && outer0->vector.fillRgba == 0xFF53646Bu,
+    Require(grid0 && grid0->transform2D.tx < 0.1f && outer0 && outer0->Vector().fillRgba == 0xFF53646Bu,
         "Previously selected ListBoxItem[0] should settle back to Unselected state");
-    Require(grid1 && grid1->transform2D.tx < 0.1f && outer1 && outer1->vector.fillRgba == 0xFF53646Bu,
+    Require(grid1 && grid1->transform2D.tx < 0.1f && outer1 && outer1->Vector().fillRgba == 0xFF53646Bu,
         "Interrupted ListBoxItem[1] should settle back to Unselected state");
-    Require(grid2 && grid2->transform2D.tx > 7.9f && outer2 && outer2->vector.fillRgba == 0xFF77ABBDu,
+    Require(grid2 && grid2->transform2D.tx > 7.9f && outer2 && outer2->Vector().fillRgba == 0xFF77ABBDu,
         "Hovered ListBoxItem[2] should settle cleanly to Selected state");
 
     // 5. Sound effects: SelectionChanged invokes PlaySoundAction once SelectionSoundAction is enabled by Loaded
@@ -1463,8 +1487,8 @@ void TestInteractiveQuestLog(aero::rs_comp::CompilerSession& session) {
     const aero::Rect thumbHoverVp = NodeViewportBounds(*thumbNode);
     const aero::GradientBrushRegistry& qGrads = host.World().ResourceStore()->GradientBrushes();
     aero::GradientBrushDesc thumbRestGrad{};
-    Require(bdMidNode && bdMidNode->vector.fillGradId > 0 &&
-            qGrads.TryGetBrush(static_cast<std::uint32_t>(bdMidNode->vector.fillGradId), thumbRestGrad) &&
+    Require(bdMidNode && bdMidNode->Vector().fillGradId > 0 &&
+            qGrads.TryGetBrush(static_cast<std::uint32_t>(bdMidNode->Vector().fillGradId), thumbRestGrad) &&
             !thumbRestGrad.stops.empty() && thumbRestGrad.stops[0].color.r < 0.55f,
         "QuestLog Thumb BdMiddle should rest at muted gold (#FF696140)");
 
@@ -1479,8 +1503,8 @@ void TestInteractiveQuestLog(aero::rs_comp::CompilerSession& session) {
     }
     bdMidNode = host.World().GetNode(bdMidId);
     aero::GradientBrushDesc thumbOverGrad{};
-    Require(bdMidNode && bdMidNode->vector.fillGradId > 0 &&
-            qGrads.TryGetBrush(static_cast<std::uint32_t>(bdMidNode->vector.fillGradId), thumbOverGrad) &&
+    Require(bdMidNode && bdMidNode->Vector().fillGradId > 0 &&
+            qGrads.TryGetBrush(static_cast<std::uint32_t>(bdMidNode->Vector().fillGradId), thumbOverGrad) &&
             !thumbOverGrad.stops.empty() && thumbOverGrad.stops[0].color.r > 0.75f,
         "QuestLog Thumb hover should animate BdMiddle stop 0 to highlighted gold (#FFDCCD8F)");
     std::vector<std::uint8_t> postThumbHover;
@@ -1494,8 +1518,8 @@ void TestInteractiveQuestLog(aero::rs_comp::CompilerSession& session) {
     }
     bdMidNode = host.World().GetNode(bdMidId);
     aero::GradientBrushDesc thumbLeaveGrad{};
-    Require(bdMidNode && bdMidNode->vector.fillGradId > 0 &&
-            qGrads.TryGetBrush(static_cast<std::uint32_t>(bdMidNode->vector.fillGradId), thumbLeaveGrad) &&
+    Require(bdMidNode && bdMidNode->Vector().fillGradId > 0 &&
+            qGrads.TryGetBrush(static_cast<std::uint32_t>(bdMidNode->Vector().fillGradId), thumbLeaveGrad) &&
             !thumbLeaveGrad.stops.empty() && thumbLeaveGrad.stops[0].color.r < 0.55f,
         "QuestLog Thumb MouseLeave should restore BdMiddle stop 0 back to #FF696140");
 }
@@ -1530,6 +1554,7 @@ void TestInteractiveLocalization(aero::rs_comp::CompilerSession& session) {
 
     std::vector<std::uint8_t> frame0;
     Require(host.RenderHeadlessRgba(800u, 600u, frame0), "Localization initial render failed");
+    MaybeDumpScreenshot(host, "localization.ppm", 800u, 600u);
 
     // Switch to French (index 1)
     Require(host.InvokeScriptMethod(host.RootScriptObject(), "SelectLanguageByIndex",
@@ -1702,14 +1727,14 @@ void TestInteractiveCustomControlAndTheme(aero::rs_comp::CompilerSession& sessio
             const aero::VisualNode* n = cWorld.NodeAtSlot(s);
             if (!n) { continue; }
             if (n->kind == aero::VisualKind::Text) {
-                if (n->text.text.find("Analog Clock Template") != std::string::npos) {
+                if (n->Text().text.find("Analog Clock Template") != std::string::npos) {
                     foundAnalogLabel = true;
-                    Require(n->text.fgRgba == 0xFF000000u,
+                    Require(n->Text().fgRgba == 0xFF000000u,
                         "CustomControl label should render in black on White background");
                 }
-                if (n->text.fontSize >= 38.0f && n->text.text == ":") {
+                if (n->Text().fontSize >= 38.0f && n->Text().text == ":") {
                     foundDigitalHour40 = true;
-                    Require(n->text.fgRgba == 0xFF000000u,
+                    Require(n->Text().fgRgba == 0xFF000000u,
                         "CustomControl Digital clock ':' should render in black at FontSize=40");
                 }
             }
@@ -1723,7 +1748,7 @@ void TestInteractiveCustomControlAndTheme(aero::rs_comp::CompilerSession& sessio
                 }
             }
             if (n->kind == aero::VisualKind::Box &&
-                n->effect.kind == aero::UIEffectKind::DropShadow &&
+                n->Effect().kind == aero::UIEffectKind::DropShadow &&
                 n->box.bgRgba == 0u && n->box.bgGradId <= 0) {
                 // Ensure transparent DropShadow containers do not emit opaque/shadow boxes in render tree
                 for (std::uint32_t k = 0u; k < n->layout.renderNodeCount; ++k) {
@@ -1867,7 +1892,7 @@ void CollectVisualNodesByOwnerName(
 [[nodiscard]] aero::Rect NodeViewportBounds(const aero::VisualNode& node) noexcept {
     aero::Rect r = node.layout.layoutRect;
     if (node.layout.hasPerspective3D) {
-        return node.layout.worldMatrix3D.TransformRectBounds(r);
+        return node.WorldMatrix3D().TransformRectBounds(r);
     }
     if (!node.layout.worldTransform.IsIdentity()) {
         return node.layout.worldTransform.TransformRectBounds(r);
@@ -2051,7 +2076,7 @@ void TestInteractiveScoreboard(aero::rs_comp::CompilerSession&) {
         const aero::VisualNode* lmMid = host.World().GetNode(listMaskNodeId);
         Require(rootMid && !rootMid->layout.isEnabled,
             "Scoreboard Root.IsEnabled should become false during VisibleTeamChanged animation");
-        Require(lmMid && lmMid->opacityMask.enabled,
+        Require(lmMid && lmMid->OpacityMask().enabled,
             "Scoreboard ListMask.opacityMask.enabled should be true during VisibleTeamChanged");
         std::vector<std::uint8_t> teamAnimF1;
         Require(host.RenderHeadlessRgba(1280u, 800u, teamAnimF1), "Scoreboard team switch frame 1 render failed");
@@ -2142,7 +2167,7 @@ void TestInteractiveScoreboard(aero::rs_comp::CompilerSession&) {
     const aero::VisualNode* icon0 = host.World().GetNode(icons[0]);
     const aero::VisualNode* stats0 = host.World().GetNode(statsList[0]);
     Require(over0 && icon0 && stats0, "PlayerRow[0] child nodes null");
-    Require(over0->box.bgOpacity < 0.05f && icon0->layout.opacity == 1.0f && icon0->effect.opacity == 0.0f,
+    Require(over0->box.bgOpacity < 0.05f && icon0->layout.opacity == 1.0f && icon0->Effect().opacity == 0.0f,
         "PlayerRow[0] rest state should keep Over bgOpacity=0, ClassIcon opacity=1, glow effect opacity=0");
 
     const aero::Rect row0Vp = NodeViewportBounds(*host.World().GetNode(rows[0]));
@@ -2158,9 +2183,9 @@ void TestInteractiveScoreboard(aero::rs_comp::CompilerSession&) {
     Require(icon0->transform2D.sx > 1.05f && icon0->transform2D.sy > 1.05f,
         "PlayerRow[0] hover OverOn should scale ClassIcon -> 1.1 (got sx=" +
         std::to_string(icon0->transform2D.sx) + ")");
-    Require(icon0->effect.opacity > 0.3f && icon0->layout.opacity == 1.0f,
+    Require(icon0->Effect().opacity > 0.3f && icon0->layout.opacity == 1.0f,
         "PlayerRow[0] hover OverOn should animate ClassIcon glow EffectOpacity -> 0.4 without hiding ClassIcon (eff=" +
-        std::to_string(icon0->effect.opacity) + ", op=" + std::to_string(icon0->layout.opacity) + ")");
+        std::to_string(icon0->Effect().opacity) + ", op=" + std::to_string(icon0->layout.opacity) + ")");
     Require(stats0->transform2D.tx > 1.5f,
         "PlayerRow[0] hover OverOn should nudge PlayerStats.X -> 2 (got " +
         std::to_string(stats0->transform2D.tx) + ")");
@@ -2175,7 +2200,7 @@ void TestInteractiveScoreboard(aero::rs_comp::CompilerSession&) {
     Require(over0->box.bgOpacity < 0.05f,
         "PlayerRow[0] leave OverOff should animate Over.bgOpacity -> 0 (got " +
         std::to_string(over0->box.bgOpacity) + ")");
-    Require(icon0->transform2D.sx < 1.02f && icon0->effect.opacity < 0.05f && icon0->layout.opacity == 1.0f,
+    Require(icon0->transform2D.sx < 1.02f && icon0->Effect().opacity < 0.05f && icon0->layout.opacity == 1.0f,
         "PlayerRow[0] leave OverOff should restore ClassIcon scale/glow without hiding it");
     Require(stats0->transform2D.tx < 0.2f,
         "PlayerRow[0] leave OverOff should restore PlayerStats.X -> 0");
@@ -2264,6 +2289,944 @@ void TestInteractiveScoreboard(aero::rs_comp::CompilerSession&) {
     }
 }
 
+void CollectDescendantsByTypeName(
+    aero::AeroAppHost& host,
+    aero::VisualNodeId rootId,
+    std::string_view typeName,
+    std::vector<aero::VisualNodeId>& outIds) {
+    outIds.clear();
+    const aero::VisualWorld& world = host.World();
+    std::vector<aero::VisualNodeId> q{rootId};
+    for (std::size_t i = 0u; i < q.size(); ++i) {
+        const aero::VisualNode* n = world.GetNode(q[i]);
+        if (!n) { continue; }
+        std::string tn;
+        if (q[i] != rootId && TryReadNodeTypeName(host, n, tn) && tn == typeName) {
+            outIds.push_back(q[i]);
+        }
+        for (aero::VisualNodeId cid : n->children) {
+            q.push_back(cid);
+        }
+    }
+}
+
+void CollectSubtreeText(
+    const aero::VisualWorld& world,
+    aero::VisualNodeId rootId,
+    std::string& outJoined) {
+    outJoined.clear();
+    std::vector<aero::VisualNodeId> q{rootId};
+    for (std::size_t i = 0u; i < q.size(); ++i) {
+        const aero::VisualNode* n = world.GetNode(q[i]);
+        if (!n) { continue; }
+        if (n->kind == aero::VisualKind::Text && !n->Text().text.empty()) {
+            if (!outJoined.empty()) { outJoined.push_back(' '); }
+            outJoined.append(n->Text().text);
+        }
+        for (aero::VisualNodeId cid : n->children) {
+            q.push_back(cid);
+        }
+    }
+}
+
+void TestInteractiveDataBinding(aero::rs_comp::CompilerSession& session) {
+    std::cout << "[Interactive] DataBinding...\n";
+    aero::AeroV3CompileInput ci;
+    aero::AeroAppHostConfig hc;
+    Require(BuildDiscoveredSample(fs::path(AERO_SAMPLES_DIR) / "DataBinding", nullptr, ci, hc, 960u, 540u),
+        "DataBinding discover failed");
+    aero::AeroAppHost host(hc);
+    std::string err;
+    Require(host.CompileAndLoad(ci, &err), "DataBinding load failed: " + err);
+
+    for (int f = 0; f < 25; ++f) {
+        host.StepFrame(1.0f / 60.0f, f == 24);
+    }
+
+    std::vector<aero::VisualNodeId> items;
+    CollectDescendantsByTypeName(host, host.RootVisualNode(), "ListBoxItem", items);
+    Require(items.size() >= 10u,
+        "DataBinding should realize 10 solar-system ListBoxItems (got " + std::to_string(items.size()) + ")");
+
+    std::vector<aero::VisualNodeId> tooltips;
+    CollectVisualNodesByOwnerName(host, "Tooltip", tooltips);
+    Require(tooltips.size() >= 10u, "DataBinding should create 10 Tooltip Popups");
+
+    auto findVisibleTooltip = [&]() -> aero::VisualNodeId {
+        for (aero::VisualNodeId tid : tooltips) {
+            const aero::VisualNode* n = host.World().GetNode(tid);
+            if (n && n->layout.visibility == aero::Visibility::Visible && !n->children.empty()) {
+                return tid;
+            }
+        }
+        return aero::VisualNodeId{};
+    };
+
+    auto tooltipCardBounds = [&](aero::VisualNodeId tipId) -> aero::Rect {
+        const aero::VisualNode* tip = host.World().GetNode(tipId);
+        if (!tip) { return aero::Rect{}; }
+        const aero::VisualNodeId bdId = FindDescendantByTypeName(host, tipId, "Border");
+        const aero::VisualNode* bd = bdId.IsValid() ? host.World().GetNode(bdId) : tip;
+        return bd ? NodeViewportBounds(*bd) : aero::Rect{};
+    };
+
+    // 1. Select Sun (item 0): diameter must format as "1380000" (no scientific notation "1.38e+06")
+    if (!items.empty()) {
+        const aero::Rect sunVp = NodeViewportBounds(*host.World().GetNode(items[0]));
+        host.InjectClick(sunVp.x + sunVp.width * 0.5f, sunVp.y + sunVp.height * 0.5f);
+        for (int f = 0; f < 25; ++f) {
+            host.StepFrame(1.0f / 60.0f, f == 24);
+        }
+        const aero::VisualNodeId sunTip = findVisibleTooltip();
+        Require(sunTip.IsValid(), "DataBinding Sun Tooltip should be visible after click");
+        if (sunTip.IsValid()) {
+            std::string tipText;
+            CollectSubtreeText(host.World(), sunTip, tipText);
+            Require(tipText.find("1380000") != std::string::npos,
+                "DataBinding Sun Tooltip should format Diameter as 1380000 (got text: " + tipText + ")");
+            Require(tipText.find("1.38e") == std::string::npos && tipText.find("1.38E") == std::string::npos,
+                "DataBinding Sun Tooltip must not use scientific notation (got text: " + tipText + ")");
+        }
+        MaybeDumpScreenshot(host, "databinding_sun.ppm", 960u, 540u);
+    }
+
+    // 2. Select Pluto (last item) and check automatic popup placement + resize recalculation
+    if (items.size() >= 10u) {
+        const aero::Rect plutoVp = NodeViewportBounds(*host.World().GetNode(items[9]));
+        host.InjectClick(plutoVp.x + plutoVp.width * 0.5f, plutoVp.y + plutoVp.height * 0.5f);
+        for (int f = 0; f < 25; ++f) {
+            host.StepFrame(1.0f / 60.0f, f == 24);
+        }
+        const aero::VisualNodeId plutoTip = findVisibleTooltip();
+        Require(plutoTip.IsValid(), "DataBinding Pluto Tooltip should be visible after click");
+        if (plutoTip.IsValid()) {
+            const aero::Rect vp0 = tooltipCardBounds(plutoTip);
+            Require(vp0.width > 100.0f && vp0.x >= -0.5f && vp0.y >= -0.5f &&
+                    vp0.x + vp0.width <= 961.0f && vp0.y + vp0.height <= 541.0f,
+                "DataBinding Pluto Tooltip should stay on-screen at 960x540 (got " +
+                std::to_string(vp0.x) + "," + std::to_string(vp0.y) + " " +
+                std::to_string(vp0.width) + "x" + std::to_string(vp0.height) + ")");
+
+            host.InjectResize(540u, 530u);
+            for (int f = 0; f < 4; ++f) {
+                host.StepFrame(1.0f / 60.0f, f == 3);
+            }
+            const aero::Rect vp540 = tooltipCardBounds(plutoTip);
+            Require(vp540.width > 50.0f && vp540.x >= -0.5f && vp540.y >= -0.5f &&
+                    vp540.x + vp540.width <= 541.0f && vp540.y + vp540.height <= 531.0f,
+                "DataBinding Pluto Tooltip should recalculate inside 540x530 without clipping (got " +
+                std::to_string(vp540.x) + "," + std::to_string(vp540.y) + " " +
+                std::to_string(vp540.width) + "x" + std::to_string(vp540.height) + ")");
+            MaybeDumpScreenshot(host, "databinding_pluto_540.ppm", 540u, 530u);
+
+            host.InjectResize(960u, 540u);
+            for (int f = 0; f < 4; ++f) {
+                host.StepFrame(1.0f / 60.0f, f == 3);
+            }
+            const aero::Rect vp960 = tooltipCardBounds(plutoTip);
+            Require(vp960.width > 100.0f && vp960.x >= -0.5f && vp960.y >= -0.5f &&
+                    vp960.x + vp960.width <= 961.0f && vp960.y + vp960.height <= 541.0f,
+                "DataBinding Pluto Tooltip should recalculate cleanly after resize back to 960x540");
+            MaybeDumpScreenshot(host, "databinding_pluto_960.ppm", 960u, 540u);
+        }
+    }
+}
+
+void TestInteractiveIntegration(aero::rs_comp::CompilerSession& session) {
+    std::cout << "[Interactive] Integration...\n";
+    aero::AeroV3CompileInput ci;
+    aero::AeroAppHostConfig hc;
+    Require(BuildDiscoveredSample(fs::path(AERO_SAMPLES_DIR) / "Integration", nullptr, ci, hc, 960u, 540u),
+        "Integration discover failed");
+    aero::AeroAppHost host(hc);
+    std::string err;
+    Require(host.CompileAndLoad(ci, &err), "Integration load failed: " + err);
+
+    for (int f = 0; f < 15; ++f) {
+        host.StepFrame(1.0f / 60.0f, f == 14);
+    }
+
+    std::vector<aero::VisualNodeId> tabs;
+    CollectDescendantsByTypeName(host, host.RootVisualNode(), "TabItem", tabs);
+    Require(tabs.size() == 3u, "Integration should have 3 TabItems (got " + std::to_string(tabs.size()) + ")");
+    MaybeDumpScreenshot(host, "integration_game.ppm", 960u, 540u);
+
+    if (tabs.size() >= 2u) {
+        const aero::Rect videoTabVp = NodeViewportBounds(*host.World().GetNode(tabs[1]));
+        host.InjectClick(videoTabVp.x + videoTabVp.width * 0.5f, videoTabVp.y + videoTabVp.height * 0.5f);
+        for (int f = 0; f < 10; ++f) {
+            host.StepFrame(1.0f / 60.0f, f == 9);
+        }
+        MaybeDumpScreenshot(host, "integration_video.ppm", 960u, 540u);
+
+        // Open Screen Resolution ComboBox (first ComboBox in active Video tab)
+        std::vector<aero::VisualNodeId> combos;
+        CollectDescendantsByTypeName(host, host.RootVisualNode(), "ComboBox", combos);
+        aero::VisualNodeId resComboId;
+        for (aero::VisualNodeId cid : combos) {
+            const aero::VisualNode* n = host.World().GetNode(cid);
+            if (n && n->layout.visibility == aero::Visibility::Visible && n->layout.layoutRect.width > 10.0f) {
+                resComboId = cid;
+                break;
+            }
+        }
+        Require(resComboId.IsValid(), "Integration Video ComboBox not visible");
+        if (resComboId.IsValid()) {
+            const aero::Rect cbVp = NodeViewportBounds(*host.World().GetNode(resComboId));
+            const aero::VisualNodeId popId = FindDescendantByOwnerName(host, resComboId, "PART_Popup");
+            host.InjectClick(cbVp.x + cbVp.width * 0.5f, cbVp.y + cbVp.height * 0.5f);
+            for (int f = 0; f < 4; ++f) {
+                host.StepFrame(1.0f / 60.0f, f == 3);
+            }
+            const aero::VisualNode* popNode = popId.IsValid() ? host.World().GetNode(popId) : nullptr;
+            Require(popNode && popNode->layout.visibility == aero::Visibility::Visible,
+                "Integration ComboBox PART_Popup should be visible after click");
+            if (popId.IsValid()) {
+                std::vector<aero::VisualNodeId> cbItems;
+                CollectDescendantsByTypeName(host, popId, "ComboBoxItem", cbItems);
+                Require(!cbItems.empty(), "Integration ComboBox should realize ComboBoxItems");
+                if (!cbItems.empty()) {
+                    const aero::Rect itemVp = NodeViewportBounds(*host.World().GetNode(cbItems[0]));
+                    Require(itemVp.height >= 26.0f,
+                        "Integration ComboBoxItem height should reflect 10,8 padding (got " +
+                        std::to_string(itemVp.height) + ")");
+                }
+            }
+            MaybeDumpScreenshot(host, "integration_combobox_open.ppm", 960u, 540u);
+            // Close ComboBox dropdown by clicking header again
+            host.InjectClick(cbVp.x + cbVp.width * 0.5f, cbVp.y + cbVp.height * 0.5f);
+            for (int f = 0; f < 3; ++f) {
+                host.StepFrame(1.0f / 60.0f, f == 2);
+            }
+        }
+
+        // Hover vertical ScrollBar on Video tab -> expands & shows dark track/chevrons
+        std::vector<aero::VisualNodeId> bars;
+        CollectDescendantsByTypeName(host, host.RootVisualNode(), "ScrollBar", bars);
+        aero::VisualNodeId vBarId;
+        for (aero::VisualNodeId bid : bars) {
+            const aero::VisualNode* bn = host.World().GetNode(bid);
+            const aero::Rect bvp = bn ? NodeViewportBounds(*bn) : aero::Rect{};
+            if (bn && bn->layout.visibility == aero::Visibility::Visible && bvp.height > bvp.width && bvp.width > 2.0f) {
+                vBarId = bid;
+                break;
+            }
+        }
+        Require(vBarId.IsValid(), "Integration visible vertical ScrollBar not found");
+        if (vBarId.IsValid()) {
+            std::vector<std::uint8_t> preHover;
+            Require(host.RenderHeadlessRgba(960u, 540u, preHover), "Integration pre-scrollbar-hover render failed");
+            const aero::Rect sbVp = NodeViewportBounds(*host.World().GetNode(vBarId));
+            host.InjectPointerMove(sbVp.x + sbVp.width * 0.5f, sbVp.y + sbVp.height * 0.5f);
+            for (int f = 0; f < 15; ++f) {
+                host.StepFrame(1.0f / 60.0f, f == 14);
+            }
+            std::vector<std::uint8_t> postHover;
+            Require(host.RenderHeadlessRgba(960u, 540u, postHover), "Integration post-scrollbar-hover render failed");
+            Require(CountChangedPixels(preHover, postHover) > 50u,
+                "Integration ScrollBar hover should animate dark track and chevrons");
+            MaybeDumpScreenshot(host, "integration_scrollbar_hover.ppm", 960u, 540u);
+        }
+    }
+
+    if (tabs.size() >= 3u) {
+        const aero::Rect audioTabVp = NodeViewportBounds(*host.World().GetNode(tabs[2]));
+        host.InjectClick(audioTabVp.x + audioTabVp.width * 0.5f, audioTabVp.y + audioTabVp.height * 0.5f);
+        for (int f = 0; f < 10; ++f) {
+            host.StepFrame(1.0f / 60.0f, f == 9);
+        }
+        MaybeDumpScreenshot(host, "integration_audio.ppm", 960u, 540u);
+    }
+}
+
+void TestInteractiveMenu3D(aero::rs_comp::CompilerSession& session, std::uint32_t clearRgba) {
+    std::cout << "[Interactive] Menu3D...\n";
+    aero::AeroV3CompileInput ci;
+    aero::AeroAppHostConfig hc;
+    Require(BuildDiscoveredSample(fs::path(AERO_SAMPLES_DIR) / "Menu3D", nullptr, ci, hc, 1280u, 720u),
+        "Menu3D discover failed");
+    aero::AeroAppHost host(hc);
+    std::string err;
+    Require(host.CompileAndLoad(ci, &err), "Menu3D load failed: " + err);
+
+    for (int f = 0; f < 30; ++f) {
+        host.StepFrame(1.0f / 60.0f, f == 29);
+    }
+
+    // 1. MainMenu checks: AnimatedBackground parallax layers & pixels, PC-only MenuDesc, single active tooltip
+    const std::array<const char*, 5> kParallaxLayers = {
+        "SkyAndSun", "BackClouds", "Mountains", "FrontClouds", "FrontTrees"
+    };
+    const std::array<const char*, 5> kParallaxWidths = {
+        "SkyAndSunWidth", "BackCloudsWidth", "MountainsWidth", "FrontCloudsWidth", "FrontTreesWidth"
+    };
+    for (const char* layerName : kParallaxLayers) {
+        const aero::VisualNodeId lid = host.FindVisualByOwnerName(layerName);
+        const aero::VisualNode* ln = lid.IsValid() ? host.World().GetNode(lid) : nullptr;
+        Require(ln && ln->layout.layoutRect.width > 100.0f && ln->layout.layoutRect.height > 15.0f,
+            std::string("Menu3D parallax layer '") + layerName + "' should have non-zero layout bounds");
+    }
+    for (const char* widthName : kParallaxWidths) {
+        const aero::VisualNodeId wid = host.FindVisualByOwnerName(widthName);
+        const aero::VisualNode* wn = wid.IsValid() ? host.World().GetNode(wid) : nullptr;
+        Require(wn && wn->layout.layoutRect.width > 100.0f && wn->layout.layoutRect.height > 15.0f,
+            std::string("Menu3D parallax image '") + widthName + "' should have non-zero layout bounds");
+    }
+    const aero::VisualNodeId ftId = host.FindVisualByOwnerName("FrontTrees");
+    const aero::VisualNode* ftNode0 = ftId.IsValid() ? host.World().GetNode(ftId) : nullptr;
+    const float ftTxBefore = ftNode0 ? ftNode0->transform2D.tx : 0.0f;
+    for (int f = 0; f < 30; ++f) {
+        host.StepFrame(1.0f / 60.0f, f == 29);
+    }
+    const aero::VisualNode* ftNode1 = ftId.IsValid() ? host.World().GetNode(ftId) : nullptr;
+    const float ftTxAfter = ftNode1 ? ftNode1->transform2D.tx : 0.0f;
+    Require(ftNode1 && std::fabs(ftTxAfter - ftTxBefore) > 0.01f,
+        "Menu3D BackgroundAnim should animate FrontTrees parallax TranslateTransform.X (before=" +
+        std::to_string(ftTxBefore) + ", after=" + std::to_string(ftTxAfter) + ")");
+
+    std::vector<std::uint8_t> mainRgba;
+    Require(host.RenderHeadlessRgba(1280u, 720u, mainRgba), "Menu3D MainMenu render failed");
+    const ImageMetrics mainMetrics = ComputeExactImageMetrics(mainRgba, clearRgba);
+    Require(mainMetrics.nonBlankPercent > 70.0,
+        "Menu3D AnimatedBackground should cover canvas (nonBlankPercent=" +
+        std::to_string(mainMetrics.nonBlankPercent) + "%)");
+
+    auto checkVis = [&](std::string_view name, aero::Visibility expected) {
+        const aero::VisualNodeId id = host.FindVisualByOwnerName(name);
+        const aero::VisualNode* n = id.IsValid() ? host.World().GetNode(id) : nullptr;
+        Require(n && n->layout.visibility == expected,
+            "Menu3D '" + std::string(name) + "' visibility mismatch");
+    };
+    checkVis("PCAccept", aero::Visibility::Visible);
+    checkVis("PCCancel", aero::Visibility::Visible);
+    checkVis("XBOXAccept", aero::Visibility::Collapsed);
+    checkVis("PS4Accept", aero::Visibility::Collapsed);
+    checkVis("XBOXCancel", aero::Visibility::Collapsed);
+    checkVis("PS4Cancel", aero::Visibility::Collapsed);
+
+    const aero::VisualNodeId tipsId = host.FindVisualByOwnerName("ToolTips");
+    if (tipsId.IsValid()) {
+        const aero::VisualNode* tips = host.World().GetNode(tipsId);
+        int activeTips = 0;
+        if (tips) {
+            for (aero::VisualNodeId cid : tips->children) {
+                const aero::VisualNode* c = host.World().GetNode(cid);
+                if (!c || c->layout.visibility != aero::Visibility::Visible) {
+                    continue;
+                }
+                float effOpacity = c->layout.opacity;
+                std::vector<aero::VisualNodeId> q{cid};
+                for (std::size_t qi = 0u; qi < q.size(); ++qi) {
+                    const aero::VisualNode* qn = host.World().GetNode(q[qi]);
+                    if (!qn) { continue; }
+                    if (qn->kind == aero::VisualKind::Text) {
+                        effOpacity *= qn->Text().fgOpacity;
+                        break;
+                    }
+                    for (aero::VisualNodeId sub : qn->children) {
+                        q.push_back(sub);
+                    }
+                }
+                if (effOpacity > 0.5f) {
+                    ++activeTips;
+                }
+            }
+        }
+        Require(activeTips <= 1,
+            "Menu3D ToolTips should display at most 1 active tooltip at a time (got " +
+            std::to_string(activeTips) + ")");
+    }
+    MaybeDumpScreenshot(host, "menu3d_main.ppm", 1280u, 720u);
+
+    // 2. Navigate to Start -> StartMenu (Casual/Normal/Expert badges + Back/Esc)
+    float sx = 0.0f, sy = 0.0f;
+    if (RequireNodeCenter(host, "Start", sx, sy)) {
+        host.InjectClick(sx, sy);
+        for (int f = 0; f < 65; ++f) {
+            host.StepFrame(1.0f / 60.0f, f == 64);
+        }
+        float cx = 0.0f, cy = 0.0f, nx = 0.0f, ny = 0.0f;
+        Require(RequireNodeCenter(host, "Casual", cx, cy), "Menu3D StartMenu Casual button missing");
+        host.InjectClick(cx, cy);
+        for (int f = 0; f < 16; ++f) {
+            host.StepFrame(1.0f / 60.0f, f == 15);
+        }
+        const aero::VisualNodeId casualTreeId = host.FindVisualByOwnerName("CasualTree");
+        const aero::VisualNode* casualTree = casualTreeId.IsValid() ? host.World().GetNode(casualTreeId) : nullptr;
+        Require(casualTree && casualTree->layout.opacity > 0.5f,
+            "Menu3D StartMenu CasualTree should activate after checking Casual");
+
+        if (RequireNodeCenter(host, "Normal", nx, ny)) {
+            host.InjectClick(nx, ny);
+            for (int f = 0; f < 16; ++f) {
+                host.StepFrame(1.0f / 60.0f, f == 15);
+            }
+            const aero::VisualNodeId normalTreeId = host.FindVisualByOwnerName("NormalTree");
+            const aero::VisualNode* normalTree = normalTreeId.IsValid() ? host.World().GetNode(normalTreeId) : nullptr;
+            Require(normalTree && normalTree->layout.opacity > 0.5f,
+                "Menu3D StartMenu NormalTree should activate after checking Normal");
+        }
+        MaybeDumpScreenshot(host, "menu3d_start.ppm", 1280u, 720u);
+
+        float bx = 0.0f, by = 0.0f;
+        if (RequireNodeCenter(host, "Back", bx, by)) {
+            host.InjectClick(bx, by);
+            for (int f = 0; f < 65; ++f) {
+                host.StepFrame(1.0f / 60.0f, f == 64);
+            }
+        }
+        Require(host.FindVisualByOwnerName("Settings").IsValid(),
+            "Menu3D Back from StartMenu should return to MainMenu");
+    }
+
+    // 3. Navigate to Settings -> SettingsMenu (OptionSelector < / > + keys, CheckBox, Esc back)
+    float setX = 0.0f, setY = 0.0f;
+    if (RequireNodeCenter(host, "Settings", setX, setY)) {
+        host.InjectClick(setX, setY);
+        for (int f = 0; f < 65; ++f) {
+            host.StepFrame(1.0f / 60.0f, f == 64);
+        }
+        const aero::VisualNodeId texId = host.FindVisualByOwnerName("TexDetailContent");
+        const aero::VisualNodeId soundId = host.FindVisualByOwnerName("SoundVol");
+        const aero::VisualNodeId aaId = host.FindVisualByOwnerName("AAlias");
+        const aero::VisualNode* texNode = texId.IsValid() ? host.World().GetNode(texId) : nullptr;
+        const aero::VisualNode* soundNode = soundId.IsValid() ? host.World().GetNode(soundId) : nullptr;
+        Require(texNode && texNode->scriptOwner.valid(), "Menu3D Settings TexDetailContent missing");
+        const aero::VisualNodeId soundListId = soundNode ? FindDescendantByTypeName(host, soundId, "ListBox") : aero::VisualNodeId{};
+        const aero::VisualNode* soundList = soundListId.IsValid() ? host.World().GetNode(soundListId) : nullptr;
+
+        if (texNode && texNode->scriptOwner.valid()) {
+            auto dumpMenu3DState = [&](const char* tag) {
+                std::int64_t si = -999, rsi = -999, rpend = -999;
+                const bool okSi = ReadIntMember(host, texNode->scriptOwner, "SelectedIndex", si);
+                const bool okRsi = ReadIntMember(host, texNode->scriptOwner, "_selectedIndex", rsi);
+                const bool okPend = ReadIntMember(host, texNode->scriptOwner, "_pendingSelectedIndex", rpend);
+                const aero::VisualNodeId auxId = FindDescendantByOwnerName(host, texId, "SelectedIndexAux");
+                const aero::VisualNode* auxN = auxId.IsValid() ? host.World().GetNode(auxId) : nullptr;
+                float auxVal = -999.0f, auxMin = -999.0f, auxMax = -999.0f;
+                bool okAv = auxN && ReadFloatMember(host, auxN->scriptOwner, "Value", auxVal);
+                bool okAmin = auxN && ReadFloatMember(host, auxN->scriptOwner, "Minimum", auxMin);
+                bool okAmax = auxN && ReadFloatMember(host, auxN->scriptOwner, "Maximum", auxMax);
+                const aero::VisualNodeId nbId = FindDescendantByOwnerName(host, texId, "NextButton");
+                const aero::VisualNode* nb = nbId.IsValid() ? host.World().GetNode(nbId) : nullptr;
+                bool nbEn = false;
+                if (nb) { (void)ReadBoolMember(host, nb->scriptOwner, "IsEnabled", nbEn); }
+                std::fprintf(stderr, "[M3D_DIAG] %s: SelectedIndex(ok=%d val=%lld) _selectedIndex(ok=%d %lld) _pending(ok=%d %lld) aux(id=%u okV=%d val=%.2f min=%.2f max=%.2f) nextEn=%d\n",
+                    tag, okSi?1:0, static_cast<long long>(si), okRsi?1:0, static_cast<long long>(rsi),
+                    okPend?1:0, static_cast<long long>(rpend),
+                    auxN ? auxN->id.index : 0u, okAv?1:0, auxVal, auxMin, auxMax, nbEn?1:0);
+            };
+            dumpMenu3DState("initial");
+            std::int64_t idx0 = -1, snd0 = -1;
+            Require(ReadIntMember(host, texNode->scriptOwner, "SelectedIndex", idx0) && idx0 == 1,
+                "Menu3D TexDetailContent initial SelectedIndex should be 1 (got " + std::to_string(idx0) + ")");
+            if (soundList && soundList->scriptOwner.valid()) {
+                (void)ReadIntMember(host, soundList->scriptOwner, "SelectedIndex", snd0);
+            }
+
+            const aero::VisualNodeId nextBtnId = FindDescendantByOwnerName(host, texId, "NextButton");
+            Require(nextBtnId.IsValid(), "Menu3D TexDetailContent NextButton missing");
+            if (nextBtnId.IsValid()) {
+                const aero::Rect nextVp = NodeViewportBounds(*host.World().GetNode(nextBtnId));
+                host.InjectClick(nextVp.x + nextVp.width * 0.5f, nextVp.y + nextVp.height * 0.5f);
+                for (int f = 0; f < 5; ++f) {
+                    host.StepFrame(1.0f / 60.0f, f == 4);
+                }
+                dumpMenu3DState("after_next");
+                std::int64_t idxAfterNext = -1, sndAfterNext = -1;
+                const bool okNextIdx = ReadIntMember(host, texNode->scriptOwner, "SelectedIndex", idxAfterNext);
+                Require(okNextIdx && idxAfterNext == 2,
+                    "Menu3D NextButton should advance TexDetailContent SelectedIndex to 2 (got " +
+                    std::to_string(idxAfterNext) + ")");
+                if (soundList && soundList->scriptOwner.valid()) {
+                    const bool okSnd = ReadIntMember(host, soundList->scriptOwner, "SelectedIndex", sndAfterNext);
+                    Require(okSnd && sndAfterNext == snd0,
+                        "Menu3D TexDetail NextButton must not mutate sibling SoundVol SelectedIndex");
+                }
+            }
+
+            const aero::VisualNodeId prevBtnId = FindDescendantByOwnerName(host, texId, "PrevButton");
+            if (prevBtnId.IsValid()) {
+                const aero::Rect prevVp = NodeViewportBounds(*host.World().GetNode(prevBtnId));
+                host.InjectClick(prevVp.x + prevVp.width * 0.5f, prevVp.y + prevVp.height * 0.5f);
+                for (int f = 0; f < 5; ++f) {
+                    host.StepFrame(1.0f / 60.0f, f == 4);
+                }
+                dumpMenu3DState("after_prev");
+                std::int64_t idxAfterPrev = -1;
+                const bool okPrevIdx = ReadIntMember(host, texNode->scriptOwner, "SelectedIndex", idxAfterPrev);
+                Require(okPrevIdx && idxAfterPrev == 1,
+                    "Menu3D PrevButton should return TexDetailContent SelectedIndex to 1 (got " +
+                    std::to_string(idxAfterPrev) + ")");
+            }
+
+            // Keyboard Right on focused TexDetailContent -> advances SelectedIndex to 2
+            const aero::Rect texVp = NodeViewportBounds(*texNode);
+            host.InjectClick(texVp.x + texVp.width * 0.5f, texVp.y + texVp.height * 0.5f);
+            host.InjectKey(aero::KeyCode::Right, true);
+            host.InjectKey(aero::KeyCode::Right, false);
+            for (int f = 0; f < 5; ++f) {
+                host.StepFrame(1.0f / 60.0f, f == 4);
+            }
+            dumpMenu3DState("after_key");
+            std::int64_t idxAfterKey = -1;
+            const bool okKeyIdx = ReadIntMember(host, texNode->scriptOwner, "SelectedIndex", idxAfterKey);
+            Require(okKeyIdx && idxAfterKey == 2,
+                "Menu3D Right key should advance TexDetailContent SelectedIndex to 2 (got " +
+                std::to_string(idxAfterKey) + ")");
+        }
+
+        if (aaId.IsValid()) {
+            const aero::VisualNodeId cbId = FindDescendantByTypeName(host, aaId, "CheckBox");
+            const aero::VisualNode* cb = cbId.IsValid() ? host.World().GetNode(cbId) : nullptr;
+            if (cb && cb->scriptOwner.valid()) {
+                const aero::Rect cbVp = NodeViewportBounds(*cb);
+                host.InjectClick(cbVp.x + cbVp.width * 0.5f, cbVp.y + cbVp.height * 0.5f);
+                for (int f = 0; f < 4; ++f) {
+                    host.StepFrame(1.0f / 60.0f, f == 3);
+                }
+                bool aaChecked = false;
+                Require(ReadBoolMember(host, cb->scriptOwner, "IsChecked", aaChecked) && aaChecked,
+                    "Menu3D Anti-Aliasing CheckBox should toggle IsChecked on click");
+            }
+        }
+        MaybeDumpScreenshot(host, "menu3d_settings.ppm", 1280u, 720u);
+
+        host.InjectKey(aero::KeyCode::Escape, true);
+        host.InjectKey(aero::KeyCode::Escape, false);
+        for (int f = 0; f < 65; ++f) {
+            host.StepFrame(1.0f / 60.0f, f == 64);
+        }
+        Require(host.FindVisualByOwnerName("Start").IsValid(),
+            "Menu3D Escape from SettingsMenu should navigate back to MainMenu");
+    }
+
+    // 4. Code-Behind NavigateToSettings / NavigateToStart / NavigateToMain keep VM.ActiveMenu & UI synchronized
+    aero::ObjectRef menuVm{};
+    Require(ReadObjectMember(host, host.RootScriptObject(), "VM", menuVm), "Menu3D VM missing");
+    Require(host.InvokeScriptMethod(host.RootScriptObject(), "NavigateToSettings"),
+        "Menu3D NavigateToSettings code-behind failed");
+    for (int f = 0; f < 45; ++f) {
+        host.StepFrame(1.0f / 60.0f, f == 44);
+    }
+    std::string activeAfterSettings;
+    Require(ReadStringMember(host, menuVm, "ActiveMenu", activeAfterSettings) && activeAfterSettings == "Settings",
+        "Menu3D NavigateToSettings should set VM.ActiveMenu = 'Settings'");
+    Require(host.FindVisualByOwnerName("TexDetailContent").IsValid(),
+        "Menu3D NavigateToSettings should show SettingsMenu (TexDetailContent)");
+
+    Require(host.InvokeScriptMethod(host.RootScriptObject(), "NavigateToStart"),
+        "Menu3D NavigateToStart code-behind failed");
+    for (int f = 0; f < 45; ++f) {
+        host.StepFrame(1.0f / 60.0f, f == 44);
+    }
+    std::string activeAfterStart;
+    Require(ReadStringMember(host, menuVm, "ActiveMenu", activeAfterStart) && activeAfterStart == "Start",
+        "Menu3D NavigateToStart should set VM.ActiveMenu = 'Start'");
+    Require(host.FindVisualByOwnerName("Casual").IsValid(),
+        "Menu3D NavigateToStart should show StartMenu (Casual)");
+
+    Require(host.InvokeScriptMethod(host.RootScriptObject(), "NavigateToMain"),
+        "Menu3D NavigateToMain code-behind failed");
+    for (int f = 0; f < 45; ++f) {
+        host.StepFrame(1.0f / 60.0f, f == 44);
+    }
+    std::string activeAfterMain;
+    Require(ReadStringMember(host, menuVm, "ActiveMenu", activeAfterMain) && activeAfterMain == "Main",
+        "Menu3D NavigateToMain should set VM.ActiveMenu = 'Main'");
+    Require(host.FindVisualByOwnerName("Start").IsValid() && host.FindVisualByOwnerName("Settings").IsValid(),
+        "Menu3D NavigateToMain should show MainMenu (Start/Settings)");
+}
+
+void TestInteractiveBackgroundBlur(aero::rs_comp::CompilerSession&) {
+    std::cout << "[Interactive] BackgroundBlur...\n";
+    aero::AeroV3CompileInput ci;
+    aero::AeroAppHostConfig hc;
+    Require(BuildDiscoveredSample(fs::path(AERO_SAMPLES_DIR) / "BackgroundBlur", nullptr, ci, hc, 960u, 540u),
+        "BackgroundBlur discover failed");
+    aero::AeroAppHost host(hc);
+    std::string err;
+    Require(host.CompileAndLoad(ci, &err), "BackgroundBlur load failed: " + err);
+
+    for (int f = 0; f < 15; ++f) {
+        host.StepFrame(1.0f / 60.0f, f == 14);
+    }
+
+    const aero::VisualNodeId topBlurId = host.FindVisualByOwnerName("TopPanelBlur");
+    const aero::VisualNodeId botBlurId = host.FindVisualByOwnerName("BottomPanelBlur");
+    const aero::VisualNodeId topSliderId = host.FindVisualByOwnerName("TopBlurRadius");
+    const aero::VisualNodeId botSliderId = host.FindVisualByOwnerName("BottomBlurRadius");
+    Require(topBlurId.IsValid() && botBlurId.IsValid() && topSliderId.IsValid() && botSliderId.IsValid(),
+        "BackgroundBlur TopPanelBlur / BottomPanelBlur / Sliders missing");
+
+    const aero::VisualNode* topBlurNode = host.World().GetNode(topBlurId);
+    const aero::VisualNode* botBlurNode = host.World().GetNode(botBlurId);
+    Require(topBlurNode && topBlurNode->Effect().kind == aero::UIEffectKind::BackdropBlur &&
+            topBlurNode->Effect().radius > 15.0f,
+        "BackgroundBlur TopPanelBlur should bind initial BackdropBlur radius (~20)");
+    Require(botBlurNode && botBlurNode->Effect().kind == aero::UIEffectKind::BackdropBlur &&
+            botBlurNode->Effect().radius > 5.0f,
+        "BackgroundBlur BottomPanelBlur should bind initial BackdropBlur radius (~10)");
+
+    const auto& spans0 = host.RenderTree().BlurLayerSpans();
+    int backdropSpanCount = 0;
+    aero::Rect firstBackdropMask{};
+    for (const auto& sp : spans0) {
+        if (sp.effectMode == aero::UIEffectKind::BackdropBlur) {
+            ++backdropSpanCount;
+            Require(sp.maskDestRect.width > 10.0f && sp.maskDestRect.height > 10.0f,
+                "BackdropBlur BlurLayerSpan::maskDestRect must be valid and non-zero");
+            Require(sp.maskOpacity > 0.0f, "BackdropBlur maskOpacity must be > 0");
+            if (backdropSpanCount == 1) {
+                firstBackdropMask = sp.maskDestRect;
+            }
+        }
+    }
+    Require(backdropSpanCount >= 2,
+        "BackgroundBlur should emit >= 2 BackdropBlur BlurLayerSpans (got " + std::to_string(backdropSpanCount) + ")");
+
+    std::vector<std::uint8_t> frame0;
+    Require(host.RenderHeadlessRgba(960u, 540u, frame0), "BackgroundBlur initial render failed");
+
+    // Verify BackdropBlur produces real pixel blur: compare TopBlurRadius slider changed to minimum (~0)
+    const aero::VisualNode* topSliderNode = host.World().GetNode(topSliderId);
+    const aero::VisualNode* botSliderNode = host.World().GetNode(botSliderId);
+    Require(topSliderNode && topSliderNode->scriptOwner.valid() &&
+            botSliderNode && botSliderNode->scriptOwner.valid(),
+        "BackgroundBlur Slider scriptOwners missing");
+    if (!topSliderNode || !botSliderNode) {
+        return;
+    }
+
+    float topVal0 = 0.0f;
+    float botVal0 = 0.0f;
+    Require(ReadFloatMember(host, topSliderNode->scriptOwner, "Value", topVal0),
+        "BackgroundBlur TopBlurRadius.Value unreadable");
+    Require(ReadFloatMember(host, botSliderNode->scriptOwner, "Value", botVal0),
+        "BackgroundBlur BottomBlurRadius.Value unreadable");
+
+    // Click near left edge of TopBlurRadius slider to reduce blur radius sharply
+    const aero::Rect topSliderVp = NodeViewportBounds(*topSliderNode);
+    host.InjectClick(topSliderVp.x + 2.0f, topSliderVp.y + topSliderVp.height * 0.5f);
+    for (int f = 0; f < 5; ++f) {
+        host.StepFrame(1.0f / 60.0f, f == 4);
+    }
+
+    float topVal1 = topVal0;
+    Require(ReadFloatMember(host, topSliderNode->scriptOwner, "Value", topVal1) &&
+            topVal1 < topVal0 - 5.0f,
+        "Clicking left end of TopBlurRadius slider should decrease Value (before=" +
+        std::to_string(topVal0) + ", after=" + std::to_string(topVal1) + ")");
+
+    topBlurNode = host.World().GetNode(topBlurId);
+    Require(topBlurNode && std::fabs(topBlurNode->Effect().radius - topVal1) < 1.5f,
+        "TopPanelBlur BackdropBlur radius should update live with TopBlurRadius slider (nodeRadius=" +
+        std::to_string(topBlurNode ? topBlurNode->Effect().radius : -1.0f) + ", slider=" +
+        std::to_string(topVal1) + ")");
+
+    bool foundUpdatedSpan = false;
+    for (const auto& sp : host.RenderTree().BlurLayerSpans()) {
+        if (sp.effectMode == aero::UIEffectKind::BackdropBlur &&
+            std::fabs(sp.radiusPx - topVal1) < 1.5f) {
+            foundUpdatedSpan = true;
+            break;
+        }
+    }
+    Require(foundUpdatedSpan, "BlurLayerSpan::radiusPx should reflect updated TopBlurRadius slider value");
+
+    std::vector<std::uint8_t> frame1;
+    Require(host.RenderHeadlessRgba(960u, 540u, frame1), "BackgroundBlur post-top-slider render failed");
+    Require(CountChangedPixels(frame0, frame1) > 20u,
+        "Changing TopBlurRadius slider must produce real BackdropBlur pixel changes (diff=" +
+        std::to_string(CountChangedPixels(frame0, frame1)) + ")");
+
+    // Also click near right edge of BottomBlurRadius slider to increase bottom blur radius
+    const aero::Rect botSliderVp = NodeViewportBounds(*botSliderNode);
+    host.InjectClick(botSliderVp.x + botSliderVp.width - 2.0f, botSliderVp.y + botSliderVp.height * 0.5f);
+    for (int f = 0; f < 5; ++f) {
+        host.StepFrame(1.0f / 60.0f, f == 4);
+    }
+    float botVal1 = botVal0;
+    Require(ReadFloatMember(host, botSliderNode->scriptOwner, "Value", botVal1) &&
+            botVal1 > botVal0 + 5.0f,
+        "Clicking right end of BottomBlurRadius slider should increase Value (before=" +
+        std::to_string(botVal0) + ", after=" + std::to_string(botVal1) + ")");
+    botBlurNode = host.World().GetNode(botBlurId);
+    Require(botBlurNode && std::fabs(botBlurNode->Effect().radius - botVal1) < 1.5f,
+        "BottomPanelBlur BackdropBlur radius should update live with BottomBlurRadius slider");
+
+    std::vector<std::uint8_t> frame2;
+    Require(host.RenderHeadlessRgba(960u, 540u, frame2), "BackgroundBlur post-bottom-slider render failed");
+    Require(CountChangedPixels(frame1, frame2) > 20u,
+        "Changing BottomBlurRadius slider must produce real BackdropBlur pixel changes");
+    (void)firstBackdropMask;
+}
+
+void TestInteractiveGallery(aero::rs_comp::CompilerSession& session) {
+    std::cout << "[Interactive] Gallery...\n";
+    aero::AeroV3CompileInput ci;
+    aero::AeroAppHostConfig hc;
+    Require(BuildDiscoveredSample(fs::path(AERO_SAMPLES_DIR) / "Gallery", &session, ci, hc, 1280u, 800u),
+        "Gallery discover failed");
+    aero::AeroAppHost host(hc);
+    std::string err;
+    Require(host.CompileAndLoad(ci, &err), "Gallery load failed: " + err);
+
+    for (int f = 0; f < 20; ++f) {
+        host.StepFrame(1.0f / 60.0f, f == 19);
+    }
+
+    const aero::VisualNodeId selectorTreeId = host.FindVisualByOwnerName("SelectorTree");
+    Require(selectorTreeId.IsValid(), "Gallery SelectorTree missing");
+    const aero::VisualNode* selectorTreeNode = host.World().GetNode(selectorTreeId);
+    Require(selectorTreeNode != nullptr, "Gallery SelectorTree node null");
+    if (!selectorTreeNode) {
+        return;
+    }
+
+    // If SelectorBar starts collapsed off-screen to the left, click SelectorExpanderButton to slide it in
+    if (NodeViewportBounds(*selectorTreeNode).x < -5.0f) {
+        float ex = 0.0f, ey = 0.0f;
+        if (RequireNodeCenter(host, "SelectorExpanderButton", ex, ey)) {
+            host.InjectClick(ex, ey);
+            for (int f = 0; f < 38; ++f) {
+                host.StepFrame(1.0f / 60.0f, f == 37);
+            }
+        }
+        selectorTreeNode = host.World().GetNode(selectorTreeId);
+    }
+    const aero::Rect treeVp = selectorTreeNode ? NodeViewportBounds(*selectorTreeNode) : aero::Rect{};
+    Require(treeVp.x >= -2.0f && treeVp.width > 120.0f && treeVp.height > 200.0f,
+        "Gallery SelectorTree should be visible on screen (x=" + std::to_string(treeVp.x) +
+        ", w=" + std::to_string(treeVp.width) + ")");
+
+    // Collect TreeViewItems realized by HierarchicalDataTemplate (categories + child samples)
+    std::vector<aero::VisualNodeId> allTreeItems;
+    CollectDescendantsByTypeName(host, selectorTreeId, "TreeViewItem", allTreeItems);
+    Require(allTreeItems.size() >= 7u,
+        "Gallery SelectorTree should realize >= 7 category TreeViewItems via HierarchicalDataTemplate (got " +
+        std::to_string(allTreeItems.size()) + ")");
+
+    auto findTreeItemByText = [&](aero::VisualNodeId scopeId, std::string_view needle) -> aero::VisualNodeId {
+        std::vector<aero::VisualNodeId> candidates;
+        CollectDescendantsByTypeName(host, scopeId, "TreeViewItem", candidates);
+        for (aero::VisualNodeId tid : candidates) {
+            std::string txt;
+            CollectSubtreeText(host.World(), tid, txt);
+            if (txt.find(needle) != std::string::npos) {
+                return tid;
+            }
+        }
+        return aero::VisualNodeId{};
+    };
+
+    const aero::VisualNodeId mediaCatId = findTreeItemByText(selectorTreeId, "Media");
+    const aero::VisualNodeId basicCatId = findTreeItemByText(selectorTreeId, "Basic Input");
+    Require(mediaCatId.IsValid() && basicCatId.IsValid(),
+        "Gallery TreeView missing 'Media' or 'Basic Input' category items");
+
+    // Verify HierarchicalDataTemplate populated child TreeViewItems under 'Media'
+    std::vector<aero::VisualNodeId> mediaSubItems;
+    CollectDescendantsByTypeName(host, mediaCatId, "TreeViewItem", mediaSubItems);
+    Require(mediaSubItems.size() >= 5u,
+        "HierarchicalDataTemplate should generate >= 5 sample TreeViewItems under 'Media' (got " +
+        std::to_string(mediaSubItems.size()) + ")");
+
+    // Helper to expand a category TreeViewItem by clicking its header Border/ExpandButton
+    auto clickTreeItemHeader = [&](aero::VisualNodeId itemId) {
+        if (!itemId.IsValid()) { return; }
+        aero::VisualNodeId headerTarget = FindDescendantByOwnerName(host, itemId, "Border");
+        if (!headerTarget.IsValid()) {
+            headerTarget = FindDescendantByOwnerName(host, itemId, "ExpandButton");
+        }
+        if (!headerTarget.IsValid()) {
+            headerTarget = itemId;
+        }
+        const aero::VisualNode* targetNode = host.World().GetNode(headerTarget);
+        if (!targetNode) { return; }
+        const aero::Rect vp = NodeViewportBounds(*targetNode);
+        host.InjectClick(vp.x + vp.width * 0.5f, vp.y + vp.height * 0.5f);
+    };
+
+    if (mediaCatId.IsValid()) {
+        clickTreeItemHeader(mediaCatId);
+        for (int f = 0; f < 20; ++f) {
+            host.StepFrame(1.0f / 60.0f, f == 19);
+        }
+        bool mediaExpanded = false;
+        const aero::VisualNode* mediaNode = host.World().GetNode(mediaCatId);
+        Require(mediaNode && ReadBoolMember(host, mediaNode->scriptOwner, "IsExpanded", mediaExpanded) && mediaExpanded,
+            "Clicking 'Media' category TreeViewItem should expand it (IsExpanded == true)");
+    }
+
+    auto activeSampleContainerId = [&]() -> aero::VisualNodeId {
+        const aero::VisualNodeId c1 = host.FindVisualByOwnerName("SampleContainer1");
+        const aero::VisualNodeId c2 = host.FindVisualByOwnerName("SampleContainer2");
+        const aero::VisualNode* n1 = c1.IsValid() ? host.World().GetNode(c1) : nullptr;
+        const aero::VisualNode* n2 = c2.IsValid() ? host.World().GetNode(c2) : nullptr;
+        if (n1 && n1->layout.visibility == aero::Visibility::Visible && !n1->children.empty()) {
+            return c1;
+        }
+        if (n2 && n2->layout.visibility == aero::Visibility::Visible && !n2->children.empty()) {
+            return c2;
+        }
+        return aero::VisualNodeId{};
+    };
+
+    // Click 'Brushes' child TreeViewItem -> loads real Samples/Brushes.xaml tree (not fake colored tiles)
+    const aero::VisualNodeId brushesItemId = mediaCatId.IsValid()
+        ? findTreeItemByText(mediaCatId, "Brushes")
+        : aero::VisualNodeId{};
+    Require(brushesItemId.IsValid(), "Gallery 'Media' category missing 'Brushes' child TreeViewItem");
+    if (brushesItemId.IsValid()) {
+        clickTreeItemHeader(brushesItemId);
+        for (int f = 0; f < 55; ++f) {
+            host.StepFrame(1.0f / 60.0f, f == 54);
+        }
+        std::string loadedUri;
+        Require(ReadStringMember(host, host.RootScriptObject(), "LoadedSampleUri", loadedUri) &&
+                loadedUri == "Samples/Brushes.xaml",
+            "Clicking 'Brushes' should load Samples/Brushes.xaml (got '" + loadedUri + "')");
+        const aero::VisualNodeId containerId = activeSampleContainerId();
+        Require(containerId.IsValid(), "Gallery SampleContainer should become visible after selecting Brushes");
+        if (containerId.IsValid()) {
+            std::string containerText;
+            CollectSubtreeText(host.World(), containerId, containerText);
+            Require(containerText.find("SolidColorBrush") != std::string::npos &&
+                    containerText.find("LinearGradientBrush") != std::string::npos,
+                "Gallery Brushes should render real Brushes.xaml XAML tree (got: " + containerText.substr(0, 120) + ")");
+            Require(containerText.find("Brushes #1") == std::string::npos &&
+                    containerText.find("AeroGUI v3 Controls Gallery") == std::string::npos,
+                "Gallery Brushes must not fall back to placeholder blocks");
+        }
+    }
+
+    std::vector<std::uint8_t> frameBrushes;
+    Require(host.RenderHeadlessRgba(1280u, 800u, frameBrushes), "Gallery Brushes render failed");
+
+    // Click 'Effects' child TreeViewItem -> loads real Samples/Effects.xaml tree
+    const aero::VisualNodeId effectsItemId = mediaCatId.IsValid()
+        ? findTreeItemByText(mediaCatId, "Effects")
+        : aero::VisualNodeId{};
+    Require(effectsItemId.IsValid(), "Gallery 'Media' category missing 'Effects' child TreeViewItem");
+    if (effectsItemId.IsValid()) {
+        clickTreeItemHeader(effectsItemId);
+        for (int f = 0; f < 55; ++f) {
+            host.StepFrame(1.0f / 60.0f, f == 54);
+        }
+        std::string loadedUri;
+        Require(ReadStringMember(host, host.RootScriptObject(), "LoadedSampleUri", loadedUri) &&
+                loadedUri == "Samples/Effects.xaml",
+            "Clicking 'Effects' should load Samples/Effects.xaml (got '" + loadedUri + "')");
+        const aero::VisualNodeId containerId = activeSampleContainerId();
+        Require(containerId.IsValid(), "Gallery SampleContainer should become visible after selecting Effects");
+        if (containerId.IsValid()) {
+            std::string containerText;
+            CollectSubtreeText(host.World(), containerId, containerText);
+            Require(containerText.find("BlurEffect") != std::string::npos &&
+                    containerText.find("DropShadowEffect") != std::string::npos,
+                "Gallery Effects should render real Effects.xaml XAML tree (got: " + containerText.substr(0, 120) + ")");
+            Require(containerText.find("Effects #1") == std::string::npos,
+                "Gallery Effects must not fall back to placeholder blocks");
+        }
+    }
+
+    // Expand 'Basic Input' and click 'Button' -> loads real Samples/Button.xaml tree
+    if (basicCatId.IsValid()) {
+        clickTreeItemHeader(basicCatId);
+        for (int f = 0; f < 20; ++f) {
+            host.StepFrame(1.0f / 60.0f, f == 19);
+        }
+    }
+    const aero::VisualNodeId buttonItemId = basicCatId.IsValid()
+        ? findTreeItemByText(basicCatId, "Button")
+        : aero::VisualNodeId{};
+    Require(buttonItemId.IsValid(), "Gallery 'Basic Input' category missing 'Button' child TreeViewItem");
+    if (buttonItemId.IsValid()) {
+        clickTreeItemHeader(buttonItemId);
+        for (int f = 0; f < 55; ++f) {
+            host.StepFrame(1.0f / 60.0f, f == 54);
+        }
+        std::string loadedUri;
+        Require(ReadStringMember(host, host.RootScriptObject(), "LoadedSampleUri", loadedUri) &&
+                loadedUri == "Samples/Button.xaml",
+            "Clicking 'Button' should load Samples/Button.xaml (got '" + loadedUri + "')");
+        const aero::VisualNodeId containerId = activeSampleContainerId();
+        Require(containerId.IsValid(), "Gallery SampleContainer should become visible after selecting Button");
+        if (containerId.IsValid()) {
+            std::string containerText;
+            CollectSubtreeText(host.World(), containerId, containerText);
+            Require(containerText.find("ClickMode") != std::string::npos &&
+                    containerText.find("Normal Button") != std::string::npos,
+                "Gallery Button should render real Button.xaml XAML tree (got: " + containerText.substr(0, 120) + ")");
+            Require(containerText.find("Button #1") == std::string::npos,
+                "Gallery Button must not fall back to placeholder blocks");
+        }
+    }
+
+    std::vector<std::uint8_t> frameButton;
+    Require(host.RenderHeadlessRgba(1280u, 800u, frameButton), "Gallery Button render failed");
+    Require(CountChangedPixels(frameBrushes, frameButton) > 200u,
+        "Switching Gallery samples (Brushes -> Button) must produce substantial visual changes");
+
+    // Theme switching via ThemeColorPicker ComboBox (Light -> Dark) -> real pixel difference
+    const aero::VisualNodeId colorPickerId = host.FindVisualByOwnerName("ThemeColorPicker");
+    Require(colorPickerId.IsValid(), "Gallery ThemeColorPicker ComboBox missing");
+    if (colorPickerId.IsValid()) {
+        const aero::Rect pickerVp = NodeViewportBounds(*host.World().GetNode(colorPickerId));
+        host.InjectClick(pickerVp.x + pickerVp.width - 16.0f, pickerVp.y + pickerVp.height * 0.5f);
+        for (int f = 0; f < 5; ++f) {
+            host.StepFrame(1.0f / 60.0f, f == 4);
+        }
+        aero::VisualNodeId popupId;
+        std::vector<aero::VisualNodeId> themeItems;
+        {
+            std::vector<aero::VisualNodeId> popups;
+            CollectVisualNodesByOwnerName(host, "PART_Popup", popups);
+            for (aero::VisualNodeId pid : popups) {
+                const aero::VisualNode* pn = host.World().GetNode(pid);
+                if (pn && pn->layout.visibility == aero::Visibility::Visible) {
+                    std::vector<aero::VisualNodeId> items;
+                    CollectDescendantsByTypeName(host, pid, "ComboBoxItem", items);
+                    if (!items.empty()) {
+                        popupId = pid;
+                        themeItems = std::move(items);
+                        break;
+                    }
+                }
+            }
+            if (!popupId.IsValid()) {
+                popupId = FindDescendantByOwnerName(host, colorPickerId, "PART_Popup");
+                if (popupId.IsValid()) {
+                    CollectDescendantsByTypeName(host, popupId, "ComboBoxItem", themeItems);
+                }
+            }
+        }
+        Require(themeItems.size() >= 2u,
+            "Gallery ThemeColorPicker should open PART_Popup with Dark & Light ComboBoxItems (got " +
+            std::to_string(themeItems.size()) + ")");
+        if (!themeItems.empty()) {
+            const aero::Rect darkItemVp = NodeViewportBounds(*host.World().GetNode(themeItems[0]));
+            host.InjectClick(darkItemVp.x + darkItemVp.width * 0.5f, darkItemVp.y + darkItemVp.height * 0.5f);
+            for (int f = 0; f < 55; ++f) {
+                host.StepFrame(1.0f / 60.0f, f == 54);
+            }
+            aero::ObjectRef vmRef{};
+            std::string themeName;
+            const bool okVm = ReadObjectMember(host, host.RootScriptObject(), "ViewModel", vmRef);
+            const bool okThemeName = okVm && ReadStringMember(host, vmRef, "SelectedThemeColor.Name", themeName);
+            Require(okThemeName && themeName == "Dark",
+                "Selecting Dark in ThemeColorPicker should update ViewModel.SelectedThemeColor.Name to 'Dark' (got '" +
+                themeName + "')");
+        }
+    }
+
+    std::vector<std::uint8_t> frameDarkTheme;
+    Require(host.RenderHeadlessRgba(1280u, 800u, frameDarkTheme), "Gallery Dark theme render failed");
+    Require(CountChangedPixels(frameButton, frameDarkTheme) > 500u,
+        "Gallery theme switch (Light -> Dark) must change rendered pixels");
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -2290,23 +3253,35 @@ int main(int argc, char** argv) {
     if (want("subpages")) { TestGalleryStandaloneSubPages(clearRgba); }
 
     if (!filters.empty()) {
+        if (want("backgroundblur")) { TestInteractiveBackgroundBlur(sharedSession); }
         if (want("buttons")) { TestInteractiveButtons(sharedSession); }
         if (want("customcontrol")) { TestInteractiveCustomControlAndTheme(sharedSession); }
+        if (want("databinding")) { TestInteractiveDataBinding(sharedSession); }
+        if (want("gallery")) { TestInteractiveGallery(sharedSession); }
+        if (want("integration")) { TestInteractiveIntegration(sharedSession); }
+        if (want("login")) { TestInteractiveLogin(sharedSession); }
         if (want("tictactoe")) { TestInteractiveTicTacToe(sharedSession); }
         if (want("inventory")) { TestInteractiveInventory(sharedSession); }
         if (want("questlog")) { TestInteractiveQuestLog(sharedSession); }
         if (want("localization")) { TestInteractiveLocalization(sharedSession); }
+        if (want("menu3d")) { TestInteractiveMenu3D(sharedSession, clearRgba); }
+        if (want("usercontrol")) { TestInteractiveUserControl(sharedSession); }
         if (want("wpf")) { TestInteractiveWpfQuickStart(sharedSession); }
         if (want("scoreboard")) { TestInteractiveScoreboard(sharedSession); }
     }
 
     if (want("interactive")) {
+        TestInteractiveBackgroundBlur(sharedSession);
         TestInteractiveButtons(sharedSession);
+        TestInteractiveDataBinding(sharedSession);
+        TestInteractiveGallery(sharedSession);
+        TestInteractiveIntegration(sharedSession);
         TestInteractiveLogin(sharedSession);
         TestInteractiveTicTacToe(sharedSession);
         TestInteractiveInventory(sharedSession);
         TestInteractiveQuestLog(sharedSession);
         TestInteractiveLocalization(sharedSession);
+        TestInteractiveMenu3D(sharedSession, clearRgba);
         TestInteractiveUserControl(sharedSession);
         TestInteractiveWpfQuickStart(sharedSession);
         TestInteractiveCustomControlAndTheme(sharedSession);
@@ -2317,6 +3292,6 @@ int main(int argc, char** argv) {
         std::cerr << "\nv3_legacy_samples_tests FAILED with " << gFailureCount << " failure(s).\n";
         return 1;
     }
-    std::cout << "\nv3_legacy_samples_tests PASSED (all 23 legacy samples + 5 V3 + 6 Gallery sub-pages + 10 interactive checks).\n";
+    std::cout << "\nv3_legacy_samples_tests PASSED (all 23 legacy samples + 5 V3 + 6 Gallery sub-pages + 15 interactive checks).\n";
     return 0;
 }

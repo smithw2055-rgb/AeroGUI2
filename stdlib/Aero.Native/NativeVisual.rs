@@ -63,10 +63,14 @@ int __rs_native_Visual_SetBoxGradients(handle node, int bgGradId, int borderGrad
 public void Visual_SetBoxGradients(handle node, int bgGradId, int borderGradId) { __rs_native_Visual_SetBoxGradients(node, bgGradId, borderGradId); return; }
 int __rs_native_Visual_SetBoxBrushOpacity(handle node, float bgOpacity) { return 0; }
 public void Visual_SetBoxBrushOpacity(handle node, float bgOpacity) { __rs_native_Visual_SetBoxBrushOpacity(node, bgOpacity); return; }
+int __rs_native_Visual_SetBoxShadow(handle node, bool isBoxShadow) { return 0; }
+public void Visual_SetBoxShadow(handle node, bool isBoxShadow) { __rs_native_Visual_SetBoxShadow(node, isBoxShadow); return; }
 public int Visual_RegisterLinearGradient(float x0, float y0, float x1, float y1, int spread, int mapping, string stopsSpec) { return 0; }
 public int Visual_RegisterRadialGradient(float cx, float cy, float ox, float oy, float rx, float ry, int spread, int mapping, string stopsSpec) { return 0; }
 int __rs_native_Visual_SetTransform2D(handle node, float tx, float ty, float sx, float sy, float rotDeg, float skewX, float skewY, float ox, float oy) { return 0; }
 public void Visual_SetTransform2D(handle node, float tx, float ty, float sx, float sy, float rotDeg, float skewX, float skewY, float ox, float oy) { __rs_native_Visual_SetTransform2D(node, tx, ty, sx, sy, rotDeg, skewX, skewY, ox, oy); return; }
+int __rs_native_Visual_SetLayoutTransform(handle node, float sx, float sy, float rotDeg, bool enabled) { return 0; }
+public void Visual_SetLayoutTransform(handle node, float sx, float sy, float rotDeg, bool enabled) { __rs_native_Visual_SetLayoutTransform(node, sx, sy, rotDeg, enabled); return; }
 int __rs_native_Visual_SetTransform3D(handle node, float rx, float ry, float rz, float tx, float ty, float tz, float camDist) { return 0; }
 public void Visual_SetTransform3D(handle node, float rx, float ry, float rz, float tx, float ty, float tz, float camDist) { __rs_native_Visual_SetTransform3D(node, rx, ry, rz, tx, ty, tz, camDist); return; }
 int __rs_native_Visual_SetEffect(handle node, int kind, float radius, float depth, float dirDeg, uint colorRgba, float opacity) { return 0; }
@@ -79,6 +83,14 @@ int __rs_native_Visual_SetText(handle node, string text, string fontFamily, floa
 public void Visual_SetText(handle node, string text, string fontFamily, float fontSize, uint fgRgba, int wrap, int align, int trim) { __rs_native_Visual_SetText(node, text, fontFamily, fontSize, fgRgba, wrap, align, trim); return; }
 int __rs_native_Visual_SetTextMetrics(handle node, float lineHeight, float charSpacing, int maxLines, int decorations) { return 0; }
 public void Visual_SetTextMetrics(handle node, float lineHeight, float charSpacing, int maxLines, int decorations) { __rs_native_Visual_SetTextMetrics(node, lineHeight, charSpacing, maxLines, decorations); return; }
+int __rs_native_Visual_SetTextStyle(handle node, int fontWeight, bool fontItalic, int fgGradId) { return 0; }
+public void Visual_SetTextStyle(handle node, int fontWeight, bool fontItalic, int fgGradId) { __rs_native_Visual_SetTextStyle(node, fontWeight, fontItalic, fgGradId); return; }
+int __rs_native_Visual_SetTextBrushOpacity(handle node, float fgOpacity) { return 0; }
+public void Visual_SetTextBrushOpacity(handle node, float fgOpacity) { __rs_native_Visual_SetTextBrushOpacity(node, fgOpacity); return; }
+int __rs_native_Visual_ClearTextSpans(handle node) { return 0; }
+public void Visual_ClearTextSpans(handle node) { __rs_native_Visual_ClearTextSpans(node); return; }
+int __rs_native_Visual_AddTextSpan(handle node, string text, string fontFamily, float fontSize, int fontWeight, int fontItalic, uint fgRgba, bool hasFg, int decorations) { return 0; }
+public void Visual_AddTextSpan(handle node, string text, string fontFamily, float fontSize, int fontWeight, int fontItalic, uint fgRgba, bool hasFg, int decorations) { __rs_native_Visual_AddTextSpan(node, text, fontFamily, fontSize, fontWeight, fontItalic, fgRgba, hasFg, decorations); return; }
 int __rs_native_Visual_SetTextSelection(handle node, int selStartCp, int selLenCp, int caretCp, bool showCaret, uint selRgba, uint caretRgba) { return 0; }
 public void Visual_SetTextSelection(handle node, int selStartCp, int selLenCp, int caretCp, bool showCaret, uint selRgba, uint caretRgba) { __rs_native_Visual_SetTextSelection(node, selStartCp, selLenCp, caretCp, showCaret, selRgba, caretRgba); return; }
 public float Visual_MeasureText(string text, string fontFamily, float fontSize, float maxW, int wrap, int outAxis) { return 0.0f; }
@@ -174,3 +186,4 @@ public bool Reflect_SetPropObject(object target, string propPath, object val) { 
 public bool Reflect_InvokeCommand(object target, string propPath, string param) { return false; }
 public int Reflect_GetDirtyMask(object target) { return 0; }
 public uint Color_ParseRgba(string hexOrNamed) { return 0u; }
+public string Host_ReadTextAsset(string uri) { return ""; }

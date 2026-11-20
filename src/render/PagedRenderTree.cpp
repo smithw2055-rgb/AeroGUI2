@@ -175,6 +175,62 @@ void ApplyTextAlignmentToLayout(
     if (align == TextAlignment::Left || alignBoxWidth <= 0.0f || layout.lines.empty()) {
         return;
     }
+    if (align == TextAlignment::Justify) {
+        for (const TextLineMetrics& lm : layout.lines) {
+            if (lm.endedByNewline || lm.glyphCount <= 1u) {
+                continue;
+            }
+            const std::size_t first = lm.firstGlyphIndex;
+            const std::size_t end = std::min(first + lm.glyphCount, layout.glyphs.size());
+            std::size_t lastNonWs = end;
+            for (std::size_t k = end; k > first; --k) {
+                if (!layout.glyphs[k - 1u].isWhitespace) {
+                    lastNonWs = k - 1u;
+                    break;
+                }
+            }
+            if (lastNonWs == end || lastNonWs <= first) {
+                continue;
+            }
+            std::size_t gapCount = 0u;
+            bool inGap = false;
+            float lineRightEdge = 0.0f;
+            for (std::size_t k = first; k <= lastNonWs; ++k) {
+                const PositionedGlyph& pg = layout.glyphs[k];
+                if (pg.isWhitespace) {
+                    if (!inGap && k > first) {
+                        ++gapCount;
+                        inGap = true;
+                    }
+                } else {
+                    inGap = false;
+                    lineRightEdge = std::max(lineRightEdge, pg.penX + pg.advanceX);
+                }
+            }
+            const float extra = alignBoxWidth - lineRightEdge;
+            if (gapCount == 0u || extra <= 0.5f || extra > alignBoxWidth * 0.65f) {
+                continue;
+            }
+            const float perGap = extra / static_cast<float>(gapCount);
+            float accumDx = 0.0f;
+            inGap = false;
+            for (std::size_t k = first; k <= lastNonWs; ++k) {
+                PositionedGlyph& pg = layout.glyphs[k];
+                if (pg.isWhitespace) {
+                    if (!inGap && k > first) {
+                        accumDx += perGap;
+                        inGap = true;
+                    }
+                } else {
+                    inGap = false;
+                    pg.penX += accumDx;
+                    pg.x0 += accumDx;
+                    pg.x1 += accumDx;
+                }
+            }
+        }
+        return;
+    }
     for (PositionedGlyph& pg : layout.glyphs) {
         if (pg.lineIndex >= layout.lines.size()) continue;
         const float lw = layout.lines[pg.lineIndex].width;
@@ -861,7 +917,7 @@ void UnpackGradientRoundedRectVertexParams(
 PagedRenderTree::PagedRenderTree()
     : treeId_(gNextRenderTreeId.fetch_add(1u, std::memory_order_relaxed)),
       mtsdfOwnerId_(treeId_) {
-    InitPreCachedDigitGlyphs();
+    // Lazy init: defer pre-cached ASCII glyph table until first HUD digit lookup.
 }
 
 void PagedRenderTree::RegisterMtsdfInTreeAtlas(const AxbMtsdfPathEntry& entry) {
@@ -940,7 +996,19 @@ const AxbMtsdfPathEntry* PagedRenderTree::FindMtsdfEntry(std::uint64_t pathHash)
     return (it != mtsdfEntries_.end()) ? &it->second : nullptr;
 }
 
-void PagedRenderTree::InitPreCachedDigitGlyphs() noexcept {
+void PagedRenderTree::EnsurePreCachedDigitGlyphs() const {
+    if (preCachedGlyphsReady_.load(std::memory_order_acquire)) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(preCachedGlyphsMutex_);
+    if (preCachedGlyphsReady_.load(std::memory_order_relaxed)) {
+        return;
+    }
+    InitPreCachedDigitGlyphs();
+    preCachedGlyphsReady_.store(true, std::memory_order_release);
+}
+
+void PagedRenderTree::InitPreCachedDigitGlyphs() const {
     const FontAtlas& atlas = (resourceStore_ && resourceStore_->TryFonts())
         ? *resourceStore_->TryFonts()
         : FontAtlas::Instance();
@@ -1006,10 +1074,30 @@ void PagedRenderTree::SetRootDpiScale(float scale) noexcept {
     }
 }
 
+void PagedRenderTree::ReserveCapacity(std::size_t expectedNodes) {
+    if (nodes_.capacity() < expectedNodes) {
+        nodes_.reserve(expectedNodes);
+    }
+    const std::size_t estPages = (expectedNodes + 15u) / 16u;
+    if (pages_.capacity() < estPages) {
+        pages_.reserve(estPages);
+    }
+    if (pageClipW_.capacity() < estPages) {
+        pageClipW_.reserve(estPages);
+    }
+    if (dirtyPageList_.capacity() < estPages) {
+        dirtyPageList_.reserve(estPages);
+    }
+}
+
 void PagedRenderTree::Clear() noexcept {
+    syncedWorldId_ = 0u;
+    syncedStructureVersion_ = 0u;
     activeClipRect_ = Rect{0.0f, 0.0f, 16384.0f, 16384.0f};
     activeClipEnabled_ = false;
+    activeBlendMode_ = BlendingMode::Normal;
     pages_.clear();
+    pageClipW_.clear();
     nodes_.clear();
     pageDirtyFlags_.clear();
     dirtyPageList_.clear();
@@ -1045,6 +1133,8 @@ std::uint32_t PagedRenderTree::EnsurePageForAllocation(
             newPage.header.flags |= CommandPageFlag_ScissorClipActive;
         }
         pages_.push_back(newPage);
+        pageClipW_.emplace_back();
+        pageClipW_.back().fill(1.0f);
         pageDirtyFlags_.push_back(0u);
         dirtyPageList_.reserve(pages_.size());
     }
@@ -1079,9 +1169,15 @@ void PagedRenderTree::ZeroOutNodeVertices(RenderNodeDescriptor& node) noexcept {
         node.vertexCount,
         kVerticesPerCommandPage - std::min<std::size_t>(vOffset, kVerticesPerCommandPage));
     AeroVertex* __restrict v = page.vertices.data() + vOffset;
+    float* __restrict clipW = (node.pageIndex < pageClipW_.size())
+        ? (pageClipW_[node.pageIndex].data() + vOffset)
+        : nullptr;
     for (std::size_t i = 0; i < count; ++i) {
         v[i] = AeroVertex{};
         v[i].rgba = 0u;
+        if (clipW) {
+            clipW[i] = 1.0f;
+        }
     }
     const std::uint32_t firstQuad = static_cast<std::uint32_t>(vOffset / 4u);
     const std::uint32_t quadCount = static_cast<std::uint32_t>(count / 4u);
@@ -1111,15 +1207,21 @@ void PagedRenderTree::WriteQuadVertices(RenderNodeDescriptor& node) noexcept {
     float x1 = 0.0f, y1 = 0.0f;
     float x2 = 0.0f, y2 = 0.0f;
     float x3 = 0.0f, y3 = 0.0f;
+    float w0 = 1.0f, w1 = 1.0f, w2 = 1.0f, w3 = 1.0f;
     if (node.hasPerspective3D) {
-        const Point p0 = node.worldMatrix3D.ProjectPoint2D(Point{node.x, node.y});
-        const Point p1 = node.worldMatrix3D.ProjectPoint2D(Point{node.x + w, node.y});
-        const Point p2 = node.worldMatrix3D.ProjectPoint2D(Point{node.x + w, node.y + h});
-        const Point p3 = node.worldMatrix3D.ProjectPoint2D(Point{node.x, node.y + h});
+        float rw0 = 1.0f, rw1 = 1.0f, rw2 = 1.0f, rw3 = 1.0f;
+        const Point p0 = node.worldMatrix3D.ProjectPoint2D(Point{node.x, node.y}, &rw0);
+        const Point p1 = node.worldMatrix3D.ProjectPoint2D(Point{node.x + w, node.y}, &rw1);
+        const Point p2 = node.worldMatrix3D.ProjectPoint2D(Point{node.x + w, node.y + h}, &rw2);
+        const Point p3 = node.worldMatrix3D.ProjectPoint2D(Point{node.x, node.y + h}, &rw3);
         x0 = p0.x; y0 = p0.y;
         x1 = p1.x; y1 = p1.y;
         x2 = p2.x; y2 = p2.y;
         x3 = p3.x; y3 = p3.y;
+        w0 = (std::isfinite(rw0) && rw0 > 1e-3f) ? rw0 : 1e-3f;
+        w1 = (std::isfinite(rw1) && rw1 > 1e-3f) ? rw1 : 1e-3f;
+        w2 = (std::isfinite(rw2) && rw2 > 1e-3f) ? rw2 : 1e-3f;
+        w3 = (std::isfinite(rw3) && rw3 > 1e-3f) ? rw3 : 1e-3f;
     } else {
         // Local corners (0,0), (w,0), (w,h), (0,h) transformed by 2D affine matrix + node origin
         const float ox = node.x + node.tx;
@@ -1168,6 +1270,13 @@ void PagedRenderTree::WriteQuadVertices(RenderNodeDescriptor& node) noexcept {
     v[1] = AeroVertex{x1, y1, uMax, vMin, packedColor, prim, flags};
     v[2] = AeroVertex{x2, y2, uMax, vMax, packedColor, prim, flags};
     v[3] = AeroVertex{x3, y3, uMin, vMax, packedColor, prim, flags};
+    if (node.pageIndex < pageClipW_.size()) {
+        float* __restrict clipW = pageClipW_[node.pageIndex].data() + vOffset;
+        clipW[0] = w0;
+        clipW[1] = w1;
+        clipW[2] = w2;
+        clipW[3] = w3;
+    }
 }
 
 std::uint32_t PagedRenderTree::AllocateRenderNode(
@@ -1197,6 +1306,7 @@ std::uint32_t PagedRenderTree::AllocateRenderNode(
     desc.height = height;
     desc.opacity = 1.0f;
     desc.baseRgba = PackColorRgba8(color, 1.0f);
+    desc.blendMode = activeBlendMode_;
     desc.sourceElement = owner;
     ConfigureRoundedRectDescriptor(desc, CornerRadius{cornerRadius}, Thickness{borderThickness}, false);
 
@@ -1233,6 +1343,7 @@ std::uint32_t PagedRenderTree::AllocateRoundedRectNode(
     desc.height = height;
     desc.opacity = 1.0f;
     desc.baseRgba = PackColorRgba8(color, 1.0f);
+    desc.blendMode = activeBlendMode_;
     desc.sourceElement = owner;
     ConfigureRoundedRectDescriptor(desc, cornerRadii, Thickness{}, false);
 
@@ -1270,6 +1381,7 @@ std::uint32_t PagedRenderTree::AllocateBorderRingNode(
     desc.height = height;
     desc.opacity = 1.0f;
     desc.baseRgba = PackColorRgba8(borderColor, 1.0f);
+    desc.blendMode = activeBlendMode_;
     desc.sourceElement = owner;
     ConfigureRoundedRectDescriptor(desc, cornerRadii, borderThickness, true);
 
@@ -1314,6 +1426,7 @@ std::uint32_t PagedRenderTree::AllocateEllipseNode(
     desc.opacity = opacity;
     desc.borderThickness = strokeThickness;
     desc.baseRgba = PackColorRgba8(color, 1.0f);
+    desc.blendMode = activeBlendMode_;
     desc.sourceElement = owner;
 
     nodes_.push_back(desc);
@@ -1364,6 +1477,7 @@ std::uint32_t PagedRenderTree::AllocateGradientRoundedRectNode(
     desc.height = height;
     desc.opacity = opacity;
     desc.baseRgba = PackColorRgba8(tintModulator, 1.0f);
+    desc.blendMode = activeBlendMode_;
     desc.sourceElement = owner;
 
     nodes_.push_back(desc);
@@ -1404,6 +1518,7 @@ std::uint32_t PagedRenderTree::AllocateHudDigitsNode(
     desc.height = glyphHeight;
     desc.opacity = 1.0f;
     desc.baseRgba = PackColorRgba8(color, 1.0f);
+    desc.blendMode = activeBlendMode_;
 
     nodes_.push_back(desc);
     (void)UpdateHudDigitsText(nodeId, "0");
@@ -1450,6 +1565,7 @@ std::uint32_t PagedRenderTree::AllocateTextRunNode(
     desc.height = std::max(1.0f, fontSize * 1.2f);
     desc.opacity = opacity;
     desc.baseRgba = PackColorRgba8(color, 1.0f);
+    desc.blendMode = activeBlendMode_;
     desc.sourceElement = owner;
 
     nodes_.push_back(desc);
@@ -1504,6 +1620,7 @@ std::uint32_t PagedRenderTree::AllocateMtsdfPathNode(
     desc.uv1X = mapped.u1;
     desc.uv1Y = mapped.v1;
     desc.baseRgba = PackColorRgba8(fillColor, 1.0f);
+    desc.blendMode = activeBlendMode_;
     desc.mtsdfPathHash = activeEntry.pathHash;
     desc.sourceElement = owner;
 
@@ -1686,6 +1803,7 @@ std::uint32_t PagedRenderTree::AllocateTexturedNode(
     desc.uv1X = u1;
     desc.uv1Y = v1;
     desc.baseRgba = PackColorRgba8(tintColor, 1.0f);
+    desc.blendMode = activeBlendMode_;
     desc.textureId = textureId;
     desc.sourceElement = owner;
 
@@ -1727,6 +1845,7 @@ std::uint32_t PagedRenderTree::AllocateRadialArcNode(
     desc.height = height;
     desc.opacity = opacity;
     desc.baseRgba = PackColorRgba8(color, 1.0f);
+    desc.blendMode = activeBlendMode_;
     desc.sourceElement = owner;
 
     nodes_.push_back(desc);
@@ -1771,6 +1890,7 @@ std::uint32_t PagedRenderTree::AllocateHudBarBatch(
     nodes_.reserve(nodes_.size() + count);
     const std::size_t estimatedPages = (count + 41u) / 42u + 2u;
     pages_.reserve(pages_.size() + estimatedPages);
+    pageClipW_.reserve(pageClipW_.size() + estimatedPages);
     pageDirtyFlags_.reserve(pageDirtyFlags_.size() + estimatedPages);
     dirtyPageList_.reserve(pages_.size() + estimatedPages);
 
@@ -1802,6 +1922,54 @@ bool PagedRenderTree::UpdateNodeWidth(std::uint32_t nodeId, float newWidth) noex
         return false;
     }
     node.width = newWidth;
+    WriteQuadVertices(node);
+    MarkPageDirty(node.pageIndex, node.vertexOffsetInPage);
+    return true;
+}
+
+bool PagedRenderTree::UpdateSolidBoxNodeInPlace(
+    std::uint32_t nodeId,
+    const Rect& rect,
+    const Color& fillColor,
+    const CornerRadius& cornerRadii,
+    const Matrix2D& world2D,
+    BlendingMode blend) noexcept {
+    if (nodeId >= nodes_.size()) {
+        return false;
+    }
+    RenderNodeDescriptor& node = nodes_[nodeId];
+    if (node.pageIndex >= pages_.size()) {
+        return false;
+    }
+    if (node.primType != AeroPrimType::SolidQuad && node.primType != AeroPrimType::SdfRoundedRect) {
+        return false;
+    }
+    if (node.isHollowBorder || node.gradientBrushId > 0 || node.hasPerspective3D ||
+        node.sdfPadPx > 0.0f || node.softFeatherPx > 0.0f ||
+        rect.width <= 0.0f || rect.height <= 0.0f) {
+        return false;
+    }
+    if (node.blendMode != blend ||
+        pages_[node.pageIndex].header.BlendMode() != static_cast<std::uint32_t>(blend) ||
+        std::fabs(world2D.m01) > 1e-5f || std::fabs(world2D.m10) > 1e-5f) {
+        return false;
+    }
+    const CornerRadius cr = SanitizeCornerRadius(cornerRadii);
+    ConfigureRoundedRectDescriptor(node, cr, Thickness{}, false);
+    node.x = rect.x;
+    node.y = rect.y;
+    node.width = rect.width;
+    node.height = rect.height;
+    node.baseRgba = PackColorRgba8(fillColor, 1.0f);
+    node.opacity = 1.0f;
+    node.m00 = world2D.m00;
+    node.m01 = world2D.m01;
+    node.m10 = world2D.m10;
+    node.m11 = world2D.m11;
+    node.baseTx = world2D.tx;
+    node.baseTy = world2D.ty;
+    node.tx = world2D.tx + rect.x * (world2D.m00 - 1.0f) + rect.y * world2D.m01;
+    node.ty = world2D.ty + rect.x * world2D.m10 + rect.y * (world2D.m11 - 1.0f);
     WriteQuadVertices(node);
     MarkPageDirty(node.pageIndex, node.vertexOffsetInPage);
     return true;
@@ -1846,7 +2014,7 @@ bool PagedRenderTree::UpdateNodeTransform2D(
 
 bool PagedRenderTree::UpdateHudDigitsText(
     std::uint32_t nodeId,
-    std::string_view asciiDigits) noexcept {
+    std::string_view asciiDigits) {
     if (nodeId >= nodes_.size()) {
         return false;
     }
@@ -1855,9 +2023,13 @@ bool PagedRenderTree::UpdateHudDigitsText(
         return false;
     }
 
+    EnsurePreCachedDigitGlyphs();
     CommandPage& page = pages_[node.pageIndex];
     const std::size_t maxSlots = node.vertexCount / 4u;
     AeroVertex* __restrict vBase = page.vertices.data() + node.vertexOffsetInPage;
+    float* __restrict clipWBase = (node.pageIndex < pageClipW_.size())
+        ? (pageClipW_[node.pageIndex].data() + node.vertexOffsetInPage)
+        : nullptr;
     const std::uint32_t packedColor = ScalePackedRgbaAlpha(node.baseRgba, node.opacity);
     const auto prim = static_cast<std::uint16_t>(AeroPrimType::SdfTextGlyph);
     const std::uint16_t flags = node.encodedSdfParams;
@@ -1887,6 +2059,13 @@ bool PagedRenderTree::UpdateHudDigitsText(
             q[2] = AeroVertex{cursorX, cursorY, 0.0f, 0.0f, 0u, prim, flags};
             q[3] = AeroVertex{cursorX, cursorY, 0.0f, 0.0f, 0u, prim, flags};
         }
+        if (clipWBase) {
+            float* __restrict qw = clipWBase + (i * 4u);
+            qw[0] = 1.0f;
+            qw[1] = 1.0f;
+            qw[2] = 1.0f;
+            qw[3] = 1.0f;
+        }
     }
 
     const std::uint32_t firstQuadIdx = static_cast<std::uint32_t>(node.vertexOffsetInPage / 4u);
@@ -1909,7 +2088,11 @@ bool PagedRenderTree::WriteLayoutGlyphSlice(
     std::size_t& ioGlyphCursor,
     const Color& color,
     float opacity,
-    const std::vector<RichGlyphStyle>* optRichStyles) noexcept {
+    const std::vector<RichGlyphStyle>* optRichStyles,
+    const GradientBrushDesc* optFgGrad,
+    float gradBoxWidth,
+    float gradBoxHeight,
+    bool ignoreCustomGlyphColors) noexcept {
     if (nodeId >= nodes_.size()) {
         return false;
     }
@@ -1932,12 +2115,17 @@ bool PagedRenderTree::WriteLayoutGlyphSlice(
 
     CommandPage& page = pages_[node.pageIndex];
     AeroVertex* __restrict vBase = page.vertices.data() + node.vertexOffsetInPage;
+    float* __restrict clipWBase = (node.pageIndex < pageClipW_.size())
+        ? (pageClipW_[node.pageIndex].data() + node.vertexOffsetInPage)
+        : nullptr;
     const std::uint32_t packedColor = ScalePackedRgbaAlpha(node.baseRgba, node.opacity);
     const auto prim = static_cast<std::uint16_t>(AeroPrimType::SdfTextGlyph);
     const std::uint16_t flags = node.encodedSdfParams;
 
     const float originX = node.x + node.tx;
     const float originY = node.y + node.ty;
+    const float gwBox = std::max(1.0f, (gradBoxWidth > 0.0f) ? gradBoxWidth : layout.totalWidth);
+    const float ghBox = std::max(1.0f, (gradBoxHeight > 0.0f) ? gradBoxHeight : layout.totalHeight);
 
     for (std::size_t slot = 0u; slot < maxSlots; ++slot) {
         AeroVertex* __restrict q = vBase + (slot * 4u);
@@ -1949,35 +2137,66 @@ bool PagedRenderTree::WriteLayoutGlyphSlice(
                 continue;
             }
             std::uint32_t glyphPackedColor = packedColor;
-            float italicTopShear = 0.0f;
-            float boldPadX = 0.0f;
+            bool useCustomSolid = false;
+            if (pg.hasCustomRgba && !ignoreCustomGlyphColors) {
+                glyphPackedColor = ScalePackedRgbaAlpha(pg.customRgba, node.opacity);
+                useCustomSolid = true;
+            }
+            bool useItalic = pg.syntheticItalic;
+            bool useBold = pg.syntheticBold;
             if (optRichStyles != nullptr && pg.sourceCodePointIndex < optRichStyles->size()) {
                 const RichGlyphStyle& st = (*optRichStyles)[pg.sourceCodePointIndex];
-                if (st.hasCustomColor) {
+                if (st.hasCustomColor && !ignoreCustomGlyphColors) {
                     glyphPackedColor = ScalePackedRgbaAlpha(PackColorRgba8(st.color, 1.0f), node.opacity);
+                    useCustomSolid = true;
                 }
                 if (st.italic) {
-                    italicTopShear = 0.18f * std::max(0.0f, pg.y1 - pg.y0);
+                    useItalic = true;
                 }
                 if (st.bold) {
-                    boldPadX = 0.35f;
+                    useBold = true;
                 }
             }
+            const float italicTopShear = useItalic ? (0.18f * std::max(0.0f, pg.y1 - pg.y0)) : 0.0f;
+            const float boldPadX = useBold ? 0.35f : 0.0f;
             const float lx0 = pg.x0 - boldPadX * 0.5f;
             const float lx1 = pg.x1 + boldPadX * 0.5f;
             const float gw = std::max(0.0f, lx1 - lx0);
-            const float gh = std::max(0.0f, pg.y1 - pg.y0);
+
+            std::uint32_t c0 = glyphPackedColor;
+            std::uint32_t c1 = glyphPackedColor;
+            std::uint32_t c2 = glyphPackedColor;
+            std::uint32_t c3 = glyphPackedColor;
+            if (optFgGrad != nullptr && !ignoreCustomGlyphColors && !useCustomSolid) {
+                auto sampleGrad = [&](float lx, float ly) noexcept -> std::uint32_t {
+                    const float nu = std::clamp(lx / gwBox, 0.0f, 1.0f);
+                    const float nv = std::clamp(ly / ghBox, 0.0f, 1.0f);
+                    const Color gc = EvaluateGradientBrushAtNormalizedUv(*optFgGrad, nu, nv, gwBox, ghBox);
+                    return ScalePackedRgbaAlpha(PackColorRgba8(gc, 1.0f), node.opacity);
+                };
+                c0 = sampleGrad(lx0 + italicTopShear, pg.y0);
+                c1 = sampleGrad(lx1 + italicTopShear, pg.y0);
+                c2 = sampleGrad(lx1, pg.y1);
+                c3 = sampleGrad(lx0, pg.y1);
+            }
+
             float gx0 = 0.0f, gy0 = 0.0f, gx1 = 0.0f, gy1 = 0.0f;
             float gx2 = 0.0f, gy2 = 0.0f, gx3 = 0.0f, gy3 = 0.0f;
+            float gw0 = 1.0f, gw1 = 1.0f, gw2 = 1.0f, gw3 = 1.0f;
             if (node.hasPerspective3D) {
-                const Point p0 = node.worldMatrix3D.ProjectPoint2D(Point{node.x + lx0 + italicTopShear, node.y + pg.y0});
-                const Point p1 = node.worldMatrix3D.ProjectPoint2D(Point{node.x + lx1 + italicTopShear, node.y + pg.y0});
-                const Point p2 = node.worldMatrix3D.ProjectPoint2D(Point{node.x + lx1, node.y + pg.y1});
-                const Point p3 = node.worldMatrix3D.ProjectPoint2D(Point{node.x + lx0, node.y + pg.y1});
+                float rw0 = 1.0f, rw1 = 1.0f, rw2 = 1.0f, rw3 = 1.0f;
+                const Point p0 = node.worldMatrix3D.ProjectPoint2D(Point{node.x + lx0 + italicTopShear, node.y + pg.y0}, &rw0);
+                const Point p1 = node.worldMatrix3D.ProjectPoint2D(Point{node.x + lx1 + italicTopShear, node.y + pg.y0}, &rw1);
+                const Point p2 = node.worldMatrix3D.ProjectPoint2D(Point{node.x + lx1, node.y + pg.y1}, &rw2);
+                const Point p3 = node.worldMatrix3D.ProjectPoint2D(Point{node.x + lx0, node.y + pg.y1}, &rw3);
                 gx0 = p0.x; gy0 = p0.y;
                 gx1 = p1.x; gy1 = p1.y;
                 gx2 = p2.x; gy2 = p2.y;
                 gx3 = p3.x; gy3 = p3.y;
+                gw0 = (std::isfinite(rw0) && rw0 > 1e-3f) ? rw0 : 1e-3f;
+                gw1 = (std::isfinite(rw1) && rw1 > 1e-3f) ? rw1 : 1e-3f;
+                gw2 = (std::isfinite(rw2) && rw2 > 1e-3f) ? rw2 : 1e-3f;
+                gw3 = (std::isfinite(rw3) && rw3 > 1e-3f) ? rw3 : 1e-3f;
             } else {
                 gx0 = originX + (lx0 + italicTopShear) * node.m00 + pg.y0 * node.m01;
                 gy0 = originY + (lx0 + italicTopShear) * node.m10 + pg.y0 * node.m11;
@@ -1991,10 +2210,17 @@ bool PagedRenderTree::WriteLayoutGlyphSlice(
                 gy2 = botY0 + gw * node.m10;
             }
 
-            q[0] = AeroVertex{gx0, gy0, pg.u0, pg.v0, glyphPackedColor, prim, flags};
-            q[1] = AeroVertex{gx1, gy1, pg.u1, pg.v0, glyphPackedColor, prim, flags};
-            q[2] = AeroVertex{gx2, gy2, pg.u1, pg.v1, glyphPackedColor, prim, flags};
-            q[3] = AeroVertex{gx3, gy3, pg.u0, pg.v1, glyphPackedColor, prim, flags};
+            q[0] = AeroVertex{gx0, gy0, pg.u0, pg.v0, c0, prim, flags};
+            q[1] = AeroVertex{gx1, gy1, pg.u1, pg.v0, c1, prim, flags};
+            q[2] = AeroVertex{gx2, gy2, pg.u1, pg.v1, c2, prim, flags};
+            q[3] = AeroVertex{gx3, gy3, pg.u0, pg.v1, c3, prim, flags};
+            if (clipWBase) {
+                float* __restrict qw = clipWBase + (slot * 4u);
+                qw[0] = gw0;
+                qw[1] = gw1;
+                qw[2] = gw2;
+                qw[3] = gw3;
+            }
             emitted = true;
             break;
         }
@@ -2004,6 +2230,13 @@ bool PagedRenderTree::WriteLayoutGlyphSlice(
             q[1] = AeroVertex{originX, originY, 0.0f, 0.0f, 0u, prim, flags};
             q[2] = AeroVertex{originX, originY, 0.0f, 0.0f, 0u, prim, flags};
             q[3] = AeroVertex{originX, originY, 0.0f, 0.0f, 0u, prim, flags};
+            if (clipWBase) {
+                float* __restrict qw = clipWBase + (slot * 4u);
+                qw[0] = 1.0f;
+                qw[1] = 1.0f;
+                qw[2] = 1.0f;
+                qw[3] = 1.0f;
+            }
         }
     }
 
@@ -2062,24 +2295,22 @@ bool PagedRenderTree::UpdateTextRunNode(
     return WriteLayoutGlyphSlice(nodeId, x, y, fontSize, layout, glyphCursor, color, opacity);
 }
 
-std::uint16_t PagedRenderTree::EmitTextRunNodes(
+std::uint16_t PagedRenderTree::EmitPreparedTextLayoutNodes(
     float x,
     float y,
     float fontSize,
-    std::string_view utf8Text,
+    TextLayoutResult layout,
     const Color& color,
     float opacity,
     const RenderTraversalState& curState,
     const void* owner,
-    std::string_view fontFamily,
-    float maxWidth,
-    TextWrapping wrapMode,
     TextAlignment textAlign,
     float alignBoxWidth,
     const std::vector<RichGlyphStyle>* optRichStyles,
-    float charSpacing) {
+    const GradientBrushDesc* optFgGrad,
+    float gradBoxHeight,
+    bool ignoreCustomGlyphColors) {
     const std::uint32_t maxQuadsPerPage = static_cast<std::uint32_t>(kVerticesPerCommandPage / 4u);
-    TextLayoutResult layout = MeasureTextWithStore(utf8Text, fontFamily, fontSize, maxWidth, wrapMode, charSpacing);
     ApplyTextAlignmentToLayout(layout, textAlign, alignBoxWidth);
     const std::size_t visibleGlyphs = CountLayoutVisibleGlyphs(layout);
     const std::size_t totalDesiredSlots = std::max<std::size_t>(visibleGlyphs + 8u, 16u);
@@ -2090,6 +2321,8 @@ std::uint16_t PagedRenderTree::EmitTextRunNodes(
     std::size_t remainingDesired = totalDesiredSlots;
     std::size_t glyphCursor = 0u;
     std::uint16_t emittedNodes = 0u;
+    const BlendingMode prevActiveBlend = activeBlendMode_;
+    activeBlendMode_ = curState.blendMode;
 
     for (std::size_t c = 0u; c < chunkCount; ++c) {
         const std::uint32_t slotCap = (c + 1u < chunkCount)
@@ -2146,10 +2379,46 @@ std::uint16_t PagedRenderTree::EmitTextRunNodes(
             glyphCursor,
             color,
             opacity,
-            optRichStyles);
+            optRichStyles,
+            optFgGrad,
+            alignBoxWidth,
+            gradBoxHeight,
+            ignoreCustomGlyphColors);
         ++emittedNodes;
     }
+    activeBlendMode_ = prevActiveBlend;
     return emittedNodes;
+}
+
+std::uint16_t PagedRenderTree::EmitTextRunNodes(
+    float x,
+    float y,
+    float fontSize,
+    std::string_view utf8Text,
+    const Color& color,
+    float opacity,
+    const RenderTraversalState& curState,
+    const void* owner,
+    std::string_view fontFamily,
+    float maxWidth,
+    TextWrapping wrapMode,
+    TextAlignment textAlign,
+    float alignBoxWidth,
+    const std::vector<RichGlyphStyle>* optRichStyles,
+    float charSpacing) {
+    TextLayoutResult layout = MeasureTextWithStore(utf8Text, fontFamily, fontSize, maxWidth, wrapMode, charSpacing);
+    return EmitPreparedTextLayoutNodes(
+        x,
+        y,
+        fontSize,
+        std::move(layout),
+        color,
+        opacity,
+        curState,
+        owner,
+        textAlign,
+        alignBoxWidth,
+        optRichStyles);
 }
 
 bool PagedRenderTree::InvalidateNodePage(std::uint32_t nodeId) noexcept {
@@ -2249,7 +2518,8 @@ std::size_t PagedRenderTree::BatchUpdateWidthsFromRawColumn(
             CommandPage& page = pagesBase[node.pageIndex];
             AeroVertex* __restrict v = page.vertices.data() + node.vertexOffsetInPage;
 
-            if (node.m00 == 1.0f && node.m10 == 0.0f && node.m01 == 0.0f && node.m11 == 1.0f) {
+            if (!node.hasPerspective3D &&
+                node.m00 == 1.0f && node.m10 == 0.0f && node.m01 == 0.0f && node.m11 == 1.0f) {
                 const float ox = node.x + node.tx;
                 const float rightX = ox + w;
                 v[1].x = rightX;

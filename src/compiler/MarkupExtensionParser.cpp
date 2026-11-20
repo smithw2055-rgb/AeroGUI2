@@ -389,6 +389,10 @@ bool TryExtractBindingSpec(
     if (const auto* elArg = node.FindNamed("ElementName")) {
         outSpec.elementName = ArgToString(*elArg);
     }
+    if (const auto* srcArg = node.FindNamed("Source")) {
+        outSpec.hasSourceLiteral = true;
+        outSpec.sourceLiteral = ArgToString(*srcArg);
+    }
     if (const auto* modeArg = node.FindNamed("Mode")) {
         outSpec.mode = modeArg->literal;
     }

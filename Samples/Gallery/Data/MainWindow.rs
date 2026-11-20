@@ -312,155 +312,20 @@ public partial class MainWindow : Window
         return s;
     }
 
-    private UIElement BuildSamplePreview(string sampleName)
+    private UIElement BuildLoadErrorFallback(string xamlUri)
     {
         Border root = new Border();
         root.Background = new SolidColorBrush(this._activeThemeSurface);
         root.BorderBrush = new SolidColorBrush(this._activeThemeBorder);
         root.BorderThickness = new Thickness(1.0f);
-        root.CornerRadius = new CornerRadius(10.0f);
+        root.CornerRadius = new CornerRadius(8.0f);
         root.Padding = new Thickness(24.0f);
         root.Margin = new Thickness(24.0f);
 
-        StackPanel stack = new StackPanel();
-        stack.Spacing = 14.0f;
-
-        TextBlock title = new TextBlock(sampleName);
-        title.FontSize = 26.0f;
-        title.FontWeight = "Bold";
-        title.Foreground = new SolidColorBrush(this._activeAccent);
-        stack.AddChild(title);
-
-        TextBlock subtitle = new TextBlock("AeroGUI v3 Controls Gallery - " + sampleName);
-        subtitle.FontSize = 14.0f;
-        subtitle.Foreground = new SolidColorBrush(this._activeThemeFg);
-        stack.AddChild(subtitle);
-
-        if (sampleName == "Button" || sampleName == "RepeatButton" || sampleName == "ToggleButton")
-        {
-            StackPanel row = new StackPanel();
-            row.Orientation = Orientation.Horizontal;
-            row.Spacing = 12.0f;
-
-            Button primary = new Button();
-            primary.SetContent(sampleName + " Action");
-            primary.Background = new SolidColorBrush(this._activeAccent);
-            primary.Foreground = new SolidColorBrush("#FFFFFFFF");
-            primary.Padding = new Thickness(16.0f, 8.0f, 16.0f, 8.0f);
-            row.AddChild(primary);
-
-            ToggleButton toggle = new ToggleButton();
-            toggle.SetContent("Toggle Option");
-            toggle.IsChecked = true;
-            toggle.Padding = new Thickness(14.0f, 8.0f, 14.0f, 8.0f);
-            row.AddChild(toggle);
-
-            stack.AddChild(row);
-        }
-        else if (sampleName == "CheckBox" || sampleName == "RadioButton")
-        {
-            CheckBox cb1 = new CheckBox();
-            cb1.SetContent("Enable hardware acceleration");
-            cb1.IsChecked = true;
-            stack.AddChild(cb1);
-
-            RadioButton rb1 = new RadioButton();
-            rb1.SetContent("Balanced Quality Mode");
-            rb1.IsChecked = true;
-            stack.AddChild(rb1);
-
-            RadioButton rb2 = new RadioButton();
-            rb2.SetContent("High Performance Mode");
-            stack.AddChild(rb2);
-        }
-        else if (sampleName == "Slider" || sampleName == "ProgressBar")
-        {
-            Slider slider = new Slider();
-            slider.Minimum = 0.0f;
-            slider.Maximum = 100.0f;
-            slider.Value = 65.0f;
-            slider.Width = 320.0f;
-            stack.AddChild(slider);
-
-            ProgressBar bar = new ProgressBar();
-            bar.Minimum = 0.0f;
-            bar.Maximum = 100.0f;
-            bar.Value = 65.0f;
-            bar.Width = 320.0f;
-            bar.Height = 14.0f;
-            stack.AddChild(bar);
-        }
-        else if (sampleName == "TextBlock" || sampleName == "TextBox" || sampleName == "PasswordBox" || sampleName == "Hyperlink")
-        {
-            TextBox tb = new TextBox();
-            tb.Text = "Editable v3 " + sampleName + " input";
-            tb.Width = 340.0f;
-            stack.AddChild(tb);
-        }
-        else if (sampleName == "ComboBox" || sampleName == "ListBox" || sampleName == "ListView" || sampleName == "ItemsControl")
-        {
-            ListBox lb = new ListBox();
-            lb.Width = 300.0f;
-            lb.Height = 140.0f;
-            lb.AddItem("Alpha Control Item");
-            lb.AddItem("Beta Control Item");
-            lb.AddItem("Gamma Control Item");
-            lb.SelectedIndex = 0;
-            stack.AddChild(lb);
-        }
-        else if (sampleName == "TabControl" || sampleName == "Expander" || sampleName == "GroupBox")
-        {
-            GroupBox gb = new GroupBox();
-            gb.SetHeader(sampleName + " Preview");
-            gb.SetContent("InteractiveAero.UI container for " + sampleName);
-            stack.AddChild(gb);
-
-            Expander exp = new Expander();
-            exp.SetHeader("Details");
-            exp.IsExpanded = true;
-            exp.SetContent("Compiled AeroGUI v3 layout subtree.");
-            stack.AddChild(exp);
-        }
-        else if (sampleName == "TreeView")
-        {
-            TreeView tv = new TreeView();
-            TreeViewItem nodeA = new TreeViewItem();
-            nodeA.SetHeader("Controls");
-            nodeA.IsExpanded = true;
-            TreeViewItem child1 = new TreeViewItem();
-            child1.SetHeader("Buttons & Input");
-            TreeViewItem child2 = new TreeViewItem();
-            child2.SetHeader("Layout Panels");
-            nodeA.AddItem(child1);
-            nodeA.AddItem(child2);
-            tv.AddItem(nodeA);
-            stack.AddChild(tv);
-        }
-        else
-        {
-            UniformGrid grid = new UniformGrid();
-            grid.Columns = 3;
-            grid.Rows = 1;
-            int idx = 0;
-            while (idx < 3)
-            {
-                Border tile = new Border();
-                tile.Background = new SolidColorBrush(this._activeThemeBg);
-                tile.BorderBrush = new SolidColorBrush(this._activeAccent);
-                tile.BorderThickness = new Thickness(1.0f);
-                tile.CornerRadius = new CornerRadius(6.0f);
-                tile.Margin = new Thickness(6.0f);
-                tile.Padding = new Thickness(12.0f);
-                TextBlock label = new TextBlock(sampleName + " #" + (idx + 1));
-                label.Foreground = new SolidColorBrush(this._activeThemeFg);
-                tile.Child = label;
-                grid.AddChild(tile);
-                idx = idx + 1;
-            }
-            stack.AddChild(grid);
-        }
-
-        root.Child = stack;
+        TextBlock message = new TextBlock("Failed to load sample XAML: " + xamlUri);
+        message.FontSize = 14.0f;
+        message.Foreground = new SolidColorBrush(this._activeThemeFg);
+        root.Child = message;
         return root;
     }
 
@@ -472,8 +337,13 @@ public partial class MainWindow : Window
             return false;
         }
 
-        string sampleName = this.ExtractSampleName(xamlUri);
-        UIElement preview = this.BuildSamplePreview(sampleName);
+        UIElement preview = XamlReader.LoadUri(xamlUri, this.Resources);
+        bool loadedReal = (preview != null);
+        if (preview == null)
+        {
+            preview = this.BuildLoadErrorFallback(xamlUri);
+        }
+
         bool useFirst = (this.ActiveContainerIndex != 1);
 
         if (this.WelcomeScreen != null)
@@ -481,39 +351,30 @@ public partial class MainWindow : Window
             this.WelcomeScreen.Visibility = Visibility.Collapsed;
         }
 
-        if (useFirst)
+        ContentControl activeContainer = useFirst ? this.SampleContainer1 : this.SampleContainer2;
+        ContentControl inactiveContainer = useFirst ? this.SampleContainer2 : this.SampleContainer1;
+
+        if (activeContainer != null)
         {
-            if (this.SampleContainer1 != null)
-            {
-                this.SampleContainer1.SetContent(preview);
-                this.SampleContainer1.Visibility = Visibility.Visible;
-            }
-            if (this.SampleContainer2 != null)
-            {
-                this.SampleContainer2.Visibility = Visibility.Collapsed;
-            }
-            this.ActiveContainerIndex = 1;
-            this.LoadedSampleUri = xamlUri;
-            this.BeginStoryboard("ShowContainer1");
+            activeContainer.SetContent(preview);
+            activeContainer.Visibility = Visibility.Visible;
+            preview.ApplyTemplateSubtree();
+            preview.RefreshDynamicResourcesRecursive();
+            BindingEngine.FlushSubtree(activeContainer);
+            preview.EnsureLoadedSubtree();
         }
-        else
+        if (inactiveContainer != null)
         {
-            if (this.SampleContainer2 != null)
-            {
-                this.SampleContainer2.SetContent(preview);
-                this.SampleContainer2.Visibility = Visibility.Visible;
-            }
-            if (this.SampleContainer1 != null)
-            {
-                this.SampleContainer1.Visibility = Visibility.Collapsed;
-            }
-            this.ActiveContainerIndex = 2;
-            this.LoadedSampleUri = xamlUri;
-            this.BeginStoryboard("ShowContainer2");
+            inactiveContainer.Visibility = Visibility.Collapsed;
         }
 
-        this._lastLoadSucceeded = true;
-        return true;
+        this.ActiveContainerIndex = useFirst ? 1 : 2;
+        this.LoadedSampleUri = xamlUri;
+        this.BeginStoryboard(useFirst ? "ShowContainer1" : "ShowContainer2");
+        BindingEngine.Flush();
+
+        this._lastLoadSucceeded = loadedReal;
+        return loadedReal;
     }
 
     public bool UpdateSample(string sampleName)
@@ -552,40 +413,103 @@ public partial class MainWindow : Window
 
     public bool UpdateTheme(string colorName, string accentName)
     {
-        bool isDark = (colorName == "Dark");
-        this._activeThemeBg = isDark ? "#FF101418" : "#FFF6F7F8";
-        this._activeThemeSurface = isDark ? "#FF1A2028" : "#FFFFFFFF";
-        this._activeThemeFg = isDark ? "#FFEBF0F6" : "#FF18202A";
-        this._activeThemeBorder = isDark ? "#FF2F3B4A" : "#FFD0D7DE";
+        string safeColor = (colorName == "Dark") ? "Dark" : "Light";
+        if (colorName != null && colorName != "" && colorName != "Dark" && colorName != "Light")
+        {
+            safeColor = colorName;
+        }
+        string safeAccent = (accentName != null && accentName != "") ? accentName : "Blue";
+        bool isDark = (safeColor == "Dark");
 
-        ColorItem acc = this.ViewModel != null ? this.ViewModel.FindThemeAccent(accentName) : null;
+        ResourceDictionary themeDict = XamlReader.LoadResourceDictionary("Theme/NoesisTheme." + safeColor + safeAccent + ".xaml");
+        if (themeDict == null)
+        {
+            themeDict = XamlReader.LoadResourceDictionary("Theme/NoesisTheme.Brushes." + safeColor + safeAccent + ".xaml");
+        }
+        if (themeDict == null)
+        {
+            themeDict = XamlReader.LoadResourceDictionary("Theme/NoesisTheme." + safeColor + "Blue.xaml");
+        }
+
+        if (this.Resources == null)
+        {
+            this.Resources = new ResourceDictionary();
+        }
+        ResourceDictionary appRes = ResourceDictionary.GlobalApplicationResources();
+
+        if (themeDict != null)
+        {
+            this.Resources.Merge(themeDict);
+            if (appRes != null)
+            {
+                appRes.Merge(themeDict);
+            }
+        }
+
+        this._activeThemeBg = isDark ? "#FF20282F" : "#FFFAFAFA";
+        this._activeThemeSurface = isDark ? "#FF28323B" : "#FFFFFFFF";
+        this._activeThemeFg = isDark ? "#FFFFFFFF" : "#FF20282F";
+        this._activeThemeBorder = isDark ? "#FF3C4752" : "#FFD0D7DE";
+
+        ColorItem acc = this.ViewModel != null ? this.ViewModel.FindThemeAccent(safeAccent) : null;
         this._activeAccent = acc != null ? acc.Color : "#FF1098DF";
 
-        SolidColorBrush bgBrush = new SolidColorBrush(this._activeThemeBg);
-        SolidColorBrush fgBrush = new SolidColorBrush(this._activeThemeFg);
-        SolidColorBrush surfaceBrush = new SolidColorBrush(this._activeThemeSurface);
-        SolidColorBrush accentBrush = new SolidColorBrush(this._activeAccent);
+        Brush bgBrush = this.Resources.Get("Brush.Window.Background") as Brush;
+        if (bgBrush == null) { bgBrush = new SolidColorBrush(this._activeThemeBg); }
+
+        Brush fgBrush = this.Resources.Get("Brush.Foreground.Normal") as Brush;
+        if (fgBrush == null) { fgBrush = new SolidColorBrush(this._activeThemeFg); }
+
+        Brush surfaceBrush = this.Resources.Get("Brush.Background.Normal") as Brush;
+        if (surfaceBrush == null) { surfaceBrush = new SolidColorBrush(this._activeThemeSurface); }
+
+        Brush accentBrush = this.Resources.Get("Brush.Accent") as Brush;
+        if (accentBrush == null) { accentBrush = this.Resources.Get("Brush.Hyperlink.Normal") as Brush; }
+        if (accentBrush == null) { accentBrush = new SolidColorBrush(this._activeAccent); }
+
+        SolidColorBrush bgSolid = bgBrush as SolidColorBrush;
+        if (bgSolid != null && bgSolid.Color != "") { this._activeThemeBg = bgSolid.Color; }
+        SolidColorBrush fgSolid = fgBrush as SolidColorBrush;
+        if (fgSolid != null && fgSolid.Color != "") { this._activeThemeFg = fgSolid.Color; }
+        SolidColorBrush surfSolid = surfaceBrush as SolidColorBrush;
+        if (surfSolid != null && surfSolid.Color != "") { this._activeThemeSurface = surfSolid.Color; }
+        SolidColorBrush accSolid = accentBrush as SolidColorBrush;
+        if (accSolid != null && accSolid.Color != "") { this._activeAccent = accSolid.Color; }
+
+        Brush descBrush = new SolidColorBrush(isDark ? "#FFC8D0D8" : "#FF4E5863");
+        SolidColorBrush oldTitle = this.Resources.Get("TitleBrush") as SolidColorBrush;
+        if (oldTitle != null) { oldTitle.Color = this._activeThemeFg; }
+        SolidColorBrush oldDesc = this.Resources.Get("DescBrush") as SolidColorBrush;
+        if (oldDesc != null) { oldDesc.Color = isDark ? "#FFC8D0D8" : "#FF4E5863"; }
 
         this.Background = bgBrush;
         this.Foreground = fgBrush;
+
         this.Resources.Set("Brush.Window.Background", bgBrush);
+        this.Resources.Set("Brush.Foreground.Normal", fgBrush);
         this.Resources.Set("Brush.Control.Background", surfaceBrush);
         this.Resources.Set("Brush.Text.Foreground", fgBrush);
         this.Resources.Set("Brush.Accent", accentBrush);
+        this.Resources.Set("TitleBrush", fgBrush);
+        this.Resources.Set("DescBrush", descBrush);
 
-        ResourceDictionary appRes = ResourceDictionary.GlobalApplicationResources();
         if (appRes != null)
         {
             appRes.Set("Brush.Window.Background", bgBrush);
+            appRes.Set("Brush.Foreground.Normal", fgBrush);
             appRes.Set("Brush.Control.Background", surfaceBrush);
             appRes.Set("Brush.Text.Foreground", fgBrush);
             appRes.Set("Brush.Accent", accentBrush);
+            appRes.Set("TitleBrush", fgBrush);
+            appRes.Set("DescBrush", descBrush);
         }
 
+        this.RefreshDynamicResourcesRecursive();
         if (this.LoadedSampleUri != null && this.LoadedSampleUri != "")
         {
             this.LoadSampleXaml(this.LoadedSampleUri);
         }
+        BindingEngine.Flush();
         return true;
     }
 

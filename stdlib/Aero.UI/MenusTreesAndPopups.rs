@@ -9,44 +9,99 @@ import RealScript.Math;
 public static class PopupService {
     private static Popup[] _openPopups;
     private static bool _hooked = false;
+    private static bool _disposeHookInstalled = false;
     private static UIElement _overlayHost;
-    private static UIElement _overlayRootOwner;
-    private static Canvas _overlayCanvas;
+    private static UIElement[] _overlayRoots;
+    private static Canvas[] _overlayCanvases;
+
+    private static void EnsureDisposeHook() {
+        if (!_disposeHookInstalled) {
+            _disposeHookInstalled = true;
+            UIElement.RegisterDisposeHook(() => { PopupService.CleanupDisposed(); });
+        }
+    }
 
     public static void SetOverlayHost(UIElement host) {
         _overlayHost = host;
     }
 
+    public static void CleanupDisposed() {
+        if (_overlayHost != null && _overlayHost._isDisposedTree) {
+            _overlayHost = null;
+        }
+        if (_overlayRoots != null && _overlayCanvases != null) {
+            for (int i = _overlayRoots.Length - 1; i >= 0; i -= 1) {
+                UIElement r = _overlayRoots[i];
+                Canvas c = _overlayCanvases[i];
+                if (r == null || r._isDisposedTree || c == null || c._isDisposedTree) {
+                    _overlayRoots.RemoveAt(i);
+                    _overlayCanvases.RemoveAt(i);
+                }
+            }
+        }
+        if (_openPopups != null) {
+            for (int i = _openPopups.Length - 1; i >= 0; i -= 1) {
+                Popup p = _openPopups[i];
+                bool dead = p == null || p._isDisposedTree ||
+                    (p.PlacementTarget != null && p.PlacementTarget._isDisposedTree);
+                if (dead) {
+                    if (p != null) { p.ForceCloseDisposed(); }
+                    if (i < _openPopups.Length && _openPopups[i] == p) {
+                        _openPopups.RemoveAt(i);
+                    }
+                }
+            }
+        }
+    }
+
     public static UIElement ResolveOverlayHost(UIElement anchor) {
-        if (anchor != null) {
+        if (anchor != null && !anchor._isDisposedTree) {
             UIElement root = anchor.RootElement();
-            if (root != null) { return root; }
+            if (root != null && !root._isDisposedTree) { return root; }
+        }
+        if (_overlayHost != null && _overlayHost._isDisposedTree) {
+            _overlayHost = null;
         }
         return _overlayHost;
     }
 
     public static Canvas ResolveOverlayCanvas(UIElement anchor) {
         UIElement root = ResolveOverlayHost(anchor);
-        if (root == null) { return null; }
-        if (_overlayCanvas == null || _overlayCanvas._isDisposedTree) {
-            _overlayCanvas = new Canvas();
-            _overlayCanvas.Name = "__AeroPopupOverlay";
-            _overlayCanvas.ZIndex = 10000;
-            _overlayCanvas.HorizontalAlignment = HorizontalAlignment.Stretch;
-            _overlayCanvas.VerticalAlignment = VerticalAlignment.Stretch;
-            _overlayRootOwner = null;
+        if (root == null || root._isDisposedTree) { return null; }
+        if (_overlayRoots == null) {
+            _overlayRoots = new UIElement[0];
+            _overlayCanvases = new Canvas[0];
         }
-        if (_overlayCanvas.Parent != root || _overlayRootOwner != root) {
-            if (_overlayCanvas.Parent != null) {
-                _overlayCanvas.Parent.RemoveChild(_overlayCanvas);
+        for (int i = _overlayRoots.Length - 1; i >= 0; i -= 1) {
+            UIElement r = _overlayRoots[i];
+            Canvas c = _overlayCanvases[i];
+            if (r == null || r._isDisposedTree || c == null || c._isDisposedTree) {
+                _overlayRoots.RemoveAt(i);
+                _overlayCanvases.RemoveAt(i);
+                continue;
             }
-            root.AddChild(_overlayCanvas);
-            _overlayRootOwner = root;
+            if (r == root) {
+                if (c.Parent != root) {
+                    if (c.Parent != null) { c.Parent.RemoveChild(c); }
+                    root.AddChild(c);
+                }
+                return c;
+            }
         }
-        return _overlayCanvas;
+        var canvas = new Canvas();
+        canvas.Name = "__AeroPopupOverlay";
+        canvas.ZIndex = 10000;
+        canvas.HorizontalAlignment = HorizontalAlignment.Stretch;
+        canvas.VerticalAlignment = VerticalAlignment.Stretch;
+        root.AddChild(canvas);
+        _overlayRoots.Push(root);
+        _overlayCanvases.Push(canvas);
+        EnsureDisposeHook();
+        return canvas;
     }
 
     private static void EnsureHooked() {
+        EnsureDisposeHook();
         if (_hooked) { return; }
         _hooked = true;
         InputDispatcher.RegisterPopupDismissHook((UIElement target, bool isEscape) => {
@@ -84,14 +139,18 @@ public static class PopupService {
 
     public static void DismissNonPersistent(UIElement clickedTarget, bool isEscape) {
         if (_openPopups == null || _openPopups.Length == 0) { return; }
+        UIElement clickedRoot = (clickedTarget != null && !clickedTarget._isDisposedTree) ? clickedTarget.RootElement() : null;
         Popup[] snapshot = new Popup[0];
         for (int i = 0; i < _openPopups.Length; i += 1) {
             snapshot.Push(_openPopups[i]);
         }
         for (int i = 0; i < snapshot.Length; i += 1) {
             Popup p = snapshot[i];
+            if (p == null || p._isDisposedTree) { continue; }
             if (p.StaysOpen && !isEscape) { continue; }
             if (!isEscape && clickedTarget != null) {
+                UIElement popupRoot = p.PlacementTarget != null ? p.PlacementTarget.RootElement() : p.RootElement();
+                if (clickedRoot != null && popupRoot != null && clickedRoot != popupRoot) { continue; }
                 if (p.IsAncestorOf(clickedTarget)) { continue; }
                 if (p.PlacementTarget != null && p.PlacementTarget.IsAncestorOf(clickedTarget)) { continue; }
             }
@@ -129,6 +188,7 @@ public class Popup : FrameworkElement {
         Visibility = Visibility.Collapsed;
         HorizontalAlignment = HorizontalAlignment.Left;
         VerticalAlignment = VerticalAlignment.Top;
+        RenderTransformOrigin = new Point(0.0f, 0.0f);
         IsHitTestVisible = true;
         SyncInteractiveFlags();
     }
@@ -161,9 +221,25 @@ public class Popup : FrameworkElement {
     public float VerticalOffset { get { return _vertOffset; } set { _vertOffset = value; UpdatePosition(); } }
     public string Placement { get { return _placement; } set { _placement = value == null ? "Bottom" : value; UpdatePosition(); } }
 
+    internal void ForceCloseDisposed() {
+        _isOpen = false;
+        Visibility = Visibility.Collapsed;
+        DetachOverlay();
+        if (_logicalParent != null) {
+            _logicalParent.UnregisterDetachedLogicalChild(this);
+        }
+    }
+
     public bool IsOpen {
         get { return _isOpen; }
         set {
+            if (_isDisposedTree) {
+                if (_isOpen) {
+                    PopupService.Unregister(this);
+                    ForceCloseDisposed();
+                }
+                return;
+            }
             if (_isOpen == value) { return; }
             _isOpen = value;
             if (_isOpen) {
@@ -234,6 +310,8 @@ public class Popup : FrameworkElement {
             }
             float scaleX = (anchor.ActualWidth > 0.5f && vw > 0.5f) ? (vw / anchor.ActualWidth) : 1.0f;
             float scaleY = (anchor.ActualHeight > 0.5f && vh > 0.5f) ? (vh / anchor.ActualHeight) : 1.0f;
+            if (!ParseUtil.IsFinite(scaleX) || scaleX < 0.05f) { scaleX = 1.0f; }
+            if (!ParseUtil.IsFinite(scaleY) || scaleY < 0.05f) { scaleY = 1.0f; }
             if (Math.Absf(scaleX - _appliedScaleX) > 0.005f || Math.Absf(scaleY - _appliedScaleY) > 0.005f) {
                 _appliedScaleX = scaleX;
                 _appliedScaleY = scaleY;
@@ -254,32 +332,59 @@ public class Popup : FrameworkElement {
             float y = vy + _vertOffset * scaleY;
             if (_placement == "Bottom") {
                 y = vy + vh + _vertOffset * scaleY;
-            } else if (_placement == "Right") {
-                x = vx + vw + _horizOffset * scaleX;
             } else if (_placement == "Top") {
                 y = vy - popH - _vertOffset * scaleY;
+            } else if (_placement == "Right") {
+                x = vx + vw + _horizOffset * scaleX;
+            } else if (_placement == "Left") {
+                x = vx - popW - _horizOffset * scaleX;
+            } else if (_placement == "Center") {
+                x = vx + (vw - popW) * 0.5f + _horizOffset * scaleX;
+                y = vy + (vh - popH) * 0.5f + _vertOffset * scaleY;
             }
 
             UIElement root = PopupService.ResolveOverlayHost(anchor);
             float rootW = root != null ? root.ActualWidth : 0.0f;
             float rootH = root != null ? root.ActualHeight : 0.0f;
-            if (_placement == "Bottom" && rootH > 0.0f && popH > 0.0f && (y + popH > rootH)) {
+            float margin = 4.0f;
+            if (_placement == "Bottom" && rootH > 0.0f && popH > 0.0f && (y + popH > rootH - margin)) {
                 float aboveY = vy - popH - _vertOffset * scaleY;
-                if (aboveY >= 0.0f) {
+                if (aboveY >= margin) {
                     y = aboveY;
-                } else {
-                    y = Math.Maxf(0.0f, rootH - popH);
                 }
-            } else if (_placement == "Top" && y < 0.0f && rootH > 0.0f) {
+            } else if (_placement == "Top" && y < margin && rootH > 0.0f && popH > 0.0f) {
                 float belowY = vy + vh + _vertOffset * scaleY;
-                if (belowY + popH <= rootH) {
+                if (belowY + popH <= rootH - margin) {
                     y = belowY;
                 }
             }
-            if (rootW > 0.0f && popW > 0.0f && x + popW > rootW) {
-                x = Math.Maxf(0.0f, rootW - popW);
+            if (_placement == "Right" && rootW > 0.0f && popW > 0.0f && (x + popW > rootW - margin)) {
+                float leftX = vx - popW - _horizOffset * scaleX;
+                if (leftX >= margin || vx > rootW * 0.5f || leftX > rootW - popW - x) {
+                    x = leftX;
+                }
+            } else if (_placement == "Left" && x < margin && rootW > 0.0f && popW > 0.0f) {
+                float rightX = vx + vw + _horizOffset * scaleX;
+                if (rightX + popW <= rootW - margin) {
+                    x = rightX;
+                }
             }
-            if (x < 0.0f) { x = 0.0f; }
+            if (rootW > 0.0f && popW > 0.0f && x + popW > rootW - margin) {
+                x = Math.Maxf(margin, rootW - popW - margin);
+            }
+            if (x < margin && rootW > popW + margin * 2.0f) {
+                x = margin;
+            } else if (x < 0.0f) {
+                x = 0.0f;
+            }
+            if (rootH > 0.0f && popH > 0.0f && y + popH > rootH - margin) {
+                y = Math.Maxf(margin, rootH - popH - margin);
+            }
+            if (y < margin && rootH > popH + margin * 2.0f) {
+                y = margin;
+            } else if (y < 0.0f) {
+                y = 0.0f;
+            }
 
             float curLeft = UIElement.GetCanvasLeft(this);
             float curTop = UIElement.GetCanvasTop(this);
@@ -415,6 +520,19 @@ public class HeaderedItemsControl : ItemsControl {
     public HeaderedItemsControl() : base() {}
     public override string GetTypeName() { return "HeaderedItemsControl"; }
 
+    public override DataTemplate GetNamedContentTemplate(string source) {
+        if (source == "Header") { return _headerTemplate; }
+        return base.GetNamedContentTemplate(source);
+    }
+    public override DependencyObject GetNamedContentBox(string source) {
+        if (source == "Header") { return _headerBox; }
+        return base.GetNamedContentBox(source);
+    }
+    public override bool HasNamedContentSlot(string source) {
+        if (source == "Header") { return true; }
+        return base.HasNamedContentSlot(source);
+    }
+
     public object Header {
         get { return DependencyObject.Unbox(_headerBox); }
         set { SetHeaderBox(DependencyObject.BoxObject(value)); }
@@ -443,7 +561,38 @@ public class HeaderedItemsControl : ItemsControl {
         }
     }
 
+    public void SetHeaderAndTemplate(DependencyObject box, DataTemplate tpl) {
+        DependencyObject oldBox = _headerBox;
+        _headerTemplate = tpl;
+        _headerBox = box;
+        if (_headerPresenter != null) {
+            _headerPresenter.SetContentAndTemplate(_headerBox, _headerTemplate);
+        }
+        OnHeaderChanged(DependencyObject.Unbox(oldBox), DependencyObject.Unbox(_headerBox));
+    }
+
     protected virtual void OnHeaderChanged(object oldHeader, object newHeader) {}
+
+    public override void OnApplyTemplate() {
+        base.OnApplyTemplate();
+        if (Template == null) { return; }
+        _headerPresenter = null;
+        UIElement hFound = GetTemplateChild("PART_HeaderPresenter");
+        if (!(hFound is ContentPresenter)) { hFound = GetTemplateChild("PART_Header"); }
+        if (!(hFound is ContentPresenter)) { hFound = GetTemplateChild("HeaderHost"); }
+        if (hFound is ContentPresenter) {
+            _headerPresenter = hFound as ContentPresenter;
+        } else {
+            _headerPresenter = ContentControl.FindFirstTemplatedPresenter(TemplateRoot(), this, true);
+        }
+        if (_headerPresenter != null) {
+            if (_headerPresenter.TemplatedParent == null) {
+                _headerPresenter.TemplatedParent = this;
+                _headerPresenter.SyncFromTemplatedParent(this);
+            }
+            _headerPresenter.SetContentAndTemplate(_headerBox, _headerTemplate);
+        }
+    }
 
     public override bool SetPropertyValue(string propName, DependencyObject value) {
         if (propName == "Header") { SetHeaderBox(value); return true; }
@@ -452,6 +601,10 @@ public class HeaderedItemsControl : ItemsControl {
             return true;
         }
         return base.SetPropertyValue(propName, value);
+    }
+    public override DependencyObject GetPropertyValue(string propName) {
+        if (propName == "Header") { return _headerBox; }
+        return base.GetPropertyValue(propName);
     }
 }
 
@@ -560,7 +713,8 @@ public class MenuItem : HeaderedItemsControl {
     }
 
     protected override void OnVisualStatePropertyChanged() {
-        if (Style == null) {
+        base.OnVisualStatePropertyChanged();
+        if (Style == null && Template == null) {
             Background = new SolidColorBrush(IsMouseOver || _isSubmenuOpen ? "#FF2D3548" : "#00000000");
         }
     }
@@ -723,6 +877,8 @@ public class ContextMenu : MenuBase {
 
 public class StatusBarItem : ContentControl {
     public StatusBarItem() : base() {
+        HorizontalContentAlignment = HorizontalAlignment.Left;
+        VerticalContentAlignment = VerticalAlignment.Center;
         Padding = new Thickness(8.0f, 3.0f, 8.0f, 3.0f);
         Foreground = new SolidColorBrush("#FF94A3B8");
         FontSize = 12.0f;
@@ -774,6 +930,37 @@ public class ToolBar : HeaderedItemsControl {
 // 3. TreeView & TreeViewItem
 // ============================================================================
 
+internal class ArrayCollectionSlot : CollectionSlotBase {
+    public ArrayCollectionBox Target;
+    public ArrayCollectionSlot(ArrayCollectionBox target) : base() { Target = target; }
+    public override bool Matches(object col) {
+        var o = col as ArrayCollectionBox;
+        return o == Target;
+    }
+}
+
+internal class ArrayCollectionBox : DependencyObject, ICollectionNotifier {
+    private DependencyObject[] _items;
+    private CollectionSlotBase _notifierSlot;
+    public ArrayCollectionBox() { _items = new DependencyObject[0]; }
+    public ArrayCollectionBox(DependencyObject[] items) {
+        _items = items == null ? new DependencyObject[0] : items;
+    }
+    public override object UnboxObject() { return this; }
+    public CollectionSlotBase EnsureNotifierSlot() {
+        if (_notifierSlot == null) {
+            _notifierSlot = CollectionChangeHub.FindOrRegister(new ArrayCollectionSlot(this), this);
+        }
+        return _notifierSlot;
+    }
+    public void AddBox(DependencyObject b) { _items.Push(b); }
+    public int ItemCount() { return _items.Length; }
+    public DependencyObject BoxItemAt(int index) {
+        if (index < 0 || index >= _items.Length) { return null; }
+        return _items[index];
+    }
+}
+
 public class TreeViewItem : HeaderedItemsControl {
     private bool _isExpanded = false;
     private bool _isSelected = false;
@@ -820,6 +1007,8 @@ public class TreeViewItem : HeaderedItemsControl {
             if (_isExpanded == value) { return; }
             _isExpanded = value;
             SyncExpandedState();
+            UpdateTriggersAndStates();
+            NotifyBoundPropertyChanged("IsExpanded", DependencyObject.BoxBool(_isExpanded));
             if (_isExpanded) { Expanded(this, new RoutedEventArgs("Expanded", this)); }
             else { Collapsed(this, new RoutedEventArgs("Collapsed", this)); }
         }
@@ -831,6 +1020,8 @@ public class TreeViewItem : HeaderedItemsControl {
             if (_isSelected == value) { return; }
             _isSelected = value;
             SyncSelectedVisual();
+            UpdateTriggersAndStates();
+            NotifyBoundPropertyChanged("IsSelected", DependencyObject.BoxBool(_isSelected));
             if (_isSelected) { Selected(this, new RoutedEventArgs("Selected", this)); }
             else { Unselected(this, new RoutedEventArgs("Unselected", this)); }
         }
@@ -840,6 +1031,62 @@ public class TreeViewItem : HeaderedItemsControl {
         if (_isSelected == sel) { return; }
         _isSelected = sel;
         SyncSelectedVisual();
+        UpdateTriggersAndStates();
+        NotifyBoundPropertyChanged("IsSelected", DependencyObject.BoxBool(_isSelected));
+    }
+
+    private TreeView ResolveOwnerTree() {
+        if (_ownerTree != null) { return _ownerTree; }
+        UIElement cur = Parent;
+        while (cur != null) {
+            if (cur is TreeView) {
+                _ownerTree = cur as TreeView;
+                return _ownerTree;
+            }
+            cur = cur.Parent;
+        }
+        return null;
+    }
+
+    private static TreeViewItem ClosestTreeViewItemFrom(object src) {
+        UIElement cur = src as UIElement;
+        while (cur != null) {
+            if (cur is TreeViewItem) { return cur as TreeViewItem; }
+            cur = cur.Parent;
+        }
+        return null;
+    }
+
+    private void SelectSelf() {
+        TreeView tree = ResolveOwnerTree();
+        if (tree != null) {
+            tree.SelectTreeItem(this);
+        } else {
+            IsSelected = true;
+        }
+    }
+
+    public override void OnPreviewMouseLeftButtonDown(MouseButtonEventArgs e) {
+        base.OnPreviewMouseLeftButtonDown(e);
+        if (!IsEnabled || e == null) { return; }
+        object orig = e.OriginalSource != null ? e.OriginalSource : e.Source;
+        TreeViewItem closest = ClosestTreeViewItemFrom(orig);
+        if (closest == null || closest == this) {
+            SelectSelf();
+        }
+    }
+
+    public override void OnMouseLeftButtonDown(MouseButtonEventArgs e) {
+        base.OnMouseLeftButtonDown(e);
+        if (!IsEnabled || e == null || e.Handled) { return; }
+        object orig = e.OriginalSource != null ? e.OriginalSource : e.Source;
+        TreeViewItem closest = ClosestTreeViewItemFrom(orig);
+        if (closest != null && closest != this) { return; }
+        SelectSelf();
+        if (ItemCount() > 0 && (_rowHost == null || e.ClickCount >= 2)) {
+            IsExpanded = !IsExpanded;
+        }
+        e.Handled = true;
     }
 
     private void SyncExpandedState() {
@@ -873,33 +1120,22 @@ public class TreeViewItem : HeaderedItemsControl {
 
     protected override UIElement CreateContainerForItem() {
         var tvi = new TreeViewItem();
-        tvi.OwnerTree = _ownerTree;
+        tvi.OwnerTree = ResolveOwnerTree();
         return tvi;
     }
 
     protected override void PrepareOwnContainer(UIElement container, int index) {
         base.PrepareOwnContainer(container, index);
-        if (container is TreeViewItem && _ownerTree != null) {
-            (container as TreeViewItem).OwnerTree = _ownerTree;
+        if (container is TreeViewItem) {
+            TreeViewItem tvi = container as TreeViewItem;
+            TreeView tree = ResolveOwnerTree();
+            if (tree != null) { tvi.OwnerTree = tree; }
         }
     }
 
     protected override void PrepareContainerForItem(UIElement container, DependencyObject itemBox, int index) {
         if (container is TreeViewItem) {
-            TreeViewItem tvi = container as TreeViewItem;
-            tvi.OwnerTree = _ownerTree;
-            tvi.DataContextBox = itemBox;
-            tvi.HeaderTemplate = ItemTemplate;
-            tvi.SetHeaderBox(itemBox);
-            if (ItemTemplate is HierarchicalDataTemplate) {
-                HierarchicalDataTemplate hdt = ItemTemplate as HierarchicalDataTemplate;
-                if (hdt.ItemTemplate != null) { tvi.ItemTemplate = hdt.ItemTemplate; } else { tvi.ItemTemplate = hdt; }
-                object raw = DependencyObject.Unbox(itemBox);
-                if (raw != null && hdt.ItemsSourcePath.Length > 0) {
-                    DependencyObject subSrc = BindingEngine.ReadPathBox(raw, hdt.ItemsSourcePath);
-                    if (subSrc != null) { tvi.SetItemsSourceBox(subSrc); }
-                }
-            }
+            TreeView.PrepareTreeItemContainer(this, container as TreeViewItem, itemBox, ResolveOwnerTree());
         } else {
             base.PrepareContainerForItem(container, itemBox, index);
         }
@@ -909,9 +1145,11 @@ public class TreeViewItem : HeaderedItemsControl {
         base.RefreshItems();
         PropagateOwnerToChildren();
         SyncExpandedState();
+        UpdateTriggersAndStates();
     }
 
     protected override void OnVisualStatePropertyChanged() {
+        base.OnVisualStatePropertyChanged();
         SyncSelectedVisual();
     }
 
@@ -942,11 +1180,7 @@ public class TreeViewItem : HeaderedItemsControl {
         row.AddChild(_headerPresenter);
         _rowHost.Child = row;
         _rowHost.MouseLeftButtonDown += (object s, MouseButtonEventArgs e) => {
-            if (_ownerTree != null) {
-                _ownerTree.SelectTreeItem(this);
-            } else {
-                IsSelected = true;
-            }
+            SelectSelf();
             if (e.ClickCount >= 2 && ItemCount() > 0) {
                 IsExpanded = !IsExpanded;
             }
@@ -969,6 +1203,12 @@ public class TreeViewItem : HeaderedItemsControl {
         if (propName == "IsExpanded") { IsExpanded = DependencyObject.UnboxBool(value, false); return true; }
         if (propName == "IsSelected") { IsSelected = DependencyObject.UnboxBool(value, false); return true; }
         return base.SetPropertyValue(propName, value);
+    }
+
+    public override DependencyObject GetPropertyValue(string propName) {
+        if (propName == "IsExpanded") { return DependencyObject.BoxBool(_isExpanded); }
+        if (propName == "IsSelected") { return DependencyObject.BoxBool(_isSelected); }
+        return base.GetPropertyValue(propName);
     }
 }
 
@@ -1003,6 +1243,106 @@ public class TreeView : ItemsControl {
         SelectedItemChanged(this, EventArgs.Empty());
     }
 
+    private static string InferDataTypeKey(object raw) {
+        if (raw == null) { return ""; }
+        if (raw is UIElement) { return (raw as UIElement).GetTypeName(); }
+        if (raw is TransformGroup) { return "TransformGroup"; }
+        if (raw is RotateTransform) { return "RotateTransform"; }
+        if (raw is ScaleTransform) { return "ScaleTransform"; }
+        if (raw is TranslateTransform) { return "TranslateTransform"; }
+        if (raw is SkewTransform) { return "SkewTransform"; }
+        if (raw is DependencyObject) {
+            if (raw is SolidColorBrush) { return "SolidColorBrush"; }
+            if (raw is LinearGradientBrush) { return "LinearGradientBrush"; }
+            if (raw is RadialGradientBrush) { return "RadialGradientBrush"; }
+        }
+        return "";
+    }
+
+    private static DataTemplate ResolveDataTemplateForItem(
+        ItemsControl owner, TreeViewItem tvi, DataTemplate explicitTemplate, object raw) {
+        if (explicitTemplate != null) { return explicitTemplate; }
+        string dtKey = InferDataTypeKey(raw);
+        if (dtKey.Length > 0) {
+            DependencyObject res = tvi != null ? tvi.FindResourceBox(dtKey) : null;
+            if (res == null && owner != null) { res = owner.FindResourceBox(dtKey); }
+            if (res is DataTemplate) { return res as DataTemplate; }
+        }
+        return null;
+    }
+
+    private static DependencyObject ReadHierarchicalItemsSource(object raw, string path) {
+        if (raw == null || path == null || path.Length == 0) { return null; }
+        DependencyObject subSrc = BindingEngine.ReadPathBox(raw, path);
+        if (subSrc != null) {
+            object unboxed = DependencyObject.Unbox(subSrc);
+            if (subSrc is ICollectionNotifier || unboxed is ICollectionNotifier) {
+                return subSrc;
+            }
+        }
+        if (raw is TransformGroup && path == "Children") {
+            Transform[] arr = (raw as TransformGroup).Children();
+            var box = new ArrayCollectionBox();
+            if (arr != null) {
+                for (int i = 0; i < arr.Length; i += 1) { box.AddBox(arr[i]); }
+            }
+            return box;
+        }
+        if (raw is UIElement && (path == "Children" || path == "LogicalChildren")) {
+            UIElement[] arr = (raw as UIElement).Children();
+            var box = new ArrayCollectionBox();
+            if (arr != null) {
+                for (int i = 0; i < arr.Length; i += 1) { box.AddBox(arr[i]); }
+            }
+            return box;
+        }
+        if (raw is ItemsControl && path == "Items") {
+            ItemsControl ic = raw as ItemsControl;
+            var box = new ArrayCollectionBox();
+            int n = ic.ItemCount();
+            for (int i = 0; i < n; i += 1) { box.AddBox(ic.GetItemBoxAt(i)); }
+            return box;
+        }
+        return subSrc;
+    }
+
+    internal static void PrepareTreeItemContainer(
+        ItemsControl owner, TreeViewItem tvi, DependencyObject itemBox, TreeView tree) {
+        if (tvi == null) { return; }
+        tvi.OwnerTree = tree;
+        tvi.DataContextBox = itemBox;
+        if (owner != null && owner.ItemContainerStyle != null && tvi.ItemContainerStyle == null) {
+            tvi.ItemContainerStyle = owner.ItemContainerStyle;
+        }
+        if (owner != null && owner.ItemContainerStyle != null && tvi.Style == null) {
+            tvi.Style = owner.ItemContainerStyle;
+        }
+
+        object raw = DependencyObject.Unbox(itemBox);
+        DataTemplate itemTpl = ResolveDataTemplateForItem(
+            owner, tvi, owner != null ? owner.ItemTemplate : null, raw);
+        tvi.SetHeaderAndTemplate(itemBox, itemTpl);
+
+        if (itemTpl is HierarchicalDataTemplate) {
+            HierarchicalDataTemplate hdt = itemTpl as HierarchicalDataTemplate;
+            DataTemplate childTpl = hdt.ItemTemplate;
+            if (childTpl == null && hdt.ItemTemplateKey != null && hdt.ItemTemplateKey.Length > 0) {
+                DependencyObject tplBox = tvi.FindResourceBox(hdt.ItemTemplateKey);
+                if (tplBox == null && owner != null) { tplBox = owner.FindResourceBox(hdt.ItemTemplateKey); }
+                if (tplBox is DataTemplate) { childTpl = tplBox as DataTemplate; }
+            }
+            if (childTpl == null && (hdt.DataType == null || hdt.DataType.Length == 0)) {
+                childTpl = hdt;
+            }
+            tvi.ItemTemplate = childTpl;
+
+            if (raw != null && hdt.ItemsSourcePath.Length > 0) {
+                DependencyObject subSrc = ReadHierarchicalItemsSource(raw, hdt.ItemsSourcePath);
+                if (subSrc != null) { tvi.SetItemsSourceBox(subSrc); }
+            }
+        }
+    }
+
     protected override UIElement CreateContainerForItem() {
         var tvi = new TreeViewItem();
         tvi.OwnerTree = this;
@@ -1016,20 +1356,7 @@ public class TreeView : ItemsControl {
 
     protected override void PrepareContainerForItem(UIElement container, DependencyObject itemBox, int index) {
         if (container is TreeViewItem) {
-            TreeViewItem tvi = container as TreeViewItem;
-            tvi.OwnerTree = this;
-            tvi.DataContextBox = itemBox;
-            tvi.HeaderTemplate = ItemTemplate;
-            tvi.SetHeaderBox(itemBox);
-            if (ItemTemplate is HierarchicalDataTemplate) {
-                HierarchicalDataTemplate hdt = ItemTemplate as HierarchicalDataTemplate;
-                if (hdt.ItemTemplate != null) { tvi.ItemTemplate = hdt.ItemTemplate; } else { tvi.ItemTemplate = hdt; }
-                object raw = DependencyObject.Unbox(itemBox);
-                if (raw != null && hdt.ItemsSourcePath.Length > 0) {
-                    DependencyObject subSrc = BindingEngine.ReadPathBox(raw, hdt.ItemsSourcePath);
-                    if (subSrc != null) { tvi.SetItemsSourceBox(subSrc); }
-                }
-            }
+            PrepareTreeItemContainer(this, container as TreeViewItem, itemBox, this);
         } else {
             base.PrepareContainerForItem(container, itemBox, index);
         }
@@ -1042,6 +1369,19 @@ public class TreeView : ItemsControl {
         scroll.Content = _itemsPresenter;
         RefreshItems();
         return scroll;
+    }
+
+    public override DependencyObject GetPropertyValue(string propName) {
+        if (propName == "SelectedItem") { return DependencyObject.BoxObject(SelectedItem); }
+        return base.GetPropertyValue(propName);
+    }
+
+    public override bool SubscribeBehaviorRoutedEvent(string ev, BehaviorEventSink sink) {
+        if (ev == "SelectedItemChanged") {
+            SelectedItemChanged += (object s, EventArgs e) => { if (sink != null) { sink.OnBehaviorEvent(s, new RoutedEventArgs("SelectedItemChanged", this)); } };
+            return true;
+        }
+        return base.SubscribeBehaviorRoutedEvent(ev, sink);
     }
 }
 
@@ -1106,7 +1446,7 @@ public class Window : ContentControl {
         _isActive = true;
         PopupService.SetOverlayHost(this);
         Visibility = Visibility.Visible;
-        ApplyTemplate();
+        if (!IsTemplateApplied()) { ApplyTemplate(); }
         EnsureLoadedSubtree();
         Activated(this, EventArgs.Empty());
     }

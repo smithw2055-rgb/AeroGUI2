@@ -1,10 +1,12 @@
 #pragma once
 
 #include <array>
+#include <cmath>
 #include <cstdint>
 #include <deque>
 #include <functional>
 #include <limits>
+#include <memory>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -15,6 +17,7 @@
 namespace aero {
 
 class UIResourceStore;
+struct TextLayoutResult;
 
 enum class VisualKind : std::uint8_t {
     Box = 0,
@@ -120,6 +123,7 @@ struct VisualBoxStyle {
     float bgOpacity = 1.0f;
     bool ownsMutableBgGrad = false;
     bool ownsMutableBorderGrad = false;
+    bool isBoxShadow = false;
     Thickness borderThickness{};
     CornerRadius cornerRadius{};
 };
@@ -135,6 +139,22 @@ struct VisualTransform2D {
     float originX = 0.5f;
     float originY = 0.5f;
     BlendingMode blendMode = BlendingMode::Normal;
+};
+
+struct VisualLayoutTransform2D {
+    float sx = 1.0f;
+    float sy = 1.0f;
+    float rotDeg = 0.0f;
+    float skewX = 0.0f;
+    float skewY = 0.0f;
+
+    [[nodiscard]] bool IsIdentity() const noexcept {
+        return std::fabs(sx - 1.0f) <= 1e-6f &&
+               std::fabs(sy - 1.0f) <= 1e-6f &&
+               std::fabs(rotDeg) <= 1e-6f &&
+               std::fabs(skewX) <= 1e-6f &&
+               std::fabs(skewY) <= 1e-6f;
+    }
 };
 
 struct VisualTransform3D {
@@ -169,11 +189,26 @@ struct VisualOpacityMask {
         std::numeric_limits<float>::quiet_NaN()};
 };
 
+struct VisualTextSpan {
+    std::string text;
+    std::string fontFamily;
+    float fontSize = 0.0f;
+    int fontWeight = 0;
+    std::int8_t fontItalic = -1;
+    std::uint32_t fgRgba = 0u;
+    bool hasFg = false;
+    std::int32_t decorations = 0;
+};
+
 struct VisualTextData {
     std::string text;
     std::string fontFamily;
     float fontSize = 14.0f;
     std::uint32_t fgRgba = 0xFF000000u;
+    std::int32_t fgGradId = -1;
+    float fgOpacity = 1.0f;
+    int fontWeight = 400;
+    bool fontItalic = false;
     TextWrapping wrap = TextWrapping::NoWrap;
     TextAlignment align = TextAlignment::Left;
     TextTrimming trim = TextTrimming::None;
@@ -187,6 +222,7 @@ struct VisualTextData {
     bool showCaret = false;
     std::uint32_t selRgba = 0x66FF9933u;
     std::uint32_t caretRgba = 0xFF000000u;
+    std::vector<VisualTextSpan> richSpans;
 };
 
 struct VisualImageData {
@@ -244,8 +280,6 @@ struct VisualLayoutData {
     std::int32_t layoutInt0 = 0;
     std::int32_t layoutInt1 = 0;
 
-    std::vector<VisualGridLength> rowDefs;
-    std::vector<VisualGridLength> colDefs;
     std::int32_t gridRow = 0;
     std::int32_t gridCol = 0;
     std::int32_t gridRowSpan = 1;
@@ -260,10 +294,12 @@ struct VisualLayoutData {
     float scrollOffsetY = 0.0f;
 
     Size desiredSize{};
+    Size untransformedDesiredBox{};
     Rect layoutRect{};
     Size scrollExtent{};
     Matrix2D worldTransform{};
-    Matrix4x4 worldMatrix3D{};
+    VisualLayoutTransform2D layoutTransform2D{};
+    bool hasLayoutTransform = false;
     bool hasPerspective3D = false;
     bool hasValidMeasure = false;
     bool hasValidArrange = false;
@@ -279,9 +315,21 @@ struct VisualLayoutData {
     float viewboxScaleY = 1.0f;
     float viewboxOriginX = 0.0f;
     float viewboxOriginY = 0.0f;
-    std::uint8_t treeDepth = 0u;
+    std::uint16_t treeDepth = 0u;
     std::uint32_t renderNodeId = 0u;
     std::uint32_t renderNodeCount = 0u;
+};
+
+struct VisualNodeExtras {
+    VisualTransform3D transform3D{};
+    VisualEffectStyle effect{};
+    VisualOpacityMask opacityMask{};
+    VisualTextData text{};
+    VisualImageData image{};
+    VisualVectorData vector{};
+    Matrix4x4 worldMatrix3D{};
+    std::vector<VisualGridLength> rowDefs;
+    std::vector<VisualGridLength> colDefs;
 };
 
 struct VisualNode {
@@ -303,13 +351,45 @@ struct VisualNode {
     VisualLayoutData layout{};
     VisualBoxStyle box{};
     VisualTransform2D transform2D{};
-    VisualTransform3D transform3D{};
-    VisualEffectStyle effect{};
-    VisualOpacityMask opacityMask{};
-    VisualTextData text{};
-    VisualImageData image{};
-    VisualVectorData vector{};
-    std::array<float, 4> customScalars{};
+    std::unique_ptr<VisualNodeExtras> extras;
+    std::array<float, 4> customScalars{0.0f, 1.0f, 1.0f, 0.0f};
+
+    [[nodiscard]] bool HasExtras() const noexcept { return extras != nullptr; }
+    [[nodiscard]] VisualNodeExtras& EnsureExtras() {
+        if (!extras) extras = std::make_unique<VisualNodeExtras>();
+        return *extras;
+    }
+    [[nodiscard]] static const VisualNodeExtras& DefaultExtras() noexcept {
+        static const VisualNodeExtras kDefault{};
+        return kDefault;
+    }
+    [[nodiscard]] const VisualTransform3D& Transform3D() const noexcept {
+        return extras ? extras->transform3D : DefaultExtras().transform3D;
+    }
+    [[nodiscard]] const VisualEffectStyle& Effect() const noexcept {
+        return extras ? extras->effect : DefaultExtras().effect;
+    }
+    [[nodiscard]] const VisualOpacityMask& OpacityMask() const noexcept {
+        return extras ? extras->opacityMask : DefaultExtras().opacityMask;
+    }
+    [[nodiscard]] const VisualTextData& Text() const noexcept {
+        return extras ? extras->text : DefaultExtras().text;
+    }
+    [[nodiscard]] const VisualImageData& Image() const noexcept {
+        return extras ? extras->image : DefaultExtras().image;
+    }
+    [[nodiscard]] const VisualVectorData& Vector() const noexcept {
+        return extras ? extras->vector : DefaultExtras().vector;
+    }
+    [[nodiscard]] const Matrix4x4& WorldMatrix3D() const noexcept {
+        return extras ? extras->worldMatrix3D : DefaultExtras().worldMatrix3D;
+    }
+    [[nodiscard]] const std::vector<VisualGridLength>& RowDefs() const noexcept {
+        return extras ? extras->rowDefs : DefaultExtras().rowDefs;
+    }
+    [[nodiscard]] const std::vector<VisualGridLength>& ColDefs() const noexcept {
+        return extras ? extras->colDefs : DefaultExtras().colDefs;
+    }
 };
 
 struct VisualEcsColumnBinding {
@@ -410,6 +490,7 @@ public:
         float crBL) noexcept;
     bool SetBoxGradients(VisualNodeId id, std::int32_t bgGradId, std::int32_t borderGradId) noexcept;
     bool SetBoxBrushOpacity(VisualNodeId id, float bgOpacity) noexcept;
+    bool SetBoxShadow(VisualNodeId id, bool isBoxShadow) noexcept;
     bool SetTransform2D(
         VisualNodeId id,
         float tx,
@@ -421,6 +502,19 @@ public:
         float skewY,
         float originX,
         float originY) noexcept;
+    bool SetLayoutTransform2D(
+        VisualNodeId id,
+        float sx,
+        float sy,
+        float rotDeg,
+        float skewX,
+        float skewY) noexcept;
+    bool SetLayoutTransform(
+        VisualNodeId id,
+        float sx,
+        float sy,
+        float rotDeg,
+        bool enabled) noexcept;
     bool SetTransform3D(
         VisualNodeId id,
         float rx,
@@ -461,6 +555,23 @@ public:
         float charSpacing,
         std::int32_t maxLines,
         std::int32_t decorations) noexcept;
+    bool SetTextStyle(
+        VisualNodeId id,
+        int fontWeight,
+        bool fontItalic,
+        std::int32_t fgGradId) noexcept;
+    bool SetTextBrushOpacity(VisualNodeId id, float fgOpacity) noexcept;
+    bool ClearTextSpans(VisualNodeId id) noexcept;
+    bool AddTextSpan(
+        VisualNodeId id,
+        std::string_view text,
+        std::string_view fontFamily,
+        float fontSize,
+        int fontWeight,
+        std::int8_t fontItalic,
+        std::uint32_t fgRgba,
+        bool hasFg,
+        std::int32_t decorations);
     bool SetTextSelection(
         VisualNodeId id,
         std::int32_t selStartCp,
@@ -469,6 +580,8 @@ public:
         bool showCaret,
         std::uint32_t selRgba,
         std::uint32_t caretRgba) noexcept;
+    [[nodiscard]] TextLayoutResult LayoutTextNode(const VisualNode& node, float maxWidth) const;
+    [[nodiscard]] Size MeasureTextNode(const VisualNode& node, float maxWidth) const;
     [[nodiscard]] Size MeasureText(
         std::string_view text,
         std::string_view fontFamily,
@@ -524,6 +637,11 @@ public:
 
     void MarkDirty(VisualNodeId id, VisualDirtyFlags flags) noexcept;
     [[nodiscard]] bool HasAnyDirty() const noexcept { return anyDirty_; }
+    [[nodiscard]] bool IsStructureDirty() const noexcept { return structureDirty_; }
+    void MarkStructureDirty() noexcept { structureDirty_ = true; ++structureVersion_; anyDirty_ = true; }
+    [[nodiscard]] std::uint64_t WorldInstanceId() const noexcept { return worldInstanceId_; }
+    [[nodiscard]] std::uint64_t StructureVersion() const noexcept { return structureVersion_; }
+    [[nodiscard]] const std::vector<VisualNodeId>& DirtyNodes() const noexcept { return dirtyNodes_; }
     void ClearDirtyFlags() noexcept;
     void Clear() noexcept;
 
@@ -540,7 +658,7 @@ private:
     void DetachFromParent(VisualNode& child) noexcept;
     void RefreshOwnerPin(VisualNode& node) noexcept;
     [[nodiscard]] bool WouldCreateCycle(VisualNodeId parentId, VisualNodeId childId) const noexcept;
-    void RefreshSubtreeDepths(VisualNodeId id, std::uint8_t depth) noexcept;
+    void RefreshSubtreeDepths(VisualNodeId id, std::uint16_t depth) noexcept;
 
     SymbolId visualNodeTypeId_ = 0u;
     NativeHandleRegistry ownedFallbackRegistry_;
@@ -552,16 +670,20 @@ private:
     std::vector<std::uint32_t> freeIndices_;
     VisualNodeId rootId_{};
     std::size_t liveCount_ = 0u;
+    std::uint64_t worldInstanceId_ = 0u;
+    std::uint64_t structureVersion_ = 1u;
     bool anyDirty_ = false;
+    bool structureDirty_ = true;
+    std::vector<VisualNodeId> dirtyNodes_;
     std::vector<VisualEcsColumnBinding> ecsBindings_;
 
     Size lastViewportSize_{
         std::numeric_limits<float>::quiet_NaN(),
         std::numeric_limits<float>::quiet_NaN()};
     VisualNodeId lastLaidOutRoot_{};
-    std::array<std::vector<VisualNodeId>, 64> measureDepthBuckets_{};
-    std::array<std::vector<VisualNodeId>, 64> arrangeDepthBuckets_{};
-    std::array<std::vector<VisualNodeId>, 64> transformDepthBuckets_{};
+    std::vector<std::vector<VisualNodeId>> measureDepthBuckets_;
+    std::vector<std::vector<VisualNodeId>> arrangeDepthBuckets_;
+    std::vector<std::vector<VisualNodeId>> transformDepthBuckets_;
     CustomMeasureCallback customMeasureCallback_{};
     CustomArrangeCallback customArrangeCallback_{};
 };

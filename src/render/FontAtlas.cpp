@@ -605,6 +605,9 @@ bool TrueTypeFontFace::LoadFromMemory(
     std::size_t size,
     std::string* outError) {
     valid_ = false;
+    isCff_ = false;
+    weightClass_ = 400u;
+    isItalic_ = false;
     contentHash_ = 0u;
     data_.clear();
     familyName_.clear();
@@ -711,7 +714,7 @@ bool TrueTypeFontFace::ParseTables(std::string* outError) {
         std::uint32_t length = 0u;
         bool present = false;
     };
-    TableSpan head{}, hhea{}, maxp{}, cmap{}, hmtx{}, loca{}, glyf{}, cff{}, name{}, kern{};
+    TableSpan head{}, hhea{}, maxp{}, cmap{}, hmtx{}, loca{}, glyf{}, cff{}, name{}, kern{}, os2{};
 
     for (std::uint16_t i = 0u; i < numTables; ++i) {
         const std::size_t recOff = 12u + static_cast<std::size_t>(i) * 16u;
@@ -736,6 +739,7 @@ bool TrueTypeFontFace::ParseTables(std::string* outError) {
         else if (tag == MakeTag('C', 'F', 'F', ' ')) cff = span;
         else if (tag == MakeTag('n', 'a', 'm', 'e')) name = span;
         else if (tag == MakeTag('k', 'e', 'r', 'n')) kern = span;
+        else if (tag == MakeTag('O', 'S', '/', '2')) os2 = span;
     }
 
     const bool hasGlyf = loca.present && glyf.present;
@@ -755,6 +759,34 @@ bool TrueTypeFontFace::ParseTables(std::string* outError) {
         (!isCff_ && indexToLocFormat_ != 0 && indexToLocFormat_ != 1)) {
         if (outError) *outError = "Invalid TrueType head table";
         return false;
+    }
+
+    std::uint16_t macStyle = 0u;
+    (void)r.ReadU16BE(head.offset + 44u, macStyle);
+    if (os2.present && os2.length >= 6u) {
+        std::uint16_t usWeight = 400u;
+        if (r.ReadU16BE(os2.offset + 4u, usWeight) && usWeight >= 100u && usWeight <= 1000u) {
+            weightClass_ = usWeight;
+        }
+        if (os2.length >= 64u) {
+            std::uint16_t fsSelection = 0u;
+            if (r.ReadU16BE(os2.offset + 62u, fsSelection)) {
+                isItalic_ = ((fsSelection & 0x0001u) != 0u) || ((fsSelection & 0x0200u) != 0u);
+                if ((fsSelection & 0x0020u) != 0u && weightClass_ <= 400u) {
+                    weightClass_ = 700u;
+                }
+            }
+        } else {
+            isItalic_ = (macStyle & 0x0002u) != 0u;
+            if ((macStyle & 0x0001u) != 0u && weightClass_ <= 400u) {
+                weightClass_ = 700u;
+            }
+        }
+    } else {
+        isItalic_ = (macStyle & 0x0002u) != 0u;
+        if ((macStyle & 0x0001u) != 0u) {
+            weightClass_ = 700u;
+        }
     }
 
     if (hhea.length < 36u ||
@@ -2116,9 +2148,11 @@ bool TrueTypeFontFace::ExtractCffGlyphOutline(
                         const bool isLast = (i + 4u == n) || (i + 5u == n);
                         const float dLast = (isLast && i + 5u == n) ? stack[i + 4u] : 0.0f;
                         if (verticalStart) {
-                            curveTo(0.0f, stack[i], stack[i + 1u], stack[i + 2u], dLast, stack[i + 3u]);
+                            // vhcurveto: dy1 dx2 dy2 dx3 [dyf]
+                            curveTo(0.0f, stack[i], stack[i + 1u], stack[i + 2u], stack[i + 3u], dLast);
                         } else {
-                            curveTo(stack[i], 0.0f, stack[i + 1u], stack[i + 2u], stack[i + 3u], dLast);
+                            // hvcurveto: dx1 dx2 dy2 dy3 [dxf]
+                            curveTo(stack[i], 0.0f, stack[i + 1u], stack[i + 2u], dLast, stack[i + 3u]);
                         }
                         i += (isLast && i + 5u == n) ? 5u : 4u;
                         verticalStart = !verticalStart;
@@ -2264,12 +2298,22 @@ FontAtlas::FontAtlas(std::uint16_t atlasSize)
           static_cast<std::uint32_t>(std::max<std::uint16_t>(atlasSize, 512u) / 2u) - 4u,
           2u,
           2u)
-    , sdfPixels_(static_cast<std::size_t>(atlasWidth_) * atlasHeight_, 0u)
+    , sdfPixels_()
     , instanceId_(gNextFontAtlasInstanceId.fetch_add(1u, std::memory_order_relaxed)) {
-    InitBuiltInFallbackAscii();
+    // Lazy init: defer 1MB sdfPixels_ allocation and 95-glyph ASCII SDF baking until first glyph use.
 }
 
 std::string FontAtlas::NormalizeFamilyKey(std::string_view rawFamily) {
+    // Support CSS/WPF fallback chains ("./#PT Sans, ./#FontopoNIHONGO") by taking first valid entry
+    while (!rawFamily.empty() && (rawFamily.front() == ' ' || rawFamily.front() == '\t' || rawFamily.front() == ',')) {
+        rawFamily.remove_prefix(1u);
+    }
+    if (const auto commaPos = rawFamily.find(','); commaPos != std::string_view::npos) {
+        rawFamily = rawFamily.substr(0u, commaPos);
+    }
+    while (!rawFamily.empty() && (rawFamily.back() == ' ' || rawFamily.back() == '\t')) {
+        rawFamily.remove_suffix(1u);
+    }
     // Strip leading path components & NoesisGUI/WPF "./#FamilyName" URI prefix
     if (const auto hashPos = rawFamily.rfind('#'); hashPos != std::string_view::npos) {
         rawFamily = rawFamily.substr(hashPos + 1u);
@@ -2304,7 +2348,7 @@ bool FontAtlas::AllocateSkylineRectLocked(
     std::uint16_t cellW,
     std::uint16_t cellH,
     std::uint16_t& outX,
-    std::uint16_t& outY) noexcept {
+    std::uint16_t& outY) const noexcept {
     // Add 1-texel right/bottom safety gutter inside the [2, atlasWidth_-2) x [2, glyphRegionHeight_-2) packer bounds.
     const auto paddedW = static_cast<std::uint32_t>(cellW) + 1u;
     const auto paddedH = static_cast<std::uint32_t>(cellH) + 1u;
@@ -2323,9 +2367,12 @@ void FontAtlas::BlitCellR8Locked(
     std::uint16_t dstY,
     std::uint16_t cellW,
     std::uint16_t cellH,
-    const std::uint8_t* srcPixels) noexcept {
+    const std::uint8_t* srcPixels) const {
     if (!srcPixels) {
         return;
+    }
+    if (sdfPixels_.empty()) {
+        sdfPixels_.assign(static_cast<std::size_t>(atlasWidth_) * atlasHeight_, 0u);
     }
     for (std::uint16_t r = 0u; r < cellH; ++r) {
         if (dstY + r >= atlasHeight_) {
@@ -2342,7 +2389,23 @@ void FontAtlas::BlitCellR8Locked(
     revision_.fetch_add(1u, std::memory_order_release);
 }
 
-void FontAtlas::InitBuiltInFallbackAscii() {
+void FontAtlas::EnsureBuiltInFallbackAscii() const {
+    if (builtInAsciiReady_.load(std::memory_order_acquire)) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(mutex_);
+    EnsureBuiltInFallbackAsciiLocked();
+}
+
+void FontAtlas::EnsureBuiltInFallbackAsciiLocked() const {
+    if (builtInAsciiReady_.load(std::memory_order_relaxed)) {
+        return;
+    }
+    InitBuiltInFallbackAscii();
+    builtInAsciiReady_.store(true, std::memory_order_release);
+}
+
+void FontAtlas::InitBuiltInFallbackAscii() const {
     constexpr std::uint16_t kCellW = 20u;
     constexpr std::uint16_t kCellH = 28u;
     constexpr float kFallbackRange = 3.0f;
@@ -2421,6 +2484,7 @@ void FontAtlas::ClearCustomFonts() {
     std::lock_guard<std::mutex> lock(mutex_);
     fonts_.clear();
     familyAliasToIndex_.clear();
+    familyAliasToEntries_.clear();
     glyphCache_.clear();
     defaultFamilyKey_.clear();
     nextFontId_ = 1u;
@@ -2428,6 +2492,7 @@ void FontAtlas::ClearCustomFonts() {
     std::fill(sdfPixels_.begin(), sdfPixels_.end(), 0u);
     revision_.fetch_add(1u, std::memory_order_release);
     InitBuiltInFallbackAscii();
+    builtInAsciiReady_.store(true, std::memory_order_release);
 }
 
 void FontAtlas::BakeOutlineToSdfCell(
@@ -2677,32 +2742,85 @@ bool FontAtlas::LoadTrueTypeFontFromMemory(
         primaryKey = "defaultfont";
     }
 
+    const int faceWeight = face->WeightClass();
+    const bool faceItalic = face->IsItalic();
+
     std::size_t entryIndex = fonts_.size();
     auto existingIt = familyAliasToIndex_.find(primaryKey);
-    if (existingIt != familyAliasToIndex_.end()) {
+    if (existingIt != familyAliasToIndex_.end() &&
+        existingIt->second < fonts_.size() &&
+        (fonts_[existingIt->second].isShardOnly ||
+         (fonts_[existingIt->second].weightClass == faceWeight &&
+          fonts_[existingIt->second].isItalic == faceItalic))) {
         entryIndex = existingIt->second;
         fonts_[entryIndex].face = face;
+        fonts_[entryIndex].weightClass = faceWeight;
+        fonts_[entryIndex].isItalic = faceItalic;
         fonts_[entryIndex].isShardOnly = false;
     } else {
         RegisteredFontEntry entry{};
         entry.fontId = nextFontId_++;
         entry.canonicalKey = primaryKey;
         entry.face = face;
+        entry.weightClass = faceWeight;
+        entry.isItalic = faceItalic;
         fonts_.push_back(std::move(entry));
-        familyAliasToIndex_[primaryKey] = entryIndex;
+        if (familyAliasToIndex_.find(primaryKey) == familyAliasToIndex_.end()) {
+            familyAliasToIndex_[primaryKey] = entryIndex;
+        }
     }
+
+    auto scoreDefaultPreference = [](const RegisteredFontEntry& e) noexcept -> int {
+        int s = e.isShardOnly ? 10000 : 0;
+        if (e.isItalic) {
+            s += 2000;
+        }
+        s += std::abs(e.weightClass - 400);
+        return s;
+    };
+
+    auto addAliasKey = [&](const std::string& k) {
+        if (k.empty()) {
+            return;
+        }
+        auto& list = familyAliasToEntries_[k];
+        if (std::find(list.begin(), list.end(), entryIndex) == list.end()) {
+            list.push_back(entryIndex);
+        }
+        const auto idxIt = familyAliasToIndex_.find(k);
+        if (idxIt == familyAliasToIndex_.end() ||
+            idxIt->second >= fonts_.size() ||
+            scoreDefaultPreference(fonts_[entryIndex]) < scoreDefaultPreference(fonts_[idxIt->second])) {
+            familyAliasToIndex_[k] = entryIndex;
+        }
+    };
 
     auto registerAlias = [&](std::string_view raw) {
         const std::string k = NormalizeFamilyKey(raw);
-        if (!k.empty()) {
-            familyAliasToIndex_[k] = entryIndex;
-            // Also register base family without trailing "regular" (e.g. "Roboto-Regular" -> "roboto")
-            if (k.size() > 7u && k.substr(k.size() - 7u) == "regular") {
-                const std::string stripped = k.substr(0, k.size() - 7u);
-                if (!stripped.empty() && familyAliasToIndex_.find(stripped) == familyAliasToIndex_.end()) {
-                    familyAliasToIndex_[stripped] = entryIndex;
+        if (k.empty()) {
+            return;
+        }
+        addAliasKey(k);
+        static constexpr std::string_view kStyleSuffixes[] = {
+            "bolditalic", "boldoblique", "semibold", "demibold", "extrabold",
+            "ultrabold", "extralight", "ultralight", "regular", "italic",
+            "oblique", "bold", "light", "medium", "thin", "black", "heavy"
+        };
+        std::string stripped = k;
+        for (int pass = 0; pass < 3; ++pass) {
+            bool trimmed = false;
+            for (std::string_view suf : kStyleSuffixes) {
+                if (stripped.size() > suf.size() + 2u &&
+                    stripped.compare(stripped.size() - suf.size(), suf.size(), suf) == 0) {
+                    stripped.resize(stripped.size() - suf.size());
+                    trimmed = true;
+                    break;
                 }
             }
+            if (!trimmed) {
+                break;
+            }
+            addAliasKey(stripped);
         }
     };
 
@@ -2770,34 +2888,156 @@ std::string FontAtlas::DefaultFontFamily() const {
     return defaultFamilyKey_;
 }
 
+const FontAtlas::RegisteredFontEntry* FontAtlas::ResolveBestFaceForKeyLocked(
+    const std::string& key,
+    int weight,
+    bool italic) const noexcept {
+    if (key.empty()) {
+        return nullptr;
+    }
+    const int targetWeight = (weight > 0) ? weight : 400;
+    const auto mapIt = familyAliasToEntries_.find(key);
+    if (mapIt != familyAliasToEntries_.end() && !mapIt->second.empty()) {
+        const RegisteredFontEntry* best = nullptr;
+        int bestScore = 0x7FFFFFFF;
+        for (std::size_t idx : mapIt->second) {
+            if (idx >= fonts_.size()) {
+                continue;
+            }
+            const RegisteredFontEntry& candidate = fonts_[idx];
+            int score = std::abs(candidate.weightClass - targetWeight);
+            if (candidate.isItalic != italic) {
+                score += candidate.isItalic ? 2000 : 1000;
+            }
+            if (candidate.isShardOnly && !candidate.face) {
+                score += 5000;
+            }
+            if (!best || score < bestScore) {
+                best = &candidate;
+                bestScore = score;
+            }
+        }
+        if (best) {
+            return best;
+        }
+    }
+    const auto idxIt = familyAliasToIndex_.find(key);
+    if (idxIt != familyAliasToIndex_.end() && idxIt->second < fonts_.size()) {
+        return &fonts_[idxIt->second];
+    }
+    return nullptr;
+}
+
+void FontAtlas::ResolveFontChainLocked(
+    std::string_view fontFamily,
+    int weight,
+    bool italic,
+    std::vector<const RegisteredFontEntry*>& outChain) const {
+    outChain.clear();
+    std::size_t pos = 0u;
+    while (pos < fontFamily.size()) {
+        const std::size_t comma = fontFamily.find(',', pos);
+        const std::size_t end = (comma == std::string_view::npos) ? fontFamily.size() : comma;
+        std::string_view seg = fontFamily.substr(pos, end - pos);
+        while (!seg.empty() && (seg.front() == ' ' || seg.front() == '\t')) {
+            seg.remove_prefix(1u);
+        }
+        while (!seg.empty() && (seg.back() == ' ' || seg.back() == '\t')) {
+            seg.remove_suffix(1u);
+        }
+        if (!seg.empty()) {
+            const std::string key = NormalizeFamilyKey(seg);
+            if (const RegisteredFontEntry* entry = ResolveBestFaceForKeyLocked(key, weight, italic)) {
+                if (std::find(outChain.begin(), outChain.end(), entry) == outChain.end()) {
+                    outChain.push_back(entry);
+                }
+            }
+        }
+        pos = (comma == std::string_view::npos) ? fontFamily.size() : (comma + 1u);
+    }
+    if (outChain.empty() && !defaultFamilyKey_.empty()) {
+        if (const RegisteredFontEntry* defEntry = ResolveBestFaceForKeyLocked(defaultFamilyKey_, weight, italic)) {
+            outChain.push_back(defEntry);
+        }
+    }
+}
+
 const FontAtlas::RegisteredFontEntry* FontAtlas::ResolveFontEntryLocked(
     std::string_view fontFamily) const noexcept {
     if (!fontFamily.empty()) {
-        const std::string key = NormalizeFamilyKey(fontFamily);
-        const auto it = familyAliasToIndex_.find(key);
-        if (it != familyAliasToIndex_.end() && it->second < fonts_.size()) {
-            return &fonts_[it->second];
+        std::size_t pos = 0u;
+        while (pos < fontFamily.size()) {
+            const std::size_t comma = fontFamily.find(',', pos);
+            const std::size_t end = (comma == std::string_view::npos) ? fontFamily.size() : comma;
+            std::string_view seg = fontFamily.substr(pos, end - pos);
+            const std::string key = NormalizeFamilyKey(seg);
+            if (!key.empty()) {
+                if (const RegisteredFontEntry* entry = ResolveBestFaceForKeyLocked(key, 400, false)) {
+                    return entry;
+                }
+            }
+            pos = (comma == std::string_view::npos) ? fontFamily.size() : (comma + 1u);
         }
     }
     if (!defaultFamilyKey_.empty()) {
-        const auto it = familyAliasToIndex_.find(defaultFamilyKey_);
-        if (it != familyAliasToIndex_.end() && it->second < fonts_.size()) {
-            return &fonts_[it->second];
-        }
+        return ResolveBestFaceForKeyLocked(defaultFamilyKey_, 400, false);
     }
     return nullptr;
 }
 
 bool FontAtlas::HasFontFamily(std::string_view familyName) const noexcept {
     std::lock_guard<std::mutex> lock(mutex_);
-    const std::string key = NormalizeFamilyKey(familyName);
-    return !key.empty() && familyAliasToIndex_.find(key) != familyAliasToIndex_.end();
+    std::size_t pos = 0u;
+    while (pos < familyName.size()) {
+        const std::size_t comma = familyName.find(',', pos);
+        const std::size_t end = (comma == std::string_view::npos) ? familyName.size() : comma;
+        const std::string key = NormalizeFamilyKey(familyName.substr(pos, end - pos));
+        if (!key.empty() &&
+            (familyAliasToIndex_.find(key) != familyAliasToIndex_.end() ||
+             familyAliasToEntries_.find(key) != familyAliasToEntries_.end())) {
+            return true;
+        }
+        pos = (comma == std::string_view::npos) ? familyName.size() : (comma + 1u);
+    }
+    return false;
 }
 
 const TrueTypeFontFace* FontAtlas::FindFontFace(std::string_view familyName) const noexcept {
     std::lock_guard<std::mutex> lock(mutex_);
     const RegisteredFontEntry* entry = ResolveFontEntryLocked(familyName);
     return (entry && entry->face) ? entry->face.get() : nullptr;
+}
+
+FontAtlasGlyph FontAtlas::EnsureGlyphFromChainLocked(
+    const std::vector<const RegisteredFontEntry*>& chain,
+    std::uint32_t codePoint,
+    const RegisteredFontEntry** outChosenEntry) {
+    if (chain.empty()) {
+        if (outChosenEntry) {
+            *outChosenEntry = nullptr;
+        }
+        return EnsureGlyphLocked(nullptr, codePoint);
+    }
+    if (codePoint == ' ' || codePoint == '\t') {
+        if (outChosenEntry) {
+            *outChosenEntry = chain.front();
+        }
+        return EnsureGlyphLocked(chain.front(), codePoint);
+    }
+    for (const RegisteredFontEntry* entry : chain) {
+        if (entry && entry->face && entry->face->IsValid()) {
+            if (entry->face->FindGlyphIndex(codePoint) != 0u) {
+                if (outChosenEntry) {
+                    *outChosenEntry = entry;
+                }
+                return EnsureGlyphLocked(entry, codePoint);
+            }
+        }
+    }
+    if (outChosenEntry) {
+        *outChosenEntry = chain.front();
+    }
+    return EnsureGlyphLocked(chain.front(), codePoint);
 }
 
 FontAtlasGlyph FontAtlas::EnsureGlyphLocked(
@@ -2878,6 +3118,7 @@ FontAtlasGlyph FontAtlas::EnsureGlyphLocked(
                     } else {
                         // meta.advanceEm already computed by BakeOutlineToSdfCell
                         const float savedAdv = meta.advanceEm;
+                        EnsureBuiltInFallbackAsciiLocked();
                         meta = (codePoint < 128u) ? builtInAscii_[codePoint] : builtInCjkBoxGlyph_;
                         meta.codePoint = codePoint;
                         meta.advanceEm = savedAdv;
@@ -2898,6 +3139,7 @@ FontAtlasGlyph FontAtlas::EnsureGlyphLocked(
     // Fallback when no .ttf is loaded or codePoint is unmapped (e.g. unloaded CJK shard):
     // Allocate a unique collision-free Skyline SDF cell per distinct Unicode codePoint!
     if (codePoint < 128u) {
+        EnsureBuiltInFallbackAsciiLocked();
         return builtInAscii_[codePoint];
     }
     const std::uint64_t fallbackKey = (static_cast<std::uint64_t>(0xFFFFu) << 32u) | codePoint;
@@ -2905,6 +3147,7 @@ FontAtlasGlyph FontAtlas::EnsureGlyphLocked(
         return fbIt->second;
     }
 
+    EnsureBuiltInFallbackAsciiLocked();
     FontAtlasGlyph fallback = builtInCjkBoxGlyph_;
     fallback.codePoint = codePoint;
     fallback.glyphIndex = codePoint;
@@ -3133,6 +3376,7 @@ bool FontAtlas::UnpackGlyphShard(
             targetFontId = shardFont.fontId;
             fonts_.push_back(std::move(shardFont));
             familyAliasToIndex_[normKey] = newIdx;
+            familyAliasToEntries_[normKey].push_back(newIdx);
         }
     }
 
@@ -3207,39 +3451,83 @@ TextLayoutResult FontAtlas::MeasureLayout(
     float fontSize,
     float maxWidth,
     TextWrapping wrapMode,
-    float charSpacing) {
+    float charSpacing,
+    int fontWeight,
+    bool fontItalic,
+    float explicitLineHeight) {
+    RichTextRunInput singleRun{};
+    singleRun.text = utf8Text;
+    singleRun.fontFamily = fontFamily;
+    singleRun.fontSize = fontSize;
+    singleRun.fontWeight = (fontWeight > 0) ? fontWeight : 400;
+    singleRun.fontItalic = fontItalic ? 1 : 0;
+    std::vector<RichTextRunInput> runs;
+    if (!utf8Text.empty()) {
+        runs.push_back(singleRun);
+    }
+    return MeasureRichLayout(
+        runs,
+        fontFamily,
+        fontSize,
+        (fontWeight > 0) ? fontWeight : 400,
+        fontItalic,
+        maxWidth,
+        wrapMode,
+        charSpacing,
+        explicitLineHeight);
+}
+
+TextLayoutResult FontAtlas::MeasureRichLayout(
+    const std::vector<RichTextRunInput>& runs,
+    std::string_view defaultFontFamily,
+    float defaultFontSize,
+    int defaultFontWeight,
+    bool defaultItalic,
+    float maxWidth,
+    TextWrapping wrapMode,
+    float charSpacing,
+    float explicitLineHeight) {
     TextLayoutResult result{};
-    const float safeFont = std::max(1.0f, fontSize);
+    const float baseFont = std::max(1.0f, defaultFontSize);
+    const int baseWeight = (defaultFontWeight > 0) ? defaultFontWeight : 400;
+    const float validExplicitLineH =
+        (std::isfinite(explicitLineHeight) && explicitLineHeight > 0.0f)
+            ? explicitLineHeight
+            : 0.0f;
 
     std::unique_lock<std::mutex> lock(mutex_);
-    const RegisteredFontEntry* fontEntry = ResolveFontEntryLocked(fontFamily);
-    std::shared_ptr<TrueTypeFontFace> faceHolder =
-        (fontEntry && fontEntry->face && fontEntry->face->IsValid())
-        ? fontEntry->face
-        : nullptr;
-    const TrueTypeFontFace* face = faceHolder.get();
-    const bool hasCustomFont = (fontEntry != nullptr);
-    result.usedTrueTypeMetrics = hasCustomFont;
+    std::vector<const RegisteredFontEntry*> defaultChain;
+    ResolveFontChainLocked(defaultFontFamily, baseWeight, defaultItalic, defaultChain);
 
-    if (face) {
-        result.ascent = face->AscentEm() * safeFont;
-        result.descent = face->DescentEm() * safeFont;
-        result.lineGap = face->LineGapEm() * safeFont;
-        result.lineHeight = std::max(1.0f, result.ascent + result.descent + result.lineGap);
-    } else if (fontEntry && fontEntry->isShardOnly) {
-        result.ascent = fontEntry->shardAscentEm * safeFont;
-        result.descent = fontEntry->shardDescentEm * safeFont;
-        result.lineGap = fontEntry->shardLineGapEm * safeFont;
-        result.lineHeight = std::max(1.0f, result.ascent + result.descent + result.lineGap);
+    const RegisteredFontEntry* primaryEntry = defaultChain.empty() ? nullptr : defaultChain.front();
+    std::shared_ptr<TrueTypeFontFace> primaryFace =
+        (primaryEntry && primaryEntry->face && primaryEntry->face->IsValid())
+            ? primaryEntry->face
+            : nullptr;
+
+    const bool hasDefaultCustomFont = (primaryEntry != nullptr);
+    result.usedTrueTypeMetrics = hasDefaultCustomFont;
+
+    if (primaryFace) {
+        result.ascent = primaryFace->AscentEm() * baseFont;
+        result.descent = primaryFace->DescentEm() * baseFont;
+        result.lineGap = primaryFace->LineGapEm() * baseFont;
+    } else if (primaryEntry && primaryEntry->isShardOnly) {
+        result.ascent = primaryEntry->shardAscentEm * baseFont;
+        result.descent = primaryEntry->shardDescentEm * baseFont;
+        result.lineGap = primaryEntry->shardLineGapEm * baseFont;
     } else {
         // Built-in fallback vertical metrics preserving 100% existing unit-test layout invariants
-        result.ascent = safeFont * 0.95f;
-        result.descent = safeFont * 0.25f;
+        result.ascent = baseFont * 0.95f;
+        result.descent = baseFont * 0.25f;
         result.lineGap = 0.0f;
-        result.lineHeight = safeFont * 1.2f;
     }
+    const float natBaseLineH = std::max(1.0f, result.ascent + result.descent + result.lineGap);
+    result.lineHeight = (validExplicitLineH > 0.0f)
+        ? std::max(natBaseLineH, validExplicitLineH)
+        : natBaseLineH;
 
-    if (utf8Text.empty()) {
+    if (runs.empty()) {
         return result;
     }
 
@@ -3247,32 +3535,124 @@ TextLayoutResult FontAtlas::MeasureLayout(
         std::uint32_t cp = 0u;
         std::uint32_t sourceCodePointIndex = 0u;
         FontAtlasGlyph meta{};
+        const TrueTypeFontFace* kernFace = nullptr;
+        std::uint32_t fontId = 0u;
+        float fontSize = 14.0f;
+        float ascent = 0.0f;
+        float descent = 0.0f;
+        float lineGap = 0.0f;
+        float upemInvScale = 0.0f;
+        std::uint32_t customRgba = 0u;
+        bool hasCustomRgba = false;
+        bool hasCustomFont = false;
+        bool syntheticBold = false;
+        bool syntheticItalic = false;
+        bool underline = false;
+        bool strikethrough = false;
         bool explicitNewline = false;
     };
 
     std::vector<TokenGlyph> decoded;
-    decoded.reserve(utf8Text.size());
-    std::size_t cursor = 0u;
-    std::uint32_t cp = 0u;
+    std::vector<std::shared_ptr<TrueTypeFontFace>> keepAliveFaces;
+    if (primaryFace) {
+        keepAliveFaces.push_back(primaryFace);
+    }
+
+    auto retainFace = [&](const std::shared_ptr<TrueTypeFontFace>& sp) {
+        if (!sp) return;
+        for (const auto& existing : keepAliveFaces) {
+            if (existing.get() == sp.get()) return;
+        }
+        keepAliveFaces.push_back(sp);
+    };
+
+    std::vector<const RegisteredFontEntry*> runChain;
     std::uint32_t rawCodePointIdx = 0u;
-    while (DecodeNextUtf8CodePoint(utf8Text, cursor, cp)) {
-        const std::uint32_t curCpIdx = rawCodePointIdx++;
-        if (cp == '\r') {
+    for (const RichTextRunInput& run : runs) {
+        if (run.text.empty()) {
             continue;
         }
-        if (cp == '\n') {
-            TokenGlyph nl{};
-            nl.cp = '\n';
-            nl.sourceCodePointIndex = curCpIdx;
-            nl.explicitNewline = true;
-            decoded.push_back(nl);
-            continue;
+        const float runFontSize = (run.fontSize > 0.0f && std::isfinite(run.fontSize))
+            ? std::max(1.0f, run.fontSize)
+            : baseFont;
+        const int runWeight = (run.fontWeight > 0) ? run.fontWeight : baseWeight;
+        const bool runItalic = (run.fontItalic >= 0) ? (run.fontItalic != 0) : defaultItalic;
+        const std::string_view runFamily = !run.fontFamily.empty() ? run.fontFamily : defaultFontFamily;
+
+        ResolveFontChainLocked(runFamily, runWeight, runItalic, runChain);
+        const bool wantBold = (runWeight >= 600);
+        const bool runHasCustom = !runChain.empty();
+        if (runHasCustom) {
+            result.usedTrueTypeMetrics = true;
         }
-        TokenGlyph tg{};
-        tg.cp = cp;
-        tg.sourceCodePointIndex = curCpIdx;
-        tg.meta = EnsureGlyphLocked(fontEntry, cp);
-        decoded.push_back(tg);
+
+        const RegisteredFontEntry* runPrimary = runChain.empty() ? nullptr : runChain.front();
+        float runAscent = result.ascent;
+        float runDescent = result.descent;
+        float runLineGap = result.lineGap;
+        if (runPrimary && runPrimary->face && runPrimary->face->IsValid()) {
+            runAscent = runPrimary->face->AscentEm() * runFontSize;
+            runDescent = runPrimary->face->DescentEm() * runFontSize;
+            runLineGap = runPrimary->face->LineGapEm() * runFontSize;
+            retainFace(runPrimary->face);
+        } else if (runPrimary && runPrimary->isShardOnly) {
+            runAscent = runPrimary->shardAscentEm * runFontSize;
+            runDescent = runPrimary->shardDescentEm * runFontSize;
+            runLineGap = runPrimary->shardLineGapEm * runFontSize;
+        } else if (!hasDefaultCustomFont) {
+            runAscent = runFontSize * 0.95f;
+            runDescent = runFontSize * 0.25f;
+            runLineGap = 0.0f;
+        }
+
+        std::size_t cursor = 0u;
+        std::uint32_t cp = 0u;
+        while (DecodeNextUtf8CodePoint(run.text, cursor, cp)) {
+            const std::uint32_t curCpIdx = rawCodePointIdx++;
+            if (cp == '\r') {
+                continue;
+            }
+            if (cp == '\n') {
+                TokenGlyph nl{};
+                nl.cp = '\n';
+                nl.sourceCodePointIndex = curCpIdx;
+                nl.fontSize = runFontSize;
+                nl.ascent = runAscent;
+                nl.descent = runDescent;
+                nl.lineGap = runLineGap;
+                nl.explicitNewline = true;
+                decoded.push_back(nl);
+                continue;
+            }
+            const RegisteredFontEntry* chosen = nullptr;
+            TokenGlyph tg{};
+            tg.cp = cp;
+            tg.sourceCodePointIndex = curCpIdx;
+            tg.meta = EnsureGlyphFromChainLocked(runChain, cp, &chosen);
+            tg.fontSize = runFontSize;
+            tg.ascent = runAscent;
+            tg.descent = runDescent;
+            tg.lineGap = runLineGap;
+            tg.customRgba = run.fgRgba;
+            tg.hasCustomRgba = run.hasFg;
+            tg.underline = (run.decorations & 1) != 0;
+            tg.strikethrough = (run.decorations & 2) != 0;
+            tg.hasCustomFont = (chosen != nullptr);
+            if (chosen) {
+                tg.fontId = chosen->fontId;
+                tg.syntheticBold = wantBold && (chosen->weightClass < 600);
+                tg.syntheticItalic = runItalic && !chosen->isItalic;
+                if (chosen->face && chosen->face->IsValid()) {
+                    retainFace(chosen->face);
+                    tg.kernFace = chosen->face.get();
+                    tg.upemInvScale = runFontSize / static_cast<float>(chosen->face->UnitsPerEm());
+                }
+            } else {
+                tg.syntheticBold = wantBold;
+                tg.syntheticItalic = runItalic;
+            }
+            decoded.push_back(tg);
+        }
     }
     lock.unlock();
 
@@ -3284,9 +3664,6 @@ TextLayoutResult FontAtlas::MeasureLayout(
         std::isfinite(maxWidth) && (maxWidth > 0.0f) && (maxWidth < 500000.0f);
     // Small float tolerance prevents re-wrapping an auto-sized TextBlock arranged to its own DesiredSize.width
     const float wrapLimit = maxWidth + 0.05f;
-    const float upemInvScale = face
-        ? (safeFont / static_cast<float>(face->UnitsPerEm()))
-        : 0.0f;
 
     result.glyphs.reserve(decoded.size());
 
@@ -3297,12 +3674,46 @@ TextLayoutResult FontAtlas::MeasureLayout(
     std::size_t lastBreakDecodedIdx = static_cast<std::size_t>(-1);
     std::size_t lastBreakGlyphOutIdx = 0u;
     std::uint32_t prevGlyphIdOnLine = 0xFFFFFFFFu;
+    std::uint32_t prevFontIdOnLine = 0u;
+    std::vector<std::size_t> lineTokenIndices;
+    lineTokenIndices.reserve(64u);
 
-    auto finishLine = [&](std::size_t endGlyphIdx) {
+    auto finishLine = [&](std::size_t endGlyphIdx, bool endedByNewline) {
+        float lineAscent = result.ascent;
+        float lineDescent = result.descent;
+        float lineGap = result.lineGap;
+        if (endGlyphIdx > lineStartGlyphIdx) {
+            lineAscent = 0.0f;
+            lineDescent = 0.0f;
+            lineGap = 0.0f;
+            for (std::size_t k = lineStartGlyphIdx; k < endGlyphIdx; ++k) {
+                const TokenGlyph& ltg = decoded[lineTokenIndices[k]];
+                lineAscent = std::max(lineAscent, ltg.ascent);
+                lineDescent = std::max(lineDescent, ltg.descent);
+                lineGap = std::max(lineGap, ltg.lineGap);
+            }
+        }
+        const float natLineH = std::max(1.0f, lineAscent + lineDescent + lineGap);
+        const float effectiveLineH = (validExplicitLineH > 0.0f)
+            ? std::max(natLineH, validExplicitLineH)
+            : natLineH;
+        const float extraLeading = std::max(0.0f, effectiveLineH - natLineH);
+        const float lineBaselineY = curTopY + lineAscent + extraLeading * 0.5f;
+
         float trimmedW = 0.0f;
         for (std::size_t k = lineStartGlyphIdx; k < endGlyphIdx; ++k) {
-            if (!result.glyphs[k].isWhitespace || !wrapEnabled) {
-                trimmedW = std::max(trimmedW, result.glyphs[k].penX + result.glyphs[k].advanceX);
+            PositionedGlyph& gpg = result.glyphs[k];
+            const TokenGlyph& ltg = decoded[lineTokenIndices[k]];
+            gpg.baselineY = lineBaselineY;
+            if (ltg.hasCustomFont) {
+                gpg.y0 = lineBaselineY - ltg.meta.bearingYEm * ltg.fontSize;
+                gpg.y1 = gpg.y0 + ltg.meta.quadHeightEm * ltg.fontSize;
+            } else {
+                gpg.y0 = curTopY;
+                gpg.y1 = curTopY + effectiveLineH;
+            }
+            if (!gpg.isWhitespace || !wrapEnabled) {
+                trimmedW = std::max(trimmedW, gpg.penX + gpg.advanceX);
             }
         }
         if (!wrapEnabled && endGlyphIdx > lineStartGlyphIdx) {
@@ -3312,28 +3723,30 @@ TextLayoutResult FontAtlas::MeasureLayout(
         lm.lineIndex = curLineIdx;
         lm.width = trimmedW;
         lm.topY = curTopY;
-        lm.baselineY = curTopY + result.ascent;
-        lm.ascent = result.ascent;
-        lm.descent = result.descent;
-        lm.lineGap = result.lineGap;
-        lm.lineHeight = result.lineHeight;
+        lm.baselineY = lineBaselineY;
+        lm.ascent = lineAscent;
+        lm.descent = lineDescent;
+        lm.lineGap = lineGap;
+        lm.lineHeight = effectiveLineH;
         lm.firstGlyphIndex = lineStartGlyphIdx;
         lm.glyphCount = endGlyphIdx - lineStartGlyphIdx;
+        lm.endedByNewline = endedByNewline;
         result.lines.push_back(lm);
         result.totalWidth = std::max(result.totalWidth, lm.width);
 
         ++curLineIdx;
-        curTopY += result.lineHeight;
+        curTopY += effectiveLineH;
         curPenX = 0.0f;
         lineStartGlyphIdx = endGlyphIdx;
         lastBreakDecodedIdx = static_cast<std::size_t>(-1);
         prevGlyphIdOnLine = 0xFFFFFFFFu;
+        prevFontIdOnLine = 0u;
     };
 
     for (std::size_t i = 0u; i < decoded.size(); ++i) {
         const TokenGlyph& tg = decoded[i];
         if (tg.explicitNewline) {
-            finishLine(result.glyphs.size());
+            finishLine(result.glyphs.size(), true);
             continue;
         }
 
@@ -3341,14 +3754,14 @@ TextLayoutResult FontAtlas::MeasureLayout(
         float kernPx = 0.0f;
         float trackingPx = 0.0f;
         if (prevGlyphIdOnLine != 0xFFFFFFFFu) {
-            if (face) {
-                kernPx = face->GetKerningFUnits(prevGlyphIdOnLine, tg.meta.glyphIndex) * upemInvScale;
+            if (tg.kernFace && tg.fontId == prevFontIdOnLine) {
+                kernPx = tg.kernFace->GetKerningFUnits(prevGlyphIdOnLine, tg.meta.glyphIndex) * tg.upemInvScale;
             }
             if (std::isfinite(charSpacing) && charSpacing != 0.0f) {
-                trackingPx = charSpacing * 0.001f * safeFont;
+                trackingPx = charSpacing * 0.001f * tg.fontSize;
             }
         }
-        const float advPx = tg.meta.advanceEm * safeFont;
+        const float advPx = tg.meta.advanceEm * tg.fontSize;
         const float nextPenX = curPenX + kernPx + trackingPx + advPx;
 
         // CJK characters can also break BEFORE the ideograph itself
@@ -3365,7 +3778,8 @@ TextLayoutResult FontAtlas::MeasureLayout(
                 // Rewind back to last word/CJK break boundary (save break index before finishLine resets it)
                 const std::size_t savedBreakDecodedIdx = lastBreakDecodedIdx;
                 result.glyphs.resize(lastBreakGlyphOutIdx);
-                finishLine(result.glyphs.size());
+                lineTokenIndices.resize(lastBreakGlyphOutIdx);
+                finishLine(result.glyphs.size(), false);
                 // Skip leading spaces at the start of the wrapped line
                 std::size_t resumeIdx = savedBreakDecodedIdx;
                 while (resumeIdx < decoded.size() &&
@@ -3378,14 +3792,14 @@ TextLayoutResult FontAtlas::MeasureLayout(
             }
             if (wrapMode == TextWrapping::Wrap) {
                 // Emergency character-level break for unbroken words exceeding maxWidth
-                finishLine(result.glyphs.size());
+                finishLine(result.glyphs.size(), false);
                 kernPx = 0.0f;
                 trackingPx = 0.0f;
             }
         }
 
         const float penStart = curPenX + kernPx + trackingPx;
-        const float baselineY = curTopY + result.ascent;
+        const float baselineY = curTopY + tg.ascent;
         PositionedGlyph pg{};
         pg.codePoint = tg.cp;
         pg.glyphIndex = tg.meta.glyphIndex;
@@ -3402,12 +3816,18 @@ TextLayoutResult FontAtlas::MeasureLayout(
         pg.u1 = tg.meta.u1;
         pg.v1 = tg.meta.v1;
         pg.isWhitespace = tg.meta.isWhitespace || isSpace;
+        pg.customRgba = tg.customRgba;
+        pg.hasCustomRgba = tg.hasCustomRgba;
+        pg.syntheticBold = tg.syntheticBold;
+        pg.syntheticItalic = tg.syntheticItalic;
+        pg.underline = tg.underline;
+        pg.strikethrough = tg.strikethrough;
 
-        if (hasCustomFont) {
-            pg.x0 = penStart + tg.meta.bearingXEm * safeFont;
-            pg.y0 = baselineY - tg.meta.bearingYEm * safeFont;
-            pg.x1 = pg.x0 + tg.meta.quadWidthEm * safeFont;
-            pg.y1 = pg.y0 + tg.meta.quadHeightEm * safeFont;
+        if (tg.hasCustomFont) {
+            pg.x0 = penStart + tg.meta.bearingXEm * tg.fontSize;
+            pg.y0 = baselineY - tg.meta.bearingYEm * tg.fontSize;
+            pg.x1 = pg.x0 + tg.meta.quadWidthEm * tg.fontSize;
+            pg.y1 = pg.y0 + tg.meta.quadHeightEm * tg.fontSize;
         } else {
             pg.x0 = penStart;
             pg.y0 = curTopY;
@@ -3416,8 +3836,10 @@ TextLayoutResult FontAtlas::MeasureLayout(
         }
 
         result.glyphs.push_back(pg);
+        lineTokenIndices.push_back(i);
         curPenX = penStart + advPx;
         prevGlyphIdOnLine = tg.meta.glyphIndex;
+        prevFontIdOnLine = tg.fontId;
 
         if (wrapEnabled && IsWordBreakAfter(tg.cp)) {
             lastBreakDecodedIdx = i + 1u;
@@ -3425,13 +3847,13 @@ TextLayoutResult FontAtlas::MeasureLayout(
         }
     }
 
-    finishLine(result.glyphs.size());
+    finishLine(result.glyphs.size(), true);
 
-    if (!hasCustomFont && result.lines.size() == 1u) {
+    if (!result.usedTrueTypeMetrics && result.lines.size() == 1u && validExplicitLineH <= 0.0f) {
         // Exact single-line height compatibility with MeasureUtf8TextRun (1.25f * fontSize)
-        result.totalHeight = safeFont * 1.25f;
+        result.totalHeight = baseFont * 1.25f;
     } else {
-        result.totalHeight = static_cast<float>(result.lines.size()) * result.lineHeight;
+        result.totalHeight = curTopY;
     }
     return result;
 }

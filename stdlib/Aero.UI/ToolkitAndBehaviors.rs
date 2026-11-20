@@ -48,6 +48,16 @@ public class DateTimeControl : Control {
         if (!_sysHookInstalled) {
             _sysHookInstalled = true;
             BindingEngine.AddPreFlushHook(() => { DateTimeControl.TickLiveClocks(); });
+            UIElement.RegisterDisposeHook(() => { DateTimeControl.CleanupDisposed(); });
+        }
+    }
+
+    public static void CleanupDisposed() {
+        if (_liveClocks == null) { return; }
+        for (int i = _liveClocks.Length - 1; i >= 0; i -= 1) {
+            if (_liveClocks[i] == null || _liveClocks[i]._isDisposedTree) {
+                _liveClocks.RemoveAt(i);
+            }
         }
     }
 
@@ -494,12 +504,50 @@ public class TriggerAction : DependencyObject {
     public string ActionName { get; set; } = "";
     public string TargetName { get; set; } = "";
     public UIElement TargetObject { get; set; }
+    public string TargetObjectPath { get; set; } = "";
+    public string TargetObjectRelativeMode { get; set; } = "";
+    public string TargetObjectAncestorType { get; set; } = "";
+    public string TargetObjectElementName { get; set; } = "";
     public bool IsEnabled { get; set; } = true;
+
+    public void SetTargetObjectBinding(string path, string relMode, string ancType, string elName) {
+        TargetObjectPath = path == null ? "" : path;
+        TargetObjectRelativeMode = relMode == null ? "" : relMode;
+        TargetObjectAncestorType = ancType == null ? "" : ancType;
+        TargetObjectElementName = elName == null ? "" : elName;
+    }
 
     public UIElement ResolveTarget(UIElement associatedObject) {
         if (TargetObject != null) { return TargetObject; }
+        if (TargetObjectPath.Length > 0 && associatedObject != null) {
+            UIElement src = associatedObject;
+            if (TargetObjectElementName.Length > 0) {
+                src = BindingEntry.FindElementScoped(associatedObject, TargetObjectElementName);
+                if (src == null && associatedObject.RootElement() != null) {
+                    src = associatedObject.RootElement().FindName(TargetObjectElementName);
+                }
+            } else if (TargetObjectRelativeMode == "TemplatedParent") {
+                src = associatedObject.TemplatedParent;
+            } else if (TargetObjectRelativeMode == "FindAncestor" || TargetObjectRelativeMode == "AncestorType") {
+                UIElement anc = associatedObject;
+                while (anc != null && TargetObjectAncestorType.Length > 0 && !BindingEntry.MatchesAncestorType(anc, TargetObjectAncestorType)) {
+                    anc = anc.Parent;
+                }
+                src = anc;
+            }
+            if (src != null) {
+                DependencyObject box = src.GetPropertyValue(TargetObjectPath);
+                if (box == null) { box = BindingEngine.ReadPathBox(src, TargetObjectPath); }
+                object unboxed = DependencyObject.Unbox(box);
+                if (unboxed is UIElement) { return unboxed as UIElement; }
+            }
+        }
         if (associatedObject != null && TargetName.Length > 0) {
-            UIElement found = associatedObject.RootElement().FindName(TargetName);
+            UIElement found = BindingEntry.FindElementScoped(associatedObject, TargetName);
+            if (found == null) { found = associatedObject.FindName(TargetName); }
+            if (found == null && associatedObject.RootElement() != null) {
+                found = associatedObject.RootElement().FindName(TargetName);
+            }
             if (found != null) { return found; }
         }
         return associatedObject;
@@ -544,7 +592,7 @@ public class InvokeCommandAction : TriggerAction {
         }
         if (CommandParameterAncestorType.Length > 0) {
             UIElement cur = associatedObject;
-            while (cur != null && cur.GetTypeName() != CommandParameterAncestorType) {
+            while (cur != null && !BindingEntry.MatchesAncestorType(cur, CommandParameterAncestorType)) {
                 cur = cur.Parent;
             }
             if (cur != null) {
@@ -582,6 +630,8 @@ public class InvokeCommandAction : TriggerAction {
 
 public class ChangePropertyAction : TriggerAction {
     public string PropertyName { get; set; } = "";
+    public Binding ValueBinding { get; set; }
+    public MultiBinding ValueMultiBinding { get; set; }
     private DependencyObject _valueBox;
 
     public ChangePropertyAction() {}
@@ -613,27 +663,52 @@ public class ChangePropertyAction : TriggerAction {
         set { _valueBox = DependencyObject.BoxObject(value); }
     }
 
+    private DependencyObject ResolveActionValueBox(UIElement associatedObject) {
+        if (ValueMultiBinding != null) {
+            Binding[] subs = ValueMultiBinding.Bindings;
+            int n = subs != null ? subs.Length : 0;
+            var vals = new DependencyObject[n];
+            for (int i = 0; i < n; i += 1) {
+                vals[i] = BehaviorDataTrigger.EvaluateDynamicBinding(associatedObject, subs[i]);
+            }
+            if (ValueMultiBinding.Converter != null) {
+                DependencyObject pBox = ValueMultiBinding.ConverterParameter.Length > 0
+                    ? DependencyObject.BoxString(ValueMultiBinding.ConverterParameter) : null;
+                return DependencyObject.BoxObject(ValueMultiBinding.Converter.Convert(vals, PropertyName, pBox, ""));
+            }
+            return n > 0 ? vals[0] : null;
+        }
+        if (ValueBinding != null) {
+            return BehaviorDataTrigger.EvaluateDynamicBinding(associatedObject, ValueBinding);
+        }
+        return _valueBox;
+    }
+
     public override void Invoke(UIElement associatedObject, DependencyObject parameter) {
         if (!IsEnabled || PropertyName.Length == 0) { return; }
+        DependencyObject valBox = ResolveActionValueBox(associatedObject);
         if (TargetObject == null && TargetName.Length > 0) {
-            UIElement namedEl = associatedObject != null ? associatedObject.FindName(TargetName) : null;
+            UIElement namedEl = associatedObject != null ? BindingEntry.FindElementScoped(associatedObject, TargetName) : null;
             if (namedEl == null && associatedObject != null) {
+                namedEl = associatedObject.FindName(TargetName);
+            }
+            if (namedEl == null && associatedObject != null && associatedObject.RootElement() != null) {
                 namedEl = associatedObject.RootElement().FindName(TargetName);
             }
             if (namedEl != null) {
-                namedEl.SetPropertyValue(PropertyName, _valueBox);
+                namedEl.SetPropertyValue(PropertyName, valBox);
                 return;
             }
             TriggerAction namedAct = Interaction.FindNamedAction(associatedObject, TargetName);
             if (namedAct != null) {
-                namedAct.SetActionProperty(PropertyName, _valueBox);
+                namedAct.SetActionProperty(PropertyName, valBox);
                 return;
             }
             return;
         }
         UIElement dest = ResolveTarget(associatedObject);
         if (dest != null) {
-            dest.SetPropertyValue(PropertyName, _valueBox);
+            dest.SetPropertyValue(PropertyName, valBox);
         }
     }
 }
@@ -671,6 +746,16 @@ public class SetFocusAction : TriggerAction {
     }
 }
 
+public class RemoveElementAction : TriggerAction {
+    public override void Invoke(UIElement associatedObject, DependencyObject parameter) {
+        if (!IsEnabled) { return; }
+        UIElement dest = ResolveTarget(associatedObject);
+        if (dest != null && dest.Parent != null) {
+            dest.Parent.RemoveChild(dest);
+        }
+    }
+}
+
 public class SelectAllAction : TriggerAction {
     public override void Invoke(UIElement associatedObject, DependencyObject parameter) {
         if (!IsEnabled) { return; }
@@ -705,14 +790,364 @@ public class PlaySoundAction : TriggerAction {
     }
 }
 
+public class NavDestination : DependencyObject {
+    public string Id { get; set; } = "";
+    public DependencyObject ContentBox { get; set; }
+    public string BindingPath { get; set; } = "";
+    public DataTemplate ContentTemplate { get; set; }
+}
+
+public static class TransitionContentPresenter {
+    private static UIElement[] _enterEls;
+    private static string[] _enterKeys;
+    private static UIElement[] _exitEls;
+    private static string[] _exitKeys;
+    private static bool _disposeHookInstalled = false;
+
+    private static void EnsureDisposeHook() {
+        if (_disposeHookInstalled) { return; }
+        _disposeHookInstalled = true;
+        UIElement.RegisterDisposeHook(() => { TransitionContentPresenter.CleanupDisposed(); });
+    }
+
+    public static void SetEnterKey(UIElement el, string key) {
+        if (el == null || key == null || key.Length == 0) { return; }
+        if (_enterEls == null) {
+            _enterEls = new UIElement[0];
+            _enterKeys = new string[0];
+            EnsureDisposeHook();
+        }
+        for (int i = _enterEls.Length - 1; i >= 0; i -= 1) {
+            if (_enterEls[i] == null || _enterEls[i]._isDisposedTree) {
+                _enterEls.RemoveAt(i);
+                _enterKeys.RemoveAt(i);
+            } else if (_enterEls[i] == el) {
+                _enterKeys[i] = key;
+                return;
+            }
+        }
+        _enterEls.Push(el);
+        _enterKeys.Push(key);
+    }
+
+    public static void SetExitKey(UIElement el, string key) {
+        if (el == null || key == null || key.Length == 0) { return; }
+        if (_exitEls == null) {
+            _exitEls = new UIElement[0];
+            _exitKeys = new string[0];
+            EnsureDisposeHook();
+        }
+        for (int i = _exitEls.Length - 1; i >= 0; i -= 1) {
+            if (_exitEls[i] == null || _exitEls[i]._isDisposedTree) {
+                _exitEls.RemoveAt(i);
+                _exitKeys.RemoveAt(i);
+            } else if (_exitEls[i] == el) {
+                _exitKeys[i] = key;
+                return;
+            }
+        }
+        _exitEls.Push(el);
+        _exitKeys.Push(key);
+    }
+
+    private static string FindRegisteredEnterKey(UIElement el) {
+        if (el == null || _enterEls == null) { return ""; }
+        for (int i = _enterEls.Length - 1; i >= 0; i -= 1) {
+            if (_enterEls[i] == null || _enterEls[i]._isDisposedTree) {
+                _enterEls.RemoveAt(i);
+                _enterKeys.RemoveAt(i);
+            } else if (_enterEls[i] == el) {
+                return _enterKeys[i];
+            }
+        }
+        return "";
+    }
+
+    private static string FindRegisteredExitKey(UIElement el) {
+        if (el == null || _exitEls == null) { return ""; }
+        for (int i = _exitEls.Length - 1; i >= 0; i -= 1) {
+            if (_exitEls[i] == null || _exitEls[i]._isDisposedTree) {
+                _exitEls.RemoveAt(i);
+                _exitKeys.RemoveAt(i);
+            } else if (_exitEls[i] == el) {
+                return _exitKeys[i];
+            }
+        }
+        return "";
+    }
+
+    internal static void CleanupDisposed() {
+        if (_enterEls != null) {
+            for (int i = _enterEls.Length - 1; i >= 0; i -= 1) {
+                if (_enterEls[i] == null || _enterEls[i]._isDisposedTree) {
+                    _enterEls.RemoveAt(i);
+                    _enterKeys.RemoveAt(i);
+                }
+            }
+        }
+        if (_exitEls != null) {
+            for (int i = _exitEls.Length - 1; i >= 0; i -= 1) {
+                if (_exitEls[i] == null || _exitEls[i]._isDisposedTree) {
+                    _exitEls.RemoveAt(i);
+                    _exitKeys.RemoveAt(i);
+                }
+            }
+        }
+    }
+
+    private static UIElement FindExitTarget(UIElement root) {
+        if (root == null || _exitEls == null || _exitEls.Length == 0) { return null; }
+        var q = new UIElement[0];
+        q.Push(root);
+        int idx = 0;
+        while (idx < q.Length && idx < 32) {
+            UIElement cur = q[idx];
+            idx += 1;
+            if (cur == null || cur._isDisposedTree) { continue; }
+            if (FindRegisteredExitKey(cur).Length > 0) { return cur; }
+            for (int i = 0; i < cur.ChildCount(); i += 1) {
+                q.Push(cur.ChildAt(i));
+            }
+        }
+        return null;
+    }
+
+    public static bool HasExitTransition(UIElement root) {
+        return FindExitTarget(root) != null;
+    }
+
+    public static bool PlayExit(UIElement root, Action onFinished = null) {
+        UIElement target = FindExitTarget(root);
+        if (target == null) {
+            if (onFinished != null) { onFinished(); }
+            return false;
+        }
+        string key = FindRegisteredExitKey(target);
+        if (key.Length == 0) {
+            if (onFinished != null) { onFinished(); }
+            return false;
+        }
+        DependencyObject res = target.FindResourceBox(key);
+        if (res is Storyboard) {
+            (res as Storyboard).BeginWithCompletion(target, onFinished);
+            return true;
+        }
+        if (onFinished != null) { onFinished(); }
+        return false;
+    }
+
+    public static void PlayEnter(UIElement root) {
+        if (root == null || _enterEls == null) { return; }
+        var q = new UIElement[0];
+        q.Push(root);
+        int idx = 0;
+        while (idx < q.Length && idx < 32) {
+            UIElement cur = q[idx];
+            idx += 1;
+            if (cur == null) { continue; }
+            string key = FindRegisteredEnterKey(cur);
+            if (key.Length > 0) {
+                cur.BeginStoryboard(key);
+                return;
+            }
+            for (int i = 0; i < cur.ChildCount(); i += 1) {
+                q.Push(cur.ChildAt(i));
+            }
+        }
+    }
+}
+
+public static class Navigation {
+    private static ContentControl[] _hosts;
+    private static string[] _curDestIds;
+    private static int[] _hostNavGen;
+    private static NavDestination[] _pendingDests;
+    private static int[] _pendingGens;
+    private static int[] _destHostIdx;
+    private static NavDestination[] _dests;
+    private static int[] _histHostIdx;
+    private static string[] _histDestIds;
+
+    private static void EnsureTables() {
+        if (_hosts == null) {
+            _hosts = new ContentControl[0];
+            _curDestIds = new string[0];
+            _hostNavGen = new int[0];
+            _pendingDests = new NavDestination[0];
+            _pendingGens = new int[0];
+            _destHostIdx = new int[0];
+            _dests = new NavDestination[0];
+            _histHostIdx = new int[0];
+            _histDestIds = new string[0];
+            UIElement.RegisterDisposeHook(() => { Navigation.CleanupDisposed(); });
+        }
+    }
+
+    private static int EnsureHostIndex(ContentControl host) {
+        EnsureTables();
+        for (int i = 0; i < _hosts.Length; i += 1) {
+            if (_hosts[i] == host) { return i; }
+        }
+        _hosts.Push(host);
+        _curDestIds.Push("");
+        _hostNavGen.Push(0);
+        _pendingDests.Push(null);
+        _pendingGens.Push(0);
+        return _hosts.Length - 1;
+    }
+
+    internal static void CleanupDisposed() {
+        if (_hosts == null) { return; }
+        for (int i = 0; i < _hosts.Length; i += 1) {
+            if (_hosts[i] != null && _hosts[i]._isDisposedTree) {
+                _hosts[i] = null;
+                _hostNavGen[i] = _hostNavGen[i] + 1;
+                _pendingDests[i] = null;
+            }
+        }
+    }
+
+    public static void RegisterDestination(UIElement hostEl, NavDestination dest) {
+        ContentControl host = hostEl as ContentControl;
+        if (host == null || dest == null) { return; }
+        int hi = EnsureHostIndex(host);
+        for (int i = 0; i < _dests.Length; i += 1) {
+            if (_destHostIdx[i] == hi && _dests[i].Id == dest.Id) {
+                _dests[i] = dest;
+                return;
+            }
+        }
+        _destHostIdx.Push(hi);
+        _dests.Push(dest);
+        if (_curDestIds[hi].Length == 0 && dest.Id.Length > 0) {
+            _curDestIds[hi] = dest.Id;
+        }
+    }
+
+    private static int FindHostIndexForCaller(UIElement caller) {
+        if (_hosts == null || _hosts.Length == 0) { return -1; }
+        UIElement cur = caller;
+        while (cur != null) {
+            if (cur is ContentControl) {
+                ContentControl cc = cur as ContentControl;
+                for (int i = 0; i < _hosts.Length; i += 1) {
+                    if (_hosts[i] == cc) { return i; }
+                }
+            }
+            cur = cur.Parent;
+        }
+        for (int i = _hosts.Length - 1; i >= 0; i -= 1) {
+            if (_hosts[i] != null && !_hosts[i]._isDisposedTree) { return i; }
+        }
+        return -1;
+    }
+
+    private static NavDestination FindDestination(int hi, string destId) {
+        if (hi < 0 || destId == null || destId.Length == 0) { return null; }
+        for (int i = 0; i < _dests.Length; i += 1) {
+            if (_destHostIdx[i] == hi && _dests[i].Id == destId) { return _dests[i]; }
+        }
+        return null;
+    }
+
+    private static void CommitDestination(int hi, int expectedGen, NavDestination dest) {
+        if (hi < 0 || hi >= _hosts.Length || dest == null) { return; }
+        if (_hostNavGen[hi] != expectedGen) { return; }
+        ContentControl host = _hosts[hi];
+        if (host == null || host._isDisposedTree) { return; }
+        DependencyObject contentBox = dest.ContentBox;
+        if (contentBox == null && dest.BindingPath.Length > 0 && host.DataContext != null) {
+            contentBox = BindingEngine.ReadPathBox(host.DataContext, dest.BindingPath);
+        }
+        BindingEngine.ClearBindings(host, "Content");
+        host.SetContentAndTemplate(contentBox, dest.ContentTemplate);
+        host.ApplyTemplateSubtree();
+        BindingEngine.FlushSubtree(host);
+        host.EnsureLoadedSubtree();
+        TransitionContentPresenter.PlayEnter(host);
+    }
+
+    internal static void CommitPending() {
+        if (_hosts == null || _pendingDests == null) { return; }
+        for (int i = 0; i < _hosts.Length; i += 1) {
+            NavDestination d = _pendingDests[i];
+            if (d != null) {
+                int expGen = _pendingGens[i];
+                _pendingDests[i] = null;
+                CommitDestination(i, expGen, d);
+            }
+        }
+    }
+
+    private static void ApplyDestination(int hi, NavDestination dest) {
+        if (hi < 0 || hi >= _hosts.Length || dest == null) { return; }
+        ContentControl host = _hosts[hi];
+        if (host == null || host._isDisposedTree) { return; }
+        int gen = _hostNavGen[hi] + 1;
+        _hostNavGen[hi] = gen;
+        _pendingDests[hi] = null;
+        bool hasOldContent = host.ContentBox != null || host.ChildCount() > 0;
+        if (hasOldContent && TransitionContentPresenter.HasExitTransition(host)) {
+            _pendingDests[hi] = dest;
+            _pendingGens[hi] = gen;
+            TransitionContentPresenter.PlayExit(host, () => {
+                Navigation.CommitPending();
+            });
+            return;
+        }
+        CommitDestination(hi, gen, dest);
+    }
+
+    public static void NavigateTo(UIElement caller, string destinationId) {
+        if (destinationId == null || destinationId.Length == 0) { return; }
+        int hi = FindHostIndexForCaller(caller);
+        if (hi < 0) { return; }
+        NavDestination dest = FindDestination(hi, destinationId);
+        if (dest == null) { return; }
+        string prev = _curDestIds[hi];
+        if (prev.Length > 0 && prev != destinationId) {
+            _histHostIdx.Push(hi);
+            _histDestIds.Push(prev);
+        }
+        _curDestIds[hi] = destinationId;
+        ApplyDestination(hi, dest);
+    }
+
+    public static void NavigateBack(UIElement caller) {
+        int hi = FindHostIndexForCaller(caller);
+        if (hi < 0) { return; }
+        for (int i = _histHostIdx.Length - 1; i >= 0; i -= 1) {
+            if (_histHostIdx[i] == hi) {
+                string prevId = _histDestIds[i];
+                _histHostIdx.RemoveAt(i);
+                _histDestIds.RemoveAt(i);
+                NavDestination dest = FindDestination(hi, prevId);
+                if (dest != null) {
+                    _curDestIds[hi] = prevId;
+                    ApplyDestination(hi, dest);
+                }
+                return;
+            }
+        }
+    }
+}
+
 public class NavigateToAction : TriggerAction {
     public string Source { get; set; } = "";
     public string TargetUri { get; set; } = "";
-    public override void Invoke(UIElement associatedObject, DependencyObject parameter) {}
+    public string DestinationId { get; set; } = "";
+    public override void Invoke(UIElement associatedObject, DependencyObject parameter) {
+        if (!IsEnabled) { return; }
+        string id = DestinationId.Length > 0 ? DestinationId : (Source.Length > 0 ? Source : TargetUri);
+        if (id.Length > 0) { Navigation.NavigateTo(associatedObject, id); }
+    }
 }
 
 public class NavigateBackAction : TriggerAction {
-    public override void Invoke(UIElement associatedObject, DependencyObject parameter) {}
+    public override void Invoke(UIElement associatedObject, DependencyObject parameter) {
+        if (!IsEnabled) { return; }
+        Navigation.NavigateBack(associatedObject);
+    }
 }
 
 public class RiveInput : DependencyObject {
@@ -1032,6 +1467,7 @@ public class RewindMediaAction : TriggerAction {
 
 public class ComparisonCondition : DependencyObject {
     public string PropertyPath { get; set; } = "";
+    public string ElementName { get; set; } = "";
     public string Operator { get; set; } = "Equal";
     private DependencyObject _rightBox;
 
@@ -1041,20 +1477,42 @@ public class ComparisonCondition : DependencyObject {
         Operator = op == null ? "Equal" : op;
         _rightBox = rightVal;
     }
+    public ComparisonCondition(string propPath, string op, DependencyObject rightVal, string elementName)
+        : this(propPath, op, rightVal) {
+        ElementName = elementName == null ? "" : elementName;
+    }
 
     public object RightOperand {
         get { return DependencyObject.Unbox(_rightBox); }
         set { _rightBox = DependencyObject.BoxObject(value); }
     }
 
+    private UIElement ResolveSourceElement(UIElement scope) {
+        if (scope == null) { return null; }
+        if (ElementName == null || ElementName.Length == 0) { return scope; }
+        if (scope.Name == ElementName) { return scope; }
+        UIElement se = BindingEntry.FindElementScoped(scope, ElementName);
+        if (se == null) { se = scope.FindName(ElementName); }
+        if (se == null && scope.RootElement() != null) {
+            se = scope.RootElement().FindName(ElementName);
+        }
+        return se;
+    }
+
     public bool Evaluate(UIElement scope) {
         if (scope == null || PropertyPath.Length == 0) { return true; }
-        DependencyObject left = scope.GetPropertyValue(PropertyPath);
-        if (left == null && scope.DataContext != null) {
-            left = BindingEngine.ReadPathBox(scope.DataContext, PropertyPath);
+        UIElement src = ResolveSourceElement(scope);
+        if (src == null) { return false; }
+        DependencyObject left = src.GetPropertyValue(PropertyPath);
+        if (left == null) { left = BindingEngine.ReadPathBox(src, PropertyPath); }
+        if (left == null && PropertyPath.Length > 12 && PropertyPath.Substring(0, 12) == "DataContext." && src.DataContext != null) {
+            left = BindingEngine.ReadPathBox(src.DataContext, PropertyPath.Substring(12));
         }
-        if (Operator == "Equal" || Operator == "==") { return Trigger.BoxEquals(left, _rightBox); }
-        if (Operator == "NotEqual" || Operator == "!=") { return !Trigger.BoxEquals(left, _rightBox); }
+        if (left == null && src.DataContext != null && ElementName.Length == 0) {
+            left = BindingEngine.ReadPathBox(src.DataContext, PropertyPath);
+        }
+        if (Operator == "Equal" || Operator == "==") { return Trigger.BoxEqualsForProperty(PropertyPath, left, _rightBox); }
+        if (Operator == "NotEqual" || Operator == "!=") { return !Trigger.BoxEqualsForProperty(PropertyPath, left, _rightBox); }
         float lf = DependencyObject.UnboxFloat(left, ParseUtil.NaN());
         float rf = DependencyObject.UnboxFloat(_rightBox, ParseUtil.NaN());
         if (ParseUtil.IsNaN(lf) || ParseUtil.IsNaN(rf)) { return false; }
@@ -1169,9 +1627,9 @@ public class BehaviorEventTrigger : BehaviorTriggerBase {
             src.KeyUp += (object s, KeyEventArgs e) => { Fire(associatedObject, e); };
         } else if (ev == "PreviewKeyDown") {
             src.PreviewKeyDown += (object s, KeyEventArgs e) => { Fire(associatedObject, e); };
-        } else if (ev == "GotFocus") {
+        } else if (ev == "GotFocus" || ev == "GotKeyboardFocus") {
             src.GotFocus += (object s, RoutedEventArgs e) => { Fire(associatedObject, e); };
-        } else if (ev == "LostFocus") {
+        } else if (ev == "LostFocus" || ev == "LostKeyboardFocus") {
             src.LostFocus += (object s, RoutedEventArgs e) => { Fire(associatedObject, e); };
         } else if (src.SubscribeBehaviorRoutedEvent(ev, new BehaviorBoundEventSink(this, associatedObject))) {
             return;
@@ -1187,6 +1645,7 @@ public class BehaviorEventTrigger : BehaviorTriggerBase {
             _pendingTriggers = new BehaviorEventTrigger[0];
             _pendingOwners = new UIElement[0];
             BindingEngine.AddPreFlushHook(() => { BehaviorEventTrigger.RetryPendingAttaches(); });
+            UIElement.RegisterDisposeHook(() => { BehaviorEventTrigger.CleanupDisposedPending(); });
         }
         if (_pendingTriggers == null) { _pendingTriggers = new BehaviorEventTrigger[0]; }
         if (_pendingOwners == null) { _pendingOwners = new UIElement[0]; }
@@ -1195,6 +1654,16 @@ public class BehaviorEventTrigger : BehaviorTriggerBase {
         }
         _pendingTriggers.Push(trig);
         _pendingOwners.Push(owner);
+    }
+
+    internal static void CleanupDisposedPending() {
+        if (_pendingTriggers == null || _pendingOwners == null) { return; }
+        for (int i = _pendingOwners.Length - 1; i >= 0; i -= 1) {
+            if (_pendingOwners[i] == null || _pendingOwners[i]._isDisposedTree) {
+                _pendingTriggers.RemoveAt(i);
+                _pendingOwners.RemoveAt(i);
+            }
+        }
     }
 
     public static void RetryPendingAttaches() {
@@ -1255,6 +1724,7 @@ public class BehaviorDataTrigger : BehaviorTriggerBase {
     public string RelativeSourceMode { get; set; } = "";
     public string RelativeSourceAncestorType { get; set; } = "";
     public string Comparison { get; set; } = "Equal";
+    public Binding ValueBinding { get; set; }
     private DependencyObject _valueBox;
     private UIElement[] _initTargets;
     private UIElement[] _matchedTargets;
@@ -1333,7 +1803,7 @@ public class BehaviorDataTrigger : BehaviorTriggerBase {
             src = associatedObject;
         } else if (RelativeSourceMode == "FindAncestor" || RelativeSourceMode == "AncestorType") {
             UIElement anc = associatedObject;
-            while (anc != null && RelativeSourceAncestorType.Length > 0 && anc.GetTypeName() != RelativeSourceAncestorType) {
+            while (anc != null && RelativeSourceAncestorType.Length > 0 && !BindingEntry.MatchesAncestorType(anc, RelativeSourceAncestorType)) {
                 anc = anc.Parent;
             }
             src = anc;
@@ -1353,12 +1823,23 @@ public class BehaviorDataTrigger : BehaviorTriggerBase {
         if (!_reactiveBHookInstalled) {
             _reactiveBHookInstalled = true;
             BindingEngine.AddPreFlushHook(() => { BehaviorDataTrigger.FlushReactive(); });
+            UIElement.RegisterDisposeHook(() => { BehaviorDataTrigger.CleanupDisposedReactive(); });
         }
         for (int i = 0; i < _reactiveBTriggers.Length; i += 1) {
             if (_reactiveBTriggers[i] == dt && _reactiveBTargets[i] == target) { return; }
         }
         _reactiveBTriggers.Push(dt);
         _reactiveBTargets.Push(target);
+    }
+
+    internal static void CleanupDisposedReactive() {
+        if (_reactiveBTriggers == null || _reactiveBTargets == null) { return; }
+        for (int i = _reactiveBTargets.Length - 1; i >= 0; i -= 1) {
+            if (_reactiveBTargets[i] == null || _reactiveBTargets[i]._isDisposedTree) {
+                _reactiveBTriggers.RemoveAt(i);
+                _reactiveBTargets.RemoveAt(i);
+            }
+        }
     }
 
     public static void FlushReactive() {
@@ -1382,16 +1863,80 @@ public class BehaviorDataTrigger : BehaviorTriggerBase {
         }
     }
 
+    public static DependencyObject EvaluateDynamicBinding(UIElement associatedObject, Binding b) {
+        if (b == null || associatedObject == null) { return null; }
+        DependencyObject sv = null;
+        string path = b.Path == null ? "" : b.Path;
+        if (b.ElementName.Length > 0) {
+            UIElement se = BindingEntry.FindElementScoped(associatedObject, b.ElementName);
+            if (se == null) { se = associatedObject.FindName(b.ElementName); }
+            if (se == null && associatedObject.RootElement() != null) {
+                se = associatedObject.RootElement().FindName(b.ElementName);
+            }
+            if (se != null) {
+                if (path.Length == 0 || path == ".") { sv = se; }
+                else {
+                    sv = se.GetPropertyValue(path);
+                    if (sv == null) { sv = BindingEngine.ReadPathBox(se, path); }
+                    if (sv == null && path.Length > 12 && path.Substring(0, 12) == "DataContext." && se.DataContext != null) {
+                        sv = BindingEngine.ReadPathBox(se.DataContext, path.Substring(12));
+                    }
+                    if (sv == null && se.DataContext != null) { sv = BindingEngine.ReadPathBox(se.DataContext, path); }
+                }
+            }
+        } else if (b.RelativeSourceMode == "Self") {
+            sv = (path.Length == 0 || path == ".") ? (DependencyObject)associatedObject : associatedObject.GetPropertyValue(path);
+            if (sv == null && path.Length > 0) { sv = BindingEngine.ReadPathBox(associatedObject, path); }
+        } else if (b.RelativeSourceMode == "TemplatedParent") {
+            UIElement tp = associatedObject.TemplatedParent;
+            if (tp != null) {
+                sv = (path.Length == 0 || path == ".") ? (DependencyObject)tp : tp.GetPropertyValue(path);
+                if (sv == null && path.Length > 0) { sv = BindingEngine.ReadPathBox(tp, path); }
+            }
+        } else if (b.RelativeSourceMode == "FindAncestor" || b.RelativeSourceMode == "AncestorType") {
+            UIElement anc = associatedObject;
+            while (anc != null && b.RelativeSourceAncestorType.Length > 0 && !BindingEntry.MatchesAncestorType(anc, b.RelativeSourceAncestorType)) {
+                anc = anc.Parent;
+            }
+            if (anc != null) {
+                sv = (path.Length == 0 || path == ".") ? (DependencyObject)anc : anc.GetPropertyValue(path);
+                if (sv == null && path.Length > 0) { sv = BindingEngine.ReadPathBox(anc, path); }
+                if (sv == null && path.Length > 12 && path.Substring(0, 12) == "DataContext." && anc.DataContext != null) {
+                    sv = BindingEngine.ReadPathBox(anc.DataContext, path.Substring(12));
+                }
+            }
+        } else if (b.SourceBox != null && (path.Length == 0 || path == ".")) {
+            sv = b.SourceBox;
+        } else {
+            object dc = b.Source != null ? b.Source : associatedObject.DataContext;
+            if (dc != null && path.Length > 0) {
+                sv = BindingEngine.ReadPathBox(dc, path);
+            }
+        }
+        if (sv == null && b.HasFallbackValue) { sv = b.FallbackBox; }
+        if (b.Converter != null) {
+            DependencyObject paramBox = b.ConverterParameter.Length > 0 ? DependencyObject.BoxString(b.ConverterParameter) : null;
+            sv = DependencyObject.BoxObject(b.Converter.Convert(sv, "", paramBox, ""));
+        }
+        return sv;
+    }
+
     private void CheckAndFire(UIElement associatedObject, bool isInitialAttach) {
         if (associatedObject == null || BindingPath.Length == 0) { return; }
         DependencyObject actual = null;
         object reflectObj = null;
+        DependencyObject expectedBox = ValueBinding != null ? EvaluateDynamicBinding(associatedObject, ValueBinding) : _valueBox;
         if (ElementName.Length > 0) {
             UIElement se = ResolveElementSource(associatedObject);
             if (se == null) { return; }
             reflectObj = se;
             actual = se.GetPropertyValue(BindingPath);
             if (actual == null) { actual = BindingEngine.ReadPathBox(se, BindingPath); }
+            if (actual == null && BindingPath.Length > 12 && BindingPath.Substring(0, 12) == "DataContext." && se.DataContext != null) {
+                if (!ParseUtil.IsNativeReady() && !(se.DataContext is UIElement)) { return; }
+                reflectObj = se.DataContext;
+                actual = BindingEngine.ReadPathBox(se.DataContext, BindingPath.Substring(12));
+            }
             if (actual == null && se.DataContext != null) {
                 if (!ParseUtil.IsNativeReady() && !(se.DataContext is UIElement)) { return; }
                 reflectObj = se.DataContext;
@@ -1403,43 +1948,56 @@ public class BehaviorDataTrigger : BehaviorTriggerBase {
             if (actual == null) { actual = BindingEngine.ReadPathBox(associatedObject, BindingPath); }
         } else if (RelativeSourceMode == "FindAncestor" || RelativeSourceMode == "AncestorType") {
             UIElement anc = associatedObject;
-            while (anc != null && RelativeSourceAncestorType.Length > 0 && anc.GetTypeName() != RelativeSourceAncestorType) {
+            while (anc != null && RelativeSourceAncestorType.Length > 0 && !BindingEntry.MatchesAncestorType(anc, RelativeSourceAncestorType)) {
                 anc = anc.Parent;
             }
             if (anc == null) { return; }
             reflectObj = anc;
             actual = anc.GetPropertyValue(BindingPath);
             if (actual == null) { actual = BindingEngine.ReadPathBox(anc, BindingPath); }
+            if (actual == null && BindingPath.Length > 12 && BindingPath.Substring(0, 12) == "DataContext." && anc.DataContext != null) {
+                if (!ParseUtil.IsNativeReady() && !(anc.DataContext is UIElement)) { return; }
+                reflectObj = anc.DataContext;
+                actual = BindingEngine.ReadPathBox(anc.DataContext, BindingPath.Substring(12));
+            }
         } else if (associatedObject.DataContext != null) {
             if (!ParseUtil.IsNativeReady() && !(associatedObject.DataContext is UIElement)) { return; }
             reflectObj = associatedObject.DataContext;
             actual = BindingEngine.ReadPathBox(associatedObject.DataContext, BindingPath);
-        } else if (_valueBox != null) {
+        } else if (expectedBox != null) {
             if (HasInitTarget(associatedObject)) {
                 SetMatchedFor(associatedObject, false);
             }
             return;
         }
         bool matched = false;
-        if (Comparison == "Equal" || Comparison == "==") {
-            matched = Trigger.BoxEquals(actual, _valueBox);
-        } else if (Comparison == "NotEqual" || Comparison == "!=") {
-            matched = !Trigger.BoxEquals(actual, _valueBox);
+        string effPath = (BindingPath.Length > 12 && BindingPath.Substring(0, 12) == "DataContext.")
+            ? BindingPath.Substring(12)
+            : BindingPath;
+        if (Comparison == "Equal" || Comparison == "==" || Comparison == "NotEqual" || Comparison == "!=") {
+            bool eqMatched = Trigger.BoxEqualsForProperty(effPath, actual, expectedBox);
+            if (!eqMatched && reflectObj != null && expectedBox is BoxedString && ParseUtil.IsNativeReady()) {
+                int ordEq = Reflect_ResolveEnumOrdinal(reflectObj, effPath, (expectedBox as BoxedString).Value);
+                if (ordEq != -2147483647) {
+                    eqMatched = (Reflect_GetPropInt(reflectObj, effPath) == ordEq);
+                }
+            }
+            matched = (Comparison == "Equal" || Comparison == "==") ? eqMatched : !eqMatched;
         } else {
-            string expectedStr = DependencyObject.UnboxString(_valueBox, "");
+            string expectedStr = DependencyObject.UnboxString(expectedBox, "");
             int ord = (reflectObj != null && expectedStr.Length > 0 && ParseUtil.IsNativeReady())
-                ? Reflect_ResolveEnumOrdinal(reflectObj, BindingPath, expectedStr)
+                ? Reflect_ResolveEnumOrdinal(reflectObj, effPath, expectedStr)
                 : -2147483647;
             if (ord != -2147483647) {
-                int actOrd = Reflect_GetPropInt(reflectObj, BindingPath);
+                int actOrd = Reflect_GetPropInt(reflectObj, effPath);
                 if (Comparison == "GreaterThanOrEqual" || Comparison == ">=") { matched = actOrd >= ord; }
                 else if (Comparison == "GreaterThan" || Comparison == ">") { matched = actOrd > ord; }
                 else if (Comparison == "LessThanOrEqual" || Comparison == "<=") { matched = actOrd <= ord; }
                 else if (Comparison == "LessThan" || Comparison == "<") { matched = actOrd < ord; }
-                else { matched = Trigger.BoxEquals(actual, _valueBox); }
+                else { matched = Trigger.BoxEqualsForProperty(effPath, actual, expectedBox); }
             } else {
                 float lf = DependencyObject.UnboxFloat(actual, ParseUtil.NaN());
-                float rf = DependencyObject.UnboxFloat(_valueBox, ParseUtil.NaN());
+                float rf = DependencyObject.UnboxFloat(expectedBox, ParseUtil.NaN());
                 if (!ParseUtil.IsNaN(lf) && !ParseUtil.IsNaN(rf)) {
                     if (Comparison == "GreaterThanOrEqual" || Comparison == ">=") { matched = lf >= rf; }
                     else if (Comparison == "GreaterThan" || Comparison == ">") { matched = lf > rf; }
@@ -1449,13 +2007,13 @@ public class BehaviorDataTrigger : BehaviorTriggerBase {
                            Comparison != "GreaterThan" && Comparison != ">" &&
                            Comparison != "LessThanOrEqual" && Comparison != "<=" &&
                            Comparison != "LessThan" && Comparison != "<") {
-                    matched = Trigger.BoxEquals(actual, _valueBox);
+                    matched = Trigger.BoxEqualsForProperty(effPath, actual, expectedBox);
                 }
             }
         }
         if (!HasInitTarget(associatedObject)) {
             _initTargets.Push(associatedObject);
-            if (isInitialAttach && BindingPath == "IsMouseOver" && matched && !DependencyObject.UnboxBool(_valueBox, true)) {
+            if (isInitialAttach && BindingPath == "IsMouseOver" && matched && !DependencyObject.UnboxBool(expectedBox, true)) {
                 SetMatchedFor(associatedObject, true);
                 return;
             }
@@ -1477,10 +2035,7 @@ public class BehaviorDataTrigger : BehaviorTriggerBase {
     public override void Attach(UIElement associatedObject) {
         if (associatedObject == null) { return; }
         TryHookSource(associatedObject);
-        if (ElementName.Length == 0 && RelativeSourceMode != "Self" &&
-            RelativeSourceMode != "FindAncestor" && RelativeSourceMode != "AncestorType") {
-            RegisterReactive(this, associatedObject);
-        }
+        RegisterReactive(this, associatedObject);
         CheckAndFire(associatedObject, true);
         associatedObject.Loaded += (object s, RoutedEventArgs e) => {
             TryHookSource(associatedObject);
@@ -1494,6 +2049,7 @@ public class BehaviorDataTrigger : BehaviorTriggerBase {
 
 public class BehaviorBase : DependencyObject {
     public virtual void Attach(UIElement associatedObject) {}
+    internal virtual void Detach() {}
 }
 
 public class MouseDragElementBehavior : BehaviorBase {
@@ -1504,9 +2060,46 @@ public class MouseDragElementBehavior : BehaviorBase {
     private float _baseTX = 0.0f;
     private float _baseTY = 0.0f;
 
+    private float ClampX(UIElement target, float tx) {
+        if (!ConstrainToParentBounds || target == null || target.Parent == null) { return tx; }
+        UIElement parent = target.Parent;
+        float pw = parent.ActualWidth;
+        if (pw <= 0.0f && ParseUtil.IsFinite(parent.Width) && parent.Width > 0.0f) { pw = parent.Width; }
+        if (pw <= 0.0f) { return tx; }
+        float cw = target.ActualWidth;
+        if (cw <= 0.0f && ParseUtil.IsFinite(target.Width) && target.Width > 0.0f) { cw = target.Width; }
+        float px = parent.LayoutX;
+        float cx = target.LayoutX;
+        float minTX = px - cx;
+        float maxTX = (px + pw) - (cx + cw);
+        if (maxTX < minTX) { maxTX = minTX; }
+        return Math.Clampf(tx, minTX, maxTX);
+    }
+
+    private float ClampY(UIElement target, float ty) {
+        if (!ConstrainToParentBounds || target == null || target.Parent == null) { return ty; }
+        UIElement parent = target.Parent;
+        float ph = parent.ActualHeight;
+        if (ph <= 0.0f && ParseUtil.IsFinite(parent.Height) && parent.Height > 0.0f) { ph = parent.Height; }
+        if (ph <= 0.0f) { return ty; }
+        float ch = target.ActualHeight;
+        if (ch <= 0.0f && ParseUtil.IsFinite(target.Height) && target.Height > 0.0f) { ch = target.Height; }
+        float py = parent.LayoutY;
+        float cy = target.LayoutY;
+        float minTY = py - cy;
+        float maxTY = (py + ph) - (cy + ch);
+        if (maxTY < minTY) { maxTY = minTY; }
+        return Math.Clampf(ty, minTY, maxTY);
+    }
+
     public override void Attach(UIElement associatedObject) {
         if (associatedObject == null) { return; }
         associatedObject.MouseLeftButtonDown += (object s, MouseButtonEventArgs e) => {
+            if (associatedObject.RenderTransform is TranslateTransform) {
+                TranslateTransform tt = associatedObject.RenderTransform as TranslateTransform;
+                _baseTX = tt.X;
+                _baseTY = tt.Y;
+            }
             _dragging = true;
             _startX = e.X;
             _startY = e.Y;
@@ -1514,14 +2107,17 @@ public class MouseDragElementBehavior : BehaviorBase {
         };
         associatedObject.MouseMove += (object s, MouseEventArgs e) => {
             if (!_dragging) { return; }
-            float dx = e.X - _startX;
-            float dy = e.Y - _startY;
-            associatedObject.RenderTransform = new TranslateTransform(_baseTX + dx, _baseTY + dy);
+            float tx = ClampX(associatedObject, _baseTX + (e.X - _startX));
+            float ty = ClampY(associatedObject, _baseTY + (e.Y - _startY));
+            associatedObject.RenderTransform = new TranslateTransform(tx, ty);
         };
         associatedObject.MouseLeftButtonUp += (object s, MouseButtonEventArgs e) => {
             if (_dragging) {
-                _baseTX = _baseTX + (e.X - _startX);
-                _baseTY = _baseTY + (e.Y - _startY);
+                float tx = ClampX(associatedObject, _baseTX + (e.X - _startX));
+                float ty = ClampY(associatedObject, _baseTY + (e.Y - _startY));
+                _baseTX = tx;
+                _baseTY = ty;
+                associatedObject.RenderTransform = new TranslateTransform(tx, ty);
                 _dragging = false;
                 associatedObject.ReleaseMouseCapture();
             }
@@ -1537,19 +2133,77 @@ public class TranslateZoomRotateBehavior : BehaviorBase {
 }
 
 public class BackgroundEffectBehavior : BehaviorBase {
-    public UIElement Source { get; set; }
-    public Effect Effect { get; set; }
+    private UIElement _source;
+    private Effect _effect;
+    private UIElement _host;
+    private BackdropBlurEffect _backdrop;
+    private EffectChangeHook _hook;
+
+    public UIElement Source {
+        get { return _source; }
+        set { _source = value; }
+    }
+
+    public Effect Effect {
+        get { return _effect; }
+        set {
+            if (_effect == value) { return; }
+            UnhookEffect();
+            _effect = value;
+            HookAndSync();
+        }
+    }
+
+    private void UnhookEffect() {
+        if (_effect != null && _hook != null) {
+            _effect.RemoveChangedListener(_hook);
+        }
+        _hook = null;
+    }
+
+    private void SyncToHost() {
+        if (_host == null || _host._isDisposedTree) {
+            UnhookEffect();
+            _host = null;
+            return;
+        }
+        if (_effect == null) { return; }
+        if (_effect is BlurEffect) {
+            float r = _effect.Radius;
+            if (_backdrop == null) {
+                _backdrop = new BackdropBlurEffect(r);
+            } else {
+                _backdrop.Radius = r;
+            }
+            Effect targetEffect = _backdrop;
+            if (_host.Effect != targetEffect) {
+                _host.Effect = targetEffect;
+            } else {
+                _host.SyncEffect();
+            }
+        } else {
+            _host.Effect = _effect;
+        }
+    }
+
+    private void HookAndSync() {
+        if (_host == null || _host._isDisposedTree) { return; }
+        if (_effect != null && _hook == null) {
+            _hook = _effect.AddChangedListener(() => { SyncToHost(); });
+        }
+        SyncToHost();
+    }
 
     public override void Attach(UIElement associatedObject) {
         if (associatedObject == null) { return; }
-        Effect eff = this.Effect;
-        if (eff != null) {
-            if (eff is BlurEffect) {
-                associatedObject.Effect = new BackdropBlurEffect(eff.Radius);
-            } else {
-                associatedObject.Effect = eff;
-            }
-        }
+        _host = associatedObject;
+        HookAndSync();
+    }
+
+    internal override void Detach() {
+        UnhookEffect();
+        _host = null;
+        _backdrop = null;
     }
 }
 
@@ -1585,6 +2239,7 @@ public class KeyTrigger : BehaviorTriggerBase {
         associatedObject.KeyDown += (object s, KeyEventArgs e) => {
             if (e.Key == Key && (Modifiers == 0 || (e.Modifiers % 8) == (Modifiers % 8))) {
                 Fire(associatedObject, e);
+                e.Handled = true;
             }
         };
     }
@@ -1598,7 +2253,11 @@ public class StoryboardCompletedTrigger : BehaviorTriggerBase {
 
     public override void Attach(UIElement associatedObject) {
         if (Storyboard != null) {
-            Storyboard.Completed += (object s, EventArgs e) => { Fire(associatedObject, e); };
+            Storyboard.Completed += (object s, EventArgs e) => {
+                if (associatedObject != null && !associatedObject._isDisposedTree) {
+                    Fire(associatedObject, e);
+                }
+            };
         }
     }
 }
@@ -1608,12 +2267,20 @@ public static class Interaction {
     private static BehaviorTriggerBase[] _triggers;
     private static UIElement[] _behOwners;
     private static BehaviorBase[] _behaviors;
+    private static bool _disposeHookInstalled = false;
+
+    private static void EnsureDisposeHook() {
+        if (_disposeHookInstalled) { return; }
+        _disposeHookInstalled = true;
+        UIElement.RegisterDisposeHook(() => { Interaction.CleanupDisposed(); });
+    }
 
     public static void AddTrigger(UIElement target, BehaviorTriggerBase trigger) {
         if (target == null || trigger == null) { return; }
         if (_owners == null) {
             _owners = new UIElement[0];
             _triggers = new BehaviorTriggerBase[0];
+            EnsureDisposeHook();
         }
         _owners.Push(target);
         _triggers.Push(trigger);
@@ -1625,6 +2292,7 @@ public static class Interaction {
         if (_behOwners == null) {
             _behOwners = new UIElement[0];
             _behaviors = new BehaviorBase[0];
+            EnsureDisposeHook();
         }
         _behOwners.Push(target);
         _behaviors.Push(behavior);
@@ -1638,6 +2306,28 @@ public static class Interaction {
             if (_owners[i] == target) { res.Push(_triggers[i]); }
         }
         return res;
+    }
+
+    public static void CleanupDisposed() {
+        if (_owners != null && _triggers != null) {
+            for (int i = _owners.Length - 1; i >= 0; i -= 1) {
+                if (_owners[i] == null || _owners[i]._isDisposedTree) {
+                    _owners.RemoveAt(i);
+                    _triggers.RemoveAt(i);
+                }
+            }
+        }
+        if (_behOwners != null && _behaviors != null) {
+            for (int i = _behOwners.Length - 1; i >= 0; i -= 1) {
+                if (_behOwners[i] == null || _behOwners[i]._isDisposedTree) {
+                    if (_behaviors[i] != null) {
+                        _behaviors[i].Detach();
+                    }
+                    _behOwners.RemoveAt(i);
+                    _behaviors.RemoveAt(i);
+                }
+            }
+        }
     }
 
     public static TriggerAction FindNamedAction(UIElement scope, string name) {
@@ -1658,5 +2348,203 @@ public static class Interaction {
             }
         }
         return fallback;
+    }
+}
+
+public static class RichText {
+    private static bool _registered = false;
+
+    public static void Register() {
+        if (_registered) { return; }
+        _registered = true;
+        TextBlock._richTextHandler = (TextBlock tb, string raw) => { Apply(tb, raw); };
+    }
+
+    private static string ExtractBindFormat(string header) {
+        if (header == null || header.Length < 8) { return ""; }
+        int fIdx = -1;
+        for (int i = 0; i <= header.Length - 6; i += 1) {
+            if (header.Substring(i, 6) == "format" || header.Substring(i, 6) == "Format") {
+                fIdx = i + 6;
+                break;
+            }
+        }
+        if (fIdx < 0) { return ""; }
+        while (fIdx < header.Length && header.Substring(fIdx, 1) != "=") { fIdx += 1; }
+        if (fIdx >= header.Length) { return ""; }
+        fIdx += 1;
+        while (fIdx < header.Length && header.Substring(fIdx, 1) == " ") { fIdx += 1; }
+        if (fIdx >= header.Length) { return ""; }
+        string q = header.Substring(fIdx, 1);
+        if (q != "'" && q != "\"") { return ""; }
+        int endQ = fIdx + 1;
+        while (endQ < header.Length && header.Substring(endQ, 1) != q) { endQ += 1; }
+        if (endQ <= fIdx + 1) { return ""; }
+        return header.Substring(fIdx + 1, endQ - (fIdx + 1));
+    }
+
+    public static void Apply(TextBlock tb, string raw) {
+        if (tb == null) { return; }
+        string src = raw == null ? "" : raw;
+        tb._rawRichText = src;
+        tb._richNeedsResolve = false;
+        tb.ClearRichInlines();
+
+        if (src.Length == 0) {
+            tb.FinishRichText(true);
+            return;
+        }
+
+        var cur = new Inline();
+        string[] tagStack = new string[0];
+        Inline[] stateStack = new Inline[0];
+
+        int i = 0;
+        int literalStart = 0;
+        int len = src.Length;
+
+        while (i < len) {
+            if (src.Substring(i, 1) != "[") {
+                i += 1;
+                continue;
+            }
+            int closeIdx = -1;
+            int j = i + 1;
+            while (j < len) {
+                string cj = src.Substring(j, 1);
+                if (cj == "]") { closeIdx = j; break; }
+                if (cj == "[") { break; }
+                j += 1;
+            }
+            if (closeIdx <= i + 1) {
+                i += 1;
+                continue;
+            }
+
+            if (i > literalStart) {
+                var litRun = new Run(src.Substring(literalStart, i - literalStart));
+                litRun.CopyStyleFrom(cur);
+                tb.PushRichInline(litRun);
+            }
+
+            string tagBody = src.Substring(i + 1, closeIdx - (i + 1)).Trim();
+            if (tagBody.Length > 1 && tagBody.Substring(0, 1) == "/") {
+                string closeTag = tagBody.Substring(1, tagBody.Length - 1).Trim();
+                int matchIdx = -1;
+                for (int s = tagStack.Length - 1; s >= 0; s -= 1) {
+                    if (tagStack[s] == closeTag) { matchIdx = s; break; }
+                }
+                if (matchIdx >= 0) {
+                    cur.CopyStyleFrom(stateStack[matchIdx]);
+                    while (tagStack.Length > matchIdx) {
+                        int top = tagStack.Length - 1;
+                        tagStack.RemoveAt(top);
+                        stateStack.RemoveAt(top);
+                    }
+                }
+                i = closeIdx + 1;
+                literalStart = i;
+                continue;
+            }
+
+            if (tagBody == "bind" || (tagBody.Length >= 5 && tagBody.Substring(0, 5) == "bind ")) {
+                int endBind = -1;
+                int bSearch = closeIdx + 1;
+                while (bSearch <= len - 7) {
+                    if (src.Substring(bSearch, 7) == "[/bind]") {
+                        endBind = bSearch;
+                        break;
+                    }
+                    bSearch += 1;
+                }
+                if (endBind >= closeIdx + 1) {
+                    string bindPath = src.Substring(closeIdx + 1, endBind - (closeIdx + 1)).Trim();
+                    string fmtStr = ExtractBindFormat(tagBody);
+                    var bRun = new Run("");
+                    bRun.CopyStyleFrom(cur);
+                    tb.PushRichInline(bRun);
+                    if (bindPath.Length > 0) {
+                        BindingEngine.BindInlineEx(bRun, "Text", bindPath, "", 0, null, "", "", fmtStr);
+                        tb._richNeedsResolve = true;
+                    }
+                    i = endBind + 7;
+                    literalStart = i;
+                    continue;
+                }
+            }
+
+            string tagName = tagBody;
+            string tagArg = "";
+            int eqPos = -1;
+            for (int e = 0; e < tagBody.Length; e += 1) {
+                if (tagBody.Substring(e, 1) == "=") { eqPos = e; break; }
+            }
+            if (eqPos > 0) {
+                tagName = tagBody.Substring(0, eqPos).Trim();
+                tagArg = tagBody.Substring(eqPos + 1, tagBody.Length - (eqPos + 1)).Trim();
+            }
+
+            tagStack.Push(tagName);
+            stateStack.Push(cur.CloneStyleState());
+
+            if (tagName == "b") { cur.FontWeight = "Bold"; }
+            else if (tagName == "i") { cur.FontStyle = "Italic"; }
+            else if (tagName == "u") { if (cur.Decorations == 0) { cur.Decorations = 1; } else if (cur.Decorations == 2) { cur.Decorations = 3; } }
+            else if (tagName == "s") { if (cur.Decorations == 0) { cur.Decorations = 2; } else if (cur.Decorations == 1) { cur.Decorations = 3; } }
+            else if (tagName == "size") {
+                float sz = ParseUtil.ParseFloat(tagArg, 0.0f);
+                if (sz > 0.0f) { cur.FontSize = sz; }
+            } else if (tagName == "color") {
+                if (tagArg.Length > 0) { cur.Foreground = new SolidColorBrush(tagArg); }
+            } else if (tagName == "font") {
+                if (tagArg.Length > 0) { cur.FontFamily = tagArg; }
+            } else if (tagName == "style") {
+                DependencyObject res = tb.FindResourceBox(tagArg);
+                if (res is Style) {
+                    var sChain = new Style[0];
+                    Style stCur = res as Style;
+                    while (stCur != null && sChain.Length < 16) {
+                        sChain.Push(stCur);
+                        stCur = stCur.BasedOn;
+                    }
+                    for (int sc = sChain.Length - 1; sc >= 0; sc -= 1) {
+                        Setter[] setters = sChain[sc].Setters();
+                        for (int si = 0; si < setters.Length; si += 1) {
+                            Setter se = setters[si];
+                            if (se == null) { continue; }
+                            if (se.Property == "Foreground") {
+                                Brush b = UIElement.CoerceBrush(se.ValueBox);
+                                if (b != null) { cur.Foreground = b; }
+                            } else if (se.Property == "FontWeight") {
+                                string fw = DependencyObject.UnboxString(se.ValueBox, "");
+                                if (fw.Length > 0) { cur.FontWeight = fw; }
+                            } else if (se.Property == "FontStyle") {
+                                string fs = DependencyObject.UnboxString(se.ValueBox, "");
+                                if (fs.Length > 0) { cur.FontStyle = fs; }
+                            } else if (se.Property == "FontSize") {
+                                float fsVal = DependencyObject.UnboxFloat(se.ValueBox, 0.0f);
+                                if (fsVal > 0.0f) { cur.FontSize = fsVal; }
+                            } else if (se.Property == "FontFamily") {
+                                string ff = DependencyObject.UnboxString(se.ValueBox, "");
+                                if (ff.Length > 0) { cur.FontFamily = ff; }
+                            }
+                        }
+                    }
+                } else {
+                    tb._richNeedsResolve = true;
+                }
+            }
+
+            i = closeIdx + 1;
+            literalStart = i;
+        }
+
+        if (literalStart < len) {
+            var tailRun = new Run(src.Substring(literalStart, len - literalStart));
+            tailRun.CopyStyleFrom(cur);
+            tb.PushRichInline(tailRun);
+        }
+
+        tb.FinishRichText(false);
     }
 }

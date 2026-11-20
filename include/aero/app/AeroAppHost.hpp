@@ -204,6 +204,7 @@ private:
         SymbolId windowShow = 0u;
         SymbolId applyTemplate = 0u;
         SymbolId controlApplyTemplate = 0u;
+        SymbolId applyTemplateSubtree = 0u;
         SymbolId ensureLoadedSubtree = 0u;
         SymbolId popupSetOverlayHost = 0u;
     };

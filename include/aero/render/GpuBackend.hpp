@@ -419,9 +419,11 @@ public:
     [[nodiscard]] AeroGLuint ProgramHandle() const noexcept { return programId_; }
     [[nodiscard]] AeroGLuint VaoHandle() const noexcept { return vaoId_; }
     [[nodiscard]] AeroGLuint RingVboHandle() const noexcept { return ringVboId_; }
+    [[nodiscard]] AeroGLuint ClipWRingVboHandle() const noexcept { return clipWRingVboId_; }
     [[nodiscard]] AeroGLuint QuadEboHandle() const noexcept { return quadEboId_; }
     [[nodiscard]] AeroGLuint AtlasTextureHandle() const noexcept { return atlasTextureId_; }
     [[nodiscard]] std::size_t RingBufferByteCapacity() const noexcept { return ringBufferBytes_; }
+    [[nodiscard]] std::size_t ClipWRingBufferByteCapacity() const noexcept { return clipWRingBufferBytes_; }
 
 private:
     struct GlImageSlotState {
@@ -457,6 +459,7 @@ private:
     AeroGLuint programId_ = 0;
     AeroGLuint vaoId_ = 0;
     AeroGLuint ringVboId_ = 0;
+    AeroGLuint clipWRingVboId_ = 0;
     AeroGLuint quadEboId_ = 0;
     AeroGLuint atlasTextureId_ = 0;
     AeroGLuint fallbackWhiteTexId_ = 0;
@@ -492,6 +495,7 @@ private:
 
     std::size_t maxPagesInRing_ = 0;
     std::size_t ringBufferBytes_ = 0;
+    std::size_t clipWRingBufferBytes_ = 0;
     std::size_t quadCapacity_ = 0;
     std::uint32_t atlasWidth_ = 0;
     std::uint32_t atlasHeight_ = 0;

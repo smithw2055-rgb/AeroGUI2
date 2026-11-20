@@ -3,6 +3,7 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <string_view>
@@ -67,6 +68,7 @@ struct TextureSlotBuffer {
     std::uint32_t dirtyRevision = 0u;
     bool isAtlas = false;
     std::vector<std::uint8_t> rgbaPixels;
+    std::shared_ptr<const std::vector<std::uint8_t>> pixelSnapshot;
 };
 
 // Pure C++17 zero-dependency RFC1951 DEFLATE & RFC1950 zlib decompression (100% Wasm-ready)
@@ -207,6 +209,11 @@ public:
     [[nodiscard]] std::uint64_t Revision() const noexcept { return revision_.load(std::memory_order_acquire); }
     [[nodiscard]] bool HasTextureSlot(std::uint32_t textureId) const noexcept;
     [[nodiscard]] const TextureSlotBuffer* GetTextureSlot(std::uint32_t textureId) const noexcept;
+    [[nodiscard]] bool TryGetTextureSlotSnapshot(
+        std::uint32_t textureId,
+        std::uint32_t& outWidth,
+        std::uint32_t& outHeight,
+        std::shared_ptr<const std::vector<std::uint8_t>>& outPixels) const noexcept;
     [[nodiscard]] bool CopyTextureSlotIfModified(
         std::uint32_t textureId,
         std::uint32_t& ioKnownSlotRevision,

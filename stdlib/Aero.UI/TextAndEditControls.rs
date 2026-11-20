@@ -277,7 +277,8 @@ public class TextBoxBase : Control {
     }
 
     protected override void OnVisualStatePropertyChanged() {
-        if (Style == null) {
+        base.OnVisualStatePropertyChanged();
+        if (Style == null && Template == null) {
             BorderBrush = new SolidColorBrush(IsFocused ? "#FF3B82F6" : (IsMouseOver ? "#FF64748B" : "#FF364054"));
         }
         RefreshTextSelectionVisual();

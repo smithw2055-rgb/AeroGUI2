@@ -26,6 +26,9 @@ struct GlBufferSubDataSpan {
     std::size_t ringByteOffset = 0;
     std::size_t byteSize = 0;
     const void* sourcePageVertexPtr = nullptr;
+    std::size_t clipWRingByteOffset = 0;
+    std::size_t clipWByteSize = 0;
+    const float* sourcePageClipWPtr = nullptr;
 };
 
 struct GpuClipDrawBatch {
@@ -64,6 +67,7 @@ public:
 
     // Bind an externally mapped GPU persistent buffer (or use internal aligned ring storage)
     void BindExternalMappedRing(void* mappedPtr, std::size_t capacityBytes) noexcept;
+    void BindExternalMappedClipWRing(void* mappedPtr, std::size_t capacityBytes) noexcept;
 
     // Stream ONLY dirty 4KB CommandPages from PagedRenderTree into the GPU ring buffer
     // with 0 intermediate copies and 0 heap allocations on the frame hot path.
@@ -82,7 +86,9 @@ public:
     }
 
     [[nodiscard]] const AeroVertex* MappedPageVertices(std::size_t pageIndex) const noexcept;
+    [[nodiscard]] const float* MappedPageClipW(std::size_t pageIndex) const noexcept;
     [[nodiscard]] std::size_t RingCapacityBytes() const noexcept { return ringCapacityBytes_; }
+    [[nodiscard]] std::size_t ClipWRingCapacityBytes() const noexcept { return clipWRingCapacityBytes_; }
 
     // Headless software UberShader rasterizer matching GPU UberShader SDF (sdRoundedBox / sdRoundedBox4 /
     // hollow BorderBrush ring) / MTSDF / Scissor math for deterministic CI Golden Image pixel verification.
@@ -134,8 +140,11 @@ private:
     std::size_t maxPagesInRing_ = 32;
     std::size_t ringCapacityBytes_ = 0;
     std::vector<std::uint8_t> ownedRingStorage_;
+    std::size_t clipWRingCapacityBytes_ = 0;
+    std::vector<float> ownedClipWRingStorage_;
     std::vector<std::size_t> prevUploadedBytes_;
     std::uint8_t* mappedRingBase_ = nullptr;
+    float* mappedClipWRingBase_ = nullptr;
     std::vector<GlBufferSubDataSpan> subDataSpans_;
     std::vector<GpuClipDrawBatch> clipDrawBatches_;
     std::uint32_t cachedBatchTreeId_ = 0u;

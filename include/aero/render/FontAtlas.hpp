@@ -67,6 +67,8 @@ public:
     [[nodiscard]] std::int16_t DescentFUnits() const noexcept { return descent_; }
     [[nodiscard]] std::int16_t LineGapFUnits() const noexcept { return lineGap_; }
     [[nodiscard]] std::uint16_t GlyphCount() const noexcept { return numGlyphs_; }
+    [[nodiscard]] std::uint16_t WeightClass() const noexcept { return weightClass_; }
+    [[nodiscard]] bool IsItalic() const noexcept { return isItalic_; }
 
     [[nodiscard]] float AscentEm() const noexcept {
         return (unitsPerEm_ > 0u) ? (static_cast<float>(ascent_) / static_cast<float>(unitsPerEm_)) : 0.8f;
@@ -159,6 +161,8 @@ private:
     std::int16_t lineGap_ = 0;
     std::uint16_t numberOfHMetrics_ = 0u;
     std::uint16_t numGlyphs_ = 0u;
+    std::uint16_t weightClass_ = 400u;
+    bool isItalic_ = false;
 
     std::uint32_t hmtxOffset_ = 0u;
     std::uint32_t hmtxLength_ = 0u;
@@ -226,6 +230,12 @@ struct PositionedGlyph {
     std::uint16_t cellWidth = 0u;
     std::uint16_t cellHeight = 0u;
     bool isWhitespace = false;
+    std::uint32_t customRgba = 0u;
+    bool hasCustomRgba = false;
+    bool syntheticBold = false;
+    bool syntheticItalic = false;
+    bool underline = false;
+    bool strikethrough = false;
 };
 
 struct TextLineMetrics {
@@ -239,6 +249,7 @@ struct TextLineMetrics {
     float lineHeight = 0.0f;
     std::size_t firstGlyphIndex = 0u;
     std::size_t glyphCount = 0u;
+    bool endedByNewline = false;
 };
 
 struct TextLayoutResult {
@@ -251,6 +262,17 @@ struct TextLayoutResult {
     bool usedTrueTypeMetrics = false;
     std::vector<TextLineMetrics> lines;
     std::vector<PositionedGlyph> glyphs;
+};
+
+struct RichTextRunInput {
+    std::string_view text;
+    std::string_view fontFamily;
+    float fontSize = 0.0f;
+    int fontWeight = 0;
+    std::int8_t fontItalic = -1;
+    std::uint32_t fgRgba = 0u;
+    bool hasFg = false;
+    std::int32_t decorations = 0;
 };
 
 // Dynamic Skyline SDF Font Atlas (top half v in [0.0..0.5) of 1024x1024 unified atlas)
@@ -297,8 +319,9 @@ public:
         std::string_view fontFamily,
         std::uint32_t codePoint);
 
-    // Fast lookup of pre-baked built-in fallback ASCII glyph (0 allocations, 0 locks)
-    [[nodiscard]] const FontAtlasGlyph& GetBuiltInAsciiGlyph(std::uint32_t codePoint) const noexcept {
+    // Fast lookup of pre-baked built-in fallback ASCII glyph (lazy-initialized on first access)
+    [[nodiscard]] const FontAtlasGlyph& GetBuiltInAsciiGlyph(std::uint32_t codePoint) const {
+        EnsureBuiltInFallbackAscii();
         return builtInAscii_[codePoint < 128u ? codePoint : 0u];
     }
 
@@ -325,7 +348,21 @@ public:
         float fontSize,
         float maxWidth = 1000000.0f,
         TextWrapping wrapMode = TextWrapping::NoWrap,
-        float charSpacing = 0.0f);
+        float charSpacing = 0.0f,
+        int fontWeight = 400,
+        bool fontItalic = false,
+        float explicitLineHeight = 0.0f);
+
+    [[nodiscard]] TextLayoutResult MeasureRichLayout(
+        const std::vector<RichTextRunInput>& runs,
+        std::string_view defaultFontFamily,
+        float defaultFontSize,
+        int defaultFontWeight,
+        bool defaultItalic,
+        float maxWidth = 1000000.0f,
+        TextWrapping wrapMode = TextWrapping::NoWrap,
+        float charSpacing = 0.0f,
+        float explicitLineHeight = 0.0f);
 
     // Bilinear normalized [0..1] SDF sample at UV coordinates (u, v) in [0..1]^2
     [[nodiscard]] float SampleSdfBilinear(float u, float v) const noexcept;
@@ -372,22 +409,39 @@ private:
         float shardAscentEm = 0.8f;
         float shardDescentEm = 0.2f;
         float shardLineGapEm = 0.0f;
+        int weightClass = 400;
+        bool isItalic = false;
         bool isShardOnly = false;
     };
 
-    void InitBuiltInFallbackAscii();
+    void InitBuiltInFallbackAscii() const;
+    void EnsureBuiltInFallbackAscii() const;
+    void EnsureBuiltInFallbackAsciiLocked() const;
     bool AllocateSkylineRectLocked(
         std::uint16_t cellW,
         std::uint16_t cellH,
         std::uint16_t& outX,
-        std::uint16_t& outY) noexcept;
+        std::uint16_t& outY) const noexcept;
     void BlitCellR8Locked(
         std::uint16_t dstX,
         std::uint16_t dstY,
         std::uint16_t cellW,
         std::uint16_t cellH,
-        const std::uint8_t* srcPixels) noexcept;
+        const std::uint8_t* srcPixels) const;
+    [[nodiscard]] const RegisteredFontEntry* ResolveBestFaceForKeyLocked(
+        const std::string& key,
+        int weight,
+        bool italic) const noexcept;
+    void ResolveFontChainLocked(
+        std::string_view fontFamily,
+        int weight,
+        bool italic,
+        std::vector<const RegisteredFontEntry*>& outChain) const;
     [[nodiscard]] const RegisteredFontEntry* ResolveFontEntryLocked(std::string_view fontFamily) const noexcept;
+    [[nodiscard]] FontAtlasGlyph EnsureGlyphFromChainLocked(
+        const std::vector<const RegisteredFontEntry*>& chain,
+        std::uint32_t codePoint,
+        const RegisteredFontEntry** outChosenEntry = nullptr);
     [[nodiscard]] FontAtlasGlyph EnsureGlyphLocked(
         const RegisteredFontEntry* fontEntry,
         std::uint32_t codePoint);
@@ -396,20 +450,22 @@ private:
     std::uint16_t atlasWidth_ = kDefaultAtlasSize;
     std::uint16_t atlasHeight_ = kDefaultAtlasSize;
     std::uint16_t glyphRegionHeight_ = kDefaultAtlasSize / 2u; // Top half v in [0.0..0.5)
-    SkylinePacker skyline_;
-    std::vector<std::uint8_t> sdfPixels_;
+    mutable SkylinePacker skyline_;
+    mutable std::vector<std::uint8_t> sdfPixels_;
     std::uint64_t instanceId_ = 0u;
-    std::atomic<std::uint64_t> revision_{1u};
+    mutable std::atomic<std::uint64_t> revision_{1u};
 
     std::uint32_t nextFontId_ = 1u;
     std::string defaultFamilyKey_;
     std::vector<RegisteredFontEntry> fonts_;
     std::unordered_map<std::string, std::size_t> familyAliasToIndex_;
+    std::unordered_map<std::string, std::vector<std::size_t>> familyAliasToEntries_;
     // Key = (uint64_t(fontId) << 32) | uint64_t(codePoint); fontId == 0 denotes built-in/global shard fallback
     std::unordered_map<std::uint64_t, FontAtlasGlyph> glyphCache_;
 
-    FontAtlasGlyph builtInAscii_[128]{};
-    FontAtlasGlyph builtInCjkBoxGlyph_{};
+    mutable std::atomic<bool> builtInAsciiReady_{false};
+    mutable FontAtlasGlyph builtInAscii_[128]{};
+    mutable FontAtlasGlyph builtInCjkBoxGlyph_{};
 };
 
 // Convenience top-level layout measurement API required by AeroGUI 2.0 text pipeline

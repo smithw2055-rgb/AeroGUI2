@@ -183,7 +183,8 @@ if(AERO_BUILD_COMPILER_TOOLS AND TARGET RealScript::Frontend)
     )
     target_compile_definitions(aerogui_compiler
         PUBLIC
-            AERO_STDLIB_DIR="${CMAKE_CURRENT_SOURCE_DIR}/stdlib"
+            $<BUILD_INTERFACE:AERO_STDLIB_DIR="${CMAKE_CURRENT_SOURCE_DIR}/stdlib">
+            $<INSTALL_INTERFACE:AERO_STDLIB_DIR="$<INSTALL_PREFIX>/${CMAKE_INSTALL_DATADIR}/aerogui2/stdlib">
     )
     aero_apply_default_rtti_options(aerogui_compiler)
 
@@ -351,6 +352,11 @@ if(AERO_INSTALL_SDK)
         RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
     )
     install(DIRECTORY include/ DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
+    install(
+        DIRECTORY stdlib/
+        DESTINATION ${CMAKE_INSTALL_DATADIR}/aerogui2/stdlib
+        FILES_MATCHING PATTERN "*.rs"
+    )
     configure_package_config_file(
         cmake/AeroGUI2Config.cmake.in
         "${CMAKE_CURRENT_BINARY_DIR}/CMakeFiles/InstallConfig/AeroGUI2Config.cmake"

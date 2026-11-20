@@ -247,7 +247,13 @@ void main() {
 }
 
 constexpr std::size_t kPageVertexBytes = kVerticesPerCommandPage * sizeof(AeroVertex);
+constexpr std::size_t kPageClipWBytes = kVerticesPerCommandPage * sizeof(float);
 constexpr std::size_t kQuadsPerPage = kVerticesPerCommandPage / 4u;
+
+struct EffectQuadBufferInit {
+    AeroVertex verts[4]{};
+    float clipW[4]{1.0f, 1.0f, 1.0f, 1.0f};
+};
 
 // Compact procedural 5x7 glyph bitmap generator for ASCII printable glyphs so real OpenGL / WebGL2
 // SdfTextGlyph draws legible crisp characters out-of-the-box without external FreeType binaries.
@@ -1416,6 +1422,9 @@ void OpenGlDeviceBackend::Shutdown() noexcept {
         if (ringVboId_ != 0u) {
             gl_.DeleteBuffers(1, &ringVboId_);
         }
+        if (clipWRingVboId_ != 0u) {
+            gl_.DeleteBuffers(1, &clipWRingVboId_);
+        }
         if (vaoId_ != 0u) {
             gl_.DeleteVertexArrays(1, &vaoId_);
         }
@@ -1433,6 +1442,7 @@ void OpenGlDeviceBackend::Shutdown() noexcept {
     effectGpuPipelineFailed_ = false;
     quadEboId_ = 0u;
     ringVboId_ = 0u;
+    clipWRingVboId_ = 0u;
     vaoId_ = 0u;
     programId_ = 0u;
     uViewportSizeLoc_ = -1;
@@ -1441,6 +1451,7 @@ void OpenGlDeviceBackend::Shutdown() noexcept {
     uImageSamplerLoc_ = -1;
     maxPagesInRing_ = 0u;
     ringBufferBytes_ = 0u;
+    clipWRingBufferBytes_ = 0u;
     quadCapacity_ = 0u;
     atlasWidth_ = 0u;
     atlasHeight_ = 0u;
@@ -1635,11 +1646,12 @@ bool OpenGlDeviceBackend::EnsureEffectGpuResources(
         if (effectQuadVboId_ == 0u) {
             return false;
         }
+        const EffectQuadBufferInit initBuf{};
         gl_.BindBuffer(kGlArrayBuffer, effectQuadVboId_);
         gl_.BufferData(
             kGlArrayBuffer,
-            static_cast<AeroGLsizeiptr>(4u * sizeof(AeroVertex)),
-            nullptr,
+            static_cast<AeroGLsizeiptr>(sizeof(initBuf)),
+            &initBuf,
             kGlDynamicDraw);
     }
 
@@ -1778,9 +1790,17 @@ bool OpenGlDeviceBackend::AllocateRingVertexBuffer(std::size_t maxPagesInRing) {
             return false;
         }
     }
+    if (clipWRingVboId_ == 0u) {
+        gl_.GenBuffers(1, &clipWRingVboId_);
+        if (clipWRingVboId_ == 0u) {
+            diagnostics_ = "glGenBuffers failed for clipW ring VBO.";
+            return false;
+        }
+    }
 
     maxPagesInRing_ = maxPagesInRing;
     ringBufferBytes_ = maxPagesInRing_ * kPageVertexBytes;
+    clipWRingBufferBytes_ = maxPagesInRing_ * kPageClipWBytes;
     if (vaoId_ != 0u) {
         gl_.BindVertexArray(vaoId_);
     }
@@ -1789,6 +1809,14 @@ bool OpenGlDeviceBackend::AllocateRingVertexBuffer(std::size_t maxPagesInRing) {
         kGlArrayBuffer,
         static_cast<AeroGLsizeiptr>(ringBufferBytes_),
         nullptr,
+        kGlDynamicDraw);
+
+    std::vector<float> defaultClipW(maxPagesInRing_ * kVerticesPerCommandPage, 1.0f);
+    gl_.BindBuffer(kGlArrayBuffer, clipWRingVboId_);
+    gl_.BufferData(
+        kGlArrayBuffer,
+        static_cast<AeroGLsizeiptr>(clipWRingBufferBytes_),
+        defaultClipW.data(),
         kGlDynamicDraw);
 
     if (vaoId_ != 0u && quadEboId_ != 0u) {
@@ -1862,6 +1890,13 @@ void OpenGlDeviceBackend::BindAeroVertexLayout() noexcept {
     // layout(location = 3) in uint a_PrimFlags (uint16_t primType + uint16_t flags @ offset 20)
     gl_.EnableVertexAttribArray(3u);
     gl_.VertexAttribIPointer(3u, 1, kGlUnsignedInt, kStride, reinterpret_cast<const void*>(std::uintptr_t{20}));
+    if (clipWRingVboId_ != 0u) {
+        // layout(location = 4) in float a_ClipW (sidecar homogeneous clip-space W)
+        gl_.BindBuffer(kGlArrayBuffer, clipWRingVboId_);
+        gl_.EnableVertexAttribArray(4u);
+        gl_.VertexAttribPointer(4u, 1, kGlFloat, 0u, static_cast<AeroGLsizei>(sizeof(float)), nullptr);
+        gl_.BindBuffer(kGlArrayBuffer, ringVboId_);
+    }
 }
 
 void OpenGlDeviceBackend::SyncUnifiedUiAtlas(const PagedRenderTree& tree) {
@@ -2221,6 +2256,72 @@ GpuBackendFrameStats OpenGlDeviceBackend::ExecuteSubmission(
         }
     }
 
+    if (clipWRingVboId_ != 0u) {
+        gl_.BindBuffer(kGlArrayBuffer, clipWRingVboId_);
+        float paddedClipW[kVerticesPerCommandPage];
+        for (const GlBufferSubDataSpan& span : uploadSpans) {
+            if (!span.sourcePageVertexPtr || span.byteSize == 0u) {
+                continue;
+            }
+            const float* srcClipW = span.sourcePageClipWPtr ? span.sourcePageClipWPtr : tree.PageVertexClipW(span.pageIndex);
+            if (!srcClipW) {
+                continue;
+            }
+            const std::size_t slotIdx = span.pageIndex % effRingPages;
+            const std::size_t dstOffset = slotIdx * kPageClipWBytes;
+            if (dstOffset + kPageClipWBytes > clipWRingBufferBytes_) {
+                continue;
+            }
+            const std::size_t srcBytes = (span.clipWByteSize > 0u)
+                ? span.clipWByteSize
+                : ((span.byteSize / sizeof(AeroVertex)) * sizeof(float));
+            const std::size_t clampedBytes = std::min<std::size_t>(srcBytes, kPageClipWBytes);
+            if (clampedBytes < kPageClipWBytes) {
+                std::fill(std::begin(paddedClipW), std::end(paddedClipW), 1.0f);
+                if (clampedBytes > 0u) {
+                    std::memcpy(paddedClipW, srcClipW, clampedBytes);
+                }
+                gl_.BufferSubData(
+                    kGlArrayBuffer,
+                    static_cast<AeroGLintptr>(dstOffset),
+                    static_cast<AeroGLsizeiptr>(kPageClipWBytes),
+                    paddedClipW);
+            } else {
+                gl_.BufferSubData(
+                    kGlArrayBuffer,
+                    static_cast<AeroGLintptr>(dstOffset),
+                    static_cast<AeroGLsizeiptr>(clampedBytes),
+                    srcClipW);
+            }
+        }
+        if (ringReallocated) {
+            const std::size_t treePages = tree.PageCount();
+            for (std::size_t p = 0; p < treePages; ++p) {
+                const std::size_t slotIdx = p % effRingPages;
+                if (slotIdx < uploadedSlots.size() && uploadedSlots[slotIdx] != 0u) {
+                    continue;
+                }
+                const CommandPage& page = tree.GetPage(p);
+                const std::size_t activeVerts = std::min<std::size_t>(
+                    page.header.vertexCount,
+                    kVerticesPerCommandPage);
+                if (activeVerts == 0u) {
+                    continue;
+                }
+                const float* srcClipW = tree.PageVertexClipW(p);
+                const std::size_t dstOffset = slotIdx * kPageClipWBytes;
+                if (srcClipW != nullptr && dstOffset + kPageClipWBytes <= clipWRingBufferBytes_) {
+                    gl_.BufferSubData(
+                        kGlArrayBuffer,
+                        static_cast<AeroGLintptr>(dstOffset),
+                        static_cast<AeroGLsizeiptr>(kPageClipWBytes),
+                        srcClipW);
+                }
+            }
+        }
+        gl_.BindBuffer(kGlArrayBuffer, ringVboId_);
+    }
+
     // 2. Ensure Static Quad Index Buffer (0,1,2, 0,2,3 ...) covers every batch's highest quad index
     const std::uint32_t expansionsBefore = telemetry_.quadEboExpansionCount;
     for (const GpuClipDrawBatch& batch : drawBatches) {
@@ -2362,7 +2463,11 @@ GpuBackendFrameStats OpenGlDeviceBackend::ExecuteSubmission(
             stats.trianglesSubmitted += quadCount * 2u;
         }
     } else {
-        auto flushPageQuadSubBatch = [&](std::size_t pageIdx, std::size_t absQuadStart, std::size_t quadCount) {
+        auto flushPageQuadSubBatch = [&](
+            std::size_t pageIdx,
+            std::size_t absQuadStart,
+            std::size_t quadCount,
+            bool forceNormalBlend = false) {
             if (quadCount == 0u || pageIdx >= tree.PageCount()) {
                 return;
             }
@@ -2371,9 +2476,11 @@ GpuBackendFrameStats OpenGlDeviceBackend::ExecuteSubmission(
             }
             stats.clipBatchesProcessed += 1u;
             const CommandPageHeader& hdr = tree.GetPage(pageIdx).header;
-            const BlendingMode bm = (hdr.reserved[1] <= 3u)
-                ? static_cast<BlendingMode>(hdr.reserved[1])
-                : BlendingMode::Normal;
+            const BlendingMode bm = forceNormalBlend
+                ? BlendingMode::Normal
+                : ((hdr.reserved[1] <= 3u)
+                       ? static_cast<BlendingMode>(hdr.reserved[1])
+                       : BlendingMode::Normal);
             setGlBlendMode(bm);
 
             const std::uint32_t texId = hdr.reserved[0];
@@ -2421,11 +2528,21 @@ GpuBackendFrameStats OpenGlDeviceBackend::ExecuteSubmission(
             stats.trianglesSubmitted += quadCount * 2u;
         };
 
-        auto flushNodeRange = [&](std::uint32_t rangeStart, std::uint32_t rangeEnd) {
+        auto flushNodeRange = [&](
+            std::uint32_t rangeStart,
+            std::uint32_t rangeEnd,
+            bool forceRootNormalBlend = false) {
             bool hasPending = false;
             std::size_t pendingPage = 0u;
             std::size_t pendingQuadStart = 0u;
             std::size_t pendingQuadCount = 0u;
+            bool pendingForceNormal = false;
+            const void* rootOwner = nullptr;
+            if (forceRootNormalBlend && rangeStart < tree.NodeCount()) {
+                if (const RenderNodeDescriptor* rootNd = tree.GetNode(rangeStart)) {
+                    rootOwner = rootNd->sourceElement;
+                }
+            }
 
             for (std::uint32_t i = rangeStart; i < rangeEnd; ++i) {
                 const RenderNodeDescriptor* nd = tree.GetNode(i);
@@ -2440,23 +2557,27 @@ GpuBackendFrameStats OpenGlDeviceBackend::ExecuteSubmission(
                 if (qCount == 0u) {
                     continue;
                 }
+                const bool forceNormal = forceRootNormalBlend &&
+                    (rootOwner != nullptr ? (nd->sourceElement == rootOwner) : (i == rangeStart));
                 const std::size_t absQuad = (nd->pageIndex % effRingPages) * kQuadsPerPage + qInPage;
                 if (hasPending &&
                     nd->pageIndex == pendingPage &&
+                    forceNormal == pendingForceNormal &&
                     absQuad == pendingQuadStart + pendingQuadCount) {
                     pendingQuadCount += qCount;
                 } else {
                     if (hasPending) {
-                        flushPageQuadSubBatch(pendingPage, pendingQuadStart, pendingQuadCount);
+                        flushPageQuadSubBatch(pendingPage, pendingQuadStart, pendingQuadCount, pendingForceNormal);
                     }
                     hasPending = true;
                     pendingPage = nd->pageIndex;
                     pendingQuadStart = absQuad;
                     pendingQuadCount = qCount;
+                    pendingForceNormal = forceNormal;
                 }
             }
             if (hasPending) {
-                flushPageQuadSubBatch(pendingPage, pendingQuadStart, pendingQuadCount);
+                flushPageQuadSubBatch(pendingPage, pendingQuadStart, pendingQuadCount, pendingForceNormal);
             }
         };
 
@@ -2468,6 +2589,15 @@ GpuBackendFrameStats OpenGlDeviceBackend::ExecuteSubmission(
             gl_.VertexAttribPointer(1u, 2, kGlFloat, 0u, kStride, reinterpret_cast<const void*>(std::uintptr_t{8}));
             gl_.VertexAttribIPointer(2u, 1, kGlUnsignedInt, kStride, reinterpret_cast<const void*>(std::uintptr_t{16}));
             gl_.VertexAttribIPointer(3u, 1, kGlUnsignedInt, kStride, reinterpret_cast<const void*>(std::uintptr_t{20}));
+            if (clipWRingVboId_ != 0u) {
+                gl_.VertexAttribPointer(
+                    4u,
+                    1,
+                    kGlFloat,
+                    0u,
+                    static_cast<AeroGLsizei>(sizeof(float)),
+                    reinterpret_cast<const void*>(static_cast<std::uintptr_t>(4u * sizeof(AeroVertex))));
+            }
             gl_.BindBuffer(kGlElementArrayBuffer, quadEboId_);
         };
 
@@ -2476,7 +2606,8 @@ GpuBackendFrameStats OpenGlDeviceBackend::ExecuteSubmission(
                                          int patchW,
                                          int patchH,
                                          const std::uint8_t* premulRgba8,
-                                         bool coordsArePhysical) {
+                                         bool coordsArePhysical,
+                                         BlendingMode blendMode = BlendingMode::Normal) {
             if (patchW <= 0 || patchH <= 0 || !premulRgba8 || !EnsureQuadIndexCapacity(1u)) {
                 return;
             }
@@ -2493,11 +2624,12 @@ GpuBackendFrameStats OpenGlDeviceBackend::ExecuteSubmission(
                 if (effectQuadVboId_ == 0u) {
                     return;
                 }
+                const EffectQuadBufferInit initBuf{};
                 gl_.BindBuffer(kGlArrayBuffer, effectQuadVboId_);
                 gl_.BufferData(
                     kGlArrayBuffer,
-                    static_cast<AeroGLsizeiptr>(4u * sizeof(AeroVertex)),
-                    nullptr,
+                    static_cast<AeroGLsizeiptr>(sizeof(initBuf)),
+                    &initBuf,
                     kGlDynamicDraw);
             }
 
@@ -2538,7 +2670,7 @@ GpuBackendFrameStats OpenGlDeviceBackend::ExecuteSubmission(
             boundUnit1Tex = effectScratchTexId_;
             boundBatchTextureId = 0xFFFFFFFFu;
 
-            setGlBlendMode(BlendingMode::Normal);
+            setGlBlendMode(blendMode);
             if (scissorCurrentlyEnabled) {
                 gl_.Disable(kGlScissorTest);
                 scissorCurrentlyEnabled = false;
@@ -2659,7 +2791,7 @@ GpuBackendFrameStats OpenGlDeviceBackend::ExecuteSubmission(
             gl_.Disable(kGlScissorTest);
             scissorCurrentlyEnabled = false;
             setGlBlendMode(BlendingMode::Normal);
-            flushNodeRange(span.firstNodeId, span.endNodeId);
+            flushNodeRange(span.firstNodeId, span.endNodeId, span.blendMode != BlendingMode::Normal);
 
             // 2. Post-process via FBO effect shader and composite back to default FBO (0)
             const float fVpW = static_cast<float>(vpW);
@@ -2701,8 +2833,7 @@ GpuBackendFrameStats OpenGlDeviceBackend::ExecuteSubmission(
                 gl_.BindFramebuffer(kGlFramebuffer, targetFbo);
                 if (enableBlend) {
                     gl_.Enable(kGlBlend);
-                    gl_.BlendFuncSeparate(kGlOne, kGlOneMinusSrcAlpha, kGlOne, kGlOneMinusSrcAlpha);
-                    activeGlBlend = BlendingMode::Normal;
+                    setGlBlendMode((targetFbo == 0u) ? span.blendMode : BlendingMode::Normal);
                 } else {
                     gl_.Disable(kGlBlend);
                 }
@@ -2991,7 +3122,8 @@ GpuBackendFrameStats OpenGlDeviceBackend::ExecuteSubmission(
                     patchH,
                     effectPatchScratch_,
                     tree.ResourceStore())) {
-                drawPremulEffectPatch(patchX, patchY, patchW, patchH, effectPatchScratch_.data(), true);
+                drawPremulEffectPatch(
+                    patchX, patchY, patchW, patchH, effectPatchScratch_.data(), true, BlendingMode::Normal);
             }
         };
 
@@ -3039,7 +3171,8 @@ GpuBackendFrameStats OpenGlDeviceBackend::ExecuteSubmission(
                             patchW,
                             patchH,
                             effectPatchScratch_)) {
-                        drawPremulEffectPatch(patchX, patchY, patchW, patchH, effectPatchScratch_.data(), false);
+                        drawPremulEffectPatch(
+                            patchX, patchY, patchW, patchH, effectPatchScratch_.data(), false, span.blendMode);
                     }
                 }
                 while (blurCursor < blurSpans.size() &&

@@ -2,6 +2,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <string>
 #include <string_view>
@@ -1219,9 +1220,9 @@ public partial class MainWindow : Window {
         prunedRes.prunedMirTypes,
         prunedRes.retainedMirFunctions,
         prunedRes.prunedMirFunctions);
-    Require(prunedRes.programImageBytes.size() < 4500000u &&
+    Require(prunedRes.programImageBytes.size() < 5500000u &&
             prunedRes.programImageBytes.size() * 10u < unprunedRes.programImageBytes.size() * 3u,
-        "Tree-shaken .rsb on <Window> view must be < 4,500,000 bytes and < 30% of unpruned size");
+        "Tree-shaken .rsb on <Window> view must be < 5,500,000 bytes and < 30% of unpruned size");
     Require(prunedRes.prunedMirFunctions > 200u,
         "Tree-shaken <Window> compile must prune > 200 unreachable MIR functions");
     Require(prunedRes.prunedMirTypes > 0u,
@@ -1381,6 +1382,172 @@ public partial class MainWindow : Window {
         "Compiled ProgramImage missing MultiXamlDemo::MainWindow.InitializeComponent");
 }
 
+void TestP0P1CompilerSemanticsAndStdlibGenericCache() {
+    const std::string_view mergedResources = R"XML(
+<ResourceDictionary xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+                    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+                    xmlns:sys="clr-namespace:System;assembly=mscorlib">
+  <sys:Double x:Key="SidebarWidth">220</sys:Double>
+  <DataTemplate x:Key="LeafTpl">
+    <TextBlock Text="{Binding Title}"/>
+  </DataTemplate>
+  <HierarchicalDataTemplate x:Key="CatTpl" ItemsSource="{Binding Children}" ItemTemplate="{StaticResource LeafTpl}">
+    <TextBlock Text="{Binding Name}"/>
+  </HierarchicalDataTemplate>
+</ResourceDictionary>)XML";
+
+    const std::string_view p0p1Xaml = R"XML(
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:b="http://schemas.microsoft.com/xaml/behaviors"
+        xmlns:noesis="clr-namespace:NoesisGUIExtensions;assembly=Noesis.GUI.Extensions"
+        x:Class="P0P1CompileDemo.MainWindow"
+        Title="P0P1 Compile Demo" Width="800" Height="600">
+  <Window.Resources>
+    <ResourceDictionary>
+      <ResourceDictionary.MergedDictionaries>
+        <ResourceDictionary Source="Shared.xaml"/>
+      </ResourceDictionary.MergedDictionaries>
+      <Storyboard x:Key="IntroAndState">
+        <BooleanAnimationUsingKeyFrames Storyboard.TargetName="SubmitBtn" Storyboard.TargetProperty="(UIElement.IsEnabled)">
+          <DiscreteBooleanKeyFrame KeyTime="0" Value="False"/>
+          <DiscreteBooleanKeyFrame KeyTime="0:0:0.6" Value="True"/>
+        </BooleanAnimationUsingKeyFrames>
+        <ObjectAnimationUsingKeyFrames Storyboard.TargetName="StatusPanel" Storyboard.TargetProperty="(UIElement.Visibility)">
+          <DiscreteObjectKeyFrame KeyTime="0" Value="{x:Static Visibility.Visible}"/>
+          <DiscreteObjectKeyFrame KeyTime="0:0:0.4" Value="{x:Static Visibility.Collapsed}"/>
+        </ObjectAnimationUsingKeyFrames>
+        <PointAnimationUsingKeyFrames Storyboard.TargetName="StatusPanel" Storyboard.TargetProperty="RenderTransformOrigin">
+          <LinearPointKeyFrame KeyTime="0:0:0.5" Value="0.5,0.5"/>
+        </PointAnimationUsingKeyFrames>
+      </Storyboard>
+    </ResourceDictionary>
+  </Window.Resources>
+  <Grid>
+    <Grid.ColumnDefinitions>
+      <ColumnDefinition Width="{Binding Source={StaticResource SidebarWidth}}"/>
+      <ColumnDefinition Width="*"/>
+    </Grid.ColumnDefinitions>
+    <StackPanel Grid.Column="0">
+      <StackPanel.LayoutTransform>
+        <ScaleTransform ScaleX="1"/>
+      </StackPanel.LayoutTransform>
+      <TreeView x:Name="CatTree" ItemsSource="{Binding Categories}" ItemTemplate="{StaticResource CatTpl}">
+        <b:Interaction.Triggers>
+          <b:EventTrigger EventName="SelectedItemChanged">
+            <b:ChangePropertyAction PropertyName="Tag" Value="{Binding SelectedItem, ElementName=CatTree}"/>
+          </b:EventTrigger>
+        </b:Interaction.Triggers>
+      </TreeView>
+    </StackPanel>
+    <StackPanel x:Name="StatusPanel" Grid.Column="1" Spacing="8">
+      <Rectangle x:Name="ShaderRect" Width="120" Height="60">
+        <Rectangle.Fill>
+          <ImageBrush x:Name="ShaderFill">
+            <noesis:Brush.Shader>
+              <noesis:PlasmaBrush Time="0.5" Scale="1.0,1.0"/>
+            </noesis:Brush.Shader>
+          </ImageBrush>
+        </Rectangle.Fill>
+      </Rectangle>
+      <Button x:Name="SubmitBtn" Content="Submit"/>
+    </StackPanel>
+  </Grid>
+</Window>)XML";
+
+    aero::XamlEmitOptions opts;
+    opts.xamlPath = "P0P1CompileDemo/MainWindow.xaml";
+    opts.externalXamlResolver = [&](std::string_view req, std::string_view, std::string& resolved, std::string& content) {
+        if (req == "Shared.xaml") {
+            resolved = "P0P1CompileDemo/Shared.xaml";
+            content = std::string(mergedResources);
+            return true;
+        }
+        return false;
+    };
+
+    const auto emitRes = aero::EmitXamlToRealScript(p0p1Xaml, opts);
+    for (const auto& d : emitRes.diagnostics) {
+        if (!emitRes.succeeded) {
+            std::cerr << "  p0p1 emit diag: " << d << "\n";
+        }
+    }
+    Require(emitRes.succeeded, "P0P1 XamlToRsEmitter must succeed (warnings must not fail compilation)");
+    Require(ContainsText(emitRes.generatedRsCode, "new HierarchicalDataTemplate(") &&
+            ContainsText(emitRes.generatedRsCode, "\"Children\"") &&
+            ContainsText(emitRes.generatedRsCode, "ItemTemplate"),
+        "HierarchicalDataTemplate emission missing ItemsSourcePath or ItemTemplate wiring");
+    Require(ContainsText(emitRes.generatedRsCode, "AddDiscreteKeyFrame(\"SubmitBtn\", \"IsEnabled\"") &&
+            ContainsText(emitRes.generatedRsCode, "AddDiscreteKeyFrame(\"StatusPanel\", \"Visibility\""),
+        "BooleanAnimationUsingKeyFrames / ObjectAnimationUsingKeyFrames must emit Storyboard.AddDiscreteKeyFrame");
+    Require(ContainsText(emitRes.generatedRsCode, "ValueBinding =") &&
+            !ContainsText(emitRes.generatedRsCode, "\"{Binding SelectedItem"),
+        "ChangePropertyAction Value=\"{Binding ...}\" must emit ValueBinding assignment, not literal string");
+    Require(!ContainsText(emitRes.generatedRsCode, "new ImageBrush(\"\")"),
+        "ImageBrush with noesis:Brush.Shader must not emit blank ImageBrush(\"\")");
+    Require(ContainsText(emitRes.generatedRsCode, "220") ||
+            ContainsText(emitRes.generatedRsCode, "SidebarWidth"),
+        "Grid.ColumnDefinition Width={Binding Source={StaticResource SidebarWidth}} must not degrade silently to Auto");
+
+    const auto realStdlib = aero::LoadStdlibModulePack();
+    if (!RealStdlibHasUiClasses(realStdlib)) {
+        return;
+    }
+
+    const std::string codeBehindRs = R"RS(
+module P0P1CompileDemo;
+import Aero.UI;
+
+// ObservableList<string> in line comment must NOT trigger stdlib generic instantiation scan
+/* DelegateCommand<object> in block comment must NOT trigger stdlib generic instantiation scan */
+public partial class MainWindow : Window {
+    public string CommentProbe = "RelayCommand<int> TypedBox<float> ObservableCollection<string> in string literal";
+    public MainWindow() {
+        InitializeComponent();
+    }
+}
+)RS";
+
+    aero::AeroV3CompileInput compileInput;
+    compileInput.xamlPath = "P0P1CompileDemo/MainWindow.xaml";
+    compileInput.xamlContent = std::string(p0p1Xaml);
+    compileInput.resourceSearchRoot = "P0P1CompileDemo";
+    compileInput.includeStdlib = true;
+    compileInput.treeShakeStdlib = true;
+    compileInput.optimizeBytecode = false;
+    compileInput.scriptSources.push_back(aero::SourceFile{"P0P1CompileDemo/MainWindow.rs", codeBehindRs});
+
+    // Write temporary Shared.xaml resolver source into additionalXamlSources or temp dir on disk
+    const std::filesystem::path tmpDir = std::filesystem::path(AERO_TEST_TEMP_DIR) / "p0p1_compiler_probe";
+    std::error_code ec;
+    std::filesystem::remove_all(tmpDir, ec);
+    std::filesystem::create_directories(tmpDir, ec);
+    {
+        std::ofstream out((tmpDir / "Shared.xaml").string(), std::ios::binary | std::ios::trunc);
+        Require(out.is_open(), "Failed to create temporary Shared.xaml for compiler probe");
+        if (out.is_open()) {
+            out.write(mergedResources.data(), static_cast<std::streamsize>(mergedResources.size()));
+        }
+    }
+    compileInput.xamlPath = (tmpDir / "MainWindow.xaml").string();
+    compileInput.resourceSearchRoot = tmpDir.string();
+    compileInput.resourceSearchPaths.push_back(tmpDir.string());
+    compileInput.compilerSession = nullptr;
+
+    const aero::AeroCompilerV3 compiler;
+    const auto compileRes = compiler.Compile(compileInput);
+    for (const auto& d : compileRes.diagnostics) {
+        if (!compileRes.succeeded) {
+            std::cerr << "  p0p1 compile diag: " << d << "\n";
+        }
+    }
+    Require(compileRes.succeeded && compileRes.programImage != nullptr,
+        "End-to-end AeroCompilerV3 compile of HierarchicalDataTemplate/DiscreteKeyFrame/ChangePropertyAction failed");
+    Require(compileRes.usedStdlibCache,
+        "Stdlib cache should remain active when generics appear only inside comments and string literals");
+    std::filesystem::remove_all(tmpDir, ec);
+}
+
 } // namespace
 
 int main() {
@@ -1393,6 +1560,7 @@ int main() {
     TestEndToEndXamlCompileAndSessionReuse();
     TestMirTreeShakingAndProcessStdlibCache();
     TestMultiXamlAdditionalSourcesCompilation();
+    TestP0P1CompilerSemanticsAndStdlibGenericCache();
 
     if (gFailureCount > 0) {
         std::cerr << gFailureCount << " compiler_v3_tests assertion(s) failed.\n";

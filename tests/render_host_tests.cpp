@@ -524,10 +524,13 @@ bool TestShadersStoreIsolationAndSoftwareRasterizer() {
 
     AERO_CHECK(gl33Vs.find("#version 330 core") != std::string_view::npos);
     AERO_CHECK(es300Vs.find("#version 300 es") != std::string_view::npos);
+    AERO_CHECK(gl33Vs.find("a_ClipW") != std::string_view::npos);
+    AERO_CHECK(es300Vs.find("a_ClipW") != std::string_view::npos);
     AERO_CHECK(gl33Ps.find("#define AERO_WEBGL2_GRAYSCALE_SDF_AA 0") != std::string_view::npos);
     AERO_CHECK(es300Ps.find("#define AERO_WEBGL2_GRAYSCALE_SDF_AA 1") != std::string_view::npos);
     AERO_CHECK(gl33Ps.find("sampleAtlasGradientBrush") != std::string_view::npos);
     AERO_CHECK(wgsl.find("fs_main") != std::string_view::npos);
+    AERO_CHECK(wgsl.find("clipW") != std::string_view::npos);
 
     // Per-view UIResourceStore gradient isolation (never registered on global Instance!)
     auto store = std::make_shared<aero::UIResourceStore>();

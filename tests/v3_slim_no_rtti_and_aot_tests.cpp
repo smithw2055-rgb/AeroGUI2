@@ -575,7 +575,7 @@ void TestLiveAotExecutionAndHeadlessRenderWithoutInterpreter() {
         btnNode->layout.layoutRect.x + btnNode->layout.layoutRect.width * 0.5f,
         btnNode->layout.layoutRect.y + btnNode->layout.layoutRect.height * 0.5f};
     const Point btnViewport = btnNode->layout.hasPerspective3D
-        ? btnNode->layout.worldMatrix3D.ProjectPoint2D(btnLocalCenter)
+        ? btnNode->WorldMatrix3D().ProjectPoint2D(btnLocalCenter)
         : btnNode->layout.worldTransform.TransformPoint(btnLocalCenter);
     const float btnCx = btnViewport.x;
     const float btnCy = btnViewport.y;

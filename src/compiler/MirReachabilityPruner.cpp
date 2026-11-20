@@ -84,7 +84,8 @@ constexpr std::uint32_t kInvalidSlot = std::numeric_limits<std::uint32_t>::max()
         if (owner.name == "Window" && method.name == "Show") {
             return true;
         }
-        if (owner.name == "UIElement" && method.name == "EnsureLoadedSubtree") {
+        if (owner.name == "UIElement" &&
+            (method.name == "EnsureLoadedSubtree" || method.name == "ApplyTemplateSubtree")) {
             return true;
         }
         if (owner.name == "FrameworkElement" && method.name == "ApplyTemplate") {

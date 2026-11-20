@@ -1,7 +1,10 @@
 #include "aero/visual/VisualTree.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
+#include <limits>
+#include <utility>
 #include <realscript/semantic/Semantic.h>
 
 #include "aero/asset/GradientBrush.hpp"
@@ -12,6 +15,8 @@
 namespace aero {
 
 namespace {
+
+std::atomic<std::uint64_t> gNextVisualWorldId{1u};
 
 [[nodiscard]] bool IsFinitePositive(float v) noexcept {
     return std::isfinite(v) && v >= 0.0f;
@@ -26,7 +31,11 @@ VisualWorld::VisualWorld(
     : visualNodeTypeId_(rs_sem::stableTypeId(kVisualNodeTypeName))
     , handleRegistry_(handleRegistry ? handleRegistry : &ownedFallbackRegistry_)
     , resourceStore_(resourceStore)
-    , managedHeap_(managedHeap) {
+    , managedHeap_(managedHeap)
+    , worldInstanceId_(gNextVisualWorldId.fetch_add(1u, std::memory_order_relaxed)) {
+    measureDepthBuckets_.resize(64u);
+    arrangeDepthBuckets_.resize(64u);
+    transformDepthBuckets_.resize(64u);
     rs_rt::registerExternalValuePoolRootMarker(this, [this]() {
         MarkScriptRootsInPools();
     });
@@ -95,6 +104,8 @@ VisualNodeId VisualWorld::CreateNode(VisualKind kind) {
     node.dirtyFlags = VisualDirty_All;
     node.nativeHandle = handleRegistry_->createBorrowed(visualNodeTypeId_, &node, false);
     ++liveCount_;
+    structureDirty_ = true;
+    ++structureVersion_;
     anyDirty_ = true;
     return node.id;
 }
@@ -123,12 +134,15 @@ bool VisualWorld::DestroyNode(VisualNodeId id) {
         node->nativeHandle = NativeHandle{};
     }
     node->children.clear();
+    node->extras.reset();
     node->alive = false;
     node->dirtyFlags = VisualDirty_Clean;
     freeIndices_.push_back(id.index);
     if (liveCount_ > 0u) {
         --liveCount_;
     }
+    structureDirty_ = true;
+    ++structureVersion_;
     anyDirty_ = true;
     return true;
 }
@@ -184,6 +198,8 @@ void VisualWorld::SetRoot(VisualNodeId id) noexcept {
     if (rootId_.IsValid()) {
         RefreshSubtreeDepths(rootId_, 0u);
     }
+    structureDirty_ = true;
+    ++structureVersion_;
     anyDirty_ = true;
 }
 
@@ -196,9 +212,9 @@ bool VisualWorld::AddChild(VisualNodeId parentId, VisualNodeId childId) {
     DetachFromParent(*child);
     child->parent = parentId;
     parent->children.push_back(childId);
-    const std::uint8_t childDepth = (parent->layout.treeDepth < 63u)
-        ? static_cast<std::uint8_t>(parent->layout.treeDepth + 1u)
-        : 63u;
+    const std::uint16_t childDepth = (parent->layout.treeDepth < std::numeric_limits<std::uint16_t>::max())
+        ? static_cast<std::uint16_t>(parent->layout.treeDepth + 1u)
+        : std::numeric_limits<std::uint16_t>::max();
     RefreshSubtreeDepths(childId, childDepth);
     child->layout.hasValidMeasure = false;
     child->layout.hasValidArrange = false;
@@ -218,9 +234,9 @@ bool VisualWorld::InsertChild(VisualNodeId parentId, std::int32_t index, VisualN
         ? 0u
         : std::min(static_cast<std::size_t>(index), parent->children.size());
     parent->children.insert(parent->children.begin() + static_cast<std::ptrdiff_t>(clampedIndex), childId);
-    const std::uint8_t childDepth = (parent->layout.treeDepth < 63u)
-        ? static_cast<std::uint8_t>(parent->layout.treeDepth + 1u)
-        : 63u;
+    const std::uint16_t childDepth = (parent->layout.treeDepth < std::numeric_limits<std::uint16_t>::max())
+        ? static_cast<std::uint16_t>(parent->layout.treeDepth + 1u)
+        : std::numeric_limits<std::uint16_t>::max();
     RefreshSubtreeDepths(childId, childDepth);
     child->layout.hasValidMeasure = false;
     child->layout.hasValidArrange = false;
@@ -386,8 +402,10 @@ bool VisualWorld::SetLayoutMode(
 bool VisualWorld::GridClearDefs(VisualNodeId id) noexcept {
     VisualNode* node = GetNode(id);
     if (!node) return false;
-    node->layout.rowDefs.clear();
-    node->layout.colDefs.clear();
+    if (node->HasExtras()) {
+        node->EnsureExtras().rowDefs.clear();
+        node->EnsureExtras().colDefs.clear();
+    }
     MarkAncestorsDirty(id, VisualDirty_Layout);
     return true;
 }
@@ -395,7 +413,7 @@ bool VisualWorld::GridClearDefs(VisualNodeId id) noexcept {
 bool VisualWorld::GridAddRowDef(VisualNodeId id, GridUnitType unit, float value) {
     VisualNode* node = GetNode(id);
     if (!node) return false;
-    node->layout.rowDefs.push_back(VisualGridLength{unit, value});
+    node->EnsureExtras().rowDefs.push_back(VisualGridLength{unit, value});
     MarkAncestorsDirty(id, VisualDirty_Layout);
     return true;
 }
@@ -403,7 +421,7 @@ bool VisualWorld::GridAddRowDef(VisualNodeId id, GridUnitType unit, float value)
 bool VisualWorld::GridAddColDef(VisualNodeId id, GridUnitType unit, float value) {
     VisualNode* node = GetNode(id);
     if (!node) return false;
-    node->layout.colDefs.push_back(VisualGridLength{unit, value});
+    node->EnsureExtras().colDefs.push_back(VisualGridLength{unit, value});
     MarkAncestorsDirty(id, VisualDirty_Layout);
     return true;
 }
@@ -470,7 +488,7 @@ float VisualWorld::GetLayoutRectScalar(VisualNodeId id, VisualLayoutRectQuery wh
     case VisualLayoutRectQuery::ViewportHeight: {
         Rect bounds = node->layout.layoutRect;
         if (node->layout.hasPerspective3D) {
-            bounds = node->layout.worldMatrix3D.TransformRectBounds(bounds);
+            bounds = node->WorldMatrix3D().TransformRectBounds(bounds);
         } else if (!node->layout.worldTransform.IsIdentity()) {
             bounds = node->layout.worldTransform.TransformRectBounds(bounds);
         }
@@ -495,7 +513,7 @@ bool VisualWorld::TryScreenToLocal(VisualNodeId id, Point viewportPoint, Point& 
     }
     Point worldPt = viewportPoint;
     if (node->layout.hasPerspective3D) {
-        if (!node->layout.worldMatrix3D.InverseProjectScreenToLocalPlane(viewportPoint, worldPt)) {
+        if (!node->WorldMatrix3D().InverseProjectScreenToLocalPlane(viewportPoint, worldPt)) {
             outLocal = Point{};
             return false;
         }
@@ -574,6 +592,14 @@ bool VisualWorld::SetBoxBrushOpacity(VisualNodeId id, float bgOpacity) noexcept 
     return true;
 }
 
+bool VisualWorld::SetBoxShadow(VisualNodeId id, bool isBoxShadow) noexcept {
+    VisualNode* node = GetNode(id);
+    if (!node) return false;
+    node->box.isBoxShadow = isBoxShadow;
+    MarkDirty(id, VisualDirty_Visual);
+    return true;
+}
+
 bool VisualWorld::SetTransform2D(
     VisualNodeId id,
     float tx,
@@ -600,6 +626,88 @@ bool VisualWorld::SetTransform2D(
     return true;
 }
 
+bool VisualWorld::SetLayoutTransform2D(
+    VisualNodeId id,
+    float sx,
+    float sy,
+    float rotDeg,
+    float skewX,
+    float skewY) noexcept {
+    VisualNode* node = GetNode(id);
+    if (!node) return false;
+    VisualLayoutTransform2D& lt = node->layout.layoutTransform2D;
+    const float safeSx = std::isfinite(sx) ? sx : 1.0f;
+    const float safeSy = std::isfinite(sy) ? sy : 1.0f;
+    const float safeRot = std::isfinite(rotDeg) ? rotDeg : 0.0f;
+    const float safeSkX = std::isfinite(skewX) ? skewX : 0.0f;
+    const float safeSkY = std::isfinite(skewY) ? skewY : 0.0f;
+    const bool nextHas =
+        std::fabs(safeSx - 1.0f) > 1e-6f ||
+        std::fabs(safeSy - 1.0f) > 1e-6f ||
+        std::fabs(safeRot) > 1e-6f ||
+        std::fabs(safeSkX) > 1e-6f ||
+        std::fabs(safeSkY) > 1e-6f;
+    if (node->layout.hasLayoutTransform == nextHas &&
+        std::fabs(lt.sx - safeSx) <= 1e-6f &&
+        std::fabs(lt.sy - safeSy) <= 1e-6f &&
+        std::fabs(lt.rotDeg - safeRot) <= 1e-6f &&
+        std::fabs(lt.skewX - safeSkX) <= 1e-6f &&
+        std::fabs(lt.skewY - safeSkY) <= 1e-6f) {
+        return true;
+    }
+    lt.sx = safeSx;
+    lt.sy = safeSy;
+    lt.rotDeg = safeRot;
+    lt.skewX = safeSkX;
+    lt.skewY = safeSkY;
+    node->layout.hasLayoutTransform = nextHas;
+    node->customScalars[1] = safeSx;
+    node->customScalars[2] = safeSy;
+    node->customScalars[3] = safeRot;
+    node->layout.hasValidMeasure = false;
+    node->layout.hasValidArrange = false;
+    MarkDirty(id, static_cast<VisualDirtyFlags>(VisualDirty_Layout | VisualDirty_Transform | VisualDirty_Visual));
+    return true;
+}
+
+bool VisualWorld::SetLayoutTransform(
+    VisualNodeId id,
+    float sx,
+    float sy,
+    float rotDeg,
+    bool enabled) noexcept {
+    if (!enabled) {
+        return SetLayoutTransform2D(id, 1.0f, 1.0f, 0.0f, 0.0f, 0.0f);
+    }
+    VisualNode* node = GetNode(id);
+    if (!node) return false;
+    VisualLayoutTransform2D& lt = node->layout.layoutTransform2D;
+    const float safeSx = std::isfinite(sx) ? sx : 1.0f;
+    const float safeSy = std::isfinite(sy) ? sy : 1.0f;
+    const float safeRot = std::isfinite(rotDeg) ? rotDeg : 0.0f;
+    if (node->layout.hasLayoutTransform &&
+        std::fabs(lt.sx - safeSx) <= 1e-6f &&
+        std::fabs(lt.sy - safeSy) <= 1e-6f &&
+        std::fabs(lt.rotDeg - safeRot) <= 1e-6f &&
+        std::fabs(lt.skewX) <= 1e-6f &&
+        std::fabs(lt.skewY) <= 1e-6f) {
+        return true;
+    }
+    lt.sx = safeSx;
+    lt.sy = safeSy;
+    lt.rotDeg = safeRot;
+    lt.skewX = 0.0f;
+    lt.skewY = 0.0f;
+    node->layout.hasLayoutTransform = true;
+    node->customScalars[1] = safeSx;
+    node->customScalars[2] = safeSy;
+    node->customScalars[3] = safeRot;
+    node->layout.hasValidMeasure = false;
+    node->layout.hasValidArrange = false;
+    MarkDirty(id, static_cast<VisualDirtyFlags>(VisualDirty_Layout | VisualDirty_Transform | VisualDirty_Visual));
+    return true;
+}
+
 bool VisualWorld::SetTransform3D(
     VisualNodeId id,
     float rx,
@@ -611,15 +719,16 @@ bool VisualWorld::SetTransform3D(
     float camDist) noexcept {
     VisualNode* node = GetNode(id);
     if (!node) return false;
-    node->transform3D.rx = rx;
-    node->transform3D.ry = ry;
-    node->transform3D.rz = rz;
-    node->transform3D.tx = tx;
-    node->transform3D.ty = ty;
-    node->transform3D.tz = tz;
-    node->transform3D.camDist = camDist;
-    node->transform3D.enabled = (rx != 0.0f || ry != 0.0f || rz != 0.0f ||
-                                 tx != 0.0f || ty != 0.0f || tz != 0.0f || camDist > 0.0f);
+    auto& t3d = node->EnsureExtras().transform3D;
+    t3d.rx = rx;
+    t3d.ry = ry;
+    t3d.rz = rz;
+    t3d.tx = tx;
+    t3d.ty = ty;
+    t3d.tz = tz;
+    t3d.camDist = camDist;
+    t3d.enabled = (rx != 0.0f || ry != 0.0f || rz != 0.0f ||
+                   tx != 0.0f || ty != 0.0f || tz != 0.0f || camDist > 0.0f);
     MarkDirty(id, static_cast<VisualDirtyFlags>(VisualDirty_Transform | VisualDirty_Visual));
     return true;
 }
@@ -634,12 +743,13 @@ bool VisualWorld::SetEffect(
     float opacity) noexcept {
     VisualNode* node = GetNode(id);
     if (!node) return false;
-    node->effect.kind = kind;
-    node->effect.radius = radius;
-    node->effect.depth = depth;
-    node->effect.dirDeg = dirDeg;
-    node->effect.colorRgba = colorRgba;
-    node->effect.opacity = opacity;
+    auto& eff = node->EnsureExtras().effect;
+    eff.kind = kind;
+    eff.radius = radius;
+    eff.depth = depth;
+    eff.dirDeg = dirDeg;
+    eff.colorRgba = colorRgba;
+    eff.opacity = opacity;
     MarkDirty(id, VisualDirty_Visual);
     return true;
 }
@@ -652,13 +762,14 @@ bool VisualWorld::SetOpacityMask(
     float opacity) noexcept {
     VisualNode* node = GetNode(id);
     if (!node) return false;
-    const bool gradChanged = (node->opacityMask.gradId != gradId) || !enabled;
-    node->opacityMask.enabled = enabled;
-    node->opacityMask.gradId = gradId;
-    node->opacityMask.solidRgba = solidRgba;
-    node->opacityMask.opacity = std::clamp(opacity, 0.0f, 1.0f);
+    auto& om = node->EnsureExtras().opacityMask;
+    const bool gradChanged = (om.gradId != gradId) || !enabled;
+    om.enabled = enabled;
+    om.gradId = gradId;
+    om.solidRgba = solidRgba;
+    om.opacity = std::clamp(opacity, 0.0f, 1.0f);
     if (gradChanged) {
-        node->opacityMask.stopOffsets.fill(std::numeric_limits<float>::quiet_NaN());
+        om.stopOffsets.fill(std::numeric_limits<float>::quiet_NaN());
     }
     MarkDirty(id, VisualDirty_Visual);
     return true;
@@ -675,13 +786,14 @@ bool VisualWorld::SetText(
     TextTrimming trim) {
     VisualNode* node = GetNode(id);
     if (!node) return false;
-    node->text.text.assign(text);
-    node->text.fontFamily.assign(fontFamily);
-    node->text.fontSize = (fontSize > 0.0f) ? fontSize : 14.0f;
-    node->text.fgRgba = fgRgba;
-    node->text.wrap = wrap;
-    node->text.align = align;
-    node->text.trim = trim;
+    auto& txt = node->EnsureExtras().text;
+    txt.text.assign(text);
+    txt.fontFamily.assign(fontFamily);
+    txt.fontSize = (fontSize > 0.0f) ? fontSize : 14.0f;
+    txt.fgRgba = fgRgba;
+    txt.wrap = wrap;
+    txt.align = align;
+    txt.trim = trim;
     MarkAncestorsDirty(id, VisualDirty_All);
     return true;
 }
@@ -694,12 +806,130 @@ bool VisualWorld::SetTextMetrics(
     std::int32_t decorations) noexcept {
     VisualNode* node = GetNode(id);
     if (!node) return false;
-    node->text.lineHeight = lineHeight;
-    node->text.charSpacing = charSpacing;
-    node->text.maxLines = maxLines;
-    node->text.decorations = decorations;
+    auto& txt = node->EnsureExtras().text;
+    txt.lineHeight = lineHeight;
+    txt.charSpacing = charSpacing;
+    txt.maxLines = maxLines;
+    txt.decorations = decorations;
     MarkAncestorsDirty(id, VisualDirty_All);
     return true;
+}
+
+bool VisualWorld::SetTextStyle(
+    VisualNodeId id,
+    int fontWeight,
+    bool fontItalic,
+    std::int32_t fgGradId) noexcept {
+    VisualNode* node = GetNode(id);
+    if (!node) return false;
+    auto& txt = node->EnsureExtras().text;
+    txt.fontWeight = (fontWeight > 0) ? fontWeight : 400;
+    txt.fontItalic = fontItalic;
+    txt.fgGradId = fgGradId;
+    MarkAncestorsDirty(id, VisualDirty_All);
+    return true;
+}
+
+bool VisualWorld::SetTextBrushOpacity(VisualNodeId id, float fgOpacity) noexcept {
+    VisualNode* node = GetNode(id);
+    if (!node) return false;
+    node->EnsureExtras().text.fgOpacity = std::clamp(fgOpacity, 0.0f, 1.0f);
+    MarkDirty(id, VisualDirty_Visual);
+    return true;
+}
+
+bool VisualWorld::ClearTextSpans(VisualNodeId id) noexcept {
+    VisualNode* node = GetNode(id);
+    if (!node) return false;
+    if (node->HasExtras() && !node->Text().richSpans.empty()) {
+        node->EnsureExtras().text.richSpans.clear();
+        MarkAncestorsDirty(id, VisualDirty_All);
+    }
+    return true;
+}
+
+bool VisualWorld::AddTextSpan(
+    VisualNodeId id,
+    std::string_view text,
+    std::string_view fontFamily,
+    float fontSize,
+    int fontWeight,
+    std::int8_t fontItalic,
+    std::uint32_t fgRgba,
+    bool hasFg,
+    std::int32_t decorations) {
+    VisualNode* node = GetNode(id);
+    if (!node) return false;
+    VisualTextSpan span{};
+    span.text.assign(text);
+    span.fontFamily.assign(fontFamily);
+    span.fontSize = fontSize;
+    span.fontWeight = fontWeight;
+    span.fontItalic = fontItalic;
+    span.fgRgba = fgRgba;
+    span.hasFg = hasFg;
+    span.decorations = decorations;
+    node->EnsureExtras().text.richSpans.push_back(std::move(span));
+    MarkAncestorsDirty(id, VisualDirty_All);
+    return true;
+}
+
+TextLayoutResult VisualWorld::LayoutTextNode(const VisualNode& node, float maxWidth) const {
+    const VisualTextData& txt = node.Text();
+    UIResourceStore* store = const_cast<VisualWorld*>(this)->ResourceStore();
+    if (!store) {
+        TextLayoutResult fallback{};
+        const float safeFont = (txt.fontSize > 1.0f) ? txt.fontSize : 14.0f;
+        fallback.totalWidth = static_cast<float>(txt.text.size()) * safeFont * 0.6f;
+        fallback.totalHeight = safeFont * 1.25f;
+        return fallback;
+    }
+    if (!txt.richSpans.empty()) {
+        std::vector<RichTextRunInput> runs;
+        runs.reserve(txt.richSpans.size());
+        for (const VisualTextSpan& sp : txt.richSpans) {
+            RichTextRunInput r{};
+            r.text = sp.text;
+            r.fontFamily = sp.fontFamily;
+            r.fontSize = sp.fontSize;
+            r.fontWeight = sp.fontWeight;
+            r.fontItalic = sp.fontItalic;
+            r.fgRgba = sp.fgRgba;
+            r.hasFg = sp.hasFg;
+            r.decorations = sp.decorations;
+            runs.push_back(r);
+        }
+        return store->Fonts().MeasureRichLayout(
+            runs,
+            txt.fontFamily,
+            txt.fontSize,
+            txt.fontWeight,
+            txt.fontItalic,
+            maxWidth,
+            txt.wrap,
+            txt.charSpacing,
+            txt.lineHeight);
+    }
+    return store->Fonts().MeasureLayout(
+        txt.text,
+        txt.fontFamily,
+        txt.fontSize,
+        maxWidth,
+        txt.wrap,
+        txt.charSpacing,
+        txt.fontWeight,
+        txt.fontItalic,
+        txt.lineHeight);
+}
+
+Size VisualWorld::MeasureTextNode(const VisualNode& node, float maxWidth) const {
+    const VisualTextData& txt = node.Text();
+    if (txt.text.empty() && txt.richSpans.empty()) {
+        const float safeFont = std::max(1.0f, txt.fontSize);
+        return Size{0.0f, (txt.lineHeight > 0.0f) ? std::max(safeFont * 1.25f, txt.lineHeight) : (safeFont * 1.25f)};
+    }
+    const TextLayoutResult res = LayoutTextNode(node, maxWidth);
+    return Size{res.totalWidth, res.totalHeight};
 }
 
 bool VisualWorld::SetTextSelection(
@@ -712,12 +942,13 @@ bool VisualWorld::SetTextSelection(
     std::uint32_t caretRgba) noexcept {
     VisualNode* node = GetNode(id);
     if (!node) return false;
-    node->text.selStartCp = selStartCp;
-    node->text.selLenCp = selLenCp;
-    node->text.caretCp = caretCp;
-    node->text.showCaret = showCaret;
-    node->text.selRgba = selRgba;
-    node->text.caretRgba = caretRgba;
+    auto& txt = node->EnsureExtras().text;
+    txt.selStartCp = selStartCp;
+    txt.selLenCp = selLenCp;
+    txt.caretCp = caretCp;
+    txt.showCaret = showCaret;
+    txt.selRgba = selRgba;
+    txt.caretRgba = caretRgba;
     MarkDirty(id, VisualDirty_Visual);
     return true;
 }
@@ -744,23 +975,17 @@ Size VisualWorld::MeasureText(
 
 std::int32_t VisualWorld::HitTestTextCodePoint(VisualNodeId id, float localX, float localY) const noexcept {
     const VisualNode* node = GetNode(id);
-    if (!node || node->text.text.empty()) {
+    if (!node) {
         return 0;
     }
-    UIResourceStore* store = const_cast<VisualWorld*>(this)->ResourceStore();
-    if (!store) {
+    const VisualTextData& txt = node->Text();
+    if (txt.text.empty() && txt.richSpans.empty()) {
         return 0;
     }
-    const float maxW = (node->text.wrap == TextWrapping::NoWrap)
+    const float maxW = (txt.wrap == TextWrapping::NoWrap)
         ? 1000000.0f
         : std::max(1.0f, node->layout.layoutRect.width);
-    const TextLayoutResult layout = store->Fonts().MeasureLayout(
-        node->text.text,
-        node->text.fontFamily,
-        node->text.fontSize,
-        maxW,
-        node->text.wrap,
-        node->text.charSpacing);
+    const TextLayoutResult layout = LayoutTextNode(*node, maxW);
     if (layout.lines.empty() || layout.glyphs.empty()) {
         return 0;
     }
@@ -779,9 +1004,9 @@ std::int32_t VisualWorld::HitTestTextCodePoint(VisualNodeId id, float localX, fl
 
     float alignDx = 0.0f;
     const float boxW = std::max(0.0f, node->layout.layoutRect.width);
-    if (node->text.align == TextAlignment::Center) {
+    if (txt.align == TextAlignment::Center) {
         alignDx = std::max(0.0f, (boxW - chosenLine->width) * 0.5f);
-    } else if (node->text.align == TextAlignment::Right) {
+    } else if (txt.align == TextAlignment::Right) {
         alignDx = std::max(0.0f, boxW - chosenLine->width);
     }
 
@@ -808,10 +1033,11 @@ bool VisualWorld::SetImage(
     std::uint32_t tintRgba) {
     VisualNode* node = GetNode(id);
     if (!node) return false;
-    node->image.uri.assign(uri);
-    node->image.stretch = stretch;
-    node->image.stretchDir = stretchDir;
-    node->image.tintRgba = tintRgba;
+    auto& img = node->EnsureExtras().image;
+    img.uri.assign(uri);
+    img.stretch = stretch;
+    img.stretchDir = stretchDir;
+    img.tintRgba = tintRgba;
     MarkAncestorsDirty(id, VisualDirty_All);
     return true;
 }
@@ -824,10 +1050,11 @@ bool VisualWorld::SetImageViewbox(
     float vh) noexcept {
     VisualNode* node = GetNode(id);
     if (!node) return false;
-    node->image.viewboxX = std::isfinite(vx) ? vx : 0.0f;
-    node->image.viewboxY = std::isfinite(vy) ? vy : 0.0f;
-    node->image.viewboxW = std::isfinite(vw) ? vw : 1.0f;
-    node->image.viewboxH = std::isfinite(vh) ? vh : 1.0f;
+    auto& img = node->EnsureExtras().image;
+    img.viewboxX = std::isfinite(vx) ? vx : 0.0f;
+    img.viewboxY = std::isfinite(vy) ? vy : 0.0f;
+    img.viewboxW = std::isfinite(vw) ? vw : 1.0f;
+    img.viewboxH = std::isfinite(vh) ? vh : 1.0f;
     MarkDirty(id, VisualDirty_Visual);
     return true;
 }
@@ -846,24 +1073,25 @@ bool VisualWorld::SetVectorShape(
     float trimEnd) {
     VisualNode* node = GetNode(id);
     if (!node) return false;
-    node->vector.shapeKind = shapeKind;
-    node->vector.pathOrParams.assign(pathOrParams);
-    node->vector.fillRgba = fillRgba;
-    if (!node->vector.ownsMutableFillGrad || node->vector.baseFillGradId != fillGradId) {
-        node->vector.fillGradId = fillGradId;
-        node->vector.baseFillGradId = fillGradId;
-        node->vector.ownsMutableFillGrad = false;
+    auto& vec = node->EnsureExtras().vector;
+    vec.shapeKind = shapeKind;
+    vec.pathOrParams.assign(pathOrParams);
+    vec.fillRgba = fillRgba;
+    if (!vec.ownsMutableFillGrad || vec.baseFillGradId != fillGradId) {
+        vec.fillGradId = fillGradId;
+        vec.baseFillGradId = fillGradId;
+        vec.ownsMutableFillGrad = false;
     }
-    node->vector.strokeRgba = strokeRgba;
-    if (!node->vector.ownsMutableStrokeGrad || node->vector.baseStrokeGradId != strokeGradId) {
-        node->vector.strokeGradId = strokeGradId;
-        node->vector.baseStrokeGradId = strokeGradId;
-        node->vector.ownsMutableStrokeGrad = false;
+    vec.strokeRgba = strokeRgba;
+    if (!vec.ownsMutableStrokeGrad || vec.baseStrokeGradId != strokeGradId) {
+        vec.strokeGradId = strokeGradId;
+        vec.baseStrokeGradId = strokeGradId;
+        vec.ownsMutableStrokeGrad = false;
     }
-    node->vector.strokeWidth = strokeWidth;
-    node->vector.stretch = stretch;
-    node->vector.trimStart = trimStart;
-    node->vector.trimEnd = trimEnd;
+    vec.strokeWidth = strokeWidth;
+    vec.stretch = stretch;
+    vec.trimStart = trimStart;
+    vec.trimEnd = trimEnd;
     MarkAncestorsDirty(id, VisualDirty_All);
     return true;
 }
@@ -871,8 +1099,9 @@ bool VisualWorld::SetVectorShape(
 bool VisualWorld::SetVectorBrushOpacity(VisualNodeId id, float fillOpacity, float strokeOpacity) noexcept {
     VisualNode* node = GetNode(id);
     if (!node) return false;
-    node->vector.fillOpacity = std::clamp(fillOpacity, 0.0f, 1.0f);
-    node->vector.strokeOpacity = std::clamp(strokeOpacity, 0.0f, 1.0f);
+    auto& vec = node->EnsureExtras().vector;
+    vec.fillOpacity = std::clamp(fillOpacity, 0.0f, 1.0f);
+    vec.strokeOpacity = std::clamp(strokeOpacity, 0.0f, 1.0f);
     MarkDirty(id, VisualDirty_Visual);
     return true;
 }
@@ -993,23 +1222,27 @@ std::size_t VisualWorld::FlushTrackB() {
                 MarkDirty(binding.targetNode, VisualDirty_Visual);
                 break;
             case VisualAnimProp::PathTrimStart:
-                node->vector.trimStart = std::clamp(v, 0.0f, 1.0f);
+                node->EnsureExtras().vector.trimStart = std::clamp(v, 0.0f, 1.0f);
                 MarkDirty(binding.targetNode, VisualDirty_Visual);
                 break;
             case VisualAnimProp::PathTrimEnd:
-                node->vector.trimEnd = std::clamp(v, 0.0f, 1.0f);
+                node->EnsureExtras().vector.trimEnd = std::clamp(v, 0.0f, 1.0f);
                 MarkDirty(binding.targetNode, VisualDirty_Visual);
                 break;
             case VisualAnimProp::EffectRadius:
-                node->effect.radius = std::max(0.0f, v);
+                node->EnsureExtras().effect.radius = std::max(0.0f, v);
                 MarkDirty(binding.targetNode, VisualDirty_Visual);
                 break;
             case VisualAnimProp::EffectOpacity:
-                node->effect.opacity = std::clamp(v, 0.0f, 1.0f);
+                node->EnsureExtras().effect.opacity = std::clamp(v, 0.0f, 1.0f);
                 MarkDirty(binding.targetNode, VisualDirty_Visual);
                 break;
             case VisualAnimProp::BrushOpacity:
                 node->box.bgOpacity = std::clamp(v, 0.0f, 1.0f);
+                MarkDirty(binding.targetNode, VisualDirty_Visual);
+                break;
+            case VisualAnimProp::FgBrushOpacity:
+                node->EnsureExtras().text.fgOpacity = std::clamp(v, 0.0f, 1.0f);
                 MarkDirty(binding.targetNode, VisualDirty_Visual);
                 break;
             default:
@@ -1024,18 +1257,36 @@ std::size_t VisualWorld::FlushTrackB() {
 
 void VisualWorld::MarkDirty(VisualNodeId id, VisualDirtyFlags flags) noexcept {
     if (VisualNode* node = GetNode(id)) {
-        node->dirtyFlags = static_cast<std::uint8_t>(node->dirtyFlags | flags);
+        const std::uint8_t prev = node->dirtyFlags;
+        node->dirtyFlags = static_cast<std::uint8_t>(prev | flags);
+        if ((flags & (VisualDirty_Structure | VisualDirty_Layout)) != 0u) {
+            structureDirty_ = true;
+            ++structureVersion_;
+        } else if (!structureDirty_ && prev == VisualDirty_Clean) {
+            dirtyNodes_.push_back(id);
+        }
         anyDirty_ = true;
     }
 }
 
 void VisualWorld::ClearDirtyFlags() noexcept {
-    for (auto& node : nodes_) {
-        if (node.alive) {
-            node.dirtyFlags = VisualDirty_Clean;
-            node.drawDirty = false;
+    if (!structureDirty_ && !dirtyNodes_.empty() && dirtyNodes_.size() * 2u < nodes_.size()) {
+        for (VisualNodeId id : dirtyNodes_) {
+            if (VisualNode* node = GetNode(id)) {
+                node->dirtyFlags = VisualDirty_Clean;
+                node->drawDirty = false;
+            }
+        }
+    } else {
+        for (auto& node : nodes_) {
+            if (node.alive) {
+                node.dirtyFlags = VisualDirty_Clean;
+                node.drawDirty = false;
+            }
         }
     }
+    dirtyNodes_.clear();
+    structureDirty_ = false;
     anyDirty_ = false;
 }
 
@@ -1070,6 +1321,9 @@ void VisualWorld::Clear() noexcept {
     lastLaidOutRoot_ = VisualNodeId{};
     rootId_ = VisualNodeId{};
     liveCount_ = 0u;
+    dirtyNodes_.clear();
+    structureDirty_ = true;
+    ++structureVersion_;
     anyDirty_ = false;
 }
 
@@ -1107,6 +1361,8 @@ void VisualWorld::MarkAncestorsDirty(VisualNodeId id, VisualDirtyFlags flags) no
         node->dirtyFlags = static_cast<std::uint8_t>(node->dirtyFlags | flags);
         cur = node->parent;
     }
+    structureDirty_ = true;
+    ++structureVersion_;
     anyDirty_ = true;
 }
 
@@ -1152,15 +1408,27 @@ bool VisualWorld::WouldCreateCycle(VisualNodeId parentId, VisualNodeId childId) 
     return false;
 }
 
-void VisualWorld::RefreshSubtreeDepths(VisualNodeId id, std::uint8_t depth) noexcept {
-    VisualNode* node = GetNode(id);
-    if (!node) {
-        return;
-    }
-    node->layout.treeDepth = depth;
-    const std::uint8_t nextDepth = (depth < 63u) ? static_cast<std::uint8_t>(depth + 1u) : 63u;
-    for (VisualNodeId childId : node->children) {
-        RefreshSubtreeDepths(childId, nextDepth);
+void VisualWorld::RefreshSubtreeDepths(VisualNodeId id, std::uint16_t depth) noexcept {
+    try {
+        std::vector<std::pair<VisualNodeId, std::uint16_t>> stack;
+        stack.reserve(64u);
+        stack.emplace_back(id, depth);
+        while (!stack.empty()) {
+            const auto [curId, curDepth] = stack.back();
+            stack.pop_back();
+            VisualNode* node = GetNode(curId);
+            if (!node) {
+                continue;
+            }
+            node->layout.treeDepth = curDepth;
+            const std::uint16_t nextDepth = (curDepth < std::numeric_limits<std::uint16_t>::max())
+                ? static_cast<std::uint16_t>(curDepth + 1u)
+                : std::numeric_limits<std::uint16_t>::max();
+            for (VisualNodeId childId : node->children) {
+                stack.emplace_back(childId, nextDepth);
+            }
+        }
+    } catch (...) {
     }
 }
 

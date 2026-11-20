@@ -13,6 +13,7 @@ constexpr std::string_view kUberVertexShaderBodyGlsl = R"(layout(location = 0) i
 layout(location = 1) in vec2 a_TexCoord;   // float u, v or SDF local coords (offset 8, 8B)
 layout(location = 2) in uint a_PackedRgba; // uint32_t rgba (offset 16, 4B)
 layout(location = 3) in uint a_PrimFlags;  // low 16b: primType|sdfExtra, high 16b: flags (offset 20, 4B)
+layout(location = 4) in float a_ClipW;     // optional sidecar homogeneous W (<=0 -> 1.0)
 
 uniform vec2 u_ViewportSize;
 
@@ -26,7 +27,8 @@ flat out vec2 v_QuadHalfSize;
 void main() {
     vec2 ndc = (a_Position / max(u_ViewportSize, vec2(1.0))) * 2.0 - 1.0;
     ndc.y = -ndc.y;
-    gl_Position = vec4(ndc, 0.0, 1.0);
+    float clipW = (a_ClipW > 1e-4) ? a_ClipW : 1.0;
+    gl_Position = vec4(ndc * clipW, 0.0, clipW);
     int qCorner = gl_VertexID & 3;
     v_QuadNormUv = vec2((qCorner == 1 || qCorner == 2) ? 1.0 : 0.0, (qCorner >= 2) ? 1.0 : 0.0);
     v_UvOrLocalPos = a_TexCoord;
@@ -418,6 +420,7 @@ struct VertexIn {
     @location(1) uvOrLocal : vec2<f32>,
     @location(2) packedRgba : u32,
     @location(3) primFlags : u32,
+    @location(4) clipW : f32,
 };
 
 struct VertexOut {
@@ -551,7 +554,8 @@ fn vs_main(in : VertexIn) -> VertexOut {
     let vp = max(u_Globals.viewportSize, vec2<f32>(1.0, 1.0));
     var ndc = (in.position / vp) * 2.0 - vec2<f32>(1.0, 1.0);
     ndc.y = -ndc.y;
-    out.clipPos = vec4<f32>(ndc, 0.0, 1.0);
+    let clipW = select(1.0, in.clipW, in.clipW > 1e-4);
+    out.clipPos = vec4<f32>(ndc * clipW, 0.0, clipW);
     let qCorner = in.vertexIndex & 3u;
     out.quadNormUv = vec2<f32>(
         select(0.0, 1.0, qCorner == 1u || qCorner == 2u),
@@ -815,7 +819,9 @@ ZeroCopyGpuStream::ZeroCopyGpuStream(ShaderBackend backend, std::size_t maxPages
     : maxPagesInRing_(std::max<std::size_t>(16u, maxPagesInRing)) {
     const std::size_t pageVertexBytes = kVerticesPerCommandPage * sizeof(AeroVertex);
     ringCapacityBytes_ = maxPagesInRing_ * pageVertexBytes;
+    clipWRingCapacityBytes_ = maxPagesInRing_ * kVerticesPerCommandPage * sizeof(float);
     mappedRingBase_ = nullptr;
+    mappedClipWRingBase_ = nullptr;
     prevUploadedBytes_.assign(maxPagesInRing_, pageVertexBytes);
     subDataSpans_.reserve(maxPagesInRing_);
     clipDrawBatches_.reserve(16u);
@@ -856,6 +862,17 @@ void ZeroCopyGpuStream::BindExternalMappedRing(void* mappedPtr, std::size_t capa
     }
 }
 
+void ZeroCopyGpuStream::BindExternalMappedClipWRing(void* mappedPtr, std::size_t capacityBytes) noexcept {
+    constexpr std::size_t kPageClipWBytes = kVerticesPerCommandPage * sizeof(float);
+    if (mappedPtr && capacityBytes >= kPageClipWBytes) {
+        mappedClipWRingBase_ = static_cast<float*>(mappedPtr);
+        clipWRingCapacityBytes_ = capacityBytes;
+    } else {
+        mappedClipWRingBase_ = ownedClipWRingStorage_.empty() ? nullptr : ownedClipWRingStorage_.data();
+        clipWRingCapacityBytes_ = ownedClipWRingStorage_.size() * sizeof(float);
+    }
+}
+
 ZeroCopySubmissionStats ZeroCopyGpuStream::SubmitDirtyPages(PagedRenderTree& tree) noexcept {
     ++frameCounter_;
     ZeroCopySubmissionStats stats{};
@@ -865,6 +882,7 @@ ZeroCopySubmissionStats ZeroCopyGpuStream::SubmitDirtyPages(PagedRenderTree& tre
 
     try {
         constexpr std::size_t kPageVertexBytes = kVerticesPerCommandPage * sizeof(AeroVertex);
+        constexpr std::size_t kPageClipWBytes = kVerticesPerCommandPage * sizeof(float);
         const auto* pagesPtr = tree.Pages().data();
         const std::size_t totalTreePages = tree.PageCount();
 
@@ -887,6 +905,18 @@ ZeroCopySubmissionStats ZeroCopyGpuStream::SubmitDirtyPages(PagedRenderTree& tre
             fullRingReupload = true;
         } else if (prevUploadedBytes_.size() < maxPagesInRing_) {
             prevUploadedBytes_.resize(maxPagesInRing_, kPageVertexBytes);
+        }
+
+        const bool usingOwnedClipWRing =
+            (mappedClipWRingBase_ == nullptr) ||
+            (!ownedClipWRingStorage_.empty() && mappedClipWRingBase_ == ownedClipWRingStorage_.data());
+        const std::size_t requiredClipWFloats = std::max<std::size_t>(16u, maxPagesInRing_) * kVerticesPerCommandPage;
+        if (usingOwnedClipWRing && totalTreePages > 0u &&
+            (ownedClipWRingStorage_.empty() || ownedClipWRingStorage_.size() < requiredClipWFloats)) {
+            ownedClipWRingStorage_.assign(requiredClipWFloats, 1.0f);
+            mappedClipWRingBase_ = ownedClipWRingStorage_.data();
+            clipWRingCapacityBytes_ = ownedClipWRingStorage_.size() * sizeof(float);
+            fullRingReupload = true;
         }
 
         const auto& dirtyIndices = tree.DirtyPageIndices();
@@ -930,6 +960,9 @@ ZeroCopySubmissionStats ZeroCopyGpuStream::SubmitDirtyPages(PagedRenderTree& tre
                 }
             }
 
+            const std::size_t prevVerts = (slotIdx < prevUploadedBytes_.size())
+                ? (prevUploadedBytes_[slotIdx] / sizeof(AeroVertex))
+                : 0u;
             const std::size_t uploadBytes = hasRingSlot
                 ? std::max(activeBytes, prevUploadedBytes_[slotIdx])
                 : activeBytes;
@@ -940,11 +973,42 @@ ZeroCopySubmissionStats ZeroCopyGpuStream::SubmitDirtyPages(PagedRenderTree& tre
                 prevUploadedBytes_[slotIdx] = activeBytes;
             }
 
+            const std::size_t clipWByteOffset = slotIdx * kPageClipWBytes;
+            const std::size_t activeClipWBytes = activeVerts * sizeof(float);
+            const float* srcClipW = tree.PageVertexClipW(pageIdx);
+            const bool hasClipWRingSlot =
+                mappedClipWRingBase_ != nullptr &&
+                (clipWByteOffset + kPageClipWBytes <= clipWRingCapacityBytes_);
+
+            if (hasClipWRingSlot) {
+                float* dstClipW = mappedClipWRingBase_ + slotIdx * kVerticesPerCommandPage;
+                if (activeVerts > 0u) {
+                    if (srcClipW != nullptr) {
+                        std::memcpy(dstClipW, srcClipW, activeClipWBytes);
+                    } else {
+                        std::fill_n(dstClipW, activeVerts, 1.0f);
+                    }
+                }
+                if (activeVerts < kVerticesPerCommandPage) {
+                    std::fill(dstClipW + activeVerts, dstClipW + kVerticesPerCommandPage, 1.0f);
+                }
+            }
+
+            const std::size_t uploadClipWBytes = hasClipWRingSlot
+                ? std::max(activeVerts, prevVerts) * sizeof(float)
+                : activeClipWBytes;
+            const float* uploadClipWSrcPtr = hasClipWRingSlot
+                ? static_cast<const float*>(mappedClipWRingBase_ + slotIdx * kVerticesPerCommandPage)
+                : srcClipW;
+
             subDataSpans_.push_back(GlBufferSubDataSpan{
                 pageIdx,
                 byteOffset,
                 uploadBytes,
-                uploadSrcPtr});
+                uploadSrcPtr,
+                clipWByteOffset,
+                uploadClipWBytes,
+                uploadClipWSrcPtr});
 
             stats.dirtyPagesUploaded += 1u;
             stats.verticesStreamed += activeVerts;
@@ -1030,6 +1094,19 @@ const AeroVertex* ZeroCopyGpuStream::MappedPageVertices(std::size_t pageIndex) c
         return nullptr;
     }
     return reinterpret_cast<const AeroVertex*>(mappedRingBase_ + byteOffset);
+}
+
+const float* ZeroCopyGpuStream::MappedPageClipW(std::size_t pageIndex) const noexcept {
+    if (!mappedClipWRingBase_ || maxPagesInRing_ == 0) {
+        return nullptr;
+    }
+    constexpr std::size_t kPageClipWBytes = kVerticesPerCommandPage * sizeof(float);
+    const std::size_t slotIdx = pageIndex % maxPagesInRing_;
+    const std::size_t byteOffset = slotIdx * kPageClipWBytes;
+    if (byteOffset + kPageClipWBytes > clipWRingCapacityBytes_) {
+        return nullptr;
+    }
+    return mappedClipWRingBase_ + slotIdx * kVerticesPerCommandPage;
 }
 
 std::string_view ZeroCopyGpuStream::UberVertexShaderSource(ShaderBackend backend) noexcept {
