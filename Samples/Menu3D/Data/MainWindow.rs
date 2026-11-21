@@ -314,6 +314,7 @@ public class ViewModel : ViewModelBase
     public void OnExit()
     {
         this.Exited = true;
+        Application.Current().Shutdown();
     }
 
     public void OnStartCasual()

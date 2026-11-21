@@ -991,6 +991,7 @@ public class RangeBase : Control {
         _value = clamped;
         OnValueChanged(old, clamped);
         ValueChanged(this, new RoutedPropertyChangedEventArgs<float>(old, clamped, this));
+        BindingEngine.MarkFlushDirty();
         BindingEngine.NotifyTargetPropertyChanged(this, "Value", DependencyObject.BoxFloat(clamped));
         NotifyStateInvalidatedHooks();
     }
@@ -1368,8 +1369,44 @@ public class Slider : RangeBase {
 public class ProgressBar : RangeBase {
     private bool _isIndeterminate = false;
     private Orientation _orientation = Orientation.Horizontal;
-    private Border _track;
-    private Border _indicator;
+    private UIElement _trackPart;
+    private UIElement _indicatorPart;
+    private float _lastSyncedTrackSpan = -1.0f;
+    private static ProgressBar[] _liveBars;
+    private static bool _barSyncInstalled = false;
+
+    private static void RegisterProgressBar(ProgressBar bar) {
+        if (bar == null) { return; }
+        if (!_barSyncInstalled) {
+            _barSyncInstalled = true;
+            _liveBars = new ProgressBar[0];
+            BindingEngine.AddPostFlushHook(() => { ProgressBar.SyncAllProgressBars(); });
+            BindingEngine.AddFrameTickHook((float dt) => { ProgressBar.SyncAllProgressBars(); });
+            UIElement.RegisterDisposeHook(() => { ProgressBar.CleanupDisposedBars(); });
+        }
+        for (int i = 0; i < _liveBars.Length; i += 1) {
+            if (_liveBars[i] == bar) { return; }
+        }
+        _liveBars.Push(bar);
+    }
+
+    internal static void CleanupDisposedBars() {
+        if (_liveBars == null) { return; }
+        for (int i = _liveBars.Length - 1; i >= 0; i -= 1) {
+            if (_liveBars[i] == null || _liveBars[i]._isDisposedTree) {
+                _liveBars.RemoveAt(i);
+            }
+        }
+    }
+
+    public static void SyncAllProgressBars() {
+        if (_liveBars == null) { return; }
+        for (int i = 0; i < _liveBars.Length; i += 1) {
+            ProgressBar pb = _liveBars[i];
+            if (pb == null || pb._isDisposedTree) { continue; }
+            pb.SyncTrackResizeIfNeeded();
+        }
+    }
 
     public ProgressBar() : base() {
         Height = 10.0f;
@@ -1377,6 +1414,7 @@ public class ProgressBar : RangeBase {
         Foreground = new SolidColorBrush("#FF3B82F6");
         Background = new SolidColorBrush("#FF1B202B");
         CornerRadius = new CornerRadius(5.0f);
+        RegisterProgressBar(this);
     }
 
     public override string GetTypeName() { return "ProgressBar"; }
@@ -1390,38 +1428,77 @@ public class ProgressBar : RangeBase {
         set { _orientation = value; OnRangeUpdated(); }
     }
 
+    private float ResolveTrackWidth() {
+        if (_trackPart != null && _trackPart.ActualWidth > 1.0f) { return _trackPart.ActualWidth; }
+        if (ActualWidth > 1.0f) { return ActualWidth; }
+        return ParseUtil.IsFinite(Width) ? Width : 200.0f;
+    }
+
+    private float ResolveTrackHeight() {
+        if (_trackPart != null && _trackPart.ActualHeight > 1.0f) { return _trackPart.ActualHeight; }
+        if (ActualHeight > 1.0f) { return ActualHeight; }
+        return ParseUtil.IsFinite(Height) ? Height : 10.0f;
+    }
+
+    private void SyncTrackResizeIfNeeded() {
+        if (_indicatorPart == null) { return; }
+        bool useHorizontalTrack = (Template != null || _orientation == Orientation.Horizontal);
+        float span = useHorizontalTrack ? ResolveTrackWidth() : ResolveTrackHeight();
+        if (Math.Absf(span - _lastSyncedTrackSpan) > 0.25f) {
+            OnRangeUpdated();
+        }
+    }
+
+    public override void OnApplyTemplate() {
+        base.OnApplyTemplate();
+        if (Template == null) { return; }
+        _trackPart = GetTemplateChild("PART_Track");
+        _indicatorPart = GetTemplateChild("PART_Indicator");
+        _lastSyncedTrackSpan = -1.0f;
+        OnRangeUpdated();
+    }
+
     protected override void OnRangeUpdated() {
-        if (_indicator == null) { return; }
-        _indicator.Background = Foreground;
-        float w = ActualWidth > 1.0f ? ActualWidth : (ParseUtil.IsFinite(Width) ? Width : 200.0f);
-        float h = ActualHeight > 1.0f ? ActualHeight : (ParseUtil.IsFinite(Height) ? Height : 10.0f);
+        if (_indicatorPart == null) { return; }
+        if (Template == null) {
+            _indicatorPart.Background = Foreground;
+        }
+        float w = ResolveTrackWidth();
+        float h = ResolveTrackHeight();
+        bool useHorizontalTrack = (Template != null || _orientation == Orientation.Horizontal);
+        _lastSyncedTrackSpan = useHorizontalTrack ? w : h;
         float frac = _isIndeterminate ? 0.35f : NormalizedFraction();
-        if (_orientation == Orientation.Horizontal) {
-            _indicator.Width = w * frac;
-            _indicator.Height = h;
+        if (useHorizontalTrack) {
+            _indicatorPart.HorizontalAlignment = HorizontalAlignment.Left;
+            _indicatorPart.Width = w * frac;
+            if (Template == null) { _indicatorPart.Height = h; }
         } else {
-            _indicator.Width = w;
-            _indicator.Height = h * frac;
+            _indicatorPart.VerticalAlignment = VerticalAlignment.Bottom;
+            _indicatorPart.Width = w;
+            _indicatorPart.Height = h * frac;
         }
     }
 
     protected override UIElement CreateDefaultTemplate() {
-        _track = new Border();
-        _track.Background = Background;
-        _track.CornerRadius = CornerRadius;
-        _track.ClipToBounds = true;
-        _track.HorizontalAlignment = HorizontalAlignment.Stretch;
-        _track.VerticalAlignment = VerticalAlignment.Stretch;
+        var track = new Border();
+        track.Background = Background;
+        track.CornerRadius = CornerRadius;
+        track.ClipToBounds = true;
+        track.HorizontalAlignment = HorizontalAlignment.Stretch;
+        track.VerticalAlignment = VerticalAlignment.Stretch;
 
-        _indicator = new Border();
-        _indicator.Name = "PART_Indicator";
-        _indicator.Background = Foreground;
-        _indicator.CornerRadius = CornerRadius;
-        _indicator.HorizontalAlignment = HorizontalAlignment.Left;
-        _track.Child = _indicator;
+        var indicator = new Border();
+        indicator.Name = "PART_Indicator";
+        indicator.Background = Foreground;
+        indicator.CornerRadius = CornerRadius;
+        indicator.HorizontalAlignment = HorizontalAlignment.Left;
+        track.Child = indicator;
 
+        _trackPart = track;
+        _indicatorPart = indicator;
+        _lastSyncedTrackSpan = -1.0f;
         OnRangeUpdated();
-        return _track;
+        return track;
     }
 }
 

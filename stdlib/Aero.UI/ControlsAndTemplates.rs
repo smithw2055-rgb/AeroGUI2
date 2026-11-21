@@ -440,7 +440,7 @@ public class Control : FrameworkElement {
         if (propName == "FontSize") { FontSize = DependencyObject.UnboxFloat(value, 14.0f); return true; }
         if (propName == "FontWeight") { FontWeight = DependencyObject.UnboxString(value, "Normal"); return true; }
         if (propName == "FontStyle") { FontStyle = DependencyObject.UnboxString(value, "Normal"); return true; }
-        if (propName == "IsTabStop") { IsTabStop = DependencyObject.UnboxBool(value, true); return true; }
+        if (propName == "IsTabStop" || propName == "KeyboardNavigation.IsTabStop") { IsTabStop = DependencyObject.UnboxBool(value, true); return true; }
         if (propName == "Template" && value is ControlTemplate) {
             Template = value as ControlTemplate;
             return true;
@@ -491,7 +491,7 @@ public class Control : FrameworkElement {
         if (propName == "FontWeight") { return DependencyObject.BoxString(_fontWeight); }
         if (propName == "HorizontalContentAlignment") { return DependencyObject.BoxInt(EnumConvert.ToInt(_hContentAlign)); }
         if (propName == "VerticalContentAlignment") { return DependencyObject.BoxInt(EnumConvert.ToInt(_vContentAlign)); }
-        if (propName == "IsTabStop") { return DependencyObject.BoxBool(_isTabStop); }
+        if (propName == "IsTabStop" || propName == "KeyboardNavigation.IsTabStop") { return DependencyObject.BoxBool(_isTabStop); }
         if (propName == "Template") { return _template; }
         return base.GetPropertyValue(propName);
     }
@@ -518,7 +518,7 @@ public class ContentPresenter : FrameworkElement {
     }
 
     public override string GetTypeName() { return "ContentPresenter"; }
-    public override bool IsNamescopeBoundary() { return true; }
+    public override bool IsNamescopeBoundary() { return _contentTemplate != null; }
     protected virtual bool IsScrollPresenter() { return false; }
 
     protected override bool IsSelfHitTestSolid() {
@@ -733,7 +733,7 @@ public class ContentPresenter : FrameworkElement {
             ContentTemplate = value as DataTemplate;
             return true;
         }
-        if (propName == "Foreground" || propName == "TextElement.Foreground") {
+        if (propName == "Foreground" || propName == "TextElement.Foreground" || propName == "Foreground.Color") {
             Foreground = UIElement.CoerceBrush(value);
             return true;
         }
@@ -755,6 +755,9 @@ public class ContentPresenter : FrameworkElement {
     public override DependencyObject GetPropertyValue(string propName) {
         if (propName == "Content") { return _contentBox; }
         if (propName == "Foreground" || propName == "TextElement.Foreground") { return _foreground; }
+        if (propName == "Foreground.Color") {
+            return DependencyObject.BoxString(_foreground != null ? ParseUtil.FormatArgbHex(_foreground.ResolveRgba()) : "#FFF1F5F9");
+        }
         if (propName == "FontFamily" || propName == "TextElement.FontFamily") { return DependencyObject.BoxString(_fontFamily); }
         if (propName == "FontSize" || propName == "TextElement.FontSize") { return DependencyObject.BoxFloat(_fontSize); }
         if (propName == "FontWeight" || propName == "TextElement.FontWeight") { return DependencyObject.BoxString(_fontWeight); }

@@ -209,8 +209,10 @@ void main() {
         if (sdfMode == 1u) {
             uint asymBt = (payload27 >> 26u) & 1u;
             float r = (asymBt == 0u) ? (float(payload27 & 0xFFu) * 0.5) : float(payload27 & 0x3Fu);
-            vec4 btVec = (asymBt == 0u)
-                ? vec4(float((payload27 >> 8u) & 0xFFu) * 0.5)
+            uint subBt16 = (payload27 >> 16u) & 0x3FFu;
+            float uniformBt = (subBt16 > 0u) ? (float(subBt16) * 0.0625) : (float((payload27 >> 8u) & 0xFFu) * 0.5);
+            vec4 rawBt = (asymBt == 0u)
+                ? vec4(uniformBt)
                 : vec4(
                     float((payload27 >>  6u) & 0x1Fu),
                     float((payload27 >> 11u) & 0x1Fu),
@@ -218,6 +220,19 @@ void main() {
                     float((payload27 >> 21u) & 0x1Fu));
             float dist = sdRoundedBox(v_UvOrLocalPos, halfSize, r);
             float aa = max(fwidth(dist) * 0.75, 1e-4);
+            float minHairline = max(aa * 2.0, 0.001);
+            float maxRaw = max(max(rawBt.x, rawBt.y), max(rawBt.z, rawBt.w));
+            bool isSubpixel = (maxRaw > 0.0 && maxRaw < minHairline);
+            vec4 btVec = isSubpixel
+                ? vec4(
+                    rawBt.x > 0.0 ? max(rawBt.x, minHairline) : 0.0,
+                    rawBt.y > 0.0 ? max(rawBt.y, minHairline) : 0.0,
+                    rawBt.z > 0.0 ? max(rawBt.z, minHairline) : 0.0,
+                    rawBt.w > 0.0 ? max(rawBt.w, minHairline) : 0.0)
+                : rawBt;
+            float hairlineScale = isSubpixel
+                ? clamp(0.65 + 0.35 * (maxRaw / minHairline), 0.65, 1.0)
+                : 1.0;
             float outerCoverage = smoothstep(aa, -aa, dist);
             vec2 innerCenter = vec2(0.5 * (btVec.x - btVec.z), 0.5 * (btVec.y - btVec.w));
             vec2 innerHalf = halfSize - vec2(0.5 * (btVec.x + btVec.z), 0.5 * (btVec.y + btVec.w));
@@ -231,7 +246,7 @@ void main() {
             float innerCoverage = (innerHalf.x > 0.0 && innerHalf.y > 0.0)
                 ? smoothstep(aa, -aa, sdRoundedBox4(v_UvOrLocalPos - innerCenter, innerHalf, innerRadii))
                 : 0.0;
-            float outA = v_Color.a * clamp(outerCoverage - innerCoverage, 0.0, 1.0);
+            float outA = v_Color.a * hairlineScale * clamp(outerCoverage - innerCoverage, 0.0, 1.0);
             o_FragColor = vec4(v_Color.rgb * outA, outA);
             return;
         }
@@ -610,8 +625,10 @@ fn fs_main(in : VertexOut) -> @location(0) vec4<f32> {
         if (sdfMode == 1u) {
             let asymBt = (payload27 >> 26u) & 1u;
             let r = select(f32(payload27 & 0xFFu) * 0.5, f32(payload27 & 0x3Fu), asymBt != 0u);
-            let btVec = select(
-                vec4<f32>(f32((payload27 >> 8u) & 0xFFu) * 0.5),
+            let subBt16 = (payload27 >> 16u) & 0x3FFu;
+            let uniformBt = select(f32((payload27 >> 8u) & 0xFFu) * 0.5, f32(subBt16) * 0.0625, subBt16 > 0u);
+            let rawBt = select(
+                vec4<f32>(uniformBt),
                 vec4<f32>(
                     f32((payload27 >>  6u) & 0x1Fu),
                     f32((payload27 >> 11u) & 0x1Fu),
@@ -620,6 +637,16 @@ fn fs_main(in : VertexOut) -> @location(0) vec4<f32> {
                 asymBt != 0u);
             let dist = sdRoundedBox(in.uvOrLocal, halfSize, r);
             let aa = max(fwidth(dist) * 0.75, 1e-4);
+            let minHairline = max(aa * 2.0, 0.001);
+            let maxRaw = max(max(rawBt.x, rawBt.y), max(rawBt.z, rawBt.w));
+            let isSubpixel = (maxRaw > 0.0 && maxRaw < minHairline);
+            let clampedBt = vec4<f32>(
+                select(0.0, max(rawBt.x, minHairline), rawBt.x > 0.0),
+                select(0.0, max(rawBt.y, minHairline), rawBt.y > 0.0),
+                select(0.0, max(rawBt.z, minHairline), rawBt.z > 0.0),
+                select(0.0, max(rawBt.w, minHairline), rawBt.w > 0.0));
+            let btVec = select(rawBt, clampedBt, isSubpixel);
+            let hairlineScale = select(1.0, clamp(0.65 + 0.35 * (maxRaw / minHairline), 0.65, 1.0), isSubpixel);
             let outerCov = smoothstep(aa, -aa, dist);
             let innerCenter = vec2<f32>(0.5 * (btVec.x - btVec.z), 0.5 * (btVec.y - btVec.w));
             let innerHalf = halfSize - vec2<f32>(0.5 * (btVec.x + btVec.z), 0.5 * (btVec.y + btVec.w));
@@ -634,7 +661,7 @@ fn fs_main(in : VertexOut) -> @location(0) vec4<f32> {
             if (innerHalf.x > 0.0 && innerHalf.y > 0.0) {
                 innerCov = smoothstep(aa, -aa, sdRoundedBox4(in.uvOrLocal - innerCenter, innerHalf, innerRadii));
             }
-            let outA = in.color.a * clamp(outerCov - innerCov, 0.0, 1.0);
+            let outA = in.color.a * hairlineScale * clamp(outerCov - innerCov, 0.0, 1.0);
             return vec4<f32>(in.color.rgb * outA, outA);
         }
         if (sdfMode == 2u) {

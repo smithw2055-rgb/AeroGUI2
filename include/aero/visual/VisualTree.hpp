@@ -261,6 +261,10 @@ struct VisualVectorData {
     Stretch stretch = Stretch::Uniform;
     float trimStart = 0.0f;
     float trimEnd = 1.0f;
+    std::vector<float> dashArray;
+    std::uint8_t dashCap = 0u;
+    std::uint8_t startLineCap = 0u;
+    std::uint8_t endLineCap = 0u;
 };
 
 struct VisualLayoutData {
@@ -306,6 +310,7 @@ struct VisualLayoutData {
 
     Size desiredSize{};
     Size untransformedDesiredBox{};
+    Size unclampedContentBox{};
     Rect layoutRect{};
     Size scrollExtent{};
     Matrix2D worldTransform{};
@@ -314,6 +319,7 @@ struct VisualLayoutData {
     bool hasPerspective3D = false;
     bool hasValidMeasure = false;
     bool hasValidArrange = false;
+    bool needsLayoutClip = false;
     bool lastMeasureInnerInfW = false;
     bool lastMeasureInnerInfH = false;
     Size lastMeasureConstraint{
@@ -653,6 +659,12 @@ public:
         float trimStart,
         float trimEnd);
     bool SetVectorBrushOpacity(VisualNodeId id, float fillOpacity, float strokeOpacity) noexcept;
+    bool SetVectorStrokeDash(
+        VisualNodeId id,
+        std::string_view dashSpec,
+        std::int32_t dashCap,
+        std::int32_t startCap,
+        std::int32_t endCap);
     bool InvalidateDraw(VisualNodeId id) noexcept;
 
     // Layout & ECS Track B

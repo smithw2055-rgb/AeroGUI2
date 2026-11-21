@@ -1153,6 +1153,45 @@ bool VisualWorld::SetVectorBrushOpacity(VisualNodeId id, float fillOpacity, floa
     return true;
 }
 
+bool VisualWorld::SetVectorStrokeDash(
+    VisualNodeId id,
+    std::string_view dashSpec,
+    std::int32_t dashCap,
+    std::int32_t startCap,
+    std::int32_t endCap) {
+    VisualNode* node = GetNode(id);
+    if (!node) return false;
+    auto& vec = node->EnsureExtras().vector;
+    vec.dashArray.clear();
+    std::size_t pos = 0u;
+    while (pos < dashSpec.size()) {
+        while (pos < dashSpec.size() &&
+               (dashSpec[pos] == ' ' || dashSpec[pos] == '\t' ||
+                dashSpec[pos] == ',' || dashSpec[pos] == '\r' || dashSpec[pos] == '\n')) {
+            ++pos;
+        }
+        if (pos >= dashSpec.size()) break;
+        std::size_t endPos = pos;
+        while (endPos < dashSpec.size() &&
+               dashSpec[endPos] != ' ' && dashSpec[endPos] != '\t' &&
+               dashSpec[endPos] != ',' && dashSpec[endPos] != '\r' && dashSpec[endPos] != '\n') {
+            ++endPos;
+        }
+        const std::string tok(dashSpec.substr(pos, endPos - pos));
+        char* parseEnd = nullptr;
+        const float v = std::strtof(tok.c_str(), &parseEnd);
+        if (parseEnd != tok.c_str() && std::isfinite(v) && v >= 0.0f) {
+            vec.dashArray.push_back(v);
+        }
+        pos = endPos;
+    }
+    vec.dashCap = static_cast<std::uint8_t>(std::clamp(dashCap, 0, 3));
+    vec.startLineCap = static_cast<std::uint8_t>(std::clamp(startCap, 0, 3));
+    vec.endLineCap = static_cast<std::uint8_t>(std::clamp(endCap, 0, 3));
+    MarkDirty(id, VisualDirty_Visual);
+    return true;
+}
+
 bool VisualWorld::InvalidateDraw(VisualNodeId id) noexcept {
     VisualNode* node = GetNode(id);
     if (!node) return false;

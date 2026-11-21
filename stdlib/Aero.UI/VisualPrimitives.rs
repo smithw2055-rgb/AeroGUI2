@@ -727,6 +727,42 @@ public class Shape : FrameworkElement {
         get { return _trimStart; }
         set { _trimStart = Math.Clampf(value, 0.0f, 1.0f); SyncVectorShape(); }
     }
+    private string _strokeDashArray = "";
+    private int _strokeDashCap = 0;
+    private int _strokeStartLineCap = 0;
+    private int _strokeEndLineCap = 0;
+
+    private static int ParseLineCapCode(string s) {
+        if (s == "Round" || s == "2") { return 2; }
+        if (s == "Square" || s == "1") { return 1; }
+        if (s == "Triangle" || s == "3") { return 3; }
+        return 0;
+    }
+
+    private static string FormatLineCapCode(int code) {
+        if (code == 1) { return "Square"; }
+        if (code == 2) { return "Round"; }
+        if (code == 3) { return "Triangle"; }
+        return "Flat";
+    }
+
+    public string StrokeDashArray {
+        get { return _strokeDashArray; }
+        set { _strokeDashArray = value == null ? "" : value; SyncVectorShape(); }
+    }
+    public string StrokeDashCap {
+        get { return FormatLineCapCode(_strokeDashCap); }
+        set { _strokeDashCap = ParseLineCapCode(value); SyncVectorShape(); }
+    }
+    public string StrokeStartLineCap {
+        get { return FormatLineCapCode(_strokeStartLineCap); }
+        set { _strokeStartLineCap = ParseLineCapCode(value); SyncVectorShape(); }
+    }
+    public string StrokeEndLineCap {
+        get { return FormatLineCapCode(_strokeEndLineCap); }
+        set { _strokeEndLineCap = ParseLineCapCode(value); SyncVectorShape(); }
+    }
+
     public float TrimEnd {
         get { return _trimEnd; }
         set { _trimEnd = Math.Clampf(value, 0.0f, 1.0f); SyncVectorShape(); }
@@ -776,6 +812,12 @@ public class Shape : FrameworkElement {
             _strokeThickness,
             EnumConvert.ToInt(_stretch),
             _trimStart, _trimEnd);
+        Visual_SetVectorStrokeDash(
+            __nativeHandle,
+            _strokeDashArray,
+            _strokeDashCap,
+            _strokeStartLineCap,
+            _strokeEndLineCap);
         SyncInteractiveFlags();
     }
 
@@ -859,6 +901,10 @@ public class Shape : FrameworkElement {
             }
         }
         if (propName == "StrokeThickness") { StrokeThickness = DependencyObject.UnboxFloat(value, 1.0f); return true; }
+        if (propName == "StrokeDashArray") { StrokeDashArray = DependencyObject.UnboxString(value, ""); return true; }
+        if (propName == "StrokeDashCap") { StrokeDashCap = DependencyObject.UnboxString(value, "Flat"); return true; }
+        if (propName == "StrokeStartLineCap") { StrokeStartLineCap = DependencyObject.UnboxString(value, "Flat"); return true; }
+        if (propName == "StrokeEndLineCap") { StrokeEndLineCap = DependencyObject.UnboxString(value, "Flat"); return true; }
         if (propName == "Stretch") {
             if (value is BoxedInt) { Stretch = EnumConvert.ToStretch((value as BoxedInt).Value); return true; }
             string st = DependencyObject.UnboxString(value, "Fill").Trim();

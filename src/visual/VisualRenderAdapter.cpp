@@ -124,181 +124,6 @@ constexpr float kDegToRad = kPi / 180.0f;
     return out;
 }
 
-// Lightweight SVG subpath polyline parser supporting M/L/H/V/Q/C/Z for trimmed stroke & open path rendering.
-struct ParsedSvgSubpaths {
-    std::vector<std::vector<Point>> subpaths;
-    bool hasCloseCommand = false;
-};
-
-[[nodiscard]] ParsedSvgSubpaths ParseSvgPolylines(std::string_view svg) {
-    ParsedSvgSubpaths res;
-    std::vector<Point> curSubpath;
-    Point curPt{0.0f, 0.0f};
-    Point startPt{0.0f, 0.0f};
-    Point lastCtrl{0.0f, 0.0f};
-    char lastCmd = 0;
-
-    const char* p = svg.data();
-    const char* end = svg.data() + svg.size();
-
-    auto skipSep = [&]() {
-        while (p < end && (std::isspace(static_cast<unsigned char>(*p)) || *p == ',')) {
-            ++p;
-        }
-    };
-    auto tryReadFloat = [&](float& outVal) -> bool {
-        skipSep();
-        if (p >= end) return false;
-        char* next = nullptr;
-        const float v = std::strtof(p, &next);
-        if (next == p) return false;
-        outVal = v;
-        p = next;
-        return true;
-    };
-    auto flushSubpath = [&]() {
-        if (curSubpath.size() >= 2u) {
-            res.subpaths.push_back(std::move(curSubpath));
-        }
-        curSubpath.clear();
-    };
-
-    char cmd = 0;
-    while (p < end) {
-        skipSep();
-        if (p >= end) break;
-        if (std::isalpha(static_cast<unsigned char>(*p))) {
-            cmd = *p++;
-        } else if (cmd == 0) {
-            ++p;
-            continue;
-        } else if (cmd == 'M') {
-            cmd = 'L';
-        } else if (cmd == 'm') {
-            cmd = 'l';
-        }
-
-        const bool rel = (cmd >= 'a' && cmd <= 'z');
-        const char upper = static_cast<char>(std::toupper(static_cast<unsigned char>(cmd)));
-
-        if (upper == 'Z') {
-            res.hasCloseCommand = true;
-            if (!curSubpath.empty() &&
-                (std::fabs(curPt.x - startPt.x) > 1e-4f || std::fabs(curPt.y - startPt.y) > 1e-4f)) {
-                curSubpath.push_back(startPt);
-            }
-            curPt = startPt;
-            flushSubpath();
-            lastCmd = upper;
-            cmd = 0;
-            continue;
-        }
-
-        if (upper == 'M') {
-            float x = 0.0f, y = 0.0f;
-            if (!tryReadFloat(x) || !tryReadFloat(y)) break;
-            if (rel) { x += curPt.x; y += curPt.y; }
-            flushSubpath();
-            curPt = Point{x, y};
-            startPt = curPt;
-            curSubpath.push_back(curPt);
-            lastCmd = 'M';
-            continue;
-        }
-
-        if (upper == 'L') {
-            float x = 0.0f, y = 0.0f;
-            if (!tryReadFloat(x) || !tryReadFloat(y)) break;
-            if (rel) { x += curPt.x; y += curPt.y; }
-            if (curSubpath.empty()) curSubpath.push_back(curPt);
-            curPt = Point{x, y};
-            curSubpath.push_back(curPt);
-            lastCmd = 'L';
-            continue;
-        }
-
-        if (upper == 'H') {
-            float x = 0.0f;
-            if (!tryReadFloat(x)) break;
-            if (rel) x += curPt.x;
-            if (curSubpath.empty()) curSubpath.push_back(curPt);
-            curPt.x = x;
-            curSubpath.push_back(curPt);
-            lastCmd = 'H';
-            continue;
-        }
-
-        if (upper == 'V') {
-            float y = 0.0f;
-            if (!tryReadFloat(y)) break;
-            if (rel) y += curPt.y;
-            if (curSubpath.empty()) curSubpath.push_back(curPt);
-            curPt.y = y;
-            curSubpath.push_back(curPt);
-            lastCmd = 'V';
-            continue;
-        }
-
-        if (upper == 'Q') {
-            float cx = 0.0f, cy = 0.0f, x = 0.0f, y = 0.0f;
-            if (!tryReadFloat(cx) || !tryReadFloat(cy) || !tryReadFloat(x) || !tryReadFloat(y)) break;
-            if (rel) { cx += curPt.x; cy += curPt.y; x += curPt.x; y += curPt.y; }
-            if (curSubpath.empty()) curSubpath.push_back(curPt);
-            const Point p0 = curPt;
-            constexpr int kSteps = 12;
-            for (int s = 1; s <= kSteps; ++s) {
-                const float t = static_cast<float>(s) / static_cast<float>(kSteps);
-                const float u = 1.0f - t;
-                curSubpath.push_back(Point{
-                    u * u * p0.x + 2.0f * u * t * cx + t * t * x,
-                    u * u * p0.y + 2.0f * u * t * cy + t * t * y});
-            }
-            lastCtrl = Point{cx, cy};
-            curPt = Point{x, y};
-            lastCmd = 'Q';
-            continue;
-        }
-
-        if (upper == 'C') {
-            float c1x = 0.0f, c1y = 0.0f, c2x = 0.0f, c2y = 0.0f, x = 0.0f, y = 0.0f;
-            if (!tryReadFloat(c1x) || !tryReadFloat(c1y) ||
-                !tryReadFloat(c2x) || !tryReadFloat(c2y) ||
-                !tryReadFloat(x) || !tryReadFloat(y)) break;
-            if (rel) {
-                c1x += curPt.x; c1y += curPt.y;
-                c2x += curPt.x; c2y += curPt.y;
-                x += curPt.x; y += curPt.y;
-            }
-            if (curSubpath.empty()) curSubpath.push_back(curPt);
-            const Point p0 = curPt;
-            constexpr int kSteps = 16;
-            for (int s = 1; s <= kSteps; ++s) {
-                const float t = static_cast<float>(s) / static_cast<float>(kSteps);
-                const float u = 1.0f - t;
-                const float u2 = u * u;
-                const float t2 = t * t;
-                curSubpath.push_back(Point{
-                    u2 * u * p0.x + 3.0f * u2 * t * c1x + 3.0f * u * t2 * c2x + t2 * t * x,
-                    u2 * u * p0.y + 3.0f * u2 * t * c1y + 3.0f * u * t2 * c2y + t2 * t * y});
-            }
-            lastCtrl = Point{c2x, c2y};
-            curPt = Point{x, y};
-            lastCmd = 'C';
-            continue;
-        }
-
-        // Unsupported SVG command: consume one number if present to advance safely.
-        float dummy = 0.0f;
-        if (!tryReadFloat(dummy)) {
-            cmd = 0;
-        }
-        (void)lastCmd;
-        (void)lastCtrl;
-    }
-    flushSubpath();
-    return res;
-}
-
 [[nodiscard]] std::vector<Point> TrimPolylineRange(
     const std::vector<Point>& pts,
     float trimStart01,
@@ -470,6 +295,156 @@ std::size_t VisualRenderAdapter::EmitLineSegment(
         return endNid - beginNid;
     }
 
+std::size_t VisualRenderAdapter::EmitStyledDashCapsule(
+    PagedRenderTree& tree,
+    Point a,
+    Point b,
+    float thickness,
+    std::uint8_t startCap,
+    std::uint8_t endCap,
+    const Color& color,
+    std::int32_t strokeGradId,
+    const void* owner,
+    const Matrix2D& world2D,
+    const Matrix4x4& world3D,
+    bool has3D,
+    BlendingMode blend) {
+    const ScopedBlendMode blendGuard(tree.activeBlendMode_, blend);
+    if (thickness <= 0.0f || color.a <= 0.001f) {
+        return 0u;
+    }
+    const float dx = b.x - a.x;
+    const float dy = b.y - a.y;
+    const float len = std::hypot(dx, dy);
+    const float r = thickness * 0.5f;
+    const float extS = (startCap == 1u || startCap == 2u) ? r : 0.0f;
+    const float extE = (endCap == 1u || endCap == 2u) ? r : 0.0f;
+    if (extS <= 0.0f && extE <= 0.0f && len <= 1e-4f) {
+        return 0u;
+    }
+    const float totalLen = std::max(0.5f, len + extS + extE);
+    const float rS = (startCap == 2u) ? r : 0.0f;
+    const float rE = (endCap == 2u) ? r : 0.0f;
+    const float angleDeg = (len > 1e-4f) ? (std::atan2(dy, dx) * kRadToDeg) : 0.0f;
+    const Matrix2D segRot = Matrix2D::Rotation(angleDeg).AroundPivot(a.x, a.y);
+    const Matrix2D comb2D = Matrix2D::Multiply(world2D, segRot);
+    const Matrix4x4 comb3D = has3D
+        ? Matrix4x4::Multiply(world3D, Matrix4x4::FromMatrix2D(segRot))
+        : Matrix4x4{};
+
+    const auto beginNid = static_cast<std::uint32_t>(tree.nodes_.size());
+    const std::uint32_t nid = tree.AllocateRoundedRectNode(
+        a.x - extS,
+        a.y - r,
+        totalLen,
+        thickness,
+        color,
+        CornerRadius{rS, rE, rE, rS},
+        owner);
+    AttachNodeGradientBrush(tree, nid, strokeGradId);
+    const auto endNid = static_cast<std::uint32_t>(tree.nodes_.size());
+    ApplyNodeTransform(tree, beginNid, endNid, comb2D, comb3D, has3D, blend);
+    return endNid - beginNid;
+}
+
+std::size_t VisualRenderAdapter::EmitDashedPolylinePoints(
+    PagedRenderTree& tree,
+    const std::vector<Point>& pts,
+    const std::vector<float>& rawDashes,
+    std::uint8_t dashCap,
+    float strokeWidth,
+    const Color& strokeColor,
+    std::int32_t strokeGradId,
+    const void* owner,
+    const Matrix2D& world2D,
+    const Matrix4x4& world3D,
+    bool has3D,
+    BlendingMode blend) {
+    if (pts.size() < 2u || rawDashes.empty() || strokeWidth <= 0.0f) {
+        return 0u;
+    }
+    const float unit = std::max(0.5f, strokeWidth);
+    std::vector<float> pattern;
+    pattern.reserve(rawDashes.size() * 2u);
+    for (float d : rawDashes) {
+        pattern.push_back(std::max(0.0f, d) * unit);
+    }
+    if ((pattern.size() % 2u) == 1u) {
+        const std::size_t n = pattern.size();
+        for (std::size_t i = 0u; i < n; ++i) {
+            pattern.push_back(pattern[i]);
+        }
+    }
+    float period = 0.0f;
+    for (float p : pattern) period += p;
+    if (period <= 1e-4f) {
+        return 0u;
+    }
+
+    std::vector<float> cumLen(pts.size(), 0.0f);
+    for (std::size_t i = 1u; i < pts.size(); ++i) {
+        cumLen[i] = cumLen[i - 1u] + std::hypot(pts[i].x - pts[i - 1u].x, pts[i].y - pts[i - 1u].y);
+    }
+    const float totalLen = cumLen.back();
+    if (totalLen <= 1e-4f) {
+        return 0u;
+    }
+
+    auto sampleAtArc = [&](float s) -> Point {
+        const float cs = std::clamp(s, 0.0f, totalLen);
+        auto it = std::lower_bound(cumLen.begin(), cumLen.end(), cs);
+        if (it == cumLen.begin()) return pts.front();
+        if (it == cumLen.end()) return pts.back();
+        const std::size_t idx = static_cast<std::size_t>(it - cumLen.begin());
+        const float s0 = cumLen[idx - 1u];
+        const float seg = cumLen[idx] - s0;
+        const float f = (seg > 1e-6f) ? ((cs - s0) / seg) : 0.0f;
+        return Point{
+            pts[idx - 1u].x + (pts[idx].x - pts[idx - 1u].x) * f,
+            pts[idx - 1u].y + (pts[idx].y - pts[idx - 1u].y) * f};
+    };
+
+    std::size_t emitted = 0u;
+    float cursor = 0.0f;
+    std::size_t patIdx = 0u;
+    int guard = 0;
+    while (cursor < totalLen - 1e-4f && guard++ < 4096) {
+        const bool isDash = (patIdx % 2u) == 0u;
+        const float step = pattern[patIdx % pattern.size()];
+        const float nextCursor = std::min(totalLen, cursor + step);
+        if (isDash) {
+            if (nextCursor > cursor + 1e-4f) {
+                std::vector<Point> segPts;
+                segPts.push_back(sampleAtArc(cursor));
+                auto it = std::upper_bound(cumLen.begin(), cumLen.end(), cursor + 1e-4f);
+                while (it != cumLen.end() && *it < nextCursor - 1e-4f) {
+                    const std::size_t k = static_cast<std::size_t>(it - cumLen.begin());
+                    if (k > 0u && k + 1u < pts.size()) {
+                        segPts.push_back(pts[k]);
+                    }
+                    ++it;
+                }
+                segPts.push_back(sampleAtArc(nextCursor));
+                for (std::size_t j = 1u; j < segPts.size(); ++j) {
+                    const std::uint8_t sCap = (j == 1u) ? dashCap : 2u;
+                    const std::uint8_t eCap = (j + 1u == segPts.size()) ? dashCap : 2u;
+                    emitted += EmitStyledDashCapsule(
+                        tree, segPts[j - 1u], segPts[j], strokeWidth, sCap, eCap,
+                        strokeColor, strokeGradId, owner, world2D, world3D, has3D, blend);
+                }
+            } else if (dashCap == 1u || dashCap == 2u) {
+                const Point p0 = sampleAtArc(cursor);
+                emitted += EmitStyledDashCapsule(
+                    tree, p0, p0, strokeWidth, dashCap, dashCap, strokeColor, strokeGradId,
+                    owner, world2D, world3D, has3D, blend);
+            }
+        }
+        cursor += step;
+        ++patIdx;
+    }
+    return emitted;
+}
+
 void VisualRenderAdapter::AttachNodeGradientBrush(
     PagedRenderTree& tree,
     std::uint32_t nid,
@@ -519,7 +494,8 @@ std::size_t VisualRenderAdapter::EmitSvgPathPrimitive(
         }
         const bool trimmed = (trimStart > 0.001f) || (trimEnd < 0.999f);
 
-        const ParsedSvgSubpaths parsed = (hasStroke && trimmed) ? ParseSvgPolylines(pathData) : ParsedSvgSubpaths{};
+        const std::vector<std::vector<Point>> parsedSubpaths =
+            (hasStroke && trimmed) ? ParseSvgPathToSubpaths(pathData) : std::vector<std::vector<Point>>{};
         const Rect rawBounds = MeasureSvgPathBounds(pathData);
         Rect fitted = destBox;
         if (rawBounds.width > 0.0f && rawBounds.height > 0.0f) {
@@ -607,11 +583,14 @@ std::size_t VisualRenderAdapter::EmitSvgPathPrimitive(
             }
         }
 
+        const VisualNode* ownerNode = static_cast<const VisualNode*>(owner);
+        const bool hasDash = (ownerNode != nullptr) && (ownerNode->kind == VisualKind::Vector) &&
+                             !ownerNode->Vector().dashArray.empty();
         if (hasStroke) {
             const Color strokeColor = (strokeGradId > 0)
                 ? Color{1.0f, 1.0f, 1.0f, effStrokeOp}
                 : UnpackRgba32(strokeRgba, effStrokeOp);
-            if (!trimmed) {
+            if (!trimmed && !hasDash) {
                 const float strokeWidthPx = strokeWidth * 0.5f * (sx + sy);
                 const std::uint32_t padPx = std::clamp<std::uint32_t>(
                     static_cast<std::uint32_t>(std::ceil(0.5f * strokeWidthPx + 2.0f)), 2u, 64u);
@@ -643,11 +622,19 @@ std::size_t VisualRenderAdapter::EmitSvgPathPrimitive(
                 }
             }
 
-            const ParsedSvgSubpaths& polyData = (trimmed) ? parsed : ParseSvgPolylines(pathData);
-            if (!polyData.subpaths.empty() && rawBounds.width > 1e-5f && rawBounds.height > 1e-5f) {
+            const std::vector<std::vector<Point>> fallbackSubpaths =
+                (!trimmed) ? ParseSvgPathToSubpaths(pathData) : std::vector<std::vector<Point>>{};
+            const auto& subpaths = trimmed ? parsedSubpaths : fallbackSubpaths;
+            if (!subpaths.empty() && rawBounds.width > 1e-5f && rawBounds.height > 1e-5f) {
                 const float scaleX = fitted.width / rawBounds.width;
                 const float scaleY = fitted.height / rawBounds.height;
-                for (const auto& sub : polyData.subpaths) {
+                const bool isVec = (ownerNode != nullptr) && (ownerNode->kind == VisualKind::Vector);
+                const std::uint8_t pathStartCap = isVec ? ownerNode->Vector().startLineCap : 2u;
+                const std::uint8_t pathEndCap = isVec ? ownerNode->Vector().endLineCap : 2u;
+                for (const auto& sub : subpaths) {
+                    if (sub.size() < 2u) {
+                        continue;
+                    }
                     std::vector<Point> mapped;
                     mapped.reserve(sub.size());
                     for (const Point& pt : sub) {
@@ -658,10 +645,19 @@ std::size_t VisualRenderAdapter::EmitSvgPathPrimitive(
                     const std::vector<Point> finalPts = trimmed
                         ? TrimPolylineRange(mapped, trimStart, trimEnd)
                         : mapped;
-                    for (std::size_t i = 1u; i < finalPts.size(); ++i) {
-                        count += EmitLineSegment(
-                            tree, finalPts[i - 1u], finalPts[i], strokeWidth, strokeColor,
-                            owner, world2D, world3D, has3D, blend);
+                    if (hasDash) {
+                        count += EmitDashedPolylinePoints(
+                            tree, finalPts, ownerNode->Vector().dashArray, ownerNode->Vector().dashCap,
+                            strokeWidth, strokeColor, strokeGradId, owner, world2D, world3D, has3D, blend);
+                    } else {
+                        for (std::size_t i = 1u; i < finalPts.size(); ++i) {
+                            const std::uint8_t sCap = (i == 1u) ? pathStartCap : 2u;
+                            const std::uint8_t eCap = (i + 1u == finalPts.size()) ? pathEndCap : 2u;
+                            count += EmitStyledDashCapsule(
+                                tree, finalPts[i - 1u], finalPts[i], strokeWidth,
+                                sCap, eCap, strokeColor, strokeGradId,
+                                owner, world2D, world3D, has3D, blend);
+                        }
                     }
                 }
             }
@@ -1349,24 +1345,41 @@ std::size_t VisualRenderAdapter::EmitVectorVisual(
                 if ((HasAlpha(vec.strokeRgba) || vec.strokeGradId > 0) &&
                     vec.strokeWidth > 0.0f &&
                     effStrokeOp > 0.001f) {
-                    const auto beginNid = static_cast<std::uint32_t>(tree.nodes_.size());
                     const Color strokeCol = (vec.strokeGradId > 0)
                         ? Color{1.0f, 1.0f, 1.0f, effStrokeOp}
                         : UnpackRgba32(vec.strokeRgba, effStrokeOp);
-                    const std::uint32_t nid = tree.AllocateEllipseNode(
-                        rect.x,
-                        rect.y,
-                        rect.width,
-                        rect.height,
-                        strokeCol,
-                        vec.strokeWidth,
-                        true,
-                        1.0f,
-                        &node);
-                    AttachNodeGradientBrush(tree, nid, vec.strokeGradId);
-                    const auto endNid = static_cast<std::uint32_t>(tree.nodes_.size());
-                    ApplyNodeTransform(tree, beginNid, endNid, world2D, world3D, has3D, blend);
-                    count += (endNid - beginNid);
+                    if (!vec.dashArray.empty() && rect.width > 1.0f && rect.height > 1.0f) {
+                        constexpr int kEllipseSegs = 96;
+                        const float cx = rect.x + rect.width * 0.5f;
+                        const float cy = rect.y + rect.height * 0.5f;
+                        const float rx = std::max(0.5f, (rect.width - vec.strokeWidth) * 0.5f);
+                        const float ry = std::max(0.5f, (rect.height - vec.strokeWidth) * 0.5f);
+                        std::vector<Point> ringPts;
+                        ringPts.reserve(static_cast<std::size_t>(kEllipseSegs + 1));
+                        for (int s = 0; s <= kEllipseSegs; ++s) {
+                            const float ang = (static_cast<float>(s) / static_cast<float>(kEllipseSegs)) * 6.28318530718f;
+                            ringPts.push_back(Point{cx + std::cos(ang) * rx, cy + std::sin(ang) * ry});
+                        }
+                        count += EmitDashedPolylinePoints(
+                            tree, ringPts, vec.dashArray, vec.dashCap,
+                            vec.strokeWidth, strokeCol, vec.strokeGradId, &node, world2D, world3D, has3D, blend);
+                    } else {
+                        const auto beginNid = static_cast<std::uint32_t>(tree.nodes_.size());
+                        const std::uint32_t nid = tree.AllocateEllipseNode(
+                            rect.x,
+                            rect.y,
+                            rect.width,
+                            rect.height,
+                            strokeCol,
+                            vec.strokeWidth,
+                            true,
+                            1.0f,
+                            &node);
+                        AttachNodeGradientBrush(tree, nid, vec.strokeGradId);
+                        const auto endNid = static_cast<std::uint32_t>(tree.nodes_.size());
+                        ApplyNodeTransform(tree, beginNid, endNid, world2D, world3D, has3D, blend);
+                        count += (endNid - beginNid);
+                    }
                 }
                 break;
             }
@@ -1439,26 +1452,65 @@ std::size_t VisualRenderAdapter::EmitVectorVisual(
                             }
                         }
                     }
-                    const auto beginNid = static_cast<std::uint32_t>(tree.nodes_.size());
-                    (void)tree.AllocateBorderRingNode(
-                        rect.x,
-                        rect.y,
-                        rect.width,
-                        rect.height,
-                        strokeCol,
-                        cr,
-                        Thickness{vec.strokeWidth},
-                        &node);
-                    const auto endNid = static_cast<std::uint32_t>(tree.nodes_.size());
-                    ApplyNodeTransform(tree, beginNid, endNid, world2D, world3D, has3D, blend);
-                    count += (endNid - beginNid);
+                    if (!vec.dashArray.empty() && rect.width > 1.0f && rect.height > 1.0f) {
+                        const float halfS = std::min(vec.strokeWidth * 0.5f, 0.5f * std::min(rect.width, rect.height));
+                        const float x0 = rect.x + halfS;
+                        const float y0 = rect.y + halfS;
+                        const float x1 = rect.x + rect.width - halfS;
+                        const float y1 = rect.y + rect.height - halfS;
+                        const float iw = std::max(0.0f, x1 - x0);
+                        const float ih = std::max(0.0f, y1 - y0);
+                        const float irx = std::min(std::max(0.0f, rx - halfS), iw * 0.5f);
+                        const float iry = std::min(std::max(0.0f, ry - halfS), ih * 0.5f);
+                        std::vector<Point> rectPts;
+                        if (irx > 0.5f && iry > 0.5f) {
+                            constexpr int kCornerSteps = 8;
+                            constexpr float kHalfPi = kPi * 0.5f;
+                            auto appendArc = [&](float cx, float cy, float a0) {
+                                for (int s = 0; s <= kCornerSteps; ++s) {
+                                    const float ang = a0 + (static_cast<float>(s) / static_cast<float>(kCornerSteps)) * kHalfPi;
+                                    rectPts.push_back(Point{cx + std::cos(ang) * irx, cy + std::sin(ang) * iry});
+                                }
+                            };
+                            rectPts.reserve(static_cast<std::size_t>((kCornerSteps + 1) * 4 + 1));
+                            appendArc(x1 - irx, y0 + iry, -kHalfPi);
+                            appendArc(x1 - irx, y1 - iry, 0.0f);
+                            appendArc(x0 + irx, y1 - iry, kHalfPi);
+                            appendArc(x0 + irx, y0 + iry, kPi);
+                            rectPts.push_back(rectPts.front());
+                        } else {
+                            rectPts = {Point{x0, y0}, Point{x1, y0}, Point{x1, y1}, Point{x0, y1}, Point{x0, y0}};
+                        }
+                        const Color dashCol = (vec.strokeGradId > 0)
+                            ? Color{1.0f, 1.0f, 1.0f, effStrokeOp}
+                            : strokeCol;
+                        count += EmitDashedPolylinePoints(
+                            tree, rectPts, vec.dashArray, vec.dashCap,
+                            vec.strokeWidth, dashCol, vec.strokeGradId, &node,
+                            world2D, world3D, has3D, blend);
+                    } else {
+                        const auto beginNid = static_cast<std::uint32_t>(tree.nodes_.size());
+                        (void)tree.AllocateBorderRingNode(
+                            rect.x,
+                            rect.y,
+                            rect.width,
+                            rect.height,
+                            strokeCol,
+                            cr,
+                            Thickness{vec.strokeWidth},
+                            &node);
+                        const auto endNid = static_cast<std::uint32_t>(tree.nodes_.size());
+                        ApplyNodeTransform(tree, beginNid, endNid, world2D, world3D, has3D, blend);
+                        count += (endNid - beginNid);
+                    }
                 }
                 break;
             }
 
             case VectorShapeKind::Line: {
                 const float effStrokeOp = std::clamp(effOpacity * vec.strokeOpacity, 0.0f, 1.0f);
-                if (!HasAlpha(vec.strokeRgba) || vec.strokeWidth <= 0.0f || effStrokeOp <= 0.001f) {
+                if ((!HasAlpha(vec.strokeRgba) && vec.strokeGradId <= 0) ||
+                    vec.strokeWidth <= 0.0f || effStrokeOp <= 0.001f) {
                     break;
                 }
                 const std::vector<float> nums = ParseCsvFloats(vec.pathOrParams);
@@ -1473,17 +1525,31 @@ std::size_t VisualRenderAdapter::EmitVectorVisual(
                 if (s1 > s0) {
                     const Point tp0{p0.x + (p1.x - p0.x) * s0, p0.y + (p1.y - p0.y) * s0};
                     const Point tp1{p0.x + (p1.x - p0.x) * s1, p0.y + (p1.y - p0.y) * s1};
-                    count += EmitLineSegment(
-                        tree,
-                        tp0,
-                        tp1,
-                        vec.strokeWidth,
-                        UnpackRgba32(vec.strokeRgba, effStrokeOp),
-                        &node,
-                        world2D,
-                        world3D,
-                        has3D,
-                        blend);
+                    const Color strokeCol = (vec.strokeGradId > 0)
+                        ? Color{1.0f, 1.0f, 1.0f, effStrokeOp}
+                        : UnpackRgba32(vec.strokeRgba, effStrokeOp);
+                    if (!vec.dashArray.empty()) {
+                        const std::vector<Point> linePts{tp0, tp1};
+                        count += EmitDashedPolylinePoints(
+                            tree, linePts, vec.dashArray, vec.dashCap,
+                            vec.strokeWidth, strokeCol, vec.strokeGradId, &node,
+                            world2D, world3D, has3D, blend);
+                    } else {
+                        count += EmitStyledDashCapsule(
+                            tree,
+                            tp0,
+                            tp1,
+                            vec.strokeWidth,
+                            vec.startLineCap,
+                            vec.endLineCap,
+                            strokeCol,
+                            vec.strokeGradId,
+                            &node,
+                            world2D,
+                            world3D,
+                            has3D,
+                            blend);
+                    }
                 }
                 break;
             }
@@ -1966,7 +2032,7 @@ std::size_t VisualRenderAdapter::EmitNodeRecursive(
         PagedRenderTree& outTree,
         const VisualEffectStyle* inheritedDropShadow) {
         const VisualNode* node = world.GetNode(id);
-        if (!node || node->layout.visibility == Visibility::Collapsed) {
+        if (!node || node->layout.visibility != Visibility::Visible) {
             return 0u;
         }
 
@@ -2142,7 +2208,8 @@ std::size_t VisualRenderAdapter::EmitNodeRecursive(
         // Push node scissor clip (ClipToBounds or ScrollViewport)
         const bool prevClipEnabled = outTree.activeClipEnabled_;
         const Rect prevClipRect = outTree.activeClipRect_;
-        const bool clipsSelf = node->layout.clipToBounds || (node->layout.layoutMode == LayoutMode::ScrollViewport);
+        const bool clipsSelf = node->layout.clipToBounds || node->layout.needsLayoutClip ||
+                               (node->layout.layoutMode == LayoutMode::ScrollViewport);
         bool skipClipped = false;
         if (clipsSelf) {
             const Rect nodeWorldBounds = TransformRectViewportBounds(rect, world2D, world3D, has3D);
@@ -2505,7 +2572,8 @@ std::size_t VisualRenderAdapter::EmitDropShadowSubtreeRecursive(
 
     const bool prevClipEnabled = outTree.activeClipEnabled_;
     const Rect prevClipRect = outTree.activeClipRect_;
-    const bool clipsSelf = node->layout.clipToBounds || (node->layout.layoutMode == LayoutMode::ScrollViewport);
+    const bool clipsSelf = node->layout.clipToBounds || node->layout.needsLayoutClip ||
+                           (node->layout.layoutMode == LayoutMode::ScrollViewport);
     bool skipClipped = false;
     if (clipsSelf) {
         const Rect nodeWorldBounds = TransformRectViewportBounds(rect, world2D, world3D, has3D);

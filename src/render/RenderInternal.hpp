@@ -60,11 +60,23 @@ namespace aero::render::detail {
     }
 }
 
-[[nodiscard]] inline int ComputeSpanBoxRadius(const BlurLayerSpan& span) noexcept {
+[[nodiscard]] inline float ComputeSpanBoxRadiusFloat(const BlurLayerSpan& span) noexcept {
     const float ws = (std::isfinite(span.worldScale) && span.worldScale > 0.0f) ? span.worldScale : 1.0f;
     const float effRadius = span.radiusPx * ws;
-    if (std::isfinite(effRadius) && effRadius > 0.25f) {
-        return std::max(1, static_cast<int>(std::lround(std::clamp(effRadius, 0.5f, 160.0f) * 0.5f)));
+    if (!std::isfinite(effRadius) || effRadius <= 0.25f) {
+        return 0.0f;
+    }
+    if (span.effectMode == UIEffectKind::BackdropBlur) {
+        // Calibrate 3-pass box blur variance to WPF/NoesisGUI Gaussian BlurEffect.Radius (3*sigma = radius)
+        return std::clamp(effRadius, 0.25f, 480.0f) * 0.26f;
+    }
+    return std::clamp(effRadius, 0.5f, 240.0f) * 0.5f;
+}
+
+[[nodiscard]] inline int ComputeSpanBoxRadius(const BlurLayerSpan& span) noexcept {
+    const float boxRf = ComputeSpanBoxRadiusFloat(span);
+    if (boxRf > 0.05f) {
+        return std::max(1, static_cast<int>(std::ceil(boxRf)));
     }
     return 0;
 }

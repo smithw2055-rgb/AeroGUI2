@@ -109,6 +109,8 @@ int __rs_native_Visual_SetVectorShape(handle node, int shapeKind, string pathOrP
 public void Visual_SetVectorShape(handle node, int shapeKind, string pathOrParams, uint fillRgba, int fillGradId, uint strokeRgba, int strokeGradId, float strokeWidth, int stretch, float trimStart, float trimEnd) { __rs_native_Visual_SetVectorShape(node, shapeKind, pathOrParams, fillRgba, fillGradId, strokeRgba, strokeGradId, strokeWidth, stretch, trimStart, trimEnd); return; }
 int __rs_native_Visual_SetVectorBrushOpacity(handle node, float fillOpacity, float strokeOpacity) { return 0; }
 public void Visual_SetVectorBrushOpacity(handle node, float fillOpacity, float strokeOpacity) { __rs_native_Visual_SetVectorBrushOpacity(node, fillOpacity, strokeOpacity); return; }
+int __rs_native_Visual_SetVectorStrokeDash(handle node, string dashSpec, int dashCap, int startCap, int endCap) { return 0; }
+public void Visual_SetVectorStrokeDash(handle node, string dashSpec, int dashCap, int startCap, int endCap) { __rs_native_Visual_SetVectorStrokeDash(node, dashSpec, dashCap, startCap, endCap); return; }
 
 // Retained DrawingContext
 int __rs_native_Draw_Begin(handle node) { return 0; }
@@ -159,6 +161,15 @@ int __rs_native_Anim_StopAll(handle node) { return 0; }
 public void Anim_StopAll(handle node) { __rs_native_Anim_StopAll(node); return; }
 int __rs_native_Anim_StopTrack(int trackId) { return 0; }
 public void Anim_StopTrack(int trackId) { __rs_native_Anim_StopTrack(trackId); return; }
+int __rs_native_Anim_SetTrackEasingParams(int trackId, float param0, float param1, int paramMask) { return 0; }
+public void Anim_SetTrackEasingParams(int trackId, float param0, float param1, int paramMask = 3) { __rs_native_Anim_SetTrackEasingParams(trackId, param0, param1, paramMask); return; }
+public int Anim_BeginKeyFrames(handle node, int prop, float delaySec, bool autoReverse, int repeatCount) { return 0; }
+int __rs_native_Anim_AddKeyFrameFloat(int trackId, float timeSec, float value, int easeKind, int easeMode, float param0, float param1, int paramMask, bool discrete) { return 0; }
+public void Anim_AddKeyFrameFloat(int trackId, float timeSec, float value, int easeKind, int easeMode, float param0, float param1, int paramMask, bool discrete) { __rs_native_Anim_AddKeyFrameFloat(trackId, timeSec, value, easeKind, easeMode, param0, param1, paramMask, discrete); return; }
+int __rs_native_Anim_ApplyFloat(handle node, int prop, float value) { return 0; }
+public void Anim_ApplyFloat(handle node, int prop, float value) { __rs_native_Anim_ApplyFloat(node, prop, value); return; }
+int __rs_native_Anim_ApplyColor(handle node, int prop, uint rgba) { return 0; }
+public void Anim_ApplyColor(handle node, int prop, uint rgba) { __rs_native_Anim_ApplyColor(node, prop, rgba); return; }
 public bool Anim_IsTrackActive(int trackId) { return false; }
 public bool Anim_IsTrackStarted(int trackId) { return false; }
 public float Anim_ReadTrackFloat(int trackId, float fallback) { return fallback; }
@@ -174,6 +185,8 @@ int __rs_native_Host_SetClipboardText(string text) { return 0; }
 public void Host_SetClipboardText(string text) { __rs_native_Host_SetClipboardText(text); return; }
 int __rs_native_Host_RequestWake() { return 0; }
 public void Host_RequestWake() { __rs_native_Host_RequestWake(); return; }
+int __rs_native_Host_RequestWakeAfterMs(int delayMs) { return 0; }
+public void Host_RequestWakeAfterMs(int delayMs) { __rs_native_Host_RequestWakeAfterMs(delayMs); return; }
 int __rs_native_Host_CloseWindow() { return 0; }
 public void Host_CloseWindow() { __rs_native_Host_CloseWindow(); return; }
 int __rs_native_Host_PlaySound(string uri, float volume) { return 0; }

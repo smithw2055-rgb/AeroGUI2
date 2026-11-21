@@ -24,6 +24,7 @@ namespace {
 
 using aero::render::detail::ComputeNodeRangeScreenBounds;
 using aero::render::detail::ComputeSpanBoxRadius;
+using aero::render::detail::ComputeSpanBoxRadiusFloat;
 using aero::render::detail::ComputeSpanPaddingPx;
 using aero::render::detail::SafeCeilToInt;
 using aero::render::detail::SafeFloorToInt;
@@ -382,6 +383,111 @@ void BlendPremulOverRgba8(
         return (top + (bot - top) * fy) * kInv255;
     };
     return Color{bilerpCh(0u), bilerpCh(1u), bilerpCh(2u), bilerpCh(3u)};
+}
+
+void SeparableBoxBlurPremul3Pass(PremulOffscreenLayer& layer, int boxRadius);
+
+void SeparableBoxBlurPremul3PassFloat(PremulOffscreenLayer& layer, float boxRadiusF) {
+    if (!std::isfinite(boxRadiusF) || boxRadiusF <= 0.05f || layer.width <= 0 || layer.height <= 0) {
+        return;
+    }
+    const int coreR = std::max(0, static_cast<int>(std::floor(boxRadiusF)));
+    const float frac = std::clamp(boxRadiusF - static_cast<float>(coreR), 0.0f, 1.0f);
+    if (frac <= 0.01f && coreR > 0) {
+        SeparableBoxBlurPremul3Pass(layer, coreR);
+        return;
+    }
+    const int w = layer.width;
+    const int h = layer.height;
+    const float invKernel = 1.0f / (static_cast<float>(coreR * 2 + 1) + 2.0f * frac);
+    const std::size_t rowFloats = static_cast<std::size_t>(w) * 4u;
+    thread_local std::vector<float> tlScratch;
+    const std::size_t totalFloats = rowFloats * static_cast<std::size_t>(h);
+    if (tlScratch.size() < totalFloats) {
+        tlScratch.resize(totalFloats);
+    }
+
+    for (int pass = 0; pass < 3; ++pass) {
+        float* const scratchBase = tlScratch.data();
+        const float* const srcBase = layer.premulRgba.data();
+        auto blurRowsFn = [&](int yStart, int yEnd) {
+            for (int y = yStart; y < yEnd; ++y) {
+                const float* srcRow = srcBase + static_cast<std::size_t>(y) * rowFloats;
+                float* dstRow = scratchBase + static_cast<std::size_t>(y) * rowFloats;
+                float sumR = 0.0f, sumG = 0.0f, sumB = 0.0f, sumA = 0.0f;
+                for (int k = -coreR; k <= coreR; ++k) {
+                    const int sx = std::clamp(k, 0, w - 1);
+                    const float* p = srcRow + static_cast<std::size_t>(sx) * 4u;
+                    sumR += p[0]; sumG += p[1]; sumB += p[2]; sumA += p[3];
+                }
+                for (int x = 0; x < w; ++x) {
+                    const int leftTap = std::clamp(x - coreR - 1, 0, w - 1);
+                    const int rightTap = std::clamp(x + coreR + 1, 0, w - 1);
+                    const float* lp = srcRow + static_cast<std::size_t>(leftTap) * 4u;
+                    const float* rp = srcRow + static_cast<std::size_t>(rightTap) * 4u;
+                    float* dp = dstRow + static_cast<std::size_t>(x) * 4u;
+                    dp[0] = (sumR + frac * (lp[0] + rp[0])) * invKernel;
+                    dp[1] = (sumG + frac * (lp[1] + rp[1])) * invKernel;
+                    dp[2] = (sumB + frac * (lp[2] + rp[2])) * invKernel;
+                    dp[3] = (sumA + frac * (lp[3] + rp[3])) * invKernel;
+                    const int removeX = std::clamp(x - coreR, 0, w - 1);
+                    const int addX = std::clamp(x + coreR + 1, 0, w - 1);
+                    const float* remP = srcRow + static_cast<std::size_t>(removeX) * 4u;
+                    const float* addP = srcRow + static_cast<std::size_t>(addX) * 4u;
+                    sumR += addP[0] - remP[0];
+                    sumG += addP[1] - remP[1];
+                    sumB += addP[2] - remP[2];
+                    sumA += addP[3] - remP[3];
+                }
+            }
+        };
+        if (static_cast<std::size_t>(w) * static_cast<std::size_t>(h) >= 16384u) {
+            ScanlineWorkerPool::Instance().ParallelBands4(h, blurRowsFn);
+        } else {
+            blurRowsFn(0, h);
+        }
+
+        float* const dstBase = layer.premulRgba.data();
+        auto blurColsStripeFn = [&](int cStart, int cEnd) {
+            const std::size_t c0 = static_cast<std::size_t>(std::max(0, cStart));
+            const std::size_t c1 = static_cast<std::size_t>(std::min(static_cast<int>(rowFloats), cEnd));
+            if (c1 <= c0) return;
+            const std::size_t stripeLen = c1 - c0;
+            thread_local std::vector<float> tlStripeSums;
+            if (tlStripeSums.size() < stripeLen) {
+                tlStripeSums.resize(stripeLen);
+            }
+            float* sums = tlStripeSums.data();
+            std::fill_n(sums, stripeLen, 0.0f);
+            for (int k = -coreR; k <= coreR; ++k) {
+                const int sy = std::clamp(k, 0, h - 1);
+                const float* srcRow = scratchBase + static_cast<std::size_t>(sy) * rowFloats + c0;
+                for (std::size_t i = 0u; i < stripeLen; ++i) {
+                    sums[i] += srcRow[i];
+                }
+            }
+            for (int y = 0; y < h; ++y) {
+                float* dstRow = dstBase + static_cast<std::size_t>(y) * rowFloats + c0;
+                const int topTap = std::clamp(y - coreR - 1, 0, h - 1);
+                const int botTap = std::clamp(y + coreR + 1, 0, h - 1);
+                const float* topRow = scratchBase + static_cast<std::size_t>(topTap) * rowFloats + c0;
+                const float* botRow = scratchBase + static_cast<std::size_t>(botTap) * rowFloats + c0;
+                const int removeY = std::clamp(y - coreR, 0, h - 1);
+                const int addY = std::clamp(y + coreR + 1, 0, h - 1);
+                const float* remRow = scratchBase + static_cast<std::size_t>(removeY) * rowFloats + c0;
+                const float* addRow = scratchBase + static_cast<std::size_t>(addY) * rowFloats + c0;
+                for (std::size_t i = 0u; i < stripeLen; ++i) {
+                    dstRow[i] = (sums[i] + frac * (topRow[i] + botRow[i])) * invKernel;
+                    sums[i] += addRow[i] - remRow[i];
+                }
+            }
+        };
+        if (!gInScanlineBand && static_cast<std::size_t>(w) * static_cast<std::size_t>(h) >= 16384u && rowFloats >= 64u) {
+            ScanlineWorkerPool::Instance().ParallelBands4(static_cast<int>(rowFloats), blurColsStripeFn);
+        } else {
+            blurColsStripeFn(0, static_cast<int>(rowFloats));
+        }
+    }
 }
 
 void SeparableBoxBlurPremul3Pass(PremulOffscreenLayer& layer, int boxRadius) {
@@ -770,16 +876,16 @@ void ApplySpanPostProcessEffect(
             break;
         }
         case UIEffectKind::Blur: {
-            const int boxR = ComputeSpanBoxRadius(span);
-            if (boxR > 0) {
-                SeparableBoxBlurPremul3Pass(layer, boxR);
+            const float boxRf = ComputeSpanBoxRadiusFloat(span);
+            if (boxRf > 0.05f) {
+                SeparableBoxBlurPremul3PassFloat(layer, boxRf);
             }
             break;
         }
         case UIEffectKind::BackdropBlur: {
-            const int boxR = ComputeSpanBoxRadius(span);
-            if (boxR > 0) {
-                SeparableBoxBlurPremul3Pass(layer, boxR);
+            const float boxRf = ComputeSpanBoxRadiusFloat(span);
+            if (boxRf > 0.05f) {
+                SeparableBoxBlurPremul3PassFloat(layer, boxRf);
             }
             if (std::isfinite(span.saturation) && std::fabs(span.saturation - 1.0f) > 0.001f) {
                 ApplySaturationPremulLayer(layer, span.saturation);

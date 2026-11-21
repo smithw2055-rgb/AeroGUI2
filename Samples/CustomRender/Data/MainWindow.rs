@@ -8,30 +8,78 @@ public class Game : CustomDrawElement
 {
     public int Score { get; set; } = 0;
     public int Lives { get; set; } = 3;
-    public string StatusText { get; set; } = "AERO BREAKOUT";
-    public string ActionText { get; set; } = "SPACE: START / PAUSE | LEFT & RIGHT OR MOUSE: MOVE PADDLE";
+    public string StatusText { get; set; } = "READY";
+    public string ActionText { get; set; } = "PRESS SPACE OR CLICK TO LAUNCH";
     public bool IsRunning { get; set; } = false;
     public bool IsGameOver { get; set; } = false;
+    public int ActiveParticleCount { get; set; } = 0;
 
     private float _arenaW = 1280.0f;
     private float _arenaH = 720.0f;
     private bool _layoutSynced = false;
-    private float _paddleX = 340.0f;
-    private float _paddleW = 120.0f;
-    private float _paddleH = 16.0f;
-    private float _ballX = 400.0f;
-    private float _ballY = 510.0f;
+    private float _paddleX = 565.0f;
+    private float _paddleW = 150.0f;
+    private float _paddleH = 26.0f;
+    private float _ballX = 640.0f;
+    private float _ballY = 634.0f;
     private float _ballVX = 220.0f;
     private float _ballVY = -260.0f;
-    private float _ballR = 9.0f;
+    private float _ballR = 11.0f;
     private int _rows = 5;
-    private int _cols = 10;
-    private bool[] _bricks;
+    private int _cols = 13;
+    private int[] _bricks;
+
+    // Brick shatter particle pool
+    private int _maxParticles = 160;
+    private int[] _partAlive;
+    private float[] _partX;
+    private float[] _partY;
+    private float[] _partVX;
+    private float[] _partVY;
+    private float[] _partLife;
+    private float[] _partMaxLife;
+    private float[] _partSize;
+    private int[] _partRow;
+    private int _rngSeed = 1337;
+
+    // Cached 3D Brushes
+    private RadialGradientBrush _bgBrush;
+    private LinearGradientBrush[] _brickBrushes;
+    private LinearGradientBrush _paddleSilverBrush;
+    private LinearGradientBrush _paddleRedBrush;
+    private RadialGradientBrush _paddleTipBrush;
+    private RadialGradientBrush _ballSphereBrush;
+    private bool _brushesReady = false;
 
     public Game() : base()
     {
         this.Focusable = true;
-        this._bricks = new bool[50];
+        this._bricks = new int[0];
+        int bi = 0;
+        while (bi < 65) { this._bricks.Push(1); bi = bi + 1; }
+        this._partAlive = new int[0];
+        this._partX = new float[0];
+        this._partY = new float[0];
+        this._partVX = new float[0];
+        this._partVY = new float[0];
+        this._partLife = new float[0];
+        this._partMaxLife = new float[0];
+        this._partSize = new float[0];
+        this._partRow = new int[0];
+        int pi = 0;
+        while (pi < 160)
+        {
+            this._partAlive.Push(0);
+            this._partX.Push(0.0f);
+            this._partY.Push(0.0f);
+            this._partVX.Push(0.0f);
+            this._partVY.Push(0.0f);
+            this._partLife.Push(0.0f);
+            this._partMaxLife.Push(1.0f);
+            this._partSize.Push(5.0f);
+            this._partRow.Push(0);
+            pi = pi + 1;
+        }
         this.ResetGame();
     }
 
@@ -40,22 +88,185 @@ public class Game : CustomDrawElement
         return "Game";
     }
 
+    private void EnsureBrushes()
+    {
+        if (this._brushesReady) { return; }
+        this._brushesReady = true;
+
+        this._bgBrush = new RadialGradientBrush(0.5f, 0.5f, 0.5f, 0.5f, 0.72f, 0.72f);
+        this._bgBrush.AddStop("#FF2D313B", 0.0f);
+        this._bgBrush.AddStop("#FF20232B", 0.55f);
+        this._bgBrush.AddStop("#FF13151A", 1.0f);
+
+        this._brickBrushes = new LinearGradientBrush[0];
+
+        var b0 = new LinearGradientBrush(0.0f, 0.0f, 0.0f, 1.0f);
+        b0.AddStop("#FFFF5252", 0.0f);
+        b0.AddStop("#FFE61919", 0.45f);
+        b0.AddStop("#FF990F0F", 1.0f);
+        this._brickBrushes.Push(b0);
+
+        var b1 = new LinearGradientBrush(0.0f, 0.0f, 0.0f, 1.0f);
+        b1.AddStop("#FFFFF04D", 0.0f);
+        b1.AddStop("#FFEAB308", 0.48f);
+        b1.AddStop("#FFA16207", 1.0f);
+        this._brickBrushes.Push(b1);
+
+        var b2 = new LinearGradientBrush(0.0f, 0.0f, 0.0f, 1.0f);
+        b2.AddStop("#FF38BDF8", 0.0f);
+        b2.AddStop("#FF0284C7", 0.45f);
+        b2.AddStop("#FF1E3A8A", 1.0f);
+        this._brickBrushes.Push(b2);
+
+        var b3 = new LinearGradientBrush(0.0f, 0.0f, 0.0f, 1.0f);
+        b3.AddStop("#FFF472B6", 0.0f);
+        b3.AddStop("#FFD900D9", 0.45f);
+        b3.AddStop("#FF86198F", 1.0f);
+        this._brickBrushes.Push(b3);
+
+        var b4 = new LinearGradientBrush(0.0f, 0.0f, 0.0f, 1.0f);
+        b4.AddStop("#FF4ADE80", 0.0f);
+        b4.AddStop("#FF16A34A", 0.48f);
+        b4.AddStop("#FF14532D", 1.0f);
+        this._brickBrushes.Push(b4);
+
+        this._paddleSilverBrush = new LinearGradientBrush(0.0f, 0.0f, 0.0f, 1.0f);
+        this._paddleSilverBrush.AddStop("#FFF8FAFC", 0.0f);
+        this._paddleSilverBrush.AddStop("#FFCBD5E1", 0.35f);
+        this._paddleSilverBrush.AddStop("#FF64748B", 0.78f);
+        this._paddleSilverBrush.AddStop("#FF334155", 1.0f);
+
+        this._paddleRedBrush = new LinearGradientBrush(0.0f, 0.0f, 0.0f, 1.0f);
+        this._paddleRedBrush.AddStop("#FFFF6B6B", 0.0f);
+        this._paddleRedBrush.AddStop("#FFDC2626", 0.5f);
+        this._paddleRedBrush.AddStop("#FF7F1D1D", 1.0f);
+
+        this._paddleTipBrush = new RadialGradientBrush(0.45f, 0.38f, 0.35f, 0.32f, 0.65f, 0.65f);
+        this._paddleTipBrush.AddStop("#FFE0F2FE", 0.0f);
+        this._paddleTipBrush.AddStop("#FF38BDF8", 0.55f);
+        this._paddleTipBrush.AddStop("#FF0369A1", 1.0f);
+
+        this._ballSphereBrush = new RadialGradientBrush(0.36f, 0.32f, 0.30f, 0.26f, 0.72f, 0.72f);
+        this._ballSphereBrush.AddStop("#FFE0F2FE", 0.0f);
+        this._ballSphereBrush.AddStop("#FF38BDF8", 0.28f);
+        this._ballSphereBrush.AddStop("#FF0284C7", 0.62f);
+        this._ballSphereBrush.AddStop("#FF0F172A", 1.0f);
+    }
+
+    private float NextRand01()
+    {
+        this._rngSeed = (this._rngSeed * 9301 + 49297) % 233280;
+        if (this._rngSeed < 0) { this._rngSeed = -this._rngSeed; }
+        return (float)this._rngSeed / 233280.0f;
+    }
+
+    private void ClearParticles()
+    {
+        int i = 0;
+        while (i < this._maxParticles)
+        {
+            this._partAlive[i] = 0;
+            i = i + 1;
+        }
+        this.ActiveParticleCount = 0;
+    }
+
+    private uint RowParticleColor(int row)
+    {
+        if (row == 0) { return ParseUtil.ParseColor("#FFFF3B3B"); }
+        if (row == 1) { return ParseUtil.ParseColor("#FFFACC15"); }
+        if (row == 2) { return ParseUtil.ParseColor("#FF38BDF8"); }
+        if (row == 3) { return ParseUtil.ParseColor("#FFE843E8"); }
+        return ParseUtil.ParseColor("#FF22E538");
+    }
+
+    private void SpawnBrickShatter(float bx, float by, float bw, float bh, int row)
+    {
+        int spawned = 0;
+        int i = 0;
+        while (i < this._maxParticles && spawned < 14)
+        {
+            if (this._partAlive[i] == 0)
+            {
+                float rx = this.NextRand01();
+                float ry = this.NextRand01();
+                this._partAlive[i] = 1;
+                this._partX[i] = bx + 6.0f + rx * Math.Maxf(8.0f, bw - 12.0f);
+                this._partY[i] = by + 4.0f + ry * Math.Maxf(6.0f, bh - 8.0f);
+                this._partVX[i] = (rx - 0.5f) * 210.0f + (this.NextRand01() - 0.5f) * 70.0f;
+                this._partVY[i] = -70.0f + this.NextRand01() * 190.0f;
+                this._partMaxLife[i] = 0.55f + this.NextRand01() * 0.35f;
+                this._partLife[i] = this._partMaxLife[i];
+                this._partSize[i] = 5.0f + this.NextRand01() * 2.5f;
+                this._partRow[i] = row;
+                spawned = spawned + 1;
+            }
+            i = i + 1;
+        }
+        this.RecountParticles();
+    }
+
+    private void RecountParticles()
+    {
+        int alive = 0;
+        int i = 0;
+        while (i < this._maxParticles)
+        {
+            if (this._partAlive[i] != 0) { alive = alive + 1; }
+            i = i + 1;
+        }
+        this.ActiveParticleCount = alive;
+    }
+
+    private bool StepParticles(float step)
+    {
+        int alive = 0;
+        int i = 0;
+        while (i < this._maxParticles)
+        {
+            if (this._partAlive[i] != 0)
+            {
+                this._partLife[i] = this._partLife[i] - step;
+                if (this._partLife[i] <= 0.0f)
+                {
+                    this._partAlive[i] = 0;
+                }
+                else
+                {
+                    this._partVY[i] = this._partVY[i] + 440.0f * step;
+                    this._partX[i] = this._partX[i] + this._partVX[i] * step;
+                    this._partY[i] = this._partY[i] + this._partVY[i] * step;
+                    alive = alive + 1;
+                }
+            }
+            i = i + 1;
+        }
+        this.ActiveParticleCount = alive;
+        return alive > 0;
+    }
+
     public void ResetGame()
     {
+        float w = this.ActualWidth > 10.0f ? this.ActualWidth : this._arenaW;
+        float h = this.ActualHeight > 10.0f ? this.ActualHeight : this._arenaH;
+        this._arenaW = w;
+        this._arenaH = h;
+
         this.Score = 0;
         this.Lives = 3;
         this.IsRunning = false;
         this.IsGameOver = false;
-        this._paddleX = (this._arenaW - this._paddleW) * 0.5f;
-        this._ballX = this._arenaW * 0.5f;
-        this._ballY = this._arenaH - 86.0f;
+        this._paddleX = (w - this._paddleW) * 0.5f;
+        this._ballX = w * 0.5f;
+        this._ballY = h - 64.0f - this._ballR - 2.0f;
         this._ballVX = 220.0f;
         this._ballVY = -260.0f;
+        this.ClearParticles();
 
         int i = 0;
         while (i < this._bricks.Length)
         {
-            this._bricks[i] = true;
+            this._bricks[i] = 1;
             i = i + 1;
         }
 
@@ -63,6 +274,10 @@ public class Game : CustomDrawElement
         this.ActionText = "PRESS SPACE OR CLICK TO LAUNCH";
         this.NotifyBindings();
         this.InvalidateDraw();
+        if (ParseUtil.IsNativeReady())
+        {
+            Host_RequestWake();
+        }
     }
 
     private void SyncArenaSize(float w, float h)
@@ -77,7 +292,7 @@ public class Game : CustomDrawElement
             if (!this.IsRunning && !this.IsGameOver)
             {
                 this._ballX = this._paddleX + this._paddleW * 0.5f;
-                this._ballY = h - 86.0f;
+                this._ballY = h - 64.0f - this._ballR - 2.0f;
             }
             this._layoutSynced = true;
         }
@@ -94,7 +309,7 @@ public class Game : CustomDrawElement
         this.ActionText = this.IsRunning ? "" : "PRESS SPACE TO RESUME";
         this.NotifyBindings();
         this.InvalidateDraw();
-        if (this.IsRunning && ParseUtil.IsNativeReady())
+        if (ParseUtil.IsNativeReady())
         {
             Host_RequestWake();
         }
@@ -114,6 +329,7 @@ public class Game : CustomDrawElement
         if (propName == "Lives") { return DependencyObject.BoxInt(this.Lives); }
         if (propName == "StatusText") { return DependencyObject.BoxString(this.StatusText); }
         if (propName == "ActionText") { return DependencyObject.BoxString(this.ActionText); }
+        if (propName == "ActiveParticleCount") { return DependencyObject.BoxInt(this.ActiveParticleCount); }
         return base.GetPropertyValue(propName);
     }
 
@@ -151,12 +367,20 @@ public class Game : CustomDrawElement
         if (e.Key == KeyCode.Left || e.Key == KeyCode.A)
         {
             this._paddleX = Math.Clampf(this._paddleX - 36.0f, 16.0f, w - this._paddleW - 16.0f);
+            if (!this.IsRunning && !this.IsGameOver)
+            {
+                this._ballX = this._paddleX + this._paddleW * 0.5f;
+            }
             this.InvalidateDraw();
             e.Handled = true;
         }
         else if (e.Key == KeyCode.Right || e.Key == KeyCode.D)
         {
             this._paddleX = Math.Clampf(this._paddleX + 36.0f, 16.0f, w - this._paddleW - 16.0f);
+            if (!this.IsRunning && !this.IsGameOver)
+            {
+                this._ballX = this._paddleX + this._paddleW * 0.5f;
+            }
             this.InvalidateDraw();
             e.Handled = true;
         }
@@ -174,28 +398,44 @@ public class Game : CustomDrawElement
 
     public void StepFrame(float dt)
     {
-        if (!this.IsRunning || this.IsGameOver) { return; }
+        if (dt <= 0.0f) { return; }
+        float step = Math.Clampf(dt, 0.001f, 0.05f);
+        bool hadParticles = this.ActiveParticleCount > 0;
+        bool stillParticles = hadParticles ? this.StepParticles(step) : false;
+
+        if (!this.IsRunning || this.IsGameOver)
+        {
+            if (hadParticles)
+            {
+                this.InvalidateDraw();
+                if (stillParticles && ParseUtil.IsNativeReady())
+                {
+                    Host_RequestWake();
+                }
+            }
+            return;
+        }
+
         float w = this.ActualWidth > 10.0f ? this.ActualWidth : this._arenaW;
         float h = this.ActualHeight > 10.0f ? this.ActualHeight : this._arenaH;
-        float step = Math.Clampf(dt, 0.001f, 0.05f);
 
         this._ballX = this._ballX + this._ballVX * step;
         this._ballY = this._ballY + this._ballVY * step;
 
-        if (this._ballX - this._ballR < 12.0f)
+        if (this._ballX - this._ballR < 8.0f)
         {
-            this._ballX = 12.0f + this._ballR;
+            this._ballX = 8.0f + this._ballR;
             this._ballVX = Math.Absf(this._ballVX);
         }
-        else if (this._ballX + this._ballR > w - 12.0f)
+        else if (this._ballX + this._ballR > w - 8.0f)
         {
-            this._ballX = w - 12.0f - this._ballR;
+            this._ballX = w - 8.0f - this._ballR;
             this._ballVX = -Math.Absf(this._ballVX);
         }
 
-        if (this._ballY - this._ballR < 12.0f)
+        if (this._ballY - this._ballR < 8.0f)
         {
-            this._ballY = 12.0f + this._ballR;
+            this._ballY = 8.0f + this._ballR;
             this._ballVY = Math.Absf(this._ballVY);
         }
 
@@ -212,13 +452,14 @@ public class Game : CustomDrawElement
             this._ballVX = hitNorm * 320.0f;
         }
 
-        // Brick grid collision
-        float marginX = 44.0f;
-        float topY = 90.0f;
-        float gap = 6.0f;
+        // Brick grid collision (13 cols x 5 rows matching reference)
+        float marginX = 6.0f;
+        float topY = 148.0f;
+        float gap = 5.0f;
         float brickW = (w - marginX * 2.0f - gap * (float)(this._cols - 1)) / (float)this._cols;
-        float brickH = 22.0f;
+        float brickH = 33.0f;
         int remaining = 0;
+        bool bouncedBrick = false;
 
         int r = 0;
         while (r < this._rows)
@@ -227,16 +468,32 @@ public class Game : CustomDrawElement
             while (c < this._cols)
             {
                 int idx = r * this._cols + c;
-                if (this._bricks[idx])
+                if (this._bricks[idx] != 0)
                 {
                     float bx = marginX + (float)c * (brickW + gap);
                     float by = topY + (float)r * (brickH + gap);
-                    if (this._ballX + this._ballR >= bx && this._ballX - this._ballR <= bx + brickW &&
+                    if (!bouncedBrick &&
+                        this._ballX + this._ballR >= bx && this._ballX - this._ballR <= bx + brickW &&
                         this._ballY + this._ballR >= by && this._ballY - this._ballR <= by + brickH)
                     {
-                        this._bricks[idx] = false;
-                        this._ballVY = -this._ballVY;
-                        this.Score = this.Score + (5 - r) * 10;
+                        this._bricks[idx] = 0;
+                        bouncedBrick = true;
+                        float overlapLeft = (this._ballX + this._ballR) - bx;
+                        float overlapRight = (bx + brickW) - (this._ballX - this._ballR);
+                        float overlapTop = (this._ballY + this._ballR) - by;
+                        float overlapBottom = (by + brickH) - (this._ballY - this._ballR);
+                        float minOverlapX = Math.Minf(overlapLeft, overlapRight);
+                        float minOverlapY = Math.Minf(overlapTop, overlapBottom);
+                        if (minOverlapX < minOverlapY)
+                        {
+                            this._ballVX = -this._ballVX;
+                        }
+                        else
+                        {
+                            this._ballVY = -this._ballVY;
+                        }
+                        this.Score = this.Score + 10;
+                        this.SpawnBrickShatter(bx, by, brickW, brickH, r);
                     }
                     else
                     {
@@ -269,7 +526,7 @@ public class Game : CustomDrawElement
             {
                 this.IsRunning = false;
                 this._ballX = this._paddleX + this._paddleW * 0.5f;
-                this._ballY = paddleTop - 18.0f;
+                this._ballY = paddleTop - this._ballR - 2.0f;
                 this._ballVY = -260.0f;
                 this.StatusText = "LIFE LOST";
                 this.ActionText = "PRESS SPACE TO LAUNCH";
@@ -278,19 +535,10 @@ public class Game : CustomDrawElement
 
         this.NotifyBindings();
         this.InvalidateDraw();
-        if (this.IsRunning && ParseUtil.IsNativeReady())
+        if ((this.IsRunning || this.ActiveParticleCount > 0) && ParseUtil.IsNativeReady())
         {
             Host_RequestWake();
         }
-    }
-
-    private uint RowColor(int row)
-    {
-        if (row == 0) { return ParseUtil.ParseColor("#FFF43F5E"); }
-        if (row == 1) { return ParseUtil.ParseColor("#FFFB923C"); }
-        if (row == 2) { return ParseUtil.ParseColor("#FFFACC15"); }
-        if (row == 3) { return ParseUtil.ParseColor("#FF34D399"); }
-        return ParseUtil.ParseColor("#FF38BDF8");
     }
 
     public override void OnRender(DrawingContext dc)
@@ -298,63 +546,111 @@ public class Game : CustomDrawElement
         float w = this.ActualWidth > 10.0f ? this.ActualWidth : this._arenaW;
         float h = this.ActualHeight > 10.0f ? this.ActualHeight : this._arenaH;
         this.SyncArenaSize(w, h);
+        this.EnsureBrushes();
 
-        uint bg = ParseUtil.ParseColor("#FF060B14");
-        uint border = ParseUtil.ParseColor("#FF1E3A5F");
-        uint grid = ParseUtil.ParseColor("#FF0E1A2E");
-        uint paddleFill = ParseUtil.ParseColor("#FF38BDF8");
-        uint paddleGlow = ParseUtil.ParseColor("#FFBAE6FD");
-        uint ballCol = ParseUtil.ParseColor("#FFFFFFFF");
-        uint ballHalo = ParseUtil.ParseColor("#8060A5FA");
+        // 1. Dark radial vignette arena background
+        dc.FillRect(0.0f, 0.0f, w, h, this._bgBrush);
 
-        dc.FillRect(0.0f, 0.0f, w, h, bg, -1);
-
-        float gx = 40.0f;
-        while (gx < w)
-        {
-            dc.DrawLine(gx, 0.0f, gx, h, grid, 1.0f);
-            gx = gx + 40.0f;
-        }
-        float gy = 40.0f;
-        while (gy < h)
-        {
-            dc.DrawLine(0.0f, gy, w, gy, grid, 1.0f);
-            gy = gy + 40.0f;
-        }
-
-        dc.StrokeRect(6.0f, 6.0f, w - 12.0f, h - 12.0f, border, 2.0f);
-
-        float marginX = 44.0f;
-        float topY = 90.0f;
-        float gap = 6.0f;
+        // 2. 3D beveled rounded bricks with drop shadow, specular highlight & inner rim
+        float marginX = 6.0f;
+        float topY = 148.0f;
+        float gap = 5.0f;
         float brickW = (w - marginX * 2.0f - gap * (float)(this._cols - 1)) / (float)this._cols;
-        float brickH = 22.0f;
+        float brickH = 33.0f;
+
+        uint brickShadow = ParseUtil.ParseColor("#96000000");
+        uint brickSpec = ParseUtil.ParseColor("#55FFFFFF");
+        uint brickRim = ParseUtil.ParseColor("#78CBD5E1");
+        uint brickBottomShade = ParseUtil.ParseColor("#44000000");
 
         int r = 0;
         while (r < this._rows)
         {
-            uint col = this.RowColor(r);
+            LinearGradientBrush rowBrush = this._brickBrushes[r];
             int c = 0;
             while (c < this._cols)
             {
                 int idx = r * this._cols + c;
-                if (this._bricks[idx])
+                if (this._bricks[idx] != 0)
                 {
                     float bx = marginX + (float)c * (brickW + gap);
                     float by = topY + (float)r * (brickH + gap);
-                    dc.FillRoundedRect(bx, by, brickW, brickH, 4.0f, 4.0f, col, -1);
+                    dc.FillRoundedRect(bx + 3.0f, by + 4.0f, brickW, brickH, 5.0f, 5.0f, brickShadow, -1);
+                    dc.FillRoundedRect(bx, by, brickW, brickH, 5.0f, 5.0f, rowBrush);
+                    dc.FillRoundedRect(bx + 3.0f, by + 2.0f, brickW - 6.0f, 6.0f, 3.0f, 3.0f, brickSpec, -1);
+                    dc.FillRoundedRect(bx + 2.0f, by + brickH - 5.0f, brickW - 4.0f, 3.5f, 2.0f, 2.0f, brickBottomShade, -1);
+                    dc.StrokeRoundedRect(bx + 0.5f, by + 0.5f, brickW - 1.0f, brickH - 1.0f, 5.0f, 5.0f, brickRim, 1.2f);
                 }
                 c = c + 1;
             }
             r = r + 1;
         }
 
-        float paddleTop = h - 64.0f;
-        dc.FillRoundedRect(this._paddleX, paddleTop, this._paddleW, this._paddleH, 6.0f, 6.0f, paddleFill, -1);
-        dc.StrokeRoundedRect(this._paddleX, paddleTop, this._paddleW, this._paddleH, 6.0f, 6.0f, paddleGlow, 1.5f);
+        // 3. Shatter fragments with subtle 3D bevel + shadow
+        int pi = 0;
+        while (pi < this._maxParticles)
+        {
+            if (this._partAlive[pi] != 0)
+            {
+                float ratio = Math.Clampf(this._partLife[pi] / Math.Maxf(0.05f, this._partMaxLife[pi]), 0.0f, 1.0f);
+                float sz = this._partSize[pi] * (0.45f + 0.55f * ratio);
+                float px = this._partX[pi] - sz * 0.5f;
+                float py = this._partY[pi] - sz * 0.5f;
+                uint pCol = ParseUtil.ApplyOpacityToArgb(this.RowParticleColor(this._partRow[pi]), ratio);
+                uint pShadow = ParseUtil.ApplyOpacityToArgb(brickShadow, ratio * 0.7f);
+                uint pHi = ParseUtil.ApplyOpacityToArgb(brickSpec, ratio * 0.85f);
+                dc.FillRoundedRect(px + 2.0f, py + 2.5f, sz, sz, 1.5f, 1.5f, pShadow, -1);
+                dc.FillRoundedRect(px, py, sz, sz, 1.5f, 1.5f, pCol, -1);
+                dc.FillRect(px + 1.0f, py + 1.0f, Math.Maxf(1.0f, sz - 2.0f), 1.5f, pHi, -1);
+            }
+            pi = pi + 1;
+        }
 
-        dc.FillEllipse(this._ballX, this._ballY, this._ballR + 4.0f, this._ballR + 4.0f, ballHalo, -1);
-        dc.FillEllipse(this._ballX, this._ballY, this._ballR, this._ballR, ballCol, -1);
+        // 4. 3D metallic capsule paddle (cyan outer tips + red shoulder caps + brushed silver center + 2 grooves)
+        float px0 = this._paddleX;
+        float py0 = h - 64.0f;
+        float pw = this._paddleW;
+        float ph = this._paddleH;
+        float halfH = ph * 0.5f;
+
+        uint padShadow = ParseUtil.ParseColor("#A8000000");
+        uint grooveCol = ParseUtil.ParseColor("#FF334155");
+        uint grooveHi = ParseUtil.ParseColor("#90FFFFFF");
+        uint collarCol = ParseUtil.ParseColor("#FFE2E8F0");
+        uint paddleRim = ParseUtil.ParseColor("#B0CBD5E1");
+
+        dc.FillRoundedRect(px0 + 4.0f, py0 + 6.0f, pw, ph, halfH, halfH, padShadow, -1);
+        // Cyan glowing outer tips
+        dc.FillRoundedRect(px0, py0 + 3.0f, 22.0f, ph - 6.0f, (ph - 6.0f) * 0.5f, (ph - 6.0f) * 0.5f, this._paddleTipBrush);
+        dc.FillRoundedRect(px0 + pw - 22.0f, py0 + 3.0f, 22.0f, ph - 6.0f, (ph - 6.0f) * 0.5f, (ph - 6.0f) * 0.5f, this._paddleTipBrush);
+        // Glossy red shoulder caps
+        dc.FillRoundedRect(px0 + 8.0f, py0, pw - 16.0f, ph, halfH, halfH, this._paddleRedBrush);
+        // Brushed silver central cylinder
+        float bodyX = px0 + 31.0f;
+        float bodyW = pw - 62.0f;
+        dc.FillRect(bodyX, py0, bodyW, ph, this._paddleSilverBrush);
+        // White-silver collar rings
+        dc.FillRect(bodyX - 2.0f, py0, 2.5f, ph, collarCol, -1);
+        dc.FillRect(bodyX + bodyW - 0.5f, py0, 2.5f, ph, collarCol, -1);
+        // Center horizontal mechanical grooves
+        float grooveX = bodyX + 14.0f;
+        float grooveW = bodyW - 28.0f;
+        dc.FillRect(grooveX, py0 + ph * 0.40f, grooveW, 1.8f, grooveCol, -1);
+        dc.FillRect(grooveX, py0 + ph * 0.62f, grooveW, 1.8f, grooveCol, -1);
+        dc.FillRoundedRect(px0 + 10.0f, py0 + 2.0f, pw - 20.0f, 4.5f, 2.2f, 2.2f, grooveHi, -1);
+        dc.StrokeRoundedRect(px0 + 8.0f, py0 + 0.5f, pw - 16.0f, ph - 1.0f, halfH, halfH, paddleRim, 1.1f);
+
+        // 5. 3D glossy blue sphere ball (shadow + specular highlight + main FillEllipse LAST for test invariant)
+        float br = this._ballR;
+        uint ballShadow = ParseUtil.ParseColor("#AA000000");
+        uint specOuter = ParseUtil.ParseColor("#B8BAE6FD");
+        uint specCore = ParseUtil.ParseColor("#F2FFFFFF");
+        dc.FillRoundedRect(this._ballX - br + 4.0f, this._ballY - br + 5.0f, br * 2.0f, br * 2.0f, br, br, ballShadow, -1);
+        // Main 3D sphere FillEllipse MUST be the final FillEllipse command in OnRender
+        dc.FillEllipse(this._ballX, this._ballY, br, br, this._ballSphereBrush);
+        // Crisp specular highlight dots rendered via rounded-rect circles so FillEllipse invariant stays exact
+        dc.FillRoundedRect(this._ballX - br * 0.56f, this._ballY - br * 0.58f, br * 0.62f, br * 0.50f, br * 0.28f, br * 0.25f, specOuter, -1);
+        dc.FillRoundedRect(this._ballX - br * 0.44f, this._ballY - br * 0.48f, br * 0.34f, br * 0.28f, br * 0.15f, br * 0.14f, specCore, -1);
     }
 }
 

@@ -2889,8 +2889,8 @@ void TestInteractiveMenu3D(aero::rs_comp::CompilerSession& session, std::uint32_
             if (cb && cb->scriptOwner.valid()) {
                 const aero::Rect cbVp = NodeViewportBounds(*cb);
                 host.InjectClick(cbVp.x + cbVp.width * 0.5f, cbVp.y + cbVp.height * 0.5f);
-                for (int f = 0; f < 4; ++f) {
-                    host.StepFrame(1.0f / 60.0f, f == 3);
+                for (int f = 0; f < 18; ++f) {
+                    host.StepFrame(1.0f / 60.0f, f == 17);
                 }
                 bool aaChecked = false;
                 Require(ReadBoolMember(host, cb->scriptOwner, "IsChecked", aaChecked) && aaChecked,
@@ -3566,6 +3566,493 @@ void TestInteractiveBrushShaders(aero::rs_comp::CompilerSession&) {
         "BrushShaders AnimNoise should change rendered pixels over 0.5s");
 }
 
+
+void TestRegressionReviewFixes(aero::rs_comp::CompilerSession& session) {
+    std::cout << "[Regression] All Review Fixes...\n";
+
+    // 1. CustomRender: 3D glossy shapes, brick shatter particles, and paused/game-over ResetGame redraw
+    {
+        aero::AeroV3CompileInput ci;
+        aero::AeroAppHostConfig hc;
+        Require(BuildDiscoveredSample(fs::path(AERO_SAMPLES_DIR) / "CustomRender", nullptr, ci, hc, 1280u, 720u),
+            "CustomRender regression discover failed");
+        aero::AeroAppHost host(hc);
+        std::string err;
+        Require(host.CompileAndLoad(ci, &err), "CustomRender regression load failed: " + err);
+        for (int f = 0; f < 5; ++f) { host.StepFrame(1.0f / 60.0f, f == 4); }
+
+        const aero::VisualNodeId gameId = host.FindVisualByOwnerName("GameControl");
+        const aero::VisualNode* gameNode = host.World().GetNode(gameId);
+        Require(gameNode && gameNode->hasScriptOwner, "CustomRender GameControl missing");
+
+        std::vector<std::uint8_t> initialResetFrame;
+        Require(host.RenderHeadlessRgba(1280u, 720u, initialResetFrame), "CustomRender initial render failed");
+
+        const aero::DrawingCommandList* initCmds = host.DrawBuffer().FindCommands(gameId);
+        Require(initCmds != nullptr && initCmds->commands.size() >= 260u,
+            "CustomRender should emit layered 3D commands for arena, 65 bricks, paddle, and ball");
+
+        host.InjectKey(aero::KeyCode::Space, true);
+        host.InjectKey(aero::KeyCode::Space, false);
+        host.StepFrame(0.0f, true);
+        std::int64_t scoreHit = 0, particlesHit = 0;
+        for (int step = 0; step < 120; ++step) {
+            host.StepFrame(1.0f / 60.0f, true);
+            (void)ReadIntMember(host, gameNode->scriptOwner, "Score", scoreHit);
+            if (scoreHit > 0) {
+                for (int extra = 0; extra < 8; ++extra) { host.StepFrame(1.0f / 60.0f, true); }
+                (void)ReadIntMember(host, gameNode->scriptOwner, "ActiveParticleCount", particlesHit);
+                break;
+            }
+        }
+        Require(scoreHit >= 10 && particlesHit >= 8,
+            "CustomRender hitting brick should award 10 pts and spawn shatter particles (score=" +
+            std::to_string(scoreHit) + ", particles=" + std::to_string(particlesHit) + ")");
+
+        std::vector<std::uint8_t> midPlayFrame;
+        Require(host.RenderHeadlessRgba(1280u, 720u, midPlayFrame), "CustomRender mid-play render failed");
+        MaybeDumpScreenshot(host, "verify_customrender_shatter.ppm", 1280u, 720u);
+        Require(CountChangedPixels(initialResetFrame, midPlayFrame) > 500u,
+            "CustomRender mid-play frame should visibly differ from initial frame");
+
+        // Pause first, then press R to reset while paused -> canvas MUST immediately redraw to READY state
+        host.InjectKey(aero::KeyCode::Space, true);
+        host.InjectKey(aero::KeyCode::Space, false);
+        host.StepFrame(0.0f, true);
+        host.InjectKey(aero::KeyCode::R, true);
+        host.InjectKey(aero::KeyCode::R, false);
+        host.StepFrame(0.0f, true);
+
+        std::int64_t scoreAfterReset = -1, particlesAfterReset = -1;
+        Require(ReadIntMember(host, gameNode->scriptOwner, "Score", scoreAfterReset) && scoreAfterReset == 0,
+            "CustomRender R reset should restore Score=0");
+        Require(ReadIntMember(host, gameNode->scriptOwner, "ActiveParticleCount", particlesAfterReset) && particlesAfterReset == 0,
+            "CustomRender R reset should clear shatter particles");
+        std::vector<std::uint8_t> afterResetFrame;
+        Require(host.RenderHeadlessRgba(1280u, 720u, afterResetFrame), "CustomRender after-reset render failed");
+        Require(CountChangedPixels(midPlayFrame, afterResetFrame) > 500u &&
+                CountChangedPixels(initialResetFrame, afterResetFrame) < 80u,
+            "CustomRender pressing R while paused must immediately redraw reset board");
+    }
+
+    // 2. Login: templated TextBox/PasswordBox typing, blinking caret, and placeholder trigger
+    {
+        aero::AeroV3CompileInput ci;
+        aero::AeroAppHostConfig hc;
+        Require(BuildDiscoveredSample(fs::path(AERO_SAMPLES_DIR) / "Login", nullptr, ci, hc, 1280u, 720u),
+            "Login regression discover failed");
+        aero::AeroAppHost host(hc);
+        std::string err;
+        Require(host.CompileAndLoad(ci, &err), "Login regression load failed: " + err);
+        for (int f = 0; f < 40; ++f) { host.StepFrame(1.0f / 60.0f, f == 39); }
+
+        float ux = 0.0f, uy = 0.0f;
+        aero::VisualNodeId userId{};
+        Require(RequireNodeCenter(host, "UserBox", ux, uy, &userId), "Login UserBox missing");
+        host.InjectClick(ux, uy);
+        host.InjectTextInput("abc");
+        host.StepFrame(0.05f, true);
+        MaybeDumpScreenshot(host, "verify_login_typing.ppm", 1280u, 720u);
+
+        std::vector<std::uint8_t> caretOnFrame, caretOffFrame;
+        Require(host.RenderHeadlessRgba(1280u, 720u, caretOnFrame), "Login caret-on render failed");
+        host.StepFrame(0.55f, true);
+        Require(host.RenderHeadlessRgba(1280u, 720u, caretOffFrame), "Login caret-off render failed");
+        Require(CountChangedPixels(caretOnFrame, caretOffFrame) > 0u,
+            "Login focused UserBox caret must blink between t=0.05s and t=0.60s");
+
+        float px = 0.0f, py = 0.0f;
+        aero::VisualNodeId passId{};
+        Require(RequireNodeCenter(host, "PassBox", px, py, &passId), "Login PassBox missing");
+        const aero::VisualNode* passNode = host.World().GetNode(passId);
+        const aero::VisualNodeId passHostId = FindDescendantByOwnerName(host, passId, "PART_ContentHost");
+        Require(passHostId.IsValid(), "Login PassBox PART_ContentHost missing");
+        const aero::VisualNodeId passPlaceholderId = FindDescendantByOwnerName(host, passId, "Placeholder");
+        const aero::VisualNode* passPlaceholderBefore =
+            passPlaceholderId.IsValid() ? host.World().GetNode(passPlaceholderId) : nullptr;
+        Require(passPlaceholderBefore && passPlaceholderBefore->layout.visibility == aero::Visibility::Visible,
+            "Login PassBox Placeholder must be Visible before typing (noesis:Text.PasswordLength == 0 trigger)");
+        host.InjectClick(px, py);
+        host.InjectTextInput("secret");
+        host.StepFrame(0.05f, true);
+        std::string passRaw;
+        Require(passNode && ReadStringMember(host, passNode->scriptOwner, "Password", passRaw) && passRaw == "secret",
+            "Login PassBox Password should equal typed string (got '" + passRaw + "')");
+        const aero::VisualNode* passPlaceholderAfter = host.World().GetNode(passPlaceholderId);
+        Require(passPlaceholderAfter && passPlaceholderAfter->layout.visibility == aero::Visibility::Collapsed,
+            "Login PassBox Placeholder must collapse once password length becomes 6");
+        const aero::VisualNodeId passTxtId = FindDescendantByOwnerName(host, passId, "PART_Text");
+        const aero::VisualNode* passTxt = host.World().GetNode(passTxtId);
+        const std::string expectedBullets =
+            "\xE2\x97\x8F\xE2\x97\x8F\xE2\x97\x8F\xE2\x97\x8F\xE2\x97\x8F\xE2\x97\x8F";
+        const std::string actualMaskText =
+            (passTxt && passTxt->kind == aero::VisualKind::Text) ? passTxt->Text().text : std::string{};
+        Require(passTxt && passTxt->kind == aero::VisualKind::Text && actualMaskText == expectedBullets,
+            "Login PassBox PART_Text should render 6 PasswordChar (U+25CF) bullets instead of plaintext (got '" +
+            actualMaskText + "')");
+    }
+
+    // 3. Menu3D: Settings keyboard Up/Down/Left/Right/Enter cycling & Exit menu Shutdown
+    {
+        aero::AeroV3CompileInput ci;
+        aero::AeroAppHostConfig hc;
+        Require(BuildDiscoveredSample(fs::path(AERO_SAMPLES_DIR) / "Menu3D", nullptr, ci, hc, 1280u, 720u),
+            "Menu3D regression discover failed");
+        aero::AeroAppHost host(hc);
+        std::string err;
+        Require(host.CompileAndLoad(ci, &err), "Menu3D regression load failed: " + err);
+        for (int f = 0; f < 30; ++f) { host.StepFrame(1.0f / 60.0f, f == 29); }
+
+        float sx = 0.0f, sy = 0.0f;
+        Require(RequireNodeCenter(host, "Settings", sx, sy), "Menu3D Settings button missing");
+        host.InjectClick(sx, sy);
+        for (int f = 0; f < 65; ++f) { host.StepFrame(1.0f / 60.0f, f == 64); }
+
+        const aero::VisualNodeId texRowId = host.FindVisualByOwnerName("TexDetail");
+        const aero::VisualNodeId texId = host.FindVisualByOwnerName("TexDetailContent");
+        const aero::VisualNode* texNode = host.World().GetNode(texId);
+        Require(texRowId.IsValid() && texNode && texNode->scriptOwner.valid(), "Menu3D TexDetailContent missing");
+        const aero::Rect texVp = NodeViewportBounds(*host.World().GetNode(texRowId));
+        host.InjectPointerMove(texVp.x + 24.0f, texVp.y + texVp.height * 0.5f);
+        host.InjectClick(texVp.x + 24.0f, texVp.y + texVp.height * 0.5f);
+        host.StepFrame(1.0f / 60.0f, true);
+
+        // TexDetail starts at index 1 (Medium); Enter cycles 1 -> 2 (High) -> 0 (Low)
+        host.InjectKey(aero::KeyCode::Enter, true);
+        host.InjectKey(aero::KeyCode::Enter, false);
+        for (int f = 0; f < 4; ++f) { host.StepFrame(1.0f / 60.0f, f == 3); }
+        std::int64_t idxAfterEnter1 = -1;
+        Require(ReadIntMember(host, texNode->scriptOwner, "SelectedIndex", idxAfterEnter1) && idxAfterEnter1 == 2,
+            "Menu3D Enter on TexDetail should advance SelectedIndex 1 -> 2 (got " + std::to_string(idxAfterEnter1) + ")");
+
+        host.InjectKey(aero::KeyCode::Enter, true);
+        host.InjectKey(aero::KeyCode::Enter, false);
+        for (int f = 0; f < 4; ++f) { host.StepFrame(1.0f / 60.0f, f == 3); }
+        std::int64_t idxAfterEnter2 = -1;
+        Require(ReadIntMember(host, texNode->scriptOwner, "SelectedIndex", idxAfterEnter2) && idxAfterEnter2 == 0,
+            "Menu3D Enter at max option should wrap SelectedIndex 2 -> 0 (got " + std::to_string(idxAfterEnter2) + ")");
+
+        // Down arrow moves focus from TexDetail to AAlias CheckBox (not captured by inner horizontal ListBox)
+        host.InjectKey(aero::KeyCode::Down, true);
+        host.InjectKey(aero::KeyCode::Down, false);
+        for (int f = 0; f < 4; ++f) { host.StepFrame(1.0f / 60.0f, f == 3); }
+        const aero::VisualNodeId aaId = host.FindVisualByOwnerName("AAlias");
+        const aero::VisualNodeId aaCbId = FindDescendantByTypeName(host, aaId, "CheckBox");
+        const aero::VisualNode* aaCb = host.World().GetNode(aaCbId);
+        bool aaFocused = false;
+        Require(aaCb && ReadBoolMember(host, aaCb->scriptOwner, "IsFocused", aaFocused) && aaFocused,
+            "Menu3D Down arrow from TexDetail must move focus to AAlias CheckBox");
+
+        // Toggle AAlias CheckBox Checked -> Unchecked; empty <VisualState x:Name="Unchecked"/> must restore CheckMark
+        const aero::Rect aaVp = NodeViewportBounds(*aaCb);
+        const aero::VisualNodeId cmId = FindDescendantByOwnerName(host, aaCbId, "CheckMark");
+        Require(cmId.IsValid(), "Menu3D AAlias CheckMark missing");
+        host.InjectClick(aaVp.x + aaVp.width * 0.5f, aaVp.y + aaVp.height * 0.5f);
+        for (int f = 0; f < 18; ++f) { host.StepFrame(1.0f / 60.0f, f == 17); }
+        bool aaChecked1 = false;
+        Require(ReadBoolMember(host, aaCb->scriptOwner, "IsChecked", aaChecked1) && aaChecked1,
+            "Menu3D clicking AAlias CheckBox must check it");
+        const aero::VisualNode* cmChecked = host.World().GetNode(cmId);
+        Require(cmChecked && cmChecked->Vector().strokeOpacity > 0.9f,
+            "Menu3D AAlias CheckMark strokeOpacity must reach ~1.0 when Checked");
+
+        host.InjectClick(aaVp.x + aaVp.width * 0.5f, aaVp.y + aaVp.height * 0.5f);
+        for (int f = 0; f < 25; ++f) { host.StepFrame(1.0f / 60.0f, f == 24); }
+        bool aaChecked2 = true;
+        Require(ReadBoolMember(host, aaCb->scriptOwner, "IsChecked", aaChecked2) && !aaChecked2,
+            "Menu3D second click on AAlias CheckBox must uncheck it");
+        const aero::VisualNode* cmUnchecked = host.World().GetNode(cmId);
+        Require(cmUnchecked && cmUnchecked->Vector().strokeOpacity < 0.05f,
+            "Menu3D empty Unchecked state must restore CheckMark strokeOpacity back to ~0");
+
+        // Escape back to MainMenu, then click Exit -> host.IsCloseRequested() must become true
+        host.InjectKey(aero::KeyCode::Escape, true);
+        host.InjectKey(aero::KeyCode::Escape, false);
+        for (int f = 0; f < 65; ++f) { host.StepFrame(1.0f / 60.0f, f == 64); }
+        Require(!host.IsCloseRequested(), "Menu3D should not request close before Exit");
+        float ex = 0.0f, ey = 0.0f;
+        Require(RequireNodeCenter(host, "Exit", ex, ey), "Menu3D Exit button missing");
+        host.InjectClick(ex, ey);
+        host.StepFrame(1.0f / 60.0f, true);
+        Require(host.IsCloseRequested(), "Menu3D clicking Exit must trigger Application.Shutdown / IsCloseRequested()");
+    }
+
+    // 4. HelloWorld: NoesisGUI text clipped at Width=0 during Logo rotation (t=0.25s) and revealed at t=1.05s
+    {
+        aero::AeroV3CompileInput ci;
+        aero::AeroAppHostConfig hc;
+        Require(BuildDiscoveredSample(fs::path(AERO_SAMPLES_DIR) / "HelloWorld", nullptr, ci, hc, 1280u, 720u),
+            "HelloWorld regression discover failed");
+        aero::AeroAppHost host(hc);
+        std::string err;
+        Require(host.CompileAndLoad(ci, &err), "HelloWorld regression load failed: " + err);
+        for (int f = 0; f < 15; ++f) { host.StepFrame(1.0f / 60.0f, f == 14); } // t = 0.25s
+        const aero::VisualNodeId txtPanelId = host.FindVisualByOwnerName("NoesisGUI");
+        const aero::VisualNode* txtPanel = host.World().GetNode(txtPanelId);
+        Require(txtPanel && txtPanel->layout.layoutRect.width < 1.0f && txtPanel->layout.needsLayoutClip,
+            "HelloWorld NoesisGUI panel at t=0.25s must have Width~0 and needsLayoutClip=true");
+        std::vector<std::uint8_t> earlyFrame;
+        Require(host.RenderHeadlessRgba(1280u, 720u, earlyFrame), "HelloWorld t=0.25s render failed");
+        MaybeDumpScreenshot(host, "verify_helloworld_t025.ppm", 1280u, 720u);
+
+        for (int f = 0; f < 48; ++f) { host.StepFrame(1.0f / 60.0f, f == 47); } // t = 1.05s
+        std::vector<std::uint8_t> lateFrame;
+        Require(host.RenderHeadlessRgba(1280u, 720u, lateFrame), "HelloWorld t=1.05s render failed");
+        MaybeDumpScreenshot(host, "verify_helloworld_t105.ppm", 1280u, 720u);
+        Require(CountChangedPixels(earlyFrame, lateFrame) > 800u,
+            "HelloWorld NoesisGUI text must reveal from left to right after Symbol rotation");
+    }
+
+    // 5. Inventory: pointer press -> drag -> release equips item onto compatible slot & updates Player.Slots[i]
+    {
+        aero::AeroV3CompileInput ci;
+        aero::AeroAppHostConfig hc;
+        Require(BuildDiscoveredSample(fs::path(AERO_SAMPLES_DIR) / "Inventory", nullptr, ci, hc, 1280u, 720u),
+            "Inventory regression discover failed");
+        aero::AeroAppHost host(hc);
+        std::string err;
+        Require(host.CompileAndLoad(ci, &err), "Inventory regression load failed: " + err);
+        for (int f = 0; f < 20; ++f) { host.StepFrame(1.0f / 60.0f, f == 19); }
+
+        const aero::VisualNodeId lbId = host.FindVisualByOwnerName("InventoryListBox");
+        std::vector<aero::VisualNodeId> bagItems;
+        CollectDescendantsByTypeName(host, lbId, "ListBoxItem", bagItems);
+        Require(bagItems.size() >= 2u, "Inventory drag test requires >=2 bag items");
+        const aero::VisualNode* bag0 = host.World().GetNode(bagItems[0]);
+        const aero::Rect b0Vp = NodeViewportBounds(*bag0);
+        float leftCx = 0.0f, leftCy = 0.0f;
+        aero::VisualNodeId slotLeftId{};
+        Require(RequireNodeCenter(host, "SlotLeft", leftCx, leftCy, &slotLeftId), "Inventory SlotLeft missing");
+
+        const float sx = b0Vp.x + b0Vp.width * 0.5f;
+        const float sy = b0Vp.y + b0Vp.height * 0.5f;
+        host.InjectPointerMove(sx, sy);
+        host.InjectPointerButton(sx, sy, aero::PointerButton::Left, true);
+        host.StepFrame(1.0f / 60.0f, false);
+        host.InjectPointerMove(sx + 16.0f, sy + 8.0f);
+        host.StepFrame(1.0f / 60.0f, true);
+        host.InjectPointerMove(leftCx, leftCy);
+        host.StepFrame(1.0f / 60.0f, true);
+        host.InjectPointerButton(leftCx, leftCy, aero::PointerButton::Left, false);
+        for (int f = 0; f < 10; ++f) { host.StepFrame(1.0f / 60.0f, f == 9); }
+
+        const aero::VisualNode* slotLeftNode = host.World().GetNode(slotLeftId);
+        std::string slotLeftItemName;
+        Require(slotLeftNode && ReadStringMember(host, slotLeftNode->scriptOwner, "Content.Name", slotLeftItemName) &&
+                !slotLeftItemName.empty(),
+            "Inventory pointer drag-and-drop onto SlotLeft must equip dragged item (got '" + slotLeftItemName + "')");
+    }
+
+    // 6. TicTacToe: implicit Style Trigger IsChecked=True disables occupied cell and blocks second move
+    {
+        aero::AeroV3CompileInput ci;
+        aero::AeroAppHostConfig hc;
+        Require(BuildDiscoveredSample(fs::path(AERO_SAMPLES_DIR) / "TicTacToe", nullptr, ci, hc, 1280u, 720u),
+            "TicTacToe regression discover failed");
+        aero::AeroAppHost host(hc);
+        std::string err;
+        Require(host.CompileAndLoad(ci, &err), "TicTacToe regression load failed: " + err);
+        for (int f = 0; f < 110; ++f) { host.StepFrame(1.0f / 60.0f, f == 109); }
+
+        aero::ObjectRef vmRef{};
+        Require(ReadObjectMember(host, host.RootScriptObject(), "VM", vmRef), "TicTacToe VM missing");
+
+        float cx = 0.0f, cy = 0.0f;
+        aero::VisualNodeId cell0Id{};
+        Require(RequireNodeCenter(host, "Cell0", cx, cy, &cell0Id), "TicTacToe Cell0 missing");
+        const aero::VisualNode* cell0 = host.World().GetNode(cell0Id);
+        Require(cell0 && cell0->scriptOwner.valid(), "TicTacToe Cell0 scriptOwner missing");
+
+        host.InjectClick(cx, cy);
+        for (int f = 0; f < 45; ++f) { host.StepFrame(1.0f / 60.0f, f == 44); }
+        bool checked1 = false, enabled1 = true;
+        std::int64_t mark1 = 0;
+        Require(ReadBoolMember(host, cell0->scriptOwner, "IsChecked", checked1) && checked1,
+            "TicTacToe first click on Cell0 should check Cell0");
+        Require(ReadBoolMember(host, cell0->scriptOwner, "IsEnabled", enabled1) && !enabled1,
+            "TicTacToe implicit Style Trigger IsChecked=True should disable Cell0 (IsEnabled=false)");
+        Require(ReadIntMember(host, vmRef, "Cell0", mark1) && mark1 != 0,
+            "TicTacToe first click should record mark in VM.Cell0");
+
+        // Second click on occupied Cell0 must be rejected (neither unchecking nor switching to Player 2)
+        host.InjectClick(cx, cy);
+        for (int f = 0; f < 10; ++f) { host.StepFrame(1.0f / 60.0f, f == 9); }
+        bool checked2 = false, enabled2 = true;
+        std::int64_t mark2 = -1;
+        Require(ReadBoolMember(host, cell0->scriptOwner, "IsChecked", checked2) && checked2,
+            "TicTacToe second click on occupied Cell0 must keep IsChecked=true");
+        Require(ReadBoolMember(host, cell0->scriptOwner, "IsEnabled", enabled2) && !enabled2,
+            "TicTacToe occupied Cell0 must remain IsEnabled=false");
+        Require(ReadIntMember(host, vmRef, "Cell0", mark2) && mark2 == mark1,
+            "TicTacToe second click on occupied Cell0 must not overwrite VM.Cell0");
+    }
+
+    // 7. BackgroundBlur: progressive blur across 0 -> 20 -> 40 without mid-slider saturation
+    {
+        aero::AeroV3CompileInput ci;
+        aero::AeroAppHostConfig hc;
+        Require(BuildDiscoveredSample(fs::path(AERO_SAMPLES_DIR) / "BackgroundBlur", nullptr, ci, hc, 1280u, 720u),
+            "BackgroundBlur regression discover failed");
+        aero::AeroAppHost host(hc);
+        std::string err;
+        Require(host.CompileAndLoad(ci, &err), "BackgroundBlur regression load failed: " + err);
+        for (int f = 0; f < 15; ++f) { host.StepFrame(1.0f / 60.0f, f == 14); }
+        MaybeDumpScreenshot(host, "verify_backgroundblur.ppm", 1280u, 720u);
+
+        std::vector<std::uint8_t> frameMid20;
+        Require(host.RenderHeadlessRgba(1280u, 720u, frameMid20), "BackgroundBlur mid=20 render failed");
+
+        const aero::VisualNodeId topSliderId = host.FindVisualByOwnerName("TopBlurRadius");
+        const aero::VisualNode* topSlider = host.World().GetNode(topSliderId);
+        Require(topSlider != nullptr, "BackgroundBlur TopBlurRadius missing");
+        const aero::Rect sVp = NodeViewportBounds(*topSlider);
+
+        host.InjectClick(sVp.x + sVp.width - 2.0f, sVp.y + sVp.height * 0.5f);
+        for (int f = 0; f < 5; ++f) { host.StepFrame(1.0f / 60.0f, f == 4); }
+        std::vector<std::uint8_t> frameMax40;
+        Require(host.RenderHeadlessRgba(1280u, 720u, frameMax40), "BackgroundBlur max=40 render failed");
+        Require(CountChangedPixels(frameMid20, frameMax40) > 500u,
+            "BackgroundBlur must continue blurring progressively from Value=20 to Value=40");
+    }
+
+    // 8. CustomAnimation: dashed vector strokes, SVG elliptical arc gauge dots & true R=40 circular orbit
+    {
+        aero::AeroV3CompileInput ci;
+        aero::AeroAppHostConfig hc;
+        Require(BuildDiscoveredSample(fs::path(AERO_SAMPLES_DIR) / "CustomAnimation", &session, ci, hc, 1280u, 720u),
+            "CustomAnimation regression discover failed");
+        aero::AeroAppHost host(hc);
+        std::string err;
+        Require(host.CompileAndLoad(ci, &err), "CustomAnimation regression load failed: " + err);
+        for (int f = 0; f < 15; ++f) { host.StepFrame(1.0f / 60.0f, f == 14); }
+
+        const aero::VisualNodeId dot1Id = host.FindVisualByOwnerName("Dot1");
+        const aero::VisualNode* dot1 = host.World().GetNode(dot1Id);
+        Require(dot1 != nullptr, "CustomAnimation Dot1 missing");
+        const float rOrbit = std::hypot(dot1->transform2D.tx, dot1->transform2D.ty);
+        Require(rOrbit > 37.5f && rOrbit < 42.5f,
+            "CustomAnimation Dot1 should follow true R=40 circle at t=0.25s (got r=" + std::to_string(rOrbit) + ")");
+        for (int f = 0; f < 120; ++f) { host.StepFrame(1.0f / 60.0f, f == 119); } // t = 2.25s (second orbit!)
+        const aero::VisualNode* dot225 = host.World().GetNode(dot1Id);
+        const float tx225 = dot225 ? dot225->transform2D.tx : 0.0f;
+        const float ty225 = dot225 ? dot225->transform2D.ty : 0.0f;
+        const float rOrbit225 = std::hypot(tx225, ty225);
+        Require(rOrbit225 > 37.5f && rOrbit225 < 42.5f,
+            "CustomAnimation Dot1 must stay on R=40 circle past 2.0s at t=2.25s (got r=" + std::to_string(rOrbit225) + ")");
+        for (int f = 0; f < 30; ++f) { host.StepFrame(1.0f / 60.0f, f == 29); } // t = 2.75s
+        const aero::VisualNode* dot275 = host.World().GetNode(dot1Id);
+        const float tx275 = dot275 ? dot275->transform2D.tx : 0.0f;
+        const float ty275 = dot275 ? dot275->transform2D.ty : 0.0f;
+        const float rOrbit275 = std::hypot(tx275, ty275);
+        const float delta225To275 = std::hypot(tx275 - tx225, ty275 - ty225);
+        Require(rOrbit275 > 37.5f && rOrbit275 < 42.5f && delta225To275 > 20.0f,
+            "CustomAnimation Dot1 must keep orbiting smoothly between t=2.25s and t=2.75s");
+        MaybeDumpScreenshot(host, "verify_customanimation.ppm", 1280u, 720u);
+    }
+
+    // 9. UserControl: NumericUpDown ElementName=NumericUpDownControl displays 10, 14, 8, 12 + BarStr + MinRepeatButton disabled
+    {
+        aero::AeroV3CompileInput ci;
+        aero::AeroAppHostConfig hc;
+        Require(BuildDiscoveredSample(fs::path(AERO_SAMPLES_DIR) / "UserControl", &session, ci, hc, 1280u, 720u),
+            "UserControl regression discover failed");
+        aero::AeroAppHost host(hc);
+        std::string err;
+        Require(host.CompileAndLoad(ci, &err), "UserControl regression load failed: " + err);
+        for (int f = 0; f < 28; ++f) { host.StepFrame(1.0f / 60.0f, f == 27); }
+        std::unordered_set<std::string> texts;
+        auto walkTexts = [&](auto& self, aero::VisualNodeId nid) -> void {
+            const aero::VisualNode* n = host.World().GetNode(nid);
+            if (!n) return;
+            if (n->kind == aero::VisualKind::Text && !n->Text().text.empty()) {
+                texts.insert(n->Text().text);
+            }
+            for (aero::VisualNodeId cid : n->children) self(self, cid);
+        };
+        walkTexts(walkTexts, host.World().Root());
+        Require(texts.count("10") > 0u && texts.count("14") > 0u &&
+                texts.count("8") > 0u && texts.count("12") > 0u,
+            "UserControl NumericUpDown TextBlocks must display 10, 14, 8, and 12");
+
+        const aero::VisualNodeId barStrId = host.FindVisualByOwnerName("BarStr");
+        const aero::VisualNode* barStrNode = host.World().GetNode(barStrId);
+        float barStrVal = 0.0f;
+        Require(barStrNode && ReadFloatMember(host, barStrNode->scriptOwner, "Value", barStrVal) &&
+                std::fabs(barStrVal - 10.0f) < 0.2f,
+            "UserControl BarStr Value should match StatStr Value=10 (got " + std::to_string(barStrVal) + ")");
+
+        const aero::VisualNodeId statStrId = host.FindVisualByOwnerName("StatStr");
+        const aero::VisualNode* statStrNode = host.World().GetNode(statStrId);
+        std::int64_t minVal = 0;
+        Require(statStrNode && ReadIntMember(host, statStrNode->scriptOwner, "MinValue", minVal) && minVal == 3,
+            "UserControl StatStr MinValue should equal 3 from XAML attribute (got " + std::to_string(minVal) + ")");
+        const aero::VisualNodeId downBtnId = FindDescendantByOwnerName(host, statStrId, "DownButton");
+        const aero::VisualNode* downBtn = host.World().GetNode(downBtnId);
+        bool downEnBefore = false;
+        Require(downBtn && ReadBoolMember(host, downBtn->scriptOwner, "IsEnabled", downEnBefore) && downEnBefore,
+            "UserControl StatStr DownButton should start enabled at Value=10");
+        const aero::Rect downVp = NodeViewportBounds(*downBtn);
+        for (int click = 0; click < 7; ++click) {
+            host.InjectClick(downVp.x + downVp.width * 0.5f, downVp.y + downVp.height * 0.5f);
+            for (int f = 0; f < 3; ++f) { host.StepFrame(1.0f / 60.0f, f == 2); }
+        }
+        float statStrAfter = 0.0f;
+        Require(ReadFloatMember(host, statStrNode->scriptOwner, "Value", statStrAfter) &&
+                std::fabs(statStrAfter - 3.0f) < 0.05f,
+            "UserControl StatStr Value should decrement to MinValue=3 after 7 clicks (got " +
+            std::to_string(statStrAfter) + ")");
+        bool downEnAfter = true;
+        Require(ReadBoolMember(host, downBtn->scriptOwner, "IsEnabled", downEnAfter) && !downEnAfter,
+            "UserControl StatStr MinRepeatButton must disable DownButton when Value reaches MinValue=3");
+        MaybeDumpScreenshot(host, "verify_usercontrol.ppm", 1280u, 720u);
+    }
+
+    // 10. Vertical templated ProgressBar: rotated horizontal template tracks PART_Indicator.Width without clobbering Height
+    {
+        aero::AeroV3CompileInput ci;
+        ci.xamlPath = "VerticalTemplatedPb.xaml";
+        ci.xamlContent = R"XAML(
+<Grid xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+      xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+      Width="200" Height="200">
+  <ProgressBar x:Name="VertPb" Orientation="Vertical" Minimum="0" Maximum="100" Value="50"
+               Width="16" Height="120">
+    <ProgressBar.Template>
+      <ControlTemplate TargetType="ProgressBar">
+        <Grid Width="120" Height="16">
+          <Grid.LayoutTransform>
+            <RotateTransform Angle="-90"/>
+          </Grid.LayoutTransform>
+          <Border x:Name="PART_Track" Width="120" Height="16"/>
+          <Border x:Name="PART_Indicator" HorizontalAlignment="Left" Width="10" Height="16"/>
+        </Grid>
+      </ControlTemplate>
+    </ProgressBar.Template>
+  </ProgressBar>
+</Grid>
+)XAML";
+        ci.stdlibRootDir = AERO_STDLIB_DIR;
+        ci.compilerSession = &session;
+        ci.includeStdlib = true;
+        ci.treeShakeStdlib = true;
+        ci.allowDiskCache = true;
+        aero::AeroAppHostConfig hc;
+        hc.viewportWidth = 200u;
+        hc.viewportHeight = 200u;
+        aero::AeroAppHost host(hc);
+        std::string err;
+        Require(host.CompileAndLoad(ci, &err), "VerticalTemplatedPb load failed: " + err);
+        for (int f = 0; f < 4; ++f) { host.StepFrame(1.0f / 60.0f, f == 3); }
+        const aero::VisualNodeId indId = host.FindVisualByOwnerName("PART_Indicator");
+        const aero::VisualNode* indNode = host.World().GetNode(indId);
+        Require(indNode != nullptr, "VerticalTemplatedPb PART_Indicator missing");
+        const aero::Rect ir = indNode->layout.layoutRect;
+        Require(ir.width > 55.0f && ir.width < 65.0f && ir.height > 14.0f && ir.height < 18.0f,
+            "Vertical templated ProgressBar PART_Indicator must size Width=~60 and keep Height=~16 (got " +
+            std::to_string(ir.width) + "x" + std::to_string(ir.height) + ")");
+    }
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -3610,6 +4097,7 @@ int main(int argc, char** argv) {
         if (want("rive")) { TestInteractiveRive(sharedSession); }
         if (want("customrender")) { TestInteractiveCustomRender(sharedSession); }
         if (want("brushshaders")) { TestInteractiveBrushShaders(sharedSession); }
+        if (want("reviewfixes")) { TestRegressionReviewFixes(sharedSession); }
     }
 
     if (want("interactive")) {
@@ -3631,6 +4119,7 @@ int main(int argc, char** argv) {
         TestInteractiveRive(sharedSession);
         TestInteractiveCustomRender(sharedSession);
         TestInteractiveBrushShaders(sharedSession);
+        TestRegressionReviewFixes(sharedSession);
     }
 
     if (gFailureCount != 0) {

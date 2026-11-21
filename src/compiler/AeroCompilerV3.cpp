@@ -1168,7 +1168,7 @@ void RecordFastStdlibHash(
     WriteBinaryFileAtomic(cacheDir / "stdlib_stat_v1.bin", buf);
 }
 
-constexpr std::uint32_t kProgramCacheVersion = 5u;
+constexpr std::uint32_t kProgramCacheVersion = 8u;
 
 [[nodiscard]] std::pair<std::uint64_t, std::uint64_t> ComputeRawInputBundleKey(
     const AeroV3CompileInput& input,

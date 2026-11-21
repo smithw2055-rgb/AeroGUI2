@@ -19,12 +19,57 @@ public class TextBoxBase : Control {
     private int _anchorCp = 0;
     private bool _dragSelecting = false;
 
+    private static bool _caretHookInstalled = false;
+    private static TextBoxBase _activeBlinkBox;
+    private static float _caretBlinkTimer = 0.0f;
+    private static bool _caretBlinkVisible = true;
+
     protected TextBlock _textVisual;
     protected TextBlock _placeholderVisual;
 
     public event TextChangedEventHandler TextChanged;
 
+    private static void EnsureCaretBlinkHook() {
+        if (_caretHookInstalled) { return; }
+        _caretHookInstalled = true;
+        BindingEngine.AddFrameTickHook((float dt) => { TextBoxBase.StepCaretBlink(dt); });
+    }
+
+    public static void StepCaretBlink(float dt) {
+        if (_activeBlinkBox == null || _activeBlinkBox._isDisposedTree ||
+            !_activeBlinkBox.IsFocused || _activeBlinkBox._isReadOnly) {
+            _activeBlinkBox = null;
+            return;
+        }
+        _caretBlinkTimer += dt;
+        if (_caretBlinkTimer >= 0.53f) {
+            while (_caretBlinkTimer >= 0.53f) {
+                _caretBlinkTimer -= 0.53f;
+            }
+            _caretBlinkVisible = !_caretBlinkVisible;
+            _activeBlinkBox.RefreshTextSelectionVisual();
+        }
+        if (ParseUtil.IsNativeReady()) {
+            int remainMs = (int)((0.53f - _caretBlinkTimer) * 1000.0f) + 1;
+            if (remainMs < 16) { remainMs = 16; }
+            Host_RequestWakeAfterMs(remainMs);
+        }
+    }
+
+    protected void ResetCaretBlinkPhase() {
+        EnsureCaretBlinkHook();
+        _caretBlinkTimer = 0.0f;
+        _caretBlinkVisible = true;
+        if (IsFocused && !_isReadOnly) {
+            _activeBlinkBox = this;
+            if (ParseUtil.IsNativeReady()) {
+                Host_RequestWakeAfterMs(530);
+            }
+        }
+    }
+
     protected TextBoxBase() : base() {
+        EnsureCaretBlinkHook();
         Focusable = true;
         ClipToBounds = true;
         Background = new SolidColorBrush("#FF141821");
@@ -63,7 +108,13 @@ public class TextBoxBase : Control {
     }
     public string PlaceholderText {
         get { return _placeholderText; }
-        set { _placeholderText = value == null ? "" : value; RefreshTextVisual(); }
+        set {
+            _placeholderText = value == null ? "" : value;
+            BindingEngine.MarkFlushDirty();
+            NotifyBoundPropertyChanged("Placeholder", DependencyObject.BoxString(_placeholderText));
+            NotifyBoundPropertyChanged("Text.Placeholder", DependencyObject.BoxString(_placeholderText));
+            RefreshTextVisual();
+        }
     }
     public string Placeholder {
         get { return PlaceholderText; }
@@ -109,8 +160,11 @@ public class TextBoxBase : Control {
             _caretCp = ClampCp(_caretCp);
             _anchorCp = ClampCp(_anchorCp);
         }
+        ResetCaretBlinkPhase();
+        BindingEngine.MarkFlushDirty();
         OnRawTextChanged(_rawText);
         RefreshTextVisual();
+        UpdateTriggersAndStates();
         TextChanged(this, new TextChangedEventArgs(CanExposePlaintext() ? _rawText : "", this));
     }
 
@@ -152,6 +206,7 @@ public class TextBoxBase : Control {
     public void MoveCaret(int targetCp, bool extendSelection) {
         _caretCp = ClampCp(targetCp);
         if (!extendSelection) { _anchorCp = _caretCp; }
+        ResetCaretBlinkPhase();
         RefreshTextSelectionVisual();
         SyncImeState();
     }
@@ -175,8 +230,11 @@ public class TextBoxBase : Control {
         _rawText = next;
         _caretCp = ClampCp(nextCaret);
         _anchorCp = _caretCp;
+        ResetCaretBlinkPhase();
+        BindingEngine.MarkFlushDirty();
         OnRawTextChanged(_rawText);
         RefreshTextVisual();
+        UpdateTriggersAndStates();
         SyncImeState();
         TextChanged(this, new TextChangedEventArgs(CanExposePlaintext() ? _rawText : "", this));
     }
@@ -239,6 +297,8 @@ public class TextBoxBase : Control {
             _textVisual.Foreground = Foreground;
             _textVisual.FontFamily = FontFamily;
             _textVisual.FontSize = FontSize;
+            _textVisual.FontWeight = FontWeight;
+            _textVisual.FontStyle = FontStyle;
         }
         if (_placeholderVisual != null) {
             _placeholderVisual.Text = _placeholderText;
@@ -254,12 +314,14 @@ public class TextBoxBase : Control {
         if (_textVisual == null || !ParseUtil.IsValidHandle(_textVisual.__nativeHandle)) { return; }
         uint selCol = _selectionBrush != null ? _selectionBrush.ResolveRgba() : ParseUtil.PackArgb(102u, 59u, 130u, 246u);
         uint carCol = _caretBrush != null ? _caretBrush.ResolveRgba() : ParseUtil.PackArgb(255u, 241u, 245u, 249u);
+        bool blinkOn = (_activeBlinkBox != this) ? true : _caretBlinkVisible;
+        bool showCaret = IsFocused && !_isReadOnly && blinkOn;
         Visual_SetTextSelection(
             _textVisual.__nativeHandle,
             SelectionStart,
             SelectionLength,
             _caretCp,
-            IsFocused && !_isReadOnly,
+            showCaret,
             selCol,
             carCol);
     }
@@ -284,14 +346,21 @@ public class TextBoxBase : Control {
         RefreshTextSelectionVisual();
     }
 
+    protected override void OnTypographyChanged() {
+        base.OnTypographyChanged();
+        RefreshTextVisual();
+    }
+
     public override void OnGotFocus() {
         base.OnGotFocus();
+        ResetCaretBlinkPhase();
         RefreshTextSelectionVisual();
         SyncImeState();
     }
 
     public override void OnLostFocus() {
         base.OnLostFocus();
+        if (_activeBlinkBox == this) { _activeBlinkBox = null; }
         RefreshTextSelectionVisual();
         SyncImeState();
     }
@@ -368,6 +437,45 @@ public class TextBoxBase : Control {
         }
     }
 
+    public override void OnApplyTemplate() {
+        base.OnApplyTemplate();
+        if (Template == null) { return; }
+        _placeholderVisual = null;
+        UIElement host = GetTemplateChild("PART_ContentHost");
+        if (host == null) { return; }
+        if (host is TextBlock) {
+            _textVisual = host as TextBlock;
+        } else {
+            _textVisual = new TextBlock(GetDisplayText());
+            _textVisual.Name = "PART_Text";
+            _textVisual.Foreground = Foreground;
+            _textVisual.FontFamily = FontFamily;
+            _textVisual.FontSize = FontSize;
+            _textVisual.FontWeight = FontWeight;
+            _textVisual.FontStyle = FontStyle;
+            _textVisual.VerticalAlignment = VerticalAlignment.Center;
+            _textVisual.Margin = new Thickness(2.0f, 0.0f, 2.0f, 0.0f);
+            if (host is ContentControl) {
+                ContentControl cc = host as ContentControl;
+                if (cc.Template == null) {
+                    cc.SetPropertyValue("HorizontalScrollBarVisibility", DependencyObject.BoxString("Hidden"));
+                    cc.SetPropertyValue("VerticalScrollBarVisibility", DependencyObject.BoxString(_acceptsReturn ? "Auto" : "Disabled"));
+                    cc.BorderThickness = new Thickness(0.0f);
+                    if (cc.Background == null) {
+                        cc.Background = Brushes.Transparent();
+                    }
+                }
+                cc.Content = _textVisual;
+            } else if (host is Decorator) {
+                (host as Decorator).Child = _textVisual;
+            } else if (host is Panel) {
+                (host as Panel).ClearChildren();
+                (host as Panel).AddChild(_textVisual);
+            }
+        }
+        RefreshTextVisual();
+    }
+
     protected override UIElement CreateDefaultTemplate() {
         var host = new Grid();
         host.HorizontalAlignment = HorizontalAlignment.Stretch;
@@ -384,6 +492,8 @@ public class TextBoxBase : Control {
         _textVisual.Foreground = Foreground;
         _textVisual.FontFamily = FontFamily;
         _textVisual.FontSize = FontSize;
+        _textVisual.FontWeight = FontWeight;
+        _textVisual.FontStyle = FontStyle;
         _textVisual.VerticalAlignment = VerticalAlignment.Center;
 
         host.AddChild(_placeholderVisual);
@@ -396,8 +506,27 @@ public class TextBoxBase : Control {
         if (propName == "IsReadOnly") { IsReadOnly = DependencyObject.UnboxBool(value, false); return true; }
         if (propName == "AcceptsReturn") { AcceptsReturn = DependencyObject.UnboxBool(value, false); return true; }
         if (propName == "MaxLength") { MaxLength = DependencyObject.UnboxInt(value, 0); return true; }
-        if (propName == "PlaceholderText") { PlaceholderText = DependencyObject.UnboxString(value, ""); return true; }
+        if (propName == "PlaceholderText" || propName == "Placeholder" ||
+            propName == "Text.Placeholder" || propName == "noesis:Text.Placeholder") {
+            PlaceholderText = DependencyObject.UnboxString(value, "");
+            return true;
+        }
+        if (propName == "CaretBrush") { CaretBrush = UIElement.CoerceBrush(value); return true; }
+        if (propName == "SelectionBrush") { SelectionBrush = UIElement.CoerceBrush(value); return true; }
         return base.SetPropertyValue(propName, value);
+    }
+
+    public override DependencyObject GetPropertyValue(string propName) {
+        if (propName == "IsReadOnly") { return DependencyObject.BoxBool(_isReadOnly); }
+        if (propName == "AcceptsReturn") { return DependencyObject.BoxBool(_acceptsReturn); }
+        if (propName == "MaxLength") { return DependencyObject.BoxInt(_maxLength); }
+        if (propName == "PlaceholderText" || propName == "Placeholder" ||
+            propName == "Text.Placeholder" || propName == "noesis:Text.Placeholder") {
+            return DependencyObject.BoxString(_placeholderText);
+        }
+        if (propName == "CaretBrush") { return _caretBrush; }
+        if (propName == "SelectionBrush") { return _selectionBrush; }
+        return base.GetPropertyValue(propName);
     }
 }
 
@@ -479,7 +608,12 @@ public class PasswordBox : TextBoxBase {
     public string PasswordChar {
         get { return _passwordChar; }
         set {
-            _passwordChar = (value == null || value.Length == 0) ? "•" : value.Substring(0, 1);
+            if (value == null || value.Length == 0) {
+                _passwordChar = "•";
+            } else {
+                _passwordChar = ParseUtil.SliceCodePoints(value, 0, 1);
+                if (_passwordChar.Length == 0) { _passwordChar = "•"; }
+            }
             RefreshTextVisual();
         }
     }
@@ -498,7 +632,9 @@ public class PasswordBox : TextBoxBase {
 
     protected override void OnRawTextChanged(string newRaw) {
         PasswordChanged(this, new RoutedEventArgs("PasswordChanged", this));
+        int cpLen = ParseUtil.Utf8CodePointCount(newRaw);
         BindingEngine.NotifyTargetPropertyChanged(this, "Password", DependencyObject.BoxString(newRaw));
+        BindingEngine.NotifyTargetPropertyChanged(this, "Text.PasswordLength", DependencyObject.BoxInt(cpLen));
     }
 
     public override bool SetPropertyValue(string propName, DependencyObject value) {
@@ -508,6 +644,10 @@ public class PasswordBox : TextBoxBase {
     }
     public override DependencyObject GetPropertyValue(string propName) {
         if (propName == "Password") { return DependencyObject.BoxString(Password); }
+        if (propName == "PasswordChar") { return DependencyObject.BoxString(_passwordChar); }
+        if (propName == "PasswordLength" || propName == "Text.PasswordLength" || propName == "noesis:Text.PasswordLength") {
+            return DependencyObject.BoxInt(ParseUtil.Utf8CodePointCount(InternalRawText()));
+        }
         if (propName == "Text") { return DependencyObject.BoxString(""); }
         return base.GetPropertyValue(propName);
     }

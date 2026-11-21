@@ -54,6 +54,35 @@ private:
         bool has3D,
         BlendingMode blend);
 
+    static std::size_t EmitStyledDashCapsule(
+        PagedRenderTree& tree,
+        Point a,
+        Point b,
+        float thickness,
+        std::uint8_t startCap,
+        std::uint8_t endCap,
+        const Color& color,
+        std::int32_t strokeGradId,
+        const void* owner,
+        const Matrix2D& world2D,
+        const Matrix4x4& world3D,
+        bool has3D,
+        BlendingMode blend);
+
+    static std::size_t EmitDashedPolylinePoints(
+        PagedRenderTree& tree,
+        const std::vector<Point>& pts,
+        const std::vector<float>& rawDashes,
+        std::uint8_t dashCap,
+        float strokeWidth,
+        const Color& strokeColor,
+        std::int32_t strokeGradId,
+        const void* owner,
+        const Matrix2D& world2D,
+        const Matrix4x4& world3D,
+        bool has3D,
+        BlendingMode blend);
+
     static std::size_t EmitSvgPathPrimitive(
         PagedRenderTree& tree,
         const Rect& destBox,

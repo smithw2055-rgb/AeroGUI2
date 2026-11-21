@@ -392,7 +392,10 @@ std::uint16_t PackSdfRoundedRectParams(float cornerRadius, float borderThickness
     const float clampedR = (cornerRadius < 0.0f) ? 0.0f : (cornerRadius > 127.5f ? 127.5f : cornerRadius);
     const float clampedB = (borderThickness < 0.0f) ? 0.0f : (borderThickness > 127.5f ? 127.5f : borderThickness);
     const auto quantR = static_cast<std::uint16_t>(clampedR * 2.0f + 0.5f) & 0xFFu;
-    const auto quantB = static_cast<std::uint16_t>(clampedB * 2.0f + 0.5f) & 0xFFu;
+    auto quantB = static_cast<std::uint16_t>(clampedB * 2.0f + 0.5f) & 0xFFu;
+    if (clampedB > 0.001f && quantB == 0u) {
+        quantB = 1u;
+    }
     return static_cast<std::uint16_t>(quantR | (quantB << 8u));
 }
 
@@ -472,14 +475,23 @@ void PackSdfRoundedRectVertexParams(
 
     if (hollowBorder && IsUniformCornerRadius(cr)) {
         if (IsUniformThickness(bt)) {
-            const auto packed = static_cast<std::uint32_t>(PackSdfRoundedRectParams(cr.topLeft, bt.left));
-            writeModePayload(AeroSdfPrimMode_UniformHollowBorder, packed);
+            const auto basePacked = static_cast<std::uint32_t>(PackSdfRoundedRectParams(cr.topLeft, bt.left));
+            std::uint32_t subBt16 = 0u;
+            if (bt.left > 0.001f && bt.left <= 63.0f) {
+                subBt16 = static_cast<std::uint32_t>(std::clamp(bt.left * 16.0f + 0.5f, 1.0f, 1023.0f)) & 0x3FFu;
+            }
+            writeModePayload(AeroSdfPrimMode_UniformHollowBorder, basePacked | (subBt16 << 16u));
         } else {
+            auto quantSide = [](float v) noexcept -> std::uint32_t {
+                auto q = static_cast<std::uint32_t>(std::clamp(v + 0.5f, 0.0f, 31.0f)) & 0x1Fu;
+                if (v > 0.001f && q == 0u) q = 1u;
+                return q;
+            };
             const auto qR = static_cast<std::uint32_t>(std::clamp(cr.topLeft + 0.5f, 0.0f, 63.0f)) & 0x3Fu;
-            const auto qL = static_cast<std::uint32_t>(std::clamp(bt.left + 0.5f, 0.0f, 31.0f)) & 0x1Fu;
-            const auto qT = static_cast<std::uint32_t>(std::clamp(bt.top + 0.5f, 0.0f, 31.0f)) & 0x1Fu;
-            const auto qRi = static_cast<std::uint32_t>(std::clamp(bt.right + 0.5f, 0.0f, 31.0f)) & 0x1Fu;
-            const auto qB = static_cast<std::uint32_t>(std::clamp(bt.bottom + 0.5f, 0.0f, 31.0f)) & 0x1Fu;
+            const auto qL = quantSide(bt.left);
+            const auto qT = quantSide(bt.top);
+            const auto qRi = quantSide(bt.right);
+            const auto qB = quantSide(bt.bottom);
             const std::uint32_t payload27 =
                 qR | (qL << 6u) | (qT << 11u) | (qRi << 16u) | (qB << 21u) | (1u << 26u);
             writeModePayload(AeroSdfPrimMode_UniformHollowBorder, payload27);
@@ -555,6 +567,10 @@ void UnpackSdfRoundedRectVertexParams(
             float r = 0.0f;
             float b = 0.0f;
             UnpackSdfRoundedRectParams(static_cast<std::uint16_t>(payload27 & 0xFFFFu), r, b);
+            const std::uint32_t subBt16 = (payload27 >> 16u) & 0x3FFu;
+            if (subBt16 > 0u) {
+                b = static_cast<float>(subBt16) * (1.0f / 16.0f);
+            }
             outCornerRadii = CornerRadius{r};
             outBorderThickness = Thickness{b};
         } else {
@@ -637,13 +653,23 @@ float EvaluateSdfRoundedBorderCoverage(
     const CornerRadius& cornerRadii,
     const Thickness& borderThickness,
     float aaFeatherWidth) noexcept {
-    const float btL = std::max(0.0f, borderThickness.left);
-    const float btT = std::max(0.0f, borderThickness.top);
-    const float btR = std::max(0.0f, borderThickness.right);
-    const float btB = std::max(0.0f, borderThickness.bottom);
-    if (btL <= 0.0f && btT <= 0.0f && btR <= 0.0f && btB <= 0.0f) {
+    const float rawL = std::max(0.0f, borderThickness.left);
+    const float rawT = std::max(0.0f, borderThickness.top);
+    const float rawR = std::max(0.0f, borderThickness.right);
+    const float rawB = std::max(0.0f, borderThickness.bottom);
+    if (rawL <= 0.0f && rawT <= 0.0f && rawR <= 0.0f && rawB <= 0.0f) {
         return 0.0f;
     }
+    const float minHairline = std::max(aaFeatherWidth, 0.001f);
+    const float maxRaw = std::max(std::max(rawL, rawT), std::max(rawR, rawB));
+    const bool isSubpixelHairline = (maxRaw > 0.0f && maxRaw < minHairline);
+    const float btL = (rawL > 0.0f) ? (isSubpixelHairline ? minHairline : rawL) : 0.0f;
+    const float btT = (rawT > 0.0f) ? (isSubpixelHairline ? minHairline : rawT) : 0.0f;
+    const float btR = (rawR > 0.0f) ? (isSubpixelHairline ? minHairline : rawR) : 0.0f;
+    const float btB = (rawB > 0.0f) ? (isSubpixelHairline ? minHairline : rawB) : 0.0f;
+    const float hairlineScale = isSubpixelHairline
+        ? std::clamp(0.65f + 0.35f * (maxRaw / minHairline), 0.65f, 1.0f)
+        : 1.0f;
 
     const float outerCov = EvaluateSdfRoundedRectCoverage(
         sampleLocalX,
@@ -676,7 +702,7 @@ float EvaluateSdfRoundedBorderCoverage(
         innerHalfH,
         innerRadii,
         aaFeatherWidth);
-    return std::clamp(outerCov - innerCov, 0.0f, 1.0f);
+    return std::clamp((outerCov - innerCov) * hairlineScale, 0.0f, 1.0f);
 }
 
 float EvaluateMtsdfCoverage(

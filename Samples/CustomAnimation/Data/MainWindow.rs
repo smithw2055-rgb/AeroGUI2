@@ -38,7 +38,6 @@ public partial class MainWindow : Page
     protected override void OnLoaded()
     {
         base.OnLoaded();
-        this.PlayCircle();
     }
 
     public Storyboard BuildBounceStoryboard()
@@ -46,7 +45,9 @@ public partial class MainWindow : Page
         Storyboard sb = new Storyboard();
         sb.AddDoubleAnimation("BounceTarget", "Opacity", 0.0f, 1.0f, 0.2f, EasingFunctionKind.Linear, EasingMode.EaseOut);
         sb.AddDoubleAnimation("BounceTarget", "ScaleX", 0.0f, 1.0f, 1.5f, EasingFunctionKind.Bounce, EasingMode.EaseOut);
+        sb.SetLastEasingParams(3.0f, 2.0f, 3);
         sb.AddDoubleAnimation("BounceTarget", "ScaleY", 0.0f, 1.0f, 1.5f, EasingFunctionKind.Bounce, EasingMode.EaseOut);
+        sb.SetLastEasingParams(3.0f, 2.0f, 3);
         return sb;
     }
 
@@ -54,6 +55,7 @@ public partial class MainWindow : Page
     {
         Storyboard sb = new Storyboard();
         sb.AddDoubleAnimation("ElasticTarget", "Angle", 90.0f, 0.0f, 2.5f, EasingFunctionKind.Elastic, EasingMode.EaseOut);
+        sb.SetLastEasingParams(5.0f, 4.0f, 3);
         return sb;
     }
 
@@ -61,7 +63,16 @@ public partial class MainWindow : Page
     {
         Storyboard sb = new Storyboard();
         sb.AddDoubleAnimation("BackTarget", "TranslateX", -200.0f, 0.0f, 0.5f, EasingFunctionKind.Back, EasingMode.EaseOut);
+        sb.SetLastEasingParams(0.5f, 0.0f, 1);
         return sb;
+    }
+
+    private EasingDoubleKeyFrame MakeExpoKeyFrame(float val, float timeSec, EasingMode mode, float exponent)
+    {
+        EasingDoubleKeyFrame frame = new EasingDoubleKeyFrame(val, timeSec, EasingFunctionKind.Exponential, mode);
+        frame.EaseParam0 = exponent;
+        frame.EaseParamMask = 1;
+        return frame;
     }
 
     public Storyboard BuildExpoStoryboard()
@@ -71,12 +82,12 @@ public partial class MainWindow : Page
         kf.TargetName = "GaugeNeedle";
         kf.TargetProperty = "Angle";
         kf.AddKeyFrame(new LinearDoubleKeyFrame(-90.0f, 0.0f));
-        kf.AddKeyFrame(new EasingDoubleKeyFrame(-40.0f, 0.15f, EasingFunctionKind.Exponential, EasingMode.EaseOut));
-        kf.AddKeyFrame(new EasingDoubleKeyFrame(-70.0f, 0.30f, EasingFunctionKind.Exponential, EasingMode.EaseIn));
-        kf.AddKeyFrame(new EasingDoubleKeyFrame(-10.0f, 0.45f, EasingFunctionKind.Exponential, EasingMode.EaseOut));
-        kf.AddKeyFrame(new EasingDoubleKeyFrame(-45.0f, 0.60f, EasingFunctionKind.Exponential, EasingMode.EaseIn));
-        kf.AddKeyFrame(new EasingDoubleKeyFrame(85.0f, 0.90f, EasingFunctionKind.Exponential, EasingMode.EaseOut));
-        kf.AddKeyFrame(new EasingDoubleKeyFrame(-90.0f, 1.70f, EasingFunctionKind.Exponential, EasingMode.EaseOut));
+        kf.AddKeyFrame(this.MakeExpoKeyFrame(-40.0f, 0.15f, EasingMode.EaseOut, 3.0f));
+        kf.AddKeyFrame(this.MakeExpoKeyFrame(-70.0f, 0.30f, EasingMode.EaseIn, 2.0f));
+        kf.AddKeyFrame(this.MakeExpoKeyFrame(-10.0f, 0.45f, EasingMode.EaseOut, 3.0f));
+        kf.AddKeyFrame(this.MakeExpoKeyFrame(-45.0f, 0.60f, EasingMode.EaseIn, 2.0f));
+        kf.AddKeyFrame(this.MakeExpoKeyFrame(85.0f, 0.90f, EasingMode.EaseOut, 4.0f));
+        kf.AddKeyFrame(this.MakeExpoKeyFrame(-90.0f, 1.70f, EasingMode.EaseOut, 3.0f));
         sb.Add(kf);
         return sb;
     }
@@ -86,9 +97,9 @@ public partial class MainWindow : Page
         DoubleAnimationUsingKeyFrames kf = new DoubleAnimationUsingKeyFrames();
         kf.TargetName = targetName;
         kf.TargetProperty = prop;
-        kf.RepeatCount = 0;
+        kf.RepeatCount = -1;
 
-        int steps = 8;
+        int steps = 24;
         int i = 0;
         while (i <= steps)
         {
@@ -104,6 +115,7 @@ public partial class MainWindow : Page
     public Storyboard BuildCircleStoryboard()
     {
         Storyboard sb = new Storyboard();
+        sb.RepeatForever = true;
         sb.Add(this.BuildOrbitAxis("Dot1", "TranslateX", 40.0f, 0.0f, false));
         sb.Add(this.BuildOrbitAxis("Dot1", "TranslateY", 40.0f, 0.0f, true));
         sb.Add(this.BuildOrbitAxis("Dot2", "TranslateX", 40.0f, 0.6283185f, false));

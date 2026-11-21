@@ -1,9 +1,11 @@
 #pragma once
 
+#include <chrono>
 #include <cstdint>
 #include <filesystem>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -151,6 +153,7 @@ public:
     void ClearPlayedSounds() noexcept { playedSounds_.clear(); }
     [[nodiscard]] bool IsAotMode() const noexcept { return aotDescriptor_ != nullptr && aotContext_ != nullptr; }
     [[nodiscard]] bool IsBytecodeMode() const noexcept { return programImage_ != nullptr && interpreter_ != nullptr; }
+    [[nodiscard]] bool IsCloseRequested() const noexcept { return closeRequested_ || windowHost_.ShouldClose(); }
 
     [[nodiscard]] VisualWorld& World() noexcept { return world_; }
     [[nodiscard]] const VisualWorld& World() const noexcept { return world_; }
@@ -282,7 +285,9 @@ private:
     std::unordered_map<std::uint64_t, std::pair<float, float>> lastCanvasDrawSizes_;
     std::vector<PlayedSoundRecord> playedSounds_;
     std::string lastError_;
+    std::optional<std::chrono::steady_clock::time_point> scheduledWakeAt_;
     bool scriptWakeRequested_ = false;
+    bool closeRequested_ = false;
     bool initialized_ = false;
 };
 

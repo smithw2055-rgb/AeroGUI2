@@ -234,7 +234,8 @@ namespace {
                         localPt.x <= node->layout.layoutRect.width &&
                         localPt.y <= node->layout.layoutRect.height;
     const bool clipsChildren =
-        node->layout.clipToBounds || (node->layout.layoutMode == LayoutMode::ScrollViewport);
+        node->layout.clipToBounds || node->layout.needsLayoutClip ||
+        (node->layout.layoutMode == LayoutMode::ScrollViewport);
     if (clipsChildren && !inside) {
         return VisualNodeId{};
     }

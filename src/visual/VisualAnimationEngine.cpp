@@ -64,25 +64,39 @@ void ApplyTextFgColorRecursive(
     }
 }
 
-[[nodiscard]] float EaseOutBounceCore(float u) noexcept {
-    constexpr float n1 = 7.5625f;
-    constexpr float d1 = 2.75f;
-    if (u < 1.0f / d1) {
-        return n1 * u * u;
+[[nodiscard]] float EaseInBounceWpf(float t, float bouncesParam, float bouncinessParam) noexcept {
+    if (t <= 0.0f) return 0.0f;
+    if (t >= 1.0f) return 1.0f;
+    const double bounces = std::max(0.0, std::floor(static_cast<double>(bouncesParam)));
+    const double bounciness = std::max(1.001, static_cast<double>(bouncinessParam));
+    const double powN = std::pow(bounciness, bounces);
+    const double oneMinusB = 1.0 - bounciness;
+    const double sumOfUnits = (1.0 - powN) / oneMinusB + powN * 0.5;
+    const double logArg = std::max(1e-12, -static_cast<double>(t) * sumOfUnits * oneMinusB + 1.0);
+    const double unitAtT = std::clamp(
+        std::floor(std::log(logArg) / std::log(bounciness)),
+        0.0,
+        bounces);
+    const double start = (1.0 - std::pow(bounciness, unitAtT)) / (oneMinusB * sumOfUnits);
+    const double end = (1.0 - std::pow(bounciness, unitAtT + 1.0)) / (oneMinusB * sumOfUnits);
+    const double mid = (start + end) * 0.5;
+    const double radius = end - mid;
+    if (radius <= 1e-9) {
+        return 1.0f;
     }
-    if (u < 2.0f / d1) {
-        const float x = u - 1.5f / d1;
-        return n1 * x * x + 0.75f;
-    }
-    if (u < 2.5f / d1) {
-        const float x = u - 2.25f / d1;
-        return n1 * x * x + 0.9375f;
-    }
-    const float x = u - 2.625f / d1;
-    return n1 * x * x + 0.984375f;
+    const double rel = (static_cast<double>(t) - mid) / radius;
+    const double peak = std::pow(1.0 / bounciness, bounces - unitAtT);
+    return static_cast<float>((-peak / (radius * radius)) * (rel * radius - radius) * (rel * radius + radius));
 }
 
-[[nodiscard]] float EaseInCore(EasingFunctionKind kind, float t) noexcept {
+[[nodiscard]] float EaseInCore(
+    EasingFunctionKind kind,
+    float t,
+    float param0,
+    float param1,
+    std::uint8_t paramMask) noexcept {
+    const bool hasP0 = (paramMask & 1u) != 0u || (paramMask == 0u && param0 != 0.0f);
+    const bool hasP1 = (paramMask & 2u) != 0u || (paramMask == 0u && param1 != 0.0f);
     switch (kind) {
     case EasingFunctionKind::Linear: return t;
     case EasingFunctionKind::Quadratic: return t * t;
@@ -91,18 +105,51 @@ void ApplyTextFgColorRecursive(
     case EasingFunctionKind::Quintic: return t * t * t * t * t;
     case EasingFunctionKind::Sine: return 1.0f - std::cos(t * 1.57079632679f);
     case EasingFunctionKind::Circle: return 1.0f - std::sqrt(std::max(0.0f, 1.0f - t * t));
-    case EasingFunctionKind::Exponential: return (t <= 0.0f) ? 0.0f : std::pow(2.0f, 10.0f * (t - 1.0f));
+    case EasingFunctionKind::Exponential: {
+        if (t <= 0.0f) return 0.0f;
+        if (t >= 1.0f) return 1.0f;
+        const float exponent = hasP0 ? param0 : 2.0f;
+        if (std::fabs(exponent) <= 1e-6f) return t;
+        const double denom = std::exp(static_cast<double>(exponent)) - 1.0;
+        if (std::fabs(denom) <= 1e-7) return t;
+        return static_cast<float>((std::exp(static_cast<double>(exponent * t)) - 1.0) / denom);
+    }
     case EasingFunctionKind::Back: {
-        constexpr float s = 1.70158f;
-        return t * t * ((s + 1.0f) * t - s);
+        const float amp = hasP0 ? std::max(0.0f, param0) : 1.0f;
+        return t * t * t - t * amp * std::sin(t * 3.14159265359f);
     }
     case EasingFunctionKind::Elastic: {
         if (t <= 0.0f || t >= 1.0f) return t;
-        constexpr float p = 0.3f;
-        return -std::pow(2.0f, 10.0f * (t - 1.0f)) * std::sin((t - 1.0f - p * 0.25f) * (6.28318530718f / p));
+        const float osc = hasP0 ? std::max(0.0f, param0) : 3.0f;
+        const float spring = hasP1 ? std::max(0.0f, param1) : 3.0f;
+        double expo = static_cast<double>(t);
+        if (spring > 1e-4f) {
+            expo = (std::exp(static_cast<double>(spring * t)) - 1.0) / (std::exp(static_cast<double>(spring)) - 1.0);
+        }
+        return static_cast<float>(expo * std::sin((6.28318530718 * osc + 1.57079632679) * static_cast<double>(t)));
     }
-    case EasingFunctionKind::Bounce:
-        return 1.0f - EaseOutBounceCore(1.0f - t);
+    case EasingFunctionKind::Bounce: {
+        if (hasP0 || hasP1) {
+            return EaseInBounceWpf(t, hasP0 ? param0 : 3.0f, hasP1 ? param1 : 2.0f);
+        }
+        const float inv = 1.0f - t;
+        constexpr float kN1 = 7.5625f;
+        constexpr float kD1 = 2.75f;
+        float out = 0.0f;
+        if (inv < 1.0f / kD1) {
+            out = kN1 * inv * inv;
+        } else if (inv < 2.0f / kD1) {
+            const float x = inv - 1.5f / kD1;
+            out = kN1 * x * x + 0.75f;
+        } else if (inv < 2.5f / kD1) {
+            const float x = inv - 2.25f / kD1;
+            out = kN1 * x * x + 0.9375f;
+        } else {
+            const float x = inv - 2.625f / kD1;
+            out = kN1 * x * x + 0.984375f;
+        }
+        return 1.0f - out;
+    }
     case EasingFunctionKind::Spline:
         return t * t * (3.0f - 2.0f * t);
     }
@@ -527,7 +574,7 @@ void EvaluateKeyFramesAtTime(VisualAnimTrack& track, VisualWorld& world, float l
                 return;
             }
             const float u = std::clamp((localTimeSec - kf0.timeSec) / span, 0.0f, 1.0f);
-            const float eased = EvaluateEasing(kf1.easingKind, kf1.easingMode, u);
+            const float eased = EvaluateEasing(kf1.easingKind, kf1.easingMode, u, kf1.easeParam0, kf1.easeParam1, kf1.easeParamMask);
             if (colorProp) {
                 const std::uint32_t col = LerpRgba(kf0.colorRgba, kf1.colorRgba, eased);
                 track.currentRgba = col;
@@ -548,20 +595,23 @@ void EvaluateKeyFramesAtTime(VisualAnimTrack& track, VisualWorld& world, float l
 float EvaluateEasing(
     EasingFunctionKind kind,
     EasingMode mode,
-    float normalizedTime01) noexcept {
+    float normalizedTime01,
+    float param0,
+    float param1,
+    std::uint8_t paramMask) noexcept {
     const float t = std::clamp(normalizedTime01, 0.0f, 1.0f);
     if (kind == EasingFunctionKind::Linear) {
         return t;
     }
     switch (mode) {
     case EasingMode::EaseIn:
-        return EaseInCore(kind, t);
+        return EaseInCore(kind, t, param0, param1, paramMask);
     case EasingMode::EaseOut:
-        return 1.0f - EaseInCore(kind, 1.0f - t);
+        return 1.0f - EaseInCore(kind, 1.0f - t, param0, param1, paramMask);
     case EasingMode::EaseInOut:
         return (t < 0.5f)
-            ? 0.5f * EaseInCore(kind, t * 2.0f)
-            : 1.0f - 0.5f * EaseInCore(kind, (1.0f - t) * 2.0f);
+            ? 0.5f * EaseInCore(kind, t * 2.0f, param0, param1, paramMask)
+            : 1.0f - 0.5f * EaseInCore(kind, (1.0f - t) * 2.0f, param0, param1, paramMask);
     }
     return t;
 }
@@ -809,8 +859,20 @@ std::int32_t VisualAnimationEngine::StartKeyFrames(
     VisualAnimProp prop,
     std::vector<VisualKeyFrame> keyFrames,
     bool autoReverse,
-    std::int32_t repeatCount) {
+    std::int32_t repeatCount,
+    float delaySec) {
     if (!node.IsValid() || keyFrames.empty()) return 0;
+    const float clampedDelay = std::max(0.0f, delaySec);
+    if (clampedDelay <= 0.0f && prop != VisualAnimProp::ManagedCustom) {
+        tracks_.erase(
+            std::remove_if(
+                tracks_.begin(),
+                tracks_.end(),
+                [node, prop](const VisualAnimTrack& existing) noexcept {
+                    return existing.targetNode == node && existing.prop == prop;
+                }),
+            tracks_.end());
+    }
     for (VisualKeyFrame& kf : keyFrames) {
         kf.timeSec = std::max(0.0f, kf.timeSec);
     }
@@ -825,7 +887,10 @@ std::int32_t VisualAnimationEngine::StartKeyFrames(
     track.targetNode = node;
     track.prop = prop;
     track.kind = VisualAnimTrackKind::KeyFrames;
+    track.currentVal = keyFrames.front().scalarValue;
+    track.currentRgba = keyFrames.front().colorRgba;
     track.durationSec = keyFrames.back().timeSec;
+    track.delaySec = clampedDelay;
     track.autoReverse = autoReverse;
     track.repeatCount = repeatCount;
     track.keyFrames = std::move(keyFrames);
@@ -834,6 +899,79 @@ std::int32_t VisualAnimationEngine::StartKeyFrames(
         wakeHostCallback_();
     }
     return tracks_.back().trackId;
+}
+
+std::int32_t VisualAnimationEngine::BeginKeyFramesTrack(
+    VisualNodeId node,
+    VisualAnimProp prop,
+    float delaySec,
+    bool autoReverse,
+    std::int32_t repeatCount) {
+    if (!node.IsValid()) return 0;
+    const float clampedDelay = std::max(0.0f, delaySec);
+    if (clampedDelay <= 0.0f && prop != VisualAnimProp::ManagedCustom) {
+        tracks_.erase(
+            std::remove_if(
+                tracks_.begin(),
+                tracks_.end(),
+                [node, prop](const VisualAnimTrack& existing) noexcept {
+                    return existing.targetNode == node && existing.prop == prop;
+                }),
+            tracks_.end());
+    }
+    VisualAnimTrack track{};
+    track.trackId = nextTrackId_++;
+    track.targetNode = node;
+    track.prop = prop;
+    track.kind = VisualAnimTrackKind::KeyFrames;
+    track.durationSec = 0.0f;
+    track.delaySec = clampedDelay;
+    track.autoReverse = autoReverse;
+    track.repeatCount = repeatCount;
+    tracks_.push_back(std::move(track));
+    if (wakeHostCallback_) {
+        wakeHostCallback_();
+    }
+    return tracks_.back().trackId;
+}
+
+void VisualAnimationEngine::AddKeyFrameFloat(
+    std::int32_t trackId,
+    float timeSec,
+    float value,
+    EasingFunctionKind easeKind,
+    EasingMode easeMode,
+    float param0,
+    float param1,
+    std::uint8_t paramMask,
+    bool discrete) {
+    if (trackId <= 0) return;
+    for (VisualAnimTrack& tr : tracks_) {
+        if (tr.trackId == trackId && tr.kind == VisualAnimTrackKind::KeyFrames) {
+            VisualKeyFrame kf{};
+            kf.timeSec = std::max(0.0f, timeSec);
+            kf.scalarValue = value;
+            kf.easingKind = easeKind;
+            kf.easingMode = easeMode;
+            kf.discrete = discrete;
+            kf.easeParam0 = param0;
+            kf.easeParam1 = param1;
+            kf.easeParamMask = paramMask;
+            const bool needSort = !tr.keyFrames.empty() && kf.timeSec < tr.keyFrames.back().timeSec;
+            tr.keyFrames.push_back(kf);
+            if (needSort) {
+                std::stable_sort(
+                    tr.keyFrames.begin(),
+                    tr.keyFrames.end(),
+                    [](const VisualKeyFrame& a, const VisualKeyFrame& b) {
+                        return a.timeSec < b.timeSec;
+                    });
+            }
+            tr.durationSec = tr.keyFrames.back().timeSec;
+            tr.currentVal = tr.keyFrames.front().scalarValue;
+            return;
+        }
+    }
 }
 
 void VisualAnimationEngine::StopAll(VisualNodeId node) noexcept {
@@ -850,6 +988,22 @@ void VisualAnimationEngine::StopTrack(std::int32_t trackId) noexcept {
             return tr.trackId == trackId;
         }),
         tracks_.end());
+}
+
+void VisualAnimationEngine::SetTrackEasingParams(
+    std::int32_t trackId,
+    float param0,
+    float param1,
+    std::uint8_t paramMask) noexcept {
+    if (trackId <= 0) return;
+    for (VisualAnimTrack& tr : tracks_) {
+        if (tr.trackId == trackId) {
+            tr.easeParam0 = param0;
+            tr.easeParam1 = param1;
+            tr.easeParamMask = paramMask;
+            return;
+        }
+    }
 }
 
 void VisualAnimationEngine::Clear() noexcept {
@@ -939,12 +1093,12 @@ bool VisualAnimationEngine::Tick(float dtSeconds, VisualWorld& world) {
             }
 
             if (track.kind == VisualAnimTrackKind::FloatTween) {
-                const float eased = EvaluateEasing(track.easeKind, track.easeMode, normT);
+                const float eased = EvaluateEasing(track.easeKind, track.easeMode, normT, track.easeParam0, track.easeParam1, track.easeParamMask);
                 const float val = track.fromVal + (track.toVal - track.fromVal) * eased;
                 track.currentVal = val;
                 ApplyScalarProp(world, track.targetNode, track.prop, val);
             } else if (track.kind == VisualAnimTrackKind::ColorTween) {
-                const float eased = EvaluateEasing(track.easeKind, track.easeMode, normT);
+                const float eased = EvaluateEasing(track.easeKind, track.easeMode, normT, track.easeParam0, track.easeParam1, track.easeParamMask);
                 const std::uint32_t col = LerpRgba(track.fromRgba, track.toRgba, eased);
                 track.currentRgba = col;
                 ApplyColorProp(world, track.targetNode, track.prop, col);

@@ -102,6 +102,9 @@ struct VisualKeyFrame {
     EasingFunctionKind easingKind = EasingFunctionKind::Linear;
     EasingMode easingMode = EasingMode::EaseOut;
     bool discrete = false;
+    float easeParam0 = 0.0f;
+    float easeParam1 = 0.0f;
+    std::uint8_t easeParamMask = 0u;
 };
 
 enum class VisualAnimTrackKind : std::uint8_t {
@@ -132,6 +135,9 @@ struct VisualAnimTrack {
     float elapsedSec = 0.0f;
     EasingFunctionKind easeKind = EasingFunctionKind::Linear;
     EasingMode easeMode = EasingMode::EaseOut;
+    float easeParam0 = 0.0f;
+    float easeParam1 = 0.0f;
+    std::uint8_t easeParamMask = 0u;
     bool autoReverse = false;
     std::int32_t repeatCount = 1;
     std::int32_t completedCycles = 0;
@@ -144,7 +150,10 @@ struct VisualAnimTrack {
 [[nodiscard]] float EvaluateEasing(
     EasingFunctionKind kind,
     EasingMode mode,
-    float normalizedTime01) noexcept;
+    float normalizedTime01,
+    float param0 = 0.0f,
+    float param1 = 0.0f,
+    std::uint8_t paramMask = 0u) noexcept;
 
 class VisualAnimationEngine final {
 public:
@@ -210,10 +219,34 @@ public:
         VisualAnimProp prop,
         std::vector<VisualKeyFrame> keyFrames,
         bool autoReverse = false,
+        std::int32_t repeatCount = 1,
+        float delaySec = 0.0f);
+
+    std::int32_t BeginKeyFramesTrack(
+        VisualNodeId node,
+        VisualAnimProp prop,
+        float delaySec = 0.0f,
+        bool autoReverse = false,
         std::int32_t repeatCount = 1);
+
+    void AddKeyFrameFloat(
+        std::int32_t trackId,
+        float timeSec,
+        float value,
+        EasingFunctionKind easeKind = EasingFunctionKind::Linear,
+        EasingMode easeMode = EasingMode::EaseOut,
+        float param0 = 0.0f,
+        float param1 = 0.0f,
+        std::uint8_t paramMask = 0u,
+        bool discrete = false);
 
     void StopAll(VisualNodeId node) noexcept;
     void StopTrack(std::int32_t trackId) noexcept;
+    void SetTrackEasingParams(
+        std::int32_t trackId,
+        float param0,
+        float param1,
+        std::uint8_t paramMask = 3u) noexcept;
     void Clear() noexcept;
 
     bool Tick(float dtSeconds, VisualWorld& world);

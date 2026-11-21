@@ -263,6 +263,7 @@
         <Setter Property="FontSize" Value="32"/>
         <Setter Property="Template" Value="{StaticResource Menu3D.Template.MenuToolTip}"/>
         <Setter Property="Focusable" Value="False"/>
+        <Setter Property="IsEnabled" Value="False"/>
         <Setter Property="FocusVisualStyle" Value="{x:Null}"/>
     </Style>
     <ControlTemplate x:Key="Menu3D.Template.SettingContent" TargetType="{x:Type HeaderedContentControl}">
@@ -562,11 +563,13 @@
                         <b:PlaySoundAction Source="Sounds/WaterDropBig.mp3" Volume="0.5"/>
                         <b:ChangePropertyAction PropertyName="SelectedIndex">
                             <b:ChangePropertyAction.Value>
-                                <Binding RelativeSource="{RelativeSource FindAncestor, AncestorType=ListBox}" Path="SelectedIndex">
-                                    <Binding.Converter>
-                                        <noesis:MathConverter Expression="{}{0}+1" />
-                                    </Binding.Converter>
-                                </Binding>
+                                <MultiBinding>
+                                    <MultiBinding.Converter>
+                                        <noesis:MathConverter Expression="({0}+1)%{1}" />
+                                    </MultiBinding.Converter>
+                                    <Binding RelativeSource="{RelativeSource Self}" Path="SelectedIndex"/>
+                                    <Binding RelativeSource="{RelativeSource Self}" Path="Items.Count"/>
+                                </MultiBinding>
                             </b:ChangePropertyAction.Value>
                         </b:ChangePropertyAction>
                     </b:KeyTrigger>
@@ -574,11 +577,13 @@
                         <b:PlaySoundAction Source="Sounds/WaterDropBig.mp3" Volume="0.5"/>
                         <b:ChangePropertyAction PropertyName="SelectedIndex">
                             <b:ChangePropertyAction.Value>
-                                <Binding RelativeSource="{RelativeSource FindAncestor, AncestorType=ListBox}" Path="SelectedIndex">
-                                    <Binding.Converter>
-                                        <noesis:MathConverter Expression="{}{0}+1" />
-                                    </Binding.Converter>
-                                </Binding>
+                                <MultiBinding>
+                                    <MultiBinding.Converter>
+                                        <noesis:MathConverter Expression="({0}+1)%{1}" />
+                                    </MultiBinding.Converter>
+                                    <Binding RelativeSource="{RelativeSource Self}" Path="SelectedIndex"/>
+                                    <Binding RelativeSource="{RelativeSource Self}" Path="Items.Count"/>
+                                </MultiBinding>
                             </b:ChangePropertyAction.Value>
                         </b:ChangePropertyAction>
                     </b:KeyTrigger>
@@ -586,7 +591,7 @@
                         <b:PlaySoundAction Source="Sounds/WaterDropBig.mp3" Volume="0.5"/>
                         <b:ChangePropertyAction PropertyName="SelectedIndex">
                             <b:ChangePropertyAction.Value>
-                                <Binding RelativeSource="{RelativeSource FindAncestor, AncestorType=ListBox}" Path="SelectedIndex">
+                                <Binding RelativeSource="{RelativeSource Self}" Path="SelectedIndex">
                                     <Binding.Converter>
                                         <noesis:MathConverter Expression="{}max({0}-1,0)" />
                                     </Binding.Converter>
@@ -598,11 +603,13 @@
                         <b:PlaySoundAction Source="Sounds/WaterDropBig.mp3" Volume="0.5"/>
                         <b:ChangePropertyAction PropertyName="SelectedIndex">
                             <b:ChangePropertyAction.Value>
-                                <Binding RelativeSource="{RelativeSource FindAncestor, AncestorType=ListBox}" Path="SelectedIndex">
-                                    <Binding.Converter>
-                                        <noesis:MathConverter Expression="{}{0}+1" />
-                                    </Binding.Converter>
-                                </Binding>
+                                <MultiBinding>
+                                    <MultiBinding.Converter>
+                                        <noesis:MathConverter Expression="min({0}+1,{1}-1)" />
+                                    </MultiBinding.Converter>
+                                    <Binding RelativeSource="{RelativeSource Self}" Path="SelectedIndex"/>
+                                    <Binding RelativeSource="{RelativeSource Self}" Path="Items.Count"/>
+                                </MultiBinding>
                             </b:ChangePropertyAction.Value>
                         </b:ChangePropertyAction>
                     </b:KeyTrigger>

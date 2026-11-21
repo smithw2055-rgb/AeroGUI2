@@ -974,6 +974,21 @@ void AeroAppHost::WireKernelBridges() {
         windowHost_.WakeEventLoop();
     };
 
+    platformHooks_.requestWakeAfterMs = [this](std::int32_t delayMs) {
+        const std::int32_t clamped = std::clamp(delayMs, 1, 60000);
+        const auto target = std::chrono::steady_clock::now() + std::chrono::milliseconds(clamped);
+        if (!scheduledWakeAt_.has_value() || target < *scheduledWakeAt_) {
+            scheduledWakeAt_ = target;
+        }
+    };
+
+    platformHooks_.closeWindow = [this]() {
+        closeRequested_ = true;
+        windowHost_.RequestClose();
+        desktopHost_.TriggerWake();
+        windowHost_.WakeEventLoop();
+    };
+
     platformHooks_.playSound = [this](std::string_view uri, float volume) {
         const float clampedVol = std::clamp(volume, 0.0f, 1.0f);
         const std::string resolved = ResolveSoundAssetPath(uri);
@@ -1103,6 +1118,8 @@ std::string AeroAppHost::ResolveSoundAssetPath(std::string_view uri) const {
 }
 
 void AeroAppHost::ResetLoadedProgramState() noexcept {
+    closeRequested_ = false;
+    scheduledWakeAt_.reset();
     simObjectPin_.reset();
     simObject_ = ObjectRef{};
     rootObjectPin_.reset();
@@ -2854,25 +2871,47 @@ std::uint64_t AeroAppHost::RunWindowedLoop(std::uint64_t maxFrames) {
     std::uint64_t frames = 0u;
     bool hasLastActiveTick = false;
     auto lastActiveTick = std::chrono::steady_clock::now();
-    while (!windowHost_.ShouldClose()) {
+    bool hasLastFrameTick = false;
+    auto lastFrameTick = std::chrono::steady_clock::now();
+    while (!closeRequested_ && !windowHost_.ShouldClose()) {
         if (maxFrames > 0u && frames >= maxFrames) {
             break;
         }
         const auto iterStart = std::chrono::steady_clock::now();
         const bool wakeBeforePump = scriptWakeRequested_;
         scriptWakeRequested_ = false;
+        bool scheduledWakeDue = false;
+        std::int32_t scheduledWaitMs = -1;
+        if (scheduledWakeAt_.has_value()) {
+            if (*scheduledWakeAt_ <= iterStart) {
+                scheduledWakeAt_.reset();
+                scheduledWakeDue = true;
+            } else {
+                const auto remMs = std::chrono::duration_cast<std::chrono::milliseconds>(*scheduledWakeAt_ - iterStart).count();
+                scheduledWaitMs = static_cast<std::int32_t>(std::clamp<long long>(remMs, 1, 60000));
+            }
+        }
         const bool idleAllowed =
             desktopHost_.CanSleepIdle() && !static_cast<bool>(simTickCallback_) && !wakeBeforePump &&
-            !animEngine_.HasActiveAnimations();
+            !scheduledWakeDue && !animEngine_.HasActiveAnimations();
         if (idleAllowed) {
             hasLastActiveTick = false;
+            if (!scheduledWakeAt_.has_value()) {
+                hasLastFrameTick = false;
+            }
         }
         const std::int32_t waitMs = idleAllowed
-            ? (maxFrames > 0u ? 0 : -1)
+            ? (maxFrames > 0u ? 0 : scheduledWaitMs)
             : 16;
         const std::uint64_t prevOsEvents = windowHost_.Telemetry().osEventsTranslated;
         if (!windowHost_.PumpEventsAndRender(0.016f, waitMs)) {
             break;
+        }
+
+        const auto afterPumpNow = std::chrono::steady_clock::now();
+        if (scheduledWakeAt_.has_value() && afterPumpNow >= *scheduledWakeAt_) {
+            scheduledWakeAt_.reset();
+            scheduledWakeDue = true;
         }
 
         const std::uint32_t w = std::max<std::uint32_t>(1u, windowHost_.LogicalWidth());
@@ -2899,34 +2938,48 @@ std::uint64_t AeroAppHost::RunWindowedLoop(std::uint64_t maxFrames) {
             domains_.setActiveDomain(DomainKind::UiPresentation);
             followUpDirty = true;
         }
-        if (!idleAllowed) {
+        if (!idleAllowed || scheduledWakeDue) {
             const auto now = std::chrono::steady_clock::now();
             float stepDt = 0.016f;
-            if (hasLastActiveTick) {
-                stepDt = std::clamp(
-                    std::chrono::duration<float>(now - lastActiveTick).count(),
+            if (!idleAllowed) {
+                if (hasLastActiveTick) {
+                    stepDt = std::clamp(
+                        std::chrono::duration<float>(now - lastActiveTick).count(),
+                        0.001f,
+                        0.05f);
+                }
+                lastActiveTick = now;
+                hasLastActiveTick = true;
+                if (symbols_.stepGame != 0u && rootObject_.valid()) {
+                    (void)InvokeSymbol(
+                        symbols_.stepGame,
+                        {UnifiedValue{rootObject_}, UnifiedValue{FloatValue{stepDt}}},
+                        nullptr,
+                        DomainKind::UiPresentation);
+                }
+            }
+            float timerDt = 0.016f;
+            if (hasLastFrameTick) {
+                timerDt = std::clamp(
+                    std::chrono::duration<float>(now - lastFrameTick).count(),
                     0.001f,
-                    0.05f);
+                    2.0f);
             }
-            lastActiveTick = now;
-            hasLastActiveTick = true;
-            if (symbols_.stepGame != 0u && rootObject_.valid()) {
-                (void)InvokeSymbol(
-                    symbols_.stepGame,
-                    {UnifiedValue{rootObject_}, UnifiedValue{FloatValue{stepDt}}},
-                    nullptr,
-                    DomainKind::UiPresentation);
-            }
+            lastFrameTick = now;
+            hasLastFrameTick = true;
             if (symbols_.bindingStepFrameTicks != 0u) {
                 (void)InvokeSymbol(
                     symbols_.bindingStepFrameTicks,
-                    {UnifiedValue{FloatValue{stepDt}}},
+                    {UnifiedValue{FloatValue{timerDt}}},
                     nullptr,
                     DomainKind::UiPresentation);
             }
             if (scriptWakeRequested_ || world_.HasAnyDirty()) {
                 followUpDirty = true;
             }
+        } else if (!hasLastFrameTick && scheduledWakeAt_.has_value()) {
+            lastFrameTick = afterPumpNow;
+            hasLastFrameTick = true;
         }
         if (domains_.pendingSimCommandCount() > 0u) {
             domains_.setActiveDomain(DomainKind::SimDeterministic);
@@ -2944,6 +2997,7 @@ std::uint64_t AeroAppHost::RunWindowedLoop(std::uint64_t maxFrames) {
         if (!viewportChanged &&
             (followUpDirty ||
              wakeBeforePump ||
+             scheduledWakeDue ||
              scriptWakeRequested_ ||
              (windowHost_.Telemetry().osEventsTranslated != prevOsEvents) ||
              world_.HasAnyDirty() ||

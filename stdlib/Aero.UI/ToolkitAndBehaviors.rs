@@ -2420,6 +2420,14 @@ public class PropertyChangedTrigger : BehaviorTriggerBase {
 public static class DragDrop {
     private static UIElement[] _participants;
     private static UIElement _selectedSource;
+    private static UIElement _pressCandidate;
+    private static float _pressStartX = 0.0f;
+    private static float _pressStartY = 0.0f;
+    private static bool _isDragging = false;
+    private static Panel _overlayHost;
+    private static Border _dragAdorner;
+    private static Image _dragAdornerImage;
+    private static TranslateTransform _dragAdornerTransform;
     private static bool _hookInstalled = false;
 
     public static void EnsureInstalled() {
@@ -2430,7 +2438,7 @@ public static class DragDrop {
             DragDrop.OnAttachedPropertyChanged(el, prop, val);
         };
         InputDispatcher.RegisterPopupDismissHook((UIElement clicked, bool isEscape) => {
-            if (isEscape && DragDrop.HasSelectedSource()) {
+            if (isEscape && (DragDrop.HasSelectedSource() || DragDrop.HasPressCandidate())) {
                 DragDrop.CancelSelection();
             }
         });
@@ -2493,9 +2501,9 @@ public static class DragDrop {
         if (targetEl == null) { return false; }
         bool matchKind = DependencyObject.UnboxBool(targetEl.GetPropertyValue("DragDrop.MatchKind"), true);
         if (!matchKind) { return true; }
-        if (itemKind == null || itemKind.Length == 0 || itemKind == "None") { return true; }
+        if (itemKind == null || itemKind.Length == 0 || itemKind == "None" || itemKind == "All") { return true; }
         string dstKind = ReadItemKindStr(targetEl);
-        if (dstKind.Length == 0 || dstKind == "None") { return true; }
+        if (dstKind.Length == 0 || dstKind == "None" || dstKind == "All") { return true; }
         return dstKind == itemKind;
     }
 
@@ -2536,6 +2544,17 @@ public static class DragDrop {
     }
 
     public static void RefreshAllContentEmpty() {
+        if (_overlayHost != null && _overlayHost._isDisposedTree) {
+            HideDragAdorner();
+            _overlayHost = null;
+        }
+        if ((_selectedSource != null && _selectedSource._isDisposedTree) ||
+            (_pressCandidate != null && _pressCandidate._isDisposedTree)) {
+            _pressCandidate = null;
+            _selectedSource = null;
+            _isDragging = false;
+            HideDragAdorner();
+        }
         if (_participants == null) { return; }
         for (int i = _participants.Length - 1; i >= 0; i -= 1) {
             UIElement p = _participants[i];
@@ -2571,8 +2590,179 @@ public static class DragDrop {
     }
 
     public static bool HasSelectedSource() { return _selectedSource != null; }
+    public static bool HasPressCandidate() { return _pressCandidate != null; }
+
+    private static Panel FindGridOrCanvasRecursive(UIElement el) {
+        if (el == null || el._isDisposedTree) { return null; }
+        if (el is Grid || el is Canvas) { return el as Panel; }
+        if (el is ContentControl && (el as ContentControl).Content is UIElement) {
+            Panel foundC = FindGridOrCanvasRecursive((el as ContentControl).Content as UIElement);
+            if (foundC != null) { return foundC; }
+        }
+        int cc = el.ChildCount();
+        for (int i = 0; i < cc; i += 1) {
+            Panel found = FindGridOrCanvasRecursive(el.ChildAt(i));
+            if (found != null) { return found; }
+        }
+        return null;
+    }
+
+    private static Panel ResolveOverlayPanel(UIElement refEl) {
+        if (_overlayHost != null && !_overlayHost._isDisposedTree) {
+            return _overlayHost;
+        }
+        Panel bestAncestor = null;
+        UIElement cur = refEl;
+        while (cur != null) {
+            if (cur is Grid || cur is Canvas) {
+                bestAncestor = cur as Panel;
+            }
+            cur = cur.Parent;
+        }
+        if (bestAncestor != null) { return bestAncestor; }
+        UIElement root = refEl != null ? refEl.RootElement() : null;
+        if (root is Grid || root is Canvas) { return root as Panel; }
+        if (root is ContentControl && (root as ContentControl).Content is UIElement) {
+            UIElement contentEl = (root as ContentControl).Content as UIElement;
+            if (contentEl is Grid || contentEl is Canvas) { return contentEl as Panel; }
+            Panel inner = FindGridOrCanvasRecursive(contentEl);
+            if (inner != null) { return inner; }
+        }
+        Panel fromRoot = FindGridOrCanvasRecursive(root);
+        if (fromRoot != null) { return fromRoot; }
+        if (root is Panel) { return root as Panel; }
+        if (root is ContentControl && (root as ContentControl).Content is Panel) {
+            return (root as ContentControl).Content as Panel;
+        }
+        return null;
+    }
+
+    private static void ShowDragAdorner(UIElement src, float screenX, float screenY) {
+        HideDragAdorner();
+        Panel host = ResolveOverlayPanel(src);
+        if (host == null) { return; }
+        object item = DependencyObject.Unbox(GetElementItemBox(src));
+        string iconUri = "";
+        if (item != null) {
+            iconUri = DependencyObject.UnboxString(BindingEngine.ReadPathBox(item, "Icon"), "");
+        }
+        var adorner = new Border();
+        adorner.Width = 56.0f;
+        adorner.Height = 56.0f;
+        adorner.CornerRadius = new CornerRadius(7.0f);
+        adorner.Background = new SolidColorBrush("#CC1E293B");
+        adorner.BorderBrush = new SolidColorBrush("#FF94A3B8");
+        adorner.BorderThickness = new Thickness(1.5f);
+        adorner.HorizontalAlignment = HorizontalAlignment.Left;
+        adorner.VerticalAlignment = VerticalAlignment.Top;
+        adorner.IsHitTestVisible = false;
+        adorner.ZIndex = 9999;
+        adorner.Opacity = 0.92f;
+        if (host is Grid) {
+            UIElement.SetGridRow(adorner, 0);
+            UIElement.SetGridColumn(adorner, 0);
+            UIElement.SetGridRowSpan(adorner, 64);
+            UIElement.SetGridColumnSpan(adorner, 64);
+        }
+        _dragAdornerTransform = new TranslateTransform(0.0f, 0.0f);
+        adorner.RenderTransform = _dragAdornerTransform;
+        if (iconUri.Length > 0) {
+            var img = new Image();
+            img.Source = iconUri;
+            img.Stretch = Stretch.Uniform;
+            img.Margin = new Thickness(4.0f);
+            adorner.Child = img;
+            _dragAdornerImage = img;
+        }
+        _dragAdorner = adorner;
+        host.AddChild(adorner);
+        UpdateDragAdornerPosition(screenX, screenY);
+    }
+
+    private static void UpdateDragAdornerPosition(float screenX, float screenY) {
+        if (_dragAdorner == null || _dragAdorner.Parent == null) { return; }
+        UIElement host = _dragAdorner.Parent;
+        float lx = screenX;
+        float ly = screenY;
+        if (ParseUtil.IsValidHandle(host.__nativeHandle)) {
+            lx = Visual_ScreenToLocal(host.__nativeHandle, screenX, screenY, 0);
+            ly = Visual_ScreenToLocal(host.__nativeHandle, screenX, screenY, 1);
+        }
+        if (_dragAdornerTransform == null) {
+            _dragAdornerTransform = new TranslateTransform(lx - 28.0f, ly - 28.0f);
+        } else {
+            _dragAdornerTransform.X = lx - 28.0f;
+            _dragAdornerTransform.Y = ly - 28.0f;
+        }
+        _dragAdorner.RenderTransform = _dragAdornerTransform;
+    }
+
+    private static void HideDragAdorner() {
+        if (_dragAdorner != null) {
+            if (_dragAdorner.Parent != null) {
+                _dragAdorner.Parent.RemoveChild(_dragAdorner);
+            }
+            _dragAdorner = null;
+            _dragAdornerImage = null;
+        }
+        _dragAdornerTransform = null;
+    }
+
+    private static bool IsPointInsideElement(UIElement el, float screenX, float screenY) {
+        if (el == null) { return false; }
+        UIElement cur = el;
+        while (cur != null) {
+            if (cur._isDisposedTree || cur.Visibility != Visibility.Visible) { return false; }
+            cur = cur.Parent;
+        }
+        if (!ParseUtil.IsValidHandle(el.__nativeHandle)) { return false; }
+        float w = el.ActualWidth;
+        float h = el.ActualHeight;
+        if (w <= 0.5f || h <= 0.5f) { return false; }
+        float lx = Visual_ScreenToLocal(el.__nativeHandle, screenX, screenY, 0);
+        float ly = Visual_ScreenToLocal(el.__nativeHandle, screenX, screenY, 1);
+        return lx >= 0.0f && ly >= 0.0f && lx <= w && ly <= h;
+    }
+
+    private static UIElement FindDropTargetAtPoint(UIElement src, float screenX, float screenY) {
+        if (_participants == null) { return null; }
+        UIElement bestSpecific = null;
+        UIElement bestItemsControl = null;
+        ItemsControl fallbackBag = null;
+        for (int i = _participants.Length - 1; i >= 0; i -= 1) {
+            UIElement p = _participants[i];
+            if (p == null || p._isDisposedTree || p == src) { continue; }
+            string role = ReadRole(p);
+            if (role != "DragAndDrop" && role != "Drop") { continue; }
+            if (fallbackBag == null) {
+                ItemsControl ownerIc = FindOwningItemsControl(p);
+                if (ownerIc != null && IsPointInsideElement(ownerIc, screenX, screenY)) {
+                    fallbackBag = ownerIc;
+                }
+            }
+            if (!IsPointInsideElement(p, screenX, screenY)) { continue; }
+            if (p is ItemsControl) {
+                if (bestItemsControl == null) { bestItemsControl = p; }
+            } else {
+                bestSpecific = p;
+                break;
+            }
+        }
+        if (bestSpecific != null) { return bestSpecific; }
+        if (bestItemsControl != null) { return bestItemsControl; }
+        if (fallbackBag != null && !(src.Parent != null && FindOwningItemsControl(src) == fallbackBag)) {
+            return fallbackBag;
+        }
+        return null;
+    }
 
     public static void CancelSelection() {
+        if (_pressCandidate != null) {
+            _pressCandidate.ReleaseMouseCapture();
+        }
+        _pressCandidate = null;
+        _isDragging = false;
+        HideDragAdorner();
         _selectedSource = null;
         UpdateCompatibilityStates();
     }
@@ -2700,8 +2890,70 @@ public static class DragDrop {
         }
     }
 
+    public static void HandlePointerDown(UIElement el, MouseButtonEventArgs e) {
+        if (el == null || e == null) { return; }
+        string role = ReadRole(el);
+        if (_selectedSource != null && !_isDragging) {
+            HandleActivate(el);
+            e.Handled = true;
+            return;
+        }
+        if ((role == "DragAndDrop" || role == "Drag") && !ComputeIsEmpty(el)) {
+            _pressCandidate = el;
+            _pressStartX = e.X;
+            _pressStartY = e.Y;
+            _isDragging = false;
+            el.CaptureMouse();
+            e.Handled = true;
+        }
+    }
+
+    public static void HandlePointerMove(UIElement el, MouseEventArgs e) {
+        if (el == null || e == null || _pressCandidate != el) { return; }
+        float dx = e.X - _pressStartX;
+        float dy = e.Y - _pressStartY;
+        if (!_isDragging && (dx * dx + dy * dy) >= 16.0f) {
+            _isDragging = true;
+            _selectedSource = el;
+            UpdateCompatibilityStates();
+            ShowDragAdorner(el, e.X, e.Y);
+        }
+        if (_isDragging) {
+            UpdateDragAdornerPosition(e.X, e.Y);
+        }
+    }
+
+    public static void HandlePointerUp(UIElement el, MouseButtonEventArgs e) {
+        if (el == null || e == null) { return; }
+        if (_pressCandidate != el) { return; }
+        el.ReleaseMouseCapture();
+        bool wasDragging = _isDragging;
+        _pressCandidate = null;
+        _isDragging = false;
+        HideDragAdorner();
+        if (wasDragging) {
+            UIElement dst = FindDropTargetAtPoint(el, e.X, e.Y);
+            string srcKind = ReadItemKindStr(el);
+            _selectedSource = null;
+            if (dst != null && IsItemCompatibleWithTarget(srcKind, dst)) {
+                TryTransfer(el, dst);
+            }
+            UpdateCompatibilityStates();
+            e.Handled = true;
+        } else {
+            HandleActivate(el);
+            e.Handled = true;
+        }
+    }
+
     public static void OnAttachedPropertyChanged(UIElement el, string prop, DependencyObject val) {
         if (el == null) { return; }
+        if (prop == "DragDrop.IsOverlayHost") {
+            if (DependencyObject.UnboxBool(val, false) && el is Panel) {
+                _overlayHost = el as Panel;
+            }
+            return;
+        }
         if (prop == "DragDrop.IsContentEmpty" || prop == "DragDrop.IsDropCompatible") {
             return;
         }
@@ -2721,13 +2973,19 @@ public static class DragDrop {
         if (!known) {
             _participants.Push(el);
             el.MouseLeftButtonDown += (object s, MouseButtonEventArgs e) => {
-                DragDrop.HandleActivate(el);
+                DragDrop.HandlePointerDown(el, e);
+            };
+            el.MouseMove += (object s, MouseEventArgs e) => {
+                DragDrop.HandlePointerMove(el, e);
+            };
+            el.MouseLeftButtonUp += (object s, MouseButtonEventArgs e) => {
+                DragDrop.HandlePointerUp(el, e);
             };
             el.KeyDown += (object s, KeyEventArgs e) => {
                 if (e.Key == KeyCode.Space || e.Key == KeyCode.Enter) {
                     DragDrop.HandleActivate(el);
                     e.Handled = true;
-                } else if (e.Key == KeyCode.Escape && DragDrop.HasSelectedSource()) {
+                } else if (e.Key == KeyCode.Escape && (DragDrop.HasSelectedSource() || DragDrop.HasPressCandidate())) {
                     DragDrop.CancelSelection();
                     e.Handled = true;
                 }

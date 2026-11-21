@@ -2307,6 +2307,7 @@ public partial class UIElement : DependencyObject {
     private string _flowDirection = "LeftToRight";
     private bool _hasExplicitFlowDirection = false;
     private Style _appliedStyle;
+    public string _internalRootName = "";
     internal bool _isDisposedTree = false;
     private string[] _dynPropKeys;
     private DependencyObject[] _dynPropVals;
@@ -4363,6 +4364,7 @@ public partial class UIElement : DependencyObject {
         if (cleanKey.Length >= 7 && cleanKey.Substring(0, 7) == "Custom.") { return true; }
         if (cleanKey.Length >= 9 && cleanKey.Substring(0, 9) == "DragDrop.") { return true; }
         if (cleanKey.Length >= 15 && cleanKey.Substring(0, 15) == "ToolTipService.") { return true; }
+        if (cleanKey.Length >= 5 && cleanKey.Substring(0, 5) == "Text.") { return true; }
         return false;
     }
 
@@ -4580,7 +4582,8 @@ public partial class UIElement : DependencyObject {
     }
 
     protected virtual void UpdateTriggersAndStates() {
-        if (_style != null) { _style.EvaluateTriggers(this); }
+        Style activeStyle = _style != null ? _style : _appliedStyle;
+        if (activeStyle != null) { activeStyle.EvaluateTriggers(this); }
         OnVisualStatePropertyChanged();
         NotifyStateInvalidatedHooks();
     }
@@ -4719,7 +4722,8 @@ public static class FocusManager {
     public static void CollectFocusable(UIElement root, UIElement[] output) {
         if (root == null) { return; }
         if (root.Visibility != Visibility.Visible || !root.IsEnabled) { return; }
-        if (root.Focusable) { output.Push(root); }
+        bool canTabStop = !(root is Control) || (root as Control).IsTabStop;
+        if (root.Focusable && canTabStop) { output.Push(root); }
         for (int i = 0; i < root.ChildCount(); i += 1) {
             CollectFocusable(root.ChildAt(i), output);
         }

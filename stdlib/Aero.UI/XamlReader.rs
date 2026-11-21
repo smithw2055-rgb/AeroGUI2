@@ -990,6 +990,9 @@ public static class XamlReader {
         UIElement el, string rawPropName, string rawVal, XamlBuildContext ctx) {
         if (el == null || rawPropName == null || rawPropName.Length == 0) { return; }
         string propName = XamlStr.StripOuterParens(rawPropName);
+        if (XamlStr.StartsWith(propName, "DragDrop.") || propName.Contains(":DragDrop.")) {
+            DragDrop.EnsureInstalled();
+        }
 
         if (XamlStr.LooksLikeMarkupExtension(rawVal)) {
             string kind = XamlStr.ExtractExtType(rawVal);
@@ -1448,6 +1451,9 @@ public static class XamlReader {
             if (IsIgnoredAttributeName(a.Name, a.LocalName)) { continue; }
             if (a.Name == "x:Name" || a.Name == "Name") {
                 el.Name = a.Value;
+                if (el is UserControl || el is Page) {
+                    el._internalRootName = a.Value;
+                }
                 continue;
             }
             ApplyPropertyValueOrExt(el, a.Name, a.Value, ctx);
@@ -2348,6 +2354,7 @@ public static class XamlReader {
     private static Setter BuildSetterNode(XamlXmlNode node, XamlBuildContext ctx) {
         string prop = NormalizeSetterProp(node.GetAttr("Property"));
         if (prop.Length == 0) { return null; }
+        if (XamlStr.StartsWith(prop, "DragDrop.")) { DragDrop.EnsureInstalled(); }
         string targetName = node.GetAttr("TargetName");
         if (targetName == null) { targetName = ""; }
 
@@ -2418,6 +2425,17 @@ public static class XamlReader {
                 dt.ElementName = pb.ElementName;
                 dt.RelativeSourceMode = pb.RelativeSourceMode;
                 dt.RelativeSourceAncestorType = pb.AncestorType;
+            }
+            for (int i = 0; i < node.Children.Length; i += 1) {
+                XamlXmlNode ch = node.Children[i];
+                if (ch.LocalName == "DataTrigger.Binding" && ch.Children.Length > 0) {
+                    XamlXmlNode bChild = ch.Children[0];
+                    if (bChild.LocalName == "MultiBinding") {
+                        dt.SetMultiBinding(BuildMultiBindingNode(bChild, ctx));
+                    } else if (bChild.LocalName == "Binding") {
+                        dt.SetDynamicBinding(ParseBindingElementNode(bChild, ctx));
+                    }
+                }
             }
             trig = dt;
         } else if (tag == "MultiTrigger" || tag == "MultiDataTrigger") {
@@ -2807,6 +2825,48 @@ public static class XamlReader {
         return fallback;
     }
 
+    private static float ParseEasingParam0(XamlXmlNode easeNode) {
+        if (easeNode == null) { return 0.0f; }
+        string t = easeNode.LocalName;
+        string attrName = "";
+        if (t == "BounceEase") { attrName = "Bounces"; }
+        else if (t == "ElasticEase") { attrName = "Oscillations"; }
+        else if (t == "BackEase") { attrName = "Amplitude"; }
+        else if (t == "ExponentialEase") { attrName = "Exponent"; }
+        if (attrName.Length == 0) { return 0.0f; }
+        string v = easeNode.GetAttr(attrName);
+        return v != null ? ParseUtil.ParseFloat(v, 0.0f) : 0.0f;
+    }
+
+    private static float ParseEasingParam1(XamlXmlNode easeNode) {
+        if (easeNode == null) { return 0.0f; }
+        string t = easeNode.LocalName;
+        string attrName = "";
+        if (t == "BounceEase") { attrName = "Bounciness"; }
+        else if (t == "ElasticEase") { attrName = "Springiness"; }
+        if (attrName.Length == 0) { return 0.0f; }
+        string v = easeNode.GetAttr(attrName);
+        return v != null ? ParseUtil.ParseFloat(v, 0.0f) : 0.0f;
+    }
+
+    private static int ParseEasingParamMask(XamlXmlNode easeNode) {
+        if (easeNode == null) { return 0; }
+        string t = easeNode.LocalName;
+        int mask = 0;
+        if (t == "BounceEase") {
+            if (easeNode.GetAttr("Bounces") != null) { mask = mask + 1; }
+            if (easeNode.GetAttr("Bounciness") != null) { mask = mask + 2; }
+        } else if (t == "ElasticEase") {
+            if (easeNode.GetAttr("Oscillations") != null) { mask = mask + 1; }
+            if (easeNode.GetAttr("Springiness") != null) { mask = mask + 2; }
+        } else if (t == "BackEase") {
+            if (easeNode.GetAttr("Amplitude") != null) { mask = mask + 1; }
+        } else if (t == "ExponentialEase") {
+            if (easeNode.GetAttr("Exponent") != null) { mask = mask + 1; }
+        }
+        return mask;
+    }
+
     private static VisualStateGroup[] BuildVisualStateGroupsList(XamlXmlNode vsgContainer, XamlBuildContext ctx) {
         var groups = new VisualStateGroup[0];
         for (int i = 0; i < vsgContainer.Children.Length; i += 1) {
@@ -2843,6 +2903,10 @@ public static class XamlReader {
                                 } else if (tch.LocalName == "VisualTransition.GeneratedEasingFunction" && tch.Children.Length > 0) {
                                     vt.EasingKind = ParseEasingKind(tch.Children[0], EasingFunctionKind.Linear);
                                     vt.EasingMode = ParseEasingMode(tch.Children[0], EasingMode.EaseOut);
+                                    int vtMask = ParseEasingParamMask(tch.Children[0]);
+                                    if (vtMask != 0) {
+                                        vt.SetEasingParams(ParseEasingParam0(tch.Children[0]), ParseEasingParam1(tch.Children[0]), vtMask);
+                                    }
                                 }
                             }
                             vsg.AddTransition(vt);
@@ -2887,6 +2951,9 @@ public static class XamlReader {
                     if (XamlStr.EndsWith(ch.Children[e].LocalName, ".EasingFunction") && ch.Children[e].Children.Length > 0) {
                         da.EasingKind = ParseEasingKind(ch.Children[e].Children[0], da.EasingKind);
                         da.EasingMode = ParseEasingMode(ch.Children[e].Children[0], da.EasingMode);
+                        da.EaseParam0 = ParseEasingParam0(ch.Children[e].Children[0]);
+                        da.EaseParam1 = ParseEasingParam1(ch.Children[e].Children[0]);
+                        da.EaseParamMask = ParseEasingParamMask(ch.Children[e].Children[0]);
                     }
                 }
                 sb.Add(da);
@@ -2939,14 +3006,23 @@ public static class XamlReader {
                     }
                     EasingFunctionKind ek = EasingFunctionKind.Linear;
                     EasingMode em = EasingMode.EaseOut;
+                    float kfP0 = 0.0f;
+                    float kfP1 = 0.0f;
+                    int kfMask = 0;
                     for (int e = 0; e < kf.Children.Length; e += 1) {
                         if (XamlStr.EndsWith(kf.Children[e].LocalName, ".EasingFunction") && kf.Children[e].Children.Length > 0) {
                             ek = ParseEasingKind(kf.Children[e].Children[0], ek);
                             em = ParseEasingMode(kf.Children[e].Children[0], em);
+                            kfP0 = ParseEasingParam0(kf.Children[e].Children[0]);
+                            kfP1 = ParseEasingParam1(kf.Children[e].Children[0]);
+                            kfMask = ParseEasingParamMask(kf.Children[e].Children[0]);
                         }
                     }
                     if (kf.LocalName == "SplineDoubleKeyFrame") { ek = EasingFunctionKind.Spline; }
                     var edkf = new EasingDoubleKeyFrame(kv, kt, ek, em);
+                    edkf.EaseParam0 = kfP0;
+                    edkf.EaseParam1 = kfP1;
+                    edkf.EaseParamMask = kfMask;
                     if (valBind != null) { edkf.ValueBinding = valBind; }
                     dakf.AddKeyFrame(edkf);
                 }

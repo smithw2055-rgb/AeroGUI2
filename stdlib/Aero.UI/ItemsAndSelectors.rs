@@ -887,7 +887,9 @@ public class Selector : ItemsControl {
 
     protected virtual void OnSelectionChanged(int oldIdx, int newIdx, DependencyObject oldBox, DependencyObject newBox) {
         SyncContainerSelectionStates();
+        BindingEngine.MarkFlushDirty();
         NotifyStateInvalidatedHooks();
+        UpdateTriggersAndStates();
         SelectionChanged(this, new SelectionChangedEventArgs(this, newIdx, oldBox, newBox));
         BindingEngine.NotifyTargetPropertyChanged(this, "SelectedIndex", DependencyObject.BoxInt(newIdx));
         BindingEngine.NotifyTargetPropertyChanged(this, "SelectedItem", newBox);
@@ -1114,6 +1116,7 @@ public class ListBox : Selector {
 
     public override void OnKeyDown(KeyEventArgs e) {
         base.OnKeyDown(e);
+        if (Template != null && EnsureItemsHostPanel() == null) { return; }
         int n = ItemCount();
         if (n == 0) { return; }
         if (e.Key == KeyCode.Down) {

@@ -464,6 +464,17 @@ void TestAnimationEngine() {
     }
     const float bounceMid = aero::EvaluateEasing(aero::EasingFunctionKind::Bounce, aero::EasingMode::EaseOut, 0.5f);
     CHECK(bounceMid > 0.70f); // true parabolic Bounce hits >0.75 before settling, not linear 0.5
+    const float expPos = aero::EvaluateEasing(aero::EasingFunctionKind::Exponential, aero::EasingMode::EaseOut, 0.5f, 2.0f, 0.0f, 1u);
+    const float expNeg = aero::EvaluateEasing(aero::EasingFunctionKind::Exponential, aero::EasingMode::EaseOut, 0.5f, -2.0f, 0.0f, 1u);
+    const float expZero = aero::EvaluateEasing(aero::EasingFunctionKind::Exponential, aero::EasingMode::EaseOut, 0.5f, 0.0f, 0.0f, 1u);
+    CHECK(expPos > 0.70f);
+    CHECK(expNeg < 0.45f);
+    CHECK_NEAR(expZero, 0.5f, 1e-4f);
+    const float backZero = aero::EvaluateEasing(aero::EasingFunctionKind::Back, aero::EasingMode::EaseIn, 0.5f, 0.0f, 0.0f, 1u);
+    CHECK_NEAR(backZero, 0.125f, 1e-4f);
+    const float bounceZero = aero::EvaluateEasing(aero::EasingFunctionKind::Bounce, aero::EasingMode::EaseOut, 0.5f, 0.0f, 0.0f, 1u);
+    CHECK(bounceZero >= 0.0f && bounceZero <= 1.0f);
+    CHECK(std::fabs(bounceZero - bounceMid) > 0.05f);
 
     aero::VisualWorld w;
     aero::VisualAnimationEngine anim;
@@ -526,6 +537,23 @@ void TestAnimationEngine() {
     CHECK_NEAR(w.GetNode(box)->customScalars[0], 110.0f, 0.5f);
     anim.Tick(0.5f, w); // t=2.0 -> snaps to 500 and ends
     CHECK_NEAR(w.GetNode(box)->customScalars[0], 500.0f, 0.5f);
+    CHECK(!anim.HasActiveAnimations());
+
+    // 7. BeginKeyFramesTrack + AddKeyFrameFloat infinite repeat loop (wraps smoothly past t > durationSec)
+    const std::int32_t loopKfId = anim.BeginKeyFramesTrack(
+        box, aero::VisualAnimProp::CustomScalar1, 0.0f, false, -1);
+    CHECK(loopKfId > 0);
+    anim.AddKeyFrameFloat(loopKfId, 0.0f, 0.0f, aero::EasingFunctionKind::Linear, aero::EasingMode::EaseOut, 0.0f, 0.0f, 0u, false);
+    anim.AddKeyFrameFloat(loopKfId, 0.5f, 50.0f, aero::EasingFunctionKind::Linear, aero::EasingMode::EaseOut, 0.0f, 0.0f, 0u, false);
+    anim.AddKeyFrameFloat(loopKfId, 1.0f, 100.0f, aero::EasingFunctionKind::Linear, aero::EasingMode::EaseOut, 0.0f, 0.0f, 0u, false);
+    anim.AddKeyFrameFloat(loopKfId, 1.5f, 50.0f, aero::EasingFunctionKind::Linear, aero::EasingMode::EaseOut, 0.0f, 0.0f, 0u, false);
+    anim.AddKeyFrameFloat(loopKfId, 2.0f, 0.0f, aero::EasingFunctionKind::Linear, aero::EasingMode::EaseOut, 0.0f, 0.0f, 0u, false);
+    anim.Tick(2.25f, w);
+    CHECK_NEAR(w.GetNode(box)->customScalars[1], 25.0f, 0.5f);
+    anim.Tick(0.50f, w); // t = 2.75s -> local 0.75s -> 75.0f
+    CHECK_NEAR(w.GetNode(box)->customScalars[1], 75.0f, 0.5f);
+    CHECK(anim.HasActiveAnimations());
+    anim.StopTrack(loopKfId);
     CHECK(!anim.HasActiveAnimations());
 }
 

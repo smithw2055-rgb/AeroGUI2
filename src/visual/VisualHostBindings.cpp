@@ -1521,6 +1521,15 @@ bool RegisterVisualHostBindings(
             ArgFloat(args, 2, 1.0f));
         return rs_rt::Value{std::int64_t{0}};
     });
+    ok &= bindFn("Visual_SetVectorStrokeDash", [&world, &domains](const rs_bc::FunctionReference&, rs_rt::ValueSpan args, rs_rt::RuntimeError&) -> std::optional<rs_rt::Value> {
+        (void)world.SetVectorStrokeDash(
+            ArgNode(args, 0, world),
+            ArgString(domains, args, 1),
+            static_cast<std::int32_t>(ArgInt(args, 2, 0)),
+            static_cast<std::int32_t>(ArgInt(args, 3, 0)),
+            static_cast<std::int32_t>(ArgInt(args, 4, 0)));
+        return rs_rt::Value{std::int64_t{0}};
+    });
 
     // Retained DrawingContext
     ok &= bindFn("Draw_Begin", [&world, &drawBuffer](const rs_bc::FunctionReference&, rs_rt::ValueSpan args, rs_rt::RuntimeError&) -> std::optional<rs_rt::Value> {
@@ -1596,8 +1605,12 @@ bool RegisterVisualHostBindings(
         drawBuffer.PopTransform(ArgNode(args, 0, world));
         return rs_rt::Value{std::int64_t{0}};
     });
-    ok &= bindFn("Visual_InvalidateDraw", [&world](const rs_bc::FunctionReference&, rs_rt::ValueSpan args, rs_rt::RuntimeError&) -> std::optional<rs_rt::Value> {
-        (void)world.InvalidateDraw(ArgNode(args, 0, world));
+    ok &= bindFn("Visual_InvalidateDraw", [&world, platformHooks](const rs_bc::FunctionReference&, rs_rt::ValueSpan args, rs_rt::RuntimeError&) -> std::optional<rs_rt::Value> {
+        if (world.InvalidateDraw(ArgNode(args, 0, world))) {
+            if (platformHooks && platformHooks->requestWake) {
+                platformHooks->requestWake();
+            }
+        }
         return rs_rt::Value{std::int64_t{0}};
     });
 
@@ -1716,6 +1729,49 @@ bool RegisterVisualHostBindings(
         animEngine.StopTrack(static_cast<std::int32_t>(ArgInt(args, 0, 0)));
         return rs_rt::Value{std::int64_t{0}};
     });
+    ok &= bindFn("Anim_SetTrackEasingParams", [&animEngine](const rs_bc::FunctionReference&, rs_rt::ValueSpan args, rs_rt::RuntimeError&) -> std::optional<rs_rt::Value> {
+        animEngine.SetTrackEasingParams(
+            static_cast<std::int32_t>(ArgInt(args, 0, 0)),
+            ArgFloat(args, 1, 0.0f),
+            ArgFloat(args, 2, 0.0f),
+            static_cast<std::uint8_t>(std::clamp<std::int64_t>(ArgInt(args, 3, 3), 0, 255)));
+        return rs_rt::Value{std::int64_t{0}};
+    });
+    ok &= bindFn("Anim_BeginKeyFrames", [&world, &animEngine](const rs_bc::FunctionReference&, rs_rt::ValueSpan args, rs_rt::RuntimeError&) -> std::optional<rs_rt::Value> {
+        const VisualNodeId nodeId = ArgNode(args, 0, world);
+        const auto prop = static_cast<VisualAnimProp>(ArgInt(args, 1, 0));
+        const float delaySec = ArgFloat(args, 2, 0.0f);
+        const bool autoReverse = ArgBool(args, 3, false);
+        const auto repeatCount = static_cast<std::int32_t>(ArgInt(args, 4, 1));
+        const std::int32_t tid = animEngine.BeginKeyFramesTrack(
+            nodeId, prop, delaySec, autoReverse, repeatCount);
+        return rs_rt::Value{static_cast<std::int64_t>(tid)};
+    });
+    ok &= bindFn("Anim_AddKeyFrameFloat", [&animEngine](const rs_bc::FunctionReference&, rs_rt::ValueSpan args, rs_rt::RuntimeError&) -> std::optional<rs_rt::Value> {
+        animEngine.AddKeyFrameFloat(
+            static_cast<std::int32_t>(ArgInt(args, 0, 0)),
+            ArgFloat(args, 1, 0.0f),
+            ArgFloat(args, 2, 0.0f),
+            static_cast<EasingFunctionKind>(ArgInt(args, 3, 0)),
+            static_cast<EasingMode>(ArgInt(args, 4, 0)),
+            ArgFloat(args, 5, 0.0f),
+            ArgFloat(args, 6, 0.0f),
+            static_cast<std::uint8_t>(std::clamp<std::int64_t>(ArgInt(args, 7, 0), 0, 255)),
+            ArgBool(args, 8, false));
+        return rs_rt::Value{std::int64_t{0}};
+    });
+    ok &= bindFn("Anim_ApplyFloat", [&world](const rs_bc::FunctionReference&, rs_rt::ValueSpan args, rs_rt::RuntimeError&) -> std::optional<rs_rt::Value> {
+        const VisualNodeId nodeId = ArgNode(args, 0, world);
+        const auto prop = static_cast<VisualAnimProp>(ArgInt(args, 1, 0));
+        VisualAnimationEngine::ApplyScalarPropImmediate(world, nodeId, prop, ArgFloat(args, 2, 0.0f));
+        return rs_rt::Value{std::int64_t{0}};
+    });
+    ok &= bindFn("Anim_ApplyColor", [&world](const rs_bc::FunctionReference&, rs_rt::ValueSpan args, rs_rt::RuntimeError&) -> std::optional<rs_rt::Value> {
+        const VisualNodeId nodeId = ArgNode(args, 0, world);
+        const auto prop = static_cast<VisualAnimProp>(ArgInt(args, 1, 16));
+        VisualAnimationEngine::ApplyColorPropImmediate(world, nodeId, prop, ArgUInt(args, 2, 0u));
+        return rs_rt::Value{std::int64_t{0}};
+    });
     ok &= bindFn("Anim_IsTrackActive", [&animEngine](const rs_bc::FunctionReference&, rs_rt::ValueSpan args, rs_rt::RuntimeError&) -> std::optional<rs_rt::Value> {
         return rs_rt::Value{animEngine.HasTrack(static_cast<std::int32_t>(ArgInt(args, 0, 0)))};
     });
@@ -1754,6 +1810,17 @@ bool RegisterVisualHostBindings(
     ok &= bindFn("Host_RequestWake", [platformHooks](const rs_bc::FunctionReference&, rs_rt::ValueSpan, rs_rt::RuntimeError&) -> std::optional<rs_rt::Value> {
         if (platformHooks && platformHooks->requestWake) {
             platformHooks->requestWake();
+        }
+        return rs_rt::Value{std::int64_t{0}};
+    });
+    ok &= bindFn("Host_RequestWakeAfterMs", [platformHooks](const rs_bc::FunctionReference&, rs_rt::ValueSpan args, rs_rt::RuntimeError&) -> std::optional<rs_rt::Value> {
+        const std::int32_t delayMs = static_cast<std::int32_t>(std::clamp<std::int64_t>(ArgInt(args, 0, 16), 1, 60000));
+        if (platformHooks) {
+            if (platformHooks->requestWakeAfterMs) {
+                platformHooks->requestWakeAfterMs(delayMs);
+            } else if (platformHooks->requestWake) {
+                platformHooks->requestWake();
+            }
         }
         return rs_rt::Value{std::int64_t{0}};
     });

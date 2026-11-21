@@ -1510,6 +1510,7 @@ Size MeasureNode(VisualWorld& world, VisualNodeId id, Size availSize) {
 
     if (node->layout.visibility == Visibility::Collapsed) {
         node->layout.desiredSize = Size{0.0f, 0.0f};
+        node->layout.unclampedContentBox = Size{0.0f, 0.0f};
         node->layout.lastMeasureConstraint = availSize;
         node->layout.lastMeasureInnerInfW = !std::isfinite(availSize.width);
         node->layout.lastMeasureInnerInfH = !std::isfinite(availSize.height);
@@ -1606,6 +1607,9 @@ Size MeasureNode(VisualWorld& world, VisualNodeId id, Size availSize) {
         contentDesired.height = std::max(contentDesired.height, panelDesired.height);
     }
 
+    node->layout.unclampedContentBox = Size{
+        std::isfinite(contentDesired.width) ? (contentDesired.width + padH) : 0.0f,
+        std::isfinite(contentDesired.height) ? (contentDesired.height + padV) : 0.0f};
     const float desiredBoxW = std::clamp(contentDesired.width + padH, minW, maxW);
     const float desiredBoxH = std::clamp(contentDesired.height + padV, minH, maxH);
     node->layout.untransformedDesiredBox = Size{
@@ -1644,9 +1648,10 @@ void ArrangeNode(
 
     if (node->layout.visibility == Visibility::Collapsed) {
         const Rect collapsedRect{finalSlot.x, finalSlot.y, 0.0f, 0.0f};
-        const bool rectChanged = !SameRectExact(node->layout.layoutRect, collapsedRect);
+        const bool rectChanged = !SameRectExact(node->layout.layoutRect, collapsedRect) || node->layout.needsLayoutClip;
         node->layout.layoutRect = collapsedRect;
         node->layout.lastArrangeSlot = finalSlot;
+        node->layout.needsLayoutClip = false;
         node->layout.hasValidArrange = true;
         if (rectChanged) {
             node->dirtyFlags = static_cast<std::uint8_t>(node->dirtyFlags | VisualDirty_Transform | VisualDirty_Visual);
@@ -1797,14 +1802,10 @@ void ArrangeNode(
     }
 
     const Rect newLayoutRect{posX, posY, targetW, targetH};
-    const bool rectChanged = !SameRectExact(node->layout.layoutRect, newLayoutRect) || vbChanged;
+    const bool prevRectChanged = !SameRectExact(node->layout.layoutRect, newLayoutRect) || vbChanged;
     node->layout.layoutRect = newLayoutRect;
     node->layout.lastArrangeSlot = finalSlot;
     node->layout.hasValidArrange = true;
-    if (rectChanged) {
-        node->dirtyFlags = static_cast<std::uint8_t>(node->dirtyFlags | VisualDirty_Transform | VisualDirty_Visual);
-        world.MarkStructureDirty();
-    }
 
     const float pL = std::max(0.0f, node->layout.padding.left);
     const float pT = std::max(0.0f, node->layout.padding.top);
@@ -1818,6 +1819,44 @@ void ArrangeNode(
 
     if (!node->children.empty()) {
         ArrangePanelChildren(world, *node, innerRect);
+    }
+
+    // Re-fetch node pointer after ArrangePanelChildren
+    node = world.GetNode(id);
+    if (!node) {
+        return;
+    }
+
+    const bool explicitW = std::isfinite(node->layout.width) || std::isfinite(node->layout.maxWidth);
+    const bool explicitH = std::isfinite(node->layout.height) || std::isfinite(node->layout.maxHeight);
+    const bool isViewbox = (node->layout.layoutMode == LayoutMode::Viewbox);
+    const bool viewboxUniformToFill = isViewbox &&
+        (static_cast<Stretch>(std::clamp(node->layout.layoutInt0, 0, 3)) == Stretch::UniformToFill);
+    bool childOverflows = false;
+    if ((explicitW || explicitH) && node->layout.layoutMode != LayoutMode::Canvas && (!isViewbox || viewboxUniformToFill)) {
+        if ((explicitW && targetW + 0.5f < node->layout.unclampedContentBox.width) ||
+            (explicitH && targetH + 0.5f < node->layout.unclampedContentBox.height)) {
+            childOverflows = true;
+        } else if (!isViewbox && !node->children.empty()) {
+            for (VisualNodeId cid : node->children) {
+                const VisualNode* ch = world.GetNode(cid);
+                if (!ch || ch->layout.visibility == Visibility::Collapsed) {
+                    continue;
+                }
+                const Rect& cr = ch->layout.layoutRect;
+                if ((explicitW && cr.width > targetW + 0.5f) ||
+                    (explicitH && cr.height > targetH + 0.5f)) {
+                    childOverflows = true;
+                    break;
+                }
+            }
+        }
+    }
+    const bool clipChanged = (node->layout.needsLayoutClip != childOverflows);
+    node->layout.needsLayoutClip = childOverflows;
+    if (prevRectChanged || clipChanged) {
+        node->dirtyFlags = static_cast<std::uint8_t>(node->dirtyFlags | VisualDirty_Transform | VisualDirty_Visual);
+        world.MarkStructureDirty();
     }
 }
 

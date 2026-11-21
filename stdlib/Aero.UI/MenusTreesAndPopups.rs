@@ -1393,6 +1393,7 @@ public class TreeView : ItemsControl {
 
 public class UserControl : ContentControl {
     public UserControl() : base() {
+        IsTabStop = false;
         HorizontalContentAlignment = HorizontalAlignment.Stretch;
         VerticalContentAlignment = VerticalAlignment.Stretch;
     }
@@ -1408,6 +1409,7 @@ public class Page : ContentControl {
     public string Title { get; set; } = "";
     public string WindowTitle { get; set; } = "";
     public Page() : base() {
+        IsTabStop = false;
         HorizontalContentAlignment = HorizontalAlignment.Stretch;
         VerticalContentAlignment = VerticalAlignment.Stretch;
     }

@@ -2,7 +2,9 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cerrno>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -916,7 +918,8 @@ struct XamlNode final {
         "BorderThickness", "CornerRadius", "Text", "FontSize", "FontFamily", "FontWeight",
         "TextWrapping", "TextAlignment", "TextTrimming", "Orientation", "Spacing",
         "Stretch", "StretchDirection", "ExpandDirection", "Source", "Data",
-        "Fill", "Stroke", "StrokeThickness", "RadiusX", "RadiusY",
+        "Fill", "Stroke", "StrokeThickness", "StrokeDashArray", "StrokeDashCap",
+        "StrokeStartLineCap", "StrokeEndLineCap", "CaretBrush", "RadiusX", "RadiusY",
         "X1", "Y1", "X2", "Y2", "Minimum", "Maximum", "Value", "SmallChange",
         "LargeChange", "IsChecked", "IsThreeState", "IsExpanded", "IsSelected",
         "IsReadOnly", "LastChildFill", "SelectedIndex", "SelectionMode",
@@ -1128,6 +1131,13 @@ struct XamlNode final {
     }
     if (prop == "StrokeThickness") {
         return IsShapeType(targetType) || targetType == "TextBlock";
+    }
+    if (prop == "StrokeDashArray" || prop == "StrokeDashCap" ||
+        prop == "StrokeStartLineCap" || prop == "StrokeEndLineCap") {
+        return IsShapeType(targetType);
+    }
+    if (prop == "CaretBrush") {
+        return targetType == "TextBoxBase" || targetType == "TextBox" || targetType == "PasswordBox";
     }
     if (prop == "RadiusX" || prop == "RadiusY") return targetType == "Rectangle";
     if (prop == "X1" || prop == "Y1" || prop == "X2" || prop == "Y2") return targetType == "Line";
@@ -3502,6 +3512,10 @@ private:
             Indent(out, indent);
             out << "RichText.Register();\n";
         }
+        if (aero::str::StartsWith(propName, "DragDrop.")) {
+            Indent(out, indent);
+            out << "DragDrop.EnsureInstalled();\n";
+        }
         std::string targetName;
         if (const auto* tnAttr = setterNode.FindAttribute("TargetName")) {
             targetName = tnAttr->value;
@@ -3720,6 +3734,21 @@ private:
                     const auto ext = ParseMarkupExtension(b->value);
                     (void)TryExtractBindingSpec(ext, bSpec);
                 }
+                std::string mbVar;
+                std::string dynBindVar;
+                if (const XamlNode* bindProp = trig->FindPropertyElement("DataTrigger", "Binding")) {
+                    for (const auto& bc : bindProp->children) {
+                        if (!bc) continue;
+                        if (bc->localName == "MultiBinding") {
+                            mbVar = EmitMultiBindingObject(*bc, "", dictVar, out, indent);
+                            break;
+                        }
+                        if (bc->localName == "Binding") {
+                            dynBindVar = EmitDynamicBindingObject(*bc, "", dictVar, out, indent);
+                            break;
+                        }
+                    }
+                }
                 std::string val;
                 if (const auto* v = trig->FindAttribute("Value")) val = v->value;
                 const std::string cleanPath = NormalizeBindingPath(bSpec.path);
@@ -3730,6 +3759,17 @@ private:
                     << FormatTriggerValueBoxExpr(cleanPath, val, dictVar) << ", "
                     << EscapeRsString(bSpec.relativeSourceMode) << ", "
                     << EscapeRsString(bSpec.ancestorType) << ");\n";
+                if (!bSpec.elementName.empty()) {
+                    Indent(out, indent);
+                    out << tVar << ".ElementName = " << EscapeRsString(bSpec.elementName) << ";\n";
+                }
+                if (!mbVar.empty()) {
+                    Indent(out, indent);
+                    out << tVar << ".SetMultiBinding(" << mbVar << ");\n";
+                } else if (!dynBindVar.empty()) {
+                    Indent(out, indent);
+                    out << tVar << ".SetDynamicBinding(" << dynBindVar << ");\n";
+                }
                 for (const auto& s : trig->children) {
                     if (s->localName == "Setter") {
                         EmitSetterInto(*s, tVar, dictVar, out, indent, styleTargetType);
@@ -4227,6 +4267,35 @@ private:
         return BoxSetterValueExpr(targetProp, FormatTypedValueLiteral(targetProp, rawVal, dictVar));
     }
 
+    static void ExtractEasingNodeParams(const XamlNode& easeNode, float& outP0, float& outP1, int& outMask) {
+        outP0 = 0.0f;
+        outP1 = 0.0f;
+        outMask = 0;
+        if (easeNode.localName == "BounceEase") {
+            if (const auto* a = easeNode.FindAttribute("Bounces")) {
+                if (aero::str::TryParseFloat32(a->value, outP0)) outMask |= 1;
+            }
+            if (const auto* b = easeNode.FindAttribute("Bounciness")) {
+                if (aero::str::TryParseFloat32(b->value, outP1)) outMask |= 2;
+            }
+        } else if (easeNode.localName == "ElasticEase") {
+            if (const auto* a = easeNode.FindAttribute("Oscillations")) {
+                if (aero::str::TryParseFloat32(a->value, outP0)) outMask |= 1;
+            }
+            if (const auto* b = easeNode.FindAttribute("Springiness")) {
+                if (aero::str::TryParseFloat32(b->value, outP1)) outMask |= 2;
+            }
+        } else if (easeNode.localName == "BackEase") {
+            if (const auto* a = easeNode.FindAttribute("Amplitude")) {
+                if (aero::str::TryParseFloat32(a->value, outP0)) outMask |= 1;
+            }
+        } else if (easeNode.localName == "ExponentialEase") {
+            if (const auto* a = easeNode.FindAttribute("Exponent")) {
+                if (aero::str::TryParseFloat32(a->value, outP0)) outMask |= 1;
+            }
+        }
+    }
+
     void EmitScalarKeyFrameSegment(
         std::string_view sbVar,
         std::string_view targetName,
@@ -4244,7 +4313,10 @@ private:
         bool autoRev,
         int repeatCount,
         std::ostringstream& out,
-        int indent) {
+        int indent,
+        float easeP0 = 0.0f,
+        float easeP1 = 0.0f,
+        int easeMask = 0) {
         const float segDur = std::max(0.001f, kt - prevTime);
         const bool segLoop = hasLoopParams && keyFrameCount <= 2;
         if (havePrev && kt > prevTime) {
@@ -4301,6 +4373,14 @@ private:
                 << FormatFloatLiteral(kt > 0.0001f ? kt : 0.0f) << ", "
                 << kfEase << ", " << kfMode << ", "
                 << FormatFloatLiteral(beginSec + prevTime) << ");\n";
+        } else {
+            return;
+        }
+        if (easeMask != 0 || easeP0 != 0.0f || easeP1 != 0.0f) {
+            Indent(out, indent);
+            out << sbVar << ".SetLastEasingParams("
+                << FormatFloatLiteral(easeP0) << ", " << FormatFloatLiteral(easeP1)
+                << ", " << (easeMask != 0 ? easeMask : 3) << ");\n";
         }
     }
 
@@ -4323,7 +4403,8 @@ private:
         std::string_view dictVar,
         std::ostringstream& out,
         int indent,
-        std::unordered_set<std::string>& visitedSbKeys) {
+        std::unordered_set<std::string>& visitedSbKeys,
+        bool sbRepeatForever = false) {
         for (const auto& child : sbNode.children) {
             if (!child || ShouldIgnoreXmlElement(*child)) {
                 continue;
@@ -4334,7 +4415,7 @@ private:
                     if (const auto sbIt = knownStoryboards_.find(refKey);
                         sbIt != knownStoryboards_.end() && sbIt->second != nullptr) {
                         if (visitedSbKeys.insert(refKey).second) {
-                            EmitStoryboardTimelines(*sbIt->second, sbVar, dictVar, out, indent, visitedSbKeys);
+                            EmitStoryboardTimelines(*sbIt->second, sbVar, dictVar, out, indent, visitedSbKeys, sbRepeatForever);
                             visitedSbKeys.erase(refKey);
                         }
                     } else {
@@ -4382,6 +4463,9 @@ private:
 
             int easeKind = 0;
             int easeMode = 0;
+            float easeP0 = 0.0f;
+            float easeP1 = 0.0f;
+            int easeMask = 0;
             const XamlNode* easeProp = child->FindPropertyElement(child->localName, "EasingFunction");
             if (easeProp != nullptr && !easeProp->children.empty()) {
                 const auto& easeNode = *easeProp->children.front();
@@ -4389,6 +4473,7 @@ private:
                 if (const auto* em = easeNode.FindAttribute("EasingMode")) {
                     easeMode = MapEasingMode(em->value);
                 }
+                ExtractEasingNodeParams(easeNode, easeP0, easeP1, easeMask);
             }
             if (child->localName == "BounceAnimation") easeKind = 9;
             else if (child->localName == "ElasticAnimation") easeKind = 10;
@@ -4461,6 +4546,12 @@ private:
                         << FormatFloatLiteral(durSec) << ", "
                         << easeKind << ", " << easeMode << ", "
                         << FormatFloatLiteral(beginSec) << ");\n";
+                }
+                if (easeMask != 0 || easeP0 != 0.0f || easeP1 != 0.0f) {
+                    Indent(out, indent);
+                    out << sbVar << ".SetLastEasingParams("
+                        << FormatFloatLiteral(easeP0) << ", " << FormatFloatLiteral(easeP1)
+                        << ", " << (easeMask != 0 ? easeMask : 3) << ");\n";
                 }
             } else if (child->localName == "ColorAnimation") {
                 std::string fromHex = "#FFFFFFFF";
@@ -4624,15 +4715,16 @@ private:
                 }
             } else if (child->localName == "DoubleAnimationUsingKeyFrames") {
                 bool anyDynamicKf = false;
+                std::size_t kfCount = 0u;
                 for (const auto& kf : child->children) {
                     if (!kf || ShouldIgnoreXmlElement(*kf)) continue;
+                    ++kfCount;
                     if (const auto* va = kf->FindAttribute("Value");
                         va != nullptr && LooksLikeMarkupExtension(va->value)) {
                         anyDynamicKf = true;
-                        break;
                     }
                 }
-                if (anyDynamicKf) {
+                if (anyDynamicKf || kfCount > 2u || hasLoopParams || sbRepeatForever) {
                     const std::string dakfVar = FreshVar("dakf");
                     Indent(out, indent);
                     out << "var " << dakfVar << " = new DoubleAnimationUsingKeyFrames();\n";
@@ -4675,12 +4767,17 @@ private:
                         }
                         int kfEase = (kf->localName == "SplineDoubleKeyFrame") ? 11 : 0;
                         int kfMode = 0;
+                        float kfP0 = 0.0f;
+                        float kfP1 = 0.0f;
+                        int kfMask = 0;
                         const XamlNode* kfEaseProp = kf->FindPropertyElement(kf->localName, "EasingFunction");
                         if (kfEaseProp != nullptr && !kfEaseProp->children.empty()) {
-                            kfEase = MapEasingKind(kfEaseProp->children.front()->localName);
-                            if (const auto* em = kfEaseProp->children.front()->FindAttribute("EasingMode")) {
+                            const auto& en = *kfEaseProp->children.front();
+                            kfEase = MapEasingKind(en.localName);
+                            if (const auto* em = en.FindAttribute("EasingMode")) {
                                 kfMode = MapEasingMode(em->value);
                             }
+                            ExtractEasingNodeParams(en, kfP0, kfP1, kfMask);
                         }
                         const std::string kfVar = FreshVar("dkf");
                         Indent(out, indent);
@@ -4688,6 +4785,14 @@ private:
                             << FormatFloatLiteral(val) << ", "
                             << FormatFloatLiteral(kt) << ", Storyboard.IntToEasingKind("
                             << kfEase << "), Storyboard.IntToEasingMode(" << kfMode << "));\n";
+                        if (kfMask != 0 || kfP0 != 0.0f || kfP1 != 0.0f) {
+                            Indent(out, indent);
+                            out << kfVar << ".EaseParam0 = " << FormatFloatLiteral(kfP0) << ";\n";
+                            Indent(out, indent);
+                            out << kfVar << ".EaseParam1 = " << FormatFloatLiteral(kfP1) << ";\n";
+                            Indent(out, indent);
+                            out << kfVar << ".EaseParamMask = " << (kfMask != 0 ? kfMask : 3) << ";\n";
+                        }
                         if (hasKfBind) {
                             const std::string bv = EmitBindingObjectFromSpec(
                                 kfBindSpec, targetProp, dictVar, out, indent);
@@ -4717,17 +4822,22 @@ private:
                         }
                         int kfEase = (kf->localName == "SplineDoubleKeyFrame") ? 11 : 0;
                         int kfMode = 0;
+                        float kfP0 = 0.0f;
+                        float kfP1 = 0.0f;
+                        int kfMask = 0;
                         const XamlNode* kfEaseProp = kf->FindPropertyElement(kf->localName, "EasingFunction");
                         if (kfEaseProp != nullptr && !kfEaseProp->children.empty()) {
-                            kfEase = MapEasingKind(kfEaseProp->children.front()->localName);
-                            if (const auto* em = kfEaseProp->children.front()->FindAttribute("EasingMode")) {
+                            const auto& en = *kfEaseProp->children.front();
+                            kfEase = MapEasingKind(en.localName);
+                            if (const auto* em = en.FindAttribute("EasingMode")) {
                                 kfMode = MapEasingMode(em->value);
                             }
+                            ExtractEasingNodeParams(en, kfP0, kfP1, kfMask);
                         }
                         EmitScalarKeyFrameSegment(
                             sbVar, targetName, targetProp, prevTime, prevVal, kt, val,
-                            havePrev, child->children.size(), kfEase, kfMode, beginSec,
-                            hasLoopParams, autoRev, repeatCount, out, indent);
+                            havePrev, kfCount, kfEase, kfMode, beginSec,
+                            hasLoopParams, autoRev, repeatCount, out, indent, kfP0, kfP1, kfMask);
                         prevTime = kt;
                         prevVal = val;
                         havePrev = true;
@@ -4818,8 +4928,10 @@ private:
                 out << sbVar << ".SpeedRatio = " << FormatFloatLiteral(sr) << ";\n";
             }
         }
+        bool sbRepeatForever = false;
         if (const auto* rbAttr = sbNode.FindAttribute("RepeatBehavior")) {
             if (aero::str::EqualsIgnoreCase(aero::str::Trim(rbAttr->value), "Forever")) {
+                sbRepeatForever = true;
                 Indent(out, indent);
                 out << sbVar << ".RepeatForever = true;\n";
             }
@@ -4830,7 +4942,7 @@ private:
         if (!ownKey.empty()) {
             visitedSbKeys.insert(ownKey);
         }
-        EmitStoryboardTimelines(sbNode, sbVar, dictVar, out, indent, visitedSbKeys);
+        EmitStoryboardTimelines(sbNode, sbVar, dictVar, out, indent, visitedSbKeys, sbRepeatForever);
         return sbVar;
     }
 
@@ -5226,7 +5338,8 @@ private:
         std::string_view dictVar,
         std::ostringstream& out,
         int indent,
-        std::string_view explicitBindSourceVar = {}) {
+        std::string_view explicitBindSourceVar = {},
+        bool isUiElementTarget = false) {
         if (targetType == "TextBlock") {
             if (aero::str::EndsWith(propName, "Text.Stroke")) {
                 propName = "Stroke";
@@ -5277,6 +5390,12 @@ private:
             }
             return;
         }
+        const bool isCustomUiElementAttr =
+            isUiElementTarget &&
+            !IsKnownUIElementType(targetType) &&
+            !IsNonUIElementType(targetType) &&
+            propName.find('.') == std::string_view::npos &&
+            propName.find(':') == std::string_view::npos;
         std::string ownedRawVal;
         if (LooksLikeMarkupExtension(rawVal)) {
             const auto ext = ParseMarkupExtension(rawVal);
@@ -5347,7 +5466,7 @@ private:
                         Indent(out, indent);
                         out << targetVar << ".SetPropertyBox(" << EscapeRsString(propName)
                             << ", DependencyObject.BoxObject(" << lookup << "));\n";
-                    } else if (IsDirectUIProperty(propName) && !IsNonUIElementType(targetType)) {
+                    } else if ((IsDirectUIProperty(propName) || isCustomUiElementAttr) && !IsNonUIElementType(targetType)) {
                         Indent(out, indent);
                         out << targetVar << ".SetPropertyBox(" << EscapeRsString(propName)
                             << ", DependencyObject.BoxObject(" << lookup << "));\n";
@@ -5587,6 +5706,46 @@ private:
             out << targetVar << ".SetPropertyBox(" << EscapeRsString(propName) << ", "
                 << BoxSetterValueExpr(propName, FormatTypedValueLiteral(propName, rawVal, dictVar, targetType), targetType)
                 << ");\n";
+        } else if (isCustomUiElementAttr) {
+            const std::string_view trimmedVal = aero::str::Trim(rawVal);
+            std::string boxExpr;
+            if (aero::str::EqualsIgnoreCase(trimmedVal, "True") ||
+                aero::str::EqualsIgnoreCase(trimmedVal, "False")) {
+                const bool bv = aero::str::EqualsIgnoreCase(trimmedVal, "True");
+                boxExpr = std::string("DependencyObject.BoxBool(") + (bv ? "true" : "false") + ")";
+            } else {
+                bool isPureInt = !trimmedVal.empty();
+                std::size_t idx = (trimmedVal.front() == '+' || trimmedVal.front() == '-') ? 1u : 0u;
+                if (idx >= trimmedVal.size()) {
+                    isPureInt = false;
+                }
+                for (; idx < trimmedVal.size(); ++idx) {
+                    if (!std::isdigit(static_cast<unsigned char>(trimmedVal[idx]))) {
+                        isPureInt = false;
+                        break;
+                    }
+                }
+                if (isPureInt) {
+                    const std::string numStr(trimmedVal);
+                    errno = 0;
+                    char* endPtr = nullptr;
+                    const long long iv = std::strtoll(numStr.c_str(), &endPtr, 10);
+                    if (errno == 0 && endPtr == numStr.c_str() + numStr.size() &&
+                        iv >= -2147483647LL && iv <= 2147483647LL) {
+                        boxExpr = "DependencyObject.BoxInt(" + std::to_string(iv) + ")";
+                    }
+                }
+                if (boxExpr.empty()) {
+                    float fv = 0.0f;
+                    if (aero::str::TryParseFloat32(trimmedVal, fv)) {
+                        boxExpr = "DependencyObject.BoxFloat(" + FormatFloatLiteral(fv) + ")";
+                    } else {
+                        boxExpr = "DependencyObject.BoxString(" + EscapeRsString(rawVal) + ")";
+                    }
+                }
+            }
+            Indent(out, indent);
+            out << targetVar << ".SetPropertyBox(" << EscapeRsString(propName) << ", " << boxExpr << ");\n";
         }
     }
 
@@ -5980,6 +6139,10 @@ private:
         if (!elemName.empty()) {
             Indent(out, indent);
             out << targetVar << ".Name = " << EscapeRsString(elemName) << ";\n";
+            if (targetVar == "this") {
+                Indent(out, indent);
+                out << "this._internalRootName = " << EscapeRsString(elemName) << ";\n";
+            }
             RegisterNamedField(elemName, std::string(resolvedTypeName));
             if (inPartialClass_ && targetVar != "this") {
                 Indent(out, indent);
@@ -5991,6 +6154,21 @@ private:
         EmitResourcesPropertyElement(node, xmlLocalName, targetVar, currentXamlPath, out, indent);
 
         // Emit regular attributes
+        bool hasDragDropAttr = false;
+        for (const auto& attr : node.attributes) {
+            if (attr.isXmlns || IsDesignOrMarkupCompatPrefix(attr.prefix, attr.namespaceUri)) {
+                continue;
+            }
+            if (aero::str::StartsWith(attr.rawName, "DragDrop.") ||
+                attr.rawName.find(":DragDrop.") != std::string::npos) {
+                hasDragDropAttr = true;
+                break;
+            }
+        }
+        if (hasDragDropAttr) {
+            Indent(out, indent);
+            out << "DragDrop.EnsureInstalled();\n";
+        }
         for (const auto& attr : node.attributes) {
             if (attr.isXmlns || IsDesignOrMarkupCompatPrefix(attr.prefix, attr.namespaceUri)) {
                 continue;
@@ -6005,7 +6183,8 @@ private:
             }
             EmitPropertyAttributeOrBinding(
                 targetVar, resolvedTypeName, attr.rawName, attr.value,
-                xDataType, dictVar, out, indent, explicitBindSourceVar);
+                xDataType, dictVar, out, indent, explicitBindSourceVar,
+                !IsNonUIElementType(resolvedTypeName));
         }
 
         // Grid RowDefinitions / ColumnDefinitions
@@ -7467,6 +7646,9 @@ private:
                 }
                 int easeKind = 0;
                 int easeMode = 0;
+                float easeP0 = 0.0f;
+                float easeP1 = 0.0f;
+                int easeMask = 0;
                 bool hasEase = false;
                 if (const auto* eAttr = trNode.FindAttribute("GeneratedEasingFunction")) {
                     easeKind = MapEasingKind(eAttr->value);
@@ -7479,11 +7661,18 @@ private:
                     if (const auto* em = eNode.FindAttribute("EasingMode")) {
                         easeMode = MapEasingMode(em->value);
                     }
+                    ExtractEasingNodeParams(eNode, easeP0, easeP1, easeMask);
                     hasEase = true;
                 }
                 if (hasEase) {
                     Indent(out, indent);
                     out << vtVar << ".SetEasing(" << easeKind << ", " << easeMode << ");\n";
+                    if (easeMask != 0 || easeP0 != 0.0f || easeP1 != 0.0f) {
+                        Indent(out, indent);
+                        out << vtVar << ".SetEasingParams("
+                            << FormatFloatLiteral(easeP0) << ", " << FormatFloatLiteral(easeP1)
+                            << ", " << (easeMask != 0 ? easeMask : 3) << ");\n";
+                    }
                 }
                 Indent(out, indent);
                 out << gVar << ".AddTransition(" << vtVar << ");\n";
