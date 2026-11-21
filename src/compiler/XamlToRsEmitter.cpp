@@ -468,10 +468,15 @@ struct XamlNode final {
         }
     }
     // Handle optional [d.]hh:mm:ss.fff (e.g. KeyTime="100.0:0:0")
+    float daySeconds = 0.0f;
     const std::size_t firstColon = s.find(':');
     if (firstColon != std::string_view::npos) {
         const std::size_t dotBeforeColon = s.substr(0, firstColon).find('.');
         if (dotBeforeColon != std::string_view::npos) {
+            float days = 0.0f;
+            if (aero::str::TryParseFloat32(s.substr(0, dotBeforeColon), days)) {
+                daySeconds = days * 86400.0f;
+            }
             s = s.substr(dotBeforeColon + 1);
         }
     }
@@ -492,9 +497,9 @@ struct XamlNode final {
         }
         start = colon + 1;
     }
-    if (parts.size() == 1) return parts[0];
-    if (parts.size() == 2) return parts[0] * 60.0f + parts[1];
-    if (parts.size() >= 3) return parts[0] * 3600.0f + parts[1] * 60.0f + parts[2];
+    if (parts.size() == 1) return daySeconds + parts[0];
+    if (parts.size() == 2) return daySeconds + parts[0] * 60.0f + parts[1];
+    if (parts.size() >= 3) return daySeconds + parts[0] * 3600.0f + parts[1] * 60.0f + parts[2];
     return 0.3f;
 }
 
@@ -578,6 +583,9 @@ struct XamlNode final {
         if (s.find("Foreground") != std::string_view::npos) {
             return "Foreground.Opacity";
         }
+        if (s.find("BorderBrush") != std::string_view::npos) {
+            return "BorderBrush.Opacity";
+        }
         if (s.find("Shape.Stroke") != std::string_view::npos ||
             s.find("(Stroke)") != std::string_view::npos ||
             s.find("Stroke.") != std::string_view::npos) {
@@ -605,6 +613,28 @@ struct XamlNode final {
         if (s.find("Angle") != std::string_view::npos || s.find("Rotation") != std::string_view::npos) {
             return "LayoutTransform.Angle";
         }
+    }
+    if (s.find("PlasmaBrush.") != std::string_view::npos) {
+        const std::string prefix = (s.find("Background") != std::string_view::npos) ? "Background." : "Fill.";
+        if (s.find("PlasmaBrush.Time") != std::string_view::npos) return prefix + "PlasmaTime";
+        if (s.find("PlasmaBrush.Seed") != std::string_view::npos) return prefix + "PlasmaSeed";
+        if (s.find("PlasmaBrush.Color") != std::string_view::npos) return prefix + "PlasmaColor";
+        if (s.find("PlasmaBrush.ScaleX") != std::string_view::npos) return prefix + "PlasmaScaleX";
+        if (s.find("PlasmaBrush.ScaleY") != std::string_view::npos) return prefix + "PlasmaScaleY";
+    }
+    if (s.find("Transform3D") != std::string_view::npos || s.find("CompositeTransform3D") != std::string_view::npos) {
+        if (s.find("RotationX") != std::string_view::npos) return "Rot3DX";
+        if (s.find("RotationY") != std::string_view::npos) return "Rot3DY";
+        if (s.find("RotationZ") != std::string_view::npos) return "Rot3DZ";
+        if (s.find("TranslateX") != std::string_view::npos || s.find("Translation3DX") != std::string_view::npos) return "Trans3DX";
+        if (s.find("TranslateY") != std::string_view::npos || s.find("Translation3DY") != std::string_view::npos) return "Trans3DY";
+        if (s.find("TranslateZ") != std::string_view::npos || s.find("Translation3DZ") != std::string_view::npos) return "Trans3DZ";
+        if (s.find("ScaleX") != std::string_view::npos || s.find("Scale3DX") != std::string_view::npos) return "Scale3DX";
+        if (s.find("ScaleY") != std::string_view::npos || s.find("Scale3DY") != std::string_view::npos) return "Scale3DY";
+        if (s.find("ScaleZ") != std::string_view::npos || s.find("Scale3DZ") != std::string_view::npos) return "Scale3DZ";
+        if (s.find("CenterX") != std::string_view::npos) return "Transform3D.CenterX";
+        if (s.find("CenterY") != std::string_view::npos) return "Transform3D.CenterY";
+        if (s.find("CenterZ") != std::string_view::npos) return "Transform3D.CenterZ";
     }
     if (s.find("ScaleTransform.ScaleX") != std::string_view::npos || s.find("ScaleX") != std::string_view::npos) {
         return "ScaleX";
@@ -647,14 +677,6 @@ struct XamlNode final {
     if (s.find("GlobalOffsetZ") != std::string_view::npos || s.find("LocalOffsetZ") != std::string_view::npos ||
         s.find("TranslateZ") != std::string_view::npos || s.find("Translation3DZ") != std::string_view::npos) {
         return "Trans3DZ";
-    }
-    if (s.find("PlasmaBrush.") != std::string_view::npos) {
-        const std::string prefix = (s.find("Background") != std::string_view::npos) ? "Background." : "Fill.";
-        if (s.find("PlasmaBrush.Time") != std::string_view::npos) return prefix + "PlasmaTime";
-        if (s.find("PlasmaBrush.Seed") != std::string_view::npos) return prefix + "PlasmaSeed";
-        if (s.find("PlasmaBrush.Color") != std::string_view::npos) return prefix + "PlasmaColor";
-        if (s.find("PlasmaBrush.ScaleX") != std::string_view::npos) return prefix + "PlasmaScaleX";
-        if (s.find("PlasmaBrush.ScaleY") != std::string_view::npos) return prefix + "PlasmaScaleY";
     }
     if (s.find("PathFigure.Segments") != std::string_view::npos && s.find(".Point") != std::string_view::npos) {
         int figIdx = 0;
@@ -3329,13 +3351,21 @@ private:
     }
 
     static std::string NormalizeSetterPropertyName(std::string_view rawProp) {
-        std::string propName(rawProp);
+        std::string propName(aero::str::Trim(rawProp));
+        if (propName.size() >= 2 && propName.front() == '(' && propName.back() == ')') {
+            propName = propName.substr(1, propName.size() - 2);
+        }
         const std::size_t dot = propName.find('.');
-        if (dot != std::string::npos) {
-            const std::string_view owner = std::string_view(propName).substr(0, dot);
+        const std::size_t colon = propName.find(':');
+        if (colon != std::string::npos && (dot == std::string::npos || colon < dot)) {
+            propName = propName.substr(colon + 1);
+        }
+        const std::size_t cleanDot = propName.find('.');
+        if (cleanDot != std::string::npos) {
+            const std::string_view owner = std::string_view(propName).substr(0, cleanDot);
             if (owner == "Control" || owner == "FrameworkElement" || owner == "UIElement" ||
                 owner == "TextBlock" || owner == "Panel") {
-                propName = propName.substr(dot + 1);
+                propName = propName.substr(cleanDot + 1);
             }
         }
         return propName;
@@ -3353,7 +3383,9 @@ private:
                propKey == "TextBlock.FontWeight" || propKey == "TextBlock.Foreground" ||
                propKey == "Element.Projection3D" || propKey == "Element.Transform3D" ||
                propKey == "Element.BlendingMode" || propKey == "RiveControl.Source" ||
-               aero::str::StartsWith(propKey, "Custom.");
+               aero::str::StartsWith(propKey, "Custom.") ||
+               aero::str::StartsWith(propKey, "DragDrop.") ||
+               aero::str::StartsWith(propKey, "ToolTipService.");
     }
 
     [[nodiscard]] static std::string NormalizeBindingPath(std::string_view rawPath) {
@@ -3376,6 +3408,9 @@ private:
         std::string_view targetType = {}) const {
         if (typedExpr == "null") {
             return "null";
+        }
+        if (typedExpr == "ParseUtil.NaN()") {
+            return "DependencyObject.BoxFloat(ParseUtil.NaN())";
         }
         if (typedExpr.find(".GetBox(") != std::string_view::npos ||
             typedExpr.find(".FindResourceBox(") != std::string_view::npos) {
@@ -3527,6 +3562,10 @@ private:
                     valExpr = EmitTransformObject(*c, out, indent, {}, {}, dictVar);
                     break;
                 }
+                if (c->localName == "CompositeTransform3D") {
+                    valExpr = EmitCompositeTransform3DObject(*c, out, indent);
+                    break;
+                }
             }
             if (valExpr.empty() && !valEl->textContent.empty()) {
                 valExpr = FormatTypedValueLiteral(propName, valEl->textContent, dictVar, effTargetType);
@@ -3584,7 +3623,9 @@ private:
             propName == "Template" || propName == "ItemTemplate" ||
             propName == "ContentTemplate" || propName == "Style" ||
             propName == "ItemContainerStyle" || propName == "ItemsPanel" ||
-            propName == "RenderTransform" ||
+            propName == "RenderTransform" || propName == "Element.Transform3D" ||
+            propName == "Transform3D" || aero::str::StartsWith(propName, "DragDrop.") ||
+            aero::str::StartsWith(propName, "ToolTipService.") ||
             aero::str::StartsWith(valExpr, "this.FindResource(") ||
             valExpr.find(".FindResource(") != std::string::npos ||
             valExpr.find(".Get(") != std::string::npos ||
@@ -4582,35 +4623,115 @@ private:
                     prevTime = kt;
                 }
             } else if (child->localName == "DoubleAnimationUsingKeyFrames") {
-                float prevTime = 0.0f;
-                float prevVal = 0.0f;
-                bool havePrev = false;
+                bool anyDynamicKf = false;
                 for (const auto& kf : child->children) {
                     if (!kf || ShouldIgnoreXmlElement(*kf)) continue;
-                    float kt = prevTime;
-                    if (const auto* ka = kf->FindAttribute("KeyTime")) {
-                        kt = ParseDurationSeconds(ka->value);
+                    if (const auto* va = kf->FindAttribute("Value");
+                        va != nullptr && LooksLikeMarkupExtension(va->value)) {
+                        anyDynamicKf = true;
+                        break;
                     }
-                    float val = prevVal;
-                    if (const auto* va = kf->FindAttribute("Value")) {
-                        (void)aero::str::TryParseFloat32(va->value, val);
+                }
+                if (anyDynamicKf) {
+                    const std::string dakfVar = FreshVar("dakf");
+                    Indent(out, indent);
+                    out << "var " << dakfVar << " = new DoubleAnimationUsingKeyFrames();\n";
+                    if (!targetName.empty()) {
+                        Indent(out, indent);
+                        out << dakfVar << ".TargetName = " << EscapeRsString(targetName) << ";\n";
                     }
-                    int kfEase = 0;
-                    int kfMode = 0;
-                    const XamlNode* kfEaseProp = kf->FindPropertyElement(kf->localName, "EasingFunction");
-                    if (kfEaseProp != nullptr && !kfEaseProp->children.empty()) {
-                        kfEase = MapEasingKind(kfEaseProp->children.front()->localName);
-                        if (const auto* em = kfEaseProp->children.front()->FindAttribute("EasingMode")) {
-                            kfMode = MapEasingMode(em->value);
+                    Indent(out, indent);
+                    out << dakfVar << ".TargetProperty = " << EscapeRsString(targetProp) << ";\n";
+                    if (beginSec > 0.0001f) {
+                        Indent(out, indent);
+                        out << dakfVar << ".DelaySec = " << FormatFloatLiteral(beginSec) << ";\n";
+                    }
+                    if (autoRev) {
+                        Indent(out, indent);
+                        out << dakfVar << ".AutoReverse = true;\n";
+                    }
+                    if (repeatCount != 1) {
+                        Indent(out, indent);
+                        out << dakfVar << ".RepeatCount = " << repeatCount << ";\n";
+                    }
+                    float prevTime = 0.0f;
+                    float prevVal = 0.0f;
+                    for (const auto& kf : child->children) {
+                        if (!kf || ShouldIgnoreXmlElement(*kf)) continue;
+                        float kt = prevTime;
+                        if (const auto* ka = kf->FindAttribute("KeyTime")) {
+                            kt = ParseDurationSeconds(ka->value);
                         }
+                        float val = prevVal;
+                        ParsedBindingSpec kfBindSpec;
+                        bool hasKfBind = false;
+                        if (const auto* va = kf->FindAttribute("Value")) {
+                            if (LooksLikeMarkupExtension(va->value)) {
+                                const auto ext = ParseMarkupExtension(va->value);
+                                hasKfBind = TryExtractBindingSpec(ext, kfBindSpec);
+                            } else {
+                                (void)aero::str::TryParseFloat32(va->value, val);
+                            }
+                        }
+                        int kfEase = (kf->localName == "SplineDoubleKeyFrame") ? 11 : 0;
+                        int kfMode = 0;
+                        const XamlNode* kfEaseProp = kf->FindPropertyElement(kf->localName, "EasingFunction");
+                        if (kfEaseProp != nullptr && !kfEaseProp->children.empty()) {
+                            kfEase = MapEasingKind(kfEaseProp->children.front()->localName);
+                            if (const auto* em = kfEaseProp->children.front()->FindAttribute("EasingMode")) {
+                                kfMode = MapEasingMode(em->value);
+                            }
+                        }
+                        const std::string kfVar = FreshVar("dkf");
+                        Indent(out, indent);
+                        out << "var " << kfVar << " = new EasingDoubleKeyFrame("
+                            << FormatFloatLiteral(val) << ", "
+                            << FormatFloatLiteral(kt) << ", Storyboard.IntToEasingKind("
+                            << kfEase << "), Storyboard.IntToEasingMode(" << kfMode << "));\n";
+                        if (hasKfBind) {
+                            const std::string bv = EmitBindingObjectFromSpec(
+                                kfBindSpec, targetProp, dictVar, out, indent);
+                            Indent(out, indent);
+                            out << kfVar << ".ValueBinding = " << bv << ";\n";
+                        }
+                        Indent(out, indent);
+                        out << dakfVar << ".AddKeyFrame(" << kfVar << ");\n";
+                        prevTime = kt;
+                        prevVal = val;
                     }
-                    EmitScalarKeyFrameSegment(
-                        sbVar, targetName, targetProp, prevTime, prevVal, kt, val,
-                        havePrev, child->children.size(), kfEase, kfMode, beginSec,
-                        hasLoopParams, autoRev, repeatCount, out, indent);
-                    prevTime = kt;
-                    prevVal = val;
-                    havePrev = true;
+                    Indent(out, indent);
+                    out << sbVar << ".Add(" << dakfVar << ");\n";
+                } else {
+                    float prevTime = 0.0f;
+                    float prevVal = 0.0f;
+                    bool havePrev = false;
+                    for (const auto& kf : child->children) {
+                        if (!kf || ShouldIgnoreXmlElement(*kf)) continue;
+                        float kt = prevTime;
+                        if (const auto* ka = kf->FindAttribute("KeyTime")) {
+                            kt = ParseDurationSeconds(ka->value);
+                        }
+                        float val = prevVal;
+                        if (const auto* va = kf->FindAttribute("Value")) {
+                            (void)aero::str::TryParseFloat32(va->value, val);
+                        }
+                        int kfEase = (kf->localName == "SplineDoubleKeyFrame") ? 11 : 0;
+                        int kfMode = 0;
+                        const XamlNode* kfEaseProp = kf->FindPropertyElement(kf->localName, "EasingFunction");
+                        if (kfEaseProp != nullptr && !kfEaseProp->children.empty()) {
+                            kfEase = MapEasingKind(kfEaseProp->children.front()->localName);
+                            if (const auto* em = kfEaseProp->children.front()->FindAttribute("EasingMode")) {
+                                kfMode = MapEasingMode(em->value);
+                            }
+                        }
+                        EmitScalarKeyFrameSegment(
+                            sbVar, targetName, targetProp, prevTime, prevVal, kt, val,
+                            havePrev, child->children.size(), kfEase, kfMode, beginSec,
+                            hasLoopParams, autoRev, repeatCount, out, indent);
+                        prevTime = kt;
+                        prevVal = val;
+                        havePrev = true;
+                    }
                 }
             } else if (child->localName == "ColorAnimationUsingKeyFrames") {
                 float prevTime = 0.0f;
@@ -4812,6 +4933,10 @@ private:
         if (IsIntPropertyFor(targetType, propName, rawVal)) {
             const long v = std::strtol(std::string(rawVal).c_str(), nullptr, 10);
             return std::to_string(v);
+        }
+        if ((propName == "Width" || propName == "Height") &&
+            aero::str::EqualsIgnoreCase(aero::str::Trim(rawVal), "Auto")) {
+            return "ParseUtil.NaN()";
         }
         if (IsFloatPropertyFor(targetType, propName, rawVal)) {
             float f = 0.0f;
@@ -5116,6 +5241,20 @@ private:
         if (aero::str::EndsWith(propName, "Text.Placeholder")) {
             propName = "Placeholder";
         }
+        std::string normalizedAttachedName;
+        {
+            const std::size_t dotPos = propName.find('.');
+            const std::size_t colPos = propName.find(':');
+            if (colPos != std::string_view::npos && (dotPos == std::string_view::npos || colPos < dotPos)) {
+                const std::string_view stripped = propName.substr(colPos + 1);
+                if (aero::str::StartsWith(stripped, "DragDrop.") ||
+                    aero::str::StartsWith(stripped, "ToolTipService.") ||
+                    aero::str::StartsWith(stripped, "Element.")) {
+                    normalizedAttachedName = std::string(stripped);
+                    propName = normalizedAttachedName;
+                }
+            }
+        }
         if (propName == "noesis:Loc.Source" || propName == "Loc.Source") {
             propName = "Loc.Source";
             EmitSiblingLanguageDictionaries(out, indent);
@@ -5202,7 +5341,9 @@ private:
                         // Handled at action level
                     } else if (IsDirectUIPropertyFor(targetType, propName) ||
                                propName == "Tag" || propName == "ToolTip" ||
-                               propName == "Placeholder" || aero::str::StartsWith(propName, "Custom.")) {
+                               propName == "Placeholder" || aero::str::StartsWith(propName, "Custom.") ||
+                               aero::str::StartsWith(propName, "DragDrop.") ||
+                               aero::str::StartsWith(propName, "ToolTipService.")) {
                         Indent(out, indent);
                         out << targetVar << ".SetPropertyBox(" << EscapeRsString(propName)
                             << ", DependencyObject.BoxObject(" << lookup << "));\n";
@@ -5415,12 +5556,19 @@ private:
         }
 
         // Generic scalar metadata props (`Tag`, `ToolTip`, `Placeholder`, `CommandParameter`, `Custom.*`, etc.)
-        if (aero::str::StartsWith(propName, "Custom.")) {
+        if (aero::str::StartsWith(propName, "Custom.") ||
+            aero::str::StartsWith(propName, "DragDrop.") ||
+            aero::str::StartsWith(propName, "ToolTipService.")) {
             Indent(out, indent);
             if (aero::str::EndsWith(propName, "_Int32") || aero::str::EndsWith(propName, "_Int")) {
                 const long iv = std::strtol(std::string(rawVal).c_str(), nullptr, 10);
                 out << targetVar << ".SetPropertyBox(" << EscapeRsString(propName)
                     << ", DependencyObject.BoxInt(" << iv << "));\n";
+            } else if (aero::str::EqualsIgnoreCase(aero::str::Trim(rawVal), "True") ||
+                       aero::str::EqualsIgnoreCase(aero::str::Trim(rawVal), "False")) {
+                const bool bv = aero::str::EqualsIgnoreCase(aero::str::Trim(rawVal), "True");
+                out << targetVar << ".SetPropertyBox(" << EscapeRsString(propName)
+                    << ", DependencyObject.BoxBool(" << (bv ? "true" : "false") << "));\n";
             } else {
                 out << targetVar << ".SetPropertyBox(" << EscapeRsString(propName)
                     << ", DependencyObject.BoxString(" << EscapeRsString(rawVal) << "));\n";
@@ -6488,29 +6636,57 @@ private:
         out << "Element.SetProjection3D(" << targetVar << ", " << pv << ");\n";
     }
 
+    [[nodiscard]] std::string EmitCompositeTransform3DObject(
+        const XamlNode& node,
+        std::ostringstream& out,
+        int indent,
+        std::string_view hostTargetVar = {}) {
+        const std::string tv = FreshVar("t3d");
+        Indent(out, indent);
+        out << "var " << tv << " = new CompositeTransform3D();\n";
+        auto emitScalarOrBind = [&](std::string_view attrName, float defVal) {
+            if (const auto* a = node.FindAttribute(attrName)) {
+                if (LooksLikeMarkupExtension(a->value)) {
+                    if (!hostTargetVar.empty()) {
+                        const auto ext = ParseMarkupExtension(a->value);
+                        ParsedBindingSpec spec;
+                        if (TryExtractBindingSpec(ext, spec)) {
+                            EmitBindingSpec(
+                                hostTargetVar, "UIElement",
+                                "Transform3D." + std::string(attrName),
+                                spec, "", out, indent, {});
+                        }
+                    }
+                } else {
+                    float f = defVal;
+                    if (aero::str::TryParseFloat32(a->value, f)) {
+                        Indent(out, indent);
+                        out << tv << "." << attrName << " = " << FormatFloatLiteral(f) << ";\n";
+                    }
+                }
+            }
+        };
+        emitScalarOrBind("RotationX", 0.0f);
+        emitScalarOrBind("RotationY", 0.0f);
+        emitScalarOrBind("RotationZ", 0.0f);
+        emitScalarOrBind("TranslateX", 0.0f);
+        emitScalarOrBind("TranslateY", 0.0f);
+        emitScalarOrBind("TranslateZ", 0.0f);
+        emitScalarOrBind("ScaleX", 1.0f);
+        emitScalarOrBind("ScaleY", 1.0f);
+        emitScalarOrBind("ScaleZ", 1.0f);
+        emitScalarOrBind("CenterX", 0.0f);
+        emitScalarOrBind("CenterY", 0.0f);
+        emitScalarOrBind("CenterZ", 0.0f);
+        return tv;
+    }
+
     void EmitTransform3D(
         const XamlNode& node,
         std::string_view targetVar,
         std::ostringstream& out,
         int indent) {
-        const std::string tv = FreshVar("t3d");
-        Indent(out, indent);
-        out << "var " << tv << " = new CompositeTransform3D();\n";
-        auto emitFloat = [&](std::string_view attrName) {
-            if (const auto* a = node.FindAttribute(attrName)) {
-                float f = 0.0f;
-                if (aero::str::TryParseFloat32(a->value, f)) {
-                    Indent(out, indent);
-                    out << tv << "." << attrName << " = " << FormatFloatLiteral(f) << ";\n";
-                }
-            }
-        };
-        emitFloat("RotationX");
-        emitFloat("RotationY");
-        emitFloat("RotationZ");
-        emitFloat("TranslateX");
-        emitFloat("TranslateY");
-        emitFloat("TranslateZ");
+        const std::string tv = EmitCompositeTransform3DObject(node, out, indent, targetVar);
         Indent(out, indent);
         out << "Element.SetTransform3D(" << targetVar << ", " << tv << ");\n";
     }
@@ -6686,6 +6862,18 @@ private:
                     }
                 }
             }
+        } else if (act.localName == "GoToStateAction") {
+            Indent(out, indent);
+            out << "var " << av << " = new GoToStateAction();\n";
+            if (const auto* sn = act.FindAttribute("StateName")) {
+                Indent(out, indent);
+                out << av << ".StateName = " << EscapeRsString(sn->value) << ";\n";
+            }
+            if (const auto* ut = act.FindAttribute("UseTransitions")) {
+                const bool useTr = !aero::str::EqualsIgnoreCase(aero::str::Trim(ut->value), "False");
+                Indent(out, indent);
+                out << av << ".UseTransitions = " << (useTr ? "true" : "false") << ";\n";
+            }
         } else if (act.localName == "BeginStoryboard") {
             std::string sbKey;
             std::string sbVar;
@@ -6817,6 +7005,22 @@ private:
                     out << tv << ".SetValueBox("
                         << FormatTriggerValueBoxExpr(NormalizeBindingPath(spec.path), val->value, dictVar)
                         << ");\n";
+                } else {
+                    Indent(out, indent);
+                    out << tv << ".SetValueBox(DependencyObject.BoxBool(true));\n";
+                }
+            }
+        } else if (trig.localName == "PropertyChangedTrigger") {
+            Indent(out, indent);
+            out << "var " << tv << " = new PropertyChangedTrigger();\n";
+            if (const auto* ba = trig.FindAttribute("Binding");
+                ba != nullptr && LooksLikeMarkupExtension(ba->value)) {
+                const auto ext = ParseMarkupExtension(ba->value);
+                ParsedBindingSpec spec;
+                if (TryExtractBindingSpec(ext, spec)) {
+                    const std::string bv = EmitBindingObjectFromSpec(spec, "", dictVar, out, indent);
+                    Indent(out, indent);
+                    out << tv << ".Binding = " << bv << ";\n";
                 }
             }
         } else if (trig.localName == "StoryboardCompletedTrigger") {
@@ -6982,20 +7186,10 @@ private:
             }
 
             for (const auto& act : trig->children) {
-                if (act->localName == "BeginStoryboard") {
-                    for (const auto& sbNode : act->children) {
-                        if (sbNode->localName == "Storyboard") {
-                            const std::string sbVar = EmitStoryboard(*sbNode, out, indent, dictVar);
-                            Indent(out, indent);
-                            out << etVar << ".AddAction(new ControlStoryboardAction(" << sbVar << ", \"Play\"));\n";
-                        }
-                    }
-                } else {
-                    const std::string av = EmitTriggerActionNode(*act, dictVar, out, indent);
-                    if (!av.empty()) {
-                        Indent(out, indent);
-                        out << etVar << ".AddAction(" << av << ");\n";
-                    }
+                const std::string av = EmitTriggerActionNode(*act, dictVar, out, indent);
+                if (!av.empty()) {
+                    Indent(out, indent);
+                    out << etVar << ".AddAction(" << av << ");\n";
                 }
             }
 

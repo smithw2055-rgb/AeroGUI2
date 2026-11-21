@@ -446,6 +446,7 @@ public class Control : FrameworkElement {
             return true;
         }
         if (propName == "HorizontalContentAlignment") {
+            if (value is BoxedInt) { HorizontalContentAlignment = EnumConvert.ToHorizontalAlignment((value as BoxedInt).Value); return true; }
             string ha = DependencyObject.UnboxString(value, "Center");
             if (ha == "Left") { HorizontalContentAlignment = HorizontalAlignment.Left; return true; }
             if (ha == "Right") { HorizontalContentAlignment = HorizontalAlignment.Right; return true; }
@@ -454,6 +455,7 @@ public class Control : FrameworkElement {
             return true;
         }
         if (propName == "VerticalContentAlignment") {
+            if (value is BoxedInt) { VerticalContentAlignment = EnumConvert.ToVerticalAlignment((value as BoxedInt).Value); return true; }
             string va = DependencyObject.UnboxString(value, "Center");
             if (va == "Top") { VerticalContentAlignment = VerticalAlignment.Top; return true; }
             if (va == "Bottom") { VerticalContentAlignment = VerticalAlignment.Bottom; return true; }
@@ -838,6 +840,11 @@ public class ContentControl : Control {
         if (_presenter != null) {
             _presenter.SetContentBox(_contentBox);
         }
+        NotifyBoundPropertyChanged("Content", _contentBox);
+        if (UIElement._attachedPropHook != null) {
+            var hook = UIElement._attachedPropHook;
+            hook(this, "DragDrop.__ContentChanged", _contentBox);
+        }
         OnContentChanged(DependencyObject.Unbox(oldBox), DependencyObject.Unbox(_contentBox));
         UpdateTriggersAndStates();
     }
@@ -856,6 +863,11 @@ public class ContentControl : Control {
         _contentBox = newBox;
         if (_presenter != null) {
             _presenter.SetContentAndTemplate(_contentBox, _contentTemplate);
+        }
+        NotifyBoundPropertyChanged("Content", _contentBox);
+        if (UIElement._attachedPropHook != null) {
+            var hook = UIElement._attachedPropHook;
+            hook(this, "DragDrop.__ContentChanged", _contentBox);
         }
         OnContentChanged(DependencyObject.Unbox(oldBox), DependencyObject.Unbox(_contentBox));
         UpdateTriggersAndStates();

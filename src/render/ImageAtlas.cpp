@@ -3011,9 +3011,62 @@ std::string ImageAtlas::ResolveUriToPath(
     return ResolveExistingFileLocked(clean, localBaseDir);
 }
 
+namespace {
+
+void SplitRiveSlotKeyParts(
+    std::string_view uri,
+    std::string_view& outPathPart,
+    std::string& outInstKey) {
+    outPathPart = uri;
+    outInstKey.clear();
+    if (const std::size_t qPos = uri.find('?'); qPos != std::string_view::npos) {
+        outPathPart = uri.substr(0u, qPos);
+        std::string_view q = uri.substr(qPos + 1u);
+        while (!q.empty()) {
+            const std::size_t amp = q.find('&');
+            const std::string_view kv = (amp != std::string_view::npos) ? q.substr(0u, amp) : q;
+            if (kv.size() > 7u && kv.substr(0u, 7u) == "__inst=") {
+                outInstKey = std::string(kv.substr(7u));
+            }
+            if (amp == std::string_view::npos) break;
+            q.remove_prefix(amp + 1u);
+        }
+    }
+}
+
+} // namespace
+
 const ImageAtlasEntry* ImageAtlas::FindLoaded(
     std::string_view uri,
     std::string_view localBaseDir) const noexcept {
+    if (IsRiveAssetUri(uri)) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        for (const auto& [k, v] : riveSlots_) {
+            if (v.currentExactUri == uri && textureSlots_.find(v.entry.textureId) != textureSlots_.end()) {
+                return &v.entry;
+            }
+        }
+        std::string_view pathPart;
+        std::string instKey;
+        SplitRiveSlotKeyParts(uri, pathPart, instKey);
+        const std::string riveKey = "rive_slot://" + std::string(localBaseDir) + "|" +
+            std::string(pathPart) + "|" + instKey;
+        if (const auto it = riveSlots_.find(riveKey);
+            it != riveSlots_.end() && textureSlots_.find(it->second.entry.textureId) != textureSlots_.end()) {
+            return &it->second.entry;
+        }
+        if (localBaseDir.empty()) {
+            const std::string suffix = "|" + std::string(pathPart) + "|" + instKey;
+            for (const auto& [k, v] : riveSlots_) {
+                if (k.size() >= suffix.size() &&
+                    k.compare(k.size() - suffix.size(), suffix.size(), suffix) == 0 &&
+                    textureSlots_.find(v.entry.textureId) != textureSlots_.end()) {
+                    return &v.entry;
+                }
+            }
+        }
+        return nullptr;
+    }
     const std::string clean = NormalizeImageUriPath(uri);
     if (clean.empty()) {
         return nullptr;
@@ -3238,23 +3291,29 @@ const ImageAtlasEntry* ImageAtlas::LoadOrGet(
         return &cached.entry;
     }
     if (IsRiveAssetUri(uri)) {
-        constexpr std::size_t kMaxRiveSlotCache = 32u;
-        const std::string riveKey = "rive_cache://" + std::string(localBaseDir) + "|" + std::string(uri);
+        constexpr std::size_t kMaxRiveSlotCache = 48u;
+        std::string_view pathPart;
+        std::string instKey;
+        SplitRiveSlotKeyParts(uri, pathPart, instKey);
+        const std::string riveKey = "rive_slot://" + std::string(localBaseDir) + "|" +
+            std::string(pathPart) + "|" + instKey;
+        std::uint32_t reuseSlotId = 0u;
         {
             std::lock_guard<std::mutex> lock(mutex_);
             if (const auto it = riveSlots_.find(riveKey); it != riveSlots_.end()) {
-                if (textureSlots_.find(it->second.entry.textureId) != textureSlots_.end()) {
-                    it->second.lastUsedTick = ++dynamicSlotTick_;
+                it->second.lastUsedTick = ++dynamicSlotTick_;
+                if (it->second.currentExactUri == uri &&
+                    textureSlots_.find(it->second.entry.textureId) != textureSlots_.end()) {
                     return &it->second.entry;
                 }
+                reuseSlotId = it->second.entry.textureId;
             }
         }
         DecodedImage riveImg{};
         if (!RenderRiveUriToImage(uri, *this, localBaseDir, riveImg) || !riveImg.Valid()) {
             return nullptr;
         }
-        std::uint32_t reuseSlotId = 0u;
-        {
+        if (reuseSlotId == 0u) {
             std::lock_guard<std::mutex> lock(mutex_);
             if (const auto it = riveSlots_.find(riveKey); it != riveSlots_.end()) {
                 reuseSlotId = it->second.entry.textureId;
@@ -3279,7 +3338,7 @@ const ImageAtlasEntry* ImageAtlas::LoadOrGet(
         cached.slotKey = riveKey;
         cached.currentExactUri = std::string(uri);
         cached.lastUsedTick = ++dynamicSlotTick_;
-        cached.entry.uriKey = riveKey;
+        cached.entry.uriKey = cached.currentExactUri;
         cached.entry.textureId = finalTexId;
         cached.entry.width = riveImg.width;
         cached.entry.height = riveImg.height;

@@ -201,6 +201,8 @@ private:
         SymbolId dispatchCustomMeasure = 0u;
         SymbolId dispatchDraw = 0u;
         SymbolId bindingFlush = 0u;
+        SymbolId bindingStepFrameTicks = 0u;
+        SymbolId stepGame = 0u;
         SymbolId windowShow = 0u;
         SymbolId applyTemplate = 0u;
         SymbolId controlApplyTemplate = 0u;

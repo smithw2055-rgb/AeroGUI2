@@ -717,6 +717,29 @@ bool VisualWorld::SetTransform3D(
     float ty,
     float tz,
     float camDist) noexcept {
+    return SetTransform3DEx(
+        id, rx, ry, rz, tx, ty, tz,
+        1.0f, 1.0f, 1.0f,
+        0.0f, 0.0f, 0.0f,
+        camDist, false);
+}
+
+bool VisualWorld::SetTransform3DEx(
+    VisualNodeId id,
+    float rx,
+    float ry,
+    float rz,
+    float tx,
+    float ty,
+    float tz,
+    float sx,
+    float sy,
+    float sz,
+    float cx,
+    float cy,
+    float cz,
+    float camDist,
+    bool useExplicitCenter) noexcept {
     VisualNode* node = GetNode(id);
     if (!node) return false;
     auto& t3d = node->EnsureExtras().transform3D;
@@ -726,9 +749,19 @@ bool VisualWorld::SetTransform3D(
     t3d.tx = tx;
     t3d.ty = ty;
     t3d.tz = tz;
+    t3d.sx = std::isfinite(sx) ? sx : 1.0f;
+    t3d.sy = std::isfinite(sy) ? sy : 1.0f;
+    t3d.sz = std::isfinite(sz) ? sz : 1.0f;
+    t3d.cx = std::isfinite(cx) ? cx : 0.0f;
+    t3d.cy = std::isfinite(cy) ? cy : 0.0f;
+    t3d.cz = std::isfinite(cz) ? cz : 0.0f;
     t3d.camDist = camDist;
-    t3d.enabled = (rx != 0.0f || ry != 0.0f || rz != 0.0f ||
-                   tx != 0.0f || ty != 0.0f || tz != 0.0f || camDist > 0.0f);
+    t3d.useExplicitCenter = useExplicitCenter;
+    t3d.enabled =
+        std::fabs(rx) > 1e-6f || std::fabs(ry) > 1e-6f || std::fabs(rz) > 1e-6f ||
+        std::fabs(tx) > 1e-6f || std::fabs(ty) > 1e-6f || std::fabs(tz) > 1e-6f ||
+        std::fabs(t3d.sx - 1.0f) > 1e-6f || std::fabs(t3d.sy - 1.0f) > 1e-6f || std::fabs(t3d.sz - 1.0f) > 1e-6f ||
+        camDist > 0.0f;
     MarkDirty(id, static_cast<VisualDirtyFlags>(VisualDirty_Transform | VisualDirty_Visual));
     return true;
 }

@@ -233,6 +233,28 @@ internal static class XamlStr {
             if (s.Contains("[2]")) { return prefix + ".Stop2" + suffix; }
             if (s.Contains("[3]")) { return prefix + ".Stop3" + suffix; }
         }
+        if (s.Contains("PlasmaBrush.")) {
+            string pfx = s.Contains("Background") ? "Background" : "Fill";
+            if (s.Contains(".Time")) { return pfx + ".PlasmaTime"; }
+            if (s.Contains(".Seed")) { return pfx + ".PlasmaSeed"; }
+            if (s.Contains(".ScaleX")) { return pfx + ".PlasmaScaleX"; }
+            if (s.Contains(".ScaleY")) { return pfx + ".PlasmaScaleY"; }
+            if (s.Contains(".Color")) { return pfx + ".PlasmaColor"; }
+        }
+        if (s.Contains("Transform3D") || s.Contains("CompositeTransform3D")) {
+            if (s.Contains(".RotationX")) { return "Transform3D.RotationX"; }
+            if (s.Contains(".RotationY")) { return "Transform3D.RotationY"; }
+            if (s.Contains(".RotationZ")) { return "Transform3D.RotationZ"; }
+            if (s.Contains(".TranslateX")) { return "Transform3D.TranslateX"; }
+            if (s.Contains(".TranslateY")) { return "Transform3D.TranslateY"; }
+            if (s.Contains(".TranslateZ")) { return "Transform3D.TranslateZ"; }
+            if (s.Contains(".ScaleX")) { return "Transform3D.ScaleX"; }
+            if (s.Contains(".ScaleY")) { return "Transform3D.ScaleY"; }
+            if (s.Contains(".ScaleZ")) { return "Transform3D.ScaleZ"; }
+            if (s.Contains(".CenterX")) { return "Transform3D.CenterX"; }
+            if (s.Contains(".CenterY")) { return "Transform3D.CenterY"; }
+            if (s.Contains(".CenterZ")) { return "Transform3D.CenterZ"; }
+        }
         if (s.Contains("LayoutTransform")) {
             if (s.Contains(".ScaleX")) { return "LayoutTransform.ScaleX"; }
             if (s.Contains(".ScaleY")) { return "LayoutTransform.ScaleY"; }
@@ -377,7 +399,19 @@ internal static class XamlStr {
             if (parts.Length == 2) {
                 sec = ParseUtil.ParseFloat(parts[0], 0.0f) * 60.0f + ParseUtil.ParseFloat(parts[1], 0.0f);
             } else if (parts.Length >= 3) {
-                sec = ParseUtil.ParseFloat(parts[0], 0.0f) * 3600.0f +
+                float days = 0.0f;
+                float hours = 0.0f;
+                if (parts[0].Contains(".")) {
+                    string[] dh = parts[0].Split(".");
+                    if (dh.Length >= 2) {
+                        days = ParseUtil.ParseFloat(dh[0], 0.0f);
+                        hours = ParseUtil.ParseFloat(dh[1], 0.0f);
+                    }
+                } else {
+                    hours = ParseUtil.ParseFloat(parts[0], 0.0f);
+                }
+                sec = days * 86400.0f +
+                      hours * 3600.0f +
                       ParseUtil.ParseFloat(parts[1], 0.0f) * 60.0f +
                       ParseUtil.ParseFloat(parts[2], 0.0f);
             }
@@ -937,6 +971,18 @@ public static class XamlReader {
             if (low == "auto" || low == "nan") { return DependencyObject.BoxFloat(ParseUtil.NaN()); }
             return DependencyObject.BoxFloat(ParseUtil.ParseFloat(val, ParseUtil.NaN()));
         }
+        if (p == "DragDrop.MatchKind" || p == "DragDrop.IsOverlayHost" ||
+            p == "DragDrop.AutoTransfer" || p == "DragDrop.IsContentEmpty" ||
+            p == "DragDrop.IsDropCompatible") {
+            return DependencyObject.BoxBool(ParseUtil.ParseBool(val, false));
+        }
+        if (p == "ToolTipService.InitialShowDelay" || p == "ToolTipService.BetweenShowDelay" ||
+            p == "ToolTipService.ShowDuration") {
+            return DependencyObject.BoxInt(ParseUtil.ParseInt(val, 0));
+        }
+        if (XamlStr.StartsWith(p, "Custom.") && XamlStr.EndsWith(p, "_Single")) {
+            return DependencyObject.BoxFloat(ParseUtil.ParseFloat(val, 0.0f));
+        }
         return DependencyObject.BoxString(val);
     }
 
@@ -1324,6 +1370,12 @@ public static class XamlReader {
             tag == "SkewTransform" || tag == "TransformGroup") {
             return BuildTransformNode(node, ctx);
         }
+        if (tag == "CompositeTransform3D") {
+            return BuildCompositeTransform3DNode(node);
+        }
+        if (tag == "PlaneProjection") {
+            return BuildPlaneProjectionNode(node);
+        }
         if (tag == "BlurEffect" || tag == "DropShadowEffect" || tag == "BackdropBlurEffect" ||
             tag == "TintEffect" || tag == "PixelateEffect" || tag == "ChromaticAberrationEffect" ||
             tag == "DirectionalBlurEffect" || tag == "SaturationEffect") {
@@ -1334,7 +1386,12 @@ public static class XamlReader {
         }
         if (tag == "InverseBoolConverter") { return new InverseBoolConverter(); }
         if (tag == "NullToVisibilityConverter") { return new NullToVisibilityConverter(); }
-        if (tag == "MathConverter") { return new MathConverter(); }
+        if (tag == "MathConverter") {
+            var mc = new MathConverter();
+            string expr = node.GetAttr("Expression");
+            if (expr != null) { mc.Expression = expr; }
+            return mc;
+        }
         if (tag == "AlternationConverter") {
             var ac = new AlternationConverter();
             for (int i = 0; i < node.Children.Length; i += 1) {
@@ -1562,11 +1619,90 @@ public static class XamlReader {
         }
     }
 
+    private static XamlParsedBinding ParseBindingSpecFromElementNode(XamlXmlNode bNode, XamlBuildContext ctx) {
+        var pb = new XamlParsedBinding();
+        string pathAttr = bNode.GetAttr("Path");
+        if (pathAttr != null) { pb.Path = XamlStr.StripOuterParens(pathAttr); }
+        string elName = bNode.GetAttr("ElementName");
+        if (elName != null) { pb.ElementName = elName; }
+        string modeAttr = bNode.GetAttr("Mode");
+        if (modeAttr == "TwoWay") { pb.Mode = 1; }
+        else if (modeAttr == "OneTime") { pb.Mode = 2; }
+        else if (modeAttr == "OneWayToSource") { pb.Mode = 3; }
+        string convAttr = bNode.GetAttr("Converter");
+        if (convAttr != null) {
+            if (XamlStr.LooksLikeMarkupExtension(convAttr)) {
+                DependencyObject cBox = ResolveMarkupValue(convAttr, ctx, null);
+                if (cBox is IValueConverter) { pb.Converter = cBox as IValueConverter; }
+                else if (cBox != null && DependencyObject.Unbox(cBox) is IValueConverter) {
+                    pb.Converter = DependencyObject.Unbox(cBox) as IValueConverter;
+                }
+                if (pb.Converter == null && XamlStr.StartsWith(convAttr.Trim(), "{StaticResource")) {
+                    pb.ConverterKey = XamlStr.ExtractExtBody(convAttr).Trim();
+                }
+            } else {
+                pb.ConverterKey = convAttr;
+            }
+        }
+        string cpAttr = bNode.GetAttr("ConverterParameter");
+        if (cpAttr != null) { pb.ConverterParameter = cpAttr; }
+        string sfAttr = bNode.GetAttr("StringFormat");
+        if (sfAttr != null) {
+            if (XamlStr.StartsWith(sfAttr, "{}")) { sfAttr = sfAttr.Substring(2); }
+            pb.StringFormat = sfAttr;
+        }
+        string rsAttr = bNode.GetAttr("RelativeSource");
+        if (rsAttr != null) { ParseRelativeSourceClause(rsAttr, pb); }
+        return pb;
+    }
+
+    private static Binding ParseBindingElementNode(XamlXmlNode bNode, XamlBuildContext ctx) {
+        return ToBindingObject(ParseBindingSpecFromElementNode(bNode, ctx));
+    }
+
+    private static MultiBinding BuildMultiBindingNode(XamlXmlNode mbNode, XamlBuildContext ctx) {
+        var mb = new MultiBinding();
+        string sf = mbNode.GetAttr("StringFormat");
+        if (sf != null) {
+            if (XamlStr.StartsWith(sf, "{}")) { sf = sf.Substring(2); }
+            mb.StringFormat = sf;
+        }
+        string cp = mbNode.GetAttr("ConverterParameter");
+        if (cp != null) { mb.ConverterParameter = cp; }
+        string convAttr = mbNode.GetAttr("Converter");
+        if (convAttr != null && XamlStr.LooksLikeMarkupExtension(convAttr)) {
+            DependencyObject cBox = ResolveMarkupValue(convAttr, ctx, null);
+            if (cBox is IMultiValueConverter) { mb.Converter = cBox as IMultiValueConverter; }
+            else if (cBox != null && DependencyObject.Unbox(cBox) is IMultiValueConverter) {
+                mb.Converter = DependencyObject.Unbox(cBox) as IMultiValueConverter;
+            }
+        }
+        for (int i = 0; i < mbNode.Children.Length; i += 1) {
+            XamlXmlNode ch = mbNode.Children[i];
+            if (ch.LocalName == "MultiBinding.Converter" && ch.Children.Length > 0) {
+                DependencyObject cObj = BuildObjectNode(ch.Children[0], ctx, null);
+                if (cObj is IMultiValueConverter) { mb.Converter = cObj as IMultiValueConverter; }
+                else if (cObj != null && DependencyObject.Unbox(cObj) is IMultiValueConverter) {
+                    mb.Converter = DependencyObject.Unbox(cObj) as IMultiValueConverter;
+                }
+            } else if (ch.LocalName == "Binding") {
+                mb.AddBinding(ParseBindingElementNode(ch, ctx));
+            }
+        }
+        return mb;
+    }
+
     private static void ApplyPropertyElement(UIElement el, XamlXmlNode propNode, XamlBuildContext ctx) {
         string raw = propNode.RawName;
         string local = propNode.LocalName;
         int dot = XamlStr.LastIndexOfChar(local, ".");
         string propName = dot >= 0 ? local.Substring(dot + 1) : local;
+        string cleanRawProp = XamlStr.StripOuterParens(raw);
+        string effectiveProp = (XamlStr.StartsWith(cleanRawProp, "Custom.") ||
+                                XamlStr.StartsWith(cleanRawProp, "DragDrop.") ||
+                                XamlStr.StartsWith(cleanRawProp, "ToolTipService."))
+            ? cleanRawProp
+            : propName;
 
         if (raw == "b:Interaction.Triggers" || raw == "Interaction.Triggers" || (propName == "Triggers" && raw.Contains("Interaction."))) {
             for (int i = 0; i < propNode.Children.Length; i += 1) {
@@ -1715,9 +1851,30 @@ public static class XamlReader {
         }
         if (propNode.Children.Length == 1) {
             XamlXmlNode childXml = propNode.Children[0];
+            if (childXml.LocalName == "MultiBinding") {
+                BindingEngine.BindMultiBinding(el, effectiveProp, BuildMultiBindingNode(childXml, ctx));
+                return;
+            }
+            if (childXml.LocalName == "Binding") {
+                BindElementFromSpec(el, effectiveProp, ParseBindingSpecFromElementNode(childXml, ctx), ctx);
+                return;
+            }
             DependencyObject valBox = BuildObjectNode(childXml, ctx, el);
-            ApplyResolvedPropertyBox(el, propName, valBox, ctx);
-            if (childXml.LocalName == "SolidColorBrush" && IsBrushPropertyName(propName)) {
+            ApplyResolvedPropertyBox(el, effectiveProp, valBox, ctx);
+            if (childXml.LocalName == "CompositeTransform3D") {
+                BindPlasmaAttrIfExt(el, "Transform3D.RotationX", childXml.GetAttr("RotationX"), ctx);
+                BindPlasmaAttrIfExt(el, "Transform3D.RotationY", childXml.GetAttr("RotationY"), ctx);
+                BindPlasmaAttrIfExt(el, "Transform3D.RotationZ", childXml.GetAttr("RotationZ"), ctx);
+                BindPlasmaAttrIfExt(el, "Transform3D.TranslateX", childXml.GetAttr("TranslateX"), ctx);
+                BindPlasmaAttrIfExt(el, "Transform3D.TranslateY", childXml.GetAttr("TranslateY"), ctx);
+                BindPlasmaAttrIfExt(el, "Transform3D.TranslateZ", childXml.GetAttr("TranslateZ"), ctx);
+                BindPlasmaAttrIfExt(el, "Transform3D.ScaleX", childXml.GetAttr("ScaleX"), ctx);
+                BindPlasmaAttrIfExt(el, "Transform3D.ScaleY", childXml.GetAttr("ScaleY"), ctx);
+                BindPlasmaAttrIfExt(el, "Transform3D.ScaleZ", childXml.GetAttr("ScaleZ"), ctx);
+                BindPlasmaAttrIfExt(el, "Transform3D.CenterX", childXml.GetAttr("CenterX"), ctx);
+                BindPlasmaAttrIfExt(el, "Transform3D.CenterY", childXml.GetAttr("CenterY"), ctx);
+                BindPlasmaAttrIfExt(el, "Transform3D.CenterZ", childXml.GetAttr("CenterZ"), ctx);
+            } else if (childXml.LocalName == "SolidColorBrush" && IsBrushPropertyName(effectiveProp)) {
                 string colAttr = childXml.GetAttr("Color");
                 if (colAttr != null && XamlStr.LooksLikeMarkupExtension(colAttr)) {
                     string cKind = XamlStr.ExtractExtType(colAttr);
@@ -1749,7 +1906,7 @@ public static class XamlReader {
             return;
         }
         if (propNode.Text.Length > 0) {
-            ApplyPropertyValueOrExt(el, propName, propNode.Text.Trim(), ctx);
+            ApplyPropertyValueOrExt(el, effectiveProp, propNode.Text.Trim(), ctx);
         }
     }
 
@@ -2047,6 +2204,64 @@ public static class XamlReader {
         return tg;
     }
 
+    private static CompositeTransform3D BuildCompositeTransform3DNode(XamlXmlNode node) {
+        var t3 = new CompositeTransform3D();
+        string rx = node.GetAttr("RotationX");
+        if (rx != null && !XamlStr.LooksLikeMarkupExtension(rx)) { t3.RotationX = ParseUtil.ParseFloat(rx, 0.0f); }
+        string ry = node.GetAttr("RotationY");
+        if (ry != null && !XamlStr.LooksLikeMarkupExtension(ry)) { t3.RotationY = ParseUtil.ParseFloat(ry, 0.0f); }
+        string rz = node.GetAttr("RotationZ");
+        if (rz != null && !XamlStr.LooksLikeMarkupExtension(rz)) { t3.RotationZ = ParseUtil.ParseFloat(rz, 0.0f); }
+        string tx = node.GetAttr("TranslateX");
+        if (tx != null && !XamlStr.LooksLikeMarkupExtension(tx)) { t3.TranslateX = ParseUtil.ParseFloat(tx, 0.0f); }
+        string ty = node.GetAttr("TranslateY");
+        if (ty != null && !XamlStr.LooksLikeMarkupExtension(ty)) { t3.TranslateY = ParseUtil.ParseFloat(ty, 0.0f); }
+        string tz = node.GetAttr("TranslateZ");
+        if (tz != null && !XamlStr.LooksLikeMarkupExtension(tz)) { t3.TranslateZ = ParseUtil.ParseFloat(tz, 0.0f); }
+        string sx = node.GetAttr("ScaleX");
+        if (sx != null && !XamlStr.LooksLikeMarkupExtension(sx)) { t3.ScaleX = ParseUtil.ParseFloat(sx, 1.0f); }
+        string sy = node.GetAttr("ScaleY");
+        if (sy != null && !XamlStr.LooksLikeMarkupExtension(sy)) { t3.ScaleY = ParseUtil.ParseFloat(sy, 1.0f); }
+        string sz = node.GetAttr("ScaleZ");
+        if (sz != null && !XamlStr.LooksLikeMarkupExtension(sz)) { t3.ScaleZ = ParseUtil.ParseFloat(sz, 1.0f); }
+        string cx = node.GetAttr("CenterX");
+        if (cx != null && !XamlStr.LooksLikeMarkupExtension(cx)) { t3.CenterX = ParseUtil.ParseFloat(cx, 0.0f); }
+        string cy = node.GetAttr("CenterY");
+        if (cy != null && !XamlStr.LooksLikeMarkupExtension(cy)) { t3.CenterY = ParseUtil.ParseFloat(cy, 0.0f); }
+        string cz = node.GetAttr("CenterZ");
+        if (cz != null && !XamlStr.LooksLikeMarkupExtension(cz)) { t3.CenterZ = ParseUtil.ParseFloat(cz, 0.0f); }
+        return t3;
+    }
+
+    private static PlaneProjection BuildPlaneProjectionNode(XamlXmlNode node) {
+        var pp = new PlaneProjection();
+        string rx = node.GetAttr("RotationX");
+        if (rx != null && !XamlStr.LooksLikeMarkupExtension(rx)) { pp.RotationX = ParseUtil.ParseFloat(rx, 0.0f); }
+        string ry = node.GetAttr("RotationY");
+        if (ry != null && !XamlStr.LooksLikeMarkupExtension(ry)) { pp.RotationY = ParseUtil.ParseFloat(ry, 0.0f); }
+        string rz = node.GetAttr("RotationZ");
+        if (rz != null && !XamlStr.LooksLikeMarkupExtension(rz)) { pp.RotationZ = ParseUtil.ParseFloat(rz, 0.0f); }
+        string lx = node.GetAttr("LocalOffsetX");
+        if (lx != null && !XamlStr.LooksLikeMarkupExtension(lx)) { pp.LocalOffsetX = ParseUtil.ParseFloat(lx, 0.0f); }
+        string ly = node.GetAttr("LocalOffsetY");
+        if (ly != null && !XamlStr.LooksLikeMarkupExtension(ly)) { pp.LocalOffsetY = ParseUtil.ParseFloat(ly, 0.0f); }
+        string lz = node.GetAttr("LocalOffsetZ");
+        if (lz != null && !XamlStr.LooksLikeMarkupExtension(lz)) { pp.LocalOffsetZ = ParseUtil.ParseFloat(lz, 0.0f); }
+        string gx = node.GetAttr("GlobalOffsetX");
+        if (gx != null && !XamlStr.LooksLikeMarkupExtension(gx)) { pp.GlobalOffsetX = ParseUtil.ParseFloat(gx, 0.0f); }
+        string gy = node.GetAttr("GlobalOffsetY");
+        if (gy != null && !XamlStr.LooksLikeMarkupExtension(gy)) { pp.GlobalOffsetY = ParseUtil.ParseFloat(gy, 0.0f); }
+        string gz = node.GetAttr("GlobalOffsetZ");
+        if (gz != null && !XamlStr.LooksLikeMarkupExtension(gz)) { pp.GlobalOffsetZ = ParseUtil.ParseFloat(gz, 0.0f); }
+        string cx = node.GetAttr("CenterOfRotationX");
+        if (cx != null && !XamlStr.LooksLikeMarkupExtension(cx)) { pp.CenterOfRotationX = ParseUtil.ParseFloat(cx, 0.5f); }
+        string cy = node.GetAttr("CenterOfRotationY");
+        if (cy != null && !XamlStr.LooksLikeMarkupExtension(cy)) { pp.CenterOfRotationY = ParseUtil.ParseFloat(cy, 0.5f); }
+        string cz = node.GetAttr("CenterOfRotationZ");
+        if (cz != null && !XamlStr.LooksLikeMarkupExtension(cz)) { pp.CenterOfRotationZ = ParseUtil.ParseFloat(cz, 0.0f); }
+        return pp;
+    }
+
     private static Effect BuildEffectNode(XamlXmlNode node, XamlBuildContext ctx, UIElement contextHost) {
         string tag = node.LocalName;
         if (tag == "BlurEffect") {
@@ -2114,6 +2329,8 @@ public static class XamlReader {
             string owner = p.Substring(0, dot);
             if (owner != "Grid" && owner != "Canvas" && owner != "DockPanel" &&
                 owner != "ScrollViewer" && owner != "ToolTipService" &&
+                owner != "DragDrop" && owner != "Custom" &&
+                owner != "Element" && owner != "Transform3D" && owner != "Projection3D" &&
                 owner != "RenderOptions" && owner != "TextOptions" &&
                 owner != "VirtualizingStackPanel" && owner != "RiveControl" &&
                 owner != "Storyboard" && owner != "Loc" &&
@@ -2705,7 +2922,21 @@ public static class XamlReader {
                 for (int k = 0; k < ch.Children.Length; k += 1) {
                     XamlXmlNode kf = ch.Children[k];
                     float kt = XamlStr.ParseKeyTimeSec(kf.GetAttr("KeyTime"));
-                    float kv = ParseUtil.ParseFloat(kf.GetAttr("Value"), 0.0f);
+                    string valAttr = kf.GetAttr("Value");
+                    float kv = 0.0f;
+                    Binding valBind = null;
+                    if (valAttr != null) {
+                        if (XamlStr.LooksLikeMarkupExtension(valAttr)) {
+                            string vKind = XamlStr.ExtractExtType(valAttr);
+                            if (vKind == "Binding" || vKind == "TemplateBinding") {
+                                valBind = ToBindingObject(ParseBindingSpec(valAttr, ctx));
+                            } else {
+                                kv = DependencyObject.UnboxFloat(ResolveMarkupValue(valAttr, ctx, null), 0.0f);
+                            }
+                        } else {
+                            kv = ParseUtil.ParseFloat(valAttr, 0.0f);
+                        }
+                    }
                     EasingFunctionKind ek = EasingFunctionKind.Linear;
                     EasingMode em = EasingMode.EaseOut;
                     for (int e = 0; e < kf.Children.Length; e += 1) {
@@ -2715,7 +2946,9 @@ public static class XamlReader {
                         }
                     }
                     if (kf.LocalName == "SplineDoubleKeyFrame") { ek = EasingFunctionKind.Spline; }
-                    dakf.AddKeyFrame(new EasingDoubleKeyFrame(kv, kt, ek, em));
+                    var edkf = new EasingDoubleKeyFrame(kv, kt, ek, em);
+                    if (valBind != null) { edkf.ValueBinding = valBind; }
+                    dakf.AddKeyFrame(edkf);
                 }
                 sb.Add(dakf);
             } else if (tag == "ColorAnimationUsingKeyFrames") {
@@ -2807,12 +3040,25 @@ public static class XamlReader {
             if (cmp != null) { bdt.Comparison = cmp; }
             string v = node.GetAttr("Value");
             if (v != null) {
-                DependencyObject vbox = XamlStr.LooksLikeMarkupExtension(v)
-                    ? ResolveMarkupValue(v, ctx, host)
-                    : DependencyObject.BoxString(v);
-                bdt.SetValueBox(vbox);
+                if (XamlStr.LooksLikeMarkupExtension(v)) {
+                    string vKind = XamlStr.ExtractExtType(v);
+                    if (vKind == "Binding" || vKind == "TemplateBinding") {
+                        bdt.ValueBinding = ToBindingObject(ParseBindingSpec(v, ctx));
+                    } else {
+                        bdt.SetValueBox(ResolveMarkupValue(v, ctx, host));
+                    }
+                } else {
+                    bdt.SetValueBox(DependencyObject.BoxString(v));
+                }
             }
             trig = bdt;
+        } else if (tag == "PropertyChangedTrigger") {
+            var pct = new PropertyChangedTrigger();
+            string bindAttr = node.GetAttr("Binding");
+            if (bindAttr != null && XamlStr.LooksLikeMarkupExtension(bindAttr)) {
+                pct.Binding = ToBindingObject(ParseBindingSpec(bindAttr, ctx));
+            }
+            trig = pct;
         } else if (tag == "KeyTrigger") {
             var kt = new KeyTrigger();
             string keyAttr = node.GetAttr("Key");
@@ -2833,6 +3079,16 @@ public static class XamlReader {
         if (trig == null) { return null; }
         for (int i = 0; i < node.Children.Length; i += 1) {
             XamlXmlNode actNode = node.Children[i];
+            if (actNode.LocalName == "DataTrigger.Value" && trig is BehaviorDataTrigger) {
+                if (actNode.Children.Length > 0 && actNode.Children[0].LocalName == "Binding") {
+                    (trig as BehaviorDataTrigger).ValueBinding = ParseBindingElementNode(actNode.Children[0], ctx);
+                } else if (actNode.Children.Length > 0) {
+                    (trig as BehaviorDataTrigger).SetValueBox(BuildObjectNode(actNode.Children[0], ctx, host));
+                } else if (actNode.Text.Trim().Length > 0) {
+                    (trig as BehaviorDataTrigger).SetValueBox(DependencyObject.BoxString(actNode.Text.Trim()));
+                }
+                continue;
+            }
             if (actNode.LocalName == "Interaction.Behaviors" || XamlStr.EndsWith(actNode.LocalName, ".Behaviors")) {
                 for (int b = 0; b < actNode.Children.Length; b += 1) {
                     if (actNode.Children[b].LocalName == "ConditionBehavior") {
@@ -2921,6 +3177,16 @@ public static class XamlReader {
             string tn = node.GetAttr("TargetName");
             if (tn != null) { rea.TargetName = tn; }
             return rea;
+        }
+        if (tag == "GoToStateAction") {
+            var gts = new GoToStateAction();
+            string sn = node.GetAttr("StateName");
+            if (sn != null) { gts.StateName = sn; }
+            string tn = node.GetAttr("TargetName");
+            if (tn != null) { gts.TargetName = tn; }
+            string ut = node.GetAttr("UseTransitions");
+            if (ut != null) { gts.UseTransitions = ParseUtil.ParseBool(ut, true); }
+            return gts;
         }
         if (tag == "SetFocusAction") {
             var sfa = new SetFocusAction();

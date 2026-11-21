@@ -73,6 +73,10 @@ int __rs_native_Visual_SetLayoutTransform(handle node, float sx, float sy, float
 public void Visual_SetLayoutTransform(handle node, float sx, float sy, float rotDeg, bool enabled) { __rs_native_Visual_SetLayoutTransform(node, sx, sy, rotDeg, enabled); return; }
 int __rs_native_Visual_SetTransform3D(handle node, float rx, float ry, float rz, float tx, float ty, float tz, float camDist) { return 0; }
 public void Visual_SetTransform3D(handle node, float rx, float ry, float rz, float tx, float ty, float tz, float camDist) { __rs_native_Visual_SetTransform3D(node, rx, ry, rz, tx, ty, tz, camDist); return; }
+int __rs_native_Visual_SetTransform3DEx(handle node, float rx, float ry, float rz, float tx, float ty, float tz, float sx, float sy, float sz, float cx, float cy, float cz, float camDist, bool useCenter) { return 0; }
+public void Visual_SetTransform3DEx(handle node, float rx, float ry, float rz, float tx, float ty, float tz, float sx, float sy, float sz, float cx, float cy, float cz, float camDist, bool useCenter) { __rs_native_Visual_SetTransform3DEx(node, rx, ry, rz, tx, ty, tz, sx, sy, sz, cx, cy, cz, camDist, useCenter); return; }
+int __rs_native_Visual_SetFocus(handle node) { return 0; }
+public void Visual_SetFocus(handle node) { __rs_native_Visual_SetFocus(node); return; }
 int __rs_native_Visual_SetEffect(handle node, int kind, float radius, float depth, float dirDeg, uint colorRgba, float opacity) { return 0; }
 public void Visual_SetEffect(handle node, int kind, float radius, float depth, float dirDeg, uint colorRgba, float opacity) { __rs_native_Visual_SetEffect(node, kind, radius, depth, dirDeg, colorRgba, opacity); return; }
 int __rs_native_Visual_SetOpacityMask(handle node, bool enabled, int gradId, uint solidRgba, float opacity) { return 0; }
@@ -188,6 +192,10 @@ public bool Reflect_SetPropFloat(object target, string propPath, float val) { re
 public bool Reflect_SetPropInt(object target, string propPath, int val) { return false; }
 public bool Reflect_SetPropBool(object target, string propPath, bool val) { return false; }
 public bool Reflect_SetPropObject(object target, string propPath, object val) { return false; }
+public bool Reflect_ListSet(object list, int index, object item) { return false; }
+public bool Reflect_ListAdd(object list, object item) { return false; }
+public bool Reflect_ListInsert(object list, int index, object item) { return false; }
+public bool Reflect_ListRemoveAt(object list, int index) { return false; }
 public bool Reflect_InvokeCommand(object target, string propPath, string param) { return false; }
 public int Reflect_GetDirtyMask(object target) { return 0; }
 public uint Color_ParseRgba(string hexOrNamed) { return 0u; }

@@ -1,9 +1,11 @@
 #include "aero/visual/VisualHostBindings.hpp"
+#include "aero/runtime/AeroObservableList.hpp"
 
 #include <algorithm>
 #include <chrono>
 #include <cstdlib>
 #include <ctime>
+#include <limits>
 #include <mutex>
 #include <string>
 #include <unordered_map>
@@ -411,7 +413,175 @@ struct AotProgramReflectionCache {
     return resolved;
 }
 
+[[nodiscard]] bool TryParseBracketSegment(
+    std::string_view seg,
+    std::string_view& outBaseMember,
+    std::size_t& outIndex) noexcept {
+    const std::size_t openPos = seg.find('[');
+    if (openPos == std::string_view::npos || seg.back() != ']') {
+        return false;
+    }
+    const std::string_view idxStr = seg.substr(openPos + 1u, seg.size() - openPos - 2u);
+    if (idxStr.empty()) {
+        return false;
+    }
+    std::size_t val = 0u;
+    for (char ch : idxStr) {
+        if (ch < '0' || ch > '9') {
+            return false;
+        }
+        const std::size_t digit = static_cast<std::size_t>(ch - '0');
+        if (val > (std::numeric_limits<std::size_t>::max() - digit) / 10u) {
+            return false;
+        }
+        val = val * 10u + digit;
+    }
+    outBaseMember = seg.substr(0u, openPos);
+    outIndex = val;
+    return true;
+}
+
+[[nodiscard]] rs_rt::ObjectRef ArgCollectionOrArray(rs_rt::ValueSpan args, std::size_t idx) noexcept {
+    if (idx >= args.size()) return rs_rt::ObjectRef{};
+    if (const auto* ov = std::get_if<rs_rt::ObjectRef>(&args[idx])) {
+        if (ov->valid() &&
+            (ov->kind == rs_rt::ObjectKind::Record || ov->kind == rs_rt::ObjectKind::Array)) {
+            return *ov;
+        }
+    }
+    return rs_rt::ObjectRef{};
+}
+
+[[nodiscard]] bool CanMutateCollection(
+    const ReflectHostEnv& env,
+    rs_rt::ObjectRef colObj,
+    rs_rt::ManagedHeap*& outHeap) noexcept {
+    outHeap = ResolveTargetHeap(env, colObj);
+    if (!outHeap || !colObj.valid()) {
+        return false;
+    }
+    if (env.domains &&
+        env.domains->activeDomain() == DomainKind::UiPresentation &&
+        env.domains->isSimObject(colObj)) {
+        return false;
+    }
+    return true;
+}
+
+[[nodiscard]] rs_rt::ObjectRef ResolveBackingArrayFallback(
+    rs_rt::ManagedHeap& heap,
+    rs_rt::ObjectRef colObj) noexcept {
+    rs_rt::ObjectRef arrRef = ObservableListHelper::ResolveBackingArray(heap, colObj);
+    if (!arrRef.valid() && colObj.kind == rs_rt::ObjectKind::Record) {
+        if (const rs_rt::Value* f0 = heap.fieldGetFast(colObj, 0u)) {
+            if (const auto* ov = std::get_if<rs_rt::ObjectRef>(f0);
+                ov && ov->valid() && ov->kind == rs_rt::ObjectKind::Array) {
+                arrRef = *ov;
+            }
+        }
+    }
+    return arrRef;
+}
+
+[[nodiscard]] bool ReadIndexedElement(
+    const ReflectHostEnv& env,
+    rs_rt::ObjectRef colObj,
+    std::size_t idx,
+    rs_rt::Value& outValue) {
+    rs_rt::ManagedHeap* heap = ResolveTargetHeap(env, colObj);
+    if (!heap || !colObj.valid()) {
+        return false;
+    }
+    rs_rt::ObjectRef arrRef{};
+    if (colObj.kind == rs_rt::ObjectKind::Array) {
+        arrRef = colObj;
+    } else if (colObj.kind == rs_rt::ObjectKind::Record) {
+        arrRef = ObservableListHelper::ResolveBackingArray(*heap, colObj);
+        if (!arrRef.valid()) {
+            if (const rs_rt::Value* f0 = heap->fieldGetFast(colObj, 0u)) {
+                if (const auto* ov = std::get_if<rs_rt::ObjectRef>(f0);
+                    ov && ov->valid() && ov->kind == rs_rt::ObjectKind::Array) {
+                    arrRef = *ov;
+                }
+            }
+        }
+    }
+    if (!arrRef.valid() || arrRef.kind != rs_rt::ObjectKind::Array) {
+        return false;
+    }
+    const auto elemOpt = heap->arrayGet(arrRef, idx);
+    if (!elemOpt.has_value()) {
+        return false;
+    }
+    outValue = *elemOpt;
+    return true;
+}
+
+[[nodiscard]] bool WriteIndexedElement(
+    const ReflectHostEnv& env,
+    rs_rt::ObjectRef colObj,
+    std::size_t idx,
+    const rs_rt::Value& value) {
+    rs_rt::ManagedHeap* heap = ResolveTargetHeap(env, colObj);
+    if (!heap || !colObj.valid()) {
+        return false;
+    }
+    if (env.domains &&
+        env.domains->activeDomain() == DomainKind::UiPresentation &&
+        env.domains->isSimObject(colObj)) {
+        return false;
+    }
+    rs_rt::Value writeVal = InternIfStringValueForHeap(*heap, value);
+    if (colObj.kind == rs_rt::ObjectKind::Record) {
+        if (ObservableListHelper::Replace(*heap, colObj, idx, writeVal)) {
+            return true;
+        }
+        if (const rs_rt::Value* f0 = heap->fieldGetFast(colObj, 0u)) {
+            if (const auto* ov = std::get_if<rs_rt::ObjectRef>(f0);
+                ov && ov->valid() && ov->kind == rs_rt::ObjectKind::Array) {
+                return heap->arraySet(*ov, idx, std::move(writeVal));
+            }
+        }
+        return false;
+    }
+    if (colObj.kind == rs_rt::ObjectKind::Array) {
+        return heap->arraySet(colObj, idx, std::move(writeVal));
+    }
+    return false;
+}
+
+[[nodiscard]] bool ReadSingleMemberCore(
+    const ReflectHostEnv& env,
+    rs_rt::ObjectRef obj,
+    std::string_view memberName,
+    rs_rt::Value& outValue);
+
 [[nodiscard]] bool ReadSingleMember(
+    const ReflectHostEnv& env,
+    rs_rt::ObjectRef obj,
+    std::string_view memberName,
+    rs_rt::Value& outValue) {
+    std::string_view baseMember;
+    std::size_t bracketIdx = 0u;
+    if (TryParseBracketSegment(memberName, baseMember, bracketIdx)) {
+        rs_rt::ObjectRef colObj = obj;
+        if (!baseMember.empty()) {
+            rs_rt::Value colVal{};
+            if (!ReadSingleMemberCore(env, obj, baseMember, colVal)) {
+                return false;
+            }
+            const auto* ov = std::get_if<rs_rt::ObjectRef>(&colVal);
+            if (!ov || !ov->valid()) {
+                return false;
+            }
+            colObj = *ov;
+        }
+        return ReadIndexedElement(env, colObj, bracketIdx, outValue);
+    }
+    return ReadSingleMemberCore(env, obj, memberName, outValue);
+}
+
+[[nodiscard]] bool ReadSingleMemberCore(
     const ReflectHostEnv& env,
     rs_rt::ObjectRef obj,
     std::string_view memberName,
@@ -482,7 +652,38 @@ struct AotProgramReflectionCache {
     return false;
 }
 
+[[nodiscard]] bool WriteSingleMemberCore(
+    const ReflectHostEnv& env,
+    rs_rt::ObjectRef obj,
+    std::string_view memberName,
+    const rs_rt::Value& value);
+
 [[nodiscard]] bool WriteSingleMember(
+    const ReflectHostEnv& env,
+    rs_rt::ObjectRef obj,
+    std::string_view memberName,
+    const rs_rt::Value& value) {
+    std::string_view baseMember;
+    std::size_t bracketIdx = 0u;
+    if (TryParseBracketSegment(memberName, baseMember, bracketIdx)) {
+        rs_rt::ObjectRef colObj = obj;
+        if (!baseMember.empty()) {
+            rs_rt::Value colVal{};
+            if (!ReadSingleMemberCore(env, obj, baseMember, colVal)) {
+                return false;
+            }
+            const auto* ov = std::get_if<rs_rt::ObjectRef>(&colVal);
+            if (!ov || !ov->valid()) {
+                return false;
+            }
+            colObj = *ov;
+        }
+        return WriteIndexedElement(env, colObj, bracketIdx, value);
+    }
+    return WriteSingleMemberCore(env, obj, memberName, value);
+}
+
+[[nodiscard]] bool WriteSingleMemberCore(
     const ReflectHostEnv& env,
     rs_rt::ObjectRef obj,
     std::string_view memberName,
@@ -597,7 +798,8 @@ struct AotProgramReflectionCache {
             return false;
         }
         const auto* nextObj = std::get_if<rs_rt::ObjectRef>(&hopVal);
-        if (!nextObj || !nextObj->valid() || nextObj->kind != rs_rt::ObjectKind::Record) {
+        if (!nextObj || !nextObj->valid() ||
+            (nextObj->kind != rs_rt::ObjectKind::Record && nextObj->kind != rs_rt::ObjectKind::Array)) {
             return false;
         }
         cur = *nextObj;
@@ -653,7 +855,11 @@ struct AotProgramReflectionCache {
         return false;
     }
 
-    auto dispatchMatchedFn = [&](rs_sem::SymbolId fnId, bool takesParam, bool isStatic) -> bool {
+    auto dispatchMatchedFn = [&](
+        rs_sem::SymbolId fnId,
+        bool takesParam,
+        bool isStatic,
+        rs_sem::PrimitiveType expectedParamType = rs_sem::PrimitiveType::String) -> bool {
         if (outInvokedMethod) *outInvokedMethod = true;
         std::vector<rs_rt::Value> args;
         if (!isStatic) {
@@ -661,10 +867,57 @@ struct AotProgramReflectionCache {
         }
         if (takesParam) {
             const std::string pStr = optStringParam ? *optStringParam : std::string{};
-            if (const auto interned = heap->internString(pStr, nullptr)) {
-                args.emplace_back(*interned);
-            } else {
-                args.emplace_back(rs_rt::StringValue{pStr});
+            switch (expectedParamType) {
+                case rs_sem::PrimitiveType::Bool: {
+                    const bool bv = (pStr == "true" || pStr == "True" || pStr == "TRUE" || pStr == "1");
+                    args.emplace_back(bv);
+                    break;
+                }
+                case rs_sem::PrimitiveType::Byte:
+                case rs_sem::PrimitiveType::SByte:
+                case rs_sem::PrimitiveType::Short:
+                case rs_sem::PrimitiveType::UShort:
+                case rs_sem::PrimitiveType::Int:
+                case rs_sem::PrimitiveType::UInt:
+                case rs_sem::PrimitiveType::Long:
+                case rs_sem::PrimitiveType::ULong: {
+                    char* endPtr = nullptr;
+                    const long long parsed = std::strtoll(pStr.c_str(), &endPtr, 10);
+                    if (endPtr != nullptr && endPtr != pStr.c_str()) {
+                        if (expectedParamType == rs_sem::PrimitiveType::UInt) {
+                            args.emplace_back(rs_rt::UIntValue{static_cast<std::uint32_t>(parsed)});
+                        } else if (expectedParamType == rs_sem::PrimitiveType::ULong) {
+                            args.emplace_back(rs_rt::ULongValue{static_cast<std::uint64_t>(parsed)});
+                        } else if (expectedParamType == rs_sem::PrimitiveType::Long) {
+                            args.emplace_back(rs_rt::LongValue{static_cast<std::int64_t>(parsed)});
+                        } else {
+                            args.emplace_back(static_cast<std::int64_t>(parsed));
+                        }
+                    } else {
+                        args.emplace_back(std::int64_t{0});
+                    }
+                    break;
+                }
+                case rs_sem::PrimitiveType::Float: {
+                    char* endPtr = nullptr;
+                    const float fv = std::strtof(pStr.c_str(), &endPtr);
+                    args.emplace_back(MakeRtFloat((endPtr != nullptr && endPtr != pStr.c_str()) ? fv : 0.0f));
+                    break;
+                }
+                case rs_sem::PrimitiveType::Double: {
+                    char* endPtr = nullptr;
+                    const double dv = std::strtod(pStr.c_str(), &endPtr);
+                    args.emplace_back((endPtr != nullptr && endPtr != pStr.c_str()) ? dv : 0.0);
+                    break;
+                }
+                default: {
+                    if (const auto interned = heap->internString(pStr, nullptr)) {
+                        args.emplace_back(*interned);
+                    } else {
+                        args.emplace_back(rs_rt::StringValue{pStr});
+                    }
+                    break;
+                }
             }
         }
         if (env.domains &&
@@ -706,25 +959,36 @@ struct AotProgramReflectionCache {
         std::unordered_set<rs_sem::SymbolId> visited;
         const rs_sem::TypeSymbol* cur = env.programImage->resolveType(typeId);
         while (cur && visited.insert(cur->id).second) {
-            // Prefer exact parameter match (1 string param when provided cleanly, or 0 params).
+            // Prefer exact parameter match (1 param when provided cleanly, or 0 params).
             const rs_sem::FunctionSymbol* zeroArgMatch = nullptr;
             const rs_sem::FunctionSymbol* oneArgMatch = nullptr;
+            std::size_t oneArgParamIdx = 0u;
             for (const rs_sem::FunctionSymbol& fn : cur->methods) {
                 if (fn.name != methodName) continue;
-                if (fn.parameters.empty()) {
+                const bool hasImplicitSelf =
+                    fn.method && !fn.staticMethod && !fn.parameters.empty();
+                const std::size_t explicitParamCount = hasImplicitSelf
+                    ? (fn.parameters.size() - 1u)
+                    : fn.parameters.size();
+                if (explicitParamCount == 0u) {
                     zeroArgMatch = &fn;
-                } else if (fn.parameters.size() == 1u) {
+                } else if (explicitParamCount == 1u) {
                     oneArgMatch = &fn;
+                    oneArgParamIdx = hasImplicitSelf ? 1u : 0u;
                 }
             }
+            const rs_sem::PrimitiveType oneArgType =
+                (oneArgMatch && oneArgParamIdx < oneArgMatch->parameters.size())
+                    ? oneArgMatch->parameters[oneArgParamIdx].type
+                    : rs_sem::PrimitiveType::String;
             if (optStringParam && !optStringParam->empty() && oneArgMatch) {
-                return dispatchMatchedFn(oneArgMatch->id, true, oneArgMatch->staticMethod);
+                return dispatchMatchedFn(oneArgMatch->id, true, oneArgMatch->staticMethod, oneArgType);
             }
             if (zeroArgMatch) {
                 return dispatchMatchedFn(zeroArgMatch->id, false, zeroArgMatch->staticMethod);
             }
             if (oneArgMatch) {
-                return dispatchMatchedFn(oneArgMatch->id, true, oneArgMatch->staticMethod);
+                return dispatchMatchedFn(oneArgMatch->id, true, oneArgMatch->staticMethod, oneArgType);
             }
             if (cur->baseTypeId == 0u || cur->baseTypeId == cur->id) {
                 break;
@@ -760,14 +1024,18 @@ struct AotProgramReflectionCache {
                         zeroStatic = &fn;
                     }
                 }
+                const rs_sem::PrimitiveType oneInstType =
+                    (oneInst && oneInst->parameterTypes && oneInst->parameterCount >= 2u)
+                        ? oneInst->parameterTypes[1]
+                        : rs_sem::PrimitiveType::String;
                 if (optStringParam && !optStringParam->empty() && oneInst) {
-                    return dispatchMatchedFn(oneInst->symbolId, true, false);
+                    return dispatchMatchedFn(oneInst->symbolId, true, false, oneInstType);
                 }
                 if (zeroInst) {
                     return dispatchMatchedFn(zeroInst->symbolId, false, false);
                 }
                 if (oneInst) {
-                    return dispatchMatchedFn(oneInst->symbolId, true, false);
+                    return dispatchMatchedFn(oneInst->symbolId, true, false, oneInstType);
                 }
                 if (zeroStatic) {
                     return dispatchMatchedFn(zeroStatic->symbolId, false, true);
@@ -1085,6 +1353,30 @@ bool RegisterVisualHostBindings(
             ArgFloat(args, 5),
             ArgFloat(args, 6),
             ArgFloat(args, 7));
+        return rs_rt::Value{std::int64_t{0}};
+    });
+    ok &= bindFn("Visual_SetTransform3DEx", [&world](const rs_bc::FunctionReference&, rs_rt::ValueSpan args, rs_rt::RuntimeError&) -> std::optional<rs_rt::Value> {
+        (void)world.SetTransform3DEx(
+            ArgNode(args, 0, world),
+            ArgFloat(args, 1),
+            ArgFloat(args, 2),
+            ArgFloat(args, 3),
+            ArgFloat(args, 4),
+            ArgFloat(args, 5),
+            ArgFloat(args, 6),
+            ArgFloat(args, 7, 1.0f),
+            ArgFloat(args, 8, 1.0f),
+            ArgFloat(args, 9, 1.0f),
+            ArgFloat(args, 10, 0.0f),
+            ArgFloat(args, 11, 0.0f),
+            ArgFloat(args, 12, 0.0f),
+            ArgFloat(args, 13, 0.0f),
+            ArgBool(args, 14, true));
+        return rs_rt::Value{std::int64_t{0}};
+    });
+    ok &= bindFn("Visual_SetFocus", [&world, &inputRouter](const rs_bc::FunctionReference&, rs_rt::ValueSpan args, rs_rt::RuntimeError&) -> std::optional<rs_rt::Value> {
+        const VisualNodeId nid = ArgNode(args, 0, world);
+        (void)inputRouter.SetFocus(nid);
         return rs_rt::Value{std::int64_t{0}};
     });
     ok &= bindFn("Visual_SetEffect", [&world](const rs_bc::FunctionReference&, rs_rt::ValueSpan args, rs_rt::RuntimeError&) -> std::optional<rs_rt::Value> {
@@ -1717,6 +2009,59 @@ bool RegisterVisualHostBindings(
         }
         const rs_rt::Value objVal = (args.size() > 2u) ? args[2] : rs_rt::Value{rs_rt::NullObject{}};
         return rs_rt::Value{WriteDotPathValue(reflectEnv, target, propPath, objVal)};
+    });
+    ok &= bindFn("Reflect_ListSet", [reflectEnv](const rs_bc::FunctionReference&, rs_rt::ValueSpan args, rs_rt::RuntimeError&) -> std::optional<rs_rt::Value> {
+        const rs_rt::ObjectRef colObj = ArgCollectionOrArray(args, 0);
+        const std::int64_t rawIdx = ArgInt(args, 1, -1);
+        if (!colObj.valid() || rawIdx < 0) {
+            return rs_rt::Value{false};
+        }
+        const rs_rt::Value itemVal = (args.size() > 2u) ? args[2] : rs_rt::Value{rs_rt::NullObject{}};
+        return rs_rt::Value{WriteIndexedElement(reflectEnv, colObj, static_cast<std::size_t>(rawIdx), itemVal)};
+    });
+    ok &= bindFn("Reflect_ListAdd", [reflectEnv](const rs_bc::FunctionReference&, rs_rt::ValueSpan args, rs_rt::RuntimeError&) -> std::optional<rs_rt::Value> {
+        const rs_rt::ObjectRef colObj = ArgCollectionOrArray(args, 0);
+        rs_rt::ManagedHeap* heap = nullptr;
+        if (!CanMutateCollection(reflectEnv, colObj, heap)) {
+            return rs_rt::Value{false};
+        }
+        const rs_rt::Value itemVal = (args.size() > 1u) ? args[1] : rs_rt::Value{rs_rt::NullObject{}};
+        const rs_rt::Value writeVal = InternIfStringValueForHeap(*heap, itemVal);
+        if (ObservableListHelper::Add(*heap, colObj, writeVal)) {
+            return rs_rt::Value{true};
+        }
+        const rs_rt::ObjectRef arrRef = ResolveBackingArrayFallback(*heap, colObj);
+        return rs_rt::Value{arrRef.valid() && heap->arrayPush(arrRef, writeVal)};
+    });
+    ok &= bindFn("Reflect_ListInsert", [reflectEnv](const rs_bc::FunctionReference&, rs_rt::ValueSpan args, rs_rt::RuntimeError&) -> std::optional<rs_rt::Value> {
+        const rs_rt::ObjectRef colObj = ArgCollectionOrArray(args, 0);
+        const std::int64_t rawIdx = ArgInt(args, 1, -1);
+        rs_rt::ManagedHeap* heap = nullptr;
+        if (rawIdx < 0 || !CanMutateCollection(reflectEnv, colObj, heap)) {
+            return rs_rt::Value{false};
+        }
+        const auto idx = static_cast<std::size_t>(rawIdx);
+        const rs_rt::Value itemVal = (args.size() > 2u) ? args[2] : rs_rt::Value{rs_rt::NullObject{}};
+        const rs_rt::Value writeVal = InternIfStringValueForHeap(*heap, itemVal);
+        if (ObservableListHelper::Insert(*heap, colObj, idx, writeVal)) {
+            return rs_rt::Value{true};
+        }
+        const rs_rt::ObjectRef arrRef = ResolveBackingArrayFallback(*heap, colObj);
+        return rs_rt::Value{arrRef.valid() && heap->arrayInsert(arrRef, idx, writeVal)};
+    });
+    ok &= bindFn("Reflect_ListRemoveAt", [reflectEnv](const rs_bc::FunctionReference&, rs_rt::ValueSpan args, rs_rt::RuntimeError&) -> std::optional<rs_rt::Value> {
+        const rs_rt::ObjectRef colObj = ArgCollectionOrArray(args, 0);
+        const std::int64_t rawIdx = ArgInt(args, 1, -1);
+        rs_rt::ManagedHeap* heap = nullptr;
+        if (rawIdx < 0 || !CanMutateCollection(reflectEnv, colObj, heap)) {
+            return rs_rt::Value{false};
+        }
+        const auto idx = static_cast<std::size_t>(rawIdx);
+        if (ObservableListHelper::RemoveAt(*heap, colObj, idx)) {
+            return rs_rt::Value{true};
+        }
+        const rs_rt::ObjectRef arrRef = ResolveBackingArrayFallback(*heap, colObj);
+        return rs_rt::Value{arrRef.valid() && heap->arrayRemoveAt(arrRef, idx)};
     });
     ok &= bindFn("Reflect_InvokeCommand", [reflectEnv](const rs_bc::FunctionReference&, rs_rt::ValueSpan args, rs_rt::RuntimeError&) -> std::optional<rs_rt::Value> {
         const rs_rt::ObjectRef target = ArgObject(args, 0);

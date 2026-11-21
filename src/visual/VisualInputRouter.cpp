@@ -6,6 +6,9 @@
 #include <limits>
 #include <vector>
 
+#include "aero/core/UIResourceStore.hpp"
+#include "aero/render/ImageAtlas.hpp"
+
 namespace aero {
 
 void ImeCompositionController::AppendBoundedCommittedText(std::string& ioHistory, std::string_view committed) {
@@ -247,6 +250,41 @@ namespace {
     }
 
     if (inside && node->layout.isHitTestVisible) {
+        if (node->kind == VisualKind::Image) {
+            const VisualImageData& img = node->Image();
+            if (img.uri.size() >= 7u && img.uri.substr(0u, 7u) == "rive://") {
+                if (const UIResourceStore* store = world.ResourceStore()) {
+                    const ImageAtlas& atlas = store->Images();
+                    if (const ImageAtlasEntry* entry = atlas.FindLoaded(img.uri)) {
+                        const Rect localBox{0.0f, 0.0f, node->layout.layoutRect.width, node->layout.layoutRect.height};
+                        const ImageStretchPlacement place = ComputeImageStretchPlacement(
+                            localBox,
+                            static_cast<float>(entry->width),
+                            static_cast<float>(entry->height),
+                            img.stretch,
+                            img.stretchDir,
+                            entry->u0, entry->v0, entry->u1, entry->v1);
+                        if (!place.valid ||
+                            localPt.x < place.destRect.x ||
+                            localPt.y < place.destRect.y ||
+                            localPt.x > place.destRect.x + place.destRect.width ||
+                            localPt.y > place.destRect.y + place.destRect.height ||
+                            place.destRect.width <= 1e-4f ||
+                            place.destRect.height <= 1e-4f) {
+                            return VisualNodeId{};
+                        }
+                        const float rx = (localPt.x - place.destRect.x) / place.destRect.width;
+                        const float ry = (localPt.y - place.destRect.y) / place.destRect.height;
+                        const float u = place.u0 + rx * (place.u1 - place.u0);
+                        const float v = place.v0 + ry * (place.v1 - place.v0);
+                        const Color px = atlas.SampleBilinearRgba(entry->textureId, u, v);
+                        if (px.a < 0.03f) {
+                            return VisualNodeId{};
+                        }
+                    }
+                }
+            }
+        }
         return id;
     }
     return VisualNodeId{};
@@ -443,7 +481,10 @@ bool VisualInputRouter::DispatchKey(KeyCode key, bool isDown, std::uint8_t modif
         focusedNode_ = VisualNodeId{};
     }
     bool handled = false;
-    if (focusedNode_.IsValid()) {
+    const VisualNodeId keyTarget = focusedNode_.IsValid()
+        ? focusedNode_
+        : ((world_ && world_->Root().IsValid()) ? world_->Root() : VisualNodeId{});
+    if (keyTarget.IsValid()) {
         NativeInputEvent ev{};
         ev.kind = NativeInputEventKind::Key;
         ev.key = key;
@@ -452,7 +493,7 @@ bool VisualInputRouter::DispatchKey(KeyCode key, bool isDown, std::uint8_t modif
         handled = DispatchWithCallbackMask(
             world_,
             scriptDispatcher_,
-            focusedNode_,
+            keyTarget,
             isDown ? VisualCallback_KeyDown : VisualCallback_KeyUp,
             ev,
             true);

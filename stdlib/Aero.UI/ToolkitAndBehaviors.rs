@@ -531,7 +531,7 @@ public class TriggerAction : DependencyObject {
             } else if (TargetObjectRelativeMode == "FindAncestor" || TargetObjectRelativeMode == "AncestorType") {
                 UIElement anc = associatedObject;
                 while (anc != null && TargetObjectAncestorType.Length > 0 && !BindingEntry.MatchesAncestorType(anc, TargetObjectAncestorType)) {
-                    anc = anc.Parent;
+                    anc = BindingEntry.StepAncestor(anc);
                 }
                 src = anc;
             }
@@ -1200,7 +1200,7 @@ public class RiveInput : FrameworkElement {
     public void SetInputValueBool(bool v) { _inputValueBox = DependencyObject.BoxBool(v); NotifyOwnerRive(); }
 
     private void NotifyOwnerRive() {
-        if (_ownerRive != null) { _ownerRive.SyncRiveVisual(); }
+        if (_ownerRive != null) { _ownerRive.OnInputChanged(); }
     }
 
     public override bool SetPropertyValue(string propName, DependencyObject value) {
@@ -1221,17 +1221,79 @@ public class RiveControl : Control {
     private Stretch _stretch = Stretch.Uniform;
     private RiveInput[] _inputs;
     private Image _imageView;
+    private int _instanceId = 0;
+    private float _animTime = 0.0f;
+    private float _stateTime = 0.0f;
+    private string _lastInputsSig = "";
+    private static int _nextInstanceId = 1;
+    private static RiveControl[] _activeRives;
+    private static bool _riveHookInstalled = false;
 
     public RiveControl() : base() {
         _inputs = new RiveInput[0];
-        Focusable = true;
+        _instanceId = _nextInstanceId;
+        _nextInstanceId += 1;
+        Focusable = false;
+        IsTabStop = false;
+        RegisterLiveRive(this);
+    }
+
+    private static void RegisterLiveRive(RiveControl rc) {
+        if (rc == null) { return; }
+        if (_activeRives == null) { _activeRives = new RiveControl[0]; }
+        if (!_riveHookInstalled) {
+            _riveHookInstalled = true;
+            BindingEngine.AddFrameTickHook((float dt) => { RiveControl.TickAll(dt); });
+            UIElement.RegisterDisposeHook(() => { RiveControl.CleanupDisposed(); });
+        }
+        _activeRives.Push(rc);
+    }
+
+    internal static void CleanupDisposed() {
+        if (_activeRives == null) { return; }
+        for (int i = _activeRives.Length - 1; i >= 0; i -= 1) {
+            if (_activeRives[i] == null || _activeRives[i]._isDisposedTree) {
+                _activeRives.RemoveAt(i);
+            }
+        }
+    }
+
+    public static void TickAll() {
+        TickAll(0.0166667f);
+    }
+
+    public static void TickAll(float dt) {
+        if (dt <= 0.0f || _activeRives == null || _activeRives.Length == 0) { return; }
+        float step = Math.Clampf(dt, 0.0f, 0.1f);
+        bool anyActive = false;
+        for (int i = 0; i < _activeRives.Length; i += 1) {
+            RiveControl rc = _activeRives[i];
+            if (rc == null || rc._isDisposedTree || rc._source.Length == 0 || rc.Visibility != Visibility.Visible) {
+                continue;
+            }
+            rc._animTime += step;
+            rc._stateTime += step;
+            rc.SyncRiveVisual();
+            anyActive = true;
+        }
+        if (anyActive && ParseUtil.IsNativeReady()) {
+            Host_RequestWake();
+        }
     }
 
     public override string GetTypeName() { return "RiveControl"; }
 
     public string Source {
         get { return _source; }
-        set { _source = value == null ? "" : value; SyncRiveVisual(); }
+        set {
+            string next = value == null ? "" : value;
+            if (_source != next) {
+                _source = next;
+                _animTime = 0.0f;
+                _stateTime = 0.0f;
+            }
+            SyncRiveVisual();
+        }
     }
     public Stretch Stretch {
         get { return _stretch; }
@@ -1244,8 +1306,31 @@ public class RiveControl : Control {
             input._ownerRive = this;
             _inputs.Push(input);
             AddChild(input);
-            SyncRiveVisual();
+            OnInputChanged();
         }
+    }
+
+    internal void OnInputChanged() {
+        string sig = BuildInputsQuery();
+        if (sig != _lastInputsSig) {
+            _lastInputsSig = sig;
+            _stateTime = 0.0f;
+        }
+        SyncRiveVisual();
+    }
+
+    private string BuildInputsQuery() {
+        string q = "";
+        for (int i = 0; i < _inputs.Length; i += 1) {
+            RiveInput ri = _inputs[i];
+            if (ri != null && ri.InputName.Length > 0 && ri.InputValueBox != null) {
+                string vStr = DependencyObject.UnboxString(ri.InputValueBox, "0").Trim();
+                if (vStr.Length > 0) {
+                    q = q + "&" + ri.InputName + "=" + vStr;
+                }
+            }
+        }
+        return q;
     }
 
     public static void SetSource(UIElement el, string src) {
@@ -1258,24 +1343,40 @@ public class RiveControl : Control {
         return "";
     }
 
+    private static string QuantizeRiveClock(float t) {
+        int ticks = (int)(t * 60.0f + 0.5f);
+        float qt = (float)ticks / 60.0f;
+        return "" + qt;
+    }
+
     internal void SyncRiveVisual() {
         if (_imageView == null) { return; }
         _imageView.Stretch = _stretch;
-        if (_source == null || _source.Length == 0) {
-            _imageView.Source = "";
+        string cleanSrc = _source == null ? "" : _source.Trim();
+        if (cleanSrc.Length >= 7 && cleanSrc.Substring(0, 7) == "rive://") {
+            cleanSrc = cleanSrc.Substring(7);
+        }
+        if (cleanSrc.Length == 0) {
+            if (_imageView.Source != "") { _imageView.Source = ""; }
             return;
         }
-        string q = "";
-        for (int i = 0; i < _inputs.Length; i += 1) {
-            RiveInput ri = _inputs[i];
-            if (ri != null && ri.InputName.Length > 0 && ri.InputValueBox != null) {
-                string vStr = DependencyObject.UnboxString(ri.InputValueBox, "0").Trim();
-                if (vStr.Length > 0) {
-                    q = q + (q.Length == 0 ? "?" : "&") + ri.InputName + "=" + vStr;
-                }
-            }
+        string inp = BuildInputsQuery();
+        if (inp != _lastInputsSig) {
+            _lastInputsSig = inp;
+            _stateTime = 0.0f;
         }
-        _imageView.Source = "rive://" + _source + q;
+        string sep = cleanSrc.Contains("?") ? "&" : "?";
+        string q = sep + "__inst=" + _instanceId +
+                   "&__t=" + QuantizeRiveClock(_animTime) +
+                   "&__ts=" + QuantizeRiveClock(_stateTime) +
+                   inp;
+        string nextUri = "rive://" + cleanSrc + q;
+        if (_imageView.Source != nextUri) {
+            _imageView.Source = nextUri;
+        }
+        if (ParseUtil.IsNativeReady() && Visibility == Visibility.Visible) {
+            Host_RequestWake();
+        }
     }
 
     protected override UIElement CreateDefaultTemplate() {
@@ -1289,6 +1390,7 @@ public class RiveControl : Control {
     public override bool SetPropertyValue(string propName, DependencyObject value) {
         if (propName == "Source" || propName == "RiveControl.Source") { Source = DependencyObject.UnboxString(value, ""); return true; }
         if (propName == "Stretch") {
+            if (value is BoxedInt) { Stretch = EnumConvert.ToStretch((value as BoxedInt).Value); return true; }
             string ss = DependencyObject.UnboxString(value, "Uniform");
             if (ss == "Fill") { Stretch = Stretch.Fill; return true; }
             if (ss == "None") { Stretch = Stretch.None; return true; }
@@ -1598,6 +1700,9 @@ public class BehaviorEventTrigger : BehaviorTriggerBase {
         string ev = EventName;
         if (ev == "Loaded") {
             src.Loaded += (object s, RoutedEventArgs e) => { Fire(associatedObject, e); };
+            if (src.HasLoadedFired()) {
+                Fire(associatedObject, new RoutedEventArgs("Loaded", src));
+            }
         } else if (ev == "MouseEnter") {
             src.MouseEnter += (object s, MouseEventArgs e) => { Fire(associatedObject, e); };
         } else if (ev == "MouseLeave") {
@@ -1626,6 +1731,9 @@ public class BehaviorEventTrigger : BehaviorTriggerBase {
             return;
         } else if (ev == "Click" || ev == "Checked" || ev == "Unchecked" || ev == "Expanded") {
             src.Loaded += (object s, RoutedEventArgs e) => { WireDescendantRoutedEvent(src, ev, associatedObject); };
+            if (src.HasLoadedFired()) {
+                WireDescendantRoutedEvent(src, ev, associatedObject);
+            }
         }
     }
 
@@ -1726,6 +1834,7 @@ public class BehaviorDataTrigger : BehaviorTriggerBase {
     private static bool _reactiveBHookInstalled = false;
 
     public BehaviorDataTrigger() : base() {
+        _valueBox = DependencyObject.BoxBool(true);
         _initTargets = new UIElement[0];
         _matchedTargets = new UIElement[0];
         _hookedTargets = new UIElement[0];
@@ -1795,7 +1904,7 @@ public class BehaviorDataTrigger : BehaviorTriggerBase {
         } else if (RelativeSourceMode == "FindAncestor" || RelativeSourceMode == "AncestorType") {
             UIElement anc = associatedObject;
             while (anc != null && RelativeSourceAncestorType.Length > 0 && !BindingEntry.MatchesAncestorType(anc, RelativeSourceAncestorType)) {
-                anc = anc.Parent;
+                anc = BindingEntry.StepAncestor(anc);
             }
             src = anc;
         }
@@ -1855,61 +1964,7 @@ public class BehaviorDataTrigger : BehaviorTriggerBase {
     }
 
     public static DependencyObject EvaluateDynamicBinding(UIElement associatedObject, Binding b) {
-        if (b == null || associatedObject == null) { return null; }
-        DependencyObject sv = null;
-        string path = b.Path == null ? "" : b.Path;
-        if (b.ElementName.Length > 0) {
-            UIElement se = BindingEntry.FindElementScoped(associatedObject, b.ElementName);
-            if (se == null) { se = associatedObject.FindName(b.ElementName); }
-            if (se == null && associatedObject.RootElement() != null) {
-                se = associatedObject.RootElement().FindName(b.ElementName);
-            }
-            if (se != null) {
-                if (path.Length == 0 || path == ".") { sv = se; }
-                else {
-                    sv = se.GetPropertyValue(path);
-                    if (sv == null) { sv = BindingEngine.ReadPathBox(se, path); }
-                    if (sv == null && path.Length > 12 && path.Substring(0, 12) == "DataContext." && se.DataContext != null) {
-                        sv = BindingEngine.ReadPathBox(se.DataContext, path.Substring(12));
-                    }
-                    if (sv == null && se.DataContext != null) { sv = BindingEngine.ReadPathBox(se.DataContext, path); }
-                }
-            }
-        } else if (b.RelativeSourceMode == "Self") {
-            sv = (path.Length == 0 || path == ".") ? (DependencyObject)associatedObject : associatedObject.GetPropertyValue(path);
-            if (sv == null && path.Length > 0) { sv = BindingEngine.ReadPathBox(associatedObject, path); }
-        } else if (b.RelativeSourceMode == "TemplatedParent") {
-            UIElement tp = associatedObject.TemplatedParent;
-            if (tp != null) {
-                sv = (path.Length == 0 || path == ".") ? (DependencyObject)tp : tp.GetPropertyValue(path);
-                if (sv == null && path.Length > 0) { sv = BindingEngine.ReadPathBox(tp, path); }
-            }
-        } else if (b.RelativeSourceMode == "FindAncestor" || b.RelativeSourceMode == "AncestorType") {
-            UIElement anc = associatedObject;
-            while (anc != null && b.RelativeSourceAncestorType.Length > 0 && !BindingEntry.MatchesAncestorType(anc, b.RelativeSourceAncestorType)) {
-                anc = anc.Parent;
-            }
-            if (anc != null) {
-                sv = (path.Length == 0 || path == ".") ? (DependencyObject)anc : anc.GetPropertyValue(path);
-                if (sv == null && path.Length > 0) { sv = BindingEngine.ReadPathBox(anc, path); }
-                if (sv == null && path.Length > 12 && path.Substring(0, 12) == "DataContext." && anc.DataContext != null) {
-                    sv = BindingEngine.ReadPathBox(anc.DataContext, path.Substring(12));
-                }
-            }
-        } else if (b.SourceBox != null && (path.Length == 0 || path == ".")) {
-            sv = b.SourceBox;
-        } else {
-            object dc = b.Source != null ? b.Source : associatedObject.DataContext;
-            if (dc != null && path.Length > 0) {
-                sv = BindingEngine.ReadPathBox(dc, path);
-            }
-        }
-        if (sv == null && b.HasFallbackValue) { sv = b.FallbackBox; }
-        if (b.Converter != null) {
-            DependencyObject paramBox = b.ConverterParameter.Length > 0 ? DependencyObject.BoxString(b.ConverterParameter) : null;
-            sv = DependencyObject.BoxObject(b.Converter.Convert(sv, "", paramBox, ""));
-        }
-        return sv;
+        return BindingEntry.EvaluateStandaloneBinding(associatedObject, b);
     }
 
     private void CheckAndFire(UIElement associatedObject, bool isInitialAttach) {
@@ -1940,7 +1995,7 @@ public class BehaviorDataTrigger : BehaviorTriggerBase {
         } else if (RelativeSourceMode == "FindAncestor" || RelativeSourceMode == "AncestorType") {
             UIElement anc = associatedObject;
             while (anc != null && RelativeSourceAncestorType.Length > 0 && !BindingEntry.MatchesAncestorType(anc, RelativeSourceAncestorType)) {
-                anc = anc.Parent;
+                anc = BindingEntry.StepAncestor(anc);
             }
             if (anc == null) { return; }
             reflectObj = anc;
@@ -2253,6 +2308,435 @@ public class StoryboardCompletedTrigger : BehaviorTriggerBase {
     }
 }
 
+public class GoToStateAction : TriggerAction {
+    public string StateName { get; set; } = "";
+    public bool UseTransitions { get; set; } = true;
+
+    public GoToStateAction() : base() {}
+    public GoToStateAction(string stateName, bool useTransitions = true) : base() {
+        StateName = stateName == null ? "" : stateName;
+        UseTransitions = useTransitions;
+    }
+
+    public override bool SetActionProperty(string propName, DependencyObject value) {
+        if (propName == "StateName") { StateName = DependencyObject.UnboxString(value, ""); return true; }
+        if (propName == "UseTransitions") { UseTransitions = DependencyObject.UnboxBool(value, true); return true; }
+        return base.SetActionProperty(propName, value);
+    }
+
+    public override void Invoke(UIElement associatedObject, DependencyObject parameter) {
+        if (!IsEnabled || StateName.Length == 0) { return; }
+        UIElement dest = ResolveTarget(associatedObject);
+        UIElement cur = dest != null ? dest : associatedObject;
+        while (cur != null) {
+            if (VisualStateManager.GoToElementState(cur, StateName, UseTransitions)) { return; }
+            if (cur is Control && VisualStateManager.GoToState(cur as Control, StateName, UseTransitions)) { return; }
+            cur = cur.TemplatedParent != null ? cur.TemplatedParent : cur.Parent;
+        }
+    }
+}
+
+public class PropertyChangedTrigger : BehaviorTriggerBase {
+    public Binding Binding { get; set; }
+    private UIElement[] _targets;
+    private DependencyObject[] _lastVals;
+    private static PropertyChangedTrigger[] _allPct;
+    private static UIElement[] _allPctOwners;
+    private static bool _pctHookInstalled = false;
+
+    public PropertyChangedTrigger() : base() {
+        _targets = new UIElement[0];
+        _lastVals = new DependencyObject[0];
+    }
+
+    private void PruneDisposedTargets() {
+        for (int i = _targets.Length - 1; i >= 0; i -= 1) {
+            if (_targets[i] == null || _targets[i]._isDisposedTree) {
+                _targets.RemoveAt(i);
+                _lastVals.RemoveAt(i);
+            }
+        }
+    }
+
+    private void CheckTarget(UIElement owner) {
+        PruneDisposedTargets();
+        if (owner == null || owner._isDisposedTree || Binding == null) { return; }
+        DependencyObject cur = BehaviorDataTrigger.EvaluateDynamicBinding(owner, Binding);
+        for (int i = 0; i < _targets.Length; i += 1) {
+            if (_targets[i] == owner) {
+                DependencyObject prev = _lastVals[i];
+                bool same = (prev == cur) || (prev != null && cur != null && prev.BoxValueEquals(cur));
+                if (!same) {
+                    _lastVals[i] = cur;
+                    Fire(owner, cur);
+                }
+                return;
+            }
+        }
+        _targets.Push(owner);
+        _lastVals.Push(cur);
+    }
+
+    internal static void CleanupDisposed() {
+        if (_allPct == null || _allPctOwners == null) { return; }
+        for (int i = _allPctOwners.Length - 1; i >= 0; i -= 1) {
+            UIElement o = _allPctOwners[i];
+            if (o == null || o._isDisposedTree || _allPct[i] == null) {
+                _allPct.RemoveAt(i);
+                _allPctOwners.RemoveAt(i);
+            } else {
+                _allPct[i].PruneDisposedTargets();
+            }
+        }
+    }
+
+    public static void FlushAll() {
+        if (_allPct == null) { return; }
+        CleanupDisposed();
+        for (int i = 0; i < _allPct.Length; i += 1) {
+            _allPct[i].CheckTarget(_allPctOwners[i]);
+        }
+    }
+
+    public override void Attach(UIElement associatedObject) {
+        if (associatedObject == null) { return; }
+        if (_allPct == null) {
+            _allPct = new PropertyChangedTrigger[0];
+            _allPctOwners = new UIElement[0];
+        }
+        if (!_pctHookInstalled) {
+            _pctHookInstalled = true;
+            BindingEngine.AddPostFlushHook(() => { PropertyChangedTrigger.FlushAll(); });
+            UIElement.RegisterDisposeHook(() => { PropertyChangedTrigger.CleanupDisposed(); });
+        }
+        _allPct.Push(this);
+        _allPctOwners.Push(associatedObject);
+        CheckTarget(associatedObject);
+        associatedObject.Loaded += (object s, RoutedEventArgs e) => { CheckTarget(associatedObject); };
+        associatedObject.DataContextChanged += (object s, DependencyPropertyChangedEventArgs e) => { CheckTarget(associatedObject); };
+    }
+}
+
+public static class DragDrop {
+    private static UIElement[] _participants;
+    private static UIElement _selectedSource;
+    private static bool _hookInstalled = false;
+
+    public static void EnsureInstalled() {
+        if (_hookInstalled) { return; }
+        _hookInstalled = true;
+        _participants = new UIElement[0];
+        UIElement._attachedPropHook = (UIElement el, string prop, DependencyObject val) => {
+            DragDrop.OnAttachedPropertyChanged(el, prop, val);
+        };
+        InputDispatcher.RegisterPopupDismissHook((UIElement clicked, bool isEscape) => {
+            if (isEscape && DragDrop.HasSelectedSource()) {
+                DragDrop.CancelSelection();
+            }
+        });
+        BindingEngine.AddPreFlushHook(() => { DragDrop.RefreshAllContentEmpty(); });
+    }
+
+    private static string ReadRole(UIElement el) {
+        if (el == null) { return ""; }
+        return DependencyObject.UnboxString(el.GetPropertyValue("DragDrop.Role"), "");
+    }
+
+    private static DependencyObject GetElementItemBox(UIElement el) {
+        if (el == null) { return null; }
+        if (el is ContentControl) {
+            DependencyObject cb = (el as ContentControl).ContentBox;
+            if (cb != null) { return cb; }
+        }
+        return el.EffectiveDataContextBox();
+    }
+
+    private static bool ComputeIsEmpty(UIElement el) {
+        DependencyObject itemBox = GetElementItemBox(el);
+        object item = DependencyObject.Unbox(itemBox);
+        if (item == null) { return true; }
+        string emptyPath = DependencyObject.UnboxString(el.GetPropertyValue("DragDrop.EmptyContentPath"), "Name");
+        if (emptyPath.Length > 0) {
+            DependencyObject pb = BindingEngine.ReadPathBox(item, emptyPath);
+            if (pb == null) { return true; }
+            string s = DependencyObject.UnboxString(pb, "").Trim();
+            return s.Length == 0;
+        }
+        return false;
+    }
+
+    private static string ReadItemKindStr(UIElement el) {
+        if (el == null) { return ""; }
+        DependencyObject explicitKind = el.GetPropertyValue("DragDrop.Kind");
+        if (explicitKind != null) {
+            string ks = DependencyObject.UnboxString(explicitKind, "").Trim();
+            if (ks.Length > 0) { return ks; }
+        }
+        DependencyObject itemBox = GetElementItemBox(el);
+        object item = DependencyObject.Unbox(itemBox);
+        if (item != null) {
+            DependencyObject cb = BindingEngine.ReadPathBox(item, "Category");
+            if (cb != null) {
+                string cs = DependencyObject.UnboxString(cb, "").Trim();
+                if (cs.Length > 0) { return cs; }
+            }
+            DependencyObject kb = BindingEngine.ReadPathBox(item, "Kind");
+            if (kb != null) {
+                string ks2 = DependencyObject.UnboxString(kb, "").Trim();
+                if (ks2.Length > 0) { return ks2; }
+            }
+        }
+        return "";
+    }
+
+    private static bool IsItemCompatibleWithTarget(string itemKind, UIElement targetEl) {
+        if (targetEl == null) { return false; }
+        bool matchKind = DependencyObject.UnboxBool(targetEl.GetPropertyValue("DragDrop.MatchKind"), true);
+        if (!matchKind) { return true; }
+        if (itemKind == null || itemKind.Length == 0 || itemKind == "None") { return true; }
+        string dstKind = ReadItemKindStr(targetEl);
+        if (dstKind.Length == 0 || dstKind == "None") { return true; }
+        return dstKind == itemKind;
+    }
+
+    private static UIElement FindOwningItemContainer(UIElement el, ItemsControl ic) {
+        if (el == null || ic == null) { return null; }
+        UIElement icEl = ic;
+        UIElement cur = el;
+        while (cur != null && cur != icEl) {
+            if (ic.IndexOfItemContainer(cur) >= 0) { return cur; }
+            cur = cur.Parent;
+        }
+        return null;
+    }
+
+    private static ItemsControl FindOwningItemsControl(UIElement el) {
+        if (el == null) { return null; }
+        UIElement p = el.Parent;
+        while (p != null) {
+            if (p is ItemsControl) {
+                ItemsControl ic = p as ItemsControl;
+                if (FindOwningItemContainer(el, ic) != null) { return ic; }
+            }
+            p = p.Parent;
+        }
+        return null;
+    }
+
+    public static void RefreshElementEmpty(UIElement el) {
+        if (el == null || el._isDisposedTree) { return; }
+        bool empty = ComputeIsEmpty(el);
+        DependencyObject cur = el.GetPropertyValue("DragDrop.IsContentEmpty");
+        if (cur == null || DependencyObject.UnboxBool(cur, !empty) != empty) {
+            el.SetPropertyValue("DragDrop.IsContentEmpty", DependencyObject.BoxBool(empty));
+        }
+        if (el.GetPropertyValue("DragDrop.IsDropCompatible") == null) {
+            el.SetPropertyValue("DragDrop.IsDropCompatible", DependencyObject.BoxBool(true));
+        }
+    }
+
+    public static void RefreshAllContentEmpty() {
+        if (_participants == null) { return; }
+        for (int i = _participants.Length - 1; i >= 0; i -= 1) {
+            UIElement p = _participants[i];
+            if (p == null || p._isDisposedTree) {
+                _participants.RemoveAt(i);
+                continue;
+            }
+            RefreshElementEmpty(p);
+        }
+    }
+
+    private static void UpdateCompatibilityStates() {
+        if (_participants == null) { return; }
+        string srcKind = _selectedSource != null ? ReadItemKindStr(_selectedSource) : "";
+        for (int i = 0; i < _participants.Length; i += 1) {
+            UIElement p = _participants[i];
+            if (p == null || p._isDisposedTree) { continue; }
+            bool compat = true;
+            if (_selectedSource != null && p != _selectedSource) {
+                compat = IsItemCompatibleWithTarget(srcKind, p);
+            }
+            DependencyObject curCompat = p.GetPropertyValue("DragDrop.IsDropCompatible");
+            if (curCompat == null || DependencyObject.UnboxBool(curCompat, !compat) != compat) {
+                p.SetPropertyValue("DragDrop.IsDropCompatible", DependencyObject.BoxBool(compat));
+            }
+            string stateName = compat ? "Compatible" : "NonCompatible";
+            VisualStateManager.GoToElementState(p, stateName, true);
+            if (p is Control) {
+                VisualStateManager.GoToState(p as Control, stateName, true);
+            }
+        }
+        BindingEngine.Flush();
+    }
+
+    public static bool HasSelectedSource() { return _selectedSource != null; }
+
+    public static void CancelSelection() {
+        _selectedSource = null;
+        UpdateCompatibilityStates();
+    }
+
+    private static void TryTransfer(UIElement src, UIElement dst) {
+        if (src == null || dst == null || src == dst) { return; }
+        UIElement root = src.RootElement();
+        if (root == null || root == src) {
+            root = dst.RootElement();
+        }
+
+        ItemsControl srcIc = FindOwningItemsControl(src);
+        UIElement srcCont = srcIc != null ? FindOwningItemContainer(src, srcIc) : null;
+        int srcIdx = (srcIc != null && srcCont != null) ? srcIc.IndexOfItemContainer(srcCont) : -1;
+
+        ItemsControl dstIc = (dst is ItemsControl) ? (dst as ItemsControl) : FindOwningItemsControl(dst);
+        UIElement dstCont = (dst is ItemsControl || dstIc == null) ? null : FindOwningItemContainer(dst, dstIc);
+        int dstIdx = (dstIc != null && dstCont != null) ? dstIc.IndexOfItemContainer(dstCont) : -1;
+
+        DependencyObject srcItemBox = GetElementItemBox(src);
+        DependencyObject dstItemBox = (dst is ItemsControl) ? null : GetElementItemBox(dst);
+        DependencyObject srcDefBox = src.GetPropertyValue("DragDrop.DefaultContent");
+        bool dstEmpty = (dst is ItemsControl) ? true : ComputeIsEmpty(dst);
+
+        if (srcIc != null && srcIdx >= 0 && dstIc != null) {
+            if (dstIdx >= 0) {
+                if (!dstEmpty) {
+                    srcIc.TryReplaceItemBoxAt(srcIdx, dstItemBox);
+                    dstIc.TryReplaceItemBoxAt(dstIdx, srcItemBox);
+                } else {
+                    DependencyObject emptyCellBox = dstItemBox != null ? dstItemBox : srcDefBox;
+                    dstIc.TryReplaceItemBoxAt(dstIdx, srcItemBox);
+                    if (emptyCellBox != null) {
+                        srcIc.TryReplaceItemBoxAt(srcIdx, emptyCellBox);
+                    } else {
+                        srcIc.TryRemoveItemAt(srcIdx);
+                    }
+                }
+            } else {
+                if (dstIc.TryAddItemBox(srcItemBox)) {
+                    if (srcDefBox != null) {
+                        srcIc.TryReplaceItemBoxAt(srcIdx, srcDefBox);
+                    } else {
+                        srcIc.TryRemoveItemAt(srcIdx);
+                    }
+                }
+            }
+        } else if (srcIc != null && srcIdx >= 0 && dst is ContentControl) {
+            (dst as ContentControl).SetContentBox(srcItemBox);
+            if (!dstEmpty && dstItemBox != null) {
+                srcIc.TryReplaceItemBoxAt(srcIdx, dstItemBox);
+            } else if (srcDefBox != null) {
+                srcIc.TryReplaceItemBoxAt(srcIdx, srcDefBox);
+            } else {
+                srcIc.TryRemoveItemAt(srcIdx);
+            }
+        } else if (src is ContentControl && dstIc != null) {
+            if (dstIdx >= 0 && !dstEmpty && IsItemCompatibleWithTarget(ReadItemKindStr(dst), src)) {
+                dstIc.TryReplaceItemBoxAt(dstIdx, srcItemBox);
+                (src as ContentControl).SetContentBox(dstItemBox);
+            } else if (dstIdx >= 0 && dstEmpty) {
+                dstIc.TryReplaceItemBoxAt(dstIdx, srcItemBox);
+                (src as ContentControl).SetContentBox(srcDefBox);
+            } else {
+                int emptyIdx = -1;
+                int cc = dstIc.ContainerCount();
+                for (int i = 0; i < cc; i += 1) {
+                    UIElement cont = dstIc.ContainerAt(i);
+                    if (cont != null && ComputeIsEmpty(cont)) {
+                        emptyIdx = dstIc.IndexOfItemContainer(cont);
+                        if (emptyIdx >= 0) { break; }
+                    }
+                }
+                if (emptyIdx >= 0) {
+                    dstIc.TryReplaceItemBoxAt(emptyIdx, srcItemBox);
+                } else if (dstIdx >= 0) {
+                    dstIc.TryInsertItemBoxAt(dstIdx, srcItemBox);
+                } else {
+                    dstIc.TryAddItemBox(srcItemBox);
+                }
+                (src as ContentControl).SetContentBox(srcDefBox);
+            }
+        } else if (src is ContentControl && dst is ContentControl) {
+            if (!dstEmpty && IsItemCompatibleWithTarget(ReadItemKindStr(dst), src)) {
+                (src as ContentControl).SetContentBox(dstItemBox);
+                (dst as ContentControl).SetContentBox(srcItemBox);
+            } else {
+                (dst as ContentControl).SetContentBox(srcItemBox);
+                (src as ContentControl).SetContentBox(srcDefBox);
+            }
+        }
+
+        if (ParseUtil.IsNativeReady()) {
+            if (root == null) { root = dst.RootElement(); }
+            object vm = root != null ? root.DataContext : null;
+            if (vm == null && root != null) { vm = root; }
+            if (vm != null) {
+                Reflect_InvokeCommand(vm, "RecalculateStats", "");
+            }
+        }
+        RefreshAllContentEmpty();
+        BindingEngine.Flush();
+    }
+
+    public static void HandleActivate(UIElement el) {
+        if (el == null) { return; }
+        string role = ReadRole(el);
+        if (_selectedSource == null) {
+            if ((role == "DragAndDrop" || role == "Drag") && !ComputeIsEmpty(el)) {
+                _selectedSource = el;
+                UpdateCompatibilityStates();
+            }
+            return;
+        }
+        if (_selectedSource == el) {
+            CancelSelection();
+            return;
+        }
+        bool compat = DependencyObject.UnboxBool(el.GetPropertyValue("DragDrop.IsDropCompatible"), true);
+        if (compat && (role == "DragAndDrop" || role == "Drop")) {
+            UIElement src = _selectedSource;
+            _selectedSource = null;
+            TryTransfer(src, el);
+            UpdateCompatibilityStates();
+        }
+    }
+
+    public static void OnAttachedPropertyChanged(UIElement el, string prop, DependencyObject val) {
+        if (el == null) { return; }
+        if (prop == "DragDrop.IsContentEmpty" || prop == "DragDrop.IsDropCompatible") {
+            return;
+        }
+        if (prop == "DragDrop.__ContentChanged") {
+            RefreshElementEmpty(el);
+            return;
+        }
+        string role = ReadRole(el);
+        if (role.Length == 0) { return; }
+        if (el is ContentControl && !el.Focusable) {
+            el.Focusable = true;
+        }
+        bool known = false;
+        for (int i = 0; i < _participants.Length; i += 1) {
+            if (_participants[i] == el) { known = true; break; }
+        }
+        if (!known) {
+            _participants.Push(el);
+            el.MouseLeftButtonDown += (object s, MouseButtonEventArgs e) => {
+                DragDrop.HandleActivate(el);
+            };
+            el.KeyDown += (object s, KeyEventArgs e) => {
+                if (e.Key == KeyCode.Space || e.Key == KeyCode.Enter) {
+                    DragDrop.HandleActivate(el);
+                    e.Handled = true;
+                } else if (e.Key == KeyCode.Escape && DragDrop.HasSelectedSource()) {
+                    DragDrop.CancelSelection();
+                    e.Handled = true;
+                }
+            };
+        }
+        RefreshElementEmpty(el);
+    }
+}
+
 public static class Interaction {
     private static UIElement[] _owners;
     private static BehaviorTriggerBase[] _triggers;
@@ -2267,6 +2751,7 @@ public static class Interaction {
     }
 
     public static void AddTrigger(UIElement target, BehaviorTriggerBase trigger) {
+        DragDrop.EnsureInstalled();
         if (target == null || trigger == null) { return; }
         if (_owners == null) {
             _owners = new UIElement[0];

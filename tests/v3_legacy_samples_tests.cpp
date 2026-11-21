@@ -1088,6 +1088,29 @@ void TestInteractiveTicTacToe(aero::rs_comp::CompilerSession& session) {
     Require(CountChangedPixels(frame0, frame1) > 0u, "TicTacToe visuals should change after move");
 }
 
+[[nodiscard]] bool TryReadNodeTypeName(
+    aero::AeroAppHost& host,
+    const aero::VisualNode* n,
+    std::string& outTypeName);
+[[nodiscard]] aero::VisualNodeId FindDescendantByTypeName(
+    aero::AeroAppHost& host,
+    aero::VisualNodeId rootId,
+    std::string_view typeName);
+[[nodiscard]] aero::Rect NodeViewportBounds(const aero::VisualNode& node) noexcept;
+void CollectVisualNodesByOwnerName(
+    const aero::AeroAppHost& host,
+    std::string_view ownerName,
+    std::vector<aero::VisualNodeId>& outIds);
+void CollectDescendantsByTypeName(
+    aero::AeroAppHost& host,
+    aero::VisualNodeId rootId,
+    std::string_view typeName,
+    std::vector<aero::VisualNodeId>& outIds);
+void CollectSubtreeText(
+    const aero::VisualWorld& world,
+    aero::VisualNodeId rootId,
+    std::string& outJoined);
+
 void TestInteractiveInventory(aero::rs_comp::CompilerSession& session) {
     std::cout << "[Interactive] Inventory...\n";
     aero::AeroV3CompileInput ci;
@@ -1115,6 +1138,13 @@ void TestInteractiveInventory(aero::rs_comp::CompilerSession& session) {
         "Inventory Player.Slots should contain 8 equipment slots");
     Require(ReadIntMember(host, vmRef, "Player.TotalDps", totalDps0),
         "Inventory Player.TotalDps readable");
+
+    const aero::VisualNodeId statsId = host.FindVisualByOwnerName("Stats");
+    Require(statsId.IsValid(), "Inventory Stats grid missing");
+    std::string statsText;
+    CollectSubtreeText(host.World(), statsId, statsText);
+    Require(statsText.find("1588") != std::string::npos,
+        "Inventory initial animated Life stat should reach 1588 (got: " + statsText + ")");
 
     std::vector<std::uint8_t> frame0;
     Require(host.RenderHeadlessRgba(800u, 600u, frame0), "Inventory initial render failed");
@@ -1147,17 +1177,94 @@ void TestInteractiveInventory(aero::rs_comp::CompilerSession& session) {
     std::vector<std::uint8_t> frame1;
     Require(host.RenderHeadlessRgba(800u, 600u, frame1), "Inventory post-equip render failed");
     Require(CountChangedPixels(frame0, frame1) > 0u, "Inventory UI should update visually after equip");
-}
 
-[[nodiscard]] bool TryReadNodeTypeName(
-    aero::AeroAppHost& host,
-    const aero::VisualNode* n,
-    std::string& outTypeName);
-[[nodiscard]] aero::VisualNodeId FindDescendantByTypeName(
-    aero::AeroAppHost& host,
-    aero::VisualNodeId rootId,
-    std::string_view typeName);
-[[nodiscard]] aero::Rect NodeViewportBounds(const aero::VisualNode& node) noexcept;
+    // DragDrop compatibility + DataTemplate VSM state + Escape cancel + equip click flow
+    const aero::VisualNodeId listBoxId = host.FindVisualByOwnerName("InventoryListBox");
+    Require(listBoxId.IsValid(), "Inventory InventoryListBox missing");
+    aero::VisualNodeId slotHeadId{};
+    aero::VisualNodeId slotLeftId{};
+    float headCx = 0.0f, headCy = 0.0f;
+    float leftCx = 0.0f, leftCy = 0.0f;
+    Require(RequireNodeCenter(host, "SlotHead", headCx, headCy, &slotHeadId), "Inventory SlotHead missing");
+    Require(RequireNodeCenter(host, "SlotLeft", leftCx, leftCy, &slotLeftId), "Inventory SlotLeft missing");
+
+    std::vector<aero::VisualNodeId> bagItems;
+    CollectDescendantsByTypeName(host, listBoxId, "ListBoxItem", bagItems);
+    Require(bagItems.size() >= 2u, "InventoryListBox should realize at least 2 ListBoxItem containers");
+
+    const aero::VisualNode* bag0Node = host.World().GetNode(bagItems[0]);
+    Require(bag0Node != nullptr, "Inventory bagItems[0] node missing");
+    const aero::Rect bag0Rect = bag0Node->layout.layoutRect;
+    const aero::Point bag0Local{bag0Rect.x + bag0Rect.width * 0.5f, bag0Rect.y + bag0Rect.height * 0.5f};
+    const aero::Point bag0Vp = bag0Node->layout.hasPerspective3D
+        ? bag0Node->WorldMatrix3D().ProjectPoint2D(bag0Local)
+        : bag0Node->layout.worldTransform.TransformPoint(bag0Local);
+
+    // Click bagItems[0] (Sword, Category="Hand") -> SlotHead incompatible, SlotLeft compatible
+    host.InjectPointerMove(bag0Vp.x, bag0Vp.y);
+    host.StepFrame(1.0f / 60.0f, false);
+    host.InjectClick(bag0Vp.x, bag0Vp.y);
+    for (int f = 0; f < 10; ++f) {
+        host.StepFrame(1.0f / 60.0f, f == 9);
+    }
+
+    const aero::VisualNode* slotHeadPicked = host.World().GetNode(slotHeadId);
+    const aero::VisualNode* slotLeftPicked = host.World().GetNode(slotLeftId);
+    Require(slotHeadPicked && !slotHeadPicked->layout.isEnabled,
+        "Inventory selecting Hand item should disable incompatible SlotHead");
+    Require(slotLeftPicked && slotLeftPicked->layout.isEnabled,
+        "Inventory selecting Hand item should keep compatible SlotLeft enabled");
+    const aero::VisualNodeId invalidBorderId = FindDescendantByOwnerName(host, slotHeadId, "InvalidDropBorder");
+    Require(invalidBorderId.IsValid(), "Inventory SlotHead InvalidDropBorder missing");
+    const aero::VisualNode* invalidBorderNode = host.World().GetNode(invalidBorderId);
+    Require(invalidBorderNode && invalidBorderNode->box.bgOpacity > 0.3f,
+        "Inventory SlotHead InvalidDropBorder should become visible (NonCompatible VSM state)");
+
+    // Press Escape to cancel drag selection -> SlotHead restores Compatible + IsEnabled=true
+    host.InjectKey(aero::KeyCode::Escape, true);
+    host.InjectKey(aero::KeyCode::Escape, false);
+    for (int f = 0; f < 10; ++f) {
+        host.StepFrame(1.0f / 60.0f, f == 9);
+    }
+    slotHeadPicked = host.World().GetNode(slotHeadId);
+    invalidBorderNode = host.World().GetNode(invalidBorderId);
+    Require(slotHeadPicked && slotHeadPicked->layout.isEnabled,
+        "Inventory Escape should cancel selection and re-enable SlotHead");
+    Require(invalidBorderNode && invalidBorderNode->box.bgOpacity < 0.1f,
+        "Inventory Escape should return InvalidDropBorder bgOpacity near 0");
+
+    // Pick bagItems[1] (Mace, Dps=12; non-zero index) and click SlotLeft (Club, Dps=8) to swap -> TotalDps += 4
+    const aero::VisualNode* bag1Node = host.World().GetNode(bagItems[1]);
+    Require(bag1Node != nullptr, "Inventory bagItems[1] node missing");
+    const aero::Rect bag1Rect = bag1Node->layout.layoutRect;
+    const aero::Point bag1Local{bag1Rect.x + bag1Rect.width * 0.5f, bag1Rect.y + bag1Rect.height * 0.5f};
+    const aero::Point bag1Vp = bag1Node->layout.hasPerspective3D
+        ? bag1Node->WorldMatrix3D().ProjectPoint2D(bag1Local)
+        : bag1Node->layout.worldTransform.TransformPoint(bag1Local);
+
+    host.InjectPointerMove(bag1Vp.x, bag1Vp.y);
+    host.StepFrame(1.0f / 60.0f, false);
+    host.InjectClick(bag1Vp.x, bag1Vp.y);
+    host.StepFrame(1.0f / 60.0f, false);
+    host.InjectPointerMove(leftCx, leftCy);
+    host.StepFrame(1.0f / 60.0f, false);
+    host.InjectClick(leftCx, leftCy);
+    for (int f = 0; f < 25; ++f) {
+        host.StepFrame(1.0f / 60.0f, f == 24);
+    }
+
+    const aero::VisualNode* slotLeftAfter = host.World().GetNode(slotLeftId);
+    std::string equippedName;
+    const bool readEqOk = slotLeftAfter && slotLeftAfter->hasScriptOwner &&
+        ReadStringMember(host, slotLeftAfter->scriptOwner, "Content.Name", equippedName);
+    Require(readEqOk && equippedName == "Mace",
+        "Inventory dropping Mace onto SlotLeft should set Content.Name='Mace' (got: '" + equippedName + "')");
+    std::int64_t totalDps2 = -1;
+    const bool readDps2Ok = ReadIntMember(host, vmRef, "Player.TotalDps", totalDps2);
+    Require(readDps2Ok && totalDps2 == totalDps1 + 4,
+        "Inventory swapping Club(8) -> Mace(12) should raise TotalDps by 4 (got: " +
+            std::to_string(totalDps2) + ", expected: " + std::to_string(totalDps1 + 4) + ")");
+}
 
 void TestInteractiveQuestLog(aero::rs_comp::CompilerSession& session) {
     std::cout << "[Interactive] QuestLog...\n";
@@ -3227,6 +3334,238 @@ void TestInteractiveGallery(aero::rs_comp::CompilerSession& session) {
         "Gallery theme switch (Light -> Dark) must change rendered pixels");
 }
 
+void TestInteractiveRive(aero::rs_comp::CompilerSession&) {
+    std::cout << "[Interactive] Rive...\n";
+    aero::AeroV3CompileInput ci;
+    aero::AeroAppHostConfig hc;
+    Require(BuildDiscoveredSample(fs::path(AERO_SAMPLES_DIR) / "Rive", nullptr, ci, hc, 1280u, 720u),
+        "Rive discover failed");
+    aero::AeroAppHost host(hc);
+    std::string err;
+    Require(host.CompileAndLoad(ci, &err), "Rive load failed: " + err);
+
+    for (int f = 0; f < 90; ++f) {
+        host.StepFrame(1.0f / 60.0f, f == 89);
+    }
+
+    const auto findFirstImageDescendant = [&](aero::VisualNodeId rootId) -> aero::VisualNodeId {
+        const aero::VisualWorld& world = host.World();
+        std::vector<aero::VisualNodeId> q{rootId};
+        for (std::size_t i = 0u; i < q.size(); ++i) {
+            const aero::VisualNode* n = world.GetNode(q[i]);
+            if (!n) { continue; }
+            if (q[i] != rootId && n->kind == aero::VisualKind::Image) {
+                return q[i];
+            }
+            for (aero::VisualNodeId cid : n->children) {
+                q.push_back(cid);
+            }
+        }
+        return aero::VisualNodeId{};
+    };
+
+    const aero::VisualNodeId logoId = host.FindVisualByOwnerName("logo");
+    Require(logoId.IsValid(), "Rive logo element missing");
+    const aero::VisualNodeId logoImgId = findFirstImageDescendant(logoId);
+    Require(logoImgId.IsValid(), "Rive logo internal Image node missing");
+    const aero::VisualNode* logoImg = host.World().GetNode(logoImgId);
+    Require(logoImg != nullptr, "Rive logo Image node resolved to null");
+    const std::string uriBeforeZero = logoImg->Image().uri;
+    Require(uriBeforeZero.rfind("rive://", 0) == 0u,
+        "Rive logo Image URI should use rive:// scheme (got: '" + uriBeforeZero + "')");
+
+    // dt == 0.0f layout/render sync must not advance Rive playback time
+    host.StepFrame(0.0f, true);
+    logoImg = host.World().GetNode(logoImgId);
+    Require(logoImg && logoImg->Image().uri == uriBeforeZero,
+        "Rive dt == 0.0f StepFrame must not advance animation URI");
+
+    std::vector<std::uint8_t> frame0;
+    Require(host.RenderHeadlessRgba(1280u, 720u, frame0), "Rive frame0 render failed");
+    for (int f = 0; f < 30; ++f) {
+        host.StepFrame(1.0f / 60.0f, f == 29);
+    }
+    std::vector<std::uint8_t> frame1;
+    Require(host.RenderHeadlessRgba(1280u, 720u, frame1), "Rive frame1 render failed");
+    logoImg = host.World().GetNode(logoImgId);
+    Require(logoImg && logoImg->Image().uri != uriBeforeZero,
+        "Rive logo Image URI should advance over 0.5s");
+    Require(CountChangedPixels(frame0, frame1) > 50u,
+        "Rive animation frames should change rendered pixels over 0.5s");
+
+    const aero::VisualNodeId bgId = host.FindVisualByOwnerName("background");
+    Require(bgId.IsValid(), "Rive background element missing");
+    const aero::VisualNodeId bgImgId = findFirstImageDescendant(bgId);
+    Require(bgImgId.IsValid(), "Rive background internal Image node missing");
+
+    aero::VisualNodeId startId{};
+    aero::VisualNodeId rewardsId{};
+    float startCx = 0.0f, startCy = 0.0f;
+    float rewardsCx = 0.0f, rewardsCy = 0.0f;
+    Require(RequireNodeCenter(host, "start", startCx, startCy, &startId), "Rive start button missing");
+    Require(RequireNodeCenter(host, "rewards", rewardsCx, rewardsCy, &rewardsId), "Rive rewards button missing");
+
+    // Hover & click start button -> must hit through transparent corner leaves overlay, focus start, and set States=1
+    host.InjectPointerMove(startCx, startCy);
+    host.StepFrame(1.0f / 60.0f, false);
+    host.InjectClick(startCx, startCy);
+    host.StepFrame(1.0f / 60.0f, true);
+
+    bool startFocused = false;
+    const aero::VisualNode* startNode = host.World().GetNode(startId);
+    const bool readStartFocusOk = startNode && startNode->hasScriptOwner &&
+        ReadBoolMember(host, startNode->scriptOwner, "IsFocused", startFocused);
+    Require(readStartFocusOk && startFocused,
+        "Rive clicking start button through transparent leaves overlay should set IsFocused=true");
+    const aero::VisualNode* bgImg = host.World().GetNode(bgImgId);
+    Require(bgImg && bgImg->Image().uri.find("States=1") != std::string::npos,
+        "Rive focusing start should drive background RiveInput States=1 (got: '" +
+            (bgImg ? bgImg->Image().uri : std::string("<null>")) + "')");
+
+    // Hover rewards button -> MouseEnter SetFocusAction sets focus and switches background States=2
+    host.InjectPointerMove(rewardsCx, rewardsCy);
+    host.StepFrame(1.0f / 60.0f, true);
+    bool rewardsFocused = false;
+    const aero::VisualNode* rewardsNode = host.World().GetNode(rewardsId);
+    const bool readRewardsFocusOk = rewardsNode && rewardsNode->hasScriptOwner &&
+        ReadBoolMember(host, rewardsNode->scriptOwner, "IsFocused", rewardsFocused);
+    Require(readRewardsFocusOk && rewardsFocused,
+        "Rive hovering rewards button should set IsFocused=true");
+    bgImg = host.World().GetNode(bgImgId);
+    Require(bgImg && bgImg->Image().uri.find("States=2") != std::string::npos,
+        "Rive hovering rewards should drive background RiveInput States=2 (got: '" +
+            (bgImg ? bgImg->Image().uri : std::string("<null>")) + "')");
+}
+
+void TestInteractiveCustomRender(aero::rs_comp::CompilerSession&) {
+    std::cout << "[Interactive] CustomRender...\n";
+    aero::AeroV3CompileInput ci;
+    aero::AeroAppHostConfig hc;
+    Require(BuildDiscoveredSample(fs::path(AERO_SAMPLES_DIR) / "CustomRender", nullptr, ci, hc, 1280u, 720u),
+        "CustomRender discover failed");
+    aero::AeroAppHost host(hc);
+    std::string err;
+    Require(host.CompileAndLoad(ci, &err), "CustomRender load failed: " + err);
+
+    for (int f = 0; f < 5; ++f) {
+        host.StepFrame(1.0f / 60.0f, f == 4);
+    }
+
+    const aero::VisualNodeId gameId = host.FindVisualByOwnerName("GameControl");
+    Require(gameId.IsValid(), "CustomRender GameControl missing");
+    const aero::VisualNode* gameNode = host.World().GetNode(gameId);
+    Require(gameNode && gameNode->hasScriptOwner, "CustomRender GameControl has no scriptOwner");
+
+    bool isRunning0 = true;
+    std::string status0;
+    Require(ReadBoolMember(host, gameNode->scriptOwner, "IsRunning", isRunning0) && !isRunning0,
+        "CustomRender GameControl.IsRunning should start false");
+    Require(ReadStringMember(host, gameNode->scriptOwner, "StatusText", status0) && status0 == "READY",
+        "CustomRender GameControl.StatusText should start 'READY' (got: '" + status0 + "')");
+
+    std::vector<std::uint8_t> framePaused;
+    Require(host.RenderHeadlessRgba(1280u, 720u, framePaused), "CustomRender paused render failed");
+
+    const auto readBallY = [&]() -> float {
+        const aero::DrawingCommandList* list = host.DrawBuffer().FindCommands(gameId);
+        Require(list != nullptr, "CustomRender GameControl missing drawing commands");
+        if (!list) { return 0.0f; }
+        for (auto it = list->commands.rbegin(); it != list->commands.rend(); ++it) {
+            if (it->kind == aero::DrawCommandKind::FillEllipse) {
+                return it->rect.y;
+            }
+        }
+        Require(false, "CustomRender GameControl FillEllipse command for ball not found");
+        return 0.0f;
+    };
+
+    const float ballY0 = readBallY();
+    host.StepFrame(0.02f, true);
+    Require(std::fabs(readBallY() - ballY0) < 1e-3f,
+        "CustomRender ball should not move while paused");
+
+    // Start via Space key with dt == 0.0f flush
+    host.InjectKey(aero::KeyCode::Space, true);
+    host.InjectKey(aero::KeyCode::Space, false);
+    host.StepFrame(0.0f, true);
+
+    bool isRunning1 = false;
+    std::string status1 = "<unread>";
+    Require(ReadBoolMember(host, gameNode->scriptOwner, "IsRunning", isRunning1) && isRunning1,
+        "CustomRender Space should set GameControl.IsRunning=true");
+    Require(ReadStringMember(host, gameNode->scriptOwner, "StatusText", status1) && status1.empty(),
+        "CustomRender Space should clear StatusText (got: '" + status1 + "')");
+
+    const float ballYStart = readBallY();
+    host.StepFrame(0.02f, true);
+    const float ballDelta = readBallY() - ballYStart;
+    // _ballVY = -260.0f -> single step of 0.02s moves ball by -5.2f (not -10.4f or 0.0f)
+    Require(std::fabs(ballDelta - (-5.2f)) < 0.25f,
+        "CustomRender single StepFrame(0.02f) should advance ball by ~-5.2px (got: " +
+            std::to_string(ballDelta) + ")");
+
+    std::vector<std::uint8_t> frameRunning;
+    Require(host.RenderHeadlessRgba(1280u, 720u, frameRunning), "CustomRender running render failed");
+    Require(CountChangedPixels(framePaused, frameRunning) > 50u,
+        "CustomRender running frame should differ from paused frame");
+}
+
+void TestInteractiveBrushShaders(aero::rs_comp::CompilerSession&) {
+    std::cout << "[Interactive] BrushShaders...\n";
+    aero::AeroV3CompileInput ci;
+    aero::AeroAppHostConfig hc;
+    Require(BuildDiscoveredSample(fs::path(AERO_SAMPLES_DIR) / "BrushShaders", nullptr, ci, hc, 1280u, 720u),
+        "BrushShaders discover failed");
+    aero::AeroAppHost host(hc);
+    std::string err;
+    Require(host.CompileAndLoad(ci, &err), "BrushShaders load failed: " + err);
+
+    for (int f = 0; f < 5; ++f) {
+        host.StepFrame(1.0f / 60.0f, f == 4);
+    }
+
+    std::vector<aero::VisualNodeId> bdIds;
+    CollectVisualNodesByOwnerName(host, "bd", bdIds);
+    Require(bdIds.size() == 3u,
+        "BrushShaders should realize 3 templated 'bd' Path nodes (got: " + std::to_string(bdIds.size()) + ")");
+
+    std::vector<float> seeds(3, 0.0f);
+    std::vector<std::string> imgSrcs(3);
+    for (std::size_t i = 0u; i < 3u; ++i) {
+        const aero::VisualNode* bdNode = host.World().GetNode(bdIds[i]);
+        Require(bdNode && bdNode->hasScriptOwner, "BrushShaders bd node missing scriptOwner");
+        Require(ReadFloatMember(host, bdNode->scriptOwner, "Fill.PlasmaSeed", seeds[i]),
+            "BrushShaders bd Fill.PlasmaSeed readable");
+        Require(ReadStringMember(host, bdNode->scriptOwner, "Fill.ImageSource", imgSrcs[i]),
+            "BrushShaders bd Fill.ImageSource readable");
+        Require(imgSrcs[i].rfind("shader://plasma?", 0) == 0u,
+            "BrushShaders bd Fill.ImageSource should start with 'shader://plasma?' (got: '" + imgSrcs[i] + "')");
+    }
+    Require(std::fabs(seeds[0] - 100.0f) < 0.1f &&
+            std::fabs(seeds[1] - 200.0f) < 0.1f &&
+            std::fabs(seeds[2] - 300.0f) < 0.1f,
+        "BrushShaders 3 button templates should receive distinct Custom.PlasmaSeed_Single values 100/200/300");
+    Require(imgSrcs[0] != imgSrcs[1] && imgSrcs[1] != imgSrcs[2] && imgSrcs[0] != imgSrcs[2],
+        "BrushShaders 3 buttons should produce distinct plasma shader URIs");
+
+    std::vector<std::uint8_t> frame0;
+    Require(host.RenderHeadlessRgba(1280u, 720u, frame0), "BrushShaders frame0 render failed");
+    for (int f = 0; f < 30; ++f) {
+        host.StepFrame(1.0f / 60.0f, f == 29);
+    }
+    std::vector<std::uint8_t> frame1;
+    Require(host.RenderHeadlessRgba(1280u, 720u, frame1), "BrushShaders frame1 render failed");
+
+    const aero::VisualNode* bd0 = host.World().GetNode(bdIds[0]);
+    float plasmaTime = 0.0f;
+    Require(bd0 && bd0->hasScriptOwner && ReadFloatMember(host, bd0->scriptOwner, "Fill.PlasmaTime", plasmaTime) &&
+            plasmaTime > 0.2f,
+        "BrushShaders AnimNoise (100.0:0:0 -> 8640000) should advance Fill.PlasmaTime > 0.2f over 0.5s (got: " +
+            std::to_string(plasmaTime) + ")");
+    Require(CountChangedPixels(frame0, frame1) > 50u,
+        "BrushShaders AnimNoise should change rendered pixels over 0.5s");
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -3268,6 +3607,9 @@ int main(int argc, char** argv) {
         if (want("usercontrol")) { TestInteractiveUserControl(sharedSession); }
         if (want("wpf")) { TestInteractiveWpfQuickStart(sharedSession); }
         if (want("scoreboard")) { TestInteractiveScoreboard(sharedSession); }
+        if (want("rive")) { TestInteractiveRive(sharedSession); }
+        if (want("customrender")) { TestInteractiveCustomRender(sharedSession); }
+        if (want("brushshaders")) { TestInteractiveBrushShaders(sharedSession); }
     }
 
     if (want("interactive")) {
@@ -3286,12 +3628,15 @@ int main(int argc, char** argv) {
         TestInteractiveWpfQuickStart(sharedSession);
         TestInteractiveCustomControlAndTheme(sharedSession);
         TestInteractiveScoreboard(sharedSession);
+        TestInteractiveRive(sharedSession);
+        TestInteractiveCustomRender(sharedSession);
+        TestInteractiveBrushShaders(sharedSession);
     }
 
     if (gFailureCount != 0) {
         std::cerr << "\nv3_legacy_samples_tests FAILED with " << gFailureCount << " failure(s).\n";
         return 1;
     }
-    std::cout << "\nv3_legacy_samples_tests PASSED (all 23 legacy samples + 5 V3 + 6 Gallery sub-pages + 15 interactive checks).\n";
+    std::cout << "\nv3_legacy_samples_tests PASSED (all 23 legacy samples + 5 V3 + 6 Gallery sub-pages + 18 interactive checks).\n";
     return 0;
 }

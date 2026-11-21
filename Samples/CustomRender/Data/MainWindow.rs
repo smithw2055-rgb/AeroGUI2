@@ -1,5 +1,6 @@
 module CustomRender;
 
+import Aero.Native;
 import Aero.UI;
 import RealScript.Math;
 
@@ -12,8 +13,9 @@ public class Game : CustomDrawElement
     public bool IsRunning { get; set; } = false;
     public bool IsGameOver { get; set; } = false;
 
-    private float _arenaW = 800.0f;
-    private float _arenaH = 600.0f;
+    private float _arenaW = 1280.0f;
+    private float _arenaH = 720.0f;
+    private bool _layoutSynced = false;
     private float _paddleX = 340.0f;
     private float _paddleW = 120.0f;
     private float _paddleH = 16.0f;
@@ -63,6 +65,24 @@ public class Game : CustomDrawElement
         this.InvalidateDraw();
     }
 
+    private void SyncArenaSize(float w, float h)
+    {
+        if (w <= 10.0f || h <= 10.0f) { return; }
+        if (!this._layoutSynced || Math.Absf(w - this._arenaW) > 1.0f || Math.Absf(h - this._arenaH) > 1.0f)
+        {
+            float sx = this._arenaW > 10.0f ? (w / this._arenaW) : 1.0f;
+            this._arenaW = w;
+            this._arenaH = h;
+            this._paddleX = Math.Clampf(this._paddleX * sx, 16.0f, w - this._paddleW - 16.0f);
+            if (!this.IsRunning && !this.IsGameOver)
+            {
+                this._ballX = this._paddleX + this._paddleW * 0.5f;
+                this._ballY = h - 86.0f;
+            }
+            this._layoutSynced = true;
+        }
+    }
+
     public void ToggleRun()
     {
         if (this.IsGameOver)
@@ -70,10 +90,14 @@ public class Game : CustomDrawElement
             this.ResetGame();
         }
         this.IsRunning = !this.IsRunning;
-        this.StatusText = this.IsRunning ? "PLAYING" : "PAUSED";
-        this.ActionText = this.IsRunning ? "ARROWS / MOUSE TO STEER" : "PRESS SPACE TO RESUME";
+        this.StatusText = this.IsRunning ? "" : "PAUSED";
+        this.ActionText = this.IsRunning ? "" : "PRESS SPACE TO RESUME";
         this.NotifyBindings();
         this.InvalidateDraw();
+        if (this.IsRunning && ParseUtil.IsNativeReady())
+        {
+            Host_RequestWake();
+        }
     }
 
     private void NotifyBindings()
@@ -96,12 +120,16 @@ public class Game : CustomDrawElement
     public override void OnMouseMove(MouseEventArgs e)
     {
         float w = this.ActualWidth > 10.0f ? this.ActualWidth : this._arenaW;
-        this._paddleX = Math.Clampf(e.X - this._paddleW * 0.5f, 16.0f, w - this._paddleW - 16.0f);
+        float h = this.ActualHeight > 10.0f ? this.ActualHeight : this._arenaH;
+        this.SyncArenaSize(w, h);
+        float localX = e.X - this.LayoutX;
+        this._paddleX = Math.Clampf(localX - this._paddleW * 0.5f, 16.0f, w - this._paddleW - 16.0f);
         if (!this.IsRunning && !this.IsGameOver)
         {
             this._ballX = this._paddleX + this._paddleW * 0.5f;
         }
         this.InvalidateDraw();
+        e.Handled = true;
     }
 
     public override void OnMouseLeftButtonDown(MouseButtonEventArgs e)
@@ -250,6 +278,10 @@ public class Game : CustomDrawElement
 
         this.NotifyBindings();
         this.InvalidateDraw();
+        if (this.IsRunning && ParseUtil.IsNativeReady())
+        {
+            Host_RequestWake();
+        }
     }
 
     private uint RowColor(int row)
@@ -265,6 +297,7 @@ public class Game : CustomDrawElement
     {
         float w = this.ActualWidth > 10.0f ? this.ActualWidth : this._arenaW;
         float h = this.ActualHeight > 10.0f ? this.ActualHeight : this._arenaH;
+        this.SyncArenaSize(w, h);
 
         uint bg = ParseUtil.ParseColor("#FF060B14");
         uint border = ParseUtil.ParseColor("#FF1E3A5F");
@@ -334,6 +367,9 @@ public partial class MainWindow : Window
         if (this.GameControl != null)
         {
             this.GameControl.Focus();
+            this.Loaded += (object s, RoutedEventArgs e) => {
+                if (this.GameControl != null) { this.GameControl.Focus(); }
+            };
         }
         BindingEngine.Flush();
     }

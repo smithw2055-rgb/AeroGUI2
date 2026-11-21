@@ -1821,18 +1821,20 @@ void ArrangeNode(
     }
 }
 
-[[nodiscard]] Matrix2D ComputeNodeLocalMatrix2D(const VisualNode& node) noexcept {
-    const Rect& rect = node.layout.layoutRect;
-    const VisualTransform2D& t = node.transform2D;
+[[nodiscard]] Matrix2D ComputeNodeViewboxMatrix2D(const VisualNode& node) noexcept {
     const bool hasViewboxScale =
         std::fabs(node.layout.viewboxScaleX - 1.0f) > 1e-6f ||
         std::fabs(node.layout.viewboxScaleY - 1.0f) > 1e-6f;
-    Matrix2D viewboxM = Matrix2D::Identity();
-    if (hasViewboxScale) {
-        viewboxM = Matrix2D::Scaling(node.layout.viewboxScaleX, node.layout.viewboxScaleY)
-                       .AroundPivot(node.layout.viewboxOriginX, node.layout.viewboxOriginY);
+    if (!hasViewboxScale) {
+        return Matrix2D::Identity();
     }
+    return Matrix2D::Scaling(node.layout.viewboxScaleX, node.layout.viewboxScaleY)
+        .AroundPivot(node.layout.viewboxOriginX, node.layout.viewboxOriginY);
+}
 
+[[nodiscard]] Matrix2D ComputeNodeSelfMatrix2D(const VisualNode& node) noexcept {
+    const Rect& rect = node.layout.layoutRect;
+    const VisualTransform2D& t = node.transform2D;
     const bool hasLayoutTx = !node.layout.layoutTransform2D.IsIdentity();
     Matrix2D layoutTxM = Matrix2D::Identity();
     float boxW = rect.width;
@@ -1854,10 +1856,7 @@ void ArrangeNode(
         std::fabs(t.rotDeg) > 1e-6f ||
         std::fabs(t.skewX) > 1e-6f || std::fabs(t.skewY) > 1e-6f;
     if (!hasT2) {
-        if (!hasLayoutTx) {
-            return viewboxM;
-        }
-        return hasViewboxScale ? Matrix2D::Multiply(viewboxM, layoutTxM) : layoutTxM;
+        return hasLayoutTx ? layoutTxM : Matrix2D::Identity();
     }
 
     Matrix2D localM = Matrix2D::Identity();
@@ -1878,22 +1877,41 @@ void ArrangeNode(
     if (hasLayoutTx) {
         localM = Matrix2D::Multiply(localM, layoutTxM);
     }
-    return hasViewboxScale ? Matrix2D::Multiply(viewboxM, localM) : localM;
+    return localM;
+}
+
+[[nodiscard]] Matrix2D ComputeNodeLocalMatrix2D(const VisualNode& node) noexcept {
+    const Matrix2D viewboxM = ComputeNodeViewboxMatrix2D(node);
+    const Matrix2D selfM = ComputeNodeSelfMatrix2D(node);
+    if (viewboxM.IsIdentity()) {
+        return selfM;
+    }
+    if (selfM.IsIdentity()) {
+        return viewboxM;
+    }
+    return Matrix2D::Multiply(viewboxM, selfM);
 }
 
 void UpdateWorldTransformsRecursive(
     VisualWorld& world,
     VisualNodeId id,
     const Matrix2D& parentWorld2D,
-    const Matrix4x4& parentWorld3D,
-    bool parentHas3D) noexcept {
+    const Matrix4x4& parentModel3D,
+    float parentCamDist,
+    bool parentHas3D,
+    float viewportWidth,
+    float viewportHeight) noexcept {
     VisualNode* node = world.GetNode(id);
     if (!node) {
         return;
     }
 
     const Matrix2D prevWorld2D = node->layout.worldTransform;
-    const Matrix2D local2D = ComputeNodeLocalMatrix2D(*node);
+    const Matrix2D viewboxM = ComputeNodeViewboxMatrix2D(*node);
+    const Matrix2D self2D = ComputeNodeSelfMatrix2D(*node);
+    const Matrix2D local2D = viewboxM.IsIdentity()
+        ? self2D
+        : (self2D.IsIdentity() ? viewboxM : Matrix2D::Multiply(viewboxM, self2D));
     const Matrix2D world2D = local2D.IsIdentity()
         ? parentWorld2D
         : Matrix2D::Multiply(parentWorld2D, local2D);
@@ -1911,9 +1929,12 @@ void UpdateWorldTransformsRecursive(
     const bool hasLocal3D = t3.enabled && (
         std::fabs(t3.rx) > 1e-6f || std::fabs(t3.ry) > 1e-6f || std::fabs(t3.rz) > 1e-6f ||
         std::fabs(t3.tx) > 1e-6f || std::fabs(t3.ty) > 1e-6f || std::fabs(t3.tz) > 1e-6f ||
+        std::fabs(t3.sx - 1.0f) > 1e-6f || std::fabs(t3.sy - 1.0f) > 1e-6f || std::fabs(t3.sz - 1.0f) > 1e-6f ||
         t3.camDist > 0.0f);
 
+    Matrix4x4 nextModel3D{};
     Matrix4x4 nextWorld3D{};
+    float nextCamDist = 0.0f;
     const bool prevHas3D = node->layout.hasPerspective3D;
     const bool nextHas3D = parentHas3D || hasLocal3D;
     node->layout.hasPerspective3D = nextHas3D;
@@ -1922,9 +1943,11 @@ void UpdateWorldTransformsRecursive(
     }
 
     if (nextHas3D) {
-        Matrix4x4 base3D = parentHas3D ? parentWorld3D : Matrix4x4::FromMatrix2D(parentWorld2D);
-        if (!local2D.IsIdentity()) {
-            base3D = Matrix4x4::Multiply(base3D, Matrix4x4::FromMatrix2D(local2D));
+        Matrix4x4 model3D = parentHas3D
+            ? parentModel3D
+            : Matrix4x4::FromMatrix2DWithScaleZ(parentWorld2D);
+        if (!viewboxM.IsIdentity()) {
+            model3D = Matrix4x4::Multiply(model3D, Matrix4x4::FromMatrix2DWithScaleZ(viewboxM));
         }
         if (hasLocal3D) {
             CompositeTransform3DParams params{};
@@ -1934,23 +1957,48 @@ void UpdateWorldTransformsRecursive(
             params.translateX = t3.tx;
             params.translateY = t3.ty;
             params.translateZ = t3.tz;
+            params.scaleX = t3.sx;
+            params.scaleY = t3.sy;
+            params.scaleZ = t3.sz;
             params.cameraDistance = t3.camDist;
-            const float pivotX = node->layout.layoutRect.x + node->layout.layoutRect.width * node->transform2D.originX;
-            const float pivotY = node->layout.layoutRect.y + node->layout.layoutRect.height * node->transform2D.originY;
-            const Matrix4x4 local3D = Matrix4x4::FromCompositeTransform3D(params, pivotX, pivotY, 0.0f, pivotX, pivotY);
-            nextWorld3D = Matrix4x4::Multiply(base3D, local3D);
-        } else {
-            nextWorld3D = base3D;
+            const float pivotX = t3.useExplicitCenter
+                ? (node->layout.layoutRect.x + t3.cx)
+                : (node->layout.layoutRect.x + node->layout.layoutRect.width * node->transform2D.originX);
+            const float pivotY = t3.useExplicitCenter
+                ? (node->layout.layoutRect.y + t3.cy)
+                : (node->layout.layoutRect.y + node->layout.layoutRect.height * node->transform2D.originY);
+            const float pivotZ = t3.useExplicitCenter ? t3.cz : 0.0f;
+            const Matrix4x4 localModel3D = Matrix4x4::FromModelCompositeTransform3D(params, pivotX, pivotY, pivotZ);
+            model3D = Matrix4x4::Multiply(model3D, localModel3D);
         }
+        if (!self2D.IsIdentity()) {
+            model3D = Matrix4x4::Multiply(model3D, Matrix4x4::FromMatrix2DWithScaleZ(self2D));
+        }
+        nextModel3D = model3D;
+        nextCamDist = (t3.camDist > 10.0f) ? t3.camDist : parentCamDist;
+        const float defaultCamDist = 1.20710678f * std::max(100.0f, std::max(viewportWidth, viewportHeight));
+        const float resolvedCamDist = (nextCamDist > 10.0f) ? nextCamDist : defaultCamDist;
+        const float camCx = viewportWidth * 0.5f;
+        const float camCy = viewportHeight * 0.5f;
+        nextWorld3D = Matrix4x4::Multiply(
+            Matrix4x4::PerspectiveCamera(resolvedCamDist, camCx, camCy),
+            nextModel3D);
         for (int mi = 0; mi < 16; ++mi) {
             if (std::fabs(node->WorldMatrix3D().m[mi] - nextWorld3D.m[mi]) > 1e-5f) {
                 transformChanged = true;
                 break;
             }
         }
-        node->EnsureExtras().worldMatrix3D = nextWorld3D;
+        auto& ext = node->EnsureExtras();
+        ext.modelMatrix3D = nextModel3D;
+        ext.worldMatrix3D = nextWorld3D;
+        ext.effectiveCamDist = nextCamDist;
     } else {
-        if (node->extras) node->extras->worldMatrix3D = Matrix4x4{};
+        if (node->extras) {
+            node->extras->modelMatrix3D = Matrix4x4{};
+            node->extras->worldMatrix3D = Matrix4x4{};
+            node->extras->effectiveCamDist = 0.0f;
+        }
     }
 
     if (transformChanged) {
@@ -1960,7 +2008,8 @@ void UpdateWorldTransformsRecursive(
     node->dirtyFlags = static_cast<std::uint8_t>(node->dirtyFlags & ~VisualDirty_Transform);
 
     for (VisualNodeId cid : node->children) {
-        UpdateWorldTransformsRecursive(world, cid, world2D, nextWorld3D, nextHas3D);
+        UpdateWorldTransformsRecursive(
+            world, cid, world2D, nextModel3D, nextCamDist, nextHas3D, viewportWidth, viewportHeight);
     }
 }
 
@@ -2171,16 +2220,19 @@ void VisualWorld::UpdateLayout(float viewportWidth, float viewportHeight) {
                 continue;
             }
             Matrix2D pWorld2D = Matrix2D::Identity();
-            Matrix4x4 pWorld3D{};
+            Matrix4x4 pModel3D{};
+            float pCamDist = 0.0f;
             bool pHas3D = false;
             if (nid != rootId_ && node->parent.IsValid()) {
                 if (const VisualNode* p = GetNode(node->parent)) {
                     pWorld2D = p->layout.worldTransform;
-                    pWorld3D = p->WorldMatrix3D();
+                    pModel3D = p->ModelMatrix3D();
+                    pCamDist = p->EffectiveCamDist();
                     pHas3D = p->layout.hasPerspective3D;
                 }
             }
-            UpdateWorldTransformsRecursive(*this, nid, pWorld2D, pWorld3D, pHas3D);
+            UpdateWorldTransformsRecursive(
+                *this, nid, pWorld2D, pModel3D, pCamDist, pHas3D, viewportWidth, viewportHeight);
         }
         bucket.clear();
     }

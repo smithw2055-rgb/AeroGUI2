@@ -314,6 +314,19 @@ struct Matrix4x4 {
         return res;
     }
 
+    [[nodiscard]] static inline Matrix4x4 FromMatrix2DWithScaleZ(const Matrix2D& m2d) noexcept {
+        Matrix4x4 res = FromMatrix2D(m2d);
+        if (!m2d.IsIdentity()) {
+            const float sx = std::hypot(m2d.m00, m2d.m10);
+            const float sy = std::hypot(m2d.m01, m2d.m11);
+            const float sz = 0.5f * (sx + sy);
+            if (std::isfinite(sz) && sz > 1e-6f) {
+                res.m[2][2] = sz;
+            }
+        }
+        return res;
+    }
+
     [[nodiscard]] static constexpr Matrix4x4 Translation(float tx, float ty, float tz) noexcept {
         Matrix4x4 res{};
         res.m[0][3] = tx;
@@ -337,8 +350,8 @@ struct Matrix4x4 {
         const float s = std::sin(rad);
         Matrix4x4 res{};
         res.m[1][1] = c;
-        res.m[1][2] = -s;
-        res.m[2][1] = s;
+        res.m[1][2] = s;
+        res.m[2][1] = -s;
         res.m[2][2] = c;
         return res;
     }
@@ -350,8 +363,8 @@ struct Matrix4x4 {
         const float s = std::sin(rad);
         Matrix4x4 res{};
         res.m[0][0] = c;
-        res.m[0][2] = s;
-        res.m[2][0] = -s;
+        res.m[0][2] = -s;
+        res.m[2][0] = s;
         res.m[2][2] = c;
         return res;
     }
@@ -419,13 +432,11 @@ struct Matrix4x4 {
         return out;
     }
 
-    [[nodiscard]] static inline Matrix4x4 FromCompositeTransform3D(
+    [[nodiscard]] static inline Matrix4x4 FromModelCompositeTransform3D(
         const CompositeTransform3DParams& p,
         float pivotX,
         float pivotY,
-        float pivotZ = 0.0f,
-        float cameraCenterX = 0.0f,
-        float cameraCenterY = 0.0f) noexcept {
+        float pivotZ = 0.0f) noexcept {
         Matrix4x4 mat = Translation(-pivotX, -pivotY, -pivotZ);
         if (std::fabs(p.scaleX - 1.0f) > 1e-6f ||
             std::fabs(p.scaleY - 1.0f) > 1e-6f ||
@@ -444,6 +455,17 @@ struct Matrix4x4 {
         mat = Multiply(
             Translation(pivotX + p.translateX, pivotY + p.translateY, pivotZ + p.translateZ),
             mat);
+        return mat;
+    }
+
+    [[nodiscard]] static inline Matrix4x4 FromCompositeTransform3D(
+        const CompositeTransform3DParams& p,
+        float pivotX,
+        float pivotY,
+        float pivotZ = 0.0f,
+        float cameraCenterX = 0.0f,
+        float cameraCenterY = 0.0f) noexcept {
+        Matrix4x4 mat = FromModelCompositeTransform3D(p, pivotX, pivotY, pivotZ);
         const float camDist = (p.cameraDistance > 10.0f) ? p.cameraDistance : 1000.0f;
         mat = Multiply(PerspectiveCamera(camDist, cameraCenterX, cameraCenterY), mat);
         return mat;

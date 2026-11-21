@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <cstring>
 #include <fstream>
+#include <mutex>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -155,7 +156,7 @@ const std::unordered_map<std::uint32_t, std::uint8_t>& CorePropBackingTypes() {
         {91,2},{92,0},{93,0},{94,0},{95,0},{96,2},{97,2},{98,2},{99,2},{100,2},{101,2},{102,0},{103,0},
         {104,2},{105,2},{106,2},{107,2},{108,2},{109,2},{110,0},{111,0},{112,0},{113,0},{114,2},{115,2},
         {116,2},{117,0},{119,0},{120,0},{121,0},{122,0},{123,2},{124,2},{125,0},{126,2},{127,2},{128,0},
-        {129,0},{138,1},{140,2},{141,0},{149,0},{151,0},{152,0},{153,0},{155,0},{156,0},{157,2},{158,0},
+        {129,0},{138,1},{140,2},{141,0},{149,0},{151,0},{152,0},{153,0},{155,0},{156,0},{157,2},{158,0},{160,0},
         {161,2},{162,2},{163,2},{164,0},{181,0},{196,0},{197,0},{198,0},{236,0}
     };
     return kMap;
@@ -716,11 +717,24 @@ void RenderArtboardRecursive(
             break;
         }
     }
+    struct RivCubicInterp {
+        float x1 = 0.42f, y1 = 0.0f, x2 = 0.58f, y2 = 1.0f;
+    };
+    std::unordered_map<std::uint32_t, RivCubicInterp> cubicInterps;
     std::vector<RivObject> objs;
     objs.reserve(s1 - s0);
     for (std::size_t idx = s0; idx < rawCompEnd; ++idx) {
         const std::uint32_t tk = allObjs[idx].typeKey;
-        if (idx > s0 && (tk == 8064u || tk == 28u)) {
+        if (idx > s0 && tk == 28u) {
+            RivCubicInterp ci{};
+            ci.x1 = std::clamp(allObjs[idx].GetF(63u, 0.42f), 0.0f, 1.0f);
+            ci.y1 = allObjs[idx].GetF(64u, 0.0f);
+            ci.x2 = std::clamp(allObjs[idx].GetF(65u, 0.58f), 0.0f, 1.0f);
+            ci.y2 = allObjs[idx].GetF(66u, 1.0f);
+            cubicInterps[static_cast<std::uint32_t>(idx - s0)] = ci;
+            continue;
+        }
+        if (idx > s0 && tk == 8064u) {
             continue;
         }
         objs.push_back(allObjs[idx]);
@@ -729,7 +743,46 @@ void RenderArtboardRecursive(
         objs.push_back(allObjs[idx]);
     }
 
-    // Evaluate StateMachine inputs -> active AnimationStates -> initial keyframes (frame 0)
+    float tLoopSec = 0.0f;
+    if (const auto itT = inputs.find("__t"); itT != inputs.end()) {
+        tLoopSec = std::max(0.0f, itT->second);
+    }
+    float tStateSec = tLoopSec;
+    if (const auto itTs = inputs.find("__ts"); itTs != inputs.end()) {
+        tStateSec = std::max(0.0f, itTs->second);
+    }
+
+    auto evalCubicEase = [&](std::uint32_t interpId, float u) -> float {
+        u = std::clamp(u, 0.0f, 1.0f);
+        if (u <= 0.0f || u >= 1.0f) return u;
+        RivCubicInterp ci{};
+        if (const auto it = cubicInterps.find(interpId); it != cubicInterps.end()) {
+            ci = it->second;
+        }
+        float s = u;
+        for (int iter = 0; iter < 6; ++iter) {
+            const float inv = 1.0f - s;
+            const float bx = 3.0f * inv * inv * s * ci.x1 + 3.0f * inv * s * s * ci.x2 + s * s * s - u;
+            const float dbx = 3.0f * inv * inv * ci.x1 + 6.0f * inv * s * (ci.x2 - ci.x1) + 3.0f * s * s * (1.0f - ci.x2);
+            if (std::fabs(dbx) < 1e-5f) break;
+            s = std::clamp(s - bx / dbx, 0.0f, 1.0f);
+        }
+        const float inv = 1.0f - s;
+        return 3.0f * inv * inv * s * ci.y1 + 3.0f * inv * s * s * ci.y2 + s * s * s;
+    };
+
+    auto lerpArgb = [](std::uint32_t c0, std::uint32_t c1, float t) -> std::uint32_t {
+        t = std::clamp(t, 0.0f, 1.0f);
+        std::uint32_t out = 0u;
+        for (unsigned sh = 0u; sh < 32u; sh += 8u) {
+            const float a = static_cast<float>((c0 >> sh) & 0xFFu);
+            const float b = static_cast<float>((c1 >> sh) & 0xFFu);
+            const auto v = static_cast<std::uint32_t>(std::clamp(a + (b - a) * t + 0.5f, 0.0f, 255.0f));
+            out |= (v << sh);
+        }
+        return out;
+    };
+
     std::vector<std::size_t> animIndices;
     std::vector<std::size_t> smIndices;
     for (std::size_t i = 0u; i < objs.size(); ++i) {
@@ -737,43 +790,134 @@ void RenderArtboardRecursive(
         else if (objs[i].typeKey == 53u) smIndices.push_back(i);
     }
 
-    auto applyAnimationFrame0 = [&](std::size_t animObjIdx) {
+    struct AnimTimingInfo {
+        float fps = 60.0f;
+        float speed = 1.0f;
+        std::uint32_t loop = 0u;
+        float fStart = 0.0f;
+        float fEnd = 60.0f;
+        float fSpan = 60.0f;
+        float durationSec = 1.0f;
+    };
+    auto getAnimTiming = [&](std::size_t animObjIdx) -> AnimTimingInfo {
+        AnimTimingInfo info{};
+        if (animObjIdx >= objs.size()) return info;
+        const RivObject& ao = objs[animObjIdx];
+        info.fps = static_cast<float>(std::max(1u, ao.GetU(56u, 60u)));
+        const std::uint32_t durFrames = std::max(1u, ao.GetU(57u, 60u));
+        info.speed = ao.GetF(58u, 1.0f);
+        if (std::fabs(info.speed) < 1e-4f) info.speed = 1.0f;
+        info.loop = ao.GetU(59u, 0u);
+        const bool enWork = ao.GetU(62u, 0u) != 0u;
+        const std::uint32_t ws = ao.GetU(60u, 0u);
+        const std::uint32_t we = ao.GetU(61u, 0u);
+        info.fStart = enWork ? static_cast<float>(ws) : 0.0f;
+        info.fEnd = (enWork && we > ws) ? static_cast<float>(we) : static_cast<float>(durFrames);
+        info.fSpan = std::max(1.0f, info.fEnd - info.fStart);
+        info.durationSec = info.fSpan / std::max(1.0f, info.fps * std::fabs(info.speed));
+        return info;
+    };
+
+    auto applyAnimationAtTime = [&](std::size_t animObjIdx, float timeSec) {
         if (animObjIdx >= objs.size()) return;
+        const AnimTimingInfo ti = getAnimTiming(animObjIdx);
+        const float rawFrames = std::max(0.0f, timeSec) * ti.fps * std::fabs(ti.speed);
+        float curFrame = ti.fStart;
+        if (ti.loop == 1u) { // Loop
+            float m = std::fmod(rawFrames, ti.fSpan);
+            if (m < 0.0f) m += ti.fSpan;
+            curFrame = ti.fStart + m;
+        } else if (ti.loop == 2u) { // PingPong
+            const float cyc = std::fmod(rawFrames, 2.0f * ti.fSpan);
+            curFrame = ti.fStart + ((cyc <= ti.fSpan) ? cyc : (2.0f * ti.fSpan - cyc));
+        } else { // OneShot
+            curFrame = std::clamp(ti.fStart + rawFrames, ti.fStart, ti.fEnd);
+        }
+
+        struct KfEntry {
+            std::uint32_t tk = 0u;
+            float frame = 0.0f;
+            std::uint32_t interp = 0u; // 0=Linear, 1=Hold, 2=Cubic
+            std::uint32_t interpId = 0u;
+            float fVal = 0.0f;
+            std::uint64_t uVal = 0u;
+        };
         std::size_t curTargetObj = 0xFFFFFFFFu;
         std::uint32_t curPropKey = 0u;
-        bool appliedFirstKf = false;
+        std::vector<KfEntry> propKfs;
+
+        auto flushPropKfs = [&]() {
+            if (propKfs.empty() || curTargetObj >= objs.size() || curPropKey == 0u) {
+                propKfs.clear();
+                return;
+            }
+            const KfEntry* k0 = &propKfs.front();
+            const KfEntry* k1 = &propKfs.front();
+            float localT = 0.0f;
+            if (curFrame <= propKfs.front().frame || propKfs.size() == 1u) {
+                k0 = k1 = &propKfs.front();
+            } else if (curFrame >= propKfs.back().frame) {
+                k0 = k1 = &propKfs.back();
+            } else {
+                for (std::size_t i = 0u; i + 1u < propKfs.size(); ++i) {
+                    if (curFrame >= propKfs[i].frame && curFrame < propKfs[i + 1u].frame) {
+                        k0 = &propKfs[i];
+                        k1 = &propKfs[i + 1u];
+                        const float span = k1->frame - k0->frame;
+                        if (span > 1e-4f && k0->interp != 1u) {
+                            const float u = (curFrame - k0->frame) / span;
+                            localT = (k0->interp == 2u) ? evalCubicEase(k0->interpId, u) : u;
+                        }
+                        break;
+                    }
+                }
+            }
+            RivPropVal pv{};
+            if (k0->tk == 30u) {
+                pv.kind = 2u;
+                pv.f = k0->fVal + (k1->fVal - k0->fVal) * localT;
+                pv.u = static_cast<std::uint64_t>(std::max(0.0f, pv.f));
+            } else if (k0->tk == 37u) {
+                pv.kind = 3u;
+                pv.u = (k0 == k1 || k0->interp == 1u)
+                    ? k0->uVal
+                    : lerpArgb(static_cast<std::uint32_t>(k0->uVal), static_cast<std::uint32_t>(k1->uVal), localT);
+            } else {
+                pv.kind = 0u;
+                pv.u = k0->uVal;
+                pv.f = static_cast<float>(pv.u);
+            }
+            objs[curTargetObj].props[curPropKey] = pv;
+            propKfs.clear();
+        };
+
         for (std::size_t k = animObjIdx + 1u; k < objs.size(); ++k) {
             const std::uint32_t tk = objs[k].typeKey;
             if (tk == 31u || tk == 53u) break;
-            if (tk == 25u) { // KeyedObject
+            if (tk == 25u) {
+                flushPropKfs();
                 curTargetObj = objs[k].GetU(51u, 0xFFFFFFFFu);
                 curPropKey = 0u;
-            } else if (tk == 26u) { // KeyedProperty
+            } else if (tk == 26u) {
+                flushPropKfs();
                 curPropKey = objs[k].GetU(53u, 0u);
-                appliedFirstKf = false;
-            } else if (!appliedFirstKf && curTargetObj < objs.size() && curPropKey != 0u) {
-                if (tk == 30u) { // KeyFrameDouble: Rive clamps t <= firstKeyframe to firstKeyframe.value (omitted 70 => 0.0f)
-                    appliedFirstKf = true;
-                    RivPropVal pv{};
-                    pv.kind = 2u;
-                    pv.f = objs[k].GetF(70u, 0.0f);
-                    pv.u = static_cast<std::uint64_t>(std::max(0.0f, pv.f));
-                    objs[curTargetObj].props[curPropKey] = pv;
-                } else if (tk == 37u) { // KeyFrameColor
-                    appliedFirstKf = true;
-                    RivPropVal pv{};
-                    pv.kind = 3u;
-                    pv.u = objs[k].GetU(88u, 0u);
-                    objs[curTargetObj].props[curPropKey] = pv;
-                } else if (tk == 50u || tk == 84u) { // KeyFrameBool / Id
-                    appliedFirstKf = true;
-                    RivPropVal pv{};
-                    pv.kind = 0u;
-                    pv.u = objs[k].GetU(122u, 0u);
-                    objs[curTargetObj].props[curPropKey] = pv;
+            } else if (tk == 30u || tk == 37u || tk == 50u || tk == 84u) {
+                KfEntry e{};
+                e.tk = tk;
+                e.frame = static_cast<float>(objs[k].GetU(67u, 0u));
+                e.interp = objs[k].GetU(68u, 0u);
+                e.interpId = objs[k].GetU(69u, 0u);
+                if (tk == 30u) {
+                    e.fVal = objs[k].GetF(70u, 0.0f);
+                } else if (tk == 37u) {
+                    e.uVal = objs[k].GetU(88u, 0u);
+                } else {
+                    e.uVal = objs[k].GetU(122u, 0u);
                 }
+                propKfs.push_back(e);
             }
         }
+        flushPropKfs();
     };
 
     if (!smIndices.empty()) {
@@ -797,7 +941,6 @@ void RenderArtboardRecursive(
                 smInputs.push_back(std::move(inp));
             }
         }
-        // Evaluate each StateMachineLayer (tk=57): EntryState is state 0, AnyState is state 1, first AnimationState is state 2
         for (std::size_t k = smStart + 1u; k < objs.size(); ++k) {
             if (objs[k].typeKey == 53u) break;
             if (objs[k].typeKey != 57u) continue;
@@ -806,7 +949,9 @@ void RenderArtboardRecursive(
                 std::uint32_t animId = 0xFFFFFFFFu;
                 struct Trans {
                     std::uint32_t toState = 0u;
-                    std::vector<std::tuple<std::uint32_t, std::uint32_t, float>> conds; // inputIdx, op, val
+                    std::uint32_t flags = 0u;
+                    float exitTime = 0.0f;
+                    std::vector<std::tuple<std::uint32_t, std::uint32_t, float>> conds;
                 };
                 std::vector<Trans> transitions;
             };
@@ -816,14 +961,15 @@ void RenderArtboardRecursive(
                 const std::uint32_t tk = objs[p].typeKey;
                 if (tk == 57u || tk == 53u) break;
                 if (tk == 61u || tk == 62u || tk == 63u || tk == 64u || tk == 73u || tk == 74u) {
-                    // AnimationState(61), AnyState(62), EntryState(63), ExitState(64), BlendState(73/74)
                     LayerState st{};
                     st.tk = tk;
                     if (tk == 61u) st.animId = objs[p].GetU(149u, 0u);
                     states.push_back(std::move(st));
-                } else if ((tk == 65u || tk == 78u) && !states.empty()) { // StateTransition(65) / BlendStateTransition(78)
+                } else if ((tk == 65u || tk == 78u) && !states.empty()) {
                     LayerState::Trans tr{};
                     tr.toState = objs[p].GetU(151u, 0u);
+                    tr.flags = objs[p].GetU(152u, 0u);
+                    tr.exitTime = objs[p].GetF(160u, 0.0f);
                     states.back().transitions.push_back(std::move(tr));
                 } else if ((tk == 67u || tk == 68u || tk == 69u || tk == 70u || tk == 71u) &&
                            !states.empty() && !states.back().transitions.empty()) {
@@ -849,20 +995,41 @@ void RenderArtboardRecursive(
             };
             std::size_t curState = 0u;
             for (std::size_t si = 0u; si < states.size(); ++si) {
-                if (states[si].tk == 63u) { curState = si; break; } // EntryState(63)
+                if (states[si].tk == 63u) { curState = si; break; }
             }
-            for (int hop = 0; hop < 6 && curState < states.size(); ++hop) {
+            float remStateTime = tStateSec;
+            for (int hop = 0; hop < 8 && curState < states.size(); ++hop) {
                 bool moved = false;
                 const bool isEntry = (states[curState].tk == 63u);
+                float curStateDur = 0.0f;
+                if (!isEntry && states[curState].animId < animIndices.size()) {
+                    curStateDur = getAnimTiming(animIndices[states[curState].animId]).durationSec;
+                }
                 for (const auto& tr : states[curState].transitions) {
-                    if (!isEntry && tr.conds.empty()) continue; // Wait for animation exitTime when unconditioned
-                    if (tr.toState < states.size() && tr.toState != curState && evalConds(tr)) {
+                    if (tr.toState >= states.size() || tr.toState == curState) continue;
+                    const bool needsExit = !isEntry && (tr.conds.empty() || (tr.flags & 4u) != 0u);
+                    float reqSec = 0.0f;
+                    if (needsExit) {
+                        if (tr.exitTime <= 0.0f) {
+                            reqSec = curStateDur;
+                        } else if ((tr.flags & 8u) != 0u) {
+                            reqSec = curStateDur * std::clamp(tr.exitTime * 0.01f, 0.0f, 1.0f);
+                        } else {
+                            reqSec = std::min(curStateDur, tr.exitTime * 0.001f);
+                        }
+                        if (remStateTime + 1e-4f < reqSec) {
+                            continue;
+                        }
+                    }
+                    if (evalConds(tr)) {
                         curState = tr.toState;
+                        if (reqSec > 0.0f) {
+                            remStateTime = std::max(0.0f, remStateTime - reqSec);
+                        }
                         moved = true;
                         break;
                     }
                 }
-                // Also check AnyState(62) transitions
                 if (!moved) {
                     for (const auto& st : states) {
                         if (st.tk != 62u) continue;
@@ -879,12 +1046,16 @@ void RenderArtboardRecursive(
                 if (!moved) break;
             }
             if (curState < states.size() && states[curState].animId < animIndices.size()) {
-                applyAnimationFrame0(animIndices[states[curState].animId]);
+                const std::size_t activeAnimIdx = animIndices[states[curState].animId];
+                const AnimTimingInfo activeTi = getAnimTiming(activeAnimIdx);
+                applyAnimationAtTime(activeAnimIdx, (activeTi.loop != 0u) ? tLoopSec : remStateTime);
             }
             k = p - 1u;
         }
     } else if (!animIndices.empty()) {
-        applyAnimationFrame0(animIndices.front());
+        const std::size_t activeAnimIdx = animIndices.front();
+        const AnimTimingInfo activeTi = getAnimTiming(activeAnimIdx);
+        applyAnimationAtTime(activeAnimIdx, (activeTi.loop != 0u) ? tLoopSec : tStateSec);
     }
 
     // Component slice ends before first LinearAnimation(31) or StateMachine(53)
@@ -1502,16 +1673,36 @@ bool RenderRiveUriToImage(
     const std::string resolvedPath = atlas.ResolveUriToPath(filePart, localBaseDir);
     if (resolvedPath.empty()) return false;
 
-    std::ifstream ifs(resolvedPath, std::ios::binary | std::ios::ate);
-    if (!ifs) return false;
-    const auto fsize = ifs.tellg();
-    if (fsize <= 6 || fsize > 64 * 1024 * 1024) return false;
-    std::vector<std::uint8_t> bytes(static_cast<std::size_t>(fsize));
-    ifs.seekg(0, std::ios::beg);
-    if (!ifs.read(reinterpret_cast<char*>(bytes.data()), fsize)) return false;
+    static std::mutex sParsedCacheMutex;
+    static std::unordered_map<std::string, std::shared_ptr<const std::vector<RivObject>>> sParsedCache;
+    std::shared_ptr<const std::vector<RivObject>> parsedPtr;
+    {
+        std::lock_guard<std::mutex> lock(sParsedCacheMutex);
+        if (const auto it = sParsedCache.find(resolvedPath); it != sParsedCache.end()) {
+            parsedPtr = it->second;
+        }
+    }
+    if (!parsedPtr) {
+        std::ifstream ifs(resolvedPath, std::ios::binary | std::ios::ate);
+        if (!ifs) return false;
+        const auto fsize = ifs.tellg();
+        if (fsize <= 6 || fsize > 64 * 1024 * 1024) return false;
+        std::vector<std::uint8_t> bytes(static_cast<std::size_t>(fsize));
+        ifs.seekg(0, std::ios::beg);
+        if (!ifs.read(reinterpret_cast<char*>(bytes.data()), fsize)) return false;
 
-    std::vector<RivObject> allObjs;
-    if (!ParseRiveFileBytes(bytes, allObjs)) return false;
+        auto parsed = std::make_shared<std::vector<RivObject>>();
+        if (!ParseRiveFileBytes(bytes, *parsed)) return false;
+        {
+            std::lock_guard<std::mutex> lock(sParsedCacheMutex);
+            if (sParsedCache.size() >= 64u) {
+                sParsedCache.clear();
+            }
+            sParsedCache[resolvedPath] = parsed;
+        }
+        parsedPtr = std::move(parsed);
+    }
+    const std::vector<RivObject>& allObjs = *parsedPtr;
 
     std::vector<RivArtboardSlice> abSlices;
     for (std::size_t i = 0u; i < allObjs.size(); ++i) {

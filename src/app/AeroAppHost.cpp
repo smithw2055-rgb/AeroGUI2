@@ -10,6 +10,7 @@
 #include <fstream>
 #include <future>
 #include <sstream>
+#include <thread>
 #include <unordered_set>
 
 #include <realscript/aot_cpp/AotRuntime.h>
@@ -366,7 +367,11 @@ namespace {
             }
         }
         for (const auto& m : cur->methods) {
-            if (m.name == methodName && m.parameters.size() == nonSelfArgCount) {
+            const std::size_t explicitParams =
+                (m.method && !m.staticMethod && !m.parameters.empty())
+                    ? (m.parameters.size() - 1u)
+                    : m.parameters.size();
+            if (m.name == methodName && explicitParams == nonSelfArgCount) {
                 return m.id;
             }
         }
@@ -1152,6 +1157,7 @@ void AeroAppHost::ResolveDispatchSymbols() {
         symbols_.dispatchCustomMeasure = find("InputDispatcher::__AeroDispatchCustomMeasure");
         symbols_.dispatchDraw = find("InputDispatcher::__AeroDispatchDraw");
         symbols_.bindingFlush = find("BindingEngine::Flush");
+        symbols_.bindingStepFrameTicks = find("BindingEngine::StepFrameTicks");
         symbols_.windowShow = find("Window::Show");
         symbols_.applyTemplate = find("FrameworkElement::ApplyTemplate");
         symbols_.controlApplyTemplate = find("Control::ApplyTemplate");
@@ -1169,6 +1175,7 @@ void AeroAppHost::ResolveDispatchSymbols() {
         symbols_.dispatchCustomMeasure = find("InputDispatcher::__AeroDispatchCustomMeasure");
         symbols_.dispatchDraw = find("InputDispatcher::__AeroDispatchDraw");
         symbols_.bindingFlush = find("BindingEngine::Flush");
+        symbols_.bindingStepFrameTicks = find("BindingEngine::StepFrameTicks");
         symbols_.windowShow = find("Window::Show");
         symbols_.applyTemplate = find("FrameworkElement::ApplyTemplate");
         symbols_.controlApplyTemplate = find("Control::ApplyTemplate");
@@ -2059,6 +2066,7 @@ bool AeroAppHost::MountScriptRootObject(ObjectRef candidate) {
     if (typeId != 0u) {
         if (programImage_) {
             deferredShowSym = FindBytecodeClassMethod(*programImage_, typeId, "Show", 0u);
+            symbols_.stepGame = FindBytecodeClassMethod(*programImage_, typeId, "StepGame", 1u);
             if (deferredShowSym == 0u && symbols_.windowShow != 0u) {
                 const rs_sem::TypeSymbol* rt = programImage_->resolveType(typeId);
                 if (rt && IsBytecodeTypeDerivedFrom(*programImage_, rt, "Window")) {
@@ -2067,6 +2075,7 @@ bool AeroAppHost::MountScriptRootObject(ObjectRef candidate) {
             }
         } else if (aotDescriptor_) {
             deferredShowSym = FindAotClassMethod(*aotDescriptor_, typeId, "Show", 1u);
+            symbols_.stepGame = FindAotClassMethod(*aotDescriptor_, typeId, "StepGame", 2u);
             if (deferredShowSym == 0u && symbols_.windowShow != 0u) {
                 const rs_aot::TypeDescriptor* rt = FindAotTypeById(*aotDescriptor_, typeId);
                 if (rt && IsAotTypeDerivedFrom(*aotDescriptor_, rt, "Window")) {
@@ -2516,6 +2525,23 @@ void AeroAppHost::StepFrame(float dtSeconds, bool forceRenderSync) {
             rootObject_, "SyncHudFromSim", {}, nullptr, DomainKind::UiPresentation);
     }
 
+    if (dt > 0.0f) {
+        if (symbols_.stepGame != 0u && rootObject_.valid()) {
+            (void)InvokeSymbol(
+                symbols_.stepGame,
+                {UnifiedValue{rootObject_}, UnifiedValue{FloatValue{dt}}},
+                nullptr,
+                DomainKind::UiPresentation);
+        }
+        if (symbols_.bindingStepFrameTicks != 0u) {
+            (void)InvokeSymbol(
+                symbols_.bindingStepFrameTicks,
+                {UnifiedValue{FloatValue{dt}}},
+                nullptr,
+                DomainKind::UiPresentation);
+        }
+    }
+
     // 4. Track-B zero-alloc C++ ECS column synchronization (authoritative after script sync)
     if (world_.FlushTrackB() > 0u) {
         desktopHost_.NotifyDirtyObjects();
@@ -2826,14 +2852,21 @@ std::uint64_t AeroAppHost::RunWindowedLoop(std::uint64_t maxFrames) {
     }
 
     std::uint64_t frames = 0u;
+    bool hasLastActiveTick = false;
+    auto lastActiveTick = std::chrono::steady_clock::now();
     while (!windowHost_.ShouldClose()) {
         if (maxFrames > 0u && frames >= maxFrames) {
             break;
         }
+        const auto iterStart = std::chrono::steady_clock::now();
         const bool wakeBeforePump = scriptWakeRequested_;
         scriptWakeRequested_ = false;
         const bool idleAllowed =
-            desktopHost_.CanSleepIdle() && !static_cast<bool>(simTickCallback_) && !wakeBeforePump;
+            desktopHost_.CanSleepIdle() && !static_cast<bool>(simTickCallback_) && !wakeBeforePump &&
+            !animEngine_.HasActiveAnimations();
+        if (idleAllowed) {
+            hasLastActiveTick = false;
+        }
         const std::int32_t waitMs = idleAllowed
             ? (maxFrames > 0u ? 0 : -1)
             : 16;
@@ -2866,6 +2899,35 @@ std::uint64_t AeroAppHost::RunWindowedLoop(std::uint64_t maxFrames) {
             domains_.setActiveDomain(DomainKind::UiPresentation);
             followUpDirty = true;
         }
+        if (!idleAllowed) {
+            const auto now = std::chrono::steady_clock::now();
+            float stepDt = 0.016f;
+            if (hasLastActiveTick) {
+                stepDt = std::clamp(
+                    std::chrono::duration<float>(now - lastActiveTick).count(),
+                    0.001f,
+                    0.05f);
+            }
+            lastActiveTick = now;
+            hasLastActiveTick = true;
+            if (symbols_.stepGame != 0u && rootObject_.valid()) {
+                (void)InvokeSymbol(
+                    symbols_.stepGame,
+                    {UnifiedValue{rootObject_}, UnifiedValue{FloatValue{stepDt}}},
+                    nullptr,
+                    DomainKind::UiPresentation);
+            }
+            if (symbols_.bindingStepFrameTicks != 0u) {
+                (void)InvokeSymbol(
+                    symbols_.bindingStepFrameTicks,
+                    {UnifiedValue{FloatValue{stepDt}}},
+                    nullptr,
+                    DomainKind::UiPresentation);
+            }
+            if (scriptWakeRequested_ || world_.HasAnyDirty()) {
+                followUpDirty = true;
+            }
+        }
         if (domains_.pendingSimCommandCount() > 0u) {
             domains_.setActiveDomain(DomainKind::SimDeterministic);
             if (simInterpreter_) {
@@ -2895,6 +2957,12 @@ std::uint64_t AeroAppHost::RunWindowedLoop(std::uint64_t maxFrames) {
             StepFrame(0.0f, viewportChanged);
         } else if (DispatchPendingCanvasDraws()) {
             StepFrame(0.0f, true);
+        }
+        if (!idleAllowed && maxFrames == 0u && !windowHost_.ShouldClose()) {
+            const auto elapsed = std::chrono::steady_clock::now() - iterStart;
+            if (elapsed < std::chrono::milliseconds(16)) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(16) - elapsed);
+            }
         }
         ++frames;
     }

@@ -201,6 +201,85 @@ public class ItemsControl : Control {
         return -1;
     }
 
+    internal int IndexOfItemContainer(UIElement container) {
+        if (container == null) { return -1; }
+        if (_activeContainers != null) {
+            for (int i = 0; i < _activeContainers.Length; i += 1) {
+                if (_activeContainers[i] == container) {
+                    return (_virtualizing ? _virtFirstIndex : 0) + i;
+                }
+            }
+        }
+        DependencyObject box = (container is ContentControl)
+            ? (container as ContentControl).ContentBox
+            : container.EffectiveDataContextBox();
+        return box != null ? IndexOfItemBox(box) : -1;
+    }
+
+    internal bool TryReplaceItemBoxAt(int index, DependencyObject box) {
+        if (_itemsSourceBox != null) {
+            object src = ItemsSource;
+            if (src != null && ParseUtil.IsNativeReady() &&
+                Reflect_ListSet(src, index, DependencyObject.Unbox(box))) {
+                CollectionChangeHub.NotifyChanged(src);
+                return true;
+            }
+            return false;
+        }
+        if (index < 0 || index >= _manualItems.Length) { return false; }
+        _manualItems[index] = box;
+        RefreshItems();
+        return true;
+    }
+
+    internal bool TryInsertItemBoxAt(int index, DependencyObject box) {
+        if (_itemsSourceBox != null) {
+            object src = ItemsSource;
+            if (src != null && ParseUtil.IsNativeReady() &&
+                Reflect_ListInsert(src, index, DependencyObject.Unbox(box))) {
+                CollectionChangeHub.NotifyChanged(src);
+                return true;
+            }
+            return false;
+        }
+        int ins = index < 0 ? 0 : (index > _manualItems.Length ? _manualItems.Length : index);
+        _manualItems.Push(box);
+        for (int i = _manualItems.Length - 1; i > ins; i -= 1) {
+            _manualItems[i] = _manualItems[i - 1];
+        }
+        _manualItems[ins] = box;
+        RefreshItems();
+        return true;
+    }
+
+    internal bool TryAddItemBox(DependencyObject box) {
+        if (_itemsSourceBox != null) {
+            object src = ItemsSource;
+            if (src != null && ParseUtil.IsNativeReady() &&
+                Reflect_ListAdd(src, DependencyObject.Unbox(box))) {
+                CollectionChangeHub.NotifyChanged(src);
+                return true;
+            }
+            return false;
+        }
+        AddItemBox(box);
+        return true;
+    }
+
+    internal bool TryRemoveItemAt(int index) {
+        if (_itemsSourceBox != null) {
+            object src = ItemsSource;
+            if (src != null && ParseUtil.IsNativeReady() && Reflect_ListRemoveAt(src, index)) {
+                CollectionChangeHub.NotifyChanged(src);
+                return true;
+            }
+            return false;
+        }
+        if (index < 0 || index >= _manualItems.Length) { return false; }
+        RemoveItemAt(index);
+        return true;
+    }
+
     public void AddItemBox(DependencyObject box) {
         _manualItems.Push(box);
         if (_itemsSourceBox == null) { RefreshItems(); }

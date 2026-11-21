@@ -164,7 +164,14 @@ struct VisualTransform3D {
     float tx = 0.0f;
     float ty = 0.0f;
     float tz = 0.0f;
+    float sx = 1.0f;
+    float sy = 1.0f;
+    float sz = 1.0f;
+    float cx = 0.0f;
+    float cy = 0.0f;
+    float cz = 0.0f;
     float camDist = 0.0f;
+    bool useExplicitCenter = false;
     bool enabled = false;
 };
 
@@ -333,7 +340,9 @@ struct VisualNodeExtras {
     VisualTextData text{};
     VisualImageData image{};
     VisualVectorData vector{};
+    Matrix4x4 modelMatrix3D{};
     Matrix4x4 worldMatrix3D{};
+    float effectiveCamDist = 0.0f;
     std::vector<VisualGridLength> rowDefs;
     std::vector<VisualGridLength> colDefs;
 };
@@ -387,8 +396,14 @@ struct VisualNode {
     [[nodiscard]] const VisualVectorData& Vector() const noexcept {
         return extras ? extras->vector : DefaultExtras().vector;
     }
+    [[nodiscard]] const Matrix4x4& ModelMatrix3D() const noexcept {
+        return extras ? extras->modelMatrix3D : DefaultExtras().modelMatrix3D;
+    }
     [[nodiscard]] const Matrix4x4& WorldMatrix3D() const noexcept {
         return extras ? extras->worldMatrix3D : DefaultExtras().worldMatrix3D;
+    }
+    [[nodiscard]] float EffectiveCamDist() const noexcept {
+        return extras ? extras->effectiveCamDist : 0.0f;
     }
     [[nodiscard]] const std::vector<VisualGridLength>& RowDefs() const noexcept {
         return extras ? extras->rowDefs : DefaultExtras().rowDefs;
@@ -530,6 +545,22 @@ public:
         float ty,
         float tz,
         float camDist) noexcept;
+    bool SetTransform3DEx(
+        VisualNodeId id,
+        float rx,
+        float ry,
+        float rz,
+        float tx,
+        float ty,
+        float tz,
+        float sx,
+        float sy,
+        float sz,
+        float cx,
+        float cy,
+        float cz,
+        float camDist,
+        bool useExplicitCenter) noexcept;
     bool SetEffect(
         VisualNodeId id,
         UIEffectKind kind,

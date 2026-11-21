@@ -287,6 +287,8 @@ public class Popup : FrameworkElement {
         BindingEngine.FlushSubtree(this);
     }
 
+    internal override UIElement GetLogicalAncestorOverride() { return _logicalParent; }
+
     private void DetachOverlay() {
         if (_attachedRoot != null && Parent == _attachedRoot) {
             _attachedRoot.RemoveChild(this);
