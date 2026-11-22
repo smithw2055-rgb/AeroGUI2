@@ -1938,9 +1938,8 @@ AeroV3CompileResult AeroCompilerV3::Compile(const AeroV3CompileInput& input) con
         std::vector<rs_mir::Module>().swap(mirModules);
     }
 
-    const bool useCompactHeapLink = !input.retainBytecodeModules && !input.emitAotCpp;
-    const bool needEncodedBundle =
-        useCompactHeapLink || !input.skipRawBytecodeOutput || !progCacheFilePath.empty();
+    const bool useDirectMoveLink = !input.retainBytecodeModules && !input.emitAotCpp;
+    const bool needEncodedBundle = !input.skipRawBytecodeOutput || !progCacheFilePath.empty();
     std::vector<std::uint8_t> encodedProgramBytes;
     if (needEncodedBundle) {
         encodedProgramBytes = EncodeProgramBundle(result.bytecodeModules);
@@ -1952,23 +1951,13 @@ AeroV3CompileResult AeroCompilerV3::Compile(const AeroV3CompileInput& input) con
     // Link ProgramImage (modules above already passed rs_bc::verifyModule or cached verification)
     rs_rt::RuntimeError linkErr;
     std::optional<ProgramImage> linked;
-    if (useCompactHeapLink) {
+    if (useDirectMoveLink) {
+        linked = ProgramImage::link(std::move(result.bytecodeModules), linkErr, /*verifyModules=*/false);
         std::vector<rs_bc::Module>().swap(result.bytecodeModules);
-        CompactProcessHeapAfterCompile();
-        std::vector<rs_bc::Module> compactModules;
-        if (!DecodeProgramBundle(
-                encodedProgramBytes.data(), encodedProgramBytes.size(), compactModules)) {
-            result.diagnostics.push_back("DecodeProgramBundle failed during runtime heap compaction");
-            return result;
-        }
-        if (progCacheFilePath.empty()) {
-            std::vector<std::uint8_t>().swap(encodedProgramBytes);
-        }
-        linked = ProgramImage::link(std::move(compactModules), linkErr, /*verifyModules=*/false);
-        std::vector<rs_bc::Module>().swap(compactModules);
         if (linked.has_value()) {
             linked->compactForRuntime();
         }
+        CompactProcessHeapAfterCompile();
     } else {
         linked = input.retainBytecodeModules
             ? ProgramImage::link(result.bytecodeModules, linkErr, /*verifyModules=*/false)

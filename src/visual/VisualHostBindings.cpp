@@ -1051,6 +1051,31 @@ struct AotProgramReflectionCache {
     return false;
 }
 
+struct FastXmlAttr {
+    std::string name;
+    std::string value;
+};
+
+struct FastXmlNode {
+    std::string rawName;
+    std::string localName;
+    std::string text;
+    std::vector<FastXmlAttr> attrs;
+    std::int32_t parentId = -1;
+    std::int32_t childCount = 0;
+    bool lastChildIsLineBreak = false;
+    bool hasPrefix = false;
+};
+
+struct FastXmlScratch {
+    std::vector<FastXmlNode> nodes;
+};
+
+[[nodiscard]] FastXmlScratch& ThreadXmlScratch() noexcept {
+    static thread_local FastXmlScratch tlsXmlScratch;
+    return tlsXmlScratch;
+}
+
 } // namespace
 
 bool RegisterVisualHostBindings(
@@ -1117,7 +1142,20 @@ bool RegisterVisualHostBindings(
     ok &= bindFn("Visual_Destroy", [&world, &drawBuffer](const rs_bc::FunctionReference&, rs_rt::ValueSpan args, rs_rt::RuntimeError&) -> std::optional<rs_rt::Value> {
         const VisualNodeId id = ArgNode(args, 0, world);
         if (id.IsValid()) {
-            drawBuffer.ClearNode(id);
+            std::vector<VisualNodeId> queue;
+            queue.push_back(id);
+            const std::size_t limit = world.LiveNodeCount() + 1u;
+            for (std::size_t qi = 0u; qi < queue.size() && qi < limit; ++qi) {
+                const VisualNodeId cur = queue[qi];
+                drawBuffer.ClearNode(cur);
+                if (const VisualNode* node = world.GetNode(cur)) {
+                    for (const VisualNodeId childId : node->children) {
+                        if (childId.IsValid()) {
+                            queue.push_back(childId);
+                        }
+                    }
+                }
+            }
             (void)world.DestroyNode(id);
         }
         return rs_rt::Value{std::int64_t{0}};
@@ -2452,6 +2490,401 @@ bool RegisterVisualHostBindings(
             out.push_back(static_cast<char>(0x80u | (cp & 0x3Fu)));
         }
         return rs_rt::Value{rs_rt::StringValue{std::move(out)}};
+    });
+
+    auto isXmlSpace = [](char c) noexcept -> bool {
+        return c == ' ' || c == '\t' || c == '\r' || c == '\n';
+    };
+    auto trimView = [&](std::string_view sv) noexcept -> std::string_view {
+        std::size_t b = 0u;
+        std::size_t e = sv.size();
+        while (b < e && isXmlSpace(sv[b])) ++b;
+        while (e > b && isXmlSpace(sv[e - 1u])) --e;
+        return sv.substr(b, e - b);
+    };
+    auto stripPrefixView = [](std::string_view sv, bool& outHasPrefix) noexcept -> std::string_view {
+        const std::size_t colon = sv.rfind(':');
+        if (colon != std::string_view::npos && colon + 1u < sv.size()) {
+            outHasPrefix = true;
+            return sv.substr(colon + 1u);
+        }
+        outHasPrefix = false;
+        return sv;
+    };
+    auto appendUtf8Cp = [](std::string& dst, std::uint32_t cp) {
+        if (cp == 0u || cp > 0x10FFFFu || (cp >= 0xD800u && cp <= 0xDFFFu)) return;
+        if (cp <= 0x7Fu) {
+            dst.push_back(static_cast<char>(cp));
+        } else if (cp <= 0x7FFu) {
+            dst.push_back(static_cast<char>(0xC0u | ((cp >> 6u) & 0x1Fu)));
+            dst.push_back(static_cast<char>(0x80u | (cp & 0x3Fu)));
+        } else if (cp <= 0xFFFFu) {
+            dst.push_back(static_cast<char>(0xE0u | ((cp >> 12u) & 0x0Fu)));
+            dst.push_back(static_cast<char>(0x80u | ((cp >> 6u) & 0x3Fu)));
+            dst.push_back(static_cast<char>(0x80u | (cp & 0x3Fu)));
+        } else {
+            dst.push_back(static_cast<char>(0xF0u | ((cp >> 18u) & 0x07u)));
+            dst.push_back(static_cast<char>(0x80u | ((cp >> 12u) & 0x3Fu)));
+            dst.push_back(static_cast<char>(0x80u | ((cp >> 6u) & 0x3Fu)));
+            dst.push_back(static_cast<char>(0x80u | (cp & 0x3Fu)));
+        }
+    };
+    auto decodeXmlEntities = [appendUtf8Cp](std::string_view raw) -> std::string {
+        const std::size_t firstAmp = raw.find('&');
+        if (firstAmp == std::string_view::npos) {
+            return std::string(raw);
+        }
+        std::string out;
+        out.reserve(raw.size());
+        std::size_t pos = 0u;
+        while (pos < raw.size()) {
+            const std::size_t amp = raw.find('&', pos);
+            if (amp == std::string_view::npos) {
+                out.append(raw.data() + pos, raw.size() - pos);
+                break;
+            }
+            out.append(raw.data() + pos, amp - pos);
+            const std::size_t semi = raw.find(';', amp + 1u);
+            if (semi != std::string_view::npos && semi > amp + 1u && semi - amp <= 12u) {
+                const std::string_view ent = raw.substr(amp + 1u, semi - (amp + 1u));
+                if (ent == "lt") { out.push_back('<'); pos = semi + 1u; continue; }
+                if (ent == "gt") { out.push_back('>'); pos = semi + 1u; continue; }
+                if (ent == "quot") { out.push_back('"'); pos = semi + 1u; continue; }
+                if (ent == "apos") { out.push_back('\''); pos = semi + 1u; continue; }
+                if (ent == "amp") { out.push_back('&'); pos = semi + 1u; continue; }
+                if (ent.size() > 1u && ent[0] == '#') {
+                    std::uint32_t cp = 0u;
+                    bool valid = true;
+                    if (ent.size() > 2u && (ent[1] == 'x' || ent[1] == 'X')) {
+                        for (std::size_t k = 2u; k < ent.size(); ++k) {
+                            const char hc = ent[k];
+                            std::uint32_t d = 16u;
+                            if (hc >= '0' && hc <= '9') d = static_cast<std::uint32_t>(hc - '0');
+                            else if (hc >= 'a' && hc <= 'f') d = static_cast<std::uint32_t>(10 + (hc - 'a'));
+                            else if (hc >= 'A' && hc <= 'F') d = static_cast<std::uint32_t>(10 + (hc - 'A'));
+                            if (d >= 16u) { valid = false; break; }
+                            cp = cp * 16u + d;
+                            if (cp > 0x10FFFFu) { valid = false; break; }
+                        }
+                    } else {
+                        for (std::size_t k = 1u; k < ent.size(); ++k) {
+                            const char dc = ent[k];
+                            if (dc < '0' || dc > '9') { valid = false; break; }
+                            cp = cp * 10u + static_cast<std::uint32_t>(dc - '0');
+                            if (cp > 0x10FFFFu) { valid = false; break; }
+                        }
+                    }
+                    if (valid && cp > 0u && cp <= 0x10FFFFu && !(cp >= 0xD800u && cp <= 0xDFFFu)) {
+                        appendUtf8Cp(out, cp);
+                        pos = semi + 1u;
+                        continue;
+                    }
+                }
+            }
+            out.push_back('&');
+            pos = amp + 1u;
+        }
+        return out;
+    };
+
+    ok &= bindFn("Xml_ParseDocument", [&domains, reflectEnv, isXmlSpace, trimView, stripPrefixView, decodeXmlEntities](const rs_bc::FunctionReference&, rs_rt::ValueSpan args, rs_rt::RuntimeError&) -> std::optional<rs_rt::Value> {
+        auto& scratch = ThreadXmlScratch();
+        scratch.nodes.clear();
+        std::string storage;
+        if (!TryExtractStringValue(reflectEnv, args.size() > 0u ? args[0] : rs_rt::Value{}, storage)) {
+            storage = ArgString(domains, args, 0);
+        }
+        std::string_view src(storage);
+        if (src.size() >= 3u &&
+            static_cast<unsigned char>(src[0]) == 0xEFu &&
+            static_cast<unsigned char>(src[1]) == 0xBBu &&
+            static_cast<unsigned char>(src[2]) == 0xBFu) {
+            src.remove_prefix(3u);
+        }
+        const std::size_t firstLt = src.find('<');
+        if (firstLt == std::string_view::npos) {
+            return rs_rt::Value{std::int64_t{0}};
+        }
+        src.remove_prefix(firstLt);
+        scratch.nodes.reserve(std::max<std::size_t>(32u, src.size() / 64u));
+
+        auto appendChildNode = [&](std::int32_t parentId, std::string raw, std::string local, bool hasPfx, std::string txt) -> std::int32_t {
+            const auto id = static_cast<std::int32_t>(scratch.nodes.size());
+            FastXmlNode n;
+            n.rawName = std::move(raw);
+            n.localName = std::move(local);
+            n.text = std::move(txt);
+            n.parentId = parentId;
+            n.hasPrefix = hasPfx;
+            if (parentId >= 0 && static_cast<std::size_t>(parentId) < scratch.nodes.size()) {
+                auto& p = scratch.nodes[static_cast<std::size_t>(parentId)];
+                p.childCount += 1;
+                p.lastChildIsLineBreak = (n.localName == "LineBreak");
+            }
+            scratch.nodes.push_back(std::move(n));
+            return id;
+        };
+
+        auto appendTextSegment = [&](std::int32_t parentId, std::string_view rawSeg) {
+            if (parentId < 0 || rawSeg.empty()) return;
+            std::string decoded = decodeXmlEntities(rawSeg);
+            if (decoded.empty()) return;
+            const std::string_view tr = trimView(decoded);
+            const std::string_view pLocal = scratch.nodes[static_cast<std::size_t>(parentId)].localName;
+            const bool isInline = (pLocal == "TextBlock" || pLocal == "Span" || pLocal == "Bold" ||
+                                   pLocal == "Italic" || pLocal == "Underline" || pLocal == "Hyperlink");
+            if (isInline) {
+                if (tr.empty()) {
+                    (void)appendChildNode(parentId, "#ws", "#ws", false, std::string{});
+                } else {
+                    const bool hasLead = isXmlSpace(decoded.front());
+                    const bool hasTrail = isXmlSpace(decoded.back());
+                    const auto& pRef = scratch.nodes[static_cast<std::size_t>(parentId)];
+                    if (hasLead && pRef.childCount > 0 && !pRef.lastChildIsLineBreak) {
+                        (void)appendChildNode(parentId, "#ws", "#ws", false, std::string{});
+                    }
+                    const std::string trCopy(tr);
+                    (void)appendChildNode(parentId, "#text", "#text", false, trCopy);
+                    scratch.nodes[static_cast<std::size_t>(parentId)].text += decoded;
+                    if (hasTrail) {
+                        (void)appendChildNode(parentId, "#ws", "#ws", false, std::string{});
+                    }
+                }
+                return;
+            }
+            if (!tr.empty()) {
+                if (pLocal == "ItemsControl" || pLocal == "ListBox" || pLocal == "ListView" || pLocal == "ComboBox") {
+                    const std::string trCopy(tr);
+                    (void)appendChildNode(parentId, "#text", "#text", false, trCopy);
+                }
+                scratch.nodes[static_cast<std::size_t>(parentId)].text += decoded;
+            }
+        };
+
+        std::vector<std::int32_t> stack;
+        stack.reserve(32u);
+        std::size_t maxAttrs = 0u;
+        std::size_t pos = 0u;
+        const std::size_t len = src.size();
+        while (pos < len) {
+            if (scratch.nodes.size() >= 262143u || maxAttrs >= 1024u) {
+                std::vector<FastXmlNode>().swap(scratch.nodes);
+                return rs_rt::Value{std::int64_t{-1}};
+            }
+            const std::size_t lt = src.find('<', pos);
+            if (lt == std::string_view::npos) {
+                if (!stack.empty() && pos < len) {
+                    appendTextSegment(stack.back(), src.substr(pos));
+                }
+                break;
+            }
+            if (lt > pos && !stack.empty()) {
+                appendTextSegment(stack.back(), src.substr(pos, lt - pos));
+            }
+            if (lt + 1u >= len) break;
+
+            // Comments <!-- ... -->
+            if (lt + 4u <= len && src.substr(lt, 4u) == "<!--") {
+                const std::size_t endCom = src.find("-->", lt + 4u);
+                if (endCom == std::string_view::npos) break;
+                pos = endCom + 3u;
+                continue;
+            }
+            // CDATA <![CDATA[ ... ]]>
+            if (lt + 9u <= len && src.substr(lt, 9u) == "<![CDATA[") {
+                const std::size_t endCd = src.find("]]>", lt + 9u);
+                if (endCd == std::string_view::npos) break;
+                if (!stack.empty()) {
+                    scratch.nodes[static_cast<std::size_t>(stack.back())].text.append(
+                        src.data() + lt + 9u, endCd - (lt + 9u));
+                }
+                pos = endCd + 3u;
+                continue;
+            }
+            // PI <?...?> or <!...>
+            const char c1 = src[lt + 1u];
+            if (c1 == '?' || c1 == '!') {
+                const std::size_t gt = src.find('>', lt + 2u);
+                if (gt == std::string_view::npos) break;
+                pos = gt + 1u;
+                continue;
+            }
+
+            // Find '>' outside quotes
+            std::size_t gt = std::string_view::npos;
+            char quote = '\0';
+            for (std::size_t k = lt + 1u; k < len; ++k) {
+                const char ch = src[k];
+                if (quote != '\0') {
+                    if (ch == quote) quote = '\0';
+                } else {
+                    if (ch == '"' || ch == '\'') quote = ch;
+                    else if (ch == '>') { gt = k; break; }
+                }
+            }
+            if (gt == std::string_view::npos) break;
+
+            std::string_view header = trimView(src.substr(lt + 1u, gt - (lt + 1u)));
+            pos = gt + 1u;
+            if (header.empty()) continue;
+
+            // Closing tag </...>
+            if (header.front() == '/') {
+                const std::string_view closeRaw = trimView(header.substr(1u));
+                bool dummyPfx = false;
+                const std::string_view closeLocal = stripPrefixView(closeRaw, dummyPfx);
+                while (!stack.empty()) {
+                    const std::int32_t poppedId = stack.back();
+                    stack.pop_back();
+                    const auto& popped = scratch.nodes[static_cast<std::size_t>(poppedId)];
+                    if (popped.rawName == closeRaw || popped.localName == closeLocal) {
+                        break;
+                    }
+                }
+                continue;
+            }
+
+            bool selfClosing = false;
+            if (!header.empty() && header.back() == '/') {
+                selfClosing = true;
+                header = trimView(header.substr(0u, header.size() - 1u));
+            }
+            std::size_t nameEnd = 0u;
+            while (nameEnd < header.size() && !isXmlSpace(header[nameEnd])) {
+                ++nameEnd;
+            }
+            const std::string_view rawNameSv = header.substr(0u, nameEnd);
+            bool hasPfx = false;
+            const std::string_view localNameSv = stripPrefixView(rawNameSv, hasPfx);
+            const std::int32_t parentId = stack.empty() ? -1 : stack.back();
+            const std::int32_t nodeId = appendChildNode(
+                parentId, std::string(rawNameSv), std::string(localNameSv), hasPfx, std::string{});
+
+            // Parse attributes
+            if (nameEnd < header.size()) {
+                std::string_view attrText = header.substr(nameEnd);
+                std::size_t ai = 0u;
+                const std::size_t alen = attrText.size();
+                auto& attrVec = scratch.nodes[static_cast<std::size_t>(nodeId)].attrs;
+                while (ai < alen) {
+                    while (ai < alen && isXmlSpace(attrText[ai])) ++ai;
+                    if (ai >= alen) break;
+                    const std::size_t aStart = ai;
+                    while (ai < alen && attrText[ai] != '=' && !isXmlSpace(attrText[ai])) ++ai;
+                    const std::string_view aName = trimView(attrText.substr(aStart, ai - aStart));
+                    while (ai < alen && isXmlSpace(attrText[ai])) ++ai;
+                    if (ai >= alen || attrText[ai] != '=') {
+                        if (!aName.empty()) {
+                            attrVec.push_back(FastXmlAttr{std::string(aName), std::string{}});
+                        }
+                        continue;
+                    }
+                    ++ai; // skip '='
+                    while (ai < alen && isXmlSpace(attrText[ai])) ++ai;
+                    if (ai >= alen) break;
+                    std::string aVal;
+                    const char aq = attrText[ai];
+                    if (aq == '"' || aq == '\'') {
+                        ++ai;
+                        const std::size_t vStart = ai;
+                        while (ai < alen && attrText[ai] != aq) ++ai;
+                        aVal = decodeXmlEntities(attrText.substr(vStart, ai - vStart));
+                        if (ai < alen) ++ai;
+                    } else {
+                        const std::size_t vStart = ai;
+                        while (ai < alen && !isXmlSpace(attrText[ai])) ++ai;
+                        aVal = decodeXmlEntities(attrText.substr(vStart, ai - vStart));
+                    }
+                    if (!aName.empty()) {
+                        attrVec.push_back(FastXmlAttr{std::string(aName), std::move(aVal)});
+                    }
+                }
+                maxAttrs = std::max(maxAttrs, attrVec.size());
+            }
+
+            if (!selfClosing) {
+                stack.push_back(nodeId);
+            }
+        }
+        if (scratch.nodes.size() >= 262143u || maxAttrs >= 1024u) {
+            std::vector<FastXmlNode>().swap(scratch.nodes);
+            return rs_rt::Value{std::int64_t{-1}};
+        }
+        return rs_rt::Value{static_cast<std::int64_t>(scratch.nodes.size())};
+    });
+
+    ok &= bindFn("Xml_ClearDocument", [](const rs_bc::FunctionReference&, rs_rt::ValueSpan, rs_rt::RuntimeError&) -> std::optional<rs_rt::Value> {
+        std::vector<FastXmlNode>().swap(ThreadXmlScratch().nodes);
+        return rs_rt::Value{std::int64_t{0}};
+    });
+
+    ok &= bindFn("Xml_NodeMeta", [](const rs_bc::FunctionReference&, rs_rt::ValueSpan args, rs_rt::RuntimeError&) -> std::optional<rs_rt::Value> {
+        const auto& nodes = ThreadXmlScratch().nodes;
+        const auto idx = ArgInt(args, 0);
+        if (idx < 0 || static_cast<std::size_t>(idx) >= nodes.size()) {
+            return rs_rt::Value{std::int64_t{0}};
+        }
+        const auto& n = nodes[static_cast<std::size_t>(idx)];
+        const std::int64_t parentPlus1 = static_cast<std::int64_t>(n.parentId + 1) & 0x3FFFFLL;
+        const std::int64_t attrCount = (static_cast<std::int64_t>(n.attrs.size()) & 0x3FFLL) << 18u;
+        const std::int64_t hasText = (!n.text.empty() ? 1LL : 0LL) << 28u;
+        const std::int64_t hasPfx = (n.hasPrefix ? 1LL : 0LL) << 29u;
+        return rs_rt::Value{parentPlus1 | attrCount | hasText | hasPfx};
+    });
+
+    ok &= bindFn("Xml_NodeRawName", [](const rs_bc::FunctionReference&, rs_rt::ValueSpan args, rs_rt::RuntimeError&) -> std::optional<rs_rt::Value> {
+        const auto& nodes = ThreadXmlScratch().nodes;
+        const auto idx = ArgInt(args, 0);
+        if (idx < 0 || static_cast<std::size_t>(idx) >= nodes.size()) {
+            return rs_rt::Value{rs_rt::StringValue{std::string{}}};
+        }
+        return rs_rt::Value{rs_rt::StringValue{nodes[static_cast<std::size_t>(idx)].rawName}};
+    });
+
+    ok &= bindFn("Xml_NodeLocalName", [](const rs_bc::FunctionReference&, rs_rt::ValueSpan args, rs_rt::RuntimeError&) -> std::optional<rs_rt::Value> {
+        const auto& nodes = ThreadXmlScratch().nodes;
+        const auto idx = ArgInt(args, 0);
+        if (idx < 0 || static_cast<std::size_t>(idx) >= nodes.size()) {
+            return rs_rt::Value{rs_rt::StringValue{std::string{}}};
+        }
+        return rs_rt::Value{rs_rt::StringValue{nodes[static_cast<std::size_t>(idx)].localName}};
+    });
+
+    ok &= bindFn("Xml_NodeText", [](const rs_bc::FunctionReference&, rs_rt::ValueSpan args, rs_rt::RuntimeError&) -> std::optional<rs_rt::Value> {
+        const auto& nodes = ThreadXmlScratch().nodes;
+        const auto idx = ArgInt(args, 0);
+        if (idx < 0 || static_cast<std::size_t>(idx) >= nodes.size()) {
+            return rs_rt::Value{rs_rt::StringValue{std::string{}}};
+        }
+        return rs_rt::Value{rs_rt::StringValue{nodes[static_cast<std::size_t>(idx)].text}};
+    });
+
+    ok &= bindFn("Xml_AttrName", [](const rs_bc::FunctionReference&, rs_rt::ValueSpan args, rs_rt::RuntimeError&) -> std::optional<rs_rt::Value> {
+        const auto& nodes = ThreadXmlScratch().nodes;
+        const auto idx = ArgInt(args, 0);
+        const auto aIdx = ArgInt(args, 1);
+        if (idx < 0 || static_cast<std::size_t>(idx) >= nodes.size()) {
+            return rs_rt::Value{rs_rt::StringValue{std::string{}}};
+        }
+        const auto& attrs = nodes[static_cast<std::size_t>(idx)].attrs;
+        if (aIdx < 0 || static_cast<std::size_t>(aIdx) >= attrs.size()) {
+            return rs_rt::Value{rs_rt::StringValue{std::string{}}};
+        }
+        return rs_rt::Value{rs_rt::StringValue{attrs[static_cast<std::size_t>(aIdx)].name}};
+    });
+
+    ok &= bindFn("Xml_AttrValue", [](const rs_bc::FunctionReference&, rs_rt::ValueSpan args, rs_rt::RuntimeError&) -> std::optional<rs_rt::Value> {
+        const auto& nodes = ThreadXmlScratch().nodes;
+        const auto idx = ArgInt(args, 0);
+        const auto aIdx = ArgInt(args, 1);
+        if (idx < 0 || static_cast<std::size_t>(idx) >= nodes.size()) {
+            return rs_rt::Value{rs_rt::StringValue{std::string{}}};
+        }
+        const auto& attrs = nodes[static_cast<std::size_t>(idx)].attrs;
+        if (aIdx < 0 || static_cast<std::size_t>(aIdx) >= attrs.size()) {
+            return rs_rt::Value{rs_rt::StringValue{std::string{}}};
+        }
+        return rs_rt::Value{rs_rt::StringValue{attrs[static_cast<std::size_t>(aIdx)].value}};
     });
 
     return ok;

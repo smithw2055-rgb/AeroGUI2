@@ -214,6 +214,8 @@ public class Control : FrameworkElement {
                 _template.ResetTriggers(this);
             }
             _template = value;
+            _hasTemplateResources = (_template != null && (_template.HasResources() || _template.RawResourcesOrNull() != null));
+            _hasTemplateAmbientResources = (_template != null && _template.AmbientResources != null);
             _templateApplied = false;
             ApplyTemplate();
         }
@@ -340,7 +342,9 @@ public class Control : FrameworkElement {
             if ((node is ContentPresenter || node.IsItemsPresenterBoundary()) && node.TemplatedParent == owner) { continue; }
             if (node != owner && node is Control && node.TemplatedParent == owner) {
                 Control subCtrl = node as Control;
-                subCtrl.ApplyStyleInternal();
+                if (subCtrl._appliedStyle == null || (subCtrl.Style != null && subCtrl.Style != subCtrl._appliedStyle)) {
+                    subCtrl.ApplyStyleInternal();
+                }
                 if (!subCtrl.IsTemplateApplied() && subCtrl.TemplateRoot() == null) {
                     subCtrl.ApplyTemplate();
                 }
@@ -408,6 +412,22 @@ public class Control : FrameworkElement {
                 }
                 continue;
             }
+            if (cur is Panel && (cur as Panel).IsItemsHost) {
+                for (int i = cur.ChildCount() - 1; i >= 0; i -= 1) {
+                    UIElement ch = cur.ChildAt(i);
+                    if (ch != null) {
+                        if (IsOwnedByTemplateChain(ch, owner)) {
+                            q.Push(ch);
+                        } else {
+                            cur.RemoveChild(ch);
+                        }
+                    }
+                }
+                continue;
+            }
+            if (cur.DetachNonTemplateUserContent(owner, q)) {
+                continue;
+            }
             for (int i = cur.ChildCount() - 1; i >= 0; i -= 1) {
                 UIElement ch = cur.ChildAt(i);
                 if (ch != null && IsOwnedByTemplateChain(ch, owner)) { q.Push(ch); }
@@ -415,7 +435,18 @@ public class Control : FrameworkElement {
         }
     }
 
+    protected override void CollectExtraDisposeTargets(UIElement[] q) {
+        if (_templateRoot != null) {
+            if (!_templateRoot._isDisposedTree) { q.Push(_templateRoot); }
+            _templateRoot = null;
+        }
+        _template = null;
+        _hasTemplateResources = false;
+        _hasTemplateAmbientResources = false;
+    }
+
     public override bool ApplyTemplate() {
+        if (_isDisposedTree) { return false; }
         if (_template != null && _templateApplied) {
             _template.ResetTriggers(this);
         }
@@ -430,11 +461,15 @@ public class Control : FrameworkElement {
         }
         UIElement nextRoot = null;
         if (_template != null) {
+            UIElement._xamlBuildDepth += 1;
             nextRoot = _template.Instantiate(this);
+            UIElement._xamlBuildDepth -= 1;
         } else {
             nextRoot = CreateDefaultTemplate();
         }
         _templateRoot = nextRoot;
+        _hasTemplateResources = (_template != null && (_template.HasResources() || _template.RawResourcesOrNull() != null));
+        _hasTemplateAmbientResources = (_template != null && _template.AmbientResources != null);
         _templateApplied = true;
         SyncBoxStyleToNative();
         SyncPadding();
@@ -442,9 +477,14 @@ public class Control : FrameworkElement {
         if (_templateRoot != null) {
             MarkTemplateOwner(_templateRoot, this);
             bool prevSuppress = _suppressChildAutoLoaded;
+            bool prevSuppressStyle = _suppressChildAutoStyle;
             _suppressChildAutoLoaded = true;
+            _suppressChildAutoStyle = true;
             AddChild(_templateRoot);
+            _suppressChildAutoStyle = prevSuppressStyle;
             _suppressChildAutoLoaded = prevSuppress;
+            _templateRoot.ApplyStyleSubtree();
+            _templateRoot.RefreshDynamicResourcesRecursive();
             ExpandNestedTemplateControls(_templateRoot, self);
             SyncTemplatePresenters();
             BindingEngine.FlushSubtree(_templateRoot);
@@ -531,7 +571,7 @@ public class Control : FrameworkElement {
     }
 
     protected override DependencyObject TryFindTemplateScopedResourceBox(string key) {
-        if (_template != null && _template.Resources != null) {
+        if (_template != null && _template.HasResources()) {
             return _template.Resources.TryGetLocalBox(key);
         }
         return null;
@@ -747,22 +787,59 @@ public class ContentPresenter : FrameworkElement {
         }
     }
 
-    public void RebuildContentVisual() {
+    private void DisposeTextViewIfAny() {
+        if (_textView == null) { return; }
+        UIElement oldTv = _textView;
+        _textView = null;
+        UIElement self = this;
+        if (oldTv.Parent == self) { RemoveChild(oldTv); }
+        oldTv.DisposeSubtree();
+    }
+
+    protected override void CollectExtraDisposeTargets(UIElement[] q) {
+        if (_textView != null) {
+            if (!_textView._isDisposedTree) { q.Push(_textView); }
+            _textView = null;
+        }
         if (_templateInstanceRoot != null) {
-            _templateInstanceRoot.MarkDisposedSubtree();
+            if (!_templateInstanceRoot._isDisposedTree) { q.Push(_templateInstanceRoot); }
             _templateInstanceRoot = null;
+        }
+        _contentBox = null;
+        _contentTemplate = null;
+    }
+
+    public void RebuildContentVisual() {
+        if (_isDisposedTree) { return; }
+        if (_templateInstanceRoot != null) {
+            UIElement oldInst = _templateInstanceRoot;
+            _templateInstanceRoot = null;
+            UIElement self = this;
+            if (oldInst.Parent == self) { RemoveChild(oldInst); }
+            oldInst.MarkDisposedSubtree();
         }
         if (_contentBox == null) {
             if (_contentTemplate != null) {
-                _textView = null;
+                DisposeTextViewIfAny();
                 ClearChildren();
+                UIElement._xamlBuildDepth += 1;
                 UIElement builtNull = _contentTemplate.Instantiate(null);
+                UIElement._xamlBuildDepth -= 1;
                 _templateInstanceRoot = builtNull;
                 if (builtNull != null) {
+                    bool prevSuppressStyleNull = _suppressChildAutoStyle;
+                    _suppressChildAutoStyle = true;
                     AddChild(builtNull);
-                    BindingEngine.FlushSubtree(builtNull);
-                    builtNull.ApplyTemplateSubtree();
-                    BindingEngine.FlushSubtree(builtNull);
+                    _suppressChildAutoStyle = prevSuppressStyleNull;
+                    if (UIElement._xamlBuildDepth == 0) {
+                        builtNull.ApplyStyleSubtree();
+                        builtNull.RefreshDynamicResourcesRecursive();
+                        builtNull.ApplyTemplateSubtree();
+                        if (HasLoadedFired() && !_suppressChildAutoLoaded) {
+                            builtNull.EnsureLoadedSubtree();
+                        }
+                        BindingEngine.FlushSubtree(builtNull);
+                    }
                 }
                 return;
             }
@@ -775,7 +852,7 @@ public class ContentPresenter : FrameworkElement {
             return;
         }
         if (_contentBox is UIElement) {
-            _textView = null;
+            DisposeTextViewIfAny();
             UIElement el = _contentBox as UIElement;
             if (ChildCount() == 1 && ChildAt(0) == el) {
                 BindingEngine.FlushSubtree(el);
@@ -792,15 +869,26 @@ public class ContentPresenter : FrameworkElement {
             effTemplate = DataTemplate.ResolveImplicitDataTemplate(this, DependencyObject.Unbox(_contentBox));
         }
         if (effTemplate != null) {
-            _textView = null;
+            DisposeTextViewIfAny();
             ClearChildren();
+            UIElement._xamlBuildDepth += 1;
             UIElement built = effTemplate.Instantiate(DependencyObject.Unbox(_contentBox));
+            UIElement._xamlBuildDepth -= 1;
             _templateInstanceRoot = built;
             if (built != null) {
+                bool prevSuppressStyleBuilt = _suppressChildAutoStyle;
+                _suppressChildAutoStyle = true;
                 AddChild(built);
-                BindingEngine.FlushSubtree(built);
-                built.ApplyTemplateSubtree();
-                BindingEngine.FlushSubtree(built);
+                _suppressChildAutoStyle = prevSuppressStyleBuilt;
+                if (UIElement._xamlBuildDepth == 0) {
+                    built.ApplyStyleSubtree();
+                    built.RefreshDynamicResourcesRecursive();
+                    built.ApplyTemplateSubtree();
+                    if (HasLoadedFired() && !_suppressChildAutoLoaded) {
+                        built.EnsureLoadedSubtree();
+                    }
+                    BindingEngine.FlushSubtree(built);
+                }
             }
             return;
         }
@@ -1014,6 +1102,21 @@ public class ContentControl : Control {
         return null;
     }
 
+    protected override void CollectExtraDisposeTargets(UIElement[] q) {
+        base.CollectExtraDisposeTargets(q);
+        if (_contentBox is UIElement) {
+            UIElement cel = _contentBox as UIElement;
+            UIElement self = this;
+            UIElement pres = _presenter;
+            if (!cel._isDisposedTree && (cel.Parent == null || cel.Parent == self || (pres != null && cel.Parent == pres))) {
+                q.Push(cel);
+            }
+        }
+        _contentBox = null;
+        _contentTemplate = null;
+        _presenter = null;
+    }
+
     public override void OnApplyTemplate() {
         if (Template != null) { _presenter = null; }
         UIElement found = GetTemplateChild("PART_ContentPresenter");
@@ -1107,6 +1210,29 @@ public class HeaderedContentControl : ContentControl {
         }
     }
 
+    public void SetHeaderAndTemplate(DependencyObject box, DataTemplate tpl) {
+        DependencyObject oldBox = _headerBox;
+        _headerTemplate = tpl;
+        _headerBox = box;
+        if (_headerPresenter != null) { _headerPresenter.SetContentAndTemplate(_headerBox, _headerTemplate); }
+        OnHeaderChanged(DependencyObject.Unbox(oldBox), DependencyObject.Unbox(_headerBox));
+    }
+
+    protected override void CollectExtraDisposeTargets(UIElement[] q) {
+        base.CollectExtraDisposeTargets(q);
+        if (_headerBox is UIElement) {
+            UIElement hel = _headerBox as UIElement;
+            UIElement self = this;
+            UIElement hpres = _headerPresenter;
+            if (!hel._isDisposedTree && (hel.Parent == null || hel.Parent == self || (hpres != null && hel.Parent == hpres))) {
+                q.Push(hel);
+            }
+        }
+        _headerBox = null;
+        _headerTemplate = null;
+        _headerPresenter = null;
+    }
+
     protected virtual void OnHeaderChanged(object oldHeader, object newHeader) {}
 
     public override void OnApplyTemplate() {
@@ -1194,15 +1320,14 @@ public class Expander : HeaderedContentControl {
 
     public override string GetTypeName() { return "Expander"; }
 
+    protected override void CollectExtraDisposeTargets(UIElement[] q) {
+        base.CollectExtraDisposeTargets(q);
+        _headerToggle = null;
+        _chevron = null;
+        _bodyHost = null;
+    }
+
     public override bool SubscribeBehaviorRoutedEvent(string ev, BehaviorEventSink sink) {
-        if (ev == "Expanded") {
-            Expanded += (object s, RoutedEventArgs e) => { if (sink != null) { sink.OnBehaviorEvent(s, e); } };
-            return true;
-        }
-        if (ev == "Collapsed") {
-            Collapsed += (object s, RoutedEventArgs e) => { if (sink != null) { sink.OnBehaviorEvent(s, e); } };
-            return true;
-        }
         return base.SubscribeBehaviorRoutedEvent(ev, sink);
     }
 
@@ -1215,9 +1340,13 @@ public class Expander : HeaderedContentControl {
             UpdateTriggersAndStates();
             NotifyBoundPropertyChanged("IsExpanded", DependencyObject.BoxBool(_isExpanded));
             if (_isExpanded) {
-                Expanded(this, new RoutedEventArgs("Expanded", this));
+                var expArgs = new RoutedEventArgs("Expanded", this);
+                Expanded(this, expArgs);
+                RaiseRoutedEvent("Expanded", expArgs);
             } else {
-                Collapsed(this, new RoutedEventArgs("Collapsed", this));
+                var colArgs = new RoutedEventArgs("Collapsed", this);
+                Collapsed(this, colArgs);
+                RaiseRoutedEvent("Collapsed", colArgs);
             }
         }
     }

@@ -201,6 +201,14 @@
       </Storyboard>
     </ControlTemplate.Resources>
     <ControlTemplate.Triggers>
+      <Trigger Property="IsChecked" Value="True">
+        <Setter Property="Background" Value="{DynamicResource Brush.Background.Checked}" TargetName="Border"/>
+        <Setter Property="BorderBrush" Value="{DynamicResource Brush.Border.Checked}" TargetName="Border"/>
+      </Trigger>
+      <Trigger Property="IsChecked" Value="{x:Null}">
+        <Setter Property="Background" Value="{DynamicResource Brush.Background.Over}" TargetName="Border"/>
+        <Setter Property="BorderBrush" Value="{DynamicResource Brush.Border.Checked}" TargetName="Border"/>
+      </Trigger>
       <Trigger Property="IsMouseOver" Value="True">
         <Setter Property="BorderBrush" Value="{DynamicResource Brush.Border.Over}" TargetName="Border"/>
         <Setter Property="BorderThickness" Value="{DynamicResource Border.Over}" TargetName="Border"/>
@@ -217,10 +225,6 @@
         <Setter Property="BorderBrush" Value="{DynamicResource Brush.Border.Pressed}" TargetName="Border"/>
         <Setter Property="BorderThickness" Value="{DynamicResource Border.Normal}" TargetName="Border"/>
         <Setter Property="CornerRadius" Value="{DynamicResource Corner.Border0}" TargetName="Border"/>
-      </Trigger>
-      <Trigger Property="IsChecked" Value="True">
-        <Setter Property="Background" Value="{DynamicResource Brush.Background.Checked}" TargetName="Border"/>
-        <Setter Property="BorderBrush" Value="{DynamicResource Brush.Border.Checked}" TargetName="Border"/>
       </Trigger>
       <Trigger Property="IsEnabled" Value="False">
         <Setter Property="Foreground" Value="{DynamicResource Brush.Foreground.Disabled}"/>

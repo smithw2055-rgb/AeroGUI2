@@ -1263,10 +1263,11 @@ bool AeroAppHost::LoadProgramImageInternal(
         const realscript::jit::StencilJit jitCompiler;
         realscript::jit::StencilJitOptions jitOpts{};
         jitOpts.enableNativeCodegen = true;
-        jitOpts.enableThreadedFallback = false;
+        jitOpts.enableThreadedFallback = true;
         jitOpts.hotnessThreshold = 0;
         auto compileRes = jitCompiler.compile(programImage_, jitOpts);
-        if (compileRes.succeeded() && compileRes.nativeFunctionCount > 0) {
+        if (compileRes.succeeded() &&
+            (compileRes.nativeFunctionCount > 0 || compileRes.threadedFunctionCount > 0)) {
             auto stencilMod = compileRes.module;
             stencilMod->setHeap(domains_.uiHeapPtr());
             stencilMod->setBindingRegistry(bindings_);
@@ -1283,8 +1284,8 @@ bool AeroAppHost::LoadProgramImageInternal(
                     if (domain != DomainKind::UiPresentation) {
                         return false;
                     }
-                    if (stencilMod->functionTier(functionId) !=
-                        realscript::jit::StencilTier::NativeMachineCode) {
+                    if (stencilMod->functionTier(functionId) ==
+                        realscript::jit::StencilTier::InterpreterFallback) {
                         return false;
                     }
                     std::vector<UnifiedValue> argVec;
@@ -2246,7 +2247,12 @@ bool AeroAppHost::HandleScriptInputEvent(
     VisualCallbackFlags flag,
     const NativeInputEvent& ev) {
     const VisualNode* node = world_.GetNode(nodeId);
-    if (!node || !node->nativeHandle.valid()) {
+    const bool allowNullNode =
+        (flag == VisualCallback_PointerLeave ||
+         flag == VisualCallback_PointerUp ||
+         flag == VisualCallback_PointerMove ||
+         flag == VisualCallback_PointerDown);
+    if ((!node || !node->nativeHandle.valid()) && !allowNullNode) {
         return false;
     }
     domains_.setActiveDomain(DomainKind::UiPresentation);
@@ -2262,8 +2268,10 @@ bool AeroAppHost::HandleScriptInputEvent(
             if (symbols_.dispatchPointer == 0u) {
                 return false;
             }
+            const NativeHandle argHandle =
+                (node && node->nativeHandle.valid()) ? node->nativeHandle : NativeHandle{};
             const std::vector<UnifiedValue> args{
-                UnifiedValue{node->nativeHandle},
+                UnifiedValue{argHandle},
                 UnifiedValue{static_cast<std::int64_t>(static_cast<std::uint32_t>(flag))},
                 UnifiedValue{FloatValue{ev.x}},
                 UnifiedValue{FloatValue{ev.y}},
@@ -2280,7 +2288,7 @@ bool AeroAppHost::HandleScriptInputEvent(
             if (IsAeroTraceEnabled()) {
                 std::fprintf(stderr, "[AERO_TRACE] DispatchPointer node=%u flag=%u pos=(%.1f,%.1f) owner=%d handled=%d (gotBool=%d)\n",
                     nodeId.index, static_cast<unsigned>(flag), ev.x, ev.y,
-                    node->hasScriptOwner ? 1 : 0, handled ? 1 : 0, gotBool ? 1 : 0);
+                    (node && node->hasScriptOwner) ? 1 : 0, handled ? 1 : 0, gotBool ? 1 : 0);
                 std::fflush(stderr);
             }
             return gotBool && handled;
@@ -2423,6 +2431,17 @@ void AeroAppHost::FlushBindings() {
 bool AeroAppHost::DispatchPendingCanvasDraws() {
     if (symbols_.dispatchDraw == 0u) {
         return false;
+    }
+    if (lastCanvasDrawSizes_.size() > 64u) {
+        for (auto it = lastCanvasDrawSizes_.begin(); it != lastCanvasDrawSizes_.end();) {
+            const auto slotIdx = static_cast<std::uint32_t>(it->first & 0xFFFFFFFFull);
+            const auto gen = static_cast<std::uint32_t>(it->first >> 32u);
+            if (!world_.IsAlive(VisualNodeId{slotIdx, gen})) {
+                it = lastCanvasDrawSizes_.erase(it);
+            } else {
+                ++it;
+            }
+        }
     }
     bool anyDispatched = false;
     const std::size_t slots = world_.ArenaSlotCount();
@@ -2648,10 +2667,26 @@ void AeroAppHost::StepFrame(float dtSeconds, bool forceRenderSync) {
         logTrace("TickAndPresentFrame");
         (void)windowHost_.TickAndPresentFrame(0.0f, forceRenderSync || needSync);
     }
+    if (domains_.uiHeap().phase() == rs_rt::GcPhase::Idle &&
+        domains_.uiHeap().nurserySize() >= 4096u) {
+        rs_rt::ShadowStack emptyStack;
+        (void)domains_.uiHeap().collectYoung(emptyStack, 64u);
+    }
+    const std::uint64_t destroyedNow = world_.DestroyedNodeCount();
+    const bool majorTeardown = (destroyedNow >= lastGcDestroyedNodes_) &&
+                               ((destroyedNow - lastGcDestroyedNodes_) >= 64u);
     if (domains_.uiHeap().collectionRequested() ||
-        domains_.uiHeap().phase() != rs_rt::GcPhase::Idle) {
-        (void)domains_.uiHeap().collectIncrementalWithBudget(
-            rs_rt::RootSet{}, std::chrono::milliseconds(1));
+        domains_.uiHeap().phase() != rs_rt::GcPhase::Idle ||
+        majorTeardown) {
+        const auto gcStats = domains_.uiHeap().collectIncrementalWithBudget(
+            rs_rt::RootSet{},
+            std::chrono::milliseconds(forceRenderSync ? 20 : (majorTeardown ? 16 : 6)),
+            32u,
+            majorTeardown);
+        if (gcStats.cycleCompleted) {
+            lastGcDestroyedNodes_ = world_.DestroyedNodeCount();
+            (void)domains_.uiHeap().trimExcessCapacity();
+        }
     }
     logTrace("done");
 }

@@ -14,6 +14,22 @@ public class ItemsPresenter : FrameworkElement {
     public override string GetTypeName() { return "ItemsPresenter"; }
     internal override bool IsItemsPresenterBoundary() { return true; }
 
+    internal override bool DetachNonTemplateUserContent(UIElement owner, UIElement[] q) {
+        if (_itemsPanel != null) {
+            for (int i = _itemsPanel.ChildCount() - 1; i >= 0; i -= 1) {
+                UIElement ch = _itemsPanel.ChildAt(i);
+                if (ch != null) {
+                    if (Control.IsOwnedByTemplateChain(ch, owner)) {
+                        q.Push(ch);
+                    } else {
+                        _itemsPanel.RemoveChild(ch);
+                    }
+                }
+            }
+        }
+        return true;
+    }
+
     public Panel ItemsPanel {
         get {
             if (_itemsPanel == null) { EnsurePanel(); }
@@ -46,15 +62,30 @@ public class ItemsPresenter : FrameworkElement {
         return _itemsPanel;
     }
 
-    public void RebuildPanel() {
-        UIElement[] existing = new UIElement[0];
+    internal Panel ExistingItemsPanel() { return _itemsPanel; }
+
+    protected override void CollectExtraDisposeTargets(UIElement[] q) {
         if (_itemsPanel != null) {
-            for (int i = 0; i < _itemsPanel.ChildCount(); i += 1) {
-                existing.Push(_itemsPanel.ChildAt(i));
+            if (!_itemsPanel._isDisposedTree) { q.Push(_itemsPanel); }
+            _itemsPanel = null;
+        }
+    }
+
+    public void RebuildPanel() {
+        Panel oldPanel = _itemsPanel;
+        UIElement[] existing = new UIElement[0];
+        if (oldPanel != null) {
+            for (int i = 0; i < oldPanel.ChildCount(); i += 1) {
+                existing.Push(oldPanel.ChildAt(i));
             }
-            _itemsPanel.ClearChildren();
+            oldPanel.ClearChildren();
         }
         _itemsPanel = null;
+        if (oldPanel != null) {
+            UIElement self = this;
+            if (oldPanel.Parent == self) { RemoveChild(oldPanel); }
+            oldPanel.DisposeSubtree();
+        }
         Panel next = EnsurePanel();
         for (int i = 0; i < existing.Length; i += 1) {
             next.AddChild(existing[i]);
@@ -130,11 +161,11 @@ public class ItemsControl : Control {
 
     public DataTemplate ItemTemplate {
         get { return _itemTemplate; }
-        set { _itemTemplate = value; RecycleActiveContainers(); RefreshItems(); }
+        set { if (_itemTemplate == value) { return; } _itemTemplate = value; RecycleActiveContainers(); RefreshItems(); }
     }
     public Style ItemContainerStyle {
         get { return _itemContainerStyle; }
-        set { _itemContainerStyle = value; RecycleActiveContainers(); RefreshItems(); }
+        set { if (_itemContainerStyle == value) { return; } _itemContainerStyle = value; RecycleActiveContainers(); RefreshItems(); }
     }
     public Func<Panel> ItemsPanel {
         get { return _itemsPanelFactory; }
@@ -320,6 +351,40 @@ public class ItemsControl : Control {
         RefreshItems();
     }
 
+    protected override void CollectExtraDisposeTargets(UIElement[] q) {
+        base.CollectExtraDisposeTargets(q);
+        if (_itemsSourceBox != null && _collectionChangedHook != null) {
+            object oldObj = DependencyObject.Unbox(_itemsSourceBox);
+            CollectionChangeHub.Unsubscribe(oldObj, _collectionChangedHook);
+        }
+        _itemsSourceBox = null;
+        if (_itemsPresenter != null) {
+            if (!_itemsPresenter._isDisposedTree) { q.Push(_itemsPresenter); }
+            _itemsPresenter = null;
+        }
+        for (int i = 0; i < _activeContainers.Length; i += 1) {
+            UIElement ac = _activeContainers[i];
+            if (ac != null && !ac._isDisposedTree) { q.Push(ac); }
+        }
+        for (int i = 0; i < _recycledPool.Length; i += 1) {
+            UIElement rc = _recycledPool[i];
+            if (rc != null && !rc._isDisposedTree) { q.Push(rc); }
+        }
+        UIElement self = this;
+        for (int i = 0; i < _manualItems.Length; i += 1) {
+            if (_manualItems[i] is UIElement) {
+                UIElement mi = _manualItems[i] as UIElement;
+                if (!mi._isDisposedTree && (mi.Parent == null || mi.Parent == self)) {
+                    q.Push(mi);
+                }
+            }
+        }
+        _activeContainers.Clear();
+        _activeBoxes.Clear();
+        _recycledPool.Clear();
+        _manualItems.Clear();
+    }
+
     protected virtual void OnItemsSourceChanged() {}
     protected virtual void OnItemsCollectionChanged() { RefreshItems(); }
 
@@ -379,7 +444,9 @@ public class ItemsControl : Control {
             cp.SetContentAndTemplate(displayBox, effTpl);
         }
         if (_alternationCount > 0) {
-            container.Tag = DependencyObject.BoxInt(index % _alternationCount);
+            int altIdx = index % _alternationCount;
+            container.SetAlternationIndex(altIdx);
+            container.Tag = DependencyObject.BoxInt(altIdx);
         }
     }
 
@@ -456,6 +523,7 @@ public class ItemsControl : Control {
             return;
         }
 
+        UIElement._xamlBuildDepth += 1;
         BindingEngine.BeginBatch();
         int desiredCount = lastIdx - firstIdx + 1;
         UIElement[] prevContainers = _activeContainers;
@@ -493,7 +561,9 @@ public class ItemsControl : Control {
                 prevUsed[hit] = true;
                 UIElement reused = prevContainers[hit];
                 if (_alternationCount > 0 && reused != null) {
-                    reused.Tag = DependencyObject.BoxInt(itemIdx % _alternationCount);
+                    int altIdx = itemIdx % _alternationCount;
+                    reused.SetAlternationIndex(altIdx);
+                    reused.Tag = DependencyObject.BoxInt(altIdx);
                 }
                 nextContainers[j] = reused;
             } else {
@@ -521,7 +591,10 @@ public class ItemsControl : Control {
             }
         }
 
+        var newlyAdded = new UIElement[0];
         if (host != null) {
+            bool prevSuppressHostStyle = host._suppressChildAutoStyle;
+            host._suppressChildAutoStyle = true;
             for (int j = 0; j < desiredCount; j += 1) {
                 UIElement c = nextContainers[j];
                 if (c == null) { continue; }
@@ -533,12 +606,27 @@ public class ItemsControl : Control {
                 } else {
                     host.InsertChild(j, c);
                 }
+                newlyAdded.Push(c);
             }
+            host._suppressChildAutoStyle = prevSuppressHostStyle;
         }
 
         _activeContainers = nextContainers;
         _activeBoxes = nextBoxes;
+        UIElement._xamlBuildDepth -= 1;
         BindingEngine.EndBatch();
+        if (UIElement._xamlBuildDepth == 0 && newlyAdded.Length > 0) {
+            bool hostLoaded = host != null && host.HasLoadedFired();
+            for (int na = 0; na < newlyAdded.Length; na += 1) {
+                UIElement nc = newlyAdded[na];
+                if (nc == null || nc._isDisposedTree) { continue; }
+                nc.ApplyStyleSubtree();
+                nc.RefreshDynamicResourcesRecursive();
+                nc.ApplyTemplateSubtree();
+                if (hostLoaded) { nc.EnsureLoadedSubtree(); }
+                BindingEngine.FlushSubtree(nc);
+            }
+        }
         OnContainersRebuilt();
     }
 
@@ -774,6 +862,11 @@ public class SelectableItem : ContentControl {
         if (propName == "IsSelected") { return DependencyObject.BoxBool(_isSelected); }
         return base.GetPropertyValue(propName);
     }
+
+    protected override void CollectExtraDisposeTargets(UIElement[] q) {
+        base.CollectExtraDisposeTargets(q);
+        _ownerSelector = null;
+    }
 }
 
 public class ListBoxItem : SelectableItem {
@@ -826,10 +919,6 @@ public class Selector : ItemsControl {
     public override string GetTypeName() { return "Selector"; }
 
     public override bool SubscribeBehaviorRoutedEvent(string ev, BehaviorEventSink sink) {
-        if (ev == "SelectionChanged") {
-            SelectionChanged += (object s, SelectionChangedEventArgs e) => { if (sink != null) { sink.OnBehaviorEvent(s, e); } };
-            return true;
-        }
         return base.SubscribeBehaviorRoutedEvent(ev, sink);
     }
 
@@ -886,7 +975,9 @@ public class Selector : ItemsControl {
         BindingEngine.MarkFlushDirty();
         NotifyStateInvalidatedHooks();
         UpdateTriggersAndStates();
-        SelectionChanged(this, new SelectionChangedEventArgs(this, newIdx, oldBox, newBox));
+        var selArgs = new SelectionChangedEventArgs(this, newIdx, oldBox, newBox);
+        SelectionChanged(this, selArgs);
+        RaiseRoutedEvent("SelectionChanged", selArgs);
         BindingEngine.NotifyTargetPropertyChanged(this, "SelectedIndex", DependencyObject.BoxInt(newIdx));
         BindingEngine.NotifyTargetPropertyChanged(this, "SelectedItem", newBox);
         BindingEngine.NotifyTargetPropertyChanged(this, "SelectedItem.Content", GetPropertyValue("SelectedItem.Content"));
@@ -1110,6 +1201,15 @@ public class ListBox : Selector {
 
     public override string GetTypeName() { return "ListBox"; }
 
+    protected override bool IsItemItsOwnContainer(DependencyObject itemBox) {
+        return itemBox is ListBoxItem;
+    }
+
+    protected override void CollectExtraDisposeTargets(UIElement[] q) {
+        base.CollectExtraDisposeTargets(q);
+        _scrollViewer = null;
+    }
+
     public override void OnKeyDown(KeyEventArgs e) {
         base.OnKeyDown(e);
         if (Template != null && EnsureItemsHostPanel() == null) { return; }
@@ -1287,7 +1387,19 @@ public class GridViewHeaderRowPresenter : FrameworkElement {
         return gv != null ? gv.Columns() : new GridViewColumn[0];
     }
 
+    protected override void CollectExtraDisposeTargets(UIElement[] q) {
+        if (_rowGrid != null) {
+            if (!_rowGrid._isDisposedTree) { q.Push(_rowGrid); }
+            _rowGrid = null;
+        }
+        _columnsBox = null;
+        _toolTipBox = null;
+        ColumnHeaderContainerStyle = null;
+        ColumnHeaderTemplate = null;
+    }
+
     public void RebuildHeaders() {
+        if (_isDisposedTree) { return; }
         if (_rowGrid != null) {
             UIElement self = this;
             if (_rowGrid.Parent == self) { RemoveChild(_rowGrid); }
@@ -1380,6 +1492,20 @@ public class GridViewRowPresenter : FrameworkElement {
         RebuildCells();
     }
 
+    protected override void OnDataContextChanged(object oldDc, object newDc) {
+        base.OnDataContextChanged(oldDc, newDc);
+        RebuildCells();
+    }
+
+    protected override void CollectExtraDisposeTargets(UIElement[] q) {
+        if (_rowGrid != null) {
+            if (!_rowGrid._isDisposedTree) { q.Push(_rowGrid); }
+            _rowGrid = null;
+        }
+        _contentBox = null;
+        _columnsBox = null;
+    }
+
     private GridView ResolveGridView() {
         UIElement cur = TemplatedParent != null ? TemplatedParent : Parent;
         while (cur != null) {
@@ -1407,6 +1533,7 @@ public class GridViewRowPresenter : FrameworkElement {
     }
 
     public void RebuildCells() {
+        if (_isDisposedTree) { return; }
         if (_rowGrid != null) {
             UIElement self = this;
             if (_rowGrid.Parent == self) { RemoveChild(_rowGrid); }
@@ -1491,6 +1618,16 @@ public class ListView : ListBox {
 
     public ListView() : base() {}
     public override string GetTypeName() { return "ListView"; }
+
+    protected override bool IsItemItsOwnContainer(DependencyObject itemBox) {
+        return itemBox is ListViewItem;
+    }
+
+    protected override void CollectExtraDisposeTargets(UIElement[] q) {
+        base.CollectExtraDisposeTargets(q);
+        _headerRow = null;
+        _view = null;
+    }
 
     public GridView View {
         get { return _view; }
@@ -1792,6 +1929,25 @@ public class ComboBox : Selector {
         } else {
             _selectionDisplay.SetContentBox(box);
         }
+    }
+
+    protected override bool IsItemItsOwnContainer(DependencyObject itemBox) {
+        return itemBox is ComboBoxItem;
+    }
+
+    protected override void CollectExtraDisposeTargets(UIElement[] q) {
+        base.CollectExtraDisposeTargets(q);
+        if (_dropdownPopup != null) {
+            if (!_dropdownPopup._isDisposedTree) { q.Push(_dropdownPopup); }
+            _dropdownPopup = null;
+        }
+        _headerBox = null;
+        _selectionDisplay = null;
+        _editableTextBox = null;
+        _arrowIcon = null;
+        _dropDownToggle = null;
+        _dropBorder = null;
+        _dropScroll = null;
     }
 
     protected override UIElement CreateContainerForItem() {
@@ -2147,6 +2303,12 @@ public class TabItem : HeaderedContentControl {
 
     public override string GetTypeName() { return "TabItem"; }
 
+    protected override void CollectExtraDisposeTargets(UIElement[] q) {
+        base.CollectExtraDisposeTargets(q);
+        _ownerTabControl = null;
+        _accentUnderline = null;
+    }
+
     public int TabSlotIndex { get { return _tabSlotIndex; } set { _tabSlotIndex = value; } }
     public TabControl OwnerTabControl { get { return _ownerTabControl; } set { _ownerTabControl = value; } }
 
@@ -2275,6 +2437,7 @@ public class TabControl : Selector {
     private Panel _tabStrip;
     private Border _contentFrame;
     private ContentPresenter _selectedContentHost;
+    private DataTemplate _contentTemplate;
 
     public TabControl() : base() {
         Background = Brushes.Transparent();
@@ -2282,6 +2445,15 @@ public class TabControl : Selector {
     }
 
     public override string GetTypeName() { return "TabControl"; }
+
+    public DataTemplate ContentTemplate {
+        get { return _contentTemplate; }
+        set {
+            if (_contentTemplate == value) { return; }
+            _contentTemplate = value;
+            SyncTabSelectionVisuals();
+        }
+    }
 
     private void SyncTabStripOrientation() {
         if (_tabStrip is StackPanel) {
@@ -2359,16 +2531,20 @@ public class TabControl : Selector {
         DependencyObject itemBox = GetItemBoxAt(SelectedIndex);
         if (itemBox is TabItem) {
             TabItem ti = itemBox as TabItem;
-            _selectedContentHost.ContentTemplate = ti.ContentTemplate;
+            _selectedContentHost.ContentTemplate = ti.ContentTemplate != null ? ti.ContentTemplate : _contentTemplate;
             _selectedContentHost.SetContentBox(ti.ContentBox);
         } else {
-            _selectedContentHost.ContentTemplate = ItemTemplate;
+            _selectedContentHost.ContentTemplate = _contentTemplate;
             _selectedContentHost.SetContentBox(itemBox);
         }
     }
 
     public override void RefreshItems() {
         if (_tabStrip == null) { return; }
+        var oldTabs = new UIElement[0];
+        for (int i = 0; i < _activeContainers.Length; i += 1) {
+            oldTabs.Push(_activeContainers[i]);
+        }
         _tabStrip.ClearChildren();
         _activeContainers.Clear();
         int n = ItemCount();
@@ -2379,7 +2555,15 @@ public class TabControl : Selector {
                 ti = box as TabItem;
             } else {
                 ti = new TabItem();
-                ti.SetHeader(DependencyObject.UnboxString(box, "Tab"));
+                ti.DataContextBox = box;
+                if (ItemContainerStyle != null && ti.Style == null) {
+                    ti.Style = ItemContainerStyle;
+                }
+                if (ItemTemplate != null) {
+                    ti.SetHeaderAndTemplate(box, ItemTemplate);
+                } else {
+                    ti.SetHeader(DependencyObject.UnboxString(box, "Tab"));
+                }
                 ti.SetContentBox(box);
             }
             ti.TabSlotIndex = i;
@@ -2387,11 +2571,26 @@ public class TabControl : Selector {
             _activeContainers.Push(ti);
             _tabStrip.AddChild(ti);
         }
+        for (int i = 0; i < oldTabs.Length; i += 1) {
+            UIElement oldT = oldTabs[i];
+            if (oldT != null && !oldT._isDisposedTree && oldT.Parent == null &&
+                !_activeContainers.Contains(oldT) && IndexOfItemBox(oldT) < 0) {
+                oldT.DisposeSubtree();
+            }
+        }
         if (n > 0 && SelectedIndex < 0) {
             SetSelectedIndexInternal(0, true);
         } else {
             SyncTabSelectionVisuals();
         }
+    }
+
+    protected override void CollectExtraDisposeTargets(UIElement[] q) {
+        base.CollectExtraDisposeTargets(q);
+        _tabStrip = null;
+        _contentFrame = null;
+        _selectedContentHost = null;
+        _contentTemplate = null;
     }
 
     public override void OnApplyTemplate() {
@@ -2442,6 +2641,10 @@ public class TabControl : Selector {
     }
 
     public override bool SetPropertyValue(string propName, DependencyObject value) {
+        if (propName == "ContentTemplate" && value is DataTemplate) {
+            ContentTemplate = value as DataTemplate;
+            return true;
+        }
         if (propName == "TabStripPlacement") {
             if (value is BoxedInt) {
                 int tp = (value as BoxedInt).Value;
@@ -2459,6 +2662,7 @@ public class TabControl : Selector {
     }
 
     public override DependencyObject GetPropertyValue(string propName) {
+        if (propName == "ContentTemplate") { return _contentTemplate; }
         if (propName == "TabStripPlacement") { return DependencyObject.BoxInt(EnumConvert.ToInt(_tabStripPlacement)); }
         if (propName == "SelectedContent") {
             return _selectedContentHost != null ? _selectedContentHost.ContentBox : null;

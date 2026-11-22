@@ -48,10 +48,6 @@ public class ButtonBase : ContentControl {
     public override string GetTypeName() { return "ButtonBase"; }
 
     public override bool SubscribeBehaviorRoutedEvent(string ev, BehaviorEventSink sink) {
-        if (ev == "Click") {
-            Click += (object s, RoutedEventArgs e) => { if (sink != null) { sink.OnBehaviorEvent(s, e); } };
-            return true;
-        }
         return base.SubscribeBehaviorRoutedEvent(ev, sink);
     }
 
@@ -90,6 +86,16 @@ public class ButtonBase : ContentControl {
     public void SetCommandParameter(float v) { CommandParameterBox = DependencyObject.BoxFloat(v); }
     public void SetCommandParameter(object v) { CommandParameter = v; }
 
+    protected override void CollectExtraDisposeTargets(UIElement[] q) {
+        base.CollectExtraDisposeTargets(q);
+        if (_command is RelayCommand && _canExecHook != null) {
+            (_command as RelayCommand).UnsubscribeCanExecuteChanged(_canExecHook);
+        }
+        _command = null;
+        _canExecHook = null;
+        _commandParamBox = null;
+    }
+
     protected void SyncCommandCanExecute() {
         if (_command != null) {
             IsEnabled = CommandTriggerHelper.CanExecuteBox(_command, _commandParamBox);
@@ -97,7 +103,9 @@ public class ButtonBase : ContentControl {
     }
 
     protected virtual void OnClick() {
-        Click(this, new RoutedEventArgs("Click", this));
+        var clickArgs = new RoutedEventArgs("Click", this);
+        Click(this, clickArgs);
+        RaiseRoutedEvent("Click", clickArgs);
         CommandTriggerHelper.ExecuteBox(_command, _commandParamBox);
     }
 
@@ -251,9 +259,10 @@ public class RepeatButton : Button {
         if (_routedCommandName.Length == 0) { return; }
         if (_routedCommandName == "Slider.DecreaseLarge" || _routedCommandName == "Slider.IncreaseLarge") {
             Slider sl = FindAncestorSlider();
-            if (sl != null) {
+            if (sl != null && !sl.IsMoveToPointEnabled) {
                 float step = sl.LargeChange > 0.0f ? sl.LargeChange : 1.0f;
-                sl.Value = _routedCommandName == "Slider.DecreaseLarge" ? (sl.Value - step) : (sl.Value + step);
+                float nextVal = _routedCommandName == "Slider.DecreaseLarge" ? (sl.Value - step) : (sl.Value + step);
+                sl.Value = sl.SnapValueToTicks(nextVal);
             }
             return;
         }
@@ -339,18 +348,6 @@ public class ToggleButton : ButtonBase {
     public override string GetTypeName() { return "ToggleButton"; }
 
     public override bool SubscribeBehaviorRoutedEvent(string ev, BehaviorEventSink sink) {
-        if (ev == "Checked") {
-            Checked += (object s, RoutedEventArgs e) => { if (sink != null) { sink.OnBehaviorEvent(s, e); } };
-            return true;
-        }
-        if (ev == "Unchecked") {
-            Unchecked += (object s, RoutedEventArgs e) => { if (sink != null) { sink.OnBehaviorEvent(s, e); } };
-            return true;
-        }
-        if (ev == "Indeterminate") {
-            Indeterminate += (object s, RoutedEventArgs e) => { if (sink != null) { sink.OnBehaviorEvent(s, e); } };
-            return true;
-        }
         return base.SubscribeBehaviorRoutedEvent(ev, sink);
     }
 
@@ -373,10 +370,14 @@ public class ToggleButton : ButtonBase {
             _isIndeterminate = value;
             if (value) {
                 _isChecked = false;
-                Indeterminate(this, new RoutedEventArgs("Indeterminate", this));
             }
             UpdateVisualCheckedState();
             UpdateTriggersAndStates();
+            if (value) {
+                var indArgs = new RoutedEventArgs("Indeterminate", this);
+                Indeterminate(this, indArgs);
+                RaiseRoutedEvent("Indeterminate", indArgs);
+            }
             BindingEngine.NotifyTargetPropertyChanged(this, "IsChecked", _isIndeterminate ? null : DependencyObject.BoxBool(_isChecked));
             BindingEngine.MarkFlushDirty();
         }
@@ -386,9 +387,13 @@ public class ToggleButton : ButtonBase {
         UpdateVisualCheckedState();
         UpdateTriggersAndStates();
         if (_isChecked) {
-            Checked(this, new RoutedEventArgs("Checked", this));
+            var chkArgs = new RoutedEventArgs("Checked", this);
+            Checked(this, chkArgs);
+            RaiseRoutedEvent("Checked", chkArgs);
         } else {
-            Unchecked(this, new RoutedEventArgs("Unchecked", this));
+            var unchkArgs = new RoutedEventArgs("Unchecked", this);
+            Unchecked(this, unchkArgs);
+            RaiseRoutedEvent("Unchecked", unchkArgs);
         }
     }
 
@@ -403,8 +408,13 @@ public class ToggleButton : ButtonBase {
 
     protected virtual void UpdateVisualCheckedState() {
         if (Style == null && Template == null) {
-            Background = new SolidColorBrush(_isChecked ? "#FF3B82F6" : "#FF242B38");
-            BorderBrush = new SolidColorBrush(_isChecked ? "#FF60A5FA" : "#FF3B465C");
+            if (_isIndeterminate) {
+                Background = new SolidColorBrush("#FF334155");
+                BorderBrush = new SolidColorBrush("#FF94A3B8");
+            } else {
+                Background = new SolidColorBrush(_isChecked ? "#FF3B82F6" : "#FF242B38");
+                BorderBrush = new SolidColorBrush(_isChecked ? "#FF60A5FA" : "#FF3B465C");
+            }
         }
     }
 
@@ -528,6 +538,7 @@ public class CheckBox : ToggleButton {
 
 public class RadioButton : ToggleButton {
     private static RadioButton[] _instances;
+    private static bool _disposeHookInstalled = false;
 
     private string _groupName = "";
     private Border _ring;
@@ -554,17 +565,34 @@ public class RadioButton : ToggleButton {
 
     private static void RegisterInstance(RadioButton rb) {
         if (_instances == null) { _instances = new RadioButton[0]; }
+        if (!_disposeHookInstalled) {
+            _disposeHookInstalled = true;
+            UIElement.RegisterDisposeHook(() => { RadioButton.CleanupDisposed(); });
+        }
         for (int i = 0; i < _instances.Length; i += 1) {
             if (_instances[i] == rb) { return; }
         }
         _instances.Push(rb);
     }
 
+    internal static void CleanupDisposed() {
+        if (_instances == null) { return; }
+        for (int i = _instances.Length - 1; i >= 0; i -= 1) {
+            if (_instances[i] == null || _instances[i]._isDisposedTree) {
+                _instances.RemoveAt(i);
+            }
+        }
+    }
+
     private void UncheckGroupPeers() {
         if (_instances == null) { return; }
         UIElement myRoot = RootElement();
-        for (int i = 0; i < _instances.Length; i += 1) {
+        for (int i = _instances.Length - 1; i >= 0; i -= 1) {
             RadioButton other = _instances[i];
+            if (other == null || other._isDisposedTree) {
+                _instances.RemoveAt(i);
+                continue;
+            }
             if (other == this || !other.IsChecked) { continue; }
             bool sameGroup = false;
             if (_groupName.Length > 0) {
@@ -984,6 +1012,35 @@ public class TickBar : CustomDrawElement {
     private float _tickFreq = 1.0f;
     private float _reservedSpace = 0.0f;
     private bool _isDirRev = false;
+    private float[] _ticks;
+    private string _ticksSpec = "";
+
+    internal static float[] ParseTicksString(string raw) {
+        var list = new float[0];
+        if (raw == null || raw.Length == 0) { return list; }
+        string norm = raw.Replace(",", " ");
+        string[] parts = norm.Split(" ");
+        for (int i = 0; i < parts.Length; i += 1) {
+            string tok = parts[i].Trim();
+            if (tok.Length > 0) {
+                float val = ParseUtil.ParseFloat(tok, ParseUtil.NaN());
+                if (ParseUtil.IsFinite(val)) {
+                    list.Push(val);
+                }
+            }
+        }
+        // Insertion sort ascending
+        for (int i = 1; i < list.Length; i += 1) {
+            float key = list[i];
+            int j = i - 1;
+            while (j >= 0 && list[j] > key) {
+                list[j + 1] = list[j];
+                j -= 1;
+            }
+            list[j + 1] = key;
+        }
+        return list;
+    }
 
     public Brush Fill { get { return _fill; } set { _fill = value; InvalidateDraw(); } }
     public string Placement { get { return _placement; } set { _placement = value == null ? "Top" : value; InvalidateDraw(); } }
@@ -992,6 +1049,14 @@ public class TickBar : CustomDrawElement {
     public float TickFrequency { get { return _tickFreq; } set { _tickFreq = value; InvalidateDraw(); } }
     public float ReservedSpace { get { return _reservedSpace; } set { _reservedSpace = value; InvalidateDraw(); } }
     public bool IsDirectionReversed { get { return _isDirRev; } set { _isDirRev = value; InvalidateDraw(); } }
+    public string Ticks {
+        get { return _ticksSpec; }
+        set {
+            _ticksSpec = value == null ? "" : value.Trim();
+            _ticks = ParseTicksString(_ticksSpec);
+            InvalidateDraw();
+        }
+    }
 
     public TickBar() : base() {
         IsHitTestVisible = false;
@@ -1008,6 +1073,7 @@ public class TickBar : CustomDrawElement {
         bool rev = _isDirRev;
         float resSpace = _reservedSpace;
         Brush effFill = _fill;
+        float[] customTicks = _ticks;
         bool vertical = (_placement == "Left" || _placement == "Right");
         if (TemplatedParent is Slider) {
             Slider sl = TemplatedParent as Slider;
@@ -1017,17 +1083,50 @@ public class TickBar : CustomDrawElement {
             rev = sl.IsDirectionReversed;
             vertical = (sl.Orientation == Orientation.Vertical);
             if (effFill == null) { effFill = sl.Foreground; }
-            if (resSpace <= 0.0f) { resSpace = 10.0f; }
+            float[] slTicks = sl.TicksArray();
+            if ((customTicks == null || customTicks.Length == 0) && slTicks != null && slTicks.Length > 0) {
+                customTicks = slTicks;
+            }
+            if (resSpace <= 0.0f) {
+                resSpace = sl.EffectiveThumbSpan();
+            }
         }
         uint col = effFill != null ? effFill.ResolveRgba() : ParseUtil.PackArgb(200u, 120u, 130u, 140u);
         if ((col / 16777216u) % 256u == 0u) { return; }
         float span = maxV - minV;
         if (span <= 0.0001f) { span = 1.0f; }
+        if (span != span) { return; }
+        float halfRes = resSpace * 0.5f;
+
+        if (customTicks != null && customTicks.Length > 0) {
+            if (!vertical) {
+                float usable = Math.Maxf(1.0f, w - resSpace);
+                for (int i = 0; i < customTicks.Length; i += 1) {
+                    float tv = customTicks[i];
+                    if (tv < minV - 0.0001f || tv > maxV + 0.0001f) { continue; }
+                    float t = Math.Clampf((tv - minV) / span, 0.0f, 1.0f);
+                    if (rev) { t = 1.0f - t; }
+                    float x = halfRes + t * usable;
+                    dc.DrawLine(x, 0.0f, x, h, col, 1.0f);
+                }
+            } else {
+                float usable = Math.Maxf(1.0f, h - resSpace);
+                for (int i = 0; i < customTicks.Length; i += 1) {
+                    float tv = customTicks[i];
+                    if (tv < minV - 0.0001f || tv > maxV + 0.0001f) { continue; }
+                    float t = Math.Clampf((tv - minV) / span, 0.0f, 1.0f);
+                    if (!rev) { t = 1.0f - t; }
+                    float y = halfRes + t * usable;
+                    dc.DrawLine(0.0f, y, w, y, col, 1.0f);
+                }
+            }
+            return;
+        }
+
         if (freq <= 0.0001f) { freq = span / 10.0f; }
-        if (span != span || freq != freq) { return; }
+        if (freq != freq) { return; }
         int maxTicks = 200;
         if (span / freq > (float)maxTicks) { freq = span / (float)maxTicks; }
-        float halfRes = resSpace * 0.5f;
         if (!vertical) {
             float usable = Math.Maxf(1.0f, w - resSpace);
             float y0 = 0.0f;
@@ -1067,6 +1166,7 @@ public class TickBar : CustomDrawElement {
         if (propName == "TickFrequency") { TickFrequency = DependencyObject.UnboxFloat(value, 1.0f); return true; }
         if (propName == "ReservedSpace") { ReservedSpace = DependencyObject.UnboxFloat(value, 0.0f); return true; }
         if (propName == "IsDirectionReversed") { IsDirectionReversed = DependencyObject.UnboxBool(value, false); return true; }
+        if (propName == "Ticks") { Ticks = DependencyObject.UnboxString(value, ""); return true; }
         return base.SetPropertyValue(propName, value);
     }
     public override DependencyObject GetPropertyValue(string propName) {
@@ -1077,6 +1177,7 @@ public class TickBar : CustomDrawElement {
         if (propName == "TickFrequency") { return DependencyObject.BoxFloat(_tickFreq); }
         if (propName == "ReservedSpace") { return DependencyObject.BoxFloat(_reservedSpace); }
         if (propName == "IsDirectionReversed") { return DependencyObject.BoxBool(_isDirRev); }
+        if (propName == "Ticks") { return DependencyObject.BoxString(_ticksSpec); }
         return base.GetPropertyValue(propName);
     }
 }
@@ -1168,8 +1269,61 @@ public class Slider : RangeBase {
     private string _tickPlacement = "None";
     private bool _isDirectionReversed = false;
     private float _lastTickMin = 0.0f;
-    private float _lastTickMax = 100.0f;
+    private float _lastTickMax = 10.0f;
+    private float[] _ticks;
+    private string _ticksSpec = "";
+    private float _dragRawValue = 0.0f;
     public bool IsSnapToTickEnabled { get; set; } = false;
+    public bool IsMoveToPointEnabled { get; set; } = false;
+
+    public string Ticks {
+        get { return _ticksSpec; }
+        set {
+            string next = value == null ? "" : value.Trim();
+            if (_ticksSpec == next) { return; }
+            _ticksSpec = next;
+            _ticks = TickBar.ParseTicksString(_ticksSpec);
+            InvalidateSubtreeTickBars(TemplateRoot());
+        }
+    }
+
+    internal float[] TicksArray() { return _ticks; }
+
+    internal float EffectiveThumbSpan() {
+        if (_partTrack != null && _partTrack.Thumb != null) {
+            float ts = _orientation == Orientation.Horizontal
+                ? _partTrack.Thumb.ActualWidth
+                : _partTrack.Thumb.ActualHeight;
+            if (ts > 0.0f) { return ts; }
+        }
+        return 4.0f;
+    }
+
+    public float SnapValueToTicks(float raw) {
+        float clamped = Math.Clampf(raw, Minimum, Maximum);
+        if (!IsSnapToTickEnabled) { return clamped; }
+        if (_ticks != null && _ticks.Length > 0) {
+            float best = Minimum;
+            float bestDist = Math.Absf(clamped - Minimum);
+            float maxDist = Math.Absf(clamped - Maximum);
+            if (maxDist < bestDist) { best = Maximum; bestDist = maxDist; }
+            for (int i = 0; i < _ticks.Length; i += 1) {
+                float tv = Math.Clampf(_ticks[i], Minimum, Maximum);
+                float d = Math.Absf(clamped - tv);
+                if (d < bestDist) {
+                    bestDist = d;
+                    best = tv;
+                }
+            }
+            return best;
+        }
+        if (_tickFrequency > 0.0001f) {
+            float steps = (clamped - Minimum) / _tickFrequency;
+            int snapped = (int)(steps + 0.5f);
+            return Math.Clampf(Minimum + (float)snapped * _tickFrequency, Minimum, Maximum);
+        }
+        return clamped;
+    }
     public bool IsDirectionReversed {
         get { return _isDirectionReversed; }
         set {
@@ -1200,6 +1354,9 @@ public class Slider : RangeBase {
 
     public Slider() : base() {
         Focusable = true;
+        Maximum = 10.0f;
+        LargeChange = 1.0f;
+        SmallChange = 0.1f;
         RegisterDefaultSlider(this);
     }
     public Slider(float min, float max, float val) : this() {
@@ -1308,26 +1465,39 @@ public class Slider : RangeBase {
             if (_partTrack != null) {
                 SyncPartTrack();
                 if (_partTrack.Thumb != null) {
+                    _partTrack.Thumb.DragStarted += (object s, DragStartedEventArgs e) => {
+                        _dragRawValue = Value;
+                    };
                     _partTrack.Thumb.DragDelta += (object s, DragDeltaEventArgs e) => {
-                        float w = Math.Maxf(1.0f, ActualWidth);
-                        float h = Math.Maxf(1.0f, ActualHeight);
+                        float tw = (_partTrack != null && _partTrack.ActualWidth > 0.0f) ? _partTrack.ActualWidth : ActualWidth;
+                        float th = (_partTrack != null && _partTrack.ActualHeight > 0.0f) ? _partTrack.ActualHeight : ActualHeight;
+                        float thumbSpan = EffectiveThumbSpan();
+                        float usableW = Math.Maxf(1.0f, tw - thumbSpan);
+                        float usableH = Math.Maxf(1.0f, th - thumbSpan);
                         float span = Maximum - Minimum;
                         if (span <= 0.00001f) { return; }
                         float deltaFrac = _orientation == Orientation.Horizontal
-                            ? (e.HorizontalChange / w)
-                            : (-e.VerticalChange / h);
+                            ? (e.HorizontalChange / usableW)
+                            : (-e.VerticalChange / usableH);
                         if (IsDirectionReversed) { deltaFrac = -deltaFrac; }
-                        Value = Value + deltaFrac * span;
+                        _dragRawValue = Math.Clampf(_dragRawValue + deltaFrac * span, Minimum, Maximum);
+                        Value = SnapValueToTicks(_dragRawValue);
                     };
                 }
                 if (_partTrack.DecreaseRepeatButton != null) {
-                    _partTrack.DecreaseRepeatButton.MouseLeftButtonDown += (object s, MouseButtonEventArgs e) => {
-                        UpdateFromPointer(e.X, e.Y);
+                    _partTrack.DecreaseRepeatButton.PreviewMouseLeftButtonDown += (object s, MouseButtonEventArgs e) => {
+                        if (IsMoveToPointEnabled) {
+                            UpdateFromPointer(e.X, e.Y);
+                            e.Handled = true;
+                        }
                     };
                 }
                 if (_partTrack.IncreaseRepeatButton != null) {
-                    _partTrack.IncreaseRepeatButton.MouseLeftButtonDown += (object s, MouseButtonEventArgs e) => {
-                        UpdateFromPointer(e.X, e.Y);
+                    _partTrack.IncreaseRepeatButton.PreviewMouseLeftButtonDown += (object s, MouseButtonEventArgs e) => {
+                        if (IsMoveToPointEnabled) {
+                            UpdateFromPointer(e.X, e.Y);
+                            e.Handled = true;
+                        }
                     };
                 }
             }
@@ -1414,12 +1584,7 @@ public class Slider : RangeBase {
         }
         if (IsDirectionReversed) { frac = 1.0f - frac; }
         float raw = Minimum + frac * (Maximum - Minimum);
-        if (IsSnapToTickEnabled && _tickFrequency > 0.0001f) {
-            float steps = (raw - Minimum) / _tickFrequency;
-            int snapped = (int)(steps + 0.5f);
-            raw = Minimum + (float)snapped * _tickFrequency;
-        }
-        Value = raw;
+        Value = SnapValueToTicks(raw);
     }
 
     protected override void OnVisualStatePropertyChanged() {
@@ -1456,11 +1621,50 @@ public class Slider : RangeBase {
         }
     }
 
+    private float StepValueWithTickSnap(float current, float delta) {
+        if (!IsSnapToTickEnabled) {
+            return Math.Clampf(current + delta, Minimum, Maximum);
+        }
+        float snapped = SnapValueToTicks(current + delta);
+        if ((delta > 0.0f && snapped > current + 0.0001f) ||
+            (delta < 0.0f && snapped < current - 0.0001f)) {
+            return snapped;
+        }
+        if (_ticks != null && _ticks.Length > 0) {
+            if (delta > 0.0f) {
+                for (int i = 0; i < _ticks.Length; i += 1) {
+                    float tv = Math.Clampf(_ticks[i], Minimum, Maximum);
+                    if (tv > current + 0.0001f) { return tv; }
+                }
+                return Maximum;
+            }
+            for (int i = _ticks.Length - 1; i >= 0; i -= 1) {
+                float tv = Math.Clampf(_ticks[i], Minimum, Maximum);
+                if (tv < current - 0.0001f) { return tv; }
+            }
+            return Minimum;
+        }
+        if (_tickFrequency > 0.0001f) {
+            float steps = Math.Maxf(0.0f, (current - Minimum) / _tickFrequency);
+            if (delta > 0.0f) {
+                int nextStep = (int)(steps + 0.0001f) + 1;
+                return Math.Clampf(Minimum + (float)nextStep * _tickFrequency, Minimum, Maximum);
+            }
+            int k = (int)steps;
+            float prev = Minimum + (float)k * _tickFrequency;
+            if (prev >= current - 0.0001f && k > 0) {
+                prev = Minimum + (float)(k - 1) * _tickFrequency;
+            }
+            return Math.Clampf(prev, Minimum, Maximum);
+        }
+        return Math.Clampf(current + delta, Minimum, Maximum);
+    }
+
     public override void OnKeyDown(KeyEventArgs e) {
         base.OnKeyDown(e);
         if (!IsEnabled) { return; }
-        if (e.Key == KeyCode.Left || e.Key == KeyCode.Down) { Value = Value - SmallChange; e.Handled = true; }
-        else if (e.Key == KeyCode.Right || e.Key == KeyCode.Up) { Value = Value + SmallChange; e.Handled = true; }
+        if (e.Key == KeyCode.Left || e.Key == KeyCode.Down) { Value = StepValueWithTickSnap(Value, -SmallChange); e.Handled = true; }
+        else if (e.Key == KeyCode.Right || e.Key == KeyCode.Up) { Value = StepValueWithTickSnap(Value, SmallChange); e.Handled = true; }
         else if (e.Key == KeyCode.Home) { Value = Minimum; e.Handled = true; }
         else if (e.Key == KeyCode.End) { Value = Maximum; e.Handled = true; }
     }
@@ -1505,6 +1709,8 @@ public class Slider : RangeBase {
     public override bool SetPropertyValue(string propName, DependencyObject value) {
         if (propName == "IsDirectionReversed") { IsDirectionReversed = DependencyObject.UnboxBool(value, false); return true; }
         if (propName == "IsSnapToTickEnabled") { IsSnapToTickEnabled = DependencyObject.UnboxBool(value, false); return true; }
+        if (propName == "IsMoveToPointEnabled") { IsMoveToPointEnabled = DependencyObject.UnboxBool(value, false); return true; }
+        if (propName == "Ticks") { Ticks = DependencyObject.UnboxString(value, ""); return true; }
         if (propName == "TickFrequency") { TickFrequency = DependencyObject.UnboxFloat(value, 1.0f); return true; }
         if (propName == "TickPlacement") {
             if (value is BoxedInt) {
@@ -1530,6 +1736,8 @@ public class Slider : RangeBase {
     public override DependencyObject GetPropertyValue(string propName) {
         if (propName == "IsDirectionReversed") { return DependencyObject.BoxBool(IsDirectionReversed); }
         if (propName == "IsSnapToTickEnabled") { return DependencyObject.BoxBool(IsSnapToTickEnabled); }
+        if (propName == "IsMoveToPointEnabled") { return DependencyObject.BoxBool(IsMoveToPointEnabled); }
+        if (propName == "Ticks") { return DependencyObject.BoxString(_ticksSpec); }
         if (propName == "TickFrequency") { return DependencyObject.BoxFloat(_tickFrequency); }
         if (propName == "TickPlacement") { return DependencyObject.BoxString(_tickPlacement); }
         if (propName == "Orientation") { return DependencyObject.BoxInt(EnumConvert.ToInt(_orientation)); }
@@ -2079,6 +2287,13 @@ public class ScrollViewer : ContentControl {
     }
 
     public override string GetTypeName() { return "ScrollViewer"; }
+
+    protected override void CollectExtraDisposeTargets(UIElement[] q) {
+        base.CollectExtraDisposeTargets(q);
+        _viewport = null;
+        _vBar = null;
+        _hBar = null;
+    }
 
     public bool CanContentScroll {
         get { return _canContentScroll; }

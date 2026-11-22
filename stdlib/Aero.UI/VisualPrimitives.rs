@@ -601,6 +601,22 @@ public class TextBlock : FrameworkElement {
         if (propName == "StrokeThickness") { return DependencyObject.BoxFloat(StrokeThickness); }
         return base.GetPropertyValue(propName);
     }
+
+    protected override void CollectExtraDisposeTargets(UIElement[] q) {
+        base.CollectExtraDisposeTargets(q);
+        if (_inlines != null) {
+            for (int i = 0; i < _inlines.Length; i += 1) {
+                if (_inlines[i] != null) {
+                    _inlines[i].OwnerTextBlock = null;
+                    _inlines[i]._ownBindingsBox = null;
+                    _inlines[i].Foreground = null;
+                }
+            }
+            _inlines.Clear();
+        }
+        _foreground = null;
+        Stroke = null;
+    }
 }
 
 // ============================================================================
@@ -718,6 +734,7 @@ public class Shape : FrameworkElement {
             _fillOpacity = value != null ? Math.Clampf(value.Opacity, 0.0f, 1.0f) : 1.0f;
             SyncVectorShape();
             SyncVectorBrushOpacity();
+            SyncInteractiveFlags();
         }
     }
     public Brush Stroke {
@@ -728,11 +745,12 @@ public class Shape : FrameworkElement {
             _strokeOpacity = value != null ? Math.Clampf(value.Opacity, 0.0f, 1.0f) : 1.0f;
             SyncVectorShape();
             SyncVectorBrushOpacity();
+            SyncInteractiveFlags();
         }
     }
     public float StrokeThickness {
         get { return _strokeThickness; }
-        set { _strokeThickness = value >= 0.0f ? value : 0.0f; SyncVectorShape(); }
+        set { _strokeThickness = value >= 0.0f ? value : 0.0f; SyncVectorShape(); SyncInteractiveFlags(); }
     }
     public Stretch Stretch {
         get { return _stretch; }

@@ -141,6 +141,7 @@ bool VisualWorld::DestroyNode(VisualNodeId id) {
     if (liveCount_ > 0u) {
         --liveCount_;
     }
+    ++destroyedCount_;
     structureDirty_ = true;
     ++structureVersion_;
     anyDirty_ = true;

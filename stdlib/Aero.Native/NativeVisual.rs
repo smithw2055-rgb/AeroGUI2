@@ -216,3 +216,14 @@ public string Host_ReadTextAsset(string uri) { return ""; }
 public int Utf8_CodePointCount(string text) { return 0; }
 public string Utf8_SliceCodePoints(string text, int startCp, int countCp) { return ""; }
 public string Utf8_FromCodePoint(int cp) { return ""; }
+
+// Stateless Native XML DOM Parser Intrinsics (no caching; cleared immediately after parse)
+public int Xml_ParseDocument(string xmlText) { return -1; }
+int __rs_native_Xml_ClearDocument() { return 0; }
+public void Xml_ClearDocument() { __rs_native_Xml_ClearDocument(); return; }
+public int Xml_NodeMeta(int nodeId) { return 0; }
+public string Xml_NodeRawName(int nodeId) { return ""; }
+public string Xml_NodeLocalName(int nodeId) { return ""; }
+public string Xml_NodeText(int nodeId) { return ""; }
+public string Xml_AttrName(int nodeId, int attrIdx) { return ""; }
+public string Xml_AttrValue(int nodeId, int attrIdx) { return ""; }

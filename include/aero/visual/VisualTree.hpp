@@ -699,6 +699,7 @@ public:
     void RefreshScriptOwnerPins() noexcept;
 
     [[nodiscard]] std::size_t LiveNodeCount() const noexcept { return liveCount_; }
+    [[nodiscard]] std::uint64_t DestroyedNodeCount() const noexcept { return destroyedCount_; }
     [[nodiscard]] std::size_t ArenaSlotCount() const noexcept { return nodes_.size(); }
     [[nodiscard]] VisualNode* NodeAtSlot(std::size_t slot) noexcept;
     [[nodiscard]] const VisualNode* NodeAtSlot(std::size_t slot) const noexcept;
@@ -720,6 +721,7 @@ private:
     std::vector<std::uint32_t> freeIndices_;
     VisualNodeId rootId_{};
     std::size_t liveCount_ = 0u;
+    std::uint64_t destroyedCount_ = 0u;
     std::uint64_t worldInstanceId_ = 0u;
     std::uint64_t structureVersion_ = 1u;
     bool anyDirty_ = false;

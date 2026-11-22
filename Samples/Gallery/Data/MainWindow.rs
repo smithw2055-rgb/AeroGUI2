@@ -283,6 +283,7 @@ public partial class MainWindow : Window
     private string _activeThemeBorder = "#FFD0D7DE";
     private string _activeAccent = "#FF1098DF";
     private ResourceDictionary _sampleThemeResources = null;
+    private string _appliedThemeKey = "";
 
     public MainWindow()
     {
@@ -320,7 +321,10 @@ public partial class MainWindow : Window
 
     public void OnInitialized()
     {
-        this.ApplyTheme();
+        if (this._sampleThemeResources == null)
+        {
+            this.ApplyTheme();
+        }
     }
 
     public void SetUiScale(float scale)
@@ -381,6 +385,26 @@ public partial class MainWindow : Window
             return false;
         }
 
+        if (this.SampleContainer1 != null)
+        {
+            UIElement old1 = this.SampleContainer1.Content as UIElement;
+            if (old1 != null)
+            {
+                this.SampleContainer1.SetContentBox(null);
+                old1.DisposeSubtree();
+            }
+        }
+        if (this.SampleContainer2 != null)
+        {
+            UIElement old2 = this.SampleContainer2.Content as UIElement;
+            if (old2 != null)
+            {
+                this.SampleContainer2.SetContentBox(null);
+                old2.DisposeSubtree();
+            }
+        }
+        BindingEngine.Flush();
+
         ResourceDictionary sampleRes = this._sampleThemeResources != null ? this._sampleThemeResources : this.Resources;
         UIElement preview = XamlReader.LoadUri(xamlUri, sampleRes);
         bool loadedReal = (preview != null);
@@ -399,19 +423,17 @@ public partial class MainWindow : Window
         ContentControl activeContainer = useFirst ? this.SampleContainer1 : this.SampleContainer2;
         ContentControl inactiveContainer = useFirst ? this.SampleContainer2 : this.SampleContainer1;
 
-        if (activeContainer != null)
-        {
-            activeContainer.SetContent(preview);
-            activeContainer.Visibility = Visibility.Visible;
-            preview.ApplyTemplateSubtree();
-            preview.RefreshDynamicResourcesRecursive();
-            BindingEngine.FlushSubtree(preview);
-            BindingEngine.FlushSubtree(activeContainer);
-            preview.EnsureLoadedSubtree();
-        }
         if (inactiveContainer != null)
         {
             inactiveContainer.Visibility = Visibility.Collapsed;
+        }
+        if (activeContainer != null)
+        {
+            activeContainer.Visibility = Visibility.Visible;
+            activeContainer.SetContent(preview);
+            preview.ApplyTemplateSubtree();
+            BindingEngine.FlushSubtree(preview);
+            preview.EnsureLoadedSubtree();
         }
 
         this.ActiveContainerIndex = useFirst ? 1 : 2;
@@ -465,6 +487,12 @@ public partial class MainWindow : Window
             safeColor = colorName;
         }
         string safeAccent = (accentName != null && accentName != "") ? accentName : "Blue";
+        string nextKey = safeColor + "|" + safeAccent;
+        if (this._sampleThemeResources != null && this._appliedThemeKey == nextKey)
+        {
+            return true;
+        }
+        this._appliedThemeKey = nextKey;
         bool isDark = (safeColor == "Dark");
 
         ResourceDictionary themeDict = XamlReader.LoadResourceDictionary("Theme/NoesisTheme." + safeColor + safeAccent + ".xaml");

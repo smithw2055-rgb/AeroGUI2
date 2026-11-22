@@ -1226,7 +1226,10 @@ public class DependencyObject {
     public static int UnboxInt(DependencyObject box, int fallback = 0) {
         if (box == null) { return fallback; }
         if (box is BoxedInt) { return (box as BoxedInt).Value; }
-        if (box is BoxedFloat) { return (int)(box as BoxedFloat).Value; }
+        if (box is BoxedFloat) {
+            float fv = (box as BoxedFloat).Value;
+            return (int)(fv >= 0.0f ? (fv + 0.5f) : (fv - 0.5f));
+        }
         if (box is BoxedString) { return ParseUtil.ParseInt((box as BoxedString).Value, fallback); }
         return fallback;
     }
@@ -2298,6 +2301,7 @@ public partial class UIElement : DependencyObject {
     private DependencyObject _tag;
     private DependencyObject _toolTip;
     private Func<object, UIElement> _toolTipFactory;
+    internal UIElement _contextMenu;
     private DependencyObject _explicitDataContext;
     private DependencyObject _inheritedDataContext;
     private UIElement _templatedParent;
@@ -2334,6 +2338,7 @@ public partial class UIElement : DependencyObject {
     private bool _isPressed = false;
     private bool _clipToBounds = false;
     private int _zIndex = 0;
+    private int _alternationIndex = 0;
 
     private int _gridRow = 0;
     private int _gridCol = 0;
@@ -2392,7 +2397,9 @@ public partial class UIElement : DependencyObject {
     private string _locSource = "";
     private string _flowDirection = "LeftToRight";
     private bool _hasExplicitFlowDirection = false;
-    private Style _appliedStyle;
+    internal Style _appliedStyle;
+    internal bool _hasTemplateResources = false;
+    internal bool _hasTemplateAmbientResources = false;
     public string _internalRootName = "";
     internal bool _isDisposedTree = false;
     private string[] _dynPropKeys;
@@ -2518,6 +2525,7 @@ public partial class UIElement : DependencyObject {
             if (same) { return; }
             _tag = next;
             NotifyBoundPropertyChanged("Tag", _tag);
+            UpdateTriggersAndStates();
         }
     }
     public bool HasToolTip {
@@ -2730,7 +2738,7 @@ public partial class UIElement : DependencyObject {
         while (idx < q.Length) {
             UIElement cur = q[idx];
             idx += 1;
-            if (cur == null) { continue; }
+            if (cur == null || cur._isDisposedTree) { continue; }
             if (cur._dynResProps != null) {
                 for (int i = 0; i < cur._dynResProps.Length; i += 1) {
                     cur.ApplyDynamicResourceAt(i);
@@ -2745,7 +2753,7 @@ public partial class UIElement : DependencyObject {
     }
 
     public void ApplyStyleInternal() {
-        if (_isStyleApplying) { return; }
+        if (_isStyleApplying || _isDisposedTree) { return; }
         _isStyleApplying = true;
         Style active = _style;
         if (active == null) {
@@ -2774,14 +2782,19 @@ public partial class UIElement : DependencyObject {
         while (idx < q.Length) {
             UIElement cur = q[idx];
             idx += 1;
-            if (cur == null) { continue; }
+            if (cur == null || cur._isDisposedTree) { continue; }
+            UIElement prevTpl = (cur is Control) ? (cur as Control).TemplateRoot() : null;
+            cur.ApplyStyleInternal();
+            if (cur._isDisposedTree) { continue; }
+            UIElement nextTpl = (cur is Control) ? (cur as Control).TemplateRoot() : null;
             if (cur._children != null) {
                 int preCount = cur._children.Length;
                 for (int i = 0; i < preCount; i += 1) {
-                    q.Push(cur._children[i]);
+                    UIElement ch = cur._children[i];
+                    if (nextTpl != null && nextTpl != prevTpl && ch == nextTpl) { continue; }
+                    q.Push(ch);
                 }
             }
-            cur.ApplyStyleInternal();
         }
     }
 
@@ -2792,12 +2805,16 @@ public partial class UIElement : DependencyObject {
         while (idx < q.Length) {
             UIElement cur = q[idx];
             idx += 1;
-            if (cur == null) { continue; }
-            cur.ApplyStyleInternal();
+            if (cur == null || cur._isDisposedTree) { continue; }
+            if (cur._appliedStyle == null || (cur._style != null && cur._style != cur._appliedStyle)) {
+                cur.ApplyStyleInternal();
+            }
+            if (cur._isDisposedTree) { continue; }
             if (cur is Control) {
                 Control ctrl = cur as Control;
                 if (!ctrl.IsTemplateApplied()) { ctrl.ApplyTemplate(); }
             }
+            if (cur._isDisposedTree) { continue; }
             if (cur._children != null) {
                 for (int i = 0; i < cur._children.Length; i += 1) {
                     q.Push(cur._children[i]);
@@ -2930,6 +2947,9 @@ public partial class UIElement : DependencyObject {
             NotifyBoundPropertyChanged("IsEnabled", DependencyObject.BoxBool(_isEnabled));
         }
     }
+    private bool _effectiveHitTestVisible = true;
+    internal static int _xamlBuildDepth = 0;
+
     public bool IsHitTestVisible {
         get { return _isHitTestVisible; }
         set {
@@ -2940,7 +2960,7 @@ public partial class UIElement : DependencyObject {
         }
     }
     public bool EffectiveIsHitTestVisible() {
-        return _isHitTestVisible && (_parent == null || _parent.EffectiveIsHitTestVisible());
+        return _effectiveHitTestVisible;
     }
     protected virtual bool IsSelfHitTestSolid() {
         if (_visualKind == VisualKind.Text || _visualKind == VisualKind.Image || _visualKind == VisualKind.CanvasDraw) {
@@ -2972,6 +2992,17 @@ public partial class UIElement : DependencyObject {
             NotifyBoundPropertyChanged("ClipToBounds", DependencyObject.BoxBool(_clipToBounds));
         }
     }
+    public int AlternationIndex {
+        get { return _alternationIndex; }
+    }
+    internal void SetAlternationIndex(int idx) {
+        if (_alternationIndex == idx) { return; }
+        _alternationIndex = idx;
+        DependencyObject boxed = DependencyObject.BoxInt(_alternationIndex);
+        NotifyBoundPropertyChanged("ItemsControl.AlternationIndex", boxed);
+        NotifyBoundPropertyChanged("AlternationIndex", boxed);
+    }
+
     public int ZIndex {
         get { return _zIndex; }
         set {
@@ -3016,9 +3047,26 @@ public partial class UIElement : DependencyObject {
     public float Translation3DZ { get { return _trans3DZ; } set { if (_trans3DZ == value) { return; } _trans3DZ = value; SyncTransform3D(); NotifyBoundPropertyChanged("Translation3DZ", DependencyObject.BoxFloat(_trans3DZ)); } }
     public float CameraDistance { get { return _camDist; } set { if (_camDist == value) { return; } _camDist = value; SyncTransform3D(); NotifyBoundPropertyChanged("CameraDistance", DependencyObject.BoxFloat(_camDist)); } }
 
+    private EffectChangeHook _effectHook;
+
     public Effect Effect {
         get { return _effect; }
-        set { if (_effect == value) { return; } _effect = value; SyncEffect(); NotifyBoundPropertyChanged("Effect", _effect); }
+        set {
+            if (_effect == value) { return; }
+            if (_effect != null && _effectHook != null) {
+                _effect.RemoveChangedListener(_effectHook);
+                _effectHook = null;
+            }
+            _effect = value;
+            if (_effect != null) {
+                Effect effRef = _effect;
+                _effectHook = _effect.AddChangedListener(() => {
+                    if (_effect == effRef && !_isDisposedTree) { SyncEffect(); }
+                });
+            }
+            SyncEffect();
+            NotifyBoundPropertyChanged("Effect", _effect);
+        }
     }
     public Brush OpacityMask {
         get { return _opacityMask; }
@@ -3310,8 +3358,10 @@ public partial class UIElement : DependencyObject {
         }
     }
     protected void SyncInteractiveFlags() {
+        bool parentEff = _parent == null ? true : _parent._effectiveHitTestVisible;
+        _effectiveHitTestVisible = _isHitTestVisible && parentEff;
         if (_hasNative) {
-            bool effHit = EffectiveIsHitTestVisible() && IsSelfHitTestSolid();
+            bool effHit = _effectiveHitTestVisible && IsSelfHitTestSolid();
             Visual_SetInteractiveFlags(__nativeHandle, _isEnabled, effHit, _focusable);
         }
     }
@@ -3553,8 +3603,21 @@ public partial class UIElement : DependencyObject {
     }
 
     protected void OnChildAttached(UIElement child) {
-        if (!EffectiveIsHitTestVisible()) {
+        bool wantEffHit = child._isHitTestVisible && _effectiveHitTestVisible;
+        if (child._effectiveHitTestVisible != wantEffHit) {
             child.SyncInteractiveFlagsSubtree();
+        }
+        if ((_xamlBuildDepth > 0 && !_loadedFired) || _suppressChildAutoStyle) {
+            DependencyObject effDc = EffectiveDataContextBox();
+            if (effDc != null) { child.ReceiveInheritedDataContext(effDc); }
+            float eFs = EffectiveTextFontSizeOrZero();
+            string eFf = EffectiveTextFontFamilyOrEmpty();
+            string eFw = EffectiveTextFontWeightOrEmpty();
+            Brush eFg = EffectiveTextForeground();
+            if (eFs > 0.0f || eFf.Length > 0 || eFw.Length > 0 || eFg != null) {
+                child.ReceiveInheritedTypography(eFs, eFf, eFw, eFg);
+            }
+            return;
         }
         if (_parent == null && !_loadedFired && _resources == null && _locResources == null &&
             _explicitDataContext == null && _inheritedDataContext == null &&
@@ -3562,7 +3625,6 @@ public partial class UIElement : DependencyObject {
             _explicitFontWeight.Length == 0 && _explicitTextForeground == null) {
             return;
         }
-        child.SyncInteractiveFlagsSubtree();
         child.ReceiveInheritedDataContext(EffectiveDataContextBox());
         child.ReceiveInheritedTypography(
             EffectiveTextFontSizeOrZero(),
@@ -3585,6 +3647,9 @@ public partial class UIElement : DependencyObject {
         if (idx < 0) { return; }
         _children.RemoveAt(idx);
         child._parent = null;
+        if (child._effectiveHitTestVisible != child._isHitTestVisible) {
+            child.SyncInteractiveFlagsSubtree();
+        }
         if (_hasNative && child._hasNative) {
             Visual_RemoveChild(__nativeHandle, child.__nativeHandle);
         }
@@ -3594,8 +3659,12 @@ public partial class UIElement : DependencyObject {
     public virtual void ClearChildren() {
         if (_children != null) {
             for (int i = 0; i < _children.Length; i += 1) {
-                _children[i]._parent = null;
-                _children[i].NotifyUnloadedSubtree();
+                UIElement ch = _children[i];
+                ch._parent = null;
+                if (ch._effectiveHitTestVisible != ch._isHitTestVisible) {
+                    ch.SyncInteractiveFlagsSubtree();
+                }
+                ch.NotifyUnloadedSubtree();
             }
             _children.Clear();
         }
@@ -3605,6 +3674,7 @@ public partial class UIElement : DependencyObject {
     }
 
     internal bool _suppressChildAutoLoaded = false;
+    internal bool _suppressChildAutoStyle = false;
     internal bool _loadingSelf = false;
     private int _keyboardTabIndex = 0;
     public int TabIndex {
@@ -3615,10 +3685,15 @@ public partial class UIElement : DependencyObject {
     internal bool HasLoadedFired() { return _loadedFired; }
 
     private void EnsureLoadedSelf() {
+        if (_isDisposedTree) { return; }
         if (!_loadedFired) {
             _loadedFired = true;
             _loadingSelf = true;
-            ApplyStyleInternal();
+            if (_appliedStyle == null || (_style != null && _style != _appliedStyle)) {
+                ApplyStyleInternal();
+            } else {
+                _appliedStyle.EvaluateTriggers(this);
+            }
             OnLoaded();
             _loadingSelf = false;
             Loaded(this, new RoutedEventArgs("Loaded", this));
@@ -3639,7 +3714,7 @@ public partial class UIElement : DependencyObject {
         while (idx < q.Length) {
             UIElement cur = q[idx];
             idx += 1;
-            if (cur == null) { continue; }
+            if (cur == null || cur._isDisposedTree) { continue; }
             cur.EnsureLoadedSelf();
             if (cur._children != null) {
                 int postCount = cur._children.Length;
@@ -3693,6 +3768,8 @@ public partial class UIElement : DependencyObject {
         _disposeHooks.Push(hook);
     }
 
+    protected virtual void CollectExtraDisposeTargets(UIElement[] q) {}
+
     public void DisposeSubtree() {
         var q = new UIElement[0];
         q.Push(this);
@@ -3702,8 +3779,6 @@ public partial class UIElement : DependencyObject {
             idx += 1;
             if (cur == null || cur._isDisposedTree) { continue; }
             cur._isDisposedTree = true;
-            cur._ownBindingsBox = null;
-            cur._stateInvalidatedHooks = null;
             if (cur._children != null) {
                 for (int i = 0; i < cur._children.Length; i += 1) {
                     q.Push(cur._children[i]);
@@ -3714,7 +3789,78 @@ public partial class UIElement : DependencyObject {
                     q.Push(cur._detachedLogicalChildren[i]);
                 }
             }
+            if (cur._contextMenu != null) {
+                q.Push(cur._contextMenu);
+            }
+            if (cur._toolTip is UIElement) {
+                q.Push(cur._toolTip as UIElement);
+            }
+            if (cur._resources != null && cur._resources.Count() > 0) {
+                string[] rKeys = cur._resources.Keys();
+                for (int ri = 0; ri < rKeys.Length; ri += 1) {
+                    DependencyObject rv = cur._resources.TryGetLocalBox(rKeys[ri]);
+                    if (rv is UIElement) {
+                        UIElement rel = rv as UIElement;
+                        if (!rel._isDisposedTree && (rel._parent == null || rel._parent == cur || rel.DisposeWhenResourceOwned())) {
+                            q.Push(rel);
+                        }
+                    } else if (rv is Style) {
+                        Setter[] stSetters = (rv as Style).Setters();
+                        if (stSetters != null) {
+                            for (int si = 0; si < stSetters.Length; si += 1) {
+                                Setter stSetter = stSetters[si];
+                                if (stSetter != null && stSetter.ValueBox is UIElement) {
+                                    UIElement sel = stSetter.ValueBox as UIElement;
+                                    if (!sel._isDisposedTree && (sel._parent == null || sel._parent == cur || sel.DisposeWhenResourceOwned())) {
+                                        q.Push(sel);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            cur.CollectExtraDisposeTargets(q);
+            if (cur._effect != null && cur._effectHook != null) {
+                cur._effect.RemoveChangedListener(cur._effectHook);
+                cur._effectHook = null;
+            }
+            cur._ownBindingsBox = null;
+            cur._stateInvalidatedHooks = null;
+            cur._routedEventNames = null;
+            cur._routedEventSubs = null;
+            if (cur._hasNative && ParseUtil.IsValidHandle(cur.__nativeHandle)) {
+                cur._hasNative = false;
+                Visual_Destroy(cur.__nativeHandle);
+                cur.__nativeHandle = ParseUtil.EmptyHandle();
+            }
+            cur._parent = null;
+            cur._templatedParent = null;
+            cur._children = null;
+            cur._detachedLogicalChildren = null;
+            cur._contextMenu = null;
+            cur._toolTip = null;
+            cur._toolTipFactory = null;
+            cur._resources = null;
+            cur._ambientResources = null;
+            cur._locResources = null;
+            cur._style = null;
+            cur._appliedStyle = null;
+            cur._hasTemplateResources = false;
+            cur._hasTemplateAmbientResources = false;
+            cur._explicitDataContext = null;
+            cur._inheritedDataContext = null;
+            cur._effect = null;
+            cur._background = null;
+            cur._borderBrush = null;
+            cur._renderTransform = null;
+            cur._layoutTransform = null;
+            cur._opacityMask = null;
+            cur._dynResProps = null;
+            cur._dynResKeys = null;
+            cur._inputBindings = null;
         }
+        InputDispatcher.CleanupDisposed();
         if (_disposeHooks != null) {
             for (int i = 0; i < _disposeHooks.Length; i += 1) {
                 var fn = _disposeHooks[i];
@@ -3751,6 +3897,30 @@ public partial class UIElement : DependencyObject {
         return null;
     }
 
+    internal UIElement FindNameExcluding(string name, UIElement skipNode) {
+        if (name == null || name.Length == 0) { return null; }
+        var stack = new UIElement[0];
+        stack.Push(this);
+        while (stack.Length > 0) {
+            int last = stack.Length - 1;
+            UIElement cur = stack[last];
+            stack.RemoveAt(last);
+            if (cur == null || cur == skipNode) { continue; }
+            if (cur._name == name) { return cur; }
+            if (cur._detachedLogicalChildren != null) {
+                for (int i = cur._detachedLogicalChildren.Length - 1; i >= 0; i -= 1) {
+                    stack.Push(cur._detachedLogicalChildren[i]);
+                }
+            }
+            if (cur._children != null) {
+                for (int i = cur._children.Length - 1; i >= 0; i -= 1) {
+                    stack.Push(cur._children[i]);
+                }
+            }
+        }
+        return null;
+    }
+
     internal UIElement FindTemplateChildName(string name, UIElement owner) {
         if (name == null || name.Length == 0) { return null; }
         UIElement fallback = null;
@@ -3765,7 +3935,8 @@ public partial class UIElement : DependencyObject {
                 if (cur.TemplatedParent == owner) { return cur; }
                 if (cur.TemplatedParent == null && fallback == null) { fallback = cur; }
             }
-            if (cur is ContentPresenter && cur.TemplatedParent == owner) { continue; }
+            if ((cur is ContentPresenter || cur.IsItemsPresenterBoundary()) && cur.TemplatedParent == owner) { continue; }
+            if (cur.TemplatedParent != null && cur.TemplatedParent != owner) { continue; }
             if (cur._detachedLogicalChildren != null) {
                 for (int d = 0; d < cur._detachedLogicalChildren.Length; d += 1) {
                     q.Push(cur._detachedLogicalChildren[d]);
@@ -3807,11 +3978,29 @@ public partial class UIElement : DependencyObject {
         return activeStyle != null ? activeStyle.TryFindStyleResourceBox(key) : null;
     }
 
+    internal bool IsInTemplateOf(UIElement owner) {
+        if (owner == null) { return false; }
+        UIElement tp = _templatedParent;
+        int hops = 0;
+        while (tp != null && hops < 8) {
+            if (tp == owner) { return true; }
+            tp = tp._templatedParent;
+            hops += 1;
+        }
+        return false;
+    }
+
     public virtual DependencyObject FindResourceBox(string key) {
         if (key == null || key.Length == 0) { return null; }
-        DependencyObject firstAmb = null;
+        DependencyObject firstElemAmb = null;
+        DependencyObject firstTplAmb = null;
+        UIElement tpTarget = _templatedParent;
+        bool sawTpTarget = (tpTarget == null);
+        UIElement lastVisited = null;
         UIElement cur = this;
         while (cur != null) {
+            lastVisited = cur;
+            if (cur == tpTarget) { sawTpTarget = true; }
             if (cur._locResources != null) {
                 DependencyObject locB = cur._locResources.TryGetLocalBox(key);
                 if (locB != null) { return locB; }
@@ -3820,39 +4009,57 @@ public partial class UIElement : DependencyObject {
                 DependencyObject resB = cur._resources.TryGetLocalBox(key);
                 if (resB != null) { return resB; }
             }
-            DependencyObject tplScoped = cur.TryFindTemplateScopedResourceBox(key);
-            if (tplScoped != null) { return tplScoped; }
-            DependencyObject styScoped = cur.TryFindStyleScopedResourceBox(key);
-            if (styScoped != null) { return styScoped; }
-            if (firstAmb == null) {
-                firstAmb = cur.TryFindTemplateAmbientResourceBox(key);
-                if (firstAmb == null && cur._ambientResources != null) {
-                    firstAmb = cur._ambientResources.TryGetLocalBox(key);
-                }
+            if (cur._hasTemplateResources) {
+                DependencyObject tplScoped = cur.TryFindTemplateScopedResourceBox(key);
+                if (tplScoped != null) { return tplScoped; }
+            }
+            Style curSt = cur._style != null ? cur._style : cur._appliedStyle;
+            if (curSt != null) {
+                DependencyObject styScoped = curSt.TryFindStyleResourceBox(key);
+                if (styScoped != null) { return styScoped; }
+            }
+            if (firstTplAmb == null && cur._hasTemplateAmbientResources && (cur == this || IsInTemplateOf(cur))) {
+                firstTplAmb = cur.TryFindTemplateAmbientResourceBox(key);
+            }
+            if (firstElemAmb == null && cur._ambientResources != null) {
+                firstElemAmb = cur._ambientResources.TryGetLocalBox(key);
             }
             cur = cur._parent;
         }
-        UIElement tp = _templatedParent;
+        UIElement tp = null;
+        if (!sawTpTarget) {
+            tp = tpTarget;
+        } else if (lastVisited != null && lastVisited._templatedParent != null) {
+            tp = lastVisited._templatedParent;
+        }
         while (tp != null) {
             if (tp._locResources != null) {
                 DependencyObject tpLoc = tp._locResources.TryGetLocalBox(key);
                 if (tpLoc != null) { return tpLoc; }
             }
-            DependencyObject tpLocal = tp.TryFindLocalResourceBox(key);
-            if (tpLocal != null) { return tpLocal; }
-            DependencyObject tpScoped = tp.TryFindTemplateScopedResourceBox(key);
-            if (tpScoped != null) { return tpScoped; }
-            DependencyObject tpStyScoped = tp.TryFindStyleScopedResourceBox(key);
-            if (tpStyScoped != null) { return tpStyScoped; }
-            if (firstAmb == null) {
-                firstAmb = tp.TryFindTemplateAmbientResourceBox(key);
-                if (firstAmb == null && tp._ambientResources != null) {
-                    firstAmb = tp._ambientResources.TryGetLocalBox(key);
-                }
+            if (tp._resources != null) {
+                DependencyObject tpLocal = tp._resources.TryGetLocalBox(key);
+                if (tpLocal != null) { return tpLocal; }
+            }
+            if (tp._hasTemplateResources) {
+                DependencyObject tpScoped = tp.TryFindTemplateScopedResourceBox(key);
+                if (tpScoped != null) { return tpScoped; }
+            }
+            Style tpSt = tp._style != null ? tp._style : tp._appliedStyle;
+            if (tpSt != null) {
+                DependencyObject tpStyScoped = tpSt.TryFindStyleResourceBox(key);
+                if (tpStyScoped != null) { return tpStyScoped; }
+            }
+            if (firstTplAmb == null && tp._hasTemplateAmbientResources) {
+                firstTplAmb = tp.TryFindTemplateAmbientResourceBox(key);
+            }
+            if (firstElemAmb == null && tp._ambientResources != null) {
+                firstElemAmb = tp._ambientResources.TryGetLocalBox(key);
             }
             tp = tp._parent != null ? tp._parent : tp._templatedParent;
         }
-        if (firstAmb != null) { return firstAmb; }
+        if (firstElemAmb != null) { return firstElemAmb; }
+        if (firstTplAmb != null) { return firstTplAmb; }
         DependencyObject ambient = ResourceDictionary.FindAmbientBox(key);
         if (ambient != null) { return ambient; }
         ResourceDictionary appRes = ResourceDictionary.GlobalApplicationResources();
@@ -4180,7 +4387,10 @@ public partial class UIElement : DependencyObject {
             }
             return false;
         }
-        if (propName == "ZIndex") { ZIndex = DependencyObject.UnboxInt(value, 0); return true; }
+        if (propName == "ZIndex" || propName == "Panel.ZIndex" || propName == "Canvas.ZIndex") {
+            ZIndex = DependencyObject.UnboxInt(value, 0);
+            return true;
+        }
         if (propName == "IsEnabled") { IsEnabled = DependencyObject.UnboxBool(value, true); return true; }
         if (propName == "IsHitTestVisible") { IsHitTestVisible = DependencyObject.UnboxBool(value, true); return true; }
         if (propName == "Focusable") { Focusable = DependencyObject.UnboxBool(value, false); return true; }
@@ -4519,6 +4729,8 @@ public partial class UIElement : DependencyObject {
 
     internal virtual bool IsItemsControlBoundary() { return false; }
     internal virtual bool IsItemsPresenterBoundary() { return false; }
+    internal virtual bool DisposeWhenResourceOwned() { return false; }
+    internal virtual bool DetachNonTemplateUserContent(UIElement owner, UIElement[] q) { return false; }
 
     public virtual DependencyObject GetPropertyValue(string propName) {
         if (propName == "RiveControl.Source") { return DependencyObject.BoxString(_riveSource); }
@@ -4589,6 +4801,10 @@ public partial class UIElement : DependencyObject {
             return DependencyObject.BoxFloat(_borderBrush != null ? _borderBrush.Opacity : 1.0f);
         }
         if (propName == "Name") { return DependencyObject.BoxString(_name); }
+        if (propName == "ZIndex" || propName == "Panel.ZIndex" || propName == "Canvas.ZIndex") { return DependencyObject.BoxInt(_zIndex); }
+        if (propName == "ItemsControl.AlternationIndex" || propName == "(ItemsControl.AlternationIndex)" || propName == "AlternationIndex") {
+            return DependencyObject.BoxInt(_alternationIndex);
+        }
         if (propName == "TabIndex" || propName == "KeyboardNavigation.TabIndex") { return DependencyObject.BoxInt(_keyboardTabIndex); }
         if (propName == "DataContext") { return EffectiveDataContextBox(); }
         if (propName == "Tag") { return _tag; }
@@ -4758,7 +4974,39 @@ public partial class UIElement : DependencyObject {
     internal void RaiseKeyUp(KeyEventArgs e) { OnKeyUp(e); KeyUp(this, e); }
     internal void RaiseTextInput(TextCompositionEventArgs e) { OnTextInput(e); TextInput(this, e); }
 
-    public virtual bool SubscribeBehaviorRoutedEvent(string ev, BehaviorEventSink sink) { return false; }
+    private string[] _routedEventNames;
+    private BehaviorEventSink[] _routedEventSubs;
+
+    public virtual bool SubscribeBehaviorRoutedEvent(string ev, BehaviorEventSink sink) {
+        if (ev == null || ev.Length == 0 || sink == null) { return false; }
+        if (_routedEventNames == null) {
+            _routedEventNames = new string[0];
+            _routedEventSubs = new BehaviorEventSink[0];
+        }
+        _routedEventNames.Push(ev);
+        _routedEventSubs.Push(sink);
+        return true;
+    }
+
+    public void RaiseRoutedEvent(string ev, RoutedEventArgs args) {
+        if (ev == null || ev.Length == 0) { return; }
+        RoutedEventArgs effArgs = args != null ? args : new RoutedEventArgs(ev, this);
+        UIElement cur = this;
+        int guard = 0;
+        while (cur != null && !effArgs.Handled && guard < 256) {
+            guard += 1;
+            if (cur._routedEventSubs != null && cur._routedEventNames != null) {
+                int n = cur._routedEventSubs.Length;
+                for (int i = 0; i < n; i += 1) {
+                    if (cur._routedEventNames[i] == ev && cur._routedEventSubs[i] != null) {
+                        cur._routedEventSubs[i].OnBehaviorEvent(this, effArgs);
+                    }
+                }
+            }
+            cur = cur._parent != null ? cur._parent : cur._templatedParent;
+        }
+    }
+
     public virtual bool IsNamescopeBoundary() { return false; }
 }
 
@@ -5005,31 +5253,80 @@ public static class InputDispatcher {
         }
     }
 
+    private static UIElement[] _pressedChain;
+
+    internal static void CleanupDisposed() {
+        if (_captured != null && _captured._isDisposedTree) { _captured = null; }
+        if (_hovered != null && _hovered._isDisposedTree) { _hovered = null; }
+        if (_focused != null && _focused._isDisposedTree) { _focused = null; }
+        if (_lastClickTarget != null && _lastClickTarget._isDisposedTree) {
+            _lastClickTarget = null;
+            _clickSeq = 0;
+        }
+        if (_pressedChain != null && _pressedChain.Length > 0) {
+            int pw = 0;
+            for (int i = 0; i < _pressedChain.Length; i += 1) {
+                UIElement el = _pressedChain[i];
+                if (el != null && !el._isDisposedTree) {
+                    if (pw != i) { _pressedChain[pw] = el; }
+                    pw += 1;
+                }
+            }
+            while (_pressedChain.Length > pw) {
+                _pressedChain.RemoveAt(_pressedChain.Length - 1);
+            }
+        }
+    }
+
+    private static void ClearPressedChain() {
+        if (_pressedChain == null || _pressedChain.Length == 0) { return; }
+        for (int i = 0; i < _pressedChain.Length; i += 1) {
+            UIElement el = _pressedChain[i];
+            if (el != null && !el._isDisposedTree) {
+                el.SetPressedState(false);
+            }
+        }
+        _pressedChain.Clear();
+    }
+
     public static bool __AeroDispatchPointer(
         handle node, int kind, float x, float y, int button, int modifiers, float dx, float dy) {
+        if (_captured != null && _captured._isDisposedTree) { _captured = null; }
+        if (_hovered != null && _hovered._isDisposedTree) { _hovered = null; }
         UIElement rawTarget = Visual_GetOwner(node) as UIElement;
-        UIElement target = _captured != null ? _captured : rawTarget;
-        if (target == null) {
-            if (kind == 2) { NotifyPopupHooks(null, false); }
-            if (kind == 16 || kind == 1 || kind == 0) { UpdateHoverChain(null, x, y, modifiers); }
-            return false;
-        }
-
         if (kind == 8) {
-            UpdateHoverChain(rawTarget != null ? rawTarget : target, x, y, modifiers);
+            UpdateHoverChain(rawTarget, x, y, modifiers);
             return true;
         }
         if (kind == 16) {
-            if (_hovered != null && (rawTarget == _hovered || _hovered.IsAncestorOf(rawTarget))) {
+            if (dx == 0.0f) {
                 UpdateHoverChain(null, x, y, modifiers);
             }
             return true;
         }
 
+        UIElement target = _captured != null ? _captured : rawTarget;
+        if (target == null) {
+            if (kind == 2) {
+                NotifyPopupHooks(null, false);
+                if (EnumConvert.ToPointerButton(button) == PointerButton.Left) {
+                    ClearPressedChain();
+                }
+            }
+            if (kind == 4) {
+                if (EnumConvert.ToPointerButton(button) == PointerButton.Left) {
+                    ClearPressedChain();
+                }
+                if (_captured != null) { ReleasePointerCapture(_captured); }
+            }
+            if (kind == 1 || kind == 0) { UpdateHoverChain(null, x, y, modifiers); }
+            return false;
+        }
+
         if (kind == 1 || kind == 0) {
-            UIElement hoverLeaf = rawTarget != null ? rawTarget : target;
-            if (_hovered == null || (hoverLeaf != _hovered && !hoverLeaf.IsAncestorOf(_hovered))) {
-                UpdateHoverChain(hoverLeaf, x, y, modifiers);
+            if (_captured == null && rawTarget != null &&
+                (_hovered == null || (rawTarget != _hovered && !rawTarget.IsAncestorOf(_hovered)))) {
+                UpdateHoverChain(rawTarget, x, y, modifiers);
             }
             var moveArgs = new MouseEventArgs("MouseMove", target, x, y, modifiers);
             UIElement cur = target;
@@ -5060,6 +5357,8 @@ public static class InputDispatcher {
                 target, x, y, modifiers, btn, true, clickCount);
 
             if (btn == PointerButton.Left) {
+                ClearPressedChain();
+                if (_pressedChain == null) { _pressedChain = new UIElement[0]; }
                 UIElement[] chain = AncestorChain(target);
                 for (int i = chain.Length - 1; i >= 0 && !downArgs.Handled; i -= 1) {
                     chain[i].RaisePreviewLeftDown(downArgs);
@@ -5078,6 +5377,7 @@ public static class InputDispatcher {
                 if (cur.IsEnabled) {
                     if (btn == PointerButton.Left) {
                         cur.SetPressedState(true);
+                        _pressedChain.Push(cur);
                         cur.RaiseLeftDown(downArgs);
                     } else if (btn == PointerButton.Right) {
                         cur.RaiseRightDown(downArgs);
@@ -5103,6 +5403,9 @@ public static class InputDispatcher {
                     cur.RaiseRightUp(upArgs);
                 }
                 cur = cur.Parent;
+            }
+            if (btn == PointerButton.Left) {
+                ClearPressedChain();
             }
             if (_captured != null) { ReleasePointerCapture(_captured); }
             return upArgs.Handled;

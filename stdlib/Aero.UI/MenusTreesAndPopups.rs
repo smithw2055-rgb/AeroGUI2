@@ -195,6 +195,18 @@ public class Popup : FrameworkElement {
 
     public override string GetTypeName() { return "Popup"; }
 
+    internal override bool DetachNonTemplateUserContent(UIElement owner, UIElement[] q) {
+        UIElement popChild = Child;
+        if (popChild != null) {
+            if (Control.IsOwnedByTemplateChain(popChild, owner)) {
+                q.Push(popChild);
+            } else {
+                Child = null;
+            }
+        }
+        return true;
+    }
+
     protected override bool IsSelfHitTestSolid() {
         return Background != null;
     }
@@ -228,6 +240,20 @@ public class Popup : FrameworkElement {
         if (_logicalParent != null) {
             _logicalParent.UnregisterDetachedLogicalChild(this);
         }
+    }
+
+    protected override void CollectExtraDisposeTargets(UIElement[] q) {
+        if (_isOpen) {
+            PopupService.Unregister(this);
+            ForceCloseDisposed();
+        }
+        if (_child != null) {
+            if (!_child._isDisposedTree) { q.Push(_child); }
+            _child = null;
+        }
+        _placementTarget = null;
+        _logicalParent = null;
+        _attachedRoot = null;
     }
 
     public bool IsOpen {
@@ -332,7 +358,10 @@ public class Popup : FrameworkElement {
 
             float x = vx + _horizOffset * scaleX;
             float y = vy + _vertOffset * scaleY;
-            if (_placement == "Bottom") {
+            if (_placement == "MousePoint" || _placement == "Mouse" || _placement == "Absolute") {
+                x = _horizOffset;
+                y = _vertOffset;
+            } else if (_placement == "Bottom") {
                 y = vy + vh + _vertOffset * scaleY;
             } else if (_placement == "Top") {
                 y = vy - popH - _vertOffset * scaleY;
@@ -444,6 +473,7 @@ public class ToolTip : ContentControl {
         SetContent(text);
     }
     public override string GetTypeName() { return "ToolTip"; }
+    internal override bool DisposeWhenResourceOwned() { return true; }
 }
 
 public static class ToolTipService {
@@ -480,17 +510,17 @@ public static class ToolTipService {
 }
 
 public partial class UIElement {
-    private ContextMenu _contextMenu;
     private bool _toolTipHooked;
 
     public ContextMenu ContextMenu {
-        get { return _contextMenu; }
+        get { return _contextMenu as ContextMenu; }
         set {
             _contextMenu = value;
-            if (_contextMenu != null) {
+            if (value != null) {
                 MouseRightButtonUp += (object s, MouseButtonEventArgs e) => {
-                    if (!e.Handled && _contextMenu != null) {
-                        _contextMenu.Open(this, e.X, e.Y);
+                    ContextMenu cm = _contextMenu as ContextMenu;
+                    if (!e.Handled && cm != null) {
+                        cm.Open(this, e.X, e.Y);
                         e.Handled = true;
                     }
                 };
@@ -575,6 +605,21 @@ public class HeaderedItemsControl : ItemsControl {
 
     protected virtual void OnHeaderChanged(object oldHeader, object newHeader) {}
 
+    protected override void CollectExtraDisposeTargets(UIElement[] q) {
+        base.CollectExtraDisposeTargets(q);
+        if (_headerBox is UIElement) {
+            UIElement hel = _headerBox as UIElement;
+            UIElement self = this;
+            UIElement hpres = _headerPresenter;
+            if (!hel._isDisposedTree && (hel.Parent == null || hel.Parent == self || (hpres != null && hel.Parent == hpres))) {
+                q.Push(hel);
+            }
+        }
+        _headerBox = null;
+        _headerTemplate = null;
+        _headerPresenter = null;
+    }
+
     public override void OnApplyTemplate() {
         base.OnApplyTemplate();
         if (Template == null) { return; }
@@ -639,6 +684,30 @@ public class MenuItem : HeaderedItemsControl {
     }
     public MenuItem(string headerText) : this() {
         SetHeader(headerText);
+    }
+
+    protected override bool IsItemItsOwnContainer(DependencyObject itemBox) {
+        return itemBox is MenuItem || itemBox is Separator;
+    }
+
+    protected override void CollectExtraDisposeTargets(UIElement[] q) {
+        base.CollectExtraDisposeTargets(q);
+        if (_submenuPopup != null) {
+            if (!_submenuPopup._isDisposedTree) { q.Push(_submenuPopup); }
+            _submenuPopup = null;
+        }
+        if (_iconBox is UIElement) {
+            UIElement iel = _iconBox as UIElement;
+            UIElement self = this;
+            if (!iel._isDisposedTree && (iel.Parent == null || iel.Parent == self)) {
+                q.Push(iel);
+            }
+        }
+        _iconBox = null;
+        _commandParamBox = null;
+        _checkGlyph = null;
+        _gestureText = null;
+        _arrowGlyph = null;
     }
 
     public override string GetTypeName() { return "MenuItem"; }
@@ -929,6 +998,9 @@ public class MenuBase : ItemsControl {
         BorderBrush = new SolidColorBrush("#FF2E3748");
     }
     public override string GetTypeName() { return "MenuBase"; }
+    protected override bool IsItemItsOwnContainer(DependencyObject itemBox) {
+        return itemBox is MenuItem || itemBox is Separator;
+    }
 }
 
 public class Menu : MenuBase {
@@ -971,6 +1043,7 @@ public class ContextMenu : MenuBase {
     private void RaiseClosed() { Closed(this, new RoutedEventArgs("Closed", this)); }
 
     public override string GetTypeName() { return "ContextMenu"; }
+    internal override bool DisposeWhenResourceOwned() { return true; }
     public bool IsOpen {
         get { return _popup.IsOpen; }
         set { _popup.IsOpen = value; }
@@ -978,10 +1051,18 @@ public class ContextMenu : MenuBase {
 
     public void Open(UIElement placementTarget = null, float x = 0.0f, float y = 0.0f) {
         _popup.PlacementTarget = placementTarget;
-        _popup.Placement = placementTarget != null ? "Bottom" : "Absolute";
+        _popup.Placement = "MousePoint";
         _popup.HorizontalOffset = x;
         _popup.VerticalOffset = y;
         _popup.IsOpen = true;
+    }
+
+    protected override void CollectExtraDisposeTargets(UIElement[] q) {
+        base.CollectExtraDisposeTargets(q);
+        if (_popup != null) {
+            if (!_popup._isDisposedTree) { q.Push(_popup); }
+            _popup = null;
+        }
     }
 
     public void Close() { _popup.IsOpen = false; }
@@ -1159,11 +1240,19 @@ public class TreeViewItem : HeaderedItemsControl {
 
     public override string GetTypeName() { return "TreeViewItem"; }
 
+    protected override bool IsItemItsOwnContainer(DependencyObject itemBox) {
+        return itemBox is TreeViewItem;
+    }
+
+    protected override void CollectExtraDisposeTargets(UIElement[] q) {
+        base.CollectExtraDisposeTargets(q);
+        _ownerTree = null;
+        _rowHost = null;
+        _expanderGlyph = null;
+        _childrenHost = null;
+    }
+
     public override bool SubscribeBehaviorRoutedEvent(string ev, BehaviorEventSink sink) {
-        if (ev == "Expanded") {
-            Expanded += (object s, RoutedEventArgs e) => { if (sink != null) { sink.OnBehaviorEvent(s, e); } };
-            return true;
-        }
         return base.SubscribeBehaviorRoutedEvent(ev, sink);
     }
 
@@ -1183,8 +1272,15 @@ public class TreeViewItem : HeaderedItemsControl {
             SyncExpandedState();
             UpdateTriggersAndStates();
             NotifyBoundPropertyChanged("IsExpanded", DependencyObject.BoxBool(_isExpanded));
-            if (_isExpanded) { Expanded(this, new RoutedEventArgs("Expanded", this)); }
-            else { Collapsed(this, new RoutedEventArgs("Collapsed", this)); }
+            if (_isExpanded) {
+                var expArgs = new RoutedEventArgs("Expanded", this);
+                Expanded(this, expArgs);
+                RaiseRoutedEvent("Expanded", expArgs);
+            } else {
+                var colArgs = new RoutedEventArgs("Collapsed", this);
+                Collapsed(this, colArgs);
+                RaiseRoutedEvent("Collapsed", colArgs);
+            }
         }
     }
 
@@ -1196,8 +1292,15 @@ public class TreeViewItem : HeaderedItemsControl {
             SyncSelectedVisual();
             UpdateTriggersAndStates();
             NotifyBoundPropertyChanged("IsSelected", DependencyObject.BoxBool(_isSelected));
-            if (_isSelected) { Selected(this, new RoutedEventArgs("Selected", this)); }
-            else { Unselected(this, new RoutedEventArgs("Unselected", this)); }
+            if (_isSelected) {
+                var selArgs = new RoutedEventArgs("Selected", this);
+                Selected(this, selArgs);
+                RaiseRoutedEvent("Selected", selArgs);
+            } else {
+                var unselArgs = new RoutedEventArgs("Unselected", this);
+                Unselected(this, unselArgs);
+                RaiseRoutedEvent("Unselected", unselArgs);
+            }
         }
     }
 
@@ -1400,6 +1503,16 @@ public class TreeView : ItemsControl {
     }
 
     public override string GetTypeName() { return "TreeView"; }
+
+    protected override bool IsItemItsOwnContainer(DependencyObject itemBox) {
+        return itemBox is TreeViewItem;
+    }
+
+    protected override void CollectExtraDisposeTargets(UIElement[] q) {
+        base.CollectExtraDisposeTargets(q);
+        _selectedItem = null;
+    }
+
     public TreeViewItem SelectedContainer() { return _selectedItem; }
     public object SelectedItem {
         get {
@@ -1422,12 +1535,13 @@ public class TreeView : ItemsControl {
     }
 
     private static DataTemplate ResolveDataTemplateForItem(
-        ItemsControl owner, TreeViewItem tvi, DataTemplate explicitTemplate, object raw) {
+        ItemsControl owner, TreeViewItem tvi, TreeView tree, DataTemplate explicitTemplate, object raw) {
         if (explicitTemplate != null) { return explicitTemplate; }
         string dtKey = InferDataTypeKey(raw);
         if (dtKey.Length > 0) {
             DependencyObject res = tvi != null ? tvi.FindResourceBox(dtKey) : null;
             if (res == null && owner != null) { res = owner.FindResourceBox(dtKey); }
+            if (res == null && tree != null) { res = tree.FindResourceBox(dtKey); }
             if (res is DataTemplate) { return res as DataTemplate; }
         }
         return null;
@@ -1482,7 +1596,7 @@ public class TreeView : ItemsControl {
 
         object raw = DependencyObject.Unbox(itemBox);
         DataTemplate itemTpl = ResolveDataTemplateForItem(
-            owner, tvi, owner != null ? owner.ItemTemplate : null, raw);
+            owner, tvi, tree, owner != null ? owner.ItemTemplate : null, raw);
         tvi.SetHeaderAndTemplate(itemBox, itemTpl);
 
         if (itemTpl is HierarchicalDataTemplate) {
@@ -1491,6 +1605,7 @@ public class TreeView : ItemsControl {
             if (childTpl == null && hdt.ItemTemplateKey != null && hdt.ItemTemplateKey.Length > 0) {
                 DependencyObject tplBox = tvi.FindResourceBox(hdt.ItemTemplateKey);
                 if (tplBox == null && owner != null) { tplBox = owner.FindResourceBox(hdt.ItemTemplateKey); }
+                if (tplBox == null && tree != null) { tplBox = tree.FindResourceBox(hdt.ItemTemplateKey); }
                 if (tplBox is DataTemplate) { childTpl = tplBox as DataTemplate; }
             }
             if (childTpl == null && (hdt.DataType == null || hdt.DataType.Length == 0)) {

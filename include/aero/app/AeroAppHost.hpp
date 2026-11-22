@@ -283,6 +283,7 @@ private:
     PersistentRoot simObjectPin_{};
     SimTickCallback simTickCallback_{};
     std::unordered_map<std::uint64_t, std::pair<float, float>> lastCanvasDrawSizes_;
+    std::uint64_t lastGcDestroyedNodes_ = 0u;
     std::vector<PlayedSoundRecord> playedSounds_;
     std::string lastError_;
     std::optional<std::chrono::steady_clock::time_point> scheduledWakeAt_;

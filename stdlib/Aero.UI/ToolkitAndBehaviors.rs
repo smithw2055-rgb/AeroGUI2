@@ -1661,6 +1661,8 @@ public class BehaviorEventTrigger : BehaviorTriggerBase {
     private static BehaviorEventTrigger[] _pendingTriggers;
     private static UIElement[] _pendingOwners;
     private static bool _pendingHookInstalled = false;
+    private static BehaviorEventTrigger[] _wiredTriggers;
+    private static bool _wiredCleanupInstalled = false;
 
     public BehaviorEventTrigger() : base() {
         _wiredOwners = new UIElement[0];
@@ -1694,8 +1696,39 @@ public class BehaviorEventTrigger : BehaviorTriggerBase {
         return false;
     }
 
+    internal static void CleanupDisposedWired() {
+        if (_wiredTriggers == null) { return; }
+        for (int i = _wiredTriggers.Length - 1; i >= 0; i -= 1) {
+            BehaviorEventTrigger tr = _wiredTriggers[i];
+            if (tr == null) {
+                _wiredTriggers.RemoveAt(i);
+                continue;
+            }
+            if (tr._wiredOwners != null) {
+                for (int j = tr._wiredOwners.Length - 1; j >= 0; j -= 1) {
+                    if (tr._wiredOwners[j] == null || tr._wiredOwners[j]._isDisposedTree) {
+                        tr._wiredOwners.RemoveAt(j);
+                    }
+                }
+            }
+            if (tr._wiredOwners == null || tr._wiredOwners.Length == 0) {
+                _wiredTriggers.RemoveAt(i);
+            }
+        }
+    }
+
     private void WireSourceEvents(UIElement src, UIElement associatedObject) {
         if (src == null || associatedObject == null || IsWiredOwner(associatedObject)) { return; }
+        if (!_wiredCleanupInstalled) {
+            _wiredCleanupInstalled = true;
+            UIElement.RegisterDisposeHook(() => { BehaviorEventTrigger.CleanupDisposedWired(); });
+        }
+        if (_wiredTriggers == null) { _wiredTriggers = new BehaviorEventTrigger[0]; }
+        bool tracked = false;
+        for (int i = 0; i < _wiredTriggers.Length; i += 1) {
+            if (_wiredTriggers[i] == this) { tracked = true; break; }
+        }
+        if (!tracked) { _wiredTriggers.Push(this); }
         _wiredOwners.Push(associatedObject);
         string ev = EventName;
         if (ev == "Loaded") {
@@ -1831,6 +1864,7 @@ public class BehaviorDataTrigger : BehaviorTriggerBase {
     private UIElement[] _hookedSources;
     private static BehaviorDataTrigger[] _reactiveBTriggers;
     private static UIElement[] _reactiveBTargets;
+    private static BehaviorDataTrigger[] _triggersWithTargets;
     private static bool _reactiveBHookInstalled = false;
 
     public BehaviorDataTrigger() : base() {
@@ -1909,9 +1943,49 @@ public class BehaviorDataTrigger : BehaviorTriggerBase {
             src = anc;
         }
         if (src == null || HasHookedSource(associatedObject, src)) { return; }
+        TrackTriggerWithTargets();
         _hookedTargets.Push(associatedObject);
         _hookedSources.Push(src);
         src.AddStateInvalidatedHook(() => { CheckAndFire(associatedObject, false); });
+    }
+
+    private void TrackTriggerWithTargets() {
+        if (!_reactiveBHookInstalled) {
+            _reactiveBHookInstalled = true;
+            BindingEngine.AddPreFlushHook(() => { BehaviorDataTrigger.FlushReactive(); });
+            UIElement.RegisterDisposeHook(() => { BehaviorDataTrigger.CleanupDisposedReactive(); });
+        }
+        if (_triggersWithTargets == null) { _triggersWithTargets = new BehaviorDataTrigger[0]; }
+        for (int i = 0; i < _triggersWithTargets.Length; i += 1) {
+            if (_triggersWithTargets[i] == this) { return; }
+        }
+        _triggersWithTargets.Push(this);
+    }
+
+    internal void CleanupDisposedTargets() {
+        if (_initTargets != null) {
+            for (int i = _initTargets.Length - 1; i >= 0; i -= 1) {
+                if (_initTargets[i] == null || _initTargets[i]._isDisposedTree) {
+                    _initTargets.RemoveAt(i);
+                }
+            }
+        }
+        if (_matchedTargets != null) {
+            for (int i = _matchedTargets.Length - 1; i >= 0; i -= 1) {
+                if (_matchedTargets[i] == null || _matchedTargets[i]._isDisposedTree) {
+                    _matchedTargets.RemoveAt(i);
+                }
+            }
+        }
+        if (_hookedTargets != null && _hookedSources != null) {
+            for (int i = _hookedTargets.Length - 1; i >= 0; i -= 1) {
+                if (_hookedTargets[i] == null || _hookedTargets[i]._isDisposedTree ||
+                    _hookedSources[i] == null || _hookedSources[i]._isDisposedTree) {
+                    _hookedTargets.RemoveAt(i);
+                    _hookedSources.RemoveAt(i);
+                }
+            }
+        }
     }
 
     private static void RegisterReactive(BehaviorDataTrigger dt, UIElement target) {
@@ -1933,11 +2007,28 @@ public class BehaviorDataTrigger : BehaviorTriggerBase {
     }
 
     internal static void CleanupDisposedReactive() {
-        if (_reactiveBTriggers == null || _reactiveBTargets == null) { return; }
-        for (int i = _reactiveBTargets.Length - 1; i >= 0; i -= 1) {
-            if (_reactiveBTargets[i] == null || _reactiveBTargets[i]._isDisposedTree) {
-                _reactiveBTriggers.RemoveAt(i);
-                _reactiveBTargets.RemoveAt(i);
+        if (_reactiveBTriggers != null && _reactiveBTargets != null) {
+            for (int i = _reactiveBTargets.Length - 1; i >= 0; i -= 1) {
+                if (_reactiveBTargets[i] == null || _reactiveBTargets[i]._isDisposedTree) {
+                    _reactiveBTriggers.RemoveAt(i);
+                    _reactiveBTargets.RemoveAt(i);
+                }
+            }
+        }
+        if (_triggersWithTargets != null) {
+            for (int i = _triggersWithTargets.Length - 1; i >= 0; i -= 1) {
+                BehaviorDataTrigger dt = _triggersWithTargets[i];
+                if (dt == null) {
+                    _triggersWithTargets.RemoveAt(i);
+                    continue;
+                }
+                dt.CleanupDisposedTargets();
+                bool anyLeft = (dt._initTargets != null && dt._initTargets.Length > 0) ||
+                               (dt._matchedTargets != null && dt._matchedTargets.Length > 0) ||
+                               (dt._hookedTargets != null && dt._hookedTargets.Length > 0);
+                if (!anyLeft) {
+                    _triggersWithTargets.RemoveAt(i);
+                }
             }
         }
     }
@@ -2058,6 +2149,7 @@ public class BehaviorDataTrigger : BehaviorTriggerBase {
             }
         }
         if (!HasInitTarget(associatedObject)) {
+            TrackTriggerWithTargets();
             _initTargets.Push(associatedObject);
             if (isInitialAttach && BindingPath == "IsMouseOver" && matched && !DependencyObject.UnboxBool(expectedBox, true)) {
                 SetMatchedFor(associatedObject, true);

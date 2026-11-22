@@ -693,32 +693,41 @@ void ExecutionDomainContext::handleFieldMutated(
     const auto typeIdOpt = heap.objectTypeId(object);
     const bool isWrapper = typeIdOpt.has_value() && ObservableListHelper::IsWrapperType(*typeIdOpt);
 
-    if (isWrapper && fieldIndex == 0u) {
-        const Value* field0 = heap.fieldGetFast(object, 0u);
-        if (field0) {
-            if (const auto* arrRef = std::get_if<ObjectRef>(field0);
-                arrRef && arrRef->valid() && arrRef->kind == ObjectKind::Array &&
-                arrRef->heapId == static_cast<std::uint32_t>(heapKey)) {
-                ObservableListHelper::EnableTracking(heap, *arrRef);
-                std::vector<WrapperOwnerLink> ownersCopy;
-                {
-                    std::lock_guard<std::mutex> lock(mutex_);
-                    const auto hIt = wrapperOwnersByHeap_.find(heapKey);
-                    if (hIt != wrapperOwnersByHeap_.end()) {
-                        const auto wIt = hIt->second.find(objKey);
-                        if (wIt != hIt->second.end()) {
-                            ownersCopy = wIt->second;
+    if (isWrapper) {
+        if (fieldIndex == 0u) {
+            if (dirtyBit < 64u) {
+                ObservableListHelper::UnbindAllForOwnerField(heap, object, dirtyBit);
+            }
+            const Value* field0 = heap.fieldGetFast(object, 0u);
+            if (field0) {
+                if (const auto* arrRef = std::get_if<ObjectRef>(field0);
+                    arrRef && arrRef->valid() && arrRef->kind == ObjectKind::Array &&
+                    arrRef->heapId == static_cast<std::uint32_t>(heapKey)) {
+                    ObservableListHelper::EnableTracking(heap, *arrRef);
+                    if (dirtyBit < 64u) {
+                        ObservableListHelper::BindOwnerProperty(heap, *arrRef, object, dirtyBit);
+                    }
+                    std::vector<WrapperOwnerLink> ownersCopy;
+                    {
+                        std::lock_guard<std::mutex> lock(mutex_);
+                        const auto hIt = wrapperOwnersByHeap_.find(heapKey);
+                        if (hIt != wrapperOwnersByHeap_.end()) {
+                            const auto wIt = hIt->second.find(objKey);
+                            if (wIt != hIt->second.end()) {
+                                ownersCopy = wIt->second;
+                            }
                         }
                     }
-                }
-                for (const auto& link : ownersCopy) {
-                    if (link.ownerRef.valid() && link.bitIndex < 64u) {
-                        ObservableListHelper::BindOwnerProperty(
-                            heap, *arrRef, link.ownerRef, link.bitIndex);
+                    for (const auto& link : ownersCopy) {
+                        if (link.ownerRef.valid() && link.bitIndex < 64u) {
+                            ObservableListHelper::BindOwnerProperty(
+                                heap, *arrRef, link.ownerRef, link.bitIndex);
+                        }
                     }
                 }
             }
         }
+        return;
     }
 
     if (dirtyBit >= 64u) {

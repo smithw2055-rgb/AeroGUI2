@@ -21,6 +21,17 @@
 #include <unordered_set>
 #include <vector>
 
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#include <psapi.h>
+#endif
+
 namespace {
 
 namespace fs = std::filesystem;
@@ -3334,6 +3345,646 @@ void TestInteractiveGallery(aero::rs_comp::CompilerSession& session) {
         "Gallery theme switch (Light -> Dark) must change rendered pixels");
 }
 
+void TestInteractiveGalleryReportedSubPages(aero::rs_comp::CompilerSession& session) {
+    std::cout << "[Interactive] Gallery Reported SubPages (treeShakeStdlib=true)...\n";
+    aero::AeroV3CompileInput ci;
+    aero::AeroAppHostConfig hc;
+    Require(BuildDiscoveredSample(fs::path(AERO_SAMPLES_DIR) / "Gallery", &session, ci, hc, 1280u, 800u),
+        "GalleryReported discover failed");
+    // Match aero-viewer defaults exactly
+    ci.treeShakeStdlib = true;
+    ci.allowStdlibCache = false;
+    aero::AeroAppHost host(hc);
+    std::string err;
+    Require(host.CompileAndLoad(ci, &err), "GalleryReported load failed: " + err);
+
+    for (int f = 0; f < 20; ++f) {
+        host.StepFrame(1.0f / 60.0f, f == 19);
+    }
+
+    auto readProcMemMb = [](double& outPrivateMb, double& outWorkingMb) {
+        outPrivateMb = 0.0;
+        outWorkingMb = 0.0;
+#ifdef _WIN32
+        PROCESS_MEMORY_COUNTERS_EX pmc{};
+        if (K32GetProcessMemoryInfo(
+                GetCurrentProcess(),
+                reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&pmc),
+                sizeof(pmc))) {
+            outPrivateMb = static_cast<double>(pmc.PrivateUsage) / (1024.0 * 1024.0);
+            outWorkingMb = static_cast<double>(pmc.WorkingSetSize) / (1024.0 * 1024.0);
+        }
+#endif
+    };
+
+    auto activeSampleContainerId = [&]() -> aero::VisualNodeId {
+        const aero::VisualNodeId c1 = host.FindVisualByOwnerName("SampleContainer1");
+        const aero::VisualNodeId c2 = host.FindVisualByOwnerName("SampleContainer2");
+        const aero::VisualNode* n1 = c1.IsValid() ? host.World().GetNode(c1) : nullptr;
+        const aero::VisualNode* n2 = c2.IsValid() ? host.World().GetNode(c2) : nullptr;
+        if (n1 && n1->layout.visibility == aero::Visibility::Visible && !n1->children.empty()) {
+            return c1;
+        }
+        if (n2 && n2->layout.visibility == aero::Visibility::Visible && !n2->children.empty()) {
+            return c2;
+        }
+        return aero::VisualNodeId{};
+    };
+
+    auto loadSample = [&](const char* name, int frames = 55) -> aero::VisualNodeId {
+        aero::UnifiedValue ret{};
+        const bool okCall = host.InvokeScriptMethod(
+            host.RootScriptObject(),
+            "SelectSampleByName",
+            {aero::UnifiedValue{aero::rs_rt::StringValue{std::string(name)}}},
+            &ret);
+        bool okBool = false;
+        (void)ret.tryGetBool(okBool);
+        Require(okCall && okBool, std::string("GalleryReported SelectSampleByName('") + name + "') failed");
+        for (int f = 0; f < frames; ++f) {
+            host.StepFrame(1.0f / 60.0f, f == (frames - 1));
+        }
+        const aero::VisualNodeId cid = activeSampleContainerId();
+        Require(cid.IsValid(), std::string("GalleryReported SampleContainer not active after loading ") + name);
+        return cid;
+    };
+
+    auto scrollActiveSampleTo = [&](aero::VisualNodeId containerId, aero::VisualNodeId targetId) {
+        if (!containerId.IsValid() || !targetId.IsValid()) { return; }
+        const aero::VisualNode* tn = host.World().GetNode(targetId);
+        if (!tn) { return; }
+        const aero::Rect vp = NodeViewportBounds(*tn);
+        if (vp.y >= 70.0f && vp.y + vp.height <= 760.0f) {
+            return;
+        }
+        std::vector<aero::VisualNodeId> svs;
+        CollectDescendantsByTypeName(host, containerId, "ScrollViewer", svs);
+        if (svs.empty()) { return; }
+        const aero::VisualNode* svNode = host.World().GetNode(svs[0]);
+        if (!svNode || !svNode->scriptOwner.valid()) { return; }
+        float curOff = 0.0f;
+        (void)ReadFloatMember(host, svNode->scriptOwner, "VerticalOffset", curOff);
+        const aero::Rect svVp = NodeViewportBounds(*svNode);
+        float nextOff = curOff + (vp.y - (svVp.y + 80.0f));
+        if (nextOff < 0.0f) { nextOff = 0.0f; }
+        (void)host.InvokeScriptMethod(
+            svNode->scriptOwner,
+            "ScrollToVerticalOffset",
+            {aero::UnifiedValue{aero::FloatValue{nextOff}}});
+        for (int f = 0; f < 4; ++f) {
+            host.StepFrame(1.0f / 60.0f, f == 3);
+        }
+    };
+
+    auto readItemAndContainerCounts = [&](aero::VisualNodeId ctrlId, std::int64_t& outItems, std::int64_t& outCont) {
+        outItems = -1;
+        outCont = -1;
+        const aero::VisualNode* n = host.World().GetNode(ctrlId);
+        if (!n || !n->scriptOwner.valid()) { return; }
+        aero::UnifiedValue r1{}, r2{};
+        if (host.InvokeScriptMethod(n->scriptOwner, "ItemCount", {}, &r1)) {
+            (void)r1.tryGetInt64(outItems);
+        }
+        if (host.InvokeScriptMethod(n->scriptOwner, "ContainerCount", {}, &r2)) {
+            (void)r2.tryGetInt64(outCont);
+        }
+    };
+
+    auto findVisibleDropdownPopup = [&](std::vector<aero::VisualNodeId>& outComboItems) -> aero::VisualNodeId {
+        outComboItems.clear();
+        std::vector<aero::VisualNodeId> popups;
+        CollectVisualNodesByOwnerName(host, "PART_Popup", popups);
+        for (aero::VisualNodeId pid : popups) {
+            const aero::VisualNode* pn = host.World().GetNode(pid);
+            if (pn && pn->layout.visibility == aero::Visibility::Visible) {
+                CollectDescendantsByTypeName(host, pid, "ComboBoxItem", outComboItems);
+                return pid;
+            }
+        }
+        return aero::VisualNodeId{};
+    };
+
+    // 1. ComboBox sub-page: item counts + dropdown open on Colors, FontFamilies, FontSizes
+    {
+        const aero::VisualNodeId cid = loadSample("ComboBox");
+        if (cid.IsValid()) {
+            const char* kComboNames[3] = {"Colors", "FontFamilies", "FontSizes"};
+            const std::int64_t kExpectedItems[3] = {3, 3, 8};
+            for (int ciIdx = 0; ciIdx < 3; ++ciIdx) {
+                const char* cbName = kComboNames[ciIdx];
+                const aero::VisualNodeId cbId = FindDescendantByOwnerName(host, cid, cbName);
+                Require(cbId.IsValid(), std::string("Gallery/ComboBox missing ") + cbName);
+                if (!cbId.IsValid()) { continue; }
+                scrollActiveSampleTo(cid, cbId);
+                const aero::VisualNode* cbNode = host.World().GetNode(cbId);
+                std::int64_t itemCnt = -1, contCnt = -1;
+                readItemAndContainerCounts(cbId, itemCnt, contCnt);
+                const aero::Rect cbVp = cbNode ? NodeViewportBounds(*cbNode) : aero::Rect{};
+                std::cout << "[DIAG][ComboBox][" << cbName << "] items=" << itemCnt
+                          << " containers=" << contCnt
+                          << " vp=(" << cbVp.x << "," << cbVp.y << " " << cbVp.width << "x" << cbVp.height << ")\n";
+                Require(itemCnt == kExpectedItems[ciIdx] && contCnt == kExpectedItems[ciIdx],
+                    std::string("Gallery/ComboBox ") + cbName + " expected " +
+                    std::to_string(kExpectedItems[ciIdx]) + " items/containers (got items=" +
+                    std::to_string(itemCnt) + ", containers=" + std::to_string(contCnt) + ")");
+                Require(cbVp.width > 20.0f && cbVp.height > 10.0f,
+                    std::string("Gallery/ComboBox ") + cbName + " degenerate viewport bounds");
+
+                // Click arrow toggle region near right edge (works for both normal and IsEditable ComboBoxes)
+                host.InjectClick(cbVp.x + cbVp.width - 14.0f, cbVp.y + cbVp.height * 0.5f);
+                for (int f = 0; f < 6; ++f) {
+                    host.StepFrame(1.0f / 60.0f, f == 5);
+                }
+                bool isOpen = false;
+                if (cbNode && cbNode->scriptOwner.valid()) {
+                    (void)ReadBoolMember(host, cbNode->scriptOwner, "IsDropDownOpen", isOpen);
+                }
+                std::vector<aero::VisualNodeId> popItems;
+                const aero::VisualNodeId visPopId = findVisibleDropdownPopup(popItems);
+                const aero::VisualNode* visPopNode = visPopId.IsValid() ? host.World().GetNode(visPopId) : nullptr;
+                const aero::Rect popVp = visPopNode ? NodeViewportBounds(*visPopNode) : aero::Rect{};
+                std::cout << "[DIAG][ComboBox][" << cbName << "] afterClick IsDropDownOpen=" << (isOpen ? 1 : 0)
+                          << " visPop=" << (visPopId.IsValid() ? 1 : 0)
+                          << " popItems=" << popItems.size()
+                          << " popVp=(" << popVp.x << "," << popVp.y << " " << popVp.width << "x" << popVp.height << ")\n";
+                Require(isOpen && visPopId.IsValid() && popVp.width > 20.0f && popVp.height > 20.0f &&
+                        static_cast<std::int64_t>(popItems.size()) >= kExpectedItems[ciIdx],
+                    std::string("Gallery/ComboBox ") + cbName + " failed to open dropdown with items (open=" +
+                    std::to_string(isOpen ? 1 : 0) + ", popItems=" + std::to_string(popItems.size()) + ")");
+
+                // Dismiss popup via Escape before testing next ComboBox
+                host.InjectKey(aero::KeyCode::Escape, true);
+                host.InjectKey(aero::KeyCode::Escape, false);
+                for (int f = 0; f < 4; ++f) {
+                    host.StepFrame(1.0f / 60.0f, f == 3);
+                }
+            }
+        }
+    }
+
+    // 2. ListBox sub-page: List1 (10 items), SelectionMode ComboBox opens, second ListBox (ItemsSource=10 items)
+    {
+        const aero::VisualNodeId cid = loadSample("ListBox");
+        if (cid.IsValid()) {
+            const aero::VisualNodeId list1Id = FindDescendantByOwnerName(host, cid, "List1");
+            Require(list1Id.IsValid(), "Gallery/ListBox missing List1");
+            if (list1Id.IsValid()) {
+                std::int64_t itemCnt = -1, contCnt = -1;
+                readItemAndContainerCounts(list1Id, itemCnt, contCnt);
+                std::vector<aero::VisualNodeId> realized;
+                CollectDescendantsByTypeName(host, list1Id, "ListBoxItem", realized);
+                std::string txt;
+                CollectSubtreeText(host.World(), list1Id, txt);
+                std::cout << "[DIAG][ListBox][List1] itemCnt=" << itemCnt << " contCnt=" << contCnt
+                          << " realized=" << realized.size() << " text='" << txt.substr(0, 60) << "'\n";
+                Require(itemCnt == 10 && realized.size() == 10u && txt.find("Item 0") != std::string::npos,
+                    "Gallery/ListBox List1 should have 10 ListBoxItems");
+            }
+            const aero::VisualNodeId selModeId = FindDescendantByOwnerName(host, cid, "SelectionMode");
+            Require(selModeId.IsValid(), "Gallery/ListBox missing SelectionMode ComboBox");
+            if (selModeId.IsValid()) {
+                scrollActiveSampleTo(cid, selModeId);
+                const aero::VisualNode* smNode = host.World().GetNode(selModeId);
+                const aero::Rect smVp = NodeViewportBounds(*smNode);
+                host.InjectClick(smVp.x + smVp.width - 14.0f, smVp.y + smVp.height * 0.5f);
+                for (int f = 0; f < 6; ++f) {
+                    host.StepFrame(1.0f / 60.0f, f == 5);
+                }
+                bool isOpen = false;
+                (void)ReadBoolMember(host, smNode->scriptOwner, "IsDropDownOpen", isOpen);
+                std::vector<aero::VisualNodeId> popItems;
+                const aero::VisualNodeId visPopId = findVisibleDropdownPopup(popItems);
+                std::cout << "[DIAG][ListBox][SelectionMode] IsDropDownOpen=" << (isOpen ? 1 : 0)
+                          << " popItems=" << popItems.size() << "\n";
+                Require(isOpen && visPopId.IsValid() && popItems.size() == 3u,
+                    "Gallery/ListBox SelectionMode ComboBox should open with 3 items");
+                host.InjectKey(aero::KeyCode::Escape, true);
+                host.InjectKey(aero::KeyCode::Escape, false);
+                host.StepFrame(1.0f / 60.0f, true);
+            }
+            std::vector<aero::VisualNodeId> allLbs;
+            CollectDescendantsByTypeName(host, cid, "ListBox", allLbs);
+            std::cout << "[DIAG][ListBox] total ListBox count=" << allLbs.size() << "\n";
+            Require(allLbs.size() >= 2u, "Gallery/ListBox expected >= 2 ListBoxes");
+            if (allLbs.size() >= 2u) {
+                std::int64_t ic2 = -1, cc2 = -1;
+                readItemAndContainerCounts(allLbs[1], ic2, cc2);
+                std::vector<aero::VisualNodeId> realized2;
+                CollectDescendantsByTypeName(host, allLbs[1], "ListBoxItem", realized2);
+                std::cout << "[DIAG][ListBox][ItemsSource] itemCnt=" << ic2 << " contCnt=" << cc2
+                          << " realized=" << realized2.size() << "\n";
+                Require(ic2 == 10 && realized2.size() == 10u,
+                    "Gallery/ListBox #2 (ItemsSource) should realize 10 ListBoxItems (got items=" +
+                    std::to_string(ic2) + ", realized=" + std::to_string(realized2.size()) + ")");
+            }
+        }
+    }
+
+    // 3. ListView sub-page: 15 rows + column headers + text
+    {
+        const aero::VisualNodeId cid = loadSample("ListView");
+        if (cid.IsValid()) {
+            std::vector<aero::VisualNodeId> lvs;
+            CollectDescendantsByTypeName(host, cid, "ListView", lvs);
+            Require(!lvs.empty(), "Gallery/ListView missing ListView");
+            if (!lvs.empty()) {
+                std::int64_t ic = -1, cc = -1;
+                readItemAndContainerCounts(lvs[0], ic, cc);
+                std::vector<aero::VisualNodeId> items, hdrs;
+                CollectDescendantsByTypeName(host, lvs[0], "ListViewItem", items);
+                CollectDescendantsByTypeName(host, lvs[0], "GridViewColumnHeader", hdrs);
+                std::string txt;
+                CollectSubtreeText(host.World(), lvs[0], txt);
+                std::cout << "[DIAG][ListView] itemCnt=" << ic << " contCnt=" << cc
+                          << " items=" << items.size() << " hdrs=" << hdrs.size()
+                          << " text='" << txt.substr(0, 80) << "'\n";
+                Require(ic == 15 && items.size() >= 15u && hdrs.size() >= 5u &&
+                        txt.find("Carrot") != std::string::npos &&
+                        txt.find("Broccoli") != std::string::npos &&
+                        txt.find("#1") != std::string::npos &&
+                        txt.find("0.69") != std::string::npos,
+                    "Gallery/ListView expected 15 ListViewItems, >=5 headers, and Carrot/Broccoli rows");
+            }
+        }
+    }
+
+    // 4. TreeView sub-page: Tree1 (7 root items) + Tree2 (ItemsSource FileSystem -> Computer)
+    {
+        const aero::VisualNodeId cid = loadSample("TreeView");
+        if (cid.IsValid()) {
+            std::vector<aero::VisualNodeId> tvs;
+            CollectDescendantsByTypeName(host, cid, "TreeView", tvs);
+            Require(tvs.size() >= 2u, "Gallery/TreeView expected >= 2 TreeViews (got " + std::to_string(tvs.size()) + ")");
+            if (!tvs.empty()) {
+                std::int64_t ic1 = -1, cc1 = -1;
+                readItemAndContainerCounts(tvs[0], ic1, cc1);
+                std::vector<aero::VisualNodeId> tvis1;
+                CollectDescendantsByTypeName(host, tvs[0], "TreeViewItem", tvis1);
+                std::string txt1;
+                CollectSubtreeText(host.World(), tvs[0], txt1);
+                std::cout << "[DIAG][TreeView][Tree1] itemCnt=" << ic1 << " contCnt=" << cc1
+                          << " allTreeItems=" << tvis1.size() << " text='" << txt1.substr(0, 60) << "'\n";
+                Require(ic1 == 7 && tvis1.size() >= 7u && txt1.find("Level 1") != std::string::npos,
+                    "Gallery/TreeView Tree1 expected 7 root TreeViewItems");
+            }
+            if (tvs.size() >= 2u) {
+                scrollActiveSampleTo(cid, tvs[1]);
+                std::int64_t ic2 = -1, cc2 = -1;
+                readItemAndContainerCounts(tvs[1], ic2, cc2);
+                std::vector<aero::VisualNodeId> tvis2;
+                CollectDescendantsByTypeName(host, tvs[1], "TreeViewItem", tvis2);
+                std::string txt2;
+                CollectSubtreeText(host.World(), tvs[1], txt2);
+                std::cout << "[DIAG][TreeView][Tree2] itemCnt=" << ic2 << " contCnt=" << cc2
+                          << " allTreeItems=" << tvis2.size() << " text='" << txt2.substr(0, 80) << "'\n";
+                Require(ic2 >= 1 && !tvis2.empty() && txt2.find("Computer") != std::string::npos,
+                    "Gallery/TreeView #2 (ItemsSource) expected realized TreeViewItem containing 'Computer'");
+            }
+        }
+    }
+
+    // 5. TabControl sub-page: TabControl #1 (3 TabItems) + TabControl #2 (ItemsSource + ContentTemplate)
+    {
+        const aero::VisualNodeId cid = loadSample("TabControl");
+        if (cid.IsValid()) {
+            std::vector<aero::VisualNodeId> tcs;
+            CollectDescendantsByTypeName(host, cid, "TabControl", tcs);
+            Require(tcs.size() >= 2u, "Gallery/TabControl expected >= 2 TabControls (got " + std::to_string(tcs.size()) + ")");
+            if (!tcs.empty()) {
+                std::int64_t ic1 = -1, cc1 = -1;
+                readItemAndContainerCounts(tcs[0], ic1, cc1);
+                std::vector<aero::VisualNodeId> tabs1;
+                CollectDescendantsByTypeName(host, tcs[0], "TabItem", tabs1);
+                std::string txt1;
+                CollectSubtreeText(host.World(), tcs[0], txt1);
+                std::cout << "[DIAG][TabControl][1] itemCnt=" << ic1 << " contCnt=" << cc1
+                          << " tabs=" << tabs1.size() << " text='" << txt1.substr(0, 60) << "'\n";
+                Require(ic1 == 3 && tabs1.size() == 3u && txt1.find("Page 1") != std::string::npos,
+                    "Gallery/TabControl #1 expected 3 TabItems with Page 1..3");
+            }
+            if (tcs.size() >= 2u) {
+                scrollActiveSampleTo(cid, tcs[1]);
+                std::int64_t ic2 = -1, cc2 = -1;
+                readItemAndContainerCounts(tcs[1], ic2, cc2);
+                std::vector<aero::VisualNodeId> tabs2;
+                CollectDescendantsByTypeName(host, tcs[1], "TabItem", tabs2);
+                std::string txt2;
+                CollectSubtreeText(host.World(), tcs[1], txt2);
+                std::cout << "[DIAG][TabControl][2] itemCnt=" << ic2 << " contCnt=" << cc2
+                          << " tabs=" << tabs2.size() << " text='" << txt2.substr(0, 120) << "'\n";
+                Require(ic2 == 3 && tabs2.size() == 3u &&
+                        txt2.find("10") != std::string::npos &&
+                        txt2.find("Lorem ipsum") != std::string::npos,
+                    "Gallery/TabControl #2 (ItemsSource) expected 3 tabs and ContentTemplate Lorem ipsum content");
+            }
+        }
+    }
+
+    // 6. Menu sub-page: top-level MenuItems render with bounds & clicking "File" opens submenu popup
+    {
+        const aero::VisualNodeId cid = loadSample("Menu");
+        if (cid.IsValid()) {
+            std::vector<aero::VisualNodeId> menus;
+            CollectDescendantsByTypeName(host, cid, "Menu", menus);
+            std::cout << "[DIAG][Menu] menuCount=" << menus.size() << "\n";
+            Require(!menus.empty(), "Gallery/Menu missing Menu controls");
+            if (!menus.empty()) {
+                std::int64_t ic = -1, cc = -1;
+                readItemAndContainerCounts(menus[0], ic, cc);
+                std::vector<aero::VisualNodeId> mis;
+                CollectDescendantsByTypeName(host, menus[0], "MenuItem", mis);
+                std::string mTxt;
+                CollectSubtreeText(host.World(), menus[0], mTxt);
+                const aero::VisualNode* m0Node = host.World().GetNode(menus[0]);
+                const aero::Rect m0Vp = m0Node ? NodeViewportBounds(*m0Node) : aero::Rect{};
+                std::cout << "[DIAG][Menu][0] itemCnt=" << ic << " contCnt=" << cc
+                          << " menuItemNodes=" << mis.size()
+                          << " vp=(" << m0Vp.x << "," << m0Vp.y << " " << m0Vp.width << "x" << m0Vp.height << ")"
+                          << " text='" << mTxt.substr(0, 80) << "'\n";
+                Require(ic == 3 && m0Vp.width > 50.0f && m0Vp.height > 12.0f &&
+                        mTxt.find("File") != std::string::npos &&
+                        mTxt.find("Edit") != std::string::npos &&
+                        mTxt.find("Help") != std::string::npos,
+                    "Gallery/Menu #0 should realize File/Edit/Help MenuItems with non-zero bounds");
+                if (!mis.empty()) {
+                    const aero::VisualNode* fileNode = host.World().GetNode(mis[0]);
+                    const aero::Rect fVp = fileNode ? NodeViewportBounds(*fileNode) : aero::Rect{};
+                    std::cout << "[DIAG][Menu][File] vp=(" << fVp.x << "," << fVp.y << " " << fVp.width << "x" << fVp.height << ")\n";
+                    Require(fVp.width > 10.0f && fVp.height > 10.0f, "Gallery/Menu File MenuItem degenerate bounds");
+                    host.InjectClick(fVp.x + fVp.width * 0.5f, fVp.y + fVp.height * 0.5f);
+                    for (int f = 0; f < 6; ++f) {
+                        host.StepFrame(1.0f / 60.0f, f == 5);
+                    }
+                    bool subOpen = false;
+                    if (fileNode && fileNode->scriptOwner.valid()) {
+                        (void)ReadBoolMember(host, fileNode->scriptOwner, "IsSubmenuOpen", subOpen);
+                    }
+                    std::cout << "[DIAG][Menu][File] IsSubmenuOpen=" << (subOpen ? 1 : 0) << "\n";
+                    Require(subOpen, "Gallery/Menu clicking File should set IsSubmenuOpen=true");
+                    host.InjectKey(aero::KeyCode::Escape, true);
+                    host.InjectKey(aero::KeyCode::Escape, false);
+                    host.StepFrame(1.0f / 60.0f, true);
+                }
+            }
+        }
+    }
+
+    // 7. ContextMenu sub-page: right-click popup position near cursor + Section 3 RemoveElementAction
+    {
+        const aero::VisualNodeId cid = loadSample("ContextMenu");
+        if (cid.IsValid()) {
+            std::vector<aero::VisualNodeId> borders;
+            CollectDescendantsByTypeName(host, cid, "Border", borders);
+            aero::VisualNodeId targetBorderId;
+            for (aero::VisualNodeId bid : borders) {
+                std::string bTxt;
+                CollectSubtreeText(host.World(), bid, bTxt);
+                if (bTxt.find("Right click to open Context Menu") != std::string::npos) {
+                    const aero::VisualNode* bn = host.World().GetNode(bid);
+                    if (bn && bn->layout.layoutRect.width > 100.0f && bn->layout.layoutRect.width < 500.0f) {
+                        targetBorderId = bid;
+                        break;
+                    }
+                }
+            }
+            Require(targetBorderId.IsValid(), "Gallery/ContextMenu target Border missing");
+            if (targetBorderId.IsValid()) {
+                scrollActiveSampleTo(cid, targetBorderId);
+                const aero::VisualNode* tb = host.World().GetNode(targetBorderId);
+                const aero::Rect tbVp = NodeViewportBounds(*tb);
+                const float clickX = tbVp.x + tbVp.width * 0.5f;
+                const float clickY = tbVp.y + tbVp.height * 0.5f;
+                host.InjectClick(clickX, clickY, aero::PointerButton::Right);
+                for (int f = 0; f < 6; ++f) {
+                    host.StepFrame(1.0f / 60.0f, f == 5);
+                }
+                std::vector<aero::VisualNodeId> cms;
+                CollectDescendantsByTypeName(host, host.RootVisualNode(), "ContextMenu", cms);
+                aero::VisualNodeId openCmId;
+                for (aero::VisualNodeId cmId : cms) {
+                    const aero::VisualNode* cmNode = host.World().GetNode(cmId);
+                    bool isOpen = false;
+                    if (cmNode && cmNode->scriptOwner.valid() &&
+                        ReadBoolMember(host, cmNode->scriptOwner, "IsOpen", isOpen) && isOpen) {
+                        openCmId = cmId;
+                        break;
+                    }
+                }
+                const aero::VisualNode* openCmNode = openCmId.IsValid() ? host.World().GetNode(openCmId) : nullptr;
+                const aero::Rect cmVp = openCmNode ? NodeViewportBounds(*openCmNode) : aero::Rect{};
+                std::string cmTxt;
+                if (openCmId.IsValid()) { CollectSubtreeText(host.World(), openCmId, cmTxt); }
+                std::cout << "[DIAG][ContextMenu] click=(" << clickX << "," << clickY << ") open="
+                          << (openCmId.IsValid() ? 1 : 0) << " cmVp=(" << cmVp.x << "," << cmVp.y
+                          << " " << cmVp.width << "x" << cmVp.height << ") text='" << cmTxt << "'\n";
+                Require(openCmId.IsValid() && cmVp.width > 40.0f && cmVp.height > 20.0f &&
+                        std::fabs(cmVp.x - clickX) < 40.0f && std::fabs(cmVp.y - clickY) < 40.0f &&
+                        cmTxt.find("Option 1") != std::string::npos,
+                    "Gallery/ContextMenu right-click popup should open near click (x,y) without double offset");
+                host.InjectKey(aero::KeyCode::Escape, true);
+                host.InjectKey(aero::KeyCode::Escape, false);
+                host.StepFrame(1.0f / 60.0f, true);
+            }
+
+            // Also check section 3 ListBox (9 items) and Remove Action
+            std::vector<aero::VisualNodeId> lbs;
+            CollectDescendantsByTypeName(host, cid, "ListBox", lbs);
+            if (!lbs.empty()) {
+                scrollActiveSampleTo(cid, lbs[0]);
+                std::vector<aero::VisualNodeId> lbItems;
+                CollectDescendantsByTypeName(host, lbs[0], "ListBoxItem", lbItems);
+                std::cout << "[DIAG][ContextMenu][ListBox] itemCount=" << lbItems.size() << "\n";
+                Require(lbItems.size() == 9u,
+                    "Gallery/ContextMenu ListBox expected 9 ListBoxItems (got " + std::to_string(lbItems.size()) + ")");
+            }
+        }
+    }
+
+    // 8. Canvas sub-page: zIndex1 slider updates Canvas.ZIndex on child 1
+    {
+        const aero::VisualNodeId cid = loadSample("Canvas");
+        if (cid.IsValid()) {
+            const aero::VisualNodeId s1Id = FindDescendantByOwnerName(host, cid, "zIndex1");
+            const aero::VisualNodeId s4Id = FindDescendantByOwnerName(host, cid, "zIndex4");
+            std::vector<aero::VisualNodeId> canvases;
+            CollectDescendantsByTypeName(host, cid, "Canvas", canvases);
+            Require(s1Id.IsValid() && s4Id.IsValid() && !canvases.empty(), "Gallery/Canvas missing sliders or Canvas");
+            if (s1Id.IsValid() && !canvases.empty()) {
+                scrollActiveSampleTo(cid, s1Id);
+                const aero::VisualNode* cNode = host.World().GetNode(canvases[0]);
+                Require(cNode && cNode->children.size() >= 4u, "Gallery/Canvas expected 4 child Borders");
+                if (cNode && cNode->children.size() >= 4u) {
+                    const aero::VisualNodeId b1Id = cNode->children[0];
+                    const aero::VisualNodeId b2Id = cNode->children[1];
+                    const aero::VisualNodeId b3Id = cNode->children[2];
+                    const aero::VisualNodeId b4Id = cNode->children[3];
+                    auto zOf = [&](aero::VisualNodeId nid) -> std::int32_t {
+                        const aero::VisualNode* n = host.World().GetNode(nid);
+                        return n ? n->layout.zIndex : -999;
+                    };
+                    std::cout << "[DIAG][Canvas] initial zIndex=(" << zOf(b1Id) << "," << zOf(b2Id)
+                              << "," << zOf(b3Id) << "," << zOf(b4Id) << ")\n";
+                    Require(zOf(b4Id) == 3,
+                        "Gallery/Canvas initial zIndex4 child should bind to 3 (got " + std::to_string(zOf(b4Id)) + ")");
+                    std::vector<std::uint8_t> canvasBefore;
+                    (void)host.RenderHeadlessRgba(1280u, 800u, canvasBefore);
+
+                    const aero::VisualNode* s1Node = host.World().GetNode(s1Id);
+                    const aero::Rect s1Vp = NodeViewportBounds(*s1Node);
+                    const aero::VisualNodeId thumbId = FindDescendantByOwnerName(host, s1Id, "Thumb");
+                    const aero::VisualNode* thumbNode = thumbId.IsValid() ? host.World().GetNode(thumbId) : nullptr;
+                    if (thumbNode) {
+                        const aero::Rect tVp = NodeViewportBounds(*thumbNode);
+                        const float startX = tVp.x + tVp.width * 0.5f;
+                        const float midY = tVp.y + tVp.height * 0.5f;
+                        const float endX = s1Vp.x + s1Vp.width - 12.0f;
+                        host.InjectPointerMove(startX, midY);
+                        host.StepFrame(1.0f / 60.0f, false);
+                        host.InjectPointerButton(startX, midY, aero::PointerButton::Left, true);
+                        host.StepFrame(1.0f / 60.0f, false);
+                        host.InjectPointerMove(endX, midY);
+                        host.StepFrame(1.0f / 60.0f, false);
+                        host.InjectPointerButton(endX, midY, aero::PointerButton::Left, false);
+                    } else {
+                        for (int ci = 0; ci < 5; ++ci) {
+                            host.InjectClick(s1Vp.x + s1Vp.width - 20.0f, s1Vp.y + s1Vp.height * 0.5f);
+                            host.StepFrame(1.0f / 60.0f, false);
+                        }
+                    }
+                    for (int f = 0; f < 6; ++f) {
+                        host.StepFrame(1.0f / 60.0f, f == 5);
+                    }
+                    float s1Val = 0.0f;
+                    (void)ReadFloatMember(host, s1Node->scriptOwner, "Value", s1Val);
+                    std::cout << "[DIAG][Canvas] after zIndex1 click val=" << s1Val
+                              << " zIndex1Child=" << zOf(b1Id) << " zIndex4Child=" << zOf(b4Id) << "\n";
+                    std::vector<std::uint8_t> canvasAfter;
+                    (void)host.RenderHeadlessRgba(1280u, 800u, canvasAfter);
+                    const std::size_t diff = CountChangedPixels(canvasBefore, canvasAfter);
+                    std::cout << "[DIAG][Canvas] pixelDiff=" << diff << "\n";
+                    Require(s1Val >= 4.0f && zOf(b1Id) >= 4 && zOf(b4Id) == 3 && diff > 200u,
+                        "Gallery/Canvas moving zIndex1 slider must update b1 zIndex and change rendered pixels (val=" +
+                        std::to_string(s1Val) + ", z1=" + std::to_string(zOf(b1Id)) + ", diff=" + std::to_string(diff) + ")");
+                }
+            }
+        }
+    }
+
+    // 9. Expander sub-page: clicking collapsed Expander ("Audio Options" / "Down") expands it
+    {
+        const aero::VisualNodeId cid = loadSample("Expander");
+        if (cid.IsValid()) {
+            std::vector<aero::VisualNodeId> expanders;
+            CollectDescendantsByTypeName(host, cid, "Expander", expanders);
+            std::cout << "[DIAG][Expander] count=" << expanders.size() << "\n";
+            Require(expanders.size() >= 6u, "Gallery/Expander expected >= 6 Expander controls");
+            if (expanders.size() >= 2u) {
+                for (std::size_t ei = 0u; ei < expanders.size(); ++ei) {
+                    const aero::VisualNode* en = host.World().GetNode(expanders[ei]);
+                    bool isExp = false;
+                    (void)ReadBoolMember(host, en->scriptOwner, "IsExpanded", isExp);
+                    const aero::VisualNodeId cbId = FindDescendantByOwnerName(host, expanders[ei], "ContentBorder");
+                    const aero::VisualNode* cbNode = cbId.IsValid() ? host.World().GetNode(cbId) : nullptr;
+                    std::cout << "[DIAG][Expander][" << ei << "] init IsExpanded=" << (isExp ? 1 : 0)
+                              << " ContentBorderVis=" << (cbNode ? static_cast<int>(cbNode->layout.visibility) : -1) << "\n";
+                    if (ei == 0u) {
+                        Require(isExp && cbNode && cbNode->layout.visibility == aero::Visibility::Visible,
+                            "Gallery/Expander[0] should start expanded with Visible ContentBorder");
+                    }
+                }
+                const aero::VisualNodeId audioExpId = expanders[1];
+                scrollActiveSampleTo(cid, audioExpId);
+                const aero::VisualNodeId hdrBtnId = FindDescendantByOwnerName(host, audioExpId, "ExpanderButton");
+                const aero::VisualNodeId clickId = hdrBtnId.IsValid() ? hdrBtnId : audioExpId;
+                const aero::VisualNode* clickNode = host.World().GetNode(clickId);
+                const aero::Rect cVp = NodeViewportBounds(*clickNode);
+                host.InjectClick(cVp.x + cVp.width * 0.5f, cVp.y + cVp.height * 0.5f);
+                for (int f = 0; f < 25; ++f) {
+                    host.StepFrame(1.0f / 60.0f, f == 24);
+                }
+                const aero::VisualNode* audioAfter = host.World().GetNode(audioExpId);
+                bool audioExp = false;
+                (void)ReadBoolMember(host, audioAfter->scriptOwner, "IsExpanded", audioExp);
+                const aero::VisualNodeId cbId = FindDescendantByOwnerName(host, audioExpId, "ContentBorder");
+                const aero::VisualNodeId cbgId = FindDescendantByOwnerName(host, audioExpId, "ContentBg");
+                const aero::VisualNode* cbNode = cbId.IsValid() ? host.World().GetNode(cbId) : nullptr;
+                const aero::VisualNode* cbgNode = cbgId.IsValid() ? host.World().GetNode(cbgId) : nullptr;
+                std::cout << "[DIAG][Expander][1] after click IsExpanded=" << (audioExp ? 1 : 0)
+                          << " ContentBorderVis=" << (cbNode ? static_cast<int>(cbNode->layout.visibility) : -1)
+                          << " ContentBg.sy=" << (cbgNode ? cbgNode->transform2D.sy : -1.0f) << "\n";
+                Require(audioExp && cbNode && cbNode->layout.visibility == aero::Visibility::Visible &&
+                        cbgNode && cbgNode->transform2D.sy > 0.5f,
+                    "Gallery/Expander clicking Audio Options should expand it (exp=" +
+                    std::to_string(audioExp ? 1 : 0) + ", vis=" +
+                    std::to_string(cbNode ? static_cast<int>(cbNode->layout.visibility) : -1) +
+                    ", sy=" + std::to_string(cbgNode ? cbgNode->transform2D.sy : -1.0f) + ")");
+            }
+        }
+    }
+
+    // 10. Memory stability loop: 2 full rounds across all 9 sub-pages (18 switches)
+    {
+        const std::array<const char*, 9> kPages = {
+            "ComboBox", "ListBox", "ListView", "TreeView", "TabControl",
+            "Menu", "ContextMenu", "Canvas", "Expander"
+        };
+        std::size_t round1EndLiveNodes = 0u, round2EndLiveNodes = 0u;
+        std::size_t round1EndBrushes = 0u, round2EndBrushes = 0u;
+        std::size_t round1EndHeapObjs = 0u, round2EndHeapObjs = 0u;
+        std::size_t round1EndHeapBytes = 0u, round2EndHeapBytes = 0u;
+        double round1EndPrivMb = 0.0, round2EndPrivMb = 0.0;
+
+        for (int round = 0; round < 2; ++round) {
+            for (const char* pg : kPages) {
+                (void)loadSample(pg, 10);
+                // Force a GC cycle via collectFull? Only use step frames (host's real incremental GC + dispose hooks)
+                // plus print live heap stats.
+                double privMb = 0.0, workMb = 0.0;
+                readProcMemMb(privMb, workMb);
+                const std::size_t liveNodes = host.World().LiveNodeCount();
+                const std::size_t renderNodes = host.RenderTree().NodeCount();
+                const std::size_t storeBrushes = host.ResourceStore() ? host.ResourceStore()->GradientBrushes().BrushCount() : 0u;
+                const std::size_t defBrushes = aero::GradientBrushRegistry::Instance().BrushCount();
+                const std::size_t heapObjs = host.Domains().uiHeap().liveObjects();
+                const std::size_t heapBytes = host.Domains().uiHeap().liveBytes();
+                std::cout << "[MEM][R" << (round + 1) << "][" << pg << "] nodes=" << liveNodes
+                          << " render=" << renderNodes
+                          << " brushes=" << storeBrushes << "/" << defBrushes
+                          << " uiObjs=" << heapObjs << " uiKB=" << (heapBytes / 1024u)
+                          << " privMB=" << std::fixed << std::setprecision(1) << privMb
+                          << " wsMB=" << workMb << "\n";
+                round2EndLiveNodes = liveNodes;
+                round2EndBrushes = storeBrushes;
+                round2EndHeapObjs = heapObjs;
+                round2EndHeapBytes = heapBytes;
+                round2EndPrivMb = privMb;
+            }
+            if (round == 0) {
+                round1EndLiveNodes = round2EndLiveNodes;
+                round1EndBrushes = round2EndBrushes;
+                round1EndHeapObjs = round2EndHeapObjs;
+                round1EndHeapBytes = round2EndHeapBytes;
+                round1EndPrivMb = round2EndPrivMb;
+            }
+        }
+        std::cout << "[MEM][SUMMARY] R1->R2 delta nodes="
+                  << static_cast<long long>(round2EndLiveNodes) - static_cast<long long>(round1EndLiveNodes)
+                  << " brushes=" << static_cast<long long>(round2EndBrushes) - static_cast<long long>(round1EndBrushes)
+                  << " uiObjs=" << static_cast<long long>(round2EndHeapObjs) - static_cast<long long>(round1EndHeapObjs)
+                  << " uiKB=" << (static_cast<long long>(round2EndHeapBytes) - static_cast<long long>(round1EndHeapBytes)) / 1024LL
+                  << " privMB=" << (round2EndPrivMb - round1EndPrivMb) << "\n";
+        Require(round2EndLiveNodes <= round1EndLiveNodes + 40u,
+            "Gallery page switching should not leak VisualNodes across rounds (R1=" +
+            std::to_string(round1EndLiveNodes) + ", R2=" + std::to_string(round2EndLiveNodes) + ")");
+        Require(round2EndBrushes <= round1EndBrushes + 16u,
+            "Gallery page switching should not leak cloned GradientBrushes across rounds (R1=" +
+            std::to_string(round1EndBrushes) + ", R2=" + std::to_string(round2EndBrushes) + ")");
+        Require(round2EndHeapObjs <= round1EndHeapObjs + 500u &&
+                round2EndPrivMb - round1EndPrivMb < 15.0,
+            "Gallery page switching should not monotonically leak managed objects or process memory across rounds");
+    }
+}
+
 void TestInteractiveRive(aero::rs_comp::CompilerSession&) {
     std::cout << "[Interactive] Rive...\n";
     aero::AeroV3CompileInput ci;
@@ -4084,6 +4735,9 @@ int main(int argc, char** argv) {
         if (want("customcontrol")) { TestInteractiveCustomControlAndTheme(sharedSession); }
         if (want("databinding")) { TestInteractiveDataBinding(sharedSession); }
         if (want("gallery")) { TestInteractiveGallery(sharedSession); }
+        if (want("--only-gallery-subpages") || want("gallerysubpages")) {
+            TestInteractiveGalleryReportedSubPages(sharedSession);
+        }
         if (want("integration")) { TestInteractiveIntegration(sharedSession); }
         if (want("login")) { TestInteractiveLogin(sharedSession); }
         if (want("tictactoe")) { TestInteractiveTicTacToe(sharedSession); }
@@ -4105,6 +4759,7 @@ int main(int argc, char** argv) {
         TestInteractiveButtons(sharedSession);
         TestInteractiveDataBinding(sharedSession);
         TestInteractiveGallery(sharedSession);
+        TestInteractiveGalleryReportedSubPages(sharedSession);
         TestInteractiveIntegration(sharedSession);
         TestInteractiveLogin(sharedSession);
         TestInteractiveTicTacToe(sharedSession);

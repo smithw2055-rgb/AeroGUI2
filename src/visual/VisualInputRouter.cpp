@@ -360,6 +360,67 @@ void CollectFocusablesRecursive(
     return false;
 }
 
+[[nodiscard]] bool IsNodeDescendantOrSelf(
+    const VisualWorld* world,
+    VisualNodeId ancestor,
+    VisualNodeId candidate) noexcept {
+    if (!world || !ancestor.IsValid() || !candidate.IsValid()) {
+        return false;
+    }
+    VisualNodeId cur = candidate;
+    std::size_t hops = 0u;
+    const std::size_t maxHops = world->LiveNodeCount() + 1u;
+    while (cur.IsValid() && hops < maxHops) {
+        if (cur == ancestor) {
+            return true;
+        }
+        const VisualNode* n = world->GetNode(cur);
+        if (!n) {
+            break;
+        }
+        cur = n->parent;
+        ++hops;
+    }
+    return false;
+}
+
+void SyncHoverTransition(
+    VisualWorld* world,
+    const VisualInputRouter::ScriptEventDispatchFn& dispatcher,
+    VisualNodeId& hoveredNode,
+    VisualNodeId capturedNode,
+    VisualNodeId rawHit,
+    Point position,
+    std::uint8_t modifiers) {
+    const VisualNodeId effectiveHover = capturedNode.IsValid()
+        ? (IsNodeDescendantOrSelf(world, capturedNode, rawHit) ? rawHit : VisualNodeId{})
+        : rawHit;
+    if (effectiveHover == hoveredNode) {
+        return;
+    }
+    NativeInputEvent transitionEv{};
+    transitionEv.kind = NativeInputEventKind::PointerMove;
+    transitionEv.x = position.x;
+    transitionEv.y = position.y;
+    transitionEv.modifiers = modifiers;
+    // deltaX == 1.0 signals that PointerEnter immediately follows so LCA ancestor hover does not flicker.
+    transitionEv.deltaX = effectiveHover.IsValid() ? 1.0f : 0.0f;
+    bool dispatchedLeave = false;
+    if (hoveredNode.IsValid()) {
+        dispatchedLeave = DispatchWithCallbackMask(
+            world, dispatcher, hoveredNode, VisualCallback_PointerLeave, transitionEv, false);
+    }
+    hoveredNode = effectiveHover;
+    if (hoveredNode.IsValid()) {
+        transitionEv.deltaX = 0.0f;
+        (void)DispatchWithCallbackMask(
+            world, dispatcher, hoveredNode, VisualCallback_PointerEnter, transitionEv, false);
+    } else if (!dispatchedLeave && dispatcher) {
+        transitionEv.deltaX = 0.0f;
+        (void)dispatcher(VisualNodeId{}, VisualCallback_PointerLeave, transitionEv);
+    }
+}
+
 } // namespace
 
 bool VisualInputRouter::DispatchPointerMove(Point position, std::uint8_t modifiers) {
@@ -370,23 +431,9 @@ bool VisualInputRouter::DispatchPointerMove(Point position, std::uint8_t modifie
     if (world_ && capturedNode_.IsValid() && !world_->IsAlive(capturedNode_)) {
         capturedNode_ = VisualNodeId{};
     }
-    const VisualNodeId target = capturedNode_.IsValid() ? capturedNode_ : HitTest(position);
-    if (target != hoveredNode_) {
-        NativeInputEvent transitionEv{};
-        transitionEv.kind = NativeInputEventKind::PointerMove;
-        transitionEv.x = position.x;
-        transitionEv.y = position.y;
-        transitionEv.modifiers = modifiers;
-        if (hoveredNode_.IsValid()) {
-            (void)DispatchWithCallbackMask(
-                world_, scriptDispatcher_, hoveredNode_, VisualCallback_PointerLeave, transitionEv, false);
-        }
-        hoveredNode_ = target;
-        if (hoveredNode_.IsValid()) {
-            (void)DispatchWithCallbackMask(
-                world_, scriptDispatcher_, hoveredNode_, VisualCallback_PointerEnter, transitionEv, false);
-        }
-    }
+    const VisualNodeId rawHit = HitTest(position);
+    SyncHoverTransition(world_, scriptDispatcher_, hoveredNode_, capturedNode_, rawHit, position, modifiers);
+    const VisualNodeId target = capturedNode_.IsValid() ? capturedNode_ : rawHit;
     if (target.IsValid()) {
         NativeInputEvent ev{};
         ev.kind = NativeInputEventKind::PointerMove;
@@ -401,11 +448,26 @@ bool VisualInputRouter::DispatchPointerMove(Point position, std::uint8_t modifie
 
 bool VisualInputRouter::DispatchPointerDown(Point position, PointerButton button, std::uint8_t modifiers) {
     lastPointerPos_ = position;
+    if (world_ && hoveredNode_.IsValid() && !world_->IsAlive(hoveredNode_)) {
+        hoveredNode_ = VisualNodeId{};
+    }
     if (world_ && capturedNode_.IsValid() && !world_->IsAlive(capturedNode_)) {
         capturedNode_ = VisualNodeId{};
     }
-    const VisualNodeId target = capturedNode_.IsValid() ? capturedNode_ : HitTest(position);
+    const VisualNodeId rawHit = HitTest(position);
+    SyncHoverTransition(world_, scriptDispatcher_, hoveredNode_, capturedNode_, rawHit, position, modifiers);
+    const VisualNodeId target = capturedNode_.IsValid() ? capturedNode_ : rawHit;
     if (!target.IsValid()) {
+        if (scriptDispatcher_) {
+            NativeInputEvent ev{};
+            ev.kind = NativeInputEventKind::PointerButton;
+            ev.button = button;
+            ev.isDown = true;
+            ev.x = position.x;
+            ev.y = position.y;
+            ev.modifiers = modifiers;
+            return scriptDispatcher_(VisualNodeId{}, VisualCallback_PointerDown, ev);
+        }
         return false;
     }
 
@@ -438,13 +500,14 @@ bool VisualInputRouter::DispatchPointerDown(Point position, PointerButton button
 
 bool VisualInputRouter::DispatchPointerUp(Point position, PointerButton button, std::uint8_t modifiers) {
     lastPointerPos_ = position;
+    if (world_ && hoveredNode_.IsValid() && !world_->IsAlive(hoveredNode_)) {
+        hoveredNode_ = VisualNodeId{};
+    }
     if (world_ && capturedNode_.IsValid() && !world_->IsAlive(capturedNode_)) {
         capturedNode_ = VisualNodeId{};
     }
-    const VisualNodeId target = capturedNode_.IsValid() ? capturedNode_ : HitTest(position);
-    if (!target.IsValid()) {
-        return false;
-    }
+    const VisualNodeId rawHit = HitTest(position);
+    SyncHoverTransition(world_, scriptDispatcher_, hoveredNode_, capturedNode_, rawHit, position, modifiers);
     NativeInputEvent ev{};
     ev.kind = NativeInputEventKind::PointerButton;
     ev.button = button;
@@ -452,8 +515,27 @@ bool VisualInputRouter::DispatchPointerUp(Point position, PointerButton button, 
     ev.x = position.x;
     ev.y = position.y;
     ev.modifiers = modifiers;
-    return DispatchWithCallbackMask(
-        world_, scriptDispatcher_, target, VisualCallback_PointerUp, ev, true);
+    const VisualNodeId target = capturedNode_.IsValid() ? capturedNode_ : rawHit;
+    bool handled = false;
+    if (!target.IsValid()) {
+        if (scriptDispatcher_) {
+            handled = scriptDispatcher_(VisualNodeId{}, VisualCallback_PointerUp, ev);
+        }
+    } else {
+        handled = DispatchWithCallbackMask(
+            world_, scriptDispatcher_, target, VisualCallback_PointerUp, ev, true);
+    }
+    if (world_ && capturedNode_.IsValid() && !world_->IsAlive(capturedNode_)) {
+        capturedNode_ = VisualNodeId{};
+    }
+    if (!capturedNode_.IsValid()) {
+        if (world_ && hoveredNode_.IsValid() && !world_->IsAlive(hoveredNode_)) {
+            hoveredNode_ = VisualNodeId{};
+        }
+        SyncHoverTransition(
+            world_, scriptDispatcher_, hoveredNode_, VisualNodeId{}, HitTest(position), position, modifiers);
+    }
+    return handled;
 }
 
 bool VisualInputRouter::DispatchMouseWheel(

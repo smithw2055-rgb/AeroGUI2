@@ -27,8 +27,6 @@ using realscript::semantic::SymbolId;
 
 struct DeltaRingSlot {
     CollectionChangeRecord record{};
-    ManagedHeap::RootToken oldRoot = 0;
-    ManagedHeap::RootToken newRoot = 0;
 };
 
 struct OwnerBinding {
@@ -55,6 +53,7 @@ struct PerHeapState {
     std::size_t attachedDomainUsers = 0;
     std::vector<FieldListenerEntry> fieldListeners;
     std::unordered_map<std::uint64_t, ArrayTrackEntry> arrays;
+    std::unordered_map<std::uint64_t, std::vector<std::uint64_t>> ownerArrays;
     std::unordered_map<std::uint64_t, std::uint32_t> uiObserverCounts;
 };
 
@@ -67,43 +66,6 @@ struct GlobalHookRegistry {
 GlobalHookRegistry& hookRegistry() noexcept {
     static GlobalHookRegistry instance;
     return instance;
-}
-
-[[nodiscard]] ManagedHeap::RootToken maybeRetainValue(
-    ManagedHeap& heap,
-    const Value& value) {
-    const auto* objRef = std::get_if<ObjectRef>(&value);
-    if (!objRef || !objRef->valid() ||
-        objRef->heapId != static_cast<std::uint32_t>(heap.heapId())) {
-        return 0;
-    }
-    return heap.addPersistentRoot(*objRef);
-}
-
-void collectEntryRoots(
-    ArrayTrackEntry& entry,
-    std::vector<ManagedHeap::RootToken>& outTokens) {
-    for (auto& slot : entry.ring) {
-        if (slot.oldRoot != 0) {
-            outTokens.push_back(slot.oldRoot);
-            slot.oldRoot = 0;
-        }
-        if (slot.newRoot != 0) {
-            outTokens.push_back(slot.newRoot);
-            slot.newRoot = 0;
-        }
-        slot.record = {};
-    }
-}
-
-void releaseTokens(
-    ManagedHeap& heap,
-    const std::vector<ManagedHeap::RootToken>& tokens) noexcept {
-    for (const auto token : tokens) {
-        if (token != 0) {
-            (void)heap.removePersistentRoot(token);
-        }
-    }
 }
 
 [[nodiscard]] bool isWrapperTypeLocked(
@@ -188,14 +150,6 @@ void onHeapArrayMutated(
         break;
     }
 
-    ManagedHeap::RootToken newOldRoot = 0;
-    ManagedHeap::RootToken newNewRoot = 0;
-    if (changeKind != CollectionChangeKind::Reset && changeKind != CollectionChangeKind::Clear) {
-        newOldRoot = maybeRetainValue(heap, oldValue);
-        newNewRoot = maybeRetainValue(heap, newValue);
-    }
-
-    std::vector<ManagedHeap::RootToken> obsoleteTokens;
     std::vector<OwnerBinding> ownersCopy;
     {
         auto& reg = hookRegistry();
@@ -206,7 +160,9 @@ void onHeapArrayMutated(
 
         const std::uint64_t nextVer = ++entry.mutationVersion;
         if (changeKind == CollectionChangeKind::Reset) {
-            collectEntryRoots(entry, obsoleteTokens);
+            for (auto& s : entry.ring) {
+                s.record = {};
+            }
             entry.minAvailableVersion = nextVer;
         } else {
             const std::uint64_t capacity = ObservableListHelper::kDeltaRingCapacity;
@@ -220,12 +176,6 @@ void onHeapArrayMutated(
 
         auto& slot = entry.ring[static_cast<std::size_t>(
             nextVer % ObservableListHelper::kDeltaRingCapacity)];
-        if (slot.oldRoot != 0) {
-            obsoleteTokens.push_back(slot.oldRoot);
-        }
-        if (slot.newRoot != 0) {
-            obsoleteTokens.push_back(slot.newRoot);
-        }
         slot.record.version = nextVer;
         slot.record.kind = changeKind;
         slot.record.index = index;
@@ -237,12 +187,8 @@ void onHeapArrayMutated(
                                 changeKind == CollectionChangeKind::Clear)
             ? Value{}
             : newValue;
-        slot.oldRoot = newOldRoot;
-        slot.newRoot = newNewRoot;
         ownersCopy = entry.owners;
     }
-
-    releaseTokens(heap, obsoleteTokens);
 
     bool needPrune = false;
     for (const auto& binding : ownersCopy) {
@@ -280,7 +226,6 @@ void onHeapSlotSwept(
         return;
     }
     const std::uint64_t key = slotKey(sweptRef);
-    std::vector<ManagedHeap::RootToken> obsoleteTokens;
     {
         auto& reg = hookRegistry();
         std::lock_guard<std::mutex> lock(reg.mutex);
@@ -289,15 +234,38 @@ void onHeapSlotSwept(
             return;
         }
         hIt->second.uiObserverCounts.erase(key);
-        if (sweptRef.kind == ObjectKind::Array) {
+        if (sweptRef.kind == ObjectKind::Record) {
+            const auto oIt = hIt->second.ownerArrays.find(key);
+            if (oIt != hIt->second.ownerArrays.end()) {
+                for (const std::uint64_t aKey : oIt->second) {
+                    const auto aIt = hIt->second.arrays.find(aKey);
+                    if (aIt != hIt->second.arrays.end()) {
+                        auto& owners = aIt->second.owners;
+                        owners.erase(
+                            std::remove_if(owners.begin(), owners.end(),
+                                [&](const OwnerBinding& ob) { return slotKey(ob.ownerRef) == key; }),
+                            owners.end());
+                    }
+                }
+                hIt->second.ownerArrays.erase(oIt);
+            }
+        } else if (sweptRef.kind == ObjectKind::Array) {
             const auto aIt = hIt->second.arrays.find(key);
             if (aIt != hIt->second.arrays.end()) {
-                collectEntryRoots(aIt->second, obsoleteTokens);
+                for (const auto& ob : aIt->second.owners) {
+                    const auto oIt = hIt->second.ownerArrays.find(slotKey(ob.ownerRef));
+                    if (oIt != hIt->second.ownerArrays.end()) {
+                        auto& vec = oIt->second;
+                        vec.erase(std::remove(vec.begin(), vec.end(), key), vec.end());
+                        if (vec.empty()) {
+                            hIt->second.ownerArrays.erase(oIt);
+                        }
+                    }
+                }
                 hIt->second.arrays.erase(aIt);
             }
         }
     }
-    releaseTokens(heap, obsoleteTokens);
 }
 
 void installHooksLocked(ManagedHeap& heap, PerHeapState& state) {
@@ -375,7 +343,6 @@ void ReleaseHeapHookUser(ManagedHeap* heap) noexcept {
         return;
     }
     const std::uint64_t hId = heap->heapId();
-    std::vector<ManagedHeap::RootToken> obsoleteTokens;
     bool uninstallCallbacks = false;
     {
         auto& reg = hookRegistry();
@@ -388,10 +355,6 @@ void ReleaseHeapHookUser(ManagedHeap* heap) noexcept {
             --hIt->second.attachedDomainUsers;
         }
         if (hIt->second.attachedDomainUsers == 0u && hIt->second.fieldListeners.empty()) {
-            for (auto& [k, entry] : hIt->second.arrays) {
-                (void)k;
-                collectEntryRoots(entry, obsoleteTokens);
-            }
             reg.heaps.erase(hIt);
             uninstallCallbacks = true;
         }
@@ -401,7 +364,6 @@ void ReleaseHeapHookUser(ManagedHeap* heap) noexcept {
         heap->setArrayMutationCallback(nullptr, nullptr);
         heap->setSlotSweepCallback(nullptr, nullptr);
     }
-    releaseTokens(*heap, obsoleteTokens);
 }
 
 } // namespace detail
@@ -534,6 +496,15 @@ bool ObservableListHelper::ReadChangesSince(
         return true;
     }
 
+    auto sanitizeDeltaValue = [&](Value& val) {
+        const auto* objRef = std::get_if<ObjectRef>(&val);
+        if (objRef && objRef->valid() &&
+            objRef->heapId == static_cast<std::uint32_t>(heap.heapId()) &&
+            !heap.isAlive(*objRef)) {
+            val = Value{};
+        }
+    };
+
     outDeltas.reserve(static_cast<std::size_t>(curVer - sinceVersion));
     for (std::uint64_t v = sinceVersion + 1ULL; v <= curVer; ++v) {
         const auto& slot = entry.ring[static_cast<std::size_t>(v % kDeltaRingCapacity)];
@@ -542,7 +513,10 @@ bool ObservableListHelper::ReadChangesSince(
             outRequiresReset = true;
             return true;
         }
-        outDeltas.push_back(slot.record);
+        CollectionChangeRecord rec = slot.record;
+        sanitizeDeltaValue(rec.oldValue);
+        sanitizeDeltaValue(rec.newValue);
+        outDeltas.push_back(std::move(rec));
     }
     outRequiresReset = false;
     return true;
@@ -634,7 +608,9 @@ void ObservableListHelper::BindOwnerProperty(
     auto& reg = hookRegistry();
     std::lock_guard<std::mutex> lock(reg.mutex);
     auto& hState = reg.heaps[heap.heapId()];
-    auto& entry = hState.arrays[slotKey(arrRef)];
+    const std::uint64_t aKey = slotKey(arrRef);
+    const std::uint64_t oKey = slotKey(ownerRef);
+    auto& entry = hState.arrays[aKey];
     entry.arrayRef = arrRef;
     for (const auto& existing : entry.owners) {
         if (existing.ownerRef == ownerRef && existing.bitIndex == bitIndex) {
@@ -642,6 +618,10 @@ void ObservableListHelper::BindOwnerProperty(
         }
     }
     entry.owners.push_back(OwnerBinding{ownerRef, bitIndex});
+    auto& oVec = hState.ownerArrays[oKey];
+    if (std::find(oVec.begin(), oVec.end(), aKey) == oVec.end()) {
+        oVec.push_back(aKey);
+    }
 }
 
 void ObservableListHelper::UnbindOwnerProperty(
@@ -655,11 +635,12 @@ void ObservableListHelper::UnbindOwnerProperty(
     }
     auto& reg = hookRegistry();
     std::lock_guard<std::mutex> lock(reg.mutex);
-    const auto hIt = reg.heaps.find(heap.heapId());
+    auto hIt = reg.heaps.find(heap.heapId());
     if (hIt == reg.heaps.end()) {
         return;
     }
-    const auto aIt = hIt->second.arrays.find(slotKey(arrRef));
+    const std::uint64_t aKey = slotKey(arrRef);
+    const auto aIt = hIt->second.arrays.find(aKey);
     if (aIt == hIt->second.arrays.end()) {
         return;
     }
@@ -670,6 +651,23 @@ void ObservableListHelper::UnbindOwnerProperty(
                 return ob.ownerRef == ownerRef && ob.bitIndex == bitIndex;
             }),
         owners.end());
+    bool stillBound = false;
+    for (const auto& ob : owners) {
+        if (ob.ownerRef == ownerRef) {
+            stillBound = true;
+            break;
+        }
+    }
+    if (!stillBound) {
+        const auto oIt = hIt->second.ownerArrays.find(slotKey(ownerRef));
+        if (oIt != hIt->second.ownerArrays.end()) {
+            auto& vec = oIt->second;
+            vec.erase(std::remove(vec.begin(), vec.end(), aKey), vec.end());
+            if (vec.empty()) {
+                hIt->second.ownerArrays.erase(oIt);
+            }
+        }
+    }
 }
 
 void ObservableListHelper::UnbindAllForOwnerField(
@@ -681,13 +679,24 @@ void ObservableListHelper::UnbindAllForOwnerField(
     }
     auto& reg = hookRegistry();
     std::lock_guard<std::mutex> lock(reg.mutex);
-    const auto hIt = reg.heaps.find(heap.heapId());
+    auto hIt = reg.heaps.find(heap.heapId());
     if (hIt == reg.heaps.end()) {
         return;
     }
-    for (auto& [k, entry] : hIt->second.arrays) {
-        (void)k;
-        auto& owners = entry.owners;
+    const std::uint64_t oKey = slotKey(ownerRef);
+    const auto oIt = hIt->second.ownerArrays.find(oKey);
+    if (oIt == hIt->second.ownerArrays.end()) {
+        return;
+    }
+    auto& boundArrKeys = oIt->second;
+    for (std::size_t i = boundArrKeys.size(); i > 0u; --i) {
+        const std::uint64_t aKey = boundArrKeys[i - 1u];
+        const auto aIt = hIt->second.arrays.find(aKey);
+        if (aIt == hIt->second.arrays.end()) {
+            boundArrKeys.erase(boundArrKeys.begin() + static_cast<std::ptrdiff_t>(i - 1u));
+            continue;
+        }
+        auto& owners = aIt->second.owners;
         owners.erase(
             std::remove_if(owners.begin(), owners.end(),
                 [&](const OwnerBinding& ob) {
@@ -695,6 +704,19 @@ void ObservableListHelper::UnbindAllForOwnerField(
                         (bitIndex >= 64u || ob.bitIndex == bitIndex);
                 }),
             owners.end());
+        bool anyRemainingForOwner = false;
+        for (const auto& ob : owners) {
+            if (ob.ownerRef == ownerRef) {
+                anyRemainingForOwner = true;
+                break;
+            }
+        }
+        if (!anyRemainingForOwner) {
+            boundArrKeys.erase(boundArrKeys.begin() + static_cast<std::ptrdiff_t>(i - 1u));
+        }
+    }
+    if (boundArrKeys.empty()) {
+        hIt->second.ownerArrays.erase(oIt);
     }
 }
 

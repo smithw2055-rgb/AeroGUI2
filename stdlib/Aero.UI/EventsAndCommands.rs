@@ -616,7 +616,15 @@ public static class CollectionChangeHub {
         var host = col as ICollectionNotifier;
         if (host == null || listener == null) { return; }
         var slot = host.EnsureNotifierSlot();
-        if (slot != null) { slot.AddListener(listener); }
+        if (slot != null) {
+            EnsureInit();
+            bool hasSlot = false;
+            for (int i = 0; i < _slots.Length; i += 1) {
+                if (_slots[i] == slot) { hasSlot = true; break; }
+            }
+            if (!hasSlot) { _slots.Push(slot); }
+            slot.AddListener(listener);
+        }
     }
 
     public static void Unsubscribe(object col, Action listener) {
@@ -624,6 +632,9 @@ public static class CollectionChangeHub {
         for (int i = 0; i < _slots.Length; i += 1) {
             if (_slots[i].Matches(col)) {
                 _slots[i].RemoveListener(listener);
+                if (_slots[i].Listeners.Length == 0) {
+                    _slots.RemoveAt(i);
+                }
                 return;
             }
         }
