@@ -969,6 +969,179 @@ public partial class MainWindow : Window {
     }
 }
 
+void TestGalleryEngineRuntimeFixes(aero::rs_comp::CompilerSession& session) {
+    (void)session;
+    std::cout << "[Test] GalleryEngineRuntimeFixes (DecodeXmlText / InlineBinding / ThreeState / Style.Resources / TreeView / ComboBox)...\n";
+
+    const std::string aotXaml = R"XML(
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        x:Class="GalleryRuntimeFixDemo.MainWindow"
+        Title="Gallery Runtime Fixes" Width="800" Height="600">
+  <StackPanel x:Name="RuntimeHost" Orientation="Vertical" Spacing="8" Margin="16"/>
+</Window>)XML";
+
+    const std::string aotRs = R"RS(
+module GalleryRuntimeFixDemo;
+import Aero.UI;
+
+public class GalleryFixVm {
+    public string AccentBrush { get; set; } = "#FFFF0000";
+}
+
+public partial class MainWindow : Window {
+    public GalleryFixVm Vm;
+    public TextBlock EntTb;
+    public TextBlock InlineTb;
+    public ToggleButton TriTb;
+    public ToolBar HostTb;
+    public Button TbChildBtn;
+    public TreeView TvCheck;
+    public ComboBox CbComposite;
+
+    public MainWindow() {
+        InitializeComponent();
+        Vm = new GalleryFixVm();
+        DataContext = Vm;
+
+        string rtXml = "<StackPanel xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation' " +
+            "xmlns:x='http://schemas.microsoft.com/winfx/2006/xaml'>" +
+            "<StackPanel.Resources>" +
+              "<Style TargetType='ToolBar'>" +
+                "<Style.Resources>" +
+                  "<Style x:Key='{x:Static ToolBar.ButtonStyleKey}' TargetType='Button'>" +
+                    "<Setter Property='Tag' Value='ToolBarBtnOk'/>" +
+                  "</Style>" +
+                "</Style.Resources>" +
+              "</Style>" +
+            "</StackPanel.Resources>" +
+            "<TextBlock x:Name='EntTb'>&#38;lt;ok&#38;gt;</TextBlock>" +
+            "<TextBlock x:Name='InlineTb'><Bold Foreground='{Binding AccentBrush}'>foo </Bold>bar</TextBlock>" +
+            "<ToggleButton x:Name='TriTb' IsThreeState='True'/>" +
+            "<ToolBar x:Name='HostTb'><Button x:Name='TbChildBtn' Content='Act' Style='{DynamicResource {x:Static ToolBar.ButtonStyleKey}}'/></ToolBar>" +
+            "<TreeView x:Name='TvCheck'><TransformGroup Selector.IsSelected='True'/></TreeView>" +
+            "<ComboBox x:Name='CbComposite' SelectedIndex='0'><ComboBoxItem><StackPanel Orientation='Horizontal'><TextBlock Text='Alpha'/><TextBlock Text='Beta'/></StackPanel></ComboBoxItem></ComboBox>" +
+            "</StackPanel>";
+        UIElement parsed = XamlReader.Parse(rtXml);
+        if (parsed != null) {
+            RuntimeHost.AddChild(parsed);
+            EntTb = parsed.FindName("EntTb") as TextBlock;
+            InlineTb = parsed.FindName("InlineTb") as TextBlock;
+            TriTb = parsed.FindName("TriTb") as ToggleButton;
+            HostTb = parsed.FindName("HostTb") as ToolBar;
+            TbChildBtn = parsed.FindName("TbChildBtn") as Button;
+            TvCheck = parsed.FindName("TvCheck") as TreeView;
+            CbComposite = parsed.FindName("CbComposite") as ComboBox;
+        }
+    }
+
+    public string GetEntText() { return EntTb != null ? EntTb.Text : ""; }
+    public string GetInlineText() { return InlineTb != null ? InlineTb.Text : ""; }
+    public int CheckInlineBindingRgba() {
+        BindingEngine.Flush();
+        if (InlineTb == null || InlineTb.Inlines().Length == 0) { return -1; }
+        Brush fg = InlineTb.Inlines()[0].Foreground;
+        if (fg is SolidColorBrush) {
+            return (fg as SolidColorBrush).ResolveRgba() == ParseUtil.ParseColor("#FFFF0000") ? 1 : 0;
+        }
+        return -2;
+    }
+    public string CheckTriIndeterminateNull() {
+        if (TriTb == null) { return "MISSING"; }
+        TriTb.IsIndeterminate = true;
+        BindingEngine.Flush();
+        DependencyObject box = BindingEngine.ReadPathBox(TriTb, "IsChecked");
+        return box == null ? "NULL" : "NOTNULL";
+    }
+    public string GetToolBarBtnTag() {
+        if (TbChildBtn == null && HostTb != null) {
+            TbChildBtn = HostTb.FindName("TbChildBtn") as Button;
+        }
+        if (TbChildBtn == null) { return "MISSING"; }
+        DependencyObject res = TbChildBtn.FindResourceBox("ToolBar.ButtonStyleKey");
+        string hasRes = res != null ? "FOUND|" : "NORES|";
+        string tagStr = DependencyObject.UnboxString(TbChildBtn.GetPropertyValue("Tag"), "");
+        return hasRes + tagStr;
+    }
+    public string CheckTreeViewNotSelected() {
+        if (TvCheck == null) { return "MISSING"; }
+        return (TvCheck.ItemCount() == 1 && TvCheck.GetPropertyValue("SelectedItem") == null) ? "OK" : "SELECTED";
+    }
+    public string GetComboCompositeText() {
+        return CbComposite != null ? CbComposite.Text : "";
+    }
+}
+)RS";
+
+    aero::AeroV3CompileInput input;
+    input.stdlibRootDir = AERO_STDLIB_DIR;
+    input.includeStdlib = true;
+    input.treeShakeStdlib = false;
+    input.optimizeBytecode = false;
+    input.emitAotCpp = false;
+    input.xamlPath = "GalleryRuntimeFixDemo/MainWindow.xaml";
+    input.xamlContent = aotXaml;
+    input.scriptSources.push_back(aero::SourceFile{"GalleryRuntimeFixDemo/MainWindow.rs", aotRs});
+
+    aero::AeroAppHostConfig cfg;
+    cfg.viewportWidth = 800u;
+    cfg.viewportHeight = 600u;
+    cfg.headless = true;
+    cfg.preferSoftwareRasterizer = true;
+
+    aero::AeroAppHost host(cfg);
+    std::string err;
+    const bool loaded = host.CompileAndLoad(input, &err);
+    Require(loaded, "GalleryRuntimeFixDemo CompileAndLoad failed: " + err);
+    if (!host.RootVisualNode().IsValid()) {
+        return;
+    }
+
+    host.StepFrame(0.016f, true);
+
+    const aero::ObjectRef uiObj = host.RootScriptObject();
+    Require(uiObj.valid(), "GalleryRuntimeFixDemo RootScriptObject invalid");
+    auto callStr = [&](std::string_view fn) -> std::string {
+        aero::UnifiedValue rv{};
+        if (host.InvokeScriptMethod(uiObj, fn, {}, &rv, aero::DomainKind::UiPresentation)) {
+            if (const auto* sv = std::get_if<aero::rs_rt::StringValue>(&rv)) {
+                return sv->str();
+            }
+            if (const auto* ref = std::get_if<aero::rs_rt::ObjectRef>(&rv);
+                ref && ref->valid() && ref->kind == aero::rs_rt::ObjectKind::String) {
+                if (const auto opt = host.Domains().stringViewAcrossDomains(*ref)) {
+                    return std::string(opt->data(), opt->size());
+                }
+            }
+        }
+        return {};
+    };
+    auto callInt = [&](std::string_view fn) -> std::int64_t {
+        aero::UnifiedValue rv{};
+        std::int64_t out = -1;
+        if (host.InvokeScriptMethod(uiObj, fn, {}, &rv, aero::DomainKind::UiPresentation)) {
+            (void)rv.tryGetInt64(out);
+        }
+        return out;
+    };
+
+    Require(callStr("GetEntText") == "&lt;ok&gt;",
+        "Single-pass DecodeXmlText unexpected: " + callStr("GetEntText"));
+    Require(callStr("GetInlineText") == "foo bar",
+        "Inline trailing whitespace unexpected: " + callStr("GetInlineText"));
+    Require(callInt("CheckInlineBindingRgba") == 1,
+        "Inline inherited Foreground binding failed: code=" + std::to_string(callInt("CheckInlineBindingRgba")));
+    Require(callStr("CheckTriIndeterminateNull") == "NULL",
+        "ThreeState indeterminate ToggleButton IsChecked binding read should be NULL: " + callStr("CheckTriIndeterminateNull"));
+    Require(callStr("GetToolBarBtnTag") == "FOUND|ToolBarBtnOk",
+        "Style.Resources x:Static ToolBar.ButtonStyleKey resolution unexpected: " + callStr("GetToolBarBtnTag"));
+    Require(callStr("CheckTreeViewNotSelected") == "OK",
+        "TreeView TransformGroup Selector.IsSelected must not spuriously select TreeViewItem: " + callStr("CheckTreeViewNotSelected"));
+    const std::string cbText = callStr("GetComboCompositeText");
+    Require(cbText.find("Alpha") != std::string::npos && cbText.find("Beta") != std::string::npos,
+        "ComboBox composite StackPanel preview text unexpected: " + cbText);
+}
+
 } // namespace
 
 int main() {
@@ -979,6 +1152,7 @@ int main() {
     TestSample04VectorAndCanvas(sharedSession);
     TestSample05DualDomainSimHud(sharedSession);
     TestRegressionsFixed(sharedSession);
+    TestGalleryEngineRuntimeFixes(sharedSession);
 
     if (gFailureCount > 0) {
         std::cerr << gFailureCount << " v3_controls_and_samples_tests assertion(s) failed.\n";

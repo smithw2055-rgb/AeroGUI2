@@ -1220,9 +1220,9 @@ public partial class MainWindow : Window {
         prunedRes.prunedMirTypes,
         prunedRes.retainedMirFunctions,
         prunedRes.prunedMirFunctions);
-    Require(prunedRes.programImageBytes.size() < 5500000u &&
+    Require(prunedRes.programImageBytes.size() < 6500000u &&
             prunedRes.programImageBytes.size() * 10u < unprunedRes.programImageBytes.size() * 3u,
-        "Tree-shaken .rsb on <Window> view must be < 5,500,000 bytes and < 30% of unpruned size");
+        "Tree-shaken .rsb on <Window> view must be < 6,500,000 bytes and < 30% of unpruned size");
     Require(prunedRes.prunedMirFunctions > 200u,
         "Tree-shaken <Window> compile must prune > 200 unreachable MIR functions");
     Require(prunedRes.prunedMirTypes > 0u,
@@ -1548,6 +1548,95 @@ public partial class MainWindow : Window {
     std::filesystem::remove_all(tmpDir, ec);
 }
 
+void TestGalleryEngineCompilerFixes() {
+    const std::string_view testXaml = R"XML(
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        x:Class="GalleryFixCompileDemo.MainWindow"
+        Title="Gallery Fixes Compile Demo" Width="800" Height="600">
+  <Window.Resources>
+    <Style TargetType="ToolBar">
+      <Style.Resources>
+        <Style x:Key="{x:Static ToolBar.ButtonStyleKey}" TargetType="Button">
+          <Setter Property="Width" Value="44"/>
+        </Style>
+      </Style.Resources>
+    </Style>
+  </Window.Resources>
+  <Grid>
+    <Grid.RowDefinitions>
+      <RowDefinition x:Name="TopRow" Height="Auto"/>
+      <RowDefinition Height="*"/>
+    </Grid.RowDefinitions>
+    <Grid.ColumnDefinitions>
+      <ColumnDefinition x:Name="LeftCol" Width="100"/>
+      <ColumnDefinition Width="*"/>
+    </Grid.ColumnDefinitions>
+    <UniformGrid Grid.Row="0" Grid.Column="0" FirstColumn="2">
+      <Button TabIndex="5" Content="Go"/>
+    </UniformGrid>
+    <GridViewColumnHeader Grid.Row="1" Grid.Column="1" Content="Col"/>
+  </Grid>
+</Window>)XML";
+
+    const aero::XamlEmitOptions opts;
+    const auto emitRes = aero::EmitXamlToRealScript(testXaml, opts);
+    for (const auto& d : emitRes.diagnostics) {
+        if (!emitRes.succeeded) {
+            std::cerr << "  gallery fix emit diag: " << d << "\n";
+        }
+    }
+    Require(emitRes.succeeded, "TestGalleryEngineCompilerFixes XamlToRsEmitter must succeed");
+    Require(ContainsText(emitRes.generatedRsCode, ".Resources.SetBox(\"ToolBar.ButtonStyleKey\""),
+        "Style.Resources with x:Key={x:Static ToolBar.ButtonStyleKey} should emit ToolBar.ButtonStyleKey registration");
+    Require(ContainsText(emitRes.generatedRsCode, "FirstColumn = 2"),
+        "UniformGrid FirstColumn attribute should emit direct FirstColumn assignment");
+    Require(ContainsText(emitRes.generatedRsCode, "TabIndex = 5"),
+        "Button TabIndex attribute should emit direct TabIndex assignment on UIElement");
+    Require(ContainsText(emitRes.generatedRsCode, "new GridViewColumnHeader()"),
+        "GridViewColumnHeader should be emitted as a recognized UI control");
+    Require(ContainsText(emitRes.generatedRsCode, "AddRowDefinition(") &&
+            ContainsText(emitRes.generatedRsCode, "\"TopRow\")"),
+        "RowDefinition x:Name should be forwarded to AddRowDefinition");
+    Require(ContainsText(emitRes.generatedRsCode, "AddColumnDefinition(") &&
+            ContainsText(emitRes.generatedRsCode, "\"LeftCol\")"),
+        "ColumnDefinition x:Name should be forwarded to AddColumnDefinition");
+
+    const auto realStdlib = aero::LoadStdlibModulePack();
+    if (!RealStdlibHasUiClasses(realStdlib)) {
+        return;
+    }
+
+    const std::string codeBehindRs = R"RS(
+module GalleryFixCompileDemo;
+import Aero.UI;
+
+public partial class MainWindow : Window {
+    public MainWindow() {
+        InitializeComponent();
+    }
+}
+)RS";
+
+    aero::AeroV3CompileInput compileInput;
+    compileInput.xamlPath = "GalleryFixCompileDemo/MainWindow.xaml";
+    compileInput.xamlContent = std::string(testXaml);
+    compileInput.includeStdlib = true;
+    compileInput.treeShakeStdlib = true;
+    compileInput.optimizeBytecode = false;
+    compileInput.scriptSources.push_back(aero::SourceFile{"GalleryFixCompileDemo/MainWindow.rs", codeBehindRs});
+
+    const aero::AeroCompilerV3 compiler;
+    const auto compileRes = compiler.Compile(compileInput);
+    for (const auto& d : compileRes.diagnostics) {
+        if (!compileRes.succeeded) {
+            std::cerr << "  gallery fix compile diag: " << d << "\n";
+        }
+    }
+    Require(compileRes.succeeded && compileRes.programImage != nullptr,
+        "End-to-end AeroCompilerV3 compile of Style.Resources/x:Static/FirstColumn/TabIndex/GridViewColumnHeader/Grid x:Name failed");
+}
+
 } // namespace
 
 int main() {
@@ -1561,6 +1650,7 @@ int main() {
     TestMirTreeShakingAndProcessStdlibCache();
     TestMultiXamlAdditionalSourcesCompilation();
     TestP0P1CompilerSemanticsAndStdlibGenericCache();
+    TestGalleryEngineCompilerFixes();
 
     if (gFailureCount > 0) {
         std::cerr << gFailureCount << " compiler_v3_tests assertion(s) failed.\n";

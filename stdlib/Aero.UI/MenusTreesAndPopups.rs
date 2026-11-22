@@ -662,13 +662,36 @@ public class MenuItem : HeaderedItemsControl {
             if (_gestureText != null) { _gestureText.Text = _inputGestureText; }
         }
     }
+    public override DependencyObject GetNamedContentBox(string source) {
+        if (source == "Icon") { return _iconBox; }
+        return base.GetNamedContentBox(source);
+    }
+    public override bool HasNamedContentSlot(string source) {
+        if (source == "Icon") { return true; }
+        return base.HasNamedContentSlot(source);
+    }
+
+    public string Role {
+        get {
+            bool hasKids = ItemCount() > 0;
+            if (_isTopLevel) {
+                return hasKids ? "TopLevelHeader" : "TopLevelItem";
+            }
+            return hasKids ? "SubmenuHeader" : "SubmenuItem";
+        }
+    }
+
+    public bool IsHighlighted {
+        get { return IsMouseOver || _isSubmenuOpen; }
+    }
+
     public object Icon {
         get { return DependencyObject.Unbox(_iconBox); }
-        set { _iconBox = DependencyObject.BoxObject(value); }
+        set { _iconBox = DependencyObject.BoxObject(value); SyncIconPresenter(); UpdateTriggersAndStates(); }
     }
     public bool IsCheckable {
         get { return _isCheckable; }
-        set { _isCheckable = value; SyncMenuVisuals(); }
+        set { _isCheckable = value; SyncMenuVisuals(); UpdateTriggersAndStates(); }
     }
     public bool IsChecked {
         get { return _isChecked; }
@@ -676,13 +699,19 @@ public class MenuItem : HeaderedItemsControl {
             if (_isChecked == value) { return; }
             _isChecked = value;
             SyncMenuVisuals();
+            UpdateTriggersAndStates();
             if (_isChecked) { Checked(this, new RoutedEventArgs("Checked", this)); }
             else { Unchecked(this, new RoutedEventArgs("Unchecked", this)); }
         }
     }
     public bool IsTopLevel {
         get { return _isTopLevel; }
-        set { _isTopLevel = value; SyncMenuVisuals(); }
+        set {
+            if (_isTopLevel == value) { return; }
+            _isTopLevel = value;
+            SyncMenuVisuals();
+            UpdateTriggersAndStates();
+        }
     }
 
     public bool IsSubmenuOpen {
@@ -693,8 +722,74 @@ public class MenuItem : HeaderedItemsControl {
             if (_submenuPopup != null) {
                 _submenuPopup.IsOpen = _isSubmenuOpen && ItemCount() > 0;
             }
+            UpdateTriggersAndStates();
+            NotifyBoundPropertyChanged("IsSubmenuOpen", DependencyObject.BoxBool(_isSubmenuOpen));
             if (_isSubmenuOpen) { SubmenuOpened(this, new RoutedEventArgs("SubmenuOpened", this)); }
             else { SubmenuClosed(this, new RoutedEventArgs("SubmenuClosed", this)); }
+        }
+    }
+
+    private static Popup FindFirstTemplatedPopup(UIElement rootNode, UIElement owner) {
+        if (rootNode == null) { return null; }
+        var q = new UIElement[0];
+        q.Push(rootNode);
+        int idx = 0;
+        while (idx < q.Length) {
+            UIElement cur = q[idx];
+            idx += 1;
+            if (cur == null) { continue; }
+            if (cur is Popup && cur.TemplatedParent == owner) { return cur as Popup; }
+            if (cur is ContentPresenter && cur.TemplatedParent == owner) { continue; }
+            for (int i = 0; i < cur.ChildCount(); i += 1) {
+                UIElement ch = cur.ChildAt(i);
+                if (ch != null && Control.IsOwnedByTemplateChain(ch, owner)) { q.Push(ch); }
+            }
+        }
+        return null;
+    }
+
+    private void SyncIconPresenter() {
+        if (Template == null) { return; }
+        UIElement iconHost = GetTemplateChild("IconHost");
+        if (!(iconHost is ContentPresenter)) { iconHost = GetTemplateChild("Icon"); }
+        if (iconHost is ContentPresenter) {
+            (iconHost as ContentPresenter).SetContentBox(_iconBox);
+        }
+    }
+
+    private void HandleSubmenuPopupClosed() {
+        if (_isSubmenuOpen) {
+            _isSubmenuOpen = false;
+            NotifyBoundPropertyChanged("IsSubmenuOpen", DependencyObject.BoxBool(false));
+            UpdateTriggersAndStates();
+            SubmenuClosed(this, new RoutedEventArgs("SubmenuClosed", this));
+        }
+    }
+
+    public override void OnApplyTemplate() {
+        base.OnApplyTemplate();
+        if (Template != null) {
+            _checkGlyph = null;
+            _gestureText = null;
+            _arrowGlyph = null;
+            _submenuPopup = null;
+            UIElement pop = GetTemplateChild("PART_Popup");
+            if (!(pop is Popup)) { pop = FindFirstTemplatedPopup(TemplateRoot(), this); }
+            if (pop is Popup) {
+                _submenuPopup = pop as Popup;
+                _submenuPopup.PlacementTarget = this;
+                _submenuPopup.IsOpen = _isSubmenuOpen && ItemCount() > 0;
+                _submenuPopup.Closed += (object s, EventArgs e) => { HandleSubmenuPopupClosed(); };
+            }
+            SyncIconPresenter();
+        }
+    }
+
+    protected override void PrepareOwnContainer(UIElement container, int index) {
+        base.PrepareOwnContainer(container, index);
+        if (container is Separator && container.Style == null) {
+            DependencyObject stBox = FindResourceBox("MenuItem.SeparatorStyleKey");
+            if (stBox is Style) { container.Style = stBox as Style; }
         }
     }
 
@@ -724,6 +819,7 @@ public class MenuItem : HeaderedItemsControl {
     public override void RefreshItems() {
         base.RefreshItems();
         SyncMenuVisuals();
+        UpdateTriggersAndStates();
     }
 
     public override void OnMouseLeftButtonUp(MouseButtonEventArgs e) {
@@ -807,9 +903,23 @@ public class MenuItem : HeaderedItemsControl {
         if (propName == "Command" && value is ICommand) { Command = value as ICommand; return true; }
         if (propName == "CommandParameter") { CommandParameterBox = value; return true; }
         if (propName == "InputGestureText") { InputGestureText = DependencyObject.UnboxString(value, ""); return true; }
+        if (propName == "Icon") { _iconBox = value; SyncIconPresenter(); UpdateTriggersAndStates(); return true; }
         if (propName == "IsCheckable") { IsCheckable = DependencyObject.UnboxBool(value, false); return true; }
         if (propName == "IsChecked") { IsChecked = DependencyObject.UnboxBool(value, false); return true; }
+        if (propName == "IsSubmenuOpen") { IsSubmenuOpen = DependencyObject.UnboxBool(value, false); return true; }
         return base.SetPropertyValue(propName, value);
+    }
+
+    public override DependencyObject GetPropertyValue(string propName) {
+        if (propName == "Role") { return DependencyObject.BoxString(Role); }
+        if (propName == "IsHighlighted") { return DependencyObject.BoxBool(IsHighlighted); }
+        if (propName == "IsSubmenuOpen") { return DependencyObject.BoxBool(_isSubmenuOpen); }
+        if (propName == "IsCheckable") { return DependencyObject.BoxBool(_isCheckable); }
+        if (propName == "IsChecked") { return DependencyObject.BoxBool(_isChecked); }
+        if (propName == "InputGestureText") { return DependencyObject.BoxString(_inputGestureText); }
+        if (propName == "Icon") { return _iconBox; }
+        if (propName == "HasItems") { return DependencyObject.BoxBool(ItemCount() > 0); }
+        return base.GetPropertyValue(propName);
     }
 }
 
@@ -875,6 +985,14 @@ public class ContextMenu : MenuBase {
     }
 
     public void Close() { _popup.IsOpen = false; }
+
+    protected override void PrepareOwnContainer(UIElement container, int index) {
+        base.PrepareOwnContainer(container, index);
+        if (container is Separator && container.Style == null) {
+            DependencyObject stBox = FindResourceBox("MenuItem.SeparatorStyleKey");
+            if (stBox is Style) { container.Style = stBox as Style; }
+        }
+    }
 }
 
 public class StatusBarItem : ContentControl {
@@ -894,24 +1012,78 @@ public class StatusBar : ItemsControl {
         BorderBrush = new SolidColorBrush("#FF2E3748");
         BorderThickness = new Thickness(0.0f, 1.0f, 0.0f, 0.0f);
         Padding = new Thickness(8.0f, 3.0f, 8.0f, 3.0f);
-        ItemsPanel = () => { return new StackPanel(Orientation.Horizontal, 10.0f); };
+        ItemsPanel = () => {
+            var dp = new DockPanel();
+            dp.LastChildFill = false;
+            return dp;
+        };
     }
     public override string GetTypeName() { return "StatusBar"; }
 
     protected override UIElement CreateContainerForItem() { return new StatusBarItem(); }
+
+    protected override void PrepareOwnContainer(UIElement container, int index) {
+        base.PrepareOwnContainer(container, index);
+        if (container is Separator && container.Style == null) {
+            DependencyObject stBox = FindResourceBox("StatusBar.SeparatorStyleKey");
+            if (stBox is Style) { container.Style = stBox as Style; }
+        }
+    }
 }
 
 public class ToolBar : HeaderedItemsControl {
-    public Orientation Orientation { get; set; } = Orientation.Horizontal;
+    private Orientation _orientation = Orientation.Horizontal;
+    public Orientation Orientation {
+        get { return _orientation; }
+        set { _orientation = value; UpdateTriggersAndStates(); }
+    }
 
     public ToolBar() : base() {
         Background = new SolidColorBrush("#FF1B202B");
         BorderBrush = new SolidColorBrush("#FF2E3748");
         BorderThickness = new Thickness(0.0f, 0.0f, 0.0f, 1.0f);
         Padding = new Thickness(8.0f, 4.0f, 8.0f, 4.0f);
-        ItemsPanel = () => { return new StackPanel(Orientation, 6.0f); };
+        ItemsPanel = () => { return new StackPanel(_orientation, 2.0f); };
     }
     public override string GetTypeName() { return "ToolBar"; }
+
+    protected override void PrepareOwnContainer(UIElement container, int index) {
+        base.PrepareOwnContainer(container, index);
+        if (container != null && container.Style == null) {
+            string styleKey = "";
+            if (container is CheckBox) { styleKey = "ToolBar.CheckBoxStyleKey"; }
+            else if (container is RadioButton) { styleKey = "ToolBar.RadioButtonStyleKey"; }
+            else if (container is ToggleButton) { styleKey = "ToolBar.ToggleButtonStyleKey"; }
+            else if (container is Button) { styleKey = "ToolBar.ButtonStyleKey"; }
+            else if (container is ComboBox) { styleKey = "ToolBar.ComboBoxStyleKey"; }
+            else if (container is TextBox) { styleKey = "ToolBar.TextBoxStyleKey"; }
+            else if (container is Separator) { styleKey = "ToolBar.SeparatorStyleKey"; }
+            else if (container is Menu) { styleKey = "ToolBar.MenuStyleKey"; }
+            if (styleKey.Length > 0) {
+                DependencyObject stBox = FindResourceBox(styleKey);
+                if (stBox is Style) { container.Style = stBox as Style; }
+            }
+        }
+    }
+
+    public override bool SetPropertyValue(string propName, DependencyObject value) {
+        if (propName == "Orientation") {
+            if (value is BoxedInt) {
+                Orientation = (value as BoxedInt).Value == 1 ? Orientation.Vertical : Orientation.Horizontal;
+                return true;
+            }
+            string ov = DependencyObject.UnboxString(value, "Horizontal");
+            Orientation = ov == "Vertical" ? Orientation.Vertical : Orientation.Horizontal;
+            return true;
+        }
+        return base.SetPropertyValue(propName, value);
+    }
+
+    public override DependencyObject GetPropertyValue(string propName) {
+        if (propName == "Orientation") { return DependencyObject.BoxInt(EnumConvert.ToInt(_orientation)); }
+        if (propName == "HasOverflowItems") { return DependencyObject.BoxBool(false); }
+        return base.GetPropertyValue(propName);
+    }
 
     protected override UIElement CreateDefaultTemplate() {
         var row = new StackPanel(Orientation, 8.0f);
@@ -1246,19 +1418,7 @@ public class TreeView : ItemsControl {
     }
 
     private static string InferDataTypeKey(object raw) {
-        if (raw == null) { return ""; }
-        if (raw is UIElement) { return (raw as UIElement).GetTypeName(); }
-        if (raw is TransformGroup) { return "TransformGroup"; }
-        if (raw is RotateTransform) { return "RotateTransform"; }
-        if (raw is ScaleTransform) { return "ScaleTransform"; }
-        if (raw is TranslateTransform) { return "TranslateTransform"; }
-        if (raw is SkewTransform) { return "SkewTransform"; }
-        if (raw is DependencyObject) {
-            if (raw is SolidColorBrush) { return "SolidColorBrush"; }
-            if (raw is LinearGradientBrush) { return "LinearGradientBrush"; }
-            if (raw is RadialGradientBrush) { return "RadialGradientBrush"; }
-        }
-        return "";
+        return ItemsControl.InferImplicitDataTypeKey(raw);
     }
 
     private static DataTemplate ResolveDataTemplateForItem(

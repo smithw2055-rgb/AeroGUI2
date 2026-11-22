@@ -664,8 +664,23 @@ public class Image : FrameworkElement {
             Stretch = Stretch.Uniform;
             return true;
         }
+        if (propName == "StretchDirection") {
+            if (value is BoxedInt) { StretchDirection = EnumConvert.ToStretchDirection((value as BoxedInt).Value); return true; }
+            string sd = DependencyObject.UnboxString(value, "Both").Trim();
+            if (sd == "UpOnly" || sd == "0") { StretchDirection = StretchDirection.UpOnly; return true; }
+            if (sd == "DownOnly" || sd == "1") { StretchDirection = StretchDirection.DownOnly; return true; }
+            StretchDirection = StretchDirection.Both;
+            return true;
+        }
         if (propName == "Tint") { Tint = UIElement.CoerceBrush(value); return true; }
         return base.SetPropertyValue(propName, value);
+    }
+
+    public override DependencyObject GetPropertyValue(string propName) {
+        if (propName == "Source") { return DependencyObject.BoxString(_source); }
+        if (propName == "Stretch") { return DependencyObject.BoxInt(EnumConvert.ToInt(_stretch)); }
+        if (propName == "StretchDirection") { return DependencyObject.BoxInt(EnumConvert.ToInt(_stretchDir)); }
+        return base.GetPropertyValue(propName);
     }
 }
 
@@ -914,8 +929,14 @@ public class Shape : FrameworkElement {
             Stretch = Stretch.Fill;
             return true;
         }
-        if (propName == "TrimStart") { TrimStart = DependencyObject.UnboxFloat(value, 0.0f); return true; }
-        if (propName == "TrimEnd") { TrimEnd = DependencyObject.UnboxFloat(value, 1.0f); return true; }
+        if (propName == "TrimStart" || propName == "Path.TrimStart" || propName == "noesis:Path.TrimStart") {
+            TrimStart = DependencyObject.UnboxFloat(value, 0.0f);
+            return true;
+        }
+        if (propName == "TrimEnd" || propName == "Path.TrimEnd" || propName == "noesis:Path.TrimEnd") {
+            TrimEnd = DependencyObject.UnboxFloat(value, 1.0f);
+            return true;
+        }
         return base.SetPropertyValue(propName, value);
     }
 
@@ -958,6 +979,12 @@ public class Shape : FrameworkElement {
         }
         if (propName == "StrokeThickness") { return DependencyObject.BoxFloat(_strokeThickness); }
         if (propName == "Stretch") { return DependencyObject.BoxInt(EnumConvert.ToInt(_stretch)); }
+        if (propName == "TrimStart" || propName == "Path.TrimStart" || propName == "noesis:Path.TrimStart") {
+            return DependencyObject.BoxFloat(_trimStart);
+        }
+        if (propName == "TrimEnd" || propName == "Path.TrimEnd" || propName == "noesis:Path.TrimEnd") {
+            return DependencyObject.BoxFloat(_trimEnd);
+        }
         return base.GetPropertyValue(propName);
     }
 }

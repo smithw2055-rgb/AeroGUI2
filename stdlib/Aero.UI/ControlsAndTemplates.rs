@@ -315,6 +315,43 @@ public class Control : FrameworkElement {
         }
     }
 
+    internal static bool IsOwnedByTemplateChain(UIElement node, UIElement owner) {
+        if (node == null || owner == null) { return false; }
+        UIElement tp = node.TemplatedParent;
+        int hops = 0;
+        while (tp != null && hops < 8) {
+            if (tp == owner) { return true; }
+            tp = tp.TemplatedParent;
+            hops += 1;
+        }
+        return false;
+    }
+
+    private static void ExpandNestedTemplateControls(UIElement rootNode, UIElement owner) {
+        if (rootNode == null) { return; }
+        var q = new UIElement[0];
+        q.Push(rootNode);
+        int idx = 0;
+        while (idx < q.Length) {
+            UIElement node = q[idx];
+            idx += 1;
+            if (node == null) { continue; }
+            if (node != owner && node.IsItemsControlBoundary() && node.TemplatedParent != owner) { continue; }
+            if ((node is ContentPresenter || node.IsItemsPresenterBoundary()) && node.TemplatedParent == owner) { continue; }
+            if (node != owner && node is Control && node.TemplatedParent == owner) {
+                Control subCtrl = node as Control;
+                subCtrl.ApplyStyleInternal();
+                if (!subCtrl.IsTemplateApplied() && subCtrl.TemplateRoot() == null) {
+                    subCtrl.ApplyTemplate();
+                }
+            }
+            for (int i = 0; i < node.ChildCount(); i += 1) {
+                UIElement ch = node.ChildAt(i);
+                if (ch != null && IsOwnedByTemplateChain(ch, owner)) { q.Push(ch); }
+            }
+        }
+    }
+
     private void PropagateTypography(UIElement rootNode) {
         PropagateTypographyToSubtree();
         if (rootNode == null) { return; }
@@ -325,14 +362,17 @@ public class Control : FrameworkElement {
         while (idx < q.Length) {
             UIElement node = q[idx];
             idx += 1;
-            if (node == null || node.TemplatedParent != self) { continue; }
-            if (node is ContentPresenter) {
+            if (node == null) { continue; }
+            if (node is ContentPresenter && node.TemplatedParent == self) {
                 (node as ContentPresenter).SyncFromTemplatedParent(this);
+                continue;
+            }
+            if (node.IsItemsPresenterBoundary() && node.TemplatedParent == self) {
                 continue;
             }
             for (int i = 0; i < node.ChildCount(); i += 1) {
                 UIElement ch = node.ChildAt(i);
-                if (ch != null && ch.TemplatedParent == self) {
+                if (ch != null && IsOwnedByTemplateChain(ch, self)) {
                     q.Push(ch);
                 }
             }
@@ -355,14 +395,22 @@ public class Control : FrameworkElement {
             UIElement cur = q[qi];
             qi += 1;
             if (cur == null) { continue; }
+            if (cur is ContentPresenter) {
+                for (int i = cur.ChildCount() - 1; i >= 0; i -= 1) {
+                    UIElement ch = cur.ChildAt(i);
+                    if (ch != null) {
+                        if (IsOwnedByTemplateChain(ch, owner)) {
+                            q.Push(ch);
+                        } else {
+                            cur.RemoveChild(ch);
+                        }
+                    }
+                }
+                continue;
+            }
             for (int i = cur.ChildCount() - 1; i >= 0; i -= 1) {
                 UIElement ch = cur.ChildAt(i);
-                if (ch == null) { continue; }
-                if (ch.TemplatedParent == owner) {
-                    q.Push(ch);
-                } else if (cur is ContentPresenter) {
-                    cur.RemoveChild(ch);
-                }
+                if (ch != null && IsOwnedByTemplateChain(ch, owner)) { q.Push(ch); }
             }
         }
     }
@@ -393,18 +441,24 @@ public class Control : FrameworkElement {
         SyncInteractiveFlags();
         if (_templateRoot != null) {
             MarkTemplateOwner(_templateRoot, this);
+            bool prevSuppress = _suppressChildAutoLoaded;
+            _suppressChildAutoLoaded = true;
             AddChild(_templateRoot);
+            _suppressChildAutoLoaded = prevSuppress;
+            ExpandNestedTemplateControls(_templateRoot, self);
             SyncTemplatePresenters();
-            if (_template == null) {
-                BindingEngine.FlushSubtree(_templateRoot);
-            }
+            BindingEngine.FlushSubtree(_templateRoot);
         }
         if (_templateRoot != null && _template != null) {
-            _template.AttachTriggers(this);
+            _template.AttachNonEventTriggers(this);
         }
         OnApplyTemplate();
         if (_templateRoot != null && _template != null) {
             _template.EvaluateTriggers(this);
+            _template.AttachEventTriggers(this);
+        }
+        if (_templateRoot != null && HasLoadedFired() && !_loadingSelf) {
+            _templateRoot.EnsureLoadedSubtree();
         }
         UpdateVisualStates(false);
         return _templateRoot != null;
@@ -424,6 +478,16 @@ public class Control : FrameworkElement {
             if (el is ContentPresenter || el.TemplatedParent != ownerEl) { continue; }
             for (int i = 0; i < el.ChildCount(); i += 1) {
                 q.Push(el.ChildAt(i));
+            }
+            if (el is ContentControl && el.TemplatedParent == ownerEl) {
+                DependencyObject cb = (el as ContentControl).ContentBox;
+                if (cb is UIElement) {
+                    UIElement cEl = cb as UIElement;
+                    if (cEl.TemplatedParent == null && cEl != ownerEl &&
+                        !(ownerEl is ContentControl && (ownerEl as ContentControl).ContentBox == cb)) {
+                        q.Push(cEl);
+                    }
+                }
             }
         }
     }
@@ -527,13 +591,19 @@ public class ContentPresenter : FrameworkElement {
 
     public Brush Foreground {
         get { return _foreground; }
-        set { _hasExplicitForeground = true; _foreground = value; if (_textView != null) { _textView.Foreground = value; } }
+        set {
+            _hasExplicitForeground = true;
+            _foreground = value;
+            SetExplicitTextForeground(value);
+            if (_textView != null) { _textView.Foreground = value; }
+        }
     }
     public string FontFamily {
         get { return _fontFamily; }
         set {
             _hasExplicitFontFamily = true;
             _fontFamily = value == null ? "Segoe UI" : value;
+            SetExplicitTextFontFamily(_fontFamily);
             if (_textView != null) { _textView.FontFamily = _fontFamily; }
         }
     }
@@ -542,6 +612,7 @@ public class ContentPresenter : FrameworkElement {
         set {
             _hasExplicitFontSize = true;
             _fontSize = value > 0.0f ? value : 14.0f;
+            SetExplicitTextFontSize(_fontSize);
             if (_textView != null) { _textView.FontSize = _fontSize; }
         }
     }
@@ -550,6 +621,7 @@ public class ContentPresenter : FrameworkElement {
         set {
             _hasExplicitFontWeight = true;
             _fontWeight = value == null ? "Normal" : value;
+            SetExplicitTextFontWeight(_fontWeight);
             if (_textView != null) { _textView.FontWeight = _fontWeight; }
         }
     }
@@ -609,17 +681,24 @@ public class ContentPresenter : FrameworkElement {
         if (owner == null) { return; }
         UIElement ownerEl = owner;
         if (TemplatedParent != ownerEl) { return; }
+        Brush effFg = EffectiveTextForeground();
+        string effFf = EffectiveTextFontFamilyOrEmpty();
+        float effFs = EffectiveTextFontSizeOrZero();
+        string effFw = EffectiveTextFontWeightOrEmpty();
         if (!_hasExplicitForeground) {
-            _foreground = owner.Foreground;
+            _foreground = (effFg != null && ownerEl.IsAncestorOf(this)) ? effFg : owner.Foreground;
         }
         if (!_hasExplicitFontFamily) {
-            _fontFamily = owner.FontFamily;
+            _fontFamily = (effFf.Length > 0 && ownerEl.IsAncestorOf(this)) ? effFf : owner.FontFamily;
         }
         if (!_hasExplicitFontSize) {
-            _fontSize = owner.FontSize;
+            _fontSize = (effFs > 0.0f && ownerEl.IsAncestorOf(this)) ? effFs : owner.FontSize;
         }
         if (!_hasExplicitFontWeight) {
-            _fontWeight = owner.FontWeight;
+            _fontWeight = (effFw.Length > 0 && ownerEl.IsAncestorOf(this)) ? effFw : owner.FontWeight;
+        }
+        if (!ownerEl.IsAncestorOf(this) || effFg == null) {
+            ReceiveInheritedTypography(_fontSize, _fontFamily, _fontWeight, _foreground);
         }
         if (_syncOwnerContentAlignment && !IsScrollPresenter()) {
             if (!_hasExplicitHAlign) { HorizontalAlignment = owner.HorizontalContentAlignment; _hasExplicitHAlign = false; }
@@ -652,6 +731,17 @@ public class ContentPresenter : FrameworkElement {
                 }
             }
             if (needRebuild) {
+                RebuildContentVisual();
+            }
+        }
+    }
+
+    protected override void OnLoaded() {
+        base.OnLoaded();
+        if (_contentBox != null && _contentTemplate == null && _templateInstanceRoot == null &&
+            !(_contentBox is UIElement) && !(_contentBox is BoxedString) &&
+            !(_contentBox is BoxedFloat) && !(_contentBox is BoxedInt) && !(_contentBox is BoxedBool)) {
+            if (DataTemplate.ResolveImplicitDataTemplate(this, DependencyObject.Unbox(_contentBox)) != null) {
                 RebuildContentVisual();
             }
         }
@@ -696,10 +786,15 @@ public class ContentPresenter : FrameworkElement {
             BindingEngine.FlushSubtree(el);
             return;
         }
-        if (_contentTemplate != null) {
+        DataTemplate effTemplate = _contentTemplate;
+        if (effTemplate == null && !(_contentBox is BoxedString) && !(_contentBox is BoxedFloat) &&
+            !(_contentBox is BoxedInt) && !(_contentBox is BoxedBool)) {
+            effTemplate = DataTemplate.ResolveImplicitDataTemplate(this, DependencyObject.Unbox(_contentBox));
+        }
+        if (effTemplate != null) {
             _textView = null;
             ClearChildren();
-            UIElement built = _contentTemplate.Instantiate(DependencyObject.Unbox(_contentBox));
+            UIElement built = effTemplate.Instantiate(DependencyObject.Unbox(_contentBox));
             _templateInstanceRoot = built;
             if (built != null) {
                 AddChild(built);
@@ -896,7 +991,7 @@ public class ContentControl : Control {
             UIElement node = q[idx];
             idx += 1;
             if (node == null) { continue; }
-            if (node != rootNode && node is ItemsControl) { continue; }
+            if (node != rootNode && node.IsItemsControlBoundary()) { continue; }
             bool belongsToOwner = (node.TemplatedParent == null || node.TemplatedParent == owner);
             if (node is ContentPresenter) {
                 ContentPresenter cp = node as ContentPresenter;

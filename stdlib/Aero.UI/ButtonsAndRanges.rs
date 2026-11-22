@@ -237,9 +237,26 @@ public class RepeatButton : Button {
         return null;
     }
 
+    private Slider FindAncestorSlider() {
+        UIElement cur = TemplatedParent != null ? TemplatedParent : Parent;
+        while (cur != null) {
+            if (cur is Slider) { return cur as Slider; }
+            cur = cur.TemplatedParent != null ? cur.TemplatedParent : cur.Parent;
+        }
+        return null;
+    }
+
     protected override void OnClick() {
         base.OnClick();
         if (_routedCommandName.Length == 0) { return; }
+        if (_routedCommandName == "Slider.DecreaseLarge" || _routedCommandName == "Slider.IncreaseLarge") {
+            Slider sl = FindAncestorSlider();
+            if (sl != null) {
+                float step = sl.LargeChange > 0.0f ? sl.LargeChange : 1.0f;
+                sl.Value = _routedCommandName == "Slider.DecreaseLarge" ? (sl.Value - step) : (sl.Value + step);
+            }
+            return;
+        }
         ScrollBar sb = FindAncestorScrollBar();
         if (sb == null) { return; }
         float small = sb.SmallChange > 0.0f ? sb.SmallChange : 16.0f;
@@ -345,6 +362,7 @@ public class ToggleButton : ButtonBase {
             _isIndeterminate = false;
             OnCheckedChanged();
             BindingEngine.NotifyTargetPropertyChanged(this, "IsChecked", DependencyObject.BoxBool(_isChecked));
+            BindingEngine.MarkFlushDirty();
         }
     }
 
@@ -359,6 +377,8 @@ public class ToggleButton : ButtonBase {
             }
             UpdateVisualCheckedState();
             UpdateTriggersAndStates();
+            BindingEngine.NotifyTargetPropertyChanged(this, "IsChecked", _isIndeterminate ? null : DependencyObject.BoxBool(_isChecked));
+            BindingEngine.MarkFlushDirty();
         }
     }
 
@@ -404,12 +424,31 @@ public class ToggleButton : ButtonBase {
     }
 
     public override bool SetPropertyValue(string propName, DependencyObject value) {
-        if (propName == "IsChecked") { IsChecked = DependencyObject.UnboxBool(value, false); return true; }
+        if (propName == "IsChecked") {
+            if (value == null) {
+                IsIndeterminate = true;
+                return true;
+            }
+            string sVal = (value is BoxedString) ? (value as BoxedString).Value.Trim() : "";
+            if (sVal == "{x:Null}" || sVal == "null") {
+                IsIndeterminate = true;
+                return true;
+            }
+            IsChecked = DependencyObject.UnboxBool(value, false);
+            return true;
+        }
         if (propName == "IsThreeState") { IsThreeState = DependencyObject.UnboxBool(value, false); return true; }
         return base.SetPropertyValue(propName, value);
     }
+    public override bool IsExplicitNullProperty(string propName) {
+        return propName == "IsChecked" && _isIndeterminate;
+    }
+
     public override DependencyObject GetPropertyValue(string propName) {
-        if (propName == "IsChecked") { return DependencyObject.BoxBool(_isChecked); }
+        if (propName == "IsChecked") {
+            if (_isIndeterminate) { return null; }
+            return DependencyObject.BoxBool(_isChecked);
+        }
         if (propName == "IsThreeState") { return DependencyObject.BoxBool(IsThreeState); }
         return base.GetPropertyValue(propName);
     }
@@ -937,17 +976,88 @@ public class Track : FrameworkElement {
     }
 }
 
-public class TickBar : FrameworkElement {
-    public Brush Fill { get; set; }
-    public string Placement { get; set; } = "Top";
-    public float Minimum { get; set; } = 0.0f;
-    public float Maximum { get; set; } = 10.0f;
-    public float TickFrequency { get; set; } = 1.0f;
-    public float ReservedSpace { get; set; } = 0.0f;
-    public bool IsDirectionReversed { get; set; } = false;
+public class TickBar : CustomDrawElement {
+    private Brush _fill;
+    private string _placement = "Top";
+    private float _min = 0.0f;
+    private float _max = 10.0f;
+    private float _tickFreq = 1.0f;
+    private float _reservedSpace = 0.0f;
+    private bool _isDirRev = false;
 
-    public TickBar() : base() {}
+    public Brush Fill { get { return _fill; } set { _fill = value; InvalidateDraw(); } }
+    public string Placement { get { return _placement; } set { _placement = value == null ? "Top" : value; InvalidateDraw(); } }
+    public float Minimum { get { return _min; } set { _min = value; InvalidateDraw(); } }
+    public float Maximum { get { return _max; } set { _max = value; InvalidateDraw(); } }
+    public float TickFrequency { get { return _tickFreq; } set { _tickFreq = value; InvalidateDraw(); } }
+    public float ReservedSpace { get { return _reservedSpace; } set { _reservedSpace = value; InvalidateDraw(); } }
+    public bool IsDirectionReversed { get { return _isDirRev; } set { _isDirRev = value; InvalidateDraw(); } }
+
+    public TickBar() : base() {
+        IsHitTestVisible = false;
+    }
     public override string GetTypeName() { return "TickBar"; }
+
+    public override void OnRender(DrawingContext dc) {
+        float w = ActualWidth;
+        float h = ActualHeight;
+        if (w <= 0.5f || h <= 0.5f) { return; }
+        float minV = _min;
+        float maxV = _max;
+        float freq = _tickFreq;
+        bool rev = _isDirRev;
+        float resSpace = _reservedSpace;
+        Brush effFill = _fill;
+        bool vertical = (_placement == "Left" || _placement == "Right");
+        if (TemplatedParent is Slider) {
+            Slider sl = TemplatedParent as Slider;
+            minV = sl.Minimum;
+            maxV = sl.Maximum;
+            if (sl.TickFrequency > 0.0f) { freq = sl.TickFrequency; }
+            rev = sl.IsDirectionReversed;
+            vertical = (sl.Orientation == Orientation.Vertical);
+            if (effFill == null) { effFill = sl.Foreground; }
+            if (resSpace <= 0.0f) { resSpace = 10.0f; }
+        }
+        uint col = effFill != null ? effFill.ResolveRgba() : ParseUtil.PackArgb(200u, 120u, 130u, 140u);
+        if ((col / 16777216u) % 256u == 0u) { return; }
+        float span = maxV - minV;
+        if (span <= 0.0001f) { span = 1.0f; }
+        if (freq <= 0.0001f) { freq = span / 10.0f; }
+        if (span != span || freq != freq) { return; }
+        int maxTicks = 200;
+        if (span / freq > (float)maxTicks) { freq = span / (float)maxTicks; }
+        float halfRes = resSpace * 0.5f;
+        if (!vertical) {
+            float usable = Math.Maxf(1.0f, w - resSpace);
+            float y0 = 0.0f;
+            float y1 = h;
+            float v = minV;
+            int guard = 0;
+            while (v <= maxV + freq * 0.01f && guard <= maxTicks + 2) {
+                float t = Math.Clampf((v - minV) / span, 0.0f, 1.0f);
+                if (rev) { t = 1.0f - t; }
+                float x = halfRes + t * usable;
+                dc.DrawLine(x, y0, x, y1, col, 1.0f);
+                v = v + freq;
+                guard += 1;
+            }
+        } else {
+            float usable = Math.Maxf(1.0f, h - resSpace);
+            float x0 = 0.0f;
+            float x1 = w;
+            float v = minV;
+            int guard = 0;
+            while (v <= maxV + freq * 0.01f && guard <= maxTicks + 2) {
+                float t = Math.Clampf((v - minV) / span, 0.0f, 1.0f);
+                if (!rev) { t = 1.0f - t; }
+                float y = halfRes + t * usable;
+                dc.DrawLine(x0, y, x1, y, col, 1.0f);
+                v = v + freq;
+                guard += 1;
+            }
+        }
+    }
 
     public override bool SetPropertyValue(string propName, DependencyObject value) {
         if (propName == "Fill") { Fill = UIElement.CoerceBrush(value); return true; }
@@ -960,13 +1070,13 @@ public class TickBar : FrameworkElement {
         return base.SetPropertyValue(propName, value);
     }
     public override DependencyObject GetPropertyValue(string propName) {
-        if (propName == "Fill") { return Fill; }
-        if (propName == "Placement") { return DependencyObject.BoxString(Placement); }
-        if (propName == "Minimum") { return DependencyObject.BoxFloat(Minimum); }
-        if (propName == "Maximum") { return DependencyObject.BoxFloat(Maximum); }
-        if (propName == "TickFrequency") { return DependencyObject.BoxFloat(TickFrequency); }
-        if (propName == "ReservedSpace") { return DependencyObject.BoxFloat(ReservedSpace); }
-        if (propName == "IsDirectionReversed") { return DependencyObject.BoxBool(IsDirectionReversed); }
+        if (propName == "Fill") { return _fill; }
+        if (propName == "Placement") { return DependencyObject.BoxString(_placement); }
+        if (propName == "Minimum") { return DependencyObject.BoxFloat(_min); }
+        if (propName == "Maximum") { return DependencyObject.BoxFloat(_max); }
+        if (propName == "TickFrequency") { return DependencyObject.BoxFloat(_tickFreq); }
+        if (propName == "ReservedSpace") { return DependencyObject.BoxFloat(_reservedSpace); }
+        if (propName == "IsDirectionReversed") { return DependencyObject.BoxBool(_isDirRev); }
         return base.GetPropertyValue(propName);
     }
 }
@@ -1054,9 +1164,30 @@ public class Slider : RangeBase {
     private static Slider[] _defaultSliders;
 
     private Orientation _orientation = Orientation.Horizontal;
-    private float _tickFrequency = 0.0f;
+    private float _tickFrequency = 1.0f;
+    private string _tickPlacement = "None";
+    private bool _isDirectionReversed = false;
+    private float _lastTickMin = 0.0f;
+    private float _lastTickMax = 100.0f;
     public bool IsSnapToTickEnabled { get; set; } = false;
-    public bool IsDirectionReversed { get; set; } = false;
+    public bool IsDirectionReversed {
+        get { return _isDirectionReversed; }
+        set {
+            if (_isDirectionReversed == value) { return; }
+            _isDirectionReversed = value;
+            OnRangeUpdated();
+            InvalidateSubtreeTickBars(TemplateRoot());
+        }
+    }
+    public string TickPlacement {
+        get { return _tickPlacement; }
+        set {
+            string next = value == null ? "None" : value.Trim();
+            if (_tickPlacement == next) { return; }
+            _tickPlacement = next;
+            UpdateTriggersAndStates();
+        }
+    }
 
     private Grid _trackGrid;
     private Border _trackBg;
@@ -1108,11 +1239,34 @@ public class Slider : RangeBase {
 
     public Orientation Orientation {
         get { return _orientation; }
-        set { _orientation = value; OnRangeUpdated(); }
+        set {
+            if (_orientation == value) { return; }
+            _orientation = value;
+            OnRangeUpdated();
+            UpdateTriggersAndStates();
+            InvalidateSubtreeTickBars(TemplateRoot());
+        }
     }
     public float TickFrequency {
         get { return _tickFrequency; }
-        set { _tickFrequency = value >= 0.0f ? value : 0.0f; }
+        set {
+            _tickFrequency = value >= 0.0f ? value : 0.0f;
+            InvalidateSubtreeTickBars(TemplateRoot());
+        }
+    }
+
+    private static void InvalidateSubtreeTickBars(UIElement rootNode) {
+        if (rootNode == null) { return; }
+        var q = new UIElement[0];
+        q.Push(rootNode);
+        int idx = 0;
+        while (idx < q.Length) {
+            UIElement n = q[idx];
+            idx += 1;
+            if (n == null) { continue; }
+            if (n is TickBar) { (n as TickBar).InvalidateDraw(); }
+            for (int i = 0; i < n.ChildCount(); i += 1) { q.Push(n.ChildAt(i)); }
+        }
     }
 
     private static Track FindFirstTrack(UIElement rootNode) {
@@ -1182,6 +1336,11 @@ public class Slider : RangeBase {
 
     protected override void OnRangeUpdated() {
         SyncPartTrack();
+        if (Minimum != _lastTickMin || Maximum != _lastTickMax) {
+            _lastTickMin = Minimum;
+            _lastTickMax = Maximum;
+            InvalidateSubtreeTickBars(TemplateRoot());
+        }
         if (_trackBg == null || _fillBar == null || _thumb == null) { return; }
         float frac = NormalizedFraction();
         if (IsDirectionReversed) { frac = 1.0f - frac; }
@@ -1345,7 +1504,17 @@ public class Slider : RangeBase {
 
     public override bool SetPropertyValue(string propName, DependencyObject value) {
         if (propName == "IsDirectionReversed") { IsDirectionReversed = DependencyObject.UnboxBool(value, false); return true; }
-        if (propName == "TickFrequency") { TickFrequency = DependencyObject.UnboxFloat(value, 0.0f); return true; }
+        if (propName == "IsSnapToTickEnabled") { IsSnapToTickEnabled = DependencyObject.UnboxBool(value, false); return true; }
+        if (propName == "TickFrequency") { TickFrequency = DependencyObject.UnboxFloat(value, 1.0f); return true; }
+        if (propName == "TickPlacement") {
+            if (value is BoxedInt) {
+                int tp = (value as BoxedInt).Value;
+                TickPlacement = tp == 1 ? "TopLeft" : (tp == 2 ? "BottomRight" : (tp == 3 ? "Both" : "None"));
+                return true;
+            }
+            TickPlacement = DependencyObject.UnboxString(value, "None");
+            return true;
+        }
         if (propName == "Orientation") {
             if (value is BoxedInt) {
                 Orientation = (value as BoxedInt).Value == 1 ? Orientation.Vertical : Orientation.Horizontal;
@@ -1360,7 +1529,9 @@ public class Slider : RangeBase {
 
     public override DependencyObject GetPropertyValue(string propName) {
         if (propName == "IsDirectionReversed") { return DependencyObject.BoxBool(IsDirectionReversed); }
+        if (propName == "IsSnapToTickEnabled") { return DependencyObject.BoxBool(IsSnapToTickEnabled); }
         if (propName == "TickFrequency") { return DependencyObject.BoxFloat(_tickFrequency); }
+        if (propName == "TickPlacement") { return DependencyObject.BoxString(_tickPlacement); }
         if (propName == "Orientation") { return DependencyObject.BoxInt(EnumConvert.ToInt(_orientation)); }
         return base.GetPropertyValue(propName);
     }
@@ -1421,11 +1592,21 @@ public class ProgressBar : RangeBase {
 
     public bool IsIndeterminate {
         get { return _isIndeterminate; }
-        set { _isIndeterminate = value; OnRangeUpdated(); }
+        set {
+            if (_isIndeterminate == value) { return; }
+            _isIndeterminate = value;
+            OnRangeUpdated();
+            UpdateTriggersAndStates();
+        }
     }
     public Orientation Orientation {
         get { return _orientation; }
-        set { _orientation = value; OnRangeUpdated(); }
+        set {
+            if (_orientation == value) { return; }
+            _orientation = value;
+            OnRangeUpdated();
+            UpdateTriggersAndStates();
+        }
     }
 
     private float ResolveTrackWidth() {
@@ -1499,6 +1680,26 @@ public class ProgressBar : RangeBase {
         _lastSyncedTrackSpan = -1.0f;
         OnRangeUpdated();
         return track;
+    }
+
+    public override bool SetPropertyValue(string propName, DependencyObject value) {
+        if (propName == "IsIndeterminate") { IsIndeterminate = DependencyObject.UnboxBool(value, false); return true; }
+        if (propName == "Orientation") {
+            if (value is BoxedInt) {
+                Orientation = (value as BoxedInt).Value == 1 ? Orientation.Vertical : Orientation.Horizontal;
+                return true;
+            }
+            string ov = DependencyObject.UnboxString(value, "Horizontal");
+            Orientation = ov == "Vertical" ? Orientation.Vertical : Orientation.Horizontal;
+            return true;
+        }
+        return base.SetPropertyValue(propName, value);
+    }
+
+    public override DependencyObject GetPropertyValue(string propName) {
+        if (propName == "IsIndeterminate") { return DependencyObject.BoxBool(_isIndeterminate); }
+        if (propName == "Orientation") { return DependencyObject.BoxInt(EnumConvert.ToInt(_orientation)); }
+        return base.GetPropertyValue(propName);
     }
 }
 

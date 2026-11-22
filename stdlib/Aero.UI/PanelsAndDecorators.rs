@@ -35,6 +35,33 @@ public class Viewbox : Decorator {
                 EnumConvert.ToInt(_stretchDir));
         }
     }
+
+    public override bool SetPropertyValue(string propName, DependencyObject value) {
+        if (propName == "Stretch") {
+            if (value is BoxedInt) { Stretch = EnumConvert.ToStretch((value as BoxedInt).Value); return true; }
+            string st = DependencyObject.UnboxString(value, "Uniform").Trim();
+            if (st == "None" || st == "0") { Stretch = Stretch.None; return true; }
+            if (st == "Fill" || st == "1") { Stretch = Stretch.Fill; return true; }
+            if (st == "UniformToFill" || st == "3") { Stretch = Stretch.UniformToFill; return true; }
+            Stretch = Stretch.Uniform;
+            return true;
+        }
+        if (propName == "StretchDirection") {
+            if (value is BoxedInt) { StretchDirection = EnumConvert.ToStretchDirection((value as BoxedInt).Value); return true; }
+            string sd = DependencyObject.UnboxString(value, "Both").Trim();
+            if (sd == "UpOnly" || sd == "0") { StretchDirection = StretchDirection.UpOnly; return true; }
+            if (sd == "DownOnly" || sd == "1") { StretchDirection = StretchDirection.DownOnly; return true; }
+            StretchDirection = StretchDirection.Both;
+            return true;
+        }
+        return base.SetPropertyValue(propName, value);
+    }
+
+    public override DependencyObject GetPropertyValue(string propName) {
+        if (propName == "Stretch") { return DependencyObject.BoxInt(EnumConvert.ToInt(_stretch)); }
+        if (propName == "StretchDirection") { return DependencyObject.BoxInt(EnumConvert.ToInt(_stretchDir)); }
+        return base.GetPropertyValue(propName);
+    }
 }
 
 public class LayoutScaler : Viewbox {
@@ -113,6 +140,18 @@ public class Panel : FrameworkElement {
             Visual_SetLayoutMode(__nativeHandle, EnumConvert.ToInt(mode), p0, p1, i0, i1);
         }
     }
+
+    public override DependencyObject GetPropertyValue(string propName) {
+        if (propName == "Children") {
+            var col = new ArrayCollectionBox();
+            UIElement[] kids = Children();
+            for (int i = 0; i < kids.Length; i += 1) {
+                col.AddBox(kids[i]);
+            }
+            return col;
+        }
+        return base.GetPropertyValue(propName);
+    }
 }
 
 public class StackPanel : Panel {
@@ -186,6 +225,19 @@ public class DockPanel : Panel {
 
     private void SyncDockLayout() {
         SetNativeLayoutMode(LayoutMode.Dock, 0.0f, 0.0f, _lastChildFill ? 1 : 0, 0);
+    }
+
+    public override bool SetPropertyValue(string propName, DependencyObject value) {
+        if (propName == "LastChildFill") {
+            LastChildFill = DependencyObject.UnboxBool(value, true);
+            return true;
+        }
+        return base.SetPropertyValue(propName, value);
+    }
+
+    public override DependencyObject GetPropertyValue(string propName) {
+        if (propName == "LastChildFill") { return DependencyObject.BoxBool(_lastChildFill); }
+        return base.GetPropertyValue(propName);
     }
 }
 
@@ -263,7 +315,23 @@ public class UniformGrid : Panel {
     }
 
     private void SyncUniformLayout() {
-        SetNativeLayoutMode(LayoutMode.UniformGrid, _spacing, _spacing, _rows, _columns);
+        SetNativeLayoutMode(LayoutMode.UniformGrid, (float)_firstColumn, _spacing, _rows, _columns);
+    }
+
+    public override bool SetPropertyValue(string propName, DependencyObject value) {
+        if (propName == "Rows") { Rows = DependencyObject.UnboxInt(value, 0); return true; }
+        if (propName == "Columns") { Columns = DependencyObject.UnboxInt(value, 0); return true; }
+        if (propName == "FirstColumn") { FirstColumn = DependencyObject.UnboxInt(value, 0); return true; }
+        if (propName == "Spacing") { Spacing = DependencyObject.UnboxFloat(value, 0.0f); return true; }
+        return base.SetPropertyValue(propName, value);
+    }
+
+    public override DependencyObject GetPropertyValue(string propName) {
+        if (propName == "Rows") { return DependencyObject.BoxInt(_rows); }
+        if (propName == "Columns") { return DependencyObject.BoxInt(_columns); }
+        if (propName == "FirstColumn") { return DependencyObject.BoxInt(_firstColumn); }
+        if (propName == "Spacing") { return DependencyObject.BoxFloat(_spacing); }
+        return base.GetPropertyValue(propName);
     }
 }
 
@@ -306,7 +374,16 @@ public class GridLength : DependencyObject {
 }
 
 public class RowDefinition : DependencyObject {
-    public GridLength Height { get; set; }
+    public string Name { get; set; } = "";
+    internal Grid _ownerGrid;
+    private GridLength _height;
+    public GridLength Height {
+        get { return _height; }
+        set {
+            _height = value == null ? GridLength.FromStar(1.0f) : value;
+            if (_ownerGrid != null) { _ownerGrid.SyncGridTracks(); }
+        }
+    }
     public float MinHeight { get; set; } = 0.0f;
     public float MaxHeight { get; set; } = ParseUtil.PositiveInfinity();
 
@@ -322,7 +399,16 @@ public class RowDefinition : DependencyObject {
 }
 
 public class ColumnDefinition : DependencyObject {
-    public GridLength Width { get; set; }
+    public string Name { get; set; } = "";
+    internal Grid _ownerGrid;
+    private GridLength _width;
+    public GridLength Width {
+        get { return _width; }
+        set {
+            _width = value == null ? GridLength.FromStar(1.0f) : value;
+            if (_ownerGrid != null) { _ownerGrid.SyncGridTracks(); }
+        }
+    }
     public float MinWidth { get; set; } = 0.0f;
     public float MaxWidth { get; set; } = ParseUtil.PositiveInfinity();
 
@@ -352,6 +438,7 @@ public class RowDefinitionCollection : DependencyObject {
 
     public void Add(RowDefinition def) {
         if (def == null) { return; }
+        def._ownerGrid = _owner;
         _items.Push(def);
         if (_owner != null) { _owner.SyncGridTracks(); }
     }
@@ -376,6 +463,7 @@ public class ColumnDefinitionCollection : DependencyObject {
 
     public void Add(ColumnDefinition def) {
         if (def == null) { return; }
+        def._ownerGrid = _owner;
         _items.Push(def);
         if (_owner != null) { _owner.SyncGridTracks(); }
     }
@@ -412,11 +500,15 @@ public class Grid : Panel {
         set { _colSpacing = value >= 0.0f ? value : 0.0f; SyncGridTracks(); }
     }
 
-    public void AddRowDefinition(GridUnitType unit, float value = 1.0f) {
-        _rowDefs.Add(new RowDefinition(value, unit));
+    public void AddRowDefinition(GridUnitType unit, float value = 1.0f, string name = "") {
+        var def = new RowDefinition(value, unit);
+        if (name != null && name.Length > 0) { def.Name = name; }
+        _rowDefs.Add(def);
     }
-    public void AddColumnDefinition(GridUnitType unit, float value = 1.0f) {
-        _colDefs.Add(new ColumnDefinition(value, unit));
+    public void AddColumnDefinition(GridUnitType unit, float value = 1.0f, string name = "") {
+        var def = new ColumnDefinition(value, unit);
+        if (name != null && name.Length > 0) { def.Name = name; }
+        _colDefs.Add(def);
     }
     public void ClearRowDefinitions() { _rowDefs.Clear(); }
     public void ClearColumnDefinitions() { _colDefs.Clear(); }
@@ -437,6 +529,40 @@ public class Grid : Panel {
         for (int i = 0; i < parts.Length; i += 1) {
             _colDefs.Add(new ColumnDefinition(GridLength.Parse(parts[i])));
         }
+    }
+
+    public bool SetNamedDefinitionProperty(string defName, string propName, DependencyObject val) {
+        if (defName == null || defName.Length == 0) { return false; }
+        RowDefinition[] rows = _rowDefs.Items();
+        for (int i = 0; i < rows.Length; i += 1) {
+            if (rows[i].Name == defName && propName == "Height") {
+                if (val is GridLength) { rows[i].Height = val as GridLength; }
+                else { rows[i].Height = GridLength.Parse(DependencyObject.UnboxString(val, "Auto")); }
+                return true;
+            }
+        }
+        ColumnDefinition[] cols = _colDefs.Items();
+        for (int i = 0; i < cols.Length; i += 1) {
+            if (cols[i].Name == defName && propName == "Width") {
+                if (val is GridLength) { cols[i].Width = val as GridLength; }
+                else { cols[i].Width = GridLength.Parse(DependencyObject.UnboxString(val, "Auto")); }
+                return true;
+            }
+        }
+        return false;
+    }
+
+    public DependencyObject GetNamedDefinitionProperty(string defName, string propName) {
+        if (defName == null || defName.Length == 0) { return null; }
+        RowDefinition[] rows = _rowDefs.Items();
+        for (int i = 0; i < rows.Length; i += 1) {
+            if (rows[i].Name == defName && propName == "Height") { return rows[i].Height; }
+        }
+        ColumnDefinition[] cols = _colDefs.Items();
+        for (int i = 0; i < cols.Length; i += 1) {
+            if (cols[i].Name == defName && propName == "Width") { return cols[i].Width; }
+        }
+        return null;
     }
 
     public void SyncGridTracks() {

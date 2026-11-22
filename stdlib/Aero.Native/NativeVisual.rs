@@ -213,3 +213,6 @@ public bool Reflect_InvokeCommand(object target, string propPath, string param) 
 public int Reflect_GetDirtyMask(object target) { return 0; }
 public uint Color_ParseRgba(string hexOrNamed) { return 0u; }
 public string Host_ReadTextAsset(string uri) { return ""; }
+public int Utf8_CodePointCount(string text) { return 0; }
+public string Utf8_SliceCodePoints(string text, int startCp, int countCp) { return ""; }
+public string Utf8_FromCodePoint(int cp) { return ""; }

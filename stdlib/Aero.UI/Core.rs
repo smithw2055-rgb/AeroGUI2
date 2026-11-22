@@ -598,14 +598,14 @@ public static class EnumConvert {
         if (n == "OpacityMask.Stop1.Offset" || (n.Contains("OpacityMask") && (n.Contains("[1]") || n.Contains("Stop1")))) { return 32; }
         if (n == "OpacityMask.Stop2.Offset" || (n.Contains("OpacityMask") && (n.Contains("[2]") || n.Contains("Stop2")))) { return 33; }
         if (n == "OpacityMask.Stop3.Offset" || (n.Contains("OpacityMask") && (n.Contains("[3]") || n.Contains("Stop3")))) { return 34; }
-        if (n == "Fill.Stop0Color") { return 37; }
-        if (n == "Fill.Stop1Color") { return 38; }
-        if (n == "Fill.Stop2Color") { return 39; }
-        if (n == "Fill.Stop3Color") { return 40; }
-        if (n == "Fill.Stop0Offset") { return 41; }
-        if (n == "Fill.Stop1Offset") { return 42; }
-        if (n == "Fill.Stop2Offset") { return 43; }
-        if (n == "Fill.Stop3Offset") { return 44; }
+        if (n == "Fill.Stop0Color" || n == "Background.Stop0Color") { return 37; }
+        if (n == "Fill.Stop1Color" || n == "Background.Stop1Color") { return 38; }
+        if (n == "Fill.Stop2Color" || n == "Background.Stop2Color") { return 39; }
+        if (n == "Fill.Stop3Color" || n == "Background.Stop3Color") { return 40; }
+        if (n == "Fill.Stop0Offset" || n == "Background.Stop0Offset") { return 41; }
+        if (n == "Fill.Stop1Offset" || n == "Background.Stop1Offset") { return 42; }
+        if (n == "Fill.Stop2Offset" || n == "Background.Stop2Offset") { return 43; }
+        if (n == "Fill.Stop3Offset" || n == "Background.Stop3Offset") { return 44; }
         if (n == "Stroke.Stop0Color") { return 45; }
         if (n == "Stroke.Stop1Color") { return 46; }
         if (n == "Stroke.Stop2Color") { return 47; }
@@ -646,8 +646,8 @@ public static class EnumConvert {
         if (n == "Foreground" || n == "Foreground.Color") { return 17; }
         if (n == "BorderBrush" || n == "BorderBrush.Color") { return 18; }
         if (n == "CornerRadius") { return 19; }
-        if (n == "PathTrimStart" || n == "TrimStart") { return 20; }
-        if (n == "PathTrimEnd" || n == "TrimEnd") { return 21; }
+        if (n == "PathTrimStart" || n == "TrimStart" || n == "Path.TrimStart" || n == "noesis:Path.TrimStart") { return 20; }
+        if (n == "PathTrimEnd" || n == "TrimEnd" || n == "Path.TrimEnd" || n == "noesis:Path.TrimEnd") { return 21; }
         if (n == "EffectRadius" || n == "Effect.Radius" || n == "BlurRadius") { return 22; }
         if (n == "EffectOpacity" || n == "Effect.Opacity" || n == "DropShadowEffect.Opacity") { return 27; }
         if (n == "BrushOpacity" || n == "Brush.Opacity") { return 28; }
@@ -1117,31 +1117,58 @@ public static class ParseUtil {
     }
 
     public static int Utf8CodePointCount(string text) {
-        if (text == null) { return 0; }
+        if (text == null || text.Length == 0) { return 0; }
+        if (_nativeReady) { return Utf8_CodePointCount(text); }
         return text.Length;
     }
 
     public static string SliceCodePoints(string text, int startCp, int countCp) {
-        if (text == null || countCp <= 0 || startCp >= text.Length) { return ""; }
+        if (text == null || countCp <= 0 || text.Length == 0) { return ""; }
+        if (_nativeReady) { return Utf8_SliceCodePoints(text, startCp, countCp); }
+        if (startCp >= text.Length) { return ""; }
         int s = startCp < 0 ? 0 : startCp;
         int avail = text.Length - s;
         int len = countCp > avail ? avail : countCp;
         return text.Substring(s, len);
     }
 
+    public static string FromCodePoint(int cp) {
+        if (cp <= 0 || cp > 1114111 || (cp >= 55296 && cp <= 57343)) { return ""; }
+        if (_nativeReady) { return Utf8_FromCodePoint(cp); }
+        if (cp == 10) { return "\n"; }
+        if (cp == 13) { return "\r"; }
+        if (cp == 9) { return "\t"; }
+        if (cp == 32) { return " "; }
+        if (cp == 8226) { return "•"; }
+        return "";
+    }
+
     public static int FindNextWordBoundary(string text, int fromCp) {
-        if (text == null || fromCp >= text.Length) { return text == null ? 0 : text.Length; }
+        if (text == null || text.Length == 0) { return 0; }
+        int totalCp = Utf8CodePointCount(text);
+        if (fromCp >= totalCp) { return totalCp; }
         int i = fromCp < 0 ? 0 : fromCp;
-        while (i < text.Length && text.Substring(i, 1) == " ") { i += 1; }
-        while (i < text.Length && text.Substring(i, 1) != " ") { i += 1; }
+        if (totalCp == text.Length) {
+            while (i < totalCp && text.Substring(i, 1) == " ") { i += 1; }
+            while (i < totalCp && text.Substring(i, 1) != " ") { i += 1; }
+            return i;
+        }
+        while (i < totalCp && SliceCodePoints(text, i, 1) == " ") { i += 1; }
+        while (i < totalCp && SliceCodePoints(text, i, 1) != " ") { i += 1; }
         return i;
     }
 
     public static int FindPrevWordBoundary(string text, int fromCp) {
-        if (text == null || fromCp <= 0) { return 0; }
-        int i = fromCp > text.Length ? text.Length : fromCp;
-        while (i > 0 && text.Substring(i - 1, 1) == " ") { i -= 1; }
-        while (i > 0 && text.Substring(i - 1, 1) != " ") { i -= 1; }
+        if (text == null || text.Length == 0 || fromCp <= 0) { return 0; }
+        int totalCp = Utf8CodePointCount(text);
+        int i = fromCp > totalCp ? totalCp : fromCp;
+        if (totalCp == text.Length) {
+            while (i > 0 && text.Substring(i - 1, 1) == " ") { i -= 1; }
+            while (i > 0 && text.Substring(i - 1, 1) != " ") { i -= 1; }
+            return i;
+        }
+        while (i > 0 && SliceCodePoints(text, i - 1, 1) == " ") { i -= 1; }
+        while (i > 0 && SliceCodePoints(text, i - 1, 1) != " ") { i -= 1; }
         return i;
     }
 }
@@ -1210,6 +1237,32 @@ public class DependencyObject {
         if (box is BoxedInt) { return (box as BoxedInt).Value != 0; }
         if (box is BoxedString) { return ParseUtil.ParseBool((box as BoxedString).Value, fallback); }
         return fallback;
+    }
+
+    internal virtual DependencyObject GetBindingPropertyValue(string propName) { return null; }
+
+    internal static bool SameValueBox(DependencyObject a, DependencyObject b) {
+        if (a == b) { return true; }
+        if (a == null || b == null) { return false; }
+        if (a is BoxedString && b is BoxedString) {
+            return (a as BoxedString).Value == (b as BoxedString).Value;
+        }
+        if (a is BoxedInt && b is BoxedInt) {
+            return (a as BoxedInt).Value == (b as BoxedInt).Value;
+        }
+        if (a is BoxedFloat && b is BoxedFloat) {
+            return (a as BoxedFloat).Value == (b as BoxedFloat).Value;
+        }
+        if (a is BoxedBool && b is BoxedBool) {
+            return (a as BoxedBool).Value == (b as BoxedBool).Value;
+        }
+        if (a.BoxValueEquals(b)) { return true; }
+        object ua = DependencyObject.Unbox(a);
+        object ub = DependencyObject.Unbox(b);
+        if (ua != null && ub != null && ua == ub) {
+            return true;
+        }
+        return false;
     }
 }
 
@@ -1614,10 +1667,16 @@ public class GradientBrush : Brush {
     }
 
     internal static int ParseStopSlotIndex(string suffix) {
-        if (suffix == "Stop0Color" || suffix == "Stop0Offset") { return 0; }
-        if (suffix == "Stop1Color" || suffix == "Stop1Offset") { return 1; }
-        if (suffix == "Stop2Color" || suffix == "Stop2Offset") { return 2; }
-        if (suffix == "Stop3Color" || suffix == "Stop3Offset") { return 3; }
+        if (suffix == null || suffix.Length < 10) { return -1; }
+        if (suffix.Substring(0, 4) != "Stop") { return -1; }
+        if (suffix.EndsWith("Color")) {
+            string numC = suffix.Substring(4, suffix.Length - 9);
+            return ParseUtil.ParseInt(numC, -1);
+        }
+        if (suffix.EndsWith("Offset")) {
+            string numO = suffix.Substring(4, suffix.Length - 10);
+            return ParseUtil.ParseInt(numO, -1);
+        }
         return -1;
     }
 
@@ -1788,7 +1847,34 @@ public class TransformData : DependencyObject {
 }
 
 public class Transform : DependencyObject {
+    private string[] _attachedKeys;
+    private DependencyObject[] _attachedVals;
+
     public virtual void Accumulate(TransformData acc) {}
+
+    public void SetAttachedValue(string key, DependencyObject val) {
+        if (key == null || key.Length == 0) { return; }
+        if (_attachedKeys == null) {
+            _attachedKeys = new string[0];
+            _attachedVals = new DependencyObject[0];
+        }
+        for (int i = 0; i < _attachedKeys.Length; i += 1) {
+            if (_attachedKeys[i] == key) {
+                _attachedVals[i] = val;
+                return;
+            }
+        }
+        _attachedKeys.Push(key);
+        _attachedVals.Push(val);
+    }
+
+    public DependencyObject GetAttachedValue(string key) {
+        if (key == null || _attachedKeys == null) { return null; }
+        for (int i = 0; i < _attachedKeys.Length; i += 1) {
+            if (_attachedKeys[i] == key) { return _attachedVals[i]; }
+        }
+        return null;
+    }
 }
 
 public class TranslateTransform : Transform {
@@ -3485,7 +3571,7 @@ public partial class UIElement : DependencyObject {
             EffectiveTextForeground());
         child.ApplyStyleSubtree();
         child.RefreshDynamicResourcesRecursive();
-        if (_loadedFired) {
+        if (_loadedFired && !_suppressChildAutoLoaded) {
             child.EnsureLoadedSubtree();
         }
     }
@@ -3518,13 +3604,23 @@ public partial class UIElement : DependencyObject {
         }
     }
 
+    internal bool _suppressChildAutoLoaded = false;
+    internal bool _loadingSelf = false;
+    private int _keyboardTabIndex = 0;
+    public int TabIndex {
+        get { return _keyboardTabIndex; }
+        set { _keyboardTabIndex = value; }
+    }
+
     internal bool HasLoadedFired() { return _loadedFired; }
 
     private void EnsureLoadedSelf() {
         if (!_loadedFired) {
             _loadedFired = true;
+            _loadingSelf = true;
             ApplyStyleInternal();
             OnLoaded();
+            _loadingSelf = false;
             Loaded(this, new RoutedEventArgs("Loaded", this));
         }
     }
@@ -3544,13 +3640,13 @@ public partial class UIElement : DependencyObject {
             UIElement cur = q[idx];
             idx += 1;
             if (cur == null) { continue; }
+            cur.EnsureLoadedSelf();
             if (cur._children != null) {
-                int preCount = cur._children.Length;
-                for (int i = 0; i < preCount; i += 1) {
+                int postCount = cur._children.Length;
+                for (int i = 0; i < postCount; i += 1) {
                     q.Push(cur._children[i]);
                 }
             }
-            cur.EnsureLoadedSelf();
         }
     }
 
@@ -3706,6 +3802,11 @@ public partial class UIElement : DependencyObject {
     protected virtual DependencyObject TryFindTemplateScopedResourceBox(string key) { return null; }
     protected virtual DependencyObject TryFindTemplateAmbientResourceBox(string key) { return null; }
 
+    protected DependencyObject TryFindStyleScopedResourceBox(string key) {
+        Style activeStyle = _style != null ? _style : _appliedStyle;
+        return activeStyle != null ? activeStyle.TryFindStyleResourceBox(key) : null;
+    }
+
     public virtual DependencyObject FindResourceBox(string key) {
         if (key == null || key.Length == 0) { return null; }
         DependencyObject firstAmb = null;
@@ -3721,6 +3822,8 @@ public partial class UIElement : DependencyObject {
             }
             DependencyObject tplScoped = cur.TryFindTemplateScopedResourceBox(key);
             if (tplScoped != null) { return tplScoped; }
+            DependencyObject styScoped = cur.TryFindStyleScopedResourceBox(key);
+            if (styScoped != null) { return styScoped; }
             if (firstAmb == null) {
                 firstAmb = cur.TryFindTemplateAmbientResourceBox(key);
                 if (firstAmb == null && cur._ambientResources != null) {
@@ -3739,6 +3842,8 @@ public partial class UIElement : DependencyObject {
             if (tpLocal != null) { return tpLocal; }
             DependencyObject tpScoped = tp.TryFindTemplateScopedResourceBox(key);
             if (tpScoped != null) { return tpScoped; }
+            DependencyObject tpStyScoped = tp.TryFindStyleScopedResourceBox(key);
+            if (tpStyScoped != null) { return tpStyScoped; }
             if (firstAmb == null) {
                 firstAmb = tp.TryFindTemplateAmbientResourceBox(key);
                 if (firstAmb == null && tp._ambientResources != null) {
@@ -4162,8 +4267,9 @@ public partial class UIElement : DependencyObject {
             OnBoxAppearanceChanged();
             return true;
         }
-        if (propName.Length > 5 && propName.Substring(0, 5) == "Fill.") {
-            string suffix = propName.Substring(5);
+        if ((propName.Length > 5 && propName.Substring(0, 5) == "Fill.") ||
+            (propName.Length > 11 && propName.Substring(0, 11) == "Background.")) {
+            string suffix = propName.Substring(0, 5) == "Fill." ? propName.Substring(5) : propName.Substring(11);
             if (_background is GradientBrush && GradientBrush.ParseStopSlotIndex(suffix) >= 0) {
                 GradientBrush gb = _background as GradientBrush;
                 if (!_ownsClonedBgGrad) {
@@ -4243,6 +4349,10 @@ public partial class UIElement : DependencyObject {
         }
         if (propName == "Name") {
             Name = DependencyObject.UnboxString(value, "");
+            return true;
+        }
+        if (propName == "TabIndex" || propName == "KeyboardNavigation.TabIndex") {
+            TabIndex = DependencyObject.UnboxInt(value, 0);
             return true;
         }
         if (propName == "DataContext") {
@@ -4354,8 +4464,10 @@ public partial class UIElement : DependencyObject {
         if (s.Length > 2 && s.Substring(0, 1) == "(" && s.Substring(s.Length - 1, 1) == ")") {
             s = s.Substring(1, s.Length - 2).Trim();
         }
-        if (s.Length > 7 && s.Substring(0, 7) == "noesis:") {
-            s = s.Substring(7);
+        int colon = s.IndexOf(":");
+        int dot = s.IndexOf(".");
+        if (colon > 0 && colon + 1 < s.Length && (dot < 0 || colon < dot)) {
+            s = s.Substring(colon + 1);
         }
         return s;
     }
@@ -4402,6 +4514,11 @@ public partial class UIElement : DependencyObject {
         BindingEngine.Flush();
         UpdateLayout();
     }
+
+    public virtual bool IsExplicitNullProperty(string propName) { return false; }
+
+    internal virtual bool IsItemsControlBoundary() { return false; }
+    internal virtual bool IsItemsPresenterBoundary() { return false; }
 
     public virtual DependencyObject GetPropertyValue(string propName) {
         if (propName == "RiveControl.Source") { return DependencyObject.BoxString(_riveSource); }
@@ -4452,8 +4569,9 @@ public partial class UIElement : DependencyObject {
         if (propName == "Background.PlasmaScaleY" && _background is ImageBrush) {
             return DependencyObject.BoxFloat((_background as ImageBrush).PlasmaScaleY);
         }
-        if (propName.Length > 5 && propName.Substring(0, 5) == "Fill.") {
-            string suffix = propName.Substring(5);
+        if ((propName.Length > 5 && propName.Substring(0, 5) == "Fill.") ||
+            (propName.Length > 11 && propName.Substring(0, 11) == "Background.")) {
+            string suffix = propName.Substring(0, 5) == "Fill." ? propName.Substring(5) : propName.Substring(11);
             if (_background is GradientBrush) {
                 DependencyObject stopBox = (_background as GradientBrush).TryReadStopProperty(suffix);
                 if (stopBox != null) { return stopBox; }
@@ -4471,6 +4589,7 @@ public partial class UIElement : DependencyObject {
             return DependencyObject.BoxFloat(_borderBrush != null ? _borderBrush.Opacity : 1.0f);
         }
         if (propName == "Name") { return DependencyObject.BoxString(_name); }
+        if (propName == "TabIndex" || propName == "KeyboardNavigation.TabIndex") { return DependencyObject.BoxInt(_keyboardTabIndex); }
         if (propName == "DataContext") { return EffectiveDataContextBox(); }
         if (propName == "Tag") { return _tag; }
         if (propName == "Rotation3DX" || propName == "Rot3DX" || propName == "Transform3D.RotationX" || propName == "Projection3D.RotationX") { return DependencyObject.BoxFloat(_rot3DX); }

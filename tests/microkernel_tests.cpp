@@ -1013,6 +1013,32 @@ void TestHostBindingsAndReflection() {
 
         const auto cNamed = invokeBound("Color_ParseRgba", {MakeStrVal("CornflowerBlue")});
         CHECK(cNamed.has_value() && std::get<aero::rs_rt::UIntValue>(*cNamed).value == 0xFFED9564u); // RGBA8 LE of #FF6495ED
+
+        auto readBoundStr = [&](const std::optional<aero::rs_rt::Value>& v) -> std::string {
+            if (!v.has_value()) { return "<MISSING>"; }
+            if (const auto* sv = std::get_if<aero::rs_rt::StringValue>(&*v)) {
+                return sv->str();
+            }
+            if (const auto* ref = std::get_if<aero::rs_rt::ObjectRef>(&*v);
+                ref && ref->valid() && ref->kind == aero::rs_rt::ObjectKind::String) {
+                if (const auto opt = domains.stringViewAcrossDomains(*ref)) {
+                    return std::string(opt->data(), opt->size());
+                }
+            }
+            return "<NONSTR>";
+        };
+        const auto sliced = invokeBound("Utf8_SliceCodePoints", {
+            MakeStrVal("hello"), aero::rs_rt::Value{2LL}, aero::rs_rt::Value{2147483647LL}});
+        CHECK(readBoundStr(sliced) == "llo");
+
+        const auto sLow = invokeBound("Utf8_FromCodePoint", {aero::rs_rt::Value{0xD800LL}});
+        CHECK(readBoundStr(sLow).empty());
+
+        const auto sHigh = invokeBound("Utf8_FromCodePoint", {aero::rs_rt::Value{0xDFFFLL}});
+        CHECK(readBoundStr(sHigh).empty());
+
+        const auto sEmoji = invokeBound("Utf8_FromCodePoint", {aero::rs_rt::Value{0x1F600LL}});
+        CHECK(readBoundStr(sEmoji) == "\xF0\x9F\x98\x80");
     }
 
     // Invoke Visual_* bindings directly through BindingRegistry (bare & canonical)
@@ -1601,6 +1627,64 @@ void TestAnimationEngineManagedCustomAndDelayStart() {
     CHECK(b > 40u && b < 220u);
 }
 
+void TestGalleryEngineFixesMicrokernel() {
+    aero::VisualWorld w;
+    const aero::VisualNodeId root = w.CreateNode(aero::VisualKind::Box);
+    w.SetRoot(root);
+
+    const aero::VisualNodeId b1 = w.CreateNode(aero::VisualKind::Box);
+    const aero::VisualNodeId b2 = w.CreateNode(aero::VisualKind::Box);
+    const aero::VisualNodeId b3 = w.CreateNode(aero::VisualKind::Box);
+    const aero::VisualNodeId b4 = w.CreateNode(aero::VisualKind::Box);
+    w.AddChild(root, b1);
+    w.AddChild(root, b2);
+    w.AddChild(root, b3);
+    w.AddChild(root, b4);
+
+    // CustomScalar1 passing through/landing on identity (1.0f) and leaving identity
+    w.SetLayoutTransform2D(b1, 0.5f, 1.0f, 0.0f, 0.0f, 0.0f);
+    // CustomScalar3 (rotDeg) passing through/landing on identity (0.0f) and leaving identity
+    w.SetLayoutTransform2D(b3, 1.0f, 1.0f, 45.0f, 0.0f, 0.0f);
+
+    aero::VisualAnimationEngine engine;
+    (void)engine.StartFloat(
+        b1, aero::VisualAnimProp::CustomScalar1, 0.5f, 1.0f, 0.2f,
+        aero::EasingFunctionKind::Linear, aero::EasingMode::EaseOut, 0.0f, false, 1);
+    (void)engine.StartFloat(
+        b2, aero::VisualAnimProp::CustomScalar1, 1.0f, 0.5f, 0.2f,
+        aero::EasingFunctionKind::Linear, aero::EasingMode::EaseOut, 0.0f, false, 1);
+    (void)engine.StartFloat(
+        b3, aero::VisualAnimProp::CustomScalar3, 45.0f, 0.0f, 0.2f,
+        aero::EasingFunctionKind::Linear, aero::EasingMode::EaseOut, 0.0f, false, 1);
+    (void)engine.StartFloat(
+        b4, aero::VisualAnimProp::CustomScalar3, 0.0f, 45.0f, 0.2f,
+        aero::EasingFunctionKind::Linear, aero::EasingMode::EaseOut, 0.0f, false, 1);
+
+    (void)engine.Tick(0.05f, w);
+    const aero::VisualNode* n1 = w.GetNode(b1);
+    const aero::VisualNode* n2 = w.GetNode(b2);
+    const aero::VisualNode* n3 = w.GetNode(b3);
+    const aero::VisualNode* n4 = w.GetNode(b4);
+    CHECK(n1 && n1->layout.hasLayoutTransform && n1->layout.layoutTransform2D.sx > 0.5f && n1->layout.layoutTransform2D.sx < 1.0f);
+    CHECK(n2 && n2->layout.hasLayoutTransform && n2->layout.layoutTransform2D.sx < 1.0f && n2->layout.layoutTransform2D.sx > 0.5f);
+    CHECK(n3 && n3->layout.hasLayoutTransform && n3->layout.layoutTransform2D.rotDeg > 0.0f && n3->layout.layoutTransform2D.rotDeg < 45.0f);
+    CHECK(n4 && n4->layout.hasLayoutTransform && n4->layout.layoutTransform2D.rotDeg > 0.0f && n4->layout.layoutTransform2D.rotDeg < 45.0f);
+
+    (void)engine.Tick(0.20f, w);
+    n1 = w.GetNode(b1);
+    n2 = w.GetNode(b2);
+    n3 = w.GetNode(b3);
+    n4 = w.GetNode(b4);
+    CHECK(n1 && !n1->layout.hasLayoutTransform);
+    CHECK_NEAR(n1->layout.layoutTransform2D.sx, 1.0f, 1e-4f);
+    CHECK(n2 && n2->layout.hasLayoutTransform);
+    CHECK_NEAR(n2->layout.layoutTransform2D.sx, 0.5f, 1e-4f);
+    CHECK(n3 && !n3->layout.hasLayoutTransform);
+    CHECK_NEAR(n3->layout.layoutTransform2D.rotDeg, 0.0f, 1e-4f);
+    CHECK(n4 && n4->layout.hasLayoutTransform);
+    CHECK_NEAR(n4->layout.layoutTransform2D.rotDeg, 45.0f, 1e-4f);
+}
+
 } // namespace
 
 int main() {
@@ -1620,6 +1704,7 @@ int main() {
     TestPerspective3DPageVertexClipW();
     TestGridStarInsideExplicitWidthAndInfParent();
     TestAnimationEngineManagedCustomAndDelayStart();
+    TestGalleryEngineFixesMicrokernel();
 
     if (gFailureCount != 0) {
         std::fprintf(stderr, "microkernel_tests FAILED (%d checks failed)\n", gFailureCount);

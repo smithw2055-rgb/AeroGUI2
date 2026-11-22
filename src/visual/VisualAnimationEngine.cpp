@@ -406,12 +406,27 @@ void ApplyScalarProp(VisualWorld& world, VisualNodeId id, VisualAnimProp prop, f
         break;
     case VisualAnimProp::CustomScalar1:
         node->customScalars[1] = value;
+        if (node->layout.hasLayoutTransform || std::fabs(value - 1.0f) > 1e-6f) {
+            const auto& lt = node->layout.layoutTransform2D;
+            world.SetLayoutTransform2D(id, value, lt.sy, lt.rotDeg, lt.skewX, lt.skewY);
+            return;
+        }
         break;
     case VisualAnimProp::CustomScalar2:
         node->customScalars[2] = value;
+        if (node->layout.hasLayoutTransform || std::fabs(value - 1.0f) > 1e-6f) {
+            const auto& lt = node->layout.layoutTransform2D;
+            world.SetLayoutTransform2D(id, lt.sx, value, lt.rotDeg, lt.skewX, lt.skewY);
+            return;
+        }
         break;
     case VisualAnimProp::CustomScalar3:
         node->customScalars[3] = value;
+        if (node->layout.hasLayoutTransform || std::fabs(value) > 1e-6f) {
+            const auto& lt = node->layout.layoutTransform2D;
+            world.SetLayoutTransform2D(id, lt.sx, lt.sy, value, lt.skewX, lt.skewY);
+            return;
+        }
         break;
     case VisualAnimProp::OpacityMaskStop0Offset:
     case VisualAnimProp::OpacityMaskStop1Offset:

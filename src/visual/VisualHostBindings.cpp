@@ -2261,7 +2261,22 @@ bool RegisterVisualHostBindings(
         }
 
         std::string text;
-        auto tryReadFile = [&text](const fs::path& candidate) -> bool {
+        auto registerLoadedAssetDir = [&world](const fs::path& loadedFile) {
+            std::error_code dirEc;
+            const fs::path absFile = loadedFile.is_absolute() ? loadedFile : fs::absolute(loadedFile, dirEc);
+            const fs::path parentDir = (!dirEc && !absFile.empty()) ? absFile.parent_path() : loadedFile.parent_path();
+            if (parentDir.empty()) {
+                return;
+            }
+            const std::string dirStr = parentDir.generic_string();
+            if (UIResourceStore* mutStore = world.ResourceStore()) {
+                mutStore->AddAssetSearchDirectory(dirStr);
+                mutStore->Images().AddSearchDirectory(dirStr);
+            } else {
+                ImageAtlas::Instance().AddSearchDirectory(dirStr);
+            }
+        };
+        auto tryReadFile = [&text, &registerLoadedAssetDir](const fs::path& candidate) -> bool {
             if (candidate.empty()) {
                 return false;
             }
@@ -2284,6 +2299,7 @@ bool RegisterVisualHostBindings(
                 loaded.erase(0u, 3u);
             }
             text = std::move(loaded);
+            registerLoadedAssetDir(candidate);
             return true;
         };
 
@@ -2355,6 +2371,87 @@ bool RegisterVisualHostBindings(
         }
 
         return rs_rt::Value{rs_rt::StringValue{std::string{}}};
+    });
+
+    ok &= bindFn("Utf8_CodePointCount", [&domains, reflectEnv](const rs_bc::FunctionReference&, rs_rt::ValueSpan args, rs_rt::RuntimeError&) -> std::optional<rs_rt::Value> {
+        std::string s;
+        if (!TryExtractStringValue(reflectEnv, args.size() > 0u ? args[0] : rs_rt::Value{}, s)) {
+            s = ArgString(domains, args, 0);
+        }
+        std::int64_t count = 0;
+        for (std::size_t i = 0u; i < s.size();) {
+            const unsigned char c = static_cast<unsigned char>(s[i]);
+            std::size_t adv = 1u;
+            if ((c & 0x80u) == 0u) adv = 1u;
+            else if ((c & 0xE0u) == 0xC0u) adv = 2u;
+            else if ((c & 0xF0u) == 0xE0u) adv = 3u;
+            else if ((c & 0xF8u) == 0xF0u) adv = 4u;
+            i += std::min(adv, s.size() - i);
+            ++count;
+        }
+        return rs_rt::Value{count};
+    });
+
+    ok &= bindFn("Utf8_SliceCodePoints", [&domains, reflectEnv](const rs_bc::FunctionReference&, rs_rt::ValueSpan args, rs_rt::RuntimeError&) -> std::optional<rs_rt::Value> {
+        std::string s;
+        if (!TryExtractStringValue(reflectEnv, args.size() > 0u ? args[0] : rs_rt::Value{}, s)) {
+            s = ArgString(domains, args, 0);
+        }
+        const std::int32_t startCp = std::max<std::int32_t>(0, ArgInt(args, 1));
+        const std::int32_t countCp = ArgInt(args, 2);
+        if (countCp <= 0 || s.empty()) {
+            return rs_rt::Value{rs_rt::StringValue{std::string{}}};
+        }
+        const std::int64_t endCp = static_cast<std::int64_t>(startCp) + static_cast<std::int64_t>(countCp);
+        std::size_t byteStart = s.size();
+        std::size_t byteEnd = s.size();
+        std::int64_t cpIdx = 0;
+        for (std::size_t i = 0u; i < s.size();) {
+            if (cpIdx == startCp) {
+                byteStart = i;
+            }
+            if (cpIdx == endCp) {
+                byteEnd = i;
+                break;
+            }
+            const unsigned char c = static_cast<unsigned char>(s[i]);
+            std::size_t adv = 1u;
+            if ((c & 0x80u) == 0u) adv = 1u;
+            else if ((c & 0xE0u) == 0xC0u) adv = 2u;
+            else if ((c & 0xF0u) == 0xE0u) adv = 3u;
+            else if ((c & 0xF8u) == 0xF0u) adv = 4u;
+            i += std::min(adv, s.size() - i);
+            ++cpIdx;
+        }
+        if (byteStart >= s.size() || byteEnd <= byteStart) {
+            return rs_rt::Value{rs_rt::StringValue{std::string{}}};
+        }
+        return rs_rt::Value{rs_rt::StringValue{s.substr(byteStart, byteEnd - byteStart)}};
+    });
+
+    ok &= bindFn("Utf8_FromCodePoint", [](const rs_bc::FunctionReference&, rs_rt::ValueSpan args, rs_rt::RuntimeError&) -> std::optional<rs_rt::Value> {
+        const auto cpRaw = ArgInt(args, 0);
+        if (cpRaw <= 0 || cpRaw > 0x10FFFF || (cpRaw >= 0xD800 && cpRaw <= 0xDFFF)) {
+            return rs_rt::Value{rs_rt::StringValue{std::string{}}};
+        }
+        const auto cp = static_cast<std::uint32_t>(cpRaw);
+        std::string out;
+        if (cp <= 0x7Fu) {
+            out.push_back(static_cast<char>(cp));
+        } else if (cp <= 0x7FFu) {
+            out.push_back(static_cast<char>(0xC0u | ((cp >> 6u) & 0x1Fu)));
+            out.push_back(static_cast<char>(0x80u | (cp & 0x3Fu)));
+        } else if (cp <= 0xFFFFu) {
+            out.push_back(static_cast<char>(0xE0u | ((cp >> 12u) & 0x0Fu)));
+            out.push_back(static_cast<char>(0x80u | ((cp >> 6u) & 0x3Fu)));
+            out.push_back(static_cast<char>(0x80u | (cp & 0x3Fu)));
+        } else {
+            out.push_back(static_cast<char>(0xF0u | ((cp >> 18u) & 0x07u)));
+            out.push_back(static_cast<char>(0x80u | ((cp >> 12u) & 0x3Fu)));
+            out.push_back(static_cast<char>(0x80u | ((cp >> 6u) & 0x3Fu)));
+            out.push_back(static_cast<char>(0x80u | (cp & 0x3Fu)));
+        }
+        return rs_rt::Value{rs_rt::StringValue{std::move(out)}};
     });
 
     return ok;

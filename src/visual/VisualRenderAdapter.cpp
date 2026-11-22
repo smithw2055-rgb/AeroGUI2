@@ -1348,7 +1348,10 @@ std::size_t VisualRenderAdapter::EmitVectorVisual(
                     const Color strokeCol = (vec.strokeGradId > 0)
                         ? Color{1.0f, 1.0f, 1.0f, effStrokeOp}
                         : UnpackRgba32(vec.strokeRgba, effStrokeOp);
-                    if (!vec.dashArray.empty() && rect.width > 1.0f && rect.height > 1.0f) {
+                    const bool trimmed = (vec.trimStart > 0.001f) || (vec.trimEnd < 0.999f);
+                    if (trimmed && (vec.trimEnd <= vec.trimStart + 0.0005f || rect.width <= 1.0f || rect.height <= 1.0f)) {
+                        // Fully trimmed or degenerate trimmed arc: emit nothing.
+                    } else if ((trimmed || !vec.dashArray.empty()) && rect.width > 1.0f && rect.height > 1.0f) {
                         constexpr int kEllipseSegs = 96;
                         const float cx = rect.x + rect.width * 0.5f;
                         const float cy = rect.y + rect.height * 0.5f;
@@ -1360,9 +1363,23 @@ std::size_t VisualRenderAdapter::EmitVectorVisual(
                             const float ang = (static_cast<float>(s) / static_cast<float>(kEllipseSegs)) * 6.28318530718f;
                             ringPts.push_back(Point{cx + std::cos(ang) * rx, cy + std::sin(ang) * ry});
                         }
-                        count += EmitDashedPolylinePoints(
-                            tree, ringPts, vec.dashArray, vec.dashCap,
-                            vec.strokeWidth, strokeCol, vec.strokeGradId, &node, world2D, world3D, has3D, blend);
+                        const std::vector<Point> finalPts = trimmed
+                            ? TrimPolylineRange(ringPts, vec.trimStart, vec.trimEnd)
+                            : ringPts;
+                        if (!vec.dashArray.empty()) {
+                            count += EmitDashedPolylinePoints(
+                                tree, finalPts, vec.dashArray, vec.dashCap,
+                                vec.strokeWidth, strokeCol, vec.strokeGradId, &node, world2D, world3D, has3D, blend);
+                        } else {
+                            for (std::size_t i = 1u; i < finalPts.size(); ++i) {
+                                const std::uint8_t sCap = (i == 1u) ? vec.startLineCap : 2u;
+                                const std::uint8_t eCap = (i + 1u == finalPts.size()) ? vec.endLineCap : 2u;
+                                count += EmitStyledDashCapsule(
+                                    tree, finalPts[i - 1u], finalPts[i], vec.strokeWidth,
+                                    sCap, eCap, strokeCol, vec.strokeGradId,
+                                    &node, world2D, world3D, has3D, blend);
+                            }
+                        }
                     } else {
                         const auto beginNid = static_cast<std::uint32_t>(tree.nodes_.size());
                         const std::uint32_t nid = tree.AllocateEllipseNode(

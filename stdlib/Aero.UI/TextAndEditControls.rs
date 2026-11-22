@@ -453,7 +453,7 @@ public class TextBoxBase : Control {
             _textVisual.FontSize = FontSize;
             _textVisual.FontWeight = FontWeight;
             _textVisual.FontStyle = FontStyle;
-            _textVisual.VerticalAlignment = VerticalAlignment.Center;
+            _textVisual.VerticalAlignment = _acceptsReturn ? VerticalAlignment.Top : VerticalAlignment.Center;
             _textVisual.Margin = new Thickness(2.0f, 0.0f, 2.0f, 0.0f);
             if (host is ContentControl) {
                 ContentControl cc = host as ContentControl;
@@ -507,7 +507,8 @@ public class TextBoxBase : Control {
         if (propName == "AcceptsReturn") { AcceptsReturn = DependencyObject.UnboxBool(value, false); return true; }
         if (propName == "MaxLength") { MaxLength = DependencyObject.UnboxInt(value, 0); return true; }
         if (propName == "PlaceholderText" || propName == "Placeholder" ||
-            propName == "Text.Placeholder" || propName == "noesis:Text.Placeholder") {
+            propName == "Text.Placeholder" || propName == "noesis:Text.Placeholder" ||
+            propName == "local:Text.Placeholder") {
             PlaceholderText = DependencyObject.UnboxString(value, "");
             return true;
         }
@@ -521,7 +522,8 @@ public class TextBoxBase : Control {
         if (propName == "AcceptsReturn") { return DependencyObject.BoxBool(_acceptsReturn); }
         if (propName == "MaxLength") { return DependencyObject.BoxInt(_maxLength); }
         if (propName == "PlaceholderText" || propName == "Placeholder" ||
-            propName == "Text.Placeholder" || propName == "noesis:Text.Placeholder") {
+            propName == "Text.Placeholder" || propName == "noesis:Text.Placeholder" ||
+            propName == "local:Text.Placeholder") {
             return DependencyObject.BoxString(_placeholderText);
         }
         if (propName == "CaretBrush") { return _caretBrush; }
@@ -535,6 +537,9 @@ public class TextBoxBase : Control {
 // ============================================================================
 
 public class TextBox : TextBoxBase {
+    private TextWrapping _textWrapping = TextWrapping.NoWrap;
+    private TextAlignment _textAlignment = TextAlignment.Left;
+
     public TextBox() : base() {}
     public TextBox(string initialText, string placeholder = "") : base() {
         if (placeholder != null && placeholder.Length > 0) { PlaceholderText = placeholder; }
@@ -554,13 +559,39 @@ public class TextBox : TextBoxBase {
     }
 
     public TextWrapping TextWrapping {
-        get { return _textVisual != null ? _textVisual.TextWrapping : TextWrapping.NoWrap; }
-        set { if (_textVisual != null) { _textVisual.TextWrapping = value; } }
+        get { return _textWrapping; }
+        set {
+            _textWrapping = value;
+            if (_textVisual != null) { _textVisual.TextWrapping = value; }
+            UIElement host = GetTemplateChild("PART_ContentHost");
+            if (host is ContentControl) {
+                if (_textWrapping != TextWrapping.NoWrap) {
+                    host.SetPropertyValue("HorizontalScrollBarVisibility", DependencyObject.BoxString("Disabled"));
+                } else if ((host as ContentControl).Template == null) {
+                    host.SetPropertyValue("HorizontalScrollBarVisibility", DependencyObject.BoxString("Hidden"));
+                }
+            }
+        }
     }
 
     public TextAlignment TextAlignment {
-        get { return _textVisual != null ? _textVisual.TextAlignment : TextAlignment.Left; }
-        set { if (_textVisual != null) { _textVisual.TextAlignment = value; } }
+        get { return _textAlignment; }
+        set {
+            _textAlignment = value;
+            if (_textVisual != null) { _textVisual.TextAlignment = value; }
+        }
+    }
+
+    public override void OnApplyTemplate() {
+        base.OnApplyTemplate();
+        if (_textVisual != null) {
+            _textVisual.TextWrapping = _textWrapping;
+            _textVisual.TextAlignment = _textAlignment;
+        }
+        UIElement host = GetTemplateChild("PART_ContentHost");
+        if (host is ContentControl && _textWrapping != TextWrapping.NoWrap) {
+            host.SetPropertyValue("HorizontalScrollBarVisibility", DependencyObject.BoxString("Disabled"));
+        }
     }
 
     public int MaxLines { get; set; } = 0;
@@ -574,12 +605,34 @@ public class TextBox : TextBoxBase {
         if (propName == "Text") { Text = DependencyObject.UnboxString(value, ""); return true; }
         if (propName == "MaxLines") { MaxLines = DependencyObject.UnboxInt(value, 0); return true; }
         if (propName == "MinLines") { MinLines = DependencyObject.UnboxInt(value, 1); return true; }
+        if (propName == "TextWrapping") {
+            if (value is BoxedInt) {
+                int tw = (value as BoxedInt).Value;
+                TextWrapping = tw == 1 ? TextWrapping.Wrap : (tw == 2 ? TextWrapping.WrapWithOverflow : TextWrapping.NoWrap);
+                return true;
+            }
+            string ws = DependencyObject.UnboxString(value, "NoWrap").Trim();
+            TextWrapping = ws == "Wrap" ? TextWrapping.Wrap : (ws == "WrapWithOverflow" ? TextWrapping.WrapWithOverflow : TextWrapping.NoWrap);
+            return true;
+        }
+        if (propName == "TextAlignment") {
+            if (value is BoxedInt) {
+                int ta = (value as BoxedInt).Value;
+                TextAlignment = ta == 1 ? TextAlignment.Center : (ta == 2 ? TextAlignment.Right : (ta == 3 ? TextAlignment.Justify : TextAlignment.Left));
+                return true;
+            }
+            string als = DependencyObject.UnboxString(value, "Left").Trim();
+            TextAlignment = als == "Center" ? TextAlignment.Center : (als == "Right" ? TextAlignment.Right : (als == "Justify" ? TextAlignment.Justify : TextAlignment.Left));
+            return true;
+        }
         return base.SetPropertyValue(propName, value);
     }
     public override DependencyObject GetPropertyValue(string propName) {
         if (propName == "Text") { return DependencyObject.BoxString(Text); }
         if (propName == "MaxLines") { return DependencyObject.BoxInt(MaxLines); }
         if (propName == "MinLines") { return DependencyObject.BoxInt(MinLines); }
+        if (propName == "TextWrapping") { return DependencyObject.BoxInt(EnumConvert.ToInt(_textWrapping)); }
+        if (propName == "TextAlignment") { return DependencyObject.BoxInt(EnumConvert.ToInt(_textAlignment)); }
         return base.GetPropertyValue(propName);
     }
 }
@@ -635,6 +688,8 @@ public class PasswordBox : TextBoxBase {
         int cpLen = ParseUtil.Utf8CodePointCount(newRaw);
         BindingEngine.NotifyTargetPropertyChanged(this, "Password", DependencyObject.BoxString(newRaw));
         BindingEngine.NotifyTargetPropertyChanged(this, "Text.PasswordLength", DependencyObject.BoxInt(cpLen));
+        BindingEngine.NotifyTargetPropertyChanged(this, "local:Text.PasswordLength", DependencyObject.BoxInt(cpLen));
+        UpdateTriggersAndStates();
     }
 
     public override bool SetPropertyValue(string propName, DependencyObject value) {
@@ -645,7 +700,8 @@ public class PasswordBox : TextBoxBase {
     public override DependencyObject GetPropertyValue(string propName) {
         if (propName == "Password") { return DependencyObject.BoxString(Password); }
         if (propName == "PasswordChar") { return DependencyObject.BoxString(_passwordChar); }
-        if (propName == "PasswordLength" || propName == "Text.PasswordLength" || propName == "noesis:Text.PasswordLength") {
+        if (propName == "PasswordLength" || propName == "Text.PasswordLength" ||
+            propName == "noesis:Text.PasswordLength" || propName == "local:Text.PasswordLength") {
             return DependencyObject.BoxInt(ParseUtil.Utf8CodePointCount(InternalRawText()));
         }
         if (propName == "Text") { return DependencyObject.BoxString(""); }

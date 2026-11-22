@@ -755,11 +755,44 @@ struct XamlNode final {
     return s;
 }
 
+[[nodiscard]] std::string NormalizeResourceKey(std::string_view raw) {
+    std::string s(aero::str::Trim(raw));
+    if (!LooksLikeMarkupExtension(s)) {
+        return s;
+    }
+    const auto ext = ParseMarkupExtension(s);
+    if (ext.kind == MarkupExtensionKind::XType) {
+        std::string t;
+        if (const auto* pos0 = ext.FindPositional(0)) {
+            t = pos0->literal;
+        } else if (const auto* tn = ext.FindNamed("TypeName")) {
+            t = tn->literal;
+        }
+        return t.empty() ? s : StripTargetTypeName(t);
+    }
+    if (ext.kind == MarkupExtensionKind::XStatic) {
+        std::string m;
+        if (const auto* pos0 = ext.FindPositional(0)) {
+            m = pos0->literal;
+        } else if (const auto* mn = ext.FindNamed("Member")) {
+            m = mn->literal;
+        }
+        m = std::string(aero::str::Trim(m));
+        const std::size_t dot = m.find('.');
+        const std::size_t colon = m.find(':');
+        if (colon != std::string::npos && (dot == std::string::npos || colon < dot)) {
+            m = m.substr(colon + 1);
+        }
+        return m.empty() ? s : m;
+    }
+    return s;
+}
+
 [[nodiscard]] std::string ResolveResourceKeyFromExtension(const MarkupExtensionNode& ext) {
     auto unwrap = [](const MarkupArgValue& val) -> std::string {
         if (!val.isExtension || !val.extension) {
             if (LooksLikeMarkupExtension(val.literal)) {
-                return StripTargetTypeName(val.literal);
+                return NormalizeResourceKey(val.literal);
             }
             return val.literal;
         }
@@ -771,6 +804,21 @@ struct XamlNode final {
             if (const auto* tn = nested.FindNamed("TypeName")) {
                 return StripTargetTypeName(tn->literal);
             }
+        }
+        if (nested.kind == MarkupExtensionKind::XStatic) {
+            std::string m;
+            if (const auto* m0 = nested.FindPositional(0)) {
+                m = m0->literal;
+            } else if (const auto* mn = nested.FindNamed("Member")) {
+                m = mn->literal;
+            }
+            m = std::string(aero::str::Trim(m));
+            const std::size_t dot = m.find('.');
+            const std::size_t colon = m.find(':');
+            if (colon != std::string::npos && (dot == std::string::npos || colon < dot)) {
+                m = m.substr(colon + 1);
+            }
+            return m;
         }
         if (const auto* n0 = nested.FindPositional(0)) {
             return n0->literal;
@@ -866,7 +914,7 @@ struct XamlNode final {
 
 [[nodiscard]] bool IsIntProperty(std::string_view prop) {
     static const std::unordered_set<std::string_view> kIntProps = {
-        "ZIndex", "MaxLines", "TabIndex", "SelectedIndex", "Rows", "Columns", "MaxLength",
+        "ZIndex", "MaxLines", "TabIndex", "SelectedIndex", "Rows", "Columns", "FirstColumn", "MaxLength",
         "Year", "Month", "Day", "Hour", "Minute", "Second"
     };
     return kIntProps.count(prop) > 0;
@@ -925,12 +973,12 @@ struct XamlNode final {
         "IsReadOnly", "LastChildFill", "SelectedIndex", "SelectionMode",
         "Placeholder", "IsCheckable", "TabStripPlacement",
         "HorizontalScrollBarVisibility", "VerticalScrollBarVisibility",
-        "RenderTransform", "LayoutTransform", "RenderTransformOrigin", "Effect", "OpacityMask", "Style", "ShowGridLines", "Rows", "Columns",
+        "RenderTransform", "LayoutTransform", "RenderTransformOrigin", "Effect", "OpacityMask", "Style", "ShowGridLines", "Rows", "Columns", "FirstColumn",
         "TickLength", "TickWidth", "MinAngle", "MaxAngle", "Brush",
         "Volume", "IsMuted", "LoadedBehavior", "Password", "PasswordChar",
         "Year", "Month", "Day", "Hour", "Minute", "Second", "Format", "UseSystemTime",
         "LineHeight", "CharacterSpacing", "MaxLines",
-        "IsDirectionReversed", "IsTabStop", "ViewportSize", "MaxDropDownHeight",
+        "IsDirectionReversed", "IsTabStop", "TabIndex", "ViewportSize", "MaxDropDownHeight",
         "FontStyle", "IsItemsHost", "FlowDirection"
     };
     return kProps.count(prop) > 0;
@@ -942,7 +990,7 @@ struct XamlNode final {
         "UserControl", "ScrollViewer", "ButtonBase", "Button",
         "RepeatButton", "ToggleButton", "CheckBox", "RadioButton", "GroupBox",
         "Expander", "TabItem", "MenuItem", "ListBoxItem", "ComboBoxItem",
-        "ListViewItem", "StatusBarItem", "ToolTip", "Label"
+        "ListViewItem", "StatusBarItem", "ToolTip", "Label", "GridViewColumnHeader"
     };
     return kCC.count(typeName) > 0;
 }
@@ -1002,7 +1050,7 @@ struct XamlNode final {
         "HeaderedItemsControl", "SelectableItem", "ListBoxItem", "ComboBoxItem",
         "ListViewItem", "Selector", "ListBox", "ListView", "ComboBox", "TabControl",
         "TabItem", "MenuBase", "Menu", "ContextMenu", "MenuItem", "ToolBar",
-        "StatusBar", "StatusBarItem", "TreeView", "TreeViewItem",
+        "StatusBar", "StatusBarItem", "TreeView", "TreeViewItem", "GridViewColumnHeader",
         "DateTimeControl", "RiveControl"
     };
     return kControls.count(typeName) > 0;
@@ -1040,7 +1088,7 @@ struct XamlNode final {
         "Width", "Height", "MinWidth", "MaxWidth", "MinHeight", "MaxHeight",
         "Margin", "Padding", "HorizontalAlignment", "VerticalAlignment",
         "Visibility", "Opacity", "IsEnabled", "IsHitTestVisible", "Focusable",
-        "ClipToBounds", "ZIndex", "RenderTransform", "LayoutTransform", "RenderTransformOrigin",
+        "ClipToBounds", "ZIndex", "TabIndex", "RenderTransform", "LayoutTransform", "RenderTransformOrigin",
         "Effect", "OpacityMask", "Style", "Background", "BorderBrush",
         "BorderThickness", "CornerRadius", "FlowDirection"
     };
@@ -1096,7 +1144,7 @@ struct XamlNode final {
                targetType == "UniformGrid";
     }
     if (prop == "LastChildFill") return targetType == "DockPanel";
-    if (prop == "Rows" || prop == "Columns") return targetType == "UniformGrid";
+    if (prop == "Rows" || prop == "Columns" || prop == "FirstColumn") return targetType == "UniformGrid";
     if (prop == "Stretch") {
         return targetType == "Viewbox" || targetType == "LayoutScaler" ||
                targetType == "Image" || IsShapeType(targetType) ||
@@ -1282,12 +1330,12 @@ struct XamlNode final {
     }
     if (!targetType.empty() && (IsKnownUIElementType(targetType) || IsNonUIElementType(targetType))) {
         if (prop == "ZIndex") return !IsNonUIElementType(targetType);
-        if (prop == "Rows" || prop == "Columns") return targetType == "UniformGrid";
+        if (prop == "Rows" || prop == "Columns" || prop == "FirstColumn") return targetType == "UniformGrid";
         if (prop == "MaxLines") return targetType == "TextBlock" || targetType == "TextBox";
         if (prop == "MaxLength") {
             return targetType == "TextBoxBase" || targetType == "TextBox" || targetType == "PasswordBox";
         }
-        if (prop == "TabIndex") return targetType == "TabItem";
+        if (prop == "TabIndex") return !IsNonUIElementType(targetType);
         if (prop == "SelectedIndex") return IsSelectorType(targetType);
         if (prop == "Year" || prop == "Month" || prop == "Day" ||
             prop == "Hour" || prop == "Minute" || prop == "Second") {
@@ -1295,7 +1343,7 @@ struct XamlNode final {
         }
         return false;
     }
-    if ((prop == "Rows" || prop == "Columns") && !rawVal.empty()) {
+    if ((prop == "Rows" || prop == "Columns" || prop == "FirstColumn") && !rawVal.empty()) {
         const std::string_view s = aero::str::Trim(rawVal);
         if (s.empty()) return false;
         std::size_t idx = (s.front() == '-') ? 1u : 0u;
@@ -2192,7 +2240,7 @@ private:
                 if (!rawKey.empty()) {
                     std::string effKey = rawKey;
                     if (LooksLikeMarkupExtension(effKey)) {
-                        effKey = StripTargetTypeName(effKey);
+                        effKey = NormalizeResourceKey(effKey);
                     }
                     if (liveKeys.count(rawKey) > 0u || liveKeys.count(effKey) > 0u) {
                         isLive = true;
@@ -2600,7 +2648,7 @@ private:
             liveExternalNodes_.count(&child) == 0u) {
             return;
         }
-        std::string key = child.GetKey();
+        std::string key = NormalizeResourceKey(child.GetKey());
         if (child.localName == "Style" && key.empty()) {
             if (const auto* tt = child.FindAttribute("TargetType")) {
                 key = StripTargetTypeName(tt->value);
@@ -3344,6 +3392,20 @@ private:
                     Indent(out, indent);
                     out << "if (__base_" << styVar << " is Style __bs_" << styVar << ") { "
                         << styVar << ".BasedOn = __bs_" << styVar << "; }\n";
+                }
+            }
+        }
+
+        if (const XamlNode* resProp = styleNode.FindPropertyElement("Style", "Resources")) {
+            const std::string styleDictVar = styVar + ".Resources";
+            for (const auto& rc : resProp->children) {
+                if (!rc || ShouldIgnoreXmlElement(*rc)) {
+                    continue;
+                }
+                if (rc->localName == "ResourceDictionary") {
+                    EmitResourceDictionaryEntries(*rc, "", styleDictVar, out, indent);
+                } else {
+                    EmitSingleDirectResource(*rc, styleDictVar, out, indent);
                 }
             }
         }
@@ -6033,13 +6095,15 @@ private:
         std::string_view rawLen,
         std::string_view dictVar,
         std::ostringstream& out,
-        int indent) {
+        int indent,
+        std::string_view defName = {}) {
+        const std::string nameSuffix = defName.empty() ? std::string{} : (", " + EscapeRsString(defName));
         if (LooksLikeMarkupExtension(rawLen)) {
             const auto ext = ParseMarkupExtension(rawLen);
             if (!ext.IsOk()) {
                 AddError("Invalid markup extension '" + std::string(rawLen) + "': " + ext.errorMessage);
                 Indent(out, indent);
-                out << targetVar << "." << method << "(GridUnitType.Auto, 1.0f);\n";
+                out << targetVar << "." << method << "(GridUnitType.Auto, 1.0f" << nameSuffix << ");\n";
                 return;
             }
             std::string resKey;
@@ -6067,7 +6131,7 @@ private:
                     if (const auto it = knownDoubles_.find(resKey); it != knownDoubles_.end()) {
                         Indent(out, indent);
                         out << targetVar << "." << method << "(GridUnitType.Pixel, "
-                            << FormatFloatLiteral(it->second) << ");\n";
+                            << FormatFloatLiteral(it->second) << nameSuffix << ");\n";
                         return;
                     }
                 }
@@ -6095,13 +6159,13 @@ private:
                     << " = GridLength.FromPixel(DependencyObject.UnboxFloat(" << srcVar
                     << " as DependencyObject, 0.0f)); }\n";
                 Indent(out, indent);
-                out << targetVar << "." << method << "(" << glVar << ".GridUnitType, " << glVar << ".Value);\n";
+                out << targetVar << "." << method << "(" << glVar << ".GridUnitType, " << glVar << ".Value" << nameSuffix << ");\n";
                 return;
             }
         }
         const auto [unit, val] = ParseGridLength(rawLen);
         Indent(out, indent);
-        out << targetVar << "." << method << "(" << unit << ", " << val << ");\n";
+        out << targetVar << "." << method << "(" << unit << ", " << val << nameSuffix << ");\n";
     }
 
     [[nodiscard]] std::string EmitConstructedElement(
@@ -6193,7 +6257,7 @@ private:
                 if (rd->localName != "RowDefinition") continue;
                 std::string rawH = "*";
                 if (const auto* h = rd->FindAttribute("Height")) rawH = h->value;
-                EmitSingleGridTrackDef(targetVar, "AddRowDefinition", rawH, dictVar, out, indent);
+                EmitSingleGridTrackDef(targetVar, "AddRowDefinition", rawH, dictVar, out, indent, rd->GetName());
             }
         }
         if (const auto* cDefs = node.FindPropertyElement(xmlLocalName, "ColumnDefinitions")) {
@@ -6201,7 +6265,7 @@ private:
                 if (cd->localName != "ColumnDefinition") continue;
                 std::string rawW = "*";
                 if (const auto* w = cd->FindAttribute("Width")) rawW = w->value;
-                EmitSingleGridTrackDef(targetVar, "AddColumnDefinition", rawW, dictVar, out, indent);
+                EmitSingleGridTrackDef(targetVar, "AddColumnDefinition", rawW, dictVar, out, indent, cd->GetName());
             }
         }
 
