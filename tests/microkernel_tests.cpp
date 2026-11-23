@@ -1685,6 +1685,175 @@ void TestGalleryEngineFixesMicrokernel() {
     CHECK_NEAR(n4->layout.layoutTransform2D.rotDeg, 45.0f, 1e-4f);
 }
 
+void TestReviewFixesMicrokernel() {
+    std::printf("[Test] TestReviewFixesMicrokernel (VisualBrush/BlendMode/Saturation/BiDi/StrokePad/LayoutClip)...\n");
+
+    // 1. VisualBrush masked SvgPath + Ellipse with multi-quad Text content & ImageAtlas::Clear slot safety (P0 #1)
+    {
+        aero::UIResourceStore store;
+        aero::VisualWorld w;
+        const aero::VisualNodeId root = w.CreateNode(aero::VisualKind::Box);
+        w.SetRoot(root);
+        w.SetSize(root, 320.0f, 200.0f);
+
+        const aero::VisualNodeId vbSrc = w.CreateNode(aero::VisualKind::Box);
+        w.AddChild(root, vbSrc);
+        w.SetSize(vbSrc, 80.0f, 40.0f);
+        w.SetBoxStyle(vbSrc, 0xFF335577u, 0u, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f);
+
+        const aero::VisualNodeId vbTxt = w.CreateNode(aero::VisualKind::Text);
+        w.AddChild(vbSrc, vbTxt);
+        w.SetSize(vbTxt, 80.0f, 40.0f);
+        w.SetText(
+            vbTxt, "VB!", "", 14.0f, 0xFFFFFFFFu,
+            aero::TextWrapping::NoWrap, aero::TextAlignment::Left, aero::TextTrimming::None);
+
+        const aero::VisualNodeId svgNode = w.CreateNode(aero::VisualKind::Vector);
+        w.AddChild(root, svgNode);
+        w.SetSize(svgNode, 80.0f, 40.0f);
+        w.SetVectorShape(
+            svgNode, aero::VectorShapeKind::SvgPath, "M 0,0 L 80,0 L 80,40 L 0,40 Z",
+            0xFFFFFFFFu, -1, 0u, -1, 0.0f, aero::Stretch::Fill, 0.0f, 1.0f);
+        w.SetVisualBrushSource(svgNode, vbSrc, 1, 1);
+
+        const aero::VisualNodeId ellNode = w.CreateNode(aero::VisualKind::Vector);
+        w.AddChild(root, ellNode);
+        w.SetSize(ellNode, 64.0f, 64.0f);
+        w.SetVectorShape(
+            ellNode, aero::VectorShapeKind::Ellipse, "",
+            0xFFFFFFFFu, -1, 0u, -1, 0.0f, aero::Stretch::Fill, 0.0f, 1.0f);
+        w.SetVisualBrushSource(ellNode, vbSrc, 1, 1);
+
+        w.UpdateLayout(320.0f, 200.0f);
+        aero::DrawingCommandBuffer drawBuf;
+        aero::PagedRenderTree renderTree;
+        aero::VisualRenderAdapter adapter;
+        const std::size_t emitted = adapter.SyncPagedRenderTree(w, &drawBuf, renderTree, &store);
+        CHECK(emitted >= 3u);
+
+        std::uint32_t svgTexId = 0u;
+        std::uint32_t ellTexId = 0u;
+        const aero::VisualNode* svgPtr = w.GetNode(svgNode);
+        const aero::VisualNode* ellPtr = w.GetNode(ellNode);
+        for (std::size_t i = 0u; i < renderTree.NodeCount(); ++i) {
+            const aero::RenderNodeDescriptor* desc = renderTree.GetNode(static_cast<std::uint32_t>(i));
+            if (!desc || desc->textureId == 0u) continue;
+            if (desc->sourceElement == svgPtr) svgTexId = desc->textureId;
+            if (desc->sourceElement == ellPtr) ellTexId = desc->textureId;
+        }
+        CHECK(svgTexId > 0u && store.Images().HasTextureSlot(svgTexId));
+        CHECK(ellTexId > 0u && store.Images().HasTextureSlot(ellTexId));
+
+        std::uint32_t ew = 0u, eh = 0u;
+        std::shared_ptr<const std::vector<std::uint8_t>> ePx;
+        CHECK(store.Images().TryGetTextureSlotSnapshot(ellTexId, ew, eh, ePx) && ePx != nullptr);
+        if (ePx && ew > 4u && eh > 4u && ePx->size() >= static_cast<std::size_t>(ew) * eh * 4u) {
+            // Top-left padded corner must be masked transparent while center holds VisualBrush content.
+            CHECK((*ePx)[3u] == 0u);
+            CHECK((*ePx)[(static_cast<std::size_t>(eh / 2u) * ew + (ew / 2u)) * 4u + 3u] > 0u);
+        }
+
+        // Clearing the atlas must reset visualBrushSlots_ and re-allocate valid slots on next sync.
+        store.Images().Clear();
+        CHECK(store.Images().StandaloneTextureCount() == 0u);
+        aero::UIResourceStore freshMaskStore;
+        aero::PagedRenderTree tree2;
+        w.MarkDirty(ellNode, aero::VisualDirty_Visual);
+        w.UpdateLayout(320.0f, 200.0f);
+        const std::size_t emitted2 = adapter.SyncPagedRenderTree(w, &drawBuf, tree2, &freshMaskStore);
+        CHECK(emitted2 >= 3u);
+    }
+
+    // 2. BlendMode with post-process Blur applies once at BlurLayerSpan, not inside span nodes (P1 #6)
+    {
+        aero::UIResourceStore store;
+        aero::VisualWorld w;
+        const aero::VisualNodeId root = w.CreateNode(aero::VisualKind::Box);
+        w.SetRoot(root);
+        w.SetSize(root, 200.0f, 120.0f);
+        const aero::VisualNodeId blurMult = w.CreateNode(aero::VisualKind::Box);
+        w.AddChild(root, blurMult);
+        w.SetSize(blurMult, 80.0f, 50.0f);
+        w.SetBoxStyle(blurMult, 0xFFCC8844u, 0u, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f);
+        w.SetEffect(blurMult, aero::UIEffectKind::Blur, 6.0f, 0.0f, 0.0f, 0xFFFFFFFFu, 1.0f);
+        w.SetBlendMode(blurMult, aero::BlendingMode::Multiply);
+        w.UpdateLayout(200.0f, 120.0f);
+
+        aero::DrawingCommandBuffer drawBuf;
+        aero::PagedRenderTree tree;
+        aero::VisualRenderAdapter adapter;
+        const std::size_t emitted = adapter.SyncPagedRenderTree(w, &drawBuf, tree, &store);
+        CHECK(emitted >= 1u);
+        bool foundSpan = false;
+        for (const auto& sp : tree.BlurLayerSpans()) {
+            if (sp.blendMode == aero::BlendingMode::Multiply) {
+                foundSpan = true;
+                for (std::uint32_t nid = sp.firstNodeId; nid < sp.endNodeId; ++nid) {
+                    const auto* d = tree.GetNode(nid);
+                    CHECK(d != nullptr && d->blendMode == aero::BlendingMode::Normal);
+                }
+            }
+        }
+        CHECK(foundSpan);
+    }
+
+    // 3. shader://saturation? recursion rejection & nested query param preservation (P1 #8)
+    {
+        aero::ImageAtlas atlas;
+        CHECK(atlas.LoadOrGet("shader://saturation?sat=0.5&src=shader://saturation?sat=0.2&src=missing.png") == nullptr);
+        const aero::ImageAtlasEntry* satPlasma =
+            atlas.LoadOrGet("shader://saturation?sat=0.5&src=shader://plasma?vw=48&vh=24&time=0.5");
+        CHECK(satPlasma != nullptr && satPlasma->width == 48u && satPlasma->height == 24u);
+    }
+
+    // 4. Leading CRLF line index and BiDi firstCodePointIndex (P1 #9)
+    {
+        aero::FontAtlas fonts;
+        std::vector<aero::RichTextRunInput> runs(1);
+        runs[0].text = "\r\nabc";
+        const aero::TextLayoutResult lay = fonts.MeasureRichLayout(
+            runs, "Segoe UI", 14.0f, 400, false, 1000.0f, aero::TextWrapping::NoWrap);
+        CHECK(lay.lines.size() >= 2u);
+        if (!lay.lines.empty()) {
+            CHECK(lay.lines[0].firstCodePointIndex == 0u);
+        }
+    }
+
+    // 5. Thick stroke padding > 64px & non-bulging flat cap on short multi-segment path (P2 #14)
+    {
+        aero::UIResourceStore store;
+        aero::RasterizedPathMaskEntry strokeMask{};
+        CHECK(store.GetOrRasterizePathStrokeMask(
+            0ull, "M 20,50 L 21,50 L 80,50", aero::Rect{20.0f, 50.0f, 60.0f, 1.0f},
+            60u, 10u, 80.0f, 90u, strokeMask, 0u, 0u));
+        std::uint32_t sw = 0u, sh = 0u;
+        std::shared_ptr<const std::vector<std::uint8_t>> px;
+        CHECK(store.Images().TryGetTextureSlotSnapshot(strokeMask.textureId, sw, sh, px) && px != nullptr);
+        CHECK(sw == 60u + 2u * 90u);
+        if (px && sw > 90u && sh > 2u) {
+            // 6px behind the flat start cut (pad = 90) must stay transparent despite short seg0=1px and strokeWidth=80px.
+            CHECK((*px)[(static_cast<std::size_t>(sh / 2u) * sw + 84u) * 4u + 3u] == 0u);
+        }
+    }
+
+    // 6. Stretched container without explicit Width/Height must not clip negative-margin child (P2 #14)
+    {
+        aero::VisualWorld w;
+        const aero::VisualNodeId root = w.CreateNode(aero::VisualKind::Box);
+        w.SetRoot(root);
+        const aero::VisualNodeId stretchParent = w.CreateNode(aero::VisualKind::Box);
+        w.AddChild(root, stretchParent);
+        w.SetAlignment(stretchParent, aero::HorizontalAlignment::Stretch, aero::VerticalAlignment::Stretch);
+        const aero::VisualNodeId bleedChild = w.CreateNode(aero::VisualKind::Box);
+        w.AddChild(stretchParent, bleedChild);
+        w.SetSize(bleedChild, 120.0f, 40.0f);
+        w.SetMargin(bleedChild, -12.0f, 0.0f, 0.0f, 0.0f);
+        w.UpdateLayout(200.0f, 100.0f);
+        const aero::VisualNode* sp = w.GetNode(stretchParent);
+        CHECK(sp != nullptr && !sp->layout.needsLayoutClip);
+    }
+}
+
 } // namespace
 
 int main() {
@@ -1705,6 +1874,7 @@ int main() {
     TestGridStarInsideExplicitWidthAndInfParent();
     TestAnimationEngineManagedCustomAndDelayStart();
     TestGalleryEngineFixesMicrokernel();
+    TestReviewFixesMicrokernel();
 
     if (gFailureCount != 0) {
         std::fprintf(stderr, "microkernel_tests FAILED (%d checks failed)\n", gFailureCount);

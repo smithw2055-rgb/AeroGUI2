@@ -241,6 +241,15 @@ struct VisualImageData {
     float viewboxY = 0.0f;
     float viewboxW = 1.0f;
     float viewboxH = 1.0f;
+    float viewportX = 0.0f;
+    float viewportY = 0.0f;
+    float viewportW = 1.0f;
+    float viewportH = 1.0f;
+    VisualNodeId visualBrushSource{};
+    std::uint8_t alignX = 1u;
+    std::uint8_t alignY = 1u;
+    bool hasExplicitViewport = false;
+    bool viewportAbsolute = false;
     bool tileWrap = false;
 };
 
@@ -581,6 +590,7 @@ public:
         std::int32_t gradId,
         std::uint32_t solidRgba,
         float opacity) noexcept;
+    bool SetBlendMode(VisualNodeId id, BlendingMode mode) noexcept;
 
     // Text, Image, Vector & Retained Canvas Invalidation
     bool SetText(
@@ -645,6 +655,19 @@ public:
         float vy,
         float vw,
         float vh) noexcept;
+    bool SetImageViewport(
+        VisualNodeId id,
+        float vpx,
+        float vpy,
+        float vpw,
+        float vph,
+        bool hasExplicit,
+        bool isAbsolute) noexcept;
+    bool SetVisualBrushSource(
+        VisualNodeId id,
+        VisualNodeId sourceId,
+        int alignX,
+        int alignY) noexcept;
     bool SetImageTileMode(VisualNodeId id, bool tileWrap) noexcept;
     bool SetVectorShape(
         VisualNodeId id,

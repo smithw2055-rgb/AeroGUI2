@@ -142,7 +142,9 @@ bool RasterizeSvgPathStrokeAlphaMask(
     std::uint32_t innerHeight,
     float strokeWidthPx,
     std::uint32_t padPx,
-    std::vector<std::uint8_t>& outRgba8);
+    std::vector<std::uint8_t>& outRgba8,
+    std::uint8_t startLineCap = 2u,
+    std::uint8_t endLineCap = 2u);
 
 namespace detail {
 

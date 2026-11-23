@@ -1828,8 +1828,19 @@ public class ComboBox : Selector {
             }
             if (_isDropDownOpen) {
                 QueueScrollSelectedIntoView();
+                if (_dropScroll != null) {
+                    _dropScroll.SetKeyboardFocusWithinState(true);
+                }
+                if (!_isEditable && ContainerCount() > 0) {
+                    int focusIdx = (SelectedIndex >= 0 && SelectedIndex < ContainerCount()) ? SelectedIndex : 0;
+                    UIElement itemEl = ContainerAt(focusIdx);
+                    if (itemEl != null) { InputDispatcher.SetFocus(itemEl); }
+                }
             } else {
                 _pendingScrollToSelected = false;
+                if (_dropScroll != null) {
+                    _dropScroll.SetKeyboardFocusWithinState(false);
+                }
             }
             UpdateHeaderVisual();
             BindingEngine.NotifyTargetPropertyChanged(this, "IsDropDownOpen", DependencyObject.BoxBool(_isDropDownOpen));
@@ -1974,6 +1985,23 @@ public class ComboBox : Selector {
         return null;
     }
 
+    private static ScrollViewer FindDescendantScrollViewer(UIElement rootNode) {
+        if (rootNode == null) { return null; }
+        var q = new UIElement[0];
+        q.Push(rootNode);
+        int idx = 0;
+        while (idx < q.Length) {
+            UIElement node = q[idx];
+            idx += 1;
+            if (node == null) { continue; }
+            if (node is ScrollViewer) { return node as ScrollViewer; }
+            for (int i = 0; i < node.ChildCount(); i += 1) {
+                q.Push(node.ChildAt(i));
+            }
+        }
+        return null;
+    }
+
     private static ToggleButton FindDescendantToggleButton(UIElement rootNode) {
         if (rootNode == null) { return null; }
         var q = new UIElement[0];
@@ -1994,6 +2022,9 @@ public class ComboBox : Selector {
 
     private void NotifyPopupClosedInternal() {
         _isDropDownOpen = false;
+        if (_dropScroll != null) {
+            _dropScroll.SetKeyboardFocusWithinState(false);
+        }
         if (_dropDownToggle != null && _dropDownToggle.IsChecked) {
             _dropDownToggle.IsChecked = false;
         }
@@ -2009,6 +2040,7 @@ public class ComboBox : Selector {
             _dropdownPopup = null;
             _dropDownToggle = null;
             _editableTextBox = null;
+            _dropScroll = null;
             UIElement edTb = GetTemplateChild("PART_EditableTextBox");
             if (edTb is TextBox) {
                 _editableTextBox = edTb as TextBox;
@@ -2037,10 +2069,18 @@ public class ComboBox : Selector {
             if (_dropDownToggle != null && _dropDownToggle.IsChecked != _isDropDownOpen) {
                 _dropDownToggle.IsChecked = _isDropDownOpen;
             }
+            UIElement dsv = GetTemplateChild("DropDownScrollViewer");
+            if (!(dsv is ScrollViewer)) { dsv = GetTemplateChild("PART_ScrollViewer"); }
+            if (dsv is ScrollViewer) { _dropScroll = dsv as ScrollViewer; }
             UIElement pop = GetTemplateChild("PART_Popup");
             if (pop is Popup) {
                 _dropdownPopup = pop as Popup;
                 _dropdownPopup.PlacementTarget = this;
+                if (_dropScroll == null && _dropdownPopup.Child != null) {
+                    UIElement foundSv = _dropdownPopup.Child.FindName("DropDownScrollViewer");
+                    if (foundSv is ScrollViewer) { _dropScroll = foundSv as ScrollViewer; }
+                    else { _dropScroll = FindDescendantScrollViewer(_dropdownPopup.Child); }
+                }
                 _dropdownPopup.IsOpen = _isDropDownOpen;
                 _dropdownPopup.Closed += (object s, EventArgs e) => { NotifyPopupClosedInternal(); };
             }
@@ -2365,7 +2405,7 @@ public class TabItem : HeaderedContentControl {
     }
 
     private void UpdateTabVisual() {
-        if (Style == null) {
+        if (Style == null && _appliedStyle == null && Template == null) {
             Background = new SolidColorBrush(_isSelected ? "#FF282D32" : (IsMouseOver ? "#FF23272B" : "#00000000"));
             Foreground = new SolidColorBrush(_isSelected ? "#FFF1F5F9" : "#FFD0D6DC");
         }

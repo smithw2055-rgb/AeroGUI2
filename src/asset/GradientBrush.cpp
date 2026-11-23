@@ -151,11 +151,14 @@ Color EvaluateGradientBrushAtNormalizedUv(
         }
     } else if (brush.kind == GradientBrushKind::Conic) {
         constexpr float kTwoPi = 6.2831853071795864769f;
+        constexpr float kHalfPi = 1.5707963267948966192f;
         const float dx = sampleX - brush.center.x;
         const float dy = sampleY - brush.center.y;
-        float angle = std::atan2(dy, dx);
+        float angle = std::atan2(dy, dx) + kHalfPi;
         if (angle < 0.0f) {
             angle += kTwoPi;
+        } else if (angle >= kTwoPi) {
+            angle -= kTwoPi;
         }
         t = angle / kTwoPi;
     } else {

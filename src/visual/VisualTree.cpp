@@ -627,6 +627,15 @@ bool VisualWorld::SetTransform2D(
     return true;
 }
 
+bool VisualWorld::SetBlendMode(VisualNodeId id, BlendingMode mode) noexcept {
+    VisualNode* node = GetNode(id);
+    if (!node) return false;
+    if (node->transform2D.blendMode == mode) return true;
+    node->transform2D.blendMode = mode;
+    MarkDirty(id, VisualDirty_Visual);
+    return true;
+}
+
 bool VisualWorld::SetLayoutTransform2D(
     VisualNodeId id,
     float sx,
@@ -1018,20 +1027,26 @@ std::int32_t VisualWorld::HitTestTextCodePoint(VisualNodeId id, float localX, fl
     if (txt.text.empty() && txt.richSpans.empty()) {
         return 0;
     }
+    const float padL = std::max(0.0f, node->layout.padding.left);
+    const float padT = std::max(0.0f, node->layout.padding.top);
+    const float padR = std::max(0.0f, node->layout.padding.right);
+    const float boxW = std::max(0.0f, node->layout.layoutRect.width - padL - padR);
+    const float tx = localX - padL;
+    const float ty = localY - padT;
     const float maxW = (txt.wrap == TextWrapping::NoWrap)
         ? 1000000.0f
-        : std::max(1.0f, node->layout.layoutRect.width);
+        : std::max(1.0f, boxW);
     const TextLayoutResult layout = LayoutTextNode(*node, maxW);
-    if (layout.lines.empty() || layout.glyphs.empty()) {
+    if (layout.lines.empty()) {
         return 0;
     }
 
     const TextLineMetrics* chosenLine = &layout.lines.back();
-    if (localY <= layout.lines.front().topY + layout.lines.front().lineHeight) {
+    if (ty <= layout.lines.front().topY + layout.lines.front().lineHeight) {
         chosenLine = &layout.lines.front();
     } else {
         for (const TextLineMetrics& line : layout.lines) {
-            if (localY <= line.topY + line.lineHeight) {
+            if (ty <= line.topY + line.lineHeight) {
                 chosenLine = &line;
                 break;
             }
@@ -1039,7 +1054,6 @@ std::int32_t VisualWorld::HitTestTextCodePoint(VisualNodeId id, float localX, fl
     }
 
     float alignDx = 0.0f;
-    const float boxW = std::max(0.0f, node->layout.layoutRect.width);
     if (txt.align == TextAlignment::Center) {
         alignDx = std::max(0.0f, (boxW - chosenLine->width) * 0.5f);
     } else if (txt.align == TextAlignment::Right) {
@@ -1051,14 +1065,14 @@ std::int32_t VisualWorld::HitTestTextCodePoint(VisualNodeId id, float localX, fl
     for (std::size_t i = lineBegin; i < lineEnd; ++i) {
         const PositionedGlyph& g = layout.glyphs[i];
         const float midX = g.penX + alignDx + g.advanceX * 0.5f;
-        if (localX < midX) {
+        if (tx < midX) {
             return static_cast<std::int32_t>(g.sourceCodePointIndex);
         }
     }
     if (lineEnd > lineBegin) {
         return static_cast<std::int32_t>(layout.glyphs[lineEnd - 1u].sourceCodePointIndex + 1u);
     }
-    return 0;
+    return static_cast<std::int32_t>(chosenLine->firstCodePointIndex);
 }
 
 bool VisualWorld::SetImage(
@@ -1091,6 +1105,42 @@ bool VisualWorld::SetImageViewbox(
     img.viewboxY = std::isfinite(vy) ? vy : 0.0f;
     img.viewboxW = std::isfinite(vw) ? vw : 1.0f;
     img.viewboxH = std::isfinite(vh) ? vh : 1.0f;
+    MarkDirty(id, VisualDirty_Visual);
+    return true;
+}
+
+bool VisualWorld::SetImageViewport(
+    VisualNodeId id,
+    float vpx,
+    float vpy,
+    float vpw,
+    float vph,
+    bool hasExplicit,
+    bool isAbsolute) noexcept {
+    VisualNode* node = GetNode(id);
+    if (!node) return false;
+    auto& img = node->EnsureExtras().image;
+    img.viewportX = std::isfinite(vpx) ? vpx : 0.0f;
+    img.viewportY = std::isfinite(vpy) ? vpy : 0.0f;
+    img.viewportW = (std::isfinite(vpw) && vpw > 0.0f) ? vpw : 1.0f;
+    img.viewportH = (std::isfinite(vph) && vph > 0.0f) ? vph : 1.0f;
+    img.hasExplicitViewport = hasExplicit;
+    img.viewportAbsolute = isAbsolute;
+    MarkDirty(id, VisualDirty_Visual);
+    return true;
+}
+
+bool VisualWorld::SetVisualBrushSource(
+    VisualNodeId id,
+    VisualNodeId sourceId,
+    int alignX,
+    int alignY) noexcept {
+    VisualNode* node = GetNode(id);
+    if (!node) return false;
+    auto& img = node->EnsureExtras().image;
+    img.visualBrushSource = sourceId;
+    img.alignX = static_cast<std::uint8_t>(std::clamp(alignX, 0, 2));
+    img.alignY = static_cast<std::uint8_t>(std::clamp(alignY, 0, 2));
     MarkDirty(id, VisualDirty_Visual);
     return true;
 }

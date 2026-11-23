@@ -4322,6 +4322,7 @@ TextLayoutResult FontAtlas::MeasureRichLayout(
     float curPenX = 0.0f;
     float curTopY = 0.0f;
     std::size_t lineStartGlyphIdx = 0u;
+    std::uint32_t curLineFirstCp = 0u;
     std::size_t lastBreakDecodedIdx = static_cast<std::size_t>(-1);
     std::size_t lastBreakGlyphOutIdx = 0u;
     std::uint32_t prevGlyphIdOnLine = 0xFFFFFFFFu;
@@ -4329,7 +4330,7 @@ TextLayoutResult FontAtlas::MeasureRichLayout(
     std::vector<std::size_t> lineTokenIndices;
     lineTokenIndices.reserve(64u);
 
-    auto finishLine = [&](std::size_t endGlyphIdx, bool endedByNewline) {
+    auto finishLine = [&](std::size_t endGlyphIdx, bool endedByNewline, std::uint32_t nextLineFirstCp) {
         float lineAscent = result.ascent;
         float lineDescent = result.descent;
         float lineGap = result.lineGap;
@@ -4455,6 +4456,15 @@ TextLayoutResult FontAtlas::MeasureRichLayout(
         lm.lineHeight = effectiveLineH;
         lm.firstGlyphIndex = lineStartGlyphIdx;
         lm.glyphCount = endGlyphIdx - lineStartGlyphIdx;
+        if (endGlyphIdx > lineStartGlyphIdx) {
+            std::uint32_t minCp = result.glyphs[lineStartGlyphIdx].sourceCodePointIndex;
+            for (std::size_t k = lineStartGlyphIdx + 1u; k < endGlyphIdx; ++k) {
+                minCp = std::min(minCp, result.glyphs[k].sourceCodePointIndex);
+            }
+            lm.firstCodePointIndex = minCp;
+        } else {
+            lm.firstCodePointIndex = curLineFirstCp;
+        }
         lm.endedByNewline = endedByNewline;
         result.lines.push_back(lm);
         result.totalWidth = std::max(result.totalWidth, lm.width);
@@ -4463,6 +4473,7 @@ TextLayoutResult FontAtlas::MeasureRichLayout(
         curTopY += effectiveLineH;
         curPenX = 0.0f;
         lineStartGlyphIdx = endGlyphIdx;
+        curLineFirstCp = nextLineFirstCp;
         lastBreakDecodedIdx = static_cast<std::size_t>(-1);
         prevGlyphIdOnLine = 0xFFFFFFFFu;
         prevFontIdOnLine = 0u;
@@ -4471,7 +4482,7 @@ TextLayoutResult FontAtlas::MeasureRichLayout(
     for (std::size_t i = 0u; i < decoded.size(); ++i) {
         const TokenGlyph& tg = decoded[i];
         if (tg.explicitNewline) {
-            finishLine(result.glyphs.size(), true);
+            finishLine(result.glyphs.size(), true, tg.sourceCodePointIndex + 1u);
             continue;
         }
 
@@ -4504,7 +4515,6 @@ TextLayoutResult FontAtlas::MeasureRichLayout(
                 const std::size_t savedBreakDecodedIdx = lastBreakDecodedIdx;
                 result.glyphs.resize(lastBreakGlyphOutIdx);
                 lineTokenIndices.resize(lastBreakGlyphOutIdx);
-                finishLine(result.glyphs.size(), false);
                 // Skip leading spaces at the start of the wrapped line
                 std::size_t resumeIdx = savedBreakDecodedIdx;
                 while (resumeIdx < decoded.size() &&
@@ -4512,12 +4522,16 @@ TextLayoutResult FontAtlas::MeasureRichLayout(
                        (decoded[resumeIdx].cp == ' ' || decoded[resumeIdx].cp == '\t')) {
                     ++resumeIdx;
                 }
+                const std::uint32_t nextCp = (resumeIdx < decoded.size())
+                    ? decoded[resumeIdx].sourceCodePointIndex
+                    : rawCodePointIdx;
+                finishLine(result.glyphs.size(), false, nextCp);
                 i = resumeIdx - 1u;
                 continue;
             }
             if (wrapMode == TextWrapping::Wrap) {
                 // Emergency character-level break for unbroken words exceeding maxWidth
-                finishLine(result.glyphs.size(), false);
+                finishLine(result.glyphs.size(), false, tg.sourceCodePointIndex);
                 kernPx = 0.0f;
                 trackingPx = 0.0f;
             }
@@ -4572,7 +4586,7 @@ TextLayoutResult FontAtlas::MeasureRichLayout(
         }
     }
 
-    finishLine(result.glyphs.size(), true);
+    finishLine(result.glyphs.size(), true, rawCodePointIdx);
 
     if (!result.usedTrueTypeMetrics && result.lines.size() == 1u && validExplicitLineH <= 0.0f) {
         // Exact single-line height compatibility with MeasureUtf8TextRun (1.25f * fontSize)

@@ -605,13 +605,13 @@ void SeparableBoxBlurPremul3Pass(PremulOffscreenLayer& layer, int boxRadius) {
         const float dx = sampleX - brush.center.x;
         const float dy = sampleY - brush.center.y;
         if (std::fabs(dx) + std::fabs(dy) <= 1e-6f) {
-            const float nudgeU = (brush.mappingMode == BrushMappingMode::Absolute)
-                ? (brush.center.x + 1e-3f) / effW
-                : (brush.center.x + 1e-3f);
-            const float safeV = (brush.mappingMode == BrushMappingMode::Absolute)
-                ? (brush.center.y / effH)
-                : brush.center.y;
-            return EvaluateGradientBrushAtNormalizedUv(brush, nudgeU, safeV, quadWidthPx, quadHeightPx);
+            const float safeU = (brush.mappingMode == BrushMappingMode::Absolute)
+                ? (brush.center.x / effW)
+                : brush.center.x;
+            const float nudgeV = (brush.mappingMode == BrushMappingMode::Absolute)
+                ? ((brush.center.y - 1e-3f) / effH)
+                : (brush.center.y - 1e-3f);
+            return EvaluateGradientBrushAtNormalizedUv(brush, safeU, nudgeV, quadWidthPx, quadHeightPx);
         }
     }
     return EvaluateGradientBrushAtNormalizedUv(brush, normU, normV, quadWidthPx, quadHeightPx);
@@ -758,9 +758,12 @@ void ApplyOpacityMaskToPremulLayer(
             }
         } else if (desc.kind == GradientBrushKind::Conic) {
             constexpr float kTwoPi = 6.2831853071795864769f;
-            float angle = std::atan2(sampleY - desc.center.y, sampleX - desc.center.x);
+            constexpr float kHalfPi = 1.5707963267948966192f;
+            float angle = std::atan2(sampleY - desc.center.y, sampleX - desc.center.x) + kHalfPi;
             if (angle < 0.0f) {
                 angle += kTwoPi;
+            } else if (angle >= kTwoPi) {
+                angle -= kTwoPi;
             }
             t = angle / kTwoPi;
         } else {

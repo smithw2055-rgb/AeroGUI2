@@ -9,6 +9,7 @@
 namespace aero {
 
 class UIResourceStore;
+struct ImageAtlasEntry;
 
 class VisualRenderAdapter final {
 public:
@@ -104,6 +105,13 @@ private:
         float fillOpacity = 1.0f,
         float strokeOpacity = 1.0f);
 
+    [[nodiscard]] static bool RasterizeVisualBrushToEntry(
+        UIResourceStore* store,
+        const VisualWorld* optWorld,
+        const DrawingCommandBuffer* optDrawBuffer,
+        VisualNodeId sourceNodeId,
+        ImageAtlasEntry& outEntry);
+
     static std::size_t EmitBoxVisual(
         PagedRenderTree& tree,
         const VisualNode& node,
@@ -112,7 +120,9 @@ private:
         const Matrix2D& world2D,
         const Matrix4x4& world3D,
         bool has3D,
-        BlendingMode blend);
+        BlendingMode blend,
+        const VisualWorld* optWorld = nullptr,
+        const DrawingCommandBuffer* optDrawBuffer = nullptr);
 
     static std::size_t EmitTextVisual(
         PagedRenderTree& tree,
@@ -133,7 +143,9 @@ private:
         const Matrix2D& world2D,
         const Matrix4x4& world3D,
         bool has3D,
-        BlendingMode blend);
+        BlendingMode blend,
+        const VisualWorld* optWorld = nullptr,
+        const DrawingCommandBuffer* optDrawBuffer = nullptr);
 
     static std::size_t EmitVectorVisual(
         PagedRenderTree& tree,
@@ -143,7 +155,9 @@ private:
         const Matrix2D& world2D,
         const Matrix4x4& world3D,
         bool has3D,
-        BlendingMode blend);
+        BlendingMode blend,
+        const VisualWorld* optWorld = nullptr,
+        const DrawingCommandBuffer* optDrawBuffer = nullptr);
 
     static std::size_t EmitCanvasDrawVisual(
         PagedRenderTree& tree,

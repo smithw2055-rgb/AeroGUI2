@@ -1505,7 +1505,9 @@ bool RasterizeSvgPathStrokeAlphaMask(
     std::uint32_t innerHeight,
     float strokeWidthPx,
     std::uint32_t padPx,
-    std::vector<std::uint8_t>& outRgba8) {
+    std::vector<std::uint8_t>& outRgba8,
+    std::uint8_t startLineCap,
+    std::uint8_t endLineCap) {
     if (strokeWidthPx <= 0.0f) {
         return false;
     }
@@ -1519,7 +1521,7 @@ bool RasterizeSvgPathStrokeAlphaMask(
 
     const std::uint32_t innerW = std::clamp<std::uint32_t>(innerWidth, 1u, 2048u);
     const std::uint32_t innerH = std::clamp<std::uint32_t>(innerHeight, 1u, 2048u);
-    const std::uint32_t pad = std::clamp<std::uint32_t>(padPx, 1u, 64u);
+    const std::uint32_t pad = std::clamp<std::uint32_t>(padPx, 1u, 256u);
     const std::uint32_t texW = innerW + 2u * pad;
     const std::uint32_t texH = innerH + 2u * pad;
     const std::size_t totalPixels = static_cast<std::size_t>(texW) * static_cast<std::size_t>(texH);
@@ -1548,10 +1550,22 @@ bool RasterizeSvgPathStrokeAlphaMask(
     const float maxRadiusSq = maxRadius * maxRadius;
     std::vector<float> minDistSq(totalPixels, maxRadiusSq);
 
-    auto accumulateSegment = [&](Point a, Point b) noexcept {
+    auto accumulateSegment = [&](
+        Point a,
+        Point b,
+        bool flatStart,
+        bool flatEnd,
+        bool clampBehindStartPlane,
+        Point startPlanePt,
+        Point startPlaneDir,
+        bool clampBehindEndPlane,
+        Point endPlanePt,
+        Point endPlaneDir) noexcept {
         const float abx = b.x - a.x;
         const float aby = b.y - a.y;
         const float lenSq = abx * abx + aby * aby;
+        const float len = (lenSq > 1e-10f) ? std::sqrt(lenSq) : 0.0f;
+        const float invLen = (len > 1e-5f) ? (1.0f / len) : 0.0f;
         const int xMin = std::clamp(
             static_cast<int>(std::floor(std::min(a.x, b.x) - maxRadius)),
             1,
@@ -1575,12 +1589,40 @@ bool RasterizeSvgPathStrokeAlphaMask(
                 const float cx = static_cast<float>(px) + 0.5f;
                 const float apx = cx - a.x;
                 const float apy = cy - a.y;
-                const float t = (lenSq > 1e-10f)
-                    ? std::clamp((apx * abx + apy * aby) / lenSq, 0.0f, 1.0f)
-                    : 0.0f;
-                const float dx = cx - (a.x + t * abx);
-                const float dy = cy - (a.y + t * aby);
-                const float d2 = dx * dx + dy * dy;
+                float d2 = maxRadiusSq;
+                if (len > 1e-5f) {
+                    const float proj = (apx * abx + apy * aby) * invLen;
+                    if (proj < 0.0f && flatStart) {
+                        const float perp = std::fabs(apx * aby - apy * abx) * invLen;
+                        const float pseudo = std::max(0.0f, effHalfStroke + std::max(perp - effHalfStroke, -proj));
+                        d2 = pseudo * pseudo;
+                    } else if (proj > len && flatEnd) {
+                        const float perp = std::fabs(apx * aby - apy * abx) * invLen;
+                        const float pseudo = std::max(0.0f, effHalfStroke + std::max(perp - effHalfStroke, proj - len));
+                        d2 = pseudo * pseudo;
+                    } else {
+                        const float t = std::clamp(proj * invLen, 0.0f, 1.0f);
+                        const float dx = cx - (a.x + t * abx);
+                        const float dy = cy - (a.y + t * aby);
+                        d2 = dx * dx + dy * dy;
+                    }
+                } else {
+                    d2 = apx * apx + apy * apy;
+                }
+                if (clampBehindStartPlane) {
+                    const float sProj = (cx - startPlanePt.x) * startPlaneDir.x + (cy - startPlanePt.y) * startPlaneDir.y;
+                    if (sProj < 0.0f) {
+                        const float planeDist = effHalfStroke - sProj;
+                        d2 = std::max(d2, planeDist * planeDist);
+                    }
+                }
+                if (clampBehindEndPlane) {
+                    const float eProj = (cx - endPlanePt.x) * endPlaneDir.x + (cy - endPlanePt.y) * endPlaneDir.y;
+                    if (eProj < 0.0f) {
+                        const float planeDist = effHalfStroke - eProj;
+                        d2 = std::max(d2, planeDist * planeDist);
+                    }
+                }
                 float& dst = minDistSq[rowOff + static_cast<std::size_t>(px)];
                 if (d2 < dst) {
                     dst = d2;
@@ -1590,13 +1632,14 @@ bool RasterizeSvgPathStrokeAlphaMask(
     };
 
     std::vector<Point> pts;
+    std::vector<float> cumLen;
     bool hasAnySegment = false;
     for (const auto& contour : geom.contours) {
         if (contour.points.size() < 2u) {
             continue;
         }
         pts.clear();
-        pts.reserve(contour.points.size());
+        pts.reserve(contour.points.size() + 2u);
         for (const Point& rawPt : contour.points) {
             const float mx = (bw > 1e-5f)
                 ? ((rawPt.x - originX) * scaleX + fPad)
@@ -1604,17 +1647,83 @@ bool RasterizeSvgPathStrokeAlphaMask(
             const float my = (bh > 1e-5f)
                 ? ((rawPt.y - originY) * scaleY + fPad)
                 : (0.5f * fInnerH + fPad);
-            pts.push_back(Point{mx, my});
+            if (pts.empty() || std::hypot(mx - pts.back().x, my - pts.back().y) > 1e-4f) {
+                pts.push_back(Point{mx, my});
+            }
         }
+        if (pts.size() < 2u) {
+            continue;
+        }
+        bool isClosed = contour.closed;
+        if (!isClosed && std::hypot(pts.back().x - pts.front().x, pts.back().y - pts.front().y) <= 1e-3f) {
+            isClosed = true;
+        }
+        if (!isClosed) {
+            if (startLineCap == 1u) {
+                const float dx = pts[1].x - pts[0].x;
+                const float dy = pts[1].y - pts[0].y;
+                const float l = std::hypot(dx, dy);
+                if (l > 1e-5f) {
+                    pts.insert(pts.begin(), Point{
+                        pts[0].x - (dx / l) * effHalfStroke,
+                        pts[0].y - (dy / l) * effHalfStroke});
+                }
+            }
+            if (endLineCap == 1u) {
+                const std::size_t n = pts.size();
+                const float dx = pts[n - 1u].x - pts[n - 2u].x;
+                const float dy = pts[n - 1u].y - pts[n - 2u].y;
+                const float l = std::hypot(dx, dy);
+                if (l > 1e-5f) {
+                    pts.push_back(Point{
+                        pts[n - 1u].x + (dx / l) * effHalfStroke,
+                        pts[n - 1u].y + (dy / l) * effHalfStroke});
+                }
+            }
+        }
+        const bool flatS = !isClosed && (startLineCap == 0u || startLineCap == 1u);
+        const bool flatE = !isClosed && (endLineCap == 0u || endLineCap == 1u);
+        cumLen.assign(pts.size(), 0.0f);
         for (std::size_t i = 0u; i + 1u < pts.size(); ++i) {
-            accumulateSegment(pts[i], pts[i + 1u]);
+            cumLen[i + 1u] = cumLen[i] + std::hypot(pts[i + 1u].x - pts[i].x, pts[i + 1u].y - pts[i].y);
+        }
+        const float totalLen = cumLen.back();
+        auto normalizeDir = [](Point from, Point to) noexcept -> Point {
+            const float dx = to.x - from.x;
+            const float dy = to.y - from.y;
+            const float l = std::hypot(dx, dy);
+            return (l > 1e-5f) ? Point{dx / l, dy / l} : Point{1.0f, 0.0f};
+        };
+        const Point pStart = pts.front();
+        const Point tStart = normalizeDir(pts[0u], pts[1u]);
+        const Point pEnd = pts.back();
+        const Point tEnd = normalizeDir(pts.back(), pts[pts.size() - 2u]);
+        for (std::size_t i = 0u; i + 1u < pts.size(); ++i) {
+            const Point segDir = normalizeDir(pts[i], pts[i + 1u]);
+            const bool clampS = flatS && (i > 0u) &&
+                (cumLen[i] < effHalfStroke + 1.5f) &&
+                ((tStart.x * segDir.x + tStart.y * segDir.y) > 0.0f);
+            const bool clampE = flatE && (i + 2u < pts.size()) &&
+                ((totalLen - cumLen[i + 1u]) < effHalfStroke + 1.5f) &&
+                ((tEnd.x * (-segDir.x) + tEnd.y * (-segDir.y)) > 0.0f);
+            accumulateSegment(
+                pts[i],
+                pts[i + 1u],
+                flatS && (i == 0u),
+                flatE && (i + 2u == pts.size()),
+                clampS, pStart, tStart,
+                clampE, pEnd, tEnd);
             hasAnySegment = true;
         }
         if (contour.closed && pts.size() >= 2u) {
             const float cdx = pts.back().x - pts.front().x;
             const float cdy = pts.back().y - pts.front().y;
             if (std::fabs(cdx) > 1e-4f || std::fabs(cdy) > 1e-4f) {
-                accumulateSegment(pts.back(), pts.front());
+                accumulateSegment(
+                    pts.back(), pts.front(),
+                    false, false,
+                    false, Point{}, Point{},
+                    false, Point{}, Point{});
                 hasAnySegment = true;
             }
         }

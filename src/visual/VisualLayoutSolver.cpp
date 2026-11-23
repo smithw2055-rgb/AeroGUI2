@@ -277,23 +277,33 @@ void ComputeViewboxScale(
         }
         case VisualKind::Vector: {
             if (node.Vector().shapeKind == VectorShapeKind::SvgPath && !node.Vector().pathOrParams.empty()) {
-                const Rect bounds = MeasureSvgPathBounds(node.Vector().pathOrParams);
-                if (node.Vector().stretch == Stretch::None) {
+                const VisualVectorData& vec = node.Vector();
+                const Rect bounds = MeasureSvgPathBounds(vec.pathOrParams);
+                const bool hasVisStroke = ((vec.strokeRgba >> 24u) > 0u || vec.strokeGradId > 0) &&
+                                          vec.strokeWidth > 0.0f && vec.strokeOpacity > 0.001f;
+                const float strokeExt = hasVisStroke ? vec.strokeWidth : 0.0f;
+                const float halfStroke = 0.5f * strokeExt;
+                if (vec.stretch == Stretch::None) {
                     if (bounds.width > 0.0f || bounds.height > 0.0f) {
                         return Size{
-                            std::max(0.0f, bounds.x + bounds.width),
-                            std::max(0.0f, bounds.y + bounds.height)};
+                            std::max(0.0f, bounds.x + bounds.width + halfStroke),
+                            std::max(0.0f, bounds.y + bounds.height + halfStroke)};
                     }
                     return Size{0.0f, 0.0f};
                 }
                 if (bounds.width > 0.0f && bounds.height > 0.0f) {
+                    if (vec.stretch == Stretch::Fill) {
+                        return Size{
+                            std::isfinite(innerAvailW) ? std::max(0.0f, innerAvailW) : (bounds.width + strokeExt),
+                            std::isfinite(innerAvailH) ? std::max(0.0f, innerAvailH) : (bounds.height + strokeExt)};
+                    }
                     Size out{};
                     (void)ResolveStretchedExtent(
-                        bounds.width,
-                        bounds.height,
+                        bounds.width + strokeExt,
+                        bounds.height + strokeExt,
                         innerAvailW,
                         innerAvailH,
-                        node.Vector().stretch,
+                        vec.stretch,
                         StretchDirection::Both,
                         out);
                     return out;
@@ -1779,8 +1789,10 @@ void ArrangeNode(
             posX = finalSlot.x + mL;
             break;
         case HorizontalAlignment::Center:
-        case HorizontalAlignment::Stretch:
             posX = finalSlot.x + mL + (availBoxW - arrangedBoxW) * 0.5f;
+            break;
+        case HorizontalAlignment::Stretch:
+            posX = finalSlot.x + mL + ((arrangedBoxW > availBoxW) ? 0.0f : (availBoxW - arrangedBoxW) * 0.5f);
             break;
         case HorizontalAlignment::Right:
             posX = finalSlot.x + mL + (availBoxW - arrangedBoxW);
@@ -1793,8 +1805,10 @@ void ArrangeNode(
             posY = finalSlot.y + mT;
             break;
         case VerticalAlignment::Center:
-        case VerticalAlignment::Stretch:
             posY = finalSlot.y + mT + (availBoxH - arrangedBoxH) * 0.5f;
+            break;
+        case VerticalAlignment::Stretch:
+            posY = finalSlot.y + mT + ((arrangedBoxH > availBoxH) ? 0.0f : (availBoxH - arrangedBoxH) * 0.5f);
             break;
         case VerticalAlignment::Bottom:
             posY = finalSlot.y + mT + (availBoxH - arrangedBoxH);
@@ -1829,23 +1843,49 @@ void ArrangeNode(
 
     const bool explicitW = std::isfinite(node->layout.width) || std::isfinite(node->layout.maxWidth);
     const bool explicitH = std::isfinite(node->layout.height) || std::isfinite(node->layout.maxHeight);
+    const bool constrainedW = explicitW ||
+        (std::isfinite(finalSlot.width) && node->layout.hAlign == HorizontalAlignment::Stretch);
+    const bool constrainedH = explicitH ||
+        (std::isfinite(finalSlot.height) && node->layout.vAlign == VerticalAlignment::Stretch);
     const bool isViewbox = (node->layout.layoutMode == LayoutMode::Viewbox);
     const bool viewboxUniformToFill = isViewbox &&
         (static_cast<Stretch>(std::clamp(node->layout.layoutInt0, 0, 3)) == Stretch::UniformToFill);
     bool childOverflows = false;
-    if ((explicitW || explicitH) && node->layout.layoutMode != LayoutMode::Canvas && (!isViewbox || viewboxUniformToFill)) {
-        if ((explicitW && targetW + 0.5f < node->layout.unclampedContentBox.width) ||
-            (explicitH && targetH + 0.5f < node->layout.unclampedContentBox.height)) {
+    if ((constrainedW || constrainedH) && node->layout.layoutMode != LayoutMode::Canvas && (!isViewbox || viewboxUniformToFill)) {
+        bool allVisibleNonNegMarginH = true;
+        bool allVisibleNonNegMarginV = true;
+        for (VisualNodeId cid : node->children) {
+            const VisualNode* ch = world.GetNode(cid);
+            if (!ch || ch->layout.visibility == Visibility::Collapsed) {
+                continue;
+            }
+            if ((std::isfinite(ch->layout.margin.left) && ch->layout.margin.left < 0.0f) ||
+                (std::isfinite(ch->layout.margin.right) && ch->layout.margin.right < 0.0f)) {
+                allVisibleNonNegMarginH = false;
+            }
+            if ((std::isfinite(ch->layout.margin.top) && ch->layout.margin.top < 0.0f) ||
+                (std::isfinite(ch->layout.margin.bottom) && ch->layout.margin.bottom < 0.0f)) {
+                allVisibleNonNegMarginV = false;
+            }
+        }
+        if ((constrainedW && (explicitW || allVisibleNonNegMarginH) && targetW + 0.5f < node->layout.unclampedContentBox.width) ||
+            (constrainedH && (explicitH || allVisibleNonNegMarginV) && targetH + 0.5f < node->layout.unclampedContentBox.height)) {
             childOverflows = true;
-        } else if (!isViewbox && !node->children.empty()) {
+        } else if ((constrainedW || constrainedH) && !isViewbox && !node->children.empty()) {
             for (VisualNodeId cid : node->children) {
                 const VisualNode* ch = world.GetNode(cid);
                 if (!ch || ch->layout.visibility == Visibility::Collapsed) {
                     continue;
                 }
                 const Rect& cr = ch->layout.layoutRect;
-                if ((explicitW && cr.width > targetW + 0.5f) ||
-                    (explicitH && cr.height > targetH + 0.5f)) {
+                const bool nonNegMarginH =
+                    (!std::isfinite(ch->layout.margin.left) || ch->layout.margin.left >= 0.0f) &&
+                    (!std::isfinite(ch->layout.margin.right) || ch->layout.margin.right >= 0.0f);
+                const bool nonNegMarginV =
+                    (!std::isfinite(ch->layout.margin.top) || ch->layout.margin.top >= 0.0f) &&
+                    (!std::isfinite(ch->layout.margin.bottom) || ch->layout.margin.bottom >= 0.0f);
+                if (((explicitW || (constrainedW && nonNegMarginH)) && cr.width > targetW + 0.5f) ||
+                    ((explicitH || (constrainedH && nonNegMarginV)) && cr.height > targetH + 0.5f)) {
                     childOverflows = true;
                     break;
                 }

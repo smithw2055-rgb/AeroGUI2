@@ -12,6 +12,8 @@ internal class XamlXmlAttr {
     public string Value = "";
     internal bool CachedInit = false;
     internal string CachedPropName = "";
+    internal string CachedLocalKey = "";
+    internal bool IsToolTipProp = false;
     internal int CachedExtMode = 0;
     internal string CachedKey = "";
     internal XamlParsedBinding CachedBinding;
@@ -1125,7 +1127,11 @@ public static class XamlReader {
         }
         if (p == "Width" || p == "Height" || p == "MinWidth" || p == "MinHeight" ||
             p == "MaxWidth" || p == "MaxHeight") {
-            string low = val.Trim().ToLower();
+            string trimmed = val.Trim();
+            string low = trimmed.ToLower();
+            if ((p == "Width" || p == "Height") && trimmed.Contains("*")) {
+                return GridLength.Parse(trimmed);
+            }
             if (low == "auto" || low == "nan") { return DependencyObject.BoxFloat(ParseUtil.NaN()); }
             return DependencyObject.BoxFloat(ParseUtil.ParseFloat(val, ParseUtil.NaN()));
         }
@@ -1149,6 +1155,14 @@ public static class XamlReader {
         if (!a.CachedInit) {
             a.CachedInit = true;
             a.CachedPropName = XamlStr.StripOuterParens(a.Name);
+            string normKey = NormalizeSetterProp(a.CachedPropName);
+            if (normKey != "Style" && normKey != "Name" &&
+                !XamlStr.StartsWith(normKey, "Grid.") &&
+                !XamlStr.StartsWith(normKey, "Canvas.") &&
+                !XamlStr.StartsWith(normKey, "DockPanel.")) {
+                a.CachedLocalKey = normKey;
+            }
+            a.IsToolTipProp = (normKey == "ToolTip" || normKey == "ToolTipService.ToolTip");
             if (!XamlStr.LooksLikeMarkupExtension(a.Value)) {
                 a.CachedExtMode = 0;
             } else {
@@ -1179,7 +1193,14 @@ public static class XamlReader {
         if (XamlStr.StartsWith(a.CachedPropName, "DragDrop.") || a.CachedPropName.Contains(":DragDrop.")) {
             DragDrop.EnsureInstalled();
         }
+        if (a.CachedLocalKey.Length > 0) {
+            el.MarkLocalProperty(a.CachedLocalKey);
+        }
+        if (a.IsToolTipProp) {
+            ToolTipService.EnsureInstalled();
+        }
         if (a.CachedExtMode == 0) {
+            el.ClearResourceReference(a.CachedPropName);
             ApplyLiteralProperty(el, a.CachedPropName, a.Value, ctx);
             return;
         }
@@ -1188,10 +1209,12 @@ public static class XamlReader {
             return;
         }
         if (a.CachedExtMode == 2) {
+            el.ClearResourceReference(a.CachedPropName);
             BindElementFromSpec(el, a.CachedPropName, a.CachedBinding, ctx);
             return;
         }
         if (a.CachedExtMode == 3) {
+            el.ClearResourceReference(a.CachedPropName);
             DependencyObject resBox = ctx != null
                 ? ctx.FindResourceBox(a.CachedKey, el)
                 : el.FindResourceBox(a.CachedKey);
@@ -1207,6 +1230,7 @@ public static class XamlReader {
         UIElement el, string rawPropName, string rawVal, XamlBuildContext ctx) {
         if (el == null || rawPropName == null || rawPropName.Length == 0) { return; }
         string propName = XamlStr.StripOuterParens(rawPropName);
+        el.MarkLocalProperty(NormalizeSetterProp(propName));
         if (XamlStr.StartsWith(propName, "DragDrop.") || propName.Contains(":DragDrop.")) {
             DragDrop.EnsureInstalled();
         }
@@ -1218,6 +1242,7 @@ public static class XamlReader {
                 el.SetResourceReference(propName, NormalizeResourceKey(body));
                 return;
             }
+            el.ClearResourceReference(propName);
             if (kind == "Binding" || kind == "TemplateBinding") {
                 XamlParsedBinding pb = ParseBindingSpec(rawVal, ctx);
                 BindElementFromSpec(el, propName, pb, ctx);
@@ -1235,6 +1260,7 @@ public static class XamlReader {
             return;
         }
 
+        el.ClearResourceReference(propName);
         ApplyLiteralProperty(el, propName, rawVal, ctx);
     }
 
@@ -1556,7 +1582,7 @@ public static class XamlReader {
         if (tag == "LinearGradientBrush") { return BuildLinearGradientBrushNode(node, ctx); }
         if (tag == "RadialGradientBrush") { return BuildRadialGradientBrushNode(node, ctx); }
         if (tag == "ImageBrush") { return BuildImageBrushNode(node, ctx); }
-        if (tag == "VisualBrush") { return Brushes.Transparent(); }
+        if (tag == "VisualBrush") { return BuildVisualBrushNode(node, ctx, contextHost); }
         if (tag == "BitmapImage") {
             string uriSrc = node.GetAttr("UriSource");
             if (uriSrc == null) { uriSrc = node.Text.Trim(); }
@@ -1788,10 +1814,15 @@ public static class XamlReader {
         bool isTb = el is TextBlock;
         bool hasRealInlineTag = false;
         bool pendingInlineWs = false;
+        var deferredTriggerNodes = new XamlXmlNode[0];
 
         for (int i = 0; i < node.Children.Length; i += 1) {
             XamlXmlNode ch = node.Children[i];
             if (XamlStr.EndsWith(ch.LocalName, ".Resources")) { continue; }
+            if (XamlStr.EndsWith(ch.LocalName, ".Triggers") && !ch.RawName.Contains("Interaction.")) {
+                deferredTriggerNodes.Push(ch);
+                continue;
+            }
             if (isTb && ch.LocalName == "#ws") {
                 if (textBlockInlines.Length > 0) { pendingInlineWs = true; }
                 continue;
@@ -1857,6 +1888,15 @@ public static class XamlReader {
             }
         }
 
+        for (int ti = 0; ti < deferredTriggerNodes.Length; ti += 1) {
+            XamlXmlNode trigProp = deferredTriggerNodes[ti];
+            for (int k = 0; k < trigProp.Children.Length; k += 1) {
+                TriggerBase etrig = BuildTriggerNode(trigProp.Children[k], ctx);
+                if (etrig != null) {
+                    etrig.Attach(el);
+                }
+            }
+        }
         for (int i = 0; i < node.Children.Length; i += 1) {
             if (XamlStr.EndsWith(node.Children[i].LocalName, ".Resources")) {
                 ctx.PopScope(el.Resources);
@@ -2229,6 +2269,7 @@ public static class XamlReader {
             return;
         }
         if (propName == "ToolTip" && propNode.Children.Length > 0) {
+            ToolTipService.EnsureInstalled();
             DependencyObject tt = BuildObjectNode(propNode.Children[0], ctx, el);
             el.ToolTipBox = tt;
             return;
@@ -2256,6 +2297,8 @@ public static class XamlReader {
             }
             return;
         }
+        el.MarkLocalProperty(NormalizeSetterProp(effectiveProp));
+        el.ClearResourceReference(effectiveProp);
         if (propNode.Children.Length == 1) {
             XamlXmlNode childXml = propNode.Children[0];
             if (childXml.LocalName == "MultiBinding") {
@@ -2305,6 +2348,12 @@ public static class XamlReader {
                     if (XamlStr.EndsWith(shProp.LocalName, ".Shader") && shProp.Children.Length > 0 &&
                         shProp.Children[0].LocalName == "PlasmaBrush") {
                         XamlXmlNode sh = shProp.Children[0];
+                        string shName = sh.GetAttr("x:Name");
+                        if (shName == null || shName.Length == 0) { shName = sh.GetAttr("Name"); }
+                        if (shName != null && shName.Length > 0 && el._internalRootName.Length == 0) {
+                            el._internalRootName = shName.Trim();
+                            if (el.Name.Length == 0) { el.Name = shName.Trim(); }
+                        }
                         BindPlasmaAttrIfExt(el, propName + ".PlasmaSeed", sh.GetAttr("Seed"), ctx);
                         BindPlasmaAttrIfExt(el, propName + ".PlasmaColor", sh.GetAttr("Color"), ctx);
                         BindPlasmaAttrIfExt(el, propName + ".PlasmaTime", sh.GetAttr("Time"), ctx);
@@ -2538,78 +2587,160 @@ public static class XamlReader {
         return rgb;
     }
 
+    private static VisualBrush BuildVisualBrushNode(XamlXmlNode node, XamlBuildContext ctx, UIElement contextHost) {
+        var vb = new VisualBrush();
+        string st = node.GetAttr("Stretch");
+        if (st != null) {
+            string sl = st.Trim();
+            if (sl == "None") { vb.Stretch = Stretch.None; }
+            else if (sl == "Fill") { vb.Stretch = Stretch.Fill; }
+            else if (sl == "UniformToFill") { vb.Stretch = Stretch.UniformToFill; }
+            else { vb.Stretch = Stretch.Uniform; }
+        }
+        string tm = node.GetAttr("TileMode");
+        if (tm != null && tm.Trim().Length > 0) { vb.TileMode = tm.Trim(); }
+        string vbx = node.GetAttr("Viewbox");
+        if (vbx != null) { vb.Viewbox = vbx; }
+        string vp = node.GetAttr("Viewport");
+        if (vp != null) { vb.Viewport = vp; }
+        string vpu = node.GetAttr("ViewportUnits");
+        if (vpu != null) { vb.ViewportUnits = vpu; }
+        string ax = node.GetAttr("AlignmentX");
+        if (ax != null) { vb.AlignmentX = ax; }
+        string ay = node.GetAttr("AlignmentY");
+        if (ay != null) { vb.AlignmentY = ay; }
+        string op = node.GetAttr("Opacity");
+        if (op != null) { vb.Opacity = ParseUtil.ParseFloat(op, 1.0f); }
+        string visAttr = node.GetAttr("Visual");
+        if (visAttr != null && XamlStr.LooksLikeMarkupExtension(visAttr)) {
+            string vKind = XamlStr.ExtractExtType(visAttr);
+            if (vKind == "Binding") {
+                XamlParsedBinding pb = ParseBindingSpec(visAttr, ctx);
+                if (pb.ElementName.Length > 0) {
+                    vb.VisualElementName = pb.ElementName;
+                    if (contextHost != null) { vb.ResolveVisual(contextHost); }
+                }
+            } else {
+                DependencyObject resolved = ResolveMarkupValue(visAttr, ctx, contextHost);
+                if (resolved is UIElement) { vb.Visual = resolved as UIElement; }
+            }
+        }
+        for (int i = 0; i < node.Children.Length; i += 1) {
+            XamlXmlNode ch = node.Children[i];
+            if (XamlStr.EndsWith(ch.LocalName, ".Visual") && ch.Children.Length > 0) {
+                UIElement childVis = BuildObjectNode(ch.Children[0], ctx, contextHost) as UIElement;
+                if (childVis != null) { vb.Visual = childVis; }
+            }
+        }
+        return vb;
+    }
+
     private static Brush BuildImageBrushNode(XamlXmlNode node, XamlBuildContext ctx) {
         string src = node.GetAttr("ImageSource");
         if (src == null) { src = ""; }
-        if (src.Length == 0) {
-            for (int i = 0; i < node.Children.Length; i += 1) {
-                XamlXmlNode ch = node.Children[i];
-                if (XamlStr.EndsWith(ch.LocalName, ".Shader") && ch.Children.Length > 0) {
-                    string shaderKind = ch.Children[0].LocalName;
-                    if (shaderKind == "PlasmaBrush") {
-                        XamlXmlNode sh = ch.Children[0];
-                        float sx = ParseUtil.ParseFloat(sh.GetAttr("ScaleX"), 64.0f);
-                        float sy = ParseUtil.ParseFloat(sh.GetAttr("ScaleY"), 64.0f);
-                        float tm = ParseUtil.ParseFloat(sh.GetAttr("Time"), 0.0f);
-                        string seedAttr = sh.GetAttr("Seed");
-                        float seed = (seedAttr != null && !XamlStr.LooksLikeMarkupExtension(seedAttr))
-                            ? ParseUtil.ParseFloat(seedAttr, 100.0f) : 100.0f;
-                        string colAttr = sh.GetAttr("Color");
-                        string col = "#FF01BCFF";
-                        if (colAttr != null && colAttr.Length > 0 && !XamlStr.LooksLikeMarkupExtension(colAttr)) {
-                            col = ParseUtil.FormatArgbHex(ParseUtil.ParseColor(colAttr));
-                        }
-                        float vw = 300.0f;
-                        float vh = 90.0f;
-                        string vpAttr = node.GetAttr("Viewport");
-                        if (vpAttr != null && vpAttr.Trim().Length > 0) {
-                            string[] parts = vpAttr.Trim().Replace(",", " ").Split(" ");
-                            var nums = new float[0];
-                            for (int p = 0; p < parts.Length; p += 1) {
-                                string pt = parts[p].Trim();
-                                if (pt.Length > 0) { nums.Push(ParseUtil.ParseFloat(pt, 0.0f)); }
-                            }
-                            if (nums.Length >= 4) {
-                                vw = nums[2];
-                                vh = nums[3];
-                            }
-                        }
-                        var pib = new ImageBrush("shader://plasma");
-                        string pst = node.GetAttr("Stretch");
-                        if (pst != null) {
-                            string sl = pst.Trim();
-                            if (sl == "None") { pib.Stretch = Stretch.None; }
-                            else if (sl == "Fill") { pib.Stretch = Stretch.Fill; }
-                            else if (sl == "UniformToFill") { pib.Stretch = Stretch.UniformToFill; }
-                            else { pib.Stretch = Stretch.Uniform; }
-                        }
-                        string ptm = node.GetAttr("TileMode");
-                        if (ptm != null && ptm.Trim().Length > 0) { pib.TileMode = ptm.Trim(); }
-                        string pvb = node.GetAttr("Viewbox");
-                        if (pvb != null) { pib.Viewbox = pvb; }
-                        string pop = node.GetAttr("Opacity");
-                        if (pop != null) { pib.Opacity = ParseUtil.ParseFloat(pop, 1.0f); }
-                        pib.EnablePlasmaShader(sx, sy, tm, seed, col, vw, vh);
-                        return pib;
-                    }
-                    if (shaderKind == "ConicGradientBrush") {
-                        var lg = new LinearGradientBrush(0.0f, 0.5f, 1.0f, 0.5f);
-                        lg.AddStop("#FFEF4444", 0.0f);
-                        lg.AddStop("#FFF59E0B", 0.33f);
-                        lg.AddStop("#FF10B981", 0.66f);
-                        lg.AddStop("#FF3B82F6", 1.0f);
-                        return lg;
-                    }
-                    var sat = new LinearGradientBrush(0.0f, 0.0f, 1.0f, 0.0f);
-                    sat.AddStop("#FF334155", 0.0f);
-                    sat.AddStop("#FF38BDF8", 1.0f);
-                    return sat;
-                }
-            }
-        }
         string resolvedSrc = (src.Length > 0 && !XamlStr.LooksLikeMarkupExtension(src) && ctx != null && ctx.BaseUri.Length > 0)
             ? XamlStr.ResolveUri(ctx.BaseUri, src)
             : src;
+        for (int i = 0; i < node.Children.Length; i += 1) {
+            XamlXmlNode ch = node.Children[i];
+            if (XamlStr.EndsWith(ch.LocalName, ".Shader") && ch.Children.Length > 0) {
+                XamlXmlNode sh = ch.Children[0];
+                string shaderKind = sh.LocalName;
+                if (shaderKind == "PlasmaBrush") {
+                    float sx = ParseUtil.ParseFloat(sh.GetAttr("ScaleX"), 64.0f);
+                    float sy = ParseUtil.ParseFloat(sh.GetAttr("ScaleY"), 64.0f);
+                    float tm = ParseUtil.ParseFloat(sh.GetAttr("Time"), 0.0f);
+                    string seedAttr = sh.GetAttr("Seed");
+                    float seed = (seedAttr != null && !XamlStr.LooksLikeMarkupExtension(seedAttr))
+                        ? ParseUtil.ParseFloat(seedAttr, 100.0f) : 100.0f;
+                    string colAttr = sh.GetAttr("Color");
+                    string col = "#FF01BCFF";
+                    if (colAttr != null && colAttr.Length > 0 && !XamlStr.LooksLikeMarkupExtension(colAttr)) {
+                        col = ParseUtil.FormatArgbHex(ParseUtil.ParseColor(colAttr));
+                    }
+                    float vw = 240.0f;
+                    float vh = 160.0f;
+                    string vpAttr = node.GetAttr("Viewport");
+                    if (vpAttr != null && vpAttr.Trim().Length > 0) {
+                        string[] parts = vpAttr.Trim().Replace(",", " ").Split(" ");
+                        var nums = new float[0];
+                        for (int p = 0; p < parts.Length; p += 1) {
+                            string pt = parts[p].Trim();
+                            if (pt.Length > 0) { nums.Push(ParseUtil.ParseFloat(pt, 0.0f)); }
+                        }
+                        if (nums.Length >= 4) {
+                            vw = nums[2];
+                            vh = nums[3];
+                        }
+                    }
+                    var pib = new ImageBrush("shader://plasma");
+                    string pst = node.GetAttr("Stretch");
+                    if (pst != null) {
+                        string sl = pst.Trim();
+                        if (sl == "None") { pib.Stretch = Stretch.None; }
+                        else if (sl == "Fill") { pib.Stretch = Stretch.Fill; }
+                        else if (sl == "UniformToFill") { pib.Stretch = Stretch.UniformToFill; }
+                        else { pib.Stretch = Stretch.Uniform; }
+                    }
+                    string ptm = node.GetAttr("TileMode");
+                    if (ptm != null && ptm.Trim().Length > 0) { pib.TileMode = ptm.Trim(); }
+                    string pvb = node.GetAttr("Viewbox");
+                    if (pvb != null) { pib.Viewbox = pvb; }
+                    if (vpAttr != null) { pib.Viewport = vpAttr; }
+                    string pvpu = node.GetAttr("ViewportUnits");
+                    if (pvpu != null) { pib.ViewportUnits = pvpu; }
+                    string pop = node.GetAttr("Opacity");
+                    if (pop != null) { pib.Opacity = ParseUtil.ParseFloat(pop, 1.0f); }
+                    pib.EnablePlasmaShader(sx, sy, tm, seed, col, vw, vh);
+                    return pib;
+                }
+                if (shaderKind == "ConicGradientBrush") {
+                    var cg = new ConicGradientBrush();
+                    ApplyCommonGradientAttrs(cg, node);
+                    ParseGradientStopsInto(cg, sh, ctx);
+                    if (cg.StopCount() == 0) {
+                        cg.AddStop("#FFFF0000", 0.0f);
+                        cg.AddStop("#FFFFFF00", 0.25f);
+                        cg.AddStop("#FFADFF2F", 0.5f);
+                        cg.AddStop("#FF1E90FF", 0.75f);
+                        cg.AddStop("#FF800080", 1.0f);
+                    }
+                    return cg;
+                }
+                if (shaderKind == "SaturationBrush") {
+                    if (resolvedSrc.Length == 0) {
+                        var fb = new LinearGradientBrush(0.0f, 0.0f, 1.0f, 1.0f);
+                        fb.AddStop("#FF64748B", 0.0f);
+                        fb.AddStop("#FF94A3B8", 0.5f);
+                        fb.AddStop("#FFCBD5E1", 1.0f);
+                        string sopFb = node.GetAttr("Opacity");
+                        if (sopFb != null) { fb.Opacity = ParseUtil.ParseFloat(sopFb, 1.0f); }
+                        return fb;
+                    }
+                    float satFactor = ParseUtil.ParseFloat(sh.GetAttr("Saturation"), 1.0f);
+                    var sib = new ImageBrush("shader://saturation?sat=" + satFactor + "&src=" + resolvedSrc);
+                    string sst = node.GetAttr("Stretch");
+                    if (sst != null) {
+                        string sl = sst.Trim();
+                        if (sl == "None") { sib.Stretch = Stretch.None; }
+                        else if (sl == "Fill") { sib.Stretch = Stretch.Fill; }
+                        else if (sl == "UniformToFill") { sib.Stretch = Stretch.UniformToFill; }
+                        else { sib.Stretch = Stretch.Uniform; }
+                    }
+                    string stm = node.GetAttr("TileMode");
+                    if (stm != null && stm.Trim().Length > 0) { sib.TileMode = stm.Trim(); }
+                    string svb = node.GetAttr("Viewbox");
+                    if (svb != null) { sib.Viewbox = svb; }
+                    string svp = node.GetAttr("Viewport");
+                    if (svp != null) { sib.Viewport = svp; }
+                    string svpu = node.GetAttr("ViewportUnits");
+                    if (svpu != null) { sib.ViewportUnits = svpu; }
+                    string sop = node.GetAttr("Opacity");
+                    if (sop != null) { sib.Opacity = ParseUtil.ParseFloat(sop, 1.0f); }
+                    return sib;
+                }
+            }
+        }
         var ib = new ImageBrush(resolvedSrc);
         string st = node.GetAttr("Stretch");
         if (st != null) {
@@ -2623,6 +2754,10 @@ public static class XamlReader {
         if (tmMode != null && tmMode.Trim().Length > 0) { ib.TileMode = tmMode.Trim(); }
         string vb = node.GetAttr("Viewbox");
         if (vb != null) { ib.Viewbox = vb; }
+        string vp2 = node.GetAttr("Viewport");
+        if (vp2 != null) { ib.Viewport = vp2; }
+        string vpu2 = node.GetAttr("ViewportUnits");
+        if (vpu2 != null) { ib.ViewportUnits = vpu2; }
         string op = node.GetAttr("Opacity");
         if (op != null) { ib.Opacity = ParseUtil.ParseFloat(op, 1.0f); }
         return ib;
@@ -2861,6 +2996,7 @@ public static class XamlReader {
         string prop = NormalizeSetterProp(node.GetAttr("Property"));
         if (prop.Length == 0) { return null; }
         if (XamlStr.StartsWith(prop, "DragDrop.")) { DragDrop.EnsureInstalled(); }
+        if (prop == "ToolTip" || prop == "ToolTipService.ToolTip") { ToolTipService.EnsureInstalled(); }
         string targetName = node.GetAttr("TargetName");
         if (targetName == null) { targetName = ""; }
 
@@ -3438,6 +3574,10 @@ public static class XamlReader {
         if (tn != null) { sb.TargetName = tn; }
         string sr = node.GetAttr("SpeedRatio");
         if (sr != null) { sb.SpeedRatio = ParseUtil.ParseFloat(sr, 1.0f); }
+        string sbBt = node.GetAttr("BeginTime");
+        if (sbBt != null) { sb.BeginTimeSec = XamlStr.ParseDurationSec(sbBt, 0.0f); }
+        string sbDur = node.GetAttr("Duration");
+        if (sbDur != null) { sb.ExplicitDurationSec = XamlStr.ParseDurationSec(sbDur, 0.0f); }
         string rb = node.GetAttr("RepeatBehavior");
         if (rb != null && rb.Trim().ToLower() == "forever") { sb.RepeatForever = true; }
 
@@ -3532,8 +3672,29 @@ public static class XamlReader {
                             kfMask = ParseEasingParamMask(kf.Children[e].Children[0]);
                         }
                     }
-                    if (kf.LocalName == "SplineDoubleKeyFrame") { ek = EasingFunctionKind.Spline; }
+                    if (kf.LocalName == "SplineDoubleKeyFrame") {
+                        ek = EasingFunctionKind.Spline;
+                        string ksAttr = kf.GetAttr("KeySpline");
+                        if (ksAttr != null && ksAttr.Trim().Length > 0) {
+                            string[] ksParts = ksAttr.Trim().Replace(",", " ").Split(" ");
+                            var ksNums = new float[0];
+                            for (int sp = 0; sp < ksParts.Length; sp += 1) {
+                                string spt = ksParts[sp].Trim();
+                                if (spt.Length > 0) { ksNums.Push(ParseUtil.ParseFloat(spt, 0.0f)); }
+                            }
+                            if (ksNums.Length >= 4) {
+                                float qx1 = (float)((int)(Math.Clampf(ksNums[0], 0.0f, 1.0f) * 4000.0f + 0.5f));
+                                float qy1 = (float)((int)(Math.Clampf(ksNums[1], 0.0f, 1.0f) * 4000.0f + 0.5f));
+                                float qx2 = (float)((int)(Math.Clampf(ksNums[2], 0.0f, 1.0f) * 4000.0f + 0.5f));
+                                float qy2 = (float)((int)(Math.Clampf(ksNums[3], 0.0f, 1.0f) * 4000.0f + 0.5f));
+                                kfP0 = qx1 * 4096.0f + qy1;
+                                kfP1 = qx2 * 4096.0f + qy2;
+                                kfMask = 16;
+                            }
+                        }
+                    }
                     var edkf = new EasingDoubleKeyFrame(kv, kt, ek, em);
+                    edkf.IsDiscrete = (kf.LocalName == "DiscreteDoubleKeyFrame");
                     edkf.EaseParam0 = kfP0;
                     edkf.EaseParam1 = kfP1;
                     edkf.EaseParamMask = kfMask;

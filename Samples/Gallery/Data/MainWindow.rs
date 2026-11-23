@@ -284,6 +284,7 @@ public partial class MainWindow : Window
     private string _activeAccent = "#FF1098DF";
     private ResourceDictionary _sampleThemeResources = null;
     private string _appliedThemeKey = "";
+    private int _sidebarMode = 1;
 
     public MainWindow()
     {
@@ -299,6 +300,7 @@ public partial class MainWindow : Window
 
     private void DockSidebarWide()
     {
+        this._sidebarMode = 1;
         if (this.SelectorExpanderButton != null)
         {
             this.SelectorExpanderButton.Visibility = Visibility.Collapsed;
@@ -317,6 +319,46 @@ public partial class MainWindow : Window
             this.SampleOverlay.Visibility = Visibility.Collapsed;
         }
         this.BeginStoryboard("ExpandSelectorInstant");
+    }
+
+    private void CollapseSidebarFloating()
+    {
+        this._sidebarMode = 2;
+        if (this.SampleOffset != null)
+        {
+            this.SampleOffset.Width = 0.0f;
+        }
+        if (this.SelectorExpanderButton != null)
+        {
+            this.SelectorExpanderButton.IsChecked = false;
+            this.SelectorExpanderButton.Visibility = Visibility.Visible;
+        }
+        if (this.SelectorExpanderButtonShadow != null)
+        {
+            this.SelectorExpanderButtonShadow.Visibility = Visibility.Visible;
+        }
+        if (this.SampleOverlay != null)
+        {
+            this.SampleOverlay.Visibility = Visibility.Collapsed;
+        }
+        this.BeginStoryboard("CollapseSelectorInstant");
+    }
+
+    public override void OnHostViewportResized(float width, float height)
+    {
+        if (width <= 1.0f || height <= 1.0f)
+        {
+            return;
+        }
+        bool wantFloating = (width < 880.0f) || (width < height);
+        if (wantFloating && this._sidebarMode != 2)
+        {
+            this.CollapseSidebarFloating();
+        }
+        else if (!wantFloating && this._sidebarMode != 1)
+        {
+            this.DockSidebarWide();
+        }
     }
 
     public void OnInitialized()
@@ -436,6 +478,10 @@ public partial class MainWindow : Window
             preview.EnsureLoadedSubtree();
         }
 
+        if (this._sidebarMode == 2 && this.SelectorExpanderButton != null && this.SelectorExpanderButton.IsChecked)
+        {
+            this.SelectorExpanderButton.IsChecked = false;
+        }
         this.ActiveContainerIndex = useFirst ? 1 : 2;
         this.LoadedSampleUri = xamlUri;
         this.BeginStoryboard(useFirst ? "ShowContainer1" : "ShowContainer2");

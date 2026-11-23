@@ -135,9 +135,12 @@ vec4 sampleAtlasGradientBrush(uint brushId, vec2 normUv, vec2 quadSize) {
         float dx = samplePt.x - p0x;
         float dy = samplePt.y - p0y;
         if (abs(dx) + abs(dy) > 1e-6) {
-            float angle = atan(dy, dx);
+            // Align 0 deg with top (12 o'clock, negative Y) clockwise to match CPU conic brush sampling.
+            float angle = atan(dy, dx) + 1.5707963267948966;
             if (angle < 0.0) {
                 angle += 6.283185307179586;
+            } else if (angle >= 6.283185307179586) {
+                angle -= 6.283185307179586;
             }
             rawT = angle / 6.283185307179586;
         }
@@ -528,9 +531,12 @@ fn sampleAtlasGradientBrush(brushId : u32, normUv : vec2<f32>, quadSize : vec2<f
         let dx = samplePt.x - p0x;
         let dy = samplePt.y - p0y;
         if (abs(dx) + abs(dy) > 1e-6) {
-            var angle = atan2(dy, dx);
+            // Align 0 deg with top (12 o'clock, negative Y) clockwise to match CPU conic brush sampling.
+            var angle = atan2(dy, dx) + 1.5707963;
             if (angle < 0.0) {
                 angle = angle + 6.2831853;
+            } else if (angle >= 6.2831853) {
+                angle = angle - 6.2831853;
             }
             rawT = angle / 6.2831853;
         }

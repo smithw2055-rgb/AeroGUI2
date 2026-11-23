@@ -137,6 +137,21 @@ public static class PopupService {
         if (idx >= 0) { _openPopups.RemoveAt(idx); }
     }
 
+    private static bool IsWithinPopupLogicalChain(Popup p, UIElement target) {
+        if (p == null || target == null) { return false; }
+        if (p.IsAncestorOf(target)) { return true; }
+        if (p.PlacementTarget != null && p.PlacementTarget.IsAncestorOf(target)) { return true; }
+        UIElement cur = target;
+        int guard = 0;
+        while (cur != null && guard < 128) {
+            guard += 1;
+            UIElement pEl = p;
+            if (cur == pEl || cur == p.PlacementTarget) { return true; }
+            cur = BindingEntry.StepAncestor(cur);
+        }
+        return false;
+    }
+
     public static void DismissNonPersistent(UIElement clickedTarget, bool isEscape) {
         if (_openPopups == null || _openPopups.Length == 0) { return; }
         UIElement clickedRoot = (clickedTarget != null && !clickedTarget._isDisposedTree) ? clickedTarget.RootElement() : null;
@@ -151,8 +166,7 @@ public static class PopupService {
             if (!isEscape && clickedTarget != null) {
                 UIElement popupRoot = p.PlacementTarget != null ? p.PlacementTarget.RootElement() : p.RootElement();
                 if (clickedRoot != null && popupRoot != null && clickedRoot != popupRoot) { continue; }
-                if (p.IsAncestorOf(clickedTarget)) { continue; }
-                if (p.PlacementTarget != null && p.PlacementTarget.IsAncestorOf(clickedTarget)) { continue; }
+                if (IsWithinPopupLogicalChain(p, clickedTarget)) { continue; }
             }
             p.IsOpen = false;
         }
@@ -171,7 +185,6 @@ public class Popup : FrameworkElement {
     private UIElement _child;
     private bool _isOpen = false;
     private UIElement _placementTarget;
-    private UIElement _logicalParent;
     private bool _staysOpen = false;
     private float _horizOffset = 0.0f;
     private float _vertOffset = 0.0f;
@@ -223,7 +236,16 @@ public class Popup : FrameworkElement {
 
     public UIElement PlacementTarget {
         get { return _placementTarget; }
-        set { _placementTarget = value; UpdatePosition(); }
+        set {
+            UIElement oldTarget = _placementTarget;
+            _placementTarget = value;
+            if (value != null) {
+                _logicalParent = value;
+            } else if (_logicalParent == oldTarget) {
+                _logicalParent = null;
+            }
+            UpdatePosition();
+        }
     }
     public UIElement LogicalParent {
         get { return _logicalParent; }
@@ -299,7 +321,13 @@ public class Popup : FrameworkElement {
                 Parent.RegisterDetachedLogicalChild(this);
                 Parent.RemoveChild(this);
             }
+            bool prevSuppressStyle = overlay._suppressChildAutoStyle;
+            bool prevSuppressLoad = overlay._suppressChildAutoLoaded;
+            overlay._suppressChildAutoStyle = true;
+            overlay._suppressChildAutoLoaded = true;
             overlay.AddChild(this);
+            overlay._suppressChildAutoStyle = prevSuppressStyle;
+            overlay._suppressChildAutoLoaded = prevSuppressLoad;
             _attachedRoot = overlay;
         }
         if (_logicalParent != null) {
@@ -310,10 +338,15 @@ public class Popup : FrameworkElement {
                 _logicalParent.EffectiveTextFontWeightOrEmpty(),
                 _logicalParent.EffectiveTextForeground());
         }
+        ApplyStyleSubtree();
+        ApplyTemplateSubtree();
+        RefreshDynamicResourcesRecursive();
+        if (overlay.HasLoadedFired()) {
+            EnsureLoadedSubtree();
+        }
         BindingEngine.FlushSubtree(this);
     }
 
-    internal override UIElement GetLogicalAncestorOverride() { return _logicalParent; }
 
     private void DetachOverlay() {
         if (_attachedRoot != null && Parent == _attachedRoot) {
@@ -460,42 +493,87 @@ public class Popup : FrameworkElement {
 
 public class ToolTip : ContentControl {
     public ToolTip() : base() {
-        Background = new SolidColorBrush("#FF0F172A");
-        Foreground = new SolidColorBrush("#FFF1F5F9");
-        BorderBrush = new SolidColorBrush("#FF3B465C");
-        BorderThickness = new Thickness(1.0f);
-        CornerRadius = new CornerRadius(6.0f);
-        Padding = new Thickness(10.0f, 6.0f, 10.0f, 6.0f);
-        FontSize = 12.0f;
-        Effect = new DropShadowEffect(8.0f, 3.0f, 315.0f, "#FF000000", 0.5f);
+        ToolTipService.EnsureInstalled();
     }
     public ToolTip(string text) : this() {
         SetContent(text);
     }
     public override string GetTypeName() { return "ToolTip"; }
     internal override bool DisposeWhenResourceOwned() { return true; }
+
+    protected override UIElement CreateDefaultTemplate() {
+        if (Style == null && _appliedStyle == null && Template == null) {
+            if (!HasLocalProperty("Background") && Background == null) {
+                Background = new SolidColorBrush("#FF0F172A");
+            }
+            if (!HasLocalProperty("Foreground") && !HasExplicitForeground()) {
+                Foreground = new SolidColorBrush("#FFF1F5F9");
+            }
+            if (!HasLocalProperty("BorderBrush") && BorderBrush == null) {
+                BorderBrush = new SolidColorBrush("#FF3B465C");
+            }
+            if (!HasLocalProperty("BorderThickness") &&
+                BorderThickness.Left == 0.0f && BorderThickness.Top == 0.0f &&
+                BorderThickness.Right == 0.0f && BorderThickness.Bottom == 0.0f) {
+                BorderThickness = new Thickness(1.0f);
+            }
+            CornerRadius curCr = this.CornerRadius;
+            if (!HasLocalProperty("CornerRadius") &&
+                (curCr == null ||
+                 (curCr.TopLeft == 0.0f && curCr.TopRight == 0.0f &&
+                  curCr.BottomRight == 0.0f && curCr.BottomLeft == 0.0f))) {
+                CornerRadius = new CornerRadius(6.0f);
+            }
+            if (!HasLocalProperty("Padding") &&
+                Padding.Left == 0.0f && Padding.Top == 0.0f &&
+                Padding.Right == 0.0f && Padding.Bottom == 0.0f) {
+                Padding = new Thickness(10.0f, 6.0f, 10.0f, 6.0f);
+            }
+            if (!HasLocalProperty("FontSize") && !_hasExplicitFontSize) {
+                FontSize = 12.0f;
+            }
+            if (!HasLocalProperty("Effect") && Effect == null) {
+                Effect = new DropShadowEffect(8.0f, 3.0f, 315.0f, "#FF000000", 0.5f);
+            }
+        }
+        return base.CreateDefaultTemplate();
+    }
 }
 
 public static class ToolTipService {
     private static Popup _activeTipPopup;
+    private static bool _ownsTipElement = false;
+    private static bool _installed = false;
+
+    public static void EnsureInstalled() {
+        if (_installed) { return; }
+        _installed = true;
+        UIElement._toolTipEventHook = (UIElement el, string prop, DependencyObject val) => {
+            if (el != null && val != null) { el.EnableToolTipHover(); }
+        };
+    }
 
     public static void ShowFor(UIElement target) {
-        if (target == null || !target.HasToolTip) { return; }
+        if (target == null || !target.IsEnabled || !target.HasToolTip) { return; }
         DependencyObject tipBox = target.ToolTipBox;
         if (tipBox == null) { return; }
+        if (tipBox is BoxedString && (tipBox as BoxedString).Value.Trim().Length == 0) { return; }
         Hide();
         _activeTipPopup = new Popup();
         _activeTipPopup.PlacementTarget = target;
         _activeTipPopup.Placement = "Bottom";
         _activeTipPopup.VerticalOffset = 4.0f;
+        _activeTipPopup.StaysOpen = true;
         _activeTipPopup.IsHitTestVisible = false;
 
         ToolTip tip = null;
         if (tipBox is ToolTip) {
             tip = tipBox as ToolTip;
+            _ownsTipElement = false;
         } else {
             tip = new ToolTip();
             tip.SetContentBox(tipBox);
+            _ownsTipElement = true;
         }
         _activeTipPopup.Child = tip;
         _activeTipPopup.IsOpen = true;
@@ -503,8 +581,15 @@ public static class ToolTipService {
 
     public static void Hide() {
         if (_activeTipPopup != null) {
-            _activeTipPopup.IsOpen = false;
+            Popup p = _activeTipPopup;
+            bool owned = _ownsTipElement;
             _activeTipPopup = null;
+            _ownsTipElement = false;
+            p.IsOpen = false;
+            if (!owned) {
+                p.Child = null;
+            }
+            p.DisposeSubtree();
         }
     }
 }
@@ -529,6 +614,7 @@ public partial class UIElement {
     }
 
     public void EnableToolTipHover() {
+        ToolTipService.EnsureInstalled();
         if (_toolTipHooked) { return; }
         _toolTipHooked = true;
         MouseEnter += (object s, MouseEventArgs e) => {
@@ -829,6 +915,7 @@ public class MenuItem : HeaderedItemsControl {
     private void HandleSubmenuPopupClosed() {
         if (_isSubmenuOpen) {
             _isSubmenuOpen = false;
+            CloseDescendantSubmenus();
             NotifyBoundPropertyChanged("IsSubmenuOpen", DependencyObject.BoxBool(false));
             UpdateTriggersAndStates();
             SubmenuClosed(this, new RoutedEventArgs("SubmenuClosed", this));
@@ -891,12 +978,123 @@ public class MenuItem : HeaderedItemsControl {
         UpdateTriggersAndStates();
     }
 
+    private ItemsControl ParentItemsOwner() {
+        UIElement cur = BindingEntry.StepAncestor(this);
+        int guard = 0;
+        while (cur != null && guard < 32) {
+            guard += 1;
+            if (cur is MenuItem || cur is MenuBase) {
+                return cur as ItemsControl;
+            }
+            cur = BindingEntry.StepAncestor(cur);
+        }
+        return null;
+    }
+
+    internal void CloseDescendantSubmenus() {
+        int n = ItemCount();
+        for (int i = 0; i < n; i += 1) {
+            DependencyObject box = GetItemBoxAt(i);
+            if (box is MenuItem) {
+                MenuItem sub = box as MenuItem;
+                sub.CloseDescendantSubmenus();
+                if (sub.IsSubmenuOpen) { sub.IsSubmenuOpen = false; }
+            }
+        }
+        int cn = ContainerCount();
+        for (int i = 0; i < cn; i += 1) {
+            UIElement c = ContainerAt(i);
+            if (c is MenuItem) {
+                MenuItem sub = c as MenuItem;
+                sub.CloseDescendantSubmenus();
+                if (sub.IsSubmenuOpen) { sub.IsSubmenuOpen = false; }
+            }
+        }
+    }
+
+    private void CloseSiblingSubmenus() {
+        ItemsControl owner = ParentItemsOwner();
+        if (owner == null) { return; }
+        UIElement self = this;
+        int n = owner.ItemCount();
+        for (int i = 0; i < n; i += 1) {
+            DependencyObject box = owner.GetItemBoxAt(i);
+            if (box is MenuItem) {
+                MenuItem sib = box as MenuItem;
+                UIElement sibEl = sib;
+                if (sibEl == self) { continue; }
+                if (sib.IsSubmenuOpen) {
+                    sib.CloseDescendantSubmenus();
+                    sib.IsSubmenuOpen = false;
+                }
+            }
+        }
+        int cn = owner.ContainerCount();
+        for (int i = 0; i < cn; i += 1) {
+            UIElement c = owner.ContainerAt(i);
+            if (c is MenuItem && c != self) {
+                MenuItem sib = c as MenuItem;
+                if (sib.IsSubmenuOpen) {
+                    sib.CloseDescendantSubmenus();
+                    sib.IsSubmenuOpen = false;
+                }
+            }
+        }
+    }
+
+    private bool HasAnyOpenSiblingSubmenu() {
+        ItemsControl owner = ParentItemsOwner();
+        if (owner == null) { return false; }
+        UIElement self = this;
+        int n = owner.ItemCount();
+        for (int i = 0; i < n; i += 1) {
+            DependencyObject box = owner.GetItemBoxAt(i);
+            if (box is MenuItem) {
+                MenuItem sib = box as MenuItem;
+                UIElement sibEl = sib;
+                if (sibEl != self && sib.IsSubmenuOpen) { return true; }
+            }
+        }
+        int cn = owner.ContainerCount();
+        for (int i = 0; i < cn; i += 1) {
+            UIElement c = owner.ContainerAt(i);
+            if (c is MenuItem && c != self && (c as MenuItem).IsSubmenuOpen) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    public override void OnMouseEnter(MouseEventArgs e) {
+        base.OnMouseEnter(e);
+        if (!IsEnabled) { return; }
+        if (_isTopLevel) {
+            if (!_isSubmenuOpen && HasAnyOpenSiblingSubmenu()) {
+                CloseSiblingSubmenus();
+                if (ItemCount() > 0) {
+                    IsSubmenuOpen = true;
+                }
+            }
+        } else {
+            CloseSiblingSubmenus();
+            if (ItemCount() > 0 && !_isSubmenuOpen) {
+                IsSubmenuOpen = true;
+            }
+        }
+    }
+
     public override void OnMouseLeftButtonUp(MouseButtonEventArgs e) {
         base.OnMouseLeftButtonUp(e);
         if (!IsEnabled) { return; }
         e.Handled = true;
         if (ItemCount() > 0) {
-            IsSubmenuOpen = !IsSubmenuOpen;
+            bool nextOpen = !IsSubmenuOpen;
+            if (nextOpen) {
+                CloseSiblingSubmenus();
+            } else {
+                CloseDescendantSubmenus();
+            }
+            IsSubmenuOpen = nextOpen;
             return;
         }
         if (_isCheckable) { IsChecked = !IsChecked; }
@@ -994,8 +1192,6 @@ public class MenuItem : HeaderedItemsControl {
 
 public class MenuBase : ItemsControl {
     public MenuBase() : base() {
-        Background = new SolidColorBrush("#FF181C24");
-        BorderBrush = new SolidColorBrush("#FF2E3748");
     }
     public override string GetTypeName() { return "MenuBase"; }
     protected override bool IsItemItsOwnContainer(DependencyObject itemBox) {
@@ -1005,9 +1201,25 @@ public class MenuBase : ItemsControl {
 
 public class Menu : MenuBase {
     public Menu() : base() {
-        BorderThickness = new Thickness(0.0f, 0.0f, 0.0f, 1.0f);
         Padding = new Thickness(6.0f, 2.0f, 6.0f, 2.0f);
         ItemsPanel = () => { return new StackPanel(Orientation.Horizontal, 2.0f); };
+    }
+
+    protected override UIElement CreateDefaultTemplate() {
+        if (Style == null && _appliedStyle == null && Template == null) {
+            if (!HasLocalProperty("Background") && Background == null) {
+                Background = new SolidColorBrush("#FF181C24");
+            }
+            if (!HasLocalProperty("BorderBrush") && BorderBrush == null) {
+                BorderBrush = new SolidColorBrush("#FF2E3748");
+            }
+            if (!HasLocalProperty("BorderThickness") &&
+                BorderThickness.Left == 0.0f && BorderThickness.Top == 0.0f &&
+                BorderThickness.Right == 0.0f && BorderThickness.Bottom == 0.0f) {
+                BorderThickness = new Thickness(0.0f, 0.0f, 0.0f, 1.0f);
+            }
+        }
+        return base.CreateDefaultTemplate();
     }
     public override string GetTypeName() { return "Menu"; }
 
@@ -1024,14 +1236,6 @@ public class ContextMenu : MenuBase {
     public event RoutedEventHandler Closed;
 
     public ContextMenu() : base() {
-        Background = new SolidColorBrush("#FF1B202B");
-        BorderBrush = new SolidColorBrush("#FF3B465C");
-        BorderThickness = new Thickness(1.0f);
-        CornerRadius = new CornerRadius(6.0f);
-        Padding = new Thickness(4.0f);
-        MinWidth = 170.0f;
-        Effect = new DropShadowEffect(12.0f, 4.0f, 315.0f, "#FF000000", 0.55f);
-
         _popup = new Popup();
         _popup.StaysOpen = false;
         _popup.Child = this;
@@ -1066,6 +1270,41 @@ public class ContextMenu : MenuBase {
     }
 
     public void Close() { _popup.IsOpen = false; }
+
+    protected override UIElement CreateDefaultTemplate() {
+        if (Style == null && _appliedStyle == null && Template == null) {
+            if (!HasLocalProperty("Background") && Background == null) {
+                Background = new SolidColorBrush("#FF1B202B");
+            }
+            if (!HasLocalProperty("BorderBrush") && BorderBrush == null) {
+                BorderBrush = new SolidColorBrush("#FF3B465C");
+            }
+            if (!HasLocalProperty("BorderThickness") &&
+                BorderThickness.Left == 0.0f && BorderThickness.Top == 0.0f &&
+                BorderThickness.Right == 0.0f && BorderThickness.Bottom == 0.0f) {
+                BorderThickness = new Thickness(1.0f);
+            }
+            CornerRadius curCr = this.CornerRadius;
+            if (!HasLocalProperty("CornerRadius") &&
+                (curCr == null ||
+                 (curCr.TopLeft == 0.0f && curCr.TopRight == 0.0f &&
+                  curCr.BottomRight == 0.0f && curCr.BottomLeft == 0.0f))) {
+                CornerRadius = new CornerRadius(6.0f);
+            }
+            if (!HasLocalProperty("Padding") &&
+                Padding.Left == 0.0f && Padding.Top == 0.0f &&
+                Padding.Right == 0.0f && Padding.Bottom == 0.0f) {
+                Padding = new Thickness(4.0f);
+            }
+            if (!HasLocalProperty("MinWidth") && MinWidth <= 0.0f) {
+                MinWidth = 170.0f;
+            }
+            if (!HasLocalProperty("Effect") && Effect == null) {
+                Effect = new DropShadowEffect(12.0f, 4.0f, 315.0f, "#FF000000", 0.55f);
+            }
+        }
+        return base.CreateDefaultTemplate();
+    }
 
     protected override void PrepareOwnContainer(UIElement container, int index) {
         base.PrepareOwnContainer(container, index);
@@ -1120,9 +1359,6 @@ public class ToolBar : HeaderedItemsControl {
     }
 
     public ToolBar() : base() {
-        Background = new SolidColorBrush("#FF1B202B");
-        BorderBrush = new SolidColorBrush("#FF2E3748");
-        BorderThickness = new Thickness(0.0f, 0.0f, 0.0f, 1.0f);
         Padding = new Thickness(8.0f, 4.0f, 8.0f, 4.0f);
         ItemsPanel = () => { return new StackPanel(_orientation, 2.0f); };
     }
@@ -1167,6 +1403,19 @@ public class ToolBar : HeaderedItemsControl {
     }
 
     protected override UIElement CreateDefaultTemplate() {
+        if (Style == null && _appliedStyle == null && Template == null) {
+            if (!HasLocalProperty("Background") && Background == null) {
+                Background = new SolidColorBrush("#FF1B202B");
+            }
+            if (!HasLocalProperty("BorderBrush") && BorderBrush == null) {
+                BorderBrush = new SolidColorBrush("#FF2E3748");
+            }
+            if (!HasLocalProperty("BorderThickness") &&
+                BorderThickness.Left == 0.0f && BorderThickness.Top == 0.0f &&
+                BorderThickness.Right == 0.0f && BorderThickness.Bottom == 0.0f) {
+                BorderThickness = new Thickness(0.0f, 0.0f, 0.0f, 1.0f);
+            }
+        }
         var row = new StackPanel(Orientation, 8.0f);
         _headerPresenter = new ContentPresenter();
         _headerPresenter.SetContentBox(HeaderBox);

@@ -124,7 +124,7 @@ public class Control : FrameworkElement {
     private ControlTemplate _template;
     private UIElement _templateRoot;
     private bool _templateApplied = false;
-    private bool _hasExplicitFontSize = false;
+    protected bool _hasExplicitFontSize = false;
     private bool _hasExplicitFontFamily = false;
     private bool _hasExplicitFontWeight = false;
     private bool _hasExplicitForeground = false;
@@ -209,6 +209,7 @@ public class Control : FrameworkElement {
     public ControlTemplate Template {
         get { return _template; }
         set {
+            MarkLocalProperty("Template");
             if (_template == value && _templateApplied) { return; }
             if (_template != null && _templateApplied) {
                 _template.ResetTriggers(this);

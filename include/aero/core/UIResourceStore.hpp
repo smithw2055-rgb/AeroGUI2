@@ -121,7 +121,9 @@ public:
         std::uint32_t innerH,
         float strokeWidthPx,
         std::uint32_t padPx,
-        RasterizedPathMaskEntry& outEntry);
+        RasterizedPathMaskEntry& outEntry,
+        std::uint8_t startLineCap = 2u,
+        std::uint8_t endLineCap = 2u);
 
     void ClearAll() noexcept;
 

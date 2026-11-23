@@ -2621,6 +2621,13 @@ void AeroAppHost::StepFrame(float dtSeconds, bool forceRenderSync) {
     if (forceRenderSync || viewportChanged || hadDirtyBeforeLayout) {
         logTrace("UpdateLayout");
         world_.UpdateLayout(vpW, vpH);
+        if (viewportChanged && rootObject_.valid()) {
+            (void)InvokeScriptMethod(
+                rootObject_,
+                "OnHostViewportResized",
+                {UnifiedValue{FloatValue{vpW}}, UnifiedValue{FloatValue{vpH}}},
+                nullptr);
+        }
         FlushBindings();
         if (world_.FlushTrackB() > 0u || world_.HasAnyDirty()) {
             world_.UpdateLayout(vpW, vpH);

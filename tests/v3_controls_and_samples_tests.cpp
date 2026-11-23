@@ -978,12 +978,16 @@ void TestGalleryEngineRuntimeFixes(aero::rs_comp::CompilerSession& session) {
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         x:Class="GalleryRuntimeFixDemo.MainWindow"
         Title="Gallery Runtime Fixes" Width="800" Height="600">
-  <StackPanel x:Name="RuntimeHost" Orientation="Vertical" Spacing="8" Margin="16"/>
+  <StackPanel x:Name="RuntimeHost" Orientation="Vertical" Spacing="8" Margin="16">
+    <Button x:Name="AotTipBtn" Content="TipHost" ToolTip="AotTipText" Width="80" Height="28"/>
+    <Border x:Name="RotNoOriginBorder" Width="40" Height="40"/>
+  </StackPanel>
 </Window>)XML";
 
     const std::string aotRs = R"RS(
 module GalleryRuntimeFixDemo;
 import Aero.UI;
+import RealScript.Math;
 
 public class GalleryFixVm {
     public string AccentBrush { get; set; } = "#FFFF0000";
@@ -998,11 +1002,35 @@ public partial class MainWindow : Window {
     public Button TbChildBtn;
     public TreeView TvCheck;
     public ComboBox CbComposite;
+    public TextBlock TrigSrcTb;
+    public Border TrigBindTarget;
+    public ToggleButton StyledTb;
+    public bool PopLogicalCleared = false;
+    public bool MaxLinesResetOk = false;
+    public bool RotateMathOk = false;
 
     public MainWindow() {
         InitializeComponent();
         Vm = new GalleryFixVm();
         DataContext = Vm;
+
+        RotNoOriginBorder.RenderTransform = new RotateTransform(90.0f, 0.0f, 0.0f);
+        var rtd = new TransformData();
+        var rCheck = new RotateTransform(90.0f, 10.0f, 10.0f);
+        rCheck.Accumulate(rtd);
+        RotateMathOk = rtd.HasExplicitCenter && Math.Absf(rtd.TX - 20.0f) < 0.02f && Math.Absf(rtd.TY) < 0.02f;
+
+        var tbLines = new TextBox();
+        tbLines.MaxLines = 2;
+        bool boundedH = ParseUtil.IsFinite(tbLines.MaxHeight);
+        tbLines.MaxLines = 0;
+        MaxLinesResetOk = boundedH && !ParseUtil.IsFinite(tbLines.MaxHeight);
+
+        var pop = new Popup();
+        pop.PlacementTarget = AotTipBtn;
+        bool popSet = (pop.LogicalParent != null && pop.LogicalParent.Name == "AotTipBtn");
+        pop.PlacementTarget = null;
+        PopLogicalCleared = popSet && (pop.LogicalParent == null);
 
         string rtXml = "<StackPanel xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation' " +
             "xmlns:x='http://schemas.microsoft.com/winfx/2006/xaml'>" +
@@ -1014,13 +1042,30 @@ public partial class MainWindow : Window {
                   "</Style>" +
                 "</Style.Resources>" +
               "</Style>" +
+              "<Style TargetType='ToggleButton'>" +
+                "<Setter Property='CornerRadius' Value='2'/>" +
+                "<Setter Property='Background' Value='#FF112233'/>" +
+              "</Style>" +
             "</StackPanel.Resources>" +
             "<TextBlock x:Name='EntTb'>&#38;lt;ok&#38;gt;</TextBlock>" +
             "<TextBlock x:Name='InlineTb'><Bold Foreground='{Binding AccentBrush}'>foo </Bold>bar</TextBlock>" +
             "<ToggleButton x:Name='TriTb' IsThreeState='True'/>" +
+            "<ToggleButton x:Name='StyledTb' Content='Styled'/>" +
             "<ToolBar x:Name='HostTb'><Button x:Name='TbChildBtn' Content='Act' Style='{DynamicResource {x:Static ToolBar.ButtonStyleKey}}'/></ToolBar>" +
             "<TreeView x:Name='TvCheck'><TransformGroup Selector.IsSelected='True'/></TreeView>" +
             "<ComboBox x:Name='CbComposite' SelectedIndex='0'><ComboBoxItem><StackPanel Orientation='Horizontal'><TextBlock Text='Alpha'/><TextBlock Text='Beta'/></StackPanel></ComboBoxItem></ComboBox>" +
+            "<TextBlock x:Name='TrigSrcTb' Text='FromSrc'/>" +
+            "<Border x:Name='TrigBindTarget' Tag='BaseTag'>" +
+              "<Border.Style>" +
+                "<Style TargetType='Border'>" +
+                  "<Style.Triggers>" +
+                    "<Trigger Property='IsEnabled' Value='False'>" +
+                      "<Setter Property='Tag' Value='{Binding Text, ElementName=TrigSrcTb}'/>" +
+                    "</Trigger>" +
+                  "</Style.Triggers>" +
+                "</Style>" +
+              "</Border.Style>" +
+            "</Border>" +
             "</StackPanel>";
         UIElement parsed = XamlReader.Parse(rtXml);
         if (parsed != null) {
@@ -1028,10 +1073,13 @@ public partial class MainWindow : Window {
             EntTb = parsed.FindName("EntTb") as TextBlock;
             InlineTb = parsed.FindName("InlineTb") as TextBlock;
             TriTb = parsed.FindName("TriTb") as ToggleButton;
+            StyledTb = parsed.FindName("StyledTb") as ToggleButton;
             HostTb = parsed.FindName("HostTb") as ToolBar;
             TbChildBtn = parsed.FindName("TbChildBtn") as Button;
             TvCheck = parsed.FindName("TvCheck") as TreeView;
             CbComposite = parsed.FindName("CbComposite") as ComboBox;
+            TrigSrcTb = parsed.FindName("TrigSrcTb") as TextBlock;
+            TrigBindTarget = parsed.FindName("TrigBindTarget") as Border;
         }
     }
 
@@ -1069,6 +1117,49 @@ public partial class MainWindow : Window {
     }
     public string GetComboCompositeText() {
         return CbComposite != null ? CbComposite.Text : "";
+    }
+    public string CheckNewReviewFixes() {
+        if (AotTipBtn == null || !AotTipBtn.HasToolTip) { return "ERR_TIP_MISSING"; }
+        string tipVal = DependencyObject.UnboxString(AotTipBtn.GetPropertyValue("ToolTip"), "");
+        if (tipVal != "AotTipText") { return "ERR_TIP_VAL=" + tipVal; }
+        var dynBtn = new Button();
+        dynBtn.SetToolTip("DynTipText");
+        if (!dynBtn.HasToolTip) { return "ERR_DYN_TIP"; }
+        if (!RotateMathOk) { return "ERR_ROT_MATH"; }
+        if (!MaxLinesResetOk) { return "ERR_MAXLINES"; }
+        if (!PopLogicalCleared) { return "ERR_POP_LP"; }
+        if (StyledTb == null) { return "ERR_STYLED_TB"; }
+        StyledTb.IsChecked = true;
+        bool crOk = StyledTb.CornerRadius != null && Math.Absf(StyledTb.CornerRadius.TopLeft - 2.0f) < 0.01f;
+        bool bgOk = StyledTb.Background is SolidColorBrush &&
+            (StyledTb.Background as SolidColorBrush).ResolveRgba() == ParseUtil.ParseColor("#FF112233");
+        if (!crOk || !bgOk) { return "ERR_IMPLICIT_TOGGLE"; }
+        if (TrigBindTarget == null || TrigSrcTb == null) { return "ERR_TRIG_NULL"; }
+        if (BindingEngine.HasTriggerBinding(TrigBindTarget, "Tag")) { return "ERR_TRIG_PREBOUND"; }
+        TrigBindTarget.IsEnabled = false;
+        TrigBindTarget.ApplyStyleInternal();
+        BindingEngine.Flush();
+        string onVal1 = DependencyObject.UnboxString(TrigBindTarget.GetPropertyValue("Tag"), "");
+        if (!BindingEngine.HasTriggerBinding(TrigBindTarget, "Tag") || onVal1 != "FromSrc") {
+            return "ERR_TRIG_ON1=" + onVal1;
+        }
+        TrigSrcTb.Text = "UpdatedSrc";
+        TrigBindTarget.ApplyStyleInternal();
+        BindingEngine.Flush();
+        string onVal2 = DependencyObject.UnboxString(TrigBindTarget.GetPropertyValue("Tag"), "");
+        if (onVal2 != "UpdatedSrc") { return "ERR_TRIG_ON2=" + onVal2; }
+        TrigBindTarget.IsEnabled = true;
+        TrigBindTarget.ApplyStyleInternal();
+        BindingEngine.Flush();
+        string offVal = DependencyObject.UnboxString(TrigBindTarget.GetPropertyValue("Tag"), "");
+        if (BindingEngine.HasTriggerBinding(TrigBindTarget, "Tag") || offVal != "BaseTag") {
+            return "ERR_TRIG_OFF=" + offVal;
+        }
+        TrigSrcTb.Text = "AfterDeact";
+        BindingEngine.Flush();
+        string afterVal = DependencyObject.UnboxString(TrigBindTarget.GetPropertyValue("Tag"), "");
+        if (afterVal != "BaseTag") { return "ERR_TRIG_LEAK=" + afterVal; }
+        return "OK";
     }
 }
 )RS";
@@ -1140,6 +1231,13 @@ public partial class MainWindow : Window {
     const std::string cbText = callStr("GetComboCompositeText");
     Require(cbText.find("Alpha") != std::string::npos && cbText.find("Beta") != std::string::npos,
         "ComboBox composite StackPanel preview text unexpected: " + cbText);
+    const std::string fixRes = callStr("CheckNewReviewFixes");
+    Require(fixRes == "OK", "CheckNewReviewFixes failed: " + fixRes);
+    const aero::VisualNode* rotNode = host.World().GetNode(host.FindVisualByOwnerName("RotNoOriginBorder"));
+    Require(rotNode && std::fabs(rotNode->transform2D.originX) < 1e-4f &&
+            std::fabs(rotNode->transform2D.originY) < 1e-4f &&
+            std::fabs(rotNode->transform2D.rotDeg - 90.0f) < 1e-3f,
+            "RotateTransform with explicit Center(0,0) and no explicit RenderTransformOrigin must pivot at (0,0)");
 }
 
 } // namespace

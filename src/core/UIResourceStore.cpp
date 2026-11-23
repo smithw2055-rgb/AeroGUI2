@@ -459,20 +459,24 @@ bool UIResourceStore::GetOrRasterizePathStrokeMask(
     std::uint32_t innerH,
     float strokeWidthPx,
     std::uint32_t padPx,
-    RasterizedPathMaskEntry& outEntry) {
+    RasterizedPathMaskEntry& outEntry,
+    std::uint8_t startLineCap,
+    std::uint8_t endLineCap) {
     if (pathData.empty() || strokeWidthPx <= 0.0f) {
         return false;
     }
     const std::uint64_t safeHash = (pathHash != 0ull) ? pathHash : ComputeSvgPathHash(pathData);
     const std::uint32_t clampedW = std::clamp<std::uint32_t>(innerW, 1u, 2048u);
     const std::uint32_t clampedH = std::clamp<std::uint32_t>(innerH, 1u, 2048u);
-    const std::uint32_t clampedPad = std::clamp<std::uint32_t>(padPx, 1u, 64u);
+    const std::uint32_t clampedPad = std::clamp<std::uint32_t>(padPx, 1u, 256u);
     const auto quantizedStroke = static_cast<std::uint64_t>(std::max<long>(1L, std::lround(strokeWidthPx * 16.0f)));
+    const auto capBits = (static_cast<std::uint64_t>(startLineCap & 0xFu) << 4u) |
+                         static_cast<std::uint64_t>(endLineCap & 0xFu);
 
     std::uint64_t key = safeHash ^ 0xD1B54A32D192ED03ULL;
     key ^= (static_cast<std::uint64_t>(clampedW) << 32u) | static_cast<std::uint64_t>(clampedH);
     key *= 1099511628211ULL;
-    key ^= (quantizedStroke << 8u) | static_cast<std::uint64_t>(clampedPad);
+    key ^= (quantizedStroke << 16u) | (capBits << 8u) | static_cast<std::uint64_t>(clampedPad);
     key *= 1099511628211ULL;
 
     {
@@ -486,7 +490,7 @@ bool UIResourceStore::GetOrRasterizePathStrokeMask(
 
     std::vector<std::uint8_t> rgba8;
     if (!RasterizeSvgPathStrokeAlphaMask(
-            pathData, rawBounds, clampedW, clampedH, strokeWidthPx, clampedPad, rgba8)) {
+            pathData, rawBounds, clampedW, clampedH, strokeWidthPx, clampedPad, rgba8, startLineCap, endLineCap)) {
         return false;
     }
 

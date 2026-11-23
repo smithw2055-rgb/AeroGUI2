@@ -618,6 +618,46 @@ float EvaluateEasing(
     if (kind == EasingFunctionKind::Linear) {
         return t;
     }
+    if (kind == EasingFunctionKind::Spline && (paramMask & 16u) != 0u) {
+        if (t <= 0.0f || t >= 1.0f) {
+            return t;
+        }
+        const float p0 = std::max(0.0f, param0);
+        const float p1 = std::max(0.0f, param1);
+        const float qx1 = std::floor(p0 / 4096.0f);
+        const float qy1 = p0 - qx1 * 4096.0f;
+        const float qx2 = std::floor(p1 / 4096.0f);
+        const float qy2 = p1 - qx2 * 4096.0f;
+        const float x1 = std::clamp(qx1 / 4000.0f, 0.0f, 1.0f);
+        const float y1 = qy1 / 4000.0f;
+        const float x2 = std::clamp(qx2 / 4000.0f, 0.0f, 1.0f);
+        const float y2 = qy2 / 4000.0f;
+        float lo = 0.0f;
+        float hi = 1.0f;
+        float s = t;
+        for (int iter = 0; iter < 10; ++iter) {
+            const float u = 1.0f - s;
+            const float bx = 3.0f * u * u * s * x1 + 3.0f * u * s * s * x2 + s * s * s;
+            const float err = bx - t;
+            if (std::fabs(err) <= 1e-5f) {
+                break;
+            }
+            if (err < 0.0f) {
+                lo = s;
+            } else {
+                hi = s;
+            }
+            const float dbx = 3.0f * u * u * x1 + 6.0f * u * s * (x2 - x1) + 3.0f * s * s * (1.0f - x2);
+            if (dbx > 1e-4f) {
+                const float next = s - err / dbx;
+                s = (next > lo && next < hi) ? next : (0.5f * (lo + hi));
+            } else {
+                s = 0.5f * (lo + hi);
+            }
+        }
+        const float u = 1.0f - s;
+        return 3.0f * u * u * s * y1 + 3.0f * u * s * s * y2 + s * s * s;
+    }
     switch (mode) {
     case EasingMode::EaseIn:
         return EaseInCore(kind, t, param0, param1, paramMask);
@@ -761,9 +801,12 @@ float VisualAnimationEngine::ReadCurrentScalarProp(
         return node->Text().fgOpacity;
     }
     case VisualAnimProp::CustomScalar0: return node->customScalars[0];
-    case VisualAnimProp::CustomScalar1: return node->customScalars[1];
-    case VisualAnimProp::CustomScalar2: return node->customScalars[2];
-    case VisualAnimProp::CustomScalar3: return node->customScalars[3];
+    case VisualAnimProp::CustomScalar1:
+        return node->layout.hasLayoutTransform ? node->layout.layoutTransform2D.sx : node->customScalars[1];
+    case VisualAnimProp::CustomScalar2:
+        return node->layout.hasLayoutTransform ? node->layout.layoutTransform2D.sy : node->customScalars[2];
+    case VisualAnimProp::CustomScalar3:
+        return node->layout.hasLayoutTransform ? node->layout.layoutTransform2D.rotDeg : node->customScalars[3];
     case VisualAnimProp::OpacityMaskStop0Offset:
     case VisualAnimProp::OpacityMaskStop1Offset:
     case VisualAnimProp::OpacityMaskStop2Offset:

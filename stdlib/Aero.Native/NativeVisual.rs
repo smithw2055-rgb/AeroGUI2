@@ -67,6 +67,7 @@ int __rs_native_Visual_SetBoxShadow(handle node, bool isBoxShadow) { return 0; }
 public void Visual_SetBoxShadow(handle node, bool isBoxShadow) { __rs_native_Visual_SetBoxShadow(node, isBoxShadow); return; }
 public int Visual_RegisterLinearGradient(float x0, float y0, float x1, float y1, int spread, int mapping, string stopsSpec) { return 0; }
 public int Visual_RegisterRadialGradient(float cx, float cy, float ox, float oy, float rx, float ry, int spread, int mapping, string stopsSpec) { return 0; }
+public int Visual_RegisterConicGradient(float cx, float cy, int spread, int mapping, string stopsSpec) { return 0; }
 int __rs_native_Visual_SetTransform2D(handle node, float tx, float ty, float sx, float sy, float rotDeg, float skewX, float skewY, float ox, float oy) { return 0; }
 public void Visual_SetTransform2D(handle node, float tx, float ty, float sx, float sy, float rotDeg, float skewX, float skewY, float ox, float oy) { __rs_native_Visual_SetTransform2D(node, tx, ty, sx, sy, rotDeg, skewX, skewY, ox, oy); return; }
 int __rs_native_Visual_SetLayoutTransform(handle node, float sx, float sy, float rotDeg, bool enabled) { return 0; }
@@ -81,6 +82,8 @@ int __rs_native_Visual_SetEffect(handle node, int kind, float radius, float dept
 public void Visual_SetEffect(handle node, int kind, float radius, float depth, float dirDeg, uint colorRgba, float opacity) { __rs_native_Visual_SetEffect(node, kind, radius, depth, dirDeg, colorRgba, opacity); return; }
 int __rs_native_Visual_SetOpacityMask(handle node, bool enabled, int gradId, uint solidRgba, float opacity) { return 0; }
 public void Visual_SetOpacityMask(handle node, bool enabled, int gradId, uint solidRgba, float opacity) { __rs_native_Visual_SetOpacityMask(node, enabled, gradId, solidRgba, opacity); return; }
+int __rs_native_Visual_SetBlendMode(handle node, int blendMode) { return 0; }
+public void Visual_SetBlendMode(handle node, int blendMode) { __rs_native_Visual_SetBlendMode(node, blendMode); return; }
 
 // Text, Image & Vector
 int __rs_native_Visual_SetText(handle node, string text, string fontFamily, float fontSize, uint fgRgba, int wrap, int align, int trim) { return 0; }
@@ -103,6 +106,10 @@ int __rs_native_Visual_SetImage(handle node, string uri, int stretch, int stretc
 public void Visual_SetImage(handle node, string uri, int stretch, int stretchDir, uint tintRgba) { __rs_native_Visual_SetImage(node, uri, stretch, stretchDir, tintRgba); return; }
 int __rs_native_Visual_SetImageViewbox(handle node, float vx, float vy, float vw, float vh) { return 0; }
 public void Visual_SetImageViewbox(handle node, float vx, float vy, float vw, float vh) { __rs_native_Visual_SetImageViewbox(node, vx, vy, vw, vh); return; }
+int __rs_native_Visual_SetImageViewport(handle node, float vpx, float vpy, float vpw, float vph, bool hasExplicit, bool isAbsolute) { return 0; }
+public void Visual_SetImageViewport(handle node, float vpx, float vpy, float vpw, float vph, bool hasExplicit, bool isAbsolute) { __rs_native_Visual_SetImageViewport(node, vpx, vpy, vpw, vph, hasExplicit, isAbsolute); return; }
+int __rs_native_Visual_SetVisualBrushSource(handle node, handle srcNode, int alignX, int alignY) { return 0; }
+public void Visual_SetVisualBrushSource(handle node, handle srcNode, int alignX, int alignY) { __rs_native_Visual_SetVisualBrushSource(node, srcNode, alignX, alignY); return; }
 int __rs_native_Visual_SetImageTile(handle node, bool tileWrap) { return 0; }
 public void Visual_SetImageTile(handle node, bool tileWrap) { __rs_native_Visual_SetImageTile(node, tileWrap); return; }
 int __rs_native_Visual_SetVectorShape(handle node, int shapeKind, string pathOrParams, uint fillRgba, int fillGradId, uint strokeRgba, int strokeGradId, float strokeWidth, int stretch, float trimStart, float trimEnd) { return 0; }

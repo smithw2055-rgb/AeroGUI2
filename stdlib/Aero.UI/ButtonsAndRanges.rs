@@ -179,6 +179,7 @@ public class ButtonBase : ContentControl {
 public class Button : ButtonBase {
     public bool IsDefault { get; set; }
     public bool IsCancel { get; set; }
+    private bool _usingDefaultTemplate = false;
 
     public Button() : base() {
         HorizontalContentAlignment = HorizontalAlignment.Center;
@@ -196,24 +197,25 @@ public class Button : ButtonBase {
 
     protected override void OnVisualStatePropertyChanged() {
         base.OnVisualStatePropertyChanged();
-        if (Style != null || Template != null) { return; }
-        if (!IsEnabled) {
-            Opacity = 0.45f;
-        } else {
-            Opacity = 1.0f;
+        if (!_usingDefaultTemplate || Style != null || _appliedStyle != null || Template != null) { return; }
+        if (!HasLocalProperty("Opacity")) {
+            Opacity = IsEnabled ? 1.0f : 0.45f;
+        }
+        if (IsEnabled && !HasLocalProperty("Background")) {
             if (IsPressed) {
                 Background = new SolidColorBrush("#FF1C222D");
             } else if (IsMouseOver) {
                 Background = new SolidColorBrush("#FF303A4D");
-                BorderBrush = new SolidColorBrush("#FF3B82F6");
+                if (!HasLocalProperty("BorderBrush")) { BorderBrush = new SolidColorBrush("#FF3B82F6"); }
             } else {
                 Background = new SolidColorBrush("#FF242B38");
-                BorderBrush = new SolidColorBrush("#FF3B465C");
+                if (!HasLocalProperty("BorderBrush")) { BorderBrush = new SolidColorBrush("#FF3B465C"); }
             }
         }
     }
 
     protected override UIElement CreateDefaultTemplate() {
+        _usingDefaultTemplate = true;
         _presenter = new ContentPresenter();
         _presenter.Name = "PART_ContentPresenter";
         _presenter.ContentTemplate = ContentTemplate;
@@ -338,11 +340,31 @@ public class ToggleButton : ButtonBase {
     public event RoutedEventHandler Indeterminate;
 
     public ToggleButton() : base() {
-        Background = new SolidColorBrush("#FF242B38");
-        BorderBrush = new SolidColorBrush("#FF3B465C");
-        BorderThickness = new Thickness(1.0f);
-        CornerRadius = new CornerRadius(6.0f);
         Padding = new Thickness(12.0f, 6.0f, 12.0f, 6.0f);
+    }
+
+    protected override UIElement CreateDefaultTemplate() {
+        if (Style == null && _appliedStyle == null && Template == null) {
+            if (!HasLocalProperty("Background") && Background == null) {
+                Background = new SolidColorBrush(_isChecked ? "#FF3B82F6" : "#FF242B38");
+            }
+            if (!HasLocalProperty("BorderBrush") && BorderBrush == null) {
+                BorderBrush = new SolidColorBrush(_isChecked ? "#FF60A5FA" : "#FF3B465C");
+            }
+            if (!HasLocalProperty("BorderThickness") &&
+                BorderThickness.Left == 0.0f && BorderThickness.Top == 0.0f &&
+                BorderThickness.Right == 0.0f && BorderThickness.Bottom == 0.0f) {
+                BorderThickness = new Thickness(1.0f);
+            }
+            CornerRadius curCr = this.CornerRadius;
+            if (!HasLocalProperty("CornerRadius") &&
+                (curCr == null ||
+                 (curCr.TopLeft == 0.0f && curCr.TopRight == 0.0f &&
+                  curCr.BottomRight == 0.0f && curCr.BottomLeft == 0.0f))) {
+                CornerRadius = new CornerRadius(6.0f);
+            }
+        }
+        return base.CreateDefaultTemplate();
     }
 
     public override string GetTypeName() { return "ToggleButton"; }
@@ -407,13 +429,17 @@ public class ToggleButton : ButtonBase {
     }
 
     protected virtual void UpdateVisualCheckedState() {
-        if (Style == null && Template == null) {
+        if (Style == null && _appliedStyle == null && Template == null) {
             if (_isIndeterminate) {
-                Background = new SolidColorBrush("#FF334155");
-                BorderBrush = new SolidColorBrush("#FF94A3B8");
+                if (!HasLocalProperty("Background")) { Background = new SolidColorBrush("#FF334155"); }
+                if (!HasLocalProperty("BorderBrush")) { BorderBrush = new SolidColorBrush("#FF94A3B8"); }
             } else {
-                Background = new SolidColorBrush(_isChecked ? "#FF3B82F6" : "#FF242B38");
-                BorderBrush = new SolidColorBrush(_isChecked ? "#FF60A5FA" : "#FF3B465C");
+                if (!HasLocalProperty("Background")) {
+                    Background = new SolidColorBrush(_isChecked ? "#FF3B82F6" : "#FF242B38");
+                }
+                if (!HasLocalProperty("BorderBrush")) {
+                    BorderBrush = new SolidColorBrush(_isChecked ? "#FF60A5FA" : "#FF3B465C");
+                }
             }
         }
     }
@@ -1788,11 +1814,8 @@ public class ProgressBar : RangeBase {
     }
 
     public ProgressBar() : base() {
-        Height = 10.0f;
-        MinWidth = 100.0f;
         Foreground = new SolidColorBrush("#FF3B82F6");
         Background = new SolidColorBrush("#FF1B202B");
-        CornerRadius = new CornerRadius(5.0f);
         RegisterProgressBar(this);
     }
 
@@ -1869,7 +1892,13 @@ public class ProgressBar : RangeBase {
     }
 
     protected override UIElement CreateDefaultTemplate() {
+        CornerRadius curCr = CornerRadius;
+        if (!HasLocalProperty("CornerRadius") && (curCr == null || curCr.TopLeft == 0.0f)) {
+            CornerRadius = new CornerRadius(5.0f);
+        }
         var track = new Border();
+        if (!ParseUtil.IsFinite(Height)) { track.MinHeight = 10.0f; }
+        if (!ParseUtil.IsFinite(Width) && MinWidth <= 0.0f) { track.MinWidth = 100.0f; }
         track.Background = Background;
         track.CornerRadius = CornerRadius;
         track.ClipToBounds = true;
@@ -2418,12 +2447,27 @@ public class ScrollViewer : ContentControl {
         }
     }
 
+    private int _lastCompVVis = -1;
+    private int _lastCompHVis = -1;
+
     private void SyncScrollBarVisibility() {
+        Visibility cv = ComputedVerticalScrollBarVisibility;
+        Visibility ch = ComputedHorizontalScrollBarVisibility;
         if (_vBar != null) {
-            _vBar.Visibility = ComputedVerticalScrollBarVisibility;
+            _vBar.Visibility = cv;
         }
         if (_hBar != null) {
-            _hBar.Visibility = ComputedHorizontalScrollBarVisibility;
+            _hBar.Visibility = ch;
+        }
+        int iv = EnumConvert.ToInt(cv);
+        int ih = EnumConvert.ToInt(ch);
+        if (iv != _lastCompVVis) {
+            _lastCompVVis = iv;
+            BindingEngine.NotifyTargetPropertyChanged(this, "ComputedVerticalScrollBarVisibility", DependencyObject.BoxInt(iv));
+        }
+        if (ih != _lastCompHVis) {
+            _lastCompHVis = ih;
+            BindingEngine.NotifyTargetPropertyChanged(this, "ComputedHorizontalScrollBarVisibility", DependencyObject.BoxInt(ih));
         }
     }
 

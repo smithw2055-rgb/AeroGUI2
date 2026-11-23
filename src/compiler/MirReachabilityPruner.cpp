@@ -59,15 +59,42 @@ constexpr std::uint32_t kInvalidSlot = std::numeric_limits<std::uint32_t>::max()
     return std::string(fnName.substr(0u, lastDot));
 }
 
+[[nodiscard]] bool IsOptionalUiElementPropertyName(std::string_view propName) noexcept {
+    return propName == "ContextMenu" ||
+           propName == "ToolTip" ||
+           propName == "ToolTipBox" ||
+           propName == "HasToolTip";
+}
+
+[[nodiscard]] bool IsOptionalUiElementAccessorName(std::string_view methodName) noexcept {
+    return methodName == "get_ContextMenu" || methodName == "set_ContextMenu" ||
+           methodName == "get_ToolTip" || methodName == "set_ToolTip" ||
+           methodName == "get_ToolTipBox" || methodName == "set_ToolTipBox" ||
+           methodName == "get_HasToolTip";
+}
+
 [[nodiscard]] bool IsHostRootMethod(
     const rs_sem::TypeSymbol& owner,
-    const rs_sem::FunctionSymbol& method) noexcept {
+    const rs_sem::FunctionSymbol& method,
+    SymbolId uiElementTypeId,
+    const std::unordered_map<SymbolId, SymbolId>& funcIdToDeclaringTypeId) noexcept {
     if (method.constructor || method.name == ".ctor" || method.name == ".cctor" ||
         method.name == owner.name) {
         return true;
     }
     if (method.propertyGetter || method.propertySetter ||
         StartsWith(method.name, "get_") || StartsWith(method.name, "set_")) {
+        if (IsOptionalUiElementAccessorName(method.name)) {
+            if (owner.moduleName == "Aero.UI" && owner.name == "UIElement") {
+                return false;
+            }
+            if (uiElementTypeId != 0u) {
+                const auto declIt = funcIdToDeclaringTypeId.find(method.id);
+                if (declIt != funcIdToDeclaringTypeId.end() && declIt->second == uiElementTypeId) {
+                    return false;
+                }
+            }
+        }
         return true;
     }
     if (owner.delegateType && method.name == "Invoke") {
@@ -104,6 +131,7 @@ constexpr std::uint32_t kInvalidSlot = std::numeric_limits<std::uint32_t>::max()
     const std::unordered_set<SymbolId>& liveFuncIds,
     const std::unordered_set<SymbolId>& dispatchSlotIds,
     bool isInstantiatedOwner,
+    SymbolId uiElementTypeId,
     const std::unordered_map<SymbolId, SymbolId>& funcIdToDeclaringTypeId) noexcept {
     if (owner.delegateType && method.name == "Invoke") {
         return true;
@@ -116,7 +144,8 @@ constexpr std::uint32_t kInvalidSlot = std::numeric_limits<std::uint32_t>::max()
     if (method.id != 0u && dispatchSlotIds.count(method.id) != 0u) {
         return true;
     }
-    if (isInstantiatedOwner && IsHostRootMethod(owner, method)) {
+    if (isInstantiatedOwner &&
+        IsHostRootMethod(owner, method, uiElementTypeId, funcIdToDeclaringTypeId)) {
         return true;
     }
     if (liveFuncIds.count(method.id) != 0u) {
@@ -270,6 +299,13 @@ bool PruneUnreachableStdlibMir(
             typeIdByCanonicalName.emplace(tPtr->name, tid);
         }
     }
+    const SymbolId uiElementTypeId = [&]() noexcept -> SymbolId {
+        if (const auto it = typeIdByCanonicalName.find("Aero.UI::UIElement");
+            it != typeIdByCanonicalName.end()) {
+            return it->second;
+        }
+        return 0u;
+    }();
 
     std::unordered_map<SymbolId, SymbolId> arrayTypeIdToElementTypeId;
     for (const auto& [tid, tPtr] : typeById) {
@@ -542,7 +578,20 @@ bool PruneUnreachableStdlibMir(
                 for (const auto& ctor : type.constructors) {
                     markFuncId(ctor.id);
                 }
+                auto isUiElementDeclaredAccessor = [&](SymbolId accId) noexcept -> bool {
+                    if (accId == 0u || uiElementTypeId == 0u) {
+                        return false;
+                    }
+                    const auto it = funcIdToDeclaringTypeId.find(accId);
+                    return it != funcIdToDeclaringTypeId.end() && it->second == uiElementTypeId;
+                };
                 for (const auto& prop : type.properties) {
+                    if (IsOptionalUiElementPropertyName(prop.name) &&
+                        ((type.moduleName == "Aero.UI" && type.name == "UIElement") ||
+                         (prop.getter.has_value() && isUiElementDeclaredAccessor(prop.getter->id)) ||
+                         (prop.setter.has_value() && isUiElementDeclaredAccessor(prop.setter->id)))) {
+                        continue;
+                    }
                     if (prop.getter.has_value()) {
                         markFuncId(prop.getter->id);
                     }
@@ -553,7 +602,9 @@ bool PruneUnreachableStdlibMir(
             }
             for (const auto& method : type.methods) {
                 const bool isDelegateInvoke = (type.delegateType && method.name == "Invoke");
-                if ((isInstantiated && IsHostRootMethod(type, method)) || isDelegateInvoke) {
+                if ((isInstantiated &&
+                     IsHostRootMethod(type, method, uiElementTypeId, funcIdToDeclaringTypeId)) ||
+                    isDelegateInvoke) {
                     markFuncId(method.id);
                 }
                 const bool isSlotOrVirtual =
@@ -676,7 +727,7 @@ bool PruneUnreachableStdlibMir(
                     t.methods.end(),
                     [&](const rs_sem::FunctionSymbol& m) {
                         return !ShouldRetainMethodOnType(
-                            t, m, liveFuncIds, slotIds, isInstantiatedOwner, funcIdToDeclaringTypeId);
+                            t, m, liveFuncIds, slotIds, isInstantiatedOwner, uiElementTypeId, funcIdToDeclaringTypeId);
                     }),
                 t.methods.end());
             t.constructors.erase(

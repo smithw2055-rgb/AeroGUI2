@@ -271,6 +271,7 @@ struct TextLineMetrics {
     float lineHeight = 0.0f;
     std::size_t firstGlyphIndex = 0u;
     std::size_t glyphCount = 0u;
+    std::uint32_t firstCodePointIndex = 0u;
     bool endedByNewline = false;
 };
 

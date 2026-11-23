@@ -141,7 +141,16 @@ public class Panel : FrameworkElement {
         }
     }
 
+    public override bool SetPropertyValue(string propName, DependencyObject value) {
+        if (propName == "IsItemsHost") {
+            IsItemsHost = DependencyObject.UnboxBool(value, false);
+            return true;
+        }
+        return base.SetPropertyValue(propName, value);
+    }
+
     public override DependencyObject GetPropertyValue(string propName) {
+        if (propName == "IsItemsHost") { return DependencyObject.BoxBool(IsItemsHost); }
         if (propName == "Children") {
             var col = new ArrayCollectionBox();
             UIElement[] kids = Children();
@@ -531,21 +540,34 @@ public class Grid : Panel {
         }
     }
 
+    private static GridLength CoerceDefinitionGridLength(DependencyObject val) {
+        if (val == null) { return GridLength.Auto(); }
+        if (val is GridLength) { return val as GridLength; }
+        if (val is BoxedFloat) {
+            float fv = (val as BoxedFloat).Value;
+            return ParseUtil.IsNaN(fv) ? GridLength.Auto() : GridLength.FromPixel(fv);
+        }
+        if (val is BoxedInt) {
+            return GridLength.FromPixel((float)(val as BoxedInt).Value);
+        }
+        string s = DependencyObject.UnboxString(val, "Auto").Trim();
+        if (s == "NaN" || s == "nan") { return GridLength.Auto(); }
+        return GridLength.Parse(s);
+    }
+
     public bool SetNamedDefinitionProperty(string defName, string propName, DependencyObject val) {
         if (defName == null || defName.Length == 0) { return false; }
         RowDefinition[] rows = _rowDefs.Items();
         for (int i = 0; i < rows.Length; i += 1) {
             if (rows[i].Name == defName && propName == "Height") {
-                if (val is GridLength) { rows[i].Height = val as GridLength; }
-                else { rows[i].Height = GridLength.Parse(DependencyObject.UnboxString(val, "Auto")); }
+                rows[i].Height = CoerceDefinitionGridLength(val);
                 return true;
             }
         }
         ColumnDefinition[] cols = _colDefs.Items();
         for (int i = 0; i < cols.Length; i += 1) {
             if (cols[i].Name == defName && propName == "Width") {
-                if (val is GridLength) { cols[i].Width = val as GridLength; }
-                else { cols[i].Width = GridLength.Parse(DependencyObject.UnboxString(val, "Auto")); }
+                cols[i].Width = CoerceDefinitionGridLength(val);
                 return true;
             }
         }

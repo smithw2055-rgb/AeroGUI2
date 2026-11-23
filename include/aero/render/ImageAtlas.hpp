@@ -195,6 +195,14 @@ public:
         std::uint32_t height,
         std::vector<std::uint8_t>&& rgbaPixels);
 
+    // Allocate or update a bounded-LRU standalone RGBA8 slot keyed by VisualBrush identity.
+    [[nodiscard]] bool RegisterOrUpdateVisualBrushSlot(
+        std::uint64_t cacheKey,
+        std::uint32_t width,
+        std::uint32_t height,
+        std::vector<std::uint8_t>&& rgbaPixels,
+        ImageAtlasEntry& outEntry);
+
     // Resolve URI (memory provider -> direct path -> localBaseDir -> baseDir -> searchDirs), decode & cache
     const ImageAtlasEntry* LoadOrGet(
         std::string_view uri,
@@ -275,9 +283,29 @@ private:
     std::unordered_map<std::string, ImageAtlasEntry> entries_;
     std::unordered_map<std::string, DynamicSlotCacheEntry> plasmaSlots_;
     std::unordered_map<std::string, DynamicSlotCacheEntry> riveSlots_;
+    std::unordered_map<std::uint64_t, DynamicSlotCacheEntry> visualBrushSlots_;
     std::uint64_t dynamicSlotTick_ = 0u;
     std::unordered_map<std::uint32_t, TextureSlotBuffer> textureSlots_;
 };
+
+/// Composite a decoded/procedural texture entry through an analytical supersampled
+/// SVG fill alpha mask fitted to `maskFittedRect`, caching into `store`.
+[[nodiscard]] bool CompositeMaskedPathTexture(
+    UIResourceStore& store,
+    ImageAtlas& atlas,
+    std::uint64_t pathHash,
+    std::string_view pathData,
+    const Rect& rawBounds,
+    const Rect& elemRect,
+    const Rect& maskFittedRect,
+    std::uint32_t innerW,
+    std::uint32_t innerH,
+    std::uint32_t padPx,
+    const ImageAtlasEntry& imgEntry,
+    Stretch fillStretch,
+    std::uint32_t fillTintRgba,
+    bool tileWrap,
+    RasterizedPathMaskEntry& outEntry);
 
 /// Composite an image fill (stretched into `elemRect`, optionally tiled) through an
 /// analytical supersampled SVG fill alpha mask fitted to `maskFittedRect`, caching

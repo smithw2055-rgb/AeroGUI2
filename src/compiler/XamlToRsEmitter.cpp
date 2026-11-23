@@ -2823,6 +2823,48 @@ private:
         return brushNode.FindPropertyElement("Brush", "Shader");
     }
 
+    void EmitImageBrushPlacementAttrs(
+        const XamlNode& brushNode,
+        std::string_view bVar,
+        std::ostringstream& out,
+        int indent) const {
+        if (const auto* vbAttr = brushNode.FindAttribute("Viewbox")) {
+            const std::string_view vb = aero::str::Trim(vbAttr->value);
+            if (!vb.empty()) {
+                Indent(out, indent);
+                out << bVar << ".Viewbox = " << EscapeRsString(vb) << ";\n";
+            }
+        }
+        if (const auto* vpAttr = brushNode.FindAttribute("Viewport")) {
+            const std::string_view vp = aero::str::Trim(vpAttr->value);
+            if (!vp.empty()) {
+                Indent(out, indent);
+                out << bVar << ".Viewport = " << EscapeRsString(vp) << ";\n";
+            }
+        }
+        if (const auto* vpuAttr = brushNode.FindAttribute("ViewportUnits")) {
+            const std::string_view vpu = aero::str::Trim(vpuAttr->value);
+            if (!vpu.empty()) {
+                Indent(out, indent);
+                out << bVar << ".ViewportUnits = " << EscapeRsString(vpu) << ";\n";
+            }
+        }
+        if (const auto* stAttr = brushNode.FindAttribute("Stretch")) {
+            const std::string_view st = aero::str::Trim(stAttr->value);
+            if (!st.empty()) {
+                Indent(out, indent);
+                out << bVar << ".Stretch = Stretch." << st << ";\n";
+            }
+        }
+        if (const auto* tmAttr = brushNode.FindAttribute("TileMode")) {
+            const std::string_view tmVal = aero::str::Trim(tmAttr->value);
+            if (!tmVal.empty()) {
+                Indent(out, indent);
+                out << bVar << ".TileMode = " << EscapeRsString(tmVal) << ";\n";
+            }
+        }
+    }
+
     [[nodiscard]] std::string EmitShaderFallbackBrush(
         const XamlNode& brushNode,
         const XamlNode& shaderNode,
@@ -2887,7 +2929,7 @@ private:
         }
 
         if (shName == "ConicGradientBrush") {
-            out << "var " << bVar << " = new LinearGradientBrush(0.0f, 0.5f, 1.0f, 0.5f);\n";
+            out << "var " << bVar << " = new ConicGradientBrush();\n";
             std::vector<std::pair<std::string, float>> stops;
             const XamlNode* stopContainer = shaderNode.FindPropertyElement("ConicGradientBrush", "GradientStops");
             const auto& stopNodes = (stopContainer != nullptr) ? stopContainer->children : shaderNode.children;
@@ -2926,15 +2968,25 @@ private:
         }
 
         if (shName == "SaturationBrush") {
-            out << "var " << bVar << " = new LinearGradientBrush(0.0f, 1.0f, 1.0f, 0.0f);\n";
-            Indent(out, indent);
-            out << bVar << ".AddStop(\"#FF10B981\", 0.0f);\n";
-            Indent(out, indent);
-            out << bVar << ".AddStop(\"#FFEAB308\", 0.5f);\n";
-            Indent(out, indent);
-            out << bVar << ".AddStop(\"#FFEF4444\", 1.0f);\n";
-            emitOpacity();
-            return bVar;
+            std::string baseImgSrc;
+            if (const auto* sa = brushNode.FindAttribute("ImageSource")) {
+                if (!LooksLikeMarkupExtension(sa->value)) baseImgSrc = sa->value;
+            }
+            if (!baseImgSrc.empty()) {
+                float satVal = 1.0f;
+                if (const auto* satAttr = shaderNode.FindAttribute("Saturation")) {
+                    (void)aero::str::TryParseFloat32(satAttr->value, satVal);
+                }
+                std::string satLit = FormatFloatLiteral(satVal);
+                if (!satLit.empty() && (satLit.back() == 'f' || satLit.back() == 'F')) {
+                    satLit.pop_back();
+                }
+                const std::string satUri = "shader://saturation?sat=" + satLit + "&src=" + baseImgSrc;
+                out << "var " << bVar << " = new ImageBrush(" << EscapeRsString(satUri) << ");\n";
+                EmitImageBrushPlacementAttrs(brushNode, bVar, out, indent);
+                emitOpacity();
+                return bVar;
+            }
         }
 
         out << "var " << bVar << " = new LinearGradientBrush(0.0f, 0.0f, 1.0f, 1.0f);\n";
@@ -3011,36 +3063,14 @@ private:
             if (const auto* sa = brushNode.FindAttribute("ImageSource")) {
                 if (!LooksLikeMarkupExtension(sa->value)) src = sa->value;
             }
-            if (src.empty()) {
-                if (const auto* shProp = FindBrushShaderElement(brushNode);
-                    shProp != nullptr && !shProp->children.empty()) {
-                    return EmitShaderFallbackBrush(brushNode, *shProp->children.front(), out, indent);
-                }
+            if (const auto* shProp = FindBrushShaderElement(brushNode);
+                shProp != nullptr && !shProp->children.empty()) {
+                return EmitShaderFallbackBrush(brushNode, *shProp->children.front(), out, indent);
             }
             const std::string bVar = FreshVar("ibrush");
             Indent(out, indent);
             out << "var " << bVar << " = new ImageBrush(" << EscapeRsString(src) << ");\n";
-            if (const auto* vbAttr = brushNode.FindAttribute("Viewbox")) {
-                const std::string_view vb = aero::str::Trim(vbAttr->value);
-                if (!vb.empty()) {
-                    Indent(out, indent);
-                    out << bVar << ".Viewbox = " << EscapeRsString(vb) << ";\n";
-                }
-            }
-            if (const auto* stAttr = brushNode.FindAttribute("Stretch")) {
-                const std::string_view st = aero::str::Trim(stAttr->value);
-                if (!st.empty()) {
-                    Indent(out, indent);
-                    out << bVar << ".Stretch = Stretch." << st << ";\n";
-                }
-            }
-            if (const auto* tmAttr = brushNode.FindAttribute("TileMode")) {
-                const std::string_view tmVal = aero::str::Trim(tmAttr->value);
-                if (!tmVal.empty()) {
-                    Indent(out, indent);
-                    out << bVar << ".TileMode = " << EscapeRsString(tmVal) << ";\n";
-                }
-            }
+            EmitImageBrushPlacementAttrs(brushNode, bVar, out, indent);
             if (const auto* opAttr = brushNode.FindAttribute("Opacity")) {
                 float op = 1.0f;
                 if (aero::str::TryParseFloat32(opAttr->value, op)) {
@@ -3577,6 +3607,11 @@ private:
         if (aero::str::StartsWith(propName, "DragDrop.")) {
             Indent(out, indent);
             out << "DragDrop.EnsureInstalled();\n";
+        }
+        if (propName == "ToolTip" || propName == "ToolTipService.ToolTip" ||
+            aero::str::StartsWith(propName, "ToolTipService.")) {
+            Indent(out, indent);
+            out << "ToolTipService.EnsureInstalled();\n";
         }
         std::string targetName;
         if (const auto* tnAttr = setterNode.FindAttribute("TargetName")) {
@@ -5525,10 +5560,18 @@ private:
                                propName == "Placeholder" || aero::str::StartsWith(propName, "Custom.") ||
                                aero::str::StartsWith(propName, "DragDrop.") ||
                                aero::str::StartsWith(propName, "ToolTipService.")) {
+                        if (propName == "ToolTip" || aero::str::StartsWith(propName, "ToolTipService.")) {
+                            Indent(out, indent);
+                            out << "ToolTipService.EnsureInstalled();\n";
+                        }
                         Indent(out, indent);
                         out << targetVar << ".SetPropertyBox(" << EscapeRsString(propName)
                             << ", DependencyObject.BoxObject(" << lookup << "));\n";
                     } else if ((IsDirectUIProperty(propName) || isCustomUiElementAttr) && !IsNonUIElementType(targetType)) {
+                        if (propName == "ToolTip" || aero::str::StartsWith(propName, "ToolTipService.")) {
+                            Indent(out, indent);
+                            out << "ToolTipService.EnsureInstalled();\n";
+                        }
                         Indent(out, indent);
                         out << targetVar << ".SetPropertyBox(" << EscapeRsString(propName)
                             << ", DependencyObject.BoxObject(" << lookup << "));\n";
@@ -5740,6 +5783,10 @@ private:
         if (aero::str::StartsWith(propName, "Custom.") ||
             aero::str::StartsWith(propName, "DragDrop.") ||
             aero::str::StartsWith(propName, "ToolTipService.")) {
+            if (aero::str::StartsWith(propName, "ToolTipService.")) {
+                Indent(out, indent);
+                out << "ToolTipService.EnsureInstalled();\n";
+            }
             Indent(out, indent);
             if (aero::str::EndsWith(propName, "_Int32") || aero::str::EndsWith(propName, "_Int")) {
                 const long iv = std::strtol(std::string(rawVal).c_str(), nullptr, 10);
@@ -5764,6 +5811,10 @@ private:
             propName == "IsOpen" || propName == "StaysOpen" ||
             propName == "Delay" || propName == "Interval" || propName == "CanContentScroll" ||
             (IsDirectUIProperty(propName) && !IsNonUIElementType(targetType) && propName != "Title")) {
+            if (propName == "ToolTip") {
+                Indent(out, indent);
+                out << "ToolTipService.EnsureInstalled();\n";
+            }
             Indent(out, indent);
             out << targetVar << ".SetPropertyBox(" << EscapeRsString(propName) << ", "
                 << BoxSetterValueExpr(propName, FormatTypedValueLiteral(propName, rawVal, dictVar, targetType), targetType)
@@ -5886,6 +5937,11 @@ private:
         int indent,
         std::string_view explicitSourceVar,
         std::string_view inlineConvExpr = {}) {
+        if (propName == "ToolTip" || propName == "ToolTipService.ToolTip" ||
+            aero::str::StartsWith(propName, "ToolTipService.")) {
+            Indent(out, indent);
+            out << "ToolTipService.EnsureInstalled();\n";
+        }
         if (spec.hasFallbackValue && IsDirectUIPropertyFor(targetType, propName)) {
             Indent(out, indent);
             out << targetVar << "." << propName << " = "
@@ -6492,6 +6548,8 @@ private:
             if (shortProp == "ToolTip" && !propNode->children.empty() &&
                 currentTplParentVar_.empty() &&
                 CanEmitLazyToolTipNode(*propNode->children.front(), true)) {
+                Indent(out, indent);
+                out << "ToolTipService.EnsureInstalled();\n";
                 const std::string dcParam = FreshVar("__tipDc");
                 Indent(out, indent);
                 out << targetVar << ".SetLazyToolTip((object " << dcParam << ") =>\n";
@@ -6513,6 +6571,10 @@ private:
             }
             if ((shortProp == "Content" || shortProp == "Header" || shortProp == "Icon" ||
                  shortProp == "ToolTip") && !propNode->children.empty()) {
+                if (shortProp == "ToolTip") {
+                    Indent(out, indent);
+                    out << "ToolTipService.EnsureInstalled();\n";
+                }
                 const std::string sub = EmitConstructedElement(
                     *propNode->children.front(), xDataType, dictVar, currentXamlPath, out, indent,
                     explicitBindSourceVar);

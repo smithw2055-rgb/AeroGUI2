@@ -722,6 +722,13 @@ public class Shape : FrameworkElement {
     }
     public override string GetTypeName() { return "Shape"; }
 
+    protected override void OnLoaded() {
+        base.OnLoaded();
+        if (_fill != null && _fill.NeedsLoadedRefresh()) {
+            SyncVectorShape();
+        }
+    }
+
     protected override bool IsSelfHitTestSolid() {
         return _fill != null || (_stroke != null && _strokeThickness > 0.0f);
     }
@@ -813,16 +820,7 @@ public class Shape : FrameworkElement {
         if (!ParseUtil.IsValidHandle(__nativeHandle)) { return; }
         uint fillCol = 0u;
         int fillGrad = -1;
-        if (_fill is ImageBrush) {
-            ImageBrush ib = _fill as ImageBrush;
-            Visual_SetImage(
-                __nativeHandle,
-                ib.ImageSource,
-                EnumConvert.ToInt(ib.Stretch),
-                EnumConvert.ToInt(StretchDirection.Both),
-                ParseUtil.PackArgb(255u, 255u, 255u, 255u));
-            UIElement.ApplyImageBrushViewbox(__nativeHandle, ib.Viewbox);
-            Visual_SetImageTile(__nativeHandle, ib.TileMode == "Tile");
+        if (_fill != null && _fill.ApplySurfaceToNative(this, __nativeHandle, false)) {
             _hadFillImage = true;
         } else {
             if (_hadFillImage) {
@@ -861,6 +859,9 @@ public class Shape : FrameworkElement {
             (_fill as ImageBrush).ImageSource = DependencyObject.UnboxString(value, "");
             SyncVectorShape();
             return true;
+        }
+        if (propName == "Time" && _fill is ImageBrush && (_fill as ImageBrush).IsPlasmaShader) {
+            propName = "Fill.PlasmaTime";
         }
         if ((propName == "Fill.PlasmaSeed" || propName == "Fill.PlasmaColor" ||
              propName == "Fill.PlasmaTime" || propName == "Fill.PlasmaScaleX" ||
@@ -969,7 +970,7 @@ public class Shape : FrameworkElement {
         if (propName == "Fill.PlasmaColor" && _fill is ImageBrush) {
             return DependencyObject.BoxString((_fill as ImageBrush).PlasmaColor);
         }
-        if (propName == "Fill.PlasmaTime" && _fill is ImageBrush) {
+        if (_fill is ImageBrush && (propName == "Fill.PlasmaTime" || (propName == "Time" && (_fill as ImageBrush).IsPlasmaShader))) {
             return DependencyObject.BoxFloat((_fill as ImageBrush).PlasmaTime);
         }
         if (propName == "Fill.PlasmaScaleX" && _fill is ImageBrush) {

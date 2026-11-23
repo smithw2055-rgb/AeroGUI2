@@ -203,11 +203,48 @@ public class TextBoxBase : Control {
         SyncImeState();
     }
 
+    protected static bool IsCrLfBefore(string s, int cp) {
+        if (cp < 2 || s == null) { return false; }
+        return ParseUtil.SliceCodePoints(s, cp - 2, 2) == "\r\n";
+    }
+
+    protected static bool IsCrLfAt(string s, int cp) {
+        if (cp < 0 || s == null) { return false; }
+        int total = ParseUtil.Utf8CodePointCount(s);
+        if (cp + 2 > total) { return false; }
+        return ParseUtil.SliceCodePoints(s, cp, 2) == "\r\n";
+    }
+
+    protected void EnsureCaretVisibleInScrollHost() {
+        UIElement host = GetTemplateChild("PART_ContentHost");
+        if (!(host is ScrollViewer) || _textVisual == null) { return; }
+        ScrollViewer sv = host as ScrollViewer;
+        float vh = sv.ViewportHeight;
+        if (vh <= 0.0f) { return; }
+        float lineH = Math.Maxf(FontSize * 1.28f, Visual_MeasureText("Ag", FontFamily, FontSize, 10000.0f, 0, 1));
+        string prefix = _caretCp > 0 ? ParseUtil.SliceCodePoints(_rawText, 0, _caretCp) : "";
+        float wrapW = _textVisual.ActualWidth > 4.0f ? _textVisual.ActualWidth : Math.Maxf(40.0f, sv.ViewportWidth);
+        int wrapCode = EnumConvert.ToInt(_textVisual.TextWrapping);
+        bool endsWithNl = prefix.Length > 0 && prefix.Substring(prefix.Length - 1, 1) == "\n";
+        float prefixH = prefix.Length > 0
+            ? Visual_MeasureText(endsWithNl ? (prefix + "I") : prefix, FontFamily, FontSize, wrapW, wrapCode, 1)
+            : lineH;
+        float caretBottom = Math.Maxf(lineH, prefixH);
+        float caretTop = Math.Maxf(0.0f, caretBottom - lineH);
+        float cur = sv.VerticalOffset;
+        if (caretTop < cur) {
+            sv.ScrollToVerticalOffset(caretTop);
+        } else if (caretBottom > cur + vh) {
+            sv.ScrollToVerticalOffset(Math.Maxf(0.0f, caretBottom - vh + 2.0f));
+        }
+    }
+
     public void MoveCaret(int targetCp, bool extendSelection) {
         _caretCp = ClampCp(targetCp);
         if (!extendSelection) { _anchorCp = _caretCp; }
         ResetCaretBlinkPhase();
         RefreshTextSelectionVisual();
+        EnsureCaretVisibleInScrollHost();
         SyncImeState();
     }
 
@@ -246,9 +283,11 @@ public class TextBoxBase : Control {
             return;
         }
         if (_caretCp <= 0) { return; }
-        int from = wholeWord ? ParseUtil.FindPrevWordBoundary(_rawText, _caretCp) : (_caretCp - 1);
+        int step = IsCrLfBefore(_rawText, _caretCp) ? 2 : 1;
+        int from = wholeWord ? ParseUtil.FindPrevWordBoundary(_rawText, _caretCp) : (_caretCp - step);
         _anchorCp = from;
         ReplaceSelection("");
+        EnsureCaretVisibleInScrollHost();
     }
 
     protected void DeleteForward(bool wholeWord) {
@@ -259,10 +298,12 @@ public class TextBoxBase : Control {
         }
         int totalCp = ParseUtil.Utf8CodePointCount(_rawText);
         if (_caretCp >= totalCp) { return; }
-        int to = wholeWord ? ParseUtil.FindNextWordBoundary(_rawText, _caretCp) : (_caretCp + 1);
+        int step = IsCrLfAt(_rawText, _caretCp) ? 2 : 1;
+        int to = wholeWord ? ParseUtil.FindNextWordBoundary(_rawText, _caretCp) : (_caretCp + step);
         _anchorCp = _caretCp;
         _caretCp = to;
         ReplaceSelection("");
+        EnsureCaretVisibleInScrollHost();
     }
 
     public void Copy() {
@@ -353,6 +394,8 @@ public class TextBoxBase : Control {
 
     public override void OnGotFocus() {
         base.OnGotFocus();
+        UIElement host = GetTemplateChild("PART_ContentHost");
+        if (host != null) { host.SetKeyboardFocusWithinState(true); }
         ResetCaretBlinkPhase();
         RefreshTextSelectionVisual();
         SyncImeState();
@@ -360,6 +403,8 @@ public class TextBoxBase : Control {
 
     public override void OnLostFocus() {
         base.OnLostFocus();
+        UIElement host = GetTemplateChild("PART_ContentHost");
+        if (host != null) { host.SetKeyboardFocusWithinState(false); }
         if (_activeBlinkBox == this) { _activeBlinkBox = null; }
         RefreshTextSelectionVisual();
         SyncImeState();
@@ -410,14 +455,26 @@ public class TextBoxBase : Control {
         if (ctrl && e.Key == KeyCode.V) { Paste(); e.Handled = true; return; }
 
         if (e.Key == KeyCode.Left) {
-            int next = ctrl ? ParseUtil.FindPrevWordBoundary(_rawText, _caretCp) : (_caretCp - 1);
+            int step = IsCrLfBefore(_rawText, _caretCp) ? 2 : 1;
+            int next = ctrl ? ParseUtil.FindPrevWordBoundary(_rawText, _caretCp) : (_caretCp - step);
             MoveCaret(next, shift);
             e.Handled = true;
             return;
         }
         if (e.Key == KeyCode.Right) {
-            int next = ctrl ? ParseUtil.FindNextWordBoundary(_rawText, _caretCp) : (_caretCp + 1);
+            int step = IsCrLfAt(_rawText, _caretCp) ? 2 : 1;
+            int next = ctrl ? ParseUtil.FindNextWordBoundary(_rawText, _caretCp) : (_caretCp + step);
             MoveCaret(next, shift);
+            e.Handled = true;
+            return;
+        }
+        if (e.Key == KeyCode.Up && _acceptsReturn && _textVisual != null && ParseUtil.IsValidHandle(_textVisual.__nativeHandle)) {
+            MoveCaretVertical(-1, shift);
+            e.Handled = true;
+            return;
+        }
+        if (e.Key == KeyCode.Down && _acceptsReturn && _textVisual != null && ParseUtil.IsValidHandle(_textVisual.__nativeHandle)) {
+            MoveCaretVertical(1, shift);
             e.Handled = true;
             return;
         }
@@ -425,7 +482,7 @@ public class TextBoxBase : Control {
         if (e.Key == KeyCode.End) { MoveCaret(ParseUtil.Utf8CodePointCount(_rawText), shift); e.Handled = true; return; }
         if (e.Key == KeyCode.Backspace) { DeleteBackward(ctrl); e.Handled = true; return; }
         if (e.Key == KeyCode.Delete) { DeleteForward(ctrl); e.Handled = true; return; }
-        if (e.Key == KeyCode.Enter && _acceptsReturn) { ReplaceSelection("\n"); e.Handled = true; return; }
+        if (e.Key == KeyCode.Enter && _acceptsReturn) { ReplaceSelection("\n"); EnsureCaretVisibleInScrollHost(); e.Handled = true; return; }
     }
 
     public override void OnTextInput(TextCompositionEventArgs e) {
@@ -457,14 +514,20 @@ public class TextBoxBase : Control {
             _textVisual.Margin = new Thickness(2.0f, 0.0f, 2.0f, 0.0f);
             if (host is ContentControl) {
                 ContentControl cc = host as ContentControl;
+                DependencyObject expVBar = GetPropertyValue("ScrollViewer.VerticalScrollBarVisibility");
+                DependencyObject expHBar = GetPropertyValue("ScrollViewer.HorizontalScrollBarVisibility");
                 if (cc.Template == null) {
-                    cc.SetPropertyValue("HorizontalScrollBarVisibility", DependencyObject.BoxString("Hidden"));
-                    cc.SetPropertyValue("VerticalScrollBarVisibility", DependencyObject.BoxString(_acceptsReturn ? "Auto" : "Disabled"));
+                    cc.SetPropertyValue("HorizontalScrollBarVisibility", expHBar != null ? expHBar : DependencyObject.BoxString("Hidden"));
+                    cc.SetPropertyValue("VerticalScrollBarVisibility", expVBar != null ? expVBar : DependencyObject.BoxString(_acceptsReturn ? "Auto" : "Disabled"));
                     cc.BorderThickness = new Thickness(0.0f);
                     if (cc.Background == null) {
                         cc.Background = Brushes.Transparent();
                     }
+                } else {
+                    if (expHBar != null) { cc.SetPropertyValue("HorizontalScrollBarVisibility", expHBar); }
+                    if (expVBar != null) { cc.SetPropertyValue("VerticalScrollBarVisibility", expVBar); }
                 }
+                if (IsFocused) { cc.SetKeyboardFocusWithinState(true); }
                 cc.Content = _textVisual;
             } else if (host is Decorator) {
                 (host as Decorator).Child = _textVisual;
@@ -514,7 +577,49 @@ public class TextBoxBase : Control {
         }
         if (propName == "CaretBrush") { CaretBrush = UIElement.CoerceBrush(value); return true; }
         if (propName == "SelectionBrush") { SelectionBrush = UIElement.CoerceBrush(value); return true; }
+        if (propName == "ScrollViewer.VerticalScrollBarVisibility" || propName == "VerticalScrollBarVisibility") {
+            base.SetPropertyValue("ScrollViewer.VerticalScrollBarVisibility", value);
+            UIElement host = GetTemplateChild("PART_ContentHost");
+            if (host != null) { host.SetPropertyValue("VerticalScrollBarVisibility", value); }
+            return true;
+        }
+        if (propName == "ScrollViewer.HorizontalScrollBarVisibility" || propName == "HorizontalScrollBarVisibility") {
+            base.SetPropertyValue("ScrollViewer.HorizontalScrollBarVisibility", value);
+            UIElement host = GetTemplateChild("PART_ContentHost");
+            if (host != null) { host.SetPropertyValue("HorizontalScrollBarVisibility", value); }
+            return true;
+        }
         return base.SetPropertyValue(propName, value);
+
+    }
+
+    protected void MoveCaretVertical(int dir, bool extendSelection) {
+        if (_textVisual == null || !ParseUtil.IsValidHandle(_textVisual.__nativeHandle)) { return; }
+        int total = ParseUtil.Utf8CodePointCount(_rawText);
+        int lineStart = _caretCp;
+        while (lineStart > 0) {
+            string prevCh = ParseUtil.SliceCodePoints(_rawText, lineStart - 1, 1);
+            if (prevCh == "\n") { break; }
+            lineStart -= 1;
+        }
+        string linePrefix = _caretCp > lineStart ? ParseUtil.SliceCodePoints(_rawText, lineStart, _caretCp - lineStart) : "";
+        float x = linePrefix.Length > 0 ? Visual_MeasureText(linePrefix, FontFamily, FontSize, 100000.0f, 0, 0) : 0.0f;
+        float lineH = Math.Maxf(FontSize * 1.25f, Visual_MeasureText("Ag", FontFamily, FontSize, 10000.0f, 0, 1));
+        string fullPrefix = _caretCp > 0 ? ParseUtil.SliceCodePoints(_rawText, 0, _caretCp) : "";
+        float wrapW = _textVisual.ActualWidth > 4.0f ? _textVisual.ActualWidth : 400.0f;
+        bool endsWithNl = fullPrefix.Length > 0 && fullPrefix.Substring(fullPrefix.Length - 1, 1) == "\n";
+        float curBottom = fullPrefix.Length > 0
+            ? Visual_MeasureText(endsWithNl ? (fullPrefix + "I") : fullPrefix, FontFamily, FontSize, wrapW, EnumConvert.ToInt(_textVisual.TextWrapping), 1)
+            : lineH;
+        float curMidY = Math.Maxf(lineH * 0.5f, curBottom - lineH * 0.5f);
+        float targetY = curMidY + (float)dir * lineH;
+        if (targetY < 0.0f) { MoveCaret(0, extendSelection); return; }
+        float padL = _textVisual.Padding != null ? Math.Maxf(0.0f, _textVisual.Padding.Left) : 0.0f;
+        float padT = _textVisual.Padding != null ? Math.Maxf(0.0f, _textVisual.Padding.Top) : 0.0f;
+        int hit = Visual_HitTestTextCp(_textVisual.__nativeHandle, x + padL, targetY + padT);
+        if (hit == _caretCp && dir > 0 && _caretCp < total) { hit = total; }
+        else if (hit == _caretCp && dir < 0 && _caretCp > 0) { hit = 0; }
+        MoveCaret(hit, extendSelection);
     }
 
     public override DependencyObject GetPropertyValue(string propName) {
@@ -582,6 +687,39 @@ public class TextBox : TextBoxBase {
         }
     }
 
+    private int _maxLines = 0;
+    private int _minLines = 1;
+    private bool _hasLineCountMaxH = false;
+    private bool _hasLineCountMinH = false;
+
+    private void SyncLineCountHeight() {
+        if (_maxLines > 0 || _minLines > 1) {
+            float lineH = Math.Maxf(FontSize * 1.28f, Visual_MeasureText("Ag", FontFamily, FontSize, 10000.0f, 0, 1));
+            float chromeV = Padding.Top + Padding.Bottom + BorderThickness.Top + BorderThickness.Bottom + 4.0f;
+            if (_maxLines > 0) {
+                MaxHeight = (float)_maxLines * lineH + chromeV;
+                _hasLineCountMaxH = true;
+            }
+            if (_minLines > 1) {
+                MinHeight = (float)_minLines * lineH + chromeV;
+                _hasLineCountMinH = true;
+            }
+        }
+        if (_maxLines == 0 && _hasLineCountMaxH) {
+            _hasLineCountMaxH = false;
+            MaxHeight = ParseUtil.PositiveInfinity();
+        }
+        if (_minLines <= 1 && _hasLineCountMinH) {
+            _hasLineCountMinH = false;
+            MinHeight = 0.0f;
+        }
+    }
+
+    protected override void OnTypographyChanged() {
+        base.OnTypographyChanged();
+        if (_maxLines > 0 || _minLines > 1) { SyncLineCountHeight(); }
+    }
+
     public override void OnApplyTemplate() {
         base.OnApplyTemplate();
         if (_textVisual != null) {
@@ -590,12 +728,21 @@ public class TextBox : TextBoxBase {
         }
         UIElement host = GetTemplateChild("PART_ContentHost");
         if (host is ContentControl && _textWrapping != TextWrapping.NoWrap) {
-            host.SetPropertyValue("HorizontalScrollBarVisibility", DependencyObject.BoxString("Disabled"));
+            if (GetPropertyValue("ScrollViewer.HorizontalScrollBarVisibility") == null) {
+                host.SetPropertyValue("HorizontalScrollBarVisibility", DependencyObject.BoxString("Disabled"));
+            }
         }
+        if (_maxLines > 0 || _minLines > 1) { SyncLineCountHeight(); }
     }
 
-    public int MaxLines { get; set; } = 0;
-    public int MinLines { get; set; } = 1;
+    public int MaxLines {
+        get { return _maxLines; }
+        set { _maxLines = value > 0 ? value : 0; SyncLineCountHeight(); }
+    }
+    public int MinLines {
+        get { return _minLines; }
+        set { _minLines = value > 1 ? value : 1; SyncLineCountHeight(); }
+    }
 
     protected override void OnRawTextChanged(string newRaw) {
         BindingEngine.NotifyTargetPropertyChanged(this, "Text", DependencyObject.BoxString(newRaw));

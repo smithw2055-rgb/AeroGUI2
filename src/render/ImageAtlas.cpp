@@ -2969,6 +2969,67 @@ std::uint32_t ImageAtlas::RegisterOrUpdateRgbaTextureSlot(
     return texId;
 }
 
+bool ImageAtlas::RegisterOrUpdateVisualBrushSlot(
+    std::uint64_t cacheKey,
+    std::uint32_t width,
+    std::uint32_t height,
+    std::vector<std::uint8_t>&& rgbaPixels,
+    ImageAtlasEntry& outEntry) {
+    constexpr std::size_t kMaxVisualBrushSlotCache = 64u;
+    if (width == 0u || height == 0u ||
+        rgbaPixels.size() != static_cast<std::size_t>(width) * static_cast<std::size_t>(height) * 4u) {
+        return false;
+    }
+
+    std::uint32_t reuseSlotId = 0u;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (const auto it = visualBrushSlots_.find(cacheKey); it != visualBrushSlots_.end()) {
+            if (textureSlots_.find(it->second.entry.textureId) != textureSlots_.end()) {
+                reuseSlotId = it->second.entry.textureId;
+            }
+        } else if (visualBrushSlots_.size() >= kMaxVisualBrushSlotCache) {
+            auto lruIt = visualBrushSlots_.begin();
+            for (auto it = visualBrushSlots_.begin(); it != visualBrushSlots_.end(); ++it) {
+                if (it->second.lastUsedTick < lruIt->second.lastUsedTick) {
+                    lruIt = it;
+                }
+            }
+            reuseSlotId = lruIt->second.entry.textureId;
+            visualBrushSlots_.erase(lruIt);
+        }
+    }
+
+    const std::uint32_t finalTexId = RegisterOrUpdateRgbaTextureSlot(
+        reuseSlotId, width, height, std::move(rgbaPixels));
+    if (finalTexId == 0u) {
+        return false;
+    }
+
+    std::lock_guard<std::mutex> lock(mutex_);
+    DynamicSlotCacheEntry& cached = visualBrushSlots_[cacheKey];
+    if (cached.slotKey.empty()) {
+        cached.slotKey = "__visualbrush__/" + std::to_string(cacheKey);
+    }
+    cached.currentExactUri = cached.slotKey;
+    cached.lastUsedTick = ++dynamicSlotTick_;
+    cached.entry.uriKey = cached.slotKey;
+    cached.entry.textureId = finalTexId;
+    cached.entry.width = width;
+    cached.entry.height = height;
+    cached.entry.atlasX = 0u;
+    cached.entry.atlasY = 0u;
+    cached.entry.atlasWidth = width;
+    cached.entry.atlasHeight = height;
+    cached.entry.u0 = 0.0f;
+    cached.entry.v0 = 0.0f;
+    cached.entry.u1 = 1.0f;
+    cached.entry.v1 = 1.0f;
+    cached.entry.isStandalone = true;
+    outEntry = cached.entry;
+    return true;
+}
+
 std::string ImageAtlas::ResolveExistingFileLocked(
     std::string_view cleanRelOrAbs,
     std::string_view localBaseDir) const {
@@ -3168,21 +3229,18 @@ bool ParsePlasmaShaderUri(std::string_view uri, PlasmaShaderParams& outParams, s
 }
 
 bool SynthesizePlasmaShaderImageFromParams(const PlasmaShaderParams& params, DecodedImage& outImg) {
-    float baseR = 0.004f, baseG = 0.737f, baseB = 1.0f, baseA = 1.0f;
-    std::string_view hex = params.colorHex;
-    if (!hex.empty() && hex.front() == '#') hex.remove_prefix(1u);
-    if (hex.size() == 8u || hex.size() == 6u) {
-        const unsigned long val = std::strtoul(std::string(hex).c_str(), nullptr, 16);
-        if (hex.size() == 8u) {
-            baseA = static_cast<float>((val >> 24u) & 0xFFu) / 255.0f;
-            baseR = static_cast<float>((val >> 16u) & 0xFFu) / 255.0f;
-            baseG = static_cast<float>((val >> 8u) & 0xFFu) / 255.0f;
-            baseB = static_cast<float>(val & 0xFFu) / 255.0f;
-        } else {
-            baseR = static_cast<float>((val >> 16u) & 0xFFu) / 255.0f;
-            baseG = static_cast<float>((val >> 8u) & 0xFFu) / 255.0f;
-            baseB = static_cast<float>(val & 0xFFu) / 255.0f;
-        }
+    float baseR = 0.118f, baseG = 0.565f, baseB = 1.0f, baseA = 1.0f;
+    std::string cleanCol = params.colorHex;
+    if (cleanCol.size() >= 3u && cleanCol.substr(0u, 3u) == "%23") {
+        cleanCol = "#" + cleanCol.substr(3u);
+    }
+    if (!cleanCol.empty()) {
+        std::uint32_t rgba = ParseColorRgba32(cleanCol);
+        if (rgba == 0u) { rgba = 0xFFFF901Eu; }
+        baseR = static_cast<float>(rgba & 0xFFu) / 255.0f;
+        baseG = static_cast<float>((rgba >> 8u) & 0xFFu) / 255.0f;
+        baseB = static_cast<float>((rgba >> 16u) & 0xFFu) / 255.0f;
+        baseA = static_cast<float>((rgba >> 24u) & 0xFFu) / 255.0f;
     }
 
     const std::uint32_t w = static_cast<std::uint32_t>(std::lround(params.vw));
@@ -3196,29 +3254,28 @@ bool SynthesizePlasmaShaderImageFromParams(const PlasmaShaderParams& params, Dec
     const float t = params.timeSec * 0.5f;
     const float invSx = 1.0f / params.sx;
     const float invSy = 1.0f / params.sy;
+    const float hiR = std::clamp(baseR * 0.25f, 0.0f, 1.0f);
+    const float hiG = std::clamp(baseG * 0.6f + 0.42f, 0.0f, 1.0f);
+    const float hiB = std::clamp(baseB * 0.8f + 0.25f, 0.0f, 1.0f);
     for (std::uint32_t py = 0u; py < h; ++py) {
         const float ny = (static_cast<float>(py) + 0.5f) * invSy;
         for (std::uint32_t px = 0u; px < w; ++px) {
             const float nx = (static_cast<float>(px) + 0.5f) * invSx;
-            const float wx = Perlin2D(nx * 0.55f + t * 0.25f, ny * 0.55f - t * 0.15f, seedInt + 17);
-            const float wy = Perlin2D(nx * 0.55f - t * 0.2f, ny * 0.55f + t * 0.22f, seedInt + 53);
-            const float nDetail = 0.45f * Perlin2D((nx + wx * 1.3f) * 0.95f, (ny + wy * 1.3f) * 0.95f, seedInt + 97);
-            const float phase = ny * 1.35f + 0.55f * std::sin(nx * 1.45f + wx * 3.4f + t * 0.35f) + (wy + nDetail) * 1.65f;
-            const float ribbon = 1.0f - std::min(1.0f, std::fabs(std::sin(phase * 3.14159265f)) * 2.15f);
-            const float pocket = std::max(0.0f, 1.0f - std::hypot(wx * 2.1f, wy * 2.1f));
-            const float v = std::clamp(std::max(ribbon, pocket * 0.92f), 0.0f, 1.0f);
-            const float glow = v * v * (2.2f - 0.6f * v);
-            const float core = std::max(0.0f, (v - 0.52f) / 0.48f);
-            const float whiteCore = core * core * 0.95f;
-
-            const float outR = std::clamp(baseR * glow + whiteCore, 0.0f, 1.0f);
-            const float outG = std::clamp(baseG * glow + whiteCore, 0.0f, 1.0f);
-            const float outB = std::clamp(baseB * glow + whiteCore * (0.45f + 0.55f * baseB), 0.0f, 1.0f);
+            const float f0 = Perlin2D(nx * 1.65f + t * 0.25f, ny * 1.65f - t * 0.18f, seedInt + 17);
+            const float f1 = 0.52f * Perlin2D(nx * 3.1f - t * 0.22f, ny * 3.1f + t * 0.24f, seedInt + 53);
+            const float field = (f0 + f1) * 2.55f + 0.22f * std::sin((nx + ny) * 3.14159265f + t * 0.4f);
+            const float wave = std::fabs(std::sin(field * 3.14159265f));
+            const float band = std::clamp((0.46f - wave) / 0.46f, 0.0f, 1.0f);
+            const float alpha = band * band * (3.0f - 2.0f * band);
+            const float ridge = std::clamp((band - 0.35f) / 0.65f, 0.0f, 1.0f);
+            const float outR = hiR + (baseR - hiR) * ridge;
+            const float outG = hiG + (baseG - hiG) * ridge;
+            const float outB = hiB + (baseB - hiB) * ridge;
             std::uint8_t* dst = outImg.rgbaPixels.data() + (static_cast<std::size_t>(py) * w + px) * 4u;
-            dst[0] = static_cast<std::uint8_t>(outR * 255.0f + 0.5f);
-            dst[1] = static_cast<std::uint8_t>(outG * 255.0f + 0.5f);
-            dst[2] = static_cast<std::uint8_t>(outB * 255.0f + 0.5f);
-            dst[3] = static_cast<std::uint8_t>(std::clamp(baseA, 0.0f, 1.0f) * 255.0f + 0.5f);
+            dst[0] = static_cast<std::uint8_t>(std::clamp(outR, 0.0f, 1.0f) * 255.0f + 0.5f);
+            dst[1] = static_cast<std::uint8_t>(std::clamp(outG, 0.0f, 1.0f) * 255.0f + 0.5f);
+            dst[2] = static_cast<std::uint8_t>(std::clamp(outB, 0.0f, 1.0f) * 255.0f + 0.5f);
+            dst[3] = static_cast<std::uint8_t>(std::clamp(baseA * alpha, 0.0f, 1.0f) * 255.0f + 0.5f);
         }
     }
     return true;
@@ -3229,6 +3286,96 @@ bool SynthesizePlasmaShaderImageFromParams(const PlasmaShaderParams& params, Dec
 const ImageAtlasEntry* ImageAtlas::LoadOrGet(
     std::string_view uri,
     std::string_view localBaseDir) {
+    if (uri.size() >= 20u && uri.substr(0u, 20u) == "shader://saturation?") {
+        struct SatDepthGuard {
+            int& depth;
+            explicit SatDepthGuard(int& d) noexcept : depth(d) { ++depth; }
+            ~SatDepthGuard() noexcept { --depth; }
+        };
+        thread_local int sSatDepth = 0;
+        if (sSatDepth >= 2) {
+            return nullptr;
+        }
+        SatDepthGuard depthGuard(sSatDepth);
+
+        std::string srcParam;
+        float sat = 1.0f;
+        std::string_view q = uri.substr(20u);
+        while (!q.empty()) {
+            if (q.size() >= 4u && q.substr(0u, 4u) == "src=") {
+                const std::string_view rest = q.substr(4u);
+                // Preserve nested query params inside `src=` (e.g. `shader://plasma?w=...&h=...`),
+                // stopping only if a trailing `&sat=` parameter follows `src=`.
+                if (const std::size_t satTail = rest.find("&sat="); satTail != std::string_view::npos) {
+                    srcParam = std::string(rest.substr(0u, satTail));
+                    q = rest.substr(satTail + 1u);
+                    continue;
+                }
+                srcParam = std::string(rest);
+                break;
+            }
+            const std::size_t amp = q.find('&');
+            const std::string_view kv = (amp != std::string_view::npos) ? q.substr(0u, amp) : q;
+            if (const std::size_t eq = kv.find('='); eq != std::string_view::npos) {
+                const std::string_view k = kv.substr(0u, eq);
+                const std::string v(kv.substr(eq + 1u));
+                if (k == "sat") sat = std::clamp(std::strtof(v.c_str(), nullptr), 0.0f, 4.0f);
+            }
+            if (amp == std::string_view::npos) break;
+            q.remove_prefix(amp + 1u);
+        }
+        if (srcParam.empty() ||
+            (srcParam.size() >= 20u && srcParam.substr(0u, 20u) == "shader://saturation?")) {
+            return nullptr;
+        }
+        const ImageAtlasEntry* baseEntry = LoadOrGet(srcParam, localBaseDir);
+        if (!baseEntry || baseEntry->width == 0u || baseEntry->height == 0u) {
+            return nullptr;
+        }
+        // Snapshot entry fields immediately so subsequent dynamic-slot evictions cannot dangle.
+        const ImageAtlasEntry baseCopy = *baseEntry;
+        const std::string satKey = "shader://sat_cached?sat=" +
+            std::to_string(std::lround(sat * 1000.0f)) + "&src=" + baseCopy.uriKey;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (const auto it = entries_.find(satKey); it != entries_.end()) {
+                return &it->second;
+            }
+        }
+        std::uint32_t slotW = 0u, slotH = 0u;
+        std::shared_ptr<const std::vector<std::uint8_t>> slotPixels;
+        if (!TryGetTextureSlotSnapshot(baseCopy.textureId, slotW, slotH, slotPixels) ||
+            !slotPixels || slotW == 0u || slotH == 0u ||
+            slotPixels->size() < static_cast<std::size_t>(slotW) * static_cast<std::size_t>(slotH) * 4u) {
+            return FindLoaded(srcParam, localBaseDir);
+        }
+        DecodedImage satImg{};
+        satImg.width = baseCopy.width;
+        satImg.height = baseCopy.height;
+        satImg.format = ImageFormat::RawRgba8;
+        satImg.rgbaPixels.resize(static_cast<std::size_t>(satImg.width) * satImg.height * 4u);
+        const std::uint32_t offX = baseCopy.isStandalone ? 0u : baseCopy.atlasX;
+        const std::uint32_t offY = baseCopy.isStandalone ? 0u : baseCopy.atlasY;
+        const std::uint8_t* srcData = slotPixels->data();
+        for (std::uint32_t py = 0u; py < satImg.height; ++py) {
+            const std::uint32_t sy = std::min(offY + py, slotH - 1u);
+            for (std::uint32_t px = 0u; px < satImg.width; ++px) {
+                const std::uint32_t sx = std::min(offX + px, slotW - 1u);
+                const std::uint8_t* sp = srcData + (static_cast<std::size_t>(sy) * slotW + sx) * 4u;
+                const float r = static_cast<float>(sp[0]);
+                const float g = static_cast<float>(sp[1]);
+                const float b = static_cast<float>(sp[2]);
+                const float lum = 0.2126f * r + 0.7152f * g + 0.0722f * b;
+                std::uint8_t* dp = satImg.rgbaPixels.data() + (static_cast<std::size_t>(py) * satImg.width + px) * 4u;
+                dp[0] = static_cast<std::uint8_t>(std::clamp(lum + sat * (r - lum), 0.0f, 255.0f) + 0.5f);
+                dp[1] = static_cast<std::uint8_t>(std::clamp(lum + sat * (g - lum), 0.0f, 255.0f) + 0.5f);
+                dp[2] = static_cast<std::uint8_t>(std::clamp(lum + sat * (b - lum), 0.0f, 255.0f) + 0.5f);
+                dp[3] = sp[3];
+            }
+        }
+        std::lock_guard<std::mutex> lock(mutex_);
+        return InsertDecodedLocked(satKey, std::move(satImg), false);
+    }
     if (uri.size() >= 16u && uri.substr(0u, 16u) == "shader://plasma?") {
         constexpr std::size_t kMaxPlasmaSlotCache = 64u;
         PlasmaShaderParams params{};
@@ -3666,13 +3813,14 @@ void ImageAtlas::Clear() noexcept {
     entries_.clear();
     plasmaSlots_.clear();
     riveSlots_.clear();
+    visualBrushSlots_.clear();
     dynamicSlotTick_ = 0u;
     textureSlots_.clear();
     nextStandaloneTextureId_ = 1u;
     revision_.fetch_add(1u, std::memory_order_release);
 }
 
-bool CompositeMaskedPathImage(
+bool CompositeMaskedPathTexture(
     UIResourceStore& store,
     ImageAtlas& atlas,
     std::uint64_t pathHash,
@@ -3683,32 +3831,29 @@ bool CompositeMaskedPathImage(
     std::uint32_t innerW,
     std::uint32_t innerH,
     std::uint32_t padPx,
-    std::string_view fillImageUri,
+    const ImageAtlasEntry& imgEntry,
     Stretch fillStretch,
     std::uint32_t fillTintRgba,
     bool tileWrap,
     RasterizedPathMaskEntry& outEntry) {
-    if (pathData.empty() || fillImageUri.empty()) {
-        return false;
-    }
-    const ImageAtlasEntry* imgEntry = atlas.LoadOrGet(fillImageUri);
-    if (!imgEntry || imgEntry->width == 0u || imgEntry->height == 0u) {
+    if (pathData.empty() || imgEntry.width == 0u || imgEntry.height == 0u) {
         return false;
     }
 
     std::uint32_t slotW = 0u;
     std::uint32_t slotH = 0u;
     std::shared_ptr<const std::vector<std::uint8_t>> slotPixels;
-    if (!atlas.TryGetTextureSlotSnapshot(imgEntry->textureId, slotW, slotH, slotPixels) ||
-        slotW == 0u || slotH == 0u || !slotPixels) {
+    if (!atlas.TryGetTextureSlotSnapshot(imgEntry.textureId, slotW, slotH, slotPixels) ||
+        slotW == 0u || slotH == 0u || !slotPixels ||
+        slotPixels->size() < static_cast<std::size_t>(slotW) * static_cast<std::size_t>(slotH) * 4u) {
         return false;
     }
 
     const std::uint64_t safeHash = (pathHash != 0ull) ? pathHash : ComputeSvgPathHash(pathData);
     const std::uint32_t clampedW = std::clamp<std::uint32_t>(innerW, 1u, 2048u);
     const std::uint32_t clampedH = std::clamp<std::uint32_t>(innerH, 1u, 2048u);
-    const std::uint32_t clampedPad = std::min<std::uint32_t>(padPx, 64u);
-    const std::uint64_t texRev = atlas.GetTextureSlotRevision(imgEntry->textureId);
+    const std::uint32_t clampedPad = std::min<std::uint32_t>(padPx, 256u);
+    const std::uint64_t texRev = atlas.GetTextureSlotRevision(imgEntry.textureId);
 
     std::uint64_t key = safeHash ^ 0xA341316C98765431ULL;
     auto mixU64 = [&](std::uint64_t v) noexcept {
@@ -3724,11 +3869,15 @@ bool CompositeMaskedPathImage(
 
     mixU64((static_cast<std::uint64_t>(clampedW) << 32u) | static_cast<std::uint64_t>(clampedH));
     mixU64(static_cast<std::uint64_t>(clampedPad));
-    for (unsigned char ch : fillImageUri) {
+    for (unsigned char ch : imgEntry.uriKey) {
         mixU64(static_cast<std::uint64_t>(ch));
     }
-    mixU64((static_cast<std::uint64_t>(imgEntry->textureId) << 32u) ^ texRev);
-    mixU64((static_cast<std::uint64_t>(imgEntry->width) << 32u) | static_cast<std::uint64_t>(imgEntry->height));
+    mixU64((static_cast<std::uint64_t>(imgEntry.textureId) << 32u) ^ texRev);
+    mixU64((static_cast<std::uint64_t>(imgEntry.width) << 32u) | static_cast<std::uint64_t>(imgEntry.height));
+    mixFloat(imgEntry.u0);
+    mixFloat(imgEntry.v0);
+    mixFloat(imgEntry.u1);
+    mixFloat(imgEntry.v1);
     mixU64((static_cast<std::uint64_t>(fillStretch) << 33u) ^
            (static_cast<std::uint64_t>(fillTintRgba) << 1u) ^
            (tileWrap ? 1ull : 0ull));
@@ -3763,14 +3912,14 @@ bool CompositeMaskedPathImage(
 
     const ImageStretchPlacement place = ComputeImageStretchPlacement(
         elemRect,
-        static_cast<float>(imgEntry->width),
-        static_cast<float>(imgEntry->height),
+        static_cast<float>(imgEntry.width),
+        static_cast<float>(imgEntry.height),
         fillStretch,
         StretchDirection::Both,
-        imgEntry->u0,
-        imgEntry->v0,
-        imgEntry->u1,
-        imgEntry->v1);
+        imgEntry.u0,
+        imgEntry.v0,
+        imgEntry.u1,
+        imgEntry.v1);
 
     constexpr float kInv255 = 1.0f / 255.0f;
     // Colors are packed in 0xAABBGGRR format (R = low byte, B = bits 16..23)
@@ -3858,6 +4007,48 @@ bool CompositeMaskedPathImage(
     const float u1 = static_cast<float>(clampedPad + clampedW) / static_cast<float>(texW);
     const float v1 = static_cast<float>(clampedPad + clampedH) / static_cast<float>(texH);
     return store.StoreCachedPathMask(key, texW, texH, u0, v0, u1, v1, std::move(maskRgba), outEntry);
+}
+
+bool CompositeMaskedPathImage(
+    UIResourceStore& store,
+    ImageAtlas& atlas,
+    std::uint64_t pathHash,
+    std::string_view pathData,
+    const Rect& rawBounds,
+    const Rect& elemRect,
+    const Rect& maskFittedRect,
+    std::uint32_t innerW,
+    std::uint32_t innerH,
+    std::uint32_t padPx,
+    std::string_view fillImageUri,
+    Stretch fillStretch,
+    std::uint32_t fillTintRgba,
+    bool tileWrap,
+    RasterizedPathMaskEntry& outEntry) {
+    if (pathData.empty() || fillImageUri.empty()) {
+        return false;
+    }
+    const ImageAtlasEntry* imgEntry = atlas.LoadOrGet(fillImageUri);
+    if (!imgEntry || imgEntry->width == 0u || imgEntry->height == 0u) {
+        return false;
+    }
+    const ImageAtlasEntry entryCopy = *imgEntry;
+    return CompositeMaskedPathTexture(
+        store,
+        atlas,
+        pathHash,
+        pathData,
+        rawBounds,
+        elemRect,
+        maskFittedRect,
+        innerW,
+        innerH,
+        padPx,
+        entryCopy,
+        fillStretch,
+        fillTintRgba,
+        tileWrap,
+        outEntry);
 }
 
 } // namespace aero

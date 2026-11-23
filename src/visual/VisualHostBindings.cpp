@@ -1358,6 +1358,16 @@ bool RegisterVisualHostBindings(
         const std::uint32_t id = world.ResourceStore()->GradientBrushes().RegisterBrush(std::move(desc));
         return rs_rt::Value{static_cast<std::int64_t>(id)};
     });
+    ok &= bindFn("Visual_RegisterConicGradient", [&world, &domains](const rs_bc::FunctionReference&, rs_rt::ValueSpan args, rs_rt::RuntimeError&) -> std::optional<rs_rt::Value> {
+        GradientBrushDesc desc{};
+        desc.kind = GradientBrushKind::Conic;
+        desc.center = Point{ArgFloat(args, 0, 0.5f), ArgFloat(args, 1, 0.5f)};
+        desc.spreadMethod = static_cast<GradientSpreadMethod>(ArgInt(args, 2, 0));
+        desc.mappingMode = static_cast<BrushMappingMode>(ArgInt(args, 3, 0));
+        ParseStopsSpec(ArgString(domains, args, 4), desc);
+        const std::uint32_t id = world.ResourceStore()->GradientBrushes().RegisterBrush(std::move(desc));
+        return rs_rt::Value{static_cast<std::int64_t>(id)};
+    });
     ok &= bindFn("Visual_SetTransform2D", [&world](const rs_bc::FunctionReference&, rs_rt::ValueSpan args, rs_rt::RuntimeError&) -> std::optional<rs_rt::Value> {
         (void)world.SetTransform2D(
             ArgNode(args, 0, world),
@@ -1435,6 +1445,14 @@ bool RegisterVisualHostBindings(
             static_cast<std::int32_t>(ArgInt(args, 2, -1)),
             ArgUInt(args, 3, 0xFFFFFFFFu),
             ArgFloat(args, 4, 1.0f));
+        return rs_rt::Value{std::int64_t{0}};
+    });
+    ok &= bindFn("Visual_SetBlendMode", [&world](const rs_bc::FunctionReference&, rs_rt::ValueSpan args, rs_rt::RuntimeError&) -> std::optional<rs_rt::Value> {
+        const int rawMode = static_cast<int>(ArgInt(args, 1, 0));
+        const BlendingMode mode = (rawMode >= 0 && rawMode <= 3)
+            ? static_cast<BlendingMode>(rawMode)
+            : BlendingMode::Normal;
+        (void)world.SetBlendMode(ArgNode(args, 0, world), mode);
         return rs_rt::Value{std::int64_t{0}};
     });
 
@@ -1531,6 +1549,25 @@ bool RegisterVisualHostBindings(
             ArgFloat(args, 2, 0.0f),
             ArgFloat(args, 3, 1.0f),
             ArgFloat(args, 4, 1.0f));
+        return rs_rt::Value{std::int64_t{0}};
+    });
+    ok &= bindFn("Visual_SetImageViewport", [&world](const rs_bc::FunctionReference&, rs_rt::ValueSpan args, rs_rt::RuntimeError&) -> std::optional<rs_rt::Value> {
+        (void)world.SetImageViewport(
+            ArgNode(args, 0, world),
+            ArgFloat(args, 1, 0.0f),
+            ArgFloat(args, 2, 0.0f),
+            ArgFloat(args, 3, 1.0f),
+            ArgFloat(args, 4, 1.0f),
+            ArgBool(args, 5, false),
+            ArgBool(args, 6, false));
+        return rs_rt::Value{std::int64_t{0}};
+    });
+    ok &= bindFn("Visual_SetVisualBrushSource", [&world](const rs_bc::FunctionReference&, rs_rt::ValueSpan args, rs_rt::RuntimeError&) -> std::optional<rs_rt::Value> {
+        (void)world.SetVisualBrushSource(
+            ArgNode(args, 0, world),
+            ArgNode(args, 1, world),
+            static_cast<int>(ArgInt(args, 2, 1)),
+            static_cast<int>(ArgInt(args, 3, 1)));
         return rs_rt::Value{std::int64_t{0}};
     });
     ok &= bindFn("Visual_SetImageTile", [&world](const rs_bc::FunctionReference&, rs_rt::ValueSpan args, rs_rt::RuntimeError&) -> std::optional<rs_rt::Value> {
