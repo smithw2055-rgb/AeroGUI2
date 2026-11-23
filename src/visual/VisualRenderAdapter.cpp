@@ -897,9 +897,12 @@ std::size_t VisualRenderAdapter::EmitTextVisual(
             std::max(0.0f, rect.height - padT - padB)};
 
         UIResourceStore* store = tree.ResourceStore() ? tree.ResourceStore() : &UIResourceStore::Default();
-        const float maxW = (txt.wrap == TextWrapping::NoWrap)
+        const float maxW = (txt.wrap == TextWrapping::NoWrap && txt.trim == TextTrimming::None)
             ? 1000000.0f
             : std::max(1.0f, textRect.width);
+        const float maxH = (txt.trim == TextTrimming::None)
+            ? 1000000.0f
+            : std::max(1.0f, textRect.height);
         TextLayoutResult measured{};
         if (!txt.richSpans.empty()) {
             std::vector<RichTextRunInput> runs;
@@ -926,7 +929,9 @@ std::size_t VisualRenderAdapter::EmitTextVisual(
                 txt.wrap,
                 txt.charSpacing,
                 txt.lineHeight,
-                node.layout.effectiveRtl);
+                node.layout.effectiveRtl,
+                txt.trim,
+                maxH);
         } else {
             measured = store->Fonts().MeasureLayout(
                 txt.text,
@@ -938,7 +943,9 @@ std::size_t VisualRenderAdapter::EmitTextVisual(
                 txt.fontWeight,
                 txt.fontItalic,
                 txt.lineHeight,
-                node.layout.effectiveRtl);
+                node.layout.effectiveRtl,
+                txt.trim,
+                maxH);
         }
 
         std::size_t count = 0u;
@@ -2479,9 +2486,23 @@ std::size_t VisualRenderAdapter::EmitNodeRecursive(
         const float worldScale = std::max(
             0.25f,
             0.5f * (std::hypot(world2D.m00, world2D.m01) + std::hypot(world2D.m10, world2D.m11)));
+        const UIResourceStore* effStore = outTree.ResourceStore() ? outTree.ResourceStore() : world.ResourceStore();
+        const bool hasOpacityMask = isVisible && NodeNeedsOpacityMaskSpan(*node, effStore);
+        const bool useTranslucentDropShadowSpan =
+            isVisible &&
+            ownDropShadow != nullptr &&
+            !hasOpacityMask &&
+            effOpacity < 0.999f &&
+            HasAlpha(ownDropShadow->colorRgba) &&
+            ownDropShadow->opacity > 0.0f &&
+            (drawsSelf || !node->children.empty());
+        if (useTranslucentDropShadowSpan) {
+            childInheritedShadow = nullptr;
+        }
 
         // Emit DropShadow behind this element (outside element clip) before node content.
         if (isVisible &&
+            !useTranslucentDropShadowSpan &&
             activeDropShadow != nullptr &&
             rect.width > 0.0f &&
             rect.height > 0.0f &&
@@ -2511,10 +2532,8 @@ std::size_t VisualRenderAdapter::EmitNodeRecursive(
         // Open post-process BlurLayerSpan BEFORE child emission to guarantee pre-order span ordering.
         const bool hasPostProcessEffect =
             isVisible &&
-            effStyle.kind != UIEffectKind::None &&
-            effStyle.kind != UIEffectKind::DropShadow;
-        const UIResourceStore* effStore = outTree.ResourceStore() ? outTree.ResourceStore() : world.ResourceStore();
-        const bool hasOpacityMask = isVisible && NodeNeedsOpacityMaskSpan(*node, effStore);
+            ((effStyle.kind != UIEffectKind::None && effStyle.kind != UIEffectKind::DropShadow) ||
+             useTranslucentDropShadowSpan);
         const BlendingMode selfBlend = (hasPostProcessEffect || hasOpacityMask) ? BlendingMode::Normal : blend;
         const ScopedBlendMode blendGuard(outTree.activeBlendMode_, selfBlend);
         std::size_t blurSpanIndex = std::numeric_limits<std::size_t>::max();
@@ -2525,7 +2544,13 @@ std::size_t VisualRenderAdapter::EmitNodeRecursive(
             span.endNodeId = spanStartNid;
             span.effectMode = hasPostProcessEffect ? effStyle.kind : UIEffectKind::OpacityMask;
             span.worldScale = worldScale;
-            if (hasPostProcessEffect) {
+            if (useTranslucentDropShadowSpan) {
+                span.radiusPx = std::max(0.0f, effStyle.radius);
+                span.angleDeg = effStyle.dirDeg;
+                span.amountX = has3D ? (effStyle.depth / std::max(0.25f, worldScale)) : effStyle.depth;
+                span.effectColor = UnpackRgba32(effStyle.colorRgba, std::clamp(effStyle.opacity, 0.0f, 1.0f));
+                span.effectOpacity = effOpacity;
+            } else if (hasPostProcessEffect) {
                 span.radiusPx = std::max(0.0f, effStyle.radius);
                 span.angleDeg = effStyle.dirDeg;
                 span.amountX = (effStyle.depth != 0.0f) ? effStyle.depth : effStyle.radius;
@@ -2628,6 +2653,7 @@ std::size_t VisualRenderAdapter::EmitNodeRecursive(
         }
 
         if (!skipClipped) {
+            const float innerEffOpacity = useTranslucentDropShadowSpan ? 1.0f : effOpacity;
             const bool hasNonZeroRect = (rect.width > 0.0f && rect.height > 0.0f);
             const bool allowZeroRectVector =
                 (node->kind == VisualKind::Vector) &&
@@ -2635,27 +2661,27 @@ std::size_t VisualRenderAdapter::EmitNodeRecursive(
                  node->Vector().shapeKind == VectorShapeKind::Line);
             if (isVisible && (hasNonZeroRect || allowZeroRectVector)) {
                 if (hasNonZeroRect) {
-                    count += EmitBoxVisual(outTree, *node, rect, effOpacity, world2D, world3D, has3D, selfBlend, &world, drawBuffer);
+                    count += EmitBoxVisual(outTree, *node, rect, innerEffOpacity, world2D, world3D, has3D, selfBlend, &world, drawBuffer);
                 }
 
                 switch (node->kind) {
                     case VisualKind::Text:
                         if (hasNonZeroRect) {
-                            count += EmitTextVisual(outTree, *node, rect, effOpacity, world2D, world3D, has3D, selfBlend);
+                            count += EmitTextVisual(outTree, *node, rect, innerEffOpacity, world2D, world3D, has3D, selfBlend);
                         }
                         break;
                     case VisualKind::Image:
                         if (hasNonZeroRect) {
-                            count += EmitImageVisual(outTree, *node, rect, effOpacity, world2D, world3D, has3D, selfBlend, &world, drawBuffer);
+                            count += EmitImageVisual(outTree, *node, rect, innerEffOpacity, world2D, world3D, has3D, selfBlend, &world, drawBuffer);
                         }
                         break;
                     case VisualKind::Vector:
-                        count += EmitVectorVisual(outTree, *node, rect, effOpacity, world2D, world3D, has3D, selfBlend, &world, drawBuffer);
+                        count += EmitVectorVisual(outTree, *node, rect, innerEffOpacity, world2D, world3D, has3D, selfBlend, &world, drawBuffer);
                         break;
                     case VisualKind::CanvasDraw:
                         if (hasNonZeroRect) {
                             count += EmitCanvasDrawVisual(
-                                outTree, drawBuffer, id, *node, rect, effOpacity, world2D, world3D, has3D, selfBlend);
+                                outTree, drawBuffer, id, *node, rect, innerEffOpacity, world2D, world3D, has3D, selfBlend);
                         }
                         break;
                     case VisualKind::Box:
@@ -2738,7 +2764,7 @@ std::size_t VisualRenderAdapter::EmitNodeRecursive(
                         world,
                         drawBuffer,
                         item.id,
-                        effOpacity,
+                        innerEffOpacity,
                         outTree,
                         passInheritedShadow);
                 }
@@ -2820,10 +2846,7 @@ std::size_t VisualRenderAdapter::EmitDropShadowLeafSilhouette(
             shadowSpan.worldScale = leafScale;
             shadowSpan.effectOpacity = 1.0f;
             shadowSpan.blendMode = blend;
-            const Rect shadowWorld = TransformRectViewportBounds(shiftedRect, shifted2D, world3D, has3D);
-            shadowSpan.clipRect = outTree.activeClipEnabled_
-                ? IntersectRects(outTree.activeClipRect_, shadowWorld)
-                : shadowWorld;
+            shadowSpan.clipRect = outTree.activeClipRect_;
             shadowSpan.clipActive = outTree.activeClipEnabled_;
             shadowSpanIndex = outTree.blurLayerSpans_.size();
             outTree.blurLayerSpans_.push_back(shadowSpan);
@@ -2853,7 +2876,7 @@ std::size_t VisualRenderAdapter::EmitDropShadowLeafSilhouette(
             if (hasSrcFill) {
                 sv.fillRgba = dropShadow.colorRgba;
                 sv.fillGradId = -1;
-                sv.strokeRgba = hasSrcStroke ? dropShadow.colorRgba : 0u;
+                sv.strokeRgba = 0u;
                 sv.strokeGradId = -1;
             } else if (hasSrcStroke) {
                 sv.strokeRgba = dropShadow.colorRgba;

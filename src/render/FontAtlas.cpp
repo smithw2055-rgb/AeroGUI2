@@ -3696,7 +3696,9 @@ TextLayoutResult FontAtlas::MeasureLayout(
     int fontWeight,
     bool fontItalic,
     float explicitLineHeight,
-    bool baseRtl) {
+    bool baseRtl,
+    TextTrimming trimMode,
+    float maxHeight) {
     RichTextRunInput singleRun{};
     singleRun.text = utf8Text;
     singleRun.fontFamily = fontFamily;
@@ -3717,7 +3719,9 @@ TextLayoutResult FontAtlas::MeasureLayout(
         wrapMode,
         charSpacing,
         explicitLineHeight,
-        baseRtl);
+        baseRtl,
+        trimMode,
+        maxHeight);
 }
 
 namespace {
@@ -4010,7 +4014,9 @@ TextLayoutResult FontAtlas::MeasureRichLayout(
     TextWrapping wrapMode,
     float charSpacing,
     float explicitLineHeight,
-    bool baseRtl) {
+    bool baseRtl,
+    TextTrimming trimMode,
+    float maxHeight) {
     TextLayoutResult result{};
     result.baseRtl = baseRtl;
     const float baseFont = std::max(1.0f, defaultFontSize);
@@ -4594,6 +4600,336 @@ TextLayoutResult FontAtlas::MeasureRichLayout(
     } else {
         result.totalHeight = curTopY;
     }
+    if (trimMode != TextTrimming::None && !result.lines.empty()) {
+        const bool trimWActive = std::isfinite(maxWidth) && (maxWidth > 0.0f) && (maxWidth < 500000.0f);
+        const bool trimHActive = std::isfinite(maxHeight) && (maxHeight > 0.0f) && (maxHeight < 500000.0f);
+        bool verticalOverflow = false;
+        std::size_t visibleLineCount = result.lines.size();
+        if (trimHActive && result.lines.size() > 1u && result.totalHeight > maxHeight + 0.5f) {
+            std::size_t lastVis = 0u;
+            for (std::size_t li = 1u; li < result.lines.size(); ++li) {
+                if (result.lines[li].topY + result.lines[li].lineHeight <= maxHeight + 0.5f) {
+                    lastVis = li;
+                } else {
+                    break;
+                }
+            }
+            if (lastVis + 1u < result.lines.size()) {
+                verticalOverflow = true;
+                visibleLineCount = lastVis + 1u;
+            }
+        }
+
+        bool anyLineNeedsTrim = verticalOverflow;
+        if (!anyLineNeedsTrim && trimWActive) {
+            for (std::size_t li = 0u; li < visibleLineCount; ++li) {
+                if (result.lines[li].width > maxWidth + 0.25f) {
+                    anyLineNeedsTrim = true;
+                    break;
+                }
+            }
+        }
+
+        if (anyLineNeedsTrim) {
+            FontAtlasGlyph defaultDotMeta{};
+            {
+                std::lock_guard<std::mutex> trimLock(mutex_);
+                std::vector<const RegisteredFontEntry*> dotChain;
+                ResolveFontChainLocked(defaultFontFamily, baseWeight, defaultItalic, dotChain);
+                defaultDotMeta = EnsureGlyphFromChainLocked(dotChain, static_cast<std::uint32_t>('.'), nullptr);
+            }
+
+            std::vector<PositionedGlyph> trimmedGlyphs;
+            trimmedGlyphs.reserve(result.glyphs.size() + 6u);
+            float maxLineW = 0.0f;
+
+            for (std::size_t li = 0u; li < visibleLineCount; ++li) {
+                TextLineMetrics& line = result.lines[li];
+                const std::size_t gStart = line.firstGlyphIndex;
+                const std::size_t gEnd = std::min(gStart + line.glyphCount, result.glyphs.size());
+                const std::size_t origCount = (gEnd >= gStart) ? (gEnd - gStart) : 0u;
+                const bool forceLastLineEllipsis = verticalOverflow && (li + 1u == visibleLineCount);
+                const bool widthOverflow = trimWActive && (line.width > maxWidth + 0.25f);
+
+                if (!forceLastLineEllipsis && !widthOverflow) {
+                    line.firstGlyphIndex = trimmedGlyphs.size();
+                    for (std::size_t gi = gStart; gi < gEnd; ++gi) {
+                        PositionedGlyph g = result.glyphs[gi];
+                        g.lineIndex = static_cast<std::uint32_t>(li);
+                        trimmedGlyphs.push_back(g);
+                    }
+                    line.glyphCount = origCount;
+                    maxLineW = std::max(maxLineW, line.width);
+                    continue;
+                }
+
+                float dotFontSize = baseFont;
+                bool dotCustomFont = hasDefaultCustomFont;
+                std::uint32_t dotCustomRgba = 0u;
+                bool dotHasCustomRgba = false;
+                bool dotBold = (baseWeight >= 600);
+                bool dotItalic = defaultItalic;
+                bool dotUnderline = false;
+                bool dotStrike = false;
+                std::uint32_t dotSrcCp = line.firstCodePointIndex;
+
+                std::size_t rtlOrigEnd = origCount;
+                if (baseRtl && wrapEnabled) {
+                    while (rtlOrigEnd > 0u && result.glyphs[gStart + rtlOrigEnd - 1u].isWhitespace) {
+                        --rtlOrigEnd;
+                    }
+                }
+                std::size_t rtlLeftWs = 0u;
+                if (baseRtl) {
+                    while (rtlLeftWs < rtlOrigEnd && result.glyphs[gStart + rtlLeftWs].isWhitespace) {
+                        ++rtlLeftWs;
+                    }
+                }
+
+                if (origCount > 0u) {
+                    const std::size_t styleIdx = baseRtl
+                        ? (rtlLeftWs < rtlOrigEnd ? (gStart + rtlLeftWs) : gStart)
+                        : (gEnd - 1u);
+                    const PositionedGlyph& tailG = result.glyphs[styleIdx];
+                    dotCustomRgba = tailG.customRgba;
+                    dotHasCustomRgba = tailG.hasCustomRgba;
+                    dotBold = tailG.syntheticBold;
+                    dotItalic = tailG.syntheticItalic;
+                    dotUnderline = tailG.underline;
+                    dotStrike = tailG.strikethrough;
+                    dotSrcCp = tailG.sourceCodePointIndex;
+                    if (styleIdx < lineTokenIndices.size() && lineTokenIndices[styleIdx] < decoded.size()) {
+                        const TokenGlyph& tailTok = decoded[lineTokenIndices[styleIdx]];
+                        dotFontSize = tailTok.fontSize;
+                        dotCustomFont = tailTok.hasCustomFont;
+                    }
+                }
+
+                const float trackPx = (std::isfinite(charSpacing) && charSpacing != 0.0f)
+                    ? (charSpacing * 0.001f * dotFontSize)
+                    : 0.0f;
+                const float dotAdv = defaultDotMeta.advanceEm * dotFontSize;
+                const float ellipsisW = 3.0f * dotAdv + 2.0f * std::max(0.0f, trackPx);
+                const float effLimitW = trimWActive ? maxWidth : (line.width + ellipsisW + 1.0f);
+                const float availBeforeEllipsis = std::max(0.0f, effLimitW - ellipsisW);
+
+                auto emitEllipsisDot = [&](float pStart) {
+                    PositionedGlyph dg{};
+                    dg.codePoint = static_cast<std::uint32_t>('.');
+                    dg.glyphIndex = defaultDotMeta.glyphIndex;
+                    dg.lineIndex = static_cast<std::uint32_t>(li);
+                    dg.sourceCodePointIndex = dotSrcCp;
+                    dg.penX = pStart;
+                    dg.baselineY = line.baselineY;
+                    dg.advanceX = dotAdv;
+                    dg.pxRange = defaultDotMeta.pxRange;
+                    dg.cellWidth = defaultDotMeta.cellWidth;
+                    dg.cellHeight = defaultDotMeta.cellHeight;
+                    dg.u0 = defaultDotMeta.u0;
+                    dg.v0 = defaultDotMeta.v0;
+                    dg.u1 = defaultDotMeta.u1;
+                    dg.v1 = defaultDotMeta.v1;
+                    dg.isWhitespace = false;
+                    dg.customRgba = dotCustomRgba;
+                    dg.hasCustomRgba = dotHasCustomRgba;
+                    dg.syntheticBold = dotBold;
+                    dg.syntheticItalic = dotItalic;
+                    dg.underline = dotUnderline;
+                    dg.strikethrough = dotStrike;
+                    if (dotCustomFont) {
+                        dg.x0 = pStart + defaultDotMeta.bearingXEm * dotFontSize;
+                        dg.x1 = dg.x0 + defaultDotMeta.quadWidthEm * dotFontSize;
+                        dg.y0 = line.baselineY - defaultDotMeta.bearingYEm * dotFontSize;
+                        dg.y1 = dg.y0 + defaultDotMeta.quadHeightEm * dotFontSize;
+                    } else {
+                        dg.x0 = pStart;
+                        dg.x1 = pStart + dotAdv;
+                        dg.y0 = line.topY;
+                        dg.y1 = line.topY + line.lineHeight;
+                    }
+                    trimmedGlyphs.push_back(dg);
+                };
+
+                if (baseRtl && rtlOrigEnd > 0u) {
+                    bool endedAtWordBoundary = line.endedByNewline;
+                    if (!endedAtWordBoundary) {
+                        std::size_t maxTokIdx = 0u;
+                        bool hasTok = false;
+                        for (std::size_t k = rtlLeftWs; k < rtlOrigEnd; ++k) {
+                            if (gStart + k < lineTokenIndices.size() && lineTokenIndices[gStart + k] < decoded.size()) {
+                                if (!hasTok || lineTokenIndices[gStart + k] > maxTokIdx) {
+                                    maxTokIdx = lineTokenIndices[gStart + k];
+                                    hasTok = true;
+                                }
+                            }
+                        }
+                        if (hasTok) {
+                            if (maxTokIdx + 1u >= decoded.size()) {
+                                endedAtWordBoundary = true;
+                            } else {
+                                const TokenGlyph& nextTok = decoded[maxTokIdx + 1u];
+                                endedAtWordBoundary = nextTok.explicitNewline ||
+                                    nextTok.cp == ' ' || nextTok.cp == '\t' || IsWideCjkCodePoint(nextTok.cp);
+                            }
+                        }
+                    }
+
+                    std::size_t rtlKeepStart = rtlOrigEnd;
+                    if (rtlLeftWs < rtlOrigEnd) {
+                        const float rightEdge =
+                            result.glyphs[gStart + rtlOrigEnd - 1u].penX +
+                            result.glyphs[gStart + rtlOrigEnd - 1u].advanceX;
+                        for (std::size_t k = rtlOrigEnd; k > rtlLeftWs; --k) {
+                            const std::size_t idx = k - 1u;
+                            const float span = rightEdge - result.glyphs[gStart + idx].penX;
+                            if (span <= availBeforeEllipsis + 0.05f) {
+                                rtlKeepStart = idx;
+                            } else {
+                                break;
+                            }
+                        }
+                    }
+
+                    if (trimMode == TextTrimming::WordEllipsis) {
+                        if (!(rtlKeepStart == rtlLeftWs && endedAtWordBoundary)) {
+                            if (rtlKeepStart > rtlLeftWs &&
+                                result.glyphs[gStart + rtlKeepStart - 1u].isWhitespace) {
+                                // Already aligned on a word boundary to the visual left
+                            } else {
+                                bool foundWs = false;
+                                for (std::size_t k = rtlKeepStart; k < rtlOrigEnd; ++k) {
+                                    if (result.glyphs[gStart + k].isWhitespace) {
+                                        rtlKeepStart = k + 1u;
+                                        foundWs = true;
+                                        break;
+                                    }
+                                }
+                                if (!foundWs) {
+                                    rtlKeepStart = rtlOrigEnd;
+                                }
+                            }
+                        }
+                    }
+                    while (rtlKeepStart < rtlOrigEnd && result.glyphs[gStart + rtlKeepStart].isWhitespace) {
+                        ++rtlKeepStart;
+                    }
+
+                    line.firstGlyphIndex = trimmedGlyphs.size();
+                    for (int d = 0; d < 3; ++d) {
+                        const float pStart = static_cast<float>(d) * (dotAdv + std::max(0.0f, trackPx));
+                        emitEllipsisDot(pStart);
+                    }
+                    float endRightX = ellipsisW;
+                    if (rtlKeepStart < rtlOrigEnd) {
+                        const float keepBaseX = ellipsisW + (trackPx != 0.0f ? trackPx : 0.0f);
+                        const float shiftX = keepBaseX - result.glyphs[gStart + rtlKeepStart].penX;
+                        for (std::size_t k = rtlKeepStart; k < rtlOrigEnd; ++k) {
+                            PositionedGlyph g = result.glyphs[gStart + k];
+                            g.lineIndex = static_cast<std::uint32_t>(li);
+                            g.penX += shiftX;
+                            g.x0 += shiftX;
+                            g.x1 += shiftX;
+                            endRightX = std::max(endRightX, g.penX + g.advanceX);
+                            trimmedGlyphs.push_back(g);
+                        }
+                    }
+                    line.glyphCount = (rtlOrigEnd - rtlKeepStart) + 3u;
+                    line.width = endRightX;
+                    maxLineW = std::max(maxLineW, line.width);
+                    continue;
+                }
+
+                std::size_t strippedCount = origCount;
+                while (strippedCount > 0u && result.glyphs[gStart + strippedCount - 1u].isWhitespace) {
+                    --strippedCount;
+                }
+
+                bool endedAtWordBoundary = line.endedByNewline;
+                if (!endedAtWordBoundary && origCount > 0u && (gStart + strippedCount - 1u) < lineTokenIndices.size()) {
+                    const std::size_t lastTokIdx = lineTokenIndices[gStart + strippedCount - 1u];
+                    if (lastTokIdx + 1u >= decoded.size()) {
+                        endedAtWordBoundary = true;
+                    } else {
+                        const TokenGlyph& nextTok = decoded[lastTokIdx + 1u];
+                        endedAtWordBoundary = nextTok.explicitNewline ||
+                            nextTok.cp == ' ' || nextTok.cp == '\t' || IsWideCjkCodePoint(nextTok.cp);
+                    }
+                }
+
+                std::size_t charKeep = 0u;
+                for (std::size_t k = 0u; k < strippedCount; ++k) {
+                    const PositionedGlyph& g = result.glyphs[gStart + k];
+                    if (g.penX + g.advanceX <= availBeforeEllipsis + 0.05f) {
+                        charKeep = k + 1u;
+                    } else {
+                        break;
+                    }
+                }
+
+                std::size_t keepCount = charKeep;
+                if (trimMode == TextTrimming::WordEllipsis) {
+                    if (charKeep == strippedCount && endedAtWordBoundary) {
+                        keepCount = charKeep;
+                    } else {
+                        std::size_t wordKeep = 0u;
+                        bool foundWs = false;
+                        for (std::size_t k = charKeep; k > 0u; --k) {
+                            if (result.glyphs[gStart + k - 1u].isWhitespace) {
+                                wordKeep = k - 1u;
+                                foundWs = true;
+                                break;
+                            }
+                        }
+                        if (!foundWs && charKeep < strippedCount && result.glyphs[gStart + charKeep].isWhitespace) {
+                            wordKeep = charKeep;
+                            foundWs = true;
+                        }
+                        if (foundWs) {
+                            while (wordKeep > 0u && result.glyphs[gStart + wordKeep - 1u].isWhitespace) {
+                                --wordKeep;
+                            }
+                            keepCount = wordKeep;
+                        } else {
+                            keepCount = 0u;
+                        }
+                    }
+                } else {
+                    while (keepCount > 0u && result.glyphs[gStart + keepCount - 1u].isWhitespace) {
+                        --keepCount;
+                    }
+                }
+
+                line.firstGlyphIndex = trimmedGlyphs.size();
+                float ellPenX = 0.0f;
+                for (std::size_t k = 0u; k < keepCount; ++k) {
+                    PositionedGlyph g = result.glyphs[gStart + k];
+                    g.lineIndex = static_cast<std::uint32_t>(li);
+                    ellPenX = std::max(ellPenX, g.penX + g.advanceX);
+                    trimmedGlyphs.push_back(g);
+                }
+                if (keepCount > 0u && trackPx != 0.0f) {
+                    ellPenX += trackPx;
+                }
+
+                for (int d = 0; d < 3; ++d) {
+                    const float pStart = ellPenX + static_cast<float>(d) * (dotAdv + std::max(0.0f, trackPx));
+                    emitEllipsisDot(pStart);
+                }
+
+                line.glyphCount = keepCount + 3u;
+                line.width = ellPenX + ellipsisW;
+                maxLineW = std::max(maxLineW, line.width);
+            }
+
+            result.lines.resize(visibleLineCount);
+            result.glyphs = std::move(trimmedGlyphs);
+            result.totalWidth = maxLineW;
+            result.totalHeight = result.lines.empty()
+                ? 0.0f
+                : (result.lines.back().topY + result.lines.back().lineHeight);
+        }
+    }
+
     return result;
 }
 

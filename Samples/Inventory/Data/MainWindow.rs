@@ -130,18 +130,16 @@ public class ViewModel : ViewModelBase
         this.Defaults.Add(new Item(ItemCategory.Ring));
         this.Defaults.Add(new Item(ItemCategory.All));
 
-        // Initial 8 equipped items in Player.Slots[0..7] matching slot categories:
+        // Initial 8 empty equipment slots in Player.Slots[0..7]:
         // [0]=Head, [1]=Chest, [2]=Hand (Left), [3]=Legs, [4]=Ring, [5]=Arms, [6]=Hand (Right), [7]=Feet
-        this.Player.Slots.Add(this.MakeItem("KnightHelmet", "A closed helm with a visor.", ItemCategory.Head, 20, 0, 0, 20));
-        this.Player.Slots.Add(this.MakeItem("PlateArmor", "A mastercrafted steel breastplate.", ItemCategory.Chest, 50, 0, 0, 35));
-        this.Player.Slots.Add(this.MakeItem("Sword", "A well-balanced steel blade.", ItemCategory.Hand, 0, 0, 15, 0));
-        this.Player.Slots.Add(this.MakeItem("PlateCuisses", "Articulated thigh armor.", ItemCategory.Legs, 25, 0, 0, 20));
-        this.Player.Slots.Add(this.MakeItem("GoldRing", "An elegant gold band.", ItemCategory.Ring, 25, 0, 0, 0));
-        this.Player.Slots.Add(this.MakeItem("PlateVambrace", "Solid steel arm guards.", ItemCategory.Arms, 15, 0, 0, 15));
-        this.Player.Slots.Add(this.MakeItem("MetalShield", "A sturdy shield of polished steel.", ItemCategory.Hand, 10, 0, 0, 25));
-        this.Player.Slots.Add(this.MakeItem("PlateGreaves", "Heavy steel boots and shin guards.", ItemCategory.Feet, 20, 0, 0, 18));
+        int initSlot = 0;
+        while (initSlot < 8)
+        {
+            this.Player.Slots.Add(this.GetDefaultForSlot(initSlot));
+            initSlot = initSlot + 1;
+        }
 
-        // Remaining 37 handcrafted items in Inventory bag (8 + 37 = 45 total items from Src/ViewModel.cpp)
+        // All 45 handcrafted items start in Inventory bag (from Src/ViewModel.cpp)
         this.Inventory = new ObservableList<Item>(45);
 
         // --- WEAPONS & SHIELDS (Hand) ---
@@ -188,6 +186,16 @@ public class ViewModel : ViewModelBase
         this.Inventory.Add(this.MakeItem("MailVambrace", "Chainmail arm protection.", ItemCategory.Arms, 0, 0, 0, 10));
         this.Inventory.Add(this.MakeItem("MailSkirt", "A skirt made of heavy chainmail.", ItemCategory.Legs, 0, 0, 0, 12));
         this.Inventory.Add(this.MakeItem("MailGreaves", "Chainmail for the lower legs.", ItemCategory.Feet, 0, 0, 0, 10));
+
+        // --- HEAVY PLATE & REMAINING ITEMS (45 total items in Inventory bag) ---
+        this.Inventory.Add(this.MakeItem("KnightHelmet", "A closed helm with a visor.", ItemCategory.Head, 20, 0, 0, 20));
+        this.Inventory.Add(this.MakeItem("PlateArmor", "A mastercrafted steel breastplate.", ItemCategory.Chest, 50, 0, 0, 35));
+        this.Inventory.Add(this.MakeItem("Sword", "A well-balanced steel blade.", ItemCategory.Hand, 0, 0, 15, 0));
+        this.Inventory.Add(this.MakeItem("PlateCuisses", "Articulated thigh armor.", ItemCategory.Legs, 25, 0, 0, 20));
+        this.Inventory.Add(this.MakeItem("GoldRing", "An elegant gold band.", ItemCategory.Ring, 25, 0, 0, 0));
+        this.Inventory.Add(this.MakeItem("PlateVambrace", "Solid steel arm guards.", ItemCategory.Arms, 15, 0, 0, 15));
+        this.Inventory.Add(this.MakeItem("MetalShield", "A sturdy shield of polished steel.", ItemCategory.Hand, 10, 0, 0, 25));
+        this.Inventory.Add(this.MakeItem("PlateGreaves", "Heavy steel boots and shin guards.", ItemCategory.Feet, 20, 0, 0, 18));
 
         this.RecalculateStats();
     }

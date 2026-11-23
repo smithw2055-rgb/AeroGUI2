@@ -86,14 +86,15 @@ public partial class NumericUpDown : UserControl
         }
         float oldVal = this._value;
         this._value = next;
-        this.OnValueChanged(new RoutedPropertyChangedEventArgs<float>(oldVal, next, this));
         BindingEngine.NotifyTargetPropertyChanged(this, "Value", DependencyObject.BoxFloat(this._value));
+        this.OnValueChanged(new RoutedPropertyChangedEventArgs<float>(oldVal, next, this));
         BindingEngine.Flush();
     }
 
     protected virtual void OnValueChanged(RoutedPropertyChangedEventArgs<float> e)
     {
         ValueChanged(this, e);
+        this.RaiseRoutedEvent("ValueChanged", e);
     }
 
     public void UpButton_Click(object sender, RoutedEventArgs e)

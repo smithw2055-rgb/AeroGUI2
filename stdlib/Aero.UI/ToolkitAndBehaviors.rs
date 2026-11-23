@@ -528,7 +528,8 @@ public class TriggerAction : DependencyObject {
                 }
             } else if (TargetObjectRelativeMode == "TemplatedParent") {
                 src = associatedObject.TemplatedParent;
-            } else if (TargetObjectRelativeMode == "FindAncestor" || TargetObjectRelativeMode == "AncestorType") {
+            } else if (TargetObjectRelativeMode == "FindAncestor" || TargetObjectRelativeMode == "AncestorType" ||
+                       TargetObjectAncestorType.Length > 0) {
                 UIElement anc = associatedObject;
                 while (anc != null && TargetObjectAncestorType.Length > 0 && !BindingEntry.MatchesAncestorType(anc, TargetObjectAncestorType)) {
                     anc = BindingEntry.StepAncestor(anc);
@@ -536,6 +537,7 @@ public class TriggerAction : DependencyObject {
                 src = anc;
             }
             if (src != null) {
+                if (TargetObjectPath == ".") { return src; }
                 DependencyObject box = src.GetPropertyValue(TargetObjectPath);
                 if (box == null) { box = BindingEngine.ReadPathBox(src, TargetObjectPath); }
                 object unboxed = DependencyObject.Unbox(box);
@@ -586,27 +588,39 @@ public class InvokeCommandAction : TriggerAction {
     public void SetCommandParameterBox(DependencyObject box) { _paramBox = box; }
 
     private DependencyObject ResolveDynamicParameter(UIElement associatedObject) {
-        if (CommandParameterPath.Length == 0 || associatedObject == null) { return null; }
+        if (associatedObject == null) { return null; }
+        bool selfPath = CommandParameterPath.Length == 0 || CommandParameterPath == ".";
         if (CommandParameterRelativeMode == "Self") {
-            return BindingEngine.ReadPathBox(associatedObject, CommandParameterPath);
+            return selfPath ? associatedObject : BindingEngine.ReadPathBox(associatedObject, CommandParameterPath);
         }
-        if (CommandParameterAncestorType.Length > 0) {
+        if (CommandParameterRelativeMode == "TemplatedParent") {
+            UIElement tp = associatedObject.TemplatedParent;
+            if (tp == null) { return null; }
+            return selfPath ? tp : BindingEngine.ReadPathBox(tp, CommandParameterPath);
+        }
+        if (CommandParameterAncestorType.Length > 0 ||
+            CommandParameterRelativeMode == "FindAncestor" ||
+            CommandParameterRelativeMode == "AncestorType") {
             UIElement cur = associatedObject;
-            while (cur != null && !BindingEntry.MatchesAncestorType(cur, CommandParameterAncestorType)) {
-                cur = cur.Parent;
+            while (cur != null && CommandParameterAncestorType.Length > 0 &&
+                   !BindingEntry.MatchesAncestorType(cur, CommandParameterAncestorType)) {
+                cur = BindingEntry.StepAncestor(cur);
             }
-            if (cur != null) {
-                return BindingEngine.ReadPathBox(cur, CommandParameterPath);
-            }
+            if (cur == null) { return null; }
+            return selfPath ? cur : BindingEngine.ReadPathBox(cur, CommandParameterPath);
         }
         if (CommandParameterElementName.Length > 0) {
-            UIElement named = associatedObject.RootElement().FindName(CommandParameterElementName);
-            if (named != null) {
-                return BindingEngine.ReadPathBox(named, CommandParameterPath);
+            UIElement named = BindingEntry.FindElementScoped(associatedObject, CommandParameterElementName);
+            if (named == null && associatedObject.RootElement() != null) {
+                named = associatedObject.RootElement().FindName(CommandParameterElementName);
             }
+            if (named == null) { return null; }
+            return selfPath ? named : BindingEngine.ReadPathBox(named, CommandParameterPath);
         }
-        if (associatedObject.DataContext != null) {
-            return BindingEngine.ReadPathBox(associatedObject.DataContext, CommandParameterPath);
+        if (CommandParameterPath.Length > 0 && associatedObject.DataContext != null) {
+            return selfPath
+                ? DependencyObject.BoxObject(associatedObject.DataContext)
+                : BindingEngine.ReadPathBox(associatedObject.DataContext, CommandParameterPath);
         }
         return null;
     }
@@ -620,7 +634,9 @@ public class InvokeCommandAction : TriggerAction {
         }
         if (cmd == null) { return; }
         DependencyObject resolved = _paramBox;
-        if (resolved == null && CommandParameterPath.Length > 0) {
+        if (resolved == null &&
+            (CommandParameterPath.Length > 0 || CommandParameterElementName.Length > 0 ||
+             CommandParameterRelativeMode.Length > 0 || CommandParameterAncestorType.Length > 0)) {
             resolved = ResolveDynamicParameter(associatedObject);
         }
         DependencyObject arg = (resolved == null && PassEventArgsToCommand) ? parameter : resolved;
@@ -750,7 +766,30 @@ public class RemoveElementAction : TriggerAction {
     public override void Invoke(UIElement associatedObject, DependencyObject parameter) {
         if (!IsEnabled) { return; }
         UIElement dest = ResolveTarget(associatedObject);
-        if (dest != null && dest.Parent != null) {
+        if (dest == null) { return; }
+        if (associatedObject != null) {
+            UIElement menuAnc = associatedObject;
+            while (menuAnc != null) {
+                if (menuAnc.GetTypeName() == "ContextMenu") {
+                    menuAnc.SetPropertyValue("IsOpen", DependencyObject.BoxBool(false));
+                    break;
+                }
+                menuAnc = BindingEntry.StepAncestor(menuAnc);
+            }
+        }
+        UIElement p = dest.Parent;
+        while (p != null) {
+            if (p is ItemsControl) {
+                ItemsControl ic = p as ItemsControl;
+                int idx = ic.IndexOfItemContainer(dest);
+                if (idx >= 0 && ic.TryRemoveItemAt(idx)) {
+                    return;
+                }
+                break;
+            }
+            p = p.Parent;
+        }
+        if (dest.Parent != null) {
             dest.Parent.RemoveChild(dest);
         }
     }
@@ -1935,7 +1974,10 @@ public class BehaviorDataTrigger : BehaviorTriggerBase {
             src = ResolveElementSource(associatedObject);
         } else if (RelativeSourceMode == "Self") {
             src = associatedObject;
-        } else if (RelativeSourceMode == "FindAncestor" || RelativeSourceMode == "AncestorType") {
+        } else if (RelativeSourceMode == "TemplatedParent") {
+            src = associatedObject.TemplatedParent;
+        } else if (RelativeSourceMode == "FindAncestor" || RelativeSourceMode == "AncestorType" ||
+                   RelativeSourceAncestorType.Length > 0) {
             UIElement anc = associatedObject;
             while (anc != null && RelativeSourceAncestorType.Length > 0 && !BindingEntry.MatchesAncestorType(anc, RelativeSourceAncestorType)) {
                 anc = BindingEntry.StepAncestor(anc);
@@ -2083,7 +2125,14 @@ public class BehaviorDataTrigger : BehaviorTriggerBase {
             reflectObj = associatedObject;
             actual = associatedObject.GetPropertyValue(BindingPath);
             if (actual == null) { actual = BindingEngine.ReadPathBox(associatedObject, BindingPath); }
-        } else if (RelativeSourceMode == "FindAncestor" || RelativeSourceMode == "AncestorType") {
+        } else if (RelativeSourceMode == "TemplatedParent") {
+            UIElement tp = associatedObject.TemplatedParent;
+            if (tp == null) { return; }
+            reflectObj = tp;
+            actual = tp.GetPropertyValue(BindingPath);
+            if (actual == null) { actual = BindingEngine.ReadPathBox(tp, BindingPath); }
+        } else if (RelativeSourceMode == "FindAncestor" || RelativeSourceMode == "AncestorType" ||
+                   RelativeSourceAncestorType.Length > 0) {
             UIElement anc = associatedObject;
             while (anc != null && RelativeSourceAncestorType.Length > 0 && !BindingEntry.MatchesAncestorType(anc, RelativeSourceAncestorType)) {
                 anc = BindingEntry.StepAncestor(anc);
@@ -2520,6 +2569,8 @@ public static class DragDrop {
     private static Border _dragAdorner;
     private static Image _dragAdornerImage;
     private static TranslateTransform _dragAdornerTransform;
+    private static float _dragAdornerHalfW = 56.0f;
+    private static float _dragAdornerHalfH = 56.0f;
     private static bool _hookInstalled = false;
 
     public static void EnsureInstalled() {
@@ -2738,18 +2789,43 @@ public static class DragDrop {
         if (item != null) {
             iconUri = DependencyObject.UnboxString(BindingEngine.ReadPathBox(item, "Icon"), "");
         }
+
+        float sw = src != null ? src.ActualWidth : 0.0f;
+        float sh = src != null ? src.ActualHeight : 0.0f;
+        float adW = 112.0f;
+        float adH = 40.0f;
         var adorner = new Border();
-        adorner.Width = 56.0f;
-        adorner.Height = 56.0f;
-        adorner.CornerRadius = new CornerRadius(7.0f);
-        adorner.Background = new SolidColorBrush("#CC1E293B");
-        adorner.BorderBrush = new SolidColorBrush("#FF94A3B8");
-        adorner.BorderThickness = new Thickness(1.5f);
+        if (iconUri.Length > 0) {
+            float tileSide = (sw > 8.0f && sh > 8.0f) ? Math.Minf(sw, sh) : 112.0f;
+            tileSide = Math.Clampf(tileSide, 64.0f, 160.0f);
+            adW = tileSide;
+            adH = tileSide;
+            adorner.CornerRadius = new CornerRadius(4.0f);
+            adorner.Background = new SolidColorBrush("#78DA9858");
+            adorner.BorderBrush = new SolidColorBrush("#FFEBA147");
+            adorner.BorderThickness = new Thickness(2.0f);
+        } else {
+            adW = Math.Clampf(sw > 8.0f ? sw : 112.0f, 64.0f, 320.0f);
+            adH = Math.Clampf(sh > 8.0f ? sh : 40.0f, 28.0f, 160.0f);
+            adorner.CornerRadius = new CornerRadius(6.0f);
+            adorner.Background = (src != null && src.Background != null)
+                ? src.Background
+                : new SolidColorBrush("#CC1E293B");
+            adorner.BorderBrush = (src != null && src.BorderBrush != null)
+                ? src.BorderBrush
+                : new SolidColorBrush("#FF94A3B8");
+            adorner.BorderThickness = new Thickness(1.5f);
+        }
+        _dragAdornerHalfW = adW * 0.5f;
+        _dragAdornerHalfH = adH * 0.5f;
+
+        adorner.Width = adW;
+        adorner.Height = adH;
         adorner.HorizontalAlignment = HorizontalAlignment.Left;
         adorner.VerticalAlignment = VerticalAlignment.Top;
         adorner.IsHitTestVisible = false;
         adorner.ZIndex = 9999;
-        adorner.Opacity = 0.92f;
+        adorner.Opacity = 0.94f;
         if (host is Grid) {
             UIElement.SetGridRow(adorner, 0);
             UIElement.SetGridColumn(adorner, 0);
@@ -2759,10 +2835,11 @@ public static class DragDrop {
         _dragAdornerTransform = new TranslateTransform(0.0f, 0.0f);
         adorner.RenderTransform = _dragAdornerTransform;
         if (iconUri.Length > 0) {
+            float pad = Math.Maxf(6.0f, Math.Minf(adW, adH) * 0.16f);
             var img = new Image();
             img.Source = iconUri;
             img.Stretch = Stretch.Uniform;
-            img.Margin = new Thickness(4.0f);
+            img.Margin = new Thickness(pad);
             adorner.Child = img;
             _dragAdornerImage = img;
         }
@@ -2781,23 +2858,25 @@ public static class DragDrop {
             ly = Visual_ScreenToLocal(host.__nativeHandle, screenX, screenY, 1);
         }
         if (_dragAdornerTransform == null) {
-            _dragAdornerTransform = new TranslateTransform(lx - 28.0f, ly - 28.0f);
+            _dragAdornerTransform = new TranslateTransform(lx - _dragAdornerHalfW, ly - _dragAdornerHalfH);
         } else {
-            _dragAdornerTransform.X = lx - 28.0f;
-            _dragAdornerTransform.Y = ly - 28.0f;
+            _dragAdornerTransform.X = lx - _dragAdornerHalfW;
+            _dragAdornerTransform.Y = ly - _dragAdornerHalfH;
         }
         _dragAdorner.RenderTransform = _dragAdornerTransform;
     }
 
     private static void HideDragAdorner() {
-        if (_dragAdorner != null) {
-            if (_dragAdorner.Parent != null) {
-                _dragAdorner.Parent.RemoveChild(_dragAdorner);
-            }
-            _dragAdorner = null;
-            _dragAdornerImage = null;
-        }
+        Border oldAdorner = _dragAdorner;
+        _dragAdorner = null;
+        _dragAdornerImage = null;
         _dragAdornerTransform = null;
+        if (oldAdorner != null) {
+            if (oldAdorner.Parent != null) {
+                oldAdorner.Parent.RemoveChild(oldAdorner);
+            }
+            oldAdorner.DisposeSubtree();
+        }
     }
 
     private static bool IsPointInsideElement(UIElement el, float screenX, float screenY) {

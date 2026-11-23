@@ -25,6 +25,8 @@ struct RasterizedPathMaskEntry {
     float u1 = 1.0f;
     float v1 = 1.0f;
     std::uint64_t lastUsedTick = 0u;
+    std::uint64_t groupHash = 0u;
+    std::size_t byteSize = 0u;
 };
 
 /// Explicit per-view resource store owning FontAtlas, ImageAtlas,
@@ -43,6 +45,7 @@ public:
         std::uint32_t width,
         std::uint32_t height,
         std::vector<std::uint8_t>&& rgbaPixels);
+    using ImageAtlasReleaseSlotFn = void (*)(ImageAtlas& atlas, std::uint32_t textureId) noexcept;
 
     static constexpr std::uint16_t kDefaultFontAtlasSize = 1024u;
 
@@ -64,7 +67,8 @@ public:
         ImageAtlasFactoryFn factoryFn,
         ImageAtlasClearFn clearFn) noexcept;
     static void RegisterImageAtlasSlotHook(
-        ImageAtlasRegisterSlotFn registerSlotFn) noexcept;
+        ImageAtlasRegisterSlotFn registerSlotFn,
+        ImageAtlasReleaseSlotFn releaseSlotFn = nullptr) noexcept;
 
     [[nodiscard]] FontAtlas& Fonts();
     [[nodiscard]] const FontAtlas& Fonts() const;
@@ -102,7 +106,8 @@ public:
         float u1,
         float v1,
         std::vector<std::uint8_t>&& rgba8,
-        RasterizedPathMaskEntry& outEntry);
+        RasterizedPathMaskEntry& outEntry,
+        std::uint64_t groupHash = 0u);
 
     [[nodiscard]] bool GetOrRasterizePathMask(
         std::uint64_t pathHash,
@@ -125,6 +130,15 @@ public:
         std::uint8_t startLineCap = 2u,
         std::uint8_t endLineCap = 2u);
 
+    [[nodiscard]] std::size_t PathMaskCount() const noexcept {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return pathMaskEntries_.size();
+    }
+    [[nodiscard]] std::size_t PathMaskTotalBytes() const noexcept {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return pathMaskTotalBytes_;
+    }
+
     void ClearAll() noexcept;
 
 private:
@@ -132,6 +146,7 @@ private:
     void EnsureImagesInitialized() const;
     [[nodiscard]] bool StoreOrLookupPathMaskLocked(
         std::uint64_t key,
+        std::uint64_t groupHash,
         std::uint32_t texW,
         std::uint32_t texH,
         float u0,
@@ -150,6 +165,7 @@ private:
     std::vector<std::string> assetSearchDirs_;
     std::unordered_map<std::uint64_t, AxbMtsdfPathEntry> mtsdfEntries_;
     std::unordered_map<std::uint64_t, RasterizedPathMaskEntry> pathMaskEntries_;
+    std::size_t pathMaskTotalBytes_ = 0u;
     std::uint64_t pathMaskAccessSeq_ = 0u;
 };
 

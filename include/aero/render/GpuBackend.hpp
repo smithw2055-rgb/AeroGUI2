@@ -475,9 +475,11 @@ private:
     bool effectGpuPipelineFailed_ = false;
     AeroGLint uEffectViewportSizeLoc_ = -1;
     AeroGLint uEffectSrcTexLoc_ = -1;
+    AeroGLint uEffectOrigTexLoc_ = -1;
     AeroGLint uEffectTexelSizeLoc_ = -1;
     AeroGLint uEffectModeLoc_ = -1;
     AeroGLint uEffectParamsLoc_ = -1;
+    AeroGLint uEffectShadowOffsetLoc_ = -1;
     AeroGLint uEffectUvMinLoc_ = -1;
     AeroGLint uEffectUvMaxLoc_ = -1;
     AeroGLint uEffectMaskMatRow0Loc_ = -1;
@@ -509,6 +511,7 @@ private:
     std::uint32_t syncedMtsdfRows_ = 0;
     std::uint32_t syncedGradientRevision_ = 0;
     std::uint32_t syncedMinGradRow_ = 1023u;
+    std::uint64_t syncedImageAtlasSweepRev_ = 0u;
 
     std::vector<GlImageSlotState> imageSlotTextures_;
     std::vector<std::uint8_t> uiAtlasScratchRgba8_;

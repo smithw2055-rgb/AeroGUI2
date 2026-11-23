@@ -952,7 +952,8 @@ TextLayoutResult VisualWorld::LayoutTextNode(const VisualNode& node, float maxWi
             txt.wrap,
             txt.charSpacing,
             txt.lineHeight,
-            node.layout.effectiveRtl);
+            node.layout.effectiveRtl,
+            txt.trim);
     }
     return store->Fonts().MeasureLayout(
         txt.text,
@@ -964,7 +965,8 @@ TextLayoutResult VisualWorld::LayoutTextNode(const VisualNode& node, float maxWi
         txt.fontWeight,
         txt.fontItalic,
         txt.lineHeight,
-        node.layout.effectiveRtl);
+        node.layout.effectiveRtl,
+        txt.trim);
 }
 
 Size VisualWorld::MeasureTextNode(const VisualNode& node, float maxWidth) const {
@@ -1033,7 +1035,7 @@ std::int32_t VisualWorld::HitTestTextCodePoint(VisualNodeId id, float localX, fl
     const float boxW = std::max(0.0f, node->layout.layoutRect.width - padL - padR);
     const float tx = localX - padL;
     const float ty = localY - padT;
-    const float maxW = (txt.wrap == TextWrapping::NoWrap)
+    const float maxW = (txt.wrap == TextWrapping::NoWrap && txt.trim == TextTrimming::None)
         ? 1000000.0f
         : std::max(1.0f, boxW);
     const TextLayoutResult layout = LayoutTextNode(*node, maxW);

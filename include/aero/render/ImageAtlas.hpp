@@ -194,6 +194,7 @@ public:
         std::uint32_t width,
         std::uint32_t height,
         std::vector<std::uint8_t>&& rgbaPixels);
+    void ReleaseRgbaTextureSlot(std::uint32_t textureId) noexcept;
 
     // Allocate or update a bounded-LRU standalone RGBA8 slot keyed by VisualBrush identity.
     [[nodiscard]] bool RegisterOrUpdateVisualBrushSlot(
@@ -259,6 +260,7 @@ private:
     [[nodiscard]] std::string ResolveExistingFileLocked(
         std::string_view cleanRelOrAbs,
         std::string_view localBaseDir) const;
+    [[nodiscard]] std::uint32_t AllocateStandaloneTextureIdLocked() noexcept;
 
     mutable std::mutex mutex_;
     std::uint64_t instanceId_ = 0u;
@@ -267,6 +269,7 @@ private:
     std::uint32_t maxPackableWidth_ = kDefaultMaxPackableExtent;
     std::uint32_t maxPackableHeight_ = kDefaultMaxPackableExtent;
     std::uint32_t nextStandaloneTextureId_ = 1u;
+    std::vector<std::uint32_t> freeStandaloneTextureIds_;
 
     std::string baseDirectory_;
     std::vector<std::string> searchDirectories_;

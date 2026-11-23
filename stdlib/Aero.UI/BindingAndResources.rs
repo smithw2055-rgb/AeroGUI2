@@ -389,6 +389,9 @@ public class Setter : DependencyObject {
                     BindingRelativeMode, BindingAncestorType);
             } else {
                 dest.ClearResourceReference(Property);
+                if (Property == "ContextMenu" && _valueBox is UIElement) {
+                    (_valueBox as UIElement).SetUiFlag(4096, true);
+                }
                 dest.SetPropertyValue(Property, _valueBox);
             }
             return;
@@ -725,6 +728,10 @@ public class TriggerBase : DependencyObject {
 
     internal void ApplyIfMatched(UIElement target, Style owningStyle) {
         if (target == null || !IsMatched(target)) { return; }
+        ApplyMatchedCore(target, owningStyle);
+    }
+
+    private void ApplyMatchedCore(UIElement target, Style owningStyle) {
         bool wasActive = WasActiveFor(target);
         bool savePrev = !wasActive;
         if (!wasActive) {
@@ -785,8 +792,11 @@ public class TriggerBase : DependencyObject {
 
     public void Evaluate(UIElement target, Style owningStyle) {
         if (target == null) { return; }
-        DeactivateIfUnmatched(target, owningStyle);
-        ApplyIfMatched(target, owningStyle);
+        if (IsMatched(target)) {
+            ApplyMatchedCore(target, owningStyle);
+        } else if (WasActiveFor(target)) {
+            DeactivateTarget(target, owningStyle, true);
+        }
     }
 
     public static void EvaluateGroup(TriggerBase[] triggers, UIElement target, Style owningStyle) {
@@ -1050,11 +1060,13 @@ public class Trigger : TriggerBase {
         if (BoxEquals(a, b)) { return true; }
         if (a == null || b == null || propName == null || propName.Length == 0) { return false; }
         int oa = -1;
-        if (a is BoxedInt) { oa = (a as BoxedInt).Value; }
+        if (a is BoxedEnum) { oa = (a as BoxedEnum).Ordinal; }
+        else if (a is BoxedInt) { oa = (a as BoxedInt).Value; }
         else if (a is BoxedString) { oa = ResolveKnownEnumOrdinal(propName, (a as BoxedString).Value); }
         if (oa < 0) { return false; }
         int ob = -1;
-        if (b is BoxedInt) { ob = (b as BoxedInt).Value; }
+        if (b is BoxedEnum) { ob = (b as BoxedEnum).Ordinal; }
+        else if (b is BoxedInt) { ob = (b as BoxedInt).Value; }
         else if (b is BoxedString) { ob = ResolveKnownEnumOrdinal(propName, (b as BoxedString).Value); }
         return ob >= 0 && oa == ob;
     }
@@ -1079,6 +1091,8 @@ public class Trigger : TriggerBase {
 
 public class DataTrigger : TriggerBase {
     private DependencyObject _valueBox;
+    private UIElement[] _hookedTargets;
+    private UIElement[] _hookedSources;
     private static DataTrigger[] _reactiveTriggers;
     private static UIElement[] _reactiveTargets;
     private static bool _reactiveHookInstalled = false;
@@ -1144,13 +1158,85 @@ public class DataTrigger : TriggerBase {
         set { _valueBox = DependencyObject.BoxObject(value); }
     }
 
+    private bool HasHooked(UIElement target, UIElement src) {
+        if (_hookedTargets == null || _hookedSources == null) { return false; }
+        for (int i = 0; i < _hookedTargets.Length; i += 1) {
+            if (_hookedTargets[i] == target && _hookedSources[i] == src) { return true; }
+        }
+        return false;
+    }
+
+    internal override bool HasLiveHookedTargets() {
+        return _hookedTargets != null && _hookedTargets.Length > 0;
+    }
+
+    internal override void CleanupHookedTargets() {
+        if (_hookedTargets == null || _hookedSources == null) { return; }
+        for (int i = _hookedTargets.Length - 1; i >= 0; i -= 1) {
+            if (_hookedTargets[i] == null || _hookedTargets[i]._isDisposedTree ||
+                _hookedSources[i] == null || _hookedSources[i]._isDisposedTree) {
+                _hookedTargets.RemoveAt(i);
+                _hookedSources.RemoveAt(i);
+            }
+        }
+    }
+
+    private bool HookRelativeSource(UIElement target) {
+        if (target == null || target._isDisposedTree) { return false; }
+        UIElement se = null;
+        if (ElementName.Length > 0) {
+            se = Trigger.ResolveTemplateOrNamedElement(target, ElementName);
+        } else if (RelativeSourceMode == "TemplatedParent") {
+            se = target.TemplatedParent;
+        } else if (RelativeSourceMode == "FindAncestor" || RelativeSourceMode == "AncestorType" ||
+                   RelativeSourceAncestorType.Length > 0) {
+            UIElement anc = target;
+            while (anc != null && RelativeSourceAncestorType.Length > 0 &&
+                   !BindingEntry.MatchesAncestorType(anc, RelativeSourceAncestorType)) {
+                anc = BindingEntry.StepAncestor(anc);
+            }
+            se = anc;
+        }
+        if (se == null || se._isDisposedTree) { return false; }
+        if (se != target && !HasHooked(target, se)) {
+            if (_hookedTargets == null) {
+                _hookedTargets = new UIElement[0];
+                _hookedSources = new UIElement[0];
+            }
+            RegisterTriggerWithTargets(this);
+            _hookedTargets.Push(target);
+            _hookedSources.Push(se);
+            se.AddStateInvalidatedHook(() => {
+                if (!target._isDisposedTree) { Evaluate(target, null); }
+            });
+        }
+        return true;
+    }
+
     public override void Attach(UIElement target) {
         if (target == null) { return; }
-        if (_multiBindingBox != null || _dynamicBindingBox != null || ElementName.Length > 0 ||
-            RelativeSourceMode.Length == 0 || RelativeSourceMode == "DataContext") {
-            RegisterReactive(this, target);
+        bool isRelOrNamed = ElementName.Length > 0 ||
+            RelativeSourceAncestorType.Length > 0 ||
+            RelativeSourceMode == "TemplatedParent" ||
+            RelativeSourceMode == "FindAncestor" ||
+            RelativeSourceMode == "AncestorType";
+        bool hooked = HookRelativeSource(target);
+        bool hasSubPath = BindingPath == "DataContext" || BindingPath.IndexOf(".") >= 0;
+        if (_multiBindingBox != null || _dynamicBindingBox != null ||
+            RelativeSourceMode.Length == 0 || RelativeSourceMode == "DataContext" ||
+            hasSubPath || !isRelOrNamed) {
+            if (RelativeSourceMode != "Self" || hasSubPath || _multiBindingBox != null || _dynamicBindingBox != null) {
+                RegisterReactive(this, target);
+            }
         }
-
+        if (isRelOrNamed) {
+            target.Loaded += (object s, RoutedEventArgs e) => {
+                if (!HookRelativeSource(target)) {
+                    RegisterReactive(this, target);
+                }
+                Evaluate(target, null);
+            };
+        }
     }
 
     private static void RegisterReactive(DataTrigger dt, UIElement target) {
@@ -1226,15 +1312,20 @@ public class DataTrigger : TriggerBase {
         } else if (RelativeSourceMode == "Self") {
             actual = target.GetPropertyValue(BindingPath);
             if (actual == null) { actual = BindingEngine.ReadPathBox(target, BindingPath); }
-        } else if (RelativeSourceMode == "FindAncestor" || RelativeSourceMode == "AncestorType") {
+        } else if (RelativeSourceMode == "TemplatedParent") {
+            UIElement tp = target.TemplatedParent;
+            if (tp == null) { return false; }
+            actual = tp.GetPropertyValue(BindingPath);
+            if (actual == null) { actual = BindingEngine.ReadPathBox(tp, BindingPath); }
+        } else if (RelativeSourceMode == "FindAncestor" || RelativeSourceMode == "AncestorType" ||
+                   RelativeSourceAncestorType.Length > 0) {
             UIElement anc = target;
             while (anc != null && RelativeSourceAncestorType.Length > 0 && !BindingEntry.MatchesAncestorType(anc, RelativeSourceAncestorType)) {
                 anc = BindingEntry.StepAncestor(anc);
             }
-            if (anc != null) {
-                actual = anc.GetPropertyValue(BindingPath);
-                if (actual == null) { actual = BindingEngine.ReadPathBox(anc, BindingPath); }
-            }
+            if (anc == null) { return false; }
+            actual = anc.GetPropertyValue(BindingPath);
+            if (actual == null) { actual = BindingEngine.ReadPathBox(anc, BindingPath); }
         } else {
             object dc = target.DataContext;
             if (dc == null) { return _valueBox == null; }
@@ -1263,8 +1354,23 @@ public class TriggerCondition : DependencyObject {
     }
 
     public UIElement ResolveElementSource(UIElement target) {
-        if (target == null || ElementName.Length == 0) { return null; }
-        return Trigger.ResolveTemplateOrNamedElement(target, ElementName);
+        if (target == null) { return null; }
+        if (ElementName.Length > 0) {
+            return Trigger.ResolveTemplateOrNamedElement(target, ElementName);
+        }
+        if (RelativeSourceMode == "TemplatedParent") {
+            return target.TemplatedParent;
+        }
+        if (RelativeSourceMode == "FindAncestor" || RelativeSourceMode == "AncestorType" ||
+            RelativeSourceAncestorType.Length > 0) {
+            UIElement anc = target;
+            while (anc != null && RelativeSourceAncestorType.Length > 0 &&
+                   !BindingEntry.MatchesAncestorType(anc, RelativeSourceAncestorType)) {
+                anc = BindingEntry.StepAncestor(anc);
+            }
+            return anc;
+        }
+        return null;
     }
 
     public bool Evaluate(UIElement target) {
@@ -1279,15 +1385,20 @@ public class TriggerCondition : DependencyObject {
         } else if (RelativeSourceMode == "Self") {
             actual = target.GetPropertyValue(BindingPath);
             if (actual == null) { actual = BindingEngine.ReadPathBox(target, BindingPath); }
-        } else if (RelativeSourceMode == "FindAncestor" || RelativeSourceMode == "AncestorType") {
+        } else if (RelativeSourceMode == "TemplatedParent") {
+            UIElement tp = target.TemplatedParent;
+            if (tp == null) { return false; }
+            actual = tp.GetPropertyValue(BindingPath);
+            if (actual == null) { actual = BindingEngine.ReadPathBox(tp, BindingPath); }
+        } else if (RelativeSourceMode == "FindAncestor" || RelativeSourceMode == "AncestorType" ||
+                   RelativeSourceAncestorType.Length > 0) {
             UIElement anc = target;
             while (anc != null && RelativeSourceAncestorType.Length > 0 && !BindingEntry.MatchesAncestorType(anc, RelativeSourceAncestorType)) {
                 anc = BindingEntry.StepAncestor(anc);
             }
-            if (anc != null) {
-                actual = anc.GetPropertyValue(BindingPath);
-                if (actual == null) { actual = BindingEngine.ReadPathBox(anc, BindingPath); }
-            }
+            if (anc == null) { return false; }
+            actual = anc.GetPropertyValue(BindingPath);
+            if (actual == null) { actual = BindingEngine.ReadPathBox(anc, BindingPath); }
         } else {
             object dc = target.DataContext;
             if (dc == null) { return ValueBox == null; }
@@ -1342,9 +1453,16 @@ public class MultiDataTrigger : TriggerBase {
         if (target == null || target._isDisposedTree) { return; }
         for (int i = 0; i < _conditions.Length; i += 1) {
             TriggerCondition cond = _conditions[i];
-            if (cond.ElementName.Length == 0) { continue; }
+            if (cond == null) { continue; }
+            if (cond.ElementName.Length == 0 &&
+                cond.RelativeSourceMode != "TemplatedParent" &&
+                cond.RelativeSourceMode != "FindAncestor" &&
+                cond.RelativeSourceMode != "AncestorType" &&
+                cond.RelativeSourceAncestorType.Length == 0) {
+                continue;
+            }
             UIElement se = cond.ResolveElementSource(target);
-            if (se == null || se._isDisposedTree || HasHooked(target, se)) { continue; }
+            if (se == null || se == target || se._isDisposedTree || HasHooked(target, se)) { continue; }
             RegisterTriggerWithTargets(this);
             _hookedTargets.Push(target);
             _hookedSources.Push(se);
@@ -3764,7 +3882,7 @@ internal class BindingEntry : DependencyObject {
 
     internal static UIElement FindElementScoped(UIElement host, string elementName) {
         if (host == null || elementName == null || elementName.Length == 0) { return null; }
-        if (host._internalRootName == elementName) { return host; }
+        if (host._internalRootName == elementName || host.Name == elementName) { return host; }
         if (host.TemplatedParent != null) {
             UIElement t = host;
             while (t.Parent != null && t.Parent.TemplatedParent == host.TemplatedParent) {
@@ -3773,12 +3891,12 @@ internal class BindingEntry : DependencyObject {
             if (t._internalRootName == elementName) { return t; }
             UIElement localHit = t.FindTemplateChildName(elementName, host.TemplatedParent);
             if (localHit != null) { return localHit; }
-            if (host.TemplatedParent._internalRootName == elementName) { return host.TemplatedParent; }
+            if (host.TemplatedParent._internalRootName == elementName || host.TemplatedParent.Name == elementName) { return host.TemplatedParent; }
         }
         UIElement cur = host;
         while (cur.Parent != null) {
             cur = cur.Parent;
-            if (cur._internalRootName == elementName) { return cur; }
+            if (cur._internalRootName == elementName || cur.Name == elementName) { return cur; }
             if (cur.IsNamescopeBoundary()) {
                 UIElement scopeHit = cur.FindName(elementName);
                 if (scopeHit != null) { return scopeHit; }
@@ -4575,7 +4693,9 @@ public static class BindingEngine {
     }
 
     public static void StepFrameTicks(float dt) {
-        if (dt <= 0.0f || _frameTickHooks == null) { return; }
+        if (dt <= 0.0f) { return; }
+        InputDispatcher.AdvanceUiClock(dt);
+        if (_frameTickHooks == null) { return; }
         for (int h = 0; h < _frameTickHooks.Length; h += 1) {
             var fn = _frameTickHooks[h];
             if (fn != null) { fn(dt); }
@@ -5234,6 +5354,11 @@ public static class BindingEngine {
         if (kind == 2) { return DependencyObject.BoxInt(Reflect_GetPropInt(cur, leaf)); }
         if (kind == 3) { return DependencyObject.BoxFloat(Reflect_GetPropFloat(cur, leaf)); }
         if (kind == 4) { return DependencyObject.BoxString(Reflect_GetPropString(cur, leaf)); }
+        if (kind == 6) {
+            return DependencyObject.BoxEnum(
+                Reflect_GetPropString(cur, leaf),
+                Reflect_GetPropInt(cur, leaf));
+        }
         if (kind == 5) {
             object objVal = Reflect_GetPropObject(cur, leaf);
             return objVal != null ? DependencyObject.BoxObject(objVal) : null;

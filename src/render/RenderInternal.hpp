@@ -55,6 +55,9 @@ namespace aero::render::detail {
         case UIEffectKind::BackdropBlur:
             return (std::isfinite(span.radiusPx) && span.radiusPx > 0.25f) ||
                    (std::isfinite(span.saturation) && std::fabs(span.saturation - 1.0f) > 0.001f);
+        case UIEffectKind::DropShadow:
+            return std::isfinite(span.effectColor.a) && span.effectColor.a > 0.0f &&
+                   std::isfinite(span.effectOpacity) && span.effectOpacity > 0.0f;
         default:
             return false;
     }
@@ -67,8 +70,11 @@ namespace aero::render::detail {
         return 0.0f;
     }
     if (span.effectMode == UIEffectKind::BackdropBlur) {
-        // Calibrate 3-pass box blur variance to WPF/NoesisGUI Gaussian BlurEffect.Radius (3*sigma = radius)
-        return std::clamp(effRadius, 0.25f, 480.0f) * 0.26f;
+        // Calibrate 3-pass box blur variance to WPF/NoesisGUI frosted acrylic blur
+        return std::clamp(effRadius, 0.25f, 480.0f) * 0.55f;
+    }
+    if (span.effectMode == UIEffectKind::DropShadow) {
+        return std::clamp(effRadius, 0.25f, 480.0f) * 0.45f;
     }
     return std::clamp(effRadius, 0.5f, 240.0f) * 0.5f;
 }
@@ -87,7 +93,13 @@ namespace aero::render::detail {
         case UIEffectKind::BackdropBlur:
         case UIEffectKind::Pixelate: {
             const int boxR = ComputeSpanBoxRadius(span);
-            return (boxR > 0) ? (boxR * 3 + 2) : 0;
+            return (boxR > 0) ? std::clamp(boxR * 3 + 2, 2, 256) : 0;
+        }
+        case UIEffectKind::DropShadow: {
+            const float ws = (std::isfinite(span.worldScale) && span.worldScale > 0.0f) ? span.worldScale : 1.0f;
+            const int blurPad = static_cast<int>(std::ceil(std::clamp(std::isfinite(span.radiusPx) ? span.radiusPx : 0.0f, 0.0f, 240.0f) * ws * 1.5f)) + 2;
+            const int shiftPad = static_cast<int>(std::ceil(std::fabs(std::isfinite(span.amountX) ? span.amountX : 0.0f) * ws)) + 2;
+            return std::clamp(blurPad + shiftPad, 2, 384);
         }
         case UIEffectKind::DirectionalBlur: {
             const float r = std::clamp(std::isfinite(span.radiusPx) ? span.radiusPx : 0.0f, 0.0f, 128.0f);

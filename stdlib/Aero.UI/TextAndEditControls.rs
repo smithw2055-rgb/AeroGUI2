@@ -14,6 +14,8 @@ public class TextBoxBase : Control {
     private int _maxLength = 0;
     private Brush _caretBrush;
     private Brush _selectionBrush;
+    private float _selectionOpacity = 0.4f;
+    private bool _hasExplicitSelectionOpacity = false;
 
     private int _caretCp = 0;
     private int _anchorCp = 0;
@@ -127,6 +129,14 @@ public class TextBoxBase : Control {
     public Brush SelectionBrush {
         get { return _selectionBrush; }
         set { _selectionBrush = value; RefreshTextSelectionVisual(); }
+    }
+    public float SelectionOpacity {
+        get { return _selectionOpacity; }
+        set {
+            _selectionOpacity = Math.Clampf(value, 0.0f, 1.0f);
+            _hasExplicitSelectionOpacity = true;
+            RefreshTextSelectionVisual();
+        }
     }
 
     public int CaretIndex {
@@ -321,14 +331,21 @@ public class TextBoxBase : Control {
         }
     }
 
+    protected virtual bool AllowsNewlineInput() { return _acceptsReturn; }
+
     public void Paste() {
         if (_isReadOnly) { return; }
         string clip = Host_GetClipboardText();
         if (clip != null && clip.Length > 0) {
-            if (!_acceptsReturn) {
-                clip = clip.Replace("\r", "").Replace("\n", " ");
+            clip = clip.Replace("\r\n", "\n");
+            if (AllowsNewlineInput()) {
+                clip = clip.Replace("\r", "\n");
+            } else {
+                clip = clip.Replace("\r", "").Replace("\n", "");
             }
-            ReplaceSelection(clip);
+            if (clip.Length > 0) {
+                ReplaceSelection(clip);
+            }
         }
     }
 
@@ -353,7 +370,16 @@ public class TextBoxBase : Control {
 
     protected void RefreshTextSelectionVisual() {
         if (_textVisual == null || !ParseUtil.IsValidHandle(_textVisual.__nativeHandle)) { return; }
-        uint selCol = _selectionBrush != null ? _selectionBrush.ResolveRgba() : ParseUtil.PackArgb(102u, 59u, 130u, 246u);
+        uint selCol = ParseUtil.PackArgb(102u, 59u, 130u, 246u);
+        if (_selectionBrush != null) {
+            uint rawRgba = _selectionBrush.ResolveRgba();
+            uint baseA = (rawRgba / 16777216u) % 256u;
+            if (_hasExplicitSelectionOpacity || baseA == 255u) {
+                selCol = ParseUtil.ApplyOpacityToArgb(rawRgba, Math.Clampf(_selectionOpacity, 0.0f, 1.0f));
+            } else {
+                selCol = rawRgba;
+            }
+        }
         uint carCol = _caretBrush != null ? _caretBrush.ResolveRgba() : ParseUtil.PackArgb(255u, 241u, 245u, 249u);
         bool blinkOn = (_activeBlinkBox != this) ? true : _caretBlinkVisible;
         bool showCaret = IsFocused && !_isReadOnly && blinkOn;
@@ -489,7 +515,13 @@ public class TextBoxBase : Control {
         base.OnTextInput(e);
         if (!IsEnabled || _isReadOnly) { return; }
         if (e.Text != null && e.Text.Length > 0) {
-            ReplaceSelection(e.Text);
+            string clean = e.Text.Replace("\r", "");
+            if (!AllowsNewlineInput()) {
+                clean = clean.Replace("\n", "");
+            }
+            if (clean.Length > 0) {
+                ReplaceSelection(clean);
+            }
             e.Handled = true;
         }
     }
@@ -577,6 +609,7 @@ public class TextBoxBase : Control {
         }
         if (propName == "CaretBrush") { CaretBrush = UIElement.CoerceBrush(value); return true; }
         if (propName == "SelectionBrush") { SelectionBrush = UIElement.CoerceBrush(value); return true; }
+        if (propName == "SelectionOpacity") { SelectionOpacity = DependencyObject.UnboxFloat(value, 0.4f); return true; }
         if (propName == "ScrollViewer.VerticalScrollBarVisibility" || propName == "VerticalScrollBarVisibility") {
             base.SetPropertyValue("ScrollViewer.VerticalScrollBarVisibility", value);
             UIElement host = GetTemplateChild("PART_ContentHost");
@@ -633,6 +666,7 @@ public class TextBoxBase : Control {
         }
         if (propName == "CaretBrush") { return _caretBrush; }
         if (propName == "SelectionBrush") { return _selectionBrush; }
+        if (propName == "SelectionOpacity") { return DependencyObject.BoxFloat(_selectionOpacity); }
         return base.GetPropertyValue(propName);
     }
 }
@@ -800,9 +834,14 @@ public class PasswordBox : TextBoxBase {
 
     public override string GetTypeName() { return "PasswordBox"; }
 
+    protected override bool AllowsNewlineInput() { return false; }
+
     public string Password {
         get { return InternalRawText(); }
-        set { SetInternalRawText(value, true); }
+        set {
+            string clean = value == null ? "" : value.Replace("\r", "").Replace("\n", "");
+            SetInternalRawText(clean, true);
+        }
     }
 
     public string PasswordChar {

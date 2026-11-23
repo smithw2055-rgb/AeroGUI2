@@ -24,8 +24,10 @@ void PrintUsage() {
         "  --entry <ClassOrFn>     Optional entry class name or factory function\n"
         "  --headless              Run headlessly using SoftwareRasterizer\n"
         "  --frames <N>            Step N frames before exit/screenshot (headless default: 1)\n"
-        "  --width <W>             Viewport width (default: 1280)\n"
-        "  --height <H>            Viewport height (default: 800)\n"
+        "  --width <W>             Viewport width in DIPs (default: 800)\n"
+        "  --height <H>            Viewport height in DIPs (default: 600)\n"
+        "  --dpi-scale <S>         Override UI DPI scale factor (enables High-DPI scaling)\n"
+        "  --no-dpi                Disable High-DPI scaling (1:1 physical pixels)\n"
         "  --out <screenshot.ppm>  Write rendered RGBA8 frame as binary PPM (P6)\n"
         "  --O2                    Enable optional MIR optimization (default: off / pure interpreter)\n"
         "  --no-tree-shake         Disable stdlib AST/MIR reachability pruning\n"
@@ -149,8 +151,10 @@ int main(int argc, char** argv) {
     bool headless = false;
     std::uint64_t frames = 0u;
     bool framesSet = false;
-    std::uint32_t width = 1280u;
-    std::uint32_t height = 800u;
+    std::uint32_t width = 800u;
+    std::uint32_t height = 600u;
+    bool noDpiFlag = false;
+    float dpiScaleOverride = 0.0f;
     std::string outPpmPath;
     bool optimizeO2 = false;
     bool disableTreeShake = false;
@@ -205,6 +209,18 @@ int main(int argc, char** argv) {
             const char* v = needNext(arg);
             if (!v) return 2;
             height = std::max<std::uint32_t>(1u, static_cast<std::uint32_t>(std::strtoul(v, nullptr, 10)));
+        } else if (arg == "--dpi-scale") {
+            const char* v = needNext(arg);
+            if (!v) return 2;
+            dpiScaleOverride = static_cast<float>(std::strtod(v, nullptr));
+            if (dpiScaleOverride <= 0.0f) {
+                std::cerr << "Invalid --dpi-scale value: " << v << "\n";
+                return 2;
+            }
+            noDpiFlag = false;
+        } else if (arg == "--no-dpi") {
+            noDpiFlag = true;
+            dpiScaleOverride = 0.0f;
         } else if (arg == "--out") {
             const char* v = needNext(arg);
             if (!v) return 2;
@@ -331,6 +347,8 @@ int main(int argc, char** argv) {
     hostCfg.viewportWidth = width;
     hostCfg.viewportHeight = height;
     hostCfg.headless = headless;
+    hostCfg.enableHighDpi = !headless && !noDpiFlag;
+    hostCfg.dpiScale = noDpiFlag ? 0.0f : dpiScaleOverride;
     if (softwareFlagSet) {
         hostCfg.preferSoftwareRasterizer = preferSoftware;
     }
@@ -379,6 +397,13 @@ int main(int argc, char** argv) {
         return 0;
     }
 
+    std::printf(
+        "aero-viewer window ready (%ux%u DIP, %ux%u px, %.2fx DPI).\n",
+        host.WindowHost().LogicalWidth(),
+        host.WindowHost().LogicalHeight(),
+        host.WindowHost().Width(),
+        host.WindowHost().Height(),
+        static_cast<double>(host.WindowHost().DpiScale()));
     const std::uint64_t rendered = host.RunWindowedLoop(framesSet ? frames : 0u);
     if (!outPpmPath.empty()) {
         if (!host.SaveScreenshotPpm(outPpmPath, 0u, 0u)) {

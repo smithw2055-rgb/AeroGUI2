@@ -376,7 +376,9 @@ public:
         int fontWeight = 400,
         bool fontItalic = false,
         float explicitLineHeight = 0.0f,
-        bool baseRtl = false);
+        bool baseRtl = false,
+        TextTrimming trimMode = TextTrimming::None,
+        float maxHeight = 1000000.0f);
 
     [[nodiscard]] TextLayoutResult MeasureRichLayout(
         const std::vector<RichTextRunInput>& runs,
@@ -388,7 +390,9 @@ public:
         TextWrapping wrapMode = TextWrapping::NoWrap,
         float charSpacing = 0.0f,
         float explicitLineHeight = 0.0f,
-        bool baseRtl = false);
+        bool baseRtl = false,
+        TextTrimming trimMode = TextTrimming::None,
+        float maxHeight = 1000000.0f);
 
     // Bilinear normalized [0..1] SDF sample at UV coordinates (u, v) in [0..1]^2
     [[nodiscard]] float SampleSdfBilinear(float u, float v) const noexcept;

@@ -847,6 +847,7 @@ public static class XamlReader {
             BindingEngine.EndBatch();
             return null;
         }
+        el.SetUiFlag(1024, true);
         if (fallbackResources != null && el.AmbientResources == null) {
             el.AmbientResources = fallbackResources;
         }
@@ -1143,6 +1144,9 @@ public static class XamlReader {
         if (p == "ToolTipService.InitialShowDelay" || p == "ToolTipService.BetweenShowDelay" ||
             p == "ToolTipService.ShowDuration") {
             return DependencyObject.BoxInt(ParseUtil.ParseInt(val, 0));
+        }
+        if (p == "Opacity" || p == "SelectionOpacity") {
+            return DependencyObject.BoxFloat(ParseUtil.ParseFloat(val, 1.0f));
         }
         if (XamlStr.StartsWith(p, "Custom.") && XamlStr.EndsWith(p, "_Single")) {
             return DependencyObject.BoxFloat(ParseUtil.ParseFloat(val, 0.0f));
@@ -3896,6 +3900,21 @@ public static class XamlReader {
         }
     }
 
+    private static void ApplyActionTargetAttrs(TriggerAction act, XamlXmlNode node, XamlBuildContext ctx) {
+        if (act == null || node == null) { return; }
+        string tn = node.GetAttr("TargetName");
+        if (tn != null) { act.TargetName = tn; }
+        string toAttr = node.GetAttr("TargetObject");
+        if (toAttr != null && XamlStr.LooksLikeMarkupExtension(toAttr)) {
+            string kind = XamlStr.ExtractExtType(toAttr);
+            if (kind == "Binding" || kind == "TemplateBinding") {
+                XamlParsedBinding pb = ParseBindingSpec(toAttr, ctx);
+                string effPath = pb.Path.Length > 0 ? pb.Path : ".";
+                act.SetTargetObjectBinding(effPath, pb.RelativeSourceMode, pb.AncestorType, pb.ElementName);
+            }
+        }
+    }
+
     private static TriggerAction BuildTriggerActionNode(
         XamlXmlNode node, XamlBuildContext ctx, UIElement host) {
         string tag = node.LocalName;
@@ -3903,8 +3922,7 @@ public static class XamlReader {
             var act = new ChangePropertyAction();
             string pn = node.GetAttr("PropertyName");
             if (pn != null) { act.PropertyName = XamlStr.StripOuterParens(pn); }
-            string tn = node.GetAttr("TargetName");
-            if (tn != null) { act.TargetName = tn; }
+            ApplyActionTargetAttrs(act, node, ctx);
             string an = node.GetNameAttr();
             if (an.Length > 0) { act.ActionName = an; }
             string valAttr = node.GetAttr("Value");
@@ -3933,26 +3951,60 @@ public static class XamlReader {
             if (opt != null) { csa.ControlStoryboardOption = opt; }
             return csa;
         }
+        if (tag == "InvokeCommandAction") {
+            var ica = new InvokeCommandAction();
+            ApplyActionTargetAttrs(ica, node, ctx);
+            string cmdAttr = node.GetAttr("Command");
+            if (cmdAttr != null && XamlStr.LooksLikeMarkupExtension(cmdAttr)) {
+                XamlParsedBinding cpb = ParseBindingSpec(cmdAttr, ctx);
+                ica.CommandPath = cpb.Path;
+            }
+            string cpAttr = node.GetAttr("CommandParameter");
+            if (cpAttr != null) {
+                if (XamlStr.LooksLikeMarkupExtension(cpAttr)) {
+                    string cpKind = XamlStr.ExtractExtType(cpAttr);
+                    if (cpKind == "Binding" || cpKind == "TemplateBinding") {
+                        XamlParsedBinding ppb = ParseBindingSpec(cpAttr, ctx);
+                        ica.CommandParameterPath = ppb.Path.Length > 0 ? ppb.Path : ".";
+                        ica.CommandParameterElementName = ppb.ElementName;
+                        ica.CommandParameterRelativeMode = ppb.RelativeSourceMode;
+                        ica.CommandParameterAncestorType = ppb.AncestorType;
+                    } else {
+                        ica.SetCommandParameterBox(ResolveMarkupValue(cpAttr, ctx, host));
+                    }
+                } else {
+                    ica.SetCommandParameter(cpAttr);
+                }
+            }
+            string pea = node.GetAttr("PassEventArgsToCommand");
+            if (pea != null) { ica.PassEventArgsToCommand = ParseUtil.ParseBool(pea, false); }
+            return ica;
+        }
+        if (tag == "PlaySoundAction") {
+            var psa = new PlaySoundAction();
+            string srcAttr = node.GetAttr("Source");
+            if (srcAttr != null) { psa.Source = srcAttr; }
+            string volAttr = node.GetAttr("Volume");
+            if (volAttr != null) { psa.Volume = ParseUtil.ParseFloat(volAttr, 1.0f); }
+            return psa;
+        }
         if (tag == "RemoveElementAction") {
             var rea = new RemoveElementAction();
-            string tn = node.GetAttr("TargetName");
-            if (tn != null) { rea.TargetName = tn; }
+            ApplyActionTargetAttrs(rea, node, ctx);
             return rea;
         }
         if (tag == "GoToStateAction") {
             var gts = new GoToStateAction();
             string sn = node.GetAttr("StateName");
             if (sn != null) { gts.StateName = sn; }
-            string tn = node.GetAttr("TargetName");
-            if (tn != null) { gts.TargetName = tn; }
+            ApplyActionTargetAttrs(gts, node, ctx);
             string ut = node.GetAttr("UseTransitions");
             if (ut != null) { gts.UseTransitions = ParseUtil.ParseBool(ut, true); }
             return gts;
         }
         if (tag == "SetFocusAction") {
             var sfa = new SetFocusAction();
-            string tn = node.GetAttr("TargetName");
-            if (tn != null) { sfa.TargetName = tn; }
+            ApplyActionTargetAttrs(sfa, node, ctx);
             return sfa;
         }
         return null;

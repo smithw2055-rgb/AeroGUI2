@@ -148,6 +148,11 @@ HostDriverBase::UiPhaseRunResult HostDriverBase::RunUiPhases(
         result.inputDispatched = inputRouter_->FlushQueuedEvents();
         telemetry_.inputEventsDispatched += result.inputDispatched;
         if (result.inputDispatched > 0u) {
+            if (bindingFlushCallback_ && (activePhaseMask & UiPhase_TrackABinding) != 0u) {
+                bindingFlushCallback_(bindingFlushUserData_);
+                result.trackAUpdates += 1u;
+                telemetry_.trackAUpdates += 1u;
+            }
             markDirtyObjects();
             markDirtyLayout();
         }
@@ -158,12 +163,22 @@ HostDriverBase::UiPhaseRunResult HostDriverBase::RunUiPhases(
         telemetry_.trackBUpdates += result.trackBUpdates;
     }
 
-    if ((activePhaseMask & UiPhase_Animation) != 0u && animationEngine_ && world_ &&
-        (!config.requireActiveAnimationsForTick || animationEngine_->HasActiveAnimations())) {
-        if (animationEngine_->Tick(dt, *world_)) {
-            result.animationUpdates = 1u;
-            telemetry_.animationTrackUpdates += 1u;
-            markDirtyLayout();
+    if ((activePhaseMask & UiPhase_Animation) != 0u && animationEngine_ && world_) {
+        const bool hadActiveAnimations = animationEngine_->HasActiveAnimations();
+        if (!config.requireActiveAnimationsForTick || hadActiveAnimations) {
+            if (animationEngine_->Tick(dt, *world_)) {
+                result.animationUpdates = 1u;
+                telemetry_.animationTrackUpdates += 1u;
+                markDirtyLayout();
+            }
+            if (hadActiveAnimations && !animationEngine_->HasActiveAnimations() &&
+                bindingFlushCallback_ && (activePhaseMask & UiPhase_TrackABinding) != 0u) {
+                bindingFlushCallback_(bindingFlushUserData_);
+                result.trackAUpdates += 1u;
+                telemetry_.trackAUpdates += 1u;
+                markDirtyObjects();
+                markDirtyLayout();
+            }
         }
     }
 

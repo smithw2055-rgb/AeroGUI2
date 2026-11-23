@@ -1172,11 +1172,49 @@ public class Selector : ItemsControl {
             return true;
         }
         if (propName == "SelectedValuePath") { SelectedValuePath = DependencyObject.UnboxString(value, ""); return true; }
+        if (propName == "SelectionMode") {
+            string sm = "Single";
+            if (value is BoxedInt && !(value is BoxedEnum)) {
+                int m = (value as BoxedInt).Value;
+                sm = m == 1 ? "Multiple" : (m == 2 ? "Extended" : "Single");
+            } else {
+                object rawObj = DependencyObject.Unbox(value);
+                sm = DependencyObject.UnboxString(value, "Single").Trim();
+                if ((sm.Length == 0 || sm == "ComboBoxItem" || sm == "ListBoxItem") && rawObj is ContentControl) {
+                    sm = DependencyObject.UnboxString((rawObj as ContentControl).ContentBox, "Single").Trim();
+                }
+            }
+            if (sm == "Multiple") {
+                SelectionMode = SelectionMode.Multiple;
+                if (_selectedIndex >= 0 && !_selectedIndices.Contains(_selectedIndex)) {
+                    _selectedIndices.Push(_selectedIndex);
+                }
+            } else if (sm == "Extended") {
+                SelectionMode = SelectionMode.Extended;
+                if (_selectedIndex >= 0 && !_selectedIndices.Contains(_selectedIndex)) {
+                    _selectedIndices.Push(_selectedIndex);
+                }
+            } else {
+                SelectionMode = SelectionMode.Single;
+                if (_selectedIndices.Length > 1) {
+                    int keep = _selectedIndex >= 0 ? _selectedIndex : _selectedIndices[0];
+                    _selectedIndices.Clear();
+                    if (keep >= 0) { _selectedIndices.Push(keep); }
+                }
+            }
+            SyncContainerSelectionStates();
+            return true;
+        }
         return base.SetPropertyValue(propName, value);
     }
     public override DependencyObject GetPropertyValue(string propName) {
         if (propName == "SelectedIndex") { return DependencyObject.BoxInt(_selectedIndex); }
         if (propName == "SelectedItem") { return _selectedItemBox; }
+        if (propName == "SelectionMode") { return DependencyObject.BoxInt(EnumConvert.ToInt(_selectionMode)); }
+        if (propName == "SelectedValue") {
+            object sv = SelectedValue;
+            return sv != null ? DependencyObject.BoxObject(sv) : null;
+        }
         if (propName == "SelectedItem.Content") {
             object item = DependencyObject.Unbox(_selectedItemBox);
             if (item is ContentControl) {

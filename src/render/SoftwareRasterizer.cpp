@@ -1020,6 +1020,86 @@ void ApplySpanPostProcessEffect(
             }
             break;
         }
+        case UIEffectKind::DropShadow: {
+            constexpr float kDegToRad = 3.14159265358979323846f / 180.0f;
+            const float ws = (std::isfinite(span.worldScale) && span.worldScale > 0.0f) ? span.worldScale : 1.0f;
+            const float dpi = std::max(0.25f, rootDpiScale);
+            const float angRad = (std::isfinite(span.angleDeg) ? span.angleDeg : 0.0f) * kDegToRad;
+            const float depthPx = (std::isfinite(span.amountX) ? span.amountX : 0.0f) * ws * dpi;
+            const float dxPx = std::cos(angRad) * depthPx;
+            const float dyPx = -std::sin(angRad) * depthPx;
+
+            PremulOffscreenLayer shadowLayer{};
+            ScopedPremulLayerGuard shadowGuard{shadowLayer};
+            shadowLayer.originX = layer.originX;
+            shadowLayer.originY = layer.originY;
+            shadowLayer.width = w;
+            shadowLayer.height = h;
+            const std::size_t pxCount = static_cast<std::size_t>(w) * static_cast<std::size_t>(h);
+            gTlPremulLayerPool.Acquire(shadowLayer.premulRgba, pxCount * 4u, false);
+            const float* src = layer.premulRgba.data();
+            float* shDst = shadowLayer.premulRgba.data();
+
+            auto sampleAlphaZeroOutside = [src, w, h](float fx, float fy) noexcept -> float {
+                if (fx < 0.0f || fy < 0.0f ||
+                    fx > static_cast<float>(w - 1) || fy > static_cast<float>(h - 1)) {
+                    const int ix = static_cast<int>(std::lround(fx));
+                    const int iy = static_cast<int>(std::lround(fy));
+                    if (ix < 0 || ix >= w || iy < 0 || iy >= h) {
+                        return 0.0f;
+                    }
+                    return src[(static_cast<std::size_t>(iy) * static_cast<std::size_t>(w) + static_cast<std::size_t>(ix)) * 4u + 3u];
+                }
+                const int x0 = static_cast<int>(std::floor(fx));
+                const int y0 = static_cast<int>(std::floor(fy));
+                const int x1 = std::min(x0 + 1, w - 1);
+                const int y1 = std::min(y0 + 1, h - 1);
+                const float tx = fx - static_cast<float>(x0);
+                const float ty = fy - static_cast<float>(y0);
+                const std::size_t rowFloats = static_cast<std::size_t>(w) * 4u;
+                const float a00 = src[static_cast<std::size_t>(y0) * rowFloats + static_cast<std::size_t>(x0) * 4u + 3u];
+                const float a10 = src[static_cast<std::size_t>(y0) * rowFloats + static_cast<std::size_t>(x1) * 4u + 3u];
+                const float a01 = src[static_cast<std::size_t>(y1) * rowFloats + static_cast<std::size_t>(x0) * 4u + 3u];
+                const float a11 = src[static_cast<std::size_t>(y1) * rowFloats + static_cast<std::size_t>(x1) * 4u + 3u];
+                const float top = a00 + (a10 - a00) * tx;
+                const float bot = a01 + (a11 - a01) * tx;
+                return top + (bot - top) * ty;
+            };
+
+            for (int y = 0; y < h; ++y) {
+                const float sy = static_cast<float>(y) - dyPx;
+                float* dRow = shDst + static_cast<std::size_t>(y) * static_cast<std::size_t>(w) * 4u;
+                for (int x = 0; x < w; ++x) {
+                    const float a = std::clamp(sampleAlphaZeroOutside(static_cast<float>(x) - dxPx, sy), 0.0f, 1.0f);
+                    float* dp = dRow + static_cast<std::size_t>(x) * 4u;
+                    dp[0] = 0.0f;
+                    dp[1] = 0.0f;
+                    dp[2] = 0.0f;
+                    dp[3] = a;
+                }
+            }
+            const float boxRf = ComputeSpanBoxRadiusFloat(span) * dpi;
+            if (boxRf > 0.05f) {
+                SeparableBoxBlurPremul3PassFloat(shadowLayer, boxRf);
+            }
+            const float shColR = std::clamp(span.effectColor.r, 0.0f, 1.0f);
+            const float shColG = std::clamp(span.effectColor.g, 0.0f, 1.0f);
+            const float shColB = std::clamp(span.effectColor.b, 0.0f, 1.0f);
+            const float shColA = std::clamp(span.effectColor.a, 0.0f, 1.0f);
+            const float outerOp = std::clamp(std::isfinite(span.effectOpacity) ? span.effectOpacity : 1.0f, 0.0f, 1.0f);
+            float* dst = layer.premulRgba.data();
+            for (std::size_t i = 0u; i < pxCount; ++i) {
+                float* dp = dst + i * 4u;
+                const float srcA = std::clamp(dp[3], 0.0f, 1.0f);
+                const float shA = std::clamp(shDst[i * 4u + 3u] * shColA, 0.0f, 1.0f);
+                const float invSrcA = 1.0f - srcA;
+                dp[0] = std::clamp((dp[0] + (shColR * shA) * invSrcA) * outerOp, 0.0f, 1.0f);
+                dp[1] = std::clamp((dp[1] + (shColG * shA) * invSrcA) * outerOp, 0.0f, 1.0f);
+                dp[2] = std::clamp((dp[2] + (shColB * shA) * invSrcA) * outerOp, 0.0f, 1.0f);
+                dp[3] = std::clamp((srcA + shA * invSrcA) * outerOp, 0.0f, 1.0f);
+            }
+            break;
+        }
         default:
             break;
     }

@@ -602,13 +602,22 @@ public partial class UIElement {
         set {
             _contextMenu = value;
             if (value != null) {
-                MouseRightButtonUp += (object s, MouseButtonEventArgs e) => {
-                    ContextMenu cm = _contextMenu as ContextMenu;
-                    if (!e.Handled && cm != null) {
-                        cm.Open(this, e.X, e.Y);
-                        e.Handled = true;
-                    }
-                };
+                if (HasUiFlag(64) || HasUiFlag(256) ||
+                    (value._exclusiveOwner != null && value._exclusiveOwner != this)) {
+                    value.SetUiFlag(4096, true);
+                } else if (value._exclusiveOwner == null) {
+                    value._exclusiveOwner = this;
+                }
+                if (!HasUiFlag(2048)) {
+                    SetUiFlag(2048, true);
+                    MouseRightButtonUp += (object s, MouseButtonEventArgs e) => {
+                        ContextMenu cm = _contextMenu as ContextMenu;
+                        if (!e.Handled && cm != null) {
+                            cm.Open(this, e.X, e.Y);
+                            e.Handled = true;
+                        }
+                    };
+                }
             }
         }
     }
@@ -1083,6 +1092,12 @@ public class MenuItem : HeaderedItemsControl {
         }
     }
 
+    public override void OnMouseLeftButtonDown(MouseButtonEventArgs e) {
+        base.OnMouseLeftButtonDown(e);
+        if (!IsEnabled) { return; }
+        e.Handled = true;
+    }
+
     public override void OnMouseLeftButtonUp(MouseButtonEventArgs e) {
         base.OnMouseLeftButtonUp(e);
         if (!IsEnabled) { return; }
@@ -1098,7 +1113,9 @@ public class MenuItem : HeaderedItemsControl {
             return;
         }
         if (_isCheckable) { IsChecked = !IsChecked; }
-        Click(this, new RoutedEventArgs("Click", this));
+        var clickArgs = new RoutedEventArgs("Click", this);
+        Click(this, clickArgs);
+        RaiseRoutedEvent("Click", clickArgs);
         CommandTriggerHelper.ExecuteBox(_command, _commandParamBox);
         PopupService.CloseAll();
     }
@@ -1197,6 +1214,11 @@ public class MenuBase : ItemsControl {
     protected override bool IsItemItsOwnContainer(DependencyObject itemBox) {
         return itemBox is MenuItem || itemBox is Separator;
     }
+
+    public override void OnMouseLeftButtonDown(MouseButtonEventArgs e) {
+        base.OnMouseLeftButtonDown(e);
+        if (IsEnabled) { e.Handled = true; }
+    }
 }
 
 public class Menu : MenuBase {
@@ -1231,11 +1253,19 @@ public class Menu : MenuBase {
 
 public class ContextMenu : MenuBase {
     private Popup _popup;
+    internal UIElement _exclusiveOwner;
 
     public event RoutedEventHandler Opened;
     public event RoutedEventHandler Closed;
 
     public ContextMenu() : base() {
+        if (UIElement._contextMenuSetterHook == null) {
+            UIElement._contextMenuSetterHook = (UIElement el, string prop, DependencyObject val) => {
+                if (el != null) {
+                    el.ContextMenu = DependencyObject.Unbox(val) as ContextMenu;
+                }
+            };
+        }
         _popup = new Popup();
         _popup.StaysOpen = false;
         _popup.Child = this;
@@ -1249,12 +1279,33 @@ public class ContextMenu : MenuBase {
     public override string GetTypeName() { return "ContextMenu"; }
     internal override bool DisposeWhenResourceOwned() { return true; }
     public bool IsOpen {
-        get { return _popup.IsOpen; }
-        set { _popup.IsOpen = value; }
+        get { return _popup != null && _popup.IsOpen; }
+        set { if (_popup != null) { _popup.IsOpen = value; } }
+    }
+    public UIElement PlacementTarget {
+        get { return _popup != null ? _popup.PlacementTarget : null; }
+        set { if (_popup != null) { _popup.PlacementTarget = value; } }
+    }
+
+    public override DependencyObject GetPropertyValue(string propName) {
+        if (propName == "PlacementTarget") {
+            return PlacementTarget;
+        }
+        if (propName == "IsOpen") {
+            return DependencyObject.BoxBool(IsOpen);
+        }
+        return base.GetPropertyValue(propName);
     }
 
     public void Open(UIElement placementTarget = null, float x = 0.0f, float y = 0.0f) {
+        if (_popup == null) { return; }
+        if (_popup.IsOpen) {
+            _popup.IsOpen = false;
+        }
         _popup.PlacementTarget = placementTarget;
+        if (placementTarget != null && !HasLocalProperty("DataContext")) {
+            DataContextBox = placementTarget.EffectiveDataContextBox();
+        }
         _popup.Placement = "MousePoint";
         _popup.HorizontalOffset = x;
         _popup.VerticalOffset = y;
@@ -1263,13 +1314,16 @@ public class ContextMenu : MenuBase {
 
     protected override void CollectExtraDisposeTargets(UIElement[] q) {
         base.CollectExtraDisposeTargets(q);
+        _exclusiveOwner = null;
         if (_popup != null) {
             if (!_popup._isDisposedTree) { q.Push(_popup); }
             _popup = null;
         }
     }
 
-    public void Close() { _popup.IsOpen = false; }
+    public void Close() {
+        if (_popup != null) { _popup.IsOpen = false; }
+    }
 
     protected override UIElement CreateDefaultTemplate() {
         if (Style == null && _appliedStyle == null && Template == null) {
@@ -1609,7 +1663,7 @@ public class TreeViewItem : HeaderedItemsControl {
         TreeViewItem closest = ClosestTreeViewItemFrom(orig);
         if (closest != null && closest != this) { return; }
         SelectSelf();
-        if (ItemCount() > 0 && (_rowHost == null || e.ClickCount >= 2)) {
+        if (ItemCount() > 0 && e.ClickCount >= 2) {
             IsExpanded = !IsExpanded;
         }
         e.Handled = true;
@@ -1744,11 +1798,6 @@ public class TreeView : ItemsControl {
     public event EventHandler SelectedItemChanged;
 
     public TreeView() : base() {
-        Background = new SolidColorBrush("#FF171B24");
-        BorderBrush = new SolidColorBrush("#FF364054");
-        BorderThickness = new Thickness(1.0f);
-        CornerRadius = new CornerRadius(6.0f);
-        Padding = new Thickness(6.0f);
     }
 
     public override string GetTypeName() { return "TreeView"; }
@@ -1766,7 +1815,9 @@ public class TreeView : ItemsControl {
     public object SelectedItem {
         get {
             if (_selectedItem == null) { return null; }
-            if (_selectedItem.Header != null) { return _selectedItem.Header; }
+            if (ItemsSourceBox != null && _selectedItem.DataContext != null) {
+                return _selectedItem.DataContext;
+            }
             return _selectedItem;
         }
     }
@@ -1776,7 +1827,10 @@ public class TreeView : ItemsControl {
         if (_selectedItem != null) { _selectedItem.SetSelectedSilent(false); }
         _selectedItem = item;
         if (_selectedItem != null) { _selectedItem.IsSelected = true; }
+        BindingEngine.MarkFlushDirty();
+        BindingEngine.NotifyTargetPropertyChanged(this, "SelectedItem", DependencyObject.BoxObject(SelectedItem));
         SelectedItemChanged(this, EventArgs.Empty());
+        RaiseRoutedEvent("SelectedItemChanged", new RoutedEventArgs("SelectedItemChanged", this));
     }
 
     private static string InferDataTypeKey(object raw) {
@@ -1889,6 +1943,31 @@ public class TreeView : ItemsControl {
     }
 
     protected override UIElement CreateDefaultTemplate() {
+        if (Style == null && _appliedStyle == null && Template == null) {
+            if (!HasLocalProperty("Background") && Background == null) {
+                Background = new SolidColorBrush("#FF171B24");
+            }
+            if (!HasLocalProperty("BorderBrush") && BorderBrush == null) {
+                BorderBrush = new SolidColorBrush("#FF364054");
+            }
+            if (!HasLocalProperty("BorderThickness") &&
+                BorderThickness.Left == 0.0f && BorderThickness.Top == 0.0f &&
+                BorderThickness.Right == 0.0f && BorderThickness.Bottom == 0.0f) {
+                BorderThickness = new Thickness(1.0f);
+            }
+            CornerRadius curCr = this.CornerRadius;
+            if (!HasLocalProperty("CornerRadius") &&
+                (curCr == null ||
+                 (curCr.TopLeft == 0.0f && curCr.TopRight == 0.0f &&
+                  curCr.BottomRight == 0.0f && curCr.BottomLeft == 0.0f))) {
+                CornerRadius = new CornerRadius(6.0f);
+            }
+            if (!HasLocalProperty("Padding") &&
+                Padding.Left == 0.0f && Padding.Top == 0.0f &&
+                Padding.Right == 0.0f && Padding.Bottom == 0.0f) {
+                Padding = new Thickness(6.0f);
+            }
+        }
         var scroll = new ScrollViewer();
         _itemsPresenter = new ItemsPresenter();
         _itemsPresenter.EnsurePanel();
@@ -1903,10 +1982,6 @@ public class TreeView : ItemsControl {
     }
 
     public override bool SubscribeBehaviorRoutedEvent(string ev, BehaviorEventSink sink) {
-        if (ev == "SelectedItemChanged") {
-            SelectedItemChanged += (object s, EventArgs e) => { if (sink != null) { sink.OnBehaviorEvent(s, new RoutedEventArgs("SelectedItemChanged", this)); } };
-            return true;
-        }
         return base.SubscribeBehaviorRoutedEvent(ev, sink);
     }
 }
@@ -1938,6 +2013,7 @@ public class Page : ContentControl {
         VerticalContentAlignment = VerticalAlignment.Stretch;
     }
     public override string GetTypeName() { return "Page"; }
+    public override bool IsNamescopeBoundary() { return true; }
     protected override void OnBoxAppearanceChanged() {
         base.OnBoxAppearanceChanged();
         UpdateInheritedForegroundForBackground(Background);
@@ -1965,6 +2041,7 @@ public class Window : ContentControl {
     }
 
     public override string GetTypeName() { return "Window"; }
+    public override bool IsNamescopeBoundary() { return true; }
     protected override void OnBoxAppearanceChanged() {
         base.OnBoxAppearanceChanged();
         UpdateInheritedForegroundForBackground(Background);

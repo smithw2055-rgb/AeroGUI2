@@ -648,7 +648,7 @@ public static class EnumConvert {
         if (n == "CornerRadius") { return 19; }
         if (n == "PathTrimStart" || n == "TrimStart" || n == "Path.TrimStart" || n == "noesis:Path.TrimStart") { return 20; }
         if (n == "PathTrimEnd" || n == "TrimEnd" || n == "Path.TrimEnd" || n == "noesis:Path.TrimEnd") { return 21; }
-        if (n == "EffectRadius" || n == "Effect.Radius" || n == "BlurRadius") { return 22; }
+        if (n == "EffectRadius" || n == "Effect.Radius" || n == "Effect.BlurRadius" || n == "BlurRadius" || n == "DropShadowEffect.BlurRadius") { return 22; }
         if (n == "EffectOpacity" || n == "Effect.Opacity" || n == "DropShadowEffect.Opacity") { return 27; }
         if (n == "BrushOpacity" || n == "Brush.Opacity") { return 28; }
         if (n == "Fill" || n == "Fill.Color") { return 29; }
@@ -1200,6 +1200,7 @@ public class DependencyObject {
     }
 
     public static DependencyObject BoxString(string v) { return new BoxedString(v); }
+    public static DependencyObject BoxEnum(string name, int ordinal) { return new BoxedEnum(name, ordinal); }
     public static DependencyObject BoxFloat(float v) { return new BoxedFloat(v); }
     public static DependencyObject BoxInt(int v) { return new BoxedInt(v); }
     public static DependencyObject BoxBool(bool v) { return new BoxedBool(v); }
@@ -1222,6 +1223,7 @@ public class DependencyObject {
 
     public static float UnboxFloat(DependencyObject box, float fallback = 0.0f) {
         if (box == null) { return fallback; }
+        if (box is BoxedEnum) { return (float)(box as BoxedEnum).Ordinal; }
         if (box is BoxedFloat) { return (box as BoxedFloat).Value; }
         if (box is BoxedInt) { return (float)(box as BoxedInt).Value; }
         if (box is BoxedString) { return ParseUtil.ParseFloat((box as BoxedString).Value, fallback); }
@@ -1230,6 +1232,7 @@ public class DependencyObject {
 
     public static int UnboxInt(DependencyObject box, int fallback = 0) {
         if (box == null) { return fallback; }
+        if (box is BoxedEnum) { return (box as BoxedEnum).Ordinal; }
         if (box is BoxedInt) { return (box as BoxedInt).Value; }
         if (box is BoxedFloat) {
             float fv = (box as BoxedFloat).Value;
@@ -1242,6 +1245,7 @@ public class DependencyObject {
     public static bool UnboxBool(DependencyObject box, bool fallback = false) {
         if (box == null) { return fallback; }
         if (box is BoxedBool) { return (box as BoxedBool).Value; }
+        if (box is BoxedEnum) { return (box as BoxedEnum).Ordinal != 0; }
         if (box is BoxedInt) { return (box as BoxedInt).Value != 0; }
         if (box is BoxedString) { return ParseUtil.ParseBool((box as BoxedString).Value, fallback); }
         return fallback;
@@ -1299,6 +1303,11 @@ public class TypedBox<T> : DependencyObject {
 public class BoxedString : TypedBox<string> {
     public BoxedString(string v) : base(v) {}
     public override object UnboxObject() { return this; }
+}
+
+public class BoxedEnum : BoxedString {
+    public int Ordinal = 0;
+    public BoxedEnum(string v, int ordinal) : base(v) { Ordinal = ordinal; }
 }
 
 public class BoxedFloat : TypedBox<float> {
@@ -2632,6 +2641,7 @@ public partial class UIElement : DependencyObject {
     internal string[] _activeTriggerProps;
     internal int _uiFlags = 0;
     internal static AttachedPropChangedHook _toolTipEventHook;
+    internal static AttachedPropChangedHook _contextMenuSetterHook;
 
     internal bool HasUiFlag(int bit) {
         return ((_uiFlags / bit) % 2) != 0;
@@ -4089,7 +4099,14 @@ public partial class UIElement : DependencyObject {
                 }
             }
             if (cur._contextMenu != null) {
-                q.Push(cur._contextMenu);
+                if (!cur._contextMenu.HasUiFlag(4096)) {
+                    q.Push(cur._contextMenu);
+                } else {
+                    UIElement pt = cur._contextMenu.GetPropertyValue("PlacementTarget") as UIElement;
+                    if (pt == cur) {
+                        cur._contextMenu.SetPropertyValue("IsOpen", DependencyObject.BoxBool(false));
+                    }
+                }
             }
             if (cur._toolTip is UIElement) {
                 q.Push(cur._toolTip as UIElement);
@@ -4177,22 +4194,32 @@ public partial class UIElement : DependencyObject {
 
     public UIElement FindName(string name) {
         if (name == null || name.Length == 0) { return null; }
-        var stack = new UIElement[0];
-        stack.Push(this);
-        while (stack.Length > 0) {
-            int last = stack.Length - 1;
-            UIElement cur = stack[last];
-            stack.RemoveAt(last);
-            if (cur == null) { continue; }
-            if (cur._name == name) { return cur; }
-            if (cur._detachedLogicalChildren != null) {
-                for (int i = cur._detachedLogicalChildren.Length - 1; i >= 0; i -= 1) {
-                    stack.Push(cur._detachedLogicalChildren[i]);
+        UIElement rootTp = this._templatedParent;
+        for (int pass = 0; pass < 2; pass += 1) {
+            bool scoped = (pass == 0);
+            var stack = new UIElement[0];
+            stack.Push(this);
+            while (stack.Length > 0) {
+                int last = stack.Length - 1;
+                UIElement cur = stack[last];
+                stack.RemoveAt(last);
+                if (cur == null) { continue; }
+                if (scoped && cur != this) {
+                    if (cur._templatedParent == rootTp && cur._name == name) { return cur; }
+                    if (cur.IsNamescopeBoundary()) { continue; }
+                    if (cur._templatedParent != rootTp && cur is Control && !(cur is ContentControl) && !(cur is ItemsControl)) { continue; }
+                } else {
+                    if (cur._name == name) { return cur; }
                 }
-            }
-            if (cur._children != null) {
-                for (int i = cur._children.Length - 1; i >= 0; i -= 1) {
-                    stack.Push(cur._children[i]);
+                if (cur._detachedLogicalChildren != null) {
+                    for (int i = cur._detachedLogicalChildren.Length - 1; i >= 0; i -= 1) {
+                        stack.Push(cur._detachedLogicalChildren[i]);
+                    }
+                }
+                if (cur._children != null) {
+                    for (int i = cur._children.Length - 1; i >= 0; i -= 1) {
+                        stack.Push(cur._children[i]);
+                    }
                 }
             }
         }
@@ -4971,8 +4998,20 @@ public partial class UIElement : DependencyObject {
             }
             return true;
         }
+        if (propName == "ContextMenu") {
+            if (_contextMenuSetterHook != null) {
+                var cmHook = _contextMenuSetterHook;
+                cmHook(this, propName, value);
+            } else {
+                _contextMenu = DependencyObject.Unbox(value) as UIElement;
+            }
+            return true;
+        }
         string cleanCustom = NormalizeCustomPropKey(propName);
         if (IsCustomAttachedPropKey(cleanCustom)) {
+            if (cleanCustom.Length > 6 && cleanCustom.EndsWith("_Int32") && value != null && !(value is BoxedInt)) {
+                value = DependencyObject.BoxInt(DependencyObject.UnboxInt(value, 0));
+            }
             SetDynamicProp(cleanCustom, value);
             NotifyBoundPropertyChanged(cleanCustom, value);
             if (cleanCustom != propName) {
@@ -5146,6 +5185,7 @@ public partial class UIElement : DependencyObject {
             return DependencyObject.BoxFloat(GetTransformScalar(propName));
         }
         if (propName == "FlowDirection") { return DependencyObject.BoxString(_flowDirection); }
+        if (propName == "ContextMenu") { return _contextMenu; }
         if (propName == "Loc.Source" || propName == "noesis:Loc.Source") { return DependencyObject.BoxString(_locSource); }
         DependencyObject customBox = GetDynamicProp(NormalizeCustomPropKey(propName));
         if (customBox != null) { return customBox; }
@@ -5324,7 +5364,7 @@ public partial class UIElement : DependencyObject {
         }
     }
 
-    public virtual bool IsNamescopeBoundary() { return false; }
+    public virtual bool IsNamescopeBoundary() { return HasUiFlag(1024); }
 }
 
 public class FrameworkElement : UIElement {
@@ -5444,7 +5484,13 @@ public static class InputDispatcher {
     private static float _lastClickX;
     private static float _lastClickY;
     private static int _clickSeq;
+    private static float _uiClockSec = 0.0f;
+    private static float _lastClickTimeSec = -10.0f;
     private static PopupDismissHook[] _popupHooks;
+
+    internal static void AdvanceUiClock(float dt) {
+        if (dt > 0.0f) { _uiClockSec = _uiClockSec + dt; }
+    }
 
     public static UIElement HoveredElement() { return _hovered; }
     public static UIElement CapturedElement() { return _captured; }
@@ -5660,15 +5706,23 @@ public static class InputDispatcher {
             NotifyPopupHooks(target, false);
             PointerButton btn = EnumConvert.ToPointerButton(button);
             int clickCount = 1;
-            if (btn == PointerButton.Left && _lastClickTarget == target &&
-                Math.Absf(x - _lastClickX) < 5.0f && Math.Absf(y - _lastClickY) < 5.0f && _clickSeq == 1) {
+            bool sameClickTarget = (_lastClickTarget == target) ||
+                (target != null && _lastClickTarget != null &&
+                 target.TemplatedParent != null &&
+                 target.TemplatedParent == _lastClickTarget.TemplatedParent);
+            float sinceLast = _uiClockSec - _lastClickTimeSec;
+            if (btn == PointerButton.Left && sameClickTarget && _clickSeq == 1 &&
+                sinceLast >= 0.0f && sinceLast <= 0.5f &&
+                Math.Absf(x - _lastClickX) < 6.0f && Math.Absf(y - _lastClickY) < 6.0f) {
                 clickCount = 2;
                 _clickSeq = 0;
+                _lastClickTimeSec = -10.0f;
             } else {
                 _lastClickTarget = target;
                 _lastClickX = x;
                 _lastClickY = y;
                 _clickSeq = 1;
+                _lastClickTimeSec = _uiClockSec;
             }
 
             var downArgs = new MouseButtonEventArgs(

@@ -80,6 +80,15 @@ public:
         ZeroCopyGpuStream* gpuStream = nullptr,
         VisualInputRouter* inputRouter = nullptr) noexcept;
 
+    using ModalFrameCallback = void (*)(float dtSeconds, void* userData) noexcept;
+
+    // Optional live-frame callback invoked during OS modal resize/move loops (e.g. Win32 WM_SIZE)
+    void SetModalFrameCallback(ModalFrameCallback callback, void* userData) noexcept {
+        modalFrameCallback_ = callback;
+        modalFrameUserData_ = userData;
+    }
+    void DispatchModalLiveFrame(float dtSeconds = 0.0f) noexcept;
+
     // Optional injection of custom IGpuDeviceBackend (e.g. mock GL spy backend in unit tests)
     void SetCustomGpuBackend(std::unique_ptr<IGpuDeviceBackend> customBackend) noexcept;
 
@@ -106,10 +115,16 @@ public:
     // Thread-safe wake signal: wakes a blocked X11 poll() / Win32 MsgWaitForMultipleObjects / Web rAF
     void WakeEventLoop() noexcept;
 
+    // Pump pending OS events without rendering; if CanSleepIdle() is true and maxWaitMs != 0,
+    // blocks at 0% CPU until an OS input/window event or WakeEventLoop() arrives.
+    bool PumpPlatformEvents(std::int32_t maxWaitMs = 0, bool* outSleptIdle = nullptr);
+
     // Pump pending OS events; if DesktopEventHost::CanSleepIdle() is true and maxWaitMs != 0,
     // blocks at 0% CPU until an OS input/window event or WakeEventLoop() arrives (maxWaitMs < 0 waits indefinitely).
     // Immediately runs TickUi + RecordGpuCommands + GPU/Software Present when dirty or woken.
     bool PumpEventsAndRender(float dtSeconds = 0.016f, std::int32_t maxWaitMs = 0);
+
+    [[nodiscard]] bool NeedsPresent() const noexcept { return needsInitialRender_ || !CanHostSleepIdle(); }
 
     // Run event-driven main loop until RequestClose() or maxFrames is reached (0 = unlimited).
     // On Emscripten, registers non-blocking on-demand rAF callbacks and returns immediately (0 ASYNCIFY).
@@ -219,6 +234,10 @@ private:
     std::atomic<bool> closeRequested_{false};
     std::atomic<bool> wakeSignaled_{false};
     bool needsInitialRender_ = true;
+    bool inModalFrameDispatch_ = false;
+    bool inTickAndPresent_ = false;
+    ModalFrameCallback modalFrameCallback_ = nullptr;
+    void* modalFrameUserData_ = nullptr;
     std::chrono::steady_clock::time_point lastFrameTimestamp_{};
     bool hasLastFrameTimestamp_ = false;
 
@@ -243,6 +262,8 @@ private:
     std::uint16_t pendingHighSurrogate_ = 0u;
     std::uint8_t win32PressedMouseMask_ = 0u;
     bool win32WindowShown_ = false;
+    bool win32InSizeMove_ = false;
+    std::chrono::steady_clock::time_point win32LastModalTick_{};
     struct Win32AudioState;
     std::unique_ptr<Win32AudioState> win32Audio_;
 #elif defined(__EMSCRIPTEN__)

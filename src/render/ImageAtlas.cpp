@@ -2668,6 +2668,9 @@ void EnsureImageAtlasRegisteredWithStore() noexcept {
            std::vector<std::uint8_t>&& rgbaPixels) {
             return atlas.RegisterOrUpdateRgbaTextureSlot(
                 reuseSlotId, w, h, std::move(rgbaPixels));
+        },
+        [](ImageAtlas& atlas, std::uint32_t texId) noexcept {
+            atlas.ReleaseRgbaTextureSlot(texId);
         });
 }
 
@@ -2898,7 +2901,7 @@ const ImageAtlasEntry* ImageAtlas::InsertDecodedLocked(
     }
 
     if (!packedInSharedAtlas) {
-        const std::uint32_t texId = nextStandaloneTextureId_++;
+        const std::uint32_t texId = AllocateStandaloneTextureIdLocked();
         const std::uint64_t pendingRev = revision_.load(std::memory_order_relaxed) + 1u;
         TextureSlotBuffer slot{};
         slot.textureId = texId;
@@ -2906,8 +2909,8 @@ const ImageAtlasEntry* ImageAtlas::InsertDecodedLocked(
         slot.height = image.height;
         slot.dirtyRevision = static_cast<std::uint32_t>(pendingRev != 0u ? pendingRev : 1u);
         slot.isAtlas = false;
-        slot.rgbaPixels = std::move(image.rgbaPixels);
-        slot.pixelSnapshot = std::make_shared<const std::vector<std::uint8_t>>(slot.rgbaPixels);
+        slot.pixelSnapshot = std::make_shared<const std::vector<std::uint8_t>>(std::move(image.rgbaPixels));
+        slot.rgbaPixels.clear();
         textureSlots_.emplace(texId, std::move(slot));
         revision_.fetch_add(1u, std::memory_order_release);
 
@@ -2942,6 +2945,22 @@ const ImageAtlasEntry* ImageAtlas::RegisterDecodedImage(
     return InsertDecodedLocked(normKey, std::move(image), forceStandalone);
 }
 
+std::uint32_t ImageAtlas::AllocateStandaloneTextureIdLocked() noexcept {
+    while (!freeStandaloneTextureIds_.empty()) {
+        const std::uint32_t recycled = freeStandaloneTextureIds_.back();
+        freeStandaloneTextureIds_.pop_back();
+        if (recycled > 0u &&
+            recycled != kSharedUiAtlasTextureId &&
+            textureSlots_.find(recycled) == textureSlots_.end()) {
+            if (recycled >= nextStandaloneTextureId_) {
+                nextStandaloneTextureId_ = recycled + 1u;
+            }
+            return recycled;
+        }
+    }
+    return nextStandaloneTextureId_++;
+}
+
 std::uint32_t ImageAtlas::RegisterOrUpdateRgbaTextureSlot(
     std::uint32_t reuseSlotId,
     std::uint32_t width,
@@ -2952,10 +2971,20 @@ std::uint32_t ImageAtlas::RegisterOrUpdateRgbaTextureSlot(
         return 0u;
     }
     std::lock_guard<std::mutex> lock(mutex_);
-    const std::uint32_t texId = (reuseSlotId > 0u && textureSlots_.find(reuseSlotId) != textureSlots_.end())
-        ? reuseSlotId
-        : nextStandaloneTextureId_++;
-    auto nextSnap = std::make_shared<const std::vector<std::uint8_t>>(rgbaPixels);
+    std::uint32_t texId = 0u;
+    if (reuseSlotId > 0u && reuseSlotId != kSharedUiAtlasTextureId) {
+        const auto freeIt = std::find(freeStandaloneTextureIds_.begin(), freeStandaloneTextureIds_.end(), reuseSlotId);
+        if (freeIt != freeStandaloneTextureIds_.end()) {
+            freeStandaloneTextureIds_.erase(freeIt);
+        }
+        if (reuseSlotId >= nextStandaloneTextureId_) {
+            nextStandaloneTextureId_ = reuseSlotId + 1u;
+        }
+        texId = reuseSlotId;
+    } else {
+        texId = AllocateStandaloneTextureIdLocked();
+    }
+    auto nextSnap = std::make_shared<const std::vector<std::uint8_t>>(std::move(rgbaPixels));
     const std::uint64_t pendingRev = revision_.load(std::memory_order_relaxed) + 1u;
     TextureSlotBuffer& slot = textureSlots_[texId];
     slot.textureId = texId;
@@ -2963,10 +2992,27 @@ std::uint32_t ImageAtlas::RegisterOrUpdateRgbaTextureSlot(
     slot.height = height;
     slot.dirtyRevision = static_cast<std::uint32_t>(pendingRev != 0u ? pendingRev : 1u);
     slot.isAtlas = false;
-    slot.rgbaPixels = std::move(rgbaPixels);
+    slot.rgbaPixels.clear();
+    slot.rgbaPixels.shrink_to_fit();
     slot.pixelSnapshot = std::move(nextSnap);
     revision_.fetch_add(1u, std::memory_order_release);
     return texId;
+}
+
+void ImageAtlas::ReleaseRgbaTextureSlot(std::uint32_t textureId) noexcept {
+    if (textureId == 0u || textureId == kSharedUiAtlasTextureId) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(mutex_);
+    const auto it = textureSlots_.find(textureId);
+    if (it != textureSlots_.end() && !it->second.isAtlas) {
+        textureSlots_.erase(it);
+        if (std::find(freeStandaloneTextureIds_.begin(), freeStandaloneTextureIds_.end(), textureId) ==
+            freeStandaloneTextureIds_.end()) {
+            freeStandaloneTextureIds_.push_back(textureId);
+        }
+        revision_.fetch_add(1u, std::memory_order_release);
+    }
 }
 
 bool ImageAtlas::RegisterOrUpdateVisualBrushSlot(
@@ -3160,28 +3206,70 @@ const ImageAtlasEntry* ImageAtlas::FindLoaded(
 
 namespace {
 
-float HashGrad2D(int ix, int iy, float dx, float dy, int seedOff) noexcept {
-    std::uint32_t h = static_cast<std::uint32_t>(ix * 374761393 + iy * 668265263 + seedOff * 1442695041);
+std::uint32_t HashLattice3D(int ix, int iy, int iz, std::uint32_t seed) noexcept {
+    std::uint32_t h = static_cast<std::uint32_t>(ix) * 374761393u +
+                      static_cast<std::uint32_t>(iy) * 668265263u +
+                      static_cast<std::uint32_t>(iz) * 2147483647u +
+                      seed * 1442695041u;
     h = (h ^ (h >> 13u)) * 1274126177u;
-    h ^= (h >> 16u);
-    const float ang = static_cast<float>(h & 0xFFFFu) * (6.283185307f / 65536.0f);
-    return std::cos(ang) * dx + std::sin(ang) * dy;
+    return h ^ (h >> 16u);
 }
 
-float Perlin2D(float x, float y, int seedOff) noexcept {
-    const int x0 = static_cast<int>(std::floor(x));
-    const int y0 = static_cast<int>(std::floor(y));
-    const float fx = x - static_cast<float>(x0);
-    const float fy = y - static_cast<float>(y0);
+float Grad3D(std::uint32_t h, float x, float y, float z) noexcept {
+    switch (h & 15u) {
+        case 0u:  return  x + y;
+        case 1u:  return -x + y;
+        case 2u:  return  x - y;
+        case 3u:  return -x - y;
+        case 4u:  return  x + z;
+        case 5u:  return -x + z;
+        case 6u:  return  x - z;
+        case 7u:  return -x - z;
+        case 8u:  return  y + z;
+        case 9u:  return -y + z;
+        case 10u: return  y - z;
+        case 11u: return -y - z;
+        case 12u: return  y + x;
+        case 13u: return -y + z;
+        case 14u: return  y - x;
+        default:  return -y - z;
+    }
+}
+
+float Perlin3D(float x, float y, float z, std::uint32_t seed) noexcept {
+    const float flX = std::floor(x);
+    const float flY = std::floor(y);
+    const float flZ = std::floor(z);
+    const int x0 = static_cast<int>(flX);
+    const int y0 = static_cast<int>(flY);
+    const int z0 = static_cast<int>(flZ);
+    const float fx = x - flX;
+    const float fy = y - flY;
+    const float fz = z - flZ;
     const float ux = fx * fx * fx * (fx * (fx * 6.0f - 15.0f) + 10.0f);
     const float uy = fy * fy * fy * (fy * (fy * 6.0f - 15.0f) + 10.0f);
-    const float n00 = HashGrad2D(x0, y0, fx, fy, seedOff);
-    const float n10 = HashGrad2D(x0 + 1, y0, fx - 1.0f, fy, seedOff);
-    const float n01 = HashGrad2D(x0, y0 + 1, fx, fy - 1.0f, seedOff);
-    const float n11 = HashGrad2D(x0 + 1, y0 + 1, fx - 1.0f, fy - 1.0f, seedOff);
-    const float nx0 = n00 + (n10 - n00) * ux;
-    const float nx1 = n01 + (n11 - n01) * ux;
-    return nx0 + (nx1 - nx0) * uy;
+    const float uz = fz * fz * fz * (fz * (fz * 6.0f - 15.0f) + 10.0f);
+
+    auto lerp = [](float a, float b, float t) noexcept -> float {
+        return a + (b - a) * t;
+    };
+
+    const float n000 = Grad3D(HashLattice3D(x0,     y0,     z0,     seed), fx,        fy,        fz);
+    const float n100 = Grad3D(HashLattice3D(x0 + 1, y0,     z0,     seed), fx - 1.0f, fy,        fz);
+    const float n010 = Grad3D(HashLattice3D(x0,     y0 + 1, z0,     seed), fx,        fy - 1.0f, fz);
+    const float n110 = Grad3D(HashLattice3D(x0 + 1, y0 + 1, z0,     seed), fx - 1.0f, fy - 1.0f, fz);
+    const float n001 = Grad3D(HashLattice3D(x0,     y0,     z0 + 1, seed), fx,        fy,        fz - 1.0f);
+    const float n101 = Grad3D(HashLattice3D(x0 + 1, y0,     z0 + 1, seed), fx - 1.0f, fy,        fz - 1.0f);
+    const float n011 = Grad3D(HashLattice3D(x0,     y0 + 1, z0 + 1, seed), fx,        fy - 1.0f, fz - 1.0f);
+    const float n111 = Grad3D(HashLattice3D(x0 + 1, y0 + 1, z0 + 1, seed), fx - 1.0f, fy - 1.0f, fz - 1.0f);
+
+    const float nx00 = lerp(n000, n100, ux);
+    const float nx10 = lerp(n010, n110, ux);
+    const float nx01 = lerp(n001, n101, ux);
+    const float nx11 = lerp(n011, n111, ux);
+    const float nxy0 = lerp(nx00, nx10, uy);
+    const float nxy1 = lerp(nx01, nx11, uy);
+    return lerp(nxy0, nxy1, uz);
 }
 
 struct PlasmaShaderParams {
@@ -3229,14 +3317,14 @@ bool ParsePlasmaShaderUri(std::string_view uri, PlasmaShaderParams& outParams, s
 }
 
 bool SynthesizePlasmaShaderImageFromParams(const PlasmaShaderParams& params, DecodedImage& outImg) {
-    float baseR = 0.118f, baseG = 0.565f, baseB = 1.0f, baseA = 1.0f;
+    float baseR = 0.004f, baseG = 0.737f, baseB = 1.0f, baseA = 1.0f;
     std::string cleanCol = params.colorHex;
     if (cleanCol.size() >= 3u && cleanCol.substr(0u, 3u) == "%23") {
         cleanCol = "#" + cleanCol.substr(3u);
     }
     if (!cleanCol.empty()) {
         std::uint32_t rgba = ParseColorRgba32(cleanCol);
-        if (rgba == 0u) { rgba = 0xFFFF901Eu; }
+        if (rgba == 0u) { rgba = 0xFFFFBC01u; }
         baseR = static_cast<float>(rgba & 0xFFu) / 255.0f;
         baseG = static_cast<float>((rgba >> 8u) & 0xFFu) / 255.0f;
         baseB = static_cast<float>((rgba >> 16u) & 0xFFu) / 255.0f;
@@ -3251,26 +3339,45 @@ bool SynthesizePlasmaShaderImageFromParams(const PlasmaShaderParams& params, Dec
     outImg.rgbaPixels.resize(static_cast<std::size_t>(w) * static_cast<std::size_t>(h) * 4u);
 
     const int seedInt = static_cast<int>(std::lround(params.seed));
-    const float t = params.timeSec * 0.5f;
-    const float invSx = 1.0f / params.sx;
-    const float invSy = 1.0f / params.sy;
-    const float hiR = std::clamp(baseR * 0.25f, 0.0f, 1.0f);
-    const float hiG = std::clamp(baseG * 0.6f + 0.42f, 0.0f, 1.0f);
-    const float hiB = std::clamp(baseB * 0.8f + 0.25f, 0.0f, 1.0f);
+    const std::uint32_t seedU = static_cast<std::uint32_t>(seedInt);
+    const std::uint32_t seedW1 = seedU * 3u + 11u;
+    const std::uint32_t seedW2 = seedU * 5u + 29u;
+    const std::uint32_t seedN0 = seedU * 7u + 53u;
+    const std::uint32_t seedN1 = seedU * 11u + 97u;
+    const float seedOx = static_cast<float>((seedU * 17u) % 997u) * 0.37f;
+    const float seedOy = static_cast<float>((seedU * 31u) % 997u) * 0.43f;
+
+    const float invSx = 1.30f / std::max(4.0f, params.sx);
+    const float invSy = 1.30f / std::max(4.0f, params.sy);
+    const float tz = params.timeSec * 0.55f;
+    const float driftX = params.timeSec * 0.35f;
+    const float driftY = -params.timeSec * 0.18f;
+
     for (std::uint32_t py = 0u; py < h; ++py) {
-        const float ny = (static_cast<float>(py) + 0.5f) * invSy;
+        const float y = (static_cast<float>(py) + 0.5f) * invSy + seedOy + driftY;
         for (std::uint32_t px = 0u; px < w; ++px) {
-            const float nx = (static_cast<float>(px) + 0.5f) * invSx;
-            const float f0 = Perlin2D(nx * 1.65f + t * 0.25f, ny * 1.65f - t * 0.18f, seedInt + 17);
-            const float f1 = 0.52f * Perlin2D(nx * 3.1f - t * 0.22f, ny * 3.1f + t * 0.24f, seedInt + 53);
-            const float field = (f0 + f1) * 2.55f + 0.22f * std::sin((nx + ny) * 3.14159265f + t * 0.4f);
-            const float wave = std::fabs(std::sin(field * 3.14159265f));
-            const float band = std::clamp((0.46f - wave) / 0.46f, 0.0f, 1.0f);
-            const float alpha = band * band * (3.0f - 2.0f * band);
-            const float ridge = std::clamp((band - 0.35f) / 0.65f, 0.0f, 1.0f);
-            const float outR = hiR + (baseR - hiR) * ridge;
-            const float outG = hiG + (baseG - hiG) * ridge;
-            const float outB = hiB + (baseB - hiB) * ridge;
+            const float x = (static_cast<float>(px) + 0.5f) * invSx + seedOx + driftX;
+            const float wx = Perlin3D(x * 0.75f, y * 0.75f, tz * 0.85f, seedW1);
+            const float wy = Perlin3D(x * 0.75f + 13.7f, y * 0.75f + 7.3f, tz * 0.85f + 5.1f, seedW2);
+            const float n0 = Perlin3D(x + wx * 0.90f, y + wy * 0.90f, tz, seedN0);
+            const float n1 = 0.20f * Perlin3D(x * 1.75f - wx * 0.45f, y * 1.75f + wy * 0.45f, tz * 1.30f + 9.4f, seedN1);
+            const float field = n0 + n1;
+
+            const float raw = std::clamp((field + 0.08f) / 0.56f, 0.0f, 1.0f);
+            const float glow = raw * raw * (3.0f - 2.0f * raw);
+            const float invGlow = 1.0f - glow;
+            const float alpha = std::clamp(1.0f - invGlow * invGlow, 0.0f, 1.0f);
+
+            const float boost = 1.0f + 0.80f * glow;
+            const float coreT = std::clamp((glow - 0.46f) / 0.54f, 0.0f, 1.0f);
+            const float hotCore = coreT * coreT * (3.0f - 2.0f * coreT) * 0.92f;
+            const float cR = std::clamp(baseR * boost, 0.0f, 1.0f);
+            const float cG = std::clamp(baseG * boost, 0.0f, 1.0f);
+            const float cB = std::clamp(baseB * boost, 0.0f, 1.0f);
+            const float outR = cR + (1.0f - cR) * hotCore;
+            const float outG = cG + (1.0f - cG) * hotCore;
+            const float outB = cB + (1.0f - cB) * hotCore;
+
             std::uint8_t* dst = outImg.rgbaPixels.data() + (static_cast<std::size_t>(py) * w + px) * 4u;
             dst[0] = static_cast<std::uint8_t>(std::clamp(outR, 0.0f, 1.0f) * 255.0f + 0.5f);
             dst[1] = static_cast<std::uint8_t>(std::clamp(outG, 0.0f, 1.0f) * 255.0f + 0.5f);
@@ -3816,6 +3923,7 @@ void ImageAtlas::Clear() noexcept {
     visualBrushSlots_.clear();
     dynamicSlotTick_ = 0u;
     textureSlots_.clear();
+    freeStandaloneTextureIds_.clear();
     nextStandaloneTextureId_ = 1u;
     revision_.fetch_add(1u, std::memory_order_release);
 }
@@ -4006,7 +4114,12 @@ bool CompositeMaskedPathTexture(
     const float v0 = static_cast<float>(clampedPad) / static_cast<float>(texH);
     const float u1 = static_cast<float>(clampedPad + clampedW) / static_cast<float>(texW);
     const float v1 = static_cast<float>(clampedPad + clampedH) / static_cast<float>(texH);
-    return store.StoreCachedPathMask(key, texW, texH, u0, v0, u1, v1, std::move(maskRgba), outEntry);
+    const std::uint64_t imgGroup =
+        safeHash ^
+        (static_cast<std::uint64_t>(imgEntry.textureId) << 32u) ^
+        static_cast<std::uint64_t>(fillTintRgba) ^
+        0xC3C3C3C300000003ULL;
+    return store.StoreCachedPathMask(key, texW, texH, u0, v0, u1, v1, std::move(maskRgba), outEntry, imgGroup);
 }
 
 bool CompositeMaskedPathImage(

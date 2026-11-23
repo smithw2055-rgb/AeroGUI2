@@ -962,6 +962,22 @@ AeroAppHost::~AeroAppHost() {
 }
 
 void AeroAppHost::WireKernelBridges() {
+    desktopHost_.SetBindingFlushCallback(
+        [](void* ud) noexcept {
+            if (auto* self = static_cast<AeroAppHost*>(ud)) {
+                self->FlushBindings();
+            }
+        },
+        this);
+
+    windowHost_.SetModalFrameCallback(
+        [](float dtSeconds, void* ud) noexcept {
+            if (auto* self = static_cast<AeroAppHost*>(ud)) {
+                self->StepFrame(dtSeconds, true);
+            }
+        },
+        this);
+
     animEngine_.SetWakeHostCallback([this]() {
         desktopHost_.SetActiveAnimations(true);
         desktopHost_.TriggerWake();
@@ -1032,6 +1048,8 @@ bool AeroAppHost::InitializeRuntime() {
     winCfg.height = std::max<std::uint32_t>(1u, config_.viewportHeight);
     winCfg.clearColor = config_.clearColor;
     winCfg.preferHardwareGpu = !config_.preferSoftwareRasterizer && !config_.headless;
+    winCfg.enableHighDpi = config_.enableHighDpi;
+    winCfg.dpiScale = config_.dpiScale;
     winCfg.allowHeadlessFallback = true;
     winCfg.forceHeadless = config_.headless;
 
@@ -1041,13 +1059,15 @@ bool AeroAppHost::InitializeRuntime() {
     }
 
     if (!config_.headless && windowHost_.Mode() != NativeWindowMode::HeadlessSoftware) {
+        const float dpi = std::max(0.25f, windowHost_.DpiScale());
+        const float treeDpi = (windowHost_.Mode() == NativeWindowMode::Win32GdiSoftware) ? 1.0f : dpi;
         config_.viewportWidth = std::max<std::uint32_t>(1u, windowHost_.LogicalWidth());
         config_.viewportHeight = std::max<std::uint32_t>(1u, windowHost_.LogicalHeight());
-        desktopHost_.SetDpiScale(windowHost_.DpiScale());
+        desktopHost_.SetDpiScale(dpi);
         desktopHost_.SetViewportSize(Size{
             static_cast<float>(windowHost_.Width()),
             static_cast<float>(windowHost_.Height())});
-        renderTree_.SetRootDpiScale(windowHost_.DpiScale());
+        renderTree_.SetRootDpiScale(treeDpi);
     } else {
         desktopHost_.SetDpiScale(1.0f);
         desktopHost_.SetViewportSize(Size{
@@ -1119,6 +1139,7 @@ std::string AeroAppHost::ResolveSoundAssetPath(std::string_view uri) const {
 
 void AeroAppHost::ResetLoadedProgramState() noexcept {
     closeRequested_ = false;
+    inStepFrame_ = false;
     scheduledWakeAt_.reset();
     simObjectPin_.reset();
     simObject_ = ObjectRef{};
@@ -1126,6 +1147,7 @@ void AeroAppHost::ResetLoadedProgramState() noexcept {
     rootObject_ = ObjectRef{};
     symbols_ = CachedDispatchSymbols{};
     lastCanvasDrawSizes_.clear();
+    lastNotifiedViewport_ = Size{-1.0f, -1.0f};
     playedSounds_.clear();
 
     animEngine_.Clear();
@@ -2493,9 +2515,14 @@ bool AeroAppHost::BindSimFloatColumn(
 }
 
 void AeroAppHost::StepFrame(float dtSeconds, bool forceRenderSync) {
-    if (!initialized_) {
+    if (!initialized_ || inStepFrame_) {
         return;
     }
+    struct StepFrameScopeGuard {
+        bool& flag;
+        explicit StepFrameScopeGuard(bool& f) noexcept : flag(f) { flag = true; }
+        ~StepFrameScopeGuard() noexcept { flag = false; }
+    } stepGuard(inStepFrame_);
     const bool trace = IsAeroTraceEnabled();
     auto logTrace = [&](const char* msg) {
         if (trace) {
@@ -2593,10 +2620,10 @@ void AeroAppHost::StepFrame(float dtSeconds, bool forceRenderSync) {
         if (animEngine_.Tick(dt, world_)) {
             desktopHost_.NotifyDirtyLayout();
         }
+        FlushBindings();
         const bool stillActive = animEngine_.HasActiveAnimations();
         desktopHost_.SetActiveAnimations(stillActive);
         if (!stillActive) {
-            FlushBindings();
             desktopHost_.NotifyDirtyObjects();
             desktopHost_.NotifyDirtyLayout();
         }
@@ -2616,17 +2643,21 @@ void AeroAppHost::StepFrame(float dtSeconds, bool forceRenderSync) {
         vpH = static_cast<float>(windowHost_.Height()) / dpi;
     }
     const Size targetViewport{vpW, vpH};
-    const bool viewportChanged = (world_.LastLayoutViewport() != targetViewport);
+    const bool scriptViewportChanged = (lastNotifiedViewport_ != targetViewport);
+    const bool viewportChanged = scriptViewportChanged || (world_.LastLayoutViewport() != targetViewport);
     const bool hadDirtyBeforeLayout = world_.HasAnyDirty();
     if (forceRenderSync || viewportChanged || hadDirtyBeforeLayout) {
         logTrace("UpdateLayout");
         world_.UpdateLayout(vpW, vpH);
-        if (viewportChanged && rootObject_.valid()) {
+        if (scriptViewportChanged && rootObject_.valid()) {
+            lastNotifiedViewport_ = targetViewport;
             (void)InvokeScriptMethod(
                 rootObject_,
                 "OnHostViewportResized",
                 {UnifiedValue{FloatValue{vpW}}, UnifiedValue{FloatValue{vpH}}},
                 nullptr);
+        } else if (rootObject_.valid()) {
+            lastNotifiedViewport_ = targetViewport;
         }
         FlushBindings();
         if (world_.FlushTrackB() > 0u || world_.HasAnyDirty()) {
@@ -2651,11 +2682,12 @@ void AeroAppHost::StepFrame(float dtSeconds, bool forceRenderSync) {
     if (needSync) {
         if (hasLiveWindow) {
             const float dpi = std::max(0.25f, windowHost_.DpiScale());
+            const float treeDpi = (windowHost_.Mode() == NativeWindowMode::Win32GdiSoftware) ? 1.0f : dpi;
             desktopHost_.SetDpiScale(dpi);
             desktopHost_.SetViewportSize(Size{
                 static_cast<float>(windowHost_.Width()),
                 static_cast<float>(windowHost_.Height())});
-            renderTree_.SetRootDpiScale(dpi);
+            renderTree_.SetRootDpiScale(treeDpi);
         } else {
             desktopHost_.SetDpiScale(1.0f);
             desktopHost_.SetViewportSize(targetViewport);
@@ -2944,9 +2976,9 @@ std::uint64_t AeroAppHost::RunWindowedLoop(std::uint64_t maxFrames) {
         }
         const std::int32_t waitMs = idleAllowed
             ? (maxFrames > 0u ? 0 : scheduledWaitMs)
-            : 16;
+            : 0;
         const std::uint64_t prevOsEvents = windowHost_.Telemetry().osEventsTranslated;
-        if (!windowHost_.PumpEventsAndRender(0.016f, waitMs)) {
+        if (!windowHost_.PumpPlatformEvents(waitMs)) {
             break;
         }
 
@@ -2971,21 +3003,24 @@ std::uint64_t AeroAppHost::RunWindowedLoop(std::uint64_t maxFrames) {
             liveVpW = static_cast<float>(windowHost_.Width()) / dpi;
             liveVpH = static_cast<float>(windowHost_.Height()) / dpi;
         }
-        const bool viewportChanged = (world_.LastLayoutViewport() != Size{liveVpW, liveVpH});
+        const Size liveTargetVp{liveVpW, liveVpH};
+        const bool viewportChanged =
+            (lastNotifiedViewport_ != liveTargetVp) || (world_.LastLayoutViewport() != liveTargetVp);
+        const bool osEventsArrived = (windowHost_.Telemetry().osEventsTranslated != prevOsEvents);
 
-        bool followUpDirty = viewportChanged;
+        bool followUpDirty = viewportChanged || osEventsArrived || windowHost_.NeedsPresent();
         if (simTickCallback_) {
             domains_.setActiveDomain(DomainKind::SimDeterministic);
             simTickCallback_(0.016f, *this);
             domains_.setActiveDomain(DomainKind::UiPresentation);
             followUpDirty = true;
         }
+        float activeStepDt = 0.016f;
         if (!idleAllowed || scheduledWakeDue) {
             const auto now = std::chrono::steady_clock::now();
-            float stepDt = 0.016f;
             if (!idleAllowed) {
                 if (hasLastActiveTick) {
-                    stepDt = std::clamp(
+                    activeStepDt = std::clamp(
                         std::chrono::duration<float>(now - lastActiveTick).count(),
                         0.001f,
                         0.05f);
@@ -2995,7 +3030,7 @@ std::uint64_t AeroAppHost::RunWindowedLoop(std::uint64_t maxFrames) {
                 if (symbols_.stepGame != 0u && rootObject_.valid()) {
                     (void)InvokeSymbol(
                         symbols_.stepGame,
-                        {UnifiedValue{rootObject_}, UnifiedValue{FloatValue{stepDt}}},
+                        {UnifiedValue{rootObject_}, UnifiedValue{FloatValue{activeStepDt}}},
                         nullptr,
                         DomainKind::UiPresentation);
                 }
@@ -3036,23 +3071,54 @@ std::uint64_t AeroAppHost::RunWindowedLoop(std::uint64_t maxFrames) {
         if (world_.FlushTrackB() > 0u) {
             followUpDirty = true;
         }
-        if (!viewportChanged &&
-            (followUpDirty ||
-             wakeBeforePump ||
-             scheduledWakeDue ||
-             scriptWakeRequested_ ||
-             (windowHost_.Telemetry().osEventsTranslated != prevOsEvents) ||
-             world_.HasAnyDirty() ||
-             animEngine_.HasActiveAnimations())) {
+        const bool hadActiveBeforePump = !idleAllowed;
+        if (followUpDirty ||
+            hadActiveBeforePump ||
+            wakeBeforePump ||
+            scheduledWakeDue ||
+            scriptWakeRequested_ ||
+            world_.HasAnyDirty() ||
+            animEngine_.HasActiveAnimations()) {
             FlushBindings();
+            if (animEngine_.HasActiveAnimations()) {
+                if (animEngine_.Tick(activeStepDt, world_)) {
+                    desktopHost_.NotifyDirtyLayout();
+                }
+                FlushBindings();
+                const bool stillActive = animEngine_.HasActiveAnimations();
+                desktopHost_.SetActiveAnimations(stillActive);
+                if (!stillActive) {
+                    desktopHost_.NotifyDirtyObjects();
+                    desktopHost_.NotifyDirtyLayout();
+                }
+                followUpDirty = true;
+            }
         }
         if (world_.HasAnyDirty()) {
             followUpDirty = true;
         }
         if (followUpDirty) {
-            StepFrame(0.0f, viewportChanged);
+            StepFrame(0.0f, viewportChanged || windowHost_.NeedsPresent());
         } else if (DispatchPendingCanvasDraws()) {
             StepFrame(0.0f, true);
+        } else if (!idleAllowed) {
+            if (domains_.uiHeap().phase() == rs_rt::GcPhase::Idle &&
+                domains_.uiHeap().nurserySize() >= 4096u) {
+                rs_rt::ShadowStack emptyStack;
+                (void)domains_.uiHeap().collectYoung(emptyStack, 64u);
+            }
+            if (domains_.uiHeap().collectionRequested() ||
+                domains_.uiHeap().phase() != rs_rt::GcPhase::Idle) {
+                const auto gcStats = domains_.uiHeap().collectIncrementalWithBudget(
+                    rs_rt::RootSet{},
+                    std::chrono::milliseconds(4),
+                    32u,
+                    false);
+                if (gcStats.cycleCompleted) {
+                    lastGcDestroyedNodes_ = world_.DestroyedNodeCount();
+                    (void)domains_.uiHeap().trimExcessCapacity();
+                }
+            }
         }
         if (!idleAllowed && maxFrames == 0u && !windowHost_.ShouldClose()) {
             const auto elapsed = std::chrono::steady_clock::now() - iterStart;
@@ -3186,7 +3252,13 @@ bool AeroAppHost::InvokeScriptMethod(
     std::vector<UnifiedValue> fullArgs;
     fullArgs.reserve(args.size() + 1u);
     fullArgs.push_back(UnifiedValue{targetObj});
-    fullArgs.insert(fullArgs.end(), args.begin(), args.end());
+    for (const UnifiedValue& arg : args) {
+        if (const auto* ref = std::get_if<ObjectRef>(&arg); ref && !ref->valid()) {
+            fullArgs.push_back(UnifiedValue{rs_rt::NullObject{}});
+        } else {
+            fullArgs.push_back(arg);
+        }
+    }
 
     const DomainKind prevDomain = domains_.activeDomain();
     domains_.setActiveDomain(domain);

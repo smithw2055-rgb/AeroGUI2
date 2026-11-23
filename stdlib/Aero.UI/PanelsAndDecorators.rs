@@ -282,10 +282,52 @@ public class WrapPanel : Panel {
     private void SyncWrapLayout() {
         SetNativeLayoutMode(
             LayoutMode.Wrap,
-            ParseUtil.IsNaN(_itemWidth) ? _spacing : _itemWidth,
-            ParseUtil.IsNaN(_itemHeight) ? _spacing : _itemHeight,
+            ParseUtil.IsNaN(_itemWidth) ? 0.0f : _itemWidth,
+            ParseUtil.IsNaN(_itemHeight) ? 0.0f : _itemHeight,
             EnumConvert.ToInt(_orientation),
-            0);
+            (int)(_spacing * 1000.0f));
+    }
+
+    private static float ParseItemLengthBox(DependencyObject value) {
+        if (value == null) { return ParseUtil.NaN(); }
+        if (value is BoxedFloat) { return (value as BoxedFloat).Value; }
+        if (value is BoxedInt && !(value is BoxedEnum)) { return (float)(value as BoxedInt).Value; }
+        object rawObj = DependencyObject.Unbox(value);
+        string s = DependencyObject.UnboxString(value, "").Trim();
+        if ((s.Length == 0 || s == "ComboBoxItem" || s == "ListBoxItem") && rawObj is ContentControl) {
+            s = DependencyObject.UnboxString((rawObj as ContentControl).ContentBox, "").Trim();
+        }
+        string low = s.ToLower();
+        if (low.Length == 0 || low == "auto" || low == "nan") { return ParseUtil.NaN(); }
+        return ParseUtil.ParseFloat(s, ParseUtil.NaN());
+    }
+
+    public override bool SetPropertyValue(string propName, DependencyObject value) {
+        if (propName == "Orientation") {
+            if (value is BoxedInt && !(value is BoxedEnum)) {
+                Orientation = (value as BoxedInt).Value == 1 ? Orientation.Vertical : Orientation.Horizontal;
+                return true;
+            }
+            object rawObj = DependencyObject.Unbox(value);
+            string os = DependencyObject.UnboxString(value, "Horizontal").Trim();
+            if ((os.Length == 0 || os == "ComboBoxItem" || os == "ListBoxItem") && rawObj is ContentControl) {
+                os = DependencyObject.UnboxString((rawObj as ContentControl).ContentBox, "Horizontal").Trim();
+            }
+            Orientation = os == "Vertical" ? Orientation.Vertical : Orientation.Horizontal;
+            return true;
+        }
+        if (propName == "ItemWidth") { ItemWidth = ParseItemLengthBox(value); return true; }
+        if (propName == "ItemHeight") { ItemHeight = ParseItemLengthBox(value); return true; }
+        if (propName == "Spacing") { Spacing = DependencyObject.UnboxFloat(value, 0.0f); return true; }
+        return base.SetPropertyValue(propName, value);
+    }
+
+    public override DependencyObject GetPropertyValue(string propName) {
+        if (propName == "Orientation") { return DependencyObject.BoxInt(EnumConvert.ToInt(_orientation)); }
+        if (propName == "ItemWidth") { return DependencyObject.BoxFloat(_itemWidth); }
+        if (propName == "ItemHeight") { return DependencyObject.BoxFloat(_itemHeight); }
+        if (propName == "Spacing") { return DependencyObject.BoxFloat(_spacing); }
+        return base.GetPropertyValue(propName);
     }
 }
 

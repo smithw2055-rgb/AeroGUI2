@@ -16,6 +16,7 @@ std::atomic<UIResourceStore::FontAtlasClearFn> gFontClear{nullptr};
 std::atomic<UIResourceStore::ImageAtlasFactoryFn> gImageFactory{nullptr};
 std::atomic<UIResourceStore::ImageAtlasClearFn> gImageClear{nullptr};
 std::atomic<UIResourceStore::ImageAtlasRegisterSlotFn> gImageRegisterSlot{nullptr};
+std::atomic<UIResourceStore::ImageAtlasReleaseSlotFn> gImageReleaseSlot{nullptr};
 
 [[nodiscard]] int HexNibble(char c) noexcept {
     if (c >= '0' && c <= '9') return c - '0';
@@ -91,82 +92,154 @@ Color ParseColorLiteral(std::string_view raw) noexcept {
     };
     static constexpr NamedColorEntry kNamedColors[] = {
         {"Transparent", "00000000"},
-        {"White", "FFFFFFFF"},
-        {"Black", "FF000000"},
-        {"Red", "FFFF0000"},
-        {"Green", "FF008000"},
-        {"Blue", "FF0000FF"},
-        {"Yellow", "FFFFFF00"},
-        {"Cyan", "FF00FFFF"},
-        {"Aqua", "FF00FFFF"},
-        {"Magenta", "FFFF00FF"},
-        {"Fuchsia", "FFFF00FF"},
-        {"Gray", "FF808080"},
-        {"Grey", "FF808080"},
-        {"LightGray", "FFD3D3D3"},
-        {"DarkGray", "FFA9A9A9"},
-        {"Silver", "FFC0C0C0"},
-        {"WhiteSmoke", "FFF5F5F5"},
-        {"LightSeaGreen", "FF20B2AA"},
-        {"MediumSeaGreen", "FF3CB371"},
-        {"SeaGreen", "FF2E8B57"},
-        {"Turquoise", "FF40E0D0"},
-        {"MediumTurquoise", "FF48D1CC"},
-        {"DarkTurquoise", "FF00CED1"},
-        {"DodgerBlue", "FF1E90FF"},
-        {"DeepSkyBlue", "FF00BFFF"},
-        {"SkyBlue", "FF87CEEB"},
-        {"LightSkyBlue", "FF87CEFA"},
-        {"CornflowerBlue", "FF6495ED"},
-        {"RoyalBlue", "FF4169E1"},
-        {"SteelBlue", "FF4682B4"},
-        {"Teal", "FF008080"},
-        {"OrangeRed", "FFFF4500"},
-        {"Orange", "FFFFA500"},
-        {"Gold", "FFFFD700"},
-        {"Crimson", "FFDC143C"},
-        {"Tomato", "FFFF6347"},
-        {"Coral", "FFFF7F50"},
-        {"Salmon", "FFFA8072"},
-        {"Lime", "FF00FF00"},
-        {"LimeGreen", "FF32CD32"},
-        {"LawnGreen", "FF7CFC00"},
-        {"GreenYellow", "FFADFF2F"},
-        {"Purple", "FF800080"},
-        {"Violet", "FFEE82EE"},
-        {"Plum", "FFDDA0DD"},
-        {"Indigo", "FF4B0082"},
-        {"SlateGray", "FF708090"},
-        {"DarkSlateGray", "FF2F4F4F"},
-        {"Brown", "FFA52A2A"},
-        {"SaddleBrown", "FF8B4513"},
-        {"Tan", "FFD2B48C"},
-        {"Wheat", "FFF5DEB3"},
-        {"Beige", "FFF5F5DC"},
-        {"Ivory", "FFFFFFF0"},
-        {"Navy", "FF000080"},
-        {"MidnightBlue", "FF191970"},
-        {"Maroon", "FF800000"},
-        {"Olive", "FF808000"},
-        {"Pink", "FFFFC0CB"},
-        {"HotPink", "FFFF69B4"},
-        {"DeepPink", "FFFF1493"},
-        {"Moccasin", "FFFFE4B5"},
-        {"Aquamarine", "FF7FFFD4"},
-        {"Thistle", "FFD8BFD8"},
-        {"CadetBlue", "FF5F9EA0"},
-        {"PaleTurquoise", "FFAFEEEE"},
-        {"YellowGreen", "FF9ACD32"},
         {"AliceBlue", "FFF0F8FF"},
-        {"Khaki", "FFF0E68C"},
-        {"Orchid", "FFDA70D6"},
-        {"SlateGrey", "FF708090"},
-        {"LightSlateGray", "FF778899"},
-        {"LightSlateGrey", "FF778899"},
+        {"AntiqueWhite", "FFFAEBD7"},
+        {"Aqua", "FF00FFFF"},
+        {"Aquamarine", "FF7FFFD4"},
+        {"Azure", "FFF0FFFF"},
+        {"Beige", "FFF5F5DC"},
+        {"Bisque", "FFFFE4C4"},
+        {"Black", "FF000000"},
+        {"BlanchedAlmond", "FFFFEBCD"},
+        {"Blue", "FF0000FF"},
+        {"BlueViolet", "FF8A2BE2"},
+        {"Brown", "FFA52A2A"},
+        {"BurlyWood", "FFDEB887"},
+        {"CadetBlue", "FF5F9EA0"},
+        {"Chartreuse", "FF7FFF00"},
+        {"Chocolate", "FFD2691E"},
+        {"Coral", "FFFF7F50"},
+        {"CornflowerBlue", "FF6495ED"},
+        {"Cornsilk", "FFFFF8DC"},
+        {"Crimson", "FFDC143C"},
+        {"Cyan", "FF00FFFF"},
+        {"DarkBlue", "FF00008B"},
+        {"DarkCyan", "FF008B8B"},
+        {"DarkGoldenrod", "FFB8860B"},
+        {"DarkGray", "FFA9A9A9"},
+        {"DarkGrey", "FFA9A9A9"},
+        {"DarkGreen", "FF006400"},
+        {"DarkKhaki", "FFBDB76B"},
+        {"DarkMagenta", "FF8B008B"},
+        {"DarkOliveGreen", "FF556B2F"},
+        {"DarkOrange", "FFFF8C00"},
+        {"DarkOrchid", "FF9932CC"},
+        {"DarkRed", "FF8B0000"},
+        {"DarkSalmon", "FFE9967A"},
+        {"DarkSeaGreen", "FF8FBC8F"},
+        {"DarkSlateBlue", "FF483D8B"},
+        {"DarkSlateGray", "FF2F4F4F"},
         {"DarkSlateGrey", "FF2F4F4F"},
+        {"DarkTurquoise", "FF00CED1"},
+        {"DarkViolet", "FF9400D3"},
+        {"DeepPink", "FFFF1493"},
+        {"DeepSkyBlue", "FF00BFFF"},
         {"DimGray", "FF696969"},
         {"DimGrey", "FF696969"},
+        {"DodgerBlue", "FF1E90FF"},
+        {"Firebrick", "FFB22222"},
+        {"FloralWhite", "FFFFFAF0"},
+        {"ForestGreen", "FF228B22"},
+        {"Fuchsia", "FFFF00FF"},
         {"Gainsboro", "FFDCDCDC"},
+        {"GhostWhite", "FFF8F8FF"},
+        {"Gold", "FFFFD700"},
+        {"Goldenrod", "FFDAA520"},
+        {"Gray", "FF808080"},
+        {"Grey", "FF808080"},
+        {"Green", "FF008000"},
+        {"GreenYellow", "FFADFF2F"},
+        {"Honeydew", "FFF0FFF0"},
+        {"HotPink", "FFFF69B4"},
+        {"IndianRed", "FFCD5C5C"},
+        {"Indigo", "FF4B0082"},
+        {"Ivory", "FFFFFFF0"},
+        {"Khaki", "FFF0E68C"},
+        {"Lavender", "FFE6E6FA"},
+        {"LavenderBlush", "FFFFF0F5"},
+        {"LawnGreen", "FF7CFC00"},
+        {"LemonChiffon", "FFFFFACD"},
+        {"LightBlue", "FFADD8E6"},
+        {"LightCoral", "FFF08080"},
+        {"LightCyan", "FFE0FFFF"},
+        {"LightGoldenrodYellow", "FFFAFAD2"},
+        {"LightGray", "FFD3D3D3"},
+        {"LightGrey", "FFD3D3D3"},
+        {"LightGreen", "FF90EE90"},
+        {"LightPink", "FFFFB6C1"},
+        {"LightSalmon", "FFFFA07A"},
+        {"LightSeaGreen", "FF20B2AA"},
+        {"LightSkyBlue", "FF87CEFA"},
+        {"LightSlateGray", "FF778899"},
+        {"LightSlateGrey", "FF778899"},
+        {"LightSteelBlue", "FFB0C4DE"},
+        {"LightYellow", "FFFFFFE0"},
+        {"Lime", "FF00FF00"},
+        {"LimeGreen", "FF32CD32"},
+        {"Linen", "FFFAF0E6"},
+        {"Magenta", "FFFF00FF"},
+        {"Maroon", "FF800000"},
+        {"MediumAquamarine", "FF66CDAA"},
+        {"MediumBlue", "FF0000CD"},
+        {"MediumOrchid", "FFBA55D3"},
+        {"MediumPurple", "FF9370DB"},
+        {"MediumSeaGreen", "FF3CB371"},
+        {"MediumSlateBlue", "FF7B68EE"},
+        {"MediumSpringGreen", "FF00FA9A"},
+        {"MediumTurquoise", "FF48D1CC"},
+        {"MediumVioletRed", "FFC71585"},
+        {"MidnightBlue", "FF191970"},
+        {"MintCream", "FFF5FFFA"},
+        {"MistyRose", "FFFFE4E1"},
+        {"Moccasin", "FFFFE4B5"},
+        {"NavajoWhite", "FFFFDEAD"},
+        {"Navy", "FF000080"},
+        {"OldLace", "FFFDF5E6"},
+        {"Olive", "FF808000"},
+        {"OliveDrab", "FF6B8E23"},
+        {"Orange", "FFFFA500"},
+        {"OrangeRed", "FFFF4500"},
+        {"Orchid", "FFDA70D6"},
+        {"PaleGoldenrod", "FFEEE8AA"},
+        {"PaleGreen", "FF98FB98"},
+        {"PaleTurquoise", "FFAFEEEE"},
+        {"PaleVioletRed", "FFDB7093"},
+        {"PapayaWhip", "FFFFEFD5"},
+        {"PeachPuff", "FFFFDAB9"},
+        {"Peru", "FFCD853F"},
+        {"Pink", "FFFFC0CB"},
+        {"Plum", "FFDDA0DD"},
+        {"PowderBlue", "FFB0E0E6"},
+        {"Purple", "FF800080"},
+        {"RebeccaPurple", "FF663399"},
+        {"Red", "FFFF0000"},
+        {"RosyBrown", "FFBC8F8F"},
+        {"RoyalBlue", "FF4169E1"},
+        {"SaddleBrown", "FF8B4513"},
+        {"Salmon", "FFFA8072"},
+        {"SandyBrown", "FFF4A460"},
+        {"SeaGreen", "FF2E8B57"},
+        {"SeaShell", "FFFFF5EE"},
+        {"Sienna", "FFA0522D"},
+        {"Silver", "FFC0C0C0"},
+        {"SkyBlue", "FF87CEEB"},
+        {"SlateBlue", "FF6A5ACD"},
+        {"SlateGray", "FF708090"},
+        {"SlateGrey", "FF708090"},
+        {"Snow", "FFFFFAFA"},
+        {"SpringGreen", "FF00FF7F"},
+        {"SteelBlue", "FF4682B4"},
+        {"Tan", "FFD2B48C"},
+        {"Teal", "FF008080"},
+        {"Thistle", "FFD8BFD8"},
+        {"Tomato", "FFFF6347"},
+        {"Turquoise", "FF40E0D0"},
+        {"Violet", "FFEE82EE"},
+        {"Wheat", "FFF5DEB3"},
+        {"White", "FFFFFFFF"},
+        {"WhiteSmoke", "FFF5F5F5"},
+        {"Yellow", "FFFFFF00"},
+        {"YellowGreen", "FF9ACD32"},
     };
     for (const auto& entry : kNamedColors) {
         if (str::EqualsIgnoreCase(raw, entry.name)) {
@@ -214,8 +287,10 @@ void UIResourceStore::RegisterImageAtlasHooks(
 }
 
 void UIResourceStore::RegisterImageAtlasSlotHook(
-    ImageAtlasRegisterSlotFn registerSlotFn) noexcept {
+    ImageAtlasRegisterSlotFn registerSlotFn,
+    ImageAtlasReleaseSlotFn releaseSlotFn) noexcept {
     gImageRegisterSlot.store(registerSlotFn, std::memory_order_release);
+    gImageReleaseSlot.store(releaseSlotFn, std::memory_order_release);
 }
 
 void UIResourceStore::EnsureFontsInitialized() const {
@@ -315,13 +390,30 @@ const AxbMtsdfPathEntry* UIResourceStore::FindMtsdfPath(std::uint64_t pathHash) 
 }
 
 void UIResourceStore::ClearMtsdfPaths() noexcept {
-    std::lock_guard<std::mutex> lock(mutex_);
-    mtsdfEntries_.clear();
-    pathMaskEntries_.clear();
+    std::vector<std::uint32_t> toRelease;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        mtsdfEntries_.clear();
+        for (const auto& kv : pathMaskEntries_) {
+            if (kv.second.textureId > 0u) {
+                toRelease.push_back(kv.second.textureId);
+            }
+        }
+        pathMaskEntries_.clear();
+        pathMaskTotalBytes_ = 0u;
+    }
+    if (!toRelease.empty() && images_ != nullptr) {
+        if (const ImageAtlasReleaseSlotFn relFn = gImageReleaseSlot.load(std::memory_order_acquire)) {
+            for (std::uint32_t id : toRelease) {
+                relFn(*images_, id);
+            }
+        }
+    }
 }
 
 bool UIResourceStore::StoreOrLookupPathMaskLocked(
     std::uint64_t key,
+    std::uint64_t groupHash,
     std::uint32_t texW,
     std::uint32_t texH,
     float u0,
@@ -335,8 +427,13 @@ bool UIResourceStore::StoreOrLookupPathMaskLocked(
         return false;
     }
     ImageAtlas& atlas = Images();
+    const std::size_t incomingBytes = rgba8.size();
+    constexpr std::size_t kMaxPathMaskEntries = 96u;
+    constexpr std::size_t kMaxPathMaskTotalBytes = 16u * 1024u * 1024u;
+    constexpr std::size_t kLargeMaskThresholdBytes = 64u * 1024u;
 
     std::uint32_t reuseSlotId = 0u;
+    std::vector<std::uint32_t> surplusReleaseIds;
     {
         std::lock_guard<std::mutex> lock(mutex_);
         if (const auto it = pathMaskEntries_.find(key); it != pathMaskEntries_.end()) {
@@ -344,22 +441,66 @@ bool UIResourceStore::StoreOrLookupPathMaskLocked(
             outEntry = it->second;
             return true;
         }
-        if (pathMaskEntries_.size() >= 256u) {
+
+        auto evictIter = [&](std::unordered_map<std::uint64_t, RasterizedPathMaskEntry>::iterator victim) {
+            if (victim == pathMaskEntries_.end()) {
+                return;
+            }
+            pathMaskTotalBytes_ = (pathMaskTotalBytes_ >= victim->second.byteSize)
+                ? (pathMaskTotalBytes_ - victim->second.byteSize)
+                : 0u;
+            if (victim->second.textureId > 0u) {
+                if (reuseSlotId == 0u) {
+                    reuseSlotId = victim->second.textureId;
+                } else {
+                    surplusReleaseIds.push_back(victim->second.textureId);
+                }
+            }
+            pathMaskEntries_.erase(victim);
+        };
+
+        if (groupHash != 0u && incomingBytes >= kLargeMaskThresholdBytes) {
+            std::size_t sameGroupCount = 0u;
+            auto oldestSameGroup = pathMaskEntries_.end();
+            for (auto it = pathMaskEntries_.begin(); it != pathMaskEntries_.end(); ++it) {
+                if (it->second.groupHash == groupHash) {
+                    ++sameGroupCount;
+                    if (oldestSameGroup == pathMaskEntries_.end() ||
+                        it->second.lastUsedTick < oldestSameGroup->second.lastUsedTick) {
+                        oldestSameGroup = it;
+                    }
+                }
+            }
+            if (sameGroupCount >= 2u && oldestSameGroup != pathMaskEntries_.end()) {
+                evictIter(oldestSameGroup);
+            }
+        }
+
+        while (!pathMaskEntries_.empty() &&
+               (pathMaskEntries_.size() >= kMaxPathMaskEntries ||
+                (pathMaskTotalBytes_ + incomingBytes > kMaxPathMaskTotalBytes))) {
             auto lru = pathMaskEntries_.begin();
             for (auto it = pathMaskEntries_.begin(); it != pathMaskEntries_.end(); ++it) {
                 if (it->second.lastUsedTick < lru->second.lastUsedTick) {
                     lru = it;
                 }
             }
-            if (lru != pathMaskEntries_.end()) {
-                reuseSlotId = lru->second.textureId;
-                pathMaskEntries_.erase(lru);
-            }
+            evictIter(lru);
+        }
+    }
+
+    const ImageAtlasReleaseSlotFn relFn = gImageReleaseSlot.load(std::memory_order_acquire);
+    if (!surplusReleaseIds.empty() && relFn) {
+        for (std::uint32_t id : surplusReleaseIds) {
+            relFn(atlas, id);
         }
     }
 
     const std::uint32_t texId = slotFn(atlas, reuseSlotId, texW, texH, std::move(rgba8));
     if (texId == 0u) {
+        if (reuseSlotId != 0u && relFn) {
+            relFn(atlas, reuseSlotId);
+        }
         return false;
     }
 
@@ -371,11 +512,30 @@ bool UIResourceStore::StoreOrLookupPathMaskLocked(
     entry.v0 = v0;
     entry.u1 = u1;
     entry.v1 = v1;
+    entry.groupHash = groupHash;
+    entry.byteSize = incomingBytes;
 
+    std::uint32_t replacedSlotId = 0u;
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        entry.lastUsedTick = ++pathMaskAccessSeq_;
-        pathMaskEntries_.emplace(key, entry);
+        if (const auto prevIt = pathMaskEntries_.find(key); prevIt != pathMaskEntries_.end()) {
+            pathMaskTotalBytes_ = (pathMaskTotalBytes_ >= prevIt->second.byteSize)
+                ? (pathMaskTotalBytes_ - prevIt->second.byteSize)
+                : 0u;
+            if (prevIt->second.textureId > 0u && prevIt->second.textureId != texId) {
+                replacedSlotId = prevIt->second.textureId;
+            }
+            prevIt->second = entry;
+            prevIt->second.lastUsedTick = ++pathMaskAccessSeq_;
+            entry.lastUsedTick = prevIt->second.lastUsedTick;
+        } else {
+            entry.lastUsedTick = ++pathMaskAccessSeq_;
+            pathMaskEntries_.emplace(key, entry);
+        }
+        pathMaskTotalBytes_ += incomingBytes;
+    }
+    if (replacedSlotId != 0u && relFn) {
+        relFn(atlas, replacedSlotId);
     }
     outEntry = entry;
     return true;
@@ -402,8 +562,19 @@ bool UIResourceStore::StoreCachedPathMask(
     float u1,
     float v1,
     std::vector<std::uint8_t>&& rgba8,
-    RasterizedPathMaskEntry& outEntry) {
-    return StoreOrLookupPathMaskLocked(key, texW, texH, u0, v0, u1, v1, std::move(rgba8), outEntry);
+    RasterizedPathMaskEntry& outEntry,
+    std::uint64_t groupHash) {
+    return StoreOrLookupPathMaskLocked(
+        key,
+        groupHash != 0u ? groupHash : key,
+        texW,
+        texH,
+        u0,
+        v0,
+        u1,
+        v1,
+        std::move(rgba8),
+        outEntry);
 }
 
 bool UIResourceStore::GetOrRasterizePathMask(
@@ -448,7 +619,8 @@ bool UIResourceStore::GetOrRasterizePathMask(
     const float v0 = static_cast<float>(clampedPad) / static_cast<float>(texH);
     const float u1 = static_cast<float>(clampedPad + clampedW) / static_cast<float>(texW);
     const float v1 = static_cast<float>(clampedPad + clampedH) / static_cast<float>(texH);
-    return StoreOrLookupPathMaskLocked(key, texW, texH, u0, v0, u1, v1, std::move(rgba8), outEntry);
+    const std::uint64_t fillGroup = safeHash ^ 0xA5A5A5A500000001ULL;
+    return StoreOrLookupPathMaskLocked(key, fillGroup, texW, texH, u0, v0, u1, v1, std::move(rgba8), outEntry);
 }
 
 bool UIResourceStore::GetOrRasterizePathStrokeMask(
@@ -496,7 +668,8 @@ bool UIResourceStore::GetOrRasterizePathStrokeMask(
 
     const std::uint32_t texW = clampedW + 2u * clampedPad;
     const std::uint32_t texH = clampedH + 2u * clampedPad;
-    return StoreOrLookupPathMaskLocked(key, texW, texH, 0.0f, 0.0f, 1.0f, 1.0f, std::move(rgba8), outEntry);
+    const std::uint64_t strokeGroup = safeHash ^ 0x5A5A5A5A00000002ULL;
+    return StoreOrLookupPathMaskLocked(key, strokeGroup, texW, texH, 0.0f, 0.0f, 1.0f, 1.0f, std::move(rgba8), outEntry);
 }
 
 void UIResourceStore::ClearAll() noexcept {
@@ -515,6 +688,7 @@ void UIResourceStore::ClearAll() noexcept {
     assetSearchDirs_.clear();
     mtsdfEntries_.clear();
     pathMaskEntries_.clear();
+    pathMaskTotalBytes_ = 0u;
     pathMaskAccessSeq_ = 0u;
 }
 

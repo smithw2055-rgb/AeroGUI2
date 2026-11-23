@@ -7,7 +7,7 @@ import RealScript.Math;
 public class Game : CustomDrawElement
 {
     public int Score { get; set; } = 0;
-    public int Lives { get; set; } = 3;
+    public int Lives { get; set; } = 1;
     public string StatusText { get; set; } = "READY";
     public string ActionText { get; set; } = "PRESS SPACE OR CLICK TO LAUNCH";
     public bool IsRunning { get; set; } = false;
@@ -28,6 +28,7 @@ public class Game : CustomDrawElement
     private int _rows = 5;
     private int _cols = 13;
     private int[] _bricks;
+    private int _bricksRemaining = 65;
 
     // Brick shatter particle pool
     private int _maxParticles = 160;
@@ -40,16 +41,35 @@ public class Game : CustomDrawElement
     private float[] _partMaxLife;
     private float[] _partSize;
     private int[] _partRow;
+    private int _nextParticleCursor = 0;
     private int _rngSeed = 1337;
 
-    // Cached 3D Brushes
+    // Cached 3D Brushes & packed ARGB colors (avoid per-frame string parsing / GC churn)
     private RadialGradientBrush _bgBrush;
     private LinearGradientBrush[] _brickBrushes;
     private LinearGradientBrush _paddleSilverBrush;
     private LinearGradientBrush _paddleRedBrush;
     private RadialGradientBrush _paddleTipBrush;
     private RadialGradientBrush _ballSphereBrush;
+    private uint[] _rowPartColors;
+    private uint _colBrickShadow = 0u;
+    private uint _colBrickSpec = 0u;
+    private uint _colBrickRim = 0u;
+    private uint _colBrickBottomShade = 0u;
+    private uint _colPadShadow = 0u;
+    private uint _colGroove = 0u;
+    private uint _colGrooveHi = 0u;
+    private uint _colCollar = 0u;
+    private uint _colPaddleRim = 0u;
+    private uint _colBallShadow = 0u;
+    private uint _colSpecOuter = 0u;
+    private uint _colSpecCore = 0u;
     private bool _brushesReady = false;
+
+    private int _lastBoundScore = -1;
+    private int _lastBoundLives = -1;
+    private string _lastBoundStatus = "";
+    private string _lastBoundAction = "";
 
     public Game() : base()
     {
@@ -151,13 +171,37 @@ public class Game : CustomDrawElement
         this._ballSphereBrush.AddStop("#FF38BDF8", 0.28f);
         this._ballSphereBrush.AddStop("#FF0284C7", 0.62f);
         this._ballSphereBrush.AddStop("#FF0F172A", 1.0f);
+
+        this._rowPartColors = new uint[0];
+        this._rowPartColors.Push(ParseUtil.ParseColor("#FFFF3B3B"));
+        this._rowPartColors.Push(ParseUtil.ParseColor("#FFFACC15"));
+        this._rowPartColors.Push(ParseUtil.ParseColor("#FF38BDF8"));
+        this._rowPartColors.Push(ParseUtil.ParseColor("#FFE843E8"));
+        this._rowPartColors.Push(ParseUtil.ParseColor("#FF22E538"));
+
+        this._colBrickShadow = ParseUtil.ParseColor("#96000000");
+        this._colBrickSpec = ParseUtil.ParseColor("#55FFFFFF");
+        this._colBrickRim = ParseUtil.ParseColor("#78CBD5E1");
+        this._colBrickBottomShade = ParseUtil.ParseColor("#44000000");
+        this._colPadShadow = ParseUtil.ParseColor("#A8000000");
+        this._colGroove = ParseUtil.ParseColor("#FF334155");
+        this._colGrooveHi = ParseUtil.ParseColor("#90FFFFFF");
+        this._colCollar = ParseUtil.ParseColor("#FFE2E8F0");
+        this._colPaddleRim = ParseUtil.ParseColor("#B0CBD5E1");
+        this._colBallShadow = ParseUtil.ParseColor("#AA000000");
+        this._colSpecOuter = ParseUtil.ParseColor("#B8BAE6FD");
+        this._colSpecCore = ParseUtil.ParseColor("#F2FFFFFF");
     }
 
     private float NextRand01()
     {
-        this._rngSeed = (this._rngSeed * 9301 + 49297) % 233280;
-        if (this._rngSeed < 0) { this._rngSeed = -this._rngSeed; }
-        return (float)this._rngSeed / 233280.0f;
+        // Overflow-safe 32-bit LCG: 65520 * 4093 + 1277 = 268,174,637 << INT32_MAX
+        int s = this._rngSeed % 65521;
+        if (s < 0) { s = -s; }
+        s = (s * 4093 + 1277) % 65521;
+        if (s < 0) { s = -s; }
+        this._rngSeed = s;
+        return (float)s / 65521.0f;
     }
 
     private void ClearParticles()
@@ -168,40 +212,61 @@ public class Game : CustomDrawElement
             this._partAlive[i] = 0;
             i = i + 1;
         }
+        this._nextParticleCursor = 0;
         this.ActiveParticleCount = 0;
     }
 
     private uint RowParticleColor(int row)
     {
-        if (row == 0) { return ParseUtil.ParseColor("#FFFF3B3B"); }
-        if (row == 1) { return ParseUtil.ParseColor("#FFFACC15"); }
-        if (row == 2) { return ParseUtil.ParseColor("#FF38BDF8"); }
-        if (row == 3) { return ParseUtil.ParseColor("#FFE843E8"); }
-        return ParseUtil.ParseColor("#FF22E538");
+        this.EnsureBrushes();
+        if (row >= 0 && row < this._rowPartColors.Length)
+        {
+            return this._rowPartColors[row];
+        }
+        return this._rowPartColors[this._rowPartColors.Length - 1];
     }
 
     private void SpawnBrickShatter(float bx, float by, float bw, float bh, int row)
     {
         int spawned = 0;
-        int i = 0;
-        while (i < this._maxParticles && spawned < 14)
+        int checkedSlots = 0;
+        while (checkedSlots < this._maxParticles && spawned < 14)
         {
-            if (this._partAlive[i] == 0)
+            int idx = this._nextParticleCursor;
+            this._nextParticleCursor = (this._nextParticleCursor + 1) % this._maxParticles;
+            if (this._partAlive[idx] == 0)
             {
                 float rx = this.NextRand01();
                 float ry = this.NextRand01();
-                this._partAlive[i] = 1;
-                this._partX[i] = bx + 6.0f + rx * Math.Maxf(8.0f, bw - 12.0f);
-                this._partY[i] = by + 4.0f + ry * Math.Maxf(6.0f, bh - 8.0f);
-                this._partVX[i] = (rx - 0.5f) * 210.0f + (this.NextRand01() - 0.5f) * 70.0f;
-                this._partVY[i] = -70.0f + this.NextRand01() * 190.0f;
-                this._partMaxLife[i] = 0.55f + this.NextRand01() * 0.35f;
-                this._partLife[i] = this._partMaxLife[i];
-                this._partSize[i] = 5.0f + this.NextRand01() * 2.5f;
-                this._partRow[i] = row;
+                this._partAlive[idx] = 1;
+                this._partX[idx] = bx + 6.0f + rx * Math.Maxf(8.0f, bw - 12.0f);
+                this._partY[idx] = by + 4.0f + ry * Math.Maxf(6.0f, bh - 8.0f);
+                this._partVX[idx] = (rx - 0.5f) * 210.0f + (this.NextRand01() - 0.5f) * 70.0f;
+                this._partVY[idx] = -70.0f + this.NextRand01() * 190.0f;
+                this._partMaxLife[idx] = 0.55f + this.NextRand01() * 0.35f;
+                this._partLife[idx] = this._partMaxLife[idx];
+                this._partSize[idx] = 5.0f + this.NextRand01() * 2.5f;
+                this._partRow[idx] = row;
                 spawned = spawned + 1;
             }
-            i = i + 1;
+            checkedSlots = checkedSlots + 1;
+        }
+        while (spawned < 14)
+        {
+            int idx = this._nextParticleCursor;
+            this._nextParticleCursor = (this._nextParticleCursor + 1) % this._maxParticles;
+            float rx = this.NextRand01();
+            float ry = this.NextRand01();
+            this._partAlive[idx] = 1;
+            this._partX[idx] = bx + 6.0f + rx * Math.Maxf(8.0f, bw - 12.0f);
+            this._partY[idx] = by + 4.0f + ry * Math.Maxf(6.0f, bh - 8.0f);
+            this._partVX[idx] = (rx - 0.5f) * 210.0f + (this.NextRand01() - 0.5f) * 70.0f;
+            this._partVY[idx] = -70.0f + this.NextRand01() * 190.0f;
+            this._partMaxLife[idx] = 0.55f + this.NextRand01() * 0.35f;
+            this._partLife[idx] = this._partMaxLife[idx];
+            this._partSize[idx] = 5.0f + this.NextRand01() * 2.5f;
+            this._partRow[idx] = row;
+            spawned = spawned + 1;
         }
         this.RecountParticles();
     }
@@ -245,6 +310,26 @@ public class Game : CustomDrawElement
         return alive > 0;
     }
 
+    private void RestoreBricks()
+    {
+        int i = 0;
+        while (i < this._bricks.Length)
+        {
+            this._bricks[i] = 1;
+            i = i + 1;
+        }
+        this._bricksRemaining = this._bricks.Length;
+    }
+
+    private void ResetBallOnPaddle(float w, float h)
+    {
+        this._paddleX = (w - this._paddleW) * 0.5f;
+        this._ballX = w * 0.5f;
+        this._ballY = h - 64.0f - this._ballR - 2.0f;
+        this._ballVX = 220.0f;
+        this._ballVY = -260.0f;
+    }
+
     public void ResetGame()
     {
         float w = this.ActualWidth > 10.0f ? this.ActualWidth : this._arenaW;
@@ -253,22 +338,12 @@ public class Game : CustomDrawElement
         this._arenaH = h;
 
         this.Score = 0;
-        this.Lives = 3;
+        this.Lives = 1;
         this.IsRunning = false;
         this.IsGameOver = false;
-        this._paddleX = (w - this._paddleW) * 0.5f;
-        this._ballX = w * 0.5f;
-        this._ballY = h - 64.0f - this._ballR - 2.0f;
-        this._ballVX = 220.0f;
-        this._ballVY = -260.0f;
+        this.ResetBallOnPaddle(w, h);
         this.ClearParticles();
-
-        int i = 0;
-        while (i < this._bricks.Length)
-        {
-            this._bricks[i] = 1;
-            i = i + 1;
-        }
+        this.RestoreBricks();
 
         this.StatusText = "READY";
         this.ActionText = "PRESS SPACE OR CLICK TO LAUNCH";
@@ -317,10 +392,26 @@ public class Game : CustomDrawElement
 
     private void NotifyBindings()
     {
-        BindingEngine.NotifyTargetPropertyChanged(this, "Score", DependencyObject.BoxInt(this.Score));
-        BindingEngine.NotifyTargetPropertyChanged(this, "Lives", DependencyObject.BoxInt(this.Lives));
-        BindingEngine.NotifyTargetPropertyChanged(this, "StatusText", DependencyObject.BoxString(this.StatusText));
-        BindingEngine.NotifyTargetPropertyChanged(this, "ActionText", DependencyObject.BoxString(this.ActionText));
+        if (this._lastBoundScore != this.Score)
+        {
+            this._lastBoundScore = this.Score;
+            BindingEngine.NotifyTargetPropertyChanged(this, "Score", DependencyObject.BoxInt(this.Score));
+        }
+        if (this._lastBoundLives != this.Lives)
+        {
+            this._lastBoundLives = this.Lives;
+            BindingEngine.NotifyTargetPropertyChanged(this, "Lives", DependencyObject.BoxInt(this.Lives));
+        }
+        if (this._lastBoundStatus != this.StatusText)
+        {
+            this._lastBoundStatus = this.StatusText;
+            BindingEngine.NotifyTargetPropertyChanged(this, "StatusText", DependencyObject.BoxString(this.StatusText));
+        }
+        if (this._lastBoundAction != this.ActionText)
+        {
+            this._lastBoundAction = this.ActionText;
+            BindingEngine.NotifyTargetPropertyChanged(this, "ActionText", DependencyObject.BoxString(this.ActionText));
+        }
     }
 
     public override DependencyObject GetPropertyValue(string propName)
@@ -329,6 +420,7 @@ public class Game : CustomDrawElement
         if (propName == "Lives") { return DependencyObject.BoxInt(this.Lives); }
         if (propName == "StatusText") { return DependencyObject.BoxString(this.StatusText); }
         if (propName == "ActionText") { return DependencyObject.BoxString(this.ActionText); }
+        if (propName == "BricksRemaining") { return DependencyObject.BoxInt(this._bricksRemaining); }
         if (propName == "ActiveParticleCount") { return DependencyObject.BoxInt(this.ActiveParticleCount); }
         return base.GetPropertyValue(propName);
     }
@@ -505,22 +597,27 @@ public class Game : CustomDrawElement
             r = r + 1;
         }
 
+        this._bricksRemaining = remaining;
         if (remaining == 0)
         {
+            this.RestoreBricks();
+            this.ResetBallOnPaddle(w, h);
             this.IsRunning = false;
             this.IsGameOver = true;
             this.StatusText = "VICTORY!";
-            this.ActionText = "PRESS SPACE OR R TO PLAY AGAIN";
+            this.ActionText = "PRESS SPACE OR CLICK TO PLAY AGAIN";
         }
         else if (this._ballY - this._ballR > h)
         {
             this.Lives = this.Lives - 1;
             if (this.Lives <= 0)
             {
+                this.RestoreBricks();
+                this.ResetBallOnPaddle(w, h);
                 this.IsRunning = false;
                 this.IsGameOver = true;
                 this.StatusText = "GAME OVER";
-                this.ActionText = "PRESS SPACE OR R TO RETRY";
+                this.ActionText = "PRESS SPACE OR CLICK TO RETRY";
             }
             else
             {
@@ -558,10 +655,10 @@ public class Game : CustomDrawElement
         float brickW = (w - marginX * 2.0f - gap * (float)(this._cols - 1)) / (float)this._cols;
         float brickH = 33.0f;
 
-        uint brickShadow = ParseUtil.ParseColor("#96000000");
-        uint brickSpec = ParseUtil.ParseColor("#55FFFFFF");
-        uint brickRim = ParseUtil.ParseColor("#78CBD5E1");
-        uint brickBottomShade = ParseUtil.ParseColor("#44000000");
+        uint brickShadow = this._colBrickShadow;
+        uint brickSpec = this._colBrickSpec;
+        uint brickRim = this._colBrickRim;
+        uint brickBottomShade = this._colBrickBottomShade;
 
         int r = 0;
         while (r < this._rows)
@@ -613,13 +710,7 @@ public class Game : CustomDrawElement
         float ph = this._paddleH;
         float halfH = ph * 0.5f;
 
-        uint padShadow = ParseUtil.ParseColor("#A8000000");
-        uint grooveCol = ParseUtil.ParseColor("#FF334155");
-        uint grooveHi = ParseUtil.ParseColor("#90FFFFFF");
-        uint collarCol = ParseUtil.ParseColor("#FFE2E8F0");
-        uint paddleRim = ParseUtil.ParseColor("#B0CBD5E1");
-
-        dc.FillRoundedRect(px0 + 4.0f, py0 + 6.0f, pw, ph, halfH, halfH, padShadow, -1);
+        dc.FillRoundedRect(px0 + 4.0f, py0 + 6.0f, pw, ph, halfH, halfH, this._colPadShadow, -1);
         // Cyan glowing outer tips
         dc.FillRoundedRect(px0, py0 + 3.0f, 22.0f, ph - 6.0f, (ph - 6.0f) * 0.5f, (ph - 6.0f) * 0.5f, this._paddleTipBrush);
         dc.FillRoundedRect(px0 + pw - 22.0f, py0 + 3.0f, 22.0f, ph - 6.0f, (ph - 6.0f) * 0.5f, (ph - 6.0f) * 0.5f, this._paddleTipBrush);
@@ -630,27 +721,24 @@ public class Game : CustomDrawElement
         float bodyW = pw - 62.0f;
         dc.FillRect(bodyX, py0, bodyW, ph, this._paddleSilverBrush);
         // White-silver collar rings
-        dc.FillRect(bodyX - 2.0f, py0, 2.5f, ph, collarCol, -1);
-        dc.FillRect(bodyX + bodyW - 0.5f, py0, 2.5f, ph, collarCol, -1);
+        dc.FillRect(bodyX - 2.0f, py0, 2.5f, ph, this._colCollar, -1);
+        dc.FillRect(bodyX + bodyW - 0.5f, py0, 2.5f, ph, this._colCollar, -1);
         // Center horizontal mechanical grooves
         float grooveX = bodyX + 14.0f;
         float grooveW = bodyW - 28.0f;
-        dc.FillRect(grooveX, py0 + ph * 0.40f, grooveW, 1.8f, grooveCol, -1);
-        dc.FillRect(grooveX, py0 + ph * 0.62f, grooveW, 1.8f, grooveCol, -1);
-        dc.FillRoundedRect(px0 + 10.0f, py0 + 2.0f, pw - 20.0f, 4.5f, 2.2f, 2.2f, grooveHi, -1);
-        dc.StrokeRoundedRect(px0 + 8.0f, py0 + 0.5f, pw - 16.0f, ph - 1.0f, halfH, halfH, paddleRim, 1.1f);
+        dc.FillRect(grooveX, py0 + ph * 0.40f, grooveW, 1.8f, this._colGroove, -1);
+        dc.FillRect(grooveX, py0 + ph * 0.62f, grooveW, 1.8f, this._colGroove, -1);
+        dc.FillRoundedRect(px0 + 10.0f, py0 + 2.0f, pw - 20.0f, 4.5f, 2.2f, 2.2f, this._colGrooveHi, -1);
+        dc.StrokeRoundedRect(px0 + 8.0f, py0 + 0.5f, pw - 16.0f, ph - 1.0f, halfH, halfH, this._colPaddleRim, 1.1f);
 
         // 5. 3D glossy blue sphere ball (shadow + specular highlight + main FillEllipse LAST for test invariant)
         float br = this._ballR;
-        uint ballShadow = ParseUtil.ParseColor("#AA000000");
-        uint specOuter = ParseUtil.ParseColor("#B8BAE6FD");
-        uint specCore = ParseUtil.ParseColor("#F2FFFFFF");
-        dc.FillRoundedRect(this._ballX - br + 4.0f, this._ballY - br + 5.0f, br * 2.0f, br * 2.0f, br, br, ballShadow, -1);
+        dc.FillRoundedRect(this._ballX - br + 4.0f, this._ballY - br + 5.0f, br * 2.0f, br * 2.0f, br, br, this._colBallShadow, -1);
         // Main 3D sphere FillEllipse MUST be the final FillEllipse command in OnRender
         dc.FillEllipse(this._ballX, this._ballY, br, br, this._ballSphereBrush);
         // Crisp specular highlight dots rendered via rounded-rect circles so FillEllipse invariant stays exact
-        dc.FillRoundedRect(this._ballX - br * 0.56f, this._ballY - br * 0.58f, br * 0.62f, br * 0.50f, br * 0.28f, br * 0.25f, specOuter, -1);
-        dc.FillRoundedRect(this._ballX - br * 0.44f, this._ballY - br * 0.48f, br * 0.34f, br * 0.28f, br * 0.15f, br * 0.14f, specCore, -1);
+        dc.FillRoundedRect(this._ballX - br * 0.56f, this._ballY - br * 0.58f, br * 0.62f, br * 0.50f, br * 0.28f, br * 0.25f, this._colSpecOuter, -1);
+        dc.FillRoundedRect(this._ballX - br * 0.44f, this._ballY - br * 0.48f, br * 0.34f, br * 0.28f, br * 0.15f, br * 0.14f, this._colSpecCore, -1);
     }
 }
 

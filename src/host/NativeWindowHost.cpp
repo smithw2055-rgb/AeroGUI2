@@ -1505,8 +1505,6 @@ bool NativeWindowHost::Initialize(const NativeWindowConfig& config) {
     ShutdownPlatformWindow();
 
     config_ = config;
-    width_ = std::max<std::uint32_t>(1u, config.width);
-    height_ = std::max<std::uint32_t>(1u, config.height);
     dpiScale_ = 1.0f;
 #if defined(_WIN32)
     if (!config.forceHeadless && !gpuBackend_) {
@@ -1520,13 +1518,26 @@ bool NativeWindowHost::Initialize(const NativeWindowConfig& config) {
         dpiScale_ = QueryWin32SystemDpiScale();
 #endif
     }
-    const float invDpi = 1.0f / std::max(0.25f, dpiScale_);
-    logicalWidth_ = std::max<std::uint32_t>(
-        1u,
-        static_cast<std::uint32_t>(std::lround(static_cast<float>(width_) * invDpi)));
-    logicalHeight_ = std::max<std::uint32_t>(
-        1u,
-        static_cast<std::uint32_t>(std::lround(static_cast<float>(height_) * invDpi)));
+    if (config.enableHighDpi) {
+        logicalWidth_ = std::max<std::uint32_t>(1u, config.width);
+        logicalHeight_ = std::max<std::uint32_t>(1u, config.height);
+        width_ = std::max<std::uint32_t>(
+            1u,
+            static_cast<std::uint32_t>(std::lround(static_cast<double>(logicalWidth_) * static_cast<double>(dpiScale_))));
+        height_ = std::max<std::uint32_t>(
+            1u,
+            static_cast<std::uint32_t>(std::lround(static_cast<double>(logicalHeight_) * static_cast<double>(dpiScale_))));
+    } else {
+        width_ = std::max<std::uint32_t>(1u, config.width);
+        height_ = std::max<std::uint32_t>(1u, config.height);
+        const float invDpi = 1.0f / std::max(0.25f, dpiScale_);
+        logicalWidth_ = std::max<std::uint32_t>(
+            1u,
+            static_cast<std::uint32_t>(std::lround(static_cast<float>(width_) * invDpi)));
+        logicalHeight_ = std::max<std::uint32_t>(
+            1u,
+            static_cast<std::uint32_t>(std::lround(static_cast<float>(height_) * invDpi)));
+    }
     clearColor_ = config.clearColor;
     closeRequested_.store(false, std::memory_order_release);
     wakeSignaled_.store(false, std::memory_order_release);
@@ -1595,6 +1606,8 @@ void NativeWindowHost::Shutdown() noexcept {
 }
 
 void NativeWindowHost::ShutdownPlatformWindow() noexcept {
+    inModalFrameDispatch_ = false;
+    inTickAndPresent_ = false;
     if (gpuBackend_) {
         gpuBackend_->Shutdown();
         gpuBackend_.reset();
@@ -1679,6 +1692,7 @@ void NativeWindowHost::ShutdownPlatformWindow() noexcept {
     pendingHighSurrogate_ = 0u;
     win32PressedMouseMask_ = 0u;
     win32WindowShown_ = false;
+    win32InSizeMove_ = false;
     if (win32Hdc_ && win32Hwnd_) {
         ReleaseDC(static_cast<HWND>(win32Hwnd_), static_cast<HDC>(win32Hdc_));
         win32Hdc_ = nullptr;
@@ -1686,6 +1700,7 @@ void NativeWindowHost::ShutdownPlatformWindow() noexcept {
     if (win32Hwnd_) {
         HWND hwnd = static_cast<HWND>(win32Hwnd_);
         win32Hwnd_ = nullptr;
+        KillTimer(hwnd, 0xAE20u);
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
         DestroyWindow(hwnd);
     }
@@ -2034,6 +2049,35 @@ bool NativeWindowHost::InitializePlatformWindowAndBackend(const NativeWindowConf
                 return 0;
             case WM_ERASEBKGND:
                 return 1;
+            case 0x0231: { // WM_ENTERSIZEMOVE
+                self->win32InSizeMove_ = true;
+                self->win32LastModalTick_ = std::chrono::steady_clock::now();
+                SetTimer(hwnd, 0xAE20u, 16u, nullptr);
+                return 0;
+            }
+            case 0x0232: { // WM_EXITSIZEMOVE
+                KillTimer(hwnd, 0xAE20u);
+                self->win32InSizeMove_ = false;
+                if (self->gpuBackend_) {
+                    self->DispatchModalLiveFrame(0.016f);
+                }
+                return 0;
+            }
+            case WM_TIMER: {
+                if (wParam == 0xAE20u && self->win32InSizeMove_ && self->gpuBackend_) {
+                    const auto now = std::chrono::steady_clock::now();
+                    const float dt = std::clamp(
+                        std::chrono::duration<float>(now - self->win32LastModalTick_).count(),
+                        0.001f,
+                        0.05f);
+                    self->win32LastModalTick_ = now;
+                    if (!self->CanHostSleepIdle() || self->needsInitialRender_) {
+                        self->DispatchModalLiveFrame(dt);
+                    }
+                    return 0;
+                }
+                break;
+            }
             case WM_PAINT: {
                 PAINTSTRUCT ps{};
                 (void)BeginPaint(hwnd, &ps);
@@ -2042,14 +2086,22 @@ bool NativeWindowHost::InitializePlatformWindowAndBackend(const NativeWindowConf
                 if (self->desktopHost_) {
                     self->desktopHost_->NotifyDirtyLayout();
                 }
-                self->WakeEventLoop();
+                if (self->win32InSizeMove_ && self->gpuBackend_) {
+                    self->DispatchModalLiveFrame(0.0f);
+                } else {
+                    self->WakeEventLoop();
+                }
                 return 0;
             }
             case WM_SIZE: {
                 const std::uint32_t nw = static_cast<std::uint32_t>(LOWORD(lParam));
                 const std::uint32_t nh = static_cast<std::uint32_t>(HIWORD(lParam));
-                if (nw > 0u && nh > 0u) {
+                if (nw > 0u && nh > 0u && wParam != SIZE_MINIMIZED) {
+                    const bool changed = (self->width_ != nw || self->height_ != nh);
                     self->OnPlatformResize(nw, nh);
+                    if (changed && self->gpuBackend_ && (self->win32InSizeMove_ || self->win32WindowShown_)) {
+                        self->DispatchModalLiveFrame(0.0f);
+                    }
                 }
                 return 0;
             }
@@ -2374,7 +2426,8 @@ bool NativeWindowHost::InitializePlatformWindowAndBackend(const NativeWindowConf
                                           int& outW,
                                           int& outH,
                                           int& outX,
-                                          int& outY) {
+                                          int& outY,
+                                          HWND refHwnd) {
         RECT wr{0, 0, static_cast<LONG>(clientW), static_cast<LONG>(clientH)};
         AdjustWin32WindowRectForDpi(&wr, WS_OVERLAPPEDWINDOW, FALSE, 0u, scale);
         outW = std::max(1, static_cast<int>(wr.right - wr.left));
@@ -2383,8 +2436,25 @@ bool NativeWindowHost::InitializePlatformWindowAndBackend(const NativeWindowConf
         outY = CW_USEDEFAULT;
 
         RECT workArea{};
-        if (SystemParametersInfoW(SPI_GETWORKAREA, 0, &workArea, 0) &&
+        bool hasWorkArea = false;
+        if (refHwnd) {
+            if (HMONITOR hMon = MonitorFromWindow(refHwnd, MONITOR_DEFAULTTONEAREST)) {
+                MONITORINFO mi{};
+                mi.cbSize = sizeof(mi);
+                if (GetMonitorInfoW(hMon, &mi) &&
+                    mi.rcWork.right > mi.rcWork.left &&
+                    mi.rcWork.bottom > mi.rcWork.top) {
+                    workArea = mi.rcWork;
+                    hasWorkArea = true;
+                }
+            }
+        }
+        if (!hasWorkArea &&
+            SystemParametersInfoW(SPI_GETWORKAREA, 0, &workArea, 0) &&
             workArea.right > workArea.left && workArea.bottom > workArea.top) {
+            hasWorkArea = true;
+        }
+        if (hasWorkArea) {
             const int workW = static_cast<int>(workArea.right - workArea.left);
             const int workH = static_cast<int>(workArea.bottom - workArea.top);
             outW = std::min(outW, workW);
@@ -2408,7 +2478,7 @@ bool NativeWindowHost::InitializePlatformWindowAndBackend(const NativeWindowConf
     int posX = CW_USEDEFAULT;
     int posY = CW_USEDEFAULT;
     const float initialBorderDpi = QueryWin32SystemDpiScale();
-    computeClampedWindowBounds(width_, height_, initialBorderDpi, outerW, outerH, posX, posY);
+    computeClampedWindowBounds(width_, height_, initialBorderDpi, outerW, outerH, posX, posY, nullptr);
     HWND hwnd = CreateWindowExW(
         0,
         kWndClassName,
@@ -2428,23 +2498,30 @@ bool NativeWindowHost::InitializePlatformWindowAndBackend(const NativeWindowConf
         win32WindowShown_ = false;
         EnableWin32DarkTitleBar(hwnd);
         const float winBorderDpi = QueryWin32WindowDpiScale(hwnd);
+        const std::uint32_t prevW = width_;
+        const std::uint32_t prevH = height_;
         if (config.enableHighDpi && config.dpiScale <= 0.0f &&
             std::abs(winBorderDpi - dpiScale_) > 1e-3f) {
             dpiScale_ = winBorderDpi;
-            const float invDpi = 1.0f / std::max(0.25f, dpiScale_);
-            logicalWidth_ = std::max<std::uint32_t>(
+            width_ = std::max<std::uint32_t>(
                 1u,
-                static_cast<std::uint32_t>(std::lround(static_cast<float>(width_) * invDpi)));
-            logicalHeight_ = std::max<std::uint32_t>(
+                static_cast<std::uint32_t>(std::lround(static_cast<double>(logicalWidth_) * static_cast<double>(dpiScale_))));
+            height_ = std::max<std::uint32_t>(
                 1u,
-                static_cast<std::uint32_t>(std::lround(static_cast<float>(height_) * invDpi)));
+                static_cast<std::uint32_t>(std::lround(static_cast<double>(logicalHeight_) * static_cast<double>(dpiScale_))));
+            gpuCfg.initialViewportWidth = width_;
+            gpuCfg.initialViewportHeight = height_;
         }
-        if (std::abs(winBorderDpi - initialBorderDpi) > 1e-3f) {
-            int adjW = 0;
-            int adjH = 0;
-            int adjX = 0;
-            int adjY = 0;
-            computeClampedWindowBounds(width_, height_, winBorderDpi, adjW, adjH, adjX, adjY);
+        int adjW = 0;
+        int adjH = 0;
+        int adjX = 0;
+        int adjY = 0;
+        computeClampedWindowBounds(width_, height_, winBorderDpi, adjW, adjH, adjX, adjY, hwnd);
+        if (std::abs(winBorderDpi - initialBorderDpi) > 1e-3f ||
+            width_ != prevW ||
+            height_ != prevH ||
+            adjW != outerW ||
+            adjH != outerH) {
             SetWindowPos(
                 hwnd,
                 nullptr,
@@ -2485,6 +2562,7 @@ bool NativeWindowHost::InitializePlatformWindowAndBackend(const NativeWindowConf
             pfd.dwFlags = PFD_DRAW_TO_WINDOW | PFD_SUPPORT_OPENGL | PFD_DOUBLEBUFFER;
             pfd.iPixelType = PFD_TYPE_RGBA;
             pfd.cColorBits = 32;
+            pfd.cAlphaBits = 8;
             const int pf = ChoosePixelFormat(hdc, &pfd);
             if (pf != 0 && SetPixelFormat(hdc, pf, &pfd)) {
                 static HMODULE sGlMod = LoadLibraryA("opengl32.dll");
@@ -2548,6 +2626,9 @@ bool NativeWindowHost::InitializePlatformWindowAndBackend(const NativeWindowConf
         if (sw->Initialize(swCfg)) {
             gpuBackend_ = std::move(sw);
             mode_ = NativeWindowMode::Win32GdiSoftware;
+            if (renderTree_) {
+                renderTree_->SetRootDpiScale(1.0f);
+            }
             diagnostics_ = "Win32 HWND initialized with GDI SoftwareSurfaceBackend presenter.";
             return true;
         }
@@ -2993,6 +3074,22 @@ void NativeWindowHost::OnPlatformTextInput(std::string_view utf8Text) noexcept {
     NotifyHostInputArrived();
 }
 
+void NativeWindowHost::DispatchModalLiveFrame(float dtSeconds) noexcept {
+    if (inModalFrameDispatch_ || inTickAndPresent_ || ShouldClose() || !IsInitialized() || !gpuBackend_) {
+        return;
+    }
+    struct ModalFrameScopeGuard {
+        bool& flag;
+        explicit ModalFrameScopeGuard(bool& f) noexcept : flag(f) { flag = true; }
+        ~ModalFrameScopeGuard() noexcept { flag = false; }
+    } modalGuard(inModalFrameDispatch_);
+    if (modalFrameCallback_) {
+        modalFrameCallback_(dtSeconds, modalFrameUserData_);
+    } else {
+        (void)TickAndPresentFrame(dtSeconds > 0.0f ? dtSeconds : 0.016f, true);
+    }
+}
+
 void NativeWindowHost::OnPlatformResize(std::uint32_t newWidth, std::uint32_t newHeight) noexcept {
     if (newWidth == 0u || newHeight == 0u) {
         return;
@@ -3048,7 +3145,8 @@ void NativeWindowHost::UpdateDpiScale(float newDpiScale) noexcept {
         webHost_->SetViewportSize(Size{static_cast<float>(width_), static_cast<float>(height_)});
     }
     if (renderTree_) {
-        renderTree_->SetRootDpiScale(dpiScale_);
+        const float treeDpi = (mode_ == NativeWindowMode::Win32GdiSoftware) ? 1.0f : dpiScale_;
+        renderTree_->SetRootDpiScale(treeDpi);
     }
     WakeEventLoop();
 }
@@ -3237,9 +3335,14 @@ void NativeWindowHost::SwapOrBlitPlatformSurface() noexcept {
 
 GpuBackendFrameStats NativeWindowHost::TickAndPresentFrame(float dtSeconds, bool forcePresent) {
     GpuBackendFrameStats frameStats{};
-    if (!IsInitialized() || !gpuBackend_ || !activeGpuStream_) {
+    if (inTickAndPresent_ || !IsInitialized() || !gpuBackend_ || !activeGpuStream_) {
         return frameStats;
     }
+    struct TickPresentScopeGuard {
+        bool& flag;
+        explicit TickPresentScopeGuard(bool& f) noexcept : flag(f) { flag = true; }
+        ~TickPresentScopeGuard() noexcept { flag = false; }
+    } presentGuard(inTickAndPresent_);
     (void)EffectiveResourceStore();
 
     auto markAllTreePagesDirty = [](PagedRenderTree& tree) noexcept {
@@ -3263,8 +3366,8 @@ GpuBackendFrameStats NativeWindowHost::TickAndPresentFrame(float dtSeconds, bool
     auto ensureNativeWindowShown = [&]() noexcept {
 #if defined(_WIN32)
         if (win32Hwnd_ && !win32WindowShown_) {
-            win32WindowShown_ = true;
             ShowWindow(static_cast<HWND>(win32Hwnd_), SW_SHOW);
+            win32WindowShown_ = true;
         }
 #endif
     };
@@ -3361,12 +3464,11 @@ GpuBackendFrameStats NativeWindowHost::TickAndPresentFrame(float dtSeconds, bool
     return frameStats;
 }
 
-bool NativeWindowHost::PumpEventsAndRender(float dtSeconds, std::int32_t maxWaitMs) {
+bool NativeWindowHost::PumpPlatformEvents(std::int32_t maxWaitMs, bool* outSleptIdle) {
     if (!IsInitialized()) {
         return false;
     }
 
-    const auto iterationStart = std::chrono::steady_clock::now();
     bool sleptIdleThisIteration = false;
 
 #if (defined(__linux__) || defined(__APPLE__)) && !defined(__EMSCRIPTEN__)
@@ -3511,7 +3613,6 @@ bool NativeWindowHost::PumpEventsAndRender(float dtSeconds, std::int32_t maxWait
 
 #elif defined(__EMSCRIPTEN__)
     (void)maxWaitMs;
-    (void)iterationStart;
     (void)sleptIdleThisIteration;
     DrainWakeSignal();
 #else
@@ -3526,7 +3627,20 @@ bool NativeWindowHost::PumpEventsAndRender(float dtSeconds, std::int32_t maxWait
     DrainWakeSignal();
 #endif
 
-    if (ShouldClose()) {
+    if (outSleptIdle) {
+        *outSleptIdle = sleptIdleThisIteration;
+    }
+    return !ShouldClose();
+}
+
+bool NativeWindowHost::PumpEventsAndRender(float dtSeconds, std::int32_t maxWaitMs) {
+    if (!IsInitialized()) {
+        return false;
+    }
+
+    const auto iterationStart = std::chrono::steady_clock::now();
+    bool sleptIdleThisIteration = false;
+    if (!PumpPlatformEvents(maxWaitMs, &sleptIdleThisIteration)) {
         return false;
     }
 

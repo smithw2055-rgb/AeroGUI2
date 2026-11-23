@@ -23,6 +23,7 @@
 namespace aero {
 
 using HostWakeCallback = void (*)(void* userData) noexcept;
+using HostBindingFlushCallback = void (*)(void* userData) noexcept;
 
 enum UiPhaseMask : std::uint32_t {
     UiPhase_None = 0u,
@@ -108,6 +109,11 @@ public:
     void SetDomains(ExecutionDomainContext* domains) noexcept { domains_ = domains; }
     [[nodiscard]] ExecutionDomainContext* Domains() const noexcept { return domains_; }
 
+    void SetBindingFlushCallback(HostBindingFlushCallback callback, void* userData) noexcept {
+        bindingFlushCallback_ = callback;
+        bindingFlushUserData_ = userData;
+    }
+
     void SetViewportSize(Size viewport) noexcept;
     [[nodiscard]] Size ViewportSize() const noexcept { return viewportSize_; }
 
@@ -182,6 +188,8 @@ protected:
 
     HostWakeCallback wakeCallback_ = nullptr;
     void* wakeUserData_ = nullptr;
+    HostBindingFlushCallback bindingFlushCallback_ = nullptr;
+    void* bindingFlushUserData_ = nullptr;
     float dpiScale_ = 1.0f;
     Size viewportSize_{1920.0f, 1080.0f};
     Size lastLaidOutViewport_{-1.0f, -1.0f};

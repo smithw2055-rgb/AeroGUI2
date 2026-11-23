@@ -580,7 +580,16 @@ public class TextBlock : FrameworkElement {
             return true;
         }
         if (propName == "TextTrimming") {
-            string tt = DependencyObject.UnboxString(value, "None");
+            if (value is BoxedInt && !(value is BoxedEnum)) {
+                int v = (value as BoxedInt).Value;
+                TextTrimming = v == 1 ? TextTrimming.CharacterEllipsis : (v == 2 ? TextTrimming.WordEllipsis : TextTrimming.None);
+                return true;
+            }
+            object rawObj = DependencyObject.Unbox(value);
+            string tt = DependencyObject.UnboxString(value, "None").Trim();
+            if ((tt.Length == 0 || tt == "ComboBoxItem") && rawObj is ContentControl) {
+                tt = DependencyObject.UnboxString((rawObj as ContentControl).ContentBox, "None").Trim();
+            }
             if (tt == "CharacterEllipsis") { TextTrimming = TextTrimming.CharacterEllipsis; return true; }
             if (tt == "WordEllipsis") { TextTrimming = TextTrimming.WordEllipsis; return true; }
             TextTrimming = TextTrimming.None;
@@ -599,6 +608,9 @@ public class TextBlock : FrameworkElement {
         }
         if (propName == "Stroke") { return Stroke; }
         if (propName == "StrokeThickness") { return DependencyObject.BoxFloat(StrokeThickness); }
+        if (propName == "TextWrapping") { return DependencyObject.BoxInt(EnumConvert.ToInt(_textWrapping)); }
+        if (propName == "TextAlignment") { return DependencyObject.BoxInt(EnumConvert.ToInt(_textAlignment)); }
+        if (propName == "TextTrimming") { return DependencyObject.BoxInt(EnumConvert.ToInt(_textTrimming)); }
         return base.GetPropertyValue(propName);
     }
 

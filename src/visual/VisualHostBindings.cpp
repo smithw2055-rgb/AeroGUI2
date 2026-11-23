@@ -2091,9 +2091,10 @@ bool RegisterVisualHostBindings(
             case rs_rt::ValueTag::Double:
                 return rs_rt::Value{std::int64_t{3}};
             case rs_rt::ValueTag::String:
+                return rs_rt::Value{std::int64_t{4}};
             case rs_rt::ValueTag::EnumInline:
             case rs_rt::ValueTag::EnumArena:
-                return rs_rt::Value{std::int64_t{4}};
+                return rs_rt::Value{std::int64_t{6}};
             case rs_rt::ValueTag::ObjectRef: {
                 if (const auto* ov = std::get_if<rs_rt::ObjectRef>(&val); ov && ov->valid()) {
                     if (ov->kind == rs_rt::ObjectKind::String) {

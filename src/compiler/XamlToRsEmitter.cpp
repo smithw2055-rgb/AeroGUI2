@@ -900,7 +900,7 @@ struct XamlNode final {
 [[nodiscard]] bool IsFloatProperty(std::string_view prop) {
     static const std::unordered_set<std::string_view> kFloatProps = {
         "Width", "Height", "MinWidth", "MaxWidth", "MinHeight", "MaxHeight",
-        "FontSize", "Opacity", "Spacing", "Minimum", "Maximum", "Value",
+        "FontSize", "Opacity", "SelectionOpacity", "Spacing", "Minimum", "Maximum", "Value",
         "SmallChange", "LargeChange", "StrokeThickness", "RadiusX", "RadiusY",
         "X1", "Y1", "X2", "Y2", "CenterX", "CenterY", "Radius", "BlurRadius",
         "ShadowDepth", "Direction", "Angle", "AngleX", "AngleY", "ScaleX", "ScaleY",
@@ -1159,7 +1159,7 @@ struct XamlNode final {
     if (prop == "TextTrimming" || prop == "LineHeight" || prop == "CharacterSpacing") {
         return targetType == "TextBlock";
     }
-    if (prop == "IsReadOnly") {
+    if (prop == "IsReadOnly" || prop == "SelectionOpacity") {
         return targetType == "TextBoxBase" || targetType == "TextBox" || targetType == "PasswordBox";
     }
     if (prop == "Placeholder") {
@@ -2904,20 +2904,7 @@ private:
                 }
             }
             out << "var " << bVar << " = new ImageBrush(\"shader://plasma\");\n";
-            if (const auto* stAttr = brushNode.FindAttribute("Stretch")) {
-                const std::string_view st = aero::str::Trim(stAttr->value);
-                if (!st.empty()) {
-                    Indent(out, indent);
-                    out << bVar << ".Stretch = Stretch." << st << ";\n";
-                }
-            }
-            if (const auto* tmAttr = brushNode.FindAttribute("TileMode")) {
-                const std::string_view tmVal = aero::str::Trim(tmAttr->value);
-                if (!tmVal.empty()) {
-                    Indent(out, indent);
-                    out << bVar << ".TileMode = " << EscapeRsString(tmVal) << ";\n";
-                }
-            }
+            EmitImageBrushPlacementAttrs(brushNode, bVar, out, indent);
             Indent(out, indent);
             out << bVar << ".EnablePlasmaShader("
                 << FormatFloatLiteral(sx) << ", " << FormatFloatLiteral(sy) << ", "
@@ -7044,9 +7031,12 @@ private:
                 if (LooksLikeMarkupExtension(cp->value)) {
                     const auto ext = ParseMarkupExtension(cp->value);
                     ParsedBindingSpec spec;
-                    if (TryExtractBindingSpec(ext, spec) && !spec.path.empty()) {
+                    if (TryExtractBindingSpec(ext, spec) &&
+                        (!spec.path.empty() || !spec.elementName.empty() ||
+                         !spec.relativeSourceMode.empty() || !spec.ancestorType.empty())) {
+                        const std::string effPath = spec.path.empty() ? std::string(".") : spec.path;
                         Indent(out, indent);
-                        out << av << ".CommandParameterPath = " << EscapeRsString(spec.path) << ";\n";
+                        out << av << ".CommandParameterPath = " << EscapeRsString(effPath) << ";\n";
                         if (!spec.relativeSourceMode.empty()) {
                             Indent(out, indent);
                             out << av << ".CommandParameterRelativeMode = "
@@ -7453,7 +7443,7 @@ private:
                 Indent(out, indent);
                 out << "var " << bv << " = new BackgroundEffectBehavior();\n";
                 if (!beh->children.empty()) {
-                    const std::string efVar = EmitEffectObject(*beh->children.front(), {}, out, indent);
+                    const std::string efVar = EmitEffectObject(*beh->children.front(), targetVar, out, indent);
                     if (!efVar.empty()) {
                         Indent(out, indent);
                         out << bv << ".Effect = " << efVar << ";\n";

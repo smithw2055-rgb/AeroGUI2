@@ -104,9 +104,11 @@ in vec4 v_Color;
 in vec2 v_PhysPos;
 
 uniform sampler2D u_SrcTex;
+uniform sampler2D u_OrigTex;
 uniform vec2 u_TexelSize;
 uniform int u_EffectMode;
 uniform vec2 u_EffectParams;
+uniform vec2 u_ShadowOffsetUv;
 uniform vec2 u_EffectUvMin;
 uniform vec2 u_EffectUvMax;
 uniform vec4 u_MaskMatRow0;
@@ -123,14 +125,22 @@ vec4 sampleClamped(vec2 uv) {
     return texture(u_SrcTex, clamp(uv, u_EffectUvMin, u_EffectUvMax));
 }
 
+vec4 sampleInBounds(vec2 uv) {
+    if (uv.x < u_EffectUvMin.x || uv.x > u_EffectUvMax.x ||
+        uv.y < u_EffectUvMin.y || uv.y > u_EffectUvMax.y) {
+        return vec4(0.0);
+    }
+    return texture(u_SrcTex, uv);
+}
+
 void main() {
     if (u_EffectMode == 1) {
-        float radius = clamp(u_EffectParams.x, 0.5, 128.0);
-        float sigma = max(0.35, radius * 0.5);
-        float stepPx = max(1.0, radius / 6.0);
+        float radius = clamp(u_EffectParams.x, 0.5, 256.0);
+        float sigma = max(0.35, radius * 0.38);
+        float stepPx = max(1.0, radius / 12.0);
         vec4 acc = vec4(0.0);
         float wSum = 0.0;
-        for (int k = -6; k <= 6; ++k) {
+        for (int k = -12; k <= 12; ++k) {
             float d = float(k) * stepPx;
             if (abs(d) > radius + 0.5) {
                 continue;
@@ -141,6 +151,59 @@ void main() {
         }
         vec4 res = (wSum > 0.0) ? (acc / wSum) : sampleClamped(v_Uv);
         o_FragColor = res * v_Color.a;
+        return;
+    }
+    if (u_EffectMode == 8) {
+        vec2 baseUv = v_Uv + u_ShadowOffsetUv;
+        float radius = clamp(u_EffectParams.x, 0.0, 256.0);
+        float blurA = 0.0;
+        if (radius <= 0.5) {
+            blurA = sampleInBounds(baseUv).a;
+        } else {
+            float sigma = max(0.35, radius * 0.38);
+            float stepPx = max(1.0, radius / 12.0);
+            float accA = 0.0;
+            float wSum = 0.0;
+            for (int k = -12; k <= 12; ++k) {
+                float d = float(k) * stepPx;
+                if (abs(d) > radius + 0.5) {
+                    continue;
+                }
+                float w = exp(-0.5 * (d * d) / (sigma * sigma));
+                accA += sampleInBounds(baseUv + u_TexelSize * d).a * w;
+                wSum += w;
+            }
+            blurA = (wSum > 0.0) ? (accA / wSum) : sampleInBounds(baseUv).a;
+        }
+        o_FragColor = vec4(0.0, 0.0, 0.0, clamp(blurA, 0.0, 1.0));
+        return;
+    }
+    if (u_EffectMode == 9) {
+        float radius = clamp(u_EffectParams.x, 0.0, 256.0);
+        float blurA = 0.0;
+        if (radius <= 0.5) {
+            blurA = sampleInBounds(v_Uv).a;
+        } else {
+            float sigma = max(0.35, radius * 0.38);
+            float stepPx = max(1.0, radius / 12.0);
+            float accA = 0.0;
+            float wSum = 0.0;
+            for (int k = -12; k <= 12; ++k) {
+                float d = float(k) * stepPx;
+                if (abs(d) > radius + 0.5) {
+                    continue;
+                }
+                float w = exp(-0.5 * (d * d) / (sigma * sigma));
+                accA += sampleInBounds(v_Uv + u_TexelSize * d).a * w;
+                wSum += w;
+            }
+            blurA = (wSum > 0.0) ? (accA / wSum) : sampleInBounds(v_Uv).a;
+        }
+        vec4 src = texture(u_OrigTex, clamp(v_Uv, u_EffectUvMin, u_EffectUvMax));
+        float shA = clamp(blurA * v_Color.a, 0.0, 1.0);
+        vec4 shadow = vec4(v_Color.rgb * shA, shA);
+        vec4 combined = src + shadow * (1.0 - clamp(src.a, 0.0, 1.0));
+        o_FragColor = combined * clamp(u_EffectParams.y, 0.0, 1.0);
         return;
     }
     if (u_EffectMode == 2) {
@@ -1389,9 +1452,11 @@ void OpenGlDeviceBackend::DestroyEffectGpuResources() noexcept {
     effectFboH_ = 0u;
     uEffectViewportSizeLoc_ = -1;
     uEffectSrcTexLoc_ = -1;
+    uEffectOrigTexLoc_ = -1;
     uEffectTexelSizeLoc_ = -1;
     uEffectModeLoc_ = -1;
     uEffectParamsLoc_ = -1;
+    uEffectShadowOffsetLoc_ = -1;
     uEffectUvMinLoc_ = -1;
     uEffectUvMaxLoc_ = -1;
 }
@@ -1462,6 +1527,7 @@ void OpenGlDeviceBackend::Shutdown() noexcept {
     syncedMtsdfRows_ = 0u;
     syncedGradientRevision_ = 0u;
     syncedMinGradRow_ = kUnifiedUiAtlasSize - 1u;
+    syncedImageAtlasSweepRev_ = 0u;
     imageSlotTextures_.clear();
     uiAtlasScratchRgba8_.clear();
     imageUploadScratchRgba8_.clear();
@@ -1627,9 +1693,11 @@ bool OpenGlDeviceBackend::EnsureEffectGpuResources(
         effectProgramId_ = prog;
         uEffectViewportSizeLoc_ = gl_.GetUniformLocation(effectProgramId_, "u_ViewportSize");
         uEffectSrcTexLoc_ = gl_.GetUniformLocation(effectProgramId_, "u_SrcTex");
+        uEffectOrigTexLoc_ = gl_.GetUniformLocation(effectProgramId_, "u_OrigTex");
         uEffectTexelSizeLoc_ = gl_.GetUniformLocation(effectProgramId_, "u_TexelSize");
         uEffectModeLoc_ = gl_.GetUniformLocation(effectProgramId_, "u_EffectMode");
         uEffectParamsLoc_ = gl_.GetUniformLocation(effectProgramId_, "u_EffectParams");
+        uEffectShadowOffsetLoc_ = gl_.GetUniformLocation(effectProgramId_, "u_ShadowOffsetUv");
         uEffectUvMinLoc_ = gl_.GetUniformLocation(effectProgramId_, "u_EffectUvMin");
         uEffectUvMaxLoc_ = gl_.GetUniformLocation(effectProgramId_, "u_EffectUvMax");
         uEffectMaskMatRow0Loc_ = gl_.GetUniformLocation(effectProgramId_, "u_MaskMatRow0");
@@ -2020,6 +2088,24 @@ void OpenGlDeviceBackend::SyncUnifiedUiAtlas(const PagedRenderTree& tree) {
         syncedGradientRevision_ = curGradRev;
         trimAtlasScratch();
     }
+
+    const UIResourceStore* optStore = tree.ResourceStore();
+    const ImageAtlas& imageAtlas = (optStore != nullptr && optStore->TryImages() != nullptr)
+        ? *optStore->TryImages()
+        : ImageAtlas::Instance();
+    const std::uint64_t curImgRev = imageAtlas.Revision();
+    if (curImgRev != syncedImageAtlasSweepRev_) {
+        syncedImageAtlasSweepRev_ = curImgRev;
+        for (std::size_t tid = 1u; tid < imageSlotTextures_.size(); ++tid) {
+            if (imageSlotTextures_[tid].texId != 0u &&
+                !imageAtlas.HasTextureSlot(static_cast<std::uint32_t>(tid))) {
+                if (gl_.DeleteTextures) {
+                    gl_.DeleteTextures(1, &imageSlotTextures_[tid].texId);
+                }
+                imageSlotTextures_[tid] = GlImageSlotState{};
+            }
+        }
+    }
 }
 
 AeroGLuint OpenGlDeviceBackend::EnsureFallbackWhiteTexture() {
@@ -2072,6 +2158,12 @@ AeroGLuint OpenGlDeviceBackend::ResolveBatchImageTexture(
     }
 
     if (!imageAtlas.HasTextureSlot(textureId)) {
+        if (textureId < imageSlotTextures_.size() && imageSlotTextures_[textureId].texId != 0u) {
+            if (gl_.DeleteTextures) {
+                gl_.DeleteTextures(1, &imageSlotTextures_[textureId].texId);
+            }
+            imageSlotTextures_[textureId] = GlImageSlotState{};
+        }
         return fallbackTex != 0u ? fallbackTex : atlasTextureId_;
     }
 
@@ -2889,6 +2981,8 @@ GpuBackendFrameStats OpenGlDeviceBackend::ExecuteSubmission(
             const std::uint32_t opacityColor = PackColorRgba8(Color{1.0f, 1.0f, 1.0f, 1.0f}, effSpanOpacity);
             constexpr float kDegToRad = 3.14159265358979323846f / 180.0f;
             const float angRad = (std::isfinite(span.angleDeg) ? span.angleDeg : 0.0f) * kDegToRad;
+            const float ws = (std::isfinite(span.worldScale) && span.worldScale > 0.0f) ? span.worldScale : 1.0f;
+            const float effRadiusPhys = std::max(0.0f, span.radiusPx) * ws * dpiScale;
             const float invW = 1.0f / fVpW;
             const float invH = 1.0f / fVpH;
 
@@ -2906,8 +3000,43 @@ GpuBackendFrameStats OpenGlDeviceBackend::ExecuteSubmission(
                     gl_.Clear(kGlColorBufferBit);
                     gl_.Disable(kGlScissorTest);
                     scissorCurrentlyEnabled = false;
-                    issueEffectPass(effectFboIds_[1], 1, effectFboTexIds_[0], invW, 0.0f, span.radiusPx * dpiScale, 1.0f, 0xFFFFFFFFu, false, false);
-                    issueEffectPass(0u, 1, effectFboTexIds_[1], 0.0f, invH, span.radiusPx * dpiScale, 1.0f, opacityColor, true, true);
+                    issueEffectPass(effectFboIds_[1], 1, effectFboTexIds_[0], invW, 0.0f, effRadiusPhys, 1.0f, 0xFFFFFFFFu, false, false);
+                    issueEffectPass(0u, 1, effectFboTexIds_[1], 0.0f, invH, effRadiusPhys, 1.0f, opacityColor, true, true);
+                    break;
+                }
+                case UIEffectKind::DropShadow: {
+                    const float depthPx = (std::isfinite(span.amountX) ? span.amountX : 0.0f) * ws * dpiScale;
+                    const float dxPx = std::cos(angRad) * depthPx;
+                    const float dyPx = -std::sin(angRad) * depthPx;
+                    if (uEffectShadowOffsetLoc_ >= 0) {
+                        gl_.Uniform2f(uEffectShadowOffsetLoc_, -dxPx * invW, dyPx * invH);
+                    }
+                    gl_.BindFramebuffer(kGlFramebuffer, effectFboIds_[1]);
+                    gl_.Enable(kGlScissorTest);
+                    scissorCurrentlyEnabled = true;
+                    gl_.Scissor(
+                        static_cast<AeroGLint>(bx0),
+                        static_cast<AeroGLint>(vpH - by1),
+                        static_cast<AeroGLsizei>(bw),
+                        static_cast<AeroGLsizei>(bh));
+                    gl_.ClearColor(0.0f, 0.0f, 0.0f, 0.0f);
+                    gl_.Clear(kGlColorBufferBit);
+                    gl_.Disable(kGlScissorTest);
+                    scissorCurrentlyEnabled = false;
+                    issueEffectPass(effectFboIds_[1], 8, effectFboTexIds_[0], invW, 0.0f, effRadiusPhys, 1.0f, 0xFFFFFFFFu, false, false);
+
+                    gl_.ActiveTexture(kGlTexture1);
+                    gl_.BindTexture(kGlTexture2D, effectFboTexIds_[0]);
+                    if (uEffectOrigTexLoc_ >= 0) {
+                        gl_.Uniform1i(uEffectOrigTexLoc_, 1);
+                    }
+                    gl_.ActiveTexture(kGlTexture0);
+
+                    const std::uint32_t shadowPacked = PackColorRgba8(span.effectColor, 1.0f);
+                    issueEffectPass(0u, 9, effectFboTexIds_[1], 0.0f, invH, effRadiusPhys, effSpanOpacity, shadowPacked, true, true);
+                    gl_.ActiveTexture(kGlTexture1);
+                    gl_.BindTexture(kGlTexture2D, 0u);
+                    gl_.ActiveTexture(kGlTexture0);
                     break;
                 }
                 case UIEffectKind::DirectionalBlur:
@@ -2917,14 +3046,14 @@ GpuBackendFrameStats OpenGlDeviceBackend::ExecuteSubmission(
                         effectFboTexIds_[0],
                         std::cos(angRad) * invW,
                         std::sin(angRad) * invH,
-                        span.radiusPx * dpiScale,
+                        effRadiusPhys,
                         1.0f,
                         opacityColor,
                         true,
                         true);
                     break;
                 case UIEffectKind::Pixelate:
-                    issueEffectPass(0u, 3, effectFboTexIds_[0], invW, invH, span.radiusPx * dpiScale, 1.0f, opacityColor, true, true);
+                    issueEffectPass(0u, 3, effectFboTexIds_[0], invW, invH, effRadiusPhys, 1.0f, opacityColor, true, true);
                     break;
                 case UIEffectKind::Tint: {
                     const float tintStrength = std::clamp(
@@ -3104,6 +3233,12 @@ GpuBackendFrameStats OpenGlDeviceBackend::ExecuteSubmission(
                     effectReadbackTopDown_.data() + static_cast<std::size_t>(ry) * rowBytes,
                     effectReadbackBottomUp_.data() + static_cast<std::size_t>(srcRow) * rowBytes,
                     rowBytes);
+            }
+            if (clearColor.a >= 0.999f) {
+                const std::size_t pxCount = static_cast<std::size_t>(bw) * static_cast<std::size_t>(bh);
+                for (std::size_t i = 0u; i < pxCount; ++i) {
+                    effectReadbackTopDown_[i * 4u + 3u] = 255u;
+                }
             }
 
             int patchX = 0, patchY = 0, patchW = 0, patchH = 0;

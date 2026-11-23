@@ -911,6 +911,35 @@ bool TestPlasmaSlotReuseLoopAndLru() {
     AERO_CHECK(atlas.TryGetTextureSlotSnapshot(slotId, w0, h0, snap0) && snap0 != nullptr);
     const std::vector<std::uint8_t> frame0Copy = *snap0;
 
+    // Verify PlasmaBrush dark regions are transparent and have no opaque-black background pixels
+    const aero::ImageAtlasEntry* eFull = atlas.LoadOrGet(
+        "shader://plasma?sx=64&sy=64&seed=100&color=%23FF01BCFF&vw=300&vh=90&time=0.0");
+    AERO_CHECK(eFull != nullptr && eFull->textureId > 0u && eFull->textureId != slotId);
+    std::uint32_t wf = 0u, hf = 0u;
+    std::shared_ptr<const std::vector<std::uint8_t>> snapFull;
+    AERO_CHECK(atlas.TryGetTextureSlotSnapshot(eFull->textureId, wf, hf, snapFull) && snapFull != nullptr);
+    bool hasTransparentPx = false;
+    bool hasBrightGlowPx = false;
+    std::size_t opaqueBlackCount = 0u;
+    for (std::size_t i = 0u; i + 3u < snapFull->size(); i += 4u) {
+        const std::uint8_t r = (*snapFull)[i + 0u];
+        const std::uint8_t g = (*snapFull)[i + 1u];
+        const std::uint8_t b = (*snapFull)[i + 2u];
+        const std::uint8_t a = (*snapFull)[i + 3u];
+        if (a == 0u) {
+            hasTransparentPx = true;
+        }
+        if (a >= 200u) {
+            hasBrightGlowPx = true;
+            if (r < 10u && g < 10u && b < 10u) {
+                ++opaqueBlackCount;
+            }
+        }
+    }
+    AERO_CHECK(hasTransparentPx);
+    AERO_CHECK(hasBrightGlowPx);
+    AERO_CHECK(opaqueBlackCount == 0u);
+
     // Frame 1: time changes -> updates same slot in-place with different pixels
     const aero::ImageAtlasEntry* e1 = atlas.LoadOrGet("shader://plasma?" + baseParams + "&time=1.0");
     AERO_CHECK(e1 != nullptr && e1->textureId == slotId);
@@ -1197,6 +1226,191 @@ bool TestRiveOverflowGuardAndPartialTrim() {
     return true;
 }
 
+bool TestModalLiveResizeAndTextEllipsis() {
+    // 1. #18 NativeWindowHost live modal resize/paint frame callback & re-entrancy guard
+    struct ModalProbe {
+        aero::NativeWindowHost* host = nullptr;
+        int liveTicks = 0;
+        bool nestedGuarded = false;
+    };
+    aero::NativeWindowHost winHost;
+    aero::NativeWindowConfig nwCfg{};
+    nwCfg.width = 320u;
+    nwCfg.height = 240u;
+    nwCfg.forceHeadless = true;
+    AERO_CHECK(winHost.Initialize(nwCfg));
+    ModalProbe probe{&winHost, 0, false};
+    winHost.SetModalFrameCallback(
+        [](float /*dtSeconds*/, void* ud) noexcept {
+            auto* p = static_cast<ModalProbe*>(ud);
+            ++p->liveTicks;
+            const int beforeNested = p->liveTicks;
+            p->host->DispatchModalLiveFrame(0.016f);
+            if (p->liveTicks == beforeNested) {
+                p->nestedGuarded = true;
+            }
+        },
+        &probe);
+    winHost.DispatchModalLiveFrame(0.016f);
+    winHost.DispatchModalLiveFrame(0.016f);
+    AERO_CHECK(probe.liveTicks == 2 && probe.nestedGuarded);
+    winHost.Shutdown();
+
+    // 2. #13 Standard CSS/WPF named colors (including BurlyWood #FFDEB887)
+    const aero::Color burly = aero::ParseColorLiteral("BurlyWood");
+    AERO_CHECK(std::fabs(burly.r - (222.0f / 255.0f)) < 0.01f);
+    AERO_CHECK(std::fabs(burly.g - (184.0f / 255.0f)) < 0.01f);
+    AERO_CHECK(std::fabs(burly.b - (135.0f / 255.0f)) < 0.01f);
+    AERO_CHECK(std::fabs(burly.a - 1.0f) < 0.01f);
+    const aero::Color cornflower = aero::ParseColorLiteral("CornflowerBlue");
+    const aero::Color crimson = aero::ParseColorLiteral("Crimson");
+    AERO_CHECK(cornflower.b > 0.85f && crimson.r > 0.80f);
+
+    // 3. #12 FontAtlas single-line & multi-line height-constrained CharacterEllipsis / WordEllipsis
+    aero::FontAtlas fontAtlas(512u);
+    const std::string longText =
+        "The quick brown fox jumps over the lazy dog again and again across a narrow box";
+    const aero::TextLayoutResult untrimmed = fontAtlas.MeasureLayout(
+        longText, "", 16.0f, 120.0f, aero::TextWrapping::NoWrap,
+        0.0f, 400, false, 0.0f, false, aero::TextTrimming::None, 1000000.0f);
+    const aero::TextLayoutResult charTrimmed = fontAtlas.MeasureLayout(
+        longText, "", 16.0f, 120.0f, aero::TextWrapping::NoWrap,
+        0.0f, 400, false, 0.0f, false, aero::TextTrimming::CharacterEllipsis, 1000000.0f);
+    const aero::TextLayoutResult wordTrimmed = fontAtlas.MeasureLayout(
+        longText, "", 16.0f, 120.0f, aero::TextWrapping::NoWrap,
+        0.0f, 400, false, 0.0f, false, aero::TextTrimming::WordEllipsis, 1000000.0f);
+    AERO_CHECK(untrimmed.glyphs.size() > charTrimmed.glyphs.size());
+    AERO_CHECK(charTrimmed.glyphs.size() >= 4u && wordTrimmed.glyphs.size() >= 4u);
+    AERO_CHECK(charTrimmed.totalWidth <= 122.0f && wordTrimmed.totalWidth <= 122.0f);
+    const std::size_t nChar = charTrimmed.glyphs.size();
+    AERO_CHECK(charTrimmed.glyphs[nChar - 1].codePoint == '.' &&
+               charTrimmed.glyphs[nChar - 2].codePoint == '.' &&
+               charTrimmed.glyphs[nChar - 3].codePoint == '.');
+
+    const aero::TextLayoutResult multiUntrimmed = fontAtlas.MeasureLayout(
+        longText, "", 16.0f, 140.0f, aero::TextWrapping::Wrap,
+        0.0f, 400, false, 0.0f, false, aero::TextTrimming::None, 1000000.0f);
+    const aero::TextLayoutResult multiTrimmed = fontAtlas.MeasureLayout(
+        longText, "", 16.0f, 140.0f, aero::TextWrapping::Wrap,
+        0.0f, 400, false, 0.0f, false, aero::TextTrimming::WordEllipsis, 42.0f);
+    AERO_CHECK(multiUntrimmed.lines.size() >= 3u);
+    AERO_CHECK(multiTrimmed.lines.size() <= 2u && !multiTrimmed.glyphs.empty());
+    const std::size_t nMulti = multiTrimmed.glyphs.size();
+    AERO_CHECK(nMulti >= 3u &&
+               multiTrimmed.glyphs[nMulti - 1].codePoint == '.' &&
+               multiTrimmed.glyphs[nMulti - 2].codePoint == '.' &&
+               multiTrimmed.glyphs[nMulti - 3].codePoint == '.');
+
+    const aero::TextLayoutResult rtlCharTrimmed = fontAtlas.MeasureLayout(
+        longText, "", 16.0f, 90.0f, aero::TextWrapping::NoWrap,
+        0.0f, 400, false, 0.0f, true, aero::TextTrimming::CharacterEllipsis, 1000000.0f);
+    AERO_CHECK(rtlCharTrimmed.glyphs.size() >= 4u);
+    AERO_CHECK(rtlCharTrimmed.totalWidth <= 92.0f);
+    AERO_CHECK(rtlCharTrimmed.glyphs[0].codePoint == '.' &&
+               rtlCharTrimmed.glyphs[1].codePoint == '.' &&
+               rtlCharTrimmed.glyphs[2].codePoint == '.');
+#ifdef AERO_SAMPLES_DIR
+    {
+        aero::FontAtlas arAtlas(512u);
+        const std::string arPath = std::string(AERO_SAMPLES_DIR) + "/Localization/Data/A_Nefel_Sereke.ttf";
+        if (arAtlas.LoadTrueTypeFontFromFile(arPath, "ArabicEllipsis", false)) {
+            const std::string arLong =
+                "\xD8\xA7\xD9\x84\xD8\xB3\xD9\x84\xD8\xA7\xD9\x85 \xD8\xB9\xD9\x84\xD9\x8A\xD9\x83\xD9\x85 "
+                "\xD9\x88\xD8\xB1\xD8\xAD\xD9\x85\xD8\xA9 \xD8\xA7\xD9\x84\xD9\x84\xD9\x87 "
+                "\xD9\x88\xD8\xA8\xD8\xB1\xD9\x83\xD8\xA7\xD8\xAA\xD9\x87";
+            const aero::TextLayoutResult arTrimmed = arAtlas.MeasureLayout(
+                arLong, "ArabicEllipsis", 20.0f, 90.0f, aero::TextWrapping::NoWrap,
+                0.0f, 400, false, 0.0f, true, aero::TextTrimming::CharacterEllipsis, 1000000.0f);
+            AERO_CHECK(arTrimmed.glyphs.size() >= 4u);
+            AERO_CHECK(arTrimmed.totalWidth <= 92.0f);
+            AERO_CHECK(arTrimmed.glyphs[0].codePoint == '.' &&
+                       arTrimmed.glyphs[1].codePoint == '.' &&
+                       arTrimmed.glyphs[2].codePoint == '.');
+        }
+    }
+#endif
+
+    // 4. #02 UIResourceStore per-group (<=2) & byte-budget eviction for zoom-animated path masks
+    aero::UIResourceStore store;
+    const std::string svgRect = "M0,0 L200,0 L200,200 L0,200 Z";
+    for (std::uint32_t side = 128u; side <= 640u; side += 64u) {
+        aero::RasterizedPathMaskEntry entry{};
+        AERO_CHECK(store.GetOrRasterizePathMask(
+            0x987654321ULL, svgRect, aero::Rect{0.0f, 0.0f, 200.0f, 200.0f}, side, side, 2u, entry));
+        AERO_CHECK(entry.textureId != 0u);
+    }
+    AERO_CHECK(store.PathMaskCount() <= 2u);
+    AERO_CHECK(store.PathMaskTotalBytes() <= 16u * 1024u * 1024u);
+    AERO_CHECK(store.Images().StandaloneTextureCount() <= 2u);
+    return true;
+}
+
+bool TestWindowHighDpiLogicalSizing() {
+    auto store = std::make_shared<aero::UIResourceStore>();
+    aero::VisualWorld world(nullptr, store.get());
+    const aero::VisualNodeId root = world.CreateNode(aero::VisualKind::Box);
+    world.SetRoot(root);
+    world.SetSize(root, 1280.0f, 800.0f);
+    world.SetInteractiveFlags(root, true, true, false);
+
+    const aero::VisualNodeId target = world.CreateNode(aero::VisualKind::Box);
+    world.AddChild(root, target);
+    world.SetAlignment(target, aero::HorizontalAlignment::Left, aero::VerticalAlignment::Top);
+    world.SetMargin(target, 600.0f, 360.0f, 0.0f, 0.0f);
+    world.SetSize(target, 80.0f, 80.0f);
+    world.SetInteractiveFlags(target, true, true, false);
+    world.SetBoxStyle(target, 0xFF336699u, 0u, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f);
+    if (aero::VisualNode* tn = world.GetNode(target)) {
+        tn->callbackMask = aero::VisualCallback_PointerMove;
+    }
+    world.UpdateLayout(1280.0f, 800.0f);
+
+    aero::DesktopEventHost desktopHost;
+    aero::PagedRenderTree tree;
+    tree.SetResourceStore(store.get());
+    aero::ZeroCopyGpuStream stream(aero::ShaderBackend::DesktopGL33, 8u);
+    aero::VisualInputRouter router(&world);
+
+    float dispatchedX = -1.0f;
+    float dispatchedY = -1.0f;
+    int dispatchCount = 0;
+    router.SetScriptEventDispatcher([&](
+        aero::VisualNodeId nodeId,
+        aero::VisualCallbackFlags kind,
+        const aero::NativeInputEvent& ev) {
+        if (nodeId == target && kind == aero::VisualCallback_PointerMove) {
+            dispatchedX = ev.x;
+            dispatchedY = ev.y;
+            ++dispatchCount;
+            return true;
+        }
+        return false;
+    });
+
+    aero::NativeWindowHost host;
+    host.BindDesktopHost(&desktopHost, &tree, &stream, &router);
+    aero::NativeWindowConfig cfg{};
+    cfg.forceHeadless = true;
+    cfg.enableHighDpi = true;
+    cfg.dpiScale = 1.5f;
+    cfg.width = 1280u;
+    cfg.height = 800u;
+    AERO_CHECK(host.Initialize(cfg));
+    AERO_CHECK(host.LogicalWidth() == 1280u);
+    AERO_CHECK(host.LogicalHeight() == 800u);
+    AERO_CHECK(host.Width() == 1920u);
+    AERO_CHECK(host.Height() == 1200u);
+    AERO_CHECK(std::fabs(host.DpiScale() - 1.5f) < 1e-3f);
+
+    host.OnPlatformMouseMove(960.0f, 600.0f, 0u);
+    (void)router.FlushQueuedEvents();
+    AERO_CHECK(router.HoveredNode() == target);
+    AERO_CHECK(dispatchCount >= 1);
+    AERO_CHECK(std::fabs(dispatchedX - 640.0f) < 0.25f);
+    AERO_CHECK(std::fabs(dispatchedY - 400.0f) < 0.25f);
+    return true;
+}
+
 } // namespace
 
 int main() {
@@ -1213,11 +1427,13 @@ int main() {
         {"NativeWindowHostKeysClipboardAndDrivers", &TestNativeWindowHostKeysClipboardAndDrivers},
         {"HighDpiMockGlViewportAndScissor", &TestHighDpiMockGlViewportAndScissor},
         {"WindowExactClientSizeNoDpiScaling", &TestWindowExactClientSizeNoDpiScaling},
+        {"WindowHighDpiLogicalSizing", &TestWindowHighDpiLogicalSizing},
         {"RiveRendererAndBackdropBlur", &TestRiveRendererAndBackdropBlur},
         {"PlasmaSlotReuseLoopAndLru", &TestPlasmaSlotReuseLoopAndLru},
         {"CompositeMaskedPathImageTintAndTile", &TestCompositeMaskedPathImageTintAndTile},
         {"ArabicRtlAndBidiFixes", &TestArabicRtlAndBidiFixes},
         {"RiveOverflowGuardAndPartialTrim", &TestRiveOverflowGuardAndPartialTrim},
+        {"ModalLiveResizeAndTextEllipsis", &TestModalLiveResizeAndTextEllipsis},
     };
 
     int passed = 0;

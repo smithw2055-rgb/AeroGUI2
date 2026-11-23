@@ -623,7 +623,7 @@ public class ContentPresenter : FrameworkElement {
     }
 
     public override string GetTypeName() { return "ContentPresenter"; }
-    public override bool IsNamescopeBoundary() { return _contentTemplate != null; }
+    public override bool IsNamescopeBoundary() { return _contentTemplate != null || base.IsNamescopeBoundary(); }
     protected virtual bool IsScrollPresenter() { return false; }
 
     protected override bool IsSelfHitTestSolid() {

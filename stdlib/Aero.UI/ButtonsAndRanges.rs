@@ -225,24 +225,124 @@ public class Button : ButtonBase {
 }
 
 public class RepeatButton : Button {
-    public int Delay { get; set; } = 500;
-    public int Interval { get; set; } = 100;
+    public int Delay { get; set; } = 250;
+    public int Interval { get; set; } = 33;
     private string _routedCommandName = "";
+    private float _repeatElapsedMs = 0.0f;
+    private bool _repeatStarted = false;
+    private static RepeatButton[] _activeRepeats;
+    private static bool _repeatHookInstalled = false;
 
     public RepeatButton() : base() {
         ClickMode = ClickMode.Press;
     }
     public override string GetTypeName() { return "RepeatButton"; }
 
+    private bool IsRepeatEngaged() {
+        if (!IsEnabled || _isDisposedTree || Visibility != Visibility.Visible) { return false; }
+        if (ClickMode == ClickMode.Hover) { return IsMouseOver; }
+        return IsPressed;
+    }
+
+    private static void EnsureRepeatHook() {
+        if (_repeatHookInstalled) { return; }
+        _repeatHookInstalled = true;
+        _activeRepeats = new RepeatButton[0];
+        BindingEngine.AddFrameTickHook((float dt) => { RepeatButton.StepActiveRepeats(dt); });
+    }
+
+    private void StartRepeatTracking() {
+        EnsureRepeatHook();
+        _repeatElapsedMs = 0.0f;
+        _repeatStarted = false;
+        bool exists = false;
+        for (int i = 0; i < _activeRepeats.Length; i += 1) {
+            if (_activeRepeats[i] == this) { exists = true; break; }
+        }
+        if (!exists) { _activeRepeats.Push(this); }
+        if (ParseUtil.IsNativeReady()) {
+            int firstWait = Delay > 16 ? Delay : 16;
+            Host_RequestWakeAfterMs(firstWait);
+        }
+    }
+
+    public static void StepActiveRepeats(float dtSeconds) {
+        if (_activeRepeats == null || _activeRepeats.Length == 0) { return; }
+        float dtMs = dtSeconds * 1000.0f;
+        if (dtMs <= 0.0f) { dtMs = 16.0f; }
+        int minNextWakeMs = 0;
+        for (int i = _activeRepeats.Length - 1; i >= 0; i -= 1) {
+            RepeatButton rb = _activeRepeats[i];
+            if (rb == null || !rb.IsRepeatEngaged()) {
+                if (rb != null) {
+                    rb._repeatElapsedMs = 0.0f;
+                    rb._repeatStarted = false;
+                }
+                _activeRepeats.RemoveAt(i);
+                continue;
+            }
+            rb._repeatElapsedMs += dtMs;
+            int effDelay = rb.Delay > 16 ? rb.Delay : 16;
+            int effInterval = rb.Interval > 10 ? rb.Interval : 10;
+            if (!rb._repeatStarted) {
+                if (rb._repeatElapsedMs >= (float)effDelay) {
+                    rb._repeatStarted = true;
+                    rb._repeatElapsedMs -= (float)effDelay;
+                    rb.OnClick();
+                }
+                int rem = effDelay - (int)rb._repeatElapsedMs;
+                if (rem < 16) { rem = 16; }
+                if (minNextWakeMs == 0 || rem < minNextWakeMs) { minNextWakeMs = rem; }
+            } else {
+                int guard = 0;
+                while (rb._repeatElapsedMs >= (float)effInterval && guard < 4) {
+                    rb._repeatElapsedMs -= (float)effInterval;
+                    rb.OnClick();
+                    guard += 1;
+                }
+                if (rb._repeatElapsedMs >= (float)effInterval) { rb._repeatElapsedMs = 0.0f; }
+                int rem = effInterval - (int)rb._repeatElapsedMs;
+                if (rem < 16) { rem = 16; }
+                if (minNextWakeMs == 0 || rem < minNextWakeMs) { minNextWakeMs = rem; }
+            }
+        }
+        if (minNextWakeMs > 0 && ParseUtil.IsNativeReady()) {
+            Host_RequestWakeAfterMs(minNextWakeMs);
+        }
+    }
+
+    public override void OnMouseEnter(MouseEventArgs e) {
+        base.OnMouseEnter(e);
+        if (ClickMode == ClickMode.Hover && IsEnabled) {
+            StartRepeatTracking();
+        }
+    }
+
+    public override void OnMouseLeftButtonDown(MouseButtonEventArgs e) {
+        base.OnMouseLeftButtonDown(e);
+        if (ClickMode != ClickMode.Hover && IsEnabled && IsPressed) {
+            StartRepeatTracking();
+        }
+    }
+
     public void TickRepeat() {
-        if (IsEnabled && IsPressed) { OnClick(); }
+        if (IsRepeatEngaged()) { OnClick(); }
     }
 
     private ScrollBar FindAncestorScrollBar() {
         UIElement cur = TemplatedParent != null ? TemplatedParent : Parent;
         while (cur != null) {
             if (cur is ScrollBar) { return cur as ScrollBar; }
-            cur = cur.TemplatedParent != null ? cur.TemplatedParent : cur.Parent;
+            cur = cur.Parent != null ? cur.Parent : cur.TemplatedParent;
+        }
+        return null;
+    }
+
+    private ScrollViewer FindAncestorScrollViewer() {
+        UIElement cur = TemplatedParent != null ? TemplatedParent : Parent;
+        while (cur != null) {
+            if (cur is ScrollViewer) { return cur as ScrollViewer; }
+            cur = cur.Parent != null ? cur.Parent : cur.TemplatedParent;
         }
         return null;
     }
@@ -251,7 +351,7 @@ public class RepeatButton : Button {
         UIElement cur = TemplatedParent != null ? TemplatedParent : Parent;
         while (cur != null) {
             if (cur is Slider) { return cur as Slider; }
-            cur = cur.TemplatedParent != null ? cur.TemplatedParent : cur.Parent;
+            cur = cur.Parent != null ? cur.Parent : cur.TemplatedParent;
         }
         return null;
     }
@@ -269,23 +369,47 @@ public class RepeatButton : Button {
             return;
         }
         ScrollBar sb = FindAncestorScrollBar();
-        if (sb == null) { return; }
-        float small = sb.SmallChange > 0.0f ? sb.SmallChange : 16.0f;
-        float large = sb.ViewportSize > 0.0f ? sb.ViewportSize : (sb.LargeChange > 0.0f ? sb.LargeChange : 80.0f);
-        if (_routedCommandName == "ScrollBar.LineUpCommand" || _routedCommandName == "ScrollBar.LineLeftCommand") {
-            sb.Value = sb.Value - small;
-        } else if (_routedCommandName == "ScrollBar.LineDownCommand" || _routedCommandName == "ScrollBar.LineRightCommand") {
-            sb.Value = sb.Value + small;
-        } else if (_routedCommandName == "ScrollBar.PageUpCommand" || _routedCommandName == "ScrollBar.PageLeftCommand") {
-            sb.Value = sb.Value - large;
-        } else if (_routedCommandName == "ScrollBar.PageDownCommand" || _routedCommandName == "ScrollBar.PageRightCommand") {
-            sb.Value = sb.Value + large;
+        if (sb != null) {
+            float small = sb.SmallChange > 0.0f ? sb.SmallChange : 16.0f;
+            float large = sb.ViewportSize > 0.0f ? sb.ViewportSize : (sb.LargeChange > 0.0f ? sb.LargeChange : 80.0f);
+            if (_routedCommandName == "ScrollBar.LineUpCommand" || _routedCommandName == "ScrollBar.LineLeftCommand") {
+                sb.Value = sb.Value - small;
+            } else if (_routedCommandName == "ScrollBar.LineDownCommand" || _routedCommandName == "ScrollBar.LineRightCommand") {
+                sb.Value = sb.Value + small;
+            } else if (_routedCommandName == "ScrollBar.PageUpCommand" || _routedCommandName == "ScrollBar.PageLeftCommand") {
+                sb.Value = sb.Value - large;
+            } else if (_routedCommandName == "ScrollBar.PageDownCommand" || _routedCommandName == "ScrollBar.PageRightCommand") {
+                sb.Value = sb.Value + large;
+            }
+            return;
+        }
+        ScrollViewer sv = FindAncestorScrollViewer();
+        if (sv != null) {
+            float hPage = sv.ViewportWidth > 0.0f ? sv.ViewportWidth : 80.0f;
+            float vPage = sv.ViewportHeight > 0.0f ? sv.ViewportHeight : 80.0f;
+            if (_routedCommandName == "ScrollBar.LineLeftCommand") {
+                sv.ScrollToHorizontalOffset(sv.HorizontalOffset - 16.0f);
+            } else if (_routedCommandName == "ScrollBar.LineRightCommand") {
+                sv.ScrollToHorizontalOffset(sv.HorizontalOffset + 16.0f);
+            } else if (_routedCommandName == "ScrollBar.LineUpCommand") {
+                sv.ScrollToVerticalOffset(sv.VerticalOffset - 16.0f);
+            } else if (_routedCommandName == "ScrollBar.LineDownCommand") {
+                sv.ScrollToVerticalOffset(sv.VerticalOffset + 16.0f);
+            } else if (_routedCommandName == "ScrollBar.PageLeftCommand") {
+                sv.ScrollToHorizontalOffset(sv.HorizontalOffset - hPage);
+            } else if (_routedCommandName == "ScrollBar.PageRightCommand") {
+                sv.ScrollToHorizontalOffset(sv.HorizontalOffset + hPage);
+            } else if (_routedCommandName == "ScrollBar.PageUpCommand") {
+                sv.ScrollToVerticalOffset(sv.VerticalOffset - vPage);
+            } else if (_routedCommandName == "ScrollBar.PageDownCommand") {
+                sv.ScrollToVerticalOffset(sv.VerticalOffset + vPage);
+            }
         }
     }
 
     public override bool SetPropertyValue(string propName, DependencyObject value) {
-        if (propName == "Delay") { Delay = DependencyObject.UnboxInt(value, 500); return true; }
-        if (propName == "Interval") { Interval = DependencyObject.UnboxInt(value, 100); return true; }
+        if (propName == "Delay") { Delay = DependencyObject.UnboxInt(value, 250); return true; }
+        if (propName == "Interval") { Interval = DependencyObject.UnboxInt(value, 33); return true; }
         if (propName == "Command" && !(value is ICommand)) {
             _routedCommandName = DependencyObject.UnboxString(value, "");
             return true;
@@ -1226,8 +1350,10 @@ public class RangeBase : Control {
         if (_value == clamped) { return; }
         float old = _value;
         _value = clamped;
+        var evArgs = new RoutedPropertyChangedEventArgs<float>(old, clamped, this);
         OnValueChanged(old, clamped);
-        ValueChanged(this, new RoutedPropertyChangedEventArgs<float>(old, clamped, this));
+        ValueChanged(this, evArgs);
+        RaiseRoutedEvent("ValueChanged", evArgs);
         BindingEngine.MarkFlushDirty();
         BindingEngine.NotifyTargetPropertyChanged(this, "Value", DependencyObject.BoxFloat(clamped));
         NotifyStateInvalidatedHooks();

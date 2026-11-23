@@ -41,6 +41,8 @@ struct AeroAppHostConfig {
     std::uint32_t viewportHeight = 800u;
     bool headless = true;
     bool preferSoftwareRasterizer = false;
+    bool enableHighDpi = false;
+    float dpiScale = 0.0f;
     bool optimizeBytecode = false;
     std::string windowTitle = "AeroGUI 3.0";
     std::string entryClassName;
@@ -286,9 +288,11 @@ private:
     std::uint64_t lastGcDestroyedNodes_ = 0u;
     std::vector<PlayedSoundRecord> playedSounds_;
     std::string lastError_;
+    Size lastNotifiedViewport_{-1.0f, -1.0f};
     std::optional<std::chrono::steady_clock::time_point> scheduledWakeAt_;
     bool scriptWakeRequested_ = false;
     bool closeRequested_ = false;
+    bool inStepFrame_ = false;
     bool initialized_ = false;
 };
 
