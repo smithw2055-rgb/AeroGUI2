@@ -26,42 +26,54 @@ namespace {
     return nullptr;
 }
 
-void ApplyTextFgOpacityRecursive(
+bool ApplyTextFgOpacityRecursive(
     VisualWorld& world,
     VisualNodeId id,
     float opacity,
     int depth) noexcept {
-    if (depth > 8) return;
+    if (depth > 8) return false;
     VisualNode* node = world.GetNode(id);
-    if (!node) return;
+    if (!node) return false;
     if (node->kind == VisualKind::Text) {
+        const float cur = node->HasExtras() ? node->extras->text.fgOpacity : VisualNode::DefaultExtras().text.fgOpacity;
+        if (std::fabs(cur - opacity) <= 1e-5f) {
+            return false;
+        }
         node->EnsureExtras().text.fgOpacity = opacity;
         world.MarkDirty(id, VisualDirty_Visual);
-        return;
+        return true;
     }
+    bool changed = false;
     const std::vector<VisualNodeId> kids = node->children;
     for (VisualNodeId ch : kids) {
-        ApplyTextFgOpacityRecursive(world, ch, opacity, depth + 1);
+        changed |= ApplyTextFgOpacityRecursive(world, ch, opacity, depth + 1);
     }
+    return changed;
 }
 
-void ApplyTextFgColorRecursive(
+bool ApplyTextFgColorRecursive(
     VisualWorld& world,
     VisualNodeId id,
     std::uint32_t rgba,
     int depth) noexcept {
-    if (depth > 8) return;
+    if (depth > 8) return false;
     VisualNode* node = world.GetNode(id);
-    if (!node) return;
+    if (!node) return false;
     if (node->kind == VisualKind::Text) {
+        const std::uint32_t cur = node->HasExtras() ? node->extras->text.fgRgba : VisualNode::DefaultExtras().text.fgRgba;
+        if (cur == rgba) {
+            return false;
+        }
         node->EnsureExtras().text.fgRgba = rgba;
         world.MarkDirty(id, VisualDirty_Visual);
-        return;
+        return true;
     }
+    bool changed = false;
     const std::vector<VisualNodeId> kids = node->children;
     for (VisualNodeId ch : kids) {
-        ApplyTextFgColorRecursive(world, ch, rgba, depth + 1);
+        changed |= ApplyTextFgColorRecursive(world, ch, rgba, depth + 1);
     }
+    return changed;
 }
 
 [[nodiscard]] float EaseInBounceWpf(float t, float bouncesParam, float bouncinessParam) noexcept {
@@ -304,128 +316,174 @@ struct MutableGradSlot {
     }
 }
 
-void ApplyScalarProp(VisualWorld& world, VisualNodeId id, VisualAnimProp prop, float value) noexcept {
+[[nodiscard]] bool PropNeedsDefaultScriptSync(VisualAnimProp prop) noexcept {
+    return prop == VisualAnimProp::ManagedCustom ||
+           (prop >= VisualAnimProp::CustomScalar1 && prop <= VisualAnimProp::CustomScalar3);
+}
+
+bool ApplyScalarProp(VisualWorld& world, VisualNodeId id, VisualAnimProp prop, float value) noexcept {
     VisualNode* node = world.GetNode(id);
-    if (!node) return;
+    if (!node) return false;
+    auto scalarSame = [](float a, float b) noexcept {
+        return (std::isnan(a) && std::isnan(b)) || std::fabs(a - b) <= 1e-5f;
+    };
     switch (prop) {
-    case VisualAnimProp::Opacity:
-        node->layout.opacity = std::clamp(value, 0.0f, 1.0f);
+    case VisualAnimProp::Opacity: {
+        const float next = std::clamp(value, 0.0f, 1.0f);
+        if (scalarSame(node->layout.opacity, next)) return false;
+        node->layout.opacity = next;
         break;
+    }
     case VisualAnimProp::Width:
+        if (scalarSame(node->layout.width, value)) return false;
         node->layout.width = value;
         world.MarkDirty(id, VisualDirty_Layout);
-        return;
+        return true;
     case VisualAnimProp::Height:
+        if (scalarSame(node->layout.height, value)) return false;
         node->layout.height = value;
         world.MarkDirty(id, VisualDirty_Layout);
-        return;
+        return true;
     case VisualAnimProp::TranslateX:
+        if (scalarSame(node->transform2D.tx, value)) return false;
         node->transform2D.tx = value;
         break;
     case VisualAnimProp::TranslateY:
+        if (scalarSame(node->transform2D.ty, value)) return false;
         node->transform2D.ty = value;
         break;
     case VisualAnimProp::ScaleX:
+        if (scalarSame(node->transform2D.sx, value)) return false;
         node->transform2D.sx = value;
         break;
     case VisualAnimProp::ScaleY:
+        if (scalarSame(node->transform2D.sy, value)) return false;
         node->transform2D.sy = value;
         break;
     case VisualAnimProp::RotateDeg:
+        if (scalarSame(node->transform2D.rotDeg, value)) return false;
         node->transform2D.rotDeg = value;
         break;
     case VisualAnimProp::SkewX:
+        if (scalarSame(node->transform2D.skewX, value)) return false;
         node->transform2D.skewX = value;
         break;
     case VisualAnimProp::SkewY:
+        if (scalarSame(node->transform2D.skewY, value)) return false;
         node->transform2D.skewY = value;
         break;
     case VisualAnimProp::Rot3DX:
+        if (node->HasExtras() && node->extras->transform3D.enabled && scalarSame(node->extras->transform3D.rx, value)) return false;
         node->EnsureExtras().transform3D.rx = value;
         node->EnsureExtras().transform3D.enabled = true;
         break;
     case VisualAnimProp::Rot3DY:
+        if (node->HasExtras() && node->extras->transform3D.enabled && scalarSame(node->extras->transform3D.ry, value)) return false;
         node->EnsureExtras().transform3D.ry = value;
         node->EnsureExtras().transform3D.enabled = true;
         break;
     case VisualAnimProp::Rot3DZ:
+        if (node->HasExtras() && node->extras->transform3D.enabled && scalarSame(node->extras->transform3D.rz, value)) return false;
         node->EnsureExtras().transform3D.rz = value;
         node->EnsureExtras().transform3D.enabled = true;
         break;
     case VisualAnimProp::Trans3DX:
+        if (node->HasExtras() && node->extras->transform3D.enabled && scalarSame(node->extras->transform3D.tx, value)) return false;
         node->EnsureExtras().transform3D.tx = value;
         node->EnsureExtras().transform3D.enabled = true;
         break;
     case VisualAnimProp::Trans3DY:
+        if (node->HasExtras() && node->extras->transform3D.enabled && scalarSame(node->extras->transform3D.ty, value)) return false;
         node->EnsureExtras().transform3D.ty = value;
         node->EnsureExtras().transform3D.enabled = true;
         break;
     case VisualAnimProp::Trans3DZ:
+        if (node->HasExtras() && node->extras->transform3D.enabled && scalarSame(node->extras->transform3D.tz, value)) return false;
         node->EnsureExtras().transform3D.tz = value;
         node->EnsureExtras().transform3D.enabled = true;
         break;
     case VisualAnimProp::CornerRadius:
+        if (scalarSame(node->box.cornerRadius.topLeft, value) &&
+            scalarSame(node->box.cornerRadius.topRight, value) &&
+            scalarSame(node->box.cornerRadius.bottomRight, value) &&
+            scalarSame(node->box.cornerRadius.bottomLeft, value)) {
+            return false;
+        }
         node->box.cornerRadius = CornerRadius{value};
         break;
     case VisualAnimProp::PathTrimStart:
+        if (node->HasExtras() && scalarSame(node->extras->vector.trimStart, value)) return false;
+        if (!node->HasExtras() && scalarSame(VisualNode::DefaultExtras().vector.trimStart, value)) return false;
         node->EnsureExtras().vector.trimStart = value;
         break;
     case VisualAnimProp::PathTrimEnd:
+        if (node->HasExtras() && scalarSame(node->extras->vector.trimEnd, value)) return false;
+        if (!node->HasExtras() && scalarSame(VisualNode::DefaultExtras().vector.trimEnd, value)) return false;
         node->EnsureExtras().vector.trimEnd = value;
         break;
     case VisualAnimProp::EffectRadius:
+        if (node->HasExtras() && scalarSame(node->extras->effect.radius, value)) return false;
         node->EnsureExtras().effect.radius = value;
         break;
-    case VisualAnimProp::EffectOpacity:
-        node->EnsureExtras().effect.opacity = std::clamp(value, 0.0f, 1.0f);
+    case VisualAnimProp::EffectOpacity: {
+        const float next = std::clamp(value, 0.0f, 1.0f);
+        if (node->HasExtras() && scalarSame(node->extras->effect.opacity, next)) return false;
+        node->EnsureExtras().effect.opacity = next;
         break;
+    }
     case VisualAnimProp::BrushOpacity:
+    case VisualAnimProp::FillBrushOpacity: {
+        const float next = std::clamp(value, 0.0f, 1.0f);
         if (node->kind == VisualKind::Vector) {
-            node->EnsureExtras().vector.fillOpacity = std::clamp(value, 0.0f, 1.0f);
+            if (node->HasExtras() && scalarSame(node->extras->vector.fillOpacity, next)) return false;
+            node->EnsureExtras().vector.fillOpacity = next;
         } else {
-            node->box.bgOpacity = std::clamp(value, 0.0f, 1.0f);
+            if (scalarSame(node->box.bgOpacity, next)) return false;
+            node->box.bgOpacity = next;
         }
         break;
-    case VisualAnimProp::FillBrushOpacity:
+    }
+    case VisualAnimProp::StrokeBrushOpacity: {
+        const float next = std::clamp(value, 0.0f, 1.0f);
         if (node->kind == VisualKind::Vector) {
-            node->EnsureExtras().vector.fillOpacity = std::clamp(value, 0.0f, 1.0f);
+            if (node->HasExtras() && scalarSame(node->extras->vector.strokeOpacity, next)) return false;
+            node->EnsureExtras().vector.strokeOpacity = next;
         } else {
-            node->box.bgOpacity = std::clamp(value, 0.0f, 1.0f);
+            return false;
         }
         break;
-    case VisualAnimProp::StrokeBrushOpacity:
-        if (node->kind == VisualKind::Vector) {
-            node->EnsureExtras().vector.strokeOpacity = std::clamp(value, 0.0f, 1.0f);
-        }
-        break;
+    }
     case VisualAnimProp::FgBrushOpacity:
-        ApplyTextFgOpacityRecursive(world, id, std::clamp(value, 0.0f, 1.0f), 0);
-        return;
+        return ApplyTextFgOpacityRecursive(world, id, std::clamp(value, 0.0f, 1.0f), 0);
     case VisualAnimProp::CustomScalar0:
+        if (scalarSame(node->customScalars[0], value)) return false;
         node->customScalars[0] = value;
         break;
     case VisualAnimProp::CustomScalar1:
+        if (scalarSame(node->customScalars[1], value)) return false;
         node->customScalars[1] = value;
         if (node->layout.hasLayoutTransform || std::fabs(value - 1.0f) > 1e-6f) {
             const auto& lt = node->layout.layoutTransform2D;
             world.SetLayoutTransform2D(id, value, lt.sy, lt.rotDeg, lt.skewX, lt.skewY);
-            return;
+            return true;
         }
         break;
     case VisualAnimProp::CustomScalar2:
+        if (scalarSame(node->customScalars[2], value)) return false;
         node->customScalars[2] = value;
         if (node->layout.hasLayoutTransform || std::fabs(value - 1.0f) > 1e-6f) {
             const auto& lt = node->layout.layoutTransform2D;
             world.SetLayoutTransform2D(id, lt.sx, value, lt.rotDeg, lt.skewX, lt.skewY);
-            return;
+            return true;
         }
         break;
     case VisualAnimProp::CustomScalar3:
+        if (scalarSame(node->customScalars[3], value)) return false;
         node->customScalars[3] = value;
         if (node->layout.hasLayoutTransform || std::fabs(value) > 1e-6f) {
             const auto& lt = node->layout.layoutTransform2D;
             world.SetLayoutTransform2D(id, lt.sx, lt.sy, value, lt.skewX, lt.skewY);
-            return;
+            return true;
         }
         break;
     case VisualAnimProp::OpacityMaskStop0Offset:
@@ -434,64 +492,94 @@ void ApplyScalarProp(VisualWorld& world, VisualNodeId id, VisualAnimProp prop, f
     case VisualAnimProp::OpacityMaskStop3Offset: {
         const std::size_t stopIdx = static_cast<std::size_t>(
             static_cast<std::uint8_t>(prop) - static_cast<std::uint8_t>(VisualAnimProp::OpacityMaskStop0Offset));
-        if (stopIdx < node->EnsureExtras().opacityMask.stopOffsets.size()) {
-            node->EnsureExtras().opacityMask.stopOffsets[stopIdx] = std::clamp(value, 0.0f, 1.0f);
+        const float next = std::clamp(value, 0.0f, 1.0f);
+        auto& offsets = node->EnsureExtras().opacityMask.stopOffsets;
+        if (stopIdx < offsets.size()) {
+            if (scalarSame(offsets[stopIdx], next)) return false;
+            offsets[stopIdx] = next;
+        } else {
+            return false;
         }
         break;
     }
     case VisualAnimProp::ManagedCustom:
-        break;
+        return false;
     default: {
         const auto target = ParseGradientStopTarget(prop);
         if (target.isStopOffset) {
+            GradientBrushDesc desc{};
+            if (TryReadGradientBrush(world, ReadGradId(node, target.isStroke), desc) &&
+                target.stopIndex < desc.stops.size() &&
+                scalarSame(desc.stops[target.stopIndex].offset, value)) {
+                return false;
+            }
             std::uint32_t brushId = 0u;
             if (GradientBrushRegistry* reg = EnsureMutableNodeGradient(world, node, target.isStroke, brushId)) {
-                (void)reg->UpdateBrushStopOffset(brushId, target.stopIndex, value);
+                if (!reg->UpdateBrushStopOffset(brushId, target.stopIndex, value)) {
+                    return false;
+                }
+            } else {
+                return false;
             }
+        } else {
+            return false;
         }
         break;
     }
     }
     world.MarkDirty(id, DirtyFlagsForScalarProp(prop));
+    return true;
 }
 
-void ApplyColorProp(VisualWorld& world, VisualNodeId id, VisualAnimProp prop, std::uint32_t rgba) noexcept {
+bool ApplyColorProp(VisualWorld& world, VisualNodeId id, VisualAnimProp prop, std::uint32_t rgba) noexcept {
     VisualNode* node = world.GetNode(id);
-    if (!node) return;
+    if (!node) return false;
     if (const auto target = ParseGradientStopTarget(prop); target.isStopColor) {
+        GradientBrushDesc desc{};
+        if (TryReadGradientBrush(world, ReadGradId(node, target.isStroke), desc) &&
+            target.stopIndex < desc.stops.size() &&
+            PackColor(desc.stops[target.stopIndex].color) == rgba) {
+            return false;
+        }
         std::uint32_t brushId = 0u;
         if (GradientBrushRegistry* reg = EnsureMutableNodeGradient(world, node, target.isStroke, brushId)) {
-            (void)reg->UpdateBrushStopColor(brushId, target.stopIndex, UnpackRgba(rgba));
-            world.MarkDirty(id, VisualDirty_Visual);
+            if (reg->UpdateBrushStopColor(brushId, target.stopIndex, UnpackRgba(rgba))) {
+                world.MarkDirty(id, VisualDirty_Visual);
+                return true;
+            }
         }
-        return;
+        return false;
     }
     switch (prop) {
     case VisualAnimProp::BgColor:
     case VisualAnimProp::FillColor:
         if (node->kind == VisualKind::Vector) {
+            if (node->HasExtras() && node->extras->vector.fillRgba == rgba) return false;
             node->EnsureExtras().vector.fillRgba = rgba;
         } else {
+            if (node->box.bgRgba == rgba) return false;
             node->box.bgRgba = rgba;
         }
         break;
     case VisualAnimProp::FgColor:
-        ApplyTextFgColorRecursive(world, id, rgba, 0);
-        return;
+        return ApplyTextFgColorRecursive(world, id, rgba, 0);
     case VisualAnimProp::BorderColor:
     case VisualAnimProp::StrokeColor:
         if (node->kind == VisualKind::Vector) {
+            if (node->HasExtras() && node->extras->vector.strokeRgba == rgba) return false;
             node->EnsureExtras().vector.strokeRgba = rgba;
         } else {
+            if (node->box.borderRgba == rgba) return false;
             node->box.borderRgba = rgba;
         }
         break;
     case VisualAnimProp::ManagedCustom:
-        break;
+        return false;
     default:
-        return;
+        return false;
     }
     world.MarkDirty(id, VisualDirty_Visual);
+    return true;
 }
 
 [[nodiscard]] std::uint32_t LerpRgba(std::uint32_t a, std::uint32_t b, float t) noexcept {
@@ -554,29 +642,26 @@ void StepSpringAnalytical(VisualAnimTrack& track, float dtSeconds) noexcept {
     track.velocity = vNext;
 }
 
-void EvaluateKeyFramesAtTime(VisualAnimTrack& track, VisualWorld& world, float localTimeSec) noexcept {
+bool EvaluateKeyFramesAtTime(VisualAnimTrack& track, VisualWorld& world, float localTimeSec) noexcept {
     const auto& kfs = track.keyFrames;
     if (kfs.empty()) {
-        return;
+        return false;
     }
     const bool colorProp = IsColorProp(track.prop);
-    auto applyKf = [&](const VisualKeyFrame& kf) {
+    auto applyKf = [&](const VisualKeyFrame& kf) -> bool {
         if (colorProp) {
             track.currentRgba = kf.colorRgba;
-            ApplyColorProp(world, track.targetNode, track.prop, kf.colorRgba);
-        } else {
-            track.currentVal = kf.scalarValue;
-            ApplyScalarProp(world, track.targetNode, track.prop, kf.scalarValue);
+            return ApplyColorProp(world, track.targetNode, track.prop, kf.colorRgba);
         }
+        track.currentVal = kf.scalarValue;
+        return ApplyScalarProp(world, track.targetNode, track.prop, kf.scalarValue);
     };
 
     if (kfs.size() == 1u || localTimeSec <= kfs.front().timeSec) {
-        applyKf(kfs.front());
-        return;
+        return applyKf(kfs.front());
     }
     if (localTimeSec >= kfs.back().timeSec) {
-        applyKf(kfs.back());
-        return;
+        return applyKf(kfs.back());
     }
 
     for (std::size_t idx = 1u; idx < kfs.size(); ++idx) {
@@ -585,24 +670,21 @@ void EvaluateKeyFramesAtTime(VisualAnimTrack& track, VisualWorld& world, float l
         if (localTimeSec <= kf1.timeSec) {
             const float span = kf1.timeSec - kf0.timeSec;
             if (kf1.discrete || span <= 1e-6f) {
-                applyKf((localTimeSec >= kf1.timeSec) ? kf1 : kf0);
-                return;
+                return applyKf((localTimeSec >= kf1.timeSec) ? kf1 : kf0);
             }
             const float u = std::clamp((localTimeSec - kf0.timeSec) / span, 0.0f, 1.0f);
             const float eased = EvaluateEasing(kf1.easingKind, kf1.easingMode, u, kf1.easeParam0, kf1.easeParam1, kf1.easeParamMask);
             if (colorProp) {
                 const std::uint32_t col = LerpRgba(kf0.colorRgba, kf1.colorRgba, eased);
                 track.currentRgba = col;
-                ApplyColorProp(world, track.targetNode, track.prop, col);
-            } else {
-                const float val = kf0.scalarValue + (kf1.scalarValue - kf0.scalarValue) * eased;
-                track.currentVal = val;
-                ApplyScalarProp(world, track.targetNode, track.prop, val);
+                return ApplyColorProp(world, track.targetNode, track.prop, col);
             }
-            return;
+            const float val = kf0.scalarValue + (kf1.scalarValue - kf0.scalarValue) * eased;
+            track.currentVal = val;
+            return ApplyScalarProp(world, track.targetNode, track.prop, val);
         }
     }
-    applyKf(kfs.back());
+    return applyKf(kfs.back());
 }
 
 } // namespace
@@ -708,6 +790,7 @@ std::int32_t VisualAnimationEngine::StartFloat(
     track.easeMode = easeMode;
     track.autoReverse = autoReverse;
     track.repeatCount = repeatCount;
+    track.needsScriptSync = PropNeedsDefaultScriptSync(prop);
     tracks_.push_back(std::move(track));
     if (wakeHostCallback_) {
         wakeHostCallback_();
@@ -752,6 +835,7 @@ std::int32_t VisualAnimationEngine::StartColor(
     track.easeMode = easeMode;
     track.autoReverse = autoReverse;
     track.repeatCount = repeatCount;
+    track.needsScriptSync = PropNeedsDefaultScriptSync(prop);
     tracks_.push_back(std::move(track));
     if (wakeHostCallback_) {
         wakeHostCallback_();
@@ -905,6 +989,7 @@ std::int32_t VisualAnimationEngine::SpringFloat(
     track.spring.stiffness = std::max(1.0f, stiffness);
     track.spring.damping = std::max(0.1f, damping);
     track.spring.mass = std::max(0.01f, mass);
+    track.needsScriptSync = PropNeedsDefaultScriptSync(prop);
     tracks_.push_back(std::move(track));
     if (wakeHostCallback_) {
         wakeHostCallback_();
@@ -951,6 +1036,7 @@ std::int32_t VisualAnimationEngine::StartKeyFrames(
     track.delaySec = clampedDelay;
     track.autoReverse = autoReverse;
     track.repeatCount = repeatCount;
+    track.needsScriptSync = PropNeedsDefaultScriptSync(prop);
     track.keyFrames = std::move(keyFrames);
     tracks_.push_back(std::move(track));
     if (wakeHostCallback_) {
@@ -986,6 +1072,7 @@ std::int32_t VisualAnimationEngine::BeginKeyFramesTrack(
     track.delaySec = clampedDelay;
     track.autoReverse = autoReverse;
     track.repeatCount = repeatCount;
+    track.needsScriptSync = PropNeedsDefaultScriptSync(prop);
     tracks_.push_back(std::move(track));
     if (wakeHostCallback_) {
         wakeHostCallback_();
@@ -1064,22 +1151,36 @@ void VisualAnimationEngine::SetTrackEasingParams(
     }
 }
 
+void VisualAnimationEngine::MarkTrackScriptSync(std::int32_t trackId) noexcept {
+    if (trackId <= 0) return;
+    for (VisualAnimTrack& tr : tracks_) {
+        if (tr.trackId == trackId) {
+            tr.needsScriptSync = true;
+            return;
+        }
+    }
+}
+
 void VisualAnimationEngine::Clear() noexcept {
     tracks_.clear();
+    lastTickNeededScriptSync_ = false;
 }
 
 bool VisualAnimationEngine::Tick(float dtSeconds, VisualWorld& world) {
+    lastTickNeededScriptSync_ = false;
     if (tracks_.empty() || dtSeconds < 0.0f) {
         return false;
     }
-    bool anyUpdated = false;
+    bool anyVisualMutated = false;
     for (std::size_t i = 0u; i < tracks_.size(); ) {
         VisualAnimTrack& track = tracks_[i];
         if (!world.IsAlive(track.targetNode)) {
+            if (track.needsScriptSync) {
+                lastTickNeededScriptSync_ = true;
+            }
             tracks_.erase(tracks_.begin() + static_cast<std::ptrdiff_t>(i));
             continue;
         }
-        anyUpdated = true;
         float activeDt = dtSeconds;
         if (track.delaySec > 0.0f) {
             const float step = std::min(activeDt, track.delaySec);
@@ -1089,6 +1190,9 @@ bool VisualAnimationEngine::Tick(float dtSeconds, VisualWorld& world) {
                 ++i;
                 continue;
             }
+        }
+        if (track.needsScriptSync) {
+            lastTickNeededScriptSync_ = true;
         }
         track.elapsedSec += activeDt;
 
@@ -1101,7 +1205,7 @@ bool VisualAnimationEngine::Tick(float dtSeconds, VisualWorld& world) {
                 track.velocity = 0.0f;
                 finished = true;
             }
-            ApplyScalarProp(world, track.targetNode, track.prop, track.currentVal);
+            anyVisualMutated |= ApplyScalarProp(world, track.targetNode, track.prop, track.currentVal);
         } else {
             const float rawDur = track.durationSec;
             float normT = 1.0f;
@@ -1154,24 +1258,25 @@ bool VisualAnimationEngine::Tick(float dtSeconds, VisualWorld& world) {
                 const float eased = EvaluateEasing(track.easeKind, track.easeMode, normT, track.easeParam0, track.easeParam1, track.easeParamMask);
                 const float val = track.fromVal + (track.toVal - track.fromVal) * eased;
                 track.currentVal = val;
-                ApplyScalarProp(world, track.targetNode, track.prop, val);
+                anyVisualMutated |= ApplyScalarProp(world, track.targetNode, track.prop, val);
             } else if (track.kind == VisualAnimTrackKind::ColorTween) {
                 const float eased = EvaluateEasing(track.easeKind, track.easeMode, normT, track.easeParam0, track.easeParam1, track.easeParamMask);
                 const std::uint32_t col = LerpRgba(track.fromRgba, track.toRgba, eased);
                 track.currentRgba = col;
-                ApplyColorProp(world, track.targetNode, track.prop, col);
+                anyVisualMutated |= ApplyColorProp(world, track.targetNode, track.prop, col);
             } else if (track.kind == VisualAnimTrackKind::KeyFrames) {
-                EvaluateKeyFramesAtTime(track, world, localTimeSec);
+                anyVisualMutated |= EvaluateKeyFramesAtTime(track, world, localTimeSec);
             }
         }
 
         if (finished) {
+            lastTickNeededScriptSync_ = true;
             tracks_.erase(tracks_.begin() + static_cast<std::ptrdiff_t>(i));
         } else {
             ++i;
         }
     }
-    return anyUpdated;
+    return anyVisualMutated;
 }
 
 bool VisualAnimationEngine::HasTrack(std::int32_t trackId) const noexcept {

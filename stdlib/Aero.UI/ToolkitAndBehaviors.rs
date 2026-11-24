@@ -258,6 +258,8 @@ public class DateTimeControl : Control {
     }
 
     private void SyncDisplay() {
+        BumpPropEpoch();
+        BindingEngine.MarkFlushDirty();
         if (_display != null) {
             _display.Text = FormattedText();
             _display.Foreground = Foreground;
@@ -2030,11 +2032,22 @@ public class BehaviorDataTrigger : BehaviorTriggerBase {
         }
     }
 
+    private static DependencyObject[] _reactiveBLastDc;
+    private static int[] _reactiveBLastVer;
+    private static UIElement[] _reactiveBSrc;
+    private static int[] _reactiveBSrcTreeEpoch;
+    private static int[] _reactiveBSrcChainEpoch;
+
     private static void RegisterReactive(BehaviorDataTrigger dt, UIElement target) {
         if (dt == null || target == null) { return; }
         if (_reactiveBTriggers == null) {
             _reactiveBTriggers = new BehaviorDataTrigger[0];
             _reactiveBTargets = new UIElement[0];
+            _reactiveBLastDc = new DependencyObject[0];
+            _reactiveBLastVer = new int[0];
+            _reactiveBSrc = new UIElement[0];
+            _reactiveBSrcTreeEpoch = new int[0];
+            _reactiveBSrcChainEpoch = new int[0];
         }
         if (!_reactiveBHookInstalled) {
             _reactiveBHookInstalled = true;
@@ -2046,6 +2059,11 @@ public class BehaviorDataTrigger : BehaviorTriggerBase {
         }
         _reactiveBTriggers.Push(dt);
         _reactiveBTargets.Push(target);
+        _reactiveBLastDc.Push(null);
+        _reactiveBLastVer.Push(-1);
+        _reactiveBSrc.Push(null);
+        _reactiveBSrcTreeEpoch.Push(0);
+        _reactiveBSrcChainEpoch.Push(0);
     }
 
     internal static void CleanupDisposedReactive() {
@@ -2054,6 +2072,21 @@ public class BehaviorDataTrigger : BehaviorTriggerBase {
                 if (_reactiveBTargets[i] == null || _reactiveBTargets[i]._isDisposedTree) {
                     _reactiveBTriggers.RemoveAt(i);
                     _reactiveBTargets.RemoveAt(i);
+                    if (_reactiveBLastDc != null && i < _reactiveBLastDc.Length) {
+                        _reactiveBLastDc.RemoveAt(i);
+                    }
+                    if (_reactiveBLastVer != null && i < _reactiveBLastVer.Length) {
+                        _reactiveBLastVer.RemoveAt(i);
+                    }
+                    if (_reactiveBSrc != null && i < _reactiveBSrc.Length) {
+                        _reactiveBSrc.RemoveAt(i);
+                    }
+                    if (_reactiveBSrcTreeEpoch != null && i < _reactiveBSrcTreeEpoch.Length) {
+                        _reactiveBSrcTreeEpoch.RemoveAt(i);
+                    }
+                    if (_reactiveBSrcChainEpoch != null && i < _reactiveBSrcChainEpoch.Length) {
+                        _reactiveBSrcChainEpoch.RemoveAt(i);
+                    }
                 }
             }
         }
@@ -2076,7 +2109,31 @@ public class BehaviorDataTrigger : BehaviorTriggerBase {
     }
 
     public static void FlushReactive() {
-        if (_reactiveBTriggers == null || _reactiveBTargets == null) { return; }
+        if (_reactiveBTriggers == null || _reactiveBTargets == null || _reactiveBTriggers.Length == 0) { return; }
+        if (_reactiveBLastDc == null) {
+            _reactiveBLastDc = new DependencyObject[0];
+            _reactiveBLastVer = new int[0];
+        }
+        if (_reactiveBSrc == null) {
+            _reactiveBSrc = new UIElement[0];
+            _reactiveBSrcTreeEpoch = new int[0];
+            _reactiveBSrcChainEpoch = new int[0];
+        }
+        while (_reactiveBLastDc.Length < _reactiveBTriggers.Length) {
+            _reactiveBLastDc.Push(null);
+        }
+        while (_reactiveBLastVer.Length < _reactiveBTriggers.Length) {
+            _reactiveBLastVer.Push(-1);
+        }
+        while (_reactiveBSrc.Length < _reactiveBTriggers.Length) {
+            _reactiveBSrc.Push(null);
+        }
+        while (_reactiveBSrcTreeEpoch.Length < _reactiveBTriggers.Length) {
+            _reactiveBSrcTreeEpoch.Push(0);
+        }
+        while (_reactiveBSrcChainEpoch.Length < _reactiveBTriggers.Length) {
+            _reactiveBSrcChainEpoch.Push(0);
+        }
         int write = 0;
         for (int i = 0; i < _reactiveBTriggers.Length; i += 1) {
             UIElement t = _reactiveBTargets[i];
@@ -2084,6 +2141,11 @@ public class BehaviorDataTrigger : BehaviorTriggerBase {
             if (write != i) {
                 _reactiveBTriggers[write] = _reactiveBTriggers[i];
                 _reactiveBTargets[write] = t;
+                _reactiveBLastDc[write] = _reactiveBLastDc[i];
+                _reactiveBLastVer[write] = _reactiveBLastVer[i];
+                _reactiveBSrc[write] = _reactiveBSrc[i];
+                _reactiveBSrcTreeEpoch[write] = _reactiveBSrcTreeEpoch[i];
+                _reactiveBSrcChainEpoch[write] = _reactiveBSrcChainEpoch[i];
             }
             write += 1;
         }
@@ -2091,8 +2153,99 @@ public class BehaviorDataTrigger : BehaviorTriggerBase {
             _reactiveBTriggers.RemoveAt(_reactiveBTriggers.Length - 1);
             _reactiveBTargets.RemoveAt(_reactiveBTargets.Length - 1);
         }
+        while (_reactiveBLastDc.Length > write) {
+            _reactiveBLastDc.RemoveAt(_reactiveBLastDc.Length - 1);
+        }
+        while (_reactiveBLastVer.Length > write) {
+            _reactiveBLastVer.RemoveAt(_reactiveBLastVer.Length - 1);
+        }
+        while (_reactiveBSrc.Length > write) {
+            _reactiveBSrc.RemoveAt(_reactiveBSrc.Length - 1);
+        }
+        while (_reactiveBSrcTreeEpoch.Length > write) {
+            _reactiveBSrcTreeEpoch.RemoveAt(_reactiveBSrcTreeEpoch.Length - 1);
+        }
+        while (_reactiveBSrcChainEpoch.Length > write) {
+            _reactiveBSrcChainEpoch.RemoveAt(_reactiveBSrcChainEpoch.Length - 1);
+        }
         for (int i = 0; i < _reactiveBTriggers.Length; i += 1) {
-            _reactiveBTriggers[i].CheckAndFire(_reactiveBTargets[i], false);
+            BehaviorDataTrigger bdt = _reactiveBTriggers[i];
+            UIElement t = _reactiveBTargets[i];
+            if (t.IsInsideClosedPopup()) { continue; }
+            if (bdt.ValueBinding == null &&
+                bdt.ElementName.Length == 0 &&
+                bdt.RelativeSourceMode.Length == 0 &&
+                bdt.RelativeSourceAncestorType.Length == 0 &&
+                bdt.BindingPath.Length > 0 &&
+                !bdt.BindingPath.Contains(".") &&
+                bdt.HasInitTarget(t)) {
+                DependencyObject dcBox = t.EffectiveDataContextBox();
+                object dc = DependencyObject.Unbox(dcBox);
+                int dm = (dc != null && !(dc is UIElement) && ParseUtil.IsNativeReady())
+                    ? Reflect_GetDirtyMask(dc)
+                    : (dc == null ? 0 : -1);
+                if (dm >= 0 && _reactiveBLastVer[i] == dm && _reactiveBLastDc[i] == dcBox) {
+                    continue;
+                }
+                _reactiveBLastDc[i] = dcBox;
+                _reactiveBLastVer[i] = dm;
+            } else if (bdt.ValueBinding == null &&
+                       (bdt.ElementName.Length > 0 || bdt.RelativeSourceMode.Length > 0 || bdt.RelativeSourceAncestorType.Length > 0) &&
+                       bdt.BindingPath.Length > 0 &&
+                       bdt.HasInitTarget(t)) {
+                UIElement srcEl = _reactiveBSrc[i];
+                if (srcEl == null || srcEl._isDisposedTree ||
+                    _reactiveBSrcTreeEpoch[i] != UIElement._treeParentEpoch ||
+                    _reactiveBSrcChainEpoch[i] != t._ancestorChainEpoch) {
+                    srcEl = null;
+                    if (bdt.ElementName.Length > 0) {
+                        srcEl = bdt.ResolveElementSource(t);
+                    } else if (bdt.RelativeSourceMode == "Self") {
+                        srcEl = t;
+                    } else if (bdt.RelativeSourceMode == "TemplatedParent") {
+                        srcEl = t.TemplatedParent;
+                    } else if (bdt.RelativeSourceMode == "FindAncestor" || bdt.RelativeSourceMode == "AncestorType" ||
+                               bdt.RelativeSourceAncestorType.Length > 0) {
+                        UIElement anc = t;
+                        while (anc != null && bdt.RelativeSourceAncestorType.Length > 0 &&
+                               !BindingEntry.MatchesAncestorType(anc, bdt.RelativeSourceAncestorType)) {
+                            anc = BindingEntry.StepAncestor(anc);
+                        }
+                        srcEl = anc;
+                    }
+                    if (srcEl != null && !srcEl._isDisposedTree) {
+                        _reactiveBSrc[i] = srcEl;
+                        _reactiveBSrcTreeEpoch[i] = UIElement._treeParentEpoch;
+                        _reactiveBSrcChainEpoch[i] = t._ancestorChainEpoch;
+                    } else {
+                        srcEl = null;
+                        _reactiveBSrc[i] = null;
+                    }
+                }
+                if (srcEl != null) {
+                    DependencyObject srcBox = (DependencyObject)srcEl;
+                    if ((!bdt.BindingPath.Contains(".") || UIElement.IsAttachedElementPropPath(bdt.BindingPath)) &&
+                        BindingEntry.CanUseFastElementPropEpoch(srcEl, bdt.BindingPath)) {
+                        int ep = BindingEntry.GetFastElementEpoch(srcEl, bdt.BindingPath);
+                        if (ep >= 0 && _reactiveBLastVer[i] == ep && _reactiveBLastDc[i] == srcBox) {
+                            continue;
+                        }
+                        _reactiveBLastDc[i] = srcBox;
+                        _reactiveBLastVer[i] = ep;
+                    } else if (bdt.BindingPath.Length > 12 && bdt.BindingPath.Substring(0, 12) == "DataContext." &&
+                               !bdt.BindingPath.Substring(12).Contains(".") &&
+                               srcEl.DataContext != null && !(srcEl.DataContext is UIElement) && ParseUtil.IsNativeReady()) {
+                        int dm = Reflect_GetDirtyMask(srcEl.DataContext);
+                        int ep2 = dm >= 0 ? ((srcEl._propEpoch % 16384) * 16384 + (dm % 16384) + 1) : -1;
+                        if (ep2 >= 0 && _reactiveBLastVer[i] == ep2 && _reactiveBLastDc[i] == srcBox) {
+                            continue;
+                        }
+                        _reactiveBLastDc[i] = srcBox;
+                        _reactiveBLastVer[i] = ep2;
+                    }
+                }
+            }
+            bdt.CheckAndFire(t, false);
         }
     }
 
@@ -2481,6 +2634,8 @@ public class PropertyChangedTrigger : BehaviorTriggerBase {
     public Binding Binding { get; set; }
     private UIElement[] _targets;
     private DependencyObject[] _lastVals;
+    private UIElement[] _cachedSrcEls;
+    private int[] _cachedSrcEpochs;
     private static PropertyChangedTrigger[] _allPct;
     private static UIElement[] _allPctOwners;
     private static bool _pctHookInstalled = false;
@@ -2488,6 +2643,8 @@ public class PropertyChangedTrigger : BehaviorTriggerBase {
     public PropertyChangedTrigger() : base() {
         _targets = new UIElement[0];
         _lastVals = new DependencyObject[0];
+        _cachedSrcEls = new UIElement[0];
+        _cachedSrcEpochs = new int[0];
     }
 
     private void PruneDisposedTargets() {
@@ -2495,27 +2652,63 @@ public class PropertyChangedTrigger : BehaviorTriggerBase {
             if (_targets[i] == null || _targets[i]._isDisposedTree) {
                 _targets.RemoveAt(i);
                 _lastVals.RemoveAt(i);
+                if (_cachedSrcEls != null && i < _cachedSrcEls.Length) {
+                    _cachedSrcEls.RemoveAt(i);
+                }
+                if (_cachedSrcEpochs != null && i < _cachedSrcEpochs.Length) {
+                    _cachedSrcEpochs.RemoveAt(i);
+                }
             }
         }
     }
 
     private void CheckTarget(UIElement owner) {
         PruneDisposedTargets();
-        if (owner == null || owner._isDisposedTree || Binding == null) { return; }
-        DependencyObject cur = BehaviorDataTrigger.EvaluateDynamicBinding(owner, Binding);
+        Binding b = this.Binding;
+        if (owner == null || owner._isDisposedTree || b == null || owner.IsInsideClosedPopup()) { return; }
+        int existingIdx = -1;
         for (int i = 0; i < _targets.Length; i += 1) {
             if (_targets[i] == owner) {
-                DependencyObject prev = _lastVals[i];
-                bool same = (prev == cur) || (prev != null && cur != null && prev.BoxValueEquals(cur));
-                if (!same) {
-                    _lastVals[i] = cur;
-                    Fire(owner, cur);
-                }
-                return;
+                existingIdx = i;
+                break;
             }
+        }
+        if (existingIdx >= 0 && b.Converter == null && b.ElementName.Length > 0) {
+            string bp = b.Path == null ? "" : b.Path;
+            if (!bp.Contains(".") || UIElement.IsAttachedElementPropPath(bp)) {
+                UIElement se = _cachedSrcEls[existingIdx];
+                if (se == null || se._isDisposedTree) {
+                    se = BindingEntry.FindElementScoped(owner, b.ElementName);
+                    if (se == null) { se = owner.FindName(b.ElementName); }
+                    if (se == null && owner.RootElement() != null) {
+                        se = owner.RootElement().FindName(b.ElementName);
+                    }
+                    _cachedSrcEls[existingIdx] = se;
+                }
+                if (se != null && BindingEntry.CanUseFastElementPropEpoch(se, bp) &&
+                    (se.GetPropertyValue(bp) != null || se.IsExplicitNullProperty(bp) || se.DataContext == null)) {
+                    int ep = BindingEntry.GetFastElementEpoch(se, bp);
+                    if (ep >= 0 && ep == _cachedSrcEpochs[existingIdx]) {
+                        return;
+                    }
+                    _cachedSrcEpochs[existingIdx] = ep;
+                }
+            }
+        }
+        DependencyObject cur = BehaviorDataTrigger.EvaluateDynamicBinding(owner, b);
+        if (existingIdx >= 0) {
+            DependencyObject prev = _lastVals[existingIdx];
+            bool same = (prev == cur) || (prev != null && cur != null && prev.BoxValueEquals(cur));
+            if (!same) {
+                _lastVals[existingIdx] = cur;
+                Fire(owner, cur);
+            }
+            return;
         }
         _targets.Push(owner);
         _lastVals.Push(cur);
+        _cachedSrcEls.Push(null);
+        _cachedSrcEpochs.Push(-1);
     }
 
     internal static void CleanupDisposed() {
@@ -2676,6 +2869,32 @@ public static class DragDrop {
 
     public static void RefreshElementEmpty(UIElement el) {
         if (el == null || el._isDisposedTree) { return; }
+        if (el._ddInitialized && el._ddLastElemEpoch == el._propEpoch && !el._ddLastEmptyPath.Contains(".")) {
+            object cachedItem = DependencyObject.Unbox(el._ddLastItemBox);
+            int fastDm = (cachedItem != null && !(cachedItem is UIElement) && ParseUtil.IsNativeReady())
+                ? Reflect_GetDirtyMask(cachedItem)
+                : (cachedItem == null ? 0 : -1);
+            if (fastDm >= 0 && fastDm == el._ddLastItemVer) {
+                return;
+            }
+        }
+        string emptyPath = DependencyObject.UnboxString(el.GetPropertyValue("DragDrop.EmptyContentPath"), "Name");
+        DependencyObject itemBox = GetElementItemBox(el);
+        object item = DependencyObject.Unbox(itemBox);
+        int dm = (item != null && !(item is UIElement) && ParseUtil.IsNativeReady())
+            ? Reflect_GetDirtyMask(item)
+            : (item == null ? 0 : -1);
+        if (dm >= 0 && !emptyPath.Contains(".") && emptyPath == el._ddLastEmptyPath &&
+            el._ddLastItemVer == dm && el._ddLastItemBox == itemBox &&
+            el.GetPropertyValue("DragDrop.IsContentEmpty") != null &&
+            el.GetPropertyValue("DragDrop.IsDropCompatible") != null) {
+            el._ddInitialized = true;
+            el._ddLastElemEpoch = el._propEpoch;
+            return;
+        }
+        el._ddLastEmptyPath = emptyPath;
+        el._ddLastItemBox = itemBox;
+        el._ddLastItemVer = dm;
         bool empty = ComputeIsEmpty(el);
         DependencyObject cur = el.GetPropertyValue("DragDrop.IsContentEmpty");
         if (cur == null || DependencyObject.UnboxBool(cur, !empty) != empty) {
@@ -2684,6 +2903,8 @@ public static class DragDrop {
         if (el.GetPropertyValue("DragDrop.IsDropCompatible") == null) {
             el.SetPropertyValue("DragDrop.IsDropCompatible", DependencyObject.BoxBool(true));
         }
+        el._ddInitialized = true;
+        el._ddLastElemEpoch = el._propEpoch;
     }
 
     public static void RefreshAllContentEmpty() {

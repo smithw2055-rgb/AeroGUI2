@@ -238,6 +238,7 @@ public class LineBreak : Inline {
 }
 
 public class TextBlock : FrameworkElement {
+    internal override int FastPropEpochCategory() { return 2; }
     private string _text = "";
     private string _fontFamily = "Segoe UI";
     private float _fontSize = 14.0f;
@@ -461,6 +462,7 @@ public class TextBlock : FrameworkElement {
     }
 
     protected void SyncTextToNative() {
+        BumpPropEpoch();
         if (!ParseUtil.IsValidHandle(__nativeHandle)) { return; }
         uint fg = _foreground != null ? _foreground.ResolveRgbaUnscaled() : ParseUtil.PackArgb(255u, 234u, 236u, 239u);
         int fgGradId = _foreground != null ? _foreground.ResolveGradIdUnscaled() : -1;
@@ -503,6 +505,7 @@ public class TextBlock : FrameworkElement {
     }
 
     protected void SyncTextMetricsToNative() {
+        BumpPropEpoch();
         if (!ParseUtil.IsValidHandle(__nativeHandle)) { return; }
         Visual_SetTextMetrics(__nativeHandle, _lineHeight, _charSpacing, _maxLines, _decorations);
     }
@@ -1091,12 +1094,10 @@ public class Path : Shape {
 
     public Path() : base() {
         Stretch = Stretch.None;
-        SyncVectorShape();
     }
     public Path(string svgPath) : base() {
         _data = svgPath == null ? "" : svgPath;
         Stretch = Stretch.None;
-        SyncVectorShape();
     }
 
     public override string GetTypeName() { return "Path"; }

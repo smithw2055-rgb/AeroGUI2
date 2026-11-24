@@ -142,6 +142,7 @@ struct VisualAnimTrack {
     std::int32_t repeatCount = 1;
     std::int32_t completedCycles = 0;
     bool forwardDirection = true;
+    bool needsScriptSync = false;
 
     VisualSpringConfig spring{};
     std::vector<VisualKeyFrame> keyFrames;
@@ -247,9 +248,11 @@ public:
         float param0,
         float param1,
         std::uint8_t paramMask = 3u) noexcept;
+    void MarkTrackScriptSync(std::int32_t trackId) noexcept;
     void Clear() noexcept;
 
     bool Tick(float dtSeconds, VisualWorld& world);
+    [[nodiscard]] bool LastTickNeededScriptSync() const noexcept { return lastTickNeededScriptSync_; }
     [[nodiscard]] bool HasTrack(std::int32_t trackId) const noexcept;
     [[nodiscard]] bool IsTrackStarted(std::int32_t trackId) const noexcept;
     [[nodiscard]] float ReadTrackFloat(std::int32_t trackId, float fallback = 0.0f) const noexcept;
@@ -261,6 +264,7 @@ private:
     std::vector<VisualAnimTrack> tracks_;
     std::int32_t nextTrackId_ = 1;
     std::function<void()> wakeHostCallback_;
+    bool lastTickNeededScriptSync_ = false;
 };
 
 } // namespace aero

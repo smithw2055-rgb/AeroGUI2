@@ -757,6 +757,7 @@ public class ItemsControl : Control {
 // ============================================================================
 
 public class SelectableItem : ContentControl {
+    internal override int FastPropEpochCategory() { return 8; }
     private bool _isSelected = false;
     private int _itemIndex = -1;
     private Selector _ownerSelector;
@@ -901,6 +902,7 @@ public class ListViewItem : SelectableItem {
 }
 
 public class Selector : ItemsControl {
+    internal override int FastPropEpochCategory() { return 5; }
     private int _selectedIndex = -1;
     private int _pendingSelectedIndex = -1;
     protected DependencyObject _selectedItemBox;
@@ -944,6 +946,7 @@ public class Selector : ItemsControl {
         _selectedIndex = -1;
         _selectedItemBox = box;
         if (oldIdx != -1 || !ItemsControl.SameItemBox(oldBox, box)) {
+            BumpPropEpoch();
             OnSelectionChanged(oldIdx, -1, oldBox, box);
         } else {
             SyncContainerSelectionStates();
@@ -1047,6 +1050,7 @@ public class Selector : ItemsControl {
         _selectedIndex = clamped;
         _selectedItemBox = newBox;
         if (clamped >= 0) { _anchorIndex = clamped; }
+        BumpPropEpoch();
         OnSelectionChanged(oldIdx, clamped, oldBox, newBox);
     }
 
@@ -1811,6 +1815,7 @@ public class ComboBox : Selector {
     }
 
     public override string GetTypeName() { return "ComboBox"; }
+    internal override int FastPropEpochCategory() { return 6; }
 
     public bool IsEditable {
         get { return _isEditable; }
@@ -1855,6 +1860,7 @@ public class ComboBox : Selector {
         set {
             if (_isDropDownOpen == value) { return; }
             _isDropDownOpen = value;
+            BumpPropEpoch();
             if (_isDropDownOpen) {
                 SyncDropDownDimensions();
             }

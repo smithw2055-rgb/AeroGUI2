@@ -44,6 +44,7 @@ struct AeroAppHostConfig {
     bool enableHighDpi = false;
     float dpiScale = 0.0f;
     bool optimizeBytecode = false;
+    bool enableStencilJit = false;
     std::string windowTitle = "AeroGUI 3.0";
     std::string entryClassName;
     std::string entryFunctionName;
@@ -174,7 +175,7 @@ public:
     [[nodiscard]] std::shared_ptr<UIResourceStore> ResourceStore() const noexcept { return resourceStore_; }
     [[nodiscard]] std::shared_ptr<const ProgramImage> Program() const noexcept { return programImage_; }
     [[nodiscard]] Interpreter* ScriptInterpreter() noexcept { return interpreter_.get(); }
-    [[nodiscard]] Interpreter* SimInterpreter() noexcept { return simInterpreter_.get(); }
+    [[nodiscard]] Interpreter* SimInterpreter();
     [[nodiscard]] rs_aot::ExecutionContext* AotContext() noexcept { return aotContext_.get(); }
     [[nodiscard]] rs_aot::ExecutionContext* SimAotContext() noexcept { return simAotContext_.get(); }
 
@@ -206,6 +207,7 @@ private:
         SymbolId dispatchCustomMeasure = 0u;
         SymbolId dispatchDraw = 0u;
         SymbolId bindingFlush = 0u;
+        SymbolId bindingFlushPostLayout = 0u;
         SymbolId bindingStepFrameTicks = 0u;
         SymbolId stepGame = 0u;
         SymbolId windowShow = 0u;
@@ -228,6 +230,9 @@ private:
     [[nodiscard]] bool InstantiateAndMountEntry(std::string_view entryHint);
     [[nodiscard]] bool MountScriptRootObject(ObjectRef candidate);
     void FlushBindings();
+    void FlushBindingsPostLayout();
+    void StepFrameInternal(float dtSeconds, bool forceRenderSync, bool skipScriptFrameCallbacks);
+    [[nodiscard]] Interpreter* EnsureSimInterpreter() const;
     bool DispatchPendingCanvasDraws();
     [[nodiscard]] bool InvokeSymbol(
         SymbolId fnId,
@@ -250,7 +255,7 @@ private:
 
     AeroAppHostConfig config_;
     std::shared_ptr<UIResourceStore> resourceStore_;
-    ExecutionDomainContext domains_;
+    mutable ExecutionDomainContext domains_;
     VisualWorld world_;
     DrawingCommandBuffer drawBuffer_;
     VisualAnimationEngine animEngine_;
@@ -265,7 +270,7 @@ private:
     std::shared_ptr<const ProgramImage> programImage_;
     std::shared_ptr<void> uiStencilModule_;
     std::unique_ptr<Interpreter> interpreter_;
-    std::unique_ptr<Interpreter> simInterpreter_;
+    mutable std::unique_ptr<Interpreter> simInterpreter_;
 
     const rs_aot::ProgramDescriptor* aotDescriptor_ = nullptr;
     std::unordered_map<SymbolId, const rs_aot::TypeDescriptor*> aotPrebuiltTypes_;
@@ -291,6 +296,7 @@ private:
     Size lastNotifiedViewport_{-1.0f, -1.0f};
     std::optional<std::chrono::steady_clock::time_point> scheduledWakeAt_;
     bool scriptWakeRequested_ = false;
+    mutable bool pendingScriptSync_ = true;
     bool closeRequested_ = false;
     bool inStepFrame_ = false;
     bool initialized_ = false;

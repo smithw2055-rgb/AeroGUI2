@@ -1278,6 +1278,39 @@ void RasterizeSingleNode(
             }
         }
 
+        float pInv00 = 0.0f, pInv01 = 0.0f, pInv02 = 0.0f;
+        float pInv10 = 0.0f, pInv11 = 0.0f, pInv12 = 0.0f;
+        float pInv20 = 0.0f, pInv21 = 0.0f, pInv22 = 0.0f;
+        float pH20 = 0.0f, pH21 = 0.0f, pH22 = 1.0f;
+        float invPerspSpanW = 0.0f, invPerspSpanH = 0.0f;
+        if (usePerspectiveInverse) {
+            const auto& m = nd->worldMatrix3D.m;
+            const float h00 = m[0][0], h01 = m[0][1], h02 = m[0][3];
+            const float h10 = m[1][0], h11 = m[1][1], h12 = m[1][3];
+            const float h20 = m[3][0], h21 = m[3][1], h22 = m[3][3];
+            const float c00 = h11 * h22 - h12 * h21;
+            const float c01 = h12 * h20 - h10 * h22;
+            const float c02 = h10 * h21 - h11 * h20;
+            const float hDet = h00 * c00 + h01 * c01 + h02 * c02;
+            if (std::fabs(hDet) <= 1e-10f || std::fabs(perspSpanW) <= 1e-6f || std::fabs(perspSpanH) <= 1e-6f) {
+                continue;
+            }
+            pInv00 = c00;
+            pInv01 = h02 * h21 - h01 * h22;
+            pInv02 = h01 * h12 - h02 * h11;
+            pInv10 = c01;
+            pInv11 = h00 * h22 - h02 * h20;
+            pInv12 = h02 * h10 - h00 * h12;
+            pInv20 = c02;
+            pInv21 = h01 * h20 - h00 * h21;
+            pInv22 = h00 * h11 - h01 * h10;
+            pH20 = h20;
+            pH21 = h21;
+            pH22 = h22;
+            invPerspSpanW = 1.0f / perspSpanW;
+            invPerspSpanH = 1.0f / perspSpanH;
+        }
+
         if (nd->primType == AeroPrimType::MsdfVectorPath && nd->mtsdfPathHash != 0 && !resolvedNodeMtsdf) {
             cachedNodeMtsdf = tree.FindMtsdfEntry(nd->mtsdfPathHash);
             if (!cachedNodeMtsdf) {
@@ -1478,6 +1511,7 @@ void RasterizeSingleNode(
             }
         };
 
+        float perspRowU = 0.0f, perspRowV = 0.0f, perspRowW = 0.0f;
         for (int py = bandClampedPyStart; py < bandClampedPyEnd; ++py) {
             const float sy = static_cast<float>(py) + 0.5f;
             const float dy = sy - v0.y;
@@ -1556,6 +1590,44 @@ void RasterizeSingleNode(
                         }
                     }
                 }
+            } else {
+                float minEdgeX = static_cast<float>(pxEnd + 4);
+                float maxEdgeX = static_cast<float>(pxStart - 4);
+                auto accumEdgeSpan = [&](const AeroVertex& a, const AeroVertex& b) noexcept {
+                    const float yLo = std::min(a.y, b.y);
+                    const float yHi = std::max(a.y, b.y);
+                    if (sy + 0.6f < yLo || sy - 0.6f > yHi) {
+                        return;
+                    }
+                    const float dyEdge = b.y - a.y;
+                    if (std::fabs(dyEdge) <= 1e-5f) {
+                        minEdgeX = std::min(minEdgeX, std::min(a.x, b.x));
+                        maxEdgeX = std::max(maxEdgeX, std::max(a.x, b.x));
+                        return;
+                    }
+                    const float invDy = 1.0f / dyEdge;
+                    const float t0 = std::clamp((sy - 0.6f - a.y) * invDy, 0.0f, 1.0f);
+                    const float t1 = std::clamp((sy + 0.6f - a.y) * invDy, 0.0f, 1.0f);
+                    const float x0 = a.x + (b.x - a.x) * t0;
+                    const float x1 = a.x + (b.x - a.x) * t1;
+                    minEdgeX = std::min(minEdgeX, std::min(x0, x1));
+                    maxEdgeX = std::max(maxEdgeX, std::max(x0, x1));
+                };
+                accumEdgeSpan(v0, v1);
+                accumEdgeSpan(v1, v2);
+                accumEdgeSpan(v2, v3);
+                accumEdgeSpan(v3, v0);
+                if (minEdgeX > maxEdgeX) {
+                    continue;
+                }
+                rowPxStart = std::max(pxStart, SafeFloorToInt(minEdgeX - 1.5f, pxStart - 2, pxEnd + 2));
+                rowPxEnd = std::min(pxEnd, SafeCeilToInt(maxEdgeX + 1.5f, pxStart - 2, pxEnd + 2));
+                if (rowPxStart >= rowPxEnd) {
+                    continue;
+                }
+                perspRowU = pInv01 * sy + pInv02;
+                perspRowV = pInv11 * sy + pInv12;
+                perspRowW = pInv21 * sy + pInv22;
             }
 
             // Fast contiguous span fill for axis-aligned SolidQuad
@@ -1675,12 +1747,18 @@ void RasterizeSingleNode(
                 float su = 0.0f;
                 float sv = 0.0f;
                 if (usePerspectiveInverse) {
-                    Point localPt{};
-                    if (!nd->worldMatrix3D.InverseProjectScreenToLocalPlane(Point{sx, sy}, localPt)) {
+                    const float wH = pInv20 * sx + perspRowW;
+                    if (std::fabs(wH) <= 1e-8f) {
                         continue;
                     }
-                    su = (localPt.x - perspOrigX) / perspSpanW;
-                    sv = (localPt.y - perspOrigY) / perspSpanH;
+                    const float invWH = 1.0f / wH;
+                    const float localX = (pInv00 * sx + perspRowU) * invWH;
+                    const float localY = (pInv10 * sx + perspRowV) * invWH;
+                    if ((pH20 * localX + pH21 * localY + pH22) <= 1e-4f) {
+                        continue;
+                    }
+                    su = (localX - perspOrigX) * invPerspSpanW;
+                    sv = (localY - perspOrigY) * invPerspSpanH;
                 } else {
                     const float dx = sx - v0.x;
                     su = (dx * e3y - dy * e3x) * invDet;

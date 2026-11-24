@@ -896,6 +896,8 @@ void TestHostBindingsAndReflection() {
 
     aero::rs_bc::Module mod{};
     mod.name = "TestVm";
+    mod.languageMetadata.attributes.push_back(
+        aero::rs_comp::LanguageAttributeRecord{"TestVm::ProfileVm", "Observable", {}, {}, 0u});
     {
         aero::rs_sem::TypeSymbol childType{};
         childType.id = kChildTypeId;
@@ -1181,9 +1183,39 @@ void TestHostBindingsAndReflection() {
     bool activeVal = true;
     CHECK(gotBool.has_value() && gotBool->tryGetBool(activeVal) && !activeVal);
 
+    auto cleanChildOpt = uiHeap->allocateObject(
+        kChildTypeId,
+        {aero::rs_rt::Value{*strInit},
+         aero::rs_rt::Value{1LL},
+         aero::rs_rt::Value{aero::rs_rt::FloatValue{0.5f}},
+         aero::rs_rt::Value{true}},
+        {0u});
+    CHECK(cleanChildOpt.has_value());
+    const auto cleanDirtyVer = invokeBound("Reflect_GetDirtyMask", {aero::rs_rt::Value{*cleanChildOpt}});
+    std::int64_t cleanVerVal = -1;
+    CHECK(cleanDirtyVer.has_value() && cleanDirtyVer->tryGetInt64(cleanVerVal) && cleanVerVal == 1LL);
+
     const auto dirtyMask = invokeBound("Reflect_GetDirtyMask", {aero::rs_rt::Value{*childObjOpt}});
     std::int64_t maskBits = 0;
-    CHECK(dirtyMask.has_value() && dirtyMask->tryGetInt64(maskBits) && (maskBits & 0x0FLL) != 0LL);
+    CHECK(dirtyMask.has_value() && dirtyMask->tryGetInt64(maskBits) && maskBits >= 5LL);
+
+    // Ensure Reflect_GetDirtyMask reports strictly increasing mutation versions (including across version == 16)
+    std::int64_t prevVer = maskBits;
+    bool sawModulo16Step = false;
+    for (int step = 0; step < 16; ++step) {
+        (void)invokeBound("Reflect_SetPropInt", {
+            aero::rs_rt::Value{*rootObjOpt},
+            MakeStrVal("Profile.Score"),
+            aero::rs_rt::Value{static_cast<std::int64_t>(100 + step)}});
+        const auto nextDirtyVer = invokeBound("Reflect_GetDirtyMask", {aero::rs_rt::Value{*childObjOpt}});
+        std::int64_t nextVer = 0;
+        CHECK(nextDirtyVer.has_value() && nextDirtyVer->tryGetInt64(nextVer) && nextVer == prevVer + 1);
+        if ((nextVer & 0x0FLL) == 0LL) {
+            sawModulo16Step = true;
+        }
+        prevVer = nextVer;
+    }
+    CHECK(sawModulo16Step);
 
     // 2. Test AOT ExecutionContext Reflection & Command execution (CanExecute + Execute)
     AotTestState aotState{};

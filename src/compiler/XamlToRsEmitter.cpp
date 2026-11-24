@@ -6698,6 +6698,21 @@ private:
                 }
                 continue;
             }
+            const bool wrapClosedPopupChild = [&]() noexcept -> bool {
+                if (resolvedTypeName != "Popup") {
+                    return false;
+                }
+                if (const auto* openAttr = node.FindAttribute("IsOpen")) {
+                    if (aero::str::EqualsIgnoreCase(aero::str::Trim(openAttr->value), "true")) {
+                        return false;
+                    }
+                }
+                return true;
+            }();
+            if (wrapClosedPopupChild) {
+                Indent(out, indent);
+                out << "UIElement._closedPopupBuildDepth += 1;\n";
+            }
             const std::string childVar = EmitConstructedElement(
                 *ch, xDataType, dictVar, currentXamlPath, out, indent, explicitBindSourceVar);
             Indent(out, indent);
@@ -6707,6 +6722,10 @@ private:
                 out << targetVar << ".SetContent(" << childVar << ");\n";
             } else {
                 out << targetVar << ".AddChild(" << childVar << ");\n";
+            }
+            if (wrapClosedPopupChild) {
+                Indent(out, indent);
+                out << "UIElement._closedPopupBuildDepth -= 1;\n";
             }
         }
 

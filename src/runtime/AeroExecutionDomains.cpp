@@ -569,6 +569,17 @@ bool ExecutionDomainContext::DomainPolicy::checkArrayWrite(
     return true;
 }
 
+bool ExecutionDomainContext::DomainPolicy::interceptsCalls() const noexcept {
+    return domain_ == DomainKind::UiPresentation &&
+           owner_ != nullptr &&
+           owner_->hasSimCommands_.load(std::memory_order_relaxed);
+}
+
+bool ExecutionDomainContext::DomainPolicy::interceptsSameHeapWrites() const noexcept {
+    return domain_ != DomainKind::UiPresentation ||
+           (owner_ != nullptr && owner_->hasSimStateTypes_.load(std::memory_order_relaxed));
+}
+
 bool ExecutionDomainContext::DomainPolicy::interceptCall(
     SymbolId functionId,
     ValueSpan arguments,
@@ -950,6 +961,12 @@ void ExecutionDomainContext::ensureProgramMetadataComputedLocked(
         }
     }
 
+    std::vector<std::pair<SymbolId, std::vector<std::uint8_t>>> dirtyBatch;
+    if (pushToHeaps) {
+        dirtyBatch.reserve(orderedTypes.size());
+    }
+    bool sawAnySimState = false;
+
     for (const TypeSymbol* type : orderedTypes) {
         if (type->id == 0) continue;
 
@@ -964,8 +981,7 @@ void ExecutionDomainContext::ensureProgramMetadataComputedLocked(
         if (isWrapper) {
             ObservableListHelper::RegisterWrapperType(type->id);
             if (pushToHeaps) {
-                if (simHeap_) simHeap_->enableTypeDirtyTracking(type->id, {0u});
-                if (uiHeap_) uiHeap_->enableTypeDirtyTracking(type->id, {0u});
+                dirtyBatch.emplace_back(type->id, std::vector<std::uint8_t>{0u});
             }
             TypeObservableMeta meta;
             meta.isObservable = true;
@@ -991,6 +1007,10 @@ void ExecutionDomainContext::ensureProgramMetadataComputedLocked(
             meta.customPropSimCommand,
             simCommandFunctions_);
 
+        if (meta.isSimState || !meta.customPropSimState.empty()) {
+            sawAnySimState = true;
+        }
+
         bool anyDirtyBit = false;
         for (const std::uint8_t bit : meta.fieldToBitMap) {
             if (bit != 0xffu) {
@@ -1006,15 +1026,21 @@ void ExecutionDomainContext::ensureProgramMetadataComputedLocked(
         }
 
         if (pushToHeaps && anyDirtyBit && !meta.fieldToBitMap.empty()) {
-            if (simHeap_) simHeap_->enableTypeDirtyTracking(type->id, meta.fieldToBitMap);
-            if (uiHeap_) uiHeap_->enableTypeDirtyTracking(type->id, meta.fieldToBitMap);
+            dirtyBatch.emplace_back(type->id, meta.fieldToBitMap);
         }
 
         typeMeta_[type->id] = std::move(meta);
     }
 
+    if (pushToHeaps && !dirtyBatch.empty()) {
+        if (simHeap_) simHeap_->enableTypeDirtyTrackingBatch(dirtyBatch);
+        if (uiHeap_) uiHeap_->enableTypeDirtyTrackingBatch(std::move(dirtyBatch));
+    }
     if (pushToHeaps) {
         registeredImages_.insert(imageKey);
+    }
+    if (sawAnySimState) {
+        hasSimStateTypes_.store(true, std::memory_order_release);
     }
     if (!simCommandFunctions_.empty()) {
         hasSimCommands_.store(true, std::memory_order_release);
@@ -1135,6 +1161,9 @@ void ExecutionDomainContext::registerAotProgramAttributes(
                 shortName);
             const bool typeObs = classObs[td.id];
             const bool typeSim = classSim[td.id];
+            if (typeSim) {
+                hasSimStateTypes_.store(true, std::memory_order_release);
+            }
 
             std::vector<std::uint8_t> bitMap(td.fieldCount, 0xffu);
             std::uint32_t nextBit = 0u;

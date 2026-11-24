@@ -330,8 +330,8 @@ public partial class MainWindow : Window
         }
         if (this.SelectorExpanderButton != null)
         {
-            this.SelectorExpanderButton.IsChecked = false;
             this.SelectorExpanderButton.Visibility = Visibility.Visible;
+            this.SelectorExpanderButton.IsChecked = false;
         }
         if (this.SelectorExpanderButtonShadow != null)
         {

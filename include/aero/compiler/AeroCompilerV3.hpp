@@ -91,6 +91,8 @@ public:
         std::string_view xamlPath,
         std::string_view xamlContent,
         std::vector<std::string>* outDiagnostics = nullptr);
+
+    static void ClearProcessCaches() noexcept;
 };
 
 } // namespace aero

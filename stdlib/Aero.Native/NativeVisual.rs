@@ -173,6 +173,9 @@ public void Anim_SetTrackEasingParams(int trackId, float param0, float param1, i
 public int Anim_BeginKeyFrames(handle node, int prop, float delaySec, bool autoReverse, int repeatCount) { return 0; }
 int __rs_native_Anim_AddKeyFrameFloat(int trackId, float timeSec, float value, int easeKind, int easeMode, float param0, float param1, int paramMask, bool discrete) { return 0; }
 public void Anim_AddKeyFrameFloat(int trackId, float timeSec, float value, int easeKind, int easeMode, float param0, float param1, int paramMask, bool discrete) { __rs_native_Anim_AddKeyFrameFloat(trackId, timeSec, value, easeKind, easeMode, param0, param1, paramMask, discrete); return; }
+int __rs_native_Anim_MarkTrackScriptSync(int trackId) { return 0; }
+public void Anim_MarkTrackScriptSync(int trackId) { __rs_native_Anim_MarkTrackScriptSync(trackId); return; }
+public int Visual_GetWorldLayoutEpoch() { return 1; }
 int __rs_native_Anim_ApplyFloat(handle node, int prop, float value) { return 0; }
 public void Anim_ApplyFloat(handle node, int prop, float value) { __rs_native_Anim_ApplyFloat(node, prop, value); return; }
 int __rs_native_Anim_ApplyColor(handle node, int prop, uint rgba) { return 0; }

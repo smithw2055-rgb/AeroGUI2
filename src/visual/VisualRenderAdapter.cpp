@@ -479,7 +479,8 @@ std::size_t VisualRenderAdapter::EmitSvgPathPrimitive(
         bool has3D,
         BlendingMode blend,
         float fillOpacity,
-        float strokeOpacity) {
+        float strokeOpacity,
+        const VisualVectorData* cachedVec) {
         const ScopedBlendMode blendGuard(tree.activeBlendMode_, blend);
         if (pathData.empty() ||
             (stretch != Stretch::None && (destBox.width <= 0.0f || destBox.height <= 0.0f))) {
@@ -504,7 +505,21 @@ std::size_t VisualRenderAdapter::EmitSvgPathPrimitive(
 
         const std::vector<std::vector<Point>> parsedSubpaths =
             (hasStroke && trimmed && !trimCollapsed) ? ParseSvgPathToSubpaths(pathData) : std::vector<std::vector<Point>>{};
-        const Rect rawBounds = MeasureSvgPathBounds(pathData);
+        Rect rawBounds{};
+        std::uint64_t hash = 0u;
+        if (cachedVec != nullptr && cachedVec->shapeKind == VectorShapeKind::SvgPath &&
+            cachedVec->pathOrParams == pathData) {
+            if (!cachedVec->svgBoundsCached) {
+                cachedVec->cachedPathHash = ComputeSvgPathHash(pathData);
+                cachedVec->cachedSvgBounds = MeasureSvgPathBounds(pathData);
+                cachedVec->svgBoundsCached = true;
+            }
+            rawBounds = cachedVec->cachedSvgBounds;
+            hash = cachedVec->cachedPathHash;
+        } else {
+            rawBounds = MeasureSvgPathBounds(pathData);
+            hash = ComputeSvgPathHash(pathData);
+        }
         Rect strokeAdjustedDest = destBox;
         if (stretch != Stretch::None && hasStroke && strokeWidth > 0.0f) {
             const float halfStroke = 0.5f * strokeWidth;
@@ -543,7 +558,6 @@ std::size_t VisualRenderAdapter::EmitSvgPathPrimitive(
             static_cast<std::uint32_t>(std::lround(fitted.width * sx)), 1u, 2048u);
         const std::uint32_t innerH = std::clamp<std::uint32_t>(
             static_cast<std::uint32_t>(std::lround(fitted.height * sy)), 1u, 2048u);
-        const std::uint64_t hash = ComputeSvgPathHash(pathData);
 
         if (hasFill) {
             const Color fillColor = (fillGradId > 0)
@@ -1598,7 +1612,12 @@ std::size_t VisualRenderAdapter::EmitVectorVisual(
                 if (hasImageFill) {
                     ImageAtlasEntry fillEntry{};
                     if (!vec.pathOrParams.empty() && resolveFillEntry(fillEntry)) {
-                        const Rect rawBounds = MeasureSvgPathBounds(vec.pathOrParams);
+                        if (!vec.svgBoundsCached) {
+                            vec.cachedPathHash = ComputeSvgPathHash(vec.pathOrParams);
+                            vec.cachedSvgBounds = MeasureSvgPathBounds(vec.pathOrParams);
+                            vec.svgBoundsCached = true;
+                        }
+                        const Rect rawBounds = vec.cachedSvgBounds;
                         Rect fitted = rect;
                         if (rawBounds.width > 0.0f && rawBounds.height > 0.0f) {
                             fitted = (vec.stretch == Stretch::None)
@@ -1616,7 +1635,7 @@ std::size_t VisualRenderAdapter::EmitVectorVisual(
                         RasterizedPathMaskEntry maskedEntry{};
                         if (CompositeMaskedPathTexture(
                                 *store, store->Images(),
-                                ComputeSvgPathHash(vec.pathOrParams), vec.pathOrParams, rawBounds,
+                                vec.cachedPathHash, vec.pathOrParams, rawBounds,
                                 imgCellRect, fitted, innerW, innerH, 1u,
                                 fillEntry, fillImg.stretch, fillImg.tintRgba, fillImg.tileWrap, maskedEntry) &&
                             maskedEntry.textureId > 0u) {
@@ -1654,7 +1673,8 @@ std::size_t VisualRenderAdapter::EmitVectorVisual(
                     has3D,
                     blend,
                     vec.fillOpacity,
-                    vec.strokeOpacity);
+                    vec.strokeOpacity,
+                    &vec);
                 break;
             }
 
@@ -2592,7 +2612,12 @@ std::size_t VisualRenderAdapter::EmitNodeRecursive(
                 if (node->kind == VisualKind::Vector) {
                     const VisualVectorData& vec = node->Vector();
                     if (vec.shapeKind == VectorShapeKind::SvgPath && !vec.pathOrParams.empty()) {
-                        const Rect rawB = MeasureSvgPathBounds(vec.pathOrParams);
+                        if (!vec.svgBoundsCached) {
+                            vec.cachedPathHash = ComputeSvgPathHash(vec.pathOrParams);
+                            vec.cachedSvgBounds = MeasureSvgPathBounds(vec.pathOrParams);
+                            vec.svgBoundsCached = true;
+                        }
+                        const Rect rawB = vec.cachedSvgBounds;
                         if (rawB.width > 0.0f && rawB.height > 0.0f) {
                             const Rect fitted = (vec.stretch == Stretch::None)
                                 ? Rect{rect.x + rawB.x, rect.y + rawB.y, rawB.width, rawB.height}
@@ -2602,7 +2627,7 @@ std::size_t VisualRenderAdapter::EmitNodeRecursive(
                                 ? IntersectRects(outTree.activeClipRect_, span.maskDestRect)
                                 : span.maskDestRect;
                         }
-                        const std::uint64_t pathHash = ComputeSvgPathHash(vec.pathOrParams);
+                        const std::uint64_t pathHash = vec.cachedPathHash;
                         UIResourceStore* mutStore = outTree.ResourceStore() ? outTree.ResourceStore() : &UIResourceStore::Default();
                         const AxbMtsdfPathEntry* storeEntry = mutStore->FindMtsdfPath(pathHash);
                         if (!storeEntry) {

@@ -1199,11 +1199,53 @@ public class DependencyObject {
         return box.UnboxObject();
     }
 
-    public static DependencyObject BoxString(string v) { return new BoxedString(v); }
+    private static BoxedString _emptyStringBox = null;
+    private static BoxedBool _trueBox = null;
+    private static BoxedBool _falseBox = null;
+    private static BoxedFloat _zeroFloatBox = null;
+    private static BoxedFloat _oneFloatBox = null;
+    private static BoxedInt[] _smallIntBoxes = null;
+
+    public static DependencyObject BoxString(string v) {
+        if (v != null && v.Length == 0) {
+            if (_emptyStringBox == null) { _emptyStringBox = new BoxedString(""); }
+            return _emptyStringBox;
+        }
+        return new BoxedString(v);
+    }
     public static DependencyObject BoxEnum(string name, int ordinal) { return new BoxedEnum(name, ordinal); }
-    public static DependencyObject BoxFloat(float v) { return new BoxedFloat(v); }
-    public static DependencyObject BoxInt(int v) { return new BoxedInt(v); }
-    public static DependencyObject BoxBool(bool v) { return new BoxedBool(v); }
+    public static DependencyObject BoxFloat(float v) {
+        if (v == 0.0f) {
+            if (_zeroFloatBox == null) { _zeroFloatBox = new BoxedFloat(0.0f); }
+            return _zeroFloatBox;
+        }
+        if (v == 1.0f) {
+            if (_oneFloatBox == null) { _oneFloatBox = new BoxedFloat(1.0f); }
+            return _oneFloatBox;
+        }
+        return new BoxedFloat(v);
+    }
+    public static DependencyObject BoxInt(int v) {
+        if (v >= -16 && v <= 256) {
+            if (_smallIntBoxes == null) { _smallIntBoxes = new BoxedInt[273]; }
+            int idx = v + 16;
+            BoxedInt hit = _smallIntBoxes[idx];
+            if (hit == null) {
+                hit = new BoxedInt(v);
+                _smallIntBoxes[idx] = hit;
+            }
+            return hit;
+        }
+        return new BoxedInt(v);
+    }
+    public static DependencyObject BoxBool(bool v) {
+        if (v) {
+            if (_trueBox == null) { _trueBox = new BoxedBool(true); }
+            return _trueBox;
+        }
+        if (_falseBox == null) { _falseBox = new BoxedBool(false); }
+        return _falseBox;
+    }
 
     public static string UnboxString(DependencyObject box, string fallback = "") {
         if (box == null) { return fallback; }
@@ -1279,21 +1321,22 @@ public class DependencyObject {
 }
 
 public class TypedBox<T> : DependencyObject {
-    public T Value;
-    public TypedBox(T v) { Value = v; }
-    public override string ToDisplayString() { return "" + Value; }
+    private T _value;
+    public T Value { get { return _value; } }
+    public TypedBox(T v) { _value = v; }
+    public override string ToDisplayString() { return "" + _value; }
     public override bool BoxValueEquals(DependencyObject other) {
         DependencyObject self = this;
         if (self == other) { return true; }
         var o = other as TypedBox<T>;
         if (o == null) { return false; }
         var probe = new T[1];
-        probe[0] = Value;
-        return probe.Contains(o.Value);
+        probe[0] = _value;
+        return probe.Contains(o._value);
     }
     public override object UnboxObject() {
         if (ParseUtil.IsNativeReady()) {
-            var r = Reflect_GetPropObject(this, "Value");
+            var r = Reflect_GetPropObject(this, "_value");
             if (r != null) { return r; }
         }
         return this;
@@ -1306,8 +1349,9 @@ public class BoxedString : TypedBox<string> {
 }
 
 public class BoxedEnum : BoxedString {
-    public int Ordinal = 0;
-    public BoxedEnum(string v, int ordinal) : base(v) { Ordinal = ordinal; }
+    private int _ordinal = 0;
+    public int Ordinal { get { return _ordinal; } }
+    public BoxedEnum(string v, int ordinal) : base(v) { _ordinal = ordinal; }
 }
 
 public class BoxedFloat : TypedBox<float> {
@@ -1370,25 +1414,34 @@ public class NativeObjectBox : DependencyObject {
 // ============================================================================
 
 public class Thickness : DependencyObject {
-    public float Left;
-    public float Top;
-    public float Right;
-    public float Bottom;
+    private static Thickness _zeroThickness = null;
+    public static Thickness SharedZero() {
+        if (_zeroThickness == null) { _zeroThickness = new Thickness(0.0f); }
+        return _zeroThickness;
+    }
+    private float _left;
+    private float _top;
+    private float _right;
+    private float _bottom;
+    public float Left { get { return _left; } }
+    public float Top { get { return _top; } }
+    public float Right { get { return _right; } }
+    public float Bottom { get { return _bottom; } }
 
     public Thickness() {}
     public Thickness(float uniform) {
-        Left = uniform; Top = uniform; Right = uniform; Bottom = uniform;
+        _left = uniform; _top = uniform; _right = uniform; _bottom = uniform;
     }
     public Thickness(float horizontal, float vertical) {
-        Left = horizontal; Top = vertical; Right = horizontal; Bottom = vertical;
+        _left = horizontal; _top = vertical; _right = horizontal; _bottom = vertical;
     }
     public Thickness(float left, float top, float right, float bottom) {
-        Left = left; Top = top; Right = right; Bottom = bottom;
+        _left = left; _top = top; _right = right; _bottom = bottom;
     }
 
-    public Thickness Clone() { return new Thickness(Left, Top, Right, Bottom); }
+    public Thickness Clone() { return new Thickness(_left, _top, _right, _bottom); }
     public override string ToDisplayString() {
-        return "" + Left + "," + Top + "," + Right + "," + Bottom;
+        return "" + _left + "," + _top + "," + _right + "," + _bottom;
     }
 
     public static Thickness Parse(string text) {
@@ -1414,24 +1467,33 @@ public class Thickness : DependencyObject {
 }
 
 public class CornerRadius : DependencyObject {
-    public float TopLeft;
-    public float TopRight;
-    public float BottomRight;
-    public float BottomLeft;
+    private static CornerRadius _zeroCornerRadius = null;
+    public static CornerRadius SharedZero() {
+        if (_zeroCornerRadius == null) { _zeroCornerRadius = new CornerRadius(0.0f); }
+        return _zeroCornerRadius;
+    }
+    private float _topLeft;
+    private float _topRight;
+    private float _bottomRight;
+    private float _bottomLeft;
+    public float TopLeft { get { return _topLeft; } }
+    public float TopRight { get { return _topRight; } }
+    public float BottomRight { get { return _bottomRight; } }
+    public float BottomLeft { get { return _bottomLeft; } }
 
     public CornerRadius() {}
     public CornerRadius(float uniform) {
-        TopLeft = uniform; TopRight = uniform; BottomRight = uniform; BottomLeft = uniform;
+        _topLeft = uniform; _topRight = uniform; _bottomRight = uniform; _bottomLeft = uniform;
     }
     public CornerRadius(float topLeft, float topRight, float bottomRight, float bottomLeft) {
-        TopLeft = topLeft; TopRight = topRight; BottomRight = bottomRight; BottomLeft = bottomLeft;
+        _topLeft = topLeft; _topRight = topRight; _bottomRight = bottomRight; _bottomLeft = bottomLeft;
     }
 
     public CornerRadius Clone() {
-        return new CornerRadius(TopLeft, TopRight, BottomRight, BottomLeft);
+        return new CornerRadius(_topLeft, _topRight, _bottomRight, _bottomLeft);
     }
     public override string ToDisplayString() {
-        return "" + TopLeft + "," + TopRight + "," + BottomRight + "," + BottomLeft;
+        return "" + _topLeft + "," + _topRight + "," + _bottomRight + "," + _bottomLeft;
     }
 
     public static CornerRadius Parse(string text) {
@@ -1452,11 +1514,18 @@ public class CornerRadius : DependencyObject {
 }
 
 public class Point : DependencyObject {
-    public float X;
-    public float Y;
+    private static Point _centerPoint = null;
+    public static Point SharedCenter() {
+        if (_centerPoint == null) { _centerPoint = new Point(0.5f, 0.5f); }
+        return _centerPoint;
+    }
+    private float _x;
+    private float _y;
+    public float X { get { return _x; } }
+    public float Y { get { return _y; } }
     public Point() {}
-    public Point(float x, float y) { X = x; Y = y; }
-    public override string ToDisplayString() { return "" + X + "," + Y; }
+    public Point(float x, float y) { _x = x; _y = y; }
+    public override string ToDisplayString() { return "" + _x + "," + _y; }
     public static Point Parse(string text) {
         if (text == null) { return new Point(0.0f, 0.0f); }
         string[] parts = text.Trim().Split(",");
@@ -2527,8 +2596,82 @@ public class BehaviorEventSink : DependencyObject {
     public virtual void OnBehaviorEvent(object sender, RoutedEventArgs e) {}
 }
 
-[Observable]
 public partial class UIElement : DependencyObject {
+    internal DependencyObject _ddLastItemBox;
+    internal int _ddLastItemVer = -1;
+    internal int _ddLastElemEpoch = -1;
+    internal bool _ddInitialized = false;
+    internal string _ddLastEmptyPath = "";
+    internal int _propEpoch = 1;
+    internal int _ancestorChainEpoch = 1;
+    internal static int _disposeEpoch = 1;
+    internal static int _treeParentEpoch = 1;
+    public static int _closedPopupBuildDepth = 0;
+
+    private bool _cachedClosedPopupVal = false;
+    private int _cachedClosedPopupTreeEpoch = 0;
+    private int _cachedClosedPopupChainEpoch = 0;
+
+    internal void BumpPropEpoch() {
+        _propEpoch = _propEpoch >= 1000000000 ? 1 : (_propEpoch + 1);
+    }
+
+    internal void BumpSubtreeAncestorEpoch() {
+        bool noChildren = (_children == null || _children.Length == 0);
+        bool noDetached = (_detachedLogicalChildren == null || _detachedLogicalChildren.Length == 0);
+        if (noChildren && noDetached) {
+            _ancestorChainEpoch = _ancestorChainEpoch >= 1000000000 ? 1 : (_ancestorChainEpoch + 1);
+            return;
+        }
+        var q = new UIElement[0];
+        q.Push(this);
+        int qi = 0;
+        while (qi < q.Length) {
+            UIElement cur = q[qi];
+            qi += 1;
+            if (cur == null || cur._isDisposedTree) { continue; }
+            cur._ancestorChainEpoch = cur._ancestorChainEpoch >= 1000000000 ? 1 : (cur._ancestorChainEpoch + 1);
+            if (cur._children != null) {
+                for (int i = 0; i < cur._children.Length; i += 1) {
+                    q.Push(cur._children[i]);
+                }
+            }
+            if (cur._detachedLogicalChildren != null) {
+                for (int i = 0; i < cur._detachedLogicalChildren.Length; i += 1) {
+                    q.Push(cur._detachedLogicalChildren[i]);
+                }
+            }
+        }
+    }
+
+    internal bool IsInsideClosedPopup() {
+        if (_parent == null) { return false; }
+        if (_cachedClosedPopupTreeEpoch == _treeParentEpoch &&
+            _cachedClosedPopupChainEpoch == _ancestorChainEpoch) {
+            return _cachedClosedPopupVal;
+        }
+        bool res = false;
+        UIElement cur = _parent;
+        int guard = 0;
+        while (cur != null && guard < 128) {
+            guard += 1;
+            if (cur.IsClosedPopupBoundary()) {
+                res = true;
+                break;
+            }
+            cur = cur._parent;
+        }
+        _cachedClosedPopupVal = res;
+        _cachedClosedPopupTreeEpoch = _treeParentEpoch;
+        _cachedClosedPopupChainEpoch = _ancestorChainEpoch;
+        return res;
+    }
+
+    internal virtual int FastPropEpochCategory() { return 1; }
+
+    internal static void BumpTreeParentEpoch() {
+        _treeParentEpoch = _treeParentEpoch >= 1000000000 ? 1 : (_treeParentEpoch + 1);
+    }
     public handle __nativeHandle;
     private bool _hasNative;
     private VisualKind _visualKind = VisualKind.Box;
@@ -2718,11 +2861,11 @@ public partial class UIElement : DependencyObject {
         if (_flowDirection == null || _flowDirection.Length == 0) { _flowDirection = "LeftToRight"; }
         _children = null;
         _detachedLogicalChildren = null;
-        _margin = new Thickness(0.0f);
-        _padding = new Thickness(0.0f);
-        _borderThickness = new Thickness(0.0f);
-        _cornerRadius = new CornerRadius(0.0f);
-        _renderTransformOrigin = new Point(0.5f, 0.5f);
+        _margin = Thickness.SharedZero();
+        _padding = Thickness.SharedZero();
+        _borderThickness = Thickness.SharedZero();
+        _cornerRadius = CornerRadius.SharedZero();
+        _renderTransformOrigin = Point.SharedCenter();
         _dynResProps = null;
         _dynResKeys = null;
         _inputBindings = null;
@@ -2759,6 +2902,7 @@ public partial class UIElement : DependencyObject {
         set { _uid = value == null ? "" : value; }
     }
     protected void NotifyBoundPropertyChanged(string propName, DependencyObject boxedValue) {
+        BumpPropEpoch();
         if (_ownBindingsBox != null) {
             BindingEngine.NotifyTargetPropertyChanged(this, propName, boxedValue);
         }
@@ -2836,7 +2980,7 @@ public partial class UIElement : DependencyObject {
     public UIElement Parent { get { return _parent; } }
     public UIElement TemplatedParent {
         get { return _templatedParent; }
-        set { _templatedParent = value; }
+        set { _templatedParent = value; BumpSubtreeAncestorEpoch(); BumpPropEpoch(); }
     }
 
     public object DataContext {
@@ -2864,6 +3008,7 @@ public partial class UIElement : DependencyObject {
     public void ClearLocalDataContext() {
         DependencyObject oldBox = _explicitDataContext;
         _explicitDataContext = null;
+        BumpPropEpoch();
         PropagateDataContextToSubtree(oldBox);
     }
 
@@ -2889,6 +3034,7 @@ public partial class UIElement : DependencyObject {
             DependencyObject oldBox = cur._inheritedDataContext;
             if (oldBox == parentDc) { continue; }
             cur._inheritedDataContext = parentDc;
+            cur.BumpPropEpoch();
             cur.RaiseDataContextChanged(DependencyObject.Unbox(oldBox), DependencyObject.Unbox(parentDc));
             if (cur._children == null) { continue; }
             DependencyObject eff = cur.EffectiveDataContextBox();
@@ -2938,9 +3084,10 @@ public partial class UIElement : DependencyObject {
     public Style Style {
         get { return _style; }
         set {
-            if (_style == value) { return; }
+            if (_style == value && (_appliedStyle == value || _closedPopupBuildDepth > 0)) { return; }
             _style = value;
             _appliedStyle = null;
+            if (_closedPopupBuildDepth > 0) { return; }
             ApplyStyleInternal();
         }
     }
@@ -3023,6 +3170,7 @@ public partial class UIElement : DependencyObject {
                     cur.ApplyDynamicResourceAt(i);
                 }
             }
+            if (cur != this && cur.IsClosedPopupBoundary()) { continue; }
             if (cur._children != null) {
                 for (int i = 0; i < cur._children.Length; i += 1) {
                     q.Push(cur._children[i]);
@@ -3066,6 +3214,7 @@ public partial class UIElement : DependencyObject {
             cur.ApplyStyleInternal();
             if (cur._isDisposedTree) { continue; }
             UIElement nextTpl = (cur is Control) ? (cur as Control).TemplateRoot() : null;
+            if (cur != this && cur.IsClosedPopupBoundary()) { continue; }
             if (cur._children != null) {
                 int preCount = cur._children.Length;
                 for (int i = 0; i < preCount; i += 1) {
@@ -3094,6 +3243,7 @@ public partial class UIElement : DependencyObject {
                 if (!ctrl.IsTemplateApplied()) { ctrl.ApplyTemplate(); }
             }
             if (cur._isDisposedTree) { continue; }
+            if (cur != this && cur.IsClosedPopupBoundary()) { continue; }
             if (cur._children != null) {
                 for (int i = 0; i < cur._children.Length; i += 1) {
                     q.Push(cur._children[i]);
@@ -3368,6 +3518,7 @@ public partial class UIElement : DependencyObject {
         get { return _projection3D; }
         set {
             _projection3D = value;
+            BumpPropEpoch();
             if (value != null) {
                 _rot3DX = value.RotationX;
                 _rot3DY = value.RotationY;
@@ -3387,6 +3538,7 @@ public partial class UIElement : DependencyObject {
         get { return _transform3D; }
         set {
             _transform3D = value;
+            BumpPropEpoch();
             if (value != null) {
                 _rot3DX = value.RotationX;
                 _rot3DY = value.RotationY;
@@ -3408,6 +3560,7 @@ public partial class UIElement : DependencyObject {
 
     public void SetExplicitTextFontSize(float sz) {
         _explicitFontSize = sz > 0.0f ? sz : 0.0f;
+        BumpPropEpoch();
         PropagateTypographyToSubtree();
     }
     public float EffectiveTextFontSizeOrZero() {
@@ -3415,6 +3568,7 @@ public partial class UIElement : DependencyObject {
     }
     public void SetExplicitTextFontFamily(string ff) {
         _explicitFontFamily = ff == null ? "" : ff;
+        BumpPropEpoch();
         PropagateTypographyToSubtree();
     }
     public string EffectiveTextFontFamilyOrEmpty() {
@@ -3423,6 +3577,7 @@ public partial class UIElement : DependencyObject {
     }
     public void SetExplicitTextFontWeight(string fw) {
         _explicitFontWeight = fw == null ? "" : fw;
+        BumpPropEpoch();
         PropagateTypographyToSubtree();
     }
     public string EffectiveTextFontWeightOrEmpty() {
@@ -3431,6 +3586,7 @@ public partial class UIElement : DependencyObject {
     }
     public void SetExplicitTextForeground(Brush fg) {
         _explicitTextForeground = fg;
+        BumpPropEpoch();
         PropagateTypographyToSubtree();
     }
     public Brush EffectiveTextForeground() {
@@ -3481,6 +3637,7 @@ public partial class UIElement : DependencyObject {
             cur._inheritedFontFamily = cFf;
             cur._inheritedFontWeight = cFw;
             cur._inheritedTextForeground = cFg;
+            cur.BumpPropEpoch();
             cur.OnInheritedTypographyChanged();
             if (cur._children == null || cur._children.Length == 0) { continue; }
             float outFs = cur.EffectiveTextFontSizeOrZero();
@@ -3889,7 +4046,7 @@ public partial class UIElement : DependencyObject {
     public virtual void AddChild(UIElement child) {
         if (child == null || child == this || child.IsAncestorOf(this)) { return; }
         if (child._parent != null) { child._parent.RemoveChild(child); }
-        child._parent = this;
+        child._parent = this; child.BumpSubtreeAncestorEpoch();
         if (_children == null) { _children = new UIElement[0]; }
         _children.Push(child);
         if (_hasNative && child._hasNative) {
@@ -3903,7 +4060,7 @@ public partial class UIElement : DependencyObject {
         if (child._parent != null) { child._parent.RemoveChild(child); }
         if (_children == null) { _children = new UIElement[0]; }
         int idx = index < 0 ? 0 : (index > _children.Length ? _children.Length : index);
-        child._parent = this;
+        child._parent = this; child.BumpSubtreeAncestorEpoch();
         _children.Insert(idx, child);
         if (_hasNative && child._hasNative) {
             Visual_InsertChild(__nativeHandle, idx, child.__nativeHandle);
@@ -3916,7 +4073,7 @@ public partial class UIElement : DependencyObject {
         if (child._effectiveHitTestVisible != wantEffHit) {
             child.SyncInteractiveFlagsSubtree();
         }
-        if ((_xamlBuildDepth > 0 && !HasUiFlag(32)) || _suppressChildAutoStyle) {
+        if ((_xamlBuildDepth > 0 && !HasUiFlag(32)) || _suppressChildAutoStyle || _closedPopupBuildDepth > 0 || IsClosedPopupBoundary()) {
             DependencyObject effDc = EffectiveDataContextBox();
             if (effDc != null) { child.ReceiveInheritedDataContext(effDc); }
             float eFs = EffectiveTextFontSizeOrZero();
@@ -3955,7 +4112,7 @@ public partial class UIElement : DependencyObject {
         }
         if (idx < 0) { return; }
         _children.RemoveAt(idx);
-        child._parent = null;
+        child._parent = null; child.BumpSubtreeAncestorEpoch();
         if (child._effectiveHitTestVisible != child._isHitTestVisible) {
             child.SyncInteractiveFlagsSubtree();
         }
@@ -3969,7 +4126,7 @@ public partial class UIElement : DependencyObject {
         if (_children != null) {
             for (int i = 0; i < _children.Length; i += 1) {
                 UIElement ch = _children[i];
-                ch._parent = null;
+                ch._parent = null; ch.BumpSubtreeAncestorEpoch();
                 if (ch._effectiveHitTestVisible != ch._isHitTestVisible) {
                     ch.SyncInteractiveFlagsSubtree();
                 }
@@ -4025,6 +4182,7 @@ public partial class UIElement : DependencyObject {
             idx += 1;
             if (cur == null || cur._isDisposedTree) { continue; }
             cur.EnsureLoadedSelf();
+            if (cur != this && cur.IsClosedPopupBoundary()) { continue; }
             if (cur._children != null) {
                 int postCount = cur._children.Length;
                 for (int i = 0; i < postCount; i += 1) {
@@ -4088,6 +4246,7 @@ public partial class UIElement : DependencyObject {
             idx += 1;
             if (cur == null || cur._isDisposedTree) { continue; }
             cur._isDisposedTree = true;
+            _disposeEpoch = _disposeEpoch >= 1000000000 ? 1 : (_disposeEpoch + 1);
             if (cur._children != null) {
                 for (int i = 0; i < cur._children.Length; i += 1) {
                     q.Push(cur._children[i]);
@@ -4696,6 +4855,7 @@ public partial class UIElement : DependencyObject {
 
     // ---- Uniform Property Reflection Bridge (Style, Triggers, BindingEngine, VSM, Behaviors) ----
     public virtual bool SetPropertyValue(string propName, DependencyObject value) {
+        BumpPropEpoch();
         if (propName == null) { return false; }
         if (propName == "Width") { Width = DependencyObject.UnboxFloat(value, ParseUtil.NaN()); return true; }
         if (propName == "Height") { Height = DependencyObject.UnboxFloat(value, ParseUtil.NaN()); return true; }
@@ -5027,8 +5187,14 @@ public partial class UIElement : DependencyObject {
         return false;
     }
 
-    private static string NormalizeCustomPropKey(string propName) {
-        if (propName == null) { return ""; }
+    internal static string NormalizeCustomPropKey(string propName) {
+        if (propName == null || propName.Length == 0) { return ""; }
+        int len = propName.Length;
+        string first = propName.Substring(0, 1);
+        string last = propName.Substring(len - 1, 1);
+        if (first != " " && first != "\t" && last != " " && last != "\t" && first != "(" && propName.IndexOf(":") < 0) {
+            return propName;
+        }
         string s = propName.Trim();
         if (s.Length > 2 && s.Substring(0, 1) == "(" && s.Substring(s.Length - 1, 1) == ")") {
             s = s.Substring(1, s.Length - 2).Trim();
@@ -5041,6 +5207,13 @@ public partial class UIElement : DependencyObject {
         return s;
     }
 
+    internal static bool IsAttachedElementPropPath(string propName) {
+        if (propName == null || propName.Length == 0) { return false; }
+        string clean = NormalizeCustomPropKey(propName);
+        if (IsCustomAttachedPropKey(clean)) { return true; }
+        return clean == "ItemsControl.AlternationIndex" || clean == "AlternationIndex";
+    }
+
     private static bool IsCustomAttachedPropKey(string cleanKey) {
         if (cleanKey.Length >= 7 && cleanKey.Substring(0, 7) == "Custom.") { return true; }
         if (cleanKey.Length >= 9 && cleanKey.Substring(0, 9) == "DragDrop.") { return true; }
@@ -5051,6 +5224,7 @@ public partial class UIElement : DependencyObject {
     }
 
     private void SetDynamicProp(string cleanKey, DependencyObject value) {
+        BumpPropEpoch();
         BindingEngine.MarkFlushDirty();
         if (_dynPropKeys == null) {
             _dynPropKeys = new string[0];
@@ -5089,6 +5263,7 @@ public partial class UIElement : DependencyObject {
 
     internal virtual bool IsItemsControlBoundary() { return false; }
     internal virtual bool IsItemsPresenterBoundary() { return false; }
+    internal virtual bool IsClosedPopupBoundary() { return false; }
     internal virtual bool DisposeWhenResourceOwned() { return false; }
     internal virtual bool DetachNonTemplateUserContent(UIElement owner, UIElement[] q) { return false; }
 
@@ -5227,6 +5402,7 @@ public partial class UIElement : DependencyObject {
     internal void SetFocusedState(bool focused) {
         if (_isFocused == focused) { return; }
         _isFocused = focused;
+        BumpPropEpoch();
         if (focused) {
             OnGotFocus();
             GotFocus(this, new RoutedEventArgs("GotFocus", this));
@@ -5242,6 +5418,7 @@ public partial class UIElement : DependencyObject {
     internal void SetKeyboardFocusWithinState(bool within) {
         if (_isKeyboardFocusWithin == within) { return; }
         _isKeyboardFocusWithin = within;
+        BumpPropEpoch();
         BindingEngine.NotifyTargetPropertyChanged(this, "IsKeyboardFocusWithin", DependencyObject.BoxBool(_isKeyboardFocusWithin));
         UpdateTriggersAndStates();
     }
@@ -5249,6 +5426,7 @@ public partial class UIElement : DependencyObject {
     internal void SetMouseOverState(bool over, float x, float y, int mods) {
         if (_isMouseOver == over) { return; }
         _isMouseOver = over;
+        BumpPropEpoch();
         var args = new MouseEventArgs(over ? "MouseEnter" : "MouseLeave", this, x, y, mods);
         if (over) {
             OnMouseEnter(args);
@@ -5263,6 +5441,7 @@ public partial class UIElement : DependencyObject {
     internal void SetPressedState(bool pressed) {
         if (_isPressed == pressed) { return; }
         _isPressed = pressed;
+        BumpPropEpoch();
         UpdateTriggersAndStates();
     }
 
@@ -5271,6 +5450,7 @@ public partial class UIElement : DependencyObject {
     }
 
     protected virtual void UpdateTriggersAndStates() {
+        BumpPropEpoch();
         Style activeStyle = _style != null ? _style : _appliedStyle;
         if (activeStyle != null) { activeStyle.EvaluateTriggers(this); }
         OnVisualStatePropertyChanged();
@@ -5284,6 +5464,7 @@ public partial class UIElement : DependencyObject {
     }
 
     protected void NotifyStateInvalidatedHooks() {
+        BumpPropEpoch();
         if (_stateInvalidatedHooks == null) { return; }
         for (int i = 0; i < _stateInvalidatedHooks.Length; i += 1) {
             var fn = _stateInvalidatedHooks[i];

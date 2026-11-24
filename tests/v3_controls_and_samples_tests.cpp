@@ -1240,6 +1240,259 @@ public partial class MainWindow : Window {
             "RotateTransform with explicit Center(0,0) and no explicit RenderTransformOrigin must pivot at (0,0)");
 }
 
+void TestPhase1OptimizationRegressions(aero::rs_comp::CompilerSession& /*sharedSession*/) {
+    std::cout << "[Test] Phase1OptimizationRegressions (Window [Observable] / BumpPropEpoch / DataTrigger overlap / BehaviorDataTrigger dispose)...\n";
+
+    const std::string aotXaml = R"XML(
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:b="http://schemas.microsoft.com/xaml/behaviors"
+        x:Name="RootWin"
+        x:Class="Phase1RegDemo.MainWindow"
+        Title="Phase1 Regression Demo" Width="640" Height="480">
+  <Window.Resources>
+    <Style x:Key="TrigBorderStyle" TargetType="Border">
+      <Setter Property="Background" Value="#FF444444"/>
+      <Style.Triggers>
+        <DataTrigger Binding="{Binding FlagA}" Value="True">
+          <Setter Property="Background" Value="#FFFFD700"/>
+        </DataTrigger>
+        <DataTrigger Binding="{Binding FlagB}" Value="True">
+          <Setter Property="Background" Value="#FF0088FF"/>
+        </DataTrigger>
+      </Style.Triggers>
+    </Style>
+  </Window.Resources>
+  <StackPanel Orientation="Vertical" Spacing="8">
+    <TextBlock x:Name="WinDcBannerTxt" Text="{Binding WinBanner}"/>
+    <TextBlock x:Name="WinElBannerTxt" Text="{Binding WinBanner, ElementName=RootWin}"/>
+
+    <Button x:Name="FgBtn" Content="Btn" Foreground="#FF112233">
+      <Button.Template>
+        <ControlTemplate TargetType="Button">
+          <Border x:Name="BtnTplBd" Background="{TemplateBinding Foreground}"/>
+        </ControlTemplate>
+      </Button.Template>
+    </Button>
+
+    <GroupBox x:Name="HdrBox" Header="H1">
+      <GroupBox.Template>
+        <ControlTemplate TargetType="GroupBox">
+          <TextBlock x:Name="GrpTplHdrTb" Text="{TemplateBinding Header}"/>
+        </ControlTemplate>
+      </GroupBox.Template>
+    </GroupBox>
+
+    <Border x:Name="TrigBorder" Style="{StaticResource TrigBorderStyle}"/>
+
+    <StackPanel x:Name="BehHost">
+      <Border x:Name="BehChild1" Tag="Init1">
+        <b:Interaction.Triggers>
+          <b:DataTrigger Binding="{Binding PulseCount}" Value="2">
+            <b:ChangePropertyAction PropertyName="Tag" Value="Fired1"/>
+          </b:DataTrigger>
+        </b:Interaction.Triggers>
+      </Border>
+      <Border x:Name="BehChild2" Tag="Init2">
+        <b:Interaction.Triggers>
+          <b:DataTrigger Binding="{Binding PulseCount}" Value="2">
+            <b:ChangePropertyAction PropertyName="Tag" Value="Fired2"/>
+          </b:DataTrigger>
+        </b:Interaction.Triggers>
+      </Border>
+    </StackPanel>
+  </StackPanel>
+</Window>)XML";
+
+    const std::string aotRs = R"RS(
+module Phase1RegDemo;
+import Aero.UI;
+
+[Observable]
+public class Phase1Vm {
+    public bool FlagA { get; set; } = true;
+    public bool FlagB { get; set; } = true;
+    public int PulseCount { get; set; } = 0;
+}
+
+public partial class MainWindow : Window {
+    public string WinBanner { get; set; } = "Init";
+    public Phase1Vm Vm;
+
+    public MainWindow() {
+        InitializeComponent();
+        Vm = new Phase1Vm();
+        DataContext = this;
+        TrigBorder.DataContext = Vm;
+        BehHost.DataContext = Vm;
+    }
+
+    public string GetWinBannerDc() { return WinDcBannerTxt != null ? WinDcBannerTxt.Text : ""; }
+    public string GetWinBannerEl() { return WinElBannerTxt != null ? WinElBannerTxt.Text : ""; }
+
+    public string GetBtnTplColor() {
+        UIElement b = FgBtn != null ? FgBtn.GetTemplateChild("BtnTplBd") : null;
+        if (b is Border) {
+            Border bd = b as Border;
+            if (bd.Background is SolidColorBrush) {
+                SolidColorBrush sb = bd.Background as SolidColorBrush;
+                if (sb.ResolveRgba() == ParseUtil.ParseColor("#FFAABBCC")) {
+                    return "UPDATED";
+                }
+                return "OTHER";
+            }
+        }
+        return "MISSING";
+    }
+
+    public string GetGrpTplHeader() {
+        UIElement tb = HdrBox != null ? HdrBox.GetTemplateChild("GrpTplHdrTb") : null;
+        if (tb is TextBlock) { return (tb as TextBlock).Text; }
+        return "";
+    }
+
+    public string GetTrigColorTag() {
+        if (TrigBorder != null && TrigBorder.Background is SolidColorBrush) {
+            SolidColorBrush sb = TrigBorder.Background as SolidColorBrush;
+            uint rgba = sb.ResolveRgba();
+            if (rgba == ParseUtil.ParseColor("#FF0088FF")) { return "BLUE"; }
+            if (rgba == ParseUtil.ParseColor("#FFFFD700")) { return "GOLD"; }
+            if (rgba == ParseUtil.ParseColor("#FF444444")) { return "GRAY"; }
+            return "OTHER";
+        }
+        return "MISSING";
+    }
+
+    public string GetBehChild2Tag() {
+        return BehChild2 != null ? DependencyObject.UnboxString(BehChild2.GetPropertyValue("Tag"), "") : "";
+    }
+
+    public void MutateWinBtnGrpAndTriggerDropB() {
+        WinBanner = "UpdatedBanner";
+        FgBtn.Foreground = new SolidColorBrush("#FFAABBCC");
+        HdrBox.SetHeader("H2");
+        Vm.FlagB = false;
+    }
+
+    public void DisposeBehChild1() {
+        if (BehChild1 != null) {
+            BehHost.RemoveChild(BehChild1);
+            BehChild1.DisposeSubtree();
+        }
+    }
+
+    public void SetPulseTwo() {
+        Vm.PulseCount = 2;
+    }
+
+    public void TriggerActivateAWhileBActive() {
+        Vm.FlagA = false;
+        Vm.FlagB = true;
+    }
+
+    public void TriggerEnableAAlso() {
+        Vm.FlagA = true;
+    }
+}
+
+public static Window CreateMainWindow() {
+    return new MainWindow();
+}
+)RS";
+
+    aero::AeroV3CompileInput input;
+    input.stdlibRootDir = AERO_STDLIB_DIR;
+    input.includeStdlib = true;
+    input.treeShakeStdlib = false;
+    input.optimizeBytecode = false;
+    input.emitAotCpp = false;
+    input.xamlPath = "Phase1RegDemo/MainWindow.xaml";
+    input.xamlContent = aotXaml;
+    input.scriptSources.push_back(aero::SourceFile{"Phase1RegDemo/MainWindow.rs", aotRs});
+
+    aero::AeroAppHostConfig cfg;
+    cfg.viewportWidth = 800u;
+    cfg.viewportHeight = 600u;
+    cfg.headless = true;
+    cfg.preferSoftwareRasterizer = true;
+
+    aero::AeroAppHost host(cfg);
+    std::string err;
+    const bool loaded = host.CompileAndLoad(input, &err);
+    Require(loaded, "Phase1RegDemo CompileAndLoad failed: " + err);
+    if (!loaded || !host.RootVisualNode().IsValid()) {
+        return;
+    }
+
+    host.StepFrame(0.016f, true);
+
+    const aero::ObjectRef uiObj = host.RootScriptObject();
+    Require(uiObj.valid(), "Phase1RegDemo RootScriptObject invalid");
+    auto callStr = [&](std::string_view fn) -> std::string {
+        aero::UnifiedValue rv{};
+        if (host.InvokeScriptMethod(uiObj, fn, {}, &rv, aero::DomainKind::UiPresentation)) {
+            if (const auto* sv = std::get_if<aero::rs_rt::StringValue>(&rv)) {
+                return sv->str();
+            }
+            if (const auto* ref = std::get_if<aero::rs_rt::ObjectRef>(&rv);
+                ref && ref->valid() && ref->kind == aero::rs_rt::ObjectKind::String) {
+                if (const auto opt = host.Domains().stringViewAcrossDomains(*ref)) {
+                    return std::string(opt->data(), opt->size());
+                }
+            }
+        }
+        return {};
+    };
+    auto callVoid = [&](std::string_view fn) {
+        aero::UnifiedValue rv{};
+        Require(host.InvokeScriptMethod(uiObj, fn, {}, &rv, aero::DomainKind::UiPresentation),
+            std::string("Phase1RegDemo method failed: ") + std::string(fn));
+    };
+
+    // Frame 1 checks
+    const std::string initDcBanner = callStr("GetWinBannerDc");
+    const std::string initElBanner = callStr("GetWinBannerEl");
+    Require(initDcBanner == "Init", "Window initial WinBanner DataContext binding failed: got='" + initDcBanner + "'");
+    Require(initElBanner == "Init", "Window initial WinBanner ElementName binding failed: got='" + initElBanner + "'");
+    Require(callStr("GetGrpTplHeader") == "H1", "GroupBox initial TemplateBinding Header failed");
+    const std::string initTrigColor = callStr("GetTrigColorTag");
+    Require(initTrigColor == "BLUE", "Initial overlapping DataTrigger B should win with BLUE, got=" + initTrigColor);
+
+    // Mutate Window prop, Button.Foreground, GroupBox.Header, and deactivate FlagB while FlagA stays True
+    callVoid("MutateWinBtnGrpAndTriggerDropB");
+    host.StepFrame(0.016f, true);
+    Require(callStr("GetWinBannerDc") == "UpdatedBanner",
+        "Window custom [Observable] WinBanner DataContext binding did not update: " + callStr("GetWinBannerDc"));
+    Require(callStr("GetWinBannerEl") == "UpdatedBanner",
+        "Window custom [Observable] WinBanner ElementName binding did not update: " + callStr("GetWinBannerEl"));
+    Require(callStr("GetBtnTplColor") == "UPDATED",
+        "Button.Foreground TemplateBinding did not update after BumpPropEpoch: " + callStr("GetBtnTplColor"));
+    Require(callStr("GetGrpTplHeader") == "H2",
+        "GroupBox.Header TemplateBinding did not update after SetHeader: " + callStr("GetGrpTplHeader"));
+    const std::string goldTrig = callStr("GetTrigColorTag");
+    Require(goldTrig == "GOLD",
+        "Surviving DataTrigger A did not re-apply GOLD when overlapping DataTrigger B deactivated, got=" + goldTrig);
+
+    // Verify activating earlier FlagA while later FlagB stays active keeps FlagB (Blue) on top
+    callVoid("TriggerActivateAWhileBActive");
+    host.StepFrame(0.016f, true);
+    const std::string bAloneTrig = callStr("GetTrigColorTag");
+    Require(bAloneTrig == "BLUE", "DataTrigger B alone should apply BLUE, got=" + bAloneTrig);
+    callVoid("TriggerEnableAAlso");
+    host.StepFrame(0.016f, true);
+    const std::string bStillTrig = callStr("GetTrigColorTag");
+    Require(bStillTrig == "BLUE",
+        "Higher-precedence active DataTrigger B should remain BLUE when earlier DataTrigger A activates, got=" + bStillTrig);
+
+    // Verify BehaviorDataTrigger parallel cache arrays stay aligned after disposing first child target
+    callVoid("DisposeBehChild1");
+    host.StepFrame(0.016f, true);
+    callVoid("SetPulseTwo");
+    host.StepFrame(0.016f, true);
+    Require(callStr("GetBehChild2Tag") == "Fired2",
+        "Surviving BehaviorDataTrigger target failed to fire after BehChild1 DisposeSubtree: " + callStr("GetBehChild2Tag"));
+}
+
 } // namespace
 
 int main() {
@@ -1251,6 +1504,7 @@ int main() {
     TestSample05DualDomainSimHud(sharedSession);
     TestRegressionsFixed(sharedSession);
     TestGalleryEngineRuntimeFixes(sharedSession);
+    TestPhase1OptimizationRegressions(sharedSession);
 
     if (gFailureCount > 0) {
         std::cerr << gFailureCount << " v3_controls_and_samples_tests assertion(s) failed.\n";

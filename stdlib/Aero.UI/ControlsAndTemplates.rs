@@ -155,19 +155,19 @@ public class Control : FrameworkElement {
             }
             return _foreground;
         }
-        set { _hasExplicitForeground = true; _foreground = value; SetExplicitTextForeground(value); OnTypographyChanged(); }
+        set { _hasExplicitForeground = true; _foreground = value; BumpPropEpoch(); SetExplicitTextForeground(value); OnTypographyChanged(); }
     }
     public string FontFamily {
         get { return _fontFamily; }
-        set { _hasExplicitFontFamily = true; _fontFamily = value == null ? "Segoe UI" : value; SetExplicitTextFontFamily(_fontFamily); OnTypographyChanged(); }
+        set { _hasExplicitFontFamily = true; _fontFamily = value == null ? "Segoe UI" : value; BumpPropEpoch(); SetExplicitTextFontFamily(_fontFamily); OnTypographyChanged(); }
     }
     public float FontSize {
         get { return _fontSize; }
-        set { _hasExplicitFontSize = true; _fontSize = value > 0.0f ? value : 14.0f; SetExplicitTextFontSize(_fontSize); OnTypographyChanged(); }
+        set { _hasExplicitFontSize = true; _fontSize = value > 0.0f ? value : 14.0f; BumpPropEpoch(); SetExplicitTextFontSize(_fontSize); OnTypographyChanged(); }
     }
     public string FontWeight {
         get { return _fontWeight; }
-        set { _hasExplicitFontWeight = true; _fontWeight = value == null ? "Normal" : value; SetExplicitTextFontWeight(_fontWeight); OnTypographyChanged(); }
+        set { _hasExplicitFontWeight = true; _fontWeight = value == null ? "Normal" : value; BumpPropEpoch(); SetExplicitTextFontWeight(_fontWeight); OnTypographyChanged(); }
     }
 
     internal override void OnInheritedTypographyChanged() {
@@ -191,26 +191,26 @@ public class Control : FrameworkElement {
             Brush fg = EffectiveTextForeground();
             if (fg != null && _foreground != fg) { _foreground = fg; changed = true; }
         }
-        if (changed) { OnTypographyChanged(); }
+        if (changed) { BumpPropEpoch(); OnTypographyChanged(); }
     }
     public string FontStyle {
         get { return _fontStyle; }
-        set { _fontStyle = value == null ? "Normal" : value; OnTypographyChanged(); }
+        set { _fontStyle = value == null ? "Normal" : value; BumpPropEpoch(); OnTypographyChanged(); }
     }
     public HorizontalAlignment HorizontalContentAlignment {
         get { return _hContentAlign; }
-        set { _hContentAlign = value; OnContentAlignmentChanged(); }
+        set { _hContentAlign = value; BumpPropEpoch(); OnContentAlignmentChanged(); }
     }
     public VerticalAlignment VerticalContentAlignment {
         get { return _vContentAlign; }
-        set { _vContentAlign = value; OnContentAlignmentChanged(); }
+        set { _vContentAlign = value; BumpPropEpoch(); OnContentAlignmentChanged(); }
     }
 
     public ControlTemplate Template {
         get { return _template; }
         set {
             MarkLocalProperty("Template");
-            if (_template == value && _templateApplied) { return; }
+            if (_template == value && (_templateApplied || UIElement._closedPopupBuildDepth > 0)) { return; }
             if (_template != null && _templateApplied) {
                 _template.ResetTriggers(this);
             }
@@ -218,6 +218,7 @@ public class Control : FrameworkElement {
             _hasTemplateResources = (_template != null && (_template.HasResources() || _template.RawResourcesOrNull() != null));
             _hasTemplateAmbientResources = (_template != null && _template.AmbientResources != null);
             _templateApplied = false;
+            if (UIElement._closedPopupBuildDepth > 0) { return; }
             ApplyTemplate();
         }
     }
@@ -226,6 +227,7 @@ public class Control : FrameworkElement {
         set {
             if (_isTabStop == value) { return; }
             _isTabStop = value;
+            BumpPropEpoch();
             UpdateTriggersAndStates();
         }
     }
@@ -279,6 +281,7 @@ public class Control : FrameworkElement {
     protected void SetInheritedDefaultForeground(Brush fg) {
         if (_hasExplicitForeground || fg == null) { return; }
         _foreground = fg;
+        BumpPropEpoch();
         SetExplicitTextForeground(fg);
         OnTypographyChanged();
     }
@@ -350,6 +353,7 @@ public class Control : FrameworkElement {
                     subCtrl.ApplyTemplate();
                 }
             }
+            if (node != rootNode && node.IsClosedPopupBoundary()) { continue; }
             for (int i = 0; i < node.ChildCount(); i += 1) {
                 UIElement ch = node.ChildAt(i);
                 if (ch != null && IsOwnedByTemplateChain(ch, owner)) { q.Push(ch); }
@@ -684,6 +688,7 @@ public class ContentPresenter : FrameworkElement {
     public void SetContentBox(DependencyObject box) {
         if (box == null && _contentBox == null && _contentTemplate == null) { return; }
         _contentBox = box;
+        BumpPropEpoch();
         RebuildContentVisual();
     }
 
@@ -692,6 +697,7 @@ public class ContentPresenter : FrameworkElement {
         set {
             if (_contentTemplate == value) { return; }
             _contentTemplate = value;
+            BumpPropEpoch();
             RebuildContentVisual();
         }
     }
@@ -700,6 +706,7 @@ public class ContentPresenter : FrameworkElement {
         if (_contentBox == box && _contentTemplate == tpl && ChildCount() > 0) { return; }
         _contentBox = box;
         _contentTemplate = tpl;
+        BumpPropEpoch();
         RebuildContentVisual();
     }
 
@@ -1040,6 +1047,7 @@ public class ContentControl : Control {
         get { return _contentTemplate; }
         set {
             _contentTemplate = value;
+            BumpPropEpoch();
             if (_presenter != null) { _presenter.ContentTemplate = value; }
         }
     }
@@ -1200,6 +1208,7 @@ public class HeaderedContentControl : ContentControl {
         DependencyObject oldBox = _headerBox;
         _headerBox = box;
         if (_headerPresenter != null) { _headerPresenter.SetContentBox(_headerBox); }
+        NotifyBoundPropertyChanged("Header", _headerBox);
         OnHeaderChanged(DependencyObject.Unbox(oldBox), DependencyObject.Unbox(_headerBox));
     }
 
@@ -1207,6 +1216,7 @@ public class HeaderedContentControl : ContentControl {
         get { return _headerTemplate; }
         set {
             _headerTemplate = value;
+            BumpPropEpoch();
             if (_headerPresenter != null) { _headerPresenter.ContentTemplate = value; }
         }
     }
@@ -1216,6 +1226,7 @@ public class HeaderedContentControl : ContentControl {
         _headerTemplate = tpl;
         _headerBox = box;
         if (_headerPresenter != null) { _headerPresenter.SetContentAndTemplate(_headerBox, _headerTemplate); }
+        NotifyBoundPropertyChanged("Header", _headerBox);
         OnHeaderChanged(DependencyObject.Unbox(oldBox), DependencyObject.Unbox(_headerBox));
     }
 
@@ -1301,6 +1312,7 @@ public class GroupBox : HeaderedContentControl {
 }
 
 public class Expander : HeaderedContentControl {
+    internal override int FastPropEpochCategory() { return 7; }
     private bool _isExpanded = false;
     private ExpandDirection _expandDirection = ExpandDirection.Down;
     private Border _headerToggle;

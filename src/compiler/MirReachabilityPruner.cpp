@@ -18,7 +18,8 @@ namespace {
 constexpr std::uint32_t kInvalidSlot = std::numeric_limits<std::uint32_t>::max();
 
 [[nodiscard]] bool IsPrunableStdlibModule(std::string_view moduleName) noexcept {
-    return moduleName == "Aero.UI" || moduleName == "Aero.Native";
+    return moduleName == "Aero.UI" || moduleName == "Aero.Native" ||
+           (moduleName.size() > 15u && moduleName.substr(0u, 15u) == "Aero.UI.__spec.");
 }
 
 [[nodiscard]] bool IsPrunableFunctionOnlyModule(std::string_view moduleName) noexcept {

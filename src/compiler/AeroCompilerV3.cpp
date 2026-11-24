@@ -5,6 +5,9 @@
 #include <cctype>
 #include <cstdlib>
 #include <cstring>
+#if defined(__GLIBC__)
+#include <malloc.h>
+#endif
 #include <filesystem>
 #include <fstream>
 #include <future>
@@ -375,6 +378,8 @@ void WriteBinaryFileAtomic(const std::filesystem::path& path, const std::vector<
     std::shared_ptr<rs_comp::CompilerSession> session,
     bool enableReactiveMacros) {
     rs_comp::CompilationOptions opts;
+        opts.collectSymbolOccurrences = false;
+        opts.emitDebugInfo = false;
     opts.allowDefaultBuiltinPacks = true;
     opts.session = std::move(session);
     if (enableReactiveMacros) {
@@ -469,6 +474,9 @@ void PersistStdlibDiskCache(
 void PopulateStdlibDerivedCache(ProcessStdlibCacheEntry& entry) {
     rs_bc::Lowerer lowerer;
     for (const auto& [modName, cm] : entry.snapshot.modules) {
+        if (modName == "Aero.UI") {
+            continue;
+        }
         std::vector<rs_mir::Module> tmpMods{cm.module};
         StripAeroNativeMirBodies(tmpMods);
         rs_mir::Module& mirMod = tmpMods.front();
@@ -918,6 +926,28 @@ struct DualHash128 final {
             mixBytes(s.data(), s.size());
         }
     }
+    void mixNormalizedPath(std::string_view s) noexcept {
+        mixU64(static_cast<std::uint64_t>(s.size()));
+        if (s.empty()) {
+            return;
+        }
+        unsigned char buf[256];
+        std::size_t pos = 0u;
+        while (pos < s.size()) {
+            const std::size_t chunk = std::min<std::size_t>(sizeof(buf), s.size() - pos);
+            for (std::size_t i = 0u; i < chunk; ++i) {
+                char ch = s[pos + i];
+                if (ch == '\\') {
+                    ch = '/';
+                } else if (pos + i == 0u && s.size() >= 2u && s[1] == ':' && ch >= 'a' && ch <= 'z') {
+                    ch = static_cast<char>(ch - 'a' + 'A');
+                }
+                buf[i] = static_cast<unsigned char>(ch);
+            }
+            mixBytes(buf, chunk);
+            pos += chunk;
+        }
+    }
 };
 
 struct FastStdlibStatCache final {
@@ -1168,7 +1198,7 @@ void RecordFastStdlibHash(
     WriteBinaryFileAtomic(cacheDir / "stdlib_stat_v1.bin", buf);
 }
 
-constexpr std::uint32_t kProgramCacheVersion = 8u;
+constexpr std::uint32_t kProgramCacheVersion = 9u;
 
 [[nodiscard]] std::pair<std::uint64_t, std::uint64_t> ComputeRawInputBundleKey(
     const AeroV3CompileInput& input,
@@ -1187,23 +1217,23 @@ constexpr std::uint32_t kProgramCacheVersion = 8u;
     hasher.mixU32(flags);
     hasher.mixU64(stdlibHash);
 
-    hasher.mixString(input.xamlPath);
+    hasher.mixNormalizedPath(input.xamlPath);
     hasher.mixString(input.xamlContent);
-    hasher.mixString(input.resourceSearchRoot);
+    hasher.mixNormalizedPath(input.resourceSearchRoot);
     hasher.mixU64(static_cast<std::uint64_t>(input.resourceSearchPaths.size()));
     for (const auto& p : input.resourceSearchPaths) {
-        hasher.mixString(p);
+        hasher.mixNormalizedPath(p);
     }
 
     hasher.mixU64(static_cast<std::uint64_t>(input.additionalXamlSources.size()));
     for (const auto& sf : input.additionalXamlSources) {
-        hasher.mixString(sf.path);
+        hasher.mixNormalizedPath(sf.path);
         hasher.mixString(sf.content);
     }
 
     hasher.mixU64(static_cast<std::uint64_t>(input.scriptSources.size()));
     for (const auto& sf : input.scriptSources) {
-        hasher.mixString(sf.path);
+        hasher.mixNormalizedPath(sf.path);
         hasher.mixString(sf.content);
     }
     return {hasher.h1, hasher.h2};
@@ -1435,6 +1465,10 @@ void CompactProcessHeapAfterCompile() noexcept {
 #if defined(_WIN32)
     (void)_heapmin();
     (void)HeapCompact(GetProcessHeap(), 0u);
+#endif
+
+#if defined(__GLIBC__)
+    (void)::malloc_trim(0);
 #endif
 }
 
@@ -1696,6 +1730,9 @@ AeroV3CompileResult AeroCompilerV3::Compile(const AeroV3CompileInput& input) con
 
     // Configure RealScript compilation + stdlib snapshot/disk cache
     rs_comp::CompilationOptions compOpts;
+    compOpts.populateSnapshot = (input.compilerSession != nullptr);
+    compOpts.collectSymbolOccurrences = false;
+    compOpts.emitDebugInfo = input.emitAotCpp;
     compOpts.allowDefaultBuiltinPacks = true;
     if (input.enableReactiveMacros) {
         compOpts.macroPlugins.push_back(rs_comp::createStandardReactiveMacroPlugin());
@@ -1721,7 +1758,6 @@ AeroV3CompileResult AeroCompilerV3::Compile(const AeroV3CompileInput& input) con
         }
         if (!usePreviousSnapshot && input.includeStdlib && input.allowStdlibCache) {
             std::shared_ptr<rs_comp::CompilerSession> unusedSession;
-            std::shared_ptr<const ProcessStdlibCacheEntry> unusedEntry;
             if (ResolveStdlibCacheForCompile(
                     resolvedStdlibRootKey,
                     stdlibSources,
@@ -1731,7 +1767,7 @@ AeroV3CompileResult AeroCompilerV3::Compile(const AeroV3CompileInput& input) con
                     input.compilerSession,
                     unusedSession,
                     previousSnapshot,
-                    unusedEntry,
+                    procEntry,
                     stdlibCacheCandidate)) {
                 usePreviousSnapshot = true;
             }
@@ -1741,10 +1777,9 @@ AeroV3CompileResult AeroCompilerV3::Compile(const AeroV3CompileInput& input) con
         const bool snapMetaExists = effectiveCacheDir.empty() ||
             std::filesystem::exists(
                 effectiveCacheDir / ("aero_stdlib_" + Hex64(stdlibHash) + ".snapmeta"), snapEc);
-        const bool skipIneffectiveDiskStdlibLoad =
-            !HasProcessStdlibCacheEntry(resolvedStdlibRootKey, stdlibHash, input.enableReactiveMacros) &&
-            usesStdlibGenerics &&
-            snapMetaExists;
+        (void)usesStdlibGenerics;
+        (void)snapMetaExists;
+        const bool skipIneffectiveDiskStdlibLoad = false;
         std::shared_ptr<rs_comp::CompilerSession> procSession;
         if (ResolveStdlibCacheForCompile(
                 resolvedStdlibRootKey,
@@ -1828,7 +1863,11 @@ AeroV3CompileResult AeroCompilerV3::Compile(const AeroV3CompileInput& input) con
         if (input.compilerSession != nullptr) {
             auto& cache = GetSessionSnapshotCache();
             std::lock_guard<std::mutex> lock(cache.mutex);
-            cache.snapshots[input.compilerSession] = buildRes.snapshot;
+            if (cache.snapshots.size() >= 4u &&
+                cache.snapshots.find(input.compilerSession) == cache.snapshots.end()) {
+                cache.snapshots.erase(cache.snapshots.begin());
+            }
+            cache.snapshots[input.compilerSession] = std::move(buildRes.snapshot);
         }
 
         mirModules = std::move(buildRes.modules);
@@ -2013,6 +2052,26 @@ AeroV3CompileResult AeroCompilerV3::Compile(const AeroV3CompileInput& input) con
             progCacheFilePath, progH1, progH2, result, encodedProgramBytes, mergedExternalDeps);
     }
     return result;
+}
+
+void AeroCompilerV3::ClearProcessCaches() noexcept {
+    {
+        auto& procCache = GetProcessStdlibCache();
+        std::lock_guard<std::mutex> buildLock(procCache.buildMutex);
+        std::lock_guard<std::mutex> lookupLock(procCache.lookupMutex);
+        procCache.entries.clear();
+    }
+    {
+        auto& sessionCache = GetSessionSnapshotCache();
+        std::lock_guard<std::mutex> lock(sessionCache.mutex);
+        sessionCache.snapshots.clear();
+    }
+    {
+        auto& statCache = GetFastStdlibStatCache();
+        std::lock_guard<std::mutex> lock(statCache.mutex);
+        statCache.entries.clear();
+    }
+    CompactProcessHeapAfterCompile();
 }
 
 } // namespace aero

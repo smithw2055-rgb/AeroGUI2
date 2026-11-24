@@ -125,6 +125,7 @@ public:
     bool PumpEventsAndRender(float dtSeconds = 0.016f, std::int32_t maxWaitMs = 0);
 
     [[nodiscard]] bool NeedsPresent() const noexcept { return needsInitialRender_ || !CanHostSleepIdle(); }
+    [[nodiscard]] bool NeedsInitialPresent() const noexcept { return needsInitialRender_; }
 
     // Run event-driven main loop until RequestClose() or maxFrames is reached (0 = unlimited).
     // On Emscripten, registers non-blocking on-demand rAF callbacks and returns immediately (0 ASYNCIFY).

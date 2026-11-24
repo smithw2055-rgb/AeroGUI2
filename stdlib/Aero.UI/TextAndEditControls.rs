@@ -7,6 +7,7 @@ import RealScript.Math;
 // ============================================================================
 
 public class TextBoxBase : Control {
+    internal override int FastPropEpochCategory() { return 2; }
     private string _rawText = "";
     private string _placeholderText = "";
     private bool _isReadOnly = false;
@@ -98,15 +99,15 @@ public class TextBoxBase : Control {
 
     public bool IsReadOnly {
         get { return _isReadOnly; }
-        set { _isReadOnly = value; RefreshTextVisual(); SyncImeState(); }
+        set { _isReadOnly = value; BumpPropEpoch(); RefreshTextVisual(); SyncImeState(); }
     }
     public bool AcceptsReturn {
         get { return _acceptsReturn; }
-        set { _acceptsReturn = value; }
+        set { _acceptsReturn = value; BumpPropEpoch(); }
     }
     public int MaxLength {
         get { return _maxLength; }
-        set { _maxLength = value >= 0 ? value : 0; }
+        set { _maxLength = value >= 0 ? value : 0; BumpPropEpoch(); }
     }
     public string PlaceholderText {
         get { return _placeholderText; }
@@ -124,17 +125,18 @@ public class TextBoxBase : Control {
     }
     public Brush CaretBrush {
         get { return _caretBrush; }
-        set { _caretBrush = value; RefreshTextSelectionVisual(); }
+        set { _caretBrush = value; BumpPropEpoch(); RefreshTextSelectionVisual(); }
     }
     public Brush SelectionBrush {
         get { return _selectionBrush; }
-        set { _selectionBrush = value; RefreshTextSelectionVisual(); }
+        set { _selectionBrush = value; BumpPropEpoch(); RefreshTextSelectionVisual(); }
     }
     public float SelectionOpacity {
         get { return _selectionOpacity; }
         set {
             _selectionOpacity = Math.Clampf(value, 0.0f, 1.0f);
             _hasExplicitSelectionOpacity = true;
+            BumpPropEpoch();
             RefreshTextSelectionVisual();
         }
     }
@@ -171,6 +173,7 @@ public class TextBoxBase : Control {
             _anchorCp = ClampCp(_anchorCp);
         }
         ResetCaretBlinkPhase();
+        BumpPropEpoch();
         BindingEngine.MarkFlushDirty();
         OnRawTextChanged(_rawText);
         RefreshTextVisual();
@@ -278,6 +281,7 @@ public class TextBoxBase : Control {
         _caretCp = ClampCp(nextCaret);
         _anchorCp = _caretCp;
         ResetCaretBlinkPhase();
+        BumpPropEpoch();
         BindingEngine.MarkFlushDirty();
         OnRawTextChanged(_rawText);
         RefreshTextVisual();

@@ -30,13 +30,68 @@ void PrintUsage() {
         "  --no-dpi                Disable High-DPI scaling (1:1 physical pixels)\n"
         "  --out <screenshot.ppm>  Write rendered RGBA8 frame as binary PPM (P6)\n"
         "  --O2                    Enable optional MIR optimization (default: off / pure interpreter)\n"
+        "  --jit, --stencil-jit    Enable StencilJIT native codegen when available (default: off)\n"
         "  --no-tree-shake         Disable stdlib AST/MIR reachability pruning\n"
         "  --software              Use low-memory Win32 GDI software presenter instead of OpenGL\n"
         "  --gpu                   Prefer hardware OpenGL presenter (default)\n"
         "  --stdlib <dir>          Path to stdlib root directory\n"
-        "  --cache-dir <dir>       Enable and use disk stdlib cache directory\n"
-        "  --no-cache              Disable stdlib cache (default)\n"
+        "  --cache-dir <dir>       Use custom disk bytecode/stdlib cache directory\n"
+        "  --no-cache              Disable disk cache (default: enabled in user cache dir)\n"
         "  -h, --help              Show this help\n");
+}
+
+[[nodiscard]] std::string ReadViewerEnvVar(const char* name) {
+    if (!name || name[0] == '\0') {
+        return {};
+    }
+#ifdef _MSC_VER
+    char* buf = nullptr;
+    std::size_t len = 0u;
+    std::string val;
+    if (_dupenv_s(&buf, &len, name) == 0 && buf != nullptr) {
+        if (buf[0] != '\0') {
+            val = buf;
+        }
+        std::free(buf);
+    }
+    return val;
+#else
+    if (const char* v = std::getenv(name); v != nullptr && v[0] != '\0') {
+        return std::string(v);
+    }
+    return {};
+#endif
+}
+
+[[nodiscard]] std::string ResolveDefaultViewerCacheDir() {
+    if (const std::string envCache = ReadViewerEnvVar("AERO_CACHE_DIR"); !envCache.empty()) {
+        return std::filesystem::path(envCache).lexically_normal().generic_string();
+    }
+#ifdef _WIN32
+    std::string baseDir = ReadViewerEnvVar("LOCALAPPDATA");
+    if (baseDir.empty()) {
+        baseDir = ReadViewerEnvVar("TEMP");
+    }
+    if (baseDir.empty()) {
+        baseDir = ReadViewerEnvVar("TMP");
+    }
+    if (!baseDir.empty()) {
+        return (std::filesystem::path(baseDir) / "AeroGUI2" / "cache").lexically_normal().generic_string();
+    }
+#else
+    if (const std::string xdg = ReadViewerEnvVar("XDG_CACHE_HOME"); !xdg.empty()) {
+        return (std::filesystem::path(xdg) / "aerogui2").lexically_normal().generic_string();
+    }
+    if (const std::string home = ReadViewerEnvVar("HOME"); !home.empty()) {
+        return (std::filesystem::path(home) / ".cache" / "aerogui2").lexically_normal().generic_string();
+    }
+#endif
+    std::error_code ec;
+    const std::filesystem::path tmp = std::filesystem::temp_directory_path(ec);
+    if (!ec && !tmp.empty()) {
+        return (tmp / "aerogui2_cache").lexically_normal().generic_string();
+    }
+    return {};
 }
 
 [[nodiscard]] bool ReadFileText(const std::filesystem::path& path, std::string& out) {
@@ -157,12 +212,13 @@ int main(int argc, char** argv) {
     float dpiScaleOverride = 0.0f;
     std::string outPpmPath;
     bool optimizeO2 = false;
+    bool enableStencilJit = false;
     bool disableTreeShake = false;
     bool preferSoftware = false;
     bool softwareFlagSet = false;
     std::string stdlibDir;
     std::string cacheDir;
-    bool allowCache = false;
+    bool allowCache = true;
 
     for (int i = 1; i < argc; ++i) {
         const std::string_view arg(argv[i]);
@@ -227,6 +283,8 @@ int main(int argc, char** argv) {
             outPpmPath = v;
         } else if (arg == "--O2" || arg == "-O2") {
             optimizeO2 = true;
+        } else if (arg == "--jit" || arg == "--stencil-jit") {
+            enableStencilJit = true;
         } else if (arg == "--no-tree-shake") {
             disableTreeShake = true;
         } else if (arg == "--software") {
@@ -280,7 +338,10 @@ int main(int argc, char** argv) {
     compileInput.allowDiskCache = allowCache;
     compileInput.allowStdlibCache = false;
     compileInput.compilerSession = nullptr;
-    if (allowCache && !cacheDir.empty()) {
+    if (allowCache) {
+        if (cacheDir.empty()) {
+            cacheDir = ResolveDefaultViewerCacheDir();
+        }
         compileInput.cacheDir = cacheDir;
     } else {
         compileInput.cacheDir.clear();
@@ -353,6 +414,7 @@ int main(int argc, char** argv) {
         hostCfg.preferSoftwareRasterizer = preferSoftware;
     }
     hostCfg.optimizeBytecode = optimizeO2;
+    hostCfg.enableStencilJit = enableStencilJit;
     if (!entryName.empty()) {
         hostCfg.entryClassName = entryName;
         hostCfg.entryFunctionName = entryName;

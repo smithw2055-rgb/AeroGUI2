@@ -1637,6 +1637,146 @@ public partial class MainWindow : Window {
         "End-to-end AeroCompilerV3 compile of Style.Resources/x:Static/FirstColumn/TabIndex/GridViewColumnHeader/Grid x:Name failed");
 }
 
+void TestIncrementalSpecModuleCacheInvalidation() {
+    const auto realStdlib = aero::LoadStdlibModulePack();
+    if (!RealStdlibHasUiClasses(realStdlib)) {
+        return;
+    }
+
+    aero::rs_comp::CompilerSession specSession;
+    const aero::AeroCompilerV3 compiler;
+
+    const std::string xaml = R"XML(
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        x:Class="SpecIncDemo.MainWindow"
+        Title="Spec Incremental Cache" Width="400" Height="300">
+  <TextBlock Text="Hi"/>
+</Window>)XML";
+
+    const std::string modelV1 = R"RS(
+module SpecIncModel;
+public class Hero {
+    public int Hp = 10;
+}
+)RS";
+
+    const std::string storeV1 = R"RS(
+module SpecIncStore;
+import Aero.UI;
+import SpecIncModel;
+public class HeroStore {
+    public ObservableList<Hero> Items;
+    public int VersionTag = 1;
+    public HeroStore() {
+        Items = new ObservableList<Hero>();
+        var h = new Hero();
+        h.Hp = 42;
+        Items.Add(h);
+    }
+    public int FirstHp() {
+        return Items.Count() == 1 ? Items.Get(0).Hp : -1;
+    }
+}
+)RS";
+
+    const std::string mainRs = R"RS(
+module SpecIncDemo;
+import Aero.UI;
+import SpecIncStore;
+public partial class MainWindow : Window {
+    public HeroStore Store;
+    public MainWindow() {
+        InitializeComponent();
+        Store = new HeroStore();
+    }
+    public int CheckVal() {
+        return Store.FirstHp();
+    }
+}
+)RS";
+
+    auto makeInput = [&](std::string modelSrc, std::string storeSrc) {
+        aero::AeroV3CompileInput in;
+        in.xamlPath = "SpecIncDemo/MainWindow.xaml";
+        in.xamlContent = xaml;
+        in.includeStdlib = true;
+        in.treeShakeStdlib = false;
+        in.optimizeBytecode = false;
+        in.allowStdlibCache = true;
+        in.compilerSession = &specSession;
+        in.scriptSources.push_back(aero::SourceFile{"SpecIncDemo/Model.rs", std::move(modelSrc)});
+        in.scriptSources.push_back(aero::SourceFile{"SpecIncDemo/Store.rs", std::move(storeSrc)});
+        in.scriptSources.push_back(aero::SourceFile{"SpecIncDemo/MainWindow.rs", mainRs});
+        return in;
+    };
+
+    // 1. Initial compile populates session snapshot with Aero.UI.__spec.SpecIncModel
+    const auto r1 = compiler.Compile(makeInput(modelV1, storeV1));
+    for (const auto& d : r1.diagnostics) {
+        if (!r1.succeeded) { std::cerr << "  spec inc #1 diag: " << d << "\n"; }
+    }
+    Require(r1.succeeded && r1.programImage != nullptr, "TestIncrementalSpecModuleCacheInvalidation compile #1 failed");
+
+    // 2. Edit Store only (Model & Aero.UI.__spec.SpecIncModel stay unchanged -> dirtyQueue restores hygienic module decls)
+    const std::string storeV2 = R"RS(
+module SpecIncStore;
+import Aero.UI;
+import SpecIncModel;
+public class HeroStore {
+    public ObservableList<Hero> Items;
+    public int VersionTag = 2;
+    public HeroStore() {
+        Items = new ObservableList<Hero>();
+        var h = new Hero();
+        h.Hp = 77;
+        Items.Add(h);
+    }
+    public int FirstHp() {
+        return Items.Count() == 1 ? Items.Get(0).Hp + VersionTag : -1;
+    }
+}
+)RS";
+    const auto r2 = compiler.Compile(makeInput(modelV1, storeV2));
+    for (const auto& d : r2.diagnostics) {
+        if (!r2.succeeded) { std::cerr << "  spec inc #2 diag: " << d << "\n"; }
+    }
+    Require(r2.succeeded && r2.programImage != nullptr, "TestIncrementalSpecModuleCacheInvalidation compile #2 failed");
+
+    // 3. Edit Model (Hero gains Tag field) & read Tag in Store -> hygienicModules must invalidate cached .__spec. module
+    const std::string modelV2 = R"RS(
+module SpecIncModel;
+public class Hero {
+    public int Hp = 10;
+    public string Tag = "ok";
+}
+)RS";
+    const std::string storeV3 = R"RS(
+module SpecIncStore;
+import Aero.UI;
+import SpecIncModel;
+public class HeroStore {
+    public ObservableList<Hero> Items;
+    public int VersionTag = 3;
+    public HeroStore() {
+        Items = new ObservableList<Hero>();
+        var h = new Hero();
+        h.Hp = 88;
+        h.Tag = "ok";
+        Items.Add(h);
+    }
+    public int FirstHp() {
+        return (Items.Count() == 1 && Items.Get(0).Tag == "ok") ? 99 : -1;
+    }
+}
+)RS";
+    const auto r3 = compiler.Compile(makeInput(modelV2, storeV3));
+    for (const auto& d : r3.diagnostics) {
+        if (!r3.succeeded) { std::cerr << "  spec inc #3 diag: " << d << "\n"; }
+    }
+    Require(r3.succeeded && r3.programImage != nullptr, "TestIncrementalSpecModuleCacheInvalidation compile #3 failed");
+}
+
 } // namespace
 
 int main() {
@@ -1651,6 +1791,7 @@ int main() {
     TestMultiXamlAdditionalSourcesCompilation();
     TestP0P1CompilerSemanticsAndStdlibGenericCache();
     TestGalleryEngineCompilerFixes();
+    TestIncrementalSpecModuleCacheInvalidation();
 
     if (gFailureCount > 0) {
         std::cerr << gFailureCount << " compiler_v3_tests assertion(s) failed.\n";

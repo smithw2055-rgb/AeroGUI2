@@ -278,7 +278,12 @@ void ComputeViewboxScale(
         case VisualKind::Vector: {
             if (node.Vector().shapeKind == VectorShapeKind::SvgPath && !node.Vector().pathOrParams.empty()) {
                 const VisualVectorData& vec = node.Vector();
-                const Rect bounds = MeasureSvgPathBounds(vec.pathOrParams);
+                if (!vec.svgBoundsCached) {
+                    vec.cachedPathHash = ComputeSvgPathHash(vec.pathOrParams);
+                    vec.cachedSvgBounds = MeasureSvgPathBounds(vec.pathOrParams);
+                    vec.svgBoundsCached = true;
+                }
+                const Rect bounds = vec.cachedSvgBounds;
                 const bool hasVisStroke = ((vec.strokeRgba >> 24u) > 0u || vec.strokeGradId > 0) &&
                                           vec.strokeWidth > 0.0f && vec.strokeOpacity > 0.001f;
                 const float strokeExt = hasVisStroke ? vec.strokeWidth : 0.0f;
@@ -1658,11 +1663,19 @@ void ArrangeNode(
 
     if (node->layout.visibility == Visibility::Collapsed) {
         const Rect collapsedRect{finalSlot.x, finalSlot.y, 0.0f, 0.0f};
+        const bool hadValidArrangeBefore = node->layout.hasValidArrange;
+        const float prevW = node->layout.layoutRect.width;
+        const float prevH = node->layout.layoutRect.height;
         const bool rectChanged = !SameRectExact(node->layout.layoutRect, collapsedRect) || node->layout.needsLayoutClip;
         node->layout.layoutRect = collapsedRect;
         node->layout.lastArrangeSlot = finalSlot;
         node->layout.needsLayoutClip = false;
         node->layout.hasValidArrange = true;
+        if (!hadValidArrangeBefore ||
+            std::fabs(prevW - node->layout.layoutRect.width) > 1e-4f ||
+            std::fabs(prevH - node->layout.layoutRect.height) > 1e-4f) {
+            world.BumpLayoutSizeEpoch();
+        }
         if (rectChanged) {
             node->dirtyFlags = static_cast<std::uint8_t>(node->dirtyFlags | VisualDirty_Transform | VisualDirty_Visual);
             world.MarkStructureDirty();
@@ -1696,10 +1709,18 @@ void ArrangeNode(
         customArrange &&
         (node->layout.layoutMode == LayoutMode::CustomCallback ||
          (node->callbackMask & VisualCallback_CustomArrange) != 0u)) {
+        const bool hadValidArrangeBefore = node->layout.hasValidArrange;
+        const float prevW = node->layout.layoutRect.width;
+        const float prevH = node->layout.layoutRect.height;
         const bool rectChanged = !SameRectExact(node->layout.layoutRect, finalSlot) || vbChanged;
         node->layout.layoutRect = finalSlot;
         node->layout.lastArrangeSlot = finalSlot;
         node->layout.hasValidArrange = true;
+        if (!hadValidArrangeBefore ||
+            std::fabs(prevW - node->layout.layoutRect.width) > 1e-4f ||
+            std::fabs(prevH - node->layout.layoutRect.height) > 1e-4f) {
+            world.BumpLayoutSizeEpoch();
+        }
         if (rectChanged) {
             node->dirtyFlags = static_cast<std::uint8_t>(node->dirtyFlags | VisualDirty_Transform | VisualDirty_Visual);
             world.MarkStructureDirty();
@@ -1816,10 +1837,18 @@ void ArrangeNode(
     }
 
     const Rect newLayoutRect{posX, posY, targetW, targetH};
+    const bool hadValidArrangeBefore = node->layout.hasValidArrange;
+    const float prevW = node->layout.layoutRect.width;
+    const float prevH = node->layout.layoutRect.height;
     const bool prevRectChanged = !SameRectExact(node->layout.layoutRect, newLayoutRect) || vbChanged;
     node->layout.layoutRect = newLayoutRect;
     node->layout.lastArrangeSlot = finalSlot;
     node->layout.hasValidArrange = true;
+    if (!hadValidArrangeBefore ||
+        std::fabs(prevW - node->layout.layoutRect.width) > 1e-4f ||
+        std::fabs(prevH - node->layout.layoutRect.height) > 1e-4f) {
+        world.BumpLayoutSizeEpoch();
+    }
 
     const float pL = std::max(0.0f, node->layout.padding.left);
     const float pT = std::max(0.0f, node->layout.padding.top);
@@ -1852,24 +1881,8 @@ void ArrangeNode(
         (static_cast<Stretch>(std::clamp(node->layout.layoutInt0, 0, 3)) == Stretch::UniformToFill);
     bool childOverflows = false;
     if ((constrainedW || constrainedH) && node->layout.layoutMode != LayoutMode::Canvas && (!isViewbox || viewboxUniformToFill)) {
-        bool allVisibleNonNegMarginH = true;
-        bool allVisibleNonNegMarginV = true;
-        for (VisualNodeId cid : node->children) {
-            const VisualNode* ch = world.GetNode(cid);
-            if (!ch || ch->layout.visibility == Visibility::Collapsed) {
-                continue;
-            }
-            if ((std::isfinite(ch->layout.margin.left) && ch->layout.margin.left < 0.0f) ||
-                (std::isfinite(ch->layout.margin.right) && ch->layout.margin.right < 0.0f)) {
-                allVisibleNonNegMarginH = false;
-            }
-            if ((std::isfinite(ch->layout.margin.top) && ch->layout.margin.top < 0.0f) ||
-                (std::isfinite(ch->layout.margin.bottom) && ch->layout.margin.bottom < 0.0f)) {
-                allVisibleNonNegMarginV = false;
-            }
-        }
-        if ((constrainedW && (explicitW || allVisibleNonNegMarginH) && targetW + 0.5f < node->layout.unclampedContentBox.width) ||
-            (constrainedH && (explicitH || allVisibleNonNegMarginV) && targetH + 0.5f < node->layout.unclampedContentBox.height)) {
+        if ((constrainedW && targetW + 0.5f < node->layout.unclampedContentBox.width) ||
+            (constrainedH && targetH + 0.5f < node->layout.unclampedContentBox.height)) {
             childOverflows = true;
         } else if ((constrainedW || constrainedH) && !isViewbox && !node->children.empty()) {
             for (VisualNodeId cid : node->children) {
@@ -2318,6 +2331,7 @@ void VisualWorld::UpdateLayout(float viewportWidth, float viewportHeight) {
 
     // Clear geometry dirty bits; leave VisualDirty_Visual intact for VisualRenderAdapter::SyncPagedRenderTree.
     bool stillVisualDirty = false;
+    bool stillGeomDirty = false;
     for (std::size_t s = 0u; s < slots; ++s) {
         VisualNode* n = NodeAtSlot(s);
         if (!n) {
@@ -2325,10 +2339,14 @@ void VisualWorld::UpdateLayout(float viewportWidth, float viewportHeight) {
         }
         n->dirtyFlags = static_cast<std::uint8_t>(
             n->dirtyFlags & ~(VisualDirty_Layout | VisualDirty_Structure | VisualDirty_Transform));
+        if ((n->dirtyFlags & (VisualDirty_Layout | VisualDirty_Structure | VisualDirty_Transform)) != 0u) {
+            stillGeomDirty = true;
+        }
         if (n->dirtyFlags != VisualDirty_Clean || n->drawDirty) {
             stillVisualDirty = true;
         }
     }
+    layoutOrTransformDirty_ = stillGeomDirty;
     anyDirty_ = stillVisualDirty || structureDirty_;
 }
 

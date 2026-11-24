@@ -455,6 +455,7 @@ public class Hyperlink : ButtonBase {
 }
 
 public class ToggleButton : ButtonBase {
+    internal override int FastPropEpochCategory() { return 3; }
     private bool _isChecked = false;
     private bool _isIndeterminate = false;
     public bool IsThreeState { get; set; } = false;
@@ -943,6 +944,7 @@ public class GridSplitter : Thumb {
 }
 
 public class Track : FrameworkElement {
+    internal override int FastPropEpochCategory() { return 4; }
     private Orientation _orientation = Orientation.Horizontal;
     private float _min = 0.0f;
     private float _max = 100.0f;
@@ -963,27 +965,27 @@ public class Track : FrameworkElement {
 
     public Orientation Orientation {
         get { return _orientation; }
-        set { _orientation = value; UpdateTrackVisuals(); }
+        set { _orientation = value; BumpPropEpoch(); UpdateTrackVisuals(); }
     }
     public float Minimum {
         get { return _min; }
-        set { _min = value; UpdateTrackVisuals(); }
+        set { _min = value; BumpPropEpoch(); UpdateTrackVisuals(); }
     }
     public float Maximum {
         get { return _max; }
-        set { _max = value; UpdateTrackVisuals(); }
+        set { _max = value; BumpPropEpoch(); UpdateTrackVisuals(); }
     }
     public float Value {
         get { return _value; }
-        set { _value = value; UpdateTrackVisuals(); }
+        set { _value = value; BumpPropEpoch(); UpdateTrackVisuals(); }
     }
     public float ViewportSize {
         get { return _viewportSize; }
-        set { _viewportSize = value; UpdateTrackVisuals(); }
+        set { _viewportSize = value; BumpPropEpoch(); UpdateTrackVisuals(); }
     }
     public bool IsDirectionReversed {
         get { return _isDirectionReversed; }
-        set { _isDirectionReversed = value; UpdateTrackVisuals(); }
+        set { _isDirectionReversed = value; BumpPropEpoch(); UpdateTrackVisuals(); }
     }
     public UIElement DecreaseRepeatButton {
         get { return _decreaseRepeatButton; }
@@ -1333,12 +1335,22 @@ public class TickBar : CustomDrawElement {
 }
 
 public class RangeBase : Control {
+    internal override int FastPropEpochCategory() { return 4; }
     private float _min = 0.0f;
     private float _max = 100.0f;
     private float _value = 0.0f;
     private float _desiredValue = 0.0f;
-    public float SmallChange { get; set; } = 1.0f;
-    public float LargeChange { get; set; } = 10.0f;
+    private float _smallChange = 1.0f;
+    private float _largeChange = 10.0f;
+
+    public float SmallChange {
+        get { return _smallChange; }
+        set { _smallChange = value; BumpPropEpoch(); }
+    }
+    public float LargeChange {
+        get { return _largeChange; }
+        set { _largeChange = value; BumpPropEpoch(); }
+    }
 
     public event RoutedPropertyChangedEventHandler<float> ValueChanged;
 
@@ -1364,6 +1376,7 @@ public class RangeBase : Control {
         set {
             _min = value;
             if (_max < _min) { _max = _min; }
+            BumpPropEpoch();
             ApplyClampedValue();
             OnRangeUpdated();
             NotifyStateInvalidatedHooks();
@@ -1374,6 +1387,7 @@ public class RangeBase : Control {
         get { return _max; }
         set {
             _max = value < _min ? _min : value;
+            BumpPropEpoch();
             ApplyClampedValue();
             OnRangeUpdated();
             NotifyStateInvalidatedHooks();
@@ -2119,7 +2133,7 @@ public class ScrollBar : RangeBase {
 
     public Orientation Orientation {
         get { return _orientation; }
-        set { _orientation = value; OnRangeUpdated(); }
+        set { _orientation = value; BumpPropEpoch(); OnRangeUpdated(); }
     }
     public float ViewportSize {
         get { return _viewportSize; }

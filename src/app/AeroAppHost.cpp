@@ -631,6 +631,14 @@ namespace {
     }
     return false;
 }
+
+[[nodiscard]] std::string NormalizePathGenericUpperDrive(const std::filesystem::path& p) {
+    std::string out = p.lexically_normal().generic_string();
+    if (out.size() >= 2u && out[1] == ':' && out[0] >= 'a' && out[0] <= 'z') {
+        out[0] = static_cast<char>(out[0] - 'a' + 'A');
+    }
+    return out;
+}
 #endif
 
 } // namespace
@@ -677,7 +685,7 @@ bool DiscoverSampleProject(
         if (str::EqualsIgnoreCase(ext, ".xaml") || str::EqualsIgnoreCase(ext, ".axaml")) {
             DiscoveredXaml item;
             item.absPath = p;
-            item.normPath = p.generic_string();
+            item.normPath = NormalizePathGenericUpperDrive(p);
             const fs::path rel = p.lexically_relative(sampleRoot);
             item.lowerRel = ToLowerAscii(rel.generic_string());
             item.filename = fname;
@@ -768,10 +776,10 @@ bool DiscoverSampleProject(
         outCompileInput.xamlContent = xamls[entryIndex].content;
         if (outCompileInput.resourceSearchRoot.empty() && xamls[entryIndex].absPath.has_parent_path()) {
             outCompileInput.resourceSearchRoot =
-                xamls[entryIndex].absPath.parent_path().lexically_normal().generic_string();
+                NormalizePathGenericUpperDrive(xamls[entryIndex].absPath.parent_path());
         }
     } else if (outCompileInput.resourceSearchRoot.empty()) {
-        outCompileInput.resourceSearchRoot = sampleRoot.generic_string();
+        outCompileInput.resourceSearchRoot = NormalizePathGenericUpperDrive(sampleRoot);
     }
 
     std::unordered_set<std::string> seenAdditionalXamls;
@@ -804,7 +812,7 @@ bool DiscoverSampleProject(
         seenScripts.insert(existing.path);
     }
     for (const auto& sp : scripts) {
-        const std::string norm = sp.generic_string();
+        const std::string norm = NormalizePathGenericUpperDrive(sp);
         if (!seenScripts.insert(norm).second) {
             continue;
         }
@@ -827,7 +835,7 @@ bool DiscoverSampleProject(
         if (!fs::is_directory(dir, dirEc)) {
             return;
         }
-        const std::string norm = dir.lexically_normal().generic_string();
+        const std::string norm = NormalizePathGenericUpperDrive(dir);
         if (seenResourcePaths.insert(norm).second) {
             outCompileInput.resourceSearchPaths.push_back(norm);
         }
@@ -986,6 +994,7 @@ void AeroAppHost::WireKernelBridges() {
 
     platformHooks_.requestWake = [this]() {
         scriptWakeRequested_ = true;
+        pendingScriptSync_ = true;
         desktopHost_.TriggerWake();
         windowHost_.WakeEventLoop();
     };
@@ -1140,6 +1149,7 @@ std::string AeroAppHost::ResolveSoundAssetPath(std::string_view uri) const {
 void AeroAppHost::ResetLoadedProgramState() noexcept {
     closeRequested_ = false;
     inStepFrame_ = false;
+    pendingScriptSync_ = true;
     scheduledWakeAt_.reset();
     simObjectPin_.reset();
     simObject_ = ObjectRef{};
@@ -1196,6 +1206,7 @@ void AeroAppHost::ResolveDispatchSymbols() {
         symbols_.dispatchCustomMeasure = find("InputDispatcher::__AeroDispatchCustomMeasure");
         symbols_.dispatchDraw = find("InputDispatcher::__AeroDispatchDraw");
         symbols_.bindingFlush = find("BindingEngine::Flush");
+        symbols_.bindingFlushPostLayout = find("BindingEngine::FlushPostLayout");
         symbols_.bindingStepFrameTicks = find("BindingEngine::StepFrameTicks");
         symbols_.windowShow = find("Window::Show");
         symbols_.applyTemplate = find("FrameworkElement::ApplyTemplate");
@@ -1214,6 +1225,7 @@ void AeroAppHost::ResolveDispatchSymbols() {
         symbols_.dispatchCustomMeasure = find("InputDispatcher::__AeroDispatchCustomMeasure");
         symbols_.dispatchDraw = find("InputDispatcher::__AeroDispatchDraw");
         symbols_.bindingFlush = find("BindingEngine::Flush");
+        symbols_.bindingFlushPostLayout = find("BindingEngine::FlushPostLayout");
         symbols_.bindingStepFrameTicks = find("BindingEngine::StepFrameTicks");
         symbols_.windowShow = find("Window::Show");
         symbols_.applyTemplate = find("FrameworkElement::ApplyTemplate");
@@ -1258,9 +1270,7 @@ bool AeroAppHost::LoadProgramImageInternal(
 
     domains_.clearDesktopJitInvoker();
     interpreter_ = std::make_unique<Interpreter>(programImage_, domains_.uiHeapPtr());
-    simInterpreter_ = std::make_unique<Interpreter>(programImage_, domains_.simHeapPtr());
     domains_.attachInterpreter(*interpreter_, DomainKind::UiPresentation);
-    domains_.attachInterpreter(*simInterpreter_, DomainKind::SimDeterministic);
 
     if (!RegisterVisualHostBindings(
             *bindings_,
@@ -1278,10 +1288,12 @@ bool AeroAppHost::LoadProgramImageInternal(
     }
 
     interpreter_->setBindingRegistry(bindings_);
-    simInterpreter_->setBindingRegistry(bindings_);
+    if (domains_.hasSimStateTypes() || domains_.hasSimCommands()) {
+        (void)EnsureSimInterpreter();
+    }
 
 #ifdef AERO_HAS_STENCIL_JIT
-    if (realscript::jit::StencilJit::nativeAvailable()) {
+    if (config_.enableStencilJit && realscript::jit::StencilJit::nativeAvailable()) {
         const realscript::jit::StencilJit jitCompiler;
         realscript::jit::StencilJitOptions jitOpts{};
         jitOpts.enableNativeCodegen = true;
@@ -1550,6 +1562,21 @@ bool AeroAppHost::LoadAotProgram(
     return true;
 }
 
+Interpreter* AeroAppHost::EnsureSimInterpreter() const {
+    if (!simInterpreter_ && programImage_) {
+        simInterpreter_ = std::make_unique<Interpreter>(programImage_, domains_.simHeapPtr());
+        domains_.attachInterpreter(*simInterpreter_, DomainKind::SimDeterministic);
+        if (bindings_) {
+            simInterpreter_->setBindingRegistry(bindings_);
+        }
+    }
+    return simInterpreter_.get();
+}
+
+Interpreter* AeroAppHost::SimInterpreter() {
+    return EnsureSimInterpreter();
+}
+
 bool AeroAppHost::InvokeSymbol(
     SymbolId fnId,
     const std::vector<UnifiedValue>& args,
@@ -1560,8 +1587,8 @@ bool AeroAppHost::InvokeSymbol(
     }
     if (programImage_) {
         Interpreter* targetInterp =
-            (domain == DomainKind::SimDeterministic && simInterpreter_)
-                ? simInterpreter_.get()
+            (domain == DomainKind::SimDeterministic)
+                ? EnsureSimInterpreter()
                 : interpreter_.get();
         if (!targetInterp) {
             return false;
@@ -1736,9 +1763,11 @@ bool AeroAppHost::InstantiateAndMountEntry(std::string_view entryHint) {
             std::fflush(stderr);
         }
         if (ctorId != 0u) {
-            rs_rt::Limits ctorLimits{};
-            ctorLimits.instructionBudget = 128'000'000u;
-            const auto exec = interpreter_->invoke(ctorId, {UnifiedValue{*alloc}}, ctorLimits);
+            rs_rt::ExecutionOptions ctorOpts{};
+            ctorOpts.limits.instructionBudget = 128'000'000u;
+            ctorOpts.limits.gcWorkBudget = 0u;
+            const auto exec = domains_.invokeMethod(
+                DomainKind::UiPresentation, interpreter_.get(), ctorId, {UnifiedValue{*alloc}}, ctorOpts);
             if (!exec.succeeded) {
                 std::string stackSummary;
                 for (std::size_t si = 0u; si < exec.error.stackTrace.size() && si < 6u; ++si) {
@@ -2211,12 +2240,14 @@ bool AeroAppHost::MountScriptRootObject(ObjectRef candidate) {
         for (int pass = 0; pass < 3; ++pass) {
             world_.UpdateLayout(initW, initH);
             FlushBindings();
-            if (world_.FlushTrackB() == 0u && !world_.HasAnyDirty()) {
+            if (world_.FlushTrackB() == 0u && !world_.HasLayoutOrTransformDirty()) {
                 break;
             }
         }
-        world_.UpdateLayout(initW, initH);
-        FlushBindings();
+        if (world_.HasLayoutOrTransformDirty()) {
+            world_.UpdateLayout(initW, initH);
+            FlushBindings();
+        }
 
         bool invokedShow = false;
         if (deferredShowSym != 0u) {
@@ -2443,11 +2474,21 @@ void AeroAppHost::HandleCustomArrange(
     Rect) {}
 
 void AeroAppHost::FlushBindings() {
+    pendingScriptSync_ = false;
     if (symbols_.bindingFlush == 0u) {
         return;
     }
     domains_.setActiveDomain(DomainKind::UiPresentation);
     (void)InvokeSymbol(symbols_.bindingFlush, {}, nullptr, DomainKind::UiPresentation);
+}
+
+void AeroAppHost::FlushBindingsPostLayout() {
+    if (symbols_.bindingFlushPostLayout == 0u) {
+        FlushBindings();
+        return;
+    }
+    domains_.setActiveDomain(DomainKind::UiPresentation);
+    (void)InvokeSymbol(symbols_.bindingFlushPostLayout, {}, nullptr, DomainKind::UiPresentation);
 }
 
 bool AeroAppHost::DispatchPendingCanvasDraws() {
@@ -2515,6 +2556,10 @@ bool AeroAppHost::BindSimFloatColumn(
 }
 
 void AeroAppHost::StepFrame(float dtSeconds, bool forceRenderSync) {
+    StepFrameInternal(dtSeconds, forceRenderSync, false);
+}
+
+void AeroAppHost::StepFrameInternal(float dtSeconds, bool forceRenderSync, bool skipScriptFrameCallbacks) {
     if (!initialized_ || inStepFrame_) {
         return;
     }
@@ -2535,9 +2580,11 @@ void AeroAppHost::StepFrame(float dtSeconds, bool forceRenderSync) {
     // 1. Optional Sim domain tick callback & script SimState advance
     bool simUpdated = false;
     if (simTickCallback_) {
-        domains_.setActiveDomain(DomainKind::SimDeterministic);
-        simTickCallback_(dt, *this);
-        domains_.setActiveDomain(DomainKind::UiPresentation);
+        if (!skipScriptFrameCallbacks) {
+            domains_.setActiveDomain(DomainKind::SimDeterministic);
+            simTickCallback_(dt, *this);
+            domains_.setActiveDomain(DomainKind::UiPresentation);
+        }
         simUpdated = true;
     }
     if (simObject_.valid() && dt > 0.0f) {
@@ -2558,8 +2605,10 @@ void AeroAppHost::StepFrame(float dtSeconds, bool forceRenderSync) {
         }
         domains_.setActiveDomain(DomainKind::SimDeterministic);
         std::size_t ran = 0u;
-        if (simInterpreter_) {
-            ran = domains_.flushSimCommands(*simInterpreter_);
+        if (programImage_) {
+            if (Interpreter* simInterp = EnsureSimInterpreter()) {
+                ran = domains_.flushSimCommands(*simInterp);
+            }
         } else if (simAotContext_) {
             ran = domains_.flushSimCommands(*simAotContext_);
         }
@@ -2573,8 +2622,10 @@ void AeroAppHost::StepFrame(float dtSeconds, bool forceRenderSync) {
     simUpdated |= flushPendingSim();
 
     // 3. Queued pointer / keyboard / text input dispatch
+    std::size_t flushedInputCount = 0u;
     if (inputRouter_.HasPendingEvents()) {
-        if (inputRouter_.FlushQueuedEvents() > 0u) {
+        flushedInputCount = inputRouter_.FlushQueuedEvents();
+        if (flushedInputCount > 0u) {
             desktopHost_.NotifyDirtyObjects();
             desktopHost_.NotifyDirtyLayout();
         }
@@ -2588,9 +2639,10 @@ void AeroAppHost::StepFrame(float dtSeconds, bool forceRenderSync) {
             rootObject_, "SyncHudFromSim", {}, nullptr, DomainKind::UiPresentation);
     }
 
-    if (dt > 0.0f) {
+    bool ranStepGame = false;
+    if (!skipScriptFrameCallbacks && dt > 0.0f) {
         if (symbols_.stepGame != 0u && rootObject_.valid()) {
-            (void)InvokeSymbol(
+            ranStepGame = InvokeSymbol(
                 symbols_.stepGame,
                 {UnifiedValue{rootObject_}, UnifiedValue{FloatValue{dt}}},
                 nullptr,
@@ -2606,21 +2658,43 @@ void AeroAppHost::StepFrame(float dtSeconds, bool forceRenderSync) {
     }
 
     // 4. Track-B zero-alloc C++ ECS column synchronization (authoritative after script sync)
-    if (world_.FlushTrackB() > 0u) {
+    const std::size_t trackBCount = world_.FlushTrackB();
+    if (trackBCount > 0u) {
         desktopHost_.NotifyDirtyObjects();
     }
 
     // 5. Declarative BindingEngine synchronization (OneWay / TwoWay / Multi)
-    logTrace("FlushBindings");
-    FlushBindings();
+    const bool hadScriptWake = scriptWakeRequested_;
+    bool ranFlushThisFrame = false;
+    const bool needsPreAnimFlush =
+        !animEngine_.HasActiveAnimations() ||
+        pendingScriptSync_ ||
+        hadScriptWake ||
+        simUpdated ||
+        (flushedInputCount > 0u) ||
+        ranStepGame ||
+        (trackBCount > 0u) ||
+        forceRenderSync;
+    if (needsPreAnimFlush) {
+        logTrace("FlushBindings");
+        FlushBindings();
+        ranFlushThisFrame = true;
+    }
 
     // 6. VisualAnimationEngine tick + async UI tasks
-    (void)domains_.stepAllUiTasks(interpreter_.get());
+    const std::size_t uiTasksStepped = domains_.stepAllUiTasks(interpreter_.get());
     if (animEngine_.HasActiveAnimations()) {
         if (animEngine_.Tick(dt, world_)) {
             desktopHost_.NotifyDirtyLayout();
         }
-        FlushBindings();
+        if (animEngine_.LastTickNeededScriptSync() ||
+            uiTasksStepped > 0u ||
+            pendingScriptSync_ ||
+            scriptWakeRequested_) {
+            logTrace("FlushBindings");
+            FlushBindings();
+            ranFlushThisFrame = true;
+        }
         const bool stillActive = animEngine_.HasActiveAnimations();
         desktopHost_.SetActiveAnimations(stillActive);
         if (!stillActive) {
@@ -2645,8 +2719,10 @@ void AeroAppHost::StepFrame(float dtSeconds, bool forceRenderSync) {
     const Size targetViewport{vpW, vpH};
     const bool scriptViewportChanged = (lastNotifiedViewport_ != targetViewport);
     const bool viewportChanged = scriptViewportChanged || (world_.LastLayoutViewport() != targetViewport);
+    const bool hadLayoutDirtyBefore = world_.HasLayoutOrTransformDirty();
     const bool hadDirtyBeforeLayout = world_.HasAnyDirty();
-    if (forceRenderSync || viewportChanged || hadDirtyBeforeLayout) {
+    if (forceRenderSync || viewportChanged || hadLayoutDirtyBefore) {
+        const std::int32_t prevSizeEpoch = world_.LayoutSizeEpoch();
         logTrace("UpdateLayout");
         world_.UpdateLayout(vpW, vpH);
         if (scriptViewportChanged && rootObject_.valid()) {
@@ -2659,11 +2735,24 @@ void AeroAppHost::StepFrame(float dtSeconds, bool forceRenderSync) {
         } else if (rootObject_.valid()) {
             lastNotifiedViewport_ = targetViewport;
         }
-        FlushBindings();
-        if (world_.FlushTrackB() > 0u || world_.HasAnyDirty()) {
+        const bool layoutSizesChanged = (world_.LayoutSizeEpoch() != prevSizeEpoch);
+        if (forceRenderSync ||
+            viewportChanged ||
+            layoutSizesChanged ||
+            ranFlushThisFrame ||
+            pendingScriptSync_ ||
+            scriptWakeRequested_) {
+            FlushBindingsPostLayout();
+        }
+        if (world_.FlushTrackB() > 0u || world_.HasLayoutOrTransformDirty()) {
+            const std::int32_t prevSizeEpoch2 = world_.LayoutSizeEpoch();
             world_.UpdateLayout(vpW, vpH);
-            FlushBindings();
-            if (world_.HasAnyDirty()) {
+            if (world_.LayoutSizeEpoch() != prevSizeEpoch2 ||
+                pendingScriptSync_ ||
+                scriptWakeRequested_) {
+                FlushBindingsPostLayout();
+            }
+            if (world_.HasLayoutOrTransformDirty()) {
                 world_.UpdateLayout(vpW, vpH);
             }
         }
@@ -2677,8 +2766,8 @@ void AeroAppHost::StepFrame(float dtSeconds, bool forceRenderSync) {
     const bool needSync = forceRenderSync || drawUpdated || viewportChanged || hadDirtyBeforeLayout ||
                           world_.HasAnyDirty() ||
                           (renderTree_.NodeCount() == 0u && world_.Root().IsValid());
-    const bool willTickWindowHost = windowHost_.IsInitialized() &&
-        (needSync || forceRenderSync || !desktopHost_.CanSleepIdle());
+    const bool willTickWindowHost = hasLiveWindow &&
+        (needSync || forceRenderSync || windowHost_.NeedsInitialPresent());
     if (needSync) {
         if (hasLiveWindow) {
             const float dpi = std::max(0.25f, windowHost_.DpiScale());
@@ -2704,7 +2793,7 @@ void AeroAppHost::StepFrame(float dtSeconds, bool forceRenderSync) {
 
     if (willTickWindowHost) {
         logTrace("TickAndPresentFrame");
-        (void)windowHost_.TickAndPresentFrame(0.0f, forceRenderSync || needSync);
+        (void)windowHost_.TickAndPresentFrame(0.0f, forceRenderSync || viewportChanged);
     }
     if (domains_.uiHeap().phase() == rs_rt::GcPhase::Idle &&
         domains_.uiHeap().nurserySize() >= 4096u) {
@@ -2752,6 +2841,12 @@ bool AeroAppHost::RenderHeadlessRgba(
         (windowHost_.IsInitialized() &&
          (windowHost_.Width() != width || windowHost_.Height() != height));
     StepFrame(0.0f, mustForce);
+    if (windowHost_.IsInitialized() &&
+        windowHost_.Mode() == NativeWindowMode::HeadlessSoftware &&
+        windowHost_.Width() == width &&
+        windowHost_.Height() == height) {
+        (void)windowHost_.TickAndPresentFrame(0.0f, true);
+    }
 
     std::uint32_t capW = 0u;
     std::uint32_t capH = 0u;
@@ -3028,11 +3123,13 @@ std::uint64_t AeroAppHost::RunWindowedLoop(std::uint64_t maxFrames) {
                 lastActiveTick = now;
                 hasLastActiveTick = true;
                 if (symbols_.stepGame != 0u && rootObject_.valid()) {
-                    (void)InvokeSymbol(
-                        symbols_.stepGame,
-                        {UnifiedValue{rootObject_}, UnifiedValue{FloatValue{activeStepDt}}},
-                        nullptr,
-                        DomainKind::UiPresentation);
+                    if (InvokeSymbol(
+                            symbols_.stepGame,
+                            {UnifiedValue{rootObject_}, UnifiedValue{FloatValue{activeStepDt}}},
+                            nullptr,
+                            DomainKind::UiPresentation)) {
+                        pendingScriptSync_ = true;
+                    }
                 }
             }
             float timerDt = 0.016f;
@@ -3060,8 +3157,10 @@ std::uint64_t AeroAppHost::RunWindowedLoop(std::uint64_t maxFrames) {
         }
         if (domains_.pendingSimCommandCount() > 0u) {
             domains_.setActiveDomain(DomainKind::SimDeterministic);
-            if (simInterpreter_) {
-                (void)domains_.flushSimCommands(*simInterpreter_);
+            if (programImage_) {
+                if (Interpreter* simInterp = EnsureSimInterpreter()) {
+                    (void)domains_.flushSimCommands(*simInterp);
+                }
             } else if (simAotContext_) {
                 (void)domains_.flushSimCommands(*simAotContext_);
             }
@@ -3079,28 +3178,13 @@ std::uint64_t AeroAppHost::RunWindowedLoop(std::uint64_t maxFrames) {
             scriptWakeRequested_ ||
             world_.HasAnyDirty() ||
             animEngine_.HasActiveAnimations()) {
-            FlushBindings();
-            if (animEngine_.HasActiveAnimations()) {
-                if (animEngine_.Tick(activeStepDt, world_)) {
-                    desktopHost_.NotifyDirtyLayout();
-                }
-                FlushBindings();
-                const bool stillActive = animEngine_.HasActiveAnimations();
-                desktopHost_.SetActiveAnimations(stillActive);
-                if (!stillActive) {
-                    desktopHost_.NotifyDirtyObjects();
-                    desktopHost_.NotifyDirtyLayout();
-                }
-                followUpDirty = true;
+            if (wakeBeforePump || scheduledWakeDue || scriptWakeRequested_ || osEventsArrived) {
+                pendingScriptSync_ = true;
             }
-        }
-        if (world_.HasAnyDirty()) {
-            followUpDirty = true;
-        }
-        if (followUpDirty) {
-            StepFrame(0.0f, viewportChanged || windowHost_.NeedsPresent());
+            const float stepDt = (!idleAllowed) ? activeStepDt : 0.0f;
+            StepFrameInternal(stepDt, viewportChanged || windowHost_.NeedsInitialPresent(), true);
         } else if (DispatchPendingCanvasDraws()) {
-            StepFrame(0.0f, true);
+            StepFrameInternal(0.0f, true, true);
         } else if (!idleAllowed) {
             if (domains_.uiHeap().phase() == rs_rt::GcPhase::Idle &&
                 domains_.uiHeap().nurserySize() >= 4096u) {
@@ -3218,6 +3302,9 @@ bool AeroAppHost::InvokeScriptFunction(
     const DomainKind prevDomain = domains_.activeDomain();
     domains_.setActiveDomain(domain);
     const bool ok = InvokeSymbol(fnId, args, outResult, domain);
+    if (ok) {
+        pendingScriptSync_ = true;
+    }
     domains_.setActiveDomain(prevDomain);
     return ok;
 }
@@ -3263,6 +3350,9 @@ bool AeroAppHost::InvokeScriptMethod(
     const DomainKind prevDomain = domains_.activeDomain();
     domains_.setActiveDomain(domain);
     const bool ok = InvokeSymbol(fnId, fullArgs, outResult, domain);
+    if (ok) {
+        pendingScriptSync_ = true;
+    }
     domains_.setActiveDomain(prevDomain);
     return ok;
 }

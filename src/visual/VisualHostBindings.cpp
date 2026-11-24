@@ -1294,6 +1294,9 @@ bool RegisterVisualHostBindings(
             static_cast<VisualLayoutRectQuery>(ArgInt(args, 1, 0)));
         return MakeRtFloat(val);
     });
+    ok &= bindFn("Visual_GetWorldLayoutEpoch", [&world](const rs_bc::FunctionReference&, rs_rt::ValueSpan, rs_rt::RuntimeError&) -> std::optional<rs_rt::Value> {
+        return rs_rt::Value{static_cast<std::int64_t>(world.LayoutSizeEpoch())};
+    });
     ok &= bindFn("Visual_ScreenToLocal", [&world](const rs_bc::FunctionReference&, rs_rt::ValueSpan args, rs_rt::RuntimeError&) -> std::optional<rs_rt::Value> {
         const Point local = world.ScreenToLocal(ArgNode(args, 0, world), Point{ArgFloat(args, 1), ArgFloat(args, 2)});
         return MakeRtFloat((ArgInt(args, 3, 0) == 0) ? local.x : local.y);
@@ -1863,6 +1866,10 @@ bool RegisterVisualHostBindings(
             static_cast<std::int32_t>(ArgInt(args, 0, 0)),
             ArgUInt(args, 1, 0u)));
     });
+    ok &= bindFn("Anim_MarkTrackScriptSync", [&animEngine](const rs_bc::FunctionReference&, rs_rt::ValueSpan args, rs_rt::RuntimeError&) -> std::optional<rs_rt::Value> {
+        animEngine.MarkTrackScriptSync(static_cast<std::int32_t>(ArgInt(args, 0, 0)));
+        return rs_rt::Value{std::int64_t{0}};
+    });
     ok &= bindFn("Host_SetPointerCapture", [&world, &inputRouter](const rs_bc::FunctionReference&, rs_rt::ValueSpan args, rs_rt::RuntimeError&) -> std::optional<rs_rt::Value> {
         inputRouter.SetPointerCapture(ArgNode(args, 0, world));
         return rs_rt::Value{std::int64_t{0}};
@@ -2264,8 +2271,8 @@ bool RegisterVisualHostBindings(
             if (typeId == 0u || !reflectEnv.domains || !reflectEnv.domains->isTypeObservable(typeId)) {
                 return rs_rt::Value{static_cast<std::int64_t>(-1)};
             }
-            const std::uint64_t mask = heap->peekDirtyMask(target);
-            return rs_rt::Value{static_cast<std::int64_t>(mask)};
+            const std::uint64_t ver = heap->peekMutationVersion(target);
+            return rs_rt::Value{static_cast<std::int64_t>(ver)};
         }
         return rs_rt::Value{static_cast<std::int64_t>(-1)};
     });

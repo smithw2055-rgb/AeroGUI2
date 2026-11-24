@@ -105,6 +105,7 @@ VisualNodeId VisualWorld::CreateNode(VisualKind kind) {
     node.nativeHandle = handleRegistry_->createBorrowed(visualNodeTypeId_, &node, false);
     ++liveCount_;
     structureDirty_ = true;
+    layoutOrTransformDirty_ = true;
     ++structureVersion_;
     anyDirty_ = true;
     return node.id;
@@ -143,6 +144,7 @@ bool VisualWorld::DestroyNode(VisualNodeId id) {
     }
     ++destroyedCount_;
     structureDirty_ = true;
+    layoutOrTransformDirty_ = true;
     ++structureVersion_;
     anyDirty_ = true;
     return true;
@@ -1173,9 +1175,27 @@ bool VisualWorld::SetVectorShape(
     float trimEnd) {
     VisualNode* node = GetNode(id);
     if (!node) return false;
+    const bool firstInit = (node->extras == nullptr);
     auto& vec = node->EnsureExtras().vector;
+    const bool geomChanged = firstInit || (vec.shapeKind != shapeKind) || (vec.pathOrParams != pathOrParams);
+    const bool layoutRelevantChanged =
+        geomChanged ||
+        (std::fabs(vec.strokeWidth - strokeWidth) > 1e-6f) ||
+        (vec.stretch != stretch) ||
+        (std::fabs(vec.trimStart - trimStart) > 1e-6f) ||
+        (std::fabs(vec.trimEnd - trimEnd) > 1e-6f);
+    const std::uint32_t prevFillRgba = vec.fillRgba;
+    const std::int32_t prevFillGrad = vec.fillGradId;
+    const std::uint32_t prevStrokeRgba = vec.strokeRgba;
+    const std::int32_t prevStrokeGrad = vec.strokeGradId;
+
     vec.shapeKind = shapeKind;
-    vec.pathOrParams.assign(pathOrParams);
+    if (geomChanged) {
+        vec.pathOrParams.assign(pathOrParams);
+        vec.cachedPathHash = 0u;
+        vec.cachedSvgBounds = Rect{};
+        vec.svgBoundsCached = false;
+    }
     vec.fillRgba = fillRgba;
     if (!vec.ownsMutableFillGrad || vec.baseFillGradId != fillGradId) {
         vec.fillGradId = fillGradId;
@@ -1192,7 +1212,21 @@ bool VisualWorld::SetVectorShape(
     vec.stretch = stretch;
     vec.trimStart = trimStart;
     vec.trimEnd = trimEnd;
-    MarkAncestorsDirty(id, VisualDirty_All);
+
+    const bool visualChanged =
+        layoutRelevantChanged ||
+        (prevFillRgba != vec.fillRgba) ||
+        (prevFillGrad != vec.fillGradId) ||
+        (prevStrokeRgba != vec.strokeRgba) ||
+        (prevStrokeGrad != vec.strokeGradId);
+    if (!visualChanged) {
+        return true;
+    }
+    if (layoutRelevantChanged) {
+        MarkAncestorsDirty(id, VisualDirty_All);
+    } else {
+        MarkDirty(id, VisualDirty_Visual);
+    }
     return true;
 }
 
@@ -1398,6 +1432,9 @@ void VisualWorld::MarkDirty(VisualNodeId id, VisualDirtyFlags flags) noexcept {
     if (VisualNode* node = GetNode(id)) {
         const std::uint8_t prev = node->dirtyFlags;
         node->dirtyFlags = static_cast<std::uint8_t>(prev | flags);
+        if ((flags & (VisualDirty_Structure | VisualDirty_Layout | VisualDirty_Transform)) != 0u) {
+            layoutOrTransformDirty_ = true;
+        }
         if ((flags & (VisualDirty_Structure | VisualDirty_Layout)) != 0u) {
             structureDirty_ = true;
             ++structureVersion_;
@@ -1426,6 +1463,7 @@ void VisualWorld::ClearDirtyFlags() noexcept {
     }
     dirtyNodes_.clear();
     structureDirty_ = false;
+    layoutOrTransformDirty_ = false;
     anyDirty_ = false;
 }
 
@@ -1462,6 +1500,7 @@ void VisualWorld::Clear() noexcept {
     liveCount_ = 0u;
     dirtyNodes_.clear();
     structureDirty_ = true;
+    layoutOrTransformDirty_ = true;
     ++structureVersion_;
     anyDirty_ = false;
 }
@@ -1501,6 +1540,7 @@ void VisualWorld::MarkAncestorsDirty(VisualNodeId id, VisualDirtyFlags flags) no
         cur = node->parent;
     }
     structureDirty_ = true;
+    layoutOrTransformDirty_ = true;
     ++structureVersion_;
     anyDirty_ = true;
 }

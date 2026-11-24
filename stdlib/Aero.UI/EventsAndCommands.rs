@@ -495,9 +495,11 @@ public interface INotifyPropertyChanged {
 }
 
 public class ObservableObject : DependencyObject, INotifyPropertyChanged {
+    private int _notifyEpoch = 0;
     public event PropertyChangedEventHandler PropertyChanged;
 
     public virtual void NotifyPropertyChanged(string propertyName = "") {
+        _notifyEpoch = _notifyEpoch >= 1000000000 ? 1 : (_notifyEpoch + 1);
         PropertyChanged(this, new PropertyChangedEventArgs(propertyName));
     }
 

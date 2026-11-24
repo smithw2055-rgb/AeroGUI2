@@ -274,6 +274,9 @@ struct VisualVectorData {
     std::uint8_t dashCap = 0u;
     std::uint8_t startLineCap = 0u;
     std::uint8_t endLineCap = 0u;
+    mutable std::uint64_t cachedPathHash = 0u;
+    mutable Rect cachedSvgBounds{};
+    mutable bool svgBoundsCached = false;
 };
 
 struct VisualLayoutData {
@@ -710,8 +713,11 @@ public:
 
     void MarkDirty(VisualNodeId id, VisualDirtyFlags flags) noexcept;
     [[nodiscard]] bool HasAnyDirty() const noexcept { return anyDirty_; }
+    [[nodiscard]] bool HasLayoutOrTransformDirty() const noexcept { return layoutOrTransformDirty_; }
     [[nodiscard]] bool IsStructureDirty() const noexcept { return structureDirty_; }
-    void MarkStructureDirty() noexcept { structureDirty_ = true; ++structureVersion_; anyDirty_ = true; }
+    void MarkStructureDirty() noexcept { structureDirty_ = true; layoutOrTransformDirty_ = true; ++structureVersion_; anyDirty_ = true; }
+    [[nodiscard]] std::int32_t LayoutSizeEpoch() const noexcept { return layoutSizeEpoch_; }
+    void BumpLayoutSizeEpoch() noexcept { layoutSizeEpoch_ = (layoutSizeEpoch_ >= 1000000000) ? 1 : (layoutSizeEpoch_ + 1); }
     [[nodiscard]] std::uint64_t WorldInstanceId() const noexcept { return worldInstanceId_; }
     [[nodiscard]] std::uint64_t StructureVersion() const noexcept { return structureVersion_; }
     [[nodiscard]] const std::vector<VisualNodeId>& DirtyNodes() const noexcept { return dirtyNodes_; }
@@ -747,7 +753,9 @@ private:
     std::uint64_t destroyedCount_ = 0u;
     std::uint64_t worldInstanceId_ = 0u;
     std::uint64_t structureVersion_ = 1u;
+    std::int32_t layoutSizeEpoch_ = 1;
     bool anyDirty_ = false;
+    bool layoutOrTransformDirty_ = true;
     bool structureDirty_ = true;
     std::vector<VisualNodeId> dirtyNodes_;
     std::vector<VisualEcsColumnBinding> ecsBindings_;

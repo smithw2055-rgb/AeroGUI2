@@ -208,6 +208,8 @@ public class Popup : FrameworkElement {
 
     public override string GetTypeName() { return "Popup"; }
 
+    internal override bool IsClosedPopupBoundary() { return !_isOpen; }
+
     internal override bool DetachNonTemplateUserContent(UIElement owner, UIElement[] q) {
         UIElement popChild = Child;
         if (popChild != null) {
@@ -240,9 +242,13 @@ public class Popup : FrameworkElement {
             UIElement oldTarget = _placementTarget;
             _placementTarget = value;
             if (value != null) {
-                _logicalParent = value;
-            } else if (_logicalParent == oldTarget) {
+                if (_logicalParent != value) {
+                    _logicalParent = value;
+                    BumpSubtreeAncestorEpoch();
+                }
+            } else if (_logicalParent == oldTarget && _logicalParent != null) {
                 _logicalParent = null;
+                BumpSubtreeAncestorEpoch();
             }
             UpdatePosition();
         }
@@ -274,7 +280,10 @@ public class Popup : FrameworkElement {
             _child = null;
         }
         _placementTarget = null;
-        _logicalParent = null;
+        if (_logicalParent != null) {
+            _logicalParent = null;
+            BumpSubtreeAncestorEpoch();
+        }
         _attachedRoot = null;
     }
 
@@ -290,6 +299,7 @@ public class Popup : FrameworkElement {
             }
             if (_isOpen == value) { return; }
             _isOpen = value;
+            BumpSubtreeAncestorEpoch();
             if (_isOpen) {
                 AttachToOverlayIfNeeded();
                 Visibility = Visibility.Visible;
@@ -309,7 +319,10 @@ public class Popup : FrameworkElement {
         UIElement anchor = _placementTarget != null
             ? _placementTarget
             : (TemplatedParent != null ? TemplatedParent : (_logicalParent != null ? _logicalParent : Parent));
-        if (anchor != null) { _logicalParent = anchor; }
+        if (anchor != null && _logicalParent != anchor) {
+            _logicalParent = anchor;
+            BumpSubtreeAncestorEpoch();
+        }
         UIElement overlay = PopupService.ResolveOverlayCanvas(anchor);
         UIElement self = this;
         if (overlay == null || overlay == self) { return; }
@@ -764,6 +777,8 @@ public class MenuItem : HeaderedItemsControl {
     private TextBlock _checkGlyph;
     private TextBlock _gestureText;
     private TextBlock _arrowGlyph;
+
+    internal override int FastPropEpochCategory() { return 10; }
 
     public event RoutedEventHandler Click;
     public event RoutedEventHandler Checked;
@@ -1520,6 +1535,7 @@ internal class ArrayCollectionBox : DependencyObject, ICollectionNotifier {
 }
 
 public class TreeViewItem : HeaderedItemsControl {
+    internal override int FastPropEpochCategory() { return 9; }
     private bool _isExpanded = false;
     private bool _isSelected = false;
     private TreeView _ownerTree;
@@ -1990,6 +2006,7 @@ public class TreeView : ItemsControl {
 // 4. UserControl, Page, Window & Application
 // ============================================================================
 
+[Observable]
 public class UserControl : ContentControl {
     public UserControl() : base() {
         IsTabStop = false;
@@ -1998,12 +2015,14 @@ public class UserControl : ContentControl {
     }
     public override string GetTypeName() { return "UserControl"; }
     public override bool IsNamescopeBoundary() { return true; }
+    internal override int FastPropEpochCategory() { return 0; }
     protected override void OnBoxAppearanceChanged() {
         base.OnBoxAppearanceChanged();
         UpdateInheritedForegroundForBackground(Background);
     }
 }
 
+[Observable]
 public class Page : ContentControl {
     public string Title { get; set; } = "";
     public string WindowTitle { get; set; } = "";
@@ -2014,12 +2033,14 @@ public class Page : ContentControl {
     }
     public override string GetTypeName() { return "Page"; }
     public override bool IsNamescopeBoundary() { return true; }
+    internal override int FastPropEpochCategory() { return 0; }
     protected override void OnBoxAppearanceChanged() {
         base.OnBoxAppearanceChanged();
         UpdateInheritedForegroundForBackground(Background);
     }
 }
 
+[Observable]
 public class Window : ContentControl {
     public string Title { get; set; } = "Aero Window";
     public string Icon { get; set; } = "";
@@ -2031,6 +2052,7 @@ public class Window : ContentControl {
     public event EventHandler Activated;
 
     public bool IsActive { get { return _isActive; } }
+    internal override int FastPropEpochCategory() { return 0; }
 
     public Window() : base() {
         ThemeManager.EnsureInitialized();

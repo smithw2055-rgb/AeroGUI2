@@ -242,6 +242,12 @@ public:
     void setDesktopJitInvoker(DesktopJitInvokerFn invoker);
     void clearDesktopJitInvoker() noexcept;
     [[nodiscard]] bool hasDesktopJitInvoker() const noexcept;
+    [[nodiscard]] bool hasSimCommands() const noexcept {
+        return hasSimCommands_.load(std::memory_order_acquire);
+    }
+    [[nodiscard]] bool hasSimStateTypes() const noexcept {
+        return hasSimStateTypes_.load(std::memory_order_acquire);
+    }
 
     [[nodiscard]] realscript::runtime::IExecutionPolicy* executionPolicy(DomainKind domain) noexcept {
         return (domain == DomainKind::SimDeterministic)
@@ -295,6 +301,9 @@ private:
     public:
         DomainPolicy(ExecutionDomainContext* owner, DomainKind domain) noexcept
             : owner_(owner), domain_(domain) {}
+
+        [[nodiscard]] bool interceptsCalls() const noexcept override;
+        [[nodiscard]] bool interceptsSameHeapWrites() const noexcept override;
 
         [[nodiscard]] realscript::runtime::ManagedHeap* resolveHeap(
             realscript::runtime::ObjectRef reference,
@@ -412,6 +421,7 @@ private:
     std::shared_ptr<const DesktopJitInvokerFn> desktopJitInvoker_{};
     std::atomic<bool> hasDesktopJitInvoker_{false};
     mutable std::atomic<bool> hasSimCommands_{false};
+    mutable std::atomic<bool> hasSimStateTypes_{false};
     mutable std::atomic<std::uint64_t> desktopJitInvokeHits_{0u};
     mutable std::atomic<std::uint64_t> desktopJitFallbackHits_{0u};
 };

@@ -103,7 +103,8 @@ private:
         bool has3D,
         BlendingMode blend,
         float fillOpacity = 1.0f,
-        float strokeOpacity = 1.0f);
+        float strokeOpacity = 1.0f,
+        const VisualVectorData* cachedVec = nullptr);
 
     [[nodiscard]] static bool RasterizeVisualBrushToEntry(
         UIResourceStore* store,

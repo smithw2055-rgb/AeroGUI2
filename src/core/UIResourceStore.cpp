@@ -593,11 +593,19 @@ bool UIResourceStore::GetOrRasterizePathMask(
     const std::uint32_t clampedH = std::clamp<std::uint32_t>(innerH, 1u, 2048u);
     const std::uint32_t clampedPad = std::min<std::uint32_t>(padPx, 64u);
 
-    std::uint64_t key = safeHash ^ 0x9E3779B97F4A7C15ULL;
-    key ^= (static_cast<std::uint64_t>(clampedW) << 32u) | static_cast<std::uint64_t>(clampedH);
-    key *= 1099511628211ULL;
-    key ^= static_cast<std::uint64_t>(clampedPad);
-    key *= 1099511628211ULL;
+    auto makeMaskKey = [&](std::uint32_t w, std::uint32_t h) noexcept -> std::uint64_t {
+        std::uint64_t k = safeHash ^ 0x9E3779B97F4A7C15ULL;
+        k ^= (static_cast<std::uint64_t>(w) << 32u) | static_cast<std::uint64_t>(h);
+        k *= 1099511628211ULL;
+        k ^= static_cast<std::uint64_t>(clampedPad);
+        k *= 1099511628211ULL;
+        return k;
+    };
+
+    const std::uint64_t fillGroup = safeHash ^ 0xA5A5A5A500000001ULL;
+    std::uint32_t effW = clampedW;
+    std::uint32_t effH = clampedH;
+    std::uint64_t key = makeMaskKey(effW, effH);
 
     {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -606,20 +614,52 @@ bool UIResourceStore::GetOrRasterizePathMask(
             outEntry = it->second;
             return true;
         }
+        bool hasSameGroup = false;
+        for (const auto& kv : pathMaskEntries_) {
+            if (kv.second.groupHash == fillGroup) {
+                hasSameGroup = true;
+                break;
+            }
+        }
+        if (hasSameGroup) {
+            static constexpr std::uint32_t kBuckets[] = {
+                16u, 24u, 32u, 48u, 64u, 96u, 128u, 192u, 256u, 384u, 512u, 768u, 1024u, 1536u, 2048u
+            };
+            const std::uint32_t maxDim = std::max(clampedW, clampedH);
+            std::uint32_t bucketMax = 2048u;
+            for (const std::uint32_t b : kBuckets) {
+                if (b >= maxDim) {
+                    bucketMax = b;
+                    break;
+                }
+            }
+            if (maxDim > 0u && bucketMax != maxDim) {
+                const float scale = static_cast<float>(bucketMax) / static_cast<float>(maxDim);
+                effW = std::clamp<std::uint32_t>(
+                    static_cast<std::uint32_t>(std::lround(static_cast<float>(clampedW) * scale)), 1u, 2048u);
+                effH = std::clamp<std::uint32_t>(
+                    static_cast<std::uint32_t>(std::lround(static_cast<float>(clampedH) * scale)), 1u, 2048u);
+                key = makeMaskKey(effW, effH);
+                if (const auto bit = pathMaskEntries_.find(key); bit != pathMaskEntries_.end()) {
+                    bit->second.lastUsedTick = ++pathMaskAccessSeq_;
+                    outEntry = bit->second;
+                    return true;
+                }
+            }
+        }
     }
 
     std::vector<std::uint8_t> rgba8;
-    if (!RasterizeSvgPathFillAlphaMask(pathData, rawBounds, clampedW, clampedH, clampedPad, rgba8)) {
+    if (!RasterizeSvgPathFillAlphaMask(pathData, rawBounds, effW, effH, clampedPad, rgba8)) {
         return false;
     }
 
-    const std::uint32_t texW = clampedW + 2u * clampedPad;
-    const std::uint32_t texH = clampedH + 2u * clampedPad;
+    const std::uint32_t texW = effW + 2u * clampedPad;
+    const std::uint32_t texH = effH + 2u * clampedPad;
     const float u0 = static_cast<float>(clampedPad) / static_cast<float>(texW);
     const float v0 = static_cast<float>(clampedPad) / static_cast<float>(texH);
-    const float u1 = static_cast<float>(clampedPad + clampedW) / static_cast<float>(texW);
-    const float v1 = static_cast<float>(clampedPad + clampedH) / static_cast<float>(texH);
-    const std::uint64_t fillGroup = safeHash ^ 0xA5A5A5A500000001ULL;
+    const float u1 = static_cast<float>(clampedPad + effW) / static_cast<float>(texW);
+    const float v1 = static_cast<float>(clampedPad + effH) / static_cast<float>(texH);
     return StoreOrLookupPathMaskLocked(key, fillGroup, texW, texH, u0, v0, u1, v1, std::move(rgba8), outEntry);
 }
 
