@@ -408,6 +408,7 @@ private:
     mutable std::mutex mutex_;
     mutable std::unordered_map<realscript::semantic::SymbolId, TypeObservableMeta> typeMeta_;
     mutable std::unordered_map<realscript::semantic::SymbolId, bool> simCommandFunctions_;
+    mutable std::atomic<std::uint64_t> simCommandBloom_{0ull};
     mutable std::unordered_set<const void*> registeredImages_;
 
     // Keyed by ((heapId << 48) ^ ((slot << 32) | generation)) -> owners watching wrapper field 0

@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <cstdlib>
 #include <filesystem>
@@ -11,13 +12,29 @@
 
 #include "aero/app/AeroAppHost.hpp"
 #include "aero/core/StringUtils.hpp"
+#include "aero/runtime/AeroExecutionDomains.hpp"
+
+#if defined(_WIN32)
+#  ifndef WIN32_LEAN_AND_MEAN
+#    define WIN32_LEAN_AND_MEAN
+#  endif
+#  ifndef NOMINMAX
+#    define NOMINMAX
+#  endif
+#  include <windows.h>
+#  include <psapi.h>
+#elif defined(__APPLE__)
+#  include <mach/mach.h>
+#elif !defined(__EMSCRIPTEN__)
+#  include <unistd.h>
+#endif
 
 namespace {
 
 void PrintUsage() {
     std::printf(
         "aero-viewer v3.0 - AeroGUI 3.0 Sample & Composition Viewer\n"
-        "Usage: aero-viewer [options]\n"
+        "Usage: aero-viewer [options] [sample_dir|file.xaml|file.rs]\n"
         "  --dir <sample_dir>      Load sample directory (.xaml + .rs/.cs files)\n"
         "  --xaml <file.xaml>      Input XAML file (optional; repeatable via script inputs)\n"
         "  --rs <file.rs|file.cs>  Input RealScript / C#-compat file (repeatable)\n"
@@ -34,10 +51,44 @@ void PrintUsage() {
         "  --no-tree-shake         Disable stdlib AST/MIR reachability pruning\n"
         "  --software              Use low-memory Win32 GDI software presenter instead of OpenGL\n"
         "  --gpu                   Prefer hardware OpenGL presenter (default)\n"
-        "  --stdlib <dir>          Path to stdlib root directory\n"
-        "  --cache-dir <dir>       Use custom disk bytecode/stdlib cache directory\n"
-        "  --no-cache              Disable disk cache (default: enabled in user cache dir)\n"
+        "  --stdlib-dll <path>     Path to aerogui_stdlib DLL (default mode: DLL)\n"
+        "  --stdlib-source         Load stdlib from source files instead of aerogui_stdlib DLL\n"
+        "  --stdlib <dir>          Path to stdlib root directory (implies --stdlib-source)\n"
+        "  --cache-dir <dir>       Use custom disk bytecode/stdlib cache directory (source mode)\n"
+        "  --no-cache              Disable disk cache\n"
+        "  --profile-startup       Print startup, lazy-compile ratio, and working-set RSS metrics\n"
         "  -h, --help              Show this help\n");
+}
+
+[[nodiscard]] double QueryWorkingSetMb() noexcept {
+#if defined(_WIN32)
+    PROCESS_MEMORY_COUNTERS pmc{};
+    if (GetProcessMemoryInfo(GetCurrentProcess(), &pmc, sizeof(pmc))) {
+        return static_cast<double>(pmc.WorkingSetSize) / (1024.0 * 1024.0);
+    }
+    return 0.0;
+#elif defined(__APPLE__)
+    mach_task_basic_info info{};
+    mach_msg_type_number_t count = MACH_TASK_BASIC_INFO_COUNT;
+    if (task_info(mach_task_self(), MACH_TASK_BASIC_INFO,
+                  reinterpret_cast<task_info_t>(&info), &count) == KERN_SUCCESS) {
+        return static_cast<double>(info.resident_size) / (1024.0 * 1024.0);
+    }
+    return 0.0;
+#elif !defined(__EMSCRIPTEN__)
+    std::ifstream in("/proc/self/statm");
+    long pagesTotal = 0;
+    long pagesRss = 0;
+    if (in >> pagesTotal >> pagesRss) {
+        const long pageSz = ::sysconf(_SC_PAGESIZE);
+        if (pageSz > 0) {
+            return static_cast<double>(pagesRss * pageSz) / (1024.0 * 1024.0);
+        }
+    }
+    return 0.0;
+#else
+    return 0.0;
+#endif
 }
 
 [[nodiscard]] std::string ReadViewerEnvVar(const char* name) {
@@ -199,6 +250,8 @@ void AppendUniqueDir(std::vector<std::string>& list, const std::filesystem::path
 } // namespace
 
 int main(int argc, char** argv) {
+    const auto tProcStart = std::chrono::steady_clock::now();
+
     std::string sampleDir;
     std::string xamlPath;
     std::vector<std::string> scriptPaths;
@@ -216,9 +269,17 @@ int main(int argc, char** argv) {
     bool disableTreeShake = false;
     bool preferSoftware = false;
     bool softwareFlagSet = false;
+#ifdef __EMSCRIPTEN__
+    bool useStdlibDll = false;
+#else
+    bool useStdlibDll = true;
+#endif
+    bool stdlibDllFlagSet = false;
+    std::string stdlibDllPath;
     std::string stdlibDir;
     std::string cacheDir;
     bool allowCache = true;
+    bool profileStartup = false;
 
     for (int i = 1; i < argc; ++i) {
         const std::string_view arg(argv[i]);
@@ -293,10 +354,21 @@ int main(int argc, char** argv) {
         } else if (arg == "--gpu") {
             preferSoftware = false;
             softwareFlagSet = true;
+        } else if (arg == "--stdlib-dll") {
+            const char* v = needNext(arg);
+            if (!v) return 2;
+            stdlibDllPath = v;
+            useStdlibDll = true;
+            stdlibDllFlagSet = true;
+        } else if (arg == "--stdlib-source") {
+            useStdlibDll = false;
         } else if (arg == "--stdlib") {
             const char* v = needNext(arg);
             if (!v) return 2;
             stdlibDir = v;
+            if (!stdlibDllFlagSet) {
+                useStdlibDll = false;
+            }
         } else if (arg == "--cache-dir") {
             const char* v = needNext(arg);
             if (!v) return 2;
@@ -305,6 +377,27 @@ int main(int argc, char** argv) {
         } else if (arg == "--no-cache") {
             allowCache = false;
             cacheDir.clear();
+        } else if (arg == "--profile-startup") {
+            profileStartup = true;
+        } else if (!arg.empty() && arg.front() != '-') {
+            const std::filesystem::path posPath(arg);
+            std::error_code posEc;
+            if (std::filesystem::is_directory(posPath, posEc)) {
+                sampleDir = std::string(arg);
+            } else {
+                const std::string ext = posPath.extension().string();
+                if (aero::str::EqualsIgnoreCase(ext, ".xaml") ||
+                    aero::str::EqualsIgnoreCase(ext, ".axaml")) {
+                    xamlPath = std::string(arg);
+                } else if (aero::str::EqualsIgnoreCase(ext, ".rs") ||
+                           aero::str::EqualsIgnoreCase(ext, ".cs")) {
+                    scriptPaths.emplace_back(arg);
+                } else {
+                    std::cerr << "Unknown positional argument: " << arg << "\n";
+                    PrintUsage();
+                    return 2;
+                }
+            }
         } else {
             std::cerr << "Unknown option: " << arg << "\n";
             PrintUsage();
@@ -332,24 +425,34 @@ int main(int argc, char** argv) {
     }
 
     compileInput.includeStdlib = true;
-    compileInput.treeShakeStdlib = !disableTreeShake;
+    compileInput.useStdlibDll = useStdlibDll;
+    compileInput.stdlibDllPath = stdlibDllPath;
+    compileInput.retainStdlibDllCache = false;
+    compileInput.treeShakeStdlib = useStdlibDll ? false : !disableTreeShake;
     compileInput.optimizeBytecode = optimizeO2;
     compileInput.emitAotCpp = false;
-    compileInput.allowDiskCache = allowCache;
-    compileInput.allowStdlibCache = false;
     compileInput.compilerSession = nullptr;
-    if (allowCache) {
-        if (cacheDir.empty()) {
-            cacheDir = ResolveDefaultViewerCacheDir();
-        }
-        compileInput.cacheDir = cacheDir;
-    } else {
+    if (useStdlibDll) {
+        compileInput.allowDiskCache = false;
+        compileInput.allowStdlibCache = false;
         compileInput.cacheDir.clear();
-    }
-    if (!stdlibDir.empty()) {
-        compileInput.stdlibRootDir = stdlibDir;
-    } else if (compileInput.stdlibRootDir.empty()) {
-        compileInput.stdlibRootDir = ResolveDefaultStdlibDir(argc > 0 ? argv[0] : nullptr);
+        compileInput.stdlibRootDir.clear();
+    } else {
+        compileInput.allowDiskCache = allowCache;
+        compileInput.allowStdlibCache = false;
+        if (allowCache) {
+            if (cacheDir.empty()) {
+                cacheDir = ResolveDefaultViewerCacheDir();
+            }
+            compileInput.cacheDir = cacheDir;
+        } else {
+            compileInput.cacheDir.clear();
+        }
+        if (!stdlibDir.empty()) {
+            compileInput.stdlibRootDir = stdlibDir;
+        } else if (compileInput.stdlibRootDir.empty()) {
+            compileInput.stdlibRootDir = ResolveDefaultStdlibDir(argc > 0 ? argv[0] : nullptr);
+        }
     }
 
     if (!xamlPath.empty()) {
@@ -431,10 +534,48 @@ int main(int argc, char** argv) {
         return 1;
     }
 
+    auto printStartupProfile = [&](double firstFrameMs) {
+        if (!profileStartup) {
+            return;
+        }
+        const auto* cr = host.LastCompileResult();
+        const double dllMs = cr ? cr->stdlibDllLoadMs : 0.0;
+        const double compMs = cr ? cr->compileFrontendAndMirMs : 0.0;
+        const double lnkMs = cr ? cr->linkMs : 0.0;
+        const auto tNow = std::chrono::steady_clock::now();
+        const double totalMs = std::chrono::duration<double, std::milli>(tNow - tProcStart).count();
+        const auto prog = host.Program();
+        const std::size_t compiledLazy = prog ? prog->compiledLazyFunctionCount() : 0u;
+        const std::size_t totalLazy = prog ? prog->totalLazyFunctionCount() : 0u;
+        const double ratioPct = totalLazy > 0u
+            ? (100.0 * static_cast<double>(compiledLazy) / static_cast<double>(totalLazy))
+            : 0.0;
+        const double rssMb = QueryWorkingSetMb();
+        std::printf(
+            "[PROFILE] mode=%s dll_load_ms=%.2f compile_ms=%.2f link_ms=%.2f first_frame_ms=%.2f total_ms=%.2f lazy_compiled=%zu/%zu (%.1f%%) rss_mb=%.2f\n",
+            (cr && cr->usedStdlibDll) ? "dll" : "source",
+            dllMs,
+            compMs,
+            lnkMs,
+            firstFrameMs,
+            totalMs,
+            compiledLazy,
+            totalLazy,
+            ratioPct,
+            rssMb);
+        std::fflush(stdout);
+    };
+
     if (headless) {
         const std::uint64_t stepCount = framesSet ? std::max<std::uint64_t>(1u, frames) : 1u;
+        double firstFrameMs = 0.0;
         for (std::uint64_t f = 0u; f < stepCount; ++f) {
-            host.StepFrame(1.0f / 60.0f, false);
+            const auto tf0 = std::chrono::steady_clock::now();
+            host.StepFrame(1.0f / 60.0f, f + 1u == stepCount);
+            if (f == 0u) {
+                const auto tf1 = std::chrono::steady_clock::now();
+                firstFrameMs = std::chrono::duration<double, std::milli>(tf1 - tf0).count();
+            }
         }
 
         std::vector<std::uint8_t> rgba;
@@ -450,6 +591,7 @@ int main(int argc, char** argv) {
             std::cerr << "Failed to write PPM output: " << outPpmPath << "\n";
             return 1;
         }
+        printStartupProfile(firstFrameMs);
         std::printf(
             "aero-viewer headless OK (%ux%u, %llu frames, %zu nodes)\n",
             width,
@@ -458,6 +600,11 @@ int main(int argc, char** argv) {
             host.World().LiveNodeCount());
         return 0;
     }
+
+    const auto tf0 = std::chrono::steady_clock::now();
+    host.StepFrame(1.0f / 60.0f, true);
+    const auto tf1 = std::chrono::steady_clock::now();
+    printStartupProfile(std::chrono::duration<double, std::milli>(tf1 - tf0).count());
 
     std::printf(
         "aero-viewer window ready (%ux%u DIP, %ux%u px, %.2fx DPI).\n",

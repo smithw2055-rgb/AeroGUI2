@@ -1529,6 +1529,8 @@ void OpenGlDeviceBackend::Shutdown() noexcept {
     syncedMinGradRow_ = kUnifiedUiAtlasSize - 1u;
     syncedImageAtlasSweepRev_ = 0u;
     imageSlotTextures_.clear();
+    ringSlotTailZeroed_.clear();
+    ringSlotHasCustomClipW_.clear();
     uiAtlasScratchRgba8_.clear();
     imageUploadScratchRgba8_.clear();
     effectReadbackBottomUp_.clear();
@@ -1887,6 +1889,9 @@ bool OpenGlDeviceBackend::AllocateRingVertexBuffer(std::size_t maxPagesInRing) {
         defaultClipW.data(),
         kGlDynamicDraw);
 
+    ringSlotTailZeroed_.assign(maxPagesInRing_, 0u);
+    ringSlotHasCustomClipW_.assign(maxPagesInRing_, 0u);
+
     if (vaoId_ != 0u && quadEboId_ != 0u) {
         BindAeroVertexLayout();
     }
@@ -2173,12 +2178,21 @@ AeroGLuint OpenGlDeviceBackend::ResolveBatchImageTexture(
     GlImageSlotState& slot = imageSlotTextures_[textureId];
     std::uint32_t slotW = 0u;
     std::uint32_t slotH = 0u;
+    std::uint32_t dirtyX = 0u, dirtyY = 0u, dirtyW = 0u, dirtyH = 0u;
     bool wasUpdated = false;
-    if (!imageAtlas.CopyTextureSlotIfModified(
+    const bool needsInitialFull = (slot.texId == 0u);
+    if (needsInitialFull) {
+        slot.slotRevision = 0u;
+    }
+    if (!imageAtlas.CopyTextureSlotDirtySubRectIfModified(
             textureId,
             slot.slotRevision,
             slotW,
             slotH,
+            dirtyX,
+            dirtyY,
+            dirtyW,
+            dirtyH,
             imageUploadScratchRgba8_,
             wasUpdated) ||
         slotW == 0u ||
@@ -2188,14 +2202,17 @@ AeroGLuint OpenGlDeviceBackend::ResolveBatchImageTexture(
 
     slot.lastGlobalRevision = globalRev;
     const bool needsAlloc = (slot.texId == 0u) || (slot.width != slotW) || (slot.height != slotH);
-    if (needsAlloc && !wasUpdated) {
-        // Re-fetch full pixel buffer if GL texture handle was recreated after Shutdown/Initialize
+    if (needsAlloc && (!wasUpdated || dirtyW != slotW || dirtyH != slotH)) {
         slot.slotRevision = 0u;
-        if (!imageAtlas.CopyTextureSlotIfModified(
+        if (!imageAtlas.CopyTextureSlotDirtySubRectIfModified(
                 textureId,
                 slot.slotRevision,
                 slotW,
                 slotH,
+                dirtyX,
+                dirtyY,
+                dirtyW,
+                dirtyH,
                 imageUploadScratchRgba8_,
                 wasUpdated)) {
             return fallbackTex != 0u ? fallbackTex : atlasTextureId_;
@@ -2229,14 +2246,14 @@ AeroGLuint OpenGlDeviceBackend::ResolveBatchImageTexture(
                 imageUploadScratchRgba8_.data());
             slot.width = slotW;
             slot.height = slotH;
-        } else {
+        } else if (dirtyW > 0u && dirtyH > 0u) {
             gl_.TexSubImage2D(
                 kGlTexture2D,
                 0,
-                0,
-                0,
-                static_cast<AeroGLsizei>(slotW),
-                static_cast<AeroGLsizei>(slotH),
+                static_cast<AeroGLint>(dirtyX),
+                static_cast<AeroGLint>(dirtyY),
+                static_cast<AeroGLsizei>(dirtyW),
+                static_cast<AeroGLsizei>(dirtyH),
                 kGlRgba,
                 kGlUnsignedByte,
                 imageUploadScratchRgba8_.data());
@@ -2273,6 +2290,12 @@ GpuBackendFrameStats OpenGlDeviceBackend::ExecuteSubmission(
     }
 
     const std::size_t effRingPages = std::max<std::size_t>(1u, maxPagesInRing_);
+    if (ringSlotTailZeroed_.size() != effRingPages) {
+        ringSlotTailZeroed_.assign(effRingPages, 0u);
+    }
+    if (ringSlotHasCustomClipW_.size() != effRingPages) {
+        ringSlotHasCustomClipW_.assign(effRingPages, 0u);
+    }
     lastViewportWidth_ = viewportWidth;
     lastViewportHeight_ = viewportHeight;
 
@@ -2280,6 +2303,20 @@ GpuBackendFrameStats OpenGlDeviceBackend::ExecuteSubmission(
     std::vector<std::uint8_t> uploadedSlots;
     if (ringReallocated) {
         uploadedSlots.assign(effRingPages, 0u);
+    }
+
+    // Only interior pages of a multi-page coalesced GpuClipDrawBatch require trailing zero-padding;
+    // single-page batches and the final page of a batch draw exact clampedVerts via glDrawElements!
+    std::vector<std::uint8_t> pageNeedsTailPad(tree.PageCount(), 0u);
+    for (const GpuClipDrawBatch& batch : drawBatches) {
+        if (batch.pageCount > 1u) {
+            for (std::uint32_t i = 0u; i + 1u < batch.pageCount; ++i) {
+                const std::size_t pIdx = static_cast<std::size_t>(batch.firstPageIndex) + i;
+                if (pIdx < pageNeedsTailPad.size()) {
+                    pageNeedsTailPad[pIdx] = 1u;
+                }
+            }
+        }
     }
 
     gl_.BindVertexArray(vaoId_);
@@ -2295,9 +2332,8 @@ GpuBackendFrameStats OpenGlDeviceBackend::ExecuteSubmission(
             continue;
         }
 
-        if (clampedBytes < kPageVertexBytes) {
-            // Pad trailing unused quad vertices in this page slot with zeroed transparent vertices
-            // so coalesced multi-page draws never render stale vertex garbage from an earlier frame.
+        const bool mustPadTail = (span.pageIndex < pageNeedsTailPad.size() && pageNeedsTailPad[span.pageIndex] != 0u);
+        if (mustPadTail && clampedBytes < kPageVertexBytes) {
             AeroVertex paddedPage[kVerticesPerCommandPage]{};
             std::memcpy(paddedPage, span.sourcePageVertexPtr, clampedBytes);
             gl_.BufferSubData(
@@ -2305,12 +2341,14 @@ GpuBackendFrameStats OpenGlDeviceBackend::ExecuteSubmission(
                 static_cast<AeroGLintptr>(dstOffset),
                 static_cast<AeroGLsizeiptr>(kPageVertexBytes),
                 paddedPage);
+            ringSlotTailZeroed_[slotIdx] = 1u;
         } else {
             gl_.BufferSubData(
                 kGlArrayBuffer,
                 static_cast<AeroGLintptr>(dstOffset),
                 static_cast<AeroGLsizeiptr>(clampedBytes),
                 span.sourcePageVertexPtr);
+            ringSlotTailZeroed_[slotIdx] = (clampedBytes >= kPageVertexBytes) ? 1u : 0u;
         }
         if (ringReallocated && slotIdx < uploadedSlots.size()) {
             uploadedSlots[slotIdx] = 1u;
@@ -2336,32 +2374,106 @@ GpuBackendFrameStats OpenGlDeviceBackend::ExecuteSubmission(
             }
             const std::size_t activeBytes = activeVerts * sizeof(AeroVertex);
             const std::size_t dstOffset = slotIdx * kPageVertexBytes;
-            if (dstOffset + activeBytes <= ringBufferBytes_) {
+            const bool mustPadTail = (p < pageNeedsTailPad.size() && pageNeedsTailPad[p] != 0u);
+            if (mustPadTail && activeBytes < kPageVertexBytes && dstOffset + kPageVertexBytes <= ringBufferBytes_) {
+                AeroVertex paddedPage[kVerticesPerCommandPage]{};
+                std::memcpy(paddedPage, page.vertices.data(), activeBytes);
+                gl_.BufferSubData(
+                    kGlArrayBuffer,
+                    static_cast<AeroGLintptr>(dstOffset),
+                    static_cast<AeroGLsizeiptr>(kPageVertexBytes),
+                    paddedPage);
+                ringSlotTailZeroed_[slotIdx] = 1u;
+                stats.dirtySpansUploaded += 1u;
+                stats.bytesUploaded += activeBytes;
+            } else if (dstOffset + activeBytes <= ringBufferBytes_) {
                 gl_.BufferSubData(
                     kGlArrayBuffer,
                     static_cast<AeroGLintptr>(dstOffset),
                     static_cast<AeroGLsizeiptr>(activeBytes),
                     page.vertices.data());
+                ringSlotTailZeroed_[slotIdx] = (activeBytes >= kPageVertexBytes) ? 1u : 0u;
                 stats.dirtySpansUploaded += 1u;
                 stats.bytesUploaded += activeBytes;
             }
         }
     }
 
-    if (clipWRingVboId_ != 0u) {
+    // Ensure any pre-existing interior page of a newly coalesced multi-page batch has its tail zeroed
+    for (std::size_t pIdx = 0u; pIdx < pageNeedsTailPad.size(); ++pIdx) {
+        if (pageNeedsTailPad[pIdx] == 0u) {
+            continue;
+        }
+        const std::size_t slotIdx = pIdx % effRingPages;
+        if (ringSlotTailZeroed_[slotIdx] != 0u) {
+            continue;
+        }
+        const CommandPage& page = tree.GetPage(pIdx);
+        const std::size_t activeVerts = std::min<std::size_t>(page.header.vertexCount, kVerticesPerCommandPage);
+        const std::size_t activeBytes = activeVerts * sizeof(AeroVertex);
+        const std::size_t dstOffset = slotIdx * kPageVertexBytes;
+        if (activeBytes < kPageVertexBytes && dstOffset + kPageVertexBytes <= ringBufferBytes_) {
+            static const AeroVertex kZeroVertices[kVerticesPerCommandPage]{};
+            gl_.BufferSubData(
+                kGlArrayBuffer,
+                static_cast<AeroGLintptr>(dstOffset + activeBytes),
+                static_cast<AeroGLsizeiptr>(kPageVertexBytes - activeBytes),
+                kZeroVertices);
+        }
+        ringSlotTailZeroed_[slotIdx] = 1u;
+    }
+
+    bool needClipWUpload = false;
+    for (const GlBufferSubDataSpan& span : uploadSpans) {
+        if (!span.sourcePageVertexPtr || span.byteSize == 0u) {
+            continue;
+        }
+        const std::size_t slotIdx = span.pageIndex % effRingPages;
+        const bool pageHas3D = (span.pageIndex < tree.PageCount()) &&
+            ((tree.GetPage(span.pageIndex).header.flags & CommandPageFlag_HasPerspective3D) != 0u);
+        if (pageHas3D || ringSlotHasCustomClipW_[slotIdx] != 0u) {
+            needClipWUpload = true;
+            break;
+        }
+    }
+    if (!needClipWUpload && ringReallocated) {
+        const std::size_t treePages = tree.PageCount();
+        for (std::size_t p = 0u; p < treePages; ++p) {
+            if ((tree.GetPage(p).header.flags & CommandPageFlag_HasPerspective3D) != 0u) {
+                needClipWUpload = true;
+                break;
+            }
+        }
+    }
+    if (clipWRingVboId_ != 0u && needClipWUpload) {
         gl_.BindBuffer(kGlArrayBuffer, clipWRingVboId_);
         float paddedClipW[kVerticesPerCommandPage];
         for (const GlBufferSubDataSpan& span : uploadSpans) {
             if (!span.sourcePageVertexPtr || span.byteSize == 0u) {
                 continue;
             }
-            const float* srcClipW = span.sourcePageClipWPtr ? span.sourcePageClipWPtr : tree.PageVertexClipW(span.pageIndex);
-            if (!srcClipW) {
+            const std::size_t slotIdx = span.pageIndex % effRingPages;
+            const bool pageHas3D = (span.pageIndex < tree.PageCount()) &&
+                ((tree.GetPage(span.pageIndex).header.flags & CommandPageFlag_HasPerspective3D) != 0u);
+            if (!pageHas3D && ringSlotHasCustomClipW_[slotIdx] == 0u) {
                 continue;
             }
-            const std::size_t slotIdx = span.pageIndex % effRingPages;
             const std::size_t dstOffset = slotIdx * kPageClipWBytes;
             if (dstOffset + kPageClipWBytes > clipWRingBufferBytes_) {
+                continue;
+            }
+            if (!pageHas3D) {
+                std::fill(std::begin(paddedClipW), std::end(paddedClipW), 1.0f);
+                gl_.BufferSubData(
+                    kGlArrayBuffer,
+                    static_cast<AeroGLintptr>(dstOffset),
+                    static_cast<AeroGLsizeiptr>(kPageClipWBytes),
+                    paddedClipW);
+                ringSlotHasCustomClipW_[slotIdx] = 0u;
+                continue;
+            }
+            const float* srcClipW = span.sourcePageClipWPtr ? span.sourcePageClipWPtr : tree.PageVertexClipW(span.pageIndex);
+            if (!srcClipW) {
                 continue;
             }
             const std::size_t srcBytes = (span.clipWByteSize > 0u)
@@ -2385,6 +2497,7 @@ GpuBackendFrameStats OpenGlDeviceBackend::ExecuteSubmission(
                     static_cast<AeroGLsizeiptr>(clampedBytes),
                     srcClipW);
             }
+            ringSlotHasCustomClipW_[slotIdx] = 1u;
         }
         if (ringReallocated) {
             const std::size_t treePages = tree.PageCount();
@@ -2394,6 +2507,9 @@ GpuBackendFrameStats OpenGlDeviceBackend::ExecuteSubmission(
                     continue;
                 }
                 const CommandPage& page = tree.GetPage(p);
+                if ((page.header.flags & CommandPageFlag_HasPerspective3D) == 0u) {
+                    continue;
+                }
                 const std::size_t activeVerts = std::min<std::size_t>(
                     page.header.vertexCount,
                     kVerticesPerCommandPage);
@@ -2408,6 +2524,7 @@ GpuBackendFrameStats OpenGlDeviceBackend::ExecuteSubmission(
                         static_cast<AeroGLintptr>(dstOffset),
                         static_cast<AeroGLsizeiptr>(kPageClipWBytes),
                         srcClipW);
+                    ringSlotHasCustomClipW_[slotIdx] = 1u;
                 }
             }
         }

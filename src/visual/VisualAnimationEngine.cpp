@@ -35,11 +35,11 @@ bool ApplyTextFgOpacityRecursive(
     VisualNode* node = world.GetNode(id);
     if (!node) return false;
     if (node->kind == VisualKind::Text) {
-        const float cur = node->HasExtras() ? node->extras->text.fgOpacity : VisualNode::DefaultExtras().text.fgOpacity;
+        const float cur = node->Text().fgOpacity;
         if (std::fabs(cur - opacity) <= 1e-5f) {
             return false;
         }
-        node->EnsureExtras().text.fgOpacity = opacity;
+        node->EnsureTextData().fgOpacity = opacity;
         world.MarkDirty(id, VisualDirty_Visual);
         return true;
     }
@@ -60,11 +60,11 @@ bool ApplyTextFgColorRecursive(
     VisualNode* node = world.GetNode(id);
     if (!node) return false;
     if (node->kind == VisualKind::Text) {
-        const std::uint32_t cur = node->HasExtras() ? node->extras->text.fgRgba : VisualNode::DefaultExtras().text.fgRgba;
+        const std::uint32_t cur = node->Text().fgRgba;
         if (cur == rgba) {
             return false;
         }
-        node->EnsureExtras().text.fgRgba = rgba;
+        node->EnsureTextData().fgRgba = rgba;
         world.MarkDirty(id, VisualDirty_Visual);
         return true;
     }
@@ -221,9 +221,10 @@ struct MutableGradSlot {
 [[nodiscard]] MutableGradSlot ResolveGradSlot(VisualNode* node, bool isStroke) noexcept {
     if (!node) return {};
     if (node->kind == VisualKind::Vector) {
+        auto& v = node->EnsureVectorData();
         return isStroke
-            ? MutableGradSlot{&node->EnsureExtras().vector.strokeGradId, &node->EnsureExtras().vector.ownsMutableStrokeGrad}
-            : MutableGradSlot{&node->EnsureExtras().vector.fillGradId, &node->EnsureExtras().vector.ownsMutableFillGrad};
+            ? MutableGradSlot{&v.strokeGradId, &v.ownsMutableStrokeGrad}
+            : MutableGradSlot{&v.fillGradId, &v.ownsMutableFillGrad};
     }
     return isStroke
         ? MutableGradSlot{&node->box.borderGradId, &node->box.ownsMutableBorderGrad}
@@ -373,34 +374,34 @@ bool ApplyScalarProp(VisualWorld& world, VisualNodeId id, VisualAnimProp prop, f
         node->transform2D.skewY = value;
         break;
     case VisualAnimProp::Rot3DX:
-        if (node->HasExtras() && node->extras->transform3D.enabled && scalarSame(node->extras->transform3D.rx, value)) return false;
-        node->EnsureExtras().transform3D.rx = value;
-        node->EnsureExtras().transform3D.enabled = true;
+        if (node->Transform3D().enabled && scalarSame(node->Transform3D().rx, value)) return false;
+        node->EnsureSpatial3D().transform3D.rx = value;
+        node->EnsureSpatial3D().transform3D.enabled = true;
         break;
     case VisualAnimProp::Rot3DY:
-        if (node->HasExtras() && node->extras->transform3D.enabled && scalarSame(node->extras->transform3D.ry, value)) return false;
-        node->EnsureExtras().transform3D.ry = value;
-        node->EnsureExtras().transform3D.enabled = true;
+        if (node->Transform3D().enabled && scalarSame(node->Transform3D().ry, value)) return false;
+        node->EnsureSpatial3D().transform3D.ry = value;
+        node->EnsureSpatial3D().transform3D.enabled = true;
         break;
     case VisualAnimProp::Rot3DZ:
-        if (node->HasExtras() && node->extras->transform3D.enabled && scalarSame(node->extras->transform3D.rz, value)) return false;
-        node->EnsureExtras().transform3D.rz = value;
-        node->EnsureExtras().transform3D.enabled = true;
+        if (node->Transform3D().enabled && scalarSame(node->Transform3D().rz, value)) return false;
+        node->EnsureSpatial3D().transform3D.rz = value;
+        node->EnsureSpatial3D().transform3D.enabled = true;
         break;
     case VisualAnimProp::Trans3DX:
-        if (node->HasExtras() && node->extras->transform3D.enabled && scalarSame(node->extras->transform3D.tx, value)) return false;
-        node->EnsureExtras().transform3D.tx = value;
-        node->EnsureExtras().transform3D.enabled = true;
+        if (node->Transform3D().enabled && scalarSame(node->Transform3D().tx, value)) return false;
+        node->EnsureSpatial3D().transform3D.tx = value;
+        node->EnsureSpatial3D().transform3D.enabled = true;
         break;
     case VisualAnimProp::Trans3DY:
-        if (node->HasExtras() && node->extras->transform3D.enabled && scalarSame(node->extras->transform3D.ty, value)) return false;
-        node->EnsureExtras().transform3D.ty = value;
-        node->EnsureExtras().transform3D.enabled = true;
+        if (node->Transform3D().enabled && scalarSame(node->Transform3D().ty, value)) return false;
+        node->EnsureSpatial3D().transform3D.ty = value;
+        node->EnsureSpatial3D().transform3D.enabled = true;
         break;
     case VisualAnimProp::Trans3DZ:
-        if (node->HasExtras() && node->extras->transform3D.enabled && scalarSame(node->extras->transform3D.tz, value)) return false;
-        node->EnsureExtras().transform3D.tz = value;
-        node->EnsureExtras().transform3D.enabled = true;
+        if (node->Transform3D().enabled && scalarSame(node->Transform3D().tz, value)) return false;
+        node->EnsureSpatial3D().transform3D.tz = value;
+        node->EnsureSpatial3D().transform3D.enabled = true;
         break;
     case VisualAnimProp::CornerRadius:
         if (scalarSame(node->box.cornerRadius.topLeft, value) &&
@@ -412,31 +413,29 @@ bool ApplyScalarProp(VisualWorld& world, VisualNodeId id, VisualAnimProp prop, f
         node->box.cornerRadius = CornerRadius{value};
         break;
     case VisualAnimProp::PathTrimStart:
-        if (node->HasExtras() && scalarSame(node->extras->vector.trimStart, value)) return false;
-        if (!node->HasExtras() && scalarSame(VisualNode::DefaultExtras().vector.trimStart, value)) return false;
-        node->EnsureExtras().vector.trimStart = value;
+        if (scalarSame(node->Vector().trimStart, value)) return false;
+        node->EnsureVectorData().trimStart = value;
         break;
     case VisualAnimProp::PathTrimEnd:
-        if (node->HasExtras() && scalarSame(node->extras->vector.trimEnd, value)) return false;
-        if (!node->HasExtras() && scalarSame(VisualNode::DefaultExtras().vector.trimEnd, value)) return false;
-        node->EnsureExtras().vector.trimEnd = value;
+        if (scalarSame(node->Vector().trimEnd, value)) return false;
+        node->EnsureVectorData().trimEnd = value;
         break;
     case VisualAnimProp::EffectRadius:
-        if (node->HasExtras() && scalarSame(node->extras->effect.radius, value)) return false;
-        node->EnsureExtras().effect.radius = value;
+        if (node->HasEffectMask() && scalarSame(node->Effect().radius, value)) return false;
+        node->EnsureEffectMask().effect.radius = value;
         break;
     case VisualAnimProp::EffectOpacity: {
         const float next = std::clamp(value, 0.0f, 1.0f);
-        if (node->HasExtras() && scalarSame(node->extras->effect.opacity, next)) return false;
-        node->EnsureExtras().effect.opacity = next;
+        if (node->HasEffectMask() && scalarSame(node->Effect().opacity, next)) return false;
+        node->EnsureEffectMask().effect.opacity = next;
         break;
     }
     case VisualAnimProp::BrushOpacity:
     case VisualAnimProp::FillBrushOpacity: {
         const float next = std::clamp(value, 0.0f, 1.0f);
         if (node->kind == VisualKind::Vector) {
-            if (node->HasExtras() && scalarSame(node->extras->vector.fillOpacity, next)) return false;
-            node->EnsureExtras().vector.fillOpacity = next;
+            if (node->HasVectorData() && scalarSame(node->Vector().fillOpacity, next)) return false;
+            node->EnsureVectorData().fillOpacity = next;
         } else {
             if (scalarSame(node->box.bgOpacity, next)) return false;
             node->box.bgOpacity = next;
@@ -446,8 +445,8 @@ bool ApplyScalarProp(VisualWorld& world, VisualNodeId id, VisualAnimProp prop, f
     case VisualAnimProp::StrokeBrushOpacity: {
         const float next = std::clamp(value, 0.0f, 1.0f);
         if (node->kind == VisualKind::Vector) {
-            if (node->HasExtras() && scalarSame(node->extras->vector.strokeOpacity, next)) return false;
-            node->EnsureExtras().vector.strokeOpacity = next;
+            if (node->HasVectorData() && scalarSame(node->Vector().strokeOpacity, next)) return false;
+            node->EnsureVectorData().strokeOpacity = next;
         } else {
             return false;
         }
@@ -493,7 +492,7 @@ bool ApplyScalarProp(VisualWorld& world, VisualNodeId id, VisualAnimProp prop, f
         const std::size_t stopIdx = static_cast<std::size_t>(
             static_cast<std::uint8_t>(prop) - static_cast<std::uint8_t>(VisualAnimProp::OpacityMaskStop0Offset));
         const float next = std::clamp(value, 0.0f, 1.0f);
-        auto& offsets = node->EnsureExtras().opacityMask.stopOffsets;
+        auto& offsets = node->EnsureEffectMask().opacityMask.stopOffsets;
         if (stopIdx < offsets.size()) {
             if (scalarSame(offsets[stopIdx], next)) return false;
             offsets[stopIdx] = next;
@@ -554,8 +553,8 @@ bool ApplyColorProp(VisualWorld& world, VisualNodeId id, VisualAnimProp prop, st
     case VisualAnimProp::BgColor:
     case VisualAnimProp::FillColor:
         if (node->kind == VisualKind::Vector) {
-            if (node->HasExtras() && node->extras->vector.fillRgba == rgba) return false;
-            node->EnsureExtras().vector.fillRgba = rgba;
+            if (node->HasVectorData() && node->Vector().fillRgba == rgba) return false;
+            node->EnsureVectorData().fillRgba = rgba;
         } else {
             if (node->box.bgRgba == rgba) return false;
             node->box.bgRgba = rgba;
@@ -566,8 +565,8 @@ bool ApplyColorProp(VisualWorld& world, VisualNodeId id, VisualAnimProp prop, st
     case VisualAnimProp::BorderColor:
     case VisualAnimProp::StrokeColor:
         if (node->kind == VisualKind::Vector) {
-            if (node->HasExtras() && node->extras->vector.strokeRgba == rgba) return false;
-            node->EnsureExtras().vector.strokeRgba = rgba;
+            if (node->HasVectorData() && node->Vector().strokeRgba == rgba) return false;
+            node->EnsureVectorData().strokeRgba = rgba;
         } else {
             if (node->box.borderRgba == rgba) return false;
             node->box.borderRgba = rgba;

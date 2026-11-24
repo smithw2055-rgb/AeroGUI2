@@ -162,6 +162,7 @@ public:
 
     [[nodiscard]] const DrawingCommandList* FindCommands(VisualNodeId node) const noexcept;
     [[nodiscard]] bool HasCommands(VisualNodeId node) const noexcept;
+    [[nodiscard]] bool Empty() const noexcept { return streams_.empty(); }
 
 private:
     [[nodiscard]] static std::uint64_t PackNodeKey(VisualNodeId node) noexcept {

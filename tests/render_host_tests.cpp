@@ -54,6 +54,7 @@ struct MockGlSpyState {
         nextId = 1u;
         boundFbo = 0u;
         boundProgram = 0u;
+        boundArrayBuffer = 0u;
         genFboCalls = 0;
         deleteFboCalls = 0;
         bindFboCalls = 0;
@@ -69,11 +70,13 @@ struct MockGlSpyState {
         scissorHistory.clear();
         fboBindHistory.clear();
         programBindHistory.clear();
+        bufferMemory.clear();
     }
 
     aero::AeroGLuint nextId = 1u;
     aero::AeroGLuint boundFbo = 0u;
     aero::AeroGLuint boundProgram = 0u;
+    aero::AeroGLuint boundArrayBuffer = 0u;
     int genFboCalls = 0;
     int deleteFboCalls = 0;
     int bindFboCalls = 0;
@@ -95,6 +98,7 @@ struct MockGlSpyState {
     std::vector<ScissorRecord> scissorHistory;
     std::vector<aero::AeroGLuint> fboBindHistory;
     std::vector<aero::AeroGLuint> programBindHistory;
+    std::unordered_map<aero::AeroGLuint, std::vector<std::uint8_t>> bufferMemory;
 };
 
 MockGlSpyState gMockGl;
@@ -116,9 +120,32 @@ void AERO_GL_APIENTRY MockGenBuffers(aero::AeroGLsizei n, aero::AeroGLuint* out)
     for (aero::AeroGLsizei i = 0; i < n; ++i) out[i] = gMockGl.nextId++;
 }
 void AERO_GL_APIENTRY MockDeleteBuffers(aero::AeroGLsizei, const aero::AeroGLuint*) {}
-void AERO_GL_APIENTRY MockBindBuffer(aero::AeroGLenum, aero::AeroGLuint) {}
-void AERO_GL_APIENTRY MockBufferData(aero::AeroGLenum, aero::AeroGLsizeiptr, const void*, aero::AeroGLenum) {}
-void AERO_GL_APIENTRY MockBufferSubData(aero::AeroGLenum, aero::AeroGLintptr, aero::AeroGLsizeiptr, const void*) {}
+void AERO_GL_APIENTRY MockBindBuffer(aero::AeroGLenum target, aero::AeroGLuint buf) {
+    if (target == 0x8892u) {
+        gMockGl.boundArrayBuffer = buf;
+    }
+}
+void AERO_GL_APIENTRY MockBufferData(aero::AeroGLenum target, aero::AeroGLsizeiptr size, const void* data, aero::AeroGLenum) {
+    if (target == 0x8892u && gMockGl.boundArrayBuffer != 0u && size >= 0) {
+        auto& mem = gMockGl.bufferMemory[gMockGl.boundArrayBuffer];
+        mem.assign(static_cast<std::size_t>(size), static_cast<std::uint8_t>(0xCDu));
+        if (data != nullptr && size > 0) {
+            std::memcpy(mem.data(), data, static_cast<std::size_t>(size));
+        }
+    }
+}
+void AERO_GL_APIENTRY MockBufferSubData(aero::AeroGLenum target, aero::AeroGLintptr offset, aero::AeroGLsizeiptr size, const void* data) {
+    if (target == 0x8892u && gMockGl.boundArrayBuffer != 0u && data != nullptr && offset >= 0 && size > 0) {
+        auto it = gMockGl.bufferMemory.find(gMockGl.boundArrayBuffer);
+        if (it != gMockGl.bufferMemory.end()) {
+            const std::size_t off = static_cast<std::size_t>(offset);
+            const std::size_t sz = static_cast<std::size_t>(size);
+            if (off + sz <= it->second.size()) {
+                std::memcpy(it->second.data() + off, data, sz);
+            }
+        }
+    }
+}
 
 void AERO_GL_APIENTRY MockGenVertexArrays(aero::AeroGLsizei n, aero::AeroGLuint* out) {
     for (aero::AeroGLsizei i = 0; i < n; ++i) out[i] = gMockGl.nextId++;
@@ -1411,6 +1438,143 @@ bool TestWindowHighDpiLogicalSizing() {
     return true;
 }
 
+bool TestMockGlClipWResetAndIncrementalTailPad() {
+    // Subtest A: Switching from 3D perspective node to 2D node on the same ring slot must reset clipW back to 1.0f
+    {
+        gMockGl.Reset();
+        const aero::GlFunctionTable gl = MakeMinimalMockGlTable();
+        aero::OpenGlDeviceBackend backend(gl);
+        aero::GpuBackendConfig cfg{};
+        cfg.initialViewportWidth = 400u;
+        cfg.initialViewportHeight = 300u;
+        AERO_CHECK(backend.Initialize(cfg));
+
+        auto store = std::make_shared<aero::UIResourceStore>();
+        aero::VisualWorld world(nullptr, store.get());
+        const aero::VisualNodeId root = world.CreateNode(aero::VisualKind::Box);
+        world.SetRoot(root);
+        world.SetSize(root, 400.0f, 300.0f);
+        const aero::VisualNodeId box = world.CreateNode(aero::VisualKind::Box);
+        world.AddChild(root, box);
+        world.SetSize(box, 120.0f, 80.0f);
+        world.SetBoxStyle(box, 0xFF336699u, 0u, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f);
+        world.SetTransform3D(box, 0.0f, 45.0f, 0.0f, 0.0f, 0.0f, 0.0f, 300.0f);
+        world.UpdateLayout(400.0f, 300.0f);
+
+        aero::VisualRenderAdapter adapter;
+        aero::PagedRenderTree tree;
+        tree.SetResourceStore(store.get());
+        AERO_CHECK(adapter.SyncPagedRenderTree(world, nullptr, tree, store.get()) >= 1u);
+        AERO_CHECK(tree.PageCount() == 1u);
+        AERO_CHECK((tree.GetPage(0u).header.flags & aero::CommandPageFlag_HasPerspective3D) != 0u);
+
+        aero::ZeroCopyGpuStream stream(aero::ShaderBackend::DesktopGL33, 8u);
+        (void)stream.SubmitDirtyPages(tree);
+        const aero::GpuBackendFrameStats f1 = backend.ExecuteSubmission(
+            tree, stream.LastBufferSubDataSpans(), stream.LastClipDrawBatches(), 8u, 400u, 300u);
+        AERO_CHECK(f1.succeeded);
+
+        const auto clipWIt1 = gMockGl.bufferMemory.find(backend.ClipWRingVboHandle());
+        AERO_CHECK(clipWIt1 != gMockGl.bufferMemory.end());
+        AERO_CHECK(clipWIt1->second.size() >= 4u * sizeof(float));
+        float wVals1[4]{};
+        std::memcpy(wVals1, clipWIt1->second.data(), sizeof(wVals1));
+        AERO_CHECK(wVals1[0] != 1.0f || wVals1[1] != 1.0f || wVals1[2] != 1.0f || wVals1[3] != 1.0f);
+
+        // Now disable 3D transform -> pure 2D page in slot 0 must reset clipW in VRAM back to 1.0f
+        world.SetTransform3D(box, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f);
+        world.UpdateLayout(400.0f, 300.0f);
+        AERO_CHECK(adapter.SyncPagedRenderTree(world, nullptr, tree, store.get()) >= 1u);
+        AERO_CHECK((tree.GetPage(0u).header.flags & aero::CommandPageFlag_HasPerspective3D) == 0u);
+
+        (void)stream.SubmitDirtyPages(tree);
+        const aero::GpuBackendFrameStats f2 = backend.ExecuteSubmission(
+            tree, stream.LastBufferSubDataSpans(), stream.LastClipDrawBatches(), 8u, 400u, 300u);
+        AERO_CHECK(f2.succeeded);
+
+        const auto clipWIt2 = gMockGl.bufferMemory.find(backend.ClipWRingVboHandle());
+        AERO_CHECK(clipWIt2 != gMockGl.bufferMemory.end());
+        float wVals2[4]{};
+        std::memcpy(wVals2, clipWIt2->second.data(), sizeof(wVals2));
+        for (int i = 0; i < 4; ++i) {
+            AERO_CHECK(std::fabs(wVals2[i] - 1.0f) < 1e-6f);
+        }
+        backend.Shutdown();
+    }
+
+    // Subtest B: Single-page batch in frame 1 followed by incremental dirty Page 1 coalescing with clean Page 0 in frame 2
+    {
+        gMockGl.Reset();
+        const aero::GlFunctionTable gl = MakeMinimalMockGlTable();
+        aero::OpenGlDeviceBackend backend(gl);
+        aero::GpuBackendConfig cfg{};
+        cfg.initialViewportWidth = 400u;
+        cfg.initialViewportHeight = 300u;
+        AERO_CHECK(backend.Initialize(cfg));
+
+        auto store = std::make_shared<aero::UIResourceStore>();
+        aero::PagedRenderTree tree;
+        tree.SetResourceStore(store.get());
+        (void)tree.AllocateRenderNode(0.0f, 0.0f, 20.0f, 20.0f, aero::Color{1.0f, 0.0f, 0.0f, 1.0f});
+        AERO_CHECK(tree.PageCount() == 1u);
+
+        aero::ZeroCopyGpuStream stream(aero::ShaderBackend::DesktopGL33, 8u);
+        (void)stream.SubmitDirtyPages(tree);
+        const aero::GpuBackendFrameStats f1 = backend.ExecuteSubmission(
+            tree, stream.LastBufferSubDataSpans(), stream.LastClipDrawBatches(), 8u, 400u, 300u);
+        AERO_CHECK(f1.succeeded);
+
+        // Append a full-page HUD digits node -> spills onto Page 1 while Page 0 remains clean!
+        (void)tree.AllocateHudDigitsNode(30.0f, 0.0f, 10.0f, 12.0f, 42u, aero::Color{0.0f, 1.0f, 0.0f, 1.0f});
+        AERO_CHECK(tree.PageCount() == 2u);
+        (void)stream.SubmitDirtyPages(tree);
+        AERO_CHECK(stream.LastBufferSubDataSpans().size() == 1u);
+        AERO_CHECK(stream.LastBufferSubDataSpans()[0].pageIndex == 1u);
+        AERO_CHECK(stream.LastClipDrawBatches().size() == 1u);
+        AERO_CHECK(stream.LastClipDrawBatches()[0].pageCount == 2u);
+
+        const aero::GpuBackendFrameStats f2 = backend.ExecuteSubmission(
+            tree, stream.LastBufferSubDataSpans(), stream.LastClipDrawBatches(), 8u, 400u, 300u);
+        AERO_CHECK(f2.succeeded);
+
+        const auto ringIt = gMockGl.bufferMemory.find(backend.RingVboHandle());
+        AERO_CHECK(ringIt != gMockGl.bufferMemory.end());
+        const std::size_t activeBytes = 4u * sizeof(aero::AeroVertex);
+        const std::size_t pageBytes = aero::kVerticesPerCommandPage * sizeof(aero::AeroVertex);
+        AERO_CHECK(ringIt->second.size() >= pageBytes);
+        for (std::size_t b = activeBytes; b < pageBytes; ++b) {
+            AERO_CHECK(ringIt->second[b] == 0u);
+        }
+        backend.Shutdown();
+    }
+    return true;
+}
+
+bool TestSharedAtlasMaskQuotaNoLeak() {
+    auto store = std::make_shared<aero::UIResourceStore>();
+    // Small 64x64 shared atlas -> max 2048 texels mask budget -> only 1 30x30 (+2px border = 32x32 = 1024) or 2 fit
+    store->Images().ConfigureAtlas(64u, 64u, 64u);
+    const aero::Rect rawBounds{0.0f, 0.0f, 24.0f, 24.0f};
+    const std::string pathData = "M 2 2 L 22 2 L 22 22 L 2 22 Z";
+
+    std::size_t packedSharedCount = 0u;
+    std::unordered_map<std::uint32_t, bool> uniqueStandaloneIds;
+    for (std::uint64_t i = 1u; i <= 10u; ++i) {
+        aero::RasterizedPathMaskEntry entry{};
+        const std::uint64_t hash = 0x100000000ULL + i;
+        AERO_CHECK(store->GetOrRasterizePathMask(hash, pathData, rawBounds, 30u, 30u, 1u, entry));
+        if (entry.textureId == aero::ImageAtlas::kSharedUiAtlasTextureId) {
+            ++packedSharedCount;
+        } else {
+            uniqueStandaloneIds[entry.textureId] = true;
+        }
+    }
+    AERO_CHECK(packedSharedCount >= 1u);
+    AERO_CHECK(!uniqueStandaloneIds.empty());
+    AERO_CHECK(store->Images().StandaloneTextureCount() == uniqueStandaloneIds.size());
+    return true;
+}
+
 } // namespace
 
 int main() {
@@ -1434,6 +1598,8 @@ int main() {
         {"ArabicRtlAndBidiFixes", &TestArabicRtlAndBidiFixes},
         {"RiveOverflowGuardAndPartialTrim", &TestRiveOverflowGuardAndPartialTrim},
         {"ModalLiveResizeAndTextEllipsis", &TestModalLiveResizeAndTextEllipsis},
+        {"MockGlClipWResetAndIncrementalTailPad", &TestMockGlClipWResetAndIncrementalTailPad},
+        {"SharedAtlasMaskQuotaNoLeak", &TestSharedAtlasMaskQuotaNoLeak},
     };
 
     int passed = 0;

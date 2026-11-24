@@ -508,8 +508,9 @@ public class ItemsControl : Control {
         int total = ItemCount();
         BindingEngine.NotifyTargetPropertyChanged(this, "Items.Count", DependencyObject.BoxInt(total));
         if (EnsureItemsHostPanel() == null) { return; }
-        if (_virtualizing && total > 32) {
-            UpdateVirtualizedViewport(0.0f, ActualHeight > 0.0f ? ActualHeight : 400.0f);
+        if (_virtualizing && total > 12) {
+            float initVh = ActualHeight > 0.0f ? ActualHeight : (Height > 0.0f ? Height : 600.0f);
+            UpdateVirtualizedViewport(0.0f, initVh);
             return;
         }
         BuildContainerRange(0, total - 1);

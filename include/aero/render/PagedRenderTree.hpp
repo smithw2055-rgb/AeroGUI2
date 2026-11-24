@@ -73,6 +73,7 @@ inline constexpr std::size_t kVerticesPerCommandPage =
 enum CommandPageFlags : std::uint32_t {
     CommandPageFlag_None = 0u,
     CommandPageFlag_ScissorClipActive = 1u << 0u,
+    CommandPageFlag_HasPerspective3D = 1u << 1u,
 };
 
 struct CommandPageHeader {
@@ -160,7 +161,7 @@ struct RenderNodeDescriptor {
     BlendingMode blendMode = BlendingMode::Normal;
     float softFeatherPx = 0.0f;
     float sdfPadPx = 0.0f;
-    Matrix4x4 worldMatrix3D{};
+    std::uint32_t worldMatrix3DIndex = 0xFFFFFFFFu;
 };
 
 struct BlurLayerSpan {
@@ -631,10 +632,16 @@ public:
     }
 
     [[nodiscard]] std::size_t NodeCount() const noexcept { return nodes_.size(); }
+    [[nodiscard]] const Matrix4x4& GetNodeWorldMatrix3D(const RenderNodeDescriptor& node) const noexcept;
+    void SetNodeWorldMatrix3D(RenderNodeDescriptor& node, const Matrix4x4& world3D);
     [[nodiscard]] const RenderNodeDescriptor* GetNode(std::uint32_t nodeId) const noexcept {
         return (nodeId < nodes_.size()) ? &nodes_[nodeId] : nullptr;
     }
-    void PushBlurLayerSpan(const BlurLayerSpan& span) { blurLayerSpans_.push_back(span); }
+    void PushBlurLayerSpan(const BlurLayerSpan& span) {
+        blurLayerSpans_.push_back(span);
+        activeBlurSpanDepth_ += 1u;
+        coalesceBarrierPage_ = pages_.size();
+    }
     [[nodiscard]] const std::vector<BlurLayerSpan>& BlurLayerSpans() const noexcept {
         return blurLayerSpans_;
     }
@@ -677,6 +684,7 @@ private:
         TextWrapping wrapMode,
         float charSpacing = 0.0f) const;
     void RegisterMtsdfInTreeAtlas(const AxbMtsdfPathEntry& entry);
+    bool TryGetPageScreenBounds(std::size_t pageIdx, Rect& outBounds) noexcept;
     std::uint32_t EnsurePageForAllocation(
         std::uint32_t neededVertices,
         const Rect& clipRect,
@@ -713,7 +721,8 @@ private:
         const std::vector<RichGlyphStyle>* optRichStyles = nullptr,
         const GradientBrushDesc* optFgGrad = nullptr,
         float gradBoxHeight = 0.0f,
-        bool ignoreCustomGlyphColors = false);
+        bool ignoreCustomGlyphColors = false,
+        bool reserveDynamicSlack = false);
     std::uint16_t EmitTextRunNodes(
         float x,
         float y,
@@ -738,8 +747,16 @@ private:
     bool activeClipEnabled_ = false;
     BlendingMode activeBlendMode_ = BlendingMode::Normal;
     std::vector<CommandPage> pages_;
+    std::vector<Rect> pageScreenBounds_;
+    std::vector<std::uint8_t> pageBoundsState_;
+    std::size_t coalesceBarrierPage_ = 0u;
+    std::uint32_t activeBlurSpanDepth_ = 0u;
+    bool hasOutOfOrderCoalesce_ = false;
+    Rect hintNextBounds_{};
+    bool hasHintNextBounds_ = false;
     std::vector<std::array<float, kVerticesPerCommandPage>> pageClipW_;
     std::vector<RenderNodeDescriptor> nodes_;
+    std::vector<Matrix4x4> worldMatrices3D_;
     std::vector<std::uint8_t> pageDirtyFlags_;
     std::vector<std::uint32_t> dirtyPageList_;
     struct StandaloneTextRunRecord {

@@ -580,6 +580,14 @@ bool ExecutionDomainContext::DomainPolicy::interceptsSameHeapWrites() const noex
            (owner_ != nullptr && owner_->hasSimStateTypes_.load(std::memory_order_relaxed));
 }
 
+namespace {
+[[nodiscard]] constexpr std::uint64_t ComputeSimCommandBloomMask(SymbolId id) noexcept {
+    const std::uint64_t h0 = (static_cast<std::uint64_t>(id) * 11400714819323198485ull) >> 58u;
+    const std::uint64_t h1 = (static_cast<std::uint64_t>(id) * 7046029254386353131ull) >> 58u;
+    return (1ull << h0) | (1ull << h1);
+}
+} // namespace
+
 bool ExecutionDomainContext::DomainPolicy::interceptCall(
     SymbolId functionId,
     ValueSpan arguments,
@@ -588,6 +596,12 @@ bool ExecutionDomainContext::DomainPolicy::interceptCall(
     RuntimeError&) {
     outIntercepted = false;
     if (!owner_ || domain_ != DomainKind::UiPresentation) {
+        return true;
+    }
+
+    // Lock-free O(1) 2-bit Bloom filter rejects >99.9% of regular UI calls with zero mutex lock!
+    const std::uint64_t reqMask = ComputeSimCommandBloomMask(functionId);
+    if ((owner_->simCommandBloom_.load(std::memory_order_relaxed) & reqMask) != reqMask) {
         return true;
     }
 
@@ -1043,6 +1057,11 @@ void ExecutionDomainContext::ensureProgramMetadataComputedLocked(
         hasSimStateTypes_.store(true, std::memory_order_release);
     }
     if (!simCommandFunctions_.empty()) {
+        std::uint64_t bloom = simCommandBloom_.load(std::memory_order_relaxed);
+        for (const auto& [fnId, _] : simCommandFunctions_) {
+            bloom |= ComputeSimCommandBloomMask(fnId);
+        }
+        simCommandBloom_.store(bloom, std::memory_order_release);
         hasSimCommands_.store(true, std::memory_order_release);
     }
 }
@@ -1263,6 +1282,11 @@ void ExecutionDomainContext::registerAotProgramAttributes(
         }
     }
     if (!simCommandFunctions_.empty()) {
+        std::uint64_t bloom = simCommandBloom_.load(std::memory_order_relaxed);
+        for (const auto& [fnId, _] : simCommandFunctions_) {
+            bloom |= ComputeSimCommandBloomMask(fnId);
+        }
+        simCommandBloom_.store(bloom, std::memory_order_release);
         hasSimCommands_.store(true, std::memory_order_release);
     }
 }

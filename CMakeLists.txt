@@ -169,6 +169,7 @@ target_link_libraries(aerogui_runtime INTERFACE aerogui_host)
 if(AERO_BUILD_COMPILER_TOOLS AND TARGET RealScript::Frontend)
     add_library(aerogui_compiler STATIC
         src/compiler/StdlibModulePack.cpp
+        src/compiler/StdlibDllLoader.cpp
         src/compiler/XmlPullLexer.cpp
         src/compiler/MarkupExtensionParser.cpp
         src/compiler/XamlToRsEmitter.cpp
@@ -182,6 +183,9 @@ if(AERO_BUILD_COMPILER_TOOLS AND TARGET RealScript::Frontend)
             aerogui_foundation
             RealScript::Frontend
     )
+    if(UNIX AND NOT EMSCRIPTEN AND CMAKE_DL_LIBS)
+        target_link_libraries(aerogui_compiler PRIVATE ${CMAKE_DL_LIBS})
+    endif()
     target_compile_definitions(aerogui_compiler
         PUBLIC
             $<BUILD_INTERFACE:AERO_STDLIB_DIR="${CMAKE_CURRENT_SOURCE_DIR}/stdlib">
@@ -194,6 +198,40 @@ if(AERO_BUILD_COMPILER_TOOLS AND TARGET RealScript::Frontend)
     )
     target_link_libraries(aero-compiler PRIVATE aerogui_compiler)
     aero_apply_default_rtti_options(aero-compiler)
+
+    if(NOT EMSCRIPTEN)
+        file(GLOB_RECURSE _aero_stdlib_rs_sources CONFIGURE_DEPENDS
+            "${CMAKE_CURRENT_SOURCE_DIR}/stdlib/*.rs"
+        )
+        set(_aero_stdlib_dll_cpp "${CMAKE_CURRENT_BINARY_DIR}/generated/aerogui_stdlib_data.cpp")
+        add_custom_command(
+            OUTPUT "${_aero_stdlib_dll_cpp}"
+            COMMAND "${CMAKE_COMMAND}" -E make_directory "${CMAKE_CURRENT_BINARY_DIR}/generated"
+            COMMAND $<TARGET_FILE:aero-compiler>
+                --emit-stdlib-dll-cpp "${_aero_stdlib_dll_cpp}"
+                --stdlib "${CMAKE_CURRENT_SOURCE_DIR}/stdlib"
+                --O2
+            DEPENDS
+                aero-compiler
+                ${_aero_stdlib_rs_sources}
+            COMMENT "Generating aerogui_stdlib precompiled frontend and lazy bytecode data unit"
+            VERBATIM
+        )
+        add_library(aerogui_stdlib SHARED "${_aero_stdlib_dll_cpp}")
+        add_library(AeroGUI::Stdlib ALIAS aerogui_stdlib)
+        target_include_directories(aerogui_stdlib
+            PUBLIC
+                $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+                $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
+        )
+        target_compile_features(aerogui_stdlib PUBLIC cxx_std_17)
+        target_compile_definitions(aerogui_stdlib PRIVATE AERO_STDLIB_DLL_BUILD=1)
+        if(MSVC)
+            target_compile_options(aerogui_stdlib PRIVATE /utf-8 /GR- /Od)
+        else()
+            target_compile_options(aerogui_stdlib PRIVATE -fno-rtti -O0)
+        endif()
+    endif()
 endif()
 
 # ============================================================================
@@ -228,10 +266,43 @@ if(NOT EMSCRIPTEN)
         tools/aero_viewer/main.cpp
     )
     target_link_libraries(aero-viewer PRIVATE aerogui_app)
+    if(WIN32)
+        target_link_libraries(aero-viewer PRIVATE psapi)
+    endif()
+    if(TARGET aerogui_stdlib)
+        add_dependencies(aero-viewer aerogui_stdlib)
+    endif()
     if(AERO_BUILD_COMPILER_TOOLS AND TARGET aerogui_compiler)
         aero_apply_default_rtti_options(aero-viewer)
     else()
         aero_apply_no_rtti_options(aero-viewer)
+    endif()
+
+    if(AERO_BUILD_COMPILER_TOOLS AND TARGET aerogui_stdlib)
+        include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/AeroSampleApp.cmake")
+
+        aero_add_sample_app(
+            aero_sample_buttons
+            SAMPLE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/Samples/Buttons"
+            TITLE "AeroGUI Buttons"
+            WIDTH 1000
+            HEIGHT 640
+        )
+        aero_add_sample_app(
+            aero_sample_gallery
+            SAMPLE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/Samples/Gallery"
+            TITLE "AeroGUI Gallery"
+            WIDTH 1280
+            HEIGHT 760
+            EXTRA_ASSET_DIRS "${CMAKE_CURRENT_SOURCE_DIR}/Samples/Theme/Data/Theme:Data/Theme"
+        )
+        aero_add_sample_app(
+            aero_sample_inventory
+            SAMPLE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/Samples/Inventory"
+            TITLE "AeroGUI Inventory"
+            WIDTH 1280
+            HEIGHT 720
+        )
     endif()
 endif()
 
@@ -307,6 +378,40 @@ if(AERO_BUILD_TESTS)
         )
         aero_apply_default_rtti_options(v3_legacy_samples_tests)
         add_test(NAME v3_legacy_samples_tests COMMAND v3_legacy_samples_tests)
+        if(TARGET aerogui_stdlib)
+            add_dependencies(v3_legacy_samples_tests aerogui_stdlib)
+            add_test(
+                NAME v3_legacy_samples_tests_stdlib_dll
+                COMMAND v3_legacy_samples_tests --stdlib-dll $<TARGET_FILE:aerogui_stdlib>
+            )
+        endif()
+    endif()
+
+    if(AERO_BUILD_COMPILER_TOOLS AND TARGET aerogui_app AND TARGET aerogui_stdlib AND
+       NOT EMSCRIPTEN AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/v3_stdlib_dll_tests.cpp")
+        add_executable(v3_stdlib_dll_tests tests/v3_stdlib_dll_tests.cpp)
+        target_link_libraries(v3_stdlib_dll_tests PRIVATE aerogui_app)
+        if(WIN32)
+            target_link_libraries(v3_stdlib_dll_tests PRIVATE psapi)
+        endif()
+        add_dependencies(v3_stdlib_dll_tests
+            aerogui_stdlib
+            aero-viewer
+            aero_sample_buttons
+            aero_sample_gallery
+            aero_sample_inventory
+        )
+        target_compile_definitions(v3_stdlib_dll_tests PRIVATE
+            AERO_STDLIB_DLL_PATH="$<TARGET_FILE:aerogui_stdlib>"
+            AERO_VIEWER_EXE="$<TARGET_FILE:aero-viewer>"
+            AERO_SAMPLE_BUTTONS_EXE="$<TARGET_FILE:aero_sample_buttons>"
+            AERO_SAMPLE_GALLERY_EXE="$<TARGET_FILE:aero_sample_gallery>"
+            AERO_SAMPLE_INVENTORY_EXE="$<TARGET_FILE:aero_sample_inventory>"
+            AERO_SAMPLES_DIR="${CMAKE_CURRENT_SOURCE_DIR}/Samples"
+            AERO_TEST_TEMP_DIR="${CMAKE_CURRENT_BINARY_DIR}/test_out"
+        )
+        aero_apply_default_rtti_options(v3_stdlib_dll_tests)
+        add_test(NAME v3_stdlib_dll_tests COMMAND v3_stdlib_dll_tests)
     endif()
 endif()
 
@@ -327,6 +432,9 @@ if(TARGET aerogui_compiler)
     set(AERO_HAS_COMPILER_TOOLS_CMAKE TRUE)
 else()
     set(AERO_HAS_COMPILER_TOOLS_CMAKE FALSE)
+endif()
+if(TARGET aerogui_stdlib)
+    list(APPEND _aero_export_targets aerogui_stdlib)
 endif()
 
 file(TO_CMAKE_PATH "${RealScript_DIR}" REALSCRIPT_CONFIG_HINT_DIR)
@@ -376,6 +484,12 @@ if(AERO_INSTALL_SDK)
         FILES
             "${CMAKE_CURRENT_BINARY_DIR}/CMakeFiles/InstallConfig/AeroGUI2Config.cmake"
             "${CMAKE_CURRENT_BINARY_DIR}/AeroGUI2ConfigVersion.cmake"
+            "${CMAKE_CURRENT_SOURCE_DIR}/cmake/AeroSampleApp.cmake"
         DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/AeroGUI2
+    )
+    install(
+        FILES "${CMAKE_CURRENT_SOURCE_DIR}/tools/aero_sample_launcher/main.cpp"
+        DESTINATION ${CMAKE_INSTALL_DATADIR}/aerogui2
+        RENAME aero_sample_launcher_main.cpp
     )
 endif()

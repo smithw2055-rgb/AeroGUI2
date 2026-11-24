@@ -2671,6 +2671,21 @@ void EnsureImageAtlasRegisteredWithStore() noexcept {
         },
         [](ImageAtlas& atlas, std::uint32_t texId) noexcept {
             atlas.ReleaseRgbaTextureSlot(texId);
+        },
+        [](ImageAtlas& atlas,
+           std::uint64_t maskKey,
+           std::uint32_t w,
+           std::uint32_t h,
+           const std::uint8_t* rgbaPixels,
+           std::size_t byteSize,
+           std::uint32_t& outTexId,
+           float& outU0,
+           float& outV0,
+           float& outU1,
+           float& outV1) -> bool {
+            outTexId = ImageAtlas::kSharedUiAtlasTextureId;
+            return atlas.TryPackMaskIntoSharedAtlas(
+                maskKey, w, h, rgbaPixels, byteSize, outU0, outV0, outU1, outV1);
         });
 }
 
@@ -2777,7 +2792,10 @@ void ImageAtlas::EnsureSharedAtlasAllocatedLocked() {
     slot.isAtlas = true;
     slot.rgbaPixels.assign(
         static_cast<std::size_t>(sharedAtlasSize_) * sharedAtlasSize_ * 4u, 0u);
-    slot.pixelSnapshot = std::make_shared<const std::vector<std::uint8_t>>(slot.rgbaPixels);
+    // Defer pixelSnapshot materialization lazily until CPU software sampling requests it
+    slot.pixelSnapshot.reset();
+    slot.hasDirtyRect = false;
+    slot.dirtyBaseRevision = 1u;
     textureSlots_.emplace(kSharedUiAtlasTextureId, std::move(slot));
 
     skyline_.Reset(sharedAtlasSize_, sharedAtlasSize_);
@@ -2797,13 +2815,22 @@ void ImageAtlas::BlitWithExtrudedBorderLocked(
     std::uint32_t innerX,
     std::uint32_t innerY,
     const DecodedImage& img) noexcept {
+    BlitWithExtrudedBorderLocked(
+        atlasBuf, innerX, innerY, img.width, img.height, img.rgbaPixels.data());
+}
+
+void ImageAtlas::BlitWithExtrudedBorderLocked(
+    TextureSlotBuffer& atlasBuf,
+    std::uint32_t innerX,
+    std::uint32_t innerY,
+    std::uint32_t iw,
+    std::uint32_t ih,
+    const std::uint8_t* srcPixels) noexcept {
     const std::uint32_t aw = atlasBuf.width;
-    const std::uint32_t iw = img.width;
-    const std::uint32_t ih = img.height;
 
     auto copyTexel = [&](std::uint32_t dstX, std::uint32_t dstY, std::uint32_t srcX, std::uint32_t srcY) noexcept {
         std::uint8_t* dst = atlasBuf.rgbaPixels.data() + (static_cast<std::size_t>(dstY) * aw + dstX) * 4u;
-        const std::uint8_t* src = img.rgbaPixels.data() + (static_cast<std::size_t>(srcY) * iw + srcX) * 4u;
+        const std::uint8_t* src = srcPixels + (static_cast<std::size_t>(srcY) * iw + srcX) * 4u;
         std::memcpy(dst, src, 4u);
     };
 
@@ -2811,7 +2838,7 @@ void ImageAtlas::BlitWithExtrudedBorderLocked(
     for (std::uint32_t y = 0u; y < ih; ++y) {
         std::uint8_t* dstRow = atlasBuf.rgbaPixels.data() +
             (static_cast<std::size_t>(innerY + y) * aw + innerX) * 4u;
-        const std::uint8_t* srcRow = img.rgbaPixels.data() + static_cast<std::size_t>(y) * iw * 4u;
+        const std::uint8_t* srcRow = srcPixels + static_cast<std::size_t>(y) * iw * 4u;
         std::memcpy(dstRow, srcRow, static_cast<std::size_t>(iw) * 4u);
 
         // 1px left & right extruded border
@@ -2827,7 +2854,7 @@ void ImageAtlas::BlitWithExtrudedBorderLocked(
     if (innerY > 0u) {
         std::uint8_t* topDst = atlasBuf.rgbaPixels.data() +
             (static_cast<std::size_t>(innerY - 1u) * aw + innerX) * 4u;
-        const std::uint8_t* topSrc = img.rgbaPixels.data();
+        const std::uint8_t* topSrc = srcPixels;
         std::memcpy(topDst, topSrc, static_cast<std::size_t>(iw) * 4u);
         if (innerX > 0u) copyTexel(innerX - 1u, innerY - 1u, 0u, 0u);
         if (innerX + iw < aw) copyTexel(innerX + iw, innerY - 1u, iw - 1u, 0u);
@@ -2835,19 +2862,104 @@ void ImageAtlas::BlitWithExtrudedBorderLocked(
     if (innerY + ih < atlasBuf.height) {
         std::uint8_t* botDst = atlasBuf.rgbaPixels.data() +
             (static_cast<std::size_t>(innerY + ih) * aw + innerX) * 4u;
-        const std::uint8_t* botSrc = img.rgbaPixels.data() + static_cast<std::size_t>(ih - 1u) * iw * 4u;
+        const std::uint8_t* botSrc = srcPixels + static_cast<std::size_t>(ih - 1u) * iw * 4u;
         std::memcpy(botDst, botSrc, static_cast<std::size_t>(iw) * 4u);
         if (innerX > 0u) copyTexel(innerX - 1u, innerY + ih, 0u, ih - 1u);
         if (innerX + iw < aw) copyTexel(innerX + iw, innerY + ih, iw - 1u, ih - 1u);
     }
 
-    try {
-        atlasBuf.pixelSnapshot = std::make_shared<const std::vector<std::uint8_t>>(atlasBuf.rgbaPixels);
-    } catch (...) {
-        atlasBuf.pixelSnapshot.reset();
+    // Invalidate cached CPU snapshot without deep-copying 16MB on every icon blit!
+    atlasBuf.pixelSnapshot.reset();
+    const std::uint32_t bx0 = (innerX > 0u) ? (innerX - 1u) : 0u;
+    const std::uint32_t by0 = (innerY > 0u) ? (innerY - 1u) : 0u;
+    const std::uint32_t bx1 = std::min<std::uint32_t>(atlasBuf.width, innerX + iw + 1u);
+    const std::uint32_t by1 = std::min<std::uint32_t>(atlasBuf.height, innerY + ih + 1u);
+    if (!atlasBuf.hasDirtyRect) {
+        atlasBuf.dirtyBaseRevision = atlasBuf.dirtyRevision;
+        atlasBuf.dirtyX0 = bx0;
+        atlasBuf.dirtyY0 = by0;
+        atlasBuf.dirtyX1 = bx1;
+        atlasBuf.dirtyY1 = by1;
+        atlasBuf.hasDirtyRect = true;
+    } else {
+        atlasBuf.dirtyX0 = std::min(atlasBuf.dirtyX0, bx0);
+        atlasBuf.dirtyY0 = std::min(atlasBuf.dirtyY0, by0);
+        atlasBuf.dirtyX1 = std::max(atlasBuf.dirtyX1, bx1);
+        atlasBuf.dirtyY1 = std::max(atlasBuf.dirtyY1, by1);
     }
     const std::uint64_t nextRev = revision_.fetch_add(1u, std::memory_order_acq_rel) + 1u;
     atlasBuf.dirtyRevision = static_cast<std::uint32_t>(nextRev != 0u ? nextRev : 1u);
+}
+
+bool ImageAtlas::TryPackMaskIntoSharedAtlas(
+    std::uint64_t maskKey,
+    std::uint32_t width,
+    std::uint32_t height,
+    const std::uint8_t* rgbaPixels,
+    std::size_t byteSize,
+    float& outU0,
+    float& outV0,
+    float& outU1,
+    float& outV1) {
+    if (width == 0u || height == 0u || rgbaPixels == nullptr ||
+        byteSize < static_cast<std::size_t>(width) * static_cast<std::size_t>(height) * 4u) {
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (const auto it = packedMasks_.find(maskKey); it != packedMasks_.end()) {
+        if (it->second.width == width && it->second.height == height) {
+            outU0 = it->second.u0;
+            outV0 = it->second.v0;
+            outU1 = it->second.u1;
+            outV1 = it->second.v1;
+            return true;
+        }
+    }
+
+    if (width > maxPackableWidth_ ||
+        height > maxPackableHeight_ ||
+        (width + 2u) > sharedAtlasSize_ ||
+        (height + 2u) > sharedAtlasSize_ ||
+        packedMasks_.size() >= 1024u) {
+        return false;
+    }
+
+    const std::size_t reqArea = static_cast<std::size_t>(width + 2u) * static_cast<std::size_t>(height + 2u);
+    const std::size_t maxMaskBudget =
+        (static_cast<std::size_t>(sharedAtlasSize_) * static_cast<std::size_t>(sharedAtlasSize_)) / 2u;
+    if (packedMaskAreaTexels_ + reqArea > maxMaskBudget) {
+        return false;
+    }
+
+    EnsureSharedAtlasAllocatedLocked();
+    std::uint32_t paddedX = 0u;
+    std::uint32_t paddedY = 0u;
+    if (!TryAllocateSkylineRectLocked(width + 2u, height + 2u, paddedX, paddedY)) {
+        return false;
+    }
+
+    const std::uint32_t innerX = paddedX + 1u;
+    const std::uint32_t innerY = paddedY + 1u;
+    TextureSlotBuffer& sharedBuf = textureSlots_[kSharedUiAtlasTextureId];
+    BlitWithExtrudedBorderLocked(sharedBuf, innerX, innerY, width, height, rgbaPixels);
+
+    const float invAtlasW = 1.0f / static_cast<float>(sharedAtlasSize_);
+    const float invAtlasH = 1.0f / static_cast<float>(sharedAtlasSize_);
+    PackedMaskUvEntry entry{};
+    entry.width = width;
+    entry.height = height;
+    entry.u0 = static_cast<float>(innerX) * invAtlasW;
+    entry.v0 = static_cast<float>(innerY) * invAtlasH;
+    entry.u1 = static_cast<float>(innerX + width) * invAtlasW;
+    entry.v1 = static_cast<float>(innerY + height) * invAtlasH;
+    packedMasks_[maskKey] = entry;
+    packedMaskAreaTexels_ += reqArea;
+
+    outU0 = entry.u0;
+    outV0 = entry.v0;
+    outU1 = entry.u1;
+    outV1 = entry.v1;
+    return true;
 }
 
 const ImageAtlasEntry* ImageAtlas::InsertDecodedLocked(
@@ -2992,6 +3104,8 @@ std::uint32_t ImageAtlas::RegisterOrUpdateRgbaTextureSlot(
     slot.height = height;
     slot.dirtyRevision = static_cast<std::uint32_t>(pendingRev != 0u ? pendingRev : 1u);
     slot.isAtlas = false;
+    slot.hasDirtyRect = false;
+    slot.dirtyBaseRevision = slot.dirtyRevision;
     slot.rgbaPixels.clear();
     slot.rgbaPixels.shrink_to_fit();
     slot.pixelSnapshot = std::move(nextSnap);
@@ -3353,36 +3467,74 @@ bool SynthesizePlasmaShaderImageFromParams(const PlasmaShaderParams& params, Dec
     const float driftX = params.timeSec * 0.35f;
     const float driftY = -params.timeSec * 0.18f;
 
-    for (std::uint32_t py = 0u; py < h; ++py) {
-        const float y = (static_cast<float>(py) + 0.5f) * invSy + seedOy + driftY;
-        for (std::uint32_t px = 0u; px < w; ++px) {
-            const float x = (static_cast<float>(px) + 0.5f) * invSx + seedOx + driftX;
-            const float wx = Perlin3D(x * 0.75f, y * 0.75f, tz * 0.85f, seedW1);
-            const float wy = Perlin3D(x * 0.75f + 13.7f, y * 0.75f + 7.3f, tz * 0.85f + 5.1f, seedW2);
-            const float n0 = Perlin3D(x + wx * 0.90f, y + wy * 0.90f, tz, seedN0);
-            const float n1 = 0.20f * Perlin3D(x * 1.75f - wx * 0.45f, y * 1.75f + wy * 0.45f, tz * 1.30f + 9.4f, seedN1);
-            const float field = n0 + n1;
+    auto shadePlasmaField = [&](float field, std::uint8_t* dst) noexcept {
+        const float raw = std::clamp((field + 0.08f) / 0.56f, 0.0f, 1.0f);
+        const float glow = raw * raw * (3.0f - 2.0f * raw);
+        const float invGlow = 1.0f - glow;
+        const float alpha = std::clamp(1.0f - invGlow * invGlow, 0.0f, 1.0f);
+        const float boost = 1.0f + 0.80f * glow;
+        const float coreT = std::clamp((glow - 0.46f) / 0.54f, 0.0f, 1.0f);
+        const float hotCore = coreT * coreT * (3.0f - 2.0f * coreT) * 0.92f;
+        const float cR = std::clamp(baseR * boost, 0.0f, 1.0f);
+        const float cG = std::clamp(baseG * boost, 0.0f, 1.0f);
+        const float cB = std::clamp(baseB * boost, 0.0f, 1.0f);
+        const float outR = cR + (1.0f - cR) * hotCore;
+        const float outG = cG + (1.0f - cG) * hotCore;
+        const float outB = cB + (1.0f - cB) * hotCore;
+        dst[0] = static_cast<std::uint8_t>(std::clamp(outR, 0.0f, 1.0f) * 255.0f + 0.5f);
+        dst[1] = static_cast<std::uint8_t>(std::clamp(outG, 0.0f, 1.0f) * 255.0f + 0.5f);
+        dst[2] = static_cast<std::uint8_t>(std::clamp(outB, 0.0f, 1.0f) * 255.0f + 0.5f);
+        dst[3] = static_cast<std::uint8_t>(std::clamp(baseA * alpha, 0.0f, 1.0f) * 255.0f + 0.5f);
+    };
 
-            const float raw = std::clamp((field + 0.08f) / 0.56f, 0.0f, 1.0f);
-            const float glow = raw * raw * (3.0f - 2.0f * raw);
-            const float invGlow = 1.0f - glow;
-            const float alpha = std::clamp(1.0f - invGlow * invGlow, 0.0f, 1.0f);
+    auto evalFieldAt = [&](float pxF, float pyF) noexcept -> float {
+        const float x = (pxF + 0.5f) * invSx + seedOx + driftX;
+        const float y = (pyF + 0.5f) * invSy + seedOy + driftY;
+        const float wx = Perlin3D(x * 0.75f, y * 0.75f, tz * 0.85f, seedW1);
+        const float wy = Perlin3D(x * 0.75f + 13.7f, y * 0.75f + 7.3f, tz * 0.85f + 5.1f, seedW2);
+        const float n0 = Perlin3D(x + wx * 0.90f, y + wy * 0.90f, tz, seedN0);
+        const float n1 = 0.20f * Perlin3D(x * 1.75f - wx * 0.45f, y * 1.75f + wy * 0.45f, tz * 1.30f + 9.4f, seedN1);
+        return n0 + n1;
+    };
 
-            const float boost = 1.0f + 0.80f * glow;
-            const float coreT = std::clamp((glow - 0.46f) / 0.54f, 0.0f, 1.0f);
-            const float hotCore = coreT * coreT * (3.0f - 2.0f * coreT) * 0.92f;
-            const float cR = std::clamp(baseR * boost, 0.0f, 1.0f);
-            const float cG = std::clamp(baseG * boost, 0.0f, 1.0f);
-            const float cB = std::clamp(baseB * boost, 0.0f, 1.0f);
-            const float outR = cR + (1.0f - cR) * hotCore;
-            const float outG = cG + (1.0f - cG) * hotCore;
-            const float outB = cB + (1.0f - cB) * hotCore;
-
-            std::uint8_t* dst = outImg.rgbaPixels.data() + (static_cast<std::size_t>(py) * w + px) * 4u;
-            dst[0] = static_cast<std::uint8_t>(std::clamp(outR, 0.0f, 1.0f) * 255.0f + 0.5f);
-            dst[1] = static_cast<std::uint8_t>(std::clamp(outG, 0.0f, 1.0f) * 255.0f + 0.5f);
-            dst[2] = static_cast<std::uint8_t>(std::clamp(outB, 0.0f, 1.0f) * 255.0f + 0.5f);
-            dst[3] = static_cast<std::uint8_t>(std::clamp(baseA * alpha, 0.0f, 1.0f) * 255.0f + 0.5f);
+    // When surface exceeds 4096 pixels and noise wavelength is >= 16px, sample the smooth continuous
+    // Perlin scalar field on a 4x4 lattice and bilinearly reconstruct before applying the sharp glow curve.
+    if (static_cast<std::size_t>(w) * h > 4096u && params.sx >= 16.0f && params.sy >= 16.0f) {
+        constexpr std::uint32_t kStep = 4u;
+        const std::uint32_t gw = (w + kStep - 1u) / kStep + 1u;
+        const std::uint32_t gh = (h + kStep - 1u) / kStep + 1u;
+        std::vector<float> grid(static_cast<std::size_t>(gw) * gh);
+        for (std::uint32_t gy = 0u; gy < gh; ++gy) {
+            const float pyF = static_cast<float>(std::min<std::uint32_t>(gy * kStep, h - 1u));
+            for (std::uint32_t gx = 0u; gx < gw; ++gx) {
+                const float pxF = static_cast<float>(std::min<std::uint32_t>(gx * kStep, w - 1u));
+                grid[static_cast<std::size_t>(gy) * gw + gx] = evalFieldAt(pxF, pyF);
+            }
+        }
+        constexpr float kInvStep = 1.0f / static_cast<float>(kStep);
+        for (std::uint32_t py = 0u; py < h; ++py) {
+            const std::uint32_t gy0 = py / kStep;
+            const std::uint32_t gy1 = std::min<std::uint32_t>(gy0 + 1u, gh - 1u);
+            const float ty = static_cast<float>(py - gy0 * kStep) * kInvStep;
+            const float* row0 = grid.data() + static_cast<std::size_t>(gy0) * gw;
+            const float* row1 = grid.data() + static_cast<std::size_t>(gy1) * gw;
+            std::uint8_t* dstRow = outImg.rgbaPixels.data() + static_cast<std::size_t>(py) * w * 4u;
+            for (std::uint32_t px = 0u; px < w; ++px) {
+                const std::uint32_t gx0 = px / kStep;
+                const std::uint32_t gx1 = std::min<std::uint32_t>(gx0 + 1u, gw - 1u);
+                const float tx = static_cast<float>(px - gx0 * kStep) * kInvStep;
+                const float top = row0[gx0] + (row0[gx1] - row0[gx0]) * tx;
+                const float bot = row1[gx0] + (row1[gx1] - row1[gx0]) * tx;
+                shadePlasmaField(top + (bot - top) * ty, dstRow + px * 4u);
+            }
+        }
+    } else {
+        for (std::uint32_t py = 0u; py < h; ++py) {
+            for (std::uint32_t px = 0u; px < w; ++px) {
+                shadePlasmaField(
+                    evalFieldAt(static_cast<float>(px), static_cast<float>(py)),
+                    outImg.rgbaPixels.data() + (static_cast<std::size_t>(py) * w + px) * 4u);
+            }
         }
     }
     return true;
@@ -3747,6 +3899,7 @@ bool ImageAtlas::TryGetTextureSlotSnapshot(
     if (!snap && !slot.rgbaPixels.empty()) {
         try {
             snap = std::make_shared<const std::vector<std::uint8_t>>(slot.rgbaPixels);
+            slot.pixelSnapshot = snap;
         } catch (...) {
             snap.reset();
         }
@@ -3797,6 +3950,79 @@ bool ImageAtlas::CopyTextureSlotIfModified(
     return true;
 }
 
+bool ImageAtlas::CopyTextureSlotDirtySubRectIfModified(
+    std::uint32_t textureId,
+    std::uint32_t& ioKnownSlotRevision,
+    std::uint32_t& outSlotWidth,
+    std::uint32_t& outSlotHeight,
+    std::uint32_t& outDirtyX,
+    std::uint32_t& outDirtyY,
+    std::uint32_t& outDirtyW,
+    std::uint32_t& outDirtyH,
+    std::vector<std::uint8_t>& outSubRectRgba8,
+    bool& outWasUpdated) const {
+    outWasUpdated = false;
+    std::lock_guard<std::mutex> lock(mutex_);
+    const auto it = textureSlots_.find(textureId);
+    if (it == textureSlots_.end()) {
+        outSlotWidth = 0u;
+        outSlotHeight = 0u;
+        return false;
+    }
+    const TextureSlotBuffer& slot = it->second;
+    const std::vector<std::uint8_t>& px = slot.pixelSnapshot ? *slot.pixelSnapshot : slot.rgbaPixels;
+    const std::size_t expectedBytes = static_cast<std::size_t>(slot.width) * slot.height * 4u;
+    if (slot.width == 0u || slot.height == 0u || px.size() < expectedBytes) {
+        outSlotWidth = 0u;
+        outSlotHeight = 0u;
+        return false;
+    }
+    outSlotWidth = slot.width;
+    outSlotHeight = slot.height;
+    if (ioKnownSlotRevision != 0u && ioKnownSlotRevision == slot.dirtyRevision) {
+        return true;
+    }
+    if (ioKnownSlotRevision != 0u &&
+        slot.isAtlas &&
+        slot.hasDirtyRect &&
+        ioKnownSlotRevision == slot.dirtyBaseRevision &&
+        slot.dirtyX1 > slot.dirtyX0 &&
+        slot.dirtyY1 > slot.dirtyY0 &&
+        slot.dirtyX1 <= slot.width &&
+        slot.dirtyY1 <= slot.height) {
+        const std::uint32_t subW = slot.dirtyX1 - slot.dirtyX0;
+        const std::uint32_t subH = slot.dirtyY1 - slot.dirtyY0;
+        outDirtyX = slot.dirtyX0;
+        outDirtyY = slot.dirtyY0;
+        outDirtyW = subW;
+        outDirtyH = subH;
+        outSubRectRgba8.resize(static_cast<std::size_t>(subW) * subH * 4u);
+        for (std::uint32_t row = 0u; row < subH; ++row) {
+            const std::uint8_t* srcRow = px.data() +
+                (static_cast<std::size_t>(slot.dirtyY0 + row) * slot.width + slot.dirtyX0) * 4u;
+            std::memcpy(
+                outSubRectRgba8.data() + static_cast<std::size_t>(row) * subW * 4u,
+                srcRow,
+                static_cast<std::size_t>(subW) * 4u);
+        }
+        slot.dirtyBaseRevision = slot.dirtyRevision;
+        slot.hasDirtyRect = false;
+        ioKnownSlotRevision = slot.dirtyRevision;
+        outWasUpdated = true;
+        return true;
+    }
+    outDirtyX = 0u;
+    outDirtyY = 0u;
+    outDirtyW = slot.width;
+    outDirtyH = slot.height;
+    outSubRectRgba8.assign(px.data(), px.data() + expectedBytes);
+    slot.dirtyBaseRevision = slot.dirtyRevision;
+    slot.hasDirtyRect = false;
+    ioKnownSlotRevision = slot.dirtyRevision;
+    outWasUpdated = true;
+    return true;
+}
+
 Color ImageAtlas::SampleBilinearRgba(std::uint32_t textureId, float u, float v) const noexcept {
     enum class SlotCacheStatus : std::uint8_t {
         Unset = 0,
@@ -3836,6 +4062,7 @@ Color ImageAtlas::SampleBilinearRgba(std::uint32_t textureId, float u, float v) 
         if (!snap && !sBuf.rgbaPixels.empty()) {
             try {
                 snap = std::make_shared<const std::vector<std::uint8_t>>(sBuf.rgbaPixels);
+                sBuf.pixelSnapshot = snap;
             } catch (...) {
                 snap.reset();
             }
@@ -3918,6 +4145,8 @@ void ImageAtlas::Clear() noexcept {
     skyline_.ClearToEmpty();
     memoryEncodedAssets_.clear();
     entries_.clear();
+    packedMasks_.clear();
+    packedMaskAreaTexels_ = 0u;
     plasmaSlots_.clear();
     riveSlots_.clear();
     visualBrushSlots_.clear();
@@ -4006,9 +4235,55 @@ bool CompositeMaskedPathTexture(
         return true;
     }
 
+    // Cache static 1-channel SVG path alpha masks across frames so animated brushes (PlasmaBrush)
+    // never re-parse or supersample-rasterize invariant vector outlines when texRev changes!
+    const std::uint32_t maskTexW = clampedW + 2u * clampedPad;
+    const std::uint32_t maskTexH = clampedH + 2u * clampedPad;
+    const std::size_t maskPixels = static_cast<std::size_t>(maskTexW) * maskTexH;
+    std::uint64_t alphaShapeKey = safeHash ^ 0x71E2D3C4B5A69788ULL;
+    alphaShapeKey ^= (static_cast<std::uint64_t>(clampedW) << 32u) | static_cast<std::uint64_t>(clampedH);
+    alphaShapeKey *= 1099511628211ULL;
+    alphaShapeKey ^= static_cast<std::uint64_t>(clampedPad);
+    alphaShapeKey *= 1099511628211ULL;
+
+    struct StaticPathAlphaCache {
+        std::mutex mutex;
+        std::unordered_map<std::uint64_t, std::vector<std::uint8_t>> masks;
+        std::size_t totalBytes = 0u;
+    };
+    static StaticPathAlphaCache sAlphaCache;
+
     std::vector<std::uint8_t> maskRgba;
-    if (!RasterizeSvgPathFillAlphaMask(pathData, rawBounds, clampedW, clampedH, clampedPad, maskRgba)) {
-        return false;
+    bool hitAlphaCache = false;
+    if (maskPixels <= 512u * 512u) {
+        std::lock_guard<std::mutex> aLock(sAlphaCache.mutex);
+        if (const auto ait = sAlphaCache.masks.find(alphaShapeKey);
+            ait != sAlphaCache.masks.end() && ait->second.size() == maskPixels) {
+            maskRgba.resize(maskPixels * 4u);
+            const std::uint8_t* srcA = ait->second.data();
+            for (std::size_t i = 0u; i < maskPixels; ++i) {
+                maskRgba[i * 4u + 3u] = srcA[i];
+            }
+            hitAlphaCache = true;
+        }
+    }
+    if (!hitAlphaCache) {
+        if (!RasterizeSvgPathFillAlphaMask(pathData, rawBounds, clampedW, clampedH, clampedPad, maskRgba)) {
+            return false;
+        }
+        if (maskPixels <= 512u * 512u && maskRgba.size() >= maskPixels * 4u) {
+            std::vector<std::uint8_t> compactA(maskPixels);
+            for (std::size_t i = 0u; i < maskPixels; ++i) {
+                compactA[i] = maskRgba[i * 4u + 3u];
+            }
+            std::lock_guard<std::mutex> aLock(sAlphaCache.mutex);
+            if (sAlphaCache.masks.size() >= 48u || sAlphaCache.totalBytes + maskPixels > 8u * 1024u * 1024u) {
+                sAlphaCache.masks.clear();
+                sAlphaCache.totalBytes = 0u;
+            }
+            sAlphaCache.totalBytes += compactA.size();
+            sAlphaCache.masks[alphaShapeKey] = std::move(compactA);
+        }
     }
 
     const std::uint32_t texW = clampedW + 2u * clampedPad;

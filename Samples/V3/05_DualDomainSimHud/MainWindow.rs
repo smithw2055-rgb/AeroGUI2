@@ -57,6 +57,13 @@ public static SimTelemetryState CreateSimState() {
 public partial class MainWindow : Window {
     public SimTelemetryState Sim { get; private set; }
     private int _lastSyncedCmdCount = -1;
+    private RotateTransform _needleRotate = null;
+    private float _lastNeedleHeading = -99999.0f;
+    private int _lastShieldInt = -1;
+    private int _lastHullInt = -1;
+    private int _lastEnergyInt = -1;
+    private int _lastThrustInt = -1;
+    private int _lastStatsCmd = -1;
 
     public MainWindow() {
         InitializeComponent();
@@ -104,17 +111,33 @@ public partial class MainWindow : Window {
             if (HealthFill != null) { HealthFill.Width = Sim.Health; }
             if (EnergyFill != null) { EnergyFill.Width = Sim.Energy; }
             if (ThrustFill != null) { ThrustFill.Width = Sim.Thrust; }
-            if (SpeedNeedle != null) {
-                SpeedNeedle.RenderTransform = new RotateTransform(Sim.HeadingDeg);
+        }
+        if (SpeedNeedle != null && _lastNeedleHeading != Sim.HeadingDeg) {
+            _lastNeedleHeading = Sim.HeadingDeg;
+            if (_needleRotate == null) {
+                _needleRotate = new RotateTransform(Sim.HeadingDeg);
+                SpeedNeedle.RenderTransform = _needleRotate;
+            } else {
+                _needleRotate.Angle = Sim.HeadingDeg;
             }
         }
-        if (ShieldStatusText != null) {
+        int shieldInt = Sim.ShieldsActive ? 1 : 0;
+        if (ShieldStatusText != null && _lastShieldInt != shieldInt) {
+            _lastShieldInt = shieldInt;
             ShieldStatusText.Text = Sim.ShieldsActive ? "SHIELDS: ONLINE" : "SHIELDS: STANDBY";
         }
-        if (TelemetrySummaryText != null) {
-            TelemetrySummaryText.Text = "Hull " + (int)Sim.Health + " | Reactor " + (int)Sim.Energy + " | Thrust " + (int)Sim.Thrust;
+        int hullI = (int)Sim.Health;
+        int energyI = (int)Sim.Energy;
+        int thrustI = (int)Sim.Thrust;
+        if (TelemetrySummaryText != null &&
+            (hullI != _lastHullInt || energyI != _lastEnergyInt || thrustI != _lastThrustInt)) {
+            _lastHullInt = hullI;
+            _lastEnergyInt = energyI;
+            _lastThrustInt = thrustI;
+            TelemetrySummaryText.Text = "Hull " + hullI + " | Reactor " + energyI + " | Thrust " + thrustI;
         }
-        if (DomainStatsText != null) {
+        if (DomainStatsText != null && _lastStatsCmd != Sim.CommandCount) {
+            _lastStatsCmd = Sim.CommandCount;
             DomainStatsText.Text = "Sim commands processed: " + Sim.CommandCount;
         }
     }

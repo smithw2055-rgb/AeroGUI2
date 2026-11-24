@@ -18,6 +18,7 @@
 #include <unordered_set>
 
 #include "aero/compiler/MirReachabilityPruner.hpp"
+#include "aero/compiler/StdlibDllLoader.hpp"
 #include "aero/compiler/StdlibModulePack.hpp"
 #include "aero/compiler/XamlToRsEmitter.hpp"
 #include "aero/core/StringUtils.hpp"
@@ -25,10 +26,13 @@
 #include "realscript/aot_cpp/AotCpp.h"
 #include "realscript/bytecode/Bytecode.h"
 #include "realscript/compiler/ModuleBuildCache.h"
+#include "realscript/compiler/PrecompiledModule.h"
 #include "realscript/compiler/StandardMacros.h"
 #include "realscript/diagnostics/Diagnostic.h"
 #include "realscript/optimization/Optimizer.h"
 #include "realscript/runtime/Runtime.h"
+
+#include <chrono>
 
 #if defined(_WIN32)
 #ifndef WIN32_LEAN_AND_MEAN
@@ -1477,11 +1481,34 @@ void CompactProcessHeapAfterCompile() noexcept {
 AeroV3CompileResult AeroCompilerV3::Compile(const AeroV3CompileInput& input) const {
     AeroV3CompileResult result;
 
-    const std::filesystem::path effectiveCacheDir = ResolveEffectiveCacheDir(input);
+    const bool useDllMode = input.includeStdlib && input.useStdlibDll && !input.emitAotCpp;
+    std::shared_ptr<const LoadedStdlibDll> loadedDll;
+    std::shared_ptr<LoadedStdlibDll> oneShotLoadedDll;
+    if (useDllMode) {
+        std::string dllErr;
+        if (input.retainStdlibDllCache) {
+            loadedDll = LoadStdlibDll(input.stdlibDllPath, &dllErr);
+        } else {
+            oneShotLoadedDll = LoadStdlibDllOneShot(input.stdlibDllPath, &dllErr);
+            loadedDll = oneShotLoadedDll;
+        }
+        if (!loadedDll || !loadedDll->frontendPack || !loadedDll->lazyBundle) {
+            result.diagnostics.emplace_back(
+                dllErr.empty()
+                    ? std::string("StdlibDllLoader: failed to load aerogui_stdlib dynamic library")
+                    : ("StdlibDllLoader: " + dllErr));
+            return result;
+        }
+        result.stdlibDllLoadMs = loadedDll->loadAndDecodeMs;
+    }
+
+    const std::filesystem::path effectiveCacheDir =
+        useDllMode ? std::filesystem::path{} : ResolveEffectiveCacheDir(input);
     const bool sessionAllowsEarlyHit =
         (input.compilerSession == nullptr) ||
         (input.compilerSession->parsedUnitCacheSize() > 0u);
     const bool canUseRawProgramCache =
+        !useDllMode &&
         !effectiveCacheDir.empty() &&
         !input.emitAotCpp &&
         sessionAllowsEarlyHit &&
@@ -1492,7 +1519,7 @@ AeroV3CompileResult AeroCompilerV3::Compile(const AeroV3CompileInput& input) con
     std::filesystem::path resolvedStdlibRoot;
     std::uint64_t stdlibStatFp = 0u;
     std::uint64_t stdlibHash = 0u;
-    if (input.includeStdlib) {
+    if (input.includeStdlib && !useDllMode) {
         resolvedStdlibRoot = ResolveStdlibRootDirectory(input.stdlibRootDir);
         if (resolvedStdlibRoot.empty()) {
             result.diagnostics.emplace_back(
@@ -1548,7 +1575,7 @@ AeroV3CompileResult AeroCompilerV3::Compile(const AeroV3CompileInput& input) con
         }
     }
 
-    if (input.includeStdlib && stdlibSources.empty()) {
+    if (input.includeStdlib && !useDllMode && stdlibSources.empty()) {
         stdlibSources = LoadStdlibModulePack(input.stdlibRootDir);
         if (stdlibSources.empty()) {
             result.diagnostics.emplace_back(
@@ -1670,7 +1697,13 @@ AeroV3CompileResult AeroCompilerV3::Compile(const AeroV3CompileInput& input) con
     }
 
     // Assemble declared modules before C# compatibility lowering
-    std::unordered_set<std::string> availableModules = CollectDeclaredModuleNames(stdlibSources);
+    std::unordered_set<std::string> availableModules =
+        useDllMode
+            ? [&]() {
+                  const auto names = loadedDll->frontendPack->moduleNames();
+                  return std::unordered_set<std::string>(names.begin(), names.end());
+              }()
+            : CollectDeclaredModuleNames(stdlibSources);
     const auto scriptDeclared = CollectDeclaredModuleNames(input.scriptSources);
     availableModules.insert(scriptDeclared.begin(), scriptDeclared.end());
     if (!xamlRes.moduleName.empty()) {
@@ -1728,9 +1761,10 @@ AeroV3CompileResult AeroCompilerV3::Compile(const AeroV3CompileInput& input) con
         return result;
     }
 
-    // Configure RealScript compilation + stdlib snapshot/disk cache
+    // Configure RealScript compilation + stdlib snapshot/disk cache (or precompiled DLL pack)
+    const auto tCompStart = std::chrono::steady_clock::now();
     rs_comp::CompilationOptions compOpts;
-    compOpts.populateSnapshot = (input.compilerSession != nullptr);
+    compOpts.populateSnapshot = !useDllMode && (input.compilerSession != nullptr);
     compOpts.collectSymbolOccurrences = false;
     compOpts.emitDebugInfo = input.emitAotCpp;
     compOpts.allowDefaultBuiltinPacks = true;
@@ -1743,7 +1777,11 @@ AeroV3CompileResult AeroCompilerV3::Compile(const AeroV3CompileInput& input) con
     bool stdlibCacheCandidate = false;
     std::shared_ptr<const ProcessStdlibCacheEntry> procEntry;
 
-    if (input.compilerSession != nullptr) {
+    if (useDllMode) {
+        compOpts.precompiledModules = loadedDll->frontendPack;
+        compOpts.session.reset();
+        compOpts.populateSnapshot = false;
+    } else if (input.compilerSession != nullptr) {
         compOpts.session = std::shared_ptr<rs_comp::CompilerSession>(
             input.compilerSession, [](rs_comp::CompilerSession*) {});
         if (input.compilerSession->parsedUnitCacheSize() > 0) {
@@ -1798,12 +1836,16 @@ AeroV3CompileResult AeroCompilerV3::Compile(const AeroV3CompileInput& input) con
         }
     }
 
-    if (input.compilerSession == nullptr && !usePreviousSnapshot && !input.allowStdlibCache) {
+    if (!useDllMode &&
+        input.compilerSession == nullptr &&
+        !usePreviousSnapshot &&
+        !input.allowStdlibCache) {
         compOpts.populateSnapshot = false;
         compOpts.collectSymbolOccurrences = false;
         compOpts.emitDebugInfo = input.emitAotCpp;
     }
-    if (input.includeStdlib &&
+    if (!useDllMode &&
+        input.includeStdlib &&
         input.treeShakeStdlib &&
         !usePreviousSnapshot &&
         input.compilerSession == nullptr) {
@@ -1860,7 +1902,7 @@ AeroV3CompileResult AeroCompilerV3::Compile(const AeroV3CompileInput& input) con
 
         // Only update per-caller SessionSnapshotCache; NEVER overwrite the shared
         // process-wide stdlib snapshot with user compilation units.
-        if (input.compilerSession != nullptr) {
+        if (!useDllMode && input.compilerSession != nullptr) {
             auto& cache = GetSessionSnapshotCache();
             std::lock_guard<std::mutex> lock(cache.mutex);
             if (cache.snapshots.size() >= 4u &&
@@ -1872,6 +1914,9 @@ AeroV3CompileResult AeroCompilerV3::Compile(const AeroV3CompileInput& input) con
 
         mirModules = std::move(buildRes.modules);
     }
+    if (oneShotLoadedDll) {
+        oneShotLoadedDll->frontendPack.reset();
+    }
     std::vector<SourceFile>().swap(stdlibSources);
     previousSnapshot = {};
     result.usedStdlibCache = stdlibCacheCandidate && stdlibReused;
@@ -1879,7 +1924,7 @@ AeroV3CompileResult AeroCompilerV3::Compile(const AeroV3CompileInput& input) con
     // CRITICAL: Strip Aero.Native dummy bodies BEFORE tree-shaker, optimizer, lowerer, and AOT emitter!
     StripAeroNativeMirBodies(mirModules);
 
-    if (input.includeStdlib && input.treeShakeStdlib) {
+    if (input.includeStdlib && input.treeShakeStdlib && !useDllMode) {
         MirPruneStats pruneStats;
         (void)PruneUnreachableStdlibMir(mirModules, &pruneStats);
         result.retainedMirTypes = pruneStats.retainedTypes;
@@ -1977,8 +2022,12 @@ AeroV3CompileResult AeroCompilerV3::Compile(const AeroV3CompileInput& input) con
         std::vector<rs_mir::Module>().swap(mirModules);
     }
 
+    const auto tCompEnd = std::chrono::steady_clock::now();
+    result.compileFrontendAndMirMs =
+        std::chrono::duration<double, std::milli>(tCompEnd - tCompStart).count();
+
     const bool useDirectMoveLink = !input.retainBytecodeModules && !input.emitAotCpp;
-    const bool needEncodedBundle = !input.skipRawBytecodeOutput || !progCacheFilePath.empty();
+    const bool needEncodedBundle = !useDllMode && (!input.skipRawBytecodeOutput || !progCacheFilePath.empty());
     std::vector<std::uint8_t> encodedProgramBytes;
     if (needEncodedBundle) {
         encodedProgramBytes = EncodeProgramBundle(result.bytecodeModules);
@@ -1988,9 +2037,53 @@ AeroV3CompileResult AeroCompilerV3::Compile(const AeroV3CompileInput& input) con
     }
 
     // Link ProgramImage (modules above already passed rs_bc::verifyModule or cached verification)
+    const auto tLinkStart = std::chrono::steady_clock::now();
     rs_rt::RuntimeError linkErr;
     std::optional<ProgramImage> linked;
-    if (useDirectMoveLink) {
+    if (useDllMode) {
+        if (useDirectMoveLink || !input.retainBytecodeModules) {
+            if (oneShotLoadedDll && oneShotLoadedDll->lazyBundle) {
+                linked = ProgramImage::linkLayeredConsumeHeader(
+                    std::move(oneShotLoadedDll->lazyBundle),
+                    std::move(result.bytecodeModules),
+                    linkErr,
+                    /*verifyUserModules=*/false);
+                oneShotLoadedDll.reset();
+                loadedDll.reset();
+            } else {
+                linked = ProgramImage::linkLayered(
+                    loadedDll->lazyBundle,
+                    std::move(result.bytecodeModules),
+                    linkErr,
+                    /*verifyUserModules=*/false);
+            }
+            std::vector<rs_bc::Module>().swap(result.bytecodeModules);
+            if (linked.has_value()) {
+                linked->compactForRuntime();
+            }
+            CompactProcessHeapAfterCompile();
+        } else if (oneShotLoadedDll && oneShotLoadedDll->lazyBundle) {
+            auto userCopy = result.bytecodeModules;
+            linked = ProgramImage::linkLayeredConsumeHeader(
+                std::move(oneShotLoadedDll->lazyBundle),
+                std::move(userCopy),
+                linkErr,
+                /*verifyUserModules=*/false);
+            oneShotLoadedDll.reset();
+            loadedDll.reset();
+            if (linked.has_value()) {
+                linked->compactForRuntime();
+            }
+            CompactProcessHeapAfterCompile();
+        } else {
+            auto userCopy = result.bytecodeModules;
+            linked = ProgramImage::linkLayered(
+                loadedDll->lazyBundle,
+                std::move(userCopy),
+                linkErr,
+                /*verifyUserModules=*/false);
+        }
+    } else if (useDirectMoveLink) {
         linked = ProgramImage::link(std::move(result.bytecodeModules), linkErr, /*verifyModules=*/false);
         std::vector<rs_bc::Module>().swap(result.bytecodeModules);
         if (linked.has_value()) {
@@ -2005,6 +2098,9 @@ AeroV3CompileResult AeroCompilerV3::Compile(const AeroV3CompileInput& input) con
             std::vector<rs_bc::Module>().swap(result.bytecodeModules);
         }
     }
+    const auto tLinkEnd = std::chrono::steady_clock::now();
+    result.linkMs = std::chrono::duration<double, std::milli>(tLinkEnd - tLinkStart).count();
+    result.usedStdlibDll = useDllMode;
     if (!linked.has_value()) {
         result.diagnostics.push_back(
             std::string("ProgramImage link error ") + rs_rt::errorCodeName(linkErr.code) +

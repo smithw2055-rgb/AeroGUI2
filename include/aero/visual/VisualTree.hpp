@@ -13,6 +13,7 @@
 
 #include "aero/core/RsAliases.hpp"
 #include "aero/drawing/Geometry.hpp"
+#include "aero/render/FontAtlas.hpp"
 
 namespace aero {
 
@@ -230,6 +231,14 @@ struct VisualTextData {
     std::uint32_t selRgba = 0x66FF9933u;
     std::uint32_t caretRgba = 0xFF000000u;
     std::vector<VisualTextSpan> richSpans;
+    mutable bool hasCachedLayout = false;
+    mutable bool cachedRtl = false;
+    mutable float cachedMaxW = -1.0f;
+    mutable float cachedMaxH = -1.0f;
+    mutable std::uint64_t cachedFontRev = 0u;
+    mutable TextLayoutResult cachedLayout{};
+
+    void InvalidateLayoutCache() noexcept { hasCachedLayout = false; }
 };
 
 struct VisualImageData {
@@ -351,18 +360,31 @@ struct VisualLayoutData {
     std::uint32_t renderNodeCount = 0u;
 };
 
-struct VisualNodeExtras {
+struct VisualSpatial3DData {
     VisualTransform3D transform3D{};
-    VisualEffectStyle effect{};
-    VisualOpacityMask opacityMask{};
-    VisualTextData text{};
-    VisualImageData image{};
-    VisualVectorData vector{};
     Matrix4x4 modelMatrix3D{};
     Matrix4x4 worldMatrix3D{};
     float effectiveCamDist = 0.0f;
+};
+
+struct VisualEffectAndMaskData {
+    VisualEffectStyle effect{};
+    VisualOpacityMask opacityMask{};
+};
+
+struct VisualGridDefsData {
     std::vector<VisualGridLength> rowDefs;
     std::vector<VisualGridLength> colDefs;
+};
+
+// Slim 48-byte lazy pointer hub (down from 696B monolithic struct: -93.1% per-extras header!)
+struct VisualNodeExtras {
+    std::unique_ptr<VisualSpatial3DData> spatial3D;
+    std::unique_ptr<VisualEffectAndMaskData> effectMask;
+    std::unique_ptr<VisualTextData> text;
+    std::unique_ptr<VisualImageData> image;
+    std::unique_ptr<VisualVectorData> vector;
+    std::unique_ptr<VisualGridDefsData> gridDefs;
 };
 
 struct VisualNode {
@@ -388,46 +410,105 @@ struct VisualNode {
     std::array<float, 4> customScalars{0.0f, 1.0f, 1.0f, 0.0f};
 
     [[nodiscard]] bool HasExtras() const noexcept { return extras != nullptr; }
+    [[nodiscard]] bool HasSpatial3D() const noexcept { return extras && extras->spatial3D != nullptr; }
+    [[nodiscard]] bool HasEffectMask() const noexcept { return extras && extras->effectMask != nullptr; }
+    [[nodiscard]] bool HasTextData() const noexcept { return extras && extras->text != nullptr; }
+    [[nodiscard]] bool HasImageData() const noexcept { return extras && extras->image != nullptr; }
+    [[nodiscard]] bool HasVectorData() const noexcept { return extras && extras->vector != nullptr; }
+    [[nodiscard]] bool HasGridDefs() const noexcept { return extras && extras->gridDefs != nullptr; }
+
     [[nodiscard]] VisualNodeExtras& EnsureExtras() {
         if (!extras) extras = std::make_unique<VisualNodeExtras>();
         return *extras;
     }
-    [[nodiscard]] static const VisualNodeExtras& DefaultExtras() noexcept {
-        static const VisualNodeExtras kDefault{};
+    [[nodiscard]] VisualSpatial3DData& EnsureSpatial3D() {
+        auto& e = EnsureExtras();
+        if (!e.spatial3D) e.spatial3D = std::make_unique<VisualSpatial3DData>();
+        return *e.spatial3D;
+    }
+    [[nodiscard]] VisualEffectAndMaskData& EnsureEffectMask() {
+        auto& e = EnsureExtras();
+        if (!e.effectMask) e.effectMask = std::make_unique<VisualEffectAndMaskData>();
+        return *e.effectMask;
+    }
+    [[nodiscard]] VisualTextData& EnsureTextData() {
+        auto& e = EnsureExtras();
+        if (!e.text) e.text = std::make_unique<VisualTextData>();
+        return *e.text;
+    }
+    [[nodiscard]] VisualImageData& EnsureImageData() {
+        auto& e = EnsureExtras();
+        if (!e.image) e.image = std::make_unique<VisualImageData>();
+        return *e.image;
+    }
+    [[nodiscard]] VisualVectorData& EnsureVectorData() {
+        auto& e = EnsureExtras();
+        if (!e.vector) e.vector = std::make_unique<VisualVectorData>();
+        return *e.vector;
+    }
+    [[nodiscard]] VisualGridDefsData& EnsureGridDefs() {
+        auto& e = EnsureExtras();
+        if (!e.gridDefs) e.gridDefs = std::make_unique<VisualGridDefsData>();
+        return *e.gridDefs;
+    }
+
+    [[nodiscard]] static const VisualSpatial3DData& DefaultSpatial3D() noexcept {
+        static const VisualSpatial3DData kDefault{};
         return kDefault;
     }
+    [[nodiscard]] static const VisualEffectAndMaskData& DefaultEffectMask() noexcept {
+        static const VisualEffectAndMaskData kDefault{};
+        return kDefault;
+    }
+    [[nodiscard]] static const VisualTextData& DefaultTextData() noexcept {
+        static const VisualTextData kDefault{};
+        return kDefault;
+    }
+    [[nodiscard]] static const VisualImageData& DefaultImageData() noexcept {
+        static const VisualImageData kDefault{};
+        return kDefault;
+    }
+    [[nodiscard]] static const VisualVectorData& DefaultVectorData() noexcept {
+        static const VisualVectorData kDefault{};
+        return kDefault;
+    }
+    [[nodiscard]] static const VisualGridDefsData& DefaultGridDefs() noexcept {
+        static const VisualGridDefsData kDefault{};
+        return kDefault;
+    }
+
     [[nodiscard]] const VisualTransform3D& Transform3D() const noexcept {
-        return extras ? extras->transform3D : DefaultExtras().transform3D;
+        return HasSpatial3D() ? extras->spatial3D->transform3D : DefaultSpatial3D().transform3D;
     }
     [[nodiscard]] const VisualEffectStyle& Effect() const noexcept {
-        return extras ? extras->effect : DefaultExtras().effect;
+        return HasEffectMask() ? extras->effectMask->effect : DefaultEffectMask().effect;
     }
     [[nodiscard]] const VisualOpacityMask& OpacityMask() const noexcept {
-        return extras ? extras->opacityMask : DefaultExtras().opacityMask;
+        return HasEffectMask() ? extras->effectMask->opacityMask : DefaultEffectMask().opacityMask;
     }
     [[nodiscard]] const VisualTextData& Text() const noexcept {
-        return extras ? extras->text : DefaultExtras().text;
+        return HasTextData() ? *extras->text : DefaultTextData();
     }
     [[nodiscard]] const VisualImageData& Image() const noexcept {
-        return extras ? extras->image : DefaultExtras().image;
+        return HasImageData() ? *extras->image : DefaultImageData();
     }
     [[nodiscard]] const VisualVectorData& Vector() const noexcept {
-        return extras ? extras->vector : DefaultExtras().vector;
+        return HasVectorData() ? *extras->vector : DefaultVectorData();
     }
     [[nodiscard]] const Matrix4x4& ModelMatrix3D() const noexcept {
-        return extras ? extras->modelMatrix3D : DefaultExtras().modelMatrix3D;
+        return HasSpatial3D() ? extras->spatial3D->modelMatrix3D : DefaultSpatial3D().modelMatrix3D;
     }
     [[nodiscard]] const Matrix4x4& WorldMatrix3D() const noexcept {
-        return extras ? extras->worldMatrix3D : DefaultExtras().worldMatrix3D;
+        return HasSpatial3D() ? extras->spatial3D->worldMatrix3D : DefaultSpatial3D().worldMatrix3D;
     }
     [[nodiscard]] float EffectiveCamDist() const noexcept {
-        return extras ? extras->effectiveCamDist : 0.0f;
+        return HasSpatial3D() ? extras->spatial3D->effectiveCamDist : 0.0f;
     }
     [[nodiscard]] const std::vector<VisualGridLength>& RowDefs() const noexcept {
-        return extras ? extras->rowDefs : DefaultExtras().rowDefs;
+        return HasGridDefs() ? extras->gridDefs->rowDefs : DefaultGridDefs().rowDefs;
     }
     [[nodiscard]] const std::vector<VisualGridLength>& ColDefs() const noexcept {
-        return extras ? extras->colDefs : DefaultExtras().colDefs;
+        return HasGridDefs() ? extras->gridDefs->colDefs : DefaultGridDefs().colDefs;
     }
 };
 

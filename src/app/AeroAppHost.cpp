@@ -1293,7 +1293,8 @@ bool AeroAppHost::LoadProgramImageInternal(
     }
 
 #ifdef AERO_HAS_STENCIL_JIT
-    if (config_.enableStencilJit && realscript::jit::StencilJit::nativeAvailable()) {
+    if (config_.enableStencilJit && programImage_->totalLazyFunctionCount() == 0u &&
+        realscript::jit::StencilJit::nativeAvailable()) {
         const realscript::jit::StencilJit jitCompiler;
         realscript::jit::StencilJitOptions jitOpts{};
         jitOpts.enableNativeCodegen = true;
@@ -1322,7 +1323,23 @@ bool AeroAppHost::LoadProgramImageInternal(
                         realscript::jit::StencilTier::InterpreterFallback) {
                         return false;
                     }
-                    std::vector<UnifiedValue> argVec;
+                    thread_local std::vector<UnifiedValue> tlPrimaryArgs;
+                    thread_local bool tlPrimaryInUse = false;
+                    std::vector<UnifiedValue> fallbackArgs;
+                    std::vector<UnifiedValue>& argVec = !tlPrimaryInUse ? tlPrimaryArgs : fallbackArgs;
+                    const bool claimedPrimary = !tlPrimaryInUse;
+                    if (claimedPrimary) {
+                        tlPrimaryInUse = true;
+                    }
+                    struct PrimaryGuard {
+                        bool active;
+                        ~PrimaryGuard() {
+                            if (active) {
+                                tlPrimaryInUse = false;
+                            }
+                        }
+                    } guard{claimedPrimary};
+                    argVec.clear();
                     if (arguments != nullptr && argumentCount > 0u) {
                         argVec.assign(arguments, arguments + argumentCount);
                     }
@@ -2736,10 +2753,9 @@ void AeroAppHost::StepFrameInternal(float dtSeconds, bool forceRenderSync, bool 
             lastNotifiedViewport_ = targetViewport;
         }
         const bool layoutSizesChanged = (world_.LayoutSizeEpoch() != prevSizeEpoch);
-        if (forceRenderSync ||
+        if ((!ranFlushThisFrame && forceRenderSync) ||
             viewportChanged ||
             layoutSizesChanged ||
-            ranFlushThisFrame ||
             pendingScriptSync_ ||
             scriptWakeRequested_) {
             FlushBindingsPostLayout();

@@ -17,6 +17,7 @@ std::atomic<UIResourceStore::ImageAtlasFactoryFn> gImageFactory{nullptr};
 std::atomic<UIResourceStore::ImageAtlasClearFn> gImageClear{nullptr};
 std::atomic<UIResourceStore::ImageAtlasRegisterSlotFn> gImageRegisterSlot{nullptr};
 std::atomic<UIResourceStore::ImageAtlasReleaseSlotFn> gImageReleaseSlot{nullptr};
+std::atomic<UIResourceStore::ImageAtlasPackStaticMaskFn> gImagePackStaticMask{nullptr};
 
 [[nodiscard]] int HexNibble(char c) noexcept {
     if (c >= '0' && c <= '9') return c - '0';
@@ -288,9 +289,13 @@ void UIResourceStore::RegisterImageAtlasHooks(
 
 void UIResourceStore::RegisterImageAtlasSlotHook(
     ImageAtlasRegisterSlotFn registerSlotFn,
-    ImageAtlasReleaseSlotFn releaseSlotFn) noexcept {
+    ImageAtlasReleaseSlotFn releaseSlotFn,
+    ImageAtlasPackStaticMaskFn packStaticMaskFn) noexcept {
     gImageRegisterSlot.store(registerSlotFn, std::memory_order_release);
     gImageReleaseSlot.store(releaseSlotFn, std::memory_order_release);
+    if (packStaticMaskFn != nullptr) {
+        gImagePackStaticMask.store(packStaticMaskFn, std::memory_order_release);
+    }
 }
 
 void UIResourceStore::EnsureFontsInitialized() const {
@@ -421,7 +426,11 @@ bool UIResourceStore::StoreOrLookupPathMaskLocked(
     float u1,
     float v1,
     std::vector<std::uint8_t>&& rgba8,
-    RasterizedPathMaskEntry& outEntry) {
+    RasterizedPathMaskEntry& outEntry,
+    bool allowSharedAtlasPack) {
+    if (texW == 0u || texH == 0u || rgba8.size() < static_cast<std::size_t>(texW) * texH * 4u) {
+        return false;
+    }
     const ImageAtlasRegisterSlotFn slotFn = gImageRegisterSlot.load(std::memory_order_acquire);
     if (!slotFn) {
         return false;
@@ -431,6 +440,90 @@ bool UIResourceStore::StoreOrLookupPathMaskLocked(
     constexpr std::size_t kMaxPathMaskEntries = 96u;
     constexpr std::size_t kMaxPathMaskTotalBytes = 16u * 1024u * 1024u;
     constexpr std::size_t kLargeMaskThresholdBytes = 64u * 1024u;
+
+    // Pack small static SVG path masks (<64KB, <=256px) directly into kSharedUiAtlasTextureId (0)
+    // so vector icons, strokes, and checkmarks coalesce with SDF boxes & text in 1 draw call!
+    const ImageAtlasPackStaticMaskFn packFn = gImagePackStaticMask.load(std::memory_order_acquire);
+    const ImageAtlasReleaseSlotFn relFn = gImageReleaseSlot.load(std::memory_order_acquire);
+    bool attemptSharedPack = false;
+    if (allowSharedAtlasPack && packFn != nullptr &&
+        incomingBytes < kLargeMaskThresholdBytes && texW <= 256u && texH <= 256u) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (const auto it = pathMaskEntries_.find(key); it != pathMaskEntries_.end()) {
+            it->second.lastUsedTick = ++pathMaskAccessSeq_;
+            outEntry = it->second;
+            return true;
+        }
+        std::size_t sameGroupCount = 0u;
+        if (groupHash != 0u) {
+            for (const auto& kv : pathMaskEntries_) {
+                if (kv.second.groupHash == groupHash) {
+                    ++sameGroupCount;
+                }
+            }
+        }
+        attemptSharedPack = (sameGroupCount < 2u);
+    }
+
+    if (attemptSharedPack) {
+        std::uint32_t packedTexId = 0u;
+        float aU0 = 0.0f, aV0 = 0.0f, aU1 = 1.0f, aV1 = 1.0f;
+        if (packFn(atlas, key, texW, texH, rgba8.data(), rgba8.size(), packedTexId, aU0, aV0, aU1, aV1) &&
+            packedTexId == 0u) {
+            const float spanU = aU1 - aU0;
+            const float spanV = aV1 - aV0;
+            RasterizedPathMaskEntry entry{};
+            entry.textureId = 0u;
+            entry.texWidth = texW;
+            entry.texHeight = texH;
+            entry.u0 = aU0 + u0 * spanU;
+            entry.v0 = aV0 + v0 * spanV;
+            entry.u1 = aU0 + u1 * spanU;
+            entry.v1 = aV0 + v1 * spanV;
+            entry.groupHash = groupHash;
+            entry.byteSize = 0u; // Stored in shared UI atlas; does not consume standalone slot budget
+            std::vector<std::uint32_t> sharedEvictIds;
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                if (const auto prevIt = pathMaskEntries_.find(key); prevIt != pathMaskEntries_.end()) {
+                    pathMaskTotalBytes_ = (pathMaskTotalBytes_ >= prevIt->second.byteSize)
+                        ? (pathMaskTotalBytes_ - prevIt->second.byteSize)
+                        : 0u;
+                    if (prevIt->second.textureId > 0u) {
+                        sharedEvictIds.push_back(prevIt->second.textureId);
+                    }
+                    prevIt->second = entry;
+                    prevIt->second.lastUsedTick = ++pathMaskAccessSeq_;
+                    entry.lastUsedTick = prevIt->second.lastUsedTick;
+                } else {
+                    while (!pathMaskEntries_.empty() && pathMaskEntries_.size() >= kMaxPathMaskEntries) {
+                        auto lru = pathMaskEntries_.begin();
+                        for (auto it = pathMaskEntries_.begin(); it != pathMaskEntries_.end(); ++it) {
+                            if (it->second.lastUsedTick < lru->second.lastUsedTick) {
+                                lru = it;
+                            }
+                        }
+                        pathMaskTotalBytes_ = (pathMaskTotalBytes_ >= lru->second.byteSize)
+                            ? (pathMaskTotalBytes_ - lru->second.byteSize)
+                            : 0u;
+                        if (lru->second.textureId > 0u) {
+                            sharedEvictIds.push_back(lru->second.textureId);
+                        }
+                        pathMaskEntries_.erase(lru);
+                    }
+                    entry.lastUsedTick = ++pathMaskAccessSeq_;
+                    pathMaskEntries_.emplace(key, entry);
+                }
+            }
+            if (!sharedEvictIds.empty() && relFn) {
+                for (std::uint32_t id : sharedEvictIds) {
+                    relFn(atlas, id);
+                }
+            }
+            outEntry = entry;
+            return true;
+        }
+    }
 
     std::uint32_t reuseSlotId = 0u;
     std::vector<std::uint32_t> surplusReleaseIds;
@@ -489,7 +582,6 @@ bool UIResourceStore::StoreOrLookupPathMaskLocked(
         }
     }
 
-    const ImageAtlasReleaseSlotFn relFn = gImageReleaseSlot.load(std::memory_order_acquire);
     if (!surplusReleaseIds.empty() && relFn) {
         for (std::uint32_t id : surplusReleaseIds) {
             relFn(atlas, id);
@@ -660,7 +752,7 @@ bool UIResourceStore::GetOrRasterizePathMask(
     const float v0 = static_cast<float>(clampedPad) / static_cast<float>(texH);
     const float u1 = static_cast<float>(clampedPad + effW) / static_cast<float>(texW);
     const float v1 = static_cast<float>(clampedPad + effH) / static_cast<float>(texH);
-    return StoreOrLookupPathMaskLocked(key, fillGroup, texW, texH, u0, v0, u1, v1, std::move(rgba8), outEntry);
+    return StoreOrLookupPathMaskLocked(key, fillGroup, texW, texH, u0, v0, u1, v1, std::move(rgba8), outEntry, true);
 }
 
 bool UIResourceStore::GetOrRasterizePathStrokeMask(
@@ -709,7 +801,7 @@ bool UIResourceStore::GetOrRasterizePathStrokeMask(
     const std::uint32_t texW = clampedW + 2u * clampedPad;
     const std::uint32_t texH = clampedH + 2u * clampedPad;
     const std::uint64_t strokeGroup = safeHash ^ 0x5A5A5A5A00000002ULL;
-    return StoreOrLookupPathMaskLocked(key, strokeGroup, texW, texH, 0.0f, 0.0f, 1.0f, 1.0f, std::move(rgba8), outEntry);
+    return StoreOrLookupPathMaskLocked(key, strokeGroup, texW, texH, 0.0f, 0.0f, 1.0f, 1.0f, std::move(rgba8), outEntry, true);
 }
 
 void UIResourceStore::ClearAll() noexcept {

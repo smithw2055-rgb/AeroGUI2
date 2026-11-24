@@ -611,9 +611,11 @@ public partial class UIElement {
     private bool _toolTipHooked;
 
     public ContextMenu ContextMenu {
-        get { return _contextMenu as ContextMenu; }
+        get { return (_rare != null ? _rare.ContextMenuEl : null) as ContextMenu; }
         set {
-            _contextMenu = value;
+            if (value != null || _rare != null) {
+                EnsureRare().ContextMenuEl = value;
+            }
             if (value != null) {
                 if (HasUiFlag(64) || HasUiFlag(256) ||
                     (value._exclusiveOwner != null && value._exclusiveOwner != this)) {
@@ -624,7 +626,7 @@ public partial class UIElement {
                 if (!HasUiFlag(2048)) {
                     SetUiFlag(2048, true);
                     MouseRightButtonUp += (object s, MouseButtonEventArgs e) => {
-                        ContextMenu cm = _contextMenu as ContextMenu;
+                        ContextMenu cm = (_rare != null ? _rare.ContextMenuEl : null) as ContextMenu;
                         if (!e.Handled && cm != null) {
                             cm.Open(this, e.X, e.Y);
                             e.Handled = true;

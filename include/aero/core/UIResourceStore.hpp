@@ -46,6 +46,18 @@ public:
         std::uint32_t height,
         std::vector<std::uint8_t>&& rgbaPixels);
     using ImageAtlasReleaseSlotFn = void (*)(ImageAtlas& atlas, std::uint32_t textureId) noexcept;
+    using ImageAtlasPackStaticMaskFn = bool (*)(
+        ImageAtlas& atlas,
+        std::uint64_t maskKey,
+        std::uint32_t width,
+        std::uint32_t height,
+        const std::uint8_t* rgbaPixels,
+        std::size_t byteSize,
+        std::uint32_t& outTexId,
+        float& outAtlasU0,
+        float& outAtlasV0,
+        float& outAtlasU1,
+        float& outAtlasV1);
 
     static constexpr std::uint16_t kDefaultFontAtlasSize = 1024u;
 
@@ -68,7 +80,8 @@ public:
         ImageAtlasClearFn clearFn) noexcept;
     static void RegisterImageAtlasSlotHook(
         ImageAtlasRegisterSlotFn registerSlotFn,
-        ImageAtlasReleaseSlotFn releaseSlotFn = nullptr) noexcept;
+        ImageAtlasReleaseSlotFn releaseSlotFn = nullptr,
+        ImageAtlasPackStaticMaskFn packStaticMaskFn = nullptr) noexcept;
 
     [[nodiscard]] FontAtlas& Fonts();
     [[nodiscard]] const FontAtlas& Fonts() const;
@@ -154,7 +167,8 @@ private:
         float u1,
         float v1,
         std::vector<std::uint8_t>&& rgba8,
-        RasterizedPathMaskEntry& outEntry);
+        RasterizedPathMaskEntry& outEntry,
+        bool allowSharedAtlasPack = false);
 
     std::uint16_t fontAtlasSize_ = kDefaultFontAtlasSize;
     mutable std::shared_ptr<FontAtlas> fonts_;

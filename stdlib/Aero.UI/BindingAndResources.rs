@@ -4404,6 +4404,9 @@ internal class BindingEntry : DependencyObject {
             return anc;
         }
         if (ExplicitSourceBox != null) { return ExplicitSourceBox; }
+        if (Target != null && TargetProp == "DataContext" && RelativeSourceMode.Length == 0) {
+            return Target.InheritedDataContextBox();
+        }
         if (host != null) { return host.EffectiveDataContextBox(); }
         return null;
     }
@@ -4749,6 +4752,12 @@ internal class BindingEntry : DependencyObject {
         if (Target == null && TargetInline == null && TargetEffect == null) { return; }
         UIElement host = Target != null ? Target : (ContextHost != null ? ContextHost : (TargetInline != null ? TargetInline.OwnerTextBlock : null));
         if (!BindingEngine._inSubtreeFlush && host != null && host.IsInsideClosedPopup() && TargetProp != "IsOpen") {
+            return;
+        }
+        if (!BindingEngine._inSubtreeFlush && OneTimeDone && !_isTriggerBinding && host != null &&
+            TargetProp != "Visibility" && TargetProp != "IsVisible" &&
+            TargetProp != "IsSelected" && TargetProp != "IsChecked" && TargetProp != "IsOpen" &&
+            host.IsInsideCollapsedSubtree()) {
             return;
         }
         if (!_isTriggerBinding && Target != null && Target._activeTriggerProps != null) {

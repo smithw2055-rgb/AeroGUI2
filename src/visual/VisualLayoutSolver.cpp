@@ -2081,15 +2081,15 @@ void UpdateWorldTransformsRecursive(
                 break;
             }
         }
-        auto& ext = node->EnsureExtras();
-        ext.modelMatrix3D = nextModel3D;
-        ext.worldMatrix3D = nextWorld3D;
-        ext.effectiveCamDist = nextCamDist;
+        auto& s3d = node->EnsureSpatial3D();
+        s3d.modelMatrix3D = nextModel3D;
+        s3d.worldMatrix3D = nextWorld3D;
+        s3d.effectiveCamDist = nextCamDist;
     } else {
-        if (node->extras) {
-            node->extras->modelMatrix3D = Matrix4x4{};
-            node->extras->worldMatrix3D = Matrix4x4{};
-            node->extras->effectiveCamDist = 0.0f;
+        if (node->HasSpatial3D()) {
+            node->extras->spatial3D->modelMatrix3D = Matrix4x4{};
+            node->extras->spatial3D->worldMatrix3D = Matrix4x4{};
+            node->extras->spatial3D->effectiveCamDist = 0.0f;
         }
     }
 

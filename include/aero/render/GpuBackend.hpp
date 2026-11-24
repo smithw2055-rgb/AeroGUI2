@@ -514,6 +514,8 @@ private:
     std::uint64_t syncedImageAtlasSweepRev_ = 0u;
 
     std::vector<GlImageSlotState> imageSlotTextures_;
+    std::vector<std::uint8_t> ringSlotTailZeroed_;
+    std::vector<std::uint8_t> ringSlotHasCustomClipW_;
     std::vector<std::uint8_t> uiAtlasScratchRgba8_;
     std::vector<std::uint8_t> imageUploadScratchRgba8_;
     std::vector<std::uint8_t> effectReadbackBottomUp_;

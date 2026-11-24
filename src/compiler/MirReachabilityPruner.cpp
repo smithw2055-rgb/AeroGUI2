@@ -60,41 +60,84 @@ constexpr std::uint32_t kInvalidSlot = std::numeric_limits<std::uint32_t>::max()
     return std::string(fnName.substr(0u, lastDot));
 }
 
-[[nodiscard]] bool IsOptionalUiElementPropertyName(std::string_view propName) noexcept {
-    return propName == "ContextMenu" ||
-           propName == "ToolTip" ||
-           propName == "ToolTipBox" ||
-           propName == "HasToolTip";
+constexpr std::array<std::string_view, 24> kColdSubsystemPropertyNames = {
+    "ContextMenu",
+    "ToolTip",
+    "ToolTipBox",
+    "HasToolTip",
+    "Projection",
+    "Transform3D",
+    "LayoutTransform",
+    "OpacityMask",
+    "Effect",
+    "InputBindings",
+    "RiveSource",
+    "LocSource",
+    "LocalizationSource",
+    "LocResources",
+    "AllowDrop",
+    "CommandTarget",
+    "Uid",
+    "Behaviors",
+    "Triggers",
+    "VisualStateGroups",
+    "CacheMode",
+    "ManipulationMode",
+    "Cursor",
+    "FocusVisualStyle",
+};
+
+[[nodiscard]] int FindColdSubsystemPropIndex(std::string_view propName) noexcept {
+    for (std::size_t i = 0u; i < kColdSubsystemPropertyNames.size(); ++i) {
+        if (kColdSubsystemPropertyNames[i] == propName) {
+            return static_cast<int>(i);
+        }
+    }
+    return -1;
 }
 
-[[nodiscard]] bool IsOptionalUiElementAccessorName(std::string_view methodName) noexcept {
-    return methodName == "get_ContextMenu" || methodName == "set_ContextMenu" ||
-           methodName == "get_ToolTip" || methodName == "set_ToolTip" ||
-           methodName == "get_ToolTipBox" || methodName == "set_ToolTipBox" ||
-           methodName == "get_HasToolTip";
+[[nodiscard]] bool IsOptionalUiElementPropertyName(
+    std::string_view propName,
+    std::uint32_t referencedColdPropMask) noexcept {
+    const int idx = FindColdSubsystemPropIndex(propName);
+    if (idx < 0) {
+        return false;
+    }
+    return (referencedColdPropMask & (1u << static_cast<unsigned>(idx))) == 0u;
+}
+
+[[nodiscard]] bool IsOptionalUiElementAccessorName(
+    std::string_view methodName,
+    std::uint32_t referencedColdPropMask) noexcept {
+    if (StartsWith(methodName, "get_") || StartsWith(methodName, "set_")) {
+        const std::string_view propName = methodName.substr(4u);
+        return IsOptionalUiElementPropertyName(propName, referencedColdPropMask);
+    }
+    return false;
 }
 
 [[nodiscard]] bool IsHostRootMethod(
     const rs_sem::TypeSymbol& owner,
     const rs_sem::FunctionSymbol& method,
-    SymbolId uiElementTypeId,
-    const std::unordered_map<SymbolId, SymbolId>& funcIdToDeclaringTypeId) noexcept {
+    const std::unordered_map<SymbolId, const rs_sem::TypeSymbol*>& typeById,
+    const std::unordered_map<SymbolId, SymbolId>& funcIdToDeclaringTypeId,
+    std::uint32_t referencedColdPropMask) noexcept {
     if (method.constructor || method.name == ".ctor" || method.name == ".cctor" ||
         method.name == owner.name) {
         return true;
     }
     if (method.propertyGetter || method.propertySetter ||
         StartsWith(method.name, "get_") || StartsWith(method.name, "set_")) {
-        if (IsOptionalUiElementAccessorName(method.name)) {
-            if (owner.moduleName == "Aero.UI" && owner.name == "UIElement") {
-                return false;
-            }
-            if (uiElementTypeId != 0u) {
-                const auto declIt = funcIdToDeclaringTypeId.find(method.id);
-                if (declIt != funcIdToDeclaringTypeId.end() && declIt->second == uiElementTypeId) {
-                    return false;
+        bool declaredInAeroUi = (owner.moduleName == "Aero.UI");
+        if (!declaredInAeroUi && method.id != 0u) {
+            if (const auto dIt = funcIdToDeclaringTypeId.find(method.id); dIt != funcIdToDeclaringTypeId.end()) {
+                if (const auto tIt = typeById.find(dIt->second); tIt != typeById.end() && tIt->second->moduleName == "Aero.UI") {
+                    declaredInAeroUi = true;
                 }
             }
+        }
+        if (declaredInAeroUi && IsOptionalUiElementAccessorName(method.name, referencedColdPropMask)) {
+            return false;
         }
         return true;
     }
@@ -132,8 +175,9 @@ constexpr std::uint32_t kInvalidSlot = std::numeric_limits<std::uint32_t>::max()
     const std::unordered_set<SymbolId>& liveFuncIds,
     const std::unordered_set<SymbolId>& dispatchSlotIds,
     bool isInstantiatedOwner,
-    SymbolId uiElementTypeId,
-    const std::unordered_map<SymbolId, SymbolId>& funcIdToDeclaringTypeId) noexcept {
+    const std::unordered_map<SymbolId, const rs_sem::TypeSymbol*>& typeById,
+    const std::unordered_map<SymbolId, SymbolId>& funcIdToDeclaringTypeId,
+    std::uint32_t referencedColdPropMask) noexcept {
     if (owner.delegateType && method.name == "Invoke") {
         return true;
     }
@@ -146,7 +190,7 @@ constexpr std::uint32_t kInvalidSlot = std::numeric_limits<std::uint32_t>::max()
         return true;
     }
     if (isInstantiatedOwner &&
-        IsHostRootMethod(owner, method, uiElementTypeId, funcIdToDeclaringTypeId)) {
+        IsHostRootMethod(owner, method, typeById, funcIdToDeclaringTypeId, referencedColdPropMask)) {
         return true;
     }
     if (liveFuncIds.count(method.id) != 0u) {
@@ -300,13 +344,6 @@ bool PruneUnreachableStdlibMir(
             typeIdByCanonicalName.emplace(tPtr->name, tid);
         }
     }
-    const SymbolId uiElementTypeId = [&]() noexcept -> SymbolId {
-        if (const auto it = typeIdByCanonicalName.find("Aero.UI::UIElement");
-            it != typeIdByCanonicalName.end()) {
-            return it->second;
-        }
-        return 0u;
-    }();
 
     std::unordered_map<SymbolId, SymbolId> arrayTypeIdToElementTypeId;
     for (const auto& [tid, tPtr] : typeById) {
@@ -492,18 +529,59 @@ bool PruneUnreachableStdlibMir(
         }
     };
 
-    // 3. Seed roots: all non-stdlib modules + host-dispatched Aero.UI runtime roots.
+    // 3. Seed roots: all non-stdlib modules + collect user reflection/binding property tokens.
+    std::unordered_set<std::string> userReferencedTokens;
+    auto collectTokensFromString = [&](std::string_view sv) {
+        std::size_t i = 0u;
+        while (i < sv.size()) {
+            while (i < sv.size() &&
+                   !((sv[i] >= 'A' && sv[i] <= 'Z') || (sv[i] >= 'a' && sv[i] <= 'z') || sv[i] == '_')) {
+                ++i;
+            }
+            const std::size_t start = i;
+            while (i < sv.size() &&
+                   ((sv[i] >= 'A' && sv[i] <= 'Z') || (sv[i] >= 'a' && sv[i] <= 'z') ||
+                    (sv[i] >= '0' && sv[i] <= '9') || sv[i] == '_')) {
+                ++i;
+            }
+            if (i > start && (i - start) <= 64u) {
+                const std::string_view tok = sv.substr(start, i - start);
+                userReferencedTokens.emplace(tok);
+                if ((StartsWith(tok, "get_") || StartsWith(tok, "set_")) && tok.size() > 4u) {
+                    userReferencedTokens.emplace(tok.substr(4u));
+                }
+            }
+        }
+    };
+
     for (const auto& mod : mirModules) {
         if (IsPrunableStdlibModule(mod.name) || IsPrunableFunctionOnlyModule(mod.name)) {
             continue;
         }
         for (const auto& fn : mod.functions) {
             markFuncId(fn.symbolId);
+            for (const auto& bb : fn.blocks) {
+                for (const auto& inst : bb.instructions) {
+                    if (!inst.stringImmediate.empty()) {
+                        collectTokensFromString(inst.stringImmediate);
+                    }
+                    if (!inst.symbolName.empty()) {
+                        collectTokensFromString(inst.symbolName);
+                    }
+                }
+            }
         }
         for (const auto& t : mod.types) {
             if (!IsPrunableStdlibModule(t.moduleName)) {
                 markInstantiatedTypeId(t.id);
             }
+        }
+    }
+
+    std::uint32_t referencedColdPropMask = 0u;
+    for (std::size_t idx = 0u; idx < kColdSubsystemPropertyNames.size(); ++idx) {
+        if (userReferencedTokens.count(std::string(kColdSubsystemPropertyNames[idx])) != 0u) {
+            referencedColdPropMask |= (1u << idx);
         }
     }
 
@@ -579,18 +657,20 @@ bool PruneUnreachableStdlibMir(
                 for (const auto& ctor : type.constructors) {
                     markFuncId(ctor.id);
                 }
-                auto isUiElementDeclaredAccessor = [&](SymbolId accId) noexcept -> bool {
-                    if (accId == 0u || uiElementTypeId == 0u) {
-                        return false;
-                    }
-                    const auto it = funcIdToDeclaringTypeId.find(accId);
-                    return it != funcIdToDeclaringTypeId.end() && it->second == uiElementTypeId;
+                auto isDeclaredInAeroUi = [&](SymbolId accId) noexcept -> bool {
+                    if (type.moduleName == "Aero.UI") return true;
+                    if (accId == 0u) return false;
+                    const auto dIt = funcIdToDeclaringTypeId.find(accId);
+                    if (dIt == funcIdToDeclaringTypeId.end()) return false;
+                    const auto tIt = typeById.find(dIt->second);
+                    return tIt != typeById.end() && tIt->second->moduleName == "Aero.UI";
                 };
                 for (const auto& prop : type.properties) {
-                    if (IsOptionalUiElementPropertyName(prop.name) &&
-                        ((type.moduleName == "Aero.UI" && type.name == "UIElement") ||
-                         (prop.getter.has_value() && isUiElementDeclaredAccessor(prop.getter->id)) ||
-                         (prop.setter.has_value() && isUiElementDeclaredAccessor(prop.setter->id)))) {
+                    const bool aeroUiProp =
+                        (prop.getter.has_value() && isDeclaredInAeroUi(prop.getter->id)) ||
+                        (prop.setter.has_value() && isDeclaredInAeroUi(prop.setter->id)) ||
+                        (type.moduleName == "Aero.UI");
+                    if (aeroUiProp && IsOptionalUiElementPropertyName(prop.name, referencedColdPropMask)) {
                         continue;
                     }
                     if (prop.getter.has_value()) {
@@ -604,7 +684,7 @@ bool PruneUnreachableStdlibMir(
             for (const auto& method : type.methods) {
                 const bool isDelegateInvoke = (type.delegateType && method.name == "Invoke");
                 if ((isInstantiated &&
-                     IsHostRootMethod(type, method, uiElementTypeId, funcIdToDeclaringTypeId)) ||
+                     IsHostRootMethod(type, method, typeById, funcIdToDeclaringTypeId, referencedColdPropMask)) ||
                     isDelegateInvoke) {
                     markFuncId(method.id);
                 }
@@ -728,7 +808,7 @@ bool PruneUnreachableStdlibMir(
                     t.methods.end(),
                     [&](const rs_sem::FunctionSymbol& m) {
                         return !ShouldRetainMethodOnType(
-                            t, m, liveFuncIds, slotIds, isInstantiatedOwner, uiElementTypeId, funcIdToDeclaringTypeId);
+                            t, m, liveFuncIds, slotIds, isInstantiatedOwner, typeById, funcIdToDeclaringTypeId, referencedColdPropMask);
                     }),
                 t.methods.end());
             t.constructors.erase(

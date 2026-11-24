@@ -1493,6 +1493,157 @@ public static Window CreateMainWindow() {
         "Surviving BehaviorDataTrigger target failed to fire after BehChild1 DisposeSubtree: " + callStr("GetBehChild2Tag"));
 }
 
+void TestCollapsedSubtreeCatchupAndSelfDataContext(aero::rs_comp::CompilerSession& /*sharedSession*/) {
+    std::cout << "[Test] CollapsedSubtreeCatchupAndSelfDataContext...\n";
+
+    const std::string xaml = R"XML(
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        x:Class="CollapsedRegDemo.MainWindow"
+        Title="Collapsed Regression Demo" Width="640" Height="480">
+  <Window.Resources>
+    <BoolToVisibilityConverter x:Key="BoolToVis"/>
+  </Window.Resources>
+  <StackPanel Orientation="Vertical" Spacing="8">
+    <StackPanel x:Name="PanelBox" Visibility="{Binding IsPanelOpen, Converter={StaticResource BoolToVis}}">
+      <TextBlock x:Name="InnerText" Text="{Binding Counter}"/>
+    </StackPanel>
+    <Border x:Name="SelfCollapsedBorder"
+            DataContext="{Binding Sub}"
+            Visibility="{Binding Show, Converter={StaticResource BoolToVis}}">
+      <TextBlock x:Name="SelfInnerText" Text="{Binding Label}"/>
+    </Border>
+  </StackPanel>
+</Window>)XML";
+
+    const std::string rs = R"RS(
+module CollapsedRegDemo;
+import Aero.UI;
+
+[Observable]
+public class SubVm {
+    public string Label { get; set; } = "InitSub";
+    public bool Show { get; set; } = false;
+    public SubVm(string label, bool show) {
+        Label = label;
+        Show = show;
+    }
+}
+
+[Observable]
+public class MainVm {
+    public bool IsPanelOpen { get; set; } = false;
+    public string Counter { get; set; } = "InitCount";
+    public SubVm Sub { get; set; }
+    public MainVm() {
+        Sub = new SubVm("HiddenSub", false);
+    }
+}
+
+public partial class MainWindow : Window {
+    public MainVm Vm;
+
+    public MainWindow() {
+        InitializeComponent();
+        Vm = new MainVm();
+        DataContext = Vm;
+    }
+
+    public string GetInnerText() {
+        return InnerText != null ? InnerText.Text : "";
+    }
+
+    public string GetSelfInnerText() {
+        return SelfInnerText != null ? SelfInnerText.Text : "";
+    }
+
+    public string GetSelfVisible() {
+        return (SelfCollapsedBorder != null && SelfCollapsedBorder.Visibility == Visibility.Visible) ? "VISIBLE" : "COLLAPSED";
+    }
+
+    public void MutateWhileCollapsed() {
+        Vm.Counter = "Updated42";
+        Vm.Sub = new SubVm("LiveSub", true);
+    }
+
+    public void OpenPanel() {
+        Vm.IsPanelOpen = true;
+    }
+}
+
+public static Window CreateMainWindow() {
+    return new MainWindow();
+}
+)RS";
+
+    aero::AeroV3CompileInput input;
+    input.stdlibRootDir = AERO_STDLIB_DIR;
+    input.includeStdlib = true;
+    input.treeShakeStdlib = false;
+    input.optimizeBytecode = false;
+    input.emitAotCpp = false;
+    input.xamlPath = "CollapsedRegDemo/MainWindow.xaml";
+    input.xamlContent = xaml;
+    input.scriptSources.push_back(aero::SourceFile{"CollapsedRegDemo/MainWindow.rs", rs});
+
+    aero::AeroAppHostConfig cfg;
+    cfg.viewportWidth = 640u;
+    cfg.viewportHeight = 480u;
+    cfg.headless = true;
+    cfg.preferSoftwareRasterizer = true;
+
+    aero::AeroAppHost host(cfg);
+    std::string err;
+    const bool loaded = host.CompileAndLoad(input, &err);
+    Require(loaded, "CollapsedRegDemo CompileAndLoad failed: " + err);
+    if (!loaded || !host.RootVisualNode().IsValid()) {
+        return;
+    }
+
+    host.StepFrame(0.016f, true);
+    const aero::ObjectRef uiObj = host.RootScriptObject();
+    Require(uiObj.valid(), "CollapsedRegDemo RootScriptObject invalid");
+
+    auto callStr = [&](std::string_view fn) -> std::string {
+        aero::UnifiedValue rv{};
+        if (host.InvokeScriptMethod(uiObj, fn, {}, &rv, aero::DomainKind::UiPresentation)) {
+            if (const auto* sv = std::get_if<aero::rs_rt::StringValue>(&rv)) {
+                return sv->str();
+            }
+            if (const auto* ref = std::get_if<aero::rs_rt::ObjectRef>(&rv);
+                ref && ref->valid() && ref->kind == aero::rs_rt::ObjectKind::String) {
+                if (const auto opt = host.Domains().stringViewAcrossDomains(*ref)) {
+                    return std::string(opt->data(), opt->size());
+                }
+            }
+        }
+        return {};
+    };
+    auto callVoid = [&](std::string_view fn) {
+        aero::UnifiedValue rv{};
+        Require(host.InvokeScriptMethod(uiObj, fn, {}, &rv, aero::DomainKind::UiPresentation),
+            std::string("CollapsedRegDemo method failed: ") + std::string(fn));
+    };
+
+    Require(callStr("GetInnerText") == "InitCount", "Initial collapsed PanelBox InnerText unexpected");
+    Require(callStr("GetSelfVisible") == "COLLAPSED", "SelfCollapsedBorder should start Collapsed");
+
+    // Mutate Counter & Sub while PanelBox is collapsed and SelfCollapsedBorder is self-collapsed
+    callVoid("MutateWhileCollapsed");
+    host.StepFrame(0.016f, true);
+
+    // SelfCollapsedBorder must evaluate its DataContext & Visibility even while it was self-Collapsed
+    Require(callStr("GetSelfVisible") == "VISIBLE", "SelfCollapsedBorder did not transition from Collapsed to Visible");
+    Require(callStr("GetSelfInnerText") == "LiveSub", "SelfCollapsedBorder child TextBlock did not catch up on uncollapse");
+    // PanelBox is still collapsed, so InnerText remained skipped
+    Require(callStr("GetInnerText") == "InitCount", "Collapsed PanelBox child should stay skipped while collapsed");
+
+    // Uncollapse PanelBox -> BindingEngine.FlushSubtree must immediately catch InnerText up to Updated42
+    callVoid("OpenPanel");
+    host.StepFrame(0.016f, true);
+    Require(callStr("GetInnerText") == "Updated42", "InnerText did not catch up after PanelBox transitioned Collapsed -> Visible");
+}
+
 } // namespace
 
 int main() {
@@ -1505,6 +1656,7 @@ int main() {
     TestRegressionsFixed(sharedSession);
     TestGalleryEngineRuntimeFixes(sharedSession);
     TestPhase1OptimizationRegressions(sharedSession);
+    TestCollapsedSubtreeCatchupAndSelfDataContext(sharedSession);
 
     if (gFailureCount > 0) {
         std::cerr << gFailureCount << " v3_controls_and_samples_tests assertion(s) failed.\n";

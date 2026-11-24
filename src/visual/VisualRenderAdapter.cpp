@@ -248,7 +248,11 @@ void VisualRenderAdapter::ApplyNodeTransform(
             desc.tx = world2D.tx + desc.x * (world2D.m00 - 1.0f) + desc.y * world2D.m01;
             desc.ty = world2D.ty + desc.x * world2D.m10 + desc.y * (world2D.m11 - 1.0f);
             desc.hasPerspective3D = has3D;
-            desc.worldMatrix3D = world3D;
+            if (has3D) {
+                tree.SetNodeWorldMatrix3D(desc, world3D);
+            } else {
+                desc.worldMatrix3DIndex = 0xFFFFFFFFu;
+            }
             desc.blendMode = blend;
             tree.WriteQuadVertices(desc);
         }
@@ -566,7 +570,7 @@ std::size_t VisualRenderAdapter::EmitSvgPathPrimitive(
 
             RasterizedPathMaskEntry maskEntry{};
             if (store->GetOrRasterizePathMask(hash, pathData, rawBounds, innerW, innerH, 1u, maskEntry) &&
-                maskEntry.textureId > 0u) {
+                maskEntry.texWidth > 0u) {
                 const auto beginNid = static_cast<std::uint32_t>(tree.nodes_.size());
                 const std::uint32_t nid = tree.AllocateTexturedNode(
                     fitted.x,
@@ -646,7 +650,7 @@ std::size_t VisualRenderAdapter::EmitSvgPathPrimitive(
                 RasterizedPathMaskEntry strokeMask{};
                 if (store->GetOrRasterizePathStrokeMask(
                         hash, pathData, rawBounds, strokeInnerW, strokeInnerH, strokeWidthPx, padPx, strokeMask, sLineCap, eLineCap) &&
-                    strokeMask.textureId > 0u) {
+                    strokeMask.texWidth > 0u) {
                     const float worldPadX = static_cast<float>(padPx) / effSx;
                     const float worldPadY = static_cast<float>(padPx) / effSy;
                     const auto beginNid = static_cast<std::uint32_t>(tree.nodes_.size());
@@ -918,51 +922,98 @@ std::size_t VisualRenderAdapter::EmitTextVisual(
             ? 1000000.0f
             : std::max(1.0f, textRect.height);
         TextLayoutResult measured{};
-        if (!txt.richSpans.empty()) {
-            std::vector<RichTextRunInput> runs;
-            runs.reserve(txt.richSpans.size());
-            for (const VisualTextSpan& sp : txt.richSpans) {
-                RichTextRunInput r{};
-                r.text = sp.text;
-                r.fontFamily = sp.fontFamily;
-                r.fontSize = sp.fontSize;
-                r.fontWeight = sp.fontWeight;
-                r.fontItalic = sp.fontItalic;
-                r.fgRgba = sp.fgRgba;
-                r.hasFg = sp.hasFg;
-                r.decorations = sp.decorations;
-                runs.push_back(r);
-            }
-            measured = store->Fonts().MeasureRichLayout(
-                runs,
-                txt.fontFamily,
-                txt.fontSize,
-                txt.fontWeight,
-                txt.fontItalic,
-                maxW,
-                txt.wrap,
-                txt.charSpacing,
-                txt.lineHeight,
-                node.layout.effectiveRtl,
-                txt.trim,
-                maxH);
+        const std::uint64_t curFontRev = store->Fonts().Revision();
+        if (node.HasTextData() &&
+            txt.hasCachedLayout &&
+            txt.cachedRtl == node.layout.effectiveRtl &&
+            txt.cachedFontRev == curFontRev &&
+            std::fabs(txt.cachedMaxW - maxW) <= 1e-3f &&
+            (std::fabs(txt.cachedMaxH - maxH) <= 1e-3f ||
+             (txt.trim == TextTrimming::None && maxH >= txt.cachedLayout.totalHeight - 1e-3f && txt.cachedMaxH >= txt.cachedLayout.totalHeight - 1e-3f))) {
+            measured = txt.cachedLayout;
         } else {
-            measured = store->Fonts().MeasureLayout(
-                txt.text,
-                txt.fontFamily,
-                txt.fontSize,
-                maxW,
-                txt.wrap,
-                txt.charSpacing,
-                txt.fontWeight,
-                txt.fontItalic,
-                txt.lineHeight,
-                node.layout.effectiveRtl,
-                txt.trim,
-                maxH);
+            if (!txt.richSpans.empty()) {
+                std::vector<RichTextRunInput> runs;
+                runs.reserve(txt.richSpans.size());
+                for (const VisualTextSpan& sp : txt.richSpans) {
+                    RichTextRunInput r{};
+                    r.text = sp.text;
+                    r.fontFamily = sp.fontFamily;
+                    r.fontSize = sp.fontSize;
+                    r.fontWeight = sp.fontWeight;
+                    r.fontItalic = sp.fontItalic;
+                    r.fgRgba = sp.fgRgba;
+                    r.hasFg = sp.hasFg;
+                    r.decorations = sp.decorations;
+                    runs.push_back(r);
+                }
+                measured = store->Fonts().MeasureRichLayout(
+                    runs,
+                    txt.fontFamily,
+                    txt.fontSize,
+                    txt.fontWeight,
+                    txt.fontItalic,
+                    maxW,
+                    txt.wrap,
+                    txt.charSpacing,
+                    txt.lineHeight,
+                    node.layout.effectiveRtl,
+                    txt.trim,
+                    maxH);
+            } else {
+                measured = store->Fonts().MeasureLayout(
+                    txt.text,
+                    txt.fontFamily,
+                    txt.fontSize,
+                    maxW,
+                    txt.wrap,
+                    txt.charSpacing,
+                    txt.fontWeight,
+                    txt.fontItalic,
+                    txt.lineHeight,
+                    node.layout.effectiveRtl,
+                    txt.trim,
+                    maxH);
+            }
+            if (node.HasTextData()) {
+                txt.cachedLayout = measured;
+                txt.cachedMaxW = maxW;
+                txt.cachedMaxH = maxH;
+                txt.cachedRtl = node.layout.effectiveRtl;
+                txt.cachedFontRev = curFontRev;
+                txt.hasCachedLayout = true;
+            }
         }
 
         std::size_t count = 0u;
+        struct ScopedTreeHintBounds {
+            PagedRenderTree& tree;
+            bool prevHas;
+            Rect prevBounds;
+            ScopedTreeHintBounds(PagedRenderTree& t) noexcept
+                : tree(t), prevHas(t.hasHintNextBounds_), prevBounds(t.hintNextBounds_) {}
+            ~ScopedTreeHintBounds() noexcept {
+                tree.hasHintNextBounds_ = prevHas;
+                tree.hintNextBounds_ = prevBounds;
+            }
+        } hintGuard(tree);
+        if (!has3D && tree.activeBlurSpanDepth_ == 0u && !forceSolidShadowColor) {
+            const float fontPad = std::max(4.0f, txt.fontSize * 0.5f);
+            const float covW = std::max(textRect.width, measured.totalWidth);
+            const float covH = std::max(textRect.height, measured.totalHeight);
+            const float lx0 = std::min(rect.x - 2.0f, textRect.x - fontPad);
+            const float ly0 = std::min(rect.y - 2.0f, textRect.y - fontPad);
+            const float lx1 = std::max(rect.x + rect.width + 2.0f, textRect.x + covW + fontPad);
+            const float ly1 = std::max(rect.y + rect.height + 2.0f, textRect.y + covH + fontPad);
+            tree.hintNextBounds_ = TransformRectViewportBounds(
+                Rect{lx0, ly0, std::max(0.1f, lx1 - lx0), std::max(0.1f, ly1 - ly0)},
+                world2D,
+                world3D,
+                false);
+            tree.hasHintNextBounds_ = true;
+        } else {
+            tree.hasHintNextBounds_ = false;
+        }
         auto lineAlignDx = [&](const TextLineMetrics& line) noexcept -> float {
             TextAlignment effA = txt.align;
             if (node.layout.effectiveRtl) {
@@ -1269,7 +1320,9 @@ bool VisualRenderAdapter::RasterizeVisualBrushToEntry(
         nd.tx = remapped.tx + nd.x * (remapped.m00 - 1.0f) + nd.y * remapped.m01;
         nd.ty = remapped.ty + nd.x * remapped.m10 + nd.y * (remapped.m11 - 1.0f);
         if (nd.hasPerspective3D) {
-            nd.worldMatrix3D = Matrix4x4::Multiply(toTex3D, nd.worldMatrix3D);
+            vbTree.SetNodeWorldMatrix3D(
+                nd,
+                Matrix4x4::Multiply(toTex3D, vbTree.GetNodeWorldMatrix3D(nd)));
         }
         const bool isSingleQuadPrimitive =
             (nd.vertexCount == 4u) &&
@@ -2657,6 +2710,8 @@ std::size_t VisualRenderAdapter::EmitNodeRecursive(
             }
             blurSpanIndex = outTree.blurLayerSpans_.size();
             outTree.blurLayerSpans_.push_back(span);
+            outTree.activeBlurSpanDepth_ += 1u;
+            outTree.coalesceBarrierPage_ = outTree.pages_.size();
         }
 
         // Push node scissor clip (ClipToBounds or ScrollViewport)
@@ -2685,6 +2740,37 @@ std::size_t VisualRenderAdapter::EmitNodeRecursive(
                 (node->Vector().stretch == Stretch::None ||
                  node->Vector().shapeKind == VectorShapeKind::Line);
             if (isVisible && (hasNonZeroRect || allowZeroRectVector)) {
+                const bool prevHasHint = outTree.hasHintNextBounds_;
+                const Rect prevHint = outTree.hintNextBounds_;
+                const bool canHintBounds =
+                    !has3D &&
+                    outTree.activeBlurSpanDepth_ == 0u &&
+                    childInheritedShadow == nullptr &&
+                    node->Effect().kind == UIEffectKind::None &&
+                    !node->OpacityMask().enabled &&
+                    hasNonZeroRect &&
+                    node->kind != VisualKind::Text &&
+                    node->kind != VisualKind::CanvasDraw &&
+                    !(node->kind == VisualKind::Box && node->box.isBoxShadow) &&
+                    !(node->kind == VisualKind::Vector && node->Vector().stretch == Stretch::None);
+                if (canHintBounds) {
+                    const float maxBorder = std::max(
+                        std::max(0.0f, std::max(node->box.borderThickness.left, node->box.borderThickness.right)),
+                        std::max(0.0f, std::max(node->box.borderThickness.top, node->box.borderThickness.bottom)));
+                    const float strokeExtra = (node->kind == VisualKind::Vector)
+                        ? std::max(2.0f, node->Vector().strokeWidth + 4.0f)
+                        : (maxBorder + 2.0f);
+                    const Rect paddedLocal{
+                        rect.x - strokeExtra,
+                        rect.y - strokeExtra,
+                        rect.width + 2.0f * strokeExtra,
+                        rect.height + 2.0f * strokeExtra};
+                    outTree.hintNextBounds_ = TransformRectViewportBounds(paddedLocal, world2D, world3D, false);
+                    outTree.hasHintNextBounds_ = true;
+                } else {
+                    outTree.hasHintNextBounds_ = false;
+                }
+
                 if (hasNonZeroRect) {
                     count += EmitBoxVisual(outTree, *node, rect, innerEffOpacity, world2D, world3D, has3D, selfBlend, &world, drawBuffer);
                 }
@@ -2713,9 +2799,47 @@ std::size_t VisualRenderAdapter::EmitNodeRecursive(
                     default:
                         break;
                 }
+
+                outTree.hasHintNextBounds_ = prevHasHint;
+                outTree.hintNextBounds_ = prevHint;
             }
 
             if (!node->children.empty()) {
+                bool needZSort = false;
+                std::int32_t firstZ = 0;
+                bool sawFirst = false;
+                for (VisualNodeId cid : node->children) {
+                    if (const VisualNode* ch = world.GetNode(cid)) {
+                        if (!sawFirst) {
+                            firstZ = ch->layout.zIndex;
+                            sawFirst = true;
+                        } else if (ch->layout.zIndex != firstZ) {
+                            needZSort = true;
+                            break;
+                        }
+                    }
+                }
+                const bool hasShadowPass =
+                    isVisible &&
+                    childInheritedShadow != nullptr &&
+                    HasAlpha(childInheritedShadow->colorRgba) &&
+                    childInheritedShadow->opacity > 0.0f;
+
+                if (!needZSort && !hasShadowPass) {
+                    // Zero-allocation fast path for >98% of UI containers with uniform zIndex
+                    for (VisualNodeId cid : node->children) {
+                        if (world.GetNode(cid) != nullptr) {
+                            count += EmitNodeRecursive(
+                                mutableWorld,
+                                world,
+                                drawBuffer,
+                                cid,
+                                innerEffOpacity,
+                                outTree,
+                                childInheritedShadow);
+                        }
+                    }
+                } else {
                 struct ZChild {
                     VisualNodeId id{};
                     std::int32_t z = 0;
@@ -2728,18 +2852,17 @@ std::size_t VisualRenderAdapter::EmitNodeRecursive(
                         sorted.push_back(ZChild{node->children[ci], ch->layout.zIndex, ci});
                     }
                 }
-                std::sort(sorted.begin(), sorted.end(), [](const ZChild& a, const ZChild& b) {
-                    if (a.z != b.z) {
-                        return a.z < b.z;
-                    }
-                    return a.order < b.order;
-                });
+                if (needZSort) {
+                    std::sort(sorted.begin(), sorted.end(), [](const ZChild& a, const ZChild& b) {
+                        if (a.z != b.z) {
+                            return a.z < b.z;
+                        }
+                        return a.order < b.order;
+                    });
+                }
 
                 const VisualEffectStyle* passInheritedShadow = childInheritedShadow;
-                if (isVisible &&
-                    childInheritedShadow != nullptr &&
-                    HasAlpha(childInheritedShadow->colorRgba) &&
-                    childInheritedShadow->opacity > 0.0f) {
+                if (hasShadowPass) {
                     const float rad = childInheritedShadow->dirDeg * kDegToRad;
                     const float scaleOff = has3D ? 1.0f : worldScale;
                     const float dx = std::cos(rad) * childInheritedShadow->depth * scaleOff;
@@ -2760,6 +2883,8 @@ std::size_t VisualRenderAdapter::EmitNodeRecursive(
                         shadowSpan.clipActive = outTree.activeClipEnabled_;
                         shadowSpanIndex = outTree.blurLayerSpans_.size();
                         outTree.blurLayerSpans_.push_back(shadowSpan);
+                        outTree.activeBlurSpanDepth_ += 1u;
+                        outTree.coalesceBarrierPage_ = outTree.pages_.size();
                     }
                     for (const ZChild& item : sorted) {
                         count += EmitDropShadowSubtreeRecursive(
@@ -2779,6 +2904,10 @@ std::size_t VisualRenderAdapter::EmitNodeRecursive(
                             outTree.blurLayerSpans_.erase(
                                 outTree.blurLayerSpans_.begin() + static_cast<std::ptrdiff_t>(shadowSpanIndex));
                         }
+                        if (outTree.activeBlurSpanDepth_ > 0u) {
+                            outTree.activeBlurSpanDepth_ -= 1u;
+                        }
+                        outTree.coalesceBarrierPage_ = outTree.pages_.size();
                     }
                     passInheritedShadow = nullptr;
                 }
@@ -2792,6 +2921,7 @@ std::size_t VisualRenderAdapter::EmitNodeRecursive(
                         innerEffOpacity,
                         outTree,
                         passInheritedShadow);
+                }
                 }
             }
         }
@@ -2807,6 +2937,10 @@ std::size_t VisualRenderAdapter::EmitNodeRecursive(
                 outTree.blurLayerSpans_.erase(
                     outTree.blurLayerSpans_.begin() + static_cast<std::ptrdiff_t>(blurSpanIndex));
             }
+            if (outTree.activeBlurSpanDepth_ > 0u) {
+                outTree.activeBlurSpanDepth_ -= 1u;
+            }
+            outTree.coalesceBarrierPage_ = outTree.pages_.size();
         }
 
         if (mutableWorld) {
@@ -2882,12 +3016,12 @@ std::size_t VisualRenderAdapter::EmitDropShadowLeafSilhouette(
             VisualNode shadowVecNode{};
             shadowVecNode.id = node.id;
             shadowVecNode.kind = node.kind;
-            auto& sv = shadowVecNode.EnsureExtras().vector;
+            auto& sv = shadowVecNode.EnsureVectorData();
             sv = srcVec;
             const bool hasSrcImg =
                 !imgData.uri.empty() && HasAlpha(imgData.tintRgba) && srcVec.fillOpacity > 0.001f;
             if (hasSrcImg) {
-                auto& si = shadowVecNode.EnsureExtras().image;
+                auto& si = shadowVecNode.EnsureImageData();
                 si = imgData;
                 si.tintRgba = dropShadow.colorRgba;
             }
@@ -2914,7 +3048,7 @@ std::size_t VisualRenderAdapter::EmitDropShadowLeafSilhouette(
             shadowTextNode.id = node.id;
             shadowTextNode.kind = node.kind;
             shadowTextNode.layout.padding = node.layout.padding;
-            auto& st = shadowTextNode.EnsureExtras().text;
+            auto& st = shadowTextNode.EnsureTextData();
             st = node.Text();
             st.fgRgba = dropShadow.colorRgba;
             st.fgGradId = -1;
@@ -3133,10 +3267,12 @@ std::size_t VisualRenderAdapter::SyncPagedRenderTree(
     UIResourceStore* store = resourceStore ? resourceStore : world.ResourceStore();
     outTree.SetResourceStore(store);
 
+    const bool noCustomDraws = (drawBuffer == nullptr || drawBuffer->Empty());
+
     // Fast Path 1: nothing dirty and render tree already matches this world & structure version
     if (!world.HasAnyDirty() &&
         !world.IsStructureDirty() &&
-        drawBuffer == nullptr &&
+        noCustomDraws &&
         outTree.MatchesSyncedWorldState(world.WorldInstanceId(), world.StructureVersion())) {
         return outTree.NodeCount();
     }
@@ -3144,7 +3280,7 @@ std::size_t VisualRenderAdapter::SyncPagedRenderTree(
     // Fast Path 2: visual-only leaf solid-box updates in place
     const auto& dirtyList = world.DirtyNodes();
     if (!world.IsStructureDirty() &&
-        drawBuffer == nullptr &&
+        noCustomDraws &&
         !dirtyList.empty() &&
         outTree.MatchesSyncedWorldState(world.WorldInstanceId(), world.StructureVersion())) {
         bool allPatched = true;

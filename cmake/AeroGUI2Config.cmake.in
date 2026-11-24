@@ -16,6 +16,10 @@ if(NOT TARGET AeroGUI::Runtime)
     include("${CMAKE_CURRENT_LIST_DIR}/AeroGUI2Targets.cmake")
 endif()
 
+if(EXISTS "${CMAKE_CURRENT_LIST_DIR}/AeroSampleApp.cmake")
+    include("${CMAKE_CURRENT_LIST_DIR}/AeroSampleApp.cmake")
+endif()
+
 set(AeroGUI2_VERSION "@PROJECT_VERSION@")
 set(AeroGUI2_HAS_COMPILER_TOOLS @AERO_HAS_COMPILER_TOOLS_CMAKE@)
 check_required_components(AeroGUI2)

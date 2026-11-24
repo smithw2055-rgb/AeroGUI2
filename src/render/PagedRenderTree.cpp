@@ -1138,6 +1138,27 @@ void PagedRenderTree::ReserveCapacity(std::size_t expectedNodes) {
     }
 }
 
+const Matrix4x4& PagedRenderTree::GetNodeWorldMatrix3D(const RenderNodeDescriptor& node) const noexcept {
+    static const Matrix4x4 kIdentity{};
+    if (node.hasPerspective3D && node.worldMatrix3DIndex < worldMatrices3D_.size()) {
+        return worldMatrices3D_[node.worldMatrix3DIndex];
+    }
+    return kIdentity;
+}
+
+void PagedRenderTree::SetNodeWorldMatrix3D(RenderNodeDescriptor& node, const Matrix4x4& world3D) {
+    if (!node.hasPerspective3D) {
+        node.worldMatrix3DIndex = 0xFFFFFFFFu;
+        return;
+    }
+    if (node.worldMatrix3DIndex < worldMatrices3D_.size()) {
+        worldMatrices3D_[node.worldMatrix3DIndex] = world3D;
+    } else {
+        node.worldMatrix3DIndex = static_cast<std::uint32_t>(worldMatrices3D_.size());
+        worldMatrices3D_.push_back(world3D);
+    }
+}
+
 void PagedRenderTree::Clear() noexcept {
     syncedWorldId_ = 0u;
     syncedStructureVersion_ = 0u;
@@ -1145,13 +1166,65 @@ void PagedRenderTree::Clear() noexcept {
     activeClipEnabled_ = false;
     activeBlendMode_ = BlendingMode::Normal;
     pages_.clear();
+    pageScreenBounds_.clear();
+    pageBoundsState_.clear();
+    coalesceBarrierPage_ = 0u;
+    activeBlurSpanDepth_ = 0u;
+    hasOutOfOrderCoalesce_ = false;
+    hasHintNextBounds_ = false;
     pageClipW_.clear();
     nodes_.clear();
+    worldMatrices3D_.clear();
     pageDirtyFlags_.clear();
     dirtyPageList_.clear();
     blurLayerSpans_.clear();
     standaloneTextRuns_.clear();
     treeId_ = gNextRenderTreeId.fetch_add(1u, std::memory_order_relaxed);
+}
+
+bool PagedRenderTree::TryGetPageScreenBounds(std::size_t pageIdx, Rect& outBounds) noexcept {
+    if (pageIdx >= pages_.size() || pageIdx >= pageBoundsState_.size() || pageIdx >= pageScreenBounds_.size()) {
+        return false;
+    }
+    if (pageBoundsState_[pageIdx] == 1u) {
+        outBounds = pageScreenBounds_[pageIdx];
+        return true;
+    }
+    if (pageBoundsState_[pageIdx] == 0u) {
+        return false;
+    }
+    const CommandPage& pg = pages_[pageIdx];
+    const std::size_t vCount = std::min<std::size_t>(pg.header.vertexCount, kVerticesPerCommandPage);
+    if (vCount == 0u) {
+        pageBoundsState_[pageIdx] = 0u;
+        return false;
+    }
+    float minX = 1e30f;
+    float minY = 1e30f;
+    float maxX = -1e30f;
+    float maxY = -1e30f;
+    bool anyOpaque = false;
+    for (std::size_t vi = 0u; vi < vCount; ++vi) {
+        const AeroVertex& v = pg.vertices[vi];
+        if ((v.rgba & 0xFF000000u) == 0u) {
+            continue;
+        }
+        if (std::isfinite(v.x) && std::isfinite(v.y)) {
+            minX = std::min(minX, v.x);
+            minY = std::min(minY, v.y);
+            maxX = std::max(maxX, v.x);
+            maxY = std::max(maxY, v.y);
+            anyOpaque = true;
+        }
+    }
+    if (!anyOpaque || maxX < minX || maxY < minY) {
+        pageBoundsState_[pageIdx] = 0u;
+        return false;
+    }
+    outBounds = Rect{minX, minY, std::max(0.1f, maxX - minX), std::max(0.1f, maxY - minY)};
+    pageScreenBounds_[pageIdx] = outBounds;
+    pageBoundsState_[pageIdx] = 1u;
+    return true;
 }
 
 std::uint32_t PagedRenderTree::EnsurePageForAllocation(
@@ -1160,33 +1233,73 @@ std::uint32_t PagedRenderTree::EnsurePageForAllocation(
     bool clipActive,
     std::uint32_t textureId) {
     const auto desiredBlend = static_cast<std::uint32_t>(activeBlendMode_);
-    const bool needNewPage = pages_.empty() ||
-        (pages_.back().header.vertexCount + neededVertices > kVerticesPerCommandPage) ||
-        !SameClipRect(pages_.back().header, clipRect, clipActive) ||
-        (pages_.back().header.reserved[0] != textureId) ||
-        (pages_.back().header.reserved[1] != desiredBlend);
+    auto pageMatchesState = [&](const CommandPage& pg) noexcept -> bool {
+        return (pg.header.vertexCount + neededVertices <= kVerticesPerCommandPage) &&
+               SameClipRect(pg.header, clipRect, clipActive) &&
+               (pg.header.reserved[0] == textureId) &&
+               (pg.header.reserved[1] == desiredBlend);
+    };
 
-    if (needNewPage) {
-        const auto newPageIdx = static_cast<std::uint32_t>(pages_.size());
-        CommandPage newPage{};
-        newPage.header.pageIndex = newPageIdx;
-        newPage.header.firstNodeId = static_cast<std::uint32_t>(nodes_.size());
-        newPage.header.reserved[0] = textureId;
-        newPage.header.reserved[1] = desiredBlend;
-        if (clipActive) {
-            newPage.header.clipX = clipRect.x;
-            newPage.header.clipY = clipRect.y;
-            newPage.header.clipW = clipRect.width;
-            newPage.header.clipH = clipRect.height;
-            newPage.header.flags |= CommandPageFlag_ScissorClipActive;
-        }
-        pages_.push_back(newPage);
-        pageClipW_.emplace_back();
-        pageClipW_.back().fill(1.0f);
-        pageDirtyFlags_.push_back(0u);
-        dirtyPageList_.reserve(pages_.size());
+    if (!pages_.empty() && pageMatchesState(pages_.back())) {
+        return static_cast<std::uint32_t>(pages_.size() - 1u);
     }
-    return static_cast<std::uint32_t>(pages_.size() - 1u);
+
+    // Disjoint-Bounds Page Coalescing: if an earlier open page (above any BlurLayerSpan barrier)
+    // shares identical (clipRect, textureId, blendMode) and all intervening pages have screen bounds
+    // strictly disjoint from the incoming primitive's screen bounds, Painter's order commutes!
+    if (!pages_.empty() &&
+        hasHintNextBounds_ &&
+        activeBlurSpanDepth_ == 0u &&
+        hintNextBounds_.width > 0.0f &&
+        hintNextBounds_.height > 0.0f &&
+        pageBoundsState_.size() == pages_.size()) {
+        const std::size_t minPage = std::min(coalesceBarrierPage_, pages_.size());
+        const std::size_t maxScan = 32u;
+        std::size_t scanned = 0u;
+        for (std::size_t p = pages_.size(); p > minPage && scanned < maxScan; --p, ++scanned) {
+            const std::size_t idx = p - 1u;
+            if (pageMatchesState(pages_[idx])) {
+                if (idx + 1u < pages_.size()) {
+                    hasOutOfOrderCoalesce_ = true;
+                }
+                return static_cast<std::uint32_t>(idx);
+            }
+            Rect pb{};
+            if (!TryGetPageScreenBounds(idx, pb)) {
+                break;
+            }
+            constexpr float kPad = 2.0f;
+            const bool overlapsX = (hintNextBounds_.x - kPad < pb.x + pb.width) &&
+                                   (hintNextBounds_.x + hintNextBounds_.width + kPad > pb.x);
+            const bool overlapsY = (hintNextBounds_.y - kPad < pb.y + pb.height) &&
+                                   (hintNextBounds_.y + hintNextBounds_.height + kPad > pb.y);
+            if (overlapsX && overlapsY) {
+                break;
+            }
+        }
+    }
+
+    const auto newPageIdx = static_cast<std::uint32_t>(pages_.size());
+    CommandPage newPage{};
+    newPage.header.pageIndex = newPageIdx;
+    newPage.header.firstNodeId = static_cast<std::uint32_t>(nodes_.size());
+    newPage.header.reserved[0] = textureId;
+    newPage.header.reserved[1] = desiredBlend;
+    if (clipActive) {
+        newPage.header.clipX = clipRect.x;
+        newPage.header.clipY = clipRect.y;
+        newPage.header.clipW = clipRect.width;
+        newPage.header.clipH = clipRect.height;
+        newPage.header.flags |= CommandPageFlag_ScissorClipActive;
+    }
+    pages_.push_back(newPage);
+    pageScreenBounds_.push_back(Rect{});
+    pageBoundsState_.push_back(0u);
+    pageClipW_.emplace_back();
+    pageClipW_.back().fill(1.0f);
+    pageDirtyFlags_.push_back(0u);
+    dirtyPageList_.reserve(pages_.size());
+    return newPageIdx;
 }
 
 void PagedRenderTree::MarkPageDirty(
@@ -1257,11 +1370,12 @@ void PagedRenderTree::WriteQuadVertices(RenderNodeDescriptor& node) noexcept {
     float x3 = 0.0f, y3 = 0.0f;
     float w0 = 1.0f, w1 = 1.0f, w2 = 1.0f, w3 = 1.0f;
     if (node.hasPerspective3D) {
+        const Matrix4x4& wm3D = GetNodeWorldMatrix3D(node);
         float rw0 = 1.0f, rw1 = 1.0f, rw2 = 1.0f, rw3 = 1.0f;
-        const Point p0 = node.worldMatrix3D.ProjectPoint2D(Point{node.x, node.y}, &rw0);
-        const Point p1 = node.worldMatrix3D.ProjectPoint2D(Point{node.x + w, node.y}, &rw1);
-        const Point p2 = node.worldMatrix3D.ProjectPoint2D(Point{node.x + w, node.y + h}, &rw2);
-        const Point p3 = node.worldMatrix3D.ProjectPoint2D(Point{node.x, node.y + h}, &rw3);
+        const Point p0 = wm3D.ProjectPoint2D(Point{node.x, node.y}, &rw0);
+        const Point p1 = wm3D.ProjectPoint2D(Point{node.x + w, node.y}, &rw1);
+        const Point p2 = wm3D.ProjectPoint2D(Point{node.x + w, node.y + h}, &rw2);
+        const Point p3 = wm3D.ProjectPoint2D(Point{node.x, node.y + h}, &rw3);
         x0 = p0.x; y0 = p0.y;
         x1 = p1.x; y1 = p1.y;
         x2 = p2.x; y2 = p2.y;
@@ -1318,6 +1432,12 @@ void PagedRenderTree::WriteQuadVertices(RenderNodeDescriptor& node) noexcept {
     v[1] = AeroVertex{x1, y1, uMax, vMin, packedColor, prim, flags};
     v[2] = AeroVertex{x2, y2, uMax, vMax, packedColor, prim, flags};
     v[3] = AeroVertex{x3, y3, uMin, vMax, packedColor, prim, flags};
+    if (node.hasPerspective3D) {
+        page.header.flags |= CommandPageFlag_HasPerspective3D;
+    }
+    if (node.pageIndex < pageBoundsState_.size()) {
+        pageBoundsState_[node.pageIndex] = 2u;
+    }
     if (node.pageIndex < pageClipW_.size()) {
         float* __restrict clipW = pageClipW_[node.pageIndex].data() + vOffset;
         clipW[0] = w0;
@@ -1938,6 +2058,8 @@ std::uint32_t PagedRenderTree::AllocateHudBarBatch(
     nodes_.reserve(nodes_.size() + count);
     const std::size_t estimatedPages = (count + 41u) / 42u + 2u;
     pages_.reserve(pages_.size() + estimatedPages);
+    pageScreenBounds_.reserve(pageScreenBounds_.size() + estimatedPages);
+    pageBoundsState_.reserve(pageBoundsState_.size() + estimatedPages);
     pageClipW_.reserve(pageClipW_.size() + estimatedPages);
     pageDirtyFlags_.reserve(pageDirtyFlags_.size() + estimatedPages);
     dirtyPageList_.reserve(pages_.size() + estimatedPages);
@@ -2002,6 +2124,20 @@ bool PagedRenderTree::UpdateSolidBoxNodeInPlace(
         std::fabs(world2D.m01) > 1e-5f || std::fabs(world2D.m10) > 1e-5f) {
         return false;
     }
+    const float nextTx = world2D.tx + rect.x * (world2D.m00 - 1.0f) + rect.y * world2D.m01;
+    const float nextTy = world2D.ty + rect.x * world2D.m10 + rect.y * (world2D.m11 - 1.0f);
+    if (hasOutOfOrderCoalesce_) {
+        if (std::fabs(node.x - rect.x) > 1e-4f ||
+            std::fabs(node.y - rect.y) > 1e-4f ||
+            std::fabs(node.width - rect.width) > 1e-4f ||
+            std::fabs(node.height - rect.height) > 1e-4f ||
+            std::fabs(node.m00 - world2D.m00) > 1e-4f ||
+            std::fabs(node.m11 - world2D.m11) > 1e-4f ||
+            std::fabs(node.tx - nextTx) > 1e-4f ||
+            std::fabs(node.ty - nextTy) > 1e-4f) {
+            return false;
+        }
+    }
     const CornerRadius cr = SanitizeCornerRadius(cornerRadii);
     ConfigureRoundedRectDescriptor(node, cr, Thickness{}, false);
     node.x = rect.x;
@@ -2016,8 +2152,8 @@ bool PagedRenderTree::UpdateSolidBoxNodeInPlace(
     node.m11 = world2D.m11;
     node.baseTx = world2D.tx;
     node.baseTy = world2D.ty;
-    node.tx = world2D.tx + rect.x * (world2D.m00 - 1.0f) + rect.y * world2D.m01;
-    node.ty = world2D.ty + rect.x * world2D.m10 + rect.y * (world2D.m11 - 1.0f);
+    node.tx = nextTx;
+    node.ty = nextTy;
     WriteQuadVertices(node);
     MarkPageDirty(node.pageIndex, node.vertexOffsetInPage);
     return true;
@@ -2116,6 +2252,9 @@ bool PagedRenderTree::UpdateHudDigitsText(
         }
     }
 
+    if (node.pageIndex < pageBoundsState_.size()) {
+        pageBoundsState_[node.pageIndex] = 2u;
+    }
     const std::uint32_t firstQuadIdx = static_cast<std::uint32_t>(node.vertexOffsetInPage / 4u);
     for (std::size_t i = 0; i < maxSlots; ++i) {
         const std::uint32_t qIdx = firstQuadIdx + static_cast<std::uint32_t>(i);
@@ -2232,11 +2371,12 @@ bool PagedRenderTree::WriteLayoutGlyphSlice(
             float gx2 = 0.0f, gy2 = 0.0f, gx3 = 0.0f, gy3 = 0.0f;
             float gw0 = 1.0f, gw1 = 1.0f, gw2 = 1.0f, gw3 = 1.0f;
             if (node.hasPerspective3D) {
+                const Matrix4x4& wm3D = GetNodeWorldMatrix3D(node);
                 float rw0 = 1.0f, rw1 = 1.0f, rw2 = 1.0f, rw3 = 1.0f;
-                const Point p0 = node.worldMatrix3D.ProjectPoint2D(Point{node.x + lx0 + italicTopShear, node.y + pg.y0}, &rw0);
-                const Point p1 = node.worldMatrix3D.ProjectPoint2D(Point{node.x + lx1 + italicTopShear, node.y + pg.y0}, &rw1);
-                const Point p2 = node.worldMatrix3D.ProjectPoint2D(Point{node.x + lx1, node.y + pg.y1}, &rw2);
-                const Point p3 = node.worldMatrix3D.ProjectPoint2D(Point{node.x + lx0, node.y + pg.y1}, &rw3);
+                const Point p0 = wm3D.ProjectPoint2D(Point{node.x + lx0 + italicTopShear, node.y + pg.y0}, &rw0);
+                const Point p1 = wm3D.ProjectPoint2D(Point{node.x + lx1 + italicTopShear, node.y + pg.y0}, &rw1);
+                const Point p2 = wm3D.ProjectPoint2D(Point{node.x + lx1, node.y + pg.y1}, &rw2);
+                const Point p3 = wm3D.ProjectPoint2D(Point{node.x + lx0, node.y + pg.y1}, &rw3);
                 gx0 = p0.x; gy0 = p0.y;
                 gx1 = p1.x; gy1 = p1.y;
                 gx2 = p2.x; gy2 = p2.y;
@@ -2288,6 +2428,12 @@ bool PagedRenderTree::WriteLayoutGlyphSlice(
         }
     }
 
+    if (node.hasPerspective3D) {
+        page.header.flags |= CommandPageFlag_HasPerspective3D;
+    }
+    if (node.pageIndex < pageBoundsState_.size()) {
+        pageBoundsState_[node.pageIndex] = 2u;
+    }
     const std::uint32_t firstQuadIdx = static_cast<std::uint32_t>(node.vertexOffsetInPage / 4u);
     for (std::size_t i = 0u; i < maxSlots; ++i) {
         const std::uint32_t qIdx = firstQuadIdx + static_cast<std::uint32_t>(i);
@@ -2357,11 +2503,14 @@ std::uint16_t PagedRenderTree::EmitPreparedTextLayoutNodes(
     const std::vector<RichGlyphStyle>* optRichStyles,
     const GradientBrushDesc* optFgGrad,
     float gradBoxHeight,
-    bool ignoreCustomGlyphColors) {
+    bool ignoreCustomGlyphColors,
+    bool reserveDynamicSlack) {
     const std::uint32_t maxQuadsPerPage = static_cast<std::uint32_t>(kVerticesPerCommandPage / 4u);
     ApplyTextAlignmentToLayout(layout, textAlign, alignBoxWidth);
     const std::size_t visibleGlyphs = CountLayoutVisibleGlyphs(layout);
-    const std::size_t totalDesiredSlots = std::max<std::size_t>(visibleGlyphs + 8u, 16u);
+    const std::size_t totalDesiredSlots = reserveDynamicSlack
+        ? std::max<std::size_t>(visibleGlyphs + 8u, 16u)
+        : std::max<std::size_t>(visibleGlyphs, 1u);
     const std::size_t chunkCount = std::max<std::size_t>(
         1u,
         (visibleGlyphs + maxQuadsPerPage - 1u) / maxQuadsPerPage);
@@ -2413,7 +2562,9 @@ std::uint16_t PagedRenderTree::EmitPreparedTextLayoutNodes(
         desc.inheritedOpacity = curState.inheritedOpacity;
         desc.hasPerspective3D = curState.hasPerspective3D;
         desc.blendMode = curState.blendMode;
-        desc.worldMatrix3D = curState.world3D;
+        if (desc.hasPerspective3D) {
+            SetNodeWorldMatrix3D(desc, curState.world3D);
+        }
         desc.baseRgba = PackColorRgba8(color, 1.0f);
         desc.sourceElement = owner;
 
@@ -2466,7 +2617,11 @@ std::uint16_t PagedRenderTree::EmitTextRunNodes(
         owner,
         textAlign,
         alignBoxWidth,
-        optRichStyles);
+        optRichStyles,
+        nullptr,
+        0.0f,
+        false,
+        owner == nullptr);
 }
 
 bool PagedRenderTree::InvalidateNodePage(std::uint32_t nodeId) noexcept {
@@ -2593,6 +2748,9 @@ std::size_t PagedRenderTree::BatchUpdateWidthsFromRawColumn(
             if (dirtyFlagsBase[node.pageIndex] == 0u) {
                 dirtyFlagsBase[node.pageIndex] = 1u;
                 dirtyListBase[dirtyListCount++] = node.pageIndex;
+            }
+            if (node.pageIndex < pageBoundsState_.size()) {
+                pageBoundsState_[node.pageIndex] = 2u;
             }
             ++updatedCount;
         }

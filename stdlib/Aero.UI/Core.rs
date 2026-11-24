@@ -1226,9 +1226,9 @@ public class DependencyObject {
         return new BoxedFloat(v);
     }
     public static DependencyObject BoxInt(int v) {
-        if (v >= -16 && v <= 256) {
-            if (_smallIntBoxes == null) { _smallIntBoxes = new BoxedInt[273]; }
-            int idx = v + 16;
+        if (v >= -64 && v <= 1024) {
+            if (_smallIntBoxes == null) { _smallIntBoxes = new BoxedInt[1089]; }
+            int idx = v + 64;
             BoxedInt hit = _smallIntBoxes[idx];
             if (hit == null) {
                 hit = new BoxedInt(v);
@@ -2596,6 +2596,31 @@ public class BehaviorEventSink : DependencyObject {
     public virtual void OnBehaviorEvent(object sender, RoutedEventArgs e) {}
 }
 
+internal class UIElementRareData {
+    internal DependencyObject ToolTip;
+    internal Func<object, UIElement> ToolTipFactory;
+    internal UIElement ContextMenuEl;
+    internal float Rot3DX = 0.0f;
+    internal float Rot3DY = 0.0f;
+    internal float Rot3DZ = 0.0f;
+    internal float Trans3DX = 0.0f;
+    internal float Trans3DY = 0.0f;
+    internal float Trans3DZ = 0.0f;
+    internal float Scale3DX = 1.0f;
+    internal float Scale3DY = 1.0f;
+    internal float Scale3DZ = 1.0f;
+    internal float Center3DX = 0.0f;
+    internal float Center3DY = 0.0f;
+    internal float Center3DZ = 0.0f;
+    internal float CamDist = 0.0f;
+    internal PlaneProjection Projection3D;
+    internal CompositeTransform3D Transform3D;
+    internal KeyBinding[] InputBindings;
+    internal string RiveSource = "";
+    internal ResourceDictionary LocResources;
+    internal string LocSource = "";
+}
+
 public partial class UIElement : DependencyObject {
     internal DependencyObject _ddLastItemBox;
     internal int _ddLastItemVer = -1;
@@ -2606,11 +2631,16 @@ public partial class UIElement : DependencyObject {
     internal int _ancestorChainEpoch = 1;
     internal static int _disposeEpoch = 1;
     internal static int _treeParentEpoch = 1;
+    internal static int _visibilityEpoch = 1;
     public static int _closedPopupBuildDepth = 0;
 
     private bool _cachedClosedPopupVal = false;
     private int _cachedClosedPopupTreeEpoch = 0;
     private int _cachedClosedPopupChainEpoch = 0;
+    private bool _cachedCollapsedVal = false;
+    private int _cachedCollapsedVisEpoch = 0;
+    private int _cachedCollapsedTreeEpoch = 0;
+    private int _cachedCollapsedChainEpoch = 0;
 
     internal void BumpPropEpoch() {
         _propEpoch = _propEpoch >= 1000000000 ? 1 : (_propEpoch + 1);
@@ -2667,6 +2697,35 @@ public partial class UIElement : DependencyObject {
         return res;
     }
 
+    internal static void BumpVisibilityEpoch() {
+        _visibilityEpoch = _visibilityEpoch >= 1000000000 ? 1 : (_visibilityEpoch + 1);
+    }
+
+    internal bool IsInsideCollapsedSubtree() {
+        if (_parent == null) { return false; }
+        if (_cachedCollapsedVisEpoch == _visibilityEpoch &&
+            _cachedCollapsedTreeEpoch == _treeParentEpoch &&
+            _cachedCollapsedChainEpoch == _ancestorChainEpoch) {
+            return _cachedCollapsedVal;
+        }
+        bool collapsed = false;
+        UIElement cur = _parent;
+        int guard = 0;
+        while (cur != null && guard < 128) {
+            guard += 1;
+            if (cur._visibility == Visibility.Collapsed) {
+                collapsed = true;
+                break;
+            }
+            cur = cur._parent;
+        }
+        _cachedCollapsedVal = collapsed;
+        _cachedCollapsedVisEpoch = _visibilityEpoch;
+        _cachedCollapsedTreeEpoch = _treeParentEpoch;
+        _cachedCollapsedChainEpoch = _ancestorChainEpoch;
+        return collapsed;
+    }
+
     internal virtual int FastPropEpochCategory() { return 1; }
 
     internal static void BumpTreeParentEpoch() {
@@ -2679,9 +2738,11 @@ public partial class UIElement : DependencyObject {
     private string _name = "";
     private string _uid = "";
     private DependencyObject _tag;
-    private DependencyObject _toolTip;
-    private Func<object, UIElement> _toolTipFactory;
-    internal UIElement _contextMenu;
+    internal UIElementRareData _rare;
+    internal UIElementRareData EnsureRare() {
+        if (_rare == null) { _rare = new UIElementRareData(); }
+        return _rare;
+    }
     private DependencyObject _explicitDataContext;
     private DependencyObject _inheritedDataContext;
     private UIElement _templatedParent;
@@ -2733,19 +2794,6 @@ public partial class UIElement : DependencyObject {
     private Transform _renderTransform;
     private Transform _layoutTransform;
     private Point _renderTransformOrigin;
-    private float _rot3DX = 0.0f;
-    private float _rot3DY = 0.0f;
-    private float _rot3DZ = 0.0f;
-    private float _trans3DX = 0.0f;
-    private float _trans3DY = 0.0f;
-    private float _trans3DZ = 0.0f;
-    private float _scale3DX = 1.0f;
-    private float _scale3DY = 1.0f;
-    private float _scale3DZ = 1.0f;
-    private float _center3DX = 0.0f;
-    private float _center3DY = 0.0f;
-    private float _center3DZ = 0.0f;
-    private float _camDist = 0.0f;
     internal static AttachedPropChangedHook _attachedPropHook;
     private Effect _effect;
     private Brush _opacityMask;
@@ -2757,9 +2805,6 @@ public partial class UIElement : DependencyObject {
     private Thickness _borderThickness;
     private CornerRadius _cornerRadius;
 
-    private PlaneProjection _projection3D;
-    private CompositeTransform3D _transform3D;
-    private KeyBinding[] _inputBindings;
     private float _explicitFontSize = 0.0f;
     private float _inheritedFontSize = 0.0f;
     private string _explicitFontFamily = "";
@@ -2768,9 +2813,6 @@ public partial class UIElement : DependencyObject {
     private string _inheritedFontWeight = "";
     private Brush _explicitTextForeground;
     private Brush _inheritedTextForeground;
-    private string _riveSource = "";
-    private ResourceDictionary _locResources;
-    private string _locSource = "";
     private string _flowDirection = "LeftToRight";
     internal Style _appliedStyle;
     internal bool _hasTemplateResources = false;
@@ -2856,8 +2898,6 @@ public partial class UIElement : DependencyObject {
         if (_inheritedFontFamily == null) { _inheritedFontFamily = ""; }
         if (_explicitFontWeight == null) { _explicitFontWeight = ""; }
         if (_inheritedFontWeight == null) { _inheritedFontWeight = ""; }
-        if (_riveSource == null) { _riveSource = ""; }
-        if (_locSource == null) { _locSource = ""; }
         if (_flowDirection == null || _flowDirection.Length == 0) { _flowDirection = "LeftToRight"; }
         _children = null;
         _detachedLogicalChildren = null;
@@ -2868,7 +2908,6 @@ public partial class UIElement : DependencyObject {
         _renderTransformOrigin = Point.SharedCenter();
         _dynResProps = null;
         _dynResKeys = null;
-        _inputBindings = null;
         CreateNativeVisual(kind);
         SyncInteractiveFlags();
     }
@@ -2920,17 +2959,19 @@ public partial class UIElement : DependencyObject {
         }
     }
     public bool HasToolTip {
-        get { return _toolTip != null || _toolTipFactory != null; }
+        get { return _rare != null && (_rare.ToolTip != null || _rare.ToolTipFactory != null); }
     }
     public void SetLazyToolTip(Func<object, UIElement> factory) {
-        _toolTipFactory = factory;
-        _toolTip = null;
+        if (factory == null && _rare == null) { return; }
+        UIElementRareData r = EnsureRare();
+        r.ToolTipFactory = factory;
+        r.ToolTip = null;
         if (factory != null) { EnableToolTipHover(); }
     }
     private void EnsureToolTipMaterialized() {
-        if (_toolTip != null || _toolTipFactory == null) { return; }
-        var fn = _toolTipFactory;
-        _toolTipFactory = null;
+        if (_rare == null || _rare.ToolTip != null || _rare.ToolTipFactory == null) { return; }
+        var fn = _rare.ToolTipFactory;
+        _rare.ToolTipFactory = null;
         var pushed = new ResourceDictionary[0];
         var chain = new UIElement[0];
         UIElement cur = this;
@@ -2953,28 +2994,33 @@ public partial class UIElement : DependencyObject {
         for (int i = pushed.Length - 1; i >= 0; i -= 1) {
             ResourceDictionary.PopAmbient(pushed[i]);
         }
-        _toolTip = built;
+        EnsureRare().ToolTip = built;
     }
     public object ToolTip {
-        get { EnsureToolTipMaterialized(); return DependencyObject.Unbox(_toolTip); }
+        get { EnsureToolTipMaterialized(); return _rare != null ? DependencyObject.Unbox(_rare.ToolTip) : null; }
         set {
-            _toolTipFactory = null;
-            _toolTip = DependencyObject.BoxObject(value);
-            if (_toolTipEventHook != null && _toolTip != null) { var tth = _toolTipEventHook; tth(this, "ToolTip", _toolTip); }
+            if (value == null && _rare == null) { return; }
+            UIElementRareData r = EnsureRare();
+            r.ToolTipFactory = null;
+            r.ToolTip = DependencyObject.BoxObject(value);
+            if (_toolTipEventHook != null && r.ToolTip != null) { var tth = _toolTipEventHook; tth(this, "ToolTip", r.ToolTip); }
         }
     }
     public DependencyObject ToolTipBox {
-        get { EnsureToolTipMaterialized(); return _toolTip; }
+        get { EnsureToolTipMaterialized(); return _rare != null ? _rare.ToolTip : null; }
         set {
-            _toolTipFactory = null;
-            _toolTip = value;
-            if (_toolTipEventHook != null && _toolTip != null) { var tth = _toolTipEventHook; tth(this, "ToolTip", _toolTip); }
+            if (value == null && _rare == null) { return; }
+            UIElementRareData r = EnsureRare();
+            r.ToolTipFactory = null;
+            r.ToolTip = value;
+            if (_toolTipEventHook != null && r.ToolTip != null) { var tth = _toolTipEventHook; tth(this, "ToolTip", r.ToolTip); }
         }
     }
     public void SetToolTip(string text) {
-        _toolTipFactory = null;
-        _toolTip = DependencyObject.BoxString(text);
-        if (_toolTip != null) { EnableToolTipHover(); }
+        UIElementRareData r = EnsureRare();
+        r.ToolTipFactory = null;
+        r.ToolTip = DependencyObject.BoxString(text);
+        if (r.ToolTip != null) { EnableToolTipHover(); }
     }
 
     public UIElement Parent { get { return _parent; } }
@@ -3030,7 +3076,11 @@ public partial class UIElement : DependencyObject {
             UIElement cur = els[idx];
             DependencyObject parentDc = dcs[idx];
             idx += 1;
-            if (cur == null || cur._explicitDataContext != null) { continue; }
+            if (cur == null) { continue; }
+            if (cur._explicitDataContext != null) {
+                cur._inheritedDataContext = parentDc;
+                continue;
+            }
             DependencyObject oldBox = cur._inheritedDataContext;
             if (oldBox == parentDc) { continue; }
             cur._inheritedDataContext = parentDc;
@@ -3051,6 +3101,12 @@ public partial class UIElement : DependencyObject {
 
     internal DependencyObject EffectiveDataContextBox() {
         return _explicitDataContext != null ? _explicitDataContext : _inheritedDataContext;
+    }
+
+    internal DependencyObject InheritedDataContextBox() {
+        if (_inheritedDataContext != null) { return _inheritedDataContext; }
+        UIElement p = _parent != null ? _parent : _logicalParent;
+        return p != null ? p.EffectiveDataContextBox() : null;
     }
 
     private void PropagateDataContextToSubtree(DependencyObject oldBox) {
@@ -3348,10 +3404,16 @@ public partial class UIElement : DependencyObject {
         get { return _visibility; }
         set {
             if (_visibility == value) { return; }
+            bool wasCollapsed = (_visibility == Visibility.Collapsed);
             _visibility = value;
+            BumpVisibilityEpoch();
             if (_hasNative) { Visual_SetVisibility(__nativeHandle, EnumConvert.ToInt(value)); }
             OnVisualStatePropertyChanged();
             UpdateTriggersAndStates();
+            if (wasCollapsed && _visibility != Visibility.Collapsed && _xamlBuildDepth == 0 &&
+                !IsInsideCollapsedSubtree() && !IsInsideClosedPopup()) {
+                BindingEngine.FlushSubtree(this);
+            }
             NotifyBoundPropertyChanged("Visibility", DependencyObject.BoxInt(EnumConvert.ToInt(_visibility)));
         }
     }
@@ -3469,13 +3531,13 @@ public partial class UIElement : DependencyObject {
         }
     }
 
-    public float Rotation3DX { get { return _rot3DX; } set { if (_rot3DX == value) { return; } _rot3DX = value; SyncTransform3D(); NotifyBoundPropertyChanged("Rotation3DX", DependencyObject.BoxFloat(_rot3DX)); } }
-    public float Rotation3DY { get { return _rot3DY; } set { if (_rot3DY == value) { return; } _rot3DY = value; SyncTransform3D(); NotifyBoundPropertyChanged("Rotation3DY", DependencyObject.BoxFloat(_rot3DY)); } }
-    public float Rotation3DZ { get { return _rot3DZ; } set { if (_rot3DZ == value) { return; } _rot3DZ = value; SyncTransform3D(); NotifyBoundPropertyChanged("Rotation3DZ", DependencyObject.BoxFloat(_rot3DZ)); } }
-    public float Translation3DX { get { return _trans3DX; } set { if (_trans3DX == value) { return; } _trans3DX = value; SyncTransform3D(); NotifyBoundPropertyChanged("Translation3DX", DependencyObject.BoxFloat(_trans3DX)); } }
-    public float Translation3DY { get { return _trans3DY; } set { if (_trans3DY == value) { return; } _trans3DY = value; SyncTransform3D(); NotifyBoundPropertyChanged("Translation3DY", DependencyObject.BoxFloat(_trans3DY)); } }
-    public float Translation3DZ { get { return _trans3DZ; } set { if (_trans3DZ == value) { return; } _trans3DZ = value; SyncTransform3D(); NotifyBoundPropertyChanged("Translation3DZ", DependencyObject.BoxFloat(_trans3DZ)); } }
-    public float CameraDistance { get { return _camDist; } set { if (_camDist == value) { return; } _camDist = value; SyncTransform3D(); NotifyBoundPropertyChanged("CameraDistance", DependencyObject.BoxFloat(_camDist)); } }
+    public float Rotation3DX { get { return _rare != null ? _rare.Rot3DX : 0.0f; } set { if (Rotation3DX == value) { return; } EnsureRare().Rot3DX = value; SyncTransform3D(); NotifyBoundPropertyChanged("Rotation3DX", DependencyObject.BoxFloat(value)); } }
+    public float Rotation3DY { get { return _rare != null ? _rare.Rot3DY : 0.0f; } set { if (Rotation3DY == value) { return; } EnsureRare().Rot3DY = value; SyncTransform3D(); NotifyBoundPropertyChanged("Rotation3DY", DependencyObject.BoxFloat(value)); } }
+    public float Rotation3DZ { get { return _rare != null ? _rare.Rot3DZ : 0.0f; } set { if (Rotation3DZ == value) { return; } EnsureRare().Rot3DZ = value; SyncTransform3D(); NotifyBoundPropertyChanged("Rotation3DZ", DependencyObject.BoxFloat(value)); } }
+    public float Translation3DX { get { return _rare != null ? _rare.Trans3DX : 0.0f; } set { if (Translation3DX == value) { return; } EnsureRare().Trans3DX = value; SyncTransform3D(); NotifyBoundPropertyChanged("Translation3DX", DependencyObject.BoxFloat(value)); } }
+    public float Translation3DY { get { return _rare != null ? _rare.Trans3DY : 0.0f; } set { if (Translation3DY == value) { return; } EnsureRare().Trans3DY = value; SyncTransform3D(); NotifyBoundPropertyChanged("Translation3DY", DependencyObject.BoxFloat(value)); } }
+    public float Translation3DZ { get { return _rare != null ? _rare.Trans3DZ : 0.0f; } set { if (Translation3DZ == value) { return; } EnsureRare().Trans3DZ = value; SyncTransform3D(); NotifyBoundPropertyChanged("Translation3DZ", DependencyObject.BoxFloat(value)); } }
+    public float CameraDistance { get { return _rare != null ? _rare.CamDist : 0.0f; } set { if (CameraDistance == value) { return; } EnsureRare().CamDist = value; SyncTransform3D(); NotifyBoundPropertyChanged("CameraDistance", DependencyObject.BoxFloat(value)); } }
 
     private EffectChangeHook _effectHook;
 
@@ -3515,43 +3577,47 @@ public partial class UIElement : DependencyObject {
         }
     }
     public PlaneProjection Projection3D {
-        get { return _projection3D; }
+        get { return _rare != null ? _rare.Projection3D : null; }
         set {
-            _projection3D = value;
+            if (value == null && _rare == null) { return; }
+            UIElementRareData r = EnsureRare();
+            r.Projection3D = value;
             BumpPropEpoch();
             if (value != null) {
-                _rot3DX = value.RotationX;
-                _rot3DY = value.RotationY;
-                _rot3DZ = value.RotationZ;
-                _trans3DX = value.LocalOffsetX + value.GlobalOffsetX;
-                _trans3DY = value.LocalOffsetY + value.GlobalOffsetY;
-                _trans3DZ = value.LocalOffsetZ + value.GlobalOffsetZ;
-                _scale3DX = 1.0f;
-                _scale3DY = 1.0f;
-                _scale3DZ = 1.0f;
+                r.Rot3DX = value.RotationX;
+                r.Rot3DY = value.RotationY;
+                r.Rot3DZ = value.RotationZ;
+                r.Trans3DX = value.LocalOffsetX + value.GlobalOffsetX;
+                r.Trans3DY = value.LocalOffsetY + value.GlobalOffsetY;
+                r.Trans3DZ = value.LocalOffsetZ + value.GlobalOffsetZ;
+                r.Scale3DX = 1.0f;
+                r.Scale3DY = 1.0f;
+                r.Scale3DZ = 1.0f;
                 SetUiFlag(2, false);
                 SyncTransform3D();
             }
         }
     }
     public CompositeTransform3D Transform3D {
-        get { return _transform3D; }
+        get { return _rare != null ? _rare.Transform3D : null; }
         set {
-            _transform3D = value;
+            if (value == null && _rare == null) { return; }
+            UIElementRareData r = EnsureRare();
+            r.Transform3D = value;
             BumpPropEpoch();
             if (value != null) {
-                _rot3DX = value.RotationX;
-                _rot3DY = value.RotationY;
-                _rot3DZ = value.RotationZ;
-                _trans3DX = value.TranslateX;
-                _trans3DY = value.TranslateY;
-                _trans3DZ = value.TranslateZ;
-                _scale3DX = value.ScaleX;
-                _scale3DY = value.ScaleY;
-                _scale3DZ = value.ScaleZ;
-                _center3DX = value.CenterX;
-                _center3DY = value.CenterY;
-                _center3DZ = value.CenterZ;
+                r.Rot3DX = value.RotationX;
+                r.Rot3DY = value.RotationY;
+                r.Rot3DZ = value.RotationZ;
+                r.Trans3DX = value.TranslateX;
+                r.Trans3DY = value.TranslateY;
+                r.Trans3DZ = value.TranslateZ;
+                r.Scale3DX = value.ScaleX;
+                r.Scale3DY = value.ScaleY;
+                r.Scale3DZ = value.ScaleZ;
+                r.Center3DX = value.CenterX;
+                r.Center3DY = value.CenterY;
+                r.Center3DZ = value.CenterZ;
                 SetUiFlag(2, true);
                 SyncTransform3D();
             }
@@ -3672,22 +3738,24 @@ public partial class UIElement : DependencyObject {
 
     public void AddInputBinding(KeyBinding kb) {
         if (kb != null) {
-            if (_inputBindings == null) { _inputBindings = new KeyBinding[0]; }
-            _inputBindings.Push(kb);
+            UIElementRareData r = EnsureRare();
+            if (r.InputBindings == null) { r.InputBindings = new KeyBinding[0]; }
+            r.InputBindings.Push(kb);
         }
     }
     public void AddKeyBinding(KeyBinding kb) { AddInputBinding(kb); }
     public KeyBinding[] InputBindings() {
-        return _inputBindings != null ? _inputBindings : new KeyBinding[0];
+        return (_rare != null && _rare.InputBindings != null) ? _rare.InputBindings : new KeyBinding[0];
     }
 
     internal bool TryHandleInputBindings(KeyEventArgs e) {
-        if (e == null || e.Handled || _inputBindings == null || _inputBindings.Length == 0) {
+        if (e == null || e.Handled || _rare == null || _rare.InputBindings == null || _rare.InputBindings.Length == 0) {
             return false;
         }
         int evMods = e.Modifiers % 8;
-        for (int i = 0; i < _inputBindings.Length; i += 1) {
-            KeyBinding kb = _inputBindings[i];
+        KeyBinding[] ibs = _rare.InputBindings;
+        for (int i = 0; i < ibs.Length; i += 1) {
+            KeyBinding kb = ibs[i];
             if (kb.Key == e.Key && (kb.Modifiers % 8) == evMods) {
                 ICommand cmd = kb.Command;
                 if (cmd == null && kb.CommandPath.Length > 0) {
@@ -3851,13 +3919,17 @@ public partial class UIElement : DependencyObject {
     }
     public void SyncTransform3D() {
         if (!_hasNative) { return; }
+        if (_rare == null) {
+            Visual_SetTransform3DEx(__nativeHandle, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 1.0f, 1.0f, 1.0f, 0.0f, 0.0f, 0.0f, 0.0f, false);
+            return;
+        }
         Visual_SetTransform3DEx(
             __nativeHandle,
-            _rot3DX, _rot3DY, _rot3DZ,
-            _trans3DX, _trans3DY, _trans3DZ,
-            _scale3DX, _scale3DY, _scale3DZ,
-            _center3DX, _center3DY, _center3DZ,
-            _camDist, HasUiFlag(2));
+            _rare.Rot3DX, _rare.Rot3DY, _rare.Rot3DZ,
+            _rare.Trans3DX, _rare.Trans3DY, _rare.Trans3DZ,
+            _rare.Scale3DX, _rare.Scale3DY, _rare.Scale3DZ,
+            _rare.Center3DX, _rare.Center3DY, _rare.Center3DZ,
+            _rare.CamDist, HasUiFlag(2));
     }
     public void SyncEffect() {
         if (!_hasNative) { return; }
@@ -4085,7 +4157,7 @@ public partial class UIElement : DependencyObject {
             }
             return;
         }
-        if (_parent == null && !HasUiFlag(32) && _resources == null && _locResources == null &&
+        if (_parent == null && !HasUiFlag(32) && _resources == null && (_rare == null || _rare.LocResources == null) &&
             _explicitDataContext == null && _inheritedDataContext == null &&
             _explicitFontSize <= 0.0f && _explicitFontFamily.Length == 0 &&
             _explicitFontWeight.Length == 0 && _explicitTextForeground == null) {
@@ -4257,18 +4329,21 @@ public partial class UIElement : DependencyObject {
                     q.Push(cur._detachedLogicalChildren[i]);
                 }
             }
-            if (cur._contextMenu != null) {
-                if (!cur._contextMenu.HasUiFlag(4096)) {
-                    q.Push(cur._contextMenu);
-                } else {
-                    UIElement pt = cur._contextMenu.GetPropertyValue("PlacementTarget") as UIElement;
-                    if (pt == cur) {
-                        cur._contextMenu.SetPropertyValue("IsOpen", DependencyObject.BoxBool(false));
+            if (cur._rare != null) {
+                UIElement cmEl = cur._rare.ContextMenuEl;
+                if (cmEl != null) {
+                    if (!cmEl.HasUiFlag(4096)) {
+                        q.Push(cmEl);
+                    } else {
+                        UIElement pt = cmEl.GetPropertyValue("PlacementTarget") as UIElement;
+                        if (pt == cur) {
+                            cmEl.SetPropertyValue("IsOpen", DependencyObject.BoxBool(false));
+                        }
                     }
                 }
-            }
-            if (cur._toolTip is UIElement) {
-                q.Push(cur._toolTip as UIElement);
+                if (cur._rare.ToolTip is UIElement) {
+                    q.Push(cur._rare.ToolTip as UIElement);
+                }
             }
             if (cur._resources != null && cur._resources.Count() > 0) {
                 string[] rKeys = cur._resources.Keys();
@@ -4313,12 +4388,9 @@ public partial class UIElement : DependencyObject {
             cur._templatedParent = null;
             cur._children = null;
             cur._detachedLogicalChildren = null;
-            cur._contextMenu = null;
-            cur._toolTip = null;
-            cur._toolTipFactory = null;
+            cur._rare = null;
             cur._resources = null;
             cur._ambientResources = null;
-            cur._locResources = null;
             cur._style = null;
             cur._appliedStyle = null;
             cur._hasTemplateResources = false;
@@ -4336,7 +4408,7 @@ public partial class UIElement : DependencyObject {
             cur._logicalParent = null;
             cur._localProps = null;
             cur._activeTriggerProps = null;
-            cur._inputBindings = null;
+
         }
         InputDispatcher.CleanupDisposed();
         if (_disposeHooks != null) {
@@ -4491,8 +4563,8 @@ public partial class UIElement : DependencyObject {
             walkGuard += 1;
             lastVisited = cur;
             if (cur == tpTarget) { sawTpTarget = true; }
-            if (cur._locResources != null) {
-                DependencyObject locB = cur._locResources.TryGetLocalBox(key);
+            if (cur._rare != null && cur._rare.LocResources != null) {
+                DependencyObject locB = cur._rare.LocResources.TryGetLocalBox(key);
                 if (locB != null) { return locB; }
             }
             if (cur._resources != null) {
@@ -4523,8 +4595,8 @@ public partial class UIElement : DependencyObject {
             tp = lastVisited._templatedParent;
         }
         while (tp != null) {
-            if (tp._locResources != null) {
-                DependencyObject tpLoc = tp._locResources.TryGetLocalBox(key);
+            if (tp._rare != null && tp._rare.LocResources != null) {
+                DependencyObject tpLoc = tp._rare.LocResources.TryGetLocalBox(key);
                 if (tpLoc != null) { return tpLoc; }
             }
             if (tp._resources != null) {
@@ -5093,12 +5165,12 @@ public partial class UIElement : DependencyObject {
         if (propName == "Translation3DX" || propName == "Trans3DX" || propName == "Transform3D.TranslateX") { Translation3DX = DependencyObject.UnboxFloat(value, 0.0f); return true; }
         if (propName == "Translation3DY" || propName == "Trans3DY" || propName == "Transform3D.TranslateY") { Translation3DY = DependencyObject.UnboxFloat(value, 0.0f); return true; }
         if (propName == "Translation3DZ" || propName == "Trans3DZ" || propName == "Transform3D.TranslateZ") { Translation3DZ = DependencyObject.UnboxFloat(value, 0.0f); return true; }
-        if (propName == "Transform3D.ScaleX" || propName == "Scale3DX") { _scale3DX = DependencyObject.UnboxFloat(value, 1.0f); SyncTransform3D(); NotifyBoundPropertyChanged(propName, DependencyObject.BoxFloat(_scale3DX)); return true; }
-        if (propName == "Transform3D.ScaleY" || propName == "Scale3DY") { _scale3DY = DependencyObject.UnboxFloat(value, 1.0f); SyncTransform3D(); NotifyBoundPropertyChanged(propName, DependencyObject.BoxFloat(_scale3DY)); return true; }
-        if (propName == "Transform3D.ScaleZ" || propName == "Scale3DZ") { _scale3DZ = DependencyObject.UnboxFloat(value, 1.0f); SyncTransform3D(); NotifyBoundPropertyChanged(propName, DependencyObject.BoxFloat(_scale3DZ)); return true; }
-        if (propName == "Transform3D.CenterX") { _center3DX = DependencyObject.UnboxFloat(value, 0.0f); SetUiFlag(2, true); SyncTransform3D(); return true; }
-        if (propName == "Transform3D.CenterY") { _center3DY = DependencyObject.UnboxFloat(value, 0.0f); SetUiFlag(2, true); SyncTransform3D(); return true; }
-        if (propName == "Transform3D.CenterZ") { _center3DZ = DependencyObject.UnboxFloat(value, 0.0f); SetUiFlag(2, true); SyncTransform3D(); return true; }
+        if (propName == "Transform3D.ScaleX" || propName == "Scale3DX") { float sv = DependencyObject.UnboxFloat(value, 1.0f); EnsureRare().Scale3DX = sv; SyncTransform3D(); NotifyBoundPropertyChanged(propName, DependencyObject.BoxFloat(sv)); return true; }
+        if (propName == "Transform3D.ScaleY" || propName == "Scale3DY") { float sv = DependencyObject.UnboxFloat(value, 1.0f); EnsureRare().Scale3DY = sv; SyncTransform3D(); NotifyBoundPropertyChanged(propName, DependencyObject.BoxFloat(sv)); return true; }
+        if (propName == "Transform3D.ScaleZ" || propName == "Scale3DZ") { float sv = DependencyObject.UnboxFloat(value, 1.0f); EnsureRare().Scale3DZ = sv; SyncTransform3D(); NotifyBoundPropertyChanged(propName, DependencyObject.BoxFloat(sv)); return true; }
+        if (propName == "Transform3D.CenterX") { EnsureRare().Center3DX = DependencyObject.UnboxFloat(value, 0.0f); SetUiFlag(2, true); SyncTransform3D(); return true; }
+        if (propName == "Transform3D.CenterY") { EnsureRare().Center3DY = DependencyObject.UnboxFloat(value, 0.0f); SetUiFlag(2, true); SyncTransform3D(); return true; }
+        if (propName == "Transform3D.CenterZ") { EnsureRare().Center3DZ = DependencyObject.UnboxFloat(value, 0.0f); SetUiFlag(2, true); SyncTransform3D(); return true; }
         if (propName == "CameraDistance") { CameraDistance = DependencyObject.UnboxFloat(value, 0.0f); return true; }
         if (propName == "TextElement.FontSize" || propName == "TextBlock.FontSize") {
             SetExplicitTextFontSize(DependencyObject.UnboxFloat(value, 14.0f));
@@ -5117,8 +5189,11 @@ public partial class UIElement : DependencyObject {
             return true;
         }
         if (propName == "ToolTip" || propName == "ToolTipService.ToolTip" || propName == "noesis:ToolTipService.ToolTip") {
-            _toolTipFactory = null;
-            _toolTip = value;
+            if (value != null || _rare != null) {
+                UIElementRareData r = EnsureRare();
+                r.ToolTipFactory = null;
+                r.ToolTip = value;
+            }
             if (_toolTipEventHook != null && value != null) {
                 var tth = _toolTipEventHook;
                 tth(this, "ToolTip", value);
@@ -5144,7 +5219,7 @@ public partial class UIElement : DependencyObject {
             return true;
         }
         if (propName == "RiveControl.Source") {
-            _riveSource = DependencyObject.UnboxString(value, "");
+            EnsureRare().RiveSource = DependencyObject.UnboxString(value, "");
             return true;
         }
         if (propName == "Loc.Source" || propName == "noesis:Loc.Source") {
@@ -5163,7 +5238,10 @@ public partial class UIElement : DependencyObject {
                 var cmHook = _contextMenuSetterHook;
                 cmHook(this, propName, value);
             } else {
-                _contextMenu = DependencyObject.Unbox(value) as UIElement;
+                UIElement cmVal = DependencyObject.Unbox(value) as UIElement;
+                if (cmVal != null || _rare != null) {
+                    EnsureRare().ContextMenuEl = cmVal;
+                }
             }
             return true;
         }
@@ -5252,8 +5330,9 @@ public partial class UIElement : DependencyObject {
         string nextSrc = sourceName == null ? "" : sourceName.Trim();
         ResourceDictionary dict = ResourceDictionary.GetLocSource(nextSrc);
         if (dict == null) { return; }
-        _locSource = nextSrc;
-        _locResources = dict;
+        UIElementRareData r = EnsureRare();
+        r.LocSource = nextSrc;
+        r.LocResources = dict;
         RefreshDynamicResourcesRecursive();
         BindingEngine.Flush();
         UpdateLayout();
@@ -5268,7 +5347,7 @@ public partial class UIElement : DependencyObject {
     internal virtual bool DetachNonTemplateUserContent(UIElement owner, UIElement[] q) { return false; }
 
     public virtual DependencyObject GetPropertyValue(string propName) {
-        if (propName == "RiveControl.Source") { return DependencyObject.BoxString(_riveSource); }
+        if (propName == "RiveControl.Source") { return DependencyObject.BoxString(_rare != null ? _rare.RiveSource : ""); }
         if (propName == "Width") { return DependencyObject.BoxFloat(_width); }
         if (propName == "Height") { return DependencyObject.BoxFloat(_height); }
         if (propName == "MinWidth") { return DependencyObject.BoxFloat(_minWidth); }
@@ -5315,7 +5394,7 @@ public partial class UIElement : DependencyObject {
         if (propName == "LayoutTransform") { return _layoutTransform; }
         if (propName == "RenderTransformOrigin") { return _renderTransformOrigin; }
         if (propName == "OpacityMask") { return _opacityMask; }
-        if (propName == "ToolTip" || propName == "ToolTipService.ToolTip") { return _toolTip; }
+        if (propName == "ToolTip" || propName == "ToolTipService.ToolTip") { return _rare != null ? _rare.ToolTip : null; }
         if (propName == "Element.BlendingMode" || propName == "noesis:Element.BlendingMode" ||
             propName == "local:Element.BlendingMode" || propName == "BlendMode") {
             int bm = _blendMode == BlendingMode.Multiply ? 1 : (_blendMode == BlendingMode.Screen ? 2 : (_blendMode == BlendingMode.Additive ? 3 : 0));
@@ -5336,18 +5415,18 @@ public partial class UIElement : DependencyObject {
         if (propName == "TabIndex" || propName == "KeyboardNavigation.TabIndex") { return DependencyObject.BoxInt(_keyboardTabIndex); }
         if (propName == "DataContext") { return EffectiveDataContextBox(); }
         if (propName == "Tag") { return _tag; }
-        if (propName == "Rotation3DX" || propName == "Rot3DX" || propName == "Transform3D.RotationX" || propName == "Projection3D.RotationX") { return DependencyObject.BoxFloat(_rot3DX); }
-        if (propName == "Rotation3DY" || propName == "Rot3DY" || propName == "Transform3D.RotationY" || propName == "Projection3D.RotationY") { return DependencyObject.BoxFloat(_rot3DY); }
-        if (propName == "Rotation3DZ" || propName == "Rot3DZ" || propName == "Transform3D.RotationZ" || propName == "Projection3D.RotationZ") { return DependencyObject.BoxFloat(_rot3DZ); }
-        if (propName == "Translation3DX" || propName == "Trans3DX" || propName == "Transform3D.TranslateX") { return DependencyObject.BoxFloat(_trans3DX); }
-        if (propName == "Translation3DY" || propName == "Trans3DY" || propName == "Transform3D.TranslateY") { return DependencyObject.BoxFloat(_trans3DY); }
-        if (propName == "Translation3DZ" || propName == "Trans3DZ" || propName == "Transform3D.TranslateZ") { return DependencyObject.BoxFloat(_trans3DZ); }
-        if (propName == "Transform3D.ScaleX" || propName == "Scale3DX") { return DependencyObject.BoxFloat(_scale3DX); }
-        if (propName == "Transform3D.ScaleY" || propName == "Scale3DY") { return DependencyObject.BoxFloat(_scale3DY); }
-        if (propName == "Transform3D.ScaleZ" || propName == "Scale3DZ") { return DependencyObject.BoxFloat(_scale3DZ); }
-        if (propName == "Transform3D.CenterX") { return DependencyObject.BoxFloat(_center3DX); }
-        if (propName == "Transform3D.CenterY") { return DependencyObject.BoxFloat(_center3DY); }
-        if (propName == "Transform3D.CenterZ") { return DependencyObject.BoxFloat(_center3DZ); }
+        if (propName == "Rotation3DX" || propName == "Rot3DX" || propName == "Transform3D.RotationX" || propName == "Projection3D.RotationX") { return DependencyObject.BoxFloat(Rotation3DX); }
+        if (propName == "Rotation3DY" || propName == "Rot3DY" || propName == "Transform3D.RotationY" || propName == "Projection3D.RotationY") { return DependencyObject.BoxFloat(Rotation3DY); }
+        if (propName == "Rotation3DZ" || propName == "Rot3DZ" || propName == "Transform3D.RotationZ" || propName == "Projection3D.RotationZ") { return DependencyObject.BoxFloat(Rotation3DZ); }
+        if (propName == "Translation3DX" || propName == "Trans3DX" || propName == "Transform3D.TranslateX") { return DependencyObject.BoxFloat(Translation3DX); }
+        if (propName == "Translation3DY" || propName == "Trans3DY" || propName == "Transform3D.TranslateY") { return DependencyObject.BoxFloat(Translation3DY); }
+        if (propName == "Translation3DZ" || propName == "Trans3DZ" || propName == "Transform3D.TranslateZ") { return DependencyObject.BoxFloat(Translation3DZ); }
+        if (propName == "Transform3D.ScaleX" || propName == "Scale3DX") { return DependencyObject.BoxFloat(_rare != null ? _rare.Scale3DX : 1.0f); }
+        if (propName == "Transform3D.ScaleY" || propName == "Scale3DY") { return DependencyObject.BoxFloat(_rare != null ? _rare.Scale3DY : 1.0f); }
+        if (propName == "Transform3D.ScaleZ" || propName == "Scale3DZ") { return DependencyObject.BoxFloat(_rare != null ? _rare.Scale3DZ : 1.0f); }
+        if (propName == "Transform3D.CenterX") { return DependencyObject.BoxFloat(_rare != null ? _rare.Center3DX : 0.0f); }
+        if (propName == "Transform3D.CenterY") { return DependencyObject.BoxFloat(_rare != null ? _rare.Center3DY : 0.0f); }
+        if (propName == "Transform3D.CenterZ") { return DependencyObject.BoxFloat(_rare != null ? _rare.Center3DZ : 0.0f); }
         if (propName == "RenderTransform.ScaleX" || propName == "ScaleX" ||
             propName == "RenderTransform.ScaleY" || propName == "ScaleY" ||
             propName == "RenderTransform.Angle" || propName == "Rotation" || propName == "Angle" ||
@@ -5360,8 +5439,8 @@ public partial class UIElement : DependencyObject {
             return DependencyObject.BoxFloat(GetTransformScalar(propName));
         }
         if (propName == "FlowDirection") { return DependencyObject.BoxString(_flowDirection); }
-        if (propName == "ContextMenu") { return _contextMenu; }
-        if (propName == "Loc.Source" || propName == "noesis:Loc.Source") { return DependencyObject.BoxString(_locSource); }
+        if (propName == "ContextMenu") { return _rare != null ? _rare.ContextMenuEl : null; }
+        if (propName == "Loc.Source" || propName == "noesis:Loc.Source") { return DependencyObject.BoxString(_rare != null ? _rare.LocSource : ""); }
         DependencyObject customBox = GetDynamicProp(NormalizeCustomPropKey(propName));
         if (customBox != null) { return customBox; }
         return null;

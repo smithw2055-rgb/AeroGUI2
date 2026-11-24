@@ -70,8 +70,14 @@ struct TextureSlotBuffer {
     std::uint32_t height = 0u;
     std::uint32_t dirtyRevision = 0u;
     bool isAtlas = false;
+    mutable bool hasDirtyRect = false;
+    mutable std::uint32_t dirtyX0 = 0u;
+    mutable std::uint32_t dirtyY0 = 0u;
+    mutable std::uint32_t dirtyX1 = 0u;
+    mutable std::uint32_t dirtyY1 = 0u;
+    mutable std::uint32_t dirtyBaseRevision = 0u;
     std::vector<std::uint8_t> rgbaPixels;
-    std::shared_ptr<const std::vector<std::uint8_t>> pixelSnapshot;
+    mutable std::shared_ptr<const std::vector<std::uint8_t>> pixelSnapshot;
 };
 
 // Pure C++17 zero-dependency RFC1951 DEFLATE & RFC1950 zlib decompression (100% Wasm-ready)
@@ -204,6 +210,18 @@ public:
         std::vector<std::uint8_t>&& rgbaPixels,
         ImageAtlasEntry& outEntry);
 
+    // Pack a small static RGBA8 mask strictly into kSharedUiAtlasTextureId (never falls back to standalone slots).
+    [[nodiscard]] bool TryPackMaskIntoSharedAtlas(
+        std::uint64_t maskKey,
+        std::uint32_t width,
+        std::uint32_t height,
+        const std::uint8_t* rgbaPixels,
+        std::size_t byteSize,
+        float& outU0,
+        float& outV0,
+        float& outU1,
+        float& outV1);
+
     // Resolve URI (memory provider -> direct path -> localBaseDir -> baseDir -> searchDirs), decode & cache
     const ImageAtlasEntry* LoadOrGet(
         std::string_view uri,
@@ -234,6 +252,17 @@ public:
         std::uint32_t& outHeight,
         std::vector<std::uint8_t>& outRgba8,
         bool& outWasUpdated) const;
+    [[nodiscard]] bool CopyTextureSlotDirtySubRectIfModified(
+        std::uint32_t textureId,
+        std::uint32_t& ioKnownSlotRevision,
+        std::uint32_t& outSlotWidth,
+        std::uint32_t& outSlotHeight,
+        std::uint32_t& outDirtyX,
+        std::uint32_t& outDirtyY,
+        std::uint32_t& outDirtyW,
+        std::uint32_t& outDirtyH,
+        std::vector<std::uint8_t>& outSubRectRgba8,
+        bool& outWasUpdated) const;
     [[nodiscard]] Color SampleBilinearRgba(std::uint32_t textureId, float u, float v) const noexcept;
 
     [[nodiscard]] std::size_t LoadedEntryCount() const noexcept;
@@ -248,6 +277,13 @@ private:
         std::uint32_t paddedH,
         std::uint32_t& outX,
         std::uint32_t& outY) noexcept;
+    void BlitWithExtrudedBorderLocked(
+        TextureSlotBuffer& atlasBuf,
+        std::uint32_t innerX,
+        std::uint32_t innerY,
+        std::uint32_t iw,
+        std::uint32_t ih,
+        const std::uint8_t* srcPixels) noexcept;
     void BlitWithExtrudedBorderLocked(
         TextureSlotBuffer& atlasBuf,
         std::uint32_t innerX,
@@ -282,8 +318,19 @@ private:
         std::uint64_t lastUsedTick = 0u;
     };
 
+    struct PackedMaskUvEntry {
+        std::uint32_t width = 0u;
+        std::uint32_t height = 0u;
+        float u0 = 0.0f;
+        float v0 = 0.0f;
+        float u1 = 1.0f;
+        float v1 = 1.0f;
+    };
+
     std::unordered_map<std::string, std::vector<std::uint8_t>> memoryEncodedAssets_;
     std::unordered_map<std::string, ImageAtlasEntry> entries_;
+    std::unordered_map<std::uint64_t, PackedMaskUvEntry> packedMasks_;
+    std::size_t packedMaskAreaTexels_ = 0u;
     std::unordered_map<std::string, DynamicSlotCacheEntry> plasmaSlots_;
     std::unordered_map<std::string, DynamicSlotCacheEntry> riveSlots_;
     std::unordered_map<std::uint64_t, DynamicSlotCacheEntry> visualBrushSlots_;

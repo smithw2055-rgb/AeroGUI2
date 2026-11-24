@@ -405,9 +405,9 @@ bool VisualWorld::SetLayoutMode(
 bool VisualWorld::GridClearDefs(VisualNodeId id) noexcept {
     VisualNode* node = GetNode(id);
     if (!node) return false;
-    if (node->HasExtras()) {
-        node->EnsureExtras().rowDefs.clear();
-        node->EnsureExtras().colDefs.clear();
+    if (node->HasGridDefs()) {
+        node->EnsureGridDefs().rowDefs.clear();
+        node->EnsureGridDefs().colDefs.clear();
     }
     MarkAncestorsDirty(id, VisualDirty_Layout);
     return true;
@@ -416,7 +416,7 @@ bool VisualWorld::GridClearDefs(VisualNodeId id) noexcept {
 bool VisualWorld::GridAddRowDef(VisualNodeId id, GridUnitType unit, float value) {
     VisualNode* node = GetNode(id);
     if (!node) return false;
-    node->EnsureExtras().rowDefs.push_back(VisualGridLength{unit, value});
+    node->EnsureGridDefs().rowDefs.push_back(VisualGridLength{unit, value});
     MarkAncestorsDirty(id, VisualDirty_Layout);
     return true;
 }
@@ -424,7 +424,7 @@ bool VisualWorld::GridAddRowDef(VisualNodeId id, GridUnitType unit, float value)
 bool VisualWorld::GridAddColDef(VisualNodeId id, GridUnitType unit, float value) {
     VisualNode* node = GetNode(id);
     if (!node) return false;
-    node->EnsureExtras().colDefs.push_back(VisualGridLength{unit, value});
+    node->EnsureGridDefs().colDefs.push_back(VisualGridLength{unit, value});
     MarkAncestorsDirty(id, VisualDirty_Layout);
     return true;
 }
@@ -754,7 +754,7 @@ bool VisualWorld::SetTransform3DEx(
     bool useExplicitCenter) noexcept {
     VisualNode* node = GetNode(id);
     if (!node) return false;
-    auto& t3d = node->EnsureExtras().transform3D;
+    auto& t3d = node->EnsureSpatial3D().transform3D;
     t3d.rx = rx;
     t3d.ry = ry;
     t3d.rz = rz;
@@ -788,7 +788,7 @@ bool VisualWorld::SetEffect(
     float opacity) noexcept {
     VisualNode* node = GetNode(id);
     if (!node) return false;
-    auto& eff = node->EnsureExtras().effect;
+    auto& eff = node->EnsureEffectMask().effect;
     eff.kind = kind;
     eff.radius = radius;
     eff.depth = depth;
@@ -807,7 +807,7 @@ bool VisualWorld::SetOpacityMask(
     float opacity) noexcept {
     VisualNode* node = GetNode(id);
     if (!node) return false;
-    auto& om = node->EnsureExtras().opacityMask;
+    auto& om = node->EnsureEffectMask().opacityMask;
     const bool gradChanged = (om.gradId != gradId) || !enabled;
     om.enabled = enabled;
     om.gradId = gradId;
@@ -831,10 +831,16 @@ bool VisualWorld::SetText(
     TextTrimming trim) {
     VisualNode* node = GetNode(id);
     if (!node) return false;
-    auto& txt = node->EnsureExtras().text;
+    auto& txt = node->EnsureTextData();
+    const float nextSize = (fontSize > 0.0f) ? fontSize : 14.0f;
+    if (txt.text != text || txt.fontFamily != fontFamily ||
+        std::fabs(txt.fontSize - nextSize) > 1e-4f ||
+        txt.wrap != wrap || txt.trim != trim) {
+        txt.InvalidateLayoutCache();
+    }
     txt.text.assign(text);
     txt.fontFamily.assign(fontFamily);
-    txt.fontSize = (fontSize > 0.0f) ? fontSize : 14.0f;
+    txt.fontSize = nextSize;
     txt.fgRgba = fgRgba;
     txt.wrap = wrap;
     txt.align = align;
@@ -851,7 +857,12 @@ bool VisualWorld::SetTextMetrics(
     std::int32_t decorations) noexcept {
     VisualNode* node = GetNode(id);
     if (!node) return false;
-    auto& txt = node->EnsureExtras().text;
+    auto& txt = node->EnsureTextData();
+    if (std::fabs(txt.lineHeight - lineHeight) > 1e-4f ||
+        std::fabs(txt.charSpacing - charSpacing) > 1e-4f ||
+        txt.maxLines != maxLines) {
+        txt.InvalidateLayoutCache();
+    }
     txt.lineHeight = lineHeight;
     txt.charSpacing = charSpacing;
     txt.maxLines = maxLines;
@@ -867,8 +878,12 @@ bool VisualWorld::SetTextStyle(
     std::int32_t fgGradId) noexcept {
     VisualNode* node = GetNode(id);
     if (!node) return false;
-    auto& txt = node->EnsureExtras().text;
-    txt.fontWeight = (fontWeight > 0) ? fontWeight : 400;
+    auto& txt = node->EnsureTextData();
+    const int nextWeight = (fontWeight > 0) ? fontWeight : 400;
+    if (txt.fontWeight != nextWeight || txt.fontItalic != fontItalic) {
+        txt.InvalidateLayoutCache();
+    }
+    txt.fontWeight = nextWeight;
     txt.fontItalic = fontItalic;
     txt.fgGradId = fgGradId;
     MarkAncestorsDirty(id, VisualDirty_All);
@@ -878,7 +893,7 @@ bool VisualWorld::SetTextStyle(
 bool VisualWorld::SetTextBrushOpacity(VisualNodeId id, float fgOpacity) noexcept {
     VisualNode* node = GetNode(id);
     if (!node) return false;
-    node->EnsureExtras().text.fgOpacity = std::clamp(fgOpacity, 0.0f, 1.0f);
+    node->EnsureTextData().fgOpacity = std::clamp(fgOpacity, 0.0f, 1.0f);
     MarkDirty(id, VisualDirty_Visual);
     return true;
 }
@@ -886,8 +901,10 @@ bool VisualWorld::SetTextBrushOpacity(VisualNodeId id, float fgOpacity) noexcept
 bool VisualWorld::ClearTextSpans(VisualNodeId id) noexcept {
     VisualNode* node = GetNode(id);
     if (!node) return false;
-    if (node->HasExtras() && !node->Text().richSpans.empty()) {
-        node->EnsureExtras().text.richSpans.clear();
+    if (node->HasTextData() && !node->Text().richSpans.empty()) {
+        auto& txt = node->EnsureTextData();
+        txt.richSpans.clear();
+        txt.InvalidateLayoutCache();
         MarkAncestorsDirty(id, VisualDirty_All);
     }
     return true;
@@ -914,7 +931,9 @@ bool VisualWorld::AddTextSpan(
     span.fgRgba = fgRgba;
     span.hasFg = hasFg;
     span.decorations = decorations;
-    node->EnsureExtras().text.richSpans.push_back(std::move(span));
+    auto& txtRef = node->EnsureTextData();
+    txtRef.richSpans.push_back(std::move(span));
+    txtRef.InvalidateLayoutCache();
     MarkAncestorsDirty(id, VisualDirty_All);
     return true;
 }
@@ -929,6 +948,17 @@ TextLayoutResult VisualWorld::LayoutTextNode(const VisualNode& node, float maxWi
         fallback.totalHeight = safeFont * 1.25f;
         return fallback;
     }
+    const std::uint64_t fontRev = store->Fonts().Revision();
+    constexpr float kUnclampedMaxH = 1000000.0f;
+    if (node.HasTextData() &&
+        txt.hasCachedLayout &&
+        txt.cachedRtl == node.layout.effectiveRtl &&
+        txt.cachedFontRev == fontRev &&
+        std::fabs(txt.cachedMaxW - maxWidth) <= 1e-3f &&
+        std::fabs(txt.cachedMaxH - kUnclampedMaxH) <= 1.0f) {
+        return txt.cachedLayout;
+    }
+    TextLayoutResult outLayout{};
     if (!txt.richSpans.empty()) {
         std::vector<RichTextRunInput> runs;
         runs.reserve(txt.richSpans.size());
@@ -944,7 +974,7 @@ TextLayoutResult VisualWorld::LayoutTextNode(const VisualNode& node, float maxWi
             r.decorations = sp.decorations;
             runs.push_back(r);
         }
-        return store->Fonts().MeasureRichLayout(
+        outLayout = store->Fonts().MeasureRichLayout(
             runs,
             txt.fontFamily,
             txt.fontSize,
@@ -956,19 +986,29 @@ TextLayoutResult VisualWorld::LayoutTextNode(const VisualNode& node, float maxWi
             txt.lineHeight,
             node.layout.effectiveRtl,
             txt.trim);
+    } else {
+        outLayout = store->Fonts().MeasureLayout(
+            txt.text,
+            txt.fontFamily,
+            txt.fontSize,
+            maxWidth,
+            txt.wrap,
+            txt.charSpacing,
+            txt.fontWeight,
+            txt.fontItalic,
+            txt.lineHeight,
+            node.layout.effectiveRtl,
+            txt.trim);
     }
-    return store->Fonts().MeasureLayout(
-        txt.text,
-        txt.fontFamily,
-        txt.fontSize,
-        maxWidth,
-        txt.wrap,
-        txt.charSpacing,
-        txt.fontWeight,
-        txt.fontItalic,
-        txt.lineHeight,
-        node.layout.effectiveRtl,
-        txt.trim);
+    if (node.HasTextData()) {
+        txt.cachedLayout = outLayout;
+        txt.cachedMaxW = maxWidth;
+        txt.cachedMaxH = kUnclampedMaxH;
+        txt.cachedRtl = node.layout.effectiveRtl;
+        txt.cachedFontRev = fontRev;
+        txt.hasCachedLayout = true;
+    }
+    return outLayout;
 }
 
 Size VisualWorld::MeasureTextNode(const VisualNode& node, float maxWidth) const {
@@ -991,7 +1031,7 @@ bool VisualWorld::SetTextSelection(
     std::uint32_t caretRgba) noexcept {
     VisualNode* node = GetNode(id);
     if (!node) return false;
-    auto& txt = node->EnsureExtras().text;
+    auto& txt = node->EnsureTextData();
     txt.selStartCp = selStartCp;
     txt.selLenCp = selLenCp;
     txt.caretCp = caretCp;
@@ -1087,7 +1127,7 @@ bool VisualWorld::SetImage(
     std::uint32_t tintRgba) {
     VisualNode* node = GetNode(id);
     if (!node) return false;
-    auto& img = node->EnsureExtras().image;
+    auto& img = node->EnsureImageData();
     img.uri.assign(uri);
     img.stretch = stretch;
     img.stretchDir = stretchDir;
@@ -1104,7 +1144,7 @@ bool VisualWorld::SetImageViewbox(
     float vh) noexcept {
     VisualNode* node = GetNode(id);
     if (!node) return false;
-    auto& img = node->EnsureExtras().image;
+    auto& img = node->EnsureImageData();
     img.viewboxX = std::isfinite(vx) ? vx : 0.0f;
     img.viewboxY = std::isfinite(vy) ? vy : 0.0f;
     img.viewboxW = std::isfinite(vw) ? vw : 1.0f;
@@ -1123,7 +1163,7 @@ bool VisualWorld::SetImageViewport(
     bool isAbsolute) noexcept {
     VisualNode* node = GetNode(id);
     if (!node) return false;
-    auto& img = node->EnsureExtras().image;
+    auto& img = node->EnsureImageData();
     img.viewportX = std::isfinite(vpx) ? vpx : 0.0f;
     img.viewportY = std::isfinite(vpy) ? vpy : 0.0f;
     img.viewportW = (std::isfinite(vpw) && vpw > 0.0f) ? vpw : 1.0f;
@@ -1141,7 +1181,7 @@ bool VisualWorld::SetVisualBrushSource(
     int alignY) noexcept {
     VisualNode* node = GetNode(id);
     if (!node) return false;
-    auto& img = node->EnsureExtras().image;
+    auto& img = node->EnsureImageData();
     img.visualBrushSource = sourceId;
     img.alignX = static_cast<std::uint8_t>(std::clamp(alignX, 0, 2));
     img.alignY = static_cast<std::uint8_t>(std::clamp(alignY, 0, 2));
@@ -1152,7 +1192,7 @@ bool VisualWorld::SetVisualBrushSource(
 bool VisualWorld::SetImageTileMode(VisualNodeId id, bool tileWrap) noexcept {
     VisualNode* node = GetNode(id);
     if (!node) return false;
-    auto& img = node->EnsureExtras().image;
+    auto& img = node->EnsureImageData();
     if (img.tileWrap == tileWrap) {
         return true;
     }
@@ -1175,8 +1215,8 @@ bool VisualWorld::SetVectorShape(
     float trimEnd) {
     VisualNode* node = GetNode(id);
     if (!node) return false;
-    const bool firstInit = (node->extras == nullptr);
-    auto& vec = node->EnsureExtras().vector;
+    const bool firstInit = !node->HasVectorData();
+    auto& vec = node->EnsureVectorData();
     const bool geomChanged = firstInit || (vec.shapeKind != shapeKind) || (vec.pathOrParams != pathOrParams);
     const bool layoutRelevantChanged =
         geomChanged ||
@@ -1233,7 +1273,7 @@ bool VisualWorld::SetVectorShape(
 bool VisualWorld::SetVectorBrushOpacity(VisualNodeId id, float fillOpacity, float strokeOpacity) noexcept {
     VisualNode* node = GetNode(id);
     if (!node) return false;
-    auto& vec = node->EnsureExtras().vector;
+    auto& vec = node->EnsureVectorData();
     vec.fillOpacity = std::clamp(fillOpacity, 0.0f, 1.0f);
     vec.strokeOpacity = std::clamp(strokeOpacity, 0.0f, 1.0f);
     MarkDirty(id, VisualDirty_Visual);
@@ -1248,7 +1288,7 @@ bool VisualWorld::SetVectorStrokeDash(
     std::int32_t endCap) {
     VisualNode* node = GetNode(id);
     if (!node) return false;
-    auto& vec = node->EnsureExtras().vector;
+    auto& vec = node->EnsureVectorData();
     vec.dashArray.clear();
     std::size_t pos = 0u;
     while (pos < dashSpec.size()) {
@@ -1395,19 +1435,19 @@ std::size_t VisualWorld::FlushTrackB() {
                 MarkDirty(binding.targetNode, VisualDirty_Visual);
                 break;
             case VisualAnimProp::PathTrimStart:
-                node->EnsureExtras().vector.trimStart = std::clamp(v, 0.0f, 1.0f);
+                node->EnsureVectorData().trimStart = std::clamp(v, 0.0f, 1.0f);
                 MarkDirty(binding.targetNode, VisualDirty_Visual);
                 break;
             case VisualAnimProp::PathTrimEnd:
-                node->EnsureExtras().vector.trimEnd = std::clamp(v, 0.0f, 1.0f);
+                node->EnsureVectorData().trimEnd = std::clamp(v, 0.0f, 1.0f);
                 MarkDirty(binding.targetNode, VisualDirty_Visual);
                 break;
             case VisualAnimProp::EffectRadius:
-                node->EnsureExtras().effect.radius = std::max(0.0f, v);
+                node->EnsureEffectMask().effect.radius = std::max(0.0f, v);
                 MarkDirty(binding.targetNode, VisualDirty_Visual);
                 break;
             case VisualAnimProp::EffectOpacity:
-                node->EnsureExtras().effect.opacity = std::clamp(v, 0.0f, 1.0f);
+                node->EnsureEffectMask().effect.opacity = std::clamp(v, 0.0f, 1.0f);
                 MarkDirty(binding.targetNode, VisualDirty_Visual);
                 break;
             case VisualAnimProp::BrushOpacity:
@@ -1415,7 +1455,7 @@ std::size_t VisualWorld::FlushTrackB() {
                 MarkDirty(binding.targetNode, VisualDirty_Visual);
                 break;
             case VisualAnimProp::FgBrushOpacity:
-                node->EnsureExtras().text.fgOpacity = std::clamp(v, 0.0f, 1.0f);
+                node->EnsureTextData().fgOpacity = std::clamp(v, 0.0f, 1.0f);
                 MarkDirty(binding.targetNode, VisualDirty_Visual);
                 break;
             default:

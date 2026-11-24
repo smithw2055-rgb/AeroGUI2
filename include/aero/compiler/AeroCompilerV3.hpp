@@ -36,6 +36,9 @@ struct AeroV3CompileInput {
     std::vector<SourceFile> scriptSources;
     std::string stdlibRootDir;
     bool includeStdlib = true;
+    bool useStdlibDll = false;
+    std::string stdlibDllPath;
+    bool retainStdlibDllCache = true;
     bool treeShakeStdlib = true;
     std::string cacheDir;
     bool allowDiskCache = true;
@@ -73,6 +76,10 @@ struct AeroV3CompileResult {
     std::shared_ptr<const ProgramImage> programImage;
     AeroV3AotCppOutput aotCpp;
     bool usedStdlibCache = false;
+    bool usedStdlibDll = false;
+    double stdlibDllLoadMs = 0.0;
+    double compileFrontendAndMirMs = 0.0;
+    double linkMs = 0.0;
     std::size_t retainedMirTypes = 0u;
     std::size_t prunedMirTypes = 0u;
     std::size_t retainedMirFunctions = 0u;

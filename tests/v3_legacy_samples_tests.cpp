@@ -37,6 +37,33 @@ namespace {
 namespace fs = std::filesystem;
 
 int gFailureCount = 0;
+bool gUseStdlibDll = false;
+std::string gStdlibDllPath;
+
+void ConfigureStdlibForTest(
+    aero::AeroV3CompileInput& ci,
+    aero::rs_comp::CompilerSession* session,
+    bool allowTreeShakeSource = false) {
+    ci.includeStdlib = true;
+    ci.optimizeBytecode = false;
+    ci.emitAotCpp = false;
+    if (gUseStdlibDll) {
+        ci.useStdlibDll = true;
+        ci.stdlibDllPath = gStdlibDllPath;
+        ci.stdlibRootDir.clear();
+        ci.treeShakeStdlib = false;
+        ci.allowDiskCache = false;
+        ci.allowStdlibCache = false;
+        ci.compilerSession = nullptr;
+    } else {
+        ci.useStdlibDll = false;
+        ci.stdlibDllPath.clear();
+        ci.stdlibRootDir = AERO_STDLIB_DIR;
+        ci.treeShakeStdlib = allowTreeShakeSource;
+        ci.allowDiskCache = true;
+        ci.compilerSession = session;
+    }
+}
 
 void Require(bool cond, std::string_view msg) {
     if (!cond) {
@@ -354,13 +381,7 @@ void MaybeDumpScreenshot(
         outCompileInput.treeShakeStdlib = false;
     }
 
-    outCompileInput.stdlibRootDir = AERO_STDLIB_DIR;
-    outCompileInput.includeStdlib = true;
-    outCompileInput.treeShakeStdlib = false;
-    outCompileInput.optimizeBytecode = false;
-    outCompileInput.emitAotCpp = false;
-    outCompileInput.allowDiskCache = true;
-    outCompileInput.compilerSession = session;
+    ConfigureStdlibForTest(outCompileInput, session, /*allowTreeShakeSource=*/false);
 
     outHostConfig.viewportWidth = width;
     outHostConfig.viewportHeight = height;
@@ -502,11 +523,7 @@ void TestDiscoverSampleProjectAndCache(aero::rs_comp::CompilerSession& session) 
         aero::AeroV3CompileInput pageCi;
         pageCi.xamlPath = brushesPath.string();
         pageCi.xamlContent = ReadFileText(brushesPath);
-        pageCi.stdlibRootDir = AERO_STDLIB_DIR;
-        pageCi.includeStdlib = true;
-        pageCi.treeShakeStdlib = false;
-        pageCi.allowDiskCache = true;
-        pageCi.compilerSession = &session;
+        ConfigureStdlibForTest(pageCi, &session, /*allowTreeShakeSource=*/false);
         pageCi.resourceSearchRoot = (samplesRoot / "Gallery" / "Data" / "Samples").string();
         pageCi.resourceSearchPaths = galleryCi.resourceSearchPaths;
         pageCi.resourceSearchPaths.push_back((samplesRoot / "Gallery" / "Data" / "Samples").string());
@@ -530,7 +547,32 @@ void TestDiscoverSampleProjectAndCache(aero::rs_comp::CompilerSession& session) 
             "Standalone BrushesView should populate VisualWorld and PagedRenderTree");
     }
 
-    // 8. Cold vs Warm Stdlib Disk Cache + Process-Wide Default Cache + Tree-Shaking Comparison
+    // 8. Cold vs Warm Stdlib Disk Cache + Process-Wide Default Cache + Tree-Shaking Comparison (source mode)
+    // or Stdlib DLL Lazy Verification (DLL mode)
+    if (gUseStdlibDll) {
+        aero::AeroV3CompileInput dllCi;
+        aero::AeroAppHostConfig dllHc;
+        Require(BuildDiscoveredSample(samplesRoot / "Buttons", nullptr, dllCi, dllHc, 320u, 180u),
+            "BuildDiscoveredSample for DLL verification failed");
+        const aero::AeroCompilerV3 compiler;
+        const auto tDll0 = std::chrono::steady_clock::now();
+        const aero::AeroV3CompileResult dllRes = compiler.Compile(dllCi);
+        const auto tDll1 = std::chrono::steady_clock::now();
+        const double dllMs = std::chrono::duration<double, std::milli>(tDll1 - tDll0).count();
+        Require(dllRes.succeeded && !HasErrorDiagnostic(dllRes.diagnostics) && dllRes.usedStdlibDll,
+            "DLL mode compile failed on Buttons");
+        Require(dllRes.programImage && dllRes.programImage->totalLazyFunctionCount() > 0u,
+            "DLL mode ProgramImage must track lazy stdlib functions");
+        Require(dllRes.programImage->compiledLazyFunctionCount() <
+                dllRes.programImage->totalLazyFunctionCount(),
+            "DLL mode Buttons should leave unused stdlib functions uncompiled");
+        std::cout << std::fixed << std::setprecision(2)
+                  << "[DLL] Buttons uncached_compile_ms=" << dllMs
+                  << " dll_load_ms=" << dllRes.stdlibDllLoadMs
+                  << " link_ms=" << dllRes.linkMs
+                  << " lazy_compiled=" << dllRes.programImage->compiledLazyFunctionCount()
+                  << "/" << dllRes.programImage->totalLazyFunctionCount() << "\n";
+    } else {
     const fs::path tempCacheDir = fs::path(AERO_TEST_TEMP_DIR) / "v3_legacy_bench_cache";
     std::error_code ec;
     fs::remove_all(tempCacheDir, ec);
@@ -611,6 +653,7 @@ void TestDiscoverSampleProjectAndCache(aero::rs_comp::CompilerSession& session) 
               << " warm_disk_ms=" << warmDiskMs << "\n";
 
     fs::remove_all(tempCacheDir, ec);
+    }
 }
 
 struct SampleBenchRow {
@@ -655,6 +698,11 @@ void BenchmarkAndVerifySample(
         }
         Require(false, displayName + " compile failed:" + errMsg);
         return;
+    }
+    if (gUseStdlibDll) {
+        Require(compiled.usedStdlibDll, displayName + " expected usedStdlibDll == true");
+        Require(compiled.programImage->totalLazyFunctionCount() > 0u,
+            displayName + " expected totalLazyFunctionCount > 0");
     }
 
     aero::AeroAppHost host(hc);
@@ -811,11 +859,7 @@ void TestGalleryStandaloneSubPages(std::uint32_t clearRgba) {
         ci.xamlPath = pagePath.string();
         ci.xamlContent = ReadFileText(pagePath);
         Require(!ci.xamlContent.empty(), std::string("Missing Gallery sub-page: ") + fileName);
-        ci.stdlibRootDir = AERO_STDLIB_DIR;
-        ci.includeStdlib = true;
-        ci.treeShakeStdlib = false;
-        ci.allowDiskCache = true;
-        ci.compilerSession = nullptr;
+        ConfigureStdlibForTest(ci, nullptr, /*allowTreeShakeSource=*/false);
         ci.resourceSearchRoot = (samplesRoot / "Gallery" / "Data" / "Samples").string();
         ci.resourceSearchPaths = baseCi.resourceSearchPaths;
         ci.resourceSearchPaths.push_back((samplesRoot / "Gallery" / "Data" / "Samples").string());
@@ -4805,11 +4849,7 @@ void TestRegressionReviewFixes(aero::rs_comp::CompilerSession& session) {
   </ProgressBar>
 </Grid>
 )XAML";
-        ci.stdlibRootDir = AERO_STDLIB_DIR;
-        ci.compilerSession = &session;
-        ci.includeStdlib = true;
-        ci.treeShakeStdlib = true;
-        ci.allowDiskCache = true;
+        ConfigureStdlibForTest(ci, &session, /*allowTreeShakeSource=*/true);
         aero::AeroAppHostConfig hc;
         hc.viewportWidth = 200u;
         hc.viewportHeight = 200u;
@@ -5733,9 +5773,29 @@ int main(int argc, char** argv) {
     std::cout << std::unitbuf;
     std::vector<std::string_view> filters;
     for (int i = 1; i < argc; ++i) {
-        if (argv[i] && argv[i][0] != '\0') {
-            filters.emplace_back(argv[i]);
+        if (!argv[i] || argv[i][0] == '\0') {
+            continue;
         }
+        const std::string_view arg(argv[i]);
+        if (arg == "--stdlib-dll") {
+            gUseStdlibDll = true;
+            if (i + 1 < argc && argv[i + 1] && argv[i + 1][0] != '\0') {
+                const fs::path cand(argv[i + 1]);
+                std::error_code ec;
+                const std::string ext = cand.extension().string();
+                if (ext == ".dll" || ext == ".so" || ext == ".dylib" || fs::exists(cand, ec)) {
+                    gStdlibDllPath = argv[++i];
+                }
+            }
+            continue;
+        }
+        constexpr std::string_view kDllPrefix = "--stdlib-dll=";
+        if (arg.rfind(kDllPrefix, 0u) == 0u) {
+            gUseStdlibDll = true;
+            gStdlibDllPath = std::string(arg.substr(kDllPrefix.size()));
+            continue;
+        }
+        filters.emplace_back(argv[i]);
     }
     const auto want = [&](std::string_view section) {
         if (filters.empty()) { return true; }
@@ -5808,6 +5868,8 @@ int main(int argc, char** argv) {
         std::cerr << "\nv3_legacy_samples_tests FAILED with " << gFailureCount << " failure(s).\n";
         return 1;
     }
-    std::cout << "\nv3_legacy_samples_tests PASSED (all 23 legacy samples + 5 V3 + 6 Gallery sub-pages + 18 interactive checks).\n";
+    std::cout << "\nv3_legacy_samples_tests PASSED ("
+              << (gUseStdlibDll ? "stdlib-dll mode" : "stdlib-source mode")
+              << ": all 23 legacy samples + 5 V3 + 6 Gallery sub-pages + 18 interactive checks).\n";
     return 0;
 }

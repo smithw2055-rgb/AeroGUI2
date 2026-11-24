@@ -1263,10 +1263,11 @@ void RasterizeSingleNode(
                 nd->width > 1e-3f && nd->height > 1e-3f) {
                 usePerspectiveInverse = true;
             } else {
+                const Matrix4x4& wm3D = tree.GetNodeWorldMatrix3D(*nd);
                 Point pLoc0{};
                 Point pLoc2{};
-                if (nd->worldMatrix3D.InverseProjectScreenToLocalPlane(Point{v0.x, v0.y}, pLoc0) &&
-                    nd->worldMatrix3D.InverseProjectScreenToLocalPlane(Point{v2.x, v2.y}, pLoc2)) {
+                if (wm3D.InverseProjectScreenToLocalPlane(Point{v0.x, v0.y}, pLoc0) &&
+                    wm3D.InverseProjectScreenToLocalPlane(Point{v2.x, v2.y}, pLoc2)) {
                     perspOrigX = pLoc0.x;
                     perspOrigY = pLoc0.y;
                     perspSpanW = pLoc2.x - pLoc0.x;
@@ -1284,7 +1285,7 @@ void RasterizeSingleNode(
         float pH20 = 0.0f, pH21 = 0.0f, pH22 = 1.0f;
         float invPerspSpanW = 0.0f, invPerspSpanH = 0.0f;
         if (usePerspectiveInverse) {
-            const auto& m = nd->worldMatrix3D.m;
+            const auto& m = tree.GetNodeWorldMatrix3D(*nd).m;
             const float h00 = m[0][0], h01 = m[0][1], h02 = m[0][3];
             const float h10 = m[1][0], h11 = m[1][1], h12 = m[1][3];
             const float h20 = m[3][0], h21 = m[3][1], h22 = m[3][3];
