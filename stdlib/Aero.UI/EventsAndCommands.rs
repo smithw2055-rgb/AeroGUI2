@@ -509,6 +509,7 @@ public class ObservableObject : DependencyObject, INotifyPropertyChanged {
 
     public virtual void NotifyPropertyChanged(string propertyName = "") {
         _notifyEpoch = _notifyEpoch >= 1000000000 ? 1 : (_notifyEpoch + 1);
+        BindingEngine.BumpManagedVmEpoch();
         PropertyChanged(this, new PropertyChangedEventArgs(propertyName));
     }
 
@@ -585,6 +586,7 @@ public class CollectionSlotBase {
         }
     }
     public void Notify() {
+        BindingEngine.BumpManagedVmEpoch();
         for (int i = 0; i < Listeners.Length; i += 1) {
             var fn = Listeners[i];
             if (fn != null) { fn(); }

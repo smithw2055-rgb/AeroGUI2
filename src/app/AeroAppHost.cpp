@@ -897,7 +897,7 @@ AeroAppHost::AeroAppHost(const AeroAppHostConfig& config)
     , animEngine_()
     , inputRouter_(&world_, nullptr, &platformHooks_)
     , renderTree_()
-    , gpuStream_(ShaderBackend::DesktopGL33, 256u)
+    , gpuStream_(ShaderBackend::DesktopGL33, 32u)
     , desktopHost_(&world_, &drawBuffer_, &animEngine_, &inputRouter_, &renderTree_, resourceStore_)
     , windowHost_()
     , bindings_(std::make_shared<BindingRegistry>()) {
@@ -995,6 +995,12 @@ void AeroAppHost::WireKernelBridges() {
     platformHooks_.requestWake = [this]() {
         scriptWakeRequested_ = true;
         pendingScriptSync_ = true;
+        desktopHost_.TriggerWake();
+        windowHost_.WakeEventLoop();
+    };
+
+    platformHooks_.requestRenderWake = [this]() {
+        renderWakeRequested_ = true;
         desktopHost_.TriggerWake();
         windowHost_.WakeEventLoop();
     };
@@ -1152,6 +1158,7 @@ std::string AeroAppHost::ResolveSoundAssetPath(std::string_view uri) const {
 void AeroAppHost::ResetLoadedProgramState() noexcept {
     closeRequested_ = false;
     inStepFrame_ = false;
+    renderWakeRequested_ = false;
     pendingScriptSync_ = true;
     scheduledWakeAt_.reset();
     simObjectPin_.reset();
@@ -1373,6 +1380,19 @@ bool AeroAppHost::LoadProgramImageInternal(
     logTrace("LoadProgramImage: mounted entry, stepping initial frame");
 
     StepFrame(0.0f, true);
+    ZeroCopyGpuStream::ReleaseTransientPools();
+    if (programImage_) {
+        programImage_->releaseTransientLazyCaches();
+    }
+    {
+        rs_rt::ShadowStack emptyStack;
+        domains_.uiHeap().collectFull(emptyStack);
+        (void)domains_.uiHeap().trimExcessCapacity();
+    }
+#ifdef _WIN32
+    (void)_heapmin();
+    (void)HeapCompact(GetProcessHeap(), 0u);
+#endif
     if (trace) {
         const VisualNode* rn = world_.GetNode(world_.Root());
         const Rect r = rn ? rn->layout.layoutRect : Rect{};
@@ -1495,6 +1515,15 @@ bool AeroAppHost::CompileAndLoad(
         }
         return false;
     }
+    if (lastCompileResult_) {
+        std::vector<rs_bc::Module>().swap(lastCompileResult_->bytecodeModules);
+        std::vector<std::uint8_t>().swap(lastCompileResult_->programImageBytes);
+        std::string().swap(lastCompileResult_->generatedPartialRsCode);
+    }
+#ifdef _WIN32
+    (void)_heapmin();
+    (void)HeapCompact(GetProcessHeap(), 0u);
+#endif
     return true;
 }
 
@@ -2940,6 +2969,7 @@ bool AeroAppHost::RenderHeadlessRgba(
 
     if (!usedCapture) {
         ZeroCopyGpuStream::RasterizeTreeToRgba8(renderTree_, width, height, outRgba, config_.clearColor);
+        ZeroCopyGpuStream::ReleaseTransientPools();
     }
     if (std::getenv("AERO_TRACE") != nullptr && outRgba.size() >= static_cast<std::size_t>(width) * height * 4u) {
         const auto pxAt = [&](std::uint32_t x, std::uint32_t y) {
@@ -3157,7 +3187,9 @@ std::uint64_t AeroAppHost::RunWindowedLoop(std::uint64_t maxFrames) {
         }
         const auto iterStart = std::chrono::steady_clock::now();
         const bool wakeBeforePump = scriptWakeRequested_;
+        const bool renderWakeBeforePump = renderWakeRequested_;
         scriptWakeRequested_ = false;
+        renderWakeRequested_ = false;
         bool scheduledWakeDue = false;
         std::int32_t scheduledWaitMs = -1;
         if (scheduledWakeAt_.has_value()) {
@@ -3170,7 +3202,8 @@ std::uint64_t AeroAppHost::RunWindowedLoop(std::uint64_t maxFrames) {
             }
         }
         const bool idleAllowed =
-            desktopHost_.CanSleepIdle() && !static_cast<bool>(simTickCallback_) && !wakeBeforePump &&
+            desktopHost_.CanSleepIdle() && !static_cast<bool>(simTickCallback_) &&
+            !wakeBeforePump && !renderWakeBeforePump &&
             !scheduledWakeDue && !animEngine_.HasActiveAnimations();
         if (idleAllowed) {
             hasLastActiveTick = false;
@@ -3288,8 +3321,10 @@ std::uint64_t AeroAppHost::RunWindowedLoop(std::uint64_t maxFrames) {
         if (followUpDirty ||
             hadActiveBeforePump ||
             wakeBeforePump ||
+            renderWakeBeforePump ||
             scheduledWakeDue ||
             scriptWakeRequested_ ||
+            renderWakeRequested_ ||
             world_.HasAnyDirty() ||
             animEngine_.HasActiveAnimations()) {
             if (wakeBeforePump || scheduledWakeDue || scriptWakeRequested_ || osEventsArrived) {

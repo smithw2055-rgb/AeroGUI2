@@ -1321,7 +1321,7 @@ public class RiveControl : Control {
             anyActive = true;
         }
         if (anyActive && ParseUtil.IsNativeReady()) {
-            Host_RequestWake();
+            Host_RequestRenderWake();
         }
     }
 
@@ -1409,17 +1409,27 @@ public class RiveControl : Control {
             _lastInputsSig = inp;
             _stateTime = 0.0f;
         }
+        string sizeQ = "";
+        if (ActualWidth >= 16.0f && ActualHeight >= 16.0f) {
+            float effScale = (Effect != null) ? 0.5f : 1.0f;
+            int tw = (((int)(ActualWidth * effScale) + 15) / 16) * 16;
+            int th = (((int)(ActualHeight * effScale) + 15) / 16) * 16;
+            if (tw < 64) { tw = 64; }
+            if (th < 64) { th = 64; }
+            sizeQ = "&__w=" + tw + "&__h=" + th;
+        }
         string sep = cleanSrc.Contains("?") ? "&" : "?";
         string q = sep + "__inst=" + _instanceId +
                    "&__t=" + QuantizeRiveClock(_animTime) +
                    "&__ts=" + QuantizeRiveClock(_stateTime) +
+                   sizeQ +
                    inp;
         string nextUri = "rive://" + cleanSrc + q;
         if (_imageView.Source != nextUri) {
             _imageView.Source = nextUri;
         }
         if (ParseUtil.IsNativeReady() && Visibility == Visibility.Visible) {
-            Host_RequestWake();
+            Host_RequestRenderWake();
         }
     }
 
@@ -2050,6 +2060,16 @@ public class BehaviorDataTrigger : BehaviorTriggerBase {
     private static UIElement[] _reactiveBSrc;
     private static int[] _reactiveBSrcTreeEpoch;
     private static int[] _reactiveBSrcChainEpoch;
+    private static int _reactiveBCompactDisposeEpoch = -1;
+    private static bool _reactiveBAllFastEpochReady = false;
+    private static int _reactiveBFastNativeVmEp = -1;
+    private static int _reactiveBFastManagedVmEp = -1;
+    private static int _reactiveBFastUiPropEp = -1;
+    private static int _reactiveBFastLayoutEp = -1;
+    private static int _reactiveBFastDcEp = -1;
+    private static int _reactiveBFastTreeEp = -1;
+    private static int _reactiveBFastVisEp = -1;
+    private static int _reactiveBFastDispEp = -1;
 
     private static void RegisterReactive(BehaviorDataTrigger dt, UIElement target) {
         if (dt == null || target == null) { return; }
@@ -2077,9 +2097,11 @@ public class BehaviorDataTrigger : BehaviorTriggerBase {
         _reactiveBSrc.Push(null);
         _reactiveBSrcTreeEpoch.Push(0);
         _reactiveBSrcChainEpoch.Push(0);
+        _reactiveBAllFastEpochReady = false;
     }
 
     internal static void CleanupDisposedReactive() {
+        _reactiveBAllFastEpochReady = false;
         if (_reactiveBTriggers != null && _reactiveBTargets != null) {
             for (int i = _reactiveBTargets.Length - 1; i >= 0; i -= 1) {
                 if (_reactiveBTargets[i] == null || _reactiveBTargets[i]._isDisposedTree) {
@@ -2123,6 +2145,25 @@ public class BehaviorDataTrigger : BehaviorTriggerBase {
 
     public static void FlushReactive() {
         if (_reactiveBTriggers == null || _reactiveBTargets == null || _reactiveBTriggers.Length == 0) { return; }
+        if (BindingEngine._inFlushPass && _reactiveBAllFastEpochReady &&
+            _reactiveBFastNativeVmEp == BindingEngine._curNativeVmEpoch &&
+            _reactiveBFastManagedVmEp == BindingEngine._curManagedVmEpoch &&
+            _reactiveBFastUiPropEp == UIElement._globalPropEpoch &&
+            _reactiveBFastLayoutEp == BindingEngine._curLayoutSizeEpoch &&
+            _reactiveBFastDcEp == UIElement._dataContextEpoch &&
+            _reactiveBFastTreeEp == UIElement._treeParentEpoch &&
+            _reactiveBFastVisEp == UIElement._visibilityEpoch &&
+            _reactiveBFastDispEp == UIElement._disposeEpoch) {
+            return;
+        }
+        int snapNativeVmEp = BindingEngine._curNativeVmEpoch;
+        int snapManagedVmEp = BindingEngine._curManagedVmEpoch;
+        int snapUiPropEp = UIElement._globalPropEpoch;
+        int snapLayoutEp = BindingEngine._curLayoutSizeEpoch;
+        int snapDcEp = UIElement._dataContextEpoch;
+        int snapTreeEp = UIElement._treeParentEpoch;
+        int snapVisEp = UIElement._visibilityEpoch;
+        int snapDispEp = UIElement._disposeEpoch;
         if (_reactiveBLastDc == null) {
             _reactiveBLastDc = new DependencyObject[0];
             _reactiveBLastVer = new int[0];
@@ -2147,44 +2188,56 @@ public class BehaviorDataTrigger : BehaviorTriggerBase {
         while (_reactiveBSrcChainEpoch.Length < _reactiveBTriggers.Length) {
             _reactiveBSrcChainEpoch.Push(0);
         }
-        int write = 0;
-        for (int i = 0; i < _reactiveBTriggers.Length; i += 1) {
-            UIElement t = _reactiveBTargets[i];
-            if (t == null || t._isDisposedTree) { continue; }
-            if (write != i) {
-                _reactiveBTriggers[write] = _reactiveBTriggers[i];
-                _reactiveBTargets[write] = t;
-                _reactiveBLastDc[write] = _reactiveBLastDc[i];
-                _reactiveBLastVer[write] = _reactiveBLastVer[i];
-                _reactiveBSrc[write] = _reactiveBSrc[i];
-                _reactiveBSrcTreeEpoch[write] = _reactiveBSrcTreeEpoch[i];
-                _reactiveBSrcChainEpoch[write] = _reactiveBSrcChainEpoch[i];
+        if (_reactiveBCompactDisposeEpoch != UIElement._disposeEpoch) {
+            _reactiveBCompactDisposeEpoch = UIElement._disposeEpoch;
+            int write = 0;
+            for (int i = 0; i < _reactiveBTriggers.Length; i += 1) {
+                UIElement t = _reactiveBTargets[i];
+                if (t == null || t._isDisposedTree) { continue; }
+                if (write != i) {
+                    _reactiveBTriggers[write] = _reactiveBTriggers[i];
+                    _reactiveBTargets[write] = t;
+                    _reactiveBLastDc[write] = _reactiveBLastDc[i];
+                    _reactiveBLastVer[write] = _reactiveBLastVer[i];
+                    _reactiveBSrc[write] = _reactiveBSrc[i];
+                    _reactiveBSrcTreeEpoch[write] = _reactiveBSrcTreeEpoch[i];
+                    _reactiveBSrcChainEpoch[write] = _reactiveBSrcChainEpoch[i];
+                }
+                write += 1;
             }
-            write += 1;
+            while (_reactiveBTriggers.Length > write) {
+                _reactiveBTriggers.RemoveAt(_reactiveBTriggers.Length - 1);
+                _reactiveBTargets.RemoveAt(_reactiveBTargets.Length - 1);
+            }
+            while (_reactiveBLastDc.Length > write) {
+                _reactiveBLastDc.RemoveAt(_reactiveBLastDc.Length - 1);
+            }
+            while (_reactiveBLastVer.Length > write) {
+                _reactiveBLastVer.RemoveAt(_reactiveBLastVer.Length - 1);
+            }
+            while (_reactiveBSrc.Length > write) {
+                _reactiveBSrc.RemoveAt(_reactiveBSrc.Length - 1);
+            }
+            while (_reactiveBSrcTreeEpoch.Length > write) {
+                _reactiveBSrcTreeEpoch.RemoveAt(_reactiveBSrcTreeEpoch.Length - 1);
+            }
+            while (_reactiveBSrcChainEpoch.Length > write) {
+                _reactiveBSrcChainEpoch.RemoveAt(_reactiveBSrcChainEpoch.Length - 1);
+            }
         }
-        while (_reactiveBTriggers.Length > write) {
-            _reactiveBTriggers.RemoveAt(_reactiveBTriggers.Length - 1);
-            _reactiveBTargets.RemoveAt(_reactiveBTargets.Length - 1);
+        if (_reactiveBTriggers.Length == 0) {
+            _reactiveBAllFastEpochReady = false;
+            return;
         }
-        while (_reactiveBLastDc.Length > write) {
-            _reactiveBLastDc.RemoveAt(_reactiveBLastDc.Length - 1);
-        }
-        while (_reactiveBLastVer.Length > write) {
-            _reactiveBLastVer.RemoveAt(_reactiveBLastVer.Length - 1);
-        }
-        while (_reactiveBSrc.Length > write) {
-            _reactiveBSrc.RemoveAt(_reactiveBSrc.Length - 1);
-        }
-        while (_reactiveBSrcTreeEpoch.Length > write) {
-            _reactiveBSrcTreeEpoch.RemoveAt(_reactiveBSrcTreeEpoch.Length - 1);
-        }
-        while (_reactiveBSrcChainEpoch.Length > write) {
-            _reactiveBSrcChainEpoch.RemoveAt(_reactiveBSrcChainEpoch.Length - 1);
-        }
+        bool allFastVer = true;
+        bool anyFired = false;
         for (int i = 0; i < _reactiveBTriggers.Length; i += 1) {
             BehaviorDataTrigger bdt = _reactiveBTriggers[i];
             UIElement t = _reactiveBTargets[i];
-            if (t.IsInsideClosedPopup()) { continue; }
+            if (t.IsInsideClosedPopup()) {
+                if (bdt.ValueBinding != null) { allFastVer = false; }
+                continue;
+            }
             if (bdt.ValueBinding == null &&
                 bdt.ElementName.Length == 0 &&
                 bdt.RelativeSourceMode.Length == 0 &&
@@ -2200,6 +2253,7 @@ public class BehaviorDataTrigger : BehaviorTriggerBase {
                 if (dm >= 0 && _reactiveBLastVer[i] == dm && _reactiveBLastDc[i] == dcBox) {
                     continue;
                 }
+                if (dm < 0) { allFastVer = false; }
                 _reactiveBLastDc[i] = dcBox;
                 _reactiveBLastVer[i] = dm;
             } else if (bdt.ValueBinding == null &&
@@ -2243,6 +2297,7 @@ public class BehaviorDataTrigger : BehaviorTriggerBase {
                         if (ep >= 0 && _reactiveBLastVer[i] == ep && _reactiveBLastDc[i] == srcBox) {
                             continue;
                         }
+                        if (ep < 0) { allFastVer = false; }
                         _reactiveBLastDc[i] = srcBox;
                         _reactiveBLastVer[i] = ep;
                     } else if (bdt.BindingPath.Length > 12 && bdt.BindingPath.Substring(0, 12) == "DataContext." &&
@@ -2253,12 +2308,42 @@ public class BehaviorDataTrigger : BehaviorTriggerBase {
                         if (ep2 >= 0 && _reactiveBLastVer[i] == ep2 && _reactiveBLastDc[i] == srcBox) {
                             continue;
                         }
+                        if (ep2 < 0) { allFastVer = false; }
                         _reactiveBLastDc[i] = srcBox;
                         _reactiveBLastVer[i] = ep2;
+                    } else {
+                        allFastVer = false;
                     }
+                } else {
+                    allFastVer = false;
                 }
+            } else {
+                allFastVer = false;
             }
+            anyFired = true;
             bdt.CheckAndFire(t, false);
+        }
+        if (allFastVer && !anyFired &&
+            BindingEngine._inFlushPass &&
+            snapNativeVmEp == BindingEngine._curNativeVmEpoch &&
+            snapManagedVmEp == BindingEngine._curManagedVmEpoch &&
+            snapUiPropEp == UIElement._globalPropEpoch &&
+            snapLayoutEp == BindingEngine._curLayoutSizeEpoch &&
+            snapDcEp == UIElement._dataContextEpoch &&
+            snapTreeEp == UIElement._treeParentEpoch &&
+            snapVisEp == UIElement._visibilityEpoch &&
+            snapDispEp == UIElement._disposeEpoch) {
+            _reactiveBAllFastEpochReady = true;
+            _reactiveBFastNativeVmEp = snapNativeVmEp;
+            _reactiveBFastManagedVmEp = snapManagedVmEp;
+            _reactiveBFastUiPropEp = snapUiPropEp;
+            _reactiveBFastLayoutEp = snapLayoutEp;
+            _reactiveBFastDcEp = snapDcEp;
+            _reactiveBFastTreeEp = snapTreeEp;
+            _reactiveBFastVisEp = snapVisEp;
+            _reactiveBFastDispEp = snapDispEp;
+        } else {
+            _reactiveBAllFastEpochReady = false;
         }
     }
 

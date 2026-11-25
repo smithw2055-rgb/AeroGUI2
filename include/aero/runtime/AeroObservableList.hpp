@@ -111,6 +111,8 @@ public:
     [[nodiscard]] static std::uint32_t UiObserverCount(
         const realscript::runtime::ManagedHeap& heap,
         realscript::runtime::ObjectRef ref) noexcept;
+
+    [[nodiscard]] static std::uint64_t GlobalMutationEpoch() noexcept;
 };
 
 } // namespace aero

@@ -204,6 +204,8 @@ int __rs_native_Host_SetClipboardText(string text) { return 0; }
 public void Host_SetClipboardText(string text) { __rs_native_Host_SetClipboardText(text); return; }
 int __rs_native_Host_RequestWake() { return 0; }
 public void Host_RequestWake() { __rs_native_Host_RequestWake(); return; }
+int __rs_native_Host_RequestRenderWake() { return 0; }
+public void Host_RequestRenderWake() { __rs_native_Host_RequestRenderWake(); return; }
 int __rs_native_Host_RequestWakeAfterMs(int delayMs) { return 0; }
 public void Host_RequestWakeAfterMs(int delayMs) { __rs_native_Host_RequestWakeAfterMs(delayMs); return; }
 int __rs_native_Host_CloseWindow() { return 0; }
@@ -230,6 +232,7 @@ public bool Reflect_ListInsert(object list, int index, object item) { return fal
 public bool Reflect_ListRemoveAt(object list, int index) { return false; }
 public bool Reflect_InvokeCommand(object target, string propPath, string param) { return false; }
 public int Reflect_GetDirtyMask(object target) { return 0; }
+public int Reflect_GetGlobalObservableEpoch() { return 1; }
 public uint Color_ParseRgba(string hexOrNamed) { return 0u; }
 public string Host_ReadTextAsset(string uri) { return ""; }
 public int Utf8_CodePointCount(string text) { return 0; }

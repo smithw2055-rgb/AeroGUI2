@@ -1762,6 +1762,7 @@ bool NativeWindowHost::InitializePlatformWindowAndBackend(const NativeWindowConf
         return true;
     }
 
+    gpuCfg.autoBuildDefaultAtlas = false;
     if (config.forceHeadless) {
         const GpuBackendConfig swCfg = makeSwCfg(gpuCfg);
         auto sw = std::make_unique<SoftwareSurfaceBackend>();

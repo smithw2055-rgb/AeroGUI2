@@ -658,16 +658,23 @@ bool ExecutionDomainContext::DomainPolicy::interceptCall(
 // ExecutionDomainContext
 // ============================================================================
 
-[[nodiscard]] std::shared_ptr<ManagedHeap> MakeDefaultDomainHeap() {
+[[nodiscard]] std::shared_ptr<ManagedHeap> MakeDefaultSimHeap() {
     realscript::runtime::HeapConfig cfg{};
-    cfg.initialCollectionThresholdBytes = 8u * 1024u * 1024u;
+    cfg.initialCollectionThresholdBytes = 256u * 1024u;
+    cfg.maximumHeapBytes = 256u * 1024u * 1024u;
+    return std::make_shared<ManagedHeap>(cfg);
+}
+
+[[nodiscard]] std::shared_ptr<ManagedHeap> MakeDefaultUiHeap() {
+    realscript::runtime::HeapConfig cfg{};
+    cfg.initialCollectionThresholdBytes = 2u * 1024u * 1024u;
     cfg.maximumHeapBytes = 256u * 1024u * 1024u;
     return std::make_shared<ManagedHeap>(cfg);
 }
 
 ExecutionDomainContext::ExecutionDomainContext()
-    : simHeap_(MakeDefaultDomainHeap()),
-      uiHeap_(MakeDefaultDomainHeap()),
+    : simHeap_(MakeDefaultSimHeap()),
+      uiHeap_(MakeDefaultUiHeap()),
       simHeapId_(simHeap_->heapId()),
       uiHeapId_(uiHeap_->heapId()),
       nativeHandles_(std::make_shared<NativeHandleRegistry>()),
@@ -683,8 +690,8 @@ ExecutionDomainContext::ExecutionDomainContext(
     std::shared_ptr<ManagedHeap> simHeap,
     std::shared_ptr<ManagedHeap> uiHeap,
     std::shared_ptr<NativeHandleRegistry> nativeHandles)
-    : simHeap_(simHeap ? std::move(simHeap) : MakeDefaultDomainHeap()),
-      uiHeap_(uiHeap ? std::move(uiHeap) : MakeDefaultDomainHeap()),
+    : simHeap_(simHeap ? std::move(simHeap) : MakeDefaultSimHeap()),
+      uiHeap_(uiHeap ? std::move(uiHeap) : MakeDefaultUiHeap()),
       simHeapId_(simHeap_->heapId()),
       uiHeapId_(uiHeap_->heapId()),
       nativeHandles_(nativeHandles ? std::move(nativeHandles) : std::make_shared<NativeHandleRegistry>()),
@@ -726,6 +733,7 @@ void ExecutionDomainContext::handleFieldMutated(
     if (!object.valid() || object.kind != ObjectKind::Record) {
         return;
     }
+    globalObservableEpoch_.fetch_add(1u, std::memory_order_release);
 
     const std::uint64_t heapKey = heap.heapId();
     const std::uint64_t objKey = refKey(object);
@@ -883,6 +891,11 @@ std::optional<std::string_view> ExecutionDomainContext::stringViewAcrossDomains(
         return heap->stringView(ref);
     }
     return std::nullopt;
+}
+
+std::uint64_t ExecutionDomainContext::globalObservableEpoch() const noexcept {
+    return globalObservableEpoch_.load(std::memory_order_acquire) +
+        ObservableListHelper::GlobalMutationEpoch();
 }
 
 void ExecutionDomainContext::attachInterpreter(Interpreter& interpreter, DomainKind domain) {

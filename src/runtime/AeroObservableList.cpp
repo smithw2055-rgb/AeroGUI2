@@ -73,6 +73,7 @@ struct GlobalHookRegistry {
 std::atomic<std::uint64_t> gTrackedSlotEntries{0ull};
 std::atomic<std::uint64_t> gWrapperTypeBloom{0ull};
 std::atomic<bool> gHasWrapperTypes{false};
+std::atomic<std::uint64_t> gArrayMutationEpoch{1ull};
 
 GlobalHookRegistry& hookRegistry() noexcept {
     static GlobalHookRegistry instance;
@@ -137,6 +138,7 @@ void onHeapArrayMutated(
     if (!array.valid() || array.kind != ObjectKind::Array) {
         return;
     }
+    gArrayMutationEpoch.fetch_add(1ull, std::memory_order_release);
 
     CollectionChangeKind changeKind = CollectionChangeKind::Reset;
     switch (op) {
@@ -842,6 +844,10 @@ std::uint32_t ObservableListHelper::UiObserverCount(
     }
     const auto cIt = hIt->second.uiObserverCounts.find(slotKey(ref));
     return (cIt != hIt->second.uiObserverCounts.end()) ? cIt->second : 0u;
+}
+
+std::uint64_t ObservableListHelper::GlobalMutationEpoch() noexcept {
+    return gArrayMutationEpoch.load(std::memory_order_acquire);
 }
 
 } // namespace aero

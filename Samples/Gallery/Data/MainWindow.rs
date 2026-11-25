@@ -541,7 +541,21 @@ public partial class MainWindow : Window
         this._appliedThemeKey = nextKey;
         bool isDark = (safeColor == "Dark");
 
-        ResourceDictionary themeDict = XamlReader.LoadResourceDictionary("Theme/NoesisTheme." + safeColor + safeAccent + ".xaml");
+        bool hasStylesLoaded = (this.Resources != null) &&
+            (this.Resources.Contains("Brush.Window.Background") || this.Resources.Contains("Style.ButtonBase"));
+        ResourceDictionary themeDict = null;
+        if (hasStylesLoaded)
+        {
+            themeDict = XamlReader.LoadResourceDictionary("Theme/NoesisTheme.Brushes." + safeColor + safeAccent + ".xaml");
+            if (themeDict == null)
+            {
+                themeDict = XamlReader.LoadResourceDictionary("NoesisTheme.Brushes." + safeColor + safeAccent + ".xaml");
+            }
+        }
+        if (themeDict == null)
+        {
+            themeDict = XamlReader.LoadResourceDictionary("Theme/NoesisTheme." + safeColor + safeAccent + ".xaml");
+        }
         if (themeDict == null)
         {
             themeDict = XamlReader.LoadResourceDictionary("NoesisTheme." + safeColor + safeAccent + ".xaml");
@@ -553,6 +567,10 @@ public partial class MainWindow : Window
         if (themeDict == null)
         {
             themeDict = XamlReader.LoadResourceDictionary("NoesisTheme.Brushes." + safeColor + safeAccent + ".xaml");
+        }
+        if (themeDict == null && hasStylesLoaded)
+        {
+            themeDict = XamlReader.LoadResourceDictionary("Theme/NoesisTheme.Brushes." + safeColor + "Blue.xaml");
         }
         if (themeDict == null)
         {

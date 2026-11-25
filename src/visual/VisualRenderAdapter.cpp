@@ -1,10 +1,15 @@
 #include "aero/visual/VisualRenderAdapter.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <cmath>
+#include <condition_variable>
 #include <cstdlib>
 #include <limits>
+#include <mutex>
+#include <thread>
+#include <unordered_set>
 #include <vector>
 
 #include "aero/asset/GradientBrush.hpp"
@@ -12,6 +17,7 @@
 #include "aero/core/UIResourceStore.hpp"
 #include "aero/render/FontAtlas.hpp"
 #include "aero/render/ImageAtlas.hpp"
+#include "aero/render/RiveRenderer.hpp"
 #include "aero/render/ZeroCopyGpuStream.hpp"
 
 namespace aero {
@@ -2757,6 +2763,15 @@ std::size_t VisualRenderAdapter::EmitNodeRecursive(
         const auto nodeRenderStart = static_cast<std::uint32_t>(outTree.nodes_.size());
         std::size_t count = 0u;
         const float effOpacity = std::clamp(parentOpacity * node->layout.opacity, 0.0f, 1.0f);
+        if (effOpacity <= 0.001f) {
+            if (mutableWorld != nullptr) {
+                if (VisualNode* mutNode = mutableWorld->GetNode(id)) {
+                    mutNode->layout.renderNodeId = 0u;
+                    mutNode->layout.renderNodeCount = 0u;
+                }
+            }
+            return 0u;
+        }
         const Rect& rect = node->layout.layoutRect;
         const Matrix2D& world2D = node->layout.worldTransform;
         const Matrix4x4& world3D = node->WorldMatrix3D();
@@ -3620,7 +3635,136 @@ std::size_t VisualRenderAdapter::SyncPagedRenderTree(
         }
     }
 
-    // Full rebuild fallback
+    // Full rebuild fallback: prefetch multiple dirty .riv visuals in parallel before tree emit
+    if (world.Root().IsValid() && store != nullptr) {
+        std::vector<std::pair<VisualNodeId, float>> visitStack;
+        visitStack.reserve(64u);
+        visitStack.emplace_back(world.Root(), 1.0f);
+        std::vector<std::string> dirtyRiveUris;
+        std::unordered_set<std::string> seenRiveUris;
+        ImageAtlas& atlas = store->Images();
+        while (!visitStack.empty()) {
+            const auto [curId, curParentOp] = visitStack.back();
+            visitStack.pop_back();
+            const VisualNode* vn = world.GetNode(curId);
+            if (!vn || !vn->alive || vn->layout.visibility != Visibility::Visible) {
+                continue;
+            }
+            const float effOp = std::clamp(curParentOp * vn->layout.opacity, 0.0f, 1.0f);
+            if (effOp <= 0.001f) {
+                continue;
+            }
+            const std::string& uri = vn->Image().uri;
+            if (!uri.empty() && IsRiveAssetUri(uri)) {
+                const ImageAtlasEntry* cached = atlas.FindLoaded(uri);
+                if ((!cached || cached->uriKey != uri) && seenRiveUris.insert(uri).second) {
+                    dirtyRiveUris.push_back(uri);
+                }
+            }
+            for (VisualNodeId cid : vn->children) {
+                visitStack.emplace_back(cid, effOp);
+            }
+        }
+        if (dirtyRiveUris.size() >= 2u) {
+            struct RivePrefetchPool {
+                std::mutex mtx;
+                std::condition_variable cvWork;
+                std::condition_variable cvDone;
+                std::vector<std::thread> workers;
+                ImageAtlas* curAtlas = nullptr;
+                const std::vector<std::string>* curUris = nullptr;
+                std::atomic<std::size_t> nextIdx{0u};
+                std::size_t remainingWorkers = 0u;
+                std::uint64_t batchGen = 0u;
+                bool stop = false;
+
+                RivePrefetchPool() {
+                    const std::size_t hw = std::thread::hardware_concurrency();
+                    const std::size_t nThreads = std::clamp<std::size_t>(hw / 2u, 2u, 4u);
+                    workers.reserve(nThreads);
+                    for (std::size_t t = 0u; t < nThreads; ++t) {
+                        workers.emplace_back([this]() {
+                            std::uint64_t seenGen = 0u;
+                            for (;;) {
+                                ImageAtlas* localAtlas = nullptr;
+                                const std::vector<std::string>* localUris = nullptr;
+                                {
+                                    std::unique_lock<std::mutex> lk(mtx);
+                                    cvWork.wait(lk, [&]() { return stop || batchGen != seenGen; });
+                                    if (stop) break;
+                                    seenGen = batchGen;
+                                    localAtlas = curAtlas;
+                                    localUris = curUris;
+                                }
+                                if (localAtlas && localUris) {
+                                    const std::size_t n = localUris->size();
+                                    for (;;) {
+                                        const std::size_t idx = nextIdx.fetch_add(1u, std::memory_order_relaxed);
+                                        if (idx >= n) break;
+                                        (void)localAtlas->LoadOrGet((*localUris)[idx]);
+                                    }
+                                }
+                                std::lock_guard<std::mutex> lk(mtx);
+                                if (--remainingWorkers == 0u) {
+                                    cvDone.notify_one();
+                                }
+                            }
+                        });
+                    }
+                }
+                ~RivePrefetchPool() {
+                    {
+                        std::lock_guard<std::mutex> lk(mtx);
+                        stop = true;
+                    }
+                    cvWork.notify_all();
+                    for (std::thread& w : workers) {
+                        if (w.joinable()) w.join();
+                    }
+                }
+                void Run(ImageAtlas& atlasRef, const std::vector<std::string>& uris) {
+                    {
+                        std::lock_guard<std::mutex> lk(mtx);
+                        curAtlas = &atlasRef;
+                        curUris = &uris;
+                        nextIdx.store(0u, std::memory_order_relaxed);
+                        remainingWorkers = workers.size();
+                        ++batchGen;
+                    }
+                    cvWork.notify_all();
+                    std::unique_lock<std::mutex> lk(mtx);
+                    cvDone.wait(lk, [&]() { return remainingWorkers == 0u; });
+                    curAtlas = nullptr;
+                    curUris = nullptr;
+                }
+            };
+            auto parseDim = [](const std::string& uriStr, std::string_view key, std::uint64_t defVal) -> std::uint64_t {
+                const std::size_t pos = uriStr.find(key);
+                if (pos == std::string::npos) return defVal;
+                std::size_t i = pos + key.size();
+                std::uint64_t val = 0u;
+                bool any = false;
+                while (i < uriStr.size() && uriStr[i] >= '0' && uriStr[i] <= '9') {
+                    val = val * 10u + static_cast<std::uint64_t>(uriStr[i] - '0');
+                    any = true;
+                    ++i;
+                }
+                return any ? val : defVal;
+            };
+            auto estArea = [&](const std::string& uriStr) -> std::uint64_t {
+                const std::uint64_t w = parseDim(uriStr, "__w=", 960u);
+                const std::uint64_t h = parseDim(uriStr, "__h=", 960u);
+                return w * h;
+            };
+            std::sort(dirtyRiveUris.begin(), dirtyRiveUris.end(),
+                      [&](const std::string& a, const std::string& b) {
+                          return estArea(a) > estArea(b);
+                      });
+            static RivePrefetchPool sRivePool;
+            sRivePool.Run(atlas, dirtyRiveUris);
+        }
+    }
+
     outTree.Clear();
     outTree.SetResourceStore(store);
     if (!world.Root().IsValid()) {

@@ -660,19 +660,45 @@ void StepSpringAnalytical(VisualAnimTrack& track, float dtSeconds) noexcept {
     track.velocity = vNext;
 }
 
-bool EvaluateKeyFramesAtTime(VisualAnimTrack& track, VisualWorld& world, float localTimeSec) noexcept {
+bool EvaluateKeyFramesAtTime(
+    VisualAnimTrack& track,
+    VisualWorld& world,
+    float localTimeSec,
+    bool* outTrackValueChanged = nullptr) noexcept {
     const auto& kfs = track.keyFrames;
     if (kfs.empty()) {
+        if (outTrackValueChanged) {
+            *outTrackValueChanged = false;
+        }
         return false;
     }
     const bool colorProp = IsColorProp(track.prop);
+    auto applyColorValue = [&](std::uint32_t rgba) -> bool {
+        const bool same = track.hasAppliedValue && (track.currentRgba == rgba);
+        track.currentRgba = rgba;
+        track.hasAppliedValue = true;
+        if (outTrackValueChanged) {
+            *outTrackValueChanged = !same;
+        }
+        return same ? false : ApplyColorProp(world, track.targetNode, track.prop, rgba);
+    };
+    auto applyScalarValue = [&](float scalar) -> bool {
+        const bool same =
+            track.hasAppliedValue &&
+            ((std::isnan(track.currentVal) && std::isnan(scalar)) ||
+             std::fabs(track.currentVal - scalar) <= 1e-6f);
+        track.currentVal = scalar;
+        track.hasAppliedValue = true;
+        if (outTrackValueChanged) {
+            *outTrackValueChanged = !same;
+        }
+        return same ? false : ApplyScalarProp(world, track.targetNode, track.prop, scalar);
+    };
     auto applyKf = [&](const VisualKeyFrame& kf) -> bool {
         if (colorProp) {
-            track.currentRgba = kf.colorRgba;
-            return ApplyColorProp(world, track.targetNode, track.prop, kf.colorRgba);
+            return applyColorValue(kf.colorRgba);
         }
-        track.currentVal = kf.scalarValue;
-        return ApplyScalarProp(world, track.targetNode, track.prop, kf.scalarValue);
+        return applyScalarValue(kf.scalarValue);
     };
 
     if (kfs.size() == 1u || localTimeSec <= kfs.front().timeSec) {
@@ -694,12 +720,10 @@ bool EvaluateKeyFramesAtTime(VisualAnimTrack& track, VisualWorld& world, float l
             const float eased = EvaluateEasing(kf1.easingKind, kf1.easingMode, u, kf1.easeParam0, kf1.easeParam1, kf1.easeParamMask);
             if (colorProp) {
                 const std::uint32_t col = LerpRgba(kf0.colorRgba, kf1.colorRgba, eased);
-                track.currentRgba = col;
-                return ApplyColorProp(world, track.targetNode, track.prop, col);
+                return applyColorValue(col);
             }
             const float val = kf0.scalarValue + (kf1.scalarValue - kf0.scalarValue) * eased;
-            track.currentVal = val;
-            return ApplyScalarProp(world, track.targetNode, track.prop, val);
+            return applyScalarValue(val);
         }
     }
     return applyKf(kfs.back());
@@ -1186,13 +1210,12 @@ bool VisualAnimationEngine::Tick(float dtSeconds, VisualWorld& world) {
                 continue;
             }
         }
-        if (track.needsScriptSync) {
-            lastTickNeededScriptSync_ = true;
-        }
         track.elapsedSec += activeDt;
 
         bool finished = false;
+        bool trackValueChanged = false;
         if (track.kind == VisualAnimTrackKind::FloatSpring) {
+            const float prevVal = track.currentVal;
             StepSpringAnalytical(track, activeDt);
             if (std::abs(track.currentVal - track.toVal) <= track.spring.restPositionEpsilon &&
                 std::abs(track.velocity) <= track.spring.restVelocityEpsilon) {
@@ -1200,7 +1223,11 @@ bool VisualAnimationEngine::Tick(float dtSeconds, VisualWorld& world) {
                 track.velocity = 0.0f;
                 finished = true;
             }
-            anyVisualMutated |= ApplyScalarProp(world, track.targetNode, track.prop, track.currentVal);
+            trackValueChanged = !track.hasAppliedValue || (std::fabs(prevVal - track.currentVal) > 1e-6f);
+            track.hasAppliedValue = true;
+            if (trackValueChanged) {
+                anyVisualMutated |= ApplyScalarProp(world, track.targetNode, track.prop, track.currentVal);
+            }
         } else {
             const float rawDur = track.durationSec;
             float normT = 1.0f;
@@ -1252,16 +1279,28 @@ bool VisualAnimationEngine::Tick(float dtSeconds, VisualWorld& world) {
             if (track.kind == VisualAnimTrackKind::FloatTween) {
                 const float eased = EvaluateEasing(track.easeKind, track.easeMode, normT, track.easeParam0, track.easeParam1, track.easeParamMask);
                 const float val = track.fromVal + (track.toVal - track.fromVal) * eased;
+                trackValueChanged = !track.hasAppliedValue || (std::fabs(track.currentVal - val) > 1e-6f);
                 track.currentVal = val;
-                anyVisualMutated |= ApplyScalarProp(world, track.targetNode, track.prop, val);
+                track.hasAppliedValue = true;
+                if (trackValueChanged) {
+                    anyVisualMutated |= ApplyScalarProp(world, track.targetNode, track.prop, val);
+                }
             } else if (track.kind == VisualAnimTrackKind::ColorTween) {
                 const float eased = EvaluateEasing(track.easeKind, track.easeMode, normT, track.easeParam0, track.easeParam1, track.easeParamMask);
                 const std::uint32_t col = LerpRgba(track.fromRgba, track.toRgba, eased);
+                trackValueChanged = !track.hasAppliedValue || (track.currentRgba != col);
                 track.currentRgba = col;
-                anyVisualMutated |= ApplyColorProp(world, track.targetNode, track.prop, col);
+                track.hasAppliedValue = true;
+                if (trackValueChanged) {
+                    anyVisualMutated |= ApplyColorProp(world, track.targetNode, track.prop, col);
+                }
             } else if (track.kind == VisualAnimTrackKind::KeyFrames) {
-                anyVisualMutated |= EvaluateKeyFramesAtTime(track, world, localTimeSec);
+                anyVisualMutated |= EvaluateKeyFramesAtTime(track, world, localTimeSec, &trackValueChanged);
             }
+        }
+
+        if (track.needsScriptSync && (trackValueChanged || finished)) {
+            lastTickNeededScriptSync_ = true;
         }
 
         if (finished) {

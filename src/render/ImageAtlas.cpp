@@ -3852,26 +3852,61 @@ const ImageAtlasEntry* ImageAtlas::LoadOrGet(
         return &cached.entry;
     }
     if (IsRiveAssetUri(uri)) {
-        constexpr std::size_t kMaxRiveSlotCache = 48u;
+        constexpr std::size_t kMaxRiveSlotCache = 16u;
         std::string_view pathPart;
         std::string instKey;
         SplitRiveSlotKeyParts(uri, pathPart, instKey);
         const std::string riveKey = "rive_slot://" + std::string(localBaseDir) + "|" +
             std::string(pathPart) + "|" + instKey;
         std::uint32_t reuseSlotId = 0u;
+        std::uint64_t prevPoseHash = 0u;
+        bool hasPrevPose = false;
         {
             std::lock_guard<std::mutex> lock(mutex_);
             if (const auto it = riveSlots_.find(riveKey); it != riveSlots_.end()) {
                 it->second.lastUsedTick = ++dynamicSlotTick_;
-                if (it->second.currentExactUri == uri &&
-                    textureSlots_.find(it->second.entry.textureId) != textureSlots_.end()) {
+                const bool hasSlot =
+                    textureSlots_.find(it->second.entry.textureId) != textureSlots_.end();
+                if (it->second.currentExactUri == uri && hasSlot) {
                     return &it->second.entry;
                 }
                 reuseSlotId = it->second.entry.textureId;
+                if (hasSlot && it->second.hasLastPoseHash) {
+                    prevPoseHash = it->second.lastPoseHash;
+                    hasPrevPose = true;
+                }
             }
         }
         DecodedImage riveImg{};
-        if (!RenderRiveUriToImage(uri, *this, localBaseDir, riveImg) || !riveImg.Valid()) {
+        std::uint64_t newPoseHash = 0u;
+        bool poseChanged = true;
+        if (!RenderRiveUriToImageIfChanged(
+                uri,
+                *this,
+                localBaseDir,
+                hasPrevPose ? &prevPoseHash : nullptr,
+                newPoseHash,
+                poseChanged,
+                riveImg)) {
+            return nullptr;
+        }
+        if (!poseChanged && hasPrevPose) {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (const auto it = riveSlots_.find(riveKey);
+                it != riveSlots_.end() &&
+                textureSlots_.find(it->second.entry.textureId) != textureSlots_.end()) {
+                it->second.currentExactUri = std::string(uri);
+                it->second.lastUsedTick = ++dynamicSlotTick_;
+                it->second.entry.uriKey = it->second.currentExactUri;
+                return &it->second.entry;
+            }
+            // Slot was evicted concurrently; re-render without prevPoseHash
+            if (!RenderRiveUriToImageIfChanged(
+                    uri, *this, localBaseDir, nullptr, newPoseHash, poseChanged, riveImg)) {
+                return nullptr;
+            }
+        }
+        if (!riveImg.Valid()) {
             return nullptr;
         }
         if (reuseSlotId == 0u) {
@@ -3899,6 +3934,8 @@ const ImageAtlasEntry* ImageAtlas::LoadOrGet(
         cached.slotKey = riveKey;
         cached.currentExactUri = std::string(uri);
         cached.lastUsedTick = ++dynamicSlotTick_;
+        cached.lastPoseHash = newPoseHash;
+        cached.hasLastPoseHash = true;
         cached.entry.uriKey = cached.currentExactUri;
         cached.entry.textureId = finalTexId;
         cached.entry.width = riveImg.width;
@@ -3951,10 +3988,10 @@ const ImageAtlasEntry* ImageAtlas::LoadOrGet(
         std::size_t totalBytes = 0u;
 
         void InsertBounded(const std::string& key, const CachedDecodedImage& img) {
-            constexpr std::size_t kMaxCacheEntries = 64u;
-            constexpr std::size_t kMaxCacheBytes = 32u * 1024u * 1024u;
+            constexpr std::size_t kMaxCacheEntries = 32u;
+            constexpr std::size_t kMaxCacheBytes = 4u * 1024u * 1024u;
             const std::size_t imgBytes = img.rgbaPixels ? img.rgbaPixels->size() : 0u;
-            if (imgBytes == 0u || imgBytes > 24u * 1024u * 1024u || imgBytes > kMaxCacheBytes) {
+            if (imgBytes == 0u || imgBytes > 1u * 1024u * 1024u || imgBytes > kMaxCacheBytes) {
                 return;
             }
             std::lock_guard<std::mutex> dLock(mutex);
@@ -4128,6 +4165,88 @@ bool ImageAtlas::CopyTextureSlotIfModified(
         ioKnownSlotRevision = slot.dirtyRevision;
         outWasUpdated = true;
     }
+    return true;
+}
+
+bool ImageAtlas::AcquireTextureSlotUploadIfModified(
+    std::uint32_t textureId,
+    std::uint32_t& ioKnownSlotRevision,
+    std::uint32_t& outSlotWidth,
+    std::uint32_t& outSlotHeight,
+    std::uint32_t& outDirtyX,
+    std::uint32_t& outDirtyY,
+    std::uint32_t& outDirtyW,
+    std::uint32_t& outDirtyH,
+    std::shared_ptr<const std::vector<std::uint8_t>>& outFullSnapshot,
+    std::vector<std::uint8_t>& outSubRectRgba8,
+    bool& outWasUpdated) const {
+    outWasUpdated = false;
+    outFullSnapshot.reset();
+    std::lock_guard<std::mutex> lock(mutex_);
+    const auto it = textureSlots_.find(textureId);
+    if (it == textureSlots_.end()) {
+        outSlotWidth = 0u;
+        outSlotHeight = 0u;
+        return false;
+    }
+    const TextureSlotBuffer& slot = it->second;
+    const std::shared_ptr<const std::vector<std::uint8_t>> snapPtr =
+        slot.cowAtlasPixels ? std::static_pointer_cast<const std::vector<std::uint8_t>>(slot.cowAtlasPixels)
+                            : slot.pixelSnapshot;
+    const std::vector<std::uint8_t>& px = snapPtr ? *snapPtr : slot.rgbaPixels;
+    const std::size_t expectedBytes = static_cast<std::size_t>(slot.width) * slot.height * 4u;
+    if (slot.width == 0u || slot.height == 0u || px.size() < expectedBytes) {
+        outSlotWidth = 0u;
+        outSlotHeight = 0u;
+        return false;
+    }
+    outSlotWidth = slot.width;
+    outSlotHeight = slot.height;
+    if (ioKnownSlotRevision != 0u && ioKnownSlotRevision == slot.dirtyRevision) {
+        return true;
+    }
+    if (ioKnownSlotRevision != 0u &&
+        slot.isAtlas &&
+        slot.hasDirtyRect &&
+        ioKnownSlotRevision == slot.dirtyBaseRevision &&
+        slot.dirtyX1 > slot.dirtyX0 &&
+        slot.dirtyY1 > slot.dirtyY0 &&
+        slot.dirtyX1 <= slot.width &&
+        slot.dirtyY1 <= slot.height) {
+        const std::uint32_t subW = slot.dirtyX1 - slot.dirtyX0;
+        const std::uint32_t subH = slot.dirtyY1 - slot.dirtyY0;
+        outDirtyX = slot.dirtyX0;
+        outDirtyY = slot.dirtyY0;
+        outDirtyW = subW;
+        outDirtyH = subH;
+        outSubRectRgba8.resize(static_cast<std::size_t>(subW) * subH * 4u);
+        for (std::uint32_t row = 0u; row < subH; ++row) {
+            const std::uint8_t* srcRow = px.data() +
+                (static_cast<std::size_t>(slot.dirtyY0 + row) * slot.width + slot.dirtyX0) * 4u;
+            std::memcpy(
+                outSubRectRgba8.data() + static_cast<std::size_t>(row) * subW * 4u,
+                srcRow,
+                static_cast<std::size_t>(subW) * 4u);
+        }
+        slot.dirtyBaseRevision = slot.dirtyRevision;
+        slot.hasDirtyRect = false;
+        ioKnownSlotRevision = slot.dirtyRevision;
+        outWasUpdated = true;
+        return true;
+    }
+    outDirtyX = 0u;
+    outDirtyY = 0u;
+    outDirtyW = slot.width;
+    outDirtyH = slot.height;
+    if (snapPtr) {
+        outFullSnapshot = snapPtr;
+    } else {
+        outSubRectRgba8.assign(px.data(), px.data() + expectedBytes);
+    }
+    slot.dirtyBaseRevision = slot.dirtyRevision;
+    slot.hasDirtyRect = false;
+    ioKnownSlotRevision = slot.dirtyRevision;
+    outWasUpdated = true;
     return true;
 }
 

@@ -143,6 +143,7 @@ struct VisualAnimTrack {
     std::int32_t completedCycles = 0;
     bool forwardDirection = true;
     bool needsScriptSync = false;
+    bool hasAppliedValue = false;
 
     VisualSpringConfig spring{};
     std::vector<VisualKeyFrame> keyFrames;

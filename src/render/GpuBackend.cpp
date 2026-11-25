@@ -134,13 +134,41 @@ vec4 sampleInBounds(vec2 uv) {
 }
 
 void main() {
+    if (u_EffectMode == 10) {
+        vec2 hOff = u_TexelSize;
+        if (u_EffectParams.x > 0.5) {
+            o_FragColor = 0.25 * (
+                sampleClamped(v_Uv + vec2(-hOff.x, -hOff.y)) +
+                sampleClamped(v_Uv + vec2( hOff.x, -hOff.y)) +
+                sampleClamped(v_Uv + vec2(-hOff.x,  hOff.y)) +
+                sampleClamped(v_Uv + vec2( hOff.x,  hOff.y)));
+        } else {
+            o_FragColor = 0.25 * (
+                sampleInBounds(v_Uv + vec2(-hOff.x, -hOff.y)) +
+                sampleInBounds(v_Uv + vec2( hOff.x, -hOff.y)) +
+                sampleInBounds(v_Uv + vec2(-hOff.x,  hOff.y)) +
+                sampleInBounds(v_Uv + vec2( hOff.x,  hOff.y)));
+        }
+        return;
+    }
+    if (u_EffectMode == 11) {
+        vec2 dp = v_PhysPos - u_MaskGradPts.xy;
+        vec2 halfUv = vec2(dp.x * u_MaskGradPts.z, 1.0 - dp.y * u_MaskGradPts.w);
+        float blurA = clamp(texture(u_SrcTex, clamp(halfUv, u_EffectUvMin, u_EffectUvMax)).a, 0.0, 1.0);
+        vec4 src = texture(u_OrigTex, clamp(v_Uv, u_MaskStopOffsets.xy, u_MaskStopOffsets.zw));
+        float shA = clamp(blurA * v_Color.a, 0.0, 1.0);
+        vec4 shadow = vec4(v_Color.rgb * shA, shA);
+        vec4 combined = src + shadow * (1.0 - clamp(src.a, 0.0, 1.0));
+        o_FragColor = combined * clamp(u_EffectParams.y, 0.0, 1.0);
+        return;
+    }
     if (u_EffectMode == 1) {
         float radius = clamp(u_EffectParams.x, 0.5, 256.0);
         float sigma = max(0.35, radius * 0.38);
-        float stepPx = max(1.0, radius / 12.0);
+        float stepPx = max(1.0, radius / 8.0);
         vec4 acc = vec4(0.0);
         float wSum = 0.0;
-        for (int k = -12; k <= 12; ++k) {
+        for (int k = -8; k <= 8; ++k) {
             float d = float(k) * stepPx;
             if (abs(d) > radius + 0.5) {
                 continue;
@@ -161,10 +189,10 @@ void main() {
             blurA = sampleInBounds(baseUv).a;
         } else {
             float sigma = max(0.35, radius * 0.38);
-            float stepPx = max(1.0, radius / 12.0);
+            float stepPx = max(1.0, radius / 8.0);
             float accA = 0.0;
             float wSum = 0.0;
-            for (int k = -12; k <= 12; ++k) {
+            for (int k = -8; k <= 8; ++k) {
                 float d = float(k) * stepPx;
                 if (abs(d) > radius + 0.5) {
                     continue;
@@ -185,10 +213,10 @@ void main() {
             blurA = sampleInBounds(v_Uv).a;
         } else {
             float sigma = max(0.35, radius * 0.38);
-            float stepPx = max(1.0, radius / 12.0);
+            float stepPx = max(1.0, radius / 8.0);
             float accA = 0.0;
             float wSum = 0.0;
-            for (int k = -12; k <= 12; ++k) {
+            for (int k = -8; k <= 8; ++k) {
                 float d = float(k) * stepPx;
                 if (abs(d) > radius + 0.5) {
                     continue;
@@ -1448,8 +1476,27 @@ void OpenGlDeviceBackend::DestroyEffectGpuResources() noexcept {
         gl_.DeleteProgram(effectProgramId_);
     }
     effectProgramId_ = 0u;
+    if (gl_.IsComplete()) {
+        for (AeroGLuint& fboId : halfEffectFboIds_) {
+            if (fboId != 0u && gl_.DeleteFramebuffers) {
+                gl_.DeleteFramebuffers(1, &fboId);
+            }
+            fboId = 0u;
+        }
+        for (AeroGLuint& texId : halfEffectFboTexIds_) {
+            if (texId != 0u) {
+                gl_.DeleteTextures(1, &texId);
+            }
+            texId = 0u;
+        }
+    }
+    halfEffectFboW_ = 0u;
+    halfEffectFboH_ = 0u;
+    halfEffectFailed_ = false;
     effectFboW_ = 0u;
     effectFboH_ = 0u;
+    effectFbo1W_ = 0u;
+    effectFbo1H_ = 0u;
     uEffectViewportSizeLoc_ = -1;
     uEffectSrcTexLoc_ = -1;
     uEffectOrigTexLoc_ = -1;
@@ -1726,11 +1773,10 @@ bool OpenGlDeviceBackend::EnsureEffectGpuResources(
             kGlDynamicDraw);
     }
 
-    if (effectFboIds_[0] == 0u || effectFboIds_[1] == 0u) {
-        gl_.GenFramebuffers(2, effectFboIds_);
-        gl_.GenTextures(2, effectFboTexIds_);
-        if (effectFboIds_[0] == 0u || effectFboIds_[1] == 0u ||
-            effectFboTexIds_[0] == 0u || effectFboTexIds_[1] == 0u) {
+    if (effectFboIds_[0] == 0u) {
+        gl_.GenFramebuffers(1, &effectFboIds_[0]);
+        gl_.GenTextures(1, &effectFboTexIds_[0]);
+        if (effectFboIds_[0] == 0u || effectFboTexIds_[0] == 0u) {
             DestroyEffectGpuResources();
             return false;
         }
@@ -1740,8 +1786,122 @@ bool OpenGlDeviceBackend::EnsureEffectGpuResources(
 
     if (effectFboW_ != viewportWidth || effectFboH_ != viewportHeight) {
         gl_.ActiveTexture(kGlTexture0);
+        gl_.BindTexture(kGlTexture2D, effectFboTexIds_[0]);
+        gl_.TexParameteri(kGlTexture2D, kGlTextureMinFilter, static_cast<AeroGLint>(kGlLinear));
+        gl_.TexParameteri(kGlTexture2D, kGlTextureMagFilter, static_cast<AeroGLint>(kGlLinear));
+        gl_.TexParameteri(kGlTexture2D, kGlTextureWrapS, static_cast<AeroGLint>(kGlClampToEdge));
+        gl_.TexParameteri(kGlTexture2D, kGlTextureWrapT, static_cast<AeroGLint>(kGlClampToEdge));
+        gl_.TexImage2D(
+            kGlTexture2D,
+            0,
+            static_cast<AeroGLint>(kGlRgba8),
+            static_cast<AeroGLsizei>(viewportWidth),
+            static_cast<AeroGLsizei>(viewportHeight),
+            0,
+            kGlRgba,
+            kGlUnsignedByte,
+            nullptr);
+        gl_.BindFramebuffer(kGlFramebuffer, effectFboIds_[0]);
+        gl_.FramebufferTexture2D(
+            kGlFramebuffer,
+            kGlColorAttachment0,
+            kGlTexture2D,
+            effectFboTexIds_[0],
+            0);
+        if (gl_.CheckFramebufferStatus(kGlFramebuffer) != kGlFramebufferComplete) {
+            gl_.BindFramebuffer(kGlFramebuffer, 0u);
+            DestroyEffectGpuResources();
+            effectGpuPipelineFailed_ = true;
+            return false;
+        }
+        gl_.BindFramebuffer(kGlFramebuffer, 0u);
+        gl_.BindTexture(kGlTexture2D, atlasTextureId_);
+        effectFboW_ = viewportWidth;
+        effectFboH_ = viewportHeight;
+    }
+
+    return true;
+}
+
+bool OpenGlDeviceBackend::EnsureSecondEffectFbo(
+    std::uint32_t viewportWidth,
+    std::uint32_t viewportHeight) {
+    if (!EnsureEffectGpuResources(viewportWidth, viewportHeight)) {
+        return false;
+    }
+    if (effectFboIds_[1] == 0u) {
+        gl_.GenFramebuffers(1, &effectFboIds_[1]);
+        gl_.GenTextures(1, &effectFboTexIds_[1]);
+        if (effectFboIds_[1] == 0u || effectFboTexIds_[1] == 0u) {
+            DestroyEffectGpuResources();
+            effectGpuPipelineFailed_ = true;
+            return false;
+        }
+        effectFbo1W_ = 0u;
+        effectFbo1H_ = 0u;
+    }
+    if (effectFbo1W_ != viewportWidth || effectFbo1H_ != viewportHeight) {
+        gl_.ActiveTexture(kGlTexture0);
+        gl_.BindTexture(kGlTexture2D, effectFboTexIds_[1]);
+        gl_.TexParameteri(kGlTexture2D, kGlTextureMinFilter, static_cast<AeroGLint>(kGlLinear));
+        gl_.TexParameteri(kGlTexture2D, kGlTextureMagFilter, static_cast<AeroGLint>(kGlLinear));
+        gl_.TexParameteri(kGlTexture2D, kGlTextureWrapS, static_cast<AeroGLint>(kGlClampToEdge));
+        gl_.TexParameteri(kGlTexture2D, kGlTextureWrapT, static_cast<AeroGLint>(kGlClampToEdge));
+        gl_.TexImage2D(
+            kGlTexture2D,
+            0,
+            static_cast<AeroGLint>(kGlRgba8),
+            static_cast<AeroGLsizei>(viewportWidth),
+            static_cast<AeroGLsizei>(viewportHeight),
+            0,
+            kGlRgba,
+            kGlUnsignedByte,
+            nullptr);
+        gl_.BindFramebuffer(kGlFramebuffer, effectFboIds_[1]);
+        gl_.FramebufferTexture2D(
+            kGlFramebuffer,
+            kGlColorAttachment0,
+            kGlTexture2D,
+            effectFboTexIds_[1],
+            0);
+        if (gl_.CheckFramebufferStatus(kGlFramebuffer) != kGlFramebufferComplete) {
+            gl_.BindFramebuffer(kGlFramebuffer, 0u);
+            DestroyEffectGpuResources();
+            effectGpuPipelineFailed_ = true;
+            return false;
+        }
+        gl_.BindFramebuffer(kGlFramebuffer, 0u);
+        gl_.BindTexture(kGlTexture2D, atlasTextureId_);
+        effectFbo1W_ = viewportWidth;
+        effectFbo1H_ = viewportHeight;
+    }
+    return true;
+}
+
+bool OpenGlDeviceBackend::EnsureHalfEffectGpuResources(
+    std::uint32_t viewportWidth,
+    std::uint32_t viewportHeight) {
+    if (halfEffectFailed_ || viewportWidth == 0u || viewportHeight == 0u ||
+        !gl_.GenFramebuffers || !gl_.BindFramebuffer || !gl_.FramebufferTexture2D || !gl_.CheckFramebufferStatus) {
+        return false;
+    }
+    const std::uint32_t hw = (viewportWidth + 1u) / 2u;
+    const std::uint32_t hh = (viewportHeight + 1u) / 2u;
+    if (halfEffectFboIds_[0] == 0u || halfEffectFboIds_[1] == 0u) {
+        gl_.GenFramebuffers(2, halfEffectFboIds_);
+        gl_.GenTextures(2, halfEffectFboTexIds_);
+        if (halfEffectFboIds_[0] == 0u || halfEffectFboIds_[1] == 0u ||
+            halfEffectFboTexIds_[0] == 0u || halfEffectFboTexIds_[1] == 0u) {
+            halfEffectFailed_ = true;
+            return false;
+        }
+        halfEffectFboW_ = 0u;
+        halfEffectFboH_ = 0u;
+    }
+    if (halfEffectFboW_ != hw || halfEffectFboH_ != hh) {
+        gl_.ActiveTexture(kGlTexture0);
         for (int i = 0; i < 2; ++i) {
-            gl_.BindTexture(kGlTexture2D, effectFboTexIds_[i]);
+            gl_.BindTexture(kGlTexture2D, halfEffectFboTexIds_[i]);
             gl_.TexParameteri(kGlTexture2D, kGlTextureMinFilter, static_cast<AeroGLint>(kGlLinear));
             gl_.TexParameteri(kGlTexture2D, kGlTextureMagFilter, static_cast<AeroGLint>(kGlLinear));
             gl_.TexParameteri(kGlTexture2D, kGlTextureWrapS, static_cast<AeroGLint>(kGlClampToEdge));
@@ -1750,32 +1910,30 @@ bool OpenGlDeviceBackend::EnsureEffectGpuResources(
                 kGlTexture2D,
                 0,
                 static_cast<AeroGLint>(kGlRgba8),
-                static_cast<AeroGLsizei>(viewportWidth),
-                static_cast<AeroGLsizei>(viewportHeight),
+                static_cast<AeroGLsizei>(hw),
+                static_cast<AeroGLsizei>(hh),
                 0,
                 kGlRgba,
                 kGlUnsignedByte,
                 nullptr);
-            gl_.BindFramebuffer(kGlFramebuffer, effectFboIds_[i]);
+            gl_.BindFramebuffer(kGlFramebuffer, halfEffectFboIds_[i]);
             gl_.FramebufferTexture2D(
                 kGlFramebuffer,
                 kGlColorAttachment0,
                 kGlTexture2D,
-                effectFboTexIds_[i],
+                halfEffectFboTexIds_[i],
                 0);
             if (gl_.CheckFramebufferStatus(kGlFramebuffer) != kGlFramebufferComplete) {
+                halfEffectFailed_ = true;
                 gl_.BindFramebuffer(kGlFramebuffer, 0u);
-                DestroyEffectGpuResources();
-                effectGpuPipelineFailed_ = true;
                 return false;
             }
         }
         gl_.BindFramebuffer(kGlFramebuffer, 0u);
         gl_.BindTexture(kGlTexture2D, atlasTextureId_);
-        effectFboW_ = viewportWidth;
-        effectFboH_ = viewportHeight;
+        halfEffectFboW_ = hw;
+        halfEffectFboH_ = hh;
     }
-
     return true;
 }
 
@@ -1935,6 +2093,7 @@ bool OpenGlDeviceBackend::EnsureQuadIndexCapacity(std::size_t requiredQuadCount)
         static_cast<AeroGLsizeiptr>(quadIndexMirror_.size() * sizeof(std::uint32_t)),
         quadIndexMirror_.data(),
         kGlStaticDraw);
+    std::vector<std::uint32_t>().swap(quadIndexMirror_);
 
     quadCapacity_ = nextCap;
     if (wasAllocated) {
@@ -2198,7 +2357,8 @@ AeroGLuint OpenGlDeviceBackend::ResolveBatchImageTexture(
     if (needsInitialFull) {
         slot.slotRevision = 0u;
     }
-    if (!imageAtlas.CopyTextureSlotDirtySubRectIfModified(
+    std::shared_ptr<const std::vector<std::uint8_t>> fullSnapshot;
+    if (!imageAtlas.AcquireTextureSlotUploadIfModified(
             textureId,
             slot.slotRevision,
             slotW,
@@ -2207,6 +2367,7 @@ AeroGLuint OpenGlDeviceBackend::ResolveBatchImageTexture(
             dirtyY,
             dirtyW,
             dirtyH,
+            fullSnapshot,
             imageUploadScratchRgba8_,
             wasUpdated) ||
         slotW == 0u ||
@@ -2224,7 +2385,8 @@ AeroGLuint OpenGlDeviceBackend::ResolveBatchImageTexture(
     const bool needsAlloc = (slot.texId == 0u) || (slot.width != slotW) || (slot.height != slotH);
     if (needsAlloc && (!wasUpdated || dirtyW != slotW || dirtyH != slotH)) {
         slot.slotRevision = 0u;
-        if (!imageAtlas.CopyTextureSlotDirtySubRectIfModified(
+        fullSnapshot.reset();
+        if (!imageAtlas.AcquireTextureSlotUploadIfModified(
                 textureId,
                 slot.slotRevision,
                 slotW,
@@ -2233,6 +2395,7 @@ AeroGLuint OpenGlDeviceBackend::ResolveBatchImageTexture(
                 dirtyY,
                 dirtyW,
                 dirtyH,
+                fullSnapshot,
                 imageUploadScratchRgba8_,
                 wasUpdated)) {
             return fallbackTex != 0u ? fallbackTex : atlasTextureId_;
@@ -2240,6 +2403,9 @@ AeroGLuint OpenGlDeviceBackend::ResolveBatchImageTexture(
     }
 
     if (needsAlloc || wasUpdated) {
+        const std::uint8_t* uploadPtr = fullSnapshot
+            ? fullSnapshot->data()
+            : imageUploadScratchRgba8_.data();
         if (slot.texId == 0u) {
             gl_.GenTextures(1, &slot.texId);
             if (slot.texId == 0u) {
@@ -2263,7 +2429,7 @@ AeroGLuint OpenGlDeviceBackend::ResolveBatchImageTexture(
                 0,
                 kGlRgba,
                 kGlUnsignedByte,
-                imageUploadScratchRgba8_.data());
+                uploadPtr);
             slot.width = slotW;
             slot.height = slotH;
         } else if (dirtyW > 0u && dirtyH > 0u) {
@@ -2276,9 +2442,10 @@ AeroGLuint OpenGlDeviceBackend::ResolveBatchImageTexture(
                 static_cast<AeroGLsizei>(dirtyH),
                 kGlRgba,
                 kGlUnsignedByte,
-                imageUploadScratchRgba8_.data());
+                uploadPtr);
         }
     }
+    fullSnapshot.reset();
     if (imageUploadScratchRgba8_.capacity() > 256u * 1024u) {
         std::vector<std::uint8_t>().swap(imageUploadScratchRgba8_);
     }
@@ -3128,6 +3295,126 @@ GpuBackendFrameStats OpenGlDeviceBackend::ExecuteSubmission(
 
             switch (span.effectMode) {
                 case UIEffectKind::Blur: {
+                    const int hbw = (bw + 1) / 2;
+                    const int hbh = (bh + 1) / 2;
+                    if (effRadiusPhys >= 6.0f && bw >= 32 && bh >= 32 &&
+                        EnsureHalfEffectGpuResources(viewportWidth, viewportHeight)) {
+                        const int halfW = static_cast<int>(halfEffectFboW_);
+                        const int halfH = static_cast<int>(halfEffectFboH_);
+                        const float fHalfW = static_cast<float>(halfW);
+                        const float fHalfH = static_cast<float>(halfH);
+                        const float scaleX = static_cast<float>(hbw) / static_cast<float>(bw);
+                        const float scaleY = static_cast<float>(hbh) / static_cast<float>(bh);
+                        const float radiusHalf = effRadiusPhys * 0.5f * (scaleX + scaleY);
+                        const float invHalfW = 1.0f / fHalfW;
+                        const float invHalfH = 1.0f / fHalfH;
+                        const float fhbw = static_cast<float>(hbw);
+                        const float fhbh = static_cast<float>(hbh);
+                        const float hU0 = 0.0f;
+                        const float hU1 = fhbw / fHalfW;
+                        const float hVTop = 1.0f;
+                        const float hVBot = 1.0f - fhbh / fHalfH;
+                        const float hUvMinX = 0.5f / fHalfW;
+                        const float hUvMaxX = std::max(hUvMinX, (fhbw - 0.5f) / fHalfW);
+                        const float hUvMinY = 1.0f - (fhbh - 0.5f) / fHalfH;
+                        const float hUvMaxY = std::max(hUvMinY, 1.0f - 0.5f / fHalfH);
+
+                        auto drawHalfQuad = [&](
+                            AeroGLuint targetFbo,
+                            AeroGLint mode,
+                            AeroGLuint srcTexId,
+                            float texelX,
+                            float texelY,
+                            float paramX,
+                            float qu0, float qu1, float qvTop, float qvBot) {
+                            gl_.BindFramebuffer(kGlFramebuffer, targetFbo);
+                            gl_.Disable(kGlBlend);
+                            gl_.Enable(kGlScissorTest);
+                            scissorCurrentlyEnabled = true;
+                            gl_.Scissor(0, static_cast<AeroGLint>(halfH - hbh), static_cast<AeroGLsizei>(hbw), static_cast<AeroGLsizei>(hbh));
+                            gl_.ClearColor(0.0f, 0.0f, 0.0f, 0.0f);
+                            gl_.Clear(kGlColorBufferBit);
+                            gl_.Disable(kGlScissorTest);
+                            scissorCurrentlyEnabled = false;
+                            gl_.ActiveTexture(kGlTexture0);
+                            gl_.BindTexture(kGlTexture2D, srcTexId);
+                            if (uEffectModeLoc_ >= 0) gl_.Uniform1i(uEffectModeLoc_, mode);
+                            if (uEffectTexelSizeLoc_ >= 0) gl_.Uniform2f(uEffectTexelSizeLoc_, texelX, texelY);
+                            if (uEffectParamsLoc_ >= 0) gl_.Uniform2f(uEffectParamsLoc_, paramX, 1.0f);
+                            const auto prim = static_cast<std::uint16_t>(AeroPrimType::TexturedQuad);
+                            const AeroVertex quadVerts[4]{
+                                {0.0f, 0.0f, qu0, qvTop, 0xFFFFFFFFu, prim, AeroVertexFlag_PremultipliedAlpha},
+                                {fhbw, 0.0f, qu1, qvTop, 0xFFFFFFFFu, prim, AeroVertexFlag_PremultipliedAlpha},
+                                {fhbw, fhbh, qu1, qvBot, 0xFFFFFFFFu, prim, AeroVertexFlag_PremultipliedAlpha},
+                                {0.0f, fhbh, qu0, qvBot, 0xFFFFFFFFu, prim, AeroVertexFlag_PremultipliedAlpha},
+                            };
+                            bindEffectQuadVboAttribs();
+                            gl_.BufferSubData(kGlArrayBuffer, 0, static_cast<AeroGLsizeiptr>(sizeof(quadVerts)), quadVerts);
+                            gl_.DrawElements(kGlTriangles, 6, kGlUnsignedInt, nullptr);
+                            stats.clipBatchesProcessed += 1u;
+                            stats.drawCallsIssued += 1u;
+                            stats.quadsSubmitted += 1u;
+                            stats.indicesSubmitted += 6u;
+                            stats.trianglesSubmitted += 2u;
+                        };
+
+                        gl_.Viewport(0, 0, static_cast<AeroGLsizei>(halfW), static_cast<AeroGLsizei>(halfH));
+                        if (uEffectViewportSizeLoc_ >= 0) gl_.Uniform2f(uEffectViewportSizeLoc_, fHalfW, fHalfH);
+                        // Downsample FBO0 -> halfFBO[0] (clamped)
+                        drawHalfQuad(halfEffectFboIds_[0], 10, effectFboTexIds_[0], invW, invH, 1.0f, u0, u1, vTop, vBot);
+                        // Switch UV window to halfFBO sub-rect
+                        if (uEffectUvMinLoc_ >= 0) gl_.Uniform2f(uEffectUvMinLoc_, hUvMinX, hUvMinY);
+                        if (uEffectUvMaxLoc_ >= 0) gl_.Uniform2f(uEffectUvMaxLoc_, hUvMaxX, hUvMaxY);
+                        // H blur -> halfFBO[1], V blur -> halfFBO[0]
+                        drawHalfQuad(halfEffectFboIds_[1], 1, halfEffectFboTexIds_[0], invHalfW, 0.0f, radiusHalf, hU0, hU1, hVTop, hVBot);
+                        drawHalfQuad(halfEffectFboIds_[0], 1, halfEffectFboTexIds_[1], 0.0f, invHalfH, radiusHalf, hU0, hU1, hVTop, hVBot);
+
+                        // Upscale composite halfFBO[0] -> default FBO(0) using full-res viewport and mode 11
+                        gl_.Viewport(0, 0, static_cast<AeroGLsizei>(vpW), static_cast<AeroGLsizei>(vpH));
+                        if (uEffectViewportSizeLoc_ >= 0) gl_.Uniform2f(uEffectViewportSizeLoc_, fVpW, fVpH);
+                        const float fx0 = static_cast<float>(bx0);
+                        const float fy0 = static_cast<float>(by0);
+                        const float fx1 = static_cast<float>(bx1);
+                        const float fy1 = static_cast<float>(by1);
+                        gl_.BindFramebuffer(kGlFramebuffer, 0u);
+                        gl_.Enable(kGlBlend);
+                        setGlBlendMode(span.blendMode);
+                        if (span.clipActive) {
+                            gl_.Enable(kGlScissorTest);
+                            scissorCurrentlyEnabled = true;
+                            const GlScissorBox sc = ComputeGlScissorBox(
+                                ScaleRectByDpi(span.clipRect, dpiScale), viewportWidth, viewportHeight);
+                            gl_.Scissor(sc.x, sc.y, sc.width, sc.height);
+                        }
+                        gl_.ActiveTexture(kGlTexture0);
+                        gl_.BindTexture(kGlTexture2D, halfEffectFboTexIds_[0]);
+                        if (uEffectModeLoc_ >= 0) gl_.Uniform1i(uEffectModeLoc_, 0);
+                        if (uEffectParamsLoc_ >= 0) gl_.Uniform2f(uEffectParamsLoc_, 1.0f, 1.0f);
+                        const auto prim = static_cast<std::uint16_t>(AeroPrimType::TexturedQuad);
+                        const AeroVertex quadVerts[4]{
+                            {fx0, fy0, hU0, hVTop, opacityColor, prim, AeroVertexFlag_PremultipliedAlpha},
+                            {fx1, fy0, hU1, hVTop, opacityColor, prim, AeroVertexFlag_PremultipliedAlpha},
+                            {fx1, fy1, hU1, hVBot, opacityColor, prim, AeroVertexFlag_PremultipliedAlpha},
+                            {fx0, fy1, hU0, hVBot, opacityColor, prim, AeroVertexFlag_PremultipliedAlpha},
+                        };
+                        bindEffectQuadVboAttribs();
+                        gl_.BufferSubData(kGlArrayBuffer, 0, static_cast<AeroGLsizeiptr>(sizeof(quadVerts)), quadVerts);
+                        gl_.DrawElements(kGlTriangles, 6, kGlUnsignedInt, nullptr);
+                        stats.clipBatchesProcessed += 1u;
+                        stats.drawCallsIssued += 1u;
+                        stats.quadsSubmitted += 1u;
+                        stats.indicesSubmitted += 6u;
+                        stats.trianglesSubmitted += 2u;
+                        break;
+                    }
+                    if (!EnsureSecondEffectFbo(viewportWidth, viewportHeight)) {
+                        gl_.BindFramebuffer(kGlFramebuffer, 0u);
+                        gl_.UseProgram(programId_);
+                        gl_.ActiveTexture(kGlTexture0);
+                        gl_.BindTexture(kGlTexture2D, atlasTextureId_);
+                        BindAeroVertexLayout();
+                        return false;
+                    }
                     gl_.BindFramebuffer(kGlFramebuffer, effectFboIds_[1]);
                     gl_.Enable(kGlScissorTest);
                     scissorCurrentlyEnabled = true;
@@ -3148,6 +3435,121 @@ GpuBackendFrameStats OpenGlDeviceBackend::ExecuteSubmission(
                     const float depthPx = (std::isfinite(span.amountX) ? span.amountX : 0.0f) * ws * dpiScale;
                     const float dxPx = std::cos(angRad) * depthPx;
                     const float dyPx = -std::sin(angRad) * depthPx;
+                    const int hbw = (bw + 1) / 2;
+                    const int hbh = (bh + 1) / 2;
+                    if (effRadiusPhys >= 6.0f && bw >= 32 && bh >= 32 &&
+                        EnsureHalfEffectGpuResources(viewportWidth, viewportHeight)) {
+                        const int halfW = static_cast<int>(halfEffectFboW_);
+                        const int halfH = static_cast<int>(halfEffectFboH_);
+                        const float fHalfW = static_cast<float>(halfW);
+                        const float fHalfH = static_cast<float>(halfH);
+                        const float scaleX = static_cast<float>(hbw) / static_cast<float>(bw);
+                        const float scaleY = static_cast<float>(hbh) / static_cast<float>(bh);
+                        const float radiusHalf = effRadiusPhys * 0.5f * (scaleX + scaleY);
+                        const float invHalfW = 1.0f / fHalfW;
+                        const float invHalfH = 1.0f / fHalfH;
+                        const float fhbw = static_cast<float>(hbw);
+                        const float fhbh = static_cast<float>(hbh);
+                        const float hU0 = 0.0f;
+                        const float hU1 = fhbw / fHalfW;
+                        const float hVTop = 1.0f;
+                        const float hVBot = 1.0f - fhbh / fHalfH;
+                        const float hUvMinX = 0.5f / fHalfW;
+                        const float hUvMaxX = std::max(hUvMinX, (fhbw - 0.5f) / fHalfW);
+                        const float hUvMinY = 1.0f - (fhbh - 0.5f) / fHalfH;
+                        const float hUvMaxY = std::max(hUvMinY, 1.0f - 0.5f / fHalfH);
+
+                        auto drawHalfQuad = [&](
+                            AeroGLuint targetFbo,
+                            AeroGLint mode,
+                            AeroGLuint srcTexId,
+                            float texelX,
+                            float texelY,
+                            float paramX,
+                            float qu0, float qu1, float qvTop, float qvBot) {
+                            gl_.BindFramebuffer(kGlFramebuffer, targetFbo);
+                            gl_.Disable(kGlBlend);
+                            gl_.Enable(kGlScissorTest);
+                            scissorCurrentlyEnabled = true;
+                            gl_.Scissor(0, static_cast<AeroGLint>(halfH - hbh), static_cast<AeroGLsizei>(hbw), static_cast<AeroGLsizei>(hbh));
+                            gl_.ClearColor(0.0f, 0.0f, 0.0f, 0.0f);
+                            gl_.Clear(kGlColorBufferBit);
+                            gl_.Disable(kGlScissorTest);
+                            scissorCurrentlyEnabled = false;
+                            gl_.ActiveTexture(kGlTexture0);
+                            gl_.BindTexture(kGlTexture2D, srcTexId);
+                            if (uEffectModeLoc_ >= 0) gl_.Uniform1i(uEffectModeLoc_, mode);
+                            if (uEffectTexelSizeLoc_ >= 0) gl_.Uniform2f(uEffectTexelSizeLoc_, texelX, texelY);
+                            if (uEffectParamsLoc_ >= 0) gl_.Uniform2f(uEffectParamsLoc_, paramX, 1.0f);
+                            const auto prim = static_cast<std::uint16_t>(AeroPrimType::TexturedQuad);
+                            const AeroVertex quadVerts[4]{
+                                {0.0f, 0.0f, qu0, qvTop, 0xFFFFFFFFu, prim, AeroVertexFlag_PremultipliedAlpha},
+                                {fhbw, 0.0f, qu1, qvTop, 0xFFFFFFFFu, prim, AeroVertexFlag_PremultipliedAlpha},
+                                {fhbw, fhbh, qu1, qvBot, 0xFFFFFFFFu, prim, AeroVertexFlag_PremultipliedAlpha},
+                                {0.0f, fhbh, qu0, qvBot, 0xFFFFFFFFu, prim, AeroVertexFlag_PremultipliedAlpha},
+                            };
+                            bindEffectQuadVboAttribs();
+                            gl_.BufferSubData(kGlArrayBuffer, 0, static_cast<AeroGLsizeiptr>(sizeof(quadVerts)), quadVerts);
+                            gl_.DrawElements(kGlTriangles, 6, kGlUnsignedInt, nullptr);
+                            stats.clipBatchesProcessed += 1u;
+                            stats.drawCallsIssued += 1u;
+                            stats.quadsSubmitted += 1u;
+                            stats.indicesSubmitted += 6u;
+                            stats.trianglesSubmitted += 2u;
+                        };
+
+                        gl_.Viewport(0, 0, static_cast<AeroGLsizei>(halfW), static_cast<AeroGLsizei>(halfH));
+                        if (uEffectViewportSizeLoc_ >= 0) gl_.Uniform2f(uEffectViewportSizeLoc_, fHalfW, fHalfH);
+                        // Downsample FBO0 -> halfFBO[0] (in-bounds)
+                        drawHalfQuad(halfEffectFboIds_[0], 10, effectFboTexIds_[0], invW, invH, 0.0f, u0, u1, vTop, vBot);
+                        if (uEffectUvMinLoc_ >= 0) gl_.Uniform2f(uEffectUvMinLoc_, hUvMinX, hUvMinY);
+                        if (uEffectUvMaxLoc_ >= 0) gl_.Uniform2f(uEffectUvMaxLoc_, hUvMaxX, hUvMaxY);
+                        // Pass H with shadow offset -> halfFBO[1]
+                        if (uEffectShadowOffsetLoc_ >= 0) {
+                            gl_.Uniform2f(uEffectShadowOffsetLoc_, -dxPx * scaleX * invHalfW, dyPx * scaleY * invHalfH);
+                        }
+                        drawHalfQuad(halfEffectFboIds_[1], 8, halfEffectFboTexIds_[0], invHalfW, 0.0f, radiusHalf, hU0, hU1, hVTop, hVBot);
+                        // Pass V (zero offset) -> halfFBO[0]
+                        if (uEffectShadowOffsetLoc_ >= 0) {
+                            gl_.Uniform2f(uEffectShadowOffsetLoc_, 0.0f, 0.0f);
+                        }
+                        drawHalfQuad(halfEffectFboIds_[0], 8, halfEffectFboTexIds_[1], 0.0f, invHalfH, radiusHalf, hU0, hU1, hVTop, hVBot);
+
+                        // Composite crisp FBO0 + blurred shadow halfFBO[0] onto default FBO(0)
+                        gl_.Viewport(0, 0, static_cast<AeroGLsizei>(vpW), static_cast<AeroGLsizei>(vpH));
+                        if (uEffectViewportSizeLoc_ >= 0) gl_.Uniform2f(uEffectViewportSizeLoc_, fVpW, fVpH);
+                        if (uEffectMaskGradPtsLoc_ >= 0 && gl_.Uniform4f) {
+                            gl_.Uniform4f(
+                                uEffectMaskGradPtsLoc_,
+                                static_cast<float>(bx0),
+                                static_cast<float>(by0),
+                                fhbw / (static_cast<float>(bw) * fHalfW),
+                                fhbh / (static_cast<float>(bh) * fHalfH));
+                        }
+                        if (uEffectMaskStopOffsetsLoc_ >= 0 && gl_.Uniform4f) {
+                            gl_.Uniform4f(uEffectMaskStopOffsetsLoc_, uvMinX, uvMinY, uvMaxX, uvMaxY);
+                        }
+                        gl_.ActiveTexture(kGlTexture1);
+                        gl_.BindTexture(kGlTexture2D, effectFboTexIds_[0]);
+                        if (uEffectOrigTexLoc_ >= 0) {
+                            gl_.Uniform1i(uEffectOrigTexLoc_, 1);
+                        }
+                        gl_.ActiveTexture(kGlTexture0);
+                        const std::uint32_t shadowPacked = PackColorRgba8(span.effectColor, 1.0f);
+                        issueEffectPass(0u, 11, halfEffectFboTexIds_[0], 0.0f, 0.0f, 0.0f, effSpanOpacity, shadowPacked, true, true);
+                        gl_.ActiveTexture(kGlTexture1);
+                        gl_.BindTexture(kGlTexture2D, 0u);
+                        gl_.ActiveTexture(kGlTexture0);
+                        break;
+                    }
+                    if (!EnsureSecondEffectFbo(viewportWidth, viewportHeight)) {
+                        gl_.BindFramebuffer(kGlFramebuffer, 0u);
+                        gl_.UseProgram(programId_);
+                        gl_.ActiveTexture(kGlTexture0);
+                        gl_.BindTexture(kGlTexture2D, atlasTextureId_);
+                        BindAeroVertexLayout();
+                        return false;
+                    }
                     if (uEffectShadowOffsetLoc_ >= 0) {
                         gl_.Uniform2f(uEffectShadowOffsetLoc_, -dxPx * invW, dyPx * invH);
                     }

@@ -157,8 +157,8 @@ struct TextureSlotBuffer {
 class ImageAtlas {
 public:
     static constexpr std::uint32_t kSharedUiAtlasTextureId = 0u;
-    static constexpr std::uint32_t kDefaultSharedAtlasSize = 2048u;
-    static constexpr std::uint32_t kDefaultMaxPackableExtent = 512u;
+    static constexpr std::uint32_t kDefaultSharedAtlasSize = 512u;
+    static constexpr std::uint32_t kDefaultMaxPackableExtent = 256u;
 
     static ImageAtlas& Instance() noexcept;
 
@@ -272,6 +272,18 @@ public:
         std::uint32_t& outHeight,
         std::vector<std::uint8_t>& outRgba8,
         bool& outWasUpdated) const;
+    [[nodiscard]] bool AcquireTextureSlotUploadIfModified(
+        std::uint32_t textureId,
+        std::uint32_t& ioKnownSlotRevision,
+        std::uint32_t& outSlotWidth,
+        std::uint32_t& outSlotHeight,
+        std::uint32_t& outDirtyX,
+        std::uint32_t& outDirtyY,
+        std::uint32_t& outDirtyW,
+        std::uint32_t& outDirtyH,
+        std::shared_ptr<const std::vector<std::uint8_t>>& outFullSnapshot,
+        std::vector<std::uint8_t>& outSubRectRgba8,
+        bool& outWasUpdated) const;
     [[nodiscard]] bool CopyTextureSlotDirtySubRectIfModified(
         std::uint32_t textureId,
         std::uint32_t& ioKnownSlotRevision,
@@ -345,6 +357,8 @@ private:
         std::string currentExactUri;
         ImageAtlasEntry entry{};
         std::uint64_t lastUsedTick = 0u;
+        std::uint64_t lastPoseHash = 0u;
+        bool hasLastPoseHash = false;
     };
 
     struct PackedMaskUvEntry {

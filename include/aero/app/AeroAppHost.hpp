@@ -309,6 +309,7 @@ private:
     Size lastNotifiedViewport_{-1.0f, -1.0f};
     std::optional<std::chrono::steady_clock::time_point> scheduledWakeAt_;
     bool scriptWakeRequested_ = false;
+    bool renderWakeRequested_ = false;
     mutable bool pendingScriptSync_ = true;
     bool closeRequested_ = false;
     bool inStepFrame_ = false;

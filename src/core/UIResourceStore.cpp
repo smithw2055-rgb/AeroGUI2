@@ -693,8 +693,15 @@ bool UIResourceStore::GetOrRasterizePathMask(
         return false;
     }
     const std::uint64_t safeHash = (pathHash != 0ull) ? pathHash : ComputeSvgPathHash(pathData);
-    const std::uint32_t clampedW = std::clamp<std::uint32_t>(innerW, 1u, 2048u);
-    const std::uint32_t clampedH = std::clamp<std::uint32_t>(innerH, 1u, 2048u);
+    constexpr std::uint32_t kMaxPathMaskDim = 1024u;
+    std::uint32_t clampedW = std::clamp<std::uint32_t>(innerW, 1u, 2048u);
+    std::uint32_t clampedH = std::clamp<std::uint32_t>(innerH, 1u, 2048u);
+    const std::uint32_t maxDimRaw = std::max(clampedW, clampedH);
+    if (maxDimRaw > kMaxPathMaskDim) {
+        const float down = static_cast<float>(kMaxPathMaskDim) / static_cast<float>(maxDimRaw);
+        clampedW = std::max<std::uint32_t>(1u, static_cast<std::uint32_t>(std::lround(static_cast<float>(clampedW) * down)));
+        clampedH = std::max<std::uint32_t>(1u, static_cast<std::uint32_t>(std::lround(static_cast<float>(clampedH) * down)));
+    }
     const std::uint32_t clampedPad = std::min<std::uint32_t>(padPx, 64u);
 
     auto makeMaskKey = [&](std::uint32_t w, std::uint32_t h) noexcept -> std::uint64_t {
@@ -727,10 +734,10 @@ bool UIResourceStore::GetOrRasterizePathMask(
         }
         if (hasSameGroup) {
             static constexpr std::uint32_t kBuckets[] = {
-                16u, 24u, 32u, 48u, 64u, 96u, 128u, 192u, 256u, 384u, 512u, 768u, 1024u, 1536u, 2048u
+                16u, 24u, 32u, 48u, 64u, 96u, 128u, 192u, 256u, 384u, 512u, 768u, 1024u
             };
             const std::uint32_t maxDim = std::max(clampedW, clampedH);
-            std::uint32_t bucketMax = 2048u;
+            std::uint32_t bucketMax = kMaxPathMaskDim;
             for (const std::uint32_t b : kBuckets) {
                 if (b >= maxDim) {
                     bucketMax = b;
@@ -782,10 +789,20 @@ bool UIResourceStore::GetOrRasterizePathStrokeMask(
         return false;
     }
     const std::uint64_t safeHash = (pathHash != 0ull) ? pathHash : ComputeSvgPathHash(pathData);
-    const std::uint32_t clampedW = std::clamp<std::uint32_t>(innerW, 1u, 2048u);
-    const std::uint32_t clampedH = std::clamp<std::uint32_t>(innerH, 1u, 2048u);
-    const std::uint32_t clampedPad = std::clamp<std::uint32_t>(padPx, 1u, 256u);
-    const auto quantizedStroke = static_cast<std::uint64_t>(std::max<long>(1L, std::lround(strokeWidthPx * 16.0f)));
+    constexpr std::uint32_t kMaxStrokeMaskDim = 1024u;
+    std::uint32_t clampedW = std::clamp<std::uint32_t>(innerW, 1u, 2048u);
+    std::uint32_t clampedH = std::clamp<std::uint32_t>(innerH, 1u, 2048u);
+    float scaledStrokeW = strokeWidthPx;
+    std::uint32_t clampedPad = std::clamp<std::uint32_t>(padPx, 1u, 256u);
+    const std::uint32_t maxStrokeDimRaw = std::max(clampedW, clampedH);
+    if (maxStrokeDimRaw > kMaxStrokeMaskDim) {
+        const float down = static_cast<float>(kMaxStrokeMaskDim) / static_cast<float>(maxStrokeDimRaw);
+        clampedW = std::max<std::uint32_t>(1u, static_cast<std::uint32_t>(std::lround(static_cast<float>(clampedW) * down)));
+        clampedH = std::max<std::uint32_t>(1u, static_cast<std::uint32_t>(std::lround(static_cast<float>(clampedH) * down)));
+        scaledStrokeW = std::max(0.25f, strokeWidthPx * down);
+        clampedPad = std::max<std::uint32_t>(1u, static_cast<std::uint32_t>(std::ceil(static_cast<float>(clampedPad) * down)));
+    }
+    const auto quantizedStroke = static_cast<std::uint64_t>(std::max<long>(1L, std::lround(scaledStrokeW * 16.0f)));
     const auto capBits = (static_cast<std::uint64_t>(startLineCap & 0xFu) << 4u) |
                          static_cast<std::uint64_t>(endLineCap & 0xFu);
 
@@ -802,7 +819,7 @@ bool UIResourceStore::GetOrRasterizePathStrokeMask(
     const std::uint64_t strokeGroup = safeHash ^ 0x5A5A5A5A00000002ULL;
     std::uint32_t effW = clampedW;
     std::uint32_t effH = clampedH;
-    float effStrokeW = strokeWidthPx;
+    float effStrokeW = scaledStrokeW;
     std::uint64_t key = makeStrokeKey(effW, effH, effStrokeW);
 
     {
@@ -821,10 +838,10 @@ bool UIResourceStore::GetOrRasterizePathStrokeMask(
         }
         if (hasSameGroup) {
             static constexpr std::uint32_t kBuckets[] = {
-                16u, 24u, 32u, 48u, 64u, 96u, 128u, 192u, 256u, 384u, 512u, 768u, 1024u, 1536u, 2048u
+                16u, 24u, 32u, 48u, 64u, 96u, 128u, 192u, 256u, 384u, 512u, 768u, 1024u
             };
             const std::uint32_t maxDim = std::max(clampedW, clampedH);
-            std::uint32_t bucketMax = 2048u;
+            std::uint32_t bucketMax = kMaxStrokeMaskDim;
             for (const std::uint32_t b : kBuckets) {
                 if (b >= maxDim) {
                     bucketMax = b;
@@ -834,10 +851,10 @@ bool UIResourceStore::GetOrRasterizePathStrokeMask(
             if (maxDim > 0u && bucketMax != maxDim) {
                 const float scale = static_cast<float>(bucketMax) / static_cast<float>(maxDim);
                 effW = std::clamp<std::uint32_t>(
-                    static_cast<std::uint32_t>(std::lround(static_cast<float>(clampedW) * scale)), 1u, 2048u);
+                    static_cast<std::uint32_t>(std::lround(static_cast<float>(clampedW) * scale)), 1u, kMaxStrokeMaskDim);
                 effH = std::clamp<std::uint32_t>(
-                    static_cast<std::uint32_t>(std::lround(static_cast<float>(clampedH) * scale)), 1u, 2048u);
-                effStrokeW = std::max(0.25f, strokeWidthPx * scale);
+                    static_cast<std::uint32_t>(std::lround(static_cast<float>(clampedH) * scale)), 1u, kMaxStrokeMaskDim);
+                effStrokeW = std::max(0.25f, scaledStrokeW * scale);
                 key = makeStrokeKey(effW, effH, effStrokeW);
                 if (const auto bit = pathMaskEntries_.find(key); bit != pathMaskEntries_.end()) {
                     bit->second.lastUsedTick = ++pathMaskAccessSeq_;

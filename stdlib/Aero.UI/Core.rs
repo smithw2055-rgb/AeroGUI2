@@ -2666,6 +2666,8 @@ public partial class UIElement : DependencyObject {
     internal static int _disposeEpoch = 1;
     internal static int _treeParentEpoch = 1;
     internal static int _visibilityEpoch = 1;
+    internal static int _dataContextEpoch = 1;
+    internal static int _globalPropEpoch = 1;
     public static int _closedPopupBuildDepth = 0;
 
     private bool _cachedClosedPopupVal = false;
@@ -2678,6 +2680,7 @@ public partial class UIElement : DependencyObject {
 
     internal void BumpPropEpoch() {
         _propEpoch = _propEpoch >= 1000000000 ? 1 : (_propEpoch + 1);
+        _globalPropEpoch = _globalPropEpoch >= 1000000000 ? 1 : (_globalPropEpoch + 1);
     }
 
     internal void BumpSubtreeAncestorEpoch() {
@@ -3163,6 +3166,7 @@ public partial class UIElement : DependencyObject {
     }
 
     private void PropagateDataContextToSubtree(DependencyObject oldBox) {
+        _dataContextEpoch = _dataContextEpoch >= 1000000000 ? 1 : (_dataContextEpoch + 1);
         DependencyObject eff = EffectiveDataContextBox();
         RaiseDataContextChangedBoxes(oldBox, eff);
         PropagateDataContextQueue(this, eff, false);

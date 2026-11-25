@@ -90,6 +90,7 @@ struct UIHostPlatformHooks {
     std::function<std::string()> getClipboardText;
     std::function<void(std::string_view)> setClipboardText;
     std::function<void()> requestWake;
+    std::function<void()> requestRenderWake;
     std::function<void(std::int32_t)> requestWakeAfterMs;
     std::function<void()> closeWindow;
     std::function<void(std::string_view, float)> playSound;

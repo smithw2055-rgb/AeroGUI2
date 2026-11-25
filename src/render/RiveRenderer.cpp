@@ -1,12 +1,16 @@
 #include "aero/render/RiveRenderer.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <memory>
 #include <mutex>
 #include <string>
+#include <tuple>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -132,6 +136,10 @@ struct RivPaint {
     std::vector<RivGradStop> stops;
 };
 
+[[nodiscard]] inline float FastHypot(float dx, float dy) noexcept {
+    return std::sqrt(dx * dx + dy * dy);
+}
+
 bool ReadVarUint(const std::uint8_t* data, std::size_t size, std::size_t& pos, std::uint64_t& out) noexcept {
     out = 0u;
     unsigned shift = 0u;
@@ -238,6 +246,1025 @@ bool ParseRiveFileBytes(const std::vector<std::uint8_t>& bytes, std::vector<RivO
     return !outObjects.empty();
 }
 
+// ============================================================================
+// Flat Pre-Indexed Rive Document Model (Built ONCE on file load, ZERO maps)
+// ============================================================================
+
+struct RivCubicInterp {
+    float x1 = 0.42f, y1 = 0.0f, x2 = 0.58f, y2 = 1.0f;
+};
+
+struct PrebuiltTimingInfo {
+    float fps = 60.0f;
+    float speed = 1.0f;
+    std::uint32_t loop = 0u;
+    float fStart = 0.0f;
+    float fEnd = 60.0f;
+    float fSpan = 60.0f;
+    float durationSec = 1.0f;
+};
+
+struct PrebuiltKfEntry {
+    std::uint32_t tk = 0u;
+    float frame = 0.0f;
+    std::uint32_t interp = 0u; // 0=Linear, 1=Hold, 2=Cubic
+    std::uint32_t interpId = 0u;
+    float fVal = 0.0f;
+    std::uint64_t uVal = 0u;
+};
+
+struct PrebuiltPropTrack {
+    std::size_t targetObj = 0u;
+    std::uint32_t propKey = 0u;
+    std::vector<PrebuiltKfEntry> kfs;
+};
+
+struct PrebuiltAnimation {
+    PrebuiltTimingInfo timing;
+    std::vector<PrebuiltPropTrack> tracks;
+};
+
+struct PrebuiltSmInput {
+    std::string name;
+    float defaultVal = 0.0f;
+};
+
+struct PrebuiltSmTransition {
+    std::uint32_t toState = 0u;
+    std::uint32_t flags = 0u;
+    float exitTime = 0.0f;
+    std::vector<std::tuple<std::uint32_t, std::uint32_t, float>> conds;
+};
+
+struct PrebuiltSmLayerState {
+    std::uint32_t tk = 0u;
+    std::uint32_t animId = 0xFFFFFFFFu;
+    std::vector<PrebuiltSmTransition> transitions;
+};
+
+struct PrebuiltSmLayer {
+    std::size_t entryState = 0u;
+    std::vector<PrebuiltSmLayerState> states;
+};
+
+struct PrebuiltStateMachine {
+    std::vector<PrebuiltSmInput> inputs;
+    std::vector<PrebuiltSmLayer> layers;
+};
+
+struct PrebuiltNodeBase {
+    float x = 0.0f;
+    float y = 0.0f;
+    float rot = 0.0f;
+    float sx = 1.0f;
+    float sy = 1.0f;
+    float opacity = 1.0f;
+    float boneLen = 0.0f;
+    std::uint8_t hidden = 0u;
+    std::uint32_t targetAb = 0xFFFFFFFFu;
+};
+
+struct PrebuiltSkinBone {
+    std::uint32_t boneId = 0u;
+    RivMat2D invBindMulSkinBind{};
+};
+
+struct PrebuiltVertex {
+    std::uint32_t objIdx = 0u;
+    std::uint32_t vtk = 0u;
+    float x = 0.0f;
+    float y = 0.0f;
+    float p0 = 0.0f;
+    float p1 = 0.0f;
+    float p2 = 0.0f;
+    float p3 = 0.0f;
+    std::uint32_t weightObjIdx = 0u;
+    std::uint32_t weightTk = 0u;
+    std::uint32_t vVals = 255u;
+    std::uint32_t vIdxs = 1u;
+    std::uint32_t inVals = 255u;
+    std::uint32_t inIdxs = 1u;
+    std::uint32_t outVals = 255u;
+    std::uint32_t outIdxs = 1u;
+};
+
+struct PrebuiltPathData {
+    std::uint32_t objIdx = 0u;
+    std::uint32_t tk = 0u;
+    bool closed = false;
+    float w = 0.0f;
+    float h = 0.0f;
+    float ox = 0.5f;
+    float oy = 0.5f;
+    float rTL = 0.0f;
+    float rTR = 0.0f;
+    float rBL = 0.0f;
+    float rBR = 0.0f;
+    bool linked = true;
+    std::vector<PrebuiltVertex> verts;
+    std::vector<PrebuiltSkinBone> skinBones;
+};
+
+struct PrebuiltClipRef {
+    std::uint32_t clipObjIdx = 0u;
+    std::uint32_t srcId = 0xFFFFFFFFu;
+    bool enabled = true;
+    bool evenOdd = false;
+};
+
+struct PrebuiltPaintStop {
+    std::uint32_t stopObjIdx = 0u;
+    float pos = 0.0f;
+    std::uint32_t argb = 0xFFFFFFFFu;
+};
+
+struct PrebuiltPaintTrim {
+    std::uint32_t trimObjIdx = 0u;
+    float start = 0.0f;
+    float end = 0.0f;
+    float offset = 0.0f;
+    std::uint32_t mode = 1u;
+};
+
+struct PrebuiltPaintDef {
+    std::uint32_t paintObjIdx = 0u;
+    std::uint32_t colorObjIdx = 0u;
+    bool enabled = true;
+    bool isStroke = false;
+    bool evenOdd = false;
+    bool transformAffectsStroke = true;
+    RivPaintStyle style = RivPaintStyle::None;
+    std::uint32_t solidArgb = 0xFFFFFFFFu;
+    float strokeThickness = 1.0f;
+    std::uint32_t strokeCap = 0u;
+    std::uint32_t strokeJoin = 0u;
+    float gx0 = 0.0f;
+    float gy0 = 0.0f;
+    float gx1 = 0.0f;
+    float gy1 = 0.0f;
+    float gradOpacity = 1.0f;
+    std::vector<PrebuiltPaintStop> stops;
+    std::vector<PrebuiltPaintTrim> trims;
+};
+
+struct PrebuiltArtboard {
+    float natW = 500.0f;
+    float natH = 200.0f;
+    float abOx = 0.0f;
+    float abOy = 0.0f;
+    std::size_t compEnd = 0u;
+    std::vector<std::uint32_t> typeKeys;
+    std::vector<std::uint32_t> parentIds;
+    std::vector<std::uint8_t> hasClipInAncestors;
+    std::vector<PrebuiltNodeBase> nodes;
+    std::vector<std::int32_t> pathDataIndex;
+    std::vector<PrebuiltPathData> paths;
+    std::vector<std::vector<PrebuiltClipRef>> nodeClips;
+    std::vector<PrebuiltPaintDef> bgPaints;
+    std::vector<std::int32_t> shapePaintIndex;
+    std::vector<std::vector<PrebuiltPaintDef>> shapePaints;
+    std::vector<std::size_t> renderOrder;
+    std::vector<std::vector<std::size_t>> childrenOf;
+    std::vector<std::pair<std::uint32_t, RivCubicInterp>> cubicInterps;
+    std::vector<PrebuiltAnimation> animations;
+    std::vector<PrebuiltStateMachine> stateMachines;
+};
+
+struct PrebuiltRiveDocument {
+    std::vector<PrebuiltArtboard> artboards;
+};
+
+[[nodiscard]] float EvalCubicEase(
+    const std::vector<std::pair<std::uint32_t, RivCubicInterp>>& cubicInterps,
+    std::uint32_t interpId,
+    float u) noexcept {
+    u = std::clamp(u, 0.0f, 1.0f);
+    if (u <= 0.0f || u >= 1.0f) return u;
+    RivCubicInterp ci{};
+    const auto it = std::lower_bound(
+        cubicInterps.begin(), cubicInterps.end(), interpId,
+        [](const std::pair<std::uint32_t, RivCubicInterp>& item, std::uint32_t key) {
+            return item.first < key;
+        });
+    if (it != cubicInterps.end() && it->first == interpId) {
+        ci = it->second;
+    }
+    float s = u;
+    for (int iter = 0; iter < 6; ++iter) {
+        const float inv = 1.0f - s;
+        const float bx = 3.0f * inv * inv * s * ci.x1 + 3.0f * inv * s * s * ci.x2 + s * s * s - u;
+        const float dbx = 3.0f * inv * inv * ci.x1 + 6.0f * inv * s * (ci.x2 - ci.x1) + 3.0f * s * s * (1.0f - ci.x2);
+        if (std::fabs(dbx) < 1e-5f) break;
+        s = std::clamp(s - bx / dbx, 0.0f, 1.0f);
+    }
+    const float inv = 1.0f - s;
+    return 3.0f * inv * inv * s * ci.y1 + 3.0f * inv * s * s * ci.y2 + s * s * s;
+}
+
+[[nodiscard]] std::uint32_t LerpArgb(std::uint32_t c0, std::uint32_t c1, float t) noexcept {
+    t = std::clamp(t, 0.0f, 1.0f);
+    std::uint32_t out = 0u;
+    for (unsigned sh = 0u; sh < 32u; sh += 8u) {
+        const float a = static_cast<float>((c0 >> sh) & 0xFFu);
+        const float b = static_cast<float>((c1 >> sh) & 0xFFu);
+        const auto v = static_cast<std::uint32_t>(std::clamp(a + (b - a) * t + 0.5f, 0.0f, 255.0f));
+        out |= (v << sh);
+    }
+    return out;
+}
+
+PrebuiltPaintDef BuildPrebuiltPaintDef(
+    const std::vector<RivObject>& objs,
+    const std::vector<std::vector<std::size_t>>& childrenOf,
+    std::size_t pIdx) {
+    PrebuiltPaintDef p{};
+    const std::uint32_t ptk = objs[pIdx].typeKey;
+    p.paintObjIdx = static_cast<std::uint32_t>(pIdx);
+    p.enabled = (objs[pIdx].GetU(41u, 1u) != 0u);
+    p.isStroke = (ptk == 24u);
+    p.evenOdd = (ptk == 20u) && (objs[pIdx].GetU(40u, 0u) == 1u);
+    p.strokeThickness = objs[pIdx].GetF(47u, 1.0f);
+    p.strokeCap = objs[pIdx].GetU(48u, 0u);
+    p.strokeJoin = objs[pIdx].GetU(49u, 0u);
+    p.transformAffectsStroke = (objs[pIdx].GetU(50u, 1u) != 0u);
+
+    for (std::size_t sc : childrenOf[pIdx]) {
+        const std::uint32_t stk = objs[sc].typeKey;
+        if (stk == 18u) {
+            p.style = RivPaintStyle::Solid;
+            p.colorObjIdx = static_cast<std::uint32_t>(sc);
+            p.solidArgb = objs[sc].GetU(37u, 0xFFFFFFFFu);
+        } else if (stk == 22u || stk == 17u) {
+            p.style = (stk == 22u) ? RivPaintStyle::Linear : RivPaintStyle::Radial;
+            p.colorObjIdx = static_cast<std::uint32_t>(sc);
+            p.gx0 = objs[sc].GetF(42u, 0.0f);
+            p.gy0 = objs[sc].GetF(33u, 0.0f);
+            p.gx1 = objs[sc].GetF(34u, 0.0f);
+            p.gy1 = objs[sc].GetF(35u, 0.0f);
+            p.gradOpacity = std::clamp(objs[sc].GetF(46u, 1.0f), 0.0f, 1.0f);
+            for (std::size_t stc : childrenOf[sc]) {
+                if (objs[stc].typeKey == 19u) {
+                    PrebuiltPaintStop stop{};
+                    stop.stopObjIdx = static_cast<std::uint32_t>(stc);
+                    stop.pos = objs[stc].GetF(39u, 0.0f);
+                    stop.argb = objs[stc].GetU(38u, 0xFFFFFFFFu);
+                    p.stops.push_back(stop);
+                }
+            }
+            std::sort(p.stops.begin(), p.stops.end(),
+                      [](const PrebuiltPaintStop& a, const PrebuiltPaintStop& b) { return a.pos < b.pos; });
+        }
+    }
+    if (p.isStroke) {
+        for (std::size_t tc : childrenOf[pIdx]) {
+            if (objs[tc].typeKey == 47u) {
+                PrebuiltPaintTrim tm{};
+                tm.trimObjIdx = static_cast<std::uint32_t>(tc);
+                tm.start = objs[tc].GetF(114u, 0.0f);
+                tm.end = objs[tc].GetF(115u, 0.0f);
+                tm.offset = objs[tc].GetF(116u, 0.0f);
+                tm.mode = objs[tc].GetU(117u, 1u);
+                p.trims.push_back(tm);
+            }
+        }
+    }
+    return p;
+}
+
+PrebuiltRiveDocument BuildPrebuiltDocument(const std::vector<RivObject>& allObjs) {
+    PrebuiltRiveDocument doc;
+    struct Slice {
+        std::size_t startIdx = 0u;
+        std::size_t endIdx = 0u;
+    };
+    std::vector<Slice> abSlices;
+    for (std::size_t i = 0u; i < allObjs.size(); ++i) {
+        if (allObjs[i].typeKey == 1u) {
+            if (!abSlices.empty()) abSlices.back().endIdx = i;
+            abSlices.push_back({i, allObjs.size()});
+        }
+    }
+    doc.artboards.resize(abSlices.size());
+
+    for (std::size_t ai = 0u; ai < abSlices.size(); ++ai) {
+        const std::size_t s0 = abSlices[ai].startIdx;
+        const std::size_t s1 = abSlices[ai].endIdx;
+        if (s1 <= s0) continue;
+
+        PrebuiltArtboard& ab = doc.artboards[ai];
+        std::size_t rawCompEnd = s1;
+        for (std::size_t idx = s0 + 1u; idx < s1; ++idx) {
+            if (allObjs[idx].typeKey == 31u || allObjs[idx].typeKey == 53u) {
+                rawCompEnd = idx;
+                break;
+            }
+        }
+        std::vector<RivObject> objs;
+        objs.reserve(s1 - s0);
+        for (std::size_t idx = s0; idx < rawCompEnd; ++idx) {
+            const std::uint32_t tk = allObjs[idx].typeKey;
+            if (idx > s0 && tk == 28u) {
+                RivCubicInterp ci{};
+                ci.x1 = std::clamp(allObjs[idx].GetF(63u, 0.42f), 0.0f, 1.0f);
+                ci.y1 = allObjs[idx].GetF(64u, 0.0f);
+                ci.x2 = std::clamp(allObjs[idx].GetF(65u, 0.58f), 0.0f, 1.0f);
+                ci.y2 = allObjs[idx].GetF(66u, 1.0f);
+                ab.cubicInterps.emplace_back(static_cast<std::uint32_t>(idx - s0), ci);
+                continue;
+            }
+            if (idx > s0 && tk == 8064u) {
+                continue;
+            }
+            objs.push_back(allObjs[idx]);
+        }
+        std::sort(ab.cubicInterps.begin(), ab.cubicInterps.end(),
+                  [](const auto& a, const auto& b) { return a.first < b.first; });
+        for (std::size_t idx = rawCompEnd; idx < s1; ++idx) {
+            objs.push_back(allObjs[idx]);
+        }
+
+        std::size_t compEnd = objs.size();
+        for (std::size_t i = 1u; i < objs.size(); ++i) {
+            if (objs[i].typeKey == 31u || objs[i].typeKey == 53u) {
+                compEnd = i;
+                break;
+            }
+        }
+        ab.compEnd = compEnd;
+        ab.natW = std::max(1.0f, objs[0].GetF(7u, 500.0f));
+        ab.natH = std::max(1.0f, objs[0].GetF(8u, 200.0f));
+        ab.abOx = objs[0].GetF(11u, 0.0f);
+        ab.abOy = objs[0].GetF(12u, 0.0f);
+
+        ab.typeKeys.resize(compEnd, 0u);
+        ab.parentIds.resize(compEnd, 0u);
+        ab.nodes.resize(compEnd);
+        ab.childrenOf.resize(compEnd);
+        ab.pathDataIndex.assign(compEnd, -1);
+        ab.nodeClips.resize(compEnd);
+        ab.shapePaintIndex.assign(compEnd, -1);
+
+        for (std::size_t i = 0u; i < compEnd; ++i) {
+            const RivObject& o = objs[i];
+            const std::uint32_t tk = o.typeKey;
+            ab.typeKeys[i] = tk;
+            const std::uint32_t pid = (i == 0u) ? 0u : o.GetU(5u, 0u);
+            ab.parentIds[i] = pid;
+            if (i > 0u && pid < compEnd) {
+                ab.childrenOf[pid].push_back(i);
+            }
+            PrebuiltNodeBase nb{};
+            nb.x = (tk == 41u) ? o.GetF(90u, 0.0f) : o.GetF(13u, 0.0f);
+            nb.y = (tk == 41u) ? o.GetF(91u, 0.0f) : o.GetF(14u, 0.0f);
+            nb.rot = o.GetF(15u, 0.0f);
+            nb.sx = o.GetF(16u, 1.0f);
+            nb.sy = o.GetF(17u, 1.0f);
+            nb.opacity = std::clamp(o.GetF(18u, 1.0f), 0.0f, 1.0f);
+            nb.boneLen = (tk == 40u) ? o.GetF(89u, 0.0f) : 0.0f;
+            nb.hidden = (o.GetU(129u, 0u) & 1u) != 0u ? 1u : 0u;
+            nb.targetAb = (tk == 92u) ? o.GetU(197u, 0xFFFFFFFFu) : 0xFFFFFFFFu;
+            ab.nodes[i] = nb;
+        }
+
+        // Precompute ancestor clip flags and per-node clips
+        for (std::size_t i = 0u; i < compEnd; ++i) {
+            for (std::size_t ch : ab.childrenOf[i]) {
+                if (ab.typeKeys[ch] == 42u) {
+                    PrebuiltClipRef cr{};
+                    cr.clipObjIdx = static_cast<std::uint32_t>(ch);
+                    cr.enabled = (objs[ch].GetU(94u, 1u) != 0u);
+                    cr.srcId = objs[ch].GetU(92u, 0xFFFFFFFFu);
+                    cr.evenOdd = (objs[ch].GetU(93u, 0u) != 0u);
+                    ab.nodeClips[i].push_back(cr);
+                }
+            }
+        }
+        ab.hasClipInAncestors.assign(compEnd, 0u);
+        auto propagateClips = [&](auto& self, std::size_t idx, std::uint8_t parentClip) -> void {
+            const std::uint8_t hasHere = (parentClip || !ab.nodeClips[idx].empty()) ? 1u : 0u;
+            ab.hasClipInAncestors[idx] = hasHere;
+            for (std::size_t ch : ab.childrenOf[idx]) {
+                self(self, ch, hasHere);
+            }
+        };
+        if (compEnd > 0u) {
+            propagateClips(propagateClips, 0u, 0u);
+        }
+
+        // Prebuild path geometry & skinning tables
+        for (std::size_t i = 0u; i < compEnd; ++i) {
+            const std::uint32_t tk = ab.typeKeys[i];
+            if (tk != 16u && tk != 7u && tk != 4u && tk != 8u) {
+                continue;
+            }
+            const std::int32_t pIndex = static_cast<std::int32_t>(ab.paths.size());
+            ab.pathDataIndex[i] = pIndex;
+            PrebuiltPathData pd{};
+            pd.objIdx = static_cast<std::uint32_t>(i);
+            pd.tk = tk;
+            if (tk == 16u) {
+                pd.closed = (objs[i].GetU(32u, 0u) != 0u);
+                std::size_t skinIdx = 0u;
+                for (std::size_t sc : ab.childrenOf[i]) {
+                    if (ab.typeKeys[sc] == 43u) {
+                        skinIdx = sc;
+                        break;
+                    }
+                }
+                if (skinIdx != 0u) {
+                    RivMat2D skinBind{};
+                    skinBind.xx = objs[skinIdx].GetF(104u, 1.0f);
+                    skinBind.yx = objs[skinIdx].GetF(105u, 0.0f);
+                    skinBind.xy = objs[skinIdx].GetF(106u, 0.0f);
+                    skinBind.yy = objs[skinIdx].GetF(107u, 1.0f);
+                    skinBind.tx = objs[skinIdx].GetF(108u, 0.0f);
+                    skinBind.ty = objs[skinIdx].GetF(109u, 0.0f);
+                    pd.skinBones.push_back(PrebuiltSkinBone{0u, RivMat2D{0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f}});
+                    for (std::size_t tc : ab.childrenOf[skinIdx]) {
+                        if (ab.typeKeys[tc] != 44u) continue;
+                        const std::uint32_t boneId = objs[tc].GetU(95u, 0u);
+                        RivMat2D tBind{};
+                        tBind.xx = objs[tc].GetF(96u, 1.0f);
+                        tBind.yx = objs[tc].GetF(97u, 0.0f);
+                        tBind.xy = objs[tc].GetF(98u, 0.0f);
+                        tBind.yy = objs[tc].GetF(99u, 1.0f);
+                        tBind.tx = objs[tc].GetF(100u, 0.0f);
+                        tBind.ty = objs[tc].GetF(101u, 0.0f);
+                        pd.skinBones.push_back(PrebuiltSkinBone{
+                            boneId,
+                            RivMat2D::Multiply(RivMat2D::Invert(tBind), skinBind)});
+                    }
+                }
+                for (std::size_t vc : ab.childrenOf[i]) {
+                    const std::uint32_t vtk = ab.typeKeys[vc];
+                    if (vtk != 5u && vtk != 6u && vtk != 34u && vtk != 35u) continue;
+                    PrebuiltVertex pv{};
+                    pv.objIdx = static_cast<std::uint32_t>(vc);
+                    pv.vtk = vtk;
+                    pv.x = objs[vc].GetF(24u, 0.0f);
+                    pv.y = objs[vc].GetF(25u, 0.0f);
+                    if (vtk == 5u) {
+                        pv.p0 = objs[vc].GetF(26u, 0.0f);
+                    } else if (vtk == 6u) {
+                        pv.p0 = objs[vc].GetF(84u, 0.0f);
+                        pv.p1 = objs[vc].GetF(85u, 0.0f);
+                        pv.p2 = objs[vc].GetF(86u, 0.0f);
+                        pv.p3 = objs[vc].GetF(87u, 0.0f);
+                    } else if (vtk == 34u) {
+                        pv.p0 = objs[vc].GetF(79u, 0.0f);
+                        pv.p1 = objs[vc].GetF(80u, 0.0f);
+                        pv.p2 = objs[vc].GetF(81u, 0.0f);
+                    } else if (vtk == 35u) {
+                        pv.p0 = objs[vc].GetF(82u, 0.0f);
+                        pv.p1 = objs[vc].GetF(83u, 0.0f);
+                    }
+                    for (std::size_t wc : ab.childrenOf[vc]) {
+                        const std::uint32_t wtk = ab.typeKeys[wc];
+                        if (wtk == 45u || wtk == 46u) {
+                            pv.weightObjIdx = static_cast<std::uint32_t>(wc);
+                            pv.weightTk = wtk;
+                            pv.vVals = objs[wc].GetU(102u, 255u);
+                            pv.vIdxs = objs[wc].GetU(103u, 1u);
+                            if (wtk == 46u) {
+                                pv.inVals = objs[wc].GetU(110u, 255u);
+                                pv.inIdxs = objs[wc].GetU(111u, 1u);
+                                pv.outVals = objs[wc].GetU(112u, 255u);
+                                pv.outIdxs = objs[wc].GetU(113u, 1u);
+                            }
+                            break;
+                        }
+                    }
+                    pd.verts.push_back(pv);
+                }
+            } else {
+                pd.w = objs[i].GetF(20u, 0.0f);
+                pd.h = objs[i].GetF(21u, 0.0f);
+                pd.ox = objs[i].GetF(123u, 0.5f);
+                pd.oy = objs[i].GetF(124u, 0.5f);
+                if (tk == 7u) {
+                    pd.rTL = objs[i].GetF(31u, 0.0f);
+                    pd.linked = (objs[i].GetU(164u, 1u) != 0u);
+                    pd.rTR = pd.linked ? pd.rTL : objs[i].GetF(161u, pd.rTL);
+                    pd.rBL = pd.linked ? pd.rTL : objs[i].GetF(162u, pd.rTL);
+                    pd.rBR = pd.linked ? pd.rTL : objs[i].GetF(163u, pd.rTL);
+                }
+            }
+            ab.paths.push_back(std::move(pd));
+        }
+
+        // Prebuild Artboard background paints and per-shape paints + descending renderOrder
+        for (std::size_t bgPaintIdx : ab.childrenOf[0]) {
+            if (ab.typeKeys[bgPaintIdx] == 20u) {
+                ab.bgPaints.push_back(BuildPrebuiltPaintDef(objs, ab.childrenOf, bgPaintIdx));
+            }
+        }
+        for (std::size_t i = compEnd; i-- > 1u;) {
+            const std::uint32_t tk = ab.typeKeys[i];
+            if (tk != 92u && tk != 3u) continue;
+            ab.renderOrder.push_back(i);
+            if (tk == 3u) {
+                std::vector<PrebuiltPaintDef> sp;
+                for (std::size_t pIdx : ab.childrenOf[i]) {
+                    const std::uint32_t ptk = ab.typeKeys[pIdx];
+                    if (ptk == 20u || ptk == 24u) {
+                        sp.push_back(BuildPrebuiltPaintDef(objs, ab.childrenOf, pIdx));
+                    }
+                }
+                ab.shapePaintIndex[i] = static_cast<std::int32_t>(ab.shapePaints.size());
+                ab.shapePaints.push_back(std::move(sp));
+            }
+        }
+
+        // Pre-parse animations (tk == 31u)
+        for (std::size_t i = compEnd; i < objs.size(); ++i) {
+            if (objs[i].typeKey == 31u) {
+                PrebuiltAnimation anim{};
+                const RivObject& ao = objs[i];
+                anim.timing.fps = static_cast<float>(std::max(1u, ao.GetU(56u, 60u)));
+                const std::uint32_t durFrames = std::max(1u, ao.GetU(57u, 60u));
+                anim.timing.speed = ao.GetF(58u, 1.0f);
+                if (std::fabs(anim.timing.speed) < 1e-4f) anim.timing.speed = 1.0f;
+                anim.timing.loop = ao.GetU(59u, 0u);
+                const bool enWork = ao.GetU(62u, 0u) != 0u;
+                const std::uint32_t ws = ao.GetU(60u, 0u);
+                const std::uint32_t we = ao.GetU(61u, 0u);
+                anim.timing.fStart = enWork ? static_cast<float>(ws) : 0.0f;
+                anim.timing.fEnd = (enWork && we > ws) ? static_cast<float>(we) : static_cast<float>(durFrames);
+                anim.timing.fSpan = std::max(1.0f, anim.timing.fEnd - anim.timing.fStart);
+                anim.timing.durationSec = anim.timing.fSpan / std::max(1.0f, anim.timing.fps * std::fabs(anim.timing.speed));
+
+                std::size_t curTargetObj = 0xFFFFFFFFu;
+                std::uint32_t curPropKey = 0u;
+                std::vector<PrebuiltKfEntry> propKfs;
+                auto flushKfs = [&]() {
+                    if (!propKfs.empty() && curTargetObj < compEnd && curPropKey != 0u) {
+                        PrebuiltPropTrack trk{};
+                        trk.targetObj = curTargetObj;
+                        trk.propKey = curPropKey;
+                        trk.kfs = std::move(propKfs);
+                        anim.tracks.push_back(std::move(trk));
+                    }
+                    propKfs.clear();
+                };
+                for (std::size_t k = i + 1u; k < objs.size(); ++k) {
+                    const std::uint32_t tk = objs[k].typeKey;
+                    if (tk == 31u || tk == 53u) break;
+                    if (tk == 25u) {
+                        flushKfs();
+                        curTargetObj = objs[k].GetU(51u, 0xFFFFFFFFu);
+                        curPropKey = 0u;
+                    } else if (tk == 26u) {
+                        flushKfs();
+                        curPropKey = objs[k].GetU(53u, 0u);
+                    } else if (tk == 30u || tk == 37u || tk == 50u || tk == 84u) {
+                        PrebuiltKfEntry e{};
+                        e.tk = tk;
+                        e.frame = static_cast<float>(objs[k].GetU(67u, 0u));
+                        e.interp = objs[k].GetU(68u, 0u);
+                        e.interpId = objs[k].GetU(69u, 0u);
+                        if (tk == 30u) e.fVal = objs[k].GetF(70u, 0.0f);
+                        else if (tk == 37u) e.uVal = objs[k].GetU(88u, 0u);
+                        else e.uVal = objs[k].GetU(122u, 0u);
+                        propKfs.push_back(e);
+                    }
+                }
+                flushKfs();
+                ab.animations.push_back(std::move(anim));
+            } else if (objs[i].typeKey == 53u) {
+                PrebuiltStateMachine sm{};
+                for (std::size_t k = i + 1u; k < objs.size(); ++k) {
+                    const std::uint32_t tk = objs[k].typeKey;
+                    if (tk == 53u) break;
+                    if (tk == 56u || tk == 58u || tk == 59u) {
+                        PrebuiltSmInput inp{};
+                        inp.name = std::string(objs[k].GetS(138u));
+                        if (tk == 56u) inp.defaultVal = objs[k].GetF(140u, 0.0f);
+                        else if (tk == 59u) inp.defaultVal = objs[k].GetU(141u, 0u) != 0u ? 1.0f : 0.0f;
+                        sm.inputs.push_back(std::move(inp));
+                    }
+                }
+                for (std::size_t k = i + 1u; k < objs.size(); ++k) {
+                    if (objs[k].typeKey == 53u) break;
+                    if (objs[k].typeKey != 57u) continue;
+                    PrebuiltSmLayer layer{};
+                    std::size_t p = k + 1u;
+                    for (; p < objs.size(); ++p) {
+                        const std::uint32_t tk = objs[p].typeKey;
+                        if (tk == 57u || tk == 53u) break;
+                        if (tk == 61u || tk == 62u || tk == 63u || tk == 64u || tk == 73u || tk == 74u) {
+                            PrebuiltSmLayerState st{};
+                            st.tk = tk;
+                            if (tk == 61u) st.animId = objs[p].GetU(149u, 0u);
+                            if (tk == 63u && layer.entryState == 0u) layer.entryState = layer.states.size();
+                            layer.states.push_back(std::move(st));
+                        } else if ((tk == 65u || tk == 78u) && !layer.states.empty()) {
+                            PrebuiltSmTransition tr{};
+                            tr.toState = objs[p].GetU(151u, 0u);
+                            tr.flags = objs[p].GetU(152u, 0u);
+                            tr.exitTime = objs[p].GetF(160u, 0.0f);
+                            layer.states.back().transitions.push_back(std::move(tr));
+                        } else if ((tk == 67u || tk == 68u || tk == 69u || tk == 70u || tk == 71u) &&
+                                   !layer.states.empty() && !layer.states.back().transitions.empty()) {
+                            const std::uint32_t inpId = objs[p].GetU(155u, 0u);
+                            const std::uint32_t op = objs[p].GetU(156u, 0u);
+                            const float defV = (tk == 68u || tk == 71u) ? 1.0f : 0.0f;
+                            const float cv = objs[p].Has(157u) ? objs[p].GetF(157u, 0.0f) : defV;
+                            layer.states.back().transitions.back().conds.emplace_back(inpId, op, cv);
+                        }
+                    }
+                    for (std::size_t si = 0u; si < layer.states.size(); ++si) {
+                        if (layer.states[si].tk == 63u) {
+                            layer.entryState = si;
+                            break;
+                        }
+                    }
+                    sm.layers.push_back(std::move(layer));
+                    k = p - 1u;
+                }
+                ab.stateMachines.push_back(std::move(sm));
+            }
+        }
+    }
+    return doc;
+}
+
+// Flat zero-alloc intrusive override table (replaces std::unordered_map)
+struct RivOverrideTable {
+    struct OvEntry {
+        std::uint32_t objIdx = 0u;
+        std::uint32_t propKey = 0u;
+        float f = 0.0f;
+        std::uint64_t u = 0u;
+        std::uint8_t kind = 0u;
+        std::int32_t next = -1;
+    };
+
+    std::vector<std::int32_t> headOfObj;
+    std::vector<std::uint32_t> dirtyObjs;
+    std::vector<OvEntry> pool;
+
+    void Reset(std::size_t compEnd) {
+        if (headOfObj.size() != compEnd) {
+            headOfObj.assign(compEnd, -1);
+        } else {
+            for (const std::uint32_t idx : dirtyObjs) {
+                if (idx < headOfObj.size()) {
+                    headOfObj[idx] = -1;
+                }
+            }
+        }
+        dirtyObjs.clear();
+        pool.clear();
+    }
+
+    void Set(std::size_t objIdx, std::uint32_t propKey, const RivPropVal& pv) {
+        if (objIdx >= headOfObj.size()) return;
+        std::int32_t cur = headOfObj[objIdx];
+        if (cur < 0) {
+            dirtyObjs.push_back(static_cast<std::uint32_t>(objIdx));
+        } else {
+            while (cur >= 0) {
+                OvEntry& e = pool[static_cast<std::size_t>(cur)];
+                if (e.propKey == propKey) {
+                    e.f = pv.f;
+                    e.u = pv.u;
+                    e.kind = pv.kind;
+                    return;
+                }
+                cur = e.next;
+            }
+        }
+        const auto newIdx = static_cast<std::int32_t>(pool.size());
+        pool.push_back(OvEntry{
+            static_cast<std::uint32_t>(objIdx),
+            propKey,
+            pv.f,
+            pv.u,
+            pv.kind,
+            headOfObj[objIdx]});
+        headOfObj[objIdx] = newIdx;
+    }
+
+    [[nodiscard]] bool IsDirty(std::size_t objIdx) const noexcept {
+        return objIdx < headOfObj.size() && headOfObj[objIdx] >= 0;
+    }
+
+    [[nodiscard]] std::uint32_t GetU(std::size_t objIdx, std::uint32_t k, std::uint32_t defVal) const noexcept {
+        if (objIdx < headOfObj.size()) {
+            std::int32_t cur = headOfObj[objIdx];
+            while (cur >= 0) {
+                const OvEntry& e = pool[static_cast<std::size_t>(cur)];
+                if (e.propKey == k) {
+                    return static_cast<std::uint32_t>(e.u);
+                }
+                cur = e.next;
+            }
+        }
+        return defVal;
+    }
+
+    [[nodiscard]] float GetF(std::size_t objIdx, std::uint32_t k, float defVal) const noexcept {
+        if (objIdx < headOfObj.size()) {
+            std::int32_t cur = headOfObj[objIdx];
+            while (cur >= 0) {
+                const OvEntry& e = pool[static_cast<std::size_t>(cur)];
+                if (e.propKey == k) {
+                    return e.f;
+                }
+                cur = e.next;
+            }
+        }
+        return defVal;
+    }
+};
+
+using RivInputPairs = std::vector<std::pair<std::string_view, float>>;
+
+[[nodiscard]] float LookupInputVal(
+    const RivInputPairs& inputs,
+    std::string_view name,
+    float defVal) noexcept {
+    for (const auto& [k, v] : inputs) {
+        if (k == name) return v;
+    }
+    return defVal;
+}
+
+void EvaluatePrebuiltAnimation(
+    const PrebuiltArtboard& ab,
+    std::size_t animIdx,
+    float timeSec,
+    RivOverrideTable& overrides) {
+    if (animIdx >= ab.animations.size()) return;
+    const PrebuiltAnimation& anim = ab.animations[animIdx];
+    const PrebuiltTimingInfo& ti = anim.timing;
+    const float rawFrames = std::max(0.0f, timeSec) * ti.fps * std::fabs(ti.speed);
+    float curFrame = ti.fStart;
+    if (ti.loop == 1u) {
+        float m = std::fmod(rawFrames, ti.fSpan);
+        if (m < 0.0f) m += ti.fSpan;
+        curFrame = ti.fStart + m;
+    } else if (ti.loop == 2u) {
+        const float cyc = std::fmod(rawFrames, 2.0f * ti.fSpan);
+        curFrame = ti.fStart + ((cyc <= ti.fSpan) ? cyc : (2.0f * ti.fSpan - cyc));
+    } else {
+        curFrame = std::clamp(ti.fStart + rawFrames, ti.fStart, ti.fEnd);
+    }
+
+    for (const PrebuiltPropTrack& trk : anim.tracks) {
+        const auto& propKfs = trk.kfs;
+        if (propKfs.empty()) continue;
+        const PrebuiltKfEntry* k0 = &propKfs.front();
+        const PrebuiltKfEntry* k1 = &propKfs.front();
+        float localT = 0.0f;
+        if (curFrame <= propKfs.front().frame || propKfs.size() == 1u) {
+            k0 = k1 = &propKfs.front();
+        } else if (curFrame >= propKfs.back().frame) {
+            k0 = k1 = &propKfs.back();
+        } else {
+            std::size_t hitIdx = 0u;
+            if (propKfs.size() > 8u) {
+                const auto it = std::upper_bound(
+                    propKfs.begin(), propKfs.end(), curFrame,
+                    [](float fVal, const PrebuiltKfEntry& kf) { return fVal < kf.frame; });
+                const std::size_t hi = static_cast<std::size_t>(it - propKfs.begin());
+                hitIdx = (hi > 0u) ? std::min(hi - 1u, propKfs.size() - 2u) : 0u;
+            } else {
+                for (std::size_t i = 0u; i + 1u < propKfs.size(); ++i) {
+                    if (curFrame >= propKfs[i].frame && curFrame < propKfs[i + 1u].frame) {
+                        hitIdx = i;
+                        break;
+                    }
+                }
+            }
+            k0 = &propKfs[hitIdx];
+            k1 = &propKfs[hitIdx + 1u];
+            const float span = k1->frame - k0->frame;
+            if (span > 1e-4f && k0->interp != 1u) {
+                const float u = (curFrame - k0->frame) / span;
+                localT = (k0->interp == 2u) ? EvalCubicEase(ab.cubicInterps, k0->interpId, u) : u;
+            }
+        }
+        RivPropVal pv{};
+        if (k0->tk == 30u) {
+            pv.kind = 2u;
+            pv.f = k0->fVal + (k1->fVal - k0->fVal) * localT;
+            pv.u = static_cast<std::uint64_t>(std::max(0.0f, pv.f));
+        } else if (k0->tk == 37u) {
+            pv.kind = 3u;
+            pv.u = (k0 == k1 || k0->interp == 1u)
+                ? k0->uVal
+                : LerpArgb(static_cast<std::uint32_t>(k0->uVal), static_cast<std::uint32_t>(k1->uVal), localT);
+        } else {
+            pv.kind = 0u;
+            pv.u = k0->uVal;
+            pv.f = static_cast<float>(pv.u);
+        }
+        overrides.Set(trk.targetObj, trk.propKey, pv);
+    }
+}
+
+void EvaluateArtboardOverrides(
+    const PrebuiltArtboard& ab,
+    float tLoopSec,
+    float tStateSec,
+    const RivInputPairs& inputs,
+    RivOverrideTable& overrides) {
+    overrides.Reset(ab.compEnd);
+    if (!ab.stateMachines.empty()) {
+        const PrebuiltStateMachine& sm = ab.stateMachines.front();
+        float stackInputs[32];
+        std::vector<float> heapInputs;
+        float* smInputVals = stackInputs;
+        const std::size_t inpCount = sm.inputs.size();
+        if (inpCount > 32u) {
+            heapInputs.resize(inpCount);
+            smInputVals = heapInputs.data();
+        }
+        for (std::size_t ii = 0u; ii < inpCount; ++ii) {
+            smInputVals[ii] = LookupInputVal(inputs, sm.inputs[ii].name, sm.inputs[ii].defaultVal);
+        }
+        auto evalConds = [&](const PrebuiltSmTransition& tr) -> bool {
+            for (const auto& [inpId, op, cval] : tr.conds) {
+                if (inpId >= inpCount) return false;
+                const float iv = smInputVals[inpId];
+                if (op == 0u && !(std::fabs(iv - cval) < 0.01f)) return false;
+                if (op == 1u && !(std::fabs(iv - cval) >= 0.01f)) return false;
+                if (op == 2u && !(iv < cval)) return false;
+                if (op == 3u && !(iv <= cval)) return false;
+                if (op == 4u && !(iv > cval)) return false;
+                if (op == 5u && !(iv >= cval)) return false;
+            }
+            return true;
+        };
+        for (const PrebuiltSmLayer& layer : sm.layers) {
+            const auto& states = layer.states;
+            std::size_t curState = layer.entryState;
+            float remStateTime = tStateSec;
+            for (int hop = 0; hop < 8 && curState < states.size(); ++hop) {
+                bool moved = false;
+                const bool isEntry = (states[curState].tk == 63u);
+                float curStateDur = 0.0f;
+                if (!isEntry && states[curState].animId < ab.animations.size()) {
+                    curStateDur = ab.animations[states[curState].animId].timing.durationSec;
+                }
+                for (const auto& tr : states[curState].transitions) {
+                    if (tr.toState >= states.size() || tr.toState == curState) continue;
+                    const bool needsExit = !isEntry && (tr.conds.empty() || (tr.flags & 4u) != 0u);
+                    float reqSec = 0.0f;
+                    if (needsExit) {
+                        if (tr.exitTime <= 0.0f) reqSec = curStateDur;
+                        else if ((tr.flags & 8u) != 0u) reqSec = curStateDur * std::clamp(tr.exitTime * 0.01f, 0.0f, 1.0f);
+                        else reqSec = std::min(curStateDur, tr.exitTime * 0.001f);
+                        if (remStateTime + 1e-4f < reqSec) continue;
+                    }
+                    if (evalConds(tr)) {
+                        curState = tr.toState;
+                        if (reqSec > 0.0f) remStateTime = std::max(0.0f, remStateTime - reqSec);
+                        moved = true;
+                        break;
+                    }
+                }
+                if (!moved) {
+                    for (const auto& st : states) {
+                        if (st.tk != 62u) continue;
+                        for (const auto& tr : st.transitions) {
+                            if (!tr.conds.empty() && tr.toState < states.size() && tr.toState != curState && evalConds(tr)) {
+                                curState = tr.toState;
+                                moved = true;
+                                break;
+                            }
+                        }
+                        if (moved) break;
+                    }
+                }
+                if (!moved) break;
+            }
+            if (curState < states.size() && states[curState].animId < ab.animations.size()) {
+                const std::size_t aIdx = states[curState].animId;
+                const float useTime = (ab.animations[aIdx].timing.loop != 0u) ? tLoopSec : remStateTime;
+                EvaluatePrebuiltAnimation(ab, aIdx, useTime, overrides);
+            }
+        }
+    } else if (!ab.animations.empty()) {
+        const float useTime = (ab.animations[0].timing.loop != 0u) ? tLoopSec : tStateSec;
+        EvaluatePrebuiltAnimation(ab, 0u, useTime, overrides);
+    }
+}
+
+struct EvaluatedArtboardTree {
+    std::size_t abIndex = 0u;
+    RivOverrideTable overrides;
+    std::vector<RivMat2D> worldMats;
+    std::vector<float> worldOpacity;
+    std::vector<std::uint8_t> worldHidden;
+    std::vector<std::pair<std::size_t, EvaluatedArtboardTree>> nestedChildren; // (objectIdx, child)
+};
+
+inline void HashMix64(std::uint64_t& h, std::uint64_t v) noexcept {
+    h ^= v + 0x9E3779B97F4A7C15ULL + (h << 6u) + (h >> 2u);
+}
+
+void BuildEvaluatedTreeRecursive(
+    const PrebuiltRiveDocument& doc,
+    std::size_t abIndex,
+    const RivMat2D& rootTransform,
+    float inheritedOpacity,
+    float tLoopSec,
+    float tStateSec,
+    const RivInputPairs& inputs,
+    int depth,
+    EvaluatedArtboardTree& outNode,
+    std::uint64_t& ioPoseHash) {
+    if (abIndex >= doc.artboards.size() || depth > 5) return;
+    const PrebuiltArtboard& ab = doc.artboards[abIndex];
+    const std::size_t compEnd = ab.compEnd;
+    if (compEnd == 0u) return;
+
+    outNode.abIndex = abIndex;
+    EvaluateArtboardOverrides(ab, tLoopSec, tStateSec, inputs, outNode.overrides);
+
+    HashMix64(ioPoseHash, static_cast<std::uint64_t>(abIndex));
+    if (!outNode.overrides.pool.empty()) {
+        for (const auto& e : outNode.overrides.pool) {
+            HashMix64(ioPoseHash, (static_cast<std::uint64_t>(e.objIdx) << 32u) | e.propKey);
+            std::uint32_t fbits = 0u;
+            std::memcpy(&fbits, &e.f, 4u);
+            HashMix64(ioPoseHash, (static_cast<std::uint64_t>(e.kind) << 32u) | fbits);
+            HashMix64(ioPoseHash, e.u);
+        }
+    } else {
+        HashMix64(ioPoseHash, 0xA5A5A5A5ULL);
+    }
+
+    const auto& tks = ab.typeKeys;
+    const auto& nodes = ab.nodes;
+    const auto& ov = outNode.overrides;
+    outNode.worldMats.resize(compEnd);
+    outNode.worldOpacity.assign(compEnd, inheritedOpacity);
+    outNode.worldHidden.assign(compEnd, 0u);
+    outNode.worldMats[0] = (depth == 0)
+        ? RivMat2D::Multiply(rootTransform, RivMat2D::FromTRS(ab.abOx * ab.natW, ab.abOy * ab.natH, 0.0f, 1.0f, 1.0f))
+        : rootTransform;
+
+    auto computeTransform = [&](auto& self, std::size_t idx) -> void {
+        for (std::size_t ch : ab.childrenOf[idx]) {
+            const std::uint32_t tk = tks[ch];
+            const PrebuiltNodeBase& nb = nodes[ch];
+            float lx = nb.x;
+            float ly = nb.y;
+            float rot = nb.rot;
+            float sx = nb.sx;
+            float sy = nb.sy;
+            float op = nb.opacity;
+            bool selfHidden = (nb.hidden != 0u);
+            if (ov.IsDirty(ch)) {
+                if (tk == 41u) {
+                    lx = ov.GetF(ch, 90u, nb.x);
+                    ly = ov.GetF(ch, 91u, nb.y);
+                } else {
+                    lx = ov.GetF(ch, 13u, nb.x);
+                    ly = ov.GetF(ch, 14u, nb.y);
+                }
+                rot = ov.GetF(ch, 15u, nb.rot);
+                sx = ov.GetF(ch, 16u, nb.sx);
+                sy = ov.GetF(ch, 17u, nb.sy);
+                op = std::clamp(ov.GetF(ch, 18u, nb.opacity), 0.0f, 1.0f);
+                selfHidden = (ov.GetU(ch, 129u, nb.hidden) & 1u) != 0u;
+            }
+            if (tk == 40u && tks[idx] == 40u) {
+                lx = ov.IsDirty(idx) ? ov.GetF(idx, 89u, nodes[idx].boneLen) : nodes[idx].boneLen;
+                ly = 0.0f;
+            }
+
+            outNode.worldMats[ch] = RivMat2D::Multiply(outNode.worldMats[idx], RivMat2D::FromTRS(lx, ly, rot, sx, sy));
+            outNode.worldOpacity[ch] = outNode.worldOpacity[idx] * op;
+            outNode.worldHidden[ch] = (outNode.worldHidden[idx] || selfHidden) ? 1u : 0u;
+
+            if (tk == 92u && !outNode.worldHidden[ch] && outNode.worldOpacity[ch] > 0.002f) {
+                const std::uint32_t targetAb = ov.IsDirty(ch) ? ov.GetU(ch, 197u, nb.targetAb) : nb.targetAb;
+                if (targetAb < doc.artboards.size() && targetAb != abIndex) {
+                    const PrebuiltArtboard& childAb = doc.artboards[targetAb];
+                    const RivMat2D nestedWorld = RivMat2D::Multiply(
+                        outNode.worldMats[ch],
+                        RivMat2D::FromTRS(-childAb.abOx * childAb.natW, -childAb.abOy * childAb.natH, 0.0f, 1.0f, 1.0f));
+                    outNode.nestedChildren.emplace_back(ch, EvaluatedArtboardTree{});
+                    BuildEvaluatedTreeRecursive(
+                        doc, targetAb, nestedWorld, outNode.worldOpacity[ch],
+                        tLoopSec, tStateSec, inputs, depth + 1,
+                        outNode.nestedChildren.back().second, ioPoseHash);
+                }
+            }
+            self(self, ch);
+        }
+    };
+    computeTransform(computeTransform, 0u);
+}
+
+// ============================================================================
+// Vector Geometry Helpers
+// ============================================================================
+
 void FlattenCubic(
     RivVec2 p0, RivVec2 p1, RivVec2 p2, RivVec2 p3,
     int depth, std::vector<RivVec2>& out) {
@@ -245,7 +1272,7 @@ void FlattenCubic(
     const float dy = p3.y - p0.y;
     const float d2 = std::fabs((p1.x - p3.x) * dy - (p1.y - p3.y) * dx);
     const float d3 = std::fabs((p2.x - p3.x) * dy - (p2.y - p3.y) * dx);
-    if (depth >= 7 || (d2 + d3) * (d2 + d3) <= 0.16f * (dx * dx + dy * dy + 1.0f)) {
+    if (depth >= 5 || (d2 + d3) * (d2 + d3) <= 0.55f * (dx * dx + dy * dy + 1.0f)) {
         out.push_back(p3);
         return;
     }
@@ -308,111 +1335,6 @@ RivSubpath BuildEllipseSubpath(float ox, float oy, float w, float h) {
     return sp;
 }
 
-void ExpandStrokeToSubpaths(
-    const std::vector<RivSubpath>& src,
-    float halfW,
-    std::uint32_t cap,
-    std::vector<RivSubpath>& out) {
-    if (halfW <= 0.02f) return;
-    for (const RivSubpath& sp : src) {
-        if (sp.pts.size() < 2u) continue;
-        std::vector<RivVec2> clean;
-        clean.reserve(sp.pts.size());
-        for (const RivVec2& p : sp.pts) {
-            if (clean.empty() || std::hypot(p.x - clean.back().x, p.y - clean.back().y) > 0.02f) {
-                clean.push_back(p);
-            }
-        }
-        if (sp.closed && clean.size() >= 2u &&
-            std::hypot(clean.front().x - clean.back().x, clean.front().y - clean.back().y) <= 0.02f) {
-            clean.pop_back();
-        }
-        if (clean.size() < 2u) continue;
-
-        const std::size_t n = clean.size();
-        const std::size_t segCount = sp.closed ? n : (n - 1u);
-        std::vector<RivVec2> normals(segCount);
-        for (std::size_t i = 0u; i < segCount; ++i) {
-            const RivVec2 a = clean[i];
-            const RivVec2 b = clean[(i + 1u) % n];
-            const float dx = b.x - a.x;
-            const float dy = b.y - a.y;
-            const float len = std::max(1e-4f, std::hypot(dx, dy));
-            normals[i] = {-dy / len, dx / len};
-        }
-
-        RivSubpath poly{};
-        poly.closed = true;
-        std::vector<RivVec2> leftSide;
-        std::vector<RivVec2> rightSide;
-        leftSide.reserve(n * 3u);
-        rightSide.reserve(n * 3u);
-
-        auto addJoin = [&](RivVec2 pt, RivVec2 n0, RivVec2 n1, std::vector<RivVec2>& side, float sign) {
-            RivVec2 m{n0.x + n1.x, n0.y + n1.y};
-            const float mlen2 = m.x * m.x + m.y * m.y;
-            if (mlen2 > 0.25f) {
-                const float scale = std::min(2.2f, 2.0f / mlen2);
-                side.push_back({pt.x + sign * m.x * scale * halfW, pt.y + sign * m.y * scale * halfW});
-            } else {
-                side.push_back({pt.x + sign * n0.x * halfW, pt.y + sign * n0.y * halfW});
-                side.push_back({pt.x + sign * n1.x * halfW, pt.y + sign * n1.y * halfW});
-            }
-        };
-
-        for (std::size_t i = 0u; i < n; ++i) {
-            if (!sp.closed && i == 0u) {
-                const RivVec2 n0 = normals[0];
-                leftSide.push_back({clean[0].x + n0.x * halfW, clean[0].y + n0.y * halfW});
-                rightSide.push_back({clean[0].x - n0.x * halfW, clean[0].y - n0.y * halfW});
-            } else if (!sp.closed && i == n - 1u) {
-                const RivVec2 n0 = normals[segCount - 1u];
-                leftSide.push_back({clean[i].x + n0.x * halfW, clean[i].y + n0.y * halfW});
-                rightSide.push_back({clean[i].x - n0.x * halfW, clean[i].y - n0.y * halfW});
-            } else {
-                const RivVec2 nPrev = normals[(i + segCount - 1u) % segCount];
-                const RivVec2 nNext = normals[i % segCount];
-                addJoin(clean[i], nPrev, nNext, leftSide, 1.0f);
-                addJoin(clean[i], nPrev, nNext, rightSide, -1.0f);
-            }
-        }
-
-        if (sp.closed) {
-            poly.pts = std::move(leftSide);
-            out.push_back(std::move(poly));
-            RivSubpath inner{};
-            inner.closed = true;
-            std::reverse(rightSide.begin(), rightSide.end());
-            inner.pts = std::move(rightSide);
-            out.push_back(std::move(inner));
-        } else {
-            poly.pts = std::move(leftSide);
-            if (cap == 1u) {
-                const RivVec2 pEnd = clean.back();
-                const RivVec2 nEnd = normals.back();
-                const float baseAng = std::atan2(nEnd.y, nEnd.x);
-                for (int s = 1; s < 6; ++s) {
-                    const float a = baseAng - kPi * (static_cast<float>(s) / 6.0f);
-                    poly.pts.push_back({pEnd.x + std::cos(a) * halfW, pEnd.y + std::sin(a) * halfW});
-                }
-            }
-            for (std::size_t k = rightSide.size(); k > 0u; --k) {
-                poly.pts.push_back(rightSide[k - 1u]);
-            }
-            if (cap == 1u) {
-                const RivVec2 pStart = clean.front();
-                const RivVec2 nStart = normals.front();
-                const float baseAng = std::atan2(-nStart.y, -nStart.x);
-                for (int s = 1; s < 6; ++s) {
-                    const float a = baseAng - kPi * (static_cast<float>(s) / 6.0f);
-                    poly.pts.push_back({pStart.x + std::cos(a) * halfW, pStart.y + std::sin(a) * halfW});
-                }
-            }
-            out.push_back(std::move(poly));
-        }
-    }
-}
-
 void AppendTrimmedSubpathSegment(
     const RivSubpath& sp,
     const std::vector<float>& cumDist,
@@ -457,7 +1379,7 @@ void AppendTrimmedSubpathSegment(
             seg.pts.push_back(sp.pts[v]);
         }
     }
-    if (std::hypot(pEnd.x - seg.pts.back().x, pEnd.y - seg.pts.back().y) > 1e-5f) {
+    if (FastHypot(pEnd.x - seg.pts.back().x, pEnd.y - seg.pts.back().y) > 1e-5f) {
         seg.pts.push_back(pEnd);
     }
     if (seg.pts.size() >= 2u) {
@@ -476,9 +1398,7 @@ void TrimRivSubpaths(
     const float lo = std::min(trimStart, trimEnd);
     const float hi = std::max(trimStart, trimEnd);
     const float span = hi - lo;
-    if (span <= 1e-4f) {
-        return;
-    }
+    if (span <= 1e-4f) return;
     if (span >= 1.0f - 1e-4f) {
         out = src;
         return;
@@ -505,7 +1425,7 @@ void TrimRivSubpaths(
         for (std::size_t s = 0u; s < segCount; ++s) {
             const RivVec2 a = sp.pts[s];
             const RivVec2 b = sp.pts[(s + 1u) % n];
-            cd[s + 1u] = cd[s] + std::hypot(b.x - a.x, b.y - a.y);
+            cd[s + 1u] = cd[s] + FastHypot(b.x - a.x, b.y - a.y);
         }
         grandTotal += cd.back();
     }
@@ -542,7 +1462,11 @@ void TrimRivSubpaths(
     }
 }
 
-void UnpackArgbPremul(std::uint32_t argb, float extraAlpha, float outPremul[4]) noexcept {
+// ============================================================================
+// High-Speed Y-Bucketed AET Scanline Rasterizer + Gradient LUT + Clip Cache
+// ============================================================================
+
+inline void UnpackArgbPremul(std::uint32_t argb, float extraAlpha, float outPremul[4]) noexcept {
     const float a = std::clamp((static_cast<float>((argb >> 24u) & 0xFFu) / 255.0f) * extraAlpha, 0.0f, 1.0f);
     const float r = static_cast<float>((argb >> 16u) & 0xFFu) / 255.0f;
     const float g = static_cast<float>((argb >> 8u) & 0xFFu) / 255.0f;
@@ -553,75 +1477,403 @@ void UnpackArgbPremul(std::uint32_t argb, float extraAlpha, float outPremul[4]) 
     outPremul[3] = a;
 }
 
-void SampleStopsPremul(const std::vector<RivGradStop>& stops, float t, float extraAlpha, float outPremul[4]) noexcept {
-    if (stops.empty()) {
-        outPremul[0] = outPremul[1] = outPremul[2] = outPremul[3] = 0.0f;
-        return;
-    }
-    const float ct = std::clamp(t, 0.0f, 1.0f);
-    if (ct <= stops.front().pos || stops.size() == 1u) {
-        UnpackArgbPremul(stops.front().argb, extraAlpha, outPremul);
-        return;
-    }
-    if (ct >= stops.back().pos) {
-        UnpackArgbPremul(stops.back().argb, extraAlpha, outPremul);
-        return;
-    }
-    for (std::size_t i = 0u; i + 1u < stops.size(); ++i) {
-        if (ct >= stops[i].pos && ct <= stops[i + 1u].pos) {
-            const float span = std::max(1e-5f, stops[i + 1u].pos - stops[i].pos);
-            const float f = (ct - stops[i].pos) / span;
-            float c0[4], c1[4];
-            UnpackArgbPremul(stops[i].argb, extraAlpha, c0);
-            UnpackArgbPremul(stops[i + 1u].argb, extraAlpha, c1);
-            for (int k = 0; k < 4; ++k) {
-                outPremul[k] = c0[k] + (c1[k] - c0[k]) * f;
-            }
-            return;
-        }
-    }
-    UnpackArgbPremul(stops.back().argb, extraAlpha, outPremul);
+[[nodiscard]] inline std::uint32_t Div255(std::uint32_t x) noexcept {
+    return (x + 128u + ((x + 128u) >> 8u)) >> 8u;
 }
 
-struct RasterEdge {
-    float x0, y0, x1, y1;
-    int dir;
+inline void UnpackArgbPremulU8(std::uint32_t argb, float extraAlpha, std::uint8_t outPremul[4]) noexcept {
+    const float a = std::clamp((static_cast<float>((argb >> 24u) & 0xFFu) / 255.0f) * extraAlpha, 0.0f, 1.0f);
+    const float r = static_cast<float>((argb >> 16u) & 0xFFu);
+    const float g = static_cast<float>((argb >> 8u) & 0xFFu);
+    const float b = static_cast<float>(argb & 0xFFu);
+    outPremul[0] = static_cast<std::uint8_t>(std::clamp(r * a + 0.5f, 0.0f, 255.0f));
+    outPremul[1] = static_cast<std::uint8_t>(std::clamp(g * a + 0.5f, 0.0f, 255.0f));
+    outPremul[2] = static_cast<std::uint8_t>(std::clamp(b * a + 0.5f, 0.0f, 255.0f));
+    outPremul[3] = static_cast<std::uint8_t>(std::clamp(a * 255.0f + 0.5f, 0.0f, 255.0f));
+}
+
+void BuildGradientLut256U8(
+    const std::vector<RivGradStop>& stops,
+    float extraAlpha,
+    std::array<std::uint8_t, 256u * 4u>& outLut) noexcept {
+    if (stops.empty()) {
+        outLut.fill(0u);
+        return;
+    }
+    auto storeFloat = [](const float c[4], std::uint8_t* dst) noexcept {
+        dst[0] = static_cast<std::uint8_t>(std::clamp(c[0] * 255.0f + 0.5f, 0.0f, 255.0f));
+        dst[1] = static_cast<std::uint8_t>(std::clamp(c[1] * 255.0f + 0.5f, 0.0f, 255.0f));
+        dst[2] = static_cast<std::uint8_t>(std::clamp(c[2] * 255.0f + 0.5f, 0.0f, 255.0f));
+        dst[3] = static_cast<std::uint8_t>(std::clamp(c[3] * 255.0f + 0.5f, 0.0f, 255.0f));
+    };
+    for (std::size_t i = 0u; i < 256u; ++i) {
+        const float ct = static_cast<float>(i) / 255.0f;
+        std::uint8_t* dst = outLut.data() + i * 4u;
+        if (ct <= stops.front().pos || stops.size() == 1u) {
+            float c[4];
+            UnpackArgbPremul(stops.front().argb, extraAlpha, c);
+            storeFloat(c, dst);
+            continue;
+        }
+        if (ct >= stops.back().pos) {
+            float c[4];
+            UnpackArgbPremul(stops.back().argb, extraAlpha, c);
+            storeFloat(c, dst);
+            continue;
+        }
+        bool matched = false;
+        for (std::size_t s = 0u; s + 1u < stops.size(); ++s) {
+            if (ct >= stops[s].pos && ct <= stops[s + 1u].pos) {
+                const float span = std::max(1e-5f, stops[s + 1u].pos - stops[s].pos);
+                const float f = (ct - stops[s].pos) / span;
+                float c0[4], c1[4];
+                UnpackArgbPremul(stops[s].argb, extraAlpha, c0);
+                UnpackArgbPremul(stops[s + 1u].argb, extraAlpha, c1);
+                const float cMix[4]{
+                    c0[0] + (c1[0] - c0[0]) * f,
+                    c0[1] + (c1[1] - c0[1]) * f,
+                    c0[2] + (c1[2] - c0[2]) * f,
+                    c0[3] + (c1[3] - c0[3]) * f
+                };
+                storeFloat(cMix, dst);
+                matched = true;
+                break;
+            }
+        }
+        if (!matched) {
+            float c[4];
+            UnpackArgbPremul(stops.back().argb, extraAlpha, c);
+            storeFloat(c, dst);
+        }
+    }
+}
+
+struct AetEdge {
+    int firstSub = 0;
+    int lastSub = -1; // inclusive
+    float x = 0.0f;
+    float stepX = 0.0f;
+    int dir = 1;
 };
 
-void BuildEdges(const std::vector<RivSubpath>& subpaths, std::vector<RasterEdge>& edges, float& minX, float& minY, float& maxX, float& maxY) {
-    edges.clear();
-    minX = minY = 1e9f;
-    maxX = maxY = -1e9f;
+struct ClipMaskBuf {
+    int x0 = 0, y0 = 0, w = 0, h = 0;
+    std::vector<std::uint8_t> mask;
+};
+
+struct RiveRasterScratch {
+    std::vector<AetEdge> edges;
+    std::vector<AetEdge> active;
+    std::vector<std::pair<float, int>> xings;
+    std::vector<float> rowCov;
+    std::vector<std::uint8_t> surfPremulU8;
+    std::vector<RivVertDesc> rawVerts;
+    std::vector<RivVertDesc> skinnedVerts;
+    std::vector<RivVertDesc> effVerts;
+    std::vector<RivSubpath> shapePaths;
+    std::vector<RivSubpath> strokeExpanded;
+    std::vector<RivSubpath> trimmedPaths;
+    std::vector<RivSubpath> nextTrimmed;
+    std::vector<RivSubpath> clipPaths;
+    std::vector<const ClipMaskBuf*> activeClips;
+    std::vector<RivMat2D> skinDeformMats;
+    std::vector<RivVec2> strokeClean;
+    std::vector<RivVec2> strokeNormals;
+    std::vector<RivVec2> strokeLeftSide;
+    std::vector<RivVec2> strokeRightSide;
+};
+
+RiveRasterScratch& ThreadRasterScratch() {
+    thread_local RiveRasterScratch scratch;
+    return scratch;
+}
+
+void ExpandStrokeToSubpaths(
+    const std::vector<RivSubpath>& src,
+    float halfW,
+    std::uint32_t cap,
+    RiveRasterScratch& rsc,
+    std::vector<RivSubpath>& out) {
+    if (halfW <= 0.02f) return;
+    auto& clean = rsc.strokeClean;
+    auto& normals = rsc.strokeNormals;
+    auto& leftSide = rsc.strokeLeftSide;
+    auto& rightSide = rsc.strokeRightSide;
+
+    for (const RivSubpath& sp : src) {
+        if (sp.pts.size() < 2u) continue;
+        clean.clear();
+        for (const RivVec2& p : sp.pts) {
+            if (clean.empty() || FastHypot(p.x - clean.back().x, p.y - clean.back().y) > 0.02f) {
+                clean.push_back(p);
+            }
+        }
+        if (sp.closed && clean.size() >= 2u &&
+            FastHypot(clean.front().x - clean.back().x, clean.front().y - clean.back().y) <= 0.02f) {
+            clean.pop_back();
+        }
+        if (clean.size() < 2u) continue;
+
+        const std::size_t n = clean.size();
+        const std::size_t segCount = sp.closed ? n : (n - 1u);
+        normals.resize(segCount);
+        for (std::size_t i = 0u; i < segCount; ++i) {
+            const RivVec2 a = clean[i];
+            const RivVec2 b = clean[(i + 1u) % n];
+            const float dx = b.x - a.x;
+            const float dy = b.y - a.y;
+            const float len = std::max(1e-4f, FastHypot(dx, dy));
+            normals[i] = {-dy / len, dx / len};
+        }
+
+        leftSide.clear();
+        rightSide.clear();
+
+        auto addJoin = [&](RivVec2 pt, RivVec2 n0, RivVec2 n1, std::vector<RivVec2>& side, float sign) {
+            RivVec2 m{n0.x + n1.x, n0.y + n1.y};
+            const float mlen2 = m.x * m.x + m.y * m.y;
+            if (mlen2 > 0.25f) {
+                const float scale = std::min(2.2f, 2.0f / mlen2);
+                side.push_back({pt.x + sign * m.x * scale * halfW, pt.y + sign * m.y * scale * halfW});
+            } else {
+                side.push_back({pt.x + sign * n0.x * halfW, pt.y + sign * n0.y * halfW});
+                side.push_back({pt.x + sign * n1.x * halfW, pt.y + sign * n1.y * halfW});
+            }
+        };
+
+        for (std::size_t i = 0u; i < n; ++i) {
+            if (!sp.closed && i == 0u) {
+                const RivVec2 n0 = normals[0];
+                leftSide.push_back({clean[0].x + n0.x * halfW, clean[0].y + n0.y * halfW});
+                rightSide.push_back({clean[0].x - n0.x * halfW, clean[0].y - n0.y * halfW});
+            } else if (!sp.closed && i == n - 1u) {
+                const RivVec2 n0 = normals[segCount - 1u];
+                leftSide.push_back({clean[i].x + n0.x * halfW, clean[i].y + n0.y * halfW});
+                rightSide.push_back({clean[i].x - n0.x * halfW, clean[i].y - n0.y * halfW});
+            } else {
+                const RivVec2 nPrev = normals[(i + segCount - 1u) % segCount];
+                const RivVec2 nNext = normals[i % segCount];
+                addJoin(clean[i], nPrev, nNext, leftSide, 1.0f);
+                addJoin(clean[i], nPrev, nNext, rightSide, -1.0f);
+            }
+        }
+
+        if (sp.closed) {
+            RivSubpath poly{};
+            poly.closed = true;
+            poly.pts = leftSide;
+            out.push_back(std::move(poly));
+            RivSubpath inner{};
+            inner.closed = true;
+            inner.pts.assign(rightSide.rbegin(), rightSide.rend());
+            out.push_back(std::move(inner));
+        } else {
+            RivSubpath poly{};
+            poly.closed = true;
+            poly.pts = leftSide;
+            if (cap == 1u) {
+                const RivVec2 pEnd = clean.back();
+                const RivVec2 nEnd = normals.back();
+                const float baseAng = std::atan2(nEnd.y, nEnd.x);
+                for (int s = 1; s < 6; ++s) {
+                    const float a = baseAng - kPi * (static_cast<float>(s) / 6.0f);
+                    poly.pts.push_back({pEnd.x + std::cos(a) * halfW, pEnd.y + std::sin(a) * halfW});
+                }
+            }
+            for (std::size_t k = rightSide.size(); k > 0u; --k) {
+                poly.pts.push_back(rightSide[k - 1u]);
+            }
+            if (cap == 1u) {
+                const RivVec2 pStart = clean.front();
+                const RivVec2 nStart = normals.front();
+                const float baseAng = std::atan2(-nStart.y, -nStart.x);
+                for (int s = 1; s < 6; ++s) {
+                    const float a = baseAng - kPi * (static_cast<float>(s) / 6.0f);
+                    poly.pts.push_back({pStart.x + std::cos(a) * halfW, pStart.y + std::sin(a) * halfW});
+                }
+            }
+            out.push_back(std::move(poly));
+        }
+    }
+}
+
+template <typename RowCallback>
+void RasterizeScanlinesStreaming(
+    int surfW, int surfH,
+    const std::vector<RivSubpath>& subpaths,
+    bool evenOdd,
+    RowCallback&& onRow) {
+    if (surfW <= 0 || surfH <= 0) return;
+
+    float minX = 1e9f, minY = 1e9f, maxX = -1e9f, maxY = -1e9f;
+    for (const RivSubpath& sp : subpaths) {
+        if (sp.pts.size() < 2u) continue;
+        for (const RivVec2& pt : sp.pts) {
+            minX = std::min(minX, pt.x);
+            minY = std::min(minY, pt.y);
+            maxX = std::max(maxX, pt.x);
+            maxY = std::max(maxY, pt.y);
+        }
+    }
+    if (minX >= maxX || minY >= maxY) return;
+
+    const int outX0 = std::clamp(static_cast<int>(std::floor(minX)), 0, surfW);
+    const int outY0 = std::clamp(static_cast<int>(std::floor(minY)), 0, surfH);
+    const int x1 = std::clamp(static_cast<int>(std::ceil(maxX)), 0, surfW);
+    const int y1 = std::clamp(static_cast<int>(std::ceil(maxY)), 0, surfH);
+    const int outW = x1 - outX0;
+    const int outH = y1 - outY0;
+    if (outW <= 0 || outH <= 0) return;
+
+    constexpr int kSubY = 2;
+    static constexpr float kOffsetsY[kSubY] = {0.25f, 0.75f};
+    const int totalSubs = outH * kSubY;
+
+    auto& sc = ThreadRasterScratch();
+    sc.edges.clear();
+
     for (const RivSubpath& sp : subpaths) {
         if (sp.pts.size() < 2u) continue;
         const std::size_t n = sp.pts.size();
         for (std::size_t i = 0u; i < n; ++i) {
-            const RivVec2 a = sp.pts[i];
-            const RivVec2 b = sp.pts[(i + 1u) % n];
-            minX = std::min(minX, std::min(a.x, b.x));
-            minY = std::min(minY, std::min(a.y, b.y));
-            maxX = std::max(maxX, std::max(a.x, b.x));
-            maxY = std::max(maxY, std::max(a.y, b.y));
+            RivVec2 a = sp.pts[i];
+            RivVec2 b = sp.pts[(i + 1u) % n];
             if (std::fabs(a.y - b.y) < 1e-5f) continue;
-            if (a.y < b.y) {
-                edges.push_back({a.x, a.y, b.x, b.y, 1});
-            } else {
-                edges.push_back({b.x, b.y, a.x, a.y, -1});
+            int dir = 1;
+            if (a.y > b.y) {
+                std::swap(a, b);
+                dir = -1;
             }
+            if (b.y <= static_cast<float>(outY0) || a.y >= static_cast<float>(y1)) {
+                continue;
+            }
+            auto subY = [&](int sub) noexcept -> float {
+                return static_cast<float>(outY0) + static_cast<float>(sub >> 1) + kOffsetsY[sub & 1];
+            };
+            const int firstSub = std::max(0, static_cast<int>(std::ceil((a.y - static_cast<float>(outY0)) * 2.0f - 0.5f - 1e-5f)));
+            int lastSub = std::min(totalSubs - 1, static_cast<int>(std::ceil((b.y - static_cast<float>(outY0)) * 2.0f - 0.5f - 1e-5f)) - 1);
+            int s0 = firstSub;
+            while (s0 > 0 && subY(s0 - 1) >= a.y) --s0;
+            while (s0 < totalSubs && subY(s0) < a.y) ++s0;
+            int s1 = std::min(totalSubs - 1, lastSub + 1);
+            while (s1 >= s0 && subY(s1) >= b.y) --s1;
+            if (s0 > s1) continue;
+
+            const float invSlope = (b.x - a.x) / (b.y - a.y);
+            const float startX = a.x + (subY(s0) - a.y) * invSlope;
+            sc.edges.push_back(AetEdge{s0, s1, startX, invSlope * 0.5f, dir});
+        }
+    }
+    if (sc.edges.empty()) return;
+
+    std::sort(sc.edges.begin(), sc.edges.end(), [](const AetEdge& e1, const AetEdge& e2) {
+        return e1.firstSub < e2.firstSub;
+    });
+
+    sc.active.clear();
+    sc.rowCov.assign(static_cast<std::size_t>(outW), 0.0f);
+    std::size_t edgeCursor = 0u;
+
+    for (int py = outY0; py < y1; ++py) {
+        const int rowBaseSub = (py - outY0) * kSubY;
+        if (sc.active.empty() && edgeCursor < sc.edges.size() &&
+            sc.edges[edgeCursor].firstSub >= rowBaseSub + kSubY) {
+            continue;
+        }
+
+        int rowMinRx = outW;
+        int rowMaxRx = -1;
+
+        for (int sy = 0; sy < kSubY; ++sy) {
+            const int sub = rowBaseSub + sy;
+            while (edgeCursor < sc.edges.size() && sc.edges[edgeCursor].firstSub <= sub) {
+                sc.active.push_back(sc.edges[edgeCursor++]);
+            }
+            for (std::size_t ai = sc.active.size(); ai > 0u; --ai) {
+                if (sc.active[ai - 1u].lastSub < sub) {
+                    sc.active[ai - 1u] = sc.active.back();
+                    sc.active.pop_back();
+                }
+            }
+            if (sc.active.size() < 2u) {
+                for (AetEdge& ae : sc.active) {
+                    ae.x += ae.stepX;
+                }
+                continue;
+            }
+
+            sc.xings.clear();
+            for (AetEdge& ae : sc.active) {
+                sc.xings.emplace_back(ae.x, ae.dir);
+                ae.x += ae.stepX;
+            }
+            for (std::size_t i = 1u; i < sc.xings.size(); ++i) {
+                const auto key = sc.xings[i];
+                std::size_t j = i;
+                while (j > 0u && sc.xings[j - 1u].first > key.first) {
+                    sc.xings[j] = sc.xings[j - 1u];
+                    --j;
+                }
+                sc.xings[j] = key;
+            }
+
+            int winding = 0;
+            float spanStart = 0.0f;
+            bool inside = false;
+            for (const auto& [xv, dir] : sc.xings) {
+                const bool wasInside = inside;
+                winding += dir;
+                inside = evenOdd ? ((winding & 1) != 0) : (winding != 0);
+                if (!wasInside && inside) {
+                    spanStart = xv;
+                } else if (wasInside && !inside) {
+                    const float s0 = std::max(spanStart, static_cast<float>(outX0));
+                    const float s1 = std::min(xv, static_cast<float>(x1));
+                    if (s1 > s0) {
+                        const int ix0 = std::clamp(static_cast<int>(std::floor(s0)), outX0, x1 - 1);
+                        const int ix1 = std::clamp(static_cast<int>(std::floor(s1)), outX0, x1 - 1);
+                        const int rx0 = ix0 - outX0;
+                        const int rx1 = ix1 - outX0;
+                        rowMinRx = std::min(rowMinRx, rx0);
+                        rowMaxRx = std::max(rowMaxRx, rx1);
+                        if (ix0 == ix1) {
+                            sc.rowCov[static_cast<std::size_t>(rx0)] += (s1 - s0) * 0.5f;
+                        } else {
+                            sc.rowCov[static_cast<std::size_t>(rx0)] += (static_cast<float>(ix0 + 1) - s0) * 0.5f;
+                            for (int rx = rx0 + 1; rx < rx1; ++rx) {
+                                sc.rowCov[static_cast<std::size_t>(rx)] += 0.5f;
+                            }
+                            sc.rowCov[static_cast<std::size_t>(rx1)] += (s1 - static_cast<float>(ix1)) * 0.5f;
+                        }
+                    }
+                }
+            }
+        }
+
+        if (rowMinRx <= rowMaxRx) {
+            const int spanW = (rowMaxRx - rowMinRx) + 1;
+            onRow(py, outX0 + rowMinRx, spanW, sc.rowCov.data() + rowMinRx);
+            std::fill_n(sc.rowCov.data() + rowMinRx, static_cast<std::size_t>(spanW), 0.0f);
         }
     }
 }
 
-void RasterizeCoverageMask(
+void RasterizeCoverageMaskIntoBuffer(
     int surfW, int surfH,
     const std::vector<RivSubpath>& subpaths,
     bool evenOdd,
     int& outX0, int& outY0, int& outW, int& outH,
-    std::vector<float>& outMask) {
-    std::vector<RasterEdge> edges;
-    float minX = 0.0f, minY = 0.0f, maxX = 0.0f, maxY = 0.0f;
-    BuildEdges(subpaths, edges, minX, minY, maxX, maxY);
-    if (edges.empty()) {
+    std::vector<std::uint8_t>& outMask) {
+    float minX = 1e9f, minY = 1e9f, maxX = -1e9f, maxY = -1e9f;
+    for (const RivSubpath& sp : subpaths) {
+        for (const RivVec2& pt : sp.pts) {
+            minX = std::min(minX, pt.x);
+            minY = std::min(minY, pt.y);
+            maxX = std::max(maxX, pt.x);
+            maxY = std::max(maxY, pt.y);
+        }
+    }
+    if (minX >= maxX || minY >= maxY) {
         outW = outH = 0;
         return;
     }
@@ -635,704 +1887,300 @@ void RasterizeCoverageMask(
         outW = outH = 0;
         return;
     }
-    outMask.assign(static_cast<std::size_t>(outW) * static_cast<std::size_t>(outH), 0.0f);
-
-    constexpr int kSubY = 4;
-    static constexpr float kOffsetsY[kSubY] = {0.125f, 0.375f, 0.625f, 0.875f};
-    std::vector<std::pair<float, int>> xings;
-    xings.reserve(64u);
-    std::vector<float> rowCov(static_cast<std::size_t>(outW), 0.0f);
-
-    for (int py = outY0; py < y1; ++py) {
-        std::fill(rowCov.begin(), rowCov.end(), 0.0f);
-        for (int sy = 0; sy < kSubY; ++sy) {
-            const float sampleY = static_cast<float>(py) + kOffsetsY[sy];
-            xings.clear();
-            for (const RasterEdge& e : edges) {
-                if (sampleY >= e.y0 && sampleY < e.y1) {
-                    const float t = (sampleY - e.y0) / (e.y1 - e.y0);
-                    xings.emplace_back(e.x0 + (e.x1 - e.x0) * t, e.dir);
-                }
+    outMask.assign(static_cast<std::size_t>(outW) * static_cast<std::size_t>(outH), 0u);
+    RasterizeScanlinesStreaming(surfW, surfH, subpaths, evenOdd,
+        [&](int py, int rowX0, int rowW, const float* rowCov) {
+            if (py < outY0 || py >= outY0 + outH) return;
+            const int rxStart = std::max(0, rowX0 - outX0);
+            const int rxEnd = std::min(outW, (rowX0 - outX0) + rowW);
+            if (rxStart >= rxEnd) return;
+            std::uint8_t* dst = outMask.data() + static_cast<std::size_t>(py - outY0) * static_cast<std::size_t>(outW);
+            const int srcBase = rxStart - (rowX0 - outX0);
+            for (int dstX = rxStart; dstX < rxEnd; ++dstX) {
+                dst[dstX] = static_cast<std::uint8_t>(
+                    std::clamp(rowCov[srcBase + (dstX - rxStart)], 0.0f, 1.0f) * 255.0f + 0.5f);
             }
-            if (xings.size() < 2u) continue;
-            std::sort(xings.begin(), xings.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
+        });
+}
 
-            int winding = 0;
-            float spanStart = 0.0f;
-            bool inside = false;
-            for (const auto& [xv, dir] : xings) {
-                const bool wasInside = inside;
-                winding += dir;
-                inside = evenOdd ? ((winding & 1) != 0) : (winding != 0);
-                if (!wasInside && inside) {
-                    spanStart = xv;
-                } else if (wasInside && !inside) {
-                    const float s0 = std::max(spanStart, static_cast<float>(outX0));
-                    const float s1 = std::min(xv, static_cast<float>(x1));
-                    if (s1 > s0) {
-                        const int ix0 = std::clamp(static_cast<int>(std::floor(s0)), outX0, x1 - 1);
-                        const int ix1 = std::clamp(static_cast<int>(std::floor(s1)), outX0, x1 - 1);
-                        if (ix0 == ix1) {
-                            rowCov[static_cast<std::size_t>(ix0 - outX0)] += (s1 - s0) * (1.0f / kSubY);
-                        } else {
-                            rowCov[static_cast<std::size_t>(ix0 - outX0)] += (static_cast<float>(ix0 + 1) - s0) * (1.0f / kSubY);
-                            for (int ix = ix0 + 1; ix < ix1; ++ix) {
-                                rowCov[static_cast<std::size_t>(ix - outX0)] += (1.0f / kSubY);
-                            }
-                            rowCov[static_cast<std::size_t>(ix1 - outX0)] += (s1 - static_cast<float>(ix1)) * (1.0f / kSubY);
-                        }
-                    }
-                }
-            }
+void ResolvePrebuiltPaint(
+    const PrebuiltPaintDef& def,
+    const RivOverrideTable& ov,
+    const RivMat2D& mat,
+    RivPaint& outPaint) {
+    outPaint.isStroke = def.isStroke;
+    outPaint.evenOdd = def.evenOdd;
+    outPaint.strokeThickness = (def.isStroke && ov.IsDirty(def.paintObjIdx))
+        ? ov.GetF(def.paintObjIdx, 47u, def.strokeThickness)
+        : def.strokeThickness;
+    outPaint.strokeCap = def.strokeCap;
+    outPaint.strokeJoin = def.strokeJoin;
+    outPaint.transformAffectsStroke = def.transformAffectsStroke;
+    outPaint.style = def.style;
+    if (def.style == RivPaintStyle::Solid) {
+        outPaint.solidArgb = ov.IsDirty(def.colorObjIdx)
+            ? ov.GetU(def.colorObjIdx, 37u, def.solidArgb)
+            : def.solidArgb;
+    } else if (def.style == RivPaintStyle::Linear || def.style == RivPaintStyle::Radial) {
+        float gx0 = def.gx0, gy0 = def.gy0, gx1 = def.gx1, gy1 = def.gy1;
+        outPaint.gradOpacity = def.gradOpacity;
+        if (ov.IsDirty(def.colorObjIdx)) {
+            gx0 = ov.GetF(def.colorObjIdx, 42u, gx0);
+            gy0 = ov.GetF(def.colorObjIdx, 33u, gy0);
+            gx1 = ov.GetF(def.colorObjIdx, 34u, gx1);
+            gy1 = ov.GetF(def.colorObjIdx, 35u, gy1);
+            outPaint.gradOpacity = std::clamp(ov.GetF(def.colorObjIdx, 46u, outPaint.gradOpacity), 0.0f, 1.0f);
         }
-        float* dst = outMask.data() + static_cast<std::size_t>(py - outY0) * static_cast<std::size_t>(outW);
-        std::memcpy(dst, rowCov.data(), static_cast<std::size_t>(outW) * sizeof(float));
+        mat.Transform(gx0, gy0, outPaint.gradStart.x, outPaint.gradStart.y);
+        mat.Transform(gx1, gy1, outPaint.gradEnd.x, outPaint.gradEnd.y);
+        outPaint.stops.clear();
+        bool needSort = false;
+        for (const auto& st : def.stops) {
+            float pos = st.pos;
+            std::uint32_t argb = st.argb;
+            if (ov.IsDirty(st.stopObjIdx)) {
+                pos = ov.GetF(st.stopObjIdx, 39u, pos);
+                argb = ov.GetU(st.stopObjIdx, 38u, argb);
+                needSort = true;
+            }
+            outPaint.stops.push_back({pos, argb});
+        }
+        if (needSort) {
+            std::sort(outPaint.stops.begin(), outPaint.stops.end(),
+                      [](const RivGradStop& a, const RivGradStop& b) { return a.pos < b.pos; });
+        }
     }
 }
 
-struct RivArtboardSlice {
-    std::size_t startIdx = 0u;
-    std::size_t endIdx = 0u;
-};
-
-void RenderArtboardRecursive(
-    const std::vector<RivObject>& allObjs,
-    const std::vector<RivArtboardSlice>& abSlices,
-    std::size_t abIndex,
+void RenderArtboardEvaluated(
+    const PrebuiltRiveDocument& doc,
+    const EvaluatedArtboardTree& node,
     const RivMat2D& rootTransform,
-    float inheritedOpacity,
-    const std::unordered_map<std::string, float>& inputs,
     int surfW, int surfH,
-    std::vector<float>& surfPremul,
+    std::vector<std::uint8_t>& surfPremulU8,
     int depth) {
-    if (abIndex >= abSlices.size() || depth > 5) return;
-    const std::size_t s0 = abSlices[abIndex].startIdx;
-    const std::size_t s1 = abSlices[abIndex].endIdx;
-    if (s1 <= s0) return;
+    if (node.abIndex >= doc.artboards.size() || depth > 5) return;
+    const PrebuiltArtboard& ab = doc.artboards[node.abIndex];
+    const auto& tks = ab.typeKeys;
+    const auto& childrenOf = ab.childrenOf;
+    const auto& ov = node.overrides;
+    const auto& worldMats = node.worldMats;
+    const auto& worldOpacity = node.worldOpacity;
+    const auto& worldHidden = node.worldHidden;
+    const std::size_t compEnd = ab.compEnd;
+    if (compEnd == 0u) return;
 
-    std::size_t rawCompEnd = s1;
-    for (std::size_t idx = s0 + 1u; idx < s1; ++idx) {
-        if (allObjs[idx].typeKey == 31u || allObjs[idx].typeKey == 53u) {
-            rawCompEnd = idx;
-            break;
-        }
-    }
-    struct RivCubicInterp {
-        float x1 = 0.42f, y1 = 0.0f, x2 = 0.58f, y2 = 1.0f;
-    };
-    std::unordered_map<std::uint32_t, RivCubicInterp> cubicInterps;
-    std::vector<RivObject> objs;
-    objs.reserve(s1 - s0);
-    for (std::size_t idx = s0; idx < rawCompEnd; ++idx) {
-        const std::uint32_t tk = allObjs[idx].typeKey;
-        if (idx > s0 && tk == 28u) {
-            RivCubicInterp ci{};
-            ci.x1 = std::clamp(allObjs[idx].GetF(63u, 0.42f), 0.0f, 1.0f);
-            ci.y1 = allObjs[idx].GetF(64u, 0.0f);
-            ci.x2 = std::clamp(allObjs[idx].GetF(65u, 0.58f), 0.0f, 1.0f);
-            ci.y2 = allObjs[idx].GetF(66u, 1.0f);
-            cubicInterps[static_cast<std::uint32_t>(idx - s0)] = ci;
-            continue;
-        }
-        if (idx > s0 && tk == 8064u) {
-            continue;
-        }
-        objs.push_back(allObjs[idx]);
-    }
-    for (std::size_t idx = rawCompEnd; idx < s1; ++idx) {
-        objs.push_back(allObjs[idx]);
-    }
-
-    float tLoopSec = 0.0f;
-    if (const auto itT = inputs.find("__t"); itT != inputs.end()) {
-        tLoopSec = std::max(0.0f, itT->second);
-    }
-    float tStateSec = tLoopSec;
-    if (const auto itTs = inputs.find("__ts"); itTs != inputs.end()) {
-        tStateSec = std::max(0.0f, itTs->second);
-    }
-
-    auto evalCubicEase = [&](std::uint32_t interpId, float u) -> float {
-        u = std::clamp(u, 0.0f, 1.0f);
-        if (u <= 0.0f || u >= 1.0f) return u;
-        RivCubicInterp ci{};
-        if (const auto it = cubicInterps.find(interpId); it != cubicInterps.end()) {
-            ci = it->second;
-        }
-        float s = u;
-        for (int iter = 0; iter < 6; ++iter) {
-            const float inv = 1.0f - s;
-            const float bx = 3.0f * inv * inv * s * ci.x1 + 3.0f * inv * s * s * ci.x2 + s * s * s - u;
-            const float dbx = 3.0f * inv * inv * ci.x1 + 6.0f * inv * s * (ci.x2 - ci.x1) + 3.0f * s * s * (1.0f - ci.x2);
-            if (std::fabs(dbx) < 1e-5f) break;
-            s = std::clamp(s - bx / dbx, 0.0f, 1.0f);
-        }
-        const float inv = 1.0f - s;
-        return 3.0f * inv * inv * s * ci.y1 + 3.0f * inv * s * s * ci.y2 + s * s * s;
-    };
-
-    auto lerpArgb = [](std::uint32_t c0, std::uint32_t c1, float t) -> std::uint32_t {
-        t = std::clamp(t, 0.0f, 1.0f);
-        std::uint32_t out = 0u;
-        for (unsigned sh = 0u; sh < 32u; sh += 8u) {
-            const float a = static_cast<float>((c0 >> sh) & 0xFFu);
-            const float b = static_cast<float>((c1 >> sh) & 0xFFu);
-            const auto v = static_cast<std::uint32_t>(std::clamp(a + (b - a) * t + 0.5f, 0.0f, 255.0f));
-            out |= (v << sh);
-        }
-        return out;
-    };
-
-    std::vector<std::size_t> animIndices;
-    std::vector<std::size_t> smIndices;
-    for (std::size_t i = 0u; i < objs.size(); ++i) {
-        if (objs[i].typeKey == 31u) animIndices.push_back(i);
-        else if (objs[i].typeKey == 53u) smIndices.push_back(i);
-    }
-
-    struct AnimTimingInfo {
-        float fps = 60.0f;
-        float speed = 1.0f;
-        std::uint32_t loop = 0u;
-        float fStart = 0.0f;
-        float fEnd = 60.0f;
-        float fSpan = 60.0f;
-        float durationSec = 1.0f;
-    };
-    auto getAnimTiming = [&](std::size_t animObjIdx) -> AnimTimingInfo {
-        AnimTimingInfo info{};
-        if (animObjIdx >= objs.size()) return info;
-        const RivObject& ao = objs[animObjIdx];
-        info.fps = static_cast<float>(std::max(1u, ao.GetU(56u, 60u)));
-        const std::uint32_t durFrames = std::max(1u, ao.GetU(57u, 60u));
-        info.speed = ao.GetF(58u, 1.0f);
-        if (std::fabs(info.speed) < 1e-4f) info.speed = 1.0f;
-        info.loop = ao.GetU(59u, 0u);
-        const bool enWork = ao.GetU(62u, 0u) != 0u;
-        const std::uint32_t ws = ao.GetU(60u, 0u);
-        const std::uint32_t we = ao.GetU(61u, 0u);
-        info.fStart = enWork ? static_cast<float>(ws) : 0.0f;
-        info.fEnd = (enWork && we > ws) ? static_cast<float>(we) : static_cast<float>(durFrames);
-        info.fSpan = std::max(1.0f, info.fEnd - info.fStart);
-        info.durationSec = info.fSpan / std::max(1.0f, info.fps * std::fabs(info.speed));
-        return info;
-    };
-
-    auto applyAnimationAtTime = [&](std::size_t animObjIdx, float timeSec) {
-        if (animObjIdx >= objs.size()) return;
-        const AnimTimingInfo ti = getAnimTiming(animObjIdx);
-        const float rawFrames = std::max(0.0f, timeSec) * ti.fps * std::fabs(ti.speed);
-        float curFrame = ti.fStart;
-        if (ti.loop == 1u) { // Loop
-            float m = std::fmod(rawFrames, ti.fSpan);
-            if (m < 0.0f) m += ti.fSpan;
-            curFrame = ti.fStart + m;
-        } else if (ti.loop == 2u) { // PingPong
-            const float cyc = std::fmod(rawFrames, 2.0f * ti.fSpan);
-            curFrame = ti.fStart + ((cyc <= ti.fSpan) ? cyc : (2.0f * ti.fSpan - cyc));
-        } else { // OneShot
-            curFrame = std::clamp(ti.fStart + rawFrames, ti.fStart, ti.fEnd);
-        }
-
-        struct KfEntry {
-            std::uint32_t tk = 0u;
-            float frame = 0.0f;
-            std::uint32_t interp = 0u; // 0=Linear, 1=Hold, 2=Cubic
-            std::uint32_t interpId = 0u;
-            float fVal = 0.0f;
-            std::uint64_t uVal = 0u;
-        };
-        std::size_t curTargetObj = 0xFFFFFFFFu;
-        std::uint32_t curPropKey = 0u;
-        std::vector<KfEntry> propKfs;
-
-        auto flushPropKfs = [&]() {
-            if (propKfs.empty() || curTargetObj >= objs.size() || curPropKey == 0u) {
-                propKfs.clear();
-                return;
-            }
-            const KfEntry* k0 = &propKfs.front();
-            const KfEntry* k1 = &propKfs.front();
-            float localT = 0.0f;
-            if (curFrame <= propKfs.front().frame || propKfs.size() == 1u) {
-                k0 = k1 = &propKfs.front();
-            } else if (curFrame >= propKfs.back().frame) {
-                k0 = k1 = &propKfs.back();
-            } else {
-                for (std::size_t i = 0u; i + 1u < propKfs.size(); ++i) {
-                    if (curFrame >= propKfs[i].frame && curFrame < propKfs[i + 1u].frame) {
-                        k0 = &propKfs[i];
-                        k1 = &propKfs[i + 1u];
-                        const float span = k1->frame - k0->frame;
-                        if (span > 1e-4f && k0->interp != 1u) {
-                            const float u = (curFrame - k0->frame) / span;
-                            localT = (k0->interp == 2u) ? evalCubicEase(k0->interpId, u) : u;
-                        }
-                        break;
-                    }
-                }
-            }
-            RivPropVal pv{};
-            if (k0->tk == 30u) {
-                pv.kind = 2u;
-                pv.f = k0->fVal + (k1->fVal - k0->fVal) * localT;
-                pv.u = static_cast<std::uint64_t>(std::max(0.0f, pv.f));
-            } else if (k0->tk == 37u) {
-                pv.kind = 3u;
-                pv.u = (k0 == k1 || k0->interp == 1u)
-                    ? k0->uVal
-                    : lerpArgb(static_cast<std::uint32_t>(k0->uVal), static_cast<std::uint32_t>(k1->uVal), localT);
-            } else {
-                pv.kind = 0u;
-                pv.u = k0->uVal;
-                pv.f = static_cast<float>(pv.u);
-            }
-            objs[curTargetObj].props[curPropKey] = pv;
-            propKfs.clear();
-        };
-
-        for (std::size_t k = animObjIdx + 1u; k < objs.size(); ++k) {
-            const std::uint32_t tk = objs[k].typeKey;
-            if (tk == 31u || tk == 53u) break;
-            if (tk == 25u) {
-                flushPropKfs();
-                curTargetObj = objs[k].GetU(51u, 0xFFFFFFFFu);
-                curPropKey = 0u;
-            } else if (tk == 26u) {
-                flushPropKfs();
-                curPropKey = objs[k].GetU(53u, 0u);
-            } else if (tk == 30u || tk == 37u || tk == 50u || tk == 84u) {
-                KfEntry e{};
-                e.tk = tk;
-                e.frame = static_cast<float>(objs[k].GetU(67u, 0u));
-                e.interp = objs[k].GetU(68u, 0u);
-                e.interpId = objs[k].GetU(69u, 0u);
-                if (tk == 30u) {
-                    e.fVal = objs[k].GetF(70u, 0.0f);
-                } else if (tk == 37u) {
-                    e.uVal = objs[k].GetU(88u, 0u);
-                } else {
-                    e.uVal = objs[k].GetU(122u, 0u);
-                }
-                propKfs.push_back(e);
-            }
-        }
-        flushPropKfs();
-    };
-
-    if (!smIndices.empty()) {
-        const std::size_t smStart = smIndices.front();
-        struct SmInput {
-            std::string name;
-            float val = 0.0f;
-        };
-        std::vector<SmInput> smInputs;
-        for (std::size_t k = smStart + 1u; k < objs.size(); ++k) {
-            const std::uint32_t tk = objs[k].typeKey;
-            if (tk == 53u) break;
-            if (tk == 56u || tk == 58u || tk == 59u) {
-                SmInput inp{};
-                inp.name = std::string(objs[k].GetS(138u));
-                if (tk == 56u) inp.val = objs[k].GetF(140u, 0.0f);
-                else if (tk == 59u) inp.val = objs[k].GetU(141u, 0u) != 0u ? 1.0f : 0.0f;
-                if (const auto it = inputs.find(inp.name); it != inputs.end()) {
-                    inp.val = it->second;
-                }
-                smInputs.push_back(std::move(inp));
-            }
-        }
-        for (std::size_t k = smStart + 1u; k < objs.size(); ++k) {
-            if (objs[k].typeKey == 53u) break;
-            if (objs[k].typeKey != 57u) continue;
-            struct LayerState {
-                std::uint32_t tk = 0u;
-                std::uint32_t animId = 0xFFFFFFFFu;
-                struct Trans {
-                    std::uint32_t toState = 0u;
-                    std::uint32_t flags = 0u;
-                    float exitTime = 0.0f;
-                    std::vector<std::tuple<std::uint32_t, std::uint32_t, float>> conds;
-                };
-                std::vector<Trans> transitions;
-            };
-            std::vector<LayerState> states;
-            std::size_t p = k + 1u;
-            for (; p < objs.size(); ++p) {
-                const std::uint32_t tk = objs[p].typeKey;
-                if (tk == 57u || tk == 53u) break;
-                if (tk == 61u || tk == 62u || tk == 63u || tk == 64u || tk == 73u || tk == 74u) {
-                    LayerState st{};
-                    st.tk = tk;
-                    if (tk == 61u) st.animId = objs[p].GetU(149u, 0u);
-                    states.push_back(std::move(st));
-                } else if ((tk == 65u || tk == 78u) && !states.empty()) {
-                    LayerState::Trans tr{};
-                    tr.toState = objs[p].GetU(151u, 0u);
-                    tr.flags = objs[p].GetU(152u, 0u);
-                    tr.exitTime = objs[p].GetF(160u, 0.0f);
-                    states.back().transitions.push_back(std::move(tr));
-                } else if ((tk == 67u || tk == 68u || tk == 69u || tk == 70u || tk == 71u) &&
-                           !states.empty() && !states.back().transitions.empty()) {
-                    const std::uint32_t inpId = objs[p].GetU(155u, 0u);
-                    const std::uint32_t op = objs[p].GetU(156u, 0u);
-                    const float defaultVal = (tk == 68u || tk == 71u) ? 1.0f : 0.0f;
-                    const float cval = objs[p].Has(157u) ? objs[p].GetF(157u, 0.0f) : defaultVal;
-                    states.back().transitions.back().conds.emplace_back(inpId, op, cval);
-                }
-            }
-            auto evalConds = [&](const LayerState::Trans& tr) -> bool {
-                for (const auto& [inpId, op, cval] : tr.conds) {
-                    if (inpId >= smInputs.size()) return false;
-                    const float iv = smInputs[inpId].val;
-                    if (op == 0u && !( std::fabs(iv - cval) < 0.01f )) return false;
-                    if (op == 1u && !( std::fabs(iv - cval) >= 0.01f )) return false;
-                    if (op == 2u && !( iv < cval )) return false;
-                    if (op == 3u && !( iv <= cval )) return false;
-                    if (op == 4u && !( iv > cval )) return false;
-                    if (op == 5u && !( iv >= cval )) return false;
-                }
-                return true;
-            };
-            std::size_t curState = 0u;
-            for (std::size_t si = 0u; si < states.size(); ++si) {
-                if (states[si].tk == 63u) { curState = si; break; }
-            }
-            float remStateTime = tStateSec;
-            for (int hop = 0; hop < 8 && curState < states.size(); ++hop) {
-                bool moved = false;
-                const bool isEntry = (states[curState].tk == 63u);
-                float curStateDur = 0.0f;
-                if (!isEntry && states[curState].animId < animIndices.size()) {
-                    curStateDur = getAnimTiming(animIndices[states[curState].animId]).durationSec;
-                }
-                for (const auto& tr : states[curState].transitions) {
-                    if (tr.toState >= states.size() || tr.toState == curState) continue;
-                    const bool needsExit = !isEntry && (tr.conds.empty() || (tr.flags & 4u) != 0u);
-                    float reqSec = 0.0f;
-                    if (needsExit) {
-                        if (tr.exitTime <= 0.0f) {
-                            reqSec = curStateDur;
-                        } else if ((tr.flags & 8u) != 0u) {
-                            reqSec = curStateDur * std::clamp(tr.exitTime * 0.01f, 0.0f, 1.0f);
-                        } else {
-                            reqSec = std::min(curStateDur, tr.exitTime * 0.001f);
-                        }
-                        if (remStateTime + 1e-4f < reqSec) {
-                            continue;
-                        }
-                    }
-                    if (evalConds(tr)) {
-                        curState = tr.toState;
-                        if (reqSec > 0.0f) {
-                            remStateTime = std::max(0.0f, remStateTime - reqSec);
-                        }
-                        moved = true;
-                        break;
-                    }
-                }
-                if (!moved) {
-                    for (const auto& st : states) {
-                        if (st.tk != 62u) continue;
-                        for (const auto& tr : st.transitions) {
-                            if (!tr.conds.empty() && tr.toState < states.size() && tr.toState != curState && evalConds(tr)) {
-                                curState = tr.toState;
-                                moved = true;
-                                break;
-                            }
-                        }
-                        if (moved) break;
-                    }
-                }
-                if (!moved) break;
-            }
-            if (curState < states.size() && states[curState].animId < animIndices.size()) {
-                const std::size_t activeAnimIdx = animIndices[states[curState].animId];
-                const AnimTimingInfo activeTi = getAnimTiming(activeAnimIdx);
-                applyAnimationAtTime(activeAnimIdx, (activeTi.loop != 0u) ? tLoopSec : remStateTime);
-            }
-            k = p - 1u;
-        }
-    } else if (!animIndices.empty()) {
-        const std::size_t activeAnimIdx = animIndices.front();
-        const AnimTimingInfo activeTi = getAnimTiming(activeAnimIdx);
-        applyAnimationAtTime(activeAnimIdx, (activeTi.loop != 0u) ? tLoopSec : tStateSec);
-    }
-
-    // Component slice ends before first LinearAnimation(31) or StateMachine(53)
-    std::size_t compEnd = objs.size();
-    for (std::size_t i = 1u; i < objs.size(); ++i) {
-        if (objs[i].typeKey == 31u || objs[i].typeKey == 53u) {
-            compEnd = i;
-            break;
-        }
-    }
-
-    const float abW = objs[0].GetF(7u, 500.0f);
-    const float abH = objs[0].GetF(8u, 200.0f);
-    const float abOx = objs[0].GetF(11u, 0.0f);
-    const float abOy = objs[0].GetF(12u, 0.0f);
-
-    std::vector<RivMat2D> worldMats(compEnd);
-    std::vector<float> worldOpacity(compEnd, inheritedOpacity);
-    std::vector<bool> worldHidden(compEnd, false);
-    std::vector<std::vector<std::size_t>> childrenOf(compEnd);
-
-    worldMats[0] = (depth == 0)
-        ? RivMat2D::Multiply(rootTransform, RivMat2D::FromTRS(abOx * abW, abOy * abH, 0.0f, 1.0f, 1.0f))
-        : rootTransform;
-
-    for (std::size_t i = 1u; i < compEnd; ++i) {
-        const std::uint32_t pid = objs[i].GetU(5u, 0u);
-        if (pid < compEnd) {
-            childrenOf[pid].push_back(i);
-        }
-    }
-
-    auto computeTransform = [&](auto& self, std::size_t idx) -> void {
-        for (std::size_t ch : childrenOf[idx]) {
-            const RivObject& o = objs[ch];
-            const std::uint32_t tk = o.typeKey;
-            float lx = o.GetF(13u, 0.0f);
-            float ly = o.GetF(14u, 0.0f);
-            if (tk == 41u) { // RootBone
-                lx = o.GetF(90u, 0.0f);
-                ly = o.GetF(91u, 0.0f);
-            } else if (tk == 40u && objs[idx].typeKey == 40u) { // Bone child of Bone
-                lx = objs[idx].GetF(89u, 0.0f);
-                ly = 0.0f;
-            }
-            const float rot = o.GetF(15u, 0.0f);
-            const float sx = o.GetF(16u, 1.0f);
-            const float sy = o.GetF(17u, 1.0f);
-            const float op = std::clamp(o.GetF(18u, 1.0f), 0.0f, 1.0f);
-            const bool selfHidden = (o.GetU(129u, 0u) & 1u) != 0u;
-
-            worldMats[ch] = RivMat2D::Multiply(worldMats[idx], RivMat2D::FromTRS(lx, ly, rot, sx, sy));
-            worldOpacity[ch] = worldOpacity[idx] * op;
-            worldHidden[ch] = worldHidden[idx] || selfHidden;
-            self(self, ch);
-        }
-    };
-    computeTransform(computeTransform, 0u);
+    auto& rsc = ThreadRasterScratch();
+    const float rScale = 0.5f * (FastHypot(rootTransform.xx, rootTransform.xy) + FastHypot(rootTransform.yx, rootTransform.yy));
+    const float maxAllowedJump = 120.0f * std::max(0.25f, rScale);
 
     auto collectShapeSubpaths = [&](std::size_t shapeOrNodeIdx, std::vector<RivSubpath>& outPaths) {
         auto walk = [&](auto& self, std::size_t cur) -> void {
-            const RivObject& po = objs[cur];
-            const std::uint32_t ptk = po.typeKey;
-            const RivMat2D& pm = worldMats[cur];
-            auto xformSubpath = [&](RivSubpath& sp) {
-                for (RivVec2& pt : sp.pts) {
-                    pm.Transform(pt.x, pt.y, pt.x, pt.y);
-                }
-            };
-            if (ptk == 16u) { // PointsPath
-                const bool closed = po.GetU(32u, 0u) != 0u;
-                std::size_t skinIdx = 0u;
-                for (std::size_t sc : childrenOf[cur]) {
-                    if (objs[sc].typeKey == 43u) {
-                        skinIdx = sc;
-                        break;
+            const std::int32_t pIdx = ab.pathDataIndex[cur];
+            if (pIdx >= 0) {
+                const PrebuiltPathData& pd = ab.paths[static_cast<std::size_t>(pIdx)];
+                const RivMat2D& pm = worldMats[cur];
+                auto xformSubpath = [&](RivSubpath& sp) {
+                    for (RivVec2& pt : sp.pts) {
+                        pm.Transform(pt.x, pt.y, pt.x, pt.y);
                     }
-                }
-                std::vector<RivMat2D> skinDeformMats;
-                if (skinIdx != 0u) {
-                    const RivObject& skObj = objs[skinIdx];
-                    RivMat2D skinBind{};
-                    skinBind.xx = skObj.GetF(104u, 1.0f);
-                    skinBind.yx = skObj.GetF(105u, 0.0f);
-                    skinBind.xy = skObj.GetF(106u, 0.0f);
-                    skinBind.yy = skObj.GetF(107u, 1.0f);
-                    skinBind.tx = skObj.GetF(108u, 0.0f);
-                    skinBind.ty = skObj.GetF(109u, 0.0f);
-                    RivMat2D zeroMat{0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
-                    skinDeformMats.push_back(zeroMat);
-                    for (std::size_t tc : childrenOf[skinIdx]) {
-                        const RivObject& tdObj = objs[tc];
-                        if (tdObj.typeKey != 44u) continue;
-                        const std::uint32_t boneId = tdObj.GetU(95u, 0u);
-                        RivMat2D tBind{};
-                        tBind.xx = tdObj.GetF(96u, 1.0f);
-                        tBind.yx = tdObj.GetF(97u, 0.0f);
-                        tBind.xy = tdObj.GetF(98u, 0.0f);
-                        tBind.yy = tdObj.GetF(99u, 1.0f);
-                        tBind.tx = tdObj.GetF(100u, 0.0f);
-                        tBind.ty = tdObj.GetF(101u, 0.0f);
-                        const RivMat2D bWorld = (boneId < compEnd) ? worldMats[boneId] : worldMats[0];
-                        skinDeformMats.push_back(RivMat2D::Multiply(bWorld, RivMat2D::Multiply(RivMat2D::Invert(tBind), skinBind)));
-                    }
-                }
-                auto deformPt = [&](RivVec2 pt, std::uint32_t vals, std::uint32_t idxs) -> RivVec2 {
-                    RivVec2 acc{0.0f, 0.0f};
-                    float wSum = 0.0f;
-                    for (unsigned b = 0u; b < 4u; ++b) {
-                        const float w = static_cast<float>((vals >> (b * 8u)) & 0xFFu) / 255.0f;
-                        const std::size_t bi = static_cast<std::size_t>((idxs >> (b * 8u)) & 0xFFu);
-                        if (w > 0.0f && bi > 0u && bi < skinDeformMats.size()) {
-                            float tx = 0.0f, ty = 0.0f;
-                            skinDeformMats[bi].Transform(pt.x, pt.y, tx, ty);
-                            acc.x += tx * w;
-                            acc.y += ty * w;
-                            wSum += w;
-                        }
-                    }
-                    if (wSum <= 1e-4f) {
-                        RivVec2 wpt{};
-                        pm.Transform(pt.x, pt.y, wpt.x, wpt.y);
-                        return wpt;
-                    }
-                    return acc;
                 };
-
-                std::vector<RivVertDesc> rawVerts;
-                std::vector<RivVertDesc> skinnedVerts;
-                bool canUseSkin = (skinDeformMats.size() > 1u);
-                const float rScale = 0.5f * (std::hypot(rootTransform.xx, rootTransform.xy) + std::hypot(rootTransform.yx, rootTransform.yy));
-                const float maxAllowedJump = 120.0f * std::max(0.25f, rScale);
-
-                for (std::size_t vc : childrenOf[cur]) {
-                    const RivObject& vo = objs[vc];
-                    const std::uint32_t vtk = vo.typeKey;
-                    if (vtk != 5u && vtk != 6u && vtk != 34u && vtk != 35u) continue;
-                    RivVertDesc vd{};
-                    vd.pos = {vo.GetF(24u, 0.0f), vo.GetF(25u, 0.0f)};
-                    vd.inPt = vd.pos;
-                    vd.outPt = vd.pos;
-                    if (vtk == 5u) { // StraightVertex
-                        vd.straightRadius = vo.GetF(26u, 0.0f);
-                    } else if (vtk == 6u) { // CubicDetachedVertex
-                        vd.isCubic = true;
-                        const float inR = vo.GetF(84u, 0.0f), inD = vo.GetF(85u, 0.0f);
-                        const float outR = vo.GetF(86u, 0.0f), outD = vo.GetF(87u, 0.0f);
-                        vd.inPt = {vd.pos.x + std::cos(inR) * inD, vd.pos.y + std::sin(inR) * inD};
-                        vd.outPt = {vd.pos.x + std::cos(outR) * outD, vd.pos.y + std::sin(outR) * outD};
-                    } else if (vtk == 34u) { // CubicAsymmetricVertex
-                        vd.isCubic = true;
-                        const float r = vo.GetF(79u, 0.0f), inD = vo.GetF(80u, 0.0f), outD = vo.GetF(81u, 0.0f);
-                        vd.inPt = {vd.pos.x - std::cos(r) * inD, vd.pos.y - std::sin(r) * inD};
-                        vd.outPt = {vd.pos.x + std::cos(r) * outD, vd.pos.y + std::sin(r) * outD};
-                    } else if (vtk == 35u) { // CubicMirroredVertex
-                        vd.isCubic = true;
-                        const float r = vo.GetF(82u, 0.0f), d = vo.GetF(83u, 0.0f);
-                        vd.inPt = {vd.pos.x - std::cos(r) * d, vd.pos.y - std::sin(r) * d};
-                        vd.outPt = {vd.pos.x + std::cos(r) * d, vd.pos.y + std::sin(r) * d};
+                if (pd.tk == 16u) {
+                    const bool closed = ov.IsDirty(cur)
+                        ? (ov.GetU(cur, 32u, pd.closed ? 1u : 0u) != 0u)
+                        : pd.closed;
+                    rsc.skinDeformMats.clear();
+                    const bool hasSkin = (pd.skinBones.size() > 1u);
+                    if (hasSkin) {
+                        rsc.skinDeformMats.push_back(pd.skinBones[0].invBindMulSkinBind);
+                        for (std::size_t bi = 1u; bi < pd.skinBones.size(); ++bi) {
+                            const PrebuiltSkinBone& sb = pd.skinBones[bi];
+                            const RivMat2D& bWorld = (sb.boneId < compEnd) ? worldMats[sb.boneId] : worldMats[0];
+                            rsc.skinDeformMats.push_back(RivMat2D::Multiply(bWorld, sb.invBindMulSkinBind));
+                        }
                     }
-                    rawVerts.push_back(vd);
-
-                    if (canUseSkin) {
-                        std::size_t wObjIdx = 0u;
-                        for (std::size_t wc : childrenOf[vc]) {
-                            if (objs[wc].typeKey == 45u || objs[wc].typeKey == 46u) {
-                                wObjIdx = wc;
-                                break;
+                    auto deformPt = [&](RivVec2 pt, std::uint32_t vals, std::uint32_t idxs) noexcept -> RivVec2 {
+                        RivVec2 acc{0.0f, 0.0f};
+                        float wSum = 0.0f;
+                        for (unsigned b = 0u; b < 4u; ++b) {
+                            const float w = static_cast<float>((vals >> (b * 8u)) & 0xFFu) / 255.0f;
+                            const std::size_t bi = static_cast<std::size_t>((idxs >> (b * 8u)) & 0xFFu);
+                            if (w > 0.0f && bi > 0u && bi < rsc.skinDeformMats.size()) {
+                                float tx = 0.0f, ty = 0.0f;
+                                rsc.skinDeformMats[bi].Transform(pt.x, pt.y, tx, ty);
+                                acc.x += tx * w;
+                                acc.y += ty * w;
+                                wSum += w;
                             }
                         }
-                        if (wObjIdx != 0u) {
-                            const RivObject& wo = objs[wObjIdx];
-                            const std::uint32_t vVals = wo.GetU(102u, 255u);
-                            const std::uint32_t vIdxs = wo.GetU(103u, 1u);
-                            RivVertDesc sv = vd;
-                            sv.pos = deformPt(vd.pos, vVals, vIdxs);
-                            if (wo.typeKey == 46u) {
-                                sv.inPt = deformPt(vd.inPt, wo.GetU(110u, 255u), wo.GetU(111u, 1u));
-                                sv.outPt = deformPt(vd.outPt, wo.GetU(112u, 255u), wo.GetU(113u, 1u));
+                        if (wSum <= 1e-4f) {
+                            RivVec2 wpt{};
+                            pm.Transform(pt.x, pt.y, wpt.x, wpt.y);
+                            return wpt;
+                        }
+                        return acc;
+                    };
+
+                    rsc.rawVerts.clear();
+                    rsc.skinnedVerts.clear();
+                    bool canUseSkin = hasSkin;
+
+                    for (const PrebuiltVertex& pv : pd.verts) {
+                        RivVertDesc vd{};
+                        const bool vDirty = ov.IsDirty(pv.objIdx);
+                        vd.pos = {
+                            vDirty ? ov.GetF(pv.objIdx, 24u, pv.x) : pv.x,
+                            vDirty ? ov.GetF(pv.objIdx, 25u, pv.y) : pv.y
+                        };
+                        vd.inPt = vd.pos;
+                        vd.outPt = vd.pos;
+                        if (pv.vtk == 5u) {
+                            vd.straightRadius = vDirty ? ov.GetF(pv.objIdx, 26u, pv.p0) : pv.p0;
+                        } else if (pv.vtk == 6u) {
+                            vd.isCubic = true;
+                            const float inR = vDirty ? ov.GetF(pv.objIdx, 84u, pv.p0) : pv.p0;
+                            const float inD = vDirty ? ov.GetF(pv.objIdx, 85u, pv.p1) : pv.p1;
+                            const float outR = vDirty ? ov.GetF(pv.objIdx, 86u, pv.p2) : pv.p2;
+                            const float outD = vDirty ? ov.GetF(pv.objIdx, 87u, pv.p3) : pv.p3;
+                            vd.inPt = {vd.pos.x + std::cos(inR) * inD, vd.pos.y + std::sin(inR) * inD};
+                            vd.outPt = {vd.pos.x + std::cos(outR) * outD, vd.pos.y + std::sin(outR) * outD};
+                        } else if (pv.vtk == 34u) {
+                            vd.isCubic = true;
+                            const float r = vDirty ? ov.GetF(pv.objIdx, 79u, pv.p0) : pv.p0;
+                            const float inD = vDirty ? ov.GetF(pv.objIdx, 80u, pv.p1) : pv.p1;
+                            const float outD = vDirty ? ov.GetF(pv.objIdx, 81u, pv.p2) : pv.p2;
+                            const float c = std::cos(r);
+                            const float s = std::sin(r);
+                            vd.inPt = {vd.pos.x - c * inD, vd.pos.y - s * inD};
+                            vd.outPt = {vd.pos.x + c * outD, vd.pos.y + s * outD};
+                        } else if (pv.vtk == 35u) {
+                            vd.isCubic = true;
+                            const float r = vDirty ? ov.GetF(pv.objIdx, 82u, pv.p0) : pv.p0;
+                            const float d = vDirty ? ov.GetF(pv.objIdx, 83u, pv.p1) : pv.p1;
+                            const float c = std::cos(r);
+                            const float s = std::sin(r);
+                            vd.inPt = {vd.pos.x - c * d, vd.pos.y - s * d};
+                            vd.outPt = {vd.pos.x + c * d, vd.pos.y + s * d};
+                        }
+                        rsc.rawVerts.push_back(vd);
+
+                        if (canUseSkin) {
+                            if (pv.weightObjIdx != 0u) {
+                                const bool wDirty = ov.IsDirty(pv.weightObjIdx);
+                                const std::uint32_t vVals = wDirty ? ov.GetU(pv.weightObjIdx, 102u, pv.vVals) : pv.vVals;
+                                const std::uint32_t vIdxs = wDirty ? ov.GetU(pv.weightObjIdx, 103u, pv.vIdxs) : pv.vIdxs;
+                                RivVertDesc sv = vd;
+                                sv.pos = deformPt(vd.pos, vVals, vIdxs);
+                                if (pv.weightTk == 46u) {
+                                    const std::uint32_t inV = wDirty ? ov.GetU(pv.weightObjIdx, 110u, pv.inVals) : pv.inVals;
+                                    const std::uint32_t inI = wDirty ? ov.GetU(pv.weightObjIdx, 111u, pv.inIdxs) : pv.inIdxs;
+                                    const std::uint32_t outV = wDirty ? ov.GetU(pv.weightObjIdx, 112u, pv.outVals) : pv.outVals;
+                                    const std::uint32_t outI = wDirty ? ov.GetU(pv.weightObjIdx, 113u, pv.outIdxs) : pv.outIdxs;
+                                    sv.inPt = deformPt(vd.inPt, inV, inI);
+                                    sv.outPt = deformPt(vd.outPt, outV, outI);
+                                } else {
+                                    sv.inPt = deformPt(vd.inPt, vVals, vIdxs);
+                                    sv.outPt = deformPt(vd.outPt, vVals, vIdxs);
+                                }
+                                RivVec2 unsk{};
+                                pm.Transform(vd.pos.x, vd.pos.y, unsk.x, unsk.y);
+                                if (FastHypot(sv.pos.x - unsk.x, sv.pos.y - unsk.y) > maxAllowedJump) {
+                                    canUseSkin = false;
+                                }
+                                rsc.skinnedVerts.push_back(sv);
                             } else {
-                                sv.inPt = deformPt(vd.inPt, vVals, vIdxs);
-                                sv.outPt = deformPt(vd.outPt, vVals, vIdxs);
-                            }
-                            RivVec2 unsk{};
-                            pm.Transform(vd.pos.x, vd.pos.y, unsk.x, unsk.y);
-                            if (std::hypot(sv.pos.x - unsk.x, sv.pos.y - unsk.y) > maxAllowedJump) {
                                 canUseSkin = false;
                             }
-                            skinnedVerts.push_back(sv);
-                        } else {
-                            canUseSkin = false;
                         }
                     }
-                }
-                const bool alreadyWorld = canUseSkin && (skinnedVerts.size() == rawVerts.size());
-                const std::vector<RivVertDesc>& verts = alreadyWorld ? skinnedVerts : rawVerts;
-                if (verts.size() >= 2u) {
-                    // Expand straight-vertex corner radii if any
-                    std::vector<RivVertDesc> effVerts;
-                    effVerts.reserve(verts.size() * 2u);
-                    const std::size_t vn = verts.size();
-                    for (std::size_t vi = 0u; vi < vn; ++vi) {
-                        const RivVertDesc& v = verts[vi];
-                        const bool isEndpoint = !closed && (vi == 0u || vi + 1u == vn);
-                        if (!v.isCubic && v.straightRadius > 0.1f && !isEndpoint && vn >= 3u) {
-                            const RivVec2 prevP = verts[(vi + vn - 1u) % vn].pos;
-                            const RivVec2 nextP = verts[(vi + 1u) % vn].pos;
-                            const float dPrev = std::hypot(v.pos.x - prevP.x, v.pos.y - prevP.y);
-                            const float dNext = std::hypot(nextP.x - v.pos.x, nextP.y - v.pos.y);
-                            const float rr = std::min(v.straightRadius, 0.5f * std::min(dPrev, dNext));
-                            if (rr > 0.1f && dPrev > 1e-3f && dNext > 1e-3f) {
-                                const RivVec2 t1{v.pos.x + (prevP.x - v.pos.x) * (rr / dPrev),
-                                                 v.pos.y + (prevP.y - v.pos.y) * (rr / dPrev)};
-                                const RivVec2 t2{v.pos.x + (nextP.x - v.pos.x) * (rr / dNext),
-                                                 v.pos.y + (nextP.y - v.pos.y) * (rr / dNext)};
-                                constexpr float kK = 0.55228475f;
-                                RivVertDesc a{};
-                                a.pos = t1; a.inPt = t1;
-                                a.outPt = {t1.x + (v.pos.x - t1.x) * kK, t1.y + (v.pos.y - t1.y) * kK};
-                                a.isCubic = true;
-                                RivVertDesc b{};
-                                b.pos = t2; b.outPt = t2;
-                                b.inPt = {t2.x + (v.pos.x - t2.x) * kK, t2.y + (v.pos.y - t2.y) * kK};
-                                b.isCubic = true;
-                                effVerts.push_back(a);
-                                effVerts.push_back(b);
-                                continue;
+
+                    const bool alreadyWorld = canUseSkin && (rsc.skinnedVerts.size() == rsc.rawVerts.size());
+                    const std::vector<RivVertDesc>& verts = alreadyWorld ? rsc.skinnedVerts : rsc.rawVerts;
+                    if (verts.size() >= 2u) {
+                        rsc.effVerts.clear();
+                        rsc.effVerts.reserve(verts.size() * 2u);
+                        const std::size_t vn = verts.size();
+                        for (std::size_t vi = 0u; vi < vn; ++vi) {
+                            const RivVertDesc& v = verts[vi];
+                            const bool isEndpoint = !closed && (vi == 0u || vi + 1u == vn);
+                            if (!v.isCubic && v.straightRadius > 0.1f && !isEndpoint && vn >= 3u) {
+                                const RivVec2 prevP = verts[(vi + vn - 1u) % vn].pos;
+                                const RivVec2 nextP = verts[(vi + 1u) % vn].pos;
+                                const float dPrev = FastHypot(v.pos.x - prevP.x, v.pos.y - prevP.y);
+                                const float dNext = FastHypot(nextP.x - v.pos.x, nextP.y - v.pos.y);
+                                const float rr = std::min(v.straightRadius, 0.5f * std::min(dPrev, dNext));
+                                if (rr > 0.1f && dPrev > 1e-3f && dNext > 1e-3f) {
+                                    const RivVec2 t1{v.pos.x + (prevP.x - v.pos.x) * (rr / dPrev),
+                                                     v.pos.y + (prevP.y - v.pos.y) * (rr / dPrev)};
+                                    const RivVec2 t2{v.pos.x + (nextP.x - v.pos.x) * (rr / dNext),
+                                                     v.pos.y + (nextP.y - v.pos.y) * (rr / dNext)};
+                                    constexpr float kK = 0.55228475f;
+                                    RivVertDesc a{};
+                                    a.pos = t1; a.inPt = t1;
+                                    a.outPt = {t1.x + (v.pos.x - t1.x) * kK, t1.y + (v.pos.y - t1.y) * kK};
+                                    a.isCubic = true;
+                                    RivVertDesc b{};
+                                    b.pos = t2; b.outPt = t2;
+                                    b.inPt = {t2.x + (v.pos.x - t2.x) * kK, t2.y + (v.pos.y - t2.y) * kK};
+                                    b.isCubic = true;
+                                    rsc.effVerts.push_back(a);
+                                    rsc.effVerts.push_back(b);
+                                    continue;
+                                }
                             }
+                            rsc.effVerts.push_back(v);
                         }
-                        effVerts.push_back(v);
-                    }
-                    RivSubpath sp{};
-                    sp.closed = closed;
-                    sp.pts.push_back(effVerts[0].pos);
-                    const std::size_t segs = closed ? effVerts.size() : (effVerts.size() - 1u);
-                    for (std::size_t si = 0u; si < segs; ++si) {
-                        const RivVertDesc& a = effVerts[si];
-                        const RivVertDesc& b = effVerts[(si + 1u) % effVerts.size()];
-                        if (!a.isCubic && !b.isCubic) {
-                            sp.pts.push_back(b.pos);
-                        } else {
-                            FlattenCubic(a.pos, a.outPt, b.inPt, b.pos, 0, sp.pts);
+                        RivSubpath sp{};
+                        sp.closed = closed;
+                        sp.pts.push_back(rsc.effVerts[0].pos);
+                        const std::size_t segs = closed ? rsc.effVerts.size() : (rsc.effVerts.size() - 1u);
+                        for (std::size_t si = 0u; si < segs; ++si) {
+                            const RivVertDesc& a = rsc.effVerts[si];
+                            const RivVertDesc& b = rsc.effVerts[(si + 1u) % rsc.effVerts.size()];
+                            if (!a.isCubic && !b.isCubic) sp.pts.push_back(b.pos);
+                            else FlattenCubic(a.pos, a.outPt, b.inPt, b.pos, 0, sp.pts);
                         }
+                        if (!alreadyWorld) xformSubpath(sp);
+                        outPaths.push_back(std::move(sp));
                     }
-                    if (!alreadyWorld) {
-                        xformSubpath(sp);
-                    }
+                } else if (pd.tk == 7u) {
+                    const bool pdDirty = ov.IsDirty(cur);
+                    const float w = pdDirty ? ov.GetF(cur, 20u, pd.w) : pd.w;
+                    const float h = pdDirty ? ov.GetF(cur, 21u, pd.h) : pd.h;
+                    const float ox = pdDirty ? ov.GetF(cur, 123u, pd.ox) : pd.ox;
+                    const float oy = pdDirty ? ov.GetF(cur, 124u, pd.oy) : pd.oy;
+                    const float rTL = pdDirty ? ov.GetF(cur, 31u, pd.rTL) : pd.rTL;
+                    const bool linked = pdDirty ? (ov.GetU(cur, 164u, pd.linked ? 1u : 0u) != 0u) : pd.linked;
+                    const float rTR = linked ? rTL : (pdDirty ? ov.GetF(cur, 161u, pd.rTR) : pd.rTR);
+                    const float rBL = linked ? rTL : (pdDirty ? ov.GetF(cur, 162u, pd.rBL) : pd.rBL);
+                    const float rBR = linked ? rTL : (pdDirty ? ov.GetF(cur, 163u, pd.rBR) : pd.rBR);
+                    RivSubpath sp = BuildRoundedRectSubpath(ox, oy, w, h, rTL, rTR, rBR, rBL);
+                    xformSubpath(sp);
+                    outPaths.push_back(std::move(sp));
+                } else if (pd.tk == 4u) {
+                    const bool pdDirty = ov.IsDirty(cur);
+                    const float w = pdDirty ? ov.GetF(cur, 20u, pd.w) : pd.w;
+                    const float h = pdDirty ? ov.GetF(cur, 21u, pd.h) : pd.h;
+                    const float ox = pdDirty ? ov.GetF(cur, 123u, pd.ox) : pd.ox;
+                    const float oy = pdDirty ? ov.GetF(cur, 124u, pd.oy) : pd.oy;
+                    RivSubpath sp = BuildEllipseSubpath(ox, oy, w, h);
+                    xformSubpath(sp);
+                    outPaths.push_back(std::move(sp));
+                } else if (pd.tk == 8u) {
+                    const bool pdDirty = ov.IsDirty(cur);
+                    const float w = pdDirty ? ov.GetF(cur, 20u, pd.w) : pd.w;
+                    const float h = pdDirty ? ov.GetF(cur, 21u, pd.h) : pd.h;
+                    const float ox = pdDirty ? ov.GetF(cur, 123u, pd.ox) : pd.ox;
+                    const float oy = pdDirty ? ov.GetF(cur, 124u, pd.oy) : pd.oy;
+                    const float x0 = -ox * w, y0 = -oy * h;
+                    RivSubpath sp{{{x0 + 0.5f * w, y0}, {x0 + w, y0 + h}, {x0, y0 + h}}, true};
+                    xformSubpath(sp);
                     outPaths.push_back(std::move(sp));
                 }
-            } else if (ptk == 7u) { // Rectangle
-                const float w = po.GetF(20u, 0.0f), h = po.GetF(21u, 0.0f);
-                const float ox = po.GetF(123u, 0.5f), oy = po.GetF(124u, 0.5f);
-                const float rTL = po.GetF(31u, 0.0f);
-                const bool linked = po.GetU(164u, 1u) != 0u;
-                const float rTR = linked ? rTL : po.GetF(161u, rTL);
-                const float rBL = linked ? rTL : po.GetF(162u, rTL);
-                const float rBR = linked ? rTL : po.GetF(163u, rTL);
-                RivSubpath sp = BuildRoundedRectSubpath(ox, oy, w, h, rTL, rTR, rBR, rBL);
-                xformSubpath(sp);
-                outPaths.push_back(std::move(sp));
-            } else if (ptk == 4u) { // Ellipse
-                const float w = po.GetF(20u, 0.0f), h = po.GetF(21u, 0.0f);
-                const float ox = po.GetF(123u, 0.5f), oy = po.GetF(124u, 0.5f);
-                RivSubpath sp = BuildEllipseSubpath(ox, oy, w, h);
-                xformSubpath(sp);
-                outPaths.push_back(std::move(sp));
-            } else if (ptk == 8u) { // Triangle
-                const float w = po.GetF(20u, 0.0f), h = po.GetF(21u, 0.0f);
-                const float ox = po.GetF(123u, 0.5f), oy = po.GetF(124u, 0.5f);
-                const float x0 = -ox * w, y0 = -oy * h;
-                RivSubpath sp{{{x0 + 0.5f * w, y0}, {x0 + w, y0 + h}, {x0, y0 + h}}, true};
-                xformSubpath(sp);
-                outPaths.push_back(std::move(sp));
             }
             for (std::size_t sub : childrenOf[cur]) {
-                const std::uint32_t stk = objs[sub].typeKey;
-                if (stk != 3u && stk != 92u) {
+                const std::uint32_t stk = tks[sub];
+                if (stk != 3u && stk != 92u && stk != 20u && stk != 24u && stk != 42u) {
                     self(self, sub);
                 }
             }
@@ -1340,281 +2188,335 @@ void RenderArtboardRecursive(
         walk(walk, shapeOrNodeIdx);
     };
 
-    // Draw Artboard background Fill(s) (childrenOf[0] with tk == 20u, e.g. sky gradient on Background artboard)
-    for (std::size_t bgPaintIdx : childrenOf[0]) {
-        const RivObject& paintObj = objs[bgPaintIdx];
-        if (paintObj.typeKey != 20u || paintObj.GetU(41u, 1u) == 0u) continue;
-        RivPaint paint{};
-        for (std::size_t sc : childrenOf[bgPaintIdx]) {
-            const RivObject& so = objs[sc];
-            if (so.typeKey == 18u) {
-                paint.style = RivPaintStyle::Solid;
-                paint.solidArgb = so.GetU(37u, 0xFFFFFFFFu);
-            } else if (so.typeKey == 22u || so.typeKey == 17u) {
-                paint.style = (so.typeKey == 22u) ? RivPaintStyle::Linear : RivPaintStyle::Radial;
-                const float gx0 = so.GetF(42u, 0.0f), gy0 = so.GetF(33u, 0.0f);
-                const float gx1 = so.GetF(34u, 0.0f), gy1 = so.GetF(35u, 0.0f);
-                worldMats[0].Transform(gx0 - abOx * abW, gy0 - abOy * abH, paint.gradStart.x, paint.gradStart.y);
-                worldMats[0].Transform(gx1 - abOx * abW, gy1 - abOy * abH, paint.gradEnd.x, paint.gradEnd.y);
-                paint.gradOpacity = std::clamp(so.GetF(46u, 1.0f), 0.0f, 1.0f);
-                for (std::size_t stc : childrenOf[sc]) {
-                    if (objs[stc].typeKey == 19u) {
-                        paint.stops.push_back({objs[stc].GetF(39u, 0.0f), objs[stc].GetU(38u, 0xFFFFFFFFu)});
-                    }
-                }
-                std::sort(paint.stops.begin(), paint.stops.end(),
-                          [](const RivGradStop& a, const RivGradStop& b) { return a.pos < b.pos; });
-            }
-        }
-        if (paint.style == RivPaintStyle::None) continue;
-        RivSubpath abRect = BuildRoundedRectSubpath(abOx, abOy, abW, abH, 0.0f, 0.0f, 0.0f, 0.0f);
-        for (RivVec2& pt : abRect.pts) {
-            worldMats[0].Transform(pt.x, pt.y, pt.x, pt.y);
-        }
-        std::vector<RivSubpath> abPaths{std::move(abRect)};
-        int mx0 = 0, my0 = 0, mw = 0, mh = 0;
-        std::vector<float> covMask;
-        RasterizeCoverageMask(surfW, surfH, abPaths, false, mx0, my0, mw, mh, covMask);
-        if (mw <= 0 || mh <= 0) continue;
-        const float effOp = worldOpacity[0] * paint.gradOpacity;
-        float solidPremul[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    std::vector<std::pair<std::uint64_t, ClipMaskBuf>> clipMaskCache;
+
+    auto blendPathsWithPaint = [&](
+        const std::vector<RivSubpath>& targetPaths,
+        bool evenOdd,
+        const RivPaint& paint,
+        float effOp,
+        const std::vector<const ClipMaskBuf*>& activeClips) {
+        if (targetPaths.empty()) return;
+        std::uint8_t solidPremulU8[4] = {0u, 0u, 0u, 0u};
+        std::uint32_t solidPacked = 0u;
+        std::array<std::uint8_t, 256u * 4u> gradLutU8{};
         if (paint.style == RivPaintStyle::Solid) {
-            UnpackArgbPremul(paint.solidArgb, effOp, solidPremul);
-            if (solidPremul[3] <= 0.001f) continue;
+            UnpackArgbPremulU8(paint.solidArgb, effOp, solidPremulU8);
+            if (solidPremulU8[3] == 0u) return;
+            std::memcpy(&solidPacked, solidPremulU8, 4u);
+        } else {
+            BuildGradientLut256U8(paint.stops, effOp, gradLutU8);
         }
         const float gdx = paint.gradEnd.x - paint.gradStart.x;
         const float gdy = paint.gradEnd.y - paint.gradStart.y;
         const float glen2 = std::max(1e-5f, gdx * gdx + gdy * gdy);
-        const float gradRad = std::max(1e-3f, std::sqrt(glen2));
-        for (int ry = 0; ry < mh; ++ry) {
-            const int py = my0 + ry;
-            const float* mRow = covMask.data() + static_cast<std::size_t>(ry) * static_cast<std::size_t>(mw);
-            float* dstRow = surfPremul.data() + static_cast<std::size_t>(py) * static_cast<std::size_t>(surfW) * 4u;
-            for (int rx = 0; rx < mw; ++rx) {
-                const float cov = mRow[rx];
-                if (cov <= 0.002f) continue;
-                const int px = mx0 + rx;
-                float col[4];
-                if (paint.style == RivPaintStyle::Solid) {
-                    col[0] = solidPremul[0] * cov;
-                    col[1] = solidPremul[1] * cov;
-                    col[2] = solidPremul[2] * cov;
-                    col[3] = solidPremul[3] * cov;
-                } else if (paint.style == RivPaintStyle::Linear) {
-                    const float t = (((static_cast<float>(px) + 0.5f) - paint.gradStart.x) * gdx +
-                                     ((static_cast<float>(py) + 0.5f) - paint.gradStart.y) * gdy) / glen2;
-                    SampleStopsPremul(paint.stops, t, effOp * cov, col);
-                } else {
-                    const float d = std::hypot((static_cast<float>(px) + 0.5f) - paint.gradStart.x,
-                                               (static_cast<float>(py) + 0.5f) - paint.gradStart.y) / gradRad;
-                    SampleStopsPremul(paint.stops, d, effOp * cov, col);
+        const float invGlen2 = 1.0f / glen2;
+        const float invGradRad = 1.0f / std::max(1e-3f, std::sqrt(glen2));
+
+        RasterizeScanlinesStreaming(surfW, surfH, targetPaths, evenOdd,
+            [&](int py, int mx0, int mw, const float* rowCov) {
+                std::uint8_t* dstRow = surfPremulU8.data() + static_cast<std::size_t>(py) * static_cast<std::size_t>(surfW) * 4u;
+                const bool hasClips = !activeClips.empty();
+                if (!hasClips && paint.style == RivPaintStyle::Solid) {
+                    const std::uint32_t sr = solidPremulU8[0];
+                    const std::uint32_t sg = solidPremulU8[1];
+                    const std::uint32_t sb = solidPremulU8[2];
+                    const std::uint32_t sa = solidPremulU8[3];
+                    std::uint8_t* dpx = dstRow + static_cast<std::size_t>(mx0) * 4u;
+                    if (sa == 255u) {
+                        for (int rx = 0; rx < mw; ++rx, dpx += 4) {
+                            const float cov = rowCov[rx];
+                            if (cov <= 0.002f) continue;
+                            if (cov >= 0.996f) {
+                                std::memcpy(dpx, &solidPacked, 4u);
+                            } else {
+                                const std::uint32_t cov255 = static_cast<std::uint32_t>(std::clamp(cov, 0.0f, 1.0f) * 255.0f + 0.5f);
+                                const std::uint32_t invA = 255u - cov255;
+                                dpx[0] = static_cast<std::uint8_t>(std::min<std::uint32_t>(255u, Div255(sr * cov255) + Div255(dpx[0] * invA)));
+                                dpx[1] = static_cast<std::uint8_t>(std::min<std::uint32_t>(255u, Div255(sg * cov255) + Div255(dpx[1] * invA)));
+                                dpx[2] = static_cast<std::uint8_t>(std::min<std::uint32_t>(255u, Div255(sb * cov255) + Div255(dpx[2] * invA)));
+                                dpx[3] = static_cast<std::uint8_t>(std::min<std::uint32_t>(255u, cov255 + Div255(dpx[3] * invA)));
+                            }
+                        }
+                    } else {
+                        for (int rx = 0; rx < mw; ++rx, dpx += 4) {
+                            const float cov = rowCov[rx];
+                            if (cov <= 0.002f) continue;
+                            const std::uint32_t cov255 = static_cast<std::uint32_t>(std::clamp(cov, 0.0f, 1.0f) * 255.0f + 0.5f);
+                            const std::uint32_t c3 = Div255(sa * cov255);
+                            if (c3 == 0u) continue;
+                            const std::uint32_t invA = 255u - c3;
+                            dpx[0] = static_cast<std::uint8_t>(std::min<std::uint32_t>(255u, Div255(sr * cov255) + Div255(dpx[0] * invA)));
+                            dpx[1] = static_cast<std::uint8_t>(std::min<std::uint32_t>(255u, Div255(sg * cov255) + Div255(dpx[1] * invA)));
+                            dpx[2] = static_cast<std::uint8_t>(std::min<std::uint32_t>(255u, Div255(sb * cov255) + Div255(dpx[2] * invA)));
+                            dpx[3] = static_cast<std::uint8_t>(std::min<std::uint32_t>(255u, c3 + Div255(dpx[3] * invA)));
+                        }
+                    }
+                    return;
                 }
-                float* dpx = dstRow + static_cast<std::size_t>(px) * 4u;
-                const float invA = 1.0f - col[3];
-                dpx[0] = col[0] + dpx[0] * invA;
-                dpx[1] = col[1] + dpx[1] * invA;
-                dpx[2] = col[2] + dpx[2] * invA;
-                dpx[3] = col[3] + dpx[3] * invA;
-            }
+                if (!hasClips && paint.style == RivPaintStyle::Linear) {
+                    const float dtDx = gdx * invGlen2;
+                    float t = ((static_cast<float>(mx0) + 0.5f - paint.gradStart.x) * gdx +
+                               (static_cast<float>(py) + 0.5f - paint.gradStart.y) * gdy) * invGlen2;
+                    std::uint8_t* dpx = dstRow + static_cast<std::size_t>(mx0) * 4u;
+                    for (int rx = 0; rx < mw; ++rx, t += dtDx, dpx += 4) {
+                        const float cov = rowCov[rx];
+                        if (cov <= 0.002f) continue;
+                        const int lutIdx = static_cast<int>(std::clamp(t, 0.0f, 1.0f) * 255.0f + 0.5f);
+                        const std::uint8_t* lpx = gradLutU8.data() + static_cast<std::size_t>(lutIdx) * 4u;
+                        if (cov >= 0.996f && lpx[3] == 255u) {
+                            std::memcpy(dpx, lpx, 4u);
+                            continue;
+                        }
+                        const std::uint32_t cov255 = static_cast<std::uint32_t>(std::clamp(cov, 0.0f, 1.0f) * 255.0f + 0.5f);
+                        const std::uint32_t c3 = Div255(static_cast<std::uint32_t>(lpx[3]) * cov255);
+                        if (c3 == 0u && lpx[0] == 0u && lpx[1] == 0u && lpx[2] == 0u) continue;
+                        const std::uint32_t c0 = Div255(static_cast<std::uint32_t>(lpx[0]) * cov255);
+                        const std::uint32_t c1 = Div255(static_cast<std::uint32_t>(lpx[1]) * cov255);
+                        const std::uint32_t c2 = Div255(static_cast<std::uint32_t>(lpx[2]) * cov255);
+                        const std::uint32_t invA = 255u - c3;
+                        dpx[0] = static_cast<std::uint8_t>(std::min<std::uint32_t>(255u, c0 + Div255(dpx[0] * invA)));
+                        dpx[1] = static_cast<std::uint8_t>(std::min<std::uint32_t>(255u, c1 + Div255(dpx[1] * invA)));
+                        dpx[2] = static_cast<std::uint8_t>(std::min<std::uint32_t>(255u, c2 + Div255(dpx[2] * invA)));
+                        dpx[3] = static_cast<std::uint8_t>(std::min<std::uint32_t>(255u, c3 + Div255(dpx[3] * invA)));
+                    }
+                    return;
+                }
+                if (!hasClips && paint.style == RivPaintStyle::Radial) {
+                    const float fy = static_cast<float>(py) + 0.5f - paint.gradStart.y;
+                    const float fy2 = fy * fy;
+                    float fx = static_cast<float>(mx0) + 0.5f - paint.gradStart.x;
+                    std::uint8_t* dpx = dstRow + static_cast<std::size_t>(mx0) * 4u;
+                    for (int rx = 0; rx < mw; ++rx, fx += 1.0f, dpx += 4) {
+                        const float cov = rowCov[rx];
+                        if (cov <= 0.002f) continue;
+                        const float d2 = fx * fx + fy2;
+                        const int lutIdx = (d2 >= glen2)
+                            ? 255
+                            : static_cast<int>(std::clamp(std::sqrt(d2) * invGradRad, 0.0f, 1.0f) * 255.0f + 0.5f);
+                        const std::uint8_t* lpx = gradLutU8.data() + static_cast<std::size_t>(lutIdx) * 4u;
+                        if (cov >= 0.996f && lpx[3] == 255u) {
+                            std::memcpy(dpx, lpx, 4u);
+                            continue;
+                        }
+                        const std::uint32_t cov255 = static_cast<std::uint32_t>(std::clamp(cov, 0.0f, 1.0f) * 255.0f + 0.5f);
+                        const std::uint32_t c3 = Div255(static_cast<std::uint32_t>(lpx[3]) * cov255);
+                        if (c3 == 0u && lpx[0] == 0u && lpx[1] == 0u && lpx[2] == 0u) continue;
+                        const std::uint32_t c0 = Div255(static_cast<std::uint32_t>(lpx[0]) * cov255);
+                        const std::uint32_t c1 = Div255(static_cast<std::uint32_t>(lpx[1]) * cov255);
+                        const std::uint32_t c2 = Div255(static_cast<std::uint32_t>(lpx[2]) * cov255);
+                        const std::uint32_t invA = 255u - c3;
+                        dpx[0] = static_cast<std::uint8_t>(std::min<std::uint32_t>(255u, c0 + Div255(dpx[0] * invA)));
+                        dpx[1] = static_cast<std::uint8_t>(std::min<std::uint32_t>(255u, c1 + Div255(dpx[1] * invA)));
+                        dpx[2] = static_cast<std::uint8_t>(std::min<std::uint32_t>(255u, c2 + Div255(dpx[2] * invA)));
+                        dpx[3] = static_cast<std::uint8_t>(std::min<std::uint32_t>(255u, c3 + Div255(dpx[3] * invA)));
+                    }
+                    return;
+                }
+                for (int rx = 0; rx < mw; ++rx) {
+                    const float cov = rowCov[rx];
+                    if (cov <= 0.002f) continue;
+                    std::uint32_t cov255 = static_cast<std::uint32_t>(std::clamp(cov, 0.0f, 1.0f) * 255.0f + 0.5f);
+                    if (cov255 == 0u) continue;
+                    const int px = mx0 + rx;
+                    if (hasClips) {
+                        for (const ClipMaskBuf* cb : activeClips) {
+                            if (px < cb->x0 || px >= cb->x0 + cb->w || py < cb->y0 || py >= cb->y0 + cb->h) {
+                                cov255 = 0u;
+                                break;
+                            }
+                            const std::uint32_t m = cb->mask[static_cast<std::size_t>(py - cb->y0) * static_cast<std::size_t>(cb->w) +
+                                                             static_cast<std::size_t>(px - cb->x0)];
+                            cov255 = Div255(cov255 * m);
+                            if (cov255 == 0u) break;
+                        }
+                        if (cov255 == 0u) continue;
+                    }
+                    std::uint32_t c0, c1, c2, c3;
+                    if (paint.style == RivPaintStyle::Solid) {
+                        c0 = Div255(static_cast<std::uint32_t>(solidPremulU8[0]) * cov255);
+                        c1 = Div255(static_cast<std::uint32_t>(solidPremulU8[1]) * cov255);
+                        c2 = Div255(static_cast<std::uint32_t>(solidPremulU8[2]) * cov255);
+                        c3 = Div255(static_cast<std::uint32_t>(solidPremulU8[3]) * cov255);
+                    } else {
+                        float t = 0.0f;
+                        const float fx = static_cast<float>(px) + 0.5f - paint.gradStart.x;
+                        const float fy = static_cast<float>(py) + 0.5f - paint.gradStart.y;
+                        if (paint.style == RivPaintStyle::Linear) {
+                            t = (fx * gdx + fy * gdy) * invGlen2;
+                        } else {
+                            const float d2 = fx * fx + fy * fy;
+                            t = (d2 >= glen2) ? 1.0f : (std::sqrt(d2) * invGradRad);
+                        }
+                        const int lutIdx = static_cast<int>(std::clamp(t, 0.0f, 1.0f) * 255.0f + 0.5f);
+                        const std::uint8_t* lpx = gradLutU8.data() + static_cast<std::size_t>(lutIdx) * 4u;
+                        c0 = Div255(static_cast<std::uint32_t>(lpx[0]) * cov255);
+                        c1 = Div255(static_cast<std::uint32_t>(lpx[1]) * cov255);
+                        c2 = Div255(static_cast<std::uint32_t>(lpx[2]) * cov255);
+                        c3 = Div255(static_cast<std::uint32_t>(lpx[3]) * cov255);
+                    }
+                    if (c3 == 0u && c0 == 0u && c1 == 0u && c2 == 0u) continue;
+                    std::uint8_t* dpx = dstRow + static_cast<std::size_t>(px) * 4u;
+                    const std::uint32_t invA = 255u - c3;
+                    dpx[0] = static_cast<std::uint8_t>(std::min<std::uint32_t>(255u, c0 + Div255(dpx[0] * invA)));
+                    dpx[1] = static_cast<std::uint8_t>(std::min<std::uint32_t>(255u, c1 + Div255(dpx[1] * invA)));
+                    dpx[2] = static_cast<std::uint8_t>(std::min<std::uint32_t>(255u, c2 + Div255(dpx[2] * invA)));
+                    dpx[3] = static_cast<std::uint8_t>(std::min<std::uint32_t>(255u, c3 + Div255(dpx[3] * invA)));
+                }
+            });
+    };
+
+    // Draw Artboard background Fill(s)
+    RivPaint bgPaint{};
+    for (const PrebuiltPaintDef& def : ab.bgPaints) {
+        const bool enabled = ov.IsDirty(def.paintObjIdx)
+            ? (ov.GetU(def.paintObjIdx, 41u, def.enabled ? 1u : 0u) != 0u)
+            : def.enabled;
+        if (!enabled || def.style == RivPaintStyle::None) continue;
+        bgPaint.stops.clear();
+        const RivMat2D abGradMat{
+            worldMats[0].xx, worldMats[0].xy,
+            worldMats[0].yx, worldMats[0].yy,
+            worldMats[0].tx - (ab.abOx * ab.natW * worldMats[0].xx + ab.abOy * ab.natH * worldMats[0].yx),
+            worldMats[0].ty - (ab.abOx * ab.natW * worldMats[0].xy + ab.abOy * ab.natH * worldMats[0].yy)
+        };
+        ResolvePrebuiltPaint(def, ov, abGradMat, bgPaint);
+        RivSubpath abRect = BuildRoundedRectSubpath(ab.abOx, ab.abOy, ab.natW, ab.natH, 0.0f, 0.0f, 0.0f, 0.0f);
+        for (RivVec2& pt : abRect.pts) {
+            worldMats[0].Transform(pt.x, pt.y, pt.x, pt.y);
         }
+        rsc.shapePaths.clear();
+        rsc.shapePaths.push_back(std::move(abRect));
+        blendPathsWithPaint(rsc.shapePaths, false, bgPaint, worldOpacity[0] * bgPaint.gradOpacity, {});
     }
 
-    // Rive v7 serializes hierarchy drawables front-to-back; iterate back-to-front for painter's order
-    for (std::size_t i = compEnd; i-- > 1u;) {
+    const float rootScale = 0.5f * (FastHypot(rootTransform.xx, rootTransform.xy) + FastHypot(rootTransform.yx, rootTransform.yy));
+    std::size_t nestedCursor = node.nestedChildren.size();
+    RivPaint shapePaint{};
+
+    for (const std::size_t i : ab.renderOrder) {
         if (worldHidden[i] || worldOpacity[i] <= 0.002f) continue;
-        const RivObject& o = objs[i];
-        if (o.typeKey == 92u) { // NestedArtboard
-            const std::uint32_t targetAb = o.GetU(197u, 0xFFFFFFFFu);
-            if (targetAb < abSlices.size() && targetAb != abIndex) {
-                const RivObject& childAbObj = allObjs[abSlices[targetAb].startIdx];
-                const float cW = childAbObj.GetF(7u, 0.0f);
-                const float cH = childAbObj.GetF(8u, 0.0f);
-                const float cOx = childAbObj.GetF(11u, 0.0f);
-                const float cOy = childAbObj.GetF(12u, 0.0f);
+        if (tks[i] == 92u) {
+            while (nestedCursor > 0u && node.nestedChildren[nestedCursor - 1u].first > i) {
+                --nestedCursor;
+            }
+            if (nestedCursor > 0u && node.nestedChildren[nestedCursor - 1u].first == i) {
+                const EvaluatedArtboardTree& childTree = node.nestedChildren[--nestedCursor].second;
+                const PrebuiltArtboard& childAb = doc.artboards[childTree.abIndex];
                 const RivMat2D nestedWorld = RivMat2D::Multiply(
                     worldMats[i],
-                    RivMat2D::FromTRS(-cOx * cW, -cOy * cH, 0.0f, 1.0f, 1.0f));
-                RenderArtboardRecursive(
-                    allObjs, abSlices, targetAb, nestedWorld, worldOpacity[i],
-                    inputs, surfW, surfH, surfPremul, depth + 1);
+                    RivMat2D::FromTRS(-childAb.abOx * childAb.natW, -childAb.abOy * childAb.natH, 0.0f, 1.0f, 1.0f));
+                RenderArtboardEvaluated(doc, childTree, nestedWorld, surfW, surfH, surfPremulU8, depth + 1);
             }
             continue;
         }
-        if (o.typeKey != 3u) continue; // Shape
 
-        std::vector<RivSubpath> shapePaths;
-        collectShapeSubpaths(i, shapePaths);
-        if (shapePaths.empty()) continue;
+        const std::int32_t spIdx = ab.shapePaintIndex[i];
+        if (spIdx < 0) continue;
+        const auto& paints = ab.shapePaints[static_cast<std::size_t>(spIdx)];
+        if (paints.empty()) continue;
 
-        // Check ClippingShape children (tk=42) on this Shape or ancestors
-        struct ClipMaskBuf {
-            int x0 = 0, y0 = 0, w = 0, h = 0;
-            std::vector<float> mask;
-        };
-        std::vector<ClipMaskBuf> activeClips;
-        for (std::size_t anc = i; anc != 0u && anc < compEnd; anc = objs[anc].GetU(5u, 0u)) {
-            for (std::size_t ch : childrenOf[anc]) {
-                if (objs[ch].typeKey == 42u && objs[ch].GetU(94u, 1u) != 0u) {
-                    const std::uint32_t srcId = objs[ch].GetU(92u, 0xFFFFFFFFu);
-                    if (srcId < compEnd) {
-                        std::vector<RivSubpath> clipPaths;
-                        collectShapeSubpaths(srcId, clipPaths);
-                        if (!clipPaths.empty()) {
-                            ClipMaskBuf cb{};
-                            RasterizeCoverageMask(
-                                surfW, surfH, clipPaths, objs[ch].GetU(93u, 0u) != 0u,
-                                cb.x0, cb.y0, cb.w, cb.h, cb.mask);
-                            if (cb.w > 0 && cb.h > 0) {
-                                activeClips.push_back(std::move(cb));
-                            }
+        rsc.shapePaths.clear();
+        collectShapeSubpaths(i, rsc.shapePaths);
+        if (rsc.shapePaths.empty()) continue;
+
+        rsc.activeClips.clear();
+        if (ab.hasClipInAncestors[i] != 0u) {
+            for (std::size_t anc = i; anc != 0u && anc < compEnd; anc = ab.parentIds[anc]) {
+                for (const PrebuiltClipRef& cr : ab.nodeClips[anc]) {
+                    const bool enabled = ov.IsDirty(cr.clipObjIdx)
+                        ? (ov.GetU(cr.clipObjIdx, 94u, cr.enabled ? 1u : 0u) != 0u)
+                        : cr.enabled;
+                    if (!enabled) continue;
+                    const std::uint32_t srcId = ov.IsDirty(cr.clipObjIdx)
+                        ? ov.GetU(cr.clipObjIdx, 92u, cr.srcId)
+                        : cr.srcId;
+                    if (srcId >= compEnd) continue;
+                    const bool clipEo = ov.IsDirty(cr.clipObjIdx)
+                        ? (ov.GetU(cr.clipObjIdx, 93u, cr.evenOdd ? 1u : 0u) != 0u)
+                        : cr.evenOdd;
+                    const std::uint64_t clipKey = (static_cast<std::uint64_t>(srcId) << 1u) | (clipEo ? 1u : 0u);
+                    ClipMaskBuf* foundMask = nullptr;
+                    for (auto& kv : clipMaskCache) {
+                        if (kv.first == clipKey) {
+                            foundMask = &kv.second;
+                            break;
                         }
+                    }
+                    if (!foundMask) {
+                        clipMaskCache.emplace_back(clipKey, ClipMaskBuf{});
+                        foundMask = &clipMaskCache.back().second;
+                        rsc.clipPaths.clear();
+                        collectShapeSubpaths(srcId, rsc.clipPaths);
+                        if (!rsc.clipPaths.empty()) {
+                            RasterizeCoverageMaskIntoBuffer(
+                                surfW, surfH, rsc.clipPaths, clipEo,
+                                foundMask->x0, foundMask->y0,
+                                foundMask->w, foundMask->h,
+                                foundMask->mask);
+                        }
+                    }
+                    if (foundMask->w > 0 && foundMask->h > 0) {
+                        rsc.activeClips.push_back(foundMask);
                     }
                 }
             }
         }
 
         const RivMat2D& shapeMat = worldMats[i];
-        const float shapeScale = 0.5f * (std::hypot(shapeMat.xx, shapeMat.xy) + std::hypot(shapeMat.yx, shapeMat.yy));
-        const float rootScale = 0.5f * (std::hypot(rootTransform.xx, rootTransform.xy) + std::hypot(rootTransform.yx, rootTransform.yy));
+        const float shapeScale = 0.5f * (FastHypot(shapeMat.xx, shapeMat.xy) + FastHypot(shapeMat.yx, shapeMat.yy));
 
-        for (std::size_t pIdx : childrenOf[i]) {
-            const RivObject& paintObj = objs[pIdx];
-            const std::uint32_t ptk = paintObj.typeKey;
-            if ((ptk != 20u && ptk != 24u) || paintObj.GetU(41u, 1u) == 0u) continue;
+        for (const PrebuiltPaintDef& def : paints) {
+            const bool enabled = ov.IsDirty(def.paintObjIdx)
+                ? (ov.GetU(def.paintObjIdx, 41u, def.enabled ? 1u : 0u) != 0u)
+                : def.enabled;
+            if (!enabled || def.style == RivPaintStyle::None) continue;
 
-            RivPaint paint{};
-            paint.isStroke = (ptk == 24u);
-            paint.evenOdd = (ptk == 20u) && (paintObj.GetU(40u, 0u) == 1u);
-            paint.strokeThickness = paintObj.GetF(47u, 1.0f);
-            paint.strokeCap = paintObj.GetU(48u, 0u);
-            paint.strokeJoin = paintObj.GetU(49u, 0u);
-            paint.transformAffectsStroke = paintObj.GetU(50u, 1u) != 0u;
+            shapePaint.stops.clear();
+            ResolvePrebuiltPaint(def, ov, shapeMat, shapePaint);
 
-            for (std::size_t sc : childrenOf[pIdx]) {
-                const RivObject& so = objs[sc];
-                if (so.typeKey == 18u) { // SolidColor
-                    paint.style = RivPaintStyle::Solid;
-                    paint.solidArgb = so.GetU(37u, 0xFFFFFFFFu);
-                } else if (so.typeKey == 22u || so.typeKey == 17u) { // Linear / Radial Gradient
-                    paint.style = (so.typeKey == 22u) ? RivPaintStyle::Linear : RivPaintStyle::Radial;
-                    const float gx0 = so.GetF(42u, 0.0f), gy0 = so.GetF(33u, 0.0f);
-                    const float gx1 = so.GetF(34u, 0.0f), gy1 = so.GetF(35u, 0.0f);
-                    shapeMat.Transform(gx0, gy0, paint.gradStart.x, paint.gradStart.y);
-                    shapeMat.Transform(gx1, gy1, paint.gradEnd.x, paint.gradEnd.y);
-                    paint.gradOpacity = std::clamp(so.GetF(46u, 1.0f), 0.0f, 1.0f);
-                    for (std::size_t stc : childrenOf[sc]) {
-                        if (objs[stc].typeKey == 19u) {
-                            paint.stops.push_back({objs[stc].GetF(39u, 0.0f), objs[stc].GetU(38u, 0xFFFFFFFFu)});
-                        }
-                    }
-                    std::sort(paint.stops.begin(), paint.stops.end(),
-                              [](const RivGradStop& a, const RivGradStop& b) { return a.pos < b.pos; });
-                }
-            }
-            if (paint.style == RivPaintStyle::None) continue;
-
-            std::vector<RivSubpath> strokeExpanded;
-            const std::vector<RivSubpath>* targetPaths = &shapePaths;
-            bool useEvenOdd = paint.evenOdd;
-            if (paint.isStroke) {
+            const std::vector<RivSubpath>* targetPaths = &rsc.shapePaths;
+            bool useEvenOdd = shapePaint.evenOdd;
+            if (shapePaint.isStroke) {
                 bool trimmedOut = false;
                 bool hasPartialTrim = false;
-                std::vector<RivSubpath> trimmedPaths;
-                for (std::size_t tc : childrenOf[pIdx]) {
-                    if (objs[tc].typeKey == 47u) { // TrimPath (114=start, 115=end, 116=offset, 117=mode)
-                        const float ts = objs[tc].GetF(114u, 0.0f);
-                        const float te = objs[tc].GetF(115u, 0.0f);
-                        const float toff = objs[tc].GetF(116u, 0.0f);
-                        const std::uint32_t tmode = objs[tc].GetU(117u, 1u);
-                        if (std::fabs(te - ts) <= 1e-4f) {
+                rsc.trimmedPaths.clear();
+                for (const PrebuiltPaintTrim& tm : def.trims) {
+                    const bool tmDirty = ov.IsDirty(tm.trimObjIdx);
+                    const float ts = tmDirty ? ov.GetF(tm.trimObjIdx, 114u, tm.start) : tm.start;
+                    const float te = tmDirty ? ov.GetF(tm.trimObjIdx, 115u, tm.end) : tm.end;
+                    const float toff = tmDirty ? ov.GetF(tm.trimObjIdx, 116u, tm.offset) : tm.offset;
+                    const std::uint32_t tmode = tmDirty ? ov.GetU(tm.trimObjIdx, 117u, tm.mode) : tm.mode;
+                    if (std::fabs(te - ts) <= 1e-4f) {
+                        trimmedOut = true;
+                        break;
+                    }
+                    if (!(std::min(ts, te) <= 1e-4f && std::max(ts, te) >= 1.0f - 1e-4f)) {
+                        rsc.nextTrimmed.clear();
+                        TrimRivSubpaths(
+                            hasPartialTrim ? rsc.trimmedPaths : rsc.shapePaths,
+                            ts, te, toff, tmode, rsc.nextTrimmed);
+                        rsc.trimmedPaths.swap(rsc.nextTrimmed);
+                        hasPartialTrim = true;
+                        if (rsc.trimmedPaths.empty()) {
                             trimmedOut = true;
                             break;
-                        }
-                        if (!(std::min(ts, te) <= 1e-4f && std::max(ts, te) >= 1.0f - 1e-4f)) {
-                            std::vector<RivSubpath> nextTrimmed;
-                            TrimRivSubpaths(
-                                hasPartialTrim ? trimmedPaths : shapePaths,
-                                ts, te, toff, tmode, nextTrimmed);
-                            trimmedPaths = std::move(nextTrimmed);
-                            hasPartialTrim = true;
-                            if (trimmedPaths.empty()) {
-                                trimmedOut = true;
-                                break;
-                            }
                         }
                     }
                 }
                 if (trimmedOut) continue;
-                const float effScale = paint.transformAffectsStroke ? shapeScale : rootScale;
-                const float halfW = 0.5f * paint.strokeThickness * effScale;
+                const float effScale = shapePaint.transformAffectsStroke ? shapeScale : rootScale;
+                const float halfW = 0.5f * shapePaint.strokeThickness * effScale;
+                rsc.strokeExpanded.clear();
                 ExpandStrokeToSubpaths(
-                    hasPartialTrim ? trimmedPaths : shapePaths,
-                    halfW, paint.strokeCap, strokeExpanded);
-                targetPaths = &strokeExpanded;
+                    hasPartialTrim ? rsc.trimmedPaths : rsc.shapePaths,
+                    halfW, shapePaint.strokeCap, rsc, rsc.strokeExpanded);
+                targetPaths = &rsc.strokeExpanded;
                 useEvenOdd = false;
             }
-            if (targetPaths->empty()) continue;
-
-            int mx0 = 0, my0 = 0, mw = 0, mh = 0;
-            std::vector<float> covMask;
-            RasterizeCoverageMask(surfW, surfH, *targetPaths, useEvenOdd, mx0, my0, mw, mh, covMask);
-            if (mw <= 0 || mh <= 0) continue;
-
-            const float effOp = worldOpacity[i] * paint.gradOpacity;
-            float solidPremul[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-            if (paint.style == RivPaintStyle::Solid) {
-                UnpackArgbPremul(paint.solidArgb, effOp, solidPremul);
-                if (solidPremul[3] <= 0.001f) continue;
-            }
-
-            const float gdx = paint.gradEnd.x - paint.gradStart.x;
-            const float gdy = paint.gradEnd.y - paint.gradStart.y;
-            const float glen2 = std::max(1e-5f, gdx * gdx + gdy * gdy);
-            const float gradRad = std::max(1e-3f, std::sqrt(glen2));
-
-            for (int ry = 0; ry < mh; ++ry) {
-                const int py = my0 + ry;
-                const float* mRow = covMask.data() + static_cast<std::size_t>(ry) * static_cast<std::size_t>(mw);
-                float* dstRow = surfPremul.data() + static_cast<std::size_t>(py) * static_cast<std::size_t>(surfW) * 4u;
-                for (int rx = 0; rx < mw; ++rx) {
-                    float cov = mRow[rx];
-                    if (cov <= 0.002f) continue;
-                    const int px = mx0 + rx;
-                    for (const ClipMaskBuf& cb : activeClips) {
-                        if (px < cb.x0 || px >= cb.x0 + cb.w || py < cb.y0 || py >= cb.y0 + cb.h) {
-                            cov = 0.0f;
-                            break;
-                        }
-                        cov *= cb.mask[static_cast<std::size_t>(py - cb.y0) * static_cast<std::size_t>(cb.w) +
-                                       static_cast<std::size_t>(px - cb.x0)];
-                        if (cov <= 0.002f) break;
-                    }
-                    if (cov <= 0.002f) continue;
-
-                    float col[4];
-                    if (paint.style == RivPaintStyle::Solid) {
-                        col[0] = solidPremul[0] * cov;
-                        col[1] = solidPremul[1] * cov;
-                        col[2] = solidPremul[2] * cov;
-                        col[3] = solidPremul[3] * cov;
-                    } else if (paint.style == RivPaintStyle::Linear) {
-                        const float t = (((static_cast<float>(px) + 0.5f) - paint.gradStart.x) * gdx +
-                                         ((static_cast<float>(py) + 0.5f) - paint.gradStart.y) * gdy) / glen2;
-                        SampleStopsPremul(paint.stops, t, effOp * cov, col);
-                    } else {
-                        const float d = std::hypot((static_cast<float>(px) + 0.5f) - paint.gradStart.x,
-                                                   (static_cast<float>(py) + 0.5f) - paint.gradStart.y) / gradRad;
-                        SampleStopsPremul(paint.stops, d, effOp * cov, col);
-                    }
-
-                    float* dpx = dstRow + static_cast<std::size_t>(px) * 4u;
-                    const float invA = 1.0f - col[3];
-                    dpx[0] = col[0] + dpx[0] * invA;
-                    dpx[1] = col[1] + dpx[1] * invA;
-                    dpx[2] = col[2] + dpx[2] * invA;
-                    dpx[3] = col[3] + dpx[3] * invA;
-                }
-            }
+            blendPathsWithPaint(
+                *targetPaths, useEvenOdd, shapePaint,
+                worldOpacity[i] * shapePaint.gradOpacity, rsc.activeClips);
         }
     }
 }
@@ -1634,11 +2536,17 @@ bool IsRiveAssetUri(std::string_view uri) noexcept {
     return false;
 }
 
-bool RenderRiveUriToImage(
+bool RenderRiveUriToImageIfChanged(
     std::string_view uri,
     const ImageAtlas& atlas,
     std::string_view localBaseDir,
+    const std::uint64_t* prevPoseHash,
+    std::uint64_t& outPoseHash,
+    bool& outChanged,
     DecodedImage& outImage) {
+    outPoseHash = 0u;
+    outChanged = true;
+
     std::string_view rest = uri;
     if (rest.size() >= 7u && rest.substr(0u, 7u) == "rive://") {
         rest.remove_prefix(7u);
@@ -1651,38 +2559,79 @@ bool RenderRiveUriToImage(
     }
     if (filePart.empty()) return false;
 
-    std::unordered_map<std::string, float> inputs;
+    RivInputPairs inputs;
+    float tLoopSec = 0.0f;
+    float tStateSec = 0.0f;
+    bool hasTs = false;
+    float reqW = 0.0f;
+    float reqH = 0.0f;
     while (!queryPart.empty()) {
         const std::size_t amp = queryPart.find('&');
         const std::string_view kv = (amp != std::string_view::npos) ? queryPart.substr(0u, amp) : queryPart;
         if (const std::size_t eq = kv.find('='); eq != std::string_view::npos) {
-            const std::string key(kv.substr(0u, eq));
-            const std::string valStr(kv.substr(eq + 1u));
-            if (valStr == "true" || valStr == "True") inputs[key] = 1.0f;
-            else if (valStr == "false" || valStr == "False") inputs[key] = 0.0f;
-            else {
+            const std::string_view kView = kv.substr(0u, eq);
+            const std::string_view vView = kv.substr(eq + 1u);
+            float parsedVal = 0.0f;
+            bool okNum = false;
+            if (vView == "true" || vView == "True") {
+                parsedVal = 1.0f;
+                okNum = true;
+            } else if (vView == "false" || vView == "False") {
+                parsedVal = 0.0f;
+                okNum = true;
+            } else if (!vView.empty() && vView.size() < 63u) {
+                char numBuf[64];
+                std::memcpy(numBuf, vView.data(), vView.size());
+                numBuf[vView.size()] = '\0';
                 char* endp = nullptr;
-                const float fv = std::strtof(valStr.c_str(), &endp);
-                if (endp != valStr.c_str()) inputs[key] = fv;
+                parsedVal = std::strtof(numBuf, &endp);
+                okNum = (endp != numBuf);
+            }
+            if (okNum) {
+                if (kView == "__t") {
+                    tLoopSec = std::max(0.0f, parsedVal);
+                } else if (kView == "__ts") {
+                    tStateSec = std::max(0.0f, parsedVal);
+                    hasTs = true;
+                } else if (kView == "__w") {
+                    reqW = parsedVal;
+                } else if (kView == "__h") {
+                    reqH = parsedVal;
+                } else if (kView != "__inst") {
+                    bool replaced = false;
+                    for (auto& kvIn : inputs) {
+                        if (kvIn.first == kView) {
+                            kvIn.second = parsedVal;
+                            replaced = true;
+                            break;
+                        }
+                    }
+                    if (!replaced) {
+                        inputs.emplace_back(kView, parsedVal);
+                    }
+                }
             }
         }
         if (amp == std::string_view::npos) break;
         queryPart.remove_prefix(amp + 1u);
     }
+    if (!hasTs) {
+        tStateSec = tLoopSec;
+    }
 
     const std::string resolvedPath = atlas.ResolveUriToPath(filePart, localBaseDir);
     if (resolvedPath.empty()) return false;
 
-    static std::mutex sParsedCacheMutex;
-    static std::unordered_map<std::string, std::shared_ptr<const std::vector<RivObject>>> sParsedCache;
-    std::shared_ptr<const std::vector<RivObject>> parsedPtr;
+    static std::mutex sDocCacheMutex;
+    static std::unordered_map<std::string, std::shared_ptr<const PrebuiltRiveDocument>> sDocCache;
+    std::shared_ptr<const PrebuiltRiveDocument> docPtr;
     {
-        std::lock_guard<std::mutex> lock(sParsedCacheMutex);
-        if (const auto it = sParsedCache.find(resolvedPath); it != sParsedCache.end()) {
-            parsedPtr = it->second;
+        std::lock_guard<std::mutex> lock(sDocCacheMutex);
+        if (const auto it = sDocCache.find(resolvedPath); it != sDocCache.end()) {
+            docPtr = it->second;
         }
     }
-    if (!parsedPtr) {
+    if (!docPtr) {
         std::ifstream ifs(resolvedPath, std::ios::binary | std::ios::ate);
         if (!ifs) return false;
         const auto fsize = ifs.tellg();
@@ -1691,63 +2640,121 @@ bool RenderRiveUriToImage(
         ifs.seekg(0, std::ios::beg);
         if (!ifs.read(reinterpret_cast<char*>(bytes.data()), fsize)) return false;
 
-        auto parsed = std::make_shared<std::vector<RivObject>>();
-        if (!ParseRiveFileBytes(bytes, *parsed)) return false;
+        std::vector<RivObject> parsedObjs;
+        if (!ParseRiveFileBytes(bytes, parsedObjs)) return false;
+        auto prebuilt = std::make_shared<PrebuiltRiveDocument>(BuildPrebuiltDocument(parsedObjs));
+        if (prebuilt->artboards.empty()) return false;
         {
-            std::lock_guard<std::mutex> lock(sParsedCacheMutex);
-            if (sParsedCache.size() >= 64u) {
-                sParsedCache.clear();
+            std::lock_guard<std::mutex> lock(sDocCacheMutex);
+            if (sDocCache.size() >= 32u) {
+                sDocCache.clear();
             }
-            sParsedCache[resolvedPath] = parsed;
+            sDocCache[resolvedPath] = prebuilt;
         }
-        parsedPtr = std::move(parsed);
+        docPtr = std::move(prebuilt);
     }
-    const std::vector<RivObject>& allObjs = *parsedPtr;
 
-    std::vector<RivArtboardSlice> abSlices;
-    for (std::size_t i = 0u; i < allObjs.size(); ++i) {
-        if (allObjs[i].typeKey == 1u) {
-            if (!abSlices.empty()) abSlices.back().endIdx = i;
-            abSlices.push_back({i, allObjs.size()});
-        }
-    }
-    if (abSlices.empty()) return false;
+    const PrebuiltRiveDocument& doc = *docPtr;
+    if (doc.artboards.empty()) return false;
 
-    const RivObject& mainAb = allObjs[abSlices[0].startIdx];
-    const float natW = std::max(1.0f, mainAb.GetF(7u, 500.0f));
-    const float natH = std::max(1.0f, mainAb.GetF(8u, 200.0f));
+    const PrebuiltArtboard& mainAb = doc.artboards[0];
+    const float natW = mainAb.natW;
+    const float natH = mainAb.natH;
     float scale = 1.0f;
     const float maxDim = std::max(natW, natH);
-    if (maxDim > 1280.0f) {
-        scale = 1280.0f / maxDim;
+    if (maxDim > 640.0f) {
+        scale = 640.0f / maxDim;
     }
-    const int surfW = std::clamp(static_cast<int>(std::lround(natW * scale)), 1, 2048);
-    const int surfH = std::clamp(static_cast<int>(std::lround(natH * scale)), 1, 2048);
+    if (reqW >= 16.0f && reqH >= 16.0f) {
+        const float maxW = std::max(64.0f, reqW);
+        const float maxH = std::max(64.0f, reqH);
+        const float fitScale = std::min(maxW / natW, maxH / natH);
+        scale = std::min(scale, fitScale);
+    }
+    const int surfW = std::clamp(static_cast<int>(std::lround(natW * scale)), 1, 640);
+    const int surfH = std::clamp(static_cast<int>(std::lround(natH * scale)), 1, 640);
 
-    std::vector<float> surfPremul(static_cast<std::size_t>(surfW) * static_cast<std::size_t>(surfH) * 4u, 0.0f);
-    const RivMat2D rootMat = RivMat2D::FromTRS(0.0f, 0.0f, 0.0f,
-                                               static_cast<float>(surfW) / natW,
-                                               static_cast<float>(surfH) / natH);
-    RenderArtboardRecursive(allObjs, abSlices, 0u, rootMat, 1.0f, inputs, surfW, surfH, surfPremul, 0);
+    const RivMat2D rootMat = RivMat2D::FromTRS(
+        0.0f, 0.0f, 0.0f,
+        static_cast<float>(surfW) / natW,
+        static_cast<float>(surfH) / natH);
+
+    std::uint64_t poseHash = 14695981039346656037ULL;
+    HashMix64(poseHash, static_cast<std::uint64_t>(surfW));
+    HashMix64(poseHash, static_cast<std::uint64_t>(surfH));
+    for (const char ch : resolvedPath) {
+        poseHash ^= static_cast<unsigned char>(ch);
+        poseHash *= 1099511628211ULL;
+    }
+
+    EvaluatedArtboardTree evalRoot{};
+    BuildEvaluatedTreeRecursive(
+        doc, 0u, rootMat, 1.0f,
+        tLoopSec, tStateSec, inputs, 0,
+        evalRoot, poseHash);
+
+    outPoseHash = poseHash;
+    if (prevPoseHash != nullptr && *prevPoseHash == poseHash) {
+        outChanged = false;
+        return true;
+    }
+
+    auto& sc = ThreadRasterScratch();
+    const std::size_t byteCount = static_cast<std::size_t>(surfW) * static_cast<std::size_t>(surfH) * 4u;
+    sc.surfPremulU8.assign(byteCount, 0u);
+    RenderArtboardEvaluated(doc, evalRoot, rootMat, surfW, surfH, sc.surfPremulU8, 0);
+
+    static const std::array<std::uint16_t, 256u> kUnpremulScale = []() {
+        std::array<std::uint16_t, 256u> lut{};
+        lut[0] = 0u;
+        for (std::uint32_t a = 1u; a < 256u; ++a) {
+            lut[a] = static_cast<std::uint16_t>((255u * 256u + a / 2u) / a);
+        }
+        return lut;
+    }();
 
     outImage.width = static_cast<std::uint32_t>(surfW);
     outImage.height = static_cast<std::uint32_t>(surfH);
     outImage.format = ImageFormat::RawRgba8;
-    outImage.rgbaPixels.resize(static_cast<std::size_t>(surfW) * static_cast<std::size_t>(surfH) * 4u);
-    for (std::size_t p = 0u, total = static_cast<std::size_t>(surfW) * static_cast<std::size_t>(surfH); p < total; ++p) {
-        const float pa = std::clamp(surfPremul[p * 4u + 3u], 0.0f, 1.0f);
-        std::uint8_t* dst = outImage.rgbaPixels.data() + p * 4u;
-        if (pa <= 0.001f) {
-            dst[0] = dst[1] = dst[2] = dst[3] = 0u;
+    outImage.rgbaPixels.resize(byteCount);
+    const std::uint8_t* __restrict src = sc.surfPremulU8.data();
+    std::uint8_t* __restrict dst = outImage.rgbaPixels.data();
+    const std::size_t totalPixels = static_cast<std::size_t>(surfW) * static_cast<std::size_t>(surfH);
+    for (std::size_t p = 0u; p < totalPixels; ++p) {
+        std::uint32_t px = 0u;
+        std::memcpy(&px, src + p * 4u, 4u);
+        const std::uint8_t a = static_cast<std::uint8_t>(px >> 24u);
+        std::uint8_t* d = dst + p * 4u;
+        if (a == 0u) {
+            std::uint32_t zero = 0u;
+            std::memcpy(d, &zero, 4u);
+        } else if (a == 255u) {
+            std::memcpy(d, &px, 4u);
         } else {
-            const float invA = 1.0f / pa;
-            dst[0] = static_cast<std::uint8_t>(std::clamp(surfPremul[p * 4u + 0u] * invA * 255.0f + 0.5f, 0.0f, 255.0f));
-            dst[1] = static_cast<std::uint8_t>(std::clamp(surfPremul[p * 4u + 1u] * invA * 255.0f + 0.5f, 0.0f, 255.0f));
-            dst[2] = static_cast<std::uint8_t>(std::clamp(surfPremul[p * 4u + 2u] * invA * 255.0f + 0.5f, 0.0f, 255.0f));
-            dst[3] = static_cast<std::uint8_t>(std::clamp(pa * 255.0f + 0.5f, 0.0f, 255.0f));
+            const std::uint32_t scaleQ8 = kUnpremulScale[a];
+            const std::uint32_t r = std::min<std::uint32_t>(255u, ((px & 0xFFu) * scaleQ8 + 128u) >> 8u);
+            const std::uint32_t g = std::min<std::uint32_t>(255u, (((px >> 8u) & 0xFFu) * scaleQ8 + 128u) >> 8u);
+            const std::uint32_t b = std::min<std::uint32_t>(255u, (((px >> 16u) & 0xFFu) * scaleQ8 + 128u) >> 8u);
+            const std::uint32_t outPx = r | (g << 8u) | (b << 16u) | (static_cast<std::uint32_t>(a) << 24u);
+            std::memcpy(d, &outPx, 4u);
         }
     }
+    if (sc.surfPremulU8.capacity() > 1536u * 1024u) {
+        std::vector<std::uint8_t>().swap(sc.surfPremulU8);
+    }
+    outChanged = true;
     return true;
+}
+
+bool RenderRiveUriToImage(
+    std::string_view uri,
+    const ImageAtlas& atlas,
+    std::string_view localBaseDir,
+    DecodedImage& outImage) {
+    std::uint64_t ignoredHash = 0u;
+    bool ignoredChanged = true;
+    return RenderRiveUriToImageIfChanged(
+        uri, atlas, localBaseDir, nullptr, ignoredHash, ignoredChanged, outImage);
 }
 
 } // namespace aero

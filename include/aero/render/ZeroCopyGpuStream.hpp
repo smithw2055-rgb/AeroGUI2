@@ -99,6 +99,8 @@ public:
         std::vector<std::uint8_t>& outRgba8,
         Color clearColor = Color{0.06f, 0.08f, 0.11f, 1.0f});
 
+    static void ReleaseTransientPools() noexcept;
+
     // Rasterize a Blur / Pixelate node span into a tight premultiplied RGBA8 patch for GPU composition.
     static bool RasterizeBlurSpanPatchPremulRgba8(
         const PagedRenderTree& tree,

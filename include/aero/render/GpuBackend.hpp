@@ -442,6 +442,8 @@ private:
         const char* shaderLabelPrefix,
         AeroGLuint& outProgramId);
     bool EnsureEffectGpuResources(std::uint32_t viewportWidth, std::uint32_t viewportHeight);
+    bool EnsureSecondEffectFbo(std::uint32_t viewportWidth, std::uint32_t viewportHeight);
+    bool EnsureHalfEffectGpuResources(std::uint32_t viewportWidth, std::uint32_t viewportHeight);
     void DestroyEffectGpuResources() noexcept;
     void BindAeroVertexLayout() noexcept;
     void SyncUnifiedUiAtlas(const PagedRenderTree& tree);
@@ -473,6 +475,13 @@ private:
     AeroGLuint effectFboTexIds_[2]{0u, 0u};
     std::uint32_t effectFboW_ = 0;
     std::uint32_t effectFboH_ = 0;
+    std::uint32_t effectFbo1W_ = 0;
+    std::uint32_t effectFbo1H_ = 0;
+    AeroGLuint halfEffectFboIds_[2]{0u, 0u};
+    AeroGLuint halfEffectFboTexIds_[2]{0u, 0u};
+    std::uint32_t halfEffectFboW_ = 0;
+    std::uint32_t halfEffectFboH_ = 0;
+    bool halfEffectFailed_ = false;
     bool effectGpuPipelineFailed_ = false;
     AeroGLint uEffectViewportSizeLoc_ = -1;
     AeroGLint uEffectSrcTexLoc_ = -1;

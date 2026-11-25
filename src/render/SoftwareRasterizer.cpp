@@ -220,8 +220,8 @@ struct PremulOffscreenLayer {
 };
 
 struct PremulLayerBufferPool {
-    static constexpr std::size_t kMaxSingleBufferBytes = 8u * 1024u * 1024u;
-    static constexpr std::size_t kMaxTotalPooledBytes = 24u * 1024u * 1024u;
+    static constexpr std::size_t kMaxSingleBufferBytes = 1u * 1024u * 1024u;
+    static constexpr std::size_t kMaxTotalPooledBytes = 2u * 1024u * 1024u;
 
     std::vector<std::vector<float>> freeBuffers;
     std::size_t totalPooledBytes = 0u;
@@ -262,13 +262,18 @@ struct PremulLayerBufferPool {
         const std::size_t capBytes = target.capacity() * sizeof(float);
         if (capBytes > 0u &&
             capBytes <= kMaxSingleBufferBytes &&
-            freeBuffers.size() < 8u &&
+            freeBuffers.size() < 4u &&
             (totalPooledBytes + capBytes) <= kMaxTotalPooledBytes) {
             totalPooledBytes += capBytes;
             freeBuffers.push_back(std::move(target));
         } else {
             std::vector<float>().swap(target);
         }
+    }
+
+    void Clear() noexcept {
+        std::vector<std::vector<float>>().swap(freeBuffers);
+        totalPooledBytes = 0u;
     }
 };
 
@@ -2972,6 +2977,10 @@ void RasterizeNodeSpanRecursive(
 }
 
 } // namespace
+
+void ZeroCopyGpuStream::ReleaseTransientPools() noexcept {
+    gTlPremulLayerPool.Clear();
+}
 
 void ZeroCopyGpuStream::RasterizeTreeToRgba8(
     const PagedRenderTree& tree,

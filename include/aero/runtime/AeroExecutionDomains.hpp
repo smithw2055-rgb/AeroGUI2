@@ -127,6 +127,7 @@ public:
     [[nodiscard]] bool isTypeSimState(realscript::semantic::SymbolId typeId) const noexcept;
     [[nodiscard]] bool isTypeObservable(realscript::semantic::SymbolId typeId) const noexcept;
     [[nodiscard]] bool isSimCommandFunction(realscript::semantic::SymbolId functionId) const noexcept;
+    [[nodiscard]] std::uint64_t globalObservableEpoch() const noexcept;
 
     [[nodiscard]] std::optional<realscript::runtime::Value> readCrossHeapFieldFast(
         realscript::runtime::ObjectRef simObject,
@@ -456,6 +457,7 @@ private:
     mutable std::atomic<bool> hasSimCommands_{false};
     mutable std::atomic<bool> hasSimStateTypes_{false};
     mutable std::atomic<bool> hasObservableTypes_{false};
+    mutable std::atomic<std::uint64_t> globalObservableEpoch_{1u};
     mutable std::atomic<std::uint64_t> desktopJitInvokeHits_{0u};
     mutable std::atomic<std::uint64_t> desktopJitFallbackHits_{0u};
 };

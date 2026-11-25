@@ -803,6 +803,39 @@ internal static class XamlDomParser {
 }
 
 public static class XamlReader {
+    private static string[] _cachedExtDictUris;
+    private static ResourceDictionary[] _cachedExtDicts;
+
+    private static ResourceDictionary TryGetCachedExtDict(string uri) {
+        if (uri == null || uri.Length == 0 || _cachedExtDictUris == null) { return null; }
+        for (int i = _cachedExtDictUris.Length - 1; i >= 0; i -= 1) {
+            if (_cachedExtDictUris[i] == uri) {
+                return _cachedExtDicts[i];
+            }
+        }
+        return null;
+    }
+
+    private static void StoreCachedExtDict(string uri, ResourceDictionary rd) {
+        if (uri == null || uri.Length == 0 || rd == null) { return; }
+        if (_cachedExtDictUris == null) {
+            _cachedExtDictUris = new string[0];
+            _cachedExtDicts = new ResourceDictionary[0];
+        }
+        for (int i = 0; i < _cachedExtDictUris.Length; i += 1) {
+            if (_cachedExtDictUris[i] == uri) {
+                _cachedExtDicts[i] = rd;
+                return;
+            }
+        }
+        if (_cachedExtDictUris.Length >= 24) {
+            _cachedExtDictUris.RemoveAt(0);
+            _cachedExtDicts.RemoveAt(0);
+        }
+        _cachedExtDictUris.Push(uri);
+        _cachedExtDicts.Push(rd);
+    }
+
     public static UIElement LoadUri(string uri, ResourceDictionary fallbackResources = null) {
         if (uri == null || uri.Trim().Length == 0) { return null; }
         string normUri = uri.Trim();
@@ -818,12 +851,16 @@ public static class XamlReader {
     public static ResourceDictionary LoadResourceDictionary(string uri) {
         if (uri == null || uri.Trim().Length == 0) { return null; }
         string normUri = uri.Trim();
+        ResourceDictionary cached = TryGetCachedExtDict(normUri);
+        if (cached != null) { return cached; }
         string text = Host_ReadTextAsset(normUri);
         if (text == null || text.Trim().Length == 0) { return null; }
         XamlXmlNode root = XamlDomParser.ParseDocument(text);
         if (root == null) { return null; }
         var ctx = new XamlBuildContext(null, normUri);
-        return BuildResourceDictionaryNode(root, ctx);
+        ResourceDictionary built = BuildResourceDictionaryNode(root, ctx);
+        StoreCachedExtDict(normUri, built);
+        return built;
     }
 
     private static UIElement ParseWithUri(string xamlText, ResourceDictionary fallbackResources, string baseUri) {
@@ -2417,20 +2454,31 @@ public static class XamlReader {
                         string srcAttr = mNode.GetAttr("Source");
                         if (srcAttr != null && srcAttr.Trim().Length > 0) {
                             string resolvedUri = XamlStr.ResolveUri(ctx.BaseUri, srcAttr);
-                            string text = Host_ReadTextAsset(resolvedUri);
-                            if (text == null || text.Trim().Length == 0) {
-                                resolvedUri = srcAttr.Trim();
-                                text = Host_ReadTextAsset(resolvedUri);
+                            ResourceDictionary cachedSub = ctx.Scopes.Length <= 2 ? TryGetCachedExtDict(resolvedUri) : null;
+                            if (cachedSub == null && ctx.Scopes.Length <= 2) {
+                                cachedSub = TryGetCachedExtDict(srcAttr.Trim());
                             }
-                            if (text != null && text.Trim().Length > 0) {
-                                XamlXmlNode subRoot = XamlDomParser.ParseDocument(text);
-                                if (subRoot != null) {
-                                    var subCtx = new XamlBuildContext(ctx.FallbackResources, resolvedUri);
-                                    for (int s = 0; s < ctx.Scopes.Length; s += 1) {
-                                        subCtx.PushScope(ctx.Scopes[s]);
+                            if (cachedSub != null) {
+                                rd.Merge(cachedSub);
+                            } else {
+                                string text = Host_ReadTextAsset(resolvedUri);
+                                if (text == null || text.Trim().Length == 0) {
+                                    resolvedUri = srcAttr.Trim();
+                                    text = Host_ReadTextAsset(resolvedUri);
+                                }
+                                if (text != null && text.Trim().Length > 0) {
+                                    XamlXmlNode subRoot = XamlDomParser.ParseDocument(text);
+                                    if (subRoot != null) {
+                                        var subCtx = new XamlBuildContext(ctx.FallbackResources, resolvedUri);
+                                        for (int s = 0; s < ctx.Scopes.Length; s += 1) {
+                                            subCtx.PushScope(ctx.Scopes[s]);
+                                        }
+                                        ResourceDictionary subDict = BuildResourceDictionaryNode(subRoot, subCtx);
+                                        if (ctx.Scopes.Length <= 2 && subDict != null) {
+                                            StoreCachedExtDict(resolvedUri, subDict);
+                                        }
+                                        rd.Merge(subDict);
                                     }
-                                    ResourceDictionary subDict = BuildResourceDictionaryNode(subRoot, subCtx);
-                                    rd.Merge(subDict);
                                 }
                             }
                         } else {

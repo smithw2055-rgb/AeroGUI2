@@ -1159,6 +1159,16 @@ public class DataTrigger : TriggerBase {
     private static int _lastSeenClobberEpoch = 0;
     private static int _reactiveCompactDisposeEpoch = -1;
     private static bool _reactiveHookInstalled = false;
+    private static bool _reactiveAllFastEpochReady = false;
+    private static int _reactiveFastNativeVmEp = -1;
+    private static int _reactiveFastManagedVmEp = -1;
+    private static int _reactiveFastUiPropEp = -1;
+    private static int _reactiveFastLayoutEp = -1;
+    private static int _reactiveFastDcEp = -1;
+    private static int _reactiveFastTreeEp = -1;
+    private static int _reactiveFastVisEp = -1;
+    private static int _reactiveFastDispEp = -1;
+    private static int _reactiveFastClobberEp = -1;
     public string BindingPath { get; set; } = "";
     public string ElementName { get; set; } = "";
     public string RelativeSourceMode { get; set; } = "";
@@ -1330,6 +1340,7 @@ public class DataTrigger : TriggerBase {
         _reactiveSrcEl.Push(null);
         _reactiveSrcTreeEpoch.Push(0);
         _reactiveSrcChainEpoch.Push(0);
+        _reactiveAllFastEpochReady = false;
     }
 
     internal bool CanUseFastDcCache() {
@@ -1396,6 +1407,7 @@ public class DataTrigger : TriggerBase {
 
     internal static void CleanupDisposedReactive() {
         if (_reactiveTriggers == null || _reactiveTargets == null) { return; }
+        _reactiveAllFastEpochReady = false;
         for (int i = _reactiveTargets.Length - 1; i >= 0; i -= 1) {
             if (_reactiveTargets[i] == null || _reactiveTargets[i]._isDisposedTree) {
                 _reactiveTriggers.RemoveAt(i);
@@ -1418,6 +1430,26 @@ public class DataTrigger : TriggerBase {
 
     public static void FlushReactive() {
         if (_reactiveTriggers == null || _reactiveTargets == null || _reactiveTriggers.Length == 0) { return; }
+        if (BindingEngine._inFlushPass && _reactiveAllFastEpochReady &&
+            _reactiveFastNativeVmEp == BindingEngine._curNativeVmEpoch &&
+            _reactiveFastManagedVmEp == BindingEngine._curManagedVmEpoch &&
+            _reactiveFastUiPropEp == UIElement._globalPropEpoch &&
+            _reactiveFastLayoutEp == BindingEngine._curLayoutSizeEpoch &&
+            _reactiveFastDcEp == UIElement._dataContextEpoch &&
+            _reactiveFastTreeEp == UIElement._treeParentEpoch &&
+            _reactiveFastVisEp == UIElement._visibilityEpoch &&
+            _reactiveFastDispEp == UIElement._disposeEpoch &&
+            _reactiveFastClobberEp == _sharedPropClobberedEpoch) {
+            return;
+        }
+        int snapNativeVmEp = BindingEngine._curNativeVmEpoch;
+        int snapManagedVmEp = BindingEngine._curManagedVmEpoch;
+        int snapUiPropEp = UIElement._globalPropEpoch;
+        int snapLayoutEp = BindingEngine._curLayoutSizeEpoch;
+        int snapDcEp = UIElement._dataContextEpoch;
+        int snapTreeEp = UIElement._treeParentEpoch;
+        int snapVisEp = UIElement._visibilityEpoch;
+        int snapDispEp = UIElement._disposeEpoch;
         if (_reactiveSrcEl == null) {
             _reactiveSrcEl = new UIElement[0];
             _reactiveSrcTreeEpoch = new int[0];
@@ -1456,9 +1488,14 @@ public class DataTrigger : TriggerBase {
             while (_reactiveSrcChainEpoch.Length > write) { _reactiveSrcChainEpoch.RemoveAt(_reactiveSrcChainEpoch.Length - 1); }
         }
         int n = _reactiveTriggers.Length;
-        if (n == 0) { return; }
+        if (n == 0) {
+            _reactiveAllFastEpochReady = false;
+            return;
+        }
         int prevClobber = _lastSeenClobberEpoch;
         bool anyTransition = false;
+        bool allFastVer = true;
+        bool anyDynamicActive = false;
         for (int i = 0; i < n; i += 1) {
             DataTrigger dt = _reactiveTriggers[i];
             UIElement t = _reactiveTargets[i];
@@ -1521,6 +1558,7 @@ public class DataTrigger : TriggerBase {
                     if (wasAct && !dt.WasActiveFor(t)) { anyTransition = true; }
                 }
             } else {
+                allFastVer = false;
                 bool wasAct = dt.WasActiveFor(t);
                 dt.DeactivateIfUnmatched(t, null);
                 if (wasAct && !dt.WasActiveFor(t)) { anyTransition = true; }
@@ -1533,9 +1571,13 @@ public class DataTrigger : TriggerBase {
         for (int i = 0; i < n; i += 1) {
             DataTrigger dt = _reactiveTriggers[i];
             UIElement t = _reactiveTargets[i];
-            if (t.IsInsideClosedPopup()) { continue; }
+            if (t.IsInsideClosedPopup()) {
+                if (!dt.CanUseFastDcCache() && !dt.CanUseFastElemCache()) { allFastVer = false; }
+                continue;
+            }
             if (_reactiveLastVer[i] >= 0) {
                 if (_reactiveLastMatch[i]) {
+                    if (dt.HasDynamicSetterBindings()) { anyDynamicActive = true; }
                     if (!dt.WasActiveFor(t)) {
                         anyTransition = true;
                         dt.ApplyMatchedCore(t, null);
@@ -1544,12 +1586,37 @@ public class DataTrigger : TriggerBase {
                     }
                 }
             } else {
+                allFastVer = false;
                 bool wasAct = dt.WasActiveFor(t);
                 dt.ApplyIfMatched(t, null);
                 if (!wasAct && dt.WasActiveFor(t)) { anyTransition = true; }
             }
         }
         _lastSeenClobberEpoch = _sharedPropClobberedEpoch;
+        if (allFastVer && !anyTransition && !anyDynamicActive &&
+            BindingEngine._inFlushPass &&
+            snapNativeVmEp == BindingEngine._curNativeVmEpoch &&
+            snapManagedVmEp == BindingEngine._curManagedVmEpoch &&
+            snapUiPropEp == UIElement._globalPropEpoch &&
+            snapLayoutEp == BindingEngine._curLayoutSizeEpoch &&
+            snapDcEp == UIElement._dataContextEpoch &&
+            snapTreeEp == UIElement._treeParentEpoch &&
+            snapVisEp == UIElement._visibilityEpoch &&
+            snapDispEp == UIElement._disposeEpoch &&
+            _sharedPropClobberedEpoch == prevClobber) {
+            _reactiveAllFastEpochReady = true;
+            _reactiveFastNativeVmEp = snapNativeVmEp;
+            _reactiveFastManagedVmEp = snapManagedVmEp;
+            _reactiveFastUiPropEp = snapUiPropEp;
+            _reactiveFastLayoutEp = snapLayoutEp;
+            _reactiveFastDcEp = snapDcEp;
+            _reactiveFastTreeEp = snapTreeEp;
+            _reactiveFastVisEp = snapVisEp;
+            _reactiveFastDispEp = snapDispEp;
+            _reactiveFastClobberEp = _sharedPropClobberedEpoch;
+        } else {
+            _reactiveAllFastEpochReady = false;
+        }
     }
 
     public override bool IsMatched(UIElement target) {
@@ -4356,6 +4423,16 @@ internal class BindingEntry : DependencyObject {
     private int _fastPropKindCache = 0;
     private DependencyObject _lastMidBox;
     private int _lastMidDirtyMask = -1;
+    private bool _fastKind1VmClean = false;
+    private bool _fastElemClean = false;
+    private int _fastNativeVmEp = -1;
+    private int _fastManagedVmEp = -1;
+    private int _fastDcEp = -1;
+    private int _fastTreeEp = -1;
+    private int _fastVisEp = -1;
+    private int _fastUiPropEp = -1;
+    private int _fastLayoutEp = -1;
+    private int _fastDispEp = -1;
 
     internal static bool CanUseFastElementPropEpoch(UIElement el, string prop) {
         if (el == null || prop == null || prop.Length == 0) {
@@ -5006,6 +5083,25 @@ internal class BindingEntry : DependencyObject {
             }
         }
         if (Mode == 2 && OneTimeDone) { return; }
+        if (BindingEngine._inFlushPass && !BindingEngine._inSubtreeFlush && OneTimeDone) {
+            if (_fastKind1VmClean && Kind == 1 &&
+                BindingEngine._curNativeVmEpoch == _fastNativeVmEp &&
+                BindingEngine._curManagedVmEpoch == _fastManagedVmEp &&
+                UIElement._dataContextEpoch == _fastDcEp &&
+                UIElement._treeParentEpoch == _fastTreeEp &&
+                UIElement._visibilityEpoch == _fastVisEp) {
+                return;
+            }
+            if (_fastElemClean &&
+                UIElement._globalPropEpoch == _fastUiPropEp &&
+                BindingEngine._curLayoutSizeEpoch == _fastLayoutEp &&
+                UIElement._treeParentEpoch == _fastTreeEp &&
+                UIElement._dataContextEpoch == _fastDcEp &&
+                UIElement._visibilityEpoch == _fastVisEp &&
+                UIElement._disposeEpoch == _fastDispEp) {
+                return;
+            }
+        }
 
         if (Kind == 0 && LambdaGetter != null) {
             DependencyObject val = LambdaGetter();
@@ -5019,11 +5115,18 @@ internal class BindingEntry : DependencyObject {
         }
 
         if (Kind == 2) {
+            int snapUiPropEp = UIElement._globalPropEpoch;
+            int snapLayoutEp = BindingEngine._curLayoutSizeEpoch;
+            int snapTreeEp = UIElement._treeParentEpoch;
+            int snapDcEp = UIElement._dataContextEpoch;
+            int snapVisEp = UIElement._visibilityEpoch;
+            int snapDispEp = UIElement._disposeEpoch;
             if (SourceElement != null && SourceElement._isDisposedTree) {
                 SourceElement = null;
                 _lastFindNameRoot = null;
                 LastDirtyMask = -1;
                 _elemPropResolvedOnSelf = false;
+                _fastElemClean = false;
             }
             if (SourceElement == null && ElementName.Length > 0 && host != null) {
                 SourceElement = BindingEntry.FindElementScoped(host, ElementName);
@@ -5039,6 +5142,17 @@ internal class BindingEntry : DependencyObject {
                 int elemDm = IsSingleHopPath ? TryGetCachedFastElementEpoch(SourceElement) : -1;
                 bool canFastElem = elemDm >= 0;
                 if (OneTimeDone && _elemPropResolvedOnSelf && elemDm >= 0 && elemDm == LastDirtyMask) {
+                    if (IsSingleHopPath) {
+                        _fastElemClean = true;
+                        _fastUiPropEp = snapUiPropEp;
+                        _fastLayoutEp = snapLayoutEp;
+                        _fastTreeEp = snapTreeEp;
+                        _fastDcEp = snapDcEp;
+                        _fastVisEp = snapVisEp;
+                        _fastDispEp = snapDispEp;
+                    } else {
+                        _fastElemClean = false;
+                    }
                     return;
                 }
                 DependencyObject selfVal = canFastElem ? SourceElement.GetPropertyValue(SourcePath) : null;
@@ -5059,21 +5173,49 @@ internal class BindingEntry : DependencyObject {
                     OneTimeDone = true;
                     ApplyConverted(ev);
                 }
-            } else if (HasFallback && host != null && !OneTimeDone) {
-                OneTimeDone = true;
-                ApplyRawBox(FallbackBox);
+                if (OneTimeDone && _elemPropResolvedOnSelf && IsSingleHopPath) {
+                    _fastElemClean = true;
+                    _fastUiPropEp = snapUiPropEp;
+                    _fastLayoutEp = snapLayoutEp;
+                    _fastTreeEp = snapTreeEp;
+                    _fastDcEp = snapDcEp;
+                    _fastVisEp = snapVisEp;
+                    _fastDispEp = snapDispEp;
+                } else {
+                    _fastElemClean = false;
+                }
+            } else {
+                _fastElemClean = false;
+                if (HasFallback && host != null && !OneTimeDone) {
+                    OneTimeDone = true;
+                    ApplyRawBox(FallbackBox);
+                }
             }
             return;
         }
 
         if (Kind == 3 && SourceElement != null) {
-            int tpEpoch = TryGetCachedFastElementEpoch(SourceElement);
+            int snapUiPropEp = UIElement._globalPropEpoch;
+            int snapLayoutEp = BindingEngine._curLayoutSizeEpoch;
+            int snapTreeEp = UIElement._treeParentEpoch;
+            int snapDcEp = UIElement._dataContextEpoch;
+            int snapVisEp = UIElement._visibilityEpoch;
+            int snapDispEp = UIElement._disposeEpoch;
+            int tpEpoch = IsSingleHopPath ? TryGetCachedFastElementEpoch(SourceElement) : -1;
             bool canFastTp = tpEpoch >= 0;
-            if (OneTimeDone && canFastTp && tpEpoch == LastDirtyMask) {
+            if (OneTimeDone && _elemPropResolvedOnSelf && canFastTp && tpEpoch == LastDirtyMask) {
+                _fastElemClean = true;
+                _fastUiPropEp = snapUiPropEp;
+                _fastLayoutEp = snapLayoutEp;
+                _fastTreeEp = snapTreeEp;
+                _fastDcEp = snapDcEp;
+                _fastVisEp = snapVisEp;
+                _fastDispEp = snapDispEp;
                 return;
             }
             DependencyObject tv = SourceElement.GetPropertyValue(SourcePath);
             bool explicitNull = (tv == null) && SourceElement.IsExplicitNullProperty(SourcePath);
+            _elemPropResolvedOnSelf = canFastTp && (tv != null || explicitNull || SourceElement.DataContext == null);
             if (tv == null && !explicitNull) {
                 tv = BindingEngine.ReadPathBox(SourceElement, SourcePath);
             }
@@ -5081,12 +5223,23 @@ internal class BindingEntry : DependencyObject {
             string sig = tv != null ? DependencyObject.UnboxString(tv, "") : "<null>";
             bool boxDiff = (tv is Brush || tv is UIElement || _lastTemplateValBox is Brush || _lastTemplateValBox is UIElement)
                 && (tv != _lastTemplateValBox);
-            LastDirtyMask = tpEpoch;
+            LastDirtyMask = _elemPropResolvedOnSelf ? tpEpoch : -1;
             if (boxDiff || sig != LastHash || !OneTimeDone) {
                 _lastTemplateValBox = tv;
                 LastHash = sig;
                 OneTimeDone = true;
                 ApplyConverted(tv);
+            }
+            if (OneTimeDone && _elemPropResolvedOnSelf) {
+                _fastElemClean = true;
+                _fastUiPropEp = snapUiPropEp;
+                _fastLayoutEp = snapLayoutEp;
+                _fastTreeEp = snapTreeEp;
+                _fastDcEp = snapDcEp;
+                _fastVisEp = snapVisEp;
+                _fastDispEp = snapDispEp;
+            } else {
+                _fastElemClean = false;
             }
             return;
         }
@@ -5200,23 +5353,52 @@ internal class BindingEntry : DependencyObject {
 
         if (Kind == 1) {
             if (host == null && RelativeSourceMode != "Self") { return; }
+            int snapNativeVmEp = BindingEngine._curNativeVmEpoch;
+            int snapManagedVmEp = BindingEngine._curManagedVmEpoch;
+            int snapDcEp = UIElement._dataContextEpoch;
+            int snapTreeEp = UIElement._treeParentEpoch;
+            int snapVisEp = UIElement._visibilityEpoch;
+            int snapUiPropEp = UIElement._globalPropEpoch;
+            int snapLayoutEp = BindingEngine._curLayoutSizeEpoch;
+            int snapDispEp = UIElement._disposeEpoch;
             DependencyObject srcBox = ResolveSourceBox();
             object srcObj = DependencyObject.Unbox(srcBox);
             if (srcObj == null) {
                 _lastMidBox = null;
                 _lastMidDirtyMask = -1;
+                _fastKind1VmClean = false;
+                _fastElemClean = false;
                 if (HasFallback) { ApplyRawBox(FallbackBox); }
                 return;
             }
+            bool srcIsUi = srcObj is UIElement;
             int dm = -1;
-            if (srcObj is UIElement) {
+            if (srcIsUi) {
                 dm = TryGetCachedFastElementEpoch(srcObj as UIElement);
             } else if (ParseUtil.IsNativeReady()) {
                 dm = Reflect_GetDirtyMask(srcObj);
             }
             bool sameSrc = DependencyObject.SameValueBox(srcBox, _lastSrcBox);
             if (OneTimeDone && sameSrc && dm >= 0 && dm == LastDirtyMask) {
-                if (IsSingleHopPath) { return; }
+                if (IsSingleHopPath) {
+                    if (!srcIsUi) {
+                        _fastKind1VmClean = true;
+                        _fastNativeVmEp = snapNativeVmEp;
+                        _fastManagedVmEp = snapManagedVmEp;
+                        _fastDcEp = snapDcEp;
+                        _fastTreeEp = snapTreeEp;
+                        _fastVisEp = snapVisEp;
+                    } else if (_elemPropResolvedOnSelf) {
+                        _fastElemClean = true;
+                        _fastUiPropEp = snapUiPropEp;
+                        _fastLayoutEp = snapLayoutEp;
+                        _fastTreeEp = snapTreeEp;
+                        _fastDcEp = snapDcEp;
+                        _fastVisEp = snapVisEp;
+                        _fastDispEp = snapDispEp;
+                    }
+                    return;
+                }
                 if (_lastMidDirtyMask >= 0 && _lastMidBox != null && PathSegments != null && PathSegments.Length == 2) {
                     object cachedMid = DependencyObject.Unbox(_lastMidBox);
                     int midDm = -1;
@@ -5229,16 +5411,27 @@ internal class BindingEntry : DependencyObject {
                         midDm = Reflect_GetDirtyMask(cachedMid);
                     }
                     if (midDm >= 0 && midDm == _lastMidDirtyMask) {
+                        if (!srcIsUi && cachedMid != null && !(cachedMid is UIElement)) {
+                            _fastKind1VmClean = true;
+                            _fastNativeVmEp = snapNativeVmEp;
+                            _fastManagedVmEp = snapManagedVmEp;
+                            _fastDcEp = snapDcEp;
+                            _fastTreeEp = snapTreeEp;
+                            _fastVisEp = snapVisEp;
+                        }
                         return;
                     }
                 }
             }
             DependencyObject valBox = null;
             bool explicitNull = false;
-            if (srcObj is UIElement && IsSingleHopPath) {
+            if (srcIsUi && IsSingleHopPath) {
                 UIElement srcEl = srcObj as UIElement;
                 valBox = srcEl.GetPropertyValue(SourcePath);
                 explicitNull = (valBox == null) && srcEl.IsExplicitNullProperty(SourcePath);
+                _elemPropResolvedOnSelf = (dm >= 0) && (valBox != null || explicitNull || srcEl.DataContext == null);
+            } else {
+                _elemPropResolvedOnSelf = false;
             }
             if (valBox == null && !explicitNull) {
                 valBox = BindingEngine.ReadSegmentsBox(srcObj, SourcePath, PathSegments);
@@ -5247,11 +5440,12 @@ internal class BindingEntry : DependencyObject {
             bool boxDiff = (valBox != _lastPathValBox) && !DependencyObject.SameValueBox(valBox, _lastPathValBox);
             _lastMidBox = null;
             _lastMidDirtyMask = -1;
+            bool midIsNonUiObservable = false;
             if (!IsSingleHopPath && PathSegments != null && PathSegments.Length == 2 && dm >= 0 &&
                 !(srcObj is Transform) && !PathSegments[0].Contains("[") && !PathSegments[1].Contains("[")) {
                 DependencyObject midBox = null;
                 object midObj = null;
-                if (srcObj is UIElement) {
+                if (srcIsUi) {
                     UIElement srcEl0 = srcObj as UIElement;
                     midBox = srcEl0.GetPropertyValue(PathSegments[0]);
                     if (midBox != null) {
@@ -5273,18 +5467,55 @@ internal class BindingEntry : DependencyObject {
                 } else if (midObj != null && !(midObj is DependencyObject) && ParseUtil.IsNativeReady()) {
                     _lastMidBox = midBox;
                     _lastMidDirtyMask = Reflect_GetDirtyMask(midObj);
+                    midIsNonUiObservable = _lastMidDirtyMask >= 0;
                 }
             }
+            bool canKind1VmFast = !srcIsUi && dm >= 0 && (IsSingleHopPath || midIsNonUiObservable);
+            bool canKind1ElemFast = srcIsUi && IsSingleHopPath && _elemPropResolvedOnSelf;
             if (!boxDiff && OneTimeDone && sameSrc &&
                 (valBox == _lastPathValBox || valBox is BoxedInt || valBox is BoxedFloat || valBox is BoxedBool || valBox is BoxedString)) {
                 _lastSrcBox = srcBox;
                 LastDirtyMask = dm;
+                _fastKind1VmClean = canKind1VmFast;
+                if (canKind1VmFast) {
+                    _fastNativeVmEp = snapNativeVmEp;
+                    _fastManagedVmEp = snapManagedVmEp;
+                    _fastDcEp = snapDcEp;
+                    _fastTreeEp = snapTreeEp;
+                    _fastVisEp = snapVisEp;
+                }
+                _fastElemClean = canKind1ElemFast;
+                if (canKind1ElemFast) {
+                    _fastUiPropEp = snapUiPropEp;
+                    _fastLayoutEp = snapLayoutEp;
+                    _fastTreeEp = snapTreeEp;
+                    _fastDcEp = snapDcEp;
+                    _fastVisEp = snapVisEp;
+                    _fastDispEp = snapDispEp;
+                }
                 return;
             }
             string sig = valBox != null ? DependencyObject.UnboxString(valBox, "") : "<null>";
             if (!boxDiff && sig == LastHash && OneTimeDone && sameSrc) {
                 _lastSrcBox = srcBox;
                 LastDirtyMask = dm;
+                _fastKind1VmClean = canKind1VmFast;
+                if (canKind1VmFast) {
+                    _fastNativeVmEp = snapNativeVmEp;
+                    _fastManagedVmEp = snapManagedVmEp;
+                    _fastDcEp = snapDcEp;
+                    _fastTreeEp = snapTreeEp;
+                    _fastVisEp = snapVisEp;
+                }
+                _fastElemClean = canKind1ElemFast;
+                if (canKind1ElemFast) {
+                    _fastUiPropEp = snapUiPropEp;
+                    _fastLayoutEp = snapLayoutEp;
+                    _fastTreeEp = snapTreeEp;
+                    _fastDcEp = snapDcEp;
+                    _fastVisEp = snapVisEp;
+                    _fastDispEp = snapDispEp;
+                }
                 return;
             }
             _lastSrcBox = srcBox;
@@ -5294,6 +5525,23 @@ internal class BindingEntry : DependencyObject {
                 LastHash = sig;
                 OneTimeDone = true;
                 ApplyConverted(valBox);
+            }
+            _fastKind1VmClean = OneTimeDone && canKind1VmFast;
+            if (_fastKind1VmClean) {
+                _fastNativeVmEp = snapNativeVmEp;
+                _fastManagedVmEp = snapManagedVmEp;
+                _fastDcEp = snapDcEp;
+                _fastTreeEp = snapTreeEp;
+                _fastVisEp = snapVisEp;
+            }
+            _fastElemClean = OneTimeDone && canKind1ElemFast;
+            if (_fastElemClean) {
+                _fastUiPropEp = snapUiPropEp;
+                _fastLayoutEp = snapLayoutEp;
+                _fastTreeEp = snapTreeEp;
+                _fastDcEp = snapDcEp;
+                _fastVisEp = snapVisEp;
+                _fastDispEp = snapDispEp;
             }
             return;
         }
@@ -5409,12 +5657,27 @@ public static class BindingEngine {
     private static bool _flushPassDirty = false;
     private static bool _inPostFlush = false;
     internal static int _curLayoutSizeEpoch = 1;
+    internal static int _managedVmNotifyEpoch = 1;
+    internal static int _curNativeVmEpoch = 1;
+    internal static int _curManagedVmEpoch = 1;
+    internal static bool _inFlushPass = false;
     internal static bool _inSubtreeFlush = false;
     private static int _lastCompactDisposeEpoch = -1;
+
+    internal static void BumpManagedVmEpoch() {
+        _managedVmNotifyEpoch = _managedVmNotifyEpoch >= 1000000000 ? 1 : (_managedVmNotifyEpoch + 1);
+    }
 
     private static void RefreshLayoutEpoch() {
         if (ParseUtil.IsNativeReady()) {
             _curLayoutSizeEpoch = Visual_GetWorldLayoutEpoch();
+        }
+    }
+
+    internal static void RefreshVmEpochs() {
+        _curManagedVmEpoch = _managedVmNotifyEpoch;
+        if (ParseUtil.IsNativeReady()) {
+            _curNativeVmEpoch = Reflect_GetGlobalObservableEpoch();
         }
     }
 
@@ -5432,6 +5695,9 @@ public static class BindingEngine {
         _batchDepth -= 1;
         if (_batchDepth > 0 || _batchPending == null || _batchPending.Length == 0) { return; }
         RefreshLayoutEpoch();
+        RefreshVmEpochs();
+        bool prevInFlush = _inFlushPass;
+        _inFlushPass = true;
         BindingEntry[] pending = _batchPending;
         _batchPending = new BindingEntry[0];
         for (int i = 0; i < pending.Length; i += 1) {
@@ -5442,6 +5708,7 @@ public static class BindingEngine {
                 e.Evaluate();
             }
         }
+        _inFlushPass = prevInFlush;
     }
 
     public static void SetPreFlushHook(Action hook) {
@@ -5999,6 +6266,7 @@ public static class BindingEngine {
                 }
             }
             for (int pass = 0; pass < 3; pass += 1) {
+                RefreshVmEpochs();
                 _flushPassDirty = false;
                 for (int i = 0; i < _entries.Length; i += 1) {
                     _entries[i].Evaluate();
@@ -6014,6 +6282,7 @@ public static class BindingEngine {
                 if (fn != null) { fn(); }
             }
             if (_flushPassDirty && _entries != null) {
+                RefreshVmEpochs();
                 _flushPassDirty = false;
                 for (int i = 0; i < _entries.Length; i += 1) {
                     _entries[i].Evaluate();
@@ -6025,6 +6294,9 @@ public static class BindingEngine {
 
     public static void Flush() {
         RefreshLayoutEpoch();
+        RefreshVmEpochs();
+        bool prevInFlush = _inFlushPass;
+        _inFlushPass = true;
         if (_preFlushHooks != null) {
             for (int h = 0; h < _preFlushHooks.Length; h += 1) {
                 var fn = _preFlushHooks[h];
@@ -6033,10 +6305,14 @@ public static class BindingEngine {
         }
         FlushCleanupOnly();
         FlushBodyAndPostHooks();
+        _inFlushPass = prevInFlush;
     }
 
     public static void FlushPostLayout() {
         RefreshLayoutEpoch();
+        RefreshVmEpochs();
+        bool prevInFlush = _inFlushPass;
+        _inFlushPass = true;
         FlushCleanupOnly();
         bool hasEntriesOrPost = (_entries != null && _entries.Length > 0) ||
                                 (_postFlushHooks != null && _postFlushHooks.Length > 0);
@@ -6049,6 +6325,7 @@ public static class BindingEngine {
                 if (fn != null) { fn(); }
             }
         }
+        _inFlushPass = prevInFlush;
     }
 
     // ---- Reflection Path Traversals ----

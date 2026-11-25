@@ -2008,6 +2008,14 @@ bool RegisterVisualHostBindings(
         }
         return rs_rt::Value{std::int64_t{0}};
     });
+    ok &= bindFn("Host_RequestRenderWake", [platformHooks](const rs_bc::FunctionReference&, rs_rt::ValueSpan, rs_rt::RuntimeError&) -> std::optional<rs_rt::Value> {
+        if (platformHooks && platformHooks->requestRenderWake) {
+            platformHooks->requestRenderWake();
+        } else if (platformHooks && platformHooks->requestWake) {
+            platformHooks->requestWake();
+        }
+        return rs_rt::Value{std::int64_t{0}};
+    });
     ok &= bindFn("Host_RequestWakeAfterMs", [platformHooks](const rs_bc::FunctionReference&, rs_rt::ValueSpan args, rs_rt::RuntimeError&) -> std::optional<rs_rt::Value> {
         const std::int32_t delayMs = static_cast<std::int32_t>(std::clamp<std::int64_t>(ArgInt(args, 0, 16), 1, 60000));
         if (platformHooks) {
@@ -2373,6 +2381,13 @@ bool RegisterVisualHostBindings(
             return rs_rt::Value{static_cast<std::int64_t>(ver)};
         }
         return rs_rt::Value{static_cast<std::int64_t>(-1)};
+    });
+    ok &= bindFn("Reflect_GetGlobalObservableEpoch", [reflectEnv](const rs_bc::FunctionReference&, rs_rt::ValueSpan, rs_rt::RuntimeError&) -> std::optional<rs_rt::Value> {
+        if (!reflectEnv.domains) {
+            return rs_rt::Value{static_cast<std::int64_t>(1)};
+        }
+        const std::uint64_t raw = reflectEnv.domains->globalObservableEpoch();
+        return rs_rt::Value{static_cast<std::int64_t>((raw % 1000000000ULL) + 1ULL)};
     });
     ok &= bindFn("Color_ParseRgba", [reflectEnv](const rs_bc::FunctionReference&, rs_rt::ValueSpan args, rs_rt::RuntimeError&) -> std::optional<rs_rt::Value> {
         std::string rawColorScratch;

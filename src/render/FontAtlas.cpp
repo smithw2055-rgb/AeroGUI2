@@ -2958,11 +2958,11 @@ bool FontAtlas::LoadTrueTypeFontFromMemoryImpl(
             auto& fc = ProcessFontFaceCache::Instance();
             std::lock_guard<std::mutex> g(fc.mtx);
             const std::size_t faceBytes = face->RawByteSize();
-            if (fc.faces.size() >= 64u || fc.totalBytes + faceBytes > 32u * 1024u * 1024u) {
+            if (fc.faces.size() >= 16u || fc.totalBytes + faceBytes > 8u * 1024u * 1024u) {
                 fc.faces.clear();
                 fc.totalBytes = 0u;
             }
-            if (faceBytes <= 32u * 1024u * 1024u) {
+            if (faceBytes <= 8u * 1024u * 1024u) {
                 fc.totalBytes += faceBytes;
                 fc.faces.emplace(blobKey, face);
             }
@@ -3421,11 +3421,11 @@ FontAtlasGlyph FontAtlas::EnsureGlyphLocked(
                         auto& pgc = ProcessBakedGlyphCache::Instance();
                         std::lock_guard<std::mutex> g(pgc.mtx);
                         const std::size_t cellBytes = cellPixels.size();
-                        if (pgc.entries.size() >= 8192u || pgc.totalBytes + cellBytes > 8u * 1024u * 1024u) {
+                        if (pgc.entries.size() >= 2048u || pgc.totalBytes + cellBytes > 2u * 1024u * 1024u) {
                             pgc.entries.clear();
                             pgc.totalBytes = 0u;
                         }
-                        if (cellBytes <= 8u * 1024u * 1024u) {
+                        if (cellBytes <= 2u * 1024u * 1024u) {
                             pgc.totalBytes += cellBytes;
                             pgc.entries.emplace(procGlyphKey, ProcessBakedGlyphEntry{meta, cellPixels});
                         }
