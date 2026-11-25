@@ -577,6 +577,7 @@ int main(int argc, char** argv) {
     if (headless) {
         const std::uint64_t stepCount = framesSet ? std::max<std::uint64_t>(1u, frames) : 1u;
         double firstFrameMs = 0.0;
+        const auto tLoop0 = std::chrono::steady_clock::now();
         for (std::uint64_t f = 0u; f < stepCount; ++f) {
             const auto tf0 = std::chrono::steady_clock::now();
             host.StepFrame(1.0f / 60.0f, f + 1u == stepCount);
@@ -585,6 +586,8 @@ int main(int argc, char** argv) {
                 firstFrameMs = std::chrono::duration<double, std::milli>(tf1 - tf0).count();
             }
         }
+        const double stepLoopMs = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - tLoop0).count();
 
         std::vector<std::uint8_t> rgba;
         if (!host.RenderHeadlessRgba(width, height, rgba)) {
@@ -600,6 +603,20 @@ int main(int argc, char** argv) {
             return 1;
         }
         printStartupProfile(firstFrameMs);
+        if (profileStartup) {
+            const double avgMs = stepLoopMs / static_cast<double>(std::max<std::uint64_t>(1u, stepCount));
+            const double fps = avgMs > 0.0001 ? (1000.0 / avgMs) : 0.0;
+            const auto& stats = host.GpuStream().LastStats();
+            std::printf(
+                "[PROFILE_RUN] frames=%llu loop_ms=%.2f avg_frame_ms=%.2f fps=%.1f draw_calls=%zu end_rss_mb=%.2f\n",
+                static_cast<unsigned long long>(stepCount),
+                stepLoopMs,
+                avgMs,
+                fps,
+                stats.drawCallCount,
+                QueryWorkingSetMb());
+            std::fflush(stdout);
+        }
         std::printf(
             "aero-viewer headless OK (%ux%u, %llu frames, %zu nodes)\n",
             width,
@@ -621,7 +638,24 @@ int main(int argc, char** argv) {
         host.WindowHost().Width(),
         host.WindowHost().Height(),
         static_cast<double>(host.WindowHost().DpiScale()));
+    const auto tWinLoop0 = std::chrono::steady_clock::now();
     const std::uint64_t rendered = host.RunWindowedLoop(framesSet ? frames : 0u);
+    const double winLoopMs = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - tWinLoop0).count();
+    if (profileStartup) {
+        const double avgMs = winLoopMs / static_cast<double>(std::max<std::uint64_t>(1u, rendered));
+        const double fps = (rendered > 0u && avgMs > 0.0001) ? (1000.0 / avgMs) : 0.0;
+        const auto& stats = host.GpuStream().LastStats();
+        std::printf(
+            "[PROFILE_RUN] frames=%llu loop_ms=%.2f avg_frame_ms=%.2f fps=%.1f draw_calls=%zu end_rss_mb=%.2f\n",
+            static_cast<unsigned long long>(rendered),
+            winLoopMs,
+            avgMs,
+            fps,
+            stats.drawCallCount,
+            QueryWorkingSetMb());
+        std::fflush(stdout);
+    }
     if (!outPpmPath.empty()) {
         if (!host.SaveScreenshotPpm(outPpmPath, 0u, 0u)) {
             std::cerr << "Failed to write PPM screenshot: " << outPpmPath << "\n";

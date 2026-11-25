@@ -76,6 +76,8 @@ struct TextureSlotBuffer {
     mutable std::uint32_t dirtyX1 = 0u;
     mutable std::uint32_t dirtyY1 = 0u;
     mutable std::uint32_t dirtyBaseRevision = 0u;
+    bool isExternalGpuHandle = false;
+    std::uint32_t externalGpuHandle = 0u;
     std::vector<std::uint8_t> rgbaPixels;
     mutable std::shared_ptr<const std::vector<std::uint8_t>> pixelSnapshot;
     std::shared_ptr<std::vector<std::uint8_t>> cowAtlasPixels;
@@ -202,6 +204,23 @@ public:
         std::uint32_t height,
         std::vector<std::uint8_t>&& rgbaPixels);
     void ReleaseRgbaTextureSlot(std::uint32_t textureId) noexcept;
+
+    // Register or update an external GPU-owned native texture (e.g. OpenGL FBO color attachment)
+    // under a URI key (e.g. "viewport://scene") for zero-copy GPU compositing.
+    // Optional fallbackRgbaPixels enables headless SoftwareRasterizer sampling in CI/tests.
+    const ImageAtlasEntry* RegisterExternalGpuTexture(
+        std::string_view uriKey,
+        std::uint32_t externalGpuHandle,
+        std::uint32_t width,
+        std::uint32_t height,
+        bool flipY = true,
+        std::vector<std::uint8_t> fallbackRgbaPixels = {});
+    bool UnregisterExternalGpuTexture(std::string_view uriKey) noexcept;
+    [[nodiscard]] bool TryGetExternalGpuTextureHandle(
+        std::uint32_t textureId,
+        std::uint32_t& outExternalGpuHandle,
+        std::uint32_t& outWidth,
+        std::uint32_t& outHeight) const noexcept;
 
     // Allocate or update a bounded-LRU standalone RGBA8 slot keyed by VisualBrush identity.
     [[nodiscard]] bool RegisterOrUpdateVisualBrushSlot(

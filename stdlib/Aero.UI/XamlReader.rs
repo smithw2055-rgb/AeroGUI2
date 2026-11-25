@@ -1569,6 +1569,17 @@ public static class XamlReader {
         if (localName == "CustomDrawElement") { return new CustomDrawElement(); }
         if (localName == "RiveControl") { return new RiveControl(); }
         if (localName == "RiveInput") { return new RiveInput(); }
+        if (localName == "NumericScrubber") { return new NumericScrubber(); }
+        if (localName == "Vector2Field") { return new Vector2Field(); }
+        if (localName == "Vector3Field") { return new Vector3Field(); }
+        if (localName == "ViewportSurface") { return new ViewportSurface(); }
+        if (localName == "DockPane") { return new DockPane(); }
+        if (localName == "DockTabGroup") { return new DockTabGroup(); }
+        if (localName == "DockSplitNode") { return new DockSplitNode(); }
+        if (localName == "DockingWorkspace") { return new DockingWorkspace(); }
+        if (localName == "CodeEditorView") { return new CodeEditorView(); }
+        if (localName == "PropertyGrid") { return new PropertyGrid(); }
+        if (localName == "NodeGraphCanvas") { return new NodeGraphCanvas(); }
         return null;
     }
 

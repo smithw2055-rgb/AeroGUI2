@@ -432,6 +432,7 @@ private:
         std::uint32_t height = 0;
         std::uint32_t slotRevision = 0;
         std::uint64_t lastGlobalRevision = 0;
+        bool isExternal = false;
     };
 
     bool LoadDynamicGlEntryPoints();

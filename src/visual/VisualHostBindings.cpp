@@ -1718,6 +1718,68 @@ bool RegisterVisualHostBindings(
             static_cast<VerticalAlignment>(ArgInt(args, 10, 0)));
         return rs_rt::Value{std::int64_t{0}};
     });
+    ok &= bindFn("Draw_Image", [&world, &drawBuffer, &domains](const rs_bc::FunctionReference&, rs_rt::ValueSpan args, rs_rt::RuntimeError&) -> std::optional<rs_rt::Value> {
+        drawBuffer.DrawImage(
+            ArgNode(args, 0, world),
+            ArgStringView(domains, args, 1),
+            ArgFloat(args, 2),
+            ArgFloat(args, 3),
+            ArgFloat(args, 4),
+            ArgFloat(args, 5),
+            ArgUInt(args, 6, 0xFFFFFFFFu));
+        return rs_rt::Value{std::int64_t{0}};
+    });
+    ok &= bindFn("Draw_BeginTextRuns", [&world, &drawBuffer, &domains](const rs_bc::FunctionReference&, rs_rt::ValueSpan args, rs_rt::RuntimeError&) -> std::optional<rs_rt::Value> {
+        drawBuffer.BeginTextRuns(
+            ArgNode(args, 0, world),
+            ArgStringView(domains, args, 1),
+            ArgFloat(args, 2),
+            ArgFloat(args, 3),
+            ArgFloat(args, 4),
+            ArgFloat(args, 5),
+            ArgStringView(domains, args, 6),
+            ArgFloat(args, 7, 14.0f),
+            ArgUInt(args, 8, 0xFFE2E8F0u));
+        return rs_rt::Value{std::int64_t{0}};
+    });
+    ok &= bindFn("Draw_AddTextRunSpan", [&world, &drawBuffer](const rs_bc::FunctionReference&, rs_rt::ValueSpan args, rs_rt::RuntimeError&) -> std::optional<rs_rt::Value> {
+        drawBuffer.AddTextRunSpan(
+            ArgNode(args, 0, world),
+            static_cast<std::uint32_t>(std::max<std::int64_t>(0, ArgInt(args, 1, 0))),
+            static_cast<std::uint32_t>(std::max<std::int64_t>(0, ArgInt(args, 2, 0))),
+            ArgUInt(args, 3, 0xFFE2E8F0u));
+        return rs_rt::Value{std::int64_t{0}};
+    });
+    ok &= bindFn("Draw_SyntaxLine", [&world, &drawBuffer, &domains](const rs_bc::FunctionReference&, rs_rt::ValueSpan args, rs_rt::RuntimeError&) -> std::optional<rs_rt::Value> {
+        const auto langRaw = std::clamp<std::int64_t>(ArgInt(args, 7, 0), 0, 3);
+        drawBuffer.DrawSyntaxLine(
+            ArgNode(args, 0, world),
+            ArgStringView(domains, args, 1),
+            ArgFloat(args, 2),
+            ArgFloat(args, 3),
+            ArgFloat(args, 4),
+            ArgFloat(args, 5),
+            ArgStringView(domains, args, 6),
+            ArgFloat(args, 8, 13.0f),
+            static_cast<SyntaxHighlightLang>(langRaw),
+            ArgUInt(args, 9, 0xFFE2E8F0u));
+        return rs_rt::Value{std::int64_t{0}};
+    });
+    ok &= bindFn("Host_GetImageNaturalSize", [&world, &domains](const rs_bc::FunctionReference&, rs_rt::ValueSpan args, rs_rt::RuntimeError&) -> std::optional<rs_rt::Value> {
+        UIResourceStore* store = world.ResourceStore() ? world.ResourceStore() : &UIResourceStore::Default();
+        const std::string_view uri = ArgStringView(domains, args, 0);
+        if (uri.empty()) {
+            return MakeRtFloat(0.0f);
+        }
+        const ImageAtlasEntry* entry = store->Images().LoadOrGet(uri);
+        if (!entry) {
+            return MakeRtFloat(0.0f);
+        }
+        const float outVal = (ArgInt(args, 1, 0) == 0)
+            ? static_cast<float>(entry->width)
+            : static_cast<float>(entry->height);
+        return MakeRtFloat(outVal);
+    });
     ok &= bindFn("Draw_PushClip", [&world, &drawBuffer](const rs_bc::FunctionReference&, rs_rt::ValueSpan args, rs_rt::RuntimeError&) -> std::optional<rs_rt::Value> {
         drawBuffer.PushClip(ArgNode(args, 0, world), ArgFloat(args, 1), ArgFloat(args, 2), ArgFloat(args, 3), ArgFloat(args, 4));
         return rs_rt::Value{std::int64_t{0}};

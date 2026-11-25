@@ -171,6 +171,7 @@ if(AERO_BUILD_COMPILER_TOOLS AND TARGET RealScript::Frontend)
         src/compiler/StdlibModulePack.cpp
         src/compiler/StdlibDllLoader.cpp
         src/compiler/XmlPullLexer.cpp
+        src/compiler/XamlDom.cpp
         src/compiler/MarkupExtensionParser.cpp
         src/compiler/XamlToRsEmitter.cpp
         src/compiler/CSharpCompatLowerer.cpp
@@ -412,6 +413,19 @@ if(AERO_BUILD_TESTS)
         )
         aero_apply_default_rtti_options(v3_stdlib_dll_tests)
         add_test(NAME v3_stdlib_dll_tests COMMAND v3_stdlib_dll_tests)
+    endif()
+
+    if(AERO_BUILD_COMPILER_TOOLS AND TARGET aerogui_app AND TARGET aerogui_stdlib AND
+       NOT EMSCRIPTEN AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/v3_editorkit_tests.cpp")
+        add_executable(v3_editorkit_tests tests/v3_editorkit_tests.cpp)
+        target_link_libraries(v3_editorkit_tests PRIVATE aerogui_app)
+        add_dependencies(v3_editorkit_tests aerogui_stdlib)
+        target_compile_definitions(v3_editorkit_tests PRIVATE
+            AERO_STDLIB_DIR="${CMAKE_CURRENT_SOURCE_DIR}/stdlib"
+            AERO_STDLIB_DLL_PATH="$<TARGET_FILE:aerogui_stdlib>"
+        )
+        aero_apply_default_rtti_options(v3_editorkit_tests)
+        add_test(NAME v3_editorkit_tests COMMAND v3_editorkit_tests)
     endif()
 endif()
 

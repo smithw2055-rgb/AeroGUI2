@@ -3155,6 +3155,8 @@ std::uint32_t ImageAtlas::RegisterOrUpdateRgbaTextureSlot(
     slot.height = height;
     slot.dirtyRevision = static_cast<std::uint32_t>(pendingRev != 0u ? pendingRev : 1u);
     slot.isAtlas = false;
+    slot.isExternalGpuHandle = false;
+    slot.externalGpuHandle = 0u;
     slot.hasDirtyRect = false;
     slot.dirtyBaseRevision = slot.dirtyRevision;
     slot.rgbaPixels.clear();
@@ -3178,6 +3180,108 @@ void ImageAtlas::ReleaseRgbaTextureSlot(std::uint32_t textureId) noexcept {
         }
         revision_.fetch_add(1u, std::memory_order_release);
     }
+}
+
+const ImageAtlasEntry* ImageAtlas::RegisterExternalGpuTexture(
+    std::string_view uriKey,
+    std::uint32_t externalGpuHandle,
+    std::uint32_t width,
+    std::uint32_t height,
+    bool flipY,
+    std::vector<std::uint8_t> fallbackRgbaPixels) {
+    const std::string normKey = NormalizeImageUriPath(uriKey);
+    if (normKey.empty() || width == 0u || height == 0u) {
+        return nullptr;
+    }
+    std::lock_guard<std::mutex> lock(mutex_);
+    std::uint32_t texId = 0u;
+    if (const auto existingIt = entries_.find(normKey);
+        existingIt != entries_.end() &&
+        existingIt->second.isStandalone &&
+        existingIt->second.textureId != kSharedUiAtlasTextureId) {
+        texId = existingIt->second.textureId;
+    } else {
+        texId = AllocateStandaloneTextureIdLocked();
+    }
+
+    const std::uint64_t pendingRev = revision_.load(std::memory_order_relaxed) + 1u;
+    TextureSlotBuffer& slot = textureSlots_[texId];
+    slot.textureId = texId;
+    slot.width = width;
+    slot.height = height;
+    slot.dirtyRevision = static_cast<std::uint32_t>(pendingRev != 0u ? pendingRev : 1u);
+    slot.dirtyBaseRevision = slot.dirtyRevision;
+    slot.isAtlas = false;
+    slot.hasDirtyRect = false;
+    slot.isExternalGpuHandle = (externalGpuHandle != 0u);
+    slot.externalGpuHandle = externalGpuHandle;
+    slot.rgbaPixels.clear();
+    const std::size_t expectedBytes = static_cast<std::size_t>(width) * static_cast<std::size_t>(height) * 4u;
+    if (fallbackRgbaPixels.size() == expectedBytes) {
+        slot.pixelSnapshot = std::make_shared<const std::vector<std::uint8_t>>(std::move(fallbackRgbaPixels));
+    } else {
+        slot.pixelSnapshot.reset();
+    }
+
+    ImageAtlasEntry& entry = entries_[normKey];
+    entry.uriKey = normKey;
+    entry.textureId = texId;
+    entry.width = width;
+    entry.height = height;
+    entry.atlasX = 0u;
+    entry.atlasY = 0u;
+    entry.atlasWidth = width;
+    entry.atlasHeight = height;
+    entry.u0 = 0.0f;
+    entry.v0 = flipY ? 1.0f : 0.0f;
+    entry.u1 = 1.0f;
+    entry.v1 = flipY ? 0.0f : 1.0f;
+    entry.isStandalone = true;
+
+    revision_.fetch_add(1u, std::memory_order_release);
+    return &entry;
+}
+
+bool ImageAtlas::UnregisterExternalGpuTexture(std::string_view uriKey) noexcept {
+    const std::string normKey = NormalizeImageUriPath(uriKey);
+    if (normKey.empty()) {
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(mutex_);
+    const auto it = entries_.find(normKey);
+    if (it == entries_.end() || !it->second.isStandalone || it->second.textureId == kSharedUiAtlasTextureId) {
+        return false;
+    }
+    const std::uint32_t texId = it->second.textureId;
+    entries_.erase(it);
+    if (const auto slotIt = textureSlots_.find(texId); slotIt != textureSlots_.end() && !slotIt->second.isAtlas) {
+        textureSlots_.erase(slotIt);
+        if (std::find(freeStandaloneTextureIds_.begin(), freeStandaloneTextureIds_.end(), texId) ==
+            freeStandaloneTextureIds_.end()) {
+            freeStandaloneTextureIds_.push_back(texId);
+        }
+    }
+    revision_.fetch_add(1u, std::memory_order_release);
+    return true;
+}
+
+bool ImageAtlas::TryGetExternalGpuTextureHandle(
+    std::uint32_t textureId,
+    std::uint32_t& outExternalGpuHandle,
+    std::uint32_t& outWidth,
+    std::uint32_t& outHeight) const noexcept {
+    std::lock_guard<std::mutex> lock(mutex_);
+    const auto it = textureSlots_.find(textureId);
+    if (it == textureSlots_.end() || !it->second.isExternalGpuHandle || it->second.externalGpuHandle == 0u) {
+        outExternalGpuHandle = 0u;
+        outWidth = 0u;
+        outHeight = 0u;
+        return false;
+    }
+    outExternalGpuHandle = it->second.externalGpuHandle;
+    outWidth = it->second.width;
+    outHeight = it->second.height;
+    return true;
 }
 
 bool ImageAtlas::RegisterOrUpdateVisualBrushSlot(

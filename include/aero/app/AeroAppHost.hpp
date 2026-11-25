@@ -122,6 +122,16 @@ public:
         std::uint32_t width = 0u,
         std::uint32_t height = 0u);
 
+    // Zero-copy external GPU viewport texture registration (e.g. "viewport://scene")
+    bool RegisterExternalViewportTexture(
+        std::string_view uriKey,
+        std::uint32_t externalGpuHandle,
+        std::uint32_t width,
+        std::uint32_t height,
+        bool flipY = true,
+        std::vector<std::uint8_t> fallbackRgbaPixels = {});
+    bool UnregisterExternalViewportTexture(std::string_view uriKey) noexcept;
+
     // Unified input injection helpers
     void InjectPointerMove(float x, float y, std::uint8_t modifiers = KeyMod_None);
     void InjectPointerButton(
@@ -167,6 +177,7 @@ public:
     [[nodiscard]] const VisualInputRouter& InputRouter() const noexcept { return inputRouter_; }
     [[nodiscard]] PagedRenderTree& RenderTree() noexcept { return renderTree_; }
     [[nodiscard]] const PagedRenderTree& RenderTree() const noexcept { return renderTree_; }
+    [[nodiscard]] const ZeroCopyGpuStream& GpuStream() const noexcept { return gpuStream_; }
     [[nodiscard]] DesktopEventHost& DesktopHost() noexcept { return desktopHost_; }
     [[nodiscard]] const DesktopEventHost& DesktopHost() const noexcept { return desktopHost_; }
     [[nodiscard]] NativeWindowHost& WindowHost() noexcept { return windowHost_; }

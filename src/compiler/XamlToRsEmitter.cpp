@@ -990,7 +990,8 @@ struct XamlNode final {
         "UserControl", "ScrollViewer", "ButtonBase", "Button",
         "RepeatButton", "ToggleButton", "CheckBox", "RadioButton", "GroupBox",
         "Expander", "TabItem", "MenuItem", "ListBoxItem", "ComboBoxItem",
-        "ListViewItem", "StatusBarItem", "ToolTip", "Label", "GridViewColumnHeader"
+        "ListViewItem", "StatusBarItem", "ToolTip", "Label", "GridViewColumnHeader",
+        "ViewportSurface", "DockPane"
     };
     return kCC.count(typeName) > 0;
 }
@@ -1051,7 +1052,10 @@ struct XamlNode final {
         "ListViewItem", "Selector", "ListBox", "ListView", "ComboBox", "TabControl",
         "TabItem", "MenuBase", "Menu", "ContextMenu", "MenuItem", "ToolBar",
         "StatusBar", "StatusBarItem", "TreeView", "TreeViewItem", "GridViewColumnHeader",
-        "DateTimeControl", "RiveControl"
+        "DateTimeControl", "RiveControl",
+        "NumericScrubber", "Vector2Field", "Vector3Field", "ViewportSurface",
+        "DockPane", "DockTabGroup", "DockSplitNode", "DockingWorkspace",
+        "CodeEditorView", "PropertyGrid", "NodeGraphCanvas"
     };
     return kControls.count(typeName) > 0;
 }
@@ -1631,6 +1635,43 @@ void ExpandControlHierarchy(std::unordered_set<std::string>& usedTypes) {
         if (has("Slider") || has("ScrollBar")) {
             changed |= add("Thumb");
             changed |= add("RepeatButton");
+        }
+        if (has("ViewportSurface") || has("DockPane")) {
+            changed |= add("ContentControl");
+            changed |= add("Grid");
+            changed |= add("Border");
+            changed |= add("Image");
+            changed |= add("TextBlock");
+            changed |= add("CustomDrawElement");
+        }
+        if (has("DockingWorkspace") || has("DockSplitNode") || has("DockTabGroup")) {
+            changed |= add("DockSplitNode");
+            changed |= add("DockTabGroup");
+            changed |= add("DockPane");
+            changed |= add("Control");
+            changed |= add("Grid");
+            changed |= add("Border");
+            changed |= add("StackPanel");
+            changed |= add("TextBlock");
+            changed |= add("Thumb");
+        }
+        if (has("PropertyGrid") || has("Vector3Field") || has("Vector2Field") || has("NumericScrubber")) {
+            changed |= add("NumericScrubber");
+            changed |= add("Vector2Field");
+            changed |= add("Vector3Field");
+            changed |= add("Control");
+            changed |= add("Grid");
+            changed |= add("Border");
+            changed |= add("StackPanel");
+            changed |= add("ScrollViewer");
+            changed |= add("TextBlock");
+            changed |= add("TextBox");
+            changed |= add("CheckBox");
+            changed |= add("Button");
+        }
+        if (has("CodeEditorView") || has("NodeGraphCanvas")) {
+            changed |= add("Control");
+            changed |= add("CustomDrawElement");
         }
     }
 }

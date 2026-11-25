@@ -3029,6 +3029,35 @@ bool AeroAppHost::SaveScreenshotPpm(
     return WritePpmP6(filePath, targetW, targetH, rgba.data());
 }
 
+bool AeroAppHost::RegisterExternalViewportTexture(
+    std::string_view uriKey,
+    std::uint32_t externalGpuHandle,
+    std::uint32_t width,
+    std::uint32_t height,
+    bool flipY,
+    std::vector<std::uint8_t> fallbackRgbaPixels) {
+    UIResourceStore& store = resourceStore_ ? *resourceStore_ : UIResourceStore::Default();
+    const ImageAtlasEntry* entry = store.Images().RegisterExternalGpuTexture(
+        uriKey,
+        externalGpuHandle,
+        width,
+        height,
+        flipY,
+        std::move(fallbackRgbaPixels));
+    if (entry != nullptr) {
+        if (world_.Root().IsValid()) {
+            world_.MarkDirty(world_.Root(), VisualDirty_Visual);
+        }
+        return true;
+    }
+    return false;
+}
+
+bool AeroAppHost::UnregisterExternalViewportTexture(std::string_view uriKey) noexcept {
+    UIResourceStore& store = resourceStore_ ? *resourceStore_ : UIResourceStore::Default();
+    return store.Images().UnregisterExternalGpuTexture(uriKey);
+}
+
 void AeroAppHost::InjectPointerMove(float x, float y, std::uint8_t modifiers) {
     if (windowHost_.IsInitialized()) {
         windowHost_.OnPlatformMouseMove(x, y, modifiers);

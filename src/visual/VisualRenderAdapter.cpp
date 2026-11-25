@@ -2515,6 +2515,117 @@ std::size_t VisualRenderAdapter::EmitCanvasDrawVisual(
                     }
                     break;
                 }
+                case DrawCommandKind::DrawTextRuns: {
+                    if (!cmd.text.empty() && curOpacity > 0.0f) {
+                        UIResourceStore* store = tree.ResourceStore() ? tree.ResourceStore() : &UIResourceStore::Default();
+                        const std::size_t sep = cmd.text.find('\0');
+                        const std::string_view fontFam = (sep != std::string::npos)
+                            ? std::string_view(cmd.text).substr(0u, sep)
+                            : std::string_view{};
+                        const std::string_view txt = (sep != std::string::npos)
+                            ? std::string_view(cmd.text).substr(sep + 1u)
+                            : std::string_view(cmd.text);
+                        if (!txt.empty()) {
+                            PagedRenderTraversalState state{};
+                            state.clipRect = tree.activeClipRect_;
+                            state.clipActive = tree.activeClipEnabled_;
+                            state.inheritedOpacity = curOpacity;
+                            state.m00 = cmdW2D.m00;
+                            state.m01 = cmdW2D.m01;
+                            state.m10 = cmdW2D.m10;
+                            state.m11 = cmdW2D.m11;
+                            state.tx = cmdW2D.tx;
+                            state.ty = cmdW2D.ty;
+                            state.hasPerspective3D = has3D;
+                            state.blendMode = blend;
+                            state.world3D = cmdW3D;
+                            const float boxW = (cmd.rect.width > 0.0f) ? cmd.rect.width : 1000000.0f;
+                            const float fontSize = (cmd.p0 > 0.0f) ? cmd.p0 : 14.0f;
+
+                            if (cmd.textSpans.empty()) {
+                                count += tree.EmitTextRunNodes(
+                                    rect.x + cmd.rect.x,
+                                    rect.y + cmd.rect.y,
+                                    fontSize,
+                                    txt,
+                                    UnpackRgba32(cmd.colorRgba, curOpacity),
+                                    curOpacity,
+                                    state,
+                                    &node,
+                                    fontFam,
+                                    boxW,
+                                    TextWrapping::NoWrap,
+                                    TextAlignment::Left,
+                                    cmd.rect.width,
+                                    nullptr);
+                            } else {
+                                std::vector<RichTextRunInput> runs;
+                                runs.reserve(cmd.textSpans.size() + 2u);
+                                std::size_t cursor = 0u;
+                                const std::size_t n = txt.size();
+                                for (const StyledTextSpan& sp : cmd.textSpans) {
+                                    const std::size_t s = std::min<std::size_t>(sp.byteOffset, n);
+                                    const std::size_t e = std::min<std::size_t>(s + sp.byteLength, n);
+                                    if (s > cursor) {
+                                        RichTextRunInput gap{};
+                                        gap.text = txt.substr(cursor, s - cursor);
+                                        gap.fontFamily = fontFam;
+                                        gap.fontSize = fontSize;
+                                        gap.fgRgba = cmd.colorRgba;
+                                        gap.hasFg = true;
+                                        runs.push_back(gap);
+                                    }
+                                    if (e > s) {
+                                        RichTextRunInput run{};
+                                        run.text = txt.substr(s, e - s);
+                                        run.fontFamily = fontFam;
+                                        run.fontSize = fontSize;
+                                        run.fgRgba = sp.colorRgba;
+                                        run.hasFg = true;
+                                        runs.push_back(run);
+                                        cursor = e;
+                                    }
+                                }
+                                if (cursor < n) {
+                                    RichTextRunInput tail{};
+                                    tail.text = txt.substr(cursor, n - cursor);
+                                    tail.fontFamily = fontFam;
+                                    tail.fontSize = fontSize;
+                                    tail.fgRgba = cmd.colorRgba;
+                                    tail.hasFg = true;
+                                    runs.push_back(tail);
+                                }
+                                if (!runs.empty()) {
+                                    TextLayoutResult layout = store->Fonts().MeasureRichLayout(
+                                        runs,
+                                        fontFam,
+                                        fontSize,
+                                        400,
+                                        false,
+                                        boxW,
+                                        TextWrapping::NoWrap);
+                                    count += tree.EmitPreparedTextLayoutNodes(
+                                        rect.x + cmd.rect.x,
+                                        rect.y + cmd.rect.y,
+                                        fontSize,
+                                        std::move(layout),
+                                        UnpackRgba32(cmd.colorRgba, curOpacity),
+                                        curOpacity,
+                                        state,
+                                        &node,
+                                        TextAlignment::Left,
+                                        cmd.rect.width,
+                                        nullptr,
+                                        nullptr,
+                                        0.0f,
+                                        /*ignoreCustomGlyphColors=*/false,
+                                        /*reserveDynamicSlack=*/false);
+                                }
+                            }
+                        }
+                    }
+                    break;
+                }
                 case DrawCommandKind::PushClip: {
                     clipStack.push_back(SavedClip{tree.activeClipEnabled_, tree.activeClipRect_});
                     const Rect localClip{rect.x + cmd.rect.x, rect.y + cmd.rect.y, cmd.rect.width, cmd.rect.height};

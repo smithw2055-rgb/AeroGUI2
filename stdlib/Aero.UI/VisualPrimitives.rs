@@ -1560,6 +1560,22 @@ public class DrawingContext : DependencyObject {
         VerticalAlignment vAlign = VerticalAlignment.Top) {
         Draw_Text(_node, text, x, y, w, h, fontFamily, fontSize, rgba, EnumConvert.ToInt(hAlign), EnumConvert.ToInt(vAlign));
     }
+    public void DrawImage(string uri, float x, float y, float w, float h, uint tintRgba = 4294967295u) {
+        Draw_Image(_node, uri, x, y, w, h, tintRgba);
+    }
+    public void BeginTextRuns(
+        string text, float x, float y, float w, float h,
+        string fontFamily, float fontSize, uint defaultRgba = 4293060848u) {
+        Draw_BeginTextRuns(_node, text, x, y, w, h, fontFamily, fontSize, defaultRgba);
+    }
+    public void AddTextRunSpan(int byteOffset, int byteLength, uint rgba) {
+        Draw_AddTextRunSpan(_node, byteOffset, byteLength, rgba);
+    }
+    public void DrawSyntaxLine(
+        string lineText, float x, float y, float w, float h,
+        string fontFamily, int langKind, float fontSize = 13.0f, uint defaultRgba = 4293060848u) {
+        Draw_SyntaxLine(_node, lineText, x, y, w, h, fontFamily, langKind, fontSize, defaultRgba);
+    }
     public void PushClip(float x, float y, float w, float h) { Draw_PushClip(_node, x, y, w, h); }
     public void PopClip() { Draw_PopClip(_node); }
     public void PushTransform(float tx, float ty, float sx = 1.0f, float sy = 1.0f, float rotDeg = 0.0f) {

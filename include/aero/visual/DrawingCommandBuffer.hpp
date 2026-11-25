@@ -30,6 +30,20 @@ enum class DrawCommandKind : std::uint8_t {
     PopTransform = 15,
     PushOpacity = 16,
     PopOpacity = 17,
+    DrawTextRuns = 18,
+};
+
+enum class SyntaxHighlightLang : std::uint8_t {
+    Plain = 0,
+    RealScript = 1,
+    Xaml = 2,
+    AeroScene = 3,
+};
+
+struct StyledTextSpan {
+    std::uint32_t byteOffset = 0u;
+    std::uint32_t byteLength = 0u;
+    std::uint32_t colorRgba = 0xFFFFFFFFu;
 };
 
 struct DrawCommand {
@@ -47,6 +61,7 @@ struct DrawCommand {
     std::int32_t intArg1 = 0;
     std::string text;
     std::vector<Point> points;
+    std::vector<StyledTextSpan> textSpans;
 };
 
 struct DrawingCommandList {
@@ -147,6 +162,43 @@ public:
         std::uint32_t rgba,
         HorizontalAlignment hAlign,
         VerticalAlignment vAlign);
+    void BeginTextRuns(
+        VisualNodeId node,
+        std::string_view text,
+        float x,
+        float y,
+        float w,
+        float h,
+        std::string_view fontFamily,
+        float fontSize,
+        std::uint32_t defaultRgba);
+    void AddTextRunSpan(
+        VisualNodeId node,
+        std::uint32_t byteOffset,
+        std::uint32_t byteLength,
+        std::uint32_t colorRgba);
+    void DrawTextRuns(
+        VisualNodeId node,
+        std::string_view text,
+        float x,
+        float y,
+        float w,
+        float h,
+        std::string_view fontFamily,
+        float fontSize,
+        std::uint32_t defaultRgba,
+        std::vector<StyledTextSpan> spans);
+    void DrawSyntaxLine(
+        VisualNodeId node,
+        std::string_view lineText,
+        float x,
+        float y,
+        float w,
+        float h,
+        std::string_view fontFamily,
+        float fontSize,
+        SyntaxHighlightLang lang,
+        std::uint32_t defaultRgba);
     void PushClip(VisualNodeId node, float x, float y, float w, float h);
     void PopClip(VisualNodeId node);
     void PushTransform(

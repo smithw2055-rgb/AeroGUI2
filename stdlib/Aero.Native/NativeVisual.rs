@@ -142,6 +142,15 @@ int __rs_native_Draw_Path(handle node, string svgPath, float x, float y, float w
 public void Draw_Path(handle node, string svgPath, float x, float y, float w, float h, uint fillRgba, uint strokeRgba, float strokeW) { __rs_native_Draw_Path(node, svgPath, x, y, w, h, fillRgba, strokeRgba, strokeW); return; }
 int __rs_native_Draw_Text(handle node, string text, float x, float y, float w, float h, string font, float size, uint rgba, int hAlign, int vAlign) { return 0; }
 public void Draw_Text(handle node, string text, float x, float y, float w, float h, string font, float size, uint rgba, int hAlign, int vAlign) { __rs_native_Draw_Text(node, text, x, y, w, h, font, size, rgba, hAlign, vAlign); return; }
+int __rs_native_Draw_Image(handle node, string uri, float x, float y, float w, float h, uint tintRgba) { return 0; }
+public void Draw_Image(handle node, string uri, float x, float y, float w, float h, uint tintRgba) { __rs_native_Draw_Image(node, uri, x, y, w, h, tintRgba); return; }
+int __rs_native_Draw_BeginTextRuns(handle node, string text, float x, float y, float w, float h, string font, float size, uint defaultRgba) { return 0; }
+public void Draw_BeginTextRuns(handle node, string text, float x, float y, float w, float h, string font, float size, uint defaultRgba) { __rs_native_Draw_BeginTextRuns(node, text, x, y, w, h, font, size, defaultRgba); return; }
+int __rs_native_Draw_AddTextRunSpan(handle node, int byteOffset, int byteLength, uint rgba) { return 0; }
+public void Draw_AddTextRunSpan(handle node, int byteOffset, int byteLength, uint rgba) { __rs_native_Draw_AddTextRunSpan(node, byteOffset, byteLength, rgba); return; }
+int __rs_native_Draw_SyntaxLine(handle node, string lineText, float x, float y, float w, float h, string font, int langKind, float size, uint defaultRgba) { return 0; }
+public void Draw_SyntaxLine(handle node, string lineText, float x, float y, float w, float h, string font, int langKind, float size, uint defaultRgba) { __rs_native_Draw_SyntaxLine(node, lineText, x, y, w, h, font, langKind, size, defaultRgba); return; }
+public float Host_GetImageNaturalSize(string uri, int axis) { return 0.0f; }
 int __rs_native_Draw_PushClip(handle node, float x, float y, float w, float h) { return 0; }
 public void Draw_PushClip(handle node, float x, float y, float w, float h) { __rs_native_Draw_PushClip(node, x, y, w, h); return; }
 int __rs_native_Draw_PopClip(handle node) { return 0; }

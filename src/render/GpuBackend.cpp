@@ -1465,7 +1465,7 @@ void OpenGlDeviceBackend::Shutdown() noexcept {
     DestroyEffectGpuResources();
     if (gl_.IsComplete()) {
         for (const GlImageSlotState& slot : imageSlotTextures_) {
-            if (slot.texId != 0u) {
+            if (slot.texId != 0u && !slot.isExternal) {
                 gl_.DeleteTextures(1, &slot.texId);
             }
         }
@@ -2109,7 +2109,7 @@ void OpenGlDeviceBackend::SyncUnifiedUiAtlas(const PagedRenderTree& tree) {
         for (std::size_t tid = 1u; tid < imageSlotTextures_.size(); ++tid) {
             if (imageSlotTextures_[tid].texId != 0u &&
                 !imageAtlas.HasTextureSlot(static_cast<std::uint32_t>(tid))) {
-                if (gl_.DeleteTextures) {
+                if (!imageSlotTextures_[tid].isExternal && gl_.DeleteTextures) {
                     gl_.DeleteTextures(1, &imageSlotTextures_[tid].texId);
                 }
                 imageSlotTextures_[tid] = GlImageSlotState{};
@@ -2171,6 +2171,25 @@ AeroGLuint OpenGlDeviceBackend::ResolveBatchImageTexture(
         imageSlotTextures_.resize(static_cast<std::size_t>(textureId) + 1u);
     }
     GlImageSlotState& slot = imageSlotTextures_[textureId];
+
+    std::uint32_t extGpuHandle = 0u;
+    std::uint32_t extW = 0u;
+    std::uint32_t extH = 0u;
+    if (imageAtlas.TryGetExternalGpuTextureHandle(textureId, extGpuHandle, extW, extH) && extGpuHandle != 0u) {
+        if (slot.texId != 0u && !slot.isExternal && gl_.DeleteTextures) {
+            gl_.DeleteTextures(1, &slot.texId);
+        }
+        slot.texId = static_cast<AeroGLuint>(extGpuHandle);
+        slot.width = extW;
+        slot.height = extH;
+        slot.isExternal = true;
+        slot.lastGlobalRevision = globalRev;
+        return slot.texId;
+    }
+    if (slot.isExternal) {
+        slot = GlImageSlotState{};
+    }
+
     std::uint32_t slotW = 0u;
     std::uint32_t slotH = 0u;
     std::uint32_t dirtyX = 0u, dirtyY = 0u, dirtyW = 0u, dirtyH = 0u;
@@ -2193,7 +2212,7 @@ AeroGLuint OpenGlDeviceBackend::ResolveBatchImageTexture(
         slotW == 0u ||
         slotH == 0u) {
         if (slot.texId != 0u) {
-            if (gl_.DeleteTextures) {
+            if (!slot.isExternal && gl_.DeleteTextures) {
                 gl_.DeleteTextures(1, &slot.texId);
             }
             slot = GlImageSlotState{};
