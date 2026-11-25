@@ -18,6 +18,7 @@ std::atomic<UIResourceStore::ImageAtlasClearFn> gImageClear{nullptr};
 std::atomic<UIResourceStore::ImageAtlasRegisterSlotFn> gImageRegisterSlot{nullptr};
 std::atomic<UIResourceStore::ImageAtlasReleaseSlotFn> gImageReleaseSlot{nullptr};
 std::atomic<UIResourceStore::ImageAtlasPackStaticMaskFn> gImagePackStaticMask{nullptr};
+std::atomic<UIResourceStore::ImageAtlasRegisterAlpha8SlotFn> gImageRegisterAlpha8Slot{nullptr};
 
 [[nodiscard]] int HexNibble(char c) noexcept {
     if (c >= '0' && c <= '9') return c - '0';
@@ -290,11 +291,15 @@ void UIResourceStore::RegisterImageAtlasHooks(
 void UIResourceStore::RegisterImageAtlasSlotHook(
     ImageAtlasRegisterSlotFn registerSlotFn,
     ImageAtlasReleaseSlotFn releaseSlotFn,
-    ImageAtlasPackStaticMaskFn packStaticMaskFn) noexcept {
+    ImageAtlasPackStaticMaskFn packStaticMaskFn,
+    ImageAtlasRegisterAlpha8SlotFn registerAlpha8SlotFn) noexcept {
     gImageRegisterSlot.store(registerSlotFn, std::memory_order_release);
     gImageReleaseSlot.store(releaseSlotFn, std::memory_order_release);
     if (packStaticMaskFn != nullptr) {
         gImagePackStaticMask.store(packStaticMaskFn, std::memory_order_release);
+    }
+    if (registerAlpha8SlotFn != nullptr) {
+        gImageRegisterAlpha8Slot.store(registerAlpha8SlotFn, std::memory_order_release);
     }
 }
 
@@ -416,6 +421,11 @@ void UIResourceStore::ClearMtsdfPaths() noexcept {
     }
 }
 
+void UIResourceStore::BeginPathMaskFrame() noexcept {
+    std::lock_guard<std::mutex> lock(mutex_);
+    pathMaskFrameStartSeq_ = ++pathMaskAccessSeq_;
+}
+
 bool UIResourceStore::StoreOrLookupPathMaskLocked(
     std::uint64_t key,
     std::uint64_t groupHash,
@@ -427,7 +437,8 @@ bool UIResourceStore::StoreOrLookupPathMaskLocked(
     float v1,
     std::vector<std::uint8_t>&& rgba8,
     RasterizedPathMaskEntry& outEntry,
-    bool allowSharedAtlasPack) {
+    bool allowSharedAtlasPack,
+    bool isPureWhiteAlphaMask) {
     if (texW == 0u || texH == 0u || rgba8.size() < static_cast<std::size_t>(texW) * texH * 4u) {
         return false;
     }
@@ -497,11 +508,18 @@ bool UIResourceStore::StoreOrLookupPathMaskLocked(
                     entry.lastUsedTick = prevIt->second.lastUsedTick;
                 } else {
                     while (!pathMaskEntries_.empty() && pathMaskEntries_.size() >= kMaxPathMaskEntries) {
-                        auto lru = pathMaskEntries_.begin();
+                        auto lru = pathMaskEntries_.end();
                         for (auto it = pathMaskEntries_.begin(); it != pathMaskEntries_.end(); ++it) {
-                            if (it->second.lastUsedTick < lru->second.lastUsedTick) {
+                            if (pathMaskFrameStartSeq_ > 0u && it->second.lastUsedTick > pathMaskFrameStartSeq_) {
+                                continue;
+                            }
+                            if (lru == pathMaskEntries_.end() ||
+                                it->second.lastUsedTick < lru->second.lastUsedTick) {
                                 lru = it;
                             }
+                        }
+                        if (lru == pathMaskEntries_.end()) {
+                            break;
                         }
                         pathMaskTotalBytes_ = (pathMaskTotalBytes_ >= lru->second.byteSize)
                             ? (pathMaskTotalBytes_ - lru->second.byteSize)
@@ -524,6 +542,22 @@ bool UIResourceStore::StoreOrLookupPathMaskLocked(
             return true;
         }
     }
+
+    bool uploadAsAlpha8 = false;
+    std::vector<std::uint8_t> uploadPixels;
+    const ImageAtlasRegisterAlpha8SlotFn alpha8Fn = gImageRegisterAlpha8Slot.load(std::memory_order_acquire);
+    if (isPureWhiteAlphaMask && alpha8Fn != nullptr) {
+        const std::size_t pixelCount = static_cast<std::size_t>(texW) * static_cast<std::size_t>(texH);
+        uploadPixels.resize(pixelCount);
+        for (std::size_t i = 0u; i < pixelCount; ++i) {
+            uploadPixels[i] = rgba8[i * 4u + 3u];
+        }
+        std::vector<std::uint8_t>().swap(rgba8);
+        uploadAsAlpha8 = true;
+    } else {
+        uploadPixels = std::move(rgba8);
+    }
+    const std::size_t slotIncomingBytes = uploadPixels.size();
 
     std::uint32_t reuseSlotId = 0u;
     std::vector<std::uint32_t> surplusReleaseIds;
@@ -558,8 +592,9 @@ bool UIResourceStore::StoreOrLookupPathMaskLocked(
             for (auto it = pathMaskEntries_.begin(); it != pathMaskEntries_.end(); ++it) {
                 if (it->second.groupHash == groupHash) {
                     ++sameGroupCount;
-                    if (oldestSameGroup == pathMaskEntries_.end() ||
-                        it->second.lastUsedTick < oldestSameGroup->second.lastUsedTick) {
+                    if ((pathMaskFrameStartSeq_ == 0u || it->second.lastUsedTick <= pathMaskFrameStartSeq_) &&
+                        (oldestSameGroup == pathMaskEntries_.end() ||
+                         it->second.lastUsedTick < oldestSameGroup->second.lastUsedTick)) {
                         oldestSameGroup = it;
                     }
                 }
@@ -571,10 +606,13 @@ bool UIResourceStore::StoreOrLookupPathMaskLocked(
 
         while (!pathMaskEntries_.empty() &&
                (pathMaskEntries_.size() >= kMaxPathMaskEntries ||
-                (pathMaskTotalBytes_ + incomingBytes > kMaxPathMaskTotalBytes))) {
+                (pathMaskTotalBytes_ + slotIncomingBytes > kMaxPathMaskTotalBytes))) {
             auto lruStandalone = pathMaskEntries_.end();
             auto lruAny = pathMaskEntries_.end();
             for (auto it = pathMaskEntries_.begin(); it != pathMaskEntries_.end(); ++it) {
+                if (pathMaskFrameStartSeq_ > 0u && it->second.lastUsedTick > pathMaskFrameStartSeq_) {
+                    continue;
+                }
                 if (lruAny == pathMaskEntries_.end() ||
                     it->second.lastUsedTick < lruAny->second.lastUsedTick) {
                     lruAny = it;
@@ -586,10 +624,12 @@ bool UIResourceStore::StoreOrLookupPathMaskLocked(
                 }
             }
             if (lruStandalone != pathMaskEntries_.end() &&
-                (pathMaskTotalBytes_ + incomingBytes > kMaxPathMaskTotalBytes)) {
+                (pathMaskTotalBytes_ + slotIncomingBytes > kMaxPathMaskTotalBytes)) {
                 evictIter(lruStandalone);
-            } else {
+            } else if (lruAny != pathMaskEntries_.end()) {
                 evictIter(lruAny);
+            } else {
+                break;
             }
         }
     }
@@ -600,7 +640,9 @@ bool UIResourceStore::StoreOrLookupPathMaskLocked(
         }
     }
 
-    const std::uint32_t texId = slotFn(atlas, reuseSlotId, texW, texH, std::move(rgba8));
+    const std::uint32_t texId = uploadAsAlpha8
+        ? alpha8Fn(atlas, reuseSlotId, texW, texH, std::move(uploadPixels))
+        : slotFn(atlas, reuseSlotId, texW, texH, std::move(uploadPixels));
     if (texId == 0u) {
         if (reuseSlotId != 0u && relFn) {
             relFn(atlas, reuseSlotId);
@@ -617,7 +659,7 @@ bool UIResourceStore::StoreOrLookupPathMaskLocked(
     entry.u1 = u1;
     entry.v1 = v1;
     entry.groupHash = groupHash;
-    entry.byteSize = incomingBytes;
+    entry.byteSize = slotIncomingBytes;
 
     std::uint32_t replacedSlotId = 0u;
     {
@@ -636,7 +678,7 @@ bool UIResourceStore::StoreOrLookupPathMaskLocked(
             entry.lastUsedTick = ++pathMaskAccessSeq_;
             pathMaskEntries_.emplace(key, entry);
         }
-        pathMaskTotalBytes_ += incomingBytes;
+        pathMaskTotalBytes_ += slotIncomingBytes;
     }
     if (replacedSlotId != 0u && relFn) {
         relFn(atlas, replacedSlotId);
@@ -733,8 +775,34 @@ bool UIResourceStore::GetOrRasterizePathMask(
             }
         }
         if (hasSameGroup) {
+            const std::uint32_t needTexW = clampedW + 2u * clampedPad;
+            const std::uint32_t needTexH = clampedH + 2u * clampedPad;
+            const RasterizedPathMaskEntry* bestExisting = nullptr;
+            std::uint64_t bestKey = 0u;
+            std::uint64_t bestArea = 0u;
+            for (const auto& kv : pathMaskEntries_) {
+                if (kv.second.groupHash == fillGroup &&
+                    kv.second.texWidth >= needTexW &&
+                    kv.second.texHeight >= needTexH &&
+                    kv.second.texWidth <= needTexW * 2u &&
+                    kv.second.texHeight <= needTexH * 2u) {
+                    const std::uint64_t area =
+                        static_cast<std::uint64_t>(kv.second.texWidth) * kv.second.texHeight;
+                    if (bestExisting == nullptr || area < bestArea) {
+                        bestExisting = &kv.second;
+                        bestKey = kv.first;
+                        bestArea = area;
+                    }
+                }
+            }
+            if (bestExisting != nullptr) {
+                auto hitIt = pathMaskEntries_.find(bestKey);
+                hitIt->second.lastUsedTick = ++pathMaskAccessSeq_;
+                outEntry = hitIt->second;
+                return true;
+            }
             static constexpr std::uint32_t kBuckets[] = {
-                16u, 24u, 32u, 48u, 64u, 96u, 128u, 192u, 256u, 384u, 512u, 768u, 1024u
+                32u, 64u, 128u, 256u, 512u, 1024u
             };
             const std::uint32_t maxDim = std::max(clampedW, clampedH);
             std::uint32_t bucketMax = kMaxPathMaskDim;
@@ -771,7 +839,7 @@ bool UIResourceStore::GetOrRasterizePathMask(
     const float v0 = static_cast<float>(clampedPad) / static_cast<float>(texH);
     const float u1 = static_cast<float>(clampedPad + effW) / static_cast<float>(texW);
     const float v1 = static_cast<float>(clampedPad + effH) / static_cast<float>(texH);
-    return StoreOrLookupPathMaskLocked(key, fillGroup, texW, texH, u0, v0, u1, v1, std::move(rgba8), outEntry, true);
+    return StoreOrLookupPathMaskLocked(key, fillGroup, texW, texH, u0, v0, u1, v1, std::move(rgba8), outEntry, true, true);
 }
 
 bool UIResourceStore::GetOrRasterizePathStrokeMask(
@@ -838,7 +906,7 @@ bool UIResourceStore::GetOrRasterizePathStrokeMask(
         }
         if (hasSameGroup) {
             static constexpr std::uint32_t kBuckets[] = {
-                16u, 24u, 32u, 48u, 64u, 96u, 128u, 192u, 256u, 384u, 512u, 768u, 1024u
+                32u, 64u, 128u, 256u, 512u, 1024u
             };
             const std::uint32_t maxDim = std::max(clampedW, clampedH);
             std::uint32_t bucketMax = kMaxStrokeMaskDim;
@@ -873,7 +941,7 @@ bool UIResourceStore::GetOrRasterizePathStrokeMask(
 
     const std::uint32_t texW = effW + 2u * clampedPad;
     const std::uint32_t texH = effH + 2u * clampedPad;
-    return StoreOrLookupPathMaskLocked(key, strokeGroup, texW, texH, 0.0f, 0.0f, 1.0f, 1.0f, std::move(rgba8), outEntry, true);
+    return StoreOrLookupPathMaskLocked(key, strokeGroup, texW, texH, 0.0f, 0.0f, 1.0f, 1.0f, std::move(rgba8), outEntry, true, true);
 }
 
 void UIResourceStore::ClearAll() noexcept {
@@ -894,6 +962,7 @@ void UIResourceStore::ClearAll() noexcept {
     pathMaskEntries_.clear();
     pathMaskTotalBytes_ = 0u;
     pathMaskAccessSeq_ = 0u;
+    pathMaskFrameStartSeq_ = 0u;
 }
 
 } // namespace aero

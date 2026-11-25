@@ -122,6 +122,13 @@ public:
     std::uint32_t RegisterOrResolveSpec(std::string_view serializedSpec);
     std::uint32_t CloneMutableBrush(std::uint32_t sourceBrushId);
     bool ReleaseMutableBrush(std::uint32_t brushId) noexcept;
+    std::uint32_t RegisterOrUpdateMutableLinearGradient(
+        std::uint32_t reuseBrushId,
+        Point startPoint,
+        Point endPoint,
+        GradientSpreadMethod spreadMethod,
+        BrushMappingMode mappingMode,
+        const std::vector<GradientStop>& stops);
     bool UpdateBrushStopColor(std::uint32_t brushId, std::size_t stopIndex, const Color& color);
     bool UpdateBrushStopOffset(std::uint32_t brushId, std::size_t stopIndex, float offset);
     [[nodiscard]] const GradientBrushDesc* Find(std::uint32_t brushId) const noexcept;

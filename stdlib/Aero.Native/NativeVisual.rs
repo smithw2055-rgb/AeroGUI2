@@ -66,6 +66,9 @@ public void Visual_SetBoxBrushOpacity(handle node, float bgOpacity) { __rs_nativ
 int __rs_native_Visual_SetBoxShadow(handle node, bool isBoxShadow) { return 0; }
 public void Visual_SetBoxShadow(handle node, bool isBoxShadow) { __rs_native_Visual_SetBoxShadow(node, isBoxShadow); return; }
 public int Visual_RegisterLinearGradient(float x0, float y0, float x1, float y1, int spread, int mapping, string stopsSpec) { return 0; }
+public int Visual_RegisterMutableLinearGradient(int reuseId, float x0, float y0, float x1, float y1, int spread, int mapping, string stopsSpec) { return 0; }
+int __rs_native_Visual_ReleaseMutableGradient(int gradId) { return 0; }
+public void Visual_ReleaseMutableGradient(int gradId) { __rs_native_Visual_ReleaseMutableGradient(gradId); return; }
 public int Visual_RegisterRadialGradient(float cx, float cy, float ox, float oy, float rx, float ry, int spread, int mapping, string stopsSpec) { return 0; }
 public int Visual_RegisterConicGradient(float cx, float cy, int spread, int mapping, string stopsSpec) { return 0; }
 int __rs_native_Visual_SetTransform2D(handle node, float tx, float ty, float sx, float sy, float rotDeg, float skewX, float skewY, float ox, float oy) { return 0; }

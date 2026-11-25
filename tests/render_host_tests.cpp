@@ -1635,6 +1635,84 @@ bool TestLeafTextClipEliminationAndOverflowClip() {
     return true;
 }
 
+bool TestFractionalScissorPixelCenterAndNoOverflowSeam() {
+    // Verify ComputeGlScissorBox uses pixel-center top-left coverage: ceil(edge - 0.5).
+    {
+        const aero::GlScissorBox s1 = aero::ComputeGlScissorBox(aero::Rect{263.25f, 147.25f, 32.0f, 32.0f}, 600u, 600u);
+        AERO_CHECK(s1.x == 263 && s1.width == 32 && s1.y == (600 - 179) && s1.height == 32);
+
+        const aero::GlScissorBox s2 = aero::ComputeGlScissorBox(aero::Rect{263.50f, 147.50f, 32.0f, 32.0f}, 600u, 600u);
+        AERO_CHECK(s2.x == 263 && s2.width == 32 && s2.y == (600 - 179) && s2.height == 32);
+
+        const aero::GlScissorBox s3 = aero::ComputeGlScissorBox(aero::Rect{263.75f, 147.75f, 32.0f, 32.0f}, 600u, 600u);
+        AERO_CHECK(s3.x == 264 && s3.width == 32 && s3.y == (600 - 180) && s3.height == 32);
+    }
+
+    // Verify SolidQuad + fractional overflow scissor clipping never leaks an underlying wider rectangle's edge pixel.
+    auto store = std::make_shared<aero::UIResourceStore>();
+    aero::VisualWorld world(nullptr, store.get());
+    const aero::VisualNodeId root = world.CreateNode(aero::VisualKind::Box);
+    world.SetRoot(root);
+    world.SetSize(root, 128.0f, 64.0f);
+
+    const std::uint32_t dodgerRgba = aero::ParseColorRgba32("#FF1E90FF");
+    const std::uint32_t limeRgba = aero::ParseColorRgba32("#FFADFF2F");
+    auto addClippedPair = [&](float mx, float my) {
+        const aero::VisualNodeId cell = world.CreateNode(aero::VisualKind::Box);
+        world.AddChild(root, cell);
+        world.SetAlignment(cell, aero::HorizontalAlignment::Left, aero::VerticalAlignment::Top);
+        world.SetMargin(cell, mx, my, 0.0f, 0.0f);
+        world.SetSize(cell, 32.0f, 32.0f);
+
+        const aero::VisualNodeId back = world.CreateNode(aero::VisualKind::Box);
+        world.AddChild(cell, back);
+        world.SetAlignment(back, aero::HorizontalAlignment::Left, aero::VerticalAlignment::Top);
+        world.SetSize(back, 40.0f, 32.0f);
+        world.SetBoxStyle(back, dodgerRgba, 0u, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f);
+
+        const aero::VisualNodeId front = world.CreateNode(aero::VisualKind::Box);
+        world.AddChild(cell, front);
+        world.SetAlignment(front, aero::HorizontalAlignment::Left, aero::VerticalAlignment::Top);
+        world.SetSize(front, 32.0f, 32.0f);
+        world.SetBoxStyle(front, limeRgba, 0u, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f);
+    };
+    addClippedPair(20.25f, 10.25f);
+    addClippedPair(64.50f, 10.50f);
+    world.UpdateLayout(128.0f, 64.0f);
+
+    aero::DrawingCommandBuffer drawBuf;
+    aero::VisualRenderAdapter adapter;
+    aero::PagedRenderTree tree;
+    tree.SetResourceStore(store.get());
+    AERO_CHECK(adapter.SyncPagedRenderTree(world, &drawBuf, tree, store.get()) >= 4u);
+
+    std::vector<std::uint8_t> rgba;
+    aero::ZeroCopyGpuStream::RasterizeTreeToRgba8(
+        tree, 128u, 64u, rgba, aero::Color{0.96f, 0.96f, 0.96f, 1.0f});
+
+    int dodgerCount = 0;
+    for (std::size_t i = 0u; i + 3u < rgba.size(); i += 4u) {
+        if (rgba[i + 0u] < 60u && rgba[i + 1u] > 110u && rgba[i + 2u] > 220u) {
+            ++dodgerCount;
+        }
+    }
+    AERO_CHECK(dodgerCount == 0);
+
+    auto countGreenSpan = [&](int py, int xStart, int xEnd) -> int {
+        int cnt = 0;
+        for (int px = xStart; px < xEnd; ++px) {
+            const std::size_t off = (static_cast<std::size_t>(py) * 128u + static_cast<std::size_t>(px)) * 4u;
+            if (rgba[off + 0u] == 0xADu && rgba[off + 1u] == 0xFFu && rgba[off + 2u] == 0x2Fu) {
+                ++cnt;
+            }
+        }
+        return cnt;
+    };
+    AERO_CHECK(countGreenSpan(26, 18, 60) == 32);
+    AERO_CHECK(countGreenSpan(26, 62, 110) == 32);
+    return true;
+}
+
 } // namespace
 
 int main() {
@@ -1661,6 +1739,7 @@ int main() {
         {"MockGlClipWResetAndIncrementalTailPad", &TestMockGlClipWResetAndIncrementalTailPad},
         {"SharedAtlasMaskQuotaNoLeak", &TestSharedAtlasMaskQuotaNoLeak},
         {"LeafTextClipEliminationAndOverflowClip", &TestLeafTextClipEliminationAndOverflowClip},
+        {"FractionalScissorPixelCenterAndNoOverflowSeam", &TestFractionalScissorPixelCenterAndNoOverflowSeam},
     };
 
     int passed = 0;

@@ -1399,6 +1399,27 @@ bool RegisterVisualHostBindings(
         const std::uint32_t id = world.ResourceStore()->GradientBrushes().RegisterBrush(std::move(desc));
         return rs_rt::Value{static_cast<std::int64_t>(id)};
     });
+    ok &= bindFn("Visual_RegisterMutableLinearGradient", [&world, &domains](const rs_bc::FunctionReference&, rs_rt::ValueSpan args, rs_rt::RuntimeError&) -> std::optional<rs_rt::Value> {
+        const std::int64_t rawReuseId = ArgInt(args, 0, -1);
+        const std::uint32_t reuseId = (rawReuseId > 0) ? static_cast<std::uint32_t>(rawReuseId) : 0u;
+        GradientBrushDesc tempDesc{};
+        ParseStopsSpec(ArgStringView(domains, args, 7), tempDesc);
+        const std::uint32_t id = world.ResourceStore()->GradientBrushes().RegisterOrUpdateMutableLinearGradient(
+            reuseId,
+            Point{ArgFloat(args, 1, 0.0f), ArgFloat(args, 2, 0.0f)},
+            Point{ArgFloat(args, 3, 1.0f), ArgFloat(args, 4, 1.0f)},
+            static_cast<GradientSpreadMethod>(ArgInt(args, 5, 0)),
+            static_cast<BrushMappingMode>(ArgInt(args, 6, 0)),
+            tempDesc.stops);
+        return rs_rt::Value{static_cast<std::int64_t>(id)};
+    });
+    ok &= bindFn("Visual_ReleaseMutableGradient", [&world](const rs_bc::FunctionReference&, rs_rt::ValueSpan args, rs_rt::RuntimeError&) -> std::optional<rs_rt::Value> {
+        const std::int64_t rawId = ArgInt(args, 0, -1);
+        if (rawId > 0) {
+            (void)world.ResourceStore()->GradientBrushes().ReleaseMutableBrush(static_cast<std::uint32_t>(rawId));
+        }
+        return rs_rt::Value{std::int64_t{0}};
+    });
     ok &= bindFn("Visual_RegisterRadialGradient", [&world, &domains](const rs_bc::FunctionReference&, rs_rt::ValueSpan args, rs_rt::RuntimeError&) -> std::optional<rs_rt::Value> {
         GradientBrushDesc desc{};
         desc.kind = GradientBrushKind::Radial;

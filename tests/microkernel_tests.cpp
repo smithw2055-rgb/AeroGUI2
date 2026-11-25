@@ -1859,12 +1859,15 @@ void TestReviewFixesMicrokernel() {
             0ull, "M 20,50 L 21,50 L 80,50", aero::Rect{20.0f, 50.0f, 60.0f, 1.0f},
             60u, 10u, 80.0f, 90u, strokeMask, 0u, 0u));
         std::uint32_t sw = 0u, sh = 0u;
+        bool isAlpha8 = false;
         std::shared_ptr<const std::vector<std::uint8_t>> px;
-        CHECK(store.Images().TryGetTextureSlotSnapshot(strokeMask.textureId, sw, sh, px) && px != nullptr);
+        CHECK(store.Images().TryGetTextureSlotSnapshot(strokeMask.textureId, sw, sh, px, &isAlpha8) && px != nullptr);
         CHECK(sw == 60u + 2u * 90u);
         if (px && sw > 90u && sh > 2u) {
             // 6px behind the flat start cut (pad = 90) must stay transparent despite short seg0=1px and strokeWidth=80px.
-            CHECK((*px)[(static_cast<std::size_t>(sh / 2u) * sw + 84u) * 4u + 3u] == 0u);
+            const std::size_t pIdx = static_cast<std::size_t>(sh / 2u) * sw + 84u;
+            const std::uint8_t alphaSample = isAlpha8 ? (*px)[pIdx] : (*px)[pIdx * 4u + 3u];
+            CHECK(alphaSample == 0u);
         }
     }
 

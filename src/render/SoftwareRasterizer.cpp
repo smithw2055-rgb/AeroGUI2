@@ -299,6 +299,7 @@ struct CachedTexSlotEntry {
     std::uint32_t width = 0u;
     std::uint32_t height = 0u;
     bool found = false;
+    bool isAlpha8 = false;
     std::shared_ptr<const std::vector<std::uint8_t>> pixels;
 };
 
@@ -338,23 +339,27 @@ struct ScopedBandTexCacheGuard {
     std::uint32_t textureId,
     std::uint32_t& outWidth,
     std::uint32_t& outHeight,
-    std::shared_ptr<const std::vector<std::uint8_t>>& outPixels) noexcept {
+    std::shared_ptr<const std::vector<std::uint8_t>>& outPixels,
+    bool* optOutIsAlpha8 = nullptr) noexcept {
     if (gTlTexSlotCache.activeDepth <= 0) {
-        return atlas.TryGetTextureSlotSnapshot(textureId, outWidth, outHeight, outPixels);
+        return atlas.TryGetTextureSlotSnapshot(textureId, outWidth, outHeight, outPixels, optOutIsAlpha8);
     }
     CachedTexSlotEntry& entry = gTlTexSlotCache.entries[textureId & (ThreadTexSlotCache::kSlots - 1u)];
     if (entry.atlas == &atlas && entry.textureId == textureId) {
         outWidth = entry.width;
         outHeight = entry.height;
         outPixels = entry.pixels;
+        if (optOutIsAlpha8) *optOutIsAlpha8 = entry.isAlpha8;
         return entry.found;
     }
     entry.atlas = &atlas;
     entry.textureId = textureId;
-    entry.found = atlas.TryGetTextureSlotSnapshot(textureId, entry.width, entry.height, entry.pixels);
+    entry.found = atlas.TryGetTextureSlotSnapshot(
+        textureId, entry.width, entry.height, entry.pixels, &entry.isAlpha8);
     outWidth = entry.width;
     outHeight = entry.height;
     outPixels = entry.pixels;
+    if (optOutIsAlpha8) *optOutIsAlpha8 = entry.isAlpha8;
     return entry.found;
 }
 
@@ -462,9 +467,11 @@ void BlendPremulOverRgba8(
     std::uint32_t height,
     const std::vector<std::uint8_t>& rgbaPixels,
     float u,
-    float v) noexcept {
+    float v,
+    bool isAlpha8 = false) noexcept {
+    const std::size_t bpp = isAlpha8 ? 1u : 4u;
     if (width == 0u || height == 0u ||
-        rgbaPixels.size() < static_cast<std::size_t>(width) * height * 4u) {
+        rgbaPixels.size() < static_cast<std::size_t>(width) * height * bpp) {
         return Color{0.0f, 0.0f, 0.0f, 0.0f};
     }
     const float clampedU = std::clamp(u, 0.0f, 1.0f);
@@ -483,13 +490,24 @@ void BlendPremulOverRgba8(
     const float fx = std::clamp(texX - flX, 0.0f, 1.0f);
     const float fy = std::clamp(texY - flY, 0.0f, 1.0f);
 
+    constexpr float kInv255 = 1.0f / 255.0f;
+    if (isAlpha8) {
+        const std::size_t stride = static_cast<std::size_t>(width);
+        const float c00 = static_cast<float>(rgbaPixels[static_cast<std::size_t>(y0) * stride + x0]);
+        const float c10 = static_cast<float>(rgbaPixels[static_cast<std::size_t>(y0) * stride + x1]);
+        const float c01 = static_cast<float>(rgbaPixels[static_cast<std::size_t>(y1) * stride + x0]);
+        const float c11 = static_cast<float>(rgbaPixels[static_cast<std::size_t>(y1) * stride + x1]);
+        const float top = c00 + (c10 - c00) * fx;
+        const float bot = c01 + (c11 - c01) * fx;
+        return Color{1.0f, 1.0f, 1.0f, (top + (bot - top) * fy) * kInv255};
+    }
+
     const std::size_t stride = static_cast<std::size_t>(width) * 4u;
     const std::uint8_t* p00 = rgbaPixels.data() + static_cast<std::size_t>(y0) * stride + static_cast<std::size_t>(x0) * 4u;
     const std::uint8_t* p10 = rgbaPixels.data() + static_cast<std::size_t>(y0) * stride + static_cast<std::size_t>(x1) * 4u;
     const std::uint8_t* p01 = rgbaPixels.data() + static_cast<std::size_t>(y1) * stride + static_cast<std::size_t>(x0) * 4u;
     const std::uint8_t* p11 = rgbaPixels.data() + static_cast<std::size_t>(y1) * stride + static_cast<std::size_t>(x1) * 4u;
 
-    constexpr float kInv255 = 1.0f / 255.0f;
     auto bilerpCh = [&](std::size_t ch) noexcept -> float {
         const float c00 = static_cast<float>(p00[ch]);
         const float c10 = static_cast<float>(p10[ch]);
@@ -1379,13 +1397,13 @@ void RasterizeSingleNode(
          !std::isfinite(page.header.clipW) || !std::isfinite(page.header.clipH))) {
         return;
     }
-    int clipMinX = clipOn ? SafeFloorToInt(page.header.clipX, 0, vpW) : 0;
-    int clipMinY = clipOn ? SafeFloorToInt(page.header.clipY, 0, vpH) : 0;
+    int clipMinX = clipOn ? SafeCeilToInt(page.header.clipX - 0.5f, 0, vpW) : 0;
+    int clipMinY = clipOn ? SafeCeilToInt(page.header.clipY - 0.5f, 0, vpH) : 0;
     int clipMaxX = clipOn
-        ? SafeCeilToInt(page.header.clipX + std::max(0.0f, page.header.clipW), 0, vpW)
+        ? SafeCeilToInt(page.header.clipX + std::max(0.0f, page.header.clipW) - 0.5f, 0, vpW)
         : vpW;
     int clipMaxY = clipOn
-        ? SafeCeilToInt(page.header.clipY + std::max(0.0f, page.header.clipH), 0, vpH)
+        ? SafeCeilToInt(page.header.clipY + std::max(0.0f, page.header.clipH) - 0.5f, 0, vpH)
         : vpH;
 
     if (optPremulLayer) {
@@ -1466,9 +1484,11 @@ void RasterizeSingleNode(
         const std::uint8_t b8 = static_cast<std::uint8_t>((v0.rgba >> 16u) & 0xFFu);
         const float baseAlpha = static_cast<float>(a8) / 255.0f;
         const AeroPrimType prim = DecodeVertexPrimType(v0.primType);
+        bool resolvedNodeTexAlpha8 = false;
         if (prim == AeroPrimType::TexturedQuad && !resolvedNodeTex) {
             (void)TryGetTextureSlotCached(
-                imageAtlasRef, boundTextureId, cachedNodeTexW, cachedNodeTexH, cachedNodeTexPixels);
+                imageAtlasRef, boundTextureId, cachedNodeTexW, cachedNodeTexH, cachedNodeTexPixels,
+                &resolvedNodeTexAlpha8);
             resolvedNodeTex = true;
         }
         if (prim == AeroPrimType::SdfTextGlyph && !resolvedNodeSdf) {
@@ -1788,7 +1808,9 @@ void RasterizeSingleNode(
         const std::uint8_t* hoistedTexPixelsData = hasBoundTexture ? cachedNodeTexPixels->data() : nullptr;
         const int hoistedTexMaxX = hasBoundTexture ? (static_cast<int>(cachedNodeTexW) - 1) : 0;
         const int hoistedTexMaxY = hasBoundTexture ? (static_cast<int>(cachedNodeTexH) - 1) : 0;
-        const std::size_t hoistedTexStride = hasBoundTexture ? (static_cast<std::size_t>(cachedNodeTexW) * 4u) : 0u;
+        const std::size_t hoistedTexStride = hasBoundTexture
+            ? (static_cast<std::size_t>(cachedNodeTexW) * (resolvedNodeTexAlpha8 ? 1u : 4u))
+            : 0u;
         const std::uint8_t* rowTexPtr0 = nullptr;
         const std::uint8_t* rowTexPtr1 = nullptr;
         float rowTexFy = 0.0f;
@@ -1930,17 +1952,17 @@ void RasterizeSingleNode(
                 ((v0.flags & AeroVertexFlag_PremultipliedAlpha) == 0u) &&
                 std::fabs(e1y) <= 1e-6f && std::fabs(e3x) <= 1e-6f) {
                 const float svConst = (e1x * dy) * invDet;
-                if (svConst >= 0.0f && svConst <= 1.0f && baseAlpha > 0.002f) {
+                if (svConst >= 0.0f && svConst < 1.0f && baseAlpha > 0.002f) {
                     int xSpan0 = rowPxStart;
                     while (xSpan0 < rowPxEnd) {
                         const float su0 = (((static_cast<float>(xSpan0) + 0.5f) - v0.x) * e3y) * invDet;
-                        if (su0 >= 0.0f && su0 <= 1.0f) break;
+                        if (su0 >= 0.0f && su0 < 1.0f) break;
                         ++xSpan0;
                     }
                     int xSpan1 = rowPxEnd;
                     while (xSpan1 > xSpan0) {
                         const float su1 = (((static_cast<float>(xSpan1 - 1) + 0.5f) - v0.x) * e3y) * invDet;
-                        if (su1 >= 0.0f && su1 <= 1.0f) break;
+                        if (su1 >= 0.0f && su1 < 1.0f) break;
                         --xSpan1;
                     }
                     if (xSpan1 > xSpan0) {
@@ -2058,6 +2080,9 @@ void RasterizeSingleNode(
                     sv = (e1x * dy - e1y * dx) * invDet;
                 }
                 if (su < 0.0f || su > 1.0f || sv < 0.0f || sv > 1.0f) {
+                    continue;
+                }
+                if (prim == AeroPrimType::SolidQuad && (su >= 1.0f || sv >= 1.0f)) {
                     continue;
                 }
 
@@ -2374,26 +2399,38 @@ void RasterizeSingleNode(
                         const int x0 = std::clamp(static_cast<int>(flX), 0, hoistedTexMaxX);
                         const int x1 = std::min(x0 + 1, hoistedTexMaxX);
                         const float fx = std::clamp(texX - flX, 0.0f, 1.0f);
-                        const std::uint8_t* p00 = rowTexPtr0 + static_cast<std::size_t>(x0) * 4u;
-                        const std::uint8_t* p10 = rowTexPtr0 + static_cast<std::size_t>(x1) * 4u;
-                        const std::uint8_t* p01 = rowTexPtr1 + static_cast<std::size_t>(x0) * 4u;
-                        const std::uint8_t* p11 = rowTexPtr1 + static_cast<std::size_t>(x1) * 4u;
                         constexpr float kInv255 = 1.0f / 255.0f;
-                        auto bilerpRowCh = [&](std::size_t ch) noexcept -> float {
-                            const float c00 = static_cast<float>(p00[ch]);
-                            const float c10 = static_cast<float>(p10[ch]);
-                            const float c01 = static_cast<float>(p01[ch]);
-                            const float c11 = static_cast<float>(p11[ch]);
+                        if (resolvedNodeTexAlpha8) {
+                            const float c00 = static_cast<float>(rowTexPtr0[x0]);
+                            const float c10 = static_cast<float>(rowTexPtr0[x1]);
+                            const float c01 = static_cast<float>(rowTexPtr1[x0]);
+                            const float c11 = static_cast<float>(rowTexPtr1[x1]);
                             const float top = c00 + (c10 - c00) * fx;
                             const float bot = c01 + (c11 - c01) * fx;
-                            return (top + (bot - top) * rowTexFy) * kInv255;
-                        };
-                        texel = Color{bilerpRowCh(0u), bilerpRowCh(1u), bilerpRowCh(2u), bilerpRowCh(3u)};
+                            texel = Color{1.0f, 1.0f, 1.0f, (top + (bot - top) * rowTexFy) * kInv255};
+                        } else {
+                            const std::uint8_t* p00 = rowTexPtr0 + static_cast<std::size_t>(x0) * 4u;
+                            const std::uint8_t* p10 = rowTexPtr0 + static_cast<std::size_t>(x1) * 4u;
+                            const std::uint8_t* p01 = rowTexPtr1 + static_cast<std::size_t>(x0) * 4u;
+                            const std::uint8_t* p11 = rowTexPtr1 + static_cast<std::size_t>(x1) * 4u;
+                            auto bilerpRowCh = [&](std::size_t ch) noexcept -> float {
+                                const float c00 = static_cast<float>(p00[ch]);
+                                const float c10 = static_cast<float>(p10[ch]);
+                                const float c01 = static_cast<float>(p01[ch]);
+                                const float c11 = static_cast<float>(p11[ch]);
+                                const float top = c00 + (c10 - c00) * fx;
+                                const float bot = c01 + (c11 - c01) * fx;
+                                return (top + (bot - top) * rowTexFy) * kInv255;
+                            };
+                            texel = Color{bilerpRowCh(0u), bilerpRowCh(1u), bilerpRowCh(2u), bilerpRowCh(3u)};
+                        }
                     } else if (hasBoundTexture) {
                         const float topV = v0.v + su * (v1.v - v0.v);
                         const float botV = v3.v + su * (v2.v - v3.v);
                         const float vInterp = topV + sv * (botV - topV);
-                        texel = SampleTextureSlotBilinear(cachedNodeTexW, cachedNodeTexH, *cachedNodeTexPixels, uInterp, vInterp);
+                        texel = SampleTextureSlotBilinear(
+                            cachedNodeTexW, cachedNodeTexH, *cachedNodeTexPixels, uInterp, vInterp,
+                            resolvedNodeTexAlpha8);
                     }
 
                     float vertR = static_cast<float>(r8) * (1.0f / 255.0f);
@@ -2812,7 +2849,8 @@ void RasterizeNodeSpanRecursive(
         while (ioBlurCursor < blurSpans.size() &&
                (blurSpans[ioBlurCursor].firstNodeId < nid ||
                 (blurSpans[ioBlurCursor].endNodeId <= nid &&
-                 blurSpans[ioBlurCursor].effectMode != UIEffectKind::BackdropBlur))) {
+                 blurSpans[ioBlurCursor].effectMode != UIEffectKind::BackdropBlur) ||
+                !SpanNeedsEffectPass(blurSpans[ioBlurCursor]))) {
             ++ioBlurCursor;
         }
         if (ioBlurCursor < blurSpans.size() &&
@@ -3131,7 +3169,8 @@ void ZeroCopyGpuStream::RasterizeTreeToRgba8(
             while (cursor < blurSpans.size() &&
                    (blurSpans[cursor].firstNodeId < curNode ||
                     (blurSpans[cursor].endNodeId <= curNode &&
-                     blurSpans[cursor].effectMode != UIEffectKind::BackdropBlur))) {
+                     blurSpans[cursor].effectMode != UIEffectKind::BackdropBlur) ||
+                    !SpanNeedsEffectPass(blurSpans[cursor]))) {
                 ++cursor;
             }
             if (cursor >= blurSpans.size()) {

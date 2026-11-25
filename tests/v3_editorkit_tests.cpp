@@ -363,6 +363,132 @@ public partial class AeroStudioShellTest : Window {
     } else {
         CHECK(false);
     }
+
+    // 3. Verify Window + DockingWorkspace resize reflow when host viewport changes
+    aero::ObjectRef wsObj{};
+    if (const auto* wsRef = std::get_if<aero::ObjectRef>(&wsVal)) {
+        wsObj = *wsRef;
+    }
+    aero::UnifiedValue wsHandleVal{};
+    aero::VisualNodeId wsNodeId{};
+    if (wsObj.valid() && host.ReadScriptMember(wsObj, "__nativeHandle", wsHandleVal)) {
+        aero::NativeHandle wsNh{};
+        if (wsHandleVal.tryGetNativeHandle(wsNh)) {
+            wsNodeId = host.World().ResolveHandle(wsNh);
+        }
+    }
+    CHECK(wsNodeId.IsValid());
+
+    host.InjectResize(1600u, 960u);
+    host.StepFrame(0.016f, true);
+    CHECK(std::fabs(host.World().GetLayoutRectScalar(rootId, aero::VisualLayoutRectQuery::Width) - 1600.0f) < 1.0f);
+    CHECK(std::fabs(host.World().GetLayoutRectScalar(rootId, aero::VisualLayoutRectQuery::Height) - 960.0f) < 1.0f);
+    CHECK(std::fabs(host.World().GetLayoutRectScalar(wsNodeId, aero::VisualLayoutRectQuery::Width) - 1600.0f) < 1.0f);
+    CHECK(std::fabs(host.World().GetLayoutRectScalar(wsNodeId, aero::VisualLayoutRectQuery::Height) - 960.0f) < 1.0f);
+
+    host.InjectResize(900u, 600u);
+    host.StepFrame(0.016f, true);
+    CHECK(std::fabs(host.World().GetLayoutRectScalar(rootId, aero::VisualLayoutRectQuery::Width) - 900.0f) < 1.0f);
+    CHECK(std::fabs(host.World().GetLayoutRectScalar(rootId, aero::VisualLayoutRectQuery::Height) - 600.0f) < 1.0f);
+    CHECK(std::fabs(host.World().GetLayoutRectScalar(wsNodeId, aero::VisualLayoutRectQuery::Width) - 900.0f) < 1.0f);
+    CHECK(std::fabs(host.World().GetLayoutRectScalar(wsNodeId, aero::VisualLayoutRectQuery::Height) - 600.0f) < 1.0f);
+
+    // 4. Verify CodeEditorView mouse drag multi-line selection and Backspace deletion
+    if (wsObj.valid()) {
+        CHECK(host.InvokeScriptMethod(
+            wsObj,
+            "ActivatePane",
+            {aero::UnifiedValue{aero::StringValue{std::string_view{"code"}}}},
+            &actRes));
+    }
+    host.StepFrame(0.016f, true);
+
+    aero::UnifiedValue edVal{};
+    aero::ObjectRef edObj{};
+    CHECK(host.ReadScriptMember(rootObj, "ScriptEditor", edVal));
+    if (const auto* edRef = std::get_if<aero::ObjectRef>(&edVal)) {
+        edObj = *edRef;
+    }
+    CHECK(edObj.valid());
+    aero::UnifiedValue edHandleVal{};
+    aero::VisualNodeId edNodeId{};
+    if (edObj.valid() && host.ReadScriptMember(edObj, "__nativeHandle", edHandleVal)) {
+        aero::NativeHandle edNh{};
+        if (edHandleVal.tryGetNativeHandle(edNh)) {
+            edNodeId = host.World().ResolveHandle(edNh);
+        }
+    }
+    CHECK(edNodeId.IsValid());
+
+    const float edX = host.World().GetLayoutRectScalar(edNodeId, aero::VisualLayoutRectQuery::X);
+    const float edY = host.World().GetLayoutRectScalar(edNodeId, aero::VisualLayoutRectQuery::Y);
+    const float edW = host.World().GetLayoutRectScalar(edNodeId, aero::VisualLayoutRectQuery::Width);
+    const float edH = host.World().GetLayoutRectScalar(edNodeId, aero::VisualLayoutRectQuery::Height);
+    CHECK(edW > 150.0f && edH > 100.0f);
+
+    const float dragStartX = edX + 76.0f;
+    const float dragStartY = edY + 12.0f;
+    const float dragEndX = edX + 140.0f;
+    const float dragEndY = edY + 52.0f;
+    host.InjectPointerMove(dragStartX, dragStartY);
+    host.InjectPointerButton(dragStartX, dragStartY, aero::PointerButton::Left, true);
+    host.InjectPointerMove(dragEndX, dragEndY);
+    host.InjectPointerButton(dragEndX, dragEndY, aero::PointerButton::Left, false);
+    host.StepFrame(0.016f, true);
+
+    aero::UnifiedValue hasSelVal{};
+    CHECK(host.ReadScriptMember(edObj, "HasSelection", hasSelVal));
+    if (const auto* b = std::get_if<bool>(&hasSelVal)) {
+        CHECK(*b);
+    } else {
+        CHECK(false);
+    }
+
+    aero::UnifiedValue selStartLineVal{};
+    aero::UnifiedValue selEndLineVal{};
+    CHECK(host.ReadScriptMember(edObj, "SelectionStartLine", selStartLineVal));
+    CHECK(host.ReadScriptMember(edObj, "SelectionEndLine", selEndLineVal));
+    if (const auto* sl = std::get_if<std::int64_t>(&selStartLineVal)) {
+        if (const auto* el = std::get_if<std::int64_t>(&selEndLineVal)) {
+            CHECK(*sl == 0 && *el >= 2);
+        } else {
+            CHECK(false);
+        }
+    } else {
+        CHECK(false);
+    }
+
+    aero::UnifiedValue selTextVal{};
+    CHECK(host.InvokeScriptMethod(edObj, "GetSelectedText", {}, &selTextVal));
+    std::string selText;
+    if (const auto* sp = std::get_if<std::string>(&selTextVal)) {
+        selText = *sp;
+    } else if (const auto* sref = std::get_if<aero::rs_rt::ObjectRef>(&selTextVal)) {
+        if (auto sv = host.Domains().stringViewAcrossDomains(*sref)) {
+            selText.assign(sv->data(), sv->size());
+        }
+    }
+    CHECK(selText.find('\n') != std::string::npos);
+
+    aero::UnifiedValue prevLinesVal{};
+    CHECK(host.InvokeScriptMethod(edObj, "LineCount", {}, &prevLinesVal));
+    std::int64_t prevLines = 0;
+    if (const auto* iv = std::get_if<std::int64_t>(&prevLinesVal)) {
+        prevLines = *iv;
+    }
+    CHECK(prevLines == 5);
+
+    host.InjectKey(aero::KeyCode::Backspace, true);
+    host.InjectKey(aero::KeyCode::Backspace, false);
+    host.StepFrame(0.016f, true);
+
+    aero::UnifiedValue afterLinesVal{};
+    CHECK(host.InvokeScriptMethod(edObj, "LineCount", {}, &afterLinesVal));
+    if (const auto* iv = std::get_if<std::int64_t>(&afterLinesVal)) {
+        CHECK(*iv < prevLines);
+    } else {
+        CHECK(false);
+    }
 }
 
 } // namespace

@@ -77,6 +77,7 @@ struct TextureSlotBuffer {
     mutable std::uint32_t dirtyY1 = 0u;
     mutable std::uint32_t dirtyBaseRevision = 0u;
     bool isExternalGpuHandle = false;
+    bool isAlpha8 = false;
     std::uint32_t externalGpuHandle = 0u;
     std::vector<std::uint8_t> rgbaPixels;
     mutable std::shared_ptr<const std::vector<std::uint8_t>> pixelSnapshot;
@@ -203,6 +204,11 @@ public:
         std::uint32_t width,
         std::uint32_t height,
         std::vector<std::uint8_t>&& rgbaPixels);
+    std::uint32_t RegisterOrUpdateAlpha8TextureSlot(
+        std::uint32_t reuseSlotId,
+        std::uint32_t width,
+        std::uint32_t height,
+        std::vector<std::uint8_t>&& alphaPixels);
     void ReleaseRgbaTextureSlot(std::uint32_t textureId) noexcept;
 
     // Register or update an external GPU-owned native texture (e.g. OpenGL FBO color attachment)
@@ -264,7 +270,8 @@ public:
         std::uint32_t textureId,
         std::uint32_t& outWidth,
         std::uint32_t& outHeight,
-        std::shared_ptr<const std::vector<std::uint8_t>>& outPixels) const noexcept;
+        std::shared_ptr<const std::vector<std::uint8_t>>& outPixels,
+        bool* optOutIsAlpha8 = nullptr) const noexcept;
     [[nodiscard]] bool CopyTextureSlotIfModified(
         std::uint32_t textureId,
         std::uint32_t& ioKnownSlotRevision,
@@ -283,7 +290,8 @@ public:
         std::uint32_t& outDirtyH,
         std::shared_ptr<const std::vector<std::uint8_t>>& outFullSnapshot,
         std::vector<std::uint8_t>& outSubRectRgba8,
-        bool& outWasUpdated) const;
+        bool& outWasUpdated,
+        bool* optOutIsAlpha8 = nullptr) const;
     [[nodiscard]] bool CopyTextureSlotDirtySubRectIfModified(
         std::uint32_t textureId,
         std::uint32_t& ioKnownSlotRevision,

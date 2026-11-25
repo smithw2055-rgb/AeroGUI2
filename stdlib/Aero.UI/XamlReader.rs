@@ -266,6 +266,11 @@ internal static class XamlStr {
             if (s.Contains(".AngleY") || s.Contains(".SkewY")) { return "LayoutTransform.SkewY"; }
             if (s.Contains(".Angle") || s.Contains(".Rotation")) { return "LayoutTransform.Angle"; }
         }
+        if (s.Contains("RelativeTransform")) {
+            string prefix = s.Contains("Fill") ? "Fill." : (s.Contains("Stroke") ? "Stroke." : (s.Contains("Foreground") ? "Foreground." : "Background."));
+            if (s.Contains(".X") || s.Contains("TranslateX")) { return prefix + "RelativeTransform.X"; }
+            if (s.Contains(".Y") || s.Contains("TranslateY")) { return prefix + "RelativeTransform.Y"; }
+        }
         if (s.Contains("RenderTransform")) {
             if (s.Contains(".ScaleX")) { return "RenderTransform.ScaleX"; }
             if (s.Contains(".ScaleY")) { return "RenderTransform.ScaleY"; }
@@ -2571,6 +2576,28 @@ public static class XamlReader {
         var counter = new int[1];
         counter[0] = 0;
         BindGradientStopsRecursive(el, propPrefix, brushNode, counter, ctx);
+        for (int i = 0; i < brushNode.Children.Length; i += 1) {
+            XamlXmlNode ch = brushNode.Children[i];
+            if (XamlStr.EndsWith(ch.LocalName, ".RelativeTransform") && ch.Children.Length > 0) {
+                XamlXmlNode tr = ch.Children[0];
+                if (tr.LocalName == "TranslateTransform") {
+                    string xa = tr.GetAttr("X");
+                    if (xa != null && XamlStr.LooksLikeMarkupExtension(xa)) {
+                        string xk = XamlStr.ExtractExtType(xa);
+                        if (xk == "Binding" || xk == "TemplateBinding") {
+                            BindElementFromSpec(el, propPrefix + ".RelativeTransform.X", ParseBindingSpec(xa, ctx), ctx);
+                        }
+                    }
+                    string ya = tr.GetAttr("Y");
+                    if (ya != null && XamlStr.LooksLikeMarkupExtension(ya)) {
+                        string yk = XamlStr.ExtractExtType(ya);
+                        if (yk == "Binding" || yk == "TemplateBinding") {
+                            BindElementFromSpec(el, propPrefix + ".RelativeTransform.Y", ParseBindingSpec(ya, ctx), ctx);
+                        }
+                    }
+                }
+            }
+        }
     }
 
     private static void ParseGradientStopsInto(GradientBrush gb, XamlXmlNode node, XamlBuildContext ctx) {
@@ -2619,6 +2646,22 @@ public static class XamlReader {
         string mm = node.GetAttr("MappingMode");
         if (mm != null) {
             gb.MappingMode = mm.Trim().ToLower() == "absolute" ? 1 : 0;
+        }
+        for (int i = 0; i < node.Children.Length; i += 1) {
+            XamlXmlNode ch = node.Children[i];
+            if (XamlStr.EndsWith(ch.LocalName, ".RelativeTransform") && ch.Children.Length > 0) {
+                XamlXmlNode tr = ch.Children[0];
+                if (tr.LocalName == "TranslateTransform") {
+                    string xa = tr.GetAttr("X");
+                    if (xa != null && !XamlStr.LooksLikeMarkupExtension(xa)) {
+                        gb.RelativeTranslateX = ParseUtil.ParseFloat(xa, 0.0f);
+                    }
+                    string ya = tr.GetAttr("Y");
+                    if (ya != null && !XamlStr.LooksLikeMarkupExtension(ya)) {
+                        gb.RelativeTranslateY = ParseUtil.ParseFloat(ya, 0.0f);
+                    }
+                }
+            }
         }
     }
 

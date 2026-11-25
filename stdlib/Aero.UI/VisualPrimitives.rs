@@ -791,9 +791,19 @@ public class Shape : FrameworkElement {
         return _fill != null || (_stroke != null && _strokeThickness > 0.0f);
     }
 
+    protected override void CollectExtraDisposeTargets(UIElement[] q) {
+        if (_fill is GradientBrush) { (_fill as GradientBrush).ReleaseNativeMutable(); }
+        if (_stroke is GradientBrush) { (_stroke as GradientBrush).ReleaseNativeMutable(); }
+        _fill = null;
+        _stroke = null;
+    }
+
     public Brush Fill {
         get { return _fill; }
         set {
+            if (_fill != value && _fill is GradientBrush) {
+                (_fill as GradientBrush).ReleaseNativeMutable();
+            }
             _fill = value;
             _ownsClonedFill = false;
             _fillOpacity = value != null ? Math.Clampf(value.Opacity, 0.0f, 1.0f) : 1.0f;
@@ -805,6 +815,9 @@ public class Shape : FrameworkElement {
     public Brush Stroke {
         get { return _stroke; }
         set {
+            if (_stroke != value && _stroke is GradientBrush) {
+                (_stroke as GradientBrush).ReleaseNativeMutable();
+            }
             _stroke = value;
             _ownsClonedStroke = false;
             _strokeOpacity = value != null ? Math.Clampf(value.Opacity, 0.0f, 1.0f) : 1.0f;
@@ -975,30 +988,22 @@ public class Shape : FrameworkElement {
             SyncVectorShape();
             return true;
         }
-        if (propName.Length > 5 && propName.Substring(0, 5) == "Fill.") {
+        if (propName.Length > 5 && propName.Substring(0, 5) == "Fill." && _fill != null) {
             string suffix = propName.Substring(5);
-            if (_fill is GradientBrush && GradientBrush.ParseStopSlotIndex(suffix) >= 0) {
-                GradientBrush gb = _fill as GradientBrush;
-                if (!_ownsClonedFill) {
-                    gb = gb.CloneBrush();
-                    _fill = gb;
-                    _ownsClonedFill = true;
-                }
-                gb.TryApplyStopProperty(suffix, value);
+            Brush updatedFill = _fill.ApplySubProperty(suffix, value, !_ownsClonedFill);
+            if (updatedFill != null) {
+                _fill = updatedFill;
+                _ownsClonedFill = true;
                 SyncVectorShape();
                 return true;
             }
         }
-        if (propName.Length > 7 && propName.Substring(0, 7) == "Stroke.") {
+        if (propName.Length > 7 && propName.Substring(0, 7) == "Stroke." && _stroke != null) {
             string suffix = propName.Substring(7);
-            if (_stroke is GradientBrush && GradientBrush.ParseStopSlotIndex(suffix) >= 0) {
-                GradientBrush gb = _stroke as GradientBrush;
-                if (!_ownsClonedStroke) {
-                    gb = gb.CloneBrush();
-                    _stroke = gb;
-                    _ownsClonedStroke = true;
-                }
-                gb.TryApplyStopProperty(suffix, value);
+            Brush updatedStroke = _stroke.ApplySubProperty(suffix, value, !_ownsClonedStroke);
+            if (updatedStroke != null) {
+                _stroke = updatedStroke;
+                _ownsClonedStroke = true;
                 SyncVectorShape();
                 return true;
             }
@@ -1057,12 +1062,12 @@ public class Shape : FrameworkElement {
         if (propName == "Stroke.Color") {
             return DependencyObject.BoxString(_stroke != null ? ParseUtil.FormatArgbHex(_stroke.ResolveRgbaUnscaled()) : "#00000000");
         }
-        if (propName.Length > 5 && propName.Substring(0, 5) == "Fill." && _fill is GradientBrush) {
-            DependencyObject stopBox = (_fill as GradientBrush).TryReadStopProperty(propName.Substring(5));
+        if (propName.Length > 5 && propName.Substring(0, 5) == "Fill." && _fill != null) {
+            DependencyObject stopBox = _fill.ReadSubProperty(propName.Substring(5));
             if (stopBox != null) { return stopBox; }
         }
-        if (propName.Length > 7 && propName.Substring(0, 7) == "Stroke." && _stroke is GradientBrush) {
-            DependencyObject stopBox = (_stroke as GradientBrush).TryReadStopProperty(propName.Substring(7));
+        if (propName.Length > 7 && propName.Substring(0, 7) == "Stroke." && _stroke != null) {
+            DependencyObject stopBox = _stroke.ReadSubProperty(propName.Substring(7));
             if (stopBox != null) { return stopBox; }
         }
         if (propName == "StrokeThickness") { return DependencyObject.BoxFloat(_strokeThickness); }

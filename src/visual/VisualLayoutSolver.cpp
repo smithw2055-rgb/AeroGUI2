@@ -567,6 +567,42 @@ void DistributeGridSpanDemand(
     }
 }
 
+void DistributeGridSpanDemandByOriginalStar(
+    GridTrackVec& tracks,
+    const GridTrackVec& origTracks,
+    std::size_t start,
+    std::size_t span,
+    float neededSize) noexcept {
+    const std::size_t end = std::min(tracks.size(), start + span);
+    float existing = 0.0f;
+    std::size_t starCount = 0u;
+    float starWeightSum = 0.0f;
+    for (std::size_t i = start; i < end; ++i) {
+        existing += tracks[i].size;
+        if (i < origTracks.size() && origTracks[i].unit == GridUnitType::Star) {
+            ++starCount;
+            starWeightSum += std::max(0.0f, origTracks[i].value);
+        }
+    }
+    if (starCount > 0u) {
+        const float deficit = neededSize - existing;
+        if (deficit <= 0.0f) {
+            return;
+        }
+        for (std::size_t i = start; i < end; ++i) {
+            if (i >= origTracks.size() || origTracks[i].unit != GridUnitType::Star) {
+                continue;
+            }
+            const float share = (starWeightSum > 0.0f)
+                ? (deficit * (std::max(0.0f, origTracks[i].value) / starWeightSum))
+                : (deficit / static_cast<float>(starCount));
+            tracks[i].size += share;
+        }
+        return;
+    }
+    DistributeGridSpanDemand(tracks, start, span, GridUnitType::Auto, neededSize);
+}
+
 void ResolveStarTracks(
     GridTrackVec& tracks,
     float totalAvail) noexcept {
@@ -629,6 +665,8 @@ void ResolveStarTracksFromInfinite(
     GridTrackVec cols;
     BuildGridTrackDefs(parent.RowDefs(), rows);
     BuildGridTrackDefs(parent.ColDefs(), cols);
+    const GridTrackVec origRows = rows;
+    const GridTrackVec origCols = cols;
 
     for (GridTrackSolved& r : rows) {
         if (r.unit == GridUnitType::Pixel) {
@@ -701,10 +739,10 @@ void ResolveStarTracksFromInfinite(
         const VisualNode* child = world.GetNode(item.id);
         if (!child) continue;
         if (item.cSpan > 1u) {
-            DistributeGridSpanDemand(cols, item.c0, item.cSpan, GridUnitType::Auto, child->layout.desiredSize.width);
+            DistributeGridSpanDemandByOriginalStar(cols, origCols, item.c0, item.cSpan, child->layout.desiredSize.width);
         }
         if (item.rSpan > 1u) {
-            DistributeGridSpanDemand(rows, item.r0, item.rSpan, GridUnitType::Auto, child->layout.desiredSize.height);
+            DistributeGridSpanDemandByOriginalStar(rows, origRows, item.r0, item.rSpan, child->layout.desiredSize.height);
         }
     }
 
@@ -725,12 +763,12 @@ void ResolveStarTracksFromInfinite(
             : (std::isfinite(availH) ? SumTrackSpan(rows, item.r0, item.rSpan) : kInf);
         const Size d = MeasureNode(world, item.id, Size{cw, ch});
         if (!item.hasStarCol) {
-            DistributeGridSpanDemand(cols, item.c0, item.cSpan, GridUnitType::Auto, d.width);
+            DistributeGridSpanDemandByOriginalStar(cols, origCols, item.c0, item.cSpan, d.width);
         } else if (!std::isfinite(availW)) {
             ResolveStarTracksFromInfinite(cols, item.c0, item.cSpan, d.width);
         }
         if (!item.hasStarRow) {
-            DistributeGridSpanDemand(rows, item.r0, item.rSpan, GridUnitType::Auto, d.height);
+            DistributeGridSpanDemandByOriginalStar(rows, origRows, item.r0, item.rSpan, d.height);
         } else if (!std::isfinite(availH)) {
             ResolveStarTracksFromInfinite(rows, item.r0, item.rSpan, d.height);
         }
@@ -866,18 +904,22 @@ void ArrangeGridPanel(
         const auto cSpan = static_cast<std::size_t>(std::clamp<std::int32_t>(child->layout.gridColSpan, 1, static_cast<std::int32_t>(cCount - c0)));
 
         if (!SpanHasStar(cols, c0, cSpan) && cSpan > 1u) {
-            DistributeGridSpanDemand(cols, c0, cSpan, GridUnitType::Auto, child->layout.desiredSize.width);
+            DistributeGridSpanDemandByOriginalStar(cols, origCols, c0, cSpan, child->layout.desiredSize.width);
         }
         if (!SpanHasStar(rows, r0, rSpan) && rSpan > 1u) {
-            DistributeGridSpanDemand(rows, r0, rSpan, GridUnitType::Auto, child->layout.desiredSize.height);
+            DistributeGridSpanDemandByOriginalStar(rows, origRows, r0, rSpan, child->layout.desiredSize.height);
         }
     }
 
     if (sizeToContentW) {
-        float usedW = 0.0f, starW = 0.0f;
+        float usedW = 0.0f, nonStarW = 0.0f, starW = 0.0f;
         for (std::size_t i = 0u; i < cCount; ++i) {
             usedW += cols[i].size;
-            if (origCols[i].unit == GridUnitType::Star) starW += std::max(0.0f, origCols[i].value);
+            if (origCols[i].unit == GridUnitType::Star) {
+                starW += std::max(0.0f, origCols[i].value);
+            } else {
+                nonStarW += cols[i].size;
+            }
         }
         const float extraW = innerRect.width - usedW;
         if (extraW > 0.0f && starW > 0.0f) {
@@ -886,21 +928,39 @@ void ArrangeGridPanel(
                     cols[i].size += extraW * (std::max(0.0f, origCols[i].value) / starW);
                 }
             }
+        } else if (extraW < 0.0f && starW > 0.0f) {
+            const float availStarW = std::max(0.0f, innerRect.width - nonStarW);
+            for (std::size_t i = 0u; i < cCount; ++i) {
+                if (origCols[i].unit == GridUnitType::Star) {
+                    cols[i].size = availStarW * (std::max(0.0f, origCols[i].value) / starW);
+                }
+            }
         }
     } else {
         ResolveStarTracks(cols, innerRect.width);
     }
     if (sizeToContentH) {
-        float usedH = 0.0f, starH = 0.0f;
+        float usedH = 0.0f, nonStarH = 0.0f, starH = 0.0f;
         for (std::size_t i = 0u; i < rCount; ++i) {
             usedH += rows[i].size;
-            if (origRows[i].unit == GridUnitType::Star) starH += std::max(0.0f, origRows[i].value);
+            if (origRows[i].unit == GridUnitType::Star) {
+                starH += std::max(0.0f, origRows[i].value);
+            } else {
+                nonStarH += rows[i].size;
+            }
         }
         const float extraH = innerRect.height - usedH;
         if (extraH > 0.0f && starH > 0.0f) {
             for (std::size_t i = 0u; i < rCount; ++i) {
                 if (origRows[i].unit == GridUnitType::Star) {
                     rows[i].size += extraH * (std::max(0.0f, origRows[i].value) / starH);
+                }
+            }
+        } else if (extraH < 0.0f && starH > 0.0f) {
+            const float availStarH = std::max(0.0f, innerRect.height - nonStarH);
+            for (std::size_t i = 0u; i < rCount; ++i) {
+                if (origRows[i].unit == GridUnitType::Star) {
+                    rows[i].size = availStarH * (std::max(0.0f, origRows[i].value) / starH);
                 }
             }
         }
@@ -1863,10 +1923,14 @@ void ArrangeNode(
     const float maxH = std::max(minH, (std::isnan(node->layout.maxHeight) || node->layout.maxHeight < 0.0f) ? kInf : node->layout.maxHeight);
 
     const bool hasLayoutTx = !node->layout.layoutTransform2D.IsIdentity();
-    const float desiredContentW = hasLayoutTx
+    const bool hasCustomMeasure =
+        (node->layout.layoutMode == LayoutMode::CustomCallback ||
+         (node->callbackMask & VisualCallback_CustomMeasure) != 0u) &&
+        world.CustomMeasureHook();
+    const float desiredContentW = !hasCustomMeasure
         ? std::max(0.0f, node->layout.untransformedDesiredBox.width)
         : std::max(0.0f, node->layout.desiredSize.width - marginH);
-    const float desiredContentH = hasLayoutTx
+    const float desiredContentH = !hasCustomMeasure
         ? std::max(0.0f, node->layout.untransformedDesiredBox.height)
         : std::max(0.0f, node->layout.desiredSize.height - marginV);
 

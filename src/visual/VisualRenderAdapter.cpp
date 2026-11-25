@@ -968,30 +968,33 @@ std::size_t VisualRenderAdapter::EmitBoxVisual(
         std::size_t count = 0u;
         const bool hasBorderThickness = HasPositiveThickness(node.box.borderThickness);
         Color borderColor = UnpackRgba32(node.box.borderRgba, effOpacity);
+        const GradientBrushDesc* borderGb = nullptr;
         if (hasBorderThickness && node.box.borderGradId > 0) {
             UIResourceStore* store = tree.ResourceStore() ? tree.ResourceStore() : &UIResourceStore::Default();
-            const GradientBrushDesc* gb = store->GradientBrushes().Find(
+            borderGb = store->GradientBrushes().Find(
                 static_cast<std::uint32_t>(node.box.borderGradId));
-            if (!gb) {
-                gb = GradientBrushRegistry::Instance().Find(
+            if (!borderGb) {
+                borderGb = GradientBrushRegistry::Instance().Find(
                     static_cast<std::uint32_t>(node.box.borderGradId));
             }
-            if (gb && !gb->stops.empty()) {
-                Color sampled = SampleGradientRampAtT(*gb, 0.5f);
+            if (borderGb && !borderGb->stops.empty()) {
+                Color sampled = SampleGradientRampAtT(*borderGb, 0.5f);
                 if (sampled.a <= 0.001f) {
-                    for (const GradientStop& st : gb->stops) {
+                    for (const GradientStop& st : borderGb->stops) {
                         if (st.color.a > sampled.a) {
                             sampled = st.color;
                         }
                     }
                 }
-                sampled.a *= gb->opacity * effOpacity;
+                sampled.a *= borderGb->opacity * effOpacity;
                 if (sampled.a > 0.0f) {
                     borderColor = sampled;
                 }
             }
         }
-        const bool hasVisibleBorder = hasBorderThickness && (borderColor.a > 0.0f);
+        const bool hasGradientBorder = hasBorderThickness && borderGb != nullptr && !borderGb->stops.empty() &&
+                                       (borderGb->opacity * effOpacity > 0.0f);
+        const bool hasVisibleBorder = hasBorderThickness && (hasGradientBorder || borderColor.a > 0.0f);
 
         Rect bgRect = rect;
         CornerRadius bgRadii = node.box.cornerRadius;
@@ -1062,20 +1065,54 @@ std::size_t VisualRenderAdapter::EmitBoxVisual(
             count += EmitImageVisual(tree, node, bgRect, effOpacity, world2D, world3D, has3D, blend, optWorld, optDrawBuffer);
         }
 
-        if (hasVisibleBorder) {
+        if (hasVisibleBorder && rect.width > 0.0f && rect.height > 0.0f) {
+            const float btL = std::max(0.0f, node.box.borderThickness.left);
+            const float btT = std::max(0.0f, node.box.borderThickness.top);
+            const float btR = std::max(0.0f, node.box.borderThickness.right);
+            const float btB = std::max(0.0f, node.box.borderThickness.bottom);
+            const bool hasInnerHole = (rect.width > btL + btR + 1e-3f) && (rect.height > btT + btB + 1e-3f);
             const auto beginNid = static_cast<std::uint32_t>(tree.nodes_.size());
-            (void)tree.AllocateBorderRingNode(
-                rect.x,
-                rect.y,
-                rect.width,
-                rect.height,
-                borderColor,
-                node.box.cornerRadius,
-                node.box.borderThickness,
-                &node);
-            const auto endNid = static_cast<std::uint32_t>(tree.nodes_.size());
-            ApplyNodeTransform(tree, beginNid, endNid, world2D, world3D, has3D, blend);
-            count += (endNid - beginNid);
+            if (hasGradientBorder && !hasInnerHole) {
+                Matrix2D borderWorld2D = world2D;
+                CornerRadius borderRadii = node.box.cornerRadius;
+                if (node.layout.effectiveRtl) {
+                    const float cx2 = 2.0f * rect.x + rect.width;
+                    borderWorld2D.tx += world2D.m00 * cx2;
+                    borderWorld2D.ty += world2D.m10 * cx2;
+                    borderWorld2D.m00 = -world2D.m00;
+                    borderWorld2D.m10 = -world2D.m10;
+                    std::swap(borderRadii.topLeft, borderRadii.topRight);
+                    std::swap(borderRadii.bottomLeft, borderRadii.bottomRight);
+                }
+                const Color tint{1.0f, 1.0f, 1.0f, std::clamp(effOpacity, 0.0f, 1.0f)};
+                (void)tree.AllocateGradientRoundedRectNode(
+                    rect.x,
+                    rect.y,
+                    rect.width,
+                    rect.height,
+                    static_cast<std::uint32_t>(node.box.borderGradId),
+                    borderRadii,
+                    false,
+                    tint,
+                    1.0f,
+                    &node);
+                const auto endNid = static_cast<std::uint32_t>(tree.nodes_.size());
+                ApplyNodeTransform(tree, beginNid, endNid, borderWorld2D, world3D, has3D, blend);
+                count += (endNid - beginNid);
+            } else {
+                (void)tree.AllocateBorderRingNode(
+                    rect.x,
+                    rect.y,
+                    rect.width,
+                    rect.height,
+                    borderColor,
+                    node.box.cornerRadius,
+                    node.box.borderThickness,
+                    &node);
+                const auto endNid = static_cast<std::uint32_t>(tree.nodes_.size());
+                ApplyNodeTransform(tree, beginNid, endNid, world2D, world3D, has3D, blend);
+                count += (endNid - beginNid);
+            }
         }
         return count;
     }
@@ -3536,7 +3573,11 @@ std::size_t VisualRenderAdapter::BuildPagedRenderTree(
     PagedRenderTree& outTree,
     UIResourceStore* resourceStore) const {
     outTree.Clear();
-    outTree.SetResourceStore(resourceStore ? resourceStore : const_cast<UIResourceStore*>(world.ResourceStore()));
+    UIResourceStore* const resolvedStore = resourceStore ? resourceStore : const_cast<UIResourceStore*>(world.ResourceStore());
+    outTree.SetResourceStore(resolvedStore);
+    if (resolvedStore != nullptr) {
+        resolvedStore->BeginPathMaskFrame();
+    }
     if (!world.Root().IsValid()) {
         return 0u;
     }
@@ -3765,6 +3806,9 @@ std::size_t VisualRenderAdapter::SyncPagedRenderTree(
         }
     }
 
+    if (store != nullptr) {
+        store->BeginPathMaskFrame();
+    }
     outTree.Clear();
     outTree.SetResourceStore(store);
     if (!world.Root().IsValid()) {

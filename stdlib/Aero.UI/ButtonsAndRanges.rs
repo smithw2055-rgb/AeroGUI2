@@ -471,10 +471,10 @@ public class ToggleButton : ButtonBase {
     protected override UIElement CreateDefaultTemplate() {
         if (Style == null && _appliedStyle == null && Template == null) {
             if (!HasLocalProperty("Background") && Background == null) {
-                Background = new SolidColorBrush(_isChecked ? "#FF3B82F6" : "#FF242B38");
+                Background = new SolidColorBrush(_isIndeterminate ? "#FF334155" : (_isChecked ? "#FF3B82F6" : "#FF242B38"));
             }
             if (!HasLocalProperty("BorderBrush") && BorderBrush == null) {
-                BorderBrush = new SolidColorBrush(_isChecked ? "#FF60A5FA" : "#FF3B465C");
+                BorderBrush = new SolidColorBrush(_isIndeterminate ? "#FF94A3B8" : (_isChecked ? "#FF60A5FA" : "#FF3B465C"));
             }
             if (!HasLocalProperty("BorderThickness") &&
                 BorderThickness.Left == 0.0f && BorderThickness.Top == 0.0f &&
@@ -554,7 +554,7 @@ public class ToggleButton : ButtonBase {
     }
 
     protected virtual void UpdateVisualCheckedState() {
-        if (Style == null && _appliedStyle == null && Template == null) {
+        if (Style == null && _appliedStyle == null && Template == null && IsTemplateApplied()) {
             if (_isIndeterminate) {
                 if (!HasLocalProperty("Background")) { Background = new SolidColorBrush("#FF334155"); }
                 if (!HasLocalProperty("BorderBrush")) { BorderBrush = new SolidColorBrush("#FF94A3B8"); }
@@ -1045,53 +1045,57 @@ public class Track : FrameworkElement {
         int autoUnit = EnumConvert.ToInt(GridUnitType.Auto);
         int pxUnit = EnumConvert.ToInt(GridUnitType.Pixel);
 
+        bool swapButtons = (_orientation == Orientation.Vertical) ? !_isDirectionReversed : _isDirectionReversed;
+        UIElement firstBtn = swapButtons ? _increaseRepeatButton : _decreaseRepeatButton;
+        UIElement secondBtn = swapButtons ? _decreaseRepeatButton : _increaseRepeatButton;
+
         if (_viewportSize <= 0.0f || ParseUtil.IsNaN(_viewportSize)) {
             float w0 = beforeFrac;
             float w2 = 1.0f - beforeFrac;
-            if (_decreaseRepeatButton != null) {
-                _decreaseRepeatButton.Visibility = w0 > 0.0001f ? Visibility.Visible : Visibility.Collapsed;
+            if (firstBtn != null) {
+                firstBtn.Visibility = w0 > 0.0001f ? Visibility.Visible : Visibility.Collapsed;
             }
-            if (_increaseRepeatButton != null) {
-                _increaseRepeatButton.Visibility = w2 > 0.0001f ? Visibility.Visible : Visibility.Collapsed;
+            if (secondBtn != null) {
+                secondBtn.Visibility = w2 > 0.0001f ? Visibility.Visible : Visibility.Collapsed;
             }
             if (_orientation == Orientation.Vertical) {
                 Visual_GridAddRowDef(__nativeHandle, w0 > 0.0001f ? starUnit : pxUnit, w0 > 0.0001f ? w0 : 0.0f);
                 Visual_GridAddRowDef(__nativeHandle, autoUnit, 1.0f);
                 Visual_GridAddRowDef(__nativeHandle, w2 > 0.0001f ? starUnit : pxUnit, w2 > 0.0001f ? w2 : 0.0f);
-                if (_decreaseRepeatButton != null) {
-                    UIElement.SetGridRow(_decreaseRepeatButton, 0);
-                    UIElement.SetGridColumn(_decreaseRepeatButton, 0);
+                if (firstBtn != null) {
+                    UIElement.SetGridRow(firstBtn, 0);
+                    UIElement.SetGridColumn(firstBtn, 0);
                 }
                 if (_thumb != null) {
                     UIElement.SetGridRow(_thumb, 1);
                     UIElement.SetGridColumn(_thumb, 0);
                 }
-                if (_increaseRepeatButton != null) {
-                    UIElement.SetGridRow(_increaseRepeatButton, 2);
-                    UIElement.SetGridColumn(_increaseRepeatButton, 0);
+                if (secondBtn != null) {
+                    UIElement.SetGridRow(secondBtn, 2);
+                    UIElement.SetGridColumn(secondBtn, 0);
                 }
             } else {
                 Visual_GridAddColDef(__nativeHandle, w0 > 0.0001f ? starUnit : pxUnit, w0 > 0.0001f ? w0 : 0.0f);
                 Visual_GridAddColDef(__nativeHandle, autoUnit, 1.0f);
                 Visual_GridAddColDef(__nativeHandle, w2 > 0.0001f ? starUnit : pxUnit, w2 > 0.0001f ? w2 : 0.0f);
-                if (_decreaseRepeatButton != null) {
-                    UIElement.SetGridRow(_decreaseRepeatButton, 0);
-                    UIElement.SetGridColumn(_decreaseRepeatButton, 0);
+                if (firstBtn != null) {
+                    UIElement.SetGridRow(firstBtn, 0);
+                    UIElement.SetGridColumn(firstBtn, 0);
                 }
                 if (_thumb != null) {
                     UIElement.SetGridRow(_thumb, 0);
                     UIElement.SetGridColumn(_thumb, 1);
                 }
-                if (_increaseRepeatButton != null) {
-                    UIElement.SetGridRow(_increaseRepeatButton, 0);
-                    UIElement.SetGridColumn(_increaseRepeatButton, 2);
+                if (secondBtn != null) {
+                    UIElement.SetGridRow(secondBtn, 0);
+                    UIElement.SetGridColumn(secondBtn, 2);
                 }
             }
             return;
         }
 
-        if (_decreaseRepeatButton != null) { _decreaseRepeatButton.Visibility = Visibility.Visible; }
-        if (_increaseRepeatButton != null) { _increaseRepeatButton.Visibility = Visibility.Visible; }
+        if (firstBtn != null) { firstBtn.Visibility = Visibility.Visible; }
+        if (secondBtn != null) { secondBtn.Visibility = Visibility.Visible; }
         float thumbRatio = (span > 0.00001f) ? Math.Clampf(_viewportSize / (span + _viewportSize), 0.08f, 1.0f) : 1.0f;
         float freeRatio = Math.Maxf(0.0f, 1.0f - thumbRatio);
         float sv0 = freeRatio * beforeFrac;
@@ -1101,33 +1105,33 @@ public class Track : FrameworkElement {
             Visual_GridAddRowDef(__nativeHandle, starUnit, sv0);
             Visual_GridAddRowDef(__nativeHandle, starUnit, sv1);
             Visual_GridAddRowDef(__nativeHandle, starUnit, sv2);
-            if (_decreaseRepeatButton != null) {
-                UIElement.SetGridRow(_decreaseRepeatButton, 0);
-                UIElement.SetGridColumn(_decreaseRepeatButton, 0);
+            if (firstBtn != null) {
+                UIElement.SetGridRow(firstBtn, 0);
+                UIElement.SetGridColumn(firstBtn, 0);
             }
             if (_thumb != null) {
                 UIElement.SetGridRow(_thumb, 1);
                 UIElement.SetGridColumn(_thumb, 0);
             }
-            if (_increaseRepeatButton != null) {
-                UIElement.SetGridRow(_increaseRepeatButton, 2);
-                UIElement.SetGridColumn(_increaseRepeatButton, 0);
+            if (secondBtn != null) {
+                UIElement.SetGridRow(secondBtn, 2);
+                UIElement.SetGridColumn(secondBtn, 0);
             }
         } else {
             Visual_GridAddColDef(__nativeHandle, starUnit, sv0);
             Visual_GridAddColDef(__nativeHandle, starUnit, sv1);
             Visual_GridAddColDef(__nativeHandle, starUnit, sv2);
-            if (_decreaseRepeatButton != null) {
-                UIElement.SetGridRow(_decreaseRepeatButton, 0);
-                UIElement.SetGridColumn(_decreaseRepeatButton, 0);
+            if (firstBtn != null) {
+                UIElement.SetGridRow(firstBtn, 0);
+                UIElement.SetGridColumn(firstBtn, 0);
             }
             if (_thumb != null) {
                 UIElement.SetGridRow(_thumb, 0);
                 UIElement.SetGridColumn(_thumb, 1);
             }
-            if (_increaseRepeatButton != null) {
-                UIElement.SetGridRow(_increaseRepeatButton, 0);
-                UIElement.SetGridColumn(_increaseRepeatButton, 2);
+            if (secondBtn != null) {
+                UIElement.SetGridRow(secondBtn, 0);
+                UIElement.SetGridColumn(secondBtn, 2);
             }
         }
     }

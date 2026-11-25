@@ -118,7 +118,7 @@ vec4 sampleAtlasGradientBrush(uint brushId, vec2 normUv, vec2 quadSize) {
     uint kind = uint(m0.r * 255.0 + 0.5);
     uint mappingMode = uint(m0.g * 255.0 + 0.5);
     uint spreadMethod = uint(m0.b * 255.0 + 0.5);
-    float brushOpacity = m0.a;
+    // bakedRampRgba8 already incorporates brush.opacity via BakeGradientBrushRamp.
     float p0x = unpackAtlasFloat32(texelFetch(u_GlyphAndUiAtlas, ivec2(1, metaRow), 0));
     float p0y = unpackAtlasFloat32(texelFetch(u_GlyphAndUiAtlas, ivec2(2, metaRow), 0));
     float p1x = unpackAtlasFloat32(texelFetch(u_GlyphAndUiAtlas, ivec2(3, metaRow), 0));
@@ -162,7 +162,6 @@ vec4 sampleAtlasGradientBrush(uint brushId, vec2 normUv, vec2 quadSize) {
     float uTex = (0.5 + t * max(1.0, rampSpan - 1.0)) / float(atlasDim.x);
     float vTex = (float(rampRow) + 0.5) / float(atlasDim.y);
     vec4 gs = textureLod(u_GlyphAndUiAtlas, vec2(uTex, vTex), 0.0);
-    gs.a *= brushOpacity;
     return gs;
 }
 
@@ -191,7 +190,7 @@ void main() {
             vec2 boxHalf = (softShadowPad > 0.0) ? max(vec2(0.5), halfSize - vec2(softShadowPad)) : halfSize;
             float dist = sdRoundedBox(v_UvOrLocalPos, boxHalf, cornerRadius);
             float softBlur = (softShadowPad > 1.05) ? (softShadowPad * 0.8) : 0.0;
-            float aa = max(max(fwidth(dist) * 0.75, softBlur), 1e-4);
+            float aa = max(max(fwidth(dist) * 0.5, softBlur), 1e-4);
             float outerCoverage = smoothstep(aa, -aa, dist);
             float outA = v_Color.a * outerCoverage;
             if (borderThickness > 0.0) {
@@ -219,7 +218,7 @@ void main() {
                     float((payload27 >> 16u) & 0x1Fu),
                     float((payload27 >> 21u) & 0x1Fu));
             float dist = sdRoundedBox(v_UvOrLocalPos, halfSize, r);
-            float aa = max(fwidth(dist) * 0.75, 1e-4);
+            float aa = max(fwidth(dist) * 0.5, 1e-4);
             float minHairline = max(aa * 2.0, 0.001);
             float maxRaw = max(max(rawBt.x, rawBt.y), max(rawBt.z, rawBt.w));
             bool isSubpixel = (maxRaw > 0.0 && maxRaw < minHairline);
@@ -258,7 +257,7 @@ void main() {
             float br = float((payload27 >> 12u) & 0x3Fu) * rStep;
             float bl = float((payload27 >> 18u) & 0x3Fu) * rStep;
             float dist = sdRoundedBox4(v_UvOrLocalPos, halfSize, vec4(tr, br, tl, bl));
-            float aa = max(fwidth(dist) * 0.75, 1e-4);
+            float aa = max(fwidth(dist) * 0.5, 1e-4);
             float outA = v_Color.a * smoothstep(aa, -aa, dist);
             o_FragColor = vec4(v_Color.rgb * outA, outA);
             return;
@@ -271,7 +270,7 @@ void main() {
         float borderThickness = float((payload27 >> 20u) & 0x3Fu) * 0.5;
         vec4 outerRadii = vec4(tr, br, tl, bl);
         float dist = sdRoundedBox4(v_UvOrLocalPos, halfSize, outerRadii);
-        float aa = max(fwidth(dist) * 0.75, 1e-4);
+        float aa = max(fwidth(dist) * 0.5, 1e-4);
         float outerCoverage = smoothstep(aa, -aa, dist);
         vec2 innerHalf = halfSize - vec2(borderThickness);
         float innerCoverage = (innerHalf.x > 0.0 && innerHalf.y > 0.0)
@@ -357,7 +356,7 @@ void main() {
         float dist = (sc.y * q.x > sc.x * q.y)
             ? (abs(length(q) - midR) - halfThick)
             : (length(q - sc * midR) - halfThick);
-        float aa = max(fwidth(dist) * 0.75, 1e-4);
+        float aa = max(fwidth(dist) * 0.5, 1e-4);
         float cov = (sweepRad <= 0.001) ? 0.0 : smoothstep(aa, -aa, dist);
         float outA = v_Color.a * cov;
         o_FragColor = vec4(v_Color.rgb * outA, outA);
@@ -370,7 +369,7 @@ void main() {
         float strokeThickness = float(v_Flags & 0x7FFFu) * 0.5;
         bool hollowStroke = (v_Flags & 0x8000u) != 0u;
         float dist = sdEllipseApprox(v_UvOrLocalPos, halfSize);
-        float aa = max(fwidth(dist) * 0.75, 1e-4);
+        float aa = max(fwidth(dist) * 0.5, 1e-4);
         float outerCov = smoothstep(aa, -aa, dist);
         float cov = outerCov;
         if (hollowStroke) {
@@ -398,7 +397,7 @@ void main() {
         float dist = isEllipse
             ? sdEllipseApprox(v_UvOrLocalPos, halfSize)
             : sdRoundedBox(v_UvOrLocalPos, halfSize, cornerRadius);
-        float aa = max(fwidth(dist) * 0.75, 1e-4);
+        float aa = max(fwidth(dist) * 0.5, 1e-4);
         float shapeCov = smoothstep(aa, -aa, dist);
 
         vec2 quadSize = max(halfSize * 2.0, vec2(1e-4));
@@ -509,7 +508,7 @@ fn sampleAtlasGradientBrush(brushId : u32, normUv : vec2<f32>, quadSize : vec2<f
     let kind = u32(m0.r * 255.0 + 0.5);
     let mappingMode = u32(m0.g * 255.0 + 0.5);
     let spreadMethod = u32(m0.b * 255.0 + 0.5);
-    let brushOpacity = m0.a;
+    // bakedRampRgba8 already incorporates brush.opacity via BakeGradientBrushRamp.
     let p0x = unpackAtlasFloat32(textureLoad(u_AtlasTex, vec2<i32>(1, metaRow), 0));
     let p0y = unpackAtlasFloat32(textureLoad(u_AtlasTex, vec2<i32>(2, metaRow), 0));
     let p1x = unpackAtlasFloat32(textureLoad(u_AtlasTex, vec2<i32>(3, metaRow), 0));
@@ -558,8 +557,7 @@ fn sampleAtlasGradientBrush(brushId : u32, normUv : vec2<f32>, quadSize : vec2<f
     let rampSpan = min(f32(atlasDim.x), 256.0);
     let uTex = (0.5 + t * max(1.0, rampSpan - 1.0)) / f32(atlasDim.x);
     let vTex = (f32(rampRow) + 0.5) / f32(atlasDim.y);
-    var gs = textureSampleLevel(u_AtlasTex, u_AtlasSampler, vec2<f32>(uTex, vTex), 0.0);
-    gs.a = gs.a * brushOpacity;
+    let gs = textureSampleLevel(u_AtlasTex, u_AtlasSampler, vec2<f32>(uTex, vTex), 0.0);
     return gs;
 }
 
@@ -609,7 +607,7 @@ fn fs_main(in : VertexOut) -> @location(0) vec4<f32> {
             let softShadowPad = f32((payload27 >> 16u) & 0x7FFu) * 0.5;
             let boxHalf = select(halfSize, max(vec2<f32>(0.5, 0.5), halfSize - vec2<f32>(softShadowPad, softShadowPad)), softShadowPad > 0.0);
             let dist = sdRoundedBox(in.uvOrLocal, boxHalf, radius);
-            let aa = max(max(fwidth(dist) * 0.75, softShadowPad * 0.8), 1e-4);
+            let aa = max(max(fwidth(dist) * 0.5, softShadowPad * 0.8), 1e-4);
             let outerCov = smoothstep(aa, -aa, dist);
             let outA = in.color.a * outerCov;
             if (borderThickness > 0.0) {
@@ -636,7 +634,7 @@ fn fs_main(in : VertexOut) -> @location(0) vec4<f32> {
                     f32((payload27 >> 21u) & 0x1Fu)),
                 asymBt != 0u);
             let dist = sdRoundedBox(in.uvOrLocal, halfSize, r);
-            let aa = max(fwidth(dist) * 0.75, 1e-4);
+            let aa = max(fwidth(dist) * 0.5, 1e-4);
             let minHairline = max(aa * 2.0, 0.001);
             let maxRaw = max(max(rawBt.x, rawBt.y), max(rawBt.z, rawBt.w));
             let isSubpixel = (maxRaw > 0.0 && maxRaw < minHairline);
@@ -672,7 +670,7 @@ fn fs_main(in : VertexOut) -> @location(0) vec4<f32> {
             let br = f32((payload27 >> 12u) & 0x3Fu) * rStep;
             let bl = f32((payload27 >> 18u) & 0x3Fu) * rStep;
             let dist = sdRoundedBox4(in.uvOrLocal, halfSize, vec4<f32>(tr, br, tl, bl));
-            let aa = max(fwidth(dist) * 0.75, 1e-4);
+            let aa = max(fwidth(dist) * 0.5, 1e-4);
             let outA = in.color.a * smoothstep(aa, -aa, dist);
             return vec4<f32>(in.color.rgb * outA, outA);
         }
@@ -684,7 +682,7 @@ fn fs_main(in : VertexOut) -> @location(0) vec4<f32> {
         let borderThickness = f32((payload27 >> 20u) & 0x3Fu) * 0.5;
         let outerRadii = vec4<f32>(tr, br, tl, bl);
         let dist = sdRoundedBox4(in.uvOrLocal, halfSize, outerRadii);
-        let aa = max(fwidth(dist) * 0.75, 1e-4);
+        let aa = max(fwidth(dist) * 0.5, 1e-4);
         let outerCov = smoothstep(aa, -aa, dist);
         let innerHalf = halfSize - vec2<f32>(borderThickness, borderThickness);
         var innerCov = 0.0;
@@ -765,7 +763,7 @@ fn fs_main(in : VertexOut) -> @location(0) vec4<f32> {
             length(q - sc * midR) - halfThick,
             abs(length(q) - midR) - halfThick,
             sc.y * q.x > sc.x * q.y);
-        let aa = max(fwidth(dist) * 0.75, 1e-4);
+        let aa = max(fwidth(dist) * 0.5, 1e-4);
         let cov = select(smoothstep(aa, -aa, dist), 0.0, sweepRad <= 0.001);
         let outA = in.color.a * cov;
         return vec4<f32>(in.color.rgb * outA, outA);
@@ -775,7 +773,7 @@ fn fs_main(in : VertexOut) -> @location(0) vec4<f32> {
         let strokeThickness = f32(in.flags & 0x7FFFu) * 0.5;
         let hollowStroke = (in.flags & 0x8000u) != 0u;
         let dist = sdEllipseApprox(in.uvOrLocal, halfSize);
-        let aa = max(fwidth(dist) * 0.75, 1e-4);
+        let aa = max(fwidth(dist) * 0.5, 1e-4);
         let outerCov = smoothstep(aa, -aa, dist);
         var cov = outerCov;
         if (hollowStroke) {
@@ -805,7 +803,7 @@ fn fs_main(in : VertexOut) -> @location(0) vec4<f32> {
             sdRoundedBox(in.uvOrLocal, halfSize, cornerRadius),
             sdEllipseApprox(in.uvOrLocal, halfSize),
             isEllipse);
-        let aa = max(fwidth(dist) * 0.75, 1e-4);
+        let aa = max(fwidth(dist) * 0.5, 1e-4);
         let shapeCov = smoothstep(aa, -aa, dist);
 
         let quadSize = max(halfSize * 2.0, vec2<f32>(1e-4, 1e-4));

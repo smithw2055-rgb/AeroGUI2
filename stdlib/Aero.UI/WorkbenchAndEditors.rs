@@ -1140,6 +1140,9 @@ public class CodeEditorView : Control {
     private int _scrollFirstLine = 0;
     private int _caretLine = 0;
     private int _caretCol = 0;
+    private int _anchorLine = 0;
+    private int _anchorCol = 0;
+    private bool _isDragSelecting = false;
     private int _activeExecLine = -1;
     private Dictionary<int, bool> _breakpoints;
     private CodeDiagnosticItem[] _diagnostics;
@@ -1190,6 +1193,17 @@ public class CodeEditorView : Control {
     public int LineCount() { return _lines.Length; }
     public int CaretLine { get { return _caretLine; } set { SetCaretPosition(value, _caretCol); } }
     public int CaretColumn { get { return _caretCol; } set { SetCaretPosition(_caretLine, value); } }
+    public bool HasSelection { get { return _anchorLine != _caretLine || _anchorCol != _caretCol; } }
+
+    private bool IsAnchorBeforeCaret() {
+        return _anchorLine < _caretLine || (_anchorLine == _caretLine && _anchorCol <= _caretCol);
+    }
+
+    public int SelectionStartLine { get { return IsAnchorBeforeCaret() ? _anchorLine : _caretLine; } }
+    public int SelectionStartColumn { get { return IsAnchorBeforeCaret() ? _anchorCol : _caretCol; } }
+    public int SelectionEndLine { get { return IsAnchorBeforeCaret() ? _caretLine : _anchorLine; } }
+    public int SelectionEndColumn { get { return IsAnchorBeforeCaret() ? _caretCol : _anchorCol; } }
+
     public int ScrollFirstLine {
         get { return _scrollFirstLine; }
         set {
@@ -1201,6 +1215,21 @@ public class CodeEditorView : Control {
     public int ActiveExecutionLine {
         get { return _activeExecLine; }
         set { _activeExecLine = value; InvalidateEditor(); }
+    }
+
+    private int LineLen(string s) {
+        return ParseUtil.Utf8CodePointCount(s);
+    }
+
+    private string LineSlice(string s, int start, int count) {
+        return ParseUtil.SliceCodePoints(s, start, count);
+    }
+
+    private string LineTail(string s, int start) {
+        int len = LineLen(s);
+        if (start < 0) { start = 0; }
+        if (start >= len) { return ""; }
+        return LineSlice(s, start, len - start);
     }
 
     public string Text {
@@ -1215,7 +1244,10 @@ public class CodeEditorView : Control {
                 _lines = split;
             }
             _caretLine = EditorMath.Clampi(_caretLine, 0, _lines.Length - 1);
-            _caretCol = EditorMath.Clampi(_caretCol, 0, _lines[_caretLine].Length);
+            _caretCol = EditorMath.Clampi(_caretCol, 0, LineLen(_lines[_caretLine]));
+            _anchorLine = _caretLine;
+            _anchorCol = _caretCol;
+            _isDragSelecting = false;
             _scrollFirstLine = EditorMath.Clampi(_scrollFirstLine, 0, EditorMath.Maxi(0, _lines.Length - 1));
             BumpPropEpoch();
             InvalidateEditor();
@@ -1227,13 +1259,75 @@ public class CodeEditorView : Control {
         return _lines[zeroBasedLine];
     }
 
-    public void SetCaretPosition(int line, int col) {
+    private void MoveCaretInternal(int line, int col, bool extendSelection) {
         _caretLine = EditorMath.Clampi(line, 0, _lines.Length - 1);
-        _caretCol = EditorMath.Clampi(col, 0, _lines[_caretLine].Length);
+        _caretCol = EditorMath.Clampi(col, 0, LineLen(_lines[_caretLine]));
+        if (!extendSelection) {
+            _anchorLine = _caretLine;
+            _anchorCol = _caretCol;
+        }
         EnsureCaretScrolledIntoView();
         SyncCodeImeCaret();
         InvalidateEditor();
         CaretMoved(this, EventArgs.Empty());
+    }
+
+    public void SetCaretPosition(int line, int col) {
+        MoveCaretInternal(line, col, false);
+    }
+
+    public void SetSelection(int startLine, int startCol, int endLine, int endCol) {
+        int sLine = EditorMath.Clampi(startLine, 0, _lines.Length - 1);
+        int sCol = EditorMath.Clampi(startCol, 0, LineLen(_lines[sLine]));
+        int eLine = EditorMath.Clampi(endLine, 0, _lines.Length - 1);
+        int eCol = EditorMath.Clampi(endCol, 0, LineLen(_lines[eLine]));
+        _anchorLine = sLine;
+        _anchorCol = sCol;
+        _caretLine = eLine;
+        _caretCol = eCol;
+        EnsureCaretScrolledIntoView();
+        SyncCodeImeCaret();
+        InvalidateEditor();
+        CaretMoved(this, EventArgs.Empty());
+    }
+
+    public void ClearSelection() {
+        _anchorLine = _caretLine;
+        _anchorCol = _caretCol;
+        InvalidateEditor();
+    }
+
+    public void SelectAll() {
+        int lastLine = _lines.Length - 1;
+        SetSelection(0, 0, lastLine, LineLen(_lines[lastLine]));
+    }
+
+    public string GetSelectedText() {
+        if (!HasSelection) { return ""; }
+        int sLine = SelectionStartLine;
+        int sCol = SelectionStartColumn;
+        int eLine = SelectionEndLine;
+        int eCol = SelectionEndColumn;
+        if (sLine == eLine) {
+            return LineSlice(_lines[sLine], sCol, eCol - sCol);
+        }
+        string acc = LineTail(_lines[sLine], sCol);
+        for (int i = sLine + 1; i < eLine; i += 1) {
+            acc = acc + "\n" + _lines[i];
+        }
+        acc = acc + "\n" + LineSlice(_lines[eLine], 0, eCol);
+        return acc;
+    }
+
+    public void CopySelection() {
+        string sel = GetSelectedText();
+        if (sel.Length > 0) { Host_SetClipboardText(sel); }
+    }
+
+    public void CutSelection() {
+        if (_isReadOnly || !HasSelection) { return; }
+        CopySelection();
+        DeleteSelectionInternal(true);
     }
 
     public void ToggleBreakpoint(int oneBasedLine) {
@@ -1276,13 +1370,54 @@ public class CodeEditorView : Control {
     }
 
     private float MeasurePrefixX(string lineStr, int col) {
-        int safeCol = EditorMath.Clampi(col, 0, lineStr.Length);
+        int lineLen = LineLen(lineStr);
+        int safeCol = EditorMath.Clampi(col, 0, lineLen);
         if (safeCol <= 0) { return 0.0f; }
-        string sub = lineStr.Substring(0, safeCol);
+        string sub = LineSlice(lineStr, 0, safeCol);
         if (ParseUtil.IsNativeReady()) {
             return Visual_MeasureText(sub, FontFamily, FontSize, 1000000.0f, 0, 0);
         }
         return (float)safeCol * (FontSize * 0.6f);
+    }
+
+    private int HitTestLineIndex(float localY) {
+        return EditorMath.Clampi(_scrollFirstLine + (int)EditorMath.Floorf((localY - 4.0f) / _lineHeight), 0, _lines.Length - 1);
+    }
+
+    private int HitTestColumnInLine(string lineStr, float textRelX) {
+        int lineLen = LineLen(lineStr);
+        if (textRelX <= 0.0f || lineLen <= 0) { return 0; }
+        if (!ParseUtil.IsNativeReady()) {
+            float approxCharW = Math.Maxf(6.0f, FontSize * 0.58f);
+            return EditorMath.Clampi(EditorMath.RoundToInt(textRelX / approxCharW), 0, lineLen);
+        }
+        float totalW = MeasurePrefixX(lineStr, lineLen);
+        if (textRelX >= totalW) { return lineLen; }
+        int lo = 0;
+        int hi = lineLen;
+        while (lo < hi) {
+            int mid = (lo + hi) / 2;
+            float wMid = MeasurePrefixX(lineStr, mid);
+            if (wMid < textRelX) {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        if (lo > 0) {
+            float wPrev = MeasurePrefixX(lineStr, lo - 1);
+            float wCur = MeasurePrefixX(lineStr, lo);
+            if ((textRelX - wPrev) < (wCur - textRelX)) {
+                return lo - 1;
+            }
+        }
+        return lo;
+    }
+
+    private bool IsWordChar(string ch) {
+        if (ch == null || ch.Length == 0) { return false; }
+        if (ch.Length > 1) { return true; }
+        return "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_".Contains(ch);
     }
 
     private void EnsureCaretScrolledIntoView() {
@@ -1320,6 +1455,7 @@ public class CodeEditorView : Control {
         uint colGutter = ParseUtil.PackArgb(255u, 15u, 23u, 42u);
         uint colBorder = ParseUtil.PackArgb(255u, 30u, 41u, 59u);
         uint colCaretRow = ParseUtil.PackArgb(34u, 56u, 189u, 248u);
+        uint colSelection = ParseUtil.PackArgb(115u, 56u, 189u, 248u);
         uint colExecRow = ParseUtil.PackArgb(68u, 250u, 204u, 21u);
         uint colRed = ParseUtil.PackArgb(255u, 239u, 68u, 68u);
         uint colAmber = ParseUtil.PackArgb(255u, 245u, 158u, 11u);
@@ -1334,12 +1470,17 @@ public class CodeEditorView : Control {
         int visibleCount = EditorMath.Maxi(1, (int)(h / _lineHeight) + 2);
         int endLine = EditorMath.Mini(_lines.Length, _scrollFirstLine + visibleCount);
         int langKind = ResolveLangKind();
+        bool hasSel = HasSelection;
+        int selSLine = hasSel ? SelectionStartLine : -1;
+        int selSCol = hasSel ? SelectionStartColumn : 0;
+        int selELine = hasSel ? SelectionEndLine : -1;
+        int selECol = hasSel ? SelectionEndColumn : 0;
 
         for (int ln = _scrollFirstLine; ln < endLine; ln += 1) {
             float rowY = (float)(ln - _scrollFirstLine) * _lineHeight + 4.0f;
             int oneBased = ln + 1;
 
-            if (ln == _caretLine) {
+            if (!hasSel && ln == _caretLine) {
                 dc.FillRect(_gutterWidth + 1.0f, rowY - 2.0f, w - _gutterWidth - 1.0f, _lineHeight, colCaretRow);
             }
             if (oneBased == _activeExecLine) {
@@ -1364,6 +1505,21 @@ public class CodeEditorView : Control {
                 VerticalAlignment.Top);
 
             string codeLine = _lines[ln];
+            if (hasSel && ln >= selSLine && ln <= selELine) {
+                int c0 = (ln == selSLine) ? selSCol : 0;
+                int c1 = (ln == selELine) ? selECol : LineLen(codeLine);
+                float x0 = _gutterWidth + 8.0f + MeasurePrefixX(codeLine, c0);
+                float x1 = _gutterWidth + 8.0f + MeasurePrefixX(codeLine, c1);
+                if (ln < selELine) {
+                    x1 = Math.Minf(w - 2.0f, Math.Maxf(x1 + 8.0f, x0 + 8.0f));
+                }
+                if (x0 < _gutterWidth + 1.0f) { x0 = _gutterWidth + 1.0f; }
+                if (x1 > w) { x1 = w; }
+                if (x1 > x0) {
+                    dc.FillRect(x0, rowY - 2.0f, x1 - x0, _lineHeight, colSelection);
+                }
+            }
+
             if (codeLine.Length > 0) {
                 dc.DrawSyntaxLine(
                     codeLine,
@@ -1415,18 +1571,50 @@ public class CodeEditorView : Control {
         }
     }
 
+    private bool DeleteSelectionInternal(bool notify) {
+        if (_isReadOnly || !HasSelection) { return false; }
+        int sLine = SelectionStartLine;
+        int sCol = SelectionStartColumn;
+        int eLine = SelectionEndLine;
+        int eCol = SelectionEndColumn;
+
+        string head = LineSlice(_lines[sLine], 0, sCol);
+        string tail = LineTail(_lines[eLine], eCol);
+        _lines[sLine] = head + tail;
+        for (int r = eLine; r > sLine; r -= 1) {
+            _lines.RemoveAt(r);
+        }
+        _caretLine = EditorMath.Clampi(sLine, 0, _lines.Length - 1);
+        _caretCol = EditorMath.Clampi(sCol, 0, LineLen(_lines[_caretLine]));
+        _anchorLine = _caretLine;
+        _anchorCol = _caretCol;
+        if (notify) {
+            EnsureCaretScrolledIntoView();
+            SyncCodeImeCaret();
+            BumpPropEpoch();
+            InvalidateEditor();
+            CaretMoved(this, EventArgs.Empty());
+            TextChanged(this, new TextChangedEventArgs(Text, this));
+        }
+        return true;
+    }
+
     private void InsertTextAtCaret(string ins) {
         if (_isReadOnly || ins == null || ins.Length == 0) { return; }
+        if (HasSelection) {
+            DeleteSelectionInternal(false);
+        }
         string cur = _lines[_caretLine];
-        int col = EditorMath.Clampi(_caretCol, 0, cur.Length);
-        string left = cur.Substring(0, col);
-        string right = cur.Substring(col);
+        int curLen = LineLen(cur);
+        int col = EditorMath.Clampi(_caretCol, 0, curLen);
+        string left = LineSlice(cur, 0, col);
+        string right = LineTail(cur, col);
 
         string clean = ins.Replace("\r\n", "\n").Replace("\r", "\n");
         string[] parts = clean.Split("\n");
         if (parts.Length <= 1) {
             _lines[_caretLine] = left + clean + right;
-            _caretCol = col + clean.Length;
+            _caretCol = col + LineLen(clean);
         } else {
             _lines[_caretLine] = left + parts[0];
             for (int p = 1; p < parts.Length - 1; p += 1) {
@@ -1435,21 +1623,28 @@ public class CodeEditorView : Control {
             string lastPart = parts[parts.Length - 1];
             _lines.Insert(_caretLine + parts.Length - 1, lastPart + right);
             _caretLine += parts.Length - 1;
-            _caretCol = lastPart.Length;
+            _caretCol = LineLen(lastPart);
         }
+        _anchorLine = _caretLine;
+        _anchorCol = _caretCol;
         EnsureCaretScrolledIntoView();
         SyncCodeImeCaret();
         BumpPropEpoch();
         InvalidateEditor();
+        CaretMoved(this, EventArgs.Empty());
         TextChanged(this, new TextChangedEventArgs(Text, this));
     }
 
     private void InsertSmartNewline() {
         if (_isReadOnly) { return; }
+        if (HasSelection) {
+            DeleteSelectionInternal(false);
+        }
         string cur = _lines[_caretLine];
+        int curLen = LineLen(cur);
         int spaces = 0;
-        while (spaces < cur.Length && cur.Substring(spaces, 1) == " ") { spaces += 1; }
-        string trimmed = cur.Substring(0, EditorMath.Clampi(_caretCol, 0, cur.Length)).Trim();
+        while (spaces < curLen && LineSlice(cur, spaces, 1) == " ") { spaces += 1; }
+        string trimmed = LineSlice(cur, 0, EditorMath.Clampi(_caretCol, 0, curLen)).Trim();
         if (trimmed.EndsWith("{") || (trimmed.EndsWith(">") && !trimmed.EndsWith("/>") && !trimmed.StartsWith("</"))) {
             spaces += 4;
         }
@@ -1460,13 +1655,17 @@ public class CodeEditorView : Control {
 
     private void BackspaceAtCaret() {
         if (_isReadOnly) { return; }
+        if (HasSelection) {
+            DeleteSelectionInternal(true);
+            return;
+        }
         string cur = _lines[_caretLine];
         if (_caretCol > 0) {
-            _lines[_caretLine] = cur.Substring(0, _caretCol - 1) + cur.Substring(_caretCol);
+            _lines[_caretLine] = LineSlice(cur, 0, _caretCol - 1) + LineTail(cur, _caretCol);
             _caretCol -= 1;
         } else if (_caretLine > 0) {
             string prev = _lines[_caretLine - 1];
-            int joinCol = prev.Length;
+            int joinCol = LineLen(prev);
             _lines[_caretLine - 1] = prev + cur;
             _lines.RemoveAt(_caretLine);
             _caretLine -= 1;
@@ -1474,6 +1673,34 @@ public class CodeEditorView : Control {
         } else {
             return;
         }
+        _anchorLine = _caretLine;
+        _anchorCol = _caretCol;
+        EnsureCaretScrolledIntoView();
+        SyncCodeImeCaret();
+        BumpPropEpoch();
+        InvalidateEditor();
+        CaretMoved(this, EventArgs.Empty());
+        TextChanged(this, new TextChangedEventArgs(Text, this));
+    }
+
+    private void DeleteAtCaret() {
+        if (_isReadOnly) { return; }
+        if (HasSelection) {
+            DeleteSelectionInternal(true);
+            return;
+        }
+        string cur = _lines[_caretLine];
+        int curLen = LineLen(cur);
+        if (_caretCol < curLen) {
+            _lines[_caretLine] = LineSlice(cur, 0, _caretCol) + LineTail(cur, _caretCol + 1);
+        } else if (_caretLine + 1 < _lines.Length) {
+            _lines[_caretLine] = cur + _lines[_caretLine + 1];
+            _lines.RemoveAt(_caretLine + 1);
+        } else {
+            return;
+        }
+        _anchorLine = _caretLine;
+        _anchorCol = _caretCol;
         EnsureCaretScrolledIntoView();
         SyncCodeImeCaret();
         BumpPropEpoch();
@@ -1481,36 +1708,86 @@ public class CodeEditorView : Control {
         TextChanged(this, new TextChangedEventArgs(Text, this));
     }
 
-    private void DeleteAtCaret() {
-        if (_isReadOnly) { return; }
-        string cur = _lines[_caretLine];
-        if (_caretCol < cur.Length) {
-            _lines[_caretLine] = cur.Substring(0, _caretCol) + cur.Substring(_caretCol + 1);
-        } else if (_caretLine + 1 < _lines.Length) {
-            _lines[_caretLine] = cur + _lines[_caretLine + 1];
-            _lines.RemoveAt(_caretLine + 1);
-        } else {
-            return;
-        }
+    public override void OnGotFocus() {
+        base.OnGotFocus();
+        SyncCodeImeCaret();
         InvalidateEditor();
-        TextChanged(this, new TextChangedEventArgs(Text, this));
+    }
+
+    public override void OnLostFocus() {
+        base.OnLostFocus();
+        if (_isDragSelecting) {
+            _isDragSelecting = false;
+            ReleaseMouseCapture();
+        }
+        SyncCodeImeCaret();
+        InvalidateEditor();
     }
 
     public override void OnMouseLeftButtonDown(MouseButtonEventArgs e) {
         base.OnMouseLeftButtonDown(e);
         Focus();
+        if (_completionVisible) { _completionVisible = false; }
         float lx = ParseUtil.IsValidHandle(__nativeHandle) ? Visual_ScreenToLocal(__nativeHandle, e.X, e.Y, 0) : e.X;
         float ly = ParseUtil.IsValidHandle(__nativeHandle) ? Visual_ScreenToLocal(__nativeHandle, e.X, e.Y, 1) : e.Y;
-        int clickedLine = EditorMath.Clampi(_scrollFirstLine + (int)((ly - 4.0f) / _lineHeight), 0, _lines.Length - 1);
+        int clickedLine = HitTestLineIndex(ly);
         if (lx < _gutterWidth) {
             ToggleBreakpoint(clickedLine + 1);
+            e.Handled = true;
+            return;
+        }
+        string lnText = _lines[clickedLine];
+        int lineLen = LineLen(lnText);
+        int col = HitTestColumnInLine(lnText, lx - (_gutterWidth + 8.0f));
+        if (e.ClickCount >= 3) {
+            if (clickedLine + 1 < _lines.Length) {
+                SetSelection(clickedLine, 0, clickedLine + 1, 0);
+            } else {
+                SetSelection(clickedLine, 0, clickedLine, lineLen);
+            }
+        } else if (e.ClickCount == 2) {
+            int probe = col >= lineLen && lineLen > 0 ? lineLen - 1 : col;
+            if (lineLen > 0 && IsWordChar(LineSlice(lnText, probe, 1))) {
+                int wStart = probe;
+                int wEnd = probe + 1;
+                while (wStart > 0 && IsWordChar(LineSlice(lnText, wStart - 1, 1))) { wStart -= 1; }
+                while (wEnd < lineLen && IsWordChar(LineSlice(lnText, wEnd, 1))) { wEnd += 1; }
+                SetSelection(clickedLine, wStart, clickedLine, wEnd);
+            } else {
+                MoveCaretInternal(clickedLine, col, false);
+            }
         } else {
-            string lnText = _lines[clickedLine];
-            float approxCharW = Math.Maxf(6.0f, FontSize * 0.58f);
-            int approxCol = EditorMath.Clampi(EditorMath.RoundToInt((lx - _gutterWidth - 8.0f) / approxCharW), 0, lnText.Length);
-            SetCaretPosition(clickedLine, approxCol);
+            bool shift = KeyModifiers.Has(e.Modifiers, KeyModifiers.Shift());
+            MoveCaretInternal(clickedLine, col, shift);
+            _isDragSelecting = true;
+            CaptureMouse();
         }
         e.Handled = true;
+    }
+
+    public override void OnMouseMove(MouseEventArgs e) {
+        base.OnMouseMove(e);
+        if (!_isDragSelecting) { return; }
+        float lx = ParseUtil.IsValidHandle(__nativeHandle) ? Visual_ScreenToLocal(__nativeHandle, e.X, e.Y, 0) : e.X;
+        float ly = ParseUtil.IsValidHandle(__nativeHandle) ? Visual_ScreenToLocal(__nativeHandle, e.X, e.Y, 1) : e.Y;
+        if (ly < 4.0f && _scrollFirstLine > 0) {
+            _scrollFirstLine -= 1;
+        } else if (ActualHeight > 20.0f && ly > ActualHeight - 4.0f && _scrollFirstLine < _lines.Length - 1) {
+            _scrollFirstLine += 1;
+        }
+        int line = HitTestLineIndex(ly);
+        int col = HitTestColumnInLine(_lines[line], lx - (_gutterWidth + 8.0f));
+        MoveCaretInternal(line, col, true);
+        e.Handled = true;
+    }
+
+    public override void OnMouseLeftButtonUp(MouseButtonEventArgs e) {
+        base.OnMouseLeftButtonUp(e);
+        if (_isDragSelecting) {
+            _isDragSelecting = false;
+            ReleaseMouseCapture();
+            e.Handled = true;
+        }
     }
 
     public override void OnMouseWheel(MouseWheelEventArgs e) {
@@ -1523,9 +1800,25 @@ public class CodeEditorView : Control {
     public override void OnKeyDown(KeyEventArgs e) {
         base.OnKeyDown(e);
         if (!IsEnabled) { return; }
+        bool shift = e.IsShiftDown;
 
         if (e.IsControlDown && e.Key == KeyCode.S) {
             SaveRequested(this, EventArgs.Empty());
+            e.Handled = true;
+            return;
+        }
+        if (e.IsControlDown && e.Key == KeyCode.A) {
+            SelectAll();
+            e.Handled = true;
+            return;
+        }
+        if (e.IsControlDown && e.Key == KeyCode.C) {
+            CopySelection();
+            e.Handled = true;
+            return;
+        }
+        if (e.IsControlDown && e.Key == KeyCode.X) {
+            CutSelection();
             e.Handled = true;
             return;
         }
@@ -1563,22 +1856,37 @@ public class CodeEditorView : Control {
             }
         }
 
+        if (e.Key == KeyCode.Escape && HasSelection) {
+            ClearSelection();
+            e.Handled = true;
+            return;
+        }
         if (e.Key == KeyCode.Left) {
-            if (_caretCol > 0) { SetCaretPosition(_caretLine, _caretCol - 1); }
-            else if (_caretLine > 0) { SetCaretPosition(_caretLine - 1, _lines[_caretLine - 1].Length); }
+            if (!shift && HasSelection) {
+                MoveCaretInternal(SelectionStartLine, SelectionStartColumn, false);
+            } else if (_caretCol > 0) {
+                MoveCaretInternal(_caretLine, _caretCol - 1, shift);
+            } else if (_caretLine > 0) {
+                MoveCaretInternal(_caretLine - 1, LineLen(_lines[_caretLine - 1]), shift);
+            }
             e.Handled = true;
             return;
         }
         if (e.Key == KeyCode.Right) {
-            if (_caretCol < _lines[_caretLine].Length) { SetCaretPosition(_caretLine, _caretCol + 1); }
-            else if (_caretLine + 1 < _lines.Length) { SetCaretPosition(_caretLine + 1, 0); }
+            if (!shift && HasSelection) {
+                MoveCaretInternal(SelectionEndLine, SelectionEndColumn, false);
+            } else if (_caretCol < LineLen(_lines[_caretLine])) {
+                MoveCaretInternal(_caretLine, _caretCol + 1, shift);
+            } else if (_caretLine + 1 < _lines.Length) {
+                MoveCaretInternal(_caretLine + 1, 0, shift);
+            }
             e.Handled = true;
             return;
         }
-        if (e.Key == KeyCode.Up) { SetCaretPosition(_caretLine - 1, _caretCol); e.Handled = true; return; }
-        if (e.Key == KeyCode.Down) { SetCaretPosition(_caretLine + 1, _caretCol); e.Handled = true; return; }
-        if (e.Key == KeyCode.Home) { SetCaretPosition(_caretLine, 0); e.Handled = true; return; }
-        if (e.Key == KeyCode.End) { SetCaretPosition(_caretLine, _lines[_caretLine].Length); e.Handled = true; return; }
+        if (e.Key == KeyCode.Up) { MoveCaretInternal(_caretLine - 1, _caretCol, shift); e.Handled = true; return; }
+        if (e.Key == KeyCode.Down) { MoveCaretInternal(_caretLine + 1, _caretCol, shift); e.Handled = true; return; }
+        if (e.Key == KeyCode.Home) { MoveCaretInternal(_caretLine, 0, shift); e.Handled = true; return; }
+        if (e.Key == KeyCode.End) { MoveCaretInternal(_caretLine, LineLen(_lines[_caretLine]), shift); e.Handled = true; return; }
         if (e.Key == KeyCode.Backspace) { BackspaceAtCaret(); e.Handled = true; return; }
         if (e.Key == KeyCode.Delete) { DeleteAtCaret(); e.Handled = true; return; }
         if (e.Key == KeyCode.Enter) { InsertSmartNewline(); e.Handled = true; return; }

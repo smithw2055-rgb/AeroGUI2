@@ -2588,6 +2588,7 @@ public class VisualStateGroup : DependencyObject {
     private float[] _baseAnimFloats;
     private uint[] _baseAnimColors;
     private int[] _transitionTrackIds;
+    private Storyboard _activeTransitionStoryboard;
 
     public VisualStateGroup() {}
     public VisualStateGroup(string name) : this() { Name = name == null ? "" : name; }
@@ -2666,6 +2667,22 @@ public class VisualStateGroup : DependencyObject {
     }
 
     private static bool NextStoryboardAnimates(Storyboard sb, UIElement scope, UIElement dest, int propId) {
+        if (sb == null || scope == null || dest == null || propId < 0) { return false; }
+        TimelineAnimation[] tls = sb.Children();
+        if (tls == null) { return false; }
+        for (int i = 0; i < tls.Length; i += 1) {
+            TimelineAnimation tl = tls[i];
+            if (tl == null || !tl.HasAnimatedDuration() || tl.TargetProperty.Length == 0) { continue; }
+            int pid = EnumConvert.ParseAnimPropOrInvalid(tl.TargetProperty);
+            if (pid != propId) { continue; }
+            if (TimelineAnimation.ResolveAnimTarget(scope, tl.TargetName) == dest) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static bool TransitionStoryboardTargets(Storyboard sb, UIElement scope, UIElement dest, int propId) {
         if (sb == null || scope == null || dest == null || propId < 0) { return false; }
         TimelineAnimation[] tls = sb.Children();
         if (tls == null) { return false; }
@@ -2757,7 +2774,7 @@ public class VisualStateGroup : DependencyObject {
         var startFloats = new float[0];
         var startColors = new uint[0];
 
-        if (scope != null && dur > 0.001f) {
+        if (scope != null && (dur > 0.001f || (tr != null && tr.Storyboard != null))) {
             if (_baseTargets != null) {
                 for (int i = 0; i < _baseTargets.Length; i += 1) {
                     int pid = EnumConvert.ParseAnimPropOrInvalid(_baseProps[i]);
@@ -2777,6 +2794,10 @@ public class VisualStateGroup : DependencyObject {
             _currentState.StopStoryboardOnly(scope);
         }
 
+        if (_activeTransitionStoryboard != null) {
+            _activeTransitionStoryboard.Stop(scope);
+            _activeTransitionStoryboard = null;
+        }
         if (_transitionTrackIds != null && _transitionTrackIds.Length > 0) {
             for (int i = 0; i < _transitionTrackIds.Length; i += 1) {
                 Anim_StopTrack(_transitionTrackIds[i]);
@@ -2819,30 +2840,37 @@ public class VisualStateGroup : DependencyObject {
         _currentState = next;
         CurrentStateName = next.Name;
 
-        if (scope != null && dur > 0.001f && animTargets.Length > 0) {
+        if (scope != null && (dur > 0.001f || (tr != null && tr.Storyboard != null)) && animTargets.Length > 0) {
             int ek = tr != null ? EnumConvert.ToInt(tr.EasingKind) : 0;
             int em = tr != null ? EnumConvert.ToInt(tr.EasingMode) : 0;
             var endFloats = new float[0];
             for (int i = 0; i < animTargets.Length; i += 1) {
                 UIElement dest = animTargets[i];
                 int propId = animPropIds[i];
+                bool handledByTrSb = (tr != null && tr.Storyboard != null) &&
+                    TransitionStoryboardTargets(tr.Storyboard, scope, dest, propId);
                 if (animIsColor[i]) {
                     endFloats.Push(0.0f);
-                    uint startCol = startColors[i];
-                    uint endCol = Anim_ReadCurrentColor(dest.__nativeHandle, propId);
-                    if (endCol != startCol) {
-                        int ctid = Anim_StartColorDelayed(dest.__nativeHandle, propId, startCol, endCol, dur, ek, em, 0.0f);
-                        if (ctid > 0) {
-                            if (tr != null) { TimelineAnimation.ApplyTrackEasing(ctid, tr.EaseParam0, tr.EaseParam1, tr.EaseParamMask); }
-                            if (_transitionTrackIds == null) { _transitionTrackIds = new int[0]; }
-                            _transitionTrackIds.Push(ctid);
+                    if (!handledByTrSb && dur > 0.001f) {
+                        uint startCol = startColors[i];
+                        uint endCol = Anim_ReadCurrentColor(dest.__nativeHandle, propId);
+                        if (endCol != startCol) {
+                            Anim_ApplyColor(dest.__nativeHandle, propId, startCol);
+                            int ctid = Anim_StartColorDelayed(dest.__nativeHandle, propId, startCol, endCol, dur, ek, em, 0.0f);
+                            if (ctid > 0) {
+                                if (tr != null) { TimelineAnimation.ApplyTrackEasing(ctid, tr.EaseParam0, tr.EaseParam1, tr.EaseParamMask); }
+                                if (_transitionTrackIds == null) { _transitionTrackIds = new int[0]; }
+                                _transitionTrackIds.Push(ctid);
+                            }
                         }
                     }
                 } else {
                     float startVal = startFloats[i];
                     float endVal = Anim_ReadCurrentFloat(dest.__nativeHandle, propId);
                     endFloats.Push(endVal);
-                    if (Math.Absf(endVal - startVal) > 0.0005f) {
+                    if (!handledByTrSb && dur > 0.001f && Math.Absf(endVal - startVal) > 0.0005f) {
+                        if (propId >= 24 && propId <= 26) { dest.EnsureLayoutTransformEnabledForAnim(); }
+                        Anim_ApplyFloat(dest.__nativeHandle, propId, startVal);
                         int ftid = Anim_StartFloat(dest.__nativeHandle, propId, startVal, endVal, dur, ek, em, 0.0f, false, 1);
                         if (ftid > 0) {
                             if (tr != null) { TimelineAnimation.ApplyTrackEasing(ftid, tr.EaseParam0, tr.EaseParam1, tr.EaseParamMask); }
@@ -2857,17 +2885,22 @@ public class VisualStateGroup : DependencyObject {
                 if (trTls != null) {
                     for (int ti = 0; ti < trTls.Length; ti += 1) {
                         TimelineAnimation ttl = trTls[ti];
-                        if (ttl != null && !ttl.IsColor && !ttl.HasFrom) {
+                        if (ttl != null && !ttl.HasFrom) {
                             int tpid = EnumConvert.ParseAnimPropOrInvalid(ttl.TargetProperty);
                             UIElement tdest = TimelineAnimation.ResolveAnimTarget(scope, ttl.TargetName);
                             if (tdest != null && tpid >= 0) {
                                 for (int ai = 0; ai < animTargets.Length; ai += 1) {
-                                    if (animTargets[ai] == tdest && animPropIds[ai] == tpid && !animIsColor[ai]) {
-                                        if (!ttl.HasTo) {
-                                            ttl._transientToOverride = endFloats[ai];
-                                            ttl._hasTransientToOverride = true;
+                                    if (animTargets[ai] == tdest && animPropIds[ai] == tpid) {
+                                        if (!ttl.IsColor && !animIsColor[ai]) {
+                                            if (!ttl.HasTo) {
+                                                ttl._transientToOverride = endFloats[ai];
+                                                ttl._hasTransientToOverride = true;
+                                            }
+                                            if (tpid >= 24 && tpid <= 26) { tdest.EnsureLayoutTransformEnabledForAnim(); }
+                                            Anim_ApplyFloat(tdest.__nativeHandle, tpid, startFloats[ai]);
+                                        } else if (ttl.IsColor && animIsColor[ai]) {
+                                            Anim_ApplyColor(tdest.__nativeHandle, tpid, startColors[ai]);
                                         }
-                                        Anim_ApplyFloat(tdest.__nativeHandle, tpid, startFloats[ai]);
                                         break;
                                     }
                                 }
@@ -2876,6 +2909,7 @@ public class VisualStateGroup : DependencyObject {
                     }
                 }
                 tr.Storyboard.Begin(scope);
+                _activeTransitionStoryboard = tr.Storyboard;
                 if (trTls != null) {
                     for (int ti = 0; ti < trTls.Length; ti += 1) {
                         if (trTls[ti] != null) {
@@ -5919,6 +5953,7 @@ public static class BindingEngine {
     public static void BindTemplateParent(
         UIElement target, string targetProp, Control templatedParent, string sourceProp, int mode = 0) {
         if (target == null || targetProp == null) { return; }
+        target.ClearResourceReference(targetProp);
         var e = new BindingEntry();
         e.Target = target;
         e.TargetProp = targetProp;
@@ -6044,6 +6079,7 @@ public static class BindingEngine {
         bool hasFallback = false, DependencyObject fallbackBox = null,
         bool hasTargetNull = false, DependencyObject targetNullBox = null, int mode = 0) {
         if (target == null || targetProp == null) { return; }
+        target.ClearResourceReference(targetProp);
         var e = new BindingEntry();
         e.Target = target;
         e.TargetProp = targetProp;

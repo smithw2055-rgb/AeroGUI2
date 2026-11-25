@@ -453,6 +453,51 @@ bool GradientBrushRegistry::ReleaseMutableBrush(std::uint32_t brushId) noexcept 
     return true;
 }
 
+std::uint32_t GradientBrushRegistry::RegisterOrUpdateMutableLinearGradient(
+    std::uint32_t reuseBrushId,
+    Point startPoint,
+    Point endPoint,
+    GradientSpreadMethod spreadMethod,
+    BrushMappingMode mappingMode,
+    const std::vector<GradientStop>& stops) {
+    GradientBrushDesc desc{};
+    desc.kind = GradientBrushKind::Linear;
+    desc.startPoint = startPoint;
+    desc.endPoint = endPoint;
+    desc.spreadMethod = spreadMethod;
+    desc.mappingMode = mappingMode;
+    desc.stops = stops;
+    desc.isMutableClone = true;
+    BakeGradientBrushRamp(desc);
+
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (reuseBrushId > 0u && reuseBrushId <= brushes_.size()) {
+        GradientBrushDesc& existing = brushes_[reuseBrushId - 1u];
+        if (existing.brushId == reuseBrushId && existing.isMutableClone) {
+            desc.brushId = reuseBrushId;
+            existing = std::move(desc);
+            revision_.fetch_add(1u, std::memory_order_release);
+            return reuseBrushId;
+        }
+    }
+    if (!freeMutableBrushIds_.empty()) {
+        const std::uint32_t id = freeMutableBrushIds_.back();
+        freeMutableBrushIds_.pop_back();
+        desc.brushId = id;
+        brushes_[id - 1u] = std::move(desc);
+        revision_.fetch_add(1u, std::memory_order_release);
+        return id;
+    }
+    if (brushes_.size() >= kMaxBrushId) {
+        return brushes_.back().brushId;
+    }
+    const auto newId = static_cast<std::uint32_t>(brushes_.size() + 1u);
+    desc.brushId = newId;
+    brushes_.push_back(std::move(desc));
+    revision_.fetch_add(1u, std::memory_order_release);
+    return newId;
+}
+
 bool GradientBrushRegistry::UpdateBrushStopColor(
     std::uint32_t brushId,
     std::size_t stopIndex,

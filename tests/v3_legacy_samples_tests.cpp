@@ -3694,6 +3694,7 @@ void TestInteractiveGalleryReportedSubPages(aero::rs_comp::CompilerSession& sess
     }
 
     // 5. TabControl sub-page: TabControl #1 (3 TabItems) + TabControl #2 (ItemsSource + ContentTemplate)
+    //    + EnableContent ToggleSwitch background leak + TabControl pixel verification
     {
         const aero::VisualNodeId cid = loadSample("TabControl");
         if (cid.IsValid()) {
@@ -3707,10 +3708,62 @@ void TestInteractiveGalleryReportedSubPages(aero::rs_comp::CompilerSession& sess
                 CollectDescendantsByTypeName(host, tcs[0], "TabItem", tabs1);
                 std::string txt1;
                 CollectSubtreeText(host.World(), tcs[0], txt1);
+                const aero::VisualNode* tc0Node = host.World().GetNode(tcs[0]);
+                const aero::Rect tc0Vp = tc0Node ? NodeViewportBounds(*tc0Node) : aero::Rect{};
+                const aero::VisualNodeId scbId = FindDescendantByOwnerName(host, tcs[0], "SelectedContentBorder");
+                const aero::VisualNode* scbNode = scbId.IsValid() ? host.World().GetNode(scbId) : nullptr;
+                const aero::Rect scbVp = scbNode ? NodeViewportBounds(*scbNode) : aero::Rect{};
                 std::cout << "[DIAG][TabControl][1] itemCnt=" << ic1 << " contCnt=" << cc1
-                          << " tabs=" << tabs1.size() << " text='" << txt1.substr(0, 60) << "'\n";
+                          << " tabs=" << tabs1.size()
+                          << " tcVp=(" << tc0Vp.x << "," << tc0Vp.y << " " << tc0Vp.width << "x" << tc0Vp.height << ")"
+                          << " scbVp=(" << scbVp.x << "," << scbVp.y << " " << scbVp.width << "x" << scbVp.height << ")"
+                          << " text='" << txt1.substr(0, 60) << "'\n";
                 Require(ic1 == 3 && tabs1.size() == 3u && txt1.find("Page 1") != std::string::npos,
                     "Gallery/TabControl #1 expected 3 TabItems with Page 1..3");
+                Require(tc0Vp.width >= 300.0f && tc0Vp.height >= 180.0f &&
+                        scbVp.width >= 300.0f && scbVp.height >= 100.0f,
+                    "Gallery/TabControl #1 must have non-collapsed TabControl and SelectedContentBorder bounds");
+                for (aero::VisualNodeId tid : tabs1) {
+                    const aero::VisualNode* tn = host.World().GetNode(tid);
+                    const aero::Rect tvp = tn ? NodeViewportBounds(*tn) : aero::Rect{};
+                    Require(tvp.width > 20.0f && tvp.height > 15.0f,
+                        "Gallery/TabControl #1 TabItem must have non-zero bounds");
+                }
+
+                std::vector<std::uint8_t> tabRgba;
+                Require(host.RenderHeadlessRgba(1280u, 800u, tabRgba), "Gallery/TabControl render failed");
+                std::unordered_set<std::uint32_t> contentColors;
+                const int x0 = std::max(0, static_cast<int>(scbVp.x + 8.0f));
+                const int y0 = std::max(0, static_cast<int>(scbVp.y + 8.0f));
+                const int x1 = std::min(1280, static_cast<int>(scbVp.x + scbVp.width - 8.0f));
+                const int y1 = std::min(800, static_cast<int>(scbVp.y + scbVp.height - 8.0f));
+                for (int py = y0; py < y1; py += 4) {
+                    for (int px = x0; px < x1; px += 4) {
+                        const std::size_t off = (static_cast<std::size_t>(py) * 1280u + static_cast<std::size_t>(px)) * 4u;
+                        contentColors.insert(PackRgba(tabRgba[off], tabRgba[off + 1u], tabRgba[off + 2u], tabRgba[off + 3u]));
+                    }
+                }
+                Require(contentColors.size() >= 4u,
+                    "Gallery/TabControl #1 SelectedContentBorder must render colorful Page 1 rectangles (colors=" +
+                    std::to_string(contentColors.size()) + ")");
+
+                const aero::VisualNodeId enableId = FindDescendantByOwnerName(host, cid, "EnableContent");
+                const aero::VisualNode* enableNode = enableId.IsValid() ? host.World().GetNode(enableId) : nullptr;
+                Require(enableNode != nullptr, "Gallery/TabControl missing EnableContent ToggleSwitch");
+                if (enableNode) {
+                    Require((enableNode->box.bgRgba >> 24u) == 0u && enableNode->box.bgGradId <= 0,
+                        "Gallery/TabControl EnableContent ToggleButton must not leak default #FF3B82F6 Background");
+                    const aero::Rect evp = NodeViewportBounds(*enableNode);
+                    const int cx = std::clamp(static_cast<int>(evp.x + 1.0f), 0, 1279);
+                    const int cy = std::clamp(static_cast<int>(evp.y + 1.0f), 0, 799);
+                    const std::size_t coff = (static_cast<std::size_t>(cy) * 1280u + static_cast<std::size_t>(cx)) * 4u;
+                    const bool isDefaultBlue =
+                        std::abs(static_cast<int>(tabRgba[coff]) - 0x3B) <= 4 &&
+                        std::abs(static_cast<int>(tabRgba[coff + 1u]) - 0x82) <= 4 &&
+                        std::abs(static_cast<int>(tabRgba[coff + 2u]) - 0xF6) <= 4;
+                    Require(!isDefaultBlue,
+                        "Gallery/TabControl EnableContent top-left corner pixel must not render #FF3B82F6 rectangle");
+                }
             }
             if (tcs.size() >= 2u) {
                 scrollActiveSampleTo(cid, tcs[1]);
@@ -3720,12 +3773,264 @@ void TestInteractiveGalleryReportedSubPages(aero::rs_comp::CompilerSession& sess
                 CollectDescendantsByTypeName(host, tcs[1], "TabItem", tabs2);
                 std::string txt2;
                 CollectSubtreeText(host.World(), tcs[1], txt2);
+                const aero::VisualNode* tc1Node = host.World().GetNode(tcs[1]);
+                const aero::Rect tc1Vp = tc1Node ? NodeViewportBounds(*tc1Node) : aero::Rect{};
                 std::cout << "[DIAG][TabControl][2] itemCnt=" << ic2 << " contCnt=" << cc2
-                          << " tabs=" << tabs2.size() << " text='" << txt2.substr(0, 120) << "'\n";
+                          << " tabs=" << tabs2.size()
+                          << " tcVp=(" << tc1Vp.x << "," << tc1Vp.y << " " << tc1Vp.width << "x" << tc1Vp.height << ")"
+                          << " text='" << txt2.substr(0, 120) << "'\n";
                 Require(ic2 == 3 && tabs2.size() == 3u &&
+                        tc1Vp.width >= 300.0f && tc1Vp.height >= 180.0f &&
                         txt2.find("10") != std::string::npos &&
                         txt2.find("Lorem ipsum") != std::string::npos,
-                    "Gallery/TabControl #2 (ItemsSource) expected 3 tabs and ContentTemplate Lorem ipsum content");
+                    "Gallery/TabControl #2 (ItemsSource) expected 3 tabs, non-collapsed bounds, and ContentTemplate Lorem ipsum content");
+            }
+        }
+    }
+
+    // 5b. ThemeAccentPicker dropdown popup scrollbar must align flush to right edge of DropDownBorder
+    {
+        host.InjectResize(1280u, 520u);
+        for (int f = 0; f < 4; ++f) {
+            host.StepFrame(1.0f / 60.0f, f == 3);
+        }
+        const aero::VisualNodeId accentPickerId = host.FindVisualByOwnerName("ThemeAccentPicker");
+        Require(accentPickerId.IsValid(), "Gallery missing ThemeAccentPicker");
+        if (accentPickerId.IsValid()) {
+            const aero::Rect apVp = NodeViewportBounds(*host.World().GetNode(accentPickerId));
+            host.InjectClick(apVp.x + apVp.width - 14.0f, apVp.y + apVp.height * 0.5f);
+            for (int f = 0; f < 6; ++f) {
+                host.StepFrame(1.0f / 60.0f, f == 5);
+            }
+            std::vector<aero::VisualNodeId> popItems;
+            const aero::VisualNodeId visPopId = findVisibleDropdownPopup(popItems);
+            Require(visPopId.IsValid() && popItems.size() >= 5u,
+                "Gallery ThemeAccentPicker failed to open dropdown popup");
+            if (visPopId.IsValid()) {
+                const aero::VisualNodeId ddId = FindDescendantByOwnerName(host, visPopId, "DropDownBorder");
+                const aero::VisualNodeId sbId = FindDescendantByOwnerName(host, visPopId, "PART_VerticalScrollBar");
+                const aero::VisualNode* ddNode = ddId.IsValid() ? host.World().GetNode(ddId) : nullptr;
+                const aero::VisualNode* sbNode = sbId.IsValid() ? host.World().GetNode(sbId) : nullptr;
+                Require(ddNode && sbNode && sbNode->layout.visibility == aero::Visibility::Visible,
+                    "Gallery ThemeAccentPicker popup must have visible DropDownBorder and PART_VerticalScrollBar");
+                if (ddNode && sbNode) {
+                    const aero::Rect ddVp = NodeViewportBounds(*ddNode);
+                    const aero::Rect sbVp = NodeViewportBounds(*sbNode);
+                    const float rightGap = std::fabs((ddVp.x + ddVp.width) - (sbVp.x + sbVp.width));
+                    std::cout << "[DIAG][ThemeAccentPicker] ddVp=(" << ddVp.x << "," << ddVp.y << " " << ddVp.width << "x" << ddVp.height
+                              << ") sbVp=(" << sbVp.x << "," << sbVp.y << " " << sbVp.width << "x" << sbVp.height
+                              << ") rightGap=" << rightGap << "\n";
+                    Require(sbVp.width > 5.0f && sbVp.width <= 24.0f && rightGap <= 3.0f,
+                        "Gallery ThemeAccentPicker PART_VerticalScrollBar must sit flush on right edge (rightGap=" +
+                        std::to_string(rightGap) + ", sbWidth=" + std::to_string(sbVp.width) + ")");
+                    const aero::VisualNodeId thumbId = FindDescendantByOwnerName(host, sbId, "Thumb");
+                    const aero::VisualNode* thumbNode = thumbId.IsValid() ? host.World().GetNode(thumbId) : nullptr;
+                    Require(thumbNode != nullptr, "Gallery ThemeAccentPicker missing Thumb inside PART_VerticalScrollBar");
+                    if (thumbNode) {
+                        const aero::Rect thumbVp = NodeViewportBounds(*thumbNode);
+                        const float thumbRightGap = (ddVp.x + ddVp.width) - (thumbVp.x + thumbVp.width);
+                        Require(thumbRightGap >= 0.0f && thumbRightGap <= 12.0f,
+                            "Gallery ThemeAccentPicker scrollbar Thumb must stay aligned near right edge (thumbRightGap=" +
+                            std::to_string(thumbRightGap) + ")");
+                    }
+                }
+            }
+            host.InjectKey(aero::KeyCode::Escape, true);
+            host.InjectKey(aero::KeyCode::Escape, false);
+            for (int f = 0; f < 4; ++f) {
+                host.StepFrame(1.0f / 60.0f, f == 3);
+            }
+        }
+        host.InjectResize(1280u, 800u);
+        for (int f = 0; f < 4; ++f) {
+            host.StepFrame(1.0f / 60.0f, f == 3);
+        }
+    }
+
+    // 5c. ToggleButton sub-page: EnableContent has no blue leak, custom switch renders gradient shadows & smooth VSM transitions
+    {
+        const aero::VisualNodeId cid = loadSample("ToggleButton");
+        if (cid.IsValid()) {
+            const aero::VisualNodeId enableId = FindDescendantByOwnerName(host, cid, "EnableContent");
+            const aero::VisualNode* enableNode = enableId.IsValid() ? host.World().GetNode(enableId) : nullptr;
+            Require(enableNode && (enableNode->box.bgRgba >> 24u) == 0u && enableNode->box.bgGradId <= 0,
+                "Gallery/ToggleButton EnableContent ToggleSwitch must not leak #FF3B82F6 Background");
+
+            std::vector<aero::VisualNodeId> tbs;
+            CollectDescendantsByTypeName(host, cid, "ToggleButton", tbs);
+            aero::VisualNodeId customTbId;
+            aero::VisualNodeId switchSpaceId;
+            aero::VisualNodeId offGroupId;
+            for (aero::VisualNodeId tbId : tbs) {
+                const aero::VisualNodeId ssId = FindDescendantByOwnerName(host, tbId, "SwitchSpace");
+                const aero::VisualNodeId ogId = FindDescendantByOwnerName(host, tbId, "OffGroup");
+                if (ssId.IsValid() && ogId.IsValid()) {
+                    customTbId = tbId;
+                    switchSpaceId = ssId;
+                    offGroupId = ogId;
+                    break;
+                }
+            }
+            Require(customTbId.IsValid() && switchSpaceId.IsValid() && offGroupId.IsValid(),
+                "Gallery/ToggleButton missing custom switch ToggleButton with SwitchSpace and OffGroup");
+            {
+                // Verify indicator Rectangles (CheckedRect1 over DodgerBlue, UncheckedRect1 over OrangeRed)
+                // do not leak a 1px colored seam at their right edge before scrolling away from the top sections.
+                host.StepFrame(1.0f / 60.0f, true);
+                std::vector<std::uint8_t> topRgba;
+                Require(host.RenderHeadlessRgba(1280u, 800u, topRgba), "Gallery/ToggleButton top render failed");
+                const aero::VisualNodeId chkRectId = FindDescendantByOwnerName(host, cid, "CheckedRect1");
+                const aero::VisualNodeId unchkRectId = FindDescendantByOwnerName(host, cid, "UncheckedRect1");
+                const aero::VisualNode* chkRectNode = chkRectId.IsValid() ? host.World().GetNode(chkRectId) : nullptr;
+                const aero::VisualNode* unchkRectNode = unchkRectId.IsValid() ? host.World().GetNode(unchkRectId) : nullptr;
+                Require(chkRectNode && unchkRectNode, "Gallery/ToggleButton missing CheckedRect1 / UncheckedRect1");
+                if (chkRectNode && unchkRectNode) {
+                    const aero::Rect cr1 = NodeViewportBounds(*chkRectNode);
+                    const aero::Rect ur1 = NodeViewportBounds(*unchkRectNode);
+                    const int cy1 = std::clamp(static_cast<int>(cr1.y + cr1.height * 0.5f), 0, 799);
+                    const int xMin1 = std::max(0, static_cast<int>(std::floor(cr1.x)) - 2);
+                    const int xMax1 = std::min(1279, static_cast<int>(std::ceil(cr1.x + cr1.width)) + 2);
+                    for (int px = xMin1; px <= xMax1; ++px) {
+                        const std::size_t off = (static_cast<std::size_t>(cy1) * 1280u + static_cast<std::size_t>(px)) * 4u;
+                        const bool isDodgerSeam = topRgba[off] < 80u && topRgba[off + 1u] > 100u && topRgba[off + 2u] > 200u;
+                        Require(!isDodgerSeam,
+                            "Gallery/ToggleButton CheckedRect1 leaked DodgerBlue seam pixel at x=" + std::to_string(px));
+                    }
+                    const int cy2 = std::clamp(static_cast<int>(ur1.y + ur1.height * 0.5f), 0, 799);
+                    const int xMin2 = std::max(0, static_cast<int>(std::floor(ur1.x)) - 2);
+                    const int xMax2 = std::min(1279, static_cast<int>(std::ceil(ur1.x + ur1.width)) + 2);
+                    for (int px = xMin2; px <= xMax2; ++px) {
+                        const std::size_t off = (static_cast<std::size_t>(cy2) * 1280u + static_cast<std::size_t>(px)) * 4u;
+                        const bool isOrangeRedSeam = topRgba[off] > 220u && topRgba[off + 1u] < 110u && topRgba[off + 2u] < 60u;
+                        Require(!isOrangeRedSeam,
+                            "Gallery/ToggleButton UncheckedRect1 leaked OrangeRed seam pixel at x=" + std::to_string(px));
+                    }
+                }
+            }
+            if (customTbId.IsValid()) {
+                scrollActiveSampleTo(cid, customTbId);
+                host.StepFrame(1.0f / 60.0f, true);
+
+                // Verify gradient-border shadow nodes inside custom ToggleButton emit GradientRoundedRect
+                std::unordered_set<const void*> borderGradNodes;
+                {
+                    std::vector<aero::VisualNodeId> bds;
+                    CollectDescendantsByTypeName(host, customTbId, "Border", bds);
+                    for (aero::VisualNodeId bid : bds) {
+                        const aero::VisualNode* bn = host.World().GetNode(bid);
+                        if (bn && bn->box.borderGradId > 0) {
+                            borderGradNodes.insert(bn);
+                        }
+                    }
+                }
+                Require(borderGradNodes.size() >= 3u,
+                    "Gallery/ToggleButton custom switch expected >= 3 gradient-border shadow Borders");
+                std::size_t gradRectShadowCount = 0u;
+                const std::size_t rCount = host.RenderTree().NodeCount();
+                for (std::size_t ri = 0u; ri < rCount; ++ri) {
+                    const aero::RenderNodeDescriptor* rd = host.RenderTree().GetNode(static_cast<std::uint32_t>(ri));
+                    if (rd && rd->sourceElement != nullptr && borderGradNodes.count(rd->sourceElement) > 0u) {
+                        Require(rd->primType == aero::AeroPrimType::GradientRoundedRect,
+                            "Gallery/ToggleButton shadow Border with LinearGradientBrush BorderBrush must emit GradientRoundedRect");
+                        ++gradRectShadowCount;
+                    }
+                }
+                Require(gradRectShadowCount >= 3u,
+                    "Gallery/ToggleButton expected >= 3 GradientRoundedRect shadow render nodes (got " +
+                    std::to_string(gradRectShadowCount) + ")");
+
+                auto readSwitchState = [&](float& outSx, float& outOffOpacity, bool& outChecked) {
+                    const aero::VisualNode* ssN = host.World().GetNode(switchSpaceId);
+                    const aero::VisualNode* ogN = host.World().GetNode(offGroupId);
+                    const aero::VisualNode* tbN = host.World().GetNode(customTbId);
+                    outSx = ssN ? ssN->layout.layoutTransform2D.sx : -1.0f;
+                    outOffOpacity = ogN ? ogN->layout.opacity : -1.0f;
+                    outChecked = false;
+                    if (tbN && tbN->scriptOwner.valid()) {
+                        (void)ReadBoolMember(host, tbN->scriptOwner, "IsChecked", outChecked);
+                    }
+                };
+
+                float sx0 = 0.0f, op0 = 0.0f;
+                bool chk0 = true;
+                readSwitchState(sx0, op0, chk0);
+                Require(!chk0 && sx0 < 0.05f && op0 > 0.95f,
+                    "Gallery/ToggleButton custom switch should start Unchecked (sx=" +
+                    std::to_string(sx0) + ", offOp=" + std::to_string(op0) + ")");
+
+                const aero::Rect tbVp = NodeViewportBounds(*host.World().GetNode(customTbId));
+                host.InjectClick(tbVp.x + tbVp.width * 0.5f, tbVp.y + tbVp.height * 0.5f);
+                for (int f = 0; f < 9; ++f) {
+                    host.StepFrame(1.0f / 60.0f, f == 8);
+                }
+                float sxMid = 0.0f, opMid = 0.0f;
+                bool chkMid = false;
+                readSwitchState(sxMid, opMid, chkMid);
+                std::cout << "[DIAG][ToggleButton][CheckMid] checked=" << (chkMid ? 1 : 0)
+                          << " sx=" << sxMid << " offOpacity=" << opMid << "\n";
+                Require(chkMid && sxMid > 0.05f && sxMid < 0.95f && opMid > 0.05f && opMid < 0.95f,
+                    "Gallery/ToggleButton custom switch Check transition must animate smoothly (sx=" +
+                    std::to_string(sxMid) + ", offOp=" + std::to_string(opMid) + ")");
+
+                for (int f = 0; f < 30; ++f) {
+                    host.StepFrame(1.0f / 60.0f, f == 29);
+                }
+                float sxEnd = 0.0f, opEnd = 0.0f;
+                bool chkEnd = false;
+                readSwitchState(sxEnd, opEnd, chkEnd);
+                Require(chkEnd && sxEnd > 0.95f && opEnd < 0.05f,
+                    "Gallery/ToggleButton custom switch should finish Checked (sx=" +
+                    std::to_string(sxEnd) + ", offOp=" + std::to_string(opEnd) + ")");
+
+                // Pixel verification of thumb right & bottom gradient shadows (must fade smoothly, never solid #CC/#A5 bars)
+                {
+                    std::vector<std::uint8_t> swRgba;
+                    Require(host.RenderHeadlessRgba(1280u, 800u, swRgba), "Gallery/ToggleButton switch render failed");
+                    const aero::VisualNodeId thumbBorderId = FindDescendantByOwnerName(host, customTbId, "border");
+                    const aero::VisualNode* thumbBorderNode = thumbBorderId.IsValid() ? host.World().GetNode(thumbBorderId) : nullptr;
+                    Require(thumbBorderNode != nullptr, "Gallery/ToggleButton missing SwitchThumb border");
+                    if (thumbBorderNode) {
+                        const aero::Rect tvp = NodeViewportBounds(*thumbBorderNode);
+                        const int rx = std::clamp(static_cast<int>(std::ceil(tvp.x + tvp.width)), 0, 1279);
+                        const int ry = std::clamp(static_cast<int>(tvp.y + tvp.height * 0.5f), 0, 799);
+                        const std::size_t roff = (static_cast<std::size_t>(ry) * 1280u + static_cast<std::size_t>(rx)) * 4u;
+                        Require(swRgba[roff] >= 100u,
+                            "Gallery/ToggleButton SwitchThumb right shadow rendered solid dark bar (R=" +
+                            std::to_string(swRgba[roff]) + ")");
+
+                        const int bx = std::clamp(static_cast<int>(tvp.x + tvp.width * 0.5f), 0, 1279);
+                        const int by0 = std::clamp(static_cast<int>(std::floor(tvp.y + tvp.height)) + 1, 0, 797);
+                        const std::uint8_t r0 = swRgba[(static_cast<std::size_t>(by0 + 0) * 1280u + static_cast<std::size_t>(bx)) * 4u];
+                        const std::uint8_t r2 = swRgba[(static_cast<std::size_t>(by0 + 2) * 1280u + static_cast<std::size_t>(bx)) * 4u];
+                        Require(r2 > static_cast<std::uint8_t>(std::min<int>(255, static_cast<int>(r0) + 15)),
+                            "Gallery/ToggleButton SwitchThumb bottom shadow must fade lighter vertically (r0=" +
+                            std::to_string(r0) + ", r2=" + std::to_string(r2) + ")");
+                    }
+                }
+
+                // Click again -> Unchecked transition
+                host.InjectClick(tbVp.x + tbVp.width * 0.5f, tbVp.y + tbVp.height * 0.5f);
+                for (int f = 0; f < 12; ++f) {
+                    host.StepFrame(1.0f / 60.0f, f == 11);
+                }
+                float sxUnMid = 0.0f, opUnMid = 0.0f;
+                bool chkUnMid = true;
+                readSwitchState(sxUnMid, opUnMid, chkUnMid);
+                std::cout << "[DIAG][ToggleButton][UncheckMid] checked=" << (chkUnMid ? 1 : 0)
+                          << " sx=" << sxUnMid << " offOpacity=" << opUnMid << "\n";
+                Require(!chkUnMid && sxUnMid > 0.05f && sxUnMid < 0.95f && opUnMid > 0.05f && opUnMid < 0.95f,
+                    "Gallery/ToggleButton custom switch Uncheck transition must animate smoothly (sx=" +
+                    std::to_string(sxUnMid) + ", offOp=" + std::to_string(opUnMid) + ")");
+
+                for (int f = 0; f < 30; ++f) {
+                    host.StepFrame(1.0f / 60.0f, f == 29);
+                }
+                float sxUnEnd = 0.0f, opUnEnd = 0.0f;
+                bool chkUnEnd = true;
+                readSwitchState(sxUnEnd, opUnEnd, chkUnEnd);
+                Require(!chkUnEnd && sxUnEnd < 0.05f && opUnEnd > 0.95f,
+                    "Gallery/ToggleButton custom switch should finish Unchecked (sx=" +
+                    std::to_string(sxUnEnd) + ", offOp=" + std::to_string(opUnEnd) + ")");
             }
         }
     }

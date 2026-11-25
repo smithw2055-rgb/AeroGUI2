@@ -45,6 +45,12 @@ public:
         std::uint32_t width,
         std::uint32_t height,
         std::vector<std::uint8_t>&& rgbaPixels);
+    using ImageAtlasRegisterAlpha8SlotFn = std::uint32_t (*)(
+        ImageAtlas& atlas,
+        std::uint32_t reuseSlotId,
+        std::uint32_t width,
+        std::uint32_t height,
+        std::vector<std::uint8_t>&& alphaPixels);
     using ImageAtlasReleaseSlotFn = void (*)(ImageAtlas& atlas, std::uint32_t textureId) noexcept;
     using ImageAtlasPackStaticMaskFn = bool (*)(
         ImageAtlas& atlas,
@@ -81,7 +87,8 @@ public:
     static void RegisterImageAtlasSlotHook(
         ImageAtlasRegisterSlotFn registerSlotFn,
         ImageAtlasReleaseSlotFn releaseSlotFn = nullptr,
-        ImageAtlasPackStaticMaskFn packStaticMaskFn = nullptr) noexcept;
+        ImageAtlasPackStaticMaskFn packStaticMaskFn = nullptr,
+        ImageAtlasRegisterAlpha8SlotFn registerAlpha8SlotFn = nullptr) noexcept;
 
     [[nodiscard]] FontAtlas& Fonts();
     [[nodiscard]] const FontAtlas& Fonts() const;
@@ -152,6 +159,7 @@ public:
         return pathMaskTotalBytes_;
     }
 
+    void BeginPathMaskFrame() noexcept;
     void ClearAll() noexcept;
 
 private:
@@ -168,7 +176,8 @@ private:
         float v1,
         std::vector<std::uint8_t>&& rgba8,
         RasterizedPathMaskEntry& outEntry,
-        bool allowSharedAtlasPack = false);
+        bool allowSharedAtlasPack = false,
+        bool isPureWhiteAlphaMask = false);
 
     std::uint16_t fontAtlasSize_ = kDefaultFontAtlasSize;
     mutable std::shared_ptr<FontAtlas> fonts_;
@@ -181,6 +190,7 @@ private:
     std::unordered_map<std::uint64_t, RasterizedPathMaskEntry> pathMaskEntries_;
     std::size_t pathMaskTotalBytes_ = 0u;
     std::uint64_t pathMaskAccessSeq_ = 0u;
+    std::uint64_t pathMaskFrameStartSeq_ = 0u;
 };
 
 } // namespace aero

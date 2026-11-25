@@ -2127,6 +2127,13 @@ public class Window : ContentControl {
         return _presenter;
     }
 
+    public override void OnHostViewportResized(float width, float height) {
+        if (width > 1.0f && height > 1.0f) {
+            if (!ParseUtil.IsNaN(Width)) { Width = ParseUtil.NaN(); }
+            if (!ParseUtil.IsNaN(Height)) { Height = ParseUtil.NaN(); }
+        }
+    }
+
     public override bool SetPropertyValue(string propName, DependencyObject value) {
         if (propName == "Title") { Title = DependencyObject.UnboxString(value, ""); return true; }
         return base.SetPropertyValue(propName, value);

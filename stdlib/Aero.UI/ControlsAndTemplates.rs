@@ -508,8 +508,8 @@ public class Control : FrameworkElement {
             _templateRoot.ApplyStyleSubtree();
             _templateRoot.RefreshDynamicResourcesRecursive();
             ExpandNestedTemplateControls(_templateRoot, self);
-            SyncTemplatePresenters();
             BindingEngine.FlushSubtree(_templateRoot);
+            SyncTemplatePresenters();
         }
         if (_templateRoot != null && _template != null) {
             _template.AttachNonEventTriggers(this);
@@ -815,6 +815,38 @@ public class ContentPresenter : FrameworkElement {
         }
     }
 
+    internal override void OnInheritedTypographyChanged() {
+        bool changed = false;
+        if (!_hasExplicitFontSize) {
+            float fs = EffectiveTextFontSizeOrZero();
+            float nextFs = fs > 0.0f ? fs : 14.0f;
+            if (_fontSize != nextFs) { _fontSize = nextFs; changed = true; }
+        }
+        if (!_hasExplicitFontFamily) {
+            string ff = EffectiveTextFontFamilyOrEmpty();
+            string nextFf = ff.Length > 0 ? ff : "Segoe UI";
+            if (_fontFamily != nextFf) { _fontFamily = nextFf; changed = true; }
+        }
+        if (!_hasExplicitFontWeight) {
+            string fw = EffectiveTextFontWeightOrEmpty();
+            string nextFw = fw.Length > 0 ? fw : "Normal";
+            if (_fontWeight != nextFw) { _fontWeight = nextFw; changed = true; }
+        }
+        if (!_hasExplicitForeground) {
+            Brush fg = EffectiveTextForeground();
+            if (fg != null && _foreground != fg) { _foreground = fg; changed = true; }
+        }
+        if (changed) {
+            BumpPropEpoch();
+            if (_textView != null) {
+                _textView.Foreground = _foreground;
+                _textView.FontFamily = _fontFamily;
+                _textView.FontSize = _fontSize;
+                _textView.FontWeight = _fontWeight;
+            }
+        }
+    }
+
     protected override void OnLoaded() {
         base.OnLoaded();
         if (_contentBox != null && _contentTemplate == null && _templateInstanceRoot == null &&
@@ -931,6 +963,22 @@ public class ContentPresenter : FrameworkElement {
             }
             return;
         }
+        if (!_hasExplicitForeground) {
+            Brush effFg = EffectiveTextForeground();
+            if (effFg != null) { _foreground = effFg; }
+        }
+        if (!_hasExplicitFontFamily) {
+            string effFf = EffectiveTextFontFamilyOrEmpty();
+            if (effFf.Length > 0) { _fontFamily = effFf; }
+        }
+        if (!_hasExplicitFontSize) {
+            float effFs = EffectiveTextFontSizeOrZero();
+            if (effFs > 0.0f) { _fontSize = effFs; }
+        }
+        if (!_hasExplicitFontWeight) {
+            string effFw = EffectiveTextFontWeightOrEmpty();
+            if (effFw.Length > 0) { _fontWeight = effFw; }
+        }
         string text = DependencyObject.UnboxString(_contentBox, "");
         if (_textView == null) {
             ClearChildren();
@@ -944,6 +992,10 @@ public class ContentPresenter : FrameworkElement {
         } else {
             _textView.Visibility = Visibility.Visible;
             _textView.Text = text;
+            _textView.Foreground = _foreground;
+            _textView.FontFamily = _fontFamily;
+            _textView.FontSize = _fontSize;
+            _textView.FontWeight = _fontWeight;
             SyncTextViewAlignment();
         }
     }

@@ -603,6 +603,19 @@ struct XamlNode final {
     if (s.find("BlurEffect.Radius") != std::string_view::npos || s == "Radius" || s == "BlurRadius") {
         return "EffectRadius";
     }
+    if (s.find("RelativeTransform") != std::string_view::npos) {
+        const std::string prefix = (s.find("Fill") != std::string_view::npos)
+            ? "Fill."
+            : ((s.find("Stroke") != std::string_view::npos)
+                ? "Stroke."
+                : ((s.find("Foreground") != std::string_view::npos) ? "Foreground." : "Background."));
+        if (s.find(".X") != std::string_view::npos || s.find("TranslateX") != std::string_view::npos) {
+            return prefix + "RelativeTransform.X";
+        }
+        if (s.find(".Y") != std::string_view::npos || s.find("TranslateY") != std::string_view::npos) {
+            return prefix + "RelativeTransform.Y";
+        }
+    }
     if (s.find("LayoutTransform") != std::string_view::npos) {
         if (s.find("ScaleX") != std::string_view::npos) return "LayoutTransform.ScaleX";
         if (s.find("ScaleY") != std::string_view::npos) return "LayoutTransform.ScaleY";
@@ -2855,6 +2868,28 @@ private:
                 out << bVar << ".SpreadMethod = 0;\n";
             }
         }
+        const XamlNode* relTrProp = brushNode.FindPropertyElement(brushNode.localName, "RelativeTransform");
+        if (relTrProp == nullptr) {
+            relTrProp = brushNode.FindPropertyElement("Brush", "RelativeTransform");
+        }
+        if (relTrProp != nullptr && !relTrProp->children.empty() &&
+            relTrProp->children.front()->localName == "TranslateTransform") {
+            const XamlNode& tr = *relTrProp->children.front();
+            if (const auto* xa = tr.FindAttribute("X")) {
+                float xVal = 0.0f;
+                if (!LooksLikeMarkupExtension(xa->value) && aero::str::TryParseFloat32(xa->value, xVal)) {
+                    Indent(out, indent);
+                    out << bVar << ".RelativeTranslateX = " << FormatFloatLiteral(xVal) << ";\n";
+                }
+            }
+            if (const auto* ya = tr.FindAttribute("Y")) {
+                float yVal = 0.0f;
+                if (!LooksLikeMarkupExtension(ya->value) && aero::str::TryParseFloat32(ya->value, yVal)) {
+                    Indent(out, indent);
+                    out << bVar << ".RelativeTranslateY = " << FormatFloatLiteral(yVal) << ";\n";
+                }
+            }
+        }
     }
 
     [[nodiscard]] const XamlNode* FindBrushShaderElement(const XamlNode& brushNode) const {
@@ -3542,6 +3577,9 @@ private:
         if (typedExpr == "ParseUtil.NaN()") {
             return "DependencyObject.BoxFloat(ParseUtil.NaN())";
         }
+        if (aero::str::StartsWith(typedExpr, "GridLength.Parse(")) {
+            return std::string(typedExpr);
+        }
         if (typedExpr.find(".GetBox(") != std::string_view::npos ||
             typedExpr.find(".FindResourceBox(") != std::string_view::npos) {
             return std::string(typedExpr);
@@ -3765,6 +3803,7 @@ private:
             propName == "RenderTransform" || propName == "Element.Transform3D" ||
             propName == "Transform3D" || aero::str::StartsWith(propName, "DragDrop.") ||
             aero::str::StartsWith(propName, "ToolTipService.") ||
+            aero::str::StartsWith(valExpr, "GridLength.Parse(") ||
             aero::str::StartsWith(valExpr, "this.FindResource(") ||
             valExpr.find(".FindResource(") != std::string::npos ||
             valExpr.find(".Get(") != std::string::npos ||
@@ -5175,6 +5214,10 @@ private:
             aero::str::EqualsIgnoreCase(aero::str::Trim(rawVal), "Auto")) {
             return "ParseUtil.NaN()";
         }
+        if ((propName == "Width" || propName == "Height") &&
+            rawVal.find('*') != std::string_view::npos) {
+            return "GridLength.Parse(" + EscapeRsString(aero::str::Trim(rawVal)) + ")";
+        }
         if (IsFloatPropertyFor(targetType, propName, rawVal)) {
             float f = 0.0f;
             if (aero::str::TryParseFloat32(rawVal, f)) {
@@ -5521,6 +5564,16 @@ private:
             !IsNonUIElementType(targetType) &&
             propName.find('.') == std::string_view::npos &&
             propName.find(':') == std::string_view::npos;
+        auto emitMarkLocal = [&](std::string_view key) {
+            if (!isUiElementTarget || key.empty()) return;
+            std::string_view k = key;
+            if (k == "TextElement.Foreground" || k == "TextBlock.Foreground") k = "Foreground";
+            else if (k == "TextElement.FontSize" || k == "TextBlock.FontSize") k = "FontSize";
+            else if (k == "TextElement.FontFamily" || k == "TextBlock.FontFamily") k = "FontFamily";
+            else if (k == "TextElement.FontWeight" || k == "TextBlock.FontWeight") k = "FontWeight";
+            Indent(out, indent);
+            out << targetVar << ".MarkLocalProperty(" << EscapeRsString(k) << ");\n";
+        };
         std::string ownedRawVal;
         if (LooksLikeMarkupExtension(rawVal)) {
             const auto ext = ParseMarkupExtension(rawVal);
@@ -5536,11 +5589,15 @@ private:
                        ext.kind == MarkupExtensionKind::MultiBinding) {
                 ParsedBindingSpec spec;
                 if (TryExtractBindingSpec(ext, spec)) {
+                    emitMarkLocal(propName);
                     EmitBindingSpec(
                         targetVar, targetType, propName, spec, xDataType, out, indent, explicitBindSourceVar);
                 }
                 return;
             } else if (ext.kind == MarkupExtensionKind::XNull) {
+                if (propName == "Template") {
+                    emitMarkLocal("Template");
+                }
                 if (propName == "FocusVisualStyle" || propName == "Style" || propName == "Template") {
                     Indent(out, indent);
                     out << targetVar << "." << propName << " = null;\n";
@@ -5551,6 +5608,10 @@ private:
                 const std::string key = ResolveResourceKeyFromExtension(ext);
                 if (!key.empty()) {
                     const std::string lookup = LookupResourceExpr(key, dictVar);
+                    if (ext.kind == MarkupExtensionKind::StaticResource &&
+                        propName != "Style" && propName != "ItemContainerStyle" && propName != "Storyboard") {
+                        emitMarkLocal(propName);
+                    }
                     if (propName == "Style" || propName == "ItemContainerStyle") {
                         Indent(out, indent);
                         out << targetVar << "." << propName << " = (Style)" << lookup << ";\n";
@@ -5641,7 +5702,28 @@ private:
             }
         }
 
-        // Attached & Grid shorthand property checks first
+        // Events (`Click="Handler"`)
+        if (IsEventAttribute(propName)) {
+            if (inPartialClass_) {
+                Indent(out, indent);
+                out << targetVar << "." << propName << " += this." << aero::str::Trim(rawVal) << ";\n";
+            }
+            return;
+        }
+
+        // Skip WPF/Noesis Width="Auto" / Height="Auto" on non-Grid-track UIElements
+        if ((propName == "Width" || propName == "Height") &&
+            aero::str::EqualsIgnoreCase(aero::str::Trim(rawVal), "Auto")) {
+            return;
+        }
+
+        if (!(propName == "Title" && targetType == "Window") &&
+            targetType != "BoxShadow" &&
+            !(targetType == "Grid" && (propName == "RowDefinitions" || propName == "ColumnDefinitions"))) {
+            emitMarkLocal(propName);
+        }
+
+        // Attached & Grid shorthand property checks
         if (propName == "Grid.Row" || propName == "Row") {
             const long v = std::strtol(std::string(rawVal).c_str(), nullptr, 10);
             Indent(out, indent);
@@ -5721,15 +5803,6 @@ private:
             return;
         }
 
-        // Events (`Click="Handler"`)
-        if (IsEventAttribute(propName)) {
-            if (inPartialClass_) {
-                Indent(out, indent);
-                out << targetVar << "." << propName << " += this." << aero::str::Trim(rawVal) << ";\n";
-            }
-            return;
-        }
-
         // Content & Header use typed overloads on Aero.UI controls (`RS5151` safe)
         if (propName == "Content") {
             Indent(out, indent);
@@ -5739,12 +5812,6 @@ private:
         if (propName == "Header") {
             Indent(out, indent);
             out << targetVar << ".SetHeader(" << FormatGenericScalarLiteral(rawVal) << ");\n";
-            return;
-        }
-
-        // Skip WPF/Noesis Width="Auto" / Height="Auto" on non-Grid-track UIElements
-        if ((propName == "Width" || propName == "Height") &&
-            aero::str::EqualsIgnoreCase(aero::str::Trim(rawVal), "Auto")) {
             return;
         }
 
@@ -6326,7 +6393,8 @@ private:
                                        attr.localName == "TypeArguments")) {
                 continue;
             }
-            if (attr.rawName == "Name" || attr.rawName == "StartupUri") {
+            if (attr.rawName == "Name" || attr.rawName == "StartupUri" ||
+                attr.rawName == "Style" || attr.rawName == "ItemContainerStyle") {
                 continue;
             }
             EmitPropertyAttributeOrBinding(
@@ -6463,6 +6531,10 @@ private:
                 const auto& brushChild = *propNode->children.front();
                 const std::string bVar = EmitBrushObject(
                     brushChild, shortProp, dictVar, out, indent);
+                if (!IsNonUIElementType(resolvedTypeName)) {
+                    Indent(out, indent);
+                    out << targetVar << ".MarkLocalProperty(" << EscapeRsString(shortProp) << ");\n";
+                }
                 Indent(out, indent);
                 out << targetVar << "." << shortProp << " = " << bVar << ";\n";
                 if (brushChild.localName == "SolidColorBrush") {
@@ -6474,6 +6546,65 @@ private:
                             EmitBindingSpec(
                                 targetVar, resolvedTypeName, shortProp + ".Color", bSpec,
                                 xDataType, out, indent, explicitBindSourceVar);
+                        }
+                    }
+                } else if (brushChild.localName == "LinearGradientBrush" ||
+                           brushChild.localName == "RadialGradientBrush") {
+                    const XamlNode* stopContainer = brushChild.FindPropertyElement(brushChild.localName, "GradientStops");
+                    const auto& stops = (stopContainer != nullptr) ? stopContainer->children : brushChild.children;
+                    int stopIdx = 0;
+                    for (const auto& stop : stops) {
+                        if (stop->localName != "GradientStop") continue;
+                        if (const auto* cAttr = stop->FindAttribute("Color");
+                            cAttr != nullptr && LooksLikeMarkupExtension(cAttr->value)) {
+                            const auto ext = ParseMarkupExtension(cAttr->value);
+                            ParsedBindingSpec bSpec;
+                            if (TryExtractBindingSpec(ext, bSpec)) {
+                                EmitBindingSpec(
+                                    targetVar, resolvedTypeName,
+                                    shortProp + ".Stop" + std::to_string(stopIdx) + "Color",
+                                    bSpec, xDataType, out, indent, explicitBindSourceVar);
+                            }
+                        }
+                        if (const auto* oAttr = stop->FindAttribute("Offset");
+                            oAttr != nullptr && LooksLikeMarkupExtension(oAttr->value)) {
+                            const auto ext = ParseMarkupExtension(oAttr->value);
+                            ParsedBindingSpec bSpec;
+                            if (TryExtractBindingSpec(ext, bSpec)) {
+                                EmitBindingSpec(
+                                    targetVar, resolvedTypeName,
+                                    shortProp + ".Stop" + std::to_string(stopIdx) + "Offset",
+                                    bSpec, xDataType, out, indent, explicitBindSourceVar);
+                            }
+                        }
+                        ++stopIdx;
+                    }
+                    const XamlNode* relTrProp = brushChild.FindPropertyElement(brushChild.localName, "RelativeTransform");
+                    if (relTrProp == nullptr) {
+                        relTrProp = brushChild.FindPropertyElement("Brush", "RelativeTransform");
+                    }
+                    if (relTrProp != nullptr && !relTrProp->children.empty() &&
+                        relTrProp->children.front()->localName == "TranslateTransform") {
+                        const XamlNode& tr = *relTrProp->children.front();
+                        if (const auto* xa = tr.FindAttribute("X");
+                            xa != nullptr && LooksLikeMarkupExtension(xa->value)) {
+                            const auto ext = ParseMarkupExtension(xa->value);
+                            ParsedBindingSpec bSpec;
+                            if (TryExtractBindingSpec(ext, bSpec)) {
+                                EmitBindingSpec(
+                                    targetVar, resolvedTypeName, shortProp + ".RelativeTransform.X",
+                                    bSpec, xDataType, out, indent, explicitBindSourceVar);
+                            }
+                        }
+                        if (const auto* ya = tr.FindAttribute("Y");
+                            ya != nullptr && LooksLikeMarkupExtension(ya->value)) {
+                            const auto ext = ParseMarkupExtension(ya->value);
+                            ParsedBindingSpec bSpec;
+                            if (TryExtractBindingSpec(ext, bSpec)) {
+                                EmitBindingSpec(
+                                    targetVar, resolvedTypeName, shortProp + ".RelativeTransform.Y",
+                                    bSpec, xDataType, out, indent, explicitBindSourceVar);
+                            }
                         }
                     }
                 } else if (brushChild.localName == "ImageBrush") {
@@ -6515,6 +6646,10 @@ private:
                 const std::string trVar = EmitTransformObject(
                     *propNode->children.front(), out, indent, targetVar, xDataType, dictVar, "RenderTransform");
                 if (!trVar.empty()) {
+                    if (!IsNonUIElementType(resolvedTypeName)) {
+                        Indent(out, indent);
+                        out << targetVar << ".MarkLocalProperty(\"RenderTransform\");\n";
+                    }
                     Indent(out, indent);
                     out << targetVar << ".RenderTransform = " << trVar << ";\n";
                 }
@@ -6524,6 +6659,10 @@ private:
                 const std::string trVar = EmitTransformObject(
                     *propNode->children.front(), out, indent, targetVar, xDataType, dictVar, "LayoutTransform");
                 if (!trVar.empty()) {
+                    if (!IsNonUIElementType(resolvedTypeName)) {
+                        Indent(out, indent);
+                        out << targetVar << ".MarkLocalProperty(\"LayoutTransform\");\n";
+                    }
                     Indent(out, indent);
                     out << targetVar << ".LayoutTransform = " << trVar << ";\n";
                 }
@@ -6533,6 +6672,10 @@ private:
                 const std::string efVar = EmitEffectObject(
                     *propNode->children.front(), targetVar, out, indent);
                 if (!efVar.empty()) {
+                    if (!IsNonUIElementType(resolvedTypeName)) {
+                        Indent(out, indent);
+                        out << targetVar << ".MarkLocalProperty(\"Effect\");\n";
+                    }
                     Indent(out, indent);
                     out << targetVar << ".Effect = " << efVar << ";\n";
                 }
@@ -6540,6 +6683,10 @@ private:
             }
             if (shortProp == "Template" && !propNode->children.empty()) {
                 const std::string tplVar = EmitControlTemplate(*propNode->children.front(), dictVar, out, indent);
+                if (!IsNonUIElementType(resolvedTypeName)) {
+                    Indent(out, indent);
+                    out << targetVar << ".MarkLocalProperty(\"Template\");\n";
+                }
                 Indent(out, indent);
                 out << targetVar << ".Template = " << tplVar << ";\n";
                 continue;
@@ -6634,6 +6781,19 @@ private:
             }
             if (shortProp == "Triggers") {
                 EmitElementTriggers(*propNode, targetVar, dictVar, out, indent);
+            }
+        }
+
+        // Apply Style/ItemContainerStyle AFTER local attributes & property elements so MarkLocalProperty protects them.
+        for (const auto& attr : node.attributes) {
+            if (attr.isXmlns || IsDesignOrMarkupCompatPrefix(attr.prefix, attr.namespaceUri)) {
+                continue;
+            }
+            if (attr.rawName == "Style" || attr.rawName == "ItemContainerStyle") {
+                EmitPropertyAttributeOrBinding(
+                    targetVar, resolvedTypeName, attr.rawName, attr.value,
+                    xDataType, dictVar, out, indent, explicitBindSourceVar,
+                    !IsNonUIElementType(resolvedTypeName));
             }
         }
 

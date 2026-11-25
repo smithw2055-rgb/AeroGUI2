@@ -433,6 +433,7 @@ private:
         std::uint32_t slotRevision = 0;
         std::uint64_t lastGlobalRevision = 0;
         bool isExternal = false;
+        bool isAlpha8 = false;
     };
 
     bool LoadDynamicGlEntryPoints();
@@ -519,6 +520,7 @@ private:
     std::uint32_t syncedMtsdfOwnerId_ = 0;
     std::uint64_t syncedMtsdfRevision_ = 0;
     std::uint32_t syncedMtsdfRows_ = 0;
+    const GradientBrushRegistry* syncedGradientRegistry_ = nullptr;
     std::uint32_t syncedGradientRevision_ = 0;
     std::uint32_t syncedMinGradRow_ = 1023u;
     std::uint64_t syncedImageAtlasSweepRev_ = 0u;

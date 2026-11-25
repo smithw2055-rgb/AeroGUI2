@@ -1591,6 +1591,7 @@ public class Brush : DependencyObject {
     public virtual bool NeedsLoadedRefresh() { return false; }
     public virtual Brush ApplySubProperty(string suffix, DependencyObject val, bool allowClone) { return null; }
     public virtual DependencyObject ReadSubProperty(string suffix) { return null; }
+    internal virtual void ReleaseNativeMutable() {}
 }
 
 public class SolidColorBrush : Brush {
@@ -1686,6 +1687,9 @@ public class GradientBrush : Brush {
     protected bool _unscaledDirty = true;
     private int _spreadMethod = 0;
     private int _mappingMode = 0;
+    protected float _relTx = 0.0f;
+    protected float _relTy = 0.0f;
+    internal bool _isMutableClone = false;
 
     public int SpreadMethod {
         get { return _spreadMethod; }
@@ -1694,6 +1698,14 @@ public class GradientBrush : Brush {
     public int MappingMode {
         get { return _mappingMode; }
         set { if (_mappingMode != value) { _mappingMode = value; _dirty = true; _unscaledDirty = true; } }
+    }
+    public float RelativeTranslateX {
+        get { return _relTx; }
+        set { if (_relTx != value) { _relTx = value; _dirty = true; _unscaledDirty = true; } }
+    }
+    public float RelativeTranslateY {
+        get { return _relTy; }
+        set { if (_relTy != value) { _relTy = value; _dirty = true; _unscaledDirty = true; } }
     }
 
     public GradientBrush() { _stops = new GradientStop[0]; }
@@ -1758,6 +1770,8 @@ public class GradientBrush : Brush {
         dst.Opacity = Opacity;
         dst.SpreadMethod = SpreadMethod;
         dst.MappingMode = MappingMode;
+        dst._relTx = _relTx;
+        dst._relTy = _relTy;
         for (int i = 0; i < _stops.Length; i += 1) {
             dst.AddStop(_stops[i].ColorRgba, _stops[i].Offset);
         }
@@ -1767,6 +1781,54 @@ public class GradientBrush : Brush {
         var copy = new GradientBrush();
         CopyGradientStopsAndPropsTo(copy);
         return copy;
+    }
+
+    public GradientBrush CloneMutableBrush() {
+        GradientBrush copy = CloneBrush();
+        if (copy != null) { copy._isMutableClone = true; }
+        return copy;
+    }
+
+    internal override void ReleaseNativeMutable() {
+        if (_isMutableClone) {
+            if (_cachedGradId > 0) {
+                Visual_ReleaseMutableGradient(_cachedGradId);
+                _cachedGradId = -1;
+            }
+            if (_cachedUnscaledGradId > 0) {
+                Visual_ReleaseMutableGradient(_cachedUnscaledGradId);
+                _cachedUnscaledGradId = -1;
+            }
+        }
+    }
+
+    public override Brush ApplySubProperty(string suffix, DependencyObject val, bool allowClone) {
+        if (suffix == null) { return null; }
+        bool isTx = (suffix == "RelativeTransform.X" || suffix == "RelativeTransform.TranslateX");
+        bool isTy = (suffix == "RelativeTransform.Y" || suffix == "RelativeTransform.TranslateY");
+        bool isStop = GradientBrush.ParseStopSlotIndex(suffix) >= 0;
+        if (!isTx && !isTy && !isStop) { return null; }
+        GradientBrush target = (allowClone || !_isMutableClone) ? CloneMutableBrush() : this;
+        if (isTx) {
+            target.RelativeTranslateX = DependencyObject.UnboxFloat(val, 0.0f);
+            return target;
+        }
+        if (isTy) {
+            target.RelativeTranslateY = DependencyObject.UnboxFloat(val, 0.0f);
+            return target;
+        }
+        target.TryApplyStopProperty(suffix, val);
+        return target;
+    }
+
+    public override DependencyObject ReadSubProperty(string suffix) {
+        if (suffix == "RelativeTransform.X" || suffix == "RelativeTransform.TranslateX") {
+            return DependencyObject.BoxFloat(_relTx);
+        }
+        if (suffix == "RelativeTransform.Y" || suffix == "RelativeTransform.TranslateY") {
+            return DependencyObject.BoxFloat(_relTy);
+        }
+        return TryReadStopProperty(suffix);
     }
 
     internal static int ParseStopSlotIndex(string suffix) {
@@ -1861,8 +1923,15 @@ public class LinearGradientBrush : GradientBrush {
 
     public override int ResolveGradId() {
         if (_dirty) {
-            _cachedGradId = Visual_RegisterLinearGradient(
-                _x0, _y0, _x1, _y1, SpreadMethod, MappingMode, BuildStopsSpec());
+            if (_isMutableClone) {
+                _cachedGradId = Visual_RegisterMutableLinearGradient(
+                    _cachedGradId, _x0 + _relTx, _y0 + _relTy, _x1 + _relTx, _y1 + _relTy,
+                    SpreadMethod, MappingMode, BuildStopsSpec());
+            } else {
+                _cachedGradId = Visual_RegisterLinearGradient(
+                    _x0 + _relTx, _y0 + _relTy, _x1 + _relTx, _y1 + _relTy,
+                    SpreadMethod, MappingMode, BuildStopsSpec());
+            }
             _dirty = false;
         }
         return _cachedGradId;
@@ -1870,8 +1939,15 @@ public class LinearGradientBrush : GradientBrush {
 
     public override int ResolveGradIdUnscaled() {
         if (_unscaledDirty) {
-            _cachedUnscaledGradId = Visual_RegisterLinearGradient(
-                _x0, _y0, _x1, _y1, SpreadMethod, MappingMode, BuildStopsSpecUnscaled());
+            if (_isMutableClone) {
+                _cachedUnscaledGradId = Visual_RegisterMutableLinearGradient(
+                    _cachedUnscaledGradId, _x0 + _relTx, _y0 + _relTy, _x1 + _relTx, _y1 + _relTy,
+                    SpreadMethod, MappingMode, BuildStopsSpecUnscaled());
+            } else {
+                _cachedUnscaledGradId = Visual_RegisterLinearGradient(
+                    _x0 + _relTx, _y0 + _relTy, _x1 + _relTx, _y1 + _relTy,
+                    SpreadMethod, MappingMode, BuildStopsSpecUnscaled());
+            }
             _unscaledDirty = false;
         }
         return _cachedUnscaledGradId;
@@ -4522,7 +4598,13 @@ public partial class UIElement : DependencyObject {
             cur._explicitDataContext = null;
             cur._inheritedDataContext = null;
             cur._effect = null;
+            if (cur._background != null) {
+                cur._background.ReleaseNativeMutable();
+            }
             cur._background = null;
+            if (cur._borderBrush != null) {
+                cur._borderBrush.ReleaseNativeMutable();
+            }
             cur._borderBrush = null;
             cur._renderTransform = null;
             cur._layoutTransform = null;
@@ -5237,17 +5319,13 @@ public partial class UIElement : DependencyObject {
             }
             if (bgSub == "ImageSource") { return false; }
         }
-        bool isFillPrefix = propName.StartsWith("Fill.") && propName.Length > 5;
-        if (isFillPrefix || (propName.StartsWith("Background.") && propName.Length > 11)) {
-            string suffix = isFillPrefix ? propName.Substring(5) : propName.Substring(11);
-            if (_background is GradientBrush && GradientBrush.ParseStopSlotIndex(suffix) >= 0) {
-                GradientBrush gb = _background as GradientBrush;
-                if (!HasUiFlag(4)) {
-                    gb = gb.CloneBrush();
-                    _background = gb;
-                    SetUiFlag(4, true);
-                }
-                gb.TryApplyStopProperty(suffix, value);
+        if (propName.StartsWith("Fill.") && propName.Length > 5 && _background != null) {
+            string suffix = propName.Substring(5);
+            bool needClone = !HasUiFlag(8);
+            Brush updatedBg = _background.ApplySubProperty(suffix, value, needClone);
+            if (updatedBg != null) {
+                _background = updatedBg;
+                if (needClone) { SetUiFlag(8, true); }
                 OnBoxAppearanceChanged();
                 return true;
             }
@@ -5589,13 +5667,9 @@ public partial class UIElement : DependencyObject {
             DependencyObject subVal = _background.ReadSubProperty(propName.Substring(11));
             if (subVal != null) { return subVal; }
         }
-        bool isGetFill = propName.StartsWith("Fill.") && propName.Length > 5;
-        if (isGetFill || (propName.StartsWith("Background.") && propName.Length > 11)) {
-            string suffix = isGetFill ? propName.Substring(5) : propName.Substring(11);
-            if (_background is GradientBrush) {
-                DependencyObject stopBox = (_background as GradientBrush).TryReadStopProperty(suffix);
-                if (stopBox != null) { return stopBox; }
-            }
+        if (propName.StartsWith("Fill.") && propName.Length > 5 && _background != null) {
+            DependencyObject stopBox = _background.ReadSubProperty(propName.Substring(5));
+            if (stopBox != null) { return stopBox; }
         }
         if (propName == "BorderBrush") { return _borderBrush; }
         if (propName == "RenderTransform") { return _renderTransform; }
