@@ -204,6 +204,185 @@ private:
     BlendingMode prev_;
 };
 
+[[nodiscard]] const TextLayoutResult* ResolveCachedTextLayout(
+    const VisualNode& node,
+    const Rect& textRect,
+    PagedRenderTree& tree,
+    TextLayoutResult& outUncached) {
+    const VisualTextData& txt = node.Text();
+    UIResourceStore* store = tree.ResourceStore() ? tree.ResourceStore() : &UIResourceStore::Default();
+    const float maxW = (txt.wrap == TextWrapping::NoWrap && txt.trim == TextTrimming::None)
+        ? 1000000.0f
+        : std::max(1.0f, textRect.width);
+    const float maxH = (txt.trim == TextTrimming::None)
+        ? 1000000.0f
+        : std::max(1.0f, textRect.height);
+    const std::uint64_t curFontRev = store->Fonts().Revision();
+    if (node.HasTextData() &&
+        txt.hasCachedLayout &&
+        txt.cachedRtl == node.layout.effectiveRtl &&
+        txt.cachedFontRev == curFontRev &&
+        std::fabs(txt.cachedMaxW - maxW) <= 1e-3f &&
+        (std::fabs(txt.cachedMaxH - maxH) <= 1e-3f ||
+         (txt.trim == TextTrimming::None &&
+          maxH >= txt.cachedLayout.totalHeight - 1e-3f &&
+          txt.cachedMaxH >= txt.cachedLayout.totalHeight - 1e-3f))) {
+        return &txt.cachedLayout;
+    }
+
+    TextLayoutResult computed{};
+    if (!txt.richSpans.empty()) {
+        std::vector<RichTextRunInput> runs;
+        runs.reserve(txt.richSpans.size());
+        for (const VisualTextSpan& sp : txt.richSpans) {
+            RichTextRunInput r{};
+            r.text = sp.text;
+            r.fontFamily = sp.fontFamily;
+            r.fontSize = sp.fontSize;
+            r.fontWeight = sp.fontWeight;
+            r.fontItalic = sp.fontItalic;
+            r.fgRgba = sp.fgRgba;
+            r.hasFg = sp.hasFg;
+            r.decorations = sp.decorations;
+            runs.push_back(r);
+        }
+        computed = store->Fonts().MeasureRichLayout(
+            runs,
+            txt.fontFamily,
+            txt.fontSize,
+            txt.fontWeight,
+            txt.fontItalic,
+            maxW,
+            txt.wrap,
+            txt.charSpacing,
+            txt.lineHeight,
+            node.layout.effectiveRtl,
+            txt.trim,
+            maxH);
+    } else {
+        computed = store->Fonts().MeasureLayout(
+            txt.text,
+            txt.fontFamily,
+            txt.fontSize,
+            maxW,
+            txt.wrap,
+            txt.charSpacing,
+            txt.fontWeight,
+            txt.fontItalic,
+            txt.lineHeight,
+            node.layout.effectiveRtl,
+            txt.trim,
+            maxH);
+    }
+    if (node.HasTextData()) {
+        txt.cachedLayout = std::move(computed);
+        txt.cachedMaxW = maxW;
+        txt.cachedMaxH = maxH;
+        txt.cachedRtl = node.layout.effectiveRtl;
+        txt.cachedFontRev = curFontRev;
+        txt.hasCachedLayout = true;
+        return &txt.cachedLayout;
+    }
+    outUncached = std::move(computed);
+    return &outUncached;
+}
+
+[[nodiscard]] bool CanSkipLeafTextClip(
+    const VisualNode& node,
+    const Rect& rect,
+    const Matrix2D& world2D,
+    bool has3D,
+    PagedRenderTree& tree) {
+    if (node.kind != VisualKind::Text || !node.children.empty() ||
+        node.layout.layoutMode == LayoutMode::ScrollViewport) {
+        return false;
+    }
+    if (has3D ||
+        std::fabs(world2D.m01) > 1e-4f ||
+        std::fabs(world2D.m10) > 1e-4f ||
+        world2D.m00 < 0.0f ||
+        world2D.m11 < 0.0f) {
+        return false;
+    }
+    if (rect.width <= 0.0f || rect.height <= 0.0f) {
+        return false;
+    }
+    if (node.box.isBoxShadow ||
+        node.Effect().kind != UIEffectKind::None ||
+        node.OpacityMask().enabled) {
+        return false;
+    }
+    const VisualTextData& txt = node.Text();
+    if (txt.showCaret || txt.selLenCp > 0 || txt.decorations != 0) {
+        return false;
+    }
+    if (txt.text.empty() && txt.richSpans.empty()) {
+        return true;
+    }
+    if (txt.align == TextAlignment::Justify) {
+        return false;
+    }
+
+    const float padL = std::max(0.0f, node.layout.padding.left);
+    const float padT = std::max(0.0f, node.layout.padding.top);
+    const float padR = std::max(0.0f, node.layout.padding.right);
+    const float padB = std::max(0.0f, node.layout.padding.bottom);
+    const Rect textRect{
+        rect.x + padL,
+        rect.y + padT,
+        std::max(0.0f, rect.width - padL - padR),
+        std::max(0.0f, rect.height - padT - padB)};
+    if (textRect.width <= 0.0f || textRect.height <= 0.0f) {
+        return false;
+    }
+
+    TextLayoutResult uncached{};
+    const TextLayoutResult* measured = ResolveCachedTextLayout(node, textRect, tree, uncached);
+    if (!measured) {
+        return false;
+    }
+    if (measured->totalWidth > textRect.width + 0.01f ||
+        measured->totalHeight > textRect.height + 0.01f) {
+        return false;
+    }
+
+    TextAlignment effAlign = txt.align;
+    if (measured->baseRtl) {
+        if (effAlign == TextAlignment::Left) effAlign = TextAlignment::Right;
+        else if (effAlign == TextAlignment::Right) effAlign = TextAlignment::Left;
+    }
+
+    const float rectR = rect.x + rect.width;
+    const float rectB = rect.y + rect.height;
+    for (const PositionedGlyph& pg : measured->glyphs) {
+        if (pg.underline || pg.strikethrough) {
+            return false;
+        }
+        if (pg.isWhitespace) {
+            continue;
+        }
+        float alignDx = 0.0f;
+        if (pg.lineIndex < measured->lines.size()) {
+            const float lw = measured->lines[pg.lineIndex].width;
+            if (effAlign == TextAlignment::Center) {
+                alignDx = std::max(0.0f, (textRect.width - lw) * 0.5f);
+            } else if (effAlign == TextAlignment::Right) {
+                alignDx = std::max(0.0f, textRect.width - lw);
+            }
+        }
+        const float italicTopShear = pg.syntheticItalic ? (0.18f * std::max(0.0f, pg.y1 - pg.y0)) : 0.0f;
+        const float boldHalf = pg.syntheticBold ? 0.175f : 0.0f;
+        const float gx0 = textRect.x + alignDx + pg.x0 - boldHalf;
+        const float gx1 = textRect.x + alignDx + pg.x1 + boldHalf + italicTopShear;
+        const float gy0 = textRect.y + pg.y0;
+        const float gy1 = textRect.y + pg.y1;
+        if (gx0 < rect.x || gx1 > rectR || gy0 < rect.y || gy1 > rectB) {
+            return false;
+        }
+    }
+    return true;
+}
+
 } // namespace
 
 void VisualRenderAdapter::ApplyNodeTransform(
@@ -918,81 +1097,8 @@ std::size_t VisualRenderAdapter::EmitTextVisual(
             std::max(0.0f, rect.height - padT - padB)};
 
         UIResourceStore* store = tree.ResourceStore() ? tree.ResourceStore() : &UIResourceStore::Default();
-        const float maxW = (txt.wrap == TextWrapping::NoWrap && txt.trim == TextTrimming::None)
-            ? 1000000.0f
-            : std::max(1.0f, textRect.width);
-        const float maxH = (txt.trim == TextTrimming::None)
-            ? 1000000.0f
-            : std::max(1.0f, textRect.height);
         TextLayoutResult uncachedLayout{};
-        const TextLayoutResult* measuredPtr = nullptr;
-        const std::uint64_t curFontRev = store->Fonts().Revision();
-        if (node.HasTextData() &&
-            txt.hasCachedLayout &&
-            txt.cachedRtl == node.layout.effectiveRtl &&
-            txt.cachedFontRev == curFontRev &&
-            std::fabs(txt.cachedMaxW - maxW) <= 1e-3f &&
-            (std::fabs(txt.cachedMaxH - maxH) <= 1e-3f ||
-             (txt.trim == TextTrimming::None && maxH >= txt.cachedLayout.totalHeight - 1e-3f && txt.cachedMaxH >= txt.cachedLayout.totalHeight - 1e-3f))) {
-            measuredPtr = &txt.cachedLayout;
-        } else {
-            TextLayoutResult computed{};
-            if (!txt.richSpans.empty()) {
-                std::vector<RichTextRunInput> runs;
-                runs.reserve(txt.richSpans.size());
-                for (const VisualTextSpan& sp : txt.richSpans) {
-                    RichTextRunInput r{};
-                    r.text = sp.text;
-                    r.fontFamily = sp.fontFamily;
-                    r.fontSize = sp.fontSize;
-                    r.fontWeight = sp.fontWeight;
-                    r.fontItalic = sp.fontItalic;
-                    r.fgRgba = sp.fgRgba;
-                    r.hasFg = sp.hasFg;
-                    r.decorations = sp.decorations;
-                    runs.push_back(r);
-                }
-                computed = store->Fonts().MeasureRichLayout(
-                    runs,
-                    txt.fontFamily,
-                    txt.fontSize,
-                    txt.fontWeight,
-                    txt.fontItalic,
-                    maxW,
-                    txt.wrap,
-                    txt.charSpacing,
-                    txt.lineHeight,
-                    node.layout.effectiveRtl,
-                    txt.trim,
-                    maxH);
-            } else {
-                computed = store->Fonts().MeasureLayout(
-                    txt.text,
-                    txt.fontFamily,
-                    txt.fontSize,
-                    maxW,
-                    txt.wrap,
-                    txt.charSpacing,
-                    txt.fontWeight,
-                    txt.fontItalic,
-                    txt.lineHeight,
-                    node.layout.effectiveRtl,
-                    txt.trim,
-                    maxH);
-            }
-            if (node.HasTextData()) {
-                txt.cachedLayout = std::move(computed);
-                txt.cachedMaxW = maxW;
-                txt.cachedMaxH = maxH;
-                txt.cachedRtl = node.layout.effectiveRtl;
-                txt.cachedFontRev = curFontRev;
-                txt.hasCachedLayout = true;
-                measuredPtr = &txt.cachedLayout;
-            } else {
-                uncachedLayout = std::move(computed);
-                measuredPtr = &uncachedLayout;
-            }
-        }
+        const TextLayoutResult* measuredPtr = ResolveCachedTextLayout(node, textRect, tree, uncachedLayout);
         const TextLayoutResult& measured = *measuredPtr;
 
         std::size_t count = 0u;
@@ -2745,10 +2851,11 @@ std::size_t VisualRenderAdapter::EmitNodeRecursive(
             const Rect newClip = prevClipEnabled
                 ? IntersectRects(prevClipRect, nodeWorldBounds)
                 : nodeWorldBounds;
-            outTree.activeClipEnabled_ = true;
-            outTree.activeClipRect_ = newClip;
             if (newClip.width <= 0.0f || newClip.height <= 0.0f) {
                 skipClipped = true;
+            } else if (!CanSkipLeafTextClip(*node, rect, world2D, has3D, outTree)) {
+                outTree.activeClipEnabled_ = true;
+                outTree.activeClipRect_ = newClip;
             }
         }
 
@@ -3204,10 +3311,11 @@ std::size_t VisualRenderAdapter::EmitDropShadowSubtreeRecursive(
         const Rect newClip = prevClipEnabled
             ? IntersectRects(prevClipRect, shiftedClipBounds)
             : shiftedClipBounds;
-        outTree.activeClipEnabled_ = true;
-        outTree.activeClipRect_ = newClip;
         if (newClip.width <= 0.0f || newClip.height <= 0.0f) {
             skipClipped = true;
+        } else if (!CanSkipLeafTextClip(*node, rect, world2D, has3D, outTree)) {
+            outTree.activeClipEnabled_ = true;
+            outTree.activeClipRect_ = newClip;
         }
     }
 

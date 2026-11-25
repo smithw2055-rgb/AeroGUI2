@@ -111,6 +111,9 @@ public static class PopupService {
         BindingEngine.AddPreFlushHook(() => {
             RefreshOpenPositions();
         });
+        BindingEngine.AddPostLayoutHook(() => {
+            RefreshOpenPositions();
+        });
     }
 
     internal static void InvalidatePositions() {
@@ -123,15 +126,19 @@ public static class PopupService {
         if (_openPopups == null || _openPopups.Length == 0) { return; }
         int curEp = BindingEngine._curLayoutSizeEpoch;
         if (curEp == _lastPopupSyncEpoch) { return; }
-        _lastPopupSyncEpoch = curEp;
+        bool anyUnmeasured = false;
         for (int i = _openPopups.Length - 1; i >= 0; i -= 1) {
             Popup p = _openPopups[i];
             if (p == null || p._isDisposedTree || !p.IsOpen) {
                 _openPopups.RemoveAt(i);
                 continue;
             }
+            if (p.DesiredWidth <= 1.0f || p.DesiredHeight <= 1.0f) {
+                anyUnmeasured = true;
+            }
             p.UpdatePosition();
         }
+        _lastPopupSyncEpoch = anyUnmeasured ? -1 : curEp;
     }
 
     public static void RegisterOpen(Popup p) {
@@ -437,12 +444,16 @@ public class Popup : FrameworkElement {
             float margin = 4.0f;
             if (_placement == "Bottom" && rootH > 0.0f && popH > 0.0f && (y + popH > rootH - margin)) {
                 float aboveY = vy - popH - _vertOffset * scaleY;
-                if (aboveY >= margin) {
+                float spaceAbove = vy - margin;
+                float spaceBelow = rootH - margin - (vy + vh);
+                if (aboveY >= margin || spaceAbove > spaceBelow) {
                     y = aboveY;
                 }
             } else if (_placement == "Top" && y < margin && rootH > 0.0f && popH > 0.0f) {
                 float belowY = vy + vh + _vertOffset * scaleY;
-                if (belowY + popH <= rootH - margin) {
+                float spaceAbove = vy - margin;
+                float spaceBelow = rootH - margin - (vy + vh);
+                if (belowY + popH <= rootH - margin || spaceBelow > spaceAbove) {
                     y = belowY;
                 }
             }
@@ -2145,6 +2156,7 @@ public class Application : DependencyObject {
         get { return _resources; }
         set {
             _resources = value;
+            ResourceDictionary.BumpGlobalMutationEpoch();
             if (value != null) { ResourceDictionary.GlobalApplicationResources().Merge(value); }
         }
     }

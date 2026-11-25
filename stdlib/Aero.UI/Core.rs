@@ -2645,6 +2645,16 @@ internal class UIElementRareData {
     internal string LocSource = "";
 }
 
+internal class ResourceScopeCache {
+    public int MutEpoch;
+    public int ChainEpoch;
+    public int NextSlot;
+    public string K0; public DependencyObject V0;
+    public string K1; public DependencyObject V1;
+    public string K2; public DependencyObject V2;
+    public string K3; public DependencyObject V3;
+}
+
 public partial class UIElement : DependencyObject {
     internal DependencyObject _ddLastItemBox;
     internal int _ddLastItemVer = -1;
@@ -2763,6 +2773,7 @@ public partial class UIElement : DependencyObject {
     private string _uid = "";
     private DependencyObject _tag;
     internal UIElementRareData _rare;
+    private ResourceScopeCache _resCache;
     internal UIElementRareData EnsureRare() {
         if (_rare == null) { _rare = new UIElementRareData(); }
         return _rare;
@@ -3169,11 +3180,15 @@ public partial class UIElement : DependencyObject {
 
     public ResourceDictionary Resources {
         get {
-            if (_resources == null) { _resources = new ResourceDictionary(); }
+            if (_resources == null) {
+                _resources = new ResourceDictionary();
+                ResourceDictionary.BumpGlobalMutationEpoch();
+            }
             return _resources;
         }
         set {
             _resources = value;
+            ResourceDictionary.BumpGlobalMutationEpoch();
             ApplyStyleSubtree();
             RefreshDynamicResourcesRecursive();
         }
@@ -3181,7 +3196,10 @@ public partial class UIElement : DependencyObject {
 
     public ResourceDictionary AmbientResources {
         get { return _ambientResources; }
-        set { _ambientResources = value; }
+        set {
+            _ambientResources = value;
+            ResourceDictionary.BumpGlobalMutationEpoch();
+        }
     }
 
     public Style Style {
@@ -3190,6 +3208,7 @@ public partial class UIElement : DependencyObject {
             if (_style == value && (_appliedStyle == value || _closedPopupBuildDepth > 0)) { return; }
             _style = value;
             _appliedStyle = null;
+            ResourceDictionary.BumpGlobalMutationEpoch();
             if (_closedPopupBuildDepth > 0) { return; }
             ApplyStyleInternal();
         }
@@ -3306,6 +3325,7 @@ public partial class UIElement : DependencyObject {
                 active.EvaluateTriggers(this);
             } else {
                 _appliedStyle = active;
+                ResourceDictionary.BumpGlobalMutationEpoch();
                 active.ApplyTo(this);
                 OnStyleApplied(active);
             }
@@ -3589,9 +3609,18 @@ public partial class UIElement : DependencyObject {
     public Point RenderTransformOrigin {
         get { return _renderTransformOrigin; }
         set {
-            SetUiFlag(512, value != null);
-            _renderTransformOrigin = value == null ? new Point(0.5f, 0.5f) : value;
-            SyncTransform2D();
+            bool nextExplicit = value != null;
+            float nextX = nextExplicit ? value.X : 0.5f;
+            float nextY = nextExplicit ? value.Y : 0.5f;
+            if (HasUiFlag(512) == nextExplicit &&
+                _renderTransformOrigin != null &&
+                Math.Absf(_renderTransformOrigin.X - nextX) <= 0.00001f &&
+                Math.Absf(_renderTransformOrigin.Y - nextY) <= 0.00001f) {
+                return;
+            }
+            SetUiFlag(512, nextExplicit);
+            _renderTransformOrigin = nextExplicit ? value : new Point(0.5f, 0.5f);
+            SyncTransform2DOriginOnly();
             NotifyBoundPropertyChanged("RenderTransformOrigin", _renderTransformOrigin);
         }
     }
@@ -4479,6 +4508,7 @@ public partial class UIElement : DependencyObject {
             cur._children = null;
             cur._detachedLogicalChildren = null;
             cur._rare = null;
+            cur._resCache = null;
             cur._resources = null;
             cur._ambientResources = null;
             cur._style = null;
@@ -4641,6 +4671,63 @@ public partial class UIElement : DependencyObject {
     }
 
     public virtual DependencyObject FindResourceBox(string key) {
+        if (key == null || key.Length == 0) { return null; }
+        UIElement anchor = this;
+        int foldGuard = 0;
+        while (foldGuard < 64) {
+            if (anchor._resources != null ||
+                (anchor._rare != null && anchor._rare.LocResources != null) ||
+                anchor._hasTemplateResources ||
+                anchor._hasTemplateAmbientResources ||
+                anchor._ambientResources != null) {
+                break;
+            }
+            Style ast = anchor._style != null ? anchor._style : anchor._appliedStyle;
+            if (ast != null && !ast.HasNoStyleResourcesFast()) {
+                break;
+            }
+            UIElement next = (anchor._logicalParent != null && anchor._logicalParent != anchor)
+                ? anchor._logicalParent
+                : anchor._parent;
+            if (next == null || next._templatedParent != anchor._templatedParent) {
+                break;
+            }
+            anchor = next;
+            foldGuard += 1;
+        }
+        int mutEp = ResourceDictionary._globalMutationEpoch;
+        int chainEp = anchor._ancestorChainEpoch;
+        ResourceScopeCache rc = anchor._resCache;
+        if (rc != null && rc.MutEpoch == mutEp && rc.ChainEpoch == chainEp) {
+            if (rc.K0 == key) { return rc.V0; }
+            if (rc.K1 == key) { return rc.V1; }
+            if (rc.K2 == key) { return rc.V2; }
+            if (rc.K3 == key) { return rc.V3; }
+        }
+        DependencyObject res = anchor.FindResourceBoxUncached(key);
+        if (rc == null) {
+            rc = new ResourceScopeCache();
+            anchor._resCache = rc;
+        }
+        if (rc.MutEpoch != mutEp || rc.ChainEpoch != chainEp) {
+            rc.MutEpoch = mutEp;
+            rc.ChainEpoch = chainEp;
+            rc.NextSlot = 0;
+            rc.K0 = null; rc.V0 = null;
+            rc.K1 = null; rc.V1 = null;
+            rc.K2 = null; rc.V2 = null;
+            rc.K3 = null; rc.V3 = null;
+        }
+        int slot = rc.NextSlot;
+        if (slot == 0) { rc.K0 = key; rc.V0 = res; }
+        else if (slot == 1) { rc.K1 = key; rc.V1 = res; }
+        else if (slot == 2) { rc.K2 = key; rc.V2 = res; }
+        else { rc.K3 = key; rc.V3 = res; }
+        rc.NextSlot = slot >= 3 ? 0 : (slot + 1);
+        return res;
+    }
+
+    private DependencyObject FindResourceBoxUncached(string key) {
         if (key == null || key.Length == 0) { return null; }
         DependencyObject firstElemAmb = null;
         DependencyObject firstTplAmb = null;
@@ -4841,6 +4928,34 @@ public partial class UIElement : DependencyObject {
             tx, ty, sx, sy, rot, skx, sky,
             useZeroOrig ? 0.0f : _renderTransformOrigin.X,
             useZeroOrig ? 0.0f : _renderTransformOrigin.Y);
+    }
+
+    private void SyncTransform2DOriginOnly() {
+        SyncSingleTransform2DScalar(-1, 0.0f);
+    }
+
+    private static bool TryApplyScalarToTransform(Transform tr, int propId, float v) {
+        if (tr == null) { return false; }
+        if (propId == 3 && tr is TranslateTransform) { (tr as TranslateTransform).X = v; return true; }
+        if (propId == 4 && tr is TranslateTransform) { (tr as TranslateTransform).Y = v; return true; }
+        if (propId == 5 && tr is ScaleTransform) { (tr as ScaleTransform).ScaleX = v; return true; }
+        if (propId == 6 && tr is ScaleTransform) { (tr as ScaleTransform).ScaleY = v; return true; }
+        if (propId == 7 && tr is RotateTransform) { (tr as RotateTransform).Angle = v; return true; }
+        if (propId == 8 && tr is SkewTransform) { (tr as SkewTransform).AngleX = v; return true; }
+        if (propId == 9 && tr is SkewTransform) { (tr as SkewTransform).AngleY = v; return true; }
+        return false;
+    }
+
+    internal void UpdateManagedTransformScalarOnly(int propId, float v) {
+        if (_renderTransform == null || propId < 3 || propId > 9) { return; }
+        if (TryApplyScalarToTransform(_renderTransform, propId, v)) { return; }
+        if (_renderTransform is TransformGroup) {
+            Transform[] kids = (_renderTransform as TransformGroup).Children();
+            if (kids == null) { return; }
+            for (int i = kids.Length - 1; i >= 0; i -= 1) {
+                if (TryApplyScalarToTransform(kids[i], propId, v)) { return; }
+            }
+        }
     }
 
     protected void SetTransformScalar(string prop, float v) {
@@ -5345,7 +5460,7 @@ public partial class UIElement : DependencyObject {
             if (cleanCustom != propName) {
                 NotifyBoundPropertyChanged(propName, value);
             }
-            if (_attachedPropHook != null && cleanCustom.Length >= 9 && cleanCustom.Substring(0, 9) == "DragDrop.") {
+            if (_attachedPropHook != null && cleanCustom.StartsWith("DragDrop.")) {
                 var hook = _attachedPropHook;
                 hook(this, cleanCustom, value);
             }
@@ -5357,14 +5472,13 @@ public partial class UIElement : DependencyObject {
 
     internal static string NormalizeCustomPropKey(string propName) {
         if (propName == null || propName.Length == 0) { return ""; }
-        int len = propName.Length;
-        string first = propName.Substring(0, 1);
-        string last = propName.Substring(len - 1, 1);
-        if (first != " " && first != "\t" && last != " " && last != "\t" && first != "(" && propName.IndexOf(":") < 0) {
+        if (!propName.StartsWith(" ") && !propName.StartsWith("\t") &&
+            !propName.EndsWith(" ") && !propName.EndsWith("\t") &&
+            !propName.StartsWith("(") && propName.IndexOf(":") < 0) {
             return propName;
         }
         string s = propName.Trim();
-        if (s.Length > 2 && s.Substring(0, 1) == "(" && s.Substring(s.Length - 1, 1) == ")") {
+        if (s.Length > 2 && s.StartsWith("(") && s.EndsWith(")")) {
             s = s.Substring(1, s.Length - 2).Trim();
         }
         int colon = s.IndexOf(":");
@@ -5422,6 +5536,7 @@ public partial class UIElement : DependencyObject {
         UIElementRareData r = EnsureRare();
         r.LocSource = nextSrc;
         r.LocResources = dict;
+        ResourceDictionary.BumpGlobalMutationEpoch();
         RefreshDynamicResourcesRecursive();
         BindingEngine.Flush();
         UpdateLayout();

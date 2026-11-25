@@ -3776,6 +3776,66 @@ void TestInteractiveGalleryReportedSubPages(aero::rs_comp::CompilerSession& sess
                     host.StepFrame(1.0f / 60.0f, true);
                 }
             }
+            if (menus.size() >= 3u) {
+                host.InjectResize(1280u, 735u);
+                for (int f = 0; f < 3; ++f) {
+                    host.StepFrame(1.0f / 60.0f, f == 2);
+                }
+                std::vector<aero::VisualNodeId> misLow;
+                CollectDescendantsByTypeName(host, menus[2], "MenuItem", misLow);
+                aero::VisualNodeId lowFileId = (!misLow.empty()) ? misLow[0] : aero::VisualNodeId{};
+                if (lowFileId.IsValid()) {
+                    const aero::Rect lowVp = NodeViewportBounds(*host.World().GetNode(lowFileId));
+                    const float spaceBelow = 735.0f - (lowVp.y + lowVp.height);
+                    std::cout << "[DIAG][Menu][BottomFile] vp=(" << lowVp.x << "," << lowVp.y
+                              << " " << lowVp.width << "x" << lowVp.height << ") spaceBelow=" << spaceBelow << "\n";
+                    Require(spaceBelow > 96.0f && spaceBelow < 145.0f,
+                        "Gallery/Menu BottomFile test precondition requires 96 < spaceBelow < 145 (got " +
+                        std::to_string(spaceBelow) + ")");
+                    host.InjectClick(lowVp.x + lowVp.width * 0.5f, lowVp.y + lowVp.height * 0.5f);
+                    // Frame 1: must open directly UPWARD on the very first rendered frame (no downward flash).
+                    host.StepFrame(1.0f / 60.0f, true);
+                    auto findVisibleOpenPopup = [&]() -> aero::VisualNodeId {
+                        std::vector<aero::VisualNodeId> pops;
+                        CollectDescendantsByTypeName(host, host.RootVisualNode(), "Popup", pops);
+                        for (aero::VisualNodeId pid : pops) {
+                            const aero::VisualNode* pn = host.World().GetNode(pid);
+                            bool isOpen = false;
+                            if (pn && pn->layout.visibility == aero::Visibility::Visible &&
+                                pn->scriptOwner.valid() &&
+                                ReadBoolMember(host, pn->scriptOwner, "IsOpen", isOpen) && isOpen) {
+                                return pid;
+                            }
+                        }
+                        return aero::VisualNodeId{};
+                    };
+                    const aero::VisualNodeId popF1Id = findVisibleOpenPopup();
+                    const aero::VisualNode* popF1Node = popF1Id.IsValid() ? host.World().GetNode(popF1Id) : nullptr;
+                    const aero::Rect popF1Vp = popF1Node ? NodeViewportBounds(*popF1Node) : aero::Rect{};
+                    std::cout << "[DIAG][Menu][BottomPopup][f1] open=" << (popF1Id.IsValid() ? 1 : 0)
+                              << " vp=(" << popF1Vp.x << "," << popF1Vp.y
+                              << " " << popF1Vp.width << "x" << popF1Vp.height << ")\n";
+                    Require(popF1Id.IsValid() && popF1Vp.height > spaceBelow &&
+                            popF1Vp.y >= 0.0f && (popF1Vp.y + popF1Vp.height <= lowVp.y + 4.0f),
+                        "Gallery/Menu near bottom must expand upward on Frame 1 (lowY=" +
+                        std::to_string(lowVp.y) + ", popY=" + std::to_string(popF1Vp.y) +
+                        ", popH=" + std::to_string(popF1Vp.height) + ")");
+                    for (int f = 0; f < 3; ++f) {
+                        host.StepFrame(1.0f / 60.0f, f == 2);
+                    }
+                    const aero::VisualNode* popF4Node = host.World().GetNode(popF1Id);
+                    const aero::Rect popF4Vp = popF4Node ? NodeViewportBounds(*popF4Node) : aero::Rect{};
+                    Require(std::fabs(popF4Vp.y - popF1Vp.y) < 1.0f,
+                        "Gallery/Menu bottom popup position should stay stable across subsequent frames");
+                    host.InjectKey(aero::KeyCode::Escape, true);
+                    host.InjectKey(aero::KeyCode::Escape, false);
+                    host.StepFrame(1.0f / 60.0f, true);
+                }
+                host.InjectResize(1280u, 800u);
+                for (int f = 0; f < 3; ++f) {
+                    host.StepFrame(1.0f / 60.0f, f == 2);
+                }
+            }
         }
     }
 
@@ -3942,32 +4002,156 @@ void TestInteractiveGalleryReportedSubPages(aero::rs_comp::CompilerSession& sess
                             "Gallery/Expander[0] should start expanded with Visible ContentBorder");
                     }
                 }
+                auto readExpanderMetrics = [&](aero::VisualNodeId expId, bool& outExp, int& outVis,
+                                               float& outSx, float& outSy, float& outWm00, float& outWm11) {
+                    const aero::VisualNode* en = host.World().GetNode(expId);
+                    const aero::VisualNodeId cbId = FindDescendantByOwnerName(host, expId, "ContentBorder");
+                    const aero::VisualNodeId cbgId = FindDescendantByOwnerName(host, expId, "ContentBg");
+                    const aero::VisualNode* cbNode = cbId.IsValid() ? host.World().GetNode(cbId) : nullptr;
+                    const aero::VisualNode* cbgNode = cbgId.IsValid() ? host.World().GetNode(cbgId) : nullptr;
+                    outExp = false;
+                    if (en && en->scriptOwner.valid()) {
+                        (void)ReadBoolMember(host, en->scriptOwner, "IsExpanded", outExp);
+                    }
+                    outVis = cbNode ? static_cast<int>(cbNode->layout.visibility) : -1;
+                    outSx = cbgNode ? cbgNode->transform2D.sx : -1.0f;
+                    outSy = cbgNode ? cbgNode->transform2D.sy : -1.0f;
+                    outWm00 = cbgNode ? cbgNode->layout.worldTransform.m00 : -1.0f;
+                    outWm11 = cbgNode ? cbgNode->layout.worldTransform.m11 : -1.0f;
+                };
+                auto clickExpander = [&](aero::VisualNodeId expId) {
+                    scrollActiveSampleTo(cid, expId);
+                    const aero::VisualNodeId hdrBtnId = FindDescendantByOwnerName(host, expId, "ExpanderButton");
+                    const aero::VisualNodeId clickId = hdrBtnId.IsValid() ? hdrBtnId : expId;
+                    const aero::VisualNode* clickNode = host.World().GetNode(clickId);
+                    const aero::Rect cVp = NodeViewportBounds(*clickNode);
+                    host.InjectClick(cVp.x + cVp.width * 0.5f, cVp.y + cVp.height * 0.5f);
+                };
+
+                // 9a. Expand Audio Options (expanders[1]): no frame-0 full-scale flash, finishes at sy == 1.
                 const aero::VisualNodeId audioExpId = expanders[1];
-                scrollActiveSampleTo(cid, audioExpId);
-                const aero::VisualNodeId hdrBtnId = FindDescendantByOwnerName(host, audioExpId, "ExpanderButton");
-                const aero::VisualNodeId clickId = hdrBtnId.IsValid() ? hdrBtnId : audioExpId;
-                const aero::VisualNode* clickNode = host.World().GetNode(clickId);
-                const aero::Rect cVp = NodeViewportBounds(*clickNode);
-                host.InjectClick(cVp.x + cVp.width * 0.5f, cVp.y + cVp.height * 0.5f);
+                clickExpander(audioExpId);
+                host.StepFrame(0.0f, true);
+                bool aExp0 = false;
+                int aVis0 = -1;
+                float aSx0 = 0.0f, aSy0 = 0.0f, aW00 = 0.0f, aW11 = 0.0f;
+                readExpanderMetrics(audioExpId, aExp0, aVis0, aSx0, aSy0, aW00, aW11);
+                Require(aExp0 && aVis0 == 0 && aSy0 < 0.35f && aW11 < 0.35f,
+                    "Gallery/Expander Audio Options must start expand smoothly without frame-0 flash (sy=" +
+                    std::to_string(aSy0) + ", m11=" + std::to_string(aW11) + ")");
+                for (int f = 1; f < 25; ++f) {
+                    host.StepFrame(1.0f / 60.0f, f == 24);
+                }
+                bool audioExp = false;
+                int aVis24 = -1;
+                float aSx24 = 0.0f, aSy24 = 0.0f, aW2400 = 0.0f, aW2411 = 0.0f;
+                readExpanderMetrics(audioExpId, audioExp, aVis24, aSx24, aSy24, aW2400, aW2411);
+                std::cout << "[DIAG][Expander][1] after click IsExpanded=" << (audioExp ? 1 : 0)
+                          << " ContentBorderVis=" << aVis24
+                          << " ContentBg.sy=" << aSy24 << " m11=" << aW2411 << "\n";
+                Require(audioExp && aVis24 == 0 && aSy24 > 0.95f && aW2411 > 0.95f,
+                    "Gallery/Expander clicking Audio Options should finish expanded (sy=" +
+                    std::to_string(aSy24) + ")");
+
+                // 9b. Clicking Down (expanders[2]) must keep Audio Options expanded & visible on frame 0 and after.
+                const aero::VisualNodeId downExpId = expanders[2];
+                clickExpander(downExpId);
+                for (int f = 0; f < 25; ++f) {
+                    host.StepFrame(f == 0 ? 0.0f : (1.0f / 60.0f), f == 0 || f == 24);
+                    if (f == 0 || f == 24) {
+                        bool dExp = false, prevExp = false;
+                        int dVis = -1, prevVis = -1;
+                        float dSx = 0.0f, dSy = 0.0f, dW00 = 0.0f, dW11 = 0.0f;
+                        float prevSx = 0.0f, prevSy = 0.0f, prevW00 = 0.0f, prevW11 = 0.0f;
+                        readExpanderMetrics(downExpId, dExp, dVis, dSx, dSy, dW00, dW11);
+                        readExpanderMetrics(audioExpId, prevExp, prevVis, prevSx, prevSy, prevW00, prevW11);
+                        if (f == 0) {
+                            Require(dExp && dVis == 0 && dSy < 0.35f && dW11 < 0.35f,
+                                "Gallery/Expander Down must start expand smoothly without frame-0 flash");
+                        } else {
+                            Require(dExp && dVis == 0 && dSy > 0.95f && dW11 > 0.95f,
+                                "Gallery/Expander Down should finish expanded");
+                        }
+                        Require(prevExp && prevVis == 0 && prevSy > 0.95f && prevW11 > 0.95f,
+                            "Gallery/Expander Audio Options must remain visible when clicking Down (f=" +
+                            std::to_string(f) + ", sy=" + std::to_string(prevSy) +
+                            ", m11=" + std::to_string(prevW11) + ")");
+                    }
+                }
+
+                // 9c. Horizontal expanders Right (expanders[4]) and Left (expanders[5]) preserve prior expanders too.
+                const aero::VisualNodeId rightExpId = expanders[4];
+                const aero::VisualNodeId leftExpId = expanders[5];
+                clickExpander(rightExpId);
+                for (int f = 0; f < 25; ++f) {
+                    host.StepFrame(f == 0 ? 0.0f : (1.0f / 60.0f), f == 0 || f == 24);
+                }
+                {
+                    bool dExp = false, rExp = false;
+                    int dVis = -1, rVis = -1;
+                    float dSx = 0.0f, dSy = 0.0f, dW00 = 0.0f, dW11 = 0.0f;
+                    float rSx = 0.0f, rSy = 0.0f, rW00 = 0.0f, rW11 = 0.0f;
+                    readExpanderMetrics(downExpId, dExp, dVis, dSx, dSy, dW00, dW11);
+                    readExpanderMetrics(rightExpId, rExp, rVis, rSx, rSy, rW00, rW11);
+                    Require(dExp && dVis == 0 && dSy > 0.95f && rExp && rVis == 0 && rSx > 0.95f && rSy > 0.95f,
+                        "Gallery/Expander Right should expand while Down stays visible");
+                }
+                clickExpander(leftExpId);
+                for (int f = 0; f < 25; ++f) {
+                    host.StepFrame(f == 0 ? 0.0f : (1.0f / 60.0f), f == 0 || f == 24);
+                }
+                {
+                    bool rExp = false, lExp = false;
+                    int rVis = -1, lVis = -1;
+                    float rSx = 0.0f, rSy = 0.0f, rW00 = 0.0f, rW11 = 0.0f;
+                    float lSx = 0.0f, lSy = 0.0f, lW00 = 0.0f, lW11 = 0.0f;
+                    readExpanderMetrics(rightExpId, rExp, rVis, rSx, rSy, rW00, rW11);
+                    readExpanderMetrics(leftExpId, lExp, lVis, lSx, lSy, lW00, lW11);
+                    Require(rExp && rVis == 0 && rSx > 0.95f && rW00 > 0.95f &&
+                            lExp && lVis == 0 && lSx > 0.95f && lSy > 0.95f,
+                        "Gallery/Expander Right must remain visible when clicking Left (rSx=" +
+                        std::to_string(rSx) + ", lSx=" + std::to_string(lSx) + ")");
+                }
+
+                // 9d. Collapse and re-expand Video Options (expanders[0]): must NOT flash full-scale on frame 0!
+                const aero::VisualNodeId videoExpId = expanders[0];
+                clickExpander(videoExpId);
                 for (int f = 0; f < 25; ++f) {
                     host.StepFrame(1.0f / 60.0f, f == 24);
                 }
-                const aero::VisualNode* audioAfter = host.World().GetNode(audioExpId);
-                bool audioExp = false;
-                (void)ReadBoolMember(host, audioAfter->scriptOwner, "IsExpanded", audioExp);
-                const aero::VisualNodeId cbId = FindDescendantByOwnerName(host, audioExpId, "ContentBorder");
-                const aero::VisualNodeId cbgId = FindDescendantByOwnerName(host, audioExpId, "ContentBg");
-                const aero::VisualNode* cbNode = cbId.IsValid() ? host.World().GetNode(cbId) : nullptr;
-                const aero::VisualNode* cbgNode = cbgId.IsValid() ? host.World().GetNode(cbgId) : nullptr;
-                std::cout << "[DIAG][Expander][1] after click IsExpanded=" << (audioExp ? 1 : 0)
-                          << " ContentBorderVis=" << (cbNode ? static_cast<int>(cbNode->layout.visibility) : -1)
-                          << " ContentBg.sy=" << (cbgNode ? cbgNode->transform2D.sy : -1.0f) << "\n";
-                Require(audioExp && cbNode && cbNode->layout.visibility == aero::Visibility::Visible &&
-                        cbgNode && cbgNode->transform2D.sy > 0.5f,
-                    "Gallery/Expander clicking Audio Options should expand it (exp=" +
-                    std::to_string(audioExp ? 1 : 0) + ", vis=" +
-                    std::to_string(cbNode ? static_cast<int>(cbNode->layout.visibility) : -1) +
-                    ", sy=" + std::to_string(cbgNode ? cbgNode->transform2D.sy : -1.0f) + ")");
+                {
+                    bool vExp = true;
+                    int vVis = -1;
+                    float vSx = 0.0f, vSy = 0.0f, vW00 = 0.0f, vW11 = 0.0f;
+                    readExpanderMetrics(videoExpId, vExp, vVis, vSx, vSy, vW00, vW11);
+                    Require(!vExp && vVis == 2 && vSy < 0.05f,
+                        "Gallery/Expander Video Options should collapse cleanly");
+                }
+                clickExpander(videoExpId);
+                host.StepFrame(0.0f, true);
+                {
+                    bool vExp0 = false;
+                    int vVis0 = -1;
+                    float vSx0 = 0.0f, vSy0 = 0.0f, vW00 = 0.0f, vW11 = 0.0f;
+                    readExpanderMetrics(videoExpId, vExp0, vVis0, vSx0, vSy0, vW00, vW11);
+                    std::cout << "[DIAG][Expander][0] re-expand f0 vis=" << vVis0
+                              << " sy=" << vSy0 << " m11=" << vW11 << "\n";
+                    Require(vExp0 && vVis0 == 0 && vSy0 < 0.35f && vW11 < 0.35f,
+                        "Gallery/Expander Video Options re-expand must NOT flash sy=1 on frame 0 (sy=" +
+                        std::to_string(vSy0) + ", m11=" + std::to_string(vW11) + ")");
+                }
+                for (int f = 1; f < 25; ++f) {
+                    host.StepFrame(1.0f / 60.0f, f == 24);
+                }
+                {
+                    bool vExp24 = false;
+                    int vVis24 = -1;
+                    float vSx24 = 0.0f, vSy24 = 0.0f, vW2400 = 0.0f, vW2411 = 0.0f;
+                    readExpanderMetrics(videoExpId, vExp24, vVis24, vSx24, vSy24, vW2400, vW2411);
+                    Require(vExp24 && vVis24 == 0 && vSy24 > 0.95f && vW2411 > 0.95f,
+                        "Gallery/Expander Video Options re-expand must finish expanded (sy=" +
+                        std::to_string(vSy24) + ")");
+                }
             }
         }
     }

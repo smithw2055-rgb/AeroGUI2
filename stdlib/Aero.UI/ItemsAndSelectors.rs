@@ -1599,9 +1599,17 @@ public class GridViewRowPresenter : FrameworkElement {
         object rawData = DependencyObject.Unbox(itemBox);
         if (rawData == null && itemBox == null) { return; }
 
+        UIElement._xamlBuildDepth += 1;
+        BindingEngine.BeginBatch();
+        bool hasCellTemplate = false;
         _rowGrid = new Grid();
         _rowGrid.HorizontalAlignment = HorizontalAlignment.Stretch;
+        bool prevSuppressSelf = _suppressChildAutoStyle;
+        _suppressChildAutoStyle = true;
         AddChild(_rowGrid);
+        _suppressChildAutoStyle = prevSuppressSelf;
+        bool prevSuppressGrid = _rowGrid._suppressChildAutoStyle;
+        _rowGrid._suppressChildAutoStyle = true;
 
         for (int i = 0; i < cols.Length; i += 1) {
             GridViewColumn col = cols[i];
@@ -1609,6 +1617,7 @@ public class GridViewRowPresenter : FrameworkElement {
             _rowGrid.AddColumnDefinition(GridUnitType.Pixel, w);
             UIElement cellEl = null;
             if (col.CellTemplate != null) {
+                hasCellTemplate = true;
                 cellEl = col.CellTemplate.Instantiate(rawData);
             } else {
                 var tb = new TextBlock("");
@@ -1642,12 +1651,21 @@ public class GridViewRowPresenter : FrameworkElement {
             if (cellEl != null) {
                 UIElement.SetGridColumn(cellEl, i);
                 _rowGrid.AddChild(cellEl);
-                if (col.CellTemplate != null) {
-                    BindingEngine.FlushSubtree(cellEl);
-                    cellEl.ApplyTemplateSubtree();
-                    BindingEngine.FlushSubtree(cellEl);
-                }
             }
+        }
+
+        _rowGrid._suppressChildAutoStyle = prevSuppressGrid;
+        UIElement._xamlBuildDepth -= 1;
+        BindingEngine.EndBatch();
+        if (UIElement._xamlBuildDepth == 0) {
+            _rowGrid.ApplyStyleSubtree();
+            _rowGrid.RefreshDynamicResourcesRecursive();
+            if (hasCellTemplate) {
+                BindingEngine.FlushSubtree(_rowGrid);
+            }
+            _rowGrid.ApplyTemplateSubtree();
+            if (HasLoadedFired()) { _rowGrid.EnsureLoadedSubtree(); }
+            BindingEngine.FlushSubtree(_rowGrid);
         }
     }
 

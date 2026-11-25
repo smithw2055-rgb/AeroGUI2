@@ -1096,7 +1096,8 @@ constexpr std::uint32_t kProgramCacheVersion = 9u;
         (input.includeStdlib ? 1u : 0u) |
         (input.treeShakeStdlib ? 2u : 0u) |
         (input.optimizeBytecode ? 4u : 0u) |
-        (input.enableReactiveMacros ? 8u : 0u);
+        (input.enableReactiveMacros ? 8u : 0u) |
+        (input.useStdlibDll ? 16u : 0u);
     hasher.mixU32(flags);
     hasher.mixU64(stdlibHash);
 
@@ -1135,7 +1136,9 @@ constexpr std::uint32_t kProgramCacheVersion = 9u;
     std::uint64_t expectedH2,
     bool skipRawBytecodeOutput,
     bool retainBytecodeModules,
-    AeroV3CompileResult& ioResult) {
+    AeroV3CompileResult& ioResult,
+    std::shared_ptr<rs_bc::LazyBytecodeBundle> lazyBaseBundle = nullptr,
+    bool consumeLazyHeader = false) {
     std::vector<std::uint8_t> bytes;
     if (!ReadBinaryFile(cacheFilePath, bytes) || bytes.size() < 88u) {
         return false;
@@ -1252,10 +1255,42 @@ constexpr std::uint32_t kProgramCacheVersion = 9u;
         std::vector<std::uint8_t>().swap(bytes);
     }
 
+    const bool hasLazyBase = (lazyBaseBundle != nullptr);
     rs_rt::RuntimeError linkErr;
-    auto linked = retainBytecodeModules
-        ? ProgramImage::link(modules, linkErr, /*verifyModules=*/false)
-        : ProgramImage::link(std::move(modules), linkErr, /*verifyModules=*/false);
+    std::optional<ProgramImage> linked;
+    if (hasLazyBase) {
+        if (retainBytecodeModules) {
+            auto userCopy = modules;
+            linked = consumeLazyHeader
+                ? ProgramImage::linkLayeredConsumeHeader(
+                      std::move(lazyBaseBundle),
+                      std::move(userCopy),
+                      linkErr,
+                      /*verifyUserModules=*/false)
+                : ProgramImage::linkLayered(
+                      lazyBaseBundle,
+                      std::move(userCopy),
+                      linkErr,
+                      /*verifyUserModules=*/false);
+        } else {
+            linked = consumeLazyHeader
+                ? ProgramImage::linkLayeredConsumeHeader(
+                      std::move(lazyBaseBundle),
+                      std::move(modules),
+                      linkErr,
+                      /*verifyUserModules=*/false)
+                : ProgramImage::linkLayered(
+                      lazyBaseBundle,
+                      std::move(modules),
+                      linkErr,
+                      /*verifyUserModules=*/false);
+            std::vector<rs_bc::Module>().swap(modules);
+        }
+    } else {
+        linked = retainBytecodeModules
+            ? ProgramImage::link(modules, linkErr, /*verifyModules=*/false)
+            : ProgramImage::link(std::move(modules), linkErr, /*verifyModules=*/false);
+    }
     if (!linked.has_value()) {
         return false;
     }
@@ -1269,7 +1304,7 @@ constexpr std::uint32_t kProgramCacheVersion = 9u;
     ioResult.prunedMirFunctions = static_cast<std::size_t>(prunedFns);
     ioResult.rootClassName = std::move(rootClassName);
     ioResult.generatedPartialRsPath = std::move(genRsPath);
-    if (!skipRawBytecodeOutput) {
+    if (!hasLazyBase && !skipRawBytecodeOutput) {
         ioResult.generatedPartialRsCode = std::move(genRsCode);
         ioResult.programImageBytes.assign(bytes.data() + arbcOffset, bytes.data() + arbcOffset + arbcLen);
     }
@@ -1277,6 +1312,10 @@ constexpr std::uint32_t kProgramCacheVersion = 9u;
         ioResult.diagnostics.end(), storedDiags.begin(), storedDiags.end());
     if (retainBytecodeModules) {
         ioResult.bytecodeModules = std::move(modules);
+    }
+    if (hasLazyBase) {
+        ioResult.usedStdlibDll = true;
+        ioResult.usedStdlibCache = false;
     }
     ioResult.programImage = std::make_shared<const ProgramImage>(std::move(*linked));
     ioResult.succeeded = true;
@@ -1360,6 +1399,16 @@ void CompactProcessHeapAfterCompile() noexcept {
 AeroV3CompileResult AeroCompilerV3::Compile(const AeroV3CompileInput& input) const {
     AeroV3CompileResult result;
 
+    const std::filesystem::path effectiveCacheDir = ResolveEffectiveCacheDir(input);
+    const bool sessionAllowsEarlyHit =
+        (input.compilerSession == nullptr) ||
+        (input.compilerSession->parsedUnitCacheSize() > 0u);
+    const bool canUseRawProgramCache =
+        !effectiveCacheDir.empty() &&
+        !input.emitAotCpp &&
+        sessionAllowsEarlyHit &&
+        !input.externalXamlResolver;
+
     const bool useDllMode = input.includeStdlib && input.useStdlibDll && !input.emitAotCpp;
     std::shared_ptr<const LoadedStdlibDll> loadedDll;
     std::shared_ptr<LoadedStdlibDll> oneShotLoadedDll;
@@ -1367,11 +1416,16 @@ AeroV3CompileResult AeroCompilerV3::Compile(const AeroV3CompileInput& input) con
         std::string dllErr;
         if (input.retainStdlibDllCache) {
             loadedDll = LoadStdlibDll(input.stdlibDllPath, &dllErr);
+        } else if (canUseRawProgramCache) {
+            oneShotLoadedDll = LoadStdlibDllLazyOnly(input.stdlibDllPath, &dllErr);
+            loadedDll = oneShotLoadedDll;
         } else {
             oneShotLoadedDll = LoadStdlibDllOneShot(input.stdlibDllPath, &dllErr);
             loadedDll = oneShotLoadedDll;
         }
-        if (!loadedDll || !loadedDll->frontendPack || !loadedDll->lazyBundle) {
+        const bool needFrontendNow = !canUseRawProgramCache || input.retainStdlibDllCache;
+        if (!loadedDll || !loadedDll->header || !loadedDll->lazyBundle ||
+            (needFrontendNow && !loadedDll->frontendPack)) {
             result.diagnostics.emplace_back(
                 dllErr.empty()
                     ? std::string("StdlibDllLoader: failed to load aerogui_stdlib dynamic library")
@@ -1381,24 +1435,18 @@ AeroV3CompileResult AeroCompilerV3::Compile(const AeroV3CompileInput& input) con
         result.stdlibDllLoadMs = loadedDll->loadAndDecodeMs;
     }
 
-    const std::filesystem::path effectiveCacheDir =
-        useDllMode ? std::filesystem::path{} : ResolveEffectiveCacheDir(input);
-    const bool sessionAllowsEarlyHit =
-        (input.compilerSession == nullptr) ||
-        (input.compilerSession->parsedUnitCacheSize() > 0u);
-    const bool canUseRawProgramCache =
-        !useDllMode &&
-        !effectiveCacheDir.empty() &&
-        !input.emitAotCpp &&
-        sessionAllowsEarlyHit &&
-        !input.externalXamlResolver;
-
     std::vector<SourceFile> stdlibSources;
     std::string resolvedStdlibRootKey;
     std::filesystem::path resolvedStdlibRoot;
     std::uint64_t stdlibStatFp = 0u;
     std::uint64_t stdlibHash = 0u;
-    if (input.includeStdlib && !useDllMode) {
+    if (useDllMode) {
+        stdlibHash = loadedDll->header->frontendPackChecksum ^
+            (loadedDll->header->lazyBytecodeChecksum * 0x9E3779B97F4A7C15ULL) ^
+            (static_cast<std::uint64_t>(loadedDll->header->abiVersion) << 32u) ^
+            loadedDll->header->frontendPackSize ^
+            (loadedDll->header->lazyBytecodeSize << 17u);
+    } else if (input.includeStdlib) {
         resolvedStdlibRoot = ResolveStdlibRootDirectory(input.stdlibRootDir);
         if (resolvedStdlibRoot.empty()) {
             result.diagnostics.emplace_back(
@@ -1448,10 +1496,33 @@ AeroV3CompileResult AeroCompilerV3::Compile(const AeroV3CompileInput& input) con
                 progH2,
                 input.skipRawBytecodeOutput,
                 input.retainBytecodeModules,
-                result)) {
-            result.usedStdlibCache = input.includeStdlib;
+                result,
+                useDllMode ? loadedDll->lazyBundle : nullptr,
+                useDllMode && oneShotLoadedDll != nullptr)) {
+            if (useDllMode) {
+                result.stdlibDllLoadMs = loadedDll->loadAndDecodeMs;
+                oneShotLoadedDll.reset();
+                loadedDll.reset();
+                if (!input.retainBytecodeModules) {
+                    CompactProcessHeapAfterCompile();
+                }
+            } else {
+                result.usedStdlibCache = input.includeStdlib;
+            }
             return result;
         }
+    }
+
+    if (useDllMode && oneShotLoadedDll && !oneShotLoadedDll->frontendPack) {
+        std::string packErr;
+        if (!DecodeStdlibDllFrontendPack(*oneShotLoadedDll, &packErr)) {
+            result.diagnostics.emplace_back(
+                packErr.empty()
+                    ? std::string("StdlibDllLoader: failed to decode PrecompiledFrontendPack")
+                    : ("StdlibDllLoader: " + packErr));
+            return result;
+        }
+        result.stdlibDllLoadMs = oneShotLoadedDll->loadAndDecodeMs;
     }
 
     if (input.includeStdlib && !useDllMode && stdlibSources.empty()) {
@@ -1909,7 +1980,7 @@ AeroV3CompileResult AeroCompilerV3::Compile(const AeroV3CompileInput& input) con
         std::chrono::duration<double, std::milli>(tCompEnd - tCompStart).count();
 
     const bool useDirectMoveLink = !input.retainBytecodeModules && !input.emitAotCpp;
-    const bool needEncodedBundle = !useDllMode && (!input.skipRawBytecodeOutput || !progCacheFilePath.empty());
+    const bool needEncodedBundle = (!useDllMode && !input.skipRawBytecodeOutput) || !progCacheFilePath.empty();
     std::vector<std::uint8_t> encodedProgramBytes;
     if (needEncodedBundle) {
         encodedProgramBytes = EncodeProgramBundle(result.bytecodeModules);
@@ -2026,7 +2097,7 @@ AeroV3CompileResult AeroCompilerV3::Compile(const AeroV3CompileInput& input) con
         PersistProgramBundleToDisk(
             progCacheFilePath, progH1, progH2, result, encodedProgramBytes, mergedExternalDeps);
     }
-    if (!input.skipRawBytecodeOutput && !encodedProgramBytes.empty()) {
+    if (!useDllMode && !input.skipRawBytecodeOutput && !encodedProgramBytes.empty()) {
         result.programImageBytes = std::move(encodedProgramBytes);
     }
     return result;

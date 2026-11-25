@@ -433,9 +433,16 @@ int main(int argc, char** argv) {
     compileInput.emitAotCpp = false;
     compileInput.compilerSession = nullptr;
     if (useStdlibDll) {
-        compileInput.allowDiskCache = false;
+        compileInput.allowDiskCache = allowCache;
         compileInput.allowStdlibCache = false;
-        compileInput.cacheDir.clear();
+        if (allowCache) {
+            if (cacheDir.empty()) {
+                cacheDir = ResolveDefaultViewerCacheDir();
+            }
+            compileInput.cacheDir = cacheDir;
+        } else {
+            compileInput.cacheDir.clear();
+        }
         compileInput.stdlibRootDir.clear();
     } else {
         compileInput.allowDiskCache = allowCache;

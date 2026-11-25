@@ -1575,6 +1575,66 @@ bool TestSharedAtlasMaskQuotaNoLeak() {
     return true;
 }
 
+bool TestLeafTextClipEliminationAndOverflowClip() {
+    auto store = std::make_shared<aero::UIResourceStore>();
+    aero::VisualWorld world(nullptr, store.get());
+    const aero::VisualNodeId root = world.CreateNode(aero::VisualKind::Box);
+    world.SetRoot(root);
+    world.SetSize(root, 400.0f, 200.0f);
+    world.SetLayoutMode(root, aero::LayoutMode::Stack, 4.0f, 0.0f, 1, 0);
+
+    // Case A: Two adjacent leaf TextBlocks with clipToBounds=true whose text fits strictly inside their boxes
+    // must NOT push per-node activeClipRect_ scissor splits, coalescing into a single CommandPage & draw batch.
+    const aero::VisualNodeId t1 = world.CreateNode(aero::VisualKind::Text);
+    const aero::VisualNodeId t2 = world.CreateNode(aero::VisualKind::Text);
+    world.AddChild(root, t1);
+    world.AddChild(root, t2);
+    world.SetAlignment(t1, aero::HorizontalAlignment::Left, aero::VerticalAlignment::Top);
+    world.SetMargin(t1, 10.0f, 10.0f, 0.0f, 0.0f);
+    world.SetSize(t1, 180.0f, 32.0f);
+    world.SetClipToBounds(t1, true);
+    world.SetText(t1, "Row 1", "", 14.0f, 0xFFFFFFFFu, aero::TextWrapping::NoWrap, aero::TextAlignment::Left, aero::TextTrimming::CharacterEllipsis);
+
+    world.SetAlignment(t2, aero::HorizontalAlignment::Left, aero::VerticalAlignment::Top);
+    world.SetMargin(t2, 10.0f, 10.0f, 0.0f, 0.0f);
+    world.SetSize(t2, 180.0f, 32.0f);
+    world.SetClipToBounds(t2, true);
+    world.SetText(t2, "Row 2", "", 14.0f, 0xFFFFFFFFu, aero::TextWrapping::NoWrap, aero::TextAlignment::Left, aero::TextTrimming::CharacterEllipsis);
+
+    world.UpdateLayout(400.0f, 200.0f);
+
+    aero::VisualRenderAdapter adapter;
+    aero::PagedRenderTree fitTree;
+    fitTree.SetResourceStore(store.get());
+    AERO_CHECK(adapter.SyncPagedRenderTree(world, nullptr, fitTree, store.get()) >= 2u);
+    AERO_CHECK(fitTree.PageCount() == 1u);
+    AERO_CHECK((fitTree.GetPage(0u).header.flags & aero::CommandPageFlag_ScissorClipActive) == 0u);
+
+    aero::ZeroCopyGpuStream fitStream(aero::ShaderBackend::DesktopGL33, 8u);
+    const aero::ZeroCopySubmissionStats fitStats = fitStream.SubmitDirtyPages(fitTree);
+    AERO_CHECK(fitStats.drawCallCount == 1u);
+
+    // Case B: Overflowing leaf TextBlock with clipToBounds=true & TextTrimming::None MUST still push active scissor clip.
+    world.SetSize(t2, 20.0f, 18.0f);
+    world.SetText(t2, "VeryLongOverflowingTextString", "", 14.0f, 0xFFFFFFFFu, aero::TextWrapping::NoWrap, aero::TextAlignment::Left, aero::TextTrimming::None);
+    world.UpdateLayout(400.0f, 200.0f);
+
+    aero::PagedRenderTree ovfTree;
+    ovfTree.SetResourceStore(store.get());
+    AERO_CHECK(adapter.SyncPagedRenderTree(world, nullptr, ovfTree, store.get()) >= 2u);
+    bool foundScissorPage = false;
+    for (std::size_t p = 0u; p < ovfTree.PageCount(); ++p) {
+        const auto& hdr = ovfTree.GetPage(p).header;
+        if ((hdr.flags & aero::CommandPageFlag_ScissorClipActive) != 0u &&
+            std::fabs(hdr.clipW - 20.0f) < 0.25f &&
+            std::fabs(hdr.clipH - 18.0f) < 0.25f) {
+            foundScissorPage = true;
+        }
+    }
+    AERO_CHECK(foundScissorPage);
+    return true;
+}
+
 } // namespace
 
 int main() {
@@ -1600,6 +1660,7 @@ int main() {
         {"ModalLiveResizeAndTextEllipsis", &TestModalLiveResizeAndTextEllipsis},
         {"MockGlClipWResetAndIncrementalTailPad", &TestMockGlClipWResetAndIncrementalTailPad},
         {"SharedAtlasMaskQuotaNoLeak", &TestSharedAtlasMaskQuotaNoLeak},
+        {"LeafTextClipEliminationAndOverflowClip", &TestLeafTextClipEliminationAndOverflowClip},
     };
 
     int passed = 0;

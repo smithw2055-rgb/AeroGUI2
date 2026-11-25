@@ -505,6 +505,81 @@ void TestIsolatedTempDirLaunchesWithoutStdlibDir() {
     fs::remove_all(tempRoot, ec);
 }
 
+void TestStdlibDllUserArbcDiskCache() {
+    std::cout << "[Test 4] stdlib DLL user .arbc disk cache & lazy-only DLL load...\n";
+    std::error_code ec;
+    const fs::path cacheDir = fs::temp_directory_path(ec) / "aero_stdlib_dll_arbc_cache_test";
+    fs::remove_all(cacheDir, ec);
+    fs::create_directories(cacheDir, ec);
+
+    // 1. Verify LoadStdlibDllLazyOnly skips PrecompiledFrontendPack until DecodeStdlibDllFrontendPack is called
+    {
+        std::string err;
+        auto lazyOnly = aero::LoadStdlibDllLazyOnly(AERO_STDLIB_DLL_PATH, &err);
+        Require(lazyOnly != nullptr, "LoadStdlibDllLazyOnly failed: " + err);
+        if (lazyOnly) {
+            Require(lazyOnly->lazyBundle != nullptr && lazyOnly->frontendPack == nullptr,
+                "LoadStdlibDllLazyOnly must leave frontendPack == nullptr");
+            Require(aero::DecodeStdlibDllFrontendPack(*lazyOnly, &err),
+                "DecodeStdlibDllFrontendPack failed: " + err);
+            Require(lazyOnly->frontendPack != nullptr,
+                "DecodeStdlibDllFrontendPack must populate frontendPack");
+        }
+    }
+
+    // 2. Cold compile with allowDiskCache=true writes .arbc; warm compile hits cache without decoding frontendPack
+    aero::AeroV3CompileInput ci;
+    aero::AeroAppHostConfig hc;
+    Require(BuildSampleForDll(fs::path(AERO_SAMPLES_DIR) / "Buttons", AERO_STDLIB_DLL_PATH, ci, hc),
+        "Buttons discovery failed for DLL .arbc cache test");
+    ci.retainStdlibDllCache = false;
+    ci.allowDiskCache = true;
+    ci.cacheDir = cacheDir.generic_string();
+
+    const aero::AeroCompilerV3 compiler;
+    const auto tCold0 = std::chrono::steady_clock::now();
+    const aero::AeroV3CompileResult coldRes = compiler.Compile(ci);
+    const auto tCold1 = std::chrono::steady_clock::now();
+    const double coldMs = std::chrono::duration<double, std::milli>(tCold1 - tCold0).count();
+    Require(coldRes.succeeded && coldRes.programImage != nullptr && coldRes.usedStdlibDll,
+        "DLL cold compile with allowDiskCache=true failed");
+
+    std::size_t arbcFiles = 0u;
+    for (const auto& entry : fs::recursive_directory_iterator(cacheDir, ec)) {
+        if (entry.is_regular_file(ec) && entry.path().extension() == ".arbc") {
+            ++arbcFiles;
+        }
+    }
+    Require(arbcFiles >= 1u, "Expected at least 1 .arbc user cache file written in DLL mode");
+
+    const auto tWarm0 = std::chrono::steady_clock::now();
+    const aero::AeroV3CompileResult warmRes = compiler.Compile(ci);
+    const auto tWarm1 = std::chrono::steady_clock::now();
+    const double warmMs = std::chrono::duration<double, std::milli>(tWarm1 - tWarm0).count();
+    Require(warmRes.succeeded && warmRes.programImage != nullptr && warmRes.usedStdlibDll && !warmRes.usedStdlibCache,
+        "DLL warm .arbc compile failed");
+
+    aero::AeroAppHost host(hc);
+    Require(host.LoadProgramImage(warmRes.programImage, warmRes.rootClassName),
+        "Warm DLL .arbc LoadProgramImage failed: " + host.LastError());
+    for (int f = 0; f < 5; ++f) {
+        host.StepFrame(1.0f / 60.0f, f == 4);
+    }
+    std::vector<std::uint8_t> rgba;
+    Require(host.RenderHeadlessRgba(320u, 180u, rgba), "Warm DLL .arbc RenderHeadlessRgba failed");
+    const std::uint32_t clearRgba = QuantizedClearColorRgba(hc.clearColor);
+    std::size_t nonClear = 0u;
+    const std::size_t colors = CountDistinctColors(rgba, clearRgba, nonClear);
+    Require(colors >= 2u && nonClear > 0u, "Warm DLL .arbc rendered blank output");
+
+    std::cout << std::fixed << std::setprecision(2)
+              << "[DLL_ARBC_CACHE] cold_ms=" << coldMs
+              << " warm_ms=" << warmMs
+              << " colors=" << colors << "\n";
+
+    fs::remove_all(cacheDir, ec);
+}
+
 } // namespace
 
 int main() {
@@ -512,6 +587,7 @@ int main() {
     TestAbiAndErrorHandling();
     TestAll28SamplesUnderDllInterpretedMode();
     TestIsolatedTempDirLaunchesWithoutStdlibDir();
+    TestStdlibDllUserArbcDiskCache();
 
     if (gFailureCount != 0) {
         std::cerr << "\nv3_stdlib_dll_tests FAILED with " << gFailureCount << " failure(s).\n";

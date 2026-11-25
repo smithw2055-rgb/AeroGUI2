@@ -255,11 +255,13 @@ namespace {
     const std::filesystem::path& resolved,
     const std::string& key,
     StdlibDllCacheState& state,
-    std::string* outError) {
+    std::string* outError,
+    bool decodeFrontendPack = true) {
 #ifdef __EMSCRIPTEN__
     (void)resolved;
     (void)key;
     (void)state;
+    (void)decodeFrontendPack;
     if (outError) {
         *outError = "aerogui_stdlib dynamic loading is not supported on Emscripten";
     }
@@ -327,28 +329,31 @@ namespace {
         return nullptr;
     }
 
-    const std::uint64_t actualFrontendChecksum = ComputeStdlibDllChecksum64(
-        hdr->frontendPackBytes, static_cast<std::size_t>(hdr->frontendPackSize));
-    if (actualFrontendChecksum != hdr->frontendPackChecksum) {
-        if (outError) {
-            *outError = "Stdlib DLL frontend pack checksum mismatch in '" + resolved.generic_string() + "'";
+    std::shared_ptr<rs_comp::PrecompiledFrontendPack> decodedPack;
+    if (decodeFrontendPack) {
+        const std::uint64_t actualFrontendChecksum = ComputeStdlibDllChecksum64(
+            hdr->frontendPackBytes, static_cast<std::size_t>(hdr->frontendPackSize));
+        if (actualFrontendChecksum != hdr->frontendPackChecksum) {
+            if (outError) {
+                *outError = "Stdlib DLL frontend pack checksum mismatch in '" + resolved.generic_string() + "'";
+            }
+            return nullptr;
         }
-        return nullptr;
-    }
 
-    auto decodedPack = std::make_shared<rs_comp::PrecompiledFrontendPack>();
-    std::string packErr;
-    if (!rs_comp::decodePrecompiledFrontendPack(
-            hdr->frontendPackBytes,
-            static_cast<std::size_t>(hdr->frontendPackSize),
-            *decodedPack,
-            &packErr,
-            /*copyBlob=*/false,
-            /*skipChecksum=*/true)) {
-        if (outError) {
-            *outError = "Failed to decode PrecompiledFrontendPack from stdlib DLL: " + packErr;
+        decodedPack = std::make_shared<rs_comp::PrecompiledFrontendPack>();
+        std::string packErr;
+        if (!rs_comp::decodePrecompiledFrontendPack(
+                hdr->frontendPackBytes,
+                static_cast<std::size_t>(hdr->frontendPackSize),
+                *decodedPack,
+                &packErr,
+                /*copyBlob=*/false,
+                /*skipChecksum=*/true)) {
+            if (outError) {
+                *outError = "Failed to decode PrecompiledFrontendPack from stdlib DLL: " + packErr;
+            }
+            return nullptr;
         }
-        return nullptr;
     }
 
     auto lazyBundle = std::make_shared<rs_bc::LazyBytecodeBundle>();
@@ -454,8 +459,83 @@ std::shared_ptr<LoadedStdlibDll> LoadStdlibDllOneShot(
     const std::string key = CanonicalCacheKey(resolved);
     auto& state = GetStdlibDllCacheState();
     std::lock_guard<std::mutex> lock(state.mutex);
-    return LoadAndDecodeStdlibDllLocked(resolved, key, state, outError);
+    return LoadAndDecodeStdlibDllLocked(resolved, key, state, outError, true);
 #endif
+}
+
+std::shared_ptr<LoadedStdlibDll> LoadStdlibDllLazyOnly(
+    std::string_view explicitPath,
+    std::string* outError) {
+#ifdef __EMSCRIPTEN__
+    (void)explicitPath;
+    if (outError) {
+        *outError = "aerogui_stdlib dynamic loading is not supported on Emscripten";
+    }
+    return nullptr;
+#else
+    const std::filesystem::path resolved = ResolveStdlibDllPath(explicitPath);
+    if (resolved.empty()) {
+        if (outError) {
+            *outError = std::string("Unable to locate ") + kStdlibDllFilename +
+                        (explicitPath.empty() ? std::string{} : (" (requested: " + std::string(explicitPath) + ")"));
+        }
+        return nullptr;
+    }
+    std::error_code existEc;
+    if (!std::filesystem::is_regular_file(resolved, existEc)) {
+        if (outError) {
+            *outError = "Stdlib DLL not found: " + resolved.generic_string();
+        }
+        return nullptr;
+    }
+
+    const std::string key = CanonicalCacheKey(resolved);
+    auto& state = GetStdlibDllCacheState();
+    std::lock_guard<std::mutex> lock(state.mutex);
+    return LoadAndDecodeStdlibDllLocked(resolved, key, state, outError, false);
+#endif
+}
+
+bool DecodeStdlibDllFrontendPack(
+    LoadedStdlibDll& loaded,
+    std::string* outError) {
+    if (loaded.frontendPack != nullptr) {
+        return true;
+    }
+    const AeroStdlibDllHeader* hdr = loaded.header;
+    if (!hdr || !hdr->frontendPackBytes || hdr->frontendPackSize == 0u) {
+        if (outError) {
+            *outError = "Stdlib DLL header has no frontend pack payload";
+        }
+        return false;
+    }
+    const auto t0 = std::chrono::steady_clock::now();
+    const std::uint64_t actualFrontendChecksum = ComputeStdlibDllChecksum64(
+        hdr->frontendPackBytes, static_cast<std::size_t>(hdr->frontendPackSize));
+    if (actualFrontendChecksum != hdr->frontendPackChecksum) {
+        if (outError) {
+            *outError = "Stdlib DLL frontend pack checksum mismatch in '" + loaded.resolvedPath + "'";
+        }
+        return false;
+    }
+    auto decodedPack = std::make_shared<rs_comp::PrecompiledFrontendPack>();
+    std::string packErr;
+    if (!rs_comp::decodePrecompiledFrontendPack(
+            hdr->frontendPackBytes,
+            static_cast<std::size_t>(hdr->frontendPackSize),
+            *decodedPack,
+            &packErr,
+            /*copyBlob=*/false,
+            /*skipChecksum=*/true)) {
+        if (outError) {
+            *outError = "Failed to decode PrecompiledFrontendPack from stdlib DLL: " + packErr;
+        }
+        return false;
+    }
+    const auto t1 = std::chrono::steady_clock::now();
+    loaded.frontendPack = std::move(decodedPack);
+    loaded.loadAndDecodeMs += std::chrono::duration<double, std::milli>(t1 - t0).count();
+    return true;
 }
 
 void ClearStdlibDllCache() noexcept {

@@ -220,6 +220,7 @@ public class Control : FrameworkElement {
             _template = value;
             _hasTemplateResources = (_template != null && (_template.HasResources() || _template.RawResourcesOrNull() != null));
             _hasTemplateAmbientResources = (_template != null && _template.AmbientResources != null);
+            ResourceDictionary.BumpGlobalMutationEpoch();
             _templateApplied = false;
             _templateHasVsm = false;
             if (_template == null) {
@@ -462,6 +463,7 @@ public class Control : FrameworkElement {
         _template = null;
         _hasTemplateResources = false;
         _hasTemplateAmbientResources = false;
+        ResourceDictionary.BumpGlobalMutationEpoch();
     }
 
     public override bool ApplyTemplate() {
@@ -489,6 +491,7 @@ public class Control : FrameworkElement {
         _templateRoot = nextRoot;
         _hasTemplateResources = (_template != null && (_template.HasResources() || _template.RawResourcesOrNull() != null));
         _hasTemplateAmbientResources = (_template != null && _template.AmbientResources != null);
+        ResourceDictionary.BumpGlobalMutationEpoch();
         _templateApplied = true;
         SyncBoxStyleToNative();
         SyncPadding();

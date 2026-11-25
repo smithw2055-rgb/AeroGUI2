@@ -928,7 +928,7 @@ ZeroCopySubmissionStats ZeroCopyGpuStream::SubmitDirtyPages(PagedRenderTree& tre
             mappedRingBase_ = ownedRingStorage_.data();
             ringCapacityBytes_ = ownedRingStorage_.size();
             maxPagesInRing_ = newCap;
-            prevUploadedBytes_.assign(newCap, kPageVertexBytes);
+            prevUploadedBytes_.assign(newCap, 0u);
             fullRingReupload = true;
         } else if (prevUploadedBytes_.size() < maxPagesInRing_) {
             prevUploadedBytes_.resize(maxPagesInRing_, kPageVertexBytes);

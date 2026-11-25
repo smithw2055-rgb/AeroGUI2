@@ -43,6 +43,14 @@ struct LoadedStdlibDll final {
     std::string_view explicitPath = {},
     std::string* outError = nullptr);
 
+[[nodiscard]] std::shared_ptr<LoadedStdlibDll> LoadStdlibDllLazyOnly(
+    std::string_view explicitPath = {},
+    std::string* outError = nullptr);
+
+[[nodiscard]] bool DecodeStdlibDllFrontendPack(
+    LoadedStdlibDll& loaded,
+    std::string* outError = nullptr);
+
 void ClearStdlibDllCache() noexcept;
 void ClearStdlibDllCacheForTesting() noexcept;
 

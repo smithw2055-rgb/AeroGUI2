@@ -13,11 +13,17 @@ public class ResourceDictionary : DependencyObject {
     private static ResourceDictionary[] _locSourceDicts;
     private static Dictionary<string, int> _registeredStyleKeys;
     private static ResourceDictionary[] _ambientStack;
+    internal static int _globalMutationEpoch = 1;
+
+    internal static void BumpGlobalMutationEpoch() {
+        _globalMutationEpoch = _globalMutationEpoch >= 1000000000 ? 1 : (_globalMutationEpoch + 1);
+    }
 
     public static void PushAmbient(ResourceDictionary rd) {
         if (rd == null) { return; }
         if (_ambientStack == null) { _ambientStack = new ResourceDictionary[0]; }
         _ambientStack.Push(rd);
+        BumpGlobalMutationEpoch();
     }
 
     public static void PopAmbient(ResourceDictionary rd) {
@@ -25,6 +31,7 @@ public class ResourceDictionary : DependencyObject {
         for (int i = _ambientStack.Length - 1; i >= 0; i -= 1) {
             if (_ambientStack[i] == rd) {
                 _ambientStack.RemoveAt(i);
+                BumpGlobalMutationEpoch();
                 return;
             }
         }
@@ -99,6 +106,7 @@ public class ResourceDictionary : DependencyObject {
         if (k.Length == 0) { return; }
         _locSources[k] = dict;
         RecordLocPair(k, dict);
+        BumpGlobalMutationEpoch();
         string baseName = LocBaseName(k);
         if (baseName.Length > 0) {
             _locSources[baseName] = dict;
@@ -181,6 +189,7 @@ public class ResourceDictionary : DependencyObject {
             }
             _registeredStyleKeys[key] = 1;
         }
+        BumpGlobalMutationEpoch();
     }
 
     public void Set(string key, object val) { SetBox(key, DependencyObject.BoxObject(val)); }
@@ -227,6 +236,7 @@ public class ResourceDictionary : DependencyObject {
                 _keyIndex[_keys[i]] = i;
             }
         }
+        BumpGlobalMutationEpoch();
         return true;
     }
 
@@ -234,6 +244,7 @@ public class ResourceDictionary : DependencyObject {
         if (_keyIndex != null) { _keyIndex.Clear(); }
         _keys.Clear();
         _vals.Clear();
+        BumpGlobalMutationEpoch();
     }
 
     public string[] Keys() { return _keys; }
@@ -1455,9 +1466,17 @@ public class DataTrigger : TriggerBase {
             if (dt.CanUseFastDcCache()) {
                 DependencyObject dcBox = t.EffectiveDataContextBox();
                 object dc = DependencyObject.Unbox(dcBox);
-                int dm = (dc != null && !(dc is UIElement) && ParseUtil.IsNativeReady())
-                    ? Reflect_GetDirtyMask(dc)
-                    : (dc == null ? 0 : -1);
+                int dm = -1;
+                if (dc == null) {
+                    dm = 0;
+                } else if (dc is UIElement) {
+                    UIElement dcEl = dc as UIElement;
+                    if (BindingEntry.CanUseFastElementPropEpoch(dcEl, dt.BindingPath)) {
+                        dm = BindingEntry.GetFastElementEpoch(dcEl, dt.BindingPath);
+                    }
+                } else if (ParseUtil.IsNativeReady()) {
+                    dm = Reflect_GetDirtyMask(dc);
+                }
                 if (dm >= 0 && _reactiveLastVer[i] == dm && _reactiveLastDc[i] == dcBox) {
                     if (!_reactiveLastMatch[i] && dt.WasActiveFor(t)) {
                         anyTransition = true;
@@ -1806,7 +1825,7 @@ public class Style : DependencyObject {
     private Style _basedOn;
     public Style BasedOn {
         get { return _basedOn; }
-        set { _basedOn = value; _cachedResVer = -1; }
+        set { _basedOn = value; _cachedResVer = -1; ResourceDictionary.BumpGlobalMutationEpoch(); }
     }
     private ResourceDictionary _resources;
     private static int _styleResourcesVersion = 0;
@@ -1814,13 +1833,17 @@ public class Style : DependencyObject {
     private bool _cachedHasAnyRes = false;
     public ResourceDictionary Resources {
         get {
-            if (_resources == null) { _resources = new ResourceDictionary(); }
+            if (_resources == null) {
+                _resources = new ResourceDictionary();
+                ResourceDictionary.BumpGlobalMutationEpoch();
+            }
             _styleResourcesVersion += 1;
             return _resources;
         }
         set {
             _resources = value;
             _styleResourcesVersion += 1;
+            ResourceDictionary.BumpGlobalMutationEpoch();
         }
     }
     public bool HasResources() { return _resources != null && _resources.Count() > 0; }
@@ -1906,6 +1929,24 @@ public class Style : DependencyObject {
         _cachedHasAnyRes = anyRes;
         _cachedResVer = _styleResourcesVersion;
         return null;
+    }
+
+    internal bool HasNoStyleResourcesFast() {
+        if (_cachedResVer == _styleResourcesVersion) { return !_cachedHasAnyRes; }
+        Style cur = this;
+        int steps = 0;
+        while (cur != null && steps < 32) {
+            if (cur._resources != null && cur._resources.Count() > 0) {
+                _cachedHasAnyRes = true;
+                _cachedResVer = _styleResourcesVersion;
+                return false;
+            }
+            cur = cur._basedOn;
+            steps += 1;
+        }
+        _cachedHasAnyRes = false;
+        _cachedResVer = _styleResourcesVersion;
+        return true;
     }
 
     public void ApplySettersOnly(UIElement target) {
@@ -2007,10 +2048,16 @@ public class ControlTemplate : DependencyObject {
     private ResourceDictionary _resources;
     public ResourceDictionary Resources {
         get {
-            if (_resources == null) { _resources = new ResourceDictionary(); }
+            if (_resources == null) {
+                _resources = new ResourceDictionary();
+                ResourceDictionary.BumpGlobalMutationEpoch();
+            }
             return _resources;
         }
-        set { _resources = value; }
+        set {
+            _resources = value;
+            ResourceDictionary.BumpGlobalMutationEpoch();
+        }
     }
     public bool HasResources() { return _resources != null && _resources.Count() > 0; }
     public ResourceDictionary RawResourcesOrNull() { return _resources; }
@@ -2147,10 +2194,16 @@ public class DataTemplate : DependencyObject {
     private ResourceDictionary _resources;
     public ResourceDictionary Resources {
         get {
-            if (_resources == null) { _resources = new ResourceDictionary(); }
+            if (_resources == null) {
+                _resources = new ResourceDictionary();
+                ResourceDictionary.BumpGlobalMutationEpoch();
+            }
             return _resources;
         }
-        set { _resources = value; }
+        set {
+            _resources = value;
+            ResourceDictionary.BumpGlobalMutationEpoch();
+        }
     }
     public bool HasResources() { return _resources != null && _resources.Count() > 0; }
     public ResourceDictionary RawResourcesOrNull() { return _resources; }
@@ -2960,6 +3013,8 @@ internal class ManagedAnimBinding {
     public float LastFloat = 0.0f;
     public bool HasLastColor = false;
     public uint LastColor = 0u;
+    public bool SyncOnFinishOnly = false;
+    public int NativePropId = -1;
 }
 
 public class TimelineAnimation : DependencyObject {
@@ -3162,6 +3217,19 @@ public class TimelineAnimation : DependencyObject {
         _lastManagedBindings.Push(mb);
     }
 
+    private void PushFinishOnlyTransformSync(UIElement dest, int tid, int propId) {
+        if (tid <= 0 || dest == null || propId < 3 || propId > 9) { return; }
+        if (_lastManagedBindings == null) { _lastManagedBindings = new ManagedAnimBinding[0]; }
+        var mb = new ManagedAnimBinding();
+        mb.TrackId = tid;
+        mb.Dest = dest;
+        mb.TargetProp = TargetProperty;
+        mb.SyncOnFinishOnly = true;
+        mb.NativePropId = propId;
+        mb.SnapEndOnFinish = false;
+        _lastManagedBindings.Push(mb);
+    }
+
     private void PushManagedColorTrack(UIElement dest, int tid, int colPropId, uint endColor, bool snapEnd) {
         if (tid > 0 && ParseUtil.IsNativeReady()) { Anim_MarkTrackScriptSync(tid); }
         if (_lastManagedBindings == null) { _lastManagedBindings = new ManagedAnimBinding[0]; }
@@ -3257,6 +3325,8 @@ public class TimelineAnimation : DependencyObject {
                 started.Push(tidSp);
                 if ((propId >= 24 && propId <= 26) || (propId >= 3 && propId <= 9 && NeedsTransformSelfSync(dest))) {
                     PushSelfSyncTrack(dest, tidSp, ToFloat, true);
+                } else if (propId >= 3 && propId <= 9) {
+                    PushFinishOnlyTransformSync(dest, tidSp, propId);
                 }
             }
             return RecordStartedForScope(rootScope, dest, propId, started);
@@ -3285,6 +3355,7 @@ public class TimelineAnimation : DependencyObject {
                     ApplyTrackEasing(tid0, KeyFrames[0].EaseParam0, KeyFrames[0].EaseParam1, KeyFrames[0].EaseParamMask);
                     started.Push(tid0);
                     if (trackSelfSync) { PushSelfSyncTrack(dest, tid0, firstVal, effRepeat > 0); }
+                    else if (propId >= 3 && propId <= 9 && effRepeat > 0) { PushFinishOnlyTransformSync(dest, tid0, propId); }
                 }
                 return RecordStartedForScope(rootScope, dest, propId, started);
             }
@@ -3329,6 +3400,8 @@ public class TimelineAnimation : DependencyObject {
                 if (trackSelfSync) {
                     float finishVal = AutoReverse ? (firstAtZero ? firstVal : startVal) : endVal;
                     PushSelfSyncTrack(dest, ktid, finishVal, effRepeat > 0);
+                } else if (propId >= 3 && propId <= 9 && effRepeat > 0) {
+                    PushFinishOnlyTransformSync(dest, ktid, propId);
                 }
             }
             return RecordStartedForScope(rootScope, dest, propId, started);
@@ -3361,6 +3434,7 @@ public class TimelineAnimation : DependencyObject {
             ApplyTrackEasing(tidMain, EaseParam0, EaseParam1, EaseParamMask);
             started.Push(tidMain);
             if (trackSelfSync) { PushSelfSyncTrack(dest, tidMain, AutoReverse ? mainFromVal : effToVal, effRepeat > 0); }
+            else if (propId >= 3 && propId <= 9 && effRepeat > 0) { PushFinishOnlyTransformSync(dest, tidMain, propId); }
         }
         return RecordStartedForScope(rootScope, dest, propId, started);
     }
@@ -3747,6 +3821,17 @@ public class Storyboard : DependencyObject {
         if (mb == null || mb.TrackId <= 0) { return false; }
         if (mb.Dest == null || mb.Dest._isDisposedTree) {
             Anim_StopTrack(mb.TrackId);
+            mb.TrackId = 0;
+            return false;
+        }
+        if (mb.SyncOnFinishOnly) {
+            if (Anim_IsTrackActive(mb.TrackId)) {
+                return true;
+            }
+            if (ParseUtil.IsNativeReady() && ParseUtil.IsValidHandle(mb.Dest.__nativeHandle)) {
+                float curVal = Anim_ReadCurrentFloat(mb.Dest.__nativeHandle, mb.NativePropId);
+                mb.Dest.UpdateManagedTransformScalarOnly(mb.NativePropId, curVal);
+            }
             mb.TrackId = 0;
             return false;
         }
@@ -5317,6 +5402,7 @@ public static class BindingEngine {
     private static BindingEntry[] _entries;
     private static Action[] _preFlushHooks;
     private static Action[] _postFlushHooks;
+    private static Action[] _postLayoutHooks;
     private static FrameTickHook[] _frameTickHooks;
     private static int _batchDepth = 0;
     private static BindingEntry[] _batchPending;
@@ -5373,6 +5459,12 @@ public static class BindingEngine {
         if (hook == null) { return; }
         if (_postFlushHooks == null) { _postFlushHooks = new Action[0]; }
         _postFlushHooks.Push(hook);
+    }
+
+    public static void AddPostLayoutHook(Action hook) {
+        if (hook == null) { return; }
+        if (_postLayoutHooks == null) { _postLayoutHooks = new Action[0]; }
+        _postLayoutHooks.Push(hook);
     }
 
     public static void AddFrameTickHook(FrameTickHook hook) {
@@ -5946,11 +6038,17 @@ public static class BindingEngine {
     public static void FlushPostLayout() {
         RefreshLayoutEpoch();
         FlushCleanupOnly();
-        if ((_entries == null || _entries.Length == 0) &&
-            (_postFlushHooks == null || _postFlushHooks.Length == 0)) {
-            return;
+        bool hasEntriesOrPost = (_entries != null && _entries.Length > 0) ||
+                                (_postFlushHooks != null && _postFlushHooks.Length > 0);
+        if (hasEntriesOrPost) {
+            FlushBodyAndPostHooks();
         }
-        FlushBodyAndPostHooks();
+        if (_postLayoutHooks != null && _postLayoutHooks.Length > 0) {
+            for (int h = 0; h < _postLayoutHooks.Length; h += 1) {
+                var fn = _postLayoutHooks[h];
+                if (fn != null) { fn(); }
+            }
+        }
     }
 
     // ---- Reflection Path Traversals ----

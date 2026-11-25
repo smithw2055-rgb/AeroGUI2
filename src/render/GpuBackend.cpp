@@ -2338,7 +2338,7 @@ GpuBackendFrameStats OpenGlDeviceBackend::ExecuteSubmission(
 
         const bool mustPadTail = (span.pageIndex < pageNeedsTailPad_.size() && pageNeedsTailPad_[span.pageIndex] != 0u);
         if (mustPadTail && clampedBytes < kPageVertexBytes) {
-            AeroVertex paddedPage[kVerticesPerCommandPage]{};
+            std::uint8_t paddedPage[kPageVertexBytes]{};
             std::memcpy(paddedPage, span.sourcePageVertexPtr, clampedBytes);
             gl_.BufferSubData(
                 kGlArrayBuffer,
@@ -2380,7 +2380,7 @@ GpuBackendFrameStats OpenGlDeviceBackend::ExecuteSubmission(
             const std::size_t dstOffset = slotIdx * kPageVertexBytes;
             const bool mustPadTail = (p < pageNeedsTailPad_.size() && pageNeedsTailPad_[p] != 0u);
             if (mustPadTail && activeBytes < kPageVertexBytes && dstOffset + kPageVertexBytes <= ringBufferBytes_) {
-                AeroVertex paddedPage[kVerticesPerCommandPage]{};
+                std::uint8_t paddedPage[kPageVertexBytes]{};
                 std::memcpy(paddedPage, page.vertices.data(), activeBytes);
                 gl_.BufferSubData(
                     kGlArrayBuffer,
@@ -2417,7 +2417,7 @@ GpuBackendFrameStats OpenGlDeviceBackend::ExecuteSubmission(
         const std::size_t activeBytes = activeVerts * sizeof(AeroVertex);
         const std::size_t dstOffset = slotIdx * kPageVertexBytes;
         if (activeBytes < kPageVertexBytes && dstOffset + kPageVertexBytes <= ringBufferBytes_) {
-            static const AeroVertex kZeroVertices[kVerticesPerCommandPage]{};
+            static const std::uint8_t kZeroVertices[kPageVertexBytes]{};
             gl_.BufferSubData(
                 kGlArrayBuffer,
                 static_cast<AeroGLintptr>(dstOffset + activeBytes),
